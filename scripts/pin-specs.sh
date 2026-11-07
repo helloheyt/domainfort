@@ -3,7 +3,9 @@
 # מוריד רק מ-hosts שב-agent-sandbox/egress-allowlist.txt (אכיפת SOURCES.md).
 # דורש: jq, curl, sha256sum (או shasum).
 # שימוש:  scripts/pin-specs.sh [--verify]
-#   ברירת מחדל: ממלא sha256/revision חסרים ושומר ל-cache.
+#   ברירת מחדל: ממלא sha256 חסר ושומר ל-cache. שדה revision נעוץ ידנית מעמוד
+#              השער של המפרט (מזהה vYYYYMMDD) — ראו docs/17 SV; sha256 הוא עוגן
+#              השלמות האמיתי, ושינוי גרסה ממילא משנה sha256 וייתפס ב---verify.
 #   --verify:   בודק שה-sha256 הקיים עדיין תואם (ל-CI), בלי לשנות את המניפסט.
 set -euo pipefail
 

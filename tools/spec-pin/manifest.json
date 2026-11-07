@@ -8,7 +8,7 @@
       "title": "Active Directory Technical Specification",
       "kind": "ms-openspec",
       "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-ADTS/%5bMS-ADTS%5d.pdf",
-      "revision": null,
+      "revision": "v20261026 (2026-10-26)",
       "sha256": "55b59eb1416d0e1b963e7fd0892071c3f72b017b6c67e08184e43fab059ab2b1",
       "phase": "1-2",
       "blocks": [
@@ -22,7 +22,7 @@
       "title": "Windows Data Types",
       "kind": "ms-openspec",
       "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-DTYP/%5bMS-DTYP%5d.pdf",
-      "revision": null,
+      "revision": "v20241119 (2024-11-19)",
       "sha256": "0f4a3744c74ebf69212e6c45f9adf182a0cfc7beacf33fa402b1f8d233ca83b3",
       "phase": "1",
       "blocks": [
@@ -34,7 +34,7 @@
       "title": "Kerberos Protocol Extensions",
       "kind": "ms-openspec",
       "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-KILE/%5bMS-KILE%5d.pdf",
-      "revision": null,
+      "revision": "v20260928 (2026-09-28)",
       "sha256": "8d172e6fb7b760812fba2e41b1bb591dc80fcfce441419153cc93622456e7a01",
       "phase": "1-2",
       "blocks": [
@@ -46,7 +46,7 @@
       "title": "Privilege Attribute Certificate Data Structure",
       "kind": "ms-openspec",
       "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-PAC/%5bMS-PAC%5d.pdf",
-      "revision": null,
+      "revision": "v20240610 (2024-06-10)",
       "sha256": "aec2704fa8503fbeee364577545a505bcc53c7f331c3632fd55abe06c4853b92",
       "phase": "2",
       "blocks": [
@@ -58,7 +58,7 @@
       "title": "Netlogon Remote Protocol",
       "kind": "ms-openspec",
       "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-NRPC/%5bMS-NRPC%5d.pdf",
-      "revision": null,
+      "revision": "v20261026 (2026-10-26)",
       "sha256": "b5ac38913765b9650742e816830eaab27d2de556cbc0e20ee49ff7adb2f73c6b",
       "phase": "2",
       "blocks": [
@@ -71,7 +71,7 @@
       "title": "Network Time Protocol (NTP) Authentication Extensions",
       "kind": "ms-openspec",
       "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-SNTP/%5bMS-SNTP%5d.pdf",
-      "revision": null,
+      "revision": "v20240423 (2024-04-23)",
       "sha256": "d75af7e1ffdf4ff9527c6ce9764739cee97b0448a3f6522e0e101b5ce849b457",
       "phase": "2",
       "blocks": [
@@ -83,7 +83,7 @@
       "title": "Security Account Manager (SAM) Remote Protocol (Client-to-Server)",
       "kind": "ms-openspec",
       "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-SAMR/%5bMS-SAMR%5d.pdf",
-      "revision": null,
+      "revision": "v20260427 (2026-04-27)",
       "sha256": "083fe00af97d47e758624155b930a6722f0c1ccf58cf329c6d2fe0bdabe98a4e",
       "phase": "2",
       "blocks": [
@@ -95,7 +95,7 @@
       "title": "Local Security Authority (Domain Policy) Remote Protocol",
       "kind": "ms-openspec",
       "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-LSAD/%5bMS-LSAD%5d.pdf",
-      "revision": null,
+      "revision": "v20250610 (2025-06-10)",
       "sha256": "f96f62297659ffec1de6e2c0dd54d8a1a4ff27e324f0301205849b2988191c50",
       "phase": "2",
       "blocks": []
@@ -105,7 +105,7 @@
       "title": "Local Security Authority (Translation Methods) Remote Protocol",
       "kind": "ms-openspec",
       "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-LSAT/%5bMS-LSAT%5d.pdf",
-      "revision": null,
+      "revision": "v20240501 (2024-05-01)",
       "sha256": "b56634f674047ae182ab892ac77e2f54f618a2351e2b35131371faec9db072ec",
       "phase": "2",
       "blocks": []
@@ -115,7 +115,7 @@
       "title": "Remote Procedure Call Protocol Extensions",
       "kind": "ms-openspec",
       "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-RPCE/%5bMS-RPCE%5d.pdf",
-      "revision": null,
+      "revision": "v20240916 (2024-09-16)",
       "sha256": "6c9d6587d6c5e353fbfc4d712b7af1fae7c84f76849e5d3345fa3ce156299506",
       "phase": "2",
       "blocks": []
@@ -125,7 +125,7 @@
       "title": "Server Message Block (SMB) Protocol Versions 2 and 3",
       "kind": "ms-openspec",
       "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-SMB2/%5bMS-SMB2%5d.pdf",
-      "revision": null,
+      "revision": "v20260928 (2026-09-28)",
       "sha256": "fef3a06507679130a8cfdcaeaed581482d7f235435dd904f6c794f113ff04bd1",
       "phase": "2",
       "blocks": [
@@ -137,7 +137,7 @@
       "title": "Directory Replication Service (DRS) Remote Protocol",
       "kind": "ms-openspec",
       "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-DRSR/%5bMS-DRSR%5d.pdf",
-      "revision": null,
+      "revision": "v20260309 (2026-03-09)",
       "sha256": "e8ce0c8ce1196c6ee713b5066531fea0439ca772ec1fbb8db88b865047a3b62c",
       "phase": "7",
       "blocks": []
@@ -147,7 +147,7 @@
       "title": "Group Key Distribution Protocol",
       "kind": "ms-openspec",
       "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-GKDI/%5bMS-GKDI%5d.pdf",
-      "revision": null,
+      "revision": "v20240423 (2024-04-23)",
       "sha256": "b956714598c2494b9cc1cb03018901893953ff6ecc1e03bf1c36992fe834ad40",
       "phase": "3",
       "blocks": []
@@ -157,7 +157,7 @@
       "title": "BackupKey Remote Protocol",
       "kind": "ms-openspec",
       "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-BKRP/%5bMS-BKRP%5d.pdf",
-      "revision": null,
+      "revision": "v20240423 (2024-04-23)",
       "sha256": "4ea8319385853ceb7ffe0bc69142c529504a7cc9b1956333b08e94f53e8593f7",
       "phase": "3",
       "blocks": [

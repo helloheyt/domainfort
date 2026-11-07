@@ -14,6 +14,8 @@ jobs:
         with: { fetch-depth: 0 }
       - name: Spec-Ref / Clean-Room trailers
         run: bash scripts/check-provenance.sh "origin/${{ github.base_ref || 'main' }}"
+      - name: No vendored / foreign-licensed / copied code
+        run: bash scripts/check-no-vendor.sh
 
   sources-sync:
     name: egress-allowlist ↔ SOURCES
