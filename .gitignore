@@ -1,0 +1,10 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock        # יוחזר ל-track כשייווצר binary ראשון
+
+# ספריית מפרטים — הקבצים שהורדו נשמרים מקומית; המניפסט (עם ה-sha256) כן ב-track.
+/tools/spec-pin/cache/
+
+# מערכת
+.DS_Store

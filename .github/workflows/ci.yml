@@ -1,0 +1,52 @@
+name: ci
+# CI של שלב 0 — שכבת האכיפה השלישית (docs/01-cleanroom.md). נכשל = לא נכנס ל-main.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  provenance:
+    name: clean-room provenance (trailers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Spec-Ref / Clean-Room trailers
+        run: bash scripts/check-provenance.sh "origin/${{ github.base_ref || 'main' }}"
+
+  sources-sync:
+    name: egress-allowlist ↔ SOURCES
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/check-sources-sync.sh
+
+  specs-pinned:
+    name: spec manifest integrity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y jq
+      # מאמת שה-sha256 המוצמד עדיין תואם את המקור (docs/17 SV-*).
+      - run: bash scripts/pin-specs.sh --verify
+
+  deps:
+    name: cargo-deny (licenses + banned deps)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  rust:
+    name: fmt / clippy / build / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: "rustfmt, clippy" }
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo build --all
+      - run: cargo test --all
+    # כל עוד ה-workspace ריק (שלב 0) השלבים עוברים no-op; הם נכנסים לתוקף עם ה-crate הראשון.

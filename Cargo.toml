@@ -1,0 +1,24 @@
+# Workspace skeleton — שלב 0.
+# אין כאן crates עם קוד מוצר. הם ייווצרו רק אחרי OD-1 (אישור משפטי)
+# ואימות ה-⚠ הרלוונטיים (docs/17-phase0-verification.md).
+#
+# ה-crates המתוכננים (לפי docs/03-components.md ו-docs/09–11), בסדר קריטיות:
+#   C0:  keyd        — משמורת הסודות (docs/10-keyd-interface.md)
+#        kdc         — הנפקת אימות
+#        pdp         — ליבת ההחלטה (docs/11-pdp-interface.md)
+#   C1:  dirstore    — אחסון + מודל אבטחה
+#        rpc         — DCE/RPC + שירותי RPC
+#   C2:  parse-*     — parsers מבודדים (asn1, ndr, dns, smb, gss)
+#
+# כל parser שמול הרשת = crate נפרד, לתהליך נפרד עם sandbox (docs/03 §עקרונות).
+
+[workspace]
+resolver = "2"
+members = []
+
+# מדיניות build לכלל ה-workspace (תחול כשייווספו crates):
+[workspace.lints.rust]
+unsafe_code = "forbid"   # חריג דורש הצדקה כתובה + סוקר שני (AGENTS.md §6)
+
+[workspace.lints.clippy]
+all = "warn"

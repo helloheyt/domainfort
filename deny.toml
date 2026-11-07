@@ -1,0 +1,51 @@
+# cargo-deny — בקרת תלויות (AGENTS.md §7, החלטה D2).
+# הרצה:  cargo deny check
+# נכשל על רישיון לא ברשימה או על חבילת לוגיקת-פרוטוקול לא מאושרת.
+
+[licenses]
+# רשימת הרישיונות המותרים בלבד (AGENTS.md §7). כל דבר אחר (GPL/LGPL/AGPL/MPL/SSPL/לא-ידוע) נדחה.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.95
+# חריג נקודתי לרישיון דורש אישור בעלים — יתווסף כאן במפורש עם נימוק, אם בכלל.
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"            # בלי תלות עם גרסת "*"
+# חבילות לוגיקת-פרוטוקול אסורות ללא אישור מפורש (D2): הלוגיקה הזו היא העבודה שלנו.
+# קישור לחבילה כזו = קוד של מישהו אחר שרץ ב-DC. רשימת דוגמאות; מורחבת בסקירה.
+deny = [
+    { name = "krb5" },
+    { name = "kerberos" },
+    { name = "sspi" },
+    { name = "ldap3" },
+    { name = "openldap" },
+    { name = "smb" },
+    { name = "smb2" },
+    { name = "pavao" },        # SMB
+    { name = "dcerpc" },
+    { name = "ndr" },
+    { name = "gssapi" },
+    { name = "libgssapi" },
+    { name = "winrm" },
+]
+
+[advisories]
+# פגיעויות ידועות בתלויות — נכשל על פגיעות, לא רק מתריע.
+version = 2
+yanked = "deny"
+ignore = []
+
+[sources]
+# מקורות חבילות מותרים בלבד (crates.io הרשמי).
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

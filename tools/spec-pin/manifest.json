@@ -1,0 +1,302 @@
+{
+  "_comment": "ספריית המפרטים המוצמדת (specs/SOURCES.md §D, docs/17 SV-*). revision+sha256 ממולאים ע\"י scripts/pin-specs.sh. ללא הצמדה — אין לכתוב קוד מהמסמך (AGENTS.md).",
+  "ms_openspec_pdf_host": "https://winprotocoldoc.z19.web.core.windows.net",
+  "generated_at": "2026-11-07T18:11:43Z",
+  "documents": [
+    {
+      "id": "MS-ADTS",
+      "title": "Active Directory Technical Specification",
+      "kind": "ms-openspec",
+      "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-ADTS/%5bMS-ADTS%5d.pdf",
+      "revision": null,
+      "sha256": "55b59eb1416d0e1b963e7fd0892071c3f72b017b6c67e08184e43fab059ab2b1",
+      "phase": "1-2",
+      "blocks": [
+        "SV-1",
+        "SV-3",
+        "SV-4"
+      ]
+    },
+    {
+      "id": "MS-DTYP",
+      "title": "Windows Data Types",
+      "kind": "ms-openspec",
+      "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-DTYP/%5bMS-DTYP%5d.pdf",
+      "revision": null,
+      "sha256": "0f4a3744c74ebf69212e6c45f9adf182a0cfc7beacf33fa402b1f8d233ca83b3",
+      "phase": "1",
+      "blocks": [
+        "SV-1"
+      ]
+    },
+    {
+      "id": "MS-KILE",
+      "title": "Kerberos Protocol Extensions",
+      "kind": "ms-openspec",
+      "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-KILE/%5bMS-KILE%5d.pdf",
+      "revision": null,
+      "sha256": "8d172e6fb7b760812fba2e41b1bb591dc80fcfce441419153cc93622456e7a01",
+      "phase": "1-2",
+      "blocks": [
+        "SV-2"
+      ]
+    },
+    {
+      "id": "MS-PAC",
+      "title": "Privilege Attribute Certificate Data Structure",
+      "kind": "ms-openspec",
+      "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-PAC/%5bMS-PAC%5d.pdf",
+      "revision": null,
+      "sha256": "aec2704fa8503fbeee364577545a505bcc53c7f331c3632fd55abe06c4853b92",
+      "phase": "2",
+      "blocks": [
+        "SV-2"
+      ]
+    },
+    {
+      "id": "MS-NRPC",
+      "title": "Netlogon Remote Protocol",
+      "kind": "ms-openspec",
+      "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-NRPC/%5bMS-NRPC%5d.pdf",
+      "revision": null,
+      "sha256": "b5ac38913765b9650742e816830eaab27d2de556cbc0e20ee49ff7adb2f73c6b",
+      "phase": "2",
+      "blocks": [
+        "SV-8",
+        "SV-9"
+      ]
+    },
+    {
+      "id": "MS-SNTP",
+      "title": "Network Time Protocol (NTP) Authentication Extensions",
+      "kind": "ms-openspec",
+      "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-SNTP/%5bMS-SNTP%5d.pdf",
+      "revision": null,
+      "sha256": "d75af7e1ffdf4ff9527c6ce9764739cee97b0448a3f6522e0e101b5ce849b457",
+      "phase": "2",
+      "blocks": [
+        "SV-8"
+      ]
+    },
+    {
+      "id": "MS-SAMR",
+      "title": "Security Account Manager (SAM) Remote Protocol (Client-to-Server)",
+      "kind": "ms-openspec",
+      "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-SAMR/%5bMS-SAMR%5d.pdf",
+      "revision": null,
+      "sha256": "083fe00af97d47e758624155b930a6722f0c1ccf58cf329c6d2fe0bdabe98a4e",
+      "phase": "2",
+      "blocks": [
+        "SV-7"
+      ]
+    },
+    {
+      "id": "MS-LSAD",
+      "title": "Local Security Authority (Domain Policy) Remote Protocol",
+      "kind": "ms-openspec",
+      "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-LSAD/%5bMS-LSAD%5d.pdf",
+      "revision": null,
+      "sha256": "f96f62297659ffec1de6e2c0dd54d8a1a4ff27e324f0301205849b2988191c50",
+      "phase": "2",
+      "blocks": []
+    },
+    {
+      "id": "MS-LSAT",
+      "title": "Local Security Authority (Translation Methods) Remote Protocol",
+      "kind": "ms-openspec",
+      "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-LSAT/%5bMS-LSAT%5d.pdf",
+      "revision": null,
+      "sha256": "b56634f674047ae182ab892ac77e2f54f618a2351e2b35131371faec9db072ec",
+      "phase": "2",
+      "blocks": []
+    },
+    {
+      "id": "MS-RPCE",
+      "title": "Remote Procedure Call Protocol Extensions",
+      "kind": "ms-openspec",
+      "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-RPCE/%5bMS-RPCE%5d.pdf",
+      "revision": null,
+      "sha256": "6c9d6587d6c5e353fbfc4d712b7af1fae7c84f76849e5d3345fa3ce156299506",
+      "phase": "2",
+      "blocks": []
+    },
+    {
+      "id": "MS-SMB2",
+      "title": "Server Message Block (SMB) Protocol Versions 2 and 3",
+      "kind": "ms-openspec",
+      "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-SMB2/%5bMS-SMB2%5d.pdf",
+      "revision": null,
+      "sha256": "fef3a06507679130a8cfdcaeaed581482d7f235435dd904f6c794f113ff04bd1",
+      "phase": "2",
+      "blocks": [
+        "SV-12"
+      ]
+    },
+    {
+      "id": "MS-DRSR",
+      "title": "Directory Replication Service (DRS) Remote Protocol",
+      "kind": "ms-openspec",
+      "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-DRSR/%5bMS-DRSR%5d.pdf",
+      "revision": null,
+      "sha256": "e8ce0c8ce1196c6ee713b5066531fea0439ca772ec1fbb8db88b865047a3b62c",
+      "phase": "7",
+      "blocks": []
+    },
+    {
+      "id": "MS-GKDI",
+      "title": "Group Key Distribution Protocol",
+      "kind": "ms-openspec",
+      "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-GKDI/%5bMS-GKDI%5d.pdf",
+      "revision": null,
+      "sha256": "b956714598c2494b9cc1cb03018901893953ff6ecc1e03bf1c36992fe834ad40",
+      "phase": "3",
+      "blocks": []
+    },
+    {
+      "id": "MS-BKRP",
+      "title": "BackupKey Remote Protocol",
+      "kind": "ms-openspec",
+      "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-BKRP/%5bMS-BKRP%5d.pdf",
+      "revision": null,
+      "sha256": "4ea8319385853ceb7ffe0bc69142c529504a7cc9b1956333b08e94f53e8593f7",
+      "phase": "3",
+      "blocks": [
+        "SV-10"
+      ]
+    },
+    {
+      "id": "RFC4120",
+      "title": "The Kerberos Network Authentication Service (V5)",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc4120.txt",
+      "revision": "RFC4120",
+      "sha256": "368d3cd1a4248e361799e3ebb2dbd124ec4fb14651e2188b77b392b66463f75b",
+      "phase": "1",
+      "blocks": []
+    },
+    {
+      "id": "RFC3961",
+      "title": "Encryption and Checksum Specifications for Kerberos 5",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc3961.txt",
+      "revision": "RFC3961",
+      "sha256": "1c4d7facc88d6d6d9fa4b2d0b92366e37c8f506455c545762a76fd83ecc7c970",
+      "phase": "1",
+      "blocks": []
+    },
+    {
+      "id": "RFC3962",
+      "title": "AES Encryption for Kerberos 5",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc3962.txt",
+      "revision": "RFC3962",
+      "sha256": "1a6bf9edff650f92e8c5f85a450335c168545169bfdd51977393d15a6932f1f0",
+      "phase": "1",
+      "blocks": []
+    },
+    {
+      "id": "RFC8009",
+      "title": "AES Encryption with HMAC-SHA2 for Kerberos 5",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc8009.txt",
+      "revision": "RFC8009",
+      "sha256": "3cdf2680c6123ae793a5632cecd27cbb043599b63c2e4bac5fef99cba55600bb",
+      "phase": "1-2",
+      "blocks": [
+        "SV-5"
+      ]
+    },
+    {
+      "id": "RFC6113",
+      "title": "A Generalized Framework for Kerberos Pre-Authentication (FAST)",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc6113.txt",
+      "revision": "RFC6113",
+      "sha256": "69c49f1a5dfae03d7e1011fae7aa2e838d346b6e4b13091e0d10022e368d278c",
+      "phase": "1",
+      "blocks": []
+    },
+    {
+      "id": "RFC4556",
+      "title": "Public Key Cryptography for Initial Authentication in Kerberos (PKINIT)",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc4556.txt",
+      "revision": "RFC4556",
+      "sha256": "4d093f20b584557ec59ce3d0557a36da5d4deedf576cac4ea2c2295c01feb538",
+      "phase": "3",
+      "blocks": []
+    },
+    {
+      "id": "RFC4511",
+      "title": "LDAP: The Protocol",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc4511.txt",
+      "revision": "RFC4511",
+      "sha256": "49c6aab64bd9835420f7fc83e9cc53fe7aea46de882daa4f99fafe20273b06fd",
+      "phase": "1",
+      "blocks": []
+    },
+    {
+      "id": "RFC4513",
+      "title": "LDAP: Authentication Methods and Security Mechanisms",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc4513.txt",
+      "revision": "RFC4513",
+      "sha256": "2215320fd3d1ae3efc456f331bd0e71a6cfda915ac964130d1565146bf732f6a",
+      "phase": "1",
+      "blocks": []
+    },
+    {
+      "id": "RFC5929",
+      "title": "Channel Bindings for TLS",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc5929.txt",
+      "revision": "RFC5929",
+      "sha256": "d32604f5d5e2028f09a8e0cf1584b7bb27e75b2e060233cd5387446ac486eab7",
+      "phase": "1",
+      "blocks": []
+    },
+    {
+      "id": "RFC8446",
+      "title": "The Transport Layer Security (TLS) Protocol Version 1.3",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc8446.txt",
+      "revision": "RFC8446",
+      "sha256": "47871bc8820a2c3b6ea89f061055577058862cf543686b82d10131239702b3bd",
+      "phase": "1",
+      "blocks": []
+    },
+    {
+      "id": "RFC2782",
+      "title": "A DNS RR for specifying the location of services (DNS SRV)",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc2782.txt",
+      "revision": "RFC2782",
+      "sha256": "bacc8972b55f30eb47d7bb07662905ba3a3a7cdefb148174d0d9fbbb313735ac",
+      "phase": "1",
+      "blocks": [
+        "SV-3"
+      ]
+    },
+    {
+      "id": "RFC3645",
+      "title": "GSS Algorithm for TSIG (GSS-TSIG)",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc3645.txt",
+      "revision": "RFC3645",
+      "sha256": "18443eba664ecbeff6ac63bf11f260b9e8cb801f60a963b3e89586485fa44efe",
+      "phase": "1",
+      "blocks": []
+    },
+    {
+      "id": "RFC8915",
+      "title": "Network Time Security for NTP",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc8915.txt",
+      "revision": "RFC8915",
+      "sha256": "c92a3ce4d1984b4c13f1cdf74d6f76c42b0fd34b2c1b71f5dd4f7d1cc641f57d",
+      "phase": "1-2",
+      "blocks": []
+    }
+  ]
+}

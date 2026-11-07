@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# commit-msg hook — אוכף את trailers ה-clean-room (AGENTS.md §4).
+#
+# כלל:
+#   • כל commit חייב trailer  Clean-Room:
+#   • commit שנוגע בקוד מוצר (crates/** או src/**) חייב גם  Spec-Ref:
+# נכשל → ה-commit נדחה. זה הופך את "אין קוד בלי provenance" לאכיף, לא להמלצה.
+set -euo pipefail
+
+msg_file="$1"
+msg="$(cat "$msg_file")"
+
+fail() { echo "✖ commit-msg: $1" >&2; echo "  ראו AGENTS.md §4." >&2; exit 1; }
+
+# 1. Clean-Room חובה תמיד.
+if ! grep -qE '^Clean-Room:[[:space:]]*\S' <<<"$msg"; then
+  fail "חסר trailer 'Clean-Room:' (הצהרה שנכתב רק ממקורות Spec-Ref / ללא קוד מוצר)."
+fi
+
+# 2. האם ה-commit נוגע בקוד מוצר?
+touches_product=0
+if git diff --cached --name-only 2>/dev/null | grep -qE '^(crates|src)/'; then
+  touches_product=1
+fi
+
+# 3. Spec-Ref חובה לקוד מוצר.
+if [ "$touches_product" -eq 1 ]; then
+  if ! grep -qE '^Spec-Ref:[[:space:]]*\S' <<<"$msg"; then
+    fail "commit נוגע בקוד מוצר (crates/|src/) אך חסר trailer 'Spec-Ref:' (למשל 'Spec-Ref: MS-KILE r49.0 3.3.5.7; RFC 4120 5.4.2')."
+  fi
+fi
+
+exit 0
