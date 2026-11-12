@@ -1,7 +1,9 @@
 # Rust
 /target
 **/*.rs.bk
-Cargo.lock        # יוחזר ל-track כשייווצר binary ראשון
+# Cargo.lock — יוחזר ל-track כשייווצר ה-binary הראשון (עד אז crate-ספרייה בלבד).
+# (הערה חייבת להיות בשורה נפרדת; הערת-inline שוברת את התבנית ב-gitignore.)
+Cargo.lock
 
 # ספריית מפרטים — הקבצים שהורדו נשמרים מקומית; המניפסט (עם ה-sha256) כן ב-track.
 /tools/spec-pin/cache/

@@ -1,0 +1,18 @@
+# parse-asn1 — strict DER decoder / canonical DER encoder for the ASN.1 subset
+# that Kerberos (RFC 4120 §5) uses. First crate (docs/45-first-crate-plan.md, D181).
+#
+# Leaf crate: ZERO runtime dependencies (the error enum is hand-rolled), so there
+# is nothing to link and nothing for cargo-deny to license-check here.
+# Written only from X.680/X.690 (ITU-T, 02/2021) and RFC 4120 §5 — AGENTS.md §1-3.
+
+[package]
+name = "parse-asn1"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# intentionally empty — zero runtime dependencies (AGENTS.md §7; docs/45 §4).
+
+[lints]
+workspace = true

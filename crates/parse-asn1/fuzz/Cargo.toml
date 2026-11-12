@@ -1,0 +1,38 @@
+# cargo-fuzz harness for parse-asn1 (AGENTS.md §6 / docs/32 §8: every parser gets
+# a fuzz target before it merges to main).
+#
+# This is a SEPARATE workspace (note the empty [workspace] table below): it is
+# intentionally NOT a member of the root workspace, so `cargo build --all`,
+# `cargo clippy`, `cargo test`, `cargo deny` and the SBOM in the product
+# workspace never pull in the fuzzing-only dependencies. It is built only via
+# `cargo fuzz run parse_asn1_decode` (nightly + cargo-fuzz).
+#
+# NOTE FOR REVIEW: libfuzzer-sys and arbitrary are fuzz-harness-only, test
+# infrastructure, not linked into any product crate. They are on the license
+# allowlist (MIT / Apache-2.0, AGENTS.md §7). Flagged for owner sign-off because
+# AGENTS.md §7 asks a human to approve any new dependency.
+
+[package]
+name = "parse-asn1-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.parse-asn1]
+path = ".."
+
+[[bin]]
+name = "parse_asn1_decode"
+path = "fuzz_targets/parse_asn1_decode.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the root workspace (see header).
+[workspace]
