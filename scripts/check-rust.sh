@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# phase-0 Rust gate: fmt / clippy / build / test.
+#
+# While the workspace has no crates (product code is gated on the interop lab /
+# ⚠ verification — see docs/44-lab-build-spec.md and Cargo.toml), this is a clean
+# no-op. It activates automatically the moment the first crate is added, so CI
+# turns green now and enforces the real checks later without an edit.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+# Empty virtual workspace → cargo's build/clippy/test error with "no members".
+if cargo metadata --no-deps --format-version 1 2>/dev/null | grep -q '"packages":\[\]'; then
+  echo "phase-0: workspace has no crates yet — skipping fmt/clippy/build/test."
+  echo "  (product crates are gated; see docs/44-lab-build-spec.md)"
+  exit 0
+fi
+
+echo "crates present — running the full Rust gate."
+cargo fmt --all --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo build --all
+cargo test --all

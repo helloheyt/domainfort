@@ -1,16 +1,25 @@
 # Workspace skeleton — שלב 0.
-# אין כאן crates עם קוד מוצר. הם ייווצרו רק אחרי OD-1 (אישור משפטי)
-# ואימות ה-⚠ הרלוונטיים (docs/17-phase0-verification.md).
+# אין כאן crates עם קוד מוצר.
+#
+# גייט ליצירת crates: OD-1 (אישור משפטי) — **נסגר 2026-11-12** ✓.
+# נותר גייט אחד: אימות ה-⚠ הרלוונטיים לכל רכיב, שתלוי בהקלטת-המעבדה
+# (docs/44-lab-build-spec.md, OD-6) — החוסם היחיד שנותר לקוד שמול Windows.
+# לכן members עדיין ריק במכוון; crate ראשון נוצר כשה-⚠ שלו סגורים.
 #
 # ה-crates המתוכננים (לפי docs/03-components.md ו-docs/09–11), בסדר קריטיות:
 #   C0:  keyd        — משמורת הסודות (docs/10-keyd-interface.md)
-#        kdc         — הנפקת אימות
+#        kdc         — הנפקת אימות (docs/30-kdc-core-flows.md)
 #        pdp         — ליבת ההחלטה (docs/11-pdp-interface.md)
-#   C1:  dirstore    — אחסון + מודל אבטחה
+#   C1:  dirstore    — אחסון + מודל אבטחה (docs/32 — מעל redb, OD-4)
 #        rpc         — DCE/RPC + שירותי RPC
+#        repl        — שכפול נייטיבי (docs/29, שלב 4)
 #   C2:  parse-*     — parsers מבודדים (asn1, ndr, dns, smb, gss)
 #
 # כל parser שמול הרשת = crate נפרד, לתהליך נפרד עם sandbox (docs/03 §עקרונות).
+#
+# תלויות מאושרות (הכרעות 2026-11-12, מקושרות לא-מועתקות — D2; יירשמו ב-Cargo של
+# כל crate כשייווצר): redb (אחסון, OD-4); RustCrypto כברירת-מחדל + aws-lc-rs
+# כ-backend מאומת-FIPS, ו-rustls ל-TLS (קריפטו/PQC, OD-9/D180).
 
 [workspace]
 resolver = "2"

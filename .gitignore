@@ -6,5 +6,9 @@ Cargo.lock        # יוחזר ל-track כשייווצר binary ראשון
 # ספריית מפרטים — הקבצים שהורדו נשמרים מקומית; המניפסט (עם ה-sha256) כן ב-track.
 /tools/spec-pin/cache/
 
+# SBOM output (נוצר ב-CI/מקומית; לא ב-track)
+*.cdx.json
+bom.json
+
 # מערכת
 .DS_Store

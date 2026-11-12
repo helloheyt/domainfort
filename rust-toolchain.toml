@@ -1,0 +1,8 @@
+# Pinned toolchain — same Rust in CI and on every machine.
+# Scaffold phase: track the current stable (already installed; no surprise
+# download). Before the first release, pin an EXACT version here for full
+# build reproducibility (docs/14 D61).
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
