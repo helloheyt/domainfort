@@ -12,8 +12,12 @@
 //! If the input is UTF-8 and parses as a SID string, the canonical string must
 //! re-parse to the same SID and differ from the input only in letter case
 //! (quoted ABNF literals and HEXDIG are case-insensitive, RFC 5234 §2.3).
+//! A decoded descriptor is also used as the parent of CreateSecurityDescriptor
+//! (container and leaf child): no panic, and any computed descriptor must
+//! encode and decode back to itself.
 //!
-//! Spec: [MS-DTYP] 2.4.2.1, 2.4.2.2, 2.4.4.1, 2.4.5, 2.4.6; RFC 5234 §2.3.
+//! Spec: [MS-DTYP] 2.4.2.1, 2.4.2.2, 2.4.4.1, 2.4.5, 2.4.6, 2.5.3.4.1;
+//! RFC 5234 §2.3.
 
 use libfuzzer_sys::fuzz_target;
 
@@ -22,6 +26,30 @@ fuzz_target!(|data: &[u8]| {
         let bytes = sd.encode().expect("a decoded descriptor must re-encode");
         let again = dtyp::SecurityDescriptor::decode(&bytes).expect("canonical output must decode");
         assert_eq!(again, sd, "decode(encode(v)) must equal v");
+        let token = dtyp::Token {
+            owner: dtyp::Sid::new(dtyp::SECURITY_NT_AUTHORITY, &[21, 1, 2, 3, 1000])
+                .expect("five sub-authorities"),
+            primary_group: dtyp::Sid::new(dtyp::SECURITY_NT_AUTHORITY, &[21, 1, 2, 3, 513])
+                .expect("five sub-authorities"),
+            default_dacl: None,
+        };
+        for container in [true, false] {
+            if let Ok(child) = dtyp::create_security_descriptor(
+                Some(&sd),
+                None,
+                container,
+                None,
+                dtyp::AutoInheritFlags::default(),
+                &token,
+                &dtyp::GenericMapping::ACTIVE_DIRECTORY,
+            ) {
+                let bytes = child.encode().expect("a computed descriptor must encode");
+                assert_eq!(
+                    dtyp::SecurityDescriptor::decode(&bytes).expect("and decode"),
+                    child
+                );
+            }
+        }
     }
     if let Ok(acl) = dtyp::Acl::decode(data) {
         let bytes = acl.encode().expect("a decoded ACL must re-encode");

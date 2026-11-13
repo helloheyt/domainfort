@@ -5,10 +5,14 @@
 //! it is fed to each decoder. Properties checked (fail closed, AGENTS.md §6):
 //! no decoder panics; whatever decodes re-encodes; re-encoding is a fixed
 //! point (`decode(encode(v)) == v`, `encode(decode(encode(v))) == encode(v)`).
-//! This complements, and does not replace, the cargo-fuzz target in
-//! `crates/dtyp/fuzz/`.
+//! The last test also runs CreateSecurityDescriptor ([MS-DTYP] 2.5.3.4.1) on
+//! every decodable substitution. This complements, and does not replace, the
+//! cargo-fuzz target in `crates/dtyp/fuzz/`.
 
-use dtyp::{Ace, Acl, SecurityDescriptor, Sid};
+use dtyp::{
+    create_security_descriptor, Ace, Acl, AutoInheritFlags, GenericMapping, Guid,
+    SecurityDescriptor, Sid, Token,
+};
 
 const EXAMPLE: [u8; 0xb0] = [
     0x01, 0x00, 0x14, 0xb0, 0x90, 0x00, 0x00, 0x00, 0xa0, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00,
@@ -104,5 +108,55 @@ fn every_sid_string_mutation_stays_consistent() {
             }
             chars[pos] = original;
         }
+    }
+}
+
+/// CreateSecurityDescriptor ([MS-DTYP] 2.5.3.4.1) on every descriptor that
+/// decodes from a single-byte substitution of the 2.5.1.4 example, used as the
+/// parent, for a container and a leaf child: never a panic; whatever it
+/// computes encodes and decodes back to the same value (strict codec), and
+/// carries the token's owner and group (Steps 1-2). Errors are allowed (fail
+/// closed).
+#[test]
+fn create_security_descriptor_on_every_decodable_substitution_of_the_example() {
+    let token = Token {
+        owner: Sid::parse_sid_string("S-1-5-21-1-2-3-1000").unwrap(),
+        primary_group: Sid::parse_sid_string("S-1-5-21-1-2-3-513").unwrap(),
+        default_dacl: None,
+    };
+    // An arbitrary class GUID label.
+    let class = [Guid {
+        data1: 1,
+        data2: 2,
+        data3: 3,
+        data4: [4; 8],
+    }];
+    let mut buf = EXAMPLE;
+    for pos in 0..buf.len() {
+        let original = buf[pos];
+        for value in 0..=255u8 {
+            buf[pos] = value;
+            let Ok(parent) = SecurityDescriptor::decode(&buf) else {
+                continue;
+            };
+            for container in [true, false] {
+                let Ok(child) = create_security_descriptor(
+                    Some(&parent),
+                    None,
+                    container,
+                    Some(&class),
+                    AutoInheritFlags::default(),
+                    &token,
+                    &GenericMapping::ACTIVE_DIRECTORY,
+                ) else {
+                    continue;
+                };
+                let bytes = child.encode().expect("a computed descriptor must encode");
+                assert_eq!(SecurityDescriptor::decode(&bytes).unwrap(), child);
+                assert_eq!(child.owner_sid, Some(token.owner));
+                assert_eq!(child.group_sid, Some(token.primary_group));
+            }
+        }
+        buf[pos] = original;
     }
 }

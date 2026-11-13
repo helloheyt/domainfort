@@ -165,6 +165,24 @@ pub enum Error {
     /// Bytes remained after a complete stand-alone SID, ACE or ACL.
     /// Strict framing (AGENTS.md §6).
     TrailingData,
+
+    // ---- CreateSecurityDescriptor ([MS-DTYP] 2.5.3.4) ----
+    /// A CreatorDescriptor was supplied. Only CreatorDescriptor = NULL is
+    /// built (project decision A-76, Q-294; Q-336). Spec: [MS-DTYP] 2.5.3.4.1.
+    CreatorDescriptorNotSupported,
+    /// DEFAULT_OWNER_FROM_PARENT was set but there is no parent descriptor or
+    /// it has no owner, so the new descriptor would have no owner (fail
+    /// closed; [MS-ADTS] 6.1.3 item 1). Spec: [MS-DTYP] 2.5.3.4.1 Step 1.
+    NewDescriptorOwnerAbsent,
+    /// DEFAULT_GROUP_FROM_PARENT was set but there is no parent descriptor or
+    /// it has no group (fail closed). Spec: [MS-DTYP] 2.5.3.4.1 Step 2.
+    NewDescriptorGroupAbsent,
+    /// The computed ACL would need an ACE this crate keeps as
+    /// `Ace::Unsupported` (an inheritable one in the parent ACL, or one in the
+    /// token's default DACL): PostProcessACL needs its Sid and Mask, which are
+    /// not interpreted. Project fail-closed rule. Spec: [MS-DTYP] 2.5.3.4.4,
+    /// 2.5.3.4.7.
+    UnsupportedAceInComputedAcl,
 }
 
 impl fmt::Display for Error {
@@ -214,6 +232,14 @@ impl fmt::Display for Error {
             Error::AceTypeNotValidInDacl => "ACE type not valid in a DACL",
             Error::AccessSystemSecurityInDacl => "ACCESS_SYSTEM_SECURITY set in a DACL ACE",
             Error::TrailingData => "unexpected trailing data",
+            Error::CreatorDescriptorNotSupported => {
+                "a creator security descriptor is not supported"
+            }
+            Error::NewDescriptorOwnerAbsent => "the new security descriptor would have no owner",
+            Error::NewDescriptorGroupAbsent => "the new security descriptor would have no group",
+            Error::UnsupportedAceInComputedAcl => {
+                "an uninterpreted ACE type would have to be inherited"
+            }
         };
         f.write_str(msg)
     }

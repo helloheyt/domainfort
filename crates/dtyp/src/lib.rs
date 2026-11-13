@@ -4,8 +4,9 @@
 //!
 //! # Scope
 //!
-//! Data types only (docs/11 §5 needs them; the access-check algorithm of
-//! [MS-DTYP] 2.5.3 is the next crate):
+//! The data types (docs/11 §5 needs them; the access-check algorithm of
+//! [MS-DTYP] 2.5.3.2 is in the crate `pdp`) and the inheritance of a new
+//! object's security descriptor (2.5.3.4, docs/51 §10):
 //!
 //! - [`Guid`] — packet representation ([MS-DTYP] 2.3.4.2).
 //! - [`Sid`] — packet representation and the "S-1-..." string form (decimal
@@ -22,10 +23,19 @@
 //!   and SACL / DACL type rules ([MS-DTYP] 2.4.5).
 //! - [`SecurityDescriptor`] — self-relative form with every offset and size
 //!   validated against the buffer ([MS-DTYP] 2.4.6).
+//! - [`create_security_descriptor()`] — the security descriptor of a new
+//!   object, inherited from its parent's: [MS-DTYP] 2.5.3.4.1-2.5.3.4.4 and
+//!   2.5.3.4.7 with CreatorDescriptor = NULL (project decision A-76), with
+//!   [`AutoInheritFlags`], [`GenericMapping`] (including the Active Directory
+//!   table of [MS-ADTS] 6.1.3) and [`Token`]. The spec-step mapping, decision
+//!   A-84 and the readings recorded in Q-335 / Q-336 are documented at the
+//!   top of `src/create_security_descriptor.rs`.
 //!
 //! Out of scope: SDDL (2.5.1), the curly-braced GUID string (2.3.4.3, defined
 //! via RFC 4122, not an allowed source), the RPC (IDL) representations, the
-//! absolute security descriptor form, and the access-check algorithm.
+//! absolute security descriptor form, the creator-descriptor branches of
+//! 2.5.3.4 (2.5.3.4.5, 2.5.3.4.6), and the access-check algorithm (crate
+//! `pdp`).
 //!
 //! # Byte order
 //!
@@ -60,11 +70,21 @@
 //! www.rfc-editor.org. No other implementation was consulted or recalled
 //! (AGENTS.md §1-3).
 //!
-//! Spec: [MS-DTYP] 2.3.4, 2.4.1-2.4.6; RFC 5234 §2.3, Appendix B.1.
+//! CreateSecurityDescriptor (task A2 of docs/51 §12) was added from the same
+//! pinned [MS-DTYP] PDF, opened in that session: 2.4.1 (CREATOR_SID_AUTHORITY),
+//! 2.4.2.4 (CREATOR_OWNER, CREATOR_GROUP), 2.4.3, 2.4.4.1, 2.4.4.2, 2.4.4.3,
+//! 2.4.5, 2.4.6, 2.5.1.4 (the worked example, used as a test parent), 2.5.2,
+//! 2.5.3.4, 2.5.3.4.1-2.5.3.4.7 and note <96>; and from [MS-ADTS] v20261026
+//! (protocol revision 70.0; pinned PDF, sha256 55b59eb1…b2b1): 5.1.3.2, 6.1.3,
+//! 6.1.3.1-6.1.3.8. No other implementation was consulted or recalled.
+//!
+//! Spec: [MS-DTYP] 2.3.4, 2.4.1-2.4.6, 2.5.3.4; RFC 5234 §2.3, Appendix B.1;
+//! [MS-ADTS] 6.1.3.
 
 mod access_mask;
 mod ace;
 mod acl;
+mod create_security_descriptor;
 mod error;
 mod guid;
 mod reader;
@@ -80,6 +100,9 @@ pub use ace::{
 pub use acl::{
     acl_revision_permits, is_valid_sacl_ace_type, Acl, ACL_HEADER_LEN, ACL_REVISION,
     ACL_REVISION_DS, MAX_ACL_SIZE,
+};
+pub use create_security_descriptor::{
+    create_security_descriptor, AutoInheritFlags, GenericMapping, Token,
 };
 pub use error::{Error, Result};
 pub use guid::{Guid, GUID_PACKET_LEN};
