@@ -32,7 +32,7 @@ use crate::audit_link::{self, AuditEndpoint, AuditLinkError};
 use crate::engine::{DirectoryEngine, EngineError, EnginePanicked, EngineThread};
 use crate::listener::{accept_loop, ServeContext};
 use crate::log::{note, Note};
-use crate::policy::DevelopmentPolicy;
+use crate::policy::{tier_map, DevelopmentPolicy};
 use core::fmt;
 use core::time::Duration;
 use directory_pip::{DirectoryContext, NamingContext};
@@ -331,7 +331,7 @@ pub async fn serve(
     let schema = ad_schema::phase1().map_err(|_| DaemonError::Schema)?;
     let ctx = DirectoryContext::new(schema, &params.keyd, params.naming_context.clone())
         .map_err(|_| DaemonError::Context)?;
-    let tiers = policy.tier_map().map_err(|_| DaemonError::Policy)?;
+    let tiers = tier_map(&policy).map_err(|_| DaemonError::Policy)?;
     let limits = ViewLimits {
         max_views: params.max_views,
         lifetime: params.view_lifetime,

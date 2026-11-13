@@ -1,7 +1,7 @@
-# cargo-fuzz harness for dird's policy-store parser (AGENTS.md §6: every
+# cargo-fuzz harness for the shared policy-store parser (AGENTS.md §6: every
 # parser gets a fuzz target before it merges to main; docs/50 §9 / R50-19
-# names `policy_store` "when defined (Q-219)" — here the UNSIGNED development
-# format, docs/questions/Q-270 item 2).
+# names `policy_store`; A-68 moved the parser here from dird — the UNSIGNED
+# development format 2).
 #
 # This is a SEPARATE workspace (note the empty [workspace] table below): it is
 # intentionally NOT a member of the root workspace, so `cargo build --all`,
@@ -15,7 +15,7 @@
 # not built or run until then.
 
 [package]
-name = "directory-daemon-fuzz"
+name = "policy-store-fuzz"
 version = "0.0.0"
 edition = "2021"
 publish = false
@@ -26,11 +26,12 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 
-[dependencies.directory-daemon]
+[dependencies.policy-store]
 path = ".."
 
 # An arbitrary file through `DevelopmentPolicy::decode` (bounded, strict),
-# with the canonical round-trip property (`cargo fuzz run policy_store`).
+# with the canonical round-trip property and the snapshot
+# (`cargo fuzz run policy_store`).
 [[bin]]
 name = "policy_store"
 path = "fuzz_targets/policy_store.rs"

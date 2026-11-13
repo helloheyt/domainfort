@@ -94,6 +94,7 @@ keyd_uid = 801
 dird_kdc_socket = /run/dird/kdc/dird-kdc.sock
 dird_uid = 802
 policy_store_path = /etc/domain/policy.store
+policy_store_format = unsigned-development
 audit_socket = /run/auditd/audit.sock
 auditd_uid = 805
 max_tcp_connections = 512
@@ -116,6 +117,7 @@ keyd_uid = 801
 dird_kdc_socket = /run/dird/kdc/dird-kdc.sock
 dird_uid = 802
 policy_store_path = /etc/domain/policy.store
+policy_store_format = unsigned-development
 audit_socket = /run/auditd/audit.sock
 auditd_uid = 805
 ";

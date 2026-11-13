@@ -37,7 +37,7 @@ pub use keyd::{eventually, my_uid, skip_as_root, FakeAuditd, TempDir, TestClock}
 
 use ad_schema::{flags::user_account_control as uac, phase1, Phase1Schema};
 use core::time::Duration;
-use directory_daemon::policy::DevelopmentPolicy;
+use directory_daemon::policy::{DevelopmentPolicy, MandatoryFast};
 use directory_daemon::{
     serve, AuditEndpoint, DaemonControl, DaemonParams, StoreSource, ENGINE_QUEUE_CAPACITY,
 };
@@ -332,12 +332,22 @@ impl Directory {
     }
 }
 
-/// The unsigned development policy of version `version`, no tier entry.
+/// The unsigned development policy of version `version`: no tier entry, no
+/// rule of its own, no anonymous grant; the mandatory-FAST entry names the
+/// computer account ws1$ itself as the bootstrap set (crates/pdp: the
+/// principal is a member of its own SID's set) with rule ids 100..=103
+/// (format 2 requires the entry, A-68; test data).
 pub fn policy(version: u64) -> DevelopmentPolicy {
     DevelopmentPolicy {
         version: PolicyVersion(version),
         principals: BTreeMap::new(),
         subtrees: Vec::new(),
+        mandatory_fast: MandatoryFast {
+            bootstrap_group: sid_of(WS1),
+            first_rule_id: pdp::RuleId(100),
+        },
+        rules: Vec::new(),
+        anonymous: Vec::new(),
     }
 }
 

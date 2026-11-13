@@ -57,7 +57,7 @@ const INTEGRITY_KEY_SOURCE: &str = "integrity_key_source";
 const INTEGRITY_KEY_PATH: &str = "integrity_key_path";
 /// Key: the format of the policy store file. Spec: docs/50 §7.2; Q-219
 /// (A-57); docs/questions/Q-270 item 2.
-const POLICY_STORE_FORMAT: &str = "policy_store_format";
+pub(crate) const POLICY_STORE_FORMAT: &str = "policy_store_format";
 
 /// Where dird's dirstore integrity key comes from.
 ///
@@ -95,7 +95,7 @@ pub enum PolicyStoreFormat {
 }
 
 /// The accepted spellings of [`PolicyStoreFormat`]. Spec: Q-270 item 2.
-const POLICY_STORE_FORMATS: &[(&str, PolicyStoreFormat)] = &[(
+pub(crate) const POLICY_STORE_FORMATS: &[(&str, PolicyStoreFormat)] = &[(
     "unsigned-development",
     PolicyStoreFormat::UnsignedDevelopment,
 )];

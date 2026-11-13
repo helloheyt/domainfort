@@ -12,7 +12,8 @@
 //!
 //! **Development sources only.** The integrity key comes from a root-only
 //! development file (Q-213's interim — the sealed source is owner item
-//! P-17), and the policy store is the UNSIGNED development format (the
+//! P-17), and the policy store is the UNSIGNED development format 2 of the
+//! shared crate `policy-store` — the same file the kdc loads (A-68; the
 //! signed format of Q-219 is not defined yet). Both must be named
 //! explicitly in the configuration, and dird prints a fixed WARNING for each
 //! at every start (docs/questions/Q-270 items 1-2). Not for deployment.
@@ -51,7 +52,7 @@
 //!
 //! | module | what |
 //! |---|---|
-//! | [`policy`] | the unsigned development policy file (format, decoder, encoder) |
+//! | [`policy`] | the shared unsigned development policy file (crates/policy-store, A-68) and its tier map |
 //! | [`audit_link`] | auditd verified first (R50-16) |
 //! | `engine` | the engine thread, its bounded queue, the view sweep |
 //! | `listener` | `dird-kdc.sock`: identity, quota, framing, deadlines |

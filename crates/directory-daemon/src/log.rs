@@ -58,11 +58,8 @@ impl Note {
                  item P-17): the dirstore integrity key was read from a development file, not \
                  from a sealed store. Not for deployment."
             }
-            Note::UnsignedDevelopmentPolicy => {
-                "WARNING: UNSIGNED DEVELOPMENT POLICY (docs/50 §7.2, Q-219): the policy store's \
-                 signature is NOT verified; its tier map is trusted as written. Not for \
-                 deployment."
-            }
+            // The same text the kdc prints for the same file (A-68).
+            Note::UnsignedDevelopmentPolicy => policy_store::UNSIGNED_DEVELOPMENT_WARNING,
             Note::Hardened => "process hardening applied and verified",
             Note::AuditVerified => "audit connection verified",
             Note::DirectoryOpen => "directory opened and domain verified; policy version",

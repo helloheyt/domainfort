@@ -148,6 +148,10 @@ fn kdc_sample_parses() {
     assert_eq!(s.dird().socket().as_str(), "/run/dird/kdc/dird-kdc.sock");
     assert_eq!(s.dird().uid(), 802);
     assert_eq!(s.policy_store_path().as_str(), "/etc/domain/policy.store");
+    assert_eq!(
+        s.policy_store_format(),
+        PolicyStoreFormat::UnsignedDevelopment
+    );
     assert_eq!(s.audit().uid(), 805);
     let l = s.limits();
     assert_eq!(l.max_tcp_connections(), 512);

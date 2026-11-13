@@ -601,6 +601,25 @@ fn dird_development_sources_are_fixed_names() {
     }
 }
 
+/// Spec: docs/50 §7.2 (kdc and dird load the same file); A-68;
+/// docs/questions/Q-270 item 2, Q-275 item 2: the kdc names the policy
+/// store's format explicitly too — only the unsigned development format,
+/// no other spelling, and never silently by default.
+#[test]
+fn kdc_policy_store_format_is_a_fixed_required_name() {
+    for value in ["signed", "Unsigned-Development", "unsigned", "none"] {
+        rejects_value(
+            Daemon::Kdc,
+            KDC,
+            "policy_store_format",
+            value,
+            ErrorKind::UnknownName,
+        );
+    }
+    let without = remove(KDC, "policy_store_format");
+    assert!(KdcSettings::parse(without.as_bytes()).is_err());
+}
+
 // ---- keyd's uid → Role map -------------------------------------------------------
 
 /// "uid 0 is never mapped". Spec: docs/50 R50-3, §3.2.

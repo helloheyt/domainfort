@@ -395,6 +395,20 @@ impl TimeWindow {
     pub fn contains(&self, t: Instant) -> bool {
         self.not_before <= t && t <= self.not_after
     }
+
+    /// The first instant of the window (for the policy store's encoder,
+    /// A-68; reading it changes no decision).
+    #[must_use]
+    pub fn not_before(&self) -> Instant {
+        self.not_before
+    }
+
+    /// The last instant of the window (for the policy store's encoder,
+    /// A-68).
+    #[must_use]
+    pub fn not_after(&self) -> Instant {
+        self.not_after
+    }
 }
 
 /// Context matcher. Spec: docs/11 §3 ("transport_sec floor, source zone, time

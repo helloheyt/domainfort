@@ -9,7 +9,7 @@
 
 use crate::audit_link::AuditEndpoint;
 use crate::daemon::{DaemonParams, ENGINE_QUEUE_CAPACITY, MAX_KDC_CONNECTIONS, MAX_OPEN_VIEWS};
-use crate::policy::{DevelopmentPolicy, PolicyError, MAX_POLICY_FILE};
+use crate::policy::{read_file, DevelopmentPolicy, LoadError, PolicyError};
 use config::{DirdSettings, IntegrityKeySource, PolicyStoreFormat};
 use core::fmt;
 use daemon_sandbox::{HardeningPlan, PlanError, ProcessIdentity};
@@ -203,27 +203,23 @@ pub fn read_integrity_key(path: &Path, owner: u32) -> Result<IntegrityKey, Start
     Ok(IntegrityKey::from_bytes(&key))
 }
 
-/// Read the development policy file: a regular file owned by `owner` (root
-/// in the daemon), not writable by group or others, at most
-/// [`MAX_POLICY_FILE`] octets, decoded by [`DevelopmentPolicy::decode`].
-/// Absent ⇒ refused (fail closed).
+/// Read the development policy file through the shared loader
+/// (`policy_store::read_file`, moved there unchanged, A-68): a regular file
+/// owned by `owner` (root in the daemon), not writable by group or others,
+/// at most `MAX_POLICY_FILE` octets, decoded by
+/// [`DevelopmentPolicy::decode`]. Absent ⇒ refused (fail closed).
 ///
 /// # Errors
 /// [`StartupError`].
 ///
 /// Spec: docs/50 §7.2 ("invalid … ⇒ do not start"); docs/questions/Q-219
-/// (A-57), Q-270 item 2.
+/// (A-57), Q-270 item 2; A-68.
 pub fn read_policy(path: &Path, owner: u32) -> Result<DevelopmentPolicy, StartupError> {
-    let file = File::open(path).map_err(|_| StartupError::PolicyUnreadable)?;
-    let metadata = file
-        .metadata()
-        .map_err(|_| StartupError::PolicyUnreadable)?;
-    if !metadata.is_file() || metadata.uid() != owner || metadata.mode() & 0o022 != 0 {
-        return Err(StartupError::PolicyPermissions);
-    }
-    let bound = MAX_POLICY_FILE as usize;
-    let contents = read_bounded(file, bound).map_err(|_| StartupError::PolicyUnreadable)?;
-    DevelopmentPolicy::decode(&contents).map_err(StartupError::Policy)
+    read_file(path, owner).map_err(|error| match error {
+        LoadError::Unreadable => StartupError::PolicyUnreadable,
+        LoadError::Permissions => StartupError::PolicyPermissions,
+        LoadError::Policy(error) => StartupError::Policy(error),
+    })
 }
 
 /// The privileged set-up (as root, before the drop): the directory of

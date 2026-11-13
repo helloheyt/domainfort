@@ -46,9 +46,11 @@ tokio = { version = "1.54.1", default-features = false, features = ["rt", "net",
 zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
 # Our own workspace crates (path dependencies).
 #
-# Framing (`FrameReader`), the shared `Refused`, the policy file's
-# primitives (A-57: "the same discipline as the IPC codec").
+# Framing (`FrameReader`), the shared `Refused`.
 ipc = { path = "../ipc" }
+# The shared policy file (A-68: moved here from this crate; the same file
+# the kdc loads, docs/50 §7.2).
+policy-store = { path = "../policy-store" }
 # The directory-view channel: `REQUEST_LIMIT`, the code tables.
 ipc-directory = { path = "../ipc-directory" }
 # The server side over the real directory (only this daemon depends on it).
@@ -66,10 +68,8 @@ ad-schema = { path = "../ad-schema" }
 keyd-types = { path = "../keyd-types" }
 # `Realm`.
 krb-proto = { path = "../krb-proto" }
-# `PolicyVersion`, `Tier`, `Dn`.
+# `PolicyVersion`.
 pdp = { path = "../pdp" }
-# SIDs of the policy file.
-dtyp = { path = "../dtyp" }
 # `DirdSettings`.
 config = { path = "../config" }
 # `HardeningPlan`, `SingleThreadProof`, `apply` (R50-14).
@@ -87,6 +87,9 @@ keyd = { path = "../keyd" }
 kdc = { path = "../kdc" }
 krb-crypto = { path = "../krb-crypto" }
 ipc-keyd = { path = "../ipc-keyd" }
+# SIDs, GUIDs and security descriptors of the test directories (the policy
+# file's SIDs moved to crates/policy-store with its decoder, A-68).
+dtyp = { path = "../dtyp" }
 
 # Tier 3 (docs/50 R50-19): the hardening drop runs in a fresh child process of
 # a binary with its own `main`, as crates/keyd-daemon does.

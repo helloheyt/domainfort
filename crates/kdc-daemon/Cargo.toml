@@ -1,0 +1,103 @@
+# kdc-daemon — the KDC process (docs/50 §10 task P9; decision A-58): the kdc
+# library behind UDP and TCP listeners on the configured internal interface
+# addresses (RFC 4120 §7.2.1, §7.2.2; docs/50 R50-9, §4.1), one engine thread
+# that owns the `Kdc` and is fed by two bounded queues (AS, TGS) chosen by the
+# first identifier octet only, keyd over `keyd.sock` (`ipc_keyd::IpcKeyd`,
+# R50-3, R50-8), the directory over `dird-kdc.sock` (a view pinned per
+# request, R50-2), the shared UNSIGNED development policy file
+# (crates/policy-store, A-68) whose version must equal dird's, per-source and
+# per-connection limits, hardening before any thread exists (R50-14), and the
+# audit channel with the A-57 gate (R50-17).
+#
+# Holds no key (docs/30 §1) and links no crypto (D182), no store (R50-2): see
+# tests/no_store_or_crypto.rs.
+#
+# Written only from this project's decided design (docs/50, docs/07 §1,
+# docs/questions Q-217, Q-218, Q-219, Q-222, Q-223, Q-230, Q-252, Q-260,
+# Q-265, Q-270 and PENDING-OWNER), RFC 4120 §5.4.1 and §7.2 (pinned copy),
+# ITU-T X.690 8.1.2 (pinned copy), the public API of the workspace crates
+# named below, and the docs.rs API pages of tokio 1.54.1 (API documentation
+# only, never source — PENDING-OWNER P-2). No other implementation, KDC,
+# daemon, server framework or RPC system was consulted or recalled
+# (AGENTS.md §1-3).
+
+[package]
+name = "kdc-daemon"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "kdc_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kdc-daemon"
+path = "src/main.rs"
+
+[dependencies]
+# tokio — owner decision P-12, the asynchronous runtime for the network
+# side. Linked, never copied; only its docs.rs API pages were read (P-2).
+# Version 1.54.1; license MIT (docs/50 §0.3) — on the AGENTS.md §7
+# allowlist. Features: the subset the other daemons use, from docs/50 §10
+# P0's list (never `macros` or `full`):
+#   rt      — `runtime::Builder::new_current_thread`, `spawn`, `JoinHandle`;
+#   net     — `net::UdpSocket`, `net::TcpListener`, `net::TcpStream`
+#             (`from_std`), `net::UnixStream` (the audit channel, `peer_cred`);
+#   time    — `time::timeout`, `time::sleep`;
+#   sync    — `sync::oneshot` (the engine's answer), `sync::Notify`;
+#   io-util — `AsyncReadExt::read`, `AsyncWriteExt::write_all`.
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "net", "time", "sync", "io-util"] }
+# Our own workspace crates (path dependencies).
+#
+# The KDC library: `Kdc::handle`, `reject_frame`, the TCP record framing
+# (`tcp_decode_frame`, `tcp_encode_frame`), `PolicyInputs`, `RateLimiter`,
+# `AuditSink`.
+kdc = { path = "../kdc" }
+# keyd's crypto-free types: `KeyCustody` and its errors (the gate wrapper).
+keyd-types = { path = "../keyd-types" }
+# The keyd channel's client (`IpcKeyd`, `KeydClient`, `UnixConnector`).
+ipc-keyd = { path = "../ipc-keyd" }
+# The directory channel's client (`DirectoryClient`, `RemoteView`,
+# `UnavailableDirectory`, `UnixConnector`).
+ipc-directory = { path = "../ipc-directory" }
+# The audit channel and the sender window (A-57), with the kdc event
+# conversion only (A-66: each daemon enables only its own).
+ipc-audit = { path = "../ipc-audit", default-features = false, features = ["kdc"] }
+# Framing of the audit channel's replies (`FrameReader`).
+ipc = { path = "../ipc" }
+# The shared policy file (A-68).
+policy-store = { path = "../policy-store" }
+# `PolicySnapshot`, `IpScope`, `RlKey`.
+pdp = { path = "../pdp" }
+# `KerberosTime`.
+krb-proto = { path = "../krb-proto" }
+# `KdcSettings`.
+config = { path = "../config" }
+# `HardeningPlan`, `SingleThreadProof`, `apply` (R50-14).
+daemon-sandbox = { path = "../daemon-sandbox" }
+
+[dev-dependencies]
+# TESTS ONLY. The flows run the real keyd daemon and the real dird
+# (crates/keyd-daemon and crates/directory-daemon tests/support, reused by
+# `#[path]`) and reuse the kdc integration fixtures (crates/kdc/tests/common,
+# the Kerberos client side with krb-crypto), as crates/directory-daemon
+# does. Every one is a workspace crate or already in the lock.
+keyd-daemon = { path = "../keyd-daemon" }
+directory-daemon = { path = "../directory-daemon" }
+keyd = { path = "../keyd" }
+krb-crypto = { path = "../krb-crypto" }
+dirstore = { path = "../dirstore" }
+directory-pip = { path = "../directory-pip" }
+ad-schema = { path = "../ad-schema" }
+dtyp = { path = "../dtyp" }
+zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
+
+# Tier 3 (docs/50 R50-19): the hardening drop runs in a fresh child process of
+# a binary with its own `main`, as the other daemons do.
+[[test]]
+name = "root_hardening"
+harness = false
+
+[lints]
+workspace = true

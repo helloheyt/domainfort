@@ -9,11 +9,18 @@
 //!
 //! **No secrets** — the kdc holds none (docs/50 §2.4; docs/30 §1).
 //!
+//! The policy store is the file dird loads too (docs/50 §7.2): its signed
+//! format (Q-219 → A-57) does not exist yet, so — as in dird's file — the
+//! operator must name the UNSIGNED development format explicitly,
+//! `policy_store_format = unsigned-development`, the only accepted value
+//! (A-68; docs/questions/Q-270 item 2, Q-275 item 2).
+//!
 //! Spec: docs/50 R50-9, R50-15, §2.4, §3.6, §4.1, §7.1, §7.2, §7.5.
 
 use core::net::SocketAddr;
 use core::time::Duration;
 
+use crate::dird::{PolicyStoreFormat, POLICY_STORE_FORMAT, POLICY_STORE_FORMATS};
 use crate::error::{Error, ErrorKind};
 use crate::format::{Document, Located};
 use crate::limits::{Bound, KEYD_DEADLINE_SECS};
@@ -141,6 +148,7 @@ pub struct KdcSettings {
     keyd: Endpoint,
     dird: Endpoint,
     policy_store_path: AbsolutePath,
+    policy_store_format: PolicyStoreFormat,
     audit: Endpoint,
     limits: KdcLimits,
 }
@@ -172,6 +180,7 @@ impl KdcSettings {
         DIRD_KDC_SOCKET,
         DIRD_UID,
         POLICY_STORE_PATH,
+        POLICY_STORE_FORMAT,
         AUDIT_SOCKET,
         AUDITD_UID,
         MAX_TCP_CONNECTIONS,
@@ -186,7 +195,8 @@ impl KdcSettings {
 
     /// Parses and validates kdc's file. Required: `run_as_uid`,
     /// `run_as_gid`, `listen`, `keyd_socket` + `keyd_uid`, `dird_kdc_socket` +
-    /// `dird_uid`, `policy_store_path`, `audit_socket`, `auditd_uid`.
+    /// `dird_uid`, `policy_store_path`, `policy_store_format` (only
+    /// `unsigned-development`, A-68), `audit_socket`, `auditd_uid`.
     /// Optional: `internal_networks` (absent ⇒ every source is `External`) and
     /// the limits (docs/50 value as default and ceiling).
     ///
@@ -207,6 +217,11 @@ impl KdcSettings {
         let keyd = schema::endpoint(&doc, &mut all, KEYD_SOCKET, KEYD_UID)?;
         let dird = schema::endpoint(&doc, &mut all, DIRD_KDC_SOCKET, DIRD_UID)?;
         let policy_store_path = schema::path(&doc, &mut all, POLICY_STORE_PATH)?;
+        let policy_store_format = doc
+            .required(POLICY_STORE_FORMAT, |text| {
+                value::named(text, POLICY_STORE_FORMATS)
+            })?
+            .value;
         let audit = schema::endpoint(&doc, &mut all, AUDIT_SOCKET, AUDITD_UID)?;
         let global = schema::limit(&doc, MAX_TCP_CONNECTIONS, MAX_TCP_CONNECTIONS_BOUND)?;
         let per_source = schema::limit(
@@ -241,6 +256,7 @@ impl KdcSettings {
             keyd,
             dird,
             policy_store_path,
+            policy_store_format,
             audit,
             limits,
         })
@@ -282,6 +298,14 @@ impl KdcSettings {
     #[must_use]
     pub fn policy_store_path(&self) -> &AbsolutePath {
         &self.policy_store_path
+    }
+
+    /// The format of the policy store: only the unsigned development format
+    /// exists (Q-219 → A-57 not defined yet). Spec: docs/50 §7.2; A-68;
+    /// docs/questions/Q-270 item 2.
+    #[must_use]
+    pub const fn policy_store_format(&self) -> PolicyStoreFormat {
+        self.policy_store_format
     }
 
     /// auditd's socket and uid. Spec: docs/50 §2.4, R50-17.
