@@ -3,15 +3,20 @@
 # attr-stamps (docs/29 §2), tombstones with explicit purge (docs/29 §5, D121),
 # schema as data with write validation (docs/32 §4) and NO secret attributes
 # (D44), atomic write transactions (D136), point-in-time snapshots (D39) and an
-# HMAC-SHA-256 at-rest integrity tag on every stored record (D135).
+# HMAC-SHA-256 at-rest integrity tag on every stored record (D135); class
+# chains, computed RDN keys, Derived attributes, value ranges / constraints, a
+# reverse-link index with referential integrity and unique indexes (docs/46
+# §8).
 #
-# Out of scope here: DN string parsing / matching rules (the LDAP layer owns
-# them), the visibility index (needs the PDP), replication, the AD schema
-# content ([MS-ADSC]/[MS-ADA*] not yet pinned).
+# Out of scope here: DN string parsing (the LDAP layer owns it), the
+# visibility index (needs the PDP), replication, the AD schema content (the
+# separate `ad-schema` crate, docs/46 R46-1).
 #
 # Written only from this project's design documents (docs/32, docs/29 §2/§5,
-# docs/12 D44, docs/25 §5, docs/10 D34, docs/11 §6) and the public API docs of
-# the linked dependencies on docs.rs (PENDING-OWNER P-2) — AGENTS.md §1-3.
+# docs/46, docs/12 D44, docs/25 §5, docs/10 D34, docs/11 §6, Q-080), the
+# pinned [MS-ADTS] / [MS-DRSR] sections cited in the source, and the public API
+# docs of the linked dependencies on docs.rs (PENDING-OWNER P-2) — AGENTS.md
+# §1-3.
 
 [package]
 name = "dirstore"

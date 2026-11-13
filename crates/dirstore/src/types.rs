@@ -9,14 +9,18 @@ use dtyp::Guid;
 
 /// Identifier of an attribute definition in the [`crate::Schema`].
 ///
-/// Opaque number: the mapping to directory attribute names / OIDs belongs to
-/// the (not yet pinned) AD schema content, not to this crate.
-/// Spec: docs/32 §4 (schema as data); docs/11 §6 (`AttrId`).
+/// Opaque number to this crate: the mapping to directory attribute names /
+/// OIDs belongs to the AD schema content (`ad-schema`, docs/46 R46-1), which
+/// uses the ATTRTYP of [MS-DRSR] 5.16.4 (docs/46 §3.3, R46-3). Every value,
+/// **including 0**, is a valid id — `AttrId(0)` is objectClass there — and
+/// this crate never uses any value as a sentinel. Spec: docs/32 §4 (schema as
+/// data); docs/11 §6 (`AttrId`); docs/46 §8.6.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AttrId(pub u32);
 
-/// Identifier of a class definition in the [`crate::Schema`].
-/// Spec: docs/32 §4 (classes as schema data).
+/// Identifier of a class definition in the [`crate::Schema`]. Like
+/// [`AttrId`], every value including 0 is valid; none is a sentinel.
+/// Spec: docs/32 §4 (classes as schema data); docs/46 §3.3, §8.6.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ClassId(pub u32);
 
@@ -121,11 +125,18 @@ pub struct Object {
     /// GUID of the parent object; `None` for a naming-context root (and in a
     /// tombstone). Spec: docs/32 §2 (DIT).
     pub parent: Option<Guid>,
-    /// Opaque, caller-normalized RDN key, unique among the live children of
-    /// `parent` (empty in a tombstone). Spec: docs/32 §2 (name as secondary
-    /// index).
+    /// RDN key, unique among the live children of `parent` (empty in a
+    /// tombstone). **Computed by this crate** from the single value of the
+    /// RDN attribute of the most specific class (ASCII, A–Z folded — Q-080
+    /// interim), stored for the name-index cross-check and re-checked against
+    /// the value on every read. Spec: docs/32 §2 (name as secondary index);
+    /// docs/46 §8.3 item 3; docs/14 D60.
     pub rdn: Vec<u8>,
-    /// Object classes, ascending, no duplicates. Spec: docs/32 §4.
+    /// Object classes, ascending, no duplicates: the full superclass chain of
+    /// the most specific class (docs/46 §8.3 item 1). The ascending order is
+    /// the codec's canonical order, not the objectClass order of
+    /// [MS-ADTS] 3.1.1.2.4.3 (top first, most specific last), which the layer
+    /// above derives from the schema. Spec: docs/32 §4; docs/46 §5.4.
     pub classes: Vec<ClassId>,
     /// Attributes, ascending by id, no duplicates (empty in a tombstone).
     /// Spec: docs/32 §2, §4.
@@ -169,19 +180,22 @@ impl Object {
 }
 
 /// A new object to create. Values are raw bytes; the engine sorts them,
-/// rejects duplicates and stamps each with `version` 1.
-/// Spec: docs/32 §2, §4; docs/29 §2.
+/// rejects duplicates and stamps each with `version` 1. There is no RDN key
+/// field: the engine computes it from the value of the RDN attribute of the
+/// most specific class (docs/46 §8.3 item 3).
+/// Spec: docs/32 §2, §4; docs/29 §2; docs/46 §8.3.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewObject {
-    /// Stable object GUID, chosen by the caller. Creation is refused while any
-    /// record — live or tombstone — holds this GUID. Spec: docs/32 §2 (the
-    /// GUID is the stable key), docs/29 §5 (a tombstone still holds it).
+    /// Stable object GUID, chosen by the caller; never the NULL GUID
+    /// ([MS-ADTS] 3.1.1.1.3). Creation is refused while any record — live or
+    /// tombstone — holds this GUID. Spec: docs/32 §2 (the GUID is the stable
+    /// key), docs/29 §5 (a tombstone still holds it).
     pub guid: Guid,
-    /// Parent GUID, or `None` for a naming-context root. Spec: docs/32 §2.
+    /// Parent GUID, or `None` for a naming-context root. Spec: docs/32 §2;
+    /// docs/46 §8.3 item 2.
     pub parent: Option<Guid>,
-    /// Opaque, already-normalized RDN key. Spec: docs/32 §2.
-    pub rdn: Vec<u8>,
-    /// Object classes (any order, no duplicates). Spec: docs/32 §4.
+    /// Object classes (any order, no duplicates): the full superclass chain
+    /// of exactly one instantiable class. Spec: docs/32 §4; docs/46 §8.3.
     pub classes: Vec<ClassId>,
     /// Attributes with their values (any order, no duplicate ids).
     pub attributes: Vec<(AttrId, Vec<Vec<u8>>)>,

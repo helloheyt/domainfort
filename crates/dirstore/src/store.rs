@@ -8,6 +8,8 @@
 //! | `dirstore.objects` | 16-byte GUID packet | object body + tag |
 //! | `dirstore.name_index` | [`record::name_index_key`] | name-index body + tag |
 //! | `dirstore.child_count` | 16-byte parent GUID packet | count body + tag |
+//! | `dirstore.back_links` | [`record::back_link_key`] | reverse-link body + tag |
+//! | `dirstore.unique_index` | [`record::unique_index_key`] | unique-index body + tag |
 //!
 //! Bodies are defined in [`record`]; tags in the integrity module (D135).
 //!
@@ -21,27 +23,39 @@
 //! transaction: it can then only be aborted (commit refuses and aborts), so a
 //! half-applied operation can never be committed. Spec: docs/32 §7, D136.
 //!
-//! Spec: docs/32 §2 (D134), §3 (D135), §6 (D39), §7 (D136); docs/29 §5 (D121).
+//! # Cross-checks
+//!
+//! Every index entry is authenticated (tag) and then checked against the
+//! object it names before it is believed: a name entry must name a live
+//! object with that parent and RDN key; a reverse-link entry
+//! `(target, back id, source)` must name a live `source` that holds `target`
+//! in the forward link `back id − 1`; a unique entry must name a live object
+//! that holds a value with that comparison key. Anything else is
+//! [`Error::Inconsistent`] — a replayed or stale record (docs/32 §3; Q-060).
+//!
+//! Spec: docs/32 §2 (D134), §3 (D135), §6 (D39), §7 (D136); docs/29 §5
+//! (D121); docs/46 §8.3-§8.5.
 
+use crate::comparison;
 use crate::error::{Error, RecordKind, Result, Violation};
 use crate::integrity::{self, IntegrityKey};
 use crate::record;
-use crate::schema::Schema;
+use crate::schema::{AttributeDefinition, Link, Schema};
 use crate::types::{
-    AttrId, Attribute, AttributeChange, NewObject, Object, Origin, StampedValue, Timestamp,
-    Tombstone,
+    AttrId, Attribute, AttributeChange, ClassId, NewObject, Object, Origin, StampedValue,
+    Timestamp, Tombstone,
 };
 use crate::{
     MAX_ATTRIBUTES_PER_OBJECT, MAX_CLASSES_PER_OBJECT, MAX_RDN_KEY_LEN, MAX_RECORD_BODY_LEN,
     MAX_VALUES_PER_ATTRIBUTE, MAX_VALUE_LEN,
 };
 use core::num::NonZeroU64;
-use dtyp::Guid;
+use dtyp::{Guid, GUID_PACKET_LEN};
 use redb::{
     Database, ReadTransaction, ReadableDatabase, ReadableTable, ReadableTableMetadata,
     TableDefinition, WriteTransaction,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Raw byte keys and values: the codec and the tag are ours, the KV engine
@@ -58,6 +72,14 @@ const NAME_INDEX_TABLE: TableDefinition<'static, Raw, Raw> =
 /// Live-child count per parent GUID. Spec: docs/32 §2 (DIT shape).
 const CHILD_COUNT_TABLE: TableDefinition<'static, Raw, Raw> =
     TableDefinition::new("dirstore.child_count");
+/// `(target, back link id, source)` for every forward-link value.
+/// Spec: docs/46 §8.4.
+const BACK_LINK_TABLE: TableDefinition<'static, Raw, Raw> =
+    TableDefinition::new("dirstore.back_links");
+/// `(attribute, comparison key) -> GUID` for every value of a unique
+/// attribute. Spec: docs/46 §8.5.
+const UNIQUE_INDEX_TABLE: TableDefinition<'static, Raw, Raw> =
+    TableDefinition::new("dirstore.unique_index");
 /// The single key of the meta table.
 const META_KEY: &[u8] = b"store";
 
@@ -67,6 +89,8 @@ enum TableId {
     Objects,
     NameIndex,
     ChildCount,
+    BackLinks,
+    UniqueIndex,
 }
 
 /// One planned insert (`value: Some`) or removal (`value: None`).
@@ -142,6 +166,8 @@ fn init_tables(txn: &WriteTransaction, key: &IntegrityKey) -> Result<()> {
     let objects = txn.open_table(OBJECT_TABLE)?;
     let names = txn.open_table(NAME_INDEX_TABLE)?;
     let counts = txn.open_table(CHILD_COUNT_TABLE)?;
+    let links = txn.open_table(BACK_LINK_TABLE)?;
+    let uniques = txn.open_table(UNIQUE_INDEX_TABLE)?;
     match raw_get(&meta, META_KEY)? {
         Some(stored) => {
             let body = integrity::open(key, RecordKind::Meta, META_KEY, &stored)?;
@@ -151,7 +177,12 @@ fn init_tables(txn: &WriteTransaction, key: &IntegrityKey) -> Result<()> {
         None => {
             // A database with records but no meta record has been edited
             // beneath us; never silently adopt it under a new key.
-            if !objects.is_empty()? || !names.is_empty()? || !counts.is_empty()? {
+            if !objects.is_empty()?
+                || !names.is_empty()?
+                || !counts.is_empty()?
+                || !links.is_empty()?
+                || !uniques.is_empty()?
+            {
                 return Err(Error::Tamper(RecordKind::Meta));
             }
             let sealed =
@@ -189,20 +220,47 @@ impl Snapshot<'_> {
         get_tombstone(&objects, self.store, guid)
     }
 
-    /// The GUID of the live child of `parent` (or the root, for `None`) named
-    /// by the opaque `rdn` key. The index entry is authenticated and
-    /// cross-checked against the object it names. Spec: docs/32 §2.
-    pub fn lookup_child(&self, parent: Option<Guid>, rdn: &[u8]) -> Result<Option<Guid>> {
+    /// The GUID of the live child of `parent` (or the root, for `None`) whose
+    /// RDN value is `rdn_value`. The RDN key is computed from the value by the
+    /// same rule as on create (printable ASCII, A–Z folded — Q-080 interim),
+    /// so `"Alice"` finds the child named `"alice"`. The index entry is
+    /// authenticated and cross-checked against the object it names.
+    /// Spec: docs/32 §2; docs/46 §8.3 item 3.
+    pub fn lookup_child(&self, parent: Option<Guid>, rdn_value: &[u8]) -> Result<Option<Guid>> {
         let names = self.txn.open_table(NAME_INDEX_TABLE)?;
         let objects = self.txn.open_table(OBJECT_TABLE)?;
-        resolve_name(&names, &objects, &self.store.key, parent, rdn)
+        lookup_child(&names, &objects, &self.store.key, parent, rdn_value)
+    }
+
+    /// The sources of the back link `back_attr` on the live object `target`:
+    /// every live object that holds `target` in the corresponding forward
+    /// link (e.g. the groups an object is a member of), ascending by GUID
+    /// packet. Each reverse-link entry is authenticated and cross-checked
+    /// against its source. Refused if `back_attr` is not a Back link
+    /// ([`Violation::NotBackLink`]); [`Error::NoSuchObject`] if `target` is
+    /// not live. Spec: docs/46 §2.3 item 3, §8.4; [MS-ADTS] 3.1.1.1.6.
+    pub fn back_links(&self, target: Guid, back_attr: AttrId) -> Result<Vec<Guid>> {
+        let links = self.txn.open_table(BACK_LINK_TABLE)?;
+        let objects = self.txn.open_table(OBJECT_TABLE)?;
+        back_links_of(&links, &objects, self.store, target, back_attr)
+    }
+
+    /// The live object that holds `value` (compared by its comparison key)
+    /// in the `unique` attribute `attr` — e.g. resolving a SID to a GUID
+    /// (docs/46 §2.3 item 1, §8.5). The entry is authenticated and
+    /// cross-checked against the object it names.
+    /// Spec: docs/46 §8.5.
+    pub fn lookup_unique(&self, attr: AttrId, value: &[u8]) -> Result<Option<Guid>> {
+        let uniques = self.txn.open_table(UNIQUE_INDEX_TABLE)?;
+        let objects = self.txn.open_table(OBJECT_TABLE)?;
+        lookup_unique(&uniques, &objects, self.store, attr, value)
     }
 }
 
 /// A write transaction. Every change made through it — values, stamps, name
-/// index, child counts and integrity tags — commits together or not at all;
-/// dropping it without [`WriteTxn::commit`] aborts it.
-/// Spec: docs/32 §7, D136.
+/// index, child counts, reverse links, unique entries and integrity tags —
+/// commits together or not at all; dropping it without [`WriteTxn::commit`]
+/// aborts it. Spec: docs/32 §7, D136.
 pub struct WriteTxn<'s> {
     store: &'s Store,
     /// `None` only after commit / abort, which consume `self`.
@@ -234,13 +292,18 @@ impl WriteTxn<'_> {
 
     /// Create an object.
     ///
-    /// Refused (nothing written) if the request breaks the schema or a bound
-    /// ([`Error::Rejected`] — including any Secret attribute, D44), if a
-    /// record already holds the GUID ([`Error::ObjectExists`]), if the parent
-    /// is not a live object ([`Error::NoSuchParent`]), or if a live child of
-    /// the parent already has the RDN key ([`Error::NameExists`]). Every value
-    /// is stamped `version` 1 with `origin`.
-    /// Spec: docs/32 §2, §4, §7; docs/29 §2; docs/12 D44.
+    /// The RDN key is computed from the RDN attribute of the most specific
+    /// class. Refused (nothing written) if the request breaks the schema or a
+    /// bound ([`Error::Rejected`] — including any Secret or Derived
+    /// attribute, a broken class chain, a parent class that is not a possible
+    /// superior, or an RDN value that breaks the naming rules), if a record
+    /// already holds the GUID ([`Error::ObjectExists`]), if the parent is not
+    /// a live object ([`Error::NoSuchParent`]), if a live child of the parent
+    /// already has the RDN key ([`Error::NameExists`]), if an ObjectRef value
+    /// names no live object ([`Error::NoSuchTarget`]), or if a unique value is
+    /// already held by another object ([`Error::ValueNotUnique`]). Every
+    /// value is stamped `version` 1 with `origin`.
+    /// Spec: docs/32 §2, §4, §7; docs/29 §2; docs/12 D44; docs/46 §8.2-§8.5.
     pub fn create_object(&mut self, new: NewObject, origin: &Origin) -> Result<()> {
         let writes = plan_create(self.txn()?, self.store, new, origin)?;
         self.apply(writes)
@@ -248,9 +311,13 @@ impl WriteTxn<'_> {
 
     /// Apply attribute changes to a live object (see
     /// [`AttributeChange::Replace`] for stamping). The resulting object is
-    /// validated as a whole. Naming a Secret attribute in any change — even to
-    /// remove it — is refused. A change that leaves every value as it was
-    /// writes nothing. Spec: docs/32 §4, §7; docs/29 §2; docs/12 D44.
+    /// validated as a whole. Naming a Secret or Derived attribute in any
+    /// change — even to remove it — is refused, as is naming the object's
+    /// RDN attribute (renaming is a separate operation). Reverse-link and
+    /// unique entries follow the change in the same transaction. A change
+    /// that leaves every value as it was writes nothing.
+    /// Spec: docs/32 §4, §7; docs/29 §2; docs/12 D44; docs/46 §8.2-§8.5;
+    /// [MS-ADTS] 3.1.1.5.3.2.
     pub fn modify_object(
         &mut self,
         guid: Guid,
@@ -264,8 +331,27 @@ impl WriteTxn<'_> {
     /// Delete a live object by replacing its record with a tombstone that
     /// keeps only its GUID, its classes and a deletion stamp (`version` 1,
     /// `origin`). The parent, the RDN key and every attribute value with its
-    /// stamp are dropped; its name is released; it disappears from normal
-    /// reads. Refused while it has live children ([`Error::HasChildren`]).
+    /// stamp are dropped; its name and unique values are released; its own
+    /// reverse-link entries go; it disappears from normal reads. Refused
+    /// while it has live children ([`Error::HasChildren`]).
+    ///
+    /// **Referential integrity** (docs/46 §2.3 item 4, §8.4; [MS-ADTS]
+    /// 3.1.1.1.6: "When an object o is … transformed into a tombstone …, any
+    /// forward link reference to o is removed"): in the same transaction, the
+    /// deleted object's GUID is removed from every forward-link attribute of
+    /// every live object that references it, with those reverse-link entries.
+    /// Values left behind keep their stamps; a removal leaves no stamp (as
+    /// for any value removal, A-20).
+    ///
+    /// Residual — cost: deleting an object referenced from N objects (e.g. a
+    /// member of N groups) reads and rewrites N object records, and N is
+    /// bounded only by the store's contents. Deletion is a privileged
+    /// operation (the PDP gates it); treat it as expensive (docs/46 §8.4).
+    ///
+    /// Residual — a reverse-link entry removed beneath the engine is not
+    /// noticed here: its referrer keeps a reference to the tombstone. Stale
+    /// entries are caught (cross-check); removed ones need the store root of
+    /// P-7 (Q-060; Q-091 item 11).
     ///
     /// Residual — no physical erasure guarantee: redb stores data in
     /// copy-on-write B-trees (redb crate docs), so the bytes of the replaced
@@ -274,7 +360,7 @@ impl WriteTxn<'_> {
     /// reachable record, not from the disk. Q-062.
     ///
     /// Spec: docs/29 §5 (D121); docs/32 §2; docs/25 §5 ("state"); Q-062 /
-    /// A-18.
+    /// A-18; docs/46 §8.4-§8.5.
     pub fn delete_object(&mut self, guid: Guid, origin: &Origin) -> Result<()> {
         let writes = plan_delete(self.txn()?, self.store, guid, origin)?;
         self.apply(writes)
@@ -283,10 +369,12 @@ impl WriteTxn<'_> {
     /// Physically remove every tombstone older than `lifetime`, i.e. whose
     /// tombstone time `t` (its deletion stamp's wall-clock) satisfies
     /// `t + lifetime < now`. A sum that overflows is treated as "not yet
-    /// expired" (keep). Every record is authenticated first; any tampered
-    /// record aborts the purge with nothing removed. Returns the number of
+    /// expired" (keep). Every object record is authenticated first, and no
+    /// reverse-link entry may still target an expiring tombstone (any such
+    /// entry is authenticated, then reported as [`Error::Inconsistent`]); any
+    /// failure aborts the purge with nothing removed. Returns the number of
     /// tombstones removed. Spec: docs/29 §5 (D121: tombstones are kept for a
-    /// lifetime, then collected).
+    /// lifetime, then collected); docs/46 §8.4.
     pub fn purge_tombstones(&mut self, now: Timestamp, lifetime: u64) -> Result<usize> {
         let writes = plan_purge(self.txn()?, self.store, now, lifetime)?;
         let count = writes.len();
@@ -307,11 +395,27 @@ impl WriteTxn<'_> {
     }
 
     /// [`Snapshot::lookup_child`], seeing this transaction's own writes.
-    pub fn lookup_child(&self, parent: Option<Guid>, rdn: &[u8]) -> Result<Option<Guid>> {
+    pub fn lookup_child(&self, parent: Option<Guid>, rdn_value: &[u8]) -> Result<Option<Guid>> {
         let txn = self.txn()?;
         let names = txn.open_table(NAME_INDEX_TABLE)?;
         let objects = txn.open_table(OBJECT_TABLE)?;
-        resolve_name(&names, &objects, &self.store.key, parent, rdn)
+        lookup_child(&names, &objects, &self.store.key, parent, rdn_value)
+    }
+
+    /// [`Snapshot::back_links`], seeing this transaction's own writes.
+    pub fn back_links(&self, target: Guid, back_attr: AttrId) -> Result<Vec<Guid>> {
+        let txn = self.txn()?;
+        let links = txn.open_table(BACK_LINK_TABLE)?;
+        let objects = txn.open_table(OBJECT_TABLE)?;
+        back_links_of(&links, &objects, self.store, target, back_attr)
+    }
+
+    /// [`Snapshot::lookup_unique`], seeing this transaction's own writes.
+    pub fn lookup_unique(&self, attr: AttrId, value: &[u8]) -> Result<Option<Guid>> {
+        let txn = self.txn()?;
+        let uniques = txn.open_table(UNIQUE_INDEX_TABLE)?;
+        let objects = txn.open_table(OBJECT_TABLE)?;
+        lookup_unique(&uniques, &objects, self.store, attr, value)
     }
 
     /// Commit every write of this transaction atomically. A poisoned
@@ -372,6 +476,15 @@ fn load_object<T: ReadableTable<Raw, Raw>>(
         .map_err(|e| Error::RecordMalformed(RecordKind::Object, e))
 }
 
+/// Load a live object record (tombstones and absent records are `None`).
+fn load_live<T: ReadableTable<Raw, Raw>>(
+    objects: &T,
+    key: &IntegrityKey,
+    guid: Guid,
+) -> Result<Option<Object>> {
+    Ok(load_object(objects, key, guid)?.filter(|o| !o.is_tombstone()))
+}
+
 /// Load a name-index entry: the GUID it names. Spec: docs/32 §2, §3.
 fn load_name<T: ReadableTable<Raw, Raw>>(
     names: &T,
@@ -404,6 +517,65 @@ fn load_child_count<T: ReadableTable<Raw, Raw>>(
         .map_err(|e| Error::RecordMalformed(RecordKind::ChildCount, e))
 }
 
+/// `true` if an authentic reverse-link entry exists under `record_key`.
+/// Spec: docs/46 §8.4; docs/32 §3.
+fn load_back_link<T: ReadableTable<Raw, Raw>>(
+    links: &T,
+    key: &IntegrityKey,
+    record_key: &[u8],
+) -> Result<bool> {
+    let Some(stored) = raw_get(links, record_key)? else {
+        return Ok(false);
+    };
+    let body = integrity::open(key, RecordKind::BackLink, record_key, &stored)?;
+    record::decode_back_link_body(body)
+        .map_err(|e| Error::RecordMalformed(RecordKind::BackLink, e))?;
+    Ok(true)
+}
+
+/// Load a unique-index entry: the GUID it names. Spec: docs/46 §8.5;
+/// docs/32 §3.
+fn load_unique<T: ReadableTable<Raw, Raw>>(
+    uniques: &T,
+    key: &IntegrityKey,
+    record_key: &[u8],
+) -> Result<Option<Guid>> {
+    let Some(stored) = raw_get(uniques, record_key)? else {
+        return Ok(None);
+    };
+    let body = integrity::open(key, RecordKind::UniqueIndex, record_key, &stored)?;
+    record::decode_unique_index_body(body)
+        .map(Some)
+        .map_err(|e| Error::RecordMalformed(RecordKind::UniqueIndex, e))
+}
+
+/// Every authentic reverse-link entry whose key starts with `prefix`, as
+/// `(target, back link id, source)`, in key order. Each entry is
+/// authenticated before its key is parsed; one bad entry fails the scan.
+/// Spec: docs/46 §8.4 (prefix scan); docs/32 §3.
+fn scan_back_links<T: ReadableTable<Raw, Raw>>(
+    links: &T,
+    key: &IntegrityKey,
+    prefix: &[u8],
+) -> Result<Vec<(Guid, u32, Guid)>> {
+    let mut out = Vec::new();
+    for entry in links.range::<&[u8]>(prefix..)? {
+        let (k, v) = entry?;
+        let record_key = k.value();
+        if !record_key.starts_with(prefix) {
+            break;
+        }
+        let body = integrity::open(key, RecordKind::BackLink, record_key, v.value())?;
+        record::decode_back_link_body(body)
+            .map_err(|e| Error::RecordMalformed(RecordKind::BackLink, e))?;
+        out.push(
+            record::decode_back_link_key(record_key)
+                .map_err(|e| Error::RecordMalformed(RecordKind::BackLink, e))?,
+        );
+    }
+    Ok(out)
+}
+
 /// RDN key bounds. Spec: docs/32 §2, §8.
 fn check_rdn(rdn: &[u8]) -> core::result::Result<(), Violation> {
     if rdn.is_empty() {
@@ -415,7 +587,7 @@ fn check_rdn(rdn: &[u8]) -> core::result::Result<(), Violation> {
     Ok(())
 }
 
-/// Resolve `(parent, rdn)` to a live object. The entry must name a live
+/// Resolve `(parent, rdn key)` to a live object. The entry must name a live
 /// object whose own (tagged) record carries the same parent and RDN key;
 /// anything else is [`Error::Inconsistent`] — e.g. a replayed index entry of
 /// a deleted object. Spec: docs/32 §2, §3.
@@ -439,6 +611,154 @@ fn resolve_name<N: ReadableTable<Raw, Raw>, O: ReadableTable<Raw, Raw>>(
     }
 }
 
+/// Look a child up by its RDN value: compute the key, then resolve it.
+/// Spec: docs/32 §2; docs/46 §8.3 item 3; Q-080.
+fn lookup_child<N: ReadableTable<Raw, Raw>, O: ReadableTable<Raw, Raw>>(
+    names: &N,
+    objects: &O,
+    key: &IntegrityKey,
+    parent: Option<Guid>,
+    rdn_value: &[u8],
+) -> Result<Option<Guid>> {
+    let rdn = comparison::lookup_rdn_key(rdn_value).map_err(Error::Rejected)?;
+    resolve_name(names, objects, key, parent, &rdn)
+}
+
+/// The packet bytes of an ObjectRef value, as a GUID (the value passed the
+/// ObjectRef syntax, so it is 16 bytes). Spec: docs/46 §8.1.
+fn ref_target(id: AttrId, value: &[u8]) -> Result<Guid> {
+    Guid::decode(value).map_err(|_| Error::Rejected(Violation::InvalidValueSyntax(id)))
+}
+
+/// The targets of an attribute's ObjectRef values, ascending by packet.
+fn ref_targets(obj: &Object, id: AttrId) -> Result<BTreeSet<[u8; GUID_PACKET_LEN]>> {
+    let mut out = BTreeSet::new();
+    if let Some(attr) = obj.attribute(id) {
+        for v in &attr.values {
+            out.insert(ref_target(id, &v.value)?.to_packet());
+        }
+    }
+    Ok(out)
+}
+
+/// `true` if `obj` holds `target` among the values of attribute `id`.
+/// Spec: docs/46 §8.4 (cross-check of a reverse-link entry).
+fn holds_ref(obj: &Object, id: AttrId, target: Guid) -> bool {
+    let packet = target.to_packet();
+    obj.attribute(id).is_some_and(|a| {
+        a.values
+            .binary_search_by(|v| v.value.as_slice().cmp(packet.as_slice()))
+            .is_ok()
+    })
+}
+
+/// The back link id that pairs with an (even) forward link id: forward + 1,
+/// written as setting bit 0 (cannot overflow). Spec: [MS-ADTS] 3.1.1.2.3.
+fn back_id(forward_link_id: u32) -> u32 {
+    forward_link_id | 1
+}
+
+/// Comparison keys of a unique attribute's values on `obj`.
+/// Spec: docs/46 §8.5.
+fn unique_keys(obj: &Object, def: &AttributeDefinition) -> Result<BTreeSet<Vec<u8>>> {
+    let mut out = BTreeSet::new();
+    if let Some(attr) = obj.attribute(def.id) {
+        for v in &attr.values {
+            let k =
+                comparison::unique_key(def.id, def.syntax, &v.value).map_err(Error::Rejected)?;
+            if !out.insert(k) {
+                return Err(Error::Rejected(Violation::DuplicateValue(def.id)));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `true` if `obj` holds a value of the unique attribute `def` whose
+/// comparison key is `ckey`. Spec: docs/46 §8.5 (cross-check).
+fn holds_unique_key(obj: &Object, def: &AttributeDefinition, ckey: &[u8]) -> bool {
+    obj.attribute(def.id).is_some_and(|a| {
+        a.values
+            .iter()
+            .any(|v| comparison::unique_key(def.id, def.syntax, &v.value).is_ok_and(|k| k == ckey))
+    })
+}
+
+/// Resolve a unique-index entry to the live object holding the value; a
+/// stale entry is [`Error::Inconsistent`]. Spec: docs/46 §8.5; docs/32 §3.
+fn resolve_unique<U: ReadableTable<Raw, Raw>, O: ReadableTable<Raw, Raw>>(
+    uniques: &U,
+    objects: &O,
+    key: &IntegrityKey,
+    def: &AttributeDefinition,
+    ckey: &[u8],
+) -> Result<Option<Guid>> {
+    let record_key = record::unique_index_key(def.id, ckey);
+    let Some(owner) = load_unique(uniques, key, &record_key)? else {
+        return Ok(None);
+    };
+    match load_live(objects, key, owner)? {
+        Some(obj) if holds_unique_key(&obj, def, ckey) => Ok(Some(owner)),
+        _ => Err(Error::Inconsistent(RecordKind::UniqueIndex)),
+    }
+}
+
+/// [`Snapshot::lookup_unique`]. Spec: docs/46 §8.5.
+fn lookup_unique<U: ReadableTable<Raw, Raw>, O: ReadableTable<Raw, Raw>>(
+    uniques: &U,
+    objects: &O,
+    store: &Store,
+    attr: AttrId,
+    value: &[u8],
+) -> Result<Option<Guid>> {
+    let def = store
+        .schema
+        .attribute(attr)
+        .ok_or(Error::Rejected(Violation::UnknownAttribute(attr)))?;
+    if !def.unique {
+        return Err(Error::Rejected(Violation::NotUnique(attr)));
+    }
+    // Bound the input before any work. Spec: docs/32 §8.
+    if value.len() > def.max_value_len {
+        return Err(Error::Rejected(Violation::ValueTooLarge(attr)));
+    }
+    let ckey = comparison::unique_key(attr, def.syntax, value).map_err(Error::Rejected)?;
+    resolve_unique(uniques, objects, &store.key, def, &ckey)
+}
+
+/// [`Snapshot::back_links`]. Spec: docs/46 §8.4.
+fn back_links_of<L: ReadableTable<Raw, Raw>, O: ReadableTable<Raw, Raw>>(
+    links: &L,
+    objects: &O,
+    store: &Store,
+    target: Guid,
+    back_attr: AttrId,
+) -> Result<Vec<Guid>> {
+    let def = store
+        .schema
+        .attribute(back_attr)
+        .ok_or(Error::Rejected(Violation::UnknownAttribute(back_attr)))?;
+    let Some(Link::Back { link_id }) = def.link else {
+        return Err(Error::Rejected(Violation::NotBackLink(back_attr)));
+    };
+    let forward = store
+        .schema
+        .forward_link_for_back_id(link_id)
+        .ok_or(Error::Rejected(Violation::NotBackLink(back_attr)))?;
+    if load_live(objects, &store.key, target)?.is_none() {
+        return Err(Error::NoSuchObject);
+    }
+    let prefix = record::back_link_prefix(target, Some(link_id));
+    let mut sources = Vec::new();
+    for (_, _, source) in scan_back_links(links, &store.key, &prefix)? {
+        match load_live(objects, &store.key, source)? {
+            Some(obj) if holds_ref(&obj, forward, target) => sources.push(source),
+            _ => return Err(Error::Inconsistent(RecordKind::BackLink)),
+        }
+    }
+    Ok(sources)
+}
+
 /// A live object, re-validated against the schema before it is handed out.
 /// Spec: docs/29 §5 (tombstones invisible); docs/14 D60; docs/12 D44.
 fn get_live<T: ReadableTable<Raw, Raw>>(
@@ -446,15 +766,15 @@ fn get_live<T: ReadableTable<Raw, Raw>>(
     store: &Store,
     guid: Guid,
 ) -> Result<Option<Object>> {
-    match load_object(objects, &store.key, guid)? {
-        Some(obj) if !obj.is_tombstone() => {
+    match load_live(objects, &store.key, guid)? {
+        Some(obj) => {
             store
                 .schema
                 .validate_object(&obj)
                 .map_err(Error::StoredObjectRejected)?;
             Ok(Some(obj))
         }
-        _ => Ok(None),
+        None => Ok(None),
     }
 }
 
@@ -521,10 +841,20 @@ fn first_repeat<T: PartialEq + Copy, I: Iterator<Item = T>>(sorted: I) -> Option
     None
 }
 
-/// Build the canonical object of a creation request; every value is stamped
-/// `version` 1. Spec: docs/32 §2, §4; docs/29 §2.
-fn build_new_object(new: NewObject, origin: &Origin) -> core::result::Result<Object, Violation> {
-    check_rdn(&new.rdn)?;
+/// Build and validate the canonical object of a creation request: every
+/// value stamped `version` 1, the RDN key computed from the RDN value.
+/// Returns the object and its most specific class.
+/// Spec: docs/32 §2, §4; docs/29 §2; docs/46 §8.3; [MS-ADTS] 3.1.1.1.3.
+fn build_new_object(
+    schema: &Schema,
+    new: NewObject,
+    origin: &Origin,
+) -> core::result::Result<(Object, ClassId), Violation> {
+    // "No actual object has objectGUID equal to the NULL GUID".
+    // Spec: [MS-ADTS] 3.1.1.1.3; Q-091 item 6.
+    if new.guid.to_packet() == [0u8; GUID_PACKET_LEN] {
+        return Err(Violation::NullGuid);
+    }
     if new.classes.len() > MAX_CLASSES_PER_OBJECT {
         return Err(Violation::TooManyClasses);
     }
@@ -555,14 +885,18 @@ fn build_new_object(new: NewObject, origin: &Origin) -> core::result::Result<Obj
     if let Some(dup) = first_repeat(attributes.iter().map(|a| a.id)) {
         return Err(Violation::DuplicateAttribute(dup));
     }
-    Ok(Object {
+    let mut obj = Object {
         guid: new.guid,
         parent: new.parent,
-        rdn: new.rdn,
+        rdn: Vec::new(),
         classes,
         attributes,
         tombstone: None,
-    })
+    };
+    // The RDN key is computed here, in one place. Spec: docs/46 §8.3 item 3.
+    let (most_specific, rdn) = schema.check_object(&obj)?;
+    obj.rdn = rdn;
+    Ok((obj, most_specific))
 }
 
 /// Encode a live object's body, keeping room for the deletion stamp so that
@@ -576,7 +910,123 @@ fn encode_live_body(obj: &Object) -> Result<Vec<u8>> {
     Ok(body)
 }
 
-/// Plan a creation. Spec: docs/32 §2, §4, §7; docs/12 D44.
+/// A planned insert of a tagged record.
+fn seal_write(
+    store: &Store,
+    table: TableId,
+    kind: RecordKind,
+    key: Vec<u8>,
+    body: Vec<u8>,
+) -> Result<Write> {
+    let value = integrity::seal(&store.key, kind, &key, body)?;
+    Ok(Write {
+        table,
+        key,
+        value: Some(value),
+    })
+}
+
+/// A planned removal.
+fn remove_write(table: TableId, key: Vec<u8>) -> Write {
+    Write {
+        table,
+        key,
+        value: None,
+    }
+}
+
+/// A planned (re)write of a live object record.
+fn object_write(store: &Store, obj: &Object) -> Result<Write> {
+    let body = encode_live_body(obj)?;
+    seal_write(
+        store,
+        TableId::Objects,
+        RecordKind::Object,
+        obj.guid.to_packet().to_vec(),
+        body,
+    )
+}
+
+/// A planned insert of the reverse-link entry `(target, back id, source)`.
+/// Spec: docs/46 §8.4.
+fn back_link_insert(store: &Store, target: Guid, back: u32, source: Guid) -> Result<Write> {
+    seal_write(
+        store,
+        TableId::BackLinks,
+        RecordKind::BackLink,
+        record::back_link_key(target, back, source).to_vec(),
+        record::encode_back_link_body(),
+    )
+}
+
+/// A planned removal of the reverse-link entry `(target, back id, source)`,
+/// which must exist and be authentic — a missing entry is
+/// [`Error::Inconsistent`]. Spec: docs/46 §8.4; docs/32 §3.
+fn back_link_removal<L: ReadableTable<Raw, Raw>>(
+    links: &L,
+    store: &Store,
+    target: Guid,
+    back: u32,
+    source: Guid,
+) -> Result<Write> {
+    let key = record::back_link_key(target, back, source).to_vec();
+    if !load_back_link(links, &store.key, &key)? {
+        return Err(Error::Inconsistent(RecordKind::BackLink));
+    }
+    Ok(remove_write(TableId::BackLinks, key))
+}
+
+/// A planned removal of a unique entry, which must name `owner` — anything
+/// else is [`Error::Inconsistent`]. Spec: docs/46 §8.5; docs/32 §3.
+fn unique_removal<U: ReadableTable<Raw, Raw>>(
+    uniques: &U,
+    store: &Store,
+    attr: AttrId,
+    ckey: &[u8],
+    owner: Guid,
+) -> Result<Write> {
+    let key = record::unique_index_key(attr, ckey);
+    if load_unique(uniques, &store.key, &key)? != Some(owner) {
+        return Err(Error::Inconsistent(RecordKind::UniqueIndex));
+    }
+    Ok(remove_write(TableId::UniqueIndex, key))
+}
+
+/// The live target of a new ObjectRef value, else [`Error::NoSuchTarget`].
+/// Spec: docs/46 §2.3 item 4, §8.4; [MS-ADTS] 3.1.1.1.6 (noSuchObject, also
+/// for a tombstone).
+fn require_live_target<O: ReadableTable<Raw, Raw>>(
+    objects: &O,
+    store: &Store,
+    attr: AttrId,
+    target: Guid,
+) -> Result<()> {
+    match load_live(objects, &store.key, target)? {
+        Some(_) => Ok(()),
+        None => Err(Error::NoSuchTarget(attr)),
+    }
+}
+
+/// The parent's most specific class must be a possible superior of the new
+/// object's class. Spec: docs/46 §8.3 item 2; [MS-ADTS] 3.1.1.5.2.2.
+fn check_parent_class(store: &Store, parent: &Object, child_class: ClassId) -> Result<()> {
+    let parent_class = store
+        .schema
+        .most_specific_class(&parent.classes)
+        .ok_or(Error::StoredObjectRejected(Violation::InvalidClassChain))?;
+    let child = store
+        .schema
+        .class(child_class)
+        .ok_or(Error::Rejected(Violation::UnknownClass(child_class)))?;
+    if !child.poss_superiors.contains(&parent_class) {
+        return Err(Error::Rejected(Violation::ParentClassNotAllowed(
+            parent_class,
+        )));
+    }
+    Ok(())
+}
+
+/// Plan a creation. Spec: docs/32 §2, §4, §7; docs/12 D44; docs/46 §8.3-§8.5.
 fn plan_create(
     txn: &WriteTransaction,
     store: &Store,
@@ -584,35 +1034,34 @@ fn plan_create(
     origin: &Origin,
 ) -> Result<Vec<Write>> {
     // Validate the request before touching storage. A Secret attribute is
-    // refused before anything else about it is examined. Spec: D44.
+    // refused before anything else about it is examined, then a Derived one.
+    // Spec: D44; docs/46 §8.2.
     if new.attributes.len() > MAX_ATTRIBUTES_PER_OBJECT {
         return Err(Error::Rejected(Violation::TooManyAttributes));
     }
     for (id, _) in &new.attributes {
         store.schema.check_writable(*id).map_err(Error::Rejected)?;
     }
-    let obj = build_new_object(new, origin).map_err(Error::Rejected)?;
-    store
-        .schema
-        .validate_object(&obj)
-        .map_err(Error::Rejected)?;
-    let body = encode_live_body(&obj)?;
+    let (obj, most_specific) =
+        build_new_object(&store.schema, new, origin).map_err(Error::Rejected)?;
+    let object = object_write(store, &obj)?;
 
     let objects = txn.open_table(OBJECT_TABLE)?;
     let names = txn.open_table(NAME_INDEX_TABLE)?;
     let counts = txn.open_table(CHILD_COUNT_TABLE)?;
+    let uniques = txn.open_table(UNIQUE_INDEX_TABLE)?;
 
     // The GUID is free: no live object and no tombstone holds it.
-    let object_key = obj.guid.to_packet();
-    if raw_get(&objects, &object_key)?.is_some() {
+    if raw_get(&objects, &obj.guid.to_packet())?.is_some() {
         return Err(Error::ObjectExists);
     }
-    // The parent is a live object. Spec: docs/32 §2 (DIT).
+    // The parent is a live object of an allowed class. Spec: docs/32 §2
+    // (DIT); docs/46 §8.3 item 2.
     if let Some(parent) = obj.parent {
-        match load_object(&objects, &store.key, parent)? {
-            Some(p) if !p.is_tombstone() => {}
-            _ => return Err(Error::NoSuchParent),
-        }
+        let Some(p) = load_live(&objects, &store.key, parent)? else {
+            return Err(Error::NoSuchParent);
+        };
+        check_parent_class(store, &p, most_specific)?;
     }
     // The name is free under the parent. Spec: docs/32 §2.
     if resolve_name(&names, &objects, &store.key, obj.parent, &obj.rdn)?.is_some() {
@@ -621,26 +1070,14 @@ fn plan_create(
 
     let name_key = record::name_index_key(obj.parent, &obj.rdn);
     let mut writes = vec![
-        Write {
-            table: TableId::Objects,
-            key: object_key.to_vec(),
-            value: Some(integrity::seal(
-                &store.key,
-                RecordKind::Object,
-                &object_key,
-                body,
-            )?),
-        },
-        Write {
-            table: TableId::NameIndex,
-            value: Some(integrity::seal(
-                &store.key,
-                RecordKind::NameIndex,
-                &name_key,
-                record::encode_name_index_body(obj.guid),
-            )?),
-            key: name_key,
-        },
+        object,
+        seal_write(
+            store,
+            TableId::NameIndex,
+            RecordKind::NameIndex,
+            name_key,
+            record::encode_name_index_body(obj.guid),
+        )?,
     ];
     if let Some(parent) = obj.parent {
         let count = load_child_count(&counts, &store.key, parent)?;
@@ -648,17 +1085,43 @@ fn plan_create(
             .checked_add(1)
             .and_then(NonZeroU64::new)
             .ok_or(Error::Inconsistent(RecordKind::ChildCount))?;
-        let count_key = parent.to_packet();
-        writes.push(Write {
-            table: TableId::ChildCount,
-            key: count_key.to_vec(),
-            value: Some(integrity::seal(
-                &store.key,
-                RecordKind::ChildCount,
-                &count_key,
-                record::encode_child_count_body(next),
-            )?),
-        });
+        writes.push(seal_write(
+            store,
+            TableId::ChildCount,
+            RecordKind::ChildCount,
+            parent.to_packet().to_vec(),
+            record::encode_child_count_body(next),
+        )?);
+    }
+
+    for attr in &obj.attributes {
+        let Some(def) = store.schema.attribute(attr.id) else {
+            return Err(Error::Rejected(Violation::UnknownAttribute(attr.id)));
+        };
+        // Forward links: live targets, one reverse-link entry per value.
+        // Spec: docs/46 §8.4.
+        if let Some(link_id) = def.forward_link_id() {
+            for v in &attr.values {
+                let target = ref_target(attr.id, &v.value)?;
+                require_live_target(&objects, store, attr.id, target)?;
+                writes.push(back_link_insert(store, target, back_id(link_id), obj.guid)?);
+            }
+        }
+        // Unique values: free, one entry per comparison key. Spec: §8.5.
+        if def.unique {
+            for ckey in unique_keys(&obj, def)? {
+                if resolve_unique(&uniques, &objects, &store.key, def, &ckey)?.is_some() {
+                    return Err(Error::ValueNotUnique(attr.id));
+                }
+                writes.push(seal_write(
+                    store,
+                    TableId::UniqueIndex,
+                    RecordKind::UniqueIndex,
+                    record::unique_index_key(attr.id, &ckey),
+                    record::encode_unique_index_body(obj.guid),
+                )?);
+            }
+        }
     }
     Ok(writes)
 }
@@ -707,7 +1170,8 @@ fn replace_values(
     Ok(())
 }
 
-/// Plan a modification. Spec: docs/32 §4, §7; docs/29 §2; docs/12 D44.
+/// Plan a modification. Spec: docs/32 §4, §7; docs/29 §2; docs/12 D44;
+/// docs/46 §8.2-§8.5; [MS-ADTS] 3.1.1.5.3.2.
 fn plan_modify(
     txn: &WriteTransaction,
     store: &Store,
@@ -728,14 +1192,29 @@ fn plan_modify(
     }
 
     let objects = txn.open_table(OBJECT_TABLE)?;
-    let original = match load_object(&objects, &store.key, guid)? {
-        Some(o) if !o.is_tombstone() => o,
-        _ => return Err(Error::NoSuchObject),
+    let links = txn.open_table(BACK_LINK_TABLE)?;
+    let uniques = txn.open_table(UNIQUE_INDEX_TABLE)?;
+    let Some(original) = load_live(&objects, &store.key, guid)? else {
+        return Err(Error::NoSuchObject);
     };
     store
         .schema
         .validate_object(&original)
         .map_err(Error::StoredObjectRejected)?;
+    // The RDN attribute is changed only by a rename. Spec: [MS-ADTS]
+    // 3.1.1.5.3.2 ("Updates to … the object's naming attribute … are
+    // disallowed"); docs/46 §8.3 item 3; Q-091 item 5.
+    let rdn_attr = store
+        .schema
+        .most_specific_class(&original.classes)
+        .and_then(|c| store.schema.class(c))
+        .map(|c| c.rdn_attr)
+        .ok_or(Error::StoredObjectRejected(Violation::InvalidClassChain))?;
+    if named.contains(&rdn_attr) {
+        return Err(Error::Rejected(Violation::RdnAttributeNotModifiable(
+            rdn_attr,
+        )));
+    }
 
     let mut obj = original.clone();
     for change in changes {
@@ -750,21 +1229,59 @@ fn plan_modify(
         .schema
         .validate_object(&obj)
         .map_err(Error::Rejected)?;
-    let body = encode_live_body(&obj)?;
-    let object_key = guid.to_packet();
-    Ok(vec![Write {
-        table: TableId::Objects,
-        key: object_key.to_vec(),
-        value: Some(integrity::seal(
-            &store.key,
-            RecordKind::Object,
-            &object_key,
-            body,
-        )?),
-    }])
+    let mut writes = vec![object_write(store, &obj)?];
+
+    for id in &named {
+        let Some(def) = store.schema.attribute(*id) else {
+            return Err(Error::Rejected(Violation::UnknownAttribute(*id)));
+        };
+        // Reverse links follow the forward values. Spec: docs/46 §8.4.
+        if let Some(link_id) = def.forward_link_id() {
+            let before = ref_targets(&original, *id)?;
+            let after = ref_targets(&obj, *id)?;
+            for gone in before.difference(&after) {
+                let target = Guid::from_packet(gone);
+                writes.push(back_link_removal(
+                    &links,
+                    store,
+                    target,
+                    back_id(link_id),
+                    guid,
+                )?);
+            }
+            for added in after.difference(&before) {
+                let target = Guid::from_packet(added);
+                require_live_target(&objects, store, *id, target)?;
+                writes.push(back_link_insert(store, target, back_id(link_id), guid)?);
+            }
+        }
+        // Unique entries follow the comparison keys. Spec: docs/46 §8.5.
+        if def.unique {
+            let before = unique_keys(&original, def)?;
+            let after = unique_keys(&obj, def)?;
+            for gone in before.difference(&after) {
+                writes.push(unique_removal(&uniques, store, *id, gone, guid)?);
+            }
+            for added in after.difference(&before) {
+                if resolve_unique(&uniques, &objects, &store.key, def, added)?.is_some() {
+                    return Err(Error::ValueNotUnique(*id));
+                }
+                writes.push(seal_write(
+                    store,
+                    TableId::UniqueIndex,
+                    RecordKind::UniqueIndex,
+                    record::unique_index_key(*id, added),
+                    record::encode_unique_index_body(guid),
+                )?);
+            }
+        }
+    }
+    Ok(writes)
 }
 
-/// Plan a deletion (tombstone). Spec: docs/29 §5 (D121); docs/32 §2.
+/// Plan a deletion (tombstone), with referential integrity.
+/// Spec: docs/29 §5 (D121); docs/32 §2; docs/46 §2.3 item 4, §8.4-§8.5;
+/// [MS-ADTS] 3.1.1.1.6.
 fn plan_delete(
     txn: &WriteTransaction,
     store: &Store,
@@ -774,11 +1291,19 @@ fn plan_delete(
     let objects = txn.open_table(OBJECT_TABLE)?;
     let names = txn.open_table(NAME_INDEX_TABLE)?;
     let counts = txn.open_table(CHILD_COUNT_TABLE)?;
+    let links = txn.open_table(BACK_LINK_TABLE)?;
+    let uniques = txn.open_table(UNIQUE_INDEX_TABLE)?;
 
-    let obj = match load_object(&objects, &store.key, guid)? {
-        Some(o) if !o.is_tombstone() => o,
-        _ => return Err(Error::NoSuchObject),
+    let Some(obj) = load_live(&objects, &store.key, guid)? else {
+        return Err(Error::NoSuchObject);
     };
+    // The object's links and unique values are read through the schema, so
+    // the object must satisfy it (fail closed). Spec: docs/14 D60; Q-091
+    // item 8.
+    store
+        .schema
+        .validate_object(&obj)
+        .map_err(Error::StoredObjectRejected)?;
     // A live object's parent is always live. Spec: docs/32 §2 (DIT).
     if load_child_count(&counts, &store.key, guid)? > 0 {
         return Err(Error::HasChildren);
@@ -788,31 +1313,109 @@ fn plan_delete(
     if load_name(&names, &store.key, &name_key)? != Some(guid) {
         return Err(Error::Inconsistent(RecordKind::NameIndex));
     }
-    let mut writes = vec![Write {
-        table: TableId::NameIndex,
-        key: name_key,
-        value: None,
-    }];
+    let mut writes = vec![remove_write(TableId::NameIndex, name_key)];
     if let Some(parent) = obj.parent {
         let remaining = load_child_count(&counts, &store.key, parent)?
             .checked_sub(1)
             .ok_or(Error::Inconsistent(RecordKind::ChildCount))?;
-        let count_key = parent.to_packet();
-        let value = match NonZeroU64::new(remaining) {
-            Some(n) => Some(integrity::seal(
-                &store.key,
+        let count_key = parent.to_packet().to_vec();
+        writes.push(match NonZeroU64::new(remaining) {
+            Some(n) => seal_write(
+                store,
+                TableId::ChildCount,
                 RecordKind::ChildCount,
-                &count_key,
+                count_key,
                 record::encode_child_count_body(n),
-            )?),
-            None => None,
-        };
-        writes.push(Write {
-            table: TableId::ChildCount,
-            key: count_key.to_vec(),
-            value,
+            )?,
+            None => remove_write(TableId::ChildCount, count_key),
         });
     }
+
+    // The object's own forward values and unique values go with the
+    // tombstone (A-18), and so do their index entries. Spec: docs/46 §2.3
+    // item 4, §8.4, §8.5.
+    let mut own_links = BTreeSet::new();
+    for attr in &obj.attributes {
+        let Some(def) = store.schema.attribute(attr.id) else {
+            return Err(Error::StoredObjectRejected(Violation::UnknownAttribute(
+                attr.id,
+            )));
+        };
+        if let Some(link_id) = def.forward_link_id() {
+            for v in &attr.values {
+                let target = ref_target(attr.id, &v.value)?;
+                writes.push(back_link_removal(
+                    &links,
+                    store,
+                    target,
+                    back_id(link_id),
+                    guid,
+                )?);
+                own_links.insert((target.to_packet(), back_id(link_id)));
+            }
+        }
+        if def.unique {
+            for ckey in unique_keys(&obj, def)? {
+                writes.push(unique_removal(&uniques, store, attr.id, &ckey, guid)?);
+            }
+        }
+    }
+
+    // Referential integrity: remove this object's GUID from every forward
+    // link that references it. Spec: [MS-ADTS] 3.1.1.1.6 ("any forward link
+    // reference to o is removed"); docs/46 §8.4.
+    let mut referrers: BTreeMap<[u8; GUID_PACKET_LEN], Object> = BTreeMap::new();
+    for (_, back, source) in
+        scan_back_links(&links, &store.key, &record::back_link_prefix(guid, None))?
+    {
+        if source == guid {
+            // A self-reference: removed above with the object's own values.
+            if !own_links.contains(&(guid.to_packet(), back)) {
+                return Err(Error::Inconsistent(RecordKind::BackLink));
+            }
+            continue;
+        }
+        let forward = store
+            .schema
+            .forward_link_for_back_id(back)
+            .ok_or(Error::Inconsistent(RecordKind::BackLink))?;
+        let referrer = match referrers.entry(source.to_packet()) {
+            std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::btree_map::Entry::Vacant(e) => {
+                let Some(r) = load_live(&objects, &store.key, source)? else {
+                    return Err(Error::Inconsistent(RecordKind::BackLink));
+                };
+                store
+                    .schema
+                    .validate_object(&r)
+                    .map_err(Error::StoredObjectRejected)?;
+                e.insert(r)
+            }
+        };
+        if !holds_ref(referrer, forward, guid) {
+            return Err(Error::Inconsistent(RecordKind::BackLink));
+        }
+        let packet = guid.to_packet();
+        for attr in &mut referrer.attributes {
+            if attr.id == forward {
+                attr.values
+                    .retain(|v| v.value.as_slice() != packet.as_slice());
+            }
+        }
+        referrer.attributes.retain(|a| !a.values.is_empty());
+        writes.push(remove_write(
+            TableId::BackLinks,
+            record::back_link_key(guid, back, source).to_vec(),
+        ));
+    }
+    for referrer in referrers.values() {
+        store
+            .schema
+            .validate_object(referrer)
+            .map_err(Error::Rejected)?;
+        writes.push(object_write(store, referrer)?);
+    }
+
     // The reduced tombstone, built fresh (the live object is not mutated):
     // identity (GUID = record key, classes) + deletion marker only. Parent,
     // RDN key and every attribute value with its stamp are dropped.
@@ -827,17 +1430,13 @@ fn plan_delete(
         tombstone: Some(origin.stamp(1)),
     };
     let body = record::encode_object_body(&tombstone).map_err(Error::Rejected)?;
-    let object_key = guid.to_packet();
-    writes.push(Write {
-        table: TableId::Objects,
-        key: object_key.to_vec(),
-        value: Some(integrity::seal(
-            &store.key,
-            RecordKind::Object,
-            &object_key,
-            body,
-        )?),
-    });
+    writes.push(seal_write(
+        store,
+        TableId::Objects,
+        RecordKind::Object,
+        guid.to_packet().to_vec(),
+        body,
+    )?);
     Ok(writes)
 }
 
@@ -850,7 +1449,8 @@ fn tombstone_expired(t: Timestamp, now: Timestamp, lifetime: u64) -> bool {
 }
 
 /// Plan a purge: authenticate every object record, collect expired
-/// tombstones. Spec: docs/29 §5 (D121); docs/32 §3.
+/// tombstones; no reverse-link entry may target one. Spec: docs/29 §5
+/// (D121); docs/32 §3; docs/46 §8.4.
 fn plan_purge(
     txn: &WriteTransaction,
     store: &Store,
@@ -858,6 +1458,7 @@ fn plan_purge(
     lifetime: u64,
 ) -> Result<Vec<Write>> {
     let objects = txn.open_table(OBJECT_TABLE)?;
+    let links = txn.open_table(BACK_LINK_TABLE)?;
     let mut writes = Vec::new();
     for entry in objects.iter()? {
         let (k, v) = entry?;
@@ -868,11 +1469,13 @@ fn plan_purge(
             .map_err(|e| Error::RecordMalformed(RecordKind::Object, e))?;
         if let Some(stamp) = obj.tombstone {
             if tombstone_expired(stamp.wall_clock, now, lifetime) {
-                writes.push(Write {
-                    table: TableId::Objects,
-                    key: record_key.to_vec(),
-                    value: None,
-                });
+                // A tombstone is referenced by nothing (its delete removed
+                // every reference). Spec: docs/46 §8.4.
+                let prefix = record::back_link_prefix(guid, None);
+                if !scan_back_links(&links, &store.key, &prefix)?.is_empty() {
+                    return Err(Error::Inconsistent(RecordKind::BackLink));
+                }
+                writes.push(remove_write(TableId::Objects, record_key.to_vec()));
             }
         }
     }
@@ -884,11 +1487,15 @@ fn apply_writes(txn: &WriteTransaction, writes: &[Write]) -> Result<()> {
     let mut objects = txn.open_table(OBJECT_TABLE)?;
     let mut names = txn.open_table(NAME_INDEX_TABLE)?;
     let mut counts = txn.open_table(CHILD_COUNT_TABLE)?;
+    let mut links = txn.open_table(BACK_LINK_TABLE)?;
+    let mut uniques = txn.open_table(UNIQUE_INDEX_TABLE)?;
     for w in writes {
         let table = match w.table {
             TableId::Objects => &mut objects,
             TableId::NameIndex => &mut names,
             TableId::ChildCount => &mut counts,
+            TableId::BackLinks => &mut links,
+            TableId::UniqueIndex => &mut uniques,
         };
         match &w.value {
             Some(value) => {
@@ -918,5 +1525,12 @@ mod tests {
             Timestamp(u64::MAX),
             1
         ));
+    }
+
+    // Source: [MS-ADTS] 3.1.1.2.3 — back link id = forward link id + 1.
+    #[test]
+    fn back_id_is_forward_plus_one() {
+        assert_eq!(back_id(2), 3);
+        assert_eq!(back_id(u32::MAX - 1), u32::MAX);
     }
 }

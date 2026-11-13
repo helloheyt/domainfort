@@ -71,8 +71,24 @@
 //!   u8 format
 //! ```
 //!
+//! # Reverse-link and unique-index records
+//!
+//! ```text
+//! reverse link (key: [16] target GUID || u32 back link id || [16] source GUID
+//!               — exactly BACK_LINK_KEY_LEN = 36 bytes)
+//!   u8 format                       (the key is the whole content; the body
+//!                                    exists so the record can carry a tag)
+//! unique index (key: u32 attribute id || comparison key)
+//!   u8 format, [16] owner GUID
+//! ```
+//!
+//! The back link id is the forward link id + 1 ([MS-ADTS] 3.1.1.2.3), so one
+//! prefix scan `target || back link id` lists the sources of one back link
+//! (docs/46 §8.4), and `target` alone lists every reference to it.
+//!
 //! Spec: docs/10 D34; docs/32 §2 (object / name index, D134), §8 (bounded
-//! parser, D138); docs/29 §2 (attr-stamp), §5 (tombstone).
+//! parser, D138); docs/29 §2 (attr-stamp), §5 (tombstone); docs/46 §8.4
+//! (reverse links), §8.5 (unique index).
 
 use crate::error::{DecodeError, Violation};
 use crate::types::{
@@ -502,6 +518,98 @@ pub fn decode_child_count_body(body: &[u8]) -> Result<NonZeroU64, DecodeError> {
     let count = r.u64()?;
     r.finish()?;
     NonZeroU64::new(count).ok_or(DecodeError::ZeroChildCount)
+}
+
+/// Length of a reverse-link key: target GUID, back link id, source GUID.
+/// Spec: docs/46 §8.4.
+pub const BACK_LINK_KEY_LEN: usize = GUID_PACKET_LEN + 4 + GUID_PACKET_LEN;
+
+/// The reverse-link key `target || u32be(back_link_id) || source`.
+/// Spec: docs/46 §8.4 ("key (target GUID, back link_id u32 BE, source
+/// GUID)").
+#[must_use]
+pub fn back_link_key(target: Guid, back_link_id: u32, source: Guid) -> [u8; BACK_LINK_KEY_LEN] {
+    // Filled by zipping (no slicing, so no panic path): 16 + 4 + 16 bytes.
+    let mut key = [0u8; BACK_LINK_KEY_LEN];
+    let parts = target
+        .to_packet()
+        .into_iter()
+        .chain(back_link_id.to_be_bytes())
+        .chain(source.to_packet());
+    for (dst, src) in key.iter_mut().zip(parts) {
+        *dst = src;
+    }
+    key
+}
+
+/// The scan prefix of every reverse-link key of `target` (and, if given, of
+/// one back link id). Spec: docs/46 §8.4 ("prefix scan (o, 3)").
+#[must_use]
+pub fn back_link_prefix(target: Guid, back_link_id: Option<u32>) -> Vec<u8> {
+    let mut prefix = target.to_packet().to_vec();
+    if let Some(id) = back_link_id {
+        prefix.extend_from_slice(&id.to_be_bytes());
+    }
+    prefix
+}
+
+/// Split a reverse-link key read back from disk into
+/// `(target, back link id, source)`. Spec: docs/46 §8.4; docs/32 §8.
+pub fn decode_back_link_key(key: &[u8]) -> Result<(Guid, u32, Guid), DecodeError> {
+    if key.len() != BACK_LINK_KEY_LEN {
+        return Err(DecodeError::KeyLength);
+    }
+    let mut r = Reader::new(key);
+    let target = r.guid()?;
+    let id = r.u32()?;
+    let source = r.guid()?;
+    r.finish()?;
+    Ok((target, id, source))
+}
+
+/// Encode a reverse-link body (format byte only: the key is the content).
+/// Spec: docs/46 §8.4 ("→ empty body"; one byte so the tag has a body).
+#[must_use]
+pub fn encode_back_link_body() -> Vec<u8> {
+    vec![RECORD_FORMAT_V1]
+}
+
+/// Decode a reverse-link body. Spec: docs/46 §8.4; docs/32 §8.
+pub fn decode_back_link_body(body: &[u8]) -> Result<(), DecodeError> {
+    let mut r = Reader::new(body);
+    if r.u8()? != RECORD_FORMAT_V1 {
+        return Err(DecodeError::UnsupportedFormat);
+    }
+    r.finish()
+}
+
+/// The unique-index key `u32be(attribute id) || comparison key`.
+/// Spec: docs/46 §8.5 ("index from the comparison key to the GUID").
+#[must_use]
+pub fn unique_index_key(attr: AttrId, comparison_key: &[u8]) -> Vec<u8> {
+    let mut key = attr.0.to_be_bytes().to_vec();
+    key.extend_from_slice(comparison_key);
+    key
+}
+
+/// Encode a unique-index body naming the `owner` object. Spec: docs/46 §8.5.
+#[must_use]
+pub fn encode_unique_index_body(owner: Guid) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + GUID_PACKET_LEN);
+    out.push(RECORD_FORMAT_V1);
+    out.extend_from_slice(&owner.to_packet());
+    out
+}
+
+/// Decode a unique-index body. Spec: docs/46 §8.5; docs/32 §8.
+pub fn decode_unique_index_body(body: &[u8]) -> Result<Guid, DecodeError> {
+    let mut r = Reader::new(body);
+    if r.u8()? != RECORD_FORMAT_V1 {
+        return Err(DecodeError::UnsupportedFormat);
+    }
+    let owner = r.guid()?;
+    r.finish()?;
+    Ok(owner)
 }
 
 /// Encode the store's meta body. Spec: docs/10 D34 (version-aware codec).

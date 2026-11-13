@@ -28,7 +28,7 @@ fn create_stamps_every_value_with_version_one() {
     let dir = TempDir::new("stamps-create");
     let store = open_store(&dir);
     let mut txn = store.begin_write().unwrap();
-    txn.create_object(container(1, None, "root"), &origin(NODE_1, 100, 7))
+    txn.create_object(root(1, "root"), &origin(NODE_1, 100, 7))
         .unwrap();
     txn.commit().unwrap();
     let root = store
@@ -51,10 +51,18 @@ fn stamps_preserved_and_versions_rise() {
     let dir = TempDir::new("stamps-modify");
     let store = open_store(&dir);
     let mut txn = store.begin_write().unwrap();
-    txn.create_object(container(1, None, "root"), &origin(NODE_1, 100, 1))
+    txn.create_object(root(1, "root"), &origin(NODE_1, 100, 1))
         .unwrap();
-    txn.create_object(principal(2, guid(1), "alice"), &origin(NODE_1, 100, 2))
-        .unwrap();
+    txn.create_object(
+        principal_with(
+            2,
+            guid(1),
+            "alice",
+            vec![(ATTR_COUNTER, vec![1i64.to_be_bytes().to_vec()])],
+        ),
+        &origin(NODE_1, 100, 2),
+    )
+    .unwrap();
     txn.modify_object(
         guid(2),
         vec![AttributeChange::Replace {
@@ -101,13 +109,15 @@ fn stamps_preserved_and_versions_rise() {
         stamp(1, NODE_1, 100, 2)
     );
 
-    // Single-valued replace: the new value gets version 2.
+    // Single-valued replace: the new value gets version 2. (The RDN
+    // attribute itself cannot be modified — [MS-ADTS] 3.1.1.5.3.2 — so a
+    // non-naming single-valued attribute is used.)
     let mut txn = store.begin_write().unwrap();
     txn.modify_object(
         guid(2),
         vec![AttributeChange::Replace {
-            id: ATTR_NAME,
-            values: vec![b"alice2".to_vec()],
+            id: ATTR_COUNTER,
+            values: vec![2i64.to_be_bytes().to_vec()],
         }],
         &origin(NODE_2, 300, 51),
     )
@@ -124,8 +134,12 @@ fn stamps_preserved_and_versions_rise() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        alice.attribute(ATTR_NAME).unwrap().values[0].stamp,
+        alice.attribute(ATTR_COUNTER).unwrap().values[0].stamp,
         stamp(2, NODE_2, 300, 51)
+    );
+    assert_eq!(
+        alice.attribute(ATTR_NAME).unwrap().values[0].stamp,
+        stamp(1, NODE_1, 100, 2)
     );
     assert_eq!(
         alice.attribute(ATTR_NOTE).unwrap().values[1].stamp,
@@ -139,15 +153,26 @@ fn unchanged_replace_writes_nothing() {
     // with itself is no change.
     let dir = TempDir::new("stamps-noop");
     let store = open_store(&dir);
-    create_all(&store, vec![container(1, None, "root")]);
-    let before = store.snapshot().unwrap().get_object(guid(1)).unwrap();
+    create_all(
+        &store,
+        vec![
+            root(1, "root"),
+            principal_with(
+                2,
+                guid(1),
+                "p",
+                vec![(ATTR_COUNTER, vec![5i64.to_be_bytes().to_vec()])],
+            ),
+        ],
+    );
+    let before = store.snapshot().unwrap().get_object(guid(2)).unwrap();
     let mut txn = store.begin_write().unwrap();
     txn.modify_object(
-        guid(1),
+        guid(2),
         vec![
             AttributeChange::Replace {
-                id: ATTR_NAME,
-                values: vec![b"root".to_vec()],
+                id: ATTR_COUNTER,
+                values: vec![5i64.to_be_bytes().to_vec()],
             },
             AttributeChange::Replace {
                 id: ATTR_NOTE,
@@ -159,7 +184,7 @@ fn unchanged_replace_writes_nothing() {
     .unwrap();
     txn.commit().unwrap();
     assert_eq!(
-        store.snapshot().unwrap().get_object(guid(1)).unwrap(),
+        store.snapshot().unwrap().get_object(guid(2)).unwrap(),
         before
     );
 }
@@ -174,7 +199,7 @@ fn tombstone_is_invisible_and_reduced_to_identity() {
     let store = open_store(&dir);
     create_all(
         &store,
-        vec![container(1, None, "root"), principal(2, guid(1), "alice")],
+        vec![root(1, "root"), principal(2, guid(1), "alice")],
     );
 
     let mut txn = store.begin_write().unwrap();
@@ -193,7 +218,7 @@ fn tombstone_is_invisible_and_reduced_to_identity() {
         ts,
         Tombstone {
             guid: guid(2),
-            classes: vec![CLASS_PRINCIPAL],
+            classes: PRINCIPAL_CHAIN.to_vec(),
             deletion: stamp(1, NODE_2, 5000, 77),
         }
     );
@@ -235,7 +260,7 @@ fn tombstone_has_its_own_validation_path() {
         let store = open_store(&dir);
         create_all(
             &store,
-            vec![container(1, None, "root"), principal(2, guid(1), "alice")],
+            vec![root(1, "root"), principal(2, guid(1), "alice")],
         );
         let mut txn = store.begin_write().unwrap();
         txn.delete_object(guid(2), &origin(NODE_1, 10, 1)).unwrap();
@@ -247,9 +272,10 @@ fn tombstone_has_its_own_validation_path() {
             .unwrap()
             .is_some());
     }
+    // CLASS_FLAGGED is a subclass of CLASS_PRINCIPAL, so it goes too.
     let without_principal: Vec<_> = class_definitions()
         .into_iter()
-        .filter(|c| c.id != CLASS_PRINCIPAL)
+        .filter(|c| c.id != CLASS_PRINCIPAL && c.id != CLASS_FLAGGED)
         .collect();
     let schema = dirstore::Schema::new(
         attribute_definitions(dirstore::AttrClass::Secret),
@@ -277,14 +303,15 @@ fn stored_tombstone_record_holds_none_of_the_deleted_values() {
     let dir = TempDir::new("tombstone-raw");
     {
         let store = open_store(&dir);
+        // The RDN key is computed from ATTR_NAME (lower-case already, so the
+        // folded key has the same bytes).
         let mut obj = principal(2, guid(1), "unused");
-        obj.rdn = RDN.to_vec();
         obj.attributes = vec![
             (ATTR_NAME, vec![RDN.to_vec()]),
             (ATTR_SID, vec![sid_value(4242)]),
             (ATTR_NOTE, vec![NOTE.to_vec()]),
         ];
-        create_all(&store, vec![container(1, None, "root"), obj]);
+        create_all(&store, vec![root(1, "root"), obj]);
         let mut txn = store.begin_write().unwrap();
         txn.delete_object(guid(2), &origin(NODE_2, 7000, 5))
             .unwrap();
@@ -309,9 +336,13 @@ fn stored_tombstone_record_holds_none_of_the_deleted_values() {
         "deleted SID value still stored"
     );
     assert!(!contains(&guid(1).to_packet()), "parent GUID still stored");
-    // Body = format, flags, rdn_len, deletion stamp, class count + one class,
-    // attribute count; then the 32-byte tag (src/record.rs layout).
-    assert_eq!(stored.len(), 1 + 1 + 2 + 40 + 2 + 4 + 2 + dirstore::MAC_LEN);
+    // Body = format, flags, rdn_len, deletion stamp, class count + the three
+    // classes of the principal chain, attribute count; then the 32-byte tag
+    // (src/record.rs layout).
+    assert_eq!(
+        stored.len(),
+        1 + 1 + 2 + 40 + 2 + 4 * PRINCIPAL_CHAIN.len() + 2 + dirstore::MAC_LEN
+    );
 }
 
 #[test]
@@ -323,7 +354,7 @@ fn purge_by_lifetime() {
     create_all(
         &store,
         vec![
-            container(1, None, "root"),
+            root(1, "root"),
             principal(2, guid(1), "old"),
             principal(3, guid(1), "recent"),
             principal(4, guid(1), "live"),

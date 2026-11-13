@@ -19,7 +19,7 @@ use dirstore::{
 fn create_error(test: &str, obj: NewObject) -> Error {
     let dir = TempDir::new(test);
     let store = open_store(&dir);
-    create_all(&store, vec![container(1, None, "root")]);
+    create_all(&store, vec![root(1, "root")]);
     let guid = obj.guid;
     let mut txn = store.begin_write().unwrap();
     let err = txn
@@ -61,15 +61,28 @@ fn missing_must_attribute() {
 
 #[test]
 fn must_attribute_of_every_class_is_required() {
-    // Source: docs/32 §4 — classes are additive; CLASS_FLAGGED adds a must.
-    let obj = NewObject {
-        classes: vec![CLASS_PRINCIPAL, CLASS_FLAGGED],
-        ..with_attrs(base_attrs())
+    // Source: docs/32 §4 — classes are additive over the whole chain
+    // (CLASSATTS, [MS-ADTS] 3.1.1.4.2; docs/46 §4.4): CLASS_FLAGGED adds a
+    // must, and its superclass CLASS_PRINCIPAL's must still applies.
+    let flagged = |attrs| NewObject {
+        classes: vec![CLASS_TOP, CLASS_PERSON, CLASS_PRINCIPAL, CLASS_FLAGGED],
+        ..with_attrs(attrs)
     };
-    let err = create_error("must-every-class", obj);
+    let err = create_error("must-every-class", flagged(base_attrs()));
     assert!(matches!(
         err,
         Error::Rejected(Violation::MissingMustAttribute(ATTR_FLAG))
+    ));
+    let err = create_error(
+        "must-superclass",
+        flagged(vec![
+            (ATTR_NAME, vec![b"p".to_vec()]),
+            (ATTR_FLAG, vec![vec![1]]),
+        ]),
+    );
+    assert!(matches!(
+        err,
+        Error::Rejected(Violation::MissingMustAttribute(ATTR_SID))
     ));
 }
 
@@ -157,7 +170,7 @@ fn oversize_value() {
     // Exactly at the bound is fine.
     let dir = TempDir::new("oversize-ok");
     let store = open_store(&dir);
-    create_all(&store, vec![container(1, None, "root")]);
+    create_all(&store, vec![root(1, "root")]);
     let mut attrs = base_attrs();
     attrs[0] = (ATTR_NAME, vec![vec![b'n'; NAME_MAX]]);
     let mut txn = store.begin_write().unwrap();
@@ -230,10 +243,7 @@ fn modify_is_validated_as_a_whole() {
     // Source: docs/32 §4 — the object after the change must satisfy the schema.
     let dir = TempDir::new("modify-validate");
     let store = open_store(&dir);
-    create_all(
-        &store,
-        vec![container(1, None, "root"), principal(2, guid(1), "p")],
-    );
+    create_all(&store, vec![root(1, "root"), principal(2, guid(1), "p")]);
     let before = store.snapshot().unwrap().get_object(guid(2)).unwrap();
     let mut txn = store.begin_write().unwrap();
     let cases = vec![
@@ -253,10 +263,10 @@ fn modify_is_validated_as_a_whole() {
         ),
         (
             AttributeChange::Replace {
-                id: ATTR_NAME,
-                values: vec![b"a".to_vec(), b"b".to_vec()],
+                id: ATTR_COUNTER,
+                values: vec![1i64.to_be_bytes().to_vec(), 2i64.to_be_bytes().to_vec()],
             },
-            Violation::MultipleValuesOnSingleValued(ATTR_NAME),
+            Violation::MultipleValuesOnSingleValued(ATTR_COUNTER),
         ),
         (
             AttributeChange::Replace {
@@ -321,10 +331,7 @@ fn secret_attribute_write_is_rejected() {
 
     let dir = TempDir::new("secret-modify");
     let store = open_store(&dir);
-    create_all(
-        &store,
-        vec![container(1, None, "root"), principal(2, guid(1), "p")],
-    );
+    create_all(&store, vec![root(1, "root"), principal(2, guid(1), "p")]);
     let before = store.snapshot().unwrap().get_object(guid(2)).unwrap();
     let mut txn = store.begin_write().unwrap();
     for values in [vec![b"k".to_vec()], vec![]] {
@@ -364,7 +371,7 @@ fn stored_attribute_later_classified_secret_is_never_returned() {
         .unwrap();
         let mut attrs = base_attrs();
         attrs.push((ATTR_KEY_MATERIAL, vec![b"k".to_vec()]));
-        create_all(&store, vec![container(1, None, "root"), with_attrs(attrs)]);
+        create_all(&store, vec![root(1, "root"), with_attrs(attrs)]);
     }
     let store = open_store(&dir); // ATTR_KEY_MATERIAL is Secret here
     let snap = store.snapshot().unwrap();
@@ -384,17 +391,40 @@ fn stored_attribute_later_classified_secret_is_never_returned() {
 #[test]
 fn schema_definition_defects() {
     // Source: docs/32 §4 (schema is data — and validated); docs/12 D44.
-    let def = |id: u32, max: usize, class: AttrClass| AttributeDefinition {
-        id: AttrId(id),
-        syntax: ValueSyntax::OctetString,
-        multiplicity: Multiplicity::SingleValued,
-        max_value_len: max,
-        class,
+    // Attribute 0 is a usable RDN attribute (docs/46 §8.3), so these classes
+    // fail only for the defect each case is about.
+    let def = |id: u32, max: usize, class: AttrClass| {
+        AttributeDefinition::new(
+            AttrId(id),
+            ValueSyntax::OctetString,
+            Multiplicity::SingleValued,
+            max,
+            class,
+        )
+    };
+    let name = AttributeDefinition {
+        rdn_att_len: Some(2),
+        ..AttributeDefinition::new(
+            AttrId(0),
+            ValueSyntax::Utf8String,
+            Multiplicity::SingleValued,
+            8,
+            AttrClass::Normal,
+        )
+    };
+    let with_name = |mut attrs: Vec<AttributeDefinition>| {
+        attrs.push(name.clone());
+        attrs
     };
     let class = |id: u32, must: Vec<u32>, may: Vec<u32>| ClassDefinition {
         id: ClassId(id),
+        superclass: None,
+        instantiable: true,
+        rdn_attr: AttrId(0),
+        poss_superiors: vec![],
+        nc_root: true,
         must: must.into_iter().map(AttrId).collect(),
-        may: may.into_iter().map(AttrId).collect(),
+        may: may.into_iter().chain([0]).map(AttrId).collect(),
     };
     let check = |attrs, classes, expected: SchemaDefect| match Schema::new(attrs, classes) {
         Err(Error::InvalidSchema(d)) => assert_eq!(d, expected),
@@ -416,29 +446,32 @@ fn schema_definition_defects() {
         SchemaDefect::ValueBoundOutOfRange(AttrId(1)),
     );
     check(
-        vec![def(1, 8, AttrClass::Normal)],
+        with_name(vec![def(1, 8, AttrClass::Normal)]),
         vec![class(1, vec![2], vec![])],
         SchemaDefect::UndefinedAttributeInClass(ClassId(1), AttrId(2)),
     );
     check(
-        vec![def(1, 8, AttrClass::Normal)],
+        with_name(vec![def(1, 8, AttrClass::Normal)]),
         vec![class(1, vec![1], vec![1])],
         SchemaDefect::DuplicateAttributeInClass(ClassId(1), AttrId(1)),
     );
     check(
-        vec![def(1, 8, AttrClass::Secret)],
+        with_name(vec![def(1, 8, AttrClass::Secret)]),
         vec![class(1, vec![1], vec![])],
         SchemaDefect::SecretMustAttribute(ClassId(1), AttrId(1)),
     );
     check(
-        vec![def(1, 8, AttrClass::Normal)],
+        with_name(vec![def(1, 8, AttrClass::Normal)]),
         vec![class(1, vec![1], vec![]), class(1, vec![], vec![1])],
         SchemaDefect::DuplicateClassDefinition(ClassId(1)),
     );
     // A Secret attribute may be *defined* (so the PDP knows its class) and
     // even listed as "may": it is the write that is refused.
     assert!(Schema::new(
-        vec![def(1, 8, AttrClass::Normal), def(2, 8, AttrClass::Secret)],
+        with_name(vec![
+            def(1, 8, AttrClass::Normal),
+            def(2, 8, AttrClass::Secret)
+        ]),
         vec![class(1, vec![1], vec![2])],
     )
     .is_ok());

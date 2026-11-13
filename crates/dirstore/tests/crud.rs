@@ -15,7 +15,7 @@ fn create_read_update_delete() {
     let store = open_store(&dir);
     create_all(
         &store,
-        vec![container(1, None, "root"), principal(2, guid(1), "alice")],
+        vec![root(1, "root"), principal(2, guid(1), "alice")],
     );
 
     // Read back through a snapshot. Source: docs/32 §2, §6.
@@ -24,7 +24,7 @@ fn create_read_update_delete() {
     assert_eq!(alice.guid, guid(2));
     assert_eq!(alice.parent, Some(guid(1)));
     assert_eq!(alice.rdn, b"alice");
-    assert_eq!(alice.classes, vec![CLASS_PRINCIPAL]);
+    assert_eq!(alice.classes, PRINCIPAL_CHAIN.to_vec());
     assert!(!alice.is_tombstone());
     let name = alice.attribute(ATTR_NAME).unwrap();
     assert_eq!(name.values.len(), 1);
@@ -132,7 +132,7 @@ fn data_survives_reopen() {
     let dir = TempDir::new("reopen");
     {
         let store = open_store(&dir);
-        create_all(&store, vec![container(1, None, "root")]);
+        create_all(&store, vec![root(1, "root")]);
     }
     let store = open_store(&dir);
     let snap = store.snapshot().unwrap();
@@ -173,9 +173,9 @@ fn name_uniqueness_under_one_parent() {
     create_all(
         &store,
         vec![
-            container(1, None, "root"),
-            container(2, Some(guid(1)), "ou-a"),
-            container(3, Some(guid(1)), "ou-b"),
+            root(1, "root"),
+            container(2, guid(1), "ou-a"),
+            container(3, guid(1), "ou-b"),
             principal(4, guid(2), "alice"),
         ],
     );
@@ -188,7 +188,7 @@ fn name_uniqueness_under_one_parent() {
     ));
     // Same RDN key at the root -> refused.
     assert!(matches!(
-        txn.create_object(container(6, None, "root"), &origin(NODE_1, 1, 2)),
+        txn.create_object(root(6, "root"), &origin(NODE_1, 1, 2)),
         Err(Error::NameExists)
     ));
     // Same RDN key under another parent -> fine.
@@ -211,29 +211,44 @@ fn name_uniqueness_under_one_parent() {
 }
 
 #[test]
-fn rdn_key_is_opaque_bytes() {
-    // Source: task scope / docs/32 §2 — the RDN key is an opaque,
-    // caller-normalized byte string; dirstore applies no matching rule, so
-    // keys differing only in letter case are distinct names.
-    let dir = TempDir::new("opaque");
+fn rdn_key_is_computed_with_case_fold() {
+    // Source: docs/46 §8.3 item 3 — the RDN key is computed by dirstore from
+    // the RDN value with the Q-080 interim rule (ASCII, A–Z folded), so names
+    // differing only in letter case collide ([MS-ADTS] 3.1.1.3.1.2.1: the RDN
+    // AttributeValue "MUST be unique among sibling objects"). The stored
+    // value keeps its case; lookup folds too.
+    let dir = TempDir::new("rdn-fold");
     let store = open_store(&dir);
     create_all(
         &store,
-        vec![container(1, None, "root"), principal(2, guid(1), "Alice")],
+        vec![root(1, "root"), principal(2, guid(1), "Alice")],
     );
     let mut txn = store.begin_write().unwrap();
-    txn.create_object(principal(3, guid(1), "alice"), &origin(NODE_1, 1, 1))
-        .unwrap();
+    assert!(matches!(
+        txn.create_object(principal(3, guid(1), "aLiCe"), &origin(NODE_1, 1, 1)),
+        Err(Error::NameExists)
+    ));
+    // Siblings of a different class whose RDN values fold equal collide too
+    // ("CN=Abc" and "L=Abc" cannot coexist, 3.1.1.3.1.2.1).
+    assert!(matches!(
+        txn.create_object(container(4, guid(1), "ALICE"), &origin(NODE_1, 1, 2)),
+        Err(Error::NameExists)
+    ));
     txn.commit().unwrap();
     let snap = store.snapshot().unwrap();
+    let alice = snap.get_object(guid(2)).unwrap().unwrap();
+    assert_eq!(alice.rdn, b"alice");
     assert_eq!(
-        snap.lookup_child(Some(guid(1)), b"Alice").unwrap(),
-        Some(guid(2))
+        alice.attribute(ATTR_NAME).unwrap().values[0].value,
+        b"Alice"
     );
-    assert_eq!(
-        snap.lookup_child(Some(guid(1)), b"alice").unwrap(),
-        Some(guid(3))
-    );
+    for name in [&b"Alice"[..], b"alice", b"ALICE"] {
+        assert_eq!(
+            snap.lookup_child(Some(guid(1)), name).unwrap(),
+            Some(guid(2))
+        );
+    }
+    assert_eq!(snap.get_object(guid(3)).unwrap(), None);
 }
 
 #[test]
@@ -245,8 +260,8 @@ fn tree_rules() {
     create_all(
         &store,
         vec![
-            container(1, None, "root"),
-            container(2, Some(guid(1)), "ou"),
+            root(1, "root"),
+            container(2, guid(1), "ou"),
             principal(3, guid(2), "alice"),
         ],
     );
@@ -273,7 +288,7 @@ fn tree_rules() {
     ));
     // The GUID of a tombstone is still taken.
     assert!(matches!(
-        txn.create_object(container(2, Some(guid(1)), "ou2"), &origin(NODE_1, 1, 7)),
+        txn.create_object(container(2, guid(1), "ou2"), &origin(NODE_1, 1, 7)),
         Err(Error::ObjectExists)
     ));
     txn.commit().unwrap();
@@ -287,7 +302,7 @@ fn deleted_name_is_released() {
     let store = open_store(&dir);
     create_all(
         &store,
-        vec![container(1, None, "root"), principal(2, guid(1), "alice")],
+        vec![root(1, "root"), principal(2, guid(1), "alice")],
     );
     let mut txn = store.begin_write().unwrap();
     txn.delete_object(guid(2), &origin(NODE_1, 5, 1)).unwrap();
@@ -311,7 +326,7 @@ fn write_transaction_reads_its_own_writes() {
     let dir = TempDir::new("own-writes");
     let store = open_store(&dir);
     let mut txn = store.begin_write().unwrap();
-    txn.create_object(container(1, None, "root"), &origin(NODE_1, 1, 1))
+    txn.create_object(root(1, "root"), &origin(NODE_1, 1, 1))
         .unwrap();
     assert!(txn.get_object(guid(1)).unwrap().is_some());
     assert_eq!(txn.lookup_child(None, b"root").unwrap(), Some(guid(1)));

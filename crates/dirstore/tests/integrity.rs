@@ -6,11 +6,16 @@
 //! bounded parse). The "edit beneath the engine" is done here exactly as that
 //! threat describes: the store is closed and the redb file is opened directly
 //! through redb's public API, bypassing dirstore. Table names and key layout
-//! are dirstore's documented on-disk layout (src/store.rs module docs).
+//! are dirstore's documented on-disk layout (src/store.rs module docs). The
+//! reverse-link and unique-index tables (docs/46 §8.4, §8.5) are held to the
+//! same properties: tag bound to table and key (tamper → `Tamper`), entries
+//! cross-checked against the object they name (stale → `Inconsistent`), and
+//! a delete or purge that meets a bad record changes nothing.
 
 mod common;
 
 use common::*;
+use dirstore::record::{back_link_key, unique_index_key};
 use dirstore::{AttributeChange, Error, IntegrityKey, RecordKind, Store, Timestamp};
 use redb::{ReadableTable, TableDefinition};
 
@@ -20,6 +25,8 @@ const OBJECTS: &str = "dirstore.objects";
 const NAME_INDEX: &str = "dirstore.name_index";
 const CHILD_COUNT: &str = "dirstore.child_count";
 const META: &str = "dirstore.meta";
+const BACK_LINKS: &str = "dirstore.back_links";
+const UNIQUE_INDEX: &str = "dirstore.unique_index";
 
 /// Open the closed store's redb file directly and edit one table.
 fn edit_beneath(dir: &TempDir, table: &str, edit: impl FnOnce(&mut RawTable<'_>)) {
@@ -52,7 +59,7 @@ fn populated(test: &str) -> TempDir {
     create_all(
         &store,
         vec![
-            container(1, None, "root"),
+            root(1, "root"),
             principal(2, guid(1), "alice"),
             principal(3, guid(1), "bob"),
         ],
@@ -350,6 +357,402 @@ fn removed_meta_record_with_data_is_tamper() {
     // Source: docs/32 §3 — a populated store whose meta record vanished is
     // never silently adopted.
     let dir = populated("meta-removed");
+    edit_beneath(&dir, META, |t| {
+        t.remove(&b"store"[..]).unwrap();
+    });
+    assert!(matches!(
+        Store::open(dir.db_path(), key_a(), test_schema()),
+        Err(Error::Tamper(RecordKind::Meta))
+    ));
+}
+
+// ------------------------------------- reverse links and unique index (§8) --
+
+/// Back link id of ATTR_MEMBER (forward link id + 1, [MS-ADTS] 3.1.1.2.3).
+const MEMBER_BACK: u32 = MEMBER_LINK + 1;
+
+/// root(1); alice(2) with login "Alice"; bob(3); g1(4) = {alice, bob};
+/// g2(5) = {alice}. Closed on return.
+fn linked(test: &str) -> TempDir {
+    let dir = TempDir::new(test);
+    let store = open_store(&dir);
+    create_all(
+        &store,
+        vec![
+            root(1, "root"),
+            principal_with(
+                2,
+                guid(1),
+                "alice",
+                vec![(ATTR_LOGIN, vec![b"Alice".to_vec()])],
+            ),
+            principal(3, guid(1), "bob"),
+            principal_with(
+                4,
+                guid(1),
+                "g1",
+                vec![(ATTR_MEMBER, vec![ref_to(2), ref_to(3)])],
+            ),
+            principal_with(5, guid(1), "g2", vec![(ATTR_MEMBER, vec![ref_to(2)])]),
+        ],
+    );
+    dir
+}
+
+/// The reverse-link key "member of `group`" for `target`.
+fn link_key(target: u32, group: u32) -> Vec<u8> {
+    back_link_key(guid(target), MEMBER_BACK, guid(group)).to_vec()
+}
+
+fn set_members(store: &Store, group: u32, refs: Vec<Vec<u8>>) {
+    let mut txn = store.begin_write().unwrap();
+    txn.modify_object(
+        guid(group),
+        vec![AttributeChange::Replace {
+            id: ATTR_MEMBER,
+            values: refs,
+        }],
+        &origin(NODE_1, 700, 70),
+    )
+    .unwrap();
+    txn.commit().unwrap();
+}
+
+/// The store's objects 1..=5 as read now (to prove a refused write changed
+/// nothing).
+fn all_objects(store: &Store) -> Vec<Option<dirstore::Object>> {
+    let snap = store.snapshot().unwrap();
+    (1..=5).map(|i| snap.get_object(guid(i)).unwrap()).collect()
+}
+
+#[test]
+fn tampered_back_link_entry_is_tamper_and_blocks_writes() {
+    // Source: docs/46 §8.4 (the reverse-link table is HMAC-tagged with its own
+    // kind); docs/32 §3. A flipped byte is caught on the query and by every
+    // write that relies on the entry; a delete that meets it changes nothing.
+    let dir = linked("bl-flip");
+    edit_beneath(&dir, BACK_LINKS, |t| {
+        let key = link_key(2, 4);
+        let mut v = raw_value(t, &key);
+        v[0] ^= 0x01; // the format byte
+        t.insert(key.as_slice(), v.as_slice()).unwrap();
+    });
+    let store = open_store(&dir);
+    let before = all_objects(&store);
+    assert!(matches!(
+        store
+            .snapshot()
+            .unwrap()
+            .back_links(guid(2), ATTR_MEMBER_OF),
+        Err(Error::Tamper(RecordKind::BackLink))
+    ));
+    let mut txn = store.begin_write().unwrap();
+    // Delete of the target scans its reverse entries.
+    assert!(matches!(
+        txn.delete_object(guid(2), &origin(NODE_1, 1, 1)),
+        Err(Error::Tamper(RecordKind::BackLink))
+    ));
+    // Delete of the source removes its own entries.
+    assert!(matches!(
+        txn.delete_object(guid(4), &origin(NODE_1, 1, 2)),
+        Err(Error::Tamper(RecordKind::BackLink))
+    ));
+    // Modify that removes the value removes the entry.
+    assert!(matches!(
+        txn.modify_object(
+            guid(4),
+            vec![AttributeChange::Replace {
+                id: ATTR_MEMBER,
+                values: vec![ref_to(3)]
+            }],
+            &origin(NODE_1, 1, 3)
+        ),
+        Err(Error::Tamper(RecordKind::BackLink))
+    ));
+    txn.commit().unwrap();
+    assert_eq!(all_objects(&store), before);
+}
+
+#[test]
+fn back_link_entry_moved_to_another_key_is_tamper() {
+    // Source: docs/46 §8.4; docs/32 §3 — the tag binds the entry to its key
+    // (target, back link id, source): a valid entry copied under a forged key
+    // ("bob is a member of g2") is refused.
+    let dir = linked("bl-move");
+    edit_beneath(&dir, BACK_LINKS, |t| {
+        let v = raw_value(t, &link_key(2, 5));
+        let forged = link_key(3, 5);
+        t.insert(forged.as_slice(), v.as_slice()).unwrap();
+    });
+    let store = open_store(&dir);
+    assert!(matches!(
+        store
+            .snapshot()
+            .unwrap()
+            .back_links(guid(3), ATTR_MEMBER_OF),
+        Err(Error::Tamper(RecordKind::BackLink))
+    ));
+}
+
+#[test]
+fn replayed_back_link_entry_is_inconsistent() {
+    // Source: docs/46 §8.4; docs/32 §3; Q-060. An entry saved while alice was
+    // in g2, put back after she was removed, is validly tagged but stale: the
+    // cross-check against g2's own record catches it — on the query, on a
+    // delete of the target (which changes nothing), and on a purge.
+    let dir = linked("bl-replay");
+    let mut saved = Vec::new();
+    edit_beneath(&dir, BACK_LINKS, |t| saved = raw_value(t, &link_key(2, 5)));
+    {
+        let store = open_store(&dir);
+        set_members(&store, 5, vec![]);
+    }
+    edit_beneath(&dir, BACK_LINKS, |t| {
+        t.insert(link_key(2, 5).as_slice(), saved.as_slice())
+            .unwrap();
+    });
+    let store = open_store(&dir);
+    let before = all_objects(&store);
+    assert!(matches!(
+        store
+            .snapshot()
+            .unwrap()
+            .back_links(guid(2), ATTR_MEMBER_OF),
+        Err(Error::Inconsistent(RecordKind::BackLink))
+    ));
+    let mut txn = store.begin_write().unwrap();
+    assert!(matches!(
+        txn.delete_object(guid(2), &origin(NODE_1, 1, 1)),
+        Err(Error::Inconsistent(RecordKind::BackLink))
+    ));
+    txn.commit().unwrap();
+    assert_eq!(all_objects(&store), before);
+}
+
+#[test]
+fn stale_back_link_to_a_tombstone_blocks_purge() {
+    // Source: docs/46 §8.4 (a deleted object's references are all removed);
+    // docs/29 §5 (purge). An entry saved before bob's delete and put back
+    // targets a tombstone; a purge meeting it removes nothing.
+    let dir = linked("bl-purge");
+    let mut saved = Vec::new();
+    edit_beneath(&dir, BACK_LINKS, |t| saved = raw_value(t, &link_key(3, 4)));
+    {
+        let store = open_store(&dir);
+        let mut txn = store.begin_write().unwrap();
+        txn.delete_object(guid(3), &origin(NODE_1, 10, 1)).unwrap();
+        txn.commit().unwrap();
+    }
+    edit_beneath(&dir, BACK_LINKS, |t| {
+        t.insert(link_key(3, 4).as_slice(), saved.as_slice())
+            .unwrap();
+    });
+    let store = open_store(&dir);
+    let mut txn = store.begin_write().unwrap();
+    assert!(matches!(
+        txn.purge_tombstones(Timestamp(u64::MAX), 0),
+        Err(Error::Inconsistent(RecordKind::BackLink))
+    ));
+    txn.commit().unwrap();
+    assert!(store
+        .snapshot()
+        .unwrap()
+        .get_tombstone(guid(3))
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn removed_back_link_entry_is_inconsistent_where_relied_on() {
+    // Source: docs/46 §8.4; docs/32 §3; Q-060 — a removed entry is caught
+    // where the engine relies on it: removing the forward value, or deleting
+    // its source, must remove an existing entry.
+    let dir = linked("bl-removed");
+    edit_beneath(&dir, BACK_LINKS, |t| {
+        t.remove(link_key(3, 4).as_slice()).unwrap();
+    });
+    let store = open_store(&dir);
+    let before = all_objects(&store);
+    let mut txn = store.begin_write().unwrap();
+    assert!(matches!(
+        txn.modify_object(
+            guid(4),
+            vec![AttributeChange::Replace {
+                id: ATTR_MEMBER,
+                values: vec![ref_to(2)]
+            }],
+            &origin(NODE_1, 1, 1)
+        ),
+        Err(Error::Inconsistent(RecordKind::BackLink))
+    ));
+    assert!(matches!(
+        txn.delete_object(guid(4), &origin(NODE_1, 1, 2)),
+        Err(Error::Inconsistent(RecordKind::BackLink))
+    ));
+    txn.commit().unwrap();
+    assert_eq!(all_objects(&store), before);
+}
+
+#[test]
+fn tampered_unique_entry_is_tamper_and_blocks_writes() {
+    // Source: docs/46 §8.5 (integrity-tagged index); docs/32 §3. A delete
+    // that meets the bad entry changes nothing.
+    let dir = linked("uq-flip");
+    let key = unique_index_key(ATTR_LOGIN, b"alice");
+    edit_beneath(&dir, UNIQUE_INDEX, |t| {
+        let mut v = raw_value(t, &key);
+        v[5] ^= 0x01; // inside the owner GUID
+        t.insert(key.as_slice(), v.as_slice()).unwrap();
+    });
+    let store = open_store(&dir);
+    let before = all_objects(&store);
+    assert!(matches!(
+        store
+            .snapshot()
+            .unwrap()
+            .lookup_unique(ATTR_LOGIN, b"ALICE"),
+        Err(Error::Tamper(RecordKind::UniqueIndex))
+    ));
+    let mut txn = store.begin_write().unwrap();
+    assert!(matches!(
+        txn.create_object(
+            principal_with(
+                9,
+                guid(1),
+                "mallory",
+                vec![(ATTR_LOGIN, vec![b"alice".to_vec()])]
+            ),
+            &origin(NODE_1, 1, 1)
+        ),
+        Err(Error::Tamper(RecordKind::UniqueIndex))
+    ));
+    assert!(matches!(
+        txn.delete_object(guid(2), &origin(NODE_1, 1, 2)),
+        Err(Error::Tamper(RecordKind::UniqueIndex))
+    ));
+    txn.commit().unwrap();
+    assert_eq!(all_objects(&store), before);
+}
+
+#[test]
+fn unique_entry_moved_to_another_key_is_tamper() {
+    // Source: docs/46 §8.5; docs/32 §3 — the tag binds the entry to
+    // (attribute, comparison key): alice's entry copied under the key of
+    // another value is refused.
+    let dir = linked("uq-move");
+    edit_beneath(&dir, UNIQUE_INDEX, |t| {
+        let v = raw_value(t, &unique_index_key(ATTR_LOGIN, b"alice"));
+        let forged = unique_index_key(ATTR_LOGIN, b"root-admin");
+        t.insert(forged.as_slice(), v.as_slice()).unwrap();
+    });
+    let store = open_store(&dir);
+    assert!(matches!(
+        store
+            .snapshot()
+            .unwrap()
+            .lookup_unique(ATTR_LOGIN, b"root-admin"),
+        Err(Error::Tamper(RecordKind::UniqueIndex))
+    ));
+}
+
+#[test]
+fn replayed_unique_entry_is_inconsistent() {
+    // Source: docs/46 §8.5; docs/32 §3; Q-060. Alice's entry, saved before
+    // she changed her login, is validly tagged but stale once put back: the
+    // cross-check against her record catches it on lookup and on a create
+    // that would take the value.
+    let dir = linked("uq-replay");
+    let key = unique_index_key(ATTR_LOGIN, b"alice");
+    let mut saved = Vec::new();
+    edit_beneath(&dir, UNIQUE_INDEX, |t| saved = raw_value(t, &key));
+    {
+        let store = open_store(&dir);
+        let mut txn = store.begin_write().unwrap();
+        txn.modify_object(
+            guid(2),
+            vec![AttributeChange::Replace {
+                id: ATTR_LOGIN,
+                values: vec![b"carol".to_vec()],
+            }],
+            &origin(NODE_1, 20, 1),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+    }
+    edit_beneath(&dir, UNIQUE_INDEX, |t| {
+        t.insert(key.as_slice(), saved.as_slice()).unwrap();
+    });
+    let store = open_store(&dir);
+    assert!(matches!(
+        store
+            .snapshot()
+            .unwrap()
+            .lookup_unique(ATTR_LOGIN, b"alice"),
+        Err(Error::Inconsistent(RecordKind::UniqueIndex))
+    ));
+    let mut txn = store.begin_write().unwrap();
+    assert!(matches!(
+        txn.create_object(
+            principal_with(
+                9,
+                guid(1),
+                "mallory",
+                vec![(ATTR_LOGIN, vec![b"Alice".to_vec()])]
+            ),
+            &origin(NODE_1, 21, 2)
+        ),
+        Err(Error::Inconsistent(RecordKind::UniqueIndex))
+    ));
+}
+
+#[test]
+fn removed_unique_entry_is_inconsistent_on_delete() {
+    // Source: docs/46 §8.5; docs/32 §3; Q-060 — a removed entry is caught
+    // where it is relied on: deleting the owner must remove an existing entry
+    // naming it; the refused delete changes nothing.
+    let dir = linked("uq-removed");
+    edit_beneath(&dir, UNIQUE_INDEX, |t| {
+        t.remove(unique_index_key(ATTR_SID, &sid_value(1003)).as_slice())
+            .unwrap();
+    });
+    let store = open_store(&dir);
+    let before = all_objects(&store);
+    let mut txn = store.begin_write().unwrap();
+    assert!(matches!(
+        txn.delete_object(guid(3), &origin(NODE_1, 1, 1)),
+        Err(Error::Inconsistent(RecordKind::UniqueIndex))
+    ));
+    txn.commit().unwrap();
+    assert_eq!(all_objects(&store), before);
+}
+
+#[test]
+fn removed_meta_record_with_only_index_records_is_tamper() {
+    // Source: docs/32 §3 — a store whose meta record vanished is never
+    // silently adopted, whichever tables still hold records.
+    let dir = linked("meta-removed-index");
+    edit_beneath(&dir, OBJECTS, |t| {
+        let keys: Vec<Vec<u8>> = t
+            .iter()
+            .unwrap()
+            .map(|e| e.unwrap().0.value().to_vec())
+            .collect();
+        for k in keys {
+            t.remove(k.as_slice()).unwrap();
+        }
+    });
+    for table in [NAME_INDEX, CHILD_COUNT] {
+        edit_beneath(&dir, table, |t| {
+            let keys: Vec<Vec<u8>> = t
+                .iter()
+                .unwrap()
+                .map(|e| e.unwrap().0.value().to_vec())
+                .collect();
+            for k in keys {
+                t.remove(k.as_slice()).unwrap();
+            }
+        });
+    }
     edit_beneath(&dir, META, |t| {
         t.remove(&b"store"[..]).unwrap();
     });

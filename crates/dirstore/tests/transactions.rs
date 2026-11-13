@@ -14,7 +14,7 @@ fn dropped_write_leaves_no_trace() {
     // Source: D136 — dropping an uncommitted transaction leaves nothing.
     let dir = TempDir::new("drop");
     let store = open_store(&dir);
-    create_all(&store, vec![container(1, None, "root")]);
+    create_all(&store, vec![root(1, "root")]);
     {
         let mut txn = store.begin_write().unwrap();
         txn.create_object(principal(2, guid(1), "alice"), &origin(NODE_1, 1, 1))
@@ -57,7 +57,7 @@ fn aborted_write_leaves_no_trace_even_after_reopen() {
     {
         let store = open_store(&dir);
         let mut txn = store.begin_write().unwrap();
-        txn.create_object(container(1, None, "root"), &origin(NODE_1, 1, 1))
+        txn.create_object(root(1, "root"), &origin(NODE_1, 1, 1))
             .unwrap();
         txn.abort().unwrap();
     }
@@ -73,7 +73,7 @@ fn several_operations_commit_together() {
     let dir = TempDir::new("together");
     let store = open_store(&dir);
     let mut txn = store.begin_write().unwrap();
-    txn.create_object(container(1, None, "root"), &origin(NODE_1, 1, 1))
+    txn.create_object(root(1, "root"), &origin(NODE_1, 1, 1))
         .unwrap();
     txn.create_object(principal(2, guid(1), "alice"), &origin(NODE_1, 1, 2))
         .unwrap();
@@ -93,7 +93,7 @@ fn snapshot_does_not_see_later_commits() {
     // neither the value nor the index.
     let dir = TempDir::new("isolation");
     let store = open_store(&dir);
-    create_all(&store, vec![container(1, None, "root")]);
+    create_all(&store, vec![root(1, "root")]);
 
     let old = store.snapshot().unwrap();
 
@@ -153,7 +153,7 @@ fn snapshot_keeps_seeing_a_deleted_object() {
     // Source: docs/32 §6 (D39) with docs/29 §5.
     let dir = TempDir::new("isolation-delete");
     let store = open_store(&dir);
-    create_all(&store, vec![container(1, None, "root")]);
+    create_all(&store, vec![root(1, "root")]);
     let old = store.snapshot().unwrap();
     let mut txn = store.begin_write().unwrap();
     txn.delete_object(guid(1), &origin(NODE_1, 9, 1)).unwrap();

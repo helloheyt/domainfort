@@ -22,7 +22,12 @@
 //!
 //! Known limit (docs/questions/Q-060): a per-record tag cannot detect the
 //! replay of an older, validly tagged version of the same record, nor the
-//! removal of a whole set of related records.
+//! removal of a whole set of related records. The same holds for the
+//! reverse-link and unique-index tables (docs/46 §8.4-§8.5): a *stale* entry
+//! put back is caught by the cross-check against the object it names, but a
+//! *removed* entry is noticed only where it is relied on (delete / modify of
+//! the value it indexes) — not by a delete of the target, nor by a create
+//! that would duplicate a value whose entry vanished.
 
 use crate::error::{Error, RecordKind, Result};
 use crate::MAX_RECORD_BODY_LEN;
@@ -78,6 +83,10 @@ fn kind_tag(kind: RecordKind) -> u8 {
         RecordKind::Object => 0x02,
         RecordKind::NameIndex => 0x03,
         RecordKind::ChildCount => 0x04,
+        // Spec: docs/46 §8.4 ("tagged with HMAC like name_index, with its
+        // own kind"), §8.5.
+        RecordKind::BackLink => 0x05,
+        RecordKind::UniqueIndex => 0x06,
     }
 }
 
@@ -92,8 +101,10 @@ fn keyed(
     // (no panic path).
     let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&key.key[..])
         .map_err(|_| Error::IntegrityKeyUnusable)?;
-    // Record keys are bounded far below 4 GiB (16-byte GUIDs, or 17 bytes
-    // plus an RDN key of at most MAX_RDN_KEY_LEN); refuse rather than wrap.
+    // Record keys are bounded far below 4 GiB (16-byte GUIDs, 17 bytes plus
+    // an RDN key of at most MAX_RDN_KEY_LEN, 36-byte reverse-link keys, or 4
+    // bytes plus a comparison key of at most MAX_VALUE_LEN); refuse rather
+    // than wrap.
     let key_len = u32::try_from(record_key.len()).map_err(|_| Error::Tamper(kind))?;
     mac.update(MAC_CONTEXT);
     mac.update(&[kind_tag(kind)]);

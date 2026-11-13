@@ -6,9 +6,11 @@
 //! implementation.
 
 use dirstore::record::{
+    back_link_key, back_link_prefix, decode_back_link_body, decode_back_link_key,
     decode_child_count_body, decode_meta_body, decode_name_index_body, decode_object_body,
-    encode_child_count_body, encode_meta_body, encode_name_index_body, encode_object_body,
-    name_index_key, RECORD_FORMAT_V1,
+    decode_unique_index_body, encode_back_link_body, encode_child_count_body, encode_meta_body,
+    encode_name_index_body, encode_object_body, encode_unique_index_body, name_index_key,
+    unique_index_key, BACK_LINK_KEY_LEN, RECORD_FORMAT_V1,
 };
 use dirstore::{
     AttrId, AttrStamp, Attribute, ClassId, DecodeError, NodeId, Object, StampedValue, Timestamp,
@@ -507,6 +509,74 @@ fn index_and_meta_bodies() {
     assert_eq!(encode_meta_body(), vec![RECORD_FORMAT_V1]);
     assert_eq!(decode_meta_body(&[RECORD_FORMAT_V1]), Ok(()));
     assert_eq!(decode_meta_body(&[2]), Err(DecodeError::UnsupportedFormat));
+}
+
+#[test]
+fn back_link_key_and_body_layout() {
+    // Source: src/record.rs reverse-link layout; docs/46 §8.4 ("key (target
+    // GUID, back link_id u32 BE, source GUID)").
+    let key = back_link_key(G, 3, P);
+    assert_eq!(key.len(), BACK_LINK_KEY_LEN);
+    assert_eq!(BACK_LINK_KEY_LEN, 36);
+    assert_eq!(&key[..16], &G.to_packet());
+    assert_eq!(&key[16..20], &[0, 0, 0, 3]);
+    assert_eq!(&key[20..], &P.to_packet());
+    assert_eq!(decode_back_link_key(&key), Ok((G, 3, P)));
+    // The scan prefixes are exactly the leading parts of the key.
+    assert_eq!(back_link_prefix(G, None).as_slice(), &key[..16]);
+    assert_eq!(back_link_prefix(G, Some(3)).as_slice(), &key[..20]);
+    // A key of any other length is refused (it is read back from disk).
+    assert_eq!(
+        decode_back_link_key(&key[..35]),
+        Err(DecodeError::KeyLength)
+    );
+    let mut long = key.to_vec();
+    long.push(0);
+    assert_eq!(decode_back_link_key(&long), Err(DecodeError::KeyLength));
+    // Body: the format byte only.
+    assert_eq!(encode_back_link_body(), vec![RECORD_FORMAT_V1]);
+    assert_eq!(decode_back_link_body(&[RECORD_FORMAT_V1]), Ok(()));
+    assert_eq!(decode_back_link_body(&[]), Err(DecodeError::Truncated));
+    assert_eq!(
+        decode_back_link_body(&[2]),
+        Err(DecodeError::UnsupportedFormat)
+    );
+    assert_eq!(
+        decode_back_link_body(&[RECORD_FORMAT_V1, 0]),
+        Err(DecodeError::TrailingData)
+    );
+}
+
+#[test]
+fn unique_index_key_and_body_layout() {
+    // Source: src/record.rs unique-index layout; docs/46 §8.5.
+    assert_eq!(
+        unique_index_key(AttrId(0x0102_0304), b"ab"),
+        vec![1, 2, 3, 4, b'a', b'b']
+    );
+    // Attribute 0 is an ordinary id (docs/46 §8.6); the empty key is a key.
+    assert_eq!(unique_index_key(AttrId(0), b""), vec![0, 0, 0, 0]);
+    let body = encode_unique_index_body(G);
+    assert_eq!(body.len(), 17);
+    assert_eq!(body[0], RECORD_FORMAT_V1);
+    assert_eq!(&body[1..], &G.to_packet());
+    assert_eq!(decode_unique_index_body(&body), Ok(G));
+    assert_eq!(
+        decode_unique_index_body(&body[..16]),
+        Err(DecodeError::Truncated)
+    );
+    let mut long = body.clone();
+    long.push(0);
+    assert_eq!(
+        decode_unique_index_body(&long),
+        Err(DecodeError::TrailingData)
+    );
+    let mut format = body;
+    format[0] = 2;
+    assert_eq!(
+        decode_unique_index_body(&format),
+        Err(DecodeError::UnsupportedFormat)
+    );
 }
 
 #[test]

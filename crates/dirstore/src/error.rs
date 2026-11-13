@@ -26,6 +26,12 @@ pub enum RecordKind {
     NameIndex,
     /// A per-parent live-child count. Spec: docs/32 §2 (DIT shape).
     ChildCount,
+    /// A reverse-link entry `(target, back link id, source)`.
+    /// Spec: docs/46 §8.4; docs/32 §7 (D136).
+    BackLink,
+    /// A unique-index entry `(attribute, comparison key) -> GUID`.
+    /// Spec: docs/46 §8.5.
+    UniqueIndex,
 }
 
 /// A rule of the record codec that a stored body broke. Raised only after the
@@ -67,6 +73,9 @@ pub enum DecodeError {
     RecordTooLarge,
     /// A child-count record held zero (absent is the only encoding of zero).
     ZeroChildCount,
+    /// An index key read back from disk does not have its table's layout.
+    /// Spec: docs/46 §8.4 (reverse-link key layout); docs/32 §8.
+    KeyLength,
 }
 
 /// A rule an object (or a requested change) breaks: schema rules
@@ -110,9 +119,87 @@ pub enum Violation {
     /// Spec: docs/32 §4 ("type"); docs/14 D60 (strict validation of what is
     /// stored).
     InvalidValueSyntax(AttrId),
-    /// Two byte-equal values in one attribute. Spec: docs/29 §4 (values form a
-    /// set).
+    /// Two byte-equal values in one attribute — or, for a `unique`
+    /// attribute, two values with the same comparison key. Spec: docs/29 §4
+    /// (values form a set); docs/46 §8.5.
     DuplicateValue(AttrId),
+
+    // ---- derived attributes and value rules (docs/46 §8.2) ----
+    /// The attribute is Derived: it is never stored, and every write naming
+    /// it is refused. Spec: docs/46 §5.4, §8.2; [MS-ADTS] 3.1.1.1.6 (servers
+    /// MUST reject writes to a back link), 3.1.1.5.3.2 (constructed
+    /// attributes cannot be modified).
+    DerivedAttribute(AttrId),
+    /// A value is outside the attribute's range (value range for integers
+    /// and times, UTF-16 length for Utf8String, byte length otherwise).
+    /// Spec: docs/46 §8.2; [MS-ADTS] 3.1.1.2.3 (rangeLower / rangeUpper).
+    ValueOutOfRange(AttrId),
+    /// An Integer32 value sets a bit outside the attribute's allowed bits.
+    /// Spec: docs/46 §8.2 (`AllowedBits`, R46-6).
+    DisallowedBits(AttrId),
+    /// An Integer32 value is not one of the attribute's allowed values.
+    /// Spec: docs/46 §8.2 (`AllowedValues`, R46-6).
+    ValueNotAllowed(AttrId),
+    /// A value of a `unique` Utf8String attribute is not printable ASCII, so
+    /// it has no comparison key in phase 1. Spec: docs/46 §8.5; Q-080
+    /// (interim: ASCII + A–Z fold, P-9).
+    ComparisonKeyNotAscii(AttrId),
+
+    // ---- class chain and tree shape (docs/46 §8.3 items 1-2) ----
+    /// The classes are not `SUPCLASSES(c) ∪ {c}` for exactly one class `c`.
+    /// Spec: docs/46 §8.3 item 1; [MS-ADTS] 3.1.1.5.2.2 ("a single, most
+    /// specific structural objectClass"), 3.1.1.2.4.3, 3.1.1.4.2.
+    InvalidClassChain,
+    /// The most specific class is not instantiable. Spec: docs/46 §8.3 item 1;
+    /// [MS-ADTS] 3.1.1.5.2.2 (objectClassCategory 0 or 1 only).
+    ClassNotInstantiable(ClassId),
+    /// An object of an NC-root class has a parent. Spec: docs/46 §8.3 item 2.
+    NcRootHasParent,
+    /// An object of a class that is not an NC root has no parent.
+    /// Spec: docs/46 §8.3 item 2.
+    ParentRequired,
+    /// The parent's most specific class (named) is not a possible superior
+    /// of the new object's class. Spec: docs/46 §8.3 item 2; [MS-ADTS]
+    /// 3.1.1.5.2.2 (possSuperiors), 3.1.1.2.4.4.
+    ParentClassNotAllowed(ClassId),
+
+    // ---- RDN (docs/46 §8.3 item 3) ----
+    /// The RDN attribute of the most specific class is absent.
+    /// Spec: docs/46 §8.3 item 3; [MS-ADTS] 3.1.1.1.4.
+    RdnAttributeMissing(AttrId),
+    /// The RDN attribute holds more than one value ("the RDN attribute of an
+    /// object always has exactly one value"). Spec: [MS-ADTS] 3.1.1.1.4,
+    /// 3.1.1.3.1.2.1.
+    RdnAttributeMultiValued(AttrId),
+    /// The RDN value contains a character 0x00 or 0x0A.
+    /// Spec: [MS-ADTS] 3.1.1.5.1.2.
+    RdnForbiddenCharacter,
+    /// The RDN value is not printable ASCII (0x20..=0x7E), so it has no
+    /// phase-1 RDN key. Spec: Q-080 (interim, P-9); docs/46 §8.3 item 3.
+    RdnNotAscii,
+    /// The RDN (`att=val`) is not under [`crate::RDN_SIZE_LIMIT`] characters.
+    /// Spec: [MS-ADTS] 3.1.1.5.1.2; docs/46 §8.3 (strict reading); Q-090.
+    RdnTooLong,
+    /// A stored object's RDN key is not the key computed from its RDN value
+    /// (re-validation on read). Spec: docs/46 §8.3 item 3; docs/14 D60.
+    RdnKeyMismatch,
+    /// A modify names the object's RDN attribute; renaming is a separate
+    /// operation (out of scope). Spec: [MS-ADTS] 3.1.1.5.3.2
+    /// (notAllowedOnRDN).
+    RdnAttributeNotModifiable(AttrId),
+
+    // ---- identity ----
+    /// The object GUID is the NULL GUID: "No actual object has objectGUID
+    /// equal to the NULL GUID". Spec: [MS-ADTS] 3.1.1.1.3.
+    NullGuid,
+
+    // ---- query arguments ----
+    /// A back-link query named an attribute that is not a Back link.
+    /// Spec: docs/46 §8.4.
+    NotBackLink(AttrId),
+    /// A unique-index lookup named an attribute that is not `unique`.
+    /// Spec: docs/46 §8.5.
+    NotUnique(AttrId),
 
     // ---- resource bounds (docs/32 §8) ----
     /// More than [`crate::MAX_CLASSES_PER_OBJECT`] classes.
@@ -158,6 +245,83 @@ pub enum SchemaDefect {
     SecretMustAttribute(ClassId, AttrId),
     /// A class lists more attributes than an object may hold.
     TooManyAttributesInClass(ClassId),
+
+    // ---- attribute definition rules (docs/46 §8.2) ----
+    /// A link id is zero ("not a link"), or its parity does not match the
+    /// link kind (even = forward, odd = back). Spec: [MS-ADTS] 3.1.1.2.3
+    /// (linkID); docs/46 §8.2.
+    InvalidLinkId(AttrId),
+    /// Two forward (or two back) links share a link id. Spec: [MS-ADTS]
+    /// 3.1.1.2.3 ("the linkID value is unique").
+    DuplicateLinkId(AttrId),
+    /// A forward link that is not a Stored attribute of syntax ObjectRef.
+    /// Spec: docs/46 §2.3 item 2, §8.2.
+    InvalidForwardLink(AttrId),
+    /// A back link whose forward link (link id − 1) is not defined.
+    /// Spec: [MS-ADTS] 3.1.1.1.6 ("A forward link attribute can exist with no
+    /// corresponding back link attribute, but not vice versa"), 3.1.1.2.3.
+    BackLinkWithoutForward(AttrId),
+    /// A back link that is not Derived. Spec: docs/46 §2.3 item 3, §8.2;
+    /// [MS-ADTS] 3.1.1.1.6 (a back link is constructed).
+    BackLinkNotDerived(AttrId),
+    /// A Stored ObjectRef attribute that is not a forward link (phase 1:
+    /// ObjectRef ⇔ Forward). Spec: docs/46 §2.3 item 2, §8.2.
+    ObjectRefWithoutForwardLink(AttrId),
+    /// A range with lower > upper, or that no value of the syntax (within the
+    /// attribute's byte bound) can satisfy. Spec: docs/46 §8.2.
+    InvalidRange(AttrId),
+    /// A range on a syntax it cannot apply to: "rangeLower does not affect
+    /// the allowed values for syntax Boolean and Object(DS-DN)".
+    /// Spec: [MS-ADTS] 3.1.1.2.3; docs/46 §8.2.
+    RangeNotApplicable(AttrId),
+    /// A value constraint on a syntax other than Integer32, or an empty
+    /// allowed-value list. Spec: docs/46 §8.2.
+    InvalidConstraint(AttrId),
+    /// A Derived attribute carries a rule that only applies to stored values
+    /// (range, constraint, unique, or an RDN label). Spec: docs/46 §8.2.
+    DerivedAttributeRule(AttrId),
+    /// `unique` on an attribute that is never stored (Secret) or on a link.
+    /// Spec: docs/46 §8.5; docs/12 D44.
+    UniqueNotApplicable(AttrId),
+    /// An RDN label length of 0 or above [`crate::MAX_RDN_ATT_LEN`].
+    /// Spec: [MS-ADTS] 3.1.1.1.4, 3.1.1.5.1.2; Q-090.
+    InvalidRdnAttLen(AttrId),
+
+    // ---- class definition rules (docs/46 §8.2-§8.3) ----
+    /// A class requires a Derived attribute, which can never be written.
+    /// Spec: docs/46 §8.2 ("forbidden in must").
+    DerivedMustAttribute(ClassId, AttrId),
+    /// A class requires a forward link: deleting the last target would leave
+    /// the referencing object without a must-attribute. Spec: docs/46 §8.4;
+    /// [MS-ADTS] 3.1.1.1.6 (references to a deleted object are removed).
+    LinkMustAttribute(ClassId, AttrId),
+    /// A class names a superclass that is not defined. Spec: docs/46 §8.3.
+    UnknownSuperclass(ClassId, ClassId),
+    /// A class's superclass chain is cyclic or longer than
+    /// [`crate::MAX_CLASSES_PER_OBJECT`]. Spec: [MS-ADTS] 3.1.1.4.2
+    /// (SUPCLASSES); docs/32 §8.
+    InvalidClassChain(ClassId),
+    /// A class's RDN attribute is not defined. Spec: docs/46 §8.3.
+    UndefinedRdnAttribute(ClassId, AttrId),
+    /// A class's RDN attribute is not a Stored, non-Secret Utf8String
+    /// attribute with an RDN label length. Spec: [MS-ADTS] 3.1.1.3.1.2.1
+    /// ("MUST be of String(Unicode) syntax"), 3.1.1.2.4.7; Q-090.
+    InvalidRdnAttribute(ClassId, AttrId),
+    /// An instantiable class whose chain allows neither must nor may of its
+    /// RDN attribute. Spec: docs/46 §8.3 item 3; [MS-ADTS] 3.1.1.4.2
+    /// (CLASSATTS).
+    RdnAttributeNotAllowed(ClassId, AttrId),
+    /// A class names a possible superior that is not defined.
+    /// Spec: docs/46 §8.3.
+    UnknownPossSuperior(ClassId, ClassId),
+    /// A class names the same possible superior twice. Spec: docs/32 §4.
+    DuplicatePossSuperior(ClassId, ClassId),
+    /// An NC-root class that is not instantiable or lists possible superiors
+    /// (an NC root has no parent). Spec: docs/46 §8.3 item 2.
+    InvalidNcRoot(ClassId),
+    /// An instantiable class that is not an NC root has no possible superior,
+    /// so no object of it could be created. Spec: docs/46 §8.3 item 2.
+    NoPossSuperiors(ClassId),
 }
 
 /// Any failure of the storage engine.
@@ -200,6 +364,13 @@ pub enum Error {
     /// The object still has live children; delete them first.
     /// Spec: docs/32 §2 (DIT: a live object's parent is live).
     HasChildren,
+    /// An ObjectRef value of this attribute names no live object (absent or a
+    /// tombstone). Spec: docs/46 §2.3 item 4, §8.4; [MS-ADTS] 3.1.1.1.6
+    /// (noSuchObject).
+    NoSuchTarget(AttrId),
+    /// Another live object already holds a value of this `unique` attribute
+    /// with the same comparison key. Spec: docs/46 §8.5.
+    ValueNotUnique(AttrId),
     /// An attribute's version counter cannot be incremented.
     /// Spec: docs/29 §2 (version rises on every change).
     VersionOverflow,
@@ -219,6 +390,8 @@ impl fmt::Display for RecordKind {
             RecordKind::Object => "object",
             RecordKind::NameIndex => "name index",
             RecordKind::ChildCount => "child count",
+            RecordKind::BackLink => "reverse link",
+            RecordKind::UniqueIndex => "unique index",
         })
     }
 }
@@ -241,6 +414,7 @@ impl fmt::Display for DecodeError {
             DecodeError::ValueOrder => "values not strictly ascending",
             DecodeError::RecordTooLarge => "record body too large",
             DecodeError::ZeroChildCount => "child count record holds zero",
+            DecodeError::KeyLength => "index key has the wrong length",
         })
     }
 }
@@ -273,6 +447,46 @@ impl fmt::Display for Violation {
                 write!(f, "value of attribute {} does not match its syntax", a.0)
             }
             Violation::DuplicateValue(a) => write!(f, "attribute {} has a duplicate value", a.0),
+            Violation::DerivedAttribute(a) => {
+                write!(f, "attribute {} is derived and never written", a.0)
+            }
+            Violation::ValueOutOfRange(a) => write!(f, "value of attribute {} out of range", a.0),
+            Violation::DisallowedBits(a) => {
+                write!(f, "value of attribute {} sets a disallowed bit", a.0)
+            }
+            Violation::ValueNotAllowed(a) => {
+                write!(f, "value of attribute {} is not an allowed value", a.0)
+            }
+            Violation::ComparisonKeyNotAscii(a) => {
+                write!(
+                    f,
+                    "value of unique attribute {} is not printable ASCII",
+                    a.0
+                )
+            }
+            Violation::InvalidClassChain => {
+                f.write_str("classes are not the chain of one most specific class")
+            }
+            Violation::ClassNotInstantiable(c) => write!(f, "class {} is not instantiable", c.0),
+            Violation::NcRootHasParent => f.write_str("naming-context root has a parent"),
+            Violation::ParentRequired => f.write_str("object requires a parent"),
+            Violation::ParentClassNotAllowed(c) => {
+                write!(f, "parent class {} is not a possible superior", c.0)
+            }
+            Violation::RdnAttributeMissing(a) => write!(f, "RDN attribute {} is absent", a.0),
+            Violation::RdnAttributeMultiValued(a) => {
+                write!(f, "RDN attribute {} has more than one value", a.0)
+            }
+            Violation::RdnForbiddenCharacter => f.write_str("RDN contains 0x00 or 0x0A"),
+            Violation::RdnNotAscii => f.write_str("RDN is not printable ASCII"),
+            Violation::RdnTooLong => f.write_str("RDN is not under the size limit"),
+            Violation::RdnKeyMismatch => f.write_str("stored RDN key does not match RDN value"),
+            Violation::RdnAttributeNotModifiable(a) => {
+                write!(f, "RDN attribute {} cannot be modified", a.0)
+            }
+            Violation::NullGuid => f.write_str("object GUID is the NULL GUID"),
+            Violation::NotBackLink(a) => write!(f, "attribute {} is not a back link", a.0),
+            Violation::NotUnique(a) => write!(f, "attribute {} is not unique", a.0),
             Violation::TooManyClasses => f.write_str("too many object classes"),
             Violation::TooManyAttributes => f.write_str("too many attributes"),
             Violation::TooManyValues(a) => write!(f, "attribute {} has too many values", a.0),
@@ -309,6 +523,71 @@ impl fmt::Display for SchemaDefect {
             SchemaDefect::TooManyAttributesInClass(c) => {
                 write!(f, "class {} lists too many attributes", c.0)
             }
+            SchemaDefect::InvalidLinkId(a) => write!(f, "attribute {} has an invalid link id", a.0),
+            SchemaDefect::DuplicateLinkId(a) => {
+                write!(f, "attribute {} reuses a link id", a.0)
+            }
+            SchemaDefect::InvalidForwardLink(a) => {
+                write!(f, "forward link {} is not a stored object reference", a.0)
+            }
+            SchemaDefect::BackLinkWithoutForward(a) => {
+                write!(f, "back link {} has no forward link", a.0)
+            }
+            SchemaDefect::BackLinkNotDerived(a) => {
+                write!(f, "back link {} is not derived", a.0)
+            }
+            SchemaDefect::ObjectRefWithoutForwardLink(a) => {
+                write!(f, "stored object reference {} is not a forward link", a.0)
+            }
+            SchemaDefect::InvalidRange(a) => write!(f, "attribute {} has an invalid range", a.0),
+            SchemaDefect::RangeNotApplicable(a) => {
+                write!(f, "attribute {} cannot carry a range", a.0)
+            }
+            SchemaDefect::InvalidConstraint(a) => {
+                write!(f, "attribute {} has an invalid value constraint", a.0)
+            }
+            SchemaDefect::DerivedAttributeRule(a) => {
+                write!(f, "derived attribute {} carries a stored-value rule", a.0)
+            }
+            SchemaDefect::UniqueNotApplicable(a) => {
+                write!(f, "attribute {} cannot be unique", a.0)
+            }
+            SchemaDefect::InvalidRdnAttLen(a) => {
+                write!(f, "attribute {} has an invalid RDN label length", a.0)
+            }
+            SchemaDefect::DerivedMustAttribute(c, a) => {
+                write!(f, "class {} requires derived attribute {}", c.0, a.0)
+            }
+            SchemaDefect::LinkMustAttribute(c, a) => {
+                write!(f, "class {} requires link attribute {}", c.0, a.0)
+            }
+            SchemaDefect::UnknownSuperclass(c, s) => {
+                write!(f, "class {} names undefined superclass {}", c.0, s.0)
+            }
+            SchemaDefect::InvalidClassChain(c) => {
+                write!(f, "class {} has a cyclic or too long superclass chain", c.0)
+            }
+            SchemaDefect::UndefinedRdnAttribute(c, a) => {
+                write!(f, "class {} names undefined RDN attribute {}", c.0, a.0)
+            }
+            SchemaDefect::InvalidRdnAttribute(c, a) => {
+                write!(f, "class {} has unusable RDN attribute {}", c.0, a.0)
+            }
+            SchemaDefect::RdnAttributeNotAllowed(c, a) => {
+                write!(f, "class {} does not allow its RDN attribute {}", c.0, a.0)
+            }
+            SchemaDefect::UnknownPossSuperior(c, p) => {
+                write!(f, "class {} names undefined possible superior {}", c.0, p.0)
+            }
+            SchemaDefect::DuplicatePossSuperior(c, p) => {
+                write!(f, "class {} names possible superior {} twice", c.0, p.0)
+            }
+            SchemaDefect::InvalidNcRoot(c) => {
+                write!(f, "naming-context root class {} is inconsistent", c.0)
+            }
+            SchemaDefect::NoPossSuperiors(c) => {
+                write!(f, "class {} has no possible superior", c.0)
+            }
         }
     }
 }
@@ -327,6 +606,12 @@ impl fmt::Display for Error {
             Error::NoSuchParent => f.write_str("no such parent object"),
             Error::NameExists => f.write_str("name already in use under this parent"),
             Error::HasChildren => f.write_str("object has live children"),
+            Error::NoSuchTarget(a) => {
+                write!(f, "a reference in attribute {} names no live object", a.0)
+            }
+            Error::ValueNotUnique(a) => {
+                write!(f, "a value of unique attribute {} is already in use", a.0)
+            }
             Error::VersionOverflow => f.write_str("attribute version overflow"),
             Error::TransactionPoisoned => f.write_str("write transaction poisoned"),
             Error::IntegrityKeyUnusable => f.write_str("integrity key unusable"),
