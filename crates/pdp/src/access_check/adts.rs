@@ -20,6 +20,10 @@
 //! RemainingAccess" / "IF any bit of RemainingAccess is in ACE.AccessMask
 //! THEN ... access_denied".)
 //!
+//! Which node of the object type tree an object ACE names ("let O be an
+//! object of class c"; "the unique node such that Guid(v) = g") follows
+//! project decision A-28 (Q-081), described in object_tree.rs.
+//!
 //! [MS-ADTS] 5.1.3.3.5 (validated writes) is not implemented: no action of
 //! docs/11 §1 is authorised by RIGHT_DS_WRITE_PROPERTY_EXTENDED, so a write is
 //! authorised only by RIGHT_DS_WRITE_PROPERTY (fewer grants, never more).
@@ -157,8 +161,11 @@ pub(crate) fn check_object_specific_access(
             // the rights in M to Grant(v). For every descendant node u of v,
             // if the rights in M are not in Deny(u), then add the rights in M
             // to Grant(u)."
+            // "the unique node": A-28 (Q-081) — the root only for the most
+            // specific class; for a GUID that labels two nodes, only the
+            // lower one (`ObjectTypeList::locate_allow`; object_tree.rs).
             (AceKind::Grant, Some(g)) => {
-                let Some(v) = tree.locate(&g) else {
+                let Some(v) = tree.locate_allow(&g) else {
                     continue;
                 };
                 for (gr, d) in grant.iter_mut().zip(deny.iter()).skip(v) {
@@ -202,9 +209,12 @@ pub(crate) fn check_object_specific_access(
             // The text names only property-set (P) and attribute (A) nodes;
             // a GUID equal to the root's (the object class) exists in V but
             // in neither — that gap is filled with v = r, the choice that
-            // denies the most (Q-051).
+            // denies the most (Q-051). A-28 (Q-081): the root is also named
+            // by every other class of the object's superclass chain, and a
+            // GUID that labels two nodes names the higher one
+            // (`ObjectTypeList::locate_deny`; object_tree.rs).
             (AceKind::Deny, Some(g)) => {
-                let Some(v) = tree.locate(&g) else {
+                let Some(v) = tree.locate_deny(&g) else {
                     continue;
                 };
                 for (index, (d, gr)) in deny.iter_mut().zip(grant.iter()).enumerate() {

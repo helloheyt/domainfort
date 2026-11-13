@@ -168,6 +168,48 @@ pub struct AttrId(pub Guid);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjClass(pub Guid);
 
+/// Every class a directory object is an instance of: the schemaIDGUIDs of
+/// its objectClass values.
+///
+/// Spec: [MS-ADTS] 3.1.1.2.4.3 (objectClass: "The first element is always
+/// class top. The last element is the name of the structural class ...
+/// (referred to as the most specific class). The rest of the classes in the
+/// superclass chain are listed in between"); 5.1.3.3.3 ("Let O be an object
+/// of class c"; "Add c to V as the root node of the tree"); A-28 (Q-081):
+/// `c` is the most specific class, an allow object ACE matches the root only
+/// for it, and a deny object ACE naming any class of the chain applies at
+/// the root.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ObjClassChain {
+    /// The most specific class (the last objectClass value): `c`, the root of
+    /// the object type tree.
+    pub most_specific: ObjClass,
+    /// The other classes of the superclass chain (`top` up to the direct
+    /// superclass of `most_specific`), in any order. Auxiliary classes are
+    /// not listed (they are not objectClass values, [MS-ADTS] 3.1.1.2.4.6).
+    pub superclasses: Vec<ObjClass>,
+}
+
+/// The property set an attribute is a member of.
+///
+/// Spec: [MS-ADTS] 3.1.1.2.3.3 ("the property set is identified by the
+/// property set GUID, which is the attributeSecurityGUID value"); 5.1.3.3.3
+/// ("Guid(pi) = ai.attributeSecurityGUID"); A-28 (Q-081) item 2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PropertySet {
+    /// The property set GUID (the attribute's attributeSecurityGUID).
+    pub guid: Guid,
+    /// `true` if `guid` is also the schemaIDGUID of an attribute — of any
+    /// attribute in the schema, not only of the classes the object can hold.
+    /// The GUID then labels two nodes of the object type tree (in the pinned
+    /// schema: the "DNS Host Name Attributes" set, [MS-ADTS] 3.1.1.2.3.3, and
+    /// the dNSHostName attribute, [MS-ADA1] 2.185 — recorded in Q-081), and
+    /// A-28 lets an allow object ACE with that ObjectType apply only at the
+    /// attribute node, never at this property set node. When unsure, `true`:
+    /// it can only remove grants.
+    pub is_attribute_guid: bool,
+}
+
 /// A control access right, identified by its rightsGuid. Spec: [MS-ADTS]
 /// 5.1.3.2.1 ("each control access right is identified by a GUID";
 /// "rightsGuid: The GUID that is used to identify the control access right in

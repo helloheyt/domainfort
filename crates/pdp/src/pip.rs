@@ -10,11 +10,14 @@
 //! it must not panic.
 //!
 //! Extension to docs/11 §6 (three methods): the object type tree of
-//! [MS-ADTS] 5.1.3.3.3 needs the object's class GUID (`Guid(c) =
-//! c!schemaIDGUID`) and each attribute's property set (`ai.attributeSecurityGUID`),
-//! and the Principal Self substitution of [MS-ADTS] 5.1.3.3 / [MS-DTYP]
-//! 2.5.3.2 (`PrincipalSelfSubst`) needs the object's `objectSid`. These are
-//! [`Pip::object_class`], [`Pip::property_set`] and [`Pip::object_sid`].
+//! [MS-ADTS] 5.1.3.3.3 needs the object's classes (`Guid(c) =
+//! c!schemaIDGUID` for the root, and — A-28 (Q-081) — the rest of the
+//! superclass chain, which deny object ACEs may name) and each attribute's
+//! property set (`ai.attributeSecurityGUID`, and whether that GUID is also an
+//! attribute's schemaIDGUID — A-28 item 2), and the Principal Self
+//! substitution of [MS-ADTS] 5.1.3.3 / [MS-DTYP] 2.5.3.2
+//! (`PrincipalSelfSubst`) needs the object's `objectSid`. These are
+//! [`Pip::object_classes`], [`Pip::property_set`] and [`Pip::object_sid`].
 //!
 //! Snapshot semantics (docs/11 §6, P9): all answers for one decision must come
 //! from one consistent view (policy version + directory read view), so that
@@ -24,9 +27,11 @@
 
 use std::collections::BTreeSet;
 
-use dtyp::{Guid, SecurityDescriptor, Sid};
+use dtyp::{SecurityDescriptor, Sid};
 
-use crate::model::{AttrId, ControlRightId, Dn, ObjClass, PrincipalId, Resource, Tier};
+use crate::model::{
+    AttrId, ControlRightId, Dn, ObjClassChain, PrincipalId, PropertySet, Resource, Tier,
+};
 
 /// Why a PIP lookup produced no answer. Either variant yields Deny (D40).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -82,10 +87,18 @@ pub trait Pip {
     /// The class of an attribute (layer 5). Spec: docs/11 §6.
     fn attr_class(&self, a: &AttrId) -> Result<AttrClass, PipError>;
 
-    /// Extension: the schemaIDGUID of the object's class — the root node of
-    /// the object type tree. Spec: [MS-ADTS] 5.1.3.3.3 ("Add c to V as the
-    /// root node of the tree and set Guid(c) to c!schemaIDGUID").
-    fn object_class(&self, dn: &Dn) -> Result<ObjClass, PipError>;
+    /// Extension: the schemaIDGUIDs of every class of the object's objectClass
+    /// chain, naming the most specific one (the last objectClass value).
+    ///
+    /// Spec: [MS-ADTS] 3.1.1.2.4.3 (objectClass, "the most specific class");
+    /// 5.1.3.3.3 ("Add c to V as the root node of the tree and set Guid(c) to
+    /// c!schemaIDGUID"); A-28 (Q-081): the most specific class is `c`, the
+    /// root; an allow object ACE matches the root only for it; a deny object
+    /// ACE whose ObjectType is any class of the chain applies at the root.
+    /// Listing a class the object is not an instance of can only add denies;
+    /// naming the wrong most specific class can grant wrongly — the PIP takes
+    /// it from the object's stored classes and the schema.
+    fn object_classes(&self, dn: &Dn) -> Result<ObjClassChain, PipError>;
 
     /// Extension: the object's objectSid, or `Ok(None)` if the object has
     /// none; substituted for PRINCIPAL_SELF. Spec: [MS-ADTS] 5.1.3.3 ("the
@@ -94,8 +107,10 @@ pub trait Pip {
     fn object_sid(&self, dn: &Dn) -> Result<Option<Sid>, PipError>;
 
     /// Extension: the property set (attributeSecurityGUID) the attribute
-    /// belongs to, or `Ok(None)` if none. Spec: [MS-ADTS] 5.1.3.3.3 ("if
-    /// ai.attributeSecurityGUID ≠ NULL, then let pi denote the property set
-    /// of which ai is a member").
-    fn property_set(&self, a: &AttrId) -> Result<Option<Guid>, PipError>;
+    /// belongs to, or `Ok(None)` if none; with it, whether that GUID is also
+    /// the schemaIDGUID of an attribute ([`PropertySet::is_attribute_guid`]).
+    /// Spec: [MS-ADTS] 5.1.3.3.3 ("if ai.attributeSecurityGUID ≠ NULL, then
+    /// let pi denote the property set of which ai is a member"), 3.1.1.2.3.3;
+    /// A-28 (Q-081) item 2.
+    fn property_set(&self, a: &AttrId) -> Result<Option<PropertySet>, PipError>;
 }

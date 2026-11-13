@@ -556,6 +556,71 @@ fn layer5_property_set_from_pip() {
     assert_eq!(decide(&read_req(), &pol, &pip).reason, ReasonCode::Acl);
 }
 
+/// Layer 5 via the PIP's class chain (A-28, Q-081; [MS-ADTS] 5.1.3.3.3,
+/// 3.1.1.2.4.3): a deny object ACE on a superclass GUID denies once the PIP
+/// lists that class in the object's chain, and an allow on it never grants.
+#[test]
+fn layer5_class_chain_from_pip() {
+    let pol = policy(vec![allow_everything(1)]);
+    let deny_top = sd(
+        None,
+        vec![
+            deny_obj(RIGHT_DS_READ_PROPERTY, Some(class_top()), user()),
+            allow(RIGHT_GENERIC_READ, group()),
+        ],
+    );
+    // Default chain (`class_user` alone): `class_top` is not in it.
+    let pip = MockPip::with_sd(deny_top.clone());
+    assert_eq!(decide(&read_req(), &pol, &pip).effect, Effect::Allow);
+    // Computer chain: `class_top` is a superclass ⇒ the deny applies.
+    let mut pip = MockPip::with_sd(deny_top);
+    pip.classes.insert(obj_dn(), computer_chain());
+    let d = decide(&read_req(), &pol, &pip);
+    assert_eq!(d.reason, ReasonCode::Acl);
+    // An allow on a superclass GUID does not grant; on the most specific
+    // class it does.
+    let mut pip = MockPip::with_sd(sd(
+        None,
+        vec![allow_obj(
+            RIGHT_DS_READ_PROPERTY,
+            Some(class_user()),
+            user(),
+        )],
+    ));
+    pip.classes.insert(obj_dn(), computer_chain());
+    assert_eq!(decide(&read_req(), &pol, &pip).reason, ReasonCode::Acl);
+    let mut pip = MockPip::with_sd(sd(
+        None,
+        vec![allow_obj(
+            RIGHT_DS_READ_PROPERTY,
+            Some(class_computer()),
+            user(),
+        )],
+    ));
+    pip.classes.insert(obj_dn(), computer_chain());
+    assert_eq!(decide(&read_req(), &pol, &pip).effect, Effect::Allow);
+}
+
+/// Layer 5 via the PIP's property set flag (A-28, Q-081 item 2): an allow on
+/// a property set GUID that is also an attribute's schemaIDGUID grants that
+/// attribute only, not the set's other members.
+#[test]
+fn layer5_shared_property_set_from_pip() {
+    let pip = MockPip::with_sd(sd(
+        None,
+        vec![allow_obj(
+            RIGHT_DS_READ_PROPERTY,
+            Some(shared_guid()),
+            user(),
+        )],
+    ));
+    let pol = policy(vec![allow_everything(1)]);
+    let attribute = dir_request(the_user(), Action::DirRead, Some(shared_guid()));
+    assert_eq!(decide(&attribute, &pol, &pip).effect, Effect::Allow);
+    let other_member = dir_request(the_user(), Action::DirRead, Some(attr_in_shared_set()));
+    assert_eq!(decide(&other_member, &pol, &pip).reason, ReasonCode::Acl);
+}
+
 /// D40: every PIP failure is a Deny(PipFailure).
 #[test]
 fn pip_failures_deny() {
@@ -565,7 +630,7 @@ fn pip_failures_deny() {
         Failing::ObjectTier,
         Failing::SecurityDescriptor,
         Failing::AttrClass,
-        Failing::ObjectClass,
+        Failing::ObjectClasses,
         Failing::ObjectSid,
         Failing::PropertySet,
     ] {

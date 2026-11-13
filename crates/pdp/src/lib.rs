@@ -70,16 +70,19 @@
 //!   2.4.4.5, 2.4.5, 2.4.6, 2.5.2, 2.5.3, 2.5.3.1.1, 2.5.3.1.3, 2.5.3.1.4,
 //!   2.5.3.2;
 //! - [MS-ADTS] v20261026 (protocol revision 70.0; pinned PDF sha256
-//!   55b59eb1…b2b1): 3.1.1.4.3, 3.1.1.4.4, 3.1.1.5.2.1, 3.1.1.5.5.4, 5.1.3,
-//!   5.1.3.1, 5.1.3.2, 5.1.3.2.1, 5.1.3.2.2, 5.1.3.3, 5.1.3.3.1-5.1.3.3.6,
-//!   6.1.3, 6.1.3.4, 6.1.1.2.4.1.2 (BlockOwnerImplicitRights row),
-//!   6.1.1.2.6.18;
+//!   55b59eb1…b2b1): 3.1.1.2.3.3, 3.1.1.2.4.3, 3.1.1.4.3, 3.1.1.4.4,
+//!   3.1.1.5.2.1, 3.1.1.5.5.4, 5.1.3, 5.1.3.1, 5.1.3.2, 5.1.3.2.1, 5.1.3.2.2,
+//!   5.1.3.3, 5.1.3.3.1-5.1.3.3.6, 6.1.3, 6.1.3.4, 6.1.1.2.4.1.2
+//!   (BlockOwnerImplicitRights row), 6.1.1.2.6.18;
+//! - [MS-ADA1] v20180912 (pinned PDF sha256 3885c568…6a50): 2.185
+//!   (dNSHostName: schemaIdGuid = attributeSecurityGuid, Q-081);
 //! - this project's docs/05, docs/06, docs/11, docs/25 §5.1, docs/45 §5-7.
 //!
 //! No other implementation was consulted or recalled (AGENTS.md §1-3).
 //! Spec gaps, conflicts and design decisions: docs/questions/Q-050 (resolved,
 //! A-21), Q-051 (deferred: owner item P-8 + lab recording), Q-052 (resolved,
-//! A-22).
+//! A-22), Q-081 (resolved, A-28: the object type tree's class and duplicate
+//! GUIDs — see [`access_check`]).
 
 pub mod access_check;
 mod decide;
@@ -93,8 +96,9 @@ pub use decide::{decide, is_write, required_sec};
 pub use model::{
     AccessRequest, Action, ActionClass, AttrId, AuthContext, AuthStrength, ClaimId, ClaimValue,
     Constraint, Context, ControlRightId, Decision, Dn, Effect, FilePath, Instant, IpScope,
-    KerbResKind, ObjClass, Obligation, PolicyScope, PrincipalId, ReasonCode, RecordKey, Resource,
-    RlKey, RuleId, ShareId, Spn, Subject, Tier, Transport, TransportSec, Uuid, ZoneId,
+    KerbResKind, ObjClass, ObjClassChain, Obligation, PolicyScope, PrincipalId, PropertySet,
+    ReasonCode, RecordKey, Resource, RlKey, RuleId, ShareId, Spn, Subject, Tier, Transport,
+    TransportSec, Uuid, ZoneId,
 };
 pub use pip::{AttrClass, Pip, PipError};
 pub use policy::{

@@ -19,6 +19,7 @@ use pdp::{
 fn object() -> DirObjectContext {
     DirObjectContext {
         object_class: class_user(),
+        superclasses: vec![],
         object_sid: None,
     }
 }
@@ -37,7 +38,7 @@ fn every_right() -> Vec<Right> {
         },
         Right::Property {
             mask: RIGHT_DS_WRITE_PROPERTY,
-            property_set: Some(propset()),
+            property_set: Some(plain_set()),
             attribute: attr_in_set(),
         },
         Right::CreateChild {

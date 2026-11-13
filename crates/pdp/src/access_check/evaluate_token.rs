@@ -30,6 +30,14 @@
 //! all its children"; [MS-ADTS] 5.1.3.3.3 step 4 checks the target node). The
 //! top-level `RemainingAccess` is only reduced by non-object ACEs, so using it
 //! for sub-objects would make every object ACE ineffective. Recorded in Q-051.
+//!
+//! "Locate node n in LocalTree such that n.GUID is the same as ACE.Object"
+//! follows A-28 (Q-081) — DELIBERATE, stricter reading: an Object Allow ACE
+//! is located with `ObjectTypeList::locate_allow` and an Object Deny ACE with
+//! `ObjectTypeList::locate_deny` (object_tree.rs), the same lookups the
+//! [MS-ADTS] 5.1.3.3.3 leg uses. In particular an Object Allow whose GUID is
+//! "contained in LocalTree" only as a property set whose GUID also names an
+//! attribute is skipped.
 
 use super::dacl::PreparedDacl;
 use super::object_tree::ObjectTypeList;
@@ -122,11 +130,14 @@ pub(crate) fn evaluate_token_against_descriptor(
             // ns such that ns is a descendent of n DO Remove ACE.AccessMask
             // from ns.Remaining; FOR each node np such that np is an ancestor
             // of n DO Set np.Remaining to np.Remaining or np-1.Remaining".
+            // Which node n is: A-28 (Q-081) — the root only for the most
+            // specific class, and the lower node of a GUID that labels two
+            // (`ObjectTypeList::locate_allow`; object_tree.rs).
             (AceKind::Grant, Some(object_type)) => {
                 if !ctx.ace_applies(&ace.sid, AceKind::Grant) {
                     continue;
                 }
-                let Some(n) = object_tree.locate(&object_type) else {
+                let Some(n) = object_tree.locate_allow(&object_type) else {
                     continue;
                 };
                 // n and its descendants (the nodes after it in the chain).
@@ -148,11 +159,14 @@ pub(crate) fn evaluate_token_against_descriptor(
             // returns True THEN Locate node n in LocalTree such that n.GUID is
             // the same as ACE.Object; IF n exists THEN If any bit of
             // n.Remaining is in ACE.AccessMask THEN ... Return access_denied".
+            // Which node n is: A-28 (Q-081) — the root for any class of the
+            // object's superclass chain, and the higher node of a GUID that
+            // labels two (`ObjectTypeList::locate_deny`; object_tree.rs).
             (AceKind::Deny, Some(object_type)) => {
                 if !ctx.ace_applies(&ace.sid, AceKind::Deny) {
                     continue;
                 }
-                if let Some(n) = object_tree.locate(&object_type) {
+                if let Some(n) = object_tree.locate_deny(&object_type) {
                     let remaining = node_remaining.get(n).copied().unwrap_or(0);
                     if remaining & ace.mask != 0 {
                         return false;

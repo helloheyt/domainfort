@@ -160,13 +160,13 @@ impl Pip for TestPip {
     fn attr_class(&self, _a: &pdp::AttrId) -> Result<pdp::AttrClass, PipError> {
         Err(PipError::NotFound)
     }
-    fn object_class(&self, _dn: &pdp::Dn) -> Result<pdp::ObjClass, PipError> {
+    fn object_classes(&self, _dn: &pdp::Dn) -> Result<pdp::ObjClassChain, PipError> {
         Err(PipError::NotFound)
     }
     fn object_sid(&self, _dn: &pdp::Dn) -> Result<Option<Sid>, PipError> {
         Err(PipError::NotFound)
     }
-    fn property_set(&self, _a: &pdp::AttrId) -> Result<Option<dtyp::Guid>, PipError> {
+    fn property_set(&self, _a: &pdp::AttrId) -> Result<Option<pdp::PropertySet>, PipError> {
         Err(PipError::NotFound)
     }
 }

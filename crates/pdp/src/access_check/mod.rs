@@ -31,6 +31,45 @@
 //! | `CreateChild` | [MS-DTYP] 2.5.3.2 + [MS-ADTS] 5.1.3.3.3 |
 //! | `ControlAccess` | [MS-DTYP] 2.5.3.2 + [MS-ADTS] 5.1.3.3.4 |
 //!
+//! # The object type tree: which class, and duplicate GUIDs (A-28, Q-081)
+//!
+//! [MS-ADTS] 5.1.3.3.3 does not say which of the object's classes is the
+//! root `c`, nor which node an object ACE names when one GUID labels two
+//! nodes. Project decision A-28 (Q-081) — DELIBERATE, the strict reading —
+//! applied to both procedures that use the tree ([MS-DTYP] 2.5.3.2 and
+//! [MS-ADTS] 5.1.3.3.3, object_tree.rs):
+//!
+//! 1. The root is the most specific class ([`DirObjectContext::object_class`]).
+//!    An allow object ACE matches it only for that class; a deny object ACE
+//!    matches it for any class of the superclass chain
+//!    ([`DirObjectContext::superclasses`]).
+//! 2. A GUID that labels two nodes (a property set GUID equal to a member
+//!    attribute's schemaIDGUID; a child class equal to the object's class):
+//!    a deny applies at the higher node, an allow only at the lower one. A
+//!    property set flagged [`PropertySet::is_attribute_guid`] never takes an
+//!    allow.
+//!
+//! **Invariant: A-28 never grants more than the tree without it** (root
+//! labelled by the most specific class only, each object ACE located at the
+//! shallowest node carrying its GUID). Argument:
+//! - Rule 1 only adds deny matches at the root, and allow matches are
+//!   unchanged. Rule 2 only moves an allow to a deeper node or drops it, and
+//!   keeps a deny at the shallowest node.
+//! - [MS-ADTS] 5.1.3.3.3: a node's Grant/Deny never depends on its ancestors
+//!   (grants propagate upward only), and the target is the last node, a
+//!   descendant of every node of the chain. So the target's result depends
+//!   only on *whether* an ACE matches some node: more deny matches and fewer
+//!   allow matches can only remove rights.
+//! - [MS-DTYP] 2.5.3.2: an allow at a deeper node, or none, clears a subset of
+//!   the nodes' Remaining bits, so every node keeps at least the bits it kept
+//!   before; a deny tested at a node no deeper than before sees at least the
+//!   bits it saw before (Remaining only shrinks with depth). So every
+//!   access_denied is still returned and the target keeps at least its bits.
+//! - The conjunction of the two is monotone in each.
+//!
+//! `tests/properties.rs` (`a28_never_grants_more_than_before`) checks it over
+//! an exhaustive domain of DACLs, class chains and duplicate GUIDs.
+//!
 //! # Project rules stricter than the specifications (docs/11 §5, D37; A-21)
 //!
 //! - 5a: an absent DACL ⇒ deny (the specs grant everything); an empty DACL
@@ -58,7 +97,7 @@ use dtyp::{Guid, SecurityDescriptor, Sid};
 
 pub use dacl::DaclRefusal;
 
-use crate::model::Subject;
+use crate::model::{PropertySet, Subject};
 use dacl::PreparedDacl;
 use object_tree::ObjectTypeList;
 use rights::{DIRECTORY_RIGHTS, RIGHT_DS_CONTROL_ACCESS, RIGHT_DS_CREATE_CHILD};
@@ -81,8 +120,10 @@ pub enum Right {
     Property {
         /// The requested rights: non-zero, only [`rights::DIRECTORY_RIGHTS`].
         mask: u32,
-        /// The attribute's property set (attributeSecurityGUID), if any.
-        property_set: Option<Guid>,
+        /// The attribute's property set (attributeSecurityGUID), if any, and
+        /// whether its GUID is also an attribute's schemaIDGUID (A-28,
+        /// Q-081).
+        property_set: Option<PropertySet>,
         /// The attribute's schemaIDGUID.
         attribute: Guid,
     },
@@ -104,11 +145,20 @@ pub enum Right {
 
 /// What the access check needs to know about the object besides its
 /// security descriptor. Spec: [MS-ADTS] 5.1.3.3.3 (root of the object type
-/// tree), 5.1.3.3 (Principal Self substitution).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// tree), 3.1.1.2.4.3 (objectClass), 5.1.3.3 (Principal Self substitution);
+/// A-28 (Q-081).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DirObjectContext {
-    /// The schemaIDGUID of the object's class.
+    /// The schemaIDGUID of the object's most specific class (the last
+    /// objectClass value) — the root `c` of the object type tree. An allow
+    /// object ACE matches the root only for this GUID (A-28).
     pub object_class: Guid,
+    /// The schemaIDGUIDs of the object's other classes (its superclass
+    /// chain, e.g. `top`, `person`, `organizationalPerson` for a user,
+    /// [MS-ADTS] 3.1.1.2.4.3). A deny object ACE naming one of them applies
+    /// at the root; an allow does not (A-28). Empty means "no other class
+    /// known", which only removes denies — the PIP supplies the full chain.
+    pub superclasses: Vec<Guid>,
     /// The object's objectSid, if it has one (substituted for
     /// PRINCIPAL_SELF).
     pub object_sid: Option<Sid>,
@@ -139,9 +189,13 @@ pub fn acl_grants(
         Err(_) => return false,
     };
     let ctx = AccessContext::new(subject, object.object_sid.as_ref(), sd.owner_sid.as_ref());
+    // The root of every object type tree: the most specific class, with the
+    // superclass chain for deny object ACEs (A-28, Q-081; object_tree.rs).
+    let class = object.object_class;
+    let superclasses = object.superclasses.as_slice();
     match *right {
         Right::Object { mask } => {
-            let tree = ObjectTypeList::object(object.object_class);
+            let tree = ObjectTypeList::object(class, superclasses);
             valid_request(mask)
                 && evaluate_token::evaluate_token_against_descriptor(&ctx, &dacl, mask, &tree)
                 && adts::check_simple_access(&ctx, &dacl, mask)
@@ -151,13 +205,13 @@ pub fn acl_grants(
             property_set,
             attribute,
         } => {
-            let tree = ObjectTypeList::property(object.object_class, property_set, attribute);
+            let tree = ObjectTypeList::property(class, superclasses, property_set, attribute);
             valid_request(mask)
                 && evaluate_token::evaluate_token_against_descriptor(&ctx, &dacl, mask, &tree)
                 && adts::check_object_specific_access(&ctx, &dacl, mask, &tree)
         }
-        Right::CreateChild { class } => {
-            let tree = ObjectTypeList::object_and(object.object_class, class);
+        Right::CreateChild { class: child } => {
+            let tree = ObjectTypeList::object_and(class, superclasses, child);
             evaluate_token::evaluate_token_against_descriptor(
                 &ctx,
                 &dacl,
@@ -169,7 +223,7 @@ pub fn acl_grants(
             // [MS-DTYP] 2.5.3.2 with the right's GUID as a level-1 node
             // ([MS-DTYP] 2.4.4.3: for CR "The ObjectType GUID identifies an
             // extended access right"), and [MS-ADTS] 5.1.3.3.4.
-            let tree = ObjectTypeList::object_and(object.object_class, right);
+            let tree = ObjectTypeList::object_and(class, superclasses, right);
             evaluate_token::evaluate_token_against_descriptor(
                 &ctx,
                 &dacl,

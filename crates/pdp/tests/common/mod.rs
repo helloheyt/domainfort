@@ -17,9 +17,9 @@ use dtyp::{
 };
 use pdp::{
     AccessRequest, Action, ActionMatch, AttrClass, AttrId, AuthContext, AuthStrength, Context,
-    ContextMatch, Dn, Effect, Instant, IpScope, Match, ObjClass, Pip, PipError, PolicySnapshot,
-    PolicyVersion, Resource, ResourceMatch, Rule, RuleId, Subject, SubjectMatch, Tier, Transport,
-    TransportSec,
+    ContextMatch, Dn, Effect, Instant, IpScope, Match, ObjClass, ObjClassChain, Pip, PipError,
+    PolicySnapshot, PolicyVersion, PropertySet, Resource, ResourceMatch, Rule, RuleId, Subject,
+    SubjectMatch, Tier, Transport, TransportSec,
 };
 
 // ---------------------------------------------------------------- SIDs ----
@@ -107,6 +107,71 @@ pub fn right_a() -> Guid {
 /// Another control access right.
 pub fn right_b() -> Guid {
     guid(0x41)
+}
+
+// A class chain and a shared GUID (A-28, Q-081). The shapes follow
+// [MS-ADTS] 3.1.1.2.4.3 (an objectClass chain: top first, the most specific
+// class last) and Q-081 (a property set GUID equal to one member attribute's
+// schemaIDGUID); the GUID values are arbitrary labels.
+
+/// The root class of every chain (`top`'s role).
+pub fn class_top() -> Guid {
+    guid(0x13)
+}
+/// An intermediate class of a chain.
+pub fn class_person() -> Guid {
+    guid(0x14)
+}
+/// A class whose chain is `class_top`, `class_person`, `class_user`,
+/// `class_computer` (most specific last).
+pub fn class_computer() -> Guid {
+    guid(0x15)
+}
+/// A GUID that is both a property set's GUID and the schemaIDGUID of one
+/// member attribute of that set.
+pub fn shared_guid() -> Guid {
+    guid(0x22)
+}
+/// Another member attribute of the `shared_guid()` property set.
+pub fn attr_in_shared_set() -> Guid {
+    guid(0x34)
+}
+
+/// The property set `propset()` (its GUID names no attribute).
+pub fn plain_set() -> PropertySet {
+    PropertySet {
+        guid: propset(),
+        is_attribute_guid: false,
+    }
+}
+
+/// The property set `shared_guid()` (its GUID is also an attribute's).
+pub fn shared_set() -> PropertySet {
+    PropertySet {
+        guid: shared_guid(),
+        is_attribute_guid: true,
+    }
+}
+
+/// The class chain of a `class_computer()` object.
+pub fn computer_chain() -> ObjClassChain {
+    ObjClassChain {
+        most_specific: ObjClass(class_computer()),
+        superclasses: vec![
+            ObjClass(class_top()),
+            ObjClass(class_person()),
+            ObjClass(class_user()),
+        ],
+    }
+}
+
+/// The class chain of the default object: `class_user()`, no other class
+/// listed.
+pub fn user_chain() -> ObjClassChain {
+    ObjClassChain {
+        most_specific: ObjClass(class_user()),
+        superclasses: Vec::new(),
+    }
 }
 
 // ---------------------------------------------------------------- ACEs ----
@@ -317,7 +382,7 @@ pub enum Failing {
     ObjectTier,
     SecurityDescriptor,
     AttrClass,
-    ObjectClass,
+    ObjectClasses,
     ObjectSid,
     PropertySet,
 }
@@ -327,8 +392,8 @@ pub enum Failing {
 pub struct MockPip {
     /// Security descriptors by DN (missing ⇒ NotFound).
     pub sds: BTreeMap<Dn, SecurityDescriptor>,
-    /// Object classes by DN (missing ⇒ `class_user()`).
-    pub classes: BTreeMap<Dn, Guid>,
+    /// Class chains by DN (missing ⇒ `user_chain()`).
+    pub classes: BTreeMap<Dn, ObjClassChain>,
     /// objectSid by DN (missing ⇒ none).
     pub object_sids: BTreeMap<Dn, Sid>,
     /// Object tiers by DN; every other resource has `default_object_tier`.
@@ -338,7 +403,7 @@ pub struct MockPip {
     /// Attribute classes (missing ⇒ Normal).
     pub attr_classes: BTreeMap<AttrId, AttrClass>,
     /// Property sets (missing ⇒ none).
-    pub property_sets: BTreeMap<AttrId, Guid>,
+    pub property_sets: BTreeMap<AttrId, PropertySet>,
     /// Principal tiers (missing ⇒ Tier1).
     pub tiers: BTreeMap<Sid, Tier>,
     /// A method that fails.
@@ -351,8 +416,10 @@ impl MockPip {
         let mut sds = BTreeMap::new();
         sds.insert(obj_dn(), sd);
         let mut property_sets = BTreeMap::new();
-        property_sets.insert(AttrId(attr_in_set()), propset());
-        property_sets.insert(AttrId(attr_in_set_2()), propset());
+        property_sets.insert(AttrId(attr_in_set()), plain_set());
+        property_sets.insert(AttrId(attr_in_set_2()), plain_set());
+        property_sets.insert(AttrId(shared_guid()), shared_set());
+        property_sets.insert(AttrId(attr_in_shared_set()), shared_set());
         MockPip {
             sds,
             classes: BTreeMap::new(),
@@ -415,13 +482,11 @@ impl Pip for MockPip {
             .unwrap_or(AttrClass::Normal))
     }
 
-    fn object_class(&self, dn: &Dn) -> Result<ObjClass, PipError> {
-        if self.fails(Failing::ObjectClass) {
+    fn object_classes(&self, dn: &Dn) -> Result<ObjClassChain, PipError> {
+        if self.fails(Failing::ObjectClasses) {
             return Err(PipError::Unavailable);
         }
-        Ok(ObjClass(
-            self.classes.get(dn).copied().unwrap_or_else(class_user),
-        ))
+        Ok(self.classes.get(dn).cloned().unwrap_or_else(user_chain))
     }
 
     fn object_sid(&self, dn: &Dn) -> Result<Option<Sid>, PipError> {
@@ -431,7 +496,7 @@ impl Pip for MockPip {
         Ok(self.object_sids.get(dn).copied())
     }
 
-    fn property_set(&self, a: &AttrId) -> Result<Option<Guid>, PipError> {
+    fn property_set(&self, a: &AttrId) -> Result<Option<PropertySet>, PipError> {
         if self.fails(Failing::PropertySet) {
             return Err(PipError::Unavailable);
         }

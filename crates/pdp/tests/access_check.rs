@@ -2,8 +2,9 @@
 //!
 //! Source of every case: [MS-DTYP] v20241119 2.5.3.2 (Access Check Algorithm
 //! Pseudocode) and [MS-ADTS] v20261026 5.1.3.3.2 / 5.1.3.3.3 / 5.1.3.3.4,
-//! worked by hand from the clause named on each test. No vector comes from
-//! another implementation.
+//! worked by hand from the clause named on each test; the `a28_*` cases
+//! also from project decision A-28 (Q-081). No vector comes from another
+//! implementation.
 
 mod common;
 
@@ -14,6 +15,7 @@ use pdp::{acl_grants, DirObjectContext, Right, Subject};
 fn object() -> DirObjectContext {
     DirObjectContext {
         object_class: class_user(),
+        superclasses: vec![],
         object_sid: None,
     }
 }
@@ -24,7 +26,9 @@ fn whole(mask: u32) -> Right {
 
 fn prop(mask: u32, attribute: dtyp::Guid) -> Right {
     let property_set = if attribute == attr_in_set() || attribute == attr_in_set_2() {
-        Some(propset())
+        Some(plain_set())
+    } else if attribute == shared_guid() || attribute == attr_in_shared_set() {
+        Some(shared_set())
     } else {
         None
     };
@@ -455,9 +459,9 @@ fn create_child_deny_for_one_class() {
     assert!(grants(&s, aces, Right::CreateChild { class: guid(0x12) }));
 }
 
-/// A child of the object's own class (two nodes with one GUID — the object
-/// type tree uses the first match; object_tree.rs). [MS-ADTS] 5.1.3.3.3 step
-/// 3.5.
+/// A child of the object's own class (two nodes with one GUID — the allow
+/// applies at the lower node, the child class: A-28 (Q-081) item 2;
+/// object_tree.rs). [MS-ADTS] 5.1.3.3.3 step 3.5.
 #[test]
 fn create_child_of_the_same_class_as_the_parent() {
     let s = the_user();
@@ -467,6 +471,274 @@ fn create_child_of_the_same_class_as_the_parent() {
         Right::CreateChild {
             class: class_user()
         }
+    ));
+}
+
+// ------------------------------------- A-28 (Q-081): which class is c ----
+
+/// An object whose class chain is `class_top`, `class_person`, `class_user`,
+/// `class_computer` (most specific last; [MS-ADTS] 3.1.1.2.4.3).
+fn computer() -> DirObjectContext {
+    DirObjectContext {
+        object_class: class_computer(),
+        superclasses: vec![class_top(), class_person(), class_user()],
+        object_sid: None,
+    }
+}
+
+fn grants_on(s: &Subject, object: &DirObjectContext, aces: Vec<dtyp::Ace>, right: Right) -> bool {
+    acl_grants(s, &sd(Some(other_user()), aces), object, &right)
+}
+
+/// A-28 (Q-081) item 1; [MS-ADTS] 5.1.3.3.3 step 3.8 and [MS-DTYP] 2.5.3.2
+/// "Object Deny Access" with the root named by any class of the chain: a
+/// deny object ACE on a superclass GUID (`class_user` on a computer object)
+/// denies — whole-object and property requests alike.
+#[test]
+fn a28_deny_on_superclass_guid_denies() {
+    let s = the_user();
+    let o = computer();
+    for superclass in [class_user(), class_person(), class_top()] {
+        let aces = vec![
+            deny_obj(RIGHT_DS_READ_PROPERTY, Some(superclass), user()),
+            allow(RIGHT_DS_READ_PROPERTY, user()),
+        ];
+        assert!(!grants_on(
+            &s,
+            &o,
+            aces.clone(),
+            whole(RIGHT_DS_READ_PROPERTY)
+        ));
+        assert!(!grants_on(
+            &s,
+            &o,
+            aces.clone(),
+            prop(RIGHT_DS_READ_PROPERTY, attr_alone())
+        ));
+        assert!(!grants_on(
+            &s,
+            &o,
+            aces,
+            prop(RIGHT_DS_READ_PROPERTY, attr_in_set())
+        ));
+    }
+    // The most specific class denies too; a class outside the chain does not.
+    let own = vec![
+        deny_obj(RIGHT_DS_READ_PROPERTY, Some(class_computer()), user()),
+        allow(RIGHT_DS_READ_PROPERTY, user()),
+    ];
+    assert!(!grants_on(
+        &s,
+        &o,
+        own,
+        prop(RIGHT_DS_READ_PROPERTY, attr_alone())
+    ));
+    let foreign = vec![
+        deny_obj(RIGHT_DS_READ_PROPERTY, Some(class_group()), user()),
+        allow(RIGHT_DS_READ_PROPERTY, user()),
+    ];
+    assert!(grants_on(
+        &s,
+        &o,
+        foreign,
+        prop(RIGHT_DS_READ_PROPERTY, attr_alone())
+    ));
+}
+
+/// A-28 (Q-081) item 1; [MS-ADTS] 5.1.3.3.3 step 3.5: an allow object ACE
+/// matches the root only for the most specific class — on a superclass GUID
+/// it grants nothing, on `class_computer` it grants the object's attributes
+/// (step 3.5: "For every descendant node u of v ... add the rights in M to
+/// Grant(u)") and child classes.
+#[test]
+fn a28_allow_matches_root_only_for_most_specific_class() {
+    let s = the_user();
+    let o = computer();
+    for superclass in [class_user(), class_person(), class_top()] {
+        let aces = vec![allow_obj(RIGHT_GENERIC_ALL, Some(superclass), user())];
+        assert!(!grants_on(
+            &s,
+            &o,
+            aces.clone(),
+            prop(RIGHT_DS_READ_PROPERTY, attr_alone())
+        ));
+        assert!(!grants_on(
+            &s,
+            &o,
+            aces.clone(),
+            prop(RIGHT_DS_WRITE_PROPERTY, attr_in_set())
+        ));
+        assert!(!grants_on(
+            &s,
+            &o,
+            aces,
+            Right::CreateChild {
+                class: class_group()
+            }
+        ));
+    }
+    let own = vec![allow_obj(RIGHT_GENERIC_ALL, Some(class_computer()), user())];
+    assert!(grants_on(
+        &s,
+        &o,
+        own.clone(),
+        prop(RIGHT_DS_READ_PROPERTY, attr_alone())
+    ));
+    assert!(grants_on(
+        &s,
+        &o,
+        own.clone(),
+        prop(RIGHT_DS_WRITE_PROPERTY, attr_in_set())
+    ));
+    assert!(grants_on(
+        &s,
+        &o,
+        own,
+        Right::CreateChild {
+            class: class_group()
+        }
+    ));
+}
+
+/// A-28 (Q-081) items 1 and 2: a child class equal to one of the object's
+/// superclasses labels the root (for denies) and the child node. A deny on
+/// it applies at the higher node — the root, which covers the child — and an
+/// allow only at the lower node, the child class itself ([MS-ADTS] 3.1.1.5.2.1
+/// / 5.1.3.2: CC with the child's objectClass as ObjectType).
+#[test]
+fn a28_create_child_of_a_superclass() {
+    let s = the_user();
+    let o = computer();
+    let child = Right::CreateChild {
+        class: class_user(),
+    };
+    assert!(grants_on(
+        &s,
+        &o,
+        vec![allow_obj(RIGHT_DS_CREATE_CHILD, Some(class_user()), user())],
+        child
+    ));
+    assert!(!grants_on(
+        &s,
+        &o,
+        vec![
+            deny_obj(RIGHT_DS_CREATE_CHILD, Some(class_user()), user()),
+            allow(RIGHT_DS_CREATE_CHILD, user()),
+        ],
+        child
+    ));
+    // The deny at the root reaches every child class.
+    assert!(!grants_on(
+        &s,
+        &o,
+        vec![
+            deny_obj(RIGHT_DS_CREATE_CHILD, Some(class_user()), user()),
+            allow(RIGHT_DS_CREATE_CHILD, user()),
+        ],
+        Right::CreateChild {
+            class: class_group()
+        }
+    ));
+}
+
+/// A-28 (Q-081) item 2 for a child of the object's own class: the allow
+/// applies at the child node, the deny at the root. [MS-DTYP] 2.5.3.2
+/// "Object Deny Access" then finds CC still in the root's Remaining (the
+/// allow cleared only the child's) ⇒ access_denied — the stricter result
+/// (the conjunction of Q-051 / P-8).
+#[test]
+fn a28_create_child_of_own_class_allow_then_deny_denies() {
+    let s = the_user();
+    assert!(!grants(
+        &s,
+        vec![
+            allow_obj(RIGHT_DS_CREATE_CHILD, Some(class_user()), user()),
+            deny_obj(RIGHT_DS_CREATE_CHILD, Some(class_user()), user()),
+        ],
+        Right::CreateChild {
+            class: class_user()
+        }
+    ));
+}
+
+// ------------------------ A-28 (Q-081): a GUID that labels two nodes ----
+
+/// A-28 (Q-081) item 2: a deny object ACE whose ObjectType is the shared
+/// GUID applies at the higher node, the property set, and so covers the
+/// attribute of that GUID and the set's other members ([MS-ADTS] 5.1.3.3.3
+/// step 3.8, "the unique node in P ... if any such node exists").
+#[test]
+fn a28_shared_guid_deny_covers_set_and_attribute() {
+    let s = the_user();
+    let aces = vec![
+        deny_obj(RIGHT_DS_READ_PROPERTY, Some(shared_guid()), user()),
+        allow(RIGHT_DS_READ_PROPERTY, user()),
+    ];
+    assert!(!grants(
+        &s,
+        aces.clone(),
+        prop(RIGHT_DS_READ_PROPERTY, shared_guid())
+    ));
+    assert!(!grants(
+        &s,
+        aces.clone(),
+        prop(RIGHT_DS_READ_PROPERTY, attr_in_shared_set())
+    ));
+    // Attributes outside the set are untouched.
+    assert!(grants(&s, aces, prop(RIGHT_DS_READ_PROPERTY, attr_alone())));
+}
+
+/// A-28 (Q-081) item 2: an allow object ACE whose ObjectType is the shared
+/// GUID applies only at the lower node, the attribute — it grants that
+/// attribute and not the set's other members ([MS-ADTS] 5.1.3.3.3 step 3.5,
+/// "the unique node such that Guid(v) = g", made unique by A-28).
+#[test]
+fn a28_shared_guid_allow_grants_only_the_attribute() {
+    let s = the_user();
+    let aces = vec![allow_obj(
+        RIGHT_DS_READ_PROPERTY,
+        Some(shared_guid()),
+        user(),
+    )];
+    assert!(grants(
+        &s,
+        aces.clone(),
+        prop(RIGHT_DS_READ_PROPERTY, shared_guid())
+    ));
+    assert!(!grants(
+        &s,
+        aces.clone(),
+        prop(RIGHT_DS_READ_PROPERTY, attr_in_shared_set())
+    ));
+    // Control: had the set's GUID named no attribute, the same allow would
+    // grant every member ([MS-ADTS] 3.1.1.2.3.3: a property set GUID grants
+    // "all attributes in one access control entry").
+    let ordinary_set = Right::Property {
+        mask: RIGHT_DS_READ_PROPERTY,
+        property_set: Some(pdp::PropertySet {
+            guid: shared_guid(),
+            is_attribute_guid: false,
+        }),
+        attribute: attr_in_shared_set(),
+    };
+    assert!(grants(&s, aces, ordinary_set));
+}
+
+/// A-28 (Q-081) item 2 with both nodes in the tree: the allow lands on the
+/// attribute node and the later deny on the property set node, so [MS-DTYP]
+/// 2.5.3.2 "Object Deny Access" finds the bit still in the set's Remaining ⇒
+/// access_denied (as for an ordinary set: Q-051 case 2,
+/// `property_set_deny_after_attribute_grant_denies`).
+#[test]
+fn a28_shared_guid_allow_then_deny_denies() {
+    let s = the_user();
+    assert!(!grants(
+        &s,
+        vec![
+            allow_obj(RIGHT_DS_READ_PROPERTY, Some(shared_guid()), user()),
+            deny_obj(RIGHT_DS_READ_PROPERTY, Some(shared_guid()), user()),
+        ],
+        prop(RIGHT_DS_READ_PROPERTY, shared_guid())
     ));
 }
 
@@ -770,6 +1042,7 @@ fn principal_self_is_replaced_by_object_sid() {
     );
     let self_object = DirObjectContext {
         object_class: class_user(),
+        superclasses: vec![],
         object_sid: Some(user()),
     };
     assert!(acl_grants(
@@ -780,6 +1053,7 @@ fn principal_self_is_replaced_by_object_sid() {
     ));
     let other_object = DirObjectContext {
         object_class: class_user(),
+        superclasses: vec![],
         object_sid: Some(other_user()),
     };
     assert!(!acl_grants(

@@ -127,8 +127,13 @@ fn evaluate<P: Pip + ?Sized>(
     // only).
     if let Resource::DirObject { dn, attr } = &req.resource {
         let sd = from_pip(pip.security_descriptor(dn))?;
+        // The root of the object type tree is the most specific class; the
+        // rest of the chain is named by deny object ACEs. Spec: [MS-ADTS]
+        // 5.1.3.3.3, 3.1.1.2.4.3; A-28 (Q-081).
+        let classes = from_pip(pip.object_classes(dn))?;
         let object = DirObjectContext {
-            object_class: from_pip(pip.object_class(dn))?.0,
+            object_class: classes.most_specific.0,
+            superclasses: classes.superclasses.iter().map(|c| c.0).collect(),
             object_sid: from_pip(pip.object_sid(dn))?,
         };
         let right = desired_right(&req.action, attr.as_ref(), pip)?;

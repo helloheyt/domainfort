@@ -109,7 +109,7 @@ fn every_right() -> Vec<Right> {
         },
         Right::Property {
             mask: RIGHT_DS_READ_PROPERTY,
-            property_set: Some(propset()),
+            property_set: Some(plain_set()),
             attribute: attr_in_set(),
         },
         Right::Property {
@@ -243,6 +243,7 @@ fn for_each_decide_input(mut f: impl FnMut(&AccessRequest, &PolicySnapshot, &Moc
 fn object() -> DirObjectContext {
     DirObjectContext {
         object_class: class_user(),
+        superclasses: vec![],
         object_sid: Some(user()),
     }
 }
@@ -543,6 +544,216 @@ fn p9_no_clock_dependence() {
         assert_eq!(d.effect == Effect::Allow, inside, "P9 window at {t}");
         req.context.time = Instant(*t);
         assert_eq!(&decide(&req, &timed, &pip), d);
+    }
+}
+
+// ------------------------------------------------- A-28 never widens ----
+
+/// The ACE alphabet of `a28_never_grants_more_than_before`: the base
+/// alphabet plus allow / deny object ACEs naming each class of the chains
+/// (most specific, superclass, a class in no chain is `class_group`, already
+/// a child class) and both GUIDs of the shared property set.
+fn a28_alphabet() -> Vec<Ace> {
+    let mut out = ace_alphabet();
+    let masks = [
+        RIGHT_DS_READ_PROPERTY,
+        RIGHT_DS_READ_PROPERTY | RIGHT_DS_WRITE_PROPERTY,
+        RIGHT_GENERIC_ALL,
+    ];
+    for mask in masks {
+        for g in [
+            class_user(),
+            class_computer(),
+            class_top(),
+            shared_guid(),
+            attr_in_shared_set(),
+        ] {
+            for ace in [
+                allow_obj(mask, Some(g), user()),
+                deny_obj(mask, Some(g), user()),
+            ] {
+                out.push(inherit_only(ace.clone()));
+                out.push(ace);
+            }
+        }
+    }
+    out
+}
+
+/// The objects: the default one (`class_user`, no other class listed) and a
+/// `class_computer` with its superclass chain.
+fn a28_objects() -> Vec<DirObjectContext> {
+    vec![
+        object(),
+        DirObjectContext {
+            object_class: class_computer(),
+            superclasses: vec![class_top(), class_person(), class_user()],
+            object_sid: Some(user()),
+        },
+    ]
+}
+
+/// Every right of `every_right()`, plus the requests A-28 is about: the
+/// attribute whose GUID is its own property set's, another member of that
+/// set, a child of the object's own class and a child of `class_user`
+/// (a superclass of the computer; the object's own class for the user).
+fn a28_rights(o: &DirObjectContext) -> Vec<Right> {
+    let mut out = every_right();
+    out.extend([
+        Right::Property {
+            mask: RIGHT_DS_READ_PROPERTY,
+            property_set: Some(shared_set()),
+            attribute: shared_guid(),
+        },
+        Right::Property {
+            mask: RIGHT_DS_WRITE_PROPERTY,
+            property_set: Some(shared_set()),
+            attribute: shared_guid(),
+        },
+        Right::Property {
+            mask: RIGHT_DS_READ_PROPERTY,
+            property_set: Some(shared_set()),
+            attribute: attr_in_shared_set(),
+        },
+        Right::CreateChild {
+            class: o.object_class,
+        },
+        Right::CreateChild {
+            class: class_user(),
+        },
+    ]);
+    out
+}
+
+/// The request as the object type tree before A-28 saw it, so that
+/// `acl_grants` on it gives the pre-A-28 result:
+/// - the root was labelled by the most specific class only (the PIP gave
+///   no other class): `superclasses` is emptied;
+/// - nothing marked a property set GUID as an attribute's:
+///   `is_attribute_guid` is cleared;
+/// - every object ACE was located at the shallowest node carrying its GUID,
+///   so a lower node with the same GUID as a higher one was never located
+///   itself and was reached by exactly the ACEs that reached the higher
+///   node. It behaved as the higher node (an attribute below its own
+///   property set: the set node is dropped) or as a node no ACE names (a
+///   child class equal to the object's class: replaced by `guid(0x7F)`,
+///   outside every alphabet).
+///
+/// Checked once against the pre-change build over this test's domain
+/// (459,382 cases with owner `None`): identical results.
+fn pre_a28(o: &DirObjectContext, right: &Right) -> (DirObjectContext, Right) {
+    let object = DirObjectContext {
+        superclasses: Vec::new(),
+        ..o.clone()
+    };
+    let unnamed = guid(0x7F);
+    let right = match *right {
+        Right::Property {
+            mask,
+            property_set: Some(set),
+            attribute,
+        } if set.guid == attribute => Right::Property {
+            mask,
+            property_set: None,
+            attribute,
+        },
+        Right::Property {
+            mask,
+            property_set: Some(set),
+            attribute,
+        } => Right::Property {
+            mask,
+            property_set: Some(pdp::PropertySet {
+                guid: set.guid,
+                is_attribute_guid: false,
+            }),
+            attribute,
+        },
+        Right::CreateChild { class } if class == o.object_class => {
+            Right::CreateChild { class: unnamed }
+        }
+        Right::ControlAccess { right } if right == o.object_class => {
+            Right::ControlAccess { right: unnamed }
+        }
+        other => other,
+    };
+    (object, right)
+}
+
+/// A-28 (Q-081) item 3: neither rule ever grants more than the object type
+/// tree without it. Over every DACL of up to two ACEs (base alphabet plus
+/// class-typed and shared-GUID object ACEs), both objects, two owners and
+/// every right: A-28 grants ⇒ the pre-A-28 tree grants. The domain also
+/// reaches a strictly stricter result for each rule, so the check is not
+/// vacuous. Source: A-28 (Q-081); [MS-ADTS] 5.1.3.3.3; the invariant stated
+/// in `access_check`'s module documentation.
+#[test]
+fn a28_never_grants_more_than_before() {
+    let s = the_user();
+    let mut checked = 0usize;
+    // Strictly stricter results: superclass (computer object), shared GUID
+    // outside the chain (other member), shared GUID inside the chain (the
+    // attribute itself), child of the object's own class.
+    let (mut superclass, mut other_member, mut in_chain, mut own_child) = (0, 0, 0, 0);
+    let alphabet = a28_alphabet();
+    let mut dacls = vec![vec![]];
+    dacls.extend(alphabet.iter().map(|a| vec![a.clone()]));
+    for a in &alphabet {
+        for b in &alphabet {
+            dacls.push(vec![a.clone(), b.clone()]);
+        }
+    }
+    for aces in &dacls {
+        for owner in [None, Some(user())] {
+            let d = sd(owner, aces.clone());
+            for o in a28_objects() {
+                for right in a28_rights(&o) {
+                    let (old_object, old_right) = pre_a28(&o, &right);
+                    let now = acl_grants(&s, &d, &o, &right);
+                    let before = acl_grants(&s, &d, &old_object, &old_right);
+                    assert!(
+                        !now || before,
+                        "A-28 widened a grant: {right:?} on {o:?} with {aces:?}, owner {owner:?}"
+                    );
+                    if before && !now {
+                        // Attribute each stricter result to one rule: rule 1
+                        // alone on the computer for the rights of
+                        // `every_right()` (no duplicate GUID involved), rule
+                        // 2 alone on the user object (no superclass listed).
+                        let duplicate = match right {
+                            Right::Property {
+                                property_set: Some(set),
+                                attribute,
+                                ..
+                            } if set.is_attribute_guid => Some(if set.guid == attribute {
+                                &mut in_chain
+                            } else {
+                                &mut other_member
+                            }),
+                            Right::CreateChild { class } if class == o.object_class => {
+                                Some(&mut own_child)
+                            }
+                            _ => None,
+                        };
+                        match (o.superclasses.is_empty(), duplicate) {
+                            (true, Some(count)) => *count += 1,
+                            (false, None) if every_right().contains(&right) => superclass += 1,
+                            _ => {}
+                        }
+                    }
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked > 900_000, "domain too small: {checked}");
+    for (rule, count) in [
+        ("superclass deny", superclass),
+        ("shared GUID, other member", other_member),
+        ("shared GUID, the attribute", in_chain),
+        ("child of the object's own class", own_child),
+    ] {
+        assert!(count > 0, "never stricter than before: {rule}");
     }
 }
 
