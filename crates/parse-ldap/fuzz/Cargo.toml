@@ -1,0 +1,50 @@
+# cargo-fuzz harness for parse-ldap (AGENTS.md §6 / docs/32 §8: every parser gets
+# a fuzz target before it merges to main; docs/49 §2.5).
+#
+# This is a SEPARATE workspace (note the empty [workspace] table below): it is
+# intentionally NOT a member of the root workspace, so `cargo build --all`,
+# `cargo clippy`, `cargo test`, `cargo deny` and the SBOM in the product
+# workspace never pull in the fuzzing-only dependencies. It is built only via
+# `cargo fuzz run parse_ldap_decode_message` / `cargo fuzz run parse_ldap_frame`
+# (nightly + cargo-fuzz).
+#
+# NOTE FOR REVIEW: libfuzzer-sys is fuzz-harness-only test infrastructure, not
+# linked into any product crate, and on the license allowlist (MIT / Apache-2.0,
+# AGENTS.md §7). Pending owner sign-off (docs/questions/PENDING-OWNER.md P-1);
+# not built or run until then.
+
+[package]
+name = "parse-ldap-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.parse-ldap]
+path = ".."
+
+# `decode_message` under every profile and direction, with the canonical
+# re-encoding property (`cargo fuzz run parse_ldap_decode_message`).
+[[bin]]
+name = "parse_ldap_decode_message"
+path = "fuzz_targets/parse_ldap_decode_message.rs"
+test = false
+doc = false
+bench = false
+
+# `frame_length` on arbitrary stream buffers, then decoding of every frame it
+# cuts (`cargo fuzz run parse_ldap_frame`).
+[[bin]]
+name = "parse_ldap_frame"
+path = "fuzz_targets/parse_ldap_frame.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the root workspace (see header).
+[workspace]

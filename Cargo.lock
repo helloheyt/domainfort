@@ -206,6 +206,10 @@ name = "parse-asn1"
 version = "0.0.0"
 
 [[package]]
+name = "parse-ldap"
+version = "0.0.0"
+
+[[package]]
 name = "pbkdf2"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
