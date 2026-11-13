@@ -20,8 +20,8 @@
 //! | channel | [`channel`] | magic, exact version, per-direction and per-field bounds, the closed kind and code tables (no kind equals `ipc::REFUSED_KIND`) |
 //! | wire | [`wire`] | fixed-order fields through `ipc` (lengths, markers, closed tables, no trailing octet); Kerberos values and SIDs opaque |
 //! | typed | [`typed`] | `PrincipalName` through krb-proto's DER, realms / salts as KerberosStrings, times through `KerberosTime::new`, SIDs through dtyp; group sets strictly ascending |
-//! | client | [`client`] | [`DirectoryClient`], [`RemoteView`], [`UnavailableDirectory`]: dird-uid check before sending, deadline, policy-version check, strict replies, not served → `Unavailable` |
-//! | socket | `unix` | [`UnixConnector`]: blocking Unix stream, peer uid via rustix (Linux; elsewhere fail closed) |
+//! | client | [`client`] | [`DirectoryClient`], [`RemoteView`], [`UnavailableDirectory`]: dird-uid check before sending, deadline, policy-version check, strict replies, not served → `Unavailable`; a held connection checked before reuse, no resend (Q-312); optionally `DescribeDomain` required of every new connection (Q-311) |
+//! | socket | `unix` | [`UnixConnector`]: blocking Unix stream, peer uid via rustix (Linux; elsewhere fail closed), non-blocking idle check |
 //!
 //! # Message kinds (magic `0x4452` "DR", version 1)
 //!

@@ -134,6 +134,11 @@ mod connector {
         ) -> Result<Zeroizing<Vec<u8>>, TransportError> {
             self.inner.exchange(frame, reply_limit, deadline)
         }
+
+        /// The blocking connection's own idle check (docs/questions/Q-312).
+        fn check_idle(&mut self) -> Result<(), TransportError> {
+            self.inner.check_idle()
+        }
     }
 }
 

@@ -22,17 +22,27 @@
 //!    error), bind, set the socket file's mode, accept (docs/50 §3.1). The
 //!    admin socket is not bound (task P13).
 //! 5. **until stopped** — [`DaemonControl::stop`]: stop accepting, answer
-//!    new requests `Unavailable`, wait (bounded) for queued requests, remove
-//!    the socket files, return; the caller drops the runtime, after which
-//!    the engine threads end and are joined ([`Stopped::join`]).
+//!    new requests `Unavailable`, wait (bounded) for queued requests, then
+//!    wait (bounded by [`AUDIT_FLUSH_GRACE`], the bound keyd and the kdc
+//!    use) until auditd acknowledged every event in the LDAP audit window —
+//!    the audit task keeps running meanwhile, reconnecting if the link
+//!    dropped — and only then end the audit task; the events still
+//!    unacknowledged are reported (the log note
+//!    `AuditUnacknowledged` with their count, and
+//!    [`Stopped::unacknowledged_audit_events`]); remove the socket files,
+//!    return; the caller drops the runtime, after which the engine threads
+//!    end and are joined ([`Stopped::join`]).
 //!
 //! SIGTERM is not wired to the stop (tokio `signal` is not in docs/50 §10's
 //! feature list — the keyd-daemon residual, docs/questions/Q-260 item 9):
 //! the default action ends the process; dird holds nothing that is not on
-//! disk (every write is a committed redb transaction, D136).
+//! disk (every write is a committed redb transaction, D136) except the LDAP
+//! events of its audit window not yet acknowledged — at most the window's
+//! capacity (Q-252 item 9).
 //!
-//! Spec: docs/50 R50-2, R50-3, R50-7, R50-14, R50-16, §3.1, §3.4, §3.6,
-//! §6.4, §7.4, §7.5; docs/questions/Q-213 (A-57), Q-270.
+//! Spec: docs/50 R50-2, R50-3, R50-7, R50-14, R50-16, R50-17, §3.1, §3.4,
+//! §3.6, §6.4, §7.4, §7.5, §8.1; docs/questions/Q-213 (A-57), Q-252 item 9
+//! (A-64), Q-270, Q-313 (A-82).
 
 use crate::audit_link::{self, AuditEndpoint, AuditLinkError};
 use crate::clock::SharedClock;
@@ -94,6 +104,12 @@ pub const SOCKET_FILE_MODE: u32 = 0o660;
 
 /// How long a stop waits for queued requests to be answered. Project choice.
 pub const DRAIN_GRACE: Duration = Duration::from_secs(5);
+
+/// How long a stop waits for auditd to acknowledge the LDAP audit window:
+/// the same bound as keyd-daemon's and kdc-daemon's `AUDIT_FLUSH_GRACE`
+/// (5 s; a project choice there). docs/questions/Q-313 (A-82: "the same
+/// bound keyd and the kdc use").
+pub const AUDIT_FLUSH_GRACE: Duration = Duration::from_secs(5);
 
 /// Poll interval while draining. Project choice.
 const DRAIN_POLL: Duration = Duration::from_millis(10);
@@ -293,6 +309,7 @@ pub struct Stopped {
     engine: EngineThread,
     ldap_engine: EngineThread,
     engine_failed: bool,
+    unacknowledged: usize,
 }
 
 impl Stopped {
@@ -300,6 +317,15 @@ impl Stopped {
     #[must_use]
     pub fn engine_failed(&self) -> bool {
         self.engine_failed
+    }
+
+    /// The LDAP audit events auditd had not acknowledged when the stop
+    /// ended the audit task (after waiting up to [`AUDIT_FLUSH_GRACE`]):
+    /// lost with the process (Q-252 item 9). 0 after a clean stop.
+    /// Spec: docs/50 R50-17, §8.1; docs/questions/Q-313 (A-82).
+    #[must_use]
+    pub fn unacknowledged_audit_events(&self) -> usize {
+        self.unacknowledged
     }
 
     /// Wait for both engine threads; call after the runtime was dropped.
@@ -528,8 +554,23 @@ pub async fn serve(
         context.in_flight() == 0 && ldap_context.in_flight() == 0
     })
     .await;
+    // Q-313 (A-82: "waits, bounded, for auditd's acknowledgement of every
+    // queued audit event"): the events already committed to the window
+    // (their operations answered) reach auditd before the audit task ends.
+    // The wait does not end early when the link counts as unreachable — the
+    // audit task keeps reconnecting (crate::audit_link) and a link that
+    // dropped just before the stop can still deliver within the bound
+    // (docs/questions/Q-350 item 11).
+    wait_until(AUDIT_FLUSH_GRACE, || gate.outstanding() == 0).await;
     audit_task.abort();
     let _ = audit_task.await;
+    let unacknowledged = gate.outstanding();
+    if unacknowledged > 0 {
+        note(
+            Note::AuditUnacknowledged,
+            Some(u64::try_from(unacknowledged).unwrap_or(u64::MAX)),
+        );
+    }
     let _ = std::fs::remove_file(&params.kdc_socket);
     let _ = std::fs::remove_file(&params.ldap_socket);
     let engine_failed = control.state.engine_ended.load(Ordering::SeqCst);
@@ -541,5 +582,6 @@ pub async fn serve(
         engine: engine_thread,
         ldap_engine: ldap_thread,
         engine_failed,
+        unacknowledged,
     })
 }

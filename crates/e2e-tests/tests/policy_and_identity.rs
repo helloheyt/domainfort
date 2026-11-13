@@ -9,8 +9,11 @@
 //!
 //! **6. Identity** (docs/50 R50-3, §3.2: a caller's identity comes only from
 //! the peer credentials, through each server's `uid → Role` table):
-//! a channel cross-wired at runtime is closed or Denied, and the client is
-//! never issued a ticket. Only what the per-daemon tests do not already
+//! a channel cross-wired at runtime is closed or refused, and the client is
+//! never issued a ticket — a keyd that no longer gives the kdc's uid the
+//! Kdc role is 29 like any keyd that does not serve, never 24 (Q-311, A-82).
+//! Every first request after a server was replaced is decided by the new
+//! process (Q-312, A-82). Only what the per-daemon tests do not already
 //! cover is added here — each server's refusal is seen **through the whole
 //! chain, by the client** (the kdc's 29, ldap-front's notice), with the
 //! other daemons running:
@@ -19,7 +22,7 @@
 //! |---|---|---|
 //! | `keyd_not_mapping_the_kdcs_uid_…` | keyd's map names another uid as Kdc | 29 / silence |
 //! | `the_kdc_does_not_start_…` | keyd maps the kdc's uid to Directory, at the kdc's start | the kdc refuses to start |
-//! | `keyd_giving_the_kdcs_uid_another_role_…` | the same, under a running kdc | a KRB-ERROR, no ticket; keyd's record says Denied (Q-311) |
+//! | `keyd_giving_the_kdcs_uid_another_role_…` | the same, under a running kdc | 29 / silence, never 24; keyd's records: refused `DescribeConfig`s only (Q-311) |
 //! | `dird_kdc_channel_for_another_uid_…` | dird's kdc channel for another uid | 29 / silence; LDAP unaffected |
 //! | `dird_ldap_channel_for_another_uid_…` | dird's LDAP channel for another uid | the notice, close; Kerberos unaffected |
 //! | `auditd_not_mapping_the_senders_…` | auditd's map names another uid | 29 / silence, the notice; auditd's own record of the refused uid |
@@ -41,7 +44,8 @@
 //!
 //! Sources: docs/50 R50-2, R50-3, R50-8, §3.2, §3.4, §3.7, §7.2, §7.5, §8.1;
 //! docs/10 §2 (I2: keyd's capability table decides); RFC 4120 §7.5.9; RFC
-//! 4511 §4.4.1; A-57, A-60, A-62, A-68, A-69, A-70. Every value is made here.
+//! 4511 §4.4.1; A-57, A-60, A-62, A-68, A-69, A-70; docs/questions/Q-311,
+//! Q-312 (A-82). Every value is made here.
 
 #[path = "../../kdc/tests/common/mod.rs"]
 mod common;
@@ -113,14 +117,19 @@ fn dird_on_another_policy_version_makes_the_kdc_answer_29() {
         let other = h.policy_file("policy-8.store", POLICY_VERSION + 1);
         let uid = h.uid;
         h.start_dird_with(&other, uid, uid).unwrap();
-        after_restart(&h, 90);
+        // The first request after each restart is decided by the dird now
+        // running (docs/questions/Q-312; Q-311: the new connection's
+        // `DescribeDomain` carries the policy version).
         assert_eq!(kdc_tcp(&h, &alice_probe(2)), UNAVAILABLE);
         assert_eq!(kdc_udp(&h, &alice_probe(3)), None, "silence over UDP");
         assert_eq!(kdc_tcp(&h, &bootstrap(4)), UNAVAILABLE);
         h.stop_dird();
         h.start_dird().unwrap();
-        after_restart(&h, 91);
-        assert_eq!(kdc_tcp(&h, &alice_probe(5)), PREAUTH_REQUIRED);
+        assert_eq!(
+            kdc_tcp(&h, &alice_probe(5)),
+            PREAUTH_REQUIRED,
+            "the first request after dird is back on version 7"
+        );
         assert!(bootstrap_issued(&h, 6));
         h.stop_all();
     });
@@ -144,12 +153,11 @@ fn keyd_not_mapping_the_kdcs_uid_is_closed_and_the_kdc_answers_29() {
         let other = CallerMap::new(&[(another_uid(&h), Role::Kdc)]).unwrap();
         h.start_keyd(other, common::keyd_started()).unwrap();
         h.keyd_clock.set(common::now());
-        after_restart(&h, 90);
         assert_eq!(kdc_tcp(&h, &bootstrap(2)), UNAVAILABLE);
         assert_eq!(kdc_udp(&h, &bootstrap(3)), None, "silence over UDP");
         h.stop_keyd();
         h.start_keyd_serving().unwrap();
-        after_restart(&h, 91);
+        // The first request after the restart (docs/questions/Q-312).
         assert!(bootstrap_issued(&h, 4), "served with the right map");
         h.stop_all();
     });
@@ -176,14 +184,19 @@ fn the_kdc_does_not_start_when_keyd_gives_its_uid_another_role() {
     });
 }
 
-/// docs/50 R50-3, §3.2; docs/10 §2 (I2), §9 (uniform `Denied`); A-26: keyd
-/// restarted under the running kdc with the kdc's uid mapped to the
-/// Directory role — the bootstrap gets a KRB-ERROR and no ticket, over TCP
-/// and UDP; keyd's own audit record of the attempt says Denied,
-/// RoleNotPermitted, for the Directory caller. The code the client sees is
-/// docs/questions/Q-311 (it is keyd's uniform refusal, not 29).
+/// docs/50 R50-3, R50-8, §3.2, §3.4 (`DescribeConfig` — Kdc, Ldap), §3.7,
+/// §7.5 step 4; docs/10 §2 (I2), §9; RFC 4120 §7.5.9; docs/questions/Q-311
+/// (A-82): keyd restarted under the running kdc with the kdc's uid mapped
+/// to the Directory role. The kdc's new keyd connection carries only its
+/// `DescribeConfig` check, which keyd refuses, so the connection is dropped
+/// and the bootstrap is answered KDC_ERR_SVC_UNAVAILABLE (29) over TCP and
+/// with silence over UDP — never KDC_ERR_PREAUTH_FAILED (24), what a wrong
+/// password looks like. keyd's own records of the attempts are refused
+/// `DescribeConfig`s of the Directory caller (one per request: a new
+/// connection each time), and keyd ran no operation of the exchange for
+/// it. keyd back with the right map ⇒ the first request is issued.
 #[test]
-fn keyd_giving_the_kdcs_uid_another_role_at_runtime_issues_nothing() {
+fn keyd_giving_the_kdcs_uid_another_role_at_runtime_is_29_not_24() {
     within(TEST_BOUND, || {
         let Some(mut h) = Harness::start() else {
             return;
@@ -193,29 +206,35 @@ fn keyd_giving_the_kdcs_uid_another_role_at_runtime_issues_nothing() {
         let directory = CallerMap::new(&[(h.uid, Role::Directory)]).unwrap();
         h.start_keyd(directory, common::keyd_started()).unwrap();
         h.keyd_clock.set(common::now());
-        after_restart(&h, 90);
-        // Observed: KDC_ERR_PREAUTH_FAILED (24) — keyd served the call and
-        // refused it with its uniform `Denied`, which the kdc maps as for a
-        // wrong key (crates/kdc as_exchange.rs `preauth_refusal`), not 29.
-        // Whether a role refusal should reach the client as 29 is
-        // docs/questions/Q-311; this test holds only the fail-closed part.
-        let tcp = kdc_tcp(&h, &bootstrap(2));
-        assert!(matches!(tcp, KdcAnswer::Error(_)), "no ticket: {tcp:?}");
-        let udp = kdc_udp(&h, &bootstrap(3));
-        assert!(
-            matches!(udp, None | Some(KdcAnswer::Error(_))),
-            "no ticket over UDP: {udp:?}"
-        );
+        assert_eq!(kdc_tcp(&h, &bootstrap(2)), UNAVAILABLE, "29, not 24");
+        assert_eq!(kdc_udp(&h, &bootstrap(3)), None, "silence over UDP");
+        assert_eq!(kdc_tcp(&h, &bootstrap(4)), UNAVAILABLE);
+        h.stop_keyd();
+        h.start_keyd_serving().unwrap();
+        assert!(bootstrap_issued(&h, 5), "the right map: served at once");
         h.stop_all();
-        let denied = h.audit_events().into_iter().any(|event| {
-            matches!(event, EventBody::Keyd(record)
-                if record.op == KeydOperation::VerifyPreauth
-                    && record.caller_role == KeydRole::Directory
-                    && record.caller_uid == h.uid
-                    && record.result == KeydOutcome::Denied
-                    && record.reason == KeydReason::RoleNotPermitted)
-        });
-        assert!(denied, "keyd recorded the Directory caller's refusal");
+
+        let directory_records: Vec<_> = h
+            .audit_events()
+            .into_iter()
+            .filter_map(|event| match event {
+                EventBody::Keyd(record) if record.caller_role == KeydRole::Directory => {
+                    Some(*record)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            directory_records.len(),
+            3,
+            "one DescribeConfig per request: {directory_records:?}"
+        );
+        for record in &directory_records {
+            assert_eq!(record.op, KeydOperation::DescribeConfig);
+            assert_eq!(record.caller_uid, h.uid);
+            assert_eq!(record.result, KeydOutcome::Denied);
+            assert_eq!(record.reason, KeydReason::RoleNotPermitted);
+        }
     });
 }
 
@@ -233,7 +252,6 @@ fn dird_kdc_channel_for_another_uid_is_closed_and_the_kdc_answers_29() {
         h.stop_dird();
         let (policy, uid, other) = (h.paths.policy.clone(), h.uid, another_uid(&h));
         h.start_dird_with(&policy, other, uid).unwrap();
-        after_restart(&h, 90);
         assert_eq!(kdc_tcp(&h, &alice_probe(2)), UNAVAILABLE);
         assert_eq!(kdc_udp(&h, &alice_probe(3)), None, "silence over UDP");
         assert!(
@@ -266,7 +284,7 @@ fn dird_ldap_channel_for_another_uid_is_closed_and_the_front_sends_its_notice() 
             LdapAnswer::NoticeThenClosed(unavailable.clone())
         );
         assert_eq!(ldap_first_words(&h), Some(unavailable));
-        after_restart(&h, 90);
+        // The kdc's first request since dird was replaced (Q-312).
         assert!(bootstrap_issued(&h, 1), "the kdc channel is unaffected");
         h.stop_all();
     });

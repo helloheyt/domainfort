@@ -52,7 +52,7 @@ use std::os::unix::fs::{chown, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use support::kdcd::{message, tcp_send, udp_send, Handles, HeldClock, Kdcd};
 use support::ldap_client::{root_dse, tcp, tls_over, LdapReader};
-use support::tls::{client_config, p256_key, placeholder_server_config};
+use support::tls::{client_config, server_config, test_pki};
 use support::*;
 
 const AUDITD_UID: u32 = 61101;
@@ -260,8 +260,8 @@ fn deploy_and_check(base: &Path) -> Result<(), String> {
     })?;
 
     // 5. ldap-front.
-    let tls_key = p256_key();
-    let tls = placeholder_server_config(&tls_key);
+    let tls_pki = test_pki();
+    let tls = server_config(&tls_pki);
     let front_params = ldap_front::FrontParams {
         dird: ldap_front::Endpoint {
             socket: dird_ldap_socket,
@@ -301,7 +301,7 @@ fn deploy_and_check(base: &Path) -> Result<(), String> {
     if open_ticket(&rep.0.ticket, &service_key()).cname != alice_name() {
         return Err(String::from("the service ticket does not name alice"));
     }
-    let client = client_config(&tls_key);
+    let client = client_config(&tls_pki);
     let mut stream = tls_over(tcp(front.ldaps), &client)?;
     std::io::Write::write_all(&mut stream, &root_dse(1)).map_err(|e| e.to_string())?;
     let mut reader = LdapReader::default();

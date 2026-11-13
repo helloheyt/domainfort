@@ -58,9 +58,9 @@ fn keyd_down_then_back_only_after_its_hold_down() {
 
         let callers = h.kdc_callers();
         h.start_keyd(callers, at(-600)).expect("keyd starts again");
-        // While keyd was down the kdc's calls failed at connect, so no
-        // stale connection is left (Q-312); the probe makes that explicit.
-        after_restart(&h, 90);
+        // The first request after the restart is decided by the new keyd —
+        // its hold-down — (docs/questions/Q-312: no stale connection is
+        // ever reused).
         assert_eq!(kdc_tcp(&h, &bootstrap(13)), UNAVAILABLE, "hold-down at S");
         assert_eq!(kdc_udp(&h, &bootstrap(14)), None, "hold-down at S, UDP");
         h.keyd_clock.set(at(0));

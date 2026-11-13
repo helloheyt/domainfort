@@ -61,25 +61,6 @@ fn classify(message: &[u8]) -> KdcAnswer {
     }
 }
 
-/// One TCP request whose answer is **not** looked at, sent right after keyd
-/// or dird was restarted under the running kdc.
-///
-/// The kdc keeps its connection to keyd and to dird open between requests
-/// (docs/50 §3.6: "clients hold a connection"); after the server process
-/// was replaced, that idle connection is found broken only when the next
-/// request uses it, and that request is answered 29 (`Unavailable`; the
-/// clients reconnect at the *next* call — crates/ipc-keyd client.rs, "Any
-/// failure drops the connection; the next call reconnects"). Observed in
-/// this harness and recorded as docs/questions/Q-312. This probe takes that
-/// one answer out of the assertions that follow, so that each of them is
-/// decided by the server now running, not by the stale connection. The
-/// probe is the computer's bootstrap, which reaches dird and then keyd
-/// (RFC 4120 §3.1.2; docs/47 §8.1), so it meets whichever connection is
-/// stale (only one server is restarted at a time in these tests).
-pub fn after_restart(h: &Harness, nonce: u32) {
-    let _ = kdc_tcp(h, &super::kdcd::bootstrap(nonce));
-}
-
 /// The computer's bootstrap AS-REQ with `nonce` over TCP: `true` if the
 /// AS-REP came and opens with the computer's key (RFC 4120 §3.1.5).
 pub fn bootstrap_issued(h: &Harness, nonce: u32) -> bool {

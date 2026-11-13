@@ -14,8 +14,8 @@
 //! | wire | [`wire`] | fixed-order fields through `ipc` (lengths, markers, closed enum tables, no trailing octet); Kerberos values stay opaque DER |
 //! | typed | [`typed`] | every Kerberos value through `krb-proto`'s strict decoder; passwords and salt as UTF-8 |
 //! | server | [`server`] | [`decode_request`] / [`encode_answer`]; `ipc_keyd_server::dispatch` calls keyd with the **transport's** caller and the **daemon's** clock between them |
-//! | client | [`client`] | [`KeydClient`] / [`IpcKeyd`]: server-uid check, deadline, strict reply decoding, transport failure → `Unavailable` |
-//! | socket | `unix` | [`UnixConnector`]: blocking Unix stream, peer uid via rustix (Linux; elsewhere fail closed) |
+//! | client | [`client`] | [`KeydClient`] / [`IpcKeyd`]: server-uid check, deadline, strict reply decoding, transport failure → `Unavailable`; a held connection checked before reuse, no resend (Q-312); `IpcKeyd`: `DescribeConfig` required of every new connection (Q-311) |
+//! | socket | `unix` | [`UnixConnector`]: blocking Unix stream, peer uid via rustix (Linux; elsewhere fail closed), non-blocking idle check |
 //!
 //! # Message kinds
 //!

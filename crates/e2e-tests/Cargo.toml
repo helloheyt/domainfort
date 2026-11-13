@@ -65,10 +65,17 @@ directory-pip = { path = "../directory-pip" }
 ad-schema = { path = "../ad-schema" }
 ldap = { path = "../ldap" }
 parse-ldap = { path = "../parse-ldap" }
+# The DER encoder (`encode`, `encode_element`) under the test certificates
+# of tests/support/tls.rs (crates/parse-x509 tests/common/build.rs, reused
+# by `#[path]`, as crates/ldap-front's tests do; docs/questions/Q-320,
+# A-81; task F1). A workspace crate, already in the lock.
+parse-asn1 = { path = "../parse-asn1" }
 # Third-party, all already locked and approved (P-12, OD-9, P-21), with the
 # daemons' own feature sets: the daemons' runners need a tokio runtime;
 # rustls is the LDAPS / StartTLS client (docs/50 §9: "TLS client — rustls
-# itself as client"); aws-lc-rs makes the per-run test key; zeroize is in
+# itself as client", trusting only the per-run test CA through its standard
+# `WebPkiServerVerifier`); aws-lc-rs makes and signs with the per-run test
+# keys (tests/support/tls.rs); zeroize is in
 # the blocking connectors' signatures.
 tokio = { version = "1.54.1", default-features = false, features = ["rt", "net", "time", "sync", "io-util"] }
 rustls = { version = "0.23.46", default-features = false, features = ["std", "aws_lc_rs"] }

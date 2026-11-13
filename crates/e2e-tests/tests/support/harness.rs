@@ -22,8 +22,10 @@
 //!    read through the kdc's own `startup::read_policy` (A-68, A-69), keyd
 //!    and dird reached over their sockets;
 //! 5. **ldap-front** — `ldap_front::serve` with its LDAP and LDAPS listeners
-//!    on 127.0.0.1 port 0, the product's TLS configuration over the test
-//!    trust model ([`super::tls`]), dird's LDAP socket.
+//!    on 127.0.0.1 port 0, the product's TLS configuration serving the DC's
+//!    real test certificate through the production loader, verified by the
+//!    clients against only the per-run test CA ([`super::tls`]; Q-320,
+//!    A-81), dird's LDAP socket.
 //!
 //! Every daemon talks to the others **only** through those sockets — the
 //! channels of docs/50 §3.1: `audit.sock` shared by every sender (file
@@ -32,14 +34,18 @@
 //! mode 0700** (crates/keyd-daemon's `TempDir`). Each daemon can be stopped
 //! and started again ([`Harness::stop_keyd`], [`Harness::start_keyd`], …);
 //! every wait is a deadline poll inside the runners (10-15 s) or
-//! [`eventually`] / [`Harness::wait_until_persisted`] (bounded by [`LONG`]),
-//! and each test runs inside [`within`] ([`TEST_BOUND`]).
+//! [`eventually`] (bounded by [`LONG`]), and each test runs inside
+//! [`within`] ([`TEST_BOUND`]).
 //!
-//! Two behaviours of the daemons met here are kept out of the assertions
-//! explicitly: the first kdc request after keyd or dird is replaced meets
-//! the kdc's stale idle connection (29 — docs/questions/Q-312;
-//! tests/support/probes.rs `after_restart`), and dird's stop does not wait
-//! for its audit window (docs/questions/Q-313; [`Harness::wait_until_persisted`]).
+//! The three defects these tests first met are fixed (task F1, A-82) and
+//! the assertions now hold them directly, with no workaround: the first kdc
+//! request after keyd or dird is replaced is decided by the new process
+//! (the clients check a held connection before reusing it —
+//! docs/questions/Q-312); keyd restarted with the kdc's uid in another role
+//! is 29 / silence, not 24 (the kdc's keyd client repeats its
+//! `DescribeConfig` check on every new connection — Q-311); and dird's stop
+//! waits, bounded, for auditd to acknowledge its audit window (Q-313), so
+//! the tests stop dird without first waiting for its events.
 //!
 //! # Identity: one test uid
 //!
@@ -99,7 +105,7 @@ use super::auditd as auditd_support;
 pub use super::kdcd::dird;
 pub use super::kdcd::keyd_support;
 use super::kdcd::{self, Handles, HeldClock, Kdcd};
-use super::tls::{client_config, p256_key, placeholder_server_config, TestKey};
+use super::tls::{client_config, server_config, test_pki, TestPki};
 use crate::common;
 use audit_daemon::listener::ListenerConfig;
 use audit_daemon::segments::{list_segments, segment_path};
@@ -370,7 +376,9 @@ pub struct Harness {
     pub policy: DevelopmentPolicy,
     pub keyd_clock: TestClock,
     pub kdc_clock: HeldClock,
-    pub tls_key: TestKey,
+    /// The per-run test CA and the DC's server certificate and key.
+    pub tls_pki: TestPki,
+    /// A client trusting only that CA.
     pub tls_client: Arc<ClientConfig>,
     pub auditd: Option<auditd_support::Server>,
     pub keyd: Option<keyd_support::Daemon>,
@@ -410,8 +418,8 @@ impl Harness {
         let policy = kdc_daemon::startup::read_policy(&paths.policy, uid)
             .map_err(|e| e.to_string())
             .expect("the policy file loads");
-        let tls_key = p256_key();
-        let tls_client = client_config(&tls_key);
+        let tls_pki = test_pki();
+        let tls_client = client_config(&tls_pki);
         Some(Harness {
             dir,
             uid,
@@ -421,7 +429,7 @@ impl Harness {
             policy,
             keyd_clock: TestClock::at(common::keyd_started()),
             kdc_clock: HeldClock::at(common::now()),
-            tls_key,
+            tls_pki,
             tls_client,
             auditd: None,
             keyd: None,
@@ -637,10 +645,7 @@ impl Harness {
             timeouts: front_timeouts(),
             limits: ConnectionLimits::DEFAULT,
         };
-        self.front = Some(Front::start(
-            params,
-            placeholder_server_config(&self.tls_key),
-        )?);
+        self.front = Some(Front::start(params, server_config(&self.tls_pki))?);
         Ok(())
     }
 
@@ -715,26 +720,6 @@ impl Harness {
             .collect()
     }
 
-    /// Wait (bounded by [`LONG`]) until the events auditd has **persisted**
-    /// so far satisfy `done` — read while auditd runs, with
-    /// [`persisted_records`].
-    ///
-    /// Needed before dird is stopped: dird's stop path ends its audit task
-    /// without waiting for its window to be acknowledged (crates/
-    /// directory-daemon daemon.rs, `serve` step 5 — unlike keyd and the kdc,
-    /// which wait `AUDIT_FLUSH_GRACE`), so an LDAP event of an operation
-    /// already answered can be lost when dird stops (docs/questions/Q-313).
-    pub fn wait_until_persisted(&self, done: impl Fn(&[ipc_audit::EventBody]) -> bool) -> bool {
-        eventually(LONG, || {
-            let events: Vec<ipc_audit::EventBody> = persisted_records(&self.paths.audit_log)
-                .iter()
-                .filter(|record| record.source != audit_log::Source::Auditd)
-                .filter_map(|record| ipc_audit::decode_event(&record.payload).ok())
-                .collect();
-            done(&events)
-        })
-    }
-
     /// dird's LDAP events of the verified log (auditd stopped).
     pub fn ldap_events(&self) -> Vec<ipc_audit::LdapEvent> {
         self.audit_events()
@@ -792,38 +777,6 @@ pub fn verified_log(base: &Path) -> Result<(ChainHead, Vec<Record>), String> {
         reader.finish().map_err(|e| e.to_string())?;
     }
     Ok((head, records))
-}
-
-/// The records of the log based at `base` that verify so far, read while
-/// its writer may be appending: each segment walked with crates/audit-log's
-/// `SegmentReader` (chained from genesis) up to the end or the first record
-/// that does not verify yet (a batch in the middle of its write). Only for
-/// waiting; the final check is [`verified_log`] with the writer stopped.
-pub fn persisted_records(base: &Path) -> Vec<Record> {
-    let mut records = Vec::new();
-    let Ok(indexes) = list_segments(base) else {
-        return records;
-    };
-    let mut anchor = Anchor::Genesis;
-    for index in indexes {
-        let Ok(file) = File::open(segment_path(base, index)) else {
-            break;
-        };
-        let Ok(mut reader) =
-            SegmentReader::open(BufReader::new(file), anchor, SegmentLimit::DEFAULT, None)
-        else {
-            break;
-        };
-        loop {
-            match reader.next_record() {
-                Ok(Some(record)) => records.push(record),
-                Ok(None) => break,
-                Err(_) => return records,
-            }
-        }
-        anchor = Anchor::After(reader.head());
-    }
-    records
 }
 
 /// Write `octets` to `path` with `mode`.

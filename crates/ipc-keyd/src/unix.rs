@@ -13,13 +13,25 @@
 //!   reply bound before the body is awaited — all within the deadline; the
 //!   socket read / write timeouts are set to the time remaining before each
 //!   step.
+//! * Before a held connection is reused, [`Connection::check_idle`] looks at
+//!   it without blocking: the stream is put in non-blocking mode and one
+//!   read of at most one octet is tried — end of stream (`Ok(0)`) is
+//!   `Closed`, an octet is `Framing` (nothing may arrive on an idle strict
+//!   request → reply connection), another error is that error, and
+//!   `WouldBlock` (nothing to read) means usable: the stream goes back to
+//!   blocking mode. Nothing is written.
 //!
 //! Spec: docs/50 §3.1 ("Unix domain stream sockets"), §3.2 (R50-3: "rustix
 //! `socket_peercred` in the synchronous client … the client verifies that
 //! the server's uid is the configured uid of keyd"), §3.3, §3.6 ("kdc:
-//! synchronous client — std `UnixStream` + timeout"; deadline 2 s), R50-7;
-//! rustix 1.1.6 docs.rs: `net::sockopt::socket_peercred`, `net::UCred`,
-//! `fs::Uid::as_raw`, `fd::AsFd`.
+//! synchronous client — std `UnixStream` + timeout"; deadline 2 s; idle
+//! connections held), §3.7, R50-7; docs/questions/Q-312 (A-82); rustix 1.1.6
+//! docs.rs: `net::sockopt::socket_peercred`, `net::UCred`,
+//! `fs::Uid::as_raw`, `fd::AsFd`; std 1.95.0 API documentation (the
+//! toolchain's rust-docs pages, API only): `os::unix::net::UnixStream::
+//! set_nonblocking` ("Moves the socket into or out of nonblocking mode"),
+//! `io::Read::read` (`Ok(0)`: "end of file"), `io::ErrorKind::{WouldBlock,
+//! Interrupted}`.
 
 use crate::client::{Connection, Connector, TransportError};
 use core::time::Duration;
@@ -119,10 +131,41 @@ fn peer_uid_of(_stream: &UnixStream) -> Result<u32, TransportError> {
     Err(TransportError::PeerCredentials)
 }
 
+/// Look at an idle stream without blocking and without writing (module
+/// documentation). Usable ⇒ the stream is back in blocking mode; otherwise
+/// the caller drops it.
+/// Spec: docs/50 §3.6, §3.7, R50-7; docs/questions/Q-312 (A-82); std
+/// `UnixStream::set_nonblocking`, `io::Read::read`.
+fn check_idle_stream(stream: &mut UnixStream) -> Result<(), TransportError> {
+    stream
+        .set_nonblocking(true)
+        .map_err(|e| io_error(e.kind()))?;
+    let mut probe = Zeroizing::new([0u8; 1]);
+    let state = loop {
+        match stream.read(&mut probe[..]) {
+            Ok(0) => break Err(TransportError::Closed),
+            // An octet on an idle request → reply connection (R50-7).
+            Ok(_) => break Err(TransportError::Framing),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => break Ok(()),
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => break Err(io_error(e.kind())),
+        }
+    };
+    state?;
+    stream
+        .set_nonblocking(false)
+        .map_err(|e| io_error(e.kind()))
+}
+
 impl Connection for UnixConnection {
     /// Spec: docs/50 R50-3, §3.2.
     fn peer_uid(&self) -> Result<u32, TransportError> {
         peer_uid_of(&self.stream)
+    }
+
+    /// Spec: docs/50 §3.6, §3.7, R50-7; docs/questions/Q-312 (A-82).
+    fn check_idle(&mut self) -> Result<(), TransportError> {
+        check_idle_stream(&mut self.stream)
     }
 
     /// Spec: docs/50 §3.3, §3.6, R50-7.

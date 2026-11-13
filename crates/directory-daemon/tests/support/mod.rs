@@ -401,7 +401,10 @@ pub fn params(
 /// The real dird on its own thread.
 pub struct Dird {
     control: DaemonControl,
-    thread: Option<JoinHandle<Result<(), String>>>,
+    /// The thread's result: the LDAP audit events left unacknowledged at
+    /// the stop (`Stopped::unacknowledged_audit_events`, Q-313), or why it
+    /// failed.
+    thread: Option<JoinHandle<Result<usize, String>>>,
     pub socket: PathBuf,
     pub ldap_socket: PathBuf,
 }
@@ -429,13 +432,14 @@ impl Dird {
                 match result {
                     Ok(stopped) => {
                         let failed = stopped.engine_failed();
+                        let unacknowledged = stopped.unacknowledged_audit_events();
                         stopped
                             .join()
                             .map_err(|_| String::from("engine panicked"))?;
                         if failed {
                             Err(String::from("engine stopped early"))
                         } else {
-                            Ok(())
+                            Ok(unacknowledged)
                         }
                     }
                     Err(error) => Err(error.to_string()),
@@ -462,7 +466,13 @@ impl Dird {
     }
 
     /// Stop dird and wait for it (engine joined).
-    pub fn stop(mut self) -> Result<(), String> {
+    pub fn stop(self) -> Result<(), String> {
+        self.stop_counting().map(|_| ())
+    }
+
+    /// Stop dird and wait for it; the LDAP audit events auditd had not
+    /// acknowledged when dird ended its audit task (docs/questions/Q-313).
+    pub fn stop_counting(mut self) -> Result<usize, String> {
         self.control.stop();
         self.thread.take().unwrap().join().unwrap()
     }
@@ -567,6 +577,10 @@ pub mod connector {
         ) -> Result<Zeroizing<Vec<u8>>, ipc_directory::TransportError> {
             self.inner.exchange(frame, reply_limit, deadline)
         }
+        /// The blocking connection's own idle check (docs/questions/Q-312).
+        fn check_idle(&mut self) -> Result<(), ipc_directory::TransportError> {
+            self.inner.check_idle()
+        }
     }
 
     pub struct KeydConnector {
@@ -609,6 +623,10 @@ pub mod connector {
             deadline: Duration,
         ) -> Result<Zeroizing<Vec<u8>>, ipc_keyd::TransportError> {
             self.inner.exchange(frame, reply_limit, deadline)
+        }
+        /// The blocking connection's own idle check (docs/questions/Q-312).
+        fn check_idle(&mut self) -> Result<(), ipc_keyd::TransportError> {
+            self.inner.check_idle()
         }
     }
 }

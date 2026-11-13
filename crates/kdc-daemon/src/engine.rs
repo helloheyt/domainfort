@@ -22,6 +22,23 @@
 //!
 //! Only then does the daemon bind its listeners to the runtime and serve.
 //!
+//! # Every new connection repeats the start checks (Q-311)
+//!
+//! The keyd description (`IpcKeyd::connect`) and the domain description
+//! (`DirectoryClient::require_domain`) the engine started from are required
+//! of **every new connection** the clients open later — after keyd or dird
+//! was restarted, say — before anything else is sent on it: keyd's
+//! `DescribeConfig` (callable only by the Kdc and Ldap roles) must answer
+//! the same description, dird's `DescribeDomain` the same realm, naming
+//! context, krbtgt handle and policy version. A mismatch drops that
+//! connection and the request is answered as for an unavailable keyd or
+//! directory: KDC_ERR_SVC_UNAVAILABLE (29) over TCP, silence over UDP — so a
+//! keyd that now maps this uid to another role never reaches the client as
+//! keyd's uniform `Denied` (a wrong password, 24). Both clients also check
+//! a held connection before reusing it (crates/ipc-keyd, crates/
+//! ipc-directory; Q-312), so the first request after such a restart is
+//! decided by the new process.
+//!
 //! # Per request (docs/50 R50-2, §4.1)
 //!
 //! own clock (`now`) → audit slot (crate::audit; none ⇒ keyd gated off and
@@ -43,7 +60,8 @@
 //! `daemon_sandbox::apply` (R50-14), so it inherits the hardened identity.
 //!
 //! Spec: docs/50 R50-2, R50-3, R50-7, R50-8, R50-9, R50-14, R50-16, §3.4,
-//! §3.6, §4.1, §7.2, §7.5; docs/47 §8.1 (R47-14); A-56; A-57; A-68.
+//! §3.6, §3.7, §4.1, §7.2, §7.5; docs/47 §8.1 (R47-14); A-56; A-57; A-68;
+//! A-69; docs/questions/Q-311, Q-312 (A-82).
 
 use crate::audit::{is_issued, AuditGate, EventBuffer, Recorded};
 use crate::clock::Clock;
@@ -151,12 +169,14 @@ where
     DC: ipc_directory::Connector,
     C: Clock,
 {
-    /// Steps 1-5 of the module documentation.
+    /// Steps 1-5 of the module documentation; the keyd and domain
+    /// descriptions then required of every new connection (Q-311).
     ///
     /// # Errors
     /// [`StartError`].
     ///
-    /// Spec: docs/50 R50-2, R50-3, R50-16, §3.4, §7.2, §7.5 step 4.
+    /// Spec: docs/50 R50-2, R50-3, R50-16, §3.4, §7.2, §7.5 step 4;
+    /// docs/questions/Q-311 (A-82).
     pub(crate) fn start(setup: EngineSetup<KC, DC, C>) -> Result<Self, StartError> {
         let snapshot = setup.policy.snapshot().map_err(StartError::Policy)?;
         let version = snapshot.version();
@@ -173,6 +193,9 @@ where
                 dird: domain.policy_version,
             });
         }
+        // Q-311: every later dird connection must describe the same domain
+        // (keyd's description is required by `IpcKeyd::connect`).
+        directory.require_domain(domain.clone());
         let mut config = KdcConfig::new(domain.realm, domain.krbtgt);
         config.udp_max_reply_len = setup.udp_max_reply_len;
         let kdc = Kdc::new(

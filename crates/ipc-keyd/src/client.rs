@@ -15,12 +15,40 @@
 //! following calls — one request in flight at a time, strict request → reply
 //! (R50-7). Any failure drops the connection; the next call reconnects.
 //!
+//! # A held connection is checked before it is reused (Q-312)
+//!
+//! Before a call reuses the connection it holds, the client asks the
+//! connection, without blocking and without sending, whether it is still
+//! usable ([`Connection::check_idle`]): end of stream or a pending error
+//! means keyd went away (e.g. it was restarted while the connection was
+//! idle), and an octet waiting on an idle strict request → reply channel is
+//! a protocol error. Either way the connection is dropped and a fresh one
+//! opened — and checked — **before** the request is sent, so the first call
+//! after a keyd restart is served by the new keyd. A request is never sent
+//! twice: once it was written, any failure ends the call `Unavailable` and
+//! the next call starts over (a keyd operation may already have run — a
+//! consumed one-time token cannot be presented again).
+//!
+//! # Each new connection is checked with `DescribeConfig` (Q-311)
+//!
+//! With [`KeydClient::require_description`] (set by [`IpcKeyd::connect`]),
+//! every new connection, after its peer uid and before any other request,
+//! carries a `DescribeConfig` whose answer must be exactly the description
+//! the client was built with. Only the Kdc and Ldap roles may call it
+//! (docs/10 §2), so a keyd restarted with this uid mapped to another role —
+//! or serving another realm — is found here; the connection is dropped and
+//! the call is not served (`Unavailable`, the KDC's 29), instead of reaching
+//! an operation whose uniform `Denied` the KDC would report as a wrong
+//! password (24). Residual: Kdc and Ldap are not told apart this way
+//! (docs/questions/Q-351).
+//!
 //! # Keyd did not serve the call → `Unavailable`, never `Denied`
 //!
 //! | what happened | the caller sees |
 //! |---|---|
 //! | connect failed, I/O error, peer closed, deadline exceeded | `Unavailable` |
 //! | peer uid unreadable or not keyd's | `Unavailable` (nothing was sent) |
+//! | the new connection's `DescribeConfig` refused or different (when required) | `Unavailable` (only `DescribeConfig` was sent) |
 //! | `Refused::Busy` / `Refused::Unavailable` | `Unavailable` |
 //! | `Refused::Malformed` / `Refused::VersionMismatch` | `Unavailable` |
 //! | a reply that does not decode, or belongs to another operation | `Unavailable` |
@@ -45,10 +73,11 @@
 //! takes `now` from its own clock (R50-5, A-56). The kdc keeps using its own
 //! clock for its own checks.
 //!
-//! Spec: docs/50 §3.1-§3.7 (R50-3, R50-5, R50-7, R50-8), §10 (`ipc-keyd`:
-//! "a synchronous client implementing `kdc::KeyCustody`" — the trait is
-//! `keyd_types::KeyCustody` since D182 / A-63); docs/10 §9;
-//! docs/questions/Q-217, Q-222 (A-56), Q-240 item 8 (A-62).
+//! Spec: docs/50 §3.1-§3.7 (R50-3, R50-5, R50-7, R50-8), §7.5 step 4, §10
+//! (`ipc-keyd`: "a synchronous client implementing `kdc::KeyCustody`" — the
+//! trait is `keyd_types::KeyCustody` since D182 / A-63); docs/10 §2, §9;
+//! docs/questions/Q-217, Q-222 (A-56), Q-240 item 8 (A-62), Q-311, Q-312
+//! (A-82).
 
 use crate::channel::{KEYD_CHANNEL, REPLY_LIMIT};
 use crate::typed::{Answer, Call, ConversionError, Password, TgsFast};
@@ -62,6 +91,7 @@ use keyd_types::{
     PrincipalBinding, ServiceContext, TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext,
 };
 use krb_proto::{ApReq, EncryptedData, KerberosTime, KrbError, KrbFastArmoredReq, PaData};
+use std::time::Instant;
 use zeroize::Zeroizing;
 
 /// The default per-call deadline of the keyd client: 2 seconds.
@@ -126,6 +156,25 @@ pub trait Connection {
         reply_limit: FrameLimit,
         deadline: Duration,
     ) -> Result<Zeroizing<Vec<u8>>, TransportError>;
+
+    /// Check, before this held connection is reused for a request, that it
+    /// is still usable — **without blocking and without sending anything**:
+    /// the peer has not closed it, no error is pending on it, and no octet
+    /// is waiting (nothing may arrive on an idle strict request → reply
+    /// connection, so a waiting octet is a protocol error,
+    /// [`TransportError::Framing`]). An `Err` makes the client drop the
+    /// connection and open a fresh one before the request is sent; nothing
+    /// is ever sent on a connection that failed this check.
+    ///
+    /// The default reports the connection usable — for a transport that
+    /// cannot tell (an in-process loopback): a dead connection is then found
+    /// by the exchange itself, as before.
+    ///
+    /// Spec: docs/50 §3.6 ("an idle connection is allowed — clients hold a
+    /// permanent connection"), §3.7, R50-7; docs/questions/Q-312 (A-82).
+    fn check_idle(&mut self) -> Result<(), TransportError> {
+        Ok(())
+    }
 }
 
 /// Opens connections to keyd.
@@ -146,7 +195,11 @@ pub trait Connector {
 pub enum Unserved {
     /// The transport failed.
     Transport(TransportError),
-    /// The peer is not the configured keyd uid; nothing was sent.
+    /// The peer is not the keyd this client was configured for: its uid is
+    /// not keyd's (nothing was sent), or — when the client requires a
+    /// description ([`KeydClient::require_description`]) — the new
+    /// connection's `DescribeConfig` was refused or answered another
+    /// description (nothing else was sent; docs/questions/Q-311).
     PeerMismatch,
     /// keyd answered with the shared transport refusal.
     Refused(Refused),
@@ -169,20 +222,64 @@ pub enum ClientConfigError {
     RootServerUid,
 }
 
-/// A connection whose peer uid was checked against keyd's.
+/// A connection whose peer uid was checked against keyd's (and, when the
+/// client requires one, whose `DescribeConfig` answer matched).
 struct Verified<C> {
     connection: C,
+}
+
+/// The time left of a call's `deadline` that started at `start`; none left
+/// is [`TransportError::DeadlineExceeded`].
+/// Spec: docs/50 §3.6 ("client deadline — keyd: 2 s"; one deadline per
+/// call, the `DescribeConfig` of a new connection included).
+fn remaining(start: Instant, deadline: Duration) -> Result<Duration, TransportError> {
+    match deadline.checked_sub(start.elapsed()) {
+        Some(left) if !left.is_zero() => Ok(left),
+        _ => Err(TransportError::DeadlineExceeded),
+    }
+}
+
+/// One `DescribeConfig` exchange on a new connection that carries nothing
+/// else yet: keyd's description, or why it was not given. keyd's own
+/// refusal (`Denied` for a role that may not call it, docs/10 §2) is
+/// [`Unserved::PeerMismatch`].
+/// Spec: docs/50 §3.3, §3.4 (`DescribeConfig` — Kdc, Ldap), §7.5 step 4;
+/// docs/questions/Q-311 (A-82).
+fn describe_on<K: Connection>(
+    connection: &mut K,
+    deadline: Duration,
+) -> Result<ConfigDescription, Unserved> {
+    let call = Call::DescribeConfig;
+    let request = call.to_wire().map_err(|_| Unserved::Unencodable)?;
+    let frame = encode_frame(KEYD_CHANNEL, Direction::Request, &request)
+        .map_err(|_| Unserved::Unencodable)?;
+    let body = connection
+        .exchange(frame.as_bytes(), REPLY_LIMIT, deadline)
+        .map_err(Unserved::Transport)?;
+    match decode_reply::<KeydReply>(KEYD_CHANNEL, &body).map_err(Unserved::MalformedReply)? {
+        Reply::Refused(refused) => Err(Unserved::Refused(refused)),
+        Reply::Message(reply) => match Answer::from_wire(call.operation(), reply) {
+            Ok(Answer::DescribeConfig(Ok(description))) => Ok(description),
+            Ok(Answer::DescribeConfig(Err(_))) => Err(Unserved::PeerMismatch),
+            Ok(_) => Err(Unserved::UnexpectedReply(ConversionError::UnexpectedReply)),
+            Err(error) => Err(Unserved::UnexpectedReply(error)),
+        },
+    }
 }
 
 /// A synchronous keyd client: every operation of the keyd channel, called
 /// with the caller identity keyd derives from this process's credentials.
 ///
-/// Spec: docs/50 §3.2 (R50-3), §3.6 (R50-7), §3.7 (R50-8), §10.
+/// Spec: docs/50 §3.2 (R50-3), §3.6 (R50-7), §3.7 (R50-8), §10;
+/// docs/questions/Q-311, Q-312 (A-82).
 pub struct KeydClient<C: Connector> {
     connector: C,
     expected_uid: u32,
     deadline: Duration,
     connection: Option<Verified<C::Connection>>,
+    /// When set, every new connection's `DescribeConfig` must answer
+    /// exactly this (Q-311).
+    description: Option<ConfigDescription>,
 }
 
 impl<C: Connector> fmt::Debug for KeydClient<C> {
@@ -191,6 +288,7 @@ impl<C: Connector> fmt::Debug for KeydClient<C> {
             .field("expected_uid", &self.expected_uid)
             .field("deadline", &self.deadline)
             .field("connected", &self.connection.is_some())
+            .field("checks_description", &self.description.is_some())
             .finish()
     }
 }
@@ -212,6 +310,7 @@ impl<C: Connector> KeydClient<C> {
             expected_uid,
             deadline,
             connection: None,
+            description: None,
         })
     }
 
@@ -225,16 +324,69 @@ impl<C: Connector> KeydClient<C> {
         &mut self.connector
     }
 
-    /// The open connection, opening and verifying a new one if needed: its
-    /// peer uid must be keyd's before it is used at all.
-    /// Spec: docs/50 R50-3, §3.2.
-    fn verified(&mut self) -> Result<&mut C::Connection, Unserved> {
+    /// Whether a verified connection is held.
+    #[must_use]
+    pub fn is_connected(&self) -> bool {
+        self.connection.is_some()
+    }
+
+    /// Require every **new** connection — after its peer uid, before any
+    /// other request is sent on it — to answer `DescribeConfig` with exactly
+    /// `description` (the one this client's user validated itself against,
+    /// docs/50 §7.5 step 4). keyd's refusal (a role that may not call it,
+    /// docs/10 §2), another description, or any failure of that exchange
+    /// drops the connection, and the call is not served
+    /// ([`Unserved::PeerMismatch`] or the failure; the caller sees
+    /// `Unavailable`). The connection held now, if any, is kept: it already
+    /// carried a call.
+    ///
+    /// Only the Kdc and Ldap roles may call `DescribeConfig`; a client of
+    /// another role must not require a description.
+    ///
+    /// Spec: docs/50 R50-3, R50-8, §3.4, §7.5 step 4; docs/questions/Q-311
+    /// (A-82).
+    pub fn require_description(&mut self, description: ConfigDescription) {
+        self.description = Some(description);
+    }
+
+    /// The description every new connection must answer, if required.
+    /// Spec: docs/questions/Q-311 (A-82).
+    #[must_use]
+    pub fn required_description(&self) -> Option<&ConfigDescription> {
+        self.description.as_ref()
+    }
+
+    /// The held connection if it is still usable, or a new one — its peer
+    /// uid keyd's and, when required, its `DescribeConfig` answer the
+    /// expected description — before anything else is sent on it. A held
+    /// connection that fails its idle check is dropped here, before the
+    /// request is sent (nothing was sent on it in this call).
+    /// Spec: docs/50 R50-3, §3.2, §3.6, §3.7; docs/questions/Q-311, Q-312
+    /// (A-82).
+    fn verified(&mut self, start: Instant) -> Result<&mut C::Connection, Unserved> {
+        // Q-312: a held connection is checked before it is reused.
+        let stale = match self.connection.as_mut() {
+            Some(held) => held.connection.check_idle().is_err(),
+            None => false,
+        };
+        if stale {
+            self.connection = None;
+        }
         if self.connection.is_none() {
-            let connection = self.connector.connect().map_err(Unserved::Transport)?;
+            let mut connection = self.connector.connect().map_err(Unserved::Transport)?;
             let uid = connection.peer_uid().map_err(Unserved::Transport)?;
             if uid != self.expected_uid {
                 // Dropped here: nothing was sent on it.
                 return Err(Unserved::PeerMismatch);
+            }
+            if let Some(expected) = self.description.as_ref() {
+                // Q-311: the start-time check, repeated on this connection
+                // before anything else is sent on it. On any failure the
+                // connection is dropped here.
+                let left = remaining(start, self.deadline).map_err(Unserved::Transport)?;
+                if describe_on(&mut connection, left)? != *expected {
+                    return Err(Unserved::PeerMismatch);
+                }
             }
             self.connection = Some(Verified { connection });
         }
@@ -246,10 +398,11 @@ impl<C: Connector> KeydClient<C> {
 
     /// Perform one call: encode it, send it on a verified connection,
     /// receive and decode the reply strictly, and check that it belongs to
-    /// the call's operation. Any failure drops the connection.
+    /// the call's operation. Any failure drops the connection; the call is
+    /// never sent a second time (Q-312: it may already have run in keyd).
     ///
     /// Spec: docs/50 §3.3 (replies decoded with the same strictness), §3.6,
-    /// §3.7, R50-7.
+    /// §3.7, R50-7; docs/questions/Q-312 (A-82).
     pub fn call(&mut self, call: &Call) -> Result<Answer, Unserved> {
         let result = self.call_inner(call);
         if result.is_err() {
@@ -259,15 +412,17 @@ impl<C: Connector> KeydClient<C> {
     }
 
     fn call_inner(&mut self, call: &Call) -> Result<Answer, Unserved> {
+        let start = Instant::now();
         let operation = call.operation();
         let request = call.to_wire().map_err(|_| Unserved::Unencodable)?;
         let frame = encode_frame(KEYD_CHANNEL, Direction::Request, &request)
             .map_err(|_| Unserved::Unencodable)?;
         drop(request);
         let deadline = self.deadline;
-        let connection = self.verified()?;
+        let connection = self.verified(start)?;
+        let left = remaining(start, deadline).map_err(Unserved::Transport)?;
         let body = connection
-            .exchange(frame.as_bytes(), REPLY_LIMIT, deadline)
+            .exchange(frame.as_bytes(), REPLY_LIMIT, left)
             .map_err(Unserved::Transport)?;
         drop(frame);
         match decode_reply::<KeydReply>(KEYD_CHANNEL, &body).map_err(Unserved::MalformedReply)? {
@@ -529,11 +684,14 @@ impl<C: Connector> KeydClient<C> {
 
 /// The keyd custody of the kdc daemon: [`KeydClient`] behind
 /// `KeyCustody`, with keyd's non-secret configuration fetched once
-/// (`describe_config`) when it is built.
+/// (`describe_config`) when it is built — and required of every new
+/// connection afterwards ([`KeydClient::require_description`]), so that
+/// [`KeyCustody::config`] stays the description of the keyd that serves the
+/// calls (docs/questions/Q-311).
 ///
 /// Spec: docs/50 §3.4, §7.5 step 4 ("`DescribeConfig` from keyd …
 /// `KdcConfig::validate(&keyd_config)` — only then bind 88"), §10; docs/10
-/// §7א.
+/// §7א; docs/questions/Q-311 (A-82).
 pub struct IpcKeyd<C: Connector> {
     client: KeydClient<C>,
     description: ConfigDescription,
@@ -552,9 +710,17 @@ impl<C: Connector> IpcKeyd<C> {
     /// Ask keyd for its configuration and build the custody. Fails with
     /// keyd's error (or `Unavailable`) when keyd does not answer it — the
     /// kdc daemon then does not start (fail closed, docs/50 §7.5).
-    /// Spec: docs/50 §7.5 step 4.
+    ///
+    /// The description is then required of every new connection the client
+    /// opens (the connection that answered it is kept): a keyd that no
+    /// longer gives it — restarted with this uid mapped to another role, or
+    /// with another configuration — serves no call (`Unavailable`) until it
+    /// does again.
+    ///
+    /// Spec: docs/50 §7.5 step 4; docs/questions/Q-311 (A-82).
     pub fn connect(mut client: KeydClient<C>) -> Result<Self, keyd_types::Error> {
         let description = client.describe_config()?;
+        client.require_description(description.clone());
         Ok(IpcKeyd {
             client,
             description,

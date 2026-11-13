@@ -61,6 +61,9 @@ pub enum Note {
     Draining,
     /// The engine thread ended before shutdown was requested.
     EngineStopped,
+    /// The stop ended the audit task with LDAP events auditd had not
+    /// acknowledged (logged with their count; docs/questions/Q-313).
+    AuditUnacknowledged,
     /// Stopped.
     Stopped,
 }
@@ -92,6 +95,9 @@ impl Note {
             Note::AuditRestored => "audit connection restored",
             Note::Draining => "shutdown requested: draining",
             Note::EngineStopped => "engine thread stopped unexpectedly",
+            Note::AuditUnacknowledged => {
+                "stopping with audit events auditd did not acknowledge within the grace; count"
+            }
             Note::Stopped => "stopped",
         }
     }

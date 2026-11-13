@@ -279,6 +279,7 @@ dependencies = [
  "krb-proto",
  "ldap",
  "ldap-front",
+ "parse-asn1",
  "parse-ldap",
  "pdp",
  "policy-store",

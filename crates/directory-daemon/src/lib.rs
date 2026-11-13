@@ -147,9 +147,9 @@ pub mod zones;
 pub use audit_link::{AuditEndpoint, AuditLinkError};
 pub use clock::{Clock, SharedClock, SystemClock};
 pub use daemon::{
-    serve, DaemonControl, DaemonError, DaemonParams, Stopped, StoreSource, DRAIN_GRACE,
-    ENGINE_QUEUE_CAPACITY, LDAP_QUEUE_CAPACITY, MAX_KDC_CONNECTIONS, MAX_LDAP_SESSIONS,
-    MAX_OPEN_VIEWS, SOCKET_FILE_MODE,
+    serve, DaemonControl, DaemonError, DaemonParams, Stopped, StoreSource, AUDIT_FLUSH_GRACE,
+    DRAIN_GRACE, ENGINE_QUEUE_CAPACITY, LDAP_QUEUE_CAPACITY, MAX_KDC_CONNECTIONS,
+    MAX_LDAP_SESSIONS, MAX_OPEN_VIEWS, SOCKET_FILE_MODE,
 };
 pub use engine::{DirectoryEngine, EngineError, EngineHandle, EnginePanicked, EngineThread};
 pub use ldap_engine::{LdapEngineHandle, LdapService, MAX_LDAP_QUEUE_CAPACITY};

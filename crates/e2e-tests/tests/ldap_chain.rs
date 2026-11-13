@@ -15,19 +15,23 @@
 //! * a password bind over TLS ⇒ refused authMethodNotSupported (A-71;
 //!   AGENTS.md §6: cleartext simple bind has no code path).
 //!
-//! The TLS client is rustls itself with ldap-front's test trust model
-//! (tests/support/tls.rs; A-71, Q-285 item 1).
+//! The TLS client is rustls itself, verifying the DC's real test
+//! certificate with its standard verifier against only the per-run test CA
+//! (tests/support/tls.rs; Q-320, A-81). Every test stops dird without first
+//! waiting for its events: dird's stop flushes its audit window (Q-313,
+//! A-82).
 //!
-//! Sources: docs/50 R50-10, R50-11, §4.2, §4.3, §8.1, §9; docs/49 R49-14,
-//! R49-15, R49-16, §5.2; RFC 4511 §4.2, §4.5.1, §4.14.1, §4.14.2, §5.2;
-//! RFC 4513 §3.1.1; A-51, A-52, A-70, A-71. Every value is made here.
+//! Sources: docs/50 R50-10, R50-11, R50-17, §4.2, §4.3, §8.1, §9; docs/49
+//! R49-14, R49-15, R49-16, §5.2; RFC 4511 §4.2, §4.5.1, §4.14.1, §4.14.2,
+//! §5.2; RFC 4513 §3.1.1; A-51, A-52, A-70, A-71, A-81, A-82. Every value is
+//! made here.
 
 #[path = "../../kdc/tests/common/mod.rs"]
 mod common;
 mod support;
 
 use common::now;
-use ipc_audit::{EventBody, LdapOperation, LdapTransport};
+use ipc_audit::{LdapOperation, LdapTransport};
 use ldap_front::relay::{take_message, WireBuffer};
 use parse_ldap::{AuthState, ProtocolOp, ResultCode};
 use std::io::{Read, Write};
@@ -72,14 +76,6 @@ fn search_responses<R: Read>(reader: &mut LdapReader, stream: &mut R) -> Vec<Vec
     }
 }
 
-/// How many of dird's LDAP events in `events` are `operation`.
-fn count(events: &[EventBody], operation: LdapOperation) -> usize {
-    events
-        .iter()
-        .filter(|event| matches!(event, EventBody::Ldap(e) if e.operation == operation))
-        .count()
-}
-
 /// The anonymous directory search's answer: only a SearchResultDone, not a
 /// success — no entry of the directory reaches an anonymous client (crates/
 /// ldap: "directory search, anonymous … before the base is looked at";
@@ -122,9 +118,11 @@ fn root_dse_and_anonymous_search_over_ldaps() {
         assert_anonymous_search_refused(&answer);
         drop(stream);
 
-        // dird's events reach auditd's log (persisted) — waited for before
-        // dird stops (tests/support harness.rs `wait_until_persisted`, Q-313).
-        assert!(h.wait_until_persisted(|e| count(e, LdapOperation::Search) >= 2));
+        // dird stopped at once, its events of the two searches still in its
+        // audit window: the stop waits (bounded) for auditd's
+        // acknowledgement of each before it ends (docs/questions/Q-313,
+        // A-82), so both are in the verified log.
+        h.stop_dird();
         h.stop_all();
         let searches: Vec<_> = h
             .ldap_events()
@@ -179,9 +177,7 @@ fn root_dse_and_anonymous_search_over_start_tls() {
         assert_anonymous_search_refused(&answer);
         drop(stream);
 
-        assert!(h.wait_until_persisted(|e| {
-            count(e, LdapOperation::StartTls) >= 1 && count(e, LdapOperation::Search) >= 2
-        }));
+        // No wait: dird's stop flushes its audit window (Q-313).
         h.stop_all();
         let events = h.ldap_events();
         assert!(events
@@ -296,7 +292,7 @@ fn a_password_bind_over_tls_is_refused() {
         assert_eq!(result_code(&response), ResultCode::AuthMethodNotSupported);
         drop(stream);
 
-        assert!(h.wait_until_persisted(|e| count(e, LdapOperation::Bind) >= 2));
+        // No wait: dird's stop flushes its audit window (Q-313).
         h.stop_all();
         let binds: Vec<_> = h
             .ldap_events()

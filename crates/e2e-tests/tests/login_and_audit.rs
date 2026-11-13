@@ -246,17 +246,10 @@ fn the_audit_log_verifies_and_holds_every_daemons_events() {
         assert_eq!(vec![entry, done], reference.responses);
         drop(stream);
 
-        // dird's event is persisted before dird stops (dird's stop does not
-        // wait for its window — tests/support harness.rs
-        // `wait_until_persisted`, docs/questions/Q-313); then every sender
-        // stops (keyd and the kdc each wait, bounded, for auditd to
-        // acknowledge their windows), then auditd.
-        assert!(h.wait_until_persisted(|events| {
-            events.iter().any(|event| {
-                matches!(event, EventBody::Ldap(e)
-                    if e.operation == LdapOperation::Search && e.transport == LdapTransport::Ldaps)
-            })
-        }));
+        // Every sender stops at once — dird, keyd and the kdc each wait,
+        // bounded, for auditd to acknowledge the events already in their
+        // windows (dird too since docs/questions/Q-313, A-82: no wait for
+        // its event here) — then auditd.
         h.stop_all();
         let (head, records) = h.verified_audit_log().expect("the log verifies");
         assert_eq!(head.seq, records.len() as u64, "one chain from genesis");

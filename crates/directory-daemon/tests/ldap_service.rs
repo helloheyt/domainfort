@@ -668,3 +668,197 @@ fn auditd_unreachable_refuses_ldap_operations() {
         "LDAP refused while auditd is unreachable"
     );
 }
+
+// ---- the stop and the audit window (docs/questions/Q-313) -------------------------
+
+/// An auditd for the stop tests, written from the audit channel's message
+/// set (crates/ipc-audit): `Ping` → `Pong` at once; `Append` → its events
+/// kept and its `Ack` sent only after `ack_delay` — or, with `None`, the
+/// `Append` is read and never answered.
+struct SlowAuditd {
+    path: std::path::PathBuf,
+    acknowledged: Arc<Mutex<Vec<EventBody>>>,
+    appends: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    connections: Arc<Mutex<Vec<UnixStream>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SlowAuditd {
+    fn start(path: &std::path::Path, ack_delay: Option<Duration>) -> SlowAuditd {
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let acknowledged = Arc::new(Mutex::new(Vec::new()));
+        let appends = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let connections = Arc::new(Mutex::new(Vec::new()));
+        let thread = {
+            let (acknowledged, appends, stop, connections) = (
+                Arc::clone(&acknowledged),
+                Arc::clone(&appends),
+                Arc::clone(&stop),
+                Arc::clone(&connections),
+            );
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            stream.set_nonblocking(false).unwrap();
+                            connections
+                                .lock()
+                                .unwrap()
+                                .push(stream.try_clone().unwrap());
+                            let (acknowledged, appends) =
+                                (Arc::clone(&acknowledged), Arc::clone(&appends));
+                            std::thread::spawn(move || {
+                                serve_slowly(stream, ack_delay, &acknowledged, &appends)
+                            });
+                        }
+                        Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                    }
+                }
+            })
+        };
+        SlowAuditd {
+            path: path.to_path_buf(),
+            acknowledged,
+            appends,
+            stop,
+            connections,
+            thread: Some(thread),
+        }
+    }
+
+    /// The LDAP events of every acknowledged `Append`.
+    fn acknowledged_ldap_events(&self) -> Vec<ipc_audit::LdapEvent> {
+        self.acknowledged
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                EventBody::Ldap(event) => Some((**event).clone()),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+impl Drop for SlowAuditd {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        for stream in self.connections.lock().unwrap().drain(..) {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// One connection of [`SlowAuditd`].
+fn serve_slowly(
+    mut stream: UnixStream,
+    ack_delay: Option<Duration>,
+    acknowledged: &Mutex<Vec<EventBody>>,
+    appends: &AtomicU64,
+) {
+    loop {
+        let mut reader = FrameReader::new(ipc_audit::AUDIT_CHANNEL.limit(Direction::Request));
+        let mut chunk = [0u8; 4096];
+        let body = loop {
+            if let Some(body) = reader.body() {
+                break body.to_vec();
+            }
+            let wanted = reader.wanted().min(chunk.len());
+            match stream.read(&mut chunk[..wanted]) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    if reader.push(&chunk[..n]).is_err() {
+                        return;
+                    }
+                }
+            }
+        };
+        let reply = match ipc_audit::decode_request(&body) {
+            Ok(ipc_audit::AuditRequest::Ping) => ipc_audit::AuditReply::Pong,
+            Ok(ipc_audit::AuditRequest::Append(append)) => {
+                appends.fetch_add(1, Ordering::SeqCst);
+                let Some(delay) = ack_delay else {
+                    continue;
+                };
+                std::thread::sleep(delay);
+                let mut held = acknowledged.lock().unwrap();
+                for event in append.events() {
+                    held.push(ipc_audit::decode_event(event.as_bytes()).unwrap());
+                }
+                ipc_audit::AuditReply::Ack(ipc_audit::Ack {
+                    through_seq: append.last_seq(),
+                    head_hash: [0; 32],
+                })
+            }
+            Err(_) => return,
+        };
+        let frame = ipc_audit::encode_reply(&Reply::Message(reply)).unwrap();
+        if stream.write_all(frame.as_bytes()).is_err() {
+            return;
+        }
+    }
+}
+
+/// How long the slow auditd holds each acknowledgement: well above a
+/// loopback exchange, well below the stop's bound. Test data.
+const ACK_DELAY: Duration = Duration::from_millis(400);
+
+/// docs/50 R50-17, §8.1; docs/questions/Q-218 (A-57), Q-252 item 9 (A-64),
+/// Q-313 (A-82): an LDAP operation answered just before dird is stopped —
+/// its event committed to the window, its acknowledgement still held by
+/// auditd — is acknowledged before the stop returns: dird's stop waits
+/// (bounded by `AUDIT_FLUSH_GRACE`) for auditd, reports no unacknowledged
+/// event, and the event is in auditd's hands.
+#[test]
+fn a_stop_waits_for_auditd_to_acknowledge_the_ldap_events() {
+    let dir = TempDir::new();
+    let slow_path = dir.join("slow.sock");
+    let slow = SlowAuditd::start(&slow_path, Some(ACK_DELAY));
+    let Some(w) = world(0, |params| params.audit.socket = slow_path.clone()) else {
+        return;
+    };
+    let mut client = open(&w, Listener::Ldap).unwrap();
+    let exchange = client.message(&root_dse(1), CLEAR).unwrap();
+    assert_eq!(last_code(&exchange.responses), ResultCode::Success);
+    client.close();
+    let World { dird, .. } = w;
+    let start = std::time::Instant::now();
+    assert_eq!(dird.stop_counting(), Ok(0), "nothing left unacknowledged");
+    assert!(start.elapsed() < directory_daemon::AUDIT_FLUSH_GRACE + LONG);
+    let events = slow.acknowledged_ldap_events();
+    assert_eq!(events.len(), 1, "the event reached auditd before the stop");
+    assert_eq!(events[0].message_id, Some(1));
+}
+
+/// docs/50 §8.1; Q-252 item 9 (the loss is bounded by the window), Q-313
+/// (A-82: "reports how many events were not acknowledged"): auditd takes
+/// the `Append` and never answers — the stop ends after its bound and
+/// reports the one event left unacknowledged.
+#[test]
+fn a_stop_reports_the_ldap_events_auditd_did_not_acknowledge() {
+    let dir = TempDir::new();
+    let silent_path = dir.join("silent.sock");
+    let silent = SlowAuditd::start(&silent_path, None);
+    let Some(w) = world(0, |params| params.audit.socket = silent_path.clone()) else {
+        return;
+    };
+    let mut client = open(&w, Listener::Ldap).unwrap();
+    assert!(client.message(&root_dse(1), CLEAR).is_ok());
+    client.close();
+    assert!(
+        eventually(LONG, || silent.appends.load(Ordering::SeqCst) >= 1),
+        "dird sent the event"
+    );
+    let World { dird, .. } = w;
+    let start = std::time::Instant::now();
+    assert_eq!(dird.stop_counting(), Ok(1), "one event unacknowledged");
+    assert!(start.elapsed() < directory_daemon::AUDIT_FLUSH_GRACE + LONG);
+    assert!(silent.acknowledged_ldap_events().is_empty());
+}

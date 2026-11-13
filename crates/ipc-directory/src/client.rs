@@ -16,6 +16,33 @@
 //! (R50-7) — and drops it on any failure; the next call reconnects. dird
 //! releases a connection's view when the connection ends (docs/50 §3.4).
 //!
+//! # A held connection is checked before it is reused (Q-312)
+//!
+//! Before a call reuses the connection it holds, the client asks it,
+//! without blocking and without sending, whether it is still usable
+//! ([`Connection::check_idle`]): end of stream or a pending error (dird
+//! went away — e.g. it was restarted while the connection was idle) or an
+//! octet waiting on the idle strict request → reply channel (a protocol
+//! error) drops it. Outside a view a fresh connection is then opened — and
+//! checked — **before** the request is sent, so the first request after a
+//! dird restart is served by the new dird. Inside a view (its queries and
+//! `EndView`) there is no fresh connection to go to — the view lived on the
+//! dropped one and dird released it — so the query fails `Unavailable`
+//! without being sent. A request is never sent twice: once written, any
+//! failure ends the call.
+//!
+//! # Each new connection is checked with `DescribeDomain` (Q-311)
+//!
+//! With [`DirectoryClient::require_domain`] (set by the kdc daemon with the
+//! description it started from, docs/50 §7.5 step 4), every new connection,
+//! after its peer uid and before any other request, carries a
+//! `DescribeDomain` whose answer must be exactly that description — the
+//! realm, the naming context, the krbtgt handle and the policy version
+//! (A-69). Another policy version is
+//! [`Unserved::PolicyVersionMismatch`]; any other difference, or any failure
+//! of that exchange, drops the connection and the call is not served
+//! (`Unavailable`, the KDC's 29).
+//!
 //! # The view and the policy version (R50-2)
 //!
 //! [`DirectoryClient::begin_view`] asks dird to pin one snapshot (and its
@@ -35,6 +62,8 @@
 //! |---|---|---|
 //! | connect failed, I/O error, peer closed, deadline exceeded | `Unavailable` | `PipError::Unavailable` |
 //! | peer uid unreadable or not dird's (nothing sent) | `Unavailable` | `PipError::Unavailable` |
+//! | the new connection's `DescribeDomain` different or not answered (when required) | `Unavailable` | `PipError::Unavailable` |
+//! | the held connection failed its idle check inside a view (nothing sent) | `Unavailable` | `PipError::Unavailable` |
 //! | `Refused::{Busy, Unavailable, Malformed, VersionMismatch}` | `Unavailable` | `PipError::Unavailable` |
 //! | a reply that does not decode, or answers another request | `Unavailable` | `PipError::Unavailable` |
 //! | the view protocol refused (unknown, expired, bound reached, no snapshot) | `Unavailable` | `PipError::Unavailable` |
@@ -56,7 +85,8 @@
 //! PDP denies (D40; docs/50 §3.4).
 //!
 //! Spec: docs/50 R50-2, R50-3, R50-7, R50-8, §3.1-§3.7, §7.5, §10; docs/47
-//! §8.1, §8.2; docs/11 §6, §9; D40; A-56.
+//! §8.1, §8.2; docs/11 §6, §9; D40; A-56; A-69; docs/questions/Q-311,
+//! Q-312 (A-82).
 
 use crate::channel::{ViewFailure, DIRECTORY_CHANNEL, REPLY_LIMIT};
 use crate::typed::{ConversionError, DomainDescription, Query, Request};
@@ -65,13 +95,14 @@ use core::cell::{Cell, RefCell};
 use core::fmt;
 use core::time::Duration;
 use dtyp::{SecurityDescriptor, Sid};
-use ipc::{decode_reply, encode_frame, Direction, FrameLimit, Refused, Reply};
+use ipc::{decode_reply, encode_frame, Direction, EncodedFrame, FrameLimit, Refused, Reply};
 use kdc::{AccountSource, AccountSourceError, ClientAccount, ServiceAccount};
 use krb_proto::{PrincipalName, Realm};
 use pdp::{
     AttrClass, AttrId, Dn, ObjClassChain, Pip, PipError, PolicyVersion, PropertySet, Resource, Tier,
 };
 use std::collections::BTreeSet;
+use std::time::Instant;
 use zeroize::Zeroizing;
 
 /// The default per-call deadline of the directory client: 2 seconds.
@@ -134,6 +165,25 @@ pub trait Connection {
         reply_limit: FrameLimit,
         deadline: Duration,
     ) -> Result<Zeroizing<Vec<u8>>, TransportError>;
+
+    /// Check, before this held connection is reused for a request, that it
+    /// is still usable — **without blocking and without sending anything**:
+    /// the peer has not closed it, no error is pending on it, and no octet
+    /// is waiting (nothing may arrive on an idle strict request → reply
+    /// connection, so a waiting octet is a protocol error,
+    /// [`TransportError::Framing`]). An `Err` makes the client drop the
+    /// connection before the request is sent; nothing is ever sent on a
+    /// connection that failed this check.
+    ///
+    /// The default reports the connection usable — for a transport that
+    /// cannot tell (an in-process loopback): a dead connection is then found
+    /// by the exchange itself, as before.
+    ///
+    /// Spec: docs/50 §3.6 ("an idle connection is allowed — clients hold a
+    /// permanent connection"), §3.7, R50-7; docs/questions/Q-312 (A-82).
+    fn check_idle(&mut self) -> Result<(), TransportError> {
+        Ok(())
+    }
 }
 
 /// Opens connections to dird.
@@ -154,7 +204,11 @@ pub trait Connector {
 pub enum Unserved {
     /// The transport failed.
     Transport(TransportError),
-    /// The peer is not the configured dird uid; nothing was sent.
+    /// The peer is not the dird this client was configured for: its uid is
+    /// not dird's (nothing was sent), or — when the client requires a domain
+    /// description ([`DirectoryClient::require_domain`]) — the new
+    /// connection's `DescribeDomain` answered another realm, naming context
+    /// or krbtgt handle (nothing else was sent; docs/questions/Q-311).
     PeerMismatch,
     /// dird answered with the shared transport refusal.
     Refused(Refused),
@@ -206,14 +260,68 @@ pub enum ClientConfigError {
     RootServerUid,
 }
 
+/// The time left of a call's `deadline` that started at `start`; none left
+/// is [`TransportError::DeadlineExceeded`].
+/// Spec: docs/50 §3.6 ("client deadline — dird-kdc: 2 s"; one deadline per
+/// call, the `DescribeDomain` of a new connection included).
+fn remaining(start: Instant, deadline: Duration) -> Result<Duration, TransportError> {
+    match deadline.checked_sub(start.elapsed()) {
+        Some(left) if !left.is_zero() => Ok(left),
+        _ => Err(TransportError::DeadlineExceeded),
+    }
+}
+
+/// One request as a frame; nothing is sent.
+/// Spec: docs/50 §3.3.
+fn encode_request(request: &Request) -> Result<EncodedFrame, Unserved> {
+    let wire = request.to_wire().map_err(|_| Unserved::Unencodable)?;
+    encode_frame(DIRECTORY_CHANNEL, Direction::Request, &wire).map_err(|_| Unserved::Unencodable)
+}
+
+/// Exchange one encoded request `frame` on `connection` and decode the
+/// reply strictly (a `ViewFailure` reply is [`Unserved::View`]).
+/// Spec: docs/50 §3.3 (replies decoded with the same strictness), §3.6,
+/// R50-7.
+fn exchange_on<K: Connection>(
+    connection: &mut K,
+    frame: &EncodedFrame,
+    deadline: Duration,
+) -> Result<DirectoryReply, Unserved> {
+    let body = connection
+        .exchange(frame.as_bytes(), REPLY_LIMIT, deadline)
+        .map_err(Unserved::Transport)?;
+    match decode_reply::<DirectoryReply>(DIRECTORY_CHANNEL, &body)
+        .map_err(Unserved::MalformedReply)?
+    {
+        Reply::Refused(refused) => Err(Unserved::Refused(refused)),
+        Reply::Message(DirectoryReply::ViewFailure(failure)) => Err(Unserved::View(failure)),
+        Reply::Message(reply) => Ok(reply),
+    }
+}
+
+/// Whether a call may replace a held connection that failed its idle check
+/// with a fresh one: not inside a view, whose state lived on the old
+/// connection (Q-312).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reconnect {
+    /// Outside a view: drop the stale connection, open a fresh one.
+    Allowed,
+    /// Inside a view: drop the stale connection, fail without sending.
+    InView,
+}
+
 /// A synchronous client of the directory-view channel.
-/// Spec: docs/50 R50-2, R50-3, R50-7, R50-8, §3.4, §3.6, §10.
+/// Spec: docs/50 R50-2, R50-3, R50-7, R50-8, §3.4, §3.6, §10;
+/// docs/questions/Q-311, Q-312 (A-82).
 pub struct DirectoryClient<C: Connector> {
     connector: C,
     expected_uid: u32,
     deadline: Duration,
     policy_version: PolicyVersion,
     connection: Option<C::Connection>,
+    /// When set, every new connection's `DescribeDomain` must answer
+    /// exactly this (Q-311).
+    domain: Option<DomainDescription>,
 }
 
 impl<C: Connector> fmt::Debug for DirectoryClient<C> {
@@ -223,6 +331,7 @@ impl<C: Connector> fmt::Debug for DirectoryClient<C> {
             .field("deadline", &self.deadline)
             .field("policy_version", &self.policy_version)
             .field("connected", &self.connection.is_some())
+            .field("checks_domain", &self.domain.is_some())
             .finish()
     }
 }
@@ -251,7 +360,30 @@ impl<C: Connector> DirectoryClient<C> {
             deadline,
             policy_version,
             connection: None,
+            domain: None,
         })
+    }
+
+    /// Require every **new** connection — after its peer uid, before any
+    /// other request is sent on it — to answer `DescribeDomain` with exactly
+    /// `domain` (the description the kdc started from, docs/50 §7.5 step 4).
+    /// Another policy version is [`Unserved::PolicyVersionMismatch`];
+    /// another realm, naming context or krbtgt handle is
+    /// [`Unserved::PeerMismatch`]; any failure of that exchange is that
+    /// failure. The connection is then dropped and the call is not served
+    /// (`Unavailable`). The connection held now, if any, is kept.
+    ///
+    /// Spec: docs/50 R50-2, R50-3, R50-8, §3.4, §7.5 step 4; A-69;
+    /// docs/questions/Q-311 (A-82).
+    pub fn require_domain(&mut self, domain: DomainDescription) {
+        self.domain = Some(domain);
+    }
+
+    /// The description every new connection must answer, if required.
+    /// Spec: docs/questions/Q-311 (A-82).
+    #[must_use]
+    pub fn required_domain(&self) -> Option<&DomainDescription> {
+        self.domain.as_ref()
     }
 
     /// The policy version views must carry.
@@ -282,16 +414,55 @@ impl<C: Connector> DirectoryClient<C> {
         self.connection.is_some()
     }
 
-    /// The open connection, opening and verifying a new one if needed: its
-    /// peer uid must be dird's before it is used at all.
-    /// Spec: docs/50 R50-3, §3.2.
-    fn verified(&mut self) -> Result<&mut C::Connection, Unserved> {
+    /// The held connection if it is still usable, or (outside a view) a new
+    /// one — its peer uid dird's and, when required, its `DescribeDomain`
+    /// answering the expected description — before anything else is sent on
+    /// it. A held connection that fails its idle check is dropped here,
+    /// before the request is sent (nothing was sent on it in this call).
+    /// Spec: docs/50 R50-3, §3.2, §3.4, §3.6, §3.7; docs/questions/Q-311,
+    /// Q-312 (A-82).
+    fn verified(
+        &mut self,
+        start: Instant,
+        reconnect: Reconnect,
+    ) -> Result<&mut C::Connection, Unserved> {
+        // Q-312: a held connection is checked before it is reused.
+        if let Some(held) = self.connection.as_mut() {
+            if let Err(error) = held.check_idle() {
+                self.connection = None;
+                if reconnect == Reconnect::InView {
+                    // The view lived on that connection; dird released it.
+                    return Err(Unserved::Transport(error));
+                }
+            }
+        }
         if self.connection.is_none() {
-            let connection = self.connector.connect().map_err(Unserved::Transport)?;
+            if reconnect == Reconnect::InView {
+                // No connection carries the view any more.
+                return Err(Unserved::ViewClosed);
+            }
+            let mut connection = self.connector.connect().map_err(Unserved::Transport)?;
             let uid = connection.peer_uid().map_err(Unserved::Transport)?;
             if uid != self.expected_uid {
                 // Dropped here: nothing was sent on it.
                 return Err(Unserved::PeerMismatch);
+            }
+            if let Some(expected) = self.domain.as_ref() {
+                // Q-311: the start-time check, repeated on this connection
+                // before anything else is sent on it. On any failure the
+                // connection is dropped here.
+                let describe = encode_request(&Request::DescribeDomain)?;
+                let left = remaining(start, self.deadline).map_err(Unserved::Transport)?;
+                let reply = exchange_on(&mut connection, &describe, left)?;
+                let domain = reply.into_domain().map_err(Unserved::UnexpectedReply)?;
+                if domain.policy_version != expected.policy_version {
+                    return Err(Unserved::PolicyVersionMismatch {
+                        dird: domain.policy_version,
+                    });
+                }
+                if domain != *expected {
+                    return Err(Unserved::PeerMismatch);
+                }
             }
             self.connection = Some(connection);
         }
@@ -300,36 +471,45 @@ impl<C: Connector> DirectoryClient<C> {
             .ok_or(Unserved::Transport(TransportError::Connect))
     }
 
-    /// One exchange: encode, send on a verified connection, receive and
-    /// decode the reply strictly. Any failure drops the connection (dird
-    /// then releases the connection's view).
+    /// One exchange outside a view: encode, send on a verified connection,
+    /// receive and decode the reply strictly. Any failure drops the
+    /// connection (dird then releases the connection's view); the request is
+    /// never sent a second time.
     /// Spec: docs/50 §3.3 (replies decoded with the same strictness), §3.6,
-    /// §3.7, R50-7.
+    /// §3.7, R50-7; docs/questions/Q-312 (A-82).
     fn call(&mut self, request: &Request) -> Result<DirectoryReply, Unserved> {
-        let result = self.call_inner(request);
+        self.call_with(request, Reconnect::Allowed)
+    }
+
+    /// [`DirectoryClient::call`] for a request of an open view: a held
+    /// connection that fails its idle check is not replaced (Q-312).
+    fn call_in_view(&mut self, request: &Request) -> Result<DirectoryReply, Unserved> {
+        self.call_with(request, Reconnect::InView)
+    }
+
+    fn call_with(
+        &mut self,
+        request: &Request,
+        reconnect: Reconnect,
+    ) -> Result<DirectoryReply, Unserved> {
+        let result = self.call_inner(request, reconnect);
         if result.is_err() {
             self.connection = None;
         }
         result
     }
 
-    fn call_inner(&mut self, request: &Request) -> Result<DirectoryReply, Unserved> {
-        let wire = request.to_wire().map_err(|_| Unserved::Unencodable)?;
-        let frame = encode_frame(DIRECTORY_CHANNEL, Direction::Request, &wire)
-            .map_err(|_| Unserved::Unencodable)?;
-        drop(wire);
+    fn call_inner(
+        &mut self,
+        request: &Request,
+        reconnect: Reconnect,
+    ) -> Result<DirectoryReply, Unserved> {
+        let start = Instant::now();
+        let frame = encode_request(request)?;
         let deadline = self.deadline;
-        let connection = self.verified()?;
-        let body = connection
-            .exchange(frame.as_bytes(), REPLY_LIMIT, deadline)
-            .map_err(Unserved::Transport)?;
-        match decode_reply::<DirectoryReply>(DIRECTORY_CHANNEL, &body)
-            .map_err(Unserved::MalformedReply)?
-        {
-            Reply::Refused(refused) => Err(Unserved::Refused(refused)),
-            Reply::Message(DirectoryReply::ViewFailure(failure)) => Err(Unserved::View(failure)),
-            Reply::Message(reply) => Ok(reply),
-        }
+        let connection = self.verified(start, reconnect)?;
+        let left = remaining(start, deadline).map_err(Unserved::Transport)?;
+        exchange_on(connection, &frame, left)
     }
 
     /// The domain description (once at the kdc's start: `KdcConfig::new(
@@ -443,8 +623,10 @@ impl<C: Connector> RemoteView<'_, C> {
         self.state.get() == ViewState::Open
     }
 
-    /// Ask one question over the view. A failure marks the view broken.
-    /// Spec: docs/50 §3.4, §3.7.
+    /// Ask one question over the view. A failure marks the view broken; a
+    /// held connection that fails its idle check is not replaced (the view
+    /// lived on it).
+    /// Spec: docs/50 §3.4, §3.7; docs/questions/Q-312 (A-82).
     fn ask(&self, query: Query) -> Result<DirectoryReply, Unserved> {
         if self.state.get() != ViewState::Open {
             return Err(Unserved::ViewClosed);
@@ -456,7 +638,7 @@ impl<C: Connector> RemoteView<'_, C> {
             view: self.view,
             query,
         };
-        let result = client.call(&request);
+        let result = client.call_in_view(&request);
         if result.is_err() {
             self.state.set(ViewState::Broken);
         }
@@ -492,7 +674,7 @@ impl<C: Connector> RemoteView<'_, C> {
         let Ok(mut client) = self.client.try_borrow_mut() else {
             return Err(Unserved::ViewClosed);
         };
-        match client.call(&Request::EndView { view: self.view })? {
+        match client.call_in_view(&Request::EndView { view: self.view })? {
             DirectoryReply::ViewEnded => Ok(()),
             _ => {
                 client.connection = None;
