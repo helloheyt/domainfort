@@ -365,6 +365,106 @@
       "blocks": [
         "SV-6"
       ]
+    },
+    {
+      "id": "RFC4512",
+      "title": "LDAP: Directory Information Models",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc4512.txt",
+      "revision": "RFC4512",
+      "sha256": "c3380501eaa81d93a2bcc4d9e8c38e9fdcef20d2ac4fa52759124bb2d2edd5bf",
+      "phase": "1",
+      "blocks": []
+    },
+    {
+      "id": "RFC4514",
+      "title": "LDAP: String Representation of Distinguished Names",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc4514.txt",
+      "revision": "RFC4514",
+      "sha256": "b272176d48a231b28e478c30c59c4bee6073883a0ca25bafd93ea3526702b7de",
+      "phase": "1",
+      "blocks": []
+    },
+    {
+      "id": "RFC4517",
+      "title": "LDAP: Syntaxes and Matching Rules",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc4517.txt",
+      "revision": "RFC4517",
+      "sha256": "326d546ce6af5571015f7eb4deedfe0f438f211e0d540580b4dfeacdea20d327",
+      "phase": "1",
+      "blocks": []
+    },
+    {
+      "id": "RFC4518",
+      "title": "LDAP: Internationalized String Preparation",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc4518.txt",
+      "revision": "RFC4518",
+      "sha256": "a12b9a04e49cf778f7a26e59d32a2bda02d6d4ab4d4151b6a8cc9db21070a068",
+      "phase": "1",
+      "blocks": []
+    },
+    {
+      "id": "RFC4422",
+      "title": "Simple Authentication and Security Layer (SASL)",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc4422.txt",
+      "revision": "RFC4422",
+      "sha256": "69fbd4a501645d049dac3cac0544179d3d4cd3b13039f565768cd2f1d5978c42",
+      "phase": "1",
+      "blocks": []
+    },
+    {
+      "id": "RFC4752",
+      "title": "The Kerberos V5 (\"GSSAPI\") SASL Mechanism",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc4752.txt",
+      "revision": "RFC4752",
+      "sha256": "3a53db51f45da47a2cdbf960806d22e60999c12d00f86cc54bc92c71c71bd48d",
+      "phase": "1",
+      "blocks": []
+    },
+    {
+      "id": "RFC4121",
+      "title": "The Kerberos Version 5 GSS-API Mechanism: Version 2",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc4121.txt",
+      "revision": "RFC4121",
+      "sha256": "2bdacc59a820b192e8787a46c742ce94719a65994552615ce0c158c3086fbe8f",
+      "phase": "1",
+      "blocks": []
+    },
+    {
+      "id": "RFC2696",
+      "title": "LDAP Control Extension for Simple Paged Results Manipulation",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc2696.txt",
+      "revision": "RFC2696",
+      "sha256": "a10622f84e0c5117b6cb535ef31f703c6d9d2953e25ec182b9029942228879f1",
+      "phase": "1",
+      "blocks": []
+    },
+    {
+      "id": "RFC4178",
+      "title": "The Simple and Protected GSS-API Negotiation Mechanism",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc4178.txt",
+      "revision": "RFC4178",
+      "sha256": "c6fda3258d782c661363cef51135fa544a804b39d16a1d54b5284490a1f13bea",
+      "phase": "1",
+      "blocks": []
+    },
+    {
+      "id": "MS-SPNG",
+      "title": "Simple and Protected GSS-API Negotiation Mechanism (SPNEGO) Extension",
+      "kind": "ms-openspec",
+      "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-SPNG/%5bMS-SPNG%5d.pdf",
+      "revision": "v20261026 (2026-10-26)",
+      "sha256": "ce8117cce276e1b01430899a6752f5b49b99fa0ad45f50de12b75e3ff02bd96e",
+      "phase": "1-2",
+      "blocks": []
     }
   ]
 }
