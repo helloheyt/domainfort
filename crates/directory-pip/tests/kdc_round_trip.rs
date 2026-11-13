@@ -43,10 +43,11 @@ mod common;
 use common::*;
 use directory_pip::{account_salt, AccountKind, DirectoryView, TierMap};
 use kdc::{
-    AccountSource, AuditEvent, Kdc, KdcConfig, KdcReply, LocalKeyd, Peer, PolicyInputs,
-    RateLimiter, Transport,
+    AccountSource, AuditEvent, Kdc, KdcConfig, KdcReply, Peer, PolicyInputs, RateLimiter, Transport,
 };
-use keyd::{AuditRecord, CallerId, InMemoryKeyStore, Keyd, OsEntropy, PrincipalBinding, Role};
+use keyd::{
+    AuditRecord, CallerId, InMemoryKeyStore, Keyd, LocalKeyd, OsEntropy, PrincipalBinding, Role,
+};
 use krb_crypto::{EncType, KeyUsage, ProtocolKey};
 use krb_proto::constants::{
     FX_FAST_ARMOR_AP_REQUEST, KDC_ERR_CLIENT_REVOKED, KDC_ERR_C_PRINCIPAL_UNKNOWN, KDC_ERR_POLICY,

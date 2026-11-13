@@ -11,7 +11,9 @@
 # sections, checked only) and this project's design documents (docs/09,
 # docs/10, docs/25 §3, docs/30, docs/33 §6.1, docs/48, docs/49 §3.3 — the
 # service-ticket verification core, A-46) — AGENTS.md §1-3. No other
-# implementation consulted or recalled.
+# implementation consulted or recalled. The crypto-free types were split into
+# crates/keyd-types (D182; A-63) and the in-process `LocalKeyd` custody moved
+# here from crates/kdc — code moved, not rewritten.
 #
 # Dependencies: our own workspace crates plus RustCrypto `zeroize` (OD-9 /
 # D180), linked, never copied. License: MIT OR Apache-2.0. No randomness crate:
@@ -24,6 +26,11 @@ edition = "2021"
 publish = false
 
 [dependencies]
+# The crypto-free types of keyd's interface (ids, roles, errors, operation
+# arguments and results, configuration, audit, the `KeyCustody` seam), moved
+# out of this crate and re-exported unchanged so that keyd's callers link no
+# crypto code (D182; decision A-63).
+keyd-types = { path = "../keyd-types" }
 # Kerberos AES profile (RFC 3961/3962/8009): string-to-key, random-to-key,
 # encrypt/decrypt with integrity, get_mic/verify_mic (constant-time compare).
 krb-crypto = { path = "../krb-crypto" }

@@ -99,7 +99,14 @@ impl IpcWorld {
         let server = share(keyd, keyd_clock);
         let mut admin =
             KeydClient::new(Loopback::new(&server, ADMIN), KEYD_UID, DEFAULT_DEADLINE).unwrap();
-        let enctypes = server.borrow().keyd.config().enctypes.clone();
+        let enctypes: Vec<krb_crypto::EncType> = server
+            .borrow()
+            .keyd
+            .config()
+            .enctypes
+            .iter()
+            .map(|e| krb_crypto::EncType::from_number(e.number()).unwrap())
+            .collect();
         for (handle, binding, key) in [
             (KRBTGT, krbtgt_name(), KRBTGT_KEY),
             (SERVICE, service_name(), SERVICE_KEY),

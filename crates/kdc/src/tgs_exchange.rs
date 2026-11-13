@@ -77,7 +77,6 @@
 use crate::accounts::AccountSource;
 use crate::as_exchange::has_unsupported_content;
 use crate::audit::{AuditReason, AuditSink};
-use crate::custody::KeyCustody;
 use crate::etype::negotiate;
 use crate::fast::{armored_request, fx_fast_padata, fx_fast_reply, has_critical_fast_option};
 use crate::gate::{enforce, PolicyInputs, Question, RateLimiter};
@@ -91,7 +90,7 @@ use crate::options::{asks_unsupported_operation, delegation_flags, FlagRequests}
 use crate::time::seconds;
 use crate::transport::Peer;
 use core::time::Duration;
-use keyd::{AuthnError, KeyPurpose, TgsFastRequest, TgsTicketTemplate};
+use keyd_types::{AuthnError, KeyCustody, KeyPurpose, TgsFastRequest, TgsTicketTemplate};
 use krb_proto::constants::{
     KDC_ERR_BADOPTION, KDC_ERR_CLIENT_REVOKED, KDC_ERR_ETYPE_NOSUPP, KDC_ERR_PADATA_TYPE_NOSUPP,
     KDC_ERR_POLICY, KDC_ERR_PREAUTH_FAILED, KDC_ERR_SERVICE_REVOKED, KDC_ERR_S_PRINCIPAL_UNKNOWN,

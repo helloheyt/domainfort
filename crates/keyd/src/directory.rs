@@ -26,6 +26,7 @@
 use crate::audit::{AuditReason, AuditSink};
 use crate::authz::{CallerId, HandleSlot, Operation};
 use crate::config::KeydConfig;
+use crate::enctype::to_crypto;
 use crate::entropy::EntropySource;
 use crate::error::{Deny, Error, Internal};
 use crate::keyd::{draw, key_usage, new_random_key, store_deny, AuditFields, Keyd};
@@ -115,8 +116,8 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
                 .ok_or(Deny::denied(AuditReason::KvnoExhausted))?,
         };
         fields.kvno = Some(new_kvno);
-        let mut keys = Vec::with_capacity(self.config.enctypes.len());
-        for enctype in &self.config.enctypes {
+        let mut keys = Vec::with_capacity(self.enctypes.len());
+        for enctype in &self.enctypes {
             keys.push(derive_password_key(
                 &self.config,
                 *enctype,
@@ -293,7 +294,7 @@ fn compare_secret<S: KeyStore, E: EntropySource>(
 /// ignored. Spec: docs/10 §9 ("no time difference between secret-dependent
 /// branches").
 fn dummy_compare<E: EntropySource>(entropy: &mut E, config: &KeydConfig, candidate: &str) {
-    let Some(enctype) = config.enctypes.first().copied() else {
+    let Some(enctype) = config.enctypes.first().copied().map(to_crypto) else {
         return;
     };
     let derived = derive_password_key(
@@ -321,6 +322,7 @@ mod tests {
     use crate::authz::Role;
     use crate::model::{KeyPurpose, PrincipalId};
     use crate::store::InMemoryKeyStore;
+    use keyd_types::EncTypeId;
     use krb_proto::{KerberosString, PrincipalName, Realm};
 
     #[derive(Default)]
@@ -371,7 +373,7 @@ mod tests {
         store.insert(at_max, seeded(u32::MAX)).unwrap();
         store.insert(below_max, seeded(u32::MAX - 1)).unwrap();
         let mut config = KeydConfig::new(Realm::new("EXAMPLE.ORG").unwrap());
-        config.enctypes = vec![EncType::Aes256CtsHmacSha196];
+        config.enctypes = vec![EncTypeId::Aes256CtsHmacSha196];
         let now = KerberosTime::new(2026, 11, 13, 10, 0, 0).unwrap();
         // Started a day earlier: the startup hold-down (Directory is not
         // held anyway) is long over.

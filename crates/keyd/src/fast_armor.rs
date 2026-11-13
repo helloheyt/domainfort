@@ -69,11 +69,12 @@ use crate::store::KeyStore;
 use crate::template::tgs_name;
 use crate::tgs_exchange::{check_ap_options, replay_key_for, subkey_protocol_key, OpenedApReq};
 use crate::time::kerberos_time_seconds;
-use crate::tokens::{ArmorId, CtxId, TOKEN_ID_LENGTH};
+use crate::tokens::{ArmorId, TOKEN_ID_LENGTH};
 use crate::usage::{
     AP_REQ_AUTHENTICATOR, AS_REP_ENC_PART, KEY_USAGE_ENC_CHALLENGE_KDC, KEY_USAGE_FAST_ENC,
     KEY_USAGE_FAST_FINISHED, KEY_USAGE_FAST_REP, KEY_USAGE_FAST_REQ_CHKSUM,
 };
+use keyd_types::{FastArmor, FastConversation, MAX_FX_COOKIE_LENGTH};
 use krb_crypto::{ChecksumType, EncType, ProtocolKey};
 use krb_proto::constants::{
     FX_FAST_ARMOR_AP_REQUEST, KDC_ERR_NONE, PA_ENCRYPTED_CHALLENGE, PA_ETYPE_INFO2, PA_FX_COOKIE,
@@ -114,47 +115,10 @@ const STRENGTHEN_KEY_PEPPER: &[u8] = b"strengthenkey";
 /// side). Spec: RFC 6113 5.4.3 (`"replykey"`).
 const REPLY_KEY_PEPPER: &[u8] = b"replykey";
 
-/// Upper bound on a PA-FX-COOKIE value keyd seals into an armored error. The
-/// cookie's content "is a local matter of the KDC" (RFC 6113 5.2); phase 1's
-/// cookie is a short constant token (docs/questions/Q-126, A-32), so this
-/// project bound only keeps the sealed reply small. Not taken from any other
-/// source.
-pub const MAX_FX_COOKIE_LENGTH: usize = 64;
-
-/// The result of `open_fast_armor`: the one-time armor token, the armor
-/// ticket's client (non-secret; the KDC re-evaluates it as an account, D126 /
-/// D53) and the decrypted inner request. No key of any kind (docs/48 §9.1
-/// I1).
-///
-/// Spec: docs/48 §2.3 (`struct FastArmor`); RFC 6113 5.4.1.1, 5.4.2.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FastArmor {
-    /// The one-time armor token (docs/48 §2.3, D36).
-    pub armor_id: ArmorId,
-    /// Client realm of the armor ticket.
-    pub armor_crealm: Realm,
-    /// Client name of the armor ticket.
-    pub armor_cname: PrincipalName,
-    /// Authentication time of the armor ticket (for the KDC's
-    /// `revoked_before` hot-list check, docs/48 §3.1).
-    pub armor_authtime: KerberosTime,
-    /// The decrypted KrbFastReq: fast-options, padata, inner req-body.
-    pub fast_req: KrbFastReq,
-}
-
-/// Which armored conversation `seal_fast_error` answers.
-///
-/// Spec: docs/48 §2.3 (`enum FastConversation { As(ArmorId), Tgs(CtxId) }`),
-/// §5, §6.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FastConversation {
-    /// The AS conversation opened by `open_fast_armor`.
-    As(ArmorId),
-    /// The TGS conversation opened by an armored `open_and_verify_tgt`
-    /// (implicit armor, RFC 6113 5.4.2); a context opened without FAST has
-    /// no armor key and is refused.
-    Tgs(CtxId),
-}
+// `MAX_FX_COOKIE_LENGTH`, `FastArmor` and `FastConversation` — the public
+// bound and the argument / result types of the FAST operations — live in the
+// crypto-free keyd-types crate (D182; decision A-63) and are re-exported at
+// the crate root.
 
 /// An armored conversation as `seal_fast_error` sees it, built from the
 /// consumed token of either conversation: the armor key, the nonce of the
@@ -706,7 +670,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             .subkey
             .as_ref()
             .ok_or(Deny::denied(AuditReason::ArmorSubkeyMissing))?;
-        let subkey = subkey_protocol_key(subkey, &self.config.enctypes)?;
+        let subkey = subkey_protocol_key(subkey, &self.enctypes)?;
 
         // 6. The armor key; its enctype is the subkey's (k1). Spec: RFC 6113
         // 5.1, 5.4.1.1.
@@ -842,7 +806,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         check_fast_error(error, &conversation, now)?;
 
         // 4. The padata, then PA-FX-ERROR.
-        let mut response_padata = allowed_fast_error_padata(padata, &self.config.enctypes)?;
+        let mut response_padata = allowed_fast_error_padata(padata, &self.enctypes)?;
         let fx_error = error
             .encode()
             .map_err(|_| Deny::unavailable(AuditReason::InternalFailure))?;

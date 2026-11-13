@@ -1,5 +1,5 @@
 //! An in-process loopback for the keyd channel: a `Connector` whose
-//! connections hand each request frame to `ipc_keyd::dispatch` on a shared
+//! connections hand each request frame to `ipc_keyd_server::dispatch` on a shared
 //! keyd, with the caller identity of the "connection" and the "daemon's"
 //! clock — exactly the two values the keyd-daemon will take from peer
 //! credentials and from its own clock (docs/50 §3.2, R50-5).
@@ -15,9 +15,8 @@
 #![allow(dead_code)] // each test binary uses a different subset
 
 use ipc::{decode_frame, encode_refused, FrameLimit, FrameStatus, Refused};
-use ipc_keyd::{
-    dispatch, Connection, Connector, Dispatch, TransportError, KEYD_CHANNEL, REQUEST_LIMIT,
-};
+use ipc_keyd::{Connection, Connector, TransportError, KEYD_CHANNEL, REQUEST_LIMIT};
+use ipc_keyd_server::{dispatch, Dispatch};
 use keyd::{AuditSink, CallerId, EntropySource, KeyStore, Keyd};
 use krb_proto::KerberosTime;
 use std::cell::RefCell;

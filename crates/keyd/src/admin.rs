@@ -71,7 +71,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             return Err(Deny::denied(AuditReason::KeyExists));
         }
         check_new_binding(&self.config.realm, handle.purpose, binding)?;
-        let keys = new_random_keys(&mut self.entropy, &self.config.enctypes)?;
+        let keys = new_random_keys(&mut self.entropy, &self.enctypes)?;
         let kvno = Kvno::INITIAL;
         fields.kvno = Some(kvno);
         let set = StoredKeySet::new(binding.clone(), KvnoKeys::new(kvno, keys, None, None));
@@ -158,7 +158,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         let next = current
             .next()
             .ok_or(Deny::denied(AuditReason::KvnoExhausted))?;
-        let keys = new_random_keys(&mut self.entropy, &self.config.enctypes)?;
+        let keys = new_random_keys(&mut self.entropy, &self.enctypes)?;
         let set = self
             .store
             .get_mut(handle)

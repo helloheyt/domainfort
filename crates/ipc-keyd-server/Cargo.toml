@@ -1,0 +1,56 @@
+# ipc-keyd-server — the server side of the keyd channel against the real,
+# in-process keyd: `execute` (one decoded call on keyd with the transport's
+# caller and the daemon's clock) and `dispatch` (one request body in, one
+# reply frame or a close out) (docs/50 §3.2-§3.7, R50-3, R50-5, R50-7; task
+# P5; decision A-58).
+#
+# Split out of ipc-keyd by D182 / decision A-63: these two functions need the
+# real `keyd::Keyd` and so link krb-crypto, which only the keyd process may.
+# ipc-keyd keeps the message set, the codec and the client, and depends only
+# on the crypto-free keyd-types. A separate crate rather than a cargo feature:
+# features are unified across one build, so a `server` feature enabled for the
+# keyd-daemon would also reach the kdc-daemon built with it. Only the
+# keyd-daemon (task P7) depends on this crate.
+#
+# Moved unchanged from ipc-keyd's `server` module (written from docs/50,
+# docs/10 §2, A-56, A-59 and this project's own crates). No other
+# implementation, serializer or RPC framework was consulted or recalled
+# (AGENTS.md §1-3).
+
+[package]
+name = "ipc-keyd-server"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Our own workspace crates only (path dependencies). No external crate.
+#
+# The refusal frame and the encoded-frame type (docs/50 §3.3; A-59).
+ipc = { path = "../ipc" }
+# The channel's message set: `decode_request`, `encode_answer`, `Call`,
+# `Answer`, `KEYD_CHANNEL`.
+ipc-keyd = { path = "../ipc-keyd" }
+# The real keyd: `Keyd` and the bounds of its generics (`KeyStore`,
+# `AuditSink`, `EntropySource`), the caller identity. Links krb-crypto — the
+# reason this crate is separate (D182; A-63).
+keyd = { path = "../keyd" }
+# `KerberosTime` (the daemon's clock, R50-5).
+krb-proto = { path = "../krb-proto" }
+
+[dev-dependencies]
+# TESTS ONLY, moved with the dispatcher from ipc-keyd: the loopback and
+# real-socket tests and the kdc flow through `IpcKeyd`. They reuse the codec
+# samples of crates/ipc-keyd/tests/samples (keyd-types, zeroize) and the kdc
+# integration fixtures of crates/kdc/tests/common (kdc, pdp, dtyp, and
+# krb-crypto to play the Kerberos client) through `#[path]` modules — all
+# workspace crates or already in the lock.
+keyd-types = { path = "../keyd-types" }
+kdc = { path = "../kdc" }
+pdp = { path = "../pdp" }
+dtyp = { path = "../dtyp" }
+krb-crypto = { path = "../krb-crypto" }
+zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
+
+[lints]
+workspace = true

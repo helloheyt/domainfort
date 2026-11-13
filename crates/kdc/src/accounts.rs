@@ -29,7 +29,7 @@
 
 use crate::names::{same_name, same_realm};
 use dtyp::Sid;
-use keyd::KeyHandle;
+use keyd_types::KeyHandle;
 use krb_proto::{EtypeInfo2Entry, KerberosString, KerberosTime, PrincipalName, Realm};
 use pdp::Tier;
 use std::collections::{BTreeMap, BTreeSet};
@@ -390,7 +390,7 @@ impl NamedPrincipal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use keyd::{KeyPurpose, PrincipalId};
+    use keyd_types::{KeyPurpose, PrincipalId};
 
     fn principal(parts: &[&str], name_type: i32) -> NamedPrincipal {
         NamedPrincipal::from_text("EXAMPLE.ORG", name_type, parts).unwrap()

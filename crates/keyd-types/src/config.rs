@@ -11,9 +11,13 @@
 //! docs/30 §2.6 (dangerous ticket options reduced by default); docs/48 §10.1
 //! (armor table); decision A-34 (preauth throttle); docs/49 §3.3, A-46
 //! (service-context table).
+//!
+//! Moved unchanged in meaning from keyd (D182; decision A-63). Encryption
+//! types are carried as crypto-free identifiers ([`EncTypeId`]); keyd
+//! converts them to its crypto profile's type internally.
 
+use crate::enctype::{s2k_iteration_count, EncTypeId};
 use crate::error::ConfigError;
-use krb_crypto::EncType;
 use krb_proto::{Realm, TicketFlags};
 
 /// Upper bound for every table capacity (memory bound, AGENTS.md §6).
@@ -120,8 +124,9 @@ pub struct KeydConfig {
     /// Encryption types for long-term keys and session keys, in preference
     /// order. The first is used to seal tickets (RFC 4120 3.1.3: the ticket
     /// uses "the encryption type associated with the server principal's
-    /// key"). Only the AES types of krb-crypto exist (I5).
-    pub enctypes: Vec<EncType>,
+    /// key"). Only the AES types exist (I5): an [`EncTypeId`] names no other
+    /// (D182; A-63).
+    pub enctypes: Vec<EncTypeId>,
     /// Acceptable clock skew in seconds. RFC 4120 §8.2: 5 minutes.
     pub clock_skew_secs: u32,
     /// Lifetime of AuthnProof / ctx tokens in seconds (docs/10 D36).
@@ -147,8 +152,9 @@ pub struct KeydConfig {
     /// default is not a recommendation for database keys).
     pub s2k_params: Option<[u8; 4]>,
     /// Cap on string-to-key iterations, enforced through krb-crypto's
-    /// `max_iterations` (RFC 3962 §4: such a limit "SHOULD be no less than
-    /// 50,000").
+    /// `max_iterations` inside keyd, and on `s2k_params` by
+    /// [`KeydConfig::validate`] (RFC 3962 §4: such a limit "SHOULD be no less
+    /// than 50,000").
     pub max_s2k_iterations: u32,
     /// Policy of the default `verify_secret` throttle.
     pub throttle: ThrottlePolicy,
@@ -169,7 +175,10 @@ impl KeydConfig {
     pub fn new(realm: Realm) -> Self {
         KeydConfig {
             realm,
-            enctypes: vec![EncType::Aes256CtsHmacSha196, EncType::Aes128CtsHmacSha196],
+            enctypes: vec![
+                EncTypeId::Aes256CtsHmacSha196,
+                EncTypeId::Aes128CtsHmacSha196,
+            ],
             clock_skew_secs: 5 * 60,
             token_lifetime_secs: 30,
             max_authn_proofs: 1_024,
@@ -227,10 +236,11 @@ impl KeydConfig {
         if !CONFIGURABLE_TICKET_FLAGS.contains(p.allowed_flags) {
             return Err(ConfigError::TicketFlags);
         }
+        // The iteration count of RFC 3962 §4 / RFC 8009 §4 (the parameter
+        // block is always four octets here, so only the cap can refuse it);
+        // pinned to krb-crypto's count by keyd's tests (A-63).
         for enctype in &self.enctypes {
-            let count =
-                krb_crypto::iteration_count(*enctype, self.s2k_params.as_ref().map(|p| &p[..]))
-                    .map_err(|_| ConfigError::S2kParams)?;
+            let count = s2k_iteration_count(*enctype, self.s2k_params);
             if count > u64::from(self.max_s2k_iterations) {
                 return Err(ConfigError::S2kParams);
             }
@@ -241,12 +251,6 @@ impl KeydConfig {
             }
         }
         Ok(())
-    }
-
-    /// `true` if `enctype` is one of the configured types (I5).
-    /// Spec: docs/10 §12 I5.
-    pub(crate) fn supports(&self, enctype: EncType) -> bool {
-        self.enctypes.contains(&enctype)
     }
 
     /// The non-secret part of this configuration that other processes need
@@ -284,7 +288,7 @@ pub struct ConfigDescription {
     pub realm: Realm,
     /// The encryption types, in keyd's preference order
     /// ([`KeydConfig::enctypes`]).
-    pub enctypes: Vec<EncType>,
+    pub enctypes: Vec<EncTypeId>,
     /// The acceptable clock skew in seconds ([`KeydConfig::clock_skew_secs`]).
     pub clock_skew_secs: u32,
     /// The one-time token lifetime in seconds
@@ -357,7 +361,7 @@ mod tests {
         c.enctypes.clear();
         assert_eq!(c.validate(), Err(ConfigError::EncTypes));
         let mut c = base();
-        c.enctypes.push(EncType::Aes256CtsHmacSha196);
+        c.enctypes.push(EncTypeId::Aes256CtsHmacSha196);
         assert_eq!(c.validate(), Err(ConfigError::EncTypes));
         let mut c = base();
         c.clock_skew_secs = 0;

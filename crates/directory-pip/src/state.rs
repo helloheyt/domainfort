@@ -19,7 +19,7 @@ use ad_schema::flags::user_account_control::{
     ADS_UF_SMARTCARD_REQUIRED, ADS_UF_WORKSTATION_TRUST_ACCOUNT, ALLOWED,
 };
 use kdc::AccountState;
-use keyd::kerberos_time_seconds;
+use keyd_types::kerberos_time_seconds;
 use krb_proto::KerberosTime;
 
 /// The account-type bits of userAccountControl, of which exactly one is

@@ -132,6 +132,7 @@ dependencies = [
  "dtyp",
  "kdc",
  "keyd",
+ "keyd-types",
  "krb-crypto",
  "krb-proto",
  "pdp",
@@ -214,14 +215,27 @@ dependencies = [
 name = "ipc-keyd"
 version = "0.0.0"
 dependencies = [
- "dtyp",
  "ipc",
  "kdc",
+ "keyd-types",
+ "krb-proto",
+ "rustix",
+ "zeroize",
+]
+
+[[package]]
+name = "ipc-keyd-server"
+version = "0.0.0"
+dependencies = [
+ "dtyp",
+ "ipc",
+ "ipc-keyd",
+ "kdc",
  "keyd",
+ "keyd-types",
  "krb-crypto",
  "krb-proto",
  "pdp",
- "rustix",
  "zeroize",
 ]
 
@@ -231,6 +245,7 @@ version = "0.0.0"
 dependencies = [
  "dtyp",
  "keyd",
+ "keyd-types",
  "krb-crypto",
  "krb-proto",
  "pdp",
@@ -240,9 +255,17 @@ dependencies = [
 name = "keyd"
 version = "0.0.0"
 dependencies = [
+ "keyd-types",
  "krb-crypto",
  "krb-proto",
  "zeroize",
+]
+
+[[package]]
+name = "keyd-types"
+version = "0.0.0"
+dependencies = [
+ "krb-proto",
 ]
 
 [[package]]
@@ -274,7 +297,7 @@ dependencies = [
  "dirstore",
  "dtyp",
  "kdc",
- "keyd",
+ "keyd-types",
  "krb-proto",
  "parse-ldap",
  "pdp",

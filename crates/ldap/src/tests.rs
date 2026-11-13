@@ -18,7 +18,7 @@ use dtyp::{SecurityDescriptor, Sid, SECURITY_NT_AUTHORITY};
 use kdc::{
     AccountKind, AccountState, ArmorPolicy, ClientAccount, InMemoryAccounts, NamedPrincipal,
 };
-use keyd::{KeyHandle, KeyPurpose, PrincipalId as KeydPrincipalId};
+use keyd_types::{KeyHandle, KeyPurpose, PrincipalId as KeydPrincipalId};
 use krb_proto::KerberosTime;
 use parse_ldap::{
     decode_message, encode_message, AuthState, AuthenticationChoice, BindRequest, DecodeOptions,

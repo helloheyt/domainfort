@@ -17,6 +17,17 @@
 //! | `Admin`     | [`Keyd::create_key`], [`Keyd::rotate_key`], [`Keyd::rotate_krbtgt`], [`Keyd::retire_kvno`], [`Keyd::destroy_key_set`], [`Keyd::ping`] |
 //! | `Ldap`      | [`Keyd::open_and_verify_service_ticket`], [`Keyd::describe_config`], [`Keyd::ping`] |
 //!
+//! **Types and seam** (D182; decision A-63): every crypto-free type of this
+//! interface — ids and handles, roles, operations and the capability table,
+//! the error enums, the argument and result types below, the token ids, the
+//! configuration and audit types, [`kerberos_time_seconds`] and the KDC's
+//! [`KeyCustody`] seam — lives in the `keyd-types` crate and is re-exported
+//! here unchanged, so that the kdc, ldap, directory-pip and ipc-keyd link no
+//! crypto code. Encryption types cross the interface as [`EncTypeId`]
+//! identifiers; keyd converts them to krb-crypto's type internally. keyd
+//! provides the in-process custody, [`LocalKeyd`] (moved from the kdc
+//! crate).
+//!
 //! **Daemon support** (docs/50 §3.4, §7.5): [`Keyd::describe_config`]
 //! returns the non-secret [`ConfigDescription`] the kdc validates its own
 //! configuration against before it binds its ports; [`Keyd::ping`] is the
@@ -201,23 +212,22 @@
 //! docs/33 §6.1, docs/45, docs/47 §9, docs/48, docs/49 §3.3, §12,
 //! docs/50 (R50-5, R50-6, R50-8, §3.4, §3.5, §3.7, §7.5),
 //! docs/questions/Q-040, Q-115 (A-35), Q-120..Q-127, Q-145, Q-150, Q-165
-//! (A-46), Q-180, Q-217 and Q-222 (A-56), Q-240 (A-62). No other
-//! implementation was consulted or recalled.
+//! (A-46), Q-180, Q-217 and Q-222 (A-56), Q-240 (A-62), Q-245 item 3 (A-63:
+//! the keyd-types split, D182). No other implementation was consulted or
+//! recalled.
 //!
 //! Spec: docs/10; docs/09 א; RFC 4120 §3, §5.
 
 mod admin;
 mod as_exchange;
-pub mod audit;
-pub mod authz;
-pub mod config;
+mod custody;
 mod directory;
+mod enctype;
 pub mod entropy;
 mod error;
 mod fast_armor;
 #[allow(clippy::module_inception)]
 mod keyd;
-pub mod model;
 mod replay;
 mod runtime;
 mod service_ticket;
@@ -229,18 +239,23 @@ mod time;
 mod tokens;
 mod usage;
 
-pub use as_exchange::{AsRepParts, AsTicketTemplate, AuthnProof};
-pub use audit::{AuditKeyRef, AuditOutcome, AuditReason, AuditRecord, AuditSink};
-pub use authz::{CallerId, Operation, Role};
-pub use config::{ConfigDescription, KeydConfig, ThrottlePolicy, TicketPolicy};
+// The crypto-free types of keyd's interface live in keyd-types (D182;
+// decision A-63) and are re-exported here unchanged: `keyd::X` and
+// `keyd_types::X` are the same item. The modules `audit`, `authz`, `config`
+// and `model` keep their paths.
+pub use keyd_types::{audit, authz, config, model};
+
+pub use custody::LocalKeyd;
 pub use entropy::{EntropyError, EntropySource, OsEntropy};
-pub use error::{AuthnError, ConfigError, Error, IssueError};
-pub use fast_armor::{FastArmor, FastConversation, MAX_FX_COOKIE_LENGTH};
 pub use keyd::Keyd;
-pub use model::{DualControlToken, KeyHandle, KeyPurpose, Kvno, PrincipalBinding, PrincipalId};
-pub use service_ticket::ServiceContext;
+pub use keyd_types::kerberos_time_seconds;
+pub use keyd_types::{
+    ArmorId, AsRepParts, AsTicketTemplate, AuditKeyRef, AuditOutcome, AuditReason, AuditRecord,
+    AuditSink, AuthnError, AuthnProof, CallerId, ConfigDescription, ConfigError, CtxId,
+    DualControlToken, EncTypeId, Error, ExchangeId, FastArmor, FastConversation, IssueError,
+    KeyCustody, KeyHandle, KeyPurpose, KeydConfig, Kvno, Operation, PrincipalBinding, PrincipalId,
+    Role, ServiceContext, ServiceCtxId, TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext,
+    ThrottlePolicy, TicketPolicy, MAX_FX_COOKIE_LENGTH, TOKEN_ID_LENGTH,
+};
 pub use store::{InMemoryKeyStore, KeyStore, StoreError, StoredKeySet};
-pub use tgs_exchange::{TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext};
 pub use throttle::{FailureWindowThrottle, SecretThrottle};
-pub use time::kerberos_time_seconds;
-pub use tokens::{ArmorId, CtxId, ExchangeId, ServiceCtxId, TOKEN_ID_LENGTH};

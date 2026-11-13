@@ -11,13 +11,15 @@
 //! constructed by hand for these tests.
 #![cfg(unix)]
 
+#[path = "../../ipc-keyd/tests/samples/mod.rs"]
 mod samples;
 
 use ipc::{encode_frame, Direction, FrameReader};
 use ipc_keyd::{
-    dispatch, Call, Connection, Dispatch, KeydClient, KeydReply, TransportError, UnixConnection,
-    UnixConnector, KEYD_CHANNEL, REPLY_LIMIT, REQUEST_LIMIT,
+    Call, Connection, KeydClient, KeydReply, TransportError, UnixConnection, UnixConnector,
+    KEYD_CHANNEL, REPLY_LIMIT, REQUEST_LIMIT,
 };
+use ipc_keyd_server::{dispatch, Dispatch};
 use keyd::{AuditRecord, CallerId, InMemoryKeyStore, Keyd, KeydConfig, Role};
 use krb_proto::KerberosTime;
 use std::io::{Read, Write};

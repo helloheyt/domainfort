@@ -3,7 +3,7 @@
 //! The KDC reads no clock: `now` always comes from the caller (main-session
 //! decision 1). Ticket planning needs "now + a lifetime", so a count of
 //! seconds must be turned back into a KerberosTime. The forward direction is
-//! keyd's [`keyd::kerberos_time_seconds`] (seconds since 0000-01-01T00:00:00Z
+//! keyd's [`keyd_types::kerberos_time_seconds`] (seconds since 0000-01-01T00:00:00Z
 //! on the proleptic Gregorian calendar, the calendar krb-proto validates
 //! against); the inverse here is derived from it directly: the year is the
 //! last one whose 1 January is not after the instant (binary search over the
@@ -27,7 +27,7 @@ const MAX_YEAR: u16 = 9999;
 
 /// Seconds of `t` on keyd's scale. Spec: RFC 4120 5.2.3.
 pub(crate) fn seconds(t: &KerberosTime) -> i64 {
-    keyd::kerberos_time_seconds(t)
+    keyd_types::kerberos_time_seconds(t)
 }
 
 /// The KerberosTime `YYYY-MM-01T00:00:00Z`, on keyd's scale.

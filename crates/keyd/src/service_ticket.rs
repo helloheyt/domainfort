@@ -44,42 +44,14 @@ use crate::tgs_exchange::{check_ap_options, replay_key_for, subkey_protocol_key,
 use crate::time::kerberos_time_seconds;
 use crate::tokens::{ServiceCtxId, TOKEN_ID_LENGTH};
 use crate::usage::AP_REQ_AUTHENTICATOR;
+use keyd_types::ServiceContext;
 use krb_crypto::ProtocolKey;
 use krb_proto::constants::DOMAIN_X500_COMPRESS;
-use krb_proto::{ApReq, KerberosTime, PrincipalName, Realm, TicketFlags, TransitedEncoding};
+use krb_proto::{ApReq, KerberosTime, TransitedEncoding};
 
-/// Non-secret facts of a verified service ticket, plus the one-time context
-/// id that names the session key keyd keeps for the later GSS steps.
-///
-/// There is no key field (docs/10 §12 I1): not the service key, not the
-/// session key, not the subkey — only whether a subkey was offered.
-/// `channel_bound` (docs/49 §3.3) arrives with channel binding in task L6b.
-///
-/// Spec: docs/49 §3.3 (`struct ServiceContext { ctx_id, client, authtime,
-/// endtime, flags, … } // no key field (I1)`); docs/questions/Q-165 item 2
-/// (A-46); RFC 4120 5.3 (the EncTicketPart fields), 5.5.1 (subkey).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServiceContext {
-    /// The one-time service-context token.
-    pub ctx_id: ServiceCtxId,
-    /// Client realm from the ticket (equal to the authenticator's).
-    pub crealm: Realm,
-    /// Client name from the ticket (equal to the authenticator's).
-    pub cname: PrincipalName,
-    /// Time of initial authentication — for the PEP's hot-list check
-    /// (docs/49 §3.2, R49-15). Spec: RFC 4120 5.3 (authtime: "the necessary
-    /// information for implementation of a 'hot list' service").
-    pub authtime: KerberosTime,
-    /// Ticket expiration time. Spec: RFC 4120 5.3 (endtime).
-    pub endtime: KerberosTime,
-    /// Ticket flags (never INVALID: such a ticket is refused).
-    /// Spec: RFC 4120 2.2, 5.3.
-    pub flags: TicketFlags,
-    /// `true` if the authenticator offered a subkey ("the client's choice
-    /// for an encryption key to be used to protect this specific application
-    /// session"); the subkey itself stays in keyd. Spec: RFC 4120 5.5.1.
-    pub subkey_present: bool,
-}
+// `ServiceContext`, the result type of this operation, lives in the
+// crypto-free keyd-types crate (D182; decision A-63) and is re-exported at
+// the crate root.
 
 /// What keyd keeps about a live service context (never leaves keyd). The
 /// keys are zeroized when the entry is removed — consumed, expired, or
@@ -317,7 +289,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         let subkey = authenticator
             .subkey
             .as_ref()
-            .map(|subkey| subkey_protocol_key(subkey, &self.config.enctypes))
+            .map(|subkey| subkey_protocol_key(subkey, &self.enctypes))
             .transpose()?;
 
         // The cryptographic chain is complete: the ticket decrypted under the

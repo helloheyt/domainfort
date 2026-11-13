@@ -8,8 +8,8 @@
 mod common;
 
 use common::*;
-use kdc::{AccountState, ConfigError, KdcConfig, KdcReply, LocalKeyd, Transport};
-use keyd::{InMemoryKeyStore, KeyPurpose, Keyd, KeydConfig};
+use kdc::{AccountState, ConfigError, KdcConfig, KdcReply, Transport};
+use keyd::{InMemoryKeyStore, KeyPurpose, Keyd, KeydConfig, LocalKeyd};
 use krb_proto::constants::{KDC_ERR_C_PRINCIPAL_UNKNOWN, KDC_ERR_PREAUTH_REQUIRED, PA_FX_FAST};
 use krb_proto::{KrbError, MethodData, Microseconds};
 
@@ -213,6 +213,6 @@ fn configuration_is_validated() {
     .unwrap();
     assert!(matches!(
         LocalKeyd::new(keyd, DIRECTORY),
-        Err(ConfigError::CustodyRole)
+        Err(keyd::ConfigError::CustodyRole)
     ));
 }

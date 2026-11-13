@@ -1,5 +1,5 @@
 //! The client side: a synchronous keyd client over a connection trait, and
-//! [`IpcKeyd`], the `kdc::KeyCustody` the kdc daemon builds its `Kdc` with.
+//! [`IpcKeyd`], the `KeyCustody` the kdc daemon builds its `Kdc` with.
 //!
 //! # Connections
 //!
@@ -28,7 +28,7 @@
 //! | keyd's own answer | exactly keyd's answer (A-26 classes, keyd's `Unavailable`) |
 //!
 //! `Unavailable` is the `Unavailable` variant of the operation's own error
-//! type (`AuthnError`, `IssueError`, `keyd::Error`), which the KDC answers
+//! type (`AuthnError`, `IssueError`, `keyd_types::Error`), which the KDC answers
 //! with KDC_ERR_SVC_UNAVAILABLE (code 29) over TCP and silence over UDP.
 //! `Denied` would be reported to the user as a wrong password
 //! (KDC_ERR_PREAUTH_FAILED) or a forged request — misleading for a refusal
@@ -46,7 +46,8 @@
 //! clock for its own checks.
 //!
 //! Spec: docs/50 §3.1-§3.7 (R50-3, R50-5, R50-7, R50-8), §10 (`ipc-keyd`:
-//! "a synchronous client implementing `kdc::KeyCustody`"); docs/10 §9;
+//! "a synchronous client implementing `kdc::KeyCustody`" — the trait is
+//! `keyd_types::KeyCustody` since D182 / A-63); docs/10 §9;
 //! docs/questions/Q-217, Q-222 (A-56), Q-240 item 8 (A-62).
 
 use crate::channel::{KEYD_CHANNEL, REPLY_LIMIT};
@@ -55,11 +56,10 @@ use crate::wire::KeydReply;
 use core::fmt;
 use core::time::Duration;
 use ipc::{decode_reply, encode_frame, Direction, FrameLimit, Refused, Reply};
-use kdc::KeyCustody;
-use keyd::{
+use keyd_types::{
     ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof, ConfigDescription, CtxId,
-    DualControlToken, FastArmor, FastConversation, IssueError, KeyHandle, Kvno, PrincipalBinding,
-    ServiceContext, TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext,
+    DualControlToken, FastArmor, FastConversation, IssueError, KeyCustody, KeyHandle, Kvno,
+    PrincipalBinding, ServiceContext, TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext,
 };
 use krb_proto::{ApReq, EncryptedData, KerberosTime, KrbError, KrbFastArmoredReq, PaData};
 use zeroize::Zeroizing;
@@ -383,7 +383,7 @@ impl<C: Connector> KeydClient<C> {
         conversation: &FastConversation,
         error: &KrbError,
         padata: &[PaData],
-    ) -> Result<EncryptedData, keyd::Error> {
+    ) -> Result<EncryptedData, keyd_types::Error> {
         let call = Call::SealFastError {
             conversation: *conversation,
             error: error.clone(),
@@ -391,7 +391,7 @@ impl<C: Connector> KeydClient<C> {
         };
         match self.call(&call) {
             Ok(Answer::SealFastError(result)) => result,
-            _ => Err(keyd::Error::Unavailable),
+            _ => Err(keyd_types::Error::Unavailable),
         }
     }
 
@@ -420,7 +420,7 @@ impl<C: Connector> KeydClient<C> {
         binding: &PrincipalBinding,
         password: Zeroizing<String>,
         salt: &str,
-    ) -> Result<Kvno, keyd::Error> {
+    ) -> Result<Kvno, keyd_types::Error> {
         let call = Call::SetSecret {
             handle: *handle,
             binding: binding.clone(),
@@ -429,7 +429,7 @@ impl<C: Connector> KeydClient<C> {
         };
         match self.call(&call) {
             Ok(Answer::SetSecret(result)) => result,
-            _ => Err(keyd::Error::Unavailable),
+            _ => Err(keyd_types::Error::Unavailable),
         }
     }
 
@@ -439,14 +439,14 @@ impl<C: Connector> KeydClient<C> {
         &mut self,
         handle: &KeyHandle,
         candidate: Zeroizing<String>,
-    ) -> Result<(), keyd::Error> {
+    ) -> Result<(), keyd_types::Error> {
         let call = Call::VerifySecret {
             handle: *handle,
             candidate: Password::new(candidate),
         };
         match self.call(&call) {
             Ok(Answer::VerifySecret(result)) => result,
-            _ => Err(keyd::Error::Unavailable),
+            _ => Err(keyd_types::Error::Unavailable),
         }
     }
 
@@ -455,22 +455,22 @@ impl<C: Connector> KeydClient<C> {
         &mut self,
         handle: &KeyHandle,
         binding: &PrincipalBinding,
-    ) -> Result<Kvno, keyd::Error> {
+    ) -> Result<Kvno, keyd_types::Error> {
         let call = Call::CreateKey {
             handle: *handle,
             binding: binding.clone(),
         };
         match self.call(&call) {
             Ok(Answer::CreateKey(result)) => result,
-            _ => Err(keyd::Error::Unavailable),
+            _ => Err(keyd_types::Error::Unavailable),
         }
     }
 
     /// docs/10 §7 `rotate_key` (Role::Admin). Spec: docs/50 §3.4.
-    pub fn rotate_key(&mut self, handle: &KeyHandle) -> Result<Kvno, keyd::Error> {
+    pub fn rotate_key(&mut self, handle: &KeyHandle) -> Result<Kvno, keyd_types::Error> {
         match self.call(&Call::RotateKey { handle: *handle }) {
             Ok(Answer::RotateKey(result)) => result,
-            _ => Err(keyd::Error::Unavailable),
+            _ => Err(keyd_types::Error::Unavailable),
         }
     }
 
@@ -479,56 +479,56 @@ impl<C: Connector> KeydClient<C> {
         &mut self,
         krbtgt: &KeyHandle,
         approval: &DualControlToken,
-    ) -> Result<Kvno, keyd::Error> {
+    ) -> Result<Kvno, keyd_types::Error> {
         let call = Call::RotateKrbtgt {
             krbtgt: *krbtgt,
             approval: *approval,
         };
         match self.call(&call) {
             Ok(Answer::RotateKrbtgt(result)) => result,
-            _ => Err(keyd::Error::Unavailable),
+            _ => Err(keyd_types::Error::Unavailable),
         }
     }
 
     /// docs/10 §7 `retire_kvno` (Role::Admin). Spec: docs/50 §3.4.
-    pub fn retire_kvno(&mut self, handle: &KeyHandle, kvno: Kvno) -> Result<(), keyd::Error> {
+    pub fn retire_kvno(&mut self, handle: &KeyHandle, kvno: Kvno) -> Result<(), keyd_types::Error> {
         let call = Call::RetireKvno {
             handle: *handle,
             kvno,
         };
         match self.call(&call) {
             Ok(Answer::RetireKvno(result)) => result,
-            _ => Err(keyd::Error::Unavailable),
+            _ => Err(keyd_types::Error::Unavailable),
         }
     }
 
     /// docs/10 §7 `destroy_key_set` (Role::Admin). Spec: docs/50 §3.4; A-35.
-    pub fn destroy_key_set(&mut self, handle: &KeyHandle) -> Result<(), keyd::Error> {
+    pub fn destroy_key_set(&mut self, handle: &KeyHandle) -> Result<(), keyd_types::Error> {
         match self.call(&Call::DestroyKeySet { handle: *handle }) {
             Ok(Answer::DestroyKeySet(result)) => result,
-            _ => Err(keyd::Error::Unavailable),
+            _ => Err(keyd_types::Error::Unavailable),
         }
     }
 
     /// docs/10 §7א `describe_config` (Kdc, Ldap). Spec: docs/50 §3.4, §7.5.
-    pub fn describe_config(&mut self) -> Result<ConfigDescription, keyd::Error> {
+    pub fn describe_config(&mut self) -> Result<ConfigDescription, keyd_types::Error> {
         match self.call(&Call::DescribeConfig) {
             Ok(Answer::DescribeConfig(result)) => result,
-            _ => Err(keyd::Error::Unavailable),
+            _ => Err(keyd_types::Error::Unavailable),
         }
     }
 
     /// docs/10 §7א `ping` (every role). Spec: docs/50 §3.4, §7.5.
-    pub fn ping(&mut self) -> Result<(), keyd::Error> {
+    pub fn ping(&mut self) -> Result<(), keyd_types::Error> {
         match self.call(&Call::Ping) {
             Ok(Answer::Ping(result)) => result,
-            _ => Err(keyd::Error::Unavailable),
+            _ => Err(keyd_types::Error::Unavailable),
         }
     }
 }
 
 /// The keyd custody of the kdc daemon: [`KeydClient`] behind
-/// `kdc::KeyCustody`, with keyd's non-secret configuration fetched once
+/// `KeyCustody`, with keyd's non-secret configuration fetched once
 /// (`describe_config`) when it is built.
 ///
 /// Spec: docs/50 §3.4, §7.5 step 4 ("`DescribeConfig` from keyd …
@@ -553,7 +553,7 @@ impl<C: Connector> IpcKeyd<C> {
     /// keyd's error (or `Unavailable`) when keyd does not answer it — the
     /// kdc daemon then does not start (fail closed, docs/50 §7.5).
     /// Spec: docs/50 §7.5 step 4.
-    pub fn connect(mut client: KeydClient<C>) -> Result<Self, keyd::Error> {
+    pub fn connect(mut client: KeydClient<C>) -> Result<Self, keyd_types::Error> {
         let description = client.describe_config()?;
         Ok(IpcKeyd {
             client,
@@ -643,7 +643,7 @@ impl<C: Connector> KeyCustody for IpcKeyd<C> {
         error: &KrbError,
         padata: &[PaData],
         _now: &KerberosTime,
-    ) -> Result<EncryptedData, keyd::Error> {
+    ) -> Result<EncryptedData, keyd_types::Error> {
         self.client.seal_fast_error(conversation, error, padata)
     }
 }

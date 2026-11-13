@@ -35,12 +35,12 @@
 use dtyp::{Sid, SECURITY_NT_AUTHORITY};
 use kdc::{
     AccountKind, AccountState, ArmorPolicy, AuditEvent, ClientAccount, InMemoryAccounts, Kdc,
-    KdcConfig, KdcReply, KeyCustody, LocalKeyd, Peer, PolicyInputs, RateLimiter, ServiceAccount,
-    Transport,
+    KdcConfig, KdcReply, KeyCustody, Peer, PolicyInputs, RateLimiter, ServiceAccount, Transport,
 };
 use keyd::{
-    AuditRecord, CallerId, ConfigDescription, EntropyError, EntropySource, InMemoryKeyStore,
-    KeyHandle, KeyPurpose, Keyd, KeydConfig, PrincipalBinding, PrincipalId, Role, TicketPolicy,
+    AuditRecord, CallerId, ConfigDescription, EncTypeId, EntropyError, EntropySource,
+    InMemoryKeyStore, KeyHandle, KeyPurpose, Keyd, KeydConfig, LocalKeyd, PrincipalBinding,
+    PrincipalId, Role, TicketPolicy,
 };
 use krb_crypto::{EncType, KeyUsage, ProtocolKey};
 use krb_proto::constants::{
@@ -532,7 +532,10 @@ impl Setup {
     /// Two AES enctypes (aes256 preferred), RFC 4120 §8.2 default policy.
     pub fn new() -> Self {
         let mut keyd = KeydConfig::new(realm());
-        keyd.enctypes = vec![EncType::Aes256CtsHmacSha196, EncType::Aes128CtsHmacSha196];
+        keyd.enctypes = vec![
+            EncTypeId::Aes256CtsHmacSha196,
+            EncTypeId::Aes128CtsHmacSha196,
+        ];
         Setup {
             keyd,
             kdc: KdcConfig::new(realm(), KRBTGT),
@@ -620,7 +623,12 @@ impl Fixture {
         )
         .unwrap();
         let n = now();
-        let enctypes = keyd.config().enctypes.clone();
+        let enctypes: Vec<EncType> = keyd
+            .config()
+            .enctypes
+            .iter()
+            .map(|e| EncType::from_number(e.number()).unwrap())
+            .collect();
         for (handle, binding, key) in [
             (KRBTGT, krbtgt_name(), KRBTGT_KEY),
             (SERVICE, service_name(), SERVICE_KEY),

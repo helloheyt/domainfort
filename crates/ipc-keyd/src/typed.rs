@@ -29,7 +29,7 @@ use crate::wire::{
 };
 use core::fmt;
 use ipc::{DerBlob, Secret};
-use keyd::{
+use keyd_types::{
     ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof, ConfigDescription, CtxId,
     DualControlToken, FastArmor, FastConversation, IssueError, KeyHandle, Kvno, Operation,
     PrincipalBinding, ServiceContext, TgsRepParts, TgsTicketTemplate, TgtContext,
@@ -656,27 +656,27 @@ pub enum Answer {
     /// Spec: docs/10 §5.
     IssueTgsRep(Result<TgsRepParts, IssueError>),
     /// Spec: docs/10 §5א.
-    SealFastError(Result<EncryptedData, keyd::Error>),
+    SealFastError(Result<EncryptedData, keyd_types::Error>),
     /// Spec: docs/10 §5ב.
     OpenAndVerifyServiceTicket(Result<ServiceContext, AuthnError>),
     /// Spec: docs/10 §6.
-    SetSecret(Result<Kvno, keyd::Error>),
+    SetSecret(Result<Kvno, keyd_types::Error>),
     /// Spec: docs/10 §6.
-    VerifySecret(Result<(), keyd::Error>),
+    VerifySecret(Result<(), keyd_types::Error>),
     /// Spec: docs/10 §7.
-    CreateKey(Result<Kvno, keyd::Error>),
+    CreateKey(Result<Kvno, keyd_types::Error>),
     /// Spec: docs/10 §7.
-    RotateKey(Result<Kvno, keyd::Error>),
+    RotateKey(Result<Kvno, keyd_types::Error>),
     /// Spec: docs/10 §7.
-    RotateKrbtgt(Result<Kvno, keyd::Error>),
+    RotateKrbtgt(Result<Kvno, keyd_types::Error>),
     /// Spec: docs/10 §7.
-    RetireKvno(Result<(), keyd::Error>),
+    RetireKvno(Result<(), keyd_types::Error>),
     /// Spec: docs/10 §7.
-    DestroyKeySet(Result<(), keyd::Error>),
+    DestroyKeySet(Result<(), keyd_types::Error>),
     /// Spec: docs/10 §7א.
-    DescribeConfig(Result<ConfigDescription, keyd::Error>),
+    DescribeConfig(Result<ConfigDescription, keyd_types::Error>),
     /// Spec: docs/10 §7א.
-    Ping(Result<(), keyd::Error>),
+    Ping(Result<(), keyd_types::Error>),
 }
 
 /// A success payload, or keyd's error carried by `failure`.

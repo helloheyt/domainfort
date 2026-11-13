@@ -105,7 +105,6 @@
 
 use crate::accounts::{AccountSource, ClientAccount, NamedPrincipal};
 use crate::audit::{AuditReason, AuditSink};
-use crate::custody::KeyCustody;
 use crate::etype::negotiate;
 use crate::fast::{
     armor_refusal, armored_request, check_cookie, cookie_padata, fx_fast_padata, fx_fast_reply,
@@ -123,7 +122,9 @@ use crate::options::{asks_unsupported_operation, delegation_flags, FlagRequests}
 use crate::time::seconds;
 use crate::transport::Peer;
 use core::time::Duration;
-use keyd::{ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof, KeyPurpose};
+use keyd_types::{
+    ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof, KeyCustody, KeyPurpose,
+};
 use krb_proto::constants::{
     FX_FAST_ARMOR_AP_REQUEST, KDC_ERR_BADOPTION, KDC_ERR_CLIENT_REVOKED,
     KDC_ERR_C_PRINCIPAL_UNKNOWN, KDC_ERR_ETYPE_NOSUPP, KDC_ERR_POLICY, KDC_ERR_PREAUTH_FAILED,

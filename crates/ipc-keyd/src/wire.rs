@@ -9,7 +9,7 @@
 //! | `KeyHandle` | 16-octet `PrincipalId` ‖ purpose `u8` (closed table) |
 //! | `ExchangeId` / `CtxId` / `ArmorId` / `ServiceCtxId` | `TOKEN_ID_LENGTH` octets |
 //! | `Kvno`, `nonce`, flags (`TicketFlags`, 32 bits) | `u32` |
-//! | `EncType` | `u8` = the etype number, closed table of krb-crypto |
+//! | `EncTypeId` | `u8` = the etype number, closed table of keyd-types (= krb-crypto's, pinned in keyd) |
 //! | Kerberos structures (`PA-DATA`, `AP-REQ`, `KrbFastArmoredReq`, `KrbFastReq`, `KRB-ERROR`, `Ticket`, `EncryptedData`, `PrincipalName`) | [`DerBlob`], decoded by `krb-proto` after the ipc layer |
 //! | `Realm` | its KerberosString octets, checked by `krb-proto` after the ipc layer |
 //! | `KerberosTime` | [`WireTime`]: year `u16` ‖ month ‖ day ‖ hour ‖ minute ‖ second (`u8` each), checked by `krb-proto` after the ipc layer |
@@ -36,11 +36,11 @@ use crate::channel::{
     MAX_SEAL_PADATA, MAX_SECRET,
 };
 use ipc::{DerBlob, Error, MessageSet, Payload, Reader, Result, Secret, Writer};
-use keyd::{
-    ArmorId, AuthnError, CtxId, DualControlToken, ExchangeId, FastConversation, IssueError,
-    KeyHandle, KeyPurpose, Kvno, PrincipalId, ServiceCtxId, TicketPolicy, TOKEN_ID_LENGTH,
+use keyd_types::{
+    ArmorId, AuthnError, CtxId, DualControlToken, EncTypeId, ExchangeId, FastConversation,
+    IssueError, KeyHandle, KeyPurpose, Kvno, PrincipalId, ServiceCtxId, TicketPolicy,
+    TOKEN_ID_LENGTH,
 };
-use krb_crypto::EncType;
 use krb_proto::{KerberosFlags, TicketFlags};
 
 // ===========================================================================
@@ -89,17 +89,18 @@ fn read_token(reader: &mut Reader<'_>) -> Result<[u8; TOKEN_ID_LENGTH]> {
     reader.read_array()
 }
 
-/// `EncType` as one octet: its etype number, from krb-crypto's closed table
-/// (17-20). Spec: docs/50 §3.3 ("enum = `u8` from a closed table"); docs/10
-/// §1 (no weak variant is expressible); RFC 3962 §7; RFC 8009 §7.
-fn write_enctype(writer: &mut Writer, enctype: EncType) -> Result<()> {
+/// `EncTypeId` as one octet: its etype number, from keyd-types' closed table
+/// (17-20; the same as krb-crypto's, D182 / A-63). Spec: docs/50 §3.3
+/// ("enum = `u8` from a closed table"); docs/10 §1 (no weak variant is
+/// expressible); RFC 3962 §7; RFC 8009 §7.
+fn write_enctype(writer: &mut Writer, enctype: EncTypeId) -> Result<()> {
     let code = u8::try_from(enctype.number()).map_err(|_| Error::UnknownCode)?;
     writer.write_enum(code)
 }
 
 /// Spec: docs/50 §3.3; docs/10 §1.
-fn read_enctype(reader: &mut Reader<'_>) -> Result<EncType> {
-    reader.read_enum(|code| EncType::from_number(i32::from(code)).ok())
+fn read_enctype(reader: &mut Reader<'_>) -> Result<EncTypeId> {
+    reader.read_enum(|code| EncTypeId::from_number(i32::from(code)))
 }
 
 /// `TicketFlags` as its 32 bits. Every 32-bit value is a KerberosFlags value
@@ -349,7 +350,7 @@ pub struct WireAsTemplate {
     /// Requested ticket flags.
     pub flags: TicketFlags,
     /// Session-key encryption type.
-    pub session_enctype: EncType,
+    pub session_enctype: EncTypeId,
     /// The AS-REQ nonce.
     pub nonce: u32,
 }
@@ -557,7 +558,7 @@ pub struct WireTgsTemplate {
     /// Requested ticket flags.
     pub flags: TicketFlags,
     /// Session-key encryption type.
-    pub session_enctype: EncType,
+    pub session_enctype: EncTypeId,
     /// The TGS-REQ nonce.
     pub nonce: u32,
 }
@@ -1192,7 +1193,7 @@ pub struct WireConfigDescription {
     /// The realm, KerberosString octets.
     pub realm: Vec<u8>,
     /// The encryption types, in keyd's preference order.
-    pub enctypes: Vec<EncType>,
+    pub enctypes: Vec<EncTypeId>,
     /// The acceptable clock skew in seconds.
     pub clock_skew_secs: u32,
     /// The one-time token lifetime in seconds.
@@ -1244,7 +1245,7 @@ impl Payload for WireConfigDescription {
     }
 }
 
-/// Wire codes of `keyd::AuthnError`, one-to-one (closed table; project
+/// Wire codes of `keyd_types::AuthnError`, one-to-one (closed table; project
 /// choice). Spec: docs/10 §9 (A-26 classes; `Unavailable`, A-56).
 const fn authn_error_code(error: AuthnError) -> u8 {
     match error {
@@ -1270,7 +1271,7 @@ const fn authn_error_from_code(code: u8) -> Option<AuthnError> {
     }
 }
 
-/// Wire codes of `keyd::IssueError`, one-to-one (closed table; project
+/// Wire codes of `keyd_types::IssueError`, one-to-one (closed table; project
 /// choice). Spec: docs/10 §9.
 const fn issue_error_code(error: IssueError) -> u8 {
     match error {
@@ -1290,22 +1291,22 @@ const fn issue_error_from_code(code: u8) -> Option<IssueError> {
     }
 }
 
-/// Wire codes of `keyd::Error`, one-to-one (closed table; project choice).
+/// Wire codes of `keyd_types::Error`, one-to-one (closed table; project choice).
 /// Spec: docs/10 §9.
-const fn error_code(error: keyd::Error) -> u8 {
+const fn error_code(error: keyd_types::Error) -> u8 {
     match error {
-        keyd::Error::Denied => 0x01,
-        keyd::Error::Unavailable => 0x02,
-        keyd::Error::RateLimited => 0x03,
+        keyd_types::Error::Denied => 0x01,
+        keyd_types::Error::Unavailable => 0x02,
+        keyd_types::Error::RateLimited => 0x03,
     }
 }
 
 /// Spec: docs/10 §9.
-const fn error_from_code(code: u8) -> Option<keyd::Error> {
+const fn error_from_code(code: u8) -> Option<keyd_types::Error> {
     match code {
-        0x01 => Some(keyd::Error::Denied),
-        0x02 => Some(keyd::Error::Unavailable),
-        0x03 => Some(keyd::Error::RateLimited),
+        0x01 => Some(keyd_types::Error::Denied),
+        0x02 => Some(keyd_types::Error::Unavailable),
+        0x03 => Some(keyd_types::Error::RateLimited),
         _ => None,
     }
 }
@@ -1357,7 +1358,7 @@ pub enum KeydReply {
     /// Spec: docs/10 §9; A-56.
     IssueFailure(IssueError),
     /// Spec: docs/10 §9.
-    Failure(keyd::Error),
+    Failure(keyd_types::Error),
 }
 
 impl MessageSet for KeydReply {

@@ -202,13 +202,13 @@ pub mod reply_kind {
     pub const DESCRIBE_CONFIG: u8 = ok(rq::DESCRIBE_CONFIG);
     /// `()`. Spec: docs/10 §7א.
     pub const PING: u8 = ok(rq::PING);
-    /// A refusal of an authentication step: `keyd::AuthnError`.
+    /// A refusal of an authentication step: `keyd_types::AuthnError`.
     /// Spec: docs/10 §9; A-26; A-56.
     pub const AUTHN_FAILURE: u8 = 0xF1;
-    /// A refusal of an issuance step: `keyd::IssueError`.
+    /// A refusal of an issuance step: `keyd_types::IssueError`.
     /// Spec: docs/10 §9; A-56.
     pub const ISSUE_FAILURE: u8 = 0xF2;
-    /// A refusal of any other operation: `keyd::Error`.
+    /// A refusal of any other operation: `keyd_types::Error`.
     /// Spec: docs/10 §9.
     pub const FAILURE: u8 = 0xF3;
 

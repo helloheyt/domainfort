@@ -24,7 +24,6 @@
 use crate::accounts::{AccountSource, AccountSourceError, NamedPrincipal};
 use crate::audit::{ArmorAudit, AuditEvent, AuditOutcome, AuditReason, AuditSink, Exchange};
 use crate::config::{ConfigError, KdcConfig, MAX_REQUEST_LEN};
-use crate::custody::KeyCustody;
 use crate::fast::armored_error_e_data;
 use crate::gate::{PolicyInputs, RateLimiter};
 use crate::krb_error::{error_message, krb_error, ErrorContext};
@@ -33,7 +32,7 @@ use crate::names::tgs_name;
 use crate::retransmit::{RetransmitCache, StoredReply};
 use crate::time::seconds;
 use crate::transport::{FramingError, KdcReply, Peer, Transport};
-use keyd::{ArmorId, CtxId, FastConversation, IssueError};
+use keyd_types::{ArmorId, CtxId, FastConversation, IssueError, KeyCustody};
 use krb_proto::constants::{
     KDC_ERR_BAD_PVNO, KDC_ERR_CANNOT_POSTDATE, KDC_ERR_NEVER_VALID, KDC_ERR_POLICY,
     KDC_ERR_SVC_UNAVAILABLE, KRB_AP_ERR_MSG_TYPE, KRB_ERR_FIELD_TOOLONG, KRB_ERR_GENERIC,

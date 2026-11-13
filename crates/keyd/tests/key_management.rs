@@ -361,9 +361,9 @@ fn rotate_service_key() {
 fn set_secret_derives_every_configured_enctype() {
     let mut c = config();
     c.enctypes = vec![
-        EncType::Aes256CtsHmacSha196,
-        EncType::Aes128CtsHmacSha196,
-        EncType::Aes128CtsHmacSha256128,
+        keyd::EncTypeId::Aes256CtsHmacSha196,
+        keyd::EncTypeId::Aes128CtsHmacSha196,
+        keyd::EncTypeId::Aes128CtsHmacSha256128,
     ];
     let mut f = Fixture::with_config(c);
     for enctype in [

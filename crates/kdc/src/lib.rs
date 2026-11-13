@@ -93,7 +93,8 @@
 //!   (docs/47 R47-11); the in-memory [`InMemoryAccounts`] serves tests and
 //!   fuzzing.
 //! - The keyd IPC client (D34) implementing [`KeyCustody`] — reporting every
-//!   transport failure as `Unavailable` (docs/50 task P5).
+//!   transport failure as `Unavailable` (docs/50 task P5): ipc-keyd's
+//!   `IpcKeyd`. The in-process implementation is `keyd::LocalKeyd`.
 //! - Which group SID the deployment's `pdp::mandatory_fast_rules` names as
 //!   the bootstrap set (Q-130, with P-10).
 //!
@@ -164,8 +165,10 @@
 //! A-32, A-33, A-39, A-42, A-43, A-56, P-10), docs/questions/Q-120..Q-127,
 //! Q-130, Q-145, Q-150, Q-217, Q-222, Q-240; docs/50 (R50-6, R50-8, §3.4,
 //! §3.5, §3.7, §7.5); and the source and documentation of this project's own
-//! crates keyd, pdp, krb-proto and dtyp. No other implementation was
-//! consulted or recalled.
+//! crates keyd, keyd-types, pdp, krb-proto and dtyp. The custody seam moved
+//! to keyd-types and `LocalKeyd` to keyd (D182; decision A-63,
+//! docs/questions/Q-245 item 3) — code moved, not rewritten. No other
+//! implementation was consulted or recalled.
 //!
 //! Spec: RFC 4120 §3.1, §3.3, §7.2; RFC 6113 §5.4; docs/30; docs/48;
 //! main-session decisions 1-15.
@@ -174,7 +177,6 @@ mod accounts;
 mod as_exchange;
 pub mod audit;
 mod config;
-mod custody;
 mod etype;
 mod fast;
 pub mod gate;
@@ -198,9 +200,14 @@ pub use config::{
     ConfigError, KdcConfig, DEFAULT_RETRANSMIT_CAPACITY, DEFAULT_RETRANSMIT_MAX_OCTETS,
     DEFAULT_UDP_MAX_REPLY_LEN, MAX_REQUEST_LEN, MAX_RETRANSMIT_CAPACITY, MAX_RETRANSMIT_OCTETS,
 };
-pub use custody::{KeyCustody, LocalKeyd};
+// The custody seam is keyd-types' (moved from this crate, D182; decision
+// A-63), re-exported so that `kdc::KeyCustody` keeps naming it. Its
+// in-process implementation, `LocalKeyd`, is keyd's (`keyd::LocalKeyd`); the
+// IPC one is ipc-keyd's `IpcKeyd`. This crate depends only on keyd-types and
+// so links no crypto code.
 pub use gate::{PolicyInputs, RateLimiter};
 pub use kdc::Kdc;
+pub use keyd_types::KeyCustody;
 pub use transport::{
     tcp_decode_frame, tcp_encode_frame, FramingError, KdcReply, Peer, TcpFrame, Transport,
     TCP_LENGTH_PREFIX_LEN,

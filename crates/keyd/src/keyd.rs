@@ -20,6 +20,7 @@ use crate::authz::{
     purpose_permitted, role_permits, startup_hold_down_applies, CallerId, HandleSlot, Operation,
 };
 use crate::config::KeydConfig;
+use crate::enctype::to_crypto;
 use crate::entropy::{EntropySource, OsEntropy};
 use crate::error::{ConfigError, Deny, Internal};
 use crate::fast_armor::ArmorEntry;
@@ -45,6 +46,11 @@ use zeroize::Zeroizing;
 /// Spec: docs/09 א (keyd), docs/10.
 pub struct Keyd<S: KeyStore, A: AuditSink, E: EntropySource = OsEntropy> {
     pub(crate) config: KeydConfig,
+    /// `config.enctypes` as the crypto profile's own type, in the same
+    /// (preference) order, converted once at construction: the configuration
+    /// carries crypto-free identifiers (D182; decision A-63) and keyd's
+    /// configuration does not change after construction.
+    pub(crate) enctypes: Vec<EncType>,
     pub(crate) store: S,
     pub(crate) audit: A,
     pub(crate) entropy: E,
@@ -147,6 +153,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         started_at: &KerberosTime,
     ) -> Result<Self, ConfigError> {
         config.validate()?;
+        let enctypes = config.enctypes.iter().copied().map(to_crypto).collect();
         let throttle = Box::new(FailureWindowThrottle::new(config.throttle));
         let startup_hold_down_until =
             startup_hold_down_until(kerberos_time_seconds(started_at), config.clock_skew_secs);
@@ -159,6 +166,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             replay: ReplayCache::new(config.replay_cache_capacity),
             preauth_throttle: FailureWindowThrottle::new(config.preauth_throttle),
             throttle,
+            enctypes,
             config,
             store,
             audit,

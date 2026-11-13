@@ -31,7 +31,7 @@
 
 use crate::options::FlagRequests;
 use crate::time::{from_seconds, seconds, till_maximum};
-use keyd::TicketPolicy;
+use keyd_types::TicketPolicy;
 use krb_proto::KerberosTime;
 
 /// What the client asked for. Spec: RFC 4120 5.4.1 (from, till, rtime).

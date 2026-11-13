@@ -29,7 +29,7 @@ use kdc::{
     AccountKind as KdcAccountKind, AccountSource, AccountSourceError, AccountState, ArmorPolicy,
     ClientAccount, ServiceAccount,
 };
-use keyd::{KeyHandle, KeyPurpose, KeydConfig, PrincipalId};
+use keyd_types::{KeyHandle, KeyPurpose, KeydConfig, PrincipalId};
 use krb_proto::{EtypeInfo2Entry, PrincipalName, Realm};
 use pdp::{
     AttrClass, ControlRightId, Dn, ObjClass, ObjClassChain, Pip, PipError, PropertySet, Resource,

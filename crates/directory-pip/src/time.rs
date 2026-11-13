@@ -10,7 +10,7 @@
 //!
 //! The 1601 epoch is not a copied constant: it is the KerberosTime
 //! 1601-01-01T00:00:00Z mapped through keyd's public seconds scale
-//! ([`keyd::kerberos_time_seconds`], seconds since 0000-01-01T00:00:00Z on
+//! ([`keyd_types::kerberos_time_seconds`], seconds since 0000-01-01T00:00:00Z on
 //! the proleptic Gregorian calendar — the calendar krb-proto validates
 //! against), as docs/47 §4.2 asks ("derive the offset from the calendar").
 //! The inverse mapping is a search over that same forward mapping, so the
@@ -20,7 +20,7 @@
 //!
 //! Spec: [MS-DTYP] 2.3.3; [MS-DRSR] 5.51; RFC 4120 5.2.3; docs/47 §4.2, §4.5.
 
-use keyd::kerberos_time_seconds;
+use keyd_types::kerberos_time_seconds;
 use krb_proto::KerberosTime;
 
 const SECONDS_PER_DAY: i64 = 86_400;
@@ -58,7 +58,7 @@ fn start_of(year: u16, month: u8) -> Option<i64> {
 
 /// The KerberosTime at `total` seconds on keyd's scale, or `None` if it is
 /// before 0000-01-01 or after 9999-12-31T23:59:59Z. Inverse of
-/// [`keyd::kerberos_time_seconds`]: the year is the last one whose 1 January
+/// [`keyd_types::kerberos_time_seconds`]: the year is the last one whose 1 January
 /// is not after `total` (binary search), the month the last whose first day
 /// is not after it, and the rest whole days, hours, minutes and seconds.
 /// Spec: RFC 4120 5.2.3.

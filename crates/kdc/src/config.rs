@@ -3,7 +3,7 @@
 //!
 //! Ticket policy (allowed flags, lifetimes), the clock skew and the AES
 //! encryption types are NOT configured here: they are keyd's — the KDC reads
-//! them from keyd's non-secret [`keyd::ConfigDescription`] (over IPC, the
+//! them from keyd's non-secret [`keyd_types::ConfigDescription`] (over IPC, the
 //! answer of `describe_config`, docs/50 §3.4, §7.5 step 4) — so the KDC can
 //! never plan a ticket that keyd's template validation would not accept on
 //! the same terms.
@@ -12,7 +12,7 @@
 //! docs/50 §3.4, §7.5.
 
 use crate::krb_error::{krb_error, ErrorContext};
-use keyd::{ConfigDescription, KeyHandle, KeyPurpose};
+use keyd_types::{ConfigDescription, KeyHandle, KeyPurpose};
 use krb_proto::constants::KRB_ERR_RESPONSE_TOO_BIG;
 use krb_proto::limits::MAX_MESSAGE_LEN;
 use krb_proto::{KerberosTime, Realm};
@@ -150,8 +150,6 @@ pub enum ConfigError {
     UdpReplyLimit,
     /// A retransmit-cache bound is zero or above its memory bound.
     RetransmitBounds,
-    /// The key-custody caller is not the `Kdc` role (docs/10 §2).
-    CustodyRole,
 }
 
 impl core::fmt::Display for ConfigError {
@@ -161,7 +159,6 @@ impl core::fmt::Display for ConfigError {
             ConfigError::KrbtgtPurpose => "krbtgt handle does not have purpose Krbtgt",
             ConfigError::UdpReplyLimit => "invalid UDP reply limit",
             ConfigError::RetransmitBounds => "invalid retransmit cache bounds",
-            ConfigError::CustodyRole => "key custody caller is not the Kdc role",
         })
     }
 }

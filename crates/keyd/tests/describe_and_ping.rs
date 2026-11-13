@@ -12,8 +12,7 @@
 mod common;
 
 use common::*;
-use keyd::{AuditOutcome, AuditReason, CallerId, ConfigDescription, Error, Operation};
-use krb_crypto::EncType;
+use keyd::{AuditOutcome, AuditReason, CallerId, ConfigDescription, EncTypeId, Error, Operation};
 
 /// The last audit record: `op` by `caller`, with `result` / `reason`, and no
 /// key reference (neither operation takes a handle).
@@ -39,7 +38,10 @@ fn assert_record(f: &Fixture, op: Operation, caller: &CallerId, result: AuditOut
 #[test]
 fn describe_config_returns_the_non_secret_configuration() {
     let mut c = config();
-    c.enctypes = vec![EncType::Aes256CtsHmacSha196, EncType::Aes128CtsHmacSha196];
+    c.enctypes = vec![
+        EncTypeId::Aes256CtsHmacSha196,
+        EncTypeId::Aes128CtsHmacSha196,
+    ];
     c.clock_skew_secs = 240;
     c.token_lifetime_secs = 20;
     c.s2k_params = Some([0x00, 0x00, 0x80, 0x00]);
@@ -68,7 +70,10 @@ fn describe_config_returns_the_non_secret_configuration() {
         assert_eq!(d_realm, realm());
         assert_eq!(
             enctypes,
-            [EncType::Aes256CtsHmacSha196, EncType::Aes128CtsHmacSha196]
+            [
+                EncTypeId::Aes256CtsHmacSha196,
+                EncTypeId::Aes128CtsHmacSha196
+            ]
         );
         assert_eq!(clock_skew_secs, 240);
         assert_eq!(token_lifetime_secs, 20);

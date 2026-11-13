@@ -471,7 +471,7 @@ fn tgs_template_bad_template() {
         ),
         (
             "unconfigured enctype",
-            Box::new(|t| t.session_enctype = EncType::Aes128CtsHmacSha196),
+            Box::new(|t| t.session_enctype = keyd::EncTypeId::Aes128CtsHmacSha196),
             AuditReason::TemplateEncType,
         ),
     ];

@@ -1,7 +1,10 @@
 #![forbid(unsafe_code)]
 //! `ipc-keyd`: the keyd channel (`keyd.sock`) — its message set, the
-//! server-side dispatcher and the synchronous client that implements
-//! `kdc::KeyCustody` (docs/50 §3, §10 task P5; decision A-58).
+//! server-side request decoding and answer encoding, and the synchronous
+//! client that implements `KeyCustody` (docs/50 §3, §10 task P5; decision
+//! A-58). The dispatcher that calls the real keyd (`execute`, `dispatch`) is
+//! the `ipc-keyd-server` crate: this crate depends only on the crypto-free
+//! `keyd-types`, never on keyd or krb-crypto (D182; decision A-63).
 //!
 //! # Layers
 //!
@@ -10,7 +13,7 @@
 //! | channel | [`channel`] | magic, exact version, per-direction body bounds, per-field bounds, the closed kind tables (none equals `ipc::REFUSED_KIND`) |
 //! | wire | [`wire`] | fixed-order fields through `ipc` (lengths, markers, closed enum tables, no trailing octet); Kerberos values stay opaque DER |
 //! | typed | [`typed`] | every Kerberos value through `krb-proto`'s strict decoder; passwords and salt as UTF-8 |
-//! | server | [`server`] | [`dispatch`]: decode, call keyd with the **transport's** caller and the **daemon's** clock, encode |
+//! | server | [`server`] | [`decode_request`] / [`encode_answer`]; `ipc_keyd_server::dispatch` calls keyd with the **transport's** caller and the **daemon's** clock between them |
 //! | client | [`client`] | [`KeydClient`] / [`IpcKeyd`]: server-uid check, deadline, strict reply decoding, transport failure → `Unavailable` |
 //! | socket | `unix` | [`UnixConnector`]: blocking Unix stream, peer uid via rustix (Linux; elsewhere fail closed) |
 //!
@@ -55,15 +58,16 @@
 //! Written only from this project's decided design, opened in-session:
 //! docs/50 (§1 R50-3..R50-8; §3.1-§3.7; §8.2; §9; §10; closing decision
 //! A-58), docs/10 (§1-§12), docs/questions Q-217 and Q-222 (A-56), Q-225
-//! (A-59), Q-240 (A-62), PENDING-OWNER (A-56..A-62, P-1, P-2, P-12); the code
-//! of this project's crates ipc, keyd, kdc, krb-proto and krb-crypto; and the
+//! (A-59), Q-240 (A-62), Q-245 (A-63), PENDING-OWNER (A-56..A-63, P-1, P-2,
+//! P-12); the code of this project's crates ipc, keyd, keyd-types, kdc,
+//! krb-proto and krb-crypto; and the
 //! docs.rs API pages of rustix 1.1.6 and zeroize 1.9.1 (P-2). The wire layout
 //! and every name come from docs/50 §3.3-§3.4 and keyd's API. No other
 //! implementation, serializer or RPC framework was consulted or recalled
 //! (AGENTS.md §1-3).
 //!
 //! Spec: docs/50 §3, §10 (P5); R50-3, R50-4, R50-5, R50-7, R50-8; docs/10;
-//! A-56; A-59; A-62.
+//! A-56; A-59; A-62; D182; A-63.
 
 pub mod channel;
 pub mod client;
@@ -78,7 +82,7 @@ pub use client::{
     ClientConfigError, Connection, Connector, IpcKeyd, KeydClient, TransportError, Unserved,
     DEFAULT_DEADLINE,
 };
-pub use server::{decode_request, dispatch, encode_answer, execute, Dispatch, Rejection};
+pub use server::{decode_request, encode_answer, Rejection};
 pub use typed::{Answer, Call, ConversionError, Password, TgsFast};
 #[cfg(unix)]
 pub use unix::{UnixConnection, UnixConnector};

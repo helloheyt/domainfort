@@ -46,7 +46,7 @@ use dtyp::{
     ACL_REVISION_DS, SECURITY_NT_AUTHORITY,
 };
 use kdc::NamedPrincipal;
-use keyd::KeydConfig;
+use keyd_types::KeydConfig;
 use krb_proto::{KerberosTime, Realm};
 use parse_ldap::{
     decode_message, encode_message, AttributeValueAssertion, DecodeOptions, DerefAliases,

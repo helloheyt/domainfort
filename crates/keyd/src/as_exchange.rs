@@ -27,6 +27,7 @@
 
 use crate::audit::{AuditKeyRef, AuditReason, AuditSink};
 use crate::authz::{CallerId, HandleSlot, Operation};
+use crate::enctype::to_crypto;
 use crate::entropy::EntropySource;
 use crate::error::{AuthnError, Deny, Internal, IssueError};
 use crate::keyd::{draw, new_random_key, open, seal, AuditFields, Keyd};
@@ -39,33 +40,19 @@ use crate::tokens::{ArmorId, ExchangeId, TokenRefusal, TOKEN_ID_LENGTH};
 use crate::usage::{
     AS_REP_ENC_PART, AS_REQ_PA_ENC_TIMESTAMP, KEY_USAGE_ENC_CHALLENGE_CLIENT, TICKET_ENC_PART,
 };
+use keyd_types::{AsRepParts, AsTicketTemplate, AuthnProof};
 use krb_crypto::{EncType, ProtocolKey};
 use krb_proto::constants::{DOMAIN_X500_COMPRESS, PA_ENCRYPTED_CHALLENGE, PA_ENC_TIMESTAMP};
 use krb_proto::{
     EncAsRepPart, EncKdcRepPart, EncTicketPart, EncryptedChallenge, EncryptedData, EncryptionKey,
-    KerberosTime, KeyValue, LastReq, PaData, PaEncTimestamp, PaEncTsEnc, PrincipalName, Realm,
-    Ticket, TicketFlags, TransitedEncoding,
+    KerberosTime, KeyValue, LastReq, PaData, PaEncTimestamp, PaEncTsEnc, Ticket, TicketFlags,
+    TransitedEncoding,
 };
 use zeroize::Zeroizing;
 
-/// Proof that pre-authentication succeeded, returned by `verify_preauth`
-/// and consumed by `issue_as_rep`. It binds the issuance to this exchange,
-/// this caller and this client; it is short-lived and single-use. It carries
-/// no decrypted plaintext (no decryption oracle, docs/10 §4).
-///
-/// The expiry is tracked inside keyd (docs/10 `expires: Instant`).
-///
-/// Spec: docs/10 §4 (`struct AuthnProof`), §8, D36.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthnProof {
-    /// The one-time exchange token.
-    pub exchange_id: ExchangeId,
-    /// The pre-authenticated principal.
-    pub client: PrincipalId,
-    /// The authentication time (the caller's `now` at pre-authentication;
-    /// RFC 4120 5.3 authtime of an AS ticket is the KDC's current time).
-    pub authtime: KerberosTime,
-}
+// The argument and result types of this exchange (`AuthnProof`,
+// `AsTicketTemplate`, `AsRepParts`) live in the crypto-free keyd-types crate
+// (D182; decision A-63) and are re-exported at the crate root.
 
 /// What keyd remembers about a live AuthnProof (never leaves keyd).
 pub(crate) struct ProofEntry {
@@ -86,61 +73,6 @@ pub(crate) struct ProofEntry {
 struct PreauthKey {
     enctype: EncType,
     kvno: Kvno,
-}
-
-/// The KDC's request for a TGT. keyd fills in the session key, the realm,
-/// authtime, transited and the INITIAL / PRE-AUTHENT flags itself.
-///
-/// Spec: docs/10 §4 (`struct TicketTemplate`); RFC 4120 5.3, 5.4.2.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AsTicketTemplate {
-    /// The client; must be the principal the proof is bound to.
-    pub client: PrincipalId,
-    /// Client realm; must be the configured realm (single realm, phase 1).
-    pub crealm: Realm,
-    /// Client name (RFC 4120 5.3 cname). Must identify the principal name
-    /// the client key set is bound to (realm + name-string, RFC 4120 6.2;
-    /// docs/questions/Q-040, A-19) — otherwise `Denied`. Canonicalization
-    /// (case, aliases, enterprise names) is the KDC's job before the call.
-    pub cname: PrincipalName,
-    /// Server name; must be this realm's TGS name, NT-SRV-INST ("krbtgt",
-    /// realm), because the ticket is sealed under the krbtgt key
-    /// (RFC 4120 7.3).
-    pub sname: PrincipalName,
-    /// Requested starttime; must be within the clock skew of now (no
-    /// postdating). `None` = authtime is the start (RFC 4120 5.3).
-    pub starttime: Option<KerberosTime>,
-    /// Expiration time.
-    pub endtime: KerberosTime,
-    /// Renew-till; present exactly when RENEWABLE is requested.
-    pub renew_till: Option<KerberosTime>,
-    /// Requested flags; must lie in the configured allowed mask.
-    pub flags: TicketFlags,
-    /// Session-key encryption type; must be configured (I5).
-    pub session_enctype: EncType,
-    /// The AS-REQ nonce, echoed in EncASRepPart (RFC 4120 5.4.2).
-    pub nonce: u32,
-}
-
-/// The sealed AS-REP parts: the ticket (sealed under krbtgt), the enc-part
-/// (sealed under the client key, or under the strengthened reply key when
-/// armored) and, when armored, the enc-fast-rep. The KDC assembles the
-/// AS-REP (and, when armored, its PA-FX-FAST padata around `fast_rep`).
-///
-/// Spec: docs/10 §4 (`struct AsRep { ticket: Sealed, enc_part: Sealed }`);
-/// docs/48 §2.3 (`fast_rep: Option<Sealed>`), §4.1 A14; RFC 4120 5.4.2; RFC
-/// 6113 5.4.3.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AsRepParts {
-    /// `ticket [5] Ticket`.
-    pub ticket: Ticket,
-    /// `enc-part [6] EncryptedData` (EncASRepPart, key usage 3, client
-    /// kvno).
-    pub enc_part: EncryptedData,
-    /// `enc-fast-rep` of the KrbFastArmoredRep (the KrbFastResponse sealed
-    /// in the armor key, key usage 52): `Some` exactly when the issuance was
-    /// armored. Spec: RFC 6113 5.4.3; docs/48 §2.3.
-    pub fast_rep: Option<EncryptedData>,
 }
 
 impl ProofEntry {
@@ -341,7 +273,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             .map_err(|_| Deny::denied(AuditReason::MalformedInput))?;
         let enctype = EncType::from_number(enc.etype)
             .ok()
-            .filter(|e| self.config.supports(*e))
+            .filter(|e| self.enctypes.contains(e))
             .ok_or(Deny::denied(AuditReason::UnsupportedEncType))?;
         let current = self
             .store
@@ -427,7 +359,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             return Err(Deny::denied(AuditReason::KvnoMismatch));
         }
         let (enctype, long_term) =
-            challenge_long_term_key(current, armor.requested_etypes(), &self.config.enctypes)
+            challenge_long_term_key(current, armor.requested_etypes(), &self.enctypes)
                 .ok_or(Deny::denied(AuditReason::KeyNotFound))?;
 
         // 4. The challenge key; the cryptographic check (usage 54) — the only
@@ -572,7 +504,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         if template.crealm != *realm || template.sname != tgs_name(realm) {
             return Err(Deny::bad_template(AuditReason::TemplateNames));
         }
-        if !self.config.supports(template.session_enctype) {
+        if !self.config.enctypes.contains(&template.session_enctype) {
             return Err(Deny::bad_template(AuditReason::TemplateEncType));
         }
         let policy = &self.config.ticket_policy;
@@ -641,7 +573,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             .ok_or(Deny::denied(AuditReason::KeyNotFound))?;
 
         // Step 3: the session key.
-        let session = new_random_key(&mut self.entropy, template.session_enctype)?;
+        let session = new_random_key(&mut self.entropy, to_crypto(template.session_enctype))?;
         let session_key = EncryptionKey {
             keytype: template.session_enctype.number(),
             keyvalue: KeyValue::from_slice(session.octets()),

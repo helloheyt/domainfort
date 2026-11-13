@@ -12,8 +12,8 @@
 # §5.2, §5.4-§5.4.6, §6.1, §6.2, §7.1-§7.3; FAST, docs/48 tasks T5/T6) and
 # this project's design documents (docs/02 §3, docs/10, docs/11, docs/25
 # §3-5, docs/30, docs/45 §10, docs/48, docs/questions/PENDING-OWNER.md A-19,
-# A-22..A-27, A-32, A-33, A-39, A-42, A-43, P-10) — AGENTS.md §1-3. No other
-# implementation consulted or recalled.
+# A-22..A-27, A-32, A-33, A-39, A-42, A-43, A-63, P-10) — AGENTS.md §1-3. No
+# other implementation consulted or recalled.
 
 [package]
 name = "kdc"
@@ -29,14 +29,22 @@ publish = false
 # Typed RFC 4120 messages with strict DER (AS-REQ, TGS-REQ, AS-REP, TGS-REP,
 # KRB-ERROR, METHOD-DATA, ETYPE-INFO2).
 krb-proto = { path = "../krb-proto" }
-# Secret custody: pre-authentication, TGT verification and ticket sealing.
-keyd = { path = "../keyd" }
+# keyd's crypto-free types and the `KeyCustody` seam (pre-authentication, TGT
+# verification and ticket sealing are keyd's, called through the seam). NOT
+# keyd itself: keyd links krb-crypto, and only keyd may (D182; decision A-63,
+# docs/questions/Q-245 item 3). Checked by
+# crates/keyd-types/tests/no_crypto_dependency.rs.
+keyd-types = { path = "../keyd-types" }
 # The policy decision point (Action::KdcAs / KdcTgs).
 pdp = { path = "../pdp" }
 # SIDs for the PDP Subject built from the account record.
 dtyp = { path = "../dtyp" }
 
 [dev-dependencies]
+# TESTS ONLY: the real in-process keyd behind the KDC of the integration
+# tests (`keyd::Keyd` through `keyd::LocalKeyd`, which moved from this crate
+# to keyd by D182 / A-63).
+keyd = { path = "../keyd" }
 # TESTS ONLY (main-session decision 2). The integration tests play the Kerberos
 # CLIENT: derive the client key from the password and the ETYPE-INFO2 salt,
 # build PA-ENC-TIMESTAMP and TGS authenticators (RFC 4120 5.2.7.2, 5.5.1), and

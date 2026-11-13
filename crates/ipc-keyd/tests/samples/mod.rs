@@ -10,13 +10,12 @@
 #![allow(dead_code)] // each test binary uses a different subset
 
 use ipc_keyd::{Answer, Call, Password, TgsFast};
-use keyd::{
+use keyd_types::{
     ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof, ConfigDescription, CtxId,
-    DualControlToken, ExchangeId, FastArmor, FastConversation, IssueError, KeyHandle, KeyPurpose,
-    Kvno, PrincipalBinding, PrincipalId, ServiceContext, ServiceCtxId, TgsRepParts,
+    DualControlToken, EncTypeId, ExchangeId, FastArmor, FastConversation, IssueError, KeyHandle,
+    KeyPurpose, Kvno, PrincipalBinding, PrincipalId, ServiceContext, ServiceCtxId, TgsRepParts,
     TgsTicketTemplate, TgtContext, TicketPolicy,
 };
-use krb_crypto::EncType;
 use krb_proto::{
     ApOptions, ApReq, Checksum, EncryptedData, FastOptions, KdcOptions, KdcReqBody, KerberosString,
     KerberosTime, KrbError, KrbFastArmor, KrbFastArmoredReq, KrbFastReq, Microseconds, PaData,
@@ -164,7 +163,7 @@ pub fn as_template(full: bool) -> AsTicketTemplate {
         endtime: time(58),
         renew_till: full.then(|| time(59)),
         flags: flags(0x0080_0000),
-        session_enctype: EncType::Aes256CtsHmacSha196,
+        session_enctype: EncTypeId::Aes256CtsHmacSha196,
         nonce: 0x0102_0304,
     }
 }
@@ -176,7 +175,7 @@ pub fn tgs_template(full: bool) -> TgsTicketTemplate {
         endtime: time(57),
         renew_till: full.then(|| time(56)),
         flags: flags(0),
-        session_enctype: EncType::Aes128CtsHmacSha196,
+        session_enctype: EncTypeId::Aes128CtsHmacSha196,
         nonce: u32::MAX,
     }
 }
@@ -294,10 +293,10 @@ pub fn description(s2k: bool) -> ConfigDescription {
     ConfigDescription {
         realm: realm(),
         enctypes: vec![
-            EncType::Aes256CtsHmacSha384192,
-            EncType::Aes256CtsHmacSha196,
-            EncType::Aes128CtsHmacSha196,
-            EncType::Aes128CtsHmacSha256128,
+            EncTypeId::Aes256CtsHmacSha384192,
+            EncTypeId::Aes256CtsHmacSha196,
+            EncTypeId::Aes128CtsHmacSha196,
+            EncTypeId::Aes128CtsHmacSha256128,
         ],
         clock_skew_secs: 300,
         token_lifetime_secs: 60,
@@ -392,9 +391,9 @@ pub fn answers() -> Vec<Answer> {
         answers.push(Answer::IssueTgsRep(Err(error)));
     }
     for error in [
-        keyd::Error::Denied,
-        keyd::Error::Unavailable,
-        keyd::Error::RateLimited,
+        keyd_types::Error::Denied,
+        keyd_types::Error::Unavailable,
+        keyd_types::Error::RateLimited,
     ] {
         answers.push(Answer::SealFastError(Err(error)));
         answers.push(Answer::SetSecret(Err(error)));

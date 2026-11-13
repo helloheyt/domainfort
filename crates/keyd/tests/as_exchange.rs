@@ -433,9 +433,9 @@ fn forbidden_flags_bad_template() {
 fn unconfigured_session_enctype_bad_template() {
     let mut f = Fixture::new();
     for enctype in [
-        EncType::Aes128CtsHmacSha196,
-        EncType::Aes128CtsHmacSha256128,
-        EncType::Aes256CtsHmacSha384192,
+        keyd::EncTypeId::Aes128CtsHmacSha196,
+        keyd::EncTypeId::Aes128CtsHmacSha256128,
+        keyd::EncTypeId::Aes256CtsHmacSha384192,
     ] {
         let p = proof(&mut f);
         let mut t = as_template();

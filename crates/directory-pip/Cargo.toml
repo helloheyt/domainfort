@@ -37,9 +37,12 @@ ad-schema = { path = "../ad-schema" }
 kdc = { path = "../kdc" }
 # The Pip trait and the request model (Tier, Dn, Resource, ...).
 pdp = { path = "../pdp" }
-# keyd TYPES only (KeyHandle, KeyPurpose, PrincipalId, KeydConfig) and its
-# public KerberosTime-to-seconds mapping; no keyd operation is called.
-keyd = { path = "../keyd" }
+# keyd TYPES only (KeyHandle, KeyPurpose, PrincipalId, KeydConfig) and the
+# public KerberosTime-to-seconds mapping; no keyd operation is called. The
+# crypto-free keyd-types crate, not keyd: this crate links no crypto code
+# (D182; decision A-63). Checked by
+# crates/keyd-types/tests/no_crypto_dependency.rs.
+keyd-types = { path = "../keyd-types" }
 # Kerberos names, KerberosString, KerberosTime, ETYPE-INFO2 entries
 # (the AccountSource signature types; docs/47 §10.2).
 krb-proto = { path = "../krb-proto" }
@@ -47,6 +50,10 @@ krb-proto = { path = "../krb-proto" }
 dtyp = { path = "../dtyp" }
 
 [dev-dependencies]
+# TESTS ONLY: the real in-process keyd behind the KDC of the AS -> TGS round
+# trip (`keyd::Keyd`, `keyd::LocalKeyd`); the tests also name keyd's types
+# through keyd's re-exports (the same items as keyd-types').
+keyd = { path = "../keyd" }
 # TESTS ONLY, as for the kdc tests (main-session decision 2): the AS -> TGS
 # round trip plays the Kerberos client — derives the client key from the
 # password and the ETYPE-INFO2 salt, builds PA-ENC-TIMESTAMP and the TGS

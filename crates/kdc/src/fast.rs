@@ -19,7 +19,7 @@
 
 use crate::audit::AuditReason;
 use crate::kdc::{custody_unavailable, Refusal};
-use keyd::{AuthnError, MAX_FX_COOKIE_LENGTH};
+use keyd_types::{AuthnError, MAX_FX_COOKIE_LENGTH};
 use krb_proto::constants::{
     KDC_ERR_PREAUTH_EXPIRED, KDC_ERR_PREAUTH_FAILED, KRB_AP_ERR_REPEAT, KRB_AP_ERR_SKEW,
     KRB_AP_ERR_TKT_EXPIRED, KRB_AP_ERR_TKT_NYV, KRB_ERR_GENERIC, PA_ENCRYPTED_CHALLENGE,

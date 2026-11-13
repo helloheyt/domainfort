@@ -828,7 +828,10 @@ fn factor_must_match_the_armor() {
 #[test]
 fn long_term_key_follows_the_inner_etype_list() {
     let mut c = config();
-    c.enctypes = vec![EncType::Aes256CtsHmacSha196, EncType::Aes128CtsHmacSha196];
+    c.enctypes = vec![
+        keyd::EncTypeId::Aes256CtsHmacSha196,
+        keyd::EncTypeId::Aes128CtsHmacSha196,
+    ];
     let (mut f, tgt) = setup_with(c);
     let alice_128 = password_key(EncType::Aes128CtsHmacSha196, ALICE_PASSWORD, ALICE_SALT);
     let with_etypes = |etypes: Vec<i32>| {

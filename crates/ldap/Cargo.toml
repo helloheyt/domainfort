@@ -42,8 +42,10 @@ kdc = { path = "../kdc" }
 krb-proto = { path = "../krb-proto" }
 # `kerberos_time_seconds` only (the project's one KerberosTime-to-seconds
 # scale, also used by kdc); no keyd operation is called in L4. L7 will add
-# the `open_and_verify_service_ticket` call behind a trait.
-keyd = { path = "../keyd" }
+# the `open_and_verify_service_ticket` call behind a trait. The crypto-free
+# keyd-types crate, not keyd: this crate links no crypto code (D182; decision
+# A-63). Checked by crates/keyd-types/tests/no_crypto_dependency.rs.
+keyd-types = { path = "../keyd-types" }
 # SIDs for the PDP Subject; GUIDs of directory objects.
 dtyp = { path = "../dtyp" }
 # Search (task L8, docs/49 R49-9, §11): the per-request directory view (one

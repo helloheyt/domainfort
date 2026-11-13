@@ -108,8 +108,8 @@ fn kind_tables_are_as_documented() {
 
 /// The error type of an operation (docs/10 §9): 1 `AuthnError`, 2
 /// `IssueError`, 3 `keyd::Error`.
-fn error_type(operation: keyd::Operation) -> u8 {
-    use keyd::Operation as O;
+fn error_type(operation: keyd_types::Operation) -> u8 {
+    use keyd_types::Operation as O;
     match operation {
         O::VerifyPreauth
         | O::OpenFastArmor
@@ -154,7 +154,7 @@ fn a_reply_of_another_operation_is_refused() {
         let Ok(Reply::Message(reply)) = decode_reply::<KeydReply>(KEYD_CHANNEL, &body) else {
             panic!("a reply message");
         };
-        for operation in keyd::Operation::ALL {
+        for operation in keyd_types::Operation::ALL {
             let result = Answer::from_wire(operation, reply.clone());
             let expected = if is_refusal(&answer) {
                 error_type(operation) == error_type(answer.operation())
@@ -194,7 +194,7 @@ fn truncated_or_extended_bodies_are_refused() {
 #[test]
 fn a_blob_that_is_not_strict_der_is_malformed() {
     let call = Call::VerifyPreauth {
-        client: samples::handle(0xA1, keyd::KeyPurpose::PrincipalLongterm),
+        client: samples::handle(0xA1, keyd_types::KeyPurpose::PrincipalLongterm),
         padata: samples::padata(2),
         armor: None,
     };
@@ -273,7 +273,7 @@ fn secret_carrying_messages_show_no_password_in_debug() {
     for call in samples::calls() {
         if !matches!(
             call.operation(),
-            keyd::Operation::SetSecret | keyd::Operation::VerifySecret
+            keyd_types::Operation::SetSecret | keyd_types::Operation::VerifySecret
         ) {
             continue;
         }
@@ -349,7 +349,8 @@ fn no_now_and_no_role_on_the_wire() {
         assert!(allowed.contains(&field.as_str()), "time field `{field}`");
     }
     // The server's entry points take `now` from their caller (the daemon).
-    let server = include_str!("../src/server.rs");
+    // They live in crates/ipc-keyd-server since D182 / A-63.
+    let server = include_str!("../../ipc-keyd-server/src/lib.rs");
     assert!(server.contains("caller: CallerId,\n    now: KerberosTime,\n    request_body: &[u8],"));
     assert!(server.contains("caller: CallerId,\n    now: KerberosTime,\n    call: Call,"));
 }

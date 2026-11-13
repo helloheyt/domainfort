@@ -238,7 +238,7 @@ pub fn at(offset_secs: i64) -> KerberosTime {
 /// One enctype (aes256-cts-hmac-sha1-96, etype 18) unless a test widens it.
 pub fn config() -> KeydConfig {
     let mut c = KeydConfig::new(realm());
-    c.enctypes = vec![EncType::Aes256CtsHmacSha196];
+    c.enctypes = vec![keyd::EncTypeId::Aes256CtsHmacSha196];
     c
 }
 
@@ -274,7 +274,12 @@ impl Fixture {
         )
         .unwrap();
         let n = now();
-        let enctypes = keyd.config().enctypes.clone();
+        let enctypes: Vec<EncType> = keyd
+            .config()
+            .enctypes
+            .iter()
+            .map(|e| EncType::from_number(e.number()).unwrap())
+            .collect();
         for enctype in &enctypes {
             entropy.push(&KRBTGT_KEY[..enctype.key_length()]);
         }
@@ -369,7 +374,7 @@ pub fn as_template() -> AsTicketTemplate {
         endtime: kt("20261113180000Z"),
         renew_till: None,
         flags: TicketFlags::empty(),
-        session_enctype: EncType::Aes256CtsHmacSha196,
+        session_enctype: keyd::EncTypeId::Aes256CtsHmacSha196,
         nonce: 0x0102_0304,
     }
 }
@@ -504,7 +509,7 @@ pub fn tgs_template(nonce: u32) -> TgsTicketTemplate {
         endtime: kt("20261113170000Z"),
         renew_till: None,
         flags: TicketFlags::empty(),
-        session_enctype: EncType::Aes256CtsHmacSha196,
+        session_enctype: keyd::EncTypeId::Aes256CtsHmacSha196,
         nonce,
     }
 }
@@ -618,7 +623,7 @@ pub fn obtain_computer_tgt(f: &mut Fixture, when: KerberosTime, endtime: Kerbero
         endtime,
         renew_till: None,
         flags: TicketFlags::empty(),
-        session_enctype: EncType::Aes256CtsHmacSha196,
+        session_enctype: keyd::EncTypeId::Aes256CtsHmacSha196,
         nonce: 0x0C0C_0C0C,
     };
     let parts = f

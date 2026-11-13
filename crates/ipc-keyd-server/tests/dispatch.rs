@@ -11,14 +11,16 @@
 //! A-56; A-59; A-62 (two-interval hold-down). Every value is constructed by
 //! hand for these tests; no vector comes from any other implementation.
 
+#[path = "../../ipc-keyd/tests/samples/mod.rs"]
 mod samples;
 mod support;
 
 use ipc::{encode_frame, Direction, Refused};
 use ipc_keyd::{
-    dispatch, ClientConfigError, Dispatch, KeydClient, KeydReply, TransportError, Unserved,
-    DEFAULT_DEADLINE, KEYD_CHANNEL,
+    ClientConfigError, KeydClient, KeydReply, TransportError, Unserved, DEFAULT_DEADLINE,
+    KEYD_CHANNEL,
 };
+use ipc_keyd_server::{dispatch, Dispatch};
 use keyd::{
     AuditRecord, AuthnError, CallerId, InMemoryKeyStore, IssueError, KeyPurpose, Keyd, KeydConfig,
     Kvno, OsEntropy, PrincipalBinding, Role,

@@ -1,0 +1,39 @@
+# keyd-types — the crypto-free vocabulary of keyd's interface (D182; decision
+# A-63, docs/questions/Q-245 item 3): ids and handles, roles and operations
+# with the compile-time capability table, the error enums, the argument and
+# result types of every keyd operation, the one-time token ids, the
+# non-secret configuration types, the audit record types, the
+# KerberosTime-to-seconds scale and the `KeyCustody` seam the KDC calls keyd
+# through.
+#
+# Why a separate crate: only keyd links the Kerberos crypto profile
+# (krb-crypto, D182). kdc, ldap, directory-pip and the ipc-keyd client need
+# keyd's TYPES, not its operations; depending on this crate instead of keyd
+# keeps krb-crypto out of their dependency graph — and so out of their
+# processes (docs/50 §1). This crate must never depend on krb-crypto,
+# directly or transitively: tests/no_crypto_dependency.rs checks it (and the
+# same for kdc, ldap, directory-pip, ipc-keyd) with `cargo tree`.
+#
+# Moved unchanged in meaning from this project's crates keyd (docs/10, RFC
+# 4120, RFC 6113, docs/48, docs/49 §3.3, docs/50 — see each item's Spec
+# line) and kdc (`KeyCustody`). New here: the crypto-free `EncTypeId` and the
+# string-to-key iteration count rule, written from RFC 3961 §8, RFC 3962 §4,
+# §7 and RFC 8009 §4, §7, opened in-session from tools/spec-pin/cache
+# (SHA-256 verified). No other implementation consulted or recalled
+# (AGENTS.md §1-3).
+
+[package]
+name = "keyd-types"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Our own workspace crate only. Typed RFC 4120 / RFC 6113 values (names,
+# realms, times, flags, Ticket, EncryptedData, KrbFastReq, ...) that the
+# moved types carry. krb-proto never encrypts or decrypts and does not link
+# krb-crypto. NOT krb-crypto (D182; A-63).
+krb-proto = { path = "../krb-proto" }
+
+[lints]
+workspace = true
