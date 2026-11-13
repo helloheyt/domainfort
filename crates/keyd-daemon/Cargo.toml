@@ -81,6 +81,12 @@ kdc = { path = "../kdc" }
 pdp = { path = "../pdp" }
 dtyp = { path = "../dtyp" }
 krb-crypto = { path = "../krb-crypto" }
+# TESTS ONLY (decision A-86, tests/intent_before_mutation.rs): the real
+# auditd listener and writer (crates/audit-daemon tests/common, reused by
+# `#[path]`, as crates/ldap-front does) and the log reader that verifies
+# the chain they wrote. Workspace crates — no third-party code.
+audit-daemon = { path = "../audit-daemon" }
+audit-log = { path = "../audit-log" }
 
 # Tier 3 (docs/50 R50-19): the hardening drop runs in a fresh child process of
 # a binary with its own `main`, as crates/daemon-sandbox does.

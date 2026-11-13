@@ -552,6 +552,8 @@ dependencies = [
 name = "keyd-daemon"
 version = "0.0.0"
 dependencies = [
+ "audit-daemon",
+ "audit-log",
  "config",
  "daemon-sandbox",
  "dtyp",

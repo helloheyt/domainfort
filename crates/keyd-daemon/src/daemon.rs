@@ -345,6 +345,21 @@ where
     .await;
     audit_task.abort();
     let _ = audit_task.await;
+    // What auditd did not acknowledge is lost with this process (Q-252 item
+    // 9) — among it, perhaps, the outcome of a key-state change whose intent
+    // is in the log (A-86): say so, with the count.
+    let unflushed = gate.outstanding();
+    if unflushed > 0 {
+        note(
+            Note::AuditUnflushed,
+            Some(u64::try_from(unflushed).unwrap_or(u64::MAX)),
+        );
+    }
+    // And the total of outcomes that never reached the window (A-86).
+    let unrecorded = gate.unrecorded_outcomes();
+    if unrecorded > 0 {
+        note(Note::OutcomeUnrecorded, Some(unrecorded));
+    }
     let engine_failed = control.state.engine_ended.load(Ordering::SeqCst);
     if engine_failed {
         note(Note::EngineStopped, None);

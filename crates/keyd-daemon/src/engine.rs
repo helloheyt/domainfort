@@ -27,6 +27,39 @@
 //!   engine is constructed ([`Engine::start`], A-62: `Keyd::new(…,
 //!   started_at)`).
 //!
+//! # Key-state changes: intent acknowledged, then the change (decision A-86)
+//!
+//! A call that changes keyd's key state (`keyd::changes_key_state`) and that
+//! keyd's own authorization step admits (`keyd::Keyd::admits`: role,
+//! purpose) takes another path (crate::audit, steps 1-3): the intent record
+//! is committed and **acknowledged by auditd before keyd runs the call**; no
+//! acknowledgement in time ⇒ `Refused::Unavailable` and keyd does not run
+//! it; after the change keyd's own record (the true result) is committed and
+//! the true result is the reply, even if that record could not be committed
+//! (the gap is counted). An authorization refusal takes the ordinary path:
+//! one record, no intent, no wait.
+//!
+//! **The wait and issuance.** The wait blocks this thread — the one that
+//! serves every keyd call, the Kerberos exchanges included — so it is
+//! bounded by [`INTENT_ACK_BUDGET`], counted from the moment the request was
+//! **queued** ([`EngineHandle::submit`]), not from the moment the engine took
+//! it:
+//!
+//! * the budget is half the keyd client's 2 s deadline (docs/50 §3.6), so a
+//!   change that is performed has the other half to run and to reach a
+//!   caller that keeps that deadline — a reply arriving after the caller gave
+//!   up would read as "unavailable" for a change that was done, the very
+//!   ambiguity A-86 removes (what is left of it: docs/questions/Q-365);
+//! * counted from queueing, a burst of changes holds the engine at most until
+//!   the last one's budget ends, so a kdc request queued behind them is served
+//!   within the budget plus the queue's own work — inside its own 2 s
+//!   deadline.
+//!
+//! The single-threaded engine and the bounded queue are unchanged. While
+//! auditd is known to be away, changes are refused `Busy` at once, with no
+//! wait (the gate's reachability, A-67 item 2); only a reachable but slow
+//! auditd makes the engine wait, at most the budget per change.
+//!
 //! # Threads and hardening
 //!
 //! The engine thread is spawned by [`Engine::spawn`], which the daemon calls
@@ -39,23 +72,44 @@
 //!
 //! Spec: docs/50 R50-5, R50-6, R50-7, R50-14, §3.5, §3.6; docs/10 §2, §11;
 //! docs/questions/Q-218 (A-57), Q-222 (A-56), Q-240 item 7 (A-62), Q-245
-//! item 12 (A-63).
+//! item 12 (A-63), Q-346 (A-86), Q-365.
 
-use crate::audit::{AuditGate, RecordBuffer};
+use crate::audit::{AuditGate, IntentRefused, KeyStateIntent, PendingOutcome, RecordBuffer};
 use crate::clock::Clock;
+use crate::log::{Note, Thinned};
 use core::fmt;
+use core::time::Duration;
 use ipc::{encode_refused, Refused};
-use ipc_keyd::{decode_request, encode_answer, KEYD_CHANNEL};
+use ipc_audit::KeydOutcome;
+use ipc_keyd::{decode_request, encode_answer, Call, KEYD_CHANNEL};
 use ipc_keyd_server::{execute, Dispatch};
-use keyd::{CallerId, ConfigError, EntropySource, KeyStore, Keyd};
+use keyd::authz::HandleSlot;
+use keyd::{changes_key_state, CallerId, ConfigError, EntropySource, KeyStore, Keyd};
 use krb_proto::KerberosTime;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 use zeroize::Zeroizing;
 
 /// Largest engine queue accepted by [`Engine::spawn`]. Project bound
 /// (tokio's `mpsc::channel` panics on 0 or "too large"; AGENTS.md §6).
 pub const MAX_QUEUE_CAPACITY: usize = 1024;
+
+/// How long after a key-state change was queued its intent record may take
+/// to be acknowledged by auditd; past it the change is answered
+/// `Refused::Unavailable` and not run (module documentation). Half the keyd
+/// client's deadline (docs/50 §3.6: 2 s), so a performed change has the
+/// other half to reach its caller. Project choice (docs/50 gives no audit
+/// deadline; docs/questions/Q-365).
+pub const INTENT_ACK_BUDGET: Duration = Duration::from_secs(1);
+
+// The budget leaves at least half the client's deadline for the change and
+// the reply (docs/questions/Q-365).
+const _: () = assert!(INTENT_ACK_BUDGET.as_nanos() * 2 <= ipc_keyd::DEFAULT_DEADLINE.as_nanos());
+
+/// Outcome records of key-state changes that could not be committed: noted
+/// on stderr (thinned), counted by the gate (A-86: "the gap is surfaced").
+static OUTCOME_UNRECORDED: Thinned = Thinned::new(Note::OutcomeUnrecorded);
 
 /// Why the engine could not start.
 /// Spec: docs/50 §7.5 ("every daemon exits with an error code on any start-up
@@ -87,11 +141,14 @@ impl std::error::Error for EngineError {}
 
 /// One request for the engine: the connection's caller identity (from its
 /// peer credentials), the request body (zeroized on drop: it may carry a
-/// password), and where to send the outcome.
-/// Spec: docs/50 R50-7, §3.2, §3.3 (secret-bearing buffers wiped).
+/// password), when it was queued (the start of a key-state change's
+/// [`INTENT_ACK_BUDGET`]), and where to send the outcome.
+/// Spec: docs/50 R50-7, §3.2, §3.3 (secret-bearing buffers wiped);
+/// docs/questions/Q-346 (A-86).
 pub(crate) struct Job {
     caller: CallerId,
     body: Zeroizing<Vec<u8>>,
+    queued: Instant,
     reply: oneshot::Sender<Dispatch>,
 }
 
@@ -126,6 +183,7 @@ impl EngineHandle {
         match self.queue.try_send(Job {
             caller,
             body,
+            queued: Instant::now(),
             reply,
         }) {
             Ok(()) => Ok(outcome),
@@ -221,11 +279,12 @@ where
         Ok(Engine { keyd, clock, gate })
     }
 
-    /// Serve one request body as `caller` (module documentation).
+    /// Serve one request body as `caller`, queued at `queued` (module
+    /// documentation).
     ///
-    /// Spec: docs/50 R50-5, §3.3, §3.7; docs/questions/Q-218 (A-57);
-    /// crates/ipc-keyd-server `dispatch` (the refusal rules).
-    pub(crate) fn handle(&mut self, caller: CallerId, body: &[u8]) -> Dispatch {
+    /// Spec: docs/50 R50-5, §3.3, §3.7; docs/questions/Q-218 (A-57), Q-346
+    /// (A-86); crates/ipc-keyd-server `dispatch` (the refusal rules).
+    pub(crate) fn handle(&mut self, caller: CallerId, body: &[u8], queued: Instant) -> Dispatch {
         // R50-5: keyd's own clock, per request; unreadable ⇒ not served.
         let Some(now) = self.clock.now() else {
             return refuse(Refused::Unavailable);
@@ -239,6 +298,24 @@ where
                 }
             }
         };
+        // A-86: a key-state change keyd's authorization step admits has its
+        // intent acknowledged before keyd runs it. An authorization refusal
+        // changes nothing and takes the ordinary path below (one record, as
+        // before).
+        let operation = call.operation();
+        if changes_key_state(operation) {
+            let Some(intent) =
+                KeyStateIntent::of(caller, now, &call).filter(|intent| intent.op() == operation)
+            else {
+                // keyd and the daemon disagree on what changes key state:
+                // not served (fail closed; AGENTS.md §6).
+                return refuse(Refused::Unavailable);
+            };
+            let handles = [(HandleSlot::Primary, intent.handle())];
+            if self.keyd.admits(&caller, operation, &handles, &now) {
+                return self.change_key_state(caller, now, call, &intent, queued);
+            }
+        }
         // A-57: a gating operation reserves its record's slot before keyd
         // runs it; auditd unreachable or the window full ⇒ Busy, keyd not
         // called. The connection stays open (Busy is not a protocol error).
@@ -256,6 +333,77 @@ where
             Ok(frame) => Dispatch::Reply(frame),
             Err(_) => refuse(Refused::Unavailable),
         }
+    }
+
+    /// Serve a key-state change keyd's authorization step admitted:
+    /// intent committed and acknowledged ⇒ keyd runs the call ⇒ its record
+    /// committed ⇒ the true result (crate::audit, steps 1-3).
+    ///
+    /// * auditd unreachable / no two free slots ⇒ `Refused::Busy` (the
+    ///   connection stays open), nothing recorded, keyd not called;
+    /// * the intent not acknowledged within [`INTENT_ACK_BUDGET`] of
+    ///   `queued` ⇒ a `NotPerformed` outcome, `Refused::Unavailable`, keyd
+    ///   not called;
+    /// * otherwise the reply is keyd's answer, whether or not its record
+    ///   could be committed (a gap is counted and noted, never turned into
+    ///   `Unavailable`: the change happened). An answer that cannot be
+    ///   encoded (cannot happen for these replies — a kvno or a unit) closes
+    ///   the connection without a reply rather than claim `Unavailable`.
+    ///
+    /// Spec: docs/questions/Q-346 (A-86), Q-365; docs/51 §5.7 item 2 (A-85);
+    /// docs/50 §3.6 (bounded waits), §3.7.
+    fn change_key_state(
+        &mut self,
+        caller: CallerId,
+        now: KerberosTime,
+        call: Call,
+        intent: &KeyStateIntent,
+        queued: Instant,
+    ) -> Dispatch {
+        let pending = match self
+            .gate
+            .begin_key_state_change(&intent.event(KeydOutcome::Intent))
+        {
+            Ok(pending) => pending,
+            Err(IntentRefused::GateClosed) => return refuse_and_stay(Refused::Busy),
+            Err(IntentRefused::NotRecorded) => return refuse(Refused::Unavailable),
+        };
+        if !self.intent_acknowledged(&pending, queued) {
+            // "Unavailable" means "not done": keyd is not called. The
+            // outcome record says so; if even it cannot be committed, the
+            // gate counts it.
+            if self
+                .gate
+                .abandon_key_state_change(pending, &intent.event(KeydOutcome::NotPerformed))
+                .is_err()
+            {
+                OUTCOME_UNRECORDED.hit(Some(caller.uid));
+            }
+            return refuse(Refused::Unavailable);
+        }
+        let answer = execute(&mut self.keyd, caller, now, call);
+        let (records, overflowed) = self.keyd.audit_sink_mut().take();
+        if self
+            .gate
+            .finish_key_state_change(pending, &records, overflowed)
+            .is_err()
+        {
+            OUTCOME_UNRECORDED.hit(Some(caller.uid));
+        }
+        match encode_answer(&answer) {
+            Ok(frame) => Dispatch::Reply(frame),
+            Err(_) => Dispatch::Close,
+        }
+    }
+
+    /// Whether the intent of `pending` was acknowledged within
+    /// [`INTENT_ACK_BUDGET`] of `queued`. A deadline that cannot be
+    /// represented is "not acknowledged" (fail closed).
+    /// Spec: docs/questions/Q-346 (A-86), Q-365.
+    fn intent_acknowledged(&self, pending: &PendingOutcome, queued: Instant) -> bool {
+        queued
+            .checked_add(INTENT_ACK_BUDGET)
+            .is_some_and(|deadline| self.gate.wait_acknowledged(pending.intent_seq(), deadline))
     }
 
     /// Move the engine onto its own OS thread behind a queue of `capacity`
@@ -294,9 +442,10 @@ where
                     let Job {
                         caller,
                         body,
+                        queued,
                         reply,
                     } = job;
-                    let outcome = engine.handle(caller, &body);
+                    let outcome = engine.handle(caller, &body, queued);
                     drop(body);
                     // The connection may be gone; its outcome is dropped.
                     let _ = reply.send(outcome);

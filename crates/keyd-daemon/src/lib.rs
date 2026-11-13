@@ -34,6 +34,16 @@
 //! (gating op: reserve a window slot or `Busy`) → keyd → commit the record →
 //! encode → reply → next frame.
 //!
+//! A **key-state change** (`keyd::changes_key_state`: `set_secret`,
+//! `create_key`, `rotate_key`, `rotate_krbtgt`, `retire_kvno`,
+//! `destroy_key_set`) that keyd's authorization step admits takes the A-86
+//! path instead: reserve two slots or `Busy` → commit the **intent** record
+//! → wait (≤ [`INTENT_ACK_BUDGET`] from queueing) for auditd to
+//! **acknowledge** it, else a `NotPerformed` record and `Unavailable`, keyd
+//! not called → keyd → commit keyd's record (the outcome) → reply with the
+//! true result, even if that record could not be committed (the gap is
+//! counted and noted on stderr). "Unavailable" always means "not done".
+//!
 //! # Modules
 //!
 //! | module | what |
@@ -71,6 +81,13 @@
 //! - No per-Role rate limit (docs/50 §3.6 names one without a number;
 //!   Q-230 item 4; Q-260 item 7).
 //! - The engine's thread-count guard has the residual of Q-235 item 2.
+//! - A key-state change waits on the engine thread for its intent's
+//!   acknowledgement (≤ [`INTENT_ACK_BUDGET`]); Kerberos requests queued
+//!   behind it wait that long too (A-86; Q-365). A caller whose reply is
+//!   lost or later than its own deadline still cannot tell a performed
+//!   change from an unperformed one — the log can (intent + outcome).
+//! - A lost outcome record is counted on stderr, not in the audit log's
+//!   `WindowSummary` (that shape has no field for it; Q-366).
 //!
 //! # Provenance
 //!
@@ -92,8 +109,16 @@
 //! source (P-2). No other implementation, daemon, server framework or RPC
 //! system was consulted or recalled (AGENTS.md §1-3).
 //!
+//! The key-state change path (decision A-86, task F2) was written only from
+//! docs/10 (§2, §5ב, §6, §7, §10, §12), docs/50 (§3.5, §3.6, §3.7, §8),
+//! docs/51 §5.7 (A-85, the precedent), PENDING-OWNER (A-57, A-62..A-67,
+//! A-85), docs/questions Q-218, Q-252, Q-260, Q-265, Q-340, the task's
+//! statement of A-86 / Q-346, and the public API of this project's crates
+//! (ipc-audit `SendWindow`, keyd, ipc-keyd); the wait uses `std::sync::
+//! Condvar` from the Rust standard library. Nothing else was consulted.
+//!
 //! Spec: docs/50 §10 (P7), R50-3, R50-5, R50-6, R50-7, R50-14, R50-16,
-//! R50-17, R50-18; docs/10; A-56; A-57; A-62; A-64.
+//! R50-17, R50-18; docs/10; A-56; A-57; A-62; A-64; A-86.
 
 pub mod audit;
 pub mod audit_client;
@@ -116,4 +141,6 @@ pub use daemon::{
     serve, DaemonControl, DaemonError, DaemonParams, Stopped, AUDIT_FLUSH_GRACE, DRAIN_GRACE,
     ENGINE_QUEUE_CAPACITY, SOCKET_FILE_MODE,
 };
-pub use engine::{EngineError, EngineHandle, EnginePanicked, EngineThread, MAX_QUEUE_CAPACITY};
+pub use engine::{
+    EngineError, EngineHandle, EnginePanicked, EngineThread, INTENT_ACK_BUDGET, MAX_QUEUE_CAPACITY,
+};

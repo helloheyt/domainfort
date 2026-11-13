@@ -55,6 +55,13 @@
 //! GSS framing, the authenticator checksum, channel binding and the AP-REP
 //! are task L6b (docs/49 §12).
 //!
+//! **Key-state changes** (decision A-86, docs/questions/Q-346):
+//! [`changes_key_state`] names the six operations that install, rotate,
+//! retire or destroy long-term key versions, and [`Keyd::admits`] runs an
+//! operation's authorization step (role, purpose, hold-down) on its own, with
+//! no record — so that the daemon can have the record of a change's intent
+//! acknowledged by auditd before keyd performs it.
+//!
 //! Key lifecycle (decision A-35, docs/questions/Q-115): keyd chooses every
 //! kvno itself — `set_secret` returns the kvno it installed — and a deleted
 //! account's key set is destroyed (zeroized) by `destroy_key_set`, never a
@@ -213,7 +220,9 @@
 //! docs/50 (R50-5, R50-6, R50-8, §3.4, §3.5, §3.7, §7.5),
 //! docs/questions/Q-040, Q-115 (A-35), Q-120..Q-127, Q-145, Q-150, Q-165
 //! (A-46), Q-180, Q-217 and Q-222 (A-56), Q-240 (A-62), Q-245 item 3 (A-63:
-//! the keyd-types split, D182). No other implementation was consulted or
+//! the keyd-types split, D182); for the key-state classification and
+//! `Keyd::admits` (task F2), docs/51 §5.7 and decision A-86 (Q-346, as
+//! stated in the task; Q-365). No other implementation was consulted or
 //! recalled.
 //!
 //! Spec: docs/10; docs/09 א; RFC 4120 §3, §5.
@@ -231,6 +240,7 @@ mod keyd;
 mod replay;
 mod runtime;
 mod service_ticket;
+mod state_change;
 pub mod store;
 mod template;
 mod tgs_exchange;
@@ -257,5 +267,6 @@ pub use keyd_types::{
     Role, ServiceContext, ServiceCtxId, TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext,
     ThrottlePolicy, TicketPolicy, MAX_FX_COOKIE_LENGTH, TOKEN_ID_LENGTH,
 };
+pub use state_change::changes_key_state;
 pub use store::{InMemoryKeyStore, KeyStore, StoreError, StoredKeySet};
 pub use throttle::{FailureWindowThrottle, SecretThrottle};

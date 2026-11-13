@@ -10,14 +10,17 @@
 //! must carry the shape `peek_shape` names, and every kept text field must
 //! be printable ASCII of at most 256 octets (docs/50 §8.2) — the admin-plane
 //! names included (docs/51 §5.7: names only as `AuditText`). Every bounded
-//! sequence of the admin-plane shapes stays within its bound.
+//! sequence of the admin-plane shapes stays within its bound. A keyd record's
+//! outcome is one of the closed table's seven codes — keyd's five outcomes
+//! or keyd-daemon's two phases of a key-state change (`Intent`,
+//! `NotPerformed`; decision A-86) — and nothing else.
 //!
 //! Spec: docs/50 §3.3, §8.1, §8.2; docs/51 §5.7; docs/questions/Q-340,
-//! Q-341.
+//! Q-341, Q-346 (A-86), Q-365.
 
 use ipc_audit::{
-    decode_event, encode_event, peek_shape, AdmindActivity, AuditText, EventBody, Principal,
-    MAX_APPROVERS, MAX_REPORTED_KVNOS, MAX_TARGET_NAMES, MAX_TEXT_OCTETS,
+    decode_event, encode_event, peek_shape, AdmindActivity, AuditText, EventBody, KeydOutcome,
+    Principal, MAX_APPROVERS, MAX_REPORTED_KVNOS, MAX_TARGET_NAMES, MAX_TEXT_OCTETS,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -68,6 +71,12 @@ fuzz_target!(|data: &[u8]| {
                 assert!(kvnos.len() <= MAX_REPORTED_KVNOS);
             }
         }
-        EventBody::Keyd(_) | EventBody::WindowSummary(_) => {}
+        EventBody::Keyd(keyd) => {
+            // Closed table (A-86 appended codes 6 and 7, nothing past them).
+            let code = keyd.result.code();
+            assert!((1..=7).contains(&code));
+            assert_eq!(KeydOutcome::from_code(code), Some(keyd.result));
+        }
+        EventBody::WindowSummary(_) => {}
     }
 });

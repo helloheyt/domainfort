@@ -18,6 +18,12 @@
 //! `kdc`, `keyd`, `ldap`) map `Source::X => Table::X` by name, so a renamed
 //! or misspelled variant does not compile.
 //!
+//! One table extends its source: [`KeydOutcome`] appends, after keyd's five
+//! outcomes, the two phase codes keyd-daemon writes around a key-state
+//! change (`Intent`, `NotPerformed`; decision A-86, docs/questions/Q-365).
+//! No source variant maps to them, and the five existing codes keep their
+//! meaning.
+//!
 //! Every variant carries no data: a code cannot hold a secret (docs/37 §2:
 //! "only identifiers and metadata"; AGENTS.md §6).
 //!
@@ -226,8 +232,35 @@ code_table! {
 }
 
 code_table! {
-    /// `keyd::AuditOutcome`. Spec: docs/10 §9, §10.
-    pub enum KeydOutcome { Success, Denied, BadTemplate, Unavailable, RateLimited }
+    /// `keyd::AuditOutcome` (codes 1-5, by name), then two **phase** codes
+    /// appended for decision A-86 (codes 6-7), which no `keyd::AuditOutcome`
+    /// maps to: keyd-daemon writes them itself around an operation that
+    /// changes keyd's key state (`keyd::changes_key_state`: `SetSecret`,
+    /// `CreateKey`, `RotateKey`, `RotateKrbtgt`, `RetireKvno`,
+    /// `DestroyKeySet`):
+    ///
+    /// * `Intent` — the record of the intent, committed and **acknowledged
+    ///   by auditd before keyd runs the operation**; keyd does not run it
+    ///   without that acknowledgement.
+    /// * `NotPerformed` — the outcome when the intent was not acknowledged
+    ///   in time: keyd did not run the operation, and the caller was
+    ///   answered `Unavailable`.
+    ///
+    /// Otherwise the outcome record of such an operation is keyd's own
+    /// record (codes 1-5) with its true result. So every intent is followed
+    /// by exactly one outcome record; an intent with none means the outcome
+    /// was lost (the sender counts it).
+    ///
+    /// Spec: docs/10 §9, §10; docs/questions/Q-346 (A-86), Q-365.
+    pub enum KeydOutcome {
+        Success,
+        Denied,
+        BadTemplate,
+        Unavailable,
+        RateLimited,
+        Intent,
+        NotPerformed,
+    }
 }
 
 code_table! {

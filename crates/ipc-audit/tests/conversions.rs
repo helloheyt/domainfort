@@ -209,6 +209,41 @@ fn keyd_record_converts() {
     round_trip(EventBody::Keyd(Box::new(wire)));
 }
 
+/// Decision A-86 (docs/questions/Q-365): keyd's five outcomes map to their
+/// same-named codes, and none maps to the two phase codes keyd-daemon
+/// writes itself (`Intent`, `NotPerformed`) — a record keyd emitted can
+/// never read as an intent.
+#[test]
+fn keyd_outcomes_never_map_to_a_phase_code() {
+    for outcome in [
+        keyd::AuditOutcome::Success,
+        keyd::AuditOutcome::Denied,
+        keyd::AuditOutcome::BadTemplate,
+        keyd::AuditOutcome::Unavailable,
+        keyd::AuditOutcome::RateLimited,
+    ] {
+        let record = keyd::AuditRecord {
+            ts: ktime(),
+            caller_role: keyd::Role::Admin,
+            caller_uid: 1,
+            op: keyd::Operation::CreateKey,
+            principal: None,
+            purpose: None,
+            kvno: None,
+            secondary: None,
+            approvers: None,
+            result: outcome,
+            reason: keyd::AuditReason::None,
+        };
+        let wire = KeydRecord::from(&record).result;
+        assert_eq!(wire.name(), format!("{outcome:?}"));
+        assert!(!matches!(
+            wire,
+            KeydOutcome::Intent | KeydOutcome::NotPerformed
+        ));
+    }
+}
+
 /// Every keyd operation and role maps to the same-named code.
 #[test]
 fn keyd_operations_and_roles_match() {

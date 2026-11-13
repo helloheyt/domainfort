@@ -13,8 +13,8 @@ mod common;
 use common::*;
 use ipc_audit::{
     decode_event, encode_event, event_round_trip_is_canonical, AuditText, CalendarTime, EventBody,
-    EventError, KdcEvent, KdcReason, KeydRecord, LdapEvent, LdapReason, Principal, SidValue,
-    EVENT_FORMAT, MAX_EVENT_OCTETS, MAX_FILTER_ATTRS, MAX_NAME_COMPONENTS,
+    EventError, KdcEvent, KdcReason, KeydOutcome, KeydRecord, LdapEvent, LdapReason, Principal,
+    SidValue, EVENT_FORMAT, MAX_EVENT_OCTETS, MAX_FILTER_ATTRS, MAX_NAME_COMPONENTS,
 };
 
 /// docs/50 §3.3: every sample decodes to itself and re-encodes to the same
@@ -201,6 +201,42 @@ fn strict_decoding() {
     );
 }
 
+/// Decision A-86 (docs/questions/Q-365): the intent and not-performed
+/// records use keyd's record layout unchanged — the same record with
+/// `result` = `Intent` differs from one with `Success` in exactly the
+/// outcome octet (the last but one: outcome, then reason) — and the first
+/// code past the table (8) is refused (docs/50 §3.3: closed tables).
+#[test]
+fn keyd_phase_codes_change_only_the_outcome_octet() {
+    let intent = keyd_intent_record();
+    let success = KeydRecord {
+        result: KeydOutcome::Success,
+        ..intent.clone()
+    };
+    let encode = |r: &KeydRecord| {
+        encode_event(&EventBody::Keyd(Box::new(r.clone())))
+            .unwrap()
+            .into_vec()
+    };
+    let (a, b) = (encode(&success), encode(&intent));
+    assert_eq!(a.len(), b.len());
+    let differing: Vec<usize> = (0..a.len()).filter(|&i| a[i] != b[i]).collect();
+    assert_eq!(differing, [a.len() - 2]);
+    let at = a.len() - 2;
+    assert_eq!(b[at], KeydOutcome::Intent.code());
+    let mut other = b.clone();
+    other[at] = KeydOutcome::NotPerformed.code();
+    assert_eq!(
+        decode_event(&other).unwrap(),
+        EventBody::Keyd(Box::new(KeydRecord {
+            result: KeydOutcome::NotPerformed,
+            ..intent
+        }))
+    );
+    other[at] = KeydOutcome::NotPerformed.code() + 1;
+    assert!(decode_event(&other).is_err());
+}
+
 /// docs/50 §3.3 ("enum = u8 from a closed table"): every table's codes are
 /// position + 1, 0 and past-the-end are refused, names are unique.
 #[test]
@@ -239,7 +275,26 @@ fn code_tables_are_closed() {
     table!(IpZone);
     table!(KeydRole);
     table!(KeyPurposeCode);
-    table!(KeydOutcome);
+    // keyd's five outcomes keep their codes; A-86 appended two phases.
+    assert_eq!(table!(KeydOutcome), 7);
+    assert_eq!(
+        KeydOutcome::ALL
+            .iter()
+            .map(|o| o.name())
+            .collect::<Vec<_>>(),
+        [
+            "Success",
+            "Denied",
+            "BadTemplate",
+            "Unavailable",
+            "RateLimited",
+            "Intent",
+            "NotPerformed"
+        ]
+    );
+    assert_eq!(KeydOutcome::RateLimited.code(), 5);
+    assert_eq!(KeydOutcome::Intent.code(), 6);
+    assert_eq!(KeydOutcome::NotPerformed.code(), 7);
     table!(LdapTransport);
     table!(UnsupportedOpCode);
     table!(SearchScope);

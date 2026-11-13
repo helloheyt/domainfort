@@ -1,0 +1,191 @@
+//! Decision A-86 (docs/questions/Q-346): the classification of the
+//! operations that change keyd's key state, and `Keyd::admits` — an
+//! operation's authorization step run on its own. Sources: docs/10 §2
+//! (capability table; role, purpose, then the hold-down), §6, §7, §11,
+//! §12 I2, I3, I8; docs/questions/Q-346 (A-86), Q-365. All values are
+//! constructed for these tests.
+
+mod common;
+
+use common::*;
+use keyd::authz::{purpose_permitted, role_permits, HandleSlot};
+use keyd::{
+    changes_key_state, AuditReason, CallerId, Error, KeyHandle, KeyPurpose, Kvno, Operation,
+    PrincipalId, Role,
+};
+use zeroize::Zeroizing;
+
+const ROLES: [Role; 4] = [Role::Kdc, Role::Directory, Role::Admin, Role::Ldap];
+const PURPOSES: [KeyPurpose; 3] = [
+    KeyPurpose::PrincipalLongterm,
+    KeyPurpose::Krbtgt,
+    KeyPurpose::Service,
+];
+
+/// docs/10 §6, §7; A-86: exactly the six operations that install, rotate,
+/// retire or destroy long-term key versions change key state. The
+/// throttles, the replay cache and the token tables are bookkeeping (the
+/// Kerberos exchanges, `verify_secret`), and `describe_config` / `ping`
+/// change nothing.
+#[test]
+fn exactly_the_key_lifecycle_operations_change_key_state() {
+    let changing: Vec<Operation> = Operation::ALL
+        .into_iter()
+        .filter(|op| changes_key_state(*op))
+        .collect();
+    assert_eq!(
+        changing,
+        [
+            Operation::SetSecret,
+            Operation::CreateKey,
+            Operation::RotateKey,
+            Operation::RotateKrbtgt,
+            Operation::RetireKvno,
+            Operation::DestroyKeySet,
+        ]
+    );
+}
+
+/// docs/10 §2, §12 I2, I3: `admits` is the role check and the purpose check
+/// of the capability tables, for every role × purpose of every key-state
+/// operation (none of which is held, docs/10 §11).
+#[test]
+fn admits_is_the_role_and_purpose_check() {
+    let f = Fixture::new();
+    for op in Operation::ALL
+        .into_iter()
+        .filter(|op| changes_key_state(*op))
+    {
+        for role in ROLES {
+            for purpose in PURPOSES {
+                let handle = KeyHandle::new(PrincipalId::from_bytes([0x44; 16]), purpose);
+                let caller = CallerId { uid: 900, role };
+                assert_eq!(
+                    f.keyd
+                        .admits(&caller, op, &[(HandleSlot::Primary, &handle)], &now()),
+                    role_permits(role, op) && purpose_permitted(op, HandleSlot::Primary, purpose),
+                    "{op:?} {role:?} {purpose:?}"
+                );
+            }
+        }
+    }
+}
+
+/// docs/10 §2 ("(c) — only after them — the startup hold-down"), §11: for a
+/// held operation `admits` is false inside the hold-down and true after it,
+/// exactly when the operation itself would be held.
+#[test]
+fn admits_includes_the_hold_down() {
+    let f = Fixture::started(config(), &now());
+    let handles = [(HandleSlot::Primary, &ALICE)];
+    assert!(!f
+        .keyd
+        .admits(&KDC, Operation::VerifyPreauth, &handles, &now()));
+    assert!(!f
+        .keyd
+        .admits(&KDC, Operation::VerifyPreauth, &handles, &at(600)));
+    assert!(f
+        .keyd
+        .admits(&KDC, Operation::VerifyPreauth, &handles, &at(601)));
+    // A key-state operation is not held (docs/10 §11).
+    assert!(f.keyd.admits(
+        &DIRECTORY,
+        Operation::SetSecret,
+        &[(HandleSlot::Primary, &BOB)],
+        &now()
+    ));
+}
+
+/// docs/10 §12 I8 ("every operation produces one audit record" — the
+/// operation, not the check) and A-86 (the check alone changes nothing):
+/// `admits` emits no record and leaves no state — the key set it was asked
+/// about is still created at the initial kvno afterwards, and the
+/// operation's own record is its only one.
+#[test]
+fn admits_emits_no_record_and_changes_nothing() {
+    let mut f = Fixture::new();
+    let carol = KeyHandle::new(
+        PrincipalId::from_bytes([0xCA; 16]),
+        KeyPurpose::PrincipalLongterm,
+    );
+    let handles = [(HandleSlot::Primary, &carol)];
+    for _ in 0..3 {
+        assert!(f
+            .keyd
+            .admits(&ADMIN, Operation::CreateKey, &handles, &now()));
+        assert!(!f.keyd.admits(&KDC, Operation::CreateKey, &handles, &now()));
+    }
+    assert!(f.records().is_empty());
+    assert_eq!(
+        f.keyd
+            .create_key(&ADMIN, &carol, &bound(alice_name()), &now()),
+        Ok(Kvno::INITIAL)
+    );
+    assert_eq!(f.records().len(), 1);
+}
+
+/// docs/10 §2 ("mismatch → Denied, recorded"): when `admits` says no, the
+/// operation is refused at its authorization step (reason RoleNotPermitted
+/// or PurposeMismatch) and nothing changes; when it says yes, a later step
+/// decides (here: the existing key set of `create_key`, KeyExists).
+#[test]
+fn admits_agrees_with_the_operations_own_refusal() {
+    let mut f = Fixture::new();
+    // Kdc may not set a secret: admits says no, the operation says why.
+    let handles = [(HandleSlot::Primary, &BOB)];
+    assert!(!f.keyd.admits(&KDC, Operation::SetSecret, &handles, &now()));
+    assert_eq!(
+        f.keyd.set_secret(
+            &KDC,
+            &BOB,
+            &bob_binding(),
+            Zeroizing::new(String::from("not-applied")),
+            BOB_SALT,
+            &now()
+        ),
+        Err(Error::Denied)
+    );
+    assert_eq!(
+        f.records().last().map(|r| r.reason),
+        Some(AuditReason::RoleNotPermitted)
+    );
+    // A krbtgt handle in rotate_key: the purpose check refuses.
+    let handles = [(HandleSlot::Primary, &KRBTGT)];
+    assert!(!f
+        .keyd
+        .admits(&ADMIN, Operation::RotateKey, &handles, &now()));
+    assert_eq!(
+        f.keyd.rotate_key(&ADMIN, &KRBTGT, &now()),
+        Err(Error::Denied)
+    );
+    assert_eq!(
+        f.records().last().map(|r| r.reason),
+        Some(AuditReason::PurposeMismatch)
+    );
+    // Admitted, then refused by a later step: the key set exists.
+    let handles = [(HandleSlot::Primary, &SERVICE)];
+    assert!(f
+        .keyd
+        .admits(&ADMIN, Operation::CreateKey, &handles, &now()));
+    assert_eq!(
+        f.keyd
+            .create_key(&ADMIN, &SERVICE, &service_binding(), &now()),
+        Err(Error::Denied)
+    );
+    assert_eq!(
+        f.records().last().map(|r| r.reason),
+        Some(AuditReason::KeyExists)
+    );
+    // Bob's password was never changed: his next set_secret is kvno 2.
+    assert_eq!(
+        f.keyd.set_secret(
+            &DIRECTORY,
+            &BOB,
+            &bob_binding(),
+            Zeroizing::new(String::from("a-new-password")),
+            BOB_SALT,
+            &now()
+        ),
+        Ok(Kvno::new(2))
+    );
+}

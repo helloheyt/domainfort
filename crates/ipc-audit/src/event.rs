@@ -204,7 +204,21 @@ impl KeyRef {
 /// One keyd audit record: `keyd::AuditRecord`, field for field
 /// (docs/10 §10: `{ ts, caller_role, caller_uid, op, principal, purpose,
 /// kvno, result }` + reason, secondary, approvers).
-/// Spec: crates/keyd audit.rs; docs/10 §10, I8.
+///
+/// **Phase records** (decision A-86): around an operation that changes
+/// keyd's key state, keyd-daemon also writes, with the same layout, the
+/// record of the intent (`result` = [`KeydOutcome::Intent`]) before keyd
+/// runs it and — only if that intent was not acknowledged in time — a
+/// [`KeydOutcome::NotPerformed`] outcome. Field use there: `ts`, the caller,
+/// `op`, the handle's `principal` / `purpose` as in keyd's record; `kvno`
+/// only for `RetireKvno` (the version named); `approvers` only for
+/// `RotateKrbtgt`; no `secondary`; `reason` = `None`. As for the other
+/// shapes, the codec checks the encoding, not the field use
+/// (docs/questions/Q-252 item 4); the layout is unchanged — the two phases
+/// are codes 6 and 7 of the closed outcome table.
+///
+/// Spec: crates/keyd audit.rs; docs/10 §10, I8; docs/questions/Q-346
+/// (A-86), Q-365.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeydRecord {
     /// The caller-supplied time of the operation.

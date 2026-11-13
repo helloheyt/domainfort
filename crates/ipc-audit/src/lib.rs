@@ -26,7 +26,10 @@
 //! [`encode_event`] / [`decode_event`]: `event_format (1) ‖ shape ‖ fields`,
 //! one shape per source — [`KdcEvent`] (crates/kdc `AuditEvent`),
 //! [`KeydRecord`] (crates/keyd `AuditRecord`), [`LdapEvent`] (crates/ldap
-//! `AuditEvent`) — plus [`WindowSummary`], and the admin-plane shapes
+//! `AuditEvent`; plus keyd-daemon's intent / not-performed phase records of
+//! a key-state change, the outcome codes [`KeydOutcome::Intent`] and
+//! [`KeydOutcome::NotPerformed`] — decision A-86, docs/questions/Q-365) —
+//! plus [`WindowSummary`], and the admin-plane shapes
 //! [`DirAdminEvent`] (sent by dird: the decision before each admin commit
 //! and the outcome after it) and [`AdmindEvent`] (sent by admind) — docs/51
 //! §5.7, task A7. Each carries exactly the

@@ -194,7 +194,26 @@ impl World {
     }
 
     /// keyd's CreateKey audit records received so far.
+    /// The CreateKey **outcome** records. Since A-88 (docs/10 §10) each
+    /// key-state change is recorded twice — an acknowledged `Intent`
+    /// record before the change, then the outcome — so the intents are
+    /// counted apart ([`World::create_key_intents`]).
     fn create_key_records(&self) -> Vec<KeydRecord> {
+        self.create_key_events()
+            .into_iter()
+            .filter(|record| record.result != KeydOutcome::Intent)
+            .collect()
+    }
+
+    /// The CreateKey `Intent` records (A-88; docs/questions/Q-365).
+    fn create_key_intents(&self) -> Vec<KeydRecord> {
+        self.create_key_events()
+            .into_iter()
+            .filter(|record| record.result == KeydOutcome::Intent)
+            .collect()
+    }
+
+    fn create_key_events(&self) -> Vec<KeydRecord> {
         self.auditd
             .events()
             .into_iter()
@@ -262,6 +281,8 @@ fn the_ceremony_creates_the_three_key_sets_with_their_bindings() {
         assert_eq!(record.result, KeydOutcome::Success);
         assert_eq!(record.caller_uid, world.uid);
     }
+    // A-88: every change was preceded by its acknowledged intent.
+    assert_eq!(world.create_key_intents().len(), 3);
     world.daemon.stop().unwrap();
 }
 

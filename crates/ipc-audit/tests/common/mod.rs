@@ -122,6 +122,40 @@ pub fn keyd_record() -> KeydRecord {
     }
 }
 
+/// keyd-daemon's intent record of a key-state change (decision A-86):
+/// `SetSecret` by the directory, before keyd runs it — no kvno (keyd chooses
+/// it), reason `None`.
+pub fn keyd_intent_record() -> KeydRecord {
+    KeydRecord {
+        ts: time(),
+        caller_role: KeydRole::Directory,
+        caller_uid: 806,
+        op: KeydOperation::SetSecret,
+        principal: Some([0x55; 16]),
+        purpose: Some(KeyPurposeCode::PrincipalLongterm),
+        kvno: None,
+        secondary: None,
+        approvers: None,
+        result: KeydOutcome::Intent,
+        reason: KeydReason::None,
+    }
+}
+
+/// keyd-daemon's not-performed outcome of a key-state change whose intent
+/// was not acknowledged in time (decision A-86): `RetireKvno` by the admin,
+/// naming kvno 4.
+pub fn keyd_not_performed_record() -> KeydRecord {
+    KeydRecord {
+        caller_role: KeydRole::Admin,
+        caller_uid: 807,
+        op: KeydOperation::RetireKvno,
+        purpose: Some(KeyPurposeCode::Service),
+        kvno: Some(4),
+        result: KeydOutcome::NotPerformed,
+        ..keyd_intent_record()
+    }
+}
+
 pub fn largest_keyd_record() -> KeydRecord {
     KeydRecord {
         approvers: Some([[0x33; 16], [0x44; 16]]),
@@ -593,6 +627,8 @@ pub fn all_samples() -> Vec<EventBody> {
         EventBody::Kdc(Box::new(largest_kdc_event())),
         EventBody::Keyd(Box::new(keyd_record())),
         EventBody::Keyd(Box::new(largest_keyd_record())),
+        EventBody::Keyd(Box::new(keyd_intent_record())),
+        EventBody::Keyd(Box::new(keyd_not_performed_record())),
         EventBody::Ldap(Box::new(ldap_event())),
         EventBody::Ldap(Box::new(ldap_malformed())),
         EventBody::Ldap(Box::new(largest_ldap_event())),

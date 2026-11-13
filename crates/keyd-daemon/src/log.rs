@@ -49,6 +49,14 @@ pub enum Note {
     Draining,
     /// The engine thread ended before shutdown was requested.
     EngineStopped,
+    /// The outcome record of a key-state change (keyd's own, or
+    /// `NotPerformed`) could not be put into the audit window; the change's
+    /// intent documents the attempt (A-86). Thinned, with the caller's uid;
+    /// at stop, the total since start.
+    OutcomeUnrecorded,
+    /// The stop ended with audit events not acknowledged by auditd: they are
+    /// lost (the bound of docs/questions/Q-252 item 9). With the count.
+    AuditUnflushed,
     /// Stopped.
     Stopped,
 }
@@ -80,6 +88,13 @@ impl Note {
             Note::AcceptFailed => "accepting a connection failed",
             Note::Draining => "shutdown requested: draining",
             Note::EngineStopped => "engine thread stopped unexpectedly",
+            Note::OutcomeUnrecorded => {
+                "the outcome record of a key-state change was not recorded; the change's \
+                 intent record documents the attempt (A-86)"
+            }
+            Note::AuditUnflushed => {
+                "stopped with audit events not acknowledged by auditd; they are lost (Q-252 item 9)"
+            }
             Note::Stopped => "stopped",
         }
     }
