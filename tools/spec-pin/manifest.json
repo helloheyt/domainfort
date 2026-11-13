@@ -317,6 +317,54 @@
       "sha256": "b69dc4754f0709a7e344c886f277ed9e37a4336029593ba91bc6df6065f9ee14",
       "phase": "1",
       "blocks": []
+    },
+    {
+      "id": "MS-ADSC",
+      "title": "Active Directory Schema Classes",
+      "kind": "ms-openspec",
+      "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-ADSC/%5bMS-ADSC%5d.pdf",
+      "revision": "v20240423 (2024-04-23)",
+      "sha256": "e95ceaf3fb73c6cf0f43de96f2471d362c223e48a9fd7f5e998ab8db4453b84b",
+      "phase": "1-2",
+      "blocks": [
+        "SV-6"
+      ]
+    },
+    {
+      "id": "MS-ADA1",
+      "title": "Active Directory Schema Attributes A-L",
+      "kind": "ms-openspec",
+      "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-ADA1/%5bMS-ADA1%5d.pdf",
+      "revision": "v20180912 (2018-09-12)",
+      "sha256": "3885c568e5dd2e8a68ccec6078a18d46978a2052c563b57157f947e0d5216a50",
+      "phase": "1-2",
+      "blocks": [
+        "SV-6"
+      ]
+    },
+    {
+      "id": "MS-ADA2",
+      "title": "Active Directory Schema Attributes M",
+      "kind": "ms-openspec",
+      "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-ADA2/%5bMS-ADA2%5d.pdf",
+      "revision": "v20240423 (2024-04-23)",
+      "sha256": "09f47728e65b6478a3295484d8045a9c1126a2ed4b2cab3c1fc87f01db23e91a",
+      "phase": "1-2",
+      "blocks": [
+        "SV-6"
+      ]
+    },
+    {
+      "id": "MS-ADA3",
+      "title": "Active Directory Schema Attributes N-Z",
+      "kind": "ms-openspec",
+      "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-ADA3/%5bMS-ADA3%5d.pdf",
+      "revision": "v20180912 (2018-09-12)",
+      "sha256": "f8eca4bff4258830f7cb439b4801f6c4331f4cff461dc6a578619be9e0ef5a49",
+      "phase": "1-2",
+      "blocks": [
+        "SV-6"
+      ]
     }
   ]
 }
