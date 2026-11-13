@@ -29,7 +29,7 @@ use crate::audit::{AuditKeyRef, AuditReason, AuditSink};
 use crate::authz::{CallerId, HandleSlot, Operation};
 use crate::entropy::EntropySource;
 use crate::error::{AuthnError, Deny, Internal, IssueError};
-use crate::keyd::{authorize, draw, new_random_key, open, seal, AuditFields, Keyd};
+use crate::keyd::{draw, new_random_key, open, seal, AuditFields, Keyd};
 use crate::model::{KeyHandle, KeyPurpose, Kvno, PrincipalId};
 use crate::store::{KeyStore, KvnoKeys};
 use crate::template::{as_ticket_flags, check_binding, check_times, tgs_name, TemplateTimes};
@@ -274,10 +274,11 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         now: &KerberosTime,
         fields: &mut AuditFields,
     ) -> Internal<AuthnProof> {
-        authorize(
+        self.admit(
             caller,
             Operation::VerifyPreauth,
             &[(HandleSlot::Primary, client)],
+            now,
         )?;
         let now_s = kerberos_time_seconds(now);
         // The failure throttle, before any secret work (A-34). `rate_limited`
@@ -467,7 +468,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// `issue_as_rep`: consume `proof` and issue a TGT — armored when
     /// `armor` is `Some`.
     ///
-    /// 1. authorize (Kdc; client handle PrincipalLongterm, krbtgt handle
+    /// 1. authorize and admit (Kdc; client handle PrincipalLongterm, krbtgt handle
     ///    Krbtgt);
     /// 2. consume the proof: live, issued to this caller, bound to this
     ///    client (`Denied` otherwise — the proof is destroyed either way);
@@ -539,10 +540,11 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         now: &KerberosTime,
         fields: &mut AuditFields,
     ) -> Internal<AsRepParts> {
-        authorize(
+        self.admit(
             caller,
             Operation::IssueAsRep,
             &[(HandleSlot::Primary, client), (HandleSlot::Krbtgt, krbtgt)],
+            now,
         )?;
         let now_s = kerberos_time_seconds(now);
 

@@ -13,7 +13,7 @@ use crate::audit::{AuditReason, AuditSink};
 use crate::authz::{CallerId, HandleSlot, Operation};
 use crate::entropy::EntropySource;
 use crate::error::{Deny, Error, Internal};
-use crate::keyd::{authorize, new_random_keys, store_deny, AuditFields, Keyd};
+use crate::keyd::{new_random_keys, store_deny, AuditFields, Keyd};
 use crate::model::{DualControlToken, KeyHandle, KeyPurpose, Kvno, PrincipalBinding};
 use crate::store::{KeyStore, KvnoKeys, StoredKeySet};
 use crate::template::check_new_binding;
@@ -45,7 +45,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         now: &KerberosTime,
     ) -> Result<Kvno, Error> {
         let mut fields = AuditFields::for_handle(handle);
-        let result = self.create_key_inner(caller, handle, binding, &mut fields);
+        let result = self.create_key_inner(caller, handle, binding, now, &mut fields);
         self.emit(caller, Operation::CreateKey, now, &fields, &result);
         result.map_err(Error::from)
     }
@@ -55,12 +55,14 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         caller: &CallerId,
         handle: &KeyHandle,
         binding: &PrincipalBinding,
+        now: &KerberosTime,
         fields: &mut AuditFields,
     ) -> Internal<Kvno> {
-        authorize(
+        self.admit(
             caller,
             Operation::CreateKey,
             &[(HandleSlot::Primary, handle)],
+            now,
         )?;
         if !self.store.accepts(handle.purpose) {
             return Err(Deny::denied(AuditReason::StoreRefusedCritical));
@@ -92,12 +94,14 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         now: &KerberosTime,
     ) -> Result<Kvno, Error> {
         let mut fields = AuditFields::for_handle(handle);
-        let result = authorize(
-            caller,
-            Operation::RotateKey,
-            &[(HandleSlot::Primary, handle)],
-        )
-        .and_then(|()| self.rotate_inner(handle, &mut fields));
+        let result = self
+            .admit(
+                caller,
+                Operation::RotateKey,
+                &[(HandleSlot::Primary, handle)],
+                now,
+            )
+            .and_then(|()| self.rotate_inner(handle, &mut fields));
         self.emit(caller, Operation::RotateKey, now, &fields, &result);
         result.map_err(Error::from)
     }
@@ -121,19 +125,21 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     ) -> Result<Kvno, Error> {
         let mut fields = AuditFields::for_handle(krbtgt);
         fields.approvers = Some([approval.approver_1, approval.approver_2]);
-        let result = authorize(
-            caller,
-            Operation::RotateKrbtgt,
-            &[(HandleSlot::Primary, krbtgt)],
-        )
-        .and_then(|()| {
-            if approval.has_distinct_approvers() {
-                Ok(())
-            } else {
-                Err(Deny::denied(AuditReason::DualControlRejected))
-            }
-        })
-        .and_then(|()| self.rotate_inner(krbtgt, &mut fields));
+        let result = self
+            .admit(
+                caller,
+                Operation::RotateKrbtgt,
+                &[(HandleSlot::Primary, krbtgt)],
+                now,
+            )
+            .and_then(|()| {
+                if approval.has_distinct_approvers() {
+                    Ok(())
+                } else {
+                    Err(Deny::denied(AuditReason::DualControlRejected))
+                }
+            })
+            .and_then(|()| self.rotate_inner(krbtgt, &mut fields));
         self.emit(caller, Operation::RotateKrbtgt, now, &fields, &result);
         result.map_err(Error::from)
     }
@@ -176,21 +182,23 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     ) -> Result<(), Error> {
         let mut fields = AuditFields::for_handle(handle);
         fields.kvno = Some(kvno);
-        let result = authorize(
-            caller,
-            Operation::RetireKvno,
-            &[(HandleSlot::Primary, handle)],
-        )
-        .and_then(|()| {
-            let set = self
-                .store
-                .get_mut(handle)
-                .ok_or(Deny::denied(AuditReason::KeyNotFound))?;
-            if set.current_kvno() == kvno || !set.retire_previous(kvno) {
-                return Err(Deny::denied(AuditReason::KvnoNotRetirable));
-            }
-            Ok(())
-        });
+        let result = self
+            .admit(
+                caller,
+                Operation::RetireKvno,
+                &[(HandleSlot::Primary, handle)],
+                now,
+            )
+            .and_then(|()| {
+                let set = self
+                    .store
+                    .get_mut(handle)
+                    .ok_or(Deny::denied(AuditReason::KeyNotFound))?;
+                if set.current_kvno() == kvno || !set.retire_previous(kvno) {
+                    return Err(Deny::denied(AuditReason::KvnoNotRetirable));
+                }
+                Ok(())
+            });
         self.emit(caller, Operation::RetireKvno, now, &fields, &result);
         result.map_err(Error::from)
     }
@@ -224,7 +232,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         now: &KerberosTime,
     ) -> Result<(), Error> {
         let mut fields = AuditFields::for_handle(handle);
-        let result = self.destroy_key_set_inner(caller, handle, &mut fields);
+        let result = self.destroy_key_set_inner(caller, handle, now, &mut fields);
         self.emit(caller, Operation::DestroyKeySet, now, &fields, &result);
         result.map_err(Error::from)
     }
@@ -233,12 +241,14 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         &mut self,
         caller: &CallerId,
         handle: &KeyHandle,
+        now: &KerberosTime,
         fields: &mut AuditFields,
     ) -> Internal<()> {
-        authorize(
+        self.admit(
             caller,
             Operation::DestroyKeySet,
             &[(HandleSlot::Primary, handle)],
+            now,
         )?;
         let current = self
             .store

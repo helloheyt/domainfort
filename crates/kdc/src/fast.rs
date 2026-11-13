@@ -18,7 +18,7 @@
 //! §4.1, §5, §6, §8; docs/questions/Q-125, Q-126 (A-32); A-25, A-26.
 
 use crate::audit::AuditReason;
-use crate::kdc::Refusal;
+use crate::kdc::{custody_unavailable, Refusal};
 use keyd::{AuthnError, MAX_FX_COOKIE_LENGTH};
 use krb_proto::constants::{
     KDC_ERR_PREAUTH_EXPIRED, KDC_ERR_PREAUTH_FAILED, KRB_AP_ERR_REPEAT, KRB_AP_ERR_SKEW,
@@ -117,11 +117,15 @@ pub(crate) fn armored_request(pa: &PaData) -> Result<KrbFastArmoredReq, Refusal>
 /// that the client refreshes its armor TGT (RFC 6113 5.4.4: "the client
 /// SHOULD process the KDC errors as the result of the KDC's inability to
 /// accept the AP_REQ armor and potentially retry another request with a
-/// different armor").
-/// Spec: RFC 6113 5.4.1, 5.4.4; RFC 4120 3.2.3; docs/48 §6.2, §6.3;
-/// docs/questions/Q-125 items 4, 5 (A-32); A-26.
+/// different armor"). `Unavailable` — keyd did not serve the call (its
+/// startup hold-down, or keyd unreachable) — is KDC_ERR_SVC_UNAVAILABLE,
+/// never PREAUTH_FAILED (docs/50 §3.7, R50-8; A-56).
+/// Spec: RFC 6113 5.4.1, 5.4.4; RFC 4120 3.2.3, 7.5.9; docs/48 §6.2, §6.3;
+/// docs/questions/Q-125 items 4, 5 (A-32); A-26; docs/questions/Q-217
+/// (A-56).
 pub(crate) fn armor_refusal(error: AuthnError) -> Refusal {
     match error {
+        AuthnError::Unavailable => custody_unavailable(),
         AuthnError::Denied => Refusal::new(KDC_ERR_PREAUTH_FAILED, AuditReason::ArmorDenied),
         AuthnError::Skew => Refusal::new(KRB_AP_ERR_SKEW, AuditReason::ArmorSkew),
         AuthnError::TicketNotYetValid => {

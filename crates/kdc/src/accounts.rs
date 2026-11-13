@@ -5,7 +5,11 @@
 //! account record: the keyd [`KeyHandle`] (never a key), the SID, group SIDs
 //! and tier the PDP Subject needs, the account state, and the PA-ETYPE-INFO2
 //! data (enctype, salt, s2kparams — public string-to-key hints, RFC 4120
-//! 5.2.7.5). Every method returns `Result`; an `Err` fails the request closed.
+//! 5.2.7.5). Every method returns `Result`; an `Err` fails the request closed:
+//! [`AccountSourceError::Unavailable`] (the source cannot be reached — the
+//! directory process down, an IPC deadline, Busy) as KDC_ERR_SVC_UNAVAILABLE,
+//! [`AccountSourceError::Failed`] (it answered but cannot tell) as
+//! KRB_ERR_GENERIC (docs/50 §3.7, R50-8; A-56).
 //!
 //! Lookup is exact (main-session decision 4; RFC 4120 6.1, 6.2): realm octets
 //! and every name-string component, the name-type not significant. A source
@@ -20,7 +24,8 @@
 //!
 //! Spec: main-session decisions 3, 4, 8; docs/11 §1 (Subject: principal,
 //! groups, tier — from authoritative data, never client-claimed, P3); docs/25
-//! §4 (re-evaluation at use, D53); RFC 4120 3.1.3, 3.3.3.1, 5.2.7.5, 6.2.
+//! §4 (re-evaluation at use, D53); RFC 4120 3.1.3, 3.3.3.1, 5.2.7.5, 6.2,
+//! 7.5.9; docs/50 §3.7 (R50-8); docs/questions/Q-217 (A-56).
 
 use crate::names::{same_name, same_realm};
 use dtyp::Sid;
@@ -176,17 +181,34 @@ pub struct ServiceAccount {
     pub enctypes: Vec<i32>,
 }
 
-/// The account source could not answer (error, timeout, inconsistent view).
-/// The request fails closed. Carries no data.
+/// The account source could not answer. The request fails closed either
+/// way. Carries no data (no name, no directory value).
+///
+/// Spec: main-session decision 3; docs/50 §3.7 (R50-8: "keyd / dird down ⇒
+/// fail closed with an explicit `Unavailable`"); docs/questions/Q-217 (A-56).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AccountSourceError;
+pub enum AccountSourceError {
+    /// The source answered but cannot tell: an inconsistent or unusable
+    /// record, an inconsistent view, a store failure, a bound exceeded. The
+    /// KDC answers KRB_ERR_GENERIC (main-session decision 3).
+    Failed,
+    /// The source cannot be reached now: the directory process is down, an
+    /// IPC deadline passed, the server is Busy (docs/50 §3.6, §3.7). Decided
+    /// before the source looked at the request — independent of its content
+    /// and of every secret — so it is no oracle (A-56). The KDC answers
+    /// KDC_ERR_SVC_UNAVAILABLE (RFC 4120 7.5.9, code 29) over TCP, nothing
+    /// over UDP.
+    Unavailable,
+}
 
 /// Where the KDC reads principals from.
 ///
 /// `Ok(None)` means "no such principal in this role"; `Err` means "cannot
-/// tell" and always refuses the request.
+/// tell" and always refuses the request — an implementation reached over
+/// IPC reports its transport failures as [`AccountSourceError::Unavailable`],
+/// never as `Ok(None)` (which would read as an unknown principal).
 ///
-/// Spec: main-session decision 3; RFC 4120 3.1.3, 3.3.3.
+/// Spec: main-session decision 3; RFC 4120 3.1.3, 3.3.3; docs/50 §3.7.
 pub trait AccountSource {
     /// The client principal (realm, name), matched exactly.
     fn client(
@@ -228,7 +250,7 @@ pub struct DuplicatePrincipal;
 pub struct InMemoryAccounts {
     clients: BTreeMap<NameKey, ClientAccount>,
     services: BTreeMap<NameKey, ServiceAccount>,
-    unavailable: bool,
+    fault: Option<AccountSourceError>,
 }
 
 impl InMemoryAccounts {
@@ -290,9 +312,18 @@ impl InMemoryAccounts {
         self.clients.remove(&name_key(realm, name))
     }
 
-    /// Make every lookup fail (to exercise the fail-closed path).
+    /// Make every lookup fail as [`AccountSourceError::Unavailable`] — the
+    /// source cannot be reached (to exercise KDC_ERR_SVC_UNAVAILABLE); `false`
+    /// restores normal answers.
     pub fn set_unavailable(&mut self, unavailable: bool) {
-        self.unavailable = unavailable;
+        self.fault = unavailable.then_some(AccountSourceError::Unavailable);
+    }
+
+    /// Make every lookup fail as [`AccountSourceError::Failed`] — the source
+    /// cannot tell (to exercise the KRB_ERR_GENERIC path); `false` restores
+    /// normal answers.
+    pub fn set_failing(&mut self, failing: bool) {
+        self.fault = failing.then_some(AccountSourceError::Failed);
     }
 }
 
@@ -302,8 +333,8 @@ impl AccountSource for InMemoryAccounts {
         realm: &Realm,
         name: &PrincipalName,
     ) -> Result<Option<ClientAccount>, AccountSourceError> {
-        if self.unavailable {
-            return Err(AccountSourceError);
+        if let Some(fault) = self.fault {
+            return Err(fault);
         }
         Ok(self.clients.get(&name_key(realm, name)).cloned())
     }
@@ -313,8 +344,8 @@ impl AccountSource for InMemoryAccounts {
         realm: &Realm,
         name: &PrincipalName,
     ) -> Result<Option<ServiceAccount>, AccountSourceError> {
-        if self.unavailable {
-            return Err(AccountSourceError);
+        if let Some(fault) = self.fault {
+            return Err(fault);
         }
         Ok(self.services.get(&name_key(realm, name)).cloned())
     }
@@ -396,7 +427,17 @@ mod tests {
             Err(DuplicatePrincipal)
         );
         source.set_unavailable(true);
-        assert_eq!(source.service(&p.realm, &p.name), Err(AccountSourceError));
+        assert_eq!(
+            source.service(&p.realm, &p.name),
+            Err(AccountSourceError::Unavailable)
+        );
+        source.set_failing(true);
+        assert_eq!(
+            source.client(&p.realm, &p.name),
+            Err(AccountSourceError::Failed)
+        );
+        source.set_failing(false);
+        assert!(source.service(&p.realm, &p.name).unwrap().is_some());
     }
 
     /// docs/48 §7.3 / Q-127 interim (P-10): only a computer account with

@@ -567,23 +567,23 @@ impl DirectoryView<'_> {
     pub fn krbtgt_handle(&self, domain_sid: &Sid) -> Result<KeyHandle, AccountSourceError> {
         let mut sub = domain_sid.sub_authority().to_vec();
         sub.push(DOMAIN_USER_RID_KRBTGT);
-        let sid =
-            Sid::new(domain_sid.identifier_authority(), &sub).map_err(|_| AccountSourceError)?;
+        let sid = Sid::new(domain_sid.identifier_authority(), &sub)
+            .map_err(|_| AccountSourceError::Failed)?;
         let ids = self.ctx.ids;
         let guid = self
             .snapshot
             .lookup_unique(ids.object_sid, &sid.encode())
-            .map_err(|_| AccountSourceError)?
-            .ok_or(AccountSourceError)?;
+            .map_err(|_| AccountSourceError::Failed)?
+            .ok_or(AccountSourceError::Failed)?;
         let obj = self
             .snapshot
             .get_object(guid)
-            .map_err(|_| AccountSourceError)?
-            .ok_or(AccountSourceError)?;
+            .map_err(|_| AccountSourceError::Failed)?
+            .ok_or(AccountSourceError::Failed)?;
         if self.most_specific_class(&obj)? != ids.user
             || record::text(&obj, ids.sam_account_name)? != Some(KRBTGT)
         {
-            return Err(AccountSourceError);
+            return Err(AccountSourceError::Failed);
         }
         Ok(KeyHandle::new(principal_id(guid), KeyPurpose::Krbtgt))
     }

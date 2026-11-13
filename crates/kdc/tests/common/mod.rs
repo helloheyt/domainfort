@@ -39,8 +39,8 @@ use kdc::{
     Transport,
 };
 use keyd::{
-    AuditRecord, CallerId, EntropyError, EntropySource, InMemoryKeyStore, KeyHandle, KeyPurpose,
-    Keyd, KeydConfig, PrincipalBinding, PrincipalId, Role, TicketPolicy,
+    AuditRecord, CallerId, ConfigDescription, EntropyError, EntropySource, InMemoryKeyStore,
+    KeyHandle, KeyPurpose, Keyd, KeydConfig, PrincipalBinding, PrincipalId, Role, TicketPolicy,
 };
 use krb_crypto::{EncType, KeyUsage, ProtocolKey};
 use krb_proto::constants::{
@@ -338,6 +338,13 @@ pub fn now() -> KerberosTime {
     kt("20261113100000Z")
 }
 
+/// When the keyd behind the KDC started: the day before [`now`], so that
+/// its startup hold-down (RFC 4120 3.2.3; docs/50 R50-6) is long over for
+/// every test that is not about it.
+pub fn keyd_started() -> KerberosTime {
+    kt("20261112100000Z")
+}
+
 /// `now` shifted by whole seconds within the same day.
 pub fn at(offset_secs: i64) -> KerberosTime {
     let total = 10 * 3600 + offset_secs;
@@ -364,13 +371,28 @@ pub fn till_max() -> KerberosTime {
 
 pub type TestKeyd = Keyd<InMemoryKeyStore, KeydAudit, TestEntropy>;
 
-/// The real keyd behind the KDC (`LocalKeyd`), with one test switch:
+/// A keyd operation of the `Kdc` role, for [`TestCustody::unavailable`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustodyOp {
+    VerifyPreauth,
+    IssueAsRep,
+    OpenFastArmor,
+    OpenAndVerifyTgt,
+    IssueTgsRep,
+    SealFastError,
+}
+
+/// The real keyd behind the KDC (`LocalKeyd`), with two test switches:
 /// `refuse_seal` makes `seal_fast_error` fail as keyd does when the
 /// conversation's token is gone (e.g. expired) — to exercise the KDC's
-/// unarmored fallback (docs/questions/Q-125 item 10). TESTS ONLY.
+/// unarmored fallback (docs/questions/Q-125 item 10); `unavailable` makes the
+/// listed operations answer `Unavailable` without reaching keyd, as the IPC
+/// client must when keyd is down, the deadline passes or keyd is Busy
+/// (docs/50 §3.7; A-56). TESTS ONLY.
 pub struct TestCustody {
     pub inner: LocalKeyd<InMemoryKeyStore, KeydAudit, TestEntropy>,
     pub refuse_seal: bool,
+    pub unavailable: Vec<CustodyOp>,
 }
 
 impl TestCustody {
@@ -383,8 +405,14 @@ impl TestCustody {
     }
 }
 
+impl TestCustody {
+    fn down(&self, op: CustodyOp) -> bool {
+        self.unavailable.contains(&op)
+    }
+}
+
 impl KeyCustody for TestCustody {
-    fn config(&self) -> &KeydConfig {
+    fn config(&self) -> &ConfigDescription {
         self.inner.config()
     }
     fn verify_preauth(
@@ -394,6 +422,9 @@ impl KeyCustody for TestCustody {
         armor: Option<keyd::ArmorId>,
         now: &KerberosTime,
     ) -> Result<keyd::AuthnProof, keyd::AuthnError> {
+        if self.down(CustodyOp::VerifyPreauth) {
+            return Err(keyd::AuthnError::Unavailable);
+        }
         self.inner.verify_preauth(client, padata, armor, now)
     }
     fn issue_as_rep(
@@ -405,6 +436,9 @@ impl KeyCustody for TestCustody {
         template: &keyd::AsTicketTemplate,
         now: &KerberosTime,
     ) -> Result<keyd::AsRepParts, keyd::IssueError> {
+        if self.down(CustodyOp::IssueAsRep) {
+            return Err(keyd::IssueError::Unavailable);
+        }
         self.inner
             .issue_as_rep(client, krbtgt, proof, armor, template, now)
     }
@@ -415,6 +449,9 @@ impl KeyCustody for TestCustody {
         outer_req_body: &[u8],
         now: &KerberosTime,
     ) -> Result<keyd::FastArmor, keyd::AuthnError> {
+        if self.down(CustodyOp::OpenFastArmor) {
+            return Err(keyd::AuthnError::Unavailable);
+        }
         self.inner
             .open_fast_armor(krbtgt, armored_req, outer_req_body, now)
     }
@@ -426,6 +463,9 @@ impl KeyCustody for TestCustody {
         fast: Option<keyd::TgsFastRequest<'_>>,
         now: &KerberosTime,
     ) -> Result<keyd::TgtContext, keyd::AuthnError> {
+        if self.down(CustodyOp::OpenAndVerifyTgt) {
+            return Err(keyd::AuthnError::Unavailable);
+        }
         self.inner
             .open_and_verify_tgt(krbtgt, ap_req, req_body, fast, now)
     }
@@ -436,6 +476,9 @@ impl KeyCustody for TestCustody {
         template: &keyd::TgsTicketTemplate,
         now: &KerberosTime,
     ) -> Result<keyd::TgsRepParts, keyd::IssueError> {
+        if self.down(CustodyOp::IssueTgsRep) {
+            return Err(keyd::IssueError::Unavailable);
+        }
         self.inner.issue_tgs_rep(service, ctx, template, now)
     }
     fn seal_fast_error(
@@ -445,6 +488,9 @@ impl KeyCustody for TestCustody {
         padata: &[PaData],
         now: &KerberosTime,
     ) -> Result<EncryptedData, keyd::Error> {
+        if self.down(CustodyOp::SealFastError) {
+            return Err(keyd::Error::Unavailable);
+        }
         if self.refuse_seal {
             return Err(keyd::Error::Denied);
         }
@@ -473,6 +519,13 @@ pub struct Setup {
     pub keyd: KeydConfig,
     pub kdc: KdcConfig,
     pub rules: Vec<Rule>,
+    /// When keyd starts (default [`keyd_started`]: its hold-down is over).
+    pub keyd_started: KerberosTime,
+    /// The computer account's TGT, if a test brings one (from another
+    /// fixture — the keys are the same scripted bytes): then the fixture
+    /// does not obtain it through its own KDC, which a keyd still in its
+    /// startup hold-down would refuse.
+    pub machine_tgt: Option<Tgt>,
 }
 
 impl Setup {
@@ -484,6 +537,8 @@ impl Setup {
             keyd,
             kdc: KdcConfig::new(realm(), KRBTGT),
             rules: vec![allow_kerberos()],
+            keyd_started: keyd_started(),
+            machine_tgt: None,
         }
     }
 
@@ -556,8 +611,14 @@ impl Fixture {
     fn from_setup(setup: Setup) -> Self {
         let entropy = TestEntropy::default();
         let store = InMemoryKeyStore::new_insecure_development_allowing_krbtgt(64);
-        let mut keyd =
-            Keyd::with_entropy(setup.keyd, store, KeydAudit::default(), entropy.clone()).unwrap();
+        let mut keyd = Keyd::with_entropy(
+            setup.keyd,
+            store,
+            KeydAudit::default(),
+            entropy.clone(),
+            &setup.keyd_started,
+        )
+        .unwrap();
         let n = now();
         let enctypes = keyd.config().enctypes.clone();
         for (handle, binding, key) in [
@@ -629,6 +690,7 @@ impl Fixture {
         let custody = TestCustody {
             inner: LocalKeyd::new(keyd, KDC_CALLER).unwrap(),
             refuse_seal: false,
+            unavailable: Vec::new(),
         };
         let mut kdc = Kdc::new(
             setup.kdc,
@@ -649,26 +711,31 @@ impl Fixture {
 
         // The computer account's TGT, through the unarmored bootstrap path
         // (docs/48 §7.3) under an allow-all policy of its own, whatever the
-        // test's rules are; then every sink is cleared so that each test sees
-        // only its own requests.
-        let allow = snapshot(vec![allow_kerberos()]);
-        let bootstrap = AsReqSpec::machine()
-            .with_timestamp(&machine_key(AES256))
-            .encode();
-        let reply = kdc.handle(
-            &bootstrap,
-            Peer {
-                transport: Transport::Tcp,
-                src_net: IpScope::Internal,
-            },
-            n,
-            &PolicyInputs {
-                snapshot: &allow,
-                pip: &pip,
-            },
-            &accounts,
-        );
-        let machine_tgt = open_as_rep(&sent(reply), &machine_key(AES256));
+        // test's rules are — unless the test brought one; then every sink is
+        // cleared so that each test sees only its own requests.
+        let machine_tgt = match setup.machine_tgt {
+            Some(tgt) => tgt,
+            None => {
+                let allow = snapshot(vec![allow_kerberos()]);
+                let bootstrap = AsReqSpec::machine()
+                    .with_timestamp(&machine_key(AES256))
+                    .encode();
+                let reply = kdc.handle(
+                    &bootstrap,
+                    Peer {
+                        transport: Transport::Tcp,
+                        src_net: IpScope::Internal,
+                    },
+                    n,
+                    &PolicyInputs {
+                        snapshot: &allow,
+                        pip: &pip,
+                    },
+                    &accounts,
+                );
+                open_as_rep(&sent(reply), &machine_key(AES256))
+            }
+        };
         kdc.audit_sink_mut().events.clear();
         kdc.custody_mut()
             .keyd_mut()

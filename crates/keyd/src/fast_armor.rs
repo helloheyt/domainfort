@@ -63,7 +63,7 @@ use crate::audit::{AuditReason, AuditSink};
 use crate::authz::{CallerId, HandleSlot, Operation};
 use crate::entropy::EntropySource;
 use crate::error::{AuthnError, Deny, Error, Internal};
-use crate::keyd::{authorize, draw, key_usage, new_random_key, open, seal, AuditFields, Keyd};
+use crate::keyd::{draw, key_usage, new_random_key, open, seal, AuditFields, Keyd};
 use crate::model::KeyHandle;
 use crate::store::KeyStore;
 use crate::template::tgs_name;
@@ -597,7 +597,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     ///
     /// Checks failing as the uniform `AuthnError::Denied` (reason to audit
     /// only):
-    /// 1. authorize (Kdc; krbtgt handle Krbtgt);
+    /// 1. authorize and admit (Kdc; krbtgt handle Krbtgt);
     /// 2. the armor is present, of type FX_FAST_ARMOR_AP_REQUEST, and its
     ///    value is a DER AP-REQ without USE-SESSION-KEY (the KDC checks the
     ///    first two before calling — RFC 6113 5.4.1 / 5.4.2 — keyd checks
@@ -662,10 +662,11 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         now: &KerberosTime,
         fields: &mut AuditFields,
     ) -> Internal<FastArmor> {
-        authorize(
+        self.admit(
             caller,
             Operation::OpenFastArmor,
             &[(HandleSlot::Primary, krbtgt)],
+            now,
         )?;
         let now_s = kerberos_time_seconds(now);
 
@@ -770,7 +771,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// PA-FX-FAST, RFC 6113 5.4.4). keyd checks the content so that a
     /// compromised KDC can only ever have an error sealed — never a reply
     /// that reads as success (docs/48 §6.1):
-    /// 1. authorize (Kdc; no handle — the conversation token is the
+    /// 1. authorize and admit (Kdc; no handle — the conversation token is the
     ///    authority);
     /// 2. consume the token: live, issued to this caller (`Denied`
     ///    otherwise; destroyed either way) — `As`: the armor id; `Tgs`: the
@@ -818,7 +819,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         padata: &[PaData],
         now: &KerberosTime,
     ) -> Internal<EncryptedData> {
-        authorize(caller, Operation::SealFastError, &[])?;
+        self.admit(caller, Operation::SealFastError, &[], now)?;
         let now_s = kerberos_time_seconds(now);
 
         // 2. The conversation's token (I4), consumed either way.

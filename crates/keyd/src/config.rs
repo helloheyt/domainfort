@@ -248,6 +248,54 @@ impl KeydConfig {
     pub(crate) fn supports(&self, enctype: EncType) -> bool {
         self.enctypes.contains(&enctype)
     }
+
+    /// The non-secret part of this configuration that other processes need
+    /// — what `describe_config` returns.
+    /// Spec: docs/50 §3.4 (`DescribeConfig`), §7.5 step 4.
+    pub fn description(&self) -> ConfigDescription {
+        ConfigDescription {
+            realm: self.realm.clone(),
+            enctypes: self.enctypes.clone(),
+            clock_skew_secs: self.clock_skew_secs,
+            token_lifetime_secs: self.token_lifetime_secs,
+            ticket_policy: self.ticket_policy,
+            s2k_params: self.s2k_params,
+        }
+    }
+}
+
+/// The non-secret part of keyd's configuration: what the kdc needs at start
+/// (`KdcConfig::validate`: realm; planning tickets keyd will accept:
+/// enctypes, clock skew, ticket policy) and what the directory process needs
+/// to describe keyd's keys (realm, enctypes, string-to-key parameters —
+/// docs/47 §7.3, R47-10). The result of `describe_config`.
+///
+/// Nothing here is secret: the realm and the policy are public, and the
+/// enctypes and s2kparams are what the KDC itself sends to clients in
+/// PA-ETYPE-INFO2 (RFC 4120 5.2.7.5). The table capacities and the throttle
+/// policies are not described (minimalism, docs/25 §5).
+///
+/// Spec: docs/50 §3.4 (`DescribeConfig`: "realm, enctypes, clock_skew_secs,
+/// token_lifetime_secs, ticket_policy"), §7.5 step 4; docs/47 §7.3 (R47-10);
+/// RFC 4120 5.2.7.5; docs/questions/Q-240 item 2 (`s2k_params` added).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigDescription {
+    /// The realm keyd serves ([`KeydConfig::realm`]).
+    pub realm: Realm,
+    /// The encryption types, in keyd's preference order
+    /// ([`KeydConfig::enctypes`]).
+    pub enctypes: Vec<EncType>,
+    /// The acceptable clock skew in seconds ([`KeydConfig::clock_skew_secs`]).
+    pub clock_skew_secs: u32,
+    /// The one-time token lifetime in seconds
+    /// ([`KeydConfig::token_lifetime_secs`]).
+    pub token_lifetime_secs: u32,
+    /// The ticket policy keyd enforces on every template
+    /// ([`KeydConfig::ticket_policy`]).
+    pub ticket_policy: TicketPolicy,
+    /// The string-to-key parameters `set_secret` uses
+    /// ([`KeydConfig::s2k_params`]).
+    pub s2k_params: Option<[u8; 4]>,
 }
 
 #[cfg(test)]

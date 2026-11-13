@@ -59,6 +59,18 @@
 //!   validate) are KDC_ERR_BADOPTION; unrecognised options are ignored
 //!   (RFC 4120 §2). See [`options`].
 //! - **KRB-ERROR:** never e-text, never internal detail; stime from `now`.
+//! - **Unavailable dependencies (docs/50 §3.7, R50-8; decision A-56):** when
+//!   keyd does not serve a call — the `Unavailable` variant of its errors:
+//!   its startup hold-down (RFC 4120 3.2.3), or, at the IPC client, keyd
+//!   down / a deadline / Busy — or the account source cannot be reached
+//!   ([`AccountSourceError::Unavailable`]), the request fails closed with
+//!   KDC_ERR_SVC_UNAVAILABLE (RFC 4120 7.5.9, code 29) over TCP and nothing
+//!   over UDP, audited `CustodyUnavailable` / `AccountSourceUnavailable` —
+//!   never as a wrong password (PREAUTH_FAILED) or a forged request
+//!   (BAD_INTEGRITY). It is decided before any secret-dependent work and
+//!   independently of the request's content, so it is no oracle.
+//!   [`KeyCustody::config`] is keyd's non-secret `ConfigDescription` (over
+//!   IPC, `describe_config`, docs/50 §3.4, §7.5).
 //! - **Bounds:** [`MAX_REQUEST_LEN`]; the retransmit cache (RFC 4120 3.1.2)
 //!   is bounded in entries and octets.
 //! - **Audit:** exactly one [`AuditEvent`] per request, with the FAST armor
@@ -80,7 +92,8 @@
 //! - The directory-backed [`AccountSource`] is the `directory-pip` crate
 //!   (docs/47 R47-11); the in-memory [`InMemoryAccounts`] serves tests and
 //!   fuzzing.
-//! - The keyd IPC client (D34) implementing [`KeyCustody`].
+//! - The keyd IPC client (D34) implementing [`KeyCustody`] — reporting every
+//!   transport failure as `Unavailable` (docs/50 task P5).
 //! - Which group SID the deployment's `pdp::mandatory_fast_rules` names as
 //!   the bootstrap set (Q-130, with P-10).
 //!
@@ -112,6 +125,13 @@
 //!   `revoked_before` (RFC 4120 3.3.3.1).
 //! - **`now` is trusted:** the caller's clock decides every time check
 //!   (RFC 4120 §1.6 / §10: clock synchronisation must itself be secured).
+//! - **The PIP is not covered by `Unavailable`:** a directory process that
+//!   becomes unreachable between the account lookup and the PDP's
+//!   `expand_groups` / `tier_of` makes the PIP fail, which the PDP turns into
+//!   Deny (D40) — KDC_ERR_POLICY, fail closed (docs/questions/Q-240 item 4).
+//! - **Unavailable reveals availability:** a client learns that keyd or the
+//!   directory cannot serve now — operational state, independent of every
+//!   secret (A-56).
 //! - **FAST interpretations awaiting the lab** (docs/questions/Q-120..Q-126,
 //!   Q-145, Q-150): among them the single PA-ETYPE-INFO2 entry of an armored
 //!   PREAUTH_REQUIRED (the key keyd will use, Q-123), the fixed
@@ -141,8 +161,9 @@
 //! docs/02 §3, docs/10 (§5א included), docs/11, docs/25 §3-§5, docs/30
 //! §1-§3, §7, docs/45 §10, docs/48 (decided A-33),
 //! docs/questions/PENDING-OWNER.md (A-17, A-19, A-22, A-23, A-24..A-27,
-//! A-32, A-33, A-39, A-42, A-43, P-10), docs/questions/Q-120..Q-127, Q-130,
-//! Q-145, Q-150; and the source and documentation of this project's own
+//! A-32, A-33, A-39, A-42, A-43, A-56, P-10), docs/questions/Q-120..Q-127,
+//! Q-130, Q-145, Q-150, Q-217, Q-222, Q-240; docs/50 (R50-6, R50-8, §3.4,
+//! §3.5, §3.7, §7.5); and the source and documentation of this project's own
 //! crates keyd, pdp, krb-proto and dtyp. No other implementation was
 //! consulted or recalled.
 //!

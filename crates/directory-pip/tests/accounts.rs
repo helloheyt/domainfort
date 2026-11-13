@@ -173,7 +173,10 @@ fn rid_502_is_refused_whatever_its_name() {
     d.create_all(objects);
     let view = d.view();
     assert_eq!(client(&view, &["kdcsvc"]), Ok(None));
-    assert_eq!(view.krbtgt_handle(&domain_sid()), Err(AccountSourceError));
+    assert_eq!(
+        view.krbtgt_handle(&domain_sid()),
+        Err(AccountSourceError::Failed)
+    );
 }
 
 /// docs/47 §1.3 TGS (R47-1), §2.3 (KeyHandle = (objectGUID, Service)),
@@ -389,7 +392,7 @@ fn account_expires() {
     // Beyond 9999-12-31 (but not "never"): an error, not "never".
     assert_eq!(
         state_of("expires-beyond", &base(Some(i64::MAX - 1))),
-        Err(AccountSourceError)
+        Err(AccountSourceError::Failed)
     );
 }
 
@@ -492,7 +495,7 @@ fn missing_or_inconsistent_user_account_control() {
                     ("pwdLastSet", vec![int64(PWD_LAST_SET)]),
                 ]
             ),
-            Err(AccountSourceError),
+            Err(AccountSourceError::Failed),
             "{test}"
         );
     }
@@ -558,6 +561,6 @@ fn missing_when_created_is_an_error() {
                 ("whenCreated", vec![]),
             ]
         ),
-        Err(AccountSourceError)
+        Err(AccountSourceError::Failed)
     );
 }

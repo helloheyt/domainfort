@@ -3,18 +3,22 @@
 //! (authorization, audit emission, sealing).
 //!
 //! Every public operation follows the same shape:
-//! 1. authorize — role in the capability table (I2), handle purposes (I3);
+//! 1. admit — role in the capability table (I2), handle purposes (I3), then
+//!    the startup hold-down (RFC 4120 3.2.3; [`Keyd::admit`]);
 //! 2. do the work on an internal result carrying the audit-only reason;
 //! 3. emit exactly one audit record (I8);
 //! 4. map to the public error (docs/10 §9): uniform, except the non-secret
 //!    classes an authentication step reports after its cryptographic chain
-//!    completed (A-26).
+//!    completed (A-26), and `Unavailable` for the hold-down (A-56).
 //!
-//! Spec: docs/10 §2, §3 ("every call is recorded"), §9, §10, §12; A-26.
+//! Spec: docs/10 §2, §3 ("every call is recorded"), §9, §10, §12; A-26;
+//! RFC 4120 3.2.3; docs/50 R50-5, R50-6, §3.5; A-56.
 
 use crate::as_exchange::ProofEntry;
 use crate::audit::{AuditKeyRef, AuditOutcome, AuditReason, AuditRecord, AuditSink};
-use crate::authz::{purpose_permitted, role_permits, CallerId, HandleSlot, Operation};
+use crate::authz::{
+    purpose_permitted, role_permits, startup_hold_down_applies, CallerId, HandleSlot, Operation,
+};
 use crate::config::KeydConfig;
 use crate::entropy::{EntropySource, OsEntropy};
 use crate::error::{ConfigError, Deny, Internal};
@@ -25,6 +29,7 @@ use crate::service_ticket::ServiceContextEntry;
 use crate::store::{KeyStore, StoreError};
 use crate::tgs_exchange::ContextEntry;
 use crate::throttle::{FailureWindowThrottle, SecretThrottle};
+use crate::time::kerberos_time_seconds;
 use crate::tokens::TokenTable;
 use core::fmt;
 use krb_crypto::{EncType, KeyUsage, ProtocolKey, CONFOUNDER_LENGTH};
@@ -55,35 +60,98 @@ pub struct Keyd<S: KeyStore, A: AuditSink, E: EntropySource = OsEntropy> {
     pub(crate) service_contexts: TokenTable<ServiceContextEntry>,
     /// The one replay cache of every AP-REQ keyd verifies (RFC 4120 3.2.3).
     pub(crate) replay: ReplayCache,
+    /// The last second (on the [`kerberos_time_seconds`] scale) of the
+    /// startup hold-down: the start time given at construction plus
+    /// [`STARTUP_HOLD_DOWN_SKEW_INTERVALS`] × `clock_skew_secs`
+    /// ([`startup_hold_down_until`]). Operations that
+    /// [`startup_hold_down_applies`] to are refused while the caller's `now`
+    /// is not later than this.
+    /// Spec: RFC 4120 3.2.3; docs/50 R50-6, §3.5; A-56, A-62.
+    pub(crate) startup_hold_down_until: i64,
+}
+
+/// How many clock-skew intervals the startup hold-down lasts: two.
+///
+/// RFC 4120 3.2.3 requires rejecting requests "until the clock skew interval
+/// has passed, providing assurance that any lost or replayed authenticators
+/// will fall outside the allowable clock skew". That assurance needs two
+/// intervals here: an authenticator keyd accepted just before it
+/// (re)started, at server time ≈ S, may carry a client time `ctime` up to
+/// S + skew (a client clock ahead by the skew is still accepted); it stays
+/// acceptable while `now ≤ ctime + skew` — until S + 2·skew — and the
+/// replay cache that would have caught it was lost in the restart. One
+/// interval would leave a replay window of up to one more interval; two
+/// close it (fail closed).
+///
+/// Spec: RFC 4120 3.2.3 (replay cache; skew check "differ by more than the
+/// allowable clock skew"); docs/questions/Q-240 item 3 (decided A-62).
+pub(crate) const STARTUP_HOLD_DOWN_SKEW_INTERVALS: i64 = 2;
+
+/// The last held second: `started_at + 2 × clock_skew_secs`, in overflow-safe
+/// arithmetic — a product or sum that does not fit holds for good
+/// (`i64::MAX`, fail closed). Unreachable with validated inputs (seconds are
+/// below 2^39, time.rs; the skew is at most `MAX_CLOCK_SKEW_SECS`).
+/// Spec: RFC 4120 3.2.3; A-62; AGENTS.md §6 (fail closed).
+pub(crate) fn startup_hold_down_until(started_at: i64, clock_skew_secs: u32) -> i64 {
+    i64::from(clock_skew_secs)
+        .checked_mul(STARTUP_HOLD_DOWN_SKEW_INTERVALS)
+        .and_then(|window| started_at.checked_add(window))
+        .unwrap_or(i64::MAX)
 }
 
 impl<S: KeyStore, A: AuditSink> Keyd<S, A, OsEntropy> {
     /// Build keyd with the operating-system entropy source (the only source
     /// permitted outside tests). The configuration is validated first.
     ///
-    /// Spec: docs/10 §11; AGENTS.md §6.
-    pub fn new(config: KeydConfig, store: S, audit: A) -> Result<Self, ConfigError> {
-        Self::with_entropy(config, store, audit, OsEntropy::new())
+    /// `started_at` is the time this keyd starts, read by the daemon from
+    /// its OWN clock — the same clock it reads `now` from for every
+    /// operation (docs/50 R50-5). keyd's replay cache and token tables start
+    /// empty, so every operation that depends on them is refused (as
+    /// `Unavailable`) until `now` is later than `started_at + 2 ×
+    /// clock_skew_secs` (RFC 4120 3.2.3, A-62: an authenticator accepted just
+    /// before the start may carry a client time up to one skew ahead and
+    /// stays acceptable one skew after that; docs/10 §11;
+    /// [`crate::authz::startup_hold_down_applies`]).
+    /// The library reads no clock. **An IPC layer must never take the start
+    /// time or any operation's `now` from the peer**: a compromised caller
+    /// could otherwise end the hold-down early, or replay an expired ticket
+    /// or an out-of-window authenticator (docs/50 §3.5, R50-5; A-56).
+    ///
+    /// Spec: docs/10 §11; AGENTS.md §6; RFC 4120 3.2.3; docs/50 R50-5,
+    /// R50-6, §3.5; docs/questions/Q-222 (A-56), Q-240 item 3 (A-62).
+    pub fn new(
+        config: KeydConfig,
+        store: S,
+        audit: A,
+        started_at: &KerberosTime,
+    ) -> Result<Self, ConfigError> {
+        Self::with_entropy(config, store, audit, OsEntropy::new(), started_at)
     }
 }
 
 impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
-    /// Build keyd with an injected entropy source.
+    /// Build keyd with an injected entropy source; `started_at` as for
+    /// [`Keyd::new`].
     ///
     /// **TESTS ONLY.** Production code must use [`Keyd::new`], which uses
     /// the kernel CSPRNG ([`OsEntropy`]). A deterministic source makes every
     /// session key and long-term key predictable.
     ///
-    /// Spec: AGENTS.md §6 (never implement an RNG; approved sources only).
+    /// Spec: AGENTS.md §6 (never implement an RNG; approved sources only);
+    /// RFC 4120 3.2.3; docs/50 R50-6.
     pub fn with_entropy(
         config: KeydConfig,
         store: S,
         audit: A,
         entropy: E,
+        started_at: &KerberosTime,
     ) -> Result<Self, ConfigError> {
         config.validate()?;
         let throttle = Box::new(FailureWindowThrottle::new(config.throttle));
+        let startup_hold_down_until =
+            startup_hold_down_until(kerberos_time_seconds(started_at), config.clock_skew_secs);
         Ok(Keyd {
+            startup_hold_down_until,
             proofs: TokenTable::new(config.max_authn_proofs),
             contexts: TokenTable::new(config.max_tgt_contexts),
             armors: TokenTable::new(config.max_armor_contexts),
@@ -116,6 +184,43 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// Mutable access to the audit sink (e.g. to drain it).
     pub fn audit_sink_mut(&mut self) -> &mut A {
         &mut self.audit
+    }
+
+    /// The first step of every operation: the role and purpose checks
+    /// ([`authorize`], I2, I3), then the startup hold-down.
+    ///
+    /// The hold-down is decided from `now`, the start time and the operation
+    /// alone — before any key set, token, throttle window or replay-cache
+    /// entry is read or written, and never from the request's content — so
+    /// a held request leaves no state behind and its refusal reveals nothing
+    /// about any secret (no oracle, A-56). It ends once `now` is LATER than
+    /// `started_at + 2 × clock_skew_secs` (A-62; why two intervals:
+    /// [`STARTUP_HOLD_DOWN_SKEW_INTERVALS`]; arithmetic that overflows holds,
+    /// [`startup_hold_down_until`]). The boundary second itself is still
+    /// held: the skew check is inclusive
+    /// ([`crate::time`] `within_skew`, `|now − ctime| ≤ skew`). A `now`
+    /// before the start (a clock stepped back) is held too: the elapsed time
+    /// cannot be established (fail closed).
+    ///
+    /// Spec: docs/10 §2, §11, §12 I2, I3; RFC 4120 3.2.3 ("MUST reject all
+    /// requests until the clock skew interval has passed, providing assurance
+    /// that any lost or replayed authenticators will fall outside the
+    /// allowable clock skew"); docs/50 R50-6, §3.5; docs/questions/Q-222
+    /// (A-56), Q-240 items 1, 3 (A-62); AGENTS.md §6 (fail closed).
+    pub(crate) fn admit(
+        &self,
+        caller: &CallerId,
+        op: Operation,
+        handles: &[(HandleSlot, &KeyHandle)],
+        now: &KerberosTime,
+    ) -> Internal<()> {
+        authorize(caller, op, handles)?;
+        if startup_hold_down_applies(op)
+            && kerberos_time_seconds(now) <= self.startup_hold_down_until
+        {
+            return Err(Deny::startup_hold_down());
+        }
+        Ok(())
     }
 
     /// Emit the one audit record of an operation. Spec: docs/10 §10, I8.
@@ -184,10 +289,11 @@ impl AuditFields {
 
 /// The two checks that precede every operation: (a) the caller's role
 /// permits the operation, (b) each handle's purpose matches its slot.
-/// Mismatch is `Denied` (and audited by the caller of this helper).
+/// Mismatch is `Denied` (and audited by the caller of this helper). Called
+/// only through [`Keyd::admit`], which adds the startup hold-down.
 ///
 /// Spec: docs/10 §2, §12 I2, I3.
-pub(crate) fn authorize(
+fn authorize(
     caller: &CallerId,
     op: Operation,
     handles: &[(HandleSlot, &KeyHandle)],
@@ -284,5 +390,22 @@ pub(crate) fn store_deny(error: StoreError) -> Deny {
         StoreError::Exists => Deny::denied(AuditReason::KeyExists),
         StoreError::Full => Deny::unavailable(AuditReason::StoreFull),
         StoreError::NotFound => Deny::denied(AuditReason::KeyNotFound),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A-62: the hold-down ends two skew intervals after the start; a sum
+    /// that cannot be represented holds for good (fail closed, AGENTS.md §6).
+    #[test]
+    fn hold_down_is_two_skew_intervals_and_overflow_holds() {
+        assert_eq!(startup_hold_down_until(1_000, 300), 1_600);
+        assert_eq!(startup_hold_down_until(0, 1), 2);
+        assert_eq!(startup_hold_down_until(i64::MAX - 599, 300), i64::MAX);
+        assert_eq!(startup_hold_down_until(i64::MAX - 600, 300), i64::MAX);
+        assert_eq!(startup_hold_down_until(i64::MAX - 601, 300), i64::MAX - 1);
+        assert_eq!(startup_hold_down_until(i64::MAX, u32::MAX), i64::MAX);
     }
 }

@@ -13,10 +13,24 @@
 //! (decision A-26, docs/questions/Q-071). The specific reason always goes to
 //! audit ([`crate::audit::AuditReason`]).
 //!
+//! One more outcome is not a class but a refusal to serve at all:
+//! [`AuthnError::Unavailable`] / [`IssueError::Unavailable`] (and the existing
+//! [`Error::Unavailable`]) — keyd is in its startup hold-down (RFC 4120
+//! 3.2.3: a server that lost its replay cache "MUST reject all requests until
+//! the clock skew interval has passed"; two intervals here, A-62). It is
+//! decided right after the role
+//! and purpose checks, before any key, token, throttle or replay-cache state
+//! is touched, from the caller's `now` and keyd's start time alone — never
+//! from the request's content — so it reveals nothing about any secret and is
+//! no oracle (decision A-56, docs/questions/Q-217). An IPC client of keyd
+//! reports its own transport failures (keyd down, deadline, Busy) through the
+//! same variants (docs/50 §3.7, R50-8).
+//!
 //! Spec: docs/10 §9 (`AuthnError { Denied }`, `IssueError { Denied,
 //! BadTemplate }`, `Error { Denied, Unavailable, RateLimited }`) as amended by
-//! A-26; docs/09 א.3 (5) uniform errors; RFC 4120 3.2.3, 3.3.2 (the codes
-//! these classes correspond to); AGENTS.md §6 (no secrets in errors).
+//! A-26 and A-56; docs/09 א.3 (5) uniform errors; RFC 4120 3.2.3, 3.3.2 (the
+//! codes these classes correspond to); docs/50 R50-6, R50-8, §3.5, §3.7;
+//! AGENTS.md §6 (no secrets in errors).
 
 use crate::audit::{AuditOutcome, AuditReason};
 use core::fmt;
@@ -60,6 +74,14 @@ pub enum AuthnError {
     /// The authenticator was already presented. Spec: RFC 4120 3.2.3, 3.3.2
     /// (KRB_AP_ERR_REPEAT); A-26.
     Replay,
+    /// keyd does not serve this operation now: its startup hold-down (RFC
+    /// 4120 3.2.3) — or, at an IPC client, keyd cannot be reached. Decided
+    /// before any secret-dependent work and independent of the request's
+    /// content (A-56). The KDC answers KDC_ERR_SVC_UNAVAILABLE (RFC 4120
+    /// 7.5.9, code 29), never a "wrong password" code.
+    /// Spec: RFC 4120 3.2.3, 7.5.9; docs/50 R50-6, R50-8; docs/questions/Q-217,
+    /// Q-222 (A-56).
+    Unavailable,
 }
 
 /// Error of an issuance step (`issue_as_rep`, `issue_tgs_rep`).
@@ -72,17 +94,25 @@ pub enum IssueError {
     /// enctype, nonce). Reveals nothing secret: template rules are public
     /// policy. Spec: docs/10 §9 ("BadTemplate only on structure").
     BadTemplate,
+    /// keyd does not serve this operation now (startup hold-down, RFC 4120
+    /// 3.2.3; or keyd unreachable, at an IPC client). Decided before any
+    /// secret-dependent work (A-56).
+    /// Spec: RFC 4120 3.2.3, 7.5.9; docs/50 R50-6, R50-8; docs/questions/Q-217,
+    /// Q-222 (A-56).
+    Unavailable,
 }
 
-/// Error of a management or secret operation (`create_key`, `rotate_key`,
-/// `rotate_krbtgt`, `retire_kvno`, `destroy_key_set`, `set_secret`,
-/// `verify_secret`).
-/// Spec: docs/10 §9.
+/// Error of a management, secret or daemon-support operation (`create_key`,
+/// `rotate_key`, `rotate_krbtgt`, `retire_kvno`, `destroy_key_set`,
+/// `set_secret`, `verify_secret`, `seal_fast_error`, `describe_config`,
+/// `ping`).
+/// Spec: docs/10 §9; docs/50 §3.4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     /// Uniform refusal. Spec: docs/10 §9.
     Denied,
-    /// keyd cannot perform the operation now (entropy or capacity failure).
+    /// keyd cannot perform the operation now (entropy or capacity failure,
+    /// or — `seal_fast_error` — the startup hold-down, RFC 4120 3.2.3).
     Unavailable,
     /// Refused by the throttling hook. Spec: docs/10 §6 ("throttled").
     RateLimited,
@@ -130,10 +160,12 @@ impl_display!(AuthnError,
     AuthnError::TicketNotYetValid => "ticket not yet valid",
     AuthnError::Skew => "clock skew too great",
     AuthnError::Replay => "replay",
+    AuthnError::Unavailable => "unavailable",
 );
 impl_display!(IssueError,
     IssueError::Denied => "denied",
     IssueError::BadTemplate => "bad ticket template",
+    IssueError::Unavailable => "unavailable",
 );
 impl_display!(Error,
     Error::Denied => "denied",
@@ -151,9 +183,11 @@ impl_display!(ConfigError,
     ConfigError::Throttle => "invalid throttle policy",
 );
 
-/// Internal refusal: the public error kind plus the audit-only reason, and —
-/// only for a refusal decided after an authentication step's cryptographic
-/// chain completed — the non-secret class reported to the caller.
+/// Internal refusal: the public error kind plus the audit-only reason, and
+/// the non-secret class reported to the caller — set only for a refusal
+/// decided after an authentication step's cryptographic chain completed
+/// ([`Deny::classified`], A-26), or for the startup hold-down
+/// ([`Deny::startup_hold_down`], A-56: decided before any secret work).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Deny {
     pub(crate) outcome: AuditOutcome,
@@ -204,6 +238,21 @@ impl Deny {
             class: None,
         }
     }
+
+    /// The startup hold-down refusal: reported as `Unavailable` by every
+    /// error type (`AuthnError`, `IssueError`, `Error`). Built ONLY by
+    /// `Keyd::admit`, after the role and purpose checks and before any key,
+    /// token, throttle or replay-cache state is read — so it depends on the
+    /// caller's `now` and keyd's start time alone, never on a secret.
+    /// Spec: RFC 4120 3.2.3; docs/50 R50-6, §3.5; docs/questions/Q-217,
+    /// Q-222 (A-56).
+    pub(crate) const fn startup_hold_down() -> Self {
+        Deny {
+            outcome: AuditOutcome::Unavailable,
+            reason: AuditReason::StartupHoldDown,
+            class: Some(AuthnError::Unavailable),
+        }
+    }
 }
 
 /// Internal result type.
@@ -212,16 +261,23 @@ pub(crate) type Internal<T> = core::result::Result<T, Deny>;
 impl From<Deny> for AuthnError {
     /// Every refusal of an authentication step is `Denied` (docs/10 §9),
     /// except one built with [`Deny::classified`] after the cryptographic
-    /// chain completed (A-26).
+    /// chain completed (A-26), and the startup hold-down (`Unavailable`,
+    /// A-56). Other `Unavailable` outcomes (entropy, a full table) stay the
+    /// uniform `Denied`: some are decided inside the chain, where telling
+    /// them apart could be an oracle (A-26).
     fn from(deny: Deny) -> Self {
         deny.class.unwrap_or(AuthnError::Denied)
     }
 }
 
 impl From<Deny> for IssueError {
-    /// Only template failures surface as `BadTemplate`; everything else is
-    /// `Denied` (docs/10 §9).
+    /// Only template failures surface as `BadTemplate`, and only the startup
+    /// hold-down as `Unavailable` (A-56); everything else is `Denied`
+    /// (docs/10 §9).
     fn from(deny: Deny) -> Self {
+        if deny.class == Some(AuthnError::Unavailable) {
+            return IssueError::Unavailable;
+        }
         match deny.outcome {
             AuditOutcome::BadTemplate => IssueError::BadTemplate,
             _ => IssueError::Denied,

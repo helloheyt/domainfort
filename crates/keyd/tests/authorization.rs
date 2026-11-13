@@ -166,6 +166,9 @@ fn invoke(f: &mut Fixture, op: Operation, caller: &CallerId, handle: &KeyHandle)
             .keyd
             .open_and_verify_service_ticket(caller, handle, &dummy_ap_req().encode().unwrap(), &n)
             .is_ok(),
+        // No handle (docs/50 §3.4): `handle` is unused.
+        Operation::DescribeConfig => f.keyd.describe_config(caller, &n).is_ok(),
+        Operation::Ping => f.keyd.ping(caller, &n).is_ok(),
     }
 }
 
@@ -178,6 +181,8 @@ fn valid_handle(op: Operation) -> KeyHandle {
         Operation::IssueTgsRep | Operation::RotateKey | Operation::RetireKvno => SERVICE,
         Operation::DestroyKeySet | Operation::OpenAndVerifyServiceTicket => SERVICE,
         Operation::SetSecret | Operation::VerifySecret => ALICE,
+        // No handle (docs/50 §3.4); unused.
+        Operation::DescribeConfig | Operation::Ping => ALICE,
         Operation::CreateKey => {
             KeyHandle::new(PrincipalId::from_bytes([0x99; 16]), KeyPurpose::Service)
         }
@@ -235,8 +240,12 @@ fn wrong_purpose_is_denied_for_every_operation() {
     ];
     for op in Operation::ALL {
         // seal_fast_error takes no handle: the armor token is its authority
-        // (docs/48 §2.3); there is no purpose to mismatch.
-        if op == Operation::SealFastError {
+        // (docs/48 §2.3); describe_config and ping take none either (docs/50
+        // §3.4). There is no purpose to mismatch.
+        if matches!(
+            op,
+            Operation::SealFastError | Operation::DescribeConfig | Operation::Ping
+        ) {
             continue;
         }
         let role = ROLES.into_iter().find(|r| role_permits(*r, op)).unwrap();
@@ -295,11 +304,13 @@ fn issue_as_rep_krbtgt_slot_purpose() {
 /// The compile-time capability table is exactly the phase-1 subset of
 /// docs/10 §2: Kdc -> AS/TGS operations (and the FAST armor operations of
 /// docs/48 §2.3); Directory -> set/verify secret; Admin -> key lifecycle;
-/// Ldap -> service-ticket verification only. No role holds a read-key
-/// operation (none exists).
+/// Ldap -> service-ticket verification; plus the daemon-support operations
+/// of docs/50 §3.4 — describe_config for Kdc and Ldap, ping for every role.
+/// No role holds a read-key operation (none exists).
 /// Source: docs/10 §2, §7 ("no read operation for a key — in any role");
 /// docs/48 §2.3, §9.1 I2; docs/questions/Q-115 (A-35: destroy_key_set is
-/// an Admin operation); docs/questions/Q-165 item 3 (A-46: Role::Ldap).
+/// an Admin operation); docs/questions/Q-165 item 3 (A-46: Role::Ldap);
+/// docs/50 §3.4 (`DescribeConfig`: Kdc, Ldap; `Ping`: every mapped role).
 #[test]
 fn capability_table_matches_design() {
     use Operation::*;
@@ -313,9 +324,11 @@ fn capability_table_matches_design() {
                 IssueTgsRep,
                 OpenFastArmor,
                 SealFastError,
+                DescribeConfig,
+                Ping,
             ],
         ),
-        (Role::Directory, &[SetSecret, VerifySecret]),
+        (Role::Directory, &[SetSecret, VerifySecret, Ping]),
         (
             Role::Admin,
             &[
@@ -324,9 +337,13 @@ fn capability_table_matches_design() {
                 RotateKrbtgt,
                 RetireKvno,
                 DestroyKeySet,
+                Ping,
             ],
         ),
-        (Role::Ldap, &[OpenAndVerifyServiceTicket]),
+        (
+            Role::Ldap,
+            &[OpenAndVerifyServiceTicket, DescribeConfig, Ping],
+        ),
     ];
     assert_eq!(CAPABILITY_TABLE.len(), expected.len());
     for ((role, ops), (exp_role, exp_ops)) in CAPABILITY_TABLE.iter().zip(expected.iter()) {

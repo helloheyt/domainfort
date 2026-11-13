@@ -51,7 +51,7 @@ use crate::error::{AuthnError, Deny, Internal, IssueError};
 use crate::fast_armor::{
     open_armored_request, seal_fast_reply, seal_strengthened, ticket_armor_key, ArmoredConversation,
 };
-use crate::keyd::{authorize, draw, key_usage, new_random_key, open, seal, AuditFields, Keyd};
+use crate::keyd::{draw, key_usage, new_random_key, open, seal, AuditFields, Keyd};
 use crate::model::KeyHandle;
 use crate::replay::{ReplayKey, ReplayRefusal};
 use crate::store::{KeyStore, KvnoKeys};
@@ -398,7 +398,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     ///
     /// Checks failing as the uniform `AuthnError::Denied` (reason to audit
     /// only):
-    /// 1. authorize (Kdc; krbtgt handle Krbtgt);
+    /// 1. authorize and admit (Kdc; krbtgt handle Krbtgt);
     /// 2. no USE-SESSION-KEY ap-option (user-to-user not implemented);
     /// 3. `req_body` decodes as KDC-REQ-BODY for this realm, without
     ///    enc-authorization-data; FAST only: no explicit armor field (Q-124),
@@ -486,10 +486,11 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         now: &KerberosTime,
         fields: &mut AuditFields,
     ) -> Internal<TgtContext> {
-        authorize(
+        self.admit(
             caller,
             Operation::OpenAndVerifyTgt,
             &[(HandleSlot::Primary, krbtgt)],
+            now,
         )?;
         let now_s = kerberos_time_seconds(now);
 
@@ -831,7 +832,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// `issue_tgs_rep`: consume `ctx` and issue a service ticket — armored
     /// when the context was opened with FAST.
     ///
-    /// 1. authorize (Kdc; service handle Service);
+    /// 1. authorize and admit (Kdc; service handle Service);
     /// 2. the context: live and issued to this caller (`Denied` otherwise;
     ///    destroyed either way). A context opened without FAST is consumed
     ///    now, whatever follows (unchanged). An ARMORED context is consumed
@@ -890,10 +891,11 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         now: &KerberosTime,
         fields: &mut AuditFields,
     ) -> Internal<TgsRepParts> {
-        authorize(
+        self.admit(
             caller,
             Operation::IssueTgsRep,
             &[(HandleSlot::Primary, service)],
+            now,
         )?;
         let now_s = kerberos_time_seconds(now);
 

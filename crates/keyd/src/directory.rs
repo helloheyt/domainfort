@@ -28,7 +28,7 @@ use crate::authz::{CallerId, HandleSlot, Operation};
 use crate::config::KeydConfig;
 use crate::entropy::EntropySource;
 use crate::error::{Deny, Error, Internal};
-use crate::keyd::{authorize, draw, key_usage, new_random_key, store_deny, AuditFields, Keyd};
+use crate::keyd::{draw, key_usage, new_random_key, store_deny, AuditFields, Keyd};
 use crate::model::{KeyHandle, Kvno, PrincipalBinding};
 use crate::store::{KeyStore, KvnoKeys, StoredKeySet};
 use crate::template::{check_binding, check_new_binding};
@@ -77,26 +77,28 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         now: &KerberosTime,
     ) -> Result<Kvno, Error> {
         let mut fields = AuditFields::for_handle(handle);
-        let result = self.set_secret_inner(caller, handle, binding, &password, salt, &mut fields);
+        let result = self
+            .admit(
+                caller,
+                Operation::SetSecret,
+                &[(HandleSlot::Primary, handle)],
+                now,
+            )
+            .and_then(|()| self.set_secret_inner(handle, binding, &password, salt, &mut fields));
         drop(password);
         self.emit(caller, Operation::SetSecret, now, &fields, &result);
         result.map_err(Error::from)
     }
 
+    /// `set_secret` after [`Keyd::admit`] passed.
     fn set_secret_inner(
         &mut self,
-        caller: &CallerId,
         handle: &KeyHandle,
         binding: &PrincipalBinding,
         password: &str,
         salt: &str,
         fields: &mut AuditFields,
     ) -> Internal<Kvno> {
-        authorize(
-            caller,
-            Operation::SetSecret,
-            &[(HandleSlot::Primary, handle)],
-        )?;
         if !self.store.accepts(handle.purpose) {
             return Err(Deny::denied(AuditReason::StoreRefusedCritical));
         }
@@ -174,10 +176,11 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         now: &KerberosTime,
         fields: &mut AuditFields,
     ) -> Internal<()> {
-        authorize(
+        self.admit(
             caller,
             Operation::VerifySecret,
             &[(HandleSlot::Primary, handle)],
+            now,
         )?;
         let now_s = kerberos_time_seconds(now);
         if !self.throttle.admit(&handle.principal, now_s) {
@@ -369,8 +372,11 @@ mod tests {
         store.insert(below_max, seeded(u32::MAX - 1)).unwrap();
         let mut config = KeydConfig::new(Realm::new("EXAMPLE.ORG").unwrap());
         config.enctypes = vec![EncType::Aes256CtsHmacSha196];
-        let mut keyd = Keyd::new(config, store, Records::default()).unwrap();
         let now = KerberosTime::new(2026, 11, 13, 10, 0, 0).unwrap();
+        // Started a day earlier: the startup hold-down (Directory is not
+        // held anyway) is long over.
+        let started = KerberosTime::new(2026, 11, 12, 10, 0, 0).unwrap();
+        let mut keyd = Keyd::new(config, store, Records::default(), &started).unwrap();
 
         let refused = keyd.set_secret(
             &DIRECTORY,

@@ -9,17 +9,19 @@
 //!    refusal in an open FAST conversation armored by keyd's
 //!    `seal_fast_error` (RFC 6113 5.4.4; docs/48 §6.1), or, should keyd
 //!    refuse to seal it, the same code unarmored (docs/questions/Q-125 item
-//!    10) — apply the UDP size rule (RFC 4120 7.2.1), and emit exactly one
-//!    audit event (main-session decision 14), with the armor principal
-//!    (R48-11).
+//!    10); an unavailable keyd or account source is KDC_ERR_SVC_UNAVAILABLE
+//!    over TCP and nothing over UDP (docs/50 §3.7, R50-8; A-56) — apply the
+//!    UDP size rule (RFC 4120 7.2.1), and emit exactly one audit event
+//!    (main-session decision 14), with the armor principal (R48-11).
 //!
 //! No input path can panic: there is no indexing, unwrap or unchecked
 //! arithmetic on request data, and every fallible step maps to a refusal.
 //!
-//! Spec: RFC 4120 3.1, 3.3, 5.1.4, 5.9.1, 7.2; RFC 6113 5.4.4; docs/30
-//! §1-§3; docs/48 §2.4, §6; main-session decisions 1, 11, 12, 14.
+//! Spec: RFC 4120 3.1, 3.3, 5.1.4, 5.9.1, 7.2, 7.5.9; RFC 6113 5.4.4;
+//! docs/30 §1-§3; docs/48 §2.4, §6; docs/50 §3.7 (R50-8); main-session
+//! decisions 1, 11, 12, 14; A-56.
 
-use crate::accounts::{AccountSource, NamedPrincipal};
+use crate::accounts::{AccountSource, AccountSourceError, NamedPrincipal};
 use crate::audit::{ArmorAudit, AuditEvent, AuditOutcome, AuditReason, AuditSink, Exchange};
 use crate::config::{ConfigError, KdcConfig, MAX_REQUEST_LEN};
 use crate::custody::KeyCustody;
@@ -34,7 +36,8 @@ use crate::transport::{FramingError, KdcReply, Peer, Transport};
 use keyd::{ArmorId, CtxId, FastConversation, IssueError};
 use krb_proto::constants::{
     KDC_ERR_BAD_PVNO, KDC_ERR_CANNOT_POSTDATE, KDC_ERR_NEVER_VALID, KDC_ERR_POLICY,
-    KRB_AP_ERR_MSG_TYPE, KRB_ERR_FIELD_TOOLONG, KRB_ERR_GENERIC, KRB_ERR_RESPONSE_TOO_BIG,
+    KDC_ERR_SVC_UNAVAILABLE, KRB_AP_ERR_MSG_TYPE, KRB_ERR_FIELD_TOOLONG, KRB_ERR_GENERIC,
+    KRB_ERR_RESPONSE_TOO_BIG,
 };
 use krb_proto::{KdcReqBody, KdcRequest, KerberosTime, PaData, Realm};
 
@@ -78,12 +81,51 @@ impl Refusal {
         self.fast_padata = padata;
         self
     }
+
+    /// `true` for the refusal of an unavailable keyd or account source —
+    /// the only refusals with code KDC_ERR_SVC_UNAVAILABLE ([`unavailable`]).
+    /// Spec: RFC 4120 7.5.9; docs/50 §3.7.
+    pub(crate) fn is_unavailable(&self) -> bool {
+        self.code == KDC_ERR_SVC_UNAVAILABLE
+    }
 }
 
 /// Internal failures that leave no specific RFC 4120 code: KRB_ERR_GENERIC
 /// ("Generic error", 7.5.9) without e-text (main-session decision 11).
 pub(crate) fn internal(reason: AuditReason) -> Refusal {
     Refusal::new(KRB_ERR_GENERIC, reason)
+}
+
+/// A dependency did not serve the request: KDC_ERR_SVC_UNAVAILABLE ("29 A
+/// service is not available", RFC 4120 7.5.9) — never a code that reads as
+/// a wrong password or a forged request (docs/50 §3.7, R50-8). Over UDP
+/// nothing is sent (`Kdc::deliver_refusal`).
+/// Spec: RFC 4120 7.5.9; docs/50 §3.7 (R50-8); docs/questions/Q-217 (A-56).
+pub(crate) fn unavailable(reason: AuditReason) -> Refusal {
+    Refusal::new(KDC_ERR_SVC_UNAVAILABLE, reason)
+}
+
+/// keyd did not serve a call: the `Unavailable` variant of any of its errors
+/// — its startup hold-down (RFC 4120 3.2.3), or keyd down / a deadline /
+/// Busy at an IPC client. keyd decides it before any secret-dependent work
+/// and independently of the request's content, so the distinct code is no
+/// oracle (A-56).
+/// Spec: RFC 4120 3.2.3, 7.5.9; docs/50 R50-6, R50-8; docs/questions/Q-217,
+/// Q-222 (A-56).
+pub(crate) fn custody_unavailable() -> Refusal {
+    unavailable(AuditReason::CustodyUnavailable)
+}
+
+/// An account-source failure: `Unavailable` (the source cannot be reached)
+/// → KDC_ERR_SVC_UNAVAILABLE; `Failed` (it cannot tell) → KRB_ERR_GENERIC
+/// (main-session decision 3). Either way the request fails closed.
+/// Spec: main-session decision 3; RFC 4120 7.5.9; docs/50 §3.7 (R50-8:
+/// "dird down ⇒ fail closed with an explicit `Unavailable`"); A-56.
+pub(crate) fn account_source_refusal(error: AccountSourceError) -> Refusal {
+    match error {
+        AccountSourceError::Unavailable => unavailable(AuditReason::AccountSourceUnavailable),
+        AccountSourceError::Failed => internal(AuditReason::AccountSourceFailure),
+    }
 }
 
 /// RFC 4120 3.1.3 / 3.3.3 time refusals.
@@ -101,11 +143,14 @@ pub(crate) fn time_refusal(refusal: TimeRefusal) -> Refusal {
 /// validation — the final check (main-session decision 10) — rejected what the
 /// KDC planned under the same policy: a policy refusal, KDC_ERR_POLICY.
 /// `Denied` is an authorization, token, binding or key failure inside keyd
-/// that the KDC cannot explain to the client: KRB_ERR_GENERIC.
+/// that the KDC cannot explain to the client: KRB_ERR_GENERIC. `Unavailable`
+/// is keyd not serving the call: KDC_ERR_SVC_UNAVAILABLE ([`custody_unavailable`]).
+/// Spec: docs/10 §9; RFC 4120 7.5.9; A-56.
 pub(crate) fn issue_refusal(error: IssueError) -> Refusal {
     match error {
         IssueError::BadTemplate => Refusal::new(KDC_ERR_POLICY, AuditReason::TemplateRejected),
         IssueError::Denied => internal(AuditReason::IssueDenied),
+        IssueError::Unavailable => custody_unavailable(),
     }
 }
 
@@ -565,8 +610,18 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
     /// request's names, falling back to the KDC's own; over UDP,
     /// KRB_ERR_RESPONSE_TOO_BIG if it does not fit. In an open FAST
     /// conversation the refusal is armored (docs/48 §6.1, R48-6).
-    /// Spec: RFC 4120 5.9.1, 7.2.1; RFC 6113 5.4.4; docs/48 §6; main-session
-    /// decision 11.
+    ///
+    /// An unavailable keyd or account source ([`Refusal::is_unavailable`])
+    /// is answered KDC_ERR_SVC_UNAVAILABLE over TCP and with nothing over
+    /// UDP ("in TCP, and silence in UDP", docs/50 §3.7 — the KDC's UDP
+    /// silence rule, RFC 4120 5.1.4, extended as for undecodable datagrams).
+    /// When it is keyd that did not serve, the refusal is not sent to keyd to
+    /// be sealed — that would meet the same unavailable keyd (over IPC, the
+    /// same deadline again) — and goes out unarmored, as when keyd refuses to
+    /// seal (docs/questions/Q-125 item 10).
+    ///
+    /// Spec: RFC 4120 5.1.4, 5.9.1, 7.2.1, 7.5.9; RFC 6113 5.4.4; docs/48 §6;
+    /// docs/50 §3.7 (R50-8); main-session decision 11; A-56.
     fn deliver_refusal(
         &mut self,
         refusal: Refusal,
@@ -574,9 +629,30 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
         peer: Peer,
         now: KerberosTime,
     ) -> KdcReply {
+        let names = |armored: bool| {
+            Some(EventNames {
+                exchange: scope.exchange,
+                client: scope.client.clone(),
+                service: scope.service.clone(),
+                armor: scope.armor_audit(armored),
+            })
+        };
+        if refusal.is_unavailable() && peer.transport == Transport::Udp {
+            self.record(
+                peer,
+                now,
+                names(false),
+                AuditOutcome::Dropped,
+                refusal.reason,
+            );
+            return KdcReply::Silent;
+        }
         let code = refusal.code;
         let (e_data, reply_armored) = match &scope.conversation {
             None => (refusal.e_data.clone(), false),
+            Some(_) if refusal.reason == AuditReason::CustodyUnavailable => {
+                (refusal.e_data.clone(), false)
+            }
             Some(conversation) => {
                 match self.seal_refusal(conversation, &refusal, &scope.error, now) {
                     Some(armored) => (Some(armored), true),
@@ -599,14 +675,6 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
             }
             Some((bytes, armored)) => Some((bytes, code, armored)),
             None => None,
-        };
-        let names = |armored: bool| {
-            Some(EventNames {
-                exchange: scope.exchange,
-                client: scope.client.clone(),
-                service: scope.service.clone(),
-                armor: scope.armor_audit(armored),
-            })
         };
         match sent {
             Some((bytes, code, armored)) => {

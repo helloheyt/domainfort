@@ -2,14 +2,17 @@
 //! request is handled).
 //!
 //! Ticket policy (allowed flags, lifetimes), the clock skew and the AES
-//! encryption types are NOT configured here: they are keyd's
-//! ([`keyd::KeydConfig`]), so the KDC can never plan a ticket that keyd's
-//! template validation would not accept on the same terms.
+//! encryption types are NOT configured here: they are keyd's — the KDC reads
+//! them from keyd's non-secret [`keyd::ConfigDescription`] (over IPC, the
+//! answer of `describe_config`, docs/50 §3.4, §7.5 step 4) — so the KDC can
+//! never plan a ticket that keyd's template validation would not accept on
+//! the same terms.
 //!
-//! Spec: RFC 4120 §7.2 (transport), §8.2; main-session decisions 1, 3, 12.
+//! Spec: RFC 4120 §7.2 (transport), §8.2; main-session decisions 1, 3, 12;
+//! docs/50 §3.4, §7.5.
 
 use crate::krb_error::{krb_error, ErrorContext};
-use keyd::{KeyHandle, KeyPurpose, KeydConfig};
+use keyd::{ConfigDescription, KeyHandle, KeyPurpose};
 use krb_proto::constants::KRB_ERR_RESPONSE_TOO_BIG;
 use krb_proto::limits::MAX_MESSAGE_LEN;
 use krb_proto::{KerberosTime, Realm};
@@ -88,8 +91,10 @@ impl KdcConfig {
         }
     }
 
-    /// Check every field against keyd's configuration; any inconsistency is
-    /// refused (fail closed).
+    /// Check every field against keyd's (non-secret) configuration; any
+    /// inconsistency is refused (fail closed). docs/50 §7.5 step 4: the
+    /// kdc daemon runs this on keyd's `describe_config` answer before it
+    /// binds its ports.
     ///
     /// - the realm is keyd's realm (single realm, main-session decision 4);
     /// - the krbtgt handle has purpose `Krbtgt` (docs/10 §1, §4);
@@ -98,8 +103,8 @@ impl KdcConfig {
     ///   krb-proto's message bound;
     /// - the retransmit bounds are non-zero and within the memory bounds.
     ///
-    /// Spec: RFC 4120 7.2.1, 7.3; docs/10 §1; AGENTS.md §6.
-    pub fn validate(&self, keyd: &KeydConfig) -> Result<(), ConfigError> {
+    /// Spec: RFC 4120 7.2.1, 7.3; docs/10 §1; AGENTS.md §6; docs/50 §7.5.
+    pub fn validate(&self, keyd: &ConfigDescription) -> Result<(), ConfigError> {
         if self.realm.as_bytes() != keyd.realm.as_bytes() {
             return Err(ConfigError::RealmMismatch);
         }

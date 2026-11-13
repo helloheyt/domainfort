@@ -592,7 +592,7 @@ fn addresses_are_badoption() {
 #[test]
 fn account_source_failure_fails_closed() {
     let mut f = Fixture::new();
-    f.accounts().set_unavailable(true);
+    f.accounts().set_failing(true);
     let reply = f.send(&AsReqSpec::alice().encode());
     let error = error_of(reply);
     assert_eq!(error.error_code, KRB_ERR_GENERIC);

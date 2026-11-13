@@ -2,8 +2,10 @@
 //! no secret, and nothing an attacker could use as an oracle, in errors).
 //!
 //! Every lookup failure inside a view is a [`Fault`]; the trait boundaries
-//! map it to `kdc::AccountSourceError` (the request fails closed,
-//! KRB_ERR_GENERIC — Q-070 item 10) or to `pdp::PipError` (Deny — D40).
+//! map it to `kdc::AccountSourceError::Failed` (the request fails closed,
+//! KRB_ERR_GENERIC — Q-070 item 10) or to `pdp::PipError` (Deny — D40). An
+//! in-process view is never `AccountSourceError::Unavailable` (that is the
+//! directory process being unreachable, docs/50 §3.7).
 //!
 //! Spec: AGENTS.md §6 ("fail closed"; "secrets never appear in ... error
 //! messages"); docs/47 §5.3 item 3, §8; D40.
@@ -85,6 +87,6 @@ impl From<Fault> for kdc::AccountSourceError {
     /// Spec: kdc `AccountSource` ("`Err` means cannot tell and always refuses
     /// the request").
     fn from(_: Fault) -> kdc::AccountSourceError {
-        kdc::AccountSourceError
+        kdc::AccountSourceError::Failed
     }
 }

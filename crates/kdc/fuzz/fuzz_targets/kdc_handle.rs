@@ -415,13 +415,18 @@ fn build() -> FuzzState {
     let machine_name = name(1, &["fuzzhost$"]);
     let service_name = name(3, &["host", "target.fuzz.example"]);
 
+    let n = base_time();
+    // keyd started a day before the harness clock: its startup hold-down
+    // (RFC 4120 3.2.3; docs/50 R50-6) is over, so the fuzzer reaches every
+    // keyd path.
+    let started = KerberosTime::new(2026, 11, 12, 0, 0, 0).expect("valid time");
     let mut keyd = Keyd::new(
         KeydConfig::new(realm.clone()),
         InMemoryKeyStore::new_insecure_development_allowing_krbtgt(16),
         NoKeydAudit,
+        &started,
     )
     .expect("valid keyd config");
-    let n = base_time();
     for (handle, binding) in [(krbtgt, krbtgt_name()), (service, service_name.clone())] {
         keyd.create_key(
             &ADMIN,

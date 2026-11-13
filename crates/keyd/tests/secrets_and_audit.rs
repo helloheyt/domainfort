@@ -305,6 +305,14 @@ fn every_operation_emits_exactly_one_audit_record() {
         .open_and_verify_service_ticket(&KDC, &SERVICE, &[0x30, 0x00], &n);
     check(&f, Operation::OpenAndVerifyServiceTicket, &KDC, false);
 
+    // Daemon support (docs/50 §3.4): one record either way.
+    f.keyd.describe_config(&KDC, &n).unwrap();
+    check(&f, Operation::DescribeConfig, &KDC, true);
+    let _ = f.keyd.describe_config(&ADMIN, &n);
+    check(&f, Operation::DescribeConfig, &ADMIN, false);
+    f.keyd.ping(&DIRECTORY, &n).unwrap();
+    check(&f, Operation::Ping, &DIRECTORY, true);
+
     // Every operation was exercised.
     for op in Operation::ALL {
         assert!(expected.iter().any(|(o, _, _)| *o == op), "{op:?}");

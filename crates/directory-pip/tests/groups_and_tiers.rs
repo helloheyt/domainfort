@@ -84,7 +84,7 @@ fn cycle_is_an_error() {
     ]);
     d.set(80, "member", vec![ref_to(BOB), ref_to(81)]);
     let view = d.view();
-    assert_eq!(client_groups(&view, "bob"), Err(AccountSourceError));
+    assert_eq!(client_groups(&view, "bob"), Err(AccountSourceError::Failed));
     assert_eq!(view.expand_groups(&sid_of(BOB)), Err(PipError::Unavailable));
     // A group in the cycle, expanded itself, meets itself.
     assert_eq!(view.expand_groups(&sid_of(80)), Err(PipError::Unavailable));
@@ -132,7 +132,10 @@ fn nesting_depth_bound() {
     assert_eq!(groups.len(), 16);
     let d = Dir::standard("depth-17");
     chain(&d, 17);
-    assert_eq!(client_groups(&d.view(), "bob"), Err(AccountSourceError));
+    assert_eq!(
+        client_groups(&d.view(), "bob"),
+        Err(AccountSourceError::Failed)
+    );
     assert_eq!(
         d.view().expand_groups(&sid_of(BOB)),
         Err(PipError::Unavailable)
@@ -164,7 +167,7 @@ fn nesting_depth_counts_the_longest_path() {
         d.create_all(objects);
         assert_eq!(
             client_groups(&d.view(), "bob"),
-            Err(AccountSourceError),
+            Err(AccountSourceError::Failed),
             "{top}"
         );
         // Fifteen levels below top is fine: drop n16 from the chain.
@@ -211,7 +214,7 @@ fn group_count_bound() {
         .collect();
     d.create_all(objects);
     let view = d.view();
-    assert_eq!(client_groups(&view, "bob"), Err(AccountSourceError));
+    assert_eq!(client_groups(&view, "bob"), Err(AccountSourceError::Failed));
     assert_eq!(view.expand_groups(&sid_of(BOB)), Err(PipError::Unavailable));
 }
 

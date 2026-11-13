@@ -188,19 +188,19 @@ fn configuration_is_validated() {
     let keyd_config = KeydConfig::new(realm());
     let mut config = KdcConfig::new(krb_proto::Realm::new("OTHER.ORG").unwrap(), KRBTGT);
     assert_eq!(
-        config.validate(&keyd_config),
+        config.validate(&keyd_config.description()),
         Err(ConfigError::RealmMismatch)
     );
     config.realm = realm();
     config.krbtgt = keyd::KeyHandle::new(KRBTGT.principal, KeyPurpose::Service);
     assert_eq!(
-        config.validate(&keyd_config),
+        config.validate(&keyd_config.description()),
         Err(ConfigError::KrbtgtPurpose)
     );
     config.krbtgt = KRBTGT;
     config.retransmit_capacity = 0;
     assert_eq!(
-        config.validate(&keyd_config),
+        config.validate(&keyd_config.description()),
         Err(ConfigError::RetransmitBounds)
     );
     let keyd = Keyd::with_entropy(
@@ -208,6 +208,7 @@ fn configuration_is_validated() {
         InMemoryKeyStore::new(4),
         KeydAudit::default(),
         TestEntropy::default(),
+        &keyd_started(),
     )
     .unwrap();
     assert!(matches!(

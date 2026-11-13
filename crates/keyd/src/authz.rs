@@ -97,11 +97,17 @@ pub enum Operation {
     /// Spec: docs/10 §5ב; docs/49 §3.3; RFC 4120 3.2.3;
     /// docs/questions/Q-165 (A-46).
     OpenAndVerifyServiceTicket = 13,
+    /// The non-secret part of keyd's configuration, which the kdc needs at
+    /// start (`KdcConfig::validate`) — no key, no secret.
+    /// Spec: docs/50 §3.4 (`DescribeConfig`), §7.5 step 4.
+    DescribeConfig = 14,
+    /// Health check. Spec: docs/50 §3.4 (`Ping`), §7.5.
+    Ping = 15,
 }
 
 impl Operation {
     /// Every operation, for exhaustive checks. Spec: docs/10 §2.
-    pub const ALL: [Operation; 14] = [
+    pub const ALL: [Operation; 16] = [
         Operation::VerifyPreauth,
         Operation::IssueAsRep,
         Operation::OpenAndVerifyTgt,
@@ -116,6 +122,8 @@ impl Operation {
         Operation::SealFastError,
         Operation::DestroyKeySet,
         Operation::OpenAndVerifyServiceTicket,
+        Operation::DescribeConfig,
+        Operation::Ping,
     ];
 }
 
@@ -128,7 +136,8 @@ impl Operation {
 /// docs/questions/Q-115 (A-35: `destroy_key_set` is an Admin operation);
 /// docs/questions/Q-165 item 3 (A-46: `Ldap` holds only the service-ticket
 /// operations — in task L6a, `open_and_verify_service_ticket` alone;
-/// `seal_ap_rep` arrives with task L6b, docs/49 §12).
+/// `seal_ap_rep` arrives with task L6b, docs/49 §12); docs/50 §3.4
+/// (`DescribeConfig`: roles Kdc and Ldap; `Ping`: every mapped role), §7.5.
 pub const CAPABILITY_TABLE: [(Role, &[Operation]); 4] = [
     (
         Role::Kdc,
@@ -139,11 +148,17 @@ pub const CAPABILITY_TABLE: [(Role, &[Operation]); 4] = [
             Operation::IssueTgsRep,
             Operation::OpenFastArmor,
             Operation::SealFastError,
+            Operation::DescribeConfig,
+            Operation::Ping,
         ],
     ),
     (
         Role::Directory,
-        &[Operation::SetSecret, Operation::VerifySecret],
+        &[
+            Operation::SetSecret,
+            Operation::VerifySecret,
+            Operation::Ping,
+        ],
     ),
     (
         Role::Admin,
@@ -153,10 +168,65 @@ pub const CAPABILITY_TABLE: [(Role, &[Operation]); 4] = [
             Operation::RotateKrbtgt,
             Operation::RetireKvno,
             Operation::DestroyKeySet,
+            Operation::Ping,
         ],
     ),
-    (Role::Ldap, &[Operation::OpenAndVerifyServiceTicket]),
+    (
+        Role::Ldap,
+        &[
+            Operation::OpenAndVerifyServiceTicket,
+            Operation::DescribeConfig,
+            Operation::Ping,
+        ],
+    ),
 ];
+
+/// `true` if the operation is refused during keyd's startup hold-down: for
+/// two `clock_skew_secs` intervals after the start time given to `Keyd::new`
+/// (A-62: an authenticator accepted just before the restart may carry a
+/// client time up to one skew ahead and stays acceptable for one skew after
+/// that).
+///
+/// keyd's replay cache — the one cache of every AP-REQ it verifies (TGT,
+/// FAST armor, service ticket) — and its one-time token tables (AuthnProof,
+/// TGS contexts, armors, service contexts) live in memory and are empty
+/// after every start. RFC 4120 3.2.3: "If a server loses track of
+/// authenticators presented within the allowable clock skew, it MUST reject
+/// all requests until the clock skew interval has passed". Held: every
+/// operation of the Kerberos exchanges — the authentication steps that
+/// create replay-cache entries and tokens and the issuance / error steps
+/// that consume those tokens (the operations of roles Kdc and Ldap, docs/50
+/// R50-6). Not held: Directory and Admin operations, which use neither
+/// ("Directory/Admin are not dependent on the replay cache and are allowed",
+/// docs/50 §3.5), and `describe_config` / `ping`, which use neither and
+/// which the daemons need at start and for health (docs/50 §7.5) —
+/// interpretation recorded in docs/questions/Q-240 item 1.
+///
+/// The match is exhaustive: a new operation does not compile until it is
+/// decided here.
+///
+/// Spec: RFC 4120 3.2.3; docs/50 R50-6, §3.5, §7.5; docs/questions/Q-222
+/// (A-56), Q-240 (A-62).
+pub const fn startup_hold_down_applies(op: Operation) -> bool {
+    match op {
+        Operation::VerifyPreauth
+        | Operation::IssueAsRep
+        | Operation::OpenAndVerifyTgt
+        | Operation::IssueTgsRep
+        | Operation::OpenFastArmor
+        | Operation::SealFastError
+        | Operation::OpenAndVerifyServiceTicket => true,
+        Operation::SetSecret
+        | Operation::VerifySecret
+        | Operation::CreateKey
+        | Operation::RotateKey
+        | Operation::RotateKrbtgt
+        | Operation::RetireKvno
+        | Operation::DestroyKeySet
+        | Operation::DescribeConfig
+        | Operation::Ping => false,
+    }
+}
 
 /// `true` if [`CAPABILITY_TABLE`] lists `op` for `role`. Deny by default.
 ///
@@ -203,6 +273,8 @@ pub enum HandleSlot {
 ///   Krbtgt").
 /// - `seal_fast_error` takes no handle: the armor token is its authority
 ///   (docs/48 §2.3), so no slot of it is permitted.
+/// - `describe_config`, `ping` take no handle (docs/50 §3.4: no request
+///   fields), so no slot of them is permitted.
 /// - `issue_tgs_rep`: Service only. Referral TGTs (Krbtgt in docs/10 §5) are
 ///   cross-realm, which phase 1 does not implement.
 /// - `open_and_verify_service_ticket`: Service only — "only handles of type
@@ -310,13 +382,17 @@ const _: () = {
         KeyPurpose::Krbtgt
     ));
     // Service-ticket verification (docs/questions/Q-165 item 3, A-46):
-    // `Ldap` may call open_and_verify_service_ticket and nothing else, no
-    // other role may call it, and it opens only Service-purpose handles.
+    // `Ldap` may call open_and_verify_service_ticket and — docs/50 §3.4 —
+    // describe_config and ping, and nothing else; no other role may call
+    // open_and_verify_service_ticket, and it opens only Service-purpose
+    // handles.
     let mut i = 0;
     while i < Operation::ALL.len() {
         let op = Operation::ALL[i];
         let is_service_ticket = op as u8 == Operation::OpenAndVerifyServiceTicket as u8;
-        assert!(role_permits(Role::Ldap, op) == is_service_ticket);
+        let is_daemon_support =
+            op as u8 == Operation::DescribeConfig as u8 || op as u8 == Operation::Ping as u8;
+        assert!(role_permits(Role::Ldap, op) == (is_service_ticket || is_daemon_support));
         if is_service_ticket {
             assert!(!role_permits(Role::Kdc, op));
             assert!(!role_permits(Role::Directory, op));
@@ -324,6 +400,68 @@ const _: () = {
         }
         i += 1;
     }
+    // Daemon support (docs/50 §3.4, §7.5): describe_config for Kdc and Ldap
+    // only (Directory and Admin have no use for it); ping for every role.
+    // Neither takes a handle, so no purpose is permitted in any slot.
+    assert!(role_permits(Role::Kdc, Operation::DescribeConfig));
+    assert!(role_permits(Role::Ldap, Operation::DescribeConfig));
+    assert!(!role_permits(Role::Directory, Operation::DescribeConfig));
+    assert!(!role_permits(Role::Admin, Operation::DescribeConfig));
+    assert!(role_permits(Role::Kdc, Operation::Ping));
+    assert!(role_permits(Role::Directory, Operation::Ping));
+    assert!(role_permits(Role::Admin, Operation::Ping));
+    assert!(role_permits(Role::Ldap, Operation::Ping));
+    let purposes = [
+        KeyPurpose::PrincipalLongterm,
+        KeyPurpose::Krbtgt,
+        KeyPurpose::Service,
+    ];
+    let mut p = 0;
+    while p < purposes.len() {
+        assert!(!purpose_permitted(
+            Operation::DescribeConfig,
+            HandleSlot::Primary,
+            purposes[p]
+        ));
+        assert!(!purpose_permitted(
+            Operation::DescribeConfig,
+            HandleSlot::Krbtgt,
+            purposes[p]
+        ));
+        assert!(!purpose_permitted(
+            Operation::Ping,
+            HandleSlot::Primary,
+            purposes[p]
+        ));
+        assert!(!purpose_permitted(
+            Operation::Ping,
+            HandleSlot::Krbtgt,
+            purposes[p]
+        ));
+        p += 1;
+    }
+    // Startup hold-down (RFC 4120 3.2.3; docs/50 R50-6, §3.5; A-56): every
+    // operation of the Kerberos exchanges is held; no Directory or Admin
+    // operation is (docs/50 §3.5), nor describe_config / ping (Q-240 item 1).
+    let mut h = 0;
+    while h < Operation::ALL.len() {
+        let op = Operation::ALL[h];
+        if role_permits(Role::Directory, op) || role_permits(Role::Admin, op) {
+            assert!(!startup_hold_down_applies(op));
+        }
+        h += 1;
+    }
+    assert!(startup_hold_down_applies(Operation::VerifyPreauth));
+    assert!(startup_hold_down_applies(Operation::IssueAsRep));
+    assert!(startup_hold_down_applies(Operation::OpenAndVerifyTgt));
+    assert!(startup_hold_down_applies(Operation::IssueTgsRep));
+    assert!(startup_hold_down_applies(Operation::OpenFastArmor));
+    assert!(startup_hold_down_applies(Operation::SealFastError));
+    assert!(startup_hold_down_applies(
+        Operation::OpenAndVerifyServiceTicket
+    ));
+    assert!(!startup_hold_down_applies(Operation::DescribeConfig));
+    assert!(!startup_hold_down_applies(Operation::Ping));
     assert!(purpose_permitted(
         Operation::OpenAndVerifyServiceTicket,
         HandleSlot::Primary,
@@ -350,16 +488,37 @@ const _: () = {
 mod tests {
     use super::*;
 
-    /// Every operation is granted to exactly one role (docs/10 §2: each
-    /// process holds only its own operations).
+    const ROLES: [Role; 4] = [Role::Kdc, Role::Directory, Role::Admin, Role::Ldap];
+
+    /// Every key operation is granted to exactly one role (docs/10 §2: each
+    /// process holds only its own operations); the two daemon-support
+    /// operations, which touch no key, are shared as docs/50 §3.4 lists:
+    /// `DescribeConfig` — Kdc and Ldap; `Ping` — every mapped role.
     #[test]
-    fn each_operation_has_exactly_one_role() {
+    fn each_key_operation_has_exactly_one_role() {
         for op in Operation::ALL {
-            let roles = [Role::Kdc, Role::Directory, Role::Admin, Role::Ldap]
+            let roles: Vec<Role> = ROLES
                 .iter()
-                .filter(|r| role_permits(**r, op))
-                .count();
-            assert_eq!(roles, 1, "{op:?}");
+                .copied()
+                .filter(|r| role_permits(*r, op))
+                .collect();
+            match op {
+                Operation::DescribeConfig => assert_eq!(roles, [Role::Kdc, Role::Ldap]),
+                Operation::Ping => assert_eq!(roles, ROLES),
+                _ => assert_eq!(roles.len(), 1, "{op:?}"),
+            }
+        }
+    }
+
+    /// RFC 4120 3.2.3 / docs/50 R50-6, §3.5: exactly the operations of the
+    /// Kerberos exchanges (roles Kdc and Ldap, except the daemon-support
+    /// operations — Q-240 item 1) are held after start.
+    #[test]
+    fn hold_down_covers_exactly_the_kerberos_operations() {
+        for op in Operation::ALL {
+            let kerberos = (role_permits(Role::Kdc, op) || role_permits(Role::Ldap, op))
+                && !matches!(op, Operation::DescribeConfig | Operation::Ping);
+            assert_eq!(startup_hold_down_applies(op), kerberos, "{op:?}");
         }
     }
 }

@@ -8,7 +8,8 @@
 //! caller-supplied byte string. The detailed reason goes only here — the
 //! caller sees the uniform error of docs/10 §9, or, for a refusal decided
 //! after an authentication step's cryptographic chain completed, one of the
-//! four non-secret `AuthnError` classes (A-26).
+//! four non-secret `AuthnError` classes (A-26), or `Unavailable` for the
+//! startup hold-down (A-56).
 //!
 //! `duration_ns` from docs/10 §10 is not recorded: keyd reads no clock (time
 //! is passed in by the caller), so the IPC layer that owns the clock adds it.
@@ -31,7 +32,9 @@ pub enum AuditOutcome {
     Denied,
     /// Refused because the ticket template was structurally unacceptable.
     BadTemplate,
-    /// keyd could not perform the operation (entropy or capacity failure).
+    /// keyd could not perform the operation (entropy or capacity failure), or
+    /// did not serve it (the startup hold-down — reason
+    /// [`AuditReason::StartupHoldDown`]).
     Unavailable,
     /// Refused by the throttling hook.
     RateLimited,
@@ -252,6 +255,17 @@ pub enum AuditReason {
     /// refused rather than ignored. Spec: RFC 4120 5.5.1 (cksum, key usage
     /// 10); docs/49 §3.3, §12; docs/questions/Q-180 item 3.
     ApChecksumUnsupported,
+    /// The operation depends on the replay cache or the one-time token
+    /// tables, which keyd holds in memory and lost when it started; it is
+    /// refused until two clock-skew intervals after the start time have
+    /// passed ("If a server loses track of authenticators presented within
+    /// the allowable clock skew, it MUST reject all requests until the clock
+    /// skew interval has passed"; two intervals because a client clock may
+    /// be up to one skew ahead, A-62). Decided after the role / purpose checks
+    /// and before anything else (A-56).
+    /// Spec: RFC 4120 3.2.3; docs/50 R50-6, §3.5; docs/questions/Q-222
+    /// (A-56), Q-240 item 3 (A-62).
+    StartupHoldDown,
 }
 
 /// A key referenced by an operation, for audit (no key material).

@@ -41,7 +41,8 @@
 //!    docs/10 §5); starttime beyond the skew → KDC_ERR_CANNOT_POSTDATE
 //!    (3.3.3);
 //! 7. re-evaluation at use (D53, decision 8): the client account is read
-//!    again — source failure → KRB_ERR_GENERIC; gone, disabled, locked or
+//!    again — source failure → KRB_ERR_GENERIC (unreachable →
+//!    KDC_ERR_SVC_UNAVAILABLE); gone, disabled, locked or
 //!    expired → KDC_ERR_CLIENT_REVOKED; TGT authtime before the account's
 //!    revocation instant → KDC_ERR_TGT_REVOKED (3.3.3.1 hot-list);
 //! 8. the service account: unknown → KDC_ERR_S_PRINCIPAL_UNKNOWN; disabled,
@@ -60,10 +61,18 @@
 //!     cname of the TGT (3.3.3: "the client's name and realm ... of the
 //!     newly-issued ticket" come from the TGT).
 //!
+//! Every keyd call above (`open_and_verify_tgt`, `issue_tgs_rep`) that keyd
+//! does not serve — the `Unavailable` variant: its startup hold-down (RFC
+//! 4120 3.2.3), or keyd unreachable at an IPC client — and every lookup
+//! whose account source cannot be reached is KDC_ERR_SVC_UNAVAILABLE (7.5.9,
+//! code 29), never KRB_AP_ERR_BAD_INTEGRITY; nothing is sent over UDP
+//! (docs/50 §3.7, R50-8; A-56).
+//!
 //! Spec: RFC 4120 3.2.3, 3.3.2, 3.3.3, 3.3.3.1, 5.2.7.1, 5.4.1, 5.4.2, 7.5.9;
 //! RFC 6113 5.4.1.1, 5.4.2, 5.4.3, 5.4.4, 7.3; docs/30 §3; docs/10 §5, §5א;
-//! docs/48 §5, §6, §7.2; docs/25 §4 (D53); docs/questions/Q-124, Q-125
-//! (A-32), Q-150 (A-43); main-session decisions 3-10, 13; A-25, A-26.
+//! docs/48 §5, §6, §7.2; docs/25 §4 (D53); docs/50 §3.7 (R50-8);
+//! docs/questions/Q-124, Q-125 (A-32), Q-150 (A-43), Q-217 (A-56);
+//! main-session decisions 3-10, 13; A-25, A-26.
 
 use crate::accounts::AccountSource;
 use crate::as_exchange::has_unsupported_content;
@@ -72,7 +81,10 @@ use crate::custody::KeyCustody;
 use crate::etype::negotiate;
 use crate::fast::{armored_request, fx_fast_padata, fx_fast_reply, has_critical_fast_option};
 use crate::gate::{enforce, PolicyInputs, Question, RateLimiter};
-use crate::kdc::{internal, issue_refusal, time_refusal, Kdc, Refusal, Scope};
+use crate::kdc::{
+    account_source_refusal, custody_unavailable, internal, issue_refusal, time_refusal, Kdc,
+    Refusal, Scope,
+};
 use crate::lifetime::{check_starttime, plan, LifetimeRequest, Limits};
 use crate::names::{classify_server, same_realm, service_spn, ServerNameKind};
 use crate::options::{asks_unsupported_operation, delegation_flags, FlagRequests};
@@ -106,12 +118,16 @@ use pdp::{Action, KerbResKind, Resource, Spn};
 /// - `Skew` → KRB_AP_ERR_SKEW (3.2.3); the KRB-ERROR's stime is the KDC's
 ///   `now` (5.9.1);
 /// - `Replay` → KRB_AP_ERR_REPEAT (3.2.3; 3.3.2: "the KDC SHOULD return
-///   KRB_AP_ERR_REPEAT").
+///   KRB_AP_ERR_REPEAT");
+/// - `Unavailable` — keyd did not look at the request (its startup
+///   hold-down, or keyd unreachable) → KDC_ERR_SVC_UNAVAILABLE (7.5.9), never
+///   BAD_INTEGRITY (docs/50 §3.7, R50-8; A-56).
 ///
-/// Spec: RFC 4120 3.2.3, 3.3.2, 5.9.1; docs/questions/Q-071 (A-26), Q-125
-/// item 9.
+/// Spec: RFC 4120 3.2.3, 3.3.2, 5.9.1, 7.5.9; docs/questions/Q-071 (A-26),
+/// Q-125 item 9, Q-217 (A-56).
 fn tgt_refusal(error: AuthnError) -> Refusal {
     match error {
+        AuthnError::Unavailable => custody_unavailable(),
         AuthnError::Denied => Refusal::new(KRB_AP_ERR_BAD_INTEGRITY, AuditReason::TgtDenied),
         AuthnError::TicketExpired => Refusal::new(KRB_AP_ERR_TKT_EXPIRED, AuditReason::TgtExpired),
         AuthnError::TicketNotYetValid => {
@@ -278,7 +294,7 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
 
         // 7. Re-evaluate the client now (D53; decision 8; 3.3.3.1).
         let client = match accounts.client(&tgt.crealm, &tgt.cname) {
-            Err(_) => return Err(internal(AuditReason::AccountSourceFailure)),
+            Err(error) => return Err(account_source_refusal(error)),
             Ok(None) => {
                 return Err(Refusal::new(
                     KDC_ERR_CLIENT_REVOKED,
@@ -299,7 +315,7 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
 
         // 8. The service account (decisions 3, 8).
         let service = match accounts.service(&body.realm, sname) {
-            Err(_) => return Err(internal(AuditReason::AccountSourceFailure)),
+            Err(error) => return Err(account_source_refusal(error)),
             Ok(None) => {
                 return Err(Refusal::new(
                     KDC_ERR_S_PRINCIPAL_UNKNOWN,

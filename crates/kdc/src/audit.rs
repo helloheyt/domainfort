@@ -120,6 +120,20 @@ pub enum AuditReason {
     ServiceRevoked,
     /// The account source failed (fail closed). Spec: main-session decision 3.
     AccountSourceFailure,
+    /// The account source could not be reached (the directory process down,
+    /// an IPC deadline, Busy — `AccountSourceError::Unavailable`): answered
+    /// KDC_ERR_SVC_UNAVAILABLE over TCP, nothing over UDP.
+    /// Spec: RFC 4120 7.5.9 (code 29); docs/50 §3.7 (R50-8);
+    /// docs/questions/Q-217 (A-56).
+    AccountSourceUnavailable,
+    /// keyd did not serve the request: its startup hold-down (RFC 4120
+    /// 3.2.3), or — at an IPC client — keyd down, a deadline, Busy (the
+    /// `Unavailable` variant of keyd's errors). Never reported as a wrong
+    /// password or a failed integrity check: answered KDC_ERR_SVC_UNAVAILABLE
+    /// over TCP, nothing over UDP.
+    /// Spec: RFC 4120 3.2.3, 7.5.9 (code 29); docs/50 R50-6, §3.7 (R50-8);
+    /// docs/questions/Q-217, Q-222 (A-56).
+    CustodyUnavailable,
     /// The account source returned an inconsistent record (e.g. a key handle
     /// of the wrong purpose). Spec: docs/10 §2 (I3).
     AccountRecordInvalid,

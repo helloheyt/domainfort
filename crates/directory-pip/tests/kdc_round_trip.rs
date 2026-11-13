@@ -169,10 +169,14 @@ fn kdc_for(d: &Dir) -> TestKdc {
     let ws01 = view.service(&realm(), &service_name()).unwrap().unwrap();
     drop(view);
     let n = now();
+    // keyd started the day before: its startup hold-down (RFC 4120 3.2.3;
+    // docs/50 R50-6) is long over.
+    let started = kt(2026, 11, 12, 10, 0, 0);
     let mut keyd = Keyd::new(
         keyd_config(),
         InMemoryKeyStore::new_insecure_development_allowing_krbtgt(16),
         NoKeydAudit,
+        &started,
     )
     .unwrap();
     keyd.create_key(

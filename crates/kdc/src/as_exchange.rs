@@ -18,8 +18,9 @@
 //!     issues only TGTs, docs/30 §2);
 //! R5. starttime beyond the skew → KDC_ERR_CANNOT_POSTDATE (3.1.3);
 //! R6. the client account: source failure → KRB_ERR_GENERIC (fail closed,
-//!     decision 3); unknown → KDC_ERR_C_PRINCIPAL_UNKNOWN (3.1.3; user
-//!     enumeration is a documented residual, decision 5);
+//!     decision 3), source unreachable → KDC_ERR_SVC_UNAVAILABLE (7.5.9;
+//!     docs/50 §3.7, A-56); unknown → KDC_ERR_C_PRINCIPAL_UNKNOWN (3.1.3;
+//!     user enumeration is a documented residual, decision 5);
 //! R7. disabled / locked / expired → KDC_ERR_CLIENT_REVOKED, checked BEFORE
 //!     pre-authentication so that a locked or disabled account is never a
 //!     password-guessing oracle and keyd is never asked for it;
@@ -90,10 +91,17 @@
 //! A14. the AS-REP: padata = [PA-FX-FAST(enc-fast-rep)] only, crealm / cname
 //!     of the inner request (5.4.3, 5.4.5).
 //!
-//! Spec: RFC 4120 3.1.2, 3.1.3, 5.2.7.2-5.2.7.5, 5.4.1, 5.4.2, 7.3, 7.5.9;
-//! RFC 6113 2.4, 5.2, 5.4, 5.4.1, 5.4.1.1, 5.4.2, 5.4.3, 5.4.4, 5.4.5, 5.4.6,
-//! 7.3; docs/30 §2; docs/10 §4, §5א; docs/48 §3.1, §4, §6, §7, §8; Q-123,
-//! Q-125, Q-126 (A-32); Q-127 interim (P-10); main-session decisions 3-10.
+//! Every keyd call above (`open_fast_armor`, `verify_preauth`,
+//! `issue_as_rep`) that keyd does not serve — the `Unavailable` variant: its
+//! startup hold-down (RFC 4120 3.2.3), or keyd unreachable at an IPC client
+//! — is KDC_ERR_SVC_UNAVAILABLE (7.5.9, code 29), never PREAUTH_FAILED;
+//! nothing is sent over UDP (docs/50 §3.7, R50-8; A-56).
+//!
+//! Spec: RFC 4120 3.1.2, 3.1.3, 3.2.3, 5.2.7.2-5.2.7.5, 5.4.1, 5.4.2, 7.3,
+//! 7.5.9; RFC 6113 2.4, 5.2, 5.4, 5.4.1, 5.4.1.1, 5.4.2, 5.4.3, 5.4.4, 5.4.5,
+//! 5.4.6, 7.3; docs/30 §2; docs/10 §4, §5א; docs/48 §3.1, §4, §6, §7, §8;
+//! docs/50 §3.7 (R50-8); Q-123, Q-125, Q-126 (A-32); Q-127 interim (P-10);
+//! Q-217 (A-56); main-session decisions 3-10.
 
 use crate::accounts::{AccountSource, ClientAccount, NamedPrincipal};
 use crate::audit::{AuditReason, AuditSink};
@@ -104,7 +112,10 @@ use crate::fast::{
     has_critical_fast_option, inner_challenge,
 };
 use crate::gate::{enforce, PolicyInputs, Question, RateLimiter};
-use crate::kdc::{internal, issue_refusal, local_tgs_name, time_refusal, Kdc, Refusal, Scope};
+use crate::kdc::{
+    account_source_refusal, custody_unavailable, internal, issue_refusal, local_tgs_name,
+    time_refusal, Kdc, Refusal, Scope,
+};
 use crate::krb_error::{advertise, etype_info2, fast_required_e_data, preauth_required_e_data};
 use crate::lifetime::{check_starttime, plan, LifetimeRequest, Limits};
 use crate::names::{classify_server, same_realm, ServerNameKind};
@@ -154,13 +165,20 @@ pub(crate) fn has_unsupported_content(body: &KdcReqBody) -> bool {
 /// a throttled attempt is the same KDC_ERR_PREAUTH_FAILED as a wrong
 /// password — nothing tells the client the account exists or is under
 /// attack; keyd's own audit records `Throttled` (the KDC audit cannot tell it
-/// apart: docs/questions/Q-128).
-/// Spec: RFC 4120 3.1.3, 5.2.7.2, 3.1.5, 3.2.3; docs/questions/Q-071 (A-26);
-/// A-34.
+/// apart: docs/questions/Q-128). The one exception is `Unavailable` — keyd
+/// did not look at the timestamp at all (its startup hold-down, or keyd
+/// unreachable): KDC_ERR_SVC_UNAVAILABLE, so that a user is not told the
+/// password is wrong (docs/50 §3.7, R50-8; A-56).
+/// Spec: RFC 4120 3.1.3, 5.2.7.2, 3.1.5, 3.2.3, 7.5.9; docs/questions/Q-071
+/// (A-26); A-34; docs/questions/Q-217 (A-56).
 fn preauth_refusal(error: AuthnError) -> Refusal {
     let reason = match error {
+        AuthnError::Unavailable => return custody_unavailable(),
         AuthnError::Skew => AuditReason::PreauthSkew,
-        _ => AuditReason::PreauthDenied,
+        AuthnError::Denied
+        | AuthnError::TicketExpired
+        | AuthnError::TicketNotYetValid
+        | AuthnError::Replay => AuditReason::PreauthDenied,
     };
     Refusal::new(KDC_ERR_PREAUTH_FAILED, reason)
 }
@@ -178,15 +196,23 @@ fn preauth_refusal(error: AuthnError) -> Refusal {
 ///   armor) → KDC_ERR_PREAUTH_FAILED "including PA-ETYPE-INFO2 in the
 ///   KRBFastResponse" (5.4.6), and the cookie (5.2: "KDCs SHOULD include a
 ///   cookie in errors containing additional information allowing a client to
-///   retry").
+///   retry");
+/// - `Unavailable` (keyd did not serve the call) → KDC_ERR_SVC_UNAVAILABLE,
+///   sent unarmored over TCP (keyd cannot seal it) and not at all over UDP
+///   (docs/50 §3.7, R50-8; A-56).
 ///
 /// Spec: RFC 6113 5.2, 5.4.6; RFC 4120 7.5.9; docs/48 §4.1 A10, §6.3 (R48-6);
-/// docs/questions/Q-125 item 8 (A-32); A-26, A-34.
+/// docs/questions/Q-125 item 8 (A-32); A-26, A-34; docs/questions/Q-217
+/// (A-56).
 fn challenge_refusal(error: AuthnError, etype_info: PaData) -> Refusal {
     match error {
+        AuthnError::Unavailable => custody_unavailable(),
         AuthnError::Skew => Refusal::new(KRB_AP_ERR_SKEW, AuditReason::PreauthSkew)
             .with_fast_padata(vec![cookie_padata()]),
-        _ => Refusal::new(KDC_ERR_PREAUTH_FAILED, AuditReason::PreauthDenied)
+        AuthnError::Denied
+        | AuthnError::TicketExpired
+        | AuthnError::TicketNotYetValid
+        | AuthnError::Replay => Refusal::new(KDC_ERR_PREAUTH_FAILED, AuditReason::PreauthDenied)
             .with_fast_padata(vec![etype_info, cookie_padata()]),
     }
 }
@@ -312,7 +338,7 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
 
         // R6-R7. The client account and its state (3.1.3; decisions 3, 5, 8).
         let account = match accounts.client(&body.realm, cname) {
-            Err(_) => return Err(internal(AuditReason::AccountSourceFailure)),
+            Err(error) => return Err(account_source_refusal(error)),
             Ok(None) => {
                 return Err(Refusal::new(
                     KDC_ERR_C_PRINCIPAL_UNKNOWN,
@@ -554,7 +580,8 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
     /// hot-list the KDC also applies at TGS) — so a machine that was removed
     /// stops armoring at once, not when its TGT expires. Every failure is
     /// KDC_ERR_POLICY (sealed by the caller); an account-source failure is
-    /// KRB_ERR_GENERIC (fail closed).
+    /// KRB_ERR_GENERIC (fail closed), an unreachable account source
+    /// KDC_ERR_SVC_UNAVAILABLE (docs/50 §3.7).
     /// Spec: docs/48 §3.1 (option (b)), §4.1 A5; RFC 6113 5.4.1.1; RFC 4120
     /// 3.3.3.1; docs/questions/Q-125 item 6 (A-32); D126, D53.
     fn check_armor_principal(
@@ -566,7 +593,7 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
         accounts: &dyn AccountSource,
     ) -> Result<(), Refusal> {
         let account = match accounts.client(crealm, cname) {
-            Err(_) => return Err(internal(AuditReason::AccountSourceFailure)),
+            Err(error) => return Err(account_source_refusal(error)),
             Ok(None) => {
                 return Err(Refusal::new(
                     KDC_ERR_POLICY,

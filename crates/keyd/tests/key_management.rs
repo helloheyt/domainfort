@@ -36,6 +36,7 @@ fn krbtgt_refused_by_non_development_store() {
         store,
         CollectingAudit::default(),
         TestEntropy::default(),
+        &keyd_started(),
     )
     .unwrap();
     assert_eq!(

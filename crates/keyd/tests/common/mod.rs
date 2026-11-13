@@ -214,6 +214,13 @@ pub fn now() -> KerberosTime {
     kt("20261113100000Z")
 }
 
+/// When the keyd under test started: the day before [`now`], so that its
+/// startup hold-down (RFC 4120 3.2.3; docs/50 R50-6) is long over for every
+/// test that is not about the hold-down.
+pub fn keyd_started() -> KerberosTime {
+    kt("20261112100000Z")
+}
+
 /// `now` shifted by whole seconds (within the same day for these tests).
 pub fn at(offset_secs: i64) -> KerberosTime {
     let total = 10 * 3600 + offset_secs;
@@ -249,10 +256,23 @@ impl Fixture {
     }
 
     pub fn with_config(config: KeydConfig) -> Self {
+        Self::started(config, &keyd_started())
+    }
+
+    /// As [`Fixture::with_config`], for a keyd that started at `started_at`
+    /// (the startup hold-down tests). The keys are created and the passwords
+    /// set at [`now`]: Admin and Directory operations are not held.
+    pub fn started(config: KeydConfig, started_at: &KerberosTime) -> Self {
         let entropy = TestEntropy::default();
         let store = InMemoryKeyStore::new_insecure_development_allowing_krbtgt(64);
-        let mut keyd =
-            Keyd::with_entropy(config, store, CollectingAudit::default(), entropy.clone()).unwrap();
+        let mut keyd = Keyd::with_entropy(
+            config,
+            store,
+            CollectingAudit::default(),
+            entropy.clone(),
+            started_at,
+        )
+        .unwrap();
         let n = now();
         let enctypes = keyd.config().enctypes.clone();
         for enctype in &enctypes {

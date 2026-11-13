@@ -36,7 +36,7 @@ use crate::audit::{AuditReason, AuditSink};
 use crate::authz::{CallerId, HandleSlot, Operation};
 use crate::entropy::EntropySource;
 use crate::error::{AuthnError, Deny, Internal};
-use crate::keyd::{authorize, draw, AuditFields, Keyd};
+use crate::keyd::{draw, AuditFields, Keyd};
 use crate::model::KeyHandle;
 use crate::store::{KeyStore, KvnoKeys, StoredKeySet};
 use crate::template::check_binding;
@@ -167,7 +167,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     ///
     /// Checks failing as the uniform `AuthnError::Denied` (reason to audit
     /// only):
-    /// 1. authorize (Ldap; service handle Service — I2, I3);
+    /// 1. authorize and admit (Ldap; service handle Service — I2, I3);
     /// 2. the octets decode as a DER AP-REQ: pvno 5, msg-type KRB_AP_REQ
     ///    (RFC 4120 3.2.3 KRB_AP_ERR_MSG_TYPE);
     /// 3. no USE-SESSION-KEY ap-option (user-to-user has no code path; RFC
@@ -263,10 +263,11 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         fields: &mut AuditFields,
     ) -> Internal<ServiceContext> {
         // 1. Role Ldap, purpose Service (I2, I3).
-        authorize(
+        self.admit(
             caller,
             Operation::OpenAndVerifyServiceTicket,
             &[(HandleSlot::Primary, service)],
+            now,
         )?;
         let now_s = kerberos_time_seconds(now);
 

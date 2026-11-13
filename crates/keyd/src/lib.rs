@@ -12,10 +12,28 @@
 //!
 //! | Role        | Operations |
 //! |-------------|------------|
-//! | `Kdc`       | [`Keyd::verify_preauth`], [`Keyd::issue_as_rep`], [`Keyd::open_and_verify_tgt`], [`Keyd::issue_tgs_rep`], [`Keyd::open_fast_armor`], [`Keyd::seal_fast_error`] |
-//! | `Directory` | [`Keyd::set_secret`], [`Keyd::verify_secret`] |
-//! | `Admin`     | [`Keyd::create_key`], [`Keyd::rotate_key`], [`Keyd::rotate_krbtgt`], [`Keyd::retire_kvno`], [`Keyd::destroy_key_set`] |
-//! | `Ldap`      | [`Keyd::open_and_verify_service_ticket`] |
+//! | `Kdc`       | [`Keyd::verify_preauth`], [`Keyd::issue_as_rep`], [`Keyd::open_and_verify_tgt`], [`Keyd::issue_tgs_rep`], [`Keyd::open_fast_armor`], [`Keyd::seal_fast_error`], [`Keyd::describe_config`], [`Keyd::ping`] |
+//! | `Directory` | [`Keyd::set_secret`], [`Keyd::verify_secret`], [`Keyd::ping`] |
+//! | `Admin`     | [`Keyd::create_key`], [`Keyd::rotate_key`], [`Keyd::rotate_krbtgt`], [`Keyd::retire_kvno`], [`Keyd::destroy_key_set`], [`Keyd::ping`] |
+//! | `Ldap`      | [`Keyd::open_and_verify_service_ticket`], [`Keyd::describe_config`], [`Keyd::ping`] |
+//!
+//! **Daemon support** (docs/50 §3.4, §7.5): [`Keyd::describe_config`]
+//! returns the non-secret [`ConfigDescription`] the kdc validates its own
+//! configuration against before it binds its ports; [`Keyd::ping`] is the
+//! health check. Neither touches a key.
+//!
+//! **Startup hold-down** (RFC 4120 3.2.3; docs/50 R50-6, §3.5; decision
+//! A-56, docs/questions/Q-222): the replay cache and the token tables live in
+//! memory and are empty after every start, so every operation of the
+//! Kerberos exchanges ([`authz::startup_hold_down_applies`]) is refused as
+//! `Unavailable` until `now` is later than the start time given to
+//! [`Keyd::new`] plus two `clock_skew_secs` intervals (A-62: an
+//! authenticator accepted just before a restart may carry a client time up
+//! to one skew ahead and stays acceptable one skew after that, while the
+//! replay cache that would catch it is gone). Decided right after the role and
+//! purpose checks, before any secret-dependent work — no oracle (A-56,
+//! docs/questions/Q-217). Directory, Admin, `describe_config` and `ping` are
+//! not held.
 //!
 //! **Service-ticket verification** (docs/49 §3.3, task L6a; decision A-46,
 //! docs/questions/Q-165): [`Keyd::open_and_verify_service_ticket`] runs RFC
@@ -103,10 +121,14 @@
 //!
 //! # Time and randomness
 //!
-//! keyd reads no clock: every operation takes `now` from the caller. The only
-//! production entropy source is the kernel CSPRNG ([`OsEntropy`],
-//! `/dev/urandom`, fail closed); tests inject a deterministic source through
-//! the test-only [`Keyd::with_entropy`].
+//! keyd reads no clock: every operation takes `now` from the caller, and the
+//! constructor takes the start time of the hold-down. The keyd daemon reads
+//! both from its OWN clock; an IPC layer never takes them from the peer
+//! (docs/50 R50-5: otherwise a compromised kdc could "turn the time back" to
+//! use an expired TGT, or end the hold-down early). The only production
+//! entropy source is the kernel CSPRNG ([`OsEntropy`], `/dev/urandom`, fail
+//! closed); tests inject a deterministic source through the test-only
+//! [`Keyd::with_entropy`].
 //!
 //! # Residuals (documented, not hidden)
 //!
@@ -125,8 +147,14 @@
 //!   binding is only as correct as the Admin / Directory caller that created
 //!   the key set. There is no rename in phase 1 (follow-up: a rename
 //!   interface, docs/10 §7).
-//! - keyd trusts the caller's `now` and the Admin caller's dual-control
-//!   approvals (authenticity is the admin plane's, docs/43).
+//! - keyd trusts the caller's `now` and start time (the daemon's own clock,
+//!   docs/50 R50-5) and the Admin caller's dual-control approvals
+//!   (authenticity is the admin plane's, docs/43).
+//! - The startup hold-down makes every Kerberos operation unavailable for
+//!   two clock-skew intervals after each start (10 minutes with the RFC 4120
+//!   §8.2 default skew) — the availability price of closing the replay
+//!   window (A-62). The `verify_secret` failure throttle (Directory, not
+//!   held) restarts empty, so a keyd restart grants fresh guesses there.
 //! - A full replay cache or token table refuses new requests (fail closed),
 //!   a denial-of-service trade-off (D33).
 //! - The `verify_preauth` failure throttle (A-34) lets anyone who can reach
@@ -171,8 +199,10 @@
 //! §3.2.5.7, §3.3.5.1, §3.3.5.7.4 — checked against Q-120..Q-124), and this
 //! project's design documents docs/09, docs/10, docs/25 §3, docs/30,
 //! docs/33 §6.1, docs/45, docs/47 §9, docs/48, docs/49 §3.3, §12,
+//! docs/50 (R50-5, R50-6, R50-8, §3.4, §3.5, §3.7, §7.5),
 //! docs/questions/Q-040, Q-115 (A-35), Q-120..Q-127, Q-145, Q-150, Q-165
-//! (A-46), Q-180. No other implementation was consulted or recalled.
+//! (A-46), Q-180, Q-217 and Q-222 (A-56), Q-240 (A-62). No other
+//! implementation was consulted or recalled.
 //!
 //! Spec: docs/10; docs/09 א; RFC 4120 §3, §5.
 
@@ -189,6 +219,7 @@ mod fast_armor;
 mod keyd;
 pub mod model;
 mod replay;
+mod runtime;
 mod service_ticket;
 pub mod store;
 mod template;
@@ -201,7 +232,7 @@ mod usage;
 pub use as_exchange::{AsRepParts, AsTicketTemplate, AuthnProof};
 pub use audit::{AuditKeyRef, AuditOutcome, AuditReason, AuditRecord, AuditSink};
 pub use authz::{CallerId, Operation, Role};
-pub use config::{KeydConfig, ThrottlePolicy, TicketPolicy};
+pub use config::{ConfigDescription, KeydConfig, ThrottlePolicy, TicketPolicy};
 pub use entropy::{EntropyError, EntropySource, OsEntropy};
 pub use error::{AuthnError, ConfigError, Error, IssueError};
 pub use fast_armor::{FastArmor, FastConversation, MAX_FX_COOKIE_LENGTH};

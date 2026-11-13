@@ -216,11 +216,11 @@ fn udp_limit_below_own_error_is_refused() {
     let mut setup = Setup::new();
     setup.kdc.udp_max_reply_len = 40;
     assert_eq!(
-        setup.kdc.validate(&setup.keyd),
+        setup.kdc.validate(&setup.keyd.description()),
         Err(kdc::ConfigError::UdpReplyLimit)
     );
     setup.kdc.udp_max_reply_len = 200;
-    assert_eq!(setup.kdc.validate(&setup.keyd), Ok(()));
+    assert_eq!(setup.kdc.validate(&setup.keyd.description()), Ok(()));
 }
 
 /// RFC 4120 7.2.2: several records on one stream are answered in turn.
