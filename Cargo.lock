@@ -196,6 +196,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ldap"
+version = "0.0.0"
+dependencies = [
+ "dtyp",
+ "kdc",
+ "keyd",
+ "krb-proto",
+ "parse-ldap",
+ "pdp",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"

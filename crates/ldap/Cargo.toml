@@ -1,0 +1,49 @@
+# ldap — the LDAP engine: the Policy Enforcement Point behind ldap-front
+# (docs/49 R49-16, §11), build task L4: the skeleton (docs/49 §12 "L4").
+#
+# Pure library: no sockets, no TLS, no clock, no threads, no secret. The
+# front (a later crate, L11) owns TCP, rustls and the framer; it hands the
+# engine ONE canonical LDAPMessage at a time (parse-ldap's canonical profile,
+# R49-16) together with the per-request inputs (policy snapshot, PIP, account
+# source, rate limiter, `now`, and the transport facts it observes), and gets
+# back zero or more canonical response messages, a connection action
+# (Continue / StartTls / Close) and exactly one audit event.
+#
+# Written only from RFC 4511, RFC 4512 §2.5/§5.1, RFC 4513, RFC 4517 §3.3.16,
+# RFC 4422 §3.1, RFC 4752 §3, [MS-ADTS] v20261026 3.1.1.2.2.2, 3.1.1.3.1.3.6,
+# 3.1.1.3.1.12, 3.1.1.3.2 (table, .3, .4, .13, .16, .21, .23, .24, .33),
+# 3.1.1.3.4.1, 3.1.1.3.4.2, 5.1.1.6, 5.1.2.1, 5.1.2.2, 5.1.3; [MS-DTYP]
+# v20241119 2.4.2.4; ITU-T X.680 / X.690 (02/2021); and this project's
+# decided design docs/49 (A-45..A-48, A-51, A-52) — AGENTS.md §1-3.
+
+[package]
+name = "ldap"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Our own workspace crates only (path dependencies). No external crate
+# (AGENTS.md §7; docs/49 §11).
+#
+# The canonical LDAP codec: decode one request (canonical profile only,
+# R49-16) and encode every response (docs/49 §11).
+parse-ldap = { path = "../parse-ldap" }
+# The policy decision point (Resource::RootDse, AnonymousGrant — L2).
+pdp = { path = "../pdp" }
+# The account source trait and its non-secret records: the per-request
+# re-check of a bound identity (docs/49 §4.4, R49-15) uses the same R47-1
+# lookup the KDC uses (docs/49 §3.2). Types only; no KDC operation is called.
+kdc = { path = "../kdc" }
+# KerberosTime (the caller's `now`), Realm and PrincipalName (a bound
+# identity's name, as keyd's ServiceContext reports it — L6a/L7).
+krb-proto = { path = "../krb-proto" }
+# `kerberos_time_seconds` only (the project's one KerberosTime-to-seconds
+# scale, also used by kdc); no keyd operation is called in L4. L7 will add
+# the `open_and_verify_service_ticket` call behind a trait.
+keyd = { path = "../keyd" }
+# SIDs for the PDP Subject.
+dtyp = { path = "../dtyp" }
+
+[lints]
+workspace = true
