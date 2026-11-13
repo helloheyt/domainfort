@@ -15,8 +15,14 @@
 //! authorization-data or addresses) is refused rather than silently dropped
 //! — dropping a restriction would widen the ticket (RFC 4120 5.3).
 //!
+//! The TGT-opening steps (local TGT, binding, decryption, validity findings,
+//! authenticator) and the end of the chain (findings, replay cache) are
+//! shared helpers — `OpenedTgt`, `open_local_tgt`, `complete_chain` — that
+//! the FAST armor (`open_fast_armor`, docs/48 §3.2) reuses with its own
+//! authenticator key usage.
+//!
 //! Spec: RFC 4120 3.2.3, 3.3.2, 3.3.3, 5.2.7.1, 5.4.1, 5.4.2, 5.5.1, 7.3,
-//! 7.5.1; docs/10 §5, §8, D33; docs/30 §3, §7.
+//! 7.5.1; docs/10 §5, §8, D33; docs/30 §3, §7; docs/48 §3.2.
 
 use crate::as_exchange::token_deny;
 use crate::audit::{AuditReason, AuditSink};
@@ -135,6 +141,77 @@ fn configured_enctype(number: i32, supported: &[EncType], deny: Deny) -> Interna
         .ok_or(deny)
 }
 
+/// The time findings of an opened TGT and authenticator, recorded during the
+/// cryptographic chain and reported only once it completed (A-26).
+/// Spec: RFC 4120 3.2.3; docs/questions/Q-071 (A-26).
+pub(crate) struct TimeFindings {
+    /// The authenticator's ctime is outside the clock skew.
+    skew: Option<Deny>,
+    /// The ticket is not yet valid, or has expired.
+    ticket_time: Option<Deny>,
+}
+
+/// What opening a TGT of this realm and its authenticator yields — shared by
+/// `open_and_verify_tgt` (PA-TGS-REQ) and `open_fast_armor` (the armor
+/// AP-REQ). The session key and the decrypted structures never leave keyd;
+/// the ticket session key and an authenticator subkey are zeroized when
+/// dropped (krb-crypto `ProtocolKey`, krb-proto `KeyValue`).
+/// Spec: RFC 4120 3.2.3; docs/48 §3.2.
+pub(crate) struct OpenedTgt {
+    /// The decrypted EncTicketPart.
+    pub(crate) ticket_part: EncTicketPart,
+    /// The ticket session key.
+    pub(crate) session: ProtocolKey,
+    /// The decrypted Authenticator.
+    pub(crate) authenticator: Authenticator,
+    /// The authenticator's ctime in seconds (keyd's time scale).
+    pub(crate) ctime: i64,
+    /// Findings to report after the caller completes its chain.
+    pub(crate) findings: TimeFindings,
+}
+
+/// Step 2 of opening an AP-REQ: USE-SESSION-KEY (user-to-user) has no code
+/// path. Spec: RFC 4120 5.5.1, 3.7; docs/48 §3.2 (same for the armor).
+pub(crate) fn check_ap_options(ap_req: &ApReq) -> Internal<()> {
+    if ap_req.ap_options.contains(ApOptions::USE_SESSION_KEY) {
+        return Err(Deny::denied(AuditReason::UnsupportedApOption));
+    }
+    Ok(())
+}
+
+/// An authenticator subkey as a protocol key: a configured enctype (I5) and a
+/// valid key of it. Spec: RFC 4120 5.5.1 (subkey); RFC 3961 §3
+/// (random-to-key); docs/10 §12 I5.
+pub(crate) fn subkey_protocol_key(
+    subkey: &EncryptionKey,
+    supported: &[EncType],
+) -> Internal<ProtocolKey> {
+    let enctype = configured_enctype(
+        subkey.keytype,
+        supported,
+        Deny::denied(AuditReason::UnsupportedEncType),
+    )?;
+    krb_crypto::random_to_key(enctype, subkey.keyvalue.as_bytes())
+        .map_err(|_| Deny::denied(AuditReason::MalformedInput))
+}
+
+/// The replay-cache key of an authenticator presented with `ticket`: server
+/// name, client name, time and microseconds. Spec: RFC 4120 3.2.3.
+pub(crate) fn replay_key_for(
+    ticket: &Ticket,
+    authenticator: &Authenticator,
+    ctime: i64,
+) -> ReplayKey {
+    ReplayKey {
+        server_realm: ticket.realm.clone(),
+        server: ticket.sname.clone(),
+        client_realm: authenticator.crealm.clone(),
+        client: authenticator.cname.clone(),
+        ctime,
+        cusec: authenticator.cusec.get(),
+    }
+}
+
 /// Decrypt the TGT enc-part under the krbtgt key set: the version named by
 /// the ticket's kvno, or — with no kvno — current then previous.
 /// Spec: RFC 4120 3.2.3 ("decrypted using the version of the server's key
@@ -239,23 +316,133 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             &[(HandleSlot::Primary, krbtgt)],
         )?;
         let now_s = kerberos_time_seconds(now);
-        let skew = self.config.clock_skew_secs;
-        let realm = &self.config.realm;
 
         // 2. AP options.
-        if ap_req.ap_options.contains(ApOptions::USE_SESSION_KEY) {
-            return Err(Deny::denied(AuditReason::UnsupportedApOption));
-        }
+        check_ap_options(ap_req)?;
 
         // 3. The request body (structure only; its checksum is step 8).
         let body =
             KdcReqBody::decode(req_body).map_err(|_| Deny::denied(AuditReason::MalformedInput))?;
-        if body.realm != *realm {
+        if body.realm != self.config.realm {
             return Err(Deny::denied(AuditReason::WrongRealm));
         }
         if body.enc_authorization_data.is_some() {
             return Err(Deny::denied(AuditReason::UnsupportedContent));
         }
+
+        // 4-7. The TGT and the authenticator, usage 7 (shared with
+        // open_fast_armor).
+        let OpenedTgt {
+            ticket_part,
+            session,
+            authenticator,
+            ctime,
+            findings,
+        } = self.open_local_tgt(krbtgt, ap_req, TGS_REQ_AUTHENTICATOR, now_s, fields)?;
+
+        // 8. The checksum over the raw KDC-REQ-BODY.
+        let cksum = authenticator
+            .cksum
+            .as_ref()
+            .ok_or(Deny::denied(AuditReason::ChecksumMissing))?;
+        let cksumtype = ChecksumType::from_number(cksum.cksumtype)
+            .ok()
+            .filter(|t| *t == session.enc_type().checksum_type())
+            .ok_or(Deny::denied(AuditReason::ChecksumUnsupported))?;
+        krb_crypto::verify_mic(
+            &session,
+            cksumtype,
+            key_usage(TGS_REQ_AUTHENTICATOR_CKSUM)?,
+            req_body,
+            &cksum.checksum,
+        )
+        .map_err(|_| Deny::denied(AuditReason::ChecksumMismatch))?;
+
+        // 9 / 11 (prepared before the findings and the replay insert, so that
+        // every check that can fail precedes them). The reply key: subkey
+        // (usage 9) or session key (usage 8). Spec: RFC 4120 3.3.3, 5.4.2.
+        let (reply_key, reply_usage) = match &authenticator.subkey {
+            Some(subkey) => {
+                let key = subkey_protocol_key(subkey, &self.config.enctypes)?;
+                drop(session);
+                (key, TGS_REP_ENC_PART_SUBKEY)
+            }
+            None => (session, TGS_REP_ENC_PART_SESSION_KEY),
+        };
+
+        // The cryptographic chain is complete: the TGT decrypted, the
+        // authenticator decrypted and its req-body checksum verified. Only now
+        // are the recorded findings reported, then the replay cache (step 10)
+        // consulted (A-26).
+        self.complete_chain(
+            findings,
+            replay_key_for(&ap_req.ticket, &authenticator, ctime),
+            now_s,
+        )?;
+
+        // 11. The one-time context.
+        let mut id = [0u8; TOKEN_ID_LENGTH];
+        draw(&mut self.entropy, &mut id)?;
+        let context = TgtContext {
+            ctx_id: CtxId::from_bytes(id),
+            crealm: ticket_part.crealm.clone(),
+            cname: ticket_part.cname.clone(),
+            authtime: ticket_part.authtime,
+            starttime: ticket_part.starttime,
+            endtime: ticket_part.endtime,
+            renew_till: ticket_part.renew_till,
+            flags: ticket_part.flags,
+        };
+        let entry = ContextEntry {
+            crealm: ticket_part.crealm.clone(),
+            cname: ticket_part.cname.clone(),
+            authtime: ticket_part.authtime,
+            endtime: ticket_part.endtime,
+            renew_till: ticket_part.renew_till,
+            flags: ticket_part.flags,
+            transited: ticket_part.transited.clone(),
+            reply_key,
+            reply_usage,
+            req_nonce: body.nonce,
+            req_sname: body.sname,
+        };
+        let expires_at = now_s + i64::from(self.config.token_lifetime_secs);
+        if !self.contexts.insert(id, *caller, expires_at, entry, now_s) {
+            return Err(Deny::unavailable(AuditReason::TokenTableFull));
+        }
+        Ok(context)
+    }
+
+    /// Steps 4-7 of opening an AP-REQ whose ticket must be this realm's TGT,
+    /// shared by `open_and_verify_tgt` (PA-TGS-REQ, `authenticator_usage`
+    /// 7) and `open_fast_armor` (armor AP-REQ, usage 11):
+    /// 4. the ticket is this realm's TGT (realm, sname krbtgt/realm), and the
+    ///    krbtgt key set is bound to krbtgt/realm (Q-040, A-19) — RFC 6113
+    ///    5.4.1.1 "The server name field of the armor ticket MUST identify
+    ///    the TGS of the target realm";
+    /// 5. decrypt the ticket under krbtgt (kvno-selected, else current then
+    ///    previous), usage 2; decode EncTicketPart; the kvno goes to audit;
+    /// 6. client realm is this realm; no INVALID flag; no authorization-data
+    ///    or addresses; the ticket times are RECORDED, not yet reported;
+    /// 7. decrypt the authenticator with the ticket session key under
+    ///    `authenticator_usage`; decode it; crealm / cname match the ticket;
+    ///    no authorization-data; the ctime skew is RECORDED.
+    ///
+    /// Every failure here is the uniform `Denied`; the findings are reported
+    /// by [`Self::complete_chain`] once the caller's chain completed (A-26).
+    ///
+    /// Spec: RFC 4120 3.2.3, 3.3.2, 5.5.1, 7.3, 7.5.1; RFC 6113 5.4.1.1;
+    /// docs/48 §3.2; A-26 (docs/questions/Q-071).
+    pub(crate) fn open_local_tgt(
+        &self,
+        krbtgt: &KeyHandle,
+        ap_req: &ApReq,
+        authenticator_usage: u32,
+        now_s: i64,
+        fields: &mut AuditFields,
+    ) -> Internal<OpenedTgt> {
+        let skew = self.config.clock_skew_secs;
+        let realm = &self.config.realm;
 
         // 4. A TGT of this realm.
         let tgt = &ap_req.ticket;
@@ -329,11 +516,8 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         if ap_req.authenticator.etype != session_enctype.number() {
             return Err(Deny::denied(AuditReason::UnsupportedEncType));
         }
-        let authenticator_plain: Zeroizing<Vec<u8>> = open(
-            &session,
-            TGS_REQ_AUTHENTICATOR,
-            &ap_req.authenticator.cipher,
-        )?;
+        let authenticator_plain: Zeroizing<Vec<u8>> =
+            open(&session, authenticator_usage, &ap_req.authenticator.cipher)?;
         let authenticator = Authenticator::decode(&authenticator_plain)
             .map_err(|_| Deny::denied(AuditReason::MalformedInput))?;
         drop(authenticator_plain);
@@ -341,106 +525,49 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             return Err(Deny::denied(AuditReason::NameMismatch));
         }
         let ctime = kerberos_time_seconds(&authenticator.ctime);
-        // Recorded; reported only after the checksum verified (A-26).
+        // Recorded; reported only after the caller's chain completed (A-26).
         let skew_finding = (!within_skew(ctime, now_s, skew))
             .then_some(Deny::classified(AuditReason::ClockSkew, AuthnError::Skew));
         if authenticator.authorization_data.is_some() {
             return Err(Deny::denied(AuditReason::UnsupportedContent));
         }
+        Ok(OpenedTgt {
+            ticket_part,
+            session,
+            authenticator,
+            ctime,
+            findings: TimeFindings {
+                skew: skew_finding,
+                ticket_time: ticket_time_finding,
+            },
+        })
+    }
 
-        // 8. The checksum over the raw KDC-REQ-BODY.
-        let cksum = authenticator
-            .cksum
-            .as_ref()
-            .ok_or(Deny::denied(AuditReason::ChecksumMissing))?;
-        let cksumtype = ChecksumType::from_number(cksum.cksumtype)
-            .ok()
-            .filter(|t| *t == session_enctype.checksum_type())
-            .ok_or(Deny::denied(AuditReason::ChecksumUnsupported))?;
-        krb_crypto::verify_mic(
-            &session,
-            cksumtype,
-            key_usage(TGS_REQ_AUTHENTICATOR_CKSUM)?,
-            req_body,
-            &cksum.checksum,
-        )
-        .map_err(|_| Deny::denied(AuditReason::ChecksumMismatch))?;
-
-        // 9 / 11 (prepared before the findings and the replay insert, so that
-        // every check that can fail precedes them). The reply key: subkey
-        // (usage 9) or session key (usage 8). Spec: RFC 4120 3.3.3, 5.4.2.
-        let (reply_key, reply_usage) = match &authenticator.subkey {
-            Some(subkey) => {
-                let enctype = configured_enctype(
-                    subkey.keytype,
-                    &self.config.enctypes,
-                    Deny::denied(AuditReason::UnsupportedEncType),
-                )?;
-                let key = krb_crypto::random_to_key(enctype, subkey.keyvalue.as_bytes())
-                    .map_err(|_| Deny::denied(AuditReason::MalformedInput))?;
-                drop(session);
-                (key, TGS_REP_ENC_PART_SUBKEY)
-            }
-            None => (session, TGS_REP_ENC_PART_SESSION_KEY),
-        };
-
-        // The cryptographic chain is complete: the TGT decrypted, the
-        // authenticator decrypted and its req-body checksum verified. Only now
-        // are the recorded findings reported, as non-secret classes, in RFC
-        // 4120 3.2.3 order (skew, then the ticket's age) — and before the
-        // replay cache, so a refused request never enters it (A-26).
-        if let Some(finding) = skew_finding.or(ticket_time_finding) {
+    /// The end of an AP-REQ chain, shared by `open_and_verify_tgt` and
+    /// `open_fast_armor`. Call ONLY once every cryptographic check of the
+    /// caller's chain has passed: the recorded findings are reported as
+    /// non-secret classes in RFC 4120 3.2.3 order (skew, then the ticket's
+    /// age) — before the replay cache, so a refused request never enters it —
+    /// then the replay cache must accept `replay_key` (a replay is the
+    /// `Replay` class; a full cache stays the uniform `Denied`, fail closed).
+    ///
+    /// Spec: RFC 4120 3.2.3; docs/10 D33; A-26 (docs/questions/Q-071).
+    pub(crate) fn complete_chain(
+        &mut self,
+        findings: TimeFindings,
+        replay_key: ReplayKey,
+        now_s: i64,
+    ) -> Internal<()> {
+        if let Some(finding) = findings.skew.or(findings.ticket_time) {
             return Err(finding);
         }
-
-        // 10. Replay cache (D33). A replay is reported as a class; a full
-        // cache stays the uniform Denied (fail closed).
-        let replay_key = ReplayKey {
-            server_realm: tgt.realm.clone(),
-            server: tgt.sname.clone(),
-            client_realm: authenticator.crealm.clone(),
-            client: authenticator.cname.clone(),
-            ctime,
-            cusec: authenticator.cusec.get(),
-        };
+        // 10. Replay cache (D33).
         self.replay
-            .check_and_insert(replay_key, skew, now_s)
+            .check_and_insert(replay_key, self.config.clock_skew_secs, now_s)
             .map_err(|refusal| match refusal {
                 ReplayRefusal::Replay => Deny::classified(AuditReason::Replay, AuthnError::Replay),
                 ReplayRefusal::Full => Deny::denied(AuditReason::ReplayCacheFull),
-            })?;
-
-        // 11. The one-time context.
-        let mut id = [0u8; TOKEN_ID_LENGTH];
-        draw(&mut self.entropy, &mut id)?;
-        let context = TgtContext {
-            ctx_id: CtxId::from_bytes(id),
-            crealm: ticket_part.crealm.clone(),
-            cname: ticket_part.cname.clone(),
-            authtime: ticket_part.authtime,
-            starttime: ticket_part.starttime,
-            endtime: ticket_part.endtime,
-            renew_till: ticket_part.renew_till,
-            flags: ticket_part.flags,
-        };
-        let entry = ContextEntry {
-            crealm: ticket_part.crealm.clone(),
-            cname: ticket_part.cname.clone(),
-            authtime: ticket_part.authtime,
-            endtime: ticket_part.endtime,
-            renew_till: ticket_part.renew_till,
-            flags: ticket_part.flags,
-            transited: ticket_part.transited.clone(),
-            reply_key,
-            reply_usage,
-            req_nonce: body.nonce,
-            req_sname: body.sname,
-        };
-        let expires_at = now_s + i64::from(self.config.token_lifetime_secs);
-        if !self.contexts.insert(id, *caller, expires_at, entry, now_s) {
-            return Err(Deny::unavailable(AuditReason::TokenTableFull));
-        }
-        Ok(context)
+            })
     }
 
     /// `issue_tgs_rep`: consume `ctx` and issue a service ticket.

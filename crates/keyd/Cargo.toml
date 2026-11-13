@@ -5,9 +5,11 @@
 # IPC, no daemon (that is a later crate, D34). No PAC (phase 2, D124).
 #
 # Written only from RFC 4120 (§2, §3.1-3.3, §4, §5.2.7-5.2.9, §5.3-5.5.1,
-# §7.3, §7.5.1, §8.2, §10), RFC 3961 §3, RFC 3962 §4 and this project's design
-# documents (docs/09, docs/10, docs/25 §3, docs/30, docs/33 §6.1) — AGENTS.md
-# §1-3. No other implementation consulted or recalled.
+# §5.9.1, §7.3, §7.5.1, §7.5.9, §8.2, §10), RFC 3961 §3, RFC 3962 §4, RFC 6113
+# (§5.1, §5.4-§5.4.6, §6.2, §8 — the FAST armor core), [MS-KILE] (FAST
+# sections, checked only) and this project's design documents (docs/09,
+# docs/10, docs/25 §3, docs/30, docs/33 §6.1, docs/48) — AGENTS.md §1-3. No
+# other implementation consulted or recalled.
 #
 # Dependencies: our own workspace crates plus RustCrypto `zeroize` (OD-9 /
 # D180), linked, never copied. License: MIT OR Apache-2.0. No randomness crate:

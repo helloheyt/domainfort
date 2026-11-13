@@ -27,6 +27,7 @@ use crate::keyd::{authorize, draw, new_random_key, open, seal, AuditFields, Keyd
 use crate::model::{KeyHandle, KeyPurpose, Kvno, PrincipalId};
 use crate::store::KeyStore;
 use crate::template::{as_ticket_flags, check_binding, check_times, tgs_name, TemplateTimes};
+use crate::throttle::SecretThrottle;
 use crate::time::{kerberos_time_seconds, within_skew};
 use crate::tokens::{ExchangeId, TokenRefusal, TOKEN_ID_LENGTH};
 use crate::usage::{AS_REP_ENC_PART, AS_REQ_PA_ENC_TIMESTAMP, TICKET_ENC_PART};
@@ -126,6 +127,18 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// `verify_preauth`: verify PA-ENC-TIMESTAMP for `client` and return a
     /// one-time [`AuthnProof`].
     ///
+    /// Throttle first (decision A-34): right after authorization and BEFORE
+    /// any secret work, the per-principal failure throttle must admit the
+    /// attempt — the same mechanism and semantics as `verify_secret`
+    /// (bounded table, self-expiring window, fail closed when full of live
+    /// windows), with its own policy ([`crate::KeydConfig::preauth_throttle`]).
+    /// A refused attempt is the uniform `AuthnError::Denied` (it is decided
+    /// before the cryptographic chain, A-26); audit records it as
+    /// `Throttled`. Only a failure of the cryptographic check itself — the
+    /// timestamp does not decrypt under the client key — counts as a
+    /// failure; a success (a proof issued) clears the principal's count, as
+    /// in `verify_secret`; every other refusal leaves the count unchanged.
+    ///
     /// Checks, failing as the uniform `AuthnError::Denied`:
     /// padata-type is PA-ENC-TIMESTAMP (2); the padata-value decodes as
     /// EncryptedData; its etype is configured (I5) and the client's CURRENT
@@ -139,7 +152,8 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     ///
     /// Spec: RFC 4120 5.2.7.2 ("encrypted using the client's secret key and a
     /// key usage value of 1"), 7.5.1 (usage 1), 3.1.3 (KDC_ERR_PREAUTH_FAILED),
-    /// 5.2.9 (kvno); docs/10 §4; docs/30 §2.3; A-26 (docs/questions/Q-071).
+    /// 5.2.9 (kvno); docs/10 §4, §6 (throttling); docs/30 §2.3; A-26
+    /// (docs/questions/Q-071); A-34 (throttle).
     pub fn verify_preauth(
         &mut self,
         caller: &CallerId,
@@ -167,6 +181,11 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             &[(HandleSlot::Primary, client)],
         )?;
         let now_s = kerberos_time_seconds(now);
+        // The failure throttle, before any secret work (A-34). `rate_limited`
+        // keeps the audit outcome; the caller sees `Denied` (no class).
+        if !self.preauth_throttle.admit(&client.principal, now_s) {
+            return Err(Deny::rate_limited(AuditReason::Throttled));
+        }
         if padata.padata_type != PA_ENC_TIMESTAMP {
             return Err(Deny::denied(AuditReason::UnsupportedPadataType));
         }
@@ -188,7 +207,16 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         let key = current
             .key_for(enctype)
             .ok_or(Deny::denied(AuditReason::KeyNotFound))?;
-        let plaintext = open(key, AS_REQ_PA_ENC_TIMESTAMP, &enc.cipher)?;
+        // The cryptographic check: the only refusal the throttle counts (a
+        // wrong key or an undecryptable timestamp — A-34).
+        let plaintext = match open(key, AS_REQ_PA_ENC_TIMESTAMP, &enc.cipher) {
+            Ok(plaintext) => plaintext,
+            Err(deny) => {
+                self.preauth_throttle
+                    .record(&client.principal, false, now_s);
+                return Err(deny);
+            }
+        };
         let timestamp = PaEncTsEnc::decode(&plaintext)
             .map_err(|_| Deny::denied(AuditReason::MalformedInput))?;
         // The cryptographic chain is complete (decrypted under the client key,
@@ -213,6 +241,9 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         if !self.proofs.insert(id, *caller, expires_at, entry, now_s) {
             return Err(Deny::unavailable(AuditReason::TokenTableFull));
         }
+        // A success clears the principal's failure count, as in
+        // verify_secret (A-34).
+        self.preauth_throttle.record(&client.principal, true, now_s);
         Ok(AuthnProof {
             exchange_id: ExchangeId::from_bytes(id),
             client: client.principal,

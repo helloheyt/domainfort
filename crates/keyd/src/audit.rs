@@ -159,13 +159,39 @@ pub enum AuditReason {
     SecretMismatch,
     /// The stored key set was not derived from a password (no salt).
     NoPasswordKey,
-    /// The throttling hook refused the attempt. Spec: docs/10 §6.
+    /// The throttling hook refused the attempt — `verify_secret` (reported
+    /// as `Error::RateLimited`), or `verify_preauth` (reported as the uniform
+    /// `AuthnError::Denied`: decided before any secret work, A-26). Spec:
+    /// docs/10 §6; decision A-34.
     Throttled,
     /// string-to-key refused the parameters (e.g. iteration cap).
     /// Spec: RFC 3962 §4.
     S2kRefused,
     /// Encoding a structure or a crypto operation failed unexpectedly.
     InternalFailure,
+    /// The KrbFastArmoredReq carries no armor (it "MUST be present in
+    /// AS-REQ"). Spec: RFC 6113 5.4.2.
+    ArmorMissing,
+    /// The armor type is not FX_FAST_ARMOR_AP_REQUEST. Spec: RFC 6113 5.4.1.
+    ArmorTypeUnsupported,
+    /// The armor AP-REQ authenticator carries no subkey ("The subkey field
+    /// in the AP-REQ MUST be present"). Spec: RFC 6113 5.4.1.1.
+    ArmorSubkeyMissing,
+    /// The armor AP-REQ authenticator carries a checksum; the armor has no
+    /// application data to checksum, so phase 1 refuses one.
+    /// Spec: RFC 4120 5.5.1 (cksum); docs/questions/Q-120 item 3 (A-32).
+    ArmorChecksumPresent,
+    /// The KrbFastArmoredReq req-checksum does not verify over the outer
+    /// request body under the armor key. Spec: RFC 6113 5.4.2.
+    FastChecksumMismatch,
+    /// `seal_fast_error`: the KRB-ERROR is not one keyd may seal — e-data or
+    /// e-text present, KDC_ERR_NONE, stime other than now, or names other
+    /// than those of the stored inner request. Spec: RFC 6113 5.4.4;
+    /// docs/48 §6.1.
+    FastErrorContentRefused,
+    /// `seal_fast_error`: a padata entry outside the allowlist, repeated, or
+    /// with an unacceptable value. Spec: docs/48 §2.3, §6.1.
+    FastErrorPadataRefused,
 }
 
 /// A key referenced by an operation, for audit (no key material).

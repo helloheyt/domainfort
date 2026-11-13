@@ -87,8 +87,13 @@ pub(crate) fn has_unsupported_content(body: &KdcReqBody) -> bool {
 /// an out-of-skew timestamp distinct from PREAUTH_FAILED (KRB_AP_ERR_SKEW is
 /// prescribed only for the AP-REQ authenticator, 3.2.3). The skew class
 /// (A-26) is kept apart in audit only (`PreauthSkew`). The KRB-ERROR's
-/// stime is the KDC's `now` (5.9.1).
-/// Spec: RFC 4120 3.1.3, 5.2.7.2, 3.1.5, 3.2.3; docs/questions/Q-071 (A-26).
+/// stime is the KDC's `now` (5.9.1). keyd's per-principal failure throttle
+/// (A-34) refuses as the uniform `Denied`, so a throttled attempt is the same
+/// KDC_ERR_PREAUTH_FAILED as a wrong password — nothing tells the client the
+/// account exists or is under attack; keyd's own audit records `Throttled`
+/// (the KDC audit cannot tell it apart: docs/questions/Q-128).
+/// Spec: RFC 4120 3.1.3, 5.2.7.2, 3.1.5, 3.2.3; docs/questions/Q-071 (A-26);
+/// A-34.
 fn preauth_refusal(error: AuthnError) -> Refusal {
     let reason = match error {
         AuthnError::Skew => AuditReason::PreauthSkew,

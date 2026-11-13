@@ -13,11 +13,14 @@ use keyd::{
     Role, TgsTicketTemplate, TgtContext,
 };
 use krb_crypto::{ChecksumType, EncType, KeyUsage, ProtocolKey};
-use krb_proto::constants::{KRB_NT_PRINCIPAL, KRB_NT_SRV_HST, KRB_NT_SRV_INST, PA_ENC_TIMESTAMP};
+use krb_proto::constants::{
+    FX_FAST_ARMOR_AP_REQUEST, KRB_NT_PRINCIPAL, KRB_NT_SRV_HST, KRB_NT_SRV_INST, PA_ENC_TIMESTAMP,
+};
 use krb_proto::{
     ApOptions, ApReq, Authenticator, Checksum, EncAsRepPart, EncryptedData, EncryptionKey,
-    KdcOptions, KdcReqBody, KerberosString, KerberosTime, KeyValue, Microseconds, PaData,
-    PaEncTsEnc, PrincipalName, Realm, Ticket, TicketFlags,
+    FastOptions, KdcOptions, KdcReqBody, KerberosString, KerberosTime, KeyValue, KrbError,
+    KrbFastArmor, KrbFastArmoredReq, KrbFastReq, Microseconds, PaData, PaEncTsEnc, PrincipalName,
+    Realm, Ticket, TicketFlags,
 };
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -496,4 +499,218 @@ pub fn open_tgt(f: &mut Fixture, tgt: &Tgt, nonce: u32, cusec: u32) -> TgtContex
 /// `true` if `needle` occurs in `haystack`.
 pub fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+// ---------------------------------------------------------------------------
+// FAST client side (RFC 6113 §5.1, §5.4.1.1, §5.4.2; RFC 4120 §5.5.1),
+// written from the RFC text for these tests. No vector comes from any other
+// implementation; the computer account and its key are made up here.
+// ---------------------------------------------------------------------------
+
+/// A computer account (D126: the armor ticket is a computer TGT, docs/48
+/// §3.1). keyd holds no account kind: to keyd it is a PrincipalLongterm key.
+pub const WS01_ID: PrincipalId = PrincipalId::from_bytes([0xC0; 16]);
+pub const WS01: KeyHandle = KeyHandle::new(WS01_ID, KeyPurpose::PrincipalLongterm);
+/// The computer's random long-term key (docs/10 §7 `create_key` draws it;
+/// the test scripts the entropy so the client side knows it).
+pub const WS01_KEY: [u8; 32] = [0xE1; 32];
+
+pub fn ws01_name() -> PrincipalName {
+    PrincipalName {
+        name_type: KRB_NT_PRINCIPAL,
+        name_string: vec![kstr("ws01$")],
+    }
+}
+
+pub fn ws01_key() -> ProtocolKey {
+    krb_crypto::random_to_key(EncType::Aes256CtsHmacSha196, &WS01_KEY).unwrap()
+}
+
+/// Create the computer's key set through the Admin role.
+pub fn add_computer(f: &mut Fixture) {
+    f.entropy.push(&WS01_KEY);
+    f.keyd
+        .create_key(&ADMIN, &WS01, &bound(ws01_name()), &now())
+        .unwrap();
+    f.keyd.audit_sink_mut().records.clear();
+}
+
+/// The computer's TGT through keyd's existing AS path (PA-ENC-TIMESTAMP).
+pub fn obtain_computer_tgt(f: &mut Fixture, when: KerberosTime, endtime: KerberosTime) -> Tgt {
+    let proof = f
+        .keyd
+        .verify_preauth(
+            &KDC,
+            &WS01,
+            &pa_enc_timestamp(&ws01_key(), Some(1), when),
+            &when,
+        )
+        .unwrap();
+    let template = AsTicketTemplate {
+        client: WS01_ID,
+        crealm: realm(),
+        cname: ws01_name(),
+        sname: krbtgt_name(),
+        starttime: None,
+        endtime,
+        renew_till: None,
+        flags: TicketFlags::empty(),
+        session_enctype: EncType::Aes256CtsHmacSha196,
+        nonce: 0x0C0C_0C0C,
+    };
+    let parts = f
+        .keyd
+        .issue_as_rep(&KDC, &WS01, &KRBTGT, &proof, &template, &when)
+        .unwrap();
+    let rep = EncAsRepPart::decode(&open(&ws01_key(), 3, &parts.enc_part)).unwrap();
+    let session = key_from(&rep.0.key);
+    Tgt {
+        parts,
+        rep,
+        session,
+    }
+}
+
+/// The armor AP-REQ authenticator (RFC 4120 5.5.1; RFC 6113 5.4.1.1): the
+/// subkey "MUST be present"; key usage 11 (Q-120). `cksum_over`, when set,
+/// adds a checksum (usage 10) — which phase 1 refuses.
+pub struct ArmorAuthSpec {
+    pub crealm: Realm,
+    pub cname: PrincipalName,
+    pub ctime: KerberosTime,
+    pub cusec: u32,
+    pub subkey: Option<[u8; 32]>,
+    pub usage: u32,
+    pub cksum_over: Option<Vec<u8>>,
+}
+
+impl ArmorAuthSpec {
+    pub fn new(ctime: KerberosTime, cusec: u32, subkey: [u8; 32]) -> Self {
+        ArmorAuthSpec {
+            crealm: realm(),
+            cname: ws01_name(),
+            ctime,
+            cusec,
+            subkey: Some(subkey),
+            usage: 11,
+            cksum_over: None,
+        }
+    }
+}
+
+pub fn armor_authenticator(session: &ProtocolKey, spec: &ArmorAuthSpec) -> EncryptedData {
+    let cksum = spec.cksum_over.as_ref().map(|data| Checksum {
+        cksumtype: ChecksumType::HmacSha196Aes256.number(),
+        checksum: krb_crypto::get_mic(session, ChecksumType::HmacSha196Aes256, usage(10), data)
+            .unwrap(),
+    });
+    let a = Authenticator {
+        crealm: spec.crealm.clone(),
+        cname: spec.cname.clone(),
+        cksum,
+        cusec: Microseconds::new(spec.cusec).unwrap(),
+        ctime: spec.ctime,
+        subkey: spec.subkey.map(|k| EncryptionKey {
+            keytype: 18,
+            keyvalue: KeyValue::from_slice(&k),
+        }),
+        seq_number: None,
+        authorization_data: None,
+    };
+    let plain = a.encode().unwrap();
+    EncryptedData {
+        etype: session.enc_type().number(),
+        kvno: None,
+        cipher: krb_crypto::encrypt(session, usage(spec.usage), &[0x55; 16], &plain).unwrap(),
+    }
+}
+
+/// armor_key = KRB-FX-CF2(subkey, ticket_session_key, "subkeyarmor",
+/// "ticketarmor") — RFC 6113 5.4.1.1.
+pub fn client_armor_key(subkey: &[u8; 32], session: &ProtocolKey) -> ProtocolKey {
+    let subkey = krb_crypto::random_to_key(EncType::Aes256CtsHmacSha196, subkey).unwrap();
+    krb_crypto::krb_fx_cf2(&subkey, session, b"subkeyarmor", b"ticketarmor").unwrap()
+}
+
+/// An AS-REQ KDC-REQ-BODY for alice's TGT and its exact DER octets (used as
+/// the outer body and as the inner req-body, RFC 6113 5.4.2).
+pub fn as_req_body(nonce: u32) -> (KdcReqBody, Vec<u8>) {
+    let body = KdcReqBody {
+        kdc_options: KdcOptions::empty(),
+        cname: Some(alice_name()),
+        realm: realm(),
+        sname: Some(krbtgt_name()),
+        from: None,
+        till: kt("20261113180000Z"),
+        rtime: None,
+        nonce,
+        etype: vec![18],
+        addresses: None,
+        enc_authorization_data: None,
+        additional_tickets: None,
+    };
+    let bytes = body.encode().unwrap();
+    (body, bytes)
+}
+
+/// The KrbFastReq of an armored AS request (RFC 6113 5.4.2).
+pub fn fast_req(inner_nonce: u32) -> KrbFastReq {
+    KrbFastReq {
+        fast_options: FastOptions::empty(),
+        padata: Vec::new(),
+        req_body: as_req_body(inner_nonce).0,
+    }
+}
+
+/// req-checksum over `outer_body` (armor key, its required checksum type,
+/// usage 50) and enc-fast-req (armor key, usage 51). RFC 6113 5.4.2.
+pub fn armored_req(
+    armor_ap_req: &ApReq,
+    armor_key: &ProtocolKey,
+    outer_body: &[u8],
+    inner: &KrbFastReq,
+) -> KrbFastArmoredReq {
+    let req_checksum = Checksum {
+        cksumtype: ChecksumType::HmacSha196Aes256.number(),
+        checksum: krb_crypto::get_mic(
+            armor_key,
+            ChecksumType::HmacSha196Aes256,
+            usage(50),
+            outer_body,
+        )
+        .unwrap(),
+    };
+    let cipher =
+        krb_crypto::encrypt(armor_key, usage(51), &[0x66; 16], &inner.encode().unwrap()).unwrap();
+    KrbFastArmoredReq {
+        armor: Some(KrbFastArmor {
+            armor_type: FX_FAST_ARMOR_AP_REQUEST,
+            armor_value: armor_ap_req.encode().unwrap(),
+        }),
+        req_checksum,
+        enc_fast_req: EncryptedData {
+            etype: armor_key.enc_type().number(),
+            kvno: None,
+            cipher,
+        },
+    }
+}
+
+/// A KRB-ERROR as the KDC builds it for alice's armored AS request
+/// (crates/kdc krb_error.rs rule: no e-text, stime = now, names from the
+/// request — here the inner one, docs/48 §8).
+pub fn fast_krb_error(code: i32) -> KrbError {
+    KrbError {
+        ctime: None,
+        cusec: None,
+        stime: now(),
+        susec: Microseconds::default(),
+        error_code: code,
+        crealm: Some(realm()),
+        cname: Some(alice_name()),
+        realm: realm(),
+        sname: krbtgt_name(),
+        e_text: None,
+        e_data: None,
+    }
 }

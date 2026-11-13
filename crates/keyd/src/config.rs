@@ -8,7 +8,8 @@
 //!
 //! Spec: RFC 4120 §8.2; docs/10 §1 (EncType list, no weak variant), §8 / D36
 //! (short-lived tokens), D33 (bounded replay cache); docs/25 §5 (minimalism);
-//! docs/30 §2.6 (dangerous ticket options reduced by default).
+//! docs/30 §2.6 (dangerous ticket options reduced by default); docs/48 §10.1
+//! (armor table); decision A-34 (preauth throttle).
 
 use crate::error::ConfigError;
 use krb_crypto::EncType;
@@ -128,6 +129,9 @@ pub struct KeydConfig {
     pub max_authn_proofs: usize,
     /// Bound of the TGS context table (docs/10 D36).
     pub max_tgt_contexts: usize,
+    /// Bound of the FAST armor table (`open_fast_armor`; docs/48 §9.1 I4,
+    /// §10.1).
+    pub max_armor_contexts: usize,
     /// Bound of the replay cache (docs/10 D33).
     pub replay_cache_capacity: usize,
     /// Ticket template policy.
@@ -143,6 +147,11 @@ pub struct KeydConfig {
     pub max_s2k_iterations: u32,
     /// Policy of the default `verify_secret` throttle.
     pub throttle: ThrottlePolicy,
+    /// Policy of the per-principal failure throttle of `verify_preauth`
+    /// (online password guessing through the AS exchange; decision A-34). A
+    /// separate table from `throttle`, so the two callers' windows are
+    /// configured independently.
+    pub preauth_throttle: ThrottlePolicy,
 }
 
 impl KeydConfig {
@@ -160,11 +169,13 @@ impl KeydConfig {
             token_lifetime_secs: 30,
             max_authn_proofs: 1_024,
             max_tgt_contexts: 1_024,
+            max_armor_contexts: 1_024,
             replay_cache_capacity: 65_536,
             ticket_policy: TicketPolicy::default(),
             s2k_params: None,
             max_s2k_iterations: 50_000,
             throttle: ThrottlePolicy::default(),
+            preauth_throttle: ThrottlePolicy::default(),
         }
     }
 
@@ -190,8 +201,10 @@ impl KeydConfig {
         for capacity in [
             self.max_authn_proofs,
             self.max_tgt_contexts,
+            self.max_armor_contexts,
             self.replay_cache_capacity,
             self.throttle.capacity,
+            self.preauth_throttle.capacity,
         ] {
             if capacity == 0 || capacity > MAX_TABLE_CAPACITY {
                 return Err(ConfigError::Capacity);
@@ -215,8 +228,10 @@ impl KeydConfig {
                 return Err(ConfigError::S2kParams);
             }
         }
-        if self.throttle.max_failures == 0 || self.throttle.window_secs == 0 {
-            return Err(ConfigError::Throttle);
+        for throttle in [&self.throttle, &self.preauth_throttle] {
+            if throttle.max_failures == 0 || throttle.window_secs == 0 {
+                return Err(ConfigError::Throttle);
+            }
         }
         Ok(())
     }
@@ -307,6 +322,27 @@ mod tests {
         assert_eq!(c.validate(), Err(ConfigError::S2kParams));
         let mut c = base();
         c.throttle.max_failures = 0;
+        assert_eq!(c.validate(), Err(ConfigError::Throttle));
+    }
+
+    /// The armor table and the preauth throttle are bounded and validated
+    /// like the other tables (docs/48 §9.1 I4; A-34; AGENTS.md §6).
+    #[test]
+    fn armor_table_and_preauth_throttle_are_validated() {
+        let mut c = base();
+        c.max_armor_contexts = 0;
+        assert_eq!(c.validate(), Err(ConfigError::Capacity));
+        let mut c = base();
+        c.max_armor_contexts = MAX_TABLE_CAPACITY + 1;
+        assert_eq!(c.validate(), Err(ConfigError::Capacity));
+        let mut c = base();
+        c.preauth_throttle.capacity = 0;
+        assert_eq!(c.validate(), Err(ConfigError::Capacity));
+        let mut c = base();
+        c.preauth_throttle.window_secs = 0;
+        assert_eq!(c.validate(), Err(ConfigError::Throttle));
+        let mut c = base();
+        c.preauth_throttle.max_failures = 0;
         assert_eq!(c.validate(), Err(ConfigError::Throttle));
     }
 }

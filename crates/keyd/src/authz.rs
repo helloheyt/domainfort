@@ -80,11 +80,15 @@ pub enum Operation {
     RotateKrbtgt = 8,
     /// Spec: docs/10 §7.
     RetireKvno = 9,
+    /// Spec: docs/10 §5a; docs/48 §2.3; RFC 6113 5.4.1.1, 5.4.2.
+    OpenFastArmor = 10,
+    /// Spec: docs/10 §5a; docs/48 §2.3, §6; RFC 6113 5.4.4.
+    SealFastError = 11,
 }
 
 impl Operation {
     /// Every operation, for exhaustive checks. Spec: docs/10 §2.
-    pub const ALL: [Operation; 10] = [
+    pub const ALL: [Operation; 12] = [
         Operation::VerifyPreauth,
         Operation::IssueAsRep,
         Operation::OpenAndVerifyTgt,
@@ -95,6 +99,8 @@ impl Operation {
         Operation::RotateKey,
         Operation::RotateKrbtgt,
         Operation::RetireKvno,
+        Operation::OpenFastArmor,
+        Operation::SealFastError,
     ];
 }
 
@@ -102,7 +108,8 @@ impl Operation {
 /// not listed is denied.
 ///
 /// Spec: docs/10 §2 (table rows Kdc, Directory, Admin — restricted to the
-/// phase-1 operations); docs/09 א.6 (D31).
+/// phase-1 operations); docs/09 א.6 (D31); docs/48 §2.3 ("`Kdc` also gets
+/// `open_fast_armor`, `seal_fast_error`. No other role").
 pub const CAPABILITY_TABLE: [(Role, &[Operation]); 3] = [
     (
         Role::Kdc,
@@ -111,6 +118,8 @@ pub const CAPABILITY_TABLE: [(Role, &[Operation]); 3] = [
             Operation::IssueAsRep,
             Operation::OpenAndVerifyTgt,
             Operation::IssueTgsRep,
+            Operation::OpenFastArmor,
+            Operation::SealFastError,
         ],
     ),
     (
@@ -168,7 +177,11 @@ pub enum HandleSlot {
 ///
 /// - `verify_preauth`, `issue_as_rep` (client): PrincipalLongterm (docs/10
 ///   §4 "חייב purpose = PrincipalLongterm").
-/// - `issue_as_rep` (krbtgt), `open_and_verify_tgt`: Krbtgt (docs/10 §4, §5).
+/// - `issue_as_rep` (krbtgt), `open_and_verify_tgt`, `open_fast_armor`:
+///   Krbtgt (docs/10 §4, §5; docs/48 §2.3 "open_fast_armor.krbtgt =
+///   Krbtgt").
+/// - `seal_fast_error` takes no handle: the armor token is its authority
+///   (docs/48 §2.3), so no slot of it is permitted.
 /// - `issue_tgs_rep`: Service only. Referral TGTs (Krbtgt in docs/10 §5) are
 ///   cross-realm, which phase 1 does not implement.
 /// - `set_secret`, `verify_secret`, `rotate_key`: PrincipalLongterm or
@@ -179,7 +192,7 @@ pub enum HandleSlot {
 ///   create_key also initializes krbtgt).
 ///
 /// Spec: docs/10 §2 ("(b) the KeyPurpose of the handle matches the
-/// operation"), §4, §5, §6, §7, §12 I3.
+/// operation"), §4, §5, §6, §7, §12 I3; docs/48 §2.3, §9.1 I3.
 pub const fn purpose_permitted(op: Operation, slot: HandleSlot, purpose: KeyPurpose) -> bool {
     use KeyPurpose::{Krbtgt, PrincipalLongterm, Service};
     match (op, slot) {
@@ -189,6 +202,7 @@ pub const fn purpose_permitted(op: Operation, slot: HandleSlot, purpose: KeyPurp
         }
         (Operation::IssueAsRep, HandleSlot::Krbtgt)
         | (Operation::OpenAndVerifyTgt, HandleSlot::Primary)
+        | (Operation::OpenFastArmor, HandleSlot::Primary)
         | (Operation::RotateKrbtgt, HandleSlot::Primary) => matches!(purpose, Krbtgt),
         (Operation::IssueTgsRep, HandleSlot::Primary) => matches!(purpose, Service),
         (Operation::SetSecret, HandleSlot::Primary)
@@ -231,6 +245,24 @@ const _: () = {
     ));
     assert!(!purpose_permitted(
         Operation::VerifyPreauth,
+        HandleSlot::Primary,
+        KeyPurpose::Service
+    ));
+    // FAST (docs/48 §2.3, §9.1 I2, I3): Kdc only; the armor ticket is opened
+    // only under a Krbtgt-purpose key.
+    assert!(role_permits(Role::Kdc, Operation::OpenFastArmor));
+    assert!(role_permits(Role::Kdc, Operation::SealFastError));
+    assert!(!role_permits(Role::Directory, Operation::OpenFastArmor));
+    assert!(!role_permits(Role::Admin, Operation::OpenFastArmor));
+    assert!(!role_permits(Role::Directory, Operation::SealFastError));
+    assert!(!role_permits(Role::Admin, Operation::SealFastError));
+    assert!(!purpose_permitted(
+        Operation::OpenFastArmor,
+        HandleSlot::Primary,
+        KeyPurpose::PrincipalLongterm
+    ));
+    assert!(!purpose_permitted(
+        Operation::OpenFastArmor,
         HandleSlot::Primary,
         KeyPurpose::Service
     ));

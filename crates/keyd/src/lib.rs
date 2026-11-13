@@ -12,18 +12,25 @@
 //!
 //! | Role        | Operations |
 //! |-------------|------------|
-//! | `Kdc`       | [`Keyd::verify_preauth`], [`Keyd::issue_as_rep`], [`Keyd::open_and_verify_tgt`], [`Keyd::issue_tgs_rep`] |
+//! | `Kdc`       | [`Keyd::verify_preauth`], [`Keyd::issue_as_rep`], [`Keyd::open_and_verify_tgt`], [`Keyd::issue_tgs_rep`], [`Keyd::open_fast_armor`], [`Keyd::seal_fast_error`] |
 //! | `Directory` | [`Keyd::set_secret`], [`Keyd::verify_secret`] |
 //! | `Admin`     | [`Keyd::create_key`], [`Keyd::rotate_key`], [`Keyd::rotate_krbtgt`], [`Keyd::retire_kvno`] |
 //!
 //! Key purposes: PrincipalLongterm, Krbtgt, Service. Encryption types: the
 //! AES types of `krb-crypto` (17, 18, 19, 20) — no weak type is expressible.
 //!
+//! **FAST (RFC 6113), armor core only** (docs/48 task T1): the AS armor
+//! (FX_FAST_ARMOR_AP_REQUEST) is opened and its KrbFastReq decrypted inside
+//! keyd; armored errors are sealed inside keyd. The armor key never leaves
+//! keyd (docs/48 §2, A-33). Computer-account-only armor (D126) is the KDC's
+//! check — keyd holds no account kind. The armored AS reply and encrypted
+//! challenge (T2) and the TGS implicit armor (T3) are not implemented yet.
+//!
 //! **Not implemented — no code path, no enum variant:** Netlogon, SNTP,
-//! GKDI, BackupKey, S4U, replication, PKINIT, FAST, user-to-user, renewal /
-//! validation, forwarded / proxy tickets, cross-realm. **No PAC** in phase 1
-//! (MS-PAC + NDR is phase 2, where D124 applies): tickets carry no
-//! authorization-data.
+//! GKDI, BackupKey, S4U, replication, PKINIT, anonymous FAST armor,
+//! user-to-user, renewal / validation, forwarded / proxy tickets,
+//! cross-realm. **No PAC** in phase 1 (MS-PAC + NDR is phase 2, where D124
+//! applies): tickets carry no authorization-data.
 //!
 //! # Invariants (docs/10 §12) and where they are enforced
 //!
@@ -34,7 +41,8 @@
 //!   [`authz::CAPABILITY_TABLE`], first step of every operation.
 //! - **I3** purpose check: [`authz::purpose_permitted`] for every handle.
 //! - **I4** issuance needs a valid, one-time, caller-bound token
-//!   ([`AuthnProof`] / [`TgtContext`] ctx id), bounded tables.
+//!   ([`AuthnProof`] / [`TgtContext`] ctx id), bounded tables; an armored
+//!   error needs the one-time [`ArmorId`] of its conversation.
 //! - **I5** only configured AES enctypes ([`KeydConfig::enctypes`]).
 //! - **I6** secret comparisons via approved constant-time facilities
 //!   (krb-crypto `verify_mic` / integrity checks). Errors are uniform for
@@ -42,8 +50,11 @@
 //!   classified after (A-26, docs/questions/Q-071): only once the TGT and the
 //!   authenticator decrypted and the req-body checksum verified
 //!   (`open_and_verify_tgt`), or the PA-ENC-TIMESTAMP decrypted and decoded
-//!   (`verify_preauth`), may an [`AuthnError`] other than `Denied` be
-//!   returned — `TicketExpired`, `TicketNotYetValid`, `Skew`, `Replay`.
+//!   (`verify_preauth`), or the armor TGT, authenticator, subkey, armor key,
+//!   req-checksum and enc-fast-req all passed (`open_fast_armor`), may an
+//!   [`AuthnError`] other than `Denied` be returned — `TicketExpired`,
+//!   `TicketNotYetValid`, `Skew`, `Replay`. A `verify_preauth` refused by its
+//!   failure throttle (A-34) is the uniform `Denied`.
 //! - **I7** plaintext secrets are taken as `Zeroizing<String>` by value.
 //! - **I8** every operation emits exactly one [`AuditRecord`], with no
 //!   field able to hold a secret.
@@ -84,14 +95,26 @@
 //!   approvals (authenticity is the admin plane's, docs/43).
 //! - A full replay cache or token table refuses new requests (fail closed),
 //!   a denial-of-service trade-off (D33).
+//! - The `verify_preauth` failure throttle (A-34) lets anyone who can reach
+//!   the KDC lock a principal out of the AS exchange for one window by
+//!   sending wrong timestamps, and refuses untracked principals while its
+//!   table is full of live windows (fail closed) — the price of bounding
+//!   online password guessing, as for `verify_secret`.
+//! - The armor AP-REQ shares the TGS replay cache (Q-120): a client that
+//!   reuses one armor AP-REQ across a conversation is refused as a replay;
+//!   the native client builds a fresh one per request (lab check before
+//!   Windows clients, D8).
 //!
 //! # Provenance
 //!
 //! Written only from the allowed sources, opened in-session (AGENTS.md
 //! §1-3): RFC 4120 (§1.6, §2, §3.1-3.3, §4, §5.2.7-5.2.9, §5.3, §5.4.1,
-//! §5.4.2, §5.5.1, §6.1, §6.2, §7.3, §7.5.1, §8.2, §10), RFC 3961 §3,
-//! RFC 3962 §3-4, and this project's design documents docs/09, docs/10,
-//! docs/25 §3, docs/30, docs/33 §6.1, docs/45, docs/questions/Q-040. No
+//! §5.4.2, §5.5.1, §5.9.1, §6.1, §6.2, §7.3, §7.5.1, §7.5.9, §8.2, §10),
+//! RFC 3961 §3, RFC 3962 §3-4, RFC 6113 (§5.1, §5.4-§5.4.6, §6.2, §8),
+//! [MS-KILE] v20260928 (§1.3.3, §3.1.1.1, §3.1.5.1, §3.1.5.9, §3.2.5.4,
+//! §3.2.5.7, §3.3.5.1, §3.3.5.7.4 — checked against Q-120..Q-124), and this
+//! project's design documents docs/09, docs/10, docs/25 §3, docs/30,
+//! docs/33 §6.1, docs/45, docs/48, docs/questions/Q-040, Q-120..Q-127. No
 //! other implementation was consulted or recalled.
 //!
 //! Spec: docs/10; docs/09 א; RFC 4120 §3, §5.
@@ -104,6 +127,7 @@ pub mod config;
 mod directory;
 pub mod entropy;
 mod error;
+mod fast_armor;
 #[allow(clippy::module_inception)]
 mod keyd;
 pub mod model;
@@ -122,10 +146,11 @@ pub use authz::{CallerId, Operation, Role};
 pub use config::{KeydConfig, ThrottlePolicy, TicketPolicy};
 pub use entropy::{EntropyError, EntropySource, OsEntropy};
 pub use error::{AuthnError, ConfigError, Error, IssueError};
+pub use fast_armor::{FastArmor, FastConversation, MAX_FX_COOKIE_LENGTH};
 pub use keyd::Keyd;
 pub use model::{DualControlToken, KeyHandle, KeyPurpose, Kvno, PrincipalBinding, PrincipalId};
 pub use store::{InMemoryKeyStore, KeyStore, StoreError, StoredKeySet};
 pub use tgs_exchange::{TgsRepParts, TgsTicketTemplate, TgtContext};
 pub use throttle::{FailureWindowThrottle, SecretThrottle};
 pub use time::kerberos_time_seconds;
-pub use tokens::{CtxId, ExchangeId, TOKEN_ID_LENGTH};
+pub use tokens::{ArmorId, CtxId, ExchangeId, TOKEN_ID_LENGTH};

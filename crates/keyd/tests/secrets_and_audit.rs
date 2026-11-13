@@ -237,6 +237,33 @@ fn every_operation_emits_exactly_one_audit_record() {
     let _ = f.keyd.rotate_krbtgt(&KDC, &KRBTGT, &approval, &n);
     check(&f, Operation::RotateKrbtgt, &KDC, false);
 
+    // FAST (docs/48 §2.4: one record per call, success or failure). The
+    // successful paths are audited in tests/fast_armor.rs.
+    let armored = krb_proto::KrbFastArmoredReq {
+        armor: None,
+        req_checksum: krb_proto::Checksum {
+            cksumtype: 16,
+            checksum: vec![0; 12],
+        },
+        enc_fast_req: krb_proto::EncryptedData {
+            etype: 18,
+            kvno: None,
+            cipher: vec![0; 48],
+        },
+    };
+    let _ = f
+        .keyd
+        .open_fast_armor(&KDC, &KRBTGT, &armored, &[0x30, 0x00], &n);
+    check(&f, Operation::OpenFastArmor, &KDC, false);
+    let _ = f.keyd.seal_fast_error(
+        &KDC,
+        &keyd::FastConversation::As(keyd::ArmorId::from_bytes([6; 16])),
+        &fast_krb_error(25),
+        &[],
+        &n,
+    );
+    check(&f, Operation::SealFastError, &KDC, false);
+
     // Every operation was exercised.
     for op in Operation::ALL {
         assert!(expected.iter().any(|(o, _, _)| *o == op), "{op:?}");

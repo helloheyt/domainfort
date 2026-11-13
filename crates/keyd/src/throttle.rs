@@ -1,16 +1,22 @@
-//! The throttling hook of `verify_secret`.
+//! The throttling hook of `verify_secret`, and the same mechanism applied to
+//! `verify_preauth` (decision A-34).
 //!
 //! keyd consults the hook BEFORE any secret work (so a throttled attempt
-//! costs no key derivation and reveals nothing secret) and reports every
-//! outcome afterwards. The default [`FailureWindowThrottle`] refuses a
-//! principal after `max_failures` failures within `window_secs`; its table
-//! is bounded and, when full of live windows, it refuses principals it
-//! cannot track (fail closed — an attacker must not escape throttling by
-//! flooding the table). That fail-closed choice is a denial-of-service
-//! trade-off for `verify_secret` callers, documented here.
+//! costs no key derivation and reveals nothing secret) and reports outcomes
+//! afterwards. The default [`FailureWindowThrottle`] refuses a principal
+//! after `max_failures` failures within `window_secs`; its table is bounded
+//! and, when full of live windows, it refuses principals it cannot track
+//! (fail closed — an attacker must not escape throttling by flooding the
+//! table). That fail-closed choice is a denial-of-service trade-off for
+//! `verify_secret` and `verify_preauth` callers, documented here.
+//!
+//! `verify_preauth` has its own [`FailureWindowThrottle`] instance (policy
+//! `KeydConfig::preauth_throttle`), reports only failures of its
+//! cryptographic check, and surfaces a refusal as the uniform
+//! `AuthnError::Denied` (A-26).
 //!
 //! Spec: docs/10 §6 (`verify_secret` "constant-time, throttled"); docs/07 D19
-//! (online guessing); AGENTS.md §6 (bounded, fail closed).
+//! (online guessing); AGENTS.md §6 (bounded, fail closed); A-34.
 
 use crate::config::ThrottlePolicy;
 use crate::model::PrincipalId;
@@ -21,7 +27,8 @@ use std::collections::HashMap;
 ///
 /// Spec: docs/10 §6.
 pub trait SecretThrottle {
-    /// `false` refuses the attempt (keyd returns `Error::RateLimited`).
+    /// `false` refuses the attempt (`verify_secret` returns
+    /// `Error::RateLimited`; `verify_preauth` returns `AuthnError::Denied`).
     fn admit(&mut self, principal: &PrincipalId, now: i64) -> bool;
     /// Report the outcome of an admitted attempt.
     fn record(&mut self, principal: &PrincipalId, success: bool, now: i64);

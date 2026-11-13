@@ -18,6 +18,7 @@ use crate::authz::{purpose_permitted, role_permits, CallerId, HandleSlot, Operat
 use crate::config::KeydConfig;
 use crate::entropy::{EntropySource, OsEntropy};
 use crate::error::{ConfigError, Deny, Internal};
+use crate::fast_armor::ArmorEntry;
 use crate::model::{KeyHandle, KeyPurpose, Kvno, PrincipalId};
 use crate::replay::ReplayCache;
 use crate::store::{KeyStore, StoreError};
@@ -42,8 +43,12 @@ pub struct Keyd<S: KeyStore, A: AuditSink, E: EntropySource = OsEntropy> {
     pub(crate) audit: A,
     pub(crate) entropy: E,
     pub(crate) throttle: Box<dyn SecretThrottle + Send>,
+    /// The per-principal failure throttle of `verify_preauth` (A-34).
+    pub(crate) preauth_throttle: FailureWindowThrottle,
     pub(crate) proofs: TokenTable<ProofEntry>,
     pub(crate) contexts: TokenTable<ContextEntry>,
+    /// Opened FAST armors (docs/48 §2.3, §9.1 I4).
+    pub(crate) armors: TokenTable<ArmorEntry>,
     pub(crate) replay: ReplayCache,
 }
 
@@ -76,7 +81,9 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         Ok(Keyd {
             proofs: TokenTable::new(config.max_authn_proofs),
             contexts: TokenTable::new(config.max_tgt_contexts),
+            armors: TokenTable::new(config.max_armor_contexts),
             replay: ReplayCache::new(config.replay_cache_capacity),
+            preauth_throttle: FailureWindowThrottle::new(config.preauth_throttle),
             throttle,
             config,
             store,
@@ -142,6 +149,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> fmt::Debug for Keyd<S, A, E> {
             .field("enctypes", &self.config.enctypes)
             .field("live_authn_proofs", &self.proofs.len())
             .field("live_tgt_contexts", &self.contexts.len())
+            .field("live_armor_contexts", &self.armors.len())
             .finish()
     }
 }

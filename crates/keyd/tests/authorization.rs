@@ -9,10 +9,13 @@ mod common;
 use common::*;
 use keyd::authz::{purpose_permitted, role_permits, HandleSlot, CAPABILITY_TABLE};
 use keyd::{
-    AuditOutcome, AuditReason, AuthnProof, CallerId, CtxId, DualControlToken, ExchangeId,
-    KeyHandle, KeyPurpose, Kvno, Operation, PrincipalId, Role,
+    ArmorId, AuditOutcome, AuditReason, AuthnProof, CallerId, CtxId, DualControlToken, ExchangeId,
+    FastConversation, KeyHandle, KeyPurpose, Kvno, Operation, PrincipalId, Role,
 };
-use krb_proto::{ApOptions, ApReq, EncryptedData, Ticket};
+use krb_proto::constants::FX_FAST_ARMOR_AP_REQUEST;
+use krb_proto::{
+    ApOptions, ApReq, Checksum, EncryptedData, KrbFastArmor, KrbFastArmoredReq, Ticket,
+};
 use zeroize::Zeroizing;
 
 const ROLES: [Role; 3] = [Role::Kdc, Role::Directory, Role::Admin];
@@ -37,6 +40,26 @@ fn dummy_ap_req() -> ApReq {
             etype: 18,
             kvno: None,
             cipher: vec![0x22; 64],
+        },
+    }
+}
+
+/// A structurally plausible armored request around [`dummy_ap_req`]
+/// (RFC 6113 5.4.1.1, 5.4.2); authorization precedes every check of it.
+fn dummy_armored_req() -> KrbFastArmoredReq {
+    KrbFastArmoredReq {
+        armor: Some(KrbFastArmor {
+            armor_type: FX_FAST_ARMOR_AP_REQUEST,
+            armor_value: dummy_ap_req().encode().unwrap(),
+        }),
+        req_checksum: Checksum {
+            cksumtype: 16,
+            checksum: vec![0x33; 12],
+        },
+        enc_fast_req: EncryptedData {
+            etype: 18,
+            kvno: None,
+            cipher: vec![0x44; 64],
         },
     }
 }
@@ -123,6 +146,21 @@ fn invoke(f: &mut Fixture, op: Operation, caller: &CallerId, handle: &KeyHandle)
             )
             .is_ok(),
         Operation::RetireKvno => f.keyd.retire_kvno(caller, handle, Kvno::new(1), &n).is_ok(),
+        Operation::OpenFastArmor => f
+            .keyd
+            .open_fast_armor(caller, handle, &dummy_armored_req(), &[0x30, 0x00], &n)
+            .is_ok(),
+        // No handle (docs/48 §2.3): `handle` is unused.
+        Operation::SealFastError => f
+            .keyd
+            .seal_fast_error(
+                caller,
+                &FastConversation::As(ArmorId::from_bytes([5; 16])),
+                &fast_krb_error(25),
+                &[],
+                &n,
+            )
+            .is_ok(),
     }
 }
 
@@ -131,6 +169,7 @@ fn valid_handle(op: Operation) -> KeyHandle {
     match op {
         Operation::VerifyPreauth | Operation::IssueAsRep => ALICE,
         Operation::OpenAndVerifyTgt | Operation::RotateKrbtgt => KRBTGT,
+        Operation::OpenFastArmor | Operation::SealFastError => KRBTGT,
         Operation::IssueTgsRep | Operation::RotateKey | Operation::RetireKvno => SERVICE,
         Operation::SetSecret | Operation::VerifySecret => ALICE,
         Operation::CreateKey => {
@@ -189,6 +228,11 @@ fn wrong_purpose_is_denied_for_every_operation() {
         (KeyPurpose::Service, SERVICE),
     ];
     for op in Operation::ALL {
+        // seal_fast_error takes no handle: the armor token is its authority
+        // (docs/48 §2.3); there is no purpose to mismatch.
+        if op == Operation::SealFastError {
+            continue;
+        }
         let role = ROLES.into_iter().find(|r| role_permits(*r, op)).unwrap();
         for (purpose, handle) in by_purpose {
             if purpose_permitted(op, HandleSlot::Primary, purpose) {
@@ -242,16 +286,25 @@ fn issue_as_rep_krbtgt_slot_purpose() {
 }
 
 /// The compile-time capability table is exactly the phase-1 subset of
-/// docs/10 §2: Kdc -> AS/TGS operations; Directory -> set/verify secret;
-/// Admin -> key lifecycle. No role holds a read-key operation (none exists).
-/// Source: docs/10 §2, §7 ("no read operation for a key — in any role").
+/// docs/10 §2: Kdc -> AS/TGS operations (and the FAST armor operations of
+/// docs/48 §2.3); Directory -> set/verify secret; Admin -> key lifecycle. No
+/// role holds a read-key operation (none exists).
+/// Source: docs/10 §2, §7 ("no read operation for a key — in any role");
+/// docs/48 §2.3, §9.1 I2.
 #[test]
 fn capability_table_matches_design() {
     use Operation::*;
     let expected: [(Role, &[Operation]); 3] = [
         (
             Role::Kdc,
-            &[VerifyPreauth, IssueAsRep, OpenAndVerifyTgt, IssueTgsRep],
+            &[
+                VerifyPreauth,
+                IssueAsRep,
+                OpenAndVerifyTgt,
+                IssueTgsRep,
+                OpenFastArmor,
+                SealFastError,
+            ],
         ),
         (Role::Directory, &[SetSecret, VerifySecret]),
         (
