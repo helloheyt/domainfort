@@ -1,0 +1,88 @@
+# e2e-tests — runtime task P12 (docs/50 §10; §9 tier 2 across ALL daemons
+# together): end-to-end tests over real sockets. auditd, keyd, dird, the kdc
+# and ldap-front run at once, each on its own threads of one test process,
+# wired to each other only through their real Unix sockets (in one unique
+# 0700 temporary directory) and their real loopback UDP / TCP listeners
+# (port 0), started in the docs/50 §7.5 order: auditd → keyd → dird → kdc →
+# ldap-front.
+#
+# Test-only: `publish = false`, no production code (src/lib.rs is empty),
+# every test under tests/. Every dependency is a dev-dependency, and every
+# one is already in the workspace lock: the workspace's own crates, plus
+# tokio, rustls, aws-lc-rs and zeroize with exactly the features the daemon
+# crates already use — this crate adds **no third-party package** to
+# Cargo.lock (task P12: "must not add any new third-party dependency").
+#
+# Written only from this project's decided design (docs/50 §1-§4, §7.5, §8,
+# §9; docs/47; docs/48; docs/questions PENDING-OWNER A-57, A-62, A-64,
+# A-66..A-71, P-10, P-17), RFC 4120 §3.1-§3.3, §5.4.1, §5.4.2, §7.2.1,
+# §7.2.2, §7.5.9, RFC 6113 §5.4-§5.4.3, §5.4.6, RFC 4511 §4.1.1, §4.2,
+# §4.4.1, §4.5.1, §4.14, §5.2 and RFC 4513 §3.1.1 (pinned copies, SHA-256
+# checked against tools/spec-pin/manifest.json), and the public API and
+# test-support code of this project's own crates. No other implementation,
+# test suite or fixture was consulted or recalled (AGENTS.md §1-3).
+
+[package]
+name = "e2e-tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+# The five daemons, started in-process through their public `serve`
+# functions with injected parameters (docs/50 §9 tier 2).
+audit-daemon = { path = "../audit-daemon" }
+keyd-daemon = { path = "../keyd-daemon" }
+directory-daemon = { path = "../directory-daemon" }
+kdc-daemon = { path = "../kdc-daemon" }
+ldap-front = { path = "../ldap-front" }
+# The channel crates and the libraries the fixtures are built from (the
+# same set the daemons' own tier-2 tests use).
+audit-log = { path = "../audit-log" }
+config = { path = "../config" }
+ipc = { path = "../ipc" }
+ipc-audit = { path = "../ipc-audit" }
+ipc-keyd = { path = "../ipc-keyd" }
+ipc-directory = { path = "../ipc-directory" }
+ipc-ldap = { path = "../ipc-ldap" }
+policy-store = { path = "../policy-store" }
+keyd = { path = "../keyd" }
+keyd-types = { path = "../keyd-types" }
+kdc = { path = "../kdc" }
+krb-proto = { path = "../krb-proto" }
+# The Kerberos client side of the kdc fixtures (crates/kdc/tests/common):
+# keys derived and replies opened client-side (RFC 3961 / 3962 through the
+# project's own crate). A dev-dependency only, as in kdc-daemon (D182 binds
+# the production graph).
+krb-crypto = { path = "../krb-crypto" }
+pdp = { path = "../pdp" }
+dtyp = { path = "../dtyp" }
+dirstore = { path = "../dirstore" }
+directory-pip = { path = "../directory-pip" }
+ad-schema = { path = "../ad-schema" }
+ldap = { path = "../ldap" }
+parse-ldap = { path = "../parse-ldap" }
+# Third-party, all already locked and approved (P-12, OD-9, P-21), with the
+# daemons' own feature sets: the daemons' runners need a tokio runtime;
+# rustls is the LDAPS / StartTLS client (docs/50 §9: "TLS client — rustls
+# itself as client"); aws-lc-rs makes the per-run test key; zeroize is in
+# the blocking connectors' signatures.
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "net", "time", "sync", "io-util"] }
+rustls = { version = "0.23.46", default-features = false, features = ["std", "aws_lc_rs"] }
+aws-lc-rs = { version = "1.19.0", default-features = false, features = ["non-fips"] }
+zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
+
+# rustix (owner decision P-12; already in the lock through daemon-sandbox,
+# ipc-keyd and ipc-directory): only the tier-3 test, which sets the
+# credentials of the thread a daemon is started from
+# (`thread::set_thread_groups`, `set_thread_res_gid`, `set_thread_res_uid` —
+# docs/50 §6.1, the same calls as crates/daemon-sandbox). Linux only, and a
+# subset of daemon-sandbox's own features (`std`, `thread`).
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rustix = { version = "1.1.6", default-features = false, features = ["std", "thread"] }
+
+[lints]
+workspace = true
