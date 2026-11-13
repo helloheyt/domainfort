@@ -47,6 +47,7 @@ run_as_uid = 61002
 run_as_gid = 61002
 realm = EXAMPLE.ORG
 naming_context = dc=example,dc=org
+dns_host_name = dc1.example.org
 database_path = /var/lib/dird/directory.redb
 integrity_key_source = insecure-development-file
 integrity_key_path = /etc/dird/integrity.key

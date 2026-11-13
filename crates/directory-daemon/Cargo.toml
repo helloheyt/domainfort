@@ -1,15 +1,18 @@
-# directory-daemon (dird) — the directory process, directory-view service
-# only (docs/50 §10 task P8; decision A-58): the only process that opens the
-# redb file and holds the dirstore IntegrityKey (R50-2; Q-213 → A-57),
-# serving `dird-kdc.sock` to the kdc's uid only (R50-3), one snapshot pinned
-# per connection (§3.4), hardening before any thread exists (R50-14), auditd
-# verified first (R50-16), the DEVELOPMENT integrity-key file and the
-# UNSIGNED development policy store only (docs/questions/Q-270). Hosting the
-# LDAP engine is task P10, the admin channel P13.
+# directory-daemon (dird) — the directory process (docs/50 §10 tasks P8 and
+# P10; decision A-58): the only process that opens the redb file and holds
+# the dirstore IntegrityKey (R50-2; Q-213 → A-57), serving `dird-kdc.sock`
+# to the kdc's uid only (R50-3), one snapshot pinned per connection (§3.4),
+# and `dird-ldap.sock` to ldap-front's uid only — the LDAP engine (the PEP)
+# hosted here, one session per channel connection (R50-10; docs/49 R49-16),
+# its events audited through auditd (R50-17); hardening before any thread
+# exists (R50-14), auditd verified first (R50-16), the DEVELOPMENT
+# integrity-key file and the UNSIGNED development policy store only
+# (docs/questions/Q-270). The admin channel is task P13.
 #
-# Written only from this project's decided design (docs/50, docs/47 §8,
-# docs/questions Q-213, Q-214, Q-218..Q-220, Q-230, Q-235, Q-245, Q-255,
-# Q-260, Q-265, Q-270 and PENDING-OWNER), the public API of the workspace
+# Written only from this project's decided design (docs/50, docs/49, docs/47
+# §8, docs/questions Q-163, Q-190, Q-200, Q-213, Q-214, Q-218..Q-220, Q-230,
+# Q-235, Q-245, Q-252, Q-255, Q-260, Q-265, Q-270, Q-275, Q-280 and
+# PENDING-OWNER), the public API of the workspace
 # crates named below, and the docs.rs API pages of tokio 1.54.1 (API
 # documentation only, never source — PENDING-OWNER P-2). No other
 # implementation, directory server, daemon or RPC system was consulted or
@@ -55,9 +58,18 @@ policy-store = { path = "../policy-store" }
 ipc-directory = { path = "../ipc-directory" }
 # The server side over the real directory (only this daemon depends on it).
 ipc-directory-server = { path = "../ipc-directory-server" }
-# The audit channel (auditd verified first, R50-16). The core only — no
-# conversion feature: dird sends no event in this task (A-66; Q-270 item 6).
-ipc-audit = { path = "../ipc-audit" }
+# The audit channel (auditd verified first, R50-16) and the LDAP engine's
+# events (R49-14, R50-17): the `ldap` conversion only — each daemon enables
+# only the conversion it sends (A-66).
+ipc-audit = { path = "../ipc-audit", features = ["ldap"] }
+# The LDAP engine — the PEP hosted in dird (docs/50 R50-1, R50-10; docs/49
+# R49-16): `Engine`, `RequestInputs`, the audit event.
+ldap = { path = "../ldap" }
+# The ldap-front ↔ dird channel: `REQUEST_LIMIT`, the message set.
+ipc-ldap = { path = "../ipc-ldap" }
+# The channel's server side: the dispatcher over the engine and a
+# per-connection session (only this daemon depends on it).
+ipc-ldap-server = { path = "../ipc-ldap-server" }
 # The view, the context, the tier map, the naming context.
 directory-pip = { path = "../directory-pip" }
 # The store and the integrity key.
@@ -90,6 +102,9 @@ ipc-keyd = { path = "../ipc-keyd" }
 # SIDs, GUIDs and security descriptors of the test directories (the policy
 # file's SIDs moved to crates/policy-store with its decoder, A-68).
 dtyp = { path = "../dtyp" }
+# The LDAP requests the tier-2 LDAP tests build and the responses they read
+# (crates/parse-ldap, the canonical codec — tests/ldap_service.rs).
+parse-ldap = { path = "../parse-ldap" }
 
 # Tier 3 (docs/50 R50-19): the hardening drop runs in a fresh child process of
 # a binary with its own `main`, as crates/keyd-daemon does.

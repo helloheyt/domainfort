@@ -78,6 +78,7 @@ fn dird_sample_parses() {
     assert_eq!((s.run_as().uid(), s.run_as().gid()), (802, 802));
     assert_eq!(s.realm(), "EXAMPLE.TEST");
     assert_eq!(s.naming_context().labels(), ["example", "test"]);
+    assert_eq!(s.dns_host_name(), "dc1.example.test");
     assert_eq!(s.database_path().as_str(), "/var/lib/dird/directory.redb");
     assert_eq!(
         s.integrity_key_source(),

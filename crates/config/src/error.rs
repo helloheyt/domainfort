@@ -91,6 +91,11 @@ pub enum ErrorKind {
     /// Not a realm name in the accepted character set (`A-Z a-z 0-9 . -`).
     /// Spec: docs/50 §7.1 ("realm"); docs/questions/Q-230 item 15.
     InvalidRealm,
+    /// Not a DNS host name in the accepted form (labels of `A-Z a-z 0-9 -`
+    /// separated by single dots, at most 255 octets).
+    /// Spec: [MS-ADTS] 3.1.1.3.2.4 (dNSHostName); docs/questions/Q-280
+    /// item 6.
+    InvalidHostName,
     /// Not a naming context of the form `dc=<label>,…,dc=<label>`.
     /// Spec: docs/50 §7.1 ("naming context (A-53)"); docs/questions/Q-230
     /// item 15.
@@ -172,6 +177,7 @@ impl ErrorKind {
             ErrorKind::ReservedId => "account id 0 or all-ones is never accepted",
             ErrorKind::InvalidPath => "value is not a canonical absolute path",
             ErrorKind::InvalidRealm => "value is not an acceptable realm name",
+            ErrorKind::InvalidHostName => "value is not an acceptable DNS host name",
             ErrorKind::InvalidNamingContext => "value is not a `dc=` naming context",
             ErrorKind::InvalidSocketAddress => "value is not a canonical socket address",
             ErrorKind::NotAnInterfaceAddress => "listener address names no single interface",

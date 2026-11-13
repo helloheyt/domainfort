@@ -8,13 +8,19 @@
 //! (A-61), Q-270.
 
 use crate::audit_link::AuditEndpoint;
-use crate::daemon::{DaemonParams, ENGINE_QUEUE_CAPACITY, MAX_KDC_CONNECTIONS, MAX_OPEN_VIEWS};
+use crate::clock::SharedClock;
+use crate::daemon::{
+    DaemonParams, ENGINE_QUEUE_CAPACITY, LDAP_QUEUE_CAPACITY, MAX_KDC_CONNECTIONS,
+    MAX_LDAP_SESSIONS, MAX_OPEN_VIEWS,
+};
 use crate::policy::{read_file, DevelopmentPolicy, LoadError, PolicyError};
+use crate::zones::ZoneTable;
 use config::{DirdSettings, IntegrityKeySource, PolicyStoreFormat};
 use core::fmt;
 use daemon_sandbox::{HardeningPlan, PlanError, ProcessIdentity};
 use directory_pip::NamingContext;
 use dirstore::{IntegrityKey, INTEGRITY_KEY_LEN};
+use ipc_audit::WindowConfig;
 use keyd_types::KeydConfig;
 use krb_proto::Realm;
 use std::fs::File;
@@ -23,10 +29,11 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 use zeroize::Zeroizing;
 
-/// Open files beyond the kdc's connection quota: stdio, the listener, the
-/// audit verification, the redb file, the runtime's own descriptors, and
-/// room for connections accepted only to be closed (refused peers). Project
-/// choice (docs/50 §6.1: "nofile according to the connection quotas").
+/// Open files beyond the kdc's connection quota and the LDAP session bound:
+/// stdio, the two listeners, the audit connection, the redb file, the
+/// runtime's own descriptors, and room for connections accepted only to be
+/// closed (refused peers). Project choice (docs/50 §6.1: "nofile according
+/// to the connection quotas").
 pub const OPEN_FILES_HEADROOM: u64 = 32;
 
 /// Mode of the socket directory: owner all, group enter, other nothing.
@@ -222,10 +229,11 @@ pub fn read_policy(path: &Path, owner: u32) -> Result<DevelopmentPolicy, Startup
     })
 }
 
-/// The privileged set-up (as root, before the drop): the directory of
-/// `dird_kdc_socket`. Missing ⇒ created with mode 0750 and handed to dird's
-/// account; present ⇒ it must be a directory owned by dird's uid with no
-/// group write and no access for others.
+/// The privileged set-up (as root, before the drop): the directories of
+/// `dird_kdc_socket` and `dird_ldap_socket` (docs/50 §3.1: "each socket in
+/// its own directory"). Missing ⇒ created with mode 0750 and handed to
+/// dird's account; present ⇒ it must be a directory owned by dird's uid
+/// with no group write and no access for others.
 ///
 /// # Errors
 /// [`StartupError`].
@@ -233,12 +241,22 @@ pub fn read_policy(path: &Path, owner: u32) -> Result<DevelopmentPolicy, Startup
 /// Spec: docs/50 §3.1, §6.2; docs/questions/Q-260 item 6 (the group is not
 /// a setting).
 pub fn prepare_socket_directory(settings: &DirdSettings) -> Result<(), StartupError> {
-    let directory = settings
-        .kdc_channel()
-        .socket()
-        .as_path()
-        .parent()
-        .ok_or(StartupError::SocketDirectory)?;
+    for socket in [
+        settings.kdc_channel().socket(),
+        settings.ldap_channel().socket(),
+    ] {
+        let directory = socket
+            .as_path()
+            .parent()
+            .ok_or(StartupError::SocketDirectory)?;
+        prepare_directory(directory, settings)?;
+    }
+    Ok(())
+}
+
+/// One socket directory (see [`prepare_socket_directory`]).
+/// Spec: docs/50 §3.1, §6.2.
+fn prepare_directory(directory: &Path, settings: &DirdSettings) -> Result<(), StartupError> {
     let account = settings.run_as();
     match std::fs::symlink_metadata(directory) {
         Ok(metadata) => {
@@ -269,7 +287,8 @@ pub fn prepare_socket_directory(settings: &DirdSettings) -> Result<(), StartupEr
 /// `run_as_gid` with the supplementary groups cleared, no_new_privs, every
 /// capability dropped, core limit 0, not dumpable, umask 077), an open-files
 /// limit sized from the kdc's connection quota, and the working directory
-/// `/`. No `mlockall` (docs/50 §6.4 names it for keyd and admind, not dird);
+/// `/` (the open-files limit also covers the LDAP sessions). No `mlockall`
+/// (docs/50 §6.4 names it for keyd and admind, not dird);
 /// no chroot (the redb file and `audit.sock` live in other directories).
 ///
 /// # Errors
@@ -280,7 +299,7 @@ pub fn prepare_socket_directory(settings: &DirdSettings) -> Result<(), StartupEr
 pub fn hardening_plan(settings: &DirdSettings) -> Result<HardeningPlan, PlanError> {
     let account = settings.run_as();
     let identity = ProcessIdentity::new(account.uid(), account.gid())?;
-    let open_files = u64::try_from(MAX_KDC_CONNECTIONS)
+    let open_files = u64::try_from(MAX_KDC_CONNECTIONS.saturating_add(MAX_LDAP_SESSIONS))
         .unwrap_or(u64::MAX)
         .saturating_add(OPEN_FILES_HEADROOM);
     HardeningPlan::daemon_baseline(identity)
@@ -316,5 +335,13 @@ pub fn params(settings: &DirdSettings) -> Result<DaemonParams, StartupError> {
         queue_capacity: ENGINE_QUEUE_CAPACITY,
         naming_context,
         keyd: KeydConfig::new(realm),
+        ldap_socket: settings.ldap_channel().socket().as_path().to_path_buf(),
+        ldap_front_uid: settings.ldap_channel().peer_uid(),
+        max_ldap_sessions: MAX_LDAP_SESSIONS,
+        ldap_queue_capacity: LDAP_QUEUE_CAPACITY,
+        dns_host_name: settings.dns_host_name().to_owned(),
+        zones: ZoneTable::from_settings(settings.internal_networks()),
+        audit_window: WindowConfig::DEFAULT,
+        clock: SharedClock::system(),
     })
 }

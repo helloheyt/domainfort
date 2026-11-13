@@ -141,7 +141,7 @@ impl EngineHandle {
 /// The engine thread, to be joined after the daemon stopped.
 #[derive(Debug)]
 pub struct EngineThread {
-    thread: std::thread::JoinHandle<()>,
+    pub(crate) thread: std::thread::JoinHandle<()>,
 }
 
 /// The engine thread ended by unwinding (a defect).
@@ -160,7 +160,7 @@ impl EngineThread {
 }
 
 /// Runs a closure when dropped — on normal return and on unwinding.
-struct OnExit<F: FnOnce()>(Option<F>);
+pub(crate) struct OnExit<F: FnOnce()>(pub(crate) Option<F>);
 
 impl<F: FnOnce()> Drop for OnExit<F> {
     fn drop(&mut self) {

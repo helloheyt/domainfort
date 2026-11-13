@@ -173,6 +173,35 @@ pub(crate) fn realm(text: &str) -> Result<String, ErrorKind> {
     }
 }
 
+/// Most octets of a DNS host name. Project choice: the value is reported in
+/// the rootDSE (bounded there by parse-ldap's 2,048-octet LDAPDN bound,
+/// crates/ldap config.rs); 255 is the conventional DNS name bound, whose
+/// source (RFC 1034) is listed in SOURCES but not pinned — the label syntax
+/// is not checked against it (docs/questions/Q-200 item 1).
+pub const MAX_HOST_NAME_OCTETS: usize = 255;
+
+/// The DC's DNS host name (the rootDSE's dNSHostName): labels of one or
+/// more `A-Z a-z 0-9 -`, separated by single dots, at most
+/// [`MAX_HOST_NAME_OCTETS`] octets in all. The engine re-validates it
+/// (crates/ldap `RootDseConfig`).
+/// Spec: [MS-ADTS] 3.1.1.3.2.4 ("dNSHostName: the DNS address of this DC");
+/// docs/questions/Q-280 item 6.
+pub(crate) fn dns_host_name(text: &str) -> Result<String, ErrorKind> {
+    let valid = !text.is_empty()
+        && text.len() <= MAX_HOST_NAME_OCTETS
+        && text.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+    if valid {
+        Ok(text.to_owned())
+    } else {
+        Err(ErrorKind::InvalidHostName)
+    }
+}
+
 /// The naming context — the DN of the domain root (A-53) — as its labels.
 ///
 /// Written `dc=<label>,…,dc=<label>`, leaf first, `dc` in lower case, no space

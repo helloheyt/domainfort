@@ -45,6 +45,7 @@ run_as_uid = 802
 run_as_gid = 802
 realm = EXAMPLE.TEST
 naming_context = dc=example,dc=test
+dns_host_name = dc1.example.test
 database_path = /var/lib/dird/directory.redb
 integrity_key_source = insecure-development-file
 integrity_key_path = /etc/dird/integrity.key
@@ -69,6 +70,7 @@ run_as_uid = 802
 run_as_gid = 802
 realm = EXAMPLE.TEST
 naming_context = dc=example,dc=test
+dns_host_name = dc1.example.test
 database_path = /var/lib/dird/directory.redb
 integrity_key_source = insecure-development-file
 integrity_key_path = /etc/dird/integrity.key

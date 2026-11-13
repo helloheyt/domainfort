@@ -38,8 +38,10 @@ pub use keyd::{eventually, my_uid, skip_as_root, FakeAuditd, TempDir, TestClock}
 use ad_schema::{flags::user_account_control as uac, phase1, Phase1Schema};
 use core::time::Duration;
 use directory_daemon::policy::{DevelopmentPolicy, MandatoryFast};
+use directory_daemon::zones::Network;
 use directory_daemon::{
-    serve, AuditEndpoint, DaemonControl, DaemonParams, StoreSource, ENGINE_QUEUE_CAPACITY,
+    serve, AuditEndpoint, DaemonControl, DaemonParams, SharedClock, StoreSource, ZoneTable,
+    ENGINE_QUEUE_CAPACITY, LDAP_QUEUE_CAPACITY, MAX_LDAP_SESSIONS,
 };
 use directory_pip::NamingContext;
 use dirstore::{AttrId, IntegrityKey, NewObject, NodeId, Origin, Store, Timestamp};
@@ -351,8 +353,19 @@ pub fn policy(version: u64) -> DevelopmentPolicy {
     }
 }
 
+/// dird's zone table in the tests: 10.0.0.0/8 is internal (test data).
+pub fn zones() -> ZoneTable {
+    ZoneTable::new(vec![Network::new(
+        core::net::IpAddr::V4(core::net::Ipv4Addr::new(10, 0, 0, 0)),
+        8,
+    )
+    .unwrap()])
+}
+
 /// dird's parameters in `dir`: `d.sock`, kdc uid `kdc_uid`, auditd at
-/// `a.sock` as `auditd_uid`, view lifetime `lifetime`, `max_views` views.
+/// `a.sock` as `auditd_uid`, view lifetime `lifetime`, `max_views` views;
+/// the LDAP channel at `l.sock` for the same uid as the kdc's, the daemon's
+/// session bound and queue, the system clock.
 pub fn params(
     dir: &TempDir,
     kdc_uid: u32,
@@ -374,6 +387,14 @@ pub fn params(
         queue_capacity: ENGINE_QUEUE_CAPACITY,
         naming_context: naming_context(),
         keyd: keyd_config(),
+        ldap_socket: dir.join("l.sock"),
+        ldap_front_uid: kdc_uid,
+        max_ldap_sessions: MAX_LDAP_SESSIONS,
+        ldap_queue_capacity: LDAP_QUEUE_CAPACITY,
+        dns_host_name: String::from("dc1.example.org"),
+        zones: zones(),
+        audit_window: ipc_audit::WindowConfig::DEFAULT,
+        clock: SharedClock::system(),
     }
 }
 
@@ -382,6 +403,7 @@ pub struct Dird {
     control: DaemonControl,
     thread: Option<JoinHandle<Result<(), String>>>,
     pub socket: PathBuf,
+    pub ldap_socket: PathBuf,
 }
 
 impl Dird {
@@ -394,6 +416,7 @@ impl Dird {
     ) -> Result<Dird, String> {
         let control = DaemonControl::new();
         let socket = params.kdc_socket.clone();
+        let ldap_socket = params.ldap_socket.clone();
         let thread = {
             let control = control.clone();
             std::thread::spawn(move || {
@@ -434,6 +457,7 @@ impl Dird {
             control,
             thread: Some(thread),
             socket,
+            ldap_socket,
         })
     }
 
@@ -481,7 +505,7 @@ pub mod connector {
     use zeroize::Zeroizing;
 
     /// Connect and read the server's uid from the kernel.
-    fn connect_checked(
+    pub fn connect_checked(
         path: &Path,
         runtime: &tokio::runtime::Runtime,
     ) -> Option<(u32, UnixStream)> {
@@ -495,7 +519,7 @@ pub mod connector {
         Some((uid, stream))
     }
 
-    fn runtime() -> tokio::runtime::Runtime {
+    pub fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
             .enable_io()
             .build()

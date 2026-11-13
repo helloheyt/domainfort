@@ -11,14 +11,20 @@
 //!    build the directory context, take the tier map of the loaded policy,
 //!    and check the domain (naming-context root, domain SID, krbtgt account)
 //!    — then spawn the engine thread (R50-7).
-//! 3. **the listener** — remove a stale socket file at `dird_kdc_socket`
-//!    (only if it is a socket; anything else ⇒ error), bind, set the socket
-//!    file's mode, accept (docs/50 §3.1). The LDAP and admin sockets are not
-//!    bound: their services are tasks P10 and P13.
-//! 4. **until stopped** — [`DaemonControl::stop`]: stop accepting, answer
+//! 3. **the LDAP service** (task P10) — the engine (`ldap::Engine` with the
+//!    naming context and `dns_host_name`), the PDP snapshot of the same
+//!    policy file, its own directory context and tier map, dird's zone
+//!    table, the audit gate (the connection verified in step 1 now delivers
+//!    the LDAP events, crate::audit_link) — then the LDAP engine thread and
+//!    its own bounded queue (crate::ldap_engine).
+//! 4. **the listeners** — for `dird_kdc_socket` and `dird_ldap_socket`:
+//!    remove a stale socket file (only if it is a socket; anything else ⇒
+//!    error), bind, set the socket file's mode, accept (docs/50 §3.1). The
+//!    admin socket is not bound (task P13).
+//! 5. **until stopped** — [`DaemonControl::stop`]: stop accepting, answer
 //!    new requests `Unavailable`, wait (bounded) for queued requests, remove
-//!    the socket file, return; the caller drops the runtime, after which the
-//!    engine thread ends and is joined ([`Stopped::join`]).
+//!    the socket files, return; the caller drops the runtime, after which
+//!    the engine threads end and are joined ([`Stopped::join`]).
 //!
 //! SIGTERM is not wired to the stop (tokio `signal` is not in docs/50 §10's
 //! feature list — the keyd-daemon residual, docs/questions/Q-260 item 9):
@@ -29,16 +35,23 @@
 //! §6.4, §7.4, §7.5; docs/questions/Q-213 (A-57), Q-270.
 
 use crate::audit_link::{self, AuditEndpoint, AuditLinkError};
+use crate::clock::SharedClock;
 use crate::engine::{DirectoryEngine, EngineError, EnginePanicked, EngineThread};
+use crate::ldap_audit::AuditGate;
+use crate::ldap_engine::LdapService;
+use crate::ldap_listener::{self, LdapServeContext};
 use crate::listener::{accept_loop, ServeContext};
 use crate::log::{note, Note};
 use crate::policy::{tier_map, DevelopmentPolicy};
+use crate::zones::ZoneTable;
 use core::fmt;
 use core::time::Duration;
 use directory_pip::{DirectoryContext, NamingContext};
 use dirstore::{IntegrityKey, Store};
+use ipc_audit::WindowConfig;
 use ipc_directory_server::ViewLimits;
 use keyd_types::KeydConfig;
+use ldap::{Engine, EngineConfig, RootDseConfig};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -62,6 +75,17 @@ pub const MAX_KDC_CONNECTIONS: usize = 8;
 /// (R50-9), so it holds one view at a time; the headroom covers a view whose
 /// release is still on its way (Q-270 item 5).
 pub const MAX_OPEN_VIEWS: usize = 4;
+
+/// LDAP sessions (channel connections) open at once. Project choice: docs/50
+/// §4.1 gives "e.g. 1024 connections" as the kdc's global TCP bound; the
+/// same number here, so a full front fits (docs/questions/Q-280 item 4).
+/// Spec: docs/50 §3.6, §4.2.
+pub const MAX_LDAP_SESSIONS: usize = 1024;
+
+/// Jobs the LDAP engine queue holds before a request is answered `Busy`.
+/// Project choice (docs/50 R50-7: a bounded queue; no number is given for
+/// dird — Q-230 item 4, Q-280 item 4).
+pub const LDAP_QUEUE_CAPACITY: usize = 64;
 
 /// Mode of the socket file after bind: owner and group may connect. The
 /// directory (0750, docs/50 §3.1) is the outer fence; the authorization is
@@ -100,6 +124,23 @@ pub struct DaemonParams {
     /// s2kparams the account records advertise (docs/47 R47-10: one
     /// configuration shared with keyd).
     pub keyd: KeydConfig,
+    /// `dird_ldap_socket` (docs/50 §3.1, §4.2).
+    pub ldap_socket: PathBuf,
+    /// `ldap_front_uid`: the only peer admitted on it (docs/50 §3.2).
+    pub ldap_front_uid: u32,
+    /// LDAP sessions open at once ([`MAX_LDAP_SESSIONS`]).
+    pub max_ldap_sessions: usize,
+    /// Jobs the LDAP engine queue holds ([`LDAP_QUEUE_CAPACITY`]).
+    pub ldap_queue_capacity: usize,
+    /// The DC's DNS host name, reported by the rootDSE ([MS-ADTS]
+    /// 3.1.1.3.2.4).
+    pub dns_host_name: String,
+    /// dird's zone table (docs/50 §4.2).
+    pub zones: ZoneTable,
+    /// The LDAP events' sender window (A-57; `WindowConfig::DEFAULT`).
+    pub audit_window: WindowConfig,
+    /// The LDAP engine's clock (the system clock; tests inject one).
+    pub clock: SharedClock,
 }
 
 /// Where the directory comes from.
@@ -164,6 +205,15 @@ pub enum DaemonError {
     SocketPathOccupied,
     /// The socket could not be bound or its mode set.
     Bind,
+    /// The policy's PDP snapshot was refused (a rule-set error).
+    PolicySnapshot,
+    /// The LDAP engine refused its configuration (naming context, DNS host
+    /// name).
+    LdapEngine,
+    /// A non-socket file is in the way of `dird_ldap_socket`.
+    LdapSocketPathOccupied,
+    /// The LDAP socket could not be bound or its mode set.
+    LdapBind,
 }
 
 impl fmt::Display for DaemonError {
@@ -182,6 +232,14 @@ impl fmt::Display for DaemonError {
                 f.write_str("dird-kdc socket path is occupied by a file that is not a socket")
             }
             DaemonError::Bind => f.write_str("dird-kdc socket could not be bound"),
+            DaemonError::PolicySnapshot => f.write_str("policy rule set refused"),
+            DaemonError::LdapEngine => {
+                f.write_str("LDAP engine refused the naming context or the DNS host name")
+            }
+            DaemonError::LdapSocketPathOccupied => {
+                f.write_str("dird-ldap socket path is occupied by a file that is not a socket")
+            }
+            DaemonError::LdapBind => f.write_str("dird-ldap socket could not be bound"),
         }
     }
 }
@@ -229,26 +287,29 @@ impl DaemonControl {
     }
 }
 
-/// The daemon stopped; join the engine after dropping the runtime.
+/// The daemon stopped; join the engines after dropping the runtime.
 #[derive(Debug)]
 pub struct Stopped {
     engine: EngineThread,
+    ldap_engine: EngineThread,
     engine_failed: bool,
 }
 
 impl Stopped {
-    /// Whether the engine thread ended before the stop was asked for.
+    /// Whether an engine thread ended before the stop was asked for.
     #[must_use]
     pub fn engine_failed(&self) -> bool {
         self.engine_failed
     }
 
-    /// Wait for the engine thread; call after the runtime was dropped.
+    /// Wait for both engine threads; call after the runtime was dropped.
     ///
     /// # Errors
-    /// [`EnginePanicked`].
+    /// [`EnginePanicked`] if either unwound.
     pub fn join(self) -> Result<(), EnginePanicked> {
-        self.engine.join()
+        let directory = self.engine.join();
+        let ldap = self.ldap_engine.join();
+        directory.and(ldap)
     }
 }
 
@@ -279,7 +340,7 @@ fn remove_stale_socket(path: &Path) -> Result<(), DaemonError> {
     }
 }
 
-/// Bind `dird_kdc_socket` and set its mode.
+/// Bind a socket path and set its mode.
 /// Spec: docs/50 §3.1; tokio `net::UnixListener::bind`.
 fn bind(path: &Path) -> Result<UnixListener, DaemonError> {
     remove_stale_socket(path)?;
@@ -287,6 +348,15 @@ fn bind(path: &Path) -> Result<UnixListener, DaemonError> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(SOCKET_FILE_MODE))
         .map_err(|_| DaemonError::Bind)?;
     Ok(listener)
+}
+
+/// Bind `dird_ldap_socket` (the LDAP variants of [`bind`]'s errors).
+/// Spec: docs/50 §3.1, §4.2.
+fn bind_ldap(path: &Path) -> Result<UnixListener, DaemonError> {
+    bind(path).map_err(|error| match error {
+        DaemonError::SocketPathOccupied => DaemonError::LdapSocketPathOccupied,
+        _ => DaemonError::LdapBind,
+    })
 }
 
 /// Wait until `done()` or `grace` passed.
@@ -297,8 +367,8 @@ async fn wait_until(grace: Duration, done: impl Fn() -> bool) {
     }
 }
 
-/// Run dird's directory-view service until [`DaemonControl::stop`] (module
-/// documentation).
+/// Run dird's directory-view service and its LDAP service until
+/// [`DaemonControl::stop`] (module documentation).
 ///
 /// Must run inside a tokio runtime with I/O and time enabled, built after
 /// the process hardening.
@@ -306,15 +376,17 @@ async fn wait_until(grace: Duration, done: impl Fn() -> bool) {
 /// # Errors
 /// [`DaemonError`] for a start-up failure (nothing is listening then).
 ///
-/// Spec: docs/50 R50-2, R50-7, R50-14, R50-16, §3.1, §3.4, §7.5.
+/// Spec: docs/50 R50-2, R50-7, R50-10, R50-14, R50-16, R50-17, §3.1, §3.4,
+/// §4.2, §7.5, §8.1.
 pub async fn serve(
     params: DaemonParams,
     source: StoreSource,
     policy: DevelopmentPolicy,
     control: DaemonControl,
 ) -> Result<Stopped, DaemonError> {
-    // 1. auditd first (R50-16).
-    audit_link::verify(&params.audit)
+    // 1. auditd first (R50-16); the verified connection is kept for the
+    //    LDAP events (crate::audit_link).
+    let audit = audit_link::connect_verified(&params.audit)
         .await
         .map_err(DaemonError::Audit)?;
     note(Note::AuditVerified, None);
@@ -336,9 +408,40 @@ pub async fn serve(
         max_views: params.max_views,
         lifetime: params.view_lifetime,
     };
-    let engine = DirectoryEngine::new(store, ctx, tiers, policy.version, limits)
+    let engine = DirectoryEngine::new(Arc::clone(&store), ctx, tiers, policy.version, limits)
         .map_err(DaemonError::Engine)?;
     note(Note::DirectoryOpen, Some(policy.version.0));
+
+    // 3. The LDAP service (task P10): its own directory context and tier
+    //    map of the same policy, the PDP snapshot of the same file (A-68),
+    //    the engine, the zone table, the audit gate.
+    let ldap_schema = ad_schema::phase1().map_err(|_| DaemonError::Schema)?;
+    let ldap_ctx = DirectoryContext::new(ldap_schema, &params.keyd, params.naming_context.clone())
+        .map_err(|_| DaemonError::Context)?;
+    let ldap_tiers = tier_map(&policy).map_err(|_| DaemonError::Policy)?;
+    let snapshot = policy.snapshot().map_err(|_| DaemonError::PolicySnapshot)?;
+    let ldap_engine = Engine::new(EngineConfig {
+        root_dse: RootDseConfig {
+            naming_context: params.naming_context.clone(),
+            dns_host_name: params.dns_host_name.clone(),
+        },
+    })
+    .map_err(|_| DaemonError::LdapEngine)?;
+    // auditd was verified a moment ago (step 1); the audit task takes over
+    // the reachability from here.
+    let gate = Arc::new(AuditGate::new(params.audit_window));
+    gate.set_reachable(true);
+    let service = LdapService {
+        store,
+        ctx: ldap_ctx,
+        tiers: ldap_tiers,
+        policy: snapshot,
+        engine: ldap_engine,
+        zones: params.zones.clone(),
+        gate: Arc::clone(&gate),
+        clock: params.clock.clone(),
+    };
+
     let ended = Arc::clone(&control.state);
     let (handle, engine_thread) = engine
         .spawn(params.queue_capacity, move || {
@@ -347,13 +450,46 @@ pub async fn serve(
             ended.stop.notify_one();
         })
         .map_err(DaemonError::Engine)?;
-
-    // 3. The listener.
-    let listener = match bind(&params.kdc_socket) {
-        Ok(listener) => listener,
+    let ended = Arc::clone(&control.state);
+    let spawned = service.spawn(params.ldap_queue_capacity, move || {
+        ended.engine_ended.store(true, Ordering::SeqCst);
+        ended.stopping.store(true, Ordering::SeqCst);
+        ended.stop.notify_one();
+    });
+    let (ldap_handle, ldap_thread) = match spawned {
+        Ok(spawned) => spawned,
         Err(error) => {
             drop(handle);
             let _ = engine_thread.join();
+            return Err(DaemonError::Engine(error));
+        }
+    };
+    let audit_task = tokio::spawn(audit_link::run(
+        Arc::clone(&gate),
+        params.audit.clone(),
+        audit,
+    ));
+
+    // 4. The listeners.
+    let listeners = match bind(&params.kdc_socket) {
+        Ok(kdc) => match bind_ldap(&params.ldap_socket) {
+            Ok(ldap) => Ok((kdc, ldap)),
+            Err(error) => {
+                let _ = std::fs::remove_file(&params.kdc_socket);
+                Err(error)
+            }
+        },
+        Err(error) => Err(error),
+    };
+    let (listener, ldap_listener) = match listeners {
+        Ok(listeners) => listeners,
+        Err(error) => {
+            audit_task.abort();
+            let _ = audit_task.await;
+            drop(handle);
+            drop(ldap_handle);
+            let _ = engine_thread.join();
+            let _ = ldap_thread.join();
             return Err(error);
         }
     };
@@ -363,19 +499,39 @@ pub async fn serve(
         params.max_connections,
         handle,
     ));
+    let ldap_context = Arc::new(LdapServeContext::new(
+        params.ldap_front_uid,
+        params.frame_timeout,
+        params.max_ldap_sessions,
+        ldap_handle,
+    ));
     let accept_task = tokio::spawn(accept_loop(listener, Arc::clone(&context)));
+    let ldap_accept_task = tokio::spawn(ldap_listener::accept_loop(
+        ldap_listener,
+        Arc::clone(&ldap_context),
+    ));
     control.state.serving.store(true, Ordering::SeqCst);
     note(Note::Listening, None);
+    note(Note::LdapListening, None);
 
-    // 4. Until stopped.
+    // 5. Until stopped.
     control.state.stop.notified().await;
     note(Note::Draining, None);
     accept_task.abort();
+    ldap_accept_task.abort();
     let _ = accept_task.await;
+    let _ = ldap_accept_task.await;
     control.state.serving.store(false, Ordering::SeqCst);
     context.start_draining();
-    wait_until(DRAIN_GRACE, || context.in_flight() == 0).await;
+    ldap_context.start_draining();
+    wait_until(DRAIN_GRACE, || {
+        context.in_flight() == 0 && ldap_context.in_flight() == 0
+    })
+    .await;
+    audit_task.abort();
+    let _ = audit_task.await;
     let _ = std::fs::remove_file(&params.kdc_socket);
+    let _ = std::fs::remove_file(&params.ldap_socket);
     let engine_failed = control.state.engine_ended.load(Ordering::SeqCst);
     if engine_failed {
         note(Note::EngineStopped, None);
@@ -383,6 +539,7 @@ pub async fn serve(
     note(Note::Stopped, None);
     Ok(Stopped {
         engine: engine_thread,
+        ldap_engine: ldap_thread,
         engine_failed,
     })
 }

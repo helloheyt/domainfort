@@ -156,12 +156,16 @@ dependencies = [
  "ipc-directory",
  "ipc-directory-server",
  "ipc-keyd",
+ "ipc-ldap",
+ "ipc-ldap-server",
  "kdc",
  "keyd",
  "keyd-daemon",
  "keyd-types",
  "krb-crypto",
  "krb-proto",
+ "ldap",
+ "parse-ldap",
  "pdp",
  "policy-store",
  "tokio",
@@ -312,6 +316,34 @@ dependencies = [
  "keyd-types",
  "krb-crypto",
  "krb-proto",
+ "pdp",
+ "zeroize",
+]
+
+[[package]]
+name = "ipc-ldap"
+version = "0.0.0"
+dependencies = [
+ "ipc",
+ "parse-ldap",
+ "rustix",
+ "zeroize",
+]
+
+[[package]]
+name = "ipc-ldap-server"
+version = "0.0.0"
+dependencies = [
+ "ad-schema",
+ "directory-pip",
+ "dirstore",
+ "dtyp",
+ "ipc",
+ "ipc-ldap",
+ "keyd",
+ "krb-proto",
+ "ldap",
+ "parse-ldap",
  "pdp",
  "zeroize",
 ]

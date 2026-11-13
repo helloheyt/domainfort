@@ -221,6 +221,7 @@ run_as_uid = 61002
 run_as_gid = 61002
 realm = EXAMPLE.ORG
 naming_context = dc=example,dc=org
+dns_host_name = dc1.example.org
 database_path = /var/lib/dird/directory.redb
 integrity_key_source = insecure-development-file
 integrity_key_path = /etc/dird/integrity.key
@@ -252,6 +253,12 @@ fn parameters_plan_and_configuration_owner() {
     assert_eq!(p.max_connections, directory_daemon::MAX_KDC_CONNECTIONS);
     assert_eq!(p.naming_context.labels(), ["example", "org"]);
     assert_eq!(p.keyd.realm.as_str(), "EXAMPLE.ORG");
+    // The LDAP service (task P10; docs/50 §3.2, §4.2; Q-280 items 4, 6).
+    assert_eq!(p.ldap_socket, Path::new("/run/dird/ldap/dird-ldap.sock"));
+    assert_eq!(p.ldap_front_uid, 61004);
+    assert_eq!(p.dns_host_name, "dc1.example.org");
+    assert_eq!(p.max_ldap_sessions, directory_daemon::MAX_LDAP_SESSIONS);
+    assert_eq!(p.ldap_queue_capacity, directory_daemon::LDAP_QUEUE_CAPACITY);
 
     let plan = hardening_plan(&settings).unwrap();
     let identity = plan.identity().unwrap();
@@ -262,7 +269,18 @@ fn parameters_plan_and_configuration_owner() {
     assert!(plan.makes_not_dumpable());
     assert!(!plan.locks_all_memory());
     assert_eq!(plan.file_mode_mask(), Some(0o077));
-    assert!(plan.open_files_limit().is_some_and(|n| n <= 64));
+    // Sized from the kdc's quota and the LDAP session bound (docs/50 §6.1:
+    // "nofile according to the connection quotas").
+    assert_eq!(
+        plan.open_files_limit(),
+        Some(
+            u64::try_from(
+                directory_daemon::MAX_KDC_CONNECTIONS + directory_daemon::MAX_LDAP_SESSIONS
+            )
+            .unwrap()
+                + directory_daemon::startup::OPEN_FILES_HEADROOM
+        )
+    );
 
     let dir = TempDir::new();
     let path = dir.join("dird.conf");

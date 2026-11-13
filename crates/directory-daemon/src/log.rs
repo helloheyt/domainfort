@@ -41,6 +41,22 @@ pub enum Note {
     QuotaExceeded,
     /// Accepting a connection failed (the listener keeps going).
     AcceptFailed,
+    /// dird listens on `dird-ldap.sock` (task P10).
+    LdapListening,
+    /// A `dird-ldap.sock` connection's peer uid is not ldap-front's; closed
+    /// without a reply (docs/50 §3.2).
+    LdapPeerRefused,
+    /// The bound on concurrent LDAP sessions is reached; the connection is
+    /// refused `Busy` and closed.
+    LdapSessionLimit,
+    /// The LDAP engine queue is full; the request is refused `Busy` and the
+    /// connection closed (docs/50 R50-7).
+    LdapBusy,
+    /// The audit connection was lost; LDAP operations are refused until it
+    /// is back (A-57).
+    AuditLost,
+    /// The audit connection is back.
+    AuditRestored,
     /// Shutdown requested; the queue is being drained.
     Draining,
     /// The engine thread ended before shutdown was requested.
@@ -68,6 +84,12 @@ impl Note {
             Note::PeerCredentialsUnreadable => "connection closed: peer credentials unreadable",
             Note::QuotaExceeded => "connection closed: connection quota exceeded",
             Note::AcceptFailed => "accepting a connection failed",
+            Note::LdapListening => "listening on the LDAP channel",
+            Note::LdapPeerRefused => "LDAP channel connection closed: peer uid is not ldap-front's",
+            Note::LdapSessionLimit => "LDAP channel connection refused: session bound reached",
+            Note::LdapBusy => "LDAP request refused: engine queue full",
+            Note::AuditLost => "audit connection lost: LDAP operations refused until it is back",
+            Note::AuditRestored => "audit connection restored",
             Note::Draining => "shutdown requested: draining",
             Note::EngineStopped => "engine thread stopped unexpectedly",
             Note::Stopped => "stopped",

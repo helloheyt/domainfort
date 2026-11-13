@@ -510,6 +510,35 @@ fn realm_character_set() {
     accepts_value(Daemon::Keyd, KEYD, "realm", "corp-1.example.test");
 }
 
+/// Spec: [MS-ADTS] 3.1.1.3.2.4 (dNSHostName); docs/questions/Q-280 item 6
+/// (labels of `A-Z a-z 0-9 -` separated by single dots, at most 255
+/// octets; a missing key is refused).
+#[test]
+fn dns_host_name_form() {
+    let long = format!("{}.test", "a".repeat(251));
+    for value in [
+        "dc1..example.test",
+        ".dc1.example.test",
+        "dc1.example.test.",
+        "dc1 example.test",
+        "dc1_example.test",
+        "dc1.ex@mple.test",
+        long.as_str(),
+    ] {
+        rejects_value(
+            Daemon::Dird,
+            DIRD,
+            "dns_host_name",
+            value,
+            ErrorKind::InvalidHostName,
+        );
+    }
+    accepts_value(Daemon::Dird, DIRD, "dns_host_name", "DC-1.Example.test");
+    accepts_value(Daemon::Dird, DIRD, "dns_host_name", "localhost");
+    let err = error(Daemon::Dird, &remove(DIRD, "dns_host_name"));
+    assert_eq!(err.kind(), ErrorKind::MissingKey);
+}
+
 /// Spec: docs/50 §7.1 ("naming context (A-53)"); PENDING-OWNER A-53 (no
 /// space after a comma); crates/directory-pip `MAX_NC_LABELS`; Q-230 item 15.
 #[test]

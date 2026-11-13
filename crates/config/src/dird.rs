@@ -39,6 +39,10 @@ const REALM: &str = "realm";
 /// Key: the DN of the domain root. Spec: docs/50 §7.1 ("naming context
 /// (A-53)").
 const NAMING_CONTEXT: &str = "naming_context";
+/// Key: the DC's DNS host name, reported by the LDAP engine's rootDSE
+/// (dNSHostName). Spec: [MS-ADTS] 3.1.1.3.2.4; docs/49 §5.2;
+/// docs/questions/Q-280 item 6.
+const DNS_HOST_NAME: &str = "dns_host_name";
 /// Key: the redb file dird alone opens. Spec: docs/50 R50-2, §2.4, §6.4.
 const DATABASE_PATH: &str = "database_path";
 /// Key: the only uid admitted on `dird-kdc.sock`. Spec: docs/50 §3.2.
@@ -136,6 +140,7 @@ pub struct DirdSettings {
     run_as: Account,
     realm: String,
     naming_context: NamingContextLabels,
+    dns_host_name: String,
     database_path: AbsolutePath,
     integrity_key_source: IntegrityKeySource,
     integrity_key_path: AbsolutePath,
@@ -169,6 +174,7 @@ impl DirdSettings {
         RUN_AS_GID,
         REALM,
         NAMING_CONTEXT,
+        DNS_HOST_NAME,
         DATABASE_PATH,
         INTEGRITY_KEY_SOURCE,
         INTEGRITY_KEY_PATH,
@@ -188,7 +194,8 @@ impl DirdSettings {
     ];
 
     /// Parses and validates dird's file. Required: `run_as_uid`,
-    /// `run_as_gid`, `realm`, `naming_context`, `database_path`,
+    /// `run_as_gid`, `realm`, `naming_context`, `dns_host_name`,
+    /// `database_path`,
     /// `integrity_key_source` (only `insecure-development-file`),
     /// `integrity_key_path`, `policy_store_path`, `policy_store_format`
     /// (only `unsigned-development`), `dird_kdc_socket` with `kdc_uid`,
@@ -207,6 +214,7 @@ impl DirdSettings {
         let run_as = schema::account(&doc, &mut all)?;
         let realm = doc.required(REALM, value::realm)?.value;
         let naming_context = doc.required(NAMING_CONTEXT, value::naming_context)?.value;
+        let dns_host_name = doc.required(DNS_HOST_NAME, value::dns_host_name)?.value;
         let database_path = schema::path(&doc, &mut all, DATABASE_PATH)?;
         let integrity_key_source = doc
             .required(INTEGRITY_KEY_SOURCE, |text| {
@@ -255,6 +263,7 @@ impl DirdSettings {
             run_as,
             realm,
             naming_context,
+            dns_host_name,
             database_path,
             integrity_key_source,
             integrity_key_path,
@@ -288,6 +297,13 @@ impl DirdSettings {
     #[must_use]
     pub fn naming_context(&self) -> &NamingContextLabels {
         &self.naming_context
+    }
+
+    /// The DC's DNS host name (the rootDSE's dNSHostName).
+    /// Spec: [MS-ADTS] 3.1.1.3.2.4; docs/49 §5.2.
+    #[must_use]
+    pub fn dns_host_name(&self) -> &str {
+        &self.dns_host_name
     }
 
     /// The redb file. Spec: docs/50 R50-2, §6.4.
