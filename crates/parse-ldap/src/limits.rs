@@ -76,6 +76,25 @@ pub const MAX_CONTROLS: usize = 8;
 /// limit and `directory_pip::MAX_DN_DEPTH`, 64).
 pub const MAX_LDAPDN_OCTETS: usize = 2048;
 
+/// Most RDNs in one distinguished name: 64.
+///
+/// Spec: docs/49 §2.4, which anchors the LDAPDN bound to
+/// `directory_pip::MAX_DN_DEPTH` (64): a DN with more RDNs than the directory
+/// produces or resolves can never name an object.
+pub const MAX_DN_RDNS: usize = 64;
+
+/// Most octets in one RDN attribute value, counted unescaped: 252.
+///
+/// Spec: [MS-ADTS] 3.1.1.5.1.2 ("The RDN size MUST be less than 255
+/// characters"), read strictly as the whole "att=val" string ([MS-ADTS]
+/// 3.1.1.1.4; docs/46 §8.3 item 3; Q-090 / A-30), the value counted unescaped
+/// (Q-090 item 3). The shortest attributeType is one character (RFC 4512
+/// §1.4: `keystring`, `number`), so `1 + 1 + value < 255` bounds the value at
+/// 252: a longer one cannot name any object. Phase-1 values are printable
+/// ASCII (Q-080), so octets are characters. dirstore applies the exact rule,
+/// with the label length of the class's RDN attribute, on create.
+pub const MAX_RDN_VALUE_OCTETS: usize = 252;
+
 /// Most octets in a short identifier string: AttributeDescription, attribute
 /// selector, LDAPOID (`controlType`, `requestName`, `responseName`),
 /// MatchingRuleId and SASL `mechanism`: 256.

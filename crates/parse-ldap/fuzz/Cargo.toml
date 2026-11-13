@@ -6,7 +6,7 @@
 # `cargo clippy`, `cargo test`, `cargo deny` and the SBOM in the product
 # workspace never pull in the fuzzing-only dependencies. It is built only via
 # `cargo fuzz run parse_ldap_decode_message` / `cargo fuzz run parse_ldap_frame`
-# (nightly + cargo-fuzz).
+# / `cargo fuzz run parse_ldap_dn` (nightly + cargo-fuzz).
 #
 # NOTE FOR REVIEW: libfuzzer-sys is fuzz-harness-only test infrastructure, not
 # linked into any product crate, and on the license allowlist (MIT / Apache-2.0,
@@ -42,6 +42,15 @@ bench = false
 [[bin]]
 name = "parse_ldap_frame"
 path = "fuzz_targets/parse_ldap_frame.rs"
+test = false
+doc = false
+bench = false
+
+# `dn::parse_ldap_dn` on arbitrary UTF-8, with the encode/parse round-trip
+# property (`cargo fuzz run parse_ldap_dn`; docs/49 R49-11, task L5).
+[[bin]]
+name = "parse_ldap_dn"
+path = "fuzz_targets/parse_ldap_dn.rs"
 test = false
 doc = false
 bench = false

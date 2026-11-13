@@ -17,8 +17,9 @@
 //! * [`encode_message`] produces the canonical form: the re-encoding the front
 //!   hands to the engine (R49-16) and the encoding of every response.
 //!
-//! Distinguished-name syntax (RFC 4514) is not parsed here: an LDAPDN is a
-//! UTF-8 LDAPString to this crate (docs/49 R49-11, task L5).
+//! The message codec treats an LDAPDN as a UTF-8 LDAPString. Its
+//! distinguished-name syntax (RFC 4514, and the `<GUID=hex>` alternative form)
+//! is parsed separately by the [`dn`] module (docs/49 R49-11, task L5).
 //!
 //! # Strictness (the LDAP-BER profile, docs/49 §2.3 and A-45)
 //!
@@ -43,13 +44,16 @@
 //! §1.4, §2.5; ITU-T X.690 (02/2021) clauses 7.3, 8.1–8.4, 8.7–8.14, 10.1–10.3,
 //! 11.1; ITU-T X.680 (02/2021) Table 1; [MS-ADTS] v20261026 3.1.1.3.4.6 and
 //! 6.3.3; and the project's
-//! decided design docs/49 with decision A-45 (docs/questions/Q-160). No other
-//! implementation was consulted or recalled.
+//! decided design docs/49 with decision A-45 (docs/questions/Q-160). The
+//! [`dn`] module adds RFC 4514, RFC 4517 §3.3.9, [MS-ADTS] 3.1.1.1.4,
+//! 3.1.1.3.1.2.1–3.1.1.3.1.2.5, 3.1.1.3.4.1.5, 3.1.1.5.1.2 and [MS-DTYP] 2.3.4
+//! (see its documentation). No other implementation was consulted or recalled.
 //!
 //! Spec: RFC 4511; X.690 (02/2021) clauses 8, 10; docs/49 §2, §11.
 
 mod ber;
 mod decode;
+pub mod dn;
 mod encode;
 mod error;
 mod frame;
@@ -63,9 +67,9 @@ pub use error::{Error, Limit, Result};
 pub use frame::{frame_length, Frame};
 pub use limits::{
     AuthState, MAX_ATTRIBUTE_SELECTORS, MAX_ATTRIBUTE_VALUES, MAX_AUTH_MESSAGE_OCTETS,
-    MAX_CONTROLS, MAX_FILTER_DEPTH, MAX_FILTER_NODES, MAX_IDENTIFIER_OCTETS, MAX_INT,
+    MAX_CONTROLS, MAX_DN_RDNS, MAX_FILTER_DEPTH, MAX_FILTER_NODES, MAX_IDENTIFIER_OCTETS, MAX_INT,
     MAX_LDAPDN_OCTETS, MAX_LENGTH_OCTETS, MAX_PARTIAL_ATTRIBUTES, MAX_PREAUTH_MESSAGE_OCTETS,
-    MAX_SUBSTRING_ANY, MAX_TLV_DEPTH, MAX_VALUE_OCTETS,
+    MAX_RDN_VALUE_OCTETS, MAX_SUBSTRING_ANY, MAX_TLV_DEPTH, MAX_VALUE_OCTETS,
 };
 pub use message::{
     AttributeValueAssertion, AuthenticationChoice, BindRequest, BindResponse, Control,
