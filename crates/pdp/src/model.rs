@@ -150,7 +150,11 @@ impl Dn {
 
     /// `true` if this DN equals `base` or lies in the subtree below it, i.e.
     /// `base`'s components are a suffix of this DN's components.
-    /// Spec: docs/11 §3 (`ResourceMatch` "subtree of DN").
+    ///
+    /// An empty `base` is a suffix of every DN, so it contains everything.
+    /// No policy rule can carry one: a rule's subtree is a
+    /// [`crate::SubtreeBase`], which refuses the empty DN (Q-164 item 2,
+    /// A-48). Spec: docs/11 §3 (`ResourceMatch` "subtree of DN").
     #[must_use]
     pub fn is_within(&self, base: &Dn) -> bool {
         self.rdns.ends_with(&base.rdns)
@@ -163,6 +167,28 @@ impl Dn {
 /// [MS-DTYP] 2.4.4.3 (ObjectType identifies "a property set or property").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AttrId(pub Guid);
+
+impl AttrId {
+    /// The nTSecurityDescriptor attribute: its schemaIDGUID.
+    ///
+    /// Spec: [MS-ADA3] v20180912 2.37 ("ldapDisplayName:
+    /// nTSecurityDescriptor"; "schemaIdGuid:
+    /// bf9679e3-0de6-11d0-a285-00aa003049e2"). The printed groups map to the
+    /// members as the project decided for every schema GUID (A-31, Q-100:
+    /// group 1 = Data1, group 2 = Data2, group 3 = Data3, groups 4-5 = the
+    /// eight Data4 bytes in array order; [MS-DTYP] 2.3.4.1, 2.3.4.2).
+    ///
+    /// Reading it needs the rights of [MS-ADTS] 3.1.1.4.4, not
+    /// RIGHT_DS_READ_PROPERTY (see `desired_right` in decide.rs; Q-164, A-48).
+    /// The PDP recognises it by this identifier itself, so the stricter rule
+    /// holds whatever class the PIP reports for the attribute.
+    pub const NT_SECURITY_DESCRIPTOR: AttrId = AttrId(Guid {
+        data1: 0xbf96_79e3,
+        data2: 0x0de6,
+        data3: 0x11d0,
+        data4: [0xa2, 0x85, 0x00, 0xaa, 0x00, 0x30, 0x49, 0xe2],
+    });
+}
 
 /// An object class, identified by its schemaIDGUID. Spec: [MS-ADTS] 5.1.3.2
 /// (CC: "The ObjectType member of an ACE can contain a GUID that identifies
@@ -295,6 +321,21 @@ pub enum Resource {
         /// The scope.
         scope: PolicyScope,
     },
+    /// The rootDSE of the LDAP server.
+    ///
+    /// "The rootDSE (empty DN) is a mechanism for clients of an LDAP server
+    /// to interact with the server itself, rather than with particular
+    /// objects contained by the server" — it is not a directory object, has
+    /// no nTSecurityDescriptor, and so has no layer 5 (no ACL, no attribute
+    /// class). Its attributes "are not described by the schema" and "are
+    /// read-only", so the resource names no attribute (an [`AttrId`] is a
+    /// schemaIDGUID) and the only well-formed action on it is
+    /// [`Action::DirRead`]; which rootDSE attributes are returned is the
+    /// PEP's choice (docs/49 §5.2). An unauthenticated read is admitted only
+    /// through an anonymous-allowlist entry naming it and the request's
+    /// source network (docs/15 §6). Spec: [MS-ADTS] v20261026 3.1.1.3,
+    /// 3.1.1.3.2; docs/49 §5.2 (R49-10); Q-164 item 1 (A-48).
+    RootDse,
 }
 
 /// The abstract action taxonomy. Spec: docs/11 §1; docs/06 §3 (D14).
@@ -394,7 +435,10 @@ impl Action {
 /// Observed request context. Spec: docs/11 §1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Context {
-    /// Network zone of the source. Spec: docs/11 §1.
+    /// Network zone of the source, as observed by the PEP. Matched by rules
+    /// (`ContextMatch.src_net`) and by every anonymous-allowlist entry
+    /// (`AnonymousGrant`: docs/15 §6, "from the internal network").
+    /// Spec: docs/11 §1.
     pub src_net: IpScope,
     /// Explicit time, supplied by the PEP. The PDP never reads a clock
     /// (P9). Spec: docs/11 §1, §10.

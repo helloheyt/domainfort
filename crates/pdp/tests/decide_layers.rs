@@ -81,31 +81,25 @@ fn layer1_unverified_ticket_is_unauthenticated() {
 /// Layer 1: the anonymous allowlist lets an unauthenticated request through
 /// to the later layers (it is not an Allow by itself) and replaces
 /// `required_sec` by its configured minimum (docs/11 §4; docs/05 §3: rootDSE
-/// only).
+/// only). The rootDSE is `Resource::RootDse` and the entry names the source
+/// network (docs/49 §5.2, R49-10; docs/15 §6; Q-164 items 1, 3) — the
+/// former spelling, a subtree with an empty base, is refused (Q-164 item 2).
 #[test]
 fn layer1_anonymous_allowlist() {
-    let root_dse = Dn::new(vec![]);
-    let mut pip = MockPip::with_sd(sd(None, vec![allow(RIGHT_GENERIC_READ, everyone())]));
-    pip.sds.insert(
-        root_dse.clone(),
-        sd(None, vec![allow(RIGHT_GENERIC_READ, everyone())]),
-    );
-    let grant = AnonymousGrant {
-        action: ActionMatch::Exact(Action::DirRead),
-        resource: ResourceMatch::DirSubtree {
-            base: root_dse.clone(),
-        },
-        min_transport: TransportSec::NONE,
-    };
+    let pip = MockPip::with_sd(sd(None, vec![allow(RIGHT_GENERIC_READ, everyone())]));
+    let grant = AnonymousGrant::new(
+        ActionMatch::Exact(Action::DirRead),
+        ResourceMatch::RootDse,
+        TransportSec::NONE,
+        IpScope::Internal,
+    )
+    .expect("a bounded grant");
     let mut anon = subject(everyone(), &[], Tier::Tier1);
     anon.auth.strength = AuthStrength::Unauth;
     anon.auth.ticket_verified = false;
     let mut req = AccessRequest {
         subject: anon,
-        resource: Resource::DirObject {
-            dn: root_dse,
-            attr: None,
-        },
+        resource: Resource::RootDse,
         action: Action::DirRead,
         context: strong_context(),
     };
@@ -119,9 +113,18 @@ fn layer1_anonymous_allowlist() {
     let pol = PolicySnapshot::new(PolicyVersion(1), vec![allow_everything(1)], vec![grant]);
     assert_eq!(decide(&req, &pol, &pip).effect, Effect::Allow);
 
-    // Not allowlisted (a write): unauthenticated.
-    req.action = Action::DirWrite;
+    // Not allowlisted (a directory object): unauthenticated.
+    req.resource = Resource::DirObject {
+        dn: obj_dn(),
+        attr: None,
+    };
     assert_eq!(decide(&req, &pol, &pip).reason, ReasonCode::Unauthenticated);
+
+    // The former spelling of the rootDSE cannot be written any more.
+    assert_eq!(
+        pdp::SubtreeBase::new(Dn::new(vec![])),
+        Err(pdp::RuleError::EmptySubtreeBase)
+    );
 }
 
 // --------------------------------------------------------------- layer 2 ----
@@ -245,11 +248,15 @@ fn layer1_unauthenticated_dns_update_is_denied() {
     let allowlisting = PolicySnapshot::new(
         PolicyVersion(1),
         vec![allow_everything(1)],
-        vec![AnonymousGrant {
-            action: ActionMatch::Exact(Action::DnsUpdate),
-            resource: ResourceMatch::Any,
-            min_transport: TransportSec::NONE,
-        }],
+        vec![AnonymousGrant::new(
+            ActionMatch::Exact(Action::DnsUpdate),
+            ResourceMatch::Dns {
+                zone: pdp::ZoneId("test".into()),
+            },
+            TransportSec::NONE,
+            IpScope::Internal,
+        )
+        .expect("a bounded grant")],
     );
     for pol in [policy(vec![allow_everything(1)]), allowlisting] {
         assert_eq!(decide(&req, &pol, &pip).reason, ReasonCode::Unauthenticated);
@@ -350,14 +357,12 @@ fn layer3_matchers() {
     let req = read_req();
 
     let inside = Match {
-        resource: ResourceMatch::DirSubtree { base: parent_dn() },
+        resource: subtree(parent_dn()),
         ..match_all()
     };
     assert!(allowed(inside, &req));
     let elsewhere = Match {
-        resource: ResourceMatch::DirSubtree {
-            base: Dn::new(vec!["ou=other".into(), "dc=test".into()]),
-        },
+        resource: subtree(Dn::new(vec!["ou=other".into(), "dc=test".into()])),
         ..match_all()
     };
     assert!(!allowed(elsewhere, &req));

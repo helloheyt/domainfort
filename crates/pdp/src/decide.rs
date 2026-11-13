@@ -22,7 +22,8 @@
 //! a deny-widening change is visible on the next call (P8).
 
 use crate::access_check::rights::{
-    RIGHT_DELETE, RIGHT_DS_LIST_CONTENTS, RIGHT_DS_READ_PROPERTY, RIGHT_DS_WRITE_PROPERTY,
+    ACCESS_SYSTEM_SECURITY, RIGHT_DELETE, RIGHT_DS_LIST_CONTENTS, RIGHT_DS_READ_PROPERTY,
+    RIGHT_DS_WRITE_PROPERTY, RIGHT_READ_CONTROL,
 };
 use crate::access_check::{acl_grants, DirObjectContext, Right};
 use crate::model::{
@@ -124,7 +125,9 @@ fn evaluate<P: Pip + ?Sized>(
     }
 
     // Layer 5 — the object ACL and the attribute class (directory objects
-    // only).
+    // only). The rootDSE is not a directory object and has no
+    // nTSecurityDescriptor ([MS-ADTS] 3.1.1.3; docs/49 §5.2, R49-10): its
+    // reads are decided by layers 1-3 alone.
     if let Resource::DirObject { dn, attr } = &req.resource {
         let sd = from_pip(pip.security_descriptor(dn))?;
         // The root of the object type tree is the most specific class; the
@@ -185,7 +188,23 @@ fn evaluate<P: Pip + ?Sized>(
 /// action come without an attribute? Spec: docs/11 §1 (each `Action` names the
 /// resource it applies to; `attr: None` for a whole-object operation), docs/06
 /// §3.
+///
+/// Two directory-specific checks (narrowing only — each turns a request into
+/// `InvalidRequest`):
+/// - the rootDSE admits `DirRead` alone (Q-164 item 1: "`well_formed` only
+///   with `DirRead`"): its attributes "are read-only" ([MS-ADTS] 3.1.1.3.2),
+///   it is not an object (3.1.1.3), and a rootDSE request is a base-object
+///   search of the empty base only (docs/49 §5.2, R49-10);
+/// - a directory object never has the empty DN: "The rootDSE (empty DN)"
+///   ([MS-ADTS] 3.1.1.3) is [`Resource::RootDse`], so
+///   `DirObject { dn: <empty> }` is malformed (fail closed, D40) — the
+///   spelling the rootDSE had before it had its own resource (docs/49 §5.2).
 fn well_formed(action: &Action, resource: &Resource) -> bool {
+    if let Resource::DirObject { dn, .. } = resource {
+        if dn.rdns().is_empty() {
+            return false;
+        }
+    }
     matches!(
         (action, resource),
         (
@@ -197,7 +216,8 @@ fn well_formed(action: &Action, resource: &Resource) -> bool {
                 | Action::DirList
                 | Action::DirControlRight(_),
             Resource::DirObject { attr: None, .. },
-        ) | (Action::RpcCall, Resource::RpcMethod { .. })
+        ) | (Action::DirRead, Resource::RootDse)
+            | (Action::RpcCall, Resource::RpcMethod { .. })
             | (Action::FileRead | Action::FileWrite, Resource::File { .. })
             | (Action::DnsUpdate | Action::DnsXfer, Resource::Dns { .. })
             | (
@@ -217,16 +237,18 @@ fn is_authenticated(auth: &AuthContext) -> bool {
 }
 
 /// The configured transport minimum for an unauthenticated request that is
-/// on the anonymous allowlist, or `None` if it is not. If several entries
-/// match, all of their minimums apply (fail closed). Spec: docs/11 §4
+/// on the anonymous allowlist, or `None` if it is not. An entry admits a
+/// request only from the source network it names (`AnonymousGrant::matches`;
+/// docs/15 §6, "from the internal network"; Q-164 item 3). If several
+/// entries match, all of their minimums apply (fail closed). Spec: docs/11 §4
 /// (`anon_allowlist`; "anonymous allowlist (rootDSE, CLDAP ping) → configured
 /// minimum").
 fn anonymous_floor(req: &AccessRequest, pol: &PolicySnapshot) -> Option<TransportSec> {
     pol.anonymous_allowlist()
         .iter()
-        .filter(|g| g.action.matches(&req.action) && g.resource.matches(&req.resource))
+        .filter(|g| g.matches(req))
         .fold(None, |floor: Option<TransportSec>, g| {
-            Some(floor.unwrap_or(TransportSec::NONE).union(g.min_transport))
+            Some(floor.unwrap_or(TransportSec::NONE).union(g.min_transport()))
         })
 }
 
@@ -329,6 +351,20 @@ pub fn is_write(action: &Action) -> bool {
 ///   "RIGHT_DS_READ_PROPERTY on OA"; 5.1.3.2 RP / WP); of the whole object:
 ///   the same right on the object ([MS-ADTS] 5.1.3.2: "If ObjectType does not
 ///   contain a GUID, the ACE controls the right to read all attributes");
+/// - `DirRead` of nTSecurityDescriptor ([`AttrId::NT_SECURITY_DESCRIPTOR`]):
+///   [MS-ADTS] 3.1.1.4.4, "OA: nTSecurityDescriptor — Requires right(s):
+///   (ACCESS_SYSTEM_SECURITY) and (RIGHT_READ_CONTROL)" — both, on the
+///   object, instead of RIGHT_DS_READ_PROPERTY (Q-164, A-48: asking only
+///   RIGHT_DS_READ_PROPERTY granted more than 3.1.1.4.4 allows). The request
+///   names the whole descriptor: the resource cannot name a part of it, and
+///   with no LDAP_SERVER_SD_FLAGS_OID control a read covers owner, group,
+///   DACL and SACL ([MS-ADTS] 3.1.1.3.4.1.11) — rights per part are Q-164
+///   item 4, a later task. ACCESS_SYSTEM_SECURITY is granted only through
+///   SeSecurityPrivilege ([MS-DTYP] 2.5.3.2: "IF Token.Privileges contains
+///   SeSecurityPrivilege THEN ... ELSE ... Return access_denied"; 2.4.3:
+///   "This bit MUST NOT be set in an ACE that is part of a DACL"), and a
+///   `Subject` carries no privileges, so [`acl_grants`] refuses this right
+///   for every descriptor: the read is always denied (fail closed);
 /// - `DirAddChild(c)`: RIGHT_DS_CREATE_CHILD for class c ([MS-ADTS]
 ///   3.1.1.5.2.1);
 /// - `DirDelete`: RIGHT_DELETE on the object ([MS-ADTS] 3.1.1.5.5.4). The
@@ -352,6 +388,11 @@ fn desired_right<P: Pip + ?Sized>(
         })
     };
     match (action, attr) {
+        // [MS-ADTS] 3.1.1.4.4: "(ACCESS_SYSTEM_SECURITY) and
+        // (RIGHT_READ_CONTROL)" — never grantable here (doc comment above).
+        (Action::DirRead, Some(a)) if *a == AttrId::NT_SECURITY_DESCRIPTOR => Ok(Right::Object {
+            mask: ACCESS_SYSTEM_SECURITY | RIGHT_READ_CONTROL,
+        }),
         (Action::DirRead, Some(a)) => property(RIGHT_DS_READ_PROPERTY, a),
         (Action::DirRead, None) => Ok(Right::Object {
             mask: RIGHT_DS_READ_PROPERTY,

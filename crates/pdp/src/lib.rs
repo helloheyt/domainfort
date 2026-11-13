@@ -23,6 +23,25 @@
 //! - [`decide_visibility`] of docs/11 §7 — search results are filtered,
 //!   never refused with an error.
 //!
+//! # LDAP extensions (docs/49 §5.2, R49-10; Q-164 items 1-3, A-48)
+//!
+//! - [`Resource::RootDse`] / [`ResourceMatch::RootDse`]: the rootDSE is not
+//!   a directory object ([MS-ADTS] 3.1.1.3); only `DirRead` is well formed
+//!   on it, and it has no layer 5. A directory object never has the empty
+//!   DN.
+//! - A rule's DN subtree is a [`SubtreeBase`], never empty — the empty base
+//!   matched every object (a bug found in merged code, Q-164 item 2).
+//! - An [`AnonymousGrant`] names the source network it admits (docs/15 §6)
+//!   and never every resource; both refusals are [`RuleError`]s at
+//!   construction.
+//! - Reading nTSecurityDescriptor asks the rights of [MS-ADTS] 3.1.1.4.4
+//!   (ACCESS_SYSTEM_SECURITY and RIGHT_READ_CONTROL), which a `Subject`
+//!   without privileges never holds (a bug found in merged code, A-48).
+//!
+//! Each of these only narrows: a decision that changes goes from Allow to
+//! Deny, and the new resource changes no other decision (`tests/properties.rs`,
+//! section "LDAP extensions: never widen"; `tests/ldap_extensions.rs`).
+//!
 //! # Project rules stricter than the specifications (docs/11 §5, D37)
 //!
 //! Each is a deliberate deviation, marked `DELIBERATE` at its `// Spec:`
@@ -78,15 +97,20 @@
 //!   2.4.4.5, 2.4.5, 2.4.6, 2.5.2, 2.5.3, 2.5.3.1.1, 2.5.3.1.3, 2.5.3.1.4,
 //!   2.5.3.2;
 //! - [MS-ADTS] v20261026 (protocol revision 70.0; pinned PDF sha256
-//!   55b59eb1…b2b1): 3.1.1.2.3.3, 3.1.1.2.4.3, 3.1.1.4.3, 3.1.1.4.4,
-//!   3.1.1.5.2.1, 3.1.1.5.5.4, 5.1.3, 5.1.3.1, 5.1.3.2, 5.1.3.2.1, 5.1.3.2.2,
-//!   5.1.3.3, 5.1.3.3.1-5.1.3.3.6, 6.1.3, 6.1.3.4, 6.1.1.2.4.1.2
-//!   (BlockOwnerImplicitRights row), 6.1.1.2.6.18;
+//!   55b59eb1…b2b1): 3.1.1.2.3.3, 3.1.1.2.4.3, 3.1.1.3 (introduction: the
+//!   rootDSE), 3.1.1.3.2 (introduction: rootDSE attributes read-only, not in
+//!   the schema), 3.1.1.3.4.1.11 (SD_FLAGS: the default covers every part),
+//!   3.1.1.4.1-3.1.1.4.4, 3.1.1.5.2.1, 3.1.1.5.5.4, 5.1.3, 5.1.3.1, 5.1.3.2,
+//!   5.1.3.2.1, 5.1.3.2.2, 5.1.3.3, 5.1.3.3.1-5.1.3.3.6, 6.1.3, 6.1.3.4,
+//!   6.1.1.2.4.1.2 (BlockOwnerImplicitRights row), 6.1.1.2.6.18;
 //! - [MS-ADA1] v20180912 (pinned PDF sha256 3885c568…6a50): 2.185
 //!   (dNSHostName: schemaIdGuid = attributeSecurityGuid, Q-081);
-//! - this project's docs/05, docs/06, docs/11, docs/25 §5.1, docs/45 §5-7,
-//!   docs/48 §4.2, §7 (and its closing decision), docs/questions/Q-127
-//!   (interim decision, owner item P-10).
+//! - [MS-ADA3] v20180912 (pinned PDF sha256 f8eca4bf…5a49): 2.37
+//!   (nTSecurityDescriptor: schemaIdGuid);
+//! - this project's docs/05, docs/06, docs/11, docs/15 §6, docs/25 §5.1,
+//!   docs/45 §5-7, docs/48 §4.2, §7 (and its closing decision), docs/49 §5.2,
+//!   §6.5, §12 (L2) and its closing decision, docs/questions/Q-127 (interim
+//!   decision, owner item P-10), Q-164 (A-48), A-31 (GUID string form).
 //!
 //! No other implementation was consulted or recalled (AGENTS.md §1-3).
 //! Spec gaps, conflicts and design decisions: docs/questions/Q-050 (resolved,
@@ -94,7 +118,8 @@
 //! A-22), Q-081 (resolved, A-28: the object type tree's class and duplicate
 //! GUIDs — see [`access_check`]), Q-127 (deferred: owner item P-10; built
 //! per the interim decision), Q-130 (open: the mandatory-FAST rule-language
-//! interpretations and the bootstrap SID).
+//! interpretations and the bootstrap SID), Q-164 (resolved, A-48: items 1-3
+//! built here), Q-170 (open: the interpretations of that build).
 
 pub mod access_check;
 mod decide;
@@ -117,6 +142,6 @@ pub use model::{
 pub use pip::{AttrClass, Pip, PipError};
 pub use policy::{
     ActionMatch, AnonymousGrant, AuthMatch, ContextMatch, Match, PolicySnapshot, PolicyVersion,
-    ResourceMatch, Rule, SubjectMatch, TimeWindow,
+    ResourceMatch, Rule, RuleError, SubjectMatch, SubtreeBase, TimeWindow,
 };
 pub use visibility::{decide_visibility, DirObjectRef, Visible};

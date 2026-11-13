@@ -23,12 +23,77 @@
 //! - a negated subject predicate takes effect in Deny rules only; in an
 //!   Allow rule it matches nothing ([`Rule::applies`]) — DELIBERATE, fail
 //!   closed, see Q-130.
+//!
+//! # Construction refusals (Q-164 items 2-3, A-48)
+//!
+//! Two pieces of policy data are checked when they are built, and a value
+//! that fails the check cannot exist:
+//! - a DN subtree ([`SubtreeBase`]) is never empty: an empty base is a
+//!   suffix of every DN ([`Dn::is_within`]), so a rule over it would match
+//!   every directory object — in an anonymous-allowlist entry, the whole
+//!   directory. Refused for every rule, Allow or Deny, and for the
+//!   allowlist. A rule over every resource is written explicitly as
+//!   [`ResourceMatch::Any`] (for a Deny, together with an action matcher
+//!   such as `ActionMatch::Class(ActionClass::Directory)`);
+//! - an anonymous-allowlist entry ([`AnonymousGrant`]) always names the
+//!   source network it admits (docs/15 §6, "only these, from the internal
+//!   network") — there is no "any network" form — and never names every
+//!   resource.
+//!
+//! A refusal is a [`RuleError`]. Whoever loads a policy must treat it as a
+//! failure of the whole load (no snapshot, so every decision is Deny), never
+//! skip the refused item: dropping a Deny rule, or an allowlist entry whose
+//! transport minimum joins another entry's, would widen.
 
 use crate::model::{
     AccessRequest, Action, ActionClass, AuthContext, ClaimId, ClaimValue, Dn, Effect, Instant,
     IpScope, KerbResKind, Obligation, PolicyScope, PrincipalId, Resource, RuleId, ShareId, Subject,
     Tier, TransportSec, Uuid, ZoneId,
 };
+
+/// Why a piece of policy data was refused when it was built. Spec: Q-164
+/// items 2-3 (A-48); docs/15 §6; the module documentation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RuleError {
+    /// A DN subtree with no RDN component: it would contain every directory
+    /// object (Q-164 item 2).
+    EmptySubtreeBase,
+    /// An anonymous-allowlist entry over every resource
+    /// ([`ResourceMatch::Any`]): docs/15 §6 lists the only resources
+    /// anonymous requests may reach.
+    UnboundedAnonymousResource,
+}
+
+/// The root of a DN subtree in a rule: a [`Dn`] with at least one RDN
+/// component. Constructed only through [`SubtreeBase::new`], so a rule can
+/// never carry the empty base that would contain every object.
+///
+/// Spec: docs/11 §3 (`ResourceMatch`: "subtree of DN"); Q-164 item 2 (A-48:
+/// "`DirSubtree` with an empty base matched every object"); [MS-ADTS]
+/// 3.1.1.3 (the empty DN is the rootDSE, not an object — expressed as
+/// [`ResourceMatch::RootDse`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtreeBase {
+    dn: Dn,
+}
+
+impl SubtreeBase {
+    /// The subtree rooted at `dn`; [`RuleError::EmptySubtreeBase`] if `dn`
+    /// has no RDN component. Spec: Q-164 item 2.
+    pub fn new(dn: Dn) -> Result<SubtreeBase, RuleError> {
+        if dn.rdns().is_empty() {
+            Err(RuleError::EmptySubtreeBase)
+        } else {
+            Ok(SubtreeBase { dn })
+        }
+    }
+
+    /// The root DN (never empty).
+    #[must_use]
+    pub fn dn(&self) -> &Dn {
+        &self.dn
+    }
+}
 
 /// A global rule. Spec: docs/11 §3.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,11 +226,15 @@ impl ActionMatch {
 pub enum ResourceMatch {
     /// Every resource.
     Any,
-    /// A directory object equal to `base` or below it (any attribute).
+    /// A directory object equal to `base` or below it (any attribute). Never
+    /// the rootDSE, which is not a directory object.
     DirSubtree {
-        /// The subtree root.
-        base: Dn,
+        /// The subtree root (never empty, [`SubtreeBase`]).
+        base: SubtreeBase,
     },
+    /// The rootDSE ([`Resource::RootDse`]), and nothing else. Spec: docs/49
+    /// §5.2 (R49-10); Q-164 item 1.
+    RootDse,
     /// An RPC method of this interface; `opnum: None` matches every opnum.
     RpcMethod {
         /// Interface UUID.
@@ -202,8 +271,9 @@ impl ResourceMatch {
         match (self, resource) {
             (ResourceMatch::Any, _) => true,
             (ResourceMatch::DirSubtree { base }, Resource::DirObject { dn, .. }) => {
-                dn.is_within(base)
+                dn.is_within(base.dn())
             }
+            (ResourceMatch::RootDse, Resource::RootDse) => true,
             (
                 ResourceMatch::RpcMethod {
                     iface: want_iface,
@@ -363,18 +433,91 @@ impl Match {
 }
 
 /// One entry of the anonymous allowlist (layer 1): which unauthenticated
-/// requests may proceed to the later layers, and the transport floor that
-/// replaces `required_sec` for them. Spec: docs/11 §4 (`anon_allowlist`;
-/// "anonymous allowlist (rootDSE, CLDAP ping) → configured minimum"); docs/06
-/// §5.1; docs/05 §3 (CLDAP / anonymous: rootDSE only).
+/// requests, from which source network, may proceed to the later layers, and
+/// the transport floor that replaces `required_sec` for them. It is not an
+/// Allow by itself: layers 3-5 still apply.
+///
+/// Constructed only through [`AnonymousGrant::new`], which enforces the
+/// module's construction refusals: the entry names exactly one source
+/// network (there is no "any network" form — the stricter option of Q-164
+/// item 3), and never every resource. docs/15 §6 lists the anonymous
+/// allowlist as "only these, from the internal network", so a deployment
+/// names [`IpScope::Internal`]; naming [`IpScope::External`] is an explicit,
+/// separate entry.
+///
+/// Spec: docs/11 §4 (`anon_allowlist`; "anonymous allowlist (rootDSE, CLDAP
+/// ping) → configured minimum"); docs/15 §6; docs/06 §5.1; docs/05 §3
+/// (CLDAP / anonymous: rootDSE only); [MS-ADTS] 5.1.3 (with
+/// fLDAPBlockAnonOps "anonymous (unauthenticated) users are limited to
+/// performing rootDSE searches and binds"); Q-164 items 2-3 (A-48).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnonymousGrant {
+    action: ActionMatch,
+    resource: ResourceMatch,
+    min_transport: TransportSec,
+    src_net: IpScope,
+}
+
+impl AnonymousGrant {
+    /// An allowlist entry for `action` on `resource` from `src_net`, with
+    /// the transport minimum `min_transport`.
+    ///
+    /// [`RuleError::UnboundedAnonymousResource`] if `resource` is
+    /// [`ResourceMatch::Any`] — DELIBERATE, stricter than Q-164 asked (it
+    /// named the empty subtree; `Any` is the same "every object" match in
+    /// explicit form, and docs/15 §6 admits only the listed resources). An
+    /// empty subtree cannot reach here at all ([`SubtreeBase`]).
+    /// Spec: docs/15 §6; Q-164 items 2-3.
+    pub fn new(
+        action: ActionMatch,
+        resource: ResourceMatch,
+        min_transport: TransportSec,
+        src_net: IpScope,
+    ) -> Result<AnonymousGrant, RuleError> {
+        if matches!(resource, ResourceMatch::Any) {
+            return Err(RuleError::UnboundedAnonymousResource);
+        }
+        Ok(AnonymousGrant {
+            action,
+            resource,
+            min_transport,
+            src_net,
+        })
+    }
+
     /// Which actions.
-    pub action: ActionMatch,
-    /// Which resources.
-    pub resource: ResourceMatch,
+    #[must_use]
+    pub fn action(&self) -> &ActionMatch {
+        &self.action
+    }
+
+    /// Which resources (never [`ResourceMatch::Any`]).
+    #[must_use]
+    pub fn resource(&self) -> &ResourceMatch {
+        &self.resource
+    }
+
     /// The configured transport minimum for these requests.
-    pub min_transport: TransportSec,
+    #[must_use]
+    pub fn min_transport(&self) -> TransportSec {
+        self.min_transport
+    }
+
+    /// The only source network this entry admits.
+    #[must_use]
+    pub fn src_net(&self) -> IpScope {
+        self.src_net
+    }
+
+    /// `true` if the entry admits `req`: its action, its resource and its
+    /// source network (`Context.src_net`) all match. Spec: docs/11 §4
+    /// (`anon_allowlist(req)`); docs/15 §6 ("from the internal network").
+    #[must_use]
+    pub fn matches(&self, req: &AccessRequest) -> bool {
+        self.action.matches(&req.action)
+            && self.resource.matches(&req.resource)
+            && self.src_net == req.context.src_net
+    }
 }
 
 /// The version of a policy snapshot. Spec: docs/11 §6, §9 (the cache key
@@ -384,7 +527,10 @@ pub struct PolicyVersion(pub u64);
 
 /// A consistent, versioned set of global rules plus the anonymous allowlist.
 /// Every decision is evaluated against one snapshot, so it is reproducible
-/// (P9, D39). Spec: docs/11 §3, §6; docs/06 §9 (D17).
+/// (P9, D39). Every rule and allowlist entry passed in has already passed
+/// its construction checks ([`SubtreeBase::new`], [`AnonymousGrant::new`]);
+/// a loader that met a [`RuleError`] builds no snapshot at all (module
+/// documentation). Spec: docs/11 §3, §6; docs/06 §9 (D17).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicySnapshot {
     version: PolicyVersion,

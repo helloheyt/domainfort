@@ -19,7 +19,7 @@ use pdp::{
     AccessRequest, Action, ActionMatch, AttrClass, AttrId, AuthContext, AuthMatch, AuthStrength,
     Context, ContextMatch, Dn, Effect, Instant, IpScope, Match, ObjClass, ObjClassChain, Pip,
     PipError, PolicySnapshot, PolicyVersion, PropertySet, Resource, ResourceMatch, Rule, RuleId,
-    Subject, SubjectMatch, Tier, Transport, TransportSec,
+    Subject, SubjectMatch, SubtreeBase, Tier, Transport, TransportSec,
 };
 
 // ---------------------------------------------------------------- SIDs ----
@@ -361,6 +361,14 @@ pub fn match_all() -> Match {
 /// A snapshot with these rules and no anonymous allowlist.
 pub fn policy(rules: Vec<Rule>) -> PolicySnapshot {
     PolicySnapshot::new(PolicyVersion(1), rules, vec![])
+}
+
+/// The resource matcher for the DN subtree rooted at `base`, which must be
+/// non-empty (Q-164 item 2: `SubtreeBase` refuses the empty DN).
+pub fn subtree(base: Dn) -> ResourceMatch {
+    ResourceMatch::DirSubtree {
+        base: SubtreeBase::new(base).expect("a non-empty subtree base"),
+    }
 }
 
 // ---------------------------------------------------------------- PIP ----

@@ -238,6 +238,16 @@ pub fn acl_grants(
 /// of the [MS-ADTS] 5.1.3.2 diagram — no generic right, no ignored X bit, no
 /// MAXIMUM_ALLOWED / ACCESS_SYSTEM_SECURITY. A malformed request is denied
 /// (fail closed, D40). Spec: [MS-ADTS] 5.1.3.2.
+///
+/// For ACCESS_SYSTEM_SECURITY this is also exactly the [MS-DTYP] 2.5.3.2
+/// outcome: the bit is granted only when "Token.Privileges contains
+/// SeSecurityPrivilege", otherwise the check returns access_denied, and no
+/// ACE can grant it (2.4.3: "This bit MUST NOT be set in an ACE that is part
+/// of a DACL"). A [`Subject`] carries no privileges (lib.rs, "Out of
+/// scope"), so a request naming it is always denied. This is how a read of
+/// nTSecurityDescriptor, which [MS-ADTS] 3.1.1.4.4 conditions on
+/// "(ACCESS_SYSTEM_SECURITY) and (RIGHT_READ_CONTROL)", is refused (Q-164,
+/// A-48; `desired_right` in decide.rs).
 fn valid_request(mask: u32) -> bool {
     mask != 0 && mask & !DIRECTORY_RIGHTS == 0
 }

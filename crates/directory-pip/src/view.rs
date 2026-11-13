@@ -621,8 +621,10 @@ impl Pip for DirectoryView<'_> {
     /// every resource kind the map cannot classify is Tier0: a policy scope
     /// (docs/06 §9), and RPC / file / DNS / Kerberos resources until the map
     /// has rows for them (A-36: an unclassified resource is Tier0 for
-    /// writes).
-    /// Spec: docs/47 §6.3, §8.2; docs/06 §9; A-36.
+    /// writes). The rootDSE is never written (pdp admits only `DirRead` on
+    /// it; [MS-ADTS] 3.1.1.3.2: its attributes "are read-only"), so it is
+    /// never asked; if it were, Tier0 (A-36).
+    /// Spec: docs/47 §6.3, §8.2; docs/06 §9; docs/49 §5.2 (R49-10); A-36.
     fn object_tier(&self, r: &Resource) -> Result<Tier, PipError> {
         match r {
             Resource::DirObject { dn, .. } => Ok(self.dir_object_tier(dn)?),
@@ -630,7 +632,8 @@ impl Pip for DirectoryView<'_> {
             | Resource::RpcMethod { .. }
             | Resource::File { .. }
             | Resource::Dns { .. }
-            | Resource::Kerberos { .. } => Ok(Tier::Tier0),
+            | Resource::Kerberos { .. }
+            | Resource::RootDse => Ok(Tier::Tier0),
         }
     }
 

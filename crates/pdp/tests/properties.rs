@@ -10,14 +10,14 @@
 mod common;
 
 use common::*;
-use dtyp::{Ace, SecurityDescriptor, Sid};
+use dtyp::{Ace, Guid, SecurityDescriptor, Sid};
 use pdp::access_check::rights::*;
 use pdp::{
     acl_grants, decide, is_write, mandatory_fast_rules, AccessRequest, Action, ActionClass,
-    ActionMatch, AttrClass, AttrId, AuthMatch, AuthStrength, ContextMatch, ControlRightId,
-    Decision, DirObjectContext, Effect, Instant, Match, ObjClass, Obligation, PolicySnapshot,
-    ReasonCode, ResourceMatch, Right, Rule, RuleId, Subject, SubjectMatch, Tier, TimeWindow,
-    TransportSec,
+    ActionMatch, AnonymousGrant, AttrClass, AttrId, AuthMatch, AuthStrength, ContextMatch,
+    ControlRightId, Decision, DirObjectContext, Dn, Effect, Instant, IpScope, Match, ObjClass,
+    Obligation, PolicySnapshot, PolicyVersion, ReasonCode, Resource, ResourceMatch, Right, Rule,
+    RuleError, RuleId, Subject, SubjectMatch, SubtreeBase, Tier, TimeWindow, TransportSec,
 };
 
 // ------------------------------------------------------------ domains ----
@@ -191,7 +191,7 @@ fn policies() -> Vec<PolicySnapshot> {
         effect: Effect::Allow,
         when: Match {
             action: ActionMatch::AnyOf(vec![Action::DirRead, Action::DirList]),
-            resource: ResourceMatch::DirSubtree { base: parent_dn() },
+            resource: subtree(parent_dn()),
             ..match_all()
         },
         obligations: vec![Obligation::Audit],
@@ -1263,5 +1263,669 @@ fn mandatory_fast_set_alone_is_exact() {
             }
         }
     }
+    assert!(allowed > 0);
+}
+
+// ------------------------------- LDAP extensions: never widen (Q-164) ----
+//
+// Source: Q-164 items 1-3 (A-48); docs/49 §5.2 (R49-10); docs/15 §6;
+// [MS-ADTS] v20261026 3.1.1.3, 3.1.1.4.4; [MS-DTYP] 2.5.3.2; docs/11 §3-§4,
+// §10. Hand-made domains; no vector from another implementation.
+//
+// The two fixes and the source-network constraint only narrow, and the new
+// resource changes no other decision:
+// - `accepted_subtree_rules_never_match_outside_their_base` — the empty-base
+//   fix (the only base that matched outside itself can no longer be built);
+// - `nt_security_descriptor_fix_only_narrows` — against the pre-fix PDP,
+//   reproduced by renaming the attribute (no other code path knows it);
+// - `source_network_fix_only_narrows` — against the pre-fix allowlist,
+//   reproduced by one entry per network;
+// - `root_dse_changes_no_other_decision` — over the equivalence domain;
+// - `root_dse_requests_keep_the_invariants` — P1-P4, P7, P9 and the exact
+//   outcome of every rootDSE request.
+//
+// One-time differential check against the pre-change build (the commit
+// before this change), over a hand-made domain of 5,760 inputs (3 subjects ×
+// 8 directory requests, including an nTSecurityDescriptor read and the
+// empty DN × 2 networks × 3 transports × 5 descriptors × 8 policies,
+// including rules and allowlist entries over the empty subtree and an entry
+// over every resource): each pre-change policy was mapped through the fix —
+// a policy holding a refused item builds no snapshot (every decision Deny),
+// every other allowlist entry names the internal network. Result: 332
+// decisions went from Allow to Deny, none from Deny to Allow; on the
+// policies that still build, the only changes were the
+// nTSecurityDescriptor read, the empty-DN directory object, and anonymous
+// requests from the external network.
+
+/// Every DN of up to `max` components over `alphabet`, the empty DN first.
+fn all_dns(alphabet: &[&str], max: usize) -> Vec<Dn> {
+    let mut out: Vec<Vec<String>> = vec![Vec::new()];
+    let mut layer: Vec<Vec<String>> = vec![Vec::new()];
+    for _ in 0..max {
+        let mut next = Vec::new();
+        for dn in &layer {
+            for component in alphabet {
+                let mut longer = dn.clone();
+                longer.push((*component).to_string());
+                next.push(longer);
+            }
+        }
+        out.extend(next.iter().cloned());
+        layer = next;
+    }
+    out.into_iter().map(Dn::new).collect()
+}
+
+/// "`dn` is `base` or lies below it", stated independently of the crate:
+/// the last `base.len()` components of `dn` are `base`'s, in order.
+fn within(dn: &Dn, base: &Dn) -> bool {
+    let (d, b) = (dn.rdns(), base.rdns());
+    d.len() >= b.len() && d[d.len() - b.len()..] == *b
+}
+
+/// Q-164 item 2 (A-48): over every DN of up to four components (341 DNs,
+/// with the empty one) as base and as object: the empty base is refused,
+/// every other base is accepted, and an accepted subtree matches a
+/// directory object exactly when the object is the base or below it —
+/// never outside it, never the rootDSE. Through `decide`, an Allow rule and
+/// a Deny rule over an accepted subtree (DNs of up to three components)
+/// apply exactly inside it.
+#[test]
+fn accepted_subtree_rules_never_match_outside_their_base() {
+    let alphabet = ["dc=test", "ou=unit", "cn=a", "ou=other"];
+    let dns = all_dns(&alphabet, 4);
+    assert_eq!(dns.len(), 341);
+    let mut matched = 0usize;
+    for base in &dns {
+        let accepted = SubtreeBase::new(base.clone());
+        if base.rdns().is_empty() {
+            assert_eq!(accepted, Err(RuleError::EmptySubtreeBase));
+            continue;
+        }
+        let base_match = ResourceMatch::DirSubtree {
+            base: accepted.expect("non-empty base"),
+        };
+        assert!(!base_match.matches(&Resource::RootDse));
+        for dn in &dns {
+            for attr in [None, Some(AttrId(attr_alone()))] {
+                let m = base_match.matches(&Resource::DirObject {
+                    dn: dn.clone(),
+                    attr,
+                });
+                assert_eq!(m, within(dn, base), "{base:?} {dn:?}");
+                assert!(!m || !dn.rdns().is_empty(), "{base:?} matched the empty DN");
+                matched += usize::from(m);
+            }
+        }
+    }
+    assert!(matched > 0);
+
+    // Through decide.
+    let small = all_dns(&alphabet, 3);
+    let mut pip = MockPip::with_sd(sd(None, vec![]));
+    for dn in &small {
+        pip.sds.insert(
+            dn.clone(),
+            sd(None, vec![allow(RIGHT_GENERIC_ALL, group())]),
+        );
+    }
+    let (mut inside, mut outside) = (0usize, 0usize);
+    for base in small.iter().filter(|b| !b.rdns().is_empty()) {
+        let allow_rule = Rule {
+            id: RuleId(1),
+            effect: Effect::Allow,
+            when: Match {
+                resource: subtree(base.clone()),
+                ..match_all()
+            },
+            obligations: vec![],
+        };
+        let deny_rule = Rule {
+            id: RuleId(2),
+            effect: Effect::Deny,
+            ..allow_rule.clone()
+        };
+        let allow_in = policy(vec![allow_rule]);
+        let deny_in = policy(vec![allow_everything(1), deny_rule]);
+        for dn in small.iter().filter(|d| !d.rdns().is_empty()) {
+            let mut req = dir_request(the_user(), Action::DirRead, None);
+            req.resource = Resource::DirObject {
+                dn: dn.clone(),
+                attr: None,
+            };
+            let w = within(dn, base);
+            assert_eq!(decide(&req, &allow_in, &pip).effect == Effect::Allow, w);
+            assert_eq!(
+                decide(&req, &deny_in, &pip).reason == ReasonCode::CoarseDeny(RuleId(2)),
+                w
+            );
+            if w {
+                inside += 1;
+            } else {
+                outside += 1;
+            }
+        }
+    }
+    assert!(inside > 0 && outside > 0);
+}
+
+/// The GUID that stands for nTSecurityDescriptor in the pre-fix
+/// reproduction: used nowhere else in these domains.
+fn renamed_ntsd() -> Guid {
+    guid(0x7E)
+}
+
+fn rename_guid(g: Guid) -> Guid {
+    if g == AttrId::NT_SECURITY_DESCRIPTOR.0 {
+        renamed_ntsd()
+    } else {
+        g
+    }
+}
+
+fn rename_ace(ace: &Ace) -> Ace {
+    match ace {
+        Ace::AccessAllowedObject(o) => {
+            let mut o = o.clone();
+            o.object_type = o.object_type.map(rename_guid);
+            Ace::AccessAllowedObject(o)
+        }
+        Ace::AccessDeniedObject(o) => {
+            let mut o = o.clone();
+            o.object_type = o.object_type.map(rename_guid);
+            Ace::AccessDeniedObject(o)
+        }
+        other => other.clone(),
+    }
+}
+
+/// [MS-ADTS] 3.1.1.4.4 fix (Q-164, A-48) only narrows. The pre-fix PDP
+/// treated nTSecurityDescriptor as an opaque GUID like any other; renaming
+/// it consistently (request, object ACEs, PIP tables) to a GUID nothing
+/// else uses therefore reproduces the pre-fix decision with the current
+/// code. Over every DACL of up to two ACEs (simple and object ACEs naming
+/// the attribute, with RP, RC, RP|RC and GENERIC_ALL, allow and deny, two
+/// trustees), two owners, two attribute classes and four requests: a read
+/// of nTSecurityDescriptor is always Deny now, and every other decision is
+/// identical to the pre-fix one — so every change is Allow → Deny (or a
+/// Deny reason). The domain reaches pre-fix Allows of the read, so the
+/// check is not vacuous.
+#[test]
+fn nt_security_descriptor_fix_only_narrows() {
+    let ntsd = AttrId::NT_SECURITY_DESCRIPTOR;
+    let mut alphabet = Vec::new();
+    for sid in [user(), other_user()] {
+        for mask in [
+            RIGHT_DS_READ_PROPERTY,
+            RIGHT_READ_CONTROL,
+            RIGHT_DS_READ_PROPERTY | RIGHT_READ_CONTROL,
+            RIGHT_GENERIC_ALL,
+        ] {
+            alphabet.push(allow(mask, sid));
+            alphabet.push(deny(mask, sid));
+            alphabet.push(allow_obj(mask, Some(ntsd.0), sid));
+            alphabet.push(deny_obj(mask, Some(ntsd.0), sid));
+            alphabet.push(allow_obj(mask, Some(attr_alone()), sid));
+        }
+    }
+    let mut dacls: Vec<Vec<Ace>> = vec![vec![]];
+    dacls.extend(alphabet.iter().map(|a| vec![a.clone()]));
+    for a in &alphabet {
+        for b in &alphabet {
+            dacls.push(vec![a.clone(), b.clone()]);
+        }
+    }
+    let requests = [
+        (Action::DirRead, Some(ntsd.0)),
+        (Action::DirWrite, Some(ntsd.0)),
+        (Action::DirRead, Some(attr_alone())),
+        (Action::DirRead, None),
+    ];
+    let pol = policy(vec![allow_everything(1)]);
+    let (mut narrowed, mut checked) = (0usize, 0usize);
+    for aces in &dacls {
+        for owner in [None, Some(user())] {
+            for class in [AttrClass::Normal, AttrClass::Secret] {
+                let mut now_pip = MockPip::with_sd(sd(owner, aces.clone()));
+                now_pip.attr_classes.insert(ntsd, class);
+                let mut before_pip =
+                    MockPip::with_sd(sd(owner, aces.iter().map(rename_ace).collect()));
+                before_pip
+                    .attr_classes
+                    .insert(AttrId(renamed_ntsd()), class);
+                for (action, attr) in &requests {
+                    let now_req = dir_request(the_user(), action.clone(), *attr);
+                    let before_req = dir_request(the_user(), action.clone(), attr.map(rename_guid));
+                    let now = decide(&now_req, &pol, &now_pip);
+                    let before = decide(&before_req, &pol, &before_pip);
+                    if *action == Action::DirRead && *attr == Some(ntsd.0) {
+                        assert_eq!(now.effect, Effect::Deny, "{aces:?} {owner:?}");
+                        if before.effect == Effect::Allow {
+                            narrowed += 1;
+                        }
+                    } else {
+                        assert_eq!(now, before, "{action:?} {attr:?} {aces:?} {owner:?}");
+                    }
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked > 20_000, "domain too small: {checked}");
+    assert!(narrowed > 0, "the domain never reached a pre-fix Allow");
+}
+
+const ENC_ONLY: TransportSec = TransportSec {
+    encrypted: true,
+    sealed: false,
+    channel_bound: false,
+};
+const ALL_SEC: TransportSec = TransportSec {
+    encrypted: true,
+    sealed: true,
+    channel_bound: true,
+};
+
+/// The allowlist entries of the source-network check, as the pre-fix
+/// allowlist held them: (action, resource, transport minimum), no network.
+fn networkless_entries() -> Vec<(ActionMatch, ResourceMatch, TransportSec)> {
+    vec![
+        (
+            ActionMatch::Exact(Action::DirRead),
+            ResourceMatch::RootDse,
+            TransportSec::NONE,
+        ),
+        (
+            ActionMatch::Exact(Action::DirRead),
+            subtree(parent_dn()),
+            TransportSec::NONE,
+        ),
+        (
+            ActionMatch::AnyOf(vec![Action::DirRead, Action::DirList]),
+            subtree(parent_dn()),
+            ENC_ONLY,
+        ),
+        (
+            ActionMatch::Class(ActionClass::Directory),
+            subtree(obj_dn()),
+            ALL_SEC,
+        ),
+        (
+            ActionMatch::Exact(Action::DirRead),
+            subtree(parent_dn()),
+            ALL_SEC,
+        ),
+    ]
+}
+
+/// The allowlist with each entry once per network in `nets`.
+fn entries_for(
+    picked: &[(ActionMatch, ResourceMatch, TransportSec)],
+    nets: &[IpScope],
+) -> Vec<AnonymousGrant> {
+    let mut out = Vec::new();
+    for (action, resource, min) in picked {
+        for net in nets {
+            out.push(
+                AnonymousGrant::new(action.clone(), resource.clone(), *min, *net).expect("bounded"),
+            );
+        }
+    }
+    out
+}
+
+/// docs/15 §6 / Q-164 item 3 only narrows. One entry per network for each
+/// pre-fix entry is network-blind (checked here: its decisions do not
+/// depend on `Context.src_net`) and, since `IpScope` has two values and the
+/// minimums of all matching entries are joined, it reproduces the pre-fix
+/// allowlist exactly. Mapping each pre-fix entry to the internal network
+/// alone (docs/15 §6): from the internal network every decision is
+/// unchanged; from the external network every anonymous request is denied,
+/// and authenticated ones are unchanged. So every change is Allow → Deny.
+/// Over seven allowlists (including joined minimums), authenticated and
+/// anonymous subjects, six requests (the rootDSE among them), both
+/// networks, three transports and two policies.
+#[test]
+fn source_network_fix_only_narrows() {
+    let entries = networkless_entries();
+    let pick = |idx: &[usize]| -> Vec<(ActionMatch, ResourceMatch, TransportSec)> {
+        idx.iter()
+            .filter_map(|i| entries.get(*i).cloned())
+            .collect()
+    };
+    let allowlists = [
+        pick(&[]),
+        pick(&[0]),
+        pick(&[1]),
+        pick(&[2]),
+        pick(&[1, 4]),
+        pick(&[0, 3]),
+        pick(&[0, 1, 2, 3, 4]),
+    ];
+    let other_dn = Dn::new(vec!["cn=x".into(), "ou=other".into(), "dc=test".into()]);
+    let mut pip = MockPip::with_sd(sd(
+        None,
+        vec![
+            allow(RIGHT_GENERIC_ALL, everyone()),
+            allow(RIGHT_GENERIC_ALL, group()),
+        ],
+    ));
+    for dn in [parent_dn(), other_dn.clone()] {
+        pip.sds.insert(
+            dn,
+            sd(
+                None,
+                vec![
+                    allow(RIGHT_GENERIC_ALL, everyone()),
+                    allow(RIGHT_GENERIC_ALL, group()),
+                ],
+            ),
+        );
+    }
+    let dir = |dn: Dn, attr: Option<Guid>| Resource::DirObject {
+        dn,
+        attr: attr.map(AttrId),
+    };
+    let requests = [
+        (Action::DirRead, dir(obj_dn(), None)),
+        (Action::DirRead, dir(obj_dn(), Some(attr_alone()))),
+        (Action::DirList, dir(obj_dn(), None)),
+        (Action::DirWrite, dir(obj_dn(), Some(attr_alone()))),
+        (Action::DirRead, dir(other_dn, None)),
+        (Action::DirRead, Resource::RootDse),
+    ];
+    let mut anonymous = subject(everyone(), &[], Tier::Tier1);
+    anonymous.auth.strength = AuthStrength::Unauth;
+    anonymous.auth.ticket_verified = false;
+    let rule_sets = [
+        vec![allow_everything(1)],
+        vec![
+            Rule {
+                id: RuleId(1),
+                effect: Effect::Allow,
+                when: Match {
+                    resource: ResourceMatch::RootDse,
+                    ..match_all()
+                },
+                obligations: vec![],
+            },
+            Rule {
+                id: RuleId(2),
+                effect: Effect::Allow,
+                when: Match {
+                    resource: subtree(parent_dn()),
+                    ..match_all()
+                },
+                obligations: vec![],
+            },
+        ],
+    ];
+    let (mut narrowed, mut kept) = (0usize, 0usize);
+    for picked in &allowlists {
+        for rules in &rule_sets {
+            let blind = PolicySnapshot::new(
+                PolicyVersion(1),
+                rules.clone(),
+                entries_for(picked, &[IpScope::Internal, IpScope::External]),
+            );
+            let internal = PolicySnapshot::new(
+                PolicyVersion(1),
+                rules.clone(),
+                entries_for(picked, &[IpScope::Internal]),
+            );
+            for s in [the_user(), anonymous.clone()] {
+                let authenticated = s.auth.strength != AuthStrength::Unauth;
+                for (action, resource) in &requests {
+                    for sec in [TransportSec::NONE, ENC_ONLY, ALL_SEC] {
+                        let at = |net: IpScope| {
+                            let mut req = AccessRequest {
+                                subject: s.clone(),
+                                resource: resource.clone(),
+                                action: action.clone(),
+                                context: strong_context(),
+                            };
+                            req.context.transport_sec = sec;
+                            req.context.src_net = net;
+                            req
+                        };
+                        let (int_req, ext_req) = (at(IpScope::Internal), at(IpScope::External));
+                        // The reproduction of the pre-fix allowlist is
+                        // network-blind.
+                        let before_int = decide(&int_req, &blind, &pip);
+                        let before_ext = decide(&ext_req, &blind, &pip);
+                        assert_eq!(before_int, before_ext, "{int_req:?}");
+                        // From the internal network: unchanged.
+                        assert_eq!(decide(&int_req, &internal, &pip), before_int);
+                        // From the external network.
+                        let now_ext = decide(&ext_req, &internal, &pip);
+                        if authenticated {
+                            assert_eq!(now_ext, before_ext);
+                        } else {
+                            assert_eq!(now_ext.effect, Effect::Deny, "{ext_req:?}");
+                            if before_ext.effect == Effect::Allow {
+                                narrowed += 1;
+                            }
+                        }
+                        if now_ext.effect == Effect::Allow {
+                            assert_eq!(now_ext, before_ext);
+                            kept += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(narrowed > 0 && kept > 0, "{narrowed} {kept}");
+}
+
+/// docs/49 §5.2 (R49-10): the new resource changes no other decision. Over
+/// the whole equivalence domain (directory and Kerberos inputs, 142,776),
+/// appending an Allow rule on the rootDSE, a Deny rule on the rootDSE, or
+/// anonymous-allowlist entries for the rootDSE on both networks to any
+/// policy of the domain leaves every decision identical.
+#[test]
+fn root_dse_changes_no_other_decision() {
+    let root_rule = |id: u32, effect: Effect| Rule {
+        id: RuleId(id),
+        effect,
+        when: Match {
+            resource: ResourceMatch::RootDse,
+            ..match_all()
+        },
+        obligations: vec![Obligation::Constrain(pdp::Constraint::MaxPageSize(1))],
+    };
+    let root_entries = vec![
+        AnonymousGrant::new(
+            ActionMatch::Any,
+            ResourceMatch::RootDse,
+            TransportSec::NONE,
+            IpScope::Internal,
+        )
+        .expect("bounded"),
+        AnonymousGrant::new(
+            ActionMatch::Any,
+            ResourceMatch::RootDse,
+            TransportSec::NONE,
+            IpScope::External,
+        )
+        .expect("bounded"),
+    ];
+    let mut count = 0usize;
+    for_each_equivalence_input(|req, pol, pip| {
+        let before = decide(req, pol, pip);
+        for effect in [Effect::Allow, Effect::Deny] {
+            let mut rules = pol.rules().to_vec();
+            rules.push(root_rule(90, effect));
+            assert_eq!(
+                decide(req, &policy(rules), pip),
+                before,
+                "{effect:?} {req:?}"
+            );
+        }
+        let with_entries =
+            PolicySnapshot::new(pol.version(), pol.rules().to_vec(), root_entries.clone());
+        assert_eq!(decide(req, &with_entries, pip), before, "{req:?}");
+        count += 1;
+    });
+    assert_eq!(count, EQUIVALENCE_DOMAIN);
+}
+
+/// P1-P4, P7, P9 for rootDSE requests, and their exact outcome (docs/11 §4,
+/// §10; docs/49 §5.2; docs/15 §6; Q-164 items 1, 3). Over twelve subjects,
+/// every directory action and two others on the rootDSE, both networks,
+/// three transports, five rule sets, four allowlists and both PIP tiers:
+/// deterministic with one Audit, Allow ⇔ reason Allowed; an Allow needs an
+/// applying Allow rule (P2); a tier disagreeing with the PIP denies (P3); a
+/// Deny-everything rule denies (P4); `Context.time` changes nothing (P9);
+/// and Allow holds exactly when the action is `DirRead`, the tier agrees,
+/// the subject is authenticated over the read floor or anonymous with an
+/// entry for its network whose minimums the transport meets, an Allow rule
+/// matches the rootDSE and no Deny rule does.
+#[test]
+fn root_dse_requests_keep_the_invariants() {
+    let rule = |id: u32, effect: Effect, resource: ResourceMatch| Rule {
+        id: RuleId(id),
+        effect,
+        when: Match {
+            resource,
+            ..match_all()
+        },
+        obligations: vec![],
+    };
+    let rule_sets: Vec<Vec<Rule>> = vec![
+        vec![],
+        vec![allow_everything(1)],
+        vec![rule(1, Effect::Allow, ResourceMatch::RootDse)],
+        vec![
+            allow_everything(1),
+            rule(2, Effect::Deny, ResourceMatch::RootDse),
+        ],
+        vec![rule(1, Effect::Allow, subtree(parent_dn()))],
+    ];
+    let entry = |net: IpScope, min: TransportSec| {
+        AnonymousGrant::new(
+            ActionMatch::Exact(Action::DirRead),
+            ResourceMatch::RootDse,
+            min,
+            net,
+        )
+        .expect("bounded")
+    };
+    let allowlists = vec![
+        vec![],
+        vec![entry(IpScope::Internal, TransportSec::NONE)],
+        vec![entry(IpScope::Internal, ENC_ONLY)],
+        vec![entry(IpScope::External, TransportSec::NONE)],
+    ];
+    let actions = [
+        Action::DirRead,
+        Action::DirWrite,
+        Action::DirList,
+        Action::DirDelete,
+        Action::DirAddChild(ObjClass(class_group())),
+        Action::DirControlRight(ControlRightId(right_a())),
+        Action::RpcCall,
+        Action::KdcAs,
+    ];
+    let deny_all = Rule {
+        id: RuleId(99),
+        effect: Effect::Deny,
+        when: match_all(),
+        obligations: vec![],
+    };
+    let (mut allowed, mut total) = (0usize, 0usize);
+    for pip_tier in [Tier::Tier0, Tier::Tier1] {
+        let mut pip = MockPip::with_sd(sd(None, vec![]));
+        pip.tiers.insert(user(), pip_tier);
+        for s in subjects() {
+            for action in &actions {
+                for net in [IpScope::Internal, IpScope::External] {
+                    for sec in transports() {
+                        let mut req = AccessRequest {
+                            subject: s.clone(),
+                            resource: Resource::RootDse,
+                            action: action.clone(),
+                            context: strong_context(),
+                        };
+                        req.context.src_net = net;
+                        req.context.transport_sec = sec;
+                        for rules in &rule_sets {
+                            for entries in &allowlists {
+                                let pol = PolicySnapshot::new(
+                                    PolicyVersion(1),
+                                    rules.clone(),
+                                    entries.clone(),
+                                );
+                                let d = decide(&req, &pol, &pip);
+                                assert_eq!(d, decide(&req, &pol, &pip), "P1");
+                                assert!(exactly_one_audit(&d), "P7: {d:?}");
+                                assert_eq!(
+                                    d.effect == Effect::Allow,
+                                    d.reason == ReasonCode::Allowed
+                                );
+                                if d.effect == Effect::Allow {
+                                    assert!(
+                                        rules
+                                            .iter()
+                                            .any(|r| r.effect == Effect::Allow && r.applies(&req)),
+                                        "P2"
+                                    );
+                                }
+                                if s.tier != pip_tier {
+                                    assert_eq!(d.effect, Effect::Deny, "P3");
+                                }
+                                let mut with_deny = rules.clone();
+                                with_deny.push(deny_all.clone());
+                                let denied = PolicySnapshot::new(
+                                    PolicyVersion(1),
+                                    with_deny,
+                                    entries.clone(),
+                                );
+                                assert_eq!(decide(&req, &denied, &pip).effect, Effect::Deny, "P4");
+                                let mut later = req.clone();
+                                later.context.time = Instant(u64::MAX);
+                                assert_eq!(decide(&later, &pol, &pip), d, "P9");
+
+                                // The exact outcome, computed independently.
+                                let authenticated = s.auth.strength != AuthStrength::Unauth
+                                    && s.auth.ticket_verified;
+                                let floor = if authenticated {
+                                    Some(ENC_ONLY)
+                                } else {
+                                    entries.iter().filter(|e| e.src_net() == net).fold(
+                                        None,
+                                        |f: Option<TransportSec>, e| {
+                                            Some(
+                                                f.unwrap_or(TransportSec::NONE)
+                                                    .union(e.min_transport()),
+                                            )
+                                        },
+                                    )
+                                };
+                                let transport_ok = floor.is_some_and(|f| sec.meets(f));
+                                let allow_rule = rules.iter().any(|r| {
+                                    r.effect == Effect::Allow
+                                        && matches!(
+                                            r.when.resource,
+                                            ResourceMatch::Any | ResourceMatch::RootDse
+                                        )
+                                });
+                                let deny_rule = rules.iter().any(|r| r.effect == Effect::Deny);
+                                let expected = *action == Action::DirRead
+                                    && s.tier == pip_tier
+                                    && transport_ok
+                                    && allow_rule
+                                    && !deny_rule;
+                                assert_eq!(d.effect == Effect::Allow, expected, "{req:?} {d:?}");
+                                allowed += usize::from(expected);
+                                total += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(total > 10_000, "domain too small: {total}");
     assert!(allowed > 0);
 }
