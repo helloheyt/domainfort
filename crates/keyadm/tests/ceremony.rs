@@ -18,8 +18,12 @@
 mod support;
 
 use dtyp::{Guid, Sid};
-use ipc_audit::{EventBody, KeyPurposeCode, KeydOperation, KeydOutcome, KeydReason, KeydRecord};
-use ipc_keyd::{KeydClient, DEFAULT_DEADLINE};
+use ipc::{Direction, FrameReader, Refused};
+use ipc_audit::{
+    AuditReply, AuditRequest, EventBody, KeyPurposeCode, KeydOperation, KeydOutcome, KeydReason,
+    KeydRecord, AUDIT_CHANNEL,
+};
+use ipc_keyd::{KeydClient, TransportError, DEFAULT_DEADLINE};
 use keyadm::ceremony::{self, NotSent, Outcome, Step, Unknown};
 use keyadm::report::{self, EXIT_COMPLETE, EXIT_INCOMPLETE, EXIT_NOTHING_ATTEMPTED};
 use keyd::Role;
@@ -28,6 +32,12 @@ use keyd_daemon::{CallerMap, SystemClock};
 use keyd_types::{Error as KeydError, Kvno};
 use krb_proto::Realm;
 use provision_manifest::{Manifest, ManifestFields};
+use std::io::{ErrorKind, Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 use support::{eventually, my_uid, params, skip_as_root, Daemon, FakeAuditd, TempDir};
 
@@ -392,4 +402,216 @@ fn an_unmapped_uid_attempts_no_key_set() {
     let text = report::render(&report, &m).join("\n");
     assert!(text.contains("mapped to Admin"), "{text}");
     world.daemon.stop().unwrap();
+}
+
+// ---- the fate of a create_key keyd did not answer (Q-367, A-88) ----------------------
+
+/// One whole frame of at most `limit` octets from `stream`, or `None` at
+/// the end of the stream (or on any failure).
+fn read_one_frame(stream: &mut UnixStream, limit: ipc::FrameLimit) -> Option<Vec<u8>> {
+    let mut reader = FrameReader::new(limit);
+    let mut chunk = [0u8; 4096];
+    loop {
+        if let Some(body) = reader.body() {
+            return Some(body.to_vec());
+        }
+        let wanted = reader.wanted().min(chunk.len());
+        match stream.read(&mut chunk[..wanted]) {
+            Ok(0) => return None,
+            Ok(n) => {
+                reader.push(&chunk[..n]).ok()?;
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    }
+}
+
+/// An auditd that is reachable and stuck: it answers `Ping` with `Pong` and
+/// never acknowledges an `Append` (written from the audit channel's own
+/// message set, crates/ipc-audit; docs/50 §8.1). keyd's intent is therefore
+/// never acknowledged (docs/10 §10, A-88).
+struct StuckAuditd {
+    stop: Arc<AtomicBool>,
+    connections: Arc<Mutex<Vec<UnixStream>>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl StuckAuditd {
+    fn start(path: &Path) -> StuckAuditd {
+        let _ = std::fs::remove_file(path);
+        let listener = UnixListener::bind(path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let connections = Arc::new(Mutex::new(Vec::new()));
+        let thread = {
+            let (stop, connections) = (Arc::clone(&stop), Arc::clone(&connections));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            stream.set_nonblocking(false).unwrap();
+                            connections
+                                .lock()
+                                .unwrap()
+                                .push(stream.try_clone().unwrap());
+                            std::thread::spawn(move || serve_stuck(stream));
+                        }
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => return,
+                    }
+                }
+            })
+        };
+        StuckAuditd {
+            stop,
+            connections,
+            thread: Some(thread),
+        }
+    }
+
+    fn stop(&mut self) {
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        self.stop.store(true, Ordering::SeqCst);
+        thread.join().unwrap();
+        for stream in self.connections.lock().unwrap().drain(..) {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
+impl Drop for StuckAuditd {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// `Ping` → `Pong`; `Append` → nothing, ever.
+fn serve_stuck(mut stream: UnixStream) {
+    while let Some(body) = read_one_frame(&mut stream, AUDIT_CHANNEL.limit(Direction::Request)) {
+        match ipc_audit::decode_request(&body) {
+            Ok(AuditRequest::Ping) => {
+                let frame =
+                    ipc_audit::encode_reply(&ipc::Reply::Message(AuditReply::Pong)).unwrap();
+                if stream.write_all(frame.as_bytes()).is_err() {
+                    return;
+                }
+            }
+            Ok(AuditRequest::Append(_)) => {}
+            Err(_) => return,
+        }
+    }
+}
+
+/// docs/10 §10 and docs/questions/Q-365 (A-88: when keyd's intent is not
+/// acknowledged in time keyd-daemon answers `Unavailable` and keyd does
+/// **not** perform the change); Q-367 (A-88: keyd's own `Unavailable` =
+/// "not performed"): against the real keyd daemon whose auditd is reachable
+/// but never acknowledges, the contact succeeds (`ping` needs no audit
+/// acknowledgement) and the krbtgt `create_key` is answered unavailable —
+/// reported as **not performed**, "not created", never "MAY have been
+/// created"; the ceremony stops there (exit 2).
+#[test]
+fn keyds_unavailable_is_reported_as_not_performed() {
+    let dir = TempDir::new();
+    let uid = my_uid(&dir);
+    if skip_as_root(uid) {
+        return;
+    }
+    let params = params(&dir, CallerMap::new(&[(uid, Role::Admin)]).unwrap(), uid);
+    let mut auditd = StuckAuditd::start(&params.audit.socket);
+    let daemon = Daemon::start(
+        params,
+        SystemClock,
+        development_keyd(Realm::new(REALM).unwrap()),
+    )
+    .unwrap();
+    let m = manifest();
+    let mut client =
+        KeydClient::new(connector::new(&daemon.socket), uid, DEFAULT_DEADLINE).unwrap();
+    let report = ceremony::run(&mut client, &m);
+    assert_eq!(report.contact, Outcome::Answered(Ok(())));
+    assert_eq!(report.steps.len(), 1, "{report:?}");
+    assert_eq!(
+        report.steps[0].outcome,
+        Outcome::NotPerformed(Refused::Unavailable)
+    );
+    assert_eq!(report::exit_code(&report), EXIT_INCOMPLETE);
+    let text = report::render(&report, &m).join("\n");
+    assert!(
+        text.contains("krbtgt: keyd answered unavailable (not performed); not created"),
+        "{text}"
+    );
+    assert!(!text.contains("MAY have been created"), "{text}");
+    drop(client);
+    auditd.stop();
+    daemon.stop().unwrap();
+}
+
+/// docs/50 §3.6, §3.7; Q-367 (A-88: "a client-side deadline … **after** the
+/// request was sent is reported as 'outcome unknown — check before
+/// retrying'"): a keyd that answers the contact and then receives the
+/// krbtgt `create_key` but never answers it (here a scripted keyd built from
+/// ipc-keyd's own codec) — keyadm's deadline passes after sending: the step
+/// is **outcome unknown**, reported as "MAY have been created" with the
+/// pointer to keyd's audit log; the request was sent once and the ceremony
+/// stops there (exit 2).
+#[test]
+fn a_create_key_keyd_never_answers_is_reported_as_outcome_unknown() {
+    let dir = TempDir::new();
+    let uid = my_uid(&dir);
+    if skip_as_root(uid) {
+        return;
+    }
+    let path = dir.join("s.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let (done, wait_done) = mpsc::channel::<()>();
+    let keyd = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut received = Vec::new();
+        while let Some(body) = read_one_frame(&mut stream, ipc_keyd::REQUEST_LIMIT) {
+            let call = ipc_keyd::decode_request(&body).unwrap();
+            received.push(call.operation());
+            if matches!(call, ipc_keyd::Call::Ping) {
+                let answer = ipc_keyd::Answer::Ping(Ok(()));
+                stream
+                    .write_all(ipc_keyd::encode_answer(&answer).unwrap().as_bytes())
+                    .unwrap();
+            } else {
+                // Never answered; the connection stays open until the
+                // client is done.
+                wait_done.recv().unwrap();
+                break;
+            }
+        }
+        received
+    });
+    let m = manifest();
+    let mut client =
+        KeydClient::new(connector::new(&path), uid, Duration::from_millis(500)).unwrap();
+    let report = ceremony::run(&mut client, &m);
+    done.send(()).unwrap();
+    assert_eq!(
+        keyd.join().unwrap(),
+        [keyd::Operation::Ping, keyd::Operation::CreateKey]
+    );
+    assert_eq!(report.contact, Outcome::Answered(Ok(())));
+    assert_eq!(report.steps.len(), 1, "{report:?}");
+    assert_eq!(
+        report.steps[0].outcome,
+        Outcome::Unknown(Unknown::Transport(TransportError::DeadlineExceeded))
+    );
+    assert_eq!(report::exit_code(&report), EXIT_INCOMPLETE);
+    let text = report::render(&report, &m).join("\n");
+    assert!(
+        text.contains(
+            "krbtgt: keyd did not answer in time after the request was sent; outcome unknown, the key set MAY have been created"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("check keyd's audit log"), "{text}");
 }

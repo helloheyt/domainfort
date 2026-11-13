@@ -32,7 +32,7 @@ use ipc::{DerBlob, Secret};
 use keyd_types::{
     ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof, ConfigDescription, CtxId,
     DualControlToken, FastArmor, FastConversation, IssueError, KeyHandle, Kvno, Operation,
-    PrincipalBinding, ServiceContext, TgsRepParts, TgsTicketTemplate, TgtContext,
+    PrincipalBinding, Role, ServiceContext, TgsRepParts, TgsTicketTemplate, TgtContext,
 };
 use krb_proto::{
     ApReq, EncryptedData, KerberosTime, KrbError, KrbFastArmoredReq, KrbFastReq, PaData,
@@ -641,6 +641,29 @@ fn proof(wire: &WireAuthnProof) -> Converted<AuthnProof> {
 // Answers.
 // ===========================================================================
 
+/// The success result of `describe_config` on the keyd channel: keyd's
+/// non-secret description, and the role keyd resolved for the **caller**
+/// from the connection's peer uid.
+///
+/// keyd's own `describe_config` returns the description; the server side
+/// (`ipc_keyd_server::execute`) adds the role from the same `CallerId` it
+/// handed keyd for the call — the identity keyd authorized with. The role
+/// is not secret, and it is only reported: no request carries a role, and
+/// keyd never takes one from a peer (docs/50 R50-3, §3.2). A client that
+/// requires its own role (`KeydClient::require_caller_role`) can thus tell
+/// the Kdc role from the Ldap role, which may both call `describe_config`
+/// (docs/10 §2) and which the description alone does not distinguish.
+///
+/// Spec: docs/10 §2, §7א; docs/50 §3.4 (`DescribeConfig`), §3.7;
+/// docs/questions/Q-351 (A-87).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescribedConfig {
+    /// keyd's non-secret configuration ([`ConfigDescription`]).
+    pub description: ConfigDescription,
+    /// The caller's role, as keyd resolved it from the peer uid.
+    pub caller_role: Role,
+}
+
 /// The outcome of one keyd call, as keyd returned it.
 /// Spec: docs/10 §4-§9; docs/50 §3.4.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -673,8 +696,9 @@ pub enum Answer {
     RetireKvno(Result<(), keyd_types::Error>),
     /// Spec: docs/10 §7.
     DestroyKeySet(Result<(), keyd_types::Error>),
-    /// Spec: docs/10 §7א.
-    DescribeConfig(Result<ConfigDescription, keyd_types::Error>),
+    /// keyd's description and the caller's role ([`DescribedConfig`]).
+    /// Spec: docs/10 §7א; docs/questions/Q-351 (A-87).
+    DescribeConfig(Result<DescribedConfig, keyd_types::Error>),
     /// Spec: docs/10 §7א.
     Ping(Result<(), keyd_types::Error>),
 }
@@ -827,7 +851,8 @@ impl Answer {
             }
             Answer::DescribeConfig(r) => outcome(
                 r,
-                |d| {
+                |described| {
+                    let d = &described.description;
                     Ok(KeydReply::DescribeConfig(WireConfigDescription {
                         realm: d.realm.as_bytes().to_vec(),
                         enctypes: d.enctypes.clone(),
@@ -835,6 +860,7 @@ impl Answer {
                         token_lifetime_secs: d.token_lifetime_secs,
                         ticket_policy: d.ticket_policy,
                         s2k_params: d.s2k_params,
+                        caller_role: described.caller_role,
                     }))
                 },
                 KeydReply::Failure,
@@ -935,13 +961,16 @@ impl Answer {
             (Operation::DestroyKeySet, R::DestroyKeySet) => Answer::DestroyKeySet(Ok(())),
             (Operation::DestroyKeySet, R::Failure(e)) => Answer::DestroyKeySet(Err(e)),
             (Operation::DescribeConfig, R::DescribeConfig(d)) => {
-                Answer::DescribeConfig(Ok(ConfigDescription {
-                    realm: realm(&d.realm)?,
-                    enctypes: d.enctypes,
-                    clock_skew_secs: d.clock_skew_secs,
-                    token_lifetime_secs: d.token_lifetime_secs,
-                    ticket_policy: d.ticket_policy,
-                    s2k_params: d.s2k_params,
+                Answer::DescribeConfig(Ok(DescribedConfig {
+                    description: ConfigDescription {
+                        realm: realm(&d.realm)?,
+                        enctypes: d.enctypes,
+                        clock_skew_secs: d.clock_skew_secs,
+                        token_lifetime_secs: d.token_lifetime_secs,
+                        ticket_policy: d.ticket_policy,
+                        s2k_params: d.s2k_params,
+                    },
+                    caller_role: d.caller_role,
                 }))
             }
             (Operation::DescribeConfig, R::Failure(e)) => Answer::DescribeConfig(Err(e)),

@@ -11,6 +11,13 @@
 //!   else is sent on it: keyd's refusal (a role that may not call it) or
 //!   another description is `Unavailable` (the KDC's 29), never keyd's
 //!   `Denied` of the operation (24).
+//! * **Q-351** (A-87) — that answer must also name the caller role `Kdc`,
+//!   at start and on every new connection: keyd mapping the kdc's uid to
+//!   Ldap (which may call `DescribeConfig` too) is `Unavailable` with only
+//!   `DescribeConfig` sent.
+//! * **Q-367** (A-88) — `call_with_fate` tells a request that was **not
+//!   sent**, one keyd refused (**not performed**), and one written without a
+//!   usable answer (**outcome unknown**).
 //!
 //! Tier 1 drives the client over a scripted in-process connection; tier 2
 //! over real Unix stream sockets in a private (0700) temporary directory
@@ -22,20 +29,21 @@
 //!
 //! Sources: docs/50 R50-3, R50-7, R50-8, §3.3, §3.4 (`DescribeConfig` — Kdc,
 //! Ldap), §3.6 (idle connections held; one deadline per call), §3.7, §7.5
-//! step 4, §9; docs/10 §2; docs/questions/Q-311, Q-312 (A-82). Every value
-//! is constructed by hand (tests/samples).
+//! step 4, §9; docs/10 §2, §10; docs/questions/Q-311, Q-312 (A-82), Q-351
+//! (A-87), Q-365, Q-367 (A-88). Every value is constructed by hand
+//! (tests/samples).
 #![cfg(unix)]
 
 mod samples;
 
 use core::time::Duration;
-use ipc::FrameLimit;
-use ipc::FrameReader;
+use ipc::{encode_refused, FrameLimit, FrameReader, Refused, Reply};
 use ipc_keyd::{
-    decode_request, encode_answer, Answer, Call, Connection, Connector, IpcKeyd, KeydClient,
-    TransportError, UnixConnection, Unserved, REQUEST_LIMIT,
+    decode_request, encode_answer, Answer, Call, CallFailure, Connection, Connector,
+    DescribedConfig, IpcKeyd, KeydClient, RequestFate, TransportError, UnixConnection, Unserved,
+    KEYD_CHANNEL, REQUEST_LIMIT,
 };
-use keyd_types::{AuthnError, ConfigDescription, KeyCustody, KeyPurpose, Operation};
+use keyd_types::{AuthnError, ConfigDescription, KeyCustody, KeyPurpose, Kvno, Operation, Role};
 use krb_proto::Realm;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
@@ -64,6 +72,28 @@ fn other_description() -> ConfigDescription {
     }
 }
 
+/// keyd's `DescribeConfig` answer: `description` for a caller keyd resolved
+/// to `role` (Q-351).
+fn described_as(description: ConfigDescription, role: Role) -> Answer {
+    Answer::DescribeConfig(Ok(DescribedConfig {
+        description,
+        caller_role: role,
+    }))
+}
+
+/// keyd's answer to the kdc: its description, the caller role Kdc.
+fn described_to_the_kdc() -> Answer {
+    described_as(description(), Role::Kdc)
+}
+
+/// A key-state change (docs/10 §10): `create_key`.
+fn create_key() -> Call {
+    Call::CreateKey {
+        handle: samples::handle(0xB2, KeyPurpose::Service),
+        binding: samples::binding(),
+    }
+}
+
 // ---- tier 1: a scripted keyd ------------------------------------------------------
 
 /// What the scripted keyd answers, and what each connection carried.
@@ -73,9 +103,11 @@ struct Script {
     carried: Vec<Vec<Operation>>,
     /// Connections whose idle check fails, with the failure.
     stale: BTreeMap<usize, TransportError>,
-    /// The answers, in order (an `Err` is a transport failure after the
-    /// request was written).
-    answers: VecDeque<Result<Answer, TransportError>>,
+    /// The replies, in order — keyd's answer or its shared refusal (an
+    /// `Err` is a transport failure after the request was written).
+    answers: VecDeque<Result<Reply<Answer>, TransportError>>,
+    /// When set, the connector fails with it (no connection is opened).
+    connect_fails: Option<TransportError>,
 }
 
 impl Script {
@@ -96,6 +128,9 @@ impl Connector for ScriptConnector {
     type Connection = ScriptConnection;
     fn connect(&mut self) -> Result<ScriptConnection, TransportError> {
         let mut script = self.0.borrow_mut();
+        if let Some(error) = script.connect_fails {
+            return Err(error);
+        }
         script.carried.push(Vec::new());
         Ok(ScriptConnection {
             script: Rc::clone(&self.0),
@@ -118,13 +153,15 @@ impl Connection for ScriptConnection {
         let call = decode_request(&frame[4..]).unwrap();
         let mut script = self.script.borrow_mut();
         script.carried[self.index].push(call.operation());
-        let answer = script
+        let reply = script
             .answers
             .pop_front()
             .unwrap_or(Err(TransportError::Closed))?;
-        Ok(Zeroizing::new(
-            encode_answer(&answer).unwrap().body().to_vec(),
-        ))
+        let frame = match reply {
+            Reply::Message(answer) => encode_answer(&answer).unwrap(),
+            Reply::Refused(refused) => encode_refused(KEYD_CHANNEL, refused).unwrap(),
+        };
+        Ok(Zeroizing::new(frame.body().to_vec()))
     }
 
     fn check_idle(&mut self) -> Result<(), TransportError> {
@@ -136,18 +173,30 @@ impl Connection for ScriptConnection {
 }
 
 fn scripted() -> (Rc<RefCell<Script>>, KeydClient<ScriptConnector>) {
+    scripted_with_deadline(Duration::from_secs(2))
+}
+
+fn scripted_with_deadline(
+    deadline: Duration,
+) -> (Rc<RefCell<Script>>, KeydClient<ScriptConnector>) {
     let script = Rc::new(RefCell::new(Script::default()));
-    let client = KeydClient::new(
-        ScriptConnector(Rc::clone(&script)),
-        KEYD_UID,
-        Duration::from_secs(2),
-    )
-    .unwrap();
+    let client = KeydClient::new(ScriptConnector(Rc::clone(&script)), KEYD_UID, deadline).unwrap();
     (script, client)
 }
 
 fn answer(script: &Rc<RefCell<Script>>, answer: Answer) {
-    script.borrow_mut().answers.push_back(Ok(answer));
+    script
+        .borrow_mut()
+        .answers
+        .push_back(Ok(Reply::Message(answer)));
+}
+
+/// keyd's shared transport refusal as the next reply.
+fn refuse(script: &Rc<RefCell<Script>>, refused: Refused) {
+    script
+        .borrow_mut()
+        .answers
+        .push_back(Ok(Reply::Refused(refused)));
 }
 
 /// docs/50 §3.6, §3.7, R50-7; Q-312 (A-82): a held connection whose idle
@@ -211,6 +260,7 @@ fn a_call_that_failed_after_it_was_sent_is_not_sent_again() {
 fn a_plain_client_sends_no_describe_config_on_a_new_connection() {
     let (script, mut client) = scripted();
     assert!(client.required_description().is_none());
+    assert!(client.required_caller_role().is_none());
     answer(&script, Answer::Ping(Ok(())));
     assert_eq!(client.ping(), Ok(()));
     script.borrow_mut().stale.insert(0, TransportError::Closed);
@@ -220,17 +270,77 @@ fn a_plain_client_sends_no_describe_config_on_a_new_connection() {
 }
 
 /// The custody of the kdc over the scripted keyd (its start-up
-/// `DescribeConfig` answered with [`description`]).
+/// `DescribeConfig` answered with [`description`] for the Kdc caller).
 fn custody() -> (Rc<RefCell<Script>>, IpcKeyd<ScriptConnector>) {
     let (script, client) = scripted();
-    answer(&script, Answer::DescribeConfig(Ok(description())));
+    answer(&script, described_to_the_kdc());
     let custody = IpcKeyd::connect(client).unwrap();
     assert_eq!(custody.config(), &description());
     assert_eq!(
         custody.client().required_description(),
         Some(&description())
     );
+    assert_eq!(custody.client().required_caller_role(), Some(Role::Kdc));
     (script, custody)
+}
+
+/// docs/50 §7.5 step 4, §3.7; docs/10 §2; Q-351 (A-87: "the kdc's client
+/// requires Role::Kdc"): a keyd whose start-up `DescribeConfig` names
+/// another caller role — this uid mapped to Ldap, which may call it; or to
+/// Directory / Admin, which keyd would refuse anyway — gives no custody:
+/// `IpcKeyd::connect` is `Unavailable` (the kdc does not start), and only
+/// `DescribeConfig` was sent.
+#[test]
+fn ipc_keyd_does_not_start_on_a_keyd_that_gives_it_another_role() {
+    for role in [Role::Ldap, Role::Directory, Role::Admin] {
+        let (script, client) = scripted();
+        answer(&script, described_as(description(), role));
+        assert_eq!(
+            IpcKeyd::connect(client).map(|_| ()),
+            Err(keyd_types::Error::Unavailable),
+            "{role:?}"
+        );
+        assert_eq!(script.borrow().carried, [[Operation::DescribeConfig]]);
+    }
+}
+
+/// docs/50 R50-8, §3.4 (`DescribeConfig` — Kdc, Ldap), §3.7; docs/10 §2;
+/// Q-351 (A-87): keyd restarted with the kdc's uid mapped to **Ldap** answers
+/// the new connection's `DescribeConfig` with the right description — Ldap
+/// may call it — but names the caller role Ldap: the connection is dropped
+/// with only `DescribeConfig` sent, and the operation is `Unavailable` (29),
+/// never keyd's `Denied` of `verify_preauth` (24); the client reports it as
+/// a peer mismatch on a request that was not sent.
+#[test]
+fn a_new_connection_describing_the_ldap_role_is_unavailable() {
+    let (script, mut custody) = custody();
+    script.borrow_mut().stale.insert(0, TransportError::Closed);
+    answer(&script, described_as(description(), Role::Ldap));
+    assert_eq!(verify_preauth(&mut custody), Err(AuthnError::Unavailable));
+    assert!(!custody.client().is_connected());
+    assert_eq!(script.borrow().connects(), 2);
+    assert_eq!(script.borrow().carried[1], [Operation::DescribeConfig]);
+
+    // The same through the client's fate: not sent, a peer mismatch.
+    script.borrow_mut().stale.clear();
+    answer(&script, described_as(description(), Role::Ldap));
+    assert_eq!(
+        custody.client_mut().call_with_fate(&Call::Ping),
+        Err(CallFailure {
+            unserved: Unserved::PeerMismatch,
+            fate: RequestFate::NotSent,
+        })
+    );
+    assert_eq!(script.borrow().carried[2], [Operation::DescribeConfig]);
+
+    // keyd back with the Kdc role: served on a fresh connection.
+    answer(&script, described_to_the_kdc());
+    answer(&script, Answer::VerifyPreauth(Ok(samples::proof())));
+    assert_eq!(verify_preauth(&mut custody), Ok(()));
+    assert_eq!(
+        script.borrow().carried[3],
+        [Operation::DescribeConfig, Operation::VerifyPreauth]
+    );
 }
 
 fn verify_preauth(custody: &mut IpcKeyd<ScriptConnector>) -> Result<(), AuthnError> {
@@ -249,14 +359,19 @@ fn verify_preauth(custody: &mut IpcKeyd<ScriptConnector>) -> Result<(), AuthnErr
 /// refused — keyd now maps this uid to a role that may not call it — so the
 /// operation is `Unavailable` (29), not keyd's `Denied` (24); only
 /// `DescribeConfig` was sent on it, and it was dropped. The same for
-/// another description (another realm) and for keyd's shared refusal.
+/// another description (another realm), for the right description of
+/// another caller role (Q-351, A-87), and for an answer of another
+/// operation.
 #[test]
 fn ipc_keyd_requires_every_new_connection_to_describe_the_same_keyd() {
     let (script, mut custody) = custody();
     assert_eq!(script.borrow().carried[0], [Operation::DescribeConfig]);
     let refusals = [
         Answer::DescribeConfig(Err(keyd_types::Error::Denied)),
-        Answer::DescribeConfig(Ok(other_description())),
+        described_as(other_description(), Role::Kdc),
+        described_as(description(), Role::Ldap),
+        described_as(description(), Role::Directory),
+        described_as(description(), Role::Admin),
         Answer::Ping(Ok(())),
     ];
     for (n, refusal) in refusals.into_iter().enumerate() {
@@ -285,7 +400,7 @@ fn ipc_keyd_requires_every_new_connection_to_describe_the_same_keyd() {
 
     // keyd describes itself as before: the operation is sent, and keyd's own
     // answer passes through unchanged (A-26 / A-63).
-    answer(&script, Answer::DescribeConfig(Ok(description())));
+    answer(&script, described_to_the_kdc());
     answer(&script, Answer::VerifyPreauth(Err(AuthnError::Denied)));
     assert_eq!(verify_preauth(&mut custody), Err(AuthnError::Denied));
     let last = script.borrow().connects() - 1;
@@ -309,19 +424,194 @@ fn ipc_keyd_requires_every_new_connection_to_describe_the_same_keyd() {
 
 /// Q-311: the `DescribeConfig` failures map to `Unserved` cases that are
 /// all `Unavailable` for the caller: keyd's refusal and another description
-/// are `PeerMismatch`.
+/// are `PeerMismatch`; so is another caller role (Q-351) — with the
+/// description and the role required together, and with the role alone.
 #[test]
 fn the_describe_check_failures_are_peer_mismatch() {
-    for refusal in [
-        Answer::DescribeConfig(Err(keyd_types::Error::Denied)),
-        Answer::DescribeConfig(Ok(other_description())),
+    for (refusal, with_description) in [
+        (Answer::DescribeConfig(Err(keyd_types::Error::Denied)), true),
+        (described_as(other_description(), Role::Kdc), true),
+        (described_as(description(), Role::Ldap), true),
+        (
+            Answer::DescribeConfig(Err(keyd_types::Error::Denied)),
+            false,
+        ),
+        (described_as(description(), Role::Ldap), false),
     ] {
         let (script, mut client) = scripted();
-        client.require_description(description());
+        if with_description {
+            client.require_description(description());
+        }
+        client.require_caller_role(Role::Kdc);
         answer(&script, refusal);
         assert_eq!(client.call(&Call::Ping), Err(Unserved::PeerMismatch));
         assert!(!client.is_connected());
         assert_eq!(script.borrow().carried[0], [Operation::DescribeConfig]);
+    }
+    // The role alone, answered for the Kdc caller (any description): served.
+    let (script, mut client) = scripted();
+    client.require_caller_role(Role::Kdc);
+    answer(&script, described_as(other_description(), Role::Kdc));
+    answer(&script, Answer::Ping(Ok(())));
+    assert_eq!(client.ping(), Ok(()));
+    assert_eq!(
+        script.borrow().carried[0],
+        [Operation::DescribeConfig, Operation::Ping]
+    );
+}
+
+// ---- tier 1: the fate of a request keyd did not answer (Q-367, A-88) --------------------
+
+/// Q-367 (A-88: "a client-side deadline or transport failure **after** the
+/// request was sent is reported as 'outcome unknown — check before
+/// retrying'"); docs/50 §3.6, §3.7: a key-state request (`create_key`) that
+/// was written and never answered — the deadline passed, keyd closed, an
+/// I/O failure, a reply that did not frame — or answered with a reply that
+/// does not belong to it is **outcome unknown**. It was sent exactly once,
+/// the connection is dropped, and `call` still reports the same `Unserved`
+/// and the typed method `Unavailable` (both unchanged).
+#[test]
+fn a_key_state_request_left_unanswered_is_outcome_unknown() {
+    for failure in [
+        TransportError::DeadlineExceeded,
+        TransportError::Closed,
+        TransportError::Io,
+        TransportError::Framing,
+    ] {
+        let (script, mut client) = scripted();
+        script.borrow_mut().answers.push_back(Err(failure));
+        assert_eq!(
+            client.call_with_fate(&create_key()),
+            Err(CallFailure {
+                unserved: Unserved::Transport(failure),
+                fate: RequestFate::OutcomeUnknown,
+            }),
+            "{failure:?}"
+        );
+        assert!(!client.is_connected());
+        assert_eq!(
+            script.borrow().carried,
+            [[Operation::CreateKey]],
+            "sent once"
+        );
+        script.borrow_mut().answers.push_back(Err(failure));
+        assert_eq!(
+            client.call(&create_key()),
+            Err(Unserved::Transport(failure))
+        );
+        script.borrow_mut().answers.push_back(Err(failure));
+        assert_eq!(
+            client.create_key(
+                &samples::handle(0xB2, KeyPurpose::Service),
+                &samples::binding()
+            ),
+            Err(keyd_types::Error::Unavailable)
+        );
+    }
+    let (script, mut client) = scripted();
+    answer(&script, Answer::Ping(Ok(())));
+    assert!(matches!(
+        client.call_with_fate(&create_key()),
+        Err(CallFailure {
+            unserved: Unserved::UnexpectedReply(_),
+            fate: RequestFate::OutcomeUnknown,
+        })
+    ));
+}
+
+/// docs/10 §10 and Q-365 items 7, 11 (A-88: keyd-daemon refuses a
+/// key-state change — `Busy` while auditd is away, `Unavailable` when the
+/// intent was not acknowledged in time — only before keyd runs it; a
+/// request it cannot decode is not run): keyd's shared refusal of a
+/// key-state request is **not performed**, for every `Refused` code. keyd's
+/// own `Unavailable` answer is keyd's answer, not a failure.
+#[test]
+fn keyds_refusal_of_a_key_state_request_is_not_performed() {
+    for refused in [
+        Refused::Unavailable,
+        Refused::Busy,
+        Refused::Malformed,
+        Refused::VersionMismatch,
+    ] {
+        let (script, mut client) = scripted();
+        refuse(&script, refused);
+        assert_eq!(
+            client.call_with_fate(&create_key()),
+            Err(CallFailure {
+                unserved: Unserved::Refused(refused),
+                fate: RequestFate::NotPerformed,
+            }),
+            "{refused:?}"
+        );
+        assert_eq!(script.borrow().carried, [[Operation::CreateKey]]);
+        refuse(&script, refused);
+        assert_eq!(client.call(&create_key()), Err(Unserved::Refused(refused)));
+    }
+    let (script, mut client) = scripted();
+    answer(
+        &script,
+        Answer::CreateKey(Err(keyd_types::Error::Unavailable)),
+    );
+    assert_eq!(
+        client.call_with_fate(&create_key()),
+        Ok(Answer::CreateKey(Err(keyd_types::Error::Unavailable)))
+    );
+    answer(&script, Answer::CreateKey(Ok(Kvno::INITIAL)));
+    assert_eq!(
+        client.call_with_fate(&create_key()),
+        Ok(Answer::CreateKey(Ok(Kvno::INITIAL)))
+    );
+}
+
+/// docs/50 R50-3, §3.6, §3.7; Q-367 (A-88): a request that never left the
+/// process is **not sent** — the connection could not be opened, the
+/// deadline passed before the request was written, or the new connection's
+/// `DescribeConfig` check failed (only `DescribeConfig` was sent, never the
+/// request).
+#[test]
+fn a_failure_before_sending_is_not_sent() {
+    let (script, mut client) = scripted();
+    script.borrow_mut().connect_fails = Some(TransportError::Connect);
+    assert_eq!(
+        client.call_with_fate(&create_key()),
+        Err(CallFailure {
+            unserved: Unserved::Transport(TransportError::Connect),
+            fate: RequestFate::NotSent,
+        })
+    );
+    assert!(script.borrow().carried.is_empty());
+
+    let (script, mut client) = scripted_with_deadline(Duration::ZERO);
+    assert_eq!(
+        client.call_with_fate(&create_key()),
+        Err(CallFailure {
+            unserved: Unserved::Transport(TransportError::DeadlineExceeded),
+            fate: RequestFate::NotSent,
+        })
+    );
+    assert_eq!(script.borrow().carried, [Vec::<Operation>::new()]);
+
+    for describe in [
+        Err(TransportError::Closed),
+        Ok(Reply::Message(described_as(description(), Role::Ldap))),
+        Ok(Reply::Refused(Refused::Busy)),
+    ] {
+        let (script, mut client) = scripted();
+        client.require_caller_role(Role::Kdc);
+        let expected = match &describe {
+            Err(error) => Unserved::Transport(*error),
+            Ok(Reply::Refused(refused)) => Unserved::Refused(*refused),
+            Ok(Reply::Message(_)) => Unserved::PeerMismatch,
+        };
+        script.borrow_mut().answers.push_back(describe);
+        assert_eq!(
+            client.call_with_fate(&create_key()),
+            Err(CallFailure {
+                unserved: expected,
+                fate: RequestFate::NotSent,
+            })
+        );
+        assert_eq!(script.borrow().carried, [[Operation::DescribeConfig]]);
     }
 }
 
@@ -411,7 +701,7 @@ fn write_answer(stream: &mut UnixStream, answer: &Answer) {
 fn answer_to(call: &Call) -> Answer {
     match call {
         Call::Ping => Answer::Ping(Ok(())),
-        Call::DescribeConfig => Answer::DescribeConfig(Ok(description())),
+        Call::DescribeConfig => described_to_the_kdc(),
         other => panic!("not scripted: {:?}", other.operation()),
     }
 }
@@ -479,7 +769,7 @@ fn octets_waiting_on_an_idle_connection_are_never_read_as_a_reply() {
         let (mut first, _) = listener.accept().unwrap();
         let call = read_request(&mut first).unwrap();
         write_answer(&mut first, &answer_to(&call));
-        write_answer(&mut first, &Answer::DescribeConfig(Ok(other_description())));
+        write_answer(&mut first, &described_as(other_description(), Role::Kdc));
         written.send(()).unwrap();
         let on_second = serve(listener.accept().unwrap().0);
         let more_on_first = read_request(&mut first).map(|call| call.operation());
@@ -541,6 +831,129 @@ fn a_request_lost_after_it_was_sent_is_not_resent_over_a_socket() {
     assert_eq!(call, Operation::Ping);
     assert_eq!(later, 0, "no new connection, no second request");
     drop(client);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// What the scripted keyd of the fate tests does with the one request it
+/// reads.
+#[derive(Clone, Copy)]
+enum Behaviour {
+    /// Never answer; keep the connection open until the client is done.
+    Silent,
+    /// Answer with the shared refusal; keep the connection open until the
+    /// client is done.
+    Refuse(Refused),
+    /// Answer with the shared refusal and close at once — as keyd-daemon
+    /// does after `Refused::Unavailable` (Q-350 item 14: some platforms then
+    /// refuse the client's read timeout).
+    RefuseAndClose(Refused),
+}
+
+/// A scripted keyd on a fresh socket that reads one request and behaves as
+/// told; the client's `call_with_fate(create_key)` result (deadline
+/// 300 ms), and the operation keyd received.
+fn fate_over_a_socket(
+    test: &str,
+    behaviour: Behaviour,
+) -> (Result<Answer, CallFailure>, Operation) {
+    let dir = private_dir(test);
+    let path = dir.join("keyd.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let (done, wait_done) = mpsc::channel::<()>();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let call = read_request(&mut stream).unwrap();
+        match behaviour {
+            Behaviour::Silent => {}
+            Behaviour::Refuse(refused) | Behaviour::RefuseAndClose(refused) => {
+                stream
+                    .write_all(encode_refused(KEYD_CHANNEL, refused).unwrap().as_bytes())
+                    .unwrap();
+            }
+        }
+        if matches!(behaviour, Behaviour::RefuseAndClose(_)) {
+            drop(stream);
+            wait_done.recv().unwrap();
+        } else {
+            wait_done.recv().unwrap();
+            drop(stream);
+        }
+        call.operation()
+    });
+    let mut client = KeydClient::new(
+        SocketConnector::new(&path),
+        KEYD_UID,
+        Duration::from_millis(300),
+    )
+    .unwrap();
+    let result = client.call_with_fate(&create_key());
+    assert!(!client.is_connected());
+    done.send(()).unwrap();
+    let received = server.join().unwrap();
+    drop(client);
+    let _ = std::fs::remove_dir_all(dir);
+    (result, received)
+}
+
+/// Q-367 (A-88): over a real socket, a keyd that receives a key-state
+/// request (`create_key`) and never answers it leaves the client's
+/// deadline to pass after the request was written — **outcome unknown**,
+/// not "not performed".
+#[test]
+fn over_a_socket_a_key_state_request_keyd_never_answers_is_outcome_unknown() {
+    let (result, received) = fate_over_a_socket("silent", Behaviour::Silent);
+    assert_eq!(received, Operation::CreateKey);
+    assert_eq!(
+        result,
+        Err(CallFailure {
+            unserved: Unserved::Transport(TransportError::DeadlineExceeded),
+            fate: RequestFate::OutcomeUnknown,
+        })
+    );
+}
+
+/// docs/10 §10 (A-88: keyd's `Unavailable` on a key-state change means "not
+/// performed"); docs/50 §3.3 (a refusal, then close): over a real socket,
+/// keyd's shared `Refused::Unavailable` to a `create_key` it received is
+/// **not performed** — also when keyd closes right after writing it, as
+/// keyd-daemon does (the refusal is still read, Q-350 item 14).
+#[test]
+fn over_a_socket_keyds_unavailable_refusal_is_not_performed() {
+    for (test, behaviour) in [
+        ("refused", Behaviour::Refuse(Refused::Unavailable)),
+        ("refclose", Behaviour::RefuseAndClose(Refused::Unavailable)),
+    ] {
+        let (result, received) = fate_over_a_socket(test, behaviour);
+        assert_eq!(received, Operation::CreateKey);
+        assert_eq!(
+            result,
+            Err(CallFailure {
+                unserved: Unserved::Refused(Refused::Unavailable),
+                fate: RequestFate::NotPerformed,
+            }),
+            "{test}"
+        );
+    }
+}
+
+/// docs/50 §3.7; Q-367 (A-88): no keyd listening on the path — the request
+/// is **not sent**.
+#[test]
+fn over_a_socket_no_keyd_listening_is_not_sent() {
+    let dir = private_dir("absent");
+    let mut client = KeydClient::new(
+        SocketConnector::new(&dir.join("keyd.sock")),
+        KEYD_UID,
+        Duration::from_millis(300),
+    )
+    .unwrap();
+    assert_eq!(
+        client.call_with_fate(&create_key()),
+        Err(CallFailure {
+            unserved: Unserved::Transport(TransportError::Connect),
+            fate: RequestFate::NotSent,
+        })
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 

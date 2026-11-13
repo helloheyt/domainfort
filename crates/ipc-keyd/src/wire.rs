@@ -23,13 +23,19 @@
 //! second representation (docs/50 §3.3; docs/questions/Q-225 item 6). The
 //! realm and time encodings are recorded in docs/questions/Q-245 item 1.
 //!
-//! **No field carries the caller's role or the operation's `now`.** The role
-//! comes from the transport's peer credentials (R50-3) and `now` from the
-//! keyd daemon's own clock (R50-5, A-56); the time fields below are ticket
-//! facts and template times only (`authtime`, `starttime`, `endtime`,
-//! `renew_till`, `armor_authtime`) — never passed to keyd as its `now`.
+//! **No request carries the caller's role, and no message carries the
+//! operation's `now`.** The role keyd authorizes with comes only from the
+//! transport's peer credentials (R50-3) and `now` from the keyd daemon's own
+//! clock (R50-5, A-56); the time fields below are ticket facts and template
+//! times only (`authtime`, `starttime`, `endtime`, `renew_till`,
+//! `armor_authtime`) — never passed to keyd as its `now`. The one role on the
+//! wire travels the other way: the `DescribeConfig` reply reports the role
+//! keyd resolved for the caller from its peer uid ([`WireConfigDescription`];
+//! docs/questions/Q-351, A-87), so that a client can refuse a keyd that does
+//! not give it its own role. No request field is ever read as a role.
 //!
-//! Spec: docs/50 §3.3, §3.4, R50-3, R50-4, R50-5; docs/10 §1-§9; A-56, A-59.
+//! Spec: docs/50 §3.3, §3.4, R50-3, R50-4, R50-5; docs/10 §1-§9; A-56, A-59;
+//! docs/questions/Q-351 (A-87).
 
 use crate::channel::{
     reply_kind, request_kind, MAX_ENCTYPES, MAX_REPLY_FIELD, MAX_REQUEST_FIELD, MAX_SALT,
@@ -38,7 +44,7 @@ use crate::channel::{
 use ipc::{DerBlob, Error, MessageSet, Payload, Reader, Result, Secret, Writer};
 use keyd_types::{
     ArmorId, AuthnError, CtxId, DualControlToken, EncTypeId, ExchangeId, FastConversation,
-    IssueError, KeyHandle, KeyPurpose, Kvno, PrincipalId, ServiceCtxId, TicketPolicy,
+    IssueError, KeyHandle, KeyPurpose, Kvno, PrincipalId, Role, ServiceCtxId, TicketPolicy,
     TOKEN_ID_LENGTH,
 };
 use krb_proto::{KerberosFlags, TicketFlags};
@@ -1185,9 +1191,50 @@ impl Payload for WireServiceContext {
     }
 }
 
-/// `ConfigDescription`. Spec: docs/50 §3.4 (`DescribeConfig`: "realm,
-/// enctypes, clock_skew_secs, token_lifetime_secs, ticket_policy"); docs/10
-/// §7א (`s2k_params` added, Q-240 item 2).
+/// Wire code of the caller's role in the `DescribeConfig` reply. Project
+/// choice: a closed table in the order of `keyd_types::Role`; 0x00 and
+/// 0x05-0xFF name no role and are refused.
+/// Spec: docs/50 §3.3 ("enum = `u8` from a closed table"); docs/10 §2
+/// (`enum Role`, the phase-1 variants of keyd-types); docs/questions/Q-351
+/// (A-87).
+const fn caller_role_code(role: Role) -> u8 {
+    match role {
+        Role::Kdc => 0x01,
+        Role::Directory => 0x02,
+        Role::Admin => 0x03,
+        Role::Ldap => 0x04,
+    }
+}
+
+/// The role of a wire code, or `None` outside the closed table.
+/// Spec: docs/50 §3.3; docs/10 §2; docs/questions/Q-351 (A-87).
+const fn caller_role_from_code(code: u8) -> Option<Role> {
+    match code {
+        0x01 => Some(Role::Kdc),
+        0x02 => Some(Role::Directory),
+        0x03 => Some(Role::Admin),
+        0x04 => Some(Role::Ldap),
+        _ => None,
+    }
+}
+
+/// The payload of the `DescribeConfig` reply: keyd's `ConfigDescription`,
+/// then — the last field — the role keyd resolved for the caller from the
+/// connection's peer uid.
+///
+/// The role is not secret: the caller holds it, and keyd puts it in every
+/// audit record (docs/10 §10, `caller_role`). It is reported, never
+/// claimed: keyd authorizes with the role its own `uid → Role` map gives the
+/// peer (R50-3, docs/50 §3.2), and no request carries one. It lets a client
+/// refuse a keyd that maps it to another role that may also call
+/// `DescribeConfig` — the kdc's uid mapped to Ldap — before any operation
+/// is sent (docs/questions/Q-351, A-87).
+///
+/// Spec: docs/50 §3.4 (`DescribeConfig`: "realm, enctypes, clock_skew_secs,
+/// token_lifetime_secs, ticket_policy"), §3.7; docs/10 §2, §7א
+/// (`s2k_params` added, Q-240 item 2); docs/questions/Q-351 (A-87: the reply
+/// "carries the caller's Role as keyd resolved it from the peer uid (not
+/// secret)").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireConfigDescription {
     /// The realm, KerberosString octets.
@@ -1202,10 +1249,13 @@ pub struct WireConfigDescription {
     pub ticket_policy: TicketPolicy,
     /// The string-to-key parameters.
     pub s2k_params: Option<[u8; 4]>,
+    /// The caller's role, as keyd resolved it from the peer uid.
+    /// Spec: docs/questions/Q-351 (A-87).
+    pub caller_role: Role,
 }
 
 impl Payload for WireConfigDescription {
-    /// Spec: docs/50 §3.4; docs/10 §7א.
+    /// Spec: docs/50 §3.4; docs/10 §7א; docs/questions/Q-351 (A-87).
     fn write_fields(&self, writer: &mut Writer) -> Result<()> {
         writer.write_bytes(&self.realm, MAX_REPLY_FIELD)?;
         writer.write_seq(&self.enctypes, MAX_ENCTYPES, |w, e| write_enctype(w, *e))?;
@@ -1215,10 +1265,12 @@ impl Payload for WireConfigDescription {
         writer.write_u32(self.ticket_policy.min_lifetime_secs)?;
         writer.write_u32(self.ticket_policy.max_lifetime_secs)?;
         writer.write_u32(self.ticket_policy.max_renewable_lifetime_secs)?;
-        writer.write_option(self.s2k_params.as_ref(), |w, p| w.write_array(p))
+        writer.write_option(self.s2k_params.as_ref(), |w, p| w.write_array(p))?;
+        writer.write_enum(caller_role_code(self.caller_role))
     }
 
-    /// Spec: docs/50 §3.4; docs/10 §7א.
+    /// Spec: docs/50 §3.3 (closed tables; nothing after the last field),
+    /// §3.4; docs/10 §7א; docs/questions/Q-351 (A-87).
     fn read_fields(reader: &mut Reader<'_>) -> Result<WireConfigDescription> {
         let realm = read_owned(reader, MAX_REPLY_FIELD)?;
         let enctypes = reader.read_seq(MAX_ENCTYPES, read_enctype)?;
@@ -1229,6 +1281,7 @@ impl Payload for WireConfigDescription {
         let max_lifetime_secs = reader.read_u32()?;
         let max_renewable_lifetime_secs = reader.read_u32()?;
         let s2k_params = reader.read_option(|r| r.read_array())?;
+        let caller_role = reader.read_enum(caller_role_from_code)?;
         Ok(WireConfigDescription {
             realm,
             enctypes,
@@ -1241,6 +1294,7 @@ impl Payload for WireConfigDescription {
                 max_renewable_lifetime_secs,
             },
             s2k_params,
+            caller_role,
         })
     }
 }
@@ -1349,7 +1403,8 @@ pub enum KeydReply {
     RetireKvno,
     /// Spec: docs/10 §7.
     DestroyKeySet,
-    /// Spec: docs/10 §7א.
+    /// keyd's description and the caller's role.
+    /// Spec: docs/10 §7א; docs/questions/Q-351 (A-87).
     DescribeConfig(WireConfigDescription),
     /// Spec: docs/10 §7א.
     Ping,

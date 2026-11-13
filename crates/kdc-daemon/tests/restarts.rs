@@ -11,11 +11,14 @@
 //!   and the request is answered KDC_ERR_SVC_UNAVAILABLE (29) over TCP and
 //!   with silence over UDP — never KDC_ERR_PREAUTH_FAILED (24); no keyd
 //!   operation runs for it.
+//! * **Q-351** (A-87) — the same when that role is **Ldap**, which may call
+//!   `DescribeConfig`: keyd answers it, naming the caller role Ldap, and the
+//!   kdc's client refuses that answer.
 //!
 //! Sources: docs/50 R50-3, R50-6, R50-8, §3.2, §3.4, §3.6, §3.7, §7.5 step
 //! 4; docs/10 §2; RFC 4120 §7.5.9 ("24 KDC_ERR_PREAUTH_FAILED", "29
 //! KDC_ERR_SVC_UNAVAILABLE"); A-56, A-62; docs/questions/Q-311, Q-312
-//! (A-82). Every value is hand-made.
+//! (A-82), Q-351 (A-87). Every value is hand-made.
 
 #[path = "../../kdc/tests/common/mod.rs"]
 mod common;
@@ -139,14 +142,36 @@ fn the_first_request_after_dird_is_restarted_is_served() {
 /// back with the right map ⇒ the first request is issued.
 #[test]
 fn keyd_restarted_with_the_kdcs_uid_in_another_role_answers_29_never_24() {
+    keyd_restarted_with_the_kdcs_uid_as(Role::Directory, KeydRole::Directory, KeydOutcome::Denied);
+}
+
+/// docs/50 R50-3, R50-8, §3.2, §3.4 (`DescribeConfig` — Kdc, **Ldap**),
+/// §3.7; docs/10 §2; RFC 4120 §7.5.9; Q-351 (A-87: "the kdc's client
+/// requires Role::Kdc"): keyd restarted under the running kdc with the
+/// kdc's uid mapped to the **Ldap** role, which may call `DescribeConfig`.
+/// keyd answers each new connection's `DescribeConfig` (Success) naming the
+/// caller role Ldap; the kdc's client refuses that answer and drops the
+/// connection, so the client gets 29 over TCP and silence over UDP — never
+/// the 24 that keyd's `Denied` of `verify_preauth` (Ldap may not call it)
+/// would have become; keyd ran no operation of the exchange.
+#[test]
+fn keyd_restarted_with_the_kdcs_uid_as_ldap_answers_29_never_24() {
+    keyd_restarted_with_the_kdcs_uid_as(Role::Ldap, KeydRole::Ldap, KeydOutcome::Success);
+}
+
+/// keyd restarted with the kdc's uid mapped to `role`; three bootstraps
+/// (TCP, UDP, TCP) are 29 / silence / 29, keyd's records since the restart
+/// are three `DescribeConfig`s of `recorded` with `outcome` and nothing
+/// else; keyd back with the Kdc map ⇒ issued at once.
+fn keyd_restarted_with_the_kdcs_uid_as(role: Role, recorded: KeydRole, outcome: KeydOutcome) {
     let Some(mut stack) = Stack::start(7, 7, |_| {}).unwrap() else {
         return;
     };
     assert!(issued(&stack, 1));
     stack.keyd.take().unwrap().stop().unwrap();
     let before = keyd_records(&stack).len();
-    let directory = CallerMap::new(&[(stack.uid, Role::Directory)]).unwrap();
-    restart_keyd(&mut stack, directory);
+    let cross_wired = CallerMap::new(&[(stack.uid, role)]).unwrap();
+    restart_keyd(&mut stack, cross_wired);
 
     let tcp = message(tcp_send(stack.kdcd().tcp, &bootstrap(2)));
     assert_eq!(error_code(&tcp), KDC_ERR_SVC_UNAVAILABLE);
@@ -157,21 +182,21 @@ fn keyd_restarted_with_the_kdcs_uid_in_another_role_answers_29_never_24() {
         KDC_ERR_SVC_UNAVAILABLE
     );
 
-    // keyd's own records of the attempts: one refused DescribeConfig per
-    // request — a new connection each time — and nothing else.
+    // keyd's own records of the attempts: one DescribeConfig per request —
+    // a new connection each time — and nothing else.
     let since = |stack: &Stack| keyd_records(stack).split_off(before);
     assert!(
         eventually(LONG, || since(&stack).len() >= 3),
-        "keyd recorded the three DescribeConfig refusals"
+        "keyd recorded the three DescribeConfigs"
     );
     std::thread::sleep(Duration::from_millis(300));
     let records = since(&stack);
     assert_eq!(records.len(), 3, "{records:?}");
     for record in &records {
         assert_eq!(record.op, KeydOperation::DescribeConfig);
-        assert_eq!(record.caller_role, KeydRole::Directory);
+        assert_eq!(record.caller_role, recorded);
         assert_eq!(record.caller_uid, stack.uid);
-        assert_eq!(record.result, KeydOutcome::Denied);
+        assert_eq!(record.result, outcome);
     }
 
     stack.keyd.take().unwrap().stop().unwrap();

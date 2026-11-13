@@ -101,8 +101,30 @@ fn a_mapped_kdc_uid_can_ping_and_describe_config() {
         ));
     }
     match client.call(&Call::DescribeConfig) {
-        Some(Ok(Answer::DescribeConfig(Ok(description)))) => {
-            assert_eq!(description.realm, realm());
+        Some(Ok(Answer::DescribeConfig(Ok(described)))) => {
+            assert_eq!(described.description.realm, realm());
+            assert_eq!(described.caller_role, Role::Kdc);
+        }
+        other => panic!("{other:?}"),
+    }
+    world.daemon.stop().unwrap();
+}
+
+/// docs/50 §3.2 (the role comes from keyd's `uid → Role` map), §3.4
+/// (`DescribeConfig` — Kdc, Ldap); docs/questions/Q-351 (A-87: the reply
+/// carries the caller's role as keyd resolved it from the peer uid): the
+/// same peer uid mapped to Ldap is answered the same description, naming
+/// the caller role Ldap.
+#[test]
+fn describe_config_names_the_role_keyd_mapped_the_peer_uid_to() {
+    let Some(world) = world(Some(Role::Ldap), |_| {}) else {
+        return;
+    };
+    let mut client = RawClient::connect(&world.daemon.socket);
+    match client.call(&Call::DescribeConfig) {
+        Some(Ok(Answer::DescribeConfig(Ok(described)))) => {
+            assert_eq!(described.description.realm, realm());
+            assert_eq!(described.caller_role, Role::Ldap);
         }
         other => panic!("{other:?}"),
     }

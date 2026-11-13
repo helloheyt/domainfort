@@ -300,8 +300,9 @@ fn acknowledge_all(gate: &AuditGate) {
 }
 
 /// docs/50 R50-3, §3.4 (`Ping`: every mapped role; `DescribeConfig`: Kdc,
-/// Ldap); docs/10 §7א: a mapped Kdc caller is served both, with keyd's own
-/// configuration (the realm of the daemon's keyd).
+/// Ldap); docs/10 §7א; docs/questions/Q-351 (A-87): a mapped Kdc caller is
+/// served both, with keyd's own configuration (the realm of the daemon's
+/// keyd) and the caller role the daemon resolved for it (Kdc).
 #[test]
 fn a_mapped_kdc_caller_can_ping_and_describe_config() {
     let clock = TestClock::at(t0());
@@ -310,7 +311,10 @@ fn a_mapped_kdc_caller_can_ping_and_describe_config() {
     assert!(matches!(answer, Ok(Answer::Ping(Ok(())))));
     assert!(open);
     match serve(&mut engine, KDC, &Call::DescribeConfig).0 {
-        Ok(Answer::DescribeConfig(Ok(description))) => assert_eq!(description.realm, realm()),
+        Ok(Answer::DescribeConfig(Ok(described))) => {
+            assert_eq!(described.description.realm, realm());
+            assert_eq!(described.caller_role, KDC.role);
+        }
         other => panic!("{other:?}"),
     }
 }

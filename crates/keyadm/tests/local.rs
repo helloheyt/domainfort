@@ -8,7 +8,7 @@
 
 use dtyp::{Guid, Sid};
 use ipc::Refused;
-use ipc_keyd::{Answer, ConversionError, TransportError, Unserved};
+use ipc_keyd::{Answer, CallFailure, ConversionError, RequestFate, TransportError, Unserved};
 use keyadm::ceremony::{classify, CeremonyReport, NotSent, Outcome, Step, StepReport, Unknown};
 use keyadm::cli::{self, Command, UsageError};
 use keyadm::identity::{refuse_root, IdentityError};
@@ -42,20 +42,27 @@ fn manifest() -> Manifest {
     .unwrap()
 }
 
-fn create(result: Result<Answer, Unserved>) -> Outcome<Kvno> {
+fn create(result: Result<Answer, CallFailure>) -> Outcome<Kvno> {
     classify(result, |answer| match answer {
         Answer::CreateKey(result) => Some(result),
         _ => None,
     })
 }
 
+/// A failure as the ipc-keyd client reports it (`call_with_fate`).
+fn failed(unserved: Unserved, fate: RequestFate) -> Result<Answer, CallFailure> {
+    Err(CallFailure { unserved, fate })
+}
+
 // ---- outcome classification --------------------------------------------------
 
-/// crates/keyadm ceremony.rs table (from docs/50 R50-3, §3.6, §3.7 and the
-/// keyd-daemon engine's refusal points): what was certainly not sent, not
-/// run, answered, or is unknown.
+/// crates/keyadm ceremony.rs table (from docs/50 R50-3, §3.6, §3.7, the
+/// keyd-daemon engine's refusal points, and the client's request fate —
+/// docs/questions/Q-367, A-88): what was certainly not sent, not performed,
+/// answered, or is unknown.
 #[test]
 fn every_client_result_is_classified() {
+    use RequestFate::{NotPerformed, NotSent as Unsent, OutcomeUnknown};
     let kvno = Kvno::new(1);
     assert_eq!(
         create(Ok(Answer::CreateKey(Ok(kvno)))),
@@ -65,36 +72,62 @@ fn every_client_result_is_classified() {
         create(Ok(Answer::CreateKey(Err(KeydError::Denied)))),
         Outcome::Answered(Err(KeydError::Denied))
     );
-    // R50-3: the peer uid check fails before anything is sent.
+    // keyd's own Unavailable answer is keyd's answer (refused before it
+    // stored anything).
     assert_eq!(
-        create(Err(Unserved::PeerMismatch)),
+        create(Ok(Answer::CreateKey(Err(KeydError::Unavailable)))),
+        Outcome::Answered(Err(KeydError::Unavailable))
+    );
+    // Not sent — R50-3: the peer uid check fails before anything is sent;
+    // the connection, the deadline before writing, encoding.
+    assert_eq!(
+        create(failed(Unserved::PeerMismatch, Unsent)),
         Outcome::NotSent(NotSent::PeerMismatch)
     );
     assert_eq!(
-        create(Err(Unserved::Transport(TransportError::Connect))),
+        create(failed(Unserved::Transport(TransportError::Connect), Unsent)),
         Outcome::NotSent(NotSent::Connect)
     );
     assert_eq!(
-        create(Err(Unserved::Transport(TransportError::PeerCredentials))),
+        create(failed(
+            Unserved::Transport(TransportError::PeerCredentials),
+            Unsent
+        )),
         Outcome::NotSent(NotSent::PeerCredentials)
     );
     assert_eq!(
-        create(Err(Unserved::Unencodable)),
+        create(failed(
+            Unserved::Transport(TransportError::DeadlineExceeded),
+            Unsent
+        )),
+        Outcome::NotSent(NotSent::Transport(TransportError::DeadlineExceeded))
+    );
+    assert_eq!(
+        create(failed(Unserved::Unencodable, Unsent)),
         Outcome::NotSent(NotSent::Unencodable)
     );
-    // Refused before keyd runs the operation (the audit gate / queue → Busy;
-    // decoding → Malformed / VersionMismatch).
-    for refused in [Refused::Busy, Refused::Malformed, Refused::VersionMismatch] {
+    // A failed DescribeConfig check (a client that requires one; keyadm's
+    // never does): only that was sent.
+    assert_eq!(
+        create(failed(Unserved::Refused(Refused::Busy), Unsent)),
+        Outcome::NotSent(NotSent::PeerMismatch)
+    );
+    // Not performed — every shared refusal, keyd's Unavailable included
+    // (A-88: keyd-daemon refuses a key-state change only before keyd runs
+    // it; Busy while auditd is away; Malformed / VersionMismatch before
+    // decoding).
+    for refused in [
+        Refused::Unavailable,
+        Refused::Busy,
+        Refused::Malformed,
+        Refused::VersionMismatch,
+    ] {
         assert_eq!(
-            create(Err(Unserved::Refused(refused))),
-            Outcome::NotRun(refused)
+            create(failed(Unserved::Refused(refused), NotPerformed)),
+            Outcome::NotPerformed(refused)
         );
     }
-    // Possibly after keyd ran it: unknown.
-    assert_eq!(
-        create(Err(Unserved::Refused(Refused::Unavailable))),
-        Outcome::Unknown(Unknown::RefusedUnavailable)
-    );
+    // Outcome unknown — the request was sent and no usable reply came.
     for transport in [
         TransportError::Closed,
         TransportError::DeadlineExceeded,
@@ -102,24 +135,41 @@ fn every_client_result_is_classified() {
         TransportError::Framing,
     ] {
         assert_eq!(
-            create(Err(Unserved::Transport(transport))),
+            create(failed(Unserved::Transport(transport), OutcomeUnknown)),
             Outcome::Unknown(Unknown::Transport(transport))
         );
     }
     assert_eq!(
-        create(Err(Unserved::MalformedReply(ipc::Error::FrameTooShort))),
+        create(failed(
+            Unserved::MalformedReply(ipc::Error::FrameTooShort),
+            OutcomeUnknown
+        )),
         Outcome::Unknown(Unknown::MalformedReply)
     );
     assert_eq!(
-        create(Err(Unserved::UnexpectedReply(
-            ConversionError::UnexpectedReply
-        ))),
+        create(failed(
+            Unserved::UnexpectedReply(ConversionError::UnexpectedReply),
+            OutcomeUnknown
+        )),
         Outcome::Unknown(Unknown::UnexpectedReply)
     );
     // An answer of another operation (never produced by the client, which
     // checks it) is unknown, not success.
     assert_eq!(
         create(Ok(Answer::Ping(Ok(())))),
+        Outcome::Unknown(Unknown::UnexpectedReply)
+    );
+    // A pairing the client never produces claims the least: "not
+    // performed" without a refusal is unknown.
+    assert_eq!(
+        create(failed(
+            Unserved::Transport(TransportError::Closed),
+            NotPerformed
+        )),
+        Outcome::Unknown(Unknown::Transport(TransportError::Closed))
+    );
+    assert_eq!(
+        create(failed(Unserved::PeerMismatch, NotPerformed)),
         Outcome::Unknown(Unknown::UnexpectedReply)
     );
 }
@@ -231,8 +281,10 @@ fn a_refused_first_step_stops_and_explains() {
     assert!(text.contains("restart keyd"));
 }
 
-/// The ceremony.rs table: an unknown outcome is reported as "MAY have been
-/// created", after the created ones.
+/// The ceremony.rs table; Q-367 (A-88: "outcome unknown — check before
+/// retrying"): an unknown outcome is reported as sent, outcome unknown and
+/// "MAY have been created", after the created ones, with the pointer to
+/// keyd's audit log.
 #[test]
 fn an_unknown_outcome_says_the_key_set_may_exist() {
     let m = manifest();
@@ -249,9 +301,76 @@ fn an_unknown_outcome_says_the_key_set_may_exist() {
     assert_eq!(report::exit_code(&report), EXIT_INCOMPLETE);
     assert_eq!(report.created(), [(Step::Krbtgt, Kvno::new(1))]);
     let text = report::render(&report, &m).join("\n");
-    assert!(text
-        .contains("ldap service: keyd did not answer in time; the key set MAY have been created"));
+    assert!(
+        text.contains(
+            "ldap service: keyd did not answer in time after the request was sent; outcome unknown, the key set MAY have been created"
+        ),
+        "{text}"
+    );
     assert!(text.contains("1 of 3 key sets created; not attempted: admin service"));
+    assert!(text.contains("check keyd's audit log before anything else"));
+}
+
+/// docs/10 §10 (A-88: keyd's `Unavailable` on a key-state change means "not
+/// performed"); docs/50 R50-3, §3.6, §3.7; Q-367 (A-88): the three fates of
+/// a `create_key` keyd did not answer — not sent, not performed, outcome
+/// unknown — each with its own report text; only the unknown one says the
+/// key set MAY exist and points to the audit log. Each stops the ceremony
+/// at the krbtgt step (exit 2: a step was attempted), and at the contact
+/// (`ping`) each attempts nothing (exit 1).
+#[test]
+fn the_three_fates_are_reported_apart() {
+    let m = manifest();
+    let cases = [
+        (
+            Outcome::NotSent(NotSent::Transport(TransportError::DeadlineExceeded)),
+            "krbtgt: the deadline passed before the request was sent (nothing was sent); not created",
+        ),
+        (
+            Outcome::NotSent(NotSent::Connect),
+            "krbtgt: the keyd socket could not be connected (nothing was sent); not created",
+        ),
+        (
+            Outcome::NotPerformed(Refused::Unavailable),
+            "krbtgt: keyd answered unavailable (not performed); not created",
+        ),
+        (
+            Outcome::NotPerformed(Refused::Busy),
+            "krbtgt: keyd is busy or cannot reach auditd (not performed); not created",
+        ),
+        (
+            Outcome::Unknown(Unknown::Transport(TransportError::Closed)),
+            "krbtgt: keyd closed the connection after the request was sent; outcome unknown, the key set MAY have been created",
+        ),
+    ];
+    for (outcome, expected) in cases {
+        let unknown = outcome.outcome_unknown();
+        let report = CeremonyReport {
+            contact: Outcome::Answered(Ok(())),
+            steps: vec![step(Step::Krbtgt, outcome)],
+        };
+        assert_eq!(report::exit_code(&report), EXIT_INCOMPLETE, "{expected}");
+        assert_eq!(report.created(), []);
+        let text = report::render(&report, &m).join("\n");
+        assert!(text.contains(expected), "{expected}\n---\n{text}");
+        assert_eq!(text.contains("MAY have been created"), unknown, "{text}");
+        assert_eq!(text.contains("audit log"), unknown, "{text}");
+        assert!(text.contains("0 of 3 key sets created"));
+
+        let contact = CeremonyReport {
+            contact: match outcome {
+                Outcome::NotSent(reason) => Outcome::NotSent(reason),
+                Outcome::NotPerformed(refused) => Outcome::NotPerformed(refused),
+                Outcome::Unknown(reason) => Outcome::Unknown(reason),
+                Outcome::Answered(_) => unreachable!("only the three fates"),
+            },
+            steps: Vec::new(),
+        };
+        assert_eq!(report::exit_code(&contact), EXIT_NOTHING_ATTEMPTED);
+        let text = report::render(&contact, &m).join("\n");
+        assert!(text.contains("contact failed: "), "{text}");
+        assert!(text.contains("no create_key was sent"), "{text}");
+    }
 }
 
 /// docs/50 R50-3 (nothing is sent to a peer that is not keyd): a failed
@@ -263,7 +382,8 @@ fn a_failed_contact_attempts_nothing() {
         Outcome::NotSent(NotSent::PeerMismatch),
         Outcome::NotSent(NotSent::Connect),
         Outcome::Unknown(Unknown::Transport(TransportError::Closed)),
-        Outcome::NotRun(Refused::Busy),
+        Outcome::NotPerformed(Refused::Busy),
+        Outcome::NotPerformed(Refused::Unavailable),
         Outcome::Answered(Err(KeydError::Denied)),
     ] {
         let report = CeremonyReport {

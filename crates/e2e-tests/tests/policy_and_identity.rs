@@ -11,7 +11,8 @@
 //! the peer credentials, through each server's `uid → Role` table):
 //! a channel cross-wired at runtime is closed or refused, and the client is
 //! never issued a ticket — a keyd that no longer gives the kdc's uid the
-//! Kdc role is 29 like any keyd that does not serve, never 24 (Q-311, A-82).
+//! Kdc role is 29 like any keyd that does not serve, never 24 (Q-311, A-82)
+//! — the Ldap role included (Q-351, A-87).
 //! Every first request after a server was replaced is decided by the new
 //! process (Q-312, A-82). Only what the per-daemon tests do not already
 //! cover is added here — each server's refusal is seen **through the whole
@@ -21,8 +22,9 @@
 //! | test | cross-wiring | seen by the client |
 //! |---|---|---|
 //! | `keyd_not_mapping_the_kdcs_uid_…` | keyd's map names another uid as Kdc | 29 / silence |
-//! | `the_kdc_does_not_start_…` | keyd maps the kdc's uid to Directory, at the kdc's start | the kdc refuses to start |
-//! | `keyd_giving_the_kdcs_uid_another_role_…` | the same, under a running kdc | 29 / silence, never 24; keyd's records: refused `DescribeConfig`s only (Q-311) |
+//! | `the_kdc_does_not_start_…` | keyd maps the kdc's uid to Directory, then to Ldap, at the kdc's start | the kdc refuses to start |
+//! | `keyd_giving_the_kdcs_uid_another_role_…` | keyd maps the kdc's uid to Directory under a running kdc | 29 / silence, never 24; keyd's records: refused `DescribeConfig`s only (Q-311) |
+//! | `keyd_giving_the_kdcs_uid_the_ldap_role_…` | the same with Ldap, which may call `DescribeConfig` | 29 / silence, never 24; keyd's records: `DescribeConfig`s of the Ldap caller only (Q-351) |
 //! | `dird_kdc_channel_for_another_uid_…` | dird's kdc channel for another uid | 29 / silence; LDAP unaffected |
 //! | `dird_ldap_channel_for_another_uid_…` | dird's LDAP channel for another uid | the notice, close; Kerberos unaffected |
 //! | `auditd_not_mapping_the_senders_…` | auditd's map names another uid | 29 / silence, the notice; auditd's own record of the refused uid |
@@ -45,7 +47,7 @@
 //! Sources: docs/50 R50-2, R50-3, R50-8, §3.2, §3.4, §3.7, §7.2, §7.5, §8.1;
 //! docs/10 §2 (I2: keyd's capability table decides); RFC 4120 §7.5.9; RFC
 //! 4511 §4.4.1; A-57, A-60, A-62, A-68, A-69, A-70; docs/questions/Q-311,
-//! Q-312 (A-82). Every value is made here.
+//! Q-312 (A-82), Q-351 (A-87). Every value is made here.
 
 #[path = "../../kdc/tests/common/mod.rs"]
 mod common;
@@ -180,6 +182,14 @@ fn the_kdc_does_not_start_when_keyd_gives_its_uid_another_role() {
         h.start_dird().unwrap();
         let refused = h.start_kdc().expect_err("refused to start");
         assert!(refused.contains("keyd not verified"), "{refused}");
+        // Q-351 (A-87): Ldap may call DescribeConfig, and keyd answers it —
+        // naming the caller role Ldap, which the kdc's client refuses.
+        h.stop_keyd();
+        let ldap = CallerMap::new(&[(h.uid, Role::Ldap)]).unwrap();
+        h.start_keyd(ldap, common::keyd_started()).unwrap();
+        h.keyd_clock.set(common::now());
+        let refused = h.start_kdc().expect_err("refused to start (Ldap)");
+        assert!(refused.contains("keyd not verified"), "{refused}");
         h.stop_all();
     });
 }
@@ -234,6 +244,59 @@ fn keyd_giving_the_kdcs_uid_another_role_at_runtime_is_29_not_24() {
             assert_eq!(record.caller_uid, h.uid);
             assert_eq!(record.result, KeydOutcome::Denied);
             assert_eq!(record.reason, KeydReason::RoleNotPermitted);
+        }
+    });
+}
+
+/// docs/50 R50-3, R50-8, §3.2, §3.4 (`DescribeConfig` — Kdc, **Ldap**),
+/// §3.7; docs/10 §2 (I2), §9; RFC 4120 §7.5.9; docs/questions/Q-351 (A-87:
+/// keyd's `DescribeConfig` reply carries the caller's role as keyd resolved
+/// it, and the kdc's client requires `Kdc`): keyd restarted under the
+/// running kdc with the kdc's uid mapped to the **Ldap** role — the one
+/// other role that may call `DescribeConfig`. keyd answers each new
+/// connection's check, naming the caller role Ldap; the kdc's client drops
+/// the connection, so the bootstrap is answered KDC_ERR_SVC_UNAVAILABLE (29)
+/// over TCP and with silence over UDP — never the KDC_ERR_PREAUTH_FAILED
+/// (24) that keyd's `Denied` of `verify_preauth` would have become. keyd's
+/// own records of the attempts are `DescribeConfig`s of the Ldap caller
+/// (one per request), and keyd ran no operation of the exchange. keyd back
+/// with the right map ⇒ the first request is issued.
+#[test]
+fn keyd_giving_the_kdcs_uid_the_ldap_role_at_runtime_is_29_not_24() {
+    within(TEST_BOUND, || {
+        let Some(mut h) = Harness::start() else {
+            return;
+        };
+        assert!(bootstrap_issued(&h, 1));
+        h.stop_keyd();
+        let ldap = CallerMap::new(&[(h.uid, Role::Ldap)]).unwrap();
+        h.start_keyd(ldap, common::keyd_started()).unwrap();
+        h.keyd_clock.set(common::now());
+        assert_eq!(kdc_tcp(&h, &bootstrap(2)), UNAVAILABLE, "29, not 24");
+        assert_eq!(kdc_udp(&h, &bootstrap(3)), None, "silence over UDP");
+        assert_eq!(kdc_tcp(&h, &bootstrap(4)), UNAVAILABLE);
+        h.stop_keyd();
+        h.start_keyd_serving().unwrap();
+        assert!(bootstrap_issued(&h, 5), "the right map: served at once");
+        h.stop_all();
+
+        let ldap_records: Vec<_> = h
+            .audit_events()
+            .into_iter()
+            .filter_map(|event| match event {
+                EventBody::Keyd(record) if record.caller_role == KeydRole::Ldap => Some(*record),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ldap_records.len(),
+            3,
+            "one DescribeConfig per request: {ldap_records:?}"
+        );
+        for record in &ldap_records {
+            assert_eq!(record.op, KeydOperation::DescribeConfig);
+            assert_eq!(record.caller_uid, h.uid);
+            assert_eq!(record.result, KeydOutcome::Success);
         }
     });
 }

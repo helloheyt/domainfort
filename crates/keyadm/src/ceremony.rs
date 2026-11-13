@@ -32,19 +32,27 @@
 //!
 //! # What each outcome means
 //!
+//! The ipc-keyd client says what it knows of a request keyd did not answer
+//! (`KeydClient::call_with_fate`, `ipc_keyd::RequestFate`: not sent / not
+//! performed / outcome unknown — docs/questions/Q-367, A-88); keyadm
+//! reports exactly that.
+//!
 //! | outcome | created? |
 //! |---|---|
 //! | keyd answered `Ok(kvno)` | yes, with that kvno |
 //! | keyd answered `Err(Denied / Unavailable / RateLimited)` | no — keyd refuses before it stores anything |
-//! | not sent: peer uid not keyd's, connect failed, peer credentials unreadable, unencodable | no — nothing left this process |
-//! | not run: `Refused::Busy` / `Malformed` / `VersionMismatch` | no — refused before keyd ran it (crates/keyd-daemon engine: the audit gate or the queue answers Busy before `execute`) |
-//! | unknown: the connection failed after sending, `Refused::Unavailable` (also sent when the audit record could not be committed **after** keyd ran), an undecodable reply | **maybe** |
+//! | not sent: peer uid not keyd's, connect failed, peer credentials unreadable, the deadline passed before sending, unencodable | no — nothing left this process |
+//! | not performed: `Refused::Busy` / `Unavailable` / `Malformed` / `VersionMismatch` | no — keyd-daemon refuses a key-state change only before keyd runs it (A-88: `Busy` while auditd is away, `Unavailable` when the intent was not acknowledged in time — keyd's audit then holds the intent and a `NotPerformed` outcome) |
+//! | outcome unknown: the request was sent and the connection failed, the deadline passed, or the reply could not be read | **maybe** — keyd's audit log holds the intent and the outcome; check it before anything else |
 //!
-//! Spec: docs/51 §4.3 steps 10-11, §4.5, §6; docs/10 §2, §7, §9; docs/50
-//! R50-3, §3.4, §3.6, §3.7; A-19; A-35; A-63; A-73; A-77.
+//! Spec: docs/51 §4.3 steps 10-11, §4.5, §6; docs/10 §2, §7, §9, §10;
+//! docs/50 R50-3, §3.4, §3.6, §3.7; A-19; A-35; A-63; A-73; A-77;
+//! docs/questions/Q-365, Q-367 (A-88).
 
 use ipc::Refused;
-use ipc_keyd::{Answer, Call, Connector, KeydClient, TransportError, Unserved};
+use ipc_keyd::{
+    Answer, Call, CallFailure, Connector, KeydClient, RequestFate, TransportError, Unserved,
+};
 use keyd_types::{Error as KeydError, Kvno};
 use provision_manifest::{KeySet, Manifest};
 
@@ -90,30 +98,33 @@ impl Step {
 }
 
 /// Why a request never left this process.
-/// Spec: docs/50 R50-3, §3.7; crates/ipc-keyd client (`Unserved`).
+/// Spec: docs/50 R50-3, §3.7; crates/ipc-keyd client (`Unserved`,
+/// `RequestFate::NotSent`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotSent {
-    /// The socket's peer uid is not the configured keyd uid (R50-3).
+    /// The socket's peer uid is not the configured keyd uid (R50-3). (Also
+    /// a failed `DescribeConfig` check of a client that requires one —
+    /// keyadm's never does.)
     PeerMismatch,
     /// The socket could not be connected.
     Connect,
     /// The socket's peer credentials could not be read (on any platform but
     /// Linux they never can — the ipc-keyd connector fails closed).
     PeerCredentials,
+    /// The connection failed before the request was written — in keyadm,
+    /// the deadline passed while the connection was being opened.
+    Transport(TransportError),
     /// The request could not be encoded.
     Unencodable,
 }
 
 /// Why keyadm does not know what keyd did with a request it sent.
-/// Spec: docs/50 §3.6, §3.7; crates/keyd-daemon engine (`Refused::
-/// Unavailable` after keyd ran, when the audit record cannot be committed).
+/// Spec: docs/50 §3.6, §3.7; crates/ipc-keyd client
+/// (`RequestFate::OutcomeUnknown`); docs/questions/Q-367 (A-88).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unknown {
-    /// The connection failed after the request may have been written.
+    /// The connection failed after the request was handed to it.
     Transport(TransportError),
-    /// keyd answered the shared `Refused::Unavailable`, which it also sends
-    /// after running an operation whose audit record it could not commit.
-    RefusedUnavailable,
     /// The reply did not decode.
     MalformedReply,
     /// The reply decoded but did not answer this operation.
@@ -128,9 +139,9 @@ pub enum Outcome<T> {
     Answered(Result<T, KeydError>),
     /// Nothing reached keyd.
     NotSent(NotSent),
-    /// keyd's transport refused the request before keyd ran it.
-    NotRun(Refused),
-    /// The request may or may not have been run.
+    /// keyd's transport refused the request: keyd did not perform it (A-88).
+    NotPerformed(Refused),
+    /// The request was sent and may or may not have been performed.
     Unknown(Unknown),
 }
 
@@ -149,31 +160,63 @@ impl<T> Outcome<T> {
     }
 }
 
-/// Classify the result of one `KeydClient::call`; `pick` takes keyd's answer
-/// out of the [`Answer`] variant of the operation called.
-/// Spec: module documentation; crates/ipc-keyd client (`Unserved`).
+/// Classify the result of one `KeydClient::call_with_fate`; `pick` takes
+/// keyd's answer out of the [`Answer`] variant of the operation called.
+///
+/// The client's fate decides the class (it alone knows whether the request
+/// was written); the `Unserved` reason only chooses the text. A combination
+/// the client never produces — a refusal reported as not sent other than by
+/// the `DescribeConfig` check, or anything but a `Refused` reported as not
+/// performed — falls to the class that claims least: not sent ⇒ the peer
+/// check, not performed ⇒ outcome unknown.
+///
+/// Spec: module documentation; crates/ipc-keyd client (`CallFailure`,
+/// `RequestFate`); docs/questions/Q-367 (A-88).
 pub fn classify<T>(
-    result: Result<Answer, Unserved>,
+    result: Result<Answer, CallFailure>,
     pick: impl FnOnce(Answer) -> Option<Result<T, KeydError>>,
 ) -> Outcome<T> {
-    match result {
-        Ok(answer) => match pick(answer) {
-            Some(answered) => Outcome::Answered(answered),
-            None => Outcome::Unknown(Unknown::UnexpectedReply),
-        },
-        Err(Unserved::PeerMismatch) => Outcome::NotSent(NotSent::PeerMismatch),
-        Err(Unserved::Unencodable) => Outcome::NotSent(NotSent::Unencodable),
-        Err(Unserved::Transport(TransportError::Connect)) => Outcome::NotSent(NotSent::Connect),
-        Err(Unserved::Transport(TransportError::PeerCredentials)) => {
+    let failure = match result {
+        Ok(answer) => {
+            return match pick(answer) {
+                Some(answered) => Outcome::Answered(answered),
+                None => Outcome::Unknown(Unknown::UnexpectedReply),
+            }
+        }
+        Err(failure) => failure,
+    };
+    match (failure.fate, failure.unserved) {
+        (RequestFate::NotSent, Unserved::Unencodable) => Outcome::NotSent(NotSent::Unencodable),
+        (RequestFate::NotSent, Unserved::Transport(TransportError::Connect)) => {
+            Outcome::NotSent(NotSent::Connect)
+        }
+        (RequestFate::NotSent, Unserved::Transport(TransportError::PeerCredentials)) => {
             Outcome::NotSent(NotSent::PeerCredentials)
         }
-        Err(Unserved::Transport(other)) => Outcome::Unknown(Unknown::Transport(other)),
-        Err(Unserved::Refused(Refused::Unavailable)) => {
-            Outcome::Unknown(Unknown::RefusedUnavailable)
+        (RequestFate::NotSent, Unserved::Transport(other)) => {
+            Outcome::NotSent(NotSent::Transport(other))
         }
-        Err(Unserved::Refused(refused)) => Outcome::NotRun(refused),
-        Err(Unserved::MalformedReply(_)) => Outcome::Unknown(Unknown::MalformedReply),
-        Err(Unserved::UnexpectedReply(_)) => Outcome::Unknown(Unknown::UnexpectedReply),
+        (
+            RequestFate::NotSent,
+            Unserved::PeerMismatch
+            | Unserved::Refused(_)
+            | Unserved::MalformedReply(_)
+            | Unserved::UnexpectedReply(_),
+        ) => Outcome::NotSent(NotSent::PeerMismatch),
+        (RequestFate::NotPerformed, Unserved::Refused(refused)) => Outcome::NotPerformed(refused),
+        (RequestFate::NotPerformed | RequestFate::OutcomeUnknown, Unserved::Transport(error)) => {
+            Outcome::Unknown(Unknown::Transport(error))
+        }
+        (RequestFate::NotPerformed | RequestFate::OutcomeUnknown, Unserved::MalformedReply(_)) => {
+            Outcome::Unknown(Unknown::MalformedReply)
+        }
+        (
+            RequestFate::NotPerformed | RequestFate::OutcomeUnknown,
+            Unserved::UnexpectedReply(_)
+            | Unserved::Refused(_)
+            | Unserved::PeerMismatch
+            | Unserved::Unencodable,
+        ) => Outcome::Unknown(Unknown::UnexpectedReply),
     }
 }
 
@@ -232,9 +275,10 @@ impl CeremonyReport {
 /// documentation): contact, then `create_key` for each [`Step`] in order,
 /// stopping at the first that does not succeed. Never retries.
 ///
-/// Spec: docs/51 §4.3 step 11; docs/10 §7; docs/50 R50-3; A-19; A-35; A-77.
+/// Spec: docs/51 §4.3 step 11; docs/10 §7; docs/50 R50-3; A-19; A-35; A-77;
+/// docs/questions/Q-367 (A-88: each call's fate from the client).
 pub fn run<C: Connector>(client: &mut KeydClient<C>, manifest: &Manifest) -> CeremonyReport {
-    let contact = classify(client.call(&Call::Ping), |answer| match answer {
+    let contact = classify(client.call_with_fate(&Call::Ping), |answer| match answer {
         Answer::Ping(result) => Some(result),
         _ => None,
     });
@@ -248,7 +292,7 @@ pub fn run<C: Connector>(client: &mut KeydClient<C>, manifest: &Manifest) -> Cer
             handle: key_set.handle,
             binding: key_set.binding.clone(),
         };
-        let outcome = classify(client.call(&call), |answer| match answer {
+        let outcome = classify(client.call_with_fate(&call), |answer| match answer {
             Answer::CreateKey(result) => Some(result),
             _ => None,
         });

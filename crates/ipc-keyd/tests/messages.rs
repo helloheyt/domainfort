@@ -1,13 +1,17 @@
 //! The keyd channel's message set: canonical round trips of every request
 //! and reply, the documented kind tables, strict decoding (truncation,
-//! trailing octets, a one-octet mutation sweep), no secret in `Debug`, and
-//! no `now` (and no role) on the wire.
+//! trailing octets, a one-octet mutation sweep), no secret in `Debug`, no
+//! `now` on the wire and no role in any request — and the one role the
+//! wire does carry, the caller role of the `DescribeConfig` reply (its
+//! closed table, its bounds, its refusal of unknown values).
 //!
 //! Sources: docs/50 §3.3 (layout; "a single encoding per value"; "every
 //! decoder checks `encode(decode(b)) == b` in property tests"; Kerberos
-//! values decoded by krb-proto; secret-bearing buffers; no trailing byte),
-//! §3.4 (the keyd rows; "no `now` field in any request"), §8.2 (no secret
-//! in debug output), §9 tier 1; R50-3, R50-5; A-56; A-59.
+//! values decoded by krb-proto; secret-bearing buffers; no trailing byte;
+//! "enum = `u8` from a closed table"; bound before allocation), §3.4 (the
+//! keyd rows; "no `now` field in any request"), §8.2 (no secret in debug
+//! output), §9 tier 1; R50-3, R50-5; A-56; A-59; docs/10 §2 (`enum Role`);
+//! docs/questions/Q-351 (A-87).
 
 mod samples;
 
@@ -15,11 +19,13 @@ use ipc::{
     decode_body, decode_reply, encode_frame, reply_round_trip_is_canonical,
     round_trip_is_canonical, Direction, Reply, REFUSED_KIND,
 };
-use ipc_keyd::channel::{reply_kind, request_kind};
+use ipc_keyd::channel::{reply_kind, request_kind, MAX_ENCTYPES, MAX_REPLY_BODY, MAX_REPLY_FIELD};
+use ipc_keyd::wire::WireConfigDescription;
 use ipc_keyd::{
-    decode_request, encode_answer, Answer, Call, KeydReply, KeydRequest, Rejection, KEYD_CHANNEL,
-    KEYD_MAGIC, KEYD_VERSION,
+    decode_request, encode_answer, Answer, Call, DescribedConfig, KeydReply, KeydRequest,
+    Rejection, KEYD_CHANNEL, KEYD_MAGIC, KEYD_VERSION,
 };
+use keyd_types::{EncTypeId, Operation, Role, TicketPolicy};
 use std::collections::BTreeSet;
 
 /// The request frame body of a call.
@@ -307,25 +313,73 @@ fn code_identifiers(source: &str) -> Vec<String> {
         .collect()
 }
 
-/// R50-5 / A-56 ("`now` does not cross the wire") and R50-3 (the role comes
-/// only from the transport), checked on the source of the message
-/// definitions: no identifier `now`, `role` or `caller` occurs in the code
-/// of `wire.rs` (the only definitions of what is encoded), and every time
-/// field encoded is a ticket fact or a template time — never a value
-/// handed to keyd as its `now`. The type-level argument: `dispatch` and
-/// `execute` take `now` as a parameter and build every keyd call from it;
-/// `Call` (what a request decodes to) has no time field outside templates,
-/// proofs and contexts.
+/// R50-5 / A-56 ("`now` does not cross the wire") and R50-3 (the role keyd
+/// authorizes with comes only from the transport), checked on the source of
+/// the message definitions (`wire.rs`, the only definitions of what is
+/// encoded):
+///
+/// * no identifier `now`, `CallerId` or `KerberosTime` in its code;
+/// * no identifier naming a role or a caller in the field helpers and the
+///   requests (from the field helpers to the replies section) — no request
+///   can carry a role;
+/// * among the replies, role identifiers only for the caller role of the
+///   `DescribeConfig` reply (Q-351, A-87): exactly one field names a role in
+///   the whole file, `pub caller_role: Role`, and it is
+///   `WireConfigDescription`'s;
+///
+/// and every time field encoded is a ticket fact or a template time — never
+/// a value handed to keyd as its `now`. The type-level argument: `dispatch`
+/// and `execute` take `now` as a parameter and build every keyd call from
+/// it; `Call` (what a request decodes to) has no time field outside
+/// templates, proofs and contexts, and no role field at all.
 #[test]
-fn no_now_and_no_role_on_the_wire() {
+fn no_now_on_the_wire_and_no_role_in_any_request() {
     let wire = include_str!("../src/wire.rs");
     let identifiers = code_identifiers(wire);
-    for forbidden in ["now", "role", "caller", "Role", "CallerId", "KerberosTime"] {
+    for forbidden in ["now", "CallerId", "KerberosTime"] {
         assert!(
             !identifiers.iter().any(|i| i == forbidden),
             "`{forbidden}` in wire.rs"
         );
     }
+    let (_imports, rest) = wire
+        .split_once("// Field helpers")
+        .expect("the field helpers section");
+    let (requests, replies) = rest.split_once("// Replies.").expect("the replies section");
+    for identifier in code_identifiers(requests) {
+        let lower = identifier.to_ascii_lowercase();
+        assert!(
+            !lower.contains("role") && !lower.contains("caller"),
+            "`{identifier}` among the field helpers or requests of wire.rs"
+        );
+    }
+    for identifier in code_identifiers(replies) {
+        let lower = identifier.to_ascii_lowercase();
+        if lower.contains("role") || lower.contains("caller") {
+            assert!(
+                [
+                    "Role",
+                    "role",
+                    "caller_role",
+                    "caller_role_code",
+                    "caller_role_from_code"
+                ]
+                .contains(&identifier.as_str()),
+                "`{identifier}` among the replies of wire.rs"
+            );
+        }
+    }
+    let role_fields: Vec<&str> = wire
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("pub ") && line.to_ascii_lowercase().contains("role"))
+        .collect();
+    assert_eq!(role_fields, ["pub caller_role: Role,"]);
+    let start = replies
+        .find("pub struct WireConfigDescription {")
+        .expect("the DescribeConfig reply");
+    let end = replies[start..].find("\n}").expect("its end") + start;
+    assert!(replies[start..end].contains("pub caller_role: Role,"));
     let allowed = [
         "authtime",
         "starttime",
@@ -353,4 +407,136 @@ fn no_now_and_no_role_on_the_wire() {
     let server = include_str!("../../ipc-keyd-server/src/lib.rs");
     assert!(server.contains("caller: CallerId,\n    now: KerberosTime,\n    request_body: &[u8],"));
     assert!(server.contains("caller: CallerId,\n    now: KerberosTime,\n    call: Call,"));
+}
+
+// ---- the caller role of the DescribeConfig reply (Q-351, A-87) ----------------------
+
+/// The closed table of the caller role, as wire.rs documents it (a project
+/// choice: keyd-types' order, from 0x01).
+const ROLE_CODES: [(Role, u8); 4] = [
+    (Role::Kdc, 0x01),
+    (Role::Directory, 0x02),
+    (Role::Admin, 0x03),
+    (Role::Ldap, 0x04),
+];
+
+/// The reply body of a described configuration for a caller of `role`.
+fn described_body(role: Role) -> Vec<u8> {
+    reply_body(&Answer::DescribeConfig(Ok(samples::described(true, role))))
+}
+
+/// docs/50 §3.3 (round trip; "enum = `u8` from a closed table"; nothing
+/// after the last field), §3.4; docs/10 §2; Q-351 (A-87: the reply carries
+/// the caller's role): the role is the reply's last octet, one code per
+/// role; only that octet differs between the roles; each body decodes to
+/// the description and that role, and re-encodes to itself.
+#[test]
+fn the_describe_config_reply_carries_each_caller_role() {
+    let kdc = described_body(Role::Kdc);
+    for (role, code) in ROLE_CODES {
+        let body = described_body(role);
+        assert_eq!(body.last(), Some(&code), "{role:?}");
+        assert_eq!(body[..body.len() - 1], kdc[..kdc.len() - 1], "{role:?}");
+        assert_eq!(
+            reply_round_trip_is_canonical::<KeydReply>(KEYD_CHANNEL, &body),
+            Ok(true)
+        );
+        let Ok(Reply::Message(reply)) = decode_reply::<KeydReply>(KEYD_CHANNEL, &body) else {
+            panic!("a reply message ({role:?})");
+        };
+        let typed = Answer::from_wire(Operation::DescribeConfig, reply).expect("typed");
+        assert_eq!(
+            typed,
+            Answer::DescribeConfig(Ok(DescribedConfig {
+                description: samples::description(true),
+                caller_role: role,
+            }))
+        );
+        assert_eq!(reply_body(&typed), body, "canonical ({role:?})");
+    }
+}
+
+/// docs/50 §3.3 ("enum = `u8` from a closed table"; "after the last field —
+/// exactly the end of the body"); docs/07 §5 via §3.3 (replies decoded with
+/// the same strictness); Q-351 (A-87): every caller-role octet outside the
+/// table is refused (`UnknownCode`), as is a reply without the role octet
+/// (`Truncated`) or with an octet after it (`TrailingBytes`) — the client
+/// never takes a reply it cannot read as a role.
+#[test]
+fn an_unknown_caller_role_is_refused() {
+    let body = described_body(Role::Kdc);
+    let last = body.len() - 1;
+    for code in 0..=u8::MAX {
+        let mut mutated = body.clone();
+        mutated[last] = code;
+        let decoded = decode_reply::<KeydReply>(KEYD_CHANNEL, &mutated);
+        if ROLE_CODES.iter().any(|(_, known)| *known == code) {
+            assert!(matches!(decoded, Ok(Reply::Message(_))), "{code:#04x}");
+        } else {
+            assert!(
+                matches!(decoded, Err(ipc::Error::UnknownCode)),
+                "{code:#04x}: {decoded:?}"
+            );
+        }
+    }
+    assert!(matches!(
+        decode_reply::<KeydReply>(KEYD_CHANNEL, &body[..last]),
+        Err(ipc::Error::Truncated)
+    ));
+    let mut extended = body.clone();
+    extended.push(0x01);
+    assert!(matches!(
+        decode_reply::<KeydReply>(KEYD_CHANNEL, &extended),
+        Err(ipc::Error::TrailingBytes)
+    ));
+}
+
+/// docs/50 §3.3 (bound before allocation; `bytes<max>` and `seq<T,max>` over
+/// their bound refused; the reply bound ≥ every reply): the largest
+/// `DescribeConfig` reply — a realm of `MAX_REPLY_FIELD` octets, the
+/// `MAX_ENCTYPES` encryption types, the s2kparams and the caller role —
+/// encodes within `MAX_REPLY_BODY` and round-trips; one realm octet or one
+/// encryption type more is refused when encoding, and a declared count over
+/// `MAX_ENCTYPES` when decoding.
+#[test]
+fn the_describe_config_reply_is_bounded() {
+    let largest = |realm_len: usize, enctypes: usize| {
+        KeydReply::DescribeConfig(WireConfigDescription {
+            realm: vec![b'A'; realm_len],
+            enctypes: vec![EncTypeId::Aes256CtsHmacSha196; enctypes],
+            clock_skew_secs: u32::MAX,
+            token_lifetime_secs: u32::MAX,
+            ticket_policy: TicketPolicy::default(),
+            s2k_params: Some([0xFF; 4]),
+            caller_role: Role::Ldap,
+        })
+    };
+    let field = MAX_REPLY_FIELD as usize;
+    let count = MAX_ENCTYPES as usize;
+    let reply = largest(field, count);
+    let frame = encode_frame(KEYD_CHANNEL, Direction::Reply, &reply).expect("within bounds");
+    assert!(frame.body().len() <= MAX_REPLY_BODY as usize);
+    let Ok(Reply::Message(decoded)) = decode_reply::<KeydReply>(KEYD_CHANNEL, frame.body()) else {
+        panic!("the largest reply decodes");
+    };
+    assert_eq!(decoded, reply);
+    assert!(matches!(
+        encode_frame(KEYD_CHANNEL, Direction::Reply, &largest(field + 1, count)),
+        Err(ipc::Error::LengthOverBound)
+    ));
+    assert!(matches!(
+        encode_frame(KEYD_CHANNEL, Direction::Reply, &largest(4, count + 1)),
+        Err(ipc::Error::CountOverBound)
+    ));
+    // A peer declaring one encryption type more than the bound: envelope (4)
+    // ‖ realm length (4) ‖ realm (4) ‖ the count (u32), then the codes.
+    let small = encode_frame(KEYD_CHANNEL, Direction::Reply, &largest(4, count)).unwrap();
+    let mut body = small.body().to_vec();
+    assert_eq!(body[12..16], (MAX_ENCTYPES).to_be_bytes());
+    body[12..16].copy_from_slice(&(MAX_ENCTYPES + 1).to_be_bytes());
+    body.insert(16, body[16]);
+    assert!(matches!(
+        decode_reply::<KeydReply>(KEYD_CHANNEL, &body),
+        Err(ipc::Error::CountOverBound)
+    ));
 }

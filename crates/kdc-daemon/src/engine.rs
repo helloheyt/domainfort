@@ -11,7 +11,8 @@
 //! 1. the snapshot of the loaded policy (`policy_store`; a refused policy
 //!    cannot reach here — it was refused at load);
 //! 2. keyd: `IpcKeyd::connect` through the connector — the server uid
-//!    checked before anything is sent (R50-3), then `DescribeConfig`;
+//!    checked before anything is sent (R50-3), then `DescribeConfig`, whose
+//!    caller role must be `Kdc` (Q-351);
 //! 3. dird: `DirectoryClient` (server uid checked, R50-3) →
 //!    `DescribeDomain` → the realm and the krbtgt handle (§3.4, §7.5);
 //! 4. **the policy version**: dird's must equal the version of the policy
@@ -22,19 +23,24 @@
 //!
 //! Only then does the daemon bind its listeners to the runtime and serve.
 //!
-//! # Every new connection repeats the start checks (Q-311)
+//! # Every new connection repeats the start checks (Q-311, Q-351)
 //!
-//! The keyd description (`IpcKeyd::connect`) and the domain description
-//! (`DirectoryClient::require_domain`) the engine started from are required
-//! of **every new connection** the clients open later — after keyd or dird
-//! was restarted, say — before anything else is sent on it: keyd's
-//! `DescribeConfig` (callable only by the Kdc and Ldap roles) must answer
-//! the same description, dird's `DescribeDomain` the same realm, naming
-//! context, krbtgt handle and policy version. A mismatch drops that
+//! The keyd description and caller role (`IpcKeyd::connect`) and the
+//! domain description (`DirectoryClient::require_domain`) the engine started
+//! from are required of **every new connection** the clients open later —
+//! after keyd or dird was restarted, say — before anything else is sent on
+//! it: keyd's `DescribeConfig` (callable only by the Kdc and Ldap roles)
+//! must answer the same description and name the caller role keyd resolved
+//! for the kdc's uid as `Kdc` (so the Ldap role is refused too), dird's
+//! `DescribeDomain` the same realm, naming context, krbtgt handle and
+//! policy version. A mismatch drops that
 //! connection and the request is answered as for an unavailable keyd or
 //! directory: KDC_ERR_SVC_UNAVAILABLE (29) over TCP, silence over UDP — so a
 //! keyd that now maps this uid to another role never reaches the client as
-//! keyd's uniform `Denied` (a wrong password, 24). Both clients also check
+//! keyd's uniform `Denied` (a wrong password, 24). A request that failed
+//! after it was sent is 29 too, whatever the keyd client knows of its fate
+//! (docs/questions/Q-367, A-88: issuance is not a key-state change, nothing
+//! was handed out). Both clients also check
 //! a held connection before reusing it (crates/ipc-keyd, crates/
 //! ipc-directory; Q-312), so the first request after such a restart is
 //! decided by the new process.

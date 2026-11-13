@@ -8,8 +8,12 @@
 //! (docs/10 §7, I1). Every identifier printed was validated by the manifest
 //! parser to be printable ASCII of a narrow alphabet.
 //!
+//! A call keyd did not answer is reported as the ipc-keyd client classed
+//! it: nothing was sent, keyd did not perform it, or its outcome is unknown
+//! (docs/questions/Q-367, A-88).
+//!
 //! Spec: docs/51 §6; docs/10 §7, §9, §10; docs/50 §8.2 (fixed messages, no
-//! request octets); AGENTS.md §6.
+//! request octets); AGENTS.md §6; docs/questions/Q-367 (A-88).
 
 use crate::ceremony::{CeremonyReport, NotSent, Outcome, Step, Unknown};
 use ipc::Refused;
@@ -42,6 +46,7 @@ pub fn exit_code(report: &CeremonyReport) -> u8 {
 }
 
 /// Why nothing was sent, as a fixed text.
+/// Spec: docs/50 R50-3, §3.6; docs/questions/Q-367 (A-88: not sent).
 const fn not_sent_text(reason: NotSent) -> &'static str {
     match reason {
         NotSent::PeerMismatch => {
@@ -51,28 +56,36 @@ const fn not_sent_text(reason: NotSent) -> &'static str {
         NotSent::PeerCredentials => {
             "the keyd socket's peer credentials could not be read; keyadm runs on Linux only (nothing was sent)"
         }
+        NotSent::Transport(TransportError::DeadlineExceeded) => {
+            "the deadline passed before the request was sent (nothing was sent)"
+        }
+        NotSent::Transport(_) => {
+            "the connection to keyd failed before the request was sent (nothing was sent)"
+        }
         NotSent::Unencodable => "the request could not be encoded (nothing was sent)",
     }
 }
 
-/// Why keyd did not run a request, as a fixed text.
-const fn not_run_text(refused: Refused) -> &'static str {
+/// Why keyd did not perform a request, as a fixed text.
+/// Spec: docs/10 §10 (A-88: keyd's `Unavailable` on a key-state change
+/// means "not performed"); docs/questions/Q-365 item 7, Q-367.
+const fn not_performed_text(refused: Refused) -> &'static str {
     match refused {
-        Refused::Busy => "keyd is busy or cannot reach auditd (request not run)",
-        Refused::Malformed => "keyd refused the request as malformed (request not run)",
-        Refused::VersionMismatch => "keyd speaks another channel version (request not run)",
-        Refused::Unavailable => "keyd is unavailable",
+        Refused::Busy => "keyd is busy or cannot reach auditd (not performed)",
+        Refused::Malformed => "keyd refused the request as malformed (not performed)",
+        Refused::VersionMismatch => "keyd speaks another channel version (not performed)",
+        Refused::Unavailable => "keyd answered unavailable (not performed)",
     }
 }
 
 /// Why an outcome is unknown, as a fixed text.
+/// Spec: docs/50 §3.6, §3.7; docs/questions/Q-367 (A-88: outcome unknown).
 const fn unknown_text(reason: Unknown) -> &'static str {
     match reason {
         Unknown::Transport(TransportError::Closed) => "keyd closed the connection",
         Unknown::Transport(TransportError::DeadlineExceeded) => "keyd did not answer in time",
         Unknown::Transport(TransportError::Framing) => "keyd's reply did not frame",
         Unknown::Transport(_) => "the connection to keyd failed",
-        Unknown::RefusedUnavailable => "keyd answered unavailable",
         Unknown::MalformedReply | Unknown::UnexpectedReply => "keyd's reply could not be read",
     }
 }
@@ -114,9 +127,9 @@ pub fn render(report: &CeremonyReport, manifest: &Manifest) -> Vec<String> {
             keyd_error_text(error)
         ),
         Outcome::NotSent(reason) => format!("contact failed: {}", not_sent_text(reason)),
-        Outcome::NotRun(refused) => format!(
+        Outcome::NotPerformed(refused) => format!(
             "contact failed: {}; no key set was touched",
-            not_run_text(refused)
+            not_performed_text(refused)
         ),
         Outcome::Unknown(Unknown::Transport(TransportError::Closed)) => {
             "contact failed: keyd closed the connection (is this account mapped to Admin in keyd's uid_roles?); no key set was touched".to_owned()
@@ -139,11 +152,14 @@ pub fn render(report: &CeremonyReport, manifest: &Manifest) -> Vec<String> {
             Outcome::NotSent(reason) => {
                 format!("{label}: {}; not created: {ids}", not_sent_text(reason))
             }
-            Outcome::NotRun(refused) => {
-                format!("{label}: {}; not created: {ids}", not_run_text(refused))
+            Outcome::NotPerformed(refused) => {
+                format!(
+                    "{label}: {}; not created: {ids}",
+                    not_performed_text(refused)
+                )
             }
             Outcome::Unknown(reason) => format!(
-                "{label}: {}; the key set MAY have been created: {ids}",
+                "{label}: {} after the request was sent; outcome unknown, the key set MAY have been created: {ids}",
                 unknown_text(reason)
             ),
         });
@@ -177,6 +193,15 @@ pub fn render(report: &CeremonyReport, manifest: &Manifest) -> Vec<String> {
     {
         lines.push(
             "keyd answers one uniform \"denied\" (docs/10 9): the key set may already exist, this account may not hold Role::Admin, or keyd refused the binding; keyd's audit record names the reason".to_owned(),
+        );
+    }
+    if report
+        .steps
+        .iter()
+        .any(|step| step.outcome.outcome_unknown())
+    {
+        lines.push(
+            "outcome unknown: the request reached keyd but its answer did not come back; check keyd's audit log before anything else - it holds the create_key intent and its outcome (docs/10 10, A-88)".to_owned(),
         );
     }
     lines.push(

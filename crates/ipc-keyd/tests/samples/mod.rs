@@ -9,12 +9,12 @@
 //! tests; no vector comes from any other implementation.
 #![allow(dead_code)] // each test binary uses a different subset
 
-use ipc_keyd::{Answer, Call, Password, TgsFast};
+use ipc_keyd::{Answer, Call, DescribedConfig, Password, TgsFast};
 use keyd_types::{
     ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof, ConfigDescription, CtxId,
     DualControlToken, EncTypeId, ExchangeId, FastArmor, FastConversation, IssueError, KeyHandle,
-    KeyPurpose, Kvno, PrincipalBinding, PrincipalId, ServiceContext, ServiceCtxId, TgsRepParts,
-    TgsTicketTemplate, TgtContext, TicketPolicy,
+    KeyPurpose, Kvno, PrincipalBinding, PrincipalId, Role, ServiceContext, ServiceCtxId,
+    TgsRepParts, TgsTicketTemplate, TgtContext, TicketPolicy,
 };
 use krb_proto::{
     ApOptions, ApReq, Checksum, EncryptedData, FastOptions, KdcOptions, KdcReqBody, KerberosString,
@@ -305,6 +305,18 @@ pub fn description(s2k: bool) -> ConfigDescription {
     }
 }
 
+/// Every caller role of keyd-types (docs/10 §2, the phase-1 variants).
+pub const ROLES: [Role; 4] = [Role::Kdc, Role::Directory, Role::Admin, Role::Ldap];
+
+/// keyd's `DescribeConfig` result for a caller keyd resolved to `role`
+/// (docs/questions/Q-351, A-87).
+pub fn described(s2k: bool, role: Role) -> DescribedConfig {
+    DescribedConfig {
+        description: description(s2k),
+        caller_role: role,
+    }
+}
+
 pub fn tgt_context(fast: bool) -> TgtContext {
     TgtContext {
         ctx_id: CtxId::from_bytes([0xC4; 16]),
@@ -365,10 +377,15 @@ pub fn answers() -> Vec<Answer> {
         Answer::RotateKrbtgt(Ok(Kvno::new(u32::MAX))),
         Answer::RetireKvno(Ok(())),
         Answer::DestroyKeySet(Ok(())),
-        Answer::DescribeConfig(Ok(description(true))),
-        Answer::DescribeConfig(Ok(description(false))),
+        Answer::DescribeConfig(Ok(described(false, Role::Kdc))),
         Answer::Ping(Ok(())),
     ];
+    // The caller role of the DescribeConfig reply: every value of the closed
+    // table (Q-351, A-87) — the codec carries any role; keyd answers only
+    // Kdc and Ldap callers (docs/10 §2).
+    for role in ROLES {
+        answers.push(Answer::DescribeConfig(Ok(described(true, role))));
+    }
     for error in [
         AuthnError::Denied,
         AuthnError::TicketExpired,

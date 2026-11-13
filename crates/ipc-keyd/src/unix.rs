@@ -12,7 +12,11 @@
 //!   current frame still needs, the declared length checked against the
 //!   reply bound before the body is awaited — all within the deadline; the
 //!   socket read / write timeouts are set to the time remaining before each
-//!   step.
+//!   step. Where the platform refuses a read timeout because keyd already
+//!   closed its end (it does after a refusal), what keyd wrote is read
+//!   without blocking, and nothing left is the end of the stream — so a
+//!   refusal is not lost (as crates/ipc-ldap unix.rs; docs/questions/Q-350
+//!   item 14, Q-367).
 //! * Before a held connection is reused, [`Connection::check_idle`] looks at
 //!   it without blocking: the stream is put in non-blocking mode and one
 //!   read of at most one octet is tried — end of stream (`Ok(0)`) is
@@ -191,15 +195,31 @@ impl Connection for UnixConnection {
                 reader.reset();
                 return Ok(reply);
             }
-            self.stream
+            // Some platforms refuse to set a socket timeout once the peer
+            // has closed its end — keyd closes after a refusal
+            // (`Refused::Unavailable`, which since A-88 means "not
+            // performed" for a key-state change). The octets it wrote before
+            // closing are still readable without waiting: read them without
+            // blocking; nothing there is the end of the stream. (The same
+            // rule as crates/ipc-ldap unix.rs; docs/questions/Q-350 item 14.)
+            let timed = self
+                .stream
                 .set_read_timeout(Some(remaining(start, deadline)?))
-                .map_err(|e| io_error(e.kind()))?;
+                .is_ok();
+            if !timed {
+                self.stream
+                    .set_nonblocking(true)
+                    .map_err(|e| io_error(e.kind()))?;
+            }
             let wanted = reader.wanted().min(READ_CHUNK);
             let buffer = chunk.get_mut(..wanted).ok_or(TransportError::Framing)?;
             let read = match self.stream.read(buffer) {
                 Ok(0) => return Err(TransportError::Closed),
                 Ok(read) => read,
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) if !timed && e.kind() == ErrorKind::WouldBlock => {
+                    return Err(TransportError::Closed)
+                }
                 Err(e) => return Err(io_error(e.kind())),
             };
             let received = buffer.get(..read).ok_or(TransportError::Framing)?;

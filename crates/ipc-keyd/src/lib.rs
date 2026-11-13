@@ -14,7 +14,7 @@
 //! | wire | [`wire`] | fixed-order fields through `ipc` (lengths, markers, closed enum tables, no trailing octet); Kerberos values stay opaque DER |
 //! | typed | [`typed`] | every Kerberos value through `krb-proto`'s strict decoder; passwords and salt as UTF-8 |
 //! | server | [`server`] | [`decode_request`] / [`encode_answer`]; `ipc_keyd_server::dispatch` calls keyd with the **transport's** caller and the **daemon's** clock between them |
-//! | client | [`client`] | [`KeydClient`] / [`IpcKeyd`]: server-uid check, deadline, strict reply decoding, transport failure → `Unavailable`; a held connection checked before reuse, no resend (Q-312); `IpcKeyd`: `DescribeConfig` required of every new connection (Q-311) |
+//! | client | [`client`] | [`KeydClient`] / [`IpcKeyd`]: server-uid check, deadline, strict reply decoding, transport failure → `Unavailable`; a held connection checked before reuse, no resend (Q-312); `IpcKeyd`: `DescribeConfig` — the same description and the caller role `Kdc` — required of every new connection (Q-311, Q-351); [`KeydClient::call_with_fate`]: not sent / not performed / outcome unknown (Q-367) |
 //! | socket | `unix` | [`UnixConnector`]: blocking Unix stream, peer uid via rustix (Linux; elsewhere fail closed), non-blocking idle check |
 //!
 //! # Message kinds
@@ -35,15 +35,17 @@
 //! | `0x0C` | `rotate_krbtgt` | Admin | `0x8C` `Kvno` | `0xF3` |
 //! | `0x0D` | `retire_kvno` | Admin | `0x8D` `()` | `0xF3` |
 //! | `0x0E` | `destroy_key_set` | Admin | `0x8E` `()` | `0xF3` |
-//! | `0x0F` | `describe_config` | Kdc, Ldap | `0x8F` `ConfigDescription` | `0xF3` |
+//! | `0x0F` | `describe_config` | Kdc, Ldap | `0x8F` `ConfigDescription` ‖ caller `Role` ([`DescribedConfig`]) | `0xF3` |
 //! | `0x10` | `ping` | every role | `0x90` `()` | `0xF3` |
 //! | — | (any) | — | `0xFF` shared `Refused` (A-59) | — |
 //!
-//! Roles are **not** on the wire: keyd checks the caller's role from the
+//! No request carries a role: keyd checks the caller's role from the
 //! connection's peer credentials (docs/50 §3.2) against its compile-time
-//! capability table (docs/10 §2, I2). No message has a role field and no
-//! message has a `now` field (R50-5, A-56): the server passes the daemon's
-//! own clock to every operation.
+//! capability table (docs/10 §2, I2). The `describe_config` reply reports
+//! that role back to the caller — not secret, never taken from the peer —
+//! so that a client can refuse a keyd that does not give it its own role
+//! (docs/questions/Q-351, A-87). No message has a `now` field (R50-5,
+//! A-56): the server passes the daemon's own clock to every operation.
 //!
 //! # Security
 //!
@@ -64,10 +66,13 @@
 //! docs.rs API pages of rustix 1.1.6 and zeroize 1.9.1 (P-2). The wire layout
 //! and every name come from docs/50 §3.3-§3.4 and keyd's API. No other
 //! implementation, serializer or RPC framework was consulted or recalled
-//! (AGENTS.md §1-3).
+//! (AGENTS.md §1-3). Task F3 added the caller role of the `describe_config`
+//! reply and the client's request fate from docs/questions Q-351, Q-365,
+//! Q-367 and PENDING-OWNER A-87, A-88, with docs/10 §2, §7א, §9, §10 and
+//! docs/50 §3.4-§3.7.
 //!
 //! Spec: docs/50 §3, §10 (P5); R50-3, R50-4, R50-5, R50-7, R50-8; docs/10;
-//! A-56; A-59; A-62; D182; A-63.
+//! A-56; A-59; A-62; D182; A-63; A-87; A-88.
 
 pub mod channel;
 pub mod client;
@@ -79,11 +84,11 @@ pub mod wire;
 
 pub use channel::{KEYD_CHANNEL, KEYD_MAGIC, KEYD_VERSION, REPLY_LIMIT, REQUEST_LIMIT};
 pub use client::{
-    ClientConfigError, Connection, Connector, IpcKeyd, KeydClient, TransportError, Unserved,
-    DEFAULT_DEADLINE,
+    CallFailure, ClientConfigError, Connection, Connector, IpcKeyd, KeydClient, RequestFate,
+    TransportError, Unserved, DEFAULT_DEADLINE,
 };
 pub use server::{decode_request, encode_answer, Rejection};
-pub use typed::{Answer, Call, ConversionError, Password, TgsFast};
+pub use typed::{Answer, Call, ConversionError, DescribedConfig, Password, TgsFast};
 #[cfg(unix)]
 pub use unix::{UnixConnection, UnixConnector};
 pub use wire::{KeydReply, KeydRequest, WireTime};

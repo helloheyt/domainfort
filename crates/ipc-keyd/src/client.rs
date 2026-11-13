@@ -29,31 +29,52 @@
 //! the next call starts over (a keyd operation may already have run — a
 //! consumed one-time token cannot be presented again).
 //!
-//! # Each new connection is checked with `DescribeConfig` (Q-311)
+//! # Each new connection is checked with `DescribeConfig` (Q-311, Q-351)
 //!
-//! With [`KeydClient::require_description`] (set by [`IpcKeyd::connect`]),
+//! With [`KeydClient::require_description`] and
+//! [`KeydClient::require_caller_role`] (both set by [`IpcKeyd::connect`]),
 //! every new connection, after its peer uid and before any other request,
 //! carries a `DescribeConfig` whose answer must be exactly the description
-//! the client was built with. Only the Kdc and Ldap roles may call it
-//! (docs/10 §2), so a keyd restarted with this uid mapped to another role —
-//! or serving another realm — is found here; the connection is dropped and
+//! the client was built with **and** name the caller role the client
+//! expects — the role keyd resolved for this process from its peer uid
+//! ([`DescribedConfig`]). Only the Kdc and Ldap roles may call
+//! `DescribeConfig` (docs/10 §2): a keyd restarted with this uid mapped to
+//! Directory or Admin refuses it, one that maps it to the other of Kdc and
+//! Ldap answers it with that role, and one serving another realm answers
+//! another description — each is found here; the connection is dropped and
 //! the call is not served (`Unavailable`, the KDC's 29), instead of reaching
 //! an operation whose uniform `Denied` the KDC would report as a wrong
-//! password (24). Residual: Kdc and Ldap are not told apart this way
-//! (docs/questions/Q-351).
+//! password (24).
 //!
 //! # Keyd did not serve the call → `Unavailable`, never `Denied`
 //!
-//! | what happened | the caller sees |
-//! |---|---|
-//! | connect failed, I/O error, peer closed, deadline exceeded | `Unavailable` |
-//! | peer uid unreadable or not keyd's | `Unavailable` (nothing was sent) |
-//! | the new connection's `DescribeConfig` refused or different (when required) | `Unavailable` (only `DescribeConfig` was sent) |
-//! | `Refused::Busy` / `Refused::Unavailable` | `Unavailable` |
-//! | `Refused::Malformed` / `Refused::VersionMismatch` | `Unavailable` |
-//! | a reply that does not decode, or belongs to another operation | `Unavailable` |
-//! | the call could not be encoded | `Unavailable` (nothing was sent) |
-//! | keyd's own answer | exactly keyd's answer (A-26 classes, keyd's `Unavailable`) |
+//! | what happened | the caller sees | [`RequestFate`] ([`KeydClient::call_with_fate`]) |
+//! |---|---|---|
+//! | connect failed, peer credentials unreadable, peer uid not keyd's | `Unavailable` | not sent |
+//! | the new connection's `DescribeConfig` failed, refused, different, or of another caller role (when required) | `Unavailable` (only `DescribeConfig` was sent) | not sent |
+//! | the deadline passed before the request was written | `Unavailable` | not sent |
+//! | the call could not be encoded | `Unavailable` | not sent |
+//! | `Refused::Busy` / `Unavailable` / `Malformed` / `VersionMismatch` | `Unavailable` | not performed |
+//! | after the request was handed to the connection: I/O error, peer closed, deadline exceeded, a reply that does not frame or decode, or belongs to another operation | `Unavailable` | **outcome unknown** |
+//! | keyd's own answer | exactly keyd's answer (A-26 classes, keyd's `Unavailable`) | — (answered) |
+//!
+//! # Not sent, not performed, outcome unknown (Q-367, A-88)
+//!
+//! For an issuing or verifying call every row above is the same to the
+//! caller: nothing was handed out, so the KDC answers 29 for each
+//! (issuance is not a state change). A key-state change (`set_secret`,
+//! `create_key`, `rotate_key`, `rotate_krbtgt`, `retire_kvno`,
+//! `destroy_key_set` — docs/10 §10) is different: keyd-daemon answers it
+//! with its shared `Refused` only when keyd did **not** perform it (A-88:
+//! the intent was not acknowledged in time, or auditd is away ⇒ `Busy`),
+//! while a request that was written and whose reply was lost or came after
+//! the client's own deadline may have been performed — inherent to request
+//! → reply with a deadline. [`KeydClient::call_with_fate`] reports which
+//! of the three it was ([`RequestFate`]): **not sent** (keyd cannot have
+//! run it), **not performed** (keyd refused it), **outcome unknown** (check
+//! before retrying — keyd's audit log holds the intent and the outcome).
+//! [`KeydClient::call`] and the typed methods keep reporting every case as
+//! before (`Unserved`, `Unavailable`).
 //!
 //! `Unavailable` is the `Unavailable` variant of the operation's own error
 //! type (`AuthnError`, `IssueError`, `keyd_types::Error`), which the KDC answers
@@ -75,12 +96,12 @@
 //!
 //! Spec: docs/50 §3.1-§3.7 (R50-3, R50-5, R50-7, R50-8), §7.5 step 4, §10
 //! (`ipc-keyd`: "a synchronous client implementing `kdc::KeyCustody`" — the
-//! trait is `keyd_types::KeyCustody` since D182 / A-63); docs/10 §2, §9;
-//! docs/questions/Q-217, Q-222 (A-56), Q-240 item 8 (A-62), Q-311, Q-312
-//! (A-82).
+//! trait is `keyd_types::KeyCustody` since D182 / A-63); docs/10 §2, §9,
+//! §10; docs/questions/Q-217, Q-222 (A-56), Q-240 item 8 (A-62), Q-311,
+//! Q-312 (A-82), Q-351 (A-87), Q-365, Q-367 (A-88).
 
 use crate::channel::{KEYD_CHANNEL, REPLY_LIMIT};
-use crate::typed::{Answer, Call, ConversionError, Password, TgsFast};
+use crate::typed::{Answer, Call, ConversionError, DescribedConfig, Password, TgsFast};
 use crate::wire::KeydReply;
 use core::fmt;
 use core::time::Duration;
@@ -88,7 +109,8 @@ use ipc::{decode_reply, encode_frame, Direction, FrameLimit, Refused, Reply};
 use keyd_types::{
     ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof, ConfigDescription, CtxId,
     DualControlToken, FastArmor, FastConversation, IssueError, KeyCustody, KeyHandle, Kvno,
-    PrincipalBinding, ServiceContext, TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext,
+    PrincipalBinding, Role, ServiceContext, TgsFastRequest, TgsRepParts, TgsTicketTemplate,
+    TgtContext,
 };
 use krb_proto::{ApReq, EncryptedData, KerberosTime, KrbError, KrbFastArmoredReq, PaData};
 use std::time::Instant;
@@ -190,6 +212,8 @@ pub trait Connector {
 
 /// Why keyd did not serve a call. Every case is reported to the caller as
 /// the `Unavailable` variant of the operation's error type (module docs).
+/// Whether the request was sent is not part of it: [`CallFailure`] adds
+/// that ([`KeydClient::call_with_fate`]).
 /// Spec: docs/50 §3.7 (R50-8); docs/questions/Q-245 item 4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unserved {
@@ -197,9 +221,11 @@ pub enum Unserved {
     Transport(TransportError),
     /// The peer is not the keyd this client was configured for: its uid is
     /// not keyd's (nothing was sent), or — when the client requires a
-    /// description ([`KeydClient::require_description`]) — the new
-    /// connection's `DescribeConfig` was refused or answered another
-    /// description (nothing else was sent; docs/questions/Q-311).
+    /// description ([`KeydClient::require_description`]) or its caller role
+    /// ([`KeydClient::require_caller_role`]) — the new connection's
+    /// `DescribeConfig` was refused, answered another description, or named
+    /// another caller role (nothing else was sent; docs/questions/Q-311,
+    /// Q-351).
     PeerMismatch,
     /// keyd answered with the shared transport refusal.
     Refused(Refused),
@@ -210,6 +236,82 @@ pub enum Unserved {
     UnexpectedReply(ConversionError),
     /// The call could not be encoded; nothing was sent.
     Unencodable,
+}
+
+/// What the client knows about the fate of a request keyd did not answer
+/// with a result (module documentation, "Not sent, not performed, outcome
+/// unknown").
+///
+/// Spec: docs/questions/Q-367 (A-88: "a client-side deadline or transport
+/// failure **after** the request was sent is reported as 'outcome unknown —
+/// check before retrying', distinct from keyd's own `Unavailable` (= not
+/// performed)"); docs/10 §10 (the audit order of a key-state change);
+/// docs/50 §3.6, §3.7.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestFate {
+    /// The request never left this process: it could not be encoded, the
+    /// connection could not be opened, the peer is not the keyd configured
+    /// (its uid, or its `DescribeConfig` when required — only that was
+    /// sent), or the deadline passed before the request was written. keyd
+    /// cannot have run it.
+    NotSent,
+    /// keyd answered the request with the shared transport refusal (`Busy`,
+    /// `Unavailable`, `Malformed`, `VersionMismatch`). For a key-state change
+    /// this means keyd did **not** perform it (A-88: keyd-daemon refuses one
+    /// only before keyd runs it). For any other operation keyd delivered no
+    /// result — nothing was issued (A-57) — though its bookkeeping (a
+    /// throttle count, a consumed one-time token) may have moved.
+    NotPerformed,
+    /// The request was handed to the connection — written, or its writing
+    /// began — and no usable reply came: the peer closed, the deadline
+    /// passed, an I/O error, a reply that did not frame or decode, or one of
+    /// another operation. keyd may or may not have performed it: **check
+    /// before retrying** (keyd's audit log holds the intent and outcome of
+    /// every key-state change; a blind retry of `create_key` is refused, of
+    /// `set_secret` installs the next kvno, of `rotate_key` rotates once
+    /// more).
+    OutcomeUnknown,
+}
+
+impl fmt::Display for RequestFate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            RequestFate::NotSent => "not sent",
+            RequestFate::NotPerformed => "not performed",
+            RequestFate::OutcomeUnknown => "outcome unknown - check before retrying",
+        })
+    }
+}
+
+/// A call that did not end in keyd's answer: why ([`Unserved`], as
+/// [`KeydClient::call`] reports it) and what is known of the request's fate
+/// ([`RequestFate`]). Carries no octet of the request or the reply.
+/// Spec: docs/questions/Q-367 (A-88); docs/50 §8.2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallFailure {
+    /// Why keyd did not serve the call.
+    pub unserved: Unserved,
+    /// Whether the request was sent, and if so whether keyd refused it.
+    pub fate: RequestFate,
+}
+
+impl CallFailure {
+    /// Nothing left this process. Spec: docs/questions/Q-367 (A-88).
+    const fn not_sent(unserved: Unserved) -> CallFailure {
+        CallFailure {
+            unserved,
+            fate: RequestFate::NotSent,
+        }
+    }
+
+    /// Handed to the connection, no usable reply.
+    /// Spec: docs/questions/Q-367 (A-88).
+    const fn outcome_unknown(unserved: Unserved) -> CallFailure {
+        CallFailure {
+            unserved,
+            fate: RequestFate::OutcomeUnknown,
+        }
+    }
 }
 
 /// The client was configured with an unacceptable keyd uid.
@@ -223,10 +325,19 @@ pub enum ClientConfigError {
 }
 
 /// A connection whose peer uid was checked against keyd's (and, when the
-/// client requires one, whose `DescribeConfig` answer matched).
+/// client requires a description or a caller role, whose `DescribeConfig`
+/// answer matched).
 struct Verified<C> {
     connection: C,
 }
+
+/// The caller role [`IpcKeyd`] requires keyd to resolve for this process:
+/// `IpcKeyd` is the `KeyCustody` of the kdc, whose operations are the Kdc
+/// role's row of the capability table.
+/// Spec: docs/10 §2 (Role `Kdc`); crates/keyd-types custody.rs
+/// (`KeyCustody`: "the `Kdc`-role operations"); docs/questions/Q-351 (A-87:
+/// "the kdc's client requires Role::Kdc").
+const KDC_CALLER_ROLE: Role = Role::Kdc;
 
 /// The time left of a call's `deadline` that started at `start`; none left
 /// is [`TransportError::DeadlineExceeded`].
@@ -240,15 +351,15 @@ fn remaining(start: Instant, deadline: Duration) -> Result<Duration, TransportEr
 }
 
 /// One `DescribeConfig` exchange on a new connection that carries nothing
-/// else yet: keyd's description, or why it was not given. keyd's own
-/// refusal (`Denied` for a role that may not call it, docs/10 §2) is
-/// [`Unserved::PeerMismatch`].
+/// else yet: keyd's description and the caller role it resolved, or why
+/// they were not given. keyd's own refusal (`Denied` for a role that may
+/// not call it, docs/10 §2) is [`Unserved::PeerMismatch`].
 /// Spec: docs/50 §3.3, §3.4 (`DescribeConfig` — Kdc, Ldap), §7.5 step 4;
-/// docs/questions/Q-311 (A-82).
+/// docs/questions/Q-311 (A-82), Q-351 (A-87).
 fn describe_on<K: Connection>(
     connection: &mut K,
     deadline: Duration,
-) -> Result<ConfigDescription, Unserved> {
+) -> Result<DescribedConfig, Unserved> {
     let call = Call::DescribeConfig;
     let request = call.to_wire().map_err(|_| Unserved::Unencodable)?;
     let frame = encode_frame(KEYD_CHANNEL, Direction::Request, &request)
@@ -259,7 +370,7 @@ fn describe_on<K: Connection>(
     match decode_reply::<KeydReply>(KEYD_CHANNEL, &body).map_err(Unserved::MalformedReply)? {
         Reply::Refused(refused) => Err(Unserved::Refused(refused)),
         Reply::Message(reply) => match Answer::from_wire(call.operation(), reply) {
-            Ok(Answer::DescribeConfig(Ok(description))) => Ok(description),
+            Ok(Answer::DescribeConfig(Ok(described))) => Ok(described),
             Ok(Answer::DescribeConfig(Err(_))) => Err(Unserved::PeerMismatch),
             Ok(_) => Err(Unserved::UnexpectedReply(ConversionError::UnexpectedReply)),
             Err(error) => Err(Unserved::UnexpectedReply(error)),
@@ -271,7 +382,7 @@ fn describe_on<K: Connection>(
 /// with the caller identity keyd derives from this process's credentials.
 ///
 /// Spec: docs/50 §3.2 (R50-3), §3.6 (R50-7), §3.7 (R50-8), §10;
-/// docs/questions/Q-311, Q-312 (A-82).
+/// docs/questions/Q-311, Q-312 (A-82), Q-351 (A-87), Q-367 (A-88).
 pub struct KeydClient<C: Connector> {
     connector: C,
     expected_uid: u32,
@@ -280,6 +391,9 @@ pub struct KeydClient<C: Connector> {
     /// When set, every new connection's `DescribeConfig` must answer
     /// exactly this (Q-311).
     description: Option<ConfigDescription>,
+    /// When set, every new connection's `DescribeConfig` must name this
+    /// caller role (Q-351).
+    caller_role: Option<Role>,
 }
 
 impl<C: Connector> fmt::Debug for KeydClient<C> {
@@ -289,6 +403,7 @@ impl<C: Connector> fmt::Debug for KeydClient<C> {
             .field("deadline", &self.deadline)
             .field("connected", &self.connection.is_some())
             .field("checks_description", &self.description.is_some())
+            .field("checks_caller_role", &self.caller_role)
             .finish()
     }
 }
@@ -311,6 +426,7 @@ impl<C: Connector> KeydClient<C> {
             deadline,
             connection: None,
             description: None,
+            caller_role: None,
         })
     }
 
@@ -341,10 +457,13 @@ impl<C: Connector> KeydClient<C> {
     /// carried a call.
     ///
     /// Only the Kdc and Ldap roles may call `DescribeConfig`; a client of
-    /// another role must not require a description.
+    /// another role must not require a description. A client that requires
+    /// a description also requires its own caller role
+    /// ([`KeydClient::require_caller_role`]): the description alone does not
+    /// tell the Kdc role from the Ldap role (docs/questions/Q-351).
     ///
     /// Spec: docs/50 R50-3, R50-8, §3.4, §7.5 step 4; docs/questions/Q-311
-    /// (A-82).
+    /// (A-82), Q-351 (A-87).
     pub fn require_description(&mut self, description: ConfigDescription) {
         self.description = Some(description);
     }
@@ -356,13 +475,41 @@ impl<C: Connector> KeydClient<C> {
         self.description.as_ref()
     }
 
+    /// Require every **new** connection — after its peer uid, before any
+    /// other request is sent on it — to answer `DescribeConfig` naming
+    /// `role` as the caller role keyd resolved for this process from its
+    /// peer uid ([`DescribedConfig::caller_role`]). Another role, keyd's
+    /// refusal, or any failure of that exchange drops the connection and the
+    /// call is not served ([`Unserved::PeerMismatch`] or the failure; the
+    /// caller sees `Unavailable`), exactly as for
+    /// [`KeydClient::require_description`], with which it shares the one
+    /// `DescribeConfig` of a new connection. The connection held now, if
+    /// any, is kept: it already carried a call.
+    ///
+    /// Only the Kdc and Ldap roles may call `DescribeConfig` (docs/10 §2):
+    /// requiring `Directory` or `Admin` would leave every new connection
+    /// refused, so a client of those roles requires no caller role.
+    ///
+    /// Spec: docs/50 R50-3, R50-8, §3.2, §3.4, §3.7; docs/10 §2;
+    /// docs/questions/Q-351 (A-87).
+    pub fn require_caller_role(&mut self, role: Role) {
+        self.caller_role = Some(role);
+    }
+
+    /// The caller role every new connection's `DescribeConfig` must name,
+    /// if required. Spec: docs/questions/Q-351 (A-87).
+    #[must_use]
+    pub fn required_caller_role(&self) -> Option<Role> {
+        self.caller_role
+    }
+
     /// The held connection if it is still usable, or a new one — its peer
     /// uid keyd's and, when required, its `DescribeConfig` answer the
-    /// expected description — before anything else is sent on it. A held
-    /// connection that fails its idle check is dropped here, before the
-    /// request is sent (nothing was sent on it in this call).
+    /// expected description and caller role — before anything else is sent
+    /// on it. A held connection that fails its idle check is dropped here,
+    /// before the request is sent (nothing was sent on it in this call).
     /// Spec: docs/50 R50-3, §3.2, §3.6, §3.7; docs/questions/Q-311, Q-312
-    /// (A-82).
+    /// (A-82), Q-351 (A-87).
     fn verified(&mut self, start: Instant) -> Result<&mut C::Connection, Unserved> {
         // Q-312: a held connection is checked before it is reused.
         let stale = match self.connection.as_mut() {
@@ -379,12 +526,20 @@ impl<C: Connector> KeydClient<C> {
                 // Dropped here: nothing was sent on it.
                 return Err(Unserved::PeerMismatch);
             }
-            if let Some(expected) = self.description.as_ref() {
-                // Q-311: the start-time check, repeated on this connection
-                // before anything else is sent on it. On any failure the
-                // connection is dropped here.
+            if self.description.is_some() || self.caller_role.is_some() {
+                // Q-311 / Q-351: the start-time check, repeated on this
+                // connection before anything else is sent on it. On any
+                // failure the connection is dropped here.
                 let left = remaining(start, self.deadline).map_err(Unserved::Transport)?;
-                if describe_on(&mut connection, left)? != *expected {
+                let described = describe_on(&mut connection, left)?;
+                let description_matches = self
+                    .description
+                    .as_ref()
+                    .is_none_or(|expected| described.description == *expected);
+                let role_matches = self
+                    .caller_role
+                    .is_none_or(|expected| described.caller_role == expected);
+                if !(description_matches && role_matches) {
                     return Err(Unserved::PeerMismatch);
                 }
             }
@@ -401,9 +556,27 @@ impl<C: Connector> KeydClient<C> {
     /// the call's operation. Any failure drops the connection; the call is
     /// never sent a second time (Q-312: it may already have run in keyd).
     ///
+    /// The failure does not say whether the request was sent; a caller that
+    /// must know — a key-state change — uses [`KeydClient::call_with_fate`].
+    ///
     /// Spec: docs/50 §3.3 (replies decoded with the same strictness), §3.6,
     /// §3.7, R50-7; docs/questions/Q-312 (A-82).
     pub fn call(&mut self, call: &Call) -> Result<Answer, Unserved> {
+        self.call_with_fate(call)
+            .map_err(|failure| failure.unserved)
+    }
+
+    /// [`KeydClient::call`], with the fate of a request keyd did not answer
+    /// ([`CallFailure`]): **not sent** (nothing left this process),
+    /// **not performed** (keyd refused it with the shared `Refused`), or
+    /// **outcome unknown** (handed to the connection, no usable reply —
+    /// check before retrying). keyd's own answer, its refusals included, is
+    /// `Ok` exactly as from `call`. Any failure drops the connection; the
+    /// call is never sent a second time.
+    ///
+    /// Spec: module documentation; docs/questions/Q-367 (A-88), Q-312
+    /// (A-82); docs/10 §10; docs/50 §3.6, §3.7, R50-7.
+    pub fn call_with_fate(&mut self, call: &Call) -> Result<Answer, CallFailure> {
         let result = self.call_inner(call);
         if result.is_err() {
             self.connection = None;
@@ -411,25 +584,36 @@ impl<C: Connector> KeydClient<C> {
         result
     }
 
-    fn call_inner(&mut self, call: &Call) -> Result<Answer, Unserved> {
+    fn call_inner(&mut self, call: &Call) -> Result<Answer, CallFailure> {
         let start = Instant::now();
         let operation = call.operation();
-        let request = call.to_wire().map_err(|_| Unserved::Unencodable)?;
+        let request = call
+            .to_wire()
+            .map_err(|_| CallFailure::not_sent(Unserved::Unencodable))?;
         let frame = encode_frame(KEYD_CHANNEL, Direction::Request, &request)
-            .map_err(|_| Unserved::Unencodable)?;
+            .map_err(|_| CallFailure::not_sent(Unserved::Unencodable))?;
         drop(request);
         let deadline = self.deadline;
-        let connection = self.verified(start)?;
-        let left = remaining(start, deadline).map_err(Unserved::Transport)?;
+        let connection = self.verified(start).map_err(CallFailure::not_sent)?;
+        let left = remaining(start, deadline)
+            .map_err(|error| CallFailure::not_sent(Unserved::Transport(error)))?;
+        // Q-367: from here on the request is in the connection's hands — any
+        // failure may come after keyd received it.
         let body = connection
             .exchange(frame.as_bytes(), REPLY_LIMIT, left)
-            .map_err(Unserved::Transport)?;
+            .map_err(|error| CallFailure::outcome_unknown(Unserved::Transport(error)))?;
         drop(frame);
-        match decode_reply::<KeydReply>(KEYD_CHANNEL, &body).map_err(Unserved::MalformedReply)? {
-            Reply::Refused(refused) => Err(Unserved::Refused(refused)),
-            Reply::Message(reply) => {
-                Answer::from_wire(operation, reply).map_err(Unserved::UnexpectedReply)
-            }
+        let reply = decode_reply::<KeydReply>(KEYD_CHANNEL, &body)
+            .map_err(|error| CallFailure::outcome_unknown(Unserved::MalformedReply(error)))?;
+        match reply {
+            // A-88: keyd-daemon refuses a key-state change only before keyd
+            // runs it.
+            Reply::Refused(refused) => Err(CallFailure {
+                unserved: Unserved::Refused(refused),
+                fate: RequestFate::NotPerformed,
+            }),
+            Reply::Message(reply) => Answer::from_wire(operation, reply)
+                .map_err(|error| CallFailure::outcome_unknown(Unserved::UnexpectedReply(error))),
         }
     }
 
@@ -568,7 +752,17 @@ impl<C: Connector> KeydClient<C> {
     }
 
     /// docs/10 §6 `set_secret` (Role::Directory). The password travels only
-    /// in zeroizing buffers. Spec: docs/50 §3.3, §3.4; docs/10 I7.
+    /// in zeroizing buffers.
+    ///
+    /// A key-state change (docs/10 §10): `Err(Unavailable)` here is keyd's
+    /// own answer **or** any failure of the call, a lost reply included; a
+    /// caller that must tell "not performed" from "outcome unknown" sends
+    /// [`Call::SetSecret`] with [`KeydClient::call_with_fate`] (Q-367,
+    /// A-88). The same holds for `create_key`, `rotate_key`,
+    /// `rotate_krbtgt`, `retire_kvno` and `destroy_key_set`.
+    ///
+    /// Spec: docs/50 §3.3, §3.4; docs/10 I7, §10; docs/questions/Q-367
+    /// (A-88).
     pub fn set_secret(
         &mut self,
         handle: &KeyHandle,
@@ -605,7 +799,10 @@ impl<C: Connector> KeydClient<C> {
         }
     }
 
-    /// docs/10 §7 `create_key` (Role::Admin). Spec: docs/50 §3.4.
+    /// docs/10 §7 `create_key` (Role::Admin). A key-state change: see
+    /// [`KeydClient::set_secret`] on `Unavailable` and
+    /// [`KeydClient::call_with_fate`]. Spec: docs/50 §3.4; docs/10 §10;
+    /// docs/questions/Q-367 (A-88).
     pub fn create_key(
         &mut self,
         handle: &KeyHandle,
@@ -621,7 +818,8 @@ impl<C: Connector> KeydClient<C> {
         }
     }
 
-    /// docs/10 §7 `rotate_key` (Role::Admin). Spec: docs/50 §3.4.
+    /// docs/10 §7 `rotate_key` (Role::Admin). A key-state change: see
+    /// [`KeydClient::set_secret`]. Spec: docs/50 §3.4; docs/10 §10.
     pub fn rotate_key(&mut self, handle: &KeyHandle) -> Result<Kvno, keyd_types::Error> {
         match self.call(&Call::RotateKey { handle: *handle }) {
             Ok(Answer::RotateKey(result)) => result,
@@ -629,7 +827,8 @@ impl<C: Connector> KeydClient<C> {
         }
     }
 
-    /// docs/10 §7 `rotate_krbtgt` (Role::Admin). Spec: docs/50 §3.4.
+    /// docs/10 §7 `rotate_krbtgt` (Role::Admin). A key-state change: see
+    /// [`KeydClient::set_secret`]. Spec: docs/50 §3.4; docs/10 §10.
     pub fn rotate_krbtgt(
         &mut self,
         krbtgt: &KeyHandle,
@@ -645,7 +844,8 @@ impl<C: Connector> KeydClient<C> {
         }
     }
 
-    /// docs/10 §7 `retire_kvno` (Role::Admin). Spec: docs/50 §3.4.
+    /// docs/10 §7 `retire_kvno` (Role::Admin). A key-state change: see
+    /// [`KeydClient::set_secret`]. Spec: docs/50 §3.4; docs/10 §10.
     pub fn retire_kvno(&mut self, handle: &KeyHandle, kvno: Kvno) -> Result<(), keyd_types::Error> {
         let call = Call::RetireKvno {
             handle: *handle,
@@ -657,7 +857,8 @@ impl<C: Connector> KeydClient<C> {
         }
     }
 
-    /// docs/10 §7 `destroy_key_set` (Role::Admin). Spec: docs/50 §3.4; A-35.
+    /// docs/10 §7 `destroy_key_set` (Role::Admin). A key-state change: see
+    /// [`KeydClient::set_secret`]. Spec: docs/50 §3.4; docs/10 §10; A-35.
     pub fn destroy_key_set(&mut self, handle: &KeyHandle) -> Result<(), keyd_types::Error> {
         match self.call(&Call::DestroyKeySet { handle: *handle }) {
             Ok(Answer::DestroyKeySet(result)) => result,
@@ -665,8 +866,18 @@ impl<C: Connector> KeydClient<C> {
         }
     }
 
-    /// docs/10 §7א `describe_config` (Kdc, Ldap). Spec: docs/50 §3.4, §7.5.
+    /// docs/10 §7א `describe_config` (Kdc, Ldap): keyd's description (the
+    /// caller role of the reply is left out — [`KeydClient::describe_config_with_role`]).
+    /// Spec: docs/50 §3.4, §7.5.
     pub fn describe_config(&mut self) -> Result<ConfigDescription, keyd_types::Error> {
+        self.describe_config_with_role()
+            .map(|described| described.description)
+    }
+
+    /// docs/10 §7א `describe_config` (Kdc, Ldap): keyd's description and the
+    /// caller role keyd resolved for this process from its peer uid.
+    /// Spec: docs/50 §3.4, §7.5; docs/questions/Q-351 (A-87).
+    pub fn describe_config_with_role(&mut self) -> Result<DescribedConfig, keyd_types::Error> {
         match self.call(&Call::DescribeConfig) {
             Ok(Answer::DescribeConfig(result)) => result,
             _ => Err(keyd_types::Error::Unavailable),
@@ -687,11 +898,13 @@ impl<C: Connector> KeydClient<C> {
 /// (`describe_config`) when it is built — and required of every new
 /// connection afterwards ([`KeydClient::require_description`]), so that
 /// [`KeyCustody::config`] stays the description of the keyd that serves the
-/// calls (docs/questions/Q-311).
+/// calls (docs/questions/Q-311) — and with the caller role `Kdc` required
+/// of that first answer and of every new connection
+/// ([`KeydClient::require_caller_role`]; docs/questions/Q-351).
 ///
 /// Spec: docs/50 §3.4, §7.5 step 4 ("`DescribeConfig` from keyd …
 /// `KdcConfig::validate(&keyd_config)` — only then bind 88"), §10; docs/10
-/// §7א; docs/questions/Q-311 (A-82).
+/// §2, §7א; docs/questions/Q-311 (A-82), Q-351 (A-87).
 pub struct IpcKeyd<C: Connector> {
     client: KeydClient<C>,
     description: ConfigDescription,
@@ -709,18 +922,29 @@ impl<C: Connector> fmt::Debug for IpcKeyd<C> {
 impl<C: Connector> IpcKeyd<C> {
     /// Ask keyd for its configuration and build the custody. Fails with
     /// keyd's error (or `Unavailable`) when keyd does not answer it — the
-    /// kdc daemon then does not start (fail closed, docs/50 §7.5).
+    /// kdc daemon then does not start (fail closed, docs/50 §7.5). Fails
+    /// with `Unavailable` when keyd answers it for a caller role other than
+    /// `Kdc` (this uid mapped to Ldap): the client and the connection that
+    /// answered are dropped, nothing else was sent (docs/questions/Q-351).
     ///
-    /// The description is then required of every new connection the client
-    /// opens (the connection that answered it is kept): a keyd that no
-    /// longer gives it — restarted with this uid mapped to another role, or
-    /// with another configuration — serves no call (`Unavailable`) until it
-    /// does again.
+    /// The description and the caller role `Kdc` are then required of every
+    /// new connection the client opens (the connection that answered them is
+    /// kept): a keyd that no longer gives them — restarted with this uid
+    /// mapped to another role, or with another configuration — serves no
+    /// call (`Unavailable`) until it does again.
     ///
-    /// Spec: docs/50 §7.5 step 4; docs/questions/Q-311 (A-82).
+    /// Spec: docs/50 §7.5 step 4, §3.7; docs/10 §2; docs/questions/Q-311
+    /// (A-82), Q-351 (A-87).
     pub fn connect(mut client: KeydClient<C>) -> Result<Self, keyd_types::Error> {
-        let description = client.describe_config()?;
+        let described = client.describe_config_with_role()?;
+        if described.caller_role != KDC_CALLER_ROLE {
+            // Q-351: keyd does not give this process the Kdc role; the
+            // connection that answered goes with the client.
+            return Err(keyd_types::Error::Unavailable);
+        }
+        let description = described.description;
         client.require_description(description.clone());
+        client.require_caller_role(KDC_CALLER_ROLE);
         Ok(IpcKeyd {
             client,
             description,

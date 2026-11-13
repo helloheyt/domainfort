@@ -40,7 +40,7 @@
 
 use core::fmt;
 use ipc::{encode_refused, EncodedFrame, Refused};
-use ipc_keyd::{decode_request, encode_answer, Answer, Call, KEYD_CHANNEL};
+use ipc_keyd::{decode_request, encode_answer, Answer, Call, DescribedConfig, KEYD_CHANNEL};
 use keyd::{AuditSink, CallerId, EntropySource, KeyStore, Keyd, TgsFastRequest};
 use krb_proto::KerberosTime;
 
@@ -80,8 +80,13 @@ impl fmt::Debug for Dispatch {
 /// role by the daemon, docs/50 §3.2) and `now` is the daemon's own clock
 /// (R50-5) — never values from the request, which has no field for either.
 ///
+/// A described configuration also reports `caller.role` — the role keyd
+/// authorized this very call with — beside keyd's description
+/// ([`DescribedConfig`]; docs/questions/Q-351, A-87).
+///
 /// Spec: docs/10 §2 (`CallerId` "derived from the connected peer … not
-/// claimed by the caller"), §4-§7א; docs/50 R50-3, R50-5; A-56.
+/// claimed by the caller"), §4-§7א; docs/50 R50-3, R50-5; A-56;
+/// docs/questions/Q-351 (A-87).
 pub fn execute<S: KeyStore, A: AuditSink, E: EntropySource>(
     keyd: &mut Keyd<S, A, E>,
     caller: CallerId,
@@ -180,7 +185,16 @@ pub fn execute<S: KeyStore, A: AuditSink, E: EntropySource>(
         Call::DestroyKeySet { handle } => {
             Answer::DestroyKeySet(keyd.destroy_key_set(caller, &handle, now))
         }
-        Call::DescribeConfig => Answer::DescribeConfig(keyd.describe_config(caller, now)),
+        // Q-351 (A-87): the role keyd resolved from the peer uid — the one
+        // its capability check just used — travels with the description.
+        Call::DescribeConfig => {
+            Answer::DescribeConfig(keyd.describe_config(caller, now).map(|description| {
+                DescribedConfig {
+                    description,
+                    caller_role: caller.role,
+                }
+            }))
+        }
         Call::Ping => Answer::Ping(keyd.ping(caller, now)),
     }
 }

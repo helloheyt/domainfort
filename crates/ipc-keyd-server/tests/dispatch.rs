@@ -167,6 +167,9 @@ fn caller_identity_comes_from_the_transport() {
         ]
     );
 
+    // Q-351 (A-87): the same DescribeConfig octets are answered, to the two
+    // roles that may call it, with the role the transport gave the caller —
+    // the identity keyd authorized with — beside the same description.
     let describe = body_of(&ipc_keyd::Call::DescribeConfig);
     for (caller, allowed) in [
         (KDC, true),
@@ -175,7 +178,17 @@ fn caller_identity_comes_from_the_transport() {
         (ADMIN, false),
     ] {
         let reply = reply_of(dispatch(&mut keyd, caller, now, &describe));
-        assert_eq!(matches!(reply, KeydReply::DescribeConfig(_)), allowed);
+        match reply {
+            KeydReply::DescribeConfig(described) => {
+                assert!(allowed, "{caller:?}");
+                assert_eq!(described.caller_role, caller.role);
+                assert_eq!(described.realm, samples::realm().as_bytes());
+            }
+            other => {
+                assert!(!allowed, "{caller:?}");
+                assert_eq!(other, KeydReply::Failure(keyd::Error::Denied));
+            }
+        }
     }
     let ping = body_of(&ipc_keyd::Call::Ping);
     for caller in [KDC, DIRECTORY, ADMIN, LDAP] {
@@ -362,6 +375,12 @@ fn admin_and_directory_operations_through_the_client() {
     assert_eq!(description, server.borrow().keyd.config().description());
     assert_eq!(ldap.describe_config().unwrap(), description);
     assert_eq!(directory.describe_config(), Err(keyd::Error::Denied));
+    // Q-351 (A-87): each caller is told the role keyd resolved for it.
+    for (client, role) in [(&mut kdc, Role::Kdc), (&mut ldap, Role::Ldap)] {
+        let described = client.describe_config_with_role().unwrap();
+        assert_eq!(described.caller_role, role);
+        assert_eq!(described.description, description);
+    }
     for c in [&mut admin, &mut directory, &mut kdc, &mut ldap] {
         assert_eq!(c.ping(), Ok(()));
     }
