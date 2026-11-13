@@ -1,0 +1,353 @@
+//! Shared test helpers: temp directories, small logs written through
+//! crates/audit-log, configuration text, a socket server harness and a
+//! blocking client.
+//!
+//! Every payload is arbitrary test octets made up here (the log treats them
+//! as opaque); expected encodings are assembled from this project's own
+//! layouts (crate `audit_daemon::own_event`, crate `audit-log` `format`).
+//! No fixture comes from any other implementation.
+#![allow(dead_code)]
+
+use audit_daemon::listener::{self, ListenerConfig};
+use audit_daemon::recovery::open_log;
+use audit_daemon::segments::segment_path;
+use audit_daemon::writer::{self, Inbox, WriterFailure};
+use audit_log::{
+    Anchor, ChainHead, Entry, FileStorage, LogWriter, Record, SegmentLimit, SegmentReader, Source,
+    Timestamp, RECORD_FIXED_BODY_LEN, RECORD_LEN_PREFIX, SEGMENT_HEADER_LEN,
+};
+use config::AuditdSettings;
+use ipc::Reply;
+use ipc_audit::{AuditReply, AuditRequest, EventBytes, AUDIT_CHANNEL};
+use std::io::{ErrorKind, Read, Write};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+/// A unique, empty temporary directory, removed on drop. Short names keep
+/// socket paths under the Unix socket path limit.
+pub struct TempDir(pub PathBuf);
+
+static NEXT_DIR: AtomicU32 = AtomicU32::new(0);
+
+impl TempDir {
+    pub fn new() -> TempDir {
+        let n = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("adt-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        TempDir(dir)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+
+    /// The log base path (`audit_log_path`) inside the directory.
+    pub fn base(&self) -> PathBuf {
+        self.0.join("audit.log")
+    }
+
+    /// The socket path inside the directory.
+    pub fn socket(&self) -> PathBuf {
+        self.0.join("audit.sock")
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The uid of this test process, from the peer credentials of a socket pair
+/// (tokio `UnixStream::peer_cred`: "effective credentials of the process
+/// which called `connect` or `pair`").
+pub fn own_uid() -> u32 {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let (one, _other) = tokio::net::UnixStream::pair().expect("pair");
+        one.peer_cred().expect("peer_cred").uid()
+    })
+}
+
+/// A uid distinct from `others`, never 0 or all-ones.
+pub fn other_uid(others: &[u32]) -> u32 {
+    (4000u32..)
+        .find(|candidate| !others.contains(candidate))
+        .expect("a free uid")
+}
+
+/// Configuration text for auditd in `dir`, mapping `mapped_uid` to `kdc`.
+/// Spec: docs/50 §7.1; crates/config `AuditdSettings`.
+pub fn settings_text(dir: &TempDir, mapped_uid: u32, frame_timeout_secs: u32) -> String {
+    let run_as = other_uid(&[mapped_uid]);
+    format!(
+        "run_as_uid = {run_as}\nrun_as_gid = {run_as}\naudit_socket = {}\naudit_log_path = {}\n\
+         uid_sources = {mapped_uid}:kdc\nframe_timeout = {frame_timeout_secs}s\n",
+        dir.socket().display(),
+        dir.base().display()
+    )
+}
+
+/// Parsed settings for auditd in `dir`.
+pub fn settings(dir: &TempDir, mapped_uid: u32, frame_timeout_secs: u32) -> AuditdSettings {
+    AuditdSettings::parse(settings_text(dir, mapped_uid, frame_timeout_secs).as_bytes())
+        .expect("valid auditd settings")
+}
+
+/// `count` arbitrary events of `len` octets, distinguished by `tag`.
+pub fn events(count: usize, len: usize, tag: u8) -> Vec<EventBytes> {
+    (0..count)
+        .map(|i| {
+            let octets = (0..len)
+                .map(|j| tag ^ (i as u8).wrapping_mul(31) ^ (j as u8))
+                .collect();
+            EventBytes::new(octets).expect("event in bounds")
+        })
+        .collect()
+}
+
+/// Octets of one record with a payload of `payload_len` octets.
+pub fn record_len(payload_len: usize) -> usize {
+    RECORD_LEN_PREFIX + RECORD_FIXED_BODY_LEN + payload_len
+}
+
+/// What `build_log` wrote.
+pub struct Built {
+    /// Head after each record, in order (index 0 = record 1).
+    pub heads: Vec<ChainHead>,
+    /// Length of each segment file.
+    pub lengths: Vec<u64>,
+}
+
+/// Write a log of `per_segment[i]` records in segment `i + 1` (payloads of
+/// `payload_len` octets) through crates/audit-log, rotating by hand.
+pub fn build_log(base: &Path, per_segment: &[usize], payload_len: usize) -> Built {
+    let limit = SegmentLimit::DEFAULT;
+    let mut heads = Vec::new();
+    let mut lengths = Vec::new();
+    let mut writer: Option<LogWriter<FileStorage>> = None;
+    let time = Timestamp::new(1_700_000_000, 0).expect("time");
+    let payload: Vec<u8> = (0..payload_len).map(|i| i as u8).collect();
+    let mut seq_in_source = 0u64;
+    for (i, &count) in per_segment.iter().enumerate() {
+        let storage = FileStorage::create_new(&segment_path(base, i as u64 + 1)).expect("create");
+        match writer.as_mut() {
+            None => writer = Some(LogWriter::create(storage, limit).expect("create log")),
+            Some(w) => {
+                lengths.push(w.segment_len());
+                let _previous = w.rotate(storage).expect("rotate");
+            }
+        }
+        let w = writer.as_mut().expect("writer");
+        for _ in 0..count {
+            seq_in_source += 1;
+            let entry = Entry {
+                source: Source::Kdc,
+                source_uid: 1234,
+                source_seq: seq_in_source,
+                payload: &payload,
+            };
+            heads.push(w.append(&entry, time).expect("append").head);
+        }
+    }
+    if let Some(w) = writer {
+        lengths.push(w.segment_len());
+    }
+    Built { heads, lengths }
+}
+
+/// The octets of segment `index`.
+pub fn segment_bytes(base: &Path, index: u64) -> Vec<u8> {
+    std::fs::read(segment_path(base, index)).expect("read segment")
+}
+
+/// Read every record of segment `index` verified against `anchor` (the
+/// segment must verify to its end).
+pub fn read_segment(base: &Path, index: u64, anchor: Anchor) -> (Vec<Record>, ChainHead) {
+    let file = std::fs::File::open(segment_path(base, index)).expect("open segment");
+    let mut reader =
+        SegmentReader::open(file, anchor, SegmentLimit::DEFAULT, None).expect("segment header");
+    let mut records = Vec::new();
+    while let Some(record) = reader.next_record().expect("record verifies") {
+        records.push(record);
+    }
+    let head = reader.head();
+    reader.finish().expect("segment verifies");
+    (records, head)
+}
+
+/// The expected payload of a `SegmentRecovered` auditd record, assembled
+/// from the layout documented in `audit_daemon::own_event`.
+pub fn expected_recovered(
+    segment: u64,
+    torn_code: u8,
+    last_good: ChainHead,
+    break_offset: u64,
+    segment_octets: u64,
+) -> Vec<u8> {
+    let mut out = vec![0xAD, 0x01];
+    out.extend_from_slice(&segment.to_be_bytes());
+    out.push(torn_code);
+    out.extend_from_slice(&last_good.seq.to_be_bytes());
+    out.extend_from_slice(last_good.hash.as_bytes());
+    out.extend_from_slice(&break_offset.to_be_bytes());
+    out.extend_from_slice(&segment_octets.to_be_bytes());
+    out
+}
+
+/// The expected payload of a `PeersRefused` auditd record.
+pub fn expected_refused(unmapped: u64, over_quota: u64, last_uid: u32) -> Vec<u8> {
+    let mut out = vec![0xAD, 0x02];
+    out.extend_from_slice(&unmapped.to_be_bytes());
+    out.extend_from_slice(&over_quota.to_be_bytes());
+    out.extend_from_slice(&last_uid.to_be_bytes());
+    out
+}
+
+/// Header length as a u64.
+pub fn header_len() -> u64 {
+    SEGMENT_HEADER_LEN as u64
+}
+
+// ---- tier 2: a server over a real temp-dir socket --------------------------
+
+/// auditd's listener and writer, running in this process: a tokio runtime
+/// for the listener and a thread for the writer (as in the daemon, where
+/// the main thread is the writer).
+pub struct Server {
+    runtime: Option<tokio::runtime::Runtime>,
+    writer: Option<JoinHandle<Result<(), WriterFailure>>>,
+    held_inbox: Option<Inbox>,
+    pub socket: PathBuf,
+}
+
+impl Server {
+    /// Start on `settings` (log opened at its `audit_log_path`, socket at
+    /// its `audit_socket`). Without `run_writer` the queue is held but never
+    /// drained.
+    pub fn start(
+        settings: &AuditdSettings,
+        config: ListenerConfig,
+        queue_capacity: usize,
+        run_writer: bool,
+    ) -> Server {
+        let opened = open_log(
+            settings.audit_log_path().as_path(),
+            SegmentLimit::DEFAULT,
+            settings.run_as().uid(),
+        )
+        .expect("log opens");
+        let (submitter, inbox) = writer::queue(queue_capacity);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let socket = settings.audit_socket().as_path().to_path_buf();
+        let bound = {
+            let _context = runtime.enter();
+            listener::bind(&socket).expect("bind")
+        };
+        let _serving = runtime.spawn(listener::serve(
+            bound,
+            Arc::new(settings.uid_sources().clone()),
+            submitter,
+            config,
+        ));
+        let (writer, held_inbox) = if run_writer {
+            let sink = opened.sink;
+            (
+                Some(std::thread::spawn(move || writer::run(sink, inbox))),
+                None,
+            )
+        } else {
+            (None, Some(inbox))
+        };
+        Server {
+            runtime: Some(runtime),
+            writer,
+            held_inbox,
+            socket,
+        }
+    }
+
+    /// Stop the listener and wait for the writer to finish.
+    pub fn stop(mut self) -> Option<Result<(), WriterFailure>> {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_timeout(Duration::from_secs(2));
+        }
+        self.held_inbox.take();
+        self.writer.take().map(|w| w.join().expect("writer thread"))
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
+/// A blocking client connection with a read timeout.
+pub fn connect(path: &Path) -> UnixStream {
+    let stream = UnixStream::connect(path).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    stream
+}
+
+/// Send one request frame.
+pub fn send(stream: &mut UnixStream, request: &AuditRequest) {
+    let frame = ipc_audit::encode_request(request).expect("encode request");
+    stream.write_all(frame.as_bytes()).expect("send");
+}
+
+/// What a read of one reply found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Got {
+    Reply(Reply<AuditReply>),
+    /// The server closed with no reply octet (end of stream or reset).
+    Closed,
+    /// No reply within the read timeout.
+    Nothing,
+}
+
+/// Read one reply frame (or observe a close / silence).
+pub fn receive(stream: &mut UnixStream) -> Got {
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 256];
+    loop {
+        if let Some((reply, _)) =
+            ipc::decode_reply_message::<AuditReply>(AUDIT_CHANNEL, &buffer).expect("reply decodes")
+        {
+            return Got::Reply(reply);
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => {
+                assert!(buffer.is_empty(), "partial reply before close");
+                return Got::Closed;
+            }
+            Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == ErrorKind::ConnectionReset => {
+                assert!(buffer.is_empty(), "partial reply before reset");
+                return Got::Closed;
+            }
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                assert!(buffer.is_empty(), "partial reply before timeout");
+                return Got::Nothing;
+            }
+            Err(e) => panic!("read failed: {e}"),
+        }
+    }
+}
