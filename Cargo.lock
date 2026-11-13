@@ -280,6 +280,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "keyd-daemon"
+version = "0.0.0"
+dependencies = [
+ "config",
+ "daemon-sandbox",
+ "dtyp",
+ "ipc",
+ "ipc-audit",
+ "ipc-keyd",
+ "ipc-keyd-server",
+ "kdc",
+ "keyd",
+ "keyd-types",
+ "krb-crypto",
+ "krb-proto",
+ "pdp",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "keyd-types"
 version = "0.0.0"
 dependencies = [
