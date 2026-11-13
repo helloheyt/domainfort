@@ -1,0 +1,57 @@
+# ipc-directory-server — dird's side of the directory-view channel: the
+# dispatcher that decodes a request, answers it from a
+# `directory_pip::DirectoryView` pinned to the connection, and encodes the
+# reply, with the per-connection view table (one view per connection, a
+# bound on concurrent views, a view lifetime) (docs/50 R50-2, §3.4, §10
+# "P8"; decision A-58).
+#
+# A separate crate, not a feature of ipc-directory: cargo unifies a
+# package's features across one build, so a `server` feature turned on for
+# dird would also be on for the kdc daemon in a workspace build and link
+# dirstore / redb / the IntegrityKey code into the kdc process (the reason
+# A-63 split ipc-keyd-server). Only the dird daemon depends on this crate.
+#
+# Written only from this project's decided design — docs/50 (R50-2, §3.3,
+# §3.4, §3.6, §3.7, §8.2, §9, §10), docs/47 §8, docs/questions Q-213 (A-57),
+# Q-225 (A-59), Q-245 / Q-255 (A-63, A-65), Q-270, PENDING-OWNER — and the
+# code of this project's crates (ipc, ipc-directory, directory-pip, dirstore,
+# kdc, pdp, dtyp, keyd-types, krb-proto; ipc-keyd-server as the pattern). No
+# other implementation, directory server or RPC framework was consulted or
+# recalled (AGENTS.md §1-3).
+
+[package]
+name = "ipc-directory-server"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Framing, the envelope, the shared `Refused` (docs/50 §3.3; A-59).
+ipc = { path = "../ipc" }
+# The channel: message sets, typed requests, the code tables.
+ipc-directory = { path = "../ipc-directory" }
+# The view: `DirectoryContext`, `DirectoryView`, `TierMap`,
+# `MAX_EXPANDED_GROUPS` (pinned to the channel's group bound).
+directory-pip = { path = "../directory-pip" }
+# The store each view is a snapshot of (`Store`).
+dirstore = { path = "../dirstore" }
+# `AccountSource`, `AccountSourceError`.
+kdc = { path = "../kdc" }
+# `Pip`, `PolicyVersion`.
+pdp = { path = "../pdp" }
+
+[dev-dependencies]
+# TESTS ONLY: the directory fixtures of crates/directory-pip/tests/common
+# (reused through `#[path]`) build a temporary dirstore with the phase-1
+# schema and name keyd's configuration through keyd's re-exports; the KDC
+# record types and names come from kdc / krb-proto / dtyp; the loopback
+# connection's reply buffer is a `Zeroizing`. Workspace crates or already in
+# the lock.
+ad-schema = { path = "../ad-schema" }
+keyd = { path = "../keyd" }
+krb-proto = { path = "../krb-proto" }
+dtyp = { path = "../dtyp" }
+zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
+
+[lints]
+workspace = true

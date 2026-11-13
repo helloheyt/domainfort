@@ -46,7 +46,10 @@ run_as_gid = 802
 realm = EXAMPLE.TEST
 naming_context = dc=example,dc=test
 database_path = /var/lib/dird/directory.redb
+integrity_key_source = insecure-development-file
+integrity_key_path = /etc/dird/integrity.key
 policy_store_path = /etc/domain/policy.store
+policy_store_format = unsigned-development
 dird_kdc_socket = /run/dird/kdc/dird-kdc.sock
 kdc_uid = 803
 dird_ldap_socket = /run/dird/ldap/dird-ldap.sock
@@ -67,7 +70,10 @@ run_as_gid = 802
 realm = EXAMPLE.TEST
 naming_context = dc=example,dc=test
 database_path = /var/lib/dird/directory.redb
+integrity_key_source = insecure-development-file
+integrity_key_path = /etc/dird/integrity.key
 policy_store_path = /etc/domain/policy.store
+policy_store_format = unsigned-development
 dird_kdc_socket = /run/dird/kdc/dird-kdc.sock
 kdc_uid = 803
 dird_ldap_socket = /run/dird/ldap/dird-ldap.sock

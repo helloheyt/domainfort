@@ -7,11 +7,20 @@
 //! (§7.2), and maps LDAP peer addresses through its **own** zone table (§4.2).
 //!
 //! **No secrets.** The dirstore `IntegrityKey` is never a setting (docs/50
-//! §7.4: "never in a readable file next to the DB"); its source is decided in
-//! Q-213 (A-57) with the sealing mechanism of Q-212 (P-17), and is added to
-//! this schema only when that is decided (docs/questions/Q-230 item 12).
+//! §7.4: "never in a readable file next to the DB"). Q-213 → A-57 decided
+//! that dird holds it, opened through the sealing mechanism of Q-212 (owner
+//! item P-17, undecided). Until then the only source is the development
+//! interim Q-213 names ("in development — a key from a development file"):
+//! the operator must say so explicitly, `integrity_key_source =
+//! insecure-development-file`, and `integrity_key_path` only **points to**
+//! the root-only file (the key itself is never in this file). Likewise the
+//! policy store: its signed format is Q-219 → A-57 and does not exist yet,
+//! so the only accepted `policy_store_format` is `unsigned-development`
+//! (docs/questions/Q-270 items 1-2). A production kind is added to each
+//! table when its decision is implemented.
 //!
-//! Spec: docs/50 R50-2, R50-15, §2.4, §3.2, §3.4, §4.2, §7.1, §7.2, §7.4.
+//! Spec: docs/50 R50-2, R50-15, §2.4, §3.2, §3.4, §4.2, §7.1, §7.2, §7.4;
+//! docs/questions/Q-213, Q-219 (A-57), Q-270.
 
 use core::time::Duration;
 
@@ -40,6 +49,56 @@ const LDAP_FRONT_UID: &str = "ldap_front_uid";
 const ADMIND_UID: &str = "admind_uid";
 /// Key: how long a `BeginView` snapshot stays pinned. Spec: docs/50 §3.4.
 const VIEW_LIFETIME: &str = "view_lifetime";
+/// Key: where the dirstore integrity key comes from. Spec: docs/50 §7.4;
+/// Q-213 (A-57); docs/questions/Q-270 item 1.
+const INTEGRITY_KEY_SOURCE: &str = "integrity_key_source";
+/// Key: the development integrity-key file (a path, never the key). Spec:
+/// docs/50 §7.1 ("only paths to protected files"), §7.4; Q-270 item 1.
+const INTEGRITY_KEY_PATH: &str = "integrity_key_path";
+/// Key: the format of the policy store file. Spec: docs/50 §7.2; Q-219
+/// (A-57); docs/questions/Q-270 item 2.
+const POLICY_STORE_FORMAT: &str = "policy_store_format";
+
+/// Where dird's dirstore integrity key comes from.
+///
+/// Phase 1 has only the development interim of Q-213: a root-only file read
+/// before the privilege drop. The sealed source of Q-212 (P-17) is added
+/// here when the owner decides it.
+///
+/// Spec: docs/50 §7.4; docs/questions/Q-213 (A-57: dird holds the key),
+/// Q-212 (P-17), Q-270 item 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegrityKeySource {
+    /// A 32-octet key in a root-owned, mode-0400 file, read as root before
+    /// the drop and wiped from the reading buffer after use — development
+    /// only (Q-213: "in development — a key from a development file").
+    InsecureDevelopmentFile,
+}
+
+/// The accepted spellings of [`IntegrityKeySource`]. Spec: Q-270 item 1.
+const INTEGRITY_KEY_SOURCES: &[(&str, IntegrityKeySource)] = &[(
+    "insecure-development-file",
+    IntegrityKeySource::InsecureDevelopmentFile,
+)];
+
+/// The format of the policy store file dird loads.
+///
+/// The signed format of Q-219 (A-57) is not defined yet; until it is, the
+/// only accepted format is a clearly marked, UNSIGNED development file, and
+/// the operator must name it here (never trusted silently).
+///
+/// Spec: docs/50 §7.2; docs/questions/Q-219 (A-57), Q-270 item 2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyStoreFormat {
+    /// The unsigned development policy file (no signature is verified).
+    UnsignedDevelopment,
+}
+
+/// The accepted spellings of [`PolicyStoreFormat`]. Spec: Q-270 item 2.
+const POLICY_STORE_FORMATS: &[(&str, PolicyStoreFormat)] = &[(
+    "unsigned-development",
+    PolicyStoreFormat::UnsignedDevelopment,
+)];
 
 /// Lifetime of a view pinned by `BeginView`: at most 5 s.
 /// Spec: docs/50 §3.4 ("expires after ≤ 5 s (project choice)").
@@ -78,7 +137,10 @@ pub struct DirdSettings {
     realm: String,
     naming_context: NamingContextLabels,
     database_path: AbsolutePath,
+    integrity_key_source: IntegrityKeySource,
+    integrity_key_path: AbsolutePath,
     policy_store_path: AbsolutePath,
+    policy_store_format: PolicyStoreFormat,
     kdc_channel: Channel,
     ldap_channel: Channel,
     admin_channel: Option<Channel>,
@@ -108,7 +170,10 @@ impl DirdSettings {
         REALM,
         NAMING_CONTEXT,
         DATABASE_PATH,
+        INTEGRITY_KEY_SOURCE,
+        INTEGRITY_KEY_PATH,
         POLICY_STORE_PATH,
+        POLICY_STORE_FORMAT,
         DIRD_KDC_SOCKET,
         KDC_UID,
         DIRD_LDAP_SOCKET,
@@ -124,7 +189,9 @@ impl DirdSettings {
 
     /// Parses and validates dird's file. Required: `run_as_uid`,
     /// `run_as_gid`, `realm`, `naming_context`, `database_path`,
-    /// `policy_store_path`, `dird_kdc_socket` with `kdc_uid`,
+    /// `integrity_key_source` (only `insecure-development-file`),
+    /// `integrity_key_path`, `policy_store_path`, `policy_store_format`
+    /// (only `unsigned-development`), `dird_kdc_socket` with `kdc_uid`,
     /// `dird_ldap_socket` with `ldap_front_uid`, `audit_socket`, `auditd_uid`.
     /// Optional: `dird_admin_socket` with `admind_uid` (both or neither —
     /// admind is blocked on Q-220, task P13), `internal_networks` (absent ⇒
@@ -141,7 +208,18 @@ impl DirdSettings {
         let realm = doc.required(REALM, value::realm)?.value;
         let naming_context = doc.required(NAMING_CONTEXT, value::naming_context)?.value;
         let database_path = schema::path(&doc, &mut all, DATABASE_PATH)?;
+        let integrity_key_source = doc
+            .required(INTEGRITY_KEY_SOURCE, |text| {
+                value::named(text, INTEGRITY_KEY_SOURCES)
+            })?
+            .value;
+        let integrity_key_path = schema::path(&doc, &mut all, INTEGRITY_KEY_PATH)?;
         let policy_store_path = schema::path(&doc, &mut all, POLICY_STORE_PATH)?;
+        let policy_store_format = doc
+            .required(POLICY_STORE_FORMAT, |text| {
+                value::named(text, POLICY_STORE_FORMATS)
+            })?
+            .value;
         let kdc_channel = channel(&doc, &mut all, DIRD_KDC_SOCKET, KDC_UID)?;
         let ldap_channel = channel(&doc, &mut all, DIRD_LDAP_SOCKET, LDAP_FRONT_UID)?;
         let admin_socket = doc.optional(DIRD_ADMIN_SOCKET, value::absolute_path)?;
@@ -178,7 +256,10 @@ impl DirdSettings {
             realm,
             naming_context,
             database_path,
+            integrity_key_source,
+            integrity_key_path,
             policy_store_path,
+            policy_store_format,
             kdc_channel,
             ldap_channel,
             admin_channel,
@@ -215,11 +296,32 @@ impl DirdSettings {
         &self.database_path
     }
 
+    /// Where the dirstore integrity key comes from (the development interim
+    /// only, until P-17). Spec: docs/50 §7.4; Q-213 (A-57); Q-270 item 1.
+    #[must_use]
+    pub const fn integrity_key_source(&self) -> IntegrityKeySource {
+        self.integrity_key_source
+    }
+
+    /// The development integrity-key file (root-owned, mode 0400 — the
+    /// daemon's checks). Spec: docs/50 §7.1, §7.4; Q-270 item 1.
+    #[must_use]
+    pub fn integrity_key_path(&self) -> &AbsolutePath {
+        &self.integrity_key_path
+    }
+
     /// The signed policy store (rules, anonymous allowlist, TierMap — A-36).
     /// Spec: docs/50 §7.2.
     #[must_use]
     pub fn policy_store_path(&self) -> &AbsolutePath {
         &self.policy_store_path
+    }
+
+    /// The policy store's format (unsigned development only, until Q-219's
+    /// signed format exists). Spec: docs/50 §7.2; Q-270 item 2.
+    #[must_use]
+    pub const fn policy_store_format(&self) -> PolicyStoreFormat {
+        self.policy_store_format
     }
 
     /// `dird-kdc.sock` and kdc's uid. Spec: docs/50 §3.2, §3.4.

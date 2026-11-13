@@ -10,8 +10,8 @@ use core::time::Duration;
 
 use common::{remove, set, Daemon, ALL};
 use config::{
-    AdmindSettings, AuditSource, AuditdSettings, DirdSettings, KdcSettings, KeyStoreKind,
-    KeydSettings, LdapFrontSettings, RoleName,
+    AdmindSettings, AuditSource, AuditdSettings, DirdSettings, IntegrityKeySource, KdcSettings,
+    KeyStoreKind, KeydSettings, LdapFrontSettings, PolicyStoreFormat, RoleName,
 };
 
 fn secs(n: u64) -> Duration {
@@ -79,7 +79,16 @@ fn dird_sample_parses() {
     assert_eq!(s.realm(), "EXAMPLE.TEST");
     assert_eq!(s.naming_context().labels(), ["example", "test"]);
     assert_eq!(s.database_path().as_str(), "/var/lib/dird/directory.redb");
+    assert_eq!(
+        s.integrity_key_source(),
+        IntegrityKeySource::InsecureDevelopmentFile
+    );
+    assert_eq!(s.integrity_key_path().as_str(), "/etc/dird/integrity.key");
     assert_eq!(s.policy_store_path().as_str(), "/etc/domain/policy.store");
+    assert_eq!(
+        s.policy_store_format(),
+        PolicyStoreFormat::UnsignedDevelopment
+    );
     assert_eq!(
         s.kdc_channel().socket().as_str(),
         "/run/dird/kdc/dird-kdc.sock"

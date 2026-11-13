@@ -1,0 +1,98 @@
+# directory-daemon (dird) — the directory process, directory-view service
+# only (docs/50 §10 task P8; decision A-58): the only process that opens the
+# redb file and holds the dirstore IntegrityKey (R50-2; Q-213 → A-57),
+# serving `dird-kdc.sock` to the kdc's uid only (R50-3), one snapshot pinned
+# per connection (§3.4), hardening before any thread exists (R50-14), auditd
+# verified first (R50-16), the DEVELOPMENT integrity-key file and the
+# UNSIGNED development policy store only (docs/questions/Q-270). Hosting the
+# LDAP engine is task P10, the admin channel P13.
+#
+# Written only from this project's decided design (docs/50, docs/47 §8,
+# docs/questions Q-213, Q-214, Q-218..Q-220, Q-230, Q-235, Q-245, Q-255,
+# Q-260, Q-265, Q-270 and PENDING-OWNER), the public API of the workspace
+# crates named below, and the docs.rs API pages of tokio 1.54.1 (API
+# documentation only, never source — PENDING-OWNER P-2). No other
+# implementation, directory server, daemon or RPC system was consulted or
+# recalled (AGENTS.md §1-3).
+
+[package]
+name = "directory-daemon"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "directory_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "directory-daemon"
+path = "src/main.rs"
+
+[dependencies]
+# tokio — owner decision P-12, the asynchronous runtime for the socket side.
+# Linked, never copied; only its docs.rs API pages were read (P-2). Version
+# 1.54.1; license MIT (docs/50 §0.3) — on the AGENTS.md §7 allowlist.
+# Features: the subset keyd-daemon uses, from docs/50 §10 P0's list (never
+# `macros` or `full`):
+#   rt      — `runtime::Builder::new_current_thread`, `spawn`;
+#   net     — `net::UnixListener`, `net::UnixStream` (`peer_cred`, `UCred`);
+#   time    — `time::timeout`, `time::sleep`;
+#   sync    — `sync::oneshot` (the engine's reply), `sync::Notify` (stop);
+#   io-util — `AsyncReadExt::read`, `AsyncWriteExt::write_all`.
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "net", "time", "sync", "io-util"] }
+# RustCrypto `zeroize` (OD-9; already in the lock): the integrity key's
+# reading buffers, and the request buffers (ipc discipline).
+zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
+# Our own workspace crates (path dependencies).
+#
+# Framing (`FrameReader`), the shared `Refused`, the policy file's
+# primitives (A-57: "the same discipline as the IPC codec").
+ipc = { path = "../ipc" }
+# The directory-view channel: `REQUEST_LIMIT`, the code tables.
+ipc-directory = { path = "../ipc-directory" }
+# The server side over the real directory (only this daemon depends on it).
+ipc-directory-server = { path = "../ipc-directory-server" }
+# The audit channel (auditd verified first, R50-16). The core only — no
+# conversion feature: dird sends no event in this task (A-66; Q-270 item 6).
+ipc-audit = { path = "../ipc-audit" }
+# The view, the context, the tier map, the naming context.
+directory-pip = { path = "../directory-pip" }
+# The store and the integrity key.
+dirstore = { path = "../dirstore" }
+# The phase-1 schema the store is opened with.
+ad-schema = { path = "../ad-schema" }
+# `KeydConfig` (realm, enctypes, s2kparams for the account records).
+keyd-types = { path = "../keyd-types" }
+# `Realm`.
+krb-proto = { path = "../krb-proto" }
+# `PolicyVersion`, `Tier`, `Dn`.
+pdp = { path = "../pdp" }
+# SIDs of the policy file.
+dtyp = { path = "../dtyp" }
+# `DirdSettings`.
+config = { path = "../config" }
+# `HardeningPlan`, `SingleThreadProof`, `apply` (R50-14).
+daemon-sandbox = { path = "../daemon-sandbox" }
+
+[dev-dependencies]
+# TESTS ONLY. The end-to-end flow runs the real keyd daemon
+# (`keyd_daemon::serve` through crates/keyd-daemon/tests/support, reused by
+# `#[path]`) and the kdc with `ipc_keyd::IpcKeyd` and this channel's client;
+# it reuses the kdc integration fixtures (crates/kdc/tests/common, the
+# Kerberos client side with krb-crypto) as crates/keyd-daemon does. Every one
+# is a workspace crate or already in the lock.
+keyd-daemon = { path = "../keyd-daemon" }
+keyd = { path = "../keyd" }
+kdc = { path = "../kdc" }
+krb-crypto = { path = "../krb-crypto" }
+ipc-keyd = { path = "../ipc-keyd" }
+
+# Tier 3 (docs/50 R50-19): the hardening drop runs in a fresh child process of
+# a binary with its own `main`, as crates/keyd-daemon does.
+[[test]]
+name = "root_hardening"
+harness = false
+
+[lints]
+workspace = true

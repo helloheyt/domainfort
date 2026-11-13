@@ -570,6 +570,37 @@ fn key_store_kind_is_a_fixed_name() {
     }
 }
 
+/// Spec: docs/50 §7.2, §7.4; docs/questions/Q-213, Q-219 (A-57), Q-270
+/// items 1-2: the dirstore integrity key comes only from the development
+/// file, and the policy store is only the unsigned development format, each
+/// named explicitly — no other spelling, no production kind yet.
+#[test]
+fn dird_development_sources_are_fixed_names() {
+    for value in [
+        "sealed",
+        "Insecure-Development-File",
+        "insecure_development_file",
+        "file",
+    ] {
+        rejects_value(
+            Daemon::Dird,
+            DIRD,
+            "integrity_key_source",
+            value,
+            ErrorKind::UnknownName,
+        );
+    }
+    for value in ["signed", "Unsigned-Development", "unsigned", "none"] {
+        rejects_value(
+            Daemon::Dird,
+            DIRD,
+            "policy_store_format",
+            value,
+            ErrorKind::UnknownName,
+        );
+    }
+}
+
 // ---- keyd's uid → Role map -------------------------------------------------------
 
 /// "uid 0 is never mapped". Spec: docs/50 R50-3, §3.2.

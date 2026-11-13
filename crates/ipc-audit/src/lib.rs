@@ -33,8 +33,10 @@
 //! printable ASCII ≤ 256 octets, else a marker ([`AuditText`]). Codes come
 //! from closed tables mirroring the source enumerations by name
 //! (crate::codes). The conversions from the source types are behind the
-//! features `kdc`, `keyd`, `ldap` (on by default; auditd builds without
-//! them).
+//! features `kdc`, `keyd`, `ldap` — none on by default (decision A-66):
+//! each daemon enables only the conversion it sends (keyd-daemon: `keyd`;
+//! auditd and dird: none), so a whole-workspace build does not unify the
+//! others into them.
 //!
 //! # Overflow policy (docs/questions/Q-218, A-57)
 //!

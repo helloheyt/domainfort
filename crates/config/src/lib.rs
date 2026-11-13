@@ -82,7 +82,7 @@ mod value;
 
 pub use admind::AdmindSettings;
 pub use auditd::{AuditSource, AuditdSettings, SourceMap};
-pub use dird::{Channel, DirdSettings, VIEW_LIFETIME_SECS};
+pub use dird::{Channel, DirdSettings, IntegrityKeySource, PolicyStoreFormat, VIEW_LIFETIME_SECS};
 pub use error::{Error, ErrorKind};
 pub use kdc::{
     KdcLimits, KdcSettings, DIRD_KDC_DEADLINE_SECS, MAX_REQUESTS_PER_TCP_CONNECTION_BOUND,

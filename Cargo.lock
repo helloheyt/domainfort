@@ -142,6 +142,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "directory-daemon"
+version = "0.0.0"
+dependencies = [
+ "ad-schema",
+ "config",
+ "daemon-sandbox",
+ "directory-pip",
+ "dirstore",
+ "dtyp",
+ "ipc",
+ "ipc-audit",
+ "ipc-directory",
+ "ipc-directory-server",
+ "ipc-keyd",
+ "kdc",
+ "keyd",
+ "keyd-daemon",
+ "keyd-types",
+ "krb-crypto",
+ "krb-proto",
+ "pdp",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "directory-pip"
 version = "0.0.0"
 dependencies = [
@@ -221,12 +247,44 @@ version = "0.0.0"
 dependencies = [
  "dtyp",
  "ipc",
+ "ipc-audit",
  "kdc",
  "keyd",
  "krb-proto",
  "ldap",
  "parse-ldap",
  "pdp",
+]
+
+[[package]]
+name = "ipc-directory"
+version = "0.0.0"
+dependencies = [
+ "dtyp",
+ "ipc",
+ "kdc",
+ "keyd-types",
+ "krb-proto",
+ "pdp",
+ "rustix",
+ "zeroize",
+]
+
+[[package]]
+name = "ipc-directory-server"
+version = "0.0.0"
+dependencies = [
+ "ad-schema",
+ "directory-pip",
+ "dirstore",
+ "dtyp",
+ "ipc",
+ "ipc-directory",
+ "kdc",
+ "keyd",
+ "krb-proto",
+ "pdp",
+ "zeroize",
 ]
 
 [[package]]

@@ -1,0 +1,71 @@
+# ipc-directory — the directory-view channel (`dird-kdc.sock`): its message
+# set, the typed requests and answers, and the kdc's side of it — a
+# synchronous client whose per-connection pinned view implements
+# `kdc::AccountSource` and the `pdp::Pip` subset the kdc needs (docs/50 R50-2,
+# §3.1-§3.7, §10 "P8"; decision A-58).
+#
+# A library: no daemon, no listener (dird is crates/directory-daemon, the kdc
+# daemon task P9). The server half — the dispatcher over a
+# `directory_pip::DirectoryView` — is the separate crate
+# `ipc-directory-server`, linked only by dird: THIS crate is the kdc's side
+# and must never link dirstore / redb / directory-pip (the kdc process never
+# opens the redb file and never holds the IntegrityKey — R50-2, A-57; the
+# same structural split as ipc-keyd / ipc-keyd-server, A-63). Checked by
+# tests/no_store_dependency.rs.
+#
+# Written only from this project's decided design — docs/50 (R50-2..R50-8,
+# §2.2, §3, §7.5, §8.2, §9, §10, the channel-magic registry), docs/47 §8,
+# docs/questions Q-213 / Q-214 / Q-218..Q-220 (A-57), Q-217 / Q-222 (A-56),
+# Q-225 (A-59), Q-245 (A-63), Q-255 (A-65), PENDING-OWNER — the code of this
+# project's own crates (ipc, kdc, pdp, keyd-types, krb-proto, dtyp,
+# ipc-keyd as the pattern), and the docs.rs API pages of rustix 1.1.6
+# (`net::sockopt::socket_peercred`, `net::UCred`, `fs::Uid`) and zeroize
+# 1.9.1 (`Zeroizing`) — API documentation only, never their source (P-2). No
+# other implementation, directory server, serializer or RPC framework was
+# consulted or recalled (AGENTS.md §1-3).
+
+[package]
+name = "ipc-directory"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# The framing, the envelope, the field primitives and the shared `Refused`
+# reply (docs/50 §3.3; A-59).
+ipc = { path = "../ipc" }
+# The AccountSource trait and its records, and `MAX_REQUEST_LEN` (the
+# per-field request bound is pinned to it at compile time). kdc links no
+# crypto and no store (D182).
+kdc = { path = "../kdc" }
+# The Pip trait, `Tier`, `PolicyVersion`.
+pdp = { path = "../pdp" }
+# keyd's crypto-free types: `KeyHandle`, `KeyPurpose`, `PrincipalId`.
+keyd-types = { path = "../keyd-types" }
+# Strict DER of `PrincipalName`; the KerberosString / KerberosTime content
+# rules (docs/50 §3.3: "Kerberos values ... decoded in krb-proto").
+krb-proto = { path = "../krb-proto" }
+# SIDs ([MS-DTYP] 2.4.2.2 packet form, strict decoding).
+dtyp = { path = "../dtyp" }
+# RustCrypto `zeroize` (OD-9; already in the lock): the reply buffers of the
+# blocking socket are wiped (docs/50 §3.3; nothing secret travels on this
+# channel, but the transport keeps the discipline of ipc-keyd's).
+zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
+
+# rustix — owner decision P-12. Peer credentials of the client's blocking
+# Unix socket (docs/50 R50-3: "rustix `socket_peercred` in the synchronous
+# client ... the client verifies that the server's uid is the configured uid
+# of keyd / dird"). Linked, never copied; only its docs.rs API pages were read
+# (P-2). License as recorded in docs/50 §0.3 (MIT / Apache-2.0 alternatives,
+# AGENTS.md §7). Features per the docs.rs pages: `net` (`socket_peercred`,
+# "Available on linux_kernel and crate feature net only"), `std` (the `AsFd`
+# the function takes). Linux only: elsewhere the peer check fails closed.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.6", default-features = false, features = ["std", "net"] }
+
+# No dev-dependency: the codec and client tests need only the crates above.
+# Tests that need a real directory behind the dispatcher live in
+# crates/ipc-directory-server and crates/directory-daemon.
+
+[lints]
+workspace = true
