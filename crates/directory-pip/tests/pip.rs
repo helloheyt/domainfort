@@ -3,7 +3,8 @@
 //! Sources (named per test): docs/47 §8.2 (the data source of every
 //! method; DN resolution); A-28 (object classes, property sets); docs/46
 //! §6, §7; [MS-ADTS] 3.1.1.2.3.3, 3.1.1.2.4.3, 5.1.3.1; D40 (any PIP failure
-//! ⇒ Deny). Test data: tests/common.
+//! ⇒ Deny); Q-170 item 7 (A-51: the nTSecurityDescriptor GUID cross-check).
+//! Test data: tests/common.
 
 mod common;
 
@@ -159,6 +160,31 @@ fn property_set() {
         view.property_set(&AttrId(guid(9999))),
         Err(PipError::NotFound)
     );
+}
+
+/// Q-170 item 7 (A-51); docs/46 §7 (`pdp::AttrId` is the schemaIDGUID; the
+/// schema-table bridge is one-to-one, both identifiers "Unique" per
+/// [MS-ADTS] 3.1.1.2.3). pdp recognises nTSecurityDescriptor by its own
+/// constant `AttrId::NT_SECURITY_DESCRIPTOR` ([MS-ADA3] 2.37, A-31), not
+/// through the PIP, and pdp does not depend on ad-schema — nothing else
+/// ties the two together. The constant equals the schemaIDGUID that
+/// `ad_schema::phase1()` reports for nTSecurityDescriptor, and no other
+/// phase-1 attribute carries that GUID, so the PDP's stricter rule cannot
+/// drift onto another attribute, or off this one, without this test failing.
+#[test]
+fn nt_security_descriptor_guid_matches_the_schema() {
+    let p1 = ad_schema::phase1().unwrap();
+    let id = p1.attribute_by_name("nTSecurityDescriptor").unwrap();
+    assert_eq!(
+        p1.attribute_schema_id_guid(id),
+        Ok(AttrId::NT_SECURITY_DESCRIPTOR.0)
+    );
+    let carriers: Vec<&str> = p1
+        .attributes()
+        .filter(|a| a.schema_id_guid == AttrId::NT_SECURITY_DESCRIPTOR.0)
+        .map(|a| a.entry.ldap_display_name)
+        .collect();
+    assert_eq!(carriers, ["nTSecurityDescriptor"]);
 }
 
 /// docs/47 §8.1: a view is taken only over a store opened with the

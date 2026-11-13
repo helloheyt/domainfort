@@ -1268,9 +1268,10 @@ fn mandatory_fast_set_alone_is_exact() {
 
 // ------------------------------- LDAP extensions: never widen (Q-164) ----
 //
-// Source: Q-164 items 1-3 (A-48); docs/49 §5.2 (R49-10); docs/15 §6;
-// [MS-ADTS] v20261026 3.1.1.3, 3.1.1.4.4; [MS-DTYP] 2.5.3.2; docs/11 §3-§4,
-// §10. Hand-made domains; no vector from another implementation.
+// Source: Q-164 items 1-3 (A-48); Q-170 item 3 (A-51); docs/49 §5.2
+// (R49-10); docs/15 §6; [MS-ADTS] v20261026 3.1.1.3, 3.1.1.4.4; [MS-DTYP]
+// 2.5.3.2; docs/11 §3-§4, §10. Hand-made domains; no vector from another
+// implementation.
 //
 // The two fixes and the source-network constraint only narrow, and the new
 // resource changes no other decision:
@@ -1279,7 +1280,12 @@ fn mandatory_fast_set_alone_is_exact() {
 // - `nt_security_descriptor_fix_only_narrows` — against the pre-fix PDP,
 //   reproduced by renaming the attribute (no other code path knows it);
 // - `source_network_fix_only_narrows` — against the pre-fix allowlist,
-//   reproduced by one entry per network;
+//   reproduced by the same request from the internal network (the pre-fix
+//   allowlist had no network; an external entry can no longer be built);
+// - `accepted_anonymous_grants_never_admit_the_external_network` — A-51:
+//   External is refused in `AnonymousGrant::new`, and no accepted entry,
+//   alone or together with the others, admits an anonymous request from
+//   the external network;
 // - `root_dse_changes_no_other_decision` — over the equivalence domain;
 // - `root_dse_requests_keep_the_invariants` — P1-P4, P7, P9 and the exact
 //   outcome of every rootDSE request.
@@ -1558,33 +1564,32 @@ fn networkless_entries() -> Vec<(ActionMatch, ResourceMatch, TransportSec)> {
     ]
 }
 
-/// The allowlist with each entry once per network in `nets`.
-fn entries_for(
-    picked: &[(ActionMatch, ResourceMatch, TransportSec)],
-    nets: &[IpScope],
-) -> Vec<AnonymousGrant> {
-    let mut out = Vec::new();
-    for (action, resource, min) in picked {
-        for net in nets {
-            out.push(
-                AnonymousGrant::new(action.clone(), resource.clone(), *min, *net).expect("bounded"),
-            );
-        }
-    }
-    out
+/// The allowlist with each pre-fix entry mapped to the internal network —
+/// the only network an entry can name (docs/15 §6; A-51).
+fn internal_entries(picked: &[(ActionMatch, ResourceMatch, TransportSec)]) -> Vec<AnonymousGrant> {
+    picked
+        .iter()
+        .map(|(action, resource, min)| {
+            AnonymousGrant::new(action.clone(), resource.clone(), *min, IpScope::Internal)
+                .expect("bounded, internal")
+        })
+        .collect()
 }
 
-/// docs/15 §6 / Q-164 item 3 only narrows. One entry per network for each
-/// pre-fix entry is network-blind (checked here: its decisions do not
-/// depend on `Context.src_net`) and, since `IpScope` has two values and the
-/// minimums of all matching entries are joined, it reproduces the pre-fix
-/// allowlist exactly. Mapping each pre-fix entry to the internal network
-/// alone (docs/15 §6): from the internal network every decision is
-/// unchanged; from the external network every anonymous request is denied,
-/// and authenticated ones are unchanged. So every change is Allow → Deny.
-/// Over seven allowlists (including joined minimums), authenticated and
-/// anonymous subjects, six requests (the rootDSE among them), both
-/// networks, three transports and two policies.
+/// docs/15 §6 / Q-164 item 3 / A-51 only narrows. The pre-fix allowlist had
+/// no network: its entries matched on action and resource alone. With each
+/// pre-fix entry mapped to the internal network, a request from the
+/// internal network meets exactly the entries the pre-fix allowlist would
+/// have matched; every rule here leaves `src_net` open (checked), and
+/// nothing else in `decide` reads the network. So the pre-fix decision for
+/// a request from EITHER network is the decision for the same request from
+/// the internal network under the mapped allowlist. (Before A-51 this was
+/// reproduced by one entry per network; an external entry can no longer be
+/// built.) From the external network every anonymous request is denied and
+/// authenticated ones are unchanged, so every change is Allow → Deny. Over
+/// seven allowlists (including joined minimums), authenticated and
+/// anonymous subjects, six requests (the rootDSE among them), three
+/// transports and two policies.
 #[test]
 fn source_network_fix_only_narrows() {
     let entries = networkless_entries();
@@ -1660,19 +1665,15 @@ fn source_network_fix_only_narrows() {
             },
         ],
     ];
+    // The premise of the reproduction: no rule constrains the network.
+    for rules in &rule_sets {
+        assert!(rules.iter().all(|r| r.when.context.src_net.is_none()));
+    }
     let (mut narrowed, mut kept) = (0usize, 0usize);
     for picked in &allowlists {
         for rules in &rule_sets {
-            let blind = PolicySnapshot::new(
-                PolicyVersion(1),
-                rules.clone(),
-                entries_for(picked, &[IpScope::Internal, IpScope::External]),
-            );
-            let internal = PolicySnapshot::new(
-                PolicyVersion(1),
-                rules.clone(),
-                entries_for(picked, &[IpScope::Internal]),
-            );
+            let internal =
+                PolicySnapshot::new(PolicyVersion(1), rules.clone(), internal_entries(picked));
             for s in [the_user(), anonymous.clone()] {
                 let authenticated = s.auth.strength != AuthStrength::Unauth;
                 for (action, resource) in &requests {
@@ -1689,13 +1690,9 @@ fn source_network_fix_only_narrows() {
                             req
                         };
                         let (int_req, ext_req) = (at(IpScope::Internal), at(IpScope::External));
-                        // The reproduction of the pre-fix allowlist is
-                        // network-blind.
-                        let before_int = decide(&int_req, &blind, &pip);
-                        let before_ext = decide(&ext_req, &blind, &pip);
-                        assert_eq!(before_int, before_ext, "{int_req:?}");
-                        // From the internal network: unchanged.
-                        assert_eq!(decide(&int_req, &internal, &pip), before_int);
+                        // The pre-fix decision, for either network (see
+                        // the test documentation).
+                        let before_ext = decide(&int_req, &internal, &pip);
                         // From the external network.
                         let now_ext = decide(&ext_req, &internal, &pip);
                         if authenticated {
@@ -1718,11 +1715,184 @@ fn source_network_fix_only_narrows() {
     assert!(narrowed > 0 && kept > 0, "{narrowed} {kept}");
 }
 
+/// docs/15 §6 ("only these, from the internal network"); A-51 (Q-170 item
+/// 3): never widen. Over every candidate allowlist entry of the domain
+/// (seven action matchers × eight resource matchers, `Any` among them ×
+/// three transport minimums × both networks): construction accepts exactly
+/// the bounded internal entries, refuses every external one, and every
+/// accepted entry names the internal network. No accepted entry matches a
+/// request from the external network — over two unauthenticated subjects,
+/// seven actions × seven resources and three transports — and through
+/// `decide`, under the widest rules (Allow everything), neither any single
+/// accepted entry nor all of them together let an anonymous request from
+/// the external network past layer 1: each is denied as malformed or
+/// unauthenticated, exactly as with no allowlist at all. The same entries do
+/// admit requests from the internal network (the domain is not vacuous).
+#[test]
+fn accepted_anonymous_grants_never_admit_the_external_network() {
+    let actions = [
+        ActionMatch::Any,
+        ActionMatch::Exact(Action::DirRead),
+        ActionMatch::Exact(Action::DirList),
+        ActionMatch::AnyOf(vec![Action::DirRead, Action::DirList]),
+        ActionMatch::Class(ActionClass::Directory),
+        ActionMatch::Class(ActionClass::Dns),
+        ActionMatch::Class(ActionClass::Kerberos),
+    ];
+    let zone = || pdp::ZoneId("test".into());
+    let resources = [
+        ResourceMatch::Any,
+        ResourceMatch::RootDse,
+        subtree(parent_dn()),
+        subtree(obj_dn()),
+        ResourceMatch::Dns { zone: zone() },
+        ResourceMatch::Kerberos { kind: None },
+        ResourceMatch::Kerberos {
+            kind: Some(pdp::KerbResKind::Tgt),
+        },
+        ResourceMatch::Policy { scope: None },
+    ];
+    let mut accepted = Vec::new();
+    let mut candidates = 0usize;
+    for action in &actions {
+        for resource in &resources {
+            for min in [TransportSec::NONE, ENC_ONLY, ALL_SEC] {
+                for net in [IpScope::Internal, IpScope::External] {
+                    let built = AnonymousGrant::new(action.clone(), resource.clone(), min, net);
+                    // The resource is checked before the network.
+                    let refusal = if matches!(resource, ResourceMatch::Any) {
+                        Some(RuleError::UnboundedAnonymousResource)
+                    } else if net == IpScope::External {
+                        Some(RuleError::AnonymousExternalNetwork)
+                    } else {
+                        None
+                    };
+                    assert_eq!(
+                        built.as_ref().err().copied(),
+                        refusal,
+                        "{action:?} {resource:?} {net:?}"
+                    );
+                    if let Ok(g) = built {
+                        assert_eq!(g.src_net(), IpScope::Internal);
+                        accepted.push(g);
+                    }
+                    candidates += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(candidates, 7 * 8 * 3 * 2);
+    assert_eq!(accepted.len(), 7 * 7 * 3);
+
+    let mut unverified = subject(everyone(), &[], Tier::Tier1);
+    unverified.auth.ticket_verified = false;
+    let mut anonymous = unverified.clone();
+    anonymous.auth.strength = AuthStrength::Unauth;
+    let request_actions = [
+        Action::DirRead,
+        Action::DirList,
+        Action::DirWrite,
+        Action::DnsUpdate,
+        Action::KdcAs,
+        Action::KdcTgs,
+        Action::PolicyAdmin,
+    ];
+    let request_resources = [
+        Resource::RootDse,
+        Resource::DirObject {
+            dn: obj_dn(),
+            attr: None,
+        },
+        Resource::DirObject {
+            dn: obj_dn(),
+            attr: Some(AttrId(attr_alone())),
+        },
+        Resource::DirObject {
+            dn: parent_dn(),
+            attr: None,
+        },
+        Resource::Dns {
+            zone: zone(),
+            record: None,
+        },
+        Resource::Kerberos {
+            kind: pdp::KerbResKind::Tgt,
+        },
+        Resource::Policy {
+            scope: pdp::PolicyScope("domain".into()),
+        },
+    ];
+    let mut requests = Vec::new();
+    for s in [anonymous, unverified] {
+        for action in &request_actions {
+            for resource in &request_resources {
+                for sec in transports() {
+                    let mut req = AccessRequest {
+                        subject: s.clone(),
+                        resource: resource.clone(),
+                        action: action.clone(),
+                        context: strong_context(),
+                    };
+                    req.context.transport_sec = sec;
+                    requests.push(req);
+                }
+            }
+        }
+    }
+    let at = |req: &AccessRequest, net: IpScope| {
+        let mut r = req.clone();
+        r.context.src_net = net;
+        r
+    };
+
+    // The matcher itself.
+    let mut internal_matches = 0usize;
+    for g in &accepted {
+        for req in &requests {
+            assert!(!g.matches(&at(req, IpScope::External)), "{g:?} {req:?}");
+            internal_matches += usize::from(g.matches(&at(req, IpScope::Internal)));
+        }
+    }
+    assert!(internal_matches > 0);
+
+    // Through decide.
+    let pip = MockPip::with_sd(sd(None, vec![allow(RIGHT_GENERIC_ALL, everyone())]));
+    let rules = vec![allow_everything(1)];
+    let no_allowlist = policy(rules.clone());
+    let mut allowlists: Vec<Vec<AnonymousGrant>> =
+        accepted.iter().map(|g| vec![g.clone()]).collect();
+    allowlists.push(accepted.clone());
+    let mut internal_allowed = 0usize;
+    for req in &requests {
+        let (int_req, ext_req) = (at(req, IpScope::Internal), at(req, IpScope::External));
+        let without = decide(&ext_req, &no_allowlist, &pip);
+        assert_eq!(without.effect, Effect::Deny);
+        assert!(
+            matches!(
+                without.reason,
+                ReasonCode::InvalidRequest | ReasonCode::Unauthenticated
+            ),
+            "{without:?}"
+        );
+        for entries in &allowlists {
+            let pol = PolicySnapshot::new(PolicyVersion(1), rules.clone(), entries.clone());
+            assert_eq!(
+                decide(&ext_req, &pol, &pip),
+                without,
+                "{ext_req:?} {entries:?}"
+            );
+            internal_allowed += usize::from(decide(&int_req, &pol, &pip).effect == Effect::Allow);
+        }
+    }
+    assert!(internal_allowed > 0);
+}
+
 /// docs/49 §5.2 (R49-10): the new resource changes no other decision. Over
 /// the whole equivalence domain (directory and Kerberos inputs, 142,776),
 /// appending an Allow rule on the rootDSE, a Deny rule on the rootDSE, or
-/// anonymous-allowlist entries for the rootDSE on both networks to any
-/// policy of the domain leaves every decision identical.
+/// an anonymous-allowlist entry for the rootDSE (internal network — an
+/// external entry cannot be built, A-51) to any policy of the domain leaves
+/// every decision identical.
 #[test]
 fn root_dse_changes_no_other_decision() {
     let root_rule = |id: u32, effect: Effect| Rule {
@@ -1734,22 +1904,22 @@ fn root_dse_changes_no_other_decision() {
         },
         obligations: vec![Obligation::Constrain(pdp::Constraint::MaxPageSize(1))],
     };
-    let root_entries = vec![
-        AnonymousGrant::new(
-            ActionMatch::Any,
-            ResourceMatch::RootDse,
-            TransportSec::NONE,
-            IpScope::Internal,
-        )
-        .expect("bounded"),
+    let root_entries = vec![AnonymousGrant::new(
+        ActionMatch::Any,
+        ResourceMatch::RootDse,
+        TransportSec::NONE,
+        IpScope::Internal,
+    )
+    .expect("bounded")];
+    assert_eq!(
         AnonymousGrant::new(
             ActionMatch::Any,
             ResourceMatch::RootDse,
             TransportSec::NONE,
             IpScope::External,
-        )
-        .expect("bounded"),
-    ];
+        ),
+        Err(RuleError::AnonymousExternalNetwork)
+    );
     let mut count = 0usize;
     for_each_equivalence_input(|req, pol, pip| {
         let before = decide(req, pol, pip);
@@ -1771,9 +1941,10 @@ fn root_dse_changes_no_other_decision() {
 }
 
 /// P1-P4, P7, P9 for rootDSE requests, and their exact outcome (docs/11 §4,
-/// §10; docs/49 §5.2; docs/15 §6; Q-164 items 1, 3). Over twelve subjects,
-/// every directory action and two others on the rootDSE, both networks,
-/// three transports, five rule sets, four allowlists and both PIP tiers:
+/// §10; docs/49 §5.2; docs/15 §6; Q-164 items 1, 3; A-51). Over twelve
+/// subjects, every directory action and two others on the rootDSE, both
+/// networks, three transports, five rule sets, four allowlists (internal
+/// entries only, A-51) and both PIP tiers:
 /// deterministic with one Audit, Allow ⇔ reason Allowed; an Allow needs an
 /// applying Allow rule (P2); a tier disagreeing with the PIP denies (P3); a
 /// Deny-everything rule denies (P4); `Context.time` changes nothing (P9);
@@ -1811,11 +1982,17 @@ fn root_dse_requests_keep_the_invariants() {
         )
         .expect("bounded")
     };
+    // Every entry names the internal network: an external one cannot be
+    // built (A-51), so anonymous requests from the external network meet no
+    // entry. The last allowlist joins two minimums.
     let allowlists = vec![
         vec![],
         vec![entry(IpScope::Internal, TransportSec::NONE)],
         vec![entry(IpScope::Internal, ENC_ONLY)],
-        vec![entry(IpScope::External, TransportSec::NONE)],
+        vec![
+            entry(IpScope::Internal, TransportSec::NONE),
+            entry(IpScope::Internal, ALL_SEC),
+        ],
     ];
     let actions = [
         Action::DirRead,

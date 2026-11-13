@@ -24,7 +24,7 @@
 //!   Allow rule it matches nothing ([`Rule::applies`]) — DELIBERATE, fail
 //!   closed, see Q-130.
 //!
-//! # Construction refusals (Q-164 items 2-3, A-48)
+//! # Construction refusals (Q-164 items 2-3, A-48; Q-170 item 3, A-51)
 //!
 //! Two pieces of policy data are checked when they are built, and a value
 //! that fails the check cannot exist:
@@ -35,10 +35,11 @@
 //!   allowlist. A rule over every resource is written explicitly as
 //!   [`ResourceMatch::Any`] (for a Deny, together with an action matcher
 //!   such as `ActionMatch::Class(ActionClass::Directory)`);
-//! - an anonymous-allowlist entry ([`AnonymousGrant`]) always names the
-//!   source network it admits (docs/15 §6, "only these, from the internal
-//!   network") — there is no "any network" form — and never names every
-//!   resource.
+//! - an anonymous-allowlist entry ([`AnonymousGrant`]) admits the internal
+//!   network only (docs/15 §6, "only these, from the internal network";
+//!   A-51: External is forbidden outright): its source network is a
+//!   required field, there is no "any network" form, and every value other
+//!   than [`IpScope::Internal`] is refused. It never names every resource.
 //!
 //! A refusal is a [`RuleError`]. Whoever loads a policy must treat it as a
 //! failure of the whole load (no snapshot, so every decision is Deny), never
@@ -52,7 +53,8 @@ use crate::model::{
 };
 
 /// Why a piece of policy data was refused when it was built. Spec: Q-164
-/// items 2-3 (A-48); docs/15 §6; the module documentation.
+/// items 2-3 (A-48); Q-170 item 3 (A-51); docs/15 §6; the module
+/// documentation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RuleError {
     /// A DN subtree with no RDN component: it would contain every directory
@@ -62,6 +64,11 @@ pub enum RuleError {
     /// ([`ResourceMatch::Any`]): docs/15 §6 lists the only resources
     /// anonymous requests may reach.
     UnboundedAnonymousResource,
+    /// An anonymous-allowlist entry for a source network other than
+    /// [`IpScope::Internal`]: docs/15 §6 admits anonymous requests "from the
+    /// internal network" only, and A-51 (Q-170 item 3) forbids External in
+    /// the allowlist outright.
+    AnonymousExternalNetwork,
 }
 
 /// The root of a DN subtree in a rule: a [`Dn`] with at least one RDN
@@ -438,18 +445,20 @@ impl Match {
 /// Allow by itself: layers 3-5 still apply.
 ///
 /// Constructed only through [`AnonymousGrant::new`], which enforces the
-/// module's construction refusals: the entry names exactly one source
-/// network (there is no "any network" form — the stricter option of Q-164
-/// item 3), and never every resource. docs/15 §6 lists the anonymous
-/// allowlist as "only these, from the internal network", so a deployment
-/// names [`IpScope::Internal`]; naming [`IpScope::External`] is an explicit,
-/// separate entry.
+/// module's construction refusals: the entry names its source network
+/// (there is no "any network" form — the stricter option of Q-164 item 3),
+/// that network is [`IpScope::Internal`] and nothing else, and the entry
+/// never names every resource. docs/15 §6 lists the anonymous allowlist as
+/// "only these, from the internal network"; A-51 (Q-170 item 3) decided
+/// that an entry for [`IpScope::External`] cannot exist, so no allowlist
+/// admits an anonymous request from the external network.
 ///
 /// Spec: docs/11 §4 (`anon_allowlist`; "anonymous allowlist (rootDSE, CLDAP
 /// ping) → configured minimum"); docs/15 §6; docs/06 §5.1; docs/05 §3
 /// (CLDAP / anonymous: rootDSE only); [MS-ADTS] 5.1.3 (with
 /// fLDAPBlockAnonOps "anonymous (unauthenticated) users are limited to
-/// performing rootDSE searches and binds"); Q-164 items 2-3 (A-48).
+/// performing rootDSE searches and binds"); Q-164 items 2-3 (A-48); Q-170
+/// item 3 (A-51).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnonymousGrant {
     action: ActionMatch,
@@ -467,7 +476,12 @@ impl AnonymousGrant {
     /// named the empty subtree; `Any` is the same "every object" match in
     /// explicit form, and docs/15 §6 admits only the listed resources). An
     /// empty subtree cannot reach here at all ([`SubtreeBase`]).
-    /// Spec: docs/15 §6; Q-164 items 2-3.
+    ///
+    /// [`RuleError::AnonymousExternalNetwork`] if `src_net` is anything but
+    /// [`IpScope::Internal`] (docs/15 §6: "from the internal network"; A-51,
+    /// Q-170 item 3). The resource is checked first, so an entry refused on
+    /// both counts reports `UnboundedAnonymousResource`.
+    /// Spec: docs/15 §6; Q-164 items 2-3 (A-48); Q-170 item 3 (A-51).
     pub fn new(
         action: ActionMatch,
         resource: ResourceMatch,
@@ -476,6 +490,13 @@ impl AnonymousGrant {
     ) -> Result<AnonymousGrant, RuleError> {
         if matches!(resource, ResourceMatch::Any) {
             return Err(RuleError::UnboundedAnonymousResource);
+        }
+        // Spec: docs/15 §6 ("only these, from the internal network"); A-51
+        // (Q-170 item 3): External is forbidden in the allowlist. Written as
+        // "anything but Internal", so a network value added to `IpScope`
+        // later is refused here too (fail closed) rather than admitted.
+        if !matches!(src_net, IpScope::Internal) {
+            return Err(RuleError::AnonymousExternalNetwork);
         }
         Ok(AnonymousGrant {
             action,
@@ -503,15 +524,17 @@ impl AnonymousGrant {
         self.min_transport
     }
 
-    /// The only source network this entry admits.
+    /// The only source network this entry admits — always
+    /// [`IpScope::Internal`] ([`AnonymousGrant::new`]; docs/15 §6, A-51).
     #[must_use]
     pub fn src_net(&self) -> IpScope {
         self.src_net
     }
 
     /// `true` if the entry admits `req`: its action, its resource and its
-    /// source network (`Context.src_net`) all match. Spec: docs/11 §4
-    /// (`anon_allowlist(req)`); docs/15 §6 ("from the internal network").
+    /// source network (`Context.src_net`, which must be the internal one)
+    /// all match. Spec: docs/11 §4 (`anon_allowlist(req)`); docs/15 §6
+    /// ("from the internal network"); A-51 (Q-170 item 3).
     #[must_use]
     pub fn matches(&self, req: &AccessRequest) -> bool {
         self.action.matches(&req.action)

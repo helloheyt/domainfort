@@ -238,8 +238,9 @@ fn is_authenticated(auth: &AuthContext) -> bool {
 
 /// The configured transport minimum for an unauthenticated request that is
 /// on the anonymous allowlist, or `None` if it is not. An entry admits a
-/// request only from the source network it names (`AnonymousGrant::matches`;
-/// docs/15 §6, "from the internal network"; Q-164 item 3). If several
+/// request only from the source network it names, which is always the
+/// internal one (`AnonymousGrant::matches`, `AnonymousGrant::new`; docs/15
+/// §6, "from the internal network"; Q-164 item 3; A-51). If several
 /// entries match, all of their minimums apply (fail closed). Spec: docs/11 §4
 /// (`anon_allowlist`; "anonymous allowlist (rootDSE, CLDAP ping) → configured
 /// minimum").

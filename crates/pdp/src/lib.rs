@@ -31,9 +31,10 @@
 //!   DN.
 //! - A rule's DN subtree is a [`SubtreeBase`], never empty — the empty base
 //!   matched every object (a bug found in merged code, Q-164 item 2).
-//! - An [`AnonymousGrant`] names the source network it admits (docs/15 §6)
-//!   and never every resource; both refusals are [`RuleError`]s at
-//!   construction.
+//! - An [`AnonymousGrant`] names the source network it admits, which can
+//!   only be the internal one (docs/15 §6; A-51, Q-170 item 3: External is
+//!   forbidden), and never every resource; these refusals are
+//!   [`RuleError`]s at construction.
 //! - Reading nTSecurityDescriptor asks the rights of [MS-ADTS] 3.1.1.4.4
 //!   (ACCESS_SYSTEM_SECURITY and RIGHT_READ_CONTROL), which a `Subject`
 //!   without privileges never holds (a bug found in merged code, A-48).

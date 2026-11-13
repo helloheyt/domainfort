@@ -1,6 +1,7 @@
 //! The PDP extensions for LDAP and the two fixes found in merged code.
 //!
-//! Source (each test names its own): Q-164 items 1-3 (A-48); docs/49 §5.2
+//! Source (each test names its own): Q-164 items 1-3 (A-48); Q-170 item 3
+//! (A-51: External forbidden in `AnonymousGrant`); docs/49 §5.2
 //! (R49-10); docs/15 §6 ("only these, from the internal network"); docs/11
 //! §4 (layers, `required_sec`); [MS-ADTS] v20261026 3.1.1.3 ("The rootDSE
 //! (empty DN) ... rather than with particular objects"), 3.1.1.3.2 (rootDSE
@@ -115,6 +116,8 @@ fn anonymous_grant_refuses_every_resource() {
         ActionMatch::Exact(Action::DirRead),
         ActionMatch::Class(ActionClass::Directory),
     ] {
+        // The resource is checked before the network (`AnonymousGrant::new`),
+        // so an external entry over every resource reports this refusal.
         for net in [IpScope::Internal, IpScope::External] {
             for min in [TransportSec::NONE, ENCRYPTED] {
                 assert_eq!(
@@ -149,62 +152,113 @@ fn anonymous_grant_refuses_every_resource() {
     }
 }
 
-/// docs/15 §6 ("from the internal network"); Q-164 item 3: an entry admits
-/// an anonymous request only from the network it names. An entry for the
-/// external network is a separate, explicit entry. Authenticated requests
-/// never consult the allowlist, so the entries' networks do not affect them.
+/// docs/15 §6 ("only these, from the internal network"); A-51 (Q-170 item
+/// 3: External is forbidden in `AnonymousGrant`): an entry for the external
+/// network is refused, whatever its action, its (bounded) resource or its
+/// transport minimum; the same entry for the internal network is accepted
+/// and keeps its fields.
 #[test]
-fn anonymous_grant_admits_only_its_source_network() {
-    let pip = open_pip();
-    let rules = vec![allow_everything(1)];
-    let internal_only = snapshot(
-        rules.clone(),
-        vec![root_dse_grant(IpScope::Internal, TransportSec::NONE)],
-    );
-    let external_only = snapshot(
-        rules.clone(),
-        vec![root_dse_grant(IpScope::External, TransportSec::NONE)],
-    );
-    let both = snapshot(
-        rules,
-        vec![
-            root_dse_grant(IpScope::Internal, TransportSec::NONE),
-            root_dse_grant(IpScope::External, TransportSec::NONE),
-        ],
-    );
-    let anon = |net| root_dse_read(anonymous(), net, TransportSec::NONE);
-    let reason = |req: &AccessRequest, pol: &PolicySnapshot| decide(req, pol, &pip).reason;
-
-    assert_eq!(
-        reason(&anon(IpScope::Internal), &internal_only),
-        ReasonCode::Allowed
-    );
-    assert_eq!(
-        reason(&anon(IpScope::External), &internal_only),
-        ReasonCode::Unauthenticated
-    );
-    assert_eq!(
-        reason(&anon(IpScope::Internal), &external_only),
-        ReasonCode::Unauthenticated
-    );
-    assert_eq!(
-        reason(&anon(IpScope::External), &external_only),
-        ReasonCode::Allowed
-    );
-    for net in [IpScope::Internal, IpScope::External] {
-        assert_eq!(reason(&anon(net), &both), ReasonCode::Allowed);
-        // An authenticated read over the read floor, from either network,
-        // under each allowlist.
-        let authenticated = root_dse_read(the_user(), net, ENCRYPTED);
-        for pol in [&internal_only, &external_only, &both] {
-            assert_eq!(reason(&authenticated, pol), ReasonCode::Allowed);
+fn anonymous_grant_refuses_the_external_network() {
+    let actions = [
+        ActionMatch::Any,
+        ActionMatch::Exact(Action::DirRead),
+        ActionMatch::AnyOf(vec![Action::DirRead, Action::DirList]),
+        ActionMatch::Class(ActionClass::Directory),
+        ActionMatch::Class(ActionClass::Dns),
+    ];
+    let bounded = [
+        ResourceMatch::RootDse,
+        subtree(parent_dn()),
+        ResourceMatch::Dns {
+            zone: pdp::ZoneId("test".into()),
+        },
+        ResourceMatch::Kerberos { kind: None },
+        ResourceMatch::Kerberos {
+            kind: Some(KerbResKind::Tgt),
+        },
+    ];
+    let all = TransportSec {
+        encrypted: true,
+        sealed: true,
+        channel_bound: true,
+    };
+    for action in &actions {
+        for resource in &bounded {
+            for min in [TransportSec::NONE, ENCRYPTED, all] {
+                assert_eq!(
+                    AnonymousGrant::new(action.clone(), resource.clone(), min, IpScope::External),
+                    Err(RuleError::AnonymousExternalNetwork),
+                    "{action:?} {resource:?}"
+                );
+                let g =
+                    AnonymousGrant::new(action.clone(), resource.clone(), min, IpScope::Internal)
+                        .expect("bounded, internal");
+                assert_eq!(g.action(), action);
+                assert_eq!(g.resource(), resource);
+                assert_eq!(g.min_transport(), min);
+                assert_eq!(g.src_net(), IpScope::Internal);
+            }
         }
     }
 }
 
-/// docs/11 §4 ("anonymous allowlist ... → configured minimum"); docs/15 §6:
-/// the transport minimum of the matching entries applies; an entry for
-/// another network does not match, so its minimum does not apply.
+/// docs/15 §6 ("from the internal network"); Q-164 item 3; A-51 (Q-170
+/// item 3): an entry admits an anonymous request only from the network it
+/// names, which can only be the internal one — an anonymous request from
+/// the external network is unauthenticated over every transport. The
+/// external entry that would have admitted it cannot be built.
+/// Authenticated requests never consult the allowlist, so they are allowed
+/// from either network.
+#[test]
+fn anonymous_grant_admits_only_its_source_network() {
+    let pip = open_pip();
+    let all = TransportSec {
+        encrypted: true,
+        sealed: true,
+        channel_bound: true,
+    };
+    let internal_only = snapshot(
+        vec![allow_everything(1)],
+        vec![root_dse_grant(IpScope::Internal, TransportSec::NONE)],
+    );
+    assert_eq!(
+        AnonymousGrant::new(
+            ActionMatch::Exact(Action::DirRead),
+            ResourceMatch::RootDse,
+            TransportSec::NONE,
+            IpScope::External,
+        ),
+        Err(RuleError::AnonymousExternalNetwork)
+    );
+    let reason = |req: &AccessRequest, pol: &PolicySnapshot| decide(req, pol, &pip).reason;
+
+    for sec in [TransportSec::NONE, ENCRYPTED, all] {
+        assert_eq!(
+            reason(
+                &root_dse_read(anonymous(), IpScope::Internal, sec),
+                &internal_only
+            ),
+            ReasonCode::Allowed
+        );
+        assert_eq!(
+            reason(
+                &root_dse_read(anonymous(), IpScope::External, sec),
+                &internal_only
+            ),
+            ReasonCode::Unauthenticated
+        );
+    }
+    for net in [IpScope::Internal, IpScope::External] {
+        // An authenticated read over the read floor, from either network.
+        let authenticated = root_dse_read(the_user(), net, ENCRYPTED);
+        assert_eq!(reason(&authenticated, &internal_only), ReasonCode::Allowed);
+    }
+}
+
+/// docs/11 §4 ("anonymous allowlist ... → configured minimum"); docs/15 §6;
+/// A-51: the transport minimum of the matching entries applies; an
+/// anonymous request from the external network matches no entry, so no
+/// minimum applies to it and it stays unauthenticated.
 #[test]
 fn anonymous_grant_floor_applies_to_its_network() {
     let pip = open_pip();
@@ -237,20 +291,17 @@ fn anonymous_grant_floor_applies_to_its_network() {
         decide(&tls, &joined, &pip).reason,
         ReasonCode::WeakTransport
     );
-    // The strict entry names the other network: not joined.
-    let per_network = snapshot(
-        vec![allow_everything(1)],
-        vec![
-            root_dse_grant(IpScope::Internal, TransportSec::NONE),
-            root_dse_grant(IpScope::External, all),
-        ],
-    );
-    assert_eq!(decide(&plain, &per_network, &pip).effect, Effect::Allow);
-    let external_plain = root_dse_read(anonymous(), IpScope::External, TransportSec::NONE);
-    assert_eq!(
-        decide(&external_plain, &per_network, &pip).reason,
-        ReasonCode::WeakTransport
-    );
+    // From the external network no entry matches (none can name it,
+    // A-51): unauthenticated, not a transport failure, over every transport.
+    for sec in [TransportSec::NONE, ENCRYPTED, all] {
+        let external = root_dse_read(anonymous(), IpScope::External, sec);
+        for pol in [&encrypted_floor, &joined] {
+            assert_eq!(
+                decide(&external, pol, &pip).reason,
+                ReasonCode::Unauthenticated
+            );
+        }
+    }
 }
 
 // ----------------------------------------------- Q-164 item 1: rootDSE ----
