@@ -160,6 +160,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ipc"
+version = "0.0.0"
+dependencies = [
+ "zeroize",
+]
+
+[[package]]
 name = "kdc"
 version = "0.0.0"
 dependencies = [

@@ -1,0 +1,52 @@
+# cargo-fuzz harness for ipc (AGENTS.md §6: every parser gets a fuzz target
+# before it merges to main; docs/50 §9 / R50-19: a fuzz target for every new
+# codec; R50-4: "parser ⇒ fuzz target").
+#
+# This is a SEPARATE workspace (note the empty [workspace] table below): it is
+# intentionally NOT a member of the root workspace, so `cargo build --all`,
+# `cargo clippy`, `cargo test`, `cargo deny` and the SBOM in the product
+# workspace never pull in the fuzzing-only dependencies. It is built only via
+# `cargo fuzz run ipc_frame` / `cargo fuzz run ipc_reader` (nightly +
+# cargo-fuzz).
+#
+# NOTE FOR REVIEW: libfuzzer-sys is fuzz-harness-only test infrastructure, not
+# linked into any product crate, and on the license allowlist (MIT / Apache-2.0,
+# AGENTS.md §7). Pending owner sign-off (docs/questions/PENDING-OWNER.md P-1);
+# not built or run until then.
+
+[package]
+name = "ipc-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ipc]
+path = ".."
+
+# `decode_frame` and `FrameReader` on arbitrary stream buffers, which must
+# agree frame for frame and never exceed the bound (`cargo fuzz run ipc_frame`).
+[[bin]]
+name = "ipc_frame"
+path = "fuzz_targets/ipc_frame.rs"
+test = false
+doc = false
+bench = false
+
+# `decode_body` / `Reader` on arbitrary bodies of a message set that uses every
+# field primitive, with the canonical round-trip property
+# (`cargo fuzz run ipc_reader`).
+[[bin]]
+name = "ipc_reader"
+path = "fuzz_targets/ipc_reader.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the root workspace (see header).
+[workspace]
