@@ -69,7 +69,20 @@
 //!   u8 format, u64 live-child count (>= 1; zero is never stored)
 //! meta        (key: "store")
 //!   u8 format
+//! counter     (key: "counter:" || name, in the meta table)
+//!   u8 format, u64 first_value, u64 next_value, u64 end_exclusive
+//!   with first_value < end_exclusive and
+//!        first_value <= next_value <= end_exclusive
 //! ```
+//!
+//! A counter name is 1..=[`crate::MAX_COUNTER_NAME_LEN`] bytes of `a`–`z`,
+//! `0`–`9`, `.`, `-`, `_`, so no counter key can equal `"store"` (a counter key
+//! always starts with [`COUNTER_KEY_PREFIX`]). The counter record also has its
+//! own integrity kind ([`crate::RecordKind::Counter`]), so a counter record
+//! and the store record can never stand in for each other, and the tag binds
+//! the key, so one counter's record cannot be moved to another name. A
+//! counter body is exactly 25 bytes; the decoder enforces the invariant, so a
+//! state outside its range is never believed (docs/51 §8.3, A-75).
 //!
 //! All name-index keys under one parent share its [`name_index_prefix`], so
 //! one prefix scan lists the live children of a parent (or the roots) in
@@ -92,15 +105,15 @@
 //!
 //! Spec: docs/10 D34; docs/32 §2 (object / name index, D134), §8 (bounded
 //! parser, D138); docs/29 §2 (attr-stamp), §5 (tombstone); docs/46 §8.4
-//! (reverse links), §8.5 (unique index).
+//! (reverse links), §8.5 (unique index); docs/51 §8.3 (named counter, A-75).
 
 use crate::error::{DecodeError, Violation};
 use crate::types::{
-    AttrId, AttrStamp, Attribute, ClassId, NodeId, Object, StampedValue, Timestamp,
+    AttrId, AttrStamp, Attribute, ClassId, CounterState, NodeId, Object, StampedValue, Timestamp,
 };
 use crate::{
-    MAX_ATTRIBUTES_PER_OBJECT, MAX_CLASSES_PER_OBJECT, MAX_RDN_KEY_LEN, MAX_RECORD_BODY_LEN,
-    MAX_VALUES_PER_ATTRIBUTE, MAX_VALUE_LEN,
+    MAX_ATTRIBUTES_PER_OBJECT, MAX_CLASSES_PER_OBJECT, MAX_COUNTER_NAME_LEN, MAX_RDN_KEY_LEN,
+    MAX_RECORD_BODY_LEN, MAX_VALUES_PER_ATTRIBUTE, MAX_VALUE_LEN,
 };
 use core::num::NonZeroU64;
 use dtyp::{Guid, GUID_PACKET_LEN};
@@ -646,6 +659,85 @@ pub fn decode_meta_body(body: &[u8]) -> Result<(), DecodeError> {
     r.finish()
 }
 
+/// Prefix of every counter key in the meta table (docs/51 §8.2 puts the
+/// counter record there). Spec: docs/51 §8.2-§8.3; project layout.
+pub const COUNTER_KEY_PREFIX: &[u8] = b"counter:";
+
+/// `true` for a byte a counter name may hold. Spec: docs/32 §8; Q-330
+/// item 2 (see [`crate::MAX_COUNTER_NAME_LEN`] for the reasons).
+fn is_counter_name_byte(b: u8) -> bool {
+    b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-' | b'_')
+}
+
+/// The meta-table key of the counter `name`: [`COUNTER_KEY_PREFIX`]
+/// followed by the name. Refused ([`Violation::InvalidCounterName`]) unless
+/// the name is 1..=[`crate::MAX_COUNTER_NAME_LEN`] bytes of `a`–`z`, `0`–`9`,
+/// `.`, `-`, `_`. The name is checked before anything else is done with it.
+/// Spec: docs/51 §8.3 (named counter, A-75); docs/32 §8 (bounded input).
+pub fn counter_key(name: &str) -> Result<Vec<u8>, Violation> {
+    let bytes = name.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > MAX_COUNTER_NAME_LEN
+        || !bytes.iter().all(|b| is_counter_name_byte(*b))
+    {
+        return Err(Violation::InvalidCounterName);
+    }
+    let mut key = COUNTER_KEY_PREFIX.to_vec();
+    key.extend_from_slice(bytes);
+    Ok(key)
+}
+
+/// `Ok` if the counter state is inside its range: `first_value <
+/// end_exclusive` (else [`Violation::EmptyCounterRange`]) and `first_value
+/// <= next_value <= end_exclusive` (else [`Violation::InvalidCounterState`]).
+/// Spec: A-75 ("within the bounds it was initialised with").
+fn check_counter_state(state: &CounterState) -> Result<(), Violation> {
+    if state.first_value >= state.end_exclusive {
+        return Err(Violation::EmptyCounterRange);
+    }
+    if state.next_value < state.first_value || state.next_value > state.end_exclusive {
+        return Err(Violation::InvalidCounterState);
+    }
+    Ok(())
+}
+
+/// Length of a counter body: format byte and three `u64`. Spec: the layout
+/// table above.
+const COUNTER_BODY_LEN: usize = 1 + 8 + 8 + 8;
+
+/// Encode a counter body. Refuses a state the decoder would reject (an empty
+/// or inverted range, or `next_value` outside `[first_value,
+/// end_exclusive]`), so `decode(encode(s)) == s`.
+/// Spec: docs/51 §8.3 (A-75); docs/10 D34 (canonical codec).
+pub fn encode_counter_body(state: &CounterState) -> Result<Vec<u8>, Violation> {
+    check_counter_state(state)?;
+    let mut out = Vec::with_capacity(COUNTER_BODY_LEN);
+    out.push(RECORD_FORMAT_V1);
+    out.extend_from_slice(&state.first_value.to_be_bytes());
+    out.extend_from_slice(&state.next_value.to_be_bytes());
+    out.extend_from_slice(&state.end_exclusive.to_be_bytes());
+    Ok(out)
+}
+
+/// Decode a counter body. Bounded and fail-closed: fixed length, known
+/// format, and a state inside its range ([`DecodeError::CounterState`]);
+/// never panics. Every body it accepts re-encodes to the same bytes.
+/// Spec: docs/51 §8.3 (A-75); docs/32 §8 (D138); docs/10 D34.
+pub fn decode_counter_body(body: &[u8]) -> Result<CounterState, DecodeError> {
+    let mut r = Reader::new(body);
+    if r.u8()? != RECORD_FORMAT_V1 {
+        return Err(DecodeError::UnsupportedFormat);
+    }
+    let state = CounterState {
+        first_value: r.u64()?,
+        next_value: r.u64()?,
+        end_exclusive: r.u64()?,
+    };
+    r.finish()?;
+    check_counter_state(&state).map_err(|_| DecodeError::CounterState)?;
+    Ok(state)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -663,6 +755,115 @@ mod tests {
         })
         .unwrap();
         assert_eq!(w.out.len(), STAMP_LEN);
+    }
+
+    // Source: the counter layout table in this module's documentation and
+    // A-75 (within its bounds); our own codec, no external vector exists.
+    #[test]
+    fn counter_body_round_trips_and_is_canonical() {
+        let s = CounterState {
+            first_value: 1101,
+            next_value: 1102,
+            end_exclusive: 0x3FFF_FFFF,
+        };
+        let body = encode_counter_body(&s).unwrap();
+        assert_eq!(body.len(), COUNTER_BODY_LEN);
+        assert_eq!(body[0], RECORD_FORMAT_V1);
+        assert_eq!(&body[1..9], &1101u64.to_be_bytes());
+        assert_eq!(&body[9..17], &1102u64.to_be_bytes());
+        assert_eq!(&body[17..25], &0x3FFF_FFFFu64.to_be_bytes());
+        assert_eq!(decode_counter_body(&body).unwrap(), s);
+        // Exhausted (next == end) and fresh (next == first) are valid.
+        for next in [1101, 0x3FFF_FFFF] {
+            let t = CounterState {
+                next_value: next,
+                ..s
+            };
+            assert_eq!(
+                decode_counter_body(&encode_counter_body(&t).unwrap()),
+                Ok(t)
+            );
+        }
+    }
+
+    // Source: A-75 (empty or inverted bounds refused; never outside them).
+    #[test]
+    fn counter_body_refuses_states_outside_the_range() {
+        let s = |first_value, next_value, end_exclusive| CounterState {
+            first_value,
+            next_value,
+            end_exclusive,
+        };
+        assert_eq!(
+            encode_counter_body(&s(5, 5, 5)),
+            Err(Violation::EmptyCounterRange)
+        );
+        assert_eq!(
+            encode_counter_body(&s(6, 6, 5)),
+            Err(Violation::EmptyCounterRange)
+        );
+        assert_eq!(
+            encode_counter_body(&s(5, 4, 9)),
+            Err(Violation::InvalidCounterState)
+        );
+        assert_eq!(
+            encode_counter_body(&s(5, 10, 9)),
+            Err(Violation::InvalidCounterState)
+        );
+        // The decoder refuses the same states, hand-encoded.
+        let raw = |a: u64, b: u64, c: u64| {
+            let mut v = vec![RECORD_FORMAT_V1];
+            v.extend_from_slice(&a.to_be_bytes());
+            v.extend_from_slice(&b.to_be_bytes());
+            v.extend_from_slice(&c.to_be_bytes());
+            v
+        };
+        for (a, b, c) in [(5, 5, 5), (6, 6, 5), (5, 4, 9), (5, 10, 9)] {
+            assert_eq!(
+                decode_counter_body(&raw(a, b, c)),
+                Err(DecodeError::CounterState)
+            );
+        }
+        let good = raw(1, 2, 3);
+        assert_eq!(
+            decode_counter_body(&good[..COUNTER_BODY_LEN - 1]),
+            Err(DecodeError::Truncated)
+        );
+        let mut long = good.clone();
+        long.push(0);
+        assert_eq!(decode_counter_body(&long), Err(DecodeError::TrailingData));
+        let mut other_format = good;
+        other_format[0] = 0x02;
+        assert_eq!(
+            decode_counter_body(&other_format),
+            Err(DecodeError::UnsupportedFormat)
+        );
+        assert_eq!(decode_counter_body(&[]), Err(DecodeError::Truncated));
+    }
+
+    // Source: MAX_COUNTER_NAME_LEN documentation (Q-330 item 2).
+    #[test]
+    fn counter_key_validates_the_name() {
+        assert_eq!(counter_key("rid").unwrap(), b"counter:rid".to_vec());
+        assert!(counter_key("change-seq").is_ok());
+        assert!(counter_key("a.b_c-9").is_ok());
+        let longest = "z".repeat(MAX_COUNTER_NAME_LEN);
+        assert!(counter_key(&longest).is_ok());
+        let too_long = "z".repeat(MAX_COUNTER_NAME_LEN + 1);
+        for bad in [
+            "",
+            "RID",
+            "a b",
+            "a/b",
+            "a:b",
+            "na\u{ef}ve",
+            "x\0",
+            too_long.as_str(),
+        ] {
+            assert_eq!(counter_key(bad), Err(Violation::InvalidCounterName));
+        }
+        // No counter key can equal the store record's key.
+        assert_ne!(counter_key("store").unwrap(), b"store".to_vec());
     }
 
     #[test]

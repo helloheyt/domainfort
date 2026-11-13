@@ -238,6 +238,49 @@ pub struct NewObject {
     pub attributes: Vec<(AttrId, Vec<Vec<u8>>)>,
 }
 
+/// The state of one named counter: the half-open range
+/// `[first_value, end_exclusive)` it was created with, and `next_value`, the
+/// value the next take returns.
+///
+/// Invariant, checked by the record codec on every write and every read:
+/// `first_value < end_exclusive` and
+/// `first_value <= next_value <= end_exclusive`. `next_value ==
+/// end_exclusive` means every value of the range has been taken: the counter
+/// is exhausted and refuses further takes (fail closed). `next_value` never
+/// decreases — no operation sets, lowers, resets or removes a counter.
+///
+/// Values are `u64` because the change-seq of docs/29 §2 is
+/// ([`Origin::origin_seq`]); a caller whose values are narrower (a 32-bit
+/// RID, [MS-SAMR] 3.1.1.9.2) creates the counter with a range that fits.
+///
+/// Spec: docs/51 §8.3 (R51-16; A-75 / Q-293); [MS-SAMR] 3.1.1.9.2 ("maintain
+/// a counter and increment the counter for each RID that is issued"),
+/// 3.1.1.9.2.2 item 2 (refuse when no value can be generated).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CounterState {
+    /// First value of the range (the first value ever taken).
+    pub first_value: u64,
+    /// The value the next take returns; `end_exclusive` once exhausted.
+    pub next_value: u64,
+    /// One past the last value of the range.
+    pub end_exclusive: u64,
+}
+
+impl CounterState {
+    /// `true` if every value of the range has been taken. Spec: A-75
+    /// ("exhaustion ⇒ refusal").
+    #[must_use]
+    pub fn is_exhausted(&self) -> bool {
+        self.next_value >= self.end_exclusive
+    }
+
+    /// How many values can still be taken. Spec: docs/51 §8.3 (diagnostics).
+    #[must_use]
+    pub fn remaining(&self) -> u64 {
+        self.end_exclusive.saturating_sub(self.next_value)
+    }
+}
+
 /// One change to an existing object's attributes.
 /// Spec: docs/32 §4 (every write validated), §7 (one atomic write).
 #[derive(Debug, Clone, PartialEq, Eq)]

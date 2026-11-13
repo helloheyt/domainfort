@@ -32,6 +32,9 @@ pub enum RecordKind {
     /// A unique-index entry `(attribute, comparison key) -> GUID`.
     /// Spec: docs/46 §8.5.
     UniqueIndex,
+    /// A named counter, stored in the meta table under its own key and MAC
+    /// domain. Spec: docs/51 §8.3 (A-75); docs/32 §3 (D135).
+    Counter,
 }
 
 /// A rule of the record codec that a stored body broke. Raised only after the
@@ -76,6 +79,10 @@ pub enum DecodeError {
     /// An index key read back from disk does not have its table's layout.
     /// Spec: docs/46 §8.4 (reverse-link key layout); docs/32 §8.
     KeyLength,
+    /// A counter record's values break `first_value < end_exclusive` and
+    /// `first_value <= next_value <= end_exclusive`.
+    /// Spec: docs/51 §8.3 (A-75: within its bounds, never decreasing).
+    CounterState,
 }
 
 /// A rule an object (or a requested change) breaks: schema rules
@@ -210,6 +217,18 @@ pub enum Violation {
     /// A children listing was given a cursor made by a listing of another
     /// parent. Spec: docs/49 §6.1 item 3 (`after`); docs/32 §2.
     CursorParentMismatch,
+
+    // ---- named counters (docs/51 §8.3, A-75) ----
+    /// A counter name is empty, longer than [`crate::MAX_COUNTER_NAME_LEN`],
+    /// or has a byte outside `a`–`z`, `0`–`9`, `.`, `-`, `_`.
+    /// Spec: docs/32 §8; Q-330 item 2.
+    InvalidCounterName,
+    /// A counter range `[first_value, end_exclusive)` is empty or inverted
+    /// (`first_value >= end_exclusive`). Spec: A-75.
+    EmptyCounterRange,
+    /// A counter state breaks `first_value <= next_value <= end_exclusive`
+    /// (encoder input). Spec: A-75 (within its bounds).
+    InvalidCounterState,
 
     // ---- resource bounds (docs/32 §8) ----
     /// More than [`crate::MAX_CLASSES_PER_OBJECT`] classes.
@@ -385,6 +404,15 @@ pub enum Error {
     /// An attribute's version counter cannot be incremented.
     /// Spec: docs/29 §2 (version rises on every change).
     VersionOverflow,
+    /// A counter with this name already exists; it is never re-created or
+    /// reset. Spec: A-75 (never decreases); docs/51 §4.3 step 5.
+    CounterExists,
+    /// No counter has this name. A counter is never created implicitly.
+    /// Spec: A-75; docs/51 §4.3 step 5 (counters are created at provisioning).
+    NoSuchCounter,
+    /// Every value of the counter's range has been taken. Nothing changed.
+    /// Spec: A-75 ("exhaustion ⇒ refusal"); [MS-SAMR] 3.1.1.9.2.2 item 2.
+    CounterExhausted,
     /// A step of this write transaction failed after it had started changing
     /// tables; the transaction can only be aborted. Spec: D136.
     TransactionPoisoned,
@@ -403,6 +431,7 @@ impl fmt::Display for RecordKind {
             RecordKind::ChildCount => "child count",
             RecordKind::BackLink => "reverse link",
             RecordKind::UniqueIndex => "unique index",
+            RecordKind::Counter => "counter",
         })
     }
 }
@@ -426,6 +455,7 @@ impl fmt::Display for DecodeError {
             DecodeError::RecordTooLarge => "record body too large",
             DecodeError::ZeroChildCount => "child count record holds zero",
             DecodeError::KeyLength => "index key has the wrong length",
+            DecodeError::CounterState => "counter state outside its bounds",
         })
     }
 }
@@ -505,6 +535,9 @@ impl fmt::Display for Violation {
             Violation::CursorParentMismatch => {
                 f.write_str("listing cursor belongs to another parent")
             }
+            Violation::InvalidCounterName => f.write_str("counter name is not a valid identifier"),
+            Violation::EmptyCounterRange => f.write_str("counter range is empty"),
+            Violation::InvalidCounterState => f.write_str("counter state outside its range"),
             Violation::TooManyClasses => f.write_str("too many object classes"),
             Violation::TooManyAttributes => f.write_str("too many attributes"),
             Violation::TooManyValues(a) => write!(f, "attribute {} has too many values", a.0),
@@ -631,6 +664,9 @@ impl fmt::Display for Error {
                 write!(f, "a value of unique attribute {} is already in use", a.0)
             }
             Error::VersionOverflow => f.write_str("attribute version overflow"),
+            Error::CounterExists => f.write_str("counter already exists"),
+            Error::NoSuchCounter => f.write_str("no such counter"),
+            Error::CounterExhausted => f.write_str("counter exhausted"),
             Error::TransactionPoisoned => f.write_str("write transaction poisoned"),
             Error::IntegrityKeyUnusable => f.write_str("integrity key unusable"),
             Error::Storage(e) => write!(f, "storage engine error: {e}"),

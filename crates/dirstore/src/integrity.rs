@@ -27,7 +27,11 @@
 //! put back is caught by the cross-check against the object it names, but a
 //! *removed* entry is noticed only where it is relied on (delete / modify of
 //! the value it indexes) — not by a delete of the target, nor by a create
-//! that would duplicate a value whose entry vanished.
+//! that would duplicate a value whose entry vanished. A named counter
+//! (docs/51 §8.3) has the same limit: an altered, truncated or moved counter
+//! record is [`Error::Tamper`], but an older, validly tagged version of it put
+//! back would re-issue values (P-7; Q-330 item 3). For a RID the unique index
+//! of objectSid (docs/46 §8.5) still refuses a value held by a live object.
 
 use crate::error::{Error, RecordKind, Result};
 use crate::MAX_RECORD_BODY_LEN;
@@ -87,6 +91,10 @@ fn kind_tag(kind: RecordKind) -> u8 {
         // own kind"), §8.5.
         RecordKind::BackLink => 0x05,
         RecordKind::UniqueIndex => 0x06,
+        // A counter shares the meta table with the store record but has its
+        // own kind, so neither can stand in for the other. Spec: docs/51
+        // §8.2-§8.3 (A-75: a MAC-tagged record in the meta table); D135.
+        RecordKind::Counter => 0x07,
     }
 }
 

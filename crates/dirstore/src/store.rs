@@ -5,6 +5,7 @@
 //! | table | key | value |
 //! |---|---|---|
 //! | `dirstore.meta` | `"store"` | meta body + tag |
+//! | `dirstore.meta` | [`record::counter_key`] (`"counter:"` ‖ name) | counter body + tag |
 //! | `dirstore.objects` | 16-byte GUID packet | object body + tag |
 //! | `dirstore.name_index` | [`record::name_index_key`] | name-index body + tag |
 //! | `dirstore.child_count` | 16-byte parent GUID packet | count body + tag |
@@ -47,8 +48,24 @@
 //! tables. Spec: docs/49 §6.1 item 3 (R49-9), §12 (L3); docs/32 §2, §3, §6,
 //! §8.
 //!
+//! # Named counters
+//!
+//! A counter is one tagged record in the meta table (docs/51 §8.2-§8.3 place
+//! it there). Taking a value plans exactly like every other write: read the
+//! record, verify its tag, decode it within its bounds, refuse if exhausted,
+//! then plan the record rewritten with its next value advanced by one. The
+//! rewrite is applied in the caller's redb write transaction, the
+//! same one its object creations use, so a value is consumed exactly when
+//! that transaction commits: an aborted or dropped transaction rolls the
+//! record back with everything else ("All writes performed in this
+//! transaction will be rolled back", redb `WriteTransaction::abort`), and
+//! after a commit no later transaction can see the older record. Nothing in
+//! this crate ever writes a lower value, re-creates or removes a counter.
+//! Spec: docs/51 §8.3 (A-75); [MS-SAMR] 3.1.1.9.2.1 item 1.2, 3.1.1.9.2.2
+//! items 1.2 and 2; docs/32 §3 (D135), §7 (D136).
+//!
 //! Spec: docs/32 §2 (D134), §3 (D135), §6 (D39), §7 (D136); docs/29 §5
-//! (D121); docs/46 §8.3-§8.5; docs/49 §6.1.
+//! (D121); docs/46 §8.3-§8.5; docs/49 §6.1; docs/51 §8.3.
 
 use crate::comparison;
 use crate::error::{Error, RecordKind, Result, Violation};
@@ -56,8 +73,8 @@ use crate::integrity::{self, IntegrityKey};
 use crate::record;
 use crate::schema::{AttributeDefinition, Link, Schema};
 use crate::types::{
-    AttrId, Attribute, AttributeChange, ChildCursor, ChildPage, ClassId, NewObject, Object, Origin,
-    StampedValue, Timestamp, Tombstone,
+    AttrId, Attribute, AttributeChange, ChildCursor, ChildPage, ClassId, CounterState, NewObject,
+    Object, Origin, StampedValue, Timestamp, Tombstone,
 };
 use crate::{
     MAX_ATTRIBUTES_PER_OBJECT, MAX_CHILDREN_PER_PAGE, MAX_CLASSES_PER_OBJECT, MAX_RDN_KEY_LEN,
@@ -76,7 +93,9 @@ use std::path::Path;
 /// only stores bytes. Spec: docs/32 §1 (D5: the KV is a replaceable engine).
 type Raw = &'static [u8];
 
-/// Store metadata: format version, and a key check at open. Spec: D135.
+/// Store metadata: format version and a key check at open (key `"store"`),
+/// and the named counters (keys [`record::counter_key`]). Spec: D135;
+/// docs/51 §8.3.
 const META_TABLE: TableDefinition<'static, Raw, Raw> = TableDefinition::new("dirstore.meta");
 /// Objects by GUID. Spec: docs/32 §2, D134.
 const OBJECT_TABLE: TableDefinition<'static, Raw, Raw> = TableDefinition::new("dirstore.objects");
@@ -100,6 +119,9 @@ const META_KEY: &[u8] = b"store";
 /// Which table a planned write targets.
 #[derive(Debug, Clone, Copy)]
 enum TableId {
+    /// Only counter records are planned here; the store record is written
+    /// once, at open. Spec: docs/51 §8.3.
+    Meta,
     Objects,
     NameIndex,
     ChildCount,
@@ -174,7 +196,9 @@ impl Store {
 }
 
 /// Create the tables and the meta record, or authenticate the existing meta
-/// record. Spec: D135; docs/10 D34.
+/// record. A database whose meta record is missing while it holds any other
+/// record — including a counter record in the meta table itself — has been
+/// edited beneath us. Spec: D135; docs/10 D34; docs/51 §8.3.
 fn init_tables(txn: &WriteTransaction, key: &IntegrityKey) -> Result<()> {
     let mut meta = txn.open_table(META_TABLE)?;
     let objects = txn.open_table(OBJECT_TABLE)?;
@@ -191,7 +215,8 @@ fn init_tables(txn: &WriteTransaction, key: &IntegrityKey) -> Result<()> {
         None => {
             // A database with records but no meta record has been edited
             // beneath us; never silently adopt it under a new key.
-            if !objects.is_empty()?
+            if !meta.is_empty()?
+                || !objects.is_empty()?
                 || !names.is_empty()?
                 || !counts.is_empty()?
                 || !links.is_empty()?
@@ -338,12 +363,25 @@ impl Snapshot<'_> {
         let objects = self.txn.open_table(OBJECT_TABLE)?;
         lookup_unique(&uniques, &objects, self.store, attr, value)
     }
+
+    /// The state of the counter `name` in this snapshot, read-only (for
+    /// diagnostics: how far a counter has advanced, how many values remain).
+    /// `None` if no counter has the name. The record is authenticated and
+    /// decoded within its bounds first ([`Error::Tamper`] /
+    /// [`Error::RecordMalformed`] of [`RecordKind::Counter`]); an invalid
+    /// name is [`Violation::InvalidCounterName`]. Never takes a value: only
+    /// [`WriteTxn::take_counter_value`] does. Spec: docs/51 §8.3 (A-75);
+    /// docs/32 §3 (D135), §6 (D39).
+    pub fn counter(&self, name: &str) -> Result<Option<CounterState>> {
+        let meta = self.txn.open_table(META_TABLE)?;
+        counter_of(&meta, &self.store.key, name)
+    }
 }
 
 /// A write transaction. Every change made through it — values, stamps, name
-/// index, child counts, reverse links, unique entries and integrity tags —
-/// commits together or not at all; dropping it without [`WriteTxn::commit`]
-/// aborts it. Spec: docs/32 §7, D136.
+/// index, child counts, reverse links, unique entries, counter values taken
+/// and integrity tags — commits together or not at all; dropping it without
+/// [`WriteTxn::commit`] aborts it. Spec: docs/32 §7, D136; docs/51 §8.3.
 pub struct WriteTxn<'s> {
     store: &'s Store,
     /// `None` only after commit / abort, which consume `self`.
@@ -463,6 +501,73 @@ impl WriteTxn<'_> {
         let count = writes.len();
         self.apply(writes)?;
         Ok(count)
+    }
+
+    /// Create the counter `name` with the half-open range
+    /// `[first_value, end_exclusive)`; its first take returns `first_value`.
+    ///
+    /// Refused, with nothing written and this transaction still usable, if
+    /// the name is not a valid counter name
+    /// ([`Violation::InvalidCounterName`]), if the range is empty or inverted
+    /// (`first_value >= end_exclusive`, [`Violation::EmptyCounterRange`]), or
+    /// if a counter already has the name ([`Error::CounterExists`] — a
+    /// counter is never re-created or reset; a tampered record under the
+    /// name is [`Error::Tamper`] and is not overwritten either).
+    ///
+    /// The range rule of a particular counter (e.g. the RID range of
+    /// docs/51 §8.3) is the caller's: this crate only keeps a counter inside
+    /// the range it was created with (R46-1). Counters are created at
+    /// provisioning, in the same transaction as the domain objects
+    /// (docs/51 §4.3 step 5); nothing here creates one implicitly.
+    /// Spec: docs/51 §8.3 (A-75), §4.3 step 5; docs/32 §3 (D135), §7 (D136).
+    pub fn create_counter(
+        &mut self,
+        name: &str,
+        first_value: u64,
+        end_exclusive: u64,
+    ) -> Result<()> {
+        let writes =
+            plan_create_counter(self.txn()?, self.store, name, first_value, end_exclusive)?;
+        self.apply(writes)
+    }
+
+    /// Take the next value of the counter `name`: return its current value
+    /// and advance it by one, in this transaction.
+    ///
+    /// The value is consumed only if this transaction commits. If it is
+    /// aborted or dropped, the counter is rolled back with every other write
+    /// of the transaction and the same value is returned again by the next
+    /// take; after a commit the value is never returned again, also across
+    /// close and reopen ([MS-SAMR] 3.1.1.9.2.1 item 1.2, 3.1.1.9.2.2 item
+    /// 1.2: a value "successfully committed in a transaction MUST NOT ever be
+    /// used again"). Take the value in the same transaction as the object
+    /// that uses it (docs/51 §8.2-§8.3: read and advanced in the creation's
+    /// own `WriteTxn`), and abort that transaction if the creation is
+    /// refused — committing it anyway consumes the value without using it (a
+    /// gap: harmless to uniqueness, Q-330 item 5).
+    ///
+    /// Refused, with nothing changed and this transaction still usable, if
+    /// the name is invalid ([`Violation::InvalidCounterName`]), if no counter
+    /// has it ([`Error::NoSuchCounter`]), or if every value of its range has
+    /// been taken ([`Error::CounterExhausted`] — [MS-SAMR] 3.1.1.9.2.2 item
+    /// 2: return an error when no value can be generated). A record that
+    /// fails its tag is [`Error::Tamper`] of [`RecordKind::Counter`]; one
+    /// whose state lies outside its range is [`Error::RecordMalformed`]. The
+    /// arithmetic is checked: `next_value < end_exclusive <= u64::MAX`, so
+    /// the advance cannot wrap.
+    ///
+    /// Spec: docs/51 §8.3 (R51-16; A-75 / Q-293); [MS-SAMR] 3.1.1.9.2,
+    /// 3.1.1.9.2.1 item 1.2, 3.1.1.9.2.2; docs/32 §3 (D135), §7 (D136).
+    pub fn take_counter_value(&mut self, name: &str) -> Result<u64> {
+        let (value, writes) = plan_take_counter(self.txn()?, self.store, name)?;
+        self.apply(writes)?;
+        Ok(value)
+    }
+
+    /// [`Snapshot::counter`], seeing this transaction's own writes.
+    pub fn counter(&self, name: &str) -> Result<Option<CounterState>> {
+        let meta = self.txn()?.open_table(META_TABLE)?;
+        counter_of(&meta, &self.store.key, name)
     }
 
     /// [`Snapshot::get_object`], seeing this transaction's own writes.
@@ -662,6 +767,35 @@ fn load_unique<T: ReadableTable<Raw, Raw>>(
     record::decode_unique_index_body(body)
         .map(Some)
         .map_err(|e| Error::RecordMalformed(RecordKind::UniqueIndex, e))
+}
+
+/// Load a counter record from the meta table: tag first (its own integrity
+/// kind, bound to its key), then the bounded decoder, which refuses a state
+/// outside its range. `None` if absent. Spec: docs/51 §8.3 (A-75); docs/32
+/// §3 (D135), §8 (D138).
+fn load_counter<T: ReadableTable<Raw, Raw>>(
+    meta: &T,
+    key: &IntegrityKey,
+    record_key: &[u8],
+) -> Result<Option<CounterState>> {
+    let Some(stored) = raw_get(meta, record_key)? else {
+        return Ok(None);
+    };
+    let body = integrity::open(key, RecordKind::Counter, record_key, &stored)?;
+    record::decode_counter_body(body)
+        .map(Some)
+        .map_err(|e| Error::RecordMalformed(RecordKind::Counter, e))
+}
+
+/// [`Snapshot::counter`]: validate the name, then load its record.
+/// Spec: docs/51 §8.3; docs/32 §8 (input checked before storage work).
+fn counter_of<T: ReadableTable<Raw, Raw>>(
+    meta: &T,
+    key: &IntegrityKey,
+    name: &str,
+) -> Result<Option<CounterState>> {
+    let record_key = record::counter_key(name).map_err(Error::Rejected)?;
+    load_counter(meta, key, &record_key)
 }
 
 /// Every authentic reverse-link entry whose key starts with `prefix`, as
@@ -1715,8 +1849,73 @@ fn plan_purge(
     Ok(writes)
 }
 
+/// Plan the creation of a counter: the name and range are checked before any
+/// storage work; the name must be free (an existing record under it is
+/// authenticated first, so a tampered one is reported, never overwritten).
+/// Spec: docs/51 §8.3 (A-75), §4.3 step 5; docs/32 §3, §8.
+fn plan_create_counter(
+    txn: &WriteTransaction,
+    store: &Store,
+    name: &str,
+    first_value: u64,
+    end_exclusive: u64,
+) -> Result<Vec<Write>> {
+    let record_key = record::counter_key(name).map_err(Error::Rejected)?;
+    // The encoder refuses an empty or inverted range. Spec: A-75.
+    let body = record::encode_counter_body(&CounterState {
+        first_value,
+        next_value: first_value,
+        end_exclusive,
+    })
+    .map_err(Error::Rejected)?;
+    let meta = txn.open_table(META_TABLE)?;
+    if load_counter(&meta, &store.key, &record_key)?.is_some() {
+        return Err(Error::CounterExists);
+    }
+    Ok(vec![seal_write(
+        store,
+        TableId::Meta,
+        RecordKind::Counter,
+        record_key,
+        body,
+    )?])
+}
+
+/// Plan one take: authenticate and decode the counter, refuse if exhausted,
+/// and plan its record rewritten with `next_value + 1`. Returns the value
+/// taken (the old `next_value`). Nothing is written by planning, so a refusal
+/// changes nothing. Spec: docs/51 §8.3 (A-75: read and advanced in the same
+/// write transaction, never decreasing, exhaustion ⇒ refusal); [MS-SAMR]
+/// 3.1.1.9.2.2 item 2; docs/32 §3, §7.
+fn plan_take_counter(
+    txn: &WriteTransaction,
+    store: &Store,
+    name: &str,
+) -> Result<(u64, Vec<Write>)> {
+    let record_key = record::counter_key(name).map_err(Error::Rejected)?;
+    let meta = txn.open_table(META_TABLE)?;
+    let Some(state) = load_counter(&meta, &store.key, &record_key)? else {
+        return Err(Error::NoSuchCounter);
+    };
+    if state.is_exhausted() {
+        return Err(Error::CounterExhausted);
+    }
+    let value = state.next_value;
+    // value < end_exclusive <= u64::MAX, so this never fails; checked anyway
+    // (no wrap, no panic).
+    let next_value = value.checked_add(1).ok_or(Error::CounterExhausted)?;
+    let body = record::encode_counter_body(&CounterState {
+        next_value,
+        ..state
+    })
+    .map_err(Error::Rejected)?;
+    let write = seal_write(store, TableId::Meta, RecordKind::Counter, record_key, body)?;
+    Ok((value, vec![write]))
+}
+
 /// Apply planned writes inside the redb transaction. Spec: D136.
 fn apply_writes(txn: &WriteTransaction, writes: &[Write]) -> Result<()> {
+    let mut meta = txn.open_table(META_TABLE)?;
     let mut objects = txn.open_table(OBJECT_TABLE)?;
     let mut names = txn.open_table(NAME_INDEX_TABLE)?;
     let mut counts = txn.open_table(CHILD_COUNT_TABLE)?;
@@ -1724,6 +1923,7 @@ fn apply_writes(txn: &WriteTransaction, writes: &[Write]) -> Result<()> {
     let mut uniques = txn.open_table(UNIQUE_INDEX_TABLE)?;
     for w in writes {
         let table = match w.table {
+            TableId::Meta => &mut meta,
             TableId::Objects => &mut objects,
             TableId::NameIndex => &mut names,
             TableId::ChildCount => &mut counts,

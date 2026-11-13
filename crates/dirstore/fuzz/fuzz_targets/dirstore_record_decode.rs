@@ -12,8 +12,8 @@
 //!
 //! Not built or run: the fuzz dependencies await owner approval (P-1).
 //!
-//! Spec: docs/32 §8 (D138); docs/10 D34; docs/46 §8.4-§8.5; src/record.rs
-//! layout.
+//! Spec: docs/32 §8 (D138); docs/10 D34; docs/46 §8.4-§8.5; docs/51 §8.3
+//! (counter record); src/record.rs layout.
 
 use libfuzzer_sys::fuzz_target;
 
@@ -54,4 +54,14 @@ fuzz_target!(|data: &[u8]| {
         );
     }
     let _ = dirstore::record::decode_meta_body(data);
+    // Named-counter records (docs/51 §8.3, A-75): a body the decoder accepts
+    // is inside its range and re-encodes to the same bytes.
+    if let Ok(state) = dirstore::record::decode_counter_body(data) {
+        assert!(state.first_value < state.end_exclusive);
+        assert!(state.first_value <= state.next_value);
+        assert!(state.next_value <= state.end_exclusive);
+        let again = dirstore::record::encode_counter_body(&state)
+            .expect("a decoded counter must re-encode");
+        assert_eq!(again.as_slice(), data, "the codec must be canonical");
+    }
 });

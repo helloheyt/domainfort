@@ -47,14 +47,26 @@
 //!   naming it is refused (docs/46 §5.4, §8.2). This crate holds **no AD
 //!   schema content** — no attribute names, OIDs or GUIDs (docs/46 §8, R46-1);
 //!   that content is data handed in by the caller.
+//! - **Named counters** (docs/51 §8.3, R51-16; A-75 / Q-293): a persistent
+//!   counter per name, created with a half-open range
+//!   `[first_value, end_exclusive)` ([`WriteTxn::create_counter`]) and read
+//!   and advanced inside the caller's own write transaction
+//!   ([`WriteTxn::take_counter_value`]), so only a commit consumes a value —
+//!   [MS-SAMR] 3.1.1.9.2.1 item 1.2 / 3.1.1.9.2.2 item 1.2: a value
+//!   "successfully committed in a transaction MUST NOT ever be used again".
+//!   It never decreases (no operation sets, lowers, resets or removes one);
+//!   an exhausted counter refuses ([`Error::CounterExhausted`]). This crate
+//!   is the mechanism only (R46-1): which counters exist and their ranges
+//!   (the RID range, the change-seq of docs/29 §2) are the caller's.
 //!
 //! # Guarantees
 //!
 //! - **Atomic writes** (D136; docs/32 §7): value, stamp, name index, child
 //!   count, reverse-link and unique-index entries, the forward references a
-//!   delete removes from other objects, and the integrity tags of one change
-//!   are written in one redb write transaction ([`WriteTxn`]). Dropping or
-//!   aborting it leaves no trace.
+//!   delete removes from other objects, the counter values taken, and the
+//!   integrity tags of one change are written in one redb write transaction
+//!   ([`WriteTxn`]). Dropping or aborting it leaves no trace — a counter value
+//!   taken in it is not consumed.
 //! - **Snapshots** (D39; docs/32 §6): a [`Snapshot`] is a redb read
 //!   transaction — a consistent point-in-time view that never shows a
 //!   half-applied write.
@@ -92,6 +104,7 @@
 //! | bytes in an RDN key | [`MAX_RDN_KEY_LEN`] |
 //! | bytes in one encoded record body | [`MAX_RECORD_BODY_LEN`] |
 //! | children in one listing page (a read bound: larger limits are capped) | [`MAX_CHILDREN_PER_PAGE`] |
+//! | bytes in a counter name | [`MAX_COUNTER_NAME_LEN`] |
 //!
 //! # Out of scope
 //!
@@ -110,15 +123,17 @@
 //! §10 / A-29), docs/12 §3 (D44), docs/25 §5, docs/10 §3 (D34), docs/11 §6
 //! (`AttrClass` = Normal | Sensitive | Secret), docs/14 §6 (D60), Q-080,
 //! Q-062 / A-18, docs/49 §6.1 and §12 (the children listing, task L3; A-30,
-//! P-7); and the pinned [MS-ADTS] v20261026 and [MS-DRSR] v20260309
-//! sections cited on each item (opened in-session from
+//! P-7); docs/51 §4.3, §8, §9 and Q-293 / A-75 (named counters, task A1);
+//! and the pinned [MS-ADTS] v20261026, [MS-DRSR] v20260309 and [MS-SAMR]
+//! v20260427 sections cited on each item (opened in-session from
 //! `tools/spec-pin/cache/`). GUID / SID / security-descriptor handling is delegated
 //! to our own `dtyp` crate (its public API and docs, read in-session); the redb,
 //! hmac and sha2 public API docs on docs.rs (PENDING-OWNER P-2). No other
 //! implementation was consulted or recalled (AGENTS.md §1-3).
 //!
 //! Spec: docs/32 §1-§8 (D134-D136, D138); docs/29 §2 (D119), §5 (D121);
-//! docs/46 §8; docs/12 D44; docs/11 §6; docs/10 D34; docs/49 §6.1 (R49-9).
+//! docs/46 §8; docs/12 D44; docs/11 §6; docs/10 D34; docs/49 §6.1 (R49-9);
+//! docs/51 §8.3 (A-75); [MS-SAMR] 3.1.1.9.2.
 
 mod comparison;
 mod error;
@@ -136,8 +151,8 @@ pub use schema::{
 };
 pub use store::{Snapshot, Store, WriteTxn};
 pub use types::{
-    AttrId, AttrStamp, Attribute, AttributeChange, ChildCursor, ChildPage, ClassId, NewObject,
-    NodeId, Object, Origin, StampedValue, Timestamp, Tombstone,
+    AttrId, AttrStamp, Attribute, AttributeChange, ChildCursor, ChildPage, ClassId, CounterState,
+    NewObject, NodeId, Object, Origin, StampedValue, Timestamp, Tombstone,
 };
 
 /// Largest attribute value, in bytes. A schema attribute's own bound may only
@@ -186,3 +201,18 @@ pub const MAX_RECORD_BODY_LEN: usize = 16 * 1024 * 1024;
 /// which the caller enforces across pages. Spec: docs/32 §8 (bounds; no
 /// number fixed there), docs/49 §6.1 item 3; project choice.
 pub const MAX_CHILDREN_PER_PAGE: usize = 1000;
+
+/// Longest counter name, in bytes (at least one byte is required). A name is
+/// made only of the bytes `a`–`z`, `0`–`9`, `.`, `-` and `_`.
+///
+/// Why a validated identifier and not a closed set of counters: this crate is
+/// the mechanism only (docs/46 R46-1) — which counters exist (the RID
+/// counter, the change-seq counter of docs/29 §2) is the caller's
+/// (docs/51 §8.3, A-75), so naming them here would put caller policy in the
+/// engine. Why this alphabet: names are fixed strings in the caller's code,
+/// never user input, so the smallest useful alphabet suffices (docs/25
+/// minimalism); lower case only, so no two names differ only by case (the
+/// folding question of Q-080 never arises); bounded, so the meta-table key
+/// stays small (docs/32 §8). Spec: docs/32 §8; docs/46 R46-1; docs/51 §8.3;
+/// project choice (Q-330 item 2).
+pub const MAX_COUNTER_NAME_LEN: usize = 64;
