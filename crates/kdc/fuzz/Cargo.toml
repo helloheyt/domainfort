@@ -1,0 +1,52 @@
+# cargo-fuzz harness for the KDC (AGENTS.md §6 / docs/32 §8: every parser of
+# network input gets a fuzz target before it merges to main). The KDC parses
+# untrusted network input: TCP record framing (RFC 4120 7.2.2) and AS-REQ /
+# TGS-REQ messages; `Kdc::handle` must never panic, hang or over-allocate.
+#
+# This is a SEPARATE workspace (note the empty [workspace] table below): it is
+# intentionally NOT a member of the root workspace, so `cargo build --all`,
+# `cargo clippy`, `cargo test`, `cargo deny` and the SBOM in the product
+# workspace never pull in the fuzzing-only dependencies. It is built only via
+# `cargo fuzz run kdc_handle` (nightly + cargo-fuzz).
+#
+# NOTE FOR REVIEW: libfuzzer-sys is fuzz-harness-only test infrastructure, not
+# linked into any product crate, and on the license allowlist (MIT /
+# Apache-2.0, AGENTS.md §7). It is PENDING OWNER APPROVAL (docs/questions/
+# PENDING-OWNER.md, P-1): this harness has not been built or run.
+
+[package]
+name = "kdc-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.kdc]
+path = ".."
+
+[dependencies.keyd]
+path = "../../keyd"
+
+[dependencies.krb-proto]
+path = "../../krb-proto"
+
+[dependencies.pdp]
+path = "../../pdp"
+
+[dependencies.dtyp]
+path = "../../dtyp"
+
+[[bin]]
+name = "kdc_handle"
+path = "fuzz_targets/kdc_handle.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the root workspace (see header).
+[workspace]

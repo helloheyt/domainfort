@@ -6,9 +6,11 @@
 //! 1. authorize — role in the capability table (I2), handle purposes (I3);
 //! 2. do the work on an internal result carrying the audit-only reason;
 //! 3. emit exactly one audit record (I8);
-//! 4. map to the uniform public error (docs/10 §9).
+//! 4. map to the public error (docs/10 §9): uniform, except the non-secret
+//!    classes an authentication step reports after its cryptographic chain
+//!    completed (A-26).
 //!
-//! Spec: docs/10 §2, §3 ("every call is recorded"), §9, §10, §12.
+//! Spec: docs/10 §2, §3 ("every call is recorded"), §9, §10, §12; A-26.
 
 use crate::as_exchange::ProofEntry;
 use crate::audit::{AuditKeyRef, AuditOutcome, AuditReason, AuditRecord, AuditSink};

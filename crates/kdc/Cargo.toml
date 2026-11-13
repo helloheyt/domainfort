@@ -1,0 +1,46 @@
+# kdc — the phase-1 native Key Distribution Center (AS + TGS) as a LIBRARY.
+#
+# Pure library: no sockets, no daemon, no threads, no clock reads. The caller
+# (a later daemon crate) owns the transport and the clock; `Kdc::handle` turns
+# one request into one reply (AS-REP, TGS-REP or KRB-ERROR). The KDC holds no
+# secret: every long-term key operation is a keyd call ("compute, don't give",
+# docs/09, docs/10, docs/30 §1), and every AS / TGS step is a PDP decision
+# (docs/11, docs/30 §1).
+#
+# Written only from RFC 4120 (§2, §3.1, §3.2.3, §3.3, §5.1, §5.2, §5.3, §5.4,
+# §5.9, §5.10, §6.1, §6.2, §7.2, §7.3, §7.5, §8.2) and this project's design
+# documents (docs/02 §3, docs/10, docs/11, docs/25 §3-5, docs/30, docs/45 §10,
+# docs/questions/PENDING-OWNER.md A-19, A-22, A-23) — AGENTS.md §1-3. No other
+# implementation consulted or recalled.
+
+[package]
+name = "kdc"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Our own workspace crates only (path dependencies). No external crate
+# (AGENTS.md §7). In particular NOT krb-crypto: only keyd links the crypto
+# profile in the product (D182) — the KDC never encrypts or decrypts.
+#
+# Typed RFC 4120 messages with strict DER (AS-REQ, TGS-REQ, AS-REP, TGS-REP,
+# KRB-ERROR, METHOD-DATA, ETYPE-INFO2).
+krb-proto = { path = "../krb-proto" }
+# Secret custody: pre-authentication, TGT verification and ticket sealing.
+keyd = { path = "../keyd" }
+# The policy decision point (Action::KdcAs / KdcTgs).
+pdp = { path = "../pdp" }
+# SIDs for the PDP Subject built from the account record.
+dtyp = { path = "../dtyp" }
+
+[dev-dependencies]
+# TESTS ONLY (main-session decision 2). The integration tests play the Kerberos
+# CLIENT: derive the client key from the password and the ETYPE-INFO2 salt,
+# build PA-ENC-TIMESTAMP and TGS authenticators (RFC 4120 5.2.7.2, 5.5.1), and
+# decrypt AS-REP / TGS-REP / ticket parts to check names, flags and times. The
+# product library never links it (D182).
+krb-crypto = { path = "../krb-crypto" }
+
+[lints]
+workspace = true

@@ -134,6 +134,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kdc"
+version = "0.0.0"
+dependencies = [
+ "dtyp",
+ "keyd",
+ "krb-crypto",
+ "krb-proto",
+ "pdp",
+]
+
+[[package]]
 name = "keyd"
 version = "0.0.0"
 dependencies = [

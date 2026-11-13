@@ -1,0 +1,355 @@
+//! The Ticket-Granting Service exchange: receipt of KRB_TGS_REQ and
+//! generation of KRB_TGS_REP (phase 1: a service ticket of this realm from a
+//! TGT of this realm).
+//!
+//! Steps, each refusing with the code named:
+//! 1. no PA-TGS-REQ → KDC_ERR_PADATA_TYPE_NOSUPP (3.3.2: "If no ticket can be
+//!    found in the padata field"); more than one → KRB_ERR_GENERIC
+//!    (ambiguous); a value that is not an AP-REQ → KRB_AP_ERR_MSG_TYPE
+//!    (3.2.3), otherwise undecodable → KRB_ERR_GENERIC;
+//! 2. operation options / unsupported content → KDC_ERR_BADOPTION
+//!    (decision 9);
+//! 3. another realm, or a TGS name of another realm → KDC_ERR_S_PRINCIPAL_UNKNOWN
+//!    (no inter-realm key; decision 4); no sname → KDC_ERR_S_PRINCIPAL_UNKNOWN
+//!    (5.4.1: sname may only be absent with ENC-TKT-IN-SKEY, refused); this
+//!    realm's TGS name → KDC_ERR_POLICY (phase 1 issues no TGT from a TGT;
+//!    keyd refuses it, docs/10 §5);
+//! 4. the presented ticket is not this realm's TGT (cleartext realm / sname)
+//!    → KRB_AP_ERR_NOT_US (3.2.3, 3.3.2: renewal / validation / proxy of other
+//!    tickets is refused in step 2);
+//! 5. starttime beyond the skew → KDC_ERR_CANNOT_POSTDATE (3.3.3);
+//! 6. keyd `open_and_verify_tgt` over the raw KDC-REQ-BODY (decision 13)
+//!    refuses (see [`tgt_refusal`], A-26): uniformly before its cryptographic
+//!    chain completed → KRB_AP_ERR_BAD_INTEGRITY (3.3.2 names it for the
+//!    decryption step every forged or altered request fails at); after it
+//!    completed, the non-secret class → KRB_AP_ERR_SKEW, KRB_AP_ERR_TKT_NYV,
+//!    KRB_AP_ERR_TKT_EXPIRED or KRB_AP_ERR_REPEAT (3.2.3, 3.3.2);
+//! 7. re-evaluation at use (D53, decision 8): the client account is read
+//!    again — source failure → KRB_ERR_GENERIC; gone, disabled, locked or
+//!    expired → KDC_ERR_CLIENT_REVOKED; TGT authtime before the account's
+//!    revocation instant → KDC_ERR_TGT_REVOKED (3.3.3.1 hot-list);
+//! 8. the service account: unknown → KDC_ERR_S_PRINCIPAL_UNKNOWN; disabled,
+//!    locked or expired → KDC_ERR_SERVICE_REVOKED (decision 8);
+//! 9. no acceptable AES enctype for the session key → KDC_ERR_ETYPE_NOSUPP
+//!    (3.1.3 via 3.3.2; decision 6);
+//! 10. the PDP (`KdcTgs`, resource = the service) denies → KDC_ERR_POLICY
+//!     (docs/30 §3.3; decision 7);
+//! 11. times planned within policy and within the TGT (3.3.3; decision 10)
+//!     → KDC_ERR_NEVER_VALID if too short;
+//! 12. keyd `issue_tgs_rep` seals the service ticket and the reply;
+//! 13. the TGS-REP: crealm / cname of the TGT (3.3.3: "the client's name and
+//!     realm ... of the newly-issued ticket" come from the TGT), no padata.
+//!
+//! Spec: RFC 4120 3.2.3, 3.3.2, 3.3.3, 3.3.3.1, 5.2.7.1, 5.4.1, 5.4.2, 7.5.9;
+//! docs/30 §3; docs/10 §5; docs/25 §4 (D53); main-session decisions 3-10, 13;
+//! A-26.
+
+use crate::accounts::AccountSource;
+use crate::as_exchange::has_unsupported_content;
+use crate::audit::{AuditReason, AuditSink};
+use crate::custody::KeyCustody;
+use crate::etype::negotiate;
+use crate::gate::{enforce, PolicyInputs, Question, RateLimiter};
+use crate::kdc::{internal, issue_refusal, time_refusal, Kdc, Refusal, Scope};
+use crate::lifetime::{check_starttime, plan, LifetimeRequest, Limits};
+use crate::names::{classify_server, same_realm, service_spn, ServerNameKind};
+use crate::options::{asks_unsupported_operation, delegation_flags, FlagRequests};
+use crate::time::seconds;
+use crate::transport::Peer;
+use core::time::Duration;
+use keyd::{AuthnError, KeyPurpose, TgsTicketTemplate};
+use krb_proto::constants::{
+    KDC_ERR_BADOPTION, KDC_ERR_CLIENT_REVOKED, KDC_ERR_ETYPE_NOSUPP, KDC_ERR_PADATA_TYPE_NOSUPP,
+    KDC_ERR_POLICY, KDC_ERR_SERVICE_REVOKED, KDC_ERR_S_PRINCIPAL_UNKNOWN, KDC_ERR_TGT_REVOKED,
+    KRB_AP_ERR_BAD_INTEGRITY, KRB_AP_ERR_MSG_TYPE, KRB_AP_ERR_NOT_US, KRB_AP_ERR_REPEAT,
+    KRB_AP_ERR_SKEW, KRB_AP_ERR_TKT_EXPIRED, KRB_AP_ERR_TKT_NYV, KRB_ERR_GENERIC, PA_TGS_REQ,
+};
+use krb_proto::{ApReq, KdcRep, KdcReq, KerberosTime, TgsRep, TicketFlags};
+use pdp::{Action, KerbResKind, Resource, Spn};
+
+/// keyd's `open_and_verify_tgt` refusals (A-26, docs/questions/Q-071).
+///
+/// keyd reports a class only after the TGT decrypted, the authenticator
+/// decrypted and the req-body checksum verified — facts only a holder of the
+/// TGT session key can learn, so no decryption or MAC oracle. Everything
+/// decided before that is the uniform `Denied`:
+/// - `Denied` → KRB_AP_ERR_BAD_INTEGRITY (3.3.2: "If any of the decryptions
+///   indicate failed integrity checks");
+/// - `TicketExpired` → KRB_AP_ERR_TKT_EXPIRED (3.2.3);
+/// - `TicketNotYetValid` → KRB_AP_ERR_TKT_NYV (3.2.3);
+/// - `Skew` → KRB_AP_ERR_SKEW (3.2.3); the KRB-ERROR's stime is the KDC's
+///   `now` (5.9.1);
+/// - `Replay` → KRB_AP_ERR_REPEAT (3.2.3; 3.3.2: "the KDC SHOULD return
+///   KRB_AP_ERR_REPEAT").
+///
+/// Spec: RFC 4120 3.2.3, 3.3.2, 5.9.1; docs/questions/Q-071 (A-26).
+fn tgt_refusal(error: AuthnError) -> Refusal {
+    match error {
+        AuthnError::Denied => Refusal::new(KRB_AP_ERR_BAD_INTEGRITY, AuditReason::TgtDenied),
+        AuthnError::TicketExpired => Refusal::new(KRB_AP_ERR_TKT_EXPIRED, AuditReason::TgtExpired),
+        AuthnError::TicketNotYetValid => {
+            Refusal::new(KRB_AP_ERR_TKT_NYV, AuditReason::TgtNotYetValid)
+        }
+        AuthnError::Skew => Refusal::new(KRB_AP_ERR_SKEW, AuditReason::AuthenticatorSkew),
+        AuthnError::Replay => Refusal::new(KRB_AP_ERR_REPEAT, AuditReason::AuthenticatorReplay),
+    }
+}
+
+impl<K: KeyCustody, D: AccountSource, U: AuditSink, R: RateLimiter> Kdc<K, D, U, R> {
+    /// Receipt of KRB_TGS_REQ and generation of KRB_TGS_REP (module docs).
+    /// Spec: RFC 4120 3.3.2, 3.3.3; docs/30 §3.
+    pub(crate) fn receive_tgs_req(
+        &mut self,
+        req: &KdcReq,
+        scope: &mut Scope,
+        peer: Peer,
+        now: &KerberosTime,
+        policy: &PolicyInputs<'_>,
+    ) -> Result<Vec<u8>, Refusal> {
+        let body = &req.req_body;
+        let keyd_config = self.custody.config();
+        let configured: Vec<i32> = keyd_config.enctypes.iter().map(|e| e.number()).collect();
+        let skew = keyd_config.clock_skew_secs;
+        let ticket_policy = keyd_config.ticket_policy;
+        let realm = self.config.realm.clone();
+
+        // 1. The authentication header (3.3.2, 5.2.7.1, 3.2.3).
+        let padata = req.padata.as_deref().unwrap_or(&[]);
+        let mut headers = padata.iter().filter(|p| p.padata_type == PA_TGS_REQ);
+        let header = match (headers.next(), headers.next()) {
+            (None, _) => {
+                return Err(Refusal::new(
+                    KDC_ERR_PADATA_TYPE_NOSUPP,
+                    AuditReason::TgsPadataMissing,
+                ))
+            }
+            (Some(_), Some(_)) => {
+                return Err(Refusal::new(
+                    KRB_ERR_GENERIC,
+                    AuditReason::TgsPadataAmbiguous,
+                ))
+            }
+            (Some(header), None) => header,
+        };
+        let ap_req = ApReq::decode(&header.padata_value).map_err(|error| {
+            let code = match error {
+                krb_proto::Error::UnexpectedApplicationTag
+                | krb_proto::Error::ExpectedApplicationTag => KRB_AP_ERR_MSG_TYPE,
+                _ => KRB_ERR_GENERIC,
+            };
+            Refusal::new(code, AuditReason::ApReqMalformed)
+        })?;
+
+        // 2. Options and content (decision 9).
+        if asks_unsupported_operation(body.kdc_options) {
+            return Err(Refusal::new(
+                KDC_ERR_BADOPTION,
+                AuditReason::UnsupportedOption,
+            ));
+        }
+        if has_unsupported_content(body) {
+            return Err(Refusal::new(
+                KDC_ERR_BADOPTION,
+                AuditReason::UnsupportedContent,
+            ));
+        }
+
+        // 3. The requested server (decision 4; 5.4.1; docs/10 §5).
+        if !same_realm(&body.realm, &realm) {
+            return Err(Refusal::new(
+                KDC_ERR_S_PRINCIPAL_UNKNOWN,
+                AuditReason::CrossRealm,
+            ));
+        }
+        let sname = body.sname.as_ref().ok_or(Refusal::new(
+            KDC_ERR_S_PRINCIPAL_UNKNOWN,
+            AuditReason::MissingName,
+        ))?;
+        match classify_server(sname, &realm) {
+            ServerNameKind::Service => {}
+            ServerNameKind::LocalTgs => {
+                return Err(Refusal::new(KDC_ERR_POLICY, AuditReason::TgsForTgs))
+            }
+            ServerNameKind::ForeignTgs => {
+                return Err(Refusal::new(
+                    KDC_ERR_S_PRINCIPAL_UNKNOWN,
+                    AuditReason::CrossRealm,
+                ))
+            }
+        }
+
+        // 4. The presented ticket must be this realm's TGT (3.3.2, 3.2.3).
+        let ticket = &ap_req.ticket;
+        if !same_realm(&ticket.realm, &realm)
+            || classify_server(&ticket.sname, &realm) != ServerNameKind::LocalTgs
+        {
+            return Err(Refusal::new(KRB_AP_ERR_NOT_US, AuditReason::NotLocalTgt));
+        }
+
+        // 5. Starttime (3.3.3).
+        check_starttime(body.from.as_ref(), now, skew).map_err(time_refusal)?;
+
+        // 6. keyd verifies the TGT and the authenticator over the raw
+        // KDC-REQ-BODY (5.2.7.1; decision 13). krb-proto decodes strict DER
+        // only and losslessly, so encoding the decoded body reproduces the
+        // received octets exactly (proven by tests/body_reencode.rs).
+        let raw_body = body
+            .encode()
+            .map_err(|_| internal(AuditReason::InternalFailure))?;
+        let krbtgt = self.config.krbtgt;
+        let tgt = self
+            .custody
+            .open_and_verify_tgt(&krbtgt, &ap_req, &raw_body, now)
+            .map_err(tgt_refusal)?;
+        scope.set_client(&tgt.crealm, &tgt.cname);
+
+        // 7. Re-evaluate the client now (D53; decision 8; 3.3.3.1).
+        let client = match self.accounts.client(&tgt.crealm, &tgt.cname) {
+            Err(_) => return Err(internal(AuditReason::AccountSourceFailure)),
+            Ok(None) => {
+                return Err(Refusal::new(
+                    KDC_ERR_CLIENT_REVOKED,
+                    AuditReason::ClientRevoked,
+                ))
+            }
+            Ok(Some(client)) => client,
+        };
+        if !client.state.usable_at(now) {
+            return Err(Refusal::new(
+                KDC_ERR_CLIENT_REVOKED,
+                AuditReason::ClientRevoked,
+            ));
+        }
+        if client.state.revokes(&tgt.authtime) {
+            return Err(Refusal::new(KDC_ERR_TGT_REVOKED, AuditReason::TgtRevoked));
+        }
+
+        // 8. The service account (decisions 3, 8).
+        let service = match self.accounts.service(&body.realm, sname) {
+            Err(_) => return Err(internal(AuditReason::AccountSourceFailure)),
+            Ok(None) => {
+                return Err(Refusal::new(
+                    KDC_ERR_S_PRINCIPAL_UNKNOWN,
+                    AuditReason::ServiceUnknown,
+                ))
+            }
+            Ok(Some(service)) => service,
+        };
+        if service.key.purpose != KeyPurpose::Service {
+            return Err(internal(AuditReason::AccountRecordInvalid));
+        }
+        if !service.state.usable_at(now) {
+            return Err(Refusal::new(
+                KDC_ERR_SERVICE_REVOKED,
+                AuditReason::ServiceRevoked,
+            ));
+        }
+
+        // 9. Session-key encryption type (3.1.3; decision 6).
+        let acceptable = negotiate(&body.etype, &configured, &service.enctypes);
+        let Some(&session_etype) = acceptable.first() else {
+            return Err(Refusal::new(
+                KDC_ERR_ETYPE_NOSUPP,
+                AuditReason::NoCommonEncType,
+            ));
+        };
+
+        // 10. The PDP (docs/30 §3.3; decision 7).
+        let spn = service_spn(sname)
+            .ok_or_else(|| Refusal::new(KDC_ERR_POLICY, AuditReason::AmbiguousServiceName))?;
+        let age = u64::try_from(seconds(now) - seconds(&tgt.authtime)).unwrap_or(0);
+        enforce(
+            Question {
+                action: Action::KdcTgs,
+                client: &client,
+                resource: Resource::Kerberos {
+                    kind: KerbResKind::Service(Spn(spn)),
+                },
+                ticket_age: Duration::from_secs(age),
+                src_net: peer.src_net,
+                now,
+            },
+            policy,
+            &mut self.rate,
+        )
+        .map_err(|reason| Refusal::new(KDC_ERR_POLICY, reason))?;
+
+        // 11. Flags and times (3.3.3; decisions 9, 10). The endtime is capped
+        // by "(b) the endtime from the TGT, and (c) the starttime of the TGT
+        // plus ... the maximum life for the local realm", and by both
+        // accounts' expiry; renew-till by the TGT's renew-till.
+        let requests = FlagRequests::of(body.kdc_options);
+        let tgt_start = tgt.starttime.unwrap_or(tgt.authtime);
+        let expiries = client
+            .state
+            .expires
+            .iter()
+            .chain(service.state.expires.iter())
+            .map(seconds);
+        let mut end_caps = vec![
+            seconds(&tgt.endtime),
+            seconds(&tgt_start) + i64::from(ticket_policy.max_lifetime_secs),
+        ];
+        end_caps.extend(expiries.clone());
+        let mut renew_caps: Vec<i64> = tgt.renew_till.iter().map(seconds).collect();
+        renew_caps.extend(expiries);
+        let renewable_permitted = ticket_policy.allowed_flags.contains(TicketFlags::RENEWABLE)
+            && tgt.flags.contains(TicketFlags::RENEWABLE)
+            && tgt.renew_till.is_some();
+        let planned = plan(
+            now,
+            &LifetimeRequest {
+                from: body.from.as_ref(),
+                till: &body.till,
+                rtime: body.rtime.as_ref(),
+                flags: requests,
+            },
+            &Limits {
+                policy: ticket_policy,
+                skew_secs: skew,
+                end_caps,
+                renew_caps,
+                renewable_permitted,
+            },
+        )
+        .map_err(time_refusal)?;
+        let mut flags = delegation_flags(requests, ticket_policy.allowed_flags, Some(tgt.flags));
+        if planned.renew_till.is_some() {
+            flags.insert(TicketFlags::RENEWABLE);
+        }
+
+        // 12. keyd issues (docs/10 §5). The service ticket starts now.
+        let session_enctype = self
+            .custody
+            .config()
+            .enctypes
+            .iter()
+            .copied()
+            .find(|e| e.number() == session_etype)
+            .ok_or_else(|| internal(AuditReason::InternalFailure))?;
+        let template = TgsTicketTemplate {
+            sname: sname.clone(),
+            starttime: Some(*now),
+            endtime: planned.endtime,
+            renew_till: planned.renew_till,
+            flags,
+            session_enctype,
+            nonce: body.nonce,
+        };
+        let parts = self
+            .custody
+            .issue_tgs_rep(&service.key, &tgt.ctx_id, &template, now)
+            .map_err(issue_refusal)?;
+
+        // 13. The TGS-REP (5.4.2).
+        TgsRep(KdcRep {
+            padata: None,
+            crealm: tgt.crealm,
+            cname: tgt.cname,
+            ticket: parts.ticket,
+            enc_part: parts.enc_part,
+        })
+        .encode()
+        .map_err(|_| internal(AuditReason::InternalFailure))
+    }
+}

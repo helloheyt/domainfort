@@ -361,10 +361,13 @@ fn debug_output_is_redacted() {
     assert!(store_text.contains("insecure_development_krbtgt"));
 }
 
-/// I6: every failure of an authentication step is the same uniform value,
-/// whatever the cause (wrong password, unknown principal, clock skew, wrong
-/// role, replay, bad checksum); errors render without detail. Source:
-/// docs/10 §9 (AuthnError { Denied } "does not distinguish"), §12 I6.
+/// I6 (as amended by A-26): every failure decided before the cryptographic
+/// chain completes is the same uniform value, whatever the cause (wrong
+/// password, unknown principal, wrong role — and a wrong password with a
+/// skewed timestamp, which never decrypts); only a key holder, past the
+/// decryption, learns the skew class. Errors render without detail. Source:
+/// docs/10 §9 (AuthnError { Denied } "does not distinguish"), §12 I6;
+/// docs/questions/Q-071 (A-26).
 #[test]
 fn errors_are_uniform() {
     let mut f = Fixture::new();
@@ -386,7 +389,7 @@ fn errors_are_uniform() {
         f.keyd.verify_preauth(
             &KDC,
             &ALICE,
-            &pa_enc_timestamp(&alice_key(), Some(1), at(-900)),
+            &pa_enc_timestamp(&wrong_pw, Some(1), at(-900)),
             &n,
         ),
         f.keyd.verify_preauth(
@@ -400,9 +403,20 @@ fn errors_are_uniform() {
         assert_eq!(r, &Err(AuthnError::Denied));
     }
     let reasons: std::collections::HashSet<_> = f.records().iter().map(|r| r.reason).collect();
-    assert_eq!(reasons.len(), 4, "distinct reasons only in audit");
+    assert_eq!(reasons.len(), 3, "distinct reasons only in audit");
+    // Past the decryption (the right key), the skew is a class (A-26).
+    assert_eq!(
+        f.keyd.verify_preauth(
+            &KDC,
+            &ALICE,
+            &pa_enc_timestamp(&alice_key(), Some(1), at(-900)),
+            &n,
+        ),
+        Err(AuthnError::Skew)
+    );
 
     assert_eq!(AuthnError::Denied.to_string(), "denied");
+    assert_eq!(AuthnError::Skew.to_string(), "clock skew too great");
     assert_eq!(IssueError::Denied.to_string(), "denied");
     assert_eq!(IssueError::BadTemplate.to_string(), "bad ticket template");
     assert_eq!(Error::Denied.to_string(), "denied");

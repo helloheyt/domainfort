@@ -109,8 +109,10 @@ fn tgs_round_trip_subkey() {
     assert!(krb_crypto::decrypt(&sub, usage(8), &parts.enc_part.cipher).is_err());
 }
 
-/// The same authenticator presented twice is a replay. Source: RFC 4120
-/// 3.2.3 (replay cache, KRB_AP_ERR_REPEAT), 3.3.2; docs/10 D33.
+/// The same authenticator presented twice is a replay, reported as the
+/// `Replay` class (the crypto chain passed, A-26). Source: RFC 4120 3.2.3
+/// (replay cache, KRB_AP_ERR_REPEAT), 3.3.2; docs/10 D33;
+/// docs/questions/Q-071 (A-26).
 #[test]
 fn replayed_authenticator_denied() {
     let mut f = Fixture::new();
@@ -127,7 +129,7 @@ fn replayed_authenticator_denied() {
     assert_eq!(
         f.keyd
             .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &at(1)),
-        Err(AuthnError::Denied)
+        Err(AuthnError::Replay)
     );
     assert_eq!(f.records().last().unwrap().reason, AuditReason::Replay);
     // A different microsecond value is a different authenticator.
@@ -190,8 +192,9 @@ fn tampered_req_body_denied() {
     );
 }
 
-/// Authenticator ctime outside the skew window. Source: RFC 4120 3.2.3
-/// (KRB_AP_ERR_SKEW), §8.2 (5 minutes).
+/// Authenticator ctime outside the skew window: the `Skew` class (A-26).
+/// Source: RFC 4120 3.2.3 (KRB_AP_ERR_SKEW), §8.2 (5 minutes);
+/// docs/questions/Q-071 (A-26).
 #[test]
 fn authenticator_clock_skew_denied() {
     let mut f = Fixture::new();
@@ -206,6 +209,9 @@ fn authenticator_clock_skew_denied() {
             .keyd
             .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &now());
         assert_eq!(r.is_ok(), ok, "offset {offset}");
+        if !ok {
+            assert_eq!(r, Err(AuthnError::Skew), "offset {offset}");
+        }
     }
 }
 
@@ -230,9 +236,9 @@ fn authenticator_name_mismatch_denied() {
     );
 }
 
-/// An expired TGT is refused. Source: RFC 4120 3.2.3
-/// (KRB_AP_ERR_TKT_EXPIRED), 3.3 ("expired tickets are not accepted by the
-/// TGS").
+/// An expired TGT is refused as the `TicketExpired` class (A-26). Source:
+/// RFC 4120 3.2.3 (KRB_AP_ERR_TKT_EXPIRED), 3.3 ("expired tickets are not
+/// accepted by the TGS"); docs/questions/Q-071 (A-26).
 #[test]
 fn expired_tgt_denied() {
     let mut f = Fixture::new();
@@ -248,7 +254,7 @@ fn expired_tgt_denied() {
     assert_eq!(
         f.keyd
             .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &later),
-        Err(AuthnError::Denied)
+        Err(AuthnError::TicketExpired)
     );
     assert_eq!(
         f.records().last().unwrap().reason,
@@ -557,4 +563,165 @@ fn service_name_type_is_not_significant() {
         .issue_tgs_rep(&KDC, &SERVICE, &ctx.ctx_id, &t, &now())
         .unwrap();
     assert_eq!(parts.ticket.sname, sname);
+}
+
+/// A TGT whose start (its authtime) lies beyond the skew in the future is
+/// refused as the `TicketNotYetValid` class. Source: RFC 4120 3.2.3
+/// (KRB_AP_ERR_TKT_NYV); 5.3 (starttime absent: authtime is used);
+/// docs/questions/Q-071 (A-26).
+#[test]
+fn not_yet_valid_tgt_is_classified() {
+    let mut f = Fixture::new();
+    let tgt = obtain_tgt(&mut f, at(400), &as_template());
+    let (_, body) = tgs_req_body(40, service_name());
+    let req = ap_req(
+        &tgt.parts.ticket,
+        authenticator(&tgt.session, &AuthenticatorSpec::new(now(), 40, &body)),
+    );
+    assert_eq!(
+        f.keyd
+            .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &now()),
+        Err(AuthnError::TicketNotYetValid)
+    );
+    assert_eq!(
+        f.records().last().unwrap().reason,
+        AuditReason::TicketNotYetValid
+    );
+}
+
+/// The ordering property (A-26): a class is reported only after the TGT
+/// decrypted, the authenticator decrypted and the req-body checksum
+/// verified. An expired TGT with a bad checksum, with a tampered
+/// authenticator or with mismatching names — and a skewed authenticator with
+/// a bad checksum — are the uniform `Denied`. Source: docs/questions/Q-071
+/// (A-26); RFC 4120 3.2.3, 3.3.2.
+#[test]
+fn classes_only_after_the_cryptographic_chain() {
+    let mut f = Fixture::new();
+    let mut t = as_template();
+    t.endtime = kt("20261113103000Z");
+    let tgt = obtain_tgt(&mut f, now(), &t);
+    let later = kt("20261113103501Z"); // endtime + 301 s: expired
+    let (_, body) = tgs_req_body(41, service_name());
+    let (_, other_body) = tgs_req_body(42, service_name());
+    let verify = |f: &mut Fixture, req: &krb_proto::ApReq, body: &[u8], when| {
+        f.keyd.open_and_verify_tgt(&KDC, &KRBTGT, req, body, &when)
+    };
+
+    // Expired + checksum over another body.
+    let req = ap_req(
+        &tgt.parts.ticket,
+        authenticator(
+            &tgt.session,
+            &AuthenticatorSpec::new(later, 41, &other_body),
+        ),
+    );
+    assert_eq!(verify(&mut f, &req, &body, later), Err(AuthnError::Denied));
+    assert_eq!(
+        f.records().last().unwrap().reason,
+        AuditReason::ChecksumMismatch
+    );
+
+    // Expired + tampered authenticator.
+    let mut auth = authenticator(&tgt.session, &AuthenticatorSpec::new(later, 42, &body));
+    let last = auth.cipher.len() - 1;
+    auth.cipher[last] ^= 0x01;
+    let req = ap_req(&tgt.parts.ticket, auth);
+    assert_eq!(verify(&mut f, &req, &body, later), Err(AuthnError::Denied));
+    assert_eq!(
+        f.records().last().unwrap().reason,
+        AuditReason::IntegrityFailure
+    );
+
+    // Expired + names that do not match the ticket.
+    let mut spec = AuthenticatorSpec::new(later, 43, &body);
+    spec.cname = bob_name();
+    let req = ap_req(&tgt.parts.ticket, authenticator(&tgt.session, &spec));
+    assert_eq!(verify(&mut f, &req, &body, later), Err(AuthnError::Denied));
+
+    // Skewed (valid ticket) + checksum over another body.
+    let tgt = obtain_tgt(&mut f, now(), &as_template());
+    let req = ap_req(
+        &tgt.parts.ticket,
+        authenticator(
+            &tgt.session,
+            &AuthenticatorSpec::new(at(-400), 44, &other_body),
+        ),
+    );
+    assert_eq!(verify(&mut f, &req, &body, now()), Err(AuthnError::Denied));
+    assert_eq!(
+        f.records().last().unwrap().reason,
+        AuditReason::ChecksumMismatch
+    );
+    // Exactly one audit record per call.
+    let verify_calls = f
+        .records()
+        .iter()
+        .filter(|r| r.op == keyd::Operation::OpenAndVerifyTgt)
+        .count();
+    assert_eq!(verify_calls, 4);
+}
+
+/// Requests refused as expired, not yet valid or skewed never enter the
+/// replay cache (A-26): the same authenticator, presented again when the
+/// times are acceptable, is accepted — not refused as a replay. Source:
+/// docs/questions/Q-071 (A-26); RFC 4120 3.2.3 (the cache remembers
+/// authenticators presented within the skew).
+#[test]
+fn time_classes_leave_the_replay_cache_unchanged() {
+    let mut f = Fixture::new();
+    // Skew: ctime = now, presented 301 s later, then at now.
+    let tgt = obtain_tgt(&mut f, now(), &as_template());
+    let (_, body) = tgs_req_body(50, service_name());
+    let req = ap_req(
+        &tgt.parts.ticket,
+        authenticator(&tgt.session, &AuthenticatorSpec::new(now(), 50, &body)),
+    );
+    assert_eq!(
+        f.keyd
+            .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &at(301)),
+        Err(AuthnError::Skew)
+    );
+    assert!(f
+        .keyd
+        .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &now())
+        .is_ok());
+
+    // Expired: endtime 10:30; ctime 10:35:01 presented at 10:35:01 (expired)
+    // then at 10:34:00 (within the skew of both endtime and ctime).
+    let mut t = as_template();
+    t.endtime = kt("20261113103000Z");
+    let tgt = obtain_tgt(&mut f, now(), &t);
+    let ctime = kt("20261113103501Z");
+    let (_, body) = tgs_req_body(51, service_name());
+    let req = ap_req(
+        &tgt.parts.ticket,
+        authenticator(&tgt.session, &AuthenticatorSpec::new(ctime, 51, &body)),
+    );
+    assert_eq!(
+        f.keyd
+            .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &ctime),
+        Err(AuthnError::TicketExpired)
+    );
+    assert!(f
+        .keyd
+        .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &kt("20261113103400Z"))
+        .is_ok());
+
+    // Not yet valid: authtime 10:06:40, presented at 10:00 then at 10:06:40.
+    let tgt = obtain_tgt(&mut f, at(400), &as_template());
+    let (_, body) = tgs_req_body(52, service_name());
+    let req = ap_req(
+        &tgt.parts.ticket,
+        authenticator(&tgt.session, &AuthenticatorSpec::new(at(200), 52, &body)),
+    );
+    assert_eq!(
+        f.keyd
+            .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &now()),
+        Err(AuthnError::TicketNotYetValid)
+    );
+    assert!(f
+        .keyd
+        .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &at(400))
+        .is_ok());
 }

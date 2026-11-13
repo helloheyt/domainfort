@@ -1,23 +1,55 @@
-//! The uniform error model.
+//! The error model: uniform before the cryptographic chain completes,
+//! classified (non-secret) after.
 //!
-//! Callers see only terse, data-free errors: no variant tells an unknown
-//! principal from a wrong password from a failed pre-authentication, a
-//! replay, a bad checksum or a missing token. The specific reason goes to
-//! audit only ([`crate::audit::AuditReason`]).
+//! Callers see only terse, data-free errors. Every failure decided BEFORE an
+//! authentication step's cryptographic chain has fully passed is the uniform
+//! `Denied`: no variant tells an unknown principal from a wrong password, an
+//! unknown kvno, a failed decryption, a bad or missing checksum, a name
+//! mismatch or a missing token. Only facts learned AFTER every cryptographic
+//! check passed — and therefore learnable only by a holder of the key or
+//! session key — are reported as a class ([`AuthnError::TicketExpired`],
+//! [`AuthnError::TicketNotYetValid`], [`AuthnError::Skew`],
+//! [`AuthnError::Replay`]): revealing them is no decryption or MAC oracle
+//! (decision A-26, docs/questions/Q-071). The specific reason always goes to
+//! audit ([`crate::audit::AuditReason`]).
 //!
 //! Spec: docs/10 §9 (`AuthnError { Denied }`, `IssueError { Denied,
-//! BadTemplate }`, `Error { Denied, Unavailable, RateLimited }`); docs/09 א.3
-//! (5) uniform errors; AGENTS.md §6 (no secrets in errors).
+//! BadTemplate }`, `Error { Denied, Unavailable, RateLimited }`) as amended by
+//! A-26; docs/09 א.3 (5) uniform errors; RFC 4120 3.2.3, 3.3.2 (the codes
+//! these classes correspond to); AGENTS.md §6 (no secrets in errors).
 
 use crate::audit::{AuditOutcome, AuditReason};
 use core::fmt;
 
 /// Error of an authentication step (`verify_preauth`,
-/// `open_and_verify_tgt`). Spec: docs/10 §9.
+/// `open_and_verify_tgt`).
+///
+/// `Denied` is returned for every failure decided before the step's
+/// cryptographic chain completed. The other variants are returned only after
+/// it completed — for `open_and_verify_tgt`: the TGT decrypted, the
+/// authenticator decrypted and its checksum over the KDC-REQ-BODY verified;
+/// for `verify_preauth` (only `Skew`): the PA-ENC-TIMESTAMP decrypted with
+/// the client key and decoded.
+///
+/// Spec: docs/10 §9 as amended by A-26 (docs/questions/Q-071); RFC 4120
+/// 3.2.3, 3.3.2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthnError {
     /// Uniform refusal. Spec: docs/10 §9.
     Denied,
+    /// The ticket's endtime has passed (beyond the clock skew). Spec: RFC 4120
+    /// 3.2.3 (KRB_AP_ERR_TKT_EXPIRED); A-26.
+    TicketExpired,
+    /// The ticket's starttime is in the future (beyond the clock skew).
+    /// Spec: RFC 4120 3.2.3 (KRB_AP_ERR_TKT_NYV); A-26.
+    TicketNotYetValid,
+    /// The client's time (authenticator ctime, or patimestamp) differs from
+    /// `now` by more than the clock skew. Spec: RFC 4120 3.2.3
+    /// (KRB_AP_ERR_SKEW), 5.2.7.2; A-26.
+    Skew,
+    /// The authenticator was already presented. Spec: RFC 4120 3.2.3, 3.3.2
+    /// (KRB_AP_ERR_REPEAT); A-26.
+    Replay,
 }
 
 /// Error of an issuance step (`issue_as_rep`, `issue_tgs_rep`).
@@ -81,7 +113,13 @@ macro_rules! impl_display {
     };
 }
 
-impl_display!(AuthnError, AuthnError::Denied => "denied");
+impl_display!(AuthnError,
+    AuthnError::Denied => "denied",
+    AuthnError::TicketExpired => "ticket expired",
+    AuthnError::TicketNotYetValid => "ticket not yet valid",
+    AuthnError::Skew => "clock skew too great",
+    AuthnError::Replay => "replay",
+);
 impl_display!(IssueError,
     IssueError::Denied => "denied",
     IssueError::BadTemplate => "bad ticket template",
@@ -102,11 +140,14 @@ impl_display!(ConfigError,
     ConfigError::Throttle => "invalid throttle policy",
 );
 
-/// Internal refusal: the public error kind plus the audit-only reason.
+/// Internal refusal: the public error kind plus the audit-only reason, and —
+/// only for a refusal decided after an authentication step's cryptographic
+/// chain completed — the non-secret class reported to the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Deny {
     pub(crate) outcome: AuditOutcome,
     pub(crate) reason: AuditReason,
+    pub(crate) class: Option<AuthnError>,
 }
 
 impl Deny {
@@ -114,6 +155,18 @@ impl Deny {
         Deny {
             outcome: AuditOutcome::Denied,
             reason,
+            class: None,
+        }
+    }
+
+    /// A refusal reported as `class`. Call ONLY where every cryptographic
+    /// check of the authentication step has already passed (A-26).
+    /// Spec: docs/questions/Q-071 (A-26).
+    pub(crate) const fn classified(reason: AuditReason, class: AuthnError) -> Self {
+        Deny {
+            outcome: AuditOutcome::Denied,
+            reason,
+            class: Some(class),
         }
     }
 
@@ -121,6 +174,7 @@ impl Deny {
         Deny {
             outcome: AuditOutcome::BadTemplate,
             reason,
+            class: None,
         }
     }
 
@@ -128,6 +182,7 @@ impl Deny {
         Deny {
             outcome: AuditOutcome::Unavailable,
             reason,
+            class: None,
         }
     }
 
@@ -135,6 +190,7 @@ impl Deny {
         Deny {
             outcome: AuditOutcome::RateLimited,
             reason,
+            class: None,
         }
     }
 }
@@ -143,9 +199,11 @@ impl Deny {
 pub(crate) type Internal<T> = core::result::Result<T, Deny>;
 
 impl From<Deny> for AuthnError {
-    /// Every refusal of an authentication step is `Denied` (docs/10 §9).
-    fn from(_: Deny) -> Self {
-        AuthnError::Denied
+    /// Every refusal of an authentication step is `Denied` (docs/10 §9),
+    /// except one built with [`Deny::classified`] after the cryptographic
+    /// chain completed (A-26).
+    fn from(deny: Deny) -> Self {
+        deny.class.unwrap_or(AuthnError::Denied)
     }
 }
 

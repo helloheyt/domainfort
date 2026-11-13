@@ -134,8 +134,11 @@ fn preauth_unknown_principal_denied() {
 }
 
 /// Clock skew: patimestamp more than the skew window (300 s, RFC 4120 §8.2)
-/// from now is refused; exactly at the window it is accepted. Source:
-/// RFC 4120 5.2.7.2, 3.2.3 (KRB_AP_ERR_SKEW).
+/// from now is refused as the `Skew` class — reported only because the
+/// timestamp decrypted under the client key (A-26); exactly at the window it
+/// is accepted. A wrong password with a skewed timestamp never decrypts and
+/// stays the uniform `Denied` (no password oracle). Source: RFC 4120 5.2.7.2,
+/// 3.2.3 (KRB_AP_ERR_SKEW); docs/questions/Q-071 (A-26).
 #[test]
 fn preauth_clock_skew() {
     let mut f = Fixture::new();
@@ -148,9 +151,22 @@ fn preauth_clock_skew() {
         );
         assert_eq!(r.is_ok(), ok, "offset {offset}");
         if !ok {
+            assert_eq!(r, Err(AuthnError::Skew), "offset {offset}");
             assert_eq!(f.records().last().unwrap().reason, AuditReason::ClockSkew);
         }
     }
+    let wrong = password_key(EncType::Aes256CtsHmacSha196, "not the password", ALICE_SALT);
+    let r = f.keyd.verify_preauth(
+        &KDC,
+        &ALICE,
+        &pa_enc_timestamp(&wrong, Some(1), at(-900)),
+        &now(),
+    );
+    assert_eq!(r, Err(AuthnError::Denied));
+    assert_eq!(
+        f.records().last().unwrap().reason,
+        AuditReason::IntegrityFailure
+    );
 }
 
 /// I5: an RC4 (etype 23) or unconfigured AES (etype 17) PA-ENC-TIMESTAMP is

@@ -37,7 +37,13 @@
 //!   ([`AuthnProof`] / [`TgtContext`] ctx id), bounded tables.
 //! - **I5** only configured AES enctypes ([`KeydConfig::enctypes`]).
 //! - **I6** secret comparisons via approved constant-time facilities
-//!   (krb-crypto `verify_mic` / integrity checks); uniform errors.
+//!   (krb-crypto `verify_mic` / integrity checks). Errors are uniform for
+//!   every failure decided before the cryptographic chain completes;
+//!   classified after (A-26, docs/questions/Q-071): only once the TGT and the
+//!   authenticator decrypted and the req-body checksum verified
+//!   (`open_and_verify_tgt`), or the PA-ENC-TIMESTAMP decrypted and decoded
+//!   (`verify_preauth`), may an [`AuthnError`] other than `Denied` be
+//!   returned — `TicketExpired`, `TicketNotYetValid`, `Skew`, `Replay`.
 //! - **I7** plaintext secrets are taken as `Zeroizing<String>` by value.
 //! - **I8** every operation emits exactly one [`AuditRecord`], with no
 //!   field able to hold a secret.

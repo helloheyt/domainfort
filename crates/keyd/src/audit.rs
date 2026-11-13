@@ -6,7 +6,9 @@
 //! approver ids, the outcome and an internal reason code. There is no field
 //! that could hold key octets, plaintext, ciphertext, names or any
 //! caller-supplied byte string. The detailed reason goes only here — the
-//! caller sees the uniform error of docs/10 §9.
+//! caller sees the uniform error of docs/10 §9, or, for a refusal decided
+//! after an authentication step's cryptographic chain completed, one of the
+//! four non-secret `AuthnError` classes (A-26).
 //!
 //! `duration_ns` from docs/10 §10 is not recorded: keyd reads no clock (time
 //! is passed in by the caller), so the IPC layer that owns the clock adds it.

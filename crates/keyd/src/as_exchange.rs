@@ -126,17 +126,20 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// `verify_preauth`: verify PA-ENC-TIMESTAMP for `client` and return a
     /// one-time [`AuthnProof`].
     ///
-    /// Checks, all failing as the uniform `AuthnError::Denied`:
+    /// Checks, failing as the uniform `AuthnError::Denied`:
     /// padata-type is PA-ENC-TIMESTAMP (2); the padata-value decodes as
     /// EncryptedData; its etype is configured (I5) and the client's CURRENT
     /// key version has a key of that type (a kvno, if present, must be the
     /// current one — a superseded password never pre-authenticates);
     /// decryption with key usage 1 succeeds; the plaintext decodes as
-    /// PA-ENC-TS-ENC; patimestamp is within the clock skew of `now`.
+    /// PA-ENC-TS-ENC. Then, and only then: patimestamp is within the clock
+    /// skew of `now`, else `AuthnError::Skew` (A-26). Only a holder of the
+    /// client key reaches the skew check, so a wrong password still cannot be
+    /// told apart from an unknown key or kvno — no password oracle.
     ///
     /// Spec: RFC 4120 5.2.7.2 ("encrypted using the client's secret key and a
     /// key usage value of 1"), 7.5.1 (usage 1), 3.1.3 (KDC_ERR_PREAUTH_FAILED),
-    /// 5.2.9 (kvno); docs/10 §4; docs/30 §2.3.
+    /// 5.2.9 (kvno); docs/10 §4; docs/30 §2.3; A-26 (docs/questions/Q-071).
     pub fn verify_preauth(
         &mut self,
         caller: &CallerId,
@@ -188,12 +191,14 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         let plaintext = open(key, AS_REQ_PA_ENC_TIMESTAMP, &enc.cipher)?;
         let timestamp = PaEncTsEnc::decode(&plaintext)
             .map_err(|_| Deny::denied(AuditReason::MalformedInput))?;
+        // The cryptographic chain is complete (decrypted under the client key,
+        // decoded): the skew finding may be reported as a class (A-26).
         if !within_skew(
             kerberos_time_seconds(&timestamp.patimestamp),
             now_s,
             self.config.clock_skew_secs,
         ) {
-            return Err(Deny::denied(AuditReason::ClockSkew));
+            return Err(Deny::classified(AuditReason::ClockSkew, AuthnError::Skew));
         }
         let reply_kvno = current.kvno();
         let mut id = [0u8; TOKEN_ID_LENGTH];

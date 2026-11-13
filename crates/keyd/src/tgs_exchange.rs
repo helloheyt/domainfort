@@ -168,7 +168,8 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// raw DER of the request's KDC-REQ-BODY, over which the authenticator
     /// checksum is verified.
     ///
-    /// Checks (each failing as `AuthnError::Denied`, reason to audit only):
+    /// Checks failing as the uniform `AuthnError::Denied` (reason to audit
+    /// only):
     /// 1. authorize (Kdc; krbtgt handle Krbtgt);
     /// 2. no USE-SESSION-KEY ap-option (user-to-user not implemented);
     /// 3. `req_body` decodes as KDC-REQ-BODY for this realm, without
@@ -177,22 +178,37 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     ///    krbtgt key set is bound to krbtgt/realm (Q-040, A-19);
     /// 5. decrypt the ticket under krbtgt (kvno-selected, else current then
     ///    previous), usage 2; decode EncTicketPart;
-    /// 6. client realm is this realm; no INVALID flag; starttime not in the
-    ///    future and endtime not past (± skew); no authorization-data or
-    ///    addresses in the TGT;
+    /// 6. client realm is this realm; no INVALID flag; no authorization-data
+    ///    or addresses in the TGT; the ticket times are RECORDED, not yet
+    ///    reported;
     /// 7. decrypt the authenticator with the ticket session key, usage 7;
-    ///    decode it; crealm / cname match the ticket; ctime within skew; no
-    ///    authorization-data;
+    ///    decode it; crealm / cname match the ticket; no authorization-data;
+    ///    the ctime skew is RECORDED, not yet reported;
     /// 8. the checksum is present, of the session key's checksum type, and
     ///    verifies over `req_body` with usage 6 — binding the authenticator
     ///    to this request (no cut-and-paste);
-    /// 9. the replay cache accepts (server, client, ctime, cusec);
-    /// 10. store the reply key (subkey with usage 9, else session key with
+    /// 9. a subkey, if present, is a configured enctype and a valid key.
+    ///
+    /// Only now — the TGT decrypted, the authenticator decrypted, the
+    /// req-body checksum verified — are the recorded findings reported, as
+    /// non-secret classes (A-26), in RFC 4120 3.2.3 order: ctime skew →
+    /// `Skew`; starttime in the future (beyond skew) → `TicketNotYetValid`;
+    /// endtime past (beyond skew) → `TicketExpired`. A request refused for
+    /// these never enters the replay cache. Then:
+    /// 10. the replay cache accepts (server, client, ctime, cusec), else
+    ///     `Replay` (a full cache stays `Denied`, fail closed);
+    /// 11. store the reply key (subkey with usage 9, else session key with
     ///     usage 8) in a new context bound to this caller.
+    ///
+    /// Any cryptographic failure is `Denied` even when the ticket is also
+    /// expired or the authenticator also skewed: classes are reachable only
+    /// by a holder of the TGT session key, so they are no decryption or MAC
+    /// oracle (A-26).
     ///
     /// Spec: RFC 4120 3.2.3, 3.3.2, 5.2.7.1 ("checksum ... computed over the
     /// KDC-REQ-BODY encoding"), 5.4.1 (req-body), 5.5.1 (cksum usage 6,
-    /// authenticator usage 7), 7.3, 7.5.1; docs/10 §5, D33.
+    /// authenticator usage 7), 7.3, 7.5.1; docs/10 §5, D33; A-26
+    /// (docs/questions/Q-071).
     pub fn open_and_verify_tgt(
         &mut self,
         caller: &CallerId,
@@ -270,7 +286,8 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             .map_err(|_| Deny::denied(AuditReason::MalformedInput))?;
         drop(ticket_plain);
 
-        // 6. Ticket validity.
+        // 6. Ticket validity. The time findings are recorded and reported only
+        // after the whole cryptographic chain has passed (A-26).
         if ticket_part.crealm != *realm {
             return Err(Deny::denied(AuditReason::WrongRealm));
         }
@@ -283,12 +300,19 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
                 .as_ref()
                 .unwrap_or(&ticket_part.authtime),
         );
-        if start > now_s + i64::from(skew) {
-            return Err(Deny::denied(AuditReason::TicketNotYetValid));
-        }
-        if now_s > kerberos_time_seconds(&ticket_part.endtime) + i64::from(skew) {
-            return Err(Deny::denied(AuditReason::TicketExpired));
-        }
+        let ticket_time_finding = if start > now_s + i64::from(skew) {
+            Some(Deny::classified(
+                AuditReason::TicketNotYetValid,
+                AuthnError::TicketNotYetValid,
+            ))
+        } else if now_s > kerberos_time_seconds(&ticket_part.endtime) + i64::from(skew) {
+            Some(Deny::classified(
+                AuditReason::TicketExpired,
+                AuthnError::TicketExpired,
+            ))
+        } else {
+            None
+        };
         if ticket_part.authorization_data.is_some() || ticket_part.caddr.is_some() {
             return Err(Deny::denied(AuditReason::UnsupportedContent));
         }
@@ -317,9 +341,9 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             return Err(Deny::denied(AuditReason::NameMismatch));
         }
         let ctime = kerberos_time_seconds(&authenticator.ctime);
-        if !within_skew(ctime, now_s, skew) {
-            return Err(Deny::denied(AuditReason::ClockSkew));
-        }
+        // Recorded; reported only after the checksum verified (A-26).
+        let skew_finding = (!within_skew(ctime, now_s, skew))
+            .then_some(Deny::classified(AuditReason::ClockSkew, AuthnError::Skew));
         if authenticator.authorization_data.is_some() {
             return Err(Deny::denied(AuditReason::UnsupportedContent));
         }
@@ -342,9 +366,9 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         )
         .map_err(|_| Deny::denied(AuditReason::ChecksumMismatch))?;
 
-        // 10 (prepared before the replay insert so that every check that can
-        // fail precedes it). The reply key: subkey (usage 9) or session key
-        // (usage 8). Spec: RFC 4120 3.3.3, 5.4.2.
+        // 9 / 11 (prepared before the findings and the replay insert, so that
+        // every check that can fail precedes them). The reply key: subkey
+        // (usage 9) or session key (usage 8). Spec: RFC 4120 3.3.3, 5.4.2.
         let (reply_key, reply_usage) = match &authenticator.subkey {
             Some(subkey) => {
                 let enctype = configured_enctype(
@@ -360,7 +384,17 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             None => (session, TGS_REP_ENC_PART_SESSION_KEY),
         };
 
-        // 9. Replay cache (D33).
+        // The cryptographic chain is complete: the TGT decrypted, the
+        // authenticator decrypted and its req-body checksum verified. Only now
+        // are the recorded findings reported, as non-secret classes, in RFC
+        // 4120 3.2.3 order (skew, then the ticket's age) — and before the
+        // replay cache, so a refused request never enters it (A-26).
+        if let Some(finding) = skew_finding.or(ticket_time_finding) {
+            return Err(finding);
+        }
+
+        // 10. Replay cache (D33). A replay is reported as a class; a full
+        // cache stays the uniform Denied (fail closed).
         let replay_key = ReplayKey {
             server_realm: tgt.realm.clone(),
             server: tgt.sname.clone(),
@@ -371,14 +405,12 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         };
         self.replay
             .check_and_insert(replay_key, skew, now_s)
-            .map_err(|refusal| {
-                Deny::denied(match refusal {
-                    ReplayRefusal::Replay => AuditReason::Replay,
-                    ReplayRefusal::Full => AuditReason::ReplayCacheFull,
-                })
+            .map_err(|refusal| match refusal {
+                ReplayRefusal::Replay => Deny::classified(AuditReason::Replay, AuthnError::Replay),
+                ReplayRefusal::Full => Deny::denied(AuditReason::ReplayCacheFull),
             })?;
 
-        // 10. The one-time context.
+        // 11. The one-time context.
         let mut id = [0u8; TOKEN_ID_LENGTH];
         draw(&mut self.entropy, &mut id)?;
         let context = TgtContext {
