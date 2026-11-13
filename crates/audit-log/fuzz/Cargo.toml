@@ -1,0 +1,41 @@
+# cargo-fuzz harness for audit-log (AGENTS.md §6: every parser gets a fuzz
+# target before it merges to main; docs/50 §9 / R50-19: a fuzz target for
+# every new codec / parser).
+#
+# This is a SEPARATE workspace (note the empty [workspace] table below): it is
+# intentionally NOT a member of the root workspace, so `cargo build --all`,
+# `cargo clippy`, `cargo test`, `cargo deny` and the SBOM in the product
+# workspace never pull in the fuzzing-only dependencies. It is built only via
+# `cargo fuzz run audit_log_verify` (nightly + cargo-fuzz).
+#
+# NOTE FOR REVIEW: libfuzzer-sys is fuzz-harness-only test infrastructure, not
+# linked into any product crate, and on the license allowlist (MIT / Apache-2.0,
+# AGENTS.md §7). Pending owner sign-off (docs/questions/PENDING-OWNER.md P-1);
+# not built or run until then.
+
+[package]
+name = "audit-log-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.audit-log]
+path = ".."
+
+# The segment verifier on arbitrary segment octets, with every anchor kind
+# and an input-chosen checkpoint (`cargo fuzz run audit_log_verify`).
+[[bin]]
+name = "audit_log_verify"
+path = "fuzz_targets/audit_log_verify.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the root workspace (see header).
+[workspace]

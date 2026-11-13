@@ -1,0 +1,66 @@
+# cargo-fuzz harness for ipc-audit (AGENTS.md §6: every parser gets a fuzz
+# target before it merges to main; docs/50 §9 / R50-19 names `ipc_audit_event`
+# among the IPC codec targets).
+#
+# This is a SEPARATE workspace (note the empty [workspace] table below): it is
+# intentionally NOT a member of the root workspace, so `cargo build --all`,
+# `cargo clippy`, `cargo test`, `cargo deny` and the SBOM in the product
+# workspace never pull in the fuzzing-only dependencies. It is built only via
+# `cargo fuzz run <target>` (nightly + cargo-fuzz). It links the decoder core
+# only (`default-features = false`: no source-crate conversions), which is
+# what auditd and a log reader run.
+#
+# NOTE FOR REVIEW: libfuzzer-sys is fuzz-harness-only test infrastructure, not
+# linked into any product crate, and on the license allowlist (MIT / Apache-2.0,
+# AGENTS.md §7). Pending owner sign-off (docs/questions/PENDING-OWNER.md P-1);
+# not built or run until then.
+
+[package]
+name = "ipc-audit-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ipc-audit]
+path = ".."
+default-features = false
+
+[dependencies.ipc]
+path = "../../ipc"
+
+# Request bodies (sender → auditd): `decode_request`, canonical round trip
+# (`cargo fuzz run ipc_audit_request`).
+[[bin]]
+name = "ipc_audit_request"
+path = "fuzz_targets/ipc_audit_request.rs"
+test = false
+doc = false
+bench = false
+
+# Reply bodies (auditd → sender), the shared Refused included: `decode_reply`,
+# canonical round trip, and the sender window fed with whatever Ack decodes
+# (`cargo fuzz run ipc_audit_reply`).
+[[bin]]
+name = "ipc_audit_reply"
+path = "fuzz_targets/ipc_audit_reply.rs"
+test = false
+doc = false
+bench = false
+
+# Event payloads: `decode_event`, canonical round trip
+# (`cargo fuzz run ipc_audit_event`).
+[[bin]]
+name = "ipc_audit_event"
+path = "fuzz_targets/ipc_audit_event.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the root workspace (see header).
+[workspace]

@@ -1,0 +1,53 @@
+# ipc-audit — the audit channel (`audit.sock`) message set over `ipc`, the
+# canonical event encoding for the kdc / keyd / ldap audit shapes, and the
+# sender-side bounded window that implements the decided overflow policy
+# (docs/50 R50-17, §8.1, §10 task P6 — the library half; docs/questions/Q-218,
+# A-57).
+#
+# Core: one dependency, this project's `ipc` (framing, codec primitives,
+# shared `Refused`). auditd (P6b) uses only the core:
+#     ipc-audit = { path = "../ipc-audit", default-features = false }
+#
+# Features `kdc`, `keyd`, `ldap` (on by default, so the workspace tests run
+# them) add the conversions from each source crate's audit type to its wire
+# shape. They pull in that source crate and the crates its audit type is made
+# of — all workspace crates, no third-party dependency. Keeping them optional
+# keeps auditd free of the protocol stacks (D104 minimality; docs/50 §10 lists
+# only `ipc` for this crate — docs/questions/Q-252 item 1).
+#
+# Written only from this project's decided design (docs/50, docs/37,
+# docs/07 §8, docs/questions/Q-218 / A-57, docs/questions/Q-225 / A-59) and
+# the public API of the workspace crates named below — AGENTS.md §1-3. No
+# other implementation, serializer, RPC framework or audit format was
+# consulted or recalled.
+
+[package]
+name = "ipc-audit"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[features]
+default = ["kdc", "keyd", "ldap"]
+# kdc::AuditEvent -> KdcEvent.
+kdc = ["dep:kdc", "dep:pdp", "dep:krb-proto"]
+# keyd::AuditRecord -> KeydRecord.
+keyd = ["dep:keyd", "dep:krb-proto"]
+# ldap::AuditEvent -> LdapEvent.
+ldap = ["dep:ldap", "dep:pdp", "dep:krb-proto", "dep:dtyp", "dep:parse-ldap"]
+
+[dependencies]
+# Framing, field primitives, the `MessageSet` pattern and `REFUSED_KIND`.
+ipc = { path = "../ipc" }
+# Source audit types, for the optional conversions only (path dependencies,
+# same workspace).
+kdc = { path = "../kdc", optional = true }
+keyd = { path = "../keyd", optional = true }
+ldap = { path = "../ldap", optional = true }
+pdp = { path = "../pdp", optional = true }
+krb-proto = { path = "../krb-proto", optional = true }
+dtyp = { path = "../dtyp", optional = true }
+parse-ldap = { path = "../parse-ldap", optional = true }
+
+[lints]
+workspace = true

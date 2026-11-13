@@ -1,0 +1,36 @@
+# audit-log — the append-only, hash-chained audit log format: segment and
+# record layout, a writer that acknowledges a record only after it is synced,
+# and a verifier that walks a segment and reports the first break (docs/50
+# R50-17, §8.1, §10 task P6 — the library half; the auditd binary is P6b).
+#
+# docs/37 §2: "every audit record includes the hash of its predecessor"; the
+# hash is SHA-256 from the approved RustCrypto `sha2` (docs/50 §8.1; OD-9 /
+# D180), linked and never copied, called only through its documented `Digest`
+# API (docs.rs sha2 0.11.1 crate root; digest 0.11.3 `Digest`, `Output`;
+# hybrid-array 0.4.11 `Array` — P-2). No hash is implemented here
+# (AGENTS.md §6).
+#
+# Signing the chain head (docs/37 §2, D157) is a hook only — the key's custody
+# is undecided (docs/questions/Q-251). No other dependency: event payloads are
+# non-secret by construction (docs/37 §2: "only identifiers and metadata"), so
+# nothing here needs zeroizing.
+#
+# Written only from this project's decided design (docs/50, docs/37,
+# docs/07 §8, docs/questions/Q-218 / A-57, OD-8) — AGENTS.md §1-3. The record
+# layout is this project's own; no existing audit or log format was consulted
+# or recalled.
+
+[package]
+name = "audit-log"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# SHA-256 for the record chain (docs/37 §2; docs/50 §8.1). RustCrypto, OD-9;
+# already in the workspace lock (krb-crypto, dirstore). License: MIT OR
+# Apache-2.0. No feature needed: the chain hashes public, non-secret records.
+sha2 = { version = "0.11", default-features = false }
+
+[lints]
+workspace = true

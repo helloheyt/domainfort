@@ -23,6 +23,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "audit-log"
+version = "0.0.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -187,6 +194,20 @@ name = "ipc"
 version = "0.0.0"
 dependencies = [
  "zeroize",
+]
+
+[[package]]
+name = "ipc-audit"
+version = "0.0.0"
+dependencies = [
+ "dtyp",
+ "ipc",
+ "kdc",
+ "keyd",
+ "krb-proto",
+ "ldap",
+ "parse-ldap",
+ "pdp",
 ]
 
 [[package]]
