@@ -76,10 +76,48 @@ impl AccountState {
     }
 }
 
+/// What kind of account a client principal is, as the directory says
+/// (authoritative data, never client-claimed — like `tier`, docs/11 P3).
+///
+/// The KDC uses it for one decision: only a computer account's TGT may armor
+/// an AS request (D126; docs/48 §3.1).
+///
+/// Spec: docs/48 §3.1, §7.2; Q-127 interim decision (ב) — `kind` derived by
+/// the AccountSource from objectClass (P-10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountKind {
+    /// A user account.
+    User,
+    /// A computer account.
+    Computer,
+}
+
+/// Whether an account may obtain a ticket without FAST armor (layer 1 of the
+/// mandatory-FAST enforcement, docs/48 §7.2).
+///
+/// Spec: docs/48 §7.1 (FAST is required for every principal and every
+/// exchange, with one exception), §7.2 (`armor_policy: Required |
+/// BootstrapAllowed`, derived by the AccountSource from authoritative data:
+/// objectClass computer → BootstrapAllowed, everything else → Required),
+/// §7.3 (the bootstrap exception (א)); Q-127 interim decision (P-10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArmorPolicy {
+    /// Every AS exchange must be FAST-armored. The default for every
+    /// principal (docs/48 §7.1).
+    Required,
+    /// An unarmored AS request for this realm's TGT, pre-authenticated with
+    /// PA-ENC-TIMESTAMP, is allowed — the bootstrap of a computer account,
+    /// which needs a TGT before it can armor anything (docs/48 §7.3, H8). It
+    /// takes effect only together with [`AccountKind::Computer`]
+    /// ([`ClientAccount::may_bootstrap`]). The TGS is armored regardless.
+    BootstrapAllowed,
+}
+
 /// A principal that requests tickets (the AS-REQ cname; the TGT's client at
 /// TGS time). Not secret.
 ///
-/// Spec: main-session decision 3; docs/11 §1 (Subject); RFC 4120 5.2.7.5.
+/// Spec: main-session decision 3; docs/11 §1 (Subject); RFC 4120 5.2.7.5;
+/// docs/48 §3.1, §7.2 (`kind`, `armor_policy`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientAccount {
     /// keyd handle of the client's long-term key set (purpose
@@ -96,6 +134,31 @@ pub struct ClientAccount {
     /// One entry per enctype of the client's keys: etype, salt and s2kparams
     /// (RFC 4120 5.2.7.5). Must describe the key set keyd holds for `key`.
     pub etype_info: Vec<EtypeInfo2Entry>,
+    /// User or computer (docs/48 §3.1; Q-127 interim (ב)).
+    pub kind: AccountKind,
+    /// Whether an unarmored AS is allowed (docs/48 §7.2 layer 1).
+    pub armor_policy: ArmorPolicy,
+}
+
+impl ClientAccount {
+    /// `true` if this account may make an unarmored AS request (the
+    /// bootstrap): a computer account whose policy is BootstrapAllowed.
+    /// BootstrapAllowed on any other kind of account counts as Required —
+    /// the exception is for computer accounts only (fail closed).
+    /// Spec: docs/48 §7.2, §7.3 ("AS unarmored, only for armor_policy =
+    /// BootstrapAllowed (computer account)"); Q-127 interim (P-10); AGENTS.md
+    /// §6 (fail closed).
+    pub(crate) fn may_bootstrap(&self) -> bool {
+        self.kind == AccountKind::Computer && self.armor_policy == ArmorPolicy::BootstrapAllowed
+    }
+
+    /// `true` if a TGT of this account may serve as FAST armor ticket in an
+    /// AS request: computer accounts only.
+    /// Spec: docs/48 §3.1 (option (b): "only a TGT of a computer account",
+    /// D126); RFC 6113 5.4.1.1 (the host machine's TGT as the armor ticket).
+    pub(crate) fn may_armor(&self) -> bool {
+        self.kind == AccountKind::Computer
+    }
 }
 
 /// A principal tickets are issued FOR (the TGS-REQ sname). Not secret.
@@ -334,6 +397,48 @@ mod tests {
         );
         source.set_unavailable(true);
         assert_eq!(source.service(&p.realm, &p.name), Err(AccountSourceError));
+    }
+
+    /// docs/48 §7.3 / Q-127 interim (P-10): only a computer account with
+    /// BootstrapAllowed may bootstrap; BootstrapAllowed on a user counts as
+    /// Required (fail closed). docs/48 §3.1 (D126): only a computer account
+    /// may armor.
+    #[test]
+    fn bootstrap_and_armor_need_a_computer_account() {
+        let account = |kind, armor_policy| ClientAccount {
+            key: KeyHandle::new(
+                PrincipalId::from_bytes([2; 16]),
+                KeyPurpose::PrincipalLongterm,
+            ),
+            sid: Sid::new(dtyp::SECURITY_NT_AUTHORITY, &[21, 1, 2, 3, 1000]).unwrap(),
+            groups: BTreeSet::new(),
+            tier: Tier::Tier2,
+            state: AccountState::ACTIVE,
+            etype_info: Vec::new(),
+            kind,
+            armor_policy,
+        };
+        let cases = [
+            (
+                AccountKind::Computer,
+                ArmorPolicy::BootstrapAllowed,
+                true,
+                true,
+            ),
+            (AccountKind::Computer, ArmorPolicy::Required, false, true),
+            (
+                AccountKind::User,
+                ArmorPolicy::BootstrapAllowed,
+                false,
+                false,
+            ),
+            (AccountKind::User, ArmorPolicy::Required, false, false),
+        ];
+        for (kind, policy, bootstrap, armor) in cases {
+            let a = account(kind, policy);
+            assert_eq!(a.may_bootstrap(), bootstrap, "{kind:?} {policy:?}");
+            assert_eq!(a.may_armor(), armor, "{kind:?} {policy:?}");
+        }
     }
 
     /// Decision 8 states and the RFC 4120 3.3.3.1 hot-list.

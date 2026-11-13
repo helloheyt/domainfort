@@ -2,8 +2,10 @@
 //! (main-session decision 14).
 //!
 //! An event carries only non-secret, fixed-shape data: the caller's time, the
-//! transport, which exchange, the client and service names, the outcome (with
-//! the RFC 4120 error code sent, if any) and an internal reason code. There is
+//! transport, which exchange, the client and service names, the FAST armor
+//! principal and whether the reply was armored (docs/48 §2.4, R48-11), the
+//! outcome (with the RFC 4120 error code sent, if any) and an internal reason
+//! code. There is
 //! no field that could hold a key, a password, a plaintext, a ticket or any
 //! other octet string from the request. The reason goes only here; the client
 //! sees the terse KRB-ERROR (no e-text, docs/10 §9, docs/11 §8).
@@ -185,6 +187,81 @@ pub enum AuditReason {
     TemplateRejected,
     /// An internal encoding step failed.
     InternalFailure,
+    /// FAST is required and the request carries no PA-FX-FAST: an unarmored
+    /// AS request for a principal that may not bootstrap (answered with a
+    /// KDC_ERR_PREAUTH_REQUIRED that advertises only FAST; keyd is not
+    /// asked), or an unarmored TGS request (KDC_ERR_POLICY).
+    /// Spec: docs/48 §7.2 layer 1; Q-125 item 11; P-10 interim.
+    FastRequired,
+    /// The request carries more than one PA-FX-FAST (ambiguous).
+    /// Spec: docs/48 §4.1 A1; Q-125 item 3.
+    FastPadataAmbiguous,
+    /// The PA-FX-FAST value does not decode (A-24).
+    /// Spec: RFC 6113 5.4.2; Q-125 item 2.
+    FastMalformed,
+    /// An armored AS request without the armor field ("MUST be present in
+    /// AS-REQ"). Spec: RFC 6113 5.4.2; Q-125 item 1.
+    FastArmorMissing,
+    /// An armor type other than FX_FAST_ARMOR_AP_REQUEST.
+    /// Spec: RFC 6113 5.4.1 (KDC_ERR_PREAUTH_FAILED).
+    FastArmorTypeUnsupported,
+    /// An armored TGS request with an explicit armor field (implicit armor
+    /// only). Spec: RFC 6113 5.4.1.1; docs/questions/Q-124 item 2.
+    TgsExplicitArmor,
+    /// keyd refused the armor before its cryptographic chain completed
+    /// (uniform `Denied`, A-26). Spec: docs/48 §6.3; Q-125 item 4.
+    ArmorDenied,
+    /// The armor chain passed, but the armor authenticator is outside the
+    /// clock skew (A-26). Spec: RFC 4120 3.2.3; Q-125 item 5.
+    ArmorSkew,
+    /// The armor chain passed, but the armor ticket is not yet valid (A-26).
+    /// Spec: RFC 4120 3.2.3; Q-125 item 5.
+    ArmorNotYetValid,
+    /// The armor chain passed, but the armor ticket has expired (A-26).
+    /// Spec: RFC 4120 3.2.3; Q-125 item 5.
+    ArmorExpired,
+    /// The armor chain passed, but the armor authenticator is a replay
+    /// (A-26). Spec: RFC 4120 3.2.3; Q-125 item 5; docs/48 §3.3.
+    ArmorReplay,
+    /// The armor ticket's client is not an account of this KDC.
+    /// Spec: docs/48 §3.1 (D126, D53); Q-125 item 6.
+    ArmorPrincipalUnknown,
+    /// The armor ticket's client is not a computer account (D126).
+    /// Spec: docs/48 §3.1; Q-125 item 6.
+    ArmorNotComputer,
+    /// The armor ticket's client is disabled, locked or expired, or the armor
+    /// ticket predates its revocation instant (D53). Spec: docs/48 §3.1;
+    /// RFC 4120 3.3.3.1; Q-125 item 6.
+    ArmorPrincipalRevoked,
+    /// A critical FastOptions bit (0-15) is set — none is supported in
+    /// phase 1, hide-client-names included.
+    /// Spec: RFC 6113 5.4.2, 7.3; A-25; docs/48 §8.
+    UnknownCriticalFastOption,
+    /// The PA-FX-COOKIE is not the KDC's (another value, or more than one).
+    /// Spec: RFC 6113 5.2 (KDC_ERR_PREAUTH_EXPIRED); Q-126.
+    CookieMismatch,
+    /// keyd's armored TGS context carries no KrbFastReq (cannot happen with a
+    /// conforming keyd; fail closed). Spec: docs/48 §5.2.
+    FastContextMissing,
+}
+
+/// Whether, and how, a request was FAST-armored — non-secret facts for the
+/// audit event (docs/48 §2.4, R48-11).
+///
+/// Spec: docs/48 §2.4 ("`armor: Option<NamedPrincipal>` (R48-11) — not
+/// secret, needed for detection"), §6.2 item 3 (a refusal sent unarmored
+/// because `seal_fast_error` failed is recorded); docs/30 §9.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ArmorAudit {
+    /// The armor ticket's client, once keyd opened the armor: the computer
+    /// account that armored an AS request; for a TGS request (implicit
+    /// armor, RFC 6113 5.4.2) the TGT's own client.
+    pub principal: Option<NamedPrincipal>,
+    /// `true` if the reply sent carries the PA-FX-FAST keyd sealed (an
+    /// armored AS-REP / TGS-REP or KRB-ERROR). `false` with `principal` set
+    /// means an armored conversation whose refusal keyd could not seal, sent
+    /// unarmored (docs/questions/Q-125 item 10).
+    pub reply_armored: bool,
 }
 
 /// One audit event: one per request.
@@ -198,11 +275,15 @@ pub struct AuditEvent {
     pub transport: Transport,
     /// The exchange, when the request decoded as AS-REQ or TGS-REQ.
     pub exchange: Option<Exchange>,
-    /// The client: the AS-REQ cname, or the TGT's client once keyd verified
-    /// it (TGS).
+    /// The client: the AS-REQ cname — of the inner request once keyd opened
+    /// the FAST armor (RFC 6113 5.4.2, 5.4.5) — or the TGT's client once keyd
+    /// verified it (TGS).
     pub client: Option<NamedPrincipal>,
     /// The server the ticket was requested for.
     pub service: Option<NamedPrincipal>,
+    /// FAST: the armor principal and whether the reply was armored
+    /// (docs/48 §2.4, R48-11).
+    pub armor: ArmorAudit,
     /// The outcome.
     pub outcome: AuditOutcome,
     /// The internal reason.

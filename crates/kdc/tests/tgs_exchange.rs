@@ -1,10 +1,18 @@
 //! The TGS exchange (and the full AS → TGS round trip) through
 //! `Kdc::handle`.
 //!
+//! The TGS is always FAST-armored (docs/48 §5, §7; P-10 interim): every
+//! TGS-REQ here carries the implicit armor of RFC 6113 5.4.2 — a subkey in
+//! the PA-TGS-REQ authenticator, a PA-FX-FAST without armor field whose
+//! req-checksum covers the PA-TGS-REQ AP-REQ and whose KrbFastReq carries the
+//! inner req-body — and every TGS-REP is opened through the KrbFastResponse
+//! (strengthened reply key, KrbFastFinished; RFC 6113 5.4.3).
+//!
 //! Sources: RFC 4120 2.1, 3.1.2, 3.2.3, 3.3.2, 3.3.3, 3.3.3.1, 5.2.7.1, 5.3,
-//! 5.4.1, 5.4.2, 5.5.1, 7.5.1, 7.5.9; RFC 3961 §8 (etype numbers used as
-//! client offers); docs/25 §4 (D53); main-session decisions 4-10, 13 (named
-//! per test); A-26 (docs/questions/Q-071). All values hand-made.
+//! 5.4.1, 5.4.2, 5.5.1, 7.5.1, 7.5.9; RFC 6113 5.4.2, 5.4.3; RFC 3961 §8
+//! (etype numbers used as client offers); docs/25 §4 (D53); docs/48 §5;
+//! docs/questions/Q-150; main-session decisions 4-10, 13 (named per test);
+//! A-26 (docs/questions/Q-071). All values hand-made.
 
 mod common;
 
@@ -14,7 +22,7 @@ use krb_proto::constants::{
     KDC_ERR_BADOPTION, KDC_ERR_CLIENT_REVOKED, KDC_ERR_ETYPE_NOSUPP, KDC_ERR_PADATA_TYPE_NOSUPP,
     KDC_ERR_POLICY, KDC_ERR_SERVICE_REVOKED, KDC_ERR_S_PRINCIPAL_UNKNOWN, KDC_ERR_TGT_REVOKED,
     KRB_AP_ERR_BAD_INTEGRITY, KRB_AP_ERR_NOT_US, KRB_AP_ERR_REPEAT, KRB_AP_ERR_SKEW,
-    KRB_AP_ERR_TKT_EXPIRED, KRB_AP_ERR_TKT_NYV, KRB_NT_SRV_INST, PA_TGS_REQ,
+    KRB_AP_ERR_TKT_EXPIRED, KRB_AP_ERR_TKT_NYV, KRB_NT_SRV_INST,
 };
 use krb_proto::{EncryptedData, KdcReq, PaData, PrincipalName, Realm, TgsReq, TicketFlags};
 use pdp::{
@@ -23,11 +31,12 @@ use pdp::{
 };
 
 /// The full round trip (RFC 4120 3.1 then 3.3): alice gets a TGT, then a
-/// service ticket. The client opens the TGS-REP with the TGT session key
-/// (usage 8, RFC 4120 5.4.2 / 7.5.1); the service opens the ticket with its
-/// key (usage 2, 5.3). Names, flags (PRE-AUTHENT carried, no INITIAL — 2.1)
-/// and times (3.3.3) are checked; keyd verified the authenticator checksum
-/// over the KDC's re-encoding of the KDC-REQ-BODY (decision 13).
+/// service ticket. The client opens the TGS-REP through the KrbFastResponse
+/// (RFC 6113 5.4.3: strengthened reply key, usage 9 — Q-121); the service
+/// opens the ticket with its key (usage 2, 5.3). Names, flags (PRE-AUTHENT
+/// carried, no INITIAL — 2.1) and times (3.3.3) are checked; keyd verified
+/// the authenticator checksum over the KDC's re-encoding of the
+/// KDC-REQ-BODY (decision 13).
 #[test]
 fn as_then_tgs_round_trip() {
     let mut f = Fixture::new();
@@ -35,10 +44,11 @@ fn as_then_tgs_round_trip() {
     let spec = TgsReqSpec::service();
     let (request, _) = spec.encode(&tgt);
     let bytes = sent(f.send(&request));
-    let (rep, part) = open_tgs_rep(&bytes, &tgt.session, 8);
+    let (rep, part) = open_tgs_rep(&bytes, &tgt, &spec);
     assert_eq!(rep.0.crealm, realm());
     assert_eq!(rep.0.cname, alice_name());
-    assert!(rep.0.padata.is_none());
+    // RFC 6113 5.4.3: only PA-FX-FAST.
+    assert_eq!(rep.0.padata.as_ref().map(Vec::len), Some(1));
     assert_eq!(rep.0.ticket.realm, realm());
     assert_eq!(rep.0.ticket.sname, service_name());
     let p = &part.0;
@@ -66,19 +76,25 @@ fn as_then_tgs_round_trip() {
     assert_eq!(events[1].service.as_ref().unwrap().name, service_name());
 }
 
-/// RFC 4120 5.4.2 / 3.3.3: with an authenticator subkey the TGS-REP is sealed
-/// under the subkey with key usage 9.
+/// RFC 4120 5.4.2 / 3.3.3 with RFC 6113 5.4.3 ("it MUST be set in a TGS
+/// reply"): the TGS-REP enc-part (usage 9) opens only under the reply key
+/// strengthened from the authenticator subkey — not under the subkey alone,
+/// nor under the TGT session key (docs/48 §9.2 item 3).
 #[test]
-fn subkey_reply_uses_usage_9() {
+fn subkey_reply_is_strengthened() {
     let mut f = Fixture::new();
     let tgt = obtain_tgt(&mut f);
-    let subkey = [0x3A; 32];
+    let subkey = [0x3B; 32];
     let mut spec = TgsReqSpec::service();
     spec.subkey = Some(subkey);
     let (request, _) = spec.encode(&tgt);
     let bytes = sent(f.send(&request));
-    let key = krb_crypto::random_to_key(krb_crypto::EncType::Aes256CtsHmacSha196, &subkey).unwrap();
-    let (_, part) = open_tgs_rep(&bytes, &key, 9);
+    let rep = krb_proto::TgsRep::decode(&bytes).unwrap();
+    for (key, n) in [(aes256(&subkey), 9), (aes256(&subkey), 8)] {
+        assert!(krb_crypto::decrypt(&key, usage(n), &rep.0.enc_part.cipher).is_err());
+    }
+    assert!(krb_crypto::decrypt(&tgt.session, usage(8), &rep.0.enc_part.cipher).is_err());
+    let (_, part) = open_tgs_rep(&bytes, &tgt, &spec);
     assert_eq!(part.0.sname, service_name());
 }
 
@@ -248,8 +264,11 @@ fn identical_retransmission_gets_the_same_reply() {
 }
 
 /// Decision 9 / RFC 4120 5.4.1: operation options at TGS are
-/// KDC_ERR_BADOPTION, as are enc-authorization-data and additional tickets
-/// (RFC 4120 5.4.1; keyd carries no authorization data, docs/10 §5).
+/// KDC_ERR_BADOPTION (the inner request), as are additional tickets (RFC 4120
+/// 5.4.1). enc-authorization-data is refused by keyd itself, which under FAST
+/// checks both bodies before its chain completes (docs/10 §5א; Q-150 item 2,
+/// A-43) — the uniform KRB_AP_ERR_BAD_INTEGRITY (A-26); keyd carries no
+/// authorization data (docs/10 §5).
 #[test]
 fn operation_options_and_content_are_badoption_at_tgs() {
     for bit in [2, 4, 5, 6, 28, 30, 31] {
@@ -269,7 +288,11 @@ fn operation_options_and_content_are_badoption_at_tgs() {
         cipher: vec![0; 32],
     });
     let (request, _) = spec.encode(&tgt);
-    assert_eq!(code_of(f.send(&request)), KDC_ERR_BADOPTION);
+    assert_eq!(code_of(f.send(&request)), KRB_AP_ERR_BAD_INTEGRITY);
+    assert_eq!(
+        f.keyd_records().last().unwrap().reason,
+        keyd::AuditReason::UnsupportedContent
+    );
     let mut spec = TgsReqSpec::service();
     spec.cusec = 3;
     spec.additional_tickets = Some(vec![tgt.rep.0.ticket.clone()]);
@@ -290,7 +313,7 @@ fn flag_options_follow_policy_and_tgt_at_tgs() {
     let mut spec = TgsReqSpec::service();
     spec.options = options(&[1]);
     let (request, _) = spec.encode(&tgt);
-    let (_, part) = open_tgs_rep(&sent(f.send(&request)), &tgt.session, 8);
+    let (_, part) = open_tgs_rep(&sent(f.send(&request)), &tgt, &spec);
     assert!(!part.0.flags.contains(TicketFlags::FORWARDABLE));
     // A forwardable TGT.
     let mut as_spec = AsReqSpec::alice();
@@ -302,7 +325,7 @@ fn flag_options_follow_policy_and_tgt_at_tgs() {
     spec.options = options(&[1]);
     spec.cusec = 2;
     let (request, _) = spec.encode(&tgt);
-    let (_, part) = open_tgs_rep(&sent(f.send(&request)), &tgt.session, 8);
+    let (_, part) = open_tgs_rep(&sent(f.send(&request)), &tgt, &spec);
     assert!(part.0.flags.contains(TicketFlags::FORWARDABLE));
 }
 
@@ -322,7 +345,7 @@ fn service_ticket_times_are_within_the_tgt() {
     spec.options = options(&[8]);
     spec.rtime = Some(kt("20261120100000Z"));
     let (request, _) = spec.encode(&tgt);
-    let (_, part) = open_tgs_rep(&sent(f.send(&request)), &tgt.session, 8);
+    let (_, part) = open_tgs_rep(&sent(f.send(&request)), &tgt, &spec);
     assert_eq!(part.0.endtime, kt("20261113120000Z"));
     assert!(part.0.flags.contains(TicketFlags::RENEWABLE));
     assert_eq!(part.0.renew_till, Some(kt("20261114100000Z")));
@@ -334,7 +357,7 @@ fn service_ticket_times_are_within_the_tgt() {
     spec.rtime = Some(kt("20261120100000Z"));
     spec.cusec = 5;
     let (request, _) = spec.encode(&tgt);
-    let (_, part) = open_tgs_rep(&sent(f.send(&request)), &tgt.session, 8);
+    let (_, part) = open_tgs_rep(&sent(f.send(&request)), &tgt, &spec);
     assert!(!part.0.flags.contains(TicketFlags::RENEWABLE));
     assert_eq!(part.0.renew_till, None);
 }
@@ -353,14 +376,19 @@ fn etype_negotiation_at_tgs() {
     spec.etypes = vec![RC4_HMAC, AES128, AES256];
     spec.cusec = 2;
     let (request, _) = spec.encode(&tgt);
-    let (_, part) = open_tgs_rep(&sent(f.send(&request)), &tgt.session, 8);
+    let (_, part) = open_tgs_rep(&sent(f.send(&request)), &tgt, &spec);
     assert_eq!(part.0.key.keytype, AES128);
 }
 
 /// RFC 4120 3.3.2, 3.2.3; decision 4; docs/questions/Q-070:
 /// - no PA-TGS-REQ → KDC_ERR_PADATA_TYPE_NOSUPP;
-/// - this realm's TGS as sname → KDC_ERR_POLICY;
-/// - another realm (or its TGS) → KDC_ERR_S_PRINCIPAL_UNKNOWN;
+/// - this realm's TGS as sname → KDC_ERR_POLICY (armored, inner request);
+/// - another realm's TGS → KDC_ERR_S_PRINCIPAL_UNKNOWN (armored);
+/// - another realm in the request → KRB_AP_ERR_BAD_INTEGRITY: under FAST
+///   keyd itself refuses a body (outer or inner) not of this realm before its
+///   chain completes (docs/questions/Q-150 item 2, A-43; the uniform `Denied`
+///   of A-26), so the KDC's own realm check of the inner body is defence in
+///   depth;
 /// - a presented ticket that is not this realm's TGT → KRB_AP_ERR_NOT_US;
 /// - a body altered after the checksum → KRB_AP_ERR_BAD_INTEGRITY (keyd's
 ///   checksum check, RFC 4120 3.3.2 / A-17).
@@ -382,8 +410,11 @@ fn tgs_request_shape_refusals() {
     spec.sname = Some(krbtgt_name());
     assert_eq!(code_of(f.send(&spec.encode(&tgt).0)), KDC_ERR_POLICY);
 
+    // The inner request is checked after keyd opened the armored context,
+    // so each request needs a fresh authenticator (keyd's replay cache).
     let mut spec = TgsReqSpec::service();
     spec.sname = Some(name(KRB_NT_SRV_INST, &["krbtgt", "OTHER.ORG"]));
+    spec.cusec = 2;
     assert_eq!(
         code_of(f.send(&spec.encode(&tgt).0)),
         KDC_ERR_S_PRINCIPAL_UNKNOWN
@@ -391,14 +422,30 @@ fn tgs_request_shape_refusals() {
 
     let mut spec = TgsReqSpec::service();
     spec.realm = Realm::new("OTHER.ORG").unwrap();
+    spec.cusec = 4;
     assert_eq!(
         code_of(f.send(&spec.encode(&tgt).0)),
-        KDC_ERR_S_PRINCIPAL_UNKNOWN
+        KRB_AP_ERR_BAD_INTEGRITY
+    );
+    assert_eq!(
+        f.keyd_records().last().unwrap().reason,
+        keyd::AuditReason::WrongRealm
+    );
+    // Only the inner body names another realm.
+    let mut spec = TgsReqSpec::service();
+    spec.cusec = 5;
+    spec.outer = Some(spec.body());
+    spec.realm = Realm::new("OTHER.ORG").unwrap();
+    assert_eq!(
+        code_of(f.send(&spec.encode(&tgt).0)),
+        KRB_AP_ERR_BAD_INTEGRITY
     );
 
     // A service ticket presented instead of a TGT.
-    let (request, _) = TgsReqSpec::service().encode(&tgt);
-    let (rep, part) = open_tgs_rep(&sent(f.send(&request)), &tgt.session, 8);
+    let mut spec = TgsReqSpec::service();
+    spec.cusec = 7;
+    let (request, _) = spec.encode(&tgt);
+    let (rep, part) = open_tgs_rep(&sent(f.send(&request)), &tgt, &spec);
     let service_session = key_from(&part.0.key);
     let mut spec = TgsReqSpec::service();
     spec.cusec = 9;
@@ -415,21 +462,11 @@ fn tgs_request_shape_refusals() {
         name_string: service_name().name_string,
     });
     altered.nonce = 12345;
-    let body = altered.body();
-    let ap_req = krb_proto::ApReq {
-        ap_options: krb_proto::ApOptions::empty(),
-        ticket: tgt.rep.0.ticket.clone(),
-        authenticator: authenticator(&tgt.session, &original, &original_body),
-    };
-    let request = TgsReq(KdcReq {
-        padata: Some(vec![PaData {
-            padata_type: PA_TGS_REQ,
-            padata_value: ap_req.encode().unwrap(),
-        }]),
-        req_body: body,
-    })
-    .encode()
-    .unwrap();
+    let request = altered.request_with(
+        &tgt.rep.0.ticket,
+        &tgt.session,
+        authenticator(&tgt.session, &original, &original_body),
+    );
     assert_eq!(code_of(f.send(&request)), KRB_AP_ERR_BAD_INTEGRITY);
     assert_eq!(
         f.keyd_records().last().unwrap().reason,
@@ -438,29 +475,10 @@ fn tgs_request_shape_refusals() {
 }
 
 /// A TGS-REQ for `spec` whose authenticator is `auth` (which may cover
-/// another body or be tampered with). RFC 4120 5.4.1, 5.2.7.1.
+/// another body or be tampered with), armored as usual. RFC 4120 5.4.1,
+/// 5.2.7.1; RFC 6113 5.4.2.
 fn request_with(tgt: &Tgt, spec: &TgsReqSpec, auth: EncryptedData) -> Vec<u8> {
-    let ap_req = krb_proto::ApReq {
-        ap_options: krb_proto::ApOptions::empty(),
-        ticket: tgt.rep.0.ticket.clone(),
-        authenticator: auth,
-    };
-    TgsReq(KdcReq {
-        padata: Some(vec![PaData {
-            padata_type: PA_TGS_REQ,
-            padata_value: ap_req.encode().unwrap(),
-        }]),
-        req_body: spec.body(),
-    })
-    .encode()
-    .unwrap()
-}
-
-/// A TGT obtained by an AS exchange at `when` (RFC 4120 3.1).
-fn tgt_at(f: &mut Fixture, mut spec: AsReqSpec, when: krb_proto::KerberosTime) -> Tgt {
-    spec.padata = Some(vec![pa_enc_timestamp(&alice_key(AES256), when)]);
-    let bytes = sent(f.send_at(&spec.encode(), kdc::Transport::Tcp, when));
-    open_as_rep(&bytes, &alice_key(AES256))
+    spec.request_with(&tgt.rep.0.ticket, &tgt.session, auth)
 }
 
 /// A-26 / RFC 4120 3.2.3: once keyd's cryptographic chain passed, each class
@@ -474,7 +492,7 @@ fn post_crypto_classes_map_to_rfc_codes() {
     // Expired: TGT until 10:10; request at 10:15:01 (beyond the 300 s skew).
     let mut short = AsReqSpec::alice();
     short.till = kt("20261113101000Z");
-    let tgt = tgt_at(&mut f, short, now());
+    let tgt = obtain_tgt_at(&mut f, short, now());
     let mut spec = TgsReqSpec::service();
     spec.ctime = at(901);
     let error = error_of(f.send_at(&spec.encode(&tgt).0, kdc::Transport::Tcp, at(901)));
@@ -485,7 +503,7 @@ fn post_crypto_classes_map_to_rfc_codes() {
     // Not yet valid: TGT authenticated at 10:06:40, request at 10:00.
     let mut later = AsReqSpec::alice();
     later.nonce = 7;
-    let tgt = tgt_at(&mut f, later, at(400));
+    let tgt = obtain_tgt_at(&mut f, later, at(400));
     let mut spec = TgsReqSpec::service();
     spec.cusec = 2;
     let error = error_of(f.send(&spec.encode(&tgt).0));
@@ -520,7 +538,7 @@ fn forged_requests_never_learn_a_class() {
     let mut f = Fixture::new();
     let mut short = AsReqSpec::alice();
     short.till = kt("20261113101000Z");
-    let tgt = tgt_at(&mut f, short, now());
+    let tgt = obtain_tgt_at(&mut f, short, now());
     let mut spec = TgsReqSpec::service();
     spec.ctime = at(901);
     let mut other = spec.clone();
@@ -576,10 +594,11 @@ fn forged_requests_never_learn_a_class() {
 fn skew_refusal_is_not_remembered_as_replay() {
     let mut f = Fixture::new();
     let tgt = obtain_tgt(&mut f);
-    let (request, _) = TgsReqSpec::service().encode(&tgt);
+    let spec = TgsReqSpec::service();
+    let (request, _) = spec.encode(&tgt);
     // The KDC's clock runs 301 s ahead of the authenticator: out of skew.
     let ahead = f.send_at(&request, kdc::Transport::Tcp, at(301));
     assert_eq!(code_of(ahead), KRB_AP_ERR_SKEW);
-    let (_, part) = open_tgs_rep(&sent(f.send(&request)), &tgt.session, 8);
+    let (_, part) = open_tgs_rep(&sent(f.send(&request)), &tgt, &spec);
     assert_eq!(part.0.sname, service_name());
 }

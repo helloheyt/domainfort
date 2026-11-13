@@ -34,6 +34,11 @@
 //!   krbtgt and the domain root as Tier0; an unclassified object is Tier0
 //!   for writes.
 //! - **Enctypes (R47-10):** keyd's configured list and s2kparams.
+//! - **Kind and armor policy (docs/48 §3.1, §7.2; Q-127 interim, P-10):**
+//!   from the most specific objectClass — a computer object is
+//!   `AccountKind::Computer` with `ArmorPolicy::BootstrapAllowed` (it may get
+//!   its TGT unarmored, and its TGT may armor others' AS requests); a user is
+//!   `AccountKind::User` with `ArmorPolicy::Required`.
 //!
 //! Every failure fails closed: `AccountSourceError` (the KDC refuses) or a
 //! `PipError` (the PDP denies).
@@ -52,9 +57,10 @@
 //!
 //! # Provenance
 //!
-//! Written only from docs/47 (in full; R47-1..R47-14, A-38), the decided
-//! questions Q-110..Q-117, PENDING-OWNER (A-18, A-19, A-27..A-38, P-6, P-9,
-//! P-11), docs/46, and the pinned specifications opened in-session from
+//! Written only from docs/47 (in full; R47-1..R47-14, A-38), docs/48 §3.1,
+//! §7.2-§7.3 (A-33), the decided questions Q-110..Q-117, Q-127 (interim),
+//! PENDING-OWNER (A-18, A-19, A-27..A-38, P-6, P-9, P-10, P-11), docs/46,
+//! and the pinned specifications opened in-session from
 //! `tools/spec-pin/cache/` (SHA-256 verified against
 //! `tools/spec-pin/manifest.json`): [MS-KILE] v20260928 3.1.1.2, 3.3.1.1,
 //! 3.3.3, 3.3.5.6.3, 4.4; [MS-ADTS] v20261026 2.2.12, 2.2.16, 3.1.1.4.5.17;

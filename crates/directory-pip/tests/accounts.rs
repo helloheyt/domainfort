@@ -2,7 +2,8 @@
 //! revoked_before.
 //!
 //! Sources (named per test): docs/47 §1.3 (R47-1), §1.4 (R47-2), §2.3
-//! (R47-3), §3.3 (R47-4), §4 (R47-5, R47-6, R47-7), §7.3 (R47-10);
+//! (R47-3), §3.3 (R47-4), §4 (R47-5, R47-6, R47-7), §7.3 (R47-10); docs/48
+//! §3.1, §7.2 and Q-127 (interim, P-10) for the kind and armor policy;
 //! [MS-KILE] 3.1.1.2, 4.4; [MS-ADTS] 2.2.16; [MS-SAMR] 2.2.1.14, 2.2.6.1,
 //! 3.1.1.6, 3.1.1.8.1; RFC 4120 3.3.3.1, 6.2. Test data: tests/common.
 
@@ -54,6 +55,31 @@ fn exact_sam_account_name_hit() {
         .client(&realm(), &name(KRB_NT_ENTERPRISE, &["alice"]))
         .unwrap();
     assert_eq!(other_type, Some(alice));
+}
+
+/// docs/48 §3.1, §7.2 ("derived by the AccountSource from authoritative
+/// data: objectClass computer → BootstrapAllowed; everything else →
+/// Required"); Q-127 interim decision ((ב) = `kind` from objectClass; P-10):
+/// users are `User` / `Required`; computers — a workstation (WT) and a DC
+/// (ST) alike — are `Computer` / `BootstrapAllowed`.
+#[test]
+fn kind_and_armor_policy_follow_the_object_class() {
+    let d = Dir::standard("kind");
+    let view = d.view();
+    for user in ["alice", "bob", "rootadmin"] {
+        let account = client(&view, &[user]).unwrap().expect(user);
+        assert_eq!(account.kind, kdc::AccountKind::User, "{user}");
+        assert_eq!(account.armor_policy, kdc::ArmorPolicy::Required, "{user}");
+    }
+    for computer in ["ws01$", "dc01$"] {
+        let account = client(&view, &[computer]).unwrap().expect(computer);
+        assert_eq!(account.kind, kdc::AccountKind::Computer, "{computer}");
+        assert_eq!(
+            account.armor_policy,
+            kdc::ArmorPolicy::BootstrapAllowed,
+            "{computer}"
+        );
+    }
 }
 
 /// docs/47 §1.3 AS step 4 (A-27): the unique index folds A–Z (Q-080), the

@@ -1,36 +1,69 @@
 #![no_main]
 //! Fuzz target for the KDC's network-facing path: TCP record framing
-//! (RFC 4120 7.2.2) and `Kdc::handle` (AS-REQ / TGS-REQ processing) against
-//! in-memory backends — a real keyd with an insecure development key store,
-//! the in-memory account source and the real PDP.
+//! (RFC 4120 7.2.2) and `Kdc::handle` (AS-REQ / TGS-REQ processing,
+//! unarmored and FAST-armored) against in-memory backends — a real keyd with
+//! an insecure development key store, the in-memory account source and the
+//! real PDP with `pdp::mandatory_fast_rules` (docs/48 §7.2).
 //!
-//! The first input octet selects the mode: a TCP byte stream (framing, then
-//! every complete record), one UDP datagram, or one TCP record. Invariants
-//! checked on every reply (AGENTS.md §6; main-session decisions 1, 11, 12):
-//! nothing panics; a reply is bounded and decodes as AS-REP, TGS-REP or
-//! KRB-ERROR; a KRB-ERROR never carries e-text.
+//! The first input octet selects the mode:
+//! - 0: a TCP byte stream (framing, then every complete record);
+//! - 1: one UDP datagram; 2: one TCP record;
+//! - 3: an armored AS-REQ (RFC 6113 5.4.2) under a fresh, VALID armor on the
+//!   computer account's TGT, whose KrbFastReq plaintext is the rest of the
+//!   input — it reaches keyd's KrbFastReq decoding and, when that decodes,
+//!   the KDC's processing of the inner request;
+//! - 4: an armored TGS-REQ (implicit armor, RFC 6113 5.4.2) on the user's
+//!   TGT, whose KrbFastReq plaintext is the rest of the input;
+//! - 5: a valid armored AS-REQ for the user whose inner padata is one PA-DATA
+//!   chosen by the second octet (PA-ENCRYPTED-CHALLENGE, PA-FX-COOKIE,
+//!   PA-ENC-TIMESTAMP, PA-FX-FAST) with the rest of the input as its value,
+//!   and whose FastOptions come from the input — the cookie, the inner
+//!   padata scan, the FastOptions check and keyd's challenge decoding.
 //!
-//! The backends are built once and reused across inputs (keys are created
-//! with keyd's `create_key` from the kernel CSPRNG); every table the KDC and
-//! keyd keep is bounded, so state growth is bounded.
+//! Invariants checked on every reply (AGENTS.md §6; main-session decisions
+//! 1, 11, 12): nothing panics; a reply is bounded and decodes as AS-REP,
+//! TGS-REP or KRB-ERROR; a KRB-ERROR never carries e-text, and its e-data,
+//! when present, is METHOD-DATA.
 //!
-//! Spec: RFC 4120 7.2.1, 7.2.2, 5.1.4, 5.9.1; AGENTS.md §6.
+//! The backends are built once and reused across inputs. The computer
+//! account's and the user's keys come from keyd's `set_secret` with
+//! passwords known to the harness, so that it can play the FAST client
+//! (RFC 6113 5.4.1.1, 5.4.6; keys from krb-crypto, as the integration tests
+//! do); the krbtgt and service keys come from `create_key` (kernel CSPRNG).
+//! The harness clock advances one second every 50 inputs, so that keyd's
+//! bounded replay cache and token tables keep expiring entries instead of
+//! filling up (fail closed would otherwise stop the armored paths early);
+//! it stays within the armor TGT's life. Every table the KDC and keyd keep
+//! is bounded, so state growth is bounded.
+//!
+//! Spec: RFC 4120 7.2.1, 7.2.2, 5.1.4, 5.9.1; RFC 6113 5.4.1.1, 5.4.2,
+//! 5.4.3, 5.4.6; docs/48 §9.2 item 16; AGENTS.md §6.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, OnceLock};
 
 use dtyp::{Sid, SECURITY_NT_AUTHORITY};
 use kdc::{
-    tcp_decode_frame, AccountState, AuditEvent, ClientAccount, InMemoryAccounts, Kdc, KdcConfig,
-    KdcReply, LocalKeyd, Peer, PolicyInputs, RateLimiter, ServiceAccount, TcpFrame, Transport,
+    tcp_decode_frame, AccountKind, AccountState, ArmorPolicy, AuditEvent, ClientAccount,
+    InMemoryAccounts, Kdc, KdcConfig, KdcReply, LocalKeyd, Peer, PolicyInputs, RateLimiter,
+    ServiceAccount, TcpFrame, Transport,
 };
 use keyd::{
     AuditRecord, CallerId, InMemoryKeyStore, KeyHandle, KeyPurpose, Keyd, KeydConfig, OsEntropy,
     PrincipalBinding, PrincipalId, Role,
 };
+use krb_crypto::{EncType, KeyUsage, ProtocolKey};
+use krb_proto::constants::{
+    FX_FAST_ARMOR_AP_REQUEST, PA_ENCRYPTED_CHALLENGE, PA_ENC_TIMESTAMP, PA_FX_COOKIE, PA_FX_FAST,
+    PA_TGS_REQ,
+};
 use krb_proto::limits::MAX_MESSAGE_LEN;
 use krb_proto::{
-    AsRep, EtypeInfo2Entry, KerberosString, KerberosTime, KrbError, PrincipalName, Realm, TgsRep,
+    ApOptions, ApReq, AsRep, AsReq, Authenticator, Checksum, EncAsRepPart, EncryptedData,
+    EncryptionKey, EtypeInfo2Entry, FastOptions, KdcOptions, KdcReq, KdcReqBody, KerberosFlags,
+    KerberosString, KerberosTime, KeyValue, KrbError, KrbFastArmor, KrbFastArmoredReq, KrbFastReq,
+    KrbFastResponse, MethodData, Microseconds, PaData, PaEncTsEnc, PaFxFastReply,
+    PaFxFastRequest, PrincipalName, Realm, TgsRep, TgsReq, Ticket,
 };
 use libfuzzer_sys::fuzz_target;
 use pdp::{
@@ -88,13 +121,28 @@ impl Pip for FuzzPip {
 
 type FuzzKdc = Kdc<LocalKeyd<InMemoryKeyStore, NoKeydAudit, OsEntropy>, NoKdcAudit, AdmitAll>;
 
+/// A TGT the harness holds as a client.
+struct HeldTgt {
+    ticket: Ticket,
+    cname: PrincipalName,
+    session: ProtocolKey,
+}
+
 /// The KDC, its policy inputs and the account source passed with each
-/// request (docs/47 R47-14).
+/// request (docs/47 R47-14), and the harness's FAST client state.
 struct FuzzState {
     kdc: FuzzKdc,
     snapshot: PolicySnapshot,
     pip: FuzzPip,
     accounts: InMemoryAccounts,
+    /// The computer account's TGT: the armor ticket (D126).
+    machine: HeldTgt,
+    /// The user's TGT (obtained armored): the TGS mode's ticket.
+    user: HeldTgt,
+    /// The user's long-term key (for the encrypted challenge).
+    user_key: ProtocolKey,
+    /// Inputs seen: drives the clock and makes every armor fresh.
+    counter: u32,
 }
 
 const REALM: &str = "FUZZ.EXAMPLE";
@@ -102,10 +150,23 @@ const ADMIN: CallerId = CallerId {
     uid: 3,
     role: Role::Admin,
 };
+const DIRECTORY: CallerId = CallerId {
+    uid: 2,
+    role: Role::Directory,
+};
 const KDC_CALLER: CallerId = CallerId {
     uid: 1,
     role: Role::Kdc,
 };
+const USER_PASSWORD: &str = "fuzz-user-password";
+const USER_SALT: &str = "FUZZ.EXAMPLEfuzzer";
+const MACHINE_PASSWORD: &str = "fuzz-machine-secret";
+const MACHINE_SALT: &str = "FUZZ.EXAMPLEhostfuzzhost.fuzz.example";
+/// Inputs per harness second (module docs).
+const INPUTS_PER_SECOND: u32 = 50;
+/// The harness clock wraps within the armor TGT's life (24 h, RFC 4120 §8.2
+/// default policy) minus an hour of margin.
+const CLOCK_SPAN_SECS: u32 = 23 * 3600;
 
 fn kstr(s: &str) -> KerberosString {
     KerberosString::new(s).expect("valid KerberosString")
@@ -118,19 +179,240 @@ fn name(name_type: i32, parts: &[&str]) -> PrincipalName {
     }
 }
 
-fn now() -> KerberosTime {
-    KerberosTime::new(2026, 11, 13, 10, 0, 0).expect("valid time")
+fn realm() -> Realm {
+    Realm::new(REALM).expect("valid realm")
+}
+
+fn krbtgt_name() -> PrincipalName {
+    name(2, &["krbtgt", REALM])
+}
+
+fn base_time() -> KerberosTime {
+    KerberosTime::new(2026, 11, 13, 0, 0, 0).expect("valid time")
+}
+
+/// The harness clock: the base time plus one second per INPUTS_PER_SECOND
+/// inputs, wrapping within CLOCK_SPAN_SECS.
+fn clock(counter: u32) -> KerberosTime {
+    let secs = (counter / INPUTS_PER_SECOND) % CLOCK_SPAN_SECS;
+    let hour = u8::try_from(secs / 3600).expect("< 24");
+    let minute = u8::try_from((secs % 3600) / 60).expect("< 60");
+    let second = u8::try_from(secs % 60).expect("< 60");
+    KerberosTime::new(2026, 11, 13, hour, minute, second).expect("valid time")
+}
+
+fn usage(n: u32) -> KeyUsage {
+    KeyUsage::new(n).expect("valid key usage")
+}
+
+fn aes256_key(password: &str, salt: &str) -> ProtocolKey {
+    krb_crypto::string_to_key(EncType::Aes256CtsHmacSha196, password, salt, None, 50_000)
+        .expect("string-to-key")
+}
+
+fn cf2(k1: &ProtocolKey, k2: &ProtocolKey, p1: &[u8], p2: &[u8]) -> ProtocolKey {
+    krb_crypto::krb_fx_cf2(k1, k2, p1, p2).expect("KRB-FX-CF2")
+}
+
+fn seal(key: &ProtocolKey, usage_number: u32, plain: &[u8]) -> EncryptedData {
+    EncryptedData {
+        etype: key.enc_type().number(),
+        kvno: None,
+        cipher: krb_crypto::encrypt(key, usage(usage_number), &[0x46; 16], plain)
+            .expect("encrypt"),
+    }
+}
+
+fn open(key: &ProtocolKey, usage_number: u32, enc: &EncryptedData) -> Vec<u8> {
+    krb_crypto::decrypt(key, usage(usage_number), &enc.cipher)
+        .expect("decrypt")
+        .to_vec()
+}
+
+fn mic(key: &ProtocolKey, usage_number: u32, data: &[u8]) -> Checksum {
+    let cksumtype = key.enc_type().checksum_type();
+    Checksum {
+        cksumtype: cksumtype.number(),
+        checksum: krb_crypto::get_mic(key, cksumtype, usage(usage_number), data).expect("mic"),
+    }
+}
+
+fn key_from(ek: &EncryptionKey) -> ProtocolKey {
+    let enc_type = EncType::from_number(ek.keytype).expect("AES enctype");
+    krb_crypto::random_to_key(enc_type, ek.keyvalue.as_bytes()).expect("random-to-key")
+}
+
+fn timestamp(ts: KerberosTime) -> Vec<u8> {
+    PaEncTsEnc {
+        patimestamp: ts,
+        pausec: None,
+    }
+    .encode()
+    .expect("PA-ENC-TS-ENC")
+}
+
+/// An AS-REQ body for this realm's TGT (RFC 4120 5.4.1).
+fn as_body(cname: PrincipalName, nonce: u32) -> KdcReqBody {
+    KdcReqBody {
+        kdc_options: KdcOptions::empty(),
+        cname: Some(cname),
+        realm: realm(),
+        sname: Some(krbtgt_name()),
+        from: None,
+        till: KerberosTime::new(1970, 1, 1, 0, 0, 0).expect("valid time"),
+        rtime: None,
+        nonce,
+        etype: vec![18, 17],
+        addresses: None,
+        enc_authorization_data: None,
+        additional_tickets: None,
+    }
+}
+
+/// A TGS-REQ body for the fuzz service (RFC 4120 5.4.1).
+fn tgs_body(nonce: u32) -> KdcReqBody {
+    KdcReqBody {
+        kdc_options: KdcOptions::empty(),
+        cname: None,
+        realm: realm(),
+        sname: Some(name(3, &["host", "target.fuzz.example"])),
+        from: None,
+        till: KerberosTime::new(1970, 1, 1, 0, 0, 0).expect("valid time"),
+        rtime: None,
+        nonce,
+        etype: vec![18, 17],
+        addresses: None,
+        enc_authorization_data: None,
+        additional_tickets: None,
+    }
+}
+
+/// A subkey distinct per `n` (RFC 6113 5.4: a fresh armor key per
+/// conversation).
+fn subkey(n: u32) -> ProtocolKey {
+    let mut octets = [0xF0u8; 32];
+    octets[..4].copy_from_slice(&n.to_be_bytes());
+    krb_crypto::random_to_key(EncType::Aes256CtsHmacSha196, &octets).expect("random-to-key")
+}
+
+/// An AP-REQ on `tgt` whose authenticator (key usage `auth_usage`) carries
+/// `sub` and, when given, a checksum over `cksum_over` (usage 6).
+/// RFC 4120 5.5.1.
+fn ap_req(
+    tgt: &HeldTgt,
+    sub: &ProtocolKey,
+    ctime: KerberosTime,
+    n: u32,
+    auth_usage: u32,
+    cksum_over: Option<&[u8]>,
+) -> ApReq {
+    let authenticator = Authenticator {
+        crealm: realm(),
+        cname: tgt.cname.clone(),
+        cksum: cksum_over.map(|body| mic(&tgt.session, 6, body)),
+        cusec: Microseconds::new(n % 1_000_000).expect("valid cusec"),
+        ctime,
+        subkey: Some(EncryptionKey {
+            keytype: sub.enc_type().number(),
+            keyvalue: KeyValue::from_slice(sub.octets()),
+        }),
+        seq_number: None,
+        authorization_data: None,
+    }
+    .encode()
+    .expect("Authenticator");
+    ApReq {
+        ap_options: ApOptions::empty(),
+        ticket: tgt.ticket.clone(),
+        authenticator: seal(&tgt.session, auth_usage, &authenticator),
+    }
+}
+
+/// The PA-FX-FAST of a request: the req-checksum over `checksummed` (armor
+/// key, usage 50) and `fast_req_plain` sealed in the armor key (usage 51).
+/// RFC 6113 5.4.2.
+fn fx_fast(
+    armor: Option<KrbFastArmor>,
+    armor_key: &ProtocolKey,
+    checksummed: &[u8],
+    fast_req_plain: &[u8],
+) -> PaData {
+    PaData {
+        padata_type: PA_FX_FAST,
+        padata_value: PaFxFastRequest::ArmoredData(KrbFastArmoredReq {
+            armor,
+            req_checksum: mic(armor_key, 50, checksummed),
+            enc_fast_req: seal(armor_key, 51, fast_req_plain),
+        })
+        .encode()
+        .expect("PA-FX-FAST-REQUEST"),
+    }
+}
+
+/// An armored AS-REQ under a fresh armor on `machine` (RFC 6113 5.4.1.1:
+/// authenticator key usage 11, subkey, no checksum — Q-120), whose
+/// KrbFastReq plaintext is `fast_req_plain`. Returns the request and the
+/// armor key.
+fn armored_as(
+    machine: &HeldTgt,
+    n: u32,
+    when: KerberosTime,
+    outer: &KdcReqBody,
+    fast_req_plain: &[u8],
+) -> (Vec<u8>, ProtocolKey) {
+    let sub = subkey(n);
+    let ap = ap_req(machine, &sub, when, n, 11, None);
+    let armor_key = cf2(&sub, &machine.session, b"subkeyarmor", b"ticketarmor");
+    let armor = KrbFastArmor {
+        armor_type: FX_FAST_ARMOR_AP_REQUEST,
+        armor_value: ap.encode().expect("AP-REQ"),
+    };
+    let outer_octets = outer.encode().expect("KDC-REQ-BODY");
+    let request = AsReq(KdcReq {
+        padata: Some(vec![fx_fast(
+            Some(armor),
+            &armor_key,
+            &outer_octets,
+            fast_req_plain,
+        )]),
+        req_body: outer.clone(),
+    })
+    .encode()
+    .expect("AS-REQ");
+    (request, armor_key)
+}
+
+/// The encrypted challenge of `long_term` under `armor_key` at `ts`
+/// (RFC 6113 5.4.6, key usage 54).
+fn encrypted_challenge(armor_key: &ProtocolKey, long_term: &ProtocolKey, ts: KerberosTime) -> PaData {
+    let key = cf2(
+        armor_key,
+        long_term,
+        b"clientchallengearmor",
+        b"challengelongterm",
+    );
+    PaData {
+        padata_type: PA_ENCRYPTED_CHALLENGE,
+        padata_value: seal(&key, 54, &timestamp(ts))
+            .encode()
+            .expect("EncryptedChallenge"),
+    }
 }
 
 fn build() -> FuzzState {
-    let realm = Realm::new(REALM).expect("valid realm");
+    let realm = realm();
     let krbtgt = KeyHandle::new(PrincipalId::from_bytes([1; 16]), KeyPurpose::Krbtgt);
     let client = KeyHandle::new(
         PrincipalId::from_bytes([2; 16]),
         KeyPurpose::PrincipalLongterm,
     );
     let service = KeyHandle::new(PrincipalId::from_bytes([3; 16]), KeyPurpose::Service);
+    let machine_handle = KeyHandle::new(
+        PrincipalId::from_bytes([4; 16]),
+        KeyPurpose::PrincipalLongterm,
+    );
     let client_name = name(1, &["fuzzer"]);
+    let machine_name = name(1, &["fuzzhost$"]);
     let service_name = name(3, &["host", "target.fuzz.example"]);
 
     let mut keyd = Keyd::new(
@@ -139,12 +421,8 @@ fn build() -> FuzzState {
         NoKeydAudit,
     )
     .expect("valid keyd config");
-    let n = now();
-    for (handle, binding) in [
-        (krbtgt, name(2, &["krbtgt", REALM])),
-        (client, client_name.clone()),
-        (service, service_name.clone()),
-    ] {
+    let n = base_time();
+    for (handle, binding) in [(krbtgt, krbtgt_name()), (service, service_name.clone())] {
         keyd.create_key(
             &ADMIN,
             &handle,
@@ -153,8 +431,39 @@ fn build() -> FuzzState {
         )
         .expect("key created");
     }
+    for (handle, binding, password, salt) in [
+        (client, client_name.clone(), USER_PASSWORD, USER_SALT),
+        (
+            machine_handle,
+            machine_name.clone(),
+            MACHINE_PASSWORD,
+            MACHINE_SALT,
+        ),
+    ] {
+        keyd.set_secret(
+            &DIRECTORY,
+            &handle,
+            &PrincipalBinding::new(realm.clone(), binding),
+            String::from(password).into(),
+            salt,
+            &n,
+        )
+        .expect("secret set");
+    }
 
+    let etype_info = |salt: &str| -> Vec<EtypeInfo2Entry> {
+        [18, 17]
+            .iter()
+            .map(|e| EtypeInfo2Entry {
+                etype: *e,
+                salt: Some(kstr(salt)),
+                s2kparams: None,
+            })
+            .collect()
+    };
     let sid = Sid::new(SECURITY_NT_AUTHORITY, &[21, 1, 2, 3, 1000]).expect("valid SID");
+    let machine_sid = Sid::new(SECURITY_NT_AUTHORITY, &[21, 1, 2, 3, 1001]).expect("valid SID");
+    let bootstrap = Sid::new(SECURITY_NT_AUTHORITY, &[21, 1, 2, 3, 1500]).expect("valid SID");
     let mut accounts = InMemoryAccounts::new();
     accounts
         .insert_client(
@@ -166,17 +475,28 @@ fn build() -> FuzzState {
                 groups: BTreeSet::new(),
                 tier: Tier::Tier2,
                 state: AccountState::ACTIVE,
-                etype_info: [18, 17]
-                    .iter()
-                    .map(|e| EtypeInfo2Entry {
-                        etype: *e,
-                        salt: Some(kstr("FUZZ.EXAMPLEfuzzer")),
-                        s2kparams: None,
-                    })
-                    .collect(),
+                etype_info: etype_info(USER_SALT),
+                kind: AccountKind::User,
+                armor_policy: ArmorPolicy::Required,
             },
         )
         .expect("client inserted");
+    accounts
+        .insert_client(
+            &realm,
+            &machine_name,
+            ClientAccount {
+                key: machine_handle,
+                sid: machine_sid,
+                groups: [bootstrap].into_iter().collect(),
+                tier: Tier::Tier2,
+                state: AccountState::ACTIVE,
+                etype_info: etype_info(MACHINE_SALT),
+                kind: AccountKind::Computer,
+                armor_policy: ArmorPolicy::BootstrapAllowed,
+            },
+        )
+        .expect("computer inserted");
     accounts
         .insert_service(
             &realm,
@@ -189,36 +509,121 @@ fn build() -> FuzzState {
         )
         .expect("service inserted");
 
-    let kdc = Kdc::new(
+    let mut kdc = Kdc::new(
         KdcConfig::new(realm, krbtgt),
         LocalKeyd::new(keyd, KDC_CALLER).expect("Kdc role"),
         NoKdcAudit,
         AdmitAll,
     )
     .expect("valid KDC config");
-    let snapshot = PolicySnapshot::new(
-        PolicyVersion(1),
-        vec![Rule {
-            id: RuleId(1),
-            effect: Effect::Allow,
-            when: Match {
-                action: ActionMatch::Class(ActionClass::Kerberos),
-                resource: ResourceMatch::Any,
-                subject: SubjectMatch::Any,
-                context: ContextMatch::ANY,
-                auth: AuthMatch::ANY,
-            },
-            obligations: Vec::new(),
-        }],
-        Vec::new(),
-    );
+    // docs/48 §7.2: the mandatory-FAST rules plus a broad grant.
+    let mut rules = pdp::mandatory_fast_rules(bootstrap, RuleId(100)).expect("rule ids");
+    rules.push(Rule {
+        id: RuleId(1),
+        effect: Effect::Allow,
+        when: Match {
+            action: ActionMatch::Class(ActionClass::Kerberos),
+            resource: ResourceMatch::Any,
+            subject: SubjectMatch::Any,
+            context: ContextMatch::ANY,
+            auth: AuthMatch::ANY,
+        },
+        obligations: Vec::new(),
+    });
+    let snapshot = PolicySnapshot::new(PolicyVersion(1), rules, Vec::new());
+    let pip = FuzzPip {
+        tiers: [(sid, Tier::Tier2), (machine_sid, Tier::Tier2)]
+            .into_iter()
+            .collect(),
+    };
+    let tcp = Peer {
+        transport: Transport::Tcp,
+        src_net: IpScope::Internal,
+    };
+
+    // The computer account's TGT: the unarmored bootstrap (docs/48 §7.3).
+    let machine_key = aes256_key(MACHINE_PASSWORD, MACHINE_SALT);
+    let mut ts = seal(&machine_key, 1, &timestamp(n));
+    ts.kvno = Some(1);
+    let bootstrap_req = AsReq(KdcReq {
+        padata: Some(vec![PaData {
+            padata_type: PA_ENC_TIMESTAMP,
+            padata_value: ts.encode().expect("PA-ENC-TIMESTAMP"),
+        }]),
+        req_body: as_body(machine_name.clone(), 1),
+    })
+    .encode()
+    .expect("AS-REQ");
+    let inputs = PolicyInputs {
+        snapshot: &snapshot,
+        pip: &pip,
+    };
+    let KdcReply::Send(bytes) = kdc.handle(&bootstrap_req, tcp, n, &inputs, &accounts) else {
+        panic!("bootstrap AS answered");
+    };
+    let rep = AsRep::decode(&bytes).expect("bootstrap AS-REP");
+    let part = EncAsRepPart::decode(&open(&machine_key, 3, &rep.0.enc_part)).expect("EncAsRepPart");
+    let machine = HeldTgt {
+        ticket: rep.0.ticket,
+        cname: rep.0.cname,
+        session: key_from(&part.0.key),
+    };
+
+    // The user's TGT: an armored AS with the encrypted challenge (RFC 6113
+    // 5.4.6), opened under the strengthened reply key (5.4.3).
+    let user_key = aes256_key(USER_PASSWORD, USER_SALT);
+    let outer = as_body(client_name.clone(), 2);
+    let sub = subkey(0);
+    let armor_key = cf2(&sub, &machine.session, b"subkeyarmor", b"ticketarmor");
+    let fast_req = KrbFastReq {
+        fast_options: FastOptions::empty(),
+        padata: vec![encrypted_challenge(&armor_key, &user_key, n)],
+        req_body: outer.clone(),
+    }
+    .encode()
+    .expect("KrbFastReq");
+    let ap = ap_req(&machine, &sub, n, 0, 11, None);
+    let request = AsReq(KdcReq {
+        padata: Some(vec![fx_fast(
+            Some(KrbFastArmor {
+                armor_type: FX_FAST_ARMOR_AP_REQUEST,
+                armor_value: ap.encode().expect("AP-REQ"),
+            }),
+            &armor_key,
+            &outer.encode().expect("KDC-REQ-BODY"),
+            &fast_req,
+        )]),
+        req_body: outer,
+    })
+    .encode()
+    .expect("AS-REQ");
+    let KdcReply::Send(bytes) = kdc.handle(&request, tcp, n, &inputs, &accounts) else {
+        panic!("armored AS answered");
+    };
+    let rep = AsRep::decode(&bytes).expect("armored AS-REP");
+    let fx = rep.0.padata.as_ref().and_then(|p| p.first()).expect("PA-FX-FAST");
+    let PaFxFastReply::ArmoredData(armored) =
+        PaFxFastReply::decode(&fx.padata_value).expect("PA-FX-FAST-REPLY");
+    let response = KrbFastResponse::decode(&open(&armor_key, 52, &armored.enc_fast_rep))
+        .expect("KrbFastResponse");
+    let strengthen = key_from(response.strengthen_key.as_ref().expect("strengthen-key"));
+    let reply_key = cf2(&strengthen, &user_key, b"strengthenkey", b"replykey");
+    let part = EncAsRepPart::decode(&open(&reply_key, 3, &rep.0.enc_part)).expect("EncAsRepPart");
+    let user = HeldTgt {
+        ticket: rep.0.ticket,
+        cname: rep.0.cname,
+        session: key_from(&part.0.key),
+    };
+
     FuzzState {
         kdc,
         snapshot,
-        pip: FuzzPip {
-            tiers: [(sid, Tier::Tier2)].into_iter().collect(),
-        },
+        pip,
         accounts,
+        machine,
+        user,
+        user_key,
+        counter: 1,
     }
 }
 
@@ -227,20 +632,96 @@ fn state() -> &'static Mutex<FuzzState> {
     STATE.get_or_init(|| Mutex::new(build()))
 }
 
-/// The invariants every reply must satisfy (decisions 11, 12).
+/// The invariants every reply must satisfy (decisions 11, 12; RFC 4120
+/// 5.9.1; RFC 6113 5.4.4).
 fn check(reply: KdcReply) {
     match reply {
         KdcReply::Silent => {}
         KdcReply::Send(bytes) | KdcReply::SendAndClose(bytes) => {
             assert!(bytes.len() <= MAX_MESSAGE_LEN);
             match KrbError::decode(&bytes) {
-                Ok(error) => assert!(error.e_text.is_none(), "KRB-ERROR with e-text"),
+                Ok(error) => {
+                    assert!(error.e_text.is_none(), "KRB-ERROR with e-text");
+                    if let Some(e_data) = &error.e_data {
+                        assert!(MethodData::decode(e_data).is_ok(), "e-data not METHOD-DATA");
+                    }
+                }
                 Err(_) => assert!(
                     AsRep::decode(&bytes).is_ok() || TgsRep::decode(&bytes).is_ok(),
                     "reply is neither KRB-ERROR nor KDC-REP"
                 ),
             }
         }
+    }
+}
+
+/// Mode 4: an armored TGS-REQ on the user's TGT (implicit armor, RFC 6113
+/// 5.4.2) whose KrbFastReq plaintext is `fast_req_plain`.
+fn armored_tgs(state: &FuzzState, n: u32, when: KerberosTime, fast_req_plain: &[u8]) -> Vec<u8> {
+    let body = tgs_body(n);
+    let body_octets = body.encode().expect("KDC-REQ-BODY");
+    let sub = subkey(n);
+    let ap = ap_req(&state.user, &sub, when, n, 7, Some(&body_octets))
+        .encode()
+        .expect("AP-REQ");
+    let armor_key = cf2(&sub, &state.user.session, b"subkeyarmor", b"ticketarmor");
+    TgsReq(KdcReq {
+        padata: Some(vec![
+            PaData {
+                padata_type: PA_TGS_REQ,
+                padata_value: ap.clone(),
+            },
+            fx_fast(None, &armor_key, &ap, fast_req_plain),
+        ]),
+        req_body: body,
+    })
+    .encode()
+    .expect("TGS-REQ")
+}
+
+/// Mode 5: a valid armored AS-REQ for the user with one fuzzed inner padata
+/// and fuzzed FastOptions (module docs).
+fn armored_as_fuzzed_padata(
+    state: &FuzzState,
+    n: u32,
+    when: KerberosTime,
+    input: &[u8],
+) -> Vec<u8> {
+    let (selector, rest): (u8, &[u8]) = match input.split_first() {
+        Some((selector, rest)) => (*selector, rest),
+        None => (0, &[]),
+    };
+    let (options, value) = if rest.len() >= 4 {
+        let (o, v) = rest.split_at(4);
+        (u32::from_be_bytes([o[0], o[1], o[2], o[3]]), v)
+    } else {
+        (0, rest)
+    };
+    let padata_type = [
+        PA_ENCRYPTED_CHALLENGE,
+        PA_FX_COOKIE,
+        PA_ENC_TIMESTAMP,
+        PA_FX_FAST,
+    ][usize::from(selector % 4)];
+    let outer = as_body(state.user.cname.clone(), n);
+    let sub = subkey(n);
+    let armor_key = cf2(&sub, &state.machine.session, b"subkeyarmor", b"ticketarmor");
+    let mut padata = vec![PaData {
+        padata_type,
+        padata_value: value.to_vec(),
+    }];
+    if selector & 0x80 != 0 {
+        padata.push(encrypted_challenge(&armor_key, &state.user_key, when));
+    }
+    let fast_req = KrbFastReq {
+        fast_options: FastOptions(KerberosFlags::from_bits(options)),
+        padata,
+        req_body: outer.clone(),
+    };
+    match fast_req.encode() {
+        Ok(plain) => armored_as(&state.machine, n, when, &outer, &plain).0,
+        // A padata value too large to encode: the plain bytes instead.
+        Err(_) => armored_as(&state.machine, n, when, &outer, value).0,
     }
 }
 
@@ -252,17 +733,9 @@ fuzz_target!(|data: &[u8]| {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    let FuzzState {
-        kdc,
-        snapshot,
-        pip,
-        accounts,
-    } = &mut *guard;
-    let accounts: &InMemoryAccounts = accounts;
-    let inputs = PolicyInputs {
-        snapshot: &*snapshot,
-        pip: &*pip,
-    };
+    guard.counter = guard.counter.wrapping_add(1);
+    let n = guard.counter;
+    let when = clock(n);
     let tcp = Peer {
         transport: Transport::Tcp,
         src_net: IpScope::Internal,
@@ -271,7 +744,33 @@ fuzz_target!(|data: &[u8]| {
         transport: Transport::Udp,
         src_net: IpScope::Internal,
     };
-    match mode % 3 {
+    // Requests built from the client state, before the KDC is borrowed.
+    let built = match mode % 6 {
+        3 => {
+            let outer = as_body(guard.user.cname.clone(), n);
+            Some(armored_as(&guard.machine, n, when, &outer, input).0)
+        }
+        4 => Some(armored_tgs(&guard, n, when, input)),
+        5 => Some(armored_as_fuzzed_padata(&guard, n, when, input)),
+        _ => None,
+    };
+    let FuzzState {
+        kdc,
+        snapshot,
+        pip,
+        accounts,
+        ..
+    } = &mut *guard;
+    let accounts: &InMemoryAccounts = accounts;
+    let inputs = PolicyInputs {
+        snapshot: &*snapshot,
+        pip: &*pip,
+    };
+    if let Some(request) = built {
+        check(kdc.handle(&request, tcp, when, &inputs, accounts));
+        return;
+    }
+    match mode % 6 {
         0 => {
             // A TCP byte stream: framing, then each complete record.
             let mut rest = input;
@@ -281,7 +780,7 @@ fuzz_target!(|data: &[u8]| {
                         message,
                         rest: next,
                     }) => {
-                        check(kdc.handle(message, tcp, now(), &inputs, accounts));
+                        check(kdc.handle(message, tcp, when, &inputs, accounts));
                         if next.len() >= rest.len() {
                             break;
                         }
@@ -289,13 +788,13 @@ fuzz_target!(|data: &[u8]| {
                     }
                     Ok(TcpFrame::Incomplete) => break,
                     Err(error) => {
-                        check(kdc.reject_frame(error, tcp, now()));
+                        check(kdc.reject_frame(error, tcp, when));
                         break;
                     }
                 }
             }
         }
-        1 => check(kdc.handle(input, udp, now(), &inputs, accounts)),
-        _ => check(kdc.handle(input, tcp, now(), &inputs, accounts)),
+        1 => check(kdc.handle(input, udp, when, &inputs, accounts)),
+        _ => check(kdc.handle(input, tcp, when, &inputs, accounts)),
     }
 });

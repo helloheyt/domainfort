@@ -8,9 +8,11 @@
 # (docs/11, docs/30 §1).
 #
 # Written only from RFC 4120 (§2, §3.1, §3.2.3, §3.3, §5.1, §5.2, §5.3, §5.4,
-# §5.9, §5.10, §6.1, §6.2, §7.2, §7.3, §7.5, §8.2) and this project's design
-# documents (docs/02 §3, docs/10, docs/11, docs/25 §3-5, docs/30, docs/45 §10,
-# docs/questions/PENDING-OWNER.md A-19, A-22, A-23) — AGENTS.md §1-3. No other
+# §5.9, §5.10, §6.1, §6.2, §7.2, §7.3, §7.5, §8.2), RFC 6113 (§2.2, §2.4,
+# §5.2, §5.4-§5.4.6, §6.1, §6.2, §7.1-§7.3; FAST, docs/48 tasks T5/T6) and
+# this project's design documents (docs/02 §3, docs/10, docs/11, docs/25
+# §3-5, docs/30, docs/45 §10, docs/48, docs/questions/PENDING-OWNER.md A-19,
+# A-22..A-27, A-32, A-33, A-39, A-42, A-43, P-10) — AGENTS.md §1-3. No other
 # implementation consulted or recalled.
 
 [package]

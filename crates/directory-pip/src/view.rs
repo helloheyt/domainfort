@@ -23,7 +23,10 @@ use crate::tier::{most_privileged, TierMap};
 use ad_schema::Phase1Schema;
 use dirstore::{ClassId, Object, Snapshot, Store};
 use dtyp::{Guid, SecurityDescriptor, Sid};
-use kdc::{AccountSource, AccountSourceError, AccountState, ClientAccount, ServiceAccount};
+use kdc::{
+    AccountKind as KdcAccountKind, AccountSource, AccountSourceError, AccountState, ArmorPolicy,
+    ClientAccount, ServiceAccount,
+};
 use keyd::{KeyHandle, KeyPurpose, KeydConfig, PrincipalId};
 use krb_proto::{EtypeInfo2Entry, PrincipalName, Realm};
 use pdp::{
@@ -163,6 +166,24 @@ struct Account<'o> {
 /// docs/10 §1 (`PrincipalId = Guid`); [MS-ADTS] 3.1.1.1.3.
 fn principal_id(guid: Guid) -> PrincipalId {
     PrincipalId::from_bytes(guid.to_packet())
+}
+
+/// The KDC's account kind and armor policy of a user / computer object, from
+/// its most specific class (objectClass — authoritative directory data, never
+/// client-claimed, like the tier, docs/11 P3): a computer object is a
+/// computer account that may bootstrap — make the one unarmored AS request
+/// for its TGT that it needs before it can armor anything; every other
+/// account must use FAST.
+/// Spec: docs/48 §3.1 (armor ticket of a computer account only, D126), §7.2
+/// ("derived by the AccountSource from authoritative data: objectClass
+/// computer → BootstrapAllowed; everything else → Required"), §7.3;
+/// docs/questions/Q-127 interim decision ((ב) = `kind` from objectClass;
+/// P-10).
+fn armor_facts(kind: AccountKind) -> (KdcAccountKind, ArmorPolicy) {
+    match kind {
+        AccountKind::Computer => (KdcAccountKind::Computer, ArmorPolicy::BootstrapAllowed),
+        AccountKind::User => (KdcAccountKind::User, ArmorPolicy::Required),
+    }
 }
 
 /// `true` if `s` is non-empty printable ASCII. Spec: P-6, Q-080.
@@ -442,6 +463,8 @@ impl DirectoryView<'_> {
             })
             .collect();
         // 8. The key set (objectGUID, PrincipalLongterm).
+        // 9. The account kind and the armor policy (docs/48 §3.1, §7.2).
+        let (kind, armor_policy) = armor_facts(account.kind);
         Ok(Some(ClientAccount {
             key: KeyHandle::new(principal_id(guid), KeyPurpose::PrincipalLongterm),
             sid: account.sid,
@@ -449,6 +472,8 @@ impl DirectoryView<'_> {
             tier,
             state,
             etype_info,
+            kind,
+            armor_policy,
         }))
     }
 

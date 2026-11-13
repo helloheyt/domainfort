@@ -1,7 +1,8 @@
 # cargo-fuzz harness for the KDC (AGENTS.md §6 / docs/32 §8: every parser of
 # network input gets a fuzz target before it merges to main). The KDC parses
 # untrusted network input: TCP record framing (RFC 4120 7.2.2) and AS-REQ /
-# TGS-REQ messages; `Kdc::handle` must never panic, hang or over-allocate.
+# TGS-REQ messages, unarmored and FAST-armored (RFC 6113 5.4.2; docs/48 §9.2
+# item 16); `Kdc::handle` must never panic, hang or over-allocate.
 #
 # This is a SEPARATE workspace (note the empty [workspace] table below): it is
 # intentionally NOT a member of the root workspace, so `cargo build --all`,
@@ -40,6 +41,13 @@ path = "../../pdp"
 
 [dependencies.dtyp]
 path = "../../dtyp"
+
+# This project's own crypto profile (a workspace crate, not an external
+# dependency): the harness plays the FAST client to reach the armored paths
+# (armor key, req-checksum, encrypted challenge), as the kdc integration
+# tests do with the same crate as a dev-dependency (docs/48 §9.2 item 16).
+[dependencies.krb-crypto]
+path = "../../krb-crypto"
 
 [[bin]]
 name = "kdc_handle"

@@ -5,10 +5,17 @@
 //!   `open_and_verify_tgt` and the account re-read (D53).
 //! - **The request:** `Action::KdcAs` / `Action::KdcTgs`; a Subject built from
 //!   the account record (SID, expanded groups, tier — authoritative data,
-//!   never client-claimed, docs/11 P3), authenticated: strength `Kerberos`,
-//!   `ticket_verified = true` (at AS the identity was established by keyd's
-//!   pre-authentication check; at TGS by keyd's TGT check), `armored = false`
-//!   (FAST is not implemented — the D126 follow-up); the resource is the TGT
+//!   never client-claimed, docs/11 P3), authenticated: `ticket_verified =
+//!   true` (at AS the identity was established by keyd's pre-authentication
+//!   check; at TGS by keyd's TGT check); `armored` reported truthfully —
+//!   `true`, with strength `KerberosFast`, exactly when keyd verified the
+//!   FAST armor of this request and the inner request is the one processed
+//!   (AS: the armor opened, the armor principal re-evaluated, and the
+//!   encrypted challenge verified under that armor; TGS: the implicit armor
+//!   verified by `open_and_verify_tgt`), otherwise `false` with strength
+//!   `Kerberos` (docs/48 §4.2, R48-10; docs/11 P3) — this is layer 2 of the
+//!   mandatory-FAST enforcement (docs/48 §7.2; `pdp::mandatory_fast_rules`);
+//!   the resource is the TGT
 //!   (AS) or the requested service (TGS); the context has transport
 //!   `Kerberos`, `TransportSec::NONE` (no floor for `Kdc*`, A-22), the
 //!   daemon-observed source zone and the caller's `now` (P9).
@@ -18,8 +25,8 @@
 //!   [`RateLimiter`], and a refusal there is a deny; any other obligation
 //!   (`Constrain`) has no meaning for the KDC and is a deny (fail closed).
 //!
-//! Spec: docs/11 §1, §2, §4, §8; docs/30 §1, §2.4, §3.3; main-session
-//! decision 7; A-22.
+//! Spec: docs/11 §1, §2, §4, §8; docs/30 §1, §2.4, §3.3; docs/48 §4.2, §7.2
+//! (R48-8, R48-10); main-session decision 7; A-22; Q-130 item 5.
 
 use crate::accounts::ClientAccount;
 use crate::audit::AuditReason;
@@ -59,6 +66,8 @@ pub(crate) struct Question<'a> {
     pub(crate) ticket_age: Duration,
     pub(crate) src_net: IpScope,
     pub(crate) now: &'a KerberosTime,
+    /// keyd verified the FAST armor of this request (module docs).
+    pub(crate) armored: bool,
 }
 
 /// Ask the PDP and enforce its decision and obligations.
@@ -69,14 +78,20 @@ pub(crate) fn enforce(
     rate: &mut dyn RateLimiter,
 ) -> Result<(), AuditReason> {
     let time = unix_seconds(question.now).ok_or(AuditReason::ClockOutOfRange)?;
+    // armored ⇔ KerberosFast: the PEP's contract (docs/48 §4.2; Q-130 item 5).
+    let strength = if question.armored {
+        AuthStrength::KerberosFast
+    } else {
+        AuthStrength::Kerberos
+    };
     let request = AccessRequest {
         subject: Subject {
             principal: question.client.sid,
             groups: question.client.groups.clone(),
             claims: BTreeMap::new(),
             auth: AuthContext {
-                strength: AuthStrength::Kerberos,
-                armored: false,
+                strength,
+                armored: question.armored,
                 ticket_age: question.ticket_age,
                 ticket_verified: true,
             },

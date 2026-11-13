@@ -11,17 +11,20 @@
 //! mutation of a valid request, end to end through keyd's checksum check,
 //! and show that a non-minimal length is refused.
 //!
-//! Sources: RFC 4120 5.1.1, 5.1.3, 5.2.7.1, 5.4.1, 5.5.1; krb-proto /
-//! parse-asn1 crate documentation (this project's own work); main-session
-//! decision 13. All values hand-made.
+//! The armored AS path relies on the same property: keyd verifies the FAST
+//! req-checksum over the KDC's re-encoding of the outer KDC-REQ-BODY
+//! (RFC 6113 5.4.2).
+//!
+//! Sources: RFC 4120 5.1.1, 5.1.3, 5.2.7.1, 5.4.1, 5.5.1; RFC 6113 5.4.2;
+//! krb-proto / parse-asn1 crate documentation (this project's own work);
+//! main-session decision 13. All values hand-made.
 
 mod common;
 
 use common::*;
 use krb_proto::constants::PA_TGS_REQ;
 use krb_proto::{
-    ApOptions, ApReq, EncryptedData, HostAddress, HostAddresses, KdcReq, KdcReqBody, KdcRequest,
-    PaData, TgsReq,
+    EncryptedData, HostAddress, HostAddresses, KdcReq, KdcReqBody, KdcRequest, PaData, TgsReq,
 };
 
 fn tgs_request(body: KdcReqBody, padata: Vec<PaData>) -> Vec<u8> {
@@ -127,30 +130,40 @@ fn non_minimal_body_length_is_refused() {
     assert!(KdcReqBody::decode(&longer).is_err());
 }
 
-/// Decision 13 end to end: a body with an empty `addresses` SEQUENCE OF
-/// (RFC 4120 5.1.3: accepted as absent) is preserved by the re-encoding, so
-/// keyd's checksum over it verifies and the ticket is issued (a re-encoding
-/// that dropped the empty element would fail the checksum).
+/// Decision 13 end to end: an (outer) body with an empty `addresses`
+/// SEQUENCE OF (RFC 4120 5.1.3: accepted as absent) is preserved by the
+/// re-encoding, so keyd's checksum over it verifies and the ticket is issued
+/// (a re-encoding that dropped the empty element would fail the checksum).
+/// Under FAST the authenticator checksum still covers the OUTER body
+/// (docs/questions/Q-124 item 1).
 #[test]
 fn checksum_verifies_over_preserved_empty_sequence() {
     let mut f = Fixture::new();
     let tgt = obtain_tgt(&mut f);
-    let spec = TgsReqSpec::service();
+    let mut spec = TgsReqSpec::service();
     let mut body = spec.body();
     body.addresses = Some(HostAddresses(Vec::new()));
-    let body_bytes = body.encode().unwrap();
-    let ap_req = ApReq {
-        ap_options: ApOptions::empty(),
-        ticket: tgt.rep.0.ticket.clone(),
-        authenticator: authenticator(&tgt.session, &spec, &body_bytes),
-    };
-    let request = tgs_request(
-        body,
-        vec![PaData {
-            padata_type: PA_TGS_REQ,
-            padata_value: ap_req.encode().unwrap(),
-        }],
-    );
-    let (_, part) = open_tgs_rep(&sent(f.send(&request)), &tgt.session, 8);
+    spec.outer = Some(body);
+    let (request, body_bytes) = spec.encode(&tgt);
+    assert!(contains_bytes(&request, &body_bytes));
+    let (_, part) = open_tgs_rep(&sent(f.send(&request)), &tgt, &spec);
     assert_eq!(part.0.sname, service_name());
+}
+
+/// The same property for the armored AS-REQ (RFC 6113 5.4.2: the
+/// req-checksum "is performed over the type KDC-REQ-BODY for the req-body
+/// field" — keyd verifies it over the KDC's re-encoding of the outer body):
+/// an outer body with an empty `addresses` SEQUENCE OF verifies, and alice
+/// gets her TGT.
+#[test]
+fn req_checksum_verifies_over_preserved_empty_sequence() {
+    let mut f = Fixture::new();
+    let key = alice_key(AES256);
+    let mut spec = AsReqSpec::alice().with_challenge(&key);
+    let mut outer = spec.body();
+    outer.addresses = Some(HostAddresses(Vec::new()));
+    spec.outer = Some(outer);
+    let fast = f.send_fast(&spec);
+    let tgt = open_fast_as_rep(&sent(fast.reply), &fast.armor_key, &key);
+    assert_eq!(tgt.rep.0.cname, alice_name());
 }

@@ -25,7 +25,7 @@
 //! Spec: RFC 4120 3.1.2, 3.3.2, 7.2.1; docs/10 D33; AGENTS.md §6 (bounded).
 
 use crate::accounts::NamedPrincipal;
-use crate::audit::Exchange;
+use crate::audit::{ArmorAudit, Exchange};
 use crate::krb_error::ErrorContext;
 use std::collections::HashMap;
 
@@ -40,6 +40,8 @@ pub(crate) struct StoredReply {
     pub(crate) exchange: Exchange,
     pub(crate) client: Option<NamedPrincipal>,
     pub(crate) service: Option<NamedPrincipal>,
+    /// The FAST audit facts of the original request (docs/48 §2.4).
+    pub(crate) armor: ArmorAudit,
 }
 
 struct Entry {
@@ -144,6 +146,7 @@ mod tests {
             exchange: Exchange::As,
             client: None,
             service: None,
+            armor: ArmorAudit::default(),
         }
     }
 

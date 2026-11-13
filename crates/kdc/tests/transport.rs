@@ -169,7 +169,8 @@ fn oversize_request_through_handle() {
 /// RFC 4120 7.2.1: a reply too large for UDP is replaced by
 /// KRB_ERR_RESPONSE_TOO_BIG; RFC 4120 3.1.2: the client's identical retry
 /// over TCP gets the reply generated the first time (from the retransmit
-/// cache), so a TGS-REQ retry is not refused as a replay.
+/// cache), so neither the armored AS-REQ retry (its armor AP-REQ is in keyd's
+/// replay cache, docs/48 §3.3) nor the TGS-REQ retry is refused as a replay.
 #[test]
 fn udp_response_too_big_then_tcp_retry() {
     let mut setup = Setup::new();
@@ -181,20 +182,21 @@ fn udp_response_too_big_then_tcp_retry() {
         ..setup.kdc
     };
     let mut f = setup.build();
-    let request = AsReqSpec::alice()
-        .with_timestamp(&alice_key(AES256))
-        .encode();
+    let key = alice_key(AES256);
+    let (request, armor) = f.fast_as_request(&AsReqSpec::alice().with_challenge(&key), now());
     let error = error_of(f.send_at(&request, Transport::Udp, now()));
     assert_eq!(error.error_code, KRB_ERR_RESPONSE_TOO_BIG);
+    assert!(!f.events()[0].armor.reply_armored);
     let bytes = sent(f.send_at(&request, Transport::Tcp, at(1)));
-    let tgt = open_as_rep(&bytes, &alice_key(AES256));
+    let tgt = open_fast_as_rep(&bytes, &armor.key, &key);
     AsRep::decode(&bytes).unwrap();
 
-    let (tgs_request, _) = TgsReqSpec::service().encode(&tgt);
+    let spec = TgsReqSpec::service();
+    let (tgs_request, _) = spec.encode(&tgt);
     let error = error_of(f.send_at(&tgs_request, Transport::Udp, at(2)));
     assert_eq!(error.error_code, KRB_ERR_RESPONSE_TOO_BIG);
     let bytes = sent(f.send_at(&tgs_request, Transport::Tcp, at(3)));
-    TgsRep::decode(&bytes).unwrap();
+    open_tgs_rep(&bytes, &tgt, &spec);
     let reasons: Vec<AuditReason> = f.events().iter().map(|e| e.reason).collect();
     assert_eq!(
         reasons,
@@ -255,11 +257,20 @@ fn several_records_on_one_stream() {
 fn mutated_requests_never_panic() {
     let mut f = Fixture::new();
     let tgt = obtain_tgt(&mut f);
+    // Unarmored and armored (RFC 6113 5.4.2) AS-REQs, the bootstrap, and an
+    // armored TGS-REQ: the mutations reach the FAST paths too.
+    let armored_as = f
+        .fast_as_request(
+            &AsReqSpec::alice().with_challenge(&alice_key(AES256)),
+            now(),
+        )
+        .0;
     let seeds = [
         AsReqSpec::alice().encode(),
-        AsReqSpec::alice()
-            .with_timestamp(&alice_key(AES256))
+        AsReqSpec::machine()
+            .with_timestamp(&machine_key(AES256))
             .encode(),
+        armored_as,
         TgsReqSpec::service().encode(&tgt).0,
     ];
     let mut state: u32 = 0x1234_5678;
@@ -267,7 +278,7 @@ fn mutated_requests_never_panic() {
         state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
         state >> 8
     };
-    for round in 0..3000u32 {
+    for round in 0..4000u32 {
         let seed = &seeds[(round as usize) % seeds.len()];
         let mut message = seed.clone();
         match next() % 4 {
@@ -307,5 +318,5 @@ fn mutated_requests_never_panic() {
         }
     }
     // One audit event per request (decision 14).
-    assert_eq!(f.events().len(), 3001);
+    assert_eq!(f.events().len(), 4001);
 }

@@ -10,10 +10,11 @@ mod common;
 use common::*;
 use kdc::{AccountState, ConfigError, KdcConfig, KdcReply, LocalKeyd, Transport};
 use keyd::{InMemoryKeyStore, KeyPurpose, Keyd, KeydConfig};
-use krb_proto::constants::{KDC_ERR_C_PRINCIPAL_UNKNOWN, KDC_ERR_PREAUTH_REQUIRED};
-use krb_proto::{KrbError, Microseconds};
+use krb_proto::constants::{KDC_ERR_C_PRINCIPAL_UNKNOWN, KDC_ERR_PREAUTH_REQUIRED, PA_FX_FAST};
+use krb_proto::{KrbError, MethodData, Microseconds};
 
-/// Every KRB-ERROR the KDC produced in a sweep of refusal scenarios.
+/// Every KRB-ERROR the KDC produced in a sweep of refusal scenarios —
+/// unarmored ones (before or without FAST) and armored ones (RFC 6113 5.4.4).
 fn refusals() -> Vec<Vec<u8>> {
     let mut f = Fixture::new();
     let tgt = obtain_tgt(&mut f);
@@ -25,28 +26,36 @@ fn refusals() -> Vec<Vec<u8>> {
             }
         }
     };
-    // AS: preauth required / failed / unknown / etype / options / times.
+    // Unarmored AS: the FAST gate, an unknown client, the bootstrap.
     push(f.send(&AsReqSpec::alice().encode()));
+    let mut unknown = AsReqSpec::alice();
+    unknown.cname = Some(name(1, &["nobody"]));
+    push(f.send(&unknown.encode()));
+    push(f.send(&AsReqSpec::machine().encode()));
     push(
         f.send(
-            &AsReqSpec::alice()
-                .with_timestamp(&password_key(AES256, "wrong", ALICE_SALT))
+            &AsReqSpec::machine()
+                .with_timestamp(&alice_key(AES256))
                 .encode(),
         ),
     );
-    let mut spec = AsReqSpec::alice();
-    spec.cname = Some(name(1, &["nobody"]));
-    push(f.send(&spec.encode()));
+    // Armored AS: preauth required / failed / unknown / etype / options / times.
+    push(f.send_fast(&AsReqSpec::alice()).reply);
+    push(
+        f.send_fast(&AsReqSpec::alice().with_challenge(&password_key(AES256, "wrong", ALICE_SALT)))
+            .reply,
+    );
+    push(f.send_fast(&unknown).reply);
     let mut spec = AsReqSpec::alice();
     spec.etypes = vec![RC4_HMAC];
-    push(f.send(&spec.encode()));
+    push(f.send_fast(&spec).reply);
     let mut spec = AsReqSpec::alice();
     spec.options = options(&[30]);
-    push(f.send(&spec.encode()));
-    let mut spec = AsReqSpec::alice().with_timestamp(&alice_key(AES256));
+    push(f.send_fast(&spec).reply);
+    let mut spec = AsReqSpec::alice().with_challenge(&alice_key(AES256));
     spec.till = kt("20261113090000Z");
-    push(f.send(&spec.encode()));
-    // TGS: replay, revoked, unknown service.
+    push(f.send_fast(&spec).reply);
+    // TGS: replay, revoked, unknown service, unarmored.
     let (request, _) = TgsReqSpec::service().encode(&tgt);
     push(f.send(&request));
     let mut replay = TgsReqSpec::service();
@@ -58,6 +67,10 @@ fn refusals() -> Vec<Vec<u8>> {
     let mut spec = TgsReqSpec::service();
     spec.sname = Some(name(3, &["host", "none.example.org"]));
     spec.cusec = 2;
+    push(f.send(&spec.encode(&tgt).0));
+    let mut spec = TgsReqSpec::service();
+    spec.armored = false;
+    spec.cusec = 4;
     push(f.send(&spec.encode(&tgt).0));
     f.accounts()
         .client_mut(&realm(), &alice_name())
@@ -76,35 +89,50 @@ fn refusals() -> Vec<Vec<u8>> {
 }
 
 /// Decision 11 / docs/10 §9: no KRB-ERROR carries e-text; e-data only for
-/// KDC_ERR_PREAUTH_REQUIRED (RFC 4120 5.9.1 METHOD-DATA); no key octets,
-/// passwords or derived keys anywhere in the bytes (AGENTS.md §6).
+/// KDC_ERR_PREAUTH_REQUIRED (RFC 4120 5.9.1 METHOD-DATA) or for an armored
+/// error, where it is METHOD-DATA with exactly one PA-FX-FAST (RFC 6113
+/// 5.4.4); no key octets, passwords or derived keys anywhere in the bytes
+/// (AGENTS.md §6) — the computer account's key and its TGT session key
+/// included.
 #[test]
 fn no_krb_error_carries_e_text_or_key_material() {
     let errors = refusals();
-    assert!(errors.len() >= 10, "sweep produced {} errors", errors.len());
+    assert!(errors.len() >= 16, "sweep produced {} errors", errors.len());
     let alice_aes256 = alice_key(AES256);
     let alice_aes128 = alice_key(AES128);
+    let f = Fixture::new();
+    let machine_session = f.machine_tgt.session.octets().to_vec();
     let secrets: Vec<&[u8]> = vec![
         &KRBTGT_KEY[..],
         &KRBTGT_KEY[..16],
         &SERVICE_KEY[..],
         &SERVICE_KEY[..16],
+        &MACHINE_KEY[..],
+        &MACHINE_KEY[..16],
+        &machine_session,
         alice_aes256.octets(),
         alice_aes128.octets(),
         ALICE_PASSWORD.as_bytes(),
         BOB_PASSWORD.as_bytes(),
     ];
+    let mut armored = 0;
     for bytes in &errors {
         let error = KrbError::decode(bytes).unwrap();
         assert!(error.e_text.is_none(), "code {}", error.error_code);
-        if error.error_code != KDC_ERR_PREAUTH_REQUIRED {
-            assert!(error.e_data.is_none(), "code {}", error.error_code);
+        if let Some(e_data) = &error.e_data {
+            let methods = MethodData::decode(e_data).unwrap();
+            if error.error_code != KDC_ERR_PREAUTH_REQUIRED {
+                assert_eq!(methods.0.len(), 1, "code {}", error.error_code);
+                assert_eq!(methods.0[0].padata_type, PA_FX_FAST);
+                armored += 1;
+            }
         }
         assert!(error.ctime.is_none() && error.cusec.is_none());
         for secret in &secrets {
             assert!(!contains_bytes(bytes, secret));
         }
     }
+    assert!(armored >= 6, "armored errors: {armored}");
 }
 
 /// RFC 4120 5.9.1 / decision 11: stime from the caller's `now`, susec 0
@@ -140,7 +168,14 @@ fn one_audit_event_per_request_without_secrets() {
     assert_eq!(f.events().len(), 4);
     let text = format!("{:?}", f.events());
     assert!(!text.contains(ALICE_PASSWORD));
-    for marker in ["199, 199, 199", "217, 217, 217", "c7c7c7", "d9d9d9"] {
+    for marker in [
+        "199, 199, 199",
+        "217, 217, 217",
+        "227, 227, 227",
+        "c7c7c7",
+        "d9d9d9",
+        "e3e3e3",
+    ] {
         assert!(!text.contains(marker), "{marker}");
     }
 }

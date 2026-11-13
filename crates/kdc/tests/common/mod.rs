@@ -9,14 +9,34 @@
 //! (RFC 4120 5.2.7.2, key usage 1) and TGS authenticators (5.5.1, usages 6
 //! and 7), and opens replies (usages 2, 3, 8, 9 — 7.5.1).
 //!
+//! FAST (RFC 6113; docs/48): FAST is mandatory for every principal but a
+//! computer account's bootstrap (docs/48 §7, P-10 interim). The fixture holds
+//! one computer account, `ws1$` (random key from keyd's `create_key`, the
+//! bootstrap exception), and gets its TGT through the unarmored AS path when
+//! it is built; that TGT is the armor ticket of every armored AS request
+//! (RFC 6113 5.4.1.1, D126). The client side of FAST is built here from
+//! RFC 6113 only: the armor AP-REQ (authenticator key usage 11 —
+//! docs/questions/Q-120 — with a fresh subkey per request and no checksum),
+//! the armor key KRB-FX-CF2(subkey, ticket session key, "subkeyarmor",
+//! "ticketarmor") (5.4.1.1), the req-checksum (usage 50) and enc-fast-req
+//! (usage 51) (5.4.2), the encrypted challenge (5.4.6, usage 54), the implicit
+//! TGS armor (5.4.2), and the opening of replies — KrbFastResponse (usage
+//! 52), the strengthened reply key KRB-FX-CF2(strengthen-key, reply key,
+//! "strengthenkey", "replykey") (5.4.3), KrbFastFinished's ticket-checksum
+//! (usage 53, over the full Ticket DER — docs/questions/Q-122), the KDC's
+//! encrypted challenge (usage 55) and the PA-FX-ERROR of armored errors
+//! (5.4.4). RFC 6113 has no vectors for these derivations: these are
+//! round-trip tests (docs/48 §9.2 item 15).
+//!
 //! Every value here is constructed by hand for these tests. No vector or
 //! fixture comes from any other implementation.
 #![allow(dead_code)] // each test binary uses a different subset
 
 use dtyp::{Sid, SECURITY_NT_AUTHORITY};
 use kdc::{
-    AccountState, AuditEvent, ClientAccount, InMemoryAccounts, Kdc, KdcConfig, KdcReply, LocalKeyd,
-    Peer, PolicyInputs, RateLimiter, ServiceAccount, Transport,
+    AccountKind, AccountState, ArmorPolicy, AuditEvent, ClientAccount, InMemoryAccounts, Kdc,
+    KdcConfig, KdcReply, KeyCustody, LocalKeyd, Peer, PolicyInputs, RateLimiter, ServiceAccount,
+    Transport,
 };
 use keyd::{
     AuditRecord, CallerId, EntropyError, EntropySource, InMemoryKeyStore, KeyHandle, KeyPurpose,
@@ -24,13 +44,16 @@ use keyd::{
 };
 use krb_crypto::{EncType, KeyUsage, ProtocolKey};
 use krb_proto::constants::{
-    KRB_NT_PRINCIPAL, KRB_NT_SRV_HST, KRB_NT_SRV_INST, PA_ENC_TIMESTAMP, PA_TGS_REQ,
+    FX_FAST_ARMOR_AP_REQUEST, KRB_NT_PRINCIPAL, KRB_NT_SRV_HST, KRB_NT_SRV_INST,
+    PA_ENCRYPTED_CHALLENGE, PA_ENC_TIMESTAMP, PA_FX_ERROR, PA_FX_FAST, PA_TGS_REQ,
 };
 use krb_proto::{
     ApOptions, ApReq, AsRep, AsReq, Authenticator, Checksum, EncAsRepPart, EncTgsRepPart,
-    EncTicketPart, EncryptedData, EncryptionKey, EtypeInfo2Entry, HostAddresses, KdcOptions,
-    KdcRep, KdcReq, KdcReqBody, KerberosFlags, KerberosString, KerberosTime, KeyValue, KrbError,
-    Microseconds, PaData, PaEncTsEnc, PrincipalName, Realm, TgsRep, TgsReq, Ticket,
+    EncTicketPart, EncryptedData, EncryptionKey, EtypeInfo2Entry, FastOptions, HostAddresses,
+    KdcOptions, KdcRep, KdcReq, KdcReqBody, KerberosFlags, KerberosString, KerberosTime, KeyValue,
+    KrbError, KrbFastArmor, KrbFastArmoredReq, KrbFastReq, KrbFastResponse, MethodData,
+    Microseconds, PaData, PaEncTsEnc, PaFxFastReply, PaFxFastRequest, PrincipalName, Realm, TgsRep,
+    TgsReq, Ticket,
 };
 use pdp::{
     ActionClass, ActionMatch, AuthMatch, ContextMatch, Effect, IpScope, Match, Pip, PipError,
@@ -140,6 +163,17 @@ pub fn users_group() -> Sid {
     nt_sid(&[21, 7, 8, 9, 513])
 }
 
+/// The computer account's SID (hand-made RID).
+pub fn machine_sid() -> Sid {
+    nt_sid(&[21, 7, 8, 9, 1201])
+}
+
+/// The group named as the bootstrap set of `pdp::mandatory_fast_rules` in
+/// these tests (Q-130: a deployment datum; hand-made RID).
+pub fn bootstrap_group() -> Sid {
+    nt_sid(&[21, 7, 8, 9, 1500])
+}
+
 pub struct TestPip {
     pub tiers: BTreeMap<Sid, Tier>,
 }
@@ -218,6 +252,12 @@ pub const BOB: KeyHandle = KeyHandle::new(
     PrincipalId::from_bytes([0xB0; 16]),
     KeyPurpose::PrincipalLongterm,
 );
+/// The computer account's long-term key set (docs/47 §9.1: a computer client
+/// is `(GUID, PrincipalLongterm)`).
+pub const MACHINE: KeyHandle = KeyHandle::new(
+    PrincipalId::from_bytes([0xC0; 16]),
+    KeyPurpose::PrincipalLongterm,
+);
 pub const KRBTGT: KeyHandle =
     KeyHandle::new(PrincipalId::from_bytes([0x7B; 16]), KeyPurpose::Krbtgt);
 pub const SERVICE: KeyHandle =
@@ -230,6 +270,12 @@ pub const ALICE_SALT: &str = "EXAMPLE.ORGalice";
 pub const BOB_SALT: &str = "EXAMPLE.ORGbob";
 pub const KRBTGT_KEY: [u8; 32] = [0xC7; 32];
 pub const SERVICE_KEY: [u8; 32] = [0xD9; 32];
+/// The computer account's random key (keyd `create_key`, docs/48 §7.3: a
+/// bootstrap account has a random key, not a human password).
+pub const MACHINE_KEY: [u8; 32] = [0xE3; 32];
+/// The default subkey of the TGS authenticators (mandatory under FAST,
+/// RFC 6113 5.4.2).
+pub const TGS_SUBKEY: [u8; 32] = [0x3A; 32];
 
 /// RFC 3961 §8 assigned numbers used as the client's "weak" offers: they are
 /// not in keyd's AES list, so the KDC must never select them.
@@ -262,6 +308,11 @@ pub fn alice_name() -> PrincipalName {
 
 pub fn bob_name() -> PrincipalName {
     name(KRB_NT_PRINCIPAL, &["bob"])
+}
+
+/// The computer account's name (docs/47 §9.1: NT-PRINCIPAL, ending in "$").
+pub fn machine_name() -> PrincipalName {
+    name(KRB_NT_PRINCIPAL, &["ws1$"])
 }
 
 /// RFC 4120 7.3: NT-SRV-INST ("krbtgt", realm).
@@ -311,16 +362,110 @@ pub fn till_max() -> KerberosTime {
 // The KDC under test.
 // ---------------------------------------------------------------------------
 
-pub type TestCustody = LocalKeyd<InMemoryKeyStore, KeydAudit, TestEntropy>;
+pub type TestKeyd = Keyd<InMemoryKeyStore, KeydAudit, TestEntropy>;
+
+/// The real keyd behind the KDC (`LocalKeyd`), with one test switch:
+/// `refuse_seal` makes `seal_fast_error` fail as keyd does when the
+/// conversation's token is gone (e.g. expired) — to exercise the KDC's
+/// unarmored fallback (docs/questions/Q-125 item 10). TESTS ONLY.
+pub struct TestCustody {
+    pub inner: LocalKeyd<InMemoryKeyStore, KeydAudit, TestEntropy>,
+    pub refuse_seal: bool,
+}
+
+impl TestCustody {
+    pub fn keyd(&self) -> &TestKeyd {
+        self.inner.keyd()
+    }
+
+    pub fn keyd_mut(&mut self) -> &mut TestKeyd {
+        self.inner.keyd_mut()
+    }
+}
+
+impl KeyCustody for TestCustody {
+    fn config(&self) -> &KeydConfig {
+        self.inner.config()
+    }
+    fn verify_preauth(
+        &mut self,
+        client: &KeyHandle,
+        padata: &PaData,
+        armor: Option<keyd::ArmorId>,
+        now: &KerberosTime,
+    ) -> Result<keyd::AuthnProof, keyd::AuthnError> {
+        self.inner.verify_preauth(client, padata, armor, now)
+    }
+    fn issue_as_rep(
+        &mut self,
+        client: &KeyHandle,
+        krbtgt: &KeyHandle,
+        proof: &keyd::AuthnProof,
+        armor: Option<keyd::ArmorId>,
+        template: &keyd::AsTicketTemplate,
+        now: &KerberosTime,
+    ) -> Result<keyd::AsRepParts, keyd::IssueError> {
+        self.inner
+            .issue_as_rep(client, krbtgt, proof, armor, template, now)
+    }
+    fn open_fast_armor(
+        &mut self,
+        krbtgt: &KeyHandle,
+        armored_req: &KrbFastArmoredReq,
+        outer_req_body: &[u8],
+        now: &KerberosTime,
+    ) -> Result<keyd::FastArmor, keyd::AuthnError> {
+        self.inner
+            .open_fast_armor(krbtgt, armored_req, outer_req_body, now)
+    }
+    fn open_and_verify_tgt(
+        &mut self,
+        krbtgt: &KeyHandle,
+        ap_req: &ApReq,
+        req_body: &[u8],
+        fast: Option<keyd::TgsFastRequest<'_>>,
+        now: &KerberosTime,
+    ) -> Result<keyd::TgtContext, keyd::AuthnError> {
+        self.inner
+            .open_and_verify_tgt(krbtgt, ap_req, req_body, fast, now)
+    }
+    fn issue_tgs_rep(
+        &mut self,
+        service: &KeyHandle,
+        ctx: &keyd::CtxId,
+        template: &keyd::TgsTicketTemplate,
+        now: &KerberosTime,
+    ) -> Result<keyd::TgsRepParts, keyd::IssueError> {
+        self.inner.issue_tgs_rep(service, ctx, template, now)
+    }
+    fn seal_fast_error(
+        &mut self,
+        conversation: &keyd::FastConversation,
+        error: &KrbError,
+        padata: &[PaData],
+        now: &KerberosTime,
+    ) -> Result<EncryptedData, keyd::Error> {
+        if self.refuse_seal {
+            return Err(keyd::Error::Denied);
+        }
+        self.inner.seal_fast_error(conversation, error, padata, now)
+    }
+}
+
 pub type TestKdc = Kdc<TestCustody, KdcAudit, TestRateLimiter>;
 
 /// The KDC, the policy inputs and the account source handed to it with each
-/// request (docs/47 R47-14).
+/// request (docs/47 R47-14), the computer account's TGT (the armor ticket of
+/// the armored AS requests, D126) and a counter that makes every armor fresh
+/// (RFC 6113 5.4: "a fresh armor key for each conversation"; docs/48 §3.3: a
+/// fresh armor AP-REQ per request).
 pub struct Fixture {
     pub kdc: TestKdc,
     pub snapshot: PolicySnapshot,
     pub pip: TestPip,
     pub accounts: InMemoryAccounts,
+    pub machine_tgt: Tgt,
+    pub armor_counter: u32,
 }
 
 /// What a test may change before the KDC is built.
@@ -365,6 +510,8 @@ pub fn etype_info(salt: &str) -> Vec<EtypeInfo2Entry> {
         .collect()
 }
 
+/// alice: a user account, so FAST is required (docs/48 §7.1, the production
+/// default).
 pub fn alice_account() -> ClientAccount {
     ClientAccount {
         key: ALICE,
@@ -373,6 +520,31 @@ pub fn alice_account() -> ClientAccount {
         tier: Tier::Tier2,
         state: AccountState::ACTIVE,
         etype_info: etype_info(ALICE_SALT),
+        kind: AccountKind::User,
+        armor_policy: ArmorPolicy::Required,
+    }
+}
+
+/// ws1$: a computer account that may bootstrap (docs/48 §7.3), member of the
+/// bootstrap group. Its keys are random (no salt is meaningful: the entries
+/// carry none, RFC 4120 5.2.7.5 "salt OPTIONAL").
+pub fn machine_account() -> ClientAccount {
+    ClientAccount {
+        key: MACHINE,
+        sid: machine_sid(),
+        groups: [bootstrap_group()].into_iter().collect(),
+        tier: Tier::Tier2,
+        state: AccountState::ACTIVE,
+        etype_info: [AES256, AES128]
+            .iter()
+            .map(|e| EtypeInfo2Entry {
+                etype: *e,
+                salt: None,
+                s2kparams: None,
+            })
+            .collect(),
+        kind: AccountKind::Computer,
+        armor_policy: ArmorPolicy::BootstrapAllowed,
     }
 }
 
@@ -388,26 +560,22 @@ impl Fixture {
             Keyd::with_entropy(setup.keyd, store, KeydAudit::default(), entropy.clone()).unwrap();
         let n = now();
         let enctypes = keyd.config().enctypes.clone();
-        for e in &enctypes {
-            entropy.push(&KRBTGT_KEY[..e.key_length()]);
+        for (handle, binding, key) in [
+            (KRBTGT, krbtgt_name(), KRBTGT_KEY),
+            (SERVICE, service_name(), SERVICE_KEY),
+            (MACHINE, machine_name(), MACHINE_KEY),
+        ] {
+            for e in &enctypes {
+                entropy.push(&key[..e.key_length()]);
+            }
+            keyd.create_key(
+                &ADMIN,
+                &handle,
+                &PrincipalBinding::new(realm(), binding),
+                &n,
+            )
+            .unwrap();
         }
-        keyd.create_key(
-            &ADMIN,
-            &KRBTGT,
-            &PrincipalBinding::new(realm(), krbtgt_name()),
-            &n,
-        )
-        .unwrap();
-        for e in &enctypes {
-            entropy.push(&SERVICE_KEY[..e.key_length()]);
-        }
-        keyd.create_key(
-            &ADMIN,
-            &SERVICE,
-            &PrincipalBinding::new(realm(), service_name()),
-            &n,
-        )
-        .unwrap();
         for (handle, who, password, salt) in [
             (ALICE, alice_name(), ALICE_PASSWORD, ALICE_SALT),
             (BOB, bob_name(), BOB_PASSWORD, BOB_SALT),
@@ -422,7 +590,6 @@ impl Fixture {
             )
             .unwrap();
         }
-        keyd.audit_sink_mut().records.clear();
 
         let mut accounts = InMemoryAccounts::new();
         accounts
@@ -439,8 +606,13 @@ impl Fixture {
                     tier: Tier::Tier2,
                     state: AccountState::ACTIVE,
                     etype_info: etype_info(BOB_SALT),
+                    kind: AccountKind::User,
+                    armor_policy: ArmorPolicy::Required,
                 },
             )
+            .unwrap();
+        accounts
+            .insert_client(&realm(), &machine_name(), machine_account())
             .unwrap();
         accounts
             .insert_service(
@@ -454,8 +626,11 @@ impl Fixture {
             )
             .unwrap();
 
-        let custody = LocalKeyd::new(keyd, KDC_CALLER).unwrap();
-        let kdc = Kdc::new(
+        let custody = TestCustody {
+            inner: LocalKeyd::new(keyd, KDC_CALLER).unwrap(),
+            refuse_seal: false,
+        };
+        let mut kdc = Kdc::new(
             setup.kdc,
             custody,
             KdcAudit::default(),
@@ -463,15 +638,52 @@ impl Fixture {
         )
         .unwrap();
         let pip = TestPip {
-            tiers: [(alice_sid(), Tier::Tier2), (bob_sid(), Tier::Tier2)]
-                .into_iter()
-                .collect(),
+            tiers: [
+                (alice_sid(), Tier::Tier2),
+                (bob_sid(), Tier::Tier2),
+                (machine_sid(), Tier::Tier2),
+            ]
+            .into_iter()
+            .collect(),
         };
+
+        // The computer account's TGT, through the unarmored bootstrap path
+        // (docs/48 §7.3) under an allow-all policy of its own, whatever the
+        // test's rules are; then every sink is cleared so that each test sees
+        // only its own requests.
+        let allow = snapshot(vec![allow_kerberos()]);
+        let bootstrap = AsReqSpec::machine()
+            .with_timestamp(&machine_key(AES256))
+            .encode();
+        let reply = kdc.handle(
+            &bootstrap,
+            Peer {
+                transport: Transport::Tcp,
+                src_net: IpScope::Internal,
+            },
+            n,
+            &PolicyInputs {
+                snapshot: &allow,
+                pip: &pip,
+            },
+            &accounts,
+        );
+        let machine_tgt = open_as_rep(&sent(reply), &machine_key(AES256));
+        kdc.audit_sink_mut().events.clear();
+        kdc.custody_mut()
+            .keyd_mut()
+            .audit_sink_mut()
+            .records
+            .clear();
+        kdc.rate_limiter_mut().seen.clear();
+
         Fixture {
             kdc,
             snapshot: snapshot(setup.rules),
             pip,
             accounts,
+            machine_tgt,
+            armor_counter: 0,
         }
     }
 
@@ -503,12 +715,55 @@ impl Fixture {
         self.send_at(request, Transport::Tcp, now())
     }
 
+    /// A fresh armor on the computer account's TGT at `when`.
+    pub fn next_armor(&mut self, when: KerberosTime) -> Armor {
+        self.armor_counter += 1;
+        Armor::new(&self.machine_tgt, when, self.armor_counter)
+    }
+
+    /// A fresh armor on any TGT `tgt` (e.g. a user's — refused, D126).
+    pub fn armor_on(&mut self, tgt: &Tgt, when: KerberosTime) -> Armor {
+        self.armor_counter += 1;
+        Armor::new(tgt, when, self.armor_counter)
+    }
+
+    /// The armored AS-REQ of `spec` at `when` under a fresh armor on the
+    /// computer account's TGT, and that armor's key.
+    pub fn fast_as_request(&mut self, spec: &AsReqSpec, when: KerberosTime) -> (Vec<u8>, Armor) {
+        let armor = self.next_armor(when);
+        (spec.encode_armored(&armor, when), armor)
+    }
+
+    /// Send `spec` as an armored AS-REQ (RFC 6113 5.4.2) at `when`.
+    pub fn send_fast_at(
+        &mut self,
+        spec: &AsReqSpec,
+        transport: Transport,
+        when: KerberosTime,
+    ) -> FastSent {
+        let (request, armor) = self.fast_as_request(spec, when);
+        FastSent {
+            reply: self.send_at(&request, transport, when),
+            armor_key: armor.key,
+        }
+    }
+
+    /// Send `spec` as an armored AS-REQ over TCP at `now`.
+    pub fn send_fast(&mut self, spec: &AsReqSpec) -> FastSent {
+        self.send_fast_at(spec, Transport::Tcp, now())
+    }
+
     pub fn events(&self) -> &[AuditEvent] {
         &self.kdc.audit_sink().events
     }
 
     pub fn keyd_records(&self) -> &[AuditRecord] {
         &self.kdc.custody().keyd().audit_sink().records
+    }
+
+    /// The keyd operations called so far, in order.
+    pub fn keyd_ops(&self) -> Vec<keyd::Operation> {
+        self.keyd_records().iter().map(|r| r.op).collect()
     }
 
     pub fn accounts(&mut self) -> &mut InMemoryAccounts {
@@ -533,7 +788,9 @@ pub fn error_of(reply: KdcReply) -> KrbError {
     KrbError::decode(&sent(reply)).expect("a KRB-ERROR")
 }
 
-/// The error code of a `Send` reply that is a KRB-ERROR.
+/// The error code of a `Send` reply that is a KRB-ERROR (for an armored
+/// error, the outer one, whose fields "should be the same" as the
+/// PA-FX-ERROR's — RFC 6113 5.4.4).
 pub fn code_of(reply: KdcReply) -> i32 {
     error_of(reply).error_code
 }
@@ -557,6 +814,13 @@ pub fn password_key(etype: i32, password: &str, salt: &str) -> ProtocolKey {
 
 pub fn alice_key(etype: i32) -> ProtocolKey {
     password_key(etype, ALICE_PASSWORD, ALICE_SALT)
+}
+
+/// The computer account's random key of `etype` (keyd drew the scripted
+/// MACHINE_KEY octets; random-to-key is the identity for AES, RFC 3962 §6).
+pub fn machine_key(etype: i32) -> ProtocolKey {
+    let e = enc_type(etype);
+    krb_crypto::random_to_key(e, &MACHINE_KEY[..e.key_length()]).unwrap()
 }
 
 pub fn krbtgt_key() -> ProtocolKey {
@@ -597,7 +861,22 @@ pub fn options(bits: &[u32]) -> KdcOptions {
     KdcOptions(KerberosFlags::from_bits(raw))
 }
 
-/// An AS-REQ under construction (RFC 4120 5.4.1).
+/// FastOptions with bit numbers `bits` set (RFC 6113 5.4.2; bit 0 = most
+/// significant, X.680 22.4).
+pub fn fast_options(bits: &[u32]) -> FastOptions {
+    let mut raw = 0u32;
+    for b in bits {
+        raw |= 0x8000_0000 >> b;
+    }
+    FastOptions(KerberosFlags::from_bits(raw))
+}
+
+/// An AS-REQ under construction (RFC 4120 5.4.1). Unarmored, `padata` is the
+/// request's padata. Armored ([`AsReqSpec::encode_armored`], RFC 6113
+/// 5.4.2), `body()` is the INNER req-body, `inner_padata` (plus the
+/// encrypted challenge when `challenge` is set) the KrbFastReq padata, and
+/// `outer` — default: the inner body — the outer req-body; `padata` then
+/// travels outside, next to PA-FX-FAST (and must be ignored, 5.4.5).
 #[derive(Clone)]
 pub struct AsReqSpec {
     pub cname: Option<PrincipalName>,
@@ -611,6 +890,14 @@ pub struct AsReqSpec {
     pub etypes: Vec<i32>,
     pub padata: Option<Vec<PaData>>,
     pub addresses: Option<HostAddresses>,
+    /// The long-term key (enctype number, octets) of the encrypted
+    /// challenge, if any (RFC 6113 5.4.6).
+    pub challenge: Option<(i32, Vec<u8>)>,
+    /// The challenge's timestamp (default: the time of sending).
+    pub challenge_at: Option<KerberosTime>,
+    pub fast_options: FastOptions,
+    pub inner_padata: Vec<PaData>,
+    pub outer: Option<KdcReqBody>,
 }
 
 impl AsReqSpec {
@@ -628,12 +915,35 @@ impl AsReqSpec {
             etypes: vec![AES256, AES128],
             padata: None,
             addresses: None,
+            challenge: None,
+            challenge_at: None,
+            fast_options: FastOptions::empty(),
+            inner_padata: Vec::new(),
+            outer: None,
         }
     }
 
-    /// The same request with a PA-ENC-TIMESTAMP made with `key` at `now`.
+    /// The computer account asks for a TGT of the maximum life.
+    pub fn machine() -> Self {
+        AsReqSpec {
+            cname: Some(machine_name()),
+            till: till_max(),
+            nonce: 0x0C0C_0C0C,
+            ..AsReqSpec::alice()
+        }
+    }
+
+    /// The same request with a PA-ENC-TIMESTAMP made with `key` at `now`
+    /// (the unarmored path).
     pub fn with_timestamp(mut self, key: &ProtocolKey) -> Self {
         self.padata = Some(vec![pa_enc_timestamp(key, now())]);
+        self
+    }
+
+    /// The same request, armored, with an encrypted challenge made with the
+    /// long-term key `key` (RFC 6113 5.4.6).
+    pub fn with_challenge(mut self, key: &ProtocolKey) -> Self {
+        self.challenge = Some((key.enc_type().number(), key.octets().to_vec()));
         self
     }
 
@@ -654,10 +964,53 @@ impl AsReqSpec {
         }
     }
 
+    /// The unarmored AS-REQ.
     pub fn encode(&self) -> Vec<u8> {
         AsReq(KdcReq {
             padata: self.padata.clone(),
             req_body: self.body(),
+        })
+        .encode()
+        .unwrap()
+    }
+
+    /// The KrbFastReq of the armored request under `armor` at `when`.
+    /// Spec: RFC 6113 5.4.2, 5.4.6.
+    pub fn fast_req(&self, armor_key: &ProtocolKey, when: KerberosTime) -> KrbFastReq {
+        let mut padata = self.inner_padata.clone();
+        if let Some((etype, octets)) = &self.challenge {
+            let long_term = krb_crypto::random_to_key(enc_type(*etype), octets).unwrap();
+            padata.push(encrypted_challenge(
+                armor_key,
+                &long_term,
+                self.challenge_at.unwrap_or(when),
+            ));
+        }
+        KrbFastReq {
+            fast_options: self.fast_options,
+            padata,
+            req_body: self.body(),
+        }
+    }
+
+    /// The armored AS-REQ under `armor` at `when` (RFC 6113 5.4.2): outer
+    /// padata = [PA-FX-FAST, then `padata`], the req-checksum over the outer
+    /// body's octets.
+    pub fn encode_armored(&self, armor: &Armor, when: KerberosTime) -> Vec<u8> {
+        let outer = self.outer.clone().unwrap_or_else(|| self.body());
+        let outer_octets = outer.encode().unwrap();
+        let fast_req = self.fast_req(&armor.key, when);
+        let armored = armored_req(
+            &armor.key,
+            Some(armor.armor_field()),
+            &outer_octets,
+            &fast_req,
+        );
+        let mut padata = vec![fx_fast_padata(&armored)];
+        padata.extend(self.padata.clone().unwrap_or_default());
+        AsReq(KdcReq {
+            padata: Some(padata),
+            req_body: outer,
         })
         .encode()
         .unwrap()
@@ -676,30 +1029,42 @@ pub fn key_from(ek: &EncryptionKey) -> ProtocolKey {
     krb_crypto::random_to_key(enc_type(ek.keytype), ek.keyvalue.as_bytes()).unwrap()
 }
 
-/// A TGT the client holds.
+/// A TGT the client holds (and, when it came armored, the KrbFastResponse).
 pub struct Tgt {
     pub rep: AsRep,
     pub part: EncAsRepPart,
     pub session: ProtocolKey,
+    pub fast: Option<KrbFastResponse>,
 }
 
-/// Decode an AS-REP and open its enc-part with `key` (usage 3).
+/// Decode an unarmored AS-REP and open its enc-part with `key` (usage 3).
 pub fn open_as_rep(bytes: &[u8], key: &ProtocolKey) -> Tgt {
     let rep = AsRep::decode(bytes).expect("an AS-REP");
     let part = EncAsRepPart::decode(&open(key, 3, &rep.0.enc_part)).unwrap();
     let session = key_from(&part.0.key);
-    Tgt { rep, part, session }
+    Tgt {
+        rep,
+        part,
+        session,
+        fast: None,
+    }
 }
 
-/// alice's TGT through the KDC (TCP, at `now`).
+/// alice's TGT through the KDC (armored, encrypted challenge; TCP, at
+/// `now`).
 pub fn obtain_tgt(f: &mut Fixture) -> Tgt {
     obtain_tgt_with(f, AsReqSpec::alice())
 }
 
 pub fn obtain_tgt_with(f: &mut Fixture, spec: AsReqSpec) -> Tgt {
-    let request = spec.with_timestamp(&alice_key(AES256)).encode();
-    let bytes = sent(f.send(&request));
-    open_as_rep(&bytes, &alice_key(AES256))
+    obtain_tgt_at(f, spec, now())
+}
+
+/// alice's TGT through an armored AS exchange at `when`.
+pub fn obtain_tgt_at(f: &mut Fixture, spec: AsReqSpec, when: KerberosTime) -> Tgt {
+    let key = alice_key(AES256);
+    let fast = f.send_fast_at(&spec.with_challenge(&key), Transport::Tcp, when);
+    open_fast_as_rep(&sent(fast.reply), &fast.armor_key, &key)
 }
 
 /// The TGT's own enc-part, opened with the krbtgt key (usage 2).
@@ -707,7 +1072,301 @@ pub fn open_ticket(ticket: &Ticket, key: &ProtocolKey) -> EncTicketPart {
     EncTicketPart::decode(&open(key, 2, &ticket.enc_part)).unwrap()
 }
 
-/// A TGS-REQ under construction (RFC 4120 5.4.1, 5.5.1).
+// ---------------------------------------------------------------------------
+// FAST, client side (RFC 6113).
+// ---------------------------------------------------------------------------
+
+/// KRB-FX-CF2 with the RFC 6113 peppers given.
+pub fn cf2(k1: &ProtocolKey, k2: &ProtocolKey, p1: &[u8], p2: &[u8]) -> ProtocolKey {
+    krb_crypto::krb_fx_cf2(k1, k2, p1, p2).unwrap()
+}
+
+/// An AES256 key from raw octets.
+pub fn aes256(octets: &[u8; 32]) -> ProtocolKey {
+    krb_crypto::random_to_key(EncType::Aes256CtsHmacSha196, octets).unwrap()
+}
+
+/// armor_key = KRB-FX-CF2(subkey, ticket_session_key, "subkeyarmor",
+/// "ticketarmor"). Spec: RFC 6113 5.4.1.1 (also the implicit TGS armor key,
+/// 5.4.2).
+pub fn ticket_armor_key(subkey: &ProtocolKey, session: &ProtocolKey) -> ProtocolKey {
+    cf2(subkey, session, b"subkeyarmor", b"ticketarmor")
+}
+
+/// The strengthened reply key: KRB-FX-CF2(strengthen-key, padata-reply-key,
+/// "strengthenkey", "replykey"). Spec: RFC 6113 5.4.3.
+pub fn strengthened(strengthen: &ProtocolKey, reply_key: &ProtocolKey) -> ProtocolKey {
+    cf2(strengthen, reply_key, b"strengthenkey", b"replykey")
+}
+
+/// An FX_FAST_ARMOR_AP_REQUEST armor the client built, and its armor key.
+pub struct Armor {
+    pub ap_req: ApReq,
+    pub key: ProtocolKey,
+}
+
+impl Armor {
+    /// The armor AP-REQ on `tgt` at `ctime` (RFC 6113 5.4.1.1: "The subkey
+    /// field in the AP-REQ MUST be present"): authenticator with the TGT's
+    /// client, no checksum (Q-120 item 3), cusec `n` and a subkey derived
+    /// from `n` (fresh per request), sealed in the TGT session key with key
+    /// usage 11 (Q-120 item 1).
+    pub fn new(tgt: &Tgt, ctime: KerberosTime, n: u32) -> Armor {
+        let mut subkey = [0xA5u8; 32];
+        subkey[..4].copy_from_slice(&n.to_be_bytes());
+        let authenticator = Authenticator {
+            crealm: tgt.rep.0.crealm.clone(),
+            cname: tgt.rep.0.cname.clone(),
+            cksum: None,
+            cusec: Microseconds::new(n % 1_000_000).unwrap(),
+            ctime,
+            subkey: Some(EncryptionKey {
+                keytype: AES256,
+                keyvalue: KeyValue::from_slice(&subkey),
+            }),
+            seq_number: None,
+            authorization_data: None,
+        };
+        let plain = authenticator.encode().unwrap();
+        let ap_req = ApReq {
+            ap_options: ApOptions::empty(),
+            ticket: tgt.rep.0.ticket.clone(),
+            authenticator: EncryptedData {
+                etype: tgt.session.enc_type().number(),
+                kvno: None,
+                cipher: krb_crypto::encrypt(&tgt.session, usage(11), &[0x55; 16], &plain).unwrap(),
+            },
+        };
+        let key = ticket_armor_key(&aes256(&subkey), &tgt.session);
+        Armor { ap_req, key }
+    }
+
+    /// The KrbFastArmor field (RFC 6113 5.4.1, 5.4.1.1).
+    pub fn armor_field(&self) -> KrbFastArmor {
+        KrbFastArmor {
+            armor_type: FX_FAST_ARMOR_AP_REQUEST,
+            armor_value: self.ap_req.encode().unwrap(),
+        }
+    }
+}
+
+/// KrbFastArmoredReq: the req-checksum over `checksummed` (armor key, its
+/// required checksum type, key usage 50) and enc-fast-req (armor key, key
+/// usage 51). Spec: RFC 6113 5.4.2.
+pub fn armored_req(
+    armor_key: &ProtocolKey,
+    armor: Option<KrbFastArmor>,
+    checksummed: &[u8],
+    fast_req: &KrbFastReq,
+) -> KrbFastArmoredReq {
+    let cksumtype = armor_key.enc_type().checksum_type();
+    KrbFastArmoredReq {
+        armor,
+        req_checksum: Checksum {
+            cksumtype: cksumtype.number(),
+            checksum: krb_crypto::get_mic(armor_key, cksumtype, usage(50), checksummed).unwrap(),
+        },
+        enc_fast_req: EncryptedData {
+            etype: armor_key.enc_type().number(),
+            kvno: None,
+            cipher: krb_crypto::encrypt(
+                armor_key,
+                usage(51),
+                &[0x66; 16],
+                &fast_req.encode().unwrap(),
+            )
+            .unwrap(),
+        },
+    }
+}
+
+/// The PA-FX-FAST padata of a request. Spec: RFC 6113 5.4.2.
+pub fn fx_fast_padata(armored: &KrbFastArmoredReq) -> PaData {
+    PaData {
+        padata_type: PA_FX_FAST,
+        padata_value: PaFxFastRequest::ArmoredData(armored.clone())
+            .encode()
+            .unwrap(),
+    }
+}
+
+/// PA-ENCRYPTED-CHALLENGE: PA-ENC-TS-ENC at `ts` in the client challenge key
+/// KRB-FX-CF2(armor_key, long_term_key, "clientchallengearmor",
+/// "challengelongterm"), key usage 54, no kvno. Spec: RFC 6113 5.4.6.
+pub fn encrypted_challenge(
+    armor_key: &ProtocolKey,
+    long_term: &ProtocolKey,
+    ts: KerberosTime,
+) -> PaData {
+    let key = cf2(
+        armor_key,
+        long_term,
+        b"clientchallengearmor",
+        b"challengelongterm",
+    );
+    let plain = PaEncTsEnc {
+        patimestamp: ts,
+        pausec: Some(Microseconds::new(77).unwrap()),
+    }
+    .encode()
+    .unwrap();
+    PaData {
+        padata_type: PA_ENCRYPTED_CHALLENGE,
+        padata_value: EncryptedData {
+            etype: key.enc_type().number(),
+            kvno: None,
+            cipher: krb_crypto::encrypt(&key, usage(54), &[0x77; 16], &plain).unwrap(),
+        }
+        .encode()
+        .unwrap(),
+    }
+}
+
+/// The reply of an armored request and the armor key its client derived.
+pub struct FastSent {
+    pub reply: KdcReply,
+    pub armor_key: ProtocolKey,
+}
+
+/// Open the KrbFastResponse of a PA-FX-FAST reply padata with the armor key
+/// (key usage 52). Spec: RFC 6113 5.4.3.
+pub fn open_fast_response(pa: &PaData, armor_key: &ProtocolKey) -> KrbFastResponse {
+    assert_eq!(pa.padata_type, PA_FX_FAST);
+    let PaFxFastReply::ArmoredData(rep) = PaFxFastReply::decode(&pa.padata_value).unwrap();
+    let plain = krb_crypto::decrypt(armor_key, usage(52), &rep.enc_fast_rep.cipher)
+        .expect("enc-fast-rep opens with the armor key");
+    KrbFastResponse::decode(&plain).unwrap()
+}
+
+/// `true` if the KrbFastResponse of `pa` decrypts under `key` (usage 52).
+pub fn fast_response_opens_with(pa: &PaData, key: &ProtocolKey) -> bool {
+    let PaFxFastReply::ArmoredData(rep) = PaFxFastReply::decode(&pa.padata_value).unwrap();
+    krb_crypto::decrypt(key, usage(52), &rep.enc_fast_rep.cipher).is_ok()
+}
+
+/// Verify KrbFastFinished against the ticket of the reply: ticket-checksum
+/// over the full Ticket DER (Q-122), armor key, its required checksum type,
+/// key usage 53; and the names. Spec: RFC 6113 5.4.3.
+pub fn check_finished(response: &KrbFastResponse, armor_key: &ProtocolKey, rep: &KdcRep) {
+    let finished = response
+        .finished
+        .as_ref()
+        .expect("finished: present in an AS-REP or a TGS-REP");
+    krb_crypto::verify_mic(
+        armor_key,
+        armor_key.enc_type().checksum_type(),
+        usage(53),
+        &rep.ticket.encode().unwrap(),
+        &finished.ticket_checksum.checksum,
+    )
+    .expect("ticket-checksum");
+    assert_eq!(finished.crealm, rep.crealm);
+    assert_eq!(finished.cname, rep.cname);
+}
+
+/// Decode an armored AS-REP and open it (RFC 6113 5.4.3, 5.4.6): the only
+/// padata is PA-FX-FAST; the KrbFastResponse (armor key) carries the KDC's
+/// encrypted challenge (usage 55 under KRB-FX-CF2(armor_key, client key,
+/// "kdcchallengearmor", "challengelongterm")), the strengthen key and
+/// KrbFastFinished; the enc-part opens (usage 3) only under the
+/// strengthened reply key.
+pub fn open_fast_as_rep(bytes: &[u8], armor_key: &ProtocolKey, client_key: &ProtocolKey) -> Tgt {
+    let rep = AsRep::decode(bytes).expect("an AS-REP");
+    let padata = rep.0.padata.as_ref().expect("PA-FX-FAST in the AS-REP");
+    assert_eq!(padata.len(), 1, "only PA-FX-FAST outside (RFC 6113 5.4.5)");
+    let response = open_fast_response(&padata[0], armor_key);
+    let strengthen = key_from(response.strengthen_key.as_ref().expect("strengthen-key"));
+    let reply_key = strengthened(&strengthen, client_key);
+    let part = EncAsRepPart::decode(&open(&reply_key, 3, &rep.0.enc_part)).unwrap();
+    assert_eq!(response.nonce, part.0.nonce);
+    check_finished(&response, armor_key, &rep.0);
+    let kdc_challenge = response
+        .padata
+        .iter()
+        .find(|p| p.padata_type == PA_ENCRYPTED_CHALLENGE)
+        .expect("the KDC's PA-ENCRYPTED-CHALLENGE");
+    let kdc_key = cf2(
+        armor_key,
+        client_key,
+        b"kdcchallengearmor",
+        b"challengelongterm",
+    );
+    let challenge = EncryptedData::decode(&kdc_challenge.padata_value).unwrap();
+    PaEncTsEnc::decode(&open(&kdc_key, 55, &challenge)).unwrap();
+    let session = key_from(&part.0.key);
+    Tgt {
+        rep,
+        part,
+        session,
+        fast: Some(response),
+    }
+}
+
+/// An armored KRB-ERROR, opened (RFC 6113 5.4.4).
+pub struct FastError {
+    /// The outer KRB-ERROR.
+    pub outer: KrbError,
+    /// The PA-FX-ERROR's KRB-ERROR.
+    pub inner: KrbError,
+    /// The KrbFastResponse.
+    pub response: KrbFastResponse,
+}
+
+impl FastError {
+    /// The padata types of the KrbFastResponse, in order.
+    pub fn padata_types(&self) -> Vec<i32> {
+        self.response.padata.iter().map(|p| p.padata_type).collect()
+    }
+
+    /// The KrbFastResponse padata of `padata_type`.
+    pub fn padata(&self, padata_type: i32) -> Option<&PaData> {
+        self.response
+            .padata
+            .iter()
+            .find(|p| p.padata_type == padata_type)
+    }
+}
+
+/// The single PA-FX-FAST of an armored KRB-ERROR's e-data (METHOD-DATA).
+pub fn error_fx_fast(error: &KrbError) -> PaData {
+    let methods = MethodData::decode(error.e_data.as_deref().expect("e-data")).unwrap();
+    assert_eq!(methods.0.len(), 1, "METHOD-DATA carries only PA-FX-FAST");
+    methods.0[0].clone()
+}
+
+/// Open an armored KRB-ERROR with the armor key and check RFC 6113 5.4.3 /
+/// 5.4.4: no strengthen-key, no finished; the PA-FX-ERROR is the outer
+/// KRB-ERROR without e-data.
+pub fn open_fast_error(reply: KdcReply, armor_key: &ProtocolKey) -> FastError {
+    let outer = error_of(reply);
+    let response = open_fast_response(&error_fx_fast(&outer), armor_key);
+    assert!(response.strengthen_key.is_none(), "absent in KRB-ERROR");
+    assert!(response.finished.is_none(), "absent in an error");
+    let fx_error = response
+        .padata
+        .iter()
+        .find(|p| p.padata_type == PA_FX_ERROR)
+        .expect("PA-FX-ERROR");
+    let inner = KrbError::decode(&fx_error.padata_value).unwrap();
+    assert!(inner.e_data.is_none());
+    let mut outer_fields = outer.clone();
+    outer_fields.e_data = None;
+    assert_eq!(inner, outer_fields, "all other fields are the same");
+    FastError {
+        outer,
+        inner,
+        response,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TGS (RFC 4120 5.4.1, 5.5.1; RFC 6113 5.4.2 implicit armor).
+// ---------------------------------------------------------------------------
+
+/// A TGS-REQ under construction. `body()` is the INNER req-body; `outer` —
+/// default: the inner body — the outer one, which the authenticator checksum
+/// covers (A-17, docs/questions/Q-124 item 1). Armored by default (implicit
+/// armor, RFC 6113 5.4.2): the subkey is then mandatory.
 #[derive(Clone)]
 pub struct TgsReqSpec {
     pub sname: Option<PrincipalName>,
@@ -724,6 +1383,9 @@ pub struct TgsReqSpec {
     pub extra_padata: Vec<PaData>,
     pub enc_authorization_data: Option<EncryptedData>,
     pub additional_tickets: Option<Vec<Ticket>>,
+    pub armored: bool,
+    pub fast_options: FastOptions,
+    pub outer: Option<KdcReqBody>,
 }
 
 impl TgsReqSpec {
@@ -740,10 +1402,13 @@ impl TgsReqSpec {
             etypes: vec![AES256, AES128],
             ctime: now(),
             cusec: 1,
-            subkey: None,
+            subkey: Some(TGS_SUBKEY),
             extra_padata: Vec::new(),
             enc_authorization_data: None,
             additional_tickets: None,
+            armored: true,
+            fast_options: FastOptions::empty(),
+            outer: None,
         }
     }
 
@@ -764,32 +1429,70 @@ impl TgsReqSpec {
         }
     }
 
-    /// The TGS-REQ octets and the exact KDC-REQ-BODY octets the
+    /// The outer req-body.
+    pub fn outer_body(&self) -> KdcReqBody {
+        self.outer.clone().unwrap_or_else(|| self.body())
+    }
+
+    /// The TGS-REQ octets and the exact outer KDC-REQ-BODY octets the
     /// authenticator checksum covers (RFC 4120 5.2.7.1).
     pub fn encode(&self, tgt: &Tgt) -> (Vec<u8>, Vec<u8>) {
         self.encode_with_ticket(&tgt.rep.0.ticket, &tgt.session)
     }
 
     pub fn encode_with_ticket(&self, ticket: &Ticket, session: &ProtocolKey) -> (Vec<u8>, Vec<u8>) {
-        let body = self.body();
-        let body_bytes = body.encode().unwrap();
+        let body_bytes = self.outer_body().encode().unwrap();
+        let auth = authenticator(session, self, &body_bytes);
+        (self.request_with(ticket, session, auth), body_bytes)
+    }
+
+    /// The implicit armor key of this request on a TGT with `session`
+    /// (RFC 6113 5.4.2). Without a subkey there is none; the session key
+    /// then stands in so that the request is well-formed (keyd refuses it).
+    pub fn armor_key(&self, session: &ProtocolKey) -> ProtocolKey {
+        match &self.subkey {
+            Some(subkey) => ticket_armor_key(&aes256(subkey), session),
+            None => krb_crypto::random_to_key(session.enc_type(), session.octets()).unwrap(),
+        }
+    }
+
+    /// The TGS-REQ for this spec with the authenticator `auth` (which may
+    /// cover another body or be tampered with): PA-TGS-REQ, then — armored —
+    /// PA-FX-FAST with no armor field, the req-checksum over the PA-TGS-REQ
+    /// AP-REQ octets and the KrbFastReq of the inner body (RFC 6113 5.4.2),
+    /// then `extra_padata`.
+    pub fn request_with(
+        &self,
+        ticket: &Ticket,
+        session: &ProtocolKey,
+        auth: EncryptedData,
+    ) -> Vec<u8> {
         let ap_req = ApReq {
             ap_options: ApOptions::empty(),
             ticket: ticket.clone(),
-            authenticator: authenticator(session, self, &body_bytes),
+            authenticator: auth,
         };
+        let ap_req_octets = ap_req.encode().unwrap();
         let mut padata = vec![PaData {
             padata_type: PA_TGS_REQ,
-            padata_value: ap_req.encode().unwrap(),
+            padata_value: ap_req_octets.clone(),
         }];
+        if self.armored {
+            let fast_req = KrbFastReq {
+                fast_options: self.fast_options,
+                padata: Vec::new(),
+                req_body: self.body(),
+            };
+            let armored = armored_req(&self.armor_key(session), None, &ap_req_octets, &fast_req);
+            padata.push(fx_fast_padata(&armored));
+        }
         padata.extend(self.extra_padata.iter().cloned());
-        let request = TgsReq(KdcReq {
+        TgsReq(KdcReq {
             padata: Some(padata),
-            req_body: body,
+            req_body: self.outer_body(),
         })
         .encode()
-        .unwrap();
-        (request, body_bytes)
+        .unwrap()
     }
 }
 
@@ -822,11 +1525,25 @@ pub fn authenticator(session: &ProtocolKey, spec: &TgsReqSpec, body: &[u8]) -> E
     }
 }
 
-/// Decode a TGS-REP and open its enc-part with `key` and `usage` (8 for the
-/// TGT session key, 9 for an authenticator subkey — RFC 4120 5.4.2).
-pub fn open_tgs_rep(bytes: &[u8], key: &ProtocolKey, usage_number: u32) -> (TgsRep, EncTgsRepPart) {
+/// Decode an armored TGS-REP for `spec` on `tgt` and open it (RFC 6113
+/// 5.4.3): the only padata is PA-FX-FAST; the KrbFastResponse (implicit
+/// armor key) carries the inner nonce, the strengthen key ("MUST be set in a
+/// TGS reply") and KrbFastFinished; the enc-part opens (usage 9,
+/// docs/questions/Q-121) only under KRB-FX-CF2(strengthen-key, subkey,
+/// "strengthenkey", "replykey").
+pub fn open_tgs_rep(bytes: &[u8], tgt: &Tgt, spec: &TgsReqSpec) -> (TgsRep, EncTgsRepPart) {
     let rep = TgsRep::decode(bytes).expect("a TGS-REP");
-    let part = EncTgsRepPart::decode(&open(key, usage_number, &rep.0.enc_part)).unwrap();
+    let padata = rep.0.padata.as_ref().expect("PA-FX-FAST in the TGS-REP");
+    assert_eq!(padata.len(), 1);
+    let armor_key = spec.armor_key(&tgt.session);
+    let response = open_fast_response(&padata[0], &armor_key);
+    assert_eq!(response.nonce, spec.nonce);
+    let strengthen = key_from(response.strengthen_key.as_ref().expect("strengthen-key"));
+    let subkey = aes256(&spec.subkey.expect("a subkey"));
+    let reply_key = strengthened(&strengthen, &subkey);
+    let part = EncTgsRepPart::decode(&open(&reply_key, 9, &rep.0.enc_part)).unwrap();
+    assert_eq!(part.0.nonce, spec.nonce);
+    check_finished(&response, &armor_key, &rep.0);
     (rep, part)
 }
 

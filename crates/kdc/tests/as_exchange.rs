@@ -1,8 +1,16 @@
 //! The AS exchange through `Kdc::handle`.
 //!
+//! FAST is mandatory for alice, a user (docs/48 §7.1, P-10 interim), so her
+//! requests are armored with the computer account's TGT (RFC 6113 5.4.1.1)
+//! and pre-authenticated with the encrypted challenge (5.4.6); the request
+//! shape steps run on the inner request (5.4.2). The PA-ENC-TIMESTAMP rules
+//! are those of the unarmored bootstrap of the computer account ws1$
+//! (docs/48 §7.3).
+//!
 //! Sources: RFC 4120 §2, 3.1.2, 3.1.3, 5.2.7.2-5.2.7.5, 5.4.1, 5.4.2, 5.9.1,
-//! 7.5.9, 8.2; RFC 3961 §8 (etype numbers used as client offers);
-//! main-session decisions 3-10 (named per test). All values hand-made.
+//! 7.5.9, 8.2; RFC 6113 2.1, 5.2, 5.4.2-5.4.6; RFC 3961 §8 (etype numbers used
+//! as client offers); docs/48 §4, §7; docs/questions/Q-123; main-session
+//! decisions 3-10 (named per test). All values hand-made.
 
 mod common;
 
@@ -12,40 +20,42 @@ use krb_proto::constants::{
     KDC_ERR_BADOPTION, KDC_ERR_CANNOT_POSTDATE, KDC_ERR_CLIENT_REVOKED,
     KDC_ERR_C_PRINCIPAL_UNKNOWN, KDC_ERR_ETYPE_NOSUPP, KDC_ERR_NEVER_VALID, KDC_ERR_POLICY,
     KDC_ERR_PREAUTH_FAILED, KDC_ERR_PREAUTH_REQUIRED, KDC_ERR_S_PRINCIPAL_UNKNOWN, KRB_ERR_GENERIC,
-    KRB_NT_SRV_INST, PA_ENC_TIMESTAMP, PA_ETYPE_INFO2,
+    KRB_NT_SRV_INST, PA_ENCRYPTED_CHALLENGE, PA_ENC_TIMESTAMP, PA_ETYPE_INFO2, PA_FX_COOKIE,
+    PA_FX_ERROR, PA_FX_FAST,
 };
 use krb_proto::{EtypeInfo2, HostAddress, HostAddresses, MethodData, TicketFlags};
 use pdp::{
     ActionMatch, AuthMatch, ContextMatch, Effect, Match, ResourceMatch, Rule, RuleId, SubjectMatch,
 };
 
-/// RFC 4120 3.1.3: PREAUTH_REQUIRED's ETYPE-INFO2, then a PA-ENC-TIMESTAMP
-/// made from the advertised salt, gives a TGT. RFC 4120 5.4.2 / 3.1.5: the
-/// client opens the enc-part with its key (usage 3), checks nonce, names,
-/// flags and times; the ticket opens under krbtgt (usage 2, RFC 4120 5.3).
+/// RFC 4120 3.1.3 + RFC 6113 5.4.4, 5.4.6: the armored PREAUTH_REQUIRED's
+/// PA-ETYPE-INFO2 (inside the sealed KrbFastResponse), then an encrypted
+/// challenge made from the advertised salt, gives a TGT. The client opens the
+/// enc-part with the strengthened reply key (usage 3, RFC 6113 5.4.3),
+/// checks nonce, names, flags and times; the ticket opens under krbtgt
+/// (usage 2, RFC 4120 5.3).
 #[test]
 fn as_exchange_issues_tgt_using_advertised_salt() {
     let mut f = Fixture::new();
     let spec = AsReqSpec::alice();
-    let error = error_of(f.send(&spec.encode()));
-    assert_eq!(error.error_code, KDC_ERR_PREAUTH_REQUIRED);
-    let methods = MethodData::decode(error.e_data.as_deref().unwrap()).unwrap();
-    let info = methods
-        .0
-        .iter()
-        .find(|p| p.padata_type == PA_ETYPE_INFO2)
-        .unwrap();
+    let first = f.send_fast(&spec);
+    let error = open_fast_error(first.reply, &first.armor_key);
+    assert_eq!(error.outer.error_code, KDC_ERR_PREAUTH_REQUIRED);
+    let info = error.padata(PA_ETYPE_INFO2).unwrap();
     let entries = EtypeInfo2::decode(&info.padata_value).unwrap();
-    let first = &entries.0[0];
-    let salt = first.salt.as_ref().unwrap().as_str().to_owned();
+    let first_entry = &entries.0[0];
+    let salt = first_entry.salt.as_ref().unwrap().as_str().to_owned();
     // The client derives its key from the password and the advertised salt.
-    let key = password_key(first.etype, ALICE_PASSWORD, &salt);
+    let key = password_key(first_entry.etype, ALICE_PASSWORD, &salt);
 
-    let bytes = sent(f.send(&spec.clone().with_timestamp(&key).encode()));
-    let tgt = open_as_rep(&bytes, &key);
+    let fast = f.send_fast(&spec.clone().with_challenge(&key));
+    let tgt = open_fast_as_rep(&sent(fast.reply), &fast.armor_key, &key);
     assert_eq!(tgt.rep.0.crealm, realm());
     assert_eq!(tgt.rep.0.cname, alice_name());
-    assert!(tgt.rep.0.padata.is_none());
+    // RFC 6113 5.4.5: only PA-FX-FAST outside.
+    let padata = tgt.rep.0.padata.as_ref().unwrap();
+    assert_eq!(padata.len(), 1);
+    assert_eq!(padata[0].padata_type, PA_FX_FAST);
     assert_eq!(tgt.rep.0.ticket.realm, realm());
     assert_eq!(tgt.rep.0.ticket.sname, krbtgt_name());
     let part = &tgt.part.0;
@@ -73,70 +83,150 @@ fn as_exchange_issues_tgt_using_advertised_salt() {
     assert_eq!(events[1].exchange, Some(Exchange::As));
 }
 
-/// RFC 4120 3.1.3, 5.9.1, 5.2.7.5: PREAUTH_REQUIRED carries METHOD-DATA with
-/// PA-ENC-TIMESTAMP and PA-ETYPE-INFO2 for the acceptable enctypes in the
-/// client's order; never PA-ETYPE-INFO (11) or PA-PW-SALT (3), RFC 4120
-/// 5.2.7.4 ("MUST NOT send PA-ETYPE-INFO when the client's AS-REQ includes at
-/// least one 'newer' etype"), 5.2.7.3. Decision 5.
+/// RFC 4120 3.1.3, 5.9.1, 5.2.7.5; RFC 6113 2.1, 5.2, 5.4.4, 5.4.6;
+/// docs/48 §4.1 A9; docs/questions/Q-123: the armored PREAUTH_REQUIRED's
+/// outer METHOD-DATA carries only PA-FX-FAST; its sealed KrbFastResponse
+/// advertises PA-ENCRYPTED-CHALLENGE (empty) and carries PA-ETYPE-INFO2 with
+/// ONE entry — the first acceptable enctype in the client's order, the key
+/// keyd will use — and the PA-FX-COOKIE, then PA-FX-ERROR; never PA-ETYPE-INFO
+/// (11) or PA-PW-SALT (3), RFC 4120 5.2.7.4, 5.2.7.3. keyd opened the armor
+/// and sealed the error; no pre-authentication was attempted. Decision 5.
 #[test]
 fn preauth_required_carries_method_data_and_etype_info2() {
+    let mut f = Fixture::new();
+    for (offer, expected) in [
+        (vec![AES256, AES128], AES256),
+        (vec![AES128, AES256], AES128),
+        (vec![RC4_HMAC, AES128], AES128),
+    ] {
+        let mut spec = AsReqSpec::alice();
+        spec.etypes = offer;
+        let fast = f.send_fast(&spec);
+        let error = open_fast_error(fast.reply, &fast.armor_key);
+        assert_eq!(error.outer.error_code, KDC_ERR_PREAUTH_REQUIRED);
+        assert!(error.outer.e_text.is_none());
+        assert_eq!(
+            error.padata_types(),
+            vec![
+                PA_ENCRYPTED_CHALLENGE,
+                PA_ETYPE_INFO2,
+                PA_FX_COOKIE,
+                PA_FX_ERROR
+            ]
+        );
+        assert!(error
+            .padata(PA_ENCRYPTED_CHALLENGE)
+            .unwrap()
+            .padata_value
+            .is_empty());
+        let entries =
+            EtypeInfo2::decode(&error.padata(PA_ETYPE_INFO2).unwrap().padata_value).unwrap();
+        assert_eq!(entries.0.len(), 1);
+        assert_eq!(entries.0[0].etype, expected);
+        assert_eq!(entries.0[0].salt.as_ref().unwrap().as_str(), ALICE_SALT);
+        assert!(entries.0[0].s2kparams.is_none());
+        assert!(!error.padata(PA_FX_COOKIE).unwrap().padata_value.is_empty());
+        // The nonce of the INNER request (RFC 6113 5.4.3).
+        assert_eq!(error.response.nonce, spec.nonce);
+    }
+    assert!(!f.keyd_ops().contains(&keyd::Operation::VerifyPreauth));
+}
+
+/// RFC 4120 3.1.3, 5.9.1, 5.2.7.5; RFC 6113 5.2, 5.4.2; docs/48 §7.3: the
+/// UNARMORED PREAUTH_REQUIRED of the computer account (the bootstrap)
+/// advertises PA-FX-FAST (empty — "KDCs MUST send the advertisement of
+/// PA-FX-FAST with an empty pa-value"), PA-ENC-TIMESTAMP (empty), PA-ETYPE-INFO2
+/// for the acceptable enctypes in the client's order, and the PA-FX-COOKIE
+/// ("a KDC MUST include a cookie in a KDC_ERR_PREAUTH_REQUIRED").
+#[test]
+fn bootstrap_preauth_required_advertises_fast_timestamp_and_cookie() {
     let mut f = Fixture::new();
     for (offer, expected) in [
         (vec![AES256, AES128], vec![AES256, AES128]),
         (vec![AES128, AES256], vec![AES128, AES256]),
         (vec![RC4_HMAC, AES128], vec![AES128]),
     ] {
-        let mut spec = AsReqSpec::alice();
+        let mut spec = AsReqSpec::machine();
         spec.etypes = offer;
         let error = error_of(f.send(&spec.encode()));
         assert_eq!(error.error_code, KDC_ERR_PREAUTH_REQUIRED);
-        assert!(error.e_text.is_none());
         let methods = MethodData::decode(error.e_data.as_deref().unwrap()).unwrap();
         let types: Vec<i32> = methods.0.iter().map(|p| p.padata_type).collect();
-        assert_eq!(types, vec![PA_ENC_TIMESTAMP, PA_ETYPE_INFO2]);
+        assert_eq!(
+            types,
+            vec![PA_FX_FAST, PA_ENC_TIMESTAMP, PA_ETYPE_INFO2, PA_FX_COOKIE]
+        );
         assert!(methods.0[0].padata_value.is_empty());
-        let entries = EtypeInfo2::decode(&methods.0[1].padata_value).unwrap();
+        assert!(methods.0[1].padata_value.is_empty());
+        let entries = EtypeInfo2::decode(&methods.0[2].padata_value).unwrap();
         let etypes: Vec<i32> = entries.0.iter().map(|e| e.etype).collect();
         assert_eq!(etypes, expected);
-        for entry in &entries.0 {
-            assert_eq!(entry.salt.as_ref().unwrap().as_str(), ALICE_SALT);
-            assert!(entry.s2kparams.is_none());
-        }
+        assert!(!methods.0[3].padata_value.is_empty());
     }
     // keyd was never asked: no padata, nothing to verify.
     assert!(f.keyd_records().is_empty());
 }
 
-/// RFC 4120 3.1.3: "if the pre-authentication check fails, an error message
-/// with the code KDC_ERR_PREAUTH_FAILED is returned" (decision 5: keyd says
-/// Denied).
+/// RFC 6113 5.4.6 ("If the decryption fails the KDC SHOULD return
+/// KDC_ERR_PREAUTH_FAILED, including PA-ETYPE-INFO2 in the KRBFastResponse"),
+/// 5.4.4; docs/48 §4.1 A10, §6.1: a challenge made with the wrong password
+/// is an ARMORED PREAUTH_FAILED — its KrbFastResponse opens only with the
+/// armor key (not with alice's key nor the armor TGT's session key) and
+/// carries the single PA-ETYPE-INFO2 entry and the cookie. RFC 4120 3.1.3
+/// for the unarmored bootstrap: a wrong key is PREAUTH_FAILED, unarmored.
 #[test]
 fn wrong_password_is_preauth_failed() {
     let mut f = Fixture::new();
     let wrong = password_key(AES256, "not-alices-password", ALICE_SALT);
-    let reply = f.send(&AsReqSpec::alice().with_timestamp(&wrong).encode());
-    assert_eq!(code_of(reply), KDC_ERR_PREAUTH_FAILED);
+    let fast = f.send_fast(&AsReqSpec::alice().with_challenge(&wrong));
+    let outer = error_of(fast.reply.clone());
+    let fx_fast = error_fx_fast(&outer);
+    assert!(!fast_response_opens_with(&fx_fast, &alice_key(AES256)));
+    assert!(!fast_response_opens_with(&fx_fast, &f.machine_tgt.session));
+    let error = open_fast_error(fast.reply, &fast.armor_key);
+    assert_eq!(error.outer.error_code, KDC_ERR_PREAUTH_FAILED);
+    assert_eq!(
+        error.padata_types(),
+        vec![PA_ETYPE_INFO2, PA_FX_COOKIE, PA_FX_ERROR]
+    );
+    let entries = EtypeInfo2::decode(&error.padata(PA_ETYPE_INFO2).unwrap().padata_value).unwrap();
+    assert_eq!(entries.0.len(), 1);
     assert_eq!(f.events()[0].reason, AuditReason::PreauthDenied);
+    assert!(f.events()[0].armor.reply_armored);
+
+    // The bootstrap path: a wrong machine key.
+    let wrong_machine =
+        krb_crypto::random_to_key(krb_crypto::EncType::Aes256CtsHmacSha196, &[0x99; 32]).unwrap();
+    let mut spec = AsReqSpec::machine().with_timestamp(&wrong_machine);
+    spec.nonce = 41;
+    let error = error_of(f.send(&spec.encode()));
+    assert_eq!(error.error_code, KDC_ERR_PREAUTH_FAILED);
+    assert!(error.e_data.is_none());
+    assert_eq!(f.events()[1].reason, AuditReason::PreauthDenied);
 }
 
-/// A-26 / RFC 4120 3.1.3, 5.2.7.2: with the correct password but a timestamp
-/// outside the skew, keyd reports the Skew class (the timestamp decrypted);
-/// RFC 4120 names no code for it other than KDC_ERR_PREAUTH_FAILED, so the
-/// client sees the same code as for a wrong password — the classes differ
-/// in audit only (PreauthSkew vs PreauthDenied). A wrong password with a
-/// skewed timestamp never decrypts: PreauthDenied (no password oracle).
+/// A-26 / RFC 4120 3.1.3, 5.2.7.2 (the unarmored bootstrap): with the correct
+/// key but a timestamp outside the skew, keyd reports the Skew class (the
+/// timestamp decrypted); RFC 4120 names no code for it other than
+/// KDC_ERR_PREAUTH_FAILED, so the client sees the same code as for a wrong
+/// key — the classes differ in audit only (PreauthSkew vs PreauthDenied). A
+/// wrong key with a skewed timestamp never decrypts: PreauthDenied (no
+/// oracle). (The ARMORED challenge out of skew is KRB_AP_ERR_SKEW: tests/fast.rs.)
 #[test]
 fn skewed_timestamp_is_preauth_failed_audited_apart() {
     let mut f = Fixture::new();
-    let mut skewed = AsReqSpec::alice();
-    skewed.padata = Some(vec![pa_enc_timestamp(&alice_key(AES256), at(-400))]);
+    let mut skewed = AsReqSpec::machine();
+    skewed.nonce = 1;
+    skewed.padata = Some(vec![pa_enc_timestamp(&machine_key(AES256), at(-400))]);
     let error = error_of(f.send(&skewed.encode()));
     assert_eq!(error.error_code, KDC_ERR_PREAUTH_FAILED);
     assert_eq!(error.stime, now());
     assert_eq!(f.events()[0].reason, AuditReason::PreauthSkew);
 
-    let wrong = password_key(AES256, "not-alices-password", ALICE_SALT);
-    let mut wrong_and_skewed = AsReqSpec::alice();
+    let wrong =
+        krb_crypto::random_to_key(krb_crypto::EncType::Aes256CtsHmacSha196, &[0x98; 32]).unwrap();
+    let mut wrong_and_skewed = AsReqSpec::machine();
+    wrong_and_skewed.nonce = 2;
     wrong_and_skewed.padata = Some(vec![pa_enc_timestamp(&wrong, at(-400))]);
     assert_eq!(
         code_of(f.send(&wrong_and_skewed.encode())),
@@ -146,72 +236,86 @@ fn skewed_timestamp_is_preauth_failed_audited_apart() {
 }
 
 /// RFC 4120 3.1.3: an unknown client is KDC_ERR_C_PRINCIPAL_UNKNOWN
-/// (decision 5; user enumeration is a documented residual).
+/// (decision 5; user enumeration is a documented residual) — armored, from
+/// the inner request.
 #[test]
 fn unknown_client_is_c_principal_unknown() {
     let mut f = Fixture::new();
     let mut spec = AsReqSpec::alice();
     spec.cname = Some(name(1, &["mallory"]));
-    let error = error_of(f.send(&spec.encode()));
-    assert_eq!(error.error_code, KDC_ERR_C_PRINCIPAL_UNKNOWN);
+    let fast = f.send_fast(&spec);
+    let error = open_fast_error(fast.reply, &fast.armor_key);
+    assert_eq!(error.outer.error_code, KDC_ERR_C_PRINCIPAL_UNKNOWN);
+    assert_eq!(error.outer.cname, Some(name(1, &["mallory"])));
     // Exact match only (decision 4): case is significant.
     spec.cname = Some(name(1, &["Alice"]));
-    assert_eq!(code_of(f.send(&spec.encode())), KDC_ERR_C_PRINCIPAL_UNKNOWN);
+    assert_eq!(
+        code_of(f.send_fast(&spec).reply),
+        KDC_ERR_C_PRINCIPAL_UNKNOWN
+    );
     // Name-type is not (RFC 4120 6.2).
     spec.cname = Some(name(0, &["alice"]));
-    assert_eq!(code_of(f.send(&spec.encode())), KDC_ERR_PREAUTH_REQUIRED);
+    assert_eq!(code_of(f.send_fast(&spec).reply), KDC_ERR_PREAUTH_REQUIRED);
+    // Unarmored: the same code, before the FAST gate (R6 precedes it).
+    spec.cname = Some(name(1, &["mallory"]));
+    assert_eq!(code_of(f.send(&spec.encode())), KDC_ERR_C_PRINCIPAL_UNKNOWN);
 }
 
 /// Decision 6 / RFC 4120 3.1.3: a list of only non-AES etypes (RFC 3961 §8
-/// numbers) is KDC_ERR_ETYPE_NOSUPP — there is no code path for them.
+/// numbers) is KDC_ERR_ETYPE_NOSUPP — there is no code path for them; keyd
+/// is not asked to verify anything.
 #[test]
 fn rc4_des_only_list_is_etype_nosupp() {
     let mut f = Fixture::new();
     let mut spec = AsReqSpec::alice();
     spec.etypes = vec![RC4_HMAC, DES3_CBC_SHA1_KD, DES_CBC_MD5, DES_CBC_CRC];
-    assert_eq!(code_of(f.send(&spec.encode())), KDC_ERR_ETYPE_NOSUPP);
-    // Even with a valid AES timestamp.
-    let spec = spec.with_timestamp(&alice_key(AES256));
-    assert_eq!(code_of(f.send(&spec.encode())), KDC_ERR_ETYPE_NOSUPP);
-    assert!(f.keyd_records().is_empty());
+    assert_eq!(code_of(f.send_fast(&spec).reply), KDC_ERR_ETYPE_NOSUPP);
+    // Even with a valid AES challenge.
+    let spec = spec.with_challenge(&alice_key(AES256));
+    assert_eq!(code_of(f.send_fast(&spec).reply), KDC_ERR_ETYPE_NOSUPP);
+    assert!(!f.keyd_ops().contains(&keyd::Operation::VerifyPreauth));
 }
 
 /// Decision 6 / RFC 4120 3.1.3 ("the KDC SHOULD use the first valid strong
 /// etype for which an encryption key is available"): a mixed list picks the
-/// client's first acceptable AES etype for the session key.
+/// client's first acceptable AES etype for the session key — and, armored,
+/// that is also the long-term key of the challenge (Q-123), so the
+/// (strengthened) reply key is aes128.
 #[test]
 fn mixed_list_picks_first_acceptable_aes() {
     let mut f = Fixture::new();
     let mut spec = AsReqSpec::alice();
     spec.etypes = vec![RC4_HMAC, AES128, DES_CBC_MD5, AES256];
-    let tgt = obtain_tgt_with(&mut f, spec);
+    let key = alice_key(AES128);
+    let fast = f.send_fast(&spec.with_challenge(&key));
+    let tgt = open_fast_as_rep(&sent(fast.reply), &fast.armor_key, &key);
     assert_eq!(tgt.part.0.key.keytype, AES128);
-    // The reply is sealed under the key that pre-authenticated (aes256).
-    assert_eq!(tgt.rep.0.enc_part.etype, AES256);
+    assert_eq!(tgt.rep.0.enc_part.etype, AES128);
 }
 
-/// RFC 4120 3.1.3 / 5.2.7.2: a PA-ENC-TIMESTAMP in an enctype the client did
-/// not offer (or that is not acceptable) is refused, before keyd.
+/// RFC 4120 3.1.3 / 5.2.7.2 (the unarmored bootstrap): a PA-ENC-TIMESTAMP in
+/// an enctype the client did not offer (or that is not acceptable) is
+/// refused, before keyd; two timestamps are ambiguous.
 #[test]
 fn timestamp_in_unnegotiated_etype_is_preauth_failed() {
     let mut f = Fixture::new();
-    let mut spec = AsReqSpec::alice();
+    let mut spec = AsReqSpec::machine();
     spec.etypes = vec![AES128];
-    let reply = f.send(&spec.with_timestamp(&alice_key(AES256)).encode());
+    let reply = f.send(&spec.with_timestamp(&machine_key(AES256)).encode());
     assert_eq!(code_of(reply), KDC_ERR_PREAUTH_FAILED);
     assert_eq!(f.events()[0].reason, AuditReason::PreauthUnacceptable);
     assert!(f.keyd_records().is_empty());
     // Two timestamps are ambiguous.
-    let mut spec = AsReqSpec::alice();
+    let mut spec = AsReqSpec::machine();
     spec.padata = Some(vec![
-        pa_enc_timestamp(&alice_key(AES256), now()),
-        pa_enc_timestamp(&alice_key(AES128), now()),
+        pa_enc_timestamp(&machine_key(AES256), now()),
+        pa_enc_timestamp(&machine_key(AES128), now()),
     ]);
     assert_eq!(code_of(f.send(&spec.encode())), KDC_ERR_PREAUTH_FAILED);
 }
 
-/// Decision 7 / docs/30 §2.4: a PDP Deny at AS is KDC_ERR_POLICY, decided
-/// after keyd verified the pre-authentication.
+/// Decision 7 / docs/30 §2.4: a PDP Deny at AS is KDC_ERR_POLICY (armored),
+/// decided after keyd verified the pre-authentication.
 #[test]
 fn pdp_deny_at_as_is_policy() {
     let mut setup = Setup::new();
@@ -228,21 +332,21 @@ fn pdp_deny_at_as_is_policy() {
         obligations: Vec::new(),
     });
     let mut f = setup.build();
-    let reply = f.send(
-        &AsReqSpec::alice()
-            .with_timestamp(&alice_key(AES256))
-            .encode(),
-    );
-    assert_eq!(code_of(reply), KDC_ERR_POLICY);
+    let fast = f.send_fast(&AsReqSpec::alice().with_challenge(&alice_key(AES256)));
+    let error = open_fast_error(fast.reply, &fast.armor_key);
+    assert_eq!(error.outer.error_code, KDC_ERR_POLICY);
     assert_eq!(
         f.events()[0].reason,
         AuditReason::PolicyDenied(pdp::ReasonCode::CoarseDeny(RuleId(9)))
     );
     // verify_preauth ran (and succeeded); issue_as_rep never did.
     let records = f.keyd_records();
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].op, keyd::Operation::VerifyPreauth);
-    assert_eq!(records[0].result, keyd::AuditOutcome::Success);
+    let verify = records
+        .iter()
+        .find(|r| r.op == keyd::Operation::VerifyPreauth)
+        .unwrap();
+    assert_eq!(verify.result, keyd::AuditOutcome::Success);
+    assert!(!f.keyd_ops().contains(&keyd::Operation::IssueAsRep));
 }
 
 /// Decision 7 / docs/11 §2, §8: a PDP Allow without a matching grant (no
@@ -252,11 +356,9 @@ fn pdp_no_grant_and_rate_limit_are_policy() {
     let mut setup = Setup::new();
     setup.rules.clear();
     let mut f = setup.build();
-    let reply = f.send(
-        &AsReqSpec::alice()
-            .with_timestamp(&alice_key(AES256))
-            .encode(),
-    );
+    let reply = f
+        .send_fast(&AsReqSpec::alice().with_challenge(&alice_key(AES256)))
+        .reply;
     assert_eq!(code_of(reply), KDC_ERR_POLICY);
     assert_eq!(
         f.events()[0].reason,
@@ -265,11 +367,9 @@ fn pdp_no_grant_and_rate_limit_are_policy() {
 
     let mut f = Fixture::new();
     f.kdc.rate_limiter_mut().refuse = true;
-    let reply = f.send(
-        &AsReqSpec::alice()
-            .with_timestamp(&alice_key(AES256))
-            .encode(),
-    );
+    let reply = f
+        .send_fast(&AsReqSpec::alice().with_challenge(&alice_key(AES256)))
+        .reply;
     assert_eq!(code_of(reply), KDC_ERR_POLICY);
     assert_eq!(f.events()[0].reason, AuditReason::RateLimited);
     let key = &f.kdc.rate_limiter_mut().seen[0];
@@ -278,7 +378,7 @@ fn pdp_no_grant_and_rate_limit_are_policy() {
 
 /// Decision 8: a disabled, locked or expired client is
 /// KDC_ERR_CLIENT_REVOKED — checked before pre-authentication, so keyd is
-/// never asked (no password oracle for a locked account).
+/// never asked to verify (no password oracle for a locked account).
 #[test]
 fn revoked_client_at_as() {
     for change in 0..3 {
@@ -289,13 +389,11 @@ fn revoked_client_at_as() {
             1 => account.state.locked = true,
             _ => account.state.expires = Some(now()),
         }
-        let reply = f.send(
-            &AsReqSpec::alice()
-                .with_timestamp(&alice_key(AES256))
-                .encode(),
-        );
+        let reply = f
+            .send_fast(&AsReqSpec::alice().with_challenge(&alice_key(AES256)))
+            .reply;
         assert_eq!(code_of(reply), KDC_ERR_CLIENT_REVOKED, "case {change}");
-        assert!(f.keyd_records().is_empty());
+        assert!(!f.keyd_ops().contains(&keyd::Operation::VerifyPreauth));
     }
 }
 
@@ -315,17 +413,18 @@ fn account_expiry_caps_endtime() {
 
 /// Decision 9 / RFC 4120 5.4.1: each operation option phase 1 lacks is
 /// KDC_ERR_BADOPTION — FORWARDED (2), PROXY (4), ALLOW-POSTDATE (5),
-/// POSTDATED (6), ENC-TKT-IN-SKEY (28), RENEW (30), VALIDATE (31).
+/// POSTDATED (6), ENC-TKT-IN-SKEY (28), RENEW (30), VALIDATE (31) — decided
+/// on the inner request, before any pre-authentication.
 #[test]
 fn operation_options_are_badoption_at_as() {
     for bit in [2, 4, 5, 6, 28, 30, 31] {
         let mut f = Fixture::new();
         let mut spec = AsReqSpec::alice();
         spec.options = options(&[bit]);
-        let reply = f.send(&spec.with_timestamp(&alice_key(AES256)).encode());
+        let reply = f.send_fast(&spec.with_challenge(&alice_key(AES256))).reply;
         assert_eq!(code_of(reply), KDC_ERR_BADOPTION, "bit {bit}");
         assert_eq!(f.events()[0].reason, AuditReason::UnsupportedOption);
-        assert!(f.keyd_records().is_empty());
+        assert!(!f.keyd_ops().contains(&keyd::Operation::VerifyPreauth));
     }
 }
 
@@ -415,12 +514,16 @@ fn ticket_times_follow_rfc4120_3_1_3() {
     );
     for till in [kt("20261113090000Z"), kt("20261113100200Z")] {
         spec.till = till;
-        let reply = f.send(&spec.clone().with_timestamp(&alice_key(AES256)).encode());
+        let reply = f
+            .send_fast(&spec.clone().with_challenge(&alice_key(AES256)))
+            .reply;
         assert_eq!(code_of(reply), KDC_ERR_NEVER_VALID);
     }
     spec.till = kt("20261113180000Z");
     spec.from = Some(at(301));
-    let reply = f.send(&spec.clone().with_timestamp(&alice_key(AES256)).encode());
+    let reply = f
+        .send_fast(&spec.clone().with_challenge(&alice_key(AES256)))
+        .reply;
     assert_eq!(code_of(reply), KDC_ERR_CANNOT_POSTDATE);
     spec.from = Some(at(-3600));
     assert_eq!(obtain_tgt_with(&mut f, spec).part.0.authtime, now());
@@ -435,22 +538,34 @@ fn realm_and_server_rules_at_as() {
     let mut f = Fixture::new();
     let mut spec = AsReqSpec::alice();
     spec.realm = krb_proto::Realm::new("OTHER.ORG").unwrap();
-    assert_eq!(code_of(f.send(&spec.encode())), KDC_ERR_C_PRINCIPAL_UNKNOWN);
+    assert_eq!(
+        code_of(f.send_fast(&spec).reply),
+        KDC_ERR_C_PRINCIPAL_UNKNOWN
+    );
 
     let mut spec = AsReqSpec::alice();
     spec.sname = Some(name(KRB_NT_SRV_INST, &["krbtgt", "OTHER.ORG"]));
-    assert_eq!(code_of(f.send(&spec.encode())), KDC_ERR_S_PRINCIPAL_UNKNOWN);
+    assert_eq!(
+        code_of(f.send_fast(&spec).reply),
+        KDC_ERR_S_PRINCIPAL_UNKNOWN
+    );
 
     let mut spec = AsReqSpec::alice();
     spec.sname = Some(service_name());
-    assert_eq!(code_of(f.send(&spec.encode())), KDC_ERR_POLICY);
+    assert_eq!(code_of(f.send_fast(&spec).reply), KDC_ERR_POLICY);
 
     let mut spec = AsReqSpec::alice();
     spec.cname = None;
-    assert_eq!(code_of(f.send(&spec.encode())), KDC_ERR_C_PRINCIPAL_UNKNOWN);
+    assert_eq!(
+        code_of(f.send_fast(&spec).reply),
+        KDC_ERR_C_PRINCIPAL_UNKNOWN
+    );
     let mut spec = AsReqSpec::alice();
     spec.sname = None;
-    assert_eq!(code_of(f.send(&spec.encode())), KDC_ERR_S_PRINCIPAL_UNKNOWN);
+    assert_eq!(
+        code_of(f.send_fast(&spec).reply),
+        KDC_ERR_S_PRINCIPAL_UNKNOWN
+    );
 }
 
 /// RFC 4120 5.4.1 / docs/10 §5: requested addresses cannot be honoured
@@ -464,23 +579,21 @@ fn addresses_are_badoption() {
         addr_type: 2,
         address: vec![192, 0, 2, 1],
     }]));
-    let reply = f.send(&spec.clone().with_timestamp(&alice_key(AES256)).encode());
+    let reply = f
+        .send_fast(&spec.clone().with_challenge(&alice_key(AES256)))
+        .reply;
     assert_eq!(code_of(reply), KDC_ERR_BADOPTION);
     spec.addresses = Some(HostAddresses(Vec::new()));
     obtain_tgt_with(&mut f, spec);
 }
 
 /// Decision 3: an account-source failure fails closed (KRB_ERR_GENERIC, no
-/// detail), before keyd is asked.
+/// detail), before keyd is asked (unarmored: R6 runs before the FAST gate).
 #[test]
 fn account_source_failure_fails_closed() {
     let mut f = Fixture::new();
     f.accounts().set_unavailable(true);
-    let reply = f.send(
-        &AsReqSpec::alice()
-            .with_timestamp(&alice_key(AES256))
-            .encode(),
-    );
+    let reply = f.send(&AsReqSpec::alice().encode());
     let error = error_of(reply);
     assert_eq!(error.error_code, KRB_ERR_GENERIC);
     assert!(error.e_text.is_none());
