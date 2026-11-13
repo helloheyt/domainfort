@@ -313,7 +313,8 @@ fn code_tables_are_closed() {
     assert_eq!(EventShape::DirAdmin.code(), 5);
     assert_eq!(EventShape::Admind.code(), 6);
     assert_eq!(table!(DirAdminOperation), 18);
-    assert_eq!(table!(AdminRefusal), 18);
+    // Task A3 appended `SelfLockout` (Q-295 item 4, P-22).
+    assert_eq!(table!(AdminRefusal), 19);
     assert_eq!(table!(AdminFailure), 4);
     assert_eq!(table!(FrameErrorCode), 15);
     table!(AdminPhase);

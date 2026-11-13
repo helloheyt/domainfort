@@ -11,9 +11,12 @@
 //! - the rule model of docs/11 §3 and the versioned [`PolicySnapshot`]
 //!   ([`policy`]) — explicit Deny wins, no matching Allow ⇒ Deny;
 //! - [`decide`], exactly the five layers of docs/11 §4 — authn, transport
-//!   floor (`required_sec`), coarse global rules, the Tier-0 write invariant
-//!   *before* the ACL, then the object ACL and the attribute class — each
-//!   deny-by-default, an explicit Deny at any layer stopping immediately;
+//!   floor (`required_sec`; on the admin plane's local socket,
+//!   [`Transport::LocalIpc`], a write needs no channel binding —
+//!   [`required_sec_on`], A-74 / Q-292), coarse global rules, the Tier-0
+//!   write invariant *before* the ACL, then the object ACL and the attribute
+//!   class — each deny-by-default, an explicit Deny at any layer stopping
+//!   immediately;
 //! - [`acl_grants`] (docs/11 §5), the [MS-DTYP] 2.5.3.2 access check over
 //!   `dtyp` types combined with the [MS-ADTS] 5.1.3.3.x directory-object
 //!   rules (object-type GUIDs, property sets and properties, control access
@@ -131,7 +134,7 @@ pub mod policy;
 mod visibility;
 
 pub use access_check::{acl_grants, dacl_preconditions, DaclRefusal, DirObjectContext, Right};
-pub use decide::{decide, is_write, required_sec};
+pub use decide::{decide, is_write, required_sec, required_sec_on};
 pub use mandatory_fast::{mandatory_fast_rules, MANDATORY_FAST_RULE_COUNT};
 pub use model::{
     AccessRequest, Action, ActionClass, AttrId, AuthContext, AuthStrength, ClaimId, ClaimValue,

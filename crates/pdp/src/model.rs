@@ -474,10 +474,11 @@ pub enum Transport {
     /// (docs/49 §4.3 names `Ldaps` for 636 and for 389 after StartTLS, and
     /// nothing for 389 before it). Recorded so the LDAP PEP reports the
     /// transport truthfully; the security state it carries is
-    /// `Context.transport_sec`, which is what [`crate::decide`] reads —
-    /// `decide` reads no `Context.transport` value, so this variant changes
-    /// no decision. Spec: docs/49 §4.3, §4.4; docs/questions/Q-190 item 2
-    /// (A-54).
+    /// `Context.transport_sec`, which is what [`crate::decide`] reads. The
+    /// only `Context.transport` value `decide` acts on is
+    /// [`Transport::LocalIpc`] (its write floor, [`crate::required_sec_on`]),
+    /// so this variant changes no decision. Spec: docs/49 §4.3, §4.4;
+    /// docs/questions/Q-190 item 2 (A-54).
     Ldap,
     /// LDAP over TLS.
     Ldaps,
@@ -493,6 +494,25 @@ pub enum Transport {
     Dns,
     /// Kerberos (KDC).
     Kerberos,
+    /// A Unix-domain socket on the DC host itself: the admin plane's
+    /// `dird-admin.sock` channel (admind → dird), whose peer is identified
+    /// by its peer credentials and whose bytes never leave the host's
+    /// kernel, with no encryption layer of its own (A-57 / Q-214). Its PEP
+    /// reports `{encrypted: true, sealed: true, channel_bound: false}`: the
+    /// AP-REQ that carries each request is not yet bound to the operation
+    /// (the Authenticator's `cksum`, "a checksum of the application data
+    /// that accompanies the KRB_AP_REQ" — RFC 4120 §5.5.1 — is task A15).
+    ///
+    /// On this transport — and on no other — a write's floor does not
+    /// require `channel_bound` ([`crate::required_sec_on`]); a network PEP
+    /// never reports it. Documented residual: until the `cksum` binding
+    /// lands, a compromised admind could attach a valid administrator AP-REQ
+    /// (one-time, within the clock skew) to another operation; admind is
+    /// Tier-0-equivalent in phase 1 anyway (docs/51 §5.8).
+    ///
+    /// Spec: docs/51 §5.4 (R51-9), §7.1; docs/questions/Q-292 (decided A-74,
+    /// option (a)); A-57 / Q-214 (the local channel); RFC 4120 §5.5.1.
+    LocalIpc,
 }
 
 /// Security properties of the transport. Spec: docs/11 §1 (`{ encrypted,

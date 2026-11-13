@@ -67,23 +67,36 @@ impl TierMap {
     /// The most privileged tier the map gives to any of `sids`, if any.
     /// Spec: docs/47 §6.3 ("the minimum ... over the map values for
     /// {p} ∪ g").
-    pub(crate) fn principal_tier<'s>(
-        &self,
-        sids: impl IntoIterator<Item = &'s Sid>,
-    ) -> Option<Tier> {
+    pub fn principal_tier<'s>(&self, sids: impl IntoIterator<Item = &'s Sid>) -> Option<Tier> {
         sids.into_iter()
             .filter_map(|s| self.principals.get(s).copied())
             .min()
     }
 
-    /// The most privileged tier of the subtrees that contain `dn`, if any.
+    /// The most privileged tier of the subtrees that contain `dn`, if any
+    /// (`None`: no subtree entry classifies `dn`).
     /// Spec: docs/47 §6.3 ("DN subtree → Tier0"); A-36; pdp `Dn::is_within`.
-    pub(crate) fn subtree_tier(&self, dn: &Dn) -> Option<Tier> {
+    pub fn subtree_tier(&self, dn: &Dn) -> Option<Tier> {
         self.subtrees
             .iter()
             .filter(|(base, _)| dn.is_within(base))
             .map(|(_, tier)| *tier)
             .min()
+    }
+
+    /// Every `SID → Tier` entry, in SID order. Added for the admin plane
+    /// (docs/51 §12 task A3): it protects the groups the policy names from
+    /// deletion and counts the enabled Tier-0 administrators (Q-295 item 4).
+    /// Spec: docs/47 §6.3; docs/51 §5.2 row 9; A-18.
+    pub fn principals(&self) -> impl Iterator<Item = (&Sid, Tier)> + '_ {
+        self.principals.iter().map(|(sid, tier)| (sid, *tier))
+    }
+
+    /// Every `DN subtree → Tier` entry, in the order given. Added for the
+    /// admin plane (task A3): a subtree base the policy names is protected
+    /// from deletion. Spec: docs/47 §6.3; docs/51 §5.2 row 9.
+    pub fn subtrees(&self) -> impl Iterator<Item = (&Dn, Tier)> + '_ {
+        self.subtrees.iter().map(|(dn, tier)| (dn, *tier))
     }
 }
 

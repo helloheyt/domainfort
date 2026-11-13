@@ -1,0 +1,57 @@
+# directory-admin — the admin plane's write PEP (docs/51 §12, task A3).
+#
+# A library only: no socket, no thread, no clock (the caller passes `now`).
+# dird's admin service (task A8) verifies each AP-REQ through keyd, then
+# calls `DirectoryAdmin::prepare` (Subject, PDP, dual control, the [MS-SAMR]
+# checks of docs/51 §11, the self-lockout guard; it returns the planned
+# `DirAdmin` decision event), sends that event and waits for auditd's
+# acknowledgement, then calls `DirectoryAdmin::apply` inside its dirstore
+# `WriteTxn` (GUID from the CSPRNG, RID and change-seq from the counters,
+# security descriptor, the write itself; it returns the outcome event),
+# commits, and sends the outcome event.
+#
+# Written only from docs/51 (decided A-72) and the decisions A-73..A-79,
+# A-83..A-85 and P-22, docs/47, docs/46, docs/11, docs/32, the questions
+# Q-290..Q-299, Q-330, Q-335, Q-336, Q-340, the public APIs of this
+# workspace's crates, and the pinned [MS-SAMR] v20260427, [MS-ADTS]
+# v20261026 and RFC 4120 sections cited in the source, opened in-session from
+# tools/spec-pin/cache/ (SHA-256 verified against the manifest) —
+# AGENTS.md §1-3. No other implementation was consulted or recalled.
+
+[package]
+name = "directory-admin"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Our own workspace crates only (path dependencies). No external crate
+# (AGENTS.md §7).
+#
+# The directory store: Snapshot, WriteTxn (create / modify / delete), the
+# named counters (A-83), NewObject, AttributeChange, Origin.
+dirstore = { path = "../dirstore" }
+# The phase-1 schema: attribute / class ids by name, class chains,
+# schemaIDGUIDs, the groupType / userAccountControl flag values.
+ad-schema = { path = "../ad-schema" }
+# SID, GUID, SECURITY_DESCRIPTOR and CreateSecurityDescriptor (A-84).
+dtyp = { path = "../dtyp" }
+# The policy decision point: decide, Subject, Action, Resource, Transport.
+pdp = { path = "../pdp" }
+# The per-request directory view (AccountSource + Pip over one snapshot),
+# the tier map, account_salt, the DSTIME mapping.
+directory-pip = { path = "../directory-pip" }
+# The AccountSource trait the view implements (the requester's account is
+# resolved exactly as the KDC resolves an AS client, docs/51 §5.3).
+kdc = { path = "../kdc" }
+# keyd's crypto-free types: KeyHandle, KeyPurpose, PrincipalBinding (the
+# BeginPasswordSet reply), ServiceContext (the verified ticket's facts) and
+# the KerberosTime-to-seconds mapping. NOT keyd and NOT krb-crypto (D182).
+keyd-types = { path = "../keyd-types" }
+# Realm, PrincipalName, KerberosString, KerberosTime and the name types.
+krb-proto = { path = "../krb-proto" }
+# The `DirAdmin` audit event this crate plans (A-85). No conversion feature.
+ipc-audit = { path = "../ipc-audit" }
+
+[lints]
+workspace = true

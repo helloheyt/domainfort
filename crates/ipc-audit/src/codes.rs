@@ -643,7 +643,10 @@ code_table! {
     ///   reply says "not found", docs/11 §7 as cited in §5.2 row 10; the log
     ///   keeps the difference, as the LDAP events do).
     /// * `Conflict` — a unique value is taken at the commit (docs/46 §8.5,
-    ///   as cited in §11).
+    ///   as cited in §11); also used by `directory-admin` (task A3) when the
+    ///   state the write depends on changed between the decision and the
+    ///   commit, or a container to delete still has children — the write
+    ///   meets a directory that no longer matches the decision.
     /// * `RidExhausted` — no RID is left in the range (§8.3, fail closed).
     /// * `PendingUnknown` — the pending key-operation request id is unknown
     ///   or expired (§5.6: in dird's memory, with a TTL).
@@ -651,9 +654,13 @@ code_table! {
     ///   number).
     /// * `NotApproved` — `FetchApproved` / `Complete` for a request not
     ///   (yet) approved (§6).
+    /// * `SelfLockout` — the self-lockout guard: a disable, delete, expiry
+    ///   or membership removal that would leave fewer enabled Tier-0
+    ///   administrators than the dual-control quorum (Q-295 item 4, owner
+    ///   item P-22). Appended by task A3: no earlier code names this check.
     ///
     /// Spec: docs/51 §5.2, §5.5, §5.6, §6, §7.4, §8.3, §11;
-    /// docs/questions/Q-340 item 3.
+    /// docs/questions/Q-340 item 3; Q-295 item 4 (P-22).
     pub enum AdminRefusal {
         Unauthenticated,
         TicketAge,
@@ -673,6 +680,7 @@ code_table! {
         PendingUnknown,
         PendingLimit,
         NotApproved,
+        SelfLockout,
     }
 }
 

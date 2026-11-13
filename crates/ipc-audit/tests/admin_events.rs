@@ -396,8 +396,9 @@ fn dir_admin_phase_and_result_tables() {
     let mut b = patched(at.phase, 2);
     b[at.result] = 1;
     assert_eq!(decode_event(&b), codec(ipc::Error::InvalidBoolean));
-    // Codes past the refusal table.
-    for code in [0u8, 19, 0xFF] {
+    // Codes past the refusal table (19 entries since task A3 appended
+    // `SelfLockout`).
+    for code in [0u8, 20, 0xFF] {
         assert_eq!(
             decode_event(&patched(at.detail, code)),
             codec(ipc::Error::UnknownCode)

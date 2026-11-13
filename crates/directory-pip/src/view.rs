@@ -707,13 +707,21 @@ impl DirectoryView<'_> {
         }))
     }
 
-    /// `object_tier` of a directory object (docs/47 §6.3; A-36): the most
-    /// privileged of every classification that applies — the subtree
+    /// `object_tier` of a directory object (docs/47 §6.3; A-36): its
+    /// classification ([`DirectoryView::classified_tier`]); no
+    /// classification ⇒ Tier0 (an unclassified resource is Tier0 for writes,
+    /// A-36).
+    fn dir_object_tier(&self, dn: &Dn) -> Result<Tier, Fault> {
+        Ok(self.classified_tier(dn)?.unwrap_or(Tier::Tier0))
+    }
+
+    /// The classification of a directory object (docs/47 §6.3; A-36): the
+    /// most privileged of every classification that applies — the subtree
     /// entries containing it; for an account or group, the map tier of its
     /// objectSid and expanded groups; Tier0 for the naming-context root, the
-    /// krbtgt account and a DC account (ST). No classification ⇒ Tier0 (an
-    /// unclassified resource is Tier0 for writes, A-36).
-    fn dir_object_tier(&self, dn: &Dn) -> Result<Tier, Fault> {
+    /// krbtgt account and a DC account (ST). `None` when nothing classifies
+    /// it — the case A-36 makes Tier0 for writes.
+    fn classified_tier(&self, dn: &Dn) -> Result<Option<Tier>, Fault> {
         let ids = self.ctx.ids;
         let obj = self.resolve(dn)?;
         let class = self.most_specific_class(&obj)?;
@@ -738,7 +746,27 @@ impl DirectoryView<'_> {
                 .principal_tier(core::iter::once(&sid).chain(groups.iter()));
             tier = most_privileged(tier, mapped);
         }
-        Ok(tier.unwrap_or(Tier::Tier0))
+        Ok(tier)
+    }
+
+    /// The explicit classification of a directory object: what
+    /// `Pip::object_tier` would answer **before** the A-36 default — `None`
+    /// when no subtree entry, no map entry of its SID or groups, and no
+    /// structural rule (NC root, krbtgt, DC account) classifies it. Added for
+    /// the admin plane (docs/51 §12 task A3): dual control is required for a
+    /// write to an object that is explicitly Tier0, and not for one that is
+    /// Tier0 only because it is unclassified (Q-295 item 1, P-22).
+    /// Spec: docs/47 §6.3 (R47-9); A-36; docs/51 §5.6; P-22.
+    pub fn classified_object_tier(&self, dn: &Dn) -> Result<Option<Tier>, PipError> {
+        Ok(self.classified_tier(dn)?)
+    }
+
+    /// The tier map this view was taken with (the request's policy
+    /// version). Added for the admin plane (task A3). Spec: docs/47 §6.3,
+    /// §8.1.
+    #[must_use]
+    pub fn tier_map(&self) -> &TierMap {
+        self.tiers
     }
 
     /// The AttrId of a pdp attribute identifier (its schemaIDGUID).

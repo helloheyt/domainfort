@@ -186,6 +186,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "directory-admin"
+version = "0.0.0"
+dependencies = [
+ "ad-schema",
+ "directory-pip",
+ "dirstore",
+ "dtyp",
+ "ipc-audit",
+ "kdc",
+ "keyd-types",
+ "krb-proto",
+ "pdp",
+]
+
+[[package]]
 name = "directory-daemon"
 version = "0.0.0"
 dependencies = [
