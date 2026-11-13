@@ -17,7 +17,16 @@
 pub const MAX_MESSAGE_LEN: usize = 256 * 1024;
 
 /// Maximum number of PA-DATA elements in KDC-REQ `padata`, KDC-REP `padata`
-/// and METHOD-DATA. Spec context: RFC 4120 5.2.7, 5.4.1, 5.4.2, 5.9.1.
+/// and METHOD-DATA, and in the FAST typed holes KrbFastReq `padata` and
+/// KrbFastResponse `padata`. Spec context: RFC 4120 5.2.7, 5.4.1, 5.4.2,
+/// 5.9.1.
+///
+/// The FAST fields share this bound because they carry the same items: the
+/// client "MUST place any padata that is otherwise in the outer KDC request
+/// body" into KrbFastReq `padata` (RFC 6113 5.4.2), and the KDC "MUST include
+/// any padata that are otherwise in the outer KDC-REP or KDC-ERROR structure"
+/// in KrbFastResponse `padata` (5.4.3, 5.4.4), whose outer padata then
+/// "typically includes only the PA-FX-FAST-REPLY padata" (5.4.3).
 pub const MAX_PADATA: usize = 32;
 
 /// Maximum number of components in PrincipalName `name-string`.

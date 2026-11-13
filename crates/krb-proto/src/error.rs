@@ -52,8 +52,22 @@ pub enum Error {
     /// A SEQUENCE component carried a context tag number that the type does not
     /// define. The Appendix A module has no extension marker, and RFC 4120 1.5
     /// / 1.5.1 state that extension is by typed holes, not by adding fields.
-    /// Spec: RFC 4120 1.5, 1.5.1, 5.1.4, 5.1.5 (fail closed: return an error).
+    /// The RFC 6113 Appendix B (FAST) types do end in an extension marker;
+    /// an undefined component is rejected there too until it is defined (fail
+    /// closed; see docs/questions/Q-032).
+    /// Spec: RFC 4120 1.5, 1.5.1, 5.1.4, 5.1.5 (fail closed: return an error);
+    /// RFC 6113 Appendix B.
     UnknownField,
+
+    /// A CHOICE value was not one of the alternatives its type defines: it was
+    /// not a context tag, or its context tag number selects no alternative.
+    /// PA-FX-FAST-REQUEST and PA-FX-FAST-REPLY define only `armored-data [0]`;
+    /// their extension marker leaves room for future alternatives, none of
+    /// which is accepted until it is defined (fail closed; see
+    /// docs/questions/Q-032).
+    /// Spec: RFC 6113 5.4.2, 5.4.3, Appendix B; X.690 8.13 (a choice value is
+    /// encoded as the chosen alternative, carrying that alternative's tag).
+    UnknownChoiceAlternative,
 
     /// SEQUENCE components were not in the order of their definition
     /// (ascending context tag numbers in every RFC 4120 type).
@@ -169,6 +183,7 @@ impl fmt::Display for Error {
             Error::ExpectedSequence => "expected a SEQUENCE",
             Error::ExpectedContextTag => "SEQUENCE component is not context-tagged",
             Error::UnknownField => "context tag number not defined for this type",
+            Error::UnknownChoiceAlternative => "value is not a defined CHOICE alternative",
             Error::FieldOutOfOrder => "SEQUENCE components out of definition order",
             Error::DuplicateField => "SEQUENCE component repeated",
             Error::MissingField => "required SEQUENCE component absent",

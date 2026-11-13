@@ -43,6 +43,15 @@ fn all_decoders(data: &[u8]) {
     check!(krb_proto::EncryptedData, data);
     check!(krb_proto::EncryptionKey, data);
     check!(krb_proto::PrincipalName, data);
+    // RFC 6113 FAST types (their own seeds are exercised in tests/fast.rs).
+    check!(krb_proto::PaFxFastRequest, data);
+    check!(krb_proto::KrbFastArmoredReq, data);
+    check!(krb_proto::KrbFastArmor, data);
+    check!(krb_proto::KrbFastReq, data);
+    check!(krb_proto::PaFxFastReply, data);
+    check!(krb_proto::KrbFastArmoredRep, data);
+    check!(krb_proto::KrbFastResponse, data);
+    check!(krb_proto::KrbFastFinished, data);
 }
 
 /// Seeds: a TGT, a service ticket, an AP-REQ around the TGT, an AS-REQ body,

@@ -21,9 +21,14 @@
 //!   [`EncTgsRepPart`], [`EncKdcRepPart`], [`LastReq`];
 //! - AP exchange (5.5): [`ApReq`], [`Authenticator`], [`ApRep`],
 //!   [`EncApRepPart`];
-//! - [`KrbError`] and [`MethodData`] (5.9.1).
+//! - [`KrbError`] and [`MethodData`] (5.9.1);
+//! - FAST (RFC 6113 5.4): [`PaFxFastRequest`], [`KrbFastArmoredReq`],
+//!   [`KrbFastArmor`], [`KrbFastReq`], [`FastOptions`], [`PaFxFastReply`],
+//!   [`KrbFastArmoredRep`], [`KrbFastResponse`], [`KrbFastFinished`],
+//!   [`EncryptedChallenge`]. The FAST types carry RFC 6113 extension markers
+//!   but undefined components are still rejected (docs/questions/Q-032).
 //!
-//! Not here (later tasks): FAST (RFC 6113), KRB-SAFE / KRB-PRIV / KRB-CRED,
+//! Not here (later tasks): KRB-SAFE / KRB-PRIV / KRB-CRED,
 //! the AD-* authorization containers, TYPED-DATA. Weak or excluded mechanisms
 //! have no code path: PA-PW-SALT / ETYPE-INFO are not implemented, and no
 //! encryption-type numbers are defined here (etype policy is the crypto
@@ -80,7 +85,8 @@
 //! `zeroize::Zeroizing` buffer (wiped on drop), redacted in `Debug`, never put
 //! in an error (no [`Error`] variant carries input content). Types that carry
 //! a key ([`EncryptionKey`], [`EncTicketPart`], [`EncAsRepPart`],
-//! [`EncTgsRepPart`], [`Authenticator`], [`EncApRepPart`]) scrub the
+//! [`EncTgsRepPart`], [`Authenticator`], [`EncApRepPart`],
+//! [`KrbFastResponse`]) scrub the
 //! intermediate `parse-asn1` value tree on decode and encode, and return their
 //! encoding in a `Zeroizing<Vec<u8>>`. Residual: transient buffers allocated
 //! inside `parse-asn1` while encoding (and the caller's own input buffer) are
@@ -100,11 +106,11 @@
 //!
 //! Written only from the allowed specifications, opened in-session
 //! (AGENTS.md §1-3): RFC 4120 (§1.5, §5, §6.2, §7.5, Appendix A), ITU-T X.680
-//! (02/2021) clauses 22 and 46 and Table 8, and ITU-T X.690 (02/2021) clauses
-//! 8.6, 8.9, 8.10, 8.14 and 11.7. No other implementation was consulted or
-//! recalled.
+//! (02/2021) clauses 22 and 46 and Table 8, ITU-T X.690 (02/2021) clauses
+//! 8.6, 8.9, 8.10, 8.13, 8.14 and 11.7, and RFC 6113 (§5.2, §5.4, §6, §7,
+//! Appendix B) for FAST. No other implementation was consulted or recalled.
 //!
-//! Spec: RFC 4120 §5, Appendix A.
+//! Spec: RFC 4120 §5, Appendix A; RFC 6113 §5.4, Appendix B.
 
 #[macro_use]
 mod macros;
@@ -114,6 +120,7 @@ mod basic;
 pub mod constants;
 mod der;
 mod error;
+mod fast;
 mod flags;
 mod kdc;
 mod krb_error;
@@ -128,7 +135,11 @@ pub use basic::{
     Realm,
 };
 pub use error::{Error, Result};
-pub use flags::{ApOptions, KdcOptions, KerberosFlags, TicketFlags};
+pub use fast::{
+    EncryptedChallenge, KrbFastArmor, KrbFastArmoredRep, KrbFastArmoredReq, KrbFastFinished,
+    KrbFastReq, KrbFastResponse, PaFxFastReply, PaFxFastRequest,
+};
+pub use flags::{ApOptions, FastOptions, KdcOptions, KerberosFlags, TicketFlags};
 pub use kdc::{
     AsRep, AsReq, EncAsRepPart, EncKdcRepPart, EncTgsRepPart, KdcRep, KdcReq, KdcReqBody,
     KdcRequest, LastReq, LastReqEntry, TgsRep, TgsReq,

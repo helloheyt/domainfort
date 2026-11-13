@@ -1,11 +1,16 @@
-//! Protocol constants, transcribed from the RFC 4120 tables opened in-session.
+//! Protocol constants, transcribed from the RFC 4120 and RFC 6113 tables opened
+//! in-session.
 //!
 //! Names are the RFC's own labels with hyphens written as underscores
 //! (AGENTS.md §4.4). Only the constants the in-scope messages (AS / TGS / AP /
-//! KRB-ERROR) use are defined; values for out-of-scope or excluded mechanisms
-//! (e.g. PA-PW-SALT, PA-ETYPE-INFO, KRB-SAFE/PRIV/CRED) are deliberately absent.
+//! KRB-ERROR, and FAST armoring of AS / TGS) use are defined; values for
+//! out-of-scope or excluded mechanisms (e.g. PA-PW-SALT, PA-ETYPE-INFO,
+//! KRB-SAFE/PRIV/CRED, the RFC 6113 5.3 authentication sets) are deliberately
+//! absent. Key usage numbers (RFC 4120 7.5.1, RFC 6113 6.2) belong to the
+//! crypto layer and are not defined here.
 //!
-//! Spec: RFC 4120 5.10, 7.5.2, 7.5.5, 7.5.6, 7.5.7, 7.5.8, 7.5.9.
+//! Spec: RFC 4120 5.10, 7.5.2, 7.5.5, 7.5.6, 7.5.7, 7.5.8, 7.5.9; RFC 6113
+//! 6.1, 6.4, 7.1, 7.2.
 
 // --- Protocol version number. Spec: RFC 4120 7.5.6; 5.2.4. -------------------
 
@@ -90,6 +95,31 @@ pub const PA_TGS_REQ: i32 = 1;
 pub const PA_ENC_TIMESTAMP: i32 = 2;
 /// padata-value is the DER encoding of ETYPE-INFO2. Spec: RFC 4120 7.5.2, 5.2.7.5.
 pub const PA_ETYPE_INFO2: i32 = 19;
+
+// --- FAST pre-authentication data types. Spec: RFC 6113 6.4 (also 7.1). -----
+
+/// Stateless cookie: padata-value is an opaque token the KDC issues and the
+/// client copies unchanged into its next message (no ASN.1 type).
+/// Spec: RFC 6113 5.2 ("PA-FX-COOKIE 133"), 6.4, 7.1.
+pub const PA_FX_COOKIE: i32 = 133;
+/// Kerberos FAST: padata-value is the DER encoding of PA-FX-FAST-REQUEST in a
+/// request and of PA-FX-FAST-REPLY in a reply or KRB-ERROR METHOD-DATA; empty
+/// when the KDC advertises FAST.
+/// Spec: RFC 6113 5.4.2 ("PA-FX-FAST 136"), 5.4.3, 5.4.4, 6.4, 7.1.
+pub const PA_FX_FAST: i32 = 136;
+/// padata-value is the DER encoding of a KRB-ERROR (with e-data absent),
+/// carried inside KrbFastResponse. Spec: RFC 6113 5.4.4 ("PA-FX-ERROR 137"),
+/// 6.4, 7.1.
+pub const PA_FX_ERROR: i32 = 137;
+/// padata-value is the DER encoding of EncryptedChallenge.
+/// Spec: RFC 6113 5.4.6 ("PA-ENCRYPTED-CHALLENGE 138"), 6.4, 7.1.
+pub const PA_ENCRYPTED_CHALLENGE: i32 = 138;
+
+// --- FAST armor types. Spec: RFC 6113 7.2 (also 5.4.1). ----------------------
+
+/// Ticket-based armor: armor-value is the DER encoding of an AP-REQ.
+/// Spec: RFC 6113 5.4.1 ("FX_FAST_ARMOR_AP_REQUEST 1"), 5.4.1.1, 7.2.
+pub const FX_FAST_ARMOR_AP_REQUEST: i32 = 1;
 
 // --- Transited encoding types. Spec: RFC 4120 7.5.5, 3.3.3.2. -----------------
 
@@ -234,3 +264,18 @@ pub const KDC_ERR_REVOCATION_STATUS_UNAVAILABLE: i32 = 74;
 pub const KDC_ERR_CLIENT_NAME_MISMATCH: i32 = 75;
 /// Reserved for PKINIT. Spec: RFC 4120 7.5.9.
 pub const KDC_ERR_KDC_NAME_MISMATCH: i32 = 76;
+
+// --- FAST / pre-authentication framework error codes. Spec: RFC 6113 6.1 (the
+// complete table). ------------------------------------------------------------
+
+/// The conversation is too old and must restart. Spec: RFC 6113 5.2, 6.1.
+pub const KDC_ERR_PREAUTH_EXPIRED: i32 = 90;
+/// At least one more pre-authentication message is expected (sent with a
+/// PA-FX-COOKIE). Spec: RFC 6113 5.2, 6.1.
+pub const KDC_ERR_MORE_PREAUTH_DATA_REQUIRED: i32 = 91;
+/// The PA-AUTH-SET-SELECTED does not match an offered authentication set.
+/// Spec: RFC 6113 5.3, 6.1.
+pub const KDC_ERR_PREAUTH_BAD_AUTHENTICATION_SET: i32 = 92;
+/// The KDC does not support a critical FastOptions bit.
+/// Spec: RFC 6113 5.4.2, 6.1.
+pub const KDC_ERR_UNKNOWN_CRITICAL_FAST_OPTIONS: i32 = 93;

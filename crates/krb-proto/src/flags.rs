@@ -1,4 +1,5 @@
-//! KerberosFlags and its three uses: TicketFlags, KDCOptions, APOptions.
+//! KerberosFlags and its uses: TicketFlags, KDCOptions, APOptions (RFC 4120)
+//! and FastOptions (RFC 6113).
 //!
 //! ```text
 //! KerberosFlags   ::= BIT STRING (SIZE (32..MAX))
@@ -20,7 +21,8 @@
 //! `0x8000_0000 >> n`.
 //!
 //! Spec: RFC 4120 5.2.8, 5.3 (TicketFlags), 5.4.1 (KDCOptions), 5.5.1
-//! (APOptions); X.680 (02/2021) 22.2, 22.4; X.690 (02/2021) 8.6.2.
+//! (APOptions); RFC 6113 5.4.2, 7.3 (FastOptions); X.680 (02/2021) 22.2,
+//! 22.4; X.690 (02/2021) 8.6.2.
 
 use crate::error::{Error, Result};
 use parse_asn1::Value;
@@ -232,5 +234,26 @@ flags_use! {
         USE_SESSION_KEY = 1;
         /// mutual-required(2). Spec: RFC 4120 5.5.1.
         MUTUAL_REQUIRED = 2;
+    }
+}
+
+flags_use! {
+    /// `FastOptions ::= KerberosFlags` with the named bit of RFC 6113 5.4.2.
+    ///
+    /// Bit 0 is reserved ("Reserved for future expansion of this field") and
+    /// bit 16, kdc-follow-referrals, is "reserved [REFERRALS]"; like every
+    /// other bit they are preserved but have no name here. RFC 6113 5.4.2 makes
+    /// bits 1-15 critical and bits 16 onward non-critical: a KDC that does not
+    /// support a critical option MUST fail the request with
+    /// KDC_ERR_UNKNOWN_CRITICAL_FAST_OPTIONS, and ignores unknown non-critical
+    /// ones. That check needs the KDC's set of supported options, so the KDC
+    /// makes it on the decoded value; this codec only carries the 32 bits.
+    /// (Whether reserved bit 0 is critical — 7.3 says "Bits 0-15 are
+    /// critical" — is docs/questions/Q-033.)
+    ///
+    /// Spec: RFC 6113 5.4.2, 7.3; Appendix B.
+    FastOptions {
+        /// hide-client-names(1). Spec: RFC 6113 5.4.2, 7.3.
+        HIDE_CLIENT_NAMES = 1;
     }
 }
