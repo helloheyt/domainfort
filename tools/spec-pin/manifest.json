@@ -297,6 +297,26 @@
       "sha256": "c92a3ce4d1984b4c13f1cdf74d6f76c42b0fd34b2c1b71f5dd4f7d1cc641f57d",
       "phase": "1-2",
       "blocks": []
+    },
+    {
+      "id": "ITU-T-X.690",
+      "title": "ASN.1 encoding rules: Specification of BER, CER and DER",
+      "kind": "itu-t",
+      "url": "https://www.itu.int/rec/dologin_pub.asp?lang=e&id=T-REC-X.690-202102-I!!PDF-E&type=items",
+      "revision": "02/2021 (T-REC-X.690-202102-I)",
+      "sha256": "6ac799a2d1ebed36abe39c9eac3586185bfb7db679f801e737189d6fdb1bbd6c",
+      "phase": "1",
+      "blocks": []
+    },
+    {
+      "id": "ITU-T-X.680",
+      "title": "Abstract Syntax Notation One (ASN.1): Specification of basic notation",
+      "kind": "itu-t",
+      "url": "https://www.itu.int/rec/dologin_pub.asp?lang=e&id=T-REC-X.680-202102-I!!PDF-E&type=items",
+      "revision": "02/2021 (T-REC-X.680-202102-I)",
+      "sha256": "b69dc4754f0709a7e344c886f277ed9e37a4336029593ba91bc6df6065f9ee14",
+      "phase": "1",
+      "blocks": []
     }
   ]
 }
