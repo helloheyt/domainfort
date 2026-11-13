@@ -1,0 +1,85 @@
+#![forbid(unsafe_code)]
+//! `ipc-keyd`: the keyd channel (`keyd.sock`) — its message set, the
+//! server-side dispatcher and the synchronous client that implements
+//! `kdc::KeyCustody` (docs/50 §3, §10 task P5; decision A-58).
+//!
+//! # Layers
+//!
+//! | layer | module | what it checks |
+//! |---|---|---|
+//! | channel | [`channel`] | magic, exact version, per-direction body bounds, per-field bounds, the closed kind tables (none equals `ipc::REFUSED_KIND`) |
+//! | wire | [`wire`] | fixed-order fields through `ipc` (lengths, markers, closed enum tables, no trailing octet); Kerberos values stay opaque DER |
+//! | typed | [`typed`] | every Kerberos value through `krb-proto`'s strict decoder; passwords and salt as UTF-8 |
+//! | server | [`server`] | [`dispatch`]: decode, call keyd with the **transport's** caller and the **daemon's** clock, encode |
+//! | client | [`client`] | [`KeydClient`] / [`IpcKeyd`]: server-uid check, deadline, strict reply decoding, transport failure → `Unavailable` |
+//! | socket | `unix` | [`UnixConnector`]: blocking Unix stream, peer uid via rustix (Linux; elsewhere fail closed) |
+//!
+//! # Message kinds
+//!
+//! | request kind | operation | role (docs/10 §2) | success reply kind | failure reply kind |
+//! |---|---|---|---|---|
+//! | `0x01` | `verify_preauth` | Kdc | `0x81` `AuthnProof` | `0xF1` `AuthnError` |
+//! | `0x02` | `issue_as_rep` | Kdc | `0x82` `AsRepParts` | `0xF2` `IssueError` |
+//! | `0x03` | `open_fast_armor` | Kdc | `0x83` `FastArmor` | `0xF1` |
+//! | `0x04` | `open_and_verify_tgt` | Kdc | `0x84` `TgtContext` | `0xF1` |
+//! | `0x05` | `issue_tgs_rep` | Kdc | `0x85` `TgsRepParts` | `0xF2` |
+//! | `0x06` | `seal_fast_error` | Kdc | `0x86` `EncryptedData` | `0xF3` `Error` |
+//! | `0x07` | `open_and_verify_service_ticket` | Ldap | `0x87` `ServiceContext` | `0xF1` |
+//! | `0x08` | `set_secret` | Directory | `0x88` `Kvno` | `0xF3` |
+//! | `0x09` | `verify_secret` | Directory | `0x89` `()` | `0xF3` |
+//! | `0x0A` | `create_key` | Admin | `0x8A` `Kvno` | `0xF3` |
+//! | `0x0B` | `rotate_key` | Admin | `0x8B` `Kvno` | `0xF3` |
+//! | `0x0C` | `rotate_krbtgt` | Admin | `0x8C` `Kvno` | `0xF3` |
+//! | `0x0D` | `retire_kvno` | Admin | `0x8D` `()` | `0xF3` |
+//! | `0x0E` | `destroy_key_set` | Admin | `0x8E` `()` | `0xF3` |
+//! | `0x0F` | `describe_config` | Kdc, Ldap | `0x8F` `ConfigDescription` | `0xF3` |
+//! | `0x10` | `ping` | every role | `0x90` `()` | `0xF3` |
+//! | — | (any) | — | `0xFF` shared `Refused` (A-59) | — |
+//!
+//! Roles are **not** on the wire: keyd checks the caller's role from the
+//! connection's peer credentials (docs/50 §3.2) against its compile-time
+//! capability table (docs/10 §2, I2). No message has a role field and no
+//! message has a `now` field (R50-5, A-56): the server passes the daemon's
+//! own clock to every operation.
+//!
+//! # Security
+//!
+//! `#![forbid(unsafe_code)]`. Every bound is a named constant
+//! ([`channel`]); nothing is allocated from a peer-supplied length beyond the
+//! bound. Passwords travel only in zeroizing buffers ([`ipc::Secret`] on the
+//! wire, [`typed::Password`] in a call) whose `Debug` prints nothing. No
+//! error carries frame octets (docs/50 §8.2).
+//!
+//! # Provenance
+//!
+//! Written only from this project's decided design, opened in-session:
+//! docs/50 (§1 R50-3..R50-8; §3.1-§3.7; §8.2; §9; §10; closing decision
+//! A-58), docs/10 (§1-§12), docs/questions Q-217 and Q-222 (A-56), Q-225
+//! (A-59), Q-240 (A-62), PENDING-OWNER (A-56..A-62, P-1, P-2, P-12); the code
+//! of this project's crates ipc, keyd, kdc, krb-proto and krb-crypto; and the
+//! docs.rs API pages of rustix 1.1.6 and zeroize 1.9.1 (P-2). The wire layout
+//! and every name come from docs/50 §3.3-§3.4 and keyd's API. No other
+//! implementation, serializer or RPC framework was consulted or recalled
+//! (AGENTS.md §1-3).
+//!
+//! Spec: docs/50 §3, §10 (P5); R50-3, R50-4, R50-5, R50-7, R50-8; docs/10;
+//! A-56; A-59; A-62.
+
+pub mod channel;
+pub mod client;
+pub mod server;
+pub mod typed;
+#[cfg(unix)]
+mod unix;
+pub mod wire;
+
+pub use channel::{KEYD_CHANNEL, KEYD_MAGIC, KEYD_VERSION, REPLY_LIMIT, REQUEST_LIMIT};
+pub use client::{
+    ClientConfigError, Connection, Connector, IpcKeyd, KeydClient, TransportError, Unserved,
+    DEFAULT_DEADLINE,
+};
+pub use server::{decode_request, dispatch, encode_answer, execute, Dispatch, Rejection};
+pub use typed::{Answer, Call, ConversionError, Password, TgsFast};
+#[cfg(unix)]
+pub use unix::{UnixConnection, UnixConnector};
+pub use wire::{KeydReply, KeydRequest, WireTime};

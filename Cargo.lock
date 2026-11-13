@@ -190,6 +190,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ipc-keyd"
+version = "0.0.0"
+dependencies = [
+ "dtyp",
+ "ipc",
+ "kdc",
+ "keyd",
+ "krb-crypto",
+ "krb-proto",
+ "pdp",
+ "rustix",
+ "zeroize",
+]
+
+[[package]]
 name = "kdc"
 version = "0.0.0"
 dependencies = [
