@@ -7,8 +7,12 @@
 //!                               ‖ last_good_hash:[32] ‖ break_offset:u64
 //!                               ‖ segment_octets:u64
 //! kind 0x02 PeersRefused     := unmapped:u64 ‖ over_quota:u64 ‖ last_uid:u32
+//! kind 0x03 EventsMisbound   := refused_batches:u64 ‖ last_uid:u32
 //! torn := 0x01 HeaderTruncated | 0x02 RecordTruncated
 //! ```
+//!
+//! Kind `0x03` was appended for the source binding of the admin-plane
+//! shapes (task A7, crate::binding); kinds `0x01` and `0x02` are unchanged.
 //!
 //! Fixed width, big-endian (the convention of the IPC codec and of the log,
 //! docs/50 §3.3; crates/audit-log `format`). Only identifiers and metadata:
@@ -40,11 +44,15 @@ pub const AUDITD_EVENT_FORMAT: u8 = 0xAD;
 pub const KIND_SEGMENT_RECOVERED: u8 = 0x01;
 /// Kind code: [`PeersRefused`]. Project choice.
 pub const KIND_PEERS_REFUSED: u8 = 0x02;
+/// Kind code: [`EventsMisbound`]. Project choice (docs/questions/Q-341).
+pub const KIND_EVENTS_MISBOUND: u8 = 0x03;
 
 /// Octets of an encoded [`SegmentRecovered`].
 pub const SEGMENT_RECOVERED_LEN: usize = 2 + 8 + 1 + 8 + audit_log::HASH_LEN + 8 + 8;
 /// Octets of an encoded [`PeersRefused`].
 pub const PEERS_REFUSED_LEN: usize = 2 + 8 + 8 + 4;
+/// Octets of an encoded [`EventsMisbound`].
+pub const EVENTS_MISBOUND_LEN: usize = 2 + 8 + 4;
 
 /// How a segment ends early: the two verifier breaks that mean "the file
 /// stops inside a structure" — a torn write (docs/questions/Q-250 item 8).
@@ -121,6 +129,23 @@ pub struct PeersRefused {
     pub last_uid: u32,
 }
 
+/// `Append` batches refused since the previous summary because an event in
+/// them has a shape its connection's source may not send (for example a
+/// `Kdc` event not from kdc, or a `DirAdmin` event not from dird —
+/// crate::binding).
+/// Counted, like refused connections, so a sender repeating a refused batch
+/// cannot fill the log (A-57: noise "summarised in counters").
+///
+/// Spec: docs/50 §3.2 ("closed + an audit record"); docs/51 §5.7;
+/// docs/questions/Q-218 (A-57), Q-341.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventsMisbound {
+    /// Batches refused.
+    pub refused_batches: u64,
+    /// The peer uid of the most recent refused batch.
+    pub last_uid: u32,
+}
+
 /// One auditd record payload.
 ///
 /// Spec: this module's layout.
@@ -130,6 +155,8 @@ pub enum AuditdEvent {
     SegmentRecovered(SegmentRecovered),
     /// A summary of refused connections.
     PeersRefused(PeersRefused),
+    /// A summary of batches refused by the source binding.
+    EventsMisbound(EventsMisbound),
 }
 
 impl AuditdEvent {
@@ -160,6 +187,14 @@ impl AuditdEvent {
                 out.extend_from_slice(&event.last_uid.to_be_bytes());
                 out
             }
+            AuditdEvent::EventsMisbound(event) => {
+                let mut out = Vec::with_capacity(EVENTS_MISBOUND_LEN);
+                out.push(AUDITD_EVENT_FORMAT);
+                out.push(KIND_EVENTS_MISBOUND);
+                out.extend_from_slice(&event.refused_batches.to_be_bytes());
+                out.extend_from_slice(&event.last_uid.to_be_bytes());
+                out
+            }
         }
     }
 }
@@ -170,3 +205,5 @@ const _: () = assert!(AUDITD_EVENT_FORMAT != ipc_audit::EVENT_FORMAT);
 // Both payloads fit the log's payload bounds.
 const _: () = assert!(SEGMENT_RECOVERED_LEN <= audit_log::MAX_PAYLOAD_LEN);
 const _: () = assert!(PEERS_REFUSED_LEN >= audit_log::MIN_PAYLOAD_LEN);
+const _: () = assert!(EVENTS_MISBOUND_LEN >= audit_log::MIN_PAYLOAD_LEN);
+const _: () = assert!(EVENTS_MISBOUND_LEN <= audit_log::MAX_PAYLOAD_LEN);

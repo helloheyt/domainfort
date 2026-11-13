@@ -12,7 +12,7 @@ use audit_daemon::listener::{self, BindError, ListenerConfig, MAX_CONNECTIONS_PE
 use audit_log::{Anchor, Source};
 use common::*;
 use ipc::{Refused, Reply};
-use ipc_audit::{Ack, Append, AuditReply, AuditRequest};
+use ipc_audit::{Ack, Append, AuditReply, AuditRequest, EventBody};
 use std::io::Write;
 use std::time::{Duration, Instant};
 
@@ -318,4 +318,234 @@ fn bind_replaces_a_stale_socket_but_never_another_file() {
     std::fs::write(&other, b"keep").unwrap();
     assert_eq!(listener::bind(&other).err(), Some(BindError::NotASocket));
     assert_eq!(std::fs::read(&other).unwrap(), b"keep");
+}
+
+// ---- the admin-plane shapes (docs/51 §5.7) ------------------------------------
+
+/// Source: docs/51 §5.7 item 2 (dird's decision event is acknowledged by
+/// auditd before the commit, the outcome event follows); docs/50 §3.2,
+/// §8.1. A dird-mapped connection appends a `DirAdmin` decision, gets the
+/// `Ack` (only after the sync), then appends the outcome; the on-disk chain
+/// verifies and the records decode back to the events, with the transport
+/// identity.
+#[test]
+fn dird_admin_decision_is_acknowledged_then_outcome() {
+    let Some(uid) = mappable_uid() else { return };
+    let dir = TempDir::new();
+    let settings = settings_for(&dir, uid, "dird", 5);
+    let server = Server::start(&settings, config(&settings), 8, true);
+    let pair = dir_admin_pair();
+    let octets = encoded(&pair);
+
+    let mut client = connect(&server.socket);
+    send(
+        &mut client,
+        &AuditRequest::Append(Append::new(1, vec![octets[0].clone()]).unwrap()),
+    );
+    let decision_ack = expect_ack(receive(&mut client));
+    assert_eq!(decision_ack.through_seq, 1);
+    // (dird commits only now; then the outcome.)
+    send(
+        &mut client,
+        &AuditRequest::Append(Append::new(2, vec![octets[1].clone()]).unwrap()),
+    );
+    let outcome_ack = expect_ack(receive(&mut client));
+    assert_eq!(outcome_ack.through_seq, 2);
+    drop(client);
+    assert_eq!(server.stop(), Some(Ok(())));
+
+    let (records, head) = read_segment(&dir.base(), 1, Anchor::Genesis);
+    assert_eq!(head.hash.as_bytes(), &outcome_ack.head_hash);
+    assert_eq!(records.len(), 2);
+    for (i, record) in records.iter().enumerate() {
+        assert_eq!(record.source, Source::Dird);
+        assert_eq!(record.source_uid, uid);
+        assert_eq!(record.source_seq, i as u64 + 1);
+        assert_eq!(ipc_audit::decode_event(&record.payload).unwrap(), pair[i]);
+    }
+}
+
+/// Source: docs/51 §5.7 item 3 (admind sends its own events); docs/50 §3.2.
+#[test]
+fn admind_events_are_appended() {
+    let Some(uid) = mappable_uid() else { return };
+    let dir = TempDir::new();
+    let settings = settings_for(&dir, uid, "admind", 5);
+    let server = Server::start(&settings, config(&settings), 8, true);
+    let admind = admind_events();
+
+    let mut client = connect(&server.socket);
+    send(
+        &mut client,
+        &AuditRequest::Append(Append::new(1, encoded(&admind)).unwrap()),
+    );
+    let ack = expect_ack(receive(&mut client));
+    assert_eq!(ack.through_seq, 2);
+    drop(client);
+    assert_eq!(server.stop(), Some(Ok(())));
+
+    let (records, head) = read_segment(&dir.base(), 1, Anchor::Genesis);
+    assert_eq!(head.hash.as_bytes(), &ack.head_hash);
+    assert_eq!(records.len(), 2);
+    for (record, event) in records.iter().zip(&admind) {
+        assert_eq!(record.source, Source::Admind);
+        assert_eq!(record.source_uid, uid);
+        assert_eq!(&ipc_audit::decode_event(&record.payload).unwrap(), event);
+    }
+}
+
+/// Source: docs/51 §5.7 (dird is the source of `DirAdmin`, admind of
+/// `Admind`); docs/50 §3.2 ("closed + an audit record"); docs/questions/
+/// Q-341. A batch holding a shape its source may not send is refused as a
+/// whole — `Refused::Malformed`, then close, nothing of it persisted — and
+/// counted into an `EventsMisbound` record. The service stays up for the
+/// source's own events.
+#[test]
+fn misbound_shape_is_refused_and_recorded() {
+    let Some(uid) = mappable_uid() else { return };
+    for (source, foreign) in [
+        ("kdc", dir_admin_pair()),
+        ("dird", admind_events()),
+        ("admind", dir_admin_pair()),
+        ("keyd", admind_events()),
+    ] {
+        let dir = TempDir::new();
+        let settings = settings_for(&dir, uid, source, 5);
+        let server = Server::start(&settings, config(&settings), 8, true);
+
+        // A legitimate batch first, then one with a foreign shape behind an
+        // opaque event.
+        let mut client = connect(&server.socket);
+        send(&mut client, &append(1, 1, 1));
+        assert_eq!(expect_ack(receive(&mut client)).through_seq, 1);
+        let mut batch = events(1, 64, 2);
+        batch.push(encoded(&foreign)[0].clone());
+        send(
+            &mut client,
+            &AuditRequest::Append(Append::new(2, batch).unwrap()),
+        );
+        assert_eq!(
+            receive(&mut client),
+            Got::Reply(Reply::Refused(Refused::Malformed)),
+            "{source}"
+        );
+        assert_eq!(receive(&mut client), Got::Closed, "{source}");
+
+        // The service is still up for this source's own events.
+        let mut again = connect(&server.socket);
+        send(&mut again, &append(2, 1, 3));
+        assert_eq!(expect_ack(receive(&mut again)).through_seq, 2);
+        drop(again);
+
+        // The summary record is written within the summary interval.
+        std::thread::sleep(Duration::from_millis(1600));
+        assert_eq!(server.stop(), Some(Ok(())), "{source}");
+        let (records, _) = read_segment(&dir.base(), 1, Anchor::Genesis);
+        let from_source: Vec<_> = records
+            .iter()
+            .filter(|r| r.source != Source::Auditd)
+            .collect();
+        assert_eq!(
+            from_source.len(),
+            2,
+            "{source}: nothing of the refused batch"
+        );
+        assert_eq!(from_source[0].payload, events(1, 64, 1)[0].as_bytes());
+        assert_eq!(from_source[1].payload, events(1, 64, 3)[0].as_bytes());
+        let own: Vec<_> = records
+            .iter()
+            .filter(|r| r.source == Source::Auditd)
+            .collect();
+        assert_eq!(own.len(), 1, "{source}");
+        assert_eq!(own[0].payload, expected_misbound(1, uid), "{source}");
+    }
+}
+
+/// Source: docs/50 §3.2, §4.2 (dird writes the LDAP events), §8.1 ("a
+/// compromised kdc can add false records"); docs/questions/Q-341 option (a)
+/// (decided): `Kdc` ⇐ kdc, `Keyd` ⇐ keyd, `Ldap` ⇐ dird, `WindowSummary` ⇐
+/// any mapped source — the older shapes are bound too. For a kdc- and a
+/// dird-mapped connection (between them every older shape is both accepted
+/// and refused; keyd's own `Keyd` is accepted in tier 1 `binding_permits`),
+/// every shape is sent on its own connection: the sender's own shapes and
+/// `WindowSummary` get an `Ack`; every other shape is refused (`Malformed`,
+/// then close), nothing of it persisted, and the refusals are counted into
+/// `EventsMisbound` records.
+#[test]
+fn older_shapes_are_bound_to_their_sender() {
+    let Some(uid) = mappable_uid() else { return };
+    let shapes: [(&str, EventBody); 6] = [
+        ("Kdc", kdc_event()),
+        ("Keyd", keyd_record()),
+        ("Ldap", ldap_event()),
+        ("DirAdmin", dir_admin_pair().remove(0)),
+        ("Admind", admind_events().remove(1)),
+        ("WindowSummary", window_summary()),
+    ];
+    for (source, own_shapes) in [("kdc", &["Kdc"][..]), ("dird", &["Ldap", "DirAdmin"][..])] {
+        let dir = TempDir::new();
+        let settings = settings_for(&dir, uid, source, 5);
+        let server = Server::start(&settings, config(&settings), 8, true);
+        let mut accepted = Vec::new();
+        let mut refused = 0u64;
+        for (name, event) in &shapes {
+            let permitted = *name == "WindowSummary" || own_shapes.contains(name);
+            let mut client = connect(&server.socket);
+            // Each Ack waits for a sync; allow for a loaded machine.
+            client
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            send(
+                &mut client,
+                &AuditRequest::Append(
+                    Append::new(1, encoded(std::slice::from_ref(event))).unwrap(),
+                ),
+            );
+            if permitted {
+                assert_eq!(
+                    expect_ack(receive(&mut client)).through_seq,
+                    1,
+                    "{source}: {name}"
+                );
+                accepted.push(event.clone());
+            } else {
+                assert_eq!(
+                    receive(&mut client),
+                    Got::Reply(Reply::Refused(Refused::Malformed)),
+                    "{source}: {name}"
+                );
+                assert_eq!(receive(&mut client), Got::Closed, "{source}: {name}");
+                refused += 1;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1600));
+        assert_eq!(server.stop(), Some(Ok(())), "{source}");
+
+        let (records, _) = read_segment(&dir.base(), 1, Anchor::Genesis);
+        let stored: Vec<EventBody> = records
+            .iter()
+            .filter(|r| r.source != Source::Auditd)
+            .map(|r| {
+                assert_eq!(r.source_uid, uid);
+                ipc_audit::decode_event(&r.payload).unwrap()
+            })
+            .collect();
+        assert_eq!(stored, accepted, "{source}: only its own shapes");
+        // The refusals are summarised at most once per summary interval, so
+        // the last ones may still be pending when the server stops (the
+        // exact count of a single refusal is checked in
+        // `misbound_shape_is_refused_and_recorded`); what was written counts
+        // refused batches only, from this uid.
+        let counted: u64 = records
+            .iter()
+            .filter(|r| r.source == Source::Auditd)
+            .map(|r| {
+                assert_eq!(&r.payload[..2], &[0xAD, 0x03], "{source}: EventsMisbound");
+                assert_eq!(&r.payload[10..14], &uid.to_be_bytes());
+                u64::from_be_bytes(r.payload[2..10].try_into().unwrap())
+            })
+            .sum();
+        assert!((1..=refused).contains(&counted), "{source}: {counted}");
+        assert_eq!(refused, 5 - own_shapes.len() as u64, "{source}");
+    }
 }

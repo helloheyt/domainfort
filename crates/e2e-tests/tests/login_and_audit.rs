@@ -278,6 +278,11 @@ fn the_audit_log_verifies_and_holds_every_daemons_events() {
                 EventBody::Keyd(record) => keyd_records.push(*record),
                 EventBody::Ldap(event) => ldap_events.push(*event),
                 EventBody::WindowSummary(_) => {}
+                // No admin-plane sender (dird's admin service, admind) runs
+                // in this test (docs/51 §5.7; A-72).
+                EventBody::DirAdmin(_) | EventBody::Admind(_) => {
+                    panic!("an admin-plane event in a test with no admin plane")
+                }
             }
         }
 

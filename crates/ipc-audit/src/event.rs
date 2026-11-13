@@ -3,15 +3,19 @@
 //!
 //! ```text
 //! Event := event_format:u8 (= 1) ‖ shape:u8 ‖ the shape's fields
-//! shape := 1 Kdc | 2 Keyd | 3 Ldap | 4 WindowSummary
+//! shape := 1 Kdc | 2 Keyd | 3 Ldap | 4 WindowSummary | 5 DirAdmin | 6 Admind
 //! ```
 //!
 //! Each shape carries exactly the non-secret fields its source crate's
 //! audit type already exposes (crates/kdc `AuditEvent`, crates/keyd
 //! `AuditRecord`, crates/ldap `AuditEvent`), in their declared order, with
-//! the `ipc` field primitives (one encoding per value, docs/50 §3.3).
+//! the `ipc` field primitives (one encoding per value, docs/50 §3.3). The
+//! admin-plane shapes `DirAdmin` (dird) and `Admind` (admind) have no source
+//! audit type yet; their fields are this crate's (crate::admin, docs/51
+//! §5.7, task A7).
 //! **No field can hold a key, a password, a ticket, a PAC, a plaintext, a
-//! ciphertext, an attribute value or any request octet string**: the types
+//! ciphertext, a free attribute value or any request octet string** (the
+//! `DirAdmin` request values are closed codes, Q-340 item 5): the types
 //! are fixed-width integers, codes from closed tables, SIDs/GUIDs/principal
 //! ids, bounded counts, and client strings kept only as printable ASCII of at
 //! most 256 octets (else a marker). The sources' own audit types were built
@@ -29,8 +33,10 @@
 //! size.
 //!
 //! Spec: docs/50 §3.3, §8.1, §8.2; docs/37 §2 ("only identifiers and
-//! metadata"); docs/10 I8; docs/49 §10.1; docs/questions/Q-252.
+//! metadata"); docs/10 I8; docs/49 §10.1; docs/questions/Q-252; docs/51
+//! §5.7; docs/questions/Q-340.
 
+use crate::admin::{AdmindEvent, DirAdminEvent};
 use crate::codes::{
     BindMechanismCode, EventShape, IpZone, KdcExchange, KdcOutcomeCode, KdcReason, KdcTransport,
     KeyPurposeCode, KeydOperation, KeydOutcome, KeydReason, KeydRole, LdapAction,
@@ -717,6 +723,10 @@ pub enum EventBody {
     Ldap(Box<LdapEvent>),
     /// A sender window's summary (A-57).
     WindowSummary(WindowSummary),
+    /// An admin-plane decision or outcome (written by dird, docs/51 §5.7).
+    DirAdmin(Box<DirAdminEvent>),
+    /// An admind event (docs/51 §5.7 item 3).
+    Admind(Box<AdmindEvent>),
 }
 
 impl EventBody {
@@ -728,6 +738,8 @@ impl EventBody {
             EventBody::Keyd(_) => EventShape::Keyd,
             EventBody::Ldap(_) => EventShape::Ldap,
             EventBody::WindowSummary(_) => EventShape::WindowSummary,
+            EventBody::DirAdmin(_) => EventShape::DirAdmin,
+            EventBody::Admind(_) => EventShape::Admind,
         }
     }
 }
@@ -803,6 +815,8 @@ pub fn encode_event(event: &EventBody) -> Result<EventBytes, EventError> {
         EventBody::Keyd(keyd) => keyd.write(&mut writer)?,
         EventBody::Ldap(ldap) => ldap.write(&mut writer)?,
         EventBody::WindowSummary(summary) => summary.write(&mut writer)?,
+        EventBody::DirAdmin(admin) => admin.write(&mut writer)?,
+        EventBody::Admind(admind) => admind.write(&mut writer)?,
     }
     // The payload holds no secret (docs/37 §2); the zeroizing buffer of the
     // ipc writer is simply copied out.
@@ -830,9 +844,30 @@ pub fn decode_event(octets: &[u8]) -> Result<EventBody, EventError> {
         EventShape::Keyd => EventBody::Keyd(Box::new(KeydRecord::read(&mut reader)?)),
         EventShape::Ldap => EventBody::Ldap(Box::new(LdapEvent::read(&mut reader)?)),
         EventShape::WindowSummary => EventBody::WindowSummary(WindowSummary::read(&mut reader)?),
+        EventShape::DirAdmin => EventBody::DirAdmin(Box::new(DirAdminEvent::read(&mut reader)?)),
+        EventShape::Admind => EventBody::Admind(Box::new(AdmindEvent::read(&mut reader)?)),
     };
     reader.finish()?;
     Ok(event)
+}
+
+/// The shape an encoded event declares — its first two octets only — or
+/// `None` if the format octet is not [`EVENT_FORMAT`] or the shape code is
+/// outside the closed table. **Nothing else is checked**: this is not a
+/// decoder, and `Some` does not mean the event decodes.
+///
+/// auditd uses it to refuse a shape from a source that may not send it
+/// (crate audit-daemon; docs/questions/Q-341) while keeping the payloads
+/// opaque, so no event parser is added to auditd (AGENTS.md §6).
+///
+/// Spec: docs/50 §3.2 (the source comes from the transport), §3.3, §8.1;
+/// docs/51 §5.7; docs/questions/Q-341.
+#[must_use]
+pub fn peek_shape(octets: &[u8]) -> Option<EventShape> {
+    match octets {
+        [format, shape, ..] if *format == EVENT_FORMAT => EventShape::from_code(*shape),
+        _ => None,
+    }
 }
 
 /// The canonical round trip for one event: decode, encode, compare.

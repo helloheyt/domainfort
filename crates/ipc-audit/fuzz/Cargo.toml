@@ -53,8 +53,9 @@ test = false
 doc = false
 bench = false
 
-# Event payloads: `decode_event`, canonical round trip
-# (`cargo fuzz run ipc_audit_event`).
+# Event payloads: `decode_event`, canonical round trip, and `peek_shape`
+# (auditd's source binding) — every shape, the admin-plane `DirAdmin` /
+# `Admind` included (`cargo fuzz run ipc_audit_event`).
 [[bin]]
 name = "ipc_audit_event"
 path = "fuzz_targets/ipc_audit_event.rs"

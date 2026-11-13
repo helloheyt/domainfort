@@ -399,6 +399,70 @@ impl CodecError {
     }
 }
 
+/// A sequence of at most `MAX` items. The bound is part of the type, so an
+/// event built from it always encodes (docs/50 §3.3: "`seq<T,max>`"), and
+/// decoding checks the count against `MAX` before reading any item.
+///
+/// Spec: docs/50 §3.3; AGENTS.md §6 (no unbounded allocation from a decoded
+/// count).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BoundedSeq<T, const MAX: usize>(Vec<T>);
+
+impl<T, const MAX: usize> BoundedSeq<T, MAX> {
+    /// No items.
+    #[must_use]
+    pub const fn empty() -> Self {
+        BoundedSeq(Vec::new())
+    }
+
+    /// `items`, or `None` with more than `MAX` of them.
+    #[must_use]
+    pub fn new(items: Vec<T>) -> Option<Self> {
+        (items.len() <= MAX).then_some(BoundedSeq(items))
+    }
+
+    /// The items.
+    #[must_use]
+    pub fn as_slice(&self) -> &[T] {
+        &self.0
+    }
+
+    /// Number of items (at most `MAX`).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether there is no item.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// `u32` count, then the items (`seq<T, MAX>`).
+    pub(crate) fn write(
+        &self,
+        writer: &mut Writer,
+        write_item: impl FnMut(&T, &mut Writer) -> Result<(), EventError>,
+    ) -> Result<(), EventError> {
+        write_seq(writer, &self.0, MAX, write_item)
+    }
+
+    /// Read a sequence written by [`BoundedSeq::write`].
+    pub(crate) fn read<'a>(
+        reader: &mut Reader<'a>,
+        read_item: impl FnMut(&mut Reader<'a>) -> Result<T, EventError>,
+    ) -> Result<Self, EventError> {
+        read_seq(reader, MAX, read_item).map(BoundedSeq)
+    }
+}
+
+impl<T, const MAX: usize> Default for BoundedSeq<T, MAX> {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
 // ---- field helpers ----------------------------------------------------------
 
 /// An optional field: the `bool` marker then the value — the octets of

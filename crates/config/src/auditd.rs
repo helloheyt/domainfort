@@ -32,15 +32,20 @@ const UID_SOURCES: &str = "uid_sources";
 /// ("every daemon writes to `audit.sock` only"), §2.4 (the processes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditSource {
-    /// keyd (`keyd::AuditRecord`).
+    /// keyd (`keyd::AuditRecord`; auditd accepts the `Keyd` shape only from
+    /// this source — docs/questions/Q-341).
     Keyd,
-    /// dird (the LDAP engine's `Outcome.audit`, R49-14).
+    /// dird (the LDAP engine's `Outcome.audit`, R49-14, and the admin-plane
+    /// `DirAdmin` events, docs/51 §5.7; auditd accepts the `Ldap` and
+    /// `DirAdmin` shapes only from this source — docs/questions/Q-341).
     Dird,
-    /// kdc (`kdc::AuditEvent`).
+    /// kdc (`kdc::AuditEvent`; auditd accepts the `Kdc` shape only from this
+    /// source — docs/questions/Q-341).
     Kdc,
     /// ldap-front.
     LdapFront,
-    /// admind.
+    /// admind (its `Admind` events, which auditd accepts only from this
+    /// source — docs/51 §5.7 item 3, docs/questions/Q-341).
     Admind,
 }
 

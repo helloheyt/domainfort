@@ -1,5 +1,7 @@
 # ipc-audit — the audit channel (`audit.sock`) message set over `ipc`, the
-# canonical event encoding for the kdc / keyd / ldap audit shapes, and the
+# canonical event encoding for the kdc / keyd / ldap audit shapes and the
+# admin-plane `DirAdmin` / `Admind` shapes (docs/51 §5.7, task A7 — core,
+# no feature, no new dependency), and the
 # sender-side bounded window that implements the decided overflow policy
 # (docs/50 R50-17, §8.1, §10 task P6 — the library half; docs/questions/Q-218,
 # A-57).
@@ -63,6 +65,13 @@ parse-ldap = { path = "../parse-ldap", optional = true }
 # builds of test targets, so this turns no conversion on for a daemon binary
 # (checked: `cargo tree -p audit-daemon -e normal`).
 ipc-audit = { path = ".", features = ["kdc", "keyd", "ldap"] }
+# TESTS ONLY: this project's schema crate, so that a test checks the six
+# `GroupTypeCode` values against `ad_schema::flags::group_type::ALLOWED_VALUES`
+# — the repository's one statement of the phase-1 groupType values
+# ([MS-ADTS] 2.2.12 as cited there; docs/46 §8.2) — instead of trusting a
+# second copy (docs/questions/Q-340 item 5). A workspace path crate, no
+# third-party dependency; dev-dependencies are not linked into any daemon.
+ad-schema = { path = "../ad-schema" }
 
 [lints]
 workspace = true

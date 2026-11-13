@@ -272,11 +272,23 @@ fn batch_events_decode() {
         let slot = window.reserve().unwrap();
         window.commit(slot, &event).unwrap();
     }
-    let batch = window.next_batch().unwrap();
-    let decoded: Vec<EventBody> = batch
-        .events()
-        .iter()
-        .map(|e| decode_event(e.as_bytes()).unwrap())
-        .collect();
+    // The samples (every shape, the admin plane included) span more than one
+    // batch of MAX_BATCH_EVENTS: drain them all.
+    let mut decoded: Vec<EventBody> = Vec::new();
+    while let Some(batch) = window.next_batch() {
+        assert!(batch.events().len() <= MAX_BATCH_EVENTS as usize);
+        decoded.extend(
+            batch
+                .events()
+                .iter()
+                .map(|e| decode_event(e.as_bytes()).unwrap()),
+        );
+        window
+            .acknowledge(&Ack {
+                through_seq: batch.last_seq(),
+                head_hash: [0; 32],
+            })
+            .unwrap();
+    }
     assert_eq!(decoded, all_samples());
 }

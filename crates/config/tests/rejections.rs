@@ -839,6 +839,44 @@ fn source_map_rules() {
     );
 }
 
+/// Spec: docs/51 §5.7 item 3 (admind sends its own audit events; the
+/// `Admind` shape is accepted only from the uid mapped to `admind`),
+/// docs/50 §2.4, §3.2; Q-230 items 5, 6. The source name is exactly the
+/// process name, at most one uid.
+#[test]
+fn admind_source_name() {
+    let key = "uid_sources";
+    for spelling in ["806:Admind", "806:admin", "806:admind-daemon", "806:keyadm"] {
+        rejects_value(
+            Daemon::Auditd,
+            AUDITD,
+            key,
+            spelling,
+            ErrorKind::UnknownName,
+        );
+    }
+    rejects_value(
+        Daemon::Auditd,
+        AUDITD,
+        key,
+        "806:admind, 807:admind",
+        ErrorKind::DuplicateEntry,
+    );
+    rejects_value(
+        Daemon::Auditd,
+        AUDITD,
+        key,
+        "0:admind",
+        ErrorKind::ReservedId,
+    );
+    let s = AuditdSettings::parse(set(AUDITD, key, "900:admind").as_bytes()).expect("valid");
+    assert_eq!(
+        s.uid_sources().source_of(900),
+        Some(config::AuditSource::Admind)
+    );
+    assert_eq!(s.uid_sources().len(), 1);
+}
+
 // ---- addresses ----------------------------------------------------------------
 
 /// Spec: docs/50 §7.1 ("listen addresses"), §4.1 ("bind to internal

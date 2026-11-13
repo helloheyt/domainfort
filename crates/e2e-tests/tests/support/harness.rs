@@ -151,6 +151,16 @@ pub const AUDIT_SOURCE_NAME: &str = "kdc";
 pub const AUDIT_CONNECTIONS_PER_SOURCE: usize =
     4 * audit_daemon::listener::MAX_CONNECTIONS_PER_SOURCE;
 
+/// auditd's shape↔source binding for the one test uid: every shape that
+/// production binds to one sender is bound here to the single label
+/// ([`AUDIT_SOURCE_NAME`] = kdc), because every sender shares that uid
+/// (R50-3: one source per uid). Same shapes, same "any source" rows as
+/// `audit_daemon::binding::PRODUCTION`; per-daemon binding is covered by
+/// audit-daemon's tier-2 tests and tier 3 (docs/questions/Q-310, Q-341, A-85).
+fn single_label_binding(shape: ipc_audit::EventShape) -> Option<audit_log::Source> {
+    audit_daemon::binding::bound_source(shape).map(|_| audit_log::Source::Kdc)
+}
+
 /// The bound of every wait for a condition in the tests. Project choice:
 /// above the daemons' audit backoff ceiling (5 s) plus their 1 s heartbeat.
 pub const LONG: Duration = Duration::from_secs(20);
@@ -457,6 +467,7 @@ impl Harness {
         let config = ListenerConfig {
             frame_timeout: settings.frame_timeout(),
             max_connections_per_source: AUDIT_CONNECTIONS_PER_SOURCE,
+            binding: single_label_binding,
         };
         self.auditd = Some(auditd_support::Server::start(&settings, config, 64, true));
     }

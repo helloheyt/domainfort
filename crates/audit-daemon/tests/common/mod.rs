@@ -3,9 +3,11 @@
 //! blocking client.
 //!
 //! Every payload is arbitrary test octets made up here (the log treats them
-//! as opaque); expected encodings are assembled from this project's own
-//! layouts (crate `audit_daemon::own_event`, crate `audit-log` `format`).
-//! No fixture comes from any other implementation.
+//! as opaque), except the admin-plane events, which are encoded with
+//! crate `ipc-audit` from values made up here (docs/51 §5.7); expected
+//! encodings are assembled from this project's own layouts (crate
+//! `audit_daemon::own_event`, crate `audit-log` `format`). No fixture comes
+//! from any other implementation.
 #![allow(dead_code)]
 
 use audit_daemon::listener::{self, ListenerConfig};
@@ -18,7 +20,7 @@ use audit_log::{
 };
 use config::AuditdSettings;
 use ipc::Reply;
-use ipc_audit::{AuditReply, AuditRequest, EventBytes, AUDIT_CHANNEL};
+use ipc_audit::{AuditReply, AuditRequest, EventBody, EventBytes, AUDIT_CHANNEL};
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -87,13 +89,36 @@ pub fn other_uid(others: &[u32]) -> u32 {
 /// Configuration text for auditd in `dir`, mapping `mapped_uid` to `kdc`.
 /// Spec: docs/50 §7.1; crates/config `AuditdSettings`.
 pub fn settings_text(dir: &TempDir, mapped_uid: u32, frame_timeout_secs: u32) -> String {
+    settings_text_for(dir, mapped_uid, "kdc", frame_timeout_secs)
+}
+
+/// Configuration text for auditd in `dir`, mapping `mapped_uid` to the
+/// source named `source` (a process name of docs/50 §2.4).
+/// Spec: docs/50 §3.2, §7.1; crates/config `AuditdSettings`.
+pub fn settings_text_for(
+    dir: &TempDir,
+    mapped_uid: u32,
+    source: &str,
+    frame_timeout_secs: u32,
+) -> String {
     let run_as = other_uid(&[mapped_uid]);
     format!(
         "run_as_uid = {run_as}\nrun_as_gid = {run_as}\naudit_socket = {}\naudit_log_path = {}\n\
-         uid_sources = {mapped_uid}:kdc\nframe_timeout = {frame_timeout_secs}s\n",
+         uid_sources = {mapped_uid}:{source}\nframe_timeout = {frame_timeout_secs}s\n",
         dir.socket().display(),
         dir.base().display()
     )
+}
+
+/// Parsed settings for auditd in `dir`, mapping `mapped_uid` to `source`.
+pub fn settings_for(
+    dir: &TempDir,
+    mapped_uid: u32,
+    source: &str,
+    frame_timeout_secs: u32,
+) -> AuditdSettings {
+    AuditdSettings::parse(settings_text_for(dir, mapped_uid, source, frame_timeout_secs).as_bytes())
+        .expect("valid auditd settings")
 }
 
 /// Parsed settings for auditd in `dir`.
@@ -210,6 +235,173 @@ pub fn expected_refused(unmapped: u64, over_quota: u64, last_uid: u32) -> Vec<u8
     out.extend_from_slice(&over_quota.to_be_bytes());
     out.extend_from_slice(&last_uid.to_be_bytes());
     out
+}
+
+/// The expected payload of an `EventsMisbound` auditd record.
+pub fn expected_misbound(refused_batches: u64, last_uid: u32) -> Vec<u8> {
+    let mut out = vec![0xAD, 0x03];
+    out.extend_from_slice(&refused_batches.to_be_bytes());
+    out.extend_from_slice(&last_uid.to_be_bytes());
+    out
+}
+
+// ---- admin-plane events (docs/51 §5.7), encoded with ipc-audit --------------
+
+/// A `DirAdmin` event of `CreateUser` in `stage` (docs/51 §5.2 row 1).
+pub fn dir_admin_event(operation_id: u64, stage: ipc_audit::DirAdminStage) -> EventBody {
+    EventBody::DirAdmin(Box::new(ipc_audit::DirAdminEvent {
+        time: ipc_audit::CalendarTime::new(2026, 11, 13, 10, 0, 0).expect("time"),
+        operation_id,
+        operation: ipc_audit::DirAdminOperation::CreateUser,
+        stage,
+        target: None,
+        parent: Some([0x0A; 16]),
+        member: None,
+        requester: ipc_audit::SidValue::new([0, 0, 0, 0, 0, 5], vec![21, 1, 2, 3, 1105]),
+        approvers: ipc_audit::BoundedSeq::empty(),
+        pdp: Some(ipc_audit::PdpReason {
+            code: ipc_audit::PdpReasonCode::Allowed,
+            rule: None,
+        }),
+        names: ipc_audit::BoundedSeq::new(vec![ipc_audit::TargetName {
+            kind: ipc_audit::AdminNameKind::SamAccountName,
+            text: ipc_audit::AuditText::from_client("dave"),
+        }])
+        .expect("one name"),
+        enable: None,
+        account_expires: None,
+        group_type: None,
+        key_request: None,
+        key_operation: None,
+        reported_kvnos: ipc_audit::BoundedSeq::empty(),
+    }))
+}
+
+/// The decision and the outcome of one `CreateUser` (docs/51 §5.7 item 2).
+pub fn dir_admin_pair() -> Vec<EventBody> {
+    vec![
+        dir_admin_event(
+            1,
+            ipc_audit::DirAdminStage::Decision(ipc_audit::DecisionResult::Proceed),
+        ),
+        dir_admin_event(
+            1,
+            ipc_audit::DirAdminStage::Outcome(ipc_audit::OutcomeResult::Committed {
+                allocated: Some(ipc_audit::Allocation {
+                    guid: [0xC7; 16],
+                    rid: Some(1106),
+                }),
+            }),
+        ),
+    ]
+}
+
+/// admind's events: a refused connection (noise) and a completed
+/// `SetPassword` (docs/51 §5.7 item 3).
+pub fn admind_events() -> Vec<EventBody> {
+    let time = ipc_audit::CalendarTime::new(2026, 11, 13, 10, 0, 1).expect("time");
+    vec![
+        EventBody::Admind(Box::new(ipc_audit::AdmindEvent {
+            time,
+            peer_uid: Some(1500),
+            activity: ipc_audit::AdmindActivity::ConnectionRefused {
+                reason: ipc_audit::ConnectionRefusal::ConnectionLimit,
+            },
+        })),
+        EventBody::Admind(Box::new(ipc_audit::AdmindEvent {
+            time,
+            peer_uid: Some(1500),
+            activity: ipc_audit::AdmindActivity::SetPassword {
+                target: [0x5E; 16],
+                kvnos: ipc_audit::BoundedSeq::new(vec![2]).expect("one kvno"),
+                result: ipc_audit::PasswordResult::Completed,
+            },
+        })),
+    ]
+}
+
+// ---- the older shapes, encoded with ipc-audit (for the source binding) ------
+
+fn calendar() -> ipc_audit::CalendarTime {
+    ipc_audit::CalendarTime::new(2026, 11, 13, 10, 0, 2).expect("time")
+}
+
+/// A minimal `Kdc` event (crates/kdc `AuditEvent` fields; values made up).
+pub fn kdc_event() -> EventBody {
+    EventBody::Kdc(Box::new(ipc_audit::KdcEvent {
+        time: calendar(),
+        transport: ipc_audit::KdcTransport::Tcp,
+        exchange: Some(ipc_audit::KdcExchange::As),
+        client: None,
+        service: None,
+        armor_principal: None,
+        reply_armored: false,
+        outcome: ipc_audit::KdcOutcome::Issued,
+        reason: ipc_audit::KdcReason::Issued,
+        policy_reason: None,
+    }))
+}
+
+/// A minimal `Keyd` record (crates/keyd `AuditRecord` fields; values made
+/// up).
+pub fn keyd_record() -> EventBody {
+    EventBody::Keyd(Box::new(ipc_audit::KeydRecord {
+        ts: calendar(),
+        caller_role: ipc_audit::KeydRole::Kdc,
+        caller_uid: 803,
+        op: ipc_audit::KeydOperation::VerifyPreauth,
+        principal: None,
+        purpose: None,
+        kvno: None,
+        secondary: None,
+        approvers: None,
+        result: ipc_audit::KeydOutcome::Success,
+        reason: ipc_audit::KeydReason::None,
+    }))
+}
+
+/// A minimal `Ldap` event (crates/ldap `AuditEvent` fields; values made
+/// up): an Unbind.
+pub fn ldap_event() -> EventBody {
+    EventBody::Ldap(Box::new(ipc_audit::LdapEvent {
+        time: calendar(),
+        connection_id: 7,
+        source_zone: ipc_audit::IpZone::Internal,
+        transport: ipc_audit::LdapTransport::Ldaps,
+        transport_sec: ipc_audit::TransportSecurity {
+            encrypted: true,
+            sealed: false,
+            channel_bound: false,
+        },
+        operation: ipc_audit::LdapOperation::Unbind,
+        message_id: Some(3),
+        principal: None,
+        bind: None,
+        target: None,
+        search: None,
+        result_code: None,
+        notice: None,
+        action: ipc_audit::LdapAction::Close,
+        reason: ipc_audit::LdapReason::Unbind,
+        policy_reason: None,
+        codec_error: None,
+    }))
+}
+
+/// A sender window's summary (any source may send one).
+pub fn window_summary() -> EventBody {
+    EventBody::WindowSummary(ipc_audit::WindowSummary {
+        suppressed_noise: 1,
+        refused_gating: 0,
+    })
+}
+
+/// Encode events for an `Append`.
+pub fn encoded(events: &[EventBody]) -> Vec<EventBytes> {
+    events
+        .iter()
+        .map(|event| ipc_audit::encode_event(event).expect("encodes"))
+        .collect()
 }
 
 /// Header length as a u64.

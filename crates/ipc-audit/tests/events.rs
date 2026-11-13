@@ -41,6 +41,8 @@ fn largest_events_fit_the_bound() {
         EventBody::Keyd(Box::new(largest_keyd_record())),
         EventBody::Ldap(Box::new(largest_ldap_event())),
         EventBody::WindowSummary(summary()),
+        EventBody::DirAdmin(Box::new(largest_dir_admin())),
+        EventBody::Admind(Box::new(largest_admind())),
     ];
     for event in largest {
         let len = encode_event(&event).unwrap().len();
@@ -156,7 +158,9 @@ fn strict_decoding() {
     let mut b = good.clone();
     b[0] = EVENT_FORMAT + 1;
     assert_eq!(decode_event(&b), Err(EventError::UnsupportedFormat));
-    for shape in [0u8, 5, 0xFF] {
+    // Shapes 5 (DirAdmin) and 6 (Admind) were appended for the admin plane
+    // (docs/51 §5.7); 7 is the first code outside the closed table.
+    for shape in [0u8, 7, 0xFF] {
         let mut b = good.clone();
         b[1] = shape;
         assert_eq!(
@@ -243,7 +247,35 @@ fn code_tables_are_closed() {
     table!(LdapOperationCode);
     table!(BindMechanismCode);
     table!(LdapTargetCode);
-    table!(EventShape);
+    // The first four shapes keep their codes; the admin plane appended two.
+    assert_eq!(table!(EventShape), 6);
+    assert_eq!(
+        EventShape::ALL.iter().map(|s| s.code()).collect::<Vec<_>>(),
+        [1, 2, 3, 4, 5, 6]
+    );
+    assert_eq!(EventShape::Kdc.code(), 1);
+    assert_eq!(EventShape::WindowSummary.code(), 4);
+    assert_eq!(EventShape::DirAdmin.code(), 5);
+    assert_eq!(EventShape::Admind.code(), 6);
+    assert_eq!(table!(DirAdminOperation), 18);
+    assert_eq!(table!(AdminRefusal), 18);
+    assert_eq!(table!(AdminFailure), 4);
+    assert_eq!(table!(FrameErrorCode), 15);
+    table!(AdminPhase);
+    table!(DecisionResultCode);
+    table!(OutcomeResultCode);
+    table!(AdminNameKind);
+    table!(AdmindActivityCode);
+    table!(ConnectionRefusal);
+    table!(PasswordResultCode);
+    table!(PasswordStepCode);
+    table!(PasswordFailure);
+    table!(KeyadmOperation);
+    table!(ForwardDecision);
+    table!(EnableDirection);
+    table!(AccountExpiresCode);
+    assert_eq!(table!(GroupTypeCode), 6);
+    assert_eq!(FrameErrorCode::ALL.last(), Some(&FrameErrorCode::Unlisted));
     // Non-exhaustive sources end in Unlisted.
     assert_eq!(KdcReason::ALL.last(), Some(&KdcReason::Unlisted));
     assert_eq!(LdapReason::ALL.last(), Some(&LdapReason::Unlisted));
@@ -306,6 +338,53 @@ fn field_inventory_holds_no_secret() {
     // A simple bind with a password is recorded as a mechanism only — the
     // shape has no field where the password could go.
     let _ = ipc_audit::BindMechanism::SimplePassword;
+    // docs/51 §5.7 item 1: "only names as AuditText, no other attribute
+    // values and no password".
+    let ipc_audit::DirAdminEvent {
+        time: _,            // dird's time
+        operation_id: _,    // dird's operation number
+        operation: _,       // code
+        stage: _,           // phase code + result code (+ refusal / failure code, or GUID + RID)
+        target: _,          // objectGUID
+        parent: _,          // objectGUID
+        member: _,          // objectGUID
+        requester: _,       // SID
+        approvers: _,       // SIDs (≤ 2)
+        pdp: _,             // code (+ rule id)
+        names: _,           // name-kind code + name (printable-ASCII rule), ≤ 4
+        enable: _,          // code (Enable / Disable) — request metadata, Q-340 item 5
+        account_expires: _, // code + FILETIME (never / a time) — request metadata
+        group_type: _,      // code (one of six groupType values) — request metadata
+        key_request: _,     // dird's request number
+        key_operation: _,   // code
+        reported_kvnos: _,  // key version numbers (not key material), ≤ 2
+    } = dir_admin_create_outcome();
+    // docs/51 §5.7 item 3, §7.6: the password never reaches the event.
+    let ipc_audit::AdmindEvent {
+        time: _,     // admind's time
+        peer_uid: _, // uid (peer credentials)
+        activity: _, // below
+    } = admind_set_password();
+    for activity in [
+        admind_connection_refused().activity,
+        admind_malformed().activity,
+        admind_set_password().activity,
+        admind_keyadm_refused().activity,
+    ] {
+        match activity {
+            ipc_audit::AdmindActivity::ConnectionRefused { reason: _ } => {} // code
+            ipc_audit::AdmindActivity::MalformedFrame { error: _ } => {}     // code, never octets
+            ipc_audit::AdmindActivity::SetPassword {
+                target: _, // objectGUID
+                kvnos: _,  // key version numbers
+                result: _, // codes (step, purpose, failure class)
+            } => {}
+            ipc_audit::AdmindActivity::KeyadmForward {
+                operation: _, // code
+                decision: _,  // code
+            } => {}
+        }
+    }
 }
 
 /// Reasons with detail: the detail travels in its own optional field.

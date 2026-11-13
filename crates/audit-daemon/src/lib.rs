@@ -11,6 +11,7 @@
 //! | [`segments`] | segment file names next to `audit_log_path`; strict listing | Q-250 item 6; Q-265 item 2 |
 //! | [`writer`] | the single writer thread, its bounded queue, ack after sync, rotation | docs/50 §3.6, §8.1; A-57 |
 //! | [`listener`] | `audit.sock`: peer uid → source, frames, deadlines, `Append` / `Ping` | docs/50 R50-3, §3.1-§3.3, §3.6 |
+//! | [`binding`] | each event shape only from its one sender (Kdc ⇐ kdc, Keyd ⇐ keyd, Ldap / DirAdmin ⇐ dird, Admind ⇐ admind) | docs/50 §3.2, §4.2; docs/51 §5.7; Q-341 |
 //! | [`own_event`] | the payload of auditd's own records | docs/50 §3.2; Q-250 items 5, 8 |
 //! | [`signing`] | the chain-head signing hook, UNSIGNED until P-20 | docs/37 §2; Q-251 |
 //!
@@ -21,7 +22,9 @@
 //! crate `ipc-audit`), are never printed, and no error or stderr line
 //! carries them: stderr lines are fixed texts with codes and numbers
 //! (docs/50 §8.2; AGENTS.md §6). There is no secret in this process at all
-//! (the chain is unsigned in phase 1 — P-20).
+//! (the chain is unsigned in phase 1 — P-20). The only octets of a payload
+//! auditd reads are its format and shape octets, for the source binding of
+//! the event shapes ([`binding`]).
 //!
 //! # Provenance
 //!
@@ -33,12 +36,15 @@
 //! (A-64), Q-251 and PENDING-OWNER (A-57, A-64, P-2, P-12, P-18, P-20); the
 //! public API of this project's crates audit-log, ipc-audit, ipc, config and
 //! daemon-sandbox; and the docs.rs API pages of tokio 1.54.1 (P-2; never its
-//! source). No existing log daemon, journal or audit implementation was
-//! consulted or recalled (AGENTS.md §1-3).
+//! source). The source binding and the `EventsMisbound` record (task A7)
+//! were written only from docs/51 §5.7 (A-72), docs/50 §3.2 / §8.1 and
+//! PENDING-OWNER (A-57, A-64, A-66). No existing log daemon, journal or
+//! audit implementation was consulted or recalled (AGENTS.md §1-3).
 //!
 //! Spec: docs/50 R50-17, §8, §10 (P6b); docs/37 §2; Q-218 (A-57);
-//! Q-250 / Q-252 (A-64); Q-251 (P-20); Q-265.
+//! Q-250 / Q-252 (A-64); Q-251 (P-20); Q-265; docs/51 §5.7; Q-341.
 
+pub mod binding;
 pub mod listener;
 pub mod own_event;
 pub mod recovery;

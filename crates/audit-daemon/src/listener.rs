@@ -25,8 +25,14 @@
 //! 4. **Requests.** `Ping` → `Pong` while the writer is available, otherwise
 //!    `Refused::Unavailable` (docs/50 §7.5). `Append` → the connection's
 //!    `AppendCursor` must accept its numbering (else `Refused::Malformed` +
-//!    close, docs/questions/Q-265 item 3), then the job goes to the writer's
-//!    queue: full → `Refused::Busy` (connection stays open — A-57); writer
+//!    close, docs/questions/Q-265 item 3); every event's shape must be one
+//!    its source may send — `Kdc` only from kdc, `Keyd` only from keyd,
+//!    `Ldap` and `DirAdmin` only from dird, `Admind` only from admind,
+//!    `WindowSummary` from any (crate::binding; else nothing of the batch is
+//!    persisted, `Refused::Malformed` + close, counted for an
+//!    `EventsMisbound` record — docs/51 §5.7, Q-341); then the job goes to
+//!    the writer's queue: full → `Refused::Busy` (connection stays open —
+//!    A-57); writer
 //!    failed → `Refused::Unavailable`; persisted → `Ack { through_seq,
 //!    head_hash }` and only then the cursor advances (docs/50 §8.1;
 //!    docs/questions/Q-252 item 7).
@@ -36,12 +42,14 @@
 //!    unknown kind → close with no reply.
 //!
 //! Spec: docs/50 R50-3, R50-7, R50-17, §3.1-§3.3, §3.6, §7.5, §8.1;
-//! docs/questions/Q-218 (A-57), Q-225 (A-59), Q-252 (A-64), Q-265;
+//! docs/questions/Q-218 (A-57), Q-225 (A-59), Q-252 (A-64), Q-265, Q-341;
+//! docs/51 §5.7;
 //! tokio 1.54.1 docs.rs: `net::UnixListener` (`bind`, `accept`),
 //! `net::UnixStream` (`peer_cred`), `net::unix::UCred`, `time::timeout_at`,
 //! `time::Instant`, `time::sleep`, `sync::oneshot`, `io::AsyncReadExt`,
 //! `io::AsyncWriteExt`.
 
+use crate::binding;
 use crate::writer::{AppendJob, JobOutcome, SubmitError, Submitter};
 use audit_log::Source;
 use config::{AuditSource, AuditdSettings, SourceMap};
@@ -83,13 +91,16 @@ const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// The listener's limits.
 ///
 /// Spec: docs/50 §3.6; docs/questions/Q-265 item 5.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub struct ListenerConfig {
     /// How long a started frame may take to arrive, and how long writing a
     /// reply may take.
     pub frame_timeout: Duration,
     /// Most simultaneous connections per mapped source.
     pub max_connections_per_source: usize,
+    /// The shape↔source binding table. Always [`binding::PRODUCTION`] in
+    /// the daemon; see [`binding::BindingTable`] for why it is a parameter.
+    pub binding: binding::BindingTable,
 }
 
 impl ListenerConfig {
@@ -101,6 +112,7 @@ impl ListenerConfig {
         ListenerConfig {
             frame_timeout: settings.frame_timeout(),
             max_connections_per_source: MAX_CONNECTIONS_PER_SOURCE,
+            binding: binding::PRODUCTION,
         }
     }
 }
@@ -292,7 +304,15 @@ async fn connection(
                 (reply, true)
             }
             AuditRequest::Append(append) => {
-                append_batch(&append, &mut cursor, source, uid, &submitter).await
+                append_batch(
+                    &append,
+                    &mut cursor,
+                    source,
+                    uid,
+                    &submitter,
+                    config.binding,
+                )
+                .await
             }
         };
         if !send(&mut stream, &reply, config.frame_timeout).await || !keep_open {
@@ -301,21 +321,29 @@ async fn connection(
     }
 }
 
-/// Check the numbering, queue the batch, wait for the writer, and build the
-/// reply; the flag says whether the connection stays open.
+/// Check the numbering and the source binding, queue the batch, wait for
+/// the writer, and build the reply; the flag says whether the connection
+/// stays open.
 ///
-/// Spec: docs/50 §8.1; docs/questions/Q-218 (A-57), Q-252 item 7,
-/// Q-265 item 3.
+/// Spec: docs/50 §3.2, §8.1; docs/questions/Q-218 (A-57), Q-252 item 7,
+/// Q-265 item 3, Q-341; docs/51 §5.7.
 async fn append_batch(
     append: &Append,
     cursor: &mut AppendCursor,
     source: Source,
     uid: u32,
     submitter: &Submitter,
+    table: binding::BindingTable,
 ) -> (Reply<AuditReply>, bool) {
     let Ok(range) = cursor.check(append) else {
         return (Reply::Refused(Refused::Malformed), false);
     };
+    // A shape this source may not send: nothing of the batch is persisted
+    // (crate::binding; docs/51 §5.7).
+    if !binding::batch_permitted_under(table, source, append.events()) {
+        submitter.refusals().count_misbound(uid);
+        return (Reply::Refused(Refused::Malformed), false);
+    }
     let (reply_to, outcome) = oneshot::channel();
     let job = AppendJob {
         source,

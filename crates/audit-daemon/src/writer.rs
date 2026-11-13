@@ -36,12 +36,14 @@
 //! * **Refused connections** are counted by the listener ([`PeerRefusals`])
 //!   and written by the writer as one `Auditd` summary record at most every
 //!   [`SUMMARY_INTERVAL`] (docs/50 §3.2: "closed + an audit record";
-//!   A-57: noise "summarised in counters").
+//!   A-57: noise "summarised in counters"). Batches refused by the source
+//!   binding of the event shapes (crate::binding) are counted and
+//!   summarised the same way, in their own `EventsMisbound` record.
 //!
 //! Spec: docs/50 R50-7, R50-17, §3.6, §8.1; docs/37 §2; docs/07 §8;
 //! docs/questions/Q-218 (A-57), Q-250 (A-64), Q-265.
 
-use crate::own_event::{AuditdEvent, PeersRefused};
+use crate::own_event::{AuditdEvent, EventsMisbound, PeersRefused};
 use crate::segments::SegmentFactory;
 use crate::signing::{NoSignature, UnsignedHeads};
 use audit_log::{AppendError, ChainHead, Entry, LogWriter, Persisted, Source, Timestamp};
@@ -163,6 +165,10 @@ pub struct PeerRefusals {
     unmapped: AtomicU64,
     over_quota: AtomicU64,
     last_uid: AtomicU32,
+    /// Batches refused by the source binding (crate::binding), and the uid
+    /// of the last one.
+    misbound: AtomicU64,
+    misbound_uid: AtomicU32,
 }
 
 /// Add one to a counter without wrapping.
@@ -184,6 +190,28 @@ impl PeerRefusals {
     pub fn count_over_quota(&self, uid: u32) {
         self.last_uid.store(uid, Ordering::Relaxed);
         bump(&self.over_quota, 1);
+    }
+
+    /// Count an `Append` refused because an event's shape may not come from
+    /// the connection's source (crate::binding).
+    /// Spec: docs/51 §5.7; docs/questions/Q-341.
+    pub fn count_misbound(&self, uid: u32) {
+        self.misbound_uid.store(uid, Ordering::Relaxed);
+        bump(&self.misbound, 1);
+    }
+
+    /// Take the misbound-batch count (resetting it), if any.
+    fn take_misbound(&self) -> Option<EventsMisbound> {
+        let refused_batches = self.misbound.swap(0, Ordering::Relaxed);
+        (refused_batches > 0).then(|| EventsMisbound {
+            refused_batches,
+            last_uid: self.misbound_uid.load(Ordering::Relaxed),
+        })
+    }
+
+    /// Put back a misbound-batch count that could not be recorded.
+    fn restore_misbound(&self, summary: EventsMisbound) {
+        bump(&self.misbound, summary.refused_batches);
     }
 
     /// Take the counts (resetting them), if any connection was refused.
@@ -510,11 +538,12 @@ pub fn run<F: SegmentFactory>(mut sink: LogSink<F>, inbox: Inbox) -> Result<(), 
     result
 }
 
-/// Write a refused-connection summary if any connection was refused and
-/// the last summary is at least [`SUMMARY_INTERVAL`] old.
+/// Write a refused-connection summary if any connection was refused, and a
+/// misbound-batch summary if any batch was refused by the source binding,
+/// when the last summary is at least [`SUMMARY_INTERVAL`] old.
 ///
 /// Spec: docs/50 §3.2; docs/questions/Q-218 (A-57); docs/questions/Q-265
-/// item 8.
+/// item 8; docs/51 §5.7; docs/questions/Q-341.
 fn record_refusals<F: SegmentFactory>(
     sink: &mut LogSink<F>,
     refusals: &PeerRefusals,
@@ -523,18 +552,23 @@ fn record_refusals<F: SegmentFactory>(
     if last_summary.is_some_and(|at| at.elapsed() < SUMMARY_INTERVAL) {
         return Ok(());
     }
-    let Some(summary) = refusals.take() else {
-        return Ok(());
-    };
-    match sink.append_own(&AuditdEvent::PeersRefused(summary)) {
-        Ok(_) => {
-            *last_summary = Some(Instant::now());
-            Ok(())
+    let mut recorded = false;
+    if let Some(summary) = refusals.take() {
+        match sink.append_own(&AuditdEvent::PeersRefused(summary)) {
+            Ok(_) => recorded = true,
+            Err(PersistError::Unavailable) => refusals.restore(summary),
+            Err(PersistError::Fatal(failure)) => return Err(failure),
         }
-        Err(PersistError::Unavailable) => {
-            refusals.restore(summary);
-            Ok(())
-        }
-        Err(PersistError::Fatal(failure)) => Err(failure),
     }
+    if let Some(summary) = refusals.take_misbound() {
+        match sink.append_own(&AuditdEvent::EventsMisbound(summary)) {
+            Ok(_) => recorded = true,
+            Err(PersistError::Unavailable) => refusals.restore_misbound(summary),
+            Err(PersistError::Fatal(failure)) => return Err(failure),
+        }
+    }
+    if recorded {
+        *last_summary = Some(Instant::now());
+    }
+    Ok(())
 }

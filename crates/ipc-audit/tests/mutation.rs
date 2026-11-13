@@ -42,12 +42,15 @@ fn event_mutations() {
     for event in all_samples() {
         let valid = encode_event(&event).unwrap();
         sweep(valid.as_bytes(), |bytes| {
-            if decode_event(bytes).is_ok() {
+            let peeked = ipc_audit::peek_shape(bytes);
+            if let Ok(decoded) = decode_event(bytes) {
                 assert_eq!(
                     event_round_trip_is_canonical(bytes),
                     Ok(true),
                     "non-canonical accept"
                 );
+                // auditd's two-octet peek agrees with the decoder (Q-341).
+                assert_eq!(peeked, Some(decoded.shape()));
             }
         });
     }
@@ -120,6 +123,8 @@ fn arbitrary_input_never_panics() {
         vec![ipc_audit::EVENT_FORMAT, 2],
         vec![ipc_audit::EVENT_FORMAT, 3],
         vec![ipc_audit::EVENT_FORMAT, 4],
+        vec![ipc_audit::EVENT_FORMAT, 5],
+        vec![ipc_audit::EVENT_FORMAT, 6],
         encode_request(&AuditRequest::Ping).unwrap().body().to_vec(),
     ];
     for round in 0..5_000 {

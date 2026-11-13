@@ -26,17 +26,29 @@
 //! [`encode_event`] / [`decode_event`]: `event_format (1) ‖ shape ‖ fields`,
 //! one shape per source — [`KdcEvent`] (crates/kdc `AuditEvent`),
 //! [`KeydRecord`] (crates/keyd `AuditRecord`), [`LdapEvent`] (crates/ldap
-//! `AuditEvent`) — plus [`WindowSummary`]. Each carries exactly the
+//! `AuditEvent`) — plus [`WindowSummary`], and the admin-plane shapes
+//! [`DirAdminEvent`] (sent by dird: the decision before each admin commit
+//! and the outcome after it) and [`AdmindEvent`] (sent by admind) — docs/51
+//! §5.7, task A7. Each carries exactly the
 //! non-secret fields its source exposes; no field can hold a key, password,
-//! ticket, PAC, plaintext, ciphertext, attribute value or request octets
-//! (docs/37 §2; docs/10 I8; docs/49 §10.1). Client strings are kept only as
+//! ticket, PAC, plaintext, ciphertext, free attribute value or request
+//! octets (docs/37 §2; docs/10 I8; docs/49 §10.1) — the only request values
+//! kept are `DirAdmin`'s three closed forms (enable direction, accountExpires
+//! never-or-FILETIME, one of six groupType codes; docs/questions/Q-340
+//! item 5). Client strings are kept only as
 //! printable ASCII ≤ 256 octets, else a marker ([`AuditText`]). Codes come
 //! from closed tables mirroring the source enumerations by name
 //! (crate::codes). The conversions from the source types are behind the
 //! features `kdc`, `keyd`, `ldap` — none on by default (decision A-66):
 //! each daemon enables only the conversion it sends (keyd-daemon: `keyd`;
 //! auditd and dird: none), so a whole-workspace build does not unify the
-//! others into them.
+//! others into them. The admin-plane shapes need no feature: they have no
+//! source crate and are built from this crate's types.
+//!
+//! [`peek_shape`] reads only an event's format and shape octets: auditd uses
+//! it to accept each shape only from its one sender (`Kdc` ⇐ kdc, `Keyd` ⇐
+//! keyd, `Ldap` / `DirAdmin` ⇐ dird, `Admind` ⇐ admind; `WindowSummary` from
+//! any), without decoding payloads (docs/questions/Q-341, option (a)).
 //!
 //! # Overflow policy (docs/questions/Q-218, A-57)
 //!
@@ -45,7 +57,9 @@
 //! issue; keyd answers `Busy`); unauthenticated noise may hold only a share
 //! of the window and is otherwise counted into a [`WindowSummary`]; nothing
 //! stops the process. "No unaudited issuance, and log overflow does not turn
-//! into shutdown."
+//! into shutdown." Every `DirAdmin` event is gating; an `Admind` event is
+//! noise exactly when it records a refused connection or a malformed frame
+//! ([`AdmindEvent::is_noise`]), so neither can make admind unavailable.
 //!
 //! # Security
 //!
@@ -64,12 +78,19 @@
 //! PENDING-OWNER (A-57, A-58, P-1), and the public API of crates/ipc,
 //! crates/kdc (audit, accounts, transport), crates/keyd (audit, authz,
 //! model), crates/ldap (audit, engine), crates/pdp (model), crates/parse-ldap
-//! (error, message), crates/dtyp (sid, guid), crates/krb-proto (basic). No
-//! other implementation, serializer, RPC framework or audit format was
-//! consulted or recalled (AGENTS.md §1-3).
+//! (error, message), crates/dtyp (sid, guid), crates/krb-proto (basic). The
+//! admin-plane shapes (task A7) were written only from docs/51 (§1, §2, §3,
+//! §5.1-§5.8, §6, §7, §8.3, §9, §11, §12 and decision A-72), docs/50 §3, §8,
+//! docs/37, docs/43 (D175), PENDING-OWNER (A-57, A-64, A-66..A-80),
+//! docs/questions Q-218, Q-252, and the public API of crates/ipc (error,
+//! refused) and crates/keyd-types (error). No other implementation,
+//! serializer, RPC framework or audit format was consulted or recalled
+//! (AGENTS.md §1-3).
 //!
-//! Spec: docs/50 R50-17, §3.3, §8.1, §10; docs/37 §2; Q-218 (A-57); A-59.
+//! Spec: docs/50 R50-17, §3.3, §8.1, §10; docs/37 §2; Q-218 (A-57); A-59;
+//! docs/51 §5.7 (A-72).
 
+mod admin;
 mod channel;
 mod codes;
 mod convert;
@@ -78,6 +99,11 @@ mod event;
 mod values;
 mod window;
 
+pub use admin::{
+    AccountExpiresValue, AdmindActivity, AdmindEvent, Allocation, DecisionResult, DirAdminEvent,
+    DirAdminStage, OutcomeResult, PasswordResult, PasswordStep, TargetName, MAX_APPROVERS,
+    MAX_REPORTED_KVNOS, MAX_TARGET_NAMES,
+};
 pub use channel::{
     decode_reply, decode_request, encode_reply, encode_request, Ack, Append, AppendCursor,
     AuditReply, AuditRequest, SeqRange, SequenceError, AUDIT_CHANNEL, AUDIT_MAGIC, AUDIT_VERSION,
@@ -85,20 +111,23 @@ pub use channel::{
     REQUEST_BODY_LIMIT,
 };
 pub use codes::{
-    BindMechanismCode, CodecErrorCode, CodecLimit, EventShape, IpZone, KdcExchange, KdcOutcomeCode,
-    KdcReason, KdcTransport, KeyPurposeCode, KeydOperation, KeydOutcome, KeydReason, KeydRole,
-    LdapAction, LdapOperationCode, LdapReason, LdapTargetCode, LdapTransport, PdpReasonCode,
-    SearchScope, UnsupportedOpCode,
+    AccountExpiresCode, AdminFailure, AdminNameKind, AdminPhase, AdminRefusal, AdmindActivityCode,
+    BindMechanismCode, CodecErrorCode, CodecLimit, ConnectionRefusal, DecisionResultCode,
+    DirAdminOperation, EnableDirection, EventShape, ForwardDecision, FrameErrorCode, GroupTypeCode,
+    IpZone, KdcExchange, KdcOutcomeCode, KdcReason, KdcTransport, KeyPurposeCode, KeyadmOperation,
+    KeydOperation, KeydOutcome, KeydReason, KeydRole, LdapAction, LdapOperationCode, LdapReason,
+    LdapTargetCode, LdapTransport, OutcomeResultCode, PasswordFailure, PasswordResultCode,
+    PasswordStepCode, PdpReasonCode, SearchScope, UnsupportedOpCode,
 };
 pub use error::EventError;
 pub use event::{
-    decode_event, encode_event, event_round_trip_is_canonical, BindMechanism, EventBody,
-    EventBytes, KdcEvent, KdcOutcome, KeyRef, KeydRecord, LdapBind, LdapEvent, LdapOperation,
-    LdapSearch, LdapTarget, TransportSecurity, WindowSummary, EVENT_FORMAT, MAX_EVENT_OCTETS,
-    MAX_FILTER_ATTRS,
+    decode_event, encode_event, event_round_trip_is_canonical, peek_shape, BindMechanism,
+    EventBody, EventBytes, KdcEvent, KdcOutcome, KeyRef, KeydRecord, LdapBind, LdapEvent,
+    LdapOperation, LdapSearch, LdapTarget, TransportSecurity, WindowSummary, EVENT_FORMAT,
+    MAX_EVENT_OCTETS, MAX_FILTER_ATTRS,
 };
 pub use values::{
-    AuditText, CalendarTime, CodecError, PdpReason, Principal, SidValue, MAX_NAME_COMPONENTS,
-    MAX_SID_SUB_AUTHORITIES, MAX_TEXT_OCTETS,
+    AuditText, BoundedSeq, CalendarTime, CodecError, PdpReason, Principal, SidValue,
+    MAX_NAME_COMPONENTS, MAX_SID_SUB_AUTHORITIES, MAX_TEXT_OCTETS,
 };
 pub use window::{NoiseAdmission, Reservation, SendWindow, WindowConfig, WindowError, WindowFull};

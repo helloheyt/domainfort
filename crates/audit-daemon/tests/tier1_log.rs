@@ -7,7 +7,10 @@
 
 mod common;
 
-use audit_daemon::own_event::{AuditdEvent, PeersRefused, SegmentRecovered, TornKind};
+use audit_daemon::binding::{batch_permitted, bound_source, permits};
+use audit_daemon::own_event::{
+    AuditdEvent, EventsMisbound, PeersRefused, SegmentRecovered, TornKind, EVENTS_MISBOUND_LEN,
+};
 use audit_daemon::recovery::{open_log, StartKind, StartupError};
 use audit_daemon::segments::{
     list_segments, segment_path, ListingError, SegmentFactory, SEGMENT_DIGITS,
@@ -70,6 +73,143 @@ fn own_event_layouts() {
         last_uid: 501,
     });
     assert_eq!(refused.encode(), expected_refused(2, 1, 501));
+    // Kind 0x03, appended for the source binding (docs/questions/Q-341).
+    let misbound = AuditdEvent::EventsMisbound(EventsMisbound {
+        refused_batches: 3,
+        last_uid: 803,
+    });
+    assert_eq!(misbound.encode(), expected_misbound(3, 803));
+    assert_eq!(misbound.encode().len(), EVENTS_MISBOUND_LEN);
+}
+
+// ---- the source binding of the event shapes ----------------------------------
+
+/// Source: docs/50 §3.2 (the source is the connection's uid), §4.2 (dird
+/// writes the LDAP events), §8.1; docs/51 §5.7 (dird is the source of the
+/// admin write events; admind sends its own); docs/questions/Q-341
+/// (option (a): every shape bound, `WindowSummary` from any source).
+#[test]
+fn binding_table() {
+    use ipc_audit::EventShape;
+    assert_eq!(bound_source(EventShape::Kdc), Some(Source::Kdc));
+    assert_eq!(bound_source(EventShape::Keyd), Some(Source::Keyd));
+    assert_eq!(bound_source(EventShape::Ldap), Some(Source::Dird));
+    assert_eq!(bound_source(EventShape::DirAdmin), Some(Source::Dird));
+    assert_eq!(bound_source(EventShape::Admind), Some(Source::Admind));
+    assert_eq!(bound_source(EventShape::WindowSummary), None);
+    // No shape is bound to ldap-front (it sends no events) or to auditd
+    // (its own records never come over the socket).
+    for shape in EventShape::ALL {
+        assert_ne!(bound_source(*shape), Some(Source::LdapFront));
+        assert_ne!(bound_source(*shape), Some(Source::Auditd));
+    }
+    // Every shape of the closed table is classified (a new shape fails
+    // the exhaustive match in `bound_source` until it is).
+    assert_eq!(EventShape::ALL.len(), 6);
+}
+
+/// Source: docs/50 §3.2, §4.2, §8.1; docs/51 §5.7; docs/questions/Q-341.
+/// Each shape is permitted only from its sender, `WindowSummary` from any;
+/// opaque payloads (not in the event format) from any source, as before.
+#[test]
+fn binding_permits() {
+    let dir_admin = encoded(&dir_admin_pair());
+    let admind = encoded(&admind_events());
+    for source in Source::ALL {
+        for event in &dir_admin {
+            assert_eq!(permits(source, event), source == Source::Dird, "{source:?}");
+        }
+        for event in &admind {
+            assert_eq!(
+                permits(source, event),
+                source == Source::Admind,
+                "{source:?}"
+            );
+        }
+        // Opaque test payloads (not the event format) are not bound.
+        for event in events(4, 32, 7) {
+            assert!(permits(source, &event));
+        }
+        // The older shapes (only the shape octet is read): Kdc ⇐ kdc,
+        // Keyd ⇐ keyd, Ldap ⇐ dird, WindowSummary ⇐ any.
+        for (shape, sender) in [
+            (1u8, Some(Source::Kdc)),
+            (2, Some(Source::Keyd)),
+            (3, Some(Source::Dird)),
+            (4, None),
+        ] {
+            let event = ipc_audit::EventBytes::new(vec![ipc_audit::EVENT_FORMAT, shape]).unwrap();
+            let expected = match sender {
+                Some(sender) => sender == source,
+                None => true,
+            };
+            assert_eq!(
+                permits(source, &event),
+                expected,
+                "{source:?} shape {shape}"
+            );
+        }
+        // Another format octet: not bound.
+        let event = ipc_audit::EventBytes::new(vec![ipc_audit::EVENT_FORMAT + 1, 1]).unwrap();
+        assert!(permits(source, &event));
+        // A shape code past the table, or another format octet: not bound.
+        let event = ipc_audit::EventBytes::new(vec![ipc_audit::EVENT_FORMAT, 7, 0]).unwrap();
+        assert!(permits(source, &event));
+        let event = ipc_audit::EventBytes::new(vec![0xAD, 5]).unwrap();
+        assert!(permits(source, &event));
+    }
+    // The shape octet alone decides — the rest is never decoded.
+    let bare = ipc_audit::EventBytes::new(vec![ipc_audit::EVENT_FORMAT, 5]).unwrap();
+    assert!(permits(Source::Dird, &bare));
+    assert!(!permits(Source::Kdc, &bare));
+    // One misbound event refuses the whole batch.
+    let mut batch = events(3, 32, 9);
+    assert!(batch_permitted(Source::Kdc, &batch));
+    batch.push(dir_admin[0].clone());
+    assert!(!batch_permitted(Source::Kdc, &batch));
+    assert!(batch_permitted(Source::Dird, &batch));
+}
+
+/// Source: docs/51 §5.7 (the new shapes are persisted like every event),
+/// docs/50 §3.2, §8.1 (transport identity), §7.5 (the chain verifies at the
+/// next start). The admin-plane events are stored through the existing
+/// writer path, verify, and decode back to themselves.
+#[test]
+fn admin_events_persist_and_verify_at_restart() {
+    let dir = TempDir::new();
+    let mut sink = open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID)
+        .expect("created")
+        .sink;
+    let dir_admin = dir_admin_pair();
+    let admind = admind_events();
+    sink.append_events(Source::Dird, 802, 1, &encoded(&dir_admin))
+        .expect("dird batch persisted");
+    let persisted = sink
+        .append_events(Source::Admind, 806, 1, &encoded(&admind))
+        .expect("admind batch persisted");
+    drop(sink);
+
+    // The next start verifies every segment (A-66) and resumes.
+    let reopened = open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID).expect("verifies");
+    assert_eq!(reopened.start, StartKind::Resumed);
+    assert_eq!(reopened.sink.head(), persisted.head);
+    drop(reopened);
+
+    let (records, head) = read_segment(&dir.base(), 1, Anchor::Genesis);
+    assert_eq!(head, persisted.head);
+    assert_eq!(records.len(), 4);
+    let expected: Vec<(Source, u32, u64, &ipc_audit::EventBody)> = vec![
+        (Source::Dird, 802, 1, &dir_admin[0]),
+        (Source::Dird, 802, 2, &dir_admin[1]),
+        (Source::Admind, 806, 1, &admind[0]),
+        (Source::Admind, 806, 2, &admind[1]),
+    ];
+    for (record, (source, uid, seq, event)) in records.iter().zip(expected) {
+        assert_eq!(record.source, source);
+        assert_eq!(record.source_uid, uid);
+        assert_eq!(record.source_seq, seq);
+        assert_eq!(&ipc_audit::decode_event(&record.payload).unwrap(), event);
+    }
 }
 
 /// Source: audit_daemon::segments naming rule (docs/questions/Q-265 item 2).
