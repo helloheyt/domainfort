@@ -18,6 +18,9 @@
 # תלויות מאושרות (הכרעות 2026-11-12, מקושרות לא-מועתקות — D2; יירשמו ב-Cargo של
 # כל crate כשייווצר): redb (אחסון, OD-4); RustCrypto כברירת-מחדל + aws-lc-rs
 # כ-backend מאומת-FIPS, ו-rustls ל-TLS (קריפטו/PQC, OD-9/D180).
+# הכרעת-בעלים 2026-11-13 (P-12): tokio (runtime אסינכרוני) ו-rustix (זיהוי-עמית בלי unsafe
+# בקוד שלנו). כל התלויות יורדות אצל מי שבונה (`scripts/install-deps.sh` / cargo) — שום קוד
+# של צד-שלישי לא נמצא במאגר.
 
 [workspace]
 resolver = "2"
