@@ -253,8 +253,9 @@ fn anonymous_floor(req: &AccessRequest, pol: &PolicySnapshot) -> Option<Transpor
 ///   Kerberos messages carry their own protection, verified inside keyd
 ///   (pre-authentication; TGT + authenticator + req-body checksum). FAST is
 ///   a separate input (`AuthContext.armored`, docs/11 §1), not a transport
-///   property, and is not mapped to `encrypted`; making it mandatory by
-///   policy (D126, docs/30 §5) is a follow-up.
+///   property, and is not mapped to `encrypted`; it is made mandatory by
+///   policy rules (`Match.auth`, D126; docs/48 §7.2; Q-127 interim — see
+///   [`crate::mandatory_fast`]), not by this table.
 /// - Every other write (`is_write`): the write floor; every other read
 ///   (including `DnsXfer`): the read floor.
 #[must_use]

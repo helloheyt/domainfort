@@ -15,7 +15,9 @@ use krb_proto::constants::{
     KRB_NT_SRV_INST, PA_ENC_TIMESTAMP, PA_ETYPE_INFO2,
 };
 use krb_proto::{EtypeInfo2, HostAddress, HostAddresses, MethodData, TicketFlags};
-use pdp::{ActionMatch, ContextMatch, Effect, Match, ResourceMatch, Rule, RuleId, SubjectMatch};
+use pdp::{
+    ActionMatch, AuthMatch, ContextMatch, Effect, Match, ResourceMatch, Rule, RuleId, SubjectMatch,
+};
 
 /// RFC 4120 3.1.3: PREAUTH_REQUIRED's ETYPE-INFO2, then a PA-ENC-TIMESTAMP
 /// made from the advertised salt, gives a TGT. RFC 4120 5.4.2 / 3.1.5: the
@@ -221,6 +223,7 @@ fn pdp_deny_at_as_is_policy() {
             resource: ResourceMatch::Any,
             subject: SubjectMatch::Principal(alice_sid()),
             context: ContextMatch::ANY,
+            auth: AuthMatch::ANY,
         },
         obligations: Vec::new(),
     });

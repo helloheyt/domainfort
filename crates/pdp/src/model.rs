@@ -84,7 +84,9 @@ pub enum ClaimValue {
 pub struct AuthContext {
     /// Strength of the authentication. Spec: docs/11 §1.
     pub strength: AuthStrength,
-    /// FAST armoring was used. Spec: docs/11 §1.
+    /// FAST armoring was used. Set by the PEP only after keyd verified the
+    /// armor (docs/48 §4.2, R48-10; P3); rules match it through
+    /// `Match.auth` (docs/48 §7.2). Spec: docs/11 §1.
     pub armored: bool,
     /// Age of the ticket, as supplied by the PEP (no clock is read here).
     /// Spec: docs/11 §1.
@@ -335,8 +337,8 @@ pub enum Action {
     /// messages carry their own protection, verified inside keyd
     /// (pre-authentication; TGT + authenticator + req-body checksum). FAST is
     /// reported separately in `AuthContext.armored` and is NOT mapped to
-    /// `TransportSec.encrypted`; requiring it by policy (D126, docs/30 §5) is
-    /// a follow-up.
+    /// `TransportSec.encrypted`; policy rules require it (`Match.auth`, D126;
+    /// docs/48 §7.2 — see [`crate::mandatory_fast`]).
     KdcAs,
     /// KDC: TGS exchange. (No transport floor — see `KdcAs`.)
     KdcTgs,

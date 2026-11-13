@@ -59,8 +59,16 @@
 //!   "List Object" mode ([MS-ADTS] 5.1.3.3.6), and the "RIGHT_DS_DELETE_CHILD
 //!   on the parent" alternative for deletes ([MS-ADTS] 3.1.1.5.5.4). Each
 //!   omission can only remove grants, never add them.
-//! - FAST as a mandatory input for KDC actions (D126, docs/30 §5): a
-//!   follow-up; `AuthContext.armored` is carried but not yet required.
+//!
+//! # Mandatory FAST (D126) — in the rule language, not in `decide`
+//!
+//! `decide` never reads `AuthContext.armored` itself. A rule can require it:
+//! [`Match`]`.auth` ([`AuthMatch`]) on the Allow side, and the negated
+//! subject predicate [`SubjectMatch::NotMemberOf`] for an explicit Deny,
+//! which takes effect in Deny rules only ([`Rule::applies`]). The default
+//! rule set of the Q-127 interim decision (owner item P-10) is
+//! [`mandatory_fast_rules`] — policy data, with the bootstrap-allowed group
+//! SID supplied by the caller (docs/48 §7).
 //!
 //! # Provenance
 //!
@@ -76,16 +84,21 @@
 //!   (BlockOwnerImplicitRights row), 6.1.1.2.6.18;
 //! - [MS-ADA1] v20180912 (pinned PDF sha256 3885c568…6a50): 2.185
 //!   (dNSHostName: schemaIdGuid = attributeSecurityGuid, Q-081);
-//! - this project's docs/05, docs/06, docs/11, docs/25 §5.1, docs/45 §5-7.
+//! - this project's docs/05, docs/06, docs/11, docs/25 §5.1, docs/45 §5-7,
+//!   docs/48 §4.2, §7 (and its closing decision), docs/questions/Q-127
+//!   (interim decision, owner item P-10).
 //!
 //! No other implementation was consulted or recalled (AGENTS.md §1-3).
 //! Spec gaps, conflicts and design decisions: docs/questions/Q-050 (resolved,
 //! A-21), Q-051 (deferred: owner item P-8 + lab recording), Q-052 (resolved,
 //! A-22), Q-081 (resolved, A-28: the object type tree's class and duplicate
-//! GUIDs — see [`access_check`]).
+//! GUIDs — see [`access_check`]), Q-127 (deferred: owner item P-10; built
+//! per the interim decision), Q-130 (open: the mandatory-FAST rule-language
+//! interpretations and the bootstrap SID).
 
 pub mod access_check;
 mod decide;
+pub mod mandatory_fast;
 pub mod model;
 pub mod pip;
 pub mod policy;
@@ -93,6 +106,7 @@ mod visibility;
 
 pub use access_check::{acl_grants, dacl_preconditions, DaclRefusal, DirObjectContext, Right};
 pub use decide::{decide, is_write, required_sec};
+pub use mandatory_fast::{mandatory_fast_rules, MANDATORY_FAST_RULE_COUNT};
 pub use model::{
     AccessRequest, Action, ActionClass, AttrId, AuthContext, AuthStrength, ClaimId, ClaimValue,
     Constraint, Context, ControlRightId, Decision, Dn, Effect, FilePath, Instant, IpScope,
@@ -102,7 +116,7 @@ pub use model::{
 };
 pub use pip::{AttrClass, Pip, PipError};
 pub use policy::{
-    ActionMatch, AnonymousGrant, ContextMatch, Match, PolicySnapshot, PolicyVersion, ResourceMatch,
-    Rule, SubjectMatch, TimeWindow,
+    ActionMatch, AnonymousGrant, AuthMatch, ContextMatch, Match, PolicySnapshot, PolicyVersion,
+    ResourceMatch, Rule, SubjectMatch, TimeWindow,
 };
 pub use visibility::{decide_visibility, DirObjectRef, Visible};

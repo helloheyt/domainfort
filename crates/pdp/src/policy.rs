@@ -9,11 +9,25 @@
 //! Matching is exact and non-recursive: no pattern language, no regular
 //! expressions, no DN parsing (DNs are compared component-wise, see
 //! [`Dn::is_within`]). Every matcher is a total function.
+//!
+//! Mandatory FAST (D126) is expressed in the rule language, not hard-wired
+//! in `decide`. Spec: docs/48 §7.2 layer 2 — option (i) `Match.auth:
+//! AuthMatch { armored: Option<bool> }` on the Allow side, and option (ii) a
+//! negated subject predicate (`SubjectMatch::NotMemberOf`) so that an
+//! explicit Deny can be written ("explicit Deny wins", docs/11 §3, P4);
+//! Q-127 interim decision (owner item P-10): (ג) = (ii). Neither extension
+//! widens an existing rule's grants:
+//! - a rule whose `auth` is [`AuthMatch::ANY`] matches exactly what it
+//!   matched before `auth` existed (the conjunction gains a `true` term);
+//! - an `auth` constraint only removes requests from a rule's match set;
+//! - a negated subject predicate takes effect in Deny rules only; in an
+//!   Allow rule it matches nothing ([`Rule::applies`]) — DELIBERATE, fail
+//!   closed, see Q-130.
 
 use crate::model::{
-    AccessRequest, Action, ActionClass, ClaimId, ClaimValue, Dn, Effect, Instant, IpScope,
-    KerbResKind, Obligation, PolicyScope, PrincipalId, Resource, RuleId, ShareId, Subject, Tier,
-    TransportSec, Uuid, ZoneId,
+    AccessRequest, Action, ActionClass, AuthContext, ClaimId, ClaimValue, Dn, Effect, Instant,
+    IpScope, KerbResKind, Obligation, PolicyScope, PrincipalId, Resource, RuleId, ShareId, Subject,
+    Tier, TransportSec, Uuid, ZoneId,
 };
 
 /// A global rule. Spec: docs/11 §3.
@@ -31,7 +45,31 @@ pub struct Rule {
     pub obligations: Vec<Obligation>,
 }
 
-/// The applicability condition of a rule. Spec: docs/11 §3.
+impl Rule {
+    /// `true` if this rule takes part in the decision for `req`.
+    ///
+    /// A Deny rule applies when its [`Match`] holds. An Allow rule applies
+    /// when its `Match` holds AND its subject predicate is not negated: an
+    /// Allow with [`SubjectMatch::NotMemberOf`] matches nothing.
+    ///
+    /// DELIBERATE (fail closed, AGENTS.md §6; Q-130): the negated predicate
+    /// exists to write an explicit Deny (docs/48 §7.2 option (ii); Q-127
+    /// (ג) = (ii)). In a grant it would hold for every subject whose
+    /// membership is absent from the request — a grant on missing data. A
+    /// negation can therefore only remove grants (through a Deny, P4), never
+    /// add one. Spec: docs/11 §3 ("explicit Deny wins; without a matching
+    /// Allow → Deny"), §4 (`eval_rules`), §10 P2, P4.
+    #[must_use]
+    pub fn applies(&self, req: &AccessRequest) -> bool {
+        match self.effect {
+            Effect::Deny => self.when.matches(req),
+            Effect::Allow => !self.when.subject.is_negated() && self.when.matches(req),
+        }
+    }
+}
+
+/// The applicability condition of a rule. Spec: docs/11 §3; docs/48 §7.2
+/// (`auth`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Match {
     /// Which actions. Spec: docs/11 §3 ("Exact | AnyOf | Class").
@@ -45,6 +83,51 @@ pub struct Match {
     /// Which contexts. Spec: docs/11 §3 ("transport_sec floor, source zone,
     /// time window").
     pub context: ContextMatch,
+    /// Which authentication contexts. [`AuthMatch::ANY`] keeps the rule
+    /// exactly as it was without this field. Spec: docs/48 §7.2 option (i)
+    /// (`Match.auth: AuthMatch { armored: Option<bool> }`); Q-127 interim
+    /// decision (P-10); docs/11 §1 (`AuthContext`).
+    pub auth: AuthMatch,
+}
+
+/// Matcher on the request's authentication context (`Subject.auth`).
+///
+/// `armored: None` — any request; `Some(true)` — only a request whose
+/// `AuthContext.armored` is `true` (FAST was used); `Some(false)` — only a
+/// request that was not armored. An `Allow` rule with `Some(true)` is the
+/// Allow-side half of mandatory FAST; deny-by-default does the rest (no
+/// matching Allow → Deny). Spec: docs/48 §7.2 option (i), §4.2 (when the
+/// PEP reports `armored = true`: only after keyd verified the armor —
+/// R48-10); Q-127 interim decision (P-10); docs/11 §1 (`armored: bool //
+/// FAST`), §3, P3 (the field is set by the PEP from the verified exchange,
+/// never claimed by the client).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthMatch {
+    /// The required value of `AuthContext.armored`, or `None` for any.
+    pub armored: Option<bool>,
+}
+
+impl AuthMatch {
+    /// Matches every authentication context (the behaviour of a rule before
+    /// `auth` existed).
+    pub const ANY: AuthMatch = AuthMatch { armored: None };
+
+    /// Matches only FAST-armored requests. Spec: docs/48 §7.2 option (i).
+    pub const ARMORED: AuthMatch = AuthMatch {
+        armored: Some(true),
+    };
+
+    /// Matches only requests that were not armored. Spec: docs/48 §7.2
+    /// option (ii) (the Deny side), §7.3 (the bootstrap Allow).
+    pub const UNARMORED: AuthMatch = AuthMatch {
+        armored: Some(false),
+    };
+
+    /// `true` if `auth` is matched. Spec: docs/48 §7.2; docs/11 §1, §3.
+    #[must_use]
+    pub fn matches(&self, auth: &AuthContext) -> bool {
+        self.armored.is_none_or(|want| want == auth.armored)
+    }
 }
 
 /// Action matcher. Spec: docs/11 §3.
@@ -151,6 +234,17 @@ pub enum SubjectMatch {
     Principal(PrincipalId),
     /// The principal is this SID or the (expanded) groups contain it.
     MemberOf(PrincipalId),
+    /// The exact complement of [`SubjectMatch::MemberOf`]: neither the
+    /// principal nor the (expanded) groups are this SID.
+    ///
+    /// Takes effect in a Deny rule only; in an Allow rule it matches nothing
+    /// ([`Rule::applies`], fail closed). A set of principals is named by one
+    /// group SID: `Subject.groups` is the expanded, nested membership from
+    /// authoritative data (docs/11 §1). Spec: docs/48 §7.2 option (ii)
+    /// ("explicit Deny with a negative predicate
+    /// (`SubjectMatch::NotMemberOf`)"); Q-127 interim decision (P-10), (ג) =
+    /// (ii); docs/11 §3 (subject predicate; explicit Deny wins), P4.
+    NotMemberOf(PrincipalId),
     /// The subject's (PIP-verified) tier is exactly this one.
     Tier(Tier),
     /// The subject carries this claim with exactly this value.
@@ -158,19 +252,41 @@ pub enum SubjectMatch {
 }
 
 impl SubjectMatch {
-    /// `true` if `subject` is matched. Spec: docs/11 §3.
+    /// `true` if `subject` is matched. Spec: docs/11 §3; docs/48 §7.2
+    /// (`NotMemberOf`).
     #[must_use]
     pub fn matches(&self, subject: &Subject) -> bool {
         match self {
             SubjectMatch::Any => true,
             SubjectMatch::Principal(sid) => subject.principal == *sid,
-            SubjectMatch::MemberOf(sid) => {
-                subject.principal == *sid || subject.groups.contains(sid)
-            }
+            SubjectMatch::MemberOf(sid) => is_member(subject, sid),
+            SubjectMatch::NotMemberOf(sid) => !is_member(subject, sid),
             SubjectMatch::Tier(tier) => subject.tier == *tier,
             SubjectMatch::Claim(id, value) => subject.claims.get(id) == Some(value),
         }
     }
+
+    /// `true` for a negated predicate, which [`Rule::applies`] admits in Deny
+    /// rules only. Spec: docs/48 §7.2 option (ii); Q-130.
+    #[must_use]
+    pub fn is_negated(&self) -> bool {
+        match self {
+            SubjectMatch::NotMemberOf(_) => true,
+            SubjectMatch::Any
+            | SubjectMatch::Principal(_)
+            | SubjectMatch::MemberOf(_)
+            | SubjectMatch::Tier(_)
+            | SubjectMatch::Claim(..) => false,
+        }
+    }
+}
+
+/// The principal is `sid`, or the expanded groups contain it. The single
+/// definition behind `MemberOf` and its complement `NotMemberOf`, so the two
+/// can never drift apart. Spec: docs/11 §1 (`groups`: expanded, nested),
+/// §3.
+fn is_member(subject: &Subject, sid: &PrincipalId) -> bool {
+    subject.principal == *sid || subject.groups.contains(sid)
 }
 
 /// An inclusive window of explicit time. Constructed only through
@@ -234,13 +350,15 @@ impl ContextMatch {
 }
 
 impl Match {
-    /// `true` if all four matchers hold. Spec: docs/11 §3, §4 (`eval_rules`).
+    /// `true` if all five matchers hold. Spec: docs/11 §3, §4 (`eval_rules`);
+    /// docs/48 §7.2 (`auth`).
     #[must_use]
     pub fn matches(&self, req: &AccessRequest) -> bool {
         self.action.matches(&req.action)
             && self.resource.matches(&req.resource)
             && self.subject.matches(&req.subject)
             && self.context.matches(&req.context)
+            && self.auth.matches(&req.subject.auth)
     }
 }
 
@@ -322,8 +440,8 @@ pub(crate) struct CoarseResult {
     pub(crate) obligations: Vec<Obligation>,
 }
 
-/// Collect the matching rules. Does nothing beyond matching and collecting.
-/// Spec: docs/11 §4 (`eval_rules`).
+/// Collect the applying rules ([`Rule::applies`]). Does nothing beyond
+/// matching and collecting. Spec: docs/11 §4 (`eval_rules`).
 pub(crate) fn eval_rules(req: &AccessRequest, pol: &PolicySnapshot) -> CoarseResult {
     let mut result = CoarseResult {
         denied_by: None,
@@ -331,7 +449,7 @@ pub(crate) fn eval_rules(req: &AccessRequest, pol: &PolicySnapshot) -> CoarseRes
         obligations: Vec::new(),
     };
     for rule in pol.rules() {
-        if !rule.when.matches(req) {
+        if !rule.applies(req) {
             continue;
         }
         match rule.effect {

@@ -10,13 +10,14 @@
 mod common;
 
 use common::*;
-use dtyp::{Ace, SecurityDescriptor};
+use dtyp::{Ace, SecurityDescriptor, Sid};
 use pdp::access_check::rights::*;
 use pdp::{
-    acl_grants, decide, is_write, AccessRequest, Action, ActionMatch, AttrClass, AttrId,
-    AuthStrength, ContextMatch, ControlRightId, Decision, DirObjectContext, Effect, Instant, Match,
-    ObjClass, Obligation, PolicySnapshot, ReasonCode, ResourceMatch, Right, Rule, RuleId, Subject,
-    SubjectMatch, Tier, TimeWindow, TransportSec,
+    acl_grants, decide, is_write, mandatory_fast_rules, AccessRequest, Action, ActionClass,
+    ActionMatch, AttrClass, AttrId, AuthMatch, AuthStrength, ContextMatch, ControlRightId,
+    Decision, DirObjectContext, Effect, Instant, Match, ObjClass, Obligation, PolicySnapshot,
+    ReasonCode, ResourceMatch, Right, Rule, RuleId, Subject, SubjectMatch, Tier, TimeWindow,
+    TransportSec,
 };
 
 // ------------------------------------------------------------ domains ----
@@ -835,4 +836,432 @@ fn layer2_follows_required_sec_for_every_action() {
             assert_eq!(d.effect, Effect::Allow, "{action:?}: {d:?}");
         }
     }
+}
+
+// ------------------------------------- mandatory FAST: never widens ----
+//
+// Source: docs/48 §7.2 (`Match.auth`, option (i); `NotMemberOf`, option
+// (ii)); Q-127 interim decision (P-10, (ג) = (ii)); docs/11 §3 (rules;
+// explicit Deny wins), §10 (P1, P2, P4, P7). Hand-made domains; no vector
+// from another implementation.
+
+/// The Kerberos policies of the equivalence domain: those of `policies()`
+/// plus an Allow for every Kerberos action, the same with a Deny for one
+/// group's TGS, and an Allow for AS of a TGT only. None names `auth` or a
+/// negated subject — they are rules as written before either existed.
+fn kerberos_policies() -> Vec<PolicySnapshot> {
+    let allow_kerberos = Rule {
+        id: RuleId(4),
+        effect: Effect::Allow,
+        when: Match {
+            action: ActionMatch::Class(ActionClass::Kerberos),
+            ..match_all()
+        },
+        obligations: vec![],
+    };
+    let deny_tgs_group = Rule {
+        id: RuleId(5),
+        effect: Effect::Deny,
+        when: Match {
+            action: ActionMatch::Exact(Action::KdcTgs),
+            subject: SubjectMatch::MemberOf(group()),
+            ..match_all()
+        },
+        obligations: vec![],
+    };
+    let allow_as_tgt = Rule {
+        id: RuleId(6),
+        effect: Effect::Allow,
+        when: Match {
+            action: ActionMatch::Exact(Action::KdcAs),
+            resource: ResourceMatch::Kerberos {
+                kind: Some(pdp::KerbResKind::Tgt),
+            },
+            ..match_all()
+        },
+        obligations: vec![],
+    };
+    let mut out = policies();
+    out.push(policy(vec![allow_kerberos.clone()]));
+    out.push(policy(vec![allow_kerberos, deny_tgs_group]));
+    out.push(policy(vec![allow_as_tgt]));
+    out
+}
+
+/// Every Kerberos action against a TGT and a service, plus one malformed
+/// pair (an AS on a DNS zone).
+fn kerberos_cases() -> Vec<(Action, pdp::Resource)> {
+    use pdp::{KerbResKind, Resource, Spn, ZoneId};
+    let tgt = Resource::Kerberos {
+        kind: KerbResKind::Tgt,
+    };
+    let service = Resource::Kerberos {
+        kind: KerbResKind::Service(Spn("host/a.test".into())),
+    };
+    let mut out = Vec::new();
+    for action in [
+        Action::KdcAs,
+        Action::KdcTgs,
+        Action::KdcS4u2Self,
+        Action::KdcS4u2Proxy,
+    ] {
+        out.push((action.clone(), tgt.clone()));
+        out.push((action, service.clone()));
+    }
+    out.push((
+        Action::KdcAs,
+        Resource::Dns {
+            zone: ZoneId("test".into()),
+            record: None,
+        },
+    ));
+    out
+}
+
+/// Visit every Kerberos `decide` input: both PIP tiers, every subject of
+/// `subjects()`, every pair of `kerberos_cases()`, every transport and every
+/// policy of `kerberos_policies()`.
+fn for_each_kerberos_input(mut f: impl FnMut(&AccessRequest, &PolicySnapshot, &MockPip)) {
+    let pols = kerberos_policies();
+    for pip_tier in [Tier::Tier0, Tier::Tier1] {
+        let mut pip = MockPip::with_sd(sd(None, vec![]));
+        pip.tiers.insert(user(), pip_tier);
+        for s in subjects() {
+            for (action, resource) in kerberos_cases() {
+                for sec in transports() {
+                    let req = AccessRequest {
+                        subject: s.clone(),
+                        resource: resource.clone(),
+                        action: action.clone(),
+                        context: pdp::Context {
+                            transport_sec: sec,
+                            transport: pdp::Transport::Kerberos,
+                            ..strong_context()
+                        },
+                    };
+                    for pol in &pols {
+                        f(&req, pol, &pip);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Both equivalence domains: the directory inputs of `for_each_decide_input`
+/// and the Kerberos inputs of `for_each_kerberos_input`.
+fn for_each_equivalence_input(mut f: impl FnMut(&AccessRequest, &PolicySnapshot, &MockPip)) {
+    for_each_decide_input(&mut f);
+    for_each_kerberos_input(&mut f);
+}
+
+/// The size of the equivalence domain the one-time pre-change check covered.
+const EQUIVALENCE_DOMAIN: usize = 142_776;
+
+/// The same request with `armored` set as given.
+fn with_armored(req: &AccessRequest, armored: bool) -> AccessRequest {
+    let mut r = req.clone();
+    r.subject.auth.armored = armored;
+    r
+}
+
+/// Membership computed here, independently of `SubjectMatch`.
+fn is_in(s: &Subject, sid: &Sid) -> bool {
+    s.principal == *sid || s.groups.contains(sid)
+}
+
+/// Rules without `auth` behave exactly as before (Q-127 interim; docs/48
+/// §7.2): over both domains (every input, `armored` true and false) the
+/// decision does not depend on `armored`. `decide` never reads it, so only
+/// a rule naming it could.
+///
+/// Checked once against the pre-change build (before `Match.auth` and
+/// `NotMemberOf` existed) over exactly this domain: the decisions (effect,
+/// reason, obligations) of all 142,776 inputs were identical to the
+/// post-change decisions with `armored = true` and with `armored = false`.
+#[test]
+fn auth_free_policies_ignore_armored() {
+    let mut count = 0usize;
+    for_each_equivalence_input(|req, pol, pip| {
+        let armored = decide(&with_armored(req, true), pol, pip);
+        let unarmored = decide(&with_armored(req, false), pol, pip);
+        assert_eq!(armored, unarmored, "{req:?}");
+        count += 1;
+    });
+    assert_eq!(
+        count, EQUIVALENCE_DOMAIN,
+        "the domain the pre-change check covered changed"
+    );
+}
+
+/// A rule whose `auth` is `AuthMatch::ANY` and whose subject is not negated
+/// matches exactly the conjunction of the four matchers it had before
+/// (docs/11 §3), and applies exactly when it matches, for either value of
+/// `armored`: `eval_rules` sees every pre-existing rule as before.
+#[test]
+fn auth_any_rules_match_exactly_as_before() {
+    let mut count = 0usize;
+    for_each_equivalence_input(|req, pol, _pip| {
+        for armored in [true, false] {
+            let r = with_armored(req, armored);
+            for rule in pol.rules() {
+                assert_eq!(rule.when.auth, AuthMatch::ANY);
+                assert!(!rule.when.subject.is_negated());
+                let before = rule.when.action.matches(&r.action)
+                    && rule.when.resource.matches(&r.resource)
+                    && rule.when.subject.matches(&r.subject)
+                    && rule.when.context.matches(&r.context);
+                assert_eq!(rule.when.matches(&r), before, "{rule:?} {r:?}");
+                assert_eq!(rule.applies(&r), before, "{rule:?} {r:?}");
+                count += 1;
+            }
+        }
+    });
+    assert!(count > 100_000, "domain too small: {count}");
+}
+
+/// An `auth` constraint added to an Allow rule only removes grants (docs/48
+/// §7.2 option (i); docs/11 P2): with `auth = c` on every Allow rule of a
+/// policy, the decision is unchanged where `c` matches the request and Deny
+/// where it does not. Both outcomes occur for inputs the unconstrained
+/// policy allows, so the check is not vacuous.
+#[test]
+fn auth_constraint_only_narrows_an_allow() {
+    let constrain = |pol: &PolicySnapshot, c: AuthMatch| {
+        let rules = pol
+            .rules()
+            .iter()
+            .cloned()
+            .map(|mut r| {
+                if r.effect == Effect::Allow {
+                    r.when.auth = c;
+                }
+                r
+            })
+            .collect();
+        policy(rules)
+    };
+    let (mut kept, mut narrowed) = (0usize, 0usize);
+    for_each_equivalence_input(|req, pol, pip| {
+        for armored in [true, false] {
+            let r = with_armored(req, armored);
+            let before = decide(&r, pol, pip);
+            for c in [AuthMatch::ARMORED, AuthMatch::UNARMORED] {
+                let after = decide(&r, &constrain(pol, c), pip);
+                if c.matches(&r.subject.auth) {
+                    assert_eq!(after, before, "{c:?} {r:?}");
+                } else {
+                    assert_eq!(after.effect, Effect::Deny, "{c:?} {r:?}");
+                }
+                if before.effect == Effect::Allow {
+                    if after.effect == Effect::Allow {
+                        kept += 1;
+                    } else {
+                        narrowed += 1;
+                    }
+                }
+            }
+        }
+    });
+    assert!(kept > 0 && narrowed > 0, "{kept} {narrowed}");
+}
+
+/// `NotMemberOf(s)` is the exact complement of `MemberOf(s)` (docs/48 §7.2
+/// option (ii)): over three principals, every subset of three groups and
+/// five SIDs. Only `NotMemberOf` is negated.
+#[test]
+fn not_member_of_is_the_exact_complement_of_member_of() {
+    let sids = [user(), other_user(), group(), other_group(), everyone()];
+    let pool = [group(), other_group(), everyone()];
+    for principal in [user(), other_user(), group()] {
+        for bits in 0u8..8 {
+            let groups: Vec<Sid> = pool
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| bits & (1 << i) != 0)
+                .map(|(_, s)| *s)
+                .collect();
+            let s = subject(principal, &groups, Tier::Tier1);
+            for sid in sids {
+                let member = SubjectMatch::MemberOf(sid).matches(&s);
+                assert_eq!(member, is_in(&s, &sid));
+                assert_eq!(SubjectMatch::NotMemberOf(sid).matches(&s), !member);
+                assert!(SubjectMatch::NotMemberOf(sid).is_negated());
+                assert!(!SubjectMatch::MemberOf(sid).is_negated());
+            }
+        }
+    }
+}
+
+/// A Deny with `NotMemberOf(g)` denies exactly the complement of `g`
+/// (docs/48 §7.2 option (ii); docs/11 §3, P4): appended to any policy of
+/// both domains it leaves every decision for a member of `g` unchanged and
+/// makes every decision for a non-member Deny — by this rule whenever the
+/// policy alone allowed.
+#[test]
+fn deny_not_member_of_denies_exactly_the_complement() {
+    let deny_outside = Rule {
+        id: RuleId(77),
+        effect: Effect::Deny,
+        when: Match {
+            subject: SubjectMatch::NotMemberOf(group()),
+            ..match_all()
+        },
+        obligations: vec![],
+    };
+    let (mut members, mut refused) = (0usize, 0usize);
+    for_each_equivalence_input(|req, pol, pip| {
+        let mut rules = pol.rules().to_vec();
+        rules.push(deny_outside.clone());
+        let before = decide(req, pol, pip);
+        let after = decide(req, &policy(rules), pip);
+        if is_in(&req.subject, &group()) {
+            assert_eq!(after, before, "member: {req:?}");
+            members += 1;
+        } else {
+            assert_eq!(after.effect, Effect::Deny, "non-member: {req:?}");
+            if before.effect == Effect::Allow {
+                assert_eq!(after.reason, ReasonCode::CoarseDeny(RuleId(77)));
+                refused += 1;
+            }
+        }
+    });
+    assert!(members > 0 && refused > 0, "{members} {refused}");
+}
+
+/// A negated subject predicate in an Allow rule grants nothing (Q-130; fail
+/// closed): appended to any policy of both domains, an Allow with
+/// `NotMemberOf` — carrying an obligation that would show if it applied —
+/// leaves every decision unchanged, for members and non-members alike.
+#[test]
+fn negated_subject_in_an_allow_changes_nothing() {
+    for_each_equivalence_input(|req, pol, pip| {
+        let before = decide(req, pol, pip);
+        for sid in [group(), other_group()] {
+            let mut rules = pol.rules().to_vec();
+            rules.push(Rule {
+                id: RuleId(78),
+                effect: Effect::Allow,
+                when: Match {
+                    subject: SubjectMatch::NotMemberOf(sid),
+                    ..match_all()
+                },
+                obligations: vec![Obligation::Constrain(pdp::Constraint::MaxPageSize(1))],
+            });
+            assert_eq!(decide(req, &policy(rules), pip), before, "{req:?}");
+        }
+    });
+}
+
+/// The mandatory-FAST set never widens a policy and its Deny rules hold
+/// against any Allow (docs/48 §7.2 option (ii); Q-127 interim; P4). Over
+/// both domains and both values of `armored`, with `group()` as the
+/// bootstrap group:
+/// - after appending its two Deny rules, every Allow was the same decision
+///   before;
+/// - an unarmored Kerberos request is then denied unless it is an AS by a
+///   member of the bootstrap group — also under the Allow-everything and
+///   Allow-Kerberos policies of the domain;
+/// - the full set (Deny and Allow rules) changes no non-Kerberos decision.
+#[test]
+fn mandatory_fast_never_widens_a_policy() {
+    let full = mandatory_fast_rules(group(), RuleId(100)).expect("ids fit");
+    let denies: Vec<Rule> = full
+        .iter()
+        .filter(|r| r.effect == Effect::Deny)
+        .cloned()
+        .collect();
+    assert_eq!(denies.len(), 2);
+    let mut refused_downgrades = 0usize;
+    for_each_equivalence_input(|req, pol, pip| {
+        for armored in [true, false] {
+            let r = with_armored(req, armored);
+            let before = decide(&r, pol, pip);
+            let mut with_denies = pol.rules().to_vec();
+            with_denies.extend(denies.iter().cloned());
+            let after = decide(&r, &policy(with_denies), pip);
+            if after.effect == Effect::Allow {
+                assert_eq!(after, before, "widened: {r:?}");
+            }
+            let kerberos = r.action.class() == ActionClass::Kerberos;
+            if !kerberos {
+                let mut with_full = pol.rules().to_vec();
+                with_full.extend(full.iter().cloned());
+                assert_eq!(decide(&r, &policy(with_full), pip), before, "{r:?}");
+            }
+            let bootstrap_as = r.action == Action::KdcAs && is_in(&r.subject, &group());
+            if kerberos && !armored && !bootstrap_as {
+                assert_eq!(after.effect, Effect::Deny, "downgrade: {r:?}");
+                if before.effect == Effect::Allow {
+                    refused_downgrades += 1;
+                }
+            }
+        }
+    });
+    assert!(refused_downgrades > 0);
+}
+
+/// The mandatory-FAST set alone, exactly (docs/48 §7.1-§7.3; Q-127 interim
+/// (1), (4)), with P1 / P7 / P2 over the Kerberos domain and both values of
+/// `armored`: the decision is deterministic, carries one Audit, and is
+/// Allow exactly when the request is well formed, authenticated, its tier
+/// agrees with the PIP, and either it is armored and an AS or TGS, or it is
+/// unarmored and an AS for a TGT by a member of the bootstrap group.
+#[test]
+fn mandatory_fast_set_alone_is_exact() {
+    use pdp::{KerbResKind, Resource};
+    let bootstrap = group();
+    let snapshot = policy(mandatory_fast_rules(bootstrap, RuleId(100)).expect("ids fit"));
+    let mut allowed = 0usize;
+    for pip_tier in [Tier::Tier0, Tier::Tier1] {
+        let mut pip = MockPip::with_sd(sd(None, vec![]));
+        pip.tiers.insert(user(), pip_tier);
+        for s in subjects() {
+            for (action, resource) in kerberos_cases() {
+                for armored in [true, false] {
+                    let req = with_armored(
+                        &AccessRequest {
+                            subject: s.clone(),
+                            resource: resource.clone(),
+                            action: action.clone(),
+                            context: strong_context(),
+                        },
+                        armored,
+                    );
+                    let d = decide(&req, &snapshot, &pip);
+                    assert_eq!(d, decide(&req, &snapshot, &pip), "P1");
+                    assert!(exactly_one_audit(&d), "P7: {d:?}");
+                    assert_eq!(d.effect == Effect::Allow, d.reason == ReasonCode::Allowed);
+                    if d.effect == Effect::Allow {
+                        assert!(
+                            snapshot
+                                .rules()
+                                .iter()
+                                .any(|r| r.effect == Effect::Allow && r.applies(&req)),
+                            "P2"
+                        );
+                    }
+                    let well_formed = matches!(resource, Resource::Kerberos { .. });
+                    let authenticated =
+                        s.auth.strength != AuthStrength::Unauth && s.auth.ticket_verified;
+                    let tier_ok = s.tier == pip_tier;
+                    let is_tgt = matches!(
+                        resource,
+                        Resource::Kerberos {
+                            kind: KerbResKind::Tgt
+                        }
+                    );
+                    let grant = if armored {
+                        matches!(action, Action::KdcAs | Action::KdcTgs)
+                    } else {
+                        action == Action::KdcAs && is_tgt && is_in(&s, &bootstrap)
+                    };
+                    let expected = well_formed && authenticated && tier_ok && grant;
+                    assert_eq!(d.effect == Effect::Allow, expected, "{req:?}: {d:?}");
+                    allowed += usize::from(expected);
+                }
+            }
+        }
+    }
+    assert!(allowed > 0);
 }

@@ -18,8 +18,8 @@ use krb_proto::constants::{
 };
 use krb_proto::{EncryptedData, KdcReq, PaData, PrincipalName, Realm, TgsReq, TicketFlags};
 use pdp::{
-    ActionMatch, ContextMatch, Effect, KerbResKind, Match, ResourceMatch, Rule, RuleId, Spn,
-    SubjectMatch,
+    ActionMatch, AuthMatch, ContextMatch, Effect, KerbResKind, Match, ResourceMatch, Rule, RuleId,
+    Spn, SubjectMatch,
 };
 
 /// The full round trip (RFC 4120 3.1 then 3.3): alice gets a TGT, then a
@@ -97,6 +97,7 @@ fn pdp_deny_at_tgs_is_policy() {
             },
             subject: SubjectMatch::MemberOf(users_group()),
             context: ContextMatch::ANY,
+            auth: AuthMatch::ANY,
         },
         obligations: Vec::new(),
     });

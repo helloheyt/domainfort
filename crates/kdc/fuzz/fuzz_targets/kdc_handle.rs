@@ -34,8 +34,8 @@ use krb_proto::{
 };
 use libfuzzer_sys::fuzz_target;
 use pdp::{
-    ActionClass, ActionMatch, ContextMatch, Effect, IpScope, Match, Pip, PipError, PolicySnapshot,
-    PolicyVersion, ResourceMatch, RlKey, Rule, RuleId, SubjectMatch, Tier,
+    ActionClass, ActionMatch, AuthMatch, ContextMatch, Effect, IpScope, Match, Pip, PipError,
+    PolicySnapshot, PolicyVersion, ResourceMatch, RlKey, Rule, RuleId, SubjectMatch, Tier,
 };
 
 struct NoKeydAudit;
@@ -209,6 +209,7 @@ fn build() -> FuzzState {
                 resource: ResourceMatch::Any,
                 subject: SubjectMatch::Any,
                 context: ContextMatch::ANY,
+                auth: AuthMatch::ANY,
             },
             obligations: Vec::new(),
         }],

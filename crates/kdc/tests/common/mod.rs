@@ -33,8 +33,8 @@ use krb_proto::{
     Microseconds, PaData, PaEncTsEnc, PrincipalName, Realm, TgsRep, TgsReq, Ticket,
 };
 use pdp::{
-    ActionClass, ActionMatch, ContextMatch, Effect, IpScope, Match, Pip, PipError, PolicySnapshot,
-    PolicyVersion, ResourceMatch, RlKey, Rule, RuleId, SubjectMatch, Tier,
+    ActionClass, ActionMatch, AuthMatch, ContextMatch, Effect, IpScope, Match, Pip, PipError,
+    PolicySnapshot, PolicyVersion, ResourceMatch, RlKey, Rule, RuleId, SubjectMatch, Tier,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -181,6 +181,7 @@ pub fn allow_kerberos() -> Rule {
             resource: ResourceMatch::Any,
             subject: SubjectMatch::Any,
             context: ContextMatch::ANY,
+            auth: AuthMatch::ANY,
         },
         obligations: Vec::new(),
     }

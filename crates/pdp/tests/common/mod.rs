@@ -16,10 +16,10 @@ use dtyp::{
     WORLD_SID_AUTHORITY,
 };
 use pdp::{
-    AccessRequest, Action, ActionMatch, AttrClass, AttrId, AuthContext, AuthStrength, Context,
-    ContextMatch, Dn, Effect, Instant, IpScope, Match, ObjClass, ObjClassChain, Pip, PipError,
-    PolicySnapshot, PolicyVersion, PropertySet, Resource, ResourceMatch, Rule, RuleId, Subject,
-    SubjectMatch, Tier, Transport, TransportSec,
+    AccessRequest, Action, ActionMatch, AttrClass, AttrId, AuthContext, AuthMatch, AuthStrength,
+    Context, ContextMatch, Dn, Effect, Instant, IpScope, Match, ObjClass, ObjClassChain, Pip,
+    PipError, PolicySnapshot, PolicyVersion, PropertySet, Resource, ResourceMatch, Rule, RuleId,
+    Subject, SubjectMatch, Tier, Transport, TransportSec,
 };
 
 // ---------------------------------------------------------------- SIDs ----
@@ -354,6 +354,7 @@ pub fn match_all() -> Match {
         resource: ResourceMatch::Any,
         subject: SubjectMatch::Any,
         context: ContextMatch::ANY,
+        auth: AuthMatch::ANY,
     }
 }
 
