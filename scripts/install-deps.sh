@@ -11,14 +11,15 @@
 #
 # מה הסקריפט עושה:
 #   1. בודק ש-rustup/cargo מותקנים (לא מוריד ולא מריץ סקריפט-התקנה בעצמו).
-#   2. מתקין את גרסת ה-Rust הנעוצה ב-rust-toolchain.toml (דרך rustup).
+#   2. מתקין את גרסת ה-Rust הנעוצה ב-rust-toolchain.toml (דרך rustup), ובודק שיש מהדר C
+#      (aws-lc-sys מקמפל C; P-21) — נכשל עם הוראות אם חסר, לא מתקין דבר. CMake — רק אזהרה (A-71).
 #   3. מוריד את התלויות בדיוק לפי Cargo.lock (`cargo fetch --locked`).
 #   4. מאמת שכל תלות של צד-שלישי ברישיון מהרשימה המותרת (AGENTS.md §7), ונכשל אם לא.
 #   5. מריץ `cargo deny check` אם הכלי מותקן (בדיקה מלאה: רישיונות, חבילות אסורות, פגיעויות).
 #
 # שימוש:
 #   bash scripts/install-deps.sh               התקנה מלאה + בדיקת רישיונות
-#   bash scripts/install-deps.sh --check-only  רק בדיקת רישיונות (בלי הורדה)
+#   bash scripts/install-deps.sh --check-only  בדיקת toolchain של C + רישיונות (בלי הורדה)
 #   bash scripts/install-deps.sh --help
 #
 # לא כלול: תלויות ה-fuzzing (workspaces נפרדים תחת crates/*/fuzz) — ממתינות לאישור P-1.
@@ -33,7 +34,7 @@ case "${1:-}" in
   "") ;;
   --check-only) check_only=1 ;;
   -h|--help)
-    sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'
     exit 0 ;;
   *) echo "אפשרות לא מוכרת: $1 (ראו --help)" >&2; exit 2 ;;
 esac
@@ -57,6 +58,45 @@ fi
 echo "==> toolchain (rust-toolchain.toml)"
 cargo --version
 rustc --version
+
+# --- 2b. ‏toolchain של C (aws-lc-sys מקמפל קוד C) ----------------------------------
+# ספק-הקריפטו שמתחת ל-rustls ‏(aws-lc-rs, ‏OD-9; ‏docs/50 R50-11) בונה את ספריית AWS-LC
+# ב-C דרך aws-lc-sys. דרישות-הבנייה כפי שהן כתובות בדף docs.rs של aws-lc-rs 1.19.0 (פרק Build):
+#   "Consuming projects will need a C/C++ compiler to build."
+#   "Non-FIPS builds (default): CMake is never required; Bindgen is never required
+#    (pre-generated bindings are provided); Go is never required."
+# ובדף docs.rs של rustls 0.23.46 (ה-feature aws_lc_rs):
+#   "Note that aws-lc-rs has additional build-time dependencies like cmake."
+# הכרעת-הבעלים P-21: לבדוק שיש מהדר C ו-CMake, ולהיכשל עם הוראות אם לא.
+# (CMake נבדק כהכרעת P-21 אף שדף aws-lc-rs אומר שאינו נדרש בבנייה הלא-FIPS —
+# docs/questions/Q-285 פריט 11.) הסקריפט לעולם לא מתקין דבר בעצמו.
+# נבדק גם ב---check-only: בלי מהדר C אין בנייה, וטוב לדעת לפני שמגיעים אליה.
+echo "==> toolchain של C (aws-lc-sys): מהדר C"
+cc_command="${CC:-cc}"
+cc_command="${cc_command%% *}"
+missing_tools=""
+if ! command -v "$cc_command" >/dev/null 2>&1; then
+  missing_tools="$missing_tools $cc_command"
+fi
+if [ -n "$missing_tools" ]; then
+  cat >&2 <<MSG
+חסרים כלי-בנייה:${missing_tools}
+ספק-הקריפטו של TLS ‏(aws-lc-rs → aws-lc-sys) מקמפל קוד C בזמן הבנייה:
+  - מהדר C/C++ (הפקודה \`cc\`, או זו שבמשתנה CC) — "Consuming projects will need a C/C++
+    compiler to build" (docs.rs aws-lc-rs 1.19.0);
+התקינו אותו דרך מנהל-החבילות של המערכת והריצו שוב.
+(הסקריפט לא מתקין דבר בעצמו.)
+MSG
+  exit 1
+fi
+"$cc_command" --version 2>&1 | sed -n 1p
+# CMake לא נדרש לבנייה הרגילה (לא-FIPS) — "Non-FIPS builds (default): CMake is never required"
+# (docs.rs aws-lc-rs 1.19.0). הכרעה A-71 (Q-285 פריט 11): רק אזהרה אם חסר.
+if command -v cmake >/dev/null 2>&1; then
+  cmake --version 2>&1 | sed -n 1p
+else
+  echo "   (CMake לא נמצא — לא נדרש לבנייה הרגילה; נדרש רק לגרסת FIPS, שחסומה ב-P-15)"
+fi
 
 # --- 3. הורדת התלויות -----------------------------------------------------------
 if [ "$check_only" -eq 0 ]; then

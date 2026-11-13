@@ -465,6 +465,16 @@
       "sha256": "ce8117cce276e1b01430899a6752f5b49b99fa0ad45f50de12b75e3ff02bd96e",
       "phase": "1-2",
       "blocks": []
+    },
+    {
+      "id": "RFC5280",
+      "title": "Internet X.509 Public Key Infrastructure Certificate and CRL Profile",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc5280.txt",
+      "revision": "RFC5280",
+      "sha256": "a2f2628c0a83b873fc4786abd921f9b2c02395954b655d190bf16b831633345d",
+      "phase": "1",
+      "blocks": []
     }
   ]
 }
