@@ -1,0 +1,72 @@
+# daemon-sandbox — process hardening for the phase-1 daemons (docs/50 R50-14,
+# §6, build task P3 in §10), as a LIBRARY.
+#
+# A daemon builds a `HardeningPlan` (target uid/gid with the supplementary
+# groups cleared, no_new_privs, rlimits, non-dumpable, opt-in mlockall, umask,
+# optional chroot then chdir, capabilities dropped), claims a
+# `SingleThreadProof` as the first statement of `main`, and calls `apply`
+# before it builds any runtime or spawns any thread. `apply` runs the steps in
+# one documented order, stops at the first failure (the daemon must then exit
+# — fail closed) and ends by reading the state back and comparing it with the
+# plan (`verify`), so the daemon can assert it and the audit can record it.
+#
+# No `unsafe` anywhere (`#![forbid(unsafe_code)]` + workspace lint): every
+# operation is a safe rustix function. Linux only: on any other target every
+# hardening call returns `SandboxError::Unsupported` and never succeeds
+# silently.
+#
+# Out of scope (docs/50 §6.3; docs/questions/Q-216, owner item P-19):
+# seccomp filters, landlock and namespaces — not reachable through rustix
+# without `unsafe` or a new dependency.
+#
+# Written only from this project's decided design docs/50 (R50-14, R50-19,
+# §6.1-§6.4, §9, §10, closing decision A-58), docs/03 (principles), docs/07
+# §9, docs/questions Q-215 / Q-216 and PENDING-OWNER (P-12, P-18, P-19), and
+# the docs.rs API pages of rustix 1.1.6 (API documentation only, never its
+# source — PENDING-OWNER P-2): modules `thread`, `process`, `mm`, `fs::Mode`,
+# `io::Errno`, `path::Arg`, and the crate's feature list. The semantics of the
+# underlying system calls are taken only from what those pages say; the Linux
+# manual pages are not an allowed source (Q-215, P-18). No other
+# implementation consulted or recalled — AGENTS.md §1-3.
+
+[package]
+name = "daemon-sandbox"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# rustix — owner decision P-12 (2026-11-13). Linked, never copied; only its
+# docs.rs API pages were read (P-2). License (crates.io, as recorded in
+# docs/50 §0.3): "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT" —
+# satisfied by the plain Apache-2.0 / MIT alternatives (AGENTS.md §7).
+#
+# Linux-only dependency: on other targets the crate compiles without it and
+# every hardening call fails closed with `Unsupported`.
+#
+# Features — the minimal set for docs/50 §6.1, per the docs.rs feature list
+# and the "Available on crate feature ..." line of each item used:
+#   std     — `&Path` as a path argument (`path::Arg`) and `process::getgroups`
+#             (needs `alloc`, which `std` enables);
+#   thread  — set_thread_res_uid / set_thread_res_gid / set_thread_groups,
+#             set_no_new_privs / no_new_privs, the capability functions,
+#             gettid;
+#   process — setrlimit / getrlimit, set_dumpable_behavior /
+#             dumpable_behavior, getuid / geteuid / getgid / getegid,
+#             getgroups;
+#   fs      — umask, chdir and chroot ("Available on crate features fs and
+#             process only") and `fs::Mode`;
+#   mm      — mlockall.
+# Default features are off so nothing beyond this list is enabled.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.6", default-features = false, features = ["std", "thread", "process", "fs", "mm"] }
+
+# The process-level tests apply real hardening, so each scenario runs in a
+# fresh child process of this binary (docs/50 §9 tier 3); the binary has its
+# own `main` (no libtest harness) so the child's `main` is truly the first and
+# only thread when it claims its SingleThreadProof (docs/50 R50-14).
+[[test]]
+name = "process_hardening"
+harness = false
+
+[lints]
+workspace = true
