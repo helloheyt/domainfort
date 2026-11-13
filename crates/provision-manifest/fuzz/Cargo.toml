@@ -1,0 +1,40 @@
+# cargo-fuzz harness for provision-manifest (AGENTS.md §6: every parser
+# gets a fuzz target before it merges to main; docs/50 §9).
+#
+# This is a SEPARATE workspace (note the empty [workspace] table below): it is
+# intentionally NOT a member of the root workspace, so `cargo build --all`,
+# `cargo clippy`, `cargo test`, `cargo deny` and the SBOM in the product
+# workspace never pull in the fuzzing-only dependencies. It is built only via
+# `cargo fuzz run provision_manifest` (nightly + cargo-fuzz).
+#
+# NOTE FOR REVIEW: libfuzzer-sys is fuzz-harness-only test infrastructure, not
+# linked into any product crate, and on the license allowlist (MIT /
+# Apache-2.0, AGENTS.md §7). It is PENDING OWNER APPROVAL (docs/questions/
+# PENDING-OWNER.md, P-1): this harness has been written, not built or run.
+
+[package]
+name = "provision-manifest-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.provision-manifest]
+path = ".."
+
+# The manifest parser on arbitrary octets, with the invariants of accepted
+# manifests (`cargo fuzz run provision_manifest`).
+[[bin]]
+name = "provision_manifest"
+path = "fuzz_targets/provision_manifest.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the root workspace (see header).
+[workspace]

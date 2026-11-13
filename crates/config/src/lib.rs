@@ -15,6 +15,7 @@
 //! | ldap-front | [`LdapFrontSettings`] | §2.4, R50-10, R50-12, §4.2, §5.3 |
 //! | auditd | [`AuditdSettings`] | §2.4, R50-17, §8.1 |
 //! | admind | [`AdmindSettings`] | §2.4 (blocked on Q-220) |
+//! | keyadm (tool, not a daemon) | [`KeyadmSettings`] | §2.4, R50-3; docs/51 §6 |
 //!
 //! Each type has `parse(&[u8])` and a public `KEYS` table. Parsing is pure: it
 //! opens no file, reads no environment, resolves no name and checks no file
@@ -74,6 +75,7 @@ mod dird;
 mod error;
 mod format;
 mod kdc;
+mod keyadm;
 mod keyd;
 mod ldap_front;
 pub mod limits;
@@ -89,6 +91,7 @@ pub use kdc::{
     MAX_TCP_CONNECTIONS_BOUND, MAX_TCP_CONNECTIONS_PER_SOURCE_BOUND, TCP_FIRST_FRAME_TIMEOUT_SECS,
     TCP_FRAME_TIMEOUT_SECS, TCP_IDLE_TIMEOUT_SECS,
 };
+pub use keyadm::KeyadmSettings;
 pub use keyd::{KeyStoreKind, KeydSettings, RoleMap, RoleName, MAX_CONNECTIONS_PER_UID_BOUND};
 pub use ldap_front::{
     LdapFrontLimits, LdapFrontSettings, DIRD_LDAP_DEADLINE_SECS, INIT_RECV_TIMEOUT_SECS,

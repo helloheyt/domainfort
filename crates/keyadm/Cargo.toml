@@ -1,0 +1,81 @@
+# keyadm — the Role::Admin one-shot tool (docs/51 §6, §12 task A5; docs/50
+# §2.4; decisions A-57, A-72): this task builds `keyadm ceremony
+# <manifest>`, which asks keyd to create the krbtgt key set and the two
+# service key sets the provisioning manifest names (docs/51 §4.3 step 11).
+#
+# keyadm runs under its own uid, which keyd maps to Role::Admin (A-57). It
+# talks ONLY to keyd, through the existing ipc-keyd client; it has no
+# Kerberos client and no access to dird. keyd computes every key; keyadm
+# only asks and prints handles, bindings and kvnos (docs/10 §7, I1). It
+# must NOT link krb-crypto (D182; A-73: a DC-host tool needs no client
+# crypto) — crates/keyd-types/tests/no_crypto_dependency.rs checks it.
+#
+# Written only from this project's decided design, opened in-session —
+# docs/51 (whole; §4.3 steps 8, 10-12, §4.5, §6, §9), docs/10 (§1, §2, §5ב,
+# §7, §7א, §9-§11), docs/47 (§1.1-§1.4, §2.3, §9.1), docs/50 (§2.4, §3.1-
+# §3.7, §6.1, §6.4, §7.1, §9 and the magic registry), docs/questions Q-290,
+# Q-295, Q-296, PENDING-OWNER (A-19, A-35, A-57, A-63, A-72, A-73, A-77,
+# P-1, P-2, P-12, P-17, P-22, R50-3) — RFC 4120 §6.2, §6.2.1, §7.3 (pinned,
+# SHA-256 verified), and the public API of this project's crates config,
+# ipc, ipc-keyd, keyd-types, provision-manifest, daemon-sandbox (and, for
+# the tests, keyd, keyd-daemon and ipc-audit). No other implementation and
+# no existing key-administration or provisioning tool — its commands, names,
+# file formats or messages — was consulted or recalled (AGENTS.md §1-3).
+
+[package]
+name = "keyadm"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "keyadm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "keyadm"
+path = "src/main.rs"
+
+[dependencies]
+# Our own workspace crates only — no third-party package is added.
+#
+# `KeyadmSettings` (docs/50 §7.1): keyd's socket, keyd's uid, the deadline.
+config = { path = "../config" }
+# The shared `Refused` reply of every channel (A-59), named when an outcome
+# is classified.
+ipc = { path = "../ipc" }
+# The keyd channel's client: `KeydClient` (peer-uid check before anything
+# is sent, R50-3 / A-63), `UnixConnector`, `Call` / `Answer`, `Unserved`.
+# The client side links no crypto (D182, A-63).
+ipc-keyd = { path = "../ipc-keyd" }
+# `Kvno`, `Error` (keyd's answer), `KeyHandle`, `KeyPurpose`.
+keyd-types = { path = "../keyd-types" }
+# The manifest: format, file check, and the handles and bindings of the
+# ceremony's three key sets (docs/51 §4.3 step 8).
+provision-manifest = { path = "../provision-manifest" }
+# Only `read_state` — the real and effective uid, read through rustix as
+# docs/50 §6.1 prescribes ("process::getuid/geteuid … to verify") — for the
+# refusal to run as root. No hardening plan is applied (src/identity.rs;
+# docs/questions/Q-347 item 3).
+daemon-sandbox = { path = "../daemon-sandbox" }
+
+[dev-dependencies]
+# TESTS ONLY (docs/50 §9 tier 2): a real keyd-daemon on a real Unix socket in
+# the test's threads, with the test's own uid mapped to the role under test.
+# Workspace crates, or third-party packages already in the lock (tokio,
+# owner decision P-12) — nothing new. `#[path]`-reuses
+# crates/keyd-daemon/tests/support, as keyd-daemon's kdc_flow reuses
+# crates/kdc/tests/common.
+keyd = { path = "../keyd" }
+keyd-daemon = { path = "../keyd-daemon" }
+ipc-audit = { path = "../ipc-audit", default-features = false, features = ["keyd"] }
+krb-proto = { path = "../krb-proto" }
+dtyp = { path = "../dtyp" }
+# Off Linux the ipc-keyd connector cannot read peer credentials (fail
+# closed), so the tests read keyd's uid with tokio `UnixStream::peer_cred`,
+# as crates/keyd-daemon/tests/kdc_flow.rs does (tokio 1.54.1 docs.rs, P-2).
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "net"] }
+zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,54 @@
+# provision-manifest — the non-secret provisioning manifest (docs/51 §4.3
+# step 8; decision A-72): its line format, the strict bounded parser, the
+# canonical encoder, the root-owned file check, and the derivation of the
+# key-set handles and immutable bindings (A-19) every later step uses.
+#
+# Why a crate of its own, named after `provision`: the manifest is WRITTEN by
+# `provision domain` (docs/51 §4.3 step 8, task A4) and READ by
+# `keyadm ceremony` (step 11, task A5) and by `provision first-admin-secret`
+# (step 12, task A6). Two tools in two crates must agree on one format and on
+# one derivation of each binding (A-19: the binding given at creation is
+# fixed for good), so both live here once. It is not a module of
+# crates/config: the manifest is not a daemon's configuration, and config's
+# schemas are per daemon (docs/50 R50-15).
+#
+# No key, password or token: the manifest holds identifiers only (docs/51
+# §4.3 step 8; docs/47 §2.3 — GUIDs and SIDs are random against collision,
+# not secret).
+#
+# Written only from this project's decided design, opened in-session —
+# docs/51 (§4.1, §4.3 steps 1, 2, 8, 11, 12, §4.4, §6, §11), docs/47 (§1.1,
+# §1.3, §1.4, §2.3, §3.3, §9.1), docs/50 (§7.1, §9), docs/10 (§1, §5ב, §7),
+# PENDING-OWNER (A-19, A-31, A-53, A-55, A-60, A-72, A-73, A-77, P-1, P-6,
+# P-22), docs/questions Q-100 item 1, Q-200 item 1, Q-295 — the pinned specs
+# RFC 4120 §6.1, §6.2, §6.2.1, §7.3; [MS-DTYP] v20241119 2.3.4.1, 2.3.4.2,
+# 2.4.2.4, 2.5.1.1; [MS-DRSR] v20260309 5.16.3.16; [MS-SAMR] v20260427
+# 3.1.1.6 items 8-14 (SHA-256 verified against tools/spec-pin/manifest.json),
+# and the public API of this project's crates config (format rules, read
+# only), dtyp, keyd-types, krb-proto and directory-pip (NamingContext rules,
+# read only). No other implementation and no existing provisioning or
+# key-administration tool was consulted or recalled (AGENTS.md §1-3).
+
+[package]
+name = "provision-manifest"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Our own workspace crates only (no third-party code).
+#
+# `Guid` (the [MS-DTYP] 2.3.4.2 packet form the directory stores objectGUID
+# in, docs/47 §2.3) and `Sid::parse_sid_string` / `to_sid_string`
+# ([MS-DTYP] 2.4.2.1) for the domain SID.
+dtyp = { path = "../dtyp" }
+# `KeyHandle`, `KeyPurpose`, `PrincipalId`, `PrincipalBinding`: what a
+# ceremony step hands keyd (docs/10 §1, §7). keyd-types links no crypto
+# (D182, A-63).
+keyd-types = { path = "../keyd-types" }
+# `KerberosString` / `Realm` / `PrincipalName` and the RFC 4120 name-type
+# constants of each binding. krb-proto links no crypto (D182).
+krb-proto = { path = "../krb-proto" }
+
+[lints]
+workspace = true

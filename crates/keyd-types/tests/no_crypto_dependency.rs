@@ -27,8 +27,19 @@ const CRYPTO_PROFILE: &str = "krb-crypto";
 
 /// The crates that must not link it (A-63): this crate, and the dependents
 /// moved onto it. `ipc-keyd` is the client side of the keyd channel; its
-/// server side is the separate crate `ipc-keyd-server`.
-const CRYPTO_FREE: [&str; 5] = ["keyd-types", "kdc", "ldap", "directory-pip", "ipc-keyd"];
+/// server side is the separate crate `ipc-keyd-server`. `keyadm` is the
+/// Role::Admin tool on the DC host, which only asks keyd and needs no
+/// client crypto, and `provision-manifest` the manifest library it reads
+/// (docs/51 §6, §12 A5; A-73: D182 binds the DC's processes).
+const CRYPTO_FREE: [&str; 7] = [
+    "keyd-types",
+    "kdc",
+    "ldap",
+    "directory-pip",
+    "ipc-keyd",
+    "keyadm",
+    "provision-manifest",
+];
 
 /// The package names in `package`'s normal dependency graph (the package
 /// itself included), as `cargo tree` lists them.

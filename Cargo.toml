@@ -24,7 +24,7 @@
 
 [workspace]
 resolver = "2"
-members = ["crates/parse-asn1", "crates/krb-crypto", "crates/krb-proto", "crates/dtyp", "crates/dirstore", "crates/pdp", "crates/keyd", "crates/kdc", "crates/ad-schema", "crates/directory-pip", "crates/parse-ldap", "crates/ldap", "crates/config", "crates/ipc", "crates/daemon-sandbox", "crates/ipc-keyd", "crates/audit-log", "crates/ipc-audit", "crates/keyd-types", "crates/ipc-keyd-server", "crates/audit-daemon", "crates/keyd-daemon", "crates/ipc-directory", "crates/ipc-directory-server", "crates/directory-daemon", "crates/policy-store", "crates/kdc-daemon", "crates/ipc-ldap", "crates/ipc-ldap-server", "crates/ldap-front", "crates/parse-x509", "crates/e2e-tests"]
+members = ["crates/parse-asn1", "crates/krb-crypto", "crates/krb-proto", "crates/dtyp", "crates/dirstore", "crates/pdp", "crates/keyd", "crates/kdc", "crates/ad-schema", "crates/directory-pip", "crates/parse-ldap", "crates/ldap", "crates/config", "crates/ipc", "crates/daemon-sandbox", "crates/ipc-keyd", "crates/audit-log", "crates/ipc-audit", "crates/keyd-types", "crates/ipc-keyd-server", "crates/audit-daemon", "crates/keyd-daemon", "crates/ipc-directory", "crates/ipc-directory-server", "crates/directory-daemon", "crates/policy-store", "crates/kdc-daemon", "crates/ipc-ldap", "crates/ipc-ldap-server", "crates/ldap-front", "crates/parse-x509", "crates/e2e-tests", "crates/provision-manifest", "crates/keyadm"]
 
 # מדיניות build לכלל ה-workspace (תחול כשייווספו crates):
 [workspace.lints.rust]

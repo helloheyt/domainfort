@@ -3,7 +3,8 @@
 //!
 //! AGENTS.md §6 / docs/32 §8 (every parser gets a fuzz target before it
 //! merges to main; docs/50 §9 names this target `config_file`). On any octets
-//! all six schemas must return without panicking, and:
+//! all seven schemas (six daemons and the keyadm tool) must return without
+//! panicking, and:
 //!
 //! * input over the file bound, or not ending in LF, is refused by every
 //!   schema (docs/50 §7.1; Q-230 item 2);
@@ -19,7 +20,7 @@
 
 use config::limits::MAX_FILE_OCTETS;
 use config::{
-    AdmindSettings, AuditdSettings, DirdSettings, Error, KdcSettings, KeydSettings,
+    AdmindSettings, AuditdSettings, DirdSettings, Error, KdcSettings, KeyadmSettings, KeydSettings,
     LdapFrontSettings,
 };
 use libfuzzer_sys::fuzz_target;
@@ -44,7 +45,13 @@ fuzz_target!(|data: &[u8]| {
         (LdapFrontSettings::parse(data).map(drop), LdapFrontSettings::KEYS),
         (AuditdSettings::parse(data).map(drop), AuditdSettings::KEYS),
         (AdmindSettings::parse(data).map(drop), AdmindSettings::KEYS),
+        (KeyadmSettings::parse(data).map(drop), KeyadmSettings::KEYS),
     ];
+    // keyadm: the keyd uid it verifies is never 0 or all-ones (R50-3; Q-230
+    // item 6).
+    if let Ok(settings) = KeyadmSettings::parse(data) {
+        assert!(valid_id(settings.keyd().uid()));
+    }
     let cut = !data.is_empty() && data.last() != Some(&b'\n');
     for (result, keys) in &results {
         check_error(result, keys);

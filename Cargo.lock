@@ -519,6 +519,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "keyadm"
+version = "0.0.0"
+dependencies = [
+ "config",
+ "daemon-sandbox",
+ "dtyp",
+ "ipc",
+ "ipc-audit",
+ "ipc-keyd",
+ "keyd",
+ "keyd-daemon",
+ "keyd-types",
+ "krb-proto",
+ "provision-manifest",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "keyd"
 version = "0.0.0"
 dependencies = [
@@ -705,6 +724,15 @@ dependencies = [
  "dtyp",
  "ipc",
  "pdp",
+]
+
+[[package]]
+name = "provision-manifest"
+version = "0.0.0"
+dependencies = [
+ "dtyp",
+ "keyd-types",
+ "krb-proto",
 ]
 
 [[package]]
