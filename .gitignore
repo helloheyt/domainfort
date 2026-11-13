@@ -1,9 +1,12 @@
 # Rust
 /target
 **/*.rs.bk
-# Cargo.lock — יוחזר ל-track כשייווצר ה-binary הראשון (עד אז crate-ספרייה בלבד).
+# Cargo.lock של ה-workspace — **ב-track** (D183): מאז שנכנסו תלויות חיצוניות
+# (RustCrypto, krb-crypto) הוא נועץ גרסאות מדויקות — build משוחזר (D61) ושרשרת-
+# אספקה (R13). רק Cargo.lock של workspaces מנותקים (fuzz) נשאר מחוץ ל-track.
 # (הערה חייבת להיות בשורה נפרדת; הערת-inline שוברת את התבנית ב-gitignore.)
-Cargo.lock
+crates/*/fuzz/Cargo.lock
+
 
 # ספריית מפרטים — הקבצים שהורדו נשמרים מקומית; המניפסט (עם ה-sha256) כן ב-track.
 /tools/spec-pin/cache/

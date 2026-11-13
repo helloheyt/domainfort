@@ -1,0 +1,47 @@
+# cargo-fuzz harness for krb-crypto (AGENTS.md §6: every parser of untrusted
+# input gets a fuzz target before it merges to main). decrypt and verify_mic
+# consume attacker-supplied bytes and must never panic, hang, or
+# over-allocate — they fail closed with a `Result` error instead.
+#
+# This is a SEPARATE workspace (note the empty [workspace] table below): it is
+# intentionally NOT a member of the root workspace, so `cargo build --all`,
+# `cargo clippy`, `cargo test`, `cargo deny` and the SBOM in the product
+# workspace never pull in the fuzzing-only dependencies. It is built only via
+# `cargo fuzz run <target>` (nightly + cargo-fuzz).
+#
+# NOTE FOR REVIEW: libfuzzer-sys is fuzz-harness-only test infrastructure, not
+# linked into any product crate, and on the license allowlist (MIT /
+# Apache-2.0, AGENTS.md §7). Pending owner sign-off (docs/questions/
+# PENDING-OWNER.md P-1) — not built or run until approved.
+
+[package]
+name = "krb-crypto-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.krb-crypto]
+path = ".."
+
+[[bin]]
+name = "krb_crypto_decrypt"
+path = "fuzz_targets/krb_crypto_decrypt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "krb_crypto_verify_mic"
+path = "fuzz_targets/krb_crypto_verify_mic.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the root workspace (see header).
+[workspace]

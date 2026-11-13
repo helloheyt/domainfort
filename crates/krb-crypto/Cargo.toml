@@ -1,0 +1,42 @@
+# krb-crypto — the Kerberos 5 encryption and checksum profile (RFC 3961
+# framework) for the AES encryption types ONLY:
+#   17 aes128-cts-hmac-sha1-96      / cksumtype 15  (RFC 3962)
+#   18 aes256-cts-hmac-sha1-96      / cksumtype 16  (RFC 3962)
+#   19 aes128-cts-hmac-sha256-128   / cksumtype 19  (RFC 8009)
+#   20 aes256-cts-hmac-sha384-192   / cksumtype 20  (RFC 8009)
+# DES, 3DES, RC4 and every other enctype have NO code path (AGENTS.md §6).
+#
+# Pure library: no I/O, no global state, no randomness (the confounder is a
+# caller-supplied parameter). Only `keyd` links this crate (compute-don't-give;
+# docs/09, docs/10).
+#
+# Written only from RFC 3961, RFC 3962, RFC 8009 and RFC 2040 §8 (the CTS
+# description RFC 3962 §5 references), opened in-session — AGENTS.md §1-3.
+#
+# Dependencies: RustCrypto crates only (owner decision OD-9 / D180), linked,
+# never copied. Cryptographic primitives (AES, SHA-1, SHA-2, HMAC, PBKDF2) come
+# from them; this crate composes only the Kerberos-specified constructions on
+# top (n-fold, DR/DK, KDF-HMAC-SHA2 framing, CBC ciphertext stealing,
+# encrypt-with-integrity). All licenses: MIT OR Apache-2.0.
+
+[package]
+name = "krb-crypto"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# AES block cipher. `zeroize`: key schedule is zeroized on drop.
+aes = { version = "0.9", default-features = false, features = ["zeroize"] }
+# HMAC. `zeroize`: MAC state (derived from the key) is zeroized on drop.
+hmac = { version = "0.13", default-features = false, features = ["zeroize"] }
+# Hash functions H (RFC 3962 §6: SHA-1; RFC 8009 §5: SHA-256 / SHA-384).
+sha1 = { version = "0.11", default-features = false, features = ["zeroize"] }
+sha2 = { version = "0.11", default-features = false, features = ["zeroize"] }
+# PBKDF2 for string-to-key (RFC 3962 §4; RFC 8009 §4). Only the HMAC PRF API.
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
+# Zeroize key material on drop (AGENTS.md §6: secrets never linger).
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
+
+[lints]
+workspace = true
