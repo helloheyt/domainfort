@@ -312,12 +312,15 @@ pub fn till_max() -> KerberosTime {
 // ---------------------------------------------------------------------------
 
 pub type TestCustody = LocalKeyd<InMemoryKeyStore, KeydAudit, TestEntropy>;
-pub type TestKdc = Kdc<TestCustody, InMemoryAccounts, KdcAudit, TestRateLimiter>;
+pub type TestKdc = Kdc<TestCustody, KdcAudit, TestRateLimiter>;
 
+/// The KDC, the policy inputs and the account source handed to it with each
+/// request (docs/47 R47-14).
 pub struct Fixture {
     pub kdc: TestKdc,
     pub snapshot: PolicySnapshot,
     pub pip: TestPip,
+    pub accounts: InMemoryAccounts,
 }
 
 /// What a test may change before the KDC is built.
@@ -456,7 +459,6 @@ impl Fixture {
         let kdc = Kdc::new(
             setup.kdc,
             custody,
-            accounts,
             KdcAudit::default(),
             TestRateLimiter::default(),
         )
@@ -470,6 +472,7 @@ impl Fixture {
             kdc,
             snapshot: snapshot(setup.rules),
             pip,
+            accounts,
         }
     }
 
@@ -492,6 +495,7 @@ impl Fixture {
             },
             when,
             &inputs,
+            &self.accounts,
         )
     }
 
@@ -509,7 +513,7 @@ impl Fixture {
     }
 
     pub fn accounts(&mut self) -> &mut InMemoryAccounts {
-        self.kdc.accounts_mut()
+        &mut self.accounts
     }
 }
 

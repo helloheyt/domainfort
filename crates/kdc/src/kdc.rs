@@ -136,15 +136,18 @@ impl Scope {
 
 /// The phase-1 KDC.
 ///
-/// Generic over the key custody `K` (keyd), the account source `D`, the audit
-/// sink `U` and the rate limiter `R`. Holds no secret. Operations take
-/// `&mut self`; the daemon serializes access (no threads here).
+/// Generic over the key custody `K` (keyd), the audit sink `U` and the rate
+/// limiter `R`. Holds no secret. The [`AccountSource`] is not held: it is
+/// passed with each request, alongside the [`PolicyInputs`], so that the
+/// account records and the PIP answers of one request come from one
+/// directory snapshot (docs/47 §8.1, R47-14). Operations take `&mut self`;
+/// the daemon serializes access (no threads here).
 ///
-/// Spec: docs/30 §1-§3; main-session decisions 1, 3, 7.
-pub struct Kdc<K: KeyCustody, D: AccountSource, U: AuditSink, R: RateLimiter> {
+/// Spec: docs/30 §1-§3; docs/47 §8.1, §10.1 (R47-14); main-session
+/// decisions 1, 3, 7.
+pub struct Kdc<K: KeyCustody, U: AuditSink, R: RateLimiter> {
     pub(crate) config: KdcConfig,
     pub(crate) custody: K,
-    pub(crate) accounts: D,
     pub(crate) audit: U,
     pub(crate) rate: R,
     pub(crate) retransmit: RetransmitCache,
@@ -153,16 +156,10 @@ pub struct Kdc<K: KeyCustody, D: AccountSource, U: AuditSink, R: RateLimiter> {
     pub(crate) local: ErrorContext,
 }
 
-impl<K: KeyCustody, D: AccountSource, U: AuditSink, R: RateLimiter> Kdc<K, D, U, R> {
+impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
     /// Build a KDC. The configuration is validated against keyd's first
     /// (fail closed). Spec: RFC 4120 7.2, 7.3; main-session decisions 1, 3.
-    pub fn new(
-        config: KdcConfig,
-        custody: K,
-        accounts: D,
-        audit: U,
-        rate: R,
-    ) -> Result<Self, ConfigError> {
+    pub fn new(config: KdcConfig, custody: K, audit: U, rate: R) -> Result<Self, ConfigError> {
         config.validate(custody.config())?;
         let local = ErrorContext::local(&config.realm).ok_or(ConfigError::RealmMismatch)?;
         Ok(Kdc {
@@ -172,7 +169,6 @@ impl<K: KeyCustody, D: AccountSource, U: AuditSink, R: RateLimiter> Kdc<K, D, U,
             ),
             config,
             custody,
-            accounts,
             audit,
             rate,
             local,
@@ -191,7 +187,9 @@ impl<K: KeyCustody, D: AccountSource, U: AuditSink, R: RateLimiter> Kdc<K, D, U,
     ///   KDC_ERR_BAD_PVNO for a protocol version other than 5 (7.5.9), and
     ///   KRB_ERR_GENERIC for anything else — no other RFC 4120 code
     ///   describes a malformed AS-REQ / TGS-REQ;
-    /// - otherwise the AS or TGS exchange.
+    /// - otherwise the AS or TGS exchange, reading principals from
+    ///   `accounts` — the account source of this request, taken from the
+    ///   same consistent view as `policy` (docs/47 §8.1, R47-14).
     ///
     /// UDP silence for every undecodable datagram extends 5.1.4's rule for
     /// unknown tags ("in order to avoid denial of service attacks"): an
@@ -200,14 +198,15 @@ impl<K: KeyCustody, D: AccountSource, U: AuditSink, R: RateLimiter> Kdc<K, D, U,
     /// Clients MUST support TCP (7.2.2), where every such request is
     /// answered.
     ///
-    /// Spec: RFC 4120 3.1.2, 3.3.2, 5.1.4, 7.2.1, 7.2.2, 7.5.9; main-session
-    /// decisions 1, 11, 12.
+    /// Spec: RFC 4120 3.1.2, 3.3.2, 5.1.4, 7.2.1, 7.2.2, 7.5.9; docs/47
+    /// §10.1 (R47-14); main-session decisions 1, 11, 12.
     pub fn handle(
         &mut self,
         request: &[u8],
         peer: Peer,
         now: KerberosTime,
         policy: &PolicyInputs<'_>,
+        accounts: &dyn AccountSource,
     ) -> KdcReply {
         if request.len() > MAX_REQUEST_LEN {
             return self.refuse_unscoped(
@@ -241,12 +240,13 @@ impl<K: KeyCustody, D: AccountSource, U: AuditSink, R: RateLimiter> Kdc<K, D, U,
             }
             Ok(KdcRequest::As(as_req)) => {
                 let scope = Scope::of(Exchange::As, &as_req.0.req_body, &self.local);
-                let result = self.receive_as_req(&as_req.0, peer, &now, policy);
+                let result = self.receive_as_req(&as_req.0, peer, &now, policy, accounts);
                 self.conclude(request, result, &scope, peer, now)
             }
             Ok(KdcRequest::Tgs(tgs_req)) => {
                 let mut scope = Scope::of(Exchange::Tgs, &tgs_req.0.req_body, &self.local);
-                let result = self.receive_tgs_req(&tgs_req.0, &mut scope, peer, &now, policy);
+                let result =
+                    self.receive_tgs_req(&tgs_req.0, &mut scope, peer, &now, policy, accounts);
                 self.conclude(request, result, &scope, peer, now)
             }
         }
@@ -285,16 +285,6 @@ impl<K: KeyCustody, D: AccountSource, U: AuditSink, R: RateLimiter> Kdc<K, D, U,
     /// Mutable access to the key custody.
     pub fn custody_mut(&mut self) -> &mut K {
         &mut self.custody
-    }
-
-    /// The account source.
-    pub fn accounts(&self) -> &D {
-        &self.accounts
-    }
-
-    /// Mutable access to the account source (e.g. to disable an account).
-    pub fn accounts_mut(&mut self) -> &mut D {
-        &mut self.accounts
     }
 
     /// The audit sink.

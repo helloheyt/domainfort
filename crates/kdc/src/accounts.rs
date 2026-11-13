@@ -13,8 +13,10 @@
 //! (RFC 4120 7.5.9 KDC_ERR_PRINCIPAL_NOT_UNIQUE) is not expressible here.
 //!
 //! [`InMemoryAccounts`] is the in-memory implementation used by the tests and
-//! the fuzz target. A directory-backed implementation (dirstore + the AD
-//! schema subset of [MS-ADSC] / [MS-ADA1-3]) is a later follow-up.
+//! the fuzz target. The directory-backed implementation (dirstore + the AD
+//! schema subset of [MS-ADSC] / [MS-ADA1-3]) is the `directory-pip` crate
+//! (docs/47 R47-11). The KDC receives the source with each request, not at
+//! construction (docs/47 R47-14).
 //!
 //! Spec: main-session decisions 3, 4, 8; docs/11 §1 (Subject: principal,
 //! groups, tier — from authoritative data, never client-claimed, P3); docs/25

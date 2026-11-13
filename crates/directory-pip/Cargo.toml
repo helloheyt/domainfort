@@ -1,0 +1,57 @@
+# directory-pip — the KDC's account source and the PDP's policy information
+# point over the directory (docs/47, decided as A-38; R47-11).
+#
+# One per-request view, built from ONE dirstore snapshot, implements both
+# `kdc::AccountSource` and `pdp::Pip`, so the account records the KDC reads
+# and the answers the PDP gets come from one consistent picture (docs/47 §8.1;
+# docs/11 §6 snapshot semantics).
+#
+# Pure library: no I/O beyond the dirstore read transaction the caller's
+# store hands out, no clock, no randomness, no secret (keys stay in keyd —
+# this crate only names key sets by handle).
+#
+# Written only from docs/47 (R47-1..R47-14, A-38), the decided questions
+# Q-110..Q-117 (A-34..A-37), PENDING-OWNER A-18, A-19, A-27..A-38, P-6, P-9,
+# and the pinned [MS-KILE] v20260928, [MS-ADTS] v20261026, [MS-SAMR]
+# v20260427, [MS-DRSR] v20260309, [MS-DTYP] v20241119 and RFC 4120 sections
+# cited in the source, opened in-session from tools/spec-pin/cache/ (SHA-256
+# verified against the manifest) — AGENTS.md §1-3.
+
+[package]
+name = "directory-pip"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Our own workspace crates only (path dependencies). No external crate
+# (AGENTS.md §7; docs/47 §10.2 "no new external dependency").
+#
+# The directory store: Snapshot, Object, lookup_unique, back_links,
+# lookup_child, get_object.
+dirstore = { path = "../dirstore" }
+# The phase-1 AD schema content: attribute / class ids by name, class chains,
+# property sets, attribute classes.
+ad-schema = { path = "../ad-schema" }
+# The AccountSource trait and its records (docs/47 §10.1).
+kdc = { path = "../kdc" }
+# The Pip trait and the request model (Tier, Dn, Resource, ...).
+pdp = { path = "../pdp" }
+# keyd TYPES only (KeyHandle, KeyPurpose, PrincipalId, KeydConfig) and its
+# public KerberosTime-to-seconds mapping; no keyd operation is called.
+keyd = { path = "../keyd" }
+# Kerberos names, KerberosString, KerberosTime, ETYPE-INFO2 entries
+# (the AccountSource signature types; docs/47 §10.2).
+krb-proto = { path = "../krb-proto" }
+# GUID, SID and SECURITY_DESCRIPTOR.
+dtyp = { path = "../dtyp" }
+
+[dev-dependencies]
+# TESTS ONLY, as for the kdc tests (main-session decision 2): the AS -> TGS
+# round trip plays the Kerberos client — derives the client key from the
+# password and the ETYPE-INFO2 salt, builds PA-ENC-TIMESTAMP and the TGS
+# authenticator, opens the replies. The product library never links it.
+krb-crypto = { path = "../krb-crypto" }
+
+[lints]
+workspace = true

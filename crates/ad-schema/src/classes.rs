@@ -222,7 +222,10 @@ pub static CLASSES: [ClassEntry; 10] = [
     // objectSid; supplementalCredentials, nTSecurityDescriptor),
     // mailRecipient (2.85: cn), msDS-CloudExtensions (2.134: none);
     // auxiliaryClass shadowAccount (2.256: description), posixAccount
-    // (2.224: cn, description).
+    // (2.224: cn, description). docs/47 R47-13 (A-38): servicePrincipalName
+    // is left out of the dirstore `may` here and allowed on computer only in
+    // phase 1 (the only class the KDC looks SPNs up on, docs/47 §1.3);
+    // `spec_attributes` (CLASSATTS) keeps it, as printed.
     ClassEntry {
         ldap_display_name: "user",
         cn: "User",
@@ -237,7 +240,6 @@ pub static CLASSES: [ClassEntry; 10] = [
         must: &["cn", "sAMAccountName", "objectSid"],
         may: &[
             "userPrincipalName",
-            "servicePrincipalName",
             "userAccountControl",
             "accountExpires",
             "pwdLastSet",
@@ -268,7 +270,9 @@ pub static CLASSES: [ClassEntry; 10] = [
         ],
     },
     // Spec: [MS-ADSC] 2.21 computer. Own systemMayContain: dNSHostName, cn;
-    // auxiliaryClass ipHost (2.67: cn, description).
+    // auxiliaryClass ipHost (2.67: cn, description). docs/47 R47-13 (A-38):
+    // servicePrincipalName (from user, [MS-ADSC] 2.269) is in the dirstore
+    // `may` of computer only in phase 1.
     ClassEntry {
         ldap_display_name: "computer",
         cn: "Computer",
@@ -281,7 +285,7 @@ pub static CLASSES: [ClassEntry; 10] = [
         system_only: false,
         source: "[MS-ADSC] 2.21",
         must: &[],
-        may: &["dNSHostName"],
+        may: &["dNSHostName", "servicePrincipalName"],
         poss_superiors: &["container", "organizationalUnit", "domainDNS"],
         nc_root: false,
         spec_attributes: &["dNSHostName", "cn", "description"],

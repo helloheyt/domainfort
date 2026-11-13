@@ -547,7 +547,11 @@ pub static ATTRIBUTES: [AttributeEntry; 35] = [
     },
     // Spec: [MS-ADA3] 2.253 servicePrincipalName; docs/46 §5.4 (1..1024 =
     // project choice, R46-8: the entry has no range), §8.5 (unique); Q-080
-    // (ASCII).
+    // (ASCII). docs/47 R47-13 (A-38; Q-112 / A-37): single-valued in phase
+    // 1, although multi-valued in the spec (isSingleValued FALSE, kept as
+    // printed) — a keyd key set is bound to exactly one name (A-19), so one
+    // object can serve exactly one SPN. A deliberate, stricter deviation like
+    // R46-8; back to multi-valued when keyd supports several bindings.
     AttributeEntry {
         ldap_display_name: "servicePrincipalName",
         attribute_id: "1.2.840.113556.1.4.771",
@@ -565,7 +569,7 @@ pub static ATTRIBUTES: [AttributeEntry; 35] = [
         link_id: None,
         source: "[MS-ADA3] 2.253",
         form: Form::Stored(Stored {
-            multiplicity: MultiValued,
+            multiplicity: SingleValued,
             max_value_len: 3072,
             range: range(1, 1024),
             constraint: Some(Constraint::AsciiPrintable),

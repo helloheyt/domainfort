@@ -310,20 +310,25 @@ impl GroupTypeFixture for Fixture {
 #[test]
 fn duplicates_are_refused_under_case_fold() {
     // Source: docs/46 §8.5 (unique sAMAccountName, userPrincipalName,
-    // servicePrincipalName; comparison key per Q-080: ASCII, A–Z folded).
+    // servicePrincipalName; comparison key per Q-080: ASCII, A–Z folded);
+    // docs/47 R47-13 (servicePrincipalName single-valued, on computers).
     let f = Fixture::new("unique");
     f.tree();
     f.create(f.user(
         10,
         guid(2),
         "alice",
-        &[
-            ("userPrincipalName", vec![b"alice@example.test".to_vec()]),
-            (
-                "servicePrincipalName",
-                vec![b"HTTP/web.example.test".to_vec()],
-            ),
-        ],
+        &[("userPrincipalName", vec![b"alice@example.test".to_vec()])],
+    ))
+    .unwrap();
+    f.create(f.computer(
+        11,
+        guid(2),
+        "web0",
+        &[(
+            "servicePrincipalName",
+            vec![b"HTTP/web.example.test".to_vec()],
+        )],
     ))
     .unwrap();
     let sam = f.attr("sAMAccountName");
@@ -356,7 +361,8 @@ fn duplicates_are_refused_under_case_fold() {
         )],
     );
     assert!(matches!(f.create(obj), Err(Error::ValueNotUnique(a)) if a == spn));
-    // Two values of one object that fold to the same key.
+    // Two values on one object: refused by the single-valued rule (R47-13)
+    // before any comparison key is computed.
     let obj = f.computer(
         23,
         guid(2),
@@ -366,7 +372,7 @@ fn duplicates_are_refused_under_case_fold() {
             vec![b"HOST/web2".to_vec(), b"host/WEB2".to_vec()],
         )],
     );
-    assert_eq!(f.refused(obj), Violation::DuplicateValue(spn));
+    assert_eq!(f.refused(obj), Violation::MultipleValuesOnSingleValued(spn));
     // Distinct names are fine.
     f.create(f.user(
         24,
@@ -375,6 +381,70 @@ fn duplicates_are_refused_under_case_fold() {
         &[("userPrincipalName", vec![b"dave@example.test".to_vec()])],
     ))
     .unwrap();
+}
+
+#[test]
+fn service_principal_name_only_on_computers_and_single_valued() {
+    // Source: docs/47 R47-13 (A-38) — servicePrincipalName single-valued, and
+    // allowed on computer only, in phase 1 (stricter than [MS-ADSC] 2.269 /
+    // [MS-ADA3] 2.253; Q-112 / A-37).
+    let f = Fixture::new("spn-computer-only");
+    f.tree();
+    let spn = f.attr("servicePrincipalName");
+    // Refused on a user, on create and on modify.
+    let obj = f.user(
+        10,
+        guid(2),
+        "svc",
+        &[(
+            "servicePrincipalName",
+            vec![b"http/svc.example.test".to_vec()],
+        )],
+    );
+    assert_eq!(f.refused(obj), Violation::AttributeNotAllowed(spn));
+    f.create(f.user(11, guid(2), "plain", &[])).unwrap();
+    let mut txn = f.store.begin_write().unwrap();
+    let result = txn.modify_object(
+        guid(11),
+        vec![AttributeChange::Replace {
+            id: spn,
+            values: vec![b"http/plain.example.test".to_vec()],
+        }],
+        &f.origin(),
+    );
+    assert!(matches!(
+        result,
+        Err(Error::Rejected(Violation::AttributeNotAllowed(a))) if a == spn
+    ));
+    drop(txn);
+    // Accepted on a computer, one value.
+    f.create(f.computer(
+        12,
+        guid(2),
+        "ws12$",
+        &[(
+            "servicePrincipalName",
+            vec![b"host/ws12.example.test".to_vec()],
+        )],
+    ))
+    .unwrap();
+    // A second distinct value is refused.
+    let mut txn = f.store.begin_write().unwrap();
+    let result = txn.modify_object(
+        guid(12),
+        vec![AttributeChange::Replace {
+            id: spn,
+            values: vec![
+                b"host/ws12.example.test".to_vec(),
+                b"cifs/ws12.example.test".to_vec(),
+            ],
+        }],
+        &f.origin(),
+    );
+    assert!(matches!(
+        result,
+        Err(Error::Rejected(Violation::MultipleValuesOnSingleValued(a))) if a == spn
+    ));
 }
 
 #[test]

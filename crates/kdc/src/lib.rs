@@ -18,7 +18,8 @@
 //! `open_and_verify_tgt`, `issue_tgs_rep` (docs/10 §4-§5). Every AS and TGS
 //! step is a PDP decision (`Action::KdcAs` / `KdcTgs`, docs/11; module
 //! [`gate`]). Principals come from a KDC-owned [`AccountSource`] trait
-//! (main-session decision 3).
+//! (main-session decision 3), passed with each request alongside the
+//! [`PolicyInputs`] so both come from one directory view (docs/47 R47-14).
 //!
 //! # Profile (decisions of the main session, docs/02 §3, docs/30)
 //!
@@ -55,8 +56,9 @@
 //!
 //! # Follow-ups
 //!
-//! - A directory-backed [`AccountSource`] (dirstore + the AD schema subset);
-//!   the in-memory [`InMemoryAccounts`] serves tests and fuzzing.
+//! - The directory-backed [`AccountSource`] is the `directory-pip` crate
+//!   (docs/47 R47-11); the in-memory [`InMemoryAccounts`] serves tests and
+//!   fuzzing.
 //! - The keyd IPC client (D34) implementing [`KeyCustody`].
 //! - FAST armoring and its PDP requirement (D126).
 //!

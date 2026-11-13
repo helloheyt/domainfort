@@ -95,8 +95,9 @@ fn tgt_refusal(error: AuthnError) -> Refusal {
     }
 }
 
-impl<K: KeyCustody, D: AccountSource, U: AuditSink, R: RateLimiter> Kdc<K, D, U, R> {
+impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
     /// Receipt of KRB_TGS_REQ and generation of KRB_TGS_REP (module docs).
+    /// `accounts` is this request's account source (docs/47 R47-14).
     /// Spec: RFC 4120 3.3.2, 3.3.3; docs/30 §3.
     pub(crate) fn receive_tgs_req(
         &mut self,
@@ -105,6 +106,7 @@ impl<K: KeyCustody, D: AccountSource, U: AuditSink, R: RateLimiter> Kdc<K, D, U,
         peer: Peer,
         now: &KerberosTime,
         policy: &PolicyInputs<'_>,
+        accounts: &dyn AccountSource,
     ) -> Result<Vec<u8>, Refusal> {
         let body = &req.req_body;
         let keyd_config = self.custody.config();
@@ -204,7 +206,7 @@ impl<K: KeyCustody, D: AccountSource, U: AuditSink, R: RateLimiter> Kdc<K, D, U,
         scope.set_client(&tgt.crealm, &tgt.cname);
 
         // 7. Re-evaluate the client now (D53; decision 8; 3.3.3.1).
-        let client = match self.accounts.client(&tgt.crealm, &tgt.cname) {
+        let client = match accounts.client(&tgt.crealm, &tgt.cname) {
             Err(_) => return Err(internal(AuditReason::AccountSourceFailure)),
             Ok(None) => {
                 return Err(Refusal::new(
@@ -225,7 +227,7 @@ impl<K: KeyCustody, D: AccountSource, U: AuditSink, R: RateLimiter> Kdc<K, D, U,
         }
 
         // 8. The service account (decisions 3, 8).
-        let service = match self.accounts.service(&body.realm, sname) {
+        let service = match accounts.service(&body.realm, sname) {
             Err(_) => return Err(internal(AuditReason::AccountSourceFailure)),
             Ok(None) => {
                 return Err(Refusal::new(

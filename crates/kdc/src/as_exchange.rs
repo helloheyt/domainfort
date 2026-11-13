@@ -102,8 +102,9 @@ fn preauth_refusal(error: AuthnError) -> Refusal {
     Refusal::new(KDC_ERR_PREAUTH_FAILED, reason)
 }
 
-impl<K: KeyCustody, D: AccountSource, U: AuditSink, R: RateLimiter> Kdc<K, D, U, R> {
+impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
     /// Receipt of KRB_AS_REQ and generation of KRB_AS_REP (module docs).
+    /// `accounts` is this request's account source (docs/47 R47-14).
     /// Spec: RFC 4120 3.1.2, 3.1.3; docs/30 §2.
     pub(crate) fn receive_as_req(
         &mut self,
@@ -111,6 +112,7 @@ impl<K: KeyCustody, D: AccountSource, U: AuditSink, R: RateLimiter> Kdc<K, D, U,
         peer: Peer,
         now: &KerberosTime,
         policy: &PolicyInputs<'_>,
+        accounts: &dyn AccountSource,
     ) -> Result<Vec<u8>, Refusal> {
         let body = &req.req_body;
         let keyd_config = self.custody.config();
@@ -164,7 +166,7 @@ impl<K: KeyCustody, D: AccountSource, U: AuditSink, R: RateLimiter> Kdc<K, D, U,
         check_starttime(body.from.as_ref(), now, skew).map_err(time_refusal)?;
 
         // 6-7. The client account and its state (3.1.3; decisions 3, 5, 8).
-        let account = match self.accounts.client(&body.realm, cname) {
+        let account = match accounts.client(&body.realm, cname) {
             Err(_) => return Err(internal(AuditReason::AccountSourceFailure)),
             Ok(None) => {
                 return Err(Refusal::new(

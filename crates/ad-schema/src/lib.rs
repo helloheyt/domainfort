@@ -8,7 +8,9 @@
 //!   (objectClass, objectCategory, instanceType, objectGUID, name,
 //!   distinguishedName, memberOf), 11 secret (the [MS-ADTS] 3.1.1.1.4 set) —
 //!   with their attributeSchema values from [MS-ADA1-3] and the dirstore
-//!   mapping of docs/46 §5.4 (R46-4, R46-6, R46-7, R46-8).
+//!   mapping of docs/46 §5.4 (R46-4, R46-6, R46-7, R46-8) and docs/47 R47-13
+//!   (servicePrincipalName single-valued, and allowed on computer only, in
+//!   phase 1).
 //! - **10 class definitions** ([`CLASSES`]): top, domain, domainDNS (NC root
 //!   only), organizationalUnit, container, person, organizationalPerson,
 //!   user, computer, group — with their classSchema values from [MS-ADSC]

@@ -177,7 +177,8 @@ fn unique_ascii_and_rdn_labels() {
 fn ranges_bounds_and_multiplicity_per_docs46_5_4() {
     // Source: docs/46 §5.4 (max_value_len, ranges, Single / Multi), R46-7
     // (nTSecurityDescriptor capped at 65536), R46-8 (ou and description
-    // single-valued; rangeLower 1 on sAMAccountName / UPN / SPN).
+    // single-valued; rangeLower 1 on sAMAccountName / UPN / SPN); docs/47
+    // R47-13 (servicePrincipalName single-valued in phase 1).
     let p1 = p1();
     let r = |lower, upper| Some(ValueRange { lower, upper });
     let expect: [(&str, ValueSyntax, Multiplicity, usize, Option<ValueRange>); 17] = [
@@ -240,7 +241,7 @@ fn ranges_bounds_and_multiplicity_per_docs46_5_4() {
         (
             "servicePrincipalName",
             ValueSyntax::Utf8String,
-            Multiplicity::MultiValued,
+            Multiplicity::SingleValued,
             3072,
             r(1, 1024),
         ),
@@ -311,7 +312,7 @@ fn ranges_bounds_and_multiplicity_per_docs46_5_4() {
         assert_eq!(d.range, range, "{name}");
     }
     // The dirstore multiplicity differs from isSingleValued only for ou and
-    // description (R46-8).
+    // description (R46-8) and servicePrincipalName (R47-13).
     let mut deviations = Vec::new();
     for a in p1.attributes() {
         let d = p1.schema().attribute(a.id).unwrap();
@@ -320,7 +321,17 @@ fn ranges_bounds_and_multiplicity_per_docs46_5_4() {
             deviations.push(a.entry.ldap_display_name);
         }
     }
-    assert_eq!(sorted(deviations), vec!["description", "ou"]);
+    assert_eq!(
+        sorted(deviations),
+        vec!["description", "ou", "servicePrincipalName"]
+    );
+    // isSingleValued is kept as printed in [MS-ADA3] 2.253.
+    let spn = p1
+        .attribute(id(&p1, "servicePrincipalName"))
+        .unwrap()
+        .entry
+        .is_single_valued;
+    assert!(!spn);
     // Secret attributes: OctetString, Utf8String for initialAuth*
     // (docs/46 §5.4).
     for a in p1.attributes().filter(|a| a.entry.form == Form::Secret) {
@@ -338,7 +349,8 @@ fn ranges_bounds_and_multiplicity_per_docs46_5_4() {
 fn class_definitions_per_docs46_4_4() {
     // Source: docs/46 §4.4 (must / may / poss_superiors / rdn_attr), §4.1
     // (instantiable: domainDNS as NC root, OU, container, user, computer,
-    // group), §8.3 (superclass, nc_root).
+    // group), §8.3 (superclass, nc_root); docs/47 R47-13
+    // (servicePrincipalName in computer's may only).
     let p1 = p1();
     let class = |n: &str| p1.class_by_name(n).expect(n);
     let attrs = |names: &[&str]| -> Vec<AttrId> { names.iter().map(|n| id(&p1, n)).collect() };
@@ -415,7 +427,6 @@ fn class_definitions_per_docs46_4_4() {
             &["cn", "sAMAccountName", "objectSid"],
             &[
                 "userPrincipalName",
-                "servicePrincipalName",
                 "userAccountControl",
                 "accountExpires",
                 "pwdLastSet",
@@ -434,7 +445,7 @@ fn class_definitions_per_docs46_4_4() {
             true,
             "cn",
             &[],
-            &["dNSHostName"],
+            &["dNSHostName", "servicePrincipalName"],
             &["container", "organizationalUnit", "domainDNS"],
             false,
         ),

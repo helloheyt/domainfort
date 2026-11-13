@@ -86,17 +86,15 @@ impl Pip for FuzzPip {
     }
 }
 
-type FuzzKdc = Kdc<
-    LocalKeyd<InMemoryKeyStore, NoKeydAudit, OsEntropy>,
-    InMemoryAccounts,
-    NoKdcAudit,
-    AdmitAll,
->;
+type FuzzKdc = Kdc<LocalKeyd<InMemoryKeyStore, NoKeydAudit, OsEntropy>, NoKdcAudit, AdmitAll>;
 
+/// The KDC, its policy inputs and the account source passed with each
+/// request (docs/47 R47-14).
 struct FuzzState {
     kdc: FuzzKdc,
     snapshot: PolicySnapshot,
     pip: FuzzPip,
+    accounts: InMemoryAccounts,
 }
 
 const REALM: &str = "FUZZ.EXAMPLE";
@@ -194,7 +192,6 @@ fn build() -> FuzzState {
     let kdc = Kdc::new(
         KdcConfig::new(realm, krbtgt),
         LocalKeyd::new(keyd, KDC_CALLER).expect("Kdc role"),
-        accounts,
         NoKdcAudit,
         AdmitAll,
     )
@@ -221,6 +218,7 @@ fn build() -> FuzzState {
         pip: FuzzPip {
             tiers: [(sid, Tier::Tier2)].into_iter().collect(),
         },
+        accounts,
     }
 }
 
@@ -254,7 +252,13 @@ fuzz_target!(|data: &[u8]| {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    let FuzzState { kdc, snapshot, pip } = &mut *guard;
+    let FuzzState {
+        kdc,
+        snapshot,
+        pip,
+        accounts,
+    } = &mut *guard;
+    let accounts: &InMemoryAccounts = accounts;
     let inputs = PolicyInputs {
         snapshot: &*snapshot,
         pip: &*pip,
@@ -277,7 +281,7 @@ fuzz_target!(|data: &[u8]| {
                         message,
                         rest: next,
                     }) => {
-                        check(kdc.handle(message, tcp, now(), &inputs));
+                        check(kdc.handle(message, tcp, now(), &inputs, accounts));
                         if next.len() >= rest.len() {
                             break;
                         }
@@ -291,7 +295,7 @@ fuzz_target!(|data: &[u8]| {
                 }
             }
         }
-        1 => check(kdc.handle(input, udp, now(), &inputs)),
-        _ => check(kdc.handle(input, tcp, now(), &inputs)),
+        1 => check(kdc.handle(input, udp, now(), &inputs, accounts)),
+        _ => check(kdc.handle(input, tcp, now(), &inputs, accounts)),
     }
 });

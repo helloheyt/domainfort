@@ -100,6 +100,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "directory-pip"
+version = "0.0.0"
+dependencies = [
+ "ad-schema",
+ "dirstore",
+ "dtyp",
+ "kdc",
+ "keyd",
+ "krb-crypto",
+ "krb-proto",
+ "pdp",
+]
+
+[[package]]
 name = "dirstore"
 version = "0.0.0"
 dependencies = [
