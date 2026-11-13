@@ -24,7 +24,7 @@
 
 [workspace]
 resolver = "2"
-members = ["crates/parse-asn1", "crates/krb-crypto", "crates/krb-proto", "crates/dtyp", "crates/dirstore", "crates/pdp", "crates/keyd", "crates/kdc", "crates/ad-schema", "crates/directory-pip", "crates/parse-ldap", "crates/ldap"]
+members = ["crates/parse-asn1", "crates/krb-crypto", "crates/krb-proto", "crates/dtyp", "crates/dirstore", "crates/pdp", "crates/keyd", "crates/kdc", "crates/ad-schema", "crates/directory-pip", "crates/parse-ldap", "crates/ldap", "crates/config"]
 
 # מדיניות build לכלל ה-workspace (תחול כשייווספו crates):
 [workspace.lints.rust]
