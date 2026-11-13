@@ -92,6 +92,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dirstore"
+version = "0.0.0"
+dependencies = [
+ "dtyp",
+ "hmac",
+ "redb",
+ "sha2",
+ "zeroize",
+]
+
+[[package]]
 name = "dtyp"
 version = "0.0.0"
 
@@ -160,6 +171,15 @@ checksum = "112d82ceb8c5bf524d9af484d4e4970c9fd5a0cc15ba14ad93dccd28873b0629"
 dependencies = [
  "digest",
  "hmac",
+]
+
+[[package]]
+name = "redb"
+version = "4.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b317ef681e18f6091efbfab532eaf924a135c492d9d0299d0fbfae07e92a39b"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
