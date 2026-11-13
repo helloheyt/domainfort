@@ -43,7 +43,9 @@ pub(crate) const TGS_REP_ENC_PART_SUBKEY: u32 = 9;
 /// key: "a key usage value of 11 in normal application exchanges, or 7 when
 /// used as the PA-TGS-REQ PA-DATA field". keyd uses it for the authenticator
 /// of the FX_FAST_ARMOR_AP_REQUEST armor AP-REQ, which is not a PA-TGS-REQ
-/// (docs/questions/Q-120 item 1, decided A-32). Spec: RFC 4120 7.5.1, 5.5.1;
+/// (docs/questions/Q-120 item 1, decided A-32), and for the authenticator of
+/// a service AP-REQ verified by `open_and_verify_service_ticket` — a normal
+/// application exchange (docs/49 §3.3, A-46). Spec: RFC 4120 7.5.1, 5.5.1;
 /// RFC 6113 5.4.1.1.
 pub(crate) const AP_REQ_AUTHENTICATOR: u32 = 11;
 

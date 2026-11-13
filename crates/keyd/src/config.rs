@@ -9,7 +9,8 @@
 //! Spec: RFC 4120 §8.2; docs/10 §1 (EncType list, no weak variant), §8 / D36
 //! (short-lived tokens), D33 (bounded replay cache); docs/25 §5 (minimalism);
 //! docs/30 §2.6 (dangerous ticket options reduced by default); docs/48 §10.1
-//! (armor table); decision A-34 (preauth throttle).
+//! (armor table); decision A-34 (preauth throttle); docs/49 §3.3, A-46
+//! (service-context table).
 
 use crate::error::ConfigError;
 use krb_crypto::EncType;
@@ -132,6 +133,10 @@ pub struct KeydConfig {
     /// Bound of the FAST armor table (`open_fast_armor`; docs/48 §9.1 I4,
     /// §10.1).
     pub max_armor_contexts: usize,
+    /// Bound of the service-context table (`open_and_verify_service_ticket`:
+    /// the session keys of verified service tickets, held for the later GSS
+    /// steps; docs/49 §3.3, A-46).
+    pub max_service_contexts: usize,
     /// Bound of the replay cache (docs/10 D33).
     pub replay_cache_capacity: usize,
     /// Ticket template policy.
@@ -170,6 +175,7 @@ impl KeydConfig {
             max_authn_proofs: 1_024,
             max_tgt_contexts: 1_024,
             max_armor_contexts: 1_024,
+            max_service_contexts: 1_024,
             replay_cache_capacity: 65_536,
             ticket_policy: TicketPolicy::default(),
             s2k_params: None,
@@ -202,6 +208,7 @@ impl KeydConfig {
             self.max_authn_proofs,
             self.max_tgt_contexts,
             self.max_armor_contexts,
+            self.max_service_contexts,
             self.replay_cache_capacity,
             self.throttle.capacity,
             self.preauth_throttle.capacity,
@@ -344,5 +351,17 @@ mod tests {
         let mut c = base();
         c.preauth_throttle.max_failures = 0;
         assert_eq!(c.validate(), Err(ConfigError::Throttle));
+    }
+
+    /// The service-context table is bounded and validated like the other
+    /// token tables (docs/49 §3.3, A-46; AGENTS.md §6).
+    #[test]
+    fn service_context_table_is_validated() {
+        let mut c = base();
+        c.max_service_contexts = 0;
+        assert_eq!(c.validate(), Err(ConfigError::Capacity));
+        let mut c = base();
+        c.max_service_contexts = MAX_TABLE_CAPACITY + 1;
+        assert_eq!(c.validate(), Err(ConfigError::Capacity));
     }
 }

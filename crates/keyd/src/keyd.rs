@@ -21,6 +21,7 @@ use crate::error::{ConfigError, Deny, Internal};
 use crate::fast_armor::ArmorEntry;
 use crate::model::{KeyHandle, KeyPurpose, Kvno, PrincipalId};
 use crate::replay::ReplayCache;
+use crate::service_ticket::ServiceContextEntry;
 use crate::store::{KeyStore, StoreError};
 use crate::tgs_exchange::ContextEntry;
 use crate::throttle::{FailureWindowThrottle, SecretThrottle};
@@ -49,6 +50,10 @@ pub struct Keyd<S: KeyStore, A: AuditSink, E: EntropySource = OsEntropy> {
     pub(crate) contexts: TokenTable<ContextEntry>,
     /// Opened FAST armors (docs/48 §2.3, §9.1 I4).
     pub(crate) armors: TokenTable<ArmorEntry>,
+    /// Verified service tickets: their session keys and subkeys, held for
+    /// the later GSS steps (docs/49 §3.3, A-46).
+    pub(crate) service_contexts: TokenTable<ServiceContextEntry>,
+    /// The one replay cache of every AP-REQ keyd verifies (RFC 4120 3.2.3).
     pub(crate) replay: ReplayCache,
 }
 
@@ -82,6 +87,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             proofs: TokenTable::new(config.max_authn_proofs),
             contexts: TokenTable::new(config.max_tgt_contexts),
             armors: TokenTable::new(config.max_armor_contexts),
+            service_contexts: TokenTable::new(config.max_service_contexts),
             replay: ReplayCache::new(config.replay_cache_capacity),
             preauth_throttle: FailureWindowThrottle::new(config.preauth_throttle),
             throttle,
@@ -150,6 +156,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> fmt::Debug for Keyd<S, A, E> {
             .field("live_authn_proofs", &self.proofs.len())
             .field("live_tgt_contexts", &self.contexts.len())
             .field("live_armor_contexts", &self.armors.len())
+            .field("live_service_contexts", &self.service_contexts.len())
             .finish()
     }
 }

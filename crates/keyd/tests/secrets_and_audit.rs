@@ -10,7 +10,7 @@ use common::*;
 use keyd::{
     ArmorId, AsRepParts, AsTicketTemplate, AuditOutcome, AuthnError, AuthnProof, CallerId, CtxId,
     DualControlToken, Error, IssueError, KeyHandle, Kvno, Operation, PrincipalBinding, PrincipalId,
-    TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext,
+    ServiceContext, TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext,
 };
 use krb_proto::{ApReq, KerberosTime, PaData};
 use zeroize::Zeroizing;
@@ -110,6 +110,16 @@ fn operation_signatures_return_no_key_material() {
         Zeroizing<String>,
         &KerberosTime,
     ) -> Result<(), Error> = K::verify_secret;
+    // docs/49 §3.3, A-46 (task L6a): the service AP-REQ goes in as octets;
+    // out come non-secret facts and a one-time token — no key, no session
+    // key.
+    let _: fn(
+        &mut K,
+        &CallerId,
+        &KeyHandle,
+        &[u8],
+        &KerberosTime,
+    ) -> Result<ServiceContext, AuthnError> = K::open_and_verify_service_ticket;
 }
 
 /// I1 at the value level: nothing keyd returns contains a long-term key or
@@ -283,6 +293,17 @@ fn every_operation_emits_exactly_one_audit_record() {
         &n,
     );
     check(&f, Operation::SealFastError, &KDC, false);
+
+    // Service-ticket verification (docs/49 §3.3, A-46): one record either
+    // way. The successful path is audited in tests/service_ticket.rs.
+    let _ = f
+        .keyd
+        .open_and_verify_service_ticket(&LDAP, &SERVICE, &[0x30, 0x00], &n);
+    check(&f, Operation::OpenAndVerifyServiceTicket, &LDAP, false);
+    let _ = f
+        .keyd
+        .open_and_verify_service_ticket(&KDC, &SERVICE, &[0x30, 0x00], &n);
+    check(&f, Operation::OpenAndVerifyServiceTicket, &KDC, false);
 
     // Every operation was exercised.
     for op in Operation::ALL {

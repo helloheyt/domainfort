@@ -114,6 +114,15 @@ pub const ADMIN: CallerId = CallerId {
     uid: 300,
     role: Role::Admin,
 };
+/// The LDAP front (docs/questions/Q-165 item 3, A-46).
+pub const LDAP: CallerId = CallerId {
+    uid: 400,
+    role: Role::Ldap,
+};
+pub const LDAP_OTHER: CallerId = CallerId {
+    uid: 401,
+    role: Role::Ldap,
+};
 
 pub const ALICE_ID: PrincipalId = PrincipalId::from_bytes([0xA1; 16]);
 pub const BOB_ID: PrincipalId = PrincipalId::from_bytes([0xB0; 16]);
@@ -499,6 +508,39 @@ pub fn open_tgt(f: &mut Fixture, tgt: &Tgt, nonce: u32, cusec: u32) -> TgtContex
 /// `true` if `needle` occurs in `haystack`.
 pub fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+// ---------------------------------------------------------------------------
+// The DC's LDAP service (docs/49 §3.3; docs/questions/Q-165 item 4, A-46): a
+// dedicated Service key set with one name, created by the Admin role with a
+// random key. The tests script that key's entropy only so that they can play
+// a compromised KDC (forging tickets under it) — keyd never returns it. The
+// name and key bytes are made up for these tests.
+// ---------------------------------------------------------------------------
+
+pub const LDAP_SERVICE_ID: PrincipalId = PrincipalId::from_bytes([0x1D; 16]);
+pub const LDAP_SERVICE: KeyHandle = KeyHandle::new(LDAP_SERVICE_ID, KeyPurpose::Service);
+pub const LDAP_SERVICE_KEY: [u8; 32] = [0xF3; 32];
+
+/// RFC 4120 6.2.1 (NT-SRV-INST): ("ldap", "dc01.example.org").
+pub fn ldap_service_name() -> PrincipalName {
+    PrincipalName {
+        name_type: KRB_NT_SRV_INST,
+        name_string: vec![kstr("ldap"), kstr("dc01.example.org")],
+    }
+}
+
+pub fn ldap_service_key() -> ProtocolKey {
+    krb_crypto::random_to_key(EncType::Aes256CtsHmacSha196, &LDAP_SERVICE_KEY).unwrap()
+}
+
+/// Create the LDAP service key set through `create_key` (Admin).
+pub fn add_ldap_service(f: &mut Fixture) {
+    f.entropy.push(&LDAP_SERVICE_KEY);
+    f.keyd
+        .create_key(&ADMIN, &LDAP_SERVICE, &bound(ldap_service_name()), &now())
+        .unwrap();
+    f.keyd.audit_sink_mut().records.clear();
 }
 
 // ---------------------------------------------------------------------------

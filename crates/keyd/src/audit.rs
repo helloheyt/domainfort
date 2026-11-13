@@ -231,6 +231,27 @@ pub enum AuditReason {
     /// it was opened without FAST, so there is no armor key to seal under.
     /// Spec: docs/48 §2.4 (`ArmorConversationMismatch`), §9.1 I4.
     ArmorConversationMismatch,
+    /// `open_and_verify_service_ticket`: the service key set holds no key
+    /// version that keyd drew itself (`create_key` / `rotate_key`) — only
+    /// password-derived ones (`set_secret`), whose key may be known outside
+    /// keyd. A-46: the LDAP service key "is created in `create_key` and
+    /// never leaves keyd". Spec: docs/questions/Q-165 item 4 (A-46);
+    /// docs/questions/Q-180 item 4.
+    ServiceKeyNotRandom,
+    /// `open_and_verify_service_ticket`: the service ticket's transited
+    /// field is not the empty encoding of local authentication, and keyd
+    /// cannot check a transited path itself (no cross-realm in phase 1).
+    /// Spec: RFC 4120 3.3.3.2 ("both local and single-hop inter-realm
+    /// authentication result in a transited field that is empty"), 5.3
+    /// (transited-policy-checked: "if unable to do so, it must reject the
+    /// authentication").
+    TransitedNotLocal,
+    /// `open_and_verify_service_ticket`: the AP-REQ authenticator carries a
+    /// checksum of application data. Task L6a has no application data to
+    /// verify it over (the GSS checksum, RFC 4121, is task L6b), so it is
+    /// refused rather than ignored. Spec: RFC 4120 5.5.1 (cksum, key usage
+    /// 10); docs/49 §3.3, §12; docs/questions/Q-180 item 3.
+    ApChecksumUnsupported,
 }
 
 /// A key referenced by an operation, for audit (no key material).

@@ -18,20 +18,28 @@ use crate::model::KeyPurpose;
 
 /// The role a calling process holds.
 ///
-/// Phase 1 has exactly three roles. The other roles of docs/10 §2 (Netlogon,
+/// Phase 1 has exactly four roles. The other roles of docs/10 §2 (Netlogon,
 /// Time, Gkdi, Bkrp, Repl) are out of scope and have no variant.
 ///
-/// Spec: docs/10 §2 (`enum Role`).
+/// Spec: docs/10 §2 (`enum Role`); docs/questions/Q-165 item 3 (decided
+/// A-46: the new `Ldap` role).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Role {
     /// The KDC process: AS / TGS issuance. Spec: docs/10 §2.
     Kdc = 0,
-    /// The directory process (LDAP / SAMR / kpasswd front): set and verify
-    /// secrets. Spec: docs/10 §2.
+    /// The directory process (management plane / SAMR / kpasswd front): set
+    /// and verify secrets. Not the LDAP front, which holds [`Role::Ldap`]
+    /// (docs/questions/Q-165 item 3: "not `Directory`, which holds
+    /// `set_secret`"). Spec: docs/10 §2.
     Directory = 1,
     /// Tier-0 key administration. Spec: docs/10 §2, §7.
     Admin = 2,
+    /// The LDAP front: verifies the AP-REQ of a GSSAPI Bind inside keyd and
+    /// receives only non-secret facts — no key, no session key (D29 strict).
+    /// Spec: docs/49 §3.3 (R49-5); docs/questions/Q-165 items 1, 3 (decided
+    /// A-46).
+    Ldap = 3,
 }
 
 /// The identity of the calling process.
@@ -86,11 +94,14 @@ pub enum Operation {
     SealFastError = 11,
     /// Spec: docs/10 §7; docs/questions/Q-115 (A-35).
     DestroyKeySet = 12,
+    /// Spec: docs/10 §5ב; docs/49 §3.3; RFC 4120 3.2.3;
+    /// docs/questions/Q-165 (A-46).
+    OpenAndVerifyServiceTicket = 13,
 }
 
 impl Operation {
     /// Every operation, for exhaustive checks. Spec: docs/10 §2.
-    pub const ALL: [Operation; 13] = [
+    pub const ALL: [Operation; 14] = [
         Operation::VerifyPreauth,
         Operation::IssueAsRep,
         Operation::OpenAndVerifyTgt,
@@ -104,6 +115,7 @@ impl Operation {
         Operation::OpenFastArmor,
         Operation::SealFastError,
         Operation::DestroyKeySet,
+        Operation::OpenAndVerifyServiceTicket,
     ];
 }
 
@@ -113,8 +125,11 @@ impl Operation {
 /// Spec: docs/10 §2 (table rows Kdc, Directory, Admin — restricted to the
 /// phase-1 operations), §7; docs/09 א.6 (D31); docs/48 §2.3 ("`Kdc` also
 /// gets `open_fast_armor`, `seal_fast_error`. No other role");
-/// docs/questions/Q-115 (A-35: `destroy_key_set` is an Admin operation).
-pub const CAPABILITY_TABLE: [(Role, &[Operation]); 3] = [
+/// docs/questions/Q-115 (A-35: `destroy_key_set` is an Admin operation);
+/// docs/questions/Q-165 item 3 (A-46: `Ldap` holds only the service-ticket
+/// operations — in task L6a, `open_and_verify_service_ticket` alone;
+/// `seal_ap_rep` arrives with task L6b, docs/49 §12).
+pub const CAPABILITY_TABLE: [(Role, &[Operation]); 4] = [
     (
         Role::Kdc,
         &[
@@ -140,6 +155,7 @@ pub const CAPABILITY_TABLE: [(Role, &[Operation]); 3] = [
             Operation::DestroyKeySet,
         ],
     ),
+    (Role::Ldap, &[Operation::OpenAndVerifyServiceTicket]),
 ];
 
 /// `true` if [`CAPABILITY_TABLE`] lists `op` for `role`. Deny by default.
@@ -189,6 +205,9 @@ pub enum HandleSlot {
 ///   (docs/48 §2.3), so no slot of it is permitted.
 /// - `issue_tgs_rep`: Service only. Referral TGTs (Krbtgt in docs/10 §5) are
 ///   cross-realm, which phase 1 does not implement.
+/// - `open_and_verify_service_ticket`: Service only — "only handles of type
+///   `Service`" (docs/questions/Q-165 item 3, A-46); a TGT is never opened
+///   here (that is the KDC's `open_and_verify_tgt`).
 /// - `set_secret`, `verify_secret`, `rotate_key`: PrincipalLongterm or
 ///   Service. The krbtgt key is never password-derived and is rotated only
 ///   through `rotate_krbtgt` (dual control, docs/10 §7).
@@ -199,10 +218,11 @@ pub enum HandleSlot {
 ///
 /// Spec: docs/10 §2 ("(b) the KeyPurpose of the handle matches the
 /// operation"), §4, §5, §6, §7, §12 I3; docs/48 §2.3, §9.1 I3;
-/// docs/questions/Q-115 (A-35).
+/// docs/questions/Q-115 (A-35), Q-165 item 3 (A-46).
 pub const fn purpose_permitted(op: Operation, slot: HandleSlot, purpose: KeyPurpose) -> bool {
     use KeyPurpose::{Krbtgt, PrincipalLongterm, Service};
     match (op, slot) {
+        (Operation::OpenAndVerifyServiceTicket, HandleSlot::Primary) => matches!(purpose, Service),
         (Operation::VerifyPreauth, HandleSlot::Primary)
         | (Operation::IssueAsRep, HandleSlot::Primary) => {
             matches!(purpose, PrincipalLongterm)
@@ -289,6 +309,41 @@ const _: () = {
         HandleSlot::Krbtgt,
         KeyPurpose::Krbtgt
     ));
+    // Service-ticket verification (docs/questions/Q-165 item 3, A-46):
+    // `Ldap` may call open_and_verify_service_ticket and nothing else, no
+    // other role may call it, and it opens only Service-purpose handles.
+    let mut i = 0;
+    while i < Operation::ALL.len() {
+        let op = Operation::ALL[i];
+        let is_service_ticket = op as u8 == Operation::OpenAndVerifyServiceTicket as u8;
+        assert!(role_permits(Role::Ldap, op) == is_service_ticket);
+        if is_service_ticket {
+            assert!(!role_permits(Role::Kdc, op));
+            assert!(!role_permits(Role::Directory, op));
+            assert!(!role_permits(Role::Admin, op));
+        }
+        i += 1;
+    }
+    assert!(purpose_permitted(
+        Operation::OpenAndVerifyServiceTicket,
+        HandleSlot::Primary,
+        KeyPurpose::Service
+    ));
+    assert!(!purpose_permitted(
+        Operation::OpenAndVerifyServiceTicket,
+        HandleSlot::Primary,
+        KeyPurpose::Krbtgt
+    ));
+    assert!(!purpose_permitted(
+        Operation::OpenAndVerifyServiceTicket,
+        HandleSlot::Primary,
+        KeyPurpose::PrincipalLongterm
+    ));
+    assert!(!purpose_permitted(
+        Operation::OpenAndVerifyServiceTicket,
+        HandleSlot::Krbtgt,
+        KeyPurpose::Service
+    ));
 };
 
 #[cfg(test)]
@@ -300,7 +355,7 @@ mod tests {
     #[test]
     fn each_operation_has_exactly_one_role() {
         for op in Operation::ALL {
-            let roles = [Role::Kdc, Role::Directory, Role::Admin]
+            let roles = [Role::Kdc, Role::Directory, Role::Admin, Role::Ldap]
                 .iter()
                 .filter(|r| role_permits(**r, op))
                 .count();

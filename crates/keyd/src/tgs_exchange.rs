@@ -17,9 +17,11 @@
 //!
 //! The TGT-opening steps (local TGT, binding, decryption, validity findings,
 //! authenticator) and the end of the chain (findings, replay cache) are
-//! shared helpers — `OpenedTgt`, `open_local_tgt`, `complete_chain` — that
+//! shared helpers — `OpenedApReq`, `open_local_tgt`, `complete_chain` — that
 //! the FAST armor (`open_fast_armor`, docs/48 §3.2) reuses with its own
-//! authenticator key usage.
+//! authenticator key usage. The decryption, validity and authenticator steps
+//! alone (`open_ap_req`) also open a service AP-REQ under a service key
+//! (`open_and_verify_service_ticket`, crate::service_ticket; docs/49 §3.3).
 //!
 //! **TGS under FAST** (docs/48 §5, task T3): implicit armor only. With a
 //! [`TgsFastRequest`], `open_and_verify_tgt` derives the armor key from the
@@ -236,13 +238,14 @@ pub(crate) struct TimeFindings {
     ticket_time: Option<Deny>,
 }
 
-/// What opening a TGT of this realm and its authenticator yields — shared by
-/// `open_and_verify_tgt` (PA-TGS-REQ) and `open_fast_armor` (the armor
-/// AP-REQ). The session key and the decrypted structures never leave keyd;
-/// the ticket session key and an authenticator subkey are zeroized when
-/// dropped (krb-crypto `ProtocolKey`, krb-proto `KeyValue`).
-/// Spec: RFC 4120 3.2.3; docs/48 §3.2.
-pub(crate) struct OpenedTgt {
+/// What opening an AP-REQ — its ticket and its authenticator — yields;
+/// shared by `open_and_verify_tgt` (PA-TGS-REQ), `open_fast_armor` (the
+/// armor AP-REQ) and `open_and_verify_service_ticket` (a service AP-REQ).
+/// The session key and the decrypted structures never leave keyd; the
+/// ticket session key and an authenticator subkey are zeroized when dropped
+/// (krb-crypto `ProtocolKey`, krb-proto `KeyValue`).
+/// Spec: RFC 4120 3.2.3; docs/48 §3.2; docs/49 §3.3.
+pub(crate) struct OpenedApReq {
     /// The decrypted EncTicketPart.
     pub(crate) ticket_part: EncTicketPart,
     /// The ticket session key.
@@ -297,10 +300,11 @@ pub(crate) fn replay_key_for(
     }
 }
 
-/// Decrypt the TGT enc-part under the krbtgt key set: the version named by
-/// the ticket's kvno, or — with no kvno — current then previous.
+/// Decrypt a ticket enc-part under the server's key versions: the version
+/// named by the ticket's kvno, or — with no kvno — current then previous.
 /// Spec: RFC 4120 3.2.3 ("decrypted using the version of the server's key
-/// specified by the ticket"); docs/10 §1 ("decrypt may try a set of kvnos").
+/// specified by the ticket"); docs/10 §1 ("decrypt may try a set of kvnos");
+/// [MS-KILE] 3.4.5 (retry with older versions of the server key).
 fn open_ticket<'a>(
     versions: [Option<&'a KvnoKeys>; 2],
     enc_part: &EncryptedData,
@@ -509,7 +513,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
 
         // 4-7. The TGT and the authenticator, usage 7 (shared with
         // open_fast_armor).
-        let OpenedTgt {
+        let OpenedApReq {
             ticket_part,
             session,
             authenticator,
@@ -643,6 +647,8 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     ///
     /// Every failure here is the uniform `Denied`; the findings are reported
     /// by [`Self::complete_chain`] once the caller's chain completed (A-26).
+    /// Steps 5-7 are [`Self::open_ap_req`], shared with
+    /// `open_and_verify_service_ticket`.
     ///
     /// Spec: RFC 4120 3.2.3, 3.3.2, 5.5.1, 7.3, 7.5.1; RFC 6113 5.4.1.1;
     /// docs/48 §3.2; A-26 (docs/questions/Q-071).
@@ -653,8 +659,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         authenticator_usage: u32,
         now_s: i64,
         fields: &mut AuditFields,
-    ) -> Internal<OpenedTgt> {
-        let skew = self.config.clock_skew_secs;
+    ) -> Internal<OpenedApReq> {
         let realm = &self.config.realm;
 
         // 4. A TGT of this realm.
@@ -662,13 +667,6 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         if tgt.realm != *realm || tgt.sname != tgs_name(realm) {
             return Err(Deny::denied(AuditReason::NotLocalTgt));
         }
-        let ticket_enctype = configured_enctype(
-            tgt.enc_part.etype,
-            &self.config.enctypes,
-            Deny::denied(AuditReason::UnsupportedEncType),
-        )?;
-
-        // 5. Decrypt under krbtgt.
         let set = self
             .store
             .get(krbtgt)
@@ -676,11 +674,55 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         // Name binding (Q-040, A-19): the krbtgt key must be bound to this
         // realm's TGS name (RFC 4120 7.3).
         check_binding(set.binding(), realm, &tgs_name(realm))?;
-        let (ticket_plain, version) = open_ticket(
+
+        // 5-7. Decrypt under krbtgt, then the ticket and the authenticator.
+        self.open_ap_req(
             [Some(set.current()), set.previous()],
-            &tgt.enc_part,
-            ticket_enctype,
+            ap_req,
+            authenticator_usage,
+            now_s,
+            fields,
+        )
+    }
+
+    /// Steps 5-7 of opening an AP-REQ under the server key `versions` (the
+    /// caller has already checked whose ticket it is and resolved the key
+    /// set — `open_local_tgt`: a TGT under krbtgt; `open_and_verify_service_
+    /// ticket`: a service ticket under the service key bound to its sname):
+    /// 5. the ticket enctype is configured; decrypt the ticket enc-part with
+    ///    usage 2 under the version its kvno names (no kvno: current, then
+    ///    previous); decode EncTicketPart; the kvno goes to audit;
+    /// 6. client realm is this realm; no INVALID flag; no authorization-data
+    ///    or addresses; the ticket times are RECORDED, not yet reported;
+    /// 7. decrypt the authenticator with the ticket session key under
+    ///    `authenticator_usage`; decode it; crealm / cname match the ticket;
+    ///    no authorization-data; the ctime skew is RECORDED.
+    ///
+    /// Every failure here is the uniform `Denied`; the findings are reported
+    /// by [`Self::complete_chain`] once the caller's chain completed (A-26).
+    ///
+    /// Spec: RFC 4120 2.2 ("Application servers MUST reject tickets that have
+    /// this flag set"), 3.2.3, 5.3, 5.5.1, 7.5.1; A-26
+    /// (docs/questions/Q-071).
+    pub(crate) fn open_ap_req(
+        &self,
+        versions: [Option<&KvnoKeys>; 2],
+        ap_req: &ApReq,
+        authenticator_usage: u32,
+        now_s: i64,
+        fields: &mut AuditFields,
+    ) -> Internal<OpenedApReq> {
+        let skew = self.config.clock_skew_secs;
+        let realm = &self.config.realm;
+        let ticket = &ap_req.ticket;
+
+        // 5. Decrypt under the server key.
+        let ticket_enctype = configured_enctype(
+            ticket.enc_part.etype,
+            &self.config.enctypes,
+            Deny::denied(AuditReason::UnsupportedEncType),
         )?;
+        let (ticket_plain, version) = open_ticket(versions, &ticket.enc_part, ticket_enctype)?;
         fields.kvno = Some(version.kvno());
         let ticket_part = EncTicketPart::decode(&ticket_plain)
             .map_err(|_| Deny::denied(AuditReason::MalformedInput))?;
@@ -744,7 +786,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         if authenticator.authorization_data.is_some() {
             return Err(Deny::denied(AuditReason::UnsupportedContent));
         }
-        Ok(OpenedTgt {
+        Ok(OpenedApReq {
             ticket_part,
             session,
             authenticator,
@@ -756,8 +798,11 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         })
     }
 
-    /// The end of an AP-REQ chain, shared by `open_and_verify_tgt` and
-    /// `open_fast_armor`. Call ONLY once every cryptographic check of the
+    /// The end of an AP-REQ chain, shared by `open_and_verify_tgt`,
+    /// `open_fast_armor` and `open_and_verify_service_ticket` (one replay
+    /// cache for every server name keyd verifies for — RFC 4120 3.2.3 "they
+    /// MUST share this replay cache"). Call ONLY once every cryptographic
+    /// check of the
     /// caller's chain has passed: the recorded findings are reported as
     /// non-secret classes in RFC 4120 3.2.3 order (skew, then the ticket's
     /// age) — before the replay cache, so a refused request never enters it —

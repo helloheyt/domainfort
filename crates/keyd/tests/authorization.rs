@@ -18,7 +18,7 @@ use krb_proto::{
 };
 use zeroize::Zeroizing;
 
-const ROLES: [Role; 3] = [Role::Kdc, Role::Directory, Role::Admin];
+const ROLES: [Role; 4] = [Role::Kdc, Role::Directory, Role::Admin, Role::Ldap];
 
 fn caller(role: Role) -> CallerId {
     CallerId { uid: 900, role }
@@ -162,6 +162,10 @@ fn invoke(f: &mut Fixture, op: Operation, caller: &CallerId, handle: &KeyHandle)
                 &n,
             )
             .is_ok(),
+        Operation::OpenAndVerifyServiceTicket => f
+            .keyd
+            .open_and_verify_service_ticket(caller, handle, &dummy_ap_req().encode().unwrap(), &n)
+            .is_ok(),
     }
 }
 
@@ -172,7 +176,7 @@ fn valid_handle(op: Operation) -> KeyHandle {
         Operation::OpenAndVerifyTgt | Operation::RotateKrbtgt => KRBTGT,
         Operation::OpenFastArmor | Operation::SealFastError => KRBTGT,
         Operation::IssueTgsRep | Operation::RotateKey | Operation::RetireKvno => SERVICE,
-        Operation::DestroyKeySet => SERVICE,
+        Operation::DestroyKeySet | Operation::OpenAndVerifyServiceTicket => SERVICE,
         Operation::SetSecret | Operation::VerifySecret => ALICE,
         Operation::CreateKey => {
             KeyHandle::new(PrincipalId::from_bytes([0x99; 16]), KeyPurpose::Service)
@@ -290,15 +294,16 @@ fn issue_as_rep_krbtgt_slot_purpose() {
 
 /// The compile-time capability table is exactly the phase-1 subset of
 /// docs/10 §2: Kdc -> AS/TGS operations (and the FAST armor operations of
-/// docs/48 §2.3); Directory -> set/verify secret; Admin -> key lifecycle. No
-/// role holds a read-key operation (none exists).
+/// docs/48 §2.3); Directory -> set/verify secret; Admin -> key lifecycle;
+/// Ldap -> service-ticket verification only. No role holds a read-key
+/// operation (none exists).
 /// Source: docs/10 §2, §7 ("no read operation for a key — in any role");
 /// docs/48 §2.3, §9.1 I2; docs/questions/Q-115 (A-35: destroy_key_set is
-/// an Admin operation).
+/// an Admin operation); docs/questions/Q-165 item 3 (A-46: Role::Ldap).
 #[test]
 fn capability_table_matches_design() {
     use Operation::*;
-    let expected: [(Role, &[Operation]); 3] = [
+    let expected: [(Role, &[Operation]); 4] = [
         (
             Role::Kdc,
             &[
@@ -321,6 +326,7 @@ fn capability_table_matches_design() {
                 DestroyKeySet,
             ],
         ),
+        (Role::Ldap, &[OpenAndVerifyServiceTicket]),
     ];
     assert_eq!(CAPABILITY_TABLE.len(), expected.len());
     for ((role, ops), (exp_role, exp_ops)) in CAPABILITY_TABLE.iter().zip(expected.iter()) {

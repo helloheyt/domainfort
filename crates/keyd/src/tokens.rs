@@ -1,6 +1,7 @@
 //! One-time tokens that bind issuance to a completed authentication: the
-//! AuthnProof exchange id (AS), the TGS context id, and the FAST armor id of
-//! an opened AS armor (docs/48 §2.3).
+//! AuthnProof exchange id (AS), the TGS context id, the FAST armor id of
+//! an opened AS armor (docs/48 §2.3), and the service-context id of a
+//! verified service ticket (docs/49 §3.3, A-46).
 //!
 //! Each token is 128 random bits from the entropy source, bound to the
 //! calling process and to the principal, short-lived, and consumed on first
@@ -16,7 +17,7 @@
 //!
 //! Spec: docs/10 §8 (state machines; tokens short-lived, single-use,
 //! caller-bound), D36; docs/25 §2 principle 3 (per-session access); docs/48
-//! §2.3 (armor id), §9.1 I4.
+//! §2.3 (armor id), §9.1 I4; docs/49 §3.3 (service ctx id).
 
 use crate::authz::CallerId;
 use core::fmt;
@@ -43,6 +44,16 @@ pub struct CtxId([u8; TOKEN_ID_LENGTH]);
 /// Spec: docs/48 §2.3 (`armor_id: ArmorId`), §9.1 I4.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ArmorId([u8; TOKEN_ID_LENGTH]);
+
+/// The service-context token returned by `open_and_verify_service_ticket`:
+/// it names the session key (and authenticator subkey) of one verified
+/// AP-REQ, which keyd holds for the later GSS steps (task L6b: `seal_ap_rep`;
+/// phase 2: wrap / unwrap). Not secret by itself (useless to any other
+/// caller); the keys it names never leave keyd.
+/// Spec: docs/49 §3.3 (`ServiceContext { ctx_id, … }`); docs/questions/Q-165
+/// item 2 (decided A-46).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ServiceCtxId([u8; TOKEN_ID_LENGTH]);
 
 macro_rules! token_id {
     ($ty:ident) => {
@@ -75,6 +86,7 @@ macro_rules! token_id {
 token_id!(ExchangeId);
 token_id!(CtxId);
 token_id!(ArmorId);
+token_id!(ServiceCtxId);
 
 /// Why a token could not be redeemed (audit detail only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

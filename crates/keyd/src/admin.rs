@@ -207,7 +207,10 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     ///
     /// A live AuthnProof issued for a destroyed PrincipalLongterm key set is
     /// discarded with it: it attests a key that no longer exists, and must
-    /// not redeem against a key set later recreated on the same handle.
+    /// not redeem against a key set later recreated on the same handle. A
+    /// live service context opened under a destroyed Service key set
+    /// (`open_and_verify_service_ticket`) is discarded likewise, its session
+    /// key zeroized.
     ///
     /// The audit record carries the destroyed current kvno (not secret).
     ///
@@ -244,10 +247,21 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             .current_kvno();
         fields.kvno = Some(current);
         self.store.destroy(handle).map_err(store_deny)?;
-        if handle.purpose == KeyPurpose::PrincipalLongterm {
-            let principal = handle.principal;
-            self.proofs
-                .discard_where(|entry| entry.principal() == principal);
+        match handle.purpose {
+            KeyPurpose::PrincipalLongterm => {
+                let principal = handle.principal;
+                self.proofs
+                    .discard_where(|entry| entry.principal() == principal);
+            }
+            // A live service context opened under a destroyed Service key set
+            // goes with it (its session key zeroized): the key set it was
+            // verified under no longer exists (docs/49 §3.3, A-46).
+            KeyPurpose::Service => {
+                let service = *handle;
+                self.service_contexts
+                    .discard_where(|entry| entry.service() == service);
+            }
+            KeyPurpose::Krbtgt => {}
         }
         Ok(())
     }

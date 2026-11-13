@@ -22,7 +22,8 @@ use crate::audit::{AuditOutcome, AuditReason};
 use core::fmt;
 
 /// Error of an authentication step (`verify_preauth`,
-/// `open_and_verify_tgt`, `open_fast_armor`).
+/// `open_and_verify_tgt`, `open_fast_armor`,
+/// `open_and_verify_service_ticket`).
 ///
 /// `Denied` is returned for every failure decided before the step's
 /// cryptographic chain completed. The other variants are returned only after
@@ -35,11 +36,13 @@ use core::fmt;
 /// subkey present, the armor key derived, the req-checksum verified and the
 /// enc-fast-req decrypted and decoded (docs/48 §6.3); for `verify_preauth`
 /// (only `Skew`): the PA-ENC-TIMESTAMP decrypted with the client key and
-/// decoded. A `verify_preauth` refused by its failure throttle is `Denied`
-/// (decided before the chain; A-34).
+/// decoded; for `open_and_verify_service_ticket`: the service ticket
+/// decrypted under the service key and the authenticator under the ticket
+/// session key (docs/49 §3.3; A-46). A `verify_preauth` refused by its
+/// failure throttle is `Denied` (decided before the chain; A-34).
 ///
 /// Spec: docs/10 §9 as amended by A-26 (docs/questions/Q-071); RFC 4120
-/// 3.2.3, 3.3.2; docs/48 §6.3.
+/// 3.2.3, 3.3.2; docs/48 §6.3; docs/questions/Q-165 item 5 (A-46).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthnError {
     /// Uniform refusal. Spec: docs/10 §9.

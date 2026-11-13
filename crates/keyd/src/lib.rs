@@ -15,6 +15,16 @@
 //! | `Kdc`       | [`Keyd::verify_preauth`], [`Keyd::issue_as_rep`], [`Keyd::open_and_verify_tgt`], [`Keyd::issue_tgs_rep`], [`Keyd::open_fast_armor`], [`Keyd::seal_fast_error`] |
 //! | `Directory` | [`Keyd::set_secret`], [`Keyd::verify_secret`] |
 //! | `Admin`     | [`Keyd::create_key`], [`Keyd::rotate_key`], [`Keyd::rotate_krbtgt`], [`Keyd::retire_kvno`], [`Keyd::destroy_key_set`] |
+//! | `Ldap`      | [`Keyd::open_and_verify_service_ticket`] |
+//!
+//! **Service-ticket verification** (docs/49 §3.3, task L6a; decision A-46,
+//! docs/questions/Q-165): [`Keyd::open_and_verify_service_ticket`] runs RFC
+//! 4120 §3.2.3 on a service AP-REQ inside keyd under the LDAP service key —
+//! a Service key set that keyd drew itself (`create_key`) and that never
+//! leaves — and returns only non-secret facts ([`ServiceContext`]) and a
+//! one-time [`ServiceCtxId`]; the session key and subkey stay in keyd. The
+//! GSS framing, the authenticator checksum, channel binding and the AP-REP
+//! are task L6b (docs/49 §12).
 //!
 //! Key lifecycle (decision A-35, docs/questions/Q-115): keyd chooses every
 //! kvno itself — `set_secret` returns the kvno it installed — and a deleted
@@ -56,7 +66,8 @@
 //!   [`authz::CAPABILITY_TABLE`], first step of every operation.
 //! - **I3** purpose check: [`authz::purpose_permitted`] for every handle.
 //! - **I4** issuance needs a valid, one-time, caller-bound token
-//!   ([`AuthnProof`] / [`TgtContext`] ctx id), bounded tables; an armored
+//!   ([`AuthnProof`] / [`TgtContext`] ctx id), bounded tables (the service
+//!   contexts of verified service tickets are one too); an armored
 //!   error needs the one-time token of its conversation ([`ArmorId`], or the
 //!   ctx id of an armored TGS context); an armor allows one
 //!   pre-authentication attempt, its proof issues only with it (and an
@@ -72,7 +83,9 @@
 //!   (`open_and_verify_tgt`), or the PA-ENC-TIMESTAMP — or, armored, the
 //!   encrypted challenge — decrypted and decoded (`verify_preauth`), or the
 //!   armor TGT, authenticator, subkey, armor key,
-//!   req-checksum and enc-fast-req all passed (`open_fast_armor`), may an
+//!   req-checksum and enc-fast-req all passed (`open_fast_armor`), or the
+//!   service ticket and its authenticator decrypted
+//!   (`open_and_verify_service_ticket`), may an
 //!   [`AuthnError`] other than `Denied` be returned — `TicketExpired`,
 //!   `TicketNotYetValid`, `Skew`, `Replay`. A `verify_preauth` refused by its
 //!   failure throttle (A-34) is the uniform `Denied`.
@@ -137,20 +150,29 @@
 //!   PA-TGS-REQ authenticator checksum still covers the OUTER body, which is
 //!   still checked (realm, no enc-authorization-data); an armored context
 //!   survives a refused `issue_tgs_rep` so that the error can be armored.
+//! - Service-ticket verification interpretations awaiting review
+//!   (docs/questions/Q-180): the A-19 binding is checked before decryption;
+//!   INVALID is the uniform `Denied`; an authenticator checksum is refused
+//!   until task L6b; only keyd-drawn (never password-derived) service key
+//!   versions open a ticket; Role::Ldap may name any Service key set (keyd
+//!   has no notion of "the LDAP key set" — the binding check is what ties a
+//!   ticket to its key). In task L6a nothing consumes a service context: it
+//!   expires with the token lifetime.
 //!
 //! # Provenance
 //!
 //! Written only from the allowed sources, opened in-session (AGENTS.md
 //! §1-3): RFC 4120 (§1.6, §2, §3.1-3.3, §4, §5.2.7-5.2.9, §5.3, §5.4.1,
-//! §5.4.2, §5.5.1, §5.9.1, §6.1, §6.2, §7.3, §7.5.1, §7.5.9, §8.2, §10),
+//! §5.4.2, §5.5.1, §5.5.2, §5.9.1, §6.1, §6.2, §7.3, §7.5.1, §7.5.3-7.5.5,
+//! §7.5.9, §8.2, §10),
 //! RFC 3961 §3, RFC 3962 §3-4, RFC 6113 (§2.1, §2.4, §5.1, §5.2,
 //! §5.4-§5.4.6, §6.2, §8),
 //! [MS-KILE] v20260928 (§1.3.3, §3.1.1.1, §3.1.5.1, §3.1.5.9, §3.2.5.4,
 //! §3.2.5.7, §3.3.5.1, §3.3.5.7.4 — checked against Q-120..Q-124), and this
 //! project's design documents docs/09, docs/10, docs/25 §3, docs/30,
-//! docs/33 §6.1, docs/45, docs/47 §9, docs/48, docs/questions/Q-040, Q-115
-//! (A-35), Q-120..Q-127, Q-145, Q-150. No other implementation was consulted
-//! or recalled.
+//! docs/33 §6.1, docs/45, docs/47 §9, docs/48, docs/49 §3.3, §12,
+//! docs/questions/Q-040, Q-115 (A-35), Q-120..Q-127, Q-145, Q-150, Q-165
+//! (A-46), Q-180. No other implementation was consulted or recalled.
 //!
 //! Spec: docs/10; docs/09 א; RFC 4120 §3, §5.
 
@@ -167,6 +189,7 @@ mod fast_armor;
 mod keyd;
 pub mod model;
 mod replay;
+mod service_ticket;
 pub mod store;
 mod template;
 mod tgs_exchange;
@@ -184,8 +207,9 @@ pub use error::{AuthnError, ConfigError, Error, IssueError};
 pub use fast_armor::{FastArmor, FastConversation, MAX_FX_COOKIE_LENGTH};
 pub use keyd::Keyd;
 pub use model::{DualControlToken, KeyHandle, KeyPurpose, Kvno, PrincipalBinding, PrincipalId};
+pub use service_ticket::ServiceContext;
 pub use store::{InMemoryKeyStore, KeyStore, StoreError, StoredKeySet};
 pub use tgs_exchange::{TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext};
 pub use throttle::{FailureWindowThrottle, SecretThrottle};
 pub use time::kerberos_time_seconds;
-pub use tokens::{ArmorId, CtxId, ExchangeId, TOKEN_ID_LENGTH};
+pub use tokens::{ArmorId, CtxId, ExchangeId, ServiceCtxId, TOKEN_ID_LENGTH};

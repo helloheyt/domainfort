@@ -67,7 +67,7 @@ use crate::keyd::{authorize, draw, key_usage, new_random_key, open, seal, AuditF
 use crate::model::KeyHandle;
 use crate::store::KeyStore;
 use crate::template::tgs_name;
-use crate::tgs_exchange::{check_ap_options, replay_key_for, subkey_protocol_key, OpenedTgt};
+use crate::tgs_exchange::{check_ap_options, replay_key_for, subkey_protocol_key, OpenedApReq};
 use crate::time::kerberos_time_seconds;
 use crate::tokens::{ArmorId, CtxId, TOKEN_ID_LENGTH};
 use crate::usage::{
@@ -688,7 +688,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             .map_err(|_| Deny::denied(AuditReason::MalformedInput))?;
 
         // 4. The armor TGT and its authenticator, usage 11 (shared steps).
-        let OpenedTgt {
+        let OpenedApReq {
             ticket_part,
             session,
             authenticator,
