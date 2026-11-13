@@ -33,8 +33,22 @@
 //! that holds a value with that comparison key. Anything else is
 //! [`Error::Inconsistent`] — a replayed or stale record (docs/32 §3; Q-060).
 //!
+//! # Children listings
+//!
+//! [`Snapshot::children`] scans the name index from the
+//! [`record::name_index_prefix`] of one parent (or of the roots), using the
+//! same redb range scan as the reverse-link prefix scan, and stops at the
+//! first key outside the prefix or after [`crate::MAX_CHILDREN_PER_PAGE`]
+//! entries. Each entry is authenticated and cross-checked exactly as a name
+//! lookup does, before it is returned. A cursor resumes strictly after the
+//! last key returned; the final page of a listing of a parent checks the
+//! number of children listed against the parent's live-child count. No new
+//! table: the listing reads only the name-index, object and child-count
+//! tables. Spec: docs/49 §6.1 item 3 (R49-9), §12 (L3); docs/32 §2, §3, §6,
+//! §8.
+//!
 //! Spec: docs/32 §2 (D134), §3 (D135), §6 (D39), §7 (D136); docs/29 §5
-//! (D121); docs/46 §8.3-§8.5.
+//! (D121); docs/46 §8.3-§8.5; docs/49 §6.1.
 
 use crate::comparison;
 use crate::error::{Error, RecordKind, Result, Violation};
@@ -42,12 +56,12 @@ use crate::integrity::{self, IntegrityKey};
 use crate::record;
 use crate::schema::{AttributeDefinition, Link, Schema};
 use crate::types::{
-    AttrId, Attribute, AttributeChange, ClassId, NewObject, Object, Origin, StampedValue,
-    Timestamp, Tombstone,
+    AttrId, Attribute, AttributeChange, ChildCursor, ChildPage, ClassId, NewObject, Object, Origin,
+    StampedValue, Timestamp, Tombstone,
 };
 use crate::{
-    MAX_ATTRIBUTES_PER_OBJECT, MAX_CLASSES_PER_OBJECT, MAX_RDN_KEY_LEN, MAX_RECORD_BODY_LEN,
-    MAX_VALUES_PER_ATTRIBUTE, MAX_VALUE_LEN,
+    MAX_ATTRIBUTES_PER_OBJECT, MAX_CHILDREN_PER_PAGE, MAX_CLASSES_PER_OBJECT, MAX_RDN_KEY_LEN,
+    MAX_RECORD_BODY_LEN, MAX_VALUES_PER_ATTRIBUTE, MAX_VALUE_LEN,
 };
 use core::num::NonZeroU64;
 use dtyp::{Guid, GUID_PACKET_LEN};
@@ -232,6 +246,75 @@ impl Snapshot<'_> {
         lookup_child(&names, &objects, &self.store.key, parent, rdn_value)
     }
 
+    /// One page of the live children of `parent` — or of the naming-context
+    /// roots, for `None` — in name-index key order (ascending RDN key). This
+    /// is the candidate source of LDAP one-level and subtree searches
+    /// (docs/49 §6.1 item 3, R49-9).
+    ///
+    /// **Bounded.** `limit` 0 is refused ([`Violation::PageLimitZero`]); a
+    /// `limit` above [`crate::MAX_CHILDREN_PER_PAGE`] is capped to it. One
+    /// call reads at most `limit` name-index entries and the object records
+    /// they name, plus the key of one more entry (only to know whether more
+    /// follow; that entry is authenticated when its page is read). When more
+    /// children follow, [`ChildPage::next`] is a cursor: pass it as `after`
+    /// to read the next page, which resumes strictly after the last child
+    /// returned. A cursor made for another parent is refused
+    /// ([`Violation::CursorParentMismatch`]).
+    ///
+    /// **Authenticated and cross-checked**, exactly as [`Snapshot::lookup_child`]:
+    /// each entry's tag is verified first ([`Error::Tamper`] of
+    /// [`RecordKind::NameIndex`]); then the object it names is authenticated
+    /// ([`Error::Tamper`] of [`RecordKind::Object`]) and must be live with
+    /// the same parent and RDN key ([`Error::Inconsistent`] of
+    /// [`RecordKind::NameIndex`] — a replayed or stale entry). Any failure
+    /// fails the whole call: nothing partial is returned.
+    ///
+    /// **Complete.** On the final page of a listing of a parent (`next` is
+    /// `None`), the number of children returned by all its pages must equal
+    /// the parent's live-child count record, else [`Error::Inconsistent`] of
+    /// [`RecordKind::ChildCount`]: a name entry removed beneath the engine
+    /// cannot silently hide a child from a listing (A-30 residual).
+    ///
+    /// A cursor continues a listing in the view that made it: the same
+    /// snapshot, or the same write transaction with no write under `parent`
+    /// in between. Carried to another view, the listing may skip or repeat
+    /// children written since, and its final count check may fail
+    /// ([`Error::Inconsistent`]) — fail closed.
+    ///
+    /// Not here: the search visit budget and the pruning of subtrees the
+    /// requester may not see (the caller's, docs/49 §6.1 item 3), and schema
+    /// re-validation of each child (done by [`Snapshot::get_object`] when the
+    /// caller reads it). A parent that is absent or a tombstone has no live
+    /// children: its listing is empty.
+    ///
+    /// Residuals: the NC roots have no count record, so a removed root entry
+    /// is not detected by a roots listing; a removed entry together with a
+    /// replayed older count record of the same parent is not detected
+    /// (P-7 / Q-060). Q-175.
+    ///
+    /// Spec: docs/49 §6.1 item 3 (R49-9), §12 (L3); docs/32 §2 (name index),
+    /// §3 (D135; edits beneath the engine are not ground truth), §6 (D39),
+    /// §8 (bounds); A-30; P-7.
+    pub fn children(
+        &self,
+        parent: Option<Guid>,
+        after: Option<&ChildCursor>,
+        limit: usize,
+    ) -> Result<ChildPage> {
+        let names = self.txn.open_table(NAME_INDEX_TABLE)?;
+        let objects = self.txn.open_table(OBJECT_TABLE)?;
+        let counts = self.txn.open_table(CHILD_COUNT_TABLE)?;
+        list_children(
+            &names,
+            &objects,
+            &counts,
+            &self.store.key,
+            parent,
+            after,
+            limit,
+        )
+    }
+
     /// The sources of the back link `back_attr` on the live object `target`:
     /// every live object that holds `target` in the corresponding forward
     /// link (e.g. the groups an object is a member of), ascending by GUID
@@ -402,6 +485,33 @@ impl WriteTxn<'_> {
         lookup_child(&names, &objects, &self.store.key, parent, rdn_value)
     }
 
+    /// [`Snapshot::children`], seeing this transaction's own writes. A cursor
+    /// continues a listing only while this transaction writes nothing under
+    /// `parent`: a child created or deleted before the cursor in between
+    /// makes the final count check fail ([`Error::Inconsistent`]) — restart
+    /// the listing after such a write. Spec: docs/49 §6.1 item 3, §12 (L3);
+    /// docs/32 §2, §3, §8.
+    pub fn children(
+        &self,
+        parent: Option<Guid>,
+        after: Option<&ChildCursor>,
+        limit: usize,
+    ) -> Result<ChildPage> {
+        let txn = self.txn()?;
+        let names = txn.open_table(NAME_INDEX_TABLE)?;
+        let objects = txn.open_table(OBJECT_TABLE)?;
+        let counts = txn.open_table(CHILD_COUNT_TABLE)?;
+        list_children(
+            &names,
+            &objects,
+            &counts,
+            &self.store.key,
+            parent,
+            after,
+            limit,
+        )
+    }
+
     /// [`Snapshot::back_links`], seeing this transaction's own writes.
     pub fn back_links(&self, target: Guid, back_attr: AttrId) -> Result<Vec<Guid>> {
         let txn = self.txn()?;
@@ -485,6 +595,14 @@ fn load_live<T: ReadableTable<Raw, Raw>>(
     Ok(load_object(objects, key, guid)?.filter(|o| !o.is_tombstone()))
 }
 
+/// Authenticate the stored value of the name-index entry under `name_key`
+/// (tag first), then decode it: the GUID it names. Spec: docs/32 §2, §3, §8.
+fn open_name(key: &IntegrityKey, name_key: &[u8], stored: &[u8]) -> Result<Guid> {
+    let body = integrity::open(key, RecordKind::NameIndex, name_key, stored)?;
+    record::decode_name_index_body(body)
+        .map_err(|e| Error::RecordMalformed(RecordKind::NameIndex, e))
+}
+
 /// Load a name-index entry: the GUID it names. Spec: docs/32 §2, §3.
 fn load_name<T: ReadableTable<Raw, Raw>>(
     names: &T,
@@ -494,10 +612,7 @@ fn load_name<T: ReadableTable<Raw, Raw>>(
     let Some(stored) = raw_get(names, name_key)? else {
         return Ok(None);
     };
-    let body = integrity::open(key, RecordKind::NameIndex, name_key, &stored)?;
-    record::decode_name_index_body(body)
-        .map(Some)
-        .map_err(|e| Error::RecordMalformed(RecordKind::NameIndex, e))
+    open_name(key, name_key, &stored).map(Some)
 }
 
 /// Load a parent's live-child count (0 when no record).
@@ -603,12 +718,130 @@ fn resolve_name<N: ReadableTable<Raw, Raw>, O: ReadableTable<Raw, Raw>>(
     let Some(child) = load_name(names, key, &name_key)? else {
         return Ok(None);
     };
+    check_name_entry(objects, key, parent, rdn, child)?;
+    Ok(Some(child))
+}
+
+/// Cross-check an authenticated name-index entry `(parent, rdn) -> child`
+/// against the object it names: the object's own (tagged) record must be
+/// live and carry the same parent and RDN key; anything else is
+/// [`Error::Inconsistent`] — e.g. a replayed entry of a deleted object.
+/// Shared by name lookups and children listings, so both believe an entry
+/// under exactly the same rule. Spec: docs/32 §2, §3; docs/49 §6.1 item 3.
+fn check_name_entry<O: ReadableTable<Raw, Raw>>(
+    objects: &O,
+    key: &IntegrityKey,
+    parent: Option<Guid>,
+    rdn: &[u8],
+    child: Guid,
+) -> Result<()> {
     match load_object(objects, key, child)? {
-        Some(obj) if !obj.is_tombstone() && obj.parent == parent && obj.rdn == rdn => {
-            Ok(Some(child))
-        }
+        Some(obj) if !obj.is_tombstone() && obj.parent == parent && obj.rdn == rdn => Ok(()),
         _ => Err(Error::Inconsistent(RecordKind::NameIndex)),
     }
+}
+
+/// [`Snapshot::children`]: one bounded page of the name index under
+/// `parent`, every entry authenticated and cross-checked before it is
+/// returned, and the final page checked against the parent's live-child
+/// count. Spec: docs/49 §6.1 item 3 (R49-9); docs/32 §2, §3, §6, §8; A-30.
+fn list_children<N, O, C>(
+    names: &N,
+    objects: &O,
+    counts: &C,
+    key: &IntegrityKey,
+    parent: Option<Guid>,
+    after: Option<&ChildCursor>,
+    limit: usize,
+) -> Result<ChildPage>
+where
+    N: ReadableTable<Raw, Raw>,
+    O: ReadableTable<Raw, Raw>,
+    C: ReadableTable<Raw, Raw>,
+{
+    // The arguments are checked before any storage work. Spec: docs/32 §8.
+    if limit == 0 {
+        return Err(Error::Rejected(Violation::PageLimitZero));
+    }
+    let limit = limit.min(MAX_CHILDREN_PER_PAGE);
+    let prefix = record::name_index_prefix(parent);
+    let (start, listed_before) = match after {
+        None => (prefix.clone(), 0u64),
+        Some(cursor) => {
+            if cursor.parent != parent {
+                return Err(Error::Rejected(Violation::CursorParentMismatch));
+            }
+            // Always true of a cursor this module made; checked so the key
+            // built from it stays bounded on its own. Spec: docs/32 §8.
+            check_rdn(&cursor.after).map_err(Error::Rejected)?;
+            // Keys compare as byte strings (the order the prefix scans rely
+            // on), so the smallest key above `prefix || after` is that key
+            // followed by one 0x00 byte: the scan resumes strictly after the
+            // last child returned. Spec: docs/49 §6.1 item 3 (`after`).
+            let mut start = record::name_index_key(parent, &cursor.after);
+            start.push(0x00);
+            (start, cursor.listed)
+        }
+    };
+
+    let mut children = Vec::new();
+    // RDN key of the last child, set only when the page is full.
+    let mut full_at: Option<Vec<u8>> = None;
+    let mut entries = names.range::<&[u8]>(start.as_slice()..)?;
+    for entry in entries.by_ref() {
+        let (k, v) = entry?;
+        let name_key = k.value();
+        let Some(rdn) = name_key.strip_prefix(prefix.as_slice()) else {
+            break;
+        };
+        // Tag first, then the cross-check against the object named, exactly
+        // as a lookup. Spec: docs/32 §3; D135.
+        let child = open_name(key, name_key, v.value())?;
+        check_name_entry(objects, key, parent, rdn, child)?;
+        children.push(child);
+        if children.len() >= limit {
+            full_at = Some(rdn.to_vec());
+            break;
+        }
+    }
+
+    let listed = u64::try_from(children.len())
+        .ok()
+        .and_then(|n| listed_before.checked_add(n))
+        .ok_or(Error::Inconsistent(RecordKind::ChildCount))?;
+
+    // A full page has a successor page if the next key is still under the
+    // prefix. Spec: docs/49 §6.1 item 3; docs/32 §8.
+    if let Some(last) = full_at {
+        let more = match entries.next() {
+            Some(entry) => entry?.0.value().starts_with(prefix.as_slice()),
+            None => false,
+        };
+        if more {
+            return Ok(ChildPage {
+                children,
+                next: Some(ChildCursor {
+                    parent,
+                    after: last,
+                    listed,
+                }),
+            });
+        }
+    }
+
+    // Final page: every live child of a parent is counted in its child-count
+    // record, so a listing that found fewer (or more) entries met an index
+    // edited beneath the engine. The roots have no count record. Spec:
+    // docs/32 §2 (child count), §3; A-30 (removed index entries); Q-175.
+    if let Some(p) = parent {
+        if load_child_count(counts, key, p)? != listed {
+            return Err(Error::Inconsistent(RecordKind::ChildCount));
+        }
+    }
+    Ok(ChildPage {
+        children,
+        next: None,
+    })
 }
 
 /// Look a child up by its RDN value: compute the key, then resolve it.

@@ -71,6 +71,10 @@
 //!   u8 format
 //! ```
 //!
+//! All name-index keys under one parent share its [`name_index_prefix`], so
+//! one prefix scan lists the live children of a parent (or the roots) in
+//! RDN-key order (docs/49 §6.1 item 3).
+//!
 //! # Reverse-link and unique-index records
 //!
 //! ```text
@@ -458,22 +462,37 @@ pub fn decode_object_body(guid: Guid, body: &[u8]) -> Result<Object, DecodeError
     })
 }
 
+/// The name-index key prefix shared by every entry under `parent`: `0x00`
+/// for the naming-context roots (`None`), `0x01 || parent GUID packet` for
+/// the children of a parent. Every name-index key is this prefix followed by
+/// a non-empty RDN key. The prefix has a fixed length for each key space (1
+/// or 1 + 16 bytes), so the keys that start with it are exactly the entries
+/// under that parent, and a range scan from it meets them in RDN-key order.
+/// Spec: docs/32 §2 (name index keyed by `(parent, RDN key)`); docs/49 §6.1
+/// item 3 (range scan over the `(parent, …)` prefix of the name index).
+#[must_use]
+pub fn name_index_prefix(parent: Option<Guid>) -> Vec<u8> {
+    let mut prefix = Vec::new();
+    match parent {
+        None => prefix.push(NAME_KEY_ROOT),
+        Some(p) => {
+            prefix.push(NAME_KEY_CHILD);
+            prefix.extend_from_slice(&p.to_packet());
+        }
+    }
+    prefix
+}
+
 /// The name-index key of `(parent, rdn)`: `0x00 || rdn` for a root,
-/// `0x01 || parent GUID packet || rdn` for a child. The prefix byte keeps the
-/// two key spaces apart without reserving any GUID value.
+/// `0x01 || parent GUID packet || rdn` for a child — the
+/// [`name_index_prefix`] of `parent` followed by `rdn`. The prefix byte keeps
+/// the two key spaces apart without reserving any GUID value.
 /// Spec: docs/32 §2 (name as secondary index; unique `(parent, RDN key)`).
 #[must_use]
 pub fn name_index_key(parent: Option<Guid>, rdn: &[u8]) -> Vec<u8> {
     // No capacity arithmetic on the caller's length (callers bound the RDN
     // key first; this keeps the function total on its own).
-    let mut key = Vec::new();
-    match parent {
-        None => key.push(NAME_KEY_ROOT),
-        Some(p) => {
-            key.push(NAME_KEY_CHILD);
-            key.extend_from_slice(&p.to_packet());
-        }
-    }
+    let mut key = name_index_prefix(parent);
     key.extend_from_slice(rdn);
     key
 }

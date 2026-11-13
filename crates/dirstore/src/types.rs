@@ -179,6 +179,43 @@ impl Object {
     }
 }
 
+/// Where a children listing resumes: after the RDN key of the last child of
+/// the previous page, under the same parent. It also carries how many
+/// children the earlier pages of the listing returned, for the completeness
+/// check on the final page.
+///
+/// Opaque, and made only by [`crate::Snapshot::children`] /
+/// [`crate::WriteTxn::children`]: its RDN key is one read from an
+/// authenticated, cross-checked name-index entry, so it is bounded. A cursor
+/// continues a listing in the view that made it (the same snapshot, or the
+/// same write transaction with no write under the parent in between); see
+/// [`crate::Snapshot::children`].
+///
+/// Spec: docs/49 §6.1 item 3 (`after: Option<RdnKey>`); docs/32 §2 (name
+/// index keyed by `(parent, RDN key)`), §8 (bounded paging).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildCursor {
+    /// The parent whose children are listed (`None`: the roots).
+    pub(crate) parent: Option<Guid>,
+    /// RDN key of the last child returned so far.
+    pub(crate) after: Vec<u8>,
+    /// Children returned by the pages before this cursor.
+    pub(crate) listed: u64,
+}
+
+/// One page of a children listing.
+/// Spec: docs/49 §6.1 item 3 (R49-9); docs/32 §8.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildPage {
+    /// GUIDs of live children, in name-index key order (ascending RDN key
+    /// bytes, i.e. the A–Z-folded RDN value — Q-080 interim). Spec: docs/32
+    /// §2; docs/49 §6.1 item 3 ("name-index order — deterministic").
+    pub children: Vec<Guid>,
+    /// `Some` when more children follow: pass it as `after` to read the next
+    /// page. `None` when the listing is complete.
+    pub next: Option<ChildCursor>,
+}
+
 /// A new object to create. Values are raw bytes; the engine sorts them,
 /// rejects duplicates and stamps each with `version` 1. There is no RDN key
 /// field: the engine computes it from the value of the RDN attribute of the

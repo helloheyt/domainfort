@@ -10,7 +10,7 @@ use dirstore::record::{
     decode_child_count_body, decode_meta_body, decode_name_index_body, decode_object_body,
     decode_unique_index_body, encode_back_link_body, encode_child_count_body, encode_meta_body,
     encode_name_index_body, encode_object_body, encode_unique_index_body, name_index_key,
-    unique_index_key, BACK_LINK_KEY_LEN, RECORD_FORMAT_V1,
+    name_index_prefix, unique_index_key, BACK_LINK_KEY_LEN, RECORD_FORMAT_V1,
 };
 use dirstore::{
     AttrId, AttrStamp, Attribute, ClassId, DecodeError, NodeId, Object, StampedValue, Timestamp,
@@ -588,4 +588,24 @@ fn name_index_keys_keep_roots_and_children_apart() {
     assert_eq!(child[0], 0x01);
     assert_eq!(&child[1..17], &P.to_packet());
     assert_eq!(&child[17..], b"ab");
+}
+
+#[test]
+fn name_index_prefix_is_the_key_without_its_rdn() {
+    // Source: src/record.rs — every key under a parent is its prefix (0x00,
+    // or 0x01 || parent) followed by the RDN key; docs/49 §6.1 item 3 scans
+    // that prefix. Keys of another parent, and root keys, do not start with
+    // a child prefix.
+    assert_eq!(name_index_prefix(None), vec![0x00]);
+    let prefix = name_index_prefix(Some(P));
+    assert_eq!(prefix.len(), 17);
+    assert_eq!(prefix[0], 0x01);
+    assert_eq!(&prefix[1..], &P.to_packet());
+    for rdn in [&b"a"[..], b"ab", b"zz"] {
+        assert!(name_index_key(Some(P), rdn).starts_with(&prefix));
+        assert!(name_index_key(None, rdn).starts_with(&name_index_prefix(None)));
+        assert!(!name_index_key(Some(G), rdn).starts_with(&prefix));
+        assert!(!name_index_key(None, rdn).starts_with(&prefix));
+        assert!(!name_index_key(Some(P), rdn).starts_with(&name_index_prefix(None)));
+    }
 }

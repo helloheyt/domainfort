@@ -204,6 +204,12 @@ pub enum Violation {
     /// A unique-index lookup named an attribute that is not `unique`.
     /// Spec: docs/46 §8.5.
     NotUnique(AttrId),
+    /// A children listing asked for a page of zero entries (such a page
+    /// could never advance). Spec: docs/49 §6.1 item 3; docs/32 §8.
+    PageLimitZero,
+    /// A children listing was given a cursor made by a listing of another
+    /// parent. Spec: docs/49 §6.1 item 3 (`after`); docs/32 §2.
+    CursorParentMismatch,
 
     // ---- resource bounds (docs/32 §8) ----
     /// More than [`crate::MAX_CLASSES_PER_OBJECT`] classes.
@@ -495,6 +501,10 @@ impl fmt::Display for Violation {
             Violation::NullGuid => f.write_str("object GUID is the NULL GUID"),
             Violation::NotBackLink(a) => write!(f, "attribute {} is not a back link", a.0),
             Violation::NotUnique(a) => write!(f, "attribute {} is not unique", a.0),
+            Violation::PageLimitZero => f.write_str("listing page limit is zero"),
+            Violation::CursorParentMismatch => {
+                f.write_str("listing cursor belongs to another parent")
+            }
             Violation::TooManyClasses => f.write_str("too many object classes"),
             Violation::TooManyAttributes => f.write_str("too many attributes"),
             Violation::TooManyValues(a) => write!(f, "attribute {} has too many values", a.0),

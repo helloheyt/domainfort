@@ -12,6 +12,10 @@
 //!   class (docs/46 §8.3 item 3; D64): ASCII only, A–Z folded to a–z (the
 //!   Q-080 interim rule, PENDING-OWNER P-9). Children are indexed by
 //!   `(parent GUID, RDN key)` and that pair is unique among live objects.
+//!   The same index lists the live children of a parent, or the
+//!   naming-context roots, in bounded pages in RDN-key order
+//!   ([`Snapshot::children`]; the candidate source of LDAP one-level and
+//!   subtree searches, docs/49 §6.1 item 3, R49-9).
 //! - **Class chains and the tree shape** (docs/46 §8.3): an object lists the
 //!   full superclass chain of exactly one instantiable class; its parent's
 //!   most specific class must be one of that class's possible superiors; an
@@ -61,6 +65,11 @@
 //!   [`Error::Tamper`] and the record is never decoded, returned or used.
 //!   Index entries (name, reverse link, unique) are also cross-checked
 //!   against the object they name; a mismatch is [`Error::Inconsistent`].
+//!   A children listing cross-checks every entry it returns the same way,
+//!   and its final page checks the number of children listed against the
+//!   parent's live-child count, so a name entry removed beneath the engine
+//!   cannot silently hide a child from a listing (residuals on
+//!   [`Snapshot::children`]).
 //! - **Bounded, canonical codec** (docs/10 D34; docs/32 §8, D138): records use
 //!   this crate's own length-prefixed encoding ([`record`]), not a general
 //!   serializer. The decoder is bounded and fail-closed; bytes read back from
@@ -82,6 +91,7 @@
 //! | object classes of one object | [`MAX_CLASSES_PER_OBJECT`] |
 //! | bytes in an RDN key | [`MAX_RDN_KEY_LEN`] |
 //! | bytes in one encoded record body | [`MAX_RECORD_BODY_LEN`] |
+//! | children in one listing page (a read bound: larger limits are capped) | [`MAX_CHILDREN_PER_PAGE`] |
 //!
 //! # Out of scope
 //!
@@ -99,7 +109,8 @@
 //! docs/32 (all sections), docs/29 §2 and §5, docs/46 (§1, §2.3, §5.4, §8,
 //! §10 / A-29), docs/12 §3 (D44), docs/25 §5, docs/10 §3 (D34), docs/11 §6
 //! (`AttrClass` = Normal | Sensitive | Secret), docs/14 §6 (D60), Q-080,
-//! Q-062 / A-18; and the pinned [MS-ADTS] v20261026 and [MS-DRSR] v20260309
+//! Q-062 / A-18, docs/49 §6.1 and §12 (the children listing, task L3; A-30,
+//! P-7); and the pinned [MS-ADTS] v20261026 and [MS-DRSR] v20260309
 //! sections cited on each item (opened in-session from
 //! `tools/spec-pin/cache/`). GUID / SID / security-descriptor handling is delegated
 //! to our own `dtyp` crate (its public API and docs, read in-session); the redb,
@@ -107,7 +118,7 @@
 //! implementation was consulted or recalled (AGENTS.md §1-3).
 //!
 //! Spec: docs/32 §1-§8 (D134-D136, D138); docs/29 §2 (D119), §5 (D121);
-//! docs/46 §8; docs/12 D44; docs/11 §6; docs/10 D34.
+//! docs/46 §8; docs/12 D44; docs/11 §6; docs/10 D34; docs/49 §6.1 (R49-9).
 
 mod comparison;
 mod error;
@@ -125,8 +136,8 @@ pub use schema::{
 };
 pub use store::{Snapshot, Store, WriteTxn};
 pub use types::{
-    AttrId, AttrStamp, Attribute, AttributeChange, ClassId, NewObject, NodeId, Object, Origin,
-    StampedValue, Timestamp, Tombstone,
+    AttrId, AttrStamp, Attribute, AttributeChange, ChildCursor, ChildPage, ClassId, NewObject,
+    NodeId, Object, Origin, StampedValue, Timestamp, Tombstone,
 };
 
 /// Largest attribute value, in bytes. A schema attribute's own bound may only
@@ -166,3 +177,12 @@ pub const MAX_RDN_ATT_LEN: usize = RDN_SIZE_LIMIT - 3;
 /// [`MAC_LEN`]-byte tag). Caps one object's total size whatever the other
 /// bounds allow. Spec: docs/32 §8 (allocation ceiling); project choice.
 pub const MAX_RECORD_BODY_LEN: usize = 16 * 1024 * 1024;
+
+/// Most children one page of [`Snapshot::children`] / [`WriteTxn::children`]
+/// returns; a larger `limit` is capped to this. One page therefore reads at
+/// most this many object records plus one more name-index key, and a caller
+/// pages through a large container instead of holding it whole. It is well
+/// under the search visit budget of docs/49 §6.1 item 3 (10,000 candidates),
+/// which the caller enforces across pages. Spec: docs/32 §8 (bounds; no
+/// number fixed there), docs/49 §6.1 item 3; project choice.
+pub const MAX_CHILDREN_PER_PAGE: usize = 1000;
