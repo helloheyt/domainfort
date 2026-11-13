@@ -675,7 +675,7 @@ fn krbtgt_bound_to_wrong_name_denied() {
     );
     assert_eq!(
         f.keyd
-            .open_and_verify_tgt(&KDC, &other_krbtgt, &req, &body, &now()),
+            .open_and_verify_tgt(&KDC, &other_krbtgt, &req, &body, None, &now()),
         Err(AuthnError::Denied)
     );
     assert_eq!(
@@ -686,6 +686,6 @@ fn krbtgt_bound_to_wrong_name_denied() {
     // the replay cache, so the authenticator was not consumed.
     assert!(f
         .keyd
-        .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &now())
+        .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, None, &now())
         .is_ok());
 }

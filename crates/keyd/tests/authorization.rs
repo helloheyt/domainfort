@@ -101,7 +101,7 @@ fn invoke(f: &mut Fixture, op: Operation, caller: &CallerId, handle: &KeyHandle)
         }
         Operation::OpenAndVerifyTgt => f
             .keyd
-            .open_and_verify_tgt(caller, handle, &dummy_ap_req(), &[0x30, 0x00], &n)
+            .open_and_verify_tgt(caller, handle, &dummy_ap_req(), &[0x30, 0x00], None, &n)
             .is_ok(),
         Operation::IssueTgsRep => f
             .keyd

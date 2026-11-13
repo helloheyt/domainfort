@@ -266,7 +266,7 @@ fn krbtgt_rotation_and_retirement() {
     );
     assert_eq!(
         f.keyd
-            .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &now()),
+            .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, None, &now()),
         Err(AuthnError::Denied)
     );
     open_tgt(&mut f, &new, 4, 4);
@@ -299,7 +299,7 @@ fn double_rotation_drops_original_key() {
     );
     assert_eq!(
         f.keyd
-            .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &now()),
+            .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, None, &now()),
         Err(AuthnError::Denied)
     );
 }

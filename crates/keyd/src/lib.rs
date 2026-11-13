@@ -24,17 +24,22 @@
 //! Key purposes: PrincipalLongterm, Krbtgt, Service. Encryption types: the
 //! AES types of `krb-crypto` (17, 18, 19, 20) — no weak type is expressible.
 //!
-//! **FAST (RFC 6113), the AS side** (docs/48 tasks T1, T2): the AS armor
+//! **FAST (RFC 6113)** (docs/48 tasks T1, T2, T3): the AS armor
 //! (FX_FAST_ARMOR_AP_REQUEST) is opened and its KrbFastReq decrypted inside
 //! keyd; [`Keyd::verify_preauth`] with an armor verifies the encrypted
 //! challenge FAST factor (one attempt per armor); [`Keyd::issue_as_rep`]
 //! with that armor seals the reply under the strengthened reply key and
 //! returns the sealed KrbFastResponse (`fast_rep`: the KDC's encrypted
-//! challenge, the strengthen key, KrbFastFinished); armored errors are
-//! sealed inside keyd. No FAST key — armor, challenge, strengthen, reply —
-//! leaves keyd (docs/48 §2, A-33). Computer-account-only armor (D126) is the
-//! KDC's check — keyd holds no account kind. The TGS implicit armor (T3) is
-//! not implemented yet.
+//! challenge, the strengthen key, KrbFastFinished). In the TGS,
+//! [`Keyd::open_and_verify_tgt`] with a [`TgsFastRequest`] derives the
+//! implicit armor key from the PA-TGS-REQ subkey and the TGT session key,
+//! verifies the req-checksum over the AP-REQ and decrypts the KrbFastReq;
+//! [`Keyd::issue_tgs_rep`] on that context strengthens the reply key and
+//! returns the sealed KrbFastResponse. Armored errors of either exchange
+//! are sealed inside keyd ([`Keyd::seal_fast_error`]). No FAST key — armor,
+//! challenge, strengthen, reply — leaves keyd (docs/48 §2, A-33).
+//! Computer-account-only armor (D126) is the KDC's check — keyd holds no
+//! account kind.
 //!
 //! **Not implemented — no code path, no enum variant:** Netlogon, SNTP,
 //! GKDI, BackupKey, S4U, replication, PKINIT, anonymous FAST armor,
@@ -52,15 +57,18 @@
 //! - **I3** purpose check: [`authz::purpose_permitted`] for every handle.
 //! - **I4** issuance needs a valid, one-time, caller-bound token
 //!   ([`AuthnProof`] / [`TgtContext`] ctx id), bounded tables; an armored
-//!   error needs the one-time [`ArmorId`] of its conversation; an armor
-//!   allows one pre-authentication attempt, its proof issues only with it
-//!   (and an unarmored proof only without one), and it is consumed once.
+//!   error needs the one-time token of its conversation ([`ArmorId`], or the
+//!   ctx id of an armored TGS context); an armor allows one
+//!   pre-authentication attempt, its proof issues only with it (and an
+//!   unarmored proof only without one), and it is consumed once — as is an
+//!   armored TGS context (by a successful issuance or by the armored error).
 //! - **I5** only configured AES enctypes ([`KeydConfig::enctypes`]).
 //! - **I6** secret comparisons via approved constant-time facilities
 //!   (krb-crypto `verify_mic` / integrity checks). Errors are uniform for
 //!   every failure decided before the cryptographic chain completes;
 //!   classified after (A-26, docs/questions/Q-071): only once the TGT and the
-//!   authenticator decrypted and the req-body checksum verified
+//!   authenticator decrypted and the req-body checksum verified — and, under
+//!   FAST, the req-checksum verified and the KrbFastReq decrypted and decoded
 //!   (`open_and_verify_tgt`), or the PA-ENC-TIMESTAMP — or, armored, the
 //!   encrypted challenge — decrypted and decoded (`verify_preauth`), or the
 //!   armor TGT, authenticator, subkey, armor key,
@@ -124,6 +132,11 @@
 //!   advertise the same one in PA-ETYPE-INFO2 — task T5); an
 //!   EncryptedChallenge carries no kvno. A client that reads them otherwise
 //!   is refused (fail closed), never accepted wrongly.
+//! - Armored TGS interpretations awaiting the lab (docs/questions/Q-121,
+//!   Q-122, Q-124, Q-150): usage 9 under the strengthened reply key; the
+//!   PA-TGS-REQ authenticator checksum still covers the OUTER body, which is
+//!   still checked (realm, no enc-authorization-data); an armored context
+//!   survives a refused `issue_tgs_rep` so that the error can be armored.
 //!
 //! # Provenance
 //!
@@ -136,8 +149,8 @@
 //! §3.2.5.7, §3.3.5.1, §3.3.5.7.4 — checked against Q-120..Q-124), and this
 //! project's design documents docs/09, docs/10, docs/25 §3, docs/30,
 //! docs/33 §6.1, docs/45, docs/47 §9, docs/48, docs/questions/Q-040, Q-115
-//! (A-35), Q-120..Q-127, Q-145. No other implementation was consulted or
-//! recalled.
+//! (A-35), Q-120..Q-127, Q-145, Q-150. No other implementation was consulted
+//! or recalled.
 //!
 //! Spec: docs/10; docs/09 א; RFC 4120 §3, §5.
 
@@ -172,7 +185,7 @@ pub use fast_armor::{FastArmor, FastConversation, MAX_FX_COOKIE_LENGTH};
 pub use keyd::Keyd;
 pub use model::{DualControlToken, KeyHandle, KeyPurpose, Kvno, PrincipalBinding, PrincipalId};
 pub use store::{InMemoryKeyStore, KeyStore, StoreError, StoredKeySet};
-pub use tgs_exchange::{TgsRepParts, TgsTicketTemplate, TgtContext};
+pub use tgs_exchange::{TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext};
 pub use throttle::{FailureWindowThrottle, SecretThrottle};
 pub use time::kerberos_time_seconds;
 pub use tokens::{ArmorId, CtxId, ExchangeId, TOKEN_ID_LENGTH};

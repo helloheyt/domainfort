@@ -27,7 +27,10 @@ use core::fmt;
 /// `Denied` is returned for every failure decided before the step's
 /// cryptographic chain completed. The other variants are returned only after
 /// it completed — for `open_and_verify_tgt`: the TGT decrypted, the
-/// authenticator decrypted and its checksum over the KDC-REQ-BODY verified;
+/// authenticator decrypted and its checksum over the KDC-REQ-BODY verified,
+/// and, for an armored request, the subkey present, the implicit armor key
+/// derived, the req-checksum over the AP-REQ verified and the enc-fast-req
+/// decrypted and decoded (docs/48 §5.2, §6.3);
 /// for `open_fast_armor`: the armor TGT and authenticator decrypted, the
 /// subkey present, the armor key derived, the req-checksum verified and the
 /// enc-fast-req decrypted and decoded (docs/48 §6.3); for `verify_preauth`

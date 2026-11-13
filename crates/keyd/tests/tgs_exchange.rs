@@ -35,6 +35,7 @@ fn tgs_round_trip_session_key() {
             &KRBTGT,
             &ap_req(&tgt.parts.ticket, auth),
             &body,
+            None,
             &now(),
         )
         .unwrap();
@@ -96,6 +97,7 @@ fn tgs_round_trip_subkey() {
             &KRBTGT,
             &ap_req(&tgt.parts.ticket, auth),
             &body,
+            None,
             &now(),
         )
         .unwrap();
@@ -124,11 +126,11 @@ fn replayed_authenticator_denied() {
     );
     assert!(f
         .keyd
-        .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &now())
+        .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, None, &now())
         .is_ok());
     assert_eq!(
         f.keyd
-            .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &at(1)),
+            .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, None, &at(1)),
         Err(AuthnError::Replay)
     );
     assert_eq!(f.records().last().unwrap().reason, AuditReason::Replay);
@@ -139,7 +141,7 @@ fn replayed_authenticator_denied() {
     );
     assert!(f
         .keyd
-        .open_and_verify_tgt(&KDC, &KRBTGT, &req2, &body, &now())
+        .open_and_verify_tgt(&KDC, &KRBTGT, &req2, &body, None, &now())
         .is_ok());
 }
 
@@ -159,7 +161,7 @@ fn tampered_req_body_denied() {
     );
     assert_eq!(
         f.keyd
-            .open_and_verify_tgt(&KDC, &KRBTGT, &req, &other_body, &now()),
+            .open_and_verify_tgt(&KDC, &KRBTGT, &req, &other_body, None, &now()),
         Err(AuthnError::Denied)
     );
     assert_eq!(
@@ -173,7 +175,7 @@ fn tampered_req_body_denied() {
     flipped[last] ^= 0x01;
     assert_eq!(
         f.keyd
-            .open_and_verify_tgt(&KDC, &KRBTGT, &req, &flipped, &now()),
+            .open_and_verify_tgt(&KDC, &KRBTGT, &req, &flipped, None, &now()),
         Err(AuthnError::Denied)
     );
 
@@ -183,7 +185,7 @@ fn tampered_req_body_denied() {
     let req = ap_req(&tgt.parts.ticket, authenticator(&tgt.session, &spec));
     assert_eq!(
         f.keyd
-            .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &now()),
+            .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, None, &now()),
         Err(AuthnError::Denied)
     );
     assert_eq!(
@@ -207,7 +209,7 @@ fn authenticator_clock_skew_denied() {
         );
         let r = f
             .keyd
-            .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &now());
+            .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, None, &now());
         assert_eq!(r.is_ok(), ok, "offset {offset}");
         if !ok {
             assert_eq!(r, Err(AuthnError::Skew), "offset {offset}");
@@ -227,7 +229,7 @@ fn authenticator_name_mismatch_denied() {
     let req = ap_req(&tgt.parts.ticket, authenticator(&tgt.session, &spec));
     assert_eq!(
         f.keyd
-            .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &now()),
+            .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, None, &now()),
         Err(AuthnError::Denied)
     );
     assert_eq!(
@@ -253,7 +255,7 @@ fn expired_tgt_denied() {
     );
     assert_eq!(
         f.keyd
-            .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &later),
+            .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, None, &later),
         Err(AuthnError::TicketExpired)
     );
     assert_eq!(
@@ -275,8 +277,14 @@ fn bad_tickets_denied() {
     let mut tampered = tgt.parts.ticket.clone();
     tampered.enc_part.cipher[20] ^= 0x80;
     assert_eq!(
-        f.keyd
-            .open_and_verify_tgt(&KDC, &KRBTGT, &ap_req(&tampered, fresh(10)), &body, &now()),
+        f.keyd.open_and_verify_tgt(
+            &KDC,
+            &KRBTGT,
+            &ap_req(&tampered, fresh(10)),
+            &body,
+            None,
+            &now()
+        ),
         Err(AuthnError::Denied)
     );
     assert_eq!(
@@ -287,8 +295,14 @@ fn bad_tickets_denied() {
     let mut not_tgt = tgt.parts.ticket.clone();
     not_tgt.sname = service_name();
     assert_eq!(
-        f.keyd
-            .open_and_verify_tgt(&KDC, &KRBTGT, &ap_req(&not_tgt, fresh(11)), &body, &now()),
+        f.keyd.open_and_verify_tgt(
+            &KDC,
+            &KRBTGT,
+            &ap_req(&not_tgt, fresh(11)),
+            &body,
+            None,
+            &now()
+        ),
         Err(AuthnError::Denied)
     );
     assert_eq!(f.records().last().unwrap().reason, AuditReason::NotLocalTgt);
@@ -297,7 +311,7 @@ fn bad_tickets_denied() {
     u2u.ap_options = ApOptions::USE_SESSION_KEY;
     assert_eq!(
         f.keyd
-            .open_and_verify_tgt(&KDC, &KRBTGT, &u2u, &body, &now()),
+            .open_and_verify_tgt(&KDC, &KRBTGT, &u2u, &body, None, &now()),
         Err(AuthnError::Denied)
     );
 
@@ -310,6 +324,7 @@ fn bad_tickets_denied() {
             &KRBTGT,
             &ap_req(&wrong_kvno, fresh(13)),
             &body,
+            None,
             &now()
         ),
         Err(AuthnError::Denied)
@@ -326,6 +341,7 @@ fn bad_tickets_denied() {
             &KRBTGT,
             &ap_req(&tgt.parts.ticket, fresh(14)),
             &[0x30, 0x00],
+            None,
             &now()
         ),
         Err(AuthnError::Denied)
@@ -491,7 +507,7 @@ fn replay_cache_full_fails_closed() {
             authenticator(&tgt.session, &AuthenticatorSpec::new(ctime, cusec, &body)),
         );
         f.keyd
-            .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &when)
+            .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, None, &when)
     };
     assert!(call(&mut f, now(), 1, now()).is_ok());
     assert!(call(&mut f, now(), 2, now()).is_ok());
@@ -524,7 +540,7 @@ fn service_bound_to_other_name_denied() {
     );
     let ctx = f
         .keyd
-        .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &now())
+        .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, None, &now())
         .unwrap();
     let mut t = tgs_template(60);
     t.sname = other;
@@ -554,7 +570,7 @@ fn service_name_type_is_not_significant() {
     );
     let ctx = f
         .keyd
-        .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &now())
+        .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, None, &now())
         .unwrap();
     let mut t = tgs_template(61);
     t.sname = sname.clone();
@@ -580,7 +596,7 @@ fn not_yet_valid_tgt_is_classified() {
     );
     assert_eq!(
         f.keyd
-            .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &now()),
+            .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, None, &now()),
         Err(AuthnError::TicketNotYetValid)
     );
     assert_eq!(
@@ -605,7 +621,8 @@ fn classes_only_after_the_cryptographic_chain() {
     let (_, body) = tgs_req_body(41, service_name());
     let (_, other_body) = tgs_req_body(42, service_name());
     let verify = |f: &mut Fixture, req: &krb_proto::ApReq, body: &[u8], when| {
-        f.keyd.open_and_verify_tgt(&KDC, &KRBTGT, req, body, &when)
+        f.keyd
+            .open_and_verify_tgt(&KDC, &KRBTGT, req, body, None, &when)
     };
 
     // Expired + checksum over another body.
@@ -679,12 +696,12 @@ fn time_classes_leave_the_replay_cache_unchanged() {
     );
     assert_eq!(
         f.keyd
-            .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &at(301)),
+            .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, None, &at(301)),
         Err(AuthnError::Skew)
     );
     assert!(f
         .keyd
-        .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &now())
+        .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, None, &now())
         .is_ok());
 
     // Expired: endtime 10:30; ctime 10:35:01 presented at 10:35:01 (expired)
@@ -700,12 +717,12 @@ fn time_classes_leave_the_replay_cache_unchanged() {
     );
     assert_eq!(
         f.keyd
-            .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &ctime),
+            .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, None, &ctime),
         Err(AuthnError::TicketExpired)
     );
     assert!(f
         .keyd
-        .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &kt("20261113103400Z"))
+        .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, None, &kt("20261113103400Z"))
         .is_ok());
 
     // Not yet valid: authtime 10:06:40, presented at 10:00 then at 10:06:40.
@@ -717,11 +734,11 @@ fn time_classes_leave_the_replay_cache_unchanged() {
     );
     assert_eq!(
         f.keyd
-            .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &now()),
+            .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, None, &now()),
         Err(AuthnError::TicketNotYetValid)
     );
     assert!(f
         .keyd
-        .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &at(400))
+        .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, None, &at(400))
         .is_ok());
 }

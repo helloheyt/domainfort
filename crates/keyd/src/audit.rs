@@ -178,14 +178,17 @@ pub enum AuditReason {
     /// The armor type is not FX_FAST_ARMOR_AP_REQUEST. Spec: RFC 6113 5.4.1.
     ArmorTypeUnsupported,
     /// The armor AP-REQ authenticator carries no subkey ("The subkey field
-    /// in the AP-REQ MUST be present"). Spec: RFC 6113 5.4.1.1.
+    /// in the AP-REQ MUST be present") — or, in an armored TGS request, the
+    /// PA-TGS-REQ authenticator carries none ("a subkey MUST be included in
+    /// the PA-TGS-REQ authenticator"). Spec: RFC 6113 5.4.1.1, 5.4.2.
     ArmorSubkeyMissing,
     /// The armor AP-REQ authenticator carries a checksum; the armor has no
     /// application data to checksum, so phase 1 refuses one.
     /// Spec: RFC 4120 5.5.1 (cksum); docs/questions/Q-120 item 3 (A-32).
     ArmorChecksumPresent,
-    /// The KrbFastArmoredReq req-checksum does not verify over the outer
-    /// request body under the armor key. Spec: RFC 6113 5.4.2.
+    /// The KrbFastArmoredReq req-checksum does not verify under the armor
+    /// key over the outer request body (AS) or the PA-TGS-REQ AP-REQ (TGS).
+    /// Spec: RFC 6113 5.4.2.
     FastChecksumMismatch,
     /// `seal_fast_error`: the KRB-ERROR is not one keyd may seal — e-data or
     /// e-text present, KDC_ERR_NONE, stime other than now, or names other
@@ -209,10 +212,25 @@ pub enum AuditReason {
     /// Some(a)↔Some(a)"), §9.2 item 8.
     ArmorProofMismatch,
     /// `issue_as_rep`: the template's crealm, cname or nonce is not that of
-    /// the inner request keyd stored when it opened the armor. Spec: RFC 6113
-    /// 5.4.2 (inner req-body preferred), 5.4.3 (nonce); docs/48 §3.4, §9.2
-    /// items 7, 8.
+    /// the inner request keyd stored when it opened the armor;
+    /// `issue_tgs_rep` on an armored context: the template's sname or nonce
+    /// is not that of the stored inner request. Spec: RFC 6113 5.4.2 (inner
+    /// req-body preferred), 5.4.3 (nonce); docs/48 §3.4, §9.2 items 7, 8.
     FastBindingMismatch,
+    /// `open_and_verify_tgt`: the KrbFastArmoredReq of a TGS request carries
+    /// an explicit armor field; implicit armor is the only TGS armor. Spec:
+    /// RFC 6113 5.4.1.1 ("This armor type is only valid for AS requests"),
+    /// 5.4.2; docs/questions/Q-124 item 2 (A-32).
+    TgsExplicitArmor,
+    /// `open_and_verify_tgt`: the AP-REQ octets given for the req-checksum
+    /// do not decode to the AP-REQ being opened. Spec: RFC 6113 5.4.2 (the
+    /// checksum is "performed over the type AP-REQ in the PA-TGS-REQ
+    /// padata"); docs/48 §5.2 step 4.
+    FastApReqMismatch,
+    /// `seal_fast_error(Tgs)`: the context names no armored conversation —
+    /// it was opened without FAST, so there is no armor key to seal under.
+    /// Spec: docs/48 §2.4 (`ArmorConversationMismatch`), §9.1 I4.
+    ArmorConversationMismatch,
 }
 
 /// A key referenced by an operation, for audit (no key material).

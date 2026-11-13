@@ -21,14 +21,34 @@
 //! the FAST armor (`open_fast_armor`, docs/48 §3.2) reuses with its own
 //! authenticator key usage.
 //!
+//! **TGS under FAST** (docs/48 §5, task T3): implicit armor only. With a
+//! [`TgsFastRequest`], `open_and_verify_tgt` derives the armor key from the
+//! PA-TGS-REQ authenticator's subkey (mandatory) and the TGT session key —
+//! "the same armor key that would be computed if the TGS-REQ authenticator
+//! was used in an FX_FAST_ARMOR_AP_REQUEST armor" (RFC 6113 5.4.2) —
+//! verifies the req-checksum over the PA-TGS-REQ AP-REQ, decrypts the
+//! KrbFastReq and keeps the armor key and the INNER request's nonce and sname
+//! in the context. `issue_tgs_rep` on such a context strengthens the reply
+//! key (mandatory in a TGS reply), seals EncTGSRepPart under it and returns
+//! the sealed KrbFastResponse (`fast_rep`); `seal_fast_error(Tgs(ctx))`
+//! (crate::fast_armor) seals an armored error instead. An explicit armor
+//! field in a TGS request is refused (RFC 6113 5.4.1.1 "only valid for AS
+//! requests"; docs/questions/Q-124). The armor key, the strengthen key and the
+//! reply key never leave keyd (docs/48 §2.2, A-33).
+//!
 //! Spec: RFC 4120 3.2.3, 3.3.2, 3.3.3, 5.2.7.1, 5.4.1, 5.4.2, 5.5.1, 7.3,
-//! 7.5.1; docs/10 §5, §8, D33; docs/30 §3, §7; docs/48 §3.2.
+//! 7.5.1; RFC 6113 5.1, 5.4.1.1, 5.4.2, 5.4.3, 6.2, 8; docs/10 §5, §8, D33;
+//! docs/30 §3, §7; docs/48 §3.2, §5; docs/questions/Q-121, Q-122, Q-124
+//! (A-32), Q-150.
 
 use crate::as_exchange::token_deny;
 use crate::audit::{AuditReason, AuditSink};
 use crate::authz::{CallerId, HandleSlot, Operation};
 use crate::entropy::EntropySource;
 use crate::error::{AuthnError, Deny, Internal, IssueError};
+use crate::fast_armor::{
+    open_armored_request, seal_fast_reply, seal_strengthened, ticket_armor_key, ArmoredConversation,
+};
 use crate::keyd::{authorize, draw, key_usage, new_random_key, open, seal, AuditFields, Keyd};
 use crate::model::KeyHandle;
 use crate::replay::{ReplayKey, ReplayRefusal};
@@ -45,10 +65,32 @@ use crate::usage::{
 use krb_crypto::{ChecksumType, EncType, ProtocolKey};
 use krb_proto::{
     ApOptions, ApReq, Authenticator, EncKdcRepPart, EncTgsRepPart, EncTicketPart, EncryptedData,
-    EncryptionKey, KdcReqBody, KerberosTime, KeyValue, LastReq, PrincipalName, Realm, Ticket,
-    TicketFlags, TransitedEncoding,
+    EncryptionKey, KdcReqBody, KerberosTime, KeyValue, KrbFastArmoredReq, KrbFastReq, LastReq,
+    PrincipalName, Realm, Ticket, TicketFlags, TransitedEncoding,
 };
 use zeroize::Zeroizing;
+
+/// The FAST part of an armored TGS-REQ, handed to `open_and_verify_tgt`
+/// (implicit armor, docs/48 §5).
+///
+/// `ap_req_octets` are the raw DER of the PA-TGS-REQ padata-value — "the
+/// type AP-REQ in the PA-TGS-REQ padata" over which the req-checksum is
+/// computed (RFC 6113 5.4.2). keyd decodes them itself and requires them to
+/// be exactly the AP-REQ it opens, so the octets the checksum covers and the
+/// AP-REQ keyd authenticates are one and the same (docs/48 §5.2 step 4).
+///
+/// Spec: docs/48 §2.3 (`fast: Option<FastArmoredFields>`; the raw AP-REQ),
+/// §5; RFC 6113 5.4.2; RFC 4120 5.2.7.1 ("padata-value will contain an
+/// encoded AP-REQ").
+#[derive(Debug, Clone, Copy)]
+pub struct TgsFastRequest<'a> {
+    /// The raw DER of the PA-TGS-REQ padata-value (the AP-REQ).
+    pub ap_req_octets: &'a [u8],
+    /// The KrbFastArmoredReq of the request's PA-FX-FAST padata. Its `armor`
+    /// field must be absent: implicit armor is the only TGS armor (RFC 6113
+    /// 5.4.1.1, 5.4.2; docs/questions/Q-124 item 2).
+    pub armored_req: &'a KrbFastArmoredReq,
+}
 
 /// Non-secret facts of a verified TGT, plus the one-time context id that
 /// binds `issue_tgs_rep` to this verification.
@@ -75,10 +117,19 @@ pub struct TgtContext {
     pub renew_till: Option<KerberosTime>,
     /// TGT flags.
     pub flags: TicketFlags,
+    /// The decrypted KrbFastReq of an armored request (fast-options, padata,
+    /// the inner req-body the KDC must process instead of the outer one);
+    /// `None` without FAST. It holds no key.
+    /// Spec: docs/48 §2.3 (`TgtContext { …, fast_req: Option<KrbFastReq> }`),
+    /// §5.2; RFC 6113 5.4.2 ("This req-body field is preferred over the
+    /// outer field").
+    pub fast_req: Option<KrbFastReq>,
 }
 
 /// What keyd keeps about a live TGS context (never leaves keyd). The reply
-/// key is zeroized when the entry is consumed or expires.
+/// key and the armor key are zeroized when the entry is consumed or expires.
+/// Under FAST, `req_nonce` / `req_sname` are the INNER request's (docs/48
+/// §3.4).
 pub(crate) struct ContextEntry {
     crealm: Realm,
     cname: PrincipalName,
@@ -91,6 +142,32 @@ pub(crate) struct ContextEntry {
     reply_usage: u32,
     req_nonce: u32,
     req_sname: Option<PrincipalName>,
+    /// The implicit armor key of an armored request; `None` without FAST.
+    /// Spec: RFC 6113 5.4.2; docs/48 §5.2 step 6.
+    armor_key: Option<ProtocolKey>,
+}
+
+impl ContextEntry {
+    /// The conversation `seal_fast_error(Tgs)` answers, or `None` for a
+    /// context opened without FAST (it has no armor key). The KRB-ERROR's
+    /// realm is the inner request's — which `open_and_verify_tgt` verified is
+    /// `realm`, this realm — its sname the inner sname (or this realm's TGS
+    /// name when it had none, the KDC's KRB-ERROR rule), and its crealm /
+    /// cname, when present, the TGT's client, as the KDC names it in a TGS
+    /// error.
+    /// Spec: docs/48 §2.3, §5, §6.1; RFC 4120 5.9.1; RFC 6113 5.4.3 (nonce),
+    /// 5.4.4; docs/questions/Q-150.
+    pub(crate) fn into_fast_conversation(self, realm: &Realm) -> Option<ArmoredConversation> {
+        let armor_key = self.armor_key?;
+        Some(ArmoredConversation {
+            armor_key,
+            nonce: self.req_nonce,
+            realm: realm.clone(),
+            sname: self.req_sname.unwrap_or_else(|| tgs_name(realm)),
+            crealm: self.crealm,
+            cname: Some(self.cname),
+        })
+    }
 }
 
 /// The KDC's request for a service ticket. keyd copies the client name,
@@ -120,10 +197,14 @@ pub struct TgsTicketTemplate {
 }
 
 /// The sealed TGS-REP parts: the service ticket (sealed under the service
-/// key) and the enc-part (sealed under the TGT session key or the
-/// authenticator subkey).
+/// key), the enc-part (sealed under the TGT session key or the authenticator
+/// subkey — under FAST, under the reply key strengthened from the subkey)
+/// and, when armored, the enc-fast-rep. The KDC assembles the TGS-REP (and,
+/// when armored, its PA-FX-FAST padata around `fast_rep`).
 ///
-/// Spec: docs/10 §5 (`struct TgsRep`); RFC 4120 5.4.2.
+/// Spec: docs/10 §5 (`struct TgsRep`); docs/48 §2.3 (`TgsRep { …, fast_rep:
+/// Option<Sealed> } // Some ⇔ ctx armored`), §5.2; RFC 4120 5.4.2; RFC 6113
+/// 5.4.3.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TgsRepParts {
     /// `ticket [5] Ticket`.
@@ -131,6 +212,10 @@ pub struct TgsRepParts {
     /// `enc-part [6] EncryptedData` (EncTGSRepPart, key usage 8 or 9, no
     /// kvno).
     pub enc_part: EncryptedData,
+    /// `enc-fast-rep` of the KrbFastArmoredRep (the KrbFastResponse sealed
+    /// in the armor key, key usage 52): `Some` exactly when the context was
+    /// armored. Spec: RFC 6113 5.4.3; docs/48 §2.3.
+    pub fast_rep: Option<EncryptedData>,
 }
 
 /// A configured encryption type from a wire number, else `deny`.
@@ -237,20 +322,84 @@ fn open_ticket<'a>(
     Err(Deny::denied(reason))
 }
 
+/// Step 3 of `open_and_verify_tgt`, FAST part — the shape of the FAST part,
+/// before any key is used (uniform `Denied`, A-26):
+/// - no explicit armor: "This armor type is only valid for AS requests;
+///   implicit armor ... is the only supported way to establish an armor key
+///   for the TGS" (RFC 6113 5.4.1.1; 5.4.2 "the client SHOULD NOT include
+///   the armor field"; refused per docs/questions/Q-124 item 2);
+/// - `ap_req_octets` decode as an AP-REQ equal to `ap_req`, the one keyd
+///   opens — so the req-checksum covers exactly the authenticated AP-REQ.
+///
+/// Spec: RFC 6113 5.4.1.1, 5.4.2; RFC 4120 5.2.7.1; docs/48 §5.2, §5.3;
+/// docs/questions/Q-124 (A-32).
+fn check_fast_shape(fast: &TgsFastRequest<'_>, ap_req: &ApReq) -> Internal<()> {
+    if fast.armored_req.armor.is_some() {
+        return Err(Deny::denied(AuditReason::TgsExplicitArmor));
+    }
+    let decoded =
+        ApReq::decode(fast.ap_req_octets).map_err(|_| Deny::denied(AuditReason::MalformedInput))?;
+    if decoded != *ap_req {
+        return Err(Deny::denied(AuditReason::FastApReqMismatch));
+    }
+    Ok(())
+}
+
+/// Step 10 of `open_and_verify_tgt` (FAST only) — the implicit armor and the
+/// inner request:
+/// 1. armor key = KRB-FX-CF2(subkey, TGT session key, "subkeyarmor",
+///    "ticketarmor"), of the subkey's enctype (RFC 6113 5.4.2: "the same
+///    armor key that would be computed if the TGS-REQ authenticator was used
+///    in an FX_FAST_ARMOR_AP_REQUEST armor"; 5.4.1.1; 5.1);
+/// 2. the req-checksum (armor key, its required checksum type, usage 50)
+///    verifies over the AP-REQ octets — "for a TGS-REQ, it is performed over
+///    the type AP-REQ in the PA-TGS-REQ padata" (RFC 6113 5.4.2);
+/// 3. enc-fast-req decrypts under the armor key (usage 51) and decodes as
+///    KrbFastReq; the inner req-body is for this realm and carries no
+///    enc-authorization-data (as the outer body, step 3; docs/48 §5.2
+///    step 5).
+///
+/// Every failure is the uniform `Denied` (A-26: the chain is not complete).
+///
+/// Spec: RFC 6113 5.1, 5.4.1.1, 5.4.2, 6.2, 8 (the armor key "tied to the
+/// authentication of the client to the KDC" through the sub-session key);
+/// RFC 4120 5.4.1; docs/48 §5.1, §5.2.
+fn open_implicit_armor(
+    fast: &TgsFastRequest<'_>,
+    subkey: &ProtocolKey,
+    session: &ProtocolKey,
+    realm: &Realm,
+) -> Internal<(ProtocolKey, KrbFastReq)> {
+    let armor_key = ticket_armor_key(subkey, session)?;
+    let fast_req = open_armored_request(&armor_key, fast.armored_req, fast.ap_req_octets)?;
+    let inner = &fast_req.req_body;
+    if inner.realm != *realm {
+        return Err(Deny::denied(AuditReason::WrongRealm));
+    }
+    if inner.enc_authorization_data.is_some() {
+        return Err(Deny::denied(AuditReason::UnsupportedContent));
+    }
+    Ok((armor_key, fast_req))
+}
+
 impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// `open_and_verify_tgt`: open the TGT and the PA-TGS-REQ authenticator
-    /// inside keyd and return a one-time [`TgtContext`].
+    /// inside keyd — and, for an armored request, its implicit FAST armor and
+    /// KrbFastReq — and return a one-time [`TgtContext`].
     ///
     /// `ap_req` is the AP-REQ from the PA-TGS-REQ padata; `req_body` is the
-    /// raw DER of the request's KDC-REQ-BODY, over which the authenticator
-    /// checksum is verified.
+    /// raw DER of the request's (outer) KDC-REQ-BODY, over which the
+    /// authenticator checksum is verified; `fast` is the FAST part of an
+    /// armored request (`None` without PA-FX-FAST).
     ///
     /// Checks failing as the uniform `AuthnError::Denied` (reason to audit
     /// only):
     /// 1. authorize (Kdc; krbtgt handle Krbtgt);
     /// 2. no USE-SESSION-KEY ap-option (user-to-user not implemented);
     /// 3. `req_body` decodes as KDC-REQ-BODY for this realm, without
-    ///    enc-authorization-data;
+    ///    enc-authorization-data; FAST only: no explicit armor field (Q-124),
+    ///    and the AP-REQ octets decode to exactly `ap_req`
+    ///    ([`TgsFastRequest`]);
     /// 4. the ticket is this realm's TGT (realm, sname krbtgt/realm), and the
     ///    krbtgt key set is bound to krbtgt/realm (Q-040, A-19);
     /// 5. decrypt the ticket under krbtgt (kvno-selected, else current then
@@ -263,50 +412,73 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     ///    the ctime skew is RECORDED, not yet reported;
     /// 8. the checksum is present, of the session key's checksum type, and
     ///    verifies over `req_body` with usage 6 — binding the authenticator
-    ///    to this request (no cut-and-paste);
-    /// 9. a subkey, if present, is a configured enctype and a valid key.
+    ///    to this request (no cut-and-paste). Under FAST too it covers the
+    ///    OUTER body (A-17 unchanged, docs/questions/Q-124 item 1); the inner
+    ///    body is bound by the armor key instead (RFC 6113 8);
+    /// 9. a subkey is a configured enctype and a valid key; without FAST it
+    ///    is optional, with FAST it is mandatory (RFC 6113 5.4.2: "a subkey
+    ///    MUST be included in the PA-TGS-REQ authenticator");
+    /// 10. FAST only: the implicit armor key, the req-checksum over the
+    ///     AP-REQ octets (usage 50) and the KrbFastReq (usage 51), whose inner
+    ///     body is for this realm without enc-authorization-data
+    ///     ([`open_implicit_armor`]).
     ///
     /// Only now — the TGT decrypted, the authenticator decrypted, the
-    /// req-body checksum verified — are the recorded findings reported, as
-    /// non-secret classes (A-26), in RFC 4120 3.2.3 order: ctime skew →
-    /// `Skew`; starttime in the future (beyond skew) → `TicketNotYetValid`;
-    /// endtime past (beyond skew) → `TicketExpired`. A request refused for
-    /// these never enters the replay cache. Then:
-    /// 10. the replay cache accepts (server, client, ctime, cusec), else
+    /// req-body checksum verified and, under FAST, the req-checksum verified
+    /// and the KrbFastReq decrypted and decoded — are the recorded findings
+    /// reported, as non-secret classes (A-26, docs/48 §6.3), in RFC 4120
+    /// 3.2.3 order: ctime skew → `Skew`; starttime in the future (beyond
+    /// skew) → `TicketNotYetValid`; endtime past (beyond skew) →
+    /// `TicketExpired`. A request refused for these never enters the replay
+    /// cache. Then:
+    /// 11. the replay cache accepts (server, client, ctime, cusec), else
     ///     `Replay` (a full cache stays `Denied`, fail closed);
-    /// 11. store the reply key (subkey with usage 9, else session key with
-    ///     usage 8) in a new context bound to this caller.
+    /// 12. store the reply key (subkey with usage 9, else session key with
+    ///     usage 8) in a new context bound to this caller — under FAST also
+    ///     the armor key, and the INNER request's nonce and sname (docs/48
+    ///     §3.4); `TgtContext::fast_req` returns the KrbFastReq.
     ///
     /// Any cryptographic failure is `Denied` even when the ticket is also
     /// expired or the authenticator also skewed: classes are reachable only
-    /// by a holder of the TGT session key, so they are no decryption or MAC
-    /// oracle (A-26).
+    /// by a holder of the TGT session key (and, under FAST, the armor key),
+    /// so they are no decryption or MAC oracle (A-26).
     ///
     /// Spec: RFC 4120 3.2.3, 3.3.2, 5.2.7.1 ("checksum ... computed over the
     /// KDC-REQ-BODY encoding"), 5.4.1 (req-body), 5.5.1 (cksum usage 6,
-    /// authenticator usage 7), 7.3, 7.5.1; docs/10 §5, D33; A-26
-    /// (docs/questions/Q-071).
+    /// authenticator usage 7), 7.3, 7.5.1; RFC 6113 5.1, 5.4.1.1, 5.4.2, 6.2,
+    /// 8; docs/10 §5, D33; docs/48 §2.3, §5, §6.3; A-26
+    /// (docs/questions/Q-071); docs/questions/Q-124 (A-32).
     pub fn open_and_verify_tgt(
         &mut self,
         caller: &CallerId,
         krbtgt: &KeyHandle,
         ap_req: &ApReq,
         req_body: &[u8],
+        fast: Option<TgsFastRequest<'_>>,
         now: &KerberosTime,
     ) -> Result<TgtContext, AuthnError> {
         let mut fields = AuditFields::for_handle(krbtgt);
-        let result =
-            self.open_and_verify_tgt_inner(caller, krbtgt, ap_req, req_body, now, &mut fields);
+        let result = self.open_and_verify_tgt_inner(
+            caller,
+            krbtgt,
+            ap_req,
+            req_body,
+            fast,
+            now,
+            &mut fields,
+        );
         self.emit(caller, Operation::OpenAndVerifyTgt, now, &fields, &result);
         result.map_err(AuthnError::from)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn open_and_verify_tgt_inner(
         &mut self,
         caller: &CallerId,
         krbtgt: &KeyHandle,
         ap_req: &ApReq,
         req_body: &[u8],
+        fast: Option<TgsFastRequest<'_>>,
         now: &KerberosTime,
         fields: &mut AuditFields,
     ) -> Internal<TgtContext> {
@@ -328,6 +500,11 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         }
         if body.enc_authorization_data.is_some() {
             return Err(Deny::denied(AuditReason::UnsupportedContent));
+        }
+
+        // 3 (FAST part). Its shape, before any key is used.
+        if let Some(fast) = &fast {
+            check_fast_shape(fast, ap_req)?;
         }
 
         // 4-7. The TGT and the authenticator, usage 7 (shared with
@@ -358,29 +535,63 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         )
         .map_err(|_| Deny::denied(AuditReason::ChecksumMismatch))?;
 
-        // 9 / 11 (prepared before the findings and the replay insert, so that
+        // 9. The subkey: a configured enctype and a valid key (I5); optional
+        // without FAST, mandatory with it. Spec: RFC 4120 5.5.1; RFC 6113
+        // 5.4.2.
+        let subkey = authenticator
+            .subkey
+            .as_ref()
+            .map(|subkey| subkey_protocol_key(subkey, &self.config.enctypes))
+            .transpose()?;
+
+        // 10. FAST: the implicit armor key, the req-checksum over the AP-REQ
+        // octets, the KrbFastReq and its inner body.
+        let armored = match (&fast, &subkey) {
+            (None, _) => None,
+            (Some(_), None) => return Err(Deny::denied(AuditReason::ArmorSubkeyMissing)),
+            (Some(fast), Some(subkey)) => Some(open_implicit_armor(
+                fast,
+                subkey,
+                &session,
+                &self.config.realm,
+            )?),
+        };
+
+        // 12 (prepared before the findings and the replay insert, so that
         // every check that can fail precedes them). The reply key: subkey
-        // (usage 9) or session key (usage 8). Spec: RFC 4120 3.3.3, 5.4.2.
-        let (reply_key, reply_usage) = match &authenticator.subkey {
+        // (usage 9) or session key (usage 8) — under FAST always the subkey,
+        // the padata reply key that issue_tgs_rep strengthens (RFC 6113
+        // 5.4.3; docs/questions/Q-121). Spec: RFC 4120 3.3.3, 5.4.2.
+        let (reply_key, reply_usage) = match subkey {
             Some(subkey) => {
-                let key = subkey_protocol_key(subkey, &self.config.enctypes)?;
                 drop(session);
-                (key, TGS_REP_ENC_PART_SUBKEY)
+                (subkey, TGS_REP_ENC_PART_SUBKEY)
             }
             None => (session, TGS_REP_ENC_PART_SESSION_KEY),
         };
 
         // The cryptographic chain is complete: the TGT decrypted, the
-        // authenticator decrypted and its req-body checksum verified. Only now
-        // are the recorded findings reported, then the replay cache (step 10)
-        // consulted (A-26).
+        // authenticator decrypted and its req-body checksum verified, and —
+        // under FAST — the req-checksum verified and the KrbFastReq decrypted
+        // and decoded. Only now are the recorded findings reported, then the
+        // replay cache (step 11) consulted (A-26; docs/48 §6.3).
         self.complete_chain(
             findings,
             replay_key_for(&ap_req.ticket, &authenticator, ctime),
             now_s,
         )?;
 
-        // 11. The one-time context.
+        // 12. The one-time context. Under FAST the nonce and sname are the
+        // inner request's (docs/48 §3.4; RFC 6113 5.4.2 "This req-body field
+        // is preferred over the outer field").
+        let (armor_key, fast_req) = match armored {
+            Some((armor_key, fast_req)) => (Some(armor_key), Some(fast_req)),
+            None => (None, None),
+        };
+        let (req_nonce, req_sname) = match &fast_req {
+            Some(fast_req) => (fast_req.req_body.nonce, fast_req.req_body.sname.clone()),
+            None => (body.nonce, body.sname),
+        };
         let mut id = [0u8; TOKEN_ID_LENGTH];
         draw(&mut self.entropy, &mut id)?;
         let context = TgtContext {
@@ -392,6 +603,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             endtime: ticket_part.endtime,
             renew_till: ticket_part.renew_till,
             flags: ticket_part.flags,
+            fast_req,
         };
         let entry = ContextEntry {
             crealm: ticket_part.crealm.clone(),
@@ -403,8 +615,9 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             transited: ticket_part.transited.clone(),
             reply_key,
             reply_usage,
-            req_nonce: body.nonce,
-            req_sname: body.sname,
+            req_nonce,
+            req_sname,
+            armor_key,
         };
         let expires_at = now_s + i64::from(self.config.token_lifetime_secs);
         if !self.contexts.insert(id, *caller, expires_at, entry, now_s) {
@@ -570,26 +783,45 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             })
     }
 
-    /// `issue_tgs_rep`: consume `ctx` and issue a service ticket.
+    /// `issue_tgs_rep`: consume `ctx` and issue a service ticket — armored
+    /// when the context was opened with FAST.
     ///
     /// 1. authorize (Kdc; service handle Service);
-    /// 2. consume the context: live, issued to this caller (`Denied`
-    ///    otherwise; destroyed either way);
-    /// 3. the service key set's name binding must identify template.sname
-    ///    in this realm (`Denied`, Q-040 A-19 — checked with the key below);
-    ///    validate the template (`BadTemplate`): sname equals the
+    /// 2. the context: live and issued to this caller (`Denied` otherwise;
+    ///    destroyed either way). A context opened without FAST is consumed
+    ///    now, whatever follows (unchanged). An ARMORED context is consumed
+    ///    only by a successful issuance: a refusal at step 3 leaves it live so
+    ///    that the KDC can seal the armored error with
+    ///    `seal_fast_error(Tgs(ctx))` — the rule A-42 set for the AS armor
+    ///    (docs/questions/Q-145 item 3), applied to the TGS conversation
+    ///    (docs/questions/Q-150);
+    /// 3. armored: template.sname and template.nonce are the INNER request's
+    ///    stored ones (`Denied`, docs/48 §3.4, §9.2 item 7); then, for every
+    ///    context, validate the template (`BadTemplate`): sname equals the
     ///    authenticated request's sname and is not a TGS name; nonce equals
     ///    the request nonce; enctype configured; flags (mask, RFC 4120 2.1 /
     ///    5.4.1 TGT rules); times within policy, endtime and renew-till not
-    ///    beyond the TGT's (RFC 4120 3.3.3);
+    ///    beyond the TGT's (RFC 4120 3.3.3); the service key set's name
+    ///    binding must identify template.sname in this realm (`Denied`, Q-040
+    ///    A-19);
     /// 4. draw a fresh session key;
     /// 5. EncTicketPart — client name, realm, authtime, transited carried
     ///    over from the TGT — sealed under the CURRENT service key, usage 2;
-    /// 6. EncTGSRepPart sealed under the context's reply key, usage 8
-    ///    (session key) or 9 (subkey), without kvno.
+    /// 6. EncTGSRepPart, without kvno, sealed under the context's reply key,
+    ///    usage 8 (session key) or 9 (subkey) — or, armored, under the reply
+    ///    key strengthened from the subkey with a fresh strengthen key, usage
+    ///    9 ("it MUST be set in a TGS reply", RFC 6113 5.4.3; usage per
+    ///    docs/questions/Q-121 (a)), with the KrbFastResponse { padata: [],
+    ///    strengthen-key, KrbFastFinished (ticket-checksum over the ticket DER
+    ///    under the armor key, usage 53 — Q-122 (a)), the stored inner nonce }
+    ///    sealed in the armor key, usage 52, as `fast_rep`.
     ///
-    /// Spec: docs/10 §5 (issue_tgs_rep), §8; RFC 4120 3.3.3, 5.3, 5.4.2,
-    /// 7.5.1 (usages 2, 8, 9).
+    /// The session key, the strengthen key, the reply key and the armor key
+    /// never leave keyd (docs/48 §2.2, §9.1 I1).
+    ///
+    /// Spec: docs/10 §5 (issue_tgs_rep), §8; docs/48 §2.3, §3.4, §5.2; RFC
+    /// 4120 3.3.3, 5.3, 5.4.2, 7.5.1 (usages 2, 8, 9); RFC 6113 5.4.3, 6.2;
+    /// docs/questions/Q-121, Q-122 (A-32), Q-150.
     pub fn issue_tgs_rep(
         &mut self,
         caller: &CallerId,
@@ -620,64 +852,107 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         )?;
         let now_s = kerberos_time_seconds(now);
 
-        // 2. The context (I4).
-        let entry = self
+        // 2. The context (I4): an unarmored one is consumed now; an armored
+        // one only after every check of step 3 passed (docs/questions/Q-150).
+        let armored = self
             .contexts
-            .take(ctx.as_bytes(), caller, now_s)
-            .map_err(token_deny)?;
+            .peek_mut(ctx.as_bytes(), caller, now_s)
+            .map_err(token_deny)?
+            .armor_key
+            .is_some();
+        let consumed = if armored {
+            None
+        } else {
+            Some(
+                self.contexts
+                    .take(ctx.as_bytes(), caller, now_s)
+                    .map_err(token_deny)?,
+            )
+        };
 
-        // 3. The template.
-        if is_tgs_name(&template.sname) || entry.req_sname.as_ref() != Some(&template.sname) {
-            return Err(Deny::bad_template(AuditReason::TemplateNames));
-        }
-        if template.nonce != entry.req_nonce {
-            return Err(Deny::bad_template(AuditReason::TemplateNonce));
-        }
-        if !self.config.supports(template.session_enctype) {
-            return Err(Deny::bad_template(AuditReason::TemplateEncType));
-        }
-        let policy = &self.config.ticket_policy;
-        let flags = tgs_ticket_flags(policy, template.flags, entry.flags)?;
-        let renewable = template.flags.contains(TicketFlags::RENEWABLE);
-        check_times(
-            policy,
-            self.config.clock_skew_secs,
-            now_s,
-            &entry.authtime,
-            &TemplateTimes {
-                starttime: template.starttime.as_ref(),
-                endtime: &template.endtime,
-                renew_till: template.renew_till.as_ref(),
-                renewable,
-            },
-        )?;
-        if kerberos_time_seconds(&template.endtime) > kerberos_time_seconds(&entry.endtime) {
-            return Err(Deny::bad_template(AuditReason::TemplateTimes));
-        }
-        if let Some(renew_till) = &template.renew_till {
-            let within_tgt = entry
-                .renew_till
-                .as_ref()
-                .is_some_and(|tgt| kerberos_time_seconds(renew_till) <= kerberos_time_seconds(tgt));
-            if !within_tgt {
+        // 3. The checks that may refuse, on the consumed (unarmored) or the
+        // still-live (armored) entry.
+        let (flags, version, service_key) = {
+            let entry: &ContextEntry = match &consumed {
+                Some(entry) => entry,
+                None => self
+                    .contexts
+                    .peek_mut(ctx.as_bytes(), caller, now_s)
+                    .map_err(token_deny)?,
+            };
+
+            // Armored: the template answers the inner request (docs/48 §3.4;
+            // RFC 6113 5.4.2 inner req-body preferred, 5.4.3 nonce).
+            if entry.armor_key.is_some()
+                && (entry.req_sname.as_ref() != Some(&template.sname)
+                    || template.nonce != entry.req_nonce)
+            {
+                return Err(Deny::denied(AuditReason::FastBindingMismatch));
+            }
+
+            // The template.
+            if is_tgs_name(&template.sname) || entry.req_sname.as_ref() != Some(&template.sname) {
+                return Err(Deny::bad_template(AuditReason::TemplateNames));
+            }
+            if template.nonce != entry.req_nonce {
+                return Err(Deny::bad_template(AuditReason::TemplateNonce));
+            }
+            if !self.config.supports(template.session_enctype) {
+                return Err(Deny::bad_template(AuditReason::TemplateEncType));
+            }
+            let policy = &self.config.ticket_policy;
+            let flags = tgs_ticket_flags(policy, template.flags, entry.flags)?;
+            let renewable = template.flags.contains(TicketFlags::RENEWABLE);
+            check_times(
+                policy,
+                self.config.clock_skew_secs,
+                now_s,
+                &entry.authtime,
+                &TemplateTimes {
+                    starttime: template.starttime.as_ref(),
+                    endtime: &template.endtime,
+                    renew_till: template.renew_till.as_ref(),
+                    renewable,
+                },
+            )?;
+            if kerberos_time_seconds(&template.endtime) > kerberos_time_seconds(&entry.endtime) {
                 return Err(Deny::bad_template(AuditReason::TemplateTimes));
             }
-        }
+            if let Some(renew_till) = &template.renew_till {
+                let within_tgt = entry.renew_till.as_ref().is_some_and(|tgt| {
+                    kerberos_time_seconds(renew_till) <= kerberos_time_seconds(tgt)
+                });
+                if !within_tgt {
+                    return Err(Deny::bad_template(AuditReason::TemplateTimes));
+                }
+            }
 
-        // The service key (current version).
-        let service_set = self
-            .store
-            .get(service)
-            .ok_or(Deny::denied(AuditReason::KeyNotFound))?;
-        let version = service_set.current();
-        fields.kvno = Some(version.kvno());
-        // Name binding (Q-040, A-19): the ticket for sname may only be sealed
-        // under the key bound to sname in this realm — otherwise service X
-        // could receive tickets naming service S.
-        check_binding(service_set.binding(), &self.config.realm, &template.sname)?;
-        let service_key = version
-            .preferred()
-            .ok_or(Deny::denied(AuditReason::KeyNotFound))?;
+            // The service key (current version).
+            let service_set = self
+                .store
+                .get(service)
+                .ok_or(Deny::denied(AuditReason::KeyNotFound))?;
+            let version = service_set.current();
+            fields.kvno = Some(version.kvno());
+            // Name binding (Q-040, A-19): the ticket for sname may only be
+            // sealed under the key bound to sname in this realm — otherwise
+            // service X could receive tickets naming service S.
+            check_binding(service_set.binding(), &self.config.realm, &template.sname)?;
+            let service_key = version
+                .preferred()
+                .ok_or(Deny::denied(AuditReason::KeyNotFound))?;
+            (flags, version, service_key)
+        };
+
+        // Every check passed: an armored context is consumed now — exactly
+        // once (docs/48 §2.3, §9.1 I4); its keys are zeroized with the entry.
+        let entry = match consumed {
+            Some(entry) => entry,
+            None => self
+                .contexts
+                .take(ctx.as_bytes(), caller, now_s)
+                .map_err(token_deny)?,
+        };
 
         // 4. The session key.
         let session = new_random_key(&mut self.entropy, template.session_enctype)?;
@@ -725,7 +1000,8 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             },
         };
 
-        // 6. EncTGSRepPart under the reply key (usage 8 or 9), no kvno.
+        // 6. EncTGSRepPart under the reply key (usage 8 or 9) — strengthened
+        // when armored — no kvno.
         let rep_part = EncTgsRepPart(EncKdcRepPart {
             key: session_key,
             last_req: LastReq::default(),
@@ -744,12 +1020,44 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             .encode()
             .map_err(|_| Deny::unavailable(AuditReason::InternalFailure))?;
         drop(rep_part);
-        let rep_cipher = seal(
-            &mut self.entropy,
-            &entry.reply_key,
-            entry.reply_usage,
-            &rep_plain,
-        )?;
+        let (rep_cipher, fast_rep) = match &entry.armor_key {
+            None => (
+                seal(
+                    &mut self.entropy,
+                    &entry.reply_key,
+                    entry.reply_usage,
+                    &rep_plain,
+                )?,
+                None,
+            ),
+            Some(armor_key) => {
+                // RFC 6113 5.4.3: the strengthen key "MUST be set in a TGS
+                // reply"; the padata reply key is the subkey (mandatory under
+                // FAST), usage 9 (Q-121 (a)). KrbFastFinished names the
+                // issued ticket's client — the TGT's (RFC 4120 3.3.3).
+                let (strengthen, cipher) = seal_strengthened(
+                    &mut self.entropy,
+                    &entry.reply_key,
+                    entry.reply_usage,
+                    &rep_plain,
+                )?;
+                let fast_rep = seal_fast_reply(
+                    &mut self.entropy,
+                    armor_key,
+                    Vec::new(),
+                    strengthen,
+                    &ticket,
+                    &entry.crealm,
+                    &entry.cname,
+                    entry.req_nonce,
+                    now,
+                )?;
+                (cipher, Some(fast_rep))
+            }
+        };
+        drop(rep_plain);
+        // The reply key, strengthened or not, has the reply key's enctype
+        // (RFC 6113 5.4.3 "same etype"; 5.1 "the enctype of k1").
         Ok(TgsRepParts {
             ticket,
             enc_part: EncryptedData {
@@ -757,6 +1065,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
                 kvno: None,
                 cipher: rep_cipher,
             },
+            fast_rep,
         })
     }
 }

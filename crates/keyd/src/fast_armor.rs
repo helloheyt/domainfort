@@ -1,7 +1,9 @@
 //! The FAST armor core inside keyd: `open_fast_armor` (an armored AS
 //! request's FX_FAST_ARMOR_AP_REQUEST armor and KrbFastReq) and
-//! `seal_fast_error` (the armored KRB-ERROR of that conversation). Role `Kdc`
-//! only.
+//! `seal_fast_error` (the armored KRB-ERROR of an AS or a TGS conversation),
+//! plus the helpers the armored TGS exchange shares with them (the armor key,
+//! opening a KrbFastArmoredReq, the strengthened reply and the sealed
+//! KrbFastResponse). Role `Kdc` only.
 //!
 //! "Compute, don't give" for FAST (docs/48 §2, decision A-33): every
 //! armor-key computation happens here. The armor key is derived, used and
@@ -24,13 +26,23 @@
 //! `verify_preauth` or `issue_as_rep` leaves the armor live, so that the KDC
 //! can seal the armored refusal (docs/48 §4.1 A10, A13).
 //!
+//! The TGS conversation (docs/48 §5, task T3) has no armor token of its own:
+//! its implicit armor key lives in the TGS context that the armored
+//! `open_and_verify_tgt` opens (crate::tgs_exchange), and that context id is
+//! what `seal_fast_error(Tgs)` consumes:
+//! ```text
+//! open_and_verify_tgt(fast) ─(ctx, armored)─► issue_tgs_rep(ctx) | seal_fast_error(Tgs(ctx))
+//! ```
+//!
 //! The armored AS reply (docs/48 §4.3, §4.4) is built here too
 //! (`ArmorEntry::seal_as_reply`): a fresh strengthen key, the reply key
 //! KRB-FX-CF2(strengthen key, client key, "strengthenkey", "replykey"), the
 //! KDC's PA-ENCRYPTED-CHALLENGE, KrbFastFinished with the ticket-checksum,
-//! and the KrbFastResponse sealed in the armor key. No FAST key — armor,
-//! challenge, strengthen, reply — leaves keyd; the strengthen key leaves only
-//! inside the sealed `fast_rep`.
+//! and the KrbFastResponse sealed in the armor key — the strengthening and
+//! the finished response are the helpers [`seal_strengthened`] and
+//! [`seal_fast_reply`], which the armored TGS reply uses too. No FAST key —
+//! armor, challenge, strengthen, reply — leaves keyd; the strengthen key
+//! leaves only inside the sealed `fast_rep`.
 //!
 //! **Computer-account-only armor (D126) is not checked here:** keyd holds no
 //! account kind. keyd verifies the armor TGT cryptographically and returns
@@ -38,14 +50,13 @@
 //! refuses a non-computer, disabled or revoked armor principal (docs/48
 //! §3.1, task T5).
 //!
-//! Not here (docs/48 §12 and later tasks): the TGS (implicit armor) variant
-//! and `seal_fast_error(Tgs)` (T3); anonymous armor; any armor type other
-//! than FX_FAST_ARMOR_AP_REQUEST; any FAST factor other than encrypted
-//! challenge.
+//! Not here (docs/48 §12): anonymous armor; an explicit armor in a TGS
+//! request (refused, Q-124); any armor type other than
+//! FX_FAST_ARMOR_AP_REQUEST; any FAST factor other than encrypted challenge.
 //!
 //! Spec: RFC 6113 5.1, 5.4, 5.4.1, 5.4.1.1, 5.4.2, 5.4.3, 5.4.4, 5.4.6, 6.2;
 //! RFC 4120 3.2.3, 5.2.7.2, 5.4.2, 5.5.1, 5.9.1, 7.5.1; RFC 3961 §3; docs/48
-//! §2.3, §3, §4, §6, §9; docs/questions/Q-120..Q-123 (A-32); A-26.
+//! §2.3, §3, §4, §5, §6, §9; docs/questions/Q-120..Q-124 (A-32), Q-150; A-26.
 
 use crate::as_exchange::token_deny;
 use crate::audit::{AuditReason, AuditSink};
@@ -58,7 +69,7 @@ use crate::store::KeyStore;
 use crate::template::tgs_name;
 use crate::tgs_exchange::{check_ap_options, replay_key_for, subkey_protocol_key, OpenedTgt};
 use crate::time::kerberos_time_seconds;
-use crate::tokens::{ArmorId, TOKEN_ID_LENGTH};
+use crate::tokens::{ArmorId, CtxId, TOKEN_ID_LENGTH};
 use crate::usage::{
     AP_REQ_AUTHENTICATOR, AS_REP_ENC_PART, KEY_USAGE_ENC_CHALLENGE_KDC, KEY_USAGE_FAST_ENC,
     KEY_USAGE_FAST_FINISHED, KEY_USAGE_FAST_REP, KEY_USAGE_FAST_REQ_CHKSUM,
@@ -131,15 +142,42 @@ pub struct FastArmor {
     pub fast_req: KrbFastReq,
 }
 
-/// Which armored conversation `seal_fast_error` answers. Phase 1 has the AS
-/// conversation only; the TGS variant (implicit armor, `Tgs(CtxId)`) is
-/// docs/48 task T3.
+/// Which armored conversation `seal_fast_error` answers.
 ///
-/// Spec: docs/48 §2.3 (`enum FastConversation`).
+/// Spec: docs/48 §2.3 (`enum FastConversation { As(ArmorId), Tgs(CtxId) }`),
+/// §5, §6.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FastConversation {
     /// The AS conversation opened by `open_fast_armor`.
     As(ArmorId),
+    /// The TGS conversation opened by an armored `open_and_verify_tgt`
+    /// (implicit armor, RFC 6113 5.4.2); a context opened without FAST has
+    /// no armor key and is refused.
+    Tgs(CtxId),
+}
+
+/// An armored conversation as `seal_fast_error` sees it, built from the
+/// consumed token of either conversation: the armor key, the nonce of the
+/// inner request, and the names a KRB-ERROR answering that request must
+/// carry. Never leaves keyd; the armor key is zeroized when it is dropped.
+///
+/// Spec: docs/48 §2.3, §6.1; RFC 6113 5.4.3 (nonce "from the client
+/// request"), 5.4.4; RFC 4120 5.9.1 (realm / sname: the service; crealm /
+/// cname: the client).
+pub(crate) struct ArmoredConversation {
+    /// The conversation's armor key.
+    pub(crate) armor_key: ProtocolKey,
+    /// The nonce of the stored inner request.
+    pub(crate) nonce: u32,
+    /// The KRB-ERROR's realm must be this one.
+    pub(crate) realm: Realm,
+    /// The KRB-ERROR's sname must be this one.
+    pub(crate) sname: PrincipalName,
+    /// The KRB-ERROR's crealm, when present, must be this one.
+    pub(crate) crealm: Realm,
+    /// The KRB-ERROR's cname, when present, must be this one (`None`: no
+    /// cname is acceptable).
+    pub(crate) cname: Option<PrincipalName>,
 }
 
 /// What keyd keeps about an opened armor (never leaves keyd). The armor key
@@ -173,6 +211,179 @@ pub(crate) struct ArmorEntry {
 /// Spec: docs/10 §9 (`Unavailable`).
 fn internal<T>(_: T) -> Deny {
     Deny::unavailable(AuditReason::InternalFailure)
+}
+
+/// armor_key = KRB-FX-CF2(subkey, ticket_session_key, "subkeyarmor",
+/// "ticketarmor"), of the subkey's enctype (k1). This is the
+/// FX_FAST_ARMOR_AP_REQUEST armor key of an AS request and also the implicit
+/// armor key of a TGS request, which RFC 6113 5.4.2 defines as "the same
+/// armor key that would be computed if the TGS-REQ authenticator was used in
+/// an FX_FAST_ARMOR_AP_REQUEST armor".
+/// Spec: RFC 6113 5.1, 5.4.1.1, 5.4.2.
+pub(crate) fn ticket_armor_key(
+    subkey: &ProtocolKey,
+    ticket_session_key: &ProtocolKey,
+) -> Internal<ProtocolKey> {
+    krb_crypto::krb_fx_cf2(
+        subkey,
+        ticket_session_key,
+        SUBKEY_ARMOR_PEPPER,
+        TICKET_ARMOR_PEPPER,
+    )
+    .map_err(internal)
+}
+
+/// Open a KrbFastArmoredReq under its armor key — shared by
+/// `open_fast_armor` (AS) and the armored `open_and_verify_tgt` (TGS):
+/// 1. the req-checksum is of "the required checksum type for the enctype of
+///    the armor key" and verifies, keyed with the armor key and key usage 50,
+///    over `checksummed` — "the type KDC-REQ-BODY for the req-body field" of
+///    an AS-REQ, "the type AP-REQ in the PA-TGS-REQ padata" of a TGS-REQ;
+/// 2. enc-fast-req is of the armor key's enctype, decrypts with key usage 51
+///    and decodes as KrbFastReq (the plaintext buffer is zeroized).
+///
+/// Every failure is the uniform `Denied` (A-26: it precedes the end of the
+/// caller's chain).
+///
+/// Spec: RFC 6113 5.4.2 (req-checksum, enc-fast-req), 6.2; RFC 3961 §3
+/// (required checksum mechanism).
+pub(crate) fn open_armored_request(
+    armor_key: &ProtocolKey,
+    armored_req: &KrbFastArmoredReq,
+    checksummed: &[u8],
+) -> Internal<KrbFastReq> {
+    // 1. The req-checksum (usage 50).
+    let req_checksum = &armored_req.req_checksum;
+    let cksumtype = ChecksumType::from_number(req_checksum.cksumtype)
+        .ok()
+        .filter(|t| *t == armor_key.enc_type().checksum_type())
+        .ok_or(Deny::denied(AuditReason::ChecksumUnsupported))?;
+    krb_crypto::verify_mic(
+        armor_key,
+        cksumtype,
+        key_usage(KEY_USAGE_FAST_REQ_CHKSUM)?,
+        checksummed,
+        &req_checksum.checksum,
+    )
+    .map_err(|_| Deny::denied(AuditReason::FastChecksumMismatch))?;
+
+    // 2. enc-fast-req (usage 51).
+    let enc_fast_req = &armored_req.enc_fast_req;
+    if enc_fast_req.etype != armor_key.enc_type().number() {
+        return Err(Deny::denied(AuditReason::UnsupportedEncType));
+    }
+    let fast_req_plain: Zeroizing<Vec<u8>> =
+        open(armor_key, KEY_USAGE_FAST_ENC, &enc_fast_req.cipher)?;
+    KrbFastReq::decode(&fast_req_plain).map_err(|_| Deny::denied(AuditReason::MalformedInput))
+}
+
+/// The strengthened reply key and the enc-part sealed in it (docs/48 §4.3,
+/// §5.2):
+/// 1. strengthen key: random, of the padata reply key's enctype — "the same
+///    etype as that of the reply key before being strengthened";
+/// 2. reply key = KRB-FX-CF2(strengthen key, padata reply key,
+///    "strengthenkey", "replykey"), of that enctype too (the enctype of k1);
+/// 3. `rep_plain` sealed in the reply key with `usage` — 3 for EncASRepPart,
+///    9 for EncTGSRepPart (docs/questions/Q-121 (a)).
+///
+/// Returns the strengthen key — it leaves keyd only inside the sealed
+/// KrbFastResponse ([`seal_fast_reply`]) — and the cipher. The reply key is
+/// zeroized on return.
+///
+/// Spec: RFC 6113 5.1, 5.4.3; RFC 3961 §3 (random-to-key); RFC 4120 5.4.2
+/// (usages 3, 9); docs/questions/Q-121 (A-32).
+pub(crate) fn seal_strengthened<E: EntropySource>(
+    entropy: &mut E,
+    padata_reply_key: &ProtocolKey,
+    usage: u32,
+    rep_plain: &[u8],
+) -> Internal<(ProtocolKey, Vec<u8>)> {
+    let strengthen = new_random_key(entropy, padata_reply_key.enc_type())?;
+    let reply_key = krb_crypto::krb_fx_cf2(
+        &strengthen,
+        padata_reply_key,
+        STRENGTHEN_KEY_PEPPER,
+        REPLY_KEY_PEPPER,
+    )
+    .map_err(internal)?;
+    let cipher = seal(entropy, &reply_key, usage, rep_plain)?;
+    drop(reply_key);
+    Ok((strengthen, cipher))
+}
+
+/// KrbFastFinished and the KrbFastResponse of a reply that returns a ticket,
+/// sealed in the armor key (docs/48 §4.4, §5.2):
+/// - KrbFastFinished: timestamp = `now`, usec = 0 (keyd reads no clock;
+///   docs/48 §4.4), crealm / cname of the issued ticket's client ("identify
+///   the authenticated client"), ticket-checksum = get_mic(armor key, its
+///   required checksum type, usage 53, the DER of `ticket` — the full
+///   `[APPLICATION 1]` Ticket as it stands in the KDC-REP,
+///   docs/questions/Q-122 (a));
+/// - KrbFastResponse { `padata`, strengthen-key, finished, `nonce` } sealed
+///   in the armor key, usage 52, without kvno.
+///
+/// The strengthen key's copy lives in a zeroizing KeyValue and the encoding
+/// in a Zeroizing buffer; the strengthen key itself is dropped (zeroized)
+/// here.
+///
+/// Spec: RFC 6113 5.4.3 (strengthen-key, finished "present in an AS-REP or
+/// a TGS-REP when a ticket is returned", nonce, KEY_USAGE_FAST_REP /
+/// FINISHED), 6.2; RFC 4120 5.6.1 (timestamp / usec semantics); RFC 3961 §3
+/// (required checksum mechanism); docs/questions/Q-122 (A-32).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn seal_fast_reply<E: EntropySource>(
+    entropy: &mut E,
+    armor_key: &ProtocolKey,
+    padata: Vec<PaData>,
+    strengthen: ProtocolKey,
+    ticket: &Ticket,
+    crealm: &Realm,
+    cname: &PrincipalName,
+    nonce: u32,
+    now: &KerberosTime,
+) -> Internal<EncryptedData> {
+    let armor_enctype = armor_key.enc_type();
+
+    // KrbFastFinished over the issued ticket's DER (usage 53).
+    let ticket_octets = ticket.encode().map_err(internal)?;
+    let cksumtype = armor_enctype.checksum_type();
+    let ticket_checksum = krb_crypto::get_mic(
+        armor_key,
+        cksumtype,
+        key_usage(KEY_USAGE_FAST_FINISHED)?,
+        &ticket_octets,
+    )
+    .map_err(internal)?;
+    let finished = KrbFastFinished {
+        timestamp: *now,
+        usec: Microseconds::default(),
+        crealm: crealm.clone(),
+        cname: cname.clone(),
+        ticket_checksum: Checksum {
+            cksumtype: cksumtype.number(),
+            checksum: ticket_checksum,
+        },
+    };
+
+    // The KrbFastResponse under the armor key (usage 52).
+    let response = KrbFastResponse {
+        padata,
+        strengthen_key: Some(EncryptionKey {
+            keytype: strengthen.enc_type().number(),
+            keyvalue: KeyValue::from_slice(strengthen.octets()),
+        }),
+        finished: Some(finished),
+        nonce,
+    };
+    drop(strengthen);
+    let plain: Zeroizing<Vec<u8>> = response.encode().map_err(internal)?;
+    drop(response);
+    let cipher = seal(entropy, armor_key, KEY_USAGE_FAST_REP, &plain)?;
+    Ok(EncryptedData {
+        etype: armor_enctype.number(),
+        kvno: None,
+        cipher,
+    })
 }
 
 /// The armored parts of an AS reply, sealed by [`ArmorEntry::seal_as_reply`].
@@ -271,7 +482,8 @@ impl ArmorEntry {
     ///    Key facility";
     /// 3. `rep_plain` (the EncASRepPart encoding) sealed in the reply key with
     ///    key usage 3 (docs/questions/Q-121 (a); RFC 4120 5.4.2: usage 3 with
-    ///    "another key selected via pre-authentication mechanisms");
+    ///    "another key selected via pre-authentication mechanisms") — steps
+    ///    1-3 are [`seal_strengthened`];
     /// 4. the KDC's PA-ENCRYPTED-CHALLENGE: PA-ENC-TS-ENC { patimestamp =
     ///    `now`, no pausec } in KRB-FX-CF2(armor_key, client key,
     ///    "kdcchallengearmor", "challengelongterm"), usage 55 (Q-123 item 3);
@@ -282,7 +494,8 @@ impl ArmorEntry {
     ///    KDC-REP, docs/questions/Q-122 (a));
     /// 6. KrbFastResponse { padata: [the KDC's PA-ENCRYPTED-CHALLENGE],
     ///    strengthen-key, finished, nonce of the stored inner request }
-    ///    sealed in the armor key, usage 52, without kvno.
+    ///    sealed in the armor key, usage 52, without kvno — steps 5-6 are
+    ///    [`seal_fast_reply`].
     ///
     /// Every intermediate key is zeroized on drop; the strengthen key leaves
     /// keyd only inside the sealed KrbFastResponse.
@@ -305,16 +518,8 @@ impl ArmorEntry {
         let armor_enctype = self.armor_key.enc_type();
 
         // 1-3. The strengthened reply key and the enc-part under it.
-        let strengthen = new_random_key(entropy, client_key.enc_type())?;
-        let reply_key = krb_crypto::krb_fx_cf2(
-            &strengthen,
-            client_key,
-            STRENGTHEN_KEY_PEPPER,
-            REPLY_KEY_PEPPER,
-        )
-        .map_err(internal)?;
-        let enc_part_cipher = seal(entropy, &reply_key, AS_REP_ENC_PART, rep_plain)?;
-        drop(reply_key);
+        let (strengthen, enc_part_cipher) =
+            seal_strengthened(entropy, client_key, AS_REP_ENC_PART, rep_plain)?;
 
         // 4. The KDC's encrypted challenge.
         let kdc_challenge_key = krb_crypto::krb_fx_cf2(
@@ -346,51 +551,39 @@ impl ArmorEntry {
             padata_value: challenge.encode().map_err(internal)?,
         };
 
-        // 5. KrbFastFinished over the issued ticket's DER.
-        let ticket_octets = ticket.encode().map_err(internal)?;
-        let cksumtype = armor_enctype.checksum_type();
-        let ticket_checksum = krb_crypto::get_mic(
+        // 5-6. KrbFastFinished and the KrbFastResponse under the armor key.
+        let fast_rep = seal_fast_reply(
+            entropy,
             &self.armor_key,
-            cksumtype,
-            key_usage(KEY_USAGE_FAST_FINISHED)?,
-            &ticket_octets,
-        )
-        .map_err(internal)?;
-        let finished = KrbFastFinished {
-            timestamp: *now,
-            usec: Microseconds::default(),
-            crealm: crealm.clone(),
-            cname: cname.clone(),
-            ticket_checksum: Checksum {
-                cksumtype: cksumtype.number(),
-                checksum: ticket_checksum,
-            },
-        };
-
-        // 6. The KrbFastResponse under the armor key (usage 52). The
-        // strengthen key's copy lives in a zeroizing KeyValue and the
-        // encoding in a Zeroizing buffer.
-        let response = KrbFastResponse {
-            padata: vec![challenge_padata],
-            strengthen_key: Some(EncryptionKey {
-                keytype: strengthen.enc_type().number(),
-                keyvalue: KeyValue::from_slice(strengthen.octets()),
-            }),
-            finished: Some(finished),
-            nonce: self.req_nonce,
-        };
-        drop(strengthen);
-        let plain: Zeroizing<Vec<u8>> = response.encode().map_err(internal)?;
-        drop(response);
-        let cipher = seal(entropy, &self.armor_key, KEY_USAGE_FAST_REP, &plain)?;
+            vec![challenge_padata],
+            strengthen,
+            ticket,
+            crealm,
+            cname,
+            self.req_nonce,
+            now,
+        )?;
         Ok(ArmoredAsReply {
             enc_part_cipher,
-            fast_rep: EncryptedData {
-                etype: armor_enctype.number(),
-                kvno: None,
-                cipher,
-            },
+            fast_rep,
         })
+    }
+
+    /// The conversation `seal_fast_error(As)` answers: the armor key, the
+    /// stored inner nonce, and the inner request's names — realm, sname (or
+    /// this realm's TGS name when it had none, the KDC's KRB-ERROR rule),
+    /// crealm = the inner realm, cname = the inner cname.
+    /// Spec: docs/48 §2.3, §6.1, §8 (names of the inner request); RFC 4120
+    /// 5.4.1 (realm: in the AS exchange also the client's realm), 5.9.1.
+    pub(crate) fn into_conversation(self, realm: &Realm) -> ArmoredConversation {
+        ArmoredConversation {
+            armor_key: self.armor_key,
+            nonce: self.req_nonce,
+            realm: self.req_realm.clone(),
+            sname: self.req_sname.unwrap_or_else(|| tgs_name(realm)),
+            crealm: self.req_realm,
+            cname: self.req_cname,
+        }
     }
 }
 
@@ -516,39 +709,13 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
 
         // 6. The armor key; its enctype is the subkey's (k1). Spec: RFC 6113
         // 5.1, 5.4.1.1.
-        let armor_key =
-            krb_crypto::krb_fx_cf2(&subkey, &session, SUBKEY_ARMOR_PEPPER, TICKET_ARMOR_PEPPER)
-                .map_err(|_| Deny::unavailable(AuditReason::InternalFailure))?;
+        let armor_key = ticket_armor_key(&subkey, &session)?;
         drop(subkey);
         drop(session);
 
-        // 7. The req-checksum over the outer KDC-REQ-BODY: keyed with the
-        // armor key, "the required checksum type for the enctype of the armor
-        // key", usage 50. Spec: RFC 6113 5.4.2; RFC 3961 §3.
-        let req_checksum = &armored_req.req_checksum;
-        let cksumtype = ChecksumType::from_number(req_checksum.cksumtype)
-            .ok()
-            .filter(|t| *t == armor_key.enc_type().checksum_type())
-            .ok_or(Deny::denied(AuditReason::ChecksumUnsupported))?;
-        krb_crypto::verify_mic(
-            &armor_key,
-            cksumtype,
-            key_usage(KEY_USAGE_FAST_REQ_CHKSUM)?,
-            outer_req_body,
-            &req_checksum.checksum,
-        )
-        .map_err(|_| Deny::denied(AuditReason::FastChecksumMismatch))?;
-
-        // 8. enc-fast-req under the armor key, usage 51. Spec: RFC 6113 5.4.2.
-        let enc_fast_req = &armored_req.enc_fast_req;
-        if enc_fast_req.etype != armor_key.enc_type().number() {
-            return Err(Deny::denied(AuditReason::UnsupportedEncType));
-        }
-        let fast_req_plain: Zeroizing<Vec<u8>> =
-            open(&armor_key, KEY_USAGE_FAST_ENC, &enc_fast_req.cipher)?;
-        let fast_req = KrbFastReq::decode(&fast_req_plain)
-            .map_err(|_| Deny::denied(AuditReason::MalformedInput))?;
-        drop(fast_req_plain);
+        // 7-8. The req-checksum over the outer KDC-REQ-BODY (usage 50), then
+        // enc-fast-req (usage 51). Spec: RFC 6113 5.4.2; RFC 3961 §3.
+        let fast_req = open_armored_request(&armor_key, armored_req, outer_req_body)?;
 
         // The chain is complete: armor TGT, authenticator, subkey, armor key,
         // req-checksum, enc-fast-req. Findings, then the replay cache
@@ -586,7 +753,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         })
     }
 
-    /// `seal_fast_error`: consume the conversation's armor and seal the
+    /// `seal_fast_error`: consume the conversation's token and seal the
     /// enc-fast-rep of an armored KRB-ERROR — a KrbFastResponse carrying the
     /// allowed `padata` plus PA-FX-ERROR (the DER of `error`), no
     /// strengthen-key, no finished, and the nonce of the inner request keyd
@@ -595,21 +762,27 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     ///
     /// It answers any refusal after the armor was opened — including a
     /// refused armored `verify_preauth` or `issue_as_rep`, which leave the
-    /// armor live for this purpose (docs/48 §4.1 A10, A13).
+    /// armor live for this purpose (docs/48 §4.1 A10, A13), and a refused
+    /// armored `issue_tgs_rep`, which leaves its context live likewise
+    /// (docs/questions/Q-150).
     ///
     /// The KDC frames the result (KRB-ERROR e-data = METHOD-DATA with
     /// PA-FX-FAST, RFC 6113 5.4.4). keyd checks the content so that a
     /// compromised KDC can only ever have an error sealed — never a reply
     /// that reads as success (docs/48 §6.1):
-    /// 1. authorize (Kdc; no handle — the armor token is the authority);
-    /// 2. consume the armor: live, issued to this caller (`Denied`
-    ///    otherwise; destroyed either way);
+    /// 1. authorize (Kdc; no handle — the conversation token is the
+    ///    authority);
+    /// 2. consume the token: live, issued to this caller (`Denied`
+    ///    otherwise; destroyed either way) — `As`: the armor id; `Tgs`: the
+    ///    context id, which must name an ARMORED context (a context opened
+    ///    without FAST has no armor key: `Denied`, consumed too);
     /// 3. `error`: no e-data ("MUST be absent in the PA-FX-ERROR"), no
     ///    e-text (docs/48 §2.3), an error code other than KDC_ERR_NONE,
     ///    stime = `now`, realm = the inner request's realm, sname = the inner
     ///    request's sname (or this realm's TGS name when it had none — the
-    ///    KDC's KRB-ERROR rule), crealm / cname, when present, those of the
-    ///    inner request;
+    ///    KDC's KRB-ERROR rule), crealm / cname, when present, the client's —
+    ///    `As`: the inner request's; `Tgs`: the TGT's (the KDC's TGS errors
+    ///    name the TGT's client once it is known);
     /// 4. `padata`: only PA-ETYPE-INFO2 (decoding, configured enctypes
     ///    only), PA-FX-COOKIE (1 to [`MAX_FX_COOKIE_LENGTH`] octets) and
     ///    PA-ENCRYPTED-CHALLENGE (empty value: an advertisement), each at
@@ -621,7 +794,8 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     ///
     /// Spec: RFC 6113 5.4.3 (strengthen-key "MUST be absent in KRB-ERROR";
     /// finished "absent otherwise"; nonce; usage 52), 5.4.4; RFC 4120 5.9.1,
-    /// 7.5.9 (KDC_ERR_NONE); docs/48 §2.3, §6.1; docs/questions/Q-125.
+    /// 7.5.9 (KDC_ERR_NONE); docs/48 §2.3, §5, §6.1; docs/questions/Q-125,
+    /// Q-150.
     pub fn seal_fast_error(
         &mut self,
         caller: &CallerId,
@@ -647,16 +821,24 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         authorize(caller, Operation::SealFastError, &[])?;
         let now_s = kerberos_time_seconds(now);
 
-        // 2. The armor (I4).
-        let entry = match conversation {
+        // 2. The conversation's token (I4), consumed either way.
+        let realm = &self.config.realm;
+        let conversation = match conversation {
             FastConversation::As(armor_id) => self
                 .armors
                 .take(armor_id.as_bytes(), caller, now_s)
-                .map_err(token_deny)?,
+                .map_err(token_deny)?
+                .into_conversation(realm),
+            FastConversation::Tgs(ctx_id) => self
+                .contexts
+                .take(ctx_id.as_bytes(), caller, now_s)
+                .map_err(token_deny)?
+                .into_fast_conversation(realm)
+                .ok_or(Deny::denied(AuditReason::ArmorConversationMismatch))?,
         };
 
         // 3. The error content.
-        check_fast_error(error, &entry, &self.config.realm, now)?;
+        check_fast_error(error, &conversation, now)?;
 
         // 4. The padata, then PA-FX-ERROR.
         let mut response_padata = allowed_fast_error_padata(padata, &self.config.enctypes)?;
@@ -674,20 +856,16 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             padata: response_padata,
             strengthen_key: None,
             finished: None,
-            nonce: entry.req_nonce,
+            nonce: conversation.nonce,
         };
         let plain: Zeroizing<Vec<u8>> = response
             .encode()
             .map_err(|_| Deny::unavailable(AuditReason::InternalFailure))?;
         drop(response);
-        let cipher = seal(
-            &mut self.entropy,
-            &entry.armor_key,
-            KEY_USAGE_FAST_REP,
-            &plain,
-        )?;
+        let armor_key = &conversation.armor_key;
+        let cipher = seal(&mut self.entropy, armor_key, KEY_USAGE_FAST_REP, &plain)?;
         Ok(EncryptedData {
-            etype: entry.armor_key.enc_type().number(),
+            etype: armor_key.enc_type().number(),
             kvno: None,
             cipher,
         })
@@ -695,7 +873,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
 }
 
 /// The KRB-ERROR checks of `seal_fast_error` step 3: an error, bound to the
-/// inner request being answered, with nothing keyd does not seal. Failure is
+/// request being answered, with nothing keyd does not seal. Failure is
 /// `Denied` (reason `FastErrorContentRefused`).
 ///
 /// Spec: RFC 6113 5.4.4 ("The e-data field MUST be absent in the
@@ -704,28 +882,23 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
 /// inner request).
 fn check_fast_error(
     error: &KrbError,
-    entry: &ArmorEntry,
-    realm: &Realm,
+    conversation: &ArmoredConversation,
     now: &KerberosTime,
 ) -> Internal<()> {
-    let expected_sname = match &entry.req_sname {
-        Some(sname) => sname.clone(),
-        None => tgs_name(realm),
-    };
     let acceptable = error.e_data.is_none()
         && error.e_text.is_none()
         && error.error_code > KDC_ERR_NONE
         && error.stime == *now
-        && error.realm == entry.req_realm
-        && error.sname == expected_sname
+        && error.realm == conversation.realm
+        && error.sname == conversation.sname
         && error
             .crealm
             .as_ref()
-            .is_none_or(|crealm| *crealm == entry.req_realm)
+            .is_none_or(|crealm| *crealm == conversation.crealm)
         && error
             .cname
             .as_ref()
-            .is_none_or(|cname| entry.req_cname.as_ref() == Some(cname));
+            .is_none_or(|cname| conversation.cname.as_ref() == Some(cname));
     if acceptable {
         Ok(())
     } else {

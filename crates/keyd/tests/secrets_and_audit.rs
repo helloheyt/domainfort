@@ -10,7 +10,7 @@ use common::*;
 use keyd::{
     ArmorId, AsRepParts, AsTicketTemplate, AuditOutcome, AuthnError, AuthnProof, CallerId, CtxId,
     DualControlToken, Error, IssueError, KeyHandle, Kvno, Operation, PrincipalBinding, PrincipalId,
-    TgsRepParts, TgsTicketTemplate, TgtContext,
+    TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext,
 };
 use krb_proto::{ApReq, KerberosTime, PaData};
 use zeroize::Zeroizing;
@@ -51,12 +51,16 @@ fn operation_signatures_return_no_key_material() {
         &AsTicketTemplate,
         &KerberosTime,
     ) -> Result<AsRepParts, IssueError> = K::issue_as_rep;
+    // docs/48 §2.3 (task T3): the TGS opening takes the FAST part of an
+    // armored request (request data, no key) and TgtContext gains only the
+    // decrypted KrbFastReq; TgsRepParts gains only the sealed `fast_rep`.
     let _: fn(
         &mut K,
         &CallerId,
         &KeyHandle,
         &ApReq,
         &[u8],
+        Option<TgsFastRequest<'_>>,
         &KerberosTime,
     ) -> Result<TgtContext, AuthnError> = K::open_and_verify_tgt;
     let _: fn(
@@ -187,10 +191,12 @@ fn every_operation_emits_exactly_one_audit_record() {
     );
     let ctx = f
         .keyd
-        .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &n)
+        .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, None, &n)
         .unwrap();
     check(&f, Operation::OpenAndVerifyTgt, &KDC, true);
-    let _ = f.keyd.open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &n);
+    let _ = f
+        .keyd
+        .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, None, &n);
     check(&f, Operation::OpenAndVerifyTgt, &KDC, false);
     f.keyd
         .issue_tgs_rep(&KDC, &SERVICE, &ctx.ctx_id, &tgs_template(70), &n)

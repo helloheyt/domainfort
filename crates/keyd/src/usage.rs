@@ -34,7 +34,9 @@ pub(crate) const TGS_REQ_AUTHENTICATOR: u32 = 7;
 pub(crate) const TGS_REP_ENC_PART_SESSION_KEY: u32 = 8;
 
 /// Key usage 9 — TGS-REP encrypted part, encrypted with the TGS authenticator subkey.
-/// Spec: RFC 4120 7.5.1, 5.4.2.
+/// Under FAST the same usage seals EncTGSRepPart in the reply key
+/// strengthened from the subkey (docs/questions/Q-121 option (a), decided
+/// A-32). Spec: RFC 4120 7.5.1, 5.4.2; RFC 6113 5.4.3.
 pub(crate) const TGS_REP_ENC_PART_SUBKEY: u32 = 9;
 
 /// Key usage 11 — AP-REQ Authenticator, encrypted with the application session
@@ -46,7 +48,9 @@ pub(crate) const TGS_REP_ENC_PART_SUBKEY: u32 = 9;
 pub(crate) const AP_REQ_AUTHENTICATOR: u32 = 11;
 
 /// Key usage 50 — KEY_USAGE_FAST_REQ_CHKSUM: the req-checksum of a
-/// KrbFastArmoredReq, keyed with the armor key. Spec: RFC 6113 5.4.2, 6.2.
+/// KrbFastArmoredReq (over the outer KDC-REQ-BODY of an AS-REQ, over the
+/// PA-TGS-REQ AP-REQ of a TGS-REQ), keyed with the armor key. Spec: RFC 6113
+/// 5.4.2, 6.2.
 pub(crate) const KEY_USAGE_FAST_REQ_CHKSUM: u32 = 50;
 
 /// Key usage 51 — KEY_USAGE_FAST_ENC: enc-fast-req (KrbFastReq), encrypted
@@ -59,8 +63,8 @@ pub(crate) const KEY_USAGE_FAST_REP: u32 = 52;
 
 /// Key usage 53 — KEY_USAGE_FAST_FINISHED: the ticket-checksum of
 /// KrbFastFinished, keyed with the armor key. Used by the armored
-/// `issue_as_rep` (docs/48 §4.4; and `issue_tgs_rep`, task T3). Spec: RFC
-/// 6113 5.4.3, 6.2.
+/// `issue_as_rep` and `issue_tgs_rep` (docs/48 §4.4, §5.2). Spec: RFC 6113
+/// 5.4.3, 6.2.
 pub(crate) const KEY_USAGE_FAST_FINISHED: u32 = 53;
 
 /// Key usage 54 — KEY_USAGE_ENC_CHALLENGE_CLIENT: the client's

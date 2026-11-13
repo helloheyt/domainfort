@@ -490,6 +490,7 @@ pub fn open_tgt(f: &mut Fixture, tgt: &Tgt, nonce: u32, cusec: u32) -> TgtContex
             &KRBTGT,
             &ap_req(&tgt.parts.ticket, auth),
             &body,
+            None,
             &now(),
         )
         .unwrap()

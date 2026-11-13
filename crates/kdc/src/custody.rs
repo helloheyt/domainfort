@@ -136,8 +136,9 @@ impl<S: KeyStore, A: keyd::AuditSink, E: EntropySource> KeyCustody for LocalKeyd
         req_body: &[u8],
         now: &KerberosTime,
     ) -> Result<TgtContext, AuthnError> {
+        // Unarmored (no FAST part): the armored TGS path is docs/48 task T6.
         self.keyd
-            .open_and_verify_tgt(&self.caller, krbtgt, ap_req, req_body, now)
+            .open_and_verify_tgt(&self.caller, krbtgt, ap_req, req_body, None, now)
     }
 
     fn issue_tgs_rep(
