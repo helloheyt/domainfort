@@ -23,7 +23,7 @@
 
 [workspace]
 resolver = "2"
-members = ["crates/parse-asn1", "crates/krb-crypto"]
+members = ["crates/parse-asn1", "crates/krb-crypto", "crates/krb-proto"]
 
 # מדיניות build לכלל ה-workspace (תחול כשייווספו crates):
 [workspace.lints.rust]
