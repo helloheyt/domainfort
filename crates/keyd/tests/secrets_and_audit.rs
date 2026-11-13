@@ -1,0 +1,411 @@
+//! Invariants I1 (no long-term key bytes out), I6 (uniform errors,
+//! constant-time comparison facilities), I7 (plaintext taken in zeroizing
+//! containers) and I8 (every operation audited, no secret in audit), plus
+//! redacted Debug output. Source: docs/10 §9, §10, §12; docs/09 א.1, א.5;
+//! AGENTS.md §6. All values are constructed for these tests.
+
+mod common;
+
+use common::*;
+use keyd::{
+    AsRepParts, AsTicketTemplate, AuditOutcome, AuthnError, AuthnProof, CallerId, CtxId,
+    DualControlToken, Error, IssueError, KeyHandle, Kvno, Operation, PrincipalBinding, PrincipalId,
+    TgsRepParts, TgsTicketTemplate, TgtContext,
+};
+use krb_proto::{ApReq, KerberosTime, PaData};
+use zeroize::Zeroizing;
+
+fn z(s: &str) -> Zeroizing<String> {
+    Zeroizing::new(s.to_owned())
+}
+
+/// I1 at the type level: every public operation's signature, pinned. None
+/// returns key material: only kvnos, unit, one-time tokens with non-secret
+/// facts, and sealed EncryptedData. Changing any return type breaks this
+/// test and forces a review. There is no read-key operation in any role.
+/// Source: docs/10 §12 I1 ("checking the output types"), §7; docs/09 א.5
+/// (export_key / get_key / read_secret / generic crypto absent).
+#[test]
+// The pinned fn-pointer types are long by nature; aliases would hide them.
+#[allow(clippy::type_complexity)]
+fn operation_signatures_return_no_key_material() {
+    type K = TestKeyd;
+    let _: fn(
+        &mut K,
+        &CallerId,
+        &KeyHandle,
+        &PaData,
+        &KerberosTime,
+    ) -> Result<AuthnProof, AuthnError> = K::verify_preauth;
+    let _: fn(
+        &mut K,
+        &CallerId,
+        &KeyHandle,
+        &KeyHandle,
+        &AuthnProof,
+        &AsTicketTemplate,
+        &KerberosTime,
+    ) -> Result<AsRepParts, IssueError> = K::issue_as_rep;
+    let _: fn(
+        &mut K,
+        &CallerId,
+        &KeyHandle,
+        &ApReq,
+        &[u8],
+        &KerberosTime,
+    ) -> Result<TgtContext, AuthnError> = K::open_and_verify_tgt;
+    let _: fn(
+        &mut K,
+        &CallerId,
+        &KeyHandle,
+        &CtxId,
+        &TgsTicketTemplate,
+        &KerberosTime,
+    ) -> Result<TgsRepParts, IssueError> = K::issue_tgs_rep;
+    let _: fn(
+        &mut K,
+        &CallerId,
+        &KeyHandle,
+        &PrincipalBinding,
+        &KerberosTime,
+    ) -> Result<Kvno, Error> = K::create_key;
+    let _: fn(&mut K, &CallerId, &KeyHandle, &KerberosTime) -> Result<Kvno, Error> = K::rotate_key;
+    let _: fn(
+        &mut K,
+        &CallerId,
+        &KeyHandle,
+        &DualControlToken,
+        &KerberosTime,
+    ) -> Result<Kvno, Error> = K::rotate_krbtgt;
+    let _: fn(&mut K, &CallerId, &KeyHandle, Kvno, &KerberosTime) -> Result<(), Error> =
+        K::retire_kvno;
+    // I7: plaintext enters as Zeroizing<String> BY VALUE — keyd owns it and
+    // it is wiped when the call returns (docs/10 §12 I7).
+    let _: fn(
+        &mut K,
+        &CallerId,
+        &KeyHandle,
+        &PrincipalBinding,
+        Zeroizing<String>,
+        &str,
+        Kvno,
+        &KerberosTime,
+    ) -> Result<(), Error> = K::set_secret;
+    let _: fn(
+        &mut K,
+        &CallerId,
+        &KeyHandle,
+        Zeroizing<String>,
+        &KerberosTime,
+    ) -> Result<(), Error> = K::verify_secret;
+}
+
+/// I1 at the value level: nothing keyd returns contains a long-term key or
+/// the session key in the clear. Source: docs/10 §12 I1; docs/09 א.4.
+#[test]
+fn returned_values_contain_no_key_octets() {
+    let mut f = Fixture::new();
+    let tgt = obtain_tgt(&mut f, now(), &as_template());
+    let ctx = open_tgt(&mut f, &tgt, 60, 60);
+    let tgs = f
+        .keyd
+        .issue_tgs_rep(&KDC, &SERVICE, &ctx.ctx_id, &tgs_template(60), &now())
+        .unwrap();
+    let service_session = krb_proto::EncTgsRepPart::decode(&open(&tgt.session, 8, &tgs.enc_part))
+        .unwrap()
+        .0
+        .key;
+
+    let alice = alice_key();
+    let secrets: Vec<&[u8]> = vec![
+        &KRBTGT_KEY,
+        &SERVICE_KEY,
+        alice.octets(),
+        tgt.rep.0.key.keyvalue.as_bytes(),
+        service_session.keyvalue.as_bytes(),
+    ];
+    let mut outputs: Vec<Vec<u8>> = vec![
+        tgt.parts.ticket.encode().unwrap(),
+        tgt.parts.enc_part.encode().unwrap(),
+        tgs.ticket.encode().unwrap(),
+        tgs.enc_part.encode().unwrap(),
+    ];
+    outputs.push(format!("{ctx:?}").into_bytes());
+    for out in &outputs {
+        for secret in &secrets {
+            assert!(!contains_bytes(out, secret));
+        }
+    }
+}
+
+/// I8: every operation — success or failure, any role — emits exactly one
+/// audit record naming the operation and the caller. Source: docs/10 §3
+/// ("every call is recorded"), §10, §12 I8.
+#[test]
+fn every_operation_emits_exactly_one_audit_record() {
+    let mut f = Fixture::new();
+    let n = now();
+    let mut expected: Vec<(Operation, u32, bool)> = Vec::new();
+    let mut check = |f: &Fixture, op: Operation, caller: &CallerId, ok: bool| {
+        expected.push((op, caller.uid, ok));
+        assert_eq!(f.records().len(), expected.len(), "after {op:?}");
+        let last = f.records().last().unwrap();
+        assert_eq!(last.op, op);
+        assert_eq!(last.caller_uid, caller.uid);
+        assert_eq!(last.result == AuditOutcome::Success, ok, "{op:?}");
+    };
+
+    let pa = pa_enc_timestamp(&alice_key(), Some(1), n);
+    let proof = f.keyd.verify_preauth(&KDC, &ALICE, &pa, &n).unwrap();
+    check(&f, Operation::VerifyPreauth, &KDC, true);
+    let _ = f.keyd.verify_preauth(&DIRECTORY, &ALICE, &pa, &n);
+    check(&f, Operation::VerifyPreauth, &DIRECTORY, false);
+    let parts = f
+        .keyd
+        .issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, &as_template(), &n)
+        .unwrap();
+    check(&f, Operation::IssueAsRep, &KDC, true);
+    let _ = f
+        .keyd
+        .issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, &as_template(), &n);
+    check(&f, Operation::IssueAsRep, &KDC, false);
+
+    let rep = krb_proto::EncAsRepPart::decode(&open(&alice_key(), 3, &parts.enc_part)).unwrap();
+    let session = key_from(&rep.0.key);
+    let (_, body) = tgs_req_body(70, service_name());
+    let req = ap_req(
+        &parts.ticket,
+        authenticator(&session, &AuthenticatorSpec::new(n, 70, &body)),
+    );
+    let ctx = f
+        .keyd
+        .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &n)
+        .unwrap();
+    check(&f, Operation::OpenAndVerifyTgt, &KDC, true);
+    let _ = f.keyd.open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, &n);
+    check(&f, Operation::OpenAndVerifyTgt, &KDC, false);
+    f.keyd
+        .issue_tgs_rep(&KDC, &SERVICE, &ctx.ctx_id, &tgs_template(70), &n)
+        .unwrap();
+    check(&f, Operation::IssueTgsRep, &KDC, true);
+    let _ = f
+        .keyd
+        .issue_tgs_rep(&ADMIN, &SERVICE, &ctx.ctx_id, &tgs_template(70), &n);
+    check(&f, Operation::IssueTgsRep, &ADMIN, false);
+
+    f.keyd
+        .set_secret(
+            &DIRECTORY,
+            &ALICE,
+            &alice_binding(),
+            z("next"),
+            ALICE_SALT,
+            Kvno::new(2),
+            &n,
+        )
+        .unwrap();
+    check(&f, Operation::SetSecret, &DIRECTORY, true);
+    f.keyd
+        .verify_secret(&DIRECTORY, &ALICE, z("next"), &n)
+        .unwrap();
+    check(&f, Operation::VerifySecret, &DIRECTORY, true);
+    let _ = f.keyd.verify_secret(&DIRECTORY, &ALICE, z("wrong"), &n);
+    check(&f, Operation::VerifySecret, &DIRECTORY, false);
+
+    let h = KeyHandle::new(
+        PrincipalId::from_bytes([0x77; 16]),
+        keyd::KeyPurpose::Service,
+    );
+    let h_binding = bound(krb_proto::PrincipalName {
+        name_type: krb_proto::constants::KRB_NT_PRINCIPAL,
+        name_string: vec![kstr("svc-77")],
+    });
+    f.keyd.create_key(&ADMIN, &h, &h_binding, &n).unwrap();
+    check(&f, Operation::CreateKey, &ADMIN, true);
+    f.keyd.rotate_key(&ADMIN, &h, &n).unwrap();
+    check(&f, Operation::RotateKey, &ADMIN, true);
+    f.keyd.retire_kvno(&ADMIN, &h, Kvno::new(1), &n).unwrap();
+    check(&f, Operation::RetireKvno, &ADMIN, true);
+    let approval = DualControlToken {
+        approver_1: PrincipalId::from_bytes([1; 16]),
+        approver_2: PrincipalId::from_bytes([2; 16]),
+    };
+    f.keyd
+        .rotate_krbtgt(&ADMIN, &KRBTGT, &approval, &n)
+        .unwrap();
+    check(&f, Operation::RotateKrbtgt, &ADMIN, true);
+    let _ = f.keyd.rotate_krbtgt(&KDC, &KRBTGT, &approval, &n);
+    check(&f, Operation::RotateKrbtgt, &KDC, false);
+
+    // Every operation was exercised.
+    for op in Operation::ALL {
+        assert!(expected.iter().any(|(o, _, _)| *o == op), "{op:?}");
+    }
+}
+
+/// Decimal and hex renderings of the first octets of `secret`, as they would
+/// appear if a byte slice leaked into Debug output.
+fn renderings(secret: &[u8]) -> Vec<String> {
+    let head = &secret[..4];
+    vec![
+        format!("{}, {}, {}, {}", head[0], head[1], head[2], head[3]),
+        format!(
+            "{:02x}{:02x}{:02x}{:02x}",
+            head[0], head[1], head[2], head[3]
+        ),
+        format!(
+            "{:02X}{:02X}{:02X}{:02X}",
+            head[0], head[1], head[2], head[3]
+        ),
+    ]
+}
+
+/// I8: audit records carry no secret — no password text, no key octets (in
+/// any rendering), no session key — across a full set of operations.
+/// Source: docs/10 §10 ("without any secret"), §12 I8; AGENTS.md §6.
+#[test]
+fn audit_records_contain_no_secret_bytes() {
+    let mut f = Fixture::new();
+    let tgt = obtain_tgt(&mut f, now(), &as_template());
+    let ctx = open_tgt(&mut f, &tgt, 80, 80);
+    let tgs = f
+        .keyd
+        .issue_tgs_rep(&KDC, &SERVICE, &ctx.ctx_id, &tgs_template(80), &now())
+        .unwrap();
+    let service_session = krb_proto::EncTgsRepPart::decode(&open(&tgt.session, 8, &tgs.enc_part))
+        .unwrap()
+        .0
+        .key;
+    f.keyd
+        .set_secret(
+            &DIRECTORY,
+            &BOB,
+            &bob_binding(),
+            z("an audit-test password"),
+            BOB_SALT,
+            Kvno::new(2),
+            &now(),
+        )
+        .unwrap();
+    let _ = f
+        .keyd
+        .verify_secret(&DIRECTORY, &BOB, z("a wrong audit guess"), &now());
+    let _ = f.keyd.verify_preauth(
+        &KDC,
+        &ALICE,
+        &pa_enc_timestamp(
+            &password_key(krb_crypto::EncType::Aes256CtsHmacSha196, "bad", ALICE_SALT),
+            Some(1),
+            now(),
+        ),
+        &now(),
+    );
+
+    let text = format!("{:?}", f.records());
+    assert!(!f.records().is_empty());
+    for password in [
+        ALICE_PASSWORD,
+        BOB_PASSWORD,
+        "an audit-test password",
+        "a wrong audit guess",
+    ] {
+        assert!(
+            !text.contains(password),
+            "password text in audit: {password}"
+        );
+    }
+    let alice = alice_key();
+    for secret in [
+        &KRBTGT_KEY[..],
+        &SERVICE_KEY[..],
+        alice.octets(),
+        tgt.rep.0.key.keyvalue.as_bytes(),
+        service_session.keyvalue.as_bytes(),
+    ] {
+        for r in renderings(secret) {
+            assert!(!text.contains(&r), "key material in audit: {r}");
+        }
+    }
+}
+
+/// Debug output of keyd's public values is redacted: no key octets, no
+/// session keys. Source: docs/09 א.7 ("no Debug on key types"); AGENTS.md §6.
+#[test]
+fn debug_output_is_redacted() {
+    let mut f = Fixture::new();
+    let tgt = obtain_tgt(&mut f, now(), &as_template());
+    let ctx = open_tgt(&mut f, &tgt, 90, 90);
+    let proof = f
+        .keyd
+        .verify_preauth(
+            &KDC,
+            &ALICE,
+            &pa_enc_timestamp(&alice_key(), Some(1), now()),
+            &now(),
+        )
+        .unwrap();
+    let text = format!("{:?} {:?} {:?}", f.keyd, ctx, proof);
+    let alice = alice_key();
+    for secret in [
+        &KRBTGT_KEY[..],
+        &SERVICE_KEY[..],
+        alice.octets(),
+        tgt.rep.0.key.keyvalue.as_bytes(),
+    ] {
+        for r in renderings(secret) {
+            assert!(!text.contains(&r), "key material in Debug: {r}");
+        }
+    }
+    let store = keyd::InMemoryKeyStore::new_insecure_development_allowing_krbtgt(4);
+    let store_text = format!("{store:?}");
+    assert!(store_text.contains("insecure_development_krbtgt"));
+}
+
+/// I6: every failure of an authentication step is the same uniform value,
+/// whatever the cause (wrong password, unknown principal, clock skew, wrong
+/// role, replay, bad checksum); errors render without detail. Source:
+/// docs/10 §9 (AuthnError { Denied } "does not distinguish"), §12 I6.
+#[test]
+fn errors_are_uniform() {
+    let mut f = Fixture::new();
+    let n = now();
+    let wrong_pw = password_key(krb_crypto::EncType::Aes256CtsHmacSha196, "x", ALICE_SALT);
+    let stranger = KeyHandle::new(
+        PrincipalId::from_bytes([0xEE; 16]),
+        keyd::KeyPurpose::PrincipalLongterm,
+    );
+    let failures = [
+        f.keyd
+            .verify_preauth(&KDC, &ALICE, &pa_enc_timestamp(&wrong_pw, Some(1), n), &n),
+        f.keyd.verify_preauth(
+            &KDC,
+            &stranger,
+            &pa_enc_timestamp(&alice_key(), Some(1), n),
+            &n,
+        ),
+        f.keyd.verify_preauth(
+            &KDC,
+            &ALICE,
+            &pa_enc_timestamp(&alice_key(), Some(1), at(-900)),
+            &n,
+        ),
+        f.keyd.verify_preauth(
+            &ADMIN,
+            &ALICE,
+            &pa_enc_timestamp(&alice_key(), Some(1), n),
+            &n,
+        ),
+    ];
+    for r in &failures {
+        assert_eq!(r, &Err(AuthnError::Denied));
+    }
+    let reasons: std::collections::HashSet<_> = f.records().iter().map(|r| r.reason).collect();
+    assert_eq!(reasons.len(), 4, "distinct reasons only in audit");
+
+    assert_eq!(AuthnError::Denied.to_string(), "denied");
+    assert_eq!(IssueError::Denied.to_string(), "denied");
+    assert_eq!(IssueError::BadTemplate.to_string(), "bad ticket template");
+    assert_eq!(Error::Denied.to_string(), "denied");
+    assert_eq!(Error::Unavailable.to_string(), "unavailable");
+    assert_eq!(Error::RateLimited.to_string(), "rate limited");
+}

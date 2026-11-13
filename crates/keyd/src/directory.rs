@@ -1,0 +1,301 @@
+//! Directory operations: set a principal's secret from a password, and
+//! verify a candidate password. Role `Directory` only.
+//!
+//! - The plaintext arrives in a RustCrypto `Zeroizing<String>` taken BY
+//!   VALUE: keyd owns it and it is wiped when the operation returns (I7).
+//! - Keys are derived inside keyd with string-to-key for every configured
+//!   enctype; the iteration count is capped through krb-crypto's
+//!   `max_iterations` (RFC 3962 §4).
+//! - `verify_secret` compares the derived candidate key with the stored key
+//!   through krb-crypto `get_mic` / `verify_mic` — whose comparison is the
+//!   RustCrypto `hmac` constant-time verification — never a hand-rolled byte
+//!   compare (I6). An unknown principal or a non-password key runs the same
+//!   derivation and comparison on dummy material before refusing, so the
+//!   refusal path costs about the same (equal up to differing stored
+//!   iteration counts; not secret-dependent).
+//!
+//! Spec: docs/10 §6 (`set_secret`, `verify_secret`), §12 I6, I7; RFC 3961
+//! §3 (string-to-key on UTF-8 strings); RFC 3962 §4; RFC 4120 §4 (default
+//! salt = realm + name components; the directory supplies the salt).
+
+use crate::audit::{AuditReason, AuditSink};
+use crate::authz::{CallerId, HandleSlot, Operation};
+use crate::config::KeydConfig;
+use crate::entropy::EntropySource;
+use crate::error::{Deny, Error, Internal};
+use crate::keyd::{authorize, draw, key_usage, new_random_key, store_deny, AuditFields, Keyd};
+use crate::model::{KeyHandle, Kvno, PrincipalBinding};
+use crate::store::{KeyStore, KvnoKeys, StoredKeySet};
+use crate::template::{check_binding, check_new_binding};
+use crate::time::kerberos_time_seconds;
+use crate::usage::KEYD_INTERNAL_SECRET_COMPARE;
+use krb_crypto::{EncType, ProtocolKey};
+use krb_proto::KerberosTime;
+use zeroize::Zeroizing;
+
+/// Length of the random challenge the constant-time comparison MACs.
+const COMPARE_CHALLENGE_LENGTH: usize = 32;
+
+impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
+    /// `set_secret`: derive the principal's keys from `password` and `salt`
+    /// (string-to-key, every configured enctype) and install them as kvno
+    /// `new_kvno`, which must be greater than the current kvno. An existing
+    /// current version becomes previous. Nothing is returned; the plaintext
+    /// is zeroized when this call returns.
+    ///
+    /// Purposes: PrincipalLongterm or Service (krbtgt is never
+    /// password-derived).
+    ///
+    /// `binding` is the principal name of the key set. When this call
+    /// creates the key set, the binding is fixed here for good (same rules
+    /// as `create_key`); when the set already exists, `binding` must
+    /// identify its existing binding (RFC 4120 6.2 equivalence) or the call
+    /// is refused — a password change can never rename a principal.
+    ///
+    /// Spec: docs/10 §6 (`set_secret(principal, purpose, material, salt,
+    /// new_kvno)`, "derives keys inside, zeroizes plaintext; nothing goes
+    /// out"), §12 I7; RFC 3961 §3; RFC 3962 §4; RFC 4120 6.2;
+    /// docs/questions/Q-040 (A-19).
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_secret(
+        &mut self,
+        caller: &CallerId,
+        handle: &KeyHandle,
+        binding: &PrincipalBinding,
+        password: Zeroizing<String>,
+        salt: &str,
+        new_kvno: Kvno,
+        now: &KerberosTime,
+    ) -> Result<(), Error> {
+        let mut fields = AuditFields::for_handle(handle);
+        fields.kvno = Some(new_kvno);
+        let result = self.set_secret_inner(caller, handle, binding, &password, salt, new_kvno);
+        drop(password);
+        self.emit(caller, Operation::SetSecret, now, &fields, &result);
+        result.map_err(Error::from)
+    }
+
+    fn set_secret_inner(
+        &mut self,
+        caller: &CallerId,
+        handle: &KeyHandle,
+        binding: &PrincipalBinding,
+        password: &str,
+        salt: &str,
+        new_kvno: Kvno,
+    ) -> Internal<()> {
+        authorize(
+            caller,
+            Operation::SetSecret,
+            &[(HandleSlot::Primary, handle)],
+        )?;
+        if !self.store.accepts(handle.purpose) {
+            return Err(Deny::denied(AuditReason::StoreRefusedCritical));
+        }
+        let existing = self.store.get(handle);
+        match existing {
+            Some(set) => check_binding(set.binding(), &binding.realm, &binding.name)?,
+            None => check_new_binding(&self.config.realm, handle.purpose, binding)?,
+        }
+        let current = existing.map(StoredKeySet::current_kvno);
+        let increasing = match current {
+            Some(current) => new_kvno > current,
+            None => new_kvno.get() != 0,
+        };
+        if !increasing {
+            return Err(Deny::denied(AuditReason::KvnoNotIncreasing));
+        }
+        let mut keys = Vec::with_capacity(self.config.enctypes.len());
+        for enctype in &self.config.enctypes {
+            keys.push(derive_password_key(
+                &self.config,
+                *enctype,
+                password,
+                salt,
+                self.config.s2k_params,
+            )?);
+        }
+        let version = KvnoKeys::new(
+            new_kvno,
+            keys,
+            Some(salt.to_owned()),
+            self.config.s2k_params,
+        );
+        match self.store.get_mut(handle) {
+            Some(set) => {
+                set.rotate(version);
+                Ok(())
+            }
+            None => self
+                .store
+                .insert(*handle, StoredKeySet::new(binding.clone(), version))
+                .map_err(store_deny),
+        }
+    }
+
+    /// `verify_secret`: does `candidate` match the principal's current
+    /// password-derived key? Constant-time comparison (krb-crypto
+    /// `verify_mic`), throttled, plaintext zeroized on return.
+    ///
+    /// Returns `Ok(())` on a match; `Error::Denied` for a wrong password, an
+    /// unknown principal, a non-password key or a wrong role — the caller
+    /// cannot tell these apart; `Error::RateLimited` when the throttling
+    /// hook refuses the attempt (decided before any secret work, from the
+    /// public failure history only). docs/10 §6 types this result as
+    /// `AuthnError`; `Error` is used so the throttle outcome of docs/10 §9
+    /// is expressible, while `Denied` stays uniform.
+    ///
+    /// Spec: docs/10 §6 ("constant-time, throttled"), §9, §12 I6, I7.
+    pub fn verify_secret(
+        &mut self,
+        caller: &CallerId,
+        handle: &KeyHandle,
+        candidate: Zeroizing<String>,
+        now: &KerberosTime,
+    ) -> Result<(), Error> {
+        let mut fields = AuditFields::for_handle(handle);
+        let result = self.verify_secret_inner(caller, handle, &candidate, now, &mut fields);
+        drop(candidate);
+        self.emit(caller, Operation::VerifySecret, now, &fields, &result);
+        result.map_err(Error::from)
+    }
+
+    fn verify_secret_inner(
+        &mut self,
+        caller: &CallerId,
+        handle: &KeyHandle,
+        candidate: &str,
+        now: &KerberosTime,
+        fields: &mut AuditFields,
+    ) -> Internal<()> {
+        authorize(
+            caller,
+            Operation::VerifySecret,
+            &[(HandleSlot::Primary, handle)],
+        )?;
+        let now_s = kerberos_time_seconds(now);
+        if !self.throttle.admit(&handle.principal, now_s) {
+            return Err(Deny::rate_limited(AuditReason::Throttled));
+        }
+        let outcome = compare_secret(
+            &self.store,
+            &mut self.entropy,
+            &self.config,
+            handle,
+            candidate,
+            fields,
+        );
+        match &outcome {
+            Ok(()) => self.throttle.record(&handle.principal, true, now_s),
+            Err(deny) if deny.outcome == crate::audit::AuditOutcome::Denied => {
+                self.throttle.record(&handle.principal, false, now_s)
+            }
+            Err(_) => {}
+        }
+        outcome
+    }
+}
+
+/// string-to-key with the configured iteration cap.
+/// Spec: RFC 3961 §3; RFC 3962 §4 (iteration limit); RFC 8009 §4.
+fn derive_password_key(
+    config: &KeydConfig,
+    enctype: EncType,
+    password: &str,
+    salt: &str,
+    s2k_params: Option<[u8; 4]>,
+) -> Internal<ProtocolKey> {
+    krb_crypto::string_to_key(
+        enctype,
+        password,
+        salt,
+        s2k_params.as_ref().map(|p| &p[..]),
+        config.max_s2k_iterations,
+    )
+    .map_err(|_| Deny::denied(AuditReason::S2kRefused))
+}
+
+/// Compare `candidate` with `stored` in constant time: MAC a fresh random
+/// challenge under the stored key (get_mic) and verify that MAC under the
+/// candidate key (verify_mic, whose comparison is the RustCrypto `hmac`
+/// constant-time check). Equal keys ⇔ the MAC verifies (up to HMAC
+/// collisions). Returns whether they match.
+///
+/// Spec: RFC 3961 §4 (get_mic / verify_mic); RFC 4120 §4 / 7.5.1 (usage
+/// 512, implementation-internal range); docs/10 §12 I6.
+fn keys_match<E: EntropySource>(
+    entropy: &mut E,
+    stored: &ProtocolKey,
+    candidate: &ProtocolKey,
+) -> Internal<bool> {
+    let mut challenge = [0u8; COMPARE_CHALLENGE_LENGTH];
+    draw(entropy, &mut challenge)?;
+    let cksumtype = stored.enc_type().checksum_type();
+    let usage = key_usage(KEYD_INTERNAL_SECRET_COMPARE)?;
+    let mic = Zeroizing::new(
+        krb_crypto::get_mic(stored, cksumtype, usage, &challenge)
+            .map_err(|_| Deny::unavailable(AuditReason::InternalFailure))?,
+    );
+    Ok(krb_crypto::verify_mic(candidate, cksumtype, usage, &challenge, &mic).is_ok())
+}
+
+/// The body of `verify_secret` after authorization and throttling.
+/// Spec: docs/10 §6, §12 I6.
+fn compare_secret<S: KeyStore, E: EntropySource>(
+    store: &S,
+    entropy: &mut E,
+    config: &KeydConfig,
+    handle: &KeyHandle,
+    candidate: &str,
+    fields: &mut AuditFields,
+) -> Internal<()> {
+    let stored = store.get(handle).map(StoredKeySet::current);
+    let real = stored.and_then(|version| {
+        fields.kvno = Some(version.kvno());
+        match (version.salt(), version.preferred()) {
+            (Some(salt), Some(key)) => Some((salt, key, version.s2k_params())),
+            _ => None,
+        }
+    });
+    match real {
+        Some((salt, stored_key, s2k_params)) => {
+            let derived =
+                derive_password_key(config, stored_key.enc_type(), candidate, salt, s2k_params)?;
+            if keys_match(entropy, stored_key, &derived)? {
+                Ok(())
+            } else {
+                Err(Deny::denied(AuditReason::SecretMismatch))
+            }
+        }
+        None => {
+            // Same work on dummy material, then refuse (uniform cost).
+            dummy_compare(entropy, config, candidate);
+            let reason = if stored.is_some() {
+                AuditReason::NoPasswordKey
+            } else {
+                AuditReason::KeyNotFound
+            };
+            Err(Deny::denied(reason))
+        }
+    }
+}
+
+/// Derive and compare against a throwaway random key; the result is
+/// ignored. Spec: docs/10 §9 ("no time difference between secret-dependent
+/// branches").
+fn dummy_compare<E: EntropySource>(entropy: &mut E, config: &KeydConfig, candidate: &str) {
+    let Some(enctype) = config.enctypes.first().copied() else {
+        return;
+    };
+    let derived = derive_password_key(
+        config,
+        enctype,
+        candidate,
+        config.realm.as_str(),
+        config.s2k_params,
+    );
+    let throwaway = new_random_key(entropy, enctype);
+    if let (Ok(derived), Ok(throwaway)) = (derived, throwaway) {
+        let _ = keys_match(entropy, &throwaway, &derived);
+    }
+}

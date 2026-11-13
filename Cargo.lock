@@ -134,6 +134,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "keyd"
+version = "0.0.0"
+dependencies = [
+ "krb-crypto",
+ "krb-proto",
+ "zeroize",
+]
+
+[[package]]
 name = "krb-crypto"
 version = "0.0.0"
 dependencies = [
