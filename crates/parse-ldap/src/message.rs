@@ -109,6 +109,20 @@ pub enum ProtocolOp {
     /// `unwillingToPerform`. The canonical encoding is the tag with an empty
     /// body. Spec: docs/49 §5.1; A-48.
     Unsupported { op_tag: UnsupportedOp },
+    /// The response to a request phase 1 does not perform: ModifyResponse
+    /// `[APPLICATION 7]`, AddResponse 9, DelResponse 11, ModifyDNResponse 13
+    /// or CompareResponse 15 — each `[APPLICATION n] LDAPResult`, the tag
+    /// number being [`UnsupportedOp::response_tag_number`] of `op`. Encoded
+    /// like SearchResultDone apart from that tag (implicit tagging keeps the
+    /// base encoding, constructed). Decoded only in the response direction.
+    /// Spec: RFC 4511 §4.6–§4.10, App. B; X.690 (02/2021) 8.14.4; A-48;
+    /// docs/questions/Q-190 item 1 (A-54).
+    UnsupportedResponse {
+        /// The request this answers.
+        op: UnsupportedOp,
+        /// `LDAPResult`.
+        result: LdapResult,
+    },
 }
 
 /// The request operations phase 1 recognises but does not perform.

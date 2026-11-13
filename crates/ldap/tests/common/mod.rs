@@ -20,6 +20,7 @@
 use std::cell::Cell;
 use std::collections::BTreeSet;
 
+use directory_pip::NamingContext;
 use dtyp::{SecurityDescriptor, Sid};
 use kdc::{AccountSource, AccountSourceError, ClientAccount, ServiceAccount};
 use krb_proto::{KerberosTime, PrincipalName, Realm};
@@ -44,15 +45,22 @@ use pdp::{
 // Configuration and time.
 // ---------------------------------------------------------------------------
 
-/// The domain NC DN the rootDSE reports (a hand-made example).
-pub const NAMING_CONTEXT: &str = "DC=example,DC=org";
+/// The domain NC DN the rootDSE reports (a hand-made example): the RFC 4514
+/// encoding of the naming context `dc=example,dc=org` (A-53; the attribute
+/// written as the lDAPDisplayName "dc").
+pub const NAMING_CONTEXT: &str = "dc=example,dc=org";
 /// The DC's DNS name (a hand-made example).
 pub const DNS_HOST_NAME: &str = "dc1.example.org";
+
+/// The naming context example.org ([MS-ADTS] 3.1.1.1.5: "dc=n1,dc=n2").
+pub fn naming_context() -> NamingContext {
+    NamingContext::new(&["example", "org"]).expect("naming context")
+}
 
 pub fn engine() -> Engine {
     Engine::new(EngineConfig {
         root_dse: RootDseConfig {
-            naming_context: NAMING_CONTEXT.to_owned(),
+            naming_context: naming_context(),
             dns_host_name: DNS_HOST_NAME.to_owned(),
         },
     })
@@ -251,6 +259,7 @@ impl Harness {
             rate: &mut self.rate,
             now: now(),
             transport,
+            directory: None,
         };
         self.engine.handle(&mut self.session, octets, inputs)
     }
@@ -424,9 +433,11 @@ pub fn only_code(outcome: &Outcome) -> ResultCode {
 
 /// Decode a ModifyResponse / AddResponse / DelResponse / ModifyDNResponse /
 /// CompareResponse: check the protocolOp identifier is `[APPLICATION n]`
-/// constructed (X.690 8.1.2.2: class bits `01`, bit 6 = 1), then read it as
-/// the SearchResultDone it is identical to apart from that octet (RFC 4511
-/// App. B: all are `[APPLICATION n] LDAPResult`; X.690 8.14.4 b)).
+/// constructed (X.690 8.1.2.2: class bits `01`, bit 6 = 1), then decode it —
+/// parse-ldap's typed `UnsupportedResponse` (Q-190 item 1, A-54) — and
+/// return it with its LDAPResult presented as a SearchResultDone, the
+/// response it is identical to apart from the tag (RFC 4511 App. B: all are
+/// `[APPLICATION n] LDAPResult`; X.690 8.14.4 b)).
 pub fn decode_ldap_result_response(octets: &[u8], tag_number: u8) -> LdapMessage {
     // A canonical response this small has the short-form outer length and a
     // short messageID: 30 L 02 n <n octets> <op identifier>.
@@ -435,9 +446,20 @@ pub fn decode_ldap_result_response(octets: &[u8], tag_number: u8) -> LdapMessage
     assert_eq!(octets[2], 0x02);
     let at = 4 + usize::from(octets[3]);
     assert_eq!(octets[at], 0x60 | tag_number, "response tag");
-    let mut swapped = octets.to_vec();
-    swapped[at] = 0x60 | 5;
-    decode(&swapped)
+    let msg = decode(octets);
+    match msg.protocol_op {
+        ProtocolOp::UnsupportedResponse { op, result } => {
+            assert_eq!(op.response_tag_number(), tag_number);
+            assert!(result.matched_dn.is_empty(), "matchedDN must be empty");
+            assert!(result.diagnostic_message.is_empty());
+            LdapMessage {
+                message_id: msg.message_id,
+                protocol_op: ProtocolOp::SearchResultDone(result),
+                controls: msg.controls,
+            }
+        }
+        other => panic!("not a typed unsupported-operation response: {other:?}"),
+    }
 }
 
 /// `true` if `needle` occurs in `haystack`.

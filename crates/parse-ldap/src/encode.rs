@@ -87,6 +87,15 @@ fn protocol_op(w: &mut Writer, op: &ProtocolOp) -> Result<()> {
             let constructed = *op_tag != UnsupportedOp::DelRequest;
             w.element(application(op_tag.tag_number(), constructed), &[])
         }
+        // "ModifyResponse ::= [APPLICATION 7] LDAPResult" (and AddResponse 9,
+        // DelResponse 11, ModifyDNResponse 13, CompareResponse 15): an
+        // implicitly tagged LDAPResult SEQUENCE, hence constructed with the
+        // LDAPResult components as contents. Spec: RFC 4511 §4.6-§4.10,
+        // App. B; X.690 8.14.4 a), b).
+        ProtocolOp::UnsupportedResponse { op, result } => w
+            .constructed(application(op.response_tag_number(), true), |w| {
+                ldap_result(w, result)
+            }),
     }
 }
 

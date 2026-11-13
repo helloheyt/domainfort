@@ -23,12 +23,13 @@
 //!
 //! # Context.transport
 //!
-//! `pdp::Transport` has no variant for cleartext LDAP (docs/49 §4.3 names
-//! `Ldaps` for 636 and for 389 after StartTLS, and nothing for 389 before
-//! it). The engine reports `Transport::Ldaps` for every LDAP request and
-//! carries the truthful security state in `transport_sec`, which is what the
-//! PDP decides on; `decide` never reads `Context.transport` (checked in the
-//! pdp source). Recorded as docs/questions/Q-190 item 2.
+//! `Transport::Ldap` for a connection with no TLS layer (the cleartext
+//! listener before StartTLS), `Transport::Ldaps` for LDAPS (636) and for
+//! 389 after StartTLS (docs/49 §4.3). The security state the PDP decides on
+//! is `transport_sec`; `decide` reads no `Context.transport` value, so the
+//! variant changes no decision (pdp's test
+//! `the_cleartext_ldap_transport_changes_no_decision`; docs/questions/Q-190
+//! item 2, A-54).
 //!
 //! # Denial → result code (docs/49 §9, R49-13; Q-169)
 //!
@@ -48,7 +49,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use dtyp::{Sid, SECURITY_NT_AUTHORITY};
 use parse_ldap::ResultCode;
-use pdp::{AuthContext, AuthStrength, Pip, PipError, ReasonCode, Subject, TransportSec};
+use pdp::{AuthContext, AuthStrength, Pip, PipError, ReasonCode, Subject, Transport, TransportSec};
 
 use crate::session::{BoundSubject, Channel, Identity, Session};
 
@@ -129,6 +130,15 @@ pub(crate) fn session_transport_sec(session: &Session) -> TransportSec {
     security(session.channel, channel_bound)
 }
 
+/// The `Context.transport` of a request on `channel` (module
+/// documentation). Spec: docs/49 §4.3; Q-190 item 2 (A-54).
+pub(crate) fn context_transport(channel: Channel) -> Transport {
+    match channel {
+        Channel::Cleartext => Transport::Ldap,
+        Channel::Ldaps | Channel::StartTls => Transport::Ldaps,
+    }
+}
+
 /// `encrypted` = TLS; `sealed` = `channel_bound` = TLS and a keyd-verified
 /// channel binding. Spec: docs/49 §4.3; A-47 (Q-163).
 fn security(channel: Channel, keyd_verified_channel_binding: bool) -> TransportSec {
@@ -138,6 +148,28 @@ fn security(channel: Channel, keyd_verified_channel_binding: bool) -> TransportS
         encrypted,
         sealed: bound,
         channel_bound: bound,
+    }
+}
+
+/// The result code of a denial of a search base's visibility: an invisible
+/// base is answered exactly like a nonexistent one, noSuchObject (R49-13;
+/// A-48; [MS-ADTS] 5.1.3.3.6 — no existence disclosure). The reasons that do
+/// not depend on the object (layer 1, layer 2, the subject's tier) keep the
+/// codes of [`denial_code`]; a PIP failure or a malformed request is other
+/// (docs/49 §9, fail closed).
+/// Spec: docs/49 §6.1 item 2, §9 (R49-13); Q-169 items 3, 4.
+pub(crate) fn visibility_denial_code(
+    reason: ReasonCode,
+    transport_sec: TransportSec,
+) -> ResultCode {
+    match reason {
+        ReasonCode::CoarseDeny(_)
+        | ReasonCode::NoGrant
+        | ReasonCode::Acl
+        | ReasonCode::TierViolation
+        | ReasonCode::Sensitive
+        | ReasonCode::NoSuchPath => ResultCode::NoSuchObject,
+        other => denial_code(other, transport_sec),
     }
 }
 

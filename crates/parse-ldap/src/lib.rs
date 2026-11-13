@@ -13,7 +13,9 @@
 //!   SearchResultDone, AbandonRequest, ExtendedRequest/ExtendedResponse, and
 //!   the Controls field (bounded, so the engine can refuse critical controls —
 //!   R49-8). Modify, Add, Delete, ModifyDN and Compare are recognised by tag
-//!   only ([`ProtocolOp::Unsupported`], A-48).
+//!   only ([`ProtocolOp::Unsupported`], A-48); their responses are typed
+//!   ([`ProtocolOp::UnsupportedResponse`], `[APPLICATION n] LDAPResult` —
+//!   docs/questions/Q-190 item 1, A-54).
 //! * [`encode_message`] produces the canonical form: the re-encoding the front
 //!   hands to the engine (R49-16) and the encoding of every response.
 //!

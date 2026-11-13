@@ -103,6 +103,25 @@ pub(crate) fn since_1601(seconds: i64) -> Option<KerberosTime> {
     from_seconds(epoch_1601()?.checked_add(seconds)?)
 }
 
+/// The calendar time of a DSTIME value ("the number of seconds since
+/// January 1, 1601, 12:00:00 A.M.") as a KerberosTime (UTC, whole seconds),
+/// or `None` if negative or after 9999-12-31T23:59:59Z. The public form of
+/// the one conversion this crate uses for whenCreated, so the LDAP layer
+/// renders String(Generalized-Time) values on the same scale (D64).
+/// Spec: [MS-DRSR] 5.51; RFC 4120 5.2.3; docs/46 §1 (DsTime).
+#[must_use]
+pub fn time_of_dstime(seconds: i64) -> Option<KerberosTime> {
+    since_1601(seconds)
+}
+
+/// The DSTIME value of a calendar time: seconds since 1601-01-01T00:00:00Z
+/// (negative before it). The inverse of [`time_of_dstime`] on its range.
+/// Spec: [MS-DRSR] 5.51; RFC 4120 5.2.3.
+#[must_use]
+pub fn dstime_of(time: &KerberosTime) -> Option<i64> {
+    kerberos_time_seconds(time).checked_sub(epoch_1601()?)
+}
+
 /// A FILETIME rounded DOWN to the whole second (an expiry: earlier is the
 /// stricter side). `None` if negative or not representable.
 /// Spec: [MS-DTYP] 2.3.3; docs/47 §4.2.

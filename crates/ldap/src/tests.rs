@@ -168,7 +168,8 @@ fn allow_policy() -> PolicySnapshot {
 fn engine() -> Engine {
     Engine::new(EngineConfig {
         root_dse: RootDseConfig {
-            naming_context: "DC=example,DC=org".to_owned(),
+            naming_context: directory_pip::NamingContext::new(&["example", "org"])
+                .expect("naming context"),
             dns_host_name: "dc1.example.org".to_owned(),
         },
     })
@@ -224,6 +225,7 @@ fn send(
             rate: &mut rate,
             now: at,
             transport: tls_report(),
+            directory: None,
         },
     )
 }
@@ -550,6 +552,7 @@ fn malformed_input_on_a_bound_session_is_recorded_against_the_principal() {
             rate: &mut rate,
             now: now(),
             transport: tls_report(),
+            directory: None,
         },
     );
     assert_eq!(outcome.audit.notice, Some(ResultCode::ProtocolError));
@@ -585,8 +588,10 @@ fn a_bind_moves_a_bound_session_to_anonymous() {
 }
 
 /// RFC 4511 App. B (ModifyResponse ::= [APPLICATION 7] LDAPResult, …) and
-/// X.690 8.1.2.2 / 8.14.4: the five refusal responses differ from a
-/// SearchResultDone only in the protocolOp identifier octet.
+/// X.690 8.1.2.2 / 8.14.4; docs/questions/Q-190 item 1 (A-54): the five
+/// refusal responses are parse-ldap's typed `UnsupportedResponse`, which
+/// decodes back to itself and differs from a SearchResultDone only in the
+/// protocolOp identifier octet (`[APPLICATION n]`, constructed).
 #[test]
 fn unsupported_responses_carry_the_matching_application_tag() {
     for (op, tag) in [
@@ -603,6 +608,13 @@ fn unsupported_responses_carry_the_matching_application_tag() {
                 ResultCode::UnwillingToPerform,
             )
             .expect("encodes");
+            assert_eq!(
+                decode(&octets).protocol_op,
+                ProtocolOp::UnsupportedResponse {
+                    op,
+                    result: LdapResult::new(ResultCode::UnwillingToPerform),
+                }
+            );
             let done = encode_message(&LdapMessage {
                 message_id: id(n),
                 protocol_op: ProtocolOp::SearchResultDone(LdapResult::new(
@@ -612,13 +624,13 @@ fn unsupported_responses_carry_the_matching_application_tag() {
             })
             .expect("encodes");
             assert_eq!(octets.len(), done.len());
-            let at = respond::protocol_op_offset(&octets).expect("offset");
-            assert_eq!(done[at], 0x65);
-            assert_eq!(octets[at], 0x60 | tag);
             let differing: Vec<usize> = (0..octets.len())
                 .filter(|&i| octets[i] != done[i])
                 .collect();
-            assert_eq!(differing, vec![at]);
+            assert_eq!(differing.len(), 1);
+            let at = differing[0];
+            assert_eq!(done[at], 0x65);
+            assert_eq!(octets[at], 0x60 | tag);
         }
     }
 }

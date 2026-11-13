@@ -47,8 +47,12 @@
 //!
 //! - The tier map is trusted as given: verifying the signed policy store
 //!   over it (docs/06 §9, D17) is a follow-up.
-//! - DNs are accepted only in the directory's own form ([`DirectoryView::dn_of`]);
-//!   RFC 4514 parsing is the LDAP layer's (docs/47 §8.2 ⚠).
+//! - DNs reach the PIP only in the directory's own form
+//!   ([`DirectoryView::dn_of`]), which ends with the configured
+//!   [`NamingContext`] (A-53: the NC root maps to exactly that DN). An LDAP
+//!   client's DN, already parsed by the LDAP layer (RFC 4514, parse-ldap),
+//!   is resolved with [`DirectoryView::lookup_dn`] (case-folded, docs/49
+//!   §7). An object outside the naming context has no DN here.
 //! - Phase 1 has no primaryGroupID, no builtin groups, no sIDHistory and no
 //!   contextual SIDs in the expansion (docs/47 §5.3 item 6).
 //! - No fuzz target: no network parser here — the input is MAC-verified
@@ -76,6 +80,7 @@
 mod error;
 mod groups;
 mod names;
+mod naming;
 mod record;
 mod salt;
 mod state;
@@ -85,6 +90,8 @@ mod view;
 
 pub use error::ViewError;
 pub use groups::{MAX_EXPANDED_GROUPS, MAX_NESTING_DEPTH};
+pub use naming::{NamingContext, MAX_NC_LABELS, NC_RDN_ATTRIBUTE};
 pub use salt::{account_salt, AccountKind, SaltError};
 pub use tier::TierMap;
+pub use time::{dstime_of, time_of_dstime};
 pub use view::{DirectoryContext, DirectoryView, MAX_DN_DEPTH};

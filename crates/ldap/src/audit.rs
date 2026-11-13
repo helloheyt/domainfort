@@ -32,7 +32,7 @@
 //! purposes only").
 
 use crate::ConnectionAction;
-use dtyp::Sid;
+use dtyp::{Guid, Sid};
 use krb_proto::KerberosTime;
 use parse_ldap::{MessageId, ResultCode, UnsupportedOp};
 use pdp::{IpScope, ReasonCode, TransportSec};
@@ -148,11 +148,15 @@ pub struct BindAudit {
 
 /// What a request was about, once resolved — never the client's DN string.
 /// Spec: docs/49 §10.1 (`target: Option<Guid> — only after resolution`).
-/// Task L8 adds directory objects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AuditTarget {
     /// The rootDSE ([MS-ADTS] 3.1.1.3; `pdp::Resource::RootDse`).
     RootDse,
+    /// The directory object a search's base resolved to, by its objectGUID
+    /// (recorded whether or not it turned out visible — the record is
+    /// internal; the client sees noSuchObject either way). Spec: docs/49
+    /// §10.1; [MS-ADTS] 3.1.1.1.3.
+    DirObject(Guid),
 }
 
 /// The scope of a search. Spec: RFC 4511 §4.5.1.2.
@@ -168,15 +172,41 @@ pub enum AuditScope {
     Unrecognized,
 }
 
-/// The search facts of an event. Spec: docs/49 §10.1 (`search: { scope,
-/// filter_attrs, entries_returned, … }` — the filter attributes and the
-/// visit counters arrive with task L8).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The search facts of an event: counts and schema names only — no
+/// attribute value, no assertion value, no client string.
+/// Spec: docs/49 §10.1 (`search: { scope, filter_attrs, entries_returned,
+/// candidates_visited, pruned_subtrees }`; "DENY is a detection signal" —
+/// docs/05 §8).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchAudit {
     /// The requested scope.
     pub scope: AuditScope,
     /// How many SearchResultEntry messages were sent.
     pub entries_returned: u32,
+    /// How many candidate objects were read and evaluated (the visit
+    /// budget's counter, crate::search).
+    pub candidates_visited: u32,
+    /// How many containers were not descended into because the requester
+    /// may not list them (docs/49 §6.1 item 3, pruning).
+    pub pruned_subtrees: u32,
+    /// The lDAPDisplayNames of the recognised attributes the filter names,
+    /// sorted, each once (schema constants — never a client spelling).
+    /// Lets a broad scan such as `(servicePrincipalName=*)` be detected
+    /// (docs/49 §10.1).
+    pub filter_attrs: Vec<&'static str>,
+}
+
+impl SearchAudit {
+    /// The facts of a search of `scope` before anything was counted.
+    pub(crate) fn new(scope: AuditScope) -> SearchAudit {
+        SearchAudit {
+            scope,
+            entries_returned: 0,
+            candidates_visited: 0,
+            pruned_subtrees: 0,
+            filter_attrs: Vec::new(),
+        }
+    }
 }
 
 /// The internal reason for an outcome. Never sent to the client.
@@ -285,8 +315,61 @@ pub enum AuditReason {
     /// §5.2; RFC 4512 §5.1 ("The root DSE SHALL NOT be included if the
     /// client performs a subtree search starting from the root").
     RootDseScopeNotBase,
-    /// A search of anything but the rootDSE: task L8. Spec: docs/49 §12.
+    /// A search of the directory when the request inputs carry no directory
+    /// view (a front that serves only the rootDSE): unwillingToPerform.
+    /// Spec: docs/49 §12; crate::inputs (`directory`).
     SearchNotImplemented,
+    /// A directory search completed: every candidate in scope was
+    /// considered. Spec: RFC 4511 §4.5.2; docs/49 §6.
+    SearchCompleted,
+    /// The search base is not a valid LDAPDN (RFC 4514 grammar, a
+    /// multi-valued RDN, or an alternative form other than `<GUID=hex>`).
+    /// Spec: RFC 4511 A.2 (invalidDNSyntax); docs/49 §9; Q-195 item 4.
+    BaseDnSyntax,
+    /// The search base names no object of the naming context (absent, a
+    /// value no phase-1 object can carry, or outside the NC): noSuchObject.
+    /// Spec: RFC 4511 §4.5.3; docs/49 §5.4, §9; Q-195 item 4; A-53.
+    BaseNotFound,
+    /// The search base exists but is not visible to the requester:
+    /// noSuchObject, identical to a nonexistent base (R49-13; A-48).
+    /// Spec: [MS-ADTS] 5.1.3.3.6; docs/49 §6.1 item 2, §9.
+    BaseNotVisible,
+    /// The client's sizeLimit stopped the search; the entries already sent
+    /// stand. Spec: RFC 4511 §4.5.1.4, A.2 (sizeLimitExceeded).
+    SizeLimitExceeded,
+    /// The server's page bound (MaxPageSize, or the PDP's MaxPageSize
+    /// obligation) stopped the search: adminLimitExceeded. Spec: [MS-ADTS]
+    /// 3.1.1.3.4.6; docs/49 §6.1 item 7; Q-168 item 5.
+    PageLimitExceeded,
+    /// The fixed visit budget stopped the search: adminLimitExceeded.
+    /// Spec: docs/49 §6.1 item 3 (`MAX_CANDIDATES_VISITED`); Q-168 item 5.
+    VisitBudgetExceeded,
+    /// The response octet bound stopped the search: adminLimitExceeded.
+    /// Spec: docs/49 §6.1 item 7 (`MAX_RESPONSE_OCTETS`).
+    ResponseTooLarge,
+    /// The bound on DN-valued values resolved for one search (member,
+    /// memberOf), or on the values of one attribute, stopped the search:
+    /// adminLimitExceeded. Spec: docs/49 §6.5 ("bounded").
+    ValueBudgetExceeded,
+    /// The tree is deeper than the DN bound: adminLimitExceeded.
+    /// Spec: AGENTS.md §6 (bounded work); directory-pip `MAX_DN_DEPTH`.
+    DepthExceeded,
+    /// The client's timeLimit passed (by the caller's clock): the entries
+    /// already sent stand. Spec: RFC 4511 §4.5.1.5, A.2 (timeLimitExceeded).
+    TimeLimitExceeded,
+    /// The server's query duration limit passed: timeLimitExceeded.
+    /// Spec: [MS-ADTS] 3.1.1.3.4.6 (MaxQueryDuration); docs/49 §9.
+    QueryDurationExceeded,
+    /// The directory could not answer (an integrity, consistency or storage
+    /// failure, or a PIP failure while reading the base): other, fail
+    /// closed. Spec: docs/49 §9 (`Tamper`, `Inconsistent`, I/O → other).
+    DirectoryUnavailable,
+    /// The directory view's naming context differs from the engine's
+    /// configured one (one source of truth, A-53): other, fail closed.
+    NamingContextMismatch,
+    /// A returned entry's DN cannot be written as an LDAPDN within the codec
+    /// bound: other, fail closed. Spec: docs/49 §2.4; RFC 4514 §2.
+    UnrepresentableDn,
     /// The PDP denied the request. Spec: docs/11 §4; docs/49 §9.
     PolicyDenied(ReasonCode),
     /// The PDP's RateLimit obligation was not admitted. Spec: docs/11 §2,

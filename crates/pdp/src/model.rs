@@ -470,6 +470,15 @@ pub struct Instant(pub u64);
 /// NcacnIpTcpPrivacy | Cldap | ...`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Transport {
+    /// LDAP with no TLS layer: the cleartext listener before any StartTLS
+    /// (docs/49 §4.3 names `Ldaps` for 636 and for 389 after StartTLS, and
+    /// nothing for 389 before it). Recorded so the LDAP PEP reports the
+    /// transport truthfully; the security state it carries is
+    /// `Context.transport_sec`, which is what [`crate::decide`] reads —
+    /// `decide` reads no `Context.transport` value, so this variant changes
+    /// no decision. Spec: docs/49 §4.3, §4.4; docs/questions/Q-190 item 2
+    /// (A-54).
+    Ldap,
     /// LDAP over TLS.
     Ldaps,
     /// LDAP with a SASL security layer.

@@ -285,7 +285,7 @@ fn realm_must_be_upper_case() {
     let p1 = ad_schema::phase1().unwrap();
     let lower = keyd::KeydConfig::new(krb_proto::Realm::new("Example.test").unwrap());
     assert!(matches!(
-        DirectoryContext::new(p1, &lower),
+        DirectoryContext::new(p1, &lower, naming_context()),
         Err(ViewError::RealmNotUppercase)
     ));
 }

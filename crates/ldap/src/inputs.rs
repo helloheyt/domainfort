@@ -12,6 +12,7 @@
 //! `connection_id` and the transport state), §10.2; docs/11 §2, §6, §8;
 //! docs/47 §8.1 (R47-11).
 
+use directory_pip::DirectoryView;
 use kdc::AccountSource;
 use krb_proto::KerberosTime;
 use pdp::{IpScope, Pip, PolicySnapshot, RlKey};
@@ -53,6 +54,35 @@ pub trait RateLimiter {
     fn admit(&mut self, key: &RlKey, now: &KerberosTime) -> bool;
 }
 
+/// The caller's time source during a directory search, which the engine
+/// consults between candidates to honour timeLimit and the server's query
+/// duration limit. The engine itself reads no clock (docs/49 §11): it asks
+/// this source, which the caller owns (and a test drives).
+/// Spec: RFC 4511 §4.5.1.5 ("the maximum time (in seconds) allowed for a
+/// Search"); [MS-ADTS] 3.1.1.3.4.6 (MaxQueryDuration); docs/49 §6.1 item 7,
+/// §11.
+pub trait SearchClock {
+    /// The caller's current time.
+    fn now(&self) -> KerberosTime;
+}
+
+/// What a directory search needs beyond the PDP inputs: the request's
+/// directory view and the caller's time source.
+///
+/// The view is one dirstore snapshot (docs/49 §6.1: "against one snapshot";
+/// [MS-ADTS] 3.1.1.5.1.4). For a directory search the engine takes every PIP
+/// answer from it as well (it implements `pdp::Pip`), so the objects it
+/// enumerates and the descriptors the PDP reads come from the same snapshot
+/// (docs/11 §6 P9); the caller passes the same view as `pip` and `accounts`
+/// (docs/47 §8.1, R47-11).
+/// Spec: docs/49 §6, §11; docs/47 §8.1.
+pub struct DirectoryInputs<'a> {
+    /// The request's directory view.
+    pub view: &'a DirectoryView<'a>,
+    /// The caller's time source (timeLimit).
+    pub clock: &'a dyn SearchClock,
+}
+
 /// Everything one request is decided against. Spec: module documentation.
 pub struct RequestInputs<'a> {
     /// The versioned policy snapshot. Spec: docs/11 §3, §6.
@@ -69,4 +99,8 @@ pub struct RequestInputs<'a> {
     pub now: KerberosTime,
     /// The transport facts the front observed.
     pub transport: TransportReport,
+    /// The directory, for a search of it (docs/49 R49-9, task L8). `None`
+    /// for a front that serves only the rootDSE: a directory search is then
+    /// unwillingToPerform.
+    pub directory: Option<DirectoryInputs<'a>>,
 }

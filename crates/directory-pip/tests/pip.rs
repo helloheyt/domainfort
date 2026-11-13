@@ -21,9 +21,13 @@ fn attr_guid(d: &Dir, name: &str) -> AttrId {
     AttrId(d.p1.attribute_schema_id_guid(d.attr(name)).unwrap())
 }
 
-/// docs/47 §8.2 (DN resolution): the directory's own DN form — leaf first,
-/// `<RDN attribute>=<stored value>` — resolves back to the object; any
-/// other spelling (case, attribute label, missing component) is NotFound.
+/// docs/47 §8.2 (DN resolution); A-53 ([MS-ADTS] 3.1.1.1.4: "The DN of a
+/// child object is the RDN of the child, followed by "," and the DN of the
+/// parent"; the root's DN is the assigned naming context): the directory's
+/// own DN form — leaf first, `<RDN attribute>=<stored value>`, ending with
+/// the naming context dc=example,dc=test — resolves back to the object; any
+/// other spelling (case, attribute label, missing component, missing or
+/// wrong suffix) is NotFound.
 #[test]
 fn dn_round_trip_and_strict_resolution() {
     let d = Dir::standard("dn");
@@ -34,20 +38,26 @@ fn dn_round_trip_and_strict_resolution() {
         &[
             "cn=alice".to_string(),
             "ou=Staff".into(),
-            "dc=example".into()
+            "dc=example".into(),
+            "dc=test".into()
         ]
     );
     assert_eq!(view.object_sid(&alice), Ok(Some(sid_of(ALICE))));
     assert_eq!(view.dn_of(guid(9999)), Ok(None));
     for bad in [
-        vec!["cn=Alice", "ou=Staff", "dc=example"],
-        vec!["CN=alice", "ou=Staff", "dc=example"],
-        vec!["cn=alice", "ou=staff", "dc=example"],
-        vec!["ou=alice", "ou=Staff", "dc=example"],
-        vec!["cn=alice", "dc=example"],
-        vec!["cn=alice", "ou=Staff"],
-        vec!["alice", "ou=Staff", "dc=example"],
-        vec!["cn=", "ou=Staff", "dc=example"],
+        vec!["cn=Alice", "ou=Staff", "dc=example", "dc=test"],
+        vec!["CN=alice", "ou=Staff", "dc=example", "dc=test"],
+        vec!["cn=alice", "ou=staff", "dc=example", "dc=test"],
+        vec!["ou=alice", "ou=Staff", "dc=example", "dc=test"],
+        vec!["cn=alice", "dc=example", "dc=test"],
+        vec!["cn=alice", "ou=Staff", "dc=test"],
+        vec!["alice", "ou=Staff", "dc=example", "dc=test"],
+        vec!["cn=", "ou=Staff", "dc=example", "dc=test"],
+        // The suffix is the naming context, exactly (A-53).
+        vec!["cn=alice", "ou=Staff", "dc=example"],
+        vec!["cn=alice", "ou=Staff", "dc=example", "dc=TEST"],
+        vec!["cn=alice", "ou=Staff", "dc=example", "dc=other"],
+        vec!["cn=alice", "ou=Staff", "dc=example", "dc=test", "dc=extra"],
         vec![],
     ] {
         let dn = Dn::new(bad.iter().map(|s| s.to_string()).collect());
@@ -64,8 +74,183 @@ fn security_descriptor() {
     let view = d.view();
     let ou = view.dn_of(guid(STAFF_OU)).unwrap().unwrap();
     assert_eq!(view.security_descriptor(&ou), Ok(sd()));
-    let ghost = Dn::new(vec!["ou=Ghost".into(), "dc=example".into()]);
+    let ghost = Dn::new(vec![
+        "ou=Ghost".into(),
+        "dc=example".into(),
+        "dc=test".into(),
+    ]);
     assert_eq!(view.security_descriptor(&ghost), Err(PipError::NotFound));
+}
+
+/// A-53; [MS-ADTS] 3.1.1.1.4 ("The DN of the root has an assigned value"),
+/// 3.1.1.1.5 (a domain NC's DN "dc=n1,dc=n2, ... dc=nk"): the NC root maps
+/// to exactly the configured naming context, and that DN resolves to it.
+#[test]
+fn the_nc_root_maps_to_exactly_the_naming_context() {
+    let d = Dir::standard("nc-root");
+    let view = d.view();
+    let root = view.dn_of(guid(ROOT)).unwrap().unwrap();
+    assert_eq!(root, naming_context().dn().clone());
+    assert_eq!(
+        root.rdns(),
+        &["dc=example".to_string(), "dc=test".to_string()]
+    );
+    assert_eq!(view.object_sid(&root), Ok(Some(domain_sid())));
+    assert_eq!(view.context().naming_context().dns_name(), "example.test");
+}
+
+/// docs/49 §7 (R49-11: a client may spell the case differently;
+/// `lookup_child` folds) and A-53 (the suffix compared by its case-folded
+/// comparison key, then stripped): `lookup_dn` resolves a client's DN to
+/// the object; a DN outside the naming context, a wrong attribute label, or
+/// a missing component names nothing.
+#[test]
+fn client_dns_resolve_case_insensitively_below_the_suffix() {
+    let d = Dir::standard("lookup-dn");
+    let view = d.view();
+    let found = |rdns: &[(&str, &str)]| view.lookup_dn(rdns).unwrap();
+    assert_eq!(
+        found(&[
+            ("CN", "ALICE"),
+            ("ou", "staff"),
+            ("DC", "Example"),
+            ("dc", "TEST")
+        ]),
+        Some(guid(ALICE))
+    );
+    assert_eq!(
+        found(&[("dc", "example"), ("dc", "test")]),
+        Some(guid(ROOT))
+    );
+    assert_eq!(
+        found(&[("Dc", "EXAMPLE"), ("dC", "Test")]),
+        Some(guid(ROOT))
+    );
+    for bad in [
+        // Outside the naming context.
+        vec![("cn", "alice"), ("ou", "Staff"), ("dc", "example")],
+        vec![
+            ("cn", "alice"),
+            ("ou", "Staff"),
+            ("dc", "example"),
+            ("dc", "com"),
+        ],
+        vec![("dc", "test")],
+        vec![],
+        // The suffix's attribute is dc.
+        vec![("ou", "example"), ("dc", "test")],
+        // Not the RDN attribute of the object found.
+        vec![
+            ("ou", "alice"),
+            ("ou", "Staff"),
+            ("dc", "example"),
+            ("dc", "test"),
+        ],
+        // A numeric OID names no attribute here (Q-195 item 10).
+        vec![
+            ("2.5.4.3", "alice"),
+            ("ou", "Staff"),
+            ("dc", "example"),
+            ("dc", "test"),
+        ],
+        // No such object.
+        vec![
+            ("cn", "carol"),
+            ("ou", "Staff"),
+            ("dc", "example"),
+            ("dc", "test"),
+        ],
+        vec![("cn", "alice"), ("dc", "example"), ("dc", "test")],
+        // Not printable ASCII (Q-080).
+        vec![
+            ("cn", "al\u{e9}"),
+            ("ou", "Staff"),
+            ("dc", "example"),
+            ("dc", "test"),
+        ],
+    ] {
+        assert_eq!(view.lookup_dn(&bad), Ok(None), "{bad:?}");
+    }
+}
+
+/// A-53: the naming context is configuration, checked: its labels are
+/// non-empty printable ASCII without "." ([MS-ADTS] 3.1.1.1.5 "n1.n2. ...
+/// .nk"; Q-080), and its DNS name in upper case must be the realm (docs/47
+/// §3.3 item 3).
+#[test]
+fn the_naming_context_is_checked() {
+    use directory_pip::NamingContext;
+    let empty: [&str; 0] = [];
+    for bad in [
+        &empty[..],
+        &[""][..],
+        &["exa.mple", "test"][..],
+        &["exampl\u{e9}", "test"][..],
+        &["ex\tample", "test"][..],
+    ] {
+        assert_eq!(
+            NamingContext::new(bad),
+            Err(ViewError::NamingContext),
+            "{bad:?}"
+        );
+    }
+    let too_long = "x".repeat(252);
+    assert_eq!(
+        NamingContext::new(&[too_long.as_str()]),
+        Err(ViewError::NamingContext)
+    );
+    assert!(NamingContext::new(&["x".repeat(251).as_str()]).is_ok());
+    let p1 = ad_schema::phase1().unwrap();
+    for other in [
+        &["example", "org"][..],
+        &["example"][..],
+        &["sub", "example", "test"][..],
+    ] {
+        assert!(
+            matches!(
+                DirectoryContext::new(
+                    p1.clone(),
+                    &keyd_config(),
+                    NamingContext::new(other).unwrap()
+                ),
+                Err(ViewError::NamingContext)
+            ),
+            "{other:?}"
+        );
+    }
+    // The case of the labels is the deployment's; only the realm is upper case.
+    assert!(DirectoryContext::new(
+        p1,
+        &keyd_config(),
+        NamingContext::new(&["Example", "TEST"]).unwrap()
+    )
+    .is_ok());
+}
+
+/// A-53 (fail closed): when no root object carries the naming context's
+/// first label, nothing is in the naming context — no DN, no resolution.
+#[test]
+fn a_directory_without_the_nc_root_has_no_dns() {
+    let d = Dir::new("no-nc-root");
+    d.create_all(vec![d.object(
+        ROOT,
+        None,
+        "domainDNS",
+        &[
+            ("dc", vec![b"elsewhere".to_vec()]),
+            ("objectSid", vec![domain_sid().encode()]),
+        ],
+    )]);
+    let view = d.view();
+    assert_eq!(view.dn_of(guid(ROOT)), Ok(None));
+    assert_eq!(
+        view.lookup_dn(&[("dc", "example"), ("dc", "test")]),
+        Ok(None)
+    );
+    assert_eq!(
+        view.object_sid(&naming_context().dn().clone()),
+        Err(PipError::NotFound)
+    );
 }
 
 /// docs/47 §8.2; A-28; [MS-ADTS] 3.1.1.2.4.3: `object_classes` = the most
@@ -215,7 +400,7 @@ fn view_refuses_a_store_with_another_schema() {
     let mut bad = keyd_config();
     bad.enctypes.clear();
     assert!(matches!(
-        DirectoryContext::new(d.p1.clone(), &bad),
+        DirectoryContext::new(d.p1.clone(), &bad, naming_context()),
         Err(ViewError::KeydConfig)
     ));
 }

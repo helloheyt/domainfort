@@ -1,0 +1,63 @@
+# cargo-fuzz harness for the LDAP engine's own parsers of network input
+# (AGENTS.md §6 / docs/32 §8: every parser gets a fuzz target before it merges
+# to main; docs/49 §2.5): the filter assertion-value parsers of search (RFC
+# 4517 Integer, Generalized Time, Boolean; the Q-080 string fold; the RFC
+# 4512 OID check; the substring rule) and filter evaluation over a fixed
+# in-memory entry. The message and DN codecs are parse-ldap's and are fuzzed
+# in crates/parse-ldap/fuzz.
+#
+# This is a SEPARATE workspace (note the empty [workspace] table below): it is
+# intentionally NOT a member of the root workspace, so `cargo build --all`,
+# `cargo clippy`, `cargo test`, `cargo deny` and the SBOM in the product
+# workspace never pull in the fuzzing-only dependencies. It is built only via
+# `cargo fuzz run ldap_assertion_values` / `cargo fuzz run
+# ldap_filter_fixed_entry` (nightly + cargo-fuzz).
+#
+# NOTE FOR REVIEW: libfuzzer-sys is fuzz-harness-only test infrastructure, not
+# linked into any product crate, and on the license allowlist (MIT / Apache-2.0,
+# AGENTS.md §7). Pending owner sign-off (docs/questions/PENDING-OWNER.md P-1);
+# not built or run until then.
+
+[package]
+name = "ldap-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+# The engine, with the `fuzz-hooks` feature that exposes `ldap::fuzz_hooks`
+# (the engine's own code, unchanged — crates/ldap/src/search/fuzz.rs).
+[dependencies.ldap]
+path = ".."
+features = ["fuzz-hooks"]
+
+# Decoding arbitrary octets into a Filter (the form the engine receives).
+[dependencies.parse-ldap]
+path = "../../parse-ldap"
+
+# The assertion-value parsers with their round-trip properties
+# (`cargo fuzz run ldap_assertion_values`).
+[[bin]]
+name = "ldap_assertion_values"
+path = "fuzz_targets/ldap_assertion_values.rs"
+test = false
+doc = false
+bench = false
+
+# Arbitrary octets decoded as a SearchRequest filter, evaluated over the fixed
+# in-memory entry with the three-valued laws (`cargo fuzz run
+# ldap_filter_fixed_entry`).
+[[bin]]
+name = "ldap_filter_fixed_entry"
+path = "fuzz_targets/ldap_filter_fixed_entry.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the root workspace (see header).
+[workspace]

@@ -34,6 +34,9 @@ pub(crate) struct Ids {
     pub(crate) member_of: AttrId,
     pub(crate) group_type: AttrId,
     pub(crate) nt_security_descriptor: AttrId,
+    /// The RDN attribute of every component of the naming context's DN
+    /// (A-53; [MS-ADTS] 3.1.1.1.5, 3.1.1.3.1.2.2).
+    pub(crate) dc: AttrId,
     pub(crate) user: ClassId,
     pub(crate) computer: ClassId,
     pub(crate) group: ClassId,
@@ -57,6 +60,7 @@ impl Ids {
             member_of: attr("memberOf")?,
             group_type: attr("groupType")?,
             nt_security_descriptor: attr("nTSecurityDescriptor")?,
+            dc: attr(crate::naming::NC_RDN_ATTRIBUTE)?,
             user: class("user")?,
             computer: class("computer")?,
             group: class("group")?,
@@ -80,6 +84,12 @@ impl Ids {
         // memberOf is answered from the reverse-link index.
         let member_of = schema.attribute(ids.member_of).ok_or(ViewError::Schema)?;
         if !matches!(member_of.link, Some(Link::Back { .. })) {
+            return Err(ViewError::Schema);
+        }
+        // The NC root is a domainDNS object named by dc ([MS-ADTS]
+        // 3.1.1.3.1.2.2: "The rDNAttID for the domainDNS class is dc").
+        let domain_dns = schema.class(ids.domain_dns).ok_or(ViewError::Schema)?;
+        if domain_dns.rdn_attr != ids.dc {
             return Err(ViewError::Schema);
         }
         Ok(ids)

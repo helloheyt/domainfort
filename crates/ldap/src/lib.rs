@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 //! `ldap`: the LDAP engine — the Policy Enforcement Point behind
-//! `ldap-front` (docs/49 R49-16, §11) — build task L4, the skeleton
-//! (docs/49 §12).
+//! `ldap-front` (docs/49 R49-16, §11) — build tasks L4 (the skeleton) and
+//! L8 (Search over the directory) of docs/49 §12.
 //!
 //! # What it is
 //!
@@ -11,28 +11,36 @@
 //! form and calls [`Engine::handle`] with the connection's [`Session`] and
 //! the [`RequestInputs`] of that request: one policy snapshot and its PIP,
 //! the account source of the same directory view, the caller's rate
-//! limiter, `now`, and the [`TransportReport`] (source zone, whether TLS is
-//! up, whether more octets are already buffered). The engine decodes the
+//! limiter, `now`, the [`TransportReport`] (source zone, whether TLS is
+//! up, whether more octets are already buffered), and — for a search of the
+//! directory — the [`DirectoryInputs`] (the request's directory view and the
+//! caller's [`SearchClock`]). The engine decodes the
 //! message with the **canonical profile only** (R49-16: a compromised front
 //! reaches the engine only with canonical, bounded input) and returns an
 //! [`Outcome`]: zero or more canonical response encodings, a
 //! [`ConnectionAction`] (Continue / StartTls / Close) and exactly one
 //! [`AuditEvent`].
 //!
-//! # Scope of L4 (docs/49 §12)
+//! # Scope (docs/49 §12)
 //!
-//! - The session state machine — cleartext / TLS (LDAPS or StartTLS), a
+//! - L4: the session state machine — cleartext / TLS (LDAPS or StartTLS), a
 //!   pending StartTLS, anonymous / bound identity, closed (the session
-//!   module's documentation; R49-15).
-//! - Dispatch, the error table (R49-13), audit (R49-14), the size bound
-//!   per authentication state, the rootDSE (R49-10), Unbind, Abandon,
-//!   StartTLS with the injection protection, and every refusal path of
-//!   docs/49 §3.1, §5.1, §5.3.
-//! - Not here: search of the directory (task L8 — every search other than
-//!   the rootDSE is unwillingToPerform), the GSSAPI bind (task L7, blocked on
-//!   owner item P-13 — every SASL mechanism is authMethodNotSupported, with
-//!   a single seam in the bind module), DN handling (task L5), writes (none in
-//!   phase 1, A-48 / Q-167).
+//!   module's documentation; R49-15); dispatch, the error table (R49-13),
+//!   audit (R49-14), the size bound per authentication state, the rootDSE
+//!   (R49-10), Unbind, Abandon, StartTLS with the injection protection, and
+//!   every refusal path of docs/49 §3.1, §5.1, §5.3.
+//! - L8: Search over the directory (R49-9, crate::search): base resolution
+//!   through the naming context (A-53) and `<GUID=hex>`, the three scopes
+//!   with paging and pruning, visibility before the filter, the
+//!   three-valued filter over readable attributes, the unique-index fast
+//!   path, the bounds (visit budget, page, octets, sizeLimit, timeLimit on
+//!   the caller's clock), attribute selection, derived attributes, the LDAP
+//!   representations of the phase-1 syntaxes, DN values filtered by
+//!   visibility; Secret attributes and nTSecurityDescriptor never returned.
+//! - Not here: the GSSAPI bind (task L7, blocked on owner item P-13 — every
+//!   SASL mechanism is authMethodNotSupported, with a single seam in the
+//!   bind module; until then only the crate's tests build a bound session),
+//!   writes (none in phase 1, A-48 / Q-167), controls (none, R49-8).
 //!
 //! # Refusals and their result codes (docs/49 §3.1, §5, §9)
 //!
@@ -53,7 +61,12 @@
 //! | StartTLS with a requestValue | protocolError (2) |
 //! | other extended operation | protocolError (2), no responseName (RFC 4511 §4.12) |
 //! | search, unrecognised scope | protocolError (2) (docs/49 E14) |
-//! | search of anything but the rootDSE, or the empty base not at baseObject | unwillingToPerform (53) |
+//! | the empty base not at baseObject; a directory search with no directory view | unwillingToPerform (53) |
+//! | directory search: base not an LDAPDN | invalidDNSyntax (34) (Q-195 item 4) |
+//! | directory search: base absent, outside the NC, or not visible | noSuchObject (32), identical octets (R49-13, A-48) |
+//! | directory search, anonymous / weak transport | operationsError (1) / confidentialityRequired (13) / strongerAuthRequired (8), before the base is looked at (Q-169 item 3) |
+//! | directory search: sizeLimit / server page, visit, octet, value or depth bound / timeLimit or query duration | sizeLimitExceeded (4) / adminLimitExceeded (11) / timeLimitExceeded (3), after the entries already sent (RFC 4511 §4.5.2) |
+//! | directory failure (integrity, consistency, storage), PIP failure, naming-context mismatch | other (80) |
 //! | rootDSE denied by the PDP | operationsError / confidentialityRequired / strongerAuthRequired / insufficientAccessRights / other (crate::subject) |
 //! | rootDSE rate-limited / page size 0 | busy (51) / adminLimitExceeded (11) |
 //! | Modify / Add / Delete / ModifyDN / Compare | unwillingToPerform (53), matching response tag (A-48) |
@@ -62,15 +75,21 @@
 //!
 //! # Fuzzing
 //!
-//! No fuzz target here: the engine parses nothing itself — every octet it
-//! reads goes through `parse_ldap::decode_message`, whose fuzz targets live
-//! in `crates/parse-ldap/fuzz` (docs/49 §2.5). The engine's own octet step
-//! (the response tag of crate::respond) runs only on its own encoder output.
+//! The engine's message input goes through `parse_ldap::decode_message` and
+//! its DNs (search base, DN assertions) through
+//! `parse_ldap::dn::parse_ldap_dn`, whose fuzz targets live in
+//! `crates/parse-ldap/fuzz` (docs/49 §2.5). The engine's own parsers of
+//! filter assertion values (RFC 4517 Integer, Generalized Time, Boolean; the
+//! Q-080 fold; the OID check; the substring rule — crate::search::syntax)
+//! and filter evaluation over a fixed in-memory entry (crate::search::filter,
+//! through the same `EntryView` seam a candidate uses) have fuzz targets in
+//! the detached workspace `crates/ldap/fuzz` (`ldap_assertion_values`,
+//! `ldap_filter_fixed_entry`), reached through the `fuzz-hooks` feature,
+//! which no product build enables (AGENTS.md §6; built only after owner item
+//! P-1).
 //!
 //! # Residuals (documented, not hidden)
 //!
-//! - `pdp::Transport` has no cleartext-LDAP variant; the engine reports
-//!   `Ldaps` with the truthful `transport_sec` (Q-190 item 2).
 //! - The rootDSE follows [MS-ADTS] 3.1.1.3.2's "Operational?" column, not
 //!   RFC 4512 §5.1 (Q-190 item 5); the filter of a rootDSE search is ignored
 //!   ([MS-ADTS] 3.1.1.3.1.3.6).
@@ -78,9 +97,12 @@
 //!   TLS (docs/49 §4.3, §5.2); an attacker on the path can strip
 //!   supportedExtension (RFC 4513 §6.2) — the native client requires TLS by
 //!   configuration (docs/49 §5.2).
-//! - The responses of the five unsupported operations are produced by
-//!   rewriting one identifier octet of a canonical SearchResultDone
-//!   (crate::respond; Q-190 item 1).
+//! - Search: the response time of a wholeSubtree search depends on the size
+//!   of the visible subtree (docs/49 §6.6); the budget and pruning bound it,
+//!   they do not hide it. objectCategory is evaluated in filters but not
+//!   returned (no schema NC, Q-168 item 3). String(Unicode) comparison is
+//!   the ASCII interim rule (Q-080, P-9). The interpretations of this build
+//!   are docs/questions/Q-200.
 //!
 //! # Provenance
 //!
@@ -101,15 +123,26 @@
 //! 5.1.2.1, 5.1.2.2, 5.1.3, 5.1.3.1; [MS-DTYP] v20241119 (0f4a3744…83b3)
 //! 2.4.2.4; ITU-T X.690 (02/2021) (6ac799a2…bd6c) 8.1.2.2-8.1.2.5,
 //! 8.1.3.3-8.1.3.5, 8.3.1, 8.9.1, 8.14.3, 8.14.4; ITU-T X.680 (02/2021)
-//! (b69dc475…ee14) Table 1. This project's documents: AGENT-ONBOARDING,
-//! AGENTS, docs/49 (decided, A-45..A-48), docs/11 §2, docs/questions Q-163,
-//! Q-166, Q-167, Q-169, Q-170 (A-51), Q-185 (A-52), PENDING-OWNER (A-45..A-52,
-//! P-12, P-13, P-14). The source and documentation of this project's own
-//! crates parse-ldap, pdp, kdc, directory-pip, keyd, krb-proto and dtyp were
+//! (b69dc475…ee14) Table 1. Task L8 added: RFC 4511 §4.5 (all of
+//! §4.5.1-§4.5.3), App. A (result codes); RFC 4512 §1.4, §2.5; RFC 4517
+//! §3.3.3, §3.3.6, §3.3.9, §3.3.13, §3.3.16, §3.3.25, §3.3.26, §3.3.30,
+//! §4.2.2, §4.2.6, §4.2.16, §4.2.17, §4.2.19, §4.2.20, §4.2.27, §4.2.28 and
+//! its header ("Obsoletes: 2252"); [MS-ADTS] 3.1.1.1.4, 3.1.1.1.5,
+//! 3.1.1.2.2.2 (with .1-.8), 3.1.1.2.2.3, 3.1.1.2.2.4 (with .1-.14),
+//! 3.1.1.3.1.1.3 (introduction), 3.1.1.3.1.2.1-3.1.1.3.1.2.5,
+//! 3.1.1.3.1.3.1-3.1.1.3.1.3.6, 3.1.1.3.4.6, 3.1.1.4.1-3.1.1.4.5
+//! (introduction), 5.1.3.3.6; [MS-DRSR] v20260309 (e8ce0c8c…b62c)
+//! 5.16.3.1-5.16.3.10, 5.51. This project's documents: AGENT-ONBOARDING,
+//! AGENTS, docs/46 §1, §2.3, §5, §6, §7, docs/47 §8.2, docs/49 (decided,
+//! A-45..A-48), docs/11 §2, docs/questions Q-163, Q-166, Q-167, Q-168,
+//! Q-169, Q-170 (A-51), Q-175 (A-49), Q-185 (A-52), Q-190 (A-54), Q-195
+//! (A-53), PENDING-OWNER (A-28..A-54, P-7, P-9, P-12, P-13, P-14). The
+//! source and documentation of this project's own crates parse-ldap, pdp,
+//! kdc, directory-pip, dirstore, ad-schema, keyd, krb-proto and dtyp were
 //! read for their APIs. No other implementation was consulted or recalled
 //! (AGENTS.md §1-3).
 //!
-//! Spec: docs/49 §3-§5, §9-§12; RFC 4511; RFC 4513.
+//! Spec: docs/49 §3-§12; RFC 4511; RFC 4513.
 
 mod audit;
 mod bind;
@@ -118,6 +151,7 @@ mod engine;
 mod inputs;
 mod respond;
 mod root_dse;
+mod search;
 mod session;
 mod subject;
 mod time;
@@ -131,5 +165,16 @@ pub use audit::{
 };
 pub use config::{ConfigError, EngineConfig, RootDseConfig};
 pub use engine::{ConnectionAction, Engine, Outcome};
-pub use inputs::{RateLimiter, RequestInputs, TransportReport};
+pub use inputs::{DirectoryInputs, RateLimiter, RequestInputs, SearchClock, TransportReport};
+pub use search::limits::{
+    CHILD_PAGE_SIZE, MAX_CANDIDATES_VISITED, MAX_DN_VALUES_RESOLVED, MAX_PAGE_SIZE,
+    MAX_QUERY_SECONDS, MAX_RESPONSE_OCTETS, MAX_VALUES_PER_RETURNED_ATTRIBUTE,
+};
 pub use session::{Listener, Session};
+
+/// Hooks for the detached fuzz workspace `crates/ldap/fuzz` only (AGENTS.md
+/// §6); compiled with the `fuzz-hooks` feature, which no product build
+/// enables. Not part of the engine's API.
+#[cfg(feature = "fuzz-hooks")]
+#[doc(hidden)]
+pub use search::fuzz as fuzz_hooks;

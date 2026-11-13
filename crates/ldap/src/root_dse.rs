@@ -62,9 +62,11 @@
 //! The values carry no secret and no directory data beyond configuration;
 //! the rootDSE has no Secret attribute (docs/49 §6.5).
 //!
-//! Value representations: Object(DS-DN) as the DN string, String(Unicode)
-//! as UTF-8, Integer as its decimal string, String(Object-Identifier) as the
-//! numeric OID ([MS-ADTS] 3.1.1.2.2.2 → RFC 4517 §3.3.16 for Integer).
+//! Value representations: Object(DS-DN) as the DN string (the naming
+//! context's RFC 4514 encoding — one source of truth with the directory,
+//! A-53, crate::config), String(Unicode) as UTF-8, Integer as its decimal
+//! string, String(Object-Identifier) as the numeric OID ([MS-ADTS]
+//! 3.1.1.2.2.2 → RFC 4517 §3.3.16 for Integer).
 //!
 //! Spec: [MS-ADTS] v20261026 3.1.1.2.2.2, 3.1.1.3, 3.1.1.3.1.3.6, 3.1.1.3.2
 //! (table; .3, .4, .13, .16, .21, .23, .24, .33), 3.1.1.3.4.2; RFC 4511
@@ -74,7 +76,7 @@
 
 use parse_ldap::{PartialAttribute, SearchResultEntry, START_TLS_OID};
 
-use crate::config::RootDseConfig;
+use crate::config::RootDseValues;
 
 /// The LDAP version advertised, as an Integer value (decimal digits).
 /// Spec: [MS-ADTS] 3.1.1.3.2.23; RFC 4517 §3.3.16; R49-17 (no LDAPv2).
@@ -124,7 +126,7 @@ impl Attribute {
     }
 
     /// The values. Spec: module documentation table.
-    fn values(self, config: &RootDseConfig) -> Vec<Vec<u8>> {
+    fn values(self, config: &RootDseValues) -> Vec<Vec<u8>> {
         let value = match self {
             Attribute::NamingContexts
             | Attribute::DefaultNamingContext
@@ -152,7 +154,7 @@ impl Attribute {
 /// nor `*`, nor an attribute name, so alone it selects nothing and beside
 /// other selectors it is ignored. Spec: module documentation.
 pub(crate) fn entry(
-    config: &RootDseConfig,
+    config: &RootDseValues,
     selection: &[String],
     types_only: bool,
 ) -> SearchResultEntry {

@@ -8,6 +8,8 @@
 # source, rate limiter, `now`, and the transport facts it observes), and gets
 # back zero or more canonical response messages, a connection action
 # (Continue / StartTls / Close) and exactly one audit event.
+# Task L8 adds Search over the directory (docs/49 R49-9) through the
+# request's directory view.
 #
 # Written only from RFC 4511, RFC 4512 §2.5/§5.1, RFC 4513, RFC 4517 §3.3.16,
 # RFC 4422 §3.1, RFC 4752 §3, [MS-ADTS] v20261026 3.1.1.2.2.2, 3.1.1.3.1.3.6,
@@ -42,8 +44,24 @@ krb-proto = { path = "../krb-proto" }
 # scale, also used by kdc); no keyd operation is called in L4. L7 will add
 # the `open_and_verify_service_ticket` call behind a trait.
 keyd = { path = "../keyd" }
-# SIDs for the PDP Subject.
+# SIDs for the PDP Subject; GUIDs of directory objects.
 dtyp = { path = "../dtyp" }
+# Search (task L8, docs/49 R49-9, §11): the per-request directory view (one
+# dirstore snapshot that is also the PDP's PIP — docs/47 §8.1), the naming
+# context (A-53) and the DSTIME conversion; the dirstore snapshot it exposes
+# (children, lookup_unique, back_links, get_object); the phase-1 schema
+# (attributes by lDAPDisplayName, class chains, CLASSATTS, syntaxes).
+directory-pip = { path = "../directory-pip" }
+dirstore = { path = "../dirstore" }
+ad-schema = { path = "../ad-schema" }
+
+[features]
+# Exposes `ldap::fuzz_hooks` — the assertion-value parsers of crate::search
+# and filter evaluation over a fixed in-memory entry — to the detached fuzz
+# workspace `crates/ldap/fuzz` only (AGENTS.md §6: every parser of network
+# input gets a fuzz target). No product build enables it; it adds no
+# dependency.
+fuzz-hooks = []
 
 [lints]
 workspace = true

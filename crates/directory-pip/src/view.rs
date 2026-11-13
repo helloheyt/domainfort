@@ -16,11 +16,13 @@ use crate::groups;
 use crate::names::{
     client_search_key, is_krbtgt_sid, service_search_key, DOMAIN_USER_RID_KRBTGT, KRBTGT,
 };
+use crate::naming::NamingContext;
 use crate::record::{self, Ids};
 use crate::salt::{account_salt, AccountKind};
 use crate::state;
 use crate::tier::{most_privileged, TierMap};
 use ad_schema::Phase1Schema;
+use core::cell::OnceCell;
 use dirstore::{ClassId, Object, Snapshot, Store};
 use dtyp::{Guid, SecurityDescriptor, Sid};
 use kdc::{
@@ -65,22 +67,34 @@ pub struct DirectoryContext {
     /// name cannot match (checked before the index is asked).
     sam_max_len: usize,
     spn_max_len: usize,
+    /// The DN of the domain NC's root: the suffix of every DN of the NC
+    /// (A-53; [MS-ADTS] 3.1.1.1.4, 3.1.1.1.5; crate::naming).
+    naming_context: NamingContext,
 }
 
 impl DirectoryContext {
-    /// Build the context from the phase-1 schema and keyd's configuration.
-    /// Fails closed if keyd's configuration is invalid, if the realm is not
-    /// an upper-case DNS name (the salt's "DNS of the realm, converted to
-    /// uppercase" must be the Kerberos realm, docs/47 §3.3 item 3), or if the
-    /// schema lacks what docs/47 reads.
+    /// Build the context from the phase-1 schema, keyd's configuration and
+    /// the naming context's DN. Fails closed if keyd's configuration is
+    /// invalid, if the realm is not an upper-case DNS name (the salt's "DNS
+    /// of the realm, converted to uppercase" must be the Kerberos realm,
+    /// docs/47 §3.3 item 3), if the naming context's DNS name in upper case
+    /// is not that realm (A-53; [MS-ADTS] 3.1.1.1.5), or if the schema lacks
+    /// what docs/47 reads.
     ///
     /// Spec: docs/47 §3.3 item 3, §7.3 (R47-10), §8.2; [MS-KILE] 3.1.1.2;
-    /// RFC 4120 §6.1.
-    pub fn new(schema: Phase1Schema, keyd: &KeydConfig) -> Result<DirectoryContext, ViewError> {
+    /// RFC 4120 §6.1; [MS-ADTS] 3.1.1.1.4, 3.1.1.1.5; A-53.
+    pub fn new(
+        schema: Phase1Schema,
+        keyd: &KeydConfig,
+        naming_context: NamingContext,
+    ) -> Result<DirectoryContext, ViewError> {
         keyd.validate().map_err(|_| ViewError::KeydConfig)?;
         let realm = keyd.realm.clone();
         if realm.as_bytes().is_empty() || realm.as_bytes().iter().any(u8::is_ascii_lowercase) {
             return Err(ViewError::RealmNotUppercase);
+        }
+        if !naming_context.names_realm(realm.as_bytes()) {
+            return Err(ViewError::NamingContext);
         }
         let ids = Ids::resolve(&schema)?;
         let mut attr_by_guid = BTreeMap::new();
@@ -107,6 +121,7 @@ impl DirectoryContext {
             sam_max_len,
             spn_max_len,
             schema,
+            naming_context,
         })
     }
 
@@ -114,6 +129,12 @@ impl DirectoryContext {
     #[must_use]
     pub fn realm(&self) -> &Realm {
         &self.realm
+    }
+
+    /// The naming context: the DN of the domain NC's root (A-53).
+    #[must_use]
+    pub fn naming_context(&self) -> &NamingContext {
+        &self.naming_context
     }
 
     /// The phase-1 schema.
@@ -139,6 +160,7 @@ impl DirectoryContext {
             ctx: self,
             snapshot,
             tiers,
+            nc_root: OnceCell::new(),
         })
     }
 }
@@ -150,6 +172,8 @@ pub struct DirectoryView<'a> {
     pub(crate) ctx: &'a DirectoryContext,
     pub(crate) snapshot: Snapshot<'a>,
     tiers: &'a TierMap,
+    /// The GUID of the NC root object, found once per view (A-53).
+    nc_root: OnceCell<Result<Guid, Fault>>,
 }
 
 /// A user or computer object, read and checked (docs/47 §1.3, §4.1).
@@ -300,71 +324,140 @@ impl DirectoryView<'_> {
         Ok((name, value))
     }
 
+    /// The GUID of the NC root object: the root (no parent) whose RDN value
+    /// is the naming context's first label n1, named by `dc`, with that
+    /// stored value octet for octet ([MS-ADTS] 3.1.1.1.4 example: the root
+    /// `(dc "microsoft")` has the DN "dc=microsoft,dc=com"). `NotFound` if
+    /// no such object exists — then nothing is in the NC (fail closed on a
+    /// misconfiguration). Found once per view.
+    /// Spec: [MS-ADTS] 3.1.1.1.4, 3.1.1.1.5, 3.1.1.3.1.2.2; A-53.
+    fn nc_root(&self) -> Result<Guid, Fault> {
+        *self.nc_root.get_or_init(|| {
+            let label = self
+                .ctx
+                .naming_context
+                .root_label()
+                .ok_or(Fault::NotFound)?;
+            let guid = match self.snapshot.lookup_child(None, label.as_bytes()) {
+                Ok(Some(guid)) => guid,
+                Ok(None) | Err(dirstore::Error::Rejected(_)) => return Err(Fault::NotFound),
+                Err(_) => return Err(Fault::Unavailable),
+            };
+            let obj = self.snapshot.get_object(guid)?.ok_or(Fault::NotFound)?;
+            let class = self.most_specific_class(&obj)?;
+            let rdn_attr = self
+                .ctx
+                .schema
+                .schema()
+                .class(class)
+                .ok_or(Fault::Unavailable)?
+                .rdn_attr;
+            let stored = record::single(&obj, rdn_attr)?.ok_or(Fault::Unavailable)?;
+            if obj.parent.is_some() || rdn_attr != self.ctx.ids.dc || stored != label.as_bytes() {
+                return Err(Fault::NotFound);
+            }
+            Ok(guid)
+        })
+    }
+
     /// Resolve a DN in the directory's own canonical form (see
-    /// [`DirectoryView::dn_of`]): from the root down, `lookup_child` per
-    /// component, then the component must name the RDN attribute of the
-    /// found object's most specific class and equal its stored value octet
-    /// for octet (one spelling per object — the PDP compares DNs exactly).
-    /// Anything else is `NotFound`.
+    /// [`DirectoryView::dn_of`]): it must end with the naming context's DN
+    /// exactly (A-53); that suffix names the NC root, and from there down
+    /// `lookup_child` per remaining component, then the component must name
+    /// the RDN attribute of the found object's most specific class and equal
+    /// its stored value octet for octet (one spelling per object — the PDP
+    /// compares DNs exactly). Anything else is `NotFound`.
     ///
-    /// The textual syntax of a DN component belongs to the LDAP layer
-    /// (RFC 4514, not opened — docs/47 §8.2 ⚠); until it exists this view
-    /// accepts only DNs the directory itself produced.
+    /// DNs from an LDAP client are resolved by [`DirectoryView::lookup_dn`]
+    /// instead (case-folded, docs/49 §7).
     ///
-    /// Spec: docs/47 §8.2 (DN resolution); docs/46 §8.3; pdp `Dn`.
+    /// Spec: docs/47 §8.2 (DN resolution); docs/46 §8.3; [MS-ADTS] 3.1.1.1.4;
+    /// A-53; pdp `Dn`.
     fn resolve(&self, dn: &Dn) -> Result<Object, Fault> {
         let rdns = dn.rdns();
-        if rdns.is_empty() || rdns.len() > MAX_DN_DEPTH {
+        let suffix = self.ctx.naming_context.dn().rdns();
+        if rdns.len() > MAX_DN_DEPTH || !rdns.ends_with(suffix) {
             return Err(Fault::NotFound);
         }
-        let mut parent: Option<Guid> = None;
-        let mut found = None;
-        for component in rdns.iter().rev() {
+        let below = rdns
+            .get(..rdns.len() - suffix.len())
+            .ok_or(Fault::NotFound)?;
+        let mut obj = self
+            .snapshot
+            .get_object(self.nc_root()?)?
+            .ok_or(Fault::NotFound)?;
+        for component in below.iter().rev() {
             let (att, value) = component.split_once(RDN_SEPARATOR).ok_or(Fault::NotFound)?;
             if !printable_ascii(value) {
                 return Err(Fault::NotFound);
             }
             let guid = self
                 .snapshot
-                .lookup_child(parent, value.as_bytes())?
+                .lookup_child(Some(obj.guid), value.as_bytes())?
                 .ok_or(Fault::NotFound)?;
-            let obj = self.snapshot.get_object(guid)?.ok_or(Fault::NotFound)?;
-            let (name, stored) = self.rdn_of(&obj)?;
+            let child = self.snapshot.get_object(guid)?.ok_or(Fault::NotFound)?;
+            let (name, stored) = self.rdn_of(&child)?;
             if name != att || stored != value.as_bytes() {
                 return Err(Fault::NotFound);
             }
-            parent = Some(guid);
-            found = Some(obj);
+            obj = child;
         }
-        found.ok_or(Fault::NotFound)
+        Ok(obj)
     }
 
-    /// The DN of a live object in the directory's own canonical form: leaf
-    /// first, each component `<lDAPDisplayName of the RDN attribute>=<stored
-    /// RDN value>`, up to the naming-context root (which has no parent).
-    /// `Ok(None)` if no live object has this GUID. These are the DNs this
-    /// view resolves, and the form of the tier map's subtree entries.
-    /// Spec: docs/47 §8.2; [MS-ADTS] 3.1.1.1.4 (RDN "att=val"); pdp `Dn`
-    /// (leaf first, naming-context root last).
+    /// The RDN component of a live object in the directory's own canonical
+    /// form, `<lDAPDisplayName of the RDN attribute>=<stored RDN value>`.
+    /// For an object below the NC root, prefixing this to the parent's DN
+    /// gives the object's DN ([MS-ADTS] 3.1.1.1.4: "the RDN of the child,
+    /// followed by "," and the DN of the parent"); the NC root's own DN is
+    /// the naming context's (A-53), not its RDN.
+    /// Spec: [MS-ADTS] 3.1.1.1.4 (RDN "att=val"); docs/47 §8.2.
+    pub fn rdn_component(&self, obj: &Object) -> Result<String, PipError> {
+        let (name, value) = self.rdn_of(obj)?;
+        let value = core::str::from_utf8(value).map_err(|_| PipError::Unavailable)?;
+        let mut component = String::with_capacity(name.len() + 1 + value.len());
+        component.push_str(name);
+        component.push(RDN_SEPARATOR);
+        component.push_str(value);
+        Ok(component)
+    }
+
+    /// The DN of a live object of the naming context in the directory's own
+    /// canonical form: leaf first, each component `<lDAPDisplayName of the
+    /// RDN attribute>=<stored RDN value>`, up to (not including) the NC
+    /// root, then the naming context's DN — so the NC root maps to exactly
+    /// that DN (A-53). `Ok(None)` if no live object has this GUID, or the
+    /// object is not below the NC root (outside the naming context: no DN
+    /// here, fail closed). These are the DNs this view resolves, and the
+    /// form of the tier map's subtree entries.
+    /// Spec: docs/47 §8.2; [MS-ADTS] 3.1.1.1.4 (RDN "att=val"; "The DN of
+    /// the root has an assigned value"), 3.1.1.1.5; A-53; pdp `Dn` (leaf
+    /// first, naming-context root last).
     pub fn dn_of(&self, guid: Guid) -> Result<Option<Dn>, PipError> {
         let Some(mut obj) = self.snapshot.get_object(guid).map_err(Fault::from)? else {
             return Ok(None);
         };
+        let suffix = self.ctx.naming_context.dn().rdns();
         let mut rdns = Vec::new();
         loop {
-            if rdns.len() >= MAX_DN_DEPTH {
-                return Err(PipError::Unavailable);
-            }
-            let (name, value) = self.rdn_of(&obj)?;
-            let value = core::str::from_utf8(value).map_err(|_| PipError::Unavailable)?;
-            let mut component = String::with_capacity(name.len() + 1 + value.len());
-            component.push_str(name);
-            component.push(RDN_SEPARATOR);
-            component.push_str(value);
-            rdns.push(component);
             match obj.parent {
-                None => break,
+                None => {
+                    match self.nc_root() {
+                        Ok(root) if root == obj.guid => {}
+                        Ok(_) | Err(Fault::NotFound) => return Ok(None),
+                        Err(Fault::Unavailable) => return Err(PipError::Unavailable),
+                    }
+                    if rdns.len() + suffix.len() > MAX_DN_DEPTH {
+                        return Err(PipError::Unavailable);
+                    }
+                    rdns.extend(suffix.iter().cloned());
+                    break;
+                }
                 Some(parent) => {
+                    if rdns.len() >= MAX_DN_DEPTH {
+                        return Err(PipError::Unavailable);
+                    }
+                    rdns.push(self.rdn_component(&obj)?);
                     obj = self
                         .snapshot
                         .get_object(parent)
@@ -374,6 +467,94 @@ impl DirectoryView<'_> {
             }
         }
         Ok(Some(Dn::new(rdns)))
+    }
+
+    /// Resolve a DN an LDAP client sent, given as its RDNs leaf first, each
+    /// `(attributeType as spelled, value unescaped)`. `Ok(None)` when it
+    /// names no object of the naming context.
+    ///
+    /// 1. It must end with the naming context's DN: each of those
+    ///    components names `dc` (lDAPDisplayName, ASCII case-insensitive,
+    ///    `ad-schema::attribute_by_name`) and its value has the configured
+    ///    label's comparison key (printable ASCII, A–Z folded — A-53,
+    ///    Q-080). Otherwise `None` (a base outside the NC is noSuchObject —
+    ///    docs/49 R49-17, §5.4).
+    /// 2. From the NC root down, `lookup_child` per remaining component
+    ///    (which folds the same way), and the component's attributeType must
+    ///    name the RDN attribute of the found object's most specific class
+    ///    (docs/49 §7: "the client may spell the case differently";
+    ///    [MS-ADTS] 3.1.1.3.1.2.1). A numeric OID names no attribute here
+    ///    (Q-195 item 10).
+    ///
+    /// The result is only the object; the PDP is always given the
+    /// directory's canonical DN of it ([`DirectoryView::dn_of`]), never the
+    /// client's spelling (R49-11).
+    ///
+    /// Spec: docs/49 §7 (R49-11); A-53; [MS-ADTS] 3.1.1.1.4, 3.1.1.1.5,
+    /// 3.1.1.3.1.2.1; Q-080; Q-195 item 10.
+    pub fn lookup_dn(&self, rdns: &[(&str, &str)]) -> Result<Option<Guid>, PipError> {
+        let labels = self.ctx.naming_context.labels();
+        if rdns.len() > MAX_DN_DEPTH || rdns.len() < labels.len() {
+            return Ok(None);
+        }
+        let (below, suffix) = rdns.split_at(rdns.len() - labels.len());
+        for ((att, value), label) in suffix.iter().zip(labels) {
+            if self.ctx.schema.attribute_by_name(att) != Some(self.ctx.ids.dc)
+                || !printable_ascii(value)
+                || !value.eq_ignore_ascii_case(label)
+            {
+                return Ok(None);
+            }
+        }
+        let mut parent = match self.nc_root() {
+            Ok(root) => root,
+            Err(Fault::NotFound) => return Ok(None),
+            Err(Fault::Unavailable) => return Err(PipError::Unavailable),
+        };
+        for (att, value) in below.iter().rev() {
+            if !printable_ascii(value) {
+                return Ok(None);
+            }
+            let guid = match self.snapshot.lookup_child(Some(parent), value.as_bytes()) {
+                Ok(Some(guid)) => guid,
+                Ok(None) | Err(dirstore::Error::Rejected(_)) => return Ok(None),
+                Err(_) => return Err(PipError::Unavailable),
+            };
+            let obj = self
+                .snapshot
+                .get_object(guid)
+                .map_err(Fault::from)?
+                .ok_or(PipError::Unavailable)?;
+            let class = self.most_specific_class(&obj)?;
+            let rdn_attr = self
+                .ctx
+                .schema
+                .schema()
+                .class(class)
+                .ok_or(PipError::Unavailable)?
+                .rdn_attr;
+            if self.ctx.schema.attribute_by_name(att) != Some(rdn_attr) {
+                return Ok(None);
+            }
+            parent = guid;
+        }
+        Ok(Some(parent))
+    }
+
+    /// The directory context this view was taken from (schema, naming
+    /// context). Spec: docs/47 §8.1.
+    #[must_use]
+    pub fn context(&self) -> &DirectoryContext {
+        self.ctx
+    }
+
+    /// The view's dirstore snapshot (read-only): the LDAP engine enumerates
+    /// candidates with `children` / `lookup_unique` / `back_links` /
+    /// `get_object` over the same snapshot the PDP's answers come from
+    /// (docs/49 §6.1: "against one snapshot"; docs/11 §6 P9).
+    #[must_use]
+    pub fn snapshot(&self) -> &Snapshot<'_> {
+        &self.snapshot
     }
 
     /// keyd's handle of the krbtgt key set (`KdcConfig.krbtgt`, docs/47

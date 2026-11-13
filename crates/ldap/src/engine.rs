@@ -39,8 +39,8 @@
 //!    R49-8: no control is supported in phase 1). No combination can be
 //!    invalid: every non-critical control is ignored, which RFC 4511 §4.1.11
 //!    allows "in order to arrive at a valid combination".
-//! 8. **Dispatch:** Bind (bind module), Search (the rootDSE, or
-//!    unwillingToPerform until task L8), Extended (StartTLS, or protocolError
+//! 8. **Dispatch:** Bind (bind module), Search (the rootDSE, or the
+//!    directory — crate::search, task L8), Extended (StartTLS, or protocolError
 //!    for any other requestName — RFC 4511 §4.12), and Modify / Add /
 //!    Delete / ModifyDN / Compare → unwillingToPerform (53) with the
 //!    matching response tag (A-48; docs/49 §5.1, §8.1).
@@ -55,6 +55,7 @@
 //! 3.1.1.3.4.6, 5.1.1.6; docs/49 §4.4 (R49-15), §5 (R49-7, R49-8), §9
 //! (R49-13), §10 (R49-14), §11 (R49-16); A-48, A-52.
 
+use directory_pip::NamingContext;
 use dtyp::Sid;
 use krb_proto::KerberosTime;
 use parse_ldap::{
@@ -62,8 +63,7 @@ use parse_ldap::{
     Scope, SearchRequest,
 };
 use pdp::{
-    AccessRequest, Action, Constraint, Context, Effect, IpScope, Obligation, Resource, Transport,
-    TransportSec,
+    AccessRequest, Action, Constraint, Context, Effect, IpScope, Obligation, Resource, TransportSec,
 };
 
 use crate::audit::{
@@ -71,12 +71,15 @@ use crate::audit::{
     SearchAudit,
 };
 use crate::bind;
-use crate::config::{ConfigError, EngineConfig, RootDseConfig};
+use crate::config::{ConfigError, EngineConfig, RootDseValues};
 use crate::inputs::RequestInputs;
 use crate::respond::{self, EncodeFailure, ResponseKind};
 use crate::root_dse;
+use crate::search::{self, SearchLimits, SearchParams};
 use crate::session::{recheck, Channel, Identity, Phase, Recheck, Session};
-use crate::subject::{denial_code, session_transport_sec, subject, transport_sec, Requester};
+use crate::subject::{
+    context_transport, denial_code, session_transport_sec, subject, transport_sec, Requester,
+};
 use crate::time::unix_instant;
 
 /// What the front does with the connection after sending the responses.
@@ -109,17 +112,32 @@ pub struct Outcome {
 /// Spec: docs/49 §11.
 #[derive(Debug, Clone)]
 pub struct Engine {
-    root_dse: RootDseConfig,
+    root_dse: RootDseValues,
+    /// The naming context: the rootDSE's values are its encoding, and a
+    /// directory search refuses a view with another one (A-53).
+    naming_context: NamingContext,
+    /// The bounds of a directory search (crate::search::limits).
+    limits: SearchLimits,
 }
 
 impl Engine {
     /// An engine with this configuration, checked once.
     /// Spec: crate::config.
     pub fn new(config: EngineConfig) -> Result<Engine, ConfigError> {
-        config.root_dse.validate()?;
+        let root_dse = config.root_dse.validate()?;
         Ok(Engine {
-            root_dse: config.root_dse,
+            root_dse,
+            naming_context: config.root_dse.naming_context,
+            limits: SearchLimits::PHASE1,
         })
+    }
+
+    /// The same engine with other search bounds (the crate's own tests reach
+    /// each bound with a small directory).
+    #[cfg(test)]
+    pub(crate) fn with_limits(mut self, limits: SearchLimits) -> Engine {
+        self.limits = limits;
+        self
     }
 
     /// Handle one LDAPMessage of `session` (module documentation).
@@ -273,7 +291,14 @@ impl Engine {
                 );
             }
             ProtocolOp::SearchRequest(request) => {
-                self.search(msg.message_id, request, &requester, inputs, run);
+                self.search(
+                    msg.message_id,
+                    request,
+                    &requester,
+                    session.channel,
+                    inputs,
+                    run,
+                );
             }
             ProtocolOp::ExtendedRequest(request) => {
                 extended(
@@ -297,27 +322,27 @@ impl Engine {
             | ProtocolOp::BindResponse(_)
             | ProtocolOp::SearchResultEntry(_)
             | ProtocolOp::SearchResultDone(_)
-            | ProtocolOp::ExtendedResponse(_) => {
+            | ProtocolOp::ExtendedResponse(_)
+            | ProtocolOp::UnsupportedResponse { .. } => {
                 run.disconnect(ResultCode::ProtocolError, AuditReason::NotARequest);
             }
         }
     }
 
-    /// A SearchRequest: the rootDSE, or nothing until task L8.
-    /// Spec: docs/49 §5.2 (R49-10), §2.3 E14, §12; crate::root_dse.
+    /// A SearchRequest: the rootDSE (crate::root_dse), or a search of the
+    /// directory (crate::search).
+    /// Spec: docs/49 §5.2 (R49-10), §6 (R49-9), §2.3 E14.
     fn search(
         &self,
         message_id: MessageId,
         request: &SearchRequest,
         requester: &Requester,
+        channel: Channel,
         inputs: &mut RequestInputs<'_>,
         run: &mut Run,
     ) {
         let done = ResponseKind::SearchDone;
-        run.search = Some(SearchAudit {
-            scope: audit_scope(request.scope),
-            entries_returned: 0,
-        });
+        run.search = Some(SearchAudit::new(audit_scope(request.scope)));
         // An unrecognised scope: the operation's response with
         // protocolError. Spec: docs/49 §2.3 E14.
         if matches!(request.scope, Scope::Unrecognized(_)) {
@@ -328,14 +353,9 @@ impl Engine {
             );
             return;
         }
-        // Only the rootDSE in L4; directory search is task L8.
-        // Spec: docs/49 §12.
+        // A search of the directory. Spec: docs/49 §6 (R49-9).
         if !request.base_object.is_empty() {
-            run.respond(
-                respond::result(message_id, done, ResultCode::UnwillingToPerform),
-                ResultCode::UnwillingToPerform,
-                AuditReason::SearchNotImplemented,
-            );
+            self.search_directory(message_id, request, requester, channel, inputs, run);
             return;
         }
         // The empty base with another scope. Spec: docs/49 §5.2; RFC 4512
@@ -374,9 +394,8 @@ impl Engine {
             context: Context {
                 src_net: inputs.transport.src_net,
                 time,
-                // No cleartext-LDAP variant exists (crate::subject; Q-190
-                // item 2); the security state is in `transport_sec`.
-                transport: Transport::Ldaps,
+                // Spec: docs/49 §4.3; Q-190 item 2 (A-54).
+                transport: context_transport(channel),
                 transport_sec: run.transport_sec,
             },
         };
@@ -435,6 +454,56 @@ impl Engine {
             respond::result(message_id, done, ResultCode::Success),
             ResultCode::Success,
             AuditReason::RootDseReturned,
+        );
+    }
+
+    /// A search of the directory (crate::search): its entries, then the
+    /// SearchResultDone with its code; one audit event with the counts.
+    /// Without a directory view in the inputs, unwillingToPerform.
+    /// Spec: docs/49 §6 (R49-9), §10.1 (R49-14), §12; RFC 4511 §4.5.2.
+    fn search_directory(
+        &self,
+        message_id: MessageId,
+        request: &SearchRequest,
+        requester: &Requester,
+        channel: Channel,
+        inputs: &mut RequestInputs<'_>,
+        run: &mut Run,
+    ) {
+        let done = ResponseKind::SearchDone;
+        let Some(directory) = inputs.directory.as_ref() else {
+            run.respond(
+                respond::result(message_id, done, ResultCode::UnwillingToPerform),
+                ResultCode::UnwillingToPerform,
+                AuditReason::SearchNotImplemented,
+            );
+            return;
+        };
+        let (view, clock) = (directory.view, directory.clock);
+        let outcome = search::run(SearchParams {
+            message_id,
+            request,
+            requester,
+            policy: inputs.snapshot,
+            rate: &mut *inputs.rate,
+            now: inputs.now,
+            src_net: inputs.transport.src_net,
+            channel,
+            transport_sec: run.transport_sec,
+            view,
+            clock,
+            naming_context: &self.naming_context,
+            limits: self.limits,
+        });
+        run.target = outcome.target.map(AuditTarget::DirObject);
+        run.responses.extend(outcome.entries);
+        let mut audit = outcome.audit;
+        audit.scope = audit_scope(request.scope);
+        run.search = Some(audit);
+        run.respond(
+            respond::result(message_id, done, outcome.code),
+            outcome.code,
+            outcome.reason,
         );
     }
 }
@@ -528,7 +597,8 @@ fn operation_of(op: &ProtocolOp) -> AuditOperation {
         ProtocolOp::BindResponse(_)
         | ProtocolOp::SearchResultEntry(_)
         | ProtocolOp::SearchResultDone(_)
-        | ProtocolOp::ExtendedResponse(_) => AuditOperation::Malformed,
+        | ProtocolOp::ExtendedResponse(_)
+        | ProtocolOp::UnsupportedResponse { .. } => AuditOperation::Malformed,
     }
 }
 
@@ -547,7 +617,8 @@ fn response_kind(op: &ProtocolOp) -> Option<ResponseKind> {
         | ProtocolOp::BindResponse(_)
         | ProtocolOp::SearchResultEntry(_)
         | ProtocolOp::SearchResultDone(_)
-        | ProtocolOp::ExtendedResponse(_) => None,
+        | ProtocolOp::ExtendedResponse(_)
+        | ProtocolOp::UnsupportedResponse { .. } => None,
     }
 }
 
@@ -560,7 +631,7 @@ fn has_critical_control(msg: &LdapMessage) -> bool {
 }
 
 /// The audit form of a scope. Spec: RFC 4511 §4.5.1.2.
-fn audit_scope(scope: Scope) -> AuditScope {
+pub(crate) fn audit_scope(scope: Scope) -> AuditScope {
     match scope {
         Scope::BaseObject => AuditScope::BaseObject,
         Scope::SingleLevel => AuditScope::SingleLevel,

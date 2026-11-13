@@ -515,8 +515,32 @@ fn protocol_op(r: &mut Reader<'_>, direction: Direction) -> Result<ProtocolOp> {
                 profile,
             )?))
         }
+        (Direction::Response, 7 | 9 | 11 | 13 | 15) => unsupported_response(&tlv, number, profile),
         _ => Err(Error::UnrecognizedProtocolOp),
     }
+}
+
+/// The `[APPLICATION n] LDAPResult` response of an operation phase 1 does
+/// not perform (ModifyResponse 7, AddResponse 9, DelResponse 11,
+/// ModifyDNResponse 13, CompareResponse 15), decoded exactly like
+/// SearchResultDone apart from the tag.
+///
+/// Spec: RFC 4511 §4.6-§4.10, App. B; X.690 8.14.4 a) (constructed, the base
+/// being a SEQUENCE); A-48; docs/questions/Q-190 item 1 (A-54).
+fn unsupported_response(tlv: &Tlv<'_>, number: u8, profile: Profile) -> Result<ProtocolOp> {
+    let op = match number {
+        7 => UnsupportedOp::ModifyRequest,
+        9 => UnsupportedOp::AddRequest,
+        11 => UnsupportedOp::DelRequest,
+        13 => UnsupportedOp::ModifyDnRequest,
+        15 => UnsupportedOp::CompareRequest,
+        _ => return Err(Error::UnrecognizedProtocolOp),
+    };
+    expect_form(tlv.identifier, true)?;
+    let mut inner = Reader::new(tlv.contents, profile);
+    let result = ldap_result_components(&mut inner)?;
+    finish_sequence(&mut inner, LDAP_RESULT_TAGS, LEVEL_OP)?;
+    Ok(ProtocolOp::UnsupportedResponse { op, result })
 }
 
 /// Recognise an out-of-scope request by its tag and form only; the body is

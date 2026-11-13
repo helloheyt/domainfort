@@ -717,3 +717,88 @@ fn nt_security_descriptor_rights_are_never_granted_together() {
     assert!(checked > 1000, "{checked}");
     assert!(rc_granted > 0);
 }
+
+/// docs/questions/Q-190 item 2 (A-54): `Transport::Ldap` lets the LDAP PEP
+/// report a cleartext connection truthfully, and must change no decision —
+/// docs/11 §4 decides on `Context.transport_sec`, never on
+/// `Context.transport`. Every request of a broad hand-made matrix (an
+/// authenticated and an anonymous subject, directory reads, lists, writes and
+/// deletes and the rootDSE, every combination of the three transport
+/// properties, both source networks, an open and a closed descriptor,
+/// policies with and without rules and an anonymous grant) gets exactly the
+/// same Decision under every `Transport` value as under `Transport::Ldaps`.
+#[test]
+fn the_cleartext_ldap_transport_changes_no_decision() {
+    use pdp::Transport;
+    let transports = [
+        Transport::Ldap,
+        Transport::Ldaps,
+        Transport::LdapSasl,
+        Transport::Cldap,
+        Transport::SmbEnc,
+        Transport::NcacnIpTcpPrivacy,
+        Transport::Dns,
+        Transport::Kerberos,
+    ];
+    let subjects = [the_user(), anonymous()];
+    let object = |attr: Option<AttrId>| Resource::DirObject { dn: obj_dn(), attr };
+    let requests: Vec<(Action, Resource)> = vec![
+        (Action::DirRead, Resource::RootDse),
+        (Action::DirRead, object(None)),
+        (Action::DirRead, object(Some(AttrId(attr_in_set())))),
+        (Action::DirList, object(None)),
+        (Action::DirWrite, object(Some(AttrId(attr_alone())))),
+        (Action::DirDelete, object(None)),
+    ];
+    let pips = [
+        open_pip(),
+        MockPip::with_sd(sd(None, vec![deny(RIGHT_GENERIC_ALL, everyone())])),
+    ];
+    let anonymous_grant = AnonymousGrant::new(
+        ActionMatch::AnyOf(vec![Action::DirRead, Action::DirList]),
+        ResourceMatch::RootDse,
+        TransportSec::NONE,
+        IpScope::Internal,
+    )
+    .expect("a bounded grant");
+    let policies = [
+        snapshot(vec![], vec![]),
+        snapshot(vec![allow_everything(1)], vec![]),
+        snapshot(vec![allow_everything(1)], vec![anonymous_grant]),
+        snapshot(vec![rule(2, Effect::Deny, ResourceMatch::RootDse)], vec![]),
+    ];
+    let mut compared = 0usize;
+    for subject in &subjects {
+        for (action, resource) in &requests {
+            for bits in 0u8..8 {
+                let sec = TransportSec {
+                    encrypted: bits & 1 != 0,
+                    sealed: bits & 2 != 0,
+                    channel_bound: bits & 4 != 0,
+                };
+                for src_net in [IpScope::Internal, IpScope::External] {
+                    for pip in &pips {
+                        for pol in &policies {
+                            let mut req = AccessRequest {
+                                subject: subject.clone(),
+                                resource: resource.clone(),
+                                action: action.clone(),
+                                context: strong_context(),
+                            };
+                            req.context.transport_sec = sec;
+                            req.context.src_net = src_net;
+                            req.context.transport = Transport::Ldaps;
+                            let reference = decide(&req, pol, pip);
+                            for transport in transports {
+                                req.context.transport = transport;
+                                assert_eq!(decide(&req, pol, pip), reference, "{req:?}");
+                                compared += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(compared, 2 * 6 * 8 * 2 * 2 * 4 * 8);
+}

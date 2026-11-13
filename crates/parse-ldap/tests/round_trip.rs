@@ -132,6 +132,40 @@ fn bind_requests() {
 }
 
 #[test]
+fn unsupported_operation_responses() {
+    // RFC 4511 App. B: ModifyResponse ::= [APPLICATION 7] LDAPResult,
+    // AddResponse 9, DelResponse 11, ModifyDNResponse 13, CompareResponse 15;
+    // docs/questions/Q-190 item 1 (A-54): a typed response.
+    for (op, tag) in [
+        (UnsupportedOp::ModifyRequest, 7u8),
+        (UnsupportedOp::AddRequest, 9),
+        (UnsupportedOp::DelRequest, 11),
+        (UnsupportedOp::ModifyDnRequest, 13),
+        (UnsupportedOp::CompareRequest, 15),
+    ] {
+        let value = msg(
+            9,
+            ProtocolOp::UnsupportedResponse {
+                op,
+                result: LdapResult::new(ResultCode::UnwillingToPerform),
+            },
+        );
+        response_round_trip(&value);
+        // X.690 8.1.2.2 / 8.1.2.5 / 8.14.4: class APPLICATION (01),
+        // constructed (bit 6), the tag number; contents = the LDAPResult
+        // components: ENUMERATED 53, matchedDN "", diagnosticMessage "".
+        // Built independently with the test's own element builder.
+        let expected = message(&tlv(0x60 | tag, &[0x0A, 0x01, 53, 0x04, 0x00, 0x04, 0x00]));
+        let mut expected = expected;
+        // `message` writes messageID 1; this value uses 9.
+        expected[4] = 9;
+        assert_eq!(encode_message(&value).unwrap(), expected);
+        // The request direction never accepts a response tag.
+        assert!(decode_message(&expected, &canonical_request()).is_err());
+    }
+}
+
+#[test]
 fn bind_responses() {
     for creds in [None, Some(Vec::new()), Some(vec![0xA1; 200])] {
         response_round_trip(&msg(

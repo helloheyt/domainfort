@@ -30,6 +30,11 @@ pub enum ViewError {
     Store,
     /// The tier map is malformed (an empty subtree DN).
     TierMap,
+    /// The naming context is malformed (no label, too many, a label that is
+    /// empty, not printable ASCII, holds "." or is too long), or its DNS
+    /// name in upper case is not the realm (A-53; [MS-ADTS] 3.1.1.1.5;
+    /// docs/47 §3.3 item 3).
+    NamingContext,
 }
 
 impl core::fmt::Display for ViewError {
@@ -41,6 +46,7 @@ impl core::fmt::Display for ViewError {
             ViewError::SchemaMismatch => "store schema differs from the context schema",
             ViewError::Store => "store snapshot failed",
             ViewError::TierMap => "tier map is malformed",
+            ViewError::NamingContext => "naming context is malformed or does not name the realm",
         })
     }
 }

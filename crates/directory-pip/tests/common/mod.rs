@@ -14,7 +14,7 @@
 #![allow(dead_code)] // each test binary uses a different subset
 
 use ad_schema::{phase1, Phase1Schema};
-use directory_pip::{DirectoryContext, DirectoryView, TierMap};
+use directory_pip::{DirectoryContext, DirectoryView, NamingContext, TierMap};
 use dirstore::{
     AttrId, AttributeChange, ClassId, IntegrityKey, NewObject, NodeId, Origin, Store, Timestamp,
 };
@@ -190,6 +190,13 @@ pub fn keyd_config() -> KeydConfig {
     KeydConfig::new(realm())
 }
 
+/// The naming context dc=example,dc=test: the DNS name example.test, whose
+/// upper case is [`REALM`] (A-53; [MS-ADTS] 3.1.1.1.5). Its first label is
+/// the root object's dc value.
+pub fn naming_context() -> NamingContext {
+    NamingContext::new(&["example", "test"]).expect("naming context")
+}
+
 // ---------------------------------------------------------------------------
 // The directory.
 // ---------------------------------------------------------------------------
@@ -233,7 +240,8 @@ impl Dir {
             p1.schema().clone(),
         )
         .expect("open store");
-        let ctx = DirectoryContext::new(p1.clone(), &keyd_config()).expect("context");
+        let ctx =
+            DirectoryContext::new(p1.clone(), &keyd_config(), naming_context()).expect("context");
         Dir {
             p1,
             store,

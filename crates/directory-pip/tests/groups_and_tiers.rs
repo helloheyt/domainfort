@@ -355,7 +355,11 @@ fn non_directory_resources_are_tier0() {
     }
     // An unknown DN: NotFound (Deny).
     let ghost = Resource::DirObject {
-        dn: Dn::new(vec!["cn=ghost".into(), "dc=example".into()]),
+        dn: Dn::new(vec![
+            "cn=ghost".into(),
+            "dc=example".into(),
+            "dc=test".into(),
+        ]),
         attr: None,
     };
     assert_eq!(view.object_tier(&ghost), Err(PipError::NotFound));
