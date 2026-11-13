@@ -7,7 +7,9 @@
 //! 1. claim the single-thread proof — the first statement of `main`;
 //! 2. read the configuration path from argv and parse it;
 //! 3. as root: read the DC certificate and the key (0400, root-owned),
-//!    check them and build the TLS configuration — the key octets are wiped
+//!    check them (RFC 5280 structure, signature and key algorithms, the key
+//!    match, validity at the start-up time) and build the TLS
+//!    configuration — the key octets are wiped
 //!    once it is built — and bind the listeners (served only once auditd
 //!    and dird are verified);
 //! 4. apply the hardening plan while the process has exactly one thread —
@@ -24,7 +26,9 @@
 
 use daemon_sandbox::{apply, SingleThreadProof};
 use ldap_front::log::{note, Note};
-use ldap_front::startup::{bind_listeners, hardening_plan, load_tls_config, read_settings};
+use ldap_front::startup::{
+    bind_listeners, hardening_plan, load_tls_config, read_settings, start_time,
+};
 use ldap_front::{serve, DaemonControl, FrontParams};
 use std::io::Write;
 use std::path::Path;
@@ -79,9 +83,14 @@ fn main() -> ExitCode {
     };
     let params = FrontParams::from_settings(&settings);
 
-    // 3. As root, before the drop: the certificate and key (the key octets
-    //    are wiped inside `load_tls_config`), then the listeners.
-    let tls = match load_tls_config(&settings, ROOT_UID) {
+    // 3. As root, before the drop: the certificate and key, checked at the
+    //    start-up time (the key octets are wiped inside `load_tls_config`),
+    //    then the listeners.
+    let now = match start_time() {
+        Ok(now) => now,
+        Err(error) => return fail("clock", &error),
+    };
+    let tls = match load_tls_config(&settings, ROOT_UID, now) {
         Ok(tls) => tls,
         Err(error) => return fail("TLS credential", &error),
     };

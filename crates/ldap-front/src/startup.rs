@@ -32,17 +32,20 @@ use crate::tls::{server_config, CredentialError, DcCredential, TlsConfigError};
 use config::LdapFrontSettings;
 use core::fmt;
 use daemon_sandbox::{HardeningPlan, PlanError, ProcessIdentity};
+use rustls::pki_types::UnixTime;
 use rustls::server::ServerConfig;
 use std::fs::File;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
 
-/// Most octets of the certificate file. Project choice (one DER certificate
-/// is a few hundred octets to a few KiB).
-pub const MAX_CERTIFICATE_OCTETS: usize = 64 * 1024;
+/// Most octets of the certificate file: the certificate reader's own bound
+/// (crates/parse-x509; project choice — one DER certificate is a few hundred
+/// octets to a few KiB).
+pub const MAX_CERTIFICATE_OCTETS: usize = parse_x509::MAX_CERTIFICATE_OCTETS;
 
 /// Most octets of the private-key file. Project choice (a PKCS#8 ECDSA
 /// P-256 key is far smaller).
@@ -86,6 +89,9 @@ pub enum StartupError {
     KeyPermissions,
     /// The key file is larger than [`MAX_PRIVATE_KEY_OCTETS`].
     KeyTooLarge,
+    /// The system clock reads a time before 1970 (no validity decision is
+    /// possible).
+    ClockBeforeEpoch,
     /// The certificate and key were refused.
     Credential(CredentialError),
     /// The TLS configuration could not be built.
@@ -113,6 +119,9 @@ impl fmt::Display for StartupError {
                 f.write_str("private key file must be a regular file owned by root with mode 0400")
             }
             StartupError::KeyTooLarge => f.write_str("private key file too large"),
+            StartupError::ClockBeforeEpoch => {
+                f.write_str("system clock reads a time before 1970; certificate validity unknown")
+            }
             StartupError::Credential(error) => write!(f, "{error}"),
             StartupError::Tls(error) => write!(f, "{error}"),
             StartupError::Bind(Some(code)) => write!(f, "listener could not be bound [{code}]"),
@@ -233,21 +242,42 @@ pub fn read_private_key(path: &Path, owner: u32) -> Result<Zeroizing<Vec<u8>>, S
     Ok(contents)
 }
 
-/// Read the certificate and key named by `settings`, check them, and build
-/// the docs/50 R50-11 server configuration. The key octets are wiped when
-/// this returns (their buffer drops here).
+/// The start-up time for the certificate's validity check (R50-12; RFC
+/// 5280 §4.1.2.5): the system clock as seconds since 1970-01-01T00:00:00Z.
+/// A clock before 1970 is refused (fail closed: no trustworthy time, no
+/// validity decision).
+///
+/// # Errors
+/// [`StartupError::ClockBeforeEpoch`].
+///
+/// Spec: docs/50 R50-12, §7.5; RFC 5280 §4.1.2.5; docs.rs rustls-pki-types
+/// 1.16.0 `UnixTime::since_unix_epoch` ("Convert a Duration since the start
+/// of 1970 to a UnixTime"); docs/questions/Q-320 item 4.
+pub fn start_time() -> Result<UnixTime, StartupError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(UnixTime::since_unix_epoch)
+        .map_err(|_| StartupError::ClockBeforeEpoch)
+}
+
+/// Read the certificate and key named by `settings`, check them at the
+/// start-up time `now` ([`start_time`] in the daemon), and build the
+/// docs/50 R50-11 server configuration. The key octets are wiped when this
+/// returns (their buffer drops here).
 ///
 /// # Errors
 /// [`StartupError`].
 ///
-/// Spec: docs/50 R50-11, R50-12, §5.1, §5.3, §6.2.
+/// Spec: docs/50 R50-11, R50-12, §5.1, §5.3, §6.2; RFC 5280 §4.1.2.5.
 pub fn load_tls_config(
     settings: &LdapFrontSettings,
     owner: u32,
+    now: UnixTime,
 ) -> Result<Arc<ServerConfig>, StartupError> {
     let certificate = read_certificate(settings.tls_certificate_path().as_path(), owner)?;
     let key = read_private_key(settings.tls_private_key_path().as_path(), owner)?;
-    let credential = DcCredential::from_der(certificate, &key).map_err(StartupError::Credential)?;
+    let credential =
+        DcCredential::from_der(certificate, &key, now).map_err(StartupError::Credential)?;
     drop(key);
     server_config(credential.resolver()).map_err(StartupError::Tls)
 }

@@ -1,91 +1,52 @@
 //! Test-only TLS material (docs/50 §9: "TLS client — rustls itself as
-//! client"), with a **test-only trust model** instead of an X.509
-//! certificate.
+//! client") with **real X.509 certificates** (docs/questions/Q-320; the
+//! follow-up of Q-285 item 1 → A-71).
 //!
-//! # Why no certificate (docs/questions/Q-285 item 1)
+//! * tests/common/cert.rs builds, per run, a test CA and the DC's server
+//!   certificate (subjectAltName dNSName `dc1.example.org`, ECDSA P-256 /
+//!   SHA-256) from RFC 5280 structures, with fresh aws-lc-rs keys.
+//! * The server side is the product's: the certificate and key go through
+//!   the production loader `DcCredential::from_der` (every R50-12 check) and
+//!   `ldap_front::tls::server_config`.
+//! * The client side is rustls' **standard** verifier:
+//!   `WebPkiServerVerifier::builder_with_provider` with a `RootCertStore`
+//!   holding only the test CA — "Signed by a trusted RootCertStore CA, Not
+//!   Expired, Valid for DNS entry" (docs.rs rustls 0.23.46
+//!   `WebPkiServerVerifier::verify_server_cert`) — so a handshake proves
+//!   the chain, the name, the validity and the CertificateVerify signature
+//!   (RFC 8446 §4.4.2, §4.4.3). No custom certificate verifier remains.
 //!
-//! R50-12 wants an ECDSA P-256 / SHA-256 certificate; the task allowed a
-//! certificate generator only if no new crate is needed (none is approved)
-//! and a hand-built DER certificate only if RFC 5280 is pinned (it is not —
-//! tools/spec-pin/manifest.json has no RFC5280 entry). So the tests:
-//!
-//! * generate a fresh ECDSA P-256 key per run through aws-lc-rs
-//!   (`EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, …)`);
-//! * let the server present an **opaque placeholder** ([`PLACEHOLDER`]) in
-//!   its Certificate message — RFC 8446 §4.4.2: `opaque cert_data<1..2^24-1>`
-//!   — through `CertifiedKey::new` (which, unlike `with_single_cert` /
-//!   `CertifiedKey::from_der`, does not parse it);
-//! * let the client trust exactly that placeholder **and** the key: the
-//!   [`PinnedKey`] verifier accepts the placeholder octets and then checks
-//!   the server's CertificateVerify signature (RFC 8446 §4.4.3) with the
-//!   pinned public key (aws-lc-rs `UnparsedPublicKey` with
-//!   `ECDSA_P256_SHA256_ASN1`) — so the handshake still proves possession of
-//!   the server's private key.
-//!
-//! Everything else in the server configuration is the product's
-//! (`ldap_front::tls::server_config`: versions, suites, groups, tickets,
-//! key log, client authentication). The production loader with a real
-//! certificate (`DcCredential::from_der`, `with keys_match`) runs in
-//! tests/tls_config.rs only with an operator-provided certificate
-//! (`LDAP_FRONT_TEST_CERT_DIR`).
-//!
-//! Sources: RFC 8446 §4.2.3, §4.4.2, §4.4.3, §9.1; docs/50 R50-11, R50-12,
-//! §9; docs.rs rustls 0.23.46 (`client::danger::ServerCertVerifier`,
-//! `ClientConfig`, `ClientConnection`, `sign::CertifiedKey`,
-//! `sign::SingleCertAndKey`, `crypto::aws_lc_rs`), aws-lc-rs 1.19.0
-//! (`signature::{EcdsaKeyPair, KeyPair, UnparsedPublicKey,
-//! ECDSA_P256_SHA256_ASN1, ECDSA_P256_SHA256_ASN1_SIGNING,
-//! ECDSA_P384_SHA384_ASN1_SIGNING}`, `rand::SystemRandom`). Every value is
-//! made here; no vector from any other implementation.
+//! Sources: RFC 8446 §4.2.3, §4.4.2, §4.4.3, §9.1; RFC 5280 §4.1, §6;
+//! docs/50 R50-11, R50-12, §9; docs.rs rustls 0.23.46 (`ClientConfig`,
+//! `ConfigBuilder::with_webpki_verifier`, `client::WebPkiServerVerifier`,
+//! `client::ServerCertVerifierBuilder::build`, `RootCertStore::{empty,
+//! add}`, `ClientConnection`, `sign::CertifiedKey`, `sign::SingleCertAndKey`,
+//! `crypto::aws_lc_rs`). Every value is made here.
 #![allow(dead_code)] // each test binary uses a different subset
 
-use aws_lc_rs::rand::SystemRandom;
-use aws_lc_rs::signature::{
-    EcdsaKeyPair, KeyPair, UnparsedPublicKey, ECDSA_P256_SHA256_ASN1,
-    ECDSA_P256_SHA256_ASN1_SIGNING, ECDSA_P384_SHA384_ASN1_SIGNING,
-};
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use crate::cert_support::{p256_pkcs8, test_pki, TestPki, SERVER_NAME};
+use ldap_front::tls::DcCredential;
+use rustls::client::WebPkiServerVerifier;
 use rustls::crypto::{aws_lc_rs as provider_lc, CryptoProvider};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::server::{ServerConfig, ServerConnection};
 use rustls::sign::{CertifiedKey, SigningKey, SingleCertAndKey};
-use rustls::{
-    ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme, SupportedCipherSuite,
-};
+use rustls::{ClientConfig, ClientConnection, RootCertStore, SupportedCipherSuite};
 use std::sync::Arc;
-
-/// The opaque octets the test server presents instead of a certificate
-/// (module documentation). Not DER; never parsed.
-pub const PLACEHOLDER: &[u8] = b"ldap-front test-only placeholder: not an X.509 certificate";
-
-/// The opaque octets a test client offers as its "certificate".
-pub const CLIENT_PLACEHOLDER: &[u8] = b"ldap-front test-only client placeholder";
-
-/// A fresh ECDSA P-256 key: its PKCS#8 DER and its public point.
-pub struct TestKey {
-    pub pkcs8: Vec<u8>,
-    pub public: Vec<u8>,
-}
-
-/// A fresh ECDSA P-256 key (aws-lc-rs).
-pub fn p256_key() -> TestKey {
-    let document =
-        EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &SystemRandom::new())
-            .expect("key generation");
-    let pkcs8 = document.as_ref().to_vec();
-    let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &pkcs8).expect("parse");
-    TestKey {
-        public: pair.public_key().as_ref().to_vec(),
-        pkcs8,
-    }
-}
 
 /// A fresh ECDSA P-384 key's PKCS#8 DER (for the R50-12 refusal).
 pub fn p384_pkcs8() -> Vec<u8> {
-    EcdsaKeyPair::generate_pkcs8(&ECDSA_P384_SHA384_ASN1_SIGNING, &SystemRandom::new())
-        .expect("key generation")
-        .as_ref()
-        .to_vec()
+    crate::cert_support::p384_pkcs8()
+}
+
+/// A fresh test PKI (tests/common/cert.rs).
+pub fn pki() -> TestPki {
+    test_pki()
+}
+
+/// A fresh ECDSA P-256 key's PKCS#8 DER.
+pub fn p256_key() -> Vec<u8> {
+    p256_pkcs8()
 }
 
 /// A rustls signing key for a PKCS#8 DER ECDSA key.
@@ -94,79 +55,17 @@ pub fn signing_key(pkcs8: &[u8]) -> Arc<dyn SigningKey> {
         .expect("ECDSA key")
 }
 
-/// The product's server configuration, serving [`PLACEHOLDER`] with `key`.
-pub fn placeholder_server_config(key: &TestKey) -> Arc<ServerConfig> {
-    let certified = CertifiedKey::new(
-        vec![CertificateDer::from(PLACEHOLDER.to_vec())],
-        signing_key(&key.pkcs8),
-    );
-    ldap_front::tls::server_config(Arc::new(SingleCertAndKey::from(certified)))
-        .expect("server configuration")
+/// The DC credential of `pki`, through the production loader at the
+/// current time.
+pub fn credential(pki: &TestPki) -> DcCredential {
+    let now = ldap_front::startup::start_time().expect("clock");
+    DcCredential::from_der(pki.server_certificate.clone(), &pki.server_key, now)
+        .expect("the test certificate passes every R50-12 check")
 }
 
-/// Trusts exactly [`PLACEHOLDER`] signed by the pinned key (module
-/// documentation).
-#[derive(Debug)]
-pub struct PinnedKey {
-    public: Vec<u8>,
-}
-
-impl PinnedKey {
-    pub fn new(key: &TestKey) -> Arc<PinnedKey> {
-        Arc::new(PinnedKey {
-            public: key.public.clone(),
-        })
-    }
-}
-
-impl ServerCertVerifier for PinnedKey {
-    fn verify_server_cert(
-        &self,
-        end_entity: &CertificateDer<'_>,
-        intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        if end_entity.as_ref() == PLACEHOLDER && intermediates.is_empty() {
-            Ok(ServerCertVerified::assertion())
-        } else {
-            Err(rustls::Error::InvalidCertificate(
-                rustls::CertificateError::UnknownIssuer,
-            ))
-        }
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Err(rustls::Error::General(String::from("TLS 1.2 is not used")))
-    }
-
-    /// RFC 8446 §4.4.3: the signature over the content the client
-    /// reconstructs, with ecdsa_secp256r1_sha256 (§4.2.3: the curve is the
-    /// scheme's).
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        _cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        if dss.scheme != SignatureScheme::ECDSA_NISTP256_SHA256 {
-            return Err(rustls::Error::General(String::from("scheme")));
-        }
-        UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, &self.public)
-            .verify(message, dss.signature())
-            .map(|()| HandshakeSignatureValid::assertion())
-            .map_err(|_| rustls::Error::General(String::from("signature")))
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![SignatureScheme::ECDSA_NISTP256_SHA256]
-    }
+/// The product's server configuration serving `pki`'s server certificate.
+pub fn server_config_for(pki: &TestPki) -> Arc<ServerConfig> {
+    ldap_front::tls::server_config(credential(pki).resolver()).expect("server configuration")
 }
 
 /// A client provider with the given suites and groups (the rest is
@@ -201,24 +100,34 @@ pub fn profile_groups() -> Vec<&'static dyn rustls::crypto::SupportedKxGroup> {
     ]
 }
 
-/// A TLS 1.3 client that trusts `key` (module documentation); with
-/// `client_certificate`, it also holds a client "certificate" it would send
-/// if asked.
+/// rustls' standard verifier trusting only `root` (DER).
+pub fn verifier(root: &[u8], provider: Arc<CryptoProvider>) -> Arc<WebPkiServerVerifier> {
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(root.to_vec()))
+        .expect("the test CA parses as a trust anchor");
+    WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
+        .build()
+        .expect("verifier")
+}
+
+/// A TLS 1.3 client that trusts `pki`'s CA through the standard verifier
+/// (module documentation); with `client_certificate`, it also holds the
+/// client certificate it would send if asked.
 pub fn client_config_with(
     provider: CryptoProvider,
-    key: &TestKey,
+    pki: &TestPki,
     client_certificate: bool,
 ) -> Arc<ClientConfig> {
-    let builder = ClientConfig::builder_with_provider(Arc::new(provider))
+    let provider = Arc::new(provider);
+    let builder = ClientConfig::builder_with_provider(Arc::clone(&provider))
         .with_protocol_versions(&[&rustls::version::TLS13])
         .expect("versions")
-        .dangerous()
-        .with_custom_certificate_verifier(PinnedKey::new(key));
+        .with_webpki_verifier(verifier(&pki.ca.certificate, provider));
     let config = if client_certificate {
-        let client_key = p256_key();
         let certified = CertifiedKey::new(
-            vec![CertificateDer::from(CLIENT_PLACEHOLDER.to_vec())],
-            signing_key(&client_key.pkcs8),
+            vec![CertificateDer::from(pki.client_certificate.clone())],
+            signing_key(&pki.client_key),
         );
         builder.with_client_cert_resolver(Arc::new(SingleCertAndKey::from(certified)))
     } else {
@@ -228,17 +137,17 @@ pub fn client_config_with(
 }
 
 /// The default test client: every TLS 1.3 suite, the R50-11 groups.
-pub fn client_config(key: &TestKey) -> Arc<ClientConfig> {
+pub fn client_config(pki: &TestPki) -> Arc<ClientConfig> {
     client_config_with(
         client_provider(all_tls13_suites(), profile_groups()),
-        key,
+        pki,
         false,
     )
 }
 
-/// The name the test client asks for (not checked by [`PinnedKey`]).
+/// The name the test client asks for — the server certificate's dNSName.
 pub fn server_name() -> ServerName<'static> {
-    ServerName::try_from("dc1.example.org").expect("name")
+    ServerName::try_from(SERVER_NAME).expect("name")
 }
 
 /// Move every TLS octet `from` wants to write into `to`.
@@ -296,9 +205,15 @@ pub fn handshake_in_memory(
     Err(String::from("handshake did not finish"))
 }
 
-/// A new client connection for `config`.
+/// A new client connection for `config`, asking for [`server_name`].
 pub fn client(config: &Arc<ClientConfig>) -> ClientConnection {
     ClientConnection::new(Arc::clone(config), server_name()).expect("client connection")
+}
+
+/// A new client connection for `config`, asking for `name`.
+pub fn client_for(config: &Arc<ClientConfig>, name: &str) -> ClientConnection {
+    let name = ServerName::try_from(name.to_owned()).expect("name");
+    ClientConnection::new(Arc::clone(config), name).expect("client connection")
 }
 
 /// A new server connection for `config`.

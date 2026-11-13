@@ -17,8 +17,8 @@
 //!   (InitRecvTimeout, MaxConnIdleTime, the handshake bound);
 //! * the start-up checks (auditd, dird, the TLS profile) refuse to serve.
 //!
-//! The client side: rustls itself (docs/50 §9) with tests/common/tls.rs's
-//! trust model; LDAP messages from parse-ldap's canonical encoder or by
+//! The client side: rustls itself (docs/50 §9) with its standard verifier
+//! trusting the per-run test CA (tests/common/cert.rs, tests/common/tls.rs); LDAP messages from parse-ldap's canonical encoder or by
 //! hand from RFC 4511; the TLS 1.2 ClientHello by hand from RFC 8446.
 //!
 //! Sources: docs/50 R50-10, R50-11, R50-16, §3.7, §4.2, §4.3, §7.5, §9;
@@ -26,6 +26,9 @@
 //! §5.2, App. A; RFC 4513 §3.1.1; RFC 8446 §4, §4.1.2, §4.2, §4.2.1, §5.1,
 //! §6, App. D.2; [MS-ADTS] 3.1.1.3.4.6 as crates/parse-ldap cites it.
 //! Every value is made here.
+
+#[path = "common/cert.rs"]
+mod cert_support;
 
 #[path = "common/tls.rs"]
 mod tls_support;
@@ -239,7 +242,7 @@ fn a_client_certificate_is_ignored() {
             tls_support::all_tls13_suites(),
             tls_support::profile_groups(),
         ),
-        &w.key,
+        &w.pki,
         true,
     );
     let mut stream = tls_over(tcp(w.front.ldaps), &config).unwrap();
@@ -467,7 +470,7 @@ fn the_start_up_checks() {
     if world::dird_support::skip_as_root(uid) {
         return;
     }
-    let key = tls_support::p256_key();
+    let pki = tls_support::pki();
     let params = FrontParams {
         dird: Endpoint {
             socket: dir.join("l.sock"),
@@ -480,14 +483,14 @@ fn the_start_up_checks() {
         timeouts: test_timeouts(),
         limits: ldap_front::ConnectionLimits::DEFAULT,
     };
-    let no_auditd = Front::start(params.clone(), tls_support::placeholder_server_config(&key));
+    let no_auditd = Front::start(params.clone(), tls_support::server_config_for(&pki));
     assert!(no_auditd.err().unwrap().contains("auditd"));
 
     let _auditd = start_auditd(&dir, uid);
-    let no_dird = Front::start(params.clone(), tls_support::placeholder_server_config(&key));
+    let no_dird = Front::start(params.clone(), tls_support::server_config_for(&pki));
     assert!(no_dird.err().unwrap().contains("dird"));
 
-    let mut weak = (*tls_support::placeholder_server_config(&key)).clone();
+    let mut weak = (*tls_support::server_config_for(&pki)).clone();
     weak.send_tls13_tickets = 2;
     let refused = Front::start(params, Arc::new(weak));
     assert_eq!(

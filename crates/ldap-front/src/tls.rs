@@ -31,6 +31,25 @@
 //! Operator-supplied DER files; the key file root-owned 0400 and read as
 //! root before the privilege drop (crate::startup). [`DcCredential::from_der`]:
 //!
+//! * the certificate file holds exactly one DER X.509 v3 certificate (no
+//!   chain, nothing after it), read by crates/parse-x509 (RFC 5280 §4.1;
+//!   strict DER, bounded);
+//! * (a) its outer `signatureAlgorithm` is identical to
+//!   `tbsCertificate.signature` (RFC 5280 §4.1.1.2: "This field MUST
+//!   contain the same algorithm identifier as the signature field in the
+//!   sequence tbsCertificate"; §4.1.2.3);
+//! * (b) that algorithm is ecdsa-with-SHA256 and the subjectPublicKeyInfo
+//!   algorithm is id-ecPublicKey on secp256r1 — compared with
+//!   rustls-pki-types' documented constants `alg_id::ECDSA_SHA256` and
+//!   `alg_id::ECDSA_P256` ("The outer sequence encoding is not included, so
+//!   this is the DER encoding of an OID for algorithm plus the parameters
+//!   value" — docs.rs rustls-pki-types 1.16.0 `AlgorithmIdentifier`), i.e.
+//!   with the AlgorithmIdentifier SEQUENCE's **contents**. This project
+//!   writes no ECDSA object identifier itself (RFC 5480 / RFC 5758 are not
+//!   in specs/SOURCES.md);
+//! * (d) the validity period contains the start-up time, inclusive (RFC
+//!   5280 §4.1.2.5) — an expired or not-yet-valid certificate stops the
+//!   start (docs/questions/Q-320 item 4);
 //! * the key is a PKCS#8 DER ECDSA key, parsed by rustls' aws-lc-rs provider
 //!   from a **borrowed** slice (`crypto::aws_lc_rs::sign::any_ecdsa_type(&
 //!   PrivateKeyDer)`) — so no copy of the key octets is handed to anyone,
@@ -39,7 +58,7 @@
 //! * the key must sign `ecdsa_secp256r1_sha256` and nothing else (R50-12:
 //!   ECDSA P-256 / SHA-256, a single-hash algorithm, RFC 5929 §4.1; RFC 8446
 //!   §9.1 MTI);
-//! * `CertifiedKey::keys_match` must succeed: "a comparison of
+//! * (c) `CertifiedKey::keys_match` must succeed: "a comparison of
 //!   SubjectPublicKeyInfo bytes" between the key and the certificate — the
 //!   same check `with_single_cert` documents ("fails if … the
 //!   SubjectPublicKeyInfo from the private key does not match the public key
@@ -49,25 +68,33 @@
 //!   the resolver is rustls' `SingleCertAndKey` ("always resolves to the same
 //!   certificate and key") — the same behaviour.
 //!
-//! Not checked here: the certificate's own `signatureAlgorithm` (the
-//! issuer's signature, the field RFC 5929 §4.1's hash rule reads) — reading
-//! it needs an X.509 parser and RFC 5280 is not pinned (Q-161 group A). It
-//! matters only to the channel-binding value, which dird computes (R50-13)
-//! and which is not in phase 1 (P-13, Q-162). docs/questions/Q-285 item 3.
+//! The signatureAlgorithm is the field RFC 5929 §4.1's hash rule reads for
+//! tls-server-end-point ("use the hash function associated with the
+//! certificate's signatureAlgorithm" when it "uses a single hash
+//! function"); with (a) and (b) the DC certificate always names exactly
+//! one hash, SHA-256. The binding value is dird's to compute (R50-13) and
+//! channel binding is not in phase 1 (P-13, Q-162); the check stands on its
+//! own as docs/50 §5.3's algorithm constraint. The certificate's signature
+//! itself is the relying party's
+//! to verify (the clients, against the anchor of their join, docs/50 §5.3);
+//! the front verifies none. Extensions are read but not interpreted
+//! (docs/questions/Q-320 item 5). Follow-up of Q-285 items 1 and 3 (A-71).
 //!
 //! Spec: docs/50 R50-11, R50-12, R50-13, §4.3, §5.1-§5.4; RFC 8446 §2.3,
 //! §4.2.1, §4.2.7, §4.3.2, §4.4.2, §4.6.1, §9.1, App. B.4; RFC 5929 §4.1;
+//! RFC 5280 §4.1, §4.1.1.2, §4.1.2.3, §4.1.2.5, §4.1.2.7;
 //! RFC 4513 §3.1.4, §3.3; docs.rs rustls 0.23.46 (`ServerConfig`,
 //! `ConfigBuilder`, `CryptoProvider`, `crypto::aws_lc_rs`, `sign::CertifiedKey`,
 //! `sign::SingleCertAndKey`, `sign::SigningKey`, `server::ProducesTickets`,
 //! `server::StoresServerSessions`, `server::NoServerSessionStorage`,
 //! `KeyLog`, `NoKeyLog`, `compress::CompressionCache`, `ServerConnection`,
-//! `HandshakeKind`).
+//! `HandshakeKind`); docs.rs rustls-pki-types 1.16.0 (`alg_id::ECDSA_SHA256`,
+//! `alg_id::ECDSA_P256`, `AlgorithmIdentifier`, `UnixTime`).
 
 use core::fmt;
 use rustls::compress::CompressionCache;
 use rustls::crypto::{aws_lc_rs, CryptoProvider};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{alg_id, CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, UnixTime};
 use rustls::server::{
     NoServerSessionStorage, ProducesTickets, ResolvesServerCert, ServerConfig, ServerConnection,
 };
@@ -398,6 +425,19 @@ pub fn check_negotiated(connection: &ServerConnection) -> Result<Negotiated, Neg
 pub enum CredentialError {
     /// The certificate file is empty.
     EmptyCertificate,
+    /// The certificate file is not exactly one DER X.509 v3 certificate
+    /// (the field and rule are named; no octet of the file).
+    /// Spec: RFC 5280 4.1.
+    CertificateMalformed(parse_x509::Error),
+    /// The outer signatureAlgorithm differs from tbsCertificate.signature.
+    /// Spec: RFC 5280 4.1.1.2, 4.1.2.3.
+    SignatureAlgorithmMismatch,
+    /// The certificate is not signed with ecdsa-with-SHA256.
+    /// Spec: docs/50 R50-12, §5.3; RFC 5929 4.1.
+    NotEcdsaSha256,
+    /// The certificate's public key is not an EC key on P-256.
+    /// Spec: docs/50 R50-12; RFC 5280 4.1.2.7.
+    PublicKeyNotP256,
     /// The key is not a PKCS#8 DER ECDSA key the provider accepts.
     KeyRejected,
     /// The key is not ECDSA P-256 / SHA-256.
@@ -405,16 +445,41 @@ pub enum CredentialError {
     /// The key does not match the certificate's public key (or the
     /// certificate's public key could not be read).
     KeyMismatch,
+    /// The start-up time is before the certificate's notBefore.
+    /// Spec: RFC 5280 4.1.2.5.
+    NotYetValid,
+    /// The start-up time is after the certificate's notAfter.
+    /// Spec: RFC 5280 4.1.2.5.
+    Expired,
 }
 
 impl fmt::Display for CredentialError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            CredentialError::EmptyCertificate => "DC certificate file is empty",
-            CredentialError::KeyRejected => "DC key is not a PKCS#8 DER ECDSA key",
-            CredentialError::NotP256 => "DC key is not ECDSA P-256 / SHA-256",
-            CredentialError::KeyMismatch => "DC key does not match the certificate",
-        })
+        match self {
+            CredentialError::EmptyCertificate => f.write_str("DC certificate file is empty"),
+            CredentialError::CertificateMalformed(error) => write!(
+                f,
+                "DC certificate file is not one DER X.509 v3 certificate: {error}"
+            ),
+            CredentialError::SignatureAlgorithmMismatch => f.write_str(
+                "DC certificate signatureAlgorithm differs from tbsCertificate.signature",
+            ),
+            CredentialError::NotEcdsaSha256 => {
+                f.write_str("DC certificate is not signed with ecdsa-with-SHA256")
+            }
+            CredentialError::PublicKeyNotP256 => {
+                f.write_str("DC certificate public key is not EC P-256")
+            }
+            CredentialError::KeyRejected => f.write_str("DC key is not a PKCS#8 DER ECDSA key"),
+            CredentialError::NotP256 => f.write_str("DC key is not ECDSA P-256 / SHA-256"),
+            CredentialError::KeyMismatch => f.write_str("DC key does not match the certificate"),
+            CredentialError::NotYetValid => {
+                f.write_str("DC certificate is not yet valid (notBefore is after the start time)")
+            }
+            CredentialError::Expired => {
+                f.write_str("DC certificate has expired (notAfter is before the start time)")
+            }
+        }
     }
 }
 
@@ -429,19 +494,33 @@ pub struct DcCredential {
 
 impl DcCredential {
     /// Check and package the operator's DER certificate and PKCS#8 DER key
-    /// (module documentation). `key` is only borrowed; the caller wipes it.
+    /// (module documentation), at the start-up time `now`. `key` is only
+    /// borrowed; the caller wipes it. The checks run in this order: the
+    /// certificate's structure, (a), (b), the key, its curve, (c), (d).
     ///
     /// # Errors
     /// [`CredentialError`].
     ///
-    /// Spec: docs/50 R50-12, §5.3; RFC 5929 §4.1; RFC 8446 §9.1; docs.rs
-    /// rustls 0.23.46 `crypto::aws_lc_rs::sign::any_ecdsa_type`,
+    /// Spec: docs/50 R50-12, §5.3; RFC 5280 §4.1, §4.1.1.2, §4.1.2.3,
+    /// §4.1.2.5, §4.1.2.7; RFC 5929 §4.1; RFC 8446 §9.1; docs.rs rustls
+    /// 0.23.46 `crypto::aws_lc_rs::sign::any_ecdsa_type`,
     /// `sign::SigningKey::{algorithm, choose_scheme}`, `sign::CertifiedKey::
-    /// {new, keys_match}`.
-    pub fn from_der(certificate: Vec<u8>, key: &[u8]) -> Result<DcCredential, CredentialError> {
+    /// {new, keys_match}`; docs.rs rustls-pki-types 1.16.0 `alg_id`,
+    /// `UnixTime::as_secs`.
+    pub fn from_der(
+        certificate: Vec<u8>,
+        key: &[u8],
+        now: UnixTime,
+    ) -> Result<DcCredential, CredentialError> {
         if certificate.is_empty() {
             return Err(CredentialError::EmptyCertificate);
         }
+        let validity = {
+            let parsed = parse_x509::parse_certificate(&certificate)
+                .map_err(CredentialError::CertificateMalformed)?;
+            check_algorithms(&parsed)?;
+            parsed.tbs_certificate.validity
+        };
         let signing = {
             let borrowed = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key));
             aws_lc_rs::sign::any_ecdsa_type(&borrowed).map_err(|_| CredentialError::KeyRejected)?
@@ -453,6 +532,7 @@ impl DcCredential {
         certified
             .keys_match()
             .map_err(|_| CredentialError::KeyMismatch)?;
+        check_validity(&validity, now)?;
         Ok(DcCredential {
             certified: Arc::new(certified),
         })
@@ -464,6 +544,60 @@ impl DcCredential {
     pub fn resolver(&self) -> Arc<dyn ResolvesServerCert> {
         Arc::new(SingleCertAndKey::from(Arc::clone(&self.certified)))
     }
+}
+
+/// Checks (a) and (b) of the module documentation on a parsed certificate.
+///
+/// # Errors
+/// [`CredentialError::SignatureAlgorithmMismatch`],
+/// [`CredentialError::NotEcdsaSha256`], [`CredentialError::PublicKeyNotP256`].
+///
+/// Spec: RFC 5280 §4.1.1.2 ("MUST contain the same algorithm identifier as
+/// the signature field in the sequence tbsCertificate"), §4.1.2.3,
+/// §4.1.2.7; docs/50 R50-12, §5.3; docs.rs rustls-pki-types 1.16.0
+/// `alg_id::ECDSA_SHA256` ("AlgorithmIdentifier for ecdsa-with-SHA256"),
+/// `alg_id::ECDSA_P256` ("AlgorithmIdentifier for id-ecPublicKey with named
+/// curve secp256r1"), `AlgorithmIdentifier` ("The outer sequence encoding is
+/// not included").
+pub fn check_algorithms(certificate: &parse_x509::Certificate<'_>) -> Result<(), CredentialError> {
+    let tbs = &certificate.tbs_certificate;
+    // (a) The same AlgorithmIdentifier, parameters included: DER gives one
+    // encoding per value (X.690 clause 10), so the octets are compared.
+    if certificate.signature_algorithm.encoding != tbs.signature.encoding {
+        return Err(CredentialError::SignatureAlgorithmMismatch);
+    }
+    // (b) The constants hold the SEQUENCE's contents, so the contents are
+    // compared.
+    if tbs.signature.contents != alg_id::ECDSA_SHA256.as_ref() {
+        return Err(CredentialError::NotEcdsaSha256);
+    }
+    if tbs.subject_public_key_info.algorithm.contents != alg_id::ECDSA_P256.as_ref() {
+        return Err(CredentialError::PublicKeyNotP256);
+    }
+    Ok(())
+}
+
+/// Check (d): `now` lies in the validity period, both ends included.
+///
+/// # Errors
+/// [`CredentialError::NotYetValid`], [`CredentialError::Expired`].
+///
+/// Spec: RFC 5280 §4.1.2.5 ("the period of time from notBefore through
+/// notAfter, inclusive"); docs/questions/Q-320 item 4 (fail closed at
+/// start).
+pub fn check_validity(
+    validity: &parse_x509::Validity,
+    now: UnixTime,
+) -> Result<(), CredentialError> {
+    // A time past i64::MAX seconds is after every representable notAfter.
+    let now = i64::try_from(now.as_secs()).unwrap_or(i64::MAX);
+    if now < validity.not_before.unix_seconds() {
+        return Err(CredentialError::NotYetValid);
+    }
+    if now > validity.not_after.unix_seconds() {
+        return Err(CredentialError::Expired);
+    }
+    Ok(())
 }
 
 /// Whether `key` is an ECDSA key that signs [`DC_SIGNATURE_SCHEME`] and no

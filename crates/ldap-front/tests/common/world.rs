@@ -15,8 +15,9 @@
 //!   ports the system picks (never a privileged port).
 //! * [`World`] — auditd, dird (whose zone table makes 127.0.0.0/8 internal,
 //!   so the A-51 internal anonymous rootDSE grant applies to the loopback
-//!   client), the front with the product's TLS configuration over a
-//!   per-run P-256 key (tests/common/tls.rs's trust model).
+//!   client), the front with the product's TLS configuration serving a
+//!   real per-run certificate (tests/common/cert.rs, tests/common/tls.rs:
+//!   rustls' standard verifier on the client side).
 //! * [`direct`] — the LDAP engine called in-process over the same store,
 //!   policy and time: the reference the replies must equal octet for octet.
 //! * [`LdapReader`] and the TLS client — the client side of RFC 4511 §5.2
@@ -32,7 +33,8 @@ pub mod dird_support;
 #[path = "../../../audit-daemon/tests/common/mod.rs"]
 pub mod auditd_support;
 
-use crate::tls_support::{client_config, placeholder_server_config, server_name, TestKey};
+use crate::cert_support::TestPki;
+use crate::tls_support::{client_config, server_config_for, server_name};
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use core::time::Duration;
 use dird_support::{Dird, Directory, TempDir};
@@ -221,7 +223,7 @@ pub struct World {
     pub dird: Option<Dird>,
     pub auditd: Option<auditd_support::Server>,
     pub directory: Directory,
-    pub key: TestKey,
+    pub pki: TestPki,
     pub client: Arc<ClientConfig>,
     pub uid: u32,
     pub dir: TempDir,
@@ -247,7 +249,7 @@ pub fn world(tweak: impl FnOnce(&mut FrontParams)) -> Option<World> {
         ldap_policy(1),
     )
     .unwrap();
-    let key = crate::tls_support::p256_key();
+    let pki = crate::tls_support::pki();
     let mut front_params = FrontParams {
         dird: Endpoint {
             socket: dird.ldap_socket.clone(),
@@ -261,14 +263,14 @@ pub fn world(tweak: impl FnOnce(&mut FrontParams)) -> Option<World> {
         limits: ConnectionLimits::DEFAULT,
     };
     tweak(&mut front_params);
-    let front = Front::start(front_params, placeholder_server_config(&key)).unwrap();
-    let client = client_config(&key);
+    let front = Front::start(front_params, server_config_for(&pki)).unwrap();
+    let client = client_config(&pki);
     Some(World {
         front,
         dird: Some(dird),
         auditd: Some(auditd),
         directory,
-        key,
+        pki,
         client,
         uid,
         dir,

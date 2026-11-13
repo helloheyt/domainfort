@@ -579,7 +579,9 @@ dependencies = [
  "keyd-types",
  "krb-proto",
  "ldap",
+ "parse-asn1",
  "parse-ldap",
+ "parse-x509",
  "pdp",
  "rustls",
  "tokio",
@@ -622,6 +624,13 @@ version = "0.0.0"
 [[package]]
 name = "parse-ldap"
 version = "0.0.0"
+
+[[package]]
+name = "parse-x509"
+version = "0.0.0"
+dependencies = [
+ "parse-asn1",
+]
 
 [[package]]
 name = "pbkdf2"

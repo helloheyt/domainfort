@@ -13,9 +13,9 @@
 use crate::decode::{validate_bit_string, validate_generalized_time, validate_integer};
 use crate::error::{Error, Result};
 use crate::types::{
-    set_of_cmp, TagClass, Value, TAG_BIT_STRING, TAG_BOOLEAN, TAG_ENUMERATED, TAG_GENERALIZED_TIME,
-    TAG_GENERAL_STRING, TAG_INTEGER, TAG_OBJECT_IDENTIFIER, TAG_OCTET_STRING, TAG_SEQUENCE,
-    TAG_SET,
+    set_of_cmp, Tag, TagClass, Value, TAG_BIT_STRING, TAG_BOOLEAN, TAG_ENUMERATED,
+    TAG_GENERALIZED_TIME, TAG_GENERAL_STRING, TAG_INTEGER, TAG_OBJECT_IDENTIFIER, TAG_OCTET_STRING,
+    TAG_SEQUENCE, TAG_SET,
 };
 
 /// Encode one [`Value`] as canonical DER.
@@ -26,6 +26,23 @@ pub fn encode(value: &Value) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     encode_into(value, &mut out)?;
     Ok(out)
+}
+
+/// Encode one element at the tag-length-value level: the identifier octets
+/// for `tag`, the definite length of `contents` in the minimum number of
+/// octets, then `contents` unchanged. The contents are the caller's: this
+/// function writes canonical identifier and length octets only, so it can
+/// build structures outside the [`Value`] model (implicitly tagged types,
+/// restricted character string types, UTCTime) whose contents the caller has
+/// already put in DER form.
+///
+/// Spec: X.690 8.1.2 (identifier octets), 8.1.3.4 / 8.1.3.5 (definite
+/// length), 10.1 (DER: minimum number of length octets).
+#[must_use]
+pub fn encode_element(tag: Tag, contents: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(contents.len().saturating_add(16));
+    write_tlv(tag.class, tag.constructed, tag.number, contents, &mut out);
+    out
 }
 
 /// Append the canonical DER encoding of `value` to `out`.

@@ -7,9 +7,13 @@
 //! (0-RTT), §4.2.7 (groups, preference order), §4.3.2 / §4.4.2 (no
 //! CertificateRequest ⇒ no client certificate), §4.6.1 (tickets), §9.1
 //! (MTI suites and groups), App. B.4; RFC 5929 §4.1 (single hash); RFC
-//! 4513 §3.1.4, §3.3. The trust model of the handshakes is
-//! tests/common/tls.rs's (a pinned key, no X.509 certificate — Q-285 item
-//! 1). Every value is made here.
+//! 4513 §3.1.4, §3.3; RFC 5280 §4.1, §6. The handshakes serve a real
+//! per-run certificate through the production loader and the clients use
+//! rustls' standard verifier (tests/common/cert.rs, tests/common/tls.rs;
+//! docs/questions/Q-320). Every value is made here.
+
+#[path = "common/cert.rs"]
+mod cert_support;
 
 #[path = "common/tls.rs"]
 mod tls_support;
@@ -20,9 +24,7 @@ use ldap_front::tls::{
 };
 use rustls::compress::{CertCompressor, CompressionFailed, CompressionLevel};
 use rustls::crypto::{aws_lc_rs as provider_lc, CryptoProvider};
-use rustls::pki_types::CertificateDer;
 use rustls::server::{ServerConfig, ServerSessionMemoryCache};
-use rustls::sign::{CertifiedKey, SingleCertAndKey};
 use rustls::{
     CertificateCompressionAlgorithm, CipherSuite, HandshakeKind, KeyLog, NamedGroup,
     ProtocolVersion,
@@ -45,8 +47,8 @@ const LABELS: [&str; 7] = [
 /// every observable setting of the built configuration, field by field.
 #[test]
 fn the_server_configuration_is_the_r50_11_profile() {
-    let key = p256_key();
-    let config = placeholder_server_config(&key);
+    let pki = pki();
+    let config = server_config_for(&pki);
     let provider = config.crypto_provider();
     let suites: Vec<CipherSuite> = provider.cipher_suites.iter().map(|s| s.suite()).collect();
     assert_eq!(
@@ -114,25 +116,22 @@ impl CertCompressor for Compresses {
 
 static COMPRESSES: Compresses = Compresses;
 
-/// A configuration built from `provider` the product's way otherwise.
-fn config_with_provider(provider: CryptoProvider, key: &TestKey) -> ServerConfig {
-    let certified = CertifiedKey::new(
-        vec![CertificateDer::from(PLACEHOLDER.to_vec())],
-        signing_key(&key.pkcs8),
-    );
+/// A configuration built from `provider` the product's way otherwise
+/// (serving the real test certificate through the production loader).
+fn config_with_provider(provider: CryptoProvider, pki: &cert_support::TestPki) -> ServerConfig {
     ServerConfig::builder_with_provider(Arc::new(provider))
         .with_protocol_versions(PROTOCOL_VERSIONS)
         .unwrap()
         .with_no_client_auth()
-        .with_cert_resolver(Arc::new(SingleCertAndKey::from(certified)))
+        .with_cert_resolver(credential(pki).resolver())
 }
 
 /// docs/50 R50-11, §5.1: the policy check names every deviation (the check
 /// `serve` runs before it serves).
 #[test]
 fn the_policy_check_refuses_every_deviation() {
-    let key = p256_key();
-    let good = (*placeholder_server_config(&key)).clone();
+    let pki = pki();
+    let good = (*server_config_for(&pki)).clone();
     let refused = |mutate: &dyn Fn(&mut ServerConfig)| {
         let mut config = good.clone();
         mutate(&mut config);
@@ -189,7 +188,7 @@ fn the_policy_check_refuses_every_deviation() {
         ..provider()
     };
     assert_eq!(
-        check_policy(&config_with_provider(chacha, &key)),
+        check_policy(&config_with_provider(chacha, &pki)),
         Err(PolicyField::CipherSuites)
     );
     let reordered = CryptoProvider {
@@ -200,7 +199,7 @@ fn the_policy_check_refuses_every_deviation() {
         ..provider()
     };
     assert_eq!(
-        check_policy(&config_with_provider(reordered, &key)),
+        check_policy(&config_with_provider(reordered, &pki)),
         Err(PolicyField::CipherSuites)
     );
     let fewer_groups = CryptoProvider {
@@ -208,7 +207,7 @@ fn the_policy_check_refuses_every_deviation() {
         ..provider()
     };
     assert_eq!(
-        check_policy(&config_with_provider(fewer_groups, &key)),
+        check_policy(&config_with_provider(fewer_groups, &pki)),
         Err(PolicyField::KxGroups)
     );
     let groups_reordered = CryptoProvider {
@@ -220,7 +219,7 @@ fn the_policy_check_refuses_every_deviation() {
         ..provider()
     };
     assert_eq!(
-        check_policy(&config_with_provider(groups_reordered, &key)),
+        check_policy(&config_with_provider(groups_reordered, &pki)),
         Err(PolicyField::KxGroups)
     );
 }
@@ -231,10 +230,10 @@ fn the_policy_check_refuses_every_deviation() {
 /// post-handshake check accepts the result.
 #[test]
 fn a_tls13_handshake_negotiates_the_profile() {
-    let key = p256_key();
-    let config = placeholder_server_config(&key);
+    let pki = pki();
+    let config = server_config_for(&pki);
     let mut server = server(&config);
-    let mut client = client(&client_config(&key));
+    let mut client = client(&client_config(&pki));
     handshake_in_memory(&mut server, &mut client).unwrap();
     assert_eq!(server.protocol_version(), Some(ProtocolVersion::TLSv1_3));
     let negotiated = check_negotiated(&server).unwrap();
@@ -252,8 +251,8 @@ fn a_tls13_handshake_negotiates_the_profile() {
 /// a suite outside it (ChaCha20-Poly1305) fail the handshake.
 #[test]
 fn groups_and_suites_outside_the_profile_fail() {
-    let key = p256_key();
-    let config = placeholder_server_config(&key);
+    let pki = pki();
+    let config = server_config_for(&pki);
     for (group, name) in [
         (provider_lc::kx_group::X25519, NamedGroup::X25519),
         (provider_lc::kx_group::SECP256R1, NamedGroup::secp256r1),
@@ -261,7 +260,7 @@ fn groups_and_suites_outside_the_profile_fail() {
         let mut server = server(&config);
         let mut client = client(&client_config_with(
             client_provider(all_tls13_suites(), vec![group]),
-            &key,
+            &pki,
             false,
         ));
         handshake_in_memory(&mut server, &mut client).unwrap();
@@ -270,7 +269,7 @@ fn groups_and_suites_outside_the_profile_fail() {
     let mut server_a = server(&config);
     let mut p384_only = client(&client_config_with(
         client_provider(all_tls13_suites(), vec![provider_lc::kx_group::SECP384R1]),
-        &key,
+        &pki,
         false,
     ));
     assert!(handshake_in_memory(&mut server_a, &mut p384_only).is_err());
@@ -280,7 +279,7 @@ fn groups_and_suites_outside_the_profile_fail() {
             vec![provider_lc::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256],
             profile_groups(),
         ),
-        &key,
+        &pki,
         false,
     ));
     assert!(handshake_in_memory(&mut server_b, &mut chacha_only).is_err());
@@ -293,12 +292,12 @@ fn groups_and_suites_outside_the_profile_fail() {
 /// certificate (ignored, not refused).
 #[test]
 fn a_client_certificate_is_never_requested() {
-    let key = p256_key();
-    let config = placeholder_server_config(&key);
+    let pki = pki();
+    let config = server_config_for(&pki);
     let mut server = server(&config);
     let mut client = client(&client_config_with(
         client_provider(all_tls13_suites(), profile_groups()),
-        &key,
+        &pki,
         true,
     ));
     handshake_in_memory(&mut server, &mut client).unwrap();
@@ -312,9 +311,9 @@ fn a_client_certificate_is_never_requested() {
 /// possible.
 #[test]
 fn no_resumption_and_no_early_data() {
-    let key = p256_key();
-    let config = placeholder_server_config(&key);
-    let mut client_config = (*client_config(&key)).clone();
+    let pki = pki();
+    let config = server_config_for(&pki);
+    let mut client_config = (*client_config(&pki)).clone();
     client_config.enable_early_data = true;
     let client_config = Arc::new(client_config);
     for _ in 0..2 {
@@ -331,8 +330,8 @@ fn no_resumption_and_no_early_data() {
 /// docs/50 §4.3 step 4: nothing counts as negotiated before the handshake.
 #[test]
 fn the_check_refuses_an_unfinished_handshake() {
-    let key = p256_key();
-    let config = placeholder_server_config(&key);
+    let pki = pki();
+    let config = server_config_for(&pki);
     let server = server(&config);
     assert_eq!(
         check_negotiated(&server),
@@ -340,43 +339,107 @@ fn the_check_refuses_an_unfinished_handshake() {
     );
 }
 
-/// docs/50 R50-12 (ECDSA P-256 / SHA-256); RFC 5929 §4.1; RFC 8446 §9.1:
-/// the credential checks — a P-384 key is refused, octets that are not a
-/// key are refused, an empty certificate is refused, and a key with
-/// something that is not a certificate fails the key/certificate match.
+/// docs/50 R50-12 (ECDSA P-256 / SHA-256); RFC 5929 §4.1; RFC 8446 §9.1;
+/// RFC 5280 §4.1: the credential checks on the key — with the real test
+/// certificate, a P-384 key is refused, octets that are not a key are
+/// refused, an empty certificate is refused, a P-256 key that is not the
+/// certificate's fails the key/certificate match, and the right key passes.
+/// (The certificate's own checks: tests/certificate_checks.rs.)
 #[test]
 fn the_credential_checks() {
-    let p256 = p256_key();
-    assert!(signs_p256_only(signing_key(&p256.pkcs8).as_ref()));
+    let pki = pki();
+    let now = ldap_front::startup::start_time().unwrap();
+    assert!(signs_p256_only(signing_key(&pki.server_key).as_ref()));
     assert!(!signs_p256_only(signing_key(&p384_pkcs8()).as_ref()));
+    let certificate = || pki.server_certificate.clone();
     assert_eq!(
-        DcCredential::from_der(PLACEHOLDER.to_vec(), &p384_pkcs8()).err(),
+        DcCredential::from_der(certificate(), &p384_pkcs8(), now).err(),
         Some(CredentialError::NotP256)
     );
     assert_eq!(
-        DcCredential::from_der(PLACEHOLDER.to_vec(), b"not a key").err(),
+        DcCredential::from_der(certificate(), b"not a key", now).err(),
         Some(CredentialError::KeyRejected)
     );
     assert_eq!(
-        DcCredential::from_der(Vec::new(), &p256.pkcs8).err(),
+        DcCredential::from_der(Vec::new(), &pki.server_key, now).err(),
         Some(CredentialError::EmptyCertificate)
     );
     assert_eq!(
-        DcCredential::from_der(PLACEHOLDER.to_vec(), &p256.pkcs8).err(),
+        DcCredential::from_der(certificate(), &p256_key(), now).err(),
         Some(CredentialError::KeyMismatch)
+    );
+    assert!(DcCredential::from_der(certificate(), &pki.server_key, now).is_ok());
+}
+
+/// docs/50 R50-12, §5.3; RFC 5280 §4.1, §6; RFC 8446 §4.4.2, §4.4.3: the
+/// real certificate, loaded by the production loader, is accepted by
+/// rustls' **standard** verifier trusting only the test CA — chain, name,
+/// validity and CertificateVerify — and the client sees exactly the one
+/// certificate the file holds (no chain).
+#[test]
+fn the_standard_verifier_accepts_the_dc_certificate() {
+    let pki = pki();
+    let config = server_config_for(&pki);
+    let mut server = server(&config);
+    let mut client = client(&client_config(&pki));
+    handshake_in_memory(&mut server, &mut client).unwrap();
+    assert!(check_negotiated(&server).is_ok());
+    let presented: Vec<Vec<u8>> = client
+        .peer_certificates()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_ref().to_vec())
+        .collect();
+    assert_eq!(presented, vec![pki.server_certificate.clone()]);
+}
+
+/// The verifier is not a formality (docs.rs rustls 0.23.46
+/// `WebPkiServerVerifier::verify_server_cert`: "Signed by a trusted
+/// RootCertStore CA … Valid for DNS entry"): a client asking for another
+/// name, and a client trusting another CA, both refuse the server.
+#[test]
+fn the_standard_verifier_refuses_another_name_or_another_ca() {
+    let pki = pki();
+    let config = server_config_for(&pki);
+    let mut server_a = server(&config);
+    let mut wrong_name = client_for(&client_config(&pki), "dc2.example.org");
+    let refused = handshake_in_memory(&mut server_a, &mut wrong_name).unwrap_err();
+    assert!(
+        refused.starts_with("client: invalid peer certificate"),
+        "{refused}"
+    );
+
+    let other = pki_with_other_ca(&pki);
+    let mut server_b = server(&config);
+    let mut wrong_ca = client(&client_config(&other));
+    let refused = handshake_in_memory(&mut server_b, &mut wrong_ca).unwrap_err();
+    assert!(
+        refused.starts_with("client: invalid peer certificate"),
+        "{refused}"
     );
 }
 
+/// `pki` with its CA replaced by a fresh one (the client then trusts a CA
+/// that did not sign the server certificate).
+fn pki_with_other_ca(pki: &cert_support::TestPki) -> cert_support::TestPki {
+    cert_support::TestPki {
+        ca: cert_support::ca(),
+        server_certificate: pki.server_certificate.clone(),
+        server_key: pki.server_key.clone(),
+        client_certificate: pki.client_certificate.clone(),
+        client_key: pki.client_key.clone(),
+    }
+}
+
 /// docs/50 R50-12, §5.3 with an **operator-provided** certificate: the
-/// production loader (`DcCredential::from_der`: P-256 key, keys_match) and
-/// a handshake whose client pins that certificate and checks the
-/// CertificateVerify signature with rustls' own `verify_tls13_signature`
-/// over the certificate's key. Skipped unless `LDAP_FRONT_TEST_CERT_DIR`
-/// names a directory holding `cert.der` (one DER certificate, ECDSA P-256 /
-/// SHA-256) and `key.der` (its PKCS#8 DER key) — test material the operator
-/// makes; nothing is committed (Q-285 item 1).
+/// production loader (`DcCredential::from_der`: every R50-12 check at the
+/// current time) and the R50-11 configuration over it. Skipped unless
+/// `LDAP_FRONT_TEST_CERT_DIR` names a directory holding `cert.der` (one DER
+/// certificate, ECDSA P-256 / SHA-256) and `key.der` (its PKCS#8 DER key)
+/// — test material the operator makes; nothing is committed. The default
+/// run proves the same path with the per-run certificate above.
 #[test]
-fn an_operator_certificate_loads_and_serves() {
+fn an_operator_certificate_loads() {
     let Some(dir) = std::env::var_os("LDAP_FRONT_TEST_CERT_DIR") else {
         println!("skipped: LDAP_FRONT_TEST_CERT_DIR not set");
         return;
@@ -384,78 +447,8 @@ fn an_operator_certificate_loads_and_serves() {
     let dir = std::path::PathBuf::from(dir);
     let certificate = std::fs::read(dir.join("cert.der")).unwrap();
     let key = zeroize::Zeroizing::new(std::fs::read(dir.join("key.der")).unwrap());
-    let credential = DcCredential::from_der(certificate.clone(), &key).unwrap();
+    let now = ldap_front::startup::start_time().unwrap();
+    let credential = DcCredential::from_der(certificate, &key, now).unwrap();
     let config = server_config(credential.resolver()).unwrap();
-    let pinned = Arc::new(PinnedCertificate {
-        certificate: certificate.clone(),
-        algorithms: provider().signature_verification_algorithms,
-    });
-    let client_config = Arc::new(
-        rustls::ClientConfig::builder_with_provider(Arc::new(client_provider(
-            all_tls13_suites(),
-            profile_groups(),
-        )))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .dangerous()
-        .with_custom_certificate_verifier(pinned)
-        .with_no_client_auth(),
-    );
-    let mut server = server(&config);
-    let mut client = client(&client_config);
-    handshake_in_memory(&mut server, &mut client).unwrap();
-    assert!(check_negotiated(&server).is_ok());
-    assert_eq!(
-        client.peer_certificates().map(|c| c[0].as_ref().to_vec()),
-        Some(certificate)
-    );
-}
-
-/// Trusts exactly one operator certificate; the CertificateVerify is
-/// checked with rustls' `crypto::verify_tls13_signature` against it.
-#[derive(Debug)]
-struct PinnedCertificate {
-    certificate: Vec<u8>,
-    algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
-}
-
-impl rustls::client::danger::ServerCertVerifier for PinnedCertificate {
-    fn verify_server_cert(
-        &self,
-        end_entity: &CertificateDer<'_>,
-        intermediates: &[CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        if end_entity.as_ref() == self.certificate.as_slice() && intermediates.is_empty() {
-            Ok(rustls::client::danger::ServerCertVerified::assertion())
-        } else {
-            Err(rustls::Error::InvalidCertificate(
-                rustls::CertificateError::UnknownIssuer,
-            ))
-        }
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Err(rustls::Error::General(String::from("TLS 1.2 is not used")))
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![rustls::SignatureScheme::ECDSA_NISTP256_SHA256]
-    }
+    assert_eq!(check_policy(&config), Ok(()));
 }

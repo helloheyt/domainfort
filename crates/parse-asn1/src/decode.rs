@@ -32,6 +32,51 @@ pub fn decode(input: &[u8]) -> Result<Value> {
     Ok(value)
 }
 
+/// One DER element read at the tag-length-value level: its identifier, its
+/// contents octets, and its complete encoding. The contents are **not**
+/// interpreted — the caller decides what the tag means (for structures
+/// outside the [`Value`] model, e.g. implicitly tagged or restricted
+/// character string types) and may pass [`Element::encoding`] to
+/// [`decode`] when the type is one the value model covers.
+///
+/// Spec: X.690 8.1 (identifier octets, length octets, contents octets).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Element<'a> {
+    /// The identifier octets, decoded. Spec: X.690 8.1.2.
+    pub tag: Tag,
+    /// The contents octets only. Spec: X.690 8.1.4.
+    pub contents: &'a [u8],
+    /// The complete encoding: identifier + length + contents.
+    pub encoding: &'a [u8],
+}
+
+/// Split the first DER element off `input`; return it and the octets after
+/// it. The identifier and length octets obey exactly the rules [`decode`]
+/// enforces — minimal high-tag-number form, definite length only, length in
+/// the minimum number of octets, never the reserved octet 0xFF — and the
+/// declared length is bounded against `input` before anything is sliced, so
+/// nothing is allocated (no allocation at all happens here).
+///
+/// # Errors
+/// [`Error::Truncated`], [`Error::NonMinimalTagNumber`],
+/// [`Error::TagNumberOverflow`], [`Error::IndefiniteLength`],
+/// [`Error::ReservedLengthOctet`], [`Error::NonMinimalLength`],
+/// [`Error::LengthOverflow`], [`Error::LengthExceedsInput`].
+///
+/// Spec: X.690 8.1.2, 8.1.3, 10.1 (DER: definite form, minimum octets).
+pub fn split_element(input: &[u8]) -> Result<(Element<'_>, &[u8])> {
+    let mut cursor = Cursor::new(input);
+    let tlv = cursor.read_tlv()?;
+    Ok((
+        Element {
+            tag: tlv.tag,
+            contents: tlv.contents,
+            encoding: tlv.element,
+        },
+        cursor.remaining(),
+    ))
+}
+
 /// A bounded forward cursor over a byte slice.
 struct Cursor<'a> {
     buf: &'a [u8],

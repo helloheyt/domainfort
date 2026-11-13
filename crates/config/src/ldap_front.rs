@@ -8,9 +8,12 @@
 //! **No secrets.** The DC's TLS private key is never a setting: the file names
 //! only the **paths** of the operator-supplied DER certificate and key. The key
 //! file is root-owned mode 0400 and is read as root before the privilege drop;
-//! the daemon checks that mode, and that the certificate is ECDSA P-256 /
-//! SHA-256, when it loads them (docs/50 R50-12, §5.3, §6.4; Q-221 → A-57
-//! option A).
+//! the daemon checks that mode when it loads them, and that the certificate
+//! is ECDSA P-256 / SHA-256: one DER X.509 v3 certificate whose
+//! signatureAlgorithm equals tbsCertificate.signature and is
+//! ecdsa-with-SHA256, whose subject key is EC P-256 and matches the P-256
+//! private key, and whose validity contains the start-up time (docs/50
+//! R50-12, §5.3, §6.4; Q-221 → A-57 option A; Q-320).
 //!
 //! Spec: docs/50 R50-10, R50-12, R50-15, §2.4, §3.6, §4.2, §5.3, §7.1.
 

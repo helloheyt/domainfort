@@ -24,6 +24,17 @@
 //! non-canonical value, so `encode(decode(x)) == x` for canonical input and
 //! `decode(encode(v)) == v`.
 //!
+//! # Element level
+//!
+//! [`split_element`] and [`encode_element`] work one level below the value
+//! model: one tag-length-value unit with strict DER identifier and length
+//! octets, its contents left to the caller. They exist for structures the
+//! Kerberos value model does not cover — the X.509 certificate of RFC 5280
+//! (crates/parse-x509), with its implicit tags, UTCTime and character
+//! string types — so that every DER header in the workspace is read and
+//! written by the one implementation here. They add no behaviour to
+//! [`decode`] / [`encode`].
+//!
 //! # Provenance
 //!
 //! Written only from the allowed specifications, opened in-session (AGENTS.md
@@ -40,7 +51,7 @@ mod encode;
 mod error;
 mod types;
 
-pub use decode::decode;
-pub use encode::encode;
+pub use decode::{decode, split_element, Element};
+pub use encode::{encode, encode_element};
 pub use error::{Error, Result};
 pub use types::{Tag, TagClass, Value, MAX_DEPTH};

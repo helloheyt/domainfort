@@ -10,6 +10,9 @@
 //! `LdapFrontSettings` (its sample in crates/config/tests/common). Every
 //! value is made here; the keys are generated per run (tests/common/tls.rs).
 
+#[path = "common/cert.rs"]
+mod cert_support;
+
 #[path = "common/tls.rs"]
 mod tls_support;
 
@@ -81,10 +84,10 @@ fn the_key_file_rules() {
     let owner = dir.uid();
     let key = tls_support::p256_key();
     let path = dir.join("key.der");
-    write(&path, &key.pkcs8, 0o400);
+    write(&path, &key, 0o400);
     assert_eq!(
         read_private_key(&path, owner).unwrap().as_slice(),
-        key.pkcs8.as_slice()
+        key.as_slice()
     );
     assert_eq!(
         read_private_key(&path, owner.wrapping_add(1)).err(),
@@ -174,8 +177,11 @@ fn the_configuration_file_rules() {
 }
 
 /// docs/50 R50-12, §5.3 (task P11: the key is checked against the
-/// certificate): from files, a P-384 key is refused as not P-256, and a
-/// P-256 key with something that is not its certificate fails the match.
+/// certificate; Q-320: the certificate's own checks): from files, with a
+/// real per-run certificate (tests/common/cert.rs) — a P-384 key is refused
+/// as not P-256, a P-256 key that is not the certificate's fails the match,
+/// the right key builds the configuration, and the same certificate is
+/// refused at a start time after its notAfter (RFC 5280 §4.1.2.5).
 #[test]
 fn the_tls_configuration_from_files() {
     let dir = TempDir::new();
@@ -187,17 +193,35 @@ fn the_tls_configuration_from_files() {
         0o644,
     );
     let settings = read_settings(&config_path, owner).unwrap();
-    write(&dir.join("cert.der"), tls_support::PLACEHOLDER, 0o644);
-    write(&dir.join("key.der"), &tls_support::p384_pkcs8(), 0o400);
+    let now = ldap_front::startup::start_time().unwrap();
+    let pki = tls_support::pki();
+    let key_path = dir.join("key.der");
+    let replace_key = |octets: &[u8]| {
+        if key_path.exists() {
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        write(&key_path, octets, 0o400);
+    };
+    write(&dir.join("cert.der"), &pki.server_certificate, 0o644);
+    replace_key(&tls_support::p384_pkcs8());
     assert_eq!(
-        load_tls_config(&settings, owner).err(),
+        load_tls_config(&settings, owner, now).err(),
         Some(StartupError::Credential(CredentialError::NotP256))
     );
-    std::fs::set_permissions(dir.join("key.der"), std::fs::Permissions::from_mode(0o600)).unwrap();
-    write(&dir.join("key.der"), &tls_support::p256_key().pkcs8, 0o400);
+    replace_key(&tls_support::p256_key());
     assert_eq!(
-        load_tls_config(&settings, owner).err(),
+        load_tls_config(&settings, owner, now).err(),
         Some(StartupError::Credential(CredentialError::KeyMismatch))
+    );
+    replace_key(&pki.server_key);
+    assert!(load_tls_config(&settings, owner, now).is_ok());
+    // A certificate that ended at 2025-01-01T00:00:10Z, loaded now.
+    let mut short = cert_support::EndEntity::server(&pki.server_key);
+    short.not_after = cert_support::build::utc_time("250101000010Z");
+    write(&dir.join("cert.der"), &pki.ca.issue(&short), 0o644);
+    assert_eq!(
+        load_tls_config(&settings, owner, now).err(),
+        Some(StartupError::Credential(CredentialError::Expired))
     );
 }
 

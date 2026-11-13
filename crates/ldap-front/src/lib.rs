@@ -19,8 +19,11 @@
 //!    ([`startup::read_settings`]: root-owned, not group/other-writable,
 //!    bounded);
 //! 3. as root, before the drop: read the DC certificate and the key (key
-//!    file root-owned, mode 0400), check them (ECDSA P-256 / SHA-256, the key
-//!    matches the certificate), build the docs/50 R50-11 `ServerConfig`, wipe
+//!    file root-owned, mode 0400), check them (one DER X.509 v3 certificate,
+//!    RFC 5280 §4.1; signatureAlgorithm identical to tbsCertificate.signature
+//!    and equal to ecdsa-with-SHA256; an EC P-256 subject key; a P-256 key
+//!    that matches it; validity containing the start time), build the
+//!    docs/50 R50-11 `ServerConfig`, wipe
 //!    the key octets ([`startup::load_tls_config`]); bind the `ldap_listen`
 //!    / `ldaps_listen` addresses ([`startup::bind_listeners`]);
 //! 4. apply the hardening plan ([`startup::hardening_plan`]) while the
@@ -73,8 +76,10 @@
 //!
 //! # Residuals (documented, not hidden — docs/questions/Q-285)
 //!
-//! - The certificate's own signatureAlgorithm is not read (RFC 5280 not
-//!   pinned); only the key (P-256) and the key/certificate match are checked.
+//! - The certificate's validity is checked at start only; a certificate
+//!   that expires while the daemon runs is served until a restart
+//!   (docs/questions/Q-320 item 4). Its extensions are read, not
+//!   interpreted, and its signature is the clients' to verify (item 5).
 //! - rustls' internal buffers (handshake state, plaintext before it is
 //!   drained, the signing key inside the provider) are rustls' to wipe; the
 //!   decoded `LdapMessage` (a SASL token, if any) is not wiped.
@@ -82,11 +87,6 @@
 //!   counted, not audited (no ipc-audit shape).
 //! - Peer credentials on the client side use tokio `peer_cred` (works on
 //!   Linux and macOS; the blocking clients' rustix path is Linux only).
-//! - The TLS handshake tests use a test-only trust model (a pinned key and
-//!   an opaque placeholder instead of an X.509 certificate — no certificate
-//!   generator is approved and RFC 5280 is not pinned); the production
-//!   loader with a real certificate runs only with an operator-provided
-//!   certificate (`LDAP_FRONT_TEST_CERT_DIR`).
 //! - SIGTERM is not handled; no chroot, no seccomp / landlock / namespaces
 //!   (Q-216, P-19).
 //!
@@ -102,10 +102,13 @@
 //! §4.14.3, §5.2, §5.3; RFC 4513 (2215320f…2f6a) §3, §3.1, §3.1.1, §3.1.2,
 //! §3.1.4, §3.1.5, §3.2, §3.3; RFC 8446 (47871bc8…b3bd) §2.3, §4.2.1,
 //! §4.2.3, §4.2.7, §4.3.2, §4.4.2, §4.4.3, §4.6.1, §9.1, App. B.4; RFC 5929
-//! (d32604f5…eab7) §4, §4.1; the public API of this project's crates
-//! parse-ldap, ipc, ipc-ldap, ipc-audit, config, daemon-sandbox (kdc-daemon
-//! and directory-daemon as the pattern); and the docs.rs API pages of tokio
-//! 1.54.1, rustls 0.23.46, rustls-pki-types 1.16.0, aws-lc-rs 1.19.0 and
+//! (d32604f5…eab7) §4, §4.1; RFC 5280 (a2f2628c…345d) §4.1, §4.1.1.2,
+//! §4.1.2.3, §4.1.2.5, §4.1.2.7 (docs/questions/Q-320); the public API of
+//! this project's crates parse-ldap, parse-x509, ipc, ipc-ldap, ipc-audit,
+//! config, daemon-sandbox (kdc-daemon and directory-daemon as the
+//! pattern); and the docs.rs API pages of tokio 1.54.1, rustls 0.23.46
+//! (incl. `client::WebPkiServerVerifier`, `RootCertStore` for the tests),
+//! rustls-pki-types 1.16.0 (incl. `alg_id`), aws-lc-rs 1.19.0 and
 //! zeroize 1.9.1 — API documentation only, never source (P-2). No other
 //! implementation, TLS-terminating proxy, LDAP server or daemon was
 //! consulted or recalled (AGENTS.md §1-3).
