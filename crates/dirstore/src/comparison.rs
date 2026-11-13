@@ -26,7 +26,9 @@ use crate::types::AttrId;
 use crate::{MAX_RDN_KEY_LEN, RDN_SIZE_LIMIT};
 
 /// `true` for a printable ASCII byte, `0x20..=0x7E`. Spec: Q-080 item 1.
-fn printable_ascii(b: u8) -> bool {
+/// Also the rule of [`crate::ValueConstraint::AsciiPrintable`] (Q-091 item
+/// 10), so both name rules use this one definition (D64).
+pub(crate) fn printable_ascii(b: u8) -> bool {
     (0x20..=0x7E).contains(&b)
 }
 

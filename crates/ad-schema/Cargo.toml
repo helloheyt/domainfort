@@ -1,0 +1,34 @@
+# ad-schema — the phase-1 Active Directory schema CONTENT as data (docs/46,
+# decided as A-29; R46-1): the 35 attribute and 10 class definitions of
+# docs/46 §4-§5, their identifiers computed with MakeAttid over
+# NewPrefixTable() ([MS-DRSR] 5.16.4, R46-3), the dirstore::Schema built from
+# them (docs/46 §5.4, §4.4, §8) and the lookup tables the PDP and the LDAP
+# layer need (schemaIDGUID, property set, class chain, CLASSATTS,
+# lDAPDisplayName — docs/46 §7, A-28).
+#
+# Leaf data crate: depends only on our own `dirstore` (the mechanism) and
+# `dtyp` (GUID). No pdp dependency — a future directory PIP adapts the plain
+# data exported here. No external crate.
+#
+# Written only from docs/46, Q-080, Q-081 / A-28, Q-090, Q-091 and the pinned
+# [MS-DRSR] v20260309, [MS-ADSC] v20240423, [MS-ADA1] v20180912, [MS-ADA2]
+# v20240423, [MS-ADA3] v20180912, [MS-ADTS] v20261026, [MS-DTYP] v20241119 and
+# ITU-T X.690 (02/2021) sections cited in the source, opened in-session from
+# tools/spec-pin/cache/ (SHA-256 verified against the manifest) — AGENTS.md
+# §1-3.
+
+[package]
+name = "ad-schema"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Our own directory storage engine: the schema mechanism this crate fills
+# (AttributeDefinition, ClassDefinition, Schema). Path dependency.
+dirstore = { path = "../dirstore" }
+# Our own Windows data types: the GUID type (schemaIDGUID values).
+dtyp = { path = "../dtyp" }
+
+[lints]
+workspace = true

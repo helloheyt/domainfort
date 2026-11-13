@@ -285,6 +285,50 @@ fn bad_constraints() {
 }
 
 #[test]
+fn ascii_printable_only_on_utf8_strings() {
+    // Source: Q-091 item 10 (A-30) — a generic printable-ASCII constraint
+    // for Utf8String; `Schema::new` refuses it on any other syntax.
+    let a = AttrId(1);
+    for syntax in [
+        ValueSyntax::OctetString,
+        ValueSyntax::Integer,
+        ValueSyntax::Integer32,
+        ValueSyntax::Boolean,
+        ValueSyntax::Guid,
+    ] {
+        expect(
+            build(
+                vec![AttributeDefinition {
+                    constraint: Some(ValueConstraint::AsciiPrintable),
+                    ..plain(1, syntax)
+                }],
+                vec![],
+            ),
+            SchemaDefect::InvalidConstraint(a),
+        );
+    }
+    // And an Integer32 constraint is still refused on Utf8String.
+    expect(
+        build(
+            vec![AttributeDefinition {
+                constraint: Some(ValueConstraint::AllowedBits(1)),
+                ..plain(1, ValueSyntax::Utf8String)
+            }],
+            vec![],
+        ),
+        SchemaDefect::InvalidConstraint(a),
+    );
+    assert!(build(
+        vec![AttributeDefinition {
+            constraint: Some(ValueConstraint::AsciiPrintable),
+            ..plain(1, ValueSyntax::Utf8String)
+        }],
+        vec![]
+    )
+    .is_ok());
+}
+
+#[test]
 fn derived_unique_and_rdn_label_rules() {
     // Source: docs/46 §8.2 (Derived: no stored-value rules, never in must),
     // §8.5 (unique on stored values only); Q-090 / [MS-ADTS] 3.1.1.5.1.2

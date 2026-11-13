@@ -1,0 +1,41 @@
+# cargo-fuzz harness for ad-schema's OID → ATTRTYP mapping and name lookups
+# (AGENTS.md §6: every parser gets a fuzz target before it merges to main).
+# `make_attid` parses a dotted-decimal OID string that a future LDAP layer
+# may take from a client (a numericoid), so it must never panic, hang or
+# over-allocate on any input.
+#
+# This is a SEPARATE workspace (note the empty [workspace] table below): it is
+# intentionally NOT a member of the root workspace, so `cargo build --all`,
+# `cargo clippy`, `cargo test`, `cargo deny` and the SBOM in the product
+# workspace never pull in the fuzzing-only dependencies. It is built only via
+# `cargo fuzz run ad_schema_make_attid` (nightly + cargo-fuzz).
+#
+# NOTE FOR REVIEW: libfuzzer-sys is fuzz-harness-only test infrastructure, not
+# linked into any product crate, and on the license allowlist (MIT /
+# Apache-2.0, AGENTS.md §7). It is PENDING OWNER APPROVAL (docs/questions/
+# PENDING-OWNER.md, P-1): this harness has not been built or run.
+
+[package]
+name = "ad-schema-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ad-schema]
+path = ".."
+
+[[bin]]
+name = "ad_schema_make_attid"
+path = "fuzz_targets/ad_schema_make_attid.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the root workspace (see header).
+[workspace]

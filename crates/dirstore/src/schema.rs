@@ -188,15 +188,22 @@ pub struct ValueRange {
     pub upper: i64,
 }
 
-/// A constraint on the values of an Integer32 attribute (the value read as
-/// its two's-complement bit pattern for `AllowedBits`). Spec: docs/46 §8.2
-/// (R46-6).
+/// A constraint on the values of an attribute: `AllowedBits` and
+/// `AllowedValues` for Integer32 (the value read as its two's-complement bit
+/// pattern for `AllowedBits`), `AsciiPrintable` for Utf8String. Any other
+/// pairing is refused by [`Schema::new`]. Spec: docs/46 §8.2 (R46-6);
+/// Q-091 item 10 (A-30).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ValueConstraint {
-    /// Every set bit of the value must be set in this mask.
+    /// Integer32: every set bit of the value must be set in this mask.
     AllowedBits(u32),
-    /// The value must be one of these (at least one).
+    /// Integer32: the value must be one of these (at least one).
     AllowedValues(Vec<i32>),
+    /// Utf8String: every byte of the value is printable ASCII,
+    /// `0x20..=0x7E` — the phase-1 rule for names that are not an RDN or a
+    /// `unique` value (e.g. dNSHostName). Spec: Q-091 item 10 (A-30); Q-080
+    /// item 1 (interim ASCII-only names, P-9).
+    AsciiPrintable,
 }
 
 /// One attribute definition. Spec: docs/32 §4; docs/46 §8.2.
@@ -218,7 +225,8 @@ pub struct AttributeDefinition {
     pub link: Option<Link>,
     /// Allowed range of values (see [`ValueRange`]). Spec: docs/46 §8.2.
     pub range: Option<ValueRange>,
-    /// Allowed values or bits (Integer32 only). Spec: docs/46 §8.2.
+    /// Allowed values or bits (Integer32), or printable ASCII (Utf8String).
+    /// Spec: docs/46 §8.2; Q-091 item 10.
     pub constraint: Option<ValueConstraint>,
     /// No two live objects may hold values with the same comparison key
     /// (docs/46 §8.5). Honoured always; nothing can switch it off at run time
@@ -368,9 +376,16 @@ fn check_attribute_definition(def: &AttributeDefinition) -> Result<()> {
     if let Some(r) = def.range {
         check_range(def, r)?;
     }
+    // Spec: docs/46 §8.2 (Integer32 constraints); Q-091 item 10
+    // (AsciiPrintable on Utf8String only).
     if let Some(c) = &def.constraint {
-        let usable = def.syntax == ValueSyntax::Integer32
-            && !matches!(c, ValueConstraint::AllowedValues(v) if v.is_empty());
+        let usable = match c {
+            ValueConstraint::AllowedBits(_) => def.syntax == ValueSyntax::Integer32,
+            ValueConstraint::AllowedValues(v) => {
+                def.syntax == ValueSyntax::Integer32 && !v.is_empty()
+            }
+            ValueConstraint::AsciiPrintable => def.syntax == ValueSyntax::Utf8String,
+        };
         if !usable {
             return defect(SchemaDefect::InvalidConstraint(id));
         }
@@ -826,22 +841,29 @@ fn check_value_rules(
             return Err(Violation::ValueOutOfRange(id));
         }
     }
-    if let Some(c) = &def.constraint {
-        let v = be_i32(value).ok_or(Violation::InvalidValueSyntax(id))?;
-        match c {
-            ValueConstraint::AllowedBits(mask) => {
-                // The two's-complement bit pattern of the value.
-                let bits = u32::from_be_bytes(v.to_be_bytes());
-                if bits & !mask != 0 {
-                    return Err(Violation::DisallowedBits(id));
-                }
-            }
-            ValueConstraint::AllowedValues(allowed) => {
-                if !allowed.contains(&v) {
-                    return Err(Violation::ValueNotAllowed(id));
-                }
+    match &def.constraint {
+        None => {}
+        Some(ValueConstraint::AllowedBits(mask)) => {
+            let v = be_i32(value).ok_or(Violation::InvalidValueSyntax(id))?;
+            // The two's-complement bit pattern of the value.
+            let bits = u32::from_be_bytes(v.to_be_bytes());
+            if bits & !mask != 0 {
+                return Err(Violation::DisallowedBits(id));
             }
         }
+        Some(ValueConstraint::AllowedValues(allowed)) => {
+            let v = be_i32(value).ok_or(Violation::InvalidValueSyntax(id))?;
+            if !allowed.contains(&v) {
+                return Err(Violation::ValueNotAllowed(id));
+            }
+        }
+        // Spec: Q-091 item 10; Q-080 item 1.
+        Some(ValueConstraint::AsciiPrintable)
+            if !value.iter().copied().all(comparison::printable_ascii) =>
+        {
+            return Err(Violation::ValueNotAsciiPrintable(id));
+        }
+        Some(ValueConstraint::AsciiPrintable) => {}
     }
     Ok(())
 }

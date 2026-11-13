@@ -144,6 +144,10 @@ pub enum Violation {
     /// it has no comparison key in phase 1. Spec: docs/46 §8.5; Q-080
     /// (interim: ASCII + A–Z fold, P-9).
     ComparisonKeyNotAscii(AttrId),
+    /// A value of an attribute constrained to printable ASCII
+    /// ([`crate::ValueConstraint::AsciiPrintable`]) has a byte outside
+    /// `0x20..=0x7E`. Spec: Q-091 item 10; Q-080 item 1.
+    ValueNotAsciiPrintable(AttrId),
 
     // ---- class chain and tree shape (docs/46 §8.3 items 1-2) ----
     /// The classes are not `SUPCLASSES(c) ∪ {c}` for exactly one class `c`.
@@ -274,8 +278,9 @@ pub enum SchemaDefect {
     /// the allowed values for syntax Boolean and Object(DS-DN)".
     /// Spec: [MS-ADTS] 3.1.1.2.3; docs/46 §8.2.
     RangeNotApplicable(AttrId),
-    /// A value constraint on a syntax other than Integer32, or an empty
-    /// allowed-value list. Spec: docs/46 §8.2.
+    /// An Integer32 value constraint on another syntax, an empty
+    /// allowed-value list, or `AsciiPrintable` on a syntax other than
+    /// Utf8String. Spec: docs/46 §8.2; Q-091 item 10.
     InvalidConstraint(AttrId),
     /// A Derived attribute carries a rule that only applies to stored values
     /// (range, constraint, unique, or an RDN label). Spec: docs/46 §8.2.
@@ -463,6 +468,9 @@ impl fmt::Display for Violation {
                     "value of unique attribute {} is not printable ASCII",
                     a.0
                 )
+            }
+            Violation::ValueNotAsciiPrintable(a) => {
+                write!(f, "value of attribute {} is not printable ASCII", a.0)
             }
             Violation::InvalidClassChain => {
                 f.write_str("classes are not the chain of one most specific class")

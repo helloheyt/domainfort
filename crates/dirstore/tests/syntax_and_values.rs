@@ -7,7 +7,8 @@
 //! §5.16.3.9 (the printed DSTIME example), §5.16.3.2 (the printed INT32
 //! example); [MS-ADTS] v20261026 §3.1.1.2.3 (rangeLower / rangeUpper),
 //! §3.1.1.1.3 (no object has the NULL GUID), §3.1.1.1.6 (back links are
-//! read-only). Test data is hand-made (tests/common).
+//! read-only); Q-091 item 10 (the printable-ASCII constraint). Test data is
+//! hand-made (tests/common).
 
 mod common;
 
@@ -287,6 +288,65 @@ fn allowed_bits_are_enforced_on_create_and_modify() {
         store.snapshot().unwrap().get_object(guid(2)).unwrap(),
         before
     );
+}
+
+#[test]
+fn ascii_printable_is_enforced_on_create_and_modify() {
+    // Source: Q-091 item 10 (A-30) — `AsciiPrintable` on a Utf8String
+    // attribute: every byte 0x20..=0x7E (Q-080 item 1); anything else
+    // (control byte, DEL, non-ASCII UTF-8) is refused. The TEST schema's
+    // multi-valued note (ATTR_NOTE) is given the constraint here.
+    let attrs = attribute_definitions(AttrClass::Secret)
+        .into_iter()
+        .map(|mut d| {
+            if d.id == ATTR_NOTE {
+                d.constraint = Some(dirstore::ValueConstraint::AsciiPrintable);
+            }
+            d
+        })
+        .collect();
+    let schema = Schema::new(attrs, class_definitions()).unwrap();
+    let dir = TempDir::new("ascii-printable");
+    let store = Store::open(dir.db_path(), key_a(), schema).unwrap();
+    create_all(&store, vec![root(1, "root")]);
+    let note = |v: &[u8]| with(vec![(ATTR_NOTE, vec![v.to_vec()])]);
+    let mut txn = store.begin_write().unwrap();
+    for bad in [&b"a\tb"[..], b"a\x7Fb", b"a\x00b", "h\u{e9}te".as_bytes()] {
+        assert!(matches!(
+            txn.create_object(note(bad), &origin(NODE_1, 2, 1)),
+            Err(Error::Rejected(Violation::ValueNotAsciiPrintable(
+                ATTR_NOTE
+            )))
+        ));
+    }
+    // The whole printable range is accepted.
+    let all: Vec<u8> = (0x20..=0x7E).collect();
+    txn.create_object(note(&all), &origin(NODE_1, 2, 2))
+        .unwrap();
+    // Modify is held to the same rule; a refusal changes nothing.
+    assert!(matches!(
+        txn.modify_object(
+            guid(2),
+            vec![AttributeChange::Replace {
+                id: ATTR_NOTE,
+                values: vec![b"ok".to_vec(), b"line\nbreak".to_vec()],
+            }],
+            &origin(NODE_1, 2, 3)
+        ),
+        Err(Error::Rejected(Violation::ValueNotAsciiPrintable(
+            ATTR_NOTE
+        )))
+    ));
+    txn.commit().unwrap();
+    let back = store
+        .snapshot()
+        .unwrap()
+        .get_object(guid(2))
+        .unwrap()
+        .expect("created");
+    let values = &back.attribute(ATTR_NOTE).unwrap().values;
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0].value, all);
 }
 
 // ----------------------------------------------------------------- derived --
