@@ -1,23 +1,29 @@
-//! The AS exchange inside keyd: `verify_preauth` (PA-ENC-TIMESTAMP) and
-//! `issue_as_rep`. Role `Kdc` only.
+//! The AS exchange inside keyd: `verify_preauth` and `issue_as_rep`, without
+//! armor (PA-ENC-TIMESTAMP) and with FAST armor (the encrypted challenge FAST
+//! factor and the armored reply, docs/48 §4). Role `Kdc` only.
 //!
 //! State machine: `verify_preauth ──(AuthnProof)──► issue_as_rep`. Issuance
 //! without a valid, unexpired, unused proof bound to the same caller and the
-//! same client is not expressible (I4).
+//! same client is not expressible (I4). Under FAST the proof is also bound to
+//! the armor of its conversation, both ways (docs/48 §2.3): an armored proof
+//! issues only with that armor, an unarmored proof only without one.
 //!
 //! `issue_as_rep` builds the EncTicketPart and EncASRepPart itself from a
 //! validated template, draws the session key from the entropy source, seals
 //! the ticket under the CURRENT krbtgt key and the reply under the client key
-//! that pre-authenticated, and returns only the two sealed blobs — the
-//! session key never leaves keyd (docs/10 §4 steps 1-7).
+//! that pre-authenticated — or, under FAST, under the reply key strengthened
+//! with a fresh strengthen key — and returns only sealed blobs: the session
+//! key, the strengthen key and the reply key never leave keyd (docs/10 §4
+//! steps 1-7; docs/48 §2.2, §4.3).
 //!
 //! Phase 1 issues no PAC (MS-PAC / NDR is phase 2, where D124 applies):
 //! tickets carry no authorization-data. Tickets are addressless (no caddr;
 //! RFC 4120 5.3 recommends allowing addressless tickets). The transited
 //! field is empty (local authentication, RFC 4120 3.3.3.2).
 //!
-//! Spec: RFC 4120 3.1.2, 3.1.3, 5.2.7.2, 5.3, 5.4.2, 7.3, 7.5.1; docs/10 §4,
-//! §8; docs/30 §2.
+//! Spec: RFC 4120 3.1.2, 3.1.3, 5.2.7.2, 5.3, 5.4.2, 7.3, 7.5.1; RFC 6113
+//! 5.1, 5.4, 5.4.3, 5.4.6, 6.2, 8; docs/10 §4, §8; docs/30 §2; docs/48 §2.3,
+//! §4.
 
 use crate::audit::{AuditKeyRef, AuditReason, AuditSink};
 use crate::authz::{CallerId, HandleSlot, Operation};
@@ -25,18 +31,20 @@ use crate::entropy::EntropySource;
 use crate::error::{AuthnError, Deny, Internal, IssueError};
 use crate::keyd::{authorize, draw, new_random_key, open, seal, AuditFields, Keyd};
 use crate::model::{KeyHandle, KeyPurpose, Kvno, PrincipalId};
-use crate::store::KeyStore;
+use crate::store::{KeyStore, KvnoKeys};
 use crate::template::{as_ticket_flags, check_binding, check_times, tgs_name, TemplateTimes};
 use crate::throttle::SecretThrottle;
 use crate::time::{kerberos_time_seconds, within_skew};
-use crate::tokens::{ExchangeId, TokenRefusal, TOKEN_ID_LENGTH};
-use crate::usage::{AS_REP_ENC_PART, AS_REQ_PA_ENC_TIMESTAMP, TICKET_ENC_PART};
-use krb_crypto::EncType;
-use krb_proto::constants::{DOMAIN_X500_COMPRESS, PA_ENC_TIMESTAMP};
+use crate::tokens::{ArmorId, ExchangeId, TokenRefusal, TOKEN_ID_LENGTH};
+use crate::usage::{
+    AS_REP_ENC_PART, AS_REQ_PA_ENC_TIMESTAMP, KEY_USAGE_ENC_CHALLENGE_CLIENT, TICKET_ENC_PART,
+};
+use krb_crypto::{EncType, ProtocolKey};
+use krb_proto::constants::{DOMAIN_X500_COMPRESS, PA_ENCRYPTED_CHALLENGE, PA_ENC_TIMESTAMP};
 use krb_proto::{
-    EncAsRepPart, EncKdcRepPart, EncTicketPart, EncryptedData, EncryptionKey, KerberosTime,
-    KeyValue, LastReq, PaData, PaEncTimestamp, PaEncTsEnc, PrincipalName, Realm, Ticket,
-    TicketFlags, TransitedEncoding,
+    EncAsRepPart, EncKdcRepPart, EncTicketPart, EncryptedChallenge, EncryptedData, EncryptionKey,
+    KerberosTime, KeyValue, LastReq, PaData, PaEncTimestamp, PaEncTsEnc, PrincipalName, Realm,
+    Ticket, TicketFlags, TransitedEncoding,
 };
 use zeroize::Zeroizing;
 
@@ -65,6 +73,19 @@ pub(crate) struct ProofEntry {
     authtime: KerberosTime,
     reply_enctype: EncType,
     reply_kvno: Kvno,
+    /// The armor of an armored pre-authentication; `None` without armor.
+    /// Spec: docs/48 §2.3 ("the internal AuthnProof remembers the
+    /// armor_id").
+    armor: Option<[u8; TOKEN_ID_LENGTH]>,
+}
+
+/// The client key that passed a pre-authentication check: the enctype and
+/// the key version the reply will be sealed for.
+/// Spec: RFC 6113 2.1 ("the KDC SHOULD pick the same key as the reply key");
+/// RFC 4120 5.4.2 (client kvno in the AS-REP enc-part).
+struct PreauthKey {
+    enctype: EncType,
+    kvno: Kvno,
 }
 
 /// The KDC's request for a TGT. keyd fills in the session key, the realm,
@@ -101,17 +122,25 @@ pub struct AsTicketTemplate {
     pub nonce: u32,
 }
 
-/// The sealed AS-REP parts: the ticket (sealed under krbtgt) and the
-/// enc-part (sealed under the client key). The KDC assembles the AS-REP.
+/// The sealed AS-REP parts: the ticket (sealed under krbtgt), the enc-part
+/// (sealed under the client key, or under the strengthened reply key when
+/// armored) and, when armored, the enc-fast-rep. The KDC assembles the
+/// AS-REP (and, when armored, its PA-FX-FAST padata around `fast_rep`).
 ///
 /// Spec: docs/10 §4 (`struct AsRep { ticket: Sealed, enc_part: Sealed }`);
-/// RFC 4120 5.4.2.
+/// docs/48 §2.3 (`fast_rep: Option<Sealed>`), §4.1 A14; RFC 4120 5.4.2; RFC
+/// 6113 5.4.3.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AsRepParts {
     /// `ticket [5] Ticket`.
     pub ticket: Ticket,
-    /// `enc-part [6] EncryptedData` (EncASRepPart, key usage 3).
+    /// `enc-part [6] EncryptedData` (EncASRepPart, key usage 3, client
+    /// kvno).
     pub enc_part: EncryptedData,
+    /// `enc-fast-rep` of the KrbFastArmoredRep (the KrbFastResponse sealed
+    /// in the armor key, key usage 52): `Some` exactly when the issuance was
+    /// armored. Spec: RFC 6113 5.4.3; docs/48 §2.3.
+    pub fast_rep: Option<EncryptedData>,
 }
 
 impl ProofEntry {
@@ -132,9 +161,40 @@ pub(crate) fn token_deny(refusal: TokenRefusal) -> Deny {
     })
 }
 
+/// The client long-term key of an encrypted challenge (docs/questions/Q-123
+/// option (a), decided A-32): the first enctype of the inner req-body's
+/// etype list (the client's order) that is configured (I5) and for which the
+/// client's CURRENT key version holds a key. The EncryptedChallenge itself
+/// names no long-term key — its etype is the challenge key's — so keyd
+/// computes the one key it accepts from what it stored, and tries no other
+/// (no per-key trial decryption, I6). The KDC advertises the same single
+/// entry in PA-ETYPE-INFO2 (RFC 6113 2.1: "KDC implementations MAY choose to
+/// offer only one key").
+/// Spec: RFC 4120 3.1.3 ("the KDC SHOULD use the first valid strong etype
+/// for which an encryption key is available"); RFC 6113 2.1, 5.4.6;
+/// docs/48 §4.5 step 3.
+fn challenge_long_term_key<'a>(
+    version: &'a KvnoKeys,
+    requested: &[i32],
+    supported: &[EncType],
+) -> Option<(EncType, &'a ProtocolKey)> {
+    requested.iter().find_map(|number| {
+        let enctype = EncType::from_number(*number)
+            .ok()
+            .filter(|e| supported.contains(e))?;
+        version.key_for(enctype).map(|key| (enctype, key))
+    })
+}
+
 impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
-    /// `verify_preauth`: verify PA-ENC-TIMESTAMP for `client` and return a
-    /// one-time [`AuthnProof`].
+    /// `verify_preauth`: verify the pre-authentication of `client` and
+    /// return a one-time [`AuthnProof`] — PA-ENC-TIMESTAMP when `armor` is
+    /// `None`; the encrypted challenge FAST factor (PA-ENCRYPTED-CHALLENGE)
+    /// under the FAST armor `armor` otherwise. Any other combination is
+    /// refused: a FAST factor "MUST NOT be used outside of FAST" (RFC 6113
+    /// 5.4), and inside FAST encrypted challenge is the only factor in phase 1
+    /// (docs/48 §4.5 — the KDC ignores a PA-ENC-TIMESTAMP inside FAST and
+    /// never passes it here; keyd refuses it if it does).
     ///
     /// Throttle first (decision A-34): right after authorization and BEFORE
     /// any secret work, the per-principal failure throttle must admit the
@@ -144,11 +204,13 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// A refused attempt is the uniform `AuthnError::Denied` (it is decided
     /// before the cryptographic chain, A-26); audit records it as
     /// `Throttled`. Only a failure of the cryptographic check itself — the
-    /// timestamp does not decrypt under the client key — counts as a
-    /// failure; a success (a proof issued) clears the principal's count, as
-    /// in `verify_secret`; every other refusal leaves the count unchanged.
+    /// timestamp does not decrypt under the client key, or the challenge
+    /// does not decrypt under the challenge key — counts as a failure, in
+    /// the one per-principal count shared by both paths; a success (a proof
+    /// issued) clears the principal's count, as in `verify_secret`; every
+    /// other refusal leaves the count unchanged.
     ///
-    /// Checks, failing as the uniform `AuthnError::Denied`:
+    /// **Without armor** — checks failing as the uniform `AuthnError::Denied`:
     /// padata-type is PA-ENC-TIMESTAMP (2); the padata-value decodes as
     /// EncryptedData; its etype is configured (I5) and the client's CURRENT
     /// key version has a key of that type (a kvno, if present, must be the
@@ -159,19 +221,46 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// client key reaches the skew check, so a wrong password still cannot be
     /// told apart from an unknown key or kvno — no password oracle.
     ///
+    /// **With armor** (docs/48 §4.5) — checks failing as `Denied`:
+    /// 1. the armor is live and this caller's (an armor presented by another
+    ///    caller is destroyed), and its ONE pre-authentication attempt is
+    ///    still open; the attempt is taken now, whatever follows;
+    /// 2. padata-type is PA-ENCRYPTED-CHALLENGE (138); the value decodes as
+    ///    EncryptedChallenge, of the armor key's enctype (the challenge key's,
+    ///    RFC 6113 5.1), without kvno (the challenge key is no long-lasting
+    ///    key, RFC 4120 5.2.9; docs/questions/Q-145);
+    /// 3. the long-term key (K2) is chosen by keyd alone from the stored
+    ///    inner etype list (`challenge_long_term_key`, Q-123);
+    /// 4. challenge key = KRB-FX-CF2(armor key, K2, "clientchallengearmor",
+    ///    "challengelongterm"); decryption with key usage 54 succeeds and the
+    ///    plaintext decodes as PA-ENC-TS-ENC;
+    /// 5. only then (A-26): patimestamp outside the clock skew → `Skew`
+    ///    (which the KDC answers with KRB_AP_ERR_SKEW, armored — RFC 6113
+    ///    5.4.6, docs/48 R48-6, §6.3).
+    ///
+    /// The proof is bound to (client, armor, enctype, kvno), and the armor to
+    /// the proof. Replay of an encrypted challenge ("the ciphertext MUST be
+    /// identical", RFC 6113 5.4.6) needs no cache of its own: the challenge
+    /// key depends on the armor key, whose armor AP-REQ is in the replay
+    /// cache, and each armor allows one attempt (docs/48 §3.3). A refusal
+    /// leaves the armor live for the armored error (docs/48 §4.1 A10).
+    ///
     /// Spec: RFC 4120 5.2.7.2 ("encrypted using the client's secret key and a
     /// key usage value of 1"), 7.5.1 (usage 1), 3.1.3 (KDC_ERR_PREAUTH_FAILED),
-    /// 5.2.9 (kvno); docs/10 §4, §6 (throttling); docs/30 §2.3; A-26
-    /// (docs/questions/Q-071); A-34 (throttle).
+    /// 5.2.9 (kvno); RFC 6113 5.1, 5.4, 5.4.6 (challenge keys, usage 54), 6.2,
+    /// 8 (factors bound to the conversation); docs/10 §4, §6 (throttling);
+    /// docs/30 §2.3; docs/48 §2.3, §4.5; A-26 (docs/questions/Q-071); A-34
+    /// (throttle); docs/questions/Q-123 (A-32).
     pub fn verify_preauth(
         &mut self,
         caller: &CallerId,
         client: &KeyHandle,
         padata: &PaData,
+        armor: Option<ArmorId>,
         now: &KerberosTime,
     ) -> Result<AuthnProof, AuthnError> {
         let mut fields = AuditFields::for_handle(client);
-        let result = self.verify_preauth_inner(caller, client, padata, now, &mut fields);
+        let result = self.verify_preauth_inner(caller, client, padata, armor, now, &mut fields);
         self.emit(caller, Operation::VerifyPreauth, now, &fields, &result);
         result.map_err(AuthnError::from)
     }
@@ -181,6 +270,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         caller: &CallerId,
         client: &KeyHandle,
         padata: &PaData,
+        armor: Option<ArmorId>,
         now: &KerberosTime,
         fields: &mut AuditFields,
     ) -> Internal<AuthnProof> {
@@ -195,6 +285,54 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         if !self.preauth_throttle.admit(&client.principal, now_s) {
             return Err(Deny::rate_limited(AuditReason::Throttled));
         }
+        let verified = match &armor {
+            None => self.check_enc_timestamp(client, padata, now_s, fields)?,
+            Some(armor_id) => {
+                self.check_encrypted_challenge(caller, client, padata, armor_id, now_s, fields)?
+            }
+        };
+        let mut id = [0u8; TOKEN_ID_LENGTH];
+        draw(&mut self.entropy, &mut id)?;
+        // The armor remembers the proof, the proof remembers the armor
+        // (docs/48 §2.3). The armor was found live at `now` above.
+        let armor = armor.map(|armor_id| *armor_id.as_bytes());
+        if let Some(armor_id) = &armor {
+            self.armors
+                .peek_mut(armor_id, caller, now_s)
+                .map_err(token_deny)?
+                .bind_proof(id);
+        }
+        let entry = ProofEntry {
+            principal: client.principal,
+            authtime: *now,
+            reply_enctype: verified.enctype,
+            reply_kvno: verified.kvno,
+            armor,
+        };
+        let expires_at = now_s + i64::from(self.config.token_lifetime_secs);
+        if !self.proofs.insert(id, *caller, expires_at, entry, now_s) {
+            return Err(Deny::unavailable(AuditReason::TokenTableFull));
+        }
+        // A success clears the principal's failure count, as in
+        // verify_secret (A-34).
+        self.preauth_throttle.record(&client.principal, true, now_s);
+        Ok(AuthnProof {
+            exchange_id: ExchangeId::from_bytes(id),
+            client: client.principal,
+            authtime: *now,
+        })
+    }
+
+    /// The unarmored check of `verify_preauth`: PA-ENC-TIMESTAMP under the
+    /// client's current key (see [`Self::verify_preauth`]).
+    /// Spec: RFC 4120 5.2.7.2, 5.2.9, 7.5.1; A-26; A-34.
+    fn check_enc_timestamp(
+        &mut self,
+        client: &KeyHandle,
+        padata: &PaData,
+        now_s: i64,
+        fields: &mut AuditFields,
+    ) -> Internal<PreauthKey> {
         if padata.padata_type != PA_ENC_TIMESTAMP {
             return Err(Deny::denied(AuditReason::UnsupportedPadataType));
         }
@@ -237,60 +375,154 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         ) {
             return Err(Deny::classified(AuditReason::ClockSkew, AuthnError::Skew));
         }
-        let reply_kvno = current.kvno();
-        let mut id = [0u8; TOKEN_ID_LENGTH];
-        draw(&mut self.entropy, &mut id)?;
-        let entry = ProofEntry {
-            principal: client.principal,
-            authtime: *now,
-            reply_enctype: enctype,
-            reply_kvno,
-        };
-        let expires_at = now_s + i64::from(self.config.token_lifetime_secs);
-        if !self.proofs.insert(id, *caller, expires_at, entry, now_s) {
-            return Err(Deny::unavailable(AuditReason::TokenTableFull));
-        }
-        // A success clears the principal's failure count, as in
-        // verify_secret (A-34).
-        self.preauth_throttle.record(&client.principal, true, now_s);
-        Ok(AuthnProof {
-            exchange_id: ExchangeId::from_bytes(id),
-            client: client.principal,
-            authtime: *now,
+        Ok(PreauthKey {
+            enctype,
+            kvno: current.kvno(),
         })
     }
 
-    /// `issue_as_rep`: consume `proof` and issue a TGT.
+    /// The armored check of `verify_preauth`: the encrypted challenge FAST
+    /// factor under `armor_id` (steps 1-5 of [`Self::verify_preauth`]).
+    /// Spec: RFC 6113 5.1, 5.4.6, 6.2; RFC 4120 5.2.7.2; docs/48 §2.3, §4.5;
+    /// docs/questions/Q-123 (A-32), Q-145; A-26; A-34.
+    fn check_encrypted_challenge(
+        &mut self,
+        caller: &CallerId,
+        client: &KeyHandle,
+        padata: &PaData,
+        armor_id: &ArmorId,
+        now_s: i64,
+        fields: &mut AuditFields,
+    ) -> Internal<PreauthKey> {
+        // 1. The armor and its one attempt (I4).
+        let armor = self
+            .armors
+            .peek_mut(armor_id.as_bytes(), caller, now_s)
+            .map_err(token_deny)?;
+        armor.begin_preauth()?;
+
+        // 2. PA-ENCRYPTED-CHALLENGE, of the challenge key's enctype.
+        if padata.padata_type != PA_ENCRYPTED_CHALLENGE {
+            return Err(Deny::denied(AuditReason::UnsupportedPadataType));
+        }
+        let challenge = EncryptedChallenge::decode(&padata.padata_value)
+            .map_err(|_| Deny::denied(AuditReason::MalformedInput))?;
+        if challenge.etype != armor.challenge_enctype().number() {
+            return Err(Deny::denied(AuditReason::ChallengeEncTypeMismatch));
+        }
+
+        // 3. The long-term key K2, chosen by keyd (Q-123), current version.
+        let current = self
+            .store
+            .get(client)
+            .ok_or(Deny::denied(AuditReason::KeyNotFound))?
+            .current();
+        fields.kvno = Some(current.kvno());
+        // The challenge key is derived per conversation, not a long-lasting
+        // key: a kvno "is only present in messages encrypted under long
+        // lasting keys" (RFC 4120 5.2.9), so a present one is refused —
+        // interim strict reading, docs/questions/Q-145.
+        if challenge.kvno.is_some() {
+            return Err(Deny::denied(AuditReason::KvnoMismatch));
+        }
+        let (enctype, long_term) =
+            challenge_long_term_key(current, armor.requested_etypes(), &self.config.enctypes)
+                .ok_or(Deny::denied(AuditReason::KeyNotFound))?;
+
+        // 4. The challenge key; the cryptographic check (usage 54) — the only
+        // refusal the throttle counts, exactly as for PA-ENC-TIMESTAMP (A-34).
+        let challenge_key = armor.client_challenge_key(long_term)?;
+        let plaintext = match open(
+            &challenge_key,
+            KEY_USAGE_ENC_CHALLENGE_CLIENT,
+            &challenge.cipher,
+        ) {
+            Ok(plaintext) => plaintext,
+            Err(deny) => {
+                self.preauth_throttle
+                    .record(&client.principal, false, now_s);
+                return Err(deny);
+            }
+        };
+        drop(challenge_key);
+        let timestamp = PaEncTsEnc::decode(&plaintext)
+            .map_err(|_| Deny::denied(AuditReason::MalformedInput))?;
+        drop(plaintext);
+
+        // 5. The chain is complete (decrypted under the challenge key,
+        // decoded): only now the skew class (A-26).
+        if !within_skew(
+            kerberos_time_seconds(&timestamp.patimestamp),
+            now_s,
+            self.config.clock_skew_secs,
+        ) {
+            return Err(Deny::classified(AuditReason::ClockSkew, AuthnError::Skew));
+        }
+        Ok(PreauthKey {
+            enctype,
+            kvno: current.kvno(),
+        })
+    }
+
+    /// `issue_as_rep`: consume `proof` and issue a TGT — armored when
+    /// `armor` is `Some`.
     ///
     /// 1. authorize (Kdc; client handle PrincipalLongterm, krbtgt handle
     ///    Krbtgt);
     /// 2. consume the proof: live, issued to this caller, bound to this
     ///    client (`Denied` otherwise — the proof is destroyed either way);
+    ///    and the proof's armor is `armor` — None↔None, Some(a)↔Some(a)
+    ///    (`Denied`, docs/48 §2.3);
     /// 3. validate the template (`BadTemplate`): realm, TGS sname, enctype
-    ///    configured, flags in the allowed mask, times within policy; then
-    ///    the name bindings (`Denied`): crealm/cname must identify the client
-    ///    key set's bound name, and the krbtgt key set must be bound to
-    ///    krbtgt/realm = template sname (Q-040, A-19; RFC 4120 6.2, 7.3);
+    ///    configured, flags in the allowed mask, times within policy;
+    ///    armored: the armor is live, this caller's and bound to this proof,
+    ///    and the template's crealm / cname / nonce are the stored inner
+    ///    request's (`Denied`, docs/48 §3.4); then the name bindings
+    ///    (`Denied`): crealm/cname must identify the client key set's bound
+    ///    name, and the krbtgt key set must be bound to krbtgt/realm =
+    ///    template sname (Q-040, A-19; RFC 4120 6.2, 7.3);
     /// 4. draw a fresh session key;
     /// 5. EncTicketPart sealed under the CURRENT krbtgt key, usage 2;
-    /// 6. EncASRepPart sealed under the client key that pre-authenticated
-    ///    (still the current version), usage 3, with the client kvno;
-    /// 7. return the two sealed parts — the session key stays inside.
+    /// 6. EncASRepPart, usage 3, with the client kvno, sealed under the
+    ///    client key that pre-authenticated (still the current version) —
+    ///    or, armored, under the reply key strengthened with a fresh
+    ///    strengthen key, with the KrbFastResponse (the KDC's encrypted
+    ///    challenge, the strengthen key, KrbFastFinished, the inner nonce)
+    ///    sealed in the armor key as `fast_rep` (`ArmorEntry::seal_as_reply`
+    ///    in the fast_armor module); the armor is consumed;
+    /// 7. return the sealed parts — the session key, the strengthen key and
+    ///    the reply key stay inside.
     ///
-    /// Spec: docs/10 §4 (issue_as_rep, steps 1-7), §8; RFC 4120 3.1.3, 5.3,
-    /// 5.4.2 (key usage 3; client kvno included), 7.5.1 (usages 2, 3).
+    /// An armored refusal leaves the armor live (only the proof is consumed),
+    /// so that the KDC can seal the armored error with `seal_fast_error`
+    /// (docs/48 §4.1 A13); an armor presented by another caller, or expired,
+    /// is destroyed.
+    ///
+    /// Spec: docs/10 §4 (issue_as_rep, steps 1-7), §8; docs/48 §2.3, §3.4,
+    /// §4.3, §4.4; RFC 4120 3.1.3, 5.3, 5.4.2 (key usage 3; client kvno
+    /// included), 7.5.1 (usages 2, 3); RFC 6113 5.4.2, 5.4.3, 5.4.6.
+    #[allow(clippy::too_many_arguments)]
     pub fn issue_as_rep(
         &mut self,
         caller: &CallerId,
         client: &KeyHandle,
         krbtgt: &KeyHandle,
         proof: &AuthnProof,
+        armor: Option<ArmorId>,
         template: &AsTicketTemplate,
         now: &KerberosTime,
     ) -> Result<AsRepParts, IssueError> {
         let mut fields = AuditFields::for_handle(client);
-        let result =
-            self.issue_as_rep_inner(caller, client, krbtgt, proof, template, now, &mut fields);
+        let result = self.issue_as_rep_inner(
+            caller,
+            client,
+            krbtgt,
+            proof,
+            armor,
+            template,
+            now,
+            &mut fields,
+        );
         self.emit(caller, Operation::IssueAsRep, now, &fields, &result);
         result.map_err(IssueError::from)
     }
@@ -302,6 +534,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         client: &KeyHandle,
         krbtgt: &KeyHandle,
         proof: &AuthnProof,
+        armor: Option<ArmorId>,
         template: &AsTicketTemplate,
         now: &KerberosTime,
         fields: &mut AuditFields,
@@ -324,6 +557,12 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             || proof.authtime != entry.authtime
         {
             return Err(Deny::denied(AuditReason::TokenPrincipalMismatch));
+        }
+        // The proof and the armor are one conversation: None↔None,
+        // Some(a)↔Some(a). Spec: docs/48 §2.3, §9.2 item 8.
+        let armor = armor.map(|armor_id| *armor_id.as_bytes());
+        if entry.armor != armor {
+            return Err(Deny::denied(AuditReason::ArmorProofMismatch));
         }
 
         // Step 2: the template.
@@ -348,6 +587,21 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
                 renewable: template.flags.contains(TicketFlags::RENEWABLE),
             },
         )?;
+        // Armored: the armor is live, this caller's and bound to this proof,
+        // and the template answers the inner request (crealm, cname, nonce).
+        // Not consumed yet — a refusal leaves it for the armored error.
+        // Spec: docs/48 §2.3, §3.4, §4.1 A13; RFC 6113 5.4.2, 5.4.3.
+        if let Some(armor_id) = &armor {
+            self.armors
+                .peek_mut(armor_id, caller, now_s)
+                .map_err(token_deny)?
+                .check_issue(
+                    proof.exchange_id.as_bytes(),
+                    &template.crealm,
+                    &template.cname,
+                    template.nonce,
+                )?;
+        }
 
         // Keys: the client key that pre-authenticated, the current krbtgt key.
         let client_set = self
@@ -427,7 +681,8 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             },
         };
 
-        // Step 6: EncASRepPart under the client key (usage 3).
+        // Step 6: EncASRepPart (usage 3) under the client key, or — armored —
+        // under the strengthened reply key, with the sealed KrbFastResponse.
         let rep_part = EncAsRepPart(EncKdcRepPart {
             key: session_key,
             last_req: LastReq::default(),
@@ -446,7 +701,39 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             .encode()
             .map_err(|_| Deny::unavailable(AuditReason::InternalFailure))?;
         drop(rep_part);
-        let rep_cipher = seal(&mut self.entropy, client_key, AS_REP_ENC_PART, &rep_plain)?;
+        let (rep_cipher, fast_rep) = match &armor {
+            None => (
+                seal(&mut self.entropy, client_key, AS_REP_ENC_PART, &rep_plain)?,
+                None,
+            ),
+            Some(armor_id) => {
+                let armored = self
+                    .armors
+                    .peek_mut(armor_id, caller, now_s)
+                    .map_err(token_deny)?
+                    .seal_as_reply(
+                        &mut self.entropy,
+                        client_key,
+                        &rep_plain,
+                        &ticket,
+                        &template.crealm,
+                        &template.cname,
+                        now,
+                    )?;
+                // Issued: the armor is consumed — exactly once (docs/48
+                // §2.3); its key is zeroized with the entry.
+                drop(
+                    self.armors
+                        .take(armor_id, caller, now_s)
+                        .map_err(token_deny)?,
+                );
+                (armored.enc_part_cipher, Some(armored.fast_rep))
+            }
+        };
+        drop(rep_plain);
+        // The reply key, strengthened or not, has the client key's enctype
+        // (RFC 6113 5.4.3 "same etype"; 5.1 "the enctype of k1"); the kvno
+        // is the client key's (RFC 4120 5.4.2; docs/questions/Q-121 (a)).
         Ok(AsRepParts {
             ticket,
             enc_part: EncryptedData {
@@ -454,6 +741,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
                 kvno: Some(client_version.kvno().get()),
                 cipher: rep_cipher,
             },
+            fast_rep,
         })
     }
 }

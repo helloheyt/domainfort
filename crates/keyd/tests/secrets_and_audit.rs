@@ -8,7 +8,7 @@ mod common;
 
 use common::*;
 use keyd::{
-    AsRepParts, AsTicketTemplate, AuditOutcome, AuthnError, AuthnProof, CallerId, CtxId,
+    ArmorId, AsRepParts, AsTicketTemplate, AuditOutcome, AuthnError, AuthnProof, CallerId, CtxId,
     DualControlToken, Error, IssueError, KeyHandle, Kvno, Operation, PrincipalBinding, PrincipalId,
     TgsRepParts, TgsTicketTemplate, TgtContext,
 };
@@ -30,11 +30,15 @@ fn z(s: &str) -> Zeroizing<String> {
 #[allow(clippy::type_complexity)]
 fn operation_signatures_return_no_key_material() {
     type K = TestKeyd;
+    // docs/48 §2.3 (task T2): both AS operations take the FAST armor id —
+    // a one-time token, not key material — and AsRepParts gains only the
+    // sealed `fast_rep`.
     let _: fn(
         &mut K,
         &CallerId,
         &KeyHandle,
         &PaData,
+        Option<ArmorId>,
         &KerberosTime,
     ) -> Result<AuthnProof, AuthnError> = K::verify_preauth;
     let _: fn(
@@ -43,6 +47,7 @@ fn operation_signatures_return_no_key_material() {
         &KeyHandle,
         &KeyHandle,
         &AuthnProof,
+        Option<ArmorId>,
         &AsTicketTemplate,
         &KerberosTime,
     ) -> Result<AsRepParts, IssueError> = K::issue_as_rep;
@@ -159,18 +164,18 @@ fn every_operation_emits_exactly_one_audit_record() {
     };
 
     let pa = pa_enc_timestamp(&alice_key(), Some(1), n);
-    let proof = f.keyd.verify_preauth(&KDC, &ALICE, &pa, &n).unwrap();
+    let proof = f.keyd.verify_preauth(&KDC, &ALICE, &pa, None, &n).unwrap();
     check(&f, Operation::VerifyPreauth, &KDC, true);
-    let _ = f.keyd.verify_preauth(&DIRECTORY, &ALICE, &pa, &n);
+    let _ = f.keyd.verify_preauth(&DIRECTORY, &ALICE, &pa, None, &n);
     check(&f, Operation::VerifyPreauth, &DIRECTORY, false);
     let parts = f
         .keyd
-        .issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, &as_template(), &n)
+        .issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, None, &as_template(), &n)
         .unwrap();
     check(&f, Operation::IssueAsRep, &KDC, true);
     let _ = f
         .keyd
-        .issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, &as_template(), &n);
+        .issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, None, &as_template(), &n);
     check(&f, Operation::IssueAsRep, &KDC, false);
 
     let rep = krb_proto::EncAsRepPart::decode(&open(&alice_key(), 3, &parts.enc_part)).unwrap();
@@ -333,6 +338,7 @@ fn audit_records_contain_no_secret_bytes() {
             Some(1),
             now(),
         ),
+        None,
         &now(),
     );
 
@@ -376,6 +382,7 @@ fn debug_output_is_redacted() {
             &KDC,
             &ALICE,
             &pa_enc_timestamp(&alice_key(), Some(1), now()),
+            None,
             &now(),
         )
         .unwrap();
@@ -413,24 +420,32 @@ fn errors_are_uniform() {
         keyd::KeyPurpose::PrincipalLongterm,
     );
     let failures = [
-        f.keyd
-            .verify_preauth(&KDC, &ALICE, &pa_enc_timestamp(&wrong_pw, Some(1), n), &n),
+        f.keyd.verify_preauth(
+            &KDC,
+            &ALICE,
+            &pa_enc_timestamp(&wrong_pw, Some(1), n),
+            None,
+            &n,
+        ),
         f.keyd.verify_preauth(
             &KDC,
             &stranger,
             &pa_enc_timestamp(&alice_key(), Some(1), n),
+            None,
             &n,
         ),
         f.keyd.verify_preauth(
             &KDC,
             &ALICE,
             &pa_enc_timestamp(&wrong_pw, Some(1), at(-900)),
+            None,
             &n,
         ),
         f.keyd.verify_preauth(
             &ADMIN,
             &ALICE,
             &pa_enc_timestamp(&alice_key(), Some(1), n),
+            None,
             &n,
         ),
     ];
@@ -445,7 +460,8 @@ fn errors_are_uniform() {
             &KDC,
             &ALICE,
             &pa_enc_timestamp(&alice_key(), Some(1), at(-900)),
-            &n,
+            None,
+            &n
         ),
         Err(AuthnError::Skew)
     );

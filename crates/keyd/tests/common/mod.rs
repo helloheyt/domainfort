@@ -370,12 +370,13 @@ pub fn obtain_tgt(f: &mut Fixture, when: KerberosTime, template: &AsTicketTempla
             &KDC,
             &ALICE,
             &pa_enc_timestamp(&alice_key(), Some(1), when),
+            None,
             &when,
         )
         .unwrap();
     let parts = f
         .keyd
-        .issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, template, &when)
+        .issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, None, template, &when)
         .unwrap();
     let rep = EncAsRepPart::decode(&open(&alice_key(), 3, &parts.enc_part)).unwrap();
     let session = key_from(&rep.0.key);
@@ -541,6 +542,7 @@ pub fn obtain_computer_tgt(f: &mut Fixture, when: KerberosTime, endtime: Kerbero
             &KDC,
             &WS01,
             &pa_enc_timestamp(&ws01_key(), Some(1), when),
+            None,
             &when,
         )
         .unwrap();
@@ -558,7 +560,7 @@ pub fn obtain_computer_tgt(f: &mut Fixture, when: KerberosTime, endtime: Kerbero
     };
     let parts = f
         .keyd
-        .issue_as_rep(&KDC, &WS01, &KRBTGT, &proof, &template, &when)
+        .issue_as_rep(&KDC, &WS01, &KRBTGT, &proof, None, &template, &when)
         .unwrap();
     let rep = EncAsRepPart::decode(&open(&ws01_key(), 3, &parts.enc_part)).unwrap();
     let session = key_from(&rep.0.key);

@@ -64,11 +64,12 @@ fn krbtgt_refused_by_non_development_store() {
             &KDC,
             &ALICE,
             &pa_enc_timestamp(&alice_key(), Some(1), now()),
+            None,
             &now(),
         )
         .unwrap();
     assert_eq!(
-        keyd.issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, &as_template(), &now()),
+        keyd.issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, None, &as_template(), &now()),
         Err(IssueError::Denied)
     );
 }
@@ -188,6 +189,7 @@ fn set_secret_cannot_rebind() {
             &KDC,
             &ALICE,
             &pa_enc_timestamp(&alice_key(), Some(1), now()),
+            None,
             &now(),
         )
         .unwrap();
@@ -195,7 +197,7 @@ fn set_secret_cannot_rebind() {
     t.cname = bob_name();
     assert_eq!(
         f.keyd
-            .issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, &t, &now()),
+            .issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, None, &t, &now()),
         Err(IssueError::Denied)
     );
 
@@ -375,6 +377,7 @@ fn set_secret_derives_every_configured_enctype() {
                     &KDC,
                     &ALICE,
                     &pa_enc_timestamp(&key, Some(1), now()),
+                    None,
                     &now()
                 )
                 .is_ok(),
@@ -530,6 +533,7 @@ fn entropy_failure_fails_closed() {
             &KDC,
             &ALICE,
             &pa_enc_timestamp(&alice_key(), Some(1), now()),
+            None,
             &now(),
         )
         .unwrap();
@@ -557,7 +561,7 @@ fn entropy_failure_fails_closed() {
     );
     assert_eq!(
         f.keyd
-            .issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, &as_template(), &now()),
+            .issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, None, &as_template(), &now()),
         Err(IssueError::Denied)
     );
     assert_eq!(
@@ -569,6 +573,7 @@ fn entropy_failure_fails_closed() {
             &KDC,
             &ALICE,
             &pa_enc_timestamp(&alice_key(), Some(1), now()),
+            None,
             &now()
         ),
         Err(AuthnError::Denied)

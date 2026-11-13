@@ -87,8 +87,11 @@ pub enum AuditReason {
     EntropyFailure,
     /// An encryption type outside the configured set (I5).
     UnsupportedEncType,
-    /// A pre-authentication type other than PA-ENC-TIMESTAMP.
-    /// Spec: RFC 4120 5.2.7.
+    /// A pre-authentication type keyd does not accept here: anything but
+    /// PA-ENC-TIMESTAMP without armor, anything but PA-ENCRYPTED-CHALLENGE
+    /// with armor (a FAST factor is not used outside FAST; PA-ENC-TIMESTAMP
+    /// is not a factor inside FAST in phase 1). Spec: RFC 4120 5.2.7; RFC
+    /// 6113 5.4, 5.4.6; docs/48 §4.5.
     UnsupportedPadataType,
     /// Input did not decode as the expected RFC 4120 structure.
     MalformedInput,
@@ -192,6 +195,24 @@ pub enum AuditReason {
     /// `seal_fast_error`: a padata entry outside the allowlist, repeated, or
     /// with an unacceptable value. Spec: docs/48 §2.3, §6.1.
     FastErrorPadataRefused,
+    /// `verify_preauth`: the armor already had its one pre-authentication
+    /// attempt (success or failure). Spec: docs/48 §2.3 ("one attempt per
+    /// armor"), §9.1 I4.
+    ArmorAlreadyAttempted,
+    /// `verify_preauth`: the EncryptedChallenge is not of the armor key's
+    /// enctype, which is the challenge key's (KRB-FX-CF2 yields the enctype
+    /// of k1). Spec: RFC 6113 5.1, 5.4.6; docs/questions/Q-123 (A-32).
+    ChallengeEncTypeMismatch,
+    /// `issue_as_rep`: the proof and the armor are not one conversation — an
+    /// armored proof without its armor, an unarmored proof with an armor, or
+    /// a proof bound to another armor. Spec: docs/48 §2.3 ("None↔None,
+    /// Some(a)↔Some(a)"), §9.2 item 8.
+    ArmorProofMismatch,
+    /// `issue_as_rep`: the template's crealm, cname or nonce is not that of
+    /// the inner request keyd stored when it opened the armor. Spec: RFC 6113
+    /// 5.4.2 (inner req-body preferred), 5.4.3 (nonce); docs/48 §3.4, §9.2
+    /// items 7, 8.
+    FastBindingMismatch,
 }
 
 /// A key referenced by an operation, for audit (no key material).

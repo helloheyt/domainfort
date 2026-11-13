@@ -12,10 +12,25 @@
 //! other keys), and the sealed enc-fast-rep.
 //!
 //! State machine (docs/48 §2.3):
-//! `open_fast_armor ──(armor_id)──► seal_fast_error(As(armor_id))` — and, in
-//! docs/48 task T2, `verify_preauth(armor)` / `issue_as_rep(armor)`. Every
-//! armor id is consumed exactly once, or expires and is removed with its key
-//! zeroized.
+//! ```text
+//! open_fast_armor ─(armor_id)─► verify_preauth(EncryptedChallenge, armor)
+//!       │                              └─(proof⊗armor)─► issue_as_rep(proof, armor)   [consumes]
+//!       └──────────────────────────────────────────────► seal_fast_error(As(armor))  [consumes]
+//! ```
+//! Every armor id is consumed exactly once — by the `issue_as_rep` that
+//! issues, or by `seal_fast_error` — or expires and is removed with its key
+//! zeroized. It allows one pre-authentication attempt (success or failure),
+//! and the proof that attempt yields is bound to it both ways. A refused
+//! `verify_preauth` or `issue_as_rep` leaves the armor live, so that the KDC
+//! can seal the armored refusal (docs/48 §4.1 A10, A13).
+//!
+//! The armored AS reply (docs/48 §4.3, §4.4) is built here too
+//! (`ArmorEntry::seal_as_reply`): a fresh strengthen key, the reply key
+//! KRB-FX-CF2(strengthen key, client key, "strengthenkey", "replykey"), the
+//! KDC's PA-ENCRYPTED-CHALLENGE, KrbFastFinished with the ticket-checksum,
+//! and the KrbFastResponse sealed in the armor key. No FAST key — armor,
+//! challenge, strengthen, reply — leaves keyd; the strengthen key leaves only
+//! inside the sealed `fast_rep`.
 //!
 //! **Computer-account-only armor (D126) is not checked here:** keyd holds no
 //! account kind. keyd verifies the armor TGT cryptographically and returns
@@ -24,20 +39,20 @@
 //! §3.1, task T5).
 //!
 //! Not here (docs/48 §12 and later tasks): the TGS (implicit armor) variant
-//! and `seal_fast_error(Tgs)` (T3); encrypted challenge and the armored AS
-//! reply (T2); anonymous armor; any armor type other than
-//! FX_FAST_ARMOR_AP_REQUEST.
+//! and `seal_fast_error(Tgs)` (T3); anonymous armor; any armor type other
+//! than FX_FAST_ARMOR_AP_REQUEST; any FAST factor other than encrypted
+//! challenge.
 //!
-//! Spec: RFC 6113 5.1, 5.4, 5.4.1, 5.4.1.1, 5.4.2, 5.4.3, 5.4.4, 6.2;
-//! RFC 4120 3.2.3, 5.5.1, 5.9.1, 7.5.1; RFC 3961 §3; docs/48 §2.3, §3, §6,
-//! §9; docs/questions/Q-120 (A-32); A-26.
+//! Spec: RFC 6113 5.1, 5.4, 5.4.1, 5.4.1.1, 5.4.2, 5.4.3, 5.4.4, 5.4.6, 6.2;
+//! RFC 4120 3.2.3, 5.2.7.2, 5.4.2, 5.5.1, 5.9.1, 7.5.1; RFC 3961 §3; docs/48
+//! §2.3, §3, §4, §6, §9; docs/questions/Q-120..Q-123 (A-32); A-26.
 
 use crate::as_exchange::token_deny;
 use crate::audit::{AuditReason, AuditSink};
 use crate::authz::{CallerId, HandleSlot, Operation};
 use crate::entropy::EntropySource;
 use crate::error::{AuthnError, Deny, Error, Internal};
-use crate::keyd::{authorize, draw, key_usage, open, seal, AuditFields, Keyd};
+use crate::keyd::{authorize, draw, key_usage, new_random_key, open, seal, AuditFields, Keyd};
 use crate::model::KeyHandle;
 use crate::store::KeyStore;
 use crate::template::tgs_name;
@@ -45,7 +60,8 @@ use crate::tgs_exchange::{check_ap_options, replay_key_for, subkey_protocol_key,
 use crate::time::kerberos_time_seconds;
 use crate::tokens::{ArmorId, TOKEN_ID_LENGTH};
 use crate::usage::{
-    AP_REQ_AUTHENTICATOR, KEY_USAGE_FAST_ENC, KEY_USAGE_FAST_REP, KEY_USAGE_FAST_REQ_CHKSUM,
+    AP_REQ_AUTHENTICATOR, AS_REP_ENC_PART, KEY_USAGE_ENC_CHALLENGE_KDC, KEY_USAGE_FAST_ENC,
+    KEY_USAGE_FAST_FINISHED, KEY_USAGE_FAST_REP, KEY_USAGE_FAST_REQ_CHKSUM,
 };
 use krb_crypto::{ChecksumType, EncType, ProtocolKey};
 use krb_proto::constants::{
@@ -53,8 +69,9 @@ use krb_proto::constants::{
     PA_FX_ERROR,
 };
 use krb_proto::{
-    ApReq, EncryptedData, EtypeInfo2, KdcReqBody, KerberosTime, KrbError, KrbFastArmoredReq,
-    KrbFastReq, KrbFastResponse, PaData, PrincipalName, Realm,
+    ApReq, Checksum, EncryptedData, EncryptionKey, EtypeInfo2, KdcReqBody, KerberosTime, KeyValue,
+    KrbError, KrbFastArmoredReq, KrbFastFinished, KrbFastReq, KrbFastResponse, Microseconds,
+    PaData, PaEncTsEnc, PrincipalName, Realm, Ticket,
 };
 use zeroize::Zeroizing;
 
@@ -65,6 +82,26 @@ const SUBKEY_ARMOR_PEPPER: &[u8] = b"subkeyarmor";
 /// KRB-FX-CF2 pepper2 of the ticket-based armor key.
 /// Spec: RFC 6113 5.4.1.1 (`"ticketarmor"`).
 const TICKET_ARMOR_PEPPER: &[u8] = b"ticketarmor";
+
+/// KRB-FX-CF2 pepper1 of the challenge key "used by the client to send a
+/// message to the KDC". Spec: RFC 6113 5.4.6 (`"clientchallengearmor"`).
+const CLIENT_CHALLENGE_ARMOR_PEPPER: &[u8] = b"clientchallengearmor";
+
+/// KRB-FX-CF2 pepper1 of the challenge key "used by the KDC encrypting to
+/// the client". Spec: RFC 6113 5.4.6 (`"kdcchallengearmor"`).
+const KDC_CHALLENGE_ARMOR_PEPPER: &[u8] = b"kdcchallengearmor";
+
+/// KRB-FX-CF2 pepper2 of both challenge keys (the long-term key's side).
+/// Spec: RFC 6113 5.4.6 (`"challengelongterm"`).
+const CHALLENGE_LONG_TERM_PEPPER: &[u8] = b"challengelongterm";
+
+/// KRB-FX-CF2 pepper1 of the strengthened reply key (the strengthen key's
+/// side). Spec: RFC 6113 5.4.3 (`"strengthenkey"`).
+const STRENGTHEN_KEY_PEPPER: &[u8] = b"strengthenkey";
+
+/// KRB-FX-CF2 pepper2 of the strengthened reply key (the padata reply key's
+/// side). Spec: RFC 6113 5.4.3 (`"replykey"`).
+const REPLY_KEY_PEPPER: &[u8] = b"replykey";
 
 /// Upper bound on a PA-FX-COOKIE value keyd seals into an armored error. The
 /// cookie's content "is a local matter of the KDC" (RFC 6113 5.2); phase 1's
@@ -108,19 +145,253 @@ pub enum FastConversation {
 /// What keyd keeps about an opened armor (never leaves keyd). The armor key
 /// is zeroized when the entry is consumed or expires (krb-crypto
 /// `ProtocolKey` wipes on drop). The inner-request facts are what
-/// `seal_fast_error` binds the error to.
+/// `seal_fast_error` and the armored `issue_as_rep` bind their output to, and
+/// what the armored `verify_preauth` selects the client key from.
 ///
-/// docs/48 §2.3 also lists the inner etype list, `preauth_attempted` and
-/// `bound_proof`: they belong to the armored `verify_preauth` /
-/// `issue_as_rep` of task T2 and are added there.
-///
-/// Spec: docs/48 §2.3 (ArmorEntry); RFC 6113 5.4.3 (nonce).
+/// Spec: docs/48 §2.3 (ArmorEntry: armor key; nonce, crealm / cname and the
+/// etype list of the inner req-body; preauth_attempted; bound_proof); RFC
+/// 6113 5.4.3 (nonce).
 pub(crate) struct ArmorEntry {
     armor_key: ProtocolKey,
     req_nonce: u32,
     req_realm: Realm,
     req_cname: Option<PrincipalName>,
     req_sname: Option<PrincipalName>,
+    /// The inner req-body etype list, in the client's order (the long-term
+    /// key selection of docs/questions/Q-123).
+    req_etypes: Vec<i32>,
+    /// The armor's one pre-authentication attempt has been made (docs/48
+    /// §2.3: "one attempt per armor, success or failure").
+    preauth_attempted: bool,
+    /// The proof the armored `verify_preauth` issued (docs/48 §2.3: "the
+    /// ArmorEntry remembers the proof").
+    bound_proof: Option<[u8; TOKEN_ID_LENGTH]>,
+}
+
+/// An encoding or crypto step of keyd's own construction failed (its inputs
+/// are keyd's, so this is internal): `Unavailable`, the error discarded.
+/// Spec: docs/10 §9 (`Unavailable`).
+fn internal<T>(_: T) -> Deny {
+    Deny::unavailable(AuditReason::InternalFailure)
+}
+
+/// The armored parts of an AS reply, sealed by [`ArmorEntry::seal_as_reply`].
+/// Spec: docs/48 §2.3 (`AsRep { enc_part, fast_rep }`); RFC 6113 5.4.3.
+pub(crate) struct ArmoredAsReply {
+    /// EncASRepPart sealed in the strengthened reply key, key usage 3. The
+    /// reply key has the client key's enctype (the strengthen key is drawn in
+    /// it, and KRB-FX-CF2 keeps the enctype of k1).
+    pub(crate) enc_part_cipher: Vec<u8>,
+    /// enc-fast-rep: the KrbFastResponse sealed in the armor key, usage 52.
+    pub(crate) fast_rep: EncryptedData,
+}
+
+impl ArmorEntry {
+    /// Take the armor's one pre-authentication attempt: refused when it was
+    /// already taken, marked otherwise — before anything else is checked, so
+    /// a failed attempt uses it up too.
+    /// Spec: docs/48 §2.3 ("one attempt per armor — success or failure —
+    /// limits online guessing to one per armor"), §4.5 step 1, §9.1 I4.
+    pub(crate) fn begin_preauth(&mut self) -> Internal<()> {
+        if self.preauth_attempted {
+            return Err(Deny::denied(AuditReason::ArmorAlreadyAttempted));
+        }
+        self.preauth_attempted = true;
+        Ok(())
+    }
+
+    /// The enctype of the challenge keys: the armor key's, because
+    /// KRB-FX-CF2 yields "the enctype of k1" and the armor key is k1.
+    /// Spec: RFC 6113 5.1, 5.4.6; docs/48 §4.5 step 2.
+    pub(crate) fn challenge_enctype(&self) -> EncType {
+        self.armor_key.enc_type()
+    }
+
+    /// The inner req-body etype list, in the client's order.
+    /// Spec: RFC 4120 3.1.3, 5.4.1 (etype); docs/questions/Q-123 (A-32).
+    pub(crate) fn requested_etypes(&self) -> &[i32] {
+        &self.req_etypes
+    }
+
+    /// The client challenge key: KRB-FX-CF2(armor_key, long_term_key,
+    /// "clientchallengearmor", "challengelongterm").
+    /// Spec: RFC 6113 5.4.6, 5.1.
+    pub(crate) fn client_challenge_key(&self, long_term: &ProtocolKey) -> Internal<ProtocolKey> {
+        krb_crypto::krb_fx_cf2(
+            &self.armor_key,
+            long_term,
+            CLIENT_CHALLENGE_ARMOR_PEPPER,
+            CHALLENGE_LONG_TERM_PEPPER,
+        )
+        .map_err(|_| Deny::unavailable(AuditReason::InternalFailure))
+    }
+
+    /// Remember the proof the armored `verify_preauth` issued.
+    /// Spec: docs/48 §2.3 ("the ArmorEntry remembers the proof").
+    pub(crate) fn bind_proof(&mut self, proof: [u8; TOKEN_ID_LENGTH]) {
+        self.bound_proof = Some(proof);
+    }
+
+    /// The armored `issue_as_rep` checks, failing as `Denied`:
+    /// - the armor is bound to `proof` (the other direction of the binding
+    ///   the proof itself carries) — reason `ArmorProofMismatch`;
+    /// - the template's crealm, cname and nonce are those of the inner
+    ///   req-body stored when the armor was opened (name-type included) —
+    ///   reason `FastBindingMismatch`.
+    ///
+    /// Spec: docs/48 §2.3, §3.4 ("template.crealm/cname and template.nonce
+    /// equal those of the inner req-body"); RFC 6113 5.4.2 ("This req-body
+    /// field is preferred over the outer field"), 5.4.3 (the nonce "binds the
+    /// KDC response with the client request").
+    pub(crate) fn check_issue(
+        &self,
+        proof: &[u8; TOKEN_ID_LENGTH],
+        crealm: &Realm,
+        cname: &PrincipalName,
+        nonce: u32,
+    ) -> Internal<()> {
+        if self.bound_proof.as_ref() != Some(proof) {
+            return Err(Deny::denied(AuditReason::ArmorProofMismatch));
+        }
+        if *crealm != self.req_realm
+            || self.req_cname.as_ref() != Some(cname)
+            || nonce != self.req_nonce
+        {
+            return Err(Deny::denied(AuditReason::FastBindingMismatch));
+        }
+        Ok(())
+    }
+
+    /// Seal the armored parts of an AS reply (docs/48 §4.3, §4.4):
+    /// 1. strengthen key: random, of the client key's enctype ("the same
+    ///    etype as that of the reply key before being strengthened");
+    /// 2. reply key = KRB-FX-CF2(strengthen key, client key,
+    ///    "strengthenkey", "replykey") — the padata reply key is the client
+    ///    key, since encrypted challenge "does not provide the Replace Reply
+    ///    Key facility";
+    /// 3. `rep_plain` (the EncASRepPart encoding) sealed in the reply key with
+    ///    key usage 3 (docs/questions/Q-121 (a); RFC 4120 5.4.2: usage 3 with
+    ///    "another key selected via pre-authentication mechanisms");
+    /// 4. the KDC's PA-ENCRYPTED-CHALLENGE: PA-ENC-TS-ENC { patimestamp =
+    ///    `now`, no pausec } in KRB-FX-CF2(armor_key, client key,
+    ///    "kdcchallengearmor", "challengelongterm"), usage 55 (Q-123 item 3);
+    /// 5. KrbFastFinished: timestamp = `now`, usec = 0 (keyd reads no clock;
+    ///    docs/48 §4.4), crealm / cname of the ticket, ticket-checksum =
+    ///    get_mic(armor key, its required checksum type, usage 53, the DER of
+    ///    `ticket` — the full `[APPLICATION 1]` Ticket as it stands in the
+    ///    KDC-REP, docs/questions/Q-122 (a));
+    /// 6. KrbFastResponse { padata: [the KDC's PA-ENCRYPTED-CHALLENGE],
+    ///    strengthen-key, finished, nonce of the stored inner request }
+    ///    sealed in the armor key, usage 52, without kvno.
+    ///
+    /// Every intermediate key is zeroized on drop; the strengthen key leaves
+    /// keyd only inside the sealed KrbFastResponse.
+    ///
+    /// Spec: RFC 6113 5.1, 5.4.3, 5.4.6, 6.2; RFC 4120 5.2.7.2, 5.4.2, 5.6.1
+    /// (timestamp / usec semantics); RFC 3961 §3 (random-to-key, required
+    /// checksum mechanism); docs/48 §4.3, §4.4; docs/questions/Q-121..Q-123
+    /// (A-32).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn seal_as_reply<E: EntropySource>(
+        &self,
+        entropy: &mut E,
+        client_key: &ProtocolKey,
+        rep_plain: &[u8],
+        ticket: &Ticket,
+        crealm: &Realm,
+        cname: &PrincipalName,
+        now: &KerberosTime,
+    ) -> Internal<ArmoredAsReply> {
+        let armor_enctype = self.armor_key.enc_type();
+
+        // 1-3. The strengthened reply key and the enc-part under it.
+        let strengthen = new_random_key(entropy, client_key.enc_type())?;
+        let reply_key = krb_crypto::krb_fx_cf2(
+            &strengthen,
+            client_key,
+            STRENGTHEN_KEY_PEPPER,
+            REPLY_KEY_PEPPER,
+        )
+        .map_err(internal)?;
+        let enc_part_cipher = seal(entropy, &reply_key, AS_REP_ENC_PART, rep_plain)?;
+        drop(reply_key);
+
+        // 4. The KDC's encrypted challenge.
+        let kdc_challenge_key = krb_crypto::krb_fx_cf2(
+            &self.armor_key,
+            client_key,
+            KDC_CHALLENGE_ARMOR_PEPPER,
+            CHALLENGE_LONG_TERM_PEPPER,
+        )
+        .map_err(internal)?;
+        let timestamp = PaEncTsEnc {
+            patimestamp: *now,
+            pausec: None,
+        }
+        .encode()
+        .map_err(internal)?;
+        let challenge = EncryptedData {
+            etype: armor_enctype.number(),
+            kvno: None,
+            cipher: seal(
+                entropy,
+                &kdc_challenge_key,
+                KEY_USAGE_ENC_CHALLENGE_KDC,
+                &timestamp,
+            )?,
+        };
+        drop(kdc_challenge_key);
+        let challenge_padata = PaData {
+            padata_type: PA_ENCRYPTED_CHALLENGE,
+            padata_value: challenge.encode().map_err(internal)?,
+        };
+
+        // 5. KrbFastFinished over the issued ticket's DER.
+        let ticket_octets = ticket.encode().map_err(internal)?;
+        let cksumtype = armor_enctype.checksum_type();
+        let ticket_checksum = krb_crypto::get_mic(
+            &self.armor_key,
+            cksumtype,
+            key_usage(KEY_USAGE_FAST_FINISHED)?,
+            &ticket_octets,
+        )
+        .map_err(internal)?;
+        let finished = KrbFastFinished {
+            timestamp: *now,
+            usec: Microseconds::default(),
+            crealm: crealm.clone(),
+            cname: cname.clone(),
+            ticket_checksum: Checksum {
+                cksumtype: cksumtype.number(),
+                checksum: ticket_checksum,
+            },
+        };
+
+        // 6. The KrbFastResponse under the armor key (usage 52). The
+        // strengthen key's copy lives in a zeroizing KeyValue and the
+        // encoding in a Zeroizing buffer.
+        let response = KrbFastResponse {
+            padata: vec![challenge_padata],
+            strengthen_key: Some(EncryptionKey {
+                keytype: strengthen.enc_type().number(),
+                keyvalue: KeyValue::from_slice(strengthen.octets()),
+            }),
+            finished: Some(finished),
+            nonce: self.req_nonce,
+        };
+        drop(strengthen);
+        let plain: Zeroizing<Vec<u8>> = response.encode().map_err(internal)?;
+        drop(response);
+        let cipher = seal(entropy, &self.armor_key, KEY_USAGE_FAST_REP, &plain)?;
+        Ok(ArmoredAsReply {
+            enc_part_cipher,
+            fast_rep: EncryptedData {
+                etype: armor_enctype.number(),
+                kvno: None,
+                cipher,
+            },
+        })
+    }
 }
 
 impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
@@ -158,8 +429,9 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// armor ticket not yet valid → `TicketNotYetValid`; expired →
     /// `TicketExpired`. Then the replay cache must accept the armor
     /// authenticator (Q-120 item 2), else `Replay` (full: `Denied`). Finally
-    /// the armor key and the inner nonce / realm / cname / sname are stored
-    /// under a fresh armor id bound to this caller.
+    /// the armor key and the inner nonce / realm / cname / sname / etype list
+    /// are stored under a fresh armor id bound to this caller, with its one
+    /// pre-authentication attempt still open.
     ///
     /// The armor principal is returned, not judged: computer-account-only
     /// armor (D126) is the KDC's check (module docs).
@@ -297,6 +569,9 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             req_realm: body.realm.clone(),
             req_cname: body.cname.clone(),
             req_sname: body.sname.clone(),
+            req_etypes: body.etype.clone(),
+            preauth_attempted: false,
+            bound_proof: None,
         };
         let expires_at = now_s + i64::from(self.config.token_lifetime_secs);
         if !self.armors.insert(id, *caller, expires_at, entry, now_s) {
@@ -317,6 +592,10 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// strengthen-key, no finished, and the nonce of the inner request keyd
     /// stored (not one from the caller), encrypted in the armor key with key
     /// usage 52.
+    ///
+    /// It answers any refusal after the armor was opened — including a
+    /// refused armored `verify_preauth` or `issue_as_rep`, which leave the
+    /// armor live for this purpose (docs/48 §4.1 A10, A13).
     ///
     /// The KDC frames the result (KRB-ERROR e-data = METHOD-DATA with
     /// PA-FX-FAST, RFC 6113 5.4.4). keyd checks the content so that a

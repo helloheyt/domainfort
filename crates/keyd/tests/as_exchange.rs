@@ -37,6 +37,7 @@ fn as_round_trip() {
             &KDC,
             &ALICE,
             &pa_enc_timestamp(&alice_key(), Some(1), n),
+            None,
             &n,
         )
         .unwrap();
@@ -44,7 +45,7 @@ fn as_round_trip() {
     assert_eq!(proof.authtime, n);
     let parts = f
         .keyd
-        .issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, &template, &n)
+        .issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, None, &template, &n)
         .unwrap();
 
     // Client side: the enc-part opens with the client key, usage 3.
@@ -107,6 +108,7 @@ fn preauth_wrong_password_denied() {
         &KDC,
         &ALICE,
         &pa_enc_timestamp(&wrong, Some(1), now()),
+        None,
         &now(),
     );
     assert_eq!(r, Err(AuthnError::Denied));
@@ -128,6 +130,7 @@ fn preauth_unknown_principal_denied() {
         &KDC,
         &stranger,
         &pa_enc_timestamp(&alice_key(), None, now()),
+        None,
         &now(),
     );
     assert_eq!(r, Err(AuthnError::Denied));
@@ -147,6 +150,7 @@ fn preauth_clock_skew() {
             &KDC,
             &ALICE,
             &pa_enc_timestamp(&alice_key(), Some(1), at(offset)),
+            None,
             &now(),
         );
         assert_eq!(r.is_ok(), ok, "offset {offset}");
@@ -160,6 +164,7 @@ fn preauth_clock_skew() {
         &KDC,
         &ALICE,
         &pa_enc_timestamp(&wrong, Some(1), at(-900)),
+        None,
         &now(),
     );
     assert_eq!(r, Err(AuthnError::Denied));
@@ -187,7 +192,7 @@ fn preauth_rejects_weak_and_unconfigured_etypes() {
             padata_value: enc.encode().unwrap(),
         };
         assert_eq!(
-            f.keyd.verify_preauth(&KDC, &ALICE, &padata, &now()),
+            f.keyd.verify_preauth(&KDC, &ALICE, &padata, None, &now()),
             Err(AuthnError::Denied),
             "etype {etype}"
         );
@@ -206,7 +211,7 @@ fn preauth_rejects_other_padata_types() {
     let mut padata = pa_enc_timestamp(&alice_key(), Some(1), now());
     padata.padata_type = 3;
     assert_eq!(
-        f.keyd.verify_preauth(&KDC, &ALICE, &padata, &now()),
+        f.keyd.verify_preauth(&KDC, &ALICE, &padata, None, &now()),
         Err(AuthnError::Denied)
     );
     assert_eq!(
@@ -235,6 +240,7 @@ fn preauth_superseded_password_denied() {
             &KDC,
             &ALICE,
             &pa_enc_timestamp(&alice_key(), kvno, now()),
+            None,
             &now(),
         );
         assert_eq!(r, Err(AuthnError::Denied), "kvno {kvno:?}");
@@ -246,6 +252,7 @@ fn preauth_superseded_password_denied() {
             &KDC,
             &ALICE,
             &pa_enc_timestamp(&new_key, Some(2), now()),
+            None,
             &now()
         )
         .is_ok());
@@ -257,6 +264,7 @@ fn proof(f: &mut Fixture) -> AuthnProof {
             &KDC,
             &ALICE,
             &pa_enc_timestamp(&alice_key(), Some(1), now()),
+            None,
             &now(),
         )
         .unwrap()
@@ -274,7 +282,7 @@ fn issue_without_proof_denied() {
     };
     assert_eq!(
         f.keyd
-            .issue_as_rep(&KDC, &ALICE, &KRBTGT, &forged, &as_template(), &now()),
+            .issue_as_rep(&KDC, &ALICE, &KRBTGT, &forged, None, &as_template(), &now()),
         Err(IssueError::Denied)
     );
     assert_eq!(
@@ -290,11 +298,11 @@ fn proof_is_single_use() {
     let p = proof(&mut f);
     assert!(f
         .keyd
-        .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, &as_template(), &now())
+        .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, None, &as_template(), &now())
         .is_ok());
     assert_eq!(
         f.keyd
-            .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, &as_template(), &now()),
+            .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, None, &as_template(), &now()),
         Err(IssueError::Denied)
     );
 }
@@ -307,7 +315,7 @@ fn expired_proof_denied() {
     let p = proof(&mut f);
     assert_eq!(
         f.keyd
-            .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, &as_template(), &at(31)),
+            .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, None, &as_template(), &at(31)),
         Err(IssueError::Denied)
     );
     assert_eq!(
@@ -318,7 +326,7 @@ fn expired_proof_denied() {
     let p = proof(&mut f);
     assert!(f
         .keyd
-        .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, &as_template(), &at(30))
+        .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, None, &as_template(), &at(30))
         .is_ok());
 }
 
@@ -330,8 +338,15 @@ fn proof_bound_to_caller() {
     let mut f = Fixture::new();
     let p = proof(&mut f);
     assert_eq!(
-        f.keyd
-            .issue_as_rep(&KDC_OTHER, &ALICE, &KRBTGT, &p, &as_template(), &now()),
+        f.keyd.issue_as_rep(
+            &KDC_OTHER,
+            &ALICE,
+            &KRBTGT,
+            &p,
+            None,
+            &as_template(),
+            &now()
+        ),
         Err(IssueError::Denied)
     );
     assert_eq!(
@@ -340,7 +355,7 @@ fn proof_bound_to_caller() {
     );
     assert_eq!(
         f.keyd
-            .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, &as_template(), &now()),
+            .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, None, &as_template(), &now()),
         Err(IssueError::Denied)
     );
 }
@@ -355,7 +370,8 @@ fn proof_bound_to_client() {
     let mut t = as_template();
     t.client = BOB_ID;
     assert_eq!(
-        f.keyd.issue_as_rep(&KDC, &BOB, &KRBTGT, &p, &t, &now()),
+        f.keyd
+            .issue_as_rep(&KDC, &BOB, &KRBTGT, &p, None, &t, &now()),
         Err(IssueError::Denied)
     );
     assert_eq!(
@@ -365,7 +381,8 @@ fn proof_bound_to_client() {
 
     let p = proof(&mut f);
     assert_eq!(
-        f.keyd.issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, &t, &now()),
+        f.keyd
+            .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, None, &t, &now()),
         Err(IssueError::Denied)
     );
 
@@ -373,7 +390,7 @@ fn proof_bound_to_client() {
     p.client = BOB_ID;
     assert_eq!(
         f.keyd
-            .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, &as_template(), &now()),
+            .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, None, &as_template(), &now()),
         Err(IssueError::Denied)
     );
 }
@@ -399,7 +416,8 @@ fn forbidden_flags_bad_template() {
         let mut t = as_template();
         t.flags = flag;
         assert_eq!(
-            f.keyd.issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, &t, &now()),
+            f.keyd
+                .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, None, &t, &now()),
             Err(IssueError::BadTemplate),
             "{flag:?}"
         );
@@ -423,7 +441,8 @@ fn unconfigured_session_enctype_bad_template() {
         let mut t = as_template();
         t.session_enctype = enctype;
         assert_eq!(
-            f.keyd.issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, &t, &now()),
+            f.keyd
+                .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, None, &t, &now()),
             Err(IssueError::BadTemplate)
         );
         assert_eq!(
@@ -461,7 +480,8 @@ fn template_times_bad_template() {
         let mut t = as_template();
         mutate(&mut t);
         assert_eq!(
-            f.keyd.issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, &t, &now()),
+            f.keyd
+                .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, None, &t, &now()),
             Err(IssueError::BadTemplate),
             "case {i}"
         );
@@ -489,7 +509,8 @@ fn template_names_bad_template() {
         let mut t = as_template();
         mutate(&mut t);
         assert_eq!(
-            f.keyd.issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, &t, &now()),
+            f.keyd
+                .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, None, &t, &now()),
             Err(IssueError::BadTemplate),
             "case {i}"
         );
@@ -519,7 +540,7 @@ fn key_change_between_steps_denied() {
         .unwrap();
     assert_eq!(
         f.keyd
-            .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, &as_template(), &now()),
+            .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, None, &as_template(), &now()),
         Err(IssueError::Denied)
     );
     assert_eq!(
@@ -537,10 +558,16 @@ fn proof_table_is_bounded() {
     c.max_authn_proofs = 2;
     let mut f = Fixture::with_config(c);
     let pa = pa_enc_timestamp(&alice_key(), Some(1), now());
-    assert!(f.keyd.verify_preauth(&KDC, &ALICE, &pa, &now()).is_ok());
-    assert!(f.keyd.verify_preauth(&KDC, &ALICE, &pa, &now()).is_ok());
+    assert!(f
+        .keyd
+        .verify_preauth(&KDC, &ALICE, &pa, None, &now())
+        .is_ok());
+    assert!(f
+        .keyd
+        .verify_preauth(&KDC, &ALICE, &pa, None, &now())
+        .is_ok());
     assert_eq!(
-        f.keyd.verify_preauth(&KDC, &ALICE, &pa, &now()),
+        f.keyd.verify_preauth(&KDC, &ALICE, &pa, None, &now()),
         Err(AuthnError::Denied)
     );
     assert_eq!(
@@ -550,7 +577,7 @@ fn proof_table_is_bounded() {
     let pa_later = pa_enc_timestamp(&alice_key(), Some(1), at(31));
     assert!(f
         .keyd
-        .verify_preauth(&KDC, &ALICE, &pa_later, &at(31))
+        .verify_preauth(&KDC, &ALICE, &pa_later, None, &at(31))
         .is_ok());
 }
 
@@ -580,7 +607,8 @@ fn as_cname_must_match_client_binding() {
         let mut t = as_template();
         t.cname = cname.clone();
         assert_eq!(
-            f.keyd.issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, &t, &now()),
+            f.keyd
+                .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, None, &t, &now()),
             Err(IssueError::Denied),
             "{cname:?}"
         );
@@ -623,8 +651,15 @@ fn krbtgt_bound_to_wrong_name_denied() {
         .unwrap();
     let p = proof(&mut f);
     assert_eq!(
-        f.keyd
-            .issue_as_rep(&KDC, &ALICE, &other_krbtgt, &p, &as_template(), &now()),
+        f.keyd.issue_as_rep(
+            &KDC,
+            &ALICE,
+            &other_krbtgt,
+            &p,
+            None,
+            &as_template(),
+            &now()
+        ),
         Err(IssueError::Denied)
     );
     assert_eq!(

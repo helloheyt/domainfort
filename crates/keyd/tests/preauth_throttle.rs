@@ -42,7 +42,7 @@ fn alice_timestamp(when: KerberosTime) -> PaData {
 
 fn preauth(f: &mut Fixture, padata: &PaData, when: KerberosTime) -> Result<(), AuthnError> {
     f.keyd
-        .verify_preauth(&KDC, &ALICE, padata, &when)
+        .verify_preauth(&KDC, &ALICE, padata, None, &when)
         .map(|_| ())
 }
 
@@ -95,7 +95,10 @@ fn throttle_is_per_principal() {
         Some(1),
         at(5),
     );
-    assert!(f.keyd.verify_preauth(&KDC, &BOB, &bob, &at(5)).is_ok());
+    assert!(f
+        .keyd
+        .verify_preauth(&KDC, &BOB, &bob, None, &at(5))
+        .is_ok());
     assert_eq!(
         preauth(&mut f, &alice_timestamp(at(5)), at(5)),
         Err(AuthnError::Denied)
@@ -119,13 +122,13 @@ fn full_throttle_table_fails_closed() {
         )
     };
     assert_eq!(
-        f.keyd.verify_preauth(&KDC, &BOB, &bob(at(1)), &at(1)),
+        f.keyd.verify_preauth(&KDC, &BOB, &bob(at(1)), None, &at(1)),
         Err(AuthnError::Denied)
     );
     assert_eq!(f.records().last().unwrap().reason, AuditReason::Throttled);
     assert!(f
         .keyd
-        .verify_preauth(&KDC, &BOB, &bob(at(60)), &at(60))
+        .verify_preauth(&KDC, &BOB, &bob(at(60)), None, &at(60))
         .is_ok());
 }
 

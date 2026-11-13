@@ -158,6 +158,39 @@ impl<V> TokenTable<V> {
         Ok(entry.value)
     }
 
+    /// Look at a live token without consuming it — for a conversation token
+    /// that more than one step uses before it is consumed (the FAST armor id:
+    /// `verify_preauth` uses it, `issue_as_rep` or `seal_fast_error` consumes
+    /// it; docs/48 §2.3). The same refusals as [`Self::take`], and the same
+    /// fail-closed rule: an expired token, or one presented by the wrong
+    /// caller (treated as leaked), is removed. Expired entries are swept.
+    /// Spec: docs/10 §8 ("one-time, caller-bound"), D36; docs/48 §2.3, §9.1
+    /// I4.
+    pub(crate) fn peek_mut(
+        &mut self,
+        id: &[u8; TOKEN_ID_LENGTH],
+        caller: &CallerId,
+        now: i64,
+    ) -> Result<&mut V, TokenRefusal> {
+        let refusal = match self.entries.get(id) {
+            None => Some(TokenRefusal::Unknown),
+            Some(entry) if now > entry.expires_at => Some(TokenRefusal::Expired),
+            Some(entry) if entry.caller != *caller => Some(TokenRefusal::CallerMismatch),
+            Some(_) => None,
+        };
+        if let Some(refusal) = refusal {
+            self.entries.remove(id);
+            self.sweep(now);
+            return Err(refusal);
+        }
+        // The entry is live at `now`, so the sweep keeps it.
+        self.sweep(now);
+        self.entries
+            .get_mut(id)
+            .map(|entry| &mut entry.value)
+            .ok_or(TokenRefusal::Unknown)
+    }
+
     /// Remove every entry (live or not) whose value satisfies `stale`;
     /// dropping a value zeroizes any key it holds. Used when the key set a
     /// token was issued for is destroyed: such a token is no longer valid.
@@ -227,6 +260,35 @@ mod tests {
         assert_eq!(t.len(), 1);
         assert_eq!(t.take(&[1; 16], &A, 1), Err(TokenRefusal::Unknown));
         assert_eq!(t.take(&[2; 16], &A, 1), Ok(8));
+    }
+
+    /// docs/48 §2.3: a peek leaves a live, caller-bound token in place; an
+    /// expired one or a wrong-caller presentation removes it, as `take` does.
+    #[test]
+    fn peek_keeps_a_live_token_and_removes_a_refused_one() {
+        let mut t = TokenTable::new(4);
+        assert!(t.insert([1; 16], A, 100, 5u8, 0));
+        *t.peek_mut(&[1; 16], &A, 1).unwrap() += 1;
+        assert_eq!(t.peek_mut(&[1; 16], &A, 2).copied(), Ok(6));
+        assert_eq!(t.take(&[1; 16], &A, 3), Ok(6));
+
+        assert!(t.insert([2; 16], A, 100, 0u8, 0));
+        assert_eq!(
+            t.peek_mut(&[2; 16], &B, 1).copied(),
+            Err(TokenRefusal::CallerMismatch)
+        );
+        assert_eq!(t.take(&[2; 16], &A, 1), Err(TokenRefusal::Unknown));
+
+        assert!(t.insert([3; 16], A, 100, 0u8, 0));
+        assert_eq!(
+            t.peek_mut(&[3; 16], &A, 101).copied(),
+            Err(TokenRefusal::Expired)
+        );
+        assert_eq!(t.len(), 0);
+        assert_eq!(
+            t.peek_mut(&[3; 16], &A, 1).copied(),
+            Err(TokenRefusal::Unknown)
+        );
     }
 
     /// Bounded: full of live entries -> refuse; expired entries make room.

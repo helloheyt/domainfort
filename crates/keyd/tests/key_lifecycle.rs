@@ -75,6 +75,7 @@ fn set_secret_on_a_new_set_returns_the_initial_kvno() {
             &KDC,
             &CAROL,
             &pa_with(CAROL_PASSWORD, CAROL_SALT, 1),
+            None,
             &now()
         )
         .is_ok());
@@ -104,12 +105,17 @@ fn set_secret_on_an_existing_set_returns_current_plus_one() {
     }
     assert!(f
         .keyd
-        .verify_preauth(&KDC, &ALICE, &pa_with("third", ALICE_SALT, 3), &now())
+        .verify_preauth(&KDC, &ALICE, &pa_with("third", ALICE_SALT, 3), None, &now())
         .is_ok());
     // The superseded kvno is not the current one any more.
     assert_eq!(
-        f.keyd
-            .verify_preauth(&KDC, &ALICE, &pa_with("second", ALICE_SALT, 2), &now()),
+        f.keyd.verify_preauth(
+            &KDC,
+            &ALICE,
+            &pa_with("second", ALICE_SALT, 2),
+            None,
+            &now()
+        ),
         Err(AuthnError::Denied)
     );
 
@@ -155,7 +161,13 @@ fn destroyed_handle_is_unknown_to_every_operation() {
     );
     let proof = f
         .keyd
-        .verify_preauth(&KDC, &ALICE, &pa_with("second", ALICE_SALT, 2), &now())
+        .verify_preauth(
+            &KDC,
+            &ALICE,
+            &pa_with("second", ALICE_SALT, 2),
+            None,
+            &now(),
+        )
         .unwrap();
 
     assert_eq!(f.keyd.destroy_key_set(&ADMIN, &ALICE, &now()), Ok(()));
@@ -168,15 +180,20 @@ fn destroyed_handle_is_unknown_to_every_operation() {
 
     for (password, kvno) in [("second", 2), (ALICE_PASSWORD, 1)] {
         assert_eq!(
-            f.keyd
-                .verify_preauth(&KDC, &ALICE, &pa_with(password, ALICE_SALT, kvno), &now()),
+            f.keyd.verify_preauth(
+                &KDC,
+                &ALICE,
+                &pa_with(password, ALICE_SALT, kvno),
+                None,
+                &now()
+            ),
             Err(AuthnError::Denied)
         );
         assert_eq!(f.records().last().unwrap().reason, AuditReason::KeyNotFound);
     }
     assert_eq!(
         f.keyd
-            .issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, &as_template(), &now()),
+            .issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, None, &as_template(), &now()),
         Err(IssueError::Denied)
     );
     assert_eq!(
@@ -239,7 +256,7 @@ fn destroyed_handle_is_unknown_to_every_operation() {
     );
     assert!(f
         .keyd
-        .verify_preauth(&KDC, &ALICE, &pa_with("new", ALICE_SALT, 1), &now())
+        .verify_preauth(&KDC, &ALICE, &pa_with("new", ALICE_SALT, 1), None, &now())
         .is_ok());
     // The destroyed versions' passwords do not come back.
     assert_eq!(
@@ -247,6 +264,7 @@ fn destroyed_handle_is_unknown_to_every_operation() {
             &KDC,
             &ALICE,
             &pa_with(ALICE_PASSWORD, ALICE_SALT, 1),
+            None,
             &now()
         ),
         Err(AuthnError::Denied)
@@ -255,7 +273,13 @@ fn destroyed_handle_is_unknown_to_every_operation() {
     // Bob was never touched.
     assert!(f
         .keyd
-        .verify_preauth(&KDC, &BOB, &pa_with(BOB_PASSWORD, BOB_SALT, 1), &now())
+        .verify_preauth(
+            &KDC,
+            &BOB,
+            &pa_with(BOB_PASSWORD, BOB_SALT, 1),
+            None,
+            &now()
+        )
         .is_ok());
 }
 
@@ -273,6 +297,7 @@ fn destroy_discards_live_proofs_of_the_key_set() {
             &KDC,
             &ALICE,
             &pa_with(ALICE_PASSWORD, ALICE_SALT, 1),
+            None,
             &now(),
         )
         .unwrap();
@@ -290,7 +315,7 @@ fn destroy_discards_live_proofs_of_the_key_set() {
     );
     assert_eq!(
         f.keyd
-            .issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, &as_template(), &now()),
+            .issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, None, &as_template(), &now()),
         Err(IssueError::Denied)
     );
     assert_eq!(
@@ -337,7 +362,13 @@ fn destroy_is_per_handle_not_per_principal() {
     }
     let proof = f
         .keyd
-        .verify_preauth(&KDC, &client, &pa_with("machine password", salt, 1), &now())
+        .verify_preauth(
+            &KDC,
+            &client,
+            &pa_with("machine password", salt, 1),
+            None,
+            &now(),
+        )
         .unwrap();
     assert_eq!(f.keyd.destroy_key_set(&ADMIN, &service, &now()), Ok(()));
     assert_eq!(
@@ -355,12 +386,17 @@ fn destroy_is_per_handle_not_per_principal() {
     };
     assert!(f
         .keyd
-        .issue_as_rep(&KDC, &client, &KRBTGT, &proof, &template, &now())
+        .issue_as_rep(&KDC, &client, &KRBTGT, &proof, None, &template, &now())
         .is_ok());
     assert_eq!(f.keyd.destroy_key_set(&ADMIN, &client, &now()), Ok(()));
     assert_eq!(
-        f.keyd
-            .verify_preauth(&KDC, &client, &pa_with("machine password", salt, 1), &now()),
+        f.keyd.verify_preauth(
+            &KDC,
+            &client,
+            &pa_with("machine password", salt, 1),
+            None,
+            &now()
+        ),
         Err(AuthnError::Denied)
     );
 }

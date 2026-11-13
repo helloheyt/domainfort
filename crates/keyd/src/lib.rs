@@ -24,12 +24,17 @@
 //! Key purposes: PrincipalLongterm, Krbtgt, Service. Encryption types: the
 //! AES types of `krb-crypto` (17, 18, 19, 20) — no weak type is expressible.
 //!
-//! **FAST (RFC 6113), armor core only** (docs/48 task T1): the AS armor
+//! **FAST (RFC 6113), the AS side** (docs/48 tasks T1, T2): the AS armor
 //! (FX_FAST_ARMOR_AP_REQUEST) is opened and its KrbFastReq decrypted inside
-//! keyd; armored errors are sealed inside keyd. The armor key never leaves
-//! keyd (docs/48 §2, A-33). Computer-account-only armor (D126) is the KDC's
-//! check — keyd holds no account kind. The armored AS reply and encrypted
-//! challenge (T2) and the TGS implicit armor (T3) are not implemented yet.
+//! keyd; [`Keyd::verify_preauth`] with an armor verifies the encrypted
+//! challenge FAST factor (one attempt per armor); [`Keyd::issue_as_rep`]
+//! with that armor seals the reply under the strengthened reply key and
+//! returns the sealed KrbFastResponse (`fast_rep`: the KDC's encrypted
+//! challenge, the strengthen key, KrbFastFinished); armored errors are
+//! sealed inside keyd. No FAST key — armor, challenge, strengthen, reply —
+//! leaves keyd (docs/48 §2, A-33). Computer-account-only armor (D126) is the
+//! KDC's check — keyd holds no account kind. The TGS implicit armor (T3) is
+//! not implemented yet.
 //!
 //! **Not implemented — no code path, no enum variant:** Netlogon, SNTP,
 //! GKDI, BackupKey, S4U, replication, PKINIT, anonymous FAST armor,
@@ -47,15 +52,18 @@
 //! - **I3** purpose check: [`authz::purpose_permitted`] for every handle.
 //! - **I4** issuance needs a valid, one-time, caller-bound token
 //!   ([`AuthnProof`] / [`TgtContext`] ctx id), bounded tables; an armored
-//!   error needs the one-time [`ArmorId`] of its conversation.
+//!   error needs the one-time [`ArmorId`] of its conversation; an armor
+//!   allows one pre-authentication attempt, its proof issues only with it
+//!   (and an unarmored proof only without one), and it is consumed once.
 //! - **I5** only configured AES enctypes ([`KeydConfig::enctypes`]).
 //! - **I6** secret comparisons via approved constant-time facilities
 //!   (krb-crypto `verify_mic` / integrity checks). Errors are uniform for
 //!   every failure decided before the cryptographic chain completes;
 //!   classified after (A-26, docs/questions/Q-071): only once the TGT and the
 //!   authenticator decrypted and the req-body checksum verified
-//!   (`open_and_verify_tgt`), or the PA-ENC-TIMESTAMP decrypted and decoded
-//!   (`verify_preauth`), or the armor TGT, authenticator, subkey, armor key,
+//!   (`open_and_verify_tgt`), or the PA-ENC-TIMESTAMP — or, armored, the
+//!   encrypted challenge — decrypted and decoded (`verify_preauth`), or the
+//!   armor TGT, authenticator, subkey, armor key,
 //!   req-checksum and enc-fast-req all passed (`open_fast_armor`), may an
 //!   [`AuthnError`] other than `Denied` be returned — `TicketExpired`,
 //!   `TicketNotYetValid`, `Skew`, `Replay`. A `verify_preauth` refused by its
@@ -109,18 +117,27 @@
 //!   reuses one armor AP-REQ across a conversation is refused as a replay;
 //!   the native client builds a fresh one per request (lab check before
 //!   Windows clients, D8).
+//! - Armored AS interpretations awaiting the lab (docs/questions/Q-121,
+//!   Q-122, Q-123, Q-145): usage 3 and the client kvno under the
+//!   strengthened reply key; the ticket-checksum over the full Ticket DER;
+//!   keyd's single choice of the challenge's long-term key (the KDC must
+//!   advertise the same one in PA-ETYPE-INFO2 — task T5); an
+//!   EncryptedChallenge carries no kvno. A client that reads them otherwise
+//!   is refused (fail closed), never accepted wrongly.
 //!
 //! # Provenance
 //!
 //! Written only from the allowed sources, opened in-session (AGENTS.md
 //! §1-3): RFC 4120 (§1.6, §2, §3.1-3.3, §4, §5.2.7-5.2.9, §5.3, §5.4.1,
 //! §5.4.2, §5.5.1, §5.9.1, §6.1, §6.2, §7.3, §7.5.1, §7.5.9, §8.2, §10),
-//! RFC 3961 §3, RFC 3962 §3-4, RFC 6113 (§5.1, §5.4-§5.4.6, §6.2, §8),
+//! RFC 3961 §3, RFC 3962 §3-4, RFC 6113 (§2.1, §2.4, §5.1, §5.2,
+//! §5.4-§5.4.6, §6.2, §8),
 //! [MS-KILE] v20260928 (§1.3.3, §3.1.1.1, §3.1.5.1, §3.1.5.9, §3.2.5.4,
 //! §3.2.5.7, §3.3.5.1, §3.3.5.7.4 — checked against Q-120..Q-124), and this
 //! project's design documents docs/09, docs/10, docs/25 §3, docs/30,
 //! docs/33 §6.1, docs/45, docs/47 §9, docs/48, docs/questions/Q-040, Q-115
-//! (A-35), Q-120..Q-127. No other implementation was consulted or recalled.
+//! (A-35), Q-120..Q-127, Q-145. No other implementation was consulted or
+//! recalled.
 //!
 //! Spec: docs/10; docs/09 א; RFC 4120 §3, §5.
 

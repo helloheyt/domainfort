@@ -14,8 +14,11 @@ pub(crate) const AS_REQ_PA_ENC_TIMESTAMP: u32 = 1;
 /// Spec: RFC 4120 7.5.1, 5.3.
 pub(crate) const TICKET_ENC_PART: u32 = 2;
 
-/// Key usage 3 — AS-REP encrypted part, encrypted with the client key.
-/// Spec: RFC 4120 7.5.1, 5.4.2.
+/// Key usage 3 — AS-REP encrypted part, encrypted with the client key ("or
+/// another key selected via pre-authentication mechanisms", RFC 4120 5.4.2).
+/// Under FAST the same usage seals EncASRepPart in the strengthened reply
+/// key (docs/questions/Q-121 option (a), decided A-32). Spec: RFC 4120
+/// 7.5.1, 5.4.2; RFC 6113 5.4.3.
 pub(crate) const AS_REP_ENC_PART: u32 = 3;
 
 /// Key usage 6 — TGS-REQ PA-TGS-REQ padata AP-REQ Authenticator cksum, keyed with the
@@ -55,22 +58,19 @@ pub(crate) const KEY_USAGE_FAST_ENC: u32 = 51;
 pub(crate) const KEY_USAGE_FAST_REP: u32 = 52;
 
 /// Key usage 53 — KEY_USAGE_FAST_FINISHED: the ticket-checksum of
-/// KrbFastFinished, keyed with the armor key. Used by the armored issuance
-/// operations (docs/48 §10.2, tasks T2 / T3). Spec: RFC 6113 5.4.3, 6.2.
-#[allow(dead_code)] // consumed by docs/48 T2 / T3
+/// KrbFastFinished, keyed with the armor key. Used by the armored
+/// `issue_as_rep` (docs/48 §4.4; and `issue_tgs_rep`, task T3). Spec: RFC
+/// 6113 5.4.3, 6.2.
 pub(crate) const KEY_USAGE_FAST_FINISHED: u32 = 53;
 
 /// Key usage 54 — KEY_USAGE_ENC_CHALLENGE_CLIENT: the client's
 /// EncryptedChallenge, encrypted with the client challenge key. Used by the
-/// armored `verify_preauth` (docs/48 §10.2, task T2). Spec: RFC 6113 5.4.6,
-/// 6.2.
-#[allow(dead_code)] // consumed by docs/48 T2
+/// armored `verify_preauth` (docs/48 §4.5). Spec: RFC 6113 5.4.6, 6.2.
 pub(crate) const KEY_USAGE_ENC_CHALLENGE_CLIENT: u32 = 54;
 
 /// Key usage 55 — KEY_USAGE_ENC_CHALLENGE_KDC: the KDC's EncryptedChallenge,
 /// encrypted with the KDC challenge key. Used by the armored `issue_as_rep`
-/// (docs/48 §10.2, task T2). Spec: RFC 6113 5.4.6, 6.2.
-#[allow(dead_code)] // consumed by docs/48 T2
+/// (docs/48 §4.3, §10.2). Spec: RFC 6113 5.4.6, 6.2.
 pub(crate) const KEY_USAGE_ENC_CHALLENGE_KDC: u32 = 55;
 
 /// keyd-internal: the one-shot MIC that `verify_secret` uses to compare a

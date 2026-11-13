@@ -111,7 +111,9 @@ impl<S: KeyStore, A: keyd::AuditSink, E: EntropySource> KeyCustody for LocalKeyd
         padata: &PaData,
         now: &KerberosTime,
     ) -> Result<AuthnProof, AuthnError> {
-        self.keyd.verify_preauth(&self.caller, client, padata, now)
+        // Unarmored (no FAST armor): the armored AS path is docs/48 task T5.
+        self.keyd
+            .verify_preauth(&self.caller, client, padata, None, now)
     }
 
     fn issue_as_rep(
@@ -122,8 +124,9 @@ impl<S: KeyStore, A: keyd::AuditSink, E: EntropySource> KeyCustody for LocalKeyd
         template: &AsTicketTemplate,
         now: &KerberosTime,
     ) -> Result<AsRepParts, IssueError> {
+        // Unarmored (no FAST armor): the armored AS path is docs/48 task T5.
         self.keyd
-            .issue_as_rep(&self.caller, client, krbtgt, proof, template, now)
+            .issue_as_rep(&self.caller, client, krbtgt, proof, None, template, now)
     }
 
     fn open_and_verify_tgt(
