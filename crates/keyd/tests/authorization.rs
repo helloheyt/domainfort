@@ -120,7 +120,6 @@ fn invoke(f: &mut Fixture, op: Operation, caller: &CallerId, handle: &KeyHandle)
                 &binding_for(handle),
                 Zeroizing::new("pw".to_owned()),
                 "salt",
-                Kvno::new(50),
                 &n,
             )
             .is_ok(),
@@ -146,6 +145,7 @@ fn invoke(f: &mut Fixture, op: Operation, caller: &CallerId, handle: &KeyHandle)
             )
             .is_ok(),
         Operation::RetireKvno => f.keyd.retire_kvno(caller, handle, Kvno::new(1), &n).is_ok(),
+        Operation::DestroyKeySet => f.keyd.destroy_key_set(caller, handle, &n).is_ok(),
         Operation::OpenFastArmor => f
             .keyd
             .open_fast_armor(caller, handle, &dummy_armored_req(), &[0x30, 0x00], &n)
@@ -171,6 +171,7 @@ fn valid_handle(op: Operation) -> KeyHandle {
         Operation::OpenAndVerifyTgt | Operation::RotateKrbtgt => KRBTGT,
         Operation::OpenFastArmor | Operation::SealFastError => KRBTGT,
         Operation::IssueTgsRep | Operation::RotateKey | Operation::RetireKvno => SERVICE,
+        Operation::DestroyKeySet => SERVICE,
         Operation::SetSecret | Operation::VerifySecret => ALICE,
         Operation::CreateKey => {
             KeyHandle::new(PrincipalId::from_bytes([0x99; 16]), KeyPurpose::Service)
@@ -290,7 +291,8 @@ fn issue_as_rep_krbtgt_slot_purpose() {
 /// docs/48 §2.3); Directory -> set/verify secret; Admin -> key lifecycle. No
 /// role holds a read-key operation (none exists).
 /// Source: docs/10 §2, §7 ("no read operation for a key — in any role");
-/// docs/48 §2.3, §9.1 I2.
+/// docs/48 §2.3, §9.1 I2; docs/questions/Q-115 (A-35: destroy_key_set is
+/// an Admin operation).
 #[test]
 fn capability_table_matches_design() {
     use Operation::*;
@@ -309,7 +311,13 @@ fn capability_table_matches_design() {
         (Role::Directory, &[SetSecret, VerifySecret]),
         (
             Role::Admin,
-            &[CreateKey, RotateKey, RotateKrbtgt, RetireKvno],
+            &[
+                CreateKey,
+                RotateKey,
+                RotateKrbtgt,
+                RetireKvno,
+                DestroyKeySet,
+            ],
         ),
     ];
     assert_eq!(CAPABILITY_TABLE.len(), expected.len());

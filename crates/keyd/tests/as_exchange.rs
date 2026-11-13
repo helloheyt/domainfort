@@ -9,7 +9,7 @@ mod common;
 use common::*;
 use keyd::{
     AuditOutcome, AuditReason, AuthnError, AuthnProof, ExchangeId, IssueError, KeyHandle,
-    KeyPurpose, Kvno, PrincipalId,
+    KeyPurpose, PrincipalId,
 };
 use krb_crypto::EncType;
 use krb_proto::constants::{KRB_NT_ENTERPRISE, KRB_NT_PRINCIPAL, KRB_NT_SRV_INST, KRB_NT_UNKNOWN};
@@ -227,7 +227,6 @@ fn preauth_superseded_password_denied() {
             &alice_binding(),
             Zeroizing::new("a new password".to_owned()),
             ALICE_SALT,
-            Kvno::new(2),
             &now(),
         )
         .unwrap();
@@ -515,7 +514,6 @@ fn key_change_between_steps_denied() {
             &alice_binding(),
             Zeroizing::new("changed".to_owned()),
             ALICE_SALT,
-            Kvno::new(2),
             &now(),
         )
         .unwrap();

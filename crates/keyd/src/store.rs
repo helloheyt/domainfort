@@ -20,8 +20,14 @@
 //! `ProtocolKey` by value (Rust move = copy) may leave stale stack copies;
 //! `mlock` / no-core-dump / guard pages (docs/10 §11) belong to the daemon.
 //!
+//! # Destruction (A-35)
+//!
+//! [`KeyStore::destroy`] removes a whole key set and zeroizes it inside the
+//! store; no store destroys a krbtgt key set (it is only ever rotated).
+//!
 //! Spec: docs/10 §1 (StoredKeySet; current + previous kvno), §7, §11, §12 I1;
-//! docs/09 א.7 (D32 rotation); docs/33 §6.1 (D178).
+//! docs/09 א.7 (D32 rotation); docs/33 §6.1 (D178); docs/questions/Q-115
+//! (A-35).
 
 use crate::model::{KeyHandle, KeyPurpose, Kvno, PrincipalBinding};
 use core::fmt;
@@ -181,16 +187,19 @@ impl fmt::Debug for StoredKeySet {
     }
 }
 
-/// Why a key store refused to hold a key set. Carries no data.
+/// Why a key store refused to hold or destroy a key set. Carries no data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreError {
     /// The store does not hold keys of this purpose (D178: krbtgt needs an
-    /// HSM-backed or explicitly-development store).
+    /// HSM-backed or explicitly-development store), or refuses to destroy a
+    /// key set of this purpose (A-35: never krbtgt).
     Refused,
     /// A key set already exists for the handle (no silent overwrite).
     Exists,
     /// The store is at capacity.
     Full,
+    /// No key set is stored for the handle (destroy).
+    NotFound,
 }
 
 /// A container of opaque [`StoredKeySet`]s, keyed by [`KeyHandle`].
@@ -211,6 +220,16 @@ pub trait KeyStore {
     /// ([`StoreError::Refused`]) and existing handles
     /// ([`StoreError::Exists`]).
     fn insert(&mut self, handle: KeyHandle, set: StoredKeySet) -> Result<(), StoreError>;
+    /// Remove the whole key set of `handle` — current and previous versions
+    /// — and destroy it inside the store: its key octets are zeroized (a
+    /// software store drops the krb-crypto `ProtocolKey`s, which wipe on
+    /// drop), and nothing of it is handed back. Must refuse a Krbtgt handle
+    /// ([`StoreError::Refused`]: krbtgt is never destroyed, only rotated)
+    /// and report an unknown handle ([`StoreError::NotFound`]).
+    ///
+    /// Spec: docs/questions/Q-115 (A-35: `destroy_key_set`, zeroize; never
+    /// krbtgt); docs/10 §7, §11 (zeroize).
+    fn destroy(&mut self, handle: &KeyHandle) -> Result<(), StoreError>;
 }
 
 /// In-memory key store (keys in process RAM, zeroized on drop), bounded.
@@ -295,6 +314,22 @@ impl KeyStore for InMemoryKeyStore {
         self.sets.insert(handle, set);
         Ok(())
     }
+
+    /// The key octets live in the `ProtocolKey`s of the version's heap
+    /// buffer, not in the map slot; dropping the removed set drops each
+    /// `ProtocolKey` in place, which zeroizes it (krb-crypto ZeroizeOnDrop).
+    /// Krbtgt is refused in both modes, the development one included.
+    ///
+    /// Spec: docs/questions/Q-115 (A-35); docs/10 §11 (zeroize); docs/33
+    /// §6.1 (D178, unchanged: `insert` still refuses krbtgt here).
+    fn destroy(&mut self, handle: &KeyHandle) -> Result<(), StoreError> {
+        if handle.purpose == KeyPurpose::Krbtgt {
+            return Err(StoreError::Refused);
+        }
+        let set = self.sets.remove(handle).ok_or(StoreError::NotFound)?;
+        drop(set);
+        Ok(())
+    }
 }
 
 impl fmt::Debug for InMemoryKeyStore {
@@ -358,6 +393,33 @@ mod tests {
         assert_eq!(store.insert(a, set(2)), Err(StoreError::Exists));
         assert_eq!(store.insert(b, set(1)), Err(StoreError::Full));
         assert_eq!(store.len(), 1);
+    }
+
+    /// A-35 (Q-115): destroy removes the whole set and frees its slot; an
+    /// unknown handle is NotFound; krbtgt is refused by both stores (the
+    /// default one never holds it — D178 — and the development one never
+    /// destroys it).
+    #[test]
+    fn destroy_removes_set_and_refuses_krbtgt() {
+        let a = KeyHandle::new(PrincipalId::from_bytes([1; 16]), KeyPurpose::Service);
+        let k = KeyHandle::new(PrincipalId::from_bytes([2; 16]), KeyPurpose::Krbtgt);
+        let mut store = InMemoryKeyStore::new(1);
+        assert_eq!(store.insert(a, set(1)), Ok(()));
+        let mut rotated = set(1);
+        let key = krb_crypto::random_to_key(EncType::Aes128CtsHmacSha196, &[0x33; 16]).unwrap();
+        rotated.rotate(KvnoKeys::new(Kvno::new(2), vec![key], None, None));
+        assert_eq!(store.destroy(&a), Ok(()));
+        assert!(store.get(&a).is_none());
+        assert!(store.is_empty());
+        assert_eq!(store.destroy(&a), Err(StoreError::NotFound));
+        // A set with a previous version goes as a whole; the slot is free.
+        assert_eq!(store.insert(a, rotated), Ok(()));
+        assert_eq!(store.destroy(&a), Ok(()));
+        assert_eq!(store.destroy(&k), Err(StoreError::Refused));
+        let mut dev = InMemoryKeyStore::new_insecure_development_allowing_krbtgt(4);
+        assert_eq!(dev.insert(k, set(1)), Ok(()));
+        assert_eq!(dev.destroy(&k), Err(StoreError::Refused));
+        assert!(dev.get(&k).is_some());
     }
 
     /// Rotation keeps exactly current + previous (docs/10 §1, §7).

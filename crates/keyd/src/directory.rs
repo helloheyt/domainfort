@@ -14,9 +14,14 @@
 //!   refusal path costs about the same (equal up to differing stored
 //!   iteration counts; not secret-dependent).
 //!
+//! - `set_secret` chooses the kvno itself and returns it (A-35): no
+//!   component outside keyd knows the current kvno (there is no read
+//!   operation, docs/10 §7).
+//!
 //! Spec: docs/10 §6 (`set_secret`, `verify_secret`), §12 I6, I7; RFC 3961
 //! §3 (string-to-key on UTF-8 strings); RFC 3962 §4; RFC 4120 §4 (default
-//! salt = realm + name components; the directory supplies the salt).
+//! salt = realm + name components; the directory supplies the salt);
+//! docs/questions/Q-115 (A-35).
 
 use crate::audit::{AuditReason, AuditSink};
 use crate::authz::{CallerId, HandleSlot, Operation};
@@ -38,10 +43,15 @@ const COMPARE_CHALLENGE_LENGTH: usize = 32;
 
 impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// `set_secret`: derive the principal's keys from `password` and `salt`
-    /// (string-to-key, every configured enctype) and install them as kvno
-    /// `new_kvno`, which must be greater than the current kvno. An existing
-    /// current version becomes previous. Nothing is returned; the plaintext
-    /// is zeroized when this call returns.
+    /// (string-to-key, every configured enctype) and install them under a
+    /// kvno that keyd chooses, which it returns (a kvno is not secret):
+    /// - the call creates the key set → [`Kvno::INITIAL`];
+    /// - the key set exists → its current kvno + 1, the old current version
+    ///   becoming previous; at the top of the UInt32 range the call is
+    ///   refused (fail closed — a kvno never wraps back to an old value).
+    ///
+    /// No key material is returned; the plaintext is zeroized when this
+    /// call returns.
     ///
     /// Purposes: PrincipalLongterm or Service (krbtgt is never
     /// password-derived).
@@ -52,11 +62,11 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// identify its existing binding (RFC 4120 6.2 equivalence) or the call
     /// is refused — a password change can never rename a principal.
     ///
-    /// Spec: docs/10 §6 (`set_secret(principal, purpose, material, salt,
-    /// new_kvno)`, "derives keys inside, zeroizes plaintext; nothing goes
-    /// out"), §12 I7; RFC 3961 §3; RFC 3962 §4; RFC 4120 6.2;
-    /// docs/questions/Q-040 (A-19).
-    #[allow(clippy::too_many_arguments)]
+    /// Spec: docs/10 §6 (`set_secret(principal, purpose, material, salt) ->
+    /// Kvno`, "derives keys inside, zeroizes plaintext"), §12 I1, I7;
+    /// docs/questions/Q-115 (A-35: "keyd chooses the next kvno and returns
+    /// it"); RFC 4120 5.2.9 (kvno, UInt32); RFC 3961 §3; RFC 3962 §4;
+    /// RFC 4120 6.2; docs/questions/Q-040 (A-19).
     pub fn set_secret(
         &mut self,
         caller: &CallerId,
@@ -64,12 +74,10 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         binding: &PrincipalBinding,
         password: Zeroizing<String>,
         salt: &str,
-        new_kvno: Kvno,
         now: &KerberosTime,
-    ) -> Result<(), Error> {
+    ) -> Result<Kvno, Error> {
         let mut fields = AuditFields::for_handle(handle);
-        fields.kvno = Some(new_kvno);
-        let result = self.set_secret_inner(caller, handle, binding, &password, salt, new_kvno);
+        let result = self.set_secret_inner(caller, handle, binding, &password, salt, &mut fields);
         drop(password);
         self.emit(caller, Operation::SetSecret, now, &fields, &result);
         result.map_err(Error::from)
@@ -82,8 +90,8 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         binding: &PrincipalBinding,
         password: &str,
         salt: &str,
-        new_kvno: Kvno,
-    ) -> Internal<()> {
+        fields: &mut AuditFields,
+    ) -> Internal<Kvno> {
         authorize(
             caller,
             Operation::SetSecret,
@@ -97,14 +105,14 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             Some(set) => check_binding(set.binding(), &binding.realm, &binding.name)?,
             None => check_new_binding(&self.config.realm, handle.purpose, binding)?,
         }
-        let current = existing.map(StoredKeySet::current_kvno);
-        let increasing = match current {
-            Some(current) => new_kvno > current,
-            None => new_kvno.get() != 0,
+        // keyd chooses the kvno (A-35), before any derivation work.
+        let new_kvno = match existing.map(StoredKeySet::current_kvno) {
+            None => Kvno::INITIAL,
+            Some(current) => current
+                .next()
+                .ok_or(Deny::denied(AuditReason::KvnoExhausted))?,
         };
-        if !increasing {
-            return Err(Deny::denied(AuditReason::KvnoNotIncreasing));
-        }
+        fields.kvno = Some(new_kvno);
         let mut keys = Vec::with_capacity(self.config.enctypes.len());
         for enctype in &self.config.enctypes {
             keys.push(derive_password_key(
@@ -122,15 +130,13 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             self.config.s2k_params,
         );
         match self.store.get_mut(handle) {
-            Some(set) => {
-                set.rotate(version);
-                Ok(())
-            }
+            Some(set) => set.rotate(version),
             None => self
                 .store
                 .insert(*handle, StoredKeySet::new(binding.clone(), version))
-                .map_err(store_deny),
+                .map_err(store_deny)?,
         }
+        Ok(new_kvno)
     }
 
     /// `verify_secret`: does `candidate` match the principal's current
@@ -297,5 +303,108 @@ fn dummy_compare<E: EntropySource>(entropy: &mut E, config: &KeydConfig, candida
     let throwaway = new_random_key(entropy, enctype);
     if let (Ok(derived), Ok(throwaway)) = (derived, throwaway) {
         let _ = keys_match(entropy, &throwaway, &derived);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The kvno ceiling of `set_secret` (A-35). A key set at the top of the
+    //! UInt32 range is unreachable through the public API (2^32 changes),
+    //! so the store is seeded here directly. All values are made up for
+    //! these tests.
+
+    use super::*;
+    use crate::audit::{AuditRecord, AuditSink};
+    use crate::authz::Role;
+    use crate::model::{KeyPurpose, PrincipalId};
+    use crate::store::InMemoryKeyStore;
+    use krb_proto::{KerberosString, PrincipalName, Realm};
+
+    #[derive(Default)]
+    struct Records(Vec<AuditRecord>);
+
+    impl AuditSink for Records {
+        fn record(&mut self, record: &AuditRecord) {
+            self.0.push(record.clone());
+        }
+    }
+
+    const DIRECTORY: CallerId = CallerId {
+        uid: 200,
+        role: Role::Directory,
+    };
+    const SALT: &str = "EXAMPLE.ORGcarol";
+
+    fn binding() -> PrincipalBinding {
+        PrincipalBinding::new(
+            Realm::new("EXAMPLE.ORG").unwrap(),
+            PrincipalName {
+                name_type: 1,
+                name_string: vec![KerberosString::new("carol").unwrap()],
+            },
+        )
+    }
+
+    fn seeded(kvno: u32) -> StoredKeySet {
+        let key = krb_crypto::random_to_key(EncType::Aes256CtsHmacSha196, &[0x4C; 32]).unwrap();
+        StoredKeySet::new(
+            binding(),
+            KvnoKeys::new(Kvno::new(kvno), vec![key], Some(SALT.to_owned()), None),
+        )
+    }
+
+    /// A-35 (Q-115): keyd chooses current + 1; at the top of the UInt32
+    /// range (RFC 4120 5.2.9) `set_secret` is refused — fail closed, the
+    /// kvno never wraps — and the stored set is left untouched. One below
+    /// the top, the top itself is still assigned.
+    #[test]
+    fn set_secret_refuses_kvno_overflow() {
+        let at_max = KeyHandle::new(
+            PrincipalId::from_bytes([0x4C; 16]),
+            KeyPurpose::PrincipalLongterm,
+        );
+        let below_max = KeyHandle::new(PrincipalId::from_bytes([0x4D; 16]), KeyPurpose::Service);
+        let mut store = InMemoryKeyStore::new(4);
+        store.insert(at_max, seeded(u32::MAX)).unwrap();
+        store.insert(below_max, seeded(u32::MAX - 1)).unwrap();
+        let mut config = KeydConfig::new(Realm::new("EXAMPLE.ORG").unwrap());
+        config.enctypes = vec![EncType::Aes256CtsHmacSha196];
+        let mut keyd = Keyd::new(config, store, Records::default()).unwrap();
+        let now = KerberosTime::new(2026, 11, 13, 10, 0, 0).unwrap();
+
+        let refused = keyd.set_secret(
+            &DIRECTORY,
+            &at_max,
+            &binding(),
+            Zeroizing::new("next".to_owned()),
+            SALT,
+            &now,
+        );
+        assert_eq!(refused, Err(Error::Denied));
+        let last = keyd.audit_sink().0.last().unwrap();
+        assert_eq!(last.reason, AuditReason::KvnoExhausted);
+        assert_eq!(last.op, Operation::SetSecret);
+        let set = keyd.store.get(&at_max).unwrap();
+        assert_eq!(set.current_kvno(), Kvno::new(u32::MAX));
+        assert_eq!(set.previous_kvno(), None);
+
+        assert_eq!(
+            keyd.set_secret(
+                &DIRECTORY,
+                &below_max,
+                &binding(),
+                Zeroizing::new("next".to_owned()),
+                SALT,
+                &now,
+            ),
+            Ok(Kvno::new(u32::MAX))
+        );
+        let set = keyd.store.get(&below_max).unwrap();
+        assert_eq!(set.current_kvno(), Kvno::new(u32::MAX));
+        assert_eq!(set.previous_kvno(), Some(Kvno::new(u32::MAX - 1)));
+        assert_eq!(
+            keyd.audit_sink().0.last().unwrap().kvno,
+            Some(Kvno::new(u32::MAX))
+        );
     }
 }

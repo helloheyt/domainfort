@@ -1,18 +1,20 @@
 //! Admin operations: the key lifecycle (create, rotate, rotate krbtgt under
-//! dual control, retire an old kvno). Role `Admin` only.
+//! dual control, retire an old kvno, destroy a deleted account's key set).
+//! Role `Admin` (tier-0) only.
 //!
 //! None of these returns key material — only the resulting kvno. "There is
 //! no read-key operation — in any role."
 //!
 //! Spec: docs/10 §7; docs/09 א.7 (D32 current + previous); docs/33 §5
-//! (double krbtgt rotation after compromise, D20), §6.1 (D178).
+//! (double krbtgt rotation after compromise, D20), §6.1 (D178);
+//! docs/questions/Q-115 (A-35, `destroy_key_set`).
 
 use crate::audit::{AuditReason, AuditSink};
 use crate::authz::{CallerId, HandleSlot, Operation};
 use crate::entropy::EntropySource;
 use crate::error::{Deny, Error, Internal};
 use crate::keyd::{authorize, new_random_keys, store_deny, AuditFields, Keyd};
-use crate::model::{DualControlToken, KeyHandle, Kvno, PrincipalBinding};
+use crate::model::{DualControlToken, KeyHandle, KeyPurpose, Kvno, PrincipalBinding};
 use crate::store::{KeyStore, KvnoKeys, StoredKeySet};
 use crate::template::check_new_binding;
 use krb_proto::KerberosTime;
@@ -191,5 +193,62 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         });
         self.emit(caller, Operation::RetireKvno, now, &fields, &result);
         result.map_err(Error::from)
+    }
+
+    /// `destroy_key_set`: remove the whole key set of `handle` — current
+    /// and previous versions — and zeroize it, when the account is deleted.
+    /// Afterwards the handle is unknown to every operation; a later
+    /// `set_secret` on it creates a NEW key set (from `Kvno::INITIAL`, with
+    /// a binding that must pass the creation rules again).
+    ///
+    /// Purposes: PrincipalLongterm or Service only — a krbtgt key set is
+    /// never destroyed, only rotated (purpose table, and the store refuses
+    /// it too). An unknown handle is the uniform `Denied`.
+    ///
+    /// A live AuthnProof issued for a destroyed PrincipalLongterm key set is
+    /// discarded with it: it attests a key that no longer exists, and must
+    /// not redeem against a key set later recreated on the same handle.
+    ///
+    /// The audit record carries the destroyed current kvno (not secret).
+    ///
+    /// Spec: docs/questions/Q-115 (A-35: "an Admin `destroy_key_set`
+    /// (zeroize + audit) called on account deletion; never for krbtgt");
+    /// docs/10 §7 (Admin operations), §8 / §12 I4 (tokens), §10, §12 I8.
+    pub fn destroy_key_set(
+        &mut self,
+        caller: &CallerId,
+        handle: &KeyHandle,
+        now: &KerberosTime,
+    ) -> Result<(), Error> {
+        let mut fields = AuditFields::for_handle(handle);
+        let result = self.destroy_key_set_inner(caller, handle, &mut fields);
+        self.emit(caller, Operation::DestroyKeySet, now, &fields, &result);
+        result.map_err(Error::from)
+    }
+
+    fn destroy_key_set_inner(
+        &mut self,
+        caller: &CallerId,
+        handle: &KeyHandle,
+        fields: &mut AuditFields,
+    ) -> Internal<()> {
+        authorize(
+            caller,
+            Operation::DestroyKeySet,
+            &[(HandleSlot::Primary, handle)],
+        )?;
+        let current = self
+            .store
+            .get(handle)
+            .ok_or(Deny::denied(AuditReason::KeyNotFound))?
+            .current_kvno();
+        fields.kvno = Some(current);
+        self.store.destroy(handle).map_err(store_deny)?;
+        if handle.purpose == KeyPurpose::PrincipalLongterm {
+            let principal = handle.principal;
+            self.proofs
+                .discard_where(|entry| entry.principal() == principal);
+        }
+        Ok(())
     }
 }

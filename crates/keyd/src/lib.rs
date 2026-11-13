@@ -14,7 +14,12 @@
 //! |-------------|------------|
 //! | `Kdc`       | [`Keyd::verify_preauth`], [`Keyd::issue_as_rep`], [`Keyd::open_and_verify_tgt`], [`Keyd::issue_tgs_rep`], [`Keyd::open_fast_armor`], [`Keyd::seal_fast_error`] |
 //! | `Directory` | [`Keyd::set_secret`], [`Keyd::verify_secret`] |
-//! | `Admin`     | [`Keyd::create_key`], [`Keyd::rotate_key`], [`Keyd::rotate_krbtgt`], [`Keyd::retire_kvno`] |
+//! | `Admin`     | [`Keyd::create_key`], [`Keyd::rotate_key`], [`Keyd::rotate_krbtgt`], [`Keyd::retire_kvno`], [`Keyd::destroy_key_set`] |
+//!
+//! Key lifecycle (decision A-35, docs/questions/Q-115): keyd chooses every
+//! kvno itself — `set_secret` returns the kvno it installed — and a deleted
+//! account's key set is destroyed (zeroized) by `destroy_key_set`, never a
+//! krbtgt key set.
 //!
 //! Key purposes: PrincipalLongterm, Krbtgt, Service. Encryption types: the
 //! AES types of `krb-crypto` (17, 18, 19, 20) — no weak type is expressible.
@@ -114,8 +119,8 @@
 //! [MS-KILE] v20260928 (§1.3.3, §3.1.1.1, §3.1.5.1, §3.1.5.9, §3.2.5.4,
 //! §3.2.5.7, §3.3.5.1, §3.3.5.7.4 — checked against Q-120..Q-124), and this
 //! project's design documents docs/09, docs/10, docs/25 §3, docs/30,
-//! docs/33 §6.1, docs/45, docs/48, docs/questions/Q-040, Q-120..Q-127. No
-//! other implementation was consulted or recalled.
+//! docs/33 §6.1, docs/45, docs/47 §9, docs/48, docs/questions/Q-040, Q-115
+//! (A-35), Q-120..Q-127. No other implementation was consulted or recalled.
 //!
 //! Spec: docs/10; docs/09 א; RFC 4120 §3, §5.
 

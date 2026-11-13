@@ -114,6 +114,15 @@ pub struct AsRepParts {
     pub enc_part: EncryptedData,
 }
 
+impl ProofEntry {
+    /// The principal whose PrincipalLongterm key pre-authenticated. A proof
+    /// is discarded when that key set is destroyed (A-35).
+    /// Spec: docs/10 §8, §12 I4; docs/questions/Q-115 (A-35).
+    pub(crate) fn principal(&self) -> PrincipalId {
+        self.principal
+    }
+}
+
 /// Map a token refusal to its audit reason. Spec: docs/10 §8, D36.
 pub(crate) fn token_deny(refusal: TokenRefusal) -> Deny {
     Deny::denied(match refusal {

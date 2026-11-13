@@ -269,11 +269,13 @@ pub(crate) fn open(
         .map_err(|_| Deny::denied(AuditReason::IntegrityFailure))
 }
 
-/// Map a key-store refusal. Spec: docs/33 §6.1 (D178).
+/// Map a key-store refusal. Spec: docs/33 §6.1 (D178); docs/10 §9 (an
+/// unknown handle is the uniform `Denied`); docs/questions/Q-115 (A-35).
 pub(crate) fn store_deny(error: StoreError) -> Deny {
     match error {
         StoreError::Refused => Deny::denied(AuditReason::StoreRefusedCritical),
         StoreError::Exists => Deny::denied(AuditReason::KeyExists),
         StoreError::Full => Deny::unavailable(AuditReason::StoreFull),
+        StoreError::NotFound => Deny::denied(AuditReason::KeyNotFound),
     }
 }

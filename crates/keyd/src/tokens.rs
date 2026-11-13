@@ -158,6 +158,14 @@ impl<V> TokenTable<V> {
         Ok(entry.value)
     }
 
+    /// Remove every entry (live or not) whose value satisfies `stale`;
+    /// dropping a value zeroizes any key it holds. Used when the key set a
+    /// token was issued for is destroyed: such a token is no longer valid.
+    /// Spec: docs/10 §8, §12 I4; docs/questions/Q-115 (A-35).
+    pub(crate) fn discard_where(&mut self, mut stale: impl FnMut(&V) -> bool) {
+        self.entries.retain(|_, e| !stale(&e.value));
+    }
+
     /// Number of live-or-unswept entries.
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
@@ -206,6 +214,19 @@ mod tests {
         assert!(t.insert([1; 16], A, 100, (), 0));
         assert_eq!(t.take(&[1; 16], &B, 1), Err(TokenRefusal::CallerMismatch));
         assert_eq!(t.take(&[1; 16], &A, 1), Err(TokenRefusal::Unknown));
+    }
+
+    /// A-35 (Q-115): tokens of a destroyed key set are discarded, others
+    /// stay redeemable.
+    #[test]
+    fn discard_where_removes_only_matching_entries() {
+        let mut t = TokenTable::new(4);
+        assert!(t.insert([1; 16], A, 100, 7u8, 0));
+        assert!(t.insert([2; 16], A, 100, 8u8, 0));
+        t.discard_where(|v| *v == 7);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.take(&[1; 16], &A, 1), Err(TokenRefusal::Unknown));
+        assert_eq!(t.take(&[2; 16], &A, 1), Ok(8));
     }
 
     /// Bounded: full of live entries -> refuse; expired entries make room.

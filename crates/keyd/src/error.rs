@@ -69,7 +69,8 @@ pub enum IssueError {
 }
 
 /// Error of a management or secret operation (`create_key`, `rotate_key`,
-/// `rotate_krbtgt`, `retire_kvno`, `set_secret`, `verify_secret`).
+/// `rotate_krbtgt`, `retire_kvno`, `destroy_key_set`, `set_secret`,
+/// `verify_secret`).
 /// Spec: docs/10 §9.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {

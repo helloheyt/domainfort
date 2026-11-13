@@ -9,8 +9,8 @@
 
 use keyd::{
     AsRepParts, AsTicketTemplate, AuditRecord, AuditSink, CallerId, EntropyError, EntropySource,
-    InMemoryKeyStore, KeyHandle, KeyPurpose, Keyd, KeydConfig, Kvno, PrincipalBinding, PrincipalId,
-    Role, TgsTicketTemplate, TgtContext,
+    InMemoryKeyStore, KeyHandle, KeyPurpose, Keyd, KeydConfig, PrincipalBinding, PrincipalId, Role,
+    TgsTicketTemplate, TgtContext,
 };
 use krb_crypto::{ChecksumType, EncType, KeyUsage, ProtocolKey};
 use krb_proto::constants::{
@@ -262,7 +262,6 @@ impl Fixture {
             &alice_binding(),
             Zeroizing::new(ALICE_PASSWORD.to_owned()),
             ALICE_SALT,
-            Kvno::new(1),
             &n,
         )
         .unwrap();
@@ -272,7 +271,6 @@ impl Fixture {
             &bob_binding(),
             Zeroizing::new(BOB_PASSWORD.to_owned()),
             BOB_SALT,
-            Kvno::new(1),
             &n,
         )
         .unwrap();

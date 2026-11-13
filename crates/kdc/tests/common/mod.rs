@@ -20,7 +20,7 @@ use kdc::{
 };
 use keyd::{
     AuditRecord, CallerId, EntropyError, EntropySource, InMemoryKeyStore, KeyHandle, KeyPurpose,
-    Keyd, KeydConfig, Kvno, PrincipalBinding, PrincipalId, Role, TicketPolicy,
+    Keyd, KeydConfig, PrincipalBinding, PrincipalId, Role, TicketPolicy,
 };
 use krb_crypto::{EncType, KeyUsage, ProtocolKey};
 use krb_proto::constants::{
@@ -418,7 +418,6 @@ impl Fixture {
                 &PrincipalBinding::new(realm(), who),
                 String::from(password).into(),
                 salt,
-                Kvno::new(1),
                 &n,
             )
             .unwrap();

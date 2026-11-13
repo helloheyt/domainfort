@@ -56,7 +56,6 @@ fn krbtgt_refused_by_non_development_store() {
         &alice_binding(),
         z(ALICE_PASSWORD),
         ALICE_SALT,
-        Kvno::new(1),
         &now(),
     )
     .unwrap();
@@ -150,7 +149,6 @@ fn create_key_validates_binding() {
             &krbtgt_binding(),
             z("pw"),
             "EXAMPLE.ORGcarol",
-            Kvno::new(1),
             &now()
         ),
         Err(Error::Denied)
@@ -175,7 +173,6 @@ fn set_secret_cannot_rebind() {
             &bob_binding(),
             z("pw2"),
             ALICE_SALT,
-            Kvno::new(2),
             &now()
         ),
         Err(Error::Denied)
@@ -205,16 +202,9 @@ fn set_secret_cannot_rebind() {
     let mut same = alice_binding();
     same.name.name_type = KRB_NT_UNKNOWN;
     assert_eq!(
-        f.keyd.set_secret(
-            &DIRECTORY,
-            &ALICE,
-            &same,
-            z("pw3"),
-            ALICE_SALT,
-            Kvno::new(2),
-            &now()
-        ),
-        Ok(())
+        f.keyd
+            .set_secret(&DIRECTORY, &ALICE, &same, z("pw3"), ALICE_SALT, &now()),
+        Ok(Kvno::new(2))
     );
 }
 
@@ -439,8 +429,9 @@ fn verify_secret_outcomes() {
     );
 }
 
-/// The kvno of set_secret must increase; krbtgt is never password-derived.
-/// Source: docs/10 §6 (`new_kvno`), §12 I3; RFC 4120 5.2.9.
+/// keyd chooses the kvno of set_secret (current + 1, or the initial kvno
+/// for a new set); krbtgt is never password-derived.
+/// Source: docs/10 §6, §12 I3; docs/questions/Q-115 (A-35); RFC 4120 5.2.9.
 #[test]
 fn set_secret_rules() {
     let mut f = Fixture::new();
@@ -451,14 +442,9 @@ fn set_secret_rules() {
             &alice_binding(),
             z("x"),
             ALICE_SALT,
-            Kvno::new(1),
             &now()
         ),
-        Err(Error::Denied)
-    );
-    assert_eq!(
-        f.records().last().unwrap().reason,
-        AuditReason::KvnoNotIncreasing
+        Ok(Kvno::new(2))
     );
     let carol = KeyHandle::new(
         PrincipalId::from_bytes([0xCA; 16]),
@@ -475,10 +461,9 @@ fn set_secret_rules() {
             &carol_binding,
             z("x"),
             "EXAMPLE.ORGcarol",
-            Kvno::new(0),
             &now()
         ),
-        Err(Error::Denied)
+        Ok(Kvno::INITIAL)
     );
     assert_eq!(
         f.keyd.set_secret(
@@ -487,7 +472,6 @@ fn set_secret_rules() {
             &krbtgt_binding(),
             z("x"),
             "salt",
-            Kvno::new(9),
             &now()
         ),
         Err(Error::Denied)

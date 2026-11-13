@@ -72,9 +72,9 @@ pub enum AuditReason {
     /// initial component of 'krbtgt' are reserved for the Kerberos
     /// ticket-granting service"), 7.3 (two-part TGS name).
     InvalidNameBinding,
-    /// The requested new kvno is not greater than the current one.
-    KvnoNotIncreasing,
-    /// The kvno range is exhausted.
+    /// The kvno range is exhausted: the next kvno (`rotate_key`,
+    /// `rotate_krbtgt`, `set_secret`) would wrap. Spec: RFC 4120 5.2.9
+    /// (UInt32); docs/questions/Q-115 (A-35: keyd chooses the kvno).
     KvnoExhausted,
     /// `retire_kvno` named a kvno that is not the retained previous kvno.
     KvnoNotRetirable,

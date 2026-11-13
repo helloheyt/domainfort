@@ -28,9 +28,7 @@ use kdc::{
     AccountSource, AuditEvent, Kdc, KdcConfig, KdcReply, LocalKeyd, Peer, PolicyInputs,
     RateLimiter, Transport,
 };
-use keyd::{
-    AuditRecord, CallerId, InMemoryKeyStore, Keyd, Kvno, OsEntropy, PrincipalBinding, Role,
-};
+use keyd::{AuditRecord, CallerId, InMemoryKeyStore, Keyd, OsEntropy, PrincipalBinding, Role};
 use krb_crypto::{EncType, KeyUsage, ProtocolKey};
 use krb_proto::constants::{
     KDC_ERR_CLIENT_REVOKED, KDC_ERR_C_PRINCIPAL_UNKNOWN, KDC_ERR_PREAUTH_REQUIRED,
@@ -152,7 +150,6 @@ fn kdc_for(d: &Dir) -> TestKdc {
         &PrincipalBinding::new(realm(), alice_name()),
         String::from(ALICE_PASSWORD).into(),
         alice_salt.as_str(),
-        Kvno::new(1),
         &n,
     )
     .unwrap();
@@ -163,7 +160,6 @@ fn kdc_for(d: &Dir) -> TestKdc {
         &PrincipalBinding::new(realm(), service_name()),
         String::from(WS01_PASSWORD).into(),
         ws01_salt.as_str(),
-        Kvno::new(1),
         &n,
     )
     .unwrap();

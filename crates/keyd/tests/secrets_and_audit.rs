@@ -79,8 +79,12 @@ fn operation_signatures_return_no_key_material() {
     ) -> Result<Kvno, Error> = K::rotate_krbtgt;
     let _: fn(&mut K, &CallerId, &KeyHandle, Kvno, &KerberosTime) -> Result<(), Error> =
         K::retire_kvno;
+    // A-35 (docs/questions/Q-115): destroy_key_set returns nothing.
+    let _: fn(&mut K, &CallerId, &KeyHandle, &KerberosTime) -> Result<(), Error> =
+        K::destroy_key_set;
     // I7: plaintext enters as Zeroizing<String> BY VALUE — keyd owns it and
-    // it is wiped when the call returns (docs/10 §12 I7).
+    // it is wiped when the call returns (docs/10 §12 I7). A-35: keyd chooses
+    // the kvno and returns it (not secret).
     let _: fn(
         &mut K,
         &CallerId,
@@ -88,9 +92,8 @@ fn operation_signatures_return_no_key_material() {
         &PrincipalBinding,
         Zeroizing<String>,
         &str,
-        Kvno,
         &KerberosTime,
-    ) -> Result<(), Error> = K::set_secret;
+    ) -> Result<Kvno, Error> = K::set_secret;
     let _: fn(
         &mut K,
         &CallerId,
@@ -200,7 +203,6 @@ fn every_operation_emits_exactly_one_audit_record() {
             &alice_binding(),
             z("next"),
             ALICE_SALT,
-            Kvno::new(2),
             &n,
         )
         .unwrap();
@@ -236,6 +238,13 @@ fn every_operation_emits_exactly_one_audit_record() {
     check(&f, Operation::RotateKrbtgt, &ADMIN, true);
     let _ = f.keyd.rotate_krbtgt(&KDC, &KRBTGT, &approval, &n);
     check(&f, Operation::RotateKrbtgt, &KDC, false);
+    // destroy_key_set (A-35, docs/questions/Q-115): one record either way.
+    let _ = f.keyd.destroy_key_set(&DIRECTORY, &h, &n);
+    check(&f, Operation::DestroyKeySet, &DIRECTORY, false);
+    f.keyd.destroy_key_set(&ADMIN, &h, &n).unwrap();
+    check(&f, Operation::DestroyKeySet, &ADMIN, true);
+    let _ = f.keyd.destroy_key_set(&ADMIN, &h, &n);
+    check(&f, Operation::DestroyKeySet, &ADMIN, false);
 
     // FAST (docs/48 §2.4: one record per call, success or failure). The
     // successful paths are audited in tests/fast_armor.rs.
@@ -310,7 +319,6 @@ fn audit_records_contain_no_secret_bytes() {
             &bob_binding(),
             z("an audit-test password"),
             BOB_SALT,
-            Kvno::new(2),
             &now(),
         )
         .unwrap();

@@ -46,8 +46,11 @@ impl fmt::Debug for PrincipalId {
 pub struct Kvno(u32);
 
 impl Kvno {
-    /// The first key version keyd assigns to a newly created key set.
-    /// Spec: docs/10 §7 (create_key returns the new kvno). The value is this
+    /// The first key version keyd assigns to a newly created key set — by
+    /// `create_key`, or by `set_secret` when it creates the set (also after
+    /// `destroy_key_set`).
+    /// Spec: docs/10 §6, §7 (create_key returns the new kvno);
+    /// docs/questions/Q-115 (A-35: keyd chooses the kvno). The value is this
     /// project's choice; RFC 4120 does not fix an initial kvno.
     pub const INITIAL: Kvno = Kvno(1);
 

@@ -84,11 +84,13 @@ pub enum Operation {
     OpenFastArmor = 10,
     /// Spec: docs/10 §5a; docs/48 §2.3, §6; RFC 6113 5.4.4.
     SealFastError = 11,
+    /// Spec: docs/10 §7; docs/questions/Q-115 (A-35).
+    DestroyKeySet = 12,
 }
 
 impl Operation {
     /// Every operation, for exhaustive checks. Spec: docs/10 §2.
-    pub const ALL: [Operation; 12] = [
+    pub const ALL: [Operation; 13] = [
         Operation::VerifyPreauth,
         Operation::IssueAsRep,
         Operation::OpenAndVerifyTgt,
@@ -101,6 +103,7 @@ impl Operation {
         Operation::RetireKvno,
         Operation::OpenFastArmor,
         Operation::SealFastError,
+        Operation::DestroyKeySet,
     ];
 }
 
@@ -108,8 +111,9 @@ impl Operation {
 /// not listed is denied.
 ///
 /// Spec: docs/10 §2 (table rows Kdc, Directory, Admin — restricted to the
-/// phase-1 operations); docs/09 א.6 (D31); docs/48 §2.3 ("`Kdc` also gets
-/// `open_fast_armor`, `seal_fast_error`. No other role").
+/// phase-1 operations), §7; docs/09 א.6 (D31); docs/48 §2.3 ("`Kdc` also
+/// gets `open_fast_armor`, `seal_fast_error`. No other role");
+/// docs/questions/Q-115 (A-35: `destroy_key_set` is an Admin operation).
 pub const CAPABILITY_TABLE: [(Role, &[Operation]); 3] = [
     (
         Role::Kdc,
@@ -133,6 +137,7 @@ pub const CAPABILITY_TABLE: [(Role, &[Operation]); 3] = [
             Operation::RotateKey,
             Operation::RotateKrbtgt,
             Operation::RetireKvno,
+            Operation::DestroyKeySet,
         ],
     ),
 ];
@@ -187,12 +192,14 @@ pub enum HandleSlot {
 /// - `set_secret`, `verify_secret`, `rotate_key`: PrincipalLongterm or
 ///   Service. The krbtgt key is never password-derived and is rotated only
 ///   through `rotate_krbtgt` (dual control, docs/10 §7).
+/// - `destroy_key_set`: PrincipalLongterm or Service — never Krbtgt (A-35).
 /// - `rotate_krbtgt`: Krbtgt.
 /// - `create_key`, `retire_kvno`: any phase-1 purpose (docs/10 §7:
 ///   create_key also initializes krbtgt).
 ///
 /// Spec: docs/10 §2 ("(b) the KeyPurpose of the handle matches the
-/// operation"), §4, §5, §6, §7, §12 I3; docs/48 §2.3, §9.1 I3.
+/// operation"), §4, §5, §6, §7, §12 I3; docs/48 §2.3, §9.1 I3;
+/// docs/questions/Q-115 (A-35).
 pub const fn purpose_permitted(op: Operation, slot: HandleSlot, purpose: KeyPurpose) -> bool {
     use KeyPurpose::{Krbtgt, PrincipalLongterm, Service};
     match (op, slot) {
@@ -207,7 +214,8 @@ pub const fn purpose_permitted(op: Operation, slot: HandleSlot, purpose: KeyPurp
         (Operation::IssueTgsRep, HandleSlot::Primary) => matches!(purpose, Service),
         (Operation::SetSecret, HandleSlot::Primary)
         | (Operation::VerifySecret, HandleSlot::Primary)
-        | (Operation::RotateKey, HandleSlot::Primary) => {
+        | (Operation::RotateKey, HandleSlot::Primary)
+        | (Operation::DestroyKeySet, HandleSlot::Primary) => {
             matches!(purpose, PrincipalLongterm | Service)
         }
         (Operation::CreateKey, HandleSlot::Primary)
@@ -265,6 +273,21 @@ const _: () = {
         Operation::OpenFastArmor,
         HandleSlot::Primary,
         KeyPurpose::Service
+    ));
+    // destroy_key_set (A-35, docs/questions/Q-115): Admin only, and never a
+    // Krbtgt key set (krbtgt is only rotated).
+    assert!(role_permits(Role::Admin, Operation::DestroyKeySet));
+    assert!(!role_permits(Role::Directory, Operation::DestroyKeySet));
+    assert!(!role_permits(Role::Kdc, Operation::DestroyKeySet));
+    assert!(!purpose_permitted(
+        Operation::DestroyKeySet,
+        HandleSlot::Primary,
+        KeyPurpose::Krbtgt
+    ));
+    assert!(!purpose_permitted(
+        Operation::DestroyKeySet,
+        HandleSlot::Krbtgt,
+        KeyPurpose::Krbtgt
     ));
 };
 
