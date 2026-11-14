@@ -45,10 +45,12 @@
 //! (A-69).
 
 use ipc_audit::{
-    Ack, Append, EventBody, LdapEvent, Reservation, SendWindow, WindowConfig, WindowError,
+    Ack, Append, DirAdminEvent, EventBody, LdapEvent, Reservation, SendWindow, WindowConfig,
+    WindowError,
 };
 use ldap::{AuditEvent, AuditOperation};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Condvar, Mutex, MutexGuard};
+use std::time::Instant;
 use tokio::sync::Notify;
 
 /// Whether `event` is noise: the engine never decoded the message, so no
@@ -80,13 +82,19 @@ struct GateState {
     reachable: bool,
 }
 
-/// Shared by the LDAP engine thread (admit, record) and the audit client
-/// task (batches, acknowledgements, reachability).
-/// Spec: docs/50 R50-17, §8.1; docs/questions/Q-218 (A-57).
+/// Shared by the LDAP engine thread (admit, record), the admin thread
+/// (reserve, commit, wait for an acknowledgement — crate::admin_engine) and
+/// the audit client task (batches, acknowledgements, reachability): one
+/// window, one link to auditd for every event dird sends (A-85: "reuse
+/// dird's existing audit link and window").
+/// Spec: docs/50 R50-17, §8.1; docs/questions/Q-218 (A-57); docs/51 §5.7.
 #[derive(Debug)]
 pub struct AuditGate {
     state: Mutex<GateState>,
     wake: Notify,
+    /// Wakes the admin thread waiting for a decision event's
+    /// acknowledgement (docs/51 §5.7 item 2); paired with `state`.
+    acked: Condvar,
 }
 
 impl AuditGate {
@@ -100,6 +108,7 @@ impl AuditGate {
                 reachable: false,
             }),
             wake: Notify::new(),
+            acked: Condvar::new(),
         }
     }
 
@@ -174,11 +183,99 @@ impl AuditGate {
         self.lock().and_then(|mut state| state.window.next_batch())
     }
 
-    /// auditd's acknowledgement of the batch in flight.
+    /// auditd's acknowledgement of the batch in flight; wakes a thread
+    /// waiting for one ([`AuditGate::wait_acknowledged`]).
     pub(crate) fn acknowledge(&self, ack: &Ack) -> Result<usize, WindowError> {
-        match self.lock() {
+        let result = match self.lock() {
             Some(mut state) => state.window.acknowledge(ack),
             None => Err(WindowError::UnexpectedAck),
+        };
+        self.acked.notify_all();
+        result
+    }
+
+    /// Reserve `count` slots for the gating events of one admin operation —
+    /// all or none — with auditd reachable; `None` otherwise (the operation
+    /// is then not performed and is answered `Unavailable`: "auditd
+    /// unavailable ⇒ the operation is refused before any commit", A-85). A
+    /// refused reservation is counted for the next `WindowSummary`.
+    /// Spec: docs/51 §5.7 items 1-2; docs/questions/Q-218 (A-57), Q-340
+    /// item 8 (every `DirAdmin` event is gating); keyd-daemon's two-slot
+    /// intent rule (A-88) as the pattern.
+    pub(crate) fn admit_slots(&self, count: usize) -> Option<Vec<Reservation>> {
+        let mut state = self.lock()?;
+        if !state.reachable {
+            return None;
+        }
+        let mut slots = Vec::with_capacity(count);
+        for _ in 0..count {
+            match state.window.reserve() {
+                Ok(slot) => slots.push(slot),
+                Err(_) => {
+                    for slot in slots {
+                        state.window.release(slot);
+                    }
+                    return None;
+                }
+            }
+        }
+        Some(slots)
+    }
+
+    /// Put one admin event into its reserved slot; returns its sequence
+    /// number, and wakes the audit client to send it.
+    ///
+    /// # Errors
+    /// [`RecordLost`] (cannot happen for an event built from ipc-audit's
+    /// types): the caller does not go on with the operation, or — after a
+    /// commit — reports the gap.
+    ///
+    /// Spec: docs/51 §5.7 item 2; docs/questions/Q-252 item 9 (A-64).
+    pub(crate) fn commit_admin(
+        &self,
+        reservation: Reservation,
+        event: &DirAdminEvent,
+    ) -> Result<u64, RecordLost> {
+        let result = match self.lock() {
+            Some(mut state) => state
+                .window
+                .commit(reservation, &EventBody::DirAdmin(Box::new(event.clone())))
+                .map_err(|_| RecordLost),
+            None => Err(RecordLost),
+        };
+        self.wake.notify_one();
+        result
+    }
+
+    /// Wait until auditd acknowledged the event numbered `seq` — persisted
+    /// it (docs/50 §8.1: `Ack` only after the sync) — or `deadline` passed.
+    /// Acknowledgements are cumulative and in order (one batch in flight,
+    /// oldest first), so `seq` is acknowledged once the last `Ack` reaches
+    /// it. A poisoned lock answers `false` (fail closed). Blocks the calling
+    /// thread (the admin thread, never the runtime's).
+    /// Spec: docs/51 §5.7 item 2 ("a decision event acknowledged by auditd
+    /// before the commit"); A-85; docs/50 §3.6 (bounded waits); the same
+    /// rule in keyd-daemon (A-88).
+    pub(crate) fn wait_acknowledged(&self, seq: u64, deadline: Instant) -> bool {
+        let Some(mut state) = self.lock() else {
+            return false;
+        };
+        loop {
+            if state
+                .window
+                .last_ack()
+                .is_some_and(|ack| ack.through_seq >= seq)
+            {
+                return true;
+            }
+            let left = match deadline.checked_duration_since(Instant::now()) {
+                Some(left) if !left.is_zero() => left,
+                _ => return false,
+            };
+            state = match self.acked.wait_timeout(state, left) {
+                Ok((guard, _)) => guard,
+                Err(_) => return false,
+            };
         }
     }
 

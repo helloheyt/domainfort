@@ -294,7 +294,7 @@ async fn write_dispatch(
 ///
 /// Spec: docs/50 §3.3 ("`length` checked against the MAX … before any body
 /// byte is allocated or read"), §3.6, R50-7.
-async fn read_frame(
+pub(crate) async fn read_frame(
     stream: &mut UnixStream,
     reader: &mut FrameReader,
     frame_timeout: Duration,

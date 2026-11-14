@@ -244,6 +244,41 @@ pub(crate) fn naming_context(text: &str) -> Result<NamingContextLabels, ErrorKin
     Ok(NamingContextLabels(labels))
 }
 
+/// Octets of a node-id. Spec: docs/29 §2 as cited in docs/51 §4.3 step 2
+/// ("NodeId (16 bytes)"); crates/dirstore `NodeId`.
+pub const NODE_ID_OCTETS: usize = 16;
+
+/// A node-id: exactly 32 lower-case hexadecimal digits (16 octets, most
+/// significant first), never all zero. One spelling per value: upper-case
+/// digits, a `0x` prefix, separators or any other length are refused. Not a
+/// secret (docs/51 §4.6: "`node_id` (hex, not secret)").
+/// Spec: docs/51 §4.3 step 2, §4.6; docs/29 §2 (as cited there); crates/
+/// directory-admin `AdminConfig::new` (an all-zero node id is refused);
+/// docs/questions/Q-385 item 3.
+pub(crate) fn node_id(text: &str) -> Result<[u8; NODE_ID_OCTETS], ErrorKind> {
+    let digits = text.as_bytes();
+    if digits.len() != 2 * NODE_ID_OCTETS {
+        return Err(ErrorKind::InvalidNodeId);
+    }
+    let nibble = |d: u8| match d {
+        b'0'..=b'9' => Ok(d - b'0'),
+        b'a'..=b'f' => Ok(d - b'a' + 10),
+        _ => Err(ErrorKind::InvalidNodeId),
+    };
+    let mut id = [0u8; NODE_ID_OCTETS];
+    for (octet, pair) in id.iter_mut().zip(digits.chunks_exact(2)) {
+        let (high, low) = match pair {
+            [high, low] => (nibble(*high)?, nibble(*low)?),
+            _ => return Err(ErrorKind::InvalidNodeId),
+        };
+        *octet = (high << 4) | low;
+    }
+    if id == [0u8; NODE_ID_OCTETS] {
+        return Err(ErrorKind::InvalidNodeId);
+    }
+    Ok(id)
+}
+
 /// One name from a fixed list, matched exactly (case-sensitive).
 /// Spec: docs/50 §3.2, §7.3, §8.1 (the closed name sets).
 pub(crate) fn named<N: Copy>(text: &str, names: &[(&str, N)]) -> Result<N, ErrorKind> {

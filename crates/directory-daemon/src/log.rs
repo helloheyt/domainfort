@@ -64,6 +64,26 @@ pub enum Note {
     /// The stop ended the audit task with LDAP events auditd had not
     /// acknowledged (logged with their count; docs/questions/Q-313).
     AuditUnacknowledged,
+    /// dird listens on `dird-admin.sock` (task A8).
+    AdminListening,
+    /// The admin service did not start (logged with the reason's code,
+    /// `admin_service::NotStarted::code`); dird's other services run.
+    AdminNotStarted,
+    /// A `dird-admin.sock` connection's peer uid is not admind's; closed
+    /// without a reply (docs/51 §7.1).
+    AdminPeerRefused,
+    /// admind's connection bound is reached; the connection is refused
+    /// `Busy` and closed (docs/51 §7.5).
+    AdminConnectionLimit,
+    /// The admin queue is full; the request is refused `Busy` (docs/51
+    /// §7.5).
+    AdminBusy,
+    /// An admin operation was refused `Unavailable`: auditd could not take
+    /// its events (A-85).
+    AdminAuditUnavailable,
+    /// An admin operation's outcome event could not be committed after the
+    /// operation (its decision event documents it).
+    AdminOutcomeUnrecorded,
     /// Stopped.
     Stopped,
 }
@@ -97,6 +117,19 @@ impl Note {
             Note::EngineStopped => "engine thread stopped unexpectedly",
             Note::AuditUnacknowledged => {
                 "stopping with audit events auditd did not acknowledge within the grace; count"
+            }
+            Note::AdminListening => "listening on the admin channel",
+            Note::AdminNotStarted => {
+                "admin service not started (the other services run); reason code"
+            }
+            Note::AdminPeerRefused => "admin channel connection closed: peer uid is not admind's",
+            Note::AdminConnectionLimit => {
+                "admin channel connection refused: connection bound reached"
+            }
+            Note::AdminBusy => "admin request refused: admin queue full",
+            Note::AdminAuditUnavailable => "admin operation refused: auditd cannot take its events",
+            Note::AdminOutcomeUnrecorded => {
+                "admin operation outcome event not recorded (its decision event was)"
             }
             Note::Stopped => "stopped",
         }

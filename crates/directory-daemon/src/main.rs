@@ -1,14 +1,16 @@
 #![forbid(unsafe_code)]
 //! The dird binary: `directory-daemon <configuration file>` — the
-//! directory-view service only (task P8).
+//! directory-view service (task P8), the LDAP service (task P10) and, when
+//! configured, the admin service (task A8, docs/51 §7).
 //!
 //! The start-up order (docs/50 R50-14, §6.2, §7.5; crates/daemon-sandbox):
 //!
 //! 1. claim the single-thread proof — the first statement of `main`;
 //! 2. read the configuration path from argv and parse it;
 //! 3. as root: read the development integrity key and the development
-//!    policy (both root-owned files, read before the drop), and prepare the
-//!    socket directory;
+//!    policy (both root-owned files, read before the drop), the provisioning
+//!    manifest when the admin channel is configured (root-owned, docs/51
+//!    §4.3 step 8), and prepare the socket directories;
 //! 4. apply the hardening plan while the process has exactly one thread;
 //! 5. only then build the tokio runtime, and serve (auditd first, then the
 //!    directory, then the socket).
@@ -22,10 +24,10 @@
 use daemon_sandbox::{apply, SingleThreadProof};
 use directory_daemon::log::{note, Note};
 use directory_daemon::startup::{
-    hardening_plan, params, prepare_socket_directory, read_integrity_key, read_policy,
-    read_settings,
+    admin_params, hardening_plan, params, prepare_socket_directory, read_integrity_key,
+    read_policy, read_provision_manifest, read_settings,
 };
-use directory_daemon::{serve, DaemonControl, StoreSource};
+use directory_daemon::{serve_with_admin, DaemonControl, StoreSource};
 use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
@@ -95,6 +97,19 @@ fn main() -> ExitCode {
         Err(error) => return fail("policy store", &error),
     };
     note(Note::UnsignedDevelopmentPolicy, None);
+    // The admin service's manifest (task A8), root-owned, read before the
+    // drop — only when the admin channel is configured (docs/51 §4.3 step 8).
+    let manifest = match settings.admin_service() {
+        Some(service) => match read_provision_manifest(service.provision_manifest().as_path()) {
+            Ok(manifest) => Some(manifest),
+            Err(error) => return fail("provisioning manifest", &error),
+        },
+        None => None,
+    };
+    let admin = match admin_params(&settings, manifest) {
+        Ok(admin) => admin,
+        Err(error) => return fail("admin service", &error),
+    };
     if let Err(error) = prepare_socket_directory(&settings) {
         return fail("socket directory", &error);
     }
@@ -124,7 +139,7 @@ fn main() -> ExitCode {
         owner_uid: settings.run_as().uid(),
     };
     let control = DaemonControl::new();
-    let result = runtime.block_on(serve(params, source, policy, control));
+    let result = runtime.block_on(serve_with_admin(params, admin, source, policy, control));
     drop(runtime);
     match result {
         Ok(stopped) => {

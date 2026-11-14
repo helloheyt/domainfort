@@ -1129,9 +1129,156 @@ fn dird_admin_pair_is_both_or_neither() {
     let err = error(Daemon::Dird, &text);
     assert_eq!(err.kind(), ErrorKind::IncompletePair);
     assert_eq!(err.key(), Some("admind_uid"));
-    let both_removed = remove(&remove(DIRD, "dird_admin_socket"), "admind_uid");
+    let mut both_removed = remove(&remove(DIRD, "dird_admin_socket"), "admind_uid");
+    for key in ["admin_ticket_age_max", "admin_quorum", "provision_manifest"] {
+        both_removed = remove(&both_removed, key);
+    }
     let s = DirdSettings::parse(both_removed.as_bytes()).expect("valid without admin");
     assert!(s.admin_channel().is_none());
+    assert!(s.admin_service().is_none());
+}
+
+/// dird's keyd endpoint (the admin service's ticket verification, A-73):
+/// both `keyd_socket` and `keyd_uid` or neither; without it the file is
+/// still valid (the admin service then does not start).
+/// Spec: docs/51 §4.6 ("`keyd_socket` + `keyd_uid` (both or neither)");
+/// A-73; docs/questions/Q-385 item 1.
+#[test]
+fn dird_keyd_pair_is_both_or_neither() {
+    let text = remove(DIRD, "keyd_uid");
+    let err = error(Daemon::Dird, &text);
+    assert_eq!(err.kind(), ErrorKind::IncompletePair);
+    assert_eq!(err.key(), Some("keyd_socket"));
+    assert_eq!(err.line(), line_of(&text, "keyd_socket"));
+    let text = remove(DIRD, "keyd_socket");
+    let err = error(Daemon::Dird, &text);
+    assert_eq!(err.kind(), ErrorKind::IncompletePair);
+    assert_eq!(err.key(), Some("keyd_uid"));
+    let neither = remove(&remove(DIRD, "keyd_socket"), "keyd_uid");
+    let s = DirdSettings::parse(neither.as_bytes()).expect("valid without keyd");
+    assert!(s.keyd().is_none());
+    assert!(s.admin_service().is_some());
+    // keyd's uid is one more account of the file (docs/50 §2.4).
+    rejects_value(Daemon::Dird, DIRD, "keyd_uid", "0", ErrorKind::ReservedId);
+    let err = error(Daemon::Dird, &set(DIRD, "keyd_uid", "803"));
+    assert_eq!(err.kind(), ErrorKind::DuplicateId);
+    let err = error(
+        Daemon::Dird,
+        &set(DIRD, "keyd_socket", "/run/dird/admin/dird-admin.sock"),
+    );
+    assert_eq!(err.kind(), ErrorKind::DuplicatePath);
+}
+
+/// With the admin channel, the admin service's settings are required (no
+/// hidden default); without it they are refused.
+/// Spec: docs/51 §5.5 (R51-10), §5.6 (R51-11), §4.6; P-22;
+/// docs/questions/Q-385 items 2, 4, 5.
+#[test]
+fn dird_admin_service_settings_follow_the_admin_channel() {
+    for key in [
+        "admin_ticket_age_max",
+        "admin_quorum",
+        "provision_manifest",
+        "node_id",
+    ] {
+        let err = error(Daemon::Dird, &remove(DIRD, key));
+        assert_eq!(err.kind(), ErrorKind::MissingKey, "{key}");
+        assert_eq!(err.key(), Some(key), "{key}");
+    }
+    let without_channel = remove(&remove(DIRD, "dird_admin_socket"), "admind_uid");
+    for key in ["admin_ticket_age_max", "admin_quorum", "provision_manifest"] {
+        let mut text = without_channel.clone();
+        for other in ["admin_ticket_age_max", "admin_quorum", "provision_manifest"] {
+            if other != key {
+                text = remove(&text, other);
+            }
+        }
+        let err = error(Daemon::Dird, &text);
+        assert_eq!(err.kind(), ErrorKind::IncompletePair, "{key}");
+        assert_eq!(err.key(), Some(key), "{key}");
+        assert_eq!(err.line(), line_of(&text, key), "{key}");
+    }
+    // node_id alone (no admin channel) is a harmless identifier: accepted.
+    let mut text = without_channel;
+    for other in ["admin_ticket_age_max", "admin_quorum", "provision_manifest"] {
+        text = remove(&text, other);
+    }
+    let s = DirdSettings::parse(text.as_bytes()).expect("node_id alone");
+    assert!(s.node_id().is_some());
+}
+
+/// The ranges: ticket age 60 s ..= 3600 s; quorum 2 ..= 3.
+/// Spec: docs/51 §5.5, §5.6, §7.2; P-22 item 3 (no single-administrator
+/// mode); docs/questions/Q-385 items 4, 5.
+#[test]
+fn dird_admin_ranges() {
+    for ok in ["60s", "600s", "3600s"] {
+        accepts_value(Daemon::Dird, DIRD, "admin_ticket_age_max", ok);
+    }
+    for bad in ["59s", "3601s", "0s"] {
+        rejects_value(
+            Daemon::Dird,
+            DIRD,
+            "admin_ticket_age_max",
+            bad,
+            ErrorKind::OutOfRange,
+        );
+    }
+    rejects_value(
+        Daemon::Dird,
+        DIRD,
+        "admin_ticket_age_max",
+        "600",
+        ErrorKind::InvalidDuration,
+    );
+    for ok in ["2", "3"] {
+        accepts_value(Daemon::Dird, DIRD, "admin_quorum", ok);
+    }
+    for bad in ["1", "4", "0"] {
+        rejects_value(
+            Daemon::Dird,
+            DIRD,
+            "admin_quorum",
+            bad,
+            ErrorKind::OutOfRange,
+        );
+    }
+    let err = error(
+        Daemon::Dird,
+        &set(DIRD, "provision_manifest", "/etc/domain/policy.store"),
+    );
+    assert_eq!(err.kind(), ErrorKind::DuplicatePath);
+    rejects_value(
+        Daemon::Dird,
+        DIRD,
+        "provision_manifest",
+        "etc/manifest",
+        ErrorKind::InvalidPath,
+    );
+}
+
+/// node_id: exactly 32 lower-case hex digits, not all zero (one spelling).
+/// Spec: docs/51 §4.6; docs/29 §2 as cited in docs/51 §4.3; directory-admin
+/// `AdminConfig::new` (all-zero refused); docs/questions/Q-385 item 3.
+#[test]
+fn dird_node_id_spelling() {
+    accepts_value(
+        Daemon::Dird,
+        DIRD,
+        "node_id",
+        "00000000000000000000000000000001",
+    );
+    for bad in [
+        "00000000000000000000000000000000",
+        "0123456789ABCDEF0123456789abcdef",
+        "0123456789abcdef0123456789abcde",
+        "0123456789abcdef0123456789abcdef0",
+        "0x23456789abcdef0123456789abcdef",
+        "0123456789abcdef-123456789abcdef",
+        "g123456789abcdef0123456789abcdef",
+    ] {
+        rejects_value(Daemon::Dird, DIRD, "node_id", bad, ErrorKind::InvalidNodeId);
+    }
 }
 
 /// The per-source TCP bound may not exceed the global one — including the

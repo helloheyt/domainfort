@@ -207,11 +207,13 @@ dependencies = [
  "ad-schema",
  "config",
  "daemon-sandbox",
+ "directory-admin",
  "directory-pip",
  "dirstore",
  "dtyp",
  "ipc",
  "ipc-audit",
+ "ipc-dird-admin",
  "ipc-directory",
  "ipc-directory-server",
  "ipc-keyd",
@@ -227,6 +229,7 @@ dependencies = [
  "parse-ldap",
  "pdp",
  "policy-store",
+ "provision-manifest",
  "tokio",
  "zeroize",
 ]
@@ -396,6 +399,19 @@ dependencies = [
  "ldap",
  "parse-ldap",
  "pdp",
+]
+
+[[package]]
+name = "ipc-dird-admin"
+version = "0.0.0"
+dependencies = [
+ "dtyp",
+ "ipc",
+ "ipc-keyd",
+ "keyd-types",
+ "krb-proto",
+ "rustix",
+ "zeroize",
 ]
 
 [[package]]

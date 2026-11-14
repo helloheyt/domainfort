@@ -103,6 +103,23 @@ fn dird_sample_parses() {
     let admin = s.admin_channel().expect("admin channel configured");
     assert_eq!(admin.socket().as_str(), "/run/dird/admin/dird-admin.sock");
     assert_eq!(admin.peer_uid(), 806);
+    let keyd = s.keyd().expect("keyd endpoint configured");
+    assert_eq!(keyd.socket().as_str(), "/run/keyd/keyd.sock");
+    assert_eq!(keyd.uid(), 801);
+    assert_eq!(
+        s.node_id(),
+        Some([
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
+            0x66, 0xff
+        ])
+    );
+    let service = s.admin_service().expect("admin service configured");
+    assert_eq!(service.ticket_age_max(), secs(600));
+    assert_eq!(service.quorum(), 2);
+    assert_eq!(
+        service.provision_manifest().as_str(),
+        "/etc/domain/provision.manifest"
+    );
     let networks: Vec<_> = s
         .internal_networks()
         .iter()
@@ -132,6 +149,9 @@ fn dird_minimal_sample_takes_defaults() {
     let s = DirdSettings::parse(common::DIRD_MINIMAL.as_bytes()).expect("valid dird file");
     assert!(s.internal_networks().is_empty());
     assert!(s.admin_channel().is_none());
+    assert!(s.admin_service().is_none());
+    assert!(s.keyd().is_none());
+    assert!(s.node_id().is_none());
     assert_eq!(s.frame_timeout(), secs(5));
     assert_eq!(s.view_lifetime(), secs(5));
 }

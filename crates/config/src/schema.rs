@@ -85,6 +85,13 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
+    /// An endpoint whose path and uid the caller already registered for
+    /// distinctness (an optional pair, e.g. dird's `keyd_socket` /
+    /// `keyd_uid`).
+    pub(crate) fn from_parts(socket: AbsolutePath, uid: u32) -> Endpoint {
+        Endpoint { socket, uid }
+    }
+
     /// The server's socket path.
     #[must_use]
     pub fn socket(&self) -> &AbsolutePath {

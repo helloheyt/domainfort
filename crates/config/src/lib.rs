@@ -84,7 +84,10 @@ mod value;
 
 pub use admind::AdmindSettings;
 pub use auditd::{AuditSource, AuditdSettings, SourceMap};
-pub use dird::{Channel, DirdSettings, IntegrityKeySource, PolicyStoreFormat, VIEW_LIFETIME_SECS};
+pub use dird::{
+    AdminServiceSettings, Channel, DirdSettings, IntegrityKeySource, PolicyStoreFormat,
+    VIEW_LIFETIME_SECS,
+};
 pub use error::{Error, ErrorKind};
 pub use kdc::{
     KdcLimits, KdcSettings, DIRD_KDC_DEADLINE_SECS, MAX_REQUESTS_PER_TCP_CONNECTION_BOUND,
@@ -98,4 +101,6 @@ pub use ldap_front::{
     MAX_CONN_IDLE_TIME_SECS, TLS_HANDSHAKE_TIMEOUT_SECS,
 };
 pub use schema::{Account, Endpoint};
-pub use value::{AbsolutePath, NamingContextLabels, Network, MAX_NAMING_CONTEXT_LABELS};
+pub use value::{
+    AbsolutePath, NamingContextLabels, Network, MAX_NAMING_CONTEXT_LABELS, NODE_ID_OCTETS,
+};

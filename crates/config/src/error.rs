@@ -153,6 +153,10 @@ pub enum ErrorKind {
     /// Two limits contradict each other (a per-source bound above the global
     /// bound). Spec: docs/50 §4.1.
     InconsistentLimits,
+    /// Not a node-id: exactly 32 lower-case hexadecimal digits, not all zero.
+    /// Spec: docs/51 §4.6 ("`node_id` (hex, not secret)"); docs/29 §2 as cited
+    /// in docs/51 §4.3; docs/questions/Q-385 item 3.
+    InvalidNodeId,
 }
 
 impl ErrorKind {
@@ -193,6 +197,7 @@ impl ErrorKind {
             ErrorKind::DuplicatePath => "path is used by more than one setting",
             ErrorKind::NoListener => "no network listener is configured",
             ErrorKind::InconsistentLimits => "per-source limit exceeds the global limit",
+            ErrorKind::InvalidNodeId => "value is not 32 lower-case hex digits, not all zero",
         }
     }
 }

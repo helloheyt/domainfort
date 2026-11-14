@@ -26,13 +26,13 @@ use core::time::Duration;
 
 use crate::error::{Error, ErrorKind};
 use crate::format::Document;
-use crate::limits::{Bound, FRAME_TIMEOUT_SECS};
+use crate::limits::{Bound, ADMIN_QUORUM, ADMIN_TICKET_AGE_MAX_SECS, FRAME_TIMEOUT_SECS};
 use crate::schema::{
     self, Account, Distinct, Endpoint, AUDITD_UID, AUDIT_SOCKET, DIRD_ADMIN_SOCKET,
-    DIRD_KDC_SOCKET, DIRD_LDAP_SOCKET, FRAME_TIMEOUT, INTERNAL_NETWORKS, POLICY_STORE_PATH,
-    RUN_AS_GID, RUN_AS_UID,
+    DIRD_KDC_SOCKET, DIRD_LDAP_SOCKET, FRAME_TIMEOUT, INTERNAL_NETWORKS, KEYD_SOCKET, KEYD_UID,
+    POLICY_STORE_PATH, RUN_AS_GID, RUN_AS_UID,
 };
-use crate::value::{self, AbsolutePath, NamingContextLabels, Network};
+use crate::value::{self, AbsolutePath, NamingContextLabels, Network, NODE_ID_OCTETS};
 
 /// Key: the realm. Spec: docs/50 §7.1; A-55 (must match the naming context).
 const REALM: &str = "realm";
@@ -62,6 +62,19 @@ const INTEGRITY_KEY_PATH: &str = "integrity_key_path";
 /// Key: the format of the policy store file. Spec: docs/50 §7.2; Q-219
 /// (A-57); docs/questions/Q-270 item 2.
 pub(crate) const POLICY_STORE_FORMAT: &str = "policy_store_format";
+/// Key: this DC's node-id, the `Origin.origin_node` of every directory write
+/// (32 lower-case hex digits, not secret). Spec: docs/51 §4.3 step 2, §4.6;
+/// docs/29 §2 as cited there; docs/questions/Q-385 item 3.
+const NODE_ID: &str = "node_id";
+/// Key: the admin plane's ticket-age threshold. Spec: docs/51 §5.5 (R51-10);
+/// docs/questions/Q-385 item 4.
+const ADMIN_TICKET_AGE_MAX: &str = "admin_ticket_age_max";
+/// Key: the dual-control quorum. Spec: docs/51 §5.6 (R51-11); P-22.
+const ADMIN_QUORUM_KEY: &str = "admin_quorum";
+/// Key: the non-secret provisioning manifest (root-owned), from which dird
+/// takes the admin service object and the service objects it protects.
+/// Spec: docs/51 §4.3 step 8, §5.2 row 9; A-73; docs/questions/Q-386.
+const PROVISION_MANIFEST: &str = "provision_manifest";
 
 /// Where dird's dirstore integrity key comes from.
 ///
@@ -132,6 +145,38 @@ impl Channel {
     }
 }
 
+/// The admin service's own settings: present exactly when the admin channel
+/// (`dird_admin_socket` + `admind_uid`) is configured.
+///
+/// Spec: docs/51 §5.5, §5.6, §7; A-73; P-22; docs/questions/Q-385, Q-386.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminServiceSettings {
+    ticket_age_max: Duration,
+    quorum: u32,
+    provision_manifest: AbsolutePath,
+}
+
+impl AdminServiceSettings {
+    /// The ticket-age threshold (60 s ..= 3600 s). Spec: docs/51 §5.5.
+    #[must_use]
+    pub const fn ticket_age_max(&self) -> Duration {
+        self.ticket_age_max
+    }
+
+    /// The dual-control quorum (2 ..= 3). Spec: docs/51 §5.6; P-22.
+    #[must_use]
+    pub const fn quorum(&self) -> u32 {
+        self.quorum
+    }
+
+    /// The provisioning manifest (root-owned, not group/other-writable — the
+    /// daemon's checks). Spec: docs/51 §4.3 step 8.
+    #[must_use]
+    pub fn provision_manifest(&self) -> &AbsolutePath {
+        &self.provision_manifest
+    }
+}
+
 /// dird's settings, as parsed and validated from its file.
 ///
 /// Spec: docs/50 R50-15, §2.4, §7.1.
@@ -149,6 +194,9 @@ pub struct DirdSettings {
     kdc_channel: Channel,
     ldap_channel: Channel,
     admin_channel: Option<Channel>,
+    keyd: Option<Endpoint>,
+    node_id: Option<[u8; NODE_ID_OCTETS]>,
+    admin_service: Option<AdminServiceSettings>,
     internal_networks: Vec<Network>,
     audit: Endpoint,
     frame_timeout: Duration,
@@ -186,6 +234,12 @@ impl DirdSettings {
         LDAP_FRONT_UID,
         DIRD_ADMIN_SOCKET,
         ADMIND_UID,
+        KEYD_SOCKET,
+        KEYD_UID,
+        NODE_ID,
+        ADMIN_TICKET_AGE_MAX,
+        ADMIN_QUORUM_KEY,
+        PROVISION_MANIFEST,
         INTERNAL_NETWORKS,
         AUDIT_SOCKET,
         AUDITD_UID,
@@ -200,9 +254,15 @@ impl DirdSettings {
     /// `integrity_key_path`, `policy_store_path`, `policy_store_format`
     /// (only `unsigned-development`), `dird_kdc_socket` with `kdc_uid`,
     /// `dird_ldap_socket` with `ldap_front_uid`, `audit_socket`, `auditd_uid`.
-    /// Optional: `dird_admin_socket` with `admind_uid` (both or neither —
-    /// admind is blocked on Q-220, task P13), `internal_networks` (absent ⇒
-    /// every peer is `External`), `frame_timeout` (5s), `view_lifetime` (5s).
+    /// Optional: `dird_admin_socket` with `admind_uid` (both or neither);
+    /// when they are present, `admin_ticket_age_max` (60s ..= 3600s),
+    /// `admin_quorum` (2 ..= 3), `provision_manifest` and `node_id` are
+    /// required, and without them the first three are refused
+    /// (`IncompletePair`); `keyd_socket` with `keyd_uid` (both or neither —
+    /// without them dird's admin service does not start, the rest of dird
+    /// runs); `node_id` (32 lower-case hex digits, not all zero);
+    /// `internal_networks` (absent ⇒ every peer is `External`),
+    /// `frame_timeout` (5s), `view_lifetime` (5s).
     ///
     /// # Errors
     /// Any rule of the format or of this schema (see [`crate::ErrorKind`]).
@@ -253,6 +313,75 @@ impl DirdSettings {
                 })
             }
         };
+        // keyd, for the admin service's ticket verification (A-73): both or
+        // neither (docs/51 §4.6).
+        let keyd_socket = doc.optional(KEYD_SOCKET, value::absolute_path)?;
+        let keyd_uid = doc.optional(KEYD_UID, value::account_id)?;
+        let keyd = match (keyd_socket, keyd_uid) {
+            (None, None) => None,
+            (Some(socket), None) => {
+                return Err(Error::at(
+                    socket.line,
+                    KEYD_SOCKET,
+                    ErrorKind::IncompletePair,
+                ))
+            }
+            (None, Some(uid)) => {
+                return Err(Error::at(uid.line, KEYD_UID, ErrorKind::IncompletePair))
+            }
+            (Some(socket), Some(uid)) => {
+                all.path(KEYD_SOCKET, &socket.value, socket.line)?;
+                all.id(KEYD_UID, uid.value, uid.line)?;
+                Some(Endpoint::from_parts(socket.value, uid.value))
+            }
+        };
+        let node_id = doc.optional(NODE_ID, value::node_id)?;
+        let ticket_age = doc.optional(ADMIN_TICKET_AGE_MAX, |text| {
+            value::duration_secs(text, ADMIN_TICKET_AGE_MAX_SECS)
+        })?;
+        let quorum = doc.optional(ADMIN_QUORUM_KEY, |text| value::bounded(text, ADMIN_QUORUM))?;
+        let manifest = doc.optional(PROVISION_MANIFEST, value::absolute_path)?;
+        let admin_service = if admin_channel.is_some() {
+            // The admin service's settings have no hidden default (docs/51
+            // §5.5: the threshold is a configured value; P-22: the quorum).
+            let ticket_age = ticket_age.ok_or(Error::missing(ADMIN_TICKET_AGE_MAX))?;
+            let quorum = quorum.ok_or(Error::missing(ADMIN_QUORUM_KEY))?;
+            let manifest = manifest.ok_or(Error::missing(PROVISION_MANIFEST))?;
+            if node_id.is_none() {
+                return Err(Error::missing(NODE_ID));
+            }
+            all.path(PROVISION_MANIFEST, &manifest.value, manifest.line)?;
+            Some(AdminServiceSettings {
+                ticket_age_max: value::seconds(ticket_age.value),
+                quorum: quorum.value,
+                provision_manifest: manifest.value,
+            })
+        } else {
+            // A setting of a service that is not configured is a mistake:
+            // refused, never silently ignored (fail closed).
+            if let Some(located) = ticket_age {
+                return Err(Error::at(
+                    located.line,
+                    ADMIN_TICKET_AGE_MAX,
+                    ErrorKind::IncompletePair,
+                ));
+            }
+            if let Some(located) = quorum {
+                return Err(Error::at(
+                    located.line,
+                    ADMIN_QUORUM_KEY,
+                    ErrorKind::IncompletePair,
+                ));
+            }
+            if let Some(located) = manifest {
+                return Err(Error::at(
+                    located.line,
+                    PROVISION_MANIFEST,
+                    ErrorKind::IncompletePair,
+                ));
+            }
+            None
+        };
         let internal_networks = doc
             .optional(INTERNAL_NETWORKS, |text| value::list(text, value::network))?
             .map_or_else(Vec::new, |located| located.value);
@@ -272,6 +401,9 @@ impl DirdSettings {
             kdc_channel,
             ldap_channel,
             admin_channel,
+            keyd,
+            node_id: node_id.map(|located| located.value),
+            admin_service,
             internal_networks,
             audit,
             frame_timeout,
@@ -357,6 +489,28 @@ impl DirdSettings {
     #[must_use]
     pub fn admin_channel(&self) -> Option<&Channel> {
         self.admin_channel.as_ref()
+    }
+
+    /// keyd's socket and uid, when configured: dird's admin service verifies
+    /// the administrators' AP-REQs through keyd as Role::Ldap (A-73).
+    /// Spec: docs/51 §4.6, §5.3 (option D), §7.4 step 1; A-73.
+    #[must_use]
+    pub fn keyd(&self) -> Option<&Endpoint> {
+        self.keyd.as_ref()
+    }
+
+    /// This DC's node-id, when configured (required with the admin
+    /// channel). Spec: docs/51 §4.6.
+    #[must_use]
+    pub const fn node_id(&self) -> Option<[u8; NODE_ID_OCTETS]> {
+        self.node_id
+    }
+
+    /// The admin service's settings, present exactly when the admin channel
+    /// is configured. Spec: docs/51 §5.5, §5.6, §7.
+    #[must_use]
+    pub fn admin_service(&self) -> Option<&AdminServiceSettings> {
+        self.admin_service.as_ref()
     }
 
     /// dird's zone table: peers inside these networks are `Internal`, all

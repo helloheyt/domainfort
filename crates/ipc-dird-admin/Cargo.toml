@@ -1,0 +1,66 @@
+# ipc-dird-admin — the admind ↔ dird admin channel (`dird-admin.sock`): its
+# message set, the typed requests and replies, the server-side decoding and
+# reply encoding dird's admin service uses, and admind's side of it — a
+# synchronous client that checks dird's uid before it sends anything
+# (docs/51 §7, R51-15; docs/50 §3.1-§3.7; decisions A-72, A-73).
+#
+# A library: no daemon, no listener, no directory. dird (crates/directory-
+# daemon) runs the write PEP (crates/directory-admin) behind it; admind
+# (task A9) links this crate as a client. THIS crate must never link
+# dirstore / redb / directory-pip / directory-admin, keyd or krb-crypto
+# (admind never opens the redb file; D182 — checked by
+# tests/no_store_dependency.rs).
+#
+# Provenance: written only from docs/51 §5, §7, docs/50 §3, §7.5, §9 and the
+# channel-magic registry, the decisions in docs/questions/PENDING-OWNER.md
+# (A-59, A-63, A-64, A-70, A-72, A-73, A-85, A-87, A-89), and the public API
+# of this workspace's crates. No other implementation was consulted or
+# recalled (AGENTS.md §1-3).
+
+[package]
+name = "ipc-dird-admin"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Our own workspace crates (path dependencies).
+#
+# The framing, the envelope, the field primitives and the shared `Refused`
+# reply (docs/50 §3.3; A-59).
+ipc = { path = "../ipc" }
+# `Guid` ([MS-DTYP] 2.3.4.2 packet form) and `Sid` ([MS-DTYP] 2.4.2.2,
+# strict decoding) of the replies.
+dtyp = { path = "../dtyp" }
+# keyd's crypto-free types: `KeyHandle`, `KeyPurpose`, `PrincipalId`,
+# `PrincipalBinding` — the `BeginPasswordSet` reply admind hands to keyd
+# `set_secret`. NOT keyd and NOT krb-crypto (D182; A-63).
+keyd-types = { path = "../keyd-types" }
+# Strict DER of `PrincipalName`; the KerberosString rules of a realm and a
+# salt (docs/50 §3.3: "Kerberos values ... decoded in krb-proto").
+krb-proto = { path = "../krb-proto" }
+# Only for `ipc_keyd::MAX_REQUEST_FIELD`, to which the AP-REQ field bound is
+# pinned at compile time (docs/51 §7.2, §7.5: "const assert against
+# ipc_keyd::MAX_REQUEST_FIELD" — dird forwards the AP-REQs to keyd as they
+# are). The client side of the keyd channel links no crypto (A-63).
+ipc-keyd = { path = "../ipc-keyd" }
+# RustCrypto `zeroize` (OD-9; already in the lock): the reply buffers of the
+# blocking socket are wiped (docs/50 §3.3 discipline).
+zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
+
+# rustix — owner decision P-12. Peer credentials of the client's blocking
+# Unix socket (docs/50 R50-3: "the client verifies that the server's uid is
+# the configured uid"; docs/51 §7.1). Linked, never copied; only its docs.rs
+# API pages were read (P-2). License as recorded in docs/50 §0.3 (MIT /
+# Apache-2.0 alternatives, AGENTS.md §7). Features per the docs.rs pages:
+# `net` (`socket_peercred`, "Available on linux_kernel and crate feature net
+# only"), `std` (the `AsFd` the function takes). Linux only: elsewhere the
+# peer check fails closed.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.6", default-features = false, features = ["std", "net"] }
+
+# No dev-dependency: the codec and client tests need only the crates above.
+# The tests that need dird behind the channel live in crates/directory-daemon.
+
+[lints]
+workspace = true

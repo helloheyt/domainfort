@@ -2,8 +2,11 @@
 //! `directory-daemon` (dird): the directory process — its **directory-view
 //! service** for the kdc (docs/50 §10 task P8; decision A-58) and its **LDAP
 //! service** for ldap-front (task P10: the LDAP engine, the PEP, hosted in
-//! dird — docs/50 R50-1, R50-10; docs/49 R49-16). The admin channel is task
-//! P13: its socket is not bound.
+//! dird — docs/50 R50-1, R50-10; docs/49 R49-16), and — when configured —
+//! its **admin service** for admind (task A8, docs/51 §7): `dird-admin.sock`,
+//! the write PEP (crates/directory-admin) on a dedicated admin thread, every
+//! AP-REQ verified through keyd under Role::Ldap (A-73), every decision
+//! acknowledged by auditd before the commit (A-85).
 //!
 //! dird is the only process that opens the redb file and holds the dirstore
 //! `IntegrityKey` (R50-2; Q-213 → A-57). The kdc asks it over
@@ -81,6 +84,9 @@
 //! | `daemon` | [`serve`], [`DaemonControl`], [`StoreSource`] |
 //! | [`startup`] | configuration, key file, policy file, socket directory, hardening plan |
 //! | [`log`] | fixed stderr messages (docs/50 §8.2) |
+//! | [`admin_service`] | the admin service's parameters, keyd verifier (Role::Ldap), key-set lookup, protected objects, message mapping (task A8) |
+//! | `admin_engine` | the admin thread: its bounded queue and the per-request steps of docs/51 §7.4 |
+//! | `admin_listener` | `dird-admin.sock`: admind's uid only, ≤ 2 connections, framing, deadlines |
 //!
 //! # Security
 //!
@@ -130,6 +136,9 @@
 //! Spec: docs/50 §10 (P8), R50-2, R50-3, R50-7, R50-14, R50-16, R50-17;
 //! docs/47 §8; A-57; A-58.
 
+mod admin_engine;
+mod admin_listener;
+pub mod admin_service;
 pub mod audit_link;
 pub mod clock;
 mod daemon;
@@ -144,12 +153,17 @@ pub mod rate;
 pub mod startup;
 pub mod zones;
 
+pub use admin_listener::admin_refused_peer_count;
+pub use admin_service::{
+    AdminParams, KeydTicketVerifier, NotStarted, TicketVerifier, VerifierFactory,
+    ADMIN_QUEUE_CAPACITY, DECISION_ACK_DEADLINE, MAX_ADMIN_CONNECTIONS,
+};
 pub use audit_link::{AuditEndpoint, AuditLinkError};
 pub use clock::{Clock, SharedClock, SystemClock};
 pub use daemon::{
-    serve, DaemonControl, DaemonError, DaemonParams, Stopped, StoreSource, AUDIT_FLUSH_GRACE,
-    DRAIN_GRACE, ENGINE_QUEUE_CAPACITY, LDAP_QUEUE_CAPACITY, MAX_KDC_CONNECTIONS,
-    MAX_LDAP_SESSIONS, MAX_OPEN_VIEWS, SOCKET_FILE_MODE,
+    serve, serve_with_admin, DaemonControl, DaemonError, DaemonParams, Stopped, StoreSource,
+    AUDIT_FLUSH_GRACE, DRAIN_GRACE, ENGINE_QUEUE_CAPACITY, LDAP_QUEUE_CAPACITY,
+    MAX_KDC_CONNECTIONS, MAX_LDAP_SESSIONS, MAX_OPEN_VIEWS, SOCKET_FILE_MODE,
 };
 pub use engine::{DirectoryEngine, EngineError, EngineHandle, EnginePanicked, EngineThread};
 pub use ldap_engine::{LdapEngineHandle, LdapService, MAX_LDAP_QUEUE_CAPACITY};

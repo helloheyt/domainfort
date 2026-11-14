@@ -44,6 +44,11 @@
 //! §3.6, §6.4, §7.4, §7.5, §8.1; docs/questions/Q-213 (A-57), Q-252 item 9
 //! (A-64), Q-270, Q-313 (A-82).
 
+use crate::admin_engine::AdminWorker;
+use crate::admin_listener::{self, AdminServeContext};
+use crate::admin_service::{
+    admin_service_handle, check_manifest, protected_objects, AdminParams, NotStarted,
+};
 use crate::audit_link::{self, AuditEndpoint, AuditLinkError};
 use crate::clock::SharedClock;
 use crate::engine::{DirectoryEngine, EngineError, EnginePanicked, EngineThread};
@@ -69,6 +74,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::UnixListener;
 use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 /// Jobs the engine queue holds before new requests are answered `Busy`.
@@ -308,6 +314,7 @@ impl DaemonControl {
 pub struct Stopped {
     engine: EngineThread,
     ldap_engine: EngineThread,
+    admin_engine: Option<EngineThread>,
     engine_failed: bool,
     unacknowledged: usize,
 }
@@ -328,14 +335,16 @@ impl Stopped {
         self.unacknowledged
     }
 
-    /// Wait for both engine threads; call after the runtime was dropped.
+    /// Wait for the engine threads (the admin thread too, if the admin
+    /// service ran); call after the runtime was dropped.
     ///
     /// # Errors
-    /// [`EnginePanicked`] if either unwound.
+    /// [`EnginePanicked`] if any unwound.
     pub fn join(self) -> Result<(), EnginePanicked> {
         let directory = self.engine.join();
         let ldap = self.ldap_engine.join();
-        directory.and(ldap)
+        let admin = self.admin_engine.map_or(Ok(()), EngineThread::join);
+        directory.and(ldap).and(admin)
     }
 }
 
@@ -393,11 +402,105 @@ async fn wait_until(grace: Duration, done: impl Fn() -> bool) {
     }
 }
 
+/// A running admin service.
+struct AdminRunning {
+    context: Arc<AdminServeContext>,
+    accept: JoinHandle<()>,
+    thread: EngineThread,
+    socket: PathBuf,
+}
+
+/// Start the admin service (docs/51 §7, task A8): check the manifest
+/// against dird's domain, build the PEP's view of the loaded policy, find
+/// the admin service's key set in the directory (A-73), build the write PEP
+/// with the protected objects, start the admin thread, bind
+/// `dird-admin.sock`, accept. Any failure ⇒ [`NotStarted`]: dird's other
+/// services run regardless (docs/51 §4.6).
+/// Spec: docs/51 §4.6, §5.3, §7.1, §7.5; A-73; docs/questions/Q-386.
+fn start_admin(
+    admin: AdminParams,
+    params: &DaemonParams,
+    store: &Arc<Store>,
+    policy: &DevelopmentPolicy,
+    gate: &Arc<AuditGate>,
+    state: &Arc<ControlState>,
+) -> Result<AdminRunning, NotStarted> {
+    let factory = admin.keyd.clone().ok_or(NotStarted::NoKeyd)?;
+    check_manifest(
+        &admin.manifest,
+        &params.keyd.realm,
+        &params.naming_context,
+        &params.dns_host_name,
+    )?;
+    let schema = ad_schema::phase1().map_err(|_| NotStarted::Configuration)?;
+    let ctx = DirectoryContext::new(schema.clone(), &params.keyd, params.naming_context.clone())
+        .map_err(|_| NotStarted::Configuration)?;
+    let tiers = tier_map(policy).map_err(|_| NotStarted::Configuration)?;
+    let snapshot = policy.snapshot().map_err(|_| NotStarted::Configuration)?;
+    let service = {
+        let view = ctx
+            .view(store, &tiers)
+            .map_err(|_| NotStarted::DirectoryUnreadable)?;
+        admin_service_handle(&view, &admin.manifest)?
+    };
+    let config = directory_admin::AdminConfig::new(
+        admin.ticket_age_max,
+        admin.quorum,
+        params.keyd.realm.clone(),
+        params.naming_context.clone(),
+        admin.node_id,
+        protected_objects(&admin.manifest, policy),
+    )
+    .map_err(|_| NotStarted::Configuration)?;
+    let pep =
+        directory_admin::DirectoryAdmin::new(config, &schema, directory_admin::OsRandom::new())
+            .map_err(|_| NotStarted::Configuration)?;
+    let verifier = factory().ok_or(NotStarted::NoKeyd)?;
+    let worker = AdminWorker {
+        store: Arc::clone(store),
+        ctx,
+        tiers,
+        policy: snapshot,
+        admin: pep,
+        verifier,
+        service,
+        gate: Arc::clone(gate),
+        clock: params.clock.clone(),
+        ack_deadline: admin.ack_deadline,
+    };
+    let ended = Arc::clone(state);
+    let (handle, thread) = worker
+        .spawn(admin.queue_capacity, move || {
+            ended.engine_ended.store(true, Ordering::SeqCst);
+            ended.stopping.store(true, Ordering::SeqCst);
+            ended.stop.notify_one();
+        })
+        .map_err(|_| NotStarted::Spawn)?;
+    let listener = match bind(&admin.socket) {
+        Ok(listener) => listener,
+        Err(_) => {
+            drop(handle);
+            let _ = thread.join();
+            return Err(NotStarted::Bind);
+        }
+    };
+    let context = Arc::new(AdminServeContext::new(
+        admin.admind_uid,
+        params.frame_timeout,
+        admin.max_connections,
+        handle,
+    ));
+    let accept = tokio::spawn(admin_listener::accept_loop(listener, Arc::clone(&context)));
+    Ok(AdminRunning {
+        context,
+        accept,
+        thread,
+        socket: admin.socket,
+    })
+}
+
 /// Run dird's directory-view service and its LDAP service until
-/// [`DaemonControl::stop`] (module documentation).
-///
-/// Must run inside a tokio runtime with I/O and time enabled, built after
-/// the process hardening.
+/// [`DaemonControl::stop`] (module documentation); no admin service.
 ///
 /// # Errors
 /// [`DaemonError`] for a start-up failure (nothing is listening then).
@@ -406,6 +509,31 @@ async fn wait_until(grace: Duration, done: impl Fn() -> bool) {
 /// §4.2, §7.5, §8.1.
 pub async fn serve(
     params: DaemonParams,
+    source: StoreSource,
+    policy: DevelopmentPolicy,
+    control: DaemonControl,
+) -> Result<Stopped, DaemonError> {
+    serve_with_admin(params, None, source, policy, control).await
+}
+
+/// [`serve`], plus — when `admin` is given — the admin service on
+/// `dird-admin.sock` (docs/51 §7, task A8). The admin service is optional:
+/// when it cannot start (no keyd endpoint, the admin service object absent,
+/// a manifest of another domain, the socket path occupied, …) dird logs why
+/// and runs its other services (docs/51 §4.6).
+///
+/// Must run inside a tokio runtime with I/O and time enabled, built after
+/// the process hardening.
+///
+/// # Errors
+/// [`DaemonError`] for a start-up failure of the directory-view or LDAP
+/// service (nothing is listening then).
+///
+/// Spec: docs/50 R50-2, R50-7, R50-10, R50-14, R50-16, R50-17, §3.1, §3.4,
+/// §4.2, §7.5, §8.1; docs/51 §4.6, §7.
+pub async fn serve_with_admin(
+    params: DaemonParams,
+    admin: Option<AdminParams>,
     source: StoreSource,
     policy: DevelopmentPolicy,
     control: DaemonControl,
@@ -458,7 +586,7 @@ pub async fn serve(
     let gate = Arc::new(AuditGate::new(params.audit_window));
     gate.set_reachable(true);
     let service = LdapService {
-        store,
+        store: Arc::clone(&store),
         ctx: ldap_ctx,
         tiers: ldap_tiers,
         policy: snapshot,
@@ -536,6 +664,22 @@ pub async fn serve(
         ldap_listener,
         Arc::clone(&ldap_context),
     ));
+    // The admin service (task A8), optional: a failure is logged and dird
+    // serves on without it (docs/51 §4.6).
+    let admin_running = match admin {
+        None => None,
+        Some(admin) => match start_admin(admin, &params, &store, &policy, &gate, &control.state) {
+            Ok(running) => {
+                note(Note::AdminListening, None);
+                Some(running)
+            }
+            Err(reason) => {
+                note(Note::AdminNotStarted, Some(reason.code()));
+                None
+            }
+        },
+    };
+    drop(store);
     control.state.serving.store(true, Ordering::SeqCst);
     note(Note::Listening, None);
     note(Note::LdapListening, None);
@@ -547,11 +691,26 @@ pub async fn serve(
     ldap_accept_task.abort();
     let _ = accept_task.await;
     let _ = ldap_accept_task.await;
+    let admin_parts = match admin_running {
+        Some(running) => {
+            running.accept.abort();
+            let _ = running.accept.await;
+            Some((running.context, running.thread, running.socket))
+        }
+        None => None,
+    };
     control.state.serving.store(false, Ordering::SeqCst);
     context.start_draining();
     ldap_context.start_draining();
+    if let Some((admin_context, _, _)) = admin_parts.as_ref() {
+        admin_context.start_draining();
+    }
     wait_until(DRAIN_GRACE, || {
-        context.in_flight() == 0 && ldap_context.in_flight() == 0
+        context.in_flight() == 0
+            && ldap_context.in_flight() == 0
+            && admin_parts
+                .as_ref()
+                .is_none_or(|(admin_context, _, _)| admin_context.in_flight() == 0)
     })
     .await;
     // Q-313 (A-82: "waits, bounded, for auditd's acknowledgement of every
@@ -573,6 +732,10 @@ pub async fn serve(
     }
     let _ = std::fs::remove_file(&params.kdc_socket);
     let _ = std::fs::remove_file(&params.ldap_socket);
+    let admin_engine = admin_parts.map(|(_, thread, socket)| {
+        let _ = std::fs::remove_file(&socket);
+        thread
+    });
     let engine_failed = control.state.engine_ended.load(Ordering::SeqCst);
     if engine_failed {
         note(Note::EngineStopped, None);
@@ -581,6 +744,7 @@ pub async fn serve(
     Ok(Stopped {
         engine: engine_thread,
         ldap_engine: ldap_thread,
+        admin_engine,
         engine_failed,
         unacknowledged,
     })

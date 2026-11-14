@@ -7,6 +7,10 @@
 //! §7.4, §7.5; docs/questions/Q-213, Q-219 (A-57), Q-230 (A-60), Q-235
 //! (A-61), Q-270.
 
+use crate::admin_service::{
+    AdminParams, KeydTicketVerifier, TicketVerifier, VerifierFactory, ADMIN_QUEUE_CAPACITY,
+    DECISION_ACK_DEADLINE, MAX_ADMIN_CONNECTIONS,
+};
 use crate::audit_link::AuditEndpoint;
 use crate::clock::SharedClock;
 use crate::daemon::{
@@ -27,6 +31,7 @@ use std::fs::File;
 use std::io::Read;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::Path;
+use std::sync::Arc;
 use zeroize::Zeroizing;
 
 /// Open files beyond the kdc's connection quota and the LDAP session bound:
@@ -82,6 +87,12 @@ pub enum StartupError {
     /// The socket directory could not be created or handed to dird's
     /// account.
     SocketDirectoryCreate,
+    /// The provisioning manifest was refused (unreadable, not root-owned,
+    /// writable by group or others, too large, or its content).
+    Manifest(String),
+    /// The admin channel is configured without the settings it requires
+    /// (the configuration refuses this; kept as a fail-closed guard).
+    AdminSettings,
 }
 
 impl fmt::Display for StartupError {
@@ -111,6 +122,10 @@ impl fmt::Display for StartupError {
             ),
             StartupError::SocketDirectoryCreate => {
                 f.write_str("dird-kdc socket directory could not be created")
+            }
+            StartupError::Manifest(error) => write!(f, "provisioning manifest refused: {error}"),
+            StartupError::AdminSettings => {
+                f.write_str("admin channel configured without its required settings")
             }
         }
     }
@@ -241,10 +256,15 @@ pub fn read_policy(path: &Path, owner: u32) -> Result<DevelopmentPolicy, Startup
 /// Spec: docs/50 §3.1, §6.2; docs/questions/Q-260 item 6 (the group is not
 /// a setting).
 pub fn prepare_socket_directory(settings: &DirdSettings) -> Result<(), StartupError> {
+    let admin_socket = settings.admin_channel().map(config::Channel::socket);
     for socket in [
-        settings.kdc_channel().socket(),
-        settings.ldap_channel().socket(),
-    ] {
+        Some(settings.kdc_channel().socket()),
+        Some(settings.ldap_channel().socket()),
+        admin_socket,
+    ]
+    .into_iter()
+    .flatten()
+    {
         let directory = socket
             .as_path()
             .parent()
@@ -344,4 +364,74 @@ pub fn params(settings: &DirdSettings) -> Result<DaemonParams, StartupError> {
         audit_window: WindowConfig::DEFAULT,
         clock: SharedClock::system(),
     })
+}
+
+/// Read the provisioning manifest (docs/51 §4.3 step 8) through the shared
+/// reader of crate provision-manifest — a regular file owned by root, not
+/// writable by group or others, bounded, strictly parsed — as root before
+/// the drop. Read only when the admin channel is configured.
+///
+/// # Errors
+/// [`StartupError::Manifest`] (no file content).
+///
+/// Spec: docs/51 §4.3 step 8; docs/50 §7.1; docs/questions/Q-386.
+pub fn read_provision_manifest(path: &Path) -> Result<provision_manifest::Manifest, StartupError> {
+    provision_manifest::read_manifest(path)
+        .map_err(|error| StartupError::Manifest(error.to_string()))
+}
+
+/// The admin service's parameters (task A8), when the admin channel is
+/// configured: the socket and admind's uid, keyd's endpoint as a verifier
+/// factory (ipc-keyd's Unix connector, keyd's uid, the keyd channel's 2 s
+/// deadline — Role::Ldap, A-73), the ticket-age threshold, the quorum, the
+/// node-id, the manifest, and the daemon's constants for the connection
+/// bound, the queue and the acknowledgement wait.
+///
+/// # Errors
+/// [`StartupError::Realm`], [`StartupError::AdminSettings`].
+///
+/// Spec: docs/51 §4.6, §5.5, §5.6, §7.1, §7.5; A-73; P-22;
+/// docs/questions/Q-385.
+pub fn admin_params(
+    settings: &DirdSettings,
+    manifest: Option<provision_manifest::Manifest>,
+) -> Result<Option<AdminParams>, StartupError> {
+    let Some(channel) = settings.admin_channel() else {
+        return Ok(None);
+    };
+    let service = settings
+        .admin_service()
+        .ok_or(StartupError::AdminSettings)?;
+    let node_id = settings.node_id().ok_or(StartupError::AdminSettings)?;
+    let manifest = manifest.ok_or(StartupError::AdminSettings)?;
+    let quorum = usize::try_from(service.quorum()).map_err(|_| StartupError::AdminSettings)?;
+    let realm = Realm::new(settings.realm()).map_err(|_| StartupError::Realm)?;
+    let keyd: Option<VerifierFactory> = settings.keyd().map(|endpoint| {
+        let path = endpoint.socket().as_path().to_path_buf();
+        let uid = endpoint.uid();
+        let factory: VerifierFactory = Arc::new(move || {
+            let client = ipc_keyd::KeydClient::new(
+                ipc_keyd::UnixConnector::new(path.clone()),
+                uid,
+                ipc_keyd::DEFAULT_DEADLINE,
+            )
+            .ok()?;
+            let verifier: Box<dyn TicketVerifier> =
+                Box::new(KeydTicketVerifier::new(client, realm.clone()));
+            Some(verifier)
+        });
+        factory
+    });
+    Ok(Some(AdminParams {
+        socket: channel.socket().as_path().to_path_buf(),
+        admind_uid: channel.peer_uid(),
+        keyd,
+        ticket_age_max: service.ticket_age_max(),
+        quorum,
+        node_id: dirstore::NodeId(node_id),
+        manifest,
+        max_connections: MAX_ADMIN_CONNECTIONS,
+        queue_capacity: ADMIN_QUEUE_CAPACITY,
+        ack_deadline: DECISION_ACK_DEADLINE,
+    }))
 }

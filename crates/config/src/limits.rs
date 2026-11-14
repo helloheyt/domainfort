@@ -81,6 +81,40 @@ impl Bound {
 /// Spec: docs/50 §3.6 ("a frame that has started must finish within 5 s").
 pub const FRAME_TIMEOUT_SECS: Bound = Bound::up_to(5);
 
+/// The admin plane's ticket-age threshold (`admin_ticket_age_max`): an
+/// administrator's ticket whose age (`now − authtime`, the time of the
+/// initial authentication) is above it is refused. Required whenever dird's
+/// admin channel is configured — no default is ever used (the `default`
+/// field below only fills the struct). Range 60 s ..= 3600 s:
+/// * the ceiling — docs/51 §5.5 (R51-10, JIT in phase 1: "no admin session;
+///   every operation carries its own AP-REQ … dird refuses `ticket_age`
+///   above a threshold (project choice ⚠, e.g. minutes)"): one hour bounds
+///   how long after an interactive login (authtime does not move when a
+///   ticket is renewed, RFC 4120 §5.3) an administrator may still act
+///   without authenticating again;
+/// * the floor — below a minute an administrator cannot obtain a TGT and a
+///   service ticket and send the operation.
+///
+/// Spec: docs/51 §5.5 (R51-10), §7.4 step 2; docs/questions/Q-385 item 4.
+pub const ADMIN_TICKET_AGE_MAX_SECS: Bound = Bound {
+    min: 60,
+    max: 3600,
+    default: 3600,
+};
+
+/// The dual-control quorum (`admin_quorum`): the requester plus approvers a
+/// dual-controlled operation needs. 2 ..= 3 — no single-administrator mode
+/// (P-22 item 3), at most the requester plus the two approvals a request
+/// carries (docs/51 §7.2). Required whenever the admin channel is
+/// configured (P-22 recommends 2).
+/// Spec: docs/51 §5.6 (R51-11), §7.2; P-22 (Q-295); crates/directory-admin
+/// `MIN_QUORUM`, `MAX_QUORUM`.
+pub const ADMIN_QUORUM: Bound = Bound {
+    min: 2,
+    max: 3,
+    default: 2,
+};
+
 /// A client's deadline for an answer on the keyd channel: 2 s.
 /// Spec: docs/50 §3.6 ("deadline in the client — keyd: 2 s").
 pub const KEYD_DEADLINE_SECS: Bound = Bound::up_to(2);
