@@ -33,7 +33,8 @@ use ipc_audit::{
 use ipc_keyd::{Answer, Call, KeydReply, KEYD_CHANNEL, REPLY_LIMIT};
 use keyd::{EntropySource, KeyStore, Keyd};
 use keyd_daemon::{
-    serve, AuditEndpoint, CallerMap, Clock, DaemonControl, DaemonParams, RecordBuffer,
+    serve, AuditEndpoint, CallerMap, Clock, DaemonControl, DaemonParams, IntentAckBudget,
+    RecordBuffer,
 };
 use krb_proto::KerberosTime;
 use std::io::{ErrorKind, Read, Write};
@@ -244,7 +245,9 @@ fn serve_audit(mut stream: UnixStream, events: &Mutex<Vec<EventBody>>) {
 }
 
 /// The parameters of a test daemon in `dir`: keyd at `k.sock`, auditd at
-/// `a.sock` running as `auditd_uid`, `frame_timeout` 1 s, quota 8.
+/// `a.sock` running as `auditd_uid`, `frame_timeout` 1 s, quota 8, the
+/// production intent budget (a test whose own client waits longer may raise
+/// it, up to the ceiling — docs/questions/Q-415).
 pub fn params(dir: &TempDir, callers: CallerMap, auditd_uid: u32) -> DaemonParams {
     DaemonParams {
         keyd_socket: dir.join("k.sock"),
@@ -257,6 +260,7 @@ pub fn params(dir: &TempDir, callers: CallerMap, auditd_uid: u32) -> DaemonParam
         max_connections_per_uid: 8,
         queue_capacity: 16,
         window: ipc_audit::WindowConfig::DEFAULT,
+        intent_ack_budget: IntentAckBudget::PRODUCTION,
     }
 }
 

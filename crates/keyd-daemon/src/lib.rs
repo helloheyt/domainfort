@@ -38,7 +38,9 @@
 //! `create_key`, `rotate_key`, `rotate_krbtgt`, `retire_kvno`,
 //! `destroy_key_set`) that keyd's authorization step admits takes the A-86
 //! path instead: reserve two slots or `Busy` → commit the **intent** record
-//! → wait (≤ [`INTENT_ACK_BUDGET`] from queueing) for auditd to
+//! → wait (≤ the daemon's [`IntentAckBudget`] from queueing —
+//! [`INTENT_ACK_BUDGET`] in production, never above
+//! [`MAX_INTENT_ACK_BUDGET`]) for auditd to
 //! **acknowledge** it, else a `NotPerformed` record and `Unavailable`, keyd
 //! not called → keyd → commit keyd's record (the outcome) → reply with the
 //! true result, even if that record could not be committed (the gap is
@@ -83,7 +85,8 @@
 //!   Q-230 item 4; Q-260 item 7).
 //! - The engine's thread-count guard has the residual of Q-235 item 2.
 //! - A key-state change waits on the engine thread for its intent's
-//!   acknowledgement (≤ [`INTENT_ACK_BUDGET`]); Kerberos requests queued
+//!   acknowledgement (≤ the budget, [`INTENT_ACK_BUDGET`] in production;
+//!   there is no configuration key for it); Kerberos requests queued
 //!   behind it wait that long too (A-86; Q-365). A caller whose reply is
 //!   lost or later than its own deadline still cannot tell a performed
 //!   change from an unperformed one — the log can (intent + outcome).
@@ -121,10 +124,14 @@
 //! Condvar` from the Rust standard library. Nothing else was consulted.
 //! Counting a lost outcome into the window's summary (decision A-88, task
 //! F4) was written only from PENDING-OWNER (A-88), docs/questions Q-366,
-//! docs/50 §8, docs/37 and the public API of ipc-audit `SendWindow`.
+//! docs/50 §8, docs/37 and the public API of ipc-audit `SendWindow`. The
+//! budget as a daemon parameter with a ceiling (A-93's follow-up, task F5)
+//! was written only from PENDING-OWNER (A-88, A-93), docs/questions Q-365,
+//! docs/50 §3.6 and the public constants of ipc-keyd (`DEFAULT_DEADLINE`)
+//! and config (`limits::KEYD_DEADLINE_SECS`).
 //!
 //! Spec: docs/50 §10 (P7), R50-3, R50-5, R50-6, R50-7, R50-14, R50-16,
-//! R50-17, R50-18; docs/10; A-56; A-57; A-62; A-64; A-86; A-88.
+//! R50-17, R50-18; docs/10; A-56; A-57; A-62; A-64; A-86; A-88; A-93.
 
 pub mod audit;
 pub mod audit_client;
@@ -148,5 +155,6 @@ pub use daemon::{
     ENGINE_QUEUE_CAPACITY, SOCKET_FILE_MODE,
 };
 pub use engine::{
-    EngineError, EngineHandle, EnginePanicked, EngineThread, INTENT_ACK_BUDGET, MAX_QUEUE_CAPACITY,
+    EngineError, EngineHandle, EnginePanicked, EngineThread, IntentAckBudget,
+    IntentAckBudgetOutOfRange, INTENT_ACK_BUDGET, MAX_INTENT_ACK_BUDGET, MAX_QUEUE_CAPACITY,
 };

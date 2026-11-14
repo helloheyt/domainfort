@@ -1029,14 +1029,15 @@ impl<R: RandomSource> DirectoryAdmin<R> {
 
     /// `AddMember` / `RemoveMember`: `DirWrite(member)` on the group; the
     /// membership rules of [MS-SAMR] 3.1.1.8.9 (native mode), the cycle
-    /// refusal, at most 4096 members, and no nesting chain deeper than group
-    /// expansion honours (16 levels — `Cx::nesting_allowed`); never krbtgt,
+    /// refusal, at most 4096 members, and no closure group expansion could
+    /// not compute — no nesting chain deeper than 16 levels and no closure
+    /// of more than 1024 groups (`Cx::expansion_allowed`); never krbtgt,
     /// a DC account, a service object or the NC root as the member; dual
     /// control when the group is explicitly Tier0; a removal passes the
     /// self-lockout guard. Adding a present member or removing an absent one
-    /// is refused, not a no-op (docs/questions/Q-356 items 2-5).
+    /// is refused, not a no-op (docs/questions/Q-356 items 2-5, Q-416).
     /// Spec: docs/51 §5.2 row 8, §5.6, §11; docs/46 §2.3 item 5; docs/47
-    /// §5.3 items 3-4; A-79; P-22.
+    /// §5.3 items 1, 3-4; A-79; A-89; P-22.
     fn membership(
         &self,
         ctx: &OpCx<'_, '_, '_, '_>,
@@ -1068,7 +1069,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                 || !cx.member_allowed(group_type, &member)?
                 || members.len() >= MAX_VALUES_PER_ATTRIBUTE
                 || cx.closes_cycle(group.guid, member.guid)?
-                || !cx.nesting_allowed(&group, &member)?
+                || !cx.expansion_allowed(&group, &member)?
             {
                 return Err(Stop::Refused(AdminRefusal::MembershipInvalid));
             }

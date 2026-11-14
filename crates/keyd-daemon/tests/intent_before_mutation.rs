@@ -11,6 +11,20 @@
 //! uid is the keyd caller (one role per daemon), keyd's audit source and
 //! auditd's expected uid.
 //!
+//! **The budget** (decision A-93's follow-up F5, docs/questions/Q-415): the
+//! tests in which the real auditd is expected to acknowledge give the daemon
+//! the ceiling, [`MAX_INTENT_ACK_BUDGET`], so that a loaded machine writing
+//! auditd's log late rarely turns the wait into `Unavailable`. The A-88 rule
+//! then holds against this test's own client: [`RawClient`] waits 10 s for a
+//! reply, more than twice the ceiling. The ceiling is a hard bound, and a
+//! heavily loaded machine was seen to need more (an acknowledgement later
+//! than 2 s), so these tests also retry an `Unavailable` change (A-86: it was
+//! not done) and require every refused attempt in the verified log as its
+//! intent and a `NotPerformed` outcome, before the performed one's intent
+//! and keyd's outcome. The test that times the expiry keeps the short
+//! production budget with an auditd that never acknowledges (deterministic),
+//! and retries the same way against the healthy auditd that follows.
+//!
 //! Every test names its source. Every value is constructed by hand for these
 //! tests; no vector comes from any other implementation.
 
@@ -32,7 +46,9 @@ use ipc_keyd::{Answer, Call, Password};
 use keyd::{CallerId, Error, KeyHandle, KeyPurpose, Kvno, PrincipalBinding, PrincipalId, Role};
 use keyd_daemon::audit::MAX_RECORDS_PER_OPERATION;
 use keyd_daemon::startup::development_keyd;
-use keyd_daemon::{CallerMap, SystemClock, INTENT_ACK_BUDGET};
+use keyd_daemon::{
+    CallerMap, IntentAckBudget, SystemClock, INTENT_ACK_BUDGET, MAX_INTENT_ACK_BUDGET,
+};
 use krb_proto::{KerberosString, KerberosTime, PrincipalName, Realm};
 use std::fs::File;
 use std::io::{BufReader, ErrorKind, Read, Write};
@@ -103,10 +119,18 @@ fn start_auditd(dir: &TempDir, uid: u32, log: &str, acknowledging: bool) -> audi
     )
 }
 
+/// The budget of a daemon whose test expects auditd to acknowledge: the
+/// ceiling (module documentation; docs/questions/Q-415).
+fn generous() -> IntentAckBudget {
+    IntentAckBudget::new(MAX_INTENT_ACK_BUDGET).unwrap()
+}
+
 /// keyd with the development store on the system clock (Admin and Directory
-/// calls are not held, docs/10 §11), the test's uid holding `role`.
-fn start_keyd(dir: &TempDir, uid: u32, role: Role) -> Daemon {
-    let params = params(dir, CallerMap::new(&[(uid, role)]).unwrap(), uid);
+/// calls are not held, docs/10 §11), the test's uid holding `role`, with the
+/// intent budget `budget`.
+fn start_keyd(dir: &TempDir, uid: u32, role: Role, budget: IntentAckBudget) -> Daemon {
+    let mut params = params(dir, CallerMap::new(&[(uid, role)]).unwrap(), uid);
+    params.intent_ack_budget = budget;
     Daemon::start(params, SystemClock, development_keyd(realm())).unwrap()
 }
 
@@ -196,16 +220,25 @@ fn phases(records: &[KeydRecord]) -> Vec<(KeydOperation, KeydOutcome, Option<u32
     records.iter().map(|r| (r.op, r.result, r.kvno)).collect()
 }
 
-/// Call until the answer is not `Busy` (keyd's audit connection is coming
-/// back; `Busy` means "not done", so retrying is safe), bounded.
-fn call_until_served(client: &mut RawClient, call: &Call) -> Result<Answer, Refused> {
+/// Call `call` on keyd at `socket` until it is performed, bounded: `Busy`
+/// (keyd's audit connection is coming back) and `Unavailable` (an intent
+/// not acknowledged within the short budget — a loaded machine) both mean
+/// "not done" (A-86), so retrying is safe. `Unavailable` closes the
+/// connection, so the next attempt opens another. Returns the last answer and
+/// how many attempts were answered `Unavailable`.
+fn call_until_performed(socket: &Path, call: &Call) -> (Result<Answer, Refused>, usize) {
     let start = Instant::now();
+    let mut unacknowledged = 0;
+    let mut client = RawClient::connect(socket);
     loop {
+        let retry = start.elapsed() < Duration::from_secs(20);
         match client.call(call).expect("a reply") {
-            Err(Refused::Busy) if start.elapsed() < Duration::from_secs(20) => {
-                std::thread::sleep(Duration::from_millis(50));
+            Err(Refused::Busy) if retry => std::thread::sleep(Duration::from_millis(50)),
+            Err(Refused::Unavailable) if retry => {
+                unacknowledged += 1;
+                client = RawClient::connect(socket);
             }
-            other => return other,
+            other => return (other, unacknowledged),
         }
     }
 }
@@ -213,13 +246,38 @@ fn call_until_served(client: &mut RawClient, call: &Call) -> Result<Answer, Refu
 use KeydOperation as Op;
 use KeydOutcome as Out;
 
+/// The log phases of one key-state change that took `unacknowledged`
+/// refused attempts before it was performed with `outcome` (kvno
+/// `kvno`): each refused attempt is its intent and a `NotPerformed`
+/// outcome (A-86), then the performed one's intent and keyd's outcome.
+/// `intent_kvno` is the kvno an intent names (`retire_kvno` only).
+fn change_phases(
+    op: KeydOperation,
+    unacknowledged: usize,
+    intent_kvno: Option<u32>,
+    outcome: KeydOutcome,
+    kvno: Option<u32>,
+) -> Vec<(KeydOperation, KeydOutcome, Option<u32>)> {
+    let mut phases = Vec::new();
+    for _ in 0..unacknowledged {
+        phases.push((op, Out::Intent, intent_kvno));
+        phases.push((op, Out::NotPerformed, intent_kvno));
+    }
+    phases.push((op, Out::Intent, intent_kvno));
+    phases.push((op, outcome, kvno));
+    phases
+}
+
 /// docs/questions/Q-346 (A-86: "auditd up ⇒ intent then outcome records,
 /// both in the verified log, in order"), with every Admin key-state change
 /// (docs/10 §7): each answered with its true result, and in the verified
 /// log each intent (outcome `Intent`, reason `None`, the handle, the kvno a
 /// `retire_kvno` names) directly followed by keyd's own outcome. A refused
 /// authorization (Admin may not `set_secret`, docs/10 §2) is one record and
-/// no intent.
+/// no intent. On a loaded machine an acknowledgement may still miss the
+/// budget: such an attempt is answered `Unavailable`, retried, and must be
+/// in the log as its intent and a `NotPerformed` outcome — the true results
+/// (kvno 2 after the rotation, …) show it changed nothing (Q-415).
 #[test]
 fn every_admin_change_is_intent_then_outcome_in_the_verified_log() {
     let dir = TempDir::new();
@@ -228,63 +286,92 @@ fn every_admin_change_is_intent_then_outcome_in_the_verified_log() {
         return;
     }
     let auditd = start_auditd(&dir, uid, "audit.log", true);
-    let keyd = start_keyd(&dir, uid, Role::Admin);
-    let mut client = RawClient::connect(&keyd.socket);
-    assert!(matches!(
-        client.call(&create_key(0xA1)),
-        Some(Ok(Answer::CreateKey(Ok(kvno)))) if kvno == Kvno::INITIAL
-    ));
-    assert!(matches!(
-        client.call(&Call::RotateKey { handle: handle(0xA1) }),
-        Some(Ok(Answer::RotateKey(Ok(kvno)))) if kvno == Kvno::new(2)
-    ));
-    assert!(matches!(
-        client.call(&Call::RetireKvno {
-            handle: handle(0xA1),
-            kvno: Kvno::INITIAL
-        }),
-        Some(Ok(Answer::RetireKvno(Ok(()))))
-    ));
-    assert!(matches!(
-        client.call(&Call::DestroyKeySet {
-            handle: handle(0xA1)
-        }),
-        Some(Ok(Answer::DestroyKeySet(Ok(()))))
-    ));
-    assert!(matches!(
-        client.call(&set_secret(0xA1)),
-        Some(Ok(Answer::SetSecret(Err(Error::Denied))))
-    ));
+    let keyd = start_keyd(&dir, uid, Role::Admin, generous());
+    let socket = keyd.socket.clone();
+    let (answer, created) = call_until_performed(&socket, &create_key(0xA1));
+    assert!(
+        matches!(&answer, Ok(Answer::CreateKey(Ok(kvno))) if *kvno == Kvno::INITIAL),
+        "{answer:?}"
+    );
+    let rotate = Call::RotateKey {
+        handle: handle(0xA1),
+    };
+    let (answer, rotated) = call_until_performed(&socket, &rotate);
+    assert!(
+        matches!(&answer, Ok(Answer::RotateKey(Ok(kvno))) if *kvno == Kvno::new(2)),
+        "{answer:?}"
+    );
+    let retire = Call::RetireKvno {
+        handle: handle(0xA1),
+        kvno: Kvno::INITIAL,
+    };
+    let (answer, retired) = call_until_performed(&socket, &retire);
+    assert!(
+        matches!(&answer, Ok(Answer::RetireKvno(Ok(())))),
+        "{answer:?}"
+    );
+    let destroy = Call::DestroyKeySet {
+        handle: handle(0xA1),
+    };
+    let (answer, destroyed) = call_until_performed(&socket, &destroy);
+    assert!(
+        matches!(&answer, Ok(Answer::DestroyKeySet(Ok(())))),
+        "{answer:?}"
+    );
+    // An authorization refusal takes no intent and never waits.
+    let answer = RawClient::connect(&socket).call(&set_secret(0xA1));
+    assert!(
+        matches!(&answer, Some(Ok(Answer::SetSecret(Err(Error::Denied))))),
+        "{answer:?}"
+    );
     // keyd waits (bounded) for auditd to acknowledge its window at stop.
     keyd.stop().unwrap();
     assert!(matches!(auditd.stop(), Some(Ok(()))));
 
     let records = keyd_records(&verified_log(&dir.join("audit.log")), uid);
-    assert_eq!(
-        phases(&records),
-        [
-            (Op::CreateKey, Out::Intent, None),
-            (Op::CreateKey, Out::Success, Some(1)),
-            (Op::RotateKey, Out::Intent, None),
-            (Op::RotateKey, Out::Success, Some(2)),
-            (Op::RetireKvno, Out::Intent, Some(1)),
-            (Op::RetireKvno, Out::Success, Some(1)),
-            (Op::DestroyKeySet, Out::Intent, None),
-            (Op::DestroyKeySet, Out::Success, Some(2)),
-            (Op::SetSecret, Out::Denied, None),
-        ]
-    );
-    for intent in records.iter().filter(|r| r.result == Out::Intent) {
-        assert_eq!(intent.reason, KeydReason::None);
-        assert_eq!(intent.caller_uid, uid);
-        assert_eq!(intent.principal, Some([0xA1; 16]));
-        assert_eq!(intent.purpose, Some(KeyPurposeCode::PrincipalLongterm));
+    let mut expected = change_phases(Op::CreateKey, created, None, Out::Success, Some(1));
+    expected.extend(change_phases(
+        Op::RotateKey,
+        rotated,
+        None,
+        Out::Success,
+        Some(2),
+    ));
+    expected.extend(change_phases(
+        Op::RetireKvno,
+        retired,
+        Some(1),
+        Out::Success,
+        Some(1),
+    ));
+    expected.extend(change_phases(
+        Op::DestroyKeySet,
+        destroyed,
+        None,
+        Out::Success,
+        Some(2),
+    ));
+    expected.push((Op::SetSecret, Out::Denied, None));
+    assert_eq!(phases(&records), expected);
+    for phase in records
+        .iter()
+        .filter(|r| matches!(r.result, Out::Intent | Out::NotPerformed))
+    {
+        assert_eq!(phase.reason, KeydReason::None);
+        assert_eq!(phase.caller_uid, uid);
+        assert_eq!(phase.principal, Some([0xA1; 16]));
+        assert_eq!(phase.purpose, Some(KeyPurposeCode::PrincipalLongterm));
     }
-    assert_eq!(records[8].reason, KeydReason::RoleNotPermitted);
+    assert_eq!(
+        records.last().map(|r| r.reason),
+        Some(KeydReason::RoleNotPermitted)
+    );
 }
 
 /// The same for the Directory's `set_secret` (docs/10 §6): kvno 1, then
-/// kvno 2, each preceded by its acknowledged intent in the verified log.
+/// kvno 2, each preceded by its acknowledged intent in the verified log
+/// (and, on a loaded machine, by any attempt refused for a late
+/// acknowledgement — its intent and `NotPerformed`; Q-415).
 #[test]
 fn set_secret_is_intent_then_outcome_in_the_verified_log() {
     let dir = TempDir::new();
@@ -293,37 +380,39 @@ fn set_secret_is_intent_then_outcome_in_the_verified_log() {
         return;
     }
     let auditd = start_auditd(&dir, uid, "audit.log", true);
-    let keyd = start_keyd(&dir, uid, Role::Directory);
-    let mut client = RawClient::connect(&keyd.socket);
-    for expected in [Kvno::INITIAL, Kvno::new(2)] {
-        assert!(matches!(
-            client.call(&set_secret(0xB0)),
-            Some(Ok(Answer::SetSecret(Ok(kvno)))) if kvno == expected
+    let keyd = start_keyd(&dir, uid, Role::Directory, generous());
+    let mut expected = Vec::new();
+    for kvno in [1, 2] {
+        let (answer, unacknowledged) = call_until_performed(&keyd.socket, &set_secret(0xB0));
+        assert!(
+            matches!(&answer, Ok(Answer::SetSecret(Ok(set))) if *set == Kvno::new(kvno)),
+            "{answer:?}"
+        );
+        expected.extend(change_phases(
+            Op::SetSecret,
+            unacknowledged,
+            None,
+            Out::Success,
+            Some(kvno),
         ));
     }
     keyd.stop().unwrap();
     assert!(matches!(auditd.stop(), Some(Ok(()))));
     let records = keyd_records(&verified_log(&dir.join("audit.log")), uid);
-    assert_eq!(
-        phases(&records),
-        [
-            (Op::SetSecret, Out::Intent, None),
-            (Op::SetSecret, Out::Success, Some(1)),
-            (Op::SetSecret, Out::Intent, None),
-            (Op::SetSecret, Out::Success, Some(2)),
-        ]
-    );
+    assert_eq!(phases(&records), expected);
 }
 
 /// docs/questions/Q-346 (A-86: "auditd down ⇒ `create_key` / `set_secret`
 /// answer `Unavailable` and a later successful ceremony proves nothing was
 /// created (kvno 1, not 2)"). auditd is reachable but never acknowledges
-/// (its writer does not run): the change is answered `Refused::Unavailable`
-/// after the budget, and keyd does not run it. Then a healthy auditd takes
-/// over: the same change is served at the **initial** kvno — the first
-/// attempt created / set nothing — and the verified log holds, in order,
-/// the first intent, its `NotPerformed` outcome, the second intent and
-/// keyd's outcome.
+/// (its writer does not run): with the short production budget the change
+/// is answered `Refused::Unavailable` after the budget, and keyd does not run
+/// it. Then a healthy auditd takes over: the same change is served at the
+/// **initial** kvno — no refused attempt created / set anything — and the
+/// verified log holds, in order, the first intent and its `NotPerformed`
+/// outcome, the same pair for every further attempt the short budget did
+/// not see acknowledged (a loaded machine — module documentation), then the
+/// last intent and keyd's outcome.
 fn unacknowledged_intent_changes_nothing(role: Role, call: &Call, op: KeydOperation) {
     let dir = TempDir::new();
     let uid = my_uid(&dir);
@@ -331,7 +420,7 @@ fn unacknowledged_intent_changes_nothing(role: Role, call: &Call, op: KeydOperat
         return;
     }
     let stuck = start_auditd(&dir, uid, "stuck.log", false);
-    let keyd = start_keyd(&dir, uid, role);
+    let keyd = start_keyd(&dir, uid, role, IntentAckBudget::PRODUCTION);
     let started = Instant::now();
     assert_eq!(
         RawClient::connect(&keyd.socket).call(call),
@@ -341,25 +430,18 @@ fn unacknowledged_intent_changes_nothing(role: Role, call: &Call, op: KeydOperat
 
     let _ = stuck.stop();
     let auditd = start_auditd(&dir, uid, "audit.log", true);
-    let answer = call_until_served(&mut RawClient::connect(&keyd.socket), call);
+    let (answer, unacknowledged) = call_until_performed(&keyd.socket, call);
     match answer {
         Ok(Answer::CreateKey(Ok(kvno)) | Answer::SetSecret(Ok(kvno))) => {
-            assert_eq!(kvno, Kvno::INITIAL, "the refused attempt changed nothing");
+            assert_eq!(kvno, Kvno::INITIAL, "no refused attempt changed anything");
         }
         other => panic!("{other:?}"),
     }
     keyd.stop().unwrap();
     assert!(matches!(auditd.stop(), Some(Ok(()))));
     let records = keyd_records(&verified_log(&dir.join("audit.log")), uid);
-    assert_eq!(
-        phases(&records),
-        [
-            (op, Out::Intent, None),
-            (op, Out::NotPerformed, None),
-            (op, Out::Intent, None),
-            (op, Out::Success, Some(1)),
-        ]
-    );
+    let expected = change_phases(op, 1 + unacknowledged, None, Out::Success, Some(1));
+    assert_eq!(phases(&records), expected);
 }
 
 #[test]
@@ -370,6 +452,31 @@ fn an_unacknowledged_create_key_is_unavailable_and_creates_nothing() {
 #[test]
 fn an_unacknowledged_set_secret_is_unavailable_and_sets_nothing() {
     unacknowledged_intent_changes_nothing(Role::Directory, &set_secret(0xB0), Op::SetSecret);
+}
+
+/// docs/questions/Q-415 (decision A-93's follow-up F5): the budget is the
+/// daemon's parameter, end to end — with an auditd that never acknowledges,
+/// a daemon given the ceiling waits at least the ceiling (longer than the
+/// production budget) before it answers `Unavailable`.
+#[test]
+fn the_daemons_budget_parameter_bounds_the_wait() {
+    let dir = TempDir::new();
+    let uid = my_uid(&dir);
+    if skip_as_root(uid) {
+        return;
+    }
+    let stuck = start_auditd(&dir, uid, "stuck.log", false);
+    let keyd = start_keyd(&dir, uid, Role::Admin, generous());
+    let started = Instant::now();
+    assert_eq!(
+        RawClient::connect(&keyd.socket).call(&create_key(0xA1)),
+        Some(Err(Refused::Unavailable))
+    );
+    assert!(started.elapsed() >= MAX_INTENT_ACK_BUDGET);
+    assert!(MAX_INTENT_ACK_BUDGET > INTENT_ACK_BUDGET);
+    // auditd first, so keyd's stop does not wait for acknowledgements.
+    let _ = stuck.stop();
+    keyd.stop().unwrap();
 }
 
 // ---- auditd that stops between the intent and the outcome -----------------
@@ -512,7 +619,7 @@ fn auditd_gone_between_intent_and_outcome_keeps_the_true_result() {
         return;
     }
     let vanishing = VanishingAuditd::start(&dir.join("a.sock"));
-    let keyd = start_keyd(&dir, uid, Role::Admin);
+    let keyd = start_keyd(&dir, uid, Role::Admin, generous());
     assert!(matches!(
         RawClient::connect(&keyd.socket).call(&create_key(0xA1)),
         Some(Ok(Answer::CreateKey(Ok(kvno)))) if kvno == Kvno::INITIAL
@@ -572,7 +679,10 @@ fn window_summaries(records: &[Record], uid: u32) -> Vec<(usize, WindowSummary)>
 /// the verified log holds the acknowledged intent, the four left-over
 /// records, no `CreateKey` outcome, and — after the intent — one window
 /// summary counting exactly one unrecorded outcome, with nothing refused or
-/// suppressed (a lost outcome is not a refusal).
+/// suppressed (a lost outcome is not a refusal). An attempt refused for a
+/// late acknowledgement on a loaded machine (retried; Q-415) leaves its
+/// intent and `NotPerformed` before all of this — keyd did not run it, so
+/// the four records are still in its sink for the performed attempt.
 #[test]
 fn a_lost_outcome_is_counted_in_a_window_summary_of_the_verified_log() {
     let dir = TempDir::new();
@@ -585,7 +695,8 @@ fn a_lost_outcome_is_counted_in_a_window_summary_of_the_verified_log() {
         uid,
         role: Role::Admin,
     };
-    let params = params(&dir, CallerMap::new(&[(uid, Role::Admin)]).unwrap(), uid);
+    let mut params = params(&dir, CallerMap::new(&[(uid, Role::Admin)]).unwrap(), uid);
+    params.intent_ack_budget = generous();
     let keyd = Daemon::start(params, SystemClock, move |started: &KerberosTime| {
         let mut keyd = development_keyd(realm())(started)?;
         for _ in 0..MAX_RECORDS_PER_OPERATION {
@@ -594,28 +705,32 @@ fn a_lost_outcome_is_counted_in_a_window_summary_of_the_verified_log() {
         Ok(keyd)
     })
     .unwrap();
-    assert!(matches!(
-        RawClient::connect(&keyd.socket).call(&create_key(0xA1)),
-        Some(Ok(Answer::CreateKey(Ok(kvno)))) if kvno == Kvno::INITIAL
-    ));
+    let (answer, unacknowledged) = call_until_performed(&keyd.socket, &create_key(0xA1));
+    assert!(
+        matches!(&answer, Ok(Answer::CreateKey(Ok(kvno))) if *kvno == Kvno::INITIAL),
+        "{answer:?}"
+    );
     // keyd waits (bounded) for auditd to acknowledge its window at stop.
     keyd.stop().unwrap();
     assert!(matches!(auditd.stop(), Some(Ok(()))));
 
     let log = verified_log(&dir.join("audit.log"));
     let records = keyd_records(&log, uid);
-    assert_eq!(records.len(), 1 + MAX_RECORDS_PER_OPERATION);
-    assert_eq!(phases(&records)[0], (Op::CreateKey, Out::Intent, None));
-    assert!(records[1..].iter().all(|r| r.op == Op::Ping));
+    let performed = 2 * unacknowledged;
+    assert_eq!(records.len(), performed + 1 + MAX_RECORDS_PER_OPERATION);
+    let mut expected = change_phases(Op::CreateKey, unacknowledged, None, Out::Success, None);
+    expected.pop(); // the performed attempt's outcome is the lost one
+    assert_eq!(phases(&records)[..=performed], expected[..]);
+    assert!(records[performed + 1..].iter().all(|r| r.op == Op::Ping));
     assert!(
         !records
             .iter()
-            .any(|r| r.op == Op::CreateKey && r.result != Out::Intent),
+            .any(|r| r.op == Op::CreateKey && !matches!(r.result, Out::Intent | Out::NotPerformed)),
         "the change's own outcome is lost"
     );
     let intent_at = log
         .iter()
-        .position(|record| {
+        .rposition(|record| {
             record.source != Source::Auditd
                 && matches!(
                     decode_event(&record.payload),

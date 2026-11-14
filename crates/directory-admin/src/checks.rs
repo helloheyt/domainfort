@@ -1,11 +1,13 @@
 //! The checks `prepare` runs against ONE directory view: resolving the
 //! objects a request names, visibility, the PDP decisions, protected
-//! objects, the membership rules, the cycle refusal, and the count the
+//! objects, the membership rules, the cycle refusal, the bounds of group
+//! expansion (nesting depth and closure size), and the count the
 //! self-lockout guard needs.
 //!
 //! Spec: docs/51 §7.4 steps 2-4 (one view: snapshot + tier map of the same
 //! policy version, docs/47 §8.1), §5.2, §5.6, §11; docs/11 §4, §7; A-55;
-//! [MS-SAMR] 3.1.1.8.9; docs/47 §5.3 item 4; Q-295 item 4 (P-22).
+//! [MS-SAMR] 3.1.1.8.9; docs/47 §5.3 items 1, 3, 4; Q-295 item 4 (P-22);
+//! docs/questions/Q-356 item 5, Q-416.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -45,12 +47,13 @@ pub(crate) const LOCAL_IPC_SECURITY: TransportSec = TransportSec {
 };
 
 /// Most references one walk over the membership graph may follow — the
-/// self-lockout count, the cycle check and the nesting-depth check alike.
-/// Every reference followed (a tier-map root, a `member` value, a memberOf
-/// back link) counts once, also when it leads to an object already seen, so
-/// the bound caps the work as well as the objects read. Project choice
-/// (AGENTS.md §6); a walk that exceeds it refuses the operation
-/// (docs/questions/Q-357 item 8; Q-356 items 4-5).
+/// self-lockout count, the cycle check, the nesting-depth check and the
+/// closure-size check alike. Every reference followed (a tier-map root, a
+/// `member` value, a memberOf back link) counts once, also when it leads to
+/// an object already seen, so the bound caps the work as well as the
+/// objects read. Project choice (AGENTS.md §6); a walk that exceeds it
+/// refuses the operation (docs/questions/Q-357 item 8; Q-356 items 4-5;
+/// Q-416).
 pub(crate) const MAX_WALK_STEPS: usize = 16_384;
 
 /// Why a nesting-depth walk stopped before an answer: the store failed, or
@@ -68,16 +71,40 @@ impl From<Stop> for Walked {
 }
 
 /// The state of one nesting-depth check: the steps taken, the memoised
-/// heights below and above, and the objects on the current path.
+/// heights below and above, the objects on the current path, and the
+/// objects met below that expansion does not enter (accounts, groups that
+/// are not security-enabled) — starts the closure-size check reuses.
 #[derive(Default)]
 struct DepthWalk {
     steps: usize,
     below: BTreeMap<Guid, usize>,
     above: BTreeMap<Guid, usize>,
     path: BTreeSet<Guid>,
+    leaves: BTreeSet<Guid>,
 }
 
 impl DepthWalk {
+    /// Count one reference followed; over [`MAX_WALK_STEPS`] ⇒ refuse.
+    fn step(&mut self) -> Result<(), Walked> {
+        self.steps += 1;
+        if self.steps > MAX_WALK_STEPS {
+            return Err(Walked::Refuse);
+        }
+        Ok(())
+    }
+}
+
+/// The state of one closure-size check: its own steps (the same bound,
+/// [`MAX_WALK_STEPS`]) and the objects already classified as
+/// security-enabled groups (`true`) or not (`false`).
+/// Spec: as [`Cx::closure_fits`].
+#[derive(Default)]
+struct ClosureWalk {
+    steps: usize,
+    security: BTreeMap<Guid, bool>,
+}
+
+impl ClosureWalk {
     /// Count one reference followed; over [`MAX_WALK_STEPS`] ⇒ refuse.
     fn step(&mut self) -> Result<(), Walked> {
         self.steps += 1;
@@ -365,8 +392,36 @@ impl Cx<'_, '_, '_> {
         Ok(group_type & GROUP_TYPE_SECURITY_ENABLED != 0)
     }
 
-    /// `true` if adding `member` to `group` keeps every nesting chain within
-    /// the depth group expansion honours.
+    /// `true` if adding `member` to `group` keeps every closure that
+    /// directory-pip's group expansion computes within both of its bounds:
+    /// no nesting chain deeper than `MAX_NESTING_DEPTH` (16 levels —
+    /// [`Cx::nesting_walk`]) and no closure of more than
+    /// `MAX_EXPANDED_GROUPS` (1024 groups — [`Cx::closure_fits`]). Beyond
+    /// either, expansion fails (docs/47 §5.3 item 3: exceeding a bound ⇒
+    /// `Err`, never a partial set) and the affected account can no longer
+    /// log in; the write is refused instead. A link into a group that is not
+    /// security-enabled is never climbed by expansion, so it changes no
+    /// closure and is allowed.
+    /// Spec: docs/47 §5.3 items 1, 3 (R47-8); crate directory-pip
+    /// `MAX_NESTING_DEPTH`, `MAX_EXPANDED_GROUPS`, `groups::expand`; docs/51
+    /// §11; docs/questions/Q-356 item 5 (A-89), Q-416.
+    pub(crate) fn expansion_allowed(
+        &self,
+        group: &Resolved,
+        member: &Resolved,
+    ) -> Result<bool, Stop> {
+        if !self.is_security_group(&group.obj)? {
+            return Ok(true);
+        }
+        let Some(depth) = self.nesting_walk(group, member)? else {
+            return Ok(false);
+        };
+        self.closure_fits(&depth, group.guid, member)
+    }
+
+    /// The nesting-depth check of adding `member` to the security-enabled
+    /// `group`: the finished walk when every nesting chain stays within the
+    /// depth group expansion honours, `None` when the link must be refused.
     ///
     /// The bound is directory-pip's: `MAX_NESTING_DEPTH` = 16, "most levels
     /// of group nesting on any path from the start: a direct membership is
@@ -382,42 +437,230 @@ impl Cx<'_, '_, '_> {
     /// longest climb from any start up to `x` (0 unless `x` is a
     /// security-enabled group — expansion enters nothing else) and
     /// `above(g)` the longest climb above `g` through security-enabled
-    /// groups. A link into a group that is not security-enabled is never
-    /// climbed, so it adds no chain. The walks share [`MAX_WALK_STEPS`];
-    /// exceeding it, meeting a cycle, or reaching a level that alone
-    /// exceeds the bound refuses (fail closed).
+    /// groups. The walks share [`MAX_WALK_STEPS`]; exceeding it, meeting a
+    /// cycle, or reaching a level that alone exceeds the bound refuses (fail
+    /// closed). The finished walk holds what the closure-size check reuses:
+    /// `above` = `group` and every security-enabled group above it, `below`
+    /// = `member` (when security-enabled) and every security-enabled group
+    /// below it, `leaves` = the other objects below.
     ///
     /// Spec: docs/47 §5.3 items 1, 3 (R47-8); crate directory-pip
     /// `MAX_NESTING_DEPTH` and `groups::expand`; docs/51 §11 (membership
     /// rules refused at the write); docs/questions/Q-356 item 5.
-    pub(crate) fn nesting_allowed(
-        &self,
-        group: &Resolved,
-        member: &Resolved,
-    ) -> Result<bool, Stop> {
-        if !self.is_security_group(&group.obj)? {
-            return Ok(true);
-        }
+    fn nesting_walk(&self, group: &Resolved, member: &Resolved) -> Result<Option<DepthWalk>, Stop> {
         let mut walk = DepthWalk::default();
         let below = match self.levels_below(&mut walk, member.guid, &member.obj, 0) {
             Ok(levels) => levels,
-            Err(Walked::Refuse) => return Ok(false),
+            Err(Walked::Refuse) => return Ok(None),
             Err(Walked::Stop(stop)) => return Err(stop),
         };
         walk.path.clear();
         let above = match self.levels_above(&mut walk, group.guid, 0) {
             Ok(levels) => levels,
-            Err(Walked::Refuse) => return Ok(false),
+            Err(Walked::Refuse) => return Ok(None),
             Err(Walked::Stop(stop)) => return Err(stop),
         };
-        Ok(below + 1 + above <= MAX_NESTING_DEPTH)
+        Ok((below + 1 + above <= MAX_NESTING_DEPTH).then_some(walk))
+    }
+
+    /// `true` if, after `group ∋ member`, no closure group expansion computes
+    /// holds more than `MAX_EXPANDED_GROUPS` groups.
+    ///
+    /// The bound is directory-pip's: `MAX_EXPANDED_GROUPS` = 1024, "most
+    /// groups one expansion may return"; its expansion climbs from a start
+    /// through the memberOf back links into security-enabled groups only,
+    /// does not count the start, and fails on the 1025th group (docs/47 §5.3
+    /// items 1, 3: exceeding ⇒ `Err`).
+    ///
+    /// The link changes the closure of exactly the starts whose climb
+    /// reaches `member`: `member` itself, and — when `member` is a
+    /// security-enabled group — every object below it through
+    /// security-enabled groups (the depth walk's `below` and `leaves`). For
+    /// each of them the new closure is its old one ∪ `U`, where `U` =
+    /// `group` and every security-enabled group above it (the depth walk's
+    /// `above`). Every start is checked, a group too — expansion may start
+    /// anywhere, as the depth check reads "from any start". Measured as:
+    ///
+    /// 1. `member`'s closure: `U` ∪ the groups above `member` (a climb that
+    ///    does not enter `U`, which is closed upward);
+    /// 2. a start below `member` has those groups and `member` itself, plus
+    ///    the groups it reaches without entering them (`beyond`). One shared
+    ///    climb from all such starts gives the union of `beyond`; if even
+    ///    the sum fits, every start fits;
+    /// 3. otherwise each start's own `beyond` is counted exactly, over the
+    ///    links the shared climb read (no second store read).
+    ///
+    /// Every reference followed — a memberOf back link read, a link
+    /// re-traversed in step 3 — is a step of this check's own
+    /// [`MAX_WALK_STEPS`]; exceeding it refuses (fail closed), as does a
+    /// closure over the bound. The references the depth walk already
+    /// followed are not followed again (its memoised results are reused).
+    ///
+    /// Spec: docs/47 §5.3 items 1, 3 (R47-8); crate directory-pip
+    /// `MAX_EXPANDED_GROUPS` and `groups::expand`; docs/51 §11;
+    /// docs/questions/Q-356 item 5 (A-89 residual), Q-416.
+    fn closure_fits(
+        &self,
+        depth: &DepthWalk,
+        group: Guid,
+        member: &Resolved,
+    ) -> Result<bool, Stop> {
+        let mut walk = ClosureWalk::default();
+        match self.closure_walk(&mut walk, depth, group, member) {
+            Ok(fits) => Ok(fits),
+            Err(Walked::Refuse) => Ok(false),
+            Err(Walked::Stop(stop)) => Err(stop),
+        }
+    }
+
+    /// The steps of [`Cx::closure_fits`].
+    fn closure_walk(
+        &self,
+        walk: &mut ClosureWalk,
+        depth: &DepthWalk,
+        group: Guid,
+        member: &Resolved,
+    ) -> Result<bool, Walked> {
+        // U: `group` and every security-enabled group above it.
+        let mut counted: BTreeSet<Guid> = depth.above.keys().copied().collect();
+        counted.insert(group);
+        if counted.len() > MAX_EXPANDED_GROUPS {
+            return Ok(false);
+        }
+        // 1. `member`'s own closure after the link.
+        let own = self.climb(walk, &[member.guid], &counted, None)?;
+        counted.extend(own);
+        if counted.len() > MAX_EXPANDED_GROUPS {
+            return Ok(false);
+        }
+        // Expansion enters nothing below a member that is not a
+        // security-enabled group: no other closure changes.
+        if !depth.below.contains_key(&member.guid) {
+            return Ok(true);
+        }
+        // 2. Every start below `member` has `counted` and `member` itself.
+        counted.insert(member.guid);
+        let starts: Vec<Guid> = depth
+            .below
+            .keys()
+            .chain(depth.leaves.iter())
+            .copied()
+            .filter(|start| *start != member.guid)
+            .collect();
+        if starts.is_empty() {
+            return Ok(true);
+        }
+        // `member` itself may be the 1025th group of every start below it.
+        let Some(room) = MAX_EXPANDED_GROUPS.checked_sub(counted.len()) else {
+            return Ok(false);
+        };
+        let mut links = BTreeMap::new();
+        let beyond = self.climb(walk, &starts, &counted, Some(&mut links))?;
+        if beyond.len() <= room {
+            return Ok(true);
+        }
+        // 3. Each start exactly.
+        for start in starts {
+            if Self::reached(walk, &links, start, room)? > room {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Climb from `starts` over the memberOf back links into
+    /// security-enabled groups, never entering `counted`; every group
+    /// reached. With `links`, the groups each climbed object leads to are
+    /// kept for [`Cx::reached`]. Each back link read is a step.
+    /// Spec: as [`Cx::closure_fits`]; docs/47 §5.3 item 1.
+    fn climb(
+        &self,
+        walk: &mut ClosureWalk,
+        starts: &[Guid],
+        counted: &BTreeSet<Guid>,
+        mut links: Option<&mut BTreeMap<Guid, Vec<Guid>>>,
+    ) -> Result<BTreeSet<Guid>, Walked> {
+        let snapshot = self.view.snapshot();
+        let mut reached = BTreeSet::new();
+        let mut climbed = BTreeSet::new();
+        let mut pending = starts.to_vec();
+        while let Some(x) = pending.pop() {
+            if !climbed.insert(x) {
+                continue;
+            }
+            let mut up = Vec::new();
+            let sources = snapshot
+                .back_links(x, self.ids.member_of)
+                .map_err(|e| store_failure(&e))?;
+            for source in sources {
+                walk.step()?;
+                if counted.contains(&source) || !self.entered(walk, source)? {
+                    continue;
+                }
+                up.push(source);
+                if reached.insert(source) {
+                    pending.push(source);
+                }
+            }
+            if let Some(links) = links.as_deref_mut() {
+                links.insert(x, up);
+            }
+        }
+        Ok(reached)
+    }
+
+    /// `true` if expansion enters `guid`: a security-enabled group
+    /// (classified once per check).
+    /// Spec: docs/47 §5.3 item 1; [`Cx::is_security_group`].
+    fn entered(&self, walk: &mut ClosureWalk, guid: Guid) -> Result<bool, Walked> {
+        if let Some(known) = walk.security.get(&guid) {
+            return Ok(*known);
+        }
+        let entered = match self
+            .view
+            .snapshot()
+            .get_object(guid)
+            .map_err(|e| store_failure(&e))?
+        {
+            Some(obj) => self.is_security_group(&obj)?,
+            None => false,
+        };
+        walk.security.insert(guid, entered);
+        Ok(entered)
+    }
+
+    /// How many groups `start` reaches over `links` (the groups beyond the
+    /// counted ones), stopping once more than `room`. Each link traversed is
+    /// a step. Spec: as [`Cx::closure_fits`].
+    fn reached(
+        walk: &mut ClosureWalk,
+        links: &BTreeMap<Guid, Vec<Guid>>,
+        start: Guid,
+        room: usize,
+    ) -> Result<usize, Walked> {
+        let mut seen = BTreeSet::new();
+        let mut pending = vec![start];
+        while let Some(x) = pending.pop() {
+            for next in links.get(&x).map(Vec::as_slice).unwrap_or_default() {
+                walk.step()?;
+                if seen.insert(*next) {
+                    if seen.len() > room {
+                        return Ok(seen.len());
+                    }
+                    pending.push(*next);
+                }
+            }
+        }
+        Ok(seen.len())
     }
 
     /// `below(x)`: the longest climb from any start up to `x`, which sits
     /// `level` member links below the new link's member. A security-enabled
     /// group at `level` ≥ 16 is itself a start 16 or more levels below, so
     /// the new link would exceed the bound: refuse at once (this also bounds
-    /// the recursion). Spec: as [`Cx::nesting_allowed`].
+    /// the recursion). An object expansion does not enter is kept in
+    /// `leaves` (a start for the closure-size check). Spec: as
+    /// [`Cx::nesting_walk`].
     fn levels_below(
         &self,
         walk: &mut DepthWalk,
@@ -426,6 +669,7 @@ impl Cx<'_, '_, '_> {
         level: usize,
     ) -> Result<usize, Walked> {
         if !self.is_security_group(obj)? {
+            walk.leaves.insert(x);
             return Ok(0);
         }
         if level >= MAX_NESTING_DEPTH {
@@ -464,7 +708,7 @@ impl Cx<'_, '_, '_> {
     /// above the new link's group, through security-enabled groups (the
     /// memberOf back links, as expansion climbs). A group `level` ≥ 16 above
     /// makes the new link's chain longer than the bound: refuse at once.
-    /// Spec: as [`Cx::nesting_allowed`].
+    /// Spec: as [`Cx::nesting_walk`].
     fn levels_above(&self, walk: &mut DepthWalk, g: Guid, level: usize) -> Result<usize, Walked> {
         if level >= MAX_NESTING_DEPTH {
             return Err(Walked::Refuse);

@@ -41,19 +41,28 @@
 //!
 //! **The wait and issuance.** The wait blocks this thread — the one that
 //! serves every keyd call, the Kerberos exchanges included — so it is
-//! bounded by [`INTENT_ACK_BUDGET`], counted from the moment the request was
-//! **queued** ([`EngineHandle::submit`]), not from the moment the engine took
-//! it:
+//! bounded by the daemon's [`IntentAckBudget`] ([`INTENT_ACK_BUDGET`] in
+//! production, never above [`MAX_INTENT_ACK_BUDGET`]), counted from the
+//! moment the request was **queued** ([`EngineHandle::submit`]), not from
+//! the moment the engine took it:
 //!
-//! * the budget is half the keyd client's 2 s deadline (docs/50 §3.6), so a
-//!   change that is performed has the other half to run and to reach a
-//!   caller that keeps that deadline — a reply arriving after the caller gave
-//!   up would read as "unavailable" for a change that was done, the very
-//!   ambiguity A-86 removes (what is left of it: docs/questions/Q-365);
+//! * the production budget is half the keyd client's 2 s deadline (docs/50
+//!   §3.6), so a change that is performed has the other half to run and to
+//!   reach a caller that keeps that deadline — a reply arriving after the
+//!   caller gave up would read as "unavailable" for a change that was done,
+//!   the very ambiguity A-86 removes (what is left of it:
+//!   docs/questions/Q-365);
 //! * counted from queueing, a burst of changes holds the engine at most until
 //!   the last one's budget ends, so a kdc request queued behind them is served
 //!   within the budget plus the queue's own work — inside its own 2 s
 //!   deadline.
+//!
+//! The budget is a daemon parameter (`DaemonParams::intent_ack_budget`,
+//! decision A-93's follow-up F5) only so that tests on a loaded machine can
+//! give a slow auditd more time, together with a client that waits
+//! correspondingly longer. Production takes [`INTENT_ACK_BUDGET`] — there is
+//! no configuration key — and no budget above [`MAX_INTENT_ACK_BUDGET`] can
+//! be built (docs/questions/Q-415).
 //!
 //! The single-threaded engine and the bounded queue are unchanged. While
 //! auditd is known to be away, changes are refused `Busy` at once, with no
@@ -72,7 +81,7 @@
 //!
 //! Spec: docs/50 R50-5, R50-6, R50-7, R50-14, §3.5, §3.6; docs/10 §2, §11;
 //! docs/questions/Q-218 (A-57), Q-222 (A-56), Q-240 item 7 (A-62), Q-245
-//! item 12 (A-63), Q-346 (A-86), Q-365.
+//! item 12 (A-63), Q-346 (A-86), Q-365, Q-415.
 
 use crate::audit::{AuditGate, IntentRefused, KeyStateIntent, PendingOutcome, RecordBuffer};
 use crate::clock::Clock;
@@ -95,17 +104,90 @@ use zeroize::Zeroizing;
 /// (tokio's `mpsc::channel` panics on 0 or "too large"; AGENTS.md §6).
 pub const MAX_QUEUE_CAPACITY: usize = 1024;
 
-/// How long after a key-state change was queued its intent record may take
-/// to be acknowledged by auditd; past it the change is answered
-/// `Refused::Unavailable` and not run (module documentation). Half the keyd
-/// client's deadline (docs/50 §3.6: 2 s), so a performed change has the
-/// other half to reach its caller. Project choice (docs/50 gives no audit
-/// deadline; docs/questions/Q-365).
+/// The production intent-acknowledgement budget: how long after a key-state
+/// change was queued its intent record may take to be acknowledged by
+/// auditd; past it the change is answered `Refused::Unavailable` and not run
+/// (module documentation). Half the keyd client's deadline (docs/50 §3.6:
+/// 2 s), so a performed change has the other half to reach its caller.
+/// Project choice (docs/50 gives no audit deadline; docs/questions/Q-365,
+/// decided A-88). Every production daemon uses it
+/// ([`IntentAckBudget::PRODUCTION`]; `DaemonParams::from_settings`).
 pub const INTENT_ACK_BUDGET: Duration = Duration::from_secs(1);
 
-// The budget leaves at least half the client's deadline for the change and
-// the reply (docs/questions/Q-365).
+/// The ceiling of any daemon's intent-acknowledgement budget: the longest
+/// deadline a production keyd client waits for its reply — ipc-keyd's
+/// `DEFAULT_DEADLINE`, which the kdc and dird use, and the most crates/config
+/// accepts for any `keyd_deadline` key (`KEYD_DEADLINE_SECS`), both docs/50
+/// §3.6's 2 s. A longer wait could only perform changes after every
+/// production caller has given up — each would then read a performed change
+/// as "unavailable", the ambiguity A-86 removes — and would hold every
+/// Kerberos request queued behind it past its own deadline. Production stays
+/// at half of it ([`INTENT_ACK_BUDGET`], the A-88 rule); a budget between the
+/// two exists only for tests whose own client waits at least twice as long.
+/// Project choice (docs/questions/Q-415).
+pub const MAX_INTENT_ACK_BUDGET: Duration = ipc_keyd::DEFAULT_DEADLINE;
+
+// The production budget leaves at least half the client's deadline for the
+// change and the reply (docs/questions/Q-365, A-88).
 const _: () = assert!(INTENT_ACK_BUDGET.as_nanos() * 2 <= ipc_keyd::DEFAULT_DEADLINE.as_nanos());
+// The production budget is within the ceiling, and the ceiling is no longer
+// than any deadline a production keyd client may be configured with
+// (docs/questions/Q-415).
+const _: () = assert!(INTENT_ACK_BUDGET.as_nanos() <= MAX_INTENT_ACK_BUDGET.as_nanos());
+const _: () = assert!(
+    MAX_INTENT_ACK_BUDGET.as_nanos() <= ipc_keyd::DEFAULT_DEADLINE.as_nanos()
+        && MAX_INTENT_ACK_BUDGET.as_secs() <= config::limits::KEYD_DEADLINE_SECS.max as u64
+);
+
+/// The intent-acknowledgement budget of one daemon: more than zero and at
+/// most [`MAX_INTENT_ACK_BUDGET`]. The range is checked when the value is
+/// built ([`IntentAckBudget::new`]), so a `DaemonParams` can only carry a
+/// budget within the ceiling. There is no configuration key for it: the
+/// daemon's parameters from its file always hold
+/// [`IntentAckBudget::PRODUCTION`].
+/// Spec: docs/questions/Q-365 (A-88), Q-415; A-93 (follow-up F5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntentAckBudget(Duration);
+
+/// A budget of zero or above [`MAX_INTENT_ACK_BUDGET`] was refused.
+/// Spec: docs/questions/Q-415.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntentAckBudgetOutOfRange;
+
+impl fmt::Display for IntentAckBudgetOutOfRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("intent acknowledgement budget out of range")
+    }
+}
+
+impl std::error::Error for IntentAckBudgetOutOfRange {}
+
+impl IntentAckBudget {
+    /// [`INTENT_ACK_BUDGET`], the budget of every production daemon.
+    pub const PRODUCTION: IntentAckBudget = IntentAckBudget(INTENT_ACK_BUDGET);
+
+    /// `budget`, if it is more than zero and at most
+    /// [`MAX_INTENT_ACK_BUDGET`].
+    ///
+    /// # Errors
+    /// [`IntentAckBudgetOutOfRange`]: zero (every key-state change would be
+    /// refused — a fault, not a setting) or above the ceiling.
+    ///
+    /// Spec: docs/questions/Q-415.
+    pub const fn new(budget: Duration) -> Result<IntentAckBudget, IntentAckBudgetOutOfRange> {
+        if budget.is_zero() || budget.as_nanos() > MAX_INTENT_ACK_BUDGET.as_nanos() {
+            Err(IntentAckBudgetOutOfRange)
+        } else {
+            Ok(IntentAckBudget(budget))
+        }
+    }
+
+    /// The budget.
+    #[must_use]
+    pub const fn get(self) -> Duration {
+        self.0
+    }
+}
 
 /// Outcome records of key-state changes that could not be committed: noted
 /// on stderr (thinned), counted by the gate (A-86: "the gap is surfaced").
@@ -142,7 +224,7 @@ impl std::error::Error for EngineError {}
 /// One request for the engine: the connection's caller identity (from its
 /// peer credentials), the request body (zeroized on drop: it may carry a
 /// password), when it was queued (the start of a key-state change's
-/// [`INTENT_ACK_BUDGET`]), and where to send the outcome.
+/// [`IntentAckBudget`]), and where to send the outcome.
 /// Spec: docs/50 R50-7, §3.2, §3.3 (secret-bearing buffers wiped);
 /// docs/questions/Q-346 (A-86).
 pub(crate) struct Job {
@@ -247,12 +329,14 @@ impl<F: FnOnce()> Drop for OnExit<F> {
     }
 }
 
-/// The engine: keyd, the clock it reads `now` from, and the audit gate.
-/// Spec: docs/50 R50-5, R50-7.
+/// The engine: keyd, the clock it reads `now` from, the audit gate, and the
+/// daemon's intent-acknowledgement budget.
+/// Spec: docs/50 R50-5, R50-7; docs/questions/Q-365, Q-415.
 pub(crate) struct Engine<S: KeyStore, E: EntropySource, C: Clock> {
     keyd: Keyd<S, RecordBuffer, E>,
     clock: C,
     gate: Arc<AuditGate>,
+    budget: IntentAckBudget,
 }
 
 impl<S, E, C> Engine<S, E, C>
@@ -263,20 +347,31 @@ where
 {
     /// Construct the engine: read the clock once for the hold-down start and
     /// build keyd with it (`build` is `Keyd::new` with the development store
-    /// in the daemon, a deterministic test keyd in tests).
+    /// in the daemon, a deterministic test keyd in tests). `budget` bounds
+    /// every key-state change's wait for its intent's acknowledgement.
     ///
     /// # Errors
     /// [`EngineError::Clock`], [`EngineError::Config`].
     ///
     /// Spec: docs/50 R50-5, R50-6, §3.5; docs/10 §11 (`Keyd::new(…,
-    /// started_at)`); A-62.
-    pub(crate) fn start<F>(clock: C, gate: Arc<AuditGate>, build: F) -> Result<Self, EngineError>
+    /// started_at)`); A-62; docs/questions/Q-365, Q-415.
+    pub(crate) fn start<F>(
+        clock: C,
+        gate: Arc<AuditGate>,
+        budget: IntentAckBudget,
+        build: F,
+    ) -> Result<Self, EngineError>
     where
         F: FnOnce(&KerberosTime) -> Result<Keyd<S, RecordBuffer, E>, ConfigError>,
     {
         let started_at = clock.now().ok_or(EngineError::Clock)?;
         let keyd = build(&started_at).map_err(EngineError::Config)?;
-        Ok(Engine { keyd, clock, gate })
+        Ok(Engine {
+            keyd,
+            clock,
+            gate,
+            budget,
+        })
     }
 
     /// Serve one request body as `caller`, queued at `queued` (module
@@ -341,7 +436,7 @@ where
     ///
     /// * auditd unreachable / no two free slots ⇒ `Refused::Busy` (the
     ///   connection stays open), nothing recorded, keyd not called;
-    /// * the intent not acknowledged within [`INTENT_ACK_BUDGET`] of
+    /// * the intent not acknowledged within the engine's budget of
     ///   `queued` ⇒ a `NotPerformed` outcome, `Refused::Unavailable`, keyd
     ///   not called;
     /// * otherwise the reply is keyd's answer, whether or not its record
@@ -396,13 +491,13 @@ where
         }
     }
 
-    /// Whether the intent of `pending` was acknowledged within
-    /// [`INTENT_ACK_BUDGET`] of `queued`. A deadline that cannot be
+    /// Whether the intent of `pending` was acknowledged within the engine's
+    /// [`IntentAckBudget`] of `queued`. A deadline that cannot be
     /// represented is "not acknowledged" (fail closed).
-    /// Spec: docs/questions/Q-346 (A-86), Q-365.
+    /// Spec: docs/questions/Q-346 (A-86), Q-365, Q-415.
     fn intent_acknowledged(&self, pending: &PendingOutcome, queued: Instant) -> bool {
         queued
-            .checked_add(INTENT_ACK_BUDGET)
+            .checked_add(self.budget.get())
             .is_some_and(|deadline| self.gate.wait_acknowledged(pending.intent_seq(), deadline))
     }
 

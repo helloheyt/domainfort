@@ -15,7 +15,7 @@ use keyd_daemon::startup::{
     hardening_plan, prepare_socket_directory, read_settings, realm, StartupError,
     LOCKED_MEMORY_LIMIT, OPEN_FILES_HEADROOM,
 };
-use keyd_daemon::{DaemonParams, ENGINE_QUEUE_CAPACITY};
+use keyd_daemon::{DaemonParams, IntentAckBudget, ENGINE_QUEUE_CAPACITY, INTENT_ACK_BUDGET};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
@@ -92,6 +92,25 @@ fn daemon_parameters_come_from_the_file() {
     assert_eq!(params.callers.caller(801), None, "keyd's own uid");
     assert_eq!(params.callers.caller(805), None, "auditd's uid");
     assert!(realm(&settings).is_ok());
+    // The intent budget is the production constant, whatever the file says
+    // (docs/questions/Q-365 / A-88, Q-415).
+    assert_eq!(params.intent_ack_budget, IntentAckBudget::PRODUCTION);
+    assert_eq!(params.intent_ack_budget.get(), INTENT_ACK_BUDGET);
+}
+
+/// docs/questions/Q-415 (decision A-93's follow-up F5: "no configuration-file
+/// key, so an operator cannot widen it"): keyd's closed key table has no key
+/// for the intent budget, and a file naming one is refused as an unknown key.
+#[test]
+fn no_configuration_key_sets_the_intent_budget() {
+    assert!(KeydSettings::KEYS
+        .iter()
+        .all(|key| !key.contains("intent") && !key.contains("budget")));
+    let text = format!("{KEYD}intent_ack_budget = 2s\n");
+    assert_eq!(
+        KeydSettings::parse(text.as_bytes()).err().map(|e| e.kind()),
+        Some(config::ErrorKind::UnknownKey)
+    );
 }
 
 /// docs/50 §7.1 ("file root:0644"; the daemon checks modes): a

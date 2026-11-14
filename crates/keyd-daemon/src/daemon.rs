@@ -42,7 +42,7 @@ use crate::audit::{AuditGate, RecordBuffer};
 use crate::audit_client::{self, AuditEndpoint, AuditLinkError};
 use crate::callers::{CallerMap, CallerMapError};
 use crate::clock::Clock;
-use crate::engine::{Engine, EngineError, EnginePanicked, EngineThread};
+use crate::engine::{Engine, EngineError, EnginePanicked, EngineThread, IntentAckBudget};
 use crate::listener::{accept_loop, ServeContext};
 use crate::log::{note, Note};
 use config::KeydSettings;
@@ -101,16 +101,25 @@ pub struct DaemonParams {
     pub queue_capacity: usize,
     /// The audit window (A-57).
     pub window: WindowConfig,
+    /// How long a key-state change may wait for auditd to acknowledge its
+    /// intent, from queueing (A-86). Production: always
+    /// [`IntentAckBudget::PRODUCTION`] — no configuration key exists, so an
+    /// operator cannot widen it; the type refuses anything above
+    /// `MAX_INTENT_ACK_BUDGET` when it is built (docs/questions/Q-415).
+    pub intent_ack_budget: IntentAckBudget,
 }
 
 impl DaemonParams {
     /// The parameters of keyd's configuration file, with the daemon's
-    /// constants for what the file does not set (Q-230 item 4).
+    /// constants for what the file does not set (Q-230 item 4) — among them
+    /// the production intent-acknowledgement budget, which no key of the
+    /// file sets (docs/questions/Q-415).
     ///
     /// # Errors
     /// [`CallerMapError`] (not reachable for a parsed file).
     ///
-    /// Spec: docs/50 §7.1; docs/questions/Q-230 items 4, 5.
+    /// Spec: docs/50 §7.1; docs/questions/Q-230 items 4, 5; Q-365 (A-88),
+    /// Q-415.
     pub fn from_settings(settings: &KeydSettings) -> Result<DaemonParams, CallerMapError> {
         Ok(DaemonParams {
             keyd_socket: settings.keyd_socket().as_path().to_path_buf(),
@@ -123,6 +132,7 @@ impl DaemonParams {
             max_connections_per_uid: settings.max_connections_per_uid(),
             queue_capacity: ENGINE_QUEUE_CAPACITY,
             window: WindowConfig::DEFAULT,
+            intent_ack_budget: IntentAckBudget::PRODUCTION,
         })
     }
 }
@@ -289,8 +299,13 @@ where
     gate.set_reachable(true);
 
     // 2. The engine: hold-down start from keyd's clock, then its thread.
-    let engine =
-        Engine::start(clock, Arc::clone(&gate), build_keyd).map_err(DaemonError::Engine)?;
+    let engine = Engine::start(
+        clock,
+        Arc::clone(&gate),
+        params.intent_ack_budget,
+        build_keyd,
+    )
+    .map_err(DaemonError::Engine)?;
     note(Note::DevelopmentKeyStore, None);
     note(Note::StartupHoldDown, None);
     let ended = Arc::clone(&control.state);

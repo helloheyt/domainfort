@@ -70,9 +70,15 @@
 //! entropy source, as the pattern A-15 names) were read. No other
 //! implementation was consulted or recalled (AGENTS.md §1-3).
 //!
+//! The closure-size refusal of `AddMember` (the A-89 residual, task F5)
+//! was written only from docs/47 §5.3, PENDING-OWNER A-89, docs/questions
+//! Q-356 and Q-357, and this repository's crate directory-pip
+//! (`MAX_EXPANDED_GROUPS`, `groups.rs`).
+//!
 //! Interpretations and gaps: docs/questions/Q-355 (names and values),
 //! Q-356 (membership and protected objects), Q-357 (dual control and the
-//! self-lockout guard), Q-358 (two-phase contract and re-verification).
+//! self-lockout guard), Q-358 (two-phase contract and re-verification),
+//! Q-416 (the closure-size refusal).
 
 mod admin;
 mod apply;

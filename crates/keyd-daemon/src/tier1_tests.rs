@@ -8,7 +8,10 @@
 
 use crate::audit::{AuditGate, KeyStateIntent};
 use crate::clock::{kerberos_time_from_unix, Clock};
-use crate::engine::{Engine, EngineError, SubmitError, INTENT_ACK_BUDGET};
+use crate::engine::{
+    Engine, EngineError, IntentAckBudget, IntentAckBudgetOutOfRange, SubmitError,
+    INTENT_ACK_BUDGET, MAX_INTENT_ACK_BUDGET,
+};
 use crate::startup::development_keyd;
 use ipc::{decode_reply, encode_frame, Direction, Refused, Reply};
 use ipc_audit::{
@@ -101,17 +104,42 @@ impl Clock for TestClock {
 
 type TestEngine = Engine<InMemoryKeyStore, OsEntropy, TestClock>;
 
+/// The budget of the tier-1 engines whose key-state calls wait for
+/// [`AutoAck`]: the ceiling, so that a loaded machine scheduling the
+/// acknowledging thread late does not turn the wait into `Unavailable`
+/// (docs/questions/Q-415). The test that times the expiry uses
+/// [`IntentAckBudget::PRODUCTION`].
+fn generous() -> IntentAckBudget {
+    IntentAckBudget::new(MAX_INTENT_ACK_BUDGET).unwrap()
+}
+
 /// The daemon's engine (development keyd, kernel CSPRNG) on a test clock,
-/// with a gate that counts auditd as reachable when `reachable`.
+/// with a gate that counts auditd as reachable when `reachable`, and the
+/// [`generous`] budget.
 fn engine(
     clock: &TestClock,
     window: WindowConfig,
     reachable: bool,
 ) -> (TestEngine, Arc<AuditGate>) {
+    engine_with(clock, window, reachable, generous())
+}
+
+/// As [`engine`], with `budget`.
+fn engine_with(
+    clock: &TestClock,
+    window: WindowConfig,
+    reachable: bool,
+    budget: IntentAckBudget,
+) -> (TestEngine, Arc<AuditGate>) {
     let gate = Arc::new(AuditGate::new(window));
     gate.set_reachable(reachable);
-    let engine =
-        Engine::start(clock.clone(), Arc::clone(&gate), development_keyd(realm())).unwrap();
+    let engine = Engine::start(
+        clock.clone(),
+        Arc::clone(&gate),
+        budget,
+        development_keyd(realm()),
+    )
+    .unwrap();
     (engine, gate)
 }
 
@@ -158,12 +186,12 @@ fn serve_queued(
     reply(operation, &engine.handle(caller, &body(call), queued))
 }
 
-/// A queueing time whose [`INTENT_ACK_BUDGET`] has already run out (now, if
-/// the monotonic clock cannot go back that far — the test then waits the
-/// budget).
+/// A queueing time whose budget has already run out — for any budget up to
+/// the ceiling (now, if the monotonic clock cannot go back that far — the
+/// test then waits the budget).
 fn long_ago() -> Instant {
     let now = Instant::now();
-    now.checked_sub(INTENT_ACK_BUDGET * 2).unwrap_or(now)
+    now.checked_sub(MAX_INTENT_ACK_BUDGET * 2).unwrap_or(now)
 }
 
 /// auditd for tier 1: a thread that acknowledges every batch of the window
@@ -397,7 +425,12 @@ fn an_unreadable_clock_at_start_is_an_error() {
     let clock = TestClock::at(t0());
     clock.set(None);
     let gate = Arc::new(AuditGate::new(WindowConfig::DEFAULT));
-    let result = Engine::start(clock, gate, development_keyd(realm()));
+    let result = Engine::start(
+        clock,
+        gate,
+        IntentAckBudget::PRODUCTION,
+        development_keyd(realm()),
+    );
     assert!(matches!(result.err(), Some(EngineError::Clock)));
 }
 
@@ -560,12 +593,18 @@ fn a_key_state_change_is_intent_then_outcome() {
 /// answered `Refused::Unavailable` (then close) and keyd does not run it;
 /// the window holds its intent and a `NotPerformed` outcome. Once auditd
 /// acknowledges, the same calls are served at the initial kvno: nothing was
-/// created or set before. The first refusal waits the real budget (the
-/// timed wait); the others were queued long ago.
+/// created or set before. The first refusal waits the real production
+/// budget (the timed wait — nothing acknowledges, so it is deterministic);
+/// the others were queued long ago.
 #[test]
 fn an_unacknowledged_intent_is_unavailable_and_changes_nothing() {
     let clock = TestClock::at(t0());
-    let (mut engine, gate) = engine(&clock, WindowConfig::DEFAULT, true);
+    let (mut engine, gate) = engine_with(
+        &clock,
+        WindowConfig::DEFAULT,
+        true,
+        IntentAckBudget::PRODUCTION,
+    );
     let started = Instant::now();
     let (answer, open) = serve(&mut engine, ADMIN, &create_key(0xA1, "alice"));
     assert_eq!(answer.err(), Some(Refused::Unavailable));
@@ -636,7 +675,7 @@ fn an_authorization_refusal_is_one_record_without_intent() {
         serve(&mut engine, ADMIN, &set_secret()).0,
         Ok(Answer::SetSecret(Err(Error::Denied)))
     ));
-    assert!(started.elapsed() < INTENT_ACK_BUDGET, "no wait");
+    assert!(started.elapsed() < generous().get(), "no wait");
     let records = window_records(&gate);
     let phases: Vec<_> = records.iter().map(|r| (r.op, r.result, r.reason)).collect();
     assert_eq!(
@@ -671,6 +710,7 @@ fn an_unrecorded_outcome_answers_the_true_result_and_is_counted() {
     let mut engine = Engine::start(
         clock.clone(),
         Arc::clone(&gate),
+        generous(),
         |started: &KerberosTime| {
             let mut keyd = development_keyd(realm())(started)?;
             for _ in 0..crate::audit::MAX_RECORDS_PER_OPERATION {
@@ -714,7 +754,7 @@ fn issuance_operations_take_no_intent_and_do_not_wait() {
         serve(&mut engine, KDC, &verify_preauth()).0,
         Ok(Answer::VerifyPreauth(Err(AuthnError::Denied)))
     ));
-    assert!(started.elapsed() < INTENT_ACK_BUDGET);
+    assert!(started.elapsed() < generous().get(), "no wait");
     let records = window_records(&gate);
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].result, KeydOutcome::Denied);
@@ -893,7 +933,13 @@ fn a_full_queue_answers_busy_at_once() {
     };
     let gate = Arc::new(AuditGate::new(WindowConfig::DEFAULT));
     gate.set_reachable(true);
-    let engine = Engine::start(clock, gate, development_keyd(realm())).unwrap();
+    let engine = Engine::start(
+        clock,
+        gate,
+        IntentAckBudget::PRODUCTION,
+        development_keyd(realm()),
+    )
+    .unwrap();
     let (handle, thread) = engine.spawn(1, || {}).unwrap();
     let ping = || Zeroizing::new(body(&Call::Ping));
 
@@ -959,5 +1005,37 @@ fn queue_capacity_is_bounded() {
             engine.spawn(capacity, || {}).err(),
             Some(EngineError::QueueCapacity)
         ));
+    }
+}
+
+/// docs/questions/Q-415 (decision A-93's follow-up F5): the intent budget is
+/// a daemon parameter whose range is checked when it is built — more than
+/// zero, at most the ceiling. Production is exactly the A-88 constant (1 s,
+/// half the keyd client's 2 s deadline, docs/50 §3.6, Q-365), and the
+/// ceiling is that production client deadline itself.
+#[test]
+fn the_intent_budget_is_bounded_when_built() {
+    assert_eq!(IntentAckBudget::PRODUCTION.get(), INTENT_ACK_BUDGET);
+    assert_eq!(INTENT_ACK_BUDGET, Duration::from_secs(1));
+    assert_eq!(MAX_INTENT_ACK_BUDGET, ipc_keyd::DEFAULT_DEADLINE);
+    assert_eq!(
+        IntentAckBudget::new(INTENT_ACK_BUDGET),
+        Ok(IntentAckBudget::PRODUCTION)
+    );
+    for accepted in [Duration::from_nanos(1), MAX_INTENT_ACK_BUDGET] {
+        assert_eq!(
+            IntentAckBudget::new(accepted).map(IntentAckBudget::get),
+            Ok(accepted)
+        );
+    }
+    for refused in [
+        Duration::ZERO,
+        MAX_INTENT_ACK_BUDGET + Duration::from_nanos(1),
+        Duration::MAX,
+    ] {
+        assert_eq!(
+            IntentAckBudget::new(refused),
+            Err(IntentAckBudgetOutOfRange)
+        );
     }
 }
