@@ -63,6 +63,7 @@ node_id = 0123456789abcdef00112233445566ff
 admin_ticket_age_max = 600s
 admin_quorum = 2
 provision_manifest = /etc/domain/provision.manifest
+policy_next_path = /var/lib/dird/policy/policy.next
 audit_socket = /run/auditd/audit.sock
 auditd_uid = 805
 frame_timeout = 5s

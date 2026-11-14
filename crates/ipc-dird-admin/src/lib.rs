@@ -57,6 +57,7 @@
 //! | → | `0x0F` | `Approve` | `id:u64 ‖ operation:KeyOperation` | `KeyRequest` |
 //! | → | `0x10`–`0x12` | (retired by A-102: keyadm's `FetchApproved`, `Complete`, `ListPendingDestruction`) | — | — |
 //! | → | `0x14` | `Ping` | (no `auth`, empty) | `Pong` |
+//! | → | `0x16` | `ChangePolicy` (task A16) | `changes:seq<PolicyChange, 4>` | `PolicyNext` |
 //! | ← | `0x81` | `Created` | `guid:[16] ‖ sid:Option<bytes<68>>` | — |
 //! | ← | `0x82` | `PasswordSet` | `kind:u8{1 User, 2 Computer} ‖ keys:seq<(principal:[16] ‖ purpose:u8{1 Longterm, 2 Service} ‖ realm:bytes<255> ‖ name:bytes<4096> DER), 2> ‖ salt:bytes<1024>` | — |
 //! | ← | `0x83` | `Done` | — | — |
@@ -65,6 +66,7 @@
 //! | ← | `0x86` | `Pong` | — | — |
 //! | ← | `0x88` | `KeyRequest` | `id:u64 ‖ digest:[32] ‖ operation:KeyOperation ‖ approvals:u8 ‖ quorum:u8` | — |
 //! | ← | `0x89`, `0x8A` | (retired by A-102: `Approved`, `PendingDestruction`) | — | — |
+//! | ← | `0x8B` | `PolicyNext` (task A16) | `version:u64` | — |
 //! | ← | `0xFF` | shared `Refused` (A-59) | `code` | — |
 //!
 //! `KeyOperation := u8 1 RotateKrbtgt | u8 2 RotateKey ‖ service:[16] |
@@ -74,7 +76,13 @@
 //! replies (`0x89`, `0x8A`) were **retired by A-102** and are never reused
 //! (docs/52 §4.6, §4.8; docs/questions/Q-460): when an `Approve` completes
 //! the quorum, dird registers the decision in keyd itself (Role::Ldap), and
-//! keyadm executes it in keyd by the request's id. Kind `0x13` (the join token of docs/51 §7.3, task A12) is unused. Reply
+//! keyadm executes it in keyd by the request's id. `PolicyChange := u8 1
+//! AddPrincipal ‖ sid:bytes<68> ‖ tier:u8 | u8 2 RemovePrincipal ‖ sid | u8 3
+//! AddSubtree ‖ dn:seq<bytes<128>,16> ‖ tier | u8 4 RemoveSubtree ‖ dn`,
+//! `tier := 0 Tier0 | 1 Tier1 | 2 Tier2` — the tier-map edit's vocabulary
+//! (task A16, docs/51 §5.10; the `auth` of a `ChangePolicy` carries the
+//! requester and the approvers, every AP-REQ bound to the request's digest
+//! like any other operation's). Kind `0x13` (the join token of docs/51 §7.3, task A12) is unused. Reply
 //! `0x87` is admin.sock's `PasswordChanged`, never dird's. Request body
 //! ≤ 256 KiB, reply body ≤ 16 KiB ([`channel`]).
 //!
@@ -126,12 +134,12 @@ pub use digest::{operation_digest, wire_operation_digest, DigestError, OPERATION
 pub use server::{decode_request, encode_refusal, encode_reply, EncodeError, Rejection};
 pub use typed::{
     AccountExpires, AccountKind, Auth, ConversionError, Found, KeyOperation, KeyRef,
-    KeyRequestState, KeyTarget, LookupKey, Operation, PasswordSet, PasswordSetOutcome, Reply,
-    Request, ACCOUNT_EXPIRES_NEVER,
+    KeyRequestState, KeyTarget, LookupKey, Operation, PasswordSet, PasswordSetOutcome,
+    PolicyChange, PolicyTier, Reply, Request, ACCOUNT_EXPIRES_NEVER,
 };
 #[cfg(unix)]
 pub use unix::{UnixConnection, UnixConnector};
 pub use wire::{
     AdminReply, AdminRequest, WireAuth, WireKeyOperation, WireKeyRef, WireKeyRequest,
-    WireKeyTarget, WireLookupKey, WireOperation,
+    WireKeyTarget, WireLookupKey, WireOperation, WirePolicyChange,
 };

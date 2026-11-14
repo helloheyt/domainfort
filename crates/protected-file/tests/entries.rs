@@ -26,8 +26,8 @@ use std::path::{Path, PathBuf};
 
 use protected_file::{
     create_new_directory, create_new_file, create_new_read_write, directory_device, entry_facts,
-    remove_empty_directory, rename_no_replace, rename_replace, sync_directory, EntryError,
-    NewFileMode, OpenError, PathBreak,
+    remove_empty_directory, remove_entry, rename_no_replace, rename_replace, sync_directory,
+    EntryError, NewFileMode, OpenError, PathBreak,
 };
 use test_scratch::ScratchDir;
 
@@ -301,4 +301,56 @@ fn a_writable_or_foreign_directory_is_refused_everywhere() {
         );
         assert!(!exists(&etc.join("db")) && exists(&etc.join("kept")));
     }
+}
+
+// Task A16 (docs/51 §5.10; docs/questions/Q-591): `remove_entry` removes the
+// entry at its name relative to the walked directory — a regular file, or a
+// link as the link itself (its target untouched) — reports an absent name,
+// refuses a directory, and refuses a path through a link or a directory
+// writable by others before touching anything.
+#[test]
+fn remove_entry_removes_a_file_or_a_link_never_through_one() {
+    let scratch = Scratch::new("remove");
+    let uid = scratch.uid();
+    let dir = scratch.dir("d");
+    let file = dir.join("policy.next");
+    std::fs::write(&file, b"next").unwrap();
+    assert_eq!(remove_entry(&file, uid), Ok(true));
+    assert!(!exists(&file));
+    assert_eq!(remove_entry(&file, uid), Ok(false));
+
+    // A link is removed as itself; its target stays.
+    let target = dir.join("target");
+    std::fs::write(&target, b"keep").unwrap();
+    let link = scratch.link("d/link", &target);
+    assert_eq!(remove_entry(&link, uid), Ok(true));
+    assert!(!exists(&link));
+    assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+
+    // A directory is not removed here.
+    let sub = scratch.dir("d/sub");
+    assert_eq!(
+        remove_entry(&sub, uid),
+        Err(EntryError::Io(ErrorKind::IsADirectory))
+    );
+    assert!(sub.is_dir());
+
+    // Through a link in a directory component: refused, the file stays.
+    let alias = scratch.link("alias", &dir);
+    assert_eq!(
+        remove_entry(&alias.join("target"), uid),
+        Err(EntryError::Path(PathBreak::NotADirectory))
+    );
+    assert!(exists(&target));
+
+    // A directory writable by others: refused, the file stays.
+    chmod(&dir, 0o777);
+    assert_eq!(
+        remove_entry(&target, uid),
+        Err(EntryError::Path(
+            PathBreak::DirectoryWritableByGroupOrOthers
+        ))
+    );
+    chmod(&dir, 0o700);
+    assert!(exists(&target));
 }

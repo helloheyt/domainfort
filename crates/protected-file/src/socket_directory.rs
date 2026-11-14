@@ -246,12 +246,51 @@ pub fn prepare_socket_directory(
     socket: &Path,
     owner: SocketDirectoryOwner,
 ) -> Result<(), SocketDirectoryError> {
+    let absolute = absolute(socket).map_err(|error| SocketDirectoryError::Io(error.kind()))?;
+    let (directory, socket_name) = prepare_directory_of(absolute.as_os_str().as_bytes(), &owner)?;
+    remove_stale_socket(&directory, socket_name)
+}
+
+/// Prepare the directory the daemon-owned file at `file` lives in, for the
+/// daemon whose account is `owner`: steps 1-2 of this module's
+/// documentation (the parent walked; an existing directory checked under the
+/// same rule, a missing one created by descriptor — mode exactly
+/// [`SOCKET_DIRECTORY_MODE`], owner and group set with `fchown` on its own
+/// descriptor), **without** step 3 — nothing in it is removed. The one
+/// implementation for a data directory a daemon keeps after its drop, as
+/// root before the drop: dird's `policy.next` directory (task A16,
+/// docs/51 §5.10; docs/questions/Q-591).
+///
+/// # Errors
+/// [`SocketDirectoryError`] (its `NoSocketDirectory` here: the path has no
+/// directory to prepare).
+///
+/// Spec: this module's documentation; docs/51 §5.10 (dird writes
+/// `policy.next`); docs/52 §3.13 (C13); docs/questions/Q-591.
+pub fn prepare_daemon_directory(
+    file: &Path,
+    owner: SocketDirectoryOwner,
+) -> Result<(), SocketDirectoryError> {
+    let absolute = absolute(file).map_err(|error| SocketDirectoryError::Io(error.kind()))?;
+    prepare_directory_of(absolute.as_os_str().as_bytes(), &owner).map(|_| ())
+}
+
+/// Steps 1-2 for the absolute path of an entry inside the directory:
+/// the directory's descriptor (checked or created) and the entry's name.
+///
+/// # Errors
+/// [`SocketDirectoryError`].
+///
+/// Spec: this module's documentation, steps 1-2.
+fn prepare_directory_of<'p>(
+    absolute: &'p [u8],
+    owner: &SocketDirectoryOwner,
+) -> Result<(OwnedFd, &'p [u8]), SocketDirectoryError> {
     if owner.uid == ALL_ONES_ID || owner.gid == ALL_ONES_ID {
         return Err(SocketDirectoryError::NotAnAccount);
     }
-    let absolute = absolute(socket).map_err(|error| SocketDirectoryError::Io(error.kind()))?;
-    let (directory_path, socket_name) = split(absolute.as_os_str().as_bytes())
-        .map_err(|_| SocketDirectoryError::NoSocketDirectory)?;
+    let (directory_path, entry_name) =
+        split(absolute).map_err(|_| SocketDirectoryError::NoSocketDirectory)?;
     let (parent, name) =
         walk::<Infallible>(directory_path, owner.uid).map_err(|error| match error {
             OpenError::Path(PathBreak::NoFileName) => SocketDirectoryError::NoSocketDirectory,
@@ -261,16 +300,16 @@ pub fn prepare_socket_directory(
         })?;
     let directory = match rustix::fs::statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(seen) => {
-            socket_directory_rule(&DirectoryFacts::of(&seen), &owner)
+            socket_directory_rule(&DirectoryFacts::of(&seen), owner)
                 .map_err(SocketDirectoryError::Directory)?;
             let directory = open_directory_no_follow(&parent, name).map_err(system)?;
-            check_opened(&directory, &owner)?;
+            check_opened(&directory, owner)?;
             directory
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => create(&parent, name, &owner)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => create(&parent, name, owner)?,
         Err(error) => return Err(system(error)),
     };
-    remove_stale_socket(&directory, socket_name)
+    Ok((directory, entry_name))
 }
 
 /// Create the socket directory `name` relative to `parent`, by descriptor

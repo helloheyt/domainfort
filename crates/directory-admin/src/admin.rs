@@ -425,10 +425,10 @@ pub(crate) fn subject_of(
 }
 
 /// The per-request part every operation handler reads.
-struct OpCx<'o, 'c, 'v, 'a> {
-    cx: &'o Cx<'c, 'v, 'a>,
-    requester: &'o AdminSubject,
-    approvals: &'o [VerifiedTicket],
+pub(crate) struct OpCx<'o, 'c, 'v, 'a> {
+    pub(crate) cx: &'o Cx<'c, 'v, 'a>,
+    pub(crate) requester: &'o AdminSubject,
+    pub(crate) approvals: &'o [VerifiedTicket],
 }
 
 /// The object a create makes.
@@ -457,7 +457,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
     /// The requester's decision on `action` / `resource`; the reason goes to
     /// the event. Deny ⇒ `PolicyDenied`. Spec: docs/51 §7.4 step 3; docs/11
     /// §4.
-    fn authorize(
+    pub(crate) fn authorize(
         &self,
         ctx: &OpCx<'_, '_, '_, '_>,
         base: &mut EventBase,
@@ -522,7 +522,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
     /// the requester plus the approvals must reach the quorum. Approvals
     /// supplied when dual control does not apply are checked all the same
     /// (docs/questions/Q-357 items 3-4).
-    fn dual_control(
+    pub(crate) fn dual_control(
         &self,
         ctx: &OpCx<'_, '_, '_, '_>,
         base: &mut EventBase,

@@ -175,8 +175,9 @@ fn remaining(start: Instant, deadline: Duration) -> Result<Duration, TransportEr
 /// Whether `reply` is an answer `request` can receive (the closed reply
 /// column of docs/51 §7.3: `GUID, SID` for a create, the key targets for
 /// `BeginPasswordSet`, `()` for the others, `Found` for `Lookup`, the
-/// pending request for `RequestKeyOperation` / `Approve`; a refusal for
-/// any operation; `Pong` for `Ping`).
+/// pending request for `RequestKeyOperation` / `Approve`, the version written
+/// for `ChangePolicy` (task A16); a refusal for any operation; `Pong` for
+/// `Ping`).
 /// Spec: docs/51 §7.3; docs/50 §3.3 (replies decoded with the same
 /// strictness).
 #[must_use]
@@ -186,6 +187,7 @@ pub fn answers(request: &Request, reply: &Reply) -> bool {
         Request::Operation { operation, .. } => match reply {
             Reply::Refused(_) => true,
             Reply::Pong => false,
+            Reply::PolicyNext { .. } => matches!(operation, Operation::ChangePolicy { .. }),
             Reply::KeyRequest(_) => matches!(
                 operation,
                 Operation::RequestKeyOperation { .. } | Operation::Approve { .. }

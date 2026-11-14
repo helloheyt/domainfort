@@ -99,7 +99,14 @@
 //!   [`create_new_directory`], [`create_new_file`],
 //!   [`create_new_read_write`], [`rename_no_replace`], [`rename_replace`],
 //!   [`remove_empty_directory`], [`sync_directory`] — each walks its path(s)
-//!   and acts with the `*at` call relative to the walked descriptor.
+//!   and acts with the `*at` call relative to the walked descriptor;
+//! * dird's `policy.next` (task A16, docs/51 §5.10): its directory prepared
+//!   as root before the drop by [`prepare_daemon_directory`] (the socket
+//!   directory's steps 1-2, nothing removed), the file written by dird with
+//!   [`create_new_read_write`] + [`rename_no_replace`] (exclusive create of a
+//!   partial file, no-replace rename — one pending change at a time), and
+//!   removed by root's activation with [`remove_entry`] (`unlinkat` of a
+//!   non-directory relative to the walked directory).
 //!
 //! Every mode a created entry gets is one of a closed set (0400, 0600, 0644
 //! for files; 0700 for the installer's staging directory; 0750 for a socket
@@ -191,13 +198,13 @@ mod write;
 
 pub use entries::{
     create_new_directory, create_new_file, create_new_read_write, directory_device, entry_facts,
-    remove_empty_directory, rename_no_replace, rename_replace, sync_directory, Device, EntryError,
-    NewFileMode,
+    remove_empty_directory, remove_entry, rename_no_replace, rename_replace, sync_directory,
+    Device, EntryError, NewFileMode,
 };
 pub use listing::for_each_entry_beside;
 pub use socket_directory::{
-    prepare_socket_directory, ExistingGroup, SocketDirectoryBreak, SocketDirectoryError,
-    SocketDirectoryOwner, SOCKET_DIRECTORY_MODE,
+    prepare_daemon_directory, prepare_socket_directory, ExistingGroup, SocketDirectoryBreak,
+    SocketDirectoryError, SocketDirectoryOwner, SOCKET_DIRECTORY_MODE,
 };
 pub use write::{create_new_append, open_append, open_read_write};
 

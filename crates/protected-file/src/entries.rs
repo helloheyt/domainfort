@@ -44,7 +44,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags, RenameFlags};
 
 use crate::{
     absolute, directory_rule, make_directory, walk, walk_to_directory, DirectoryFacts, FileFacts,
@@ -333,6 +333,42 @@ pub fn remove_empty_directory(path: &Path, owner_uid: u32) -> Result<(), EntryEr
     let absolute = absolute(path).map_err(|error| EntryError::Io(error.kind()))?;
     let (directory, name) = parent_of(absolute.as_os_str().as_bytes(), owner_uid)?;
     rustix::fs::unlinkat(&directory, name, AtFlags::REMOVEDIR).map_err(system)
+}
+
+/// Remove the entry at `path` that is **not a directory**, relative to its
+/// walked parent: inspected without following a link (a directory is
+/// refused — `remove_empty_directory` is the only way to remove one), then
+/// `unlinkat` without `REMOVEDIR`. A link at the name is removed as the
+/// link itself — `unlinkat` never follows the last component — so nothing
+/// outside the walked directory is touched. `Ok(false)` when nothing is
+/// there.
+///
+/// Callers: root's activation of dird's `policy.next` (it removes the file
+/// it installed, owned by dird's account), and dird removing the partial
+/// file an interrupted `policy.next` write left in its own directory (task
+/// A16, docs/51 §5.10; docs/questions/Q-591).
+///
+/// # Errors
+/// [`EntryError::Path`] when the path's shape or a directory on it breaks
+/// the directory rule; [`EntryError::Io`] when the inspection (other than
+/// "absent") or the removal fails, or with `IsADirectory` for a directory.
+///
+/// Spec: docs/51 §5.10; docs/52 §3.13 (C13); rustix docs.rs `fs::statat`
+/// with `AtFlags::SYMLINK_NOFOLLOW`, `fs::FileType::is_dir`, `fs::unlinkat`
+/// ("Unlinks a file or remove a directory"; without `REMOVEDIR` a file).
+pub fn remove_entry(path: &Path, owner_uid: u32) -> Result<bool, EntryError> {
+    let absolute = absolute(path).map_err(|error| EntryError::Io(error.kind()))?;
+    let (directory, name) = parent_of(absolute.as_os_str().as_bytes(), owner_uid)?;
+    match rustix::fs::statat(&directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(seen) if FileType::from_raw_mode(seen.st_mode).is_dir() => {
+            Err(EntryError::Io(io::ErrorKind::IsADirectory))
+        }
+        Ok(_) => rustix::fs::unlinkat(&directory, name, AtFlags::empty())
+            .map(|()| true)
+            .map_err(system),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(system(error)),
+    }
 }
 
 /// `fsync` the directory at `path` (makes a creation, rename or removal in

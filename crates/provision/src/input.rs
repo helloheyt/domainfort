@@ -172,6 +172,12 @@ pub struct Paths {
     pub tls_certificate: FilePath,
     /// The operator's DC private key (named in ldap-front's file only).
     pub tls_private_key: FilePath,
+    /// Where dird writes `policy.next` (`policy_next_path`, named in dird's
+    /// file only; task A16): a file in a directory of dird's own, which dird
+    /// prepares at its start — never created here, and never a directory
+    /// another path of this run lies in (docs/51 §5.10; docs/questions/
+    /// Q-591).
+    pub policy_next: FilePath,
 }
 
 /// The network settings of the configuration files, in the spelling
@@ -272,6 +278,9 @@ pub enum InputErrorKind {
     /// Two servers' sockets share a directory (docs/50 §3.1: each socket in
     /// its own directory).
     SharedSocketDirectory,
+    /// `policy-next-path` lies in a directory another path of the run lies
+    /// in (task A16: it must be a directory of dird's own — docs/51 §5.10).
+    SharedPolicyNextDirectory,
     /// A network list item is empty or holds a separator.
     NetworkItem,
     /// No kdc listener, or neither LDAP nor LDAPS listener.
@@ -316,6 +325,9 @@ impl fmt::Display for InputError {
             InputErrorKind::TooManyFirstAdmins => "too many first administrators",
             InputErrorKind::DuplicatePath => "path used twice",
             InputErrorKind::SharedSocketDirectory => "two sockets share a directory",
+            InputErrorKind::SharedPolicyNextDirectory => {
+                "the policy.next directory is shared with another path (it must be dird's own)"
+            }
             InputErrorKind::NetworkItem => "network item empty or holds a separator",
             InputErrorKind::MissingListener => "listener missing",
             InputErrorKind::MissingInternalNetwork => {
@@ -547,7 +559,7 @@ impl DomainInput {
     /// directory, owned by the server's uid"); Q-230 item 16.
     fn check_paths(&self) -> Result<(), InputError> {
         let p = &self.paths;
-        let named: [(&'static str, &FilePath); 21] = [
+        let named: [(&'static str, &FilePath); 22] = [
             ("staging-dir", &p.staging),
             ("database-path", &p.database),
             ("integrity-key-path", &p.integrity_key),
@@ -569,6 +581,7 @@ impl DomainInput {
             ("admin-socket", &p.admin_socket),
             ("tls-certificate-path", &p.tls_certificate),
             ("tls-private-key-path", &p.tls_private_key),
+            ("policy-next-path", &p.policy_next),
         ];
         for (i, (field, path)) in named.iter().enumerate() {
             let rest = named.get(i + 1..).unwrap_or_default();
@@ -600,6 +613,21 @@ impl DomainInput {
                     InputErrorKind::SharedSocketDirectory,
                 ));
             }
+        }
+        // Task A16: `policy.next` lives in a directory of dird's own (dird
+        // prepares it, owned by its account) — never one another path of
+        // this run lies in (root's files' directories are root's, A-113; a
+        // socket's directory is its server's).
+        // Spec: docs/51 §5.10; docs/questions/Q-591.
+        if named
+            .iter()
+            .filter(|(field, _)| *field != "policy-next-path")
+            .any(|(_, other)| other.parent() == p.policy_next.parent())
+        {
+            return Err(InputError::new(
+                "policy-next-path",
+                InputErrorKind::SharedPolicyNextDirectory,
+            ));
         }
         Ok(())
     }

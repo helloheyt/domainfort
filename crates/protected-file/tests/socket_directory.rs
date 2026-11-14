@@ -23,8 +23,8 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt}
 use std::path::{Path, PathBuf};
 
 use protected_file::{
-    prepare_socket_directory, ExistingGroup, PathBreak, SocketDirectoryBreak, SocketDirectoryError,
-    SocketDirectoryOwner, SOCKET_DIRECTORY_MODE,
+    prepare_daemon_directory, prepare_socket_directory, ExistingGroup, PathBreak,
+    SocketDirectoryBreak, SocketDirectoryError, SocketDirectoryOwner, SOCKET_DIRECTORY_MODE,
 };
 use test_scratch::ScratchDir;
 
@@ -276,4 +276,54 @@ fn a_path_without_a_socket_directory_or_a_non_account_is_refused() {
         );
     }
     assert!(std::fs::symlink_metadata(scratch.0.join("run")).is_err());
+}
+
+// Task A16 (docs/51 §5.10; docs/questions/Q-591): a daemon's data directory
+// — dird's `policy.next` directory — is prepared by the same steps 1-2 as a
+// socket directory (created 0750 with the daemon's owner and group, an
+// existing one judged by the same rule, a link refused), and nothing in it
+// is ever removed: not a file, not even a socket at the file's name.
+#[test]
+fn a_daemon_directory_is_prepared_like_a_socket_directory_and_nothing_is_removed() {
+    let scratch = Scratch::new("daemon");
+    let owner = scratch.owner(ExistingGroup::ChosenByOperator);
+    let file = scratch.0.join("state").join("policy.next");
+    assert_eq!(prepare_daemon_directory(&file, owner), Ok(()));
+    let created = std::fs::symlink_metadata(scratch.0.join("state")).unwrap();
+    assert!(created.is_dir());
+    assert_eq!(created.mode() & 0o7777, SOCKET_DIRECTORY_MODE);
+    assert_eq!(created.uid(), owner.uid);
+    // A pending file and a socket at the file's name stay.
+    std::fs::write(&file, b"pending").unwrap();
+    assert_eq!(prepare_daemon_directory(&file, owner), Ok(()));
+    assert_eq!(std::fs::read(&file).unwrap(), b"pending");
+    std::fs::remove_file(&file).unwrap();
+    stale_socket(&file);
+    assert_eq!(prepare_daemon_directory(&file, owner), Ok(()));
+    assert!(std::fs::symlink_metadata(&file).is_ok(), "nothing removed");
+    // An existing directory open to others is refused, as a socket
+    // directory would be.
+    let open = scratch.dir("open", 0o755);
+    assert_eq!(
+        prepare_daemon_directory(&open.join("policy.next"), owner),
+        Err(SocketDirectoryError::Directory(
+            SocketDirectoryBreak::GroupWriteOrOtherAccess
+        ))
+    );
+    // A link at the directory's name is refused, not followed.
+    let real = scratch.dir("real", 0o750);
+    let link = scratch.link("alias", &real);
+    assert_eq!(
+        prepare_daemon_directory(&link.join("policy.next"), owner),
+        Err(SocketDirectoryError::Directory(
+            SocketDirectoryBreak::NotADirectory
+        ))
+    );
+    // A link in the parent's path is refused by the walk.
+    let parent_link = scratch.link("parent-alias", &scratch.0);
+    assert_eq!(
+        prepare_daemon_directory(&parent_link.join("fresh").join("policy.next"), owner),
+        Err(SocketDirectoryError::Path(PathBreak::NotADirectory))
+    );
+    assert!(!scratch.0.join("fresh").exists());
 }

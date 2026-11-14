@@ -32,6 +32,7 @@
 use crate::admin_service::{AdminServeParams, DecisionAckDeadline};
 use crate::daemon::{DaemonControl, DaemonError, OpenedStore, Stopped, StoreSource};
 use crate::policy::DevelopmentPolicy;
+use crate::policy_next::PolicyNextFile;
 use core::time::Duration;
 use dirstore::{NodeId, Store};
 use provision_manifest::Manifest;
@@ -73,6 +74,9 @@ pub struct AdminParams {
     /// How often the admin thread re-registers lost destroy decisions
     /// (kept within the crate's bounds by the admin thread).
     pub destroy_reconcile_interval: Duration,
+    /// `policy_next_path` and its owner (task A16) — a configured value,
+    /// passed through as the product [`crate::AdminParams`] carries it.
+    pub policy_next: Option<PolicyNextFile>,
 }
 
 impl From<AdminParams> for AdminServeParams {
@@ -90,6 +94,7 @@ impl From<AdminParams> for AdminServeParams {
             ack_deadline: admin.ack_deadline,
             key_request_lifetime: admin.key_request_lifetime,
             destroy_reconcile_interval: admin.destroy_reconcile_interval,
+            policy_next: admin.policy_next,
         }
     }
 }
@@ -114,6 +119,7 @@ impl AdminParams {
             ack_deadline: full.ack_deadline,
             key_request_lifetime: full.key_request_lifetime,
             destroy_reconcile_interval: full.destroy_reconcile_interval,
+            policy_next: full.policy_next,
         }
     }
 }

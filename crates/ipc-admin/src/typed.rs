@@ -267,6 +267,12 @@ pub enum Reply {
     /// `Approve`); its id is the id of the decision dird registers in keyd
     /// when an `Approve` completes the quorum (A-102, docs/52 §4.3).
     KeyRequest(KeyRequestState),
+    /// dird's answer to a `ChangePolicy` it wrote as `policy.next` (task
+    /// A16): the version root's activation installs.
+    PolicyNext {
+        /// The `policy_version` of `policy.next`.
+        version: u64,
+    },
 }
 
 impl Reply {
@@ -338,6 +344,7 @@ impl Reply {
                     }
                 }
             }
+            AdminReply::PolicyNext { version } => Reply::PolicyNext { version: *version },
         })
     }
 
@@ -383,6 +390,7 @@ impl Reply {
                     }
                 }
             }
+            Reply::PolicyNext { version } => AdminReply::PolicyNext { version: *version },
         })
     }
 
@@ -402,6 +410,7 @@ impl Reply {
             }
             ipc_dird_admin::Reply::Pong => Some(Reply::Pong),
             ipc_dird_admin::Reply::KeyRequest(state) => Some(Reply::KeyRequest(state)),
+            ipc_dird_admin::Reply::PolicyNext { version } => Some(Reply::PolicyNext { version }),
             ipc_dird_admin::Reply::PasswordSet(_) => None,
         }
     }
@@ -409,7 +418,8 @@ impl Reply {
 
 /// Whether `reply` is an answer `request` can receive: `Created` for a
 /// create, `Found` for `Lookup`, `KeyRequest` for `RequestKeyOperation` /
-/// `Approve`, `Done` for the other forwarded operations,
+/// `Approve`, `PolicyNext` for `ChangePolicy` (task A16), `Done` for the
+/// other forwarded operations,
 /// `PasswordChanged` for `SetPassword`, a refusal for any operation, `Pong`
 /// for `Ping` (the closed reply column, docs/51 §7.3,
 /// §7.6).
@@ -425,6 +435,7 @@ pub fn answers(request: &Request, reply: &Reply) -> bool {
         Request::Forward { operation, .. } => match reply {
             Reply::Refused(_) => true,
             Reply::Pong | Reply::PasswordChanged(_) => false,
+            Reply::PolicyNext { .. } => matches!(operation, Operation::ChangePolicy { .. }),
             Reply::KeyRequest(_) => matches!(
                 operation,
                 Operation::RequestKeyOperation { .. } | Operation::Approve { .. }

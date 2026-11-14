@@ -24,8 +24,8 @@
 use daemon_sandbox::{apply, SingleThreadProof};
 use directory_daemon::log::{note, Note};
 use directory_daemon::startup::{
-    admin_params, hardening_plan, params, prepare_socket_directory, read_integrity_key,
-    read_policy, read_provision_manifest, read_settings,
+    admin_params, hardening_plan, params, prepare_policy_next_directory, prepare_socket_directory,
+    read_integrity_key, read_policy, read_provision_manifest, read_settings,
 };
 use directory_daemon::{serve_with_admin, DaemonControl, StoreSource};
 use std::io::Write;
@@ -112,6 +112,10 @@ fn main() -> ExitCode {
     };
     if let Err(error) = prepare_socket_directory(&settings) {
         return fail("socket directory", &error);
+    }
+    // Task A16: the directory dird writes `policy.next` in, when configured.
+    if let Err(error) = prepare_policy_next_directory(&settings) {
+        return fail("policy.next directory", &error);
     }
 
     // 4. Hardening, before any thread exists (R50-14).

@@ -52,6 +52,11 @@ keyd-types = { path = "../keyd-types" }
 krb-proto = { path = "../krb-proto" }
 # The `DirAdmin` audit event this crate plans (A-85). No conversion feature.
 ipc-audit = { path = "../ipc-audit" }
+# The development policy value and the one tier-map edit both
+# policy-change paths share (task A16, docs/51 §5.10: the online
+# `PolicyAdmin` path builds `policy.next` with the edit `provision policy`
+# uses offline). Our own crate; no crypto, no store.
+policy-store = { path = "../policy-store" }
 # SHA-256 of a pending key-operation request's operation digest (task A10,
 # docs/51 §5.6; docs/questions/Q-420). RustCrypto, OD-9; already in the
 # workspace lock and already in dird's graph (dirstore links it). License:

@@ -19,6 +19,7 @@
 //!     --keyd-socket <path> --dird-kdc-socket <path> --dird-ldap-socket <path> \
 //!     --dird-admin-socket <path> --audit-socket <path> --admin-socket <path> \
 //!     --tls-certificate-path <path> --tls-private-key-path <path> \
+//!     --policy-next-path <path> \
 //!     --kdc-listen <addr:port> [--kdc-listen …] \
 //!     [--ldap-listen <addr:port> …] [--ldaps-listen <addr:port> …] \
 //!     --internal-network <addr/prefix> [--internal-network …]
@@ -28,6 +29,8 @@
 //!             | --remove-principal <SID>
 //!             | --add-subtree <Tier0|Tier1|Tier2> <att=value> [<att=value> …]
 //!             | --remove-subtree <att=value> [<att=value> …]
+//!
+//! provision policy --activate-next --dird-config <path>
 //!
 //! provision first-admin-secret --manifest-path <path> --admind-config <path> \
 //!     [--password-file <sAMAccountName>=<path> …]
@@ -48,6 +51,13 @@
 //! sAMAccountName, `=`, and the file's absolute path; the name is matched
 //! against the manifest when the command runs (one file for every first
 //! administrator, or none).
+//!
+//! `policy --activate-next` (task A16, docs/51 §5.10) takes dird's
+//! configuration file and nothing else: the installed policy
+//! (`policy_store_path`), dird's `policy.next` (`policy_next_path`) and
+//! dird's account (`run_as_uid`, the file's expected owner) all come from
+//! that one file — the file dird itself reads — so root's activation and
+//! dird cannot disagree on a path or an owner (module crate::update).
 //!
 //! Spec: docs/51 §4.3 (the input; step 12), §4.4 (the password source),
 //! §5.10 (`provision policy`), §3 (D95); docs/50 §7.1 (numeric ids, no
@@ -85,6 +95,11 @@ pub enum Command {
         path: FilePath,
         /// The edits, in order.
         changes: Vec<TierChange>,
+    },
+    /// `provision policy --activate-next --dird-config <path>` (task A16).
+    ActivatePolicyNext {
+        /// dird's configuration file.
+        dird_config: FilePath,
     },
     /// `provision first-admin-secret …`.
     FirstAdminSecret(FirstAdminSecret),
@@ -163,6 +178,7 @@ const DOMAIN_FLAGS: &[(&str, Arity)] = &[
     ("--admin-socket", Arity::One),
     ("--tls-certificate-path", Arity::One),
     ("--tls-private-key-path", Arity::One),
+    ("--policy-next-path", Arity::One),
     ("--kdc-listen", Arity::Repeated),
     ("--ldap-listen", Arity::Repeated),
     ("--ldaps-listen", Arity::Repeated),
@@ -345,6 +361,7 @@ fn parse_domain(args: &[String]) -> Result<DomainInput, CliError> {
             admin_socket: f.path("--admin-socket")?,
             tls_certificate: f.path("--tls-certificate-path")?,
             tls_private_key: f.path("--tls-private-key-path")?,
+            policy_next: f.path("--policy-next-path")?,
         },
         network: Network {
             kdc_listen: f.all("--kdc-listen"),
@@ -408,8 +425,33 @@ fn value<'a>(
         .ok_or(CliError::Usage("a flag has no value"))
 }
 
+/// `provision policy --activate-next --dird-config <path>` (task A16): the
+/// two flags, in either order, each once, and nothing else.
+/// Spec: docs/51 §5.10; module documentation.
+fn parse_activate(args: &[String]) -> Result<Command, CliError> {
+    let usage = CliError::Usage("provision policy --activate-next --dird-config <path>");
+    let config = match args {
+        [a, b, c] if a == "--activate-next" && b == "--dird-config" => c,
+        [a, b, c] if a == "--dird-config" && c == "--activate-next" => b,
+        _ => return Err(usage),
+    };
+    if config.starts_with("--") {
+        return Err(usage);
+    }
+    let dird_config = FilePath::parse(config).map_err(|kind| {
+        CliError::Input(InputError {
+            field: "dird-config",
+            kind,
+        })
+    })?;
+    Ok(Command::ActivatePolicyNext { dird_config })
+}
+
 /// `provision policy …`.
 fn parse_policy(args: &[String]) -> Result<Command, CliError> {
+    if args.iter().any(|a| a == "--activate-next") {
+        return parse_activate(args);
+    }
     let mut rest = args.iter().peekable();
     let mut path = None;
     let mut changes = Vec::new();

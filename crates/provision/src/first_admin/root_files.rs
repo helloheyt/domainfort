@@ -96,6 +96,30 @@ pub fn read_admind_settings(path: &Path, root_uid: u32) -> Result<AdmindSettings
     AdmindSettings::parse(&contents).map_err(RootFileError::Config)
 }
 
+/// Read and parse dird's configuration file (owned by `root_uid`) — for
+/// `provision policy --activate-next` (task A16), which takes the installed
+/// policy's path, `policy.next`'s path and dird's account from the file dird
+/// itself reads.
+///
+/// # Errors
+/// [`RootFileError`].
+///
+/// Spec: docs/50 R50-15, §7.1; docs/51 §5.10; crates/config
+/// `DirdSettings::parse`; crates/protected-file `read_configuration_file`.
+pub fn read_dird_settings(
+    path: &Path,
+    root_uid: u32,
+) -> Result<config::DirdSettings, RootFileError> {
+    let contents =
+        protected_file::read_configuration_file(path, root_uid, config::limits::MAX_FILE_OCTETS)
+            .map_err(|refusal| match refusal {
+                Refusal::Unreadable(_) => RootFileError::Unreadable,
+                Refusal::Rule(rule) => rule_error(rule),
+                Refusal::TooLarge => RootFileError::TooLarge,
+            })?;
+    config::DirdSettings::parse(&contents).map_err(RootFileError::Config)
+}
+
 /// Read and parse the provisioning manifest (owned by `root_uid`), through
 /// crates/provision-manifest's reader — the one keyadm and dird use (A-96
 /// follow-up; Q-414 item 4).

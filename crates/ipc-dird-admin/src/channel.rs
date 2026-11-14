@@ -159,6 +159,23 @@ pub const MAX_CLASS_NAME: u32 = 64;
 /// Q-420.
 pub const DIGEST_LEN: usize = 32;
 
+/// Most tier-map changes one `ChangePolicy` request carries: four — every
+/// change is named in the request's audit events, which keep at most
+/// `ipc_audit::MAX_TARGET_NAMES` (4) names (pinned in crates/directory-daemon,
+/// which links both). A larger edit is several requests, each activated by
+/// root before the next (one pending change at a time). Project choice
+/// (task A16; docs/questions/Q-592).
+/// Spec: docs/51 §5.7 item 1 ("names only as `AuditText`"), §5.10.
+pub const MAX_POLICY_CHANGES: u32 = 4;
+
+/// Most RDN components of a tier-map subtree DN in a `ChangePolicy`
+/// request: 16 — so that four changes fit the 16 KiB payload bound
+/// (checked below). The policy file itself admits 64 (crate policy-store);
+/// a deeper subtree is edited offline (`provision policy`). Project choice
+/// (task A16; docs/questions/Q-592).
+/// Spec: docs/51 §7.5 ("payload ≤ 16 KiB").
+pub const MAX_POLICY_DN_COMPONENTS: u32 = 16;
+
 /// Body octets of the `auth` field at its largest.
 pub const MAX_AUTH: usize =
     4 + MAX_AP_REQ as usize + 4 + MAX_APPROVALS as usize * (4 + MAX_AP_REQ as usize);
@@ -195,6 +212,16 @@ const APPROVE_SIZE: usize = 8 + KEY_OPERATION_SIZE;
 /// Body octets of the largest key-request replies.
 const KEY_REQUEST_SIZE: usize = ENVELOPE + 8 + DIGEST_LEN + KEY_OPERATION_SIZE + 1 + 1;
 
+/// The largest tier-map change: its tag, then a SID and a tier, or a DN of
+/// [`MAX_POLICY_DN_COMPONENTS`] components and a tier (task A16).
+const POLICY_SUBTREE_CHANGE: usize =
+    1 + 4 + MAX_POLICY_DN_COMPONENTS as usize * (4 + MAX_DN_COMPONENT as usize) + 1;
+const POLICY_PRINCIPAL_CHANGE: usize = 1 + 4 + MAX_SID as usize + 1;
+/// Payload octets of the largest `ChangePolicy` after `auth`.
+const CHANGE_POLICY_SIZE: usize = 4 + MAX_POLICY_CHANGES as usize * POLICY_SUBTREE_CHANGE;
+/// Body octets of the `PolicyNext` reply: the version written.
+const POLICY_NEXT_SIZE: usize = ENVELOPE + 8;
+
 // The bounds agree with the values they are derived from and fit the body
 // bounds; checked at compile time, never at run time.
 const _: () = assert!(APPROVE_SIZE <= MAX_PAYLOAD);
@@ -210,6 +237,10 @@ const _: () = assert!(LOOKUP_SPN <= MAX_PAYLOAD);
 const _: () = assert!(ENVELOPE + MAX_AUTH + MAX_PAYLOAD <= MAX_REQUEST_BODY as usize);
 const _: () = assert!(PASSWORD_SET <= MAX_REPLY_BODY as usize);
 const _: () = assert!(FOUND <= MAX_REPLY_BODY as usize);
+const _: () = assert!(POLICY_PRINCIPAL_CHANGE <= POLICY_SUBTREE_CHANGE);
+const _: () = assert!(CHANGE_POLICY_SIZE <= MAX_PAYLOAD);
+const _: () = assert!(POLICY_NEXT_SIZE <= MAX_REPLY_BODY as usize);
+const _: () = assert!(MAX_POLICY_DN_COMPONENTS <= MAX_DN_COMPONENTS);
 
 // ---- kinds -----------------------------------------------------------------
 
@@ -264,6 +295,15 @@ pub mod request_kind {
     // §4.6; docs/questions/Q-460).
     /// `Ping`: the health check, no `auth`. Spec: docs/51 §7.3; docs/50 §7.5.
     pub const PING: u8 = 0x14;
+    /// `ChangePolicy {changes}` (appended by task A16): a tier-map edit
+    /// under mandatory dual control — the requester's AP-REQ and the
+    /// approvers' in `auth`, every one bound to this request's digest —
+    /// which dird writes as `policy.next` (version + 1) for root to
+    /// activate. `0x15` is admin.sock's `SetPassword` (the two channels
+    /// share the forwarded kinds' numbers), so this kind is `0x16`.
+    /// Spec: docs/51 §5.2 row 13, §5.6, §5.10 (R51-21); A-80;
+    /// docs/questions/Q-592.
+    pub const CHANGE_POLICY: u8 = 0x16;
 
     /// The kinds retired by A-102 — keyadm's `FetchApproved`, `Complete`,
     /// `ListPendingDestruction` — kept only so that tests can show the
@@ -289,6 +329,7 @@ pub mod request_kind {
         REQUEST_KEY_OPERATION,
         APPROVE,
         PING,
+        CHANGE_POLICY,
     ];
 }
 
@@ -318,6 +359,11 @@ pub mod reply_kind {
     pub const KEY_REQUEST: u8 = 0x88;
     // 0x89 (`Approved`) and 0x8A (`PendingDestruction`): keyadm's replies,
     // retired by A-102, never reused (docs/52 §4.6; docs/questions/Q-460).
+    /// `PolicyNext { version }` (appended by task A16): the answer to a
+    /// `ChangePolicy` dird wrote as `policy.next` — the version root's
+    /// activation will install.
+    /// Spec: docs/51 §5.10; docs/questions/Q-592.
+    pub const POLICY_NEXT: u8 = 0x8B;
 
     /// The reply kinds retired by A-102; never in [`ALL`], never reused.
     /// Spec: docs/52 §4.6; docs/questions/Q-460 (A-102).
@@ -333,6 +379,7 @@ pub mod reply_kind {
         REFUSED,
         PONG,
         KEY_REQUEST,
+        POLICY_NEXT,
     ];
 }
 
@@ -413,6 +460,28 @@ pub mod codes {
     /// `KeyRef`: a service object's `Service` key set; its objectGUID
     /// follows. Spec: docs/51 §6.
     pub const KEY_REF_SERVICE: u8 = 0x02;
+
+    /// `PolicyChange`: add `SID → tier` (a SID and a tier follow). The
+    /// four changes are the tier-map edit's vocabulary (crate policy-store
+    /// `TierChange`, the vocabulary of `provision policy`). Task A16.
+    /// Spec: docs/51 §5.10 ("add / remove rows of the map").
+    pub const POLICY_ADD_PRINCIPAL: u8 = 0x01;
+    /// `PolicyChange`: remove the row of a SID (the SID follows).
+    pub const POLICY_REMOVE_PRINCIPAL: u8 = 0x02;
+    /// `PolicyChange`: add `subtree → tier` (a DN and a tier follow).
+    pub const POLICY_ADD_SUBTREE: u8 = 0x03;
+    /// `PolicyChange`: remove the row of a subtree (the DN follows).
+    pub const POLICY_REMOVE_SUBTREE: u8 = 0x04;
+
+    /// A tier-map row's tier: `Tier0` — the policy file's own tier codes
+    /// (crate policy-store `codes::tier`, format 1's), without `Untiered`,
+    /// which is never a map row and so has no code here (unrepresentable).
+    /// Spec: crate policy-store (`tier := 0 Tier0 | 1 Tier1 | 2 Tier2`); A-36.
+    pub const TIER_0: u8 = 0x00;
+    /// A tier-map row's tier: `Tier1`.
+    pub const TIER_1: u8 = 0x01;
+    /// A tier-map row's tier: `Tier2`.
+    pub const TIER_2: u8 = 0x02;
 }
 
 /// What the client is told about a refused or failed operation (the reason

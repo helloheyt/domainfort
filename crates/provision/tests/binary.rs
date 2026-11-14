@@ -73,6 +73,7 @@ fn args(input: &provision::DomainInput) -> Vec<String> {
         ("--admin-socket", &p.admin_socket),
         ("--tls-certificate-path", &p.tls_certificate),
         ("--tls-private-key-path", &p.tls_private_key),
+        ("--policy-next-path", &p.policy_next),
     ] {
         push(flag, path.as_str().to_owned());
     }

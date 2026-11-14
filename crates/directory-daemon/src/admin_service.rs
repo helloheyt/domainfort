@@ -89,6 +89,15 @@
 //! than the manifest's admin service ⇒ the admin service does not start;
 //! dird's other services run (docs/questions/Q-386 item 3).
 //!
+//! # The policy change (task A16; docs/51 §5.10)
+//!
+//! `ChangePolicy` maps field for field onto crate policy-store's tier-map
+//! vocabulary ([`policy_change_of`]) — the one edit `provision policy` uses
+//! offline; the PEP decides it (`prepare_policy_change`) and dird writes the
+//! acknowledged candidate as `policy.next` ([`AdminParams::policy_next`],
+//! crate::policy_next). The channel's bounds are pinned against the PEP's
+//! and the policy file's below.
+//!
 //! # Protected objects
 //!
 //! `directory_admin::ProtectedObjects`: the service objects are the LDAP
@@ -102,6 +111,7 @@
 //! A-56; A-73; A-87; A-89; A-102.
 
 use crate::policy::DevelopmentPolicy;
+use crate::policy_next::PolicyNextFile;
 use crate::registration::DecisionRegistration;
 use core::fmt;
 use core::time::Duration;
@@ -118,7 +128,8 @@ use dtyp::Guid;
 use ipc_audit::AccountExpiresValue;
 use ipc_dird_admin::{
     AccountExpires, AccountKind, Found, KeyOperation, KeyRef, KeyRequestState, KeyTarget,
-    LookupKey, Operation, PasswordSet, PasswordSetOutcome, RefusalStatus, Reply,
+    LookupKey, Operation, PasswordSet, PasswordSetOutcome, PolicyChange, PolicyTier, RefusalStatus,
+    Reply,
 };
 use kdc::AccountSource;
 use keyd_types::{
@@ -127,6 +138,8 @@ use keyd_types::{
 };
 use krb_proto::Realm;
 use pdp::Dn;
+use pdp::Tier;
+use policy_store::TierChange;
 use provision_manifest::Manifest;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -488,6 +501,12 @@ pub struct AdminParams {
     pub node_id: NodeId,
     /// The provisioning manifest (docs/51 §4.3 step 8).
     pub manifest: Manifest,
+    /// `policy_next_path` with dird's own account (`run_as_uid`) as the
+    /// file's owner — where an approved tier-map change is written as
+    /// `policy.next` for root to activate (task A16, docs/51 §5.10); `None`
+    /// ⇒ `ChangePolicy` is answered `Unavailable` (policy changes offline
+    /// only). A configured value, not a seam.
+    pub policy_next: Option<PolicyNextFile>,
 }
 
 /// Everything the admin service runs with: the product [`AdminParams`] plus
@@ -528,6 +547,11 @@ pub(crate) struct AdminServeParams {
     /// [`MAX_DESTROY_RECONCILE_INTERVAL`]); it also does so once at start
     /// (A-105, crate::reconcile).
     pub destroy_reconcile_interval: Duration,
+    /// Where an approved tier-map change is written as `policy.next` for
+    /// root to activate (`policy_next_path`, owned by dird's account — task
+    /// A16, docs/51 §5.10); `None` ⇒ `ChangePolicy` is answered
+    /// `Unavailable` (policy changes are offline only).
+    pub policy_next: Option<PolicyNextFile>,
 }
 
 /// How often dird re-registers the destroy decisions keyd lost (A-105):
@@ -591,6 +615,8 @@ impl AdminServeParams {
             ack_deadline: DecisionAckDeadline::PRODUCTION,
             key_request_lifetime: directory_admin::KEY_REQUEST_LIFETIME,
             destroy_reconcile_interval: DESTROY_RECONCILE_INTERVAL,
+            // Task A16: configured, passed through.
+            policy_next: admin.policy_next,
         }
     }
 }
@@ -611,6 +637,7 @@ impl fmt::Debug for AdminServeParams {
                 "destroy_reconcile_interval",
                 &self.destroy_reconcile_interval,
             )
+            .field("policy_next", &self.policy_next.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -905,8 +932,41 @@ pub fn pep_operation(operation: &Operation) -> Option<PepOperation> {
             LookupKey::ServicePrincipalName(spn) => PepLookupKey::ServicePrincipalName(spn.clone()),
             LookupKey::Dn(dn) => PepLookupKey::Dn(Dn::new(dn.clone())),
         }),
-        Operation::RequestKeyOperation { .. } | Operation::Approve { .. } => return None,
+        Operation::RequestKeyOperation { .. }
+        | Operation::Approve { .. }
+        | Operation::ChangePolicy { .. } => return None,
     })
+}
+
+/// The tier-map edit's vocabulary of a typed `ChangePolicy` (task A16), if
+/// it is one: each change field for field (`Dn` of its components, the
+/// tier by name); no rule is applied here — the one tier-map edit (crate
+/// policy-store) checks every value and the PEP audits a refusal.
+/// Spec: docs/51 §5.10; crate policy-store `TierChange`; docs/questions/
+/// Q-590, Q-592.
+#[must_use]
+pub fn policy_change_of(operation: &Operation) -> Option<Vec<TierChange>> {
+    let Operation::ChangePolicy { changes } = operation else {
+        return None;
+    };
+    let tier = |tier: &PolicyTier| match tier {
+        PolicyTier::Tier0 => Tier::Tier0,
+        PolicyTier::Tier1 => Tier::Tier1,
+        PolicyTier::Tier2 => Tier::Tier2,
+    };
+    Some(
+        changes
+            .iter()
+            .map(|change| match change {
+                PolicyChange::AddPrincipal(sid, t) => TierChange::AddPrincipal(*sid, tier(t)),
+                PolicyChange::RemovePrincipal(sid) => TierChange::RemovePrincipal(*sid),
+                PolicyChange::AddSubtree(dn, t) => {
+                    TierChange::AddSubtree(Dn::new(dn.clone()), tier(t))
+                }
+                PolicyChange::RemoveSubtree(dn) => TierChange::RemoveSubtree(Dn::new(dn.clone())),
+            })
+            .collect(),
+    )
 }
 
 /// The wire status of the PEP's status (the same six values by name).
@@ -1011,3 +1071,14 @@ const _: () = assert!(ipc_dird_admin::channel::MAX_APPROVALS as usize == ipc_aud
 const _: () = assert!(ipc_dird_admin::channel::MAX_KVNOS as usize == ipc_audit::MAX_REPORTED_KVNOS);
 const _: () = assert!(ipc_dird_admin::channel::DIGEST_LEN == directory_admin::DIGEST_LEN);
 const _: () = assert!(directory_admin::MAX_QUORUM <= u8::MAX as usize);
+// Task A16: every change of a `ChangePolicy` the channel can carry is named
+// in its audit events, and the policy file can hold every subtree the
+// channel can carry.
+const _: () = assert!(
+    ipc_dird_admin::channel::MAX_POLICY_CHANGES as usize == directory_admin::MAX_POLICY_CHANGES
+);
+const _: () = assert!(directory_admin::MAX_POLICY_CHANGES == ipc_audit::MAX_TARGET_NAMES);
+const _: () =
+    assert!(ipc_dird_admin::channel::MAX_POLICY_DN_COMPONENTS <= policy_store::MAX_DN_COMPONENTS);
+const _: () = assert!(ipc_dird_admin::channel::MAX_DN_COMPONENT <= policy_store::MAX_COMPONENT);
+const _: () = assert!(ipc_dird_admin::channel::MAX_SID == policy_store::MAX_SID);

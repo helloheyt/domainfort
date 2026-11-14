@@ -16,6 +16,7 @@
 //! | outcome, expiry, lookup key, account kind, status | `u8` from a closed table |
 //! | `KeyOperation` | `u8 1 RotateKrbtgt` / `u8 2 RotateKey ‖ service:[16]` / `u8 3 RetireKvno ‖ KeyRef ‖ kvno:u32` |
 //! | `KeyRef` | `u8 1 Krbtgt` / `u8 2 Service ‖ principal:[16]` |
+//! | `PolicyChange` | `u8 1 AddPrincipal ‖ sid ‖ tier:u8` / `u8 2 RemovePrincipal ‖ sid` / `u8 3 AddSubtree ‖ dn:seq<bytes<128>,16> ‖ tier` / `u8 4 RemoveSubtree ‖ dn` (task A16) |
 //! | digest | 32 octets (a SHA-256 output, computed in dird) |
 //!
 //! Every request but `Ping` carries `auth`. keyadm's former requests
@@ -31,8 +32,8 @@
 use crate::channel::{
     codes, reply_kind, request_kind, RefusalStatus, DIGEST_LEN, MAX_APPROVALS, MAX_AP_REQ,
     MAX_BINDING_NAME, MAX_CLASS_NAME, MAX_DESCRIPTION, MAX_DNS_HOST_NAME, MAX_DN_COMPONENT,
-    MAX_DN_COMPONENTS, MAX_KEY_TARGETS, MAX_KVNOS, MAX_NAME, MAX_PRINCIPAL_NAME, MAX_REALM,
-    MAX_SALT, MAX_SID,
+    MAX_DN_COMPONENTS, MAX_KEY_TARGETS, MAX_KVNOS, MAX_NAME, MAX_POLICY_CHANGES,
+    MAX_POLICY_DN_COMPONENTS, MAX_PRINCIPAL_NAME, MAX_REALM, MAX_SALT, MAX_SID,
 };
 use ipc::{DerBlob, Error, MessageSet, Payload, Reader, Result, Writer};
 use keyd_types::KeyPurpose;
@@ -221,6 +222,121 @@ impl WireKeyOperation {
     }
 }
 
+/// A tier-map subtree DN of a `ChangePolicy` (task A16): at most
+/// [`MAX_POLICY_DN_COMPONENTS`] components of at most [`MAX_DN_COMPONENT`]
+/// octets, leaf first.
+/// Spec: docs/51 §5.10; crate::channel `MAX_POLICY_DN_COMPONENTS`.
+fn read_policy_dn(reader: &mut Reader<'_>) -> Result<Vec<Vec<u8>>> {
+    reader.read_seq(MAX_POLICY_DN_COMPONENTS, |r| {
+        read_owned(r, MAX_DN_COMPONENT)
+    })
+}
+
+/// Spec: docs/51 §5.10.
+fn write_policy_dn(writer: &mut Writer, dn: &[Vec<u8>]) -> Result<()> {
+    writer.write_seq(dn, MAX_POLICY_DN_COMPONENTS, |w, c| {
+        w.write_bytes(c, MAX_DN_COMPONENT)
+    })
+}
+
+/// A tier-map row's tier code (closed table: `Untiered` has none).
+/// Spec: crate::channel `codes::TIER_*`.
+fn read_tier(reader: &mut Reader<'_>) -> Result<u8> {
+    reader.read_enum(|c| matches!(c, codes::TIER_0 | codes::TIER_1 | codes::TIER_2).then_some(c))
+}
+
+/// One tier-map change of a `ChangePolicy` (task A16): the vocabulary of the
+/// tier-map edit (crate policy-store `TierChange`; `provision policy`).
+///
+/// `PolicyChange := u8 1 AddPrincipal ‖ sid:bytes<68> ‖ tier:u8 | u8 2
+/// RemovePrincipal ‖ sid | u8 3 AddSubtree ‖ dn:seq<bytes<128>, 16> ‖ tier |
+/// u8 4 RemoveSubtree ‖ dn`, `tier := 0 Tier0 | 1 Tier1 | 2 Tier2`.
+/// Spec: docs/51 §5.10 ("add / remove rows of the map"); docs/questions/
+/// Q-592.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WirePolicyChange {
+    /// Add `SID → tier`.
+    AddPrincipal {
+        /// The SID packet ([MS-DTYP] 2.4.2.2).
+        sid: Vec<u8>,
+        /// The tier code.
+        tier: u8,
+    },
+    /// Remove the row of a SID.
+    RemovePrincipal {
+        /// The SID packet.
+        sid: Vec<u8>,
+    },
+    /// Add `subtree → tier`.
+    AddSubtree {
+        /// The subtree's DN components, leaf first.
+        dn: Vec<Vec<u8>>,
+        /// The tier code.
+        tier: u8,
+    },
+    /// Remove the row of a subtree.
+    RemoveSubtree {
+        /// The subtree's DN components, leaf first.
+        dn: Vec<Vec<u8>>,
+    },
+}
+
+impl WirePolicyChange {
+    /// Spec: crate::channel `codes::POLICY_*`.
+    fn write(&self, writer: &mut Writer) -> Result<()> {
+        match self {
+            WirePolicyChange::AddPrincipal { sid, tier } => {
+                writer.write_enum(codes::POLICY_ADD_PRINCIPAL)?;
+                writer.write_bytes(sid, MAX_SID)?;
+                writer.write_enum(*tier)
+            }
+            WirePolicyChange::RemovePrincipal { sid } => {
+                writer.write_enum(codes::POLICY_REMOVE_PRINCIPAL)?;
+                writer.write_bytes(sid, MAX_SID)
+            }
+            WirePolicyChange::AddSubtree { dn, tier } => {
+                writer.write_enum(codes::POLICY_ADD_SUBTREE)?;
+                write_policy_dn(writer, dn)?;
+                writer.write_enum(*tier)
+            }
+            WirePolicyChange::RemoveSubtree { dn } => {
+                writer.write_enum(codes::POLICY_REMOVE_SUBTREE)?;
+                write_policy_dn(writer, dn)
+            }
+        }
+    }
+
+    /// Spec: crate::channel `codes::POLICY_*`, `codes::TIER_*`.
+    fn read(reader: &mut Reader<'_>) -> Result<WirePolicyChange> {
+        let tag = reader.read_enum(|c| {
+            matches!(
+                c,
+                codes::POLICY_ADD_PRINCIPAL
+                    | codes::POLICY_REMOVE_PRINCIPAL
+                    | codes::POLICY_ADD_SUBTREE
+                    | codes::POLICY_REMOVE_SUBTREE
+            )
+            .then_some(c)
+        })?;
+        Ok(match tag {
+            codes::POLICY_ADD_PRINCIPAL => WirePolicyChange::AddPrincipal {
+                sid: read_owned(reader, MAX_SID)?,
+                tier: read_tier(reader)?,
+            },
+            codes::POLICY_REMOVE_PRINCIPAL => WirePolicyChange::RemovePrincipal {
+                sid: read_owned(reader, MAX_SID)?,
+            },
+            codes::POLICY_ADD_SUBTREE => WirePolicyChange::AddSubtree {
+                dn: read_policy_dn(reader)?,
+                tier: read_tier(reader)?,
+            },
+            _ => WirePolicyChange::RemoveSubtree {
+                dn: read_policy_dn(reader)?,
+            },
+        })
+    }
+}
+
 /// The fields of one operation after `auth`.
 /// Spec: docs/51 §7.3 (the request column).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -332,6 +448,13 @@ pub enum WireOperation {
         /// The operation the approver approves.
         operation: WireKeyOperation,
     },
+    /// `ChangePolicy {changes}` (task A16): the tier-map edit, 1 to
+    /// [`MAX_POLICY_CHANGES`] changes (the count's lower bound is the
+    /// edit's own rule, applied in dird).
+    ChangePolicy {
+        /// The changes, in order.
+        changes: Vec<WirePolicyChange>,
+    },
 }
 
 impl WireOperation {
@@ -354,6 +477,7 @@ impl WireOperation {
             WireOperation::Lookup(_) => request_kind::LOOKUP,
             WireOperation::RequestKeyOperation { .. } => request_kind::REQUEST_KEY_OPERATION,
             WireOperation::Approve { .. } => request_kind::APPROVE,
+            WireOperation::ChangePolicy { .. } => request_kind::CHANGE_POLICY,
         }
     }
 
@@ -447,6 +571,9 @@ impl WireOperation {
                 writer.write_u64(*id)?;
                 operation.write(writer)
             }
+            WireOperation::ChangePolicy { changes } => {
+                writer.write_seq(changes, MAX_POLICY_CHANGES, |w, c| c.write(w))
+            }
         }
     }
 
@@ -534,6 +661,9 @@ impl WireOperation {
             request_kind::APPROVE => WireOperation::Approve {
                 id: reader.read_u64()?,
                 operation: WireKeyOperation::read(reader)?,
+            },
+            request_kind::CHANGE_POLICY => WireOperation::ChangePolicy {
+                changes: reader.read_seq(MAX_POLICY_CHANGES, WirePolicyChange::read)?,
             },
             _ => return Err(Error::UnknownKind),
         })
@@ -712,6 +842,11 @@ pub enum AdminReply {
     Pong,
     /// `RequestKeyOperation` / `Approve`: the pending request.
     KeyRequest(WireKeyRequest),
+    /// `ChangePolicy` written as `policy.next` (task A16): its version.
+    PolicyNext {
+        /// The `policy_version` of the file dird wrote (the loaded one + 1).
+        version: u64,
+    },
 }
 
 impl MessageSet for AdminReply {
@@ -726,6 +861,7 @@ impl MessageSet for AdminReply {
             AdminReply::Refused(_) => reply_kind::REFUSED,
             AdminReply::Pong => reply_kind::PONG,
             AdminReply::KeyRequest(_) => reply_kind::KEY_REQUEST,
+            AdminReply::PolicyNext { .. } => reply_kind::POLICY_NEXT,
         }
     }
 
@@ -761,6 +897,7 @@ impl MessageSet for AdminReply {
                 writer.write_u8(request.approvals)?;
                 writer.write_u8(request.quorum)
             }
+            AdminReply::PolicyNext { version } => writer.write_u64(*version),
         }
     }
 
@@ -795,6 +932,9 @@ impl MessageSet for AdminReply {
                 approvals: reader.read_u8()?,
                 quorum: reader.read_u8()?,
             }),
+            reply_kind::POLICY_NEXT => AdminReply::PolicyNext {
+                version: reader.read_u64()?,
+            },
             _ => return Err(Error::UnknownKind),
         })
     }

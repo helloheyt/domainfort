@@ -1206,3 +1206,123 @@ fn admind_down_the_client_sees_closure() {
         w.finish();
     });
 }
+
+// ---------------------------------------------------------------------------
+// 4. `PolicyAdmin` online (task A16).
+// ---------------------------------------------------------------------------
+
+/// Task A16 (docs/51 §5.10, R51-21; A-80 on Q-299 option (b); P-22; A-69):
+/// over the real `admin.sock` → admind → `dird-admin.sock` → dird (keyd
+/// verifying every AP-REQ, auditd recording): one first administrator alone
+/// cannot change the tier map; with the second's approval in the same
+/// request dird writes `policy.next` (version 1 → 2) in its own directory;
+/// a second change is refused while it is pending; root's activation
+/// (`provision policy --activate-next`, reading dird's own configuration
+/// file) installs it — the daemons' loaders read version 2 — and removes
+/// `policy.next`; the verified audit log holds the decision with the
+/// requester, the approver and the change, then its outcome.
+#[test]
+fn a_dual_controlled_policy_change_is_written_for_root_and_activated() {
+    within(TEST_BOUND, || {
+        let _serial = serial();
+        let Some(mut w) = World::started() else {
+            return;
+        };
+        let ws = w.bootstrap_workstation();
+        let alice_tgt = w.armored_as(&ws, ALICE, ALICE_PASSWORD).ok().unwrap();
+        let alice = w.persona(ALICE, &alice_tgt);
+        let bob_tgt = w.armored_as(&ws, BOB, BOB_PASSWORD).ok().unwrap();
+        let bob = w.persona(BOB, &bob_tgt);
+        w.advance(10);
+        w.keyd_phase(KeydPhase::Admin);
+
+        let helpdesk =
+            dtyp::Sid::parse_sid_string(&format!("{}-1200", w.plan.domain_sid.to_sid_string()))
+                .unwrap();
+        let change = |tier| Operation::ChangePolicy {
+            changes: vec![ipc_dird_admin::PolicyChange::AddPrincipal(helpdesk, tier)],
+        };
+        assert_eq!(
+            w.forward(&alice, &[], change(ipc_dird_admin::PolicyTier::Tier1))
+                .refusal(),
+            RefusalStatus::ApprovalRequired,
+            "one administrator alone cannot change the policy"
+        );
+        assert_eq!(
+            w.forward(&alice, &[&bob], change(ipc_dird_admin::PolicyTier::Tier1))
+                .reply(),
+            Reply::PolicyNext { version: 2 }
+        );
+        let next = w.input.paths.policy_next.as_path().to_path_buf();
+        assert!(next.is_file(), "dird wrote policy.next");
+        assert_eq!(
+            w.forward(&bob, &[&alice], change(ipc_dird_admin::PolicyTier::Tier2))
+                .refusal(),
+            RefusalStatus::Unavailable,
+            "one pending change at a time"
+        );
+
+        // Root's activation, from dird's own configuration file.
+        let activated = provision::update::activate_policy_next(
+            &w.input.paths.dird_config,
+            &mut admin_world::provision_common::Recorder::new(w.uid),
+        )
+        .expect("root activates policy.next");
+        assert_eq!(activated.version.0, 2);
+        assert_eq!(
+            activated.changes,
+            vec![policy_store::TierChange::AddPrincipal(
+                helpdesk,
+                pdp::Tier::Tier1
+            )]
+        );
+        assert!(!next.exists(), "policy.next removed");
+        let installed = w.input.paths.policy.as_path();
+        let dird_view = directory_daemon::startup::read_policy(installed, w.uid).unwrap();
+        let kdc_view = kdc_daemon::startup::read_policy(installed, w.uid).unwrap();
+        assert_eq!(dird_view, kdc_view, "dird and the kdc load the same file");
+        assert_eq!(dird_view.version.0, 2);
+        assert_eq!(dird_view.principals.get(&helpdesk), Some(&pdp::Tier::Tier1));
+
+        let events = w.finish();
+        let changes: Vec<&DirAdminEvent> = dir_admin_events(&events)
+            .into_iter()
+            .map(|(_, e)| e)
+            .filter(|e| e.operation == DirAdminOperation::ChangePolicy)
+            .collect();
+        assert_eq!(changes.len(), 4, "{changes:?}");
+        assert_eq!(
+            changes[0].stage,
+            DirAdminStage::Decision(DecisionResult::Refused(AdminRefusal::ApprovalRequired))
+        );
+        assert_eq!(
+            changes[1].stage,
+            DirAdminStage::Decision(DecisionResult::Proceed)
+        );
+        assert!(changes[1].requester.is_some());
+        assert_eq!(changes[1].approvers.len(), 1);
+        assert_ne!(
+            changes[1].requester.as_ref(),
+            changes[1].approvers.as_slice().first()
+        );
+        let spelled = format!("--add-principal {} Tier1", helpdesk.to_sid_string());
+        assert_eq!(
+            changes[1]
+                .names
+                .as_slice()
+                .iter()
+                .map(|n| n.text.as_text())
+                .collect::<Vec<_>>(),
+            vec![Some(spelled.as_str())]
+        );
+        assert!(matches!(
+            changes[2].stage,
+            DirAdminStage::Outcome(OutcomeResult::Committed { .. })
+        ));
+        assert_eq!(changes[2].operation_id, changes[1].operation_id);
+        assert_eq!(
+            changes[3].stage,
+            DirAdminStage::Decision(DecisionResult::Refused(AdminRefusal::PendingLimit))
+        );
+    });
+}

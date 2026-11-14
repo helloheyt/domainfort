@@ -487,6 +487,8 @@ fn every_configuration_parses_with_its_schema() {
         "admin_ticket_age_max = 600s".to_owned(),
         "admin_quorum = 2".to_owned(),
         format!("provision_manifest = {}", input.paths.manifest.as_str()),
+        // Task A16 (docs/51 §5.10): where dird writes `policy.next`.
+        format!("policy_next_path = {}", input.paths.policy_next.as_str()),
     ];
     for line in expected {
         assert!(dird.lines().any(|l| l == line), "{line}");
@@ -781,6 +783,21 @@ fn shared_paths_and_socket_directories_are_refused() {
     );
     let mut i = input(&dir, 61002, 61007);
     i.paths.manifest = path(&dir, "etc/provision-staging/manifest");
+    assert_eq!(input_kind(refused(&i)), InputErrorKind::DuplicatePath);
+    // Task A16 (docs/51 §5.10; docs/questions/Q-591): `policy.next` lives
+    // in a directory of dird's own — not root's policy directory (A-113),
+    // not a socket's directory, not the same path as another.
+    for shared in ["etc/policy.next", "run/dird-admin/policy.next"] {
+        let mut i = input(&dir, 61002, 61007);
+        i.paths.policy_next = path(&dir, shared);
+        assert_eq!(
+            input_kind(refused(&i)),
+            InputErrorKind::SharedPolicyNextDirectory,
+            "{shared}"
+        );
+    }
+    let mut i = input(&dir, 61002, 61007);
+    i.paths.policy_next = i.paths.policy.clone();
     assert_eq!(input_kind(refused(&i)), InputErrorKind::DuplicatePath);
 }
 

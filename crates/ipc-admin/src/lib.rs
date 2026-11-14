@@ -40,6 +40,7 @@
 //! | → | `0x0E`, `0x0F` | `RequestKeyOperation`, `Approve` | dird's (`auth` ‖ fields) |
 //! | → | `0x10`–`0x12` | (retired by A-102: keyadm's `FetchApproved`, `Complete`, `ListPendingDestruction`) | — |
 //! | → | `0x15` | `SetPassword` | `auth ‖ completion:bytes<64 KiB> ‖ target:[16] ‖ password:secret bytes<1024>` |
+//! | → | `0x16` | `ChangePolicy` (task A16) | dird's (`auth` ‖ fields) |
 //! | ← | `0x81` | `Created` | dird's: `guid:[16] ‖ sid:Option<bytes<68>>` |
 //! | ← | `0x83` | `Done` | — |
 //! | ← | `0x84` | `Found` | dird's: `guid ‖ dn:seq<bytes<128>,64> ‖ class:bytes<64> ‖ sid?` |
@@ -48,6 +49,7 @@
 //! | ← | `0x87` | `PasswordChanged` | `kvnos:seq<u32,2> ‖ completion_recorded:bool` |
 //! | ← | `0x88` | `KeyRequest` | dird's |
 //! | ← | `0x89`, `0x8A` | (retired by A-102: `Approved`, `PendingDestruction`) | — |
+//! | ← | `0x8B` | `PolicyNext` (task A16) | dird's: `version:u64` |
 //! | ← | `0xFF` | shared `Refused` (A-59) | `code` |
 //!
 //! Unused kinds: `0x06` / `0x07` (dird's password-set steps — only admind

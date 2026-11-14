@@ -16,14 +16,14 @@ use ipc::{
 };
 use ipc_dird_admin::channel::{
     request_kind, MAX_AP_REQ, MAX_DESCRIPTION, MAX_DNS_HOST_NAME, MAX_DN_COMPONENT,
-    MAX_DN_COMPONENTS, MAX_NAME, MAX_PRINCIPAL_NAME,
+    MAX_DN_COMPONENTS, MAX_NAME, MAX_POLICY_CHANGES, MAX_POLICY_DN_COMPONENTS, MAX_PRINCIPAL_NAME,
 };
 use ipc_dird_admin::{
     decode_request, encode_reply, AccountExpires, AccountKind, AdminReply, AdminRequest, Auth,
     Found, KeyOperation, KeyRef, KeyRequestState, KeyTarget, LookupKey, Operation, PasswordSet,
-    PasswordSetOutcome, RefusalStatus, Rejection, Reply, Request, ACCOUNT_EXPIRES_NEVER,
-    ADMIN_CHANNEL, ADMIN_MAGIC, ADMIN_VERSION, MAX_REPLY_BODY, MAX_REQUEST_BODY, REPLY_LIMIT,
-    REQUEST_LIMIT,
+    PasswordSetOutcome, PolicyChange, PolicyTier, RefusalStatus, Rejection, Reply, Request,
+    ACCOUNT_EXPIRES_NEVER, ADMIN_CHANNEL, ADMIN_MAGIC, ADMIN_VERSION, MAX_REPLY_BODY,
+    MAX_REQUEST_BODY, REPLY_LIMIT, REQUEST_LIMIT,
 };
 use keyd_types::{KeyHandle, KeyPurpose, PrincipalBinding, PrincipalId};
 use krb_proto::constants::{KRB_NT_PRINCIPAL, KRB_NT_SRV_HST};
@@ -176,6 +176,24 @@ fn requests() -> Vec<Request> {
             },
         }),
         Request::Ping,
+        // Task A16: every change of the tier-map edit, and the bound.
+        Request::Operation {
+            auth: auth(2),
+            operation: Operation::ChangePolicy {
+                changes: vec![
+                    PolicyChange::AddPrincipal(sid(1200), PolicyTier::Tier1),
+                    PolicyChange::RemovePrincipal(sid(1201)),
+                    PolicyChange::AddSubtree(
+                        vec!["ou=Lab".into(), "dc=example".into(), "dc=test".into()],
+                        PolicyTier::Tier2,
+                    ),
+                    PolicyChange::RemoveSubtree(vec!["ou=Old".into(), "dc=test".into()]),
+                ],
+            },
+        },
+        op(Operation::ChangePolicy {
+            changes: vec![PolicyChange::AddPrincipal(sid(1202), PolicyTier::Tier0)],
+        }),
     ]
 }
 
@@ -252,6 +270,9 @@ fn replies() -> Vec<Reply> {
             approvals: 1,
             quorum: 2,
         }),
+        // Task A16.
+        Reply::PolicyNext { version: 2 },
+        Reply::PolicyNext { version: u64::MAX },
     ]
 }
 
@@ -754,4 +775,117 @@ fn directions_do_not_mix() {
     assert!(decode_body::<AdminRequest>(ADMIN_CHANNEL, Direction::Request, &body).is_err());
     let body = request_body(&Request::Ping);
     assert!(decode_reply::<AdminReply>(ADMIN_CHANNEL, &body).is_err());
+}
+
+/// Task A16 (docs/51 §5.10; docs/questions/Q-592): the `ChangePolicy`
+/// layout octet for octet — `auth ‖ changes:seq<PolicyChange, 4>`,
+/// `PolicyChange := u8 1 ‖ sid:bytes<68> ‖ tier:u8 | u8 2 ‖ sid | u8 3 ‖
+/// dn:seq<bytes<128>,16> ‖ tier | u8 4 ‖ dn`, `tier := 0 | 1 | 2` — and the
+/// `PolicyNext` reply (`version:u64`), assembled by hand.
+#[test]
+fn change_policy_layout() {
+    let request = Request::Operation {
+        auth: Auth {
+            requester: vec![0xAA],
+            approvals: vec![vec![0xBB]],
+        },
+        operation: Operation::ChangePolicy {
+            changes: vec![
+                PolicyChange::AddPrincipal(sid(7), PolicyTier::Tier1),
+                PolicyChange::RemoveSubtree(vec!["ou=X".into()]),
+            ],
+        },
+    };
+    let mut expected = vec![0x44, 0x41, 0x01, 0x16];
+    expected.extend([0, 0, 0, 1, 0xAA, 0, 0, 0, 1, 0, 0, 0, 1, 0xBB]);
+    expected.extend([0, 0, 0, 2]);
+    let packet = sid(7).encode();
+    expected.push(0x01);
+    expected.extend((packet.len() as u32).to_be_bytes());
+    expected.extend(&packet);
+    expected.push(0x01);
+    expected.push(0x04);
+    expected.extend([0, 0, 0, 1, 0, 0, 0, 4]);
+    expected.extend(b"ou=X");
+    assert_eq!(request_body(&request), expected);
+    assert_eq!(decode_request(&expected).unwrap(), request);
+
+    let reply = reply_body(&Reply::PolicyNext { version: 0x0102 });
+    assert_eq!(
+        reply,
+        [0x44, 0x41, 0x01, 0x8B, 0, 0, 0, 0, 0, 0, 0x01, 0x02]
+    );
+}
+
+/// Task A16 (docs/51 §7.5; docs/questions/Q-592): at most
+/// `MAX_POLICY_CHANGES` changes and `MAX_POLICY_DN_COMPONENTS` components of
+/// at most `MAX_DN_COMPONENT` octets — refused one past each bound; the
+/// largest request fits the payload bound (it has a digest); `Untiered`
+/// (the policy file's code 3) and unknown change tags are malformed; a SID
+/// that does not decode is malformed.
+#[test]
+fn change_policy_bounds_and_codes() {
+    let subtree = |components: usize, len: usize| {
+        PolicyChange::AddSubtree(vec!["a".repeat(len); components], PolicyTier::Tier2)
+    };
+    let request = |changes: Vec<PolicyChange>| op(Operation::ChangePolicy { changes });
+    // The largest request: every change a subtree at the component bounds.
+    let largest_changes = vec![
+        subtree(MAX_POLICY_DN_COMPONENTS as usize, MAX_DN_COMPONENT as usize);
+        MAX_POLICY_CHANGES as usize
+    ];
+    let largest = request(largest_changes.clone());
+    let body = request_body(&largest);
+    assert_eq!(decode_request(&body).unwrap(), largest);
+    assert!(ipc_dird_admin::operation_digest(&Operation::ChangePolicy {
+        changes: largest_changes
+    })
+    .is_ok());
+    // One past each bound does not encode.
+    let unencodable = |r: Request| {
+        let wire = r.to_wire().unwrap();
+        encode_frame(ADMIN_CHANNEL, Direction::Request, &wire).is_err()
+    };
+    assert!(unencodable(request(vec![
+        subtree(1, 1);
+        MAX_POLICY_CHANGES as usize + 1
+    ])));
+    assert!(unencodable(request(vec![subtree(
+        MAX_POLICY_DN_COMPONENTS as usize + 1,
+        1
+    )])));
+    assert!(unencodable(request(vec![subtree(
+        1,
+        MAX_DN_COMPONENT as usize + 1
+    )])));
+    // A tier code outside the table (3 = Untiered in the policy file) and
+    // an unknown change tag are malformed.
+    let one = request(vec![PolicyChange::AddPrincipal(sid(9), PolicyTier::Tier0)]);
+    let mut body = request_body(&one);
+    let tier_at = body.len() - 1;
+    for bad in [0x03, 0x04, 0xFF] {
+        body[tier_at] = bad;
+        assert_eq!(
+            decode_request(&body),
+            Err(Rejection::Refuse(Refused::Malformed)),
+            "{bad:#x}"
+        );
+    }
+    let tag_at = body.len() - 1 - sid(9).encode().len() - 4 - 1;
+    let mut body = request_body(&one);
+    for bad in [0x00, 0x05] {
+        body[tag_at] = bad;
+        assert_eq!(
+            decode_request(&body),
+            Err(Rejection::Refuse(Refused::Malformed)),
+            "{bad:#x}"
+        );
+    }
+    // A SID packet that does not decode (revision 2, [MS-DTYP] 2.4.2.2).
+    let mut body = request_body(&one);
+    body[tag_at + 1 + 4] = 0x02;
+    assert_eq!(
+        decode_request(&body),
+        Err(Rejection::Refuse(Refused::Malformed))
+    );
 }

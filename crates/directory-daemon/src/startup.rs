@@ -11,6 +11,7 @@ use crate::admin_service::{AdminParams, KeydEndpoint};
 use crate::audit_link::AuditEndpoint;
 use crate::daemon::{DaemonParams, MAX_KDC_CONNECTIONS, MAX_LDAP_SESSIONS};
 use crate::policy::{read_file, DevelopmentPolicy, LoadError, PolicyError};
+use crate::policy_next::PolicyNextFile;
 use config::{DirdSettings, IntegrityKeySource, PolicyStoreFormat};
 use core::fmt;
 use daemon_sandbox::{HardeningPlan, PlanError, ProcessIdentity};
@@ -98,6 +99,10 @@ pub enum StartupError {
     /// The admin channel is configured without the settings it requires
     /// (the configuration refuses this; kept as a fail-closed guard).
     AdminSettings,
+    /// The directory of `policy_next_path` could not be prepared (a link or
+    /// a foreign or open directory on its path, an existing directory not
+    /// dird's or open to others, or the creation failed) — task A16.
+    PolicyNextDirectory,
 }
 
 impl fmt::Display for StartupError {
@@ -132,6 +137,9 @@ impl fmt::Display for StartupError {
             StartupError::AdminSettings => {
                 f.write_str("admin channel configured without its required settings")
             }
+            StartupError::PolicyNextDirectory => f.write_str(
+                "policy.next directory must be dird's, with no group write and no access for others, on a path of root's or dird's directories",
+            ),
         }
     }
 }
@@ -417,5 +425,42 @@ pub fn admin_params(
         quorum,
         node_id: dirstore::NodeId(node_id),
         manifest,
+        // Task A16: `policy_next_path`, owned by dird's own account — a
+        // configured value of the product parameters.
+        policy_next: service
+            .policy_next()
+            .map(|path| PolicyNextFile::new(path.as_path().to_path_buf(), settings.run_as().uid())),
     }))
+}
+
+/// The directory of `policy.next` (task A16, docs/51 §5.10), when the admin
+/// service names one: prepared as root before the drop through the one
+/// implementation every daemon-owned directory shares
+/// (`protected_file::prepare_daemon_directory`, the socket directory's
+/// steps): its parent walked from `/` (no link, every directory root's or
+/// dird's, none writable by group or others); missing ⇒ created relative to
+/// the parent, mode exactly 0750, handed to dird's account with `fchmod` /
+/// `fchown` on its own descriptor; present ⇒ it must be dird's, with no
+/// group write and no access for others. Nothing in it is removed (a pending
+/// `policy.next` survives a restart).
+///
+/// # Errors
+/// [`StartupError::PolicyNextDirectory`].
+///
+/// Spec: docs/51 §5.10; docs/52 §3.13 (C13); docs/questions/Q-591.
+pub fn prepare_policy_next_directory(settings: &DirdSettings) -> Result<(), StartupError> {
+    let Some(path) = settings
+        .admin_service()
+        .and_then(config::AdminServiceSettings::policy_next)
+    else {
+        return Ok(());
+    };
+    let account = settings.run_as();
+    let owner = SocketDirectoryOwner {
+        uid: account.uid(),
+        gid: account.gid(),
+        existing_group: ExistingGroup::ChosenByOperator,
+    };
+    protected_file::prepare_daemon_directory(path.as_path(), owner)
+        .map_err(|_| StartupError::PolicyNextDirectory)
 }

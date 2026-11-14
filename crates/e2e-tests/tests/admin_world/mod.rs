@@ -925,6 +925,9 @@ impl World {
             input.paths.admin_socket.as_path(),
             aux_keyd_socket.as_path(),
             grant_keyd_socket.as_path(),
+            // Task A16: dird's own `policy.next` directory, which dird's
+            // privileged set-up prepares (`prepare_policy_next_directory`).
+            input.paths.policy_next.as_path(),
         ] {
             std::fs::DirBuilder::new()
                 .recursive(true)
@@ -1843,6 +1846,7 @@ fn domain_input(dir: &ScratchDir, uid: u32) -> DomainInput {
             admin_socket: path("r/ad/a.sock"),
             tls_certificate: path("etc/dc-cert.der"),
             tls_private_key: path("etc/dc-key.der"),
+            policy_next: path("v/dp/policy.next"),
         },
         network: Network {
             kdc_listen: vec!["127.0.0.1:88".to_owned()],

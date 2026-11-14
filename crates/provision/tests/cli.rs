@@ -86,6 +86,7 @@ fn domain_args() -> Vec<String> {
         ("--admin-socket", "/srv/p/run/ad/admin.sock"),
         ("--tls-certificate-path", "/srv/p/etc/dc-cert.der"),
         ("--tls-private-key-path", "/srv/p/etc/dc-key.der"),
+        ("--policy-next-path", "/srv/p/var/dird-policy/policy.next"),
     ];
     for (flag, value) in paths {
         a.push(flag);

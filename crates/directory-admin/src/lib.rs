@@ -47,6 +47,19 @@
 //! `Delete` leaves to destroy, as [`TombstonedPrincipal`]s — the only input
 //! of a destroy decision (module `key_requests`; docs/51 §5.6, §6; A-105).
 //!
+//! # `PolicyAdmin` online (task A16; docs/51 §5.10, R51-21; A-80)
+//!
+//! [`DirectoryAdmin::prepare_policy_change`] decides a `ChangePolicy`
+//! request — a tier-map edit in the vocabulary of `provision policy` — with
+//! the PEP's own `authorize` (`PolicyAdmin` on the scope
+//! [`POLICY_CHANGE_SCOPE`]) and its one `dual_control`, always required;
+//! refuses while a `policy.next` waits for root ([`PendingPolicy`]); and
+//! builds the candidate with crate policy-store's one tier-map edit (the
+//! next version), decoded again by the format's own decoder before anything
+//! is written. The candidate leaves [`PreparedPolicyChange`] only as a
+//! [`PolicyCandidate`], made from the `ipc_audit::AckedIntent` of its
+//! decision event (module `policy_change`; docs/questions/Q-590..Q-593).
+//!
 //! # The proof of an acknowledged decision (docs/52 §3.11 R6, A-102)
 //!
 //! [`Prepared`] is not `Clone` and is its own `ipc_audit::IntentRecord`
@@ -145,6 +158,7 @@ mod invariants;
 mod key_requests;
 mod names;
 mod operation;
+mod policy_change;
 mod random;
 mod record;
 mod reply;
@@ -183,6 +197,12 @@ pub use names::{
 pub use operation::{
     CompletePasswordSet, CreateComputer, CreateContainerLike, CreateGroup, CreateUser, LookupKey,
     Membership, Operation, PasswordSetOutcome, SetAccountExpires, SetEnabled,
+};
+// `PolicyAdmin` online (task A16, docs/51 §5.10): the decided tier-map change
+// and the candidate `policy.next`, released only by auditd's acknowledgement.
+pub use policy_change::{
+    PendingPolicy, PolicyCandidate, PolicyChangeRequest, PreparedPolicyChange, MAX_POLICY_CHANGES,
+    POLICY_CHANGE_SCOPE,
 };
 pub use random::{OsRandom, RandomError, RandomSource};
 pub use reply::{KeyTarget, LookupResult, PasswordSetReply, Reply};

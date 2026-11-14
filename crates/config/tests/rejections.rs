@@ -1130,7 +1130,11 @@ fn dird_admin_pair_is_both_or_neither() {
     let err = error(Daemon::Dird, &text);
     assert_eq!(err.kind(), ErrorKind::IncompletePair);
     assert_eq!(err.key(), Some("admind_uid"));
-    let mut both_removed = remove(&remove(DIRD, "dird_admin_socket"), "admind_uid");
+    // Task A16: the optional admin-service key goes with the channel too.
+    let mut both_removed = remove(
+        &remove(&remove(DIRD, "dird_admin_socket"), "admind_uid"),
+        "policy_next_path",
+    );
     for key in ["admin_ticket_age_max", "admin_quorum", "provision_manifest"] {
         both_removed = remove(&both_removed, key);
     }
@@ -1186,7 +1190,12 @@ fn dird_admin_service_settings_follow_the_admin_channel() {
         assert_eq!(err.kind(), ErrorKind::MissingKey, "{key}");
         assert_eq!(err.key(), Some(key), "{key}");
     }
-    let without_channel = remove(&remove(DIRD, "dird_admin_socket"), "admind_uid");
+    // Task A16: the optional `policy_next_path` (refused without the
+    // channel, test below) is removed with the channel here.
+    let without_channel = remove(
+        &remove(&remove(DIRD, "dird_admin_socket"), "admind_uid"),
+        "policy_next_path",
+    );
     for key in ["admin_ticket_age_max", "admin_quorum", "provision_manifest"] {
         let mut text = without_channel.clone();
         for other in ["admin_ticket_age_max", "admin_quorum", "provision_manifest"] {
@@ -1206,6 +1215,39 @@ fn dird_admin_service_settings_follow_the_admin_channel() {
     }
     let s = DirdSettings::parse(text.as_bytes()).expect("node_id alone");
     assert!(s.node_id().is_some());
+}
+
+/// Task A16 (docs/51 §5.10; docs/questions/Q-591): `policy_next_path` is an
+/// admin-service setting — optional with the admin channel (absent ⇒ no
+/// online policy change), refused without it, and distinct from every other
+/// path of the file.
+#[test]
+fn dird_policy_next_path_follows_the_admin_channel() {
+    let s = DirdSettings::parse(DIRD.as_bytes()).expect("full sample");
+    assert_eq!(
+        s.admin_service()
+            .and_then(|a| a.policy_next())
+            .map(|p| p.as_path().to_path_buf()),
+        Some(std::path::PathBuf::from("/var/lib/dird/policy/policy.next"))
+    );
+    let without = remove(DIRD, "policy_next_path");
+    let s = DirdSettings::parse(without.as_bytes()).expect("optional");
+    assert!(s.admin_service().unwrap().policy_next().is_none());
+    let mut no_channel = remove(&remove(DIRD, "dird_admin_socket"), "admind_uid");
+    for other in ["admin_ticket_age_max", "admin_quorum", "provision_manifest"] {
+        no_channel = remove(&no_channel, other);
+    }
+    let err = error(Daemon::Dird, &no_channel);
+    assert_eq!(err.kind(), ErrorKind::IncompletePair);
+    assert_eq!(err.key(), Some("policy_next_path"));
+    assert_eq!(
+        err.line(),
+        line_of(&no_channel, "policy_next_path"),
+        "the line of the refused key"
+    );
+    let same = set(DIRD, "policy_next_path", "/etc/domain/policy.store");
+    let err = error(Daemon::Dird, &same);
+    assert_eq!(err.kind(), ErrorKind::DuplicatePath);
 }
 
 /// The ranges: ticket age 60 s ..= 3600 s; quorum 2 ..= 3.

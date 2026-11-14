@@ -39,9 +39,13 @@
 //! services run; **R2** — an administrator's valid AP-REQ made for one
 //! operation and attached to another (the Q-292 attack), an approval made
 //! for another operation, and an AP-REQ without its `cksum` are all
-//! `Denied`, the store unchanged.
+//! `Denied`, the store unchanged; **task A16** — a dual-controlled tier-map
+//! change written as `policy.next` (version + 1) with its decision and
+//! outcome events, and its refusals (one administrator, a self-approval, a
+//! non-Tier-0 requester, an approval for another change, a second pending
+//! change, no `policy_next_path`).
 //!
-//! Sources: docs/51 §5.2, §5.3, §5.6, §5.7, §7.1-§7.5; docs/52 §3.2, §5;
+//! Sources: docs/51 §5.2, §5.3, §5.6, §5.7, §5.10, §7.1-§7.5; docs/52 §3.2, §5;
 //! docs/50 §3.3, §3.6,
 //! §9; docs/10 §5ב; RFC 4120 §3.2.3, §5.3, §5.5.1, §6.2.1, §7.5.1; [MS-SAMR]
 //! 2.2.1.14 (RID 502); [MS-DTYP] 2.4.2.4 (SID layout); docs/11 §2, §8;
@@ -59,6 +63,7 @@ use ad_schema::{phase1, Phase1Schema};
 use core::time::Duration;
 use directory_admin::{wall_clock, CHANGE_SEQ_COUNTER, RID_COUNTER, RID_END_EXCLUSIVE, RID_FIRST};
 use directory_daemon::policy::{DevelopmentPolicy, MandatoryFast};
+use directory_daemon::policy_next::PolicyNextFile;
 // The full parameters, the generic serve and any keyd verifier are dird's
 // test seams (docs/52 C18, task R15; feature `test-seams`).
 use directory_daemon::test_seams::{serve_with_admin, AdminParams, DaemonParams, VerifierFactory};
@@ -1024,6 +1029,8 @@ struct Options {
     refuse_decisions: bool,
     /// How often dird re-registers lost destroy decisions (A-105).
     reconcile_interval: Duration,
+    /// Whether dird is given a `policy_next_path` (task A16).
+    policy_next: bool,
 }
 
 /// The decision-acknowledgement wait of the tests that expect auditd to
@@ -1047,8 +1054,19 @@ impl Default for Options {
             ack_deadline: generous(),
             refuse_decisions: false,
             reconcile_interval: directory_daemon::DESTROY_RECONCILE_INTERVAL,
+            policy_next: true,
         }
     }
+}
+
+/// dird's `policy.next` in a world (task A16): `pn/policy.next` in a
+/// scratch directory inside the workspace (crates/test-scratch, Q-480: the
+/// protected-file walk from `/` accepts it with the test's account — which
+/// stands in for dird's — as the owner; the system's temporary directory,
+/// where the sockets live, it would not); `pn` is created mode 0700, as
+/// dird's start prepares it.
+fn policy_next_path(scratch: &test_scratch::ScratchDir) -> PathBuf {
+    scratch.join("pn").join("policy.next")
 }
 
 /// dird's keyd client with every decision's registration refused as "not
@@ -1104,6 +1122,8 @@ fn keyd_params(dir: &support::TempDir, uid: u32) -> keyd_daemon::test_seams::Dae
 
 /// keyd, both auditds, dird with its admin service, and admind's client.
 struct World {
+    /// Where `policy.next` lives (task A16; [`policy_next_path`]).
+    scratch: test_scratch::ScratchDir,
     dir: support::TempDir,
     uid: u32,
     store: Arc<Store>,
@@ -1126,6 +1146,7 @@ struct World {
 }
 
 /// dird with its admin service (the world's parameters).
+#[allow(clippy::too_many_arguments)]
 fn start_dird(
     dir: &support::TempDir,
     uid: u32,
@@ -1134,6 +1155,7 @@ fn start_dird(
     keyd_socket: &Path,
     options: &Options,
     clock_offset: &Arc<std::sync::atomic::AtomicI64>,
+    policy_next: &Path,
 ) -> DirdRun {
     let mut params = support::params(dir, uid, uid, Duration::from_secs(5), 4);
     params.clock = SharedClock::new(FixedNow(Arc::clone(clock_offset)));
@@ -1169,6 +1191,9 @@ fn start_dird(
         ack_deadline: options.ack_deadline,
         key_request_lifetime: options.key_request_lifetime,
         destroy_reconcile_interval: options.reconcile_interval,
+        policy_next: options
+            .policy_next
+            .then(|| PolicyNextFile::new(policy_next.to_path_buf(), uid)),
     };
     DirdRun::start(params, admin, Arc::clone(store), policy())
 }
@@ -1201,6 +1226,15 @@ impl World {
             return None;
         }
         let store = provision(&dir.join("s.redb"), options.with_admin_service);
+        // Task A16: dird's own `policy.next` directory.
+        let scratch = test_scratch::ScratchDir::new("dd-pn").unwrap();
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(scratch.join("pn"))
+                .unwrap();
+        }
 
         // keyd: the test's uid is Role::Ldap (A-73); its own fake auditd.
         let keyd_params = keyd_params(&dir, uid);
@@ -1242,8 +1276,10 @@ impl World {
             &keyd_socket,
             &options,
             &clock_offset,
+            &policy_next_path(&scratch),
         );
         Some(World {
+            scratch,
             dir,
             uid,
             store,
@@ -1325,6 +1361,7 @@ impl World {
             &self.keyd_socket,
             &self.options,
             &self.clock_offset,
+            &policy_next_path(&self.scratch),
         ));
     }
 
@@ -3497,4 +3534,195 @@ fn a_password_set_begun_before_the_delete_creates_no_key_set() {
     assert_eq!(report.listed, 0);
     assert!(keyd_records_for(&world, ipc_audit::KeydOperation::DestroyKeySet, g(BOB)).is_empty());
     assert_eq!(registrations_for(&world, g(BOB)), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Task A16: `PolicyAdmin` online — `policy.next`.
+// ---------------------------------------------------------------------------
+
+use ipc_dird_admin::{PolicyChange, PolicyTier};
+
+/// One tier-map change: the staff group's SID as a Tier1 principal.
+fn staff_group_tier1() -> Operation {
+    Operation::ChangePolicy {
+        changes: vec![PolicyChange::AddPrincipal(
+            sid_of(STAFF_GROUP),
+            PolicyTier::Tier1,
+        )],
+    }
+}
+
+/// docs/51 §5.10 (R51-21), §5.6 (P-22), §5.7: a Tier-0 administrator asks
+/// for a tier-map change with a second Tier-0 administrator's approval in
+/// the same request (every AP-REQ bound to it, R2) — dird answers the
+/// version it wrote, `policy.next` holds the loaded policy edited by the
+/// one tier-map edit (version 1 → 2; mode 0600, dird's), and auditd holds
+/// the decision (requester, approver, the change in the edit's spelling)
+/// before the outcome `Committed`.
+#[test]
+fn a_dual_controlled_policy_change_is_written_as_policy_next() {
+    let Some(world) = World::new(Options::default()) else {
+        return;
+    };
+    let mut client = world.client();
+    assert_eq!(
+        client
+            .call(&by("admin1", &["admin2"], staff_group_tier1()))
+            .unwrap(),
+        Reply::PolicyNext { version: 2 }
+    );
+    let next = policy_next_path(&world.scratch);
+    let written = DevelopmentPolicy::decode(&std::fs::read(&next).unwrap()).unwrap();
+    let (expected, _) = policy_store::edit_tier_map(
+        &policy(),
+        &[policy_store::TierChange::AddPrincipal(
+            sid_of(STAFF_GROUP),
+            Tier::Tier1,
+        )],
+    )
+    .unwrap();
+    assert_eq!(written, expected);
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::symlink_metadata(&next).unwrap();
+        assert!(meta.is_file());
+        assert_eq!(meta.mode() & 0o7777, 0o600);
+        assert_eq!(meta.uid(), world.uid);
+    }
+    assert!(!next.with_file_name("policy.next.partial").exists());
+    let events = await_events(&world, DirAdminOperation::ChangePolicy, 2);
+    assert_eq!(
+        events[0].stage,
+        DirAdminStage::Decision(DecisionResult::Proceed)
+    );
+    assert_eq!(events[0].requester, Some(sid_value(&sid_of(ADMIN1))));
+    assert_eq!(
+        events[0].approvers.as_slice(),
+        &[sid_value(&sid_of(ADMIN2))]
+    );
+    let change = format!(
+        "--add-principal {} Tier1",
+        sid_of(STAFF_GROUP).to_sid_string()
+    );
+    assert_eq!(
+        events[0]
+            .names
+            .as_slice()
+            .iter()
+            .map(|n| (n.kind, n.text.as_text().map(str::to_owned)))
+            .collect::<Vec<_>>(),
+        vec![(ipc_audit::AdminNameKind::PolicyChange, Some(change))]
+    );
+    assert!(is_committed(&events[1]));
+    assert_eq!(events[1].operation_id, events[0].operation_id);
+}
+
+/// The attacks (docs/51 §5.2 row 13, §5.6, §5.10; docs/06 §9; P-22; R2;
+/// docs/questions/Q-591): one administrator alone, or approving himself;
+/// a non-Tier-0 account (bob) even with a Tier-0 approver; an approval made
+/// for another operation — each refused, no `policy.next` written; then,
+/// with one change pending, a second is refused (`Unavailable`, recorded
+/// `PendingLimit`) and `policy.next` is left exactly as it was.
+#[test]
+fn a_policy_change_needs_two_tier0_administrators_and_one_at_a_time() {
+    let Some(world) = World::new(Options::default()) else {
+        return;
+    };
+    let mut client = world.client();
+    let next = policy_next_path(&world.scratch);
+    assert_eq!(
+        client
+            .call(&by("admin1", &[], staff_group_tier1()))
+            .unwrap(),
+        Reply::Refused(RefusalStatus::ApprovalRequired)
+    );
+    assert_eq!(
+        client
+            .call(&by("admin1", &["admin1"], staff_group_tier1()))
+            .unwrap(),
+        Reply::Refused(RefusalStatus::Denied)
+    );
+    assert_eq!(
+        client
+            .call(&by("bob", &["admin2"], staff_group_tier1()))
+            .unwrap(),
+        Reply::Refused(RefusalStatus::Denied)
+    );
+    // admin2's approval made for another change (R2): keyd refuses it.
+    let other = Operation::ChangePolicy {
+        changes: vec![PolicyChange::AddPrincipal(
+            sid_of(STAFF_GROUP),
+            PolicyTier::Tier2,
+        )],
+    };
+    let mismatched = Request::Operation {
+        auth: Auth {
+            requester: fresh("admin1", &staff_group_tier1()),
+            approvals: vec![fresh("admin2", &other)],
+        },
+        operation: staff_group_tier1(),
+    };
+    assert_eq!(
+        client.call(&mismatched).unwrap(),
+        Reply::Refused(RefusalStatus::Denied)
+    );
+    assert!(!next.exists(), "nothing written");
+
+    // One pending change at a time.
+    assert_eq!(
+        client.call(&by("admin1", &["admin2"], other)).unwrap(),
+        Reply::PolicyNext { version: 2 }
+    );
+    let pending = std::fs::read(&next).unwrap();
+    assert_eq!(
+        client
+            .call(&by("admin2", &["admin1"], staff_group_tier1()))
+            .unwrap(),
+        Reply::Refused(RefusalStatus::Unavailable)
+    );
+    assert_eq!(std::fs::read(&next).unwrap(), pending, "left as it was");
+
+    let events = await_events(&world, DirAdminOperation::ChangePolicy, 7);
+    let stages: Vec<DirAdminStage> = events.iter().map(|e| e.stage).collect();
+    assert_eq!(
+        stages,
+        vec![
+            refused(ipc_audit::AdminRefusal::ApprovalRequired),
+            refused(ipc_audit::AdminRefusal::ApproverNotDistinct),
+            refused(ipc_audit::AdminRefusal::PolicyDenied),
+            refused(ipc_audit::AdminRefusal::ApproverUnauthenticated),
+            DirAdminStage::Decision(DecisionResult::Proceed),
+            stages[5],
+            refused(ipc_audit::AdminRefusal::PendingLimit),
+        ]
+    );
+    assert!(is_committed(&events[5]));
+}
+
+/// Without a `policy_next_path` the online path does not exist: a change —
+/// even fully approved — is refused `Unavailable`, recorded as a failure.
+/// Spec: docs/51 §5.10; crates/config `policy_next_path` (optional).
+#[test]
+fn without_policy_next_path_a_policy_change_is_unavailable() {
+    let Some(world) = World::new(Options {
+        policy_next: false,
+        ..Options::default()
+    }) else {
+        return;
+    };
+    let mut client = world.client();
+    assert_eq!(
+        client
+            .call(&by("admin1", &["admin2"], staff_group_tier1()))
+            .unwrap(),
+        Reply::Refused(RefusalStatus::Unavailable)
+    );
+    let events = await_events(&world, DirAdminOperation::ChangePolicy, 1);
+    assert_eq!(
+        events[0].stage,
+        DirAdminStage::Decision(DecisionResult::Failed(
+            ipc_audit::AdminFailure::InternalFailure
+        ))
+    );
+    assert!(!policy_next_path(&world.scratch).exists());
 }

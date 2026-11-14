@@ -37,13 +37,15 @@ use crate::input::{DomainInput, FilePath};
 /// dird's admin-channel keys (docs/51 §4.6; A-91, docs/questions/Q-385),
 /// emitted in dird's file whenever the admin channel is.
 /// Spec: docs/51 §4.6; A-91.
-pub const DIRD_ADMIN_CHANNEL_KEYS: [&str; 6] = [
+pub const DIRD_ADMIN_CHANNEL_KEYS: [&str; 7] = [
     "keyd_socket",
     "keyd_uid",
     "node_id",
     "admin_ticket_age_max",
     "admin_quorum",
     "provision_manifest",
+    // Task A16: where dird writes `policy.next` (docs/51 §5.10).
+    "policy_next_path",
 ];
 
 /// dird's `admin_ticket_age_max`, in seconds: ten minutes. A ticket whose
@@ -208,8 +210,9 @@ fn list(items: &[String]) -> String {
 ///   policy, both named explicitly (Q-270 items 1-2); the admin channel
 ///   (`dird_admin_socket` + `admind_uid`) with A8's keys ([`DIRD_ADMIN_CHANNEL_KEYS`]:
 ///   keyd's socket and uid, the node id, `admin_ticket_age_max` =
-///   [`ADMIN_TICKET_AGE_MAX_SECS`] s, `admin_quorum` = [`ADMIN_QUORUM`], and
-///   `provision_manifest` = the manifest this run writes).
+///   [`ADMIN_TICKET_AGE_MAX_SECS`] s, `admin_quorum` = [`ADMIN_QUORUM`],
+///   `provision_manifest` = the manifest this run writes, and — task A16 —
+///   `policy_next_path` = `--policy-next-path`).
 /// - kdc, ldap-front: their sockets, peers, policy (kdc), the operator's
 ///   certificate and key paths (ldap-front, R50-12).
 /// - auditd: `uid_sources` = every daemon's uid with its source name
@@ -288,6 +291,9 @@ pub fn domain_configs(input: &DomainInput, node_id: &NodeId) -> Vec<ConfigFile> 
         ),
         ("admin_quorum", ADMIN_QUORUM.to_string()),
         ("provision_manifest", path(&p.manifest)),
+        // Task A16: the online policy change's `policy.next` (dird prepares
+        // its directory; root's activation reads this same key).
+        ("policy_next_path", path(&p.policy_next)),
     ]);
     let mut kdc = vec![
         ("run_as_uid", id(a.kdc.uid)),

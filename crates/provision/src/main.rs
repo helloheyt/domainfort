@@ -29,7 +29,7 @@ use provision::first_admin::privilege::SandboxDrop;
 use provision::first_admin::terminal::StdinTerminal;
 use provision::first_admin::{execute, Environment, FirstAdminSecret};
 use provision::install::InstallState;
-use provision::update::{update_policy, RESTART_NOTICE};
+use provision::update::{activate_policy_next, update_policy, ActivateError, RESTART_NOTICE};
 use provision::{provision_domain, Progress, RootOwnership, Step};
 
 /// Refused: nothing was written.
@@ -140,6 +140,45 @@ fn policy(path: &provision::FilePath, changes: &[provision::policy::TierChange])
     }
 }
 
+/// `provision policy --activate-next` (task A16): activate dird's
+/// `policy.next`, then report the version, the rows changed (SIDs and DNs,
+/// not secret — docs/47 §2.3) and the restart notice.
+/// Spec: docs/51 §5.10; A-69; module `provision::update`.
+fn activate(dird_config: &provision::FilePath) -> ExitCode {
+    let mut ownership = match RootOwnership::new() {
+        Ok(o) => o,
+        Err(e) => {
+            complain("identity", &e);
+            return ExitCode::from(EXIT_REFUSED);
+        }
+    };
+    match activate_policy_next(dird_config, &mut ownership) {
+        Ok(activated) => {
+            let mut out = std::io::stdout().lock();
+            if activated.completed_earlier {
+                let _ = writeln!(out, "provision: policy.next was already installed; removed");
+            }
+            for change in &activated.changes {
+                let _ = writeln!(out, "provision: activated {change}");
+            }
+            let _ = writeln!(
+                out,
+                "provision: policy_version is now {}",
+                activated.version.0
+            );
+            let _ = writeln!(out, "provision: {RESTART_NOTICE}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            complain("policy", &e);
+            ExitCode::from(match e {
+                ActivateError::Remove(_) => EXIT_PARTIAL,
+                _ => EXIT_REFUSED,
+            })
+        }
+    }
+}
+
 /// `provision first-admin-secret`: refuse unless root (the drop needs it),
 /// then run with the production drop, terminal and keyd access; the files
 /// it reads must be owned by root (uid 0), the password files by the
@@ -188,6 +227,7 @@ fn main() -> ExitCode {
     match cli::parse(std::env::args_os().skip(1)) {
         Ok(Command::Domain(input)) => domain(&input),
         Ok(Command::Policy { path, changes }) => policy(&path, &changes),
+        Ok(Command::ActivatePolicyNext { dird_config }) => activate(&dird_config),
         Ok(Command::FirstAdminSecret(request)) => first_admin_secret(&request, proof),
         Err(e) => {
             complain("arguments", &e);

@@ -110,6 +110,16 @@ pub enum Note {
     /// refused one as unavailable (its table full), 4 the tombstones could
     /// not be read.
     AdminDestroyReconcileStopped,
+    /// A dual-controlled tier-map change was written as `policy.next` (task
+    /// A16, docs/51 §5.10): root must activate it (`provision policy
+    /// --activate-next`) and restart dird and the kdc. The id is its policy
+    /// version.
+    AdminPolicyNextWritten,
+    /// A decided tier-map change could not be written as `policy.next`
+    /// (task A16): answered unavailable, nothing pending. The id is the
+    /// class: 1 the file system refused a step, 2 the directory could not be
+    /// made durable.
+    AdminPolicyNextNotWritten,
     /// Stopped.
     Stopped,
 }
@@ -174,6 +184,13 @@ impl Note {
             }
             Note::AdminDestroyReconcileStopped => {
                 "re-registration of destroy decisions stopped early (runs again later); class"
+            }
+            Note::AdminPolicyNextWritten => {
+                "approved tier-map change written as policy.next: root must activate it and \
+                 restart dird and the kdc; policy version"
+            }
+            Note::AdminPolicyNextNotWritten => {
+                "approved tier-map change not written as policy.next: answered unavailable; class"
             }
             Note::Stopped => "stopped",
         }

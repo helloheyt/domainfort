@@ -127,6 +127,33 @@
 //!    unchanged) and the answer is `Unavailable`. An `Approve` that does not
 //!    complete the quorum releases the second slot.
 //!
+//! # The policy change (task A16; docs/51 §5.10, R51-21; A-80)
+//!
+//! `ChangePolicy` — a tier-map edit carrying the requester's AP-REQ and the
+//! approvers' in its `auth`, every one bound to the request's digest:
+//! 0. `now`; two audit slots (decision and outcome), all or none, auditd
+//!    reachable; `policy_next_path` not configured ⇒ its `Decision(Failed)`
+//!    and `Unavailable`;
+//! 1. the AP-REQs through keyd (requester, then each approval);
+//! 2. whether `policy.next` is pending (dird's own file, through
+//!    crates/protected-file) — unreadable ⇒ `Unavailable`;
+//! 3. one view (no `WriteTxn`: the directory is not written), then
+//!    `DirectoryAdmin::prepare_policy_change` — `PolicyAdmin` on the
+//!    `tier-map` scope, mandatory dual control with the PEP's one approval
+//!    rule, one pending change at a time, the candidate built by crate
+//!    policy-store's one tier-map edit (version + 1) and re-read by the
+//!    format's own decoder; the requester's obligations honoured;
+//! 4. the decision event committed and **acknowledged** — no
+//!    acknowledgement in time ⇒ the outcome `AuditUnacknowledged`, nothing
+//!    written, `Unavailable`; the candidate exists only as the
+//!    `PolicyCandidate` of the proof (docs/52 R6);
+//! 5. `policy.next` written (crate::policy_next: exclusive partial file,
+//!    `fsync`, no-replace rename, directory `fsync`); its `Outcome` event —
+//!    `Committed`, `Refused(PendingLimit)` when one appeared meanwhile, or
+//!    `Failed(StoreFailure)`; the reply `PolicyNext {version}` or
+//!    `Unavailable`. Activation is root's (`provision policy
+//!    --activate-next`), followed by a restart of dird and the kdc (A-69).
+//!
 //! # The three events the PEP does not plan
 //!
 //! Each has its own code, appended to ipc-audit's closed tables by task F4
@@ -145,13 +172,16 @@
 //! Q-388; A-88 (Q-366, Q-395); A-91 (Q-397); docs/11 §2, §8.
 
 use crate::admin_service::{
-    key_request_of, pep_operation, wire_key_reply, wire_reply, wire_status, RegistrationFailure,
-    TicketVerifier, MAX_DESTROY_RECONCILE_INTERVAL, MIN_DESTROY_RECONCILE_INTERVAL,
+    key_request_of, pep_operation, policy_change_of, wire_key_reply, wire_reply, wire_status,
+    RegistrationFailure, TicketVerifier, MAX_DESTROY_RECONCILE_INTERVAL,
+    MIN_DESTROY_RECONCILE_INTERVAL,
 };
 use crate::clock::SharedClock;
 use crate::engine::{EngineError, EngineThread, OnExit, SubmitError};
 use crate::ldap_audit::AuditGate;
 use crate::log::{note, Note, Thinned};
+use crate::policy::DevelopmentPolicy;
+use crate::policy_next::{PolicyNextError, PolicyNextFile};
 use crate::rate::ObligationLimiter;
 use crate::reconcile::Reconciler;
 use crate::registration::DecisionRegistration;
@@ -161,6 +191,7 @@ use directory_admin::{
     Operation as PepOperation, OsRandom, Prepared, RegistrationOutcome, Request as PepRequest,
     VerificationFailure, VerifiedTicket,
 };
+use directory_admin::{PolicyCandidate, PolicyChangeRequest};
 use directory_pip::{DirectoryContext, TierMap};
 use dirstore::{Store, WriteTxn};
 use ipc_audit::{
@@ -172,6 +203,7 @@ use keyd_types::{AuthnError, DecisionId, KeyHandle, OperationDigest};
 use krb_proto::KerberosTime;
 use ldap::RateLimiter;
 use pdp::{Constraint, Obligation, PolicySnapshot};
+use policy_store::TierChange;
 use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::Instant;
@@ -258,6 +290,12 @@ pub(crate) struct AdminWorker {
     /// crate::reconcile), kept within [`MIN_DESTROY_RECONCILE_INTERVAL`] ..=
     /// [`MAX_DESTROY_RECONCILE_INTERVAL`].
     pub(crate) reconcile_interval: Duration,
+    /// The loaded policy (of the version `policy` is a snapshot of): the base
+    /// of a tier-map change (task A16).
+    pub(crate) installed: DevelopmentPolicy,
+    /// Where an approved tier-map change is written (task A16); `None` ⇒
+    /// `ChangePolicy` is answered `Unavailable`.
+    pub(crate) policy_next: Option<PolicyNextFile>,
 }
 
 /// The running state of the admin thread.
@@ -452,6 +490,9 @@ impl Running {
                 let Ok(digest) = operation_digest(operation) else {
                     return Reply::Refused(RefusalStatus::Unavailable);
                 };
+                if let Some(changes) = policy_change_of(operation) {
+                    return self.handle_policy(auth, &changes, &digest);
+                }
                 match key_request_of(operation) {
                     Some(request) => self.handle_key(auth, request, &digest),
                     None => match pep_operation(operation) {
@@ -687,6 +728,166 @@ impl Running {
             // (R6b, docs/questions/Q-501): nothing to destroy — not a failure.
             Ok(()) | Err(RegistrationFailure::Refused(keyd_types::Error::Denied)) => {}
             Err(failure) => note(Note::AdminDestroyNotRegistered, Some(failure.code())),
+        }
+    }
+
+    /// One `ChangePolicy` (module documentation, "The policy change"; task
+    /// A16): the audit slots, the tickets through keyd, one view, whether a
+    /// `policy.next` is pending, the PEP's decision, the obligations, the
+    /// decision event **acknowledged**, then `policy.next` written from the
+    /// acknowledged candidate, its `Outcome` event, the reply.
+    /// Spec: docs/51 §5.6, §5.7 item 2, §5.10, §7.4; A-85; docs/52 §3.11 R6;
+    /// docs/questions/Q-591.
+    fn handle_policy(
+        &mut self,
+        auth: &Auth,
+        changes: &[TierChange],
+        digest: &OperationDigest,
+    ) -> Reply {
+        let Some(now) = self.worker.clock.now() else {
+            return Reply::Refused(RefusalStatus::Unavailable);
+        };
+        // Step 0: the decision and the outcome slots, before anything.
+        let Some(slots) = self.worker.gate.admit_slots(2) else {
+            AUDIT_UNAVAILABLE.hit(None);
+            return Reply::Refused(RefusalStatus::Unavailable);
+        };
+        let mut slots = slots.into_iter();
+        let first = slots.next();
+        let second = slots.next();
+        let operation_id = self.next_id();
+
+        // Not configured: the online path does not exist here (fail closed,
+        // and recorded).
+        let Some(policy_next) = self.worker.policy_next.clone() else {
+            let refusal = self.worker.admin.refuse_failed_policy_change(
+                operation_id,
+                changes,
+                AdminFailure::InternalFailure,
+                &now,
+            );
+            return self.refuse(first, second, refusal.event(), RefusalStatus::Unavailable);
+        };
+
+        // Step 1: the requester's and every approval's AP-REQ, each bound to
+        // this request (R2).
+        let (requester, approvals) = match self.verify(auth, digest) {
+            Ok(verified) => verified,
+            Err(failure) => {
+                let refusal = self.worker.admin.refuse_unverified_policy_change(
+                    operation_id,
+                    changes,
+                    failure,
+                    &now,
+                );
+                return self.refuse(
+                    first,
+                    second,
+                    refusal.event(),
+                    wire_status(refusal.status()),
+                );
+            }
+        };
+        let request = PolicyChangeRequest {
+            operation_id,
+            changes: changes.to_vec(),
+            operation_digest: *digest,
+            requester,
+            approvals,
+        };
+
+        // Steps 2-3: whether a change is pending, one view, the decision.
+        let pending = match policy_next.pending() {
+            Ok(pending) => pending,
+            Err(error) => {
+                note(Note::AdminPolicyNextNotWritten, Some(error.code()));
+                let refusal = self.worker.admin.refuse_failed_policy_change(
+                    operation_id,
+                    changes,
+                    AdminFailure::StoreFailure,
+                    &now,
+                );
+                return self.refuse(first, second, refusal.event(), RefusalStatus::Unavailable);
+            }
+        };
+        let store = Arc::clone(&self.worker.store);
+        let prepared = match self.worker.ctx.view(&store, &self.worker.tiers) {
+            Ok(view) => self.worker.admin.prepare_policy_change(
+                &request,
+                &view,
+                &self.worker.policy,
+                &self.worker.installed,
+                pending,
+                &now,
+            ),
+            Err(_) => {
+                let refusal = self.worker.admin.refuse_failed_policy_change(
+                    operation_id,
+                    changes,
+                    AdminFailure::ViewUnavailable,
+                    &now,
+                );
+                return self.refuse(first, second, refusal.event(), RefusalStatus::Unavailable);
+            }
+        };
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(refusal) => {
+                return self.refuse(
+                    first,
+                    second,
+                    refusal.event(),
+                    wire_status(refusal.status()),
+                )
+            }
+        };
+        if !honour_obligations(&mut self.rate, prepared.obligations(), false, &now) {
+            let event = restage(prepared.decision_event(), OBLIGATION_REFUSED);
+            return self.refuse(first, second, &event, RefusalStatus::Denied);
+        }
+
+        // Step 4: the decision event, acknowledged before anything is
+        // written — the candidate leaves the prepared value only with the
+        // proof (docs/52 R6: `AckedIntent<PreparedPolicyChange>`).
+        let Some(slot) = first else {
+            // Cannot happen: two slots were reserved.
+            self.release(second);
+            return Reply::Refused(RefusalStatus::Unavailable);
+        };
+        let pending = match self.worker.gate.begin_intent(slot, prepared) {
+            Ok(pending) => pending,
+            Err(_) => {
+                self.release(second);
+                return Reply::Refused(RefusalStatus::Unavailable);
+            }
+        };
+        let deadline = Instant::now() + self.worker.ack_deadline;
+        let candidate = match self.worker.gate.wait_acknowledged(pending, deadline) {
+            Ok(acked) => PolicyCandidate::from_acknowledged(acked),
+            Err(prepared) => {
+                self.commit_outcome(second, &restage(prepared.decision_event(), NOT_PERFORMED));
+                return Reply::Refused(RefusalStatus::Unavailable);
+            }
+        };
+
+        // Step 5: `policy.next`, then its outcome event, then the reply.
+        match policy_next.write(&candidate) {
+            Ok(()) => {
+                self.commit_outcome(second, &candidate.written_event(&now));
+                note(Note::AdminPolicyNextWritten, Some(candidate.version().0));
+                Reply::PolicyNext {
+                    version: candidate.version().0,
+                }
+            }
+            Err(PolicyNextError::Pending) => {
+                self.commit_outcome(second, &candidate.pending_event(&now));
+                Reply::Refused(RefusalStatus::Unavailable)
+            }
+            Err(error) => {
+                self.commit_outcome(second, &candidate.failed_event(&now));
+                note(Note::AdminPolicyNextNotWritten, Some(error.code()));
+                Reply::Refused(RefusalStatus::Unavailable)
+            }
         }
     }
 

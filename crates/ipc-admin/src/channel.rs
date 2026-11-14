@@ -150,6 +150,10 @@ pub mod request_kind {
     /// `SetPassword {auth, completion, target, password}`.
     /// Spec: docs/51 §7.6; docs/questions/Q-400.
     pub const SET_PASSWORD: u8 = 0x15;
+    /// `ChangePolicy {changes}`, forwarded like every other operation (task
+    /// A16; dird's `0x16`, which steps over this channel's `0x15`).
+    /// Spec: docs/51 §5.2 row 13, §5.10; docs/questions/Q-592.
+    pub const CHANGE_POLICY: u8 = dird::CHANGE_POLICY;
 
     /// The forwarded operations: their payload is dird's, read and written
     /// by crate ipc-dird-admin. Spec: docs/51 §7.6 ("the same operations").
@@ -167,6 +171,7 @@ pub mod request_kind {
         LOOKUP,
         REQUEST_KEY_OPERATION,
         APPROVE,
+        CHANGE_POLICY,
     ];
 
     /// The kinds retired by A-102 (keyadm's `FetchApproved`, `Complete`,
@@ -191,6 +196,7 @@ pub mod request_kind {
         APPROVE,
         PING,
         SET_PASSWORD,
+        CHANGE_POLICY,
     ];
 }
 
@@ -220,6 +226,9 @@ pub mod reply_kind {
     /// `KeyRequest`: dird's answer to `RequestKeyOperation` / `Approve`.
     /// Spec: docs/51 §5.6, §7.3.
     pub const KEY_REQUEST: u8 = dird::KEY_REQUEST;
+    /// `PolicyNext { version }`: dird's answer to `ChangePolicy` (task A16).
+    /// Spec: docs/51 §5.10.
+    pub const POLICY_NEXT: u8 = dird::POLICY_NEXT;
     /// The reply kinds retired by A-102 (`Approved`, `PendingDestruction`):
     /// never in [`ALL`], never reused.
     /// Spec: docs/52 §4.6; docs/questions/Q-460 (A-102).
@@ -235,6 +244,7 @@ pub mod reply_kind {
         PONG,
         PASSWORD_CHANGED,
         KEY_REQUEST,
+        POLICY_NEXT,
     ];
 }
 

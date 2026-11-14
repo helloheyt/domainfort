@@ -57,6 +57,9 @@
 //! `policy_version` by one, encode (policy-store re-validates). Refused: an
 //! add of a row already present, a remove of a row absent, an edit that
 //! leaves no Tier0 principal (docs/questions/Q-379), a version overflow.
+//! The edit itself is crate policy-store's `edit` module since task A16 —
+//! one implementation for the offline path and dird's online path
+//! (docs/questions/Q-590).
 //!
 //! Spec: docs/51 §4.3 step 6, §5.2, §5.10; docs/47 §6.3; docs/06 §9;
 //! docs/11 §3; A-36; A-39; A-51; A-68; A-69; A-73; A-80; crates/pdp
@@ -252,116 +255,10 @@ pub(crate) fn domain_policy(input: &DomainPolicyInput) -> Result<DevelopmentPoli
     })
 }
 
-/// One tier-map edit of `provision policy`.
-/// Spec: docs/51 §5.10 ("add / remove rows of the map"); A-36; A-80.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TierChange {
-    /// Add `SID → tier`.
-    AddPrincipal(Sid, Tier),
-    /// Remove the row of this SID.
-    RemovePrincipal(Sid),
-    /// Add `subtree → tier`.
-    AddSubtree(Dn, Tier),
-    /// Remove the row of this subtree.
-    RemoveSubtree(Dn),
-}
-
-/// Why a tier-map edit was refused. Fixed text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EditError {
-    /// No change was given.
-    NoChange,
-    /// The SID already has a row (remove it first: an edit says what it
-    /// replaces).
-    PrincipalPresent,
-    /// The SID has no row.
-    PrincipalAbsent,
-    /// The subtree already has a row.
-    SubtreePresent,
-    /// The subtree has no row.
-    SubtreeAbsent,
-    /// The edit would leave no Tier0 principal in the map (no
-    /// administrator could be Tier0 any more — docs/questions/Q-379).
-    NoTier0Principal,
-    /// `policy_version` would overflow.
-    VersionOverflow,
-    /// policy-store refused the result (an Untiered row, an invalid DN, a
-    /// bound).
-    Refused(policy_store::PolicyError),
-}
-
-impl core::fmt::Display for EditError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            EditError::NoChange => f.write_str("no tier-map change given"),
-            EditError::PrincipalPresent => f.write_str("the SID already has a tier-map row"),
-            EditError::PrincipalAbsent => f.write_str("the SID has no tier-map row"),
-            EditError::SubtreePresent => f.write_str("the subtree already has a tier-map row"),
-            EditError::SubtreeAbsent => f.write_str("the subtree has no tier-map row"),
-            EditError::NoTier0Principal => {
-                f.write_str("the edit would leave no Tier0 principal in the tier map")
-            }
-            EditError::VersionOverflow => f.write_str("policy_version would overflow"),
-            EditError::Refused(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-impl std::error::Error for EditError {}
-
-/// Apply `changes` in order to `policy`, bump the version by one, and
-/// return the new policy with its file encoding.
-///
-/// # Errors
-/// [`EditError`].
-///
-/// Spec: docs/51 §5.10 (R51-21); A-80; A-69 (the version every view
-/// compares); policy-store `encode` (its content rules).
-pub fn edit_tier_map(
-    policy: &DevelopmentPolicy,
-    changes: &[TierChange],
-) -> Result<(DevelopmentPolicy, Vec<u8>), EditError> {
-    if changes.is_empty() {
-        return Err(EditError::NoChange);
-    }
-    let mut next = policy.clone();
-    for change in changes {
-        match change {
-            TierChange::AddPrincipal(sid, tier) => {
-                if next.principals.insert(*sid, *tier).is_some() {
-                    return Err(EditError::PrincipalPresent);
-                }
-            }
-            TierChange::RemovePrincipal(sid) => {
-                if next.principals.remove(sid).is_none() {
-                    return Err(EditError::PrincipalAbsent);
-                }
-            }
-            TierChange::AddSubtree(dn, tier) => {
-                if next.subtrees.iter().any(|(d, _)| d == dn) {
-                    return Err(EditError::SubtreePresent);
-                }
-                next.subtrees.push((dn.clone(), *tier));
-            }
-            TierChange::RemoveSubtree(dn) => {
-                let before = next.subtrees.len();
-                next.subtrees.retain(|(d, _)| d != dn);
-                if next.subtrees.len() == before {
-                    return Err(EditError::SubtreeAbsent);
-                }
-            }
-        }
-    }
-    if !next.principals.values().any(|tier| *tier == Tier::Tier0) {
-        return Err(EditError::NoTier0Principal);
-    }
-    next.version = PolicyVersion(
-        policy
-            .version
-            .0
-            .checked_add(1)
-            .ok_or(EditError::VersionOverflow)?,
-    );
-    let file = next.encode().map_err(EditError::Refused)?;
-    Ok((next, file))
-}
+// The tier-map edit of `provision policy` (R51-21, A-80) is crate
+// policy-store's (module `edit`, task A16): the one implementation both the
+// offline path here and dird's online `PolicyAdmin` path use, so the two
+// cannot diverge (docs/52 C14 — the lesson of R13). Re-exported under its
+// former path for this crate's callers.
+// Spec: docs/51 §5.10; A-80; docs/questions/Q-590.
+pub use policy_store::edit::{edit_tier_map, EditError, TierChange};

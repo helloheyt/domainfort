@@ -19,7 +19,7 @@
 use crate::channel::{codes, RefusalStatus, DIGEST_LEN};
 use crate::wire::{
     AdminReply, AdminRequest, WireAuth, WireKeyOperation, WireKeyRef, WireKeyRequest,
-    WireKeyTarget, WireLookupKey, WireOperation,
+    WireKeyTarget, WireLookupKey, WireOperation, WirePolicyChange,
 };
 use core::fmt;
 use dtyp::{Guid, Sid};
@@ -192,6 +192,101 @@ impl KeyOperation {
     }
 }
 
+/// A tier-map row's tier (task A16): `Untiered` is never a map row and has
+/// no value here (crate policy-store refuses it; A-36).
+/// Spec: docs/51 §5.10; A-36; crate::channel `codes::TIER_*`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PolicyTier {
+    /// Tier 0.
+    Tier0,
+    /// Tier 1.
+    Tier1,
+    /// Tier 2.
+    Tier2,
+}
+
+impl PolicyTier {
+    /// Code → tier (the wire layer admits only these three codes).
+    fn from_code(code: u8) -> PolicyTier {
+        match code {
+            codes::TIER_0 => PolicyTier::Tier0,
+            codes::TIER_1 => PolicyTier::Tier1,
+            _ => PolicyTier::Tier2,
+        }
+    }
+
+    /// Tier → code.
+    fn code(self) -> u8 {
+        match self {
+            PolicyTier::Tier0 => codes::TIER_0,
+            PolicyTier::Tier1 => codes::TIER_1,
+            PolicyTier::Tier2 => codes::TIER_2,
+        }
+    }
+}
+
+/// One tier-map change of a `ChangePolicy` (task A16) — the vocabulary of
+/// the tier-map edit (crate policy-store `TierChange`, which dird converts
+/// it to; this crate links no policy code). SIDs pass dtyp's strict decoder;
+/// DN components are UTF-8 (the edit applies the format's own DN rules).
+/// Spec: docs/51 §5.10; docs/questions/Q-592.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PolicyChange {
+    /// Add `SID → tier`.
+    AddPrincipal(Sid, PolicyTier),
+    /// Remove the row of this SID.
+    RemovePrincipal(Sid),
+    /// Add `subtree → tier` (the DN's components, leaf first).
+    AddSubtree(Vec<String>, PolicyTier),
+    /// Remove the row of this subtree.
+    RemoveSubtree(Vec<String>),
+}
+
+impl PolicyChange {
+    /// The typed change of `wire`.
+    ///
+    /// # Errors
+    /// [`ConversionError::Sid`], [`ConversionError::Text`].
+    pub fn from_wire(wire: &WirePolicyChange) -> Result<PolicyChange, ConversionError> {
+        let dn = |components: &[Vec<u8>]| {
+            components
+                .iter()
+                .map(|c| text(c))
+                .collect::<Result<Vec<_>, _>>()
+        };
+        Ok(match wire {
+            WirePolicyChange::AddPrincipal { sid: s, tier } => {
+                PolicyChange::AddPrincipal(sid(s)?, PolicyTier::from_code(*tier))
+            }
+            WirePolicyChange::RemovePrincipal { sid: s } => PolicyChange::RemovePrincipal(sid(s)?),
+            WirePolicyChange::AddSubtree { dn: d, tier } => {
+                PolicyChange::AddSubtree(dn(d)?, PolicyTier::from_code(*tier))
+            }
+            WirePolicyChange::RemoveSubtree { dn: d } => PolicyChange::RemoveSubtree(dn(d)?),
+        })
+    }
+
+    /// The wire form.
+    #[must_use]
+    pub fn to_wire(&self) -> WirePolicyChange {
+        let dn = |components: &[String]| components.iter().map(|c| c.as_bytes().to_vec()).collect();
+        match self {
+            PolicyChange::AddPrincipal(s, tier) => WirePolicyChange::AddPrincipal {
+                sid: s.encode(),
+                tier: tier.code(),
+            },
+            PolicyChange::RemovePrincipal(s) => {
+                WirePolicyChange::RemovePrincipal { sid: s.encode() }
+            }
+            PolicyChange::AddSubtree(d, tier) => WirePolicyChange::AddSubtree {
+                dn: dn(d),
+                tier: tier.code(),
+            },
+            PolicyChange::RemoveSubtree(d) => WirePolicyChange::RemoveSubtree { dn: dn(d) },
+        }
+    }
+}
+
 /// One operation of the closed set (docs/51 §7.3), with exactly the fields
 /// that table lists.
 /// Spec: docs/51 §5.2, §7.3.
@@ -303,6 +398,12 @@ pub enum Operation {
         /// The exact operation the approver approves.
         operation: KeyOperation,
     },
+    /// `ChangePolicy {changes}` (task A16): a tier-map edit under mandatory
+    /// dual control, written by dird as `policy.next`.
+    ChangePolicy {
+        /// The changes, in order.
+        changes: Vec<PolicyChange>,
+    },
 }
 
 impl Operation {
@@ -405,6 +506,12 @@ impl Operation {
             WireOperation::Approve { id, operation } => Operation::Approve {
                 id: *id,
                 operation: KeyOperation::from_wire(operation),
+            },
+            WireOperation::ChangePolicy { changes } => Operation::ChangePolicy {
+                changes: changes
+                    .iter()
+                    .map(PolicyChange::from_wire)
+                    .collect::<Result<_, _>>()?,
             },
         })
     }
@@ -509,6 +616,9 @@ impl Operation {
             Operation::Approve { id, operation } => WireOperation::Approve {
                 id: *id,
                 operation: operation.to_wire(),
+            },
+            Operation::ChangePolicy { changes } => WireOperation::ChangePolicy {
+                changes: changes.iter().map(PolicyChange::to_wire).collect(),
             },
         })
     }
@@ -653,6 +763,12 @@ pub enum Reply {
     /// of the decision dird registers in keyd when an `Approve` completes
     /// the quorum (A-102, docs/52 §4.3) — what the operator gives keyadm.
     KeyRequest(KeyRequestState),
+    /// `ChangePolicy` written as `policy.next` (task A16): the version root's
+    /// activation installs (`provision policy --activate-next`).
+    PolicyNext {
+        /// The `policy_version` of `policy.next`.
+        version: u64,
+    },
 }
 
 impl Reply {
@@ -697,6 +813,7 @@ impl Reply {
                 approvals: request.approvals,
                 quorum: request.quorum,
             }),
+            AdminReply::PolicyNext { version } => Reply::PolicyNext { version: *version },
         })
     }
 
@@ -739,6 +856,7 @@ impl Reply {
                 approvals: request.approvals,
                 quorum: request.quorum,
             }),
+            Reply::PolicyNext { version } => AdminReply::PolicyNext { version: *version },
         })
     }
 }

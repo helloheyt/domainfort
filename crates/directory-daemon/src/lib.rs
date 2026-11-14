@@ -86,6 +86,7 @@
 //! | [`admin_service`] | the admin service's parameters, keyd verifier (Role::Ldap), key-set lookup, protected objects, message mapping (task A8) |
 //! | `admin_engine` | the admin thread: its bounded queue and the per-request steps of docs/51 §7.4 |
 //! | `admin_listener` | `dird-admin.sock`: admind's uid only, ≤ 2 connections, framing, deadlines |
+//! | [`policy_next`] | `policy.next`: an approved tier-map change written for root to activate (task A16, docs/51 §5.10) |
 //!
 //! # Security
 //!
@@ -160,6 +161,7 @@ mod ldap_listener;
 mod listener;
 pub mod log;
 pub mod policy;
+pub mod policy_next;
 pub mod rate;
 mod reconcile;
 mod registration;

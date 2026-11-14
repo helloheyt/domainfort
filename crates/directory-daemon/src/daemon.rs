@@ -592,6 +592,9 @@ fn start_admin(
         ack_deadline: admin.ack_deadline.get(),
         key_requests,
         reconcile_interval: admin.destroy_reconcile_interval,
+        // Task A16: the base of a tier-map change, and where it is written.
+        installed: policy.clone(),
+        policy_next: admin.policy_next.clone(),
     };
     let ended = Arc::clone(state);
     let (handle, thread) = worker

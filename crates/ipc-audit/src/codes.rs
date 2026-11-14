@@ -608,7 +608,13 @@ code_table! {
     /// **retired** by A-102 (docs/52 §4.6; docs/questions/Q-460): no
     /// producer sends them any more; their codes keep their meaning and are
     /// never reused.
-    /// Spec: docs/51 §5.2, §5.7, §6, §7.3; docs/questions/Q-340 item 2.
+    /// `ChangePolicy` (appended by task A16): the online `PolicyAdmin` path
+    /// of docs/51 §5.10 (R51-21; A-80 on Q-299 option (b)) — a tier-map edit
+    /// under mandatory dual control, which dird writes as `policy.next` for
+    /// root to activate; its events name each change in the edit's own
+    /// spelling (`AdminNameKind::PolicyChange`).
+    /// Spec: docs/51 §5.2, §5.7, §5.10, §6, §7.3; docs/questions/Q-340
+    /// item 2, Q-592.
     pub enum DirAdminOperation {
         CreateUser,
         CreateComputer,
@@ -628,6 +634,7 @@ code_table! {
         FetchApproved,
         Complete,
         ListPendingDestruction,
+        ChangePolicy,
     }
 }
 
@@ -812,8 +819,13 @@ code_table! {
     /// Which name a [`crate::TargetName`] is: the name fields of the
     /// `dird-admin.sock` requests (docs/51 §7.3: `sam`, `upn`, `name`,
     /// `dns_host_name`, `spn`, and `dn` for `Lookup`), by the attribute they
-    /// name in docs/51 §11.
-    /// Spec: docs/51 §5.2, §7.3, §11; docs/questions/Q-340 item 4.
+    /// name in docs/51 §11. `PolicyChange` (appended by task A16): one
+    /// tier-map change of a `ChangePolicy` request, in the command-line
+    /// spelling of `provision policy` (`--add-principal <SID> <TierN>`, …;
+    /// crate policy-store module `edit`) — SIDs and DNs only, not secret
+    /// (docs/47 §2.3).
+    /// Spec: docs/51 §5.2, §5.10, §7.3, §11; docs/questions/Q-340 item 4,
+    /// Q-592.
     pub enum AdminNameKind {
         SamAccountName,
         UserPrincipalName,
@@ -821,6 +833,7 @@ code_table! {
         DnsHostName,
         ServicePrincipalName,
         DistinguishedName,
+        PolicyChange,
     }
 }
 

@@ -80,6 +80,12 @@ const ADMIN_QUORUM_KEY: &str = "admin_quorum";
 /// takes the admin service object and the service objects it protects.
 /// Spec: docs/51 §4.3 step 8, §5.2 row 9; A-73; docs/questions/Q-386.
 const PROVISION_MANIFEST: &str = "provision_manifest";
+/// Key: where dird writes `policy.next` — the tier-map change its admin
+/// service decided under dual control, for root to activate (task A16). A
+/// file in a directory of dird's own (dird prepares it as root before the
+/// drop); root's activation reads the same key. Spec: docs/51 §5.10
+/// (R51-21); A-80; docs/questions/Q-591.
+const POLICY_NEXT_PATH: &str = "policy_next_path";
 
 /// Where dird's dirstore integrity key comes from.
 ///
@@ -159,6 +165,7 @@ pub struct AdminServiceSettings {
     ticket_age_max: Duration,
     quorum: u32,
     provision_manifest: AbsolutePath,
+    policy_next: Option<AbsolutePath>,
 }
 
 impl AdminServiceSettings {
@@ -179,6 +186,15 @@ impl AdminServiceSettings {
     #[must_use]
     pub fn provision_manifest(&self) -> &AbsolutePath {
         &self.provision_manifest
+    }
+
+    /// Where dird writes `policy.next` (task A16), when configured; absent ⇒
+    /// the online policy change is refused (`ChangePolicy` answered
+    /// `Unavailable`) and policy changes are offline only (`provision
+    /// policy`). Spec: docs/51 §5.10; A-80; docs/questions/Q-591.
+    #[must_use]
+    pub fn policy_next(&self) -> Option<&AbsolutePath> {
+        self.policy_next.as_ref()
     }
 }
 
@@ -244,6 +260,7 @@ impl DirdSettings {
         ADMIN_TICKET_AGE_MAX,
         ADMIN_QUORUM_KEY,
         PROVISION_MANIFEST,
+        POLICY_NEXT_PATH,
         AUDIT_SOCKET,
         AUDITD_UID,
         FRAME_TIMEOUT,
@@ -261,7 +278,9 @@ impl DirdSettings {
     /// when they are present, `admin_ticket_age_max` (60s ..= 3600s),
     /// `admin_quorum` (2 ..= 3), `provision_manifest` and `node_id` are
     /// required, and without them the first three are refused
-    /// (`IncompletePair`); `keyd_socket` with `keyd_uid` (both or neither —
+    /// (`IncompletePair`); with the admin channel, optionally
+    /// `policy_next_path` (task A16 — refused without the channel);
+    /// `keyd_socket` with `keyd_uid` (both or neither —
     /// without them dird's admin service does not start, the rest of dird
     /// runs); `node_id` (32 lower-case hex digits, not all zero);
     /// `frame_timeout` (5s), `view_lifetime` (5s). `internal_networks` is
@@ -345,6 +364,7 @@ impl DirdSettings {
         })?;
         let quorum = doc.optional(ADMIN_QUORUM_KEY, |text| value::bounded(text, ADMIN_QUORUM))?;
         let manifest = doc.optional(PROVISION_MANIFEST, value::absolute_path)?;
+        let policy_next = doc.optional(POLICY_NEXT_PATH, value::absolute_path)?;
         let admin_service = if admin_channel.is_some() {
             // The admin service's settings have no hidden default (docs/51
             // §5.5: the threshold is a configured value; P-22: the quorum).
@@ -355,10 +375,16 @@ impl DirdSettings {
                 return Err(Error::missing(NODE_ID));
             }
             all.path(PROVISION_MANIFEST, &manifest.value, manifest.line)?;
+            // Task A16: optional — without it the online policy change is
+            // refused; distinct from every other path of the file.
+            if let Some(located) = &policy_next {
+                all.path(POLICY_NEXT_PATH, &located.value, located.line)?;
+            }
             Some(AdminServiceSettings {
                 ticket_age_max: value::seconds(ticket_age.value),
                 quorum: quorum.value,
                 provision_manifest: manifest.value,
+                policy_next: policy_next.map(|located| located.value),
             })
         } else {
             // A setting of a service that is not configured is a mistake:
@@ -381,6 +407,13 @@ impl DirdSettings {
                 return Err(Error::at(
                     located.line,
                     PROVISION_MANIFEST,
+                    ErrorKind::IncompletePair,
+                ));
+            }
+            if let Some(located) = policy_next {
+                return Err(Error::at(
+                    located.line,
+                    POLICY_NEXT_PATH,
                     ErrorKind::IncompletePair,
                 ));
             }

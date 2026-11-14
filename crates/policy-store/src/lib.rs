@@ -84,6 +84,14 @@
 //! [`DevelopmentPolicy::principals`] / [`DevelopmentPolicy::subtrees`]
 //! itself (this crate links no directory code).
 //!
+//! # The tier-map edit (task A16)
+//!
+//! [`edit`] holds the one implementation of the tier-map edit both
+//! policy-change paths use — `provision policy` offline and dird's online
+//! `PolicyAdmin` path, which writes the result as `policy.next` for root to
+//! activate (docs/51 §5.10; A-80) — and the rule a `policy.next` must meet to
+//! be activated ([`check_tier_map_successor`]).
+//!
 //! # Security
 //!
 //! `#![forbid(unsafe_code)]`; no `unwrap`, `expect` or `panic!` outside tests
@@ -108,10 +116,15 @@
 //! A-36; A-39; A-51; A-57; A-68.
 
 pub mod codes;
+pub mod edit;
 mod file;
 mod policy;
 mod wire;
 
+pub use edit::{
+    check_tier_map_successor, edit_tier_map, tier_map_difference, EditError, SuccessorError,
+    TierChange,
+};
 pub use file::{read_file, LoadError};
 pub use policy::{
     DevelopmentPolicy, MandatoryFast, PolicyError, FORMAT, MARKER, MAX_ACTIONS,

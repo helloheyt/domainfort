@@ -1511,6 +1511,8 @@ impl World {
                     ack_deadline: DecisionAckDeadline::PRODUCTION,
                     key_request_lifetime: options.key_request_lifetime,
                     destroy_reconcile_interval: directory_daemon::DESTROY_RECONCILE_INTERVAL,
+                    // Task A16: these worlds exercise no policy change.
+                    policy_next: None,
                 };
                 dird_run = Some(DirdRun::start(params, admin, Arc::clone(&provisioned)));
                 store = Some(provisioned);

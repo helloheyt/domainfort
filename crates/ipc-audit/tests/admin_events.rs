@@ -457,13 +457,15 @@ fn dir_admin_phase_and_result_tables() {
     assert_eq!(decode_event(&b), codec(ipc::Error::UnknownCode));
 }
 
-/// docs/50 §3.3: unknown operation and name-kind codes are refused.
+/// docs/50 §3.3: unknown operation and name-kind codes are refused (task
+/// A16 appended `ChangePolicy` = 19 and `PolicyChange` = 7, so the first
+/// unknown codes are 20 and 8).
 #[test]
 fn dir_admin_unknown_codes() {
     let (good, at) = delete_refused_octets();
     for (position, codes) in [
-        (at.operation, [0u8, 19, 0xFF]),
-        (at.name_kind, [0u8, 7, 0xFF]),
+        (at.operation, [0u8, 20, 0xFF]),
+        (at.name_kind, [0u8, 8, 0xFF]),
     ] {
         for code in codes {
             let mut b = good.clone();
@@ -480,6 +482,12 @@ fn dir_admin_unknown_codes() {
         let mut b = good.clone();
         b[at.operation] = op.code();
         assert!(decode_event(&b).is_ok(), "{}", op.name());
+    }
+    // Every name-kind code decodes (task A16's `PolicyChange` included).
+    for kind in AdminNameKind::ALL {
+        let mut b = good.clone();
+        b[at.name_kind] = kind.code();
+        assert!(decode_event(&b).is_ok(), "{}", kind.name());
     }
 }
 

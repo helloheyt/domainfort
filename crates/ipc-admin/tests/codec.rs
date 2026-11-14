@@ -27,7 +27,7 @@ use ipc_admin::{
 use ipc_dird_admin::channel::{MAX_AP_REQ, MAX_DN_COMPONENT, MAX_DN_COMPONENTS};
 use ipc_dird_admin::{
     AccountExpires, Auth, Found, KeyOperation, KeyRef, KeyRequestState, LookupKey, Operation,
-    PasswordSetOutcome,
+    PasswordSetOutcome, PolicyChange, PolicyTier,
 };
 use zeroize::Zeroizing;
 
@@ -156,6 +156,13 @@ fn forwarded() -> Vec<Operation> {
                 kvno: 3,
             },
         },
+        // Task A16: the tier-map edit, forwarded like every other operation.
+        Operation::ChangePolicy {
+            changes: vec![
+                PolicyChange::AddPrincipal(sid(1300), PolicyTier::Tier1),
+                PolicyChange::RemoveSubtree(vec!["ou=Old".into(), "dc=test".into()]),
+            ],
+        },
     ]
 }
 
@@ -225,6 +232,8 @@ fn replies() -> Vec<Reply> {
             approvals: 0,
             quorum: 2,
         }),
+        // Task A16: dird's `PolicyNext`, passed on.
+        Reply::PolicyNext { version: 7 },
     ]
 }
 
@@ -431,7 +440,8 @@ fn dirds_password_set_steps_are_not_on_this_channel() {
 /// the unused numbers (dird's password-set steps, the join token), and the
 /// reserved `REFUSED_KIND` close the connection without a reply. (The key
 /// operations `0x0E`, `0x0F` are this channel's since task A10; keyadm's
-/// `0x10`–`0x12` are retired by A-102 and close too.)
+/// `0x10`–`0x12` are retired by A-102 and close too; `0x16` is
+/// `ChangePolicy` since task A16, so `0x17` stands for the next unused one.)
 #[test]
 fn unknown_kinds_close() {
     for kind in [
@@ -442,7 +452,7 @@ fn unknown_kinds_close() {
         0x11,
         0x12,
         0x13,
-        0x16,
+        0x17,
         0x81,
         0x87,
         0x7F,

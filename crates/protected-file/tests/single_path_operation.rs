@@ -14,10 +14,12 @@
 //! the socket bind by path (`UnixListener::bind(`) — appear only in
 //! `crates/protected-file/src` and in the files listed in [`ALLOWED`], each
 //! with its reason. A new one in daemon, tool or library source fails this
-//! test; it must use `protected_file::prepare_socket_directory` or the
+//! test; it must use `protected_file::prepare_socket_directory` (or
+//! `prepare_daemon_directory`, task A16) or the
 //! installer's operations (`entry_facts`, `create_new_directory`,
 //! `create_new_file`, `create_new_read_write`, `rename_no_replace`,
-//! `rename_replace`, `remove_empty_directory`, `sync_directory`) instead.
+//! `rename_replace`, `remove_empty_directory`, `remove_entry` (task A16),
+//! `sync_directory`) instead.
 //!
 //! A call matches only as a whole name: the character before it is not part
 //! of an identifier, so `fchown(` (on a descriptor) is not `chown(`, and

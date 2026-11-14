@@ -14,12 +14,12 @@
 //! value is constructed by hand for these tests; no vector comes from any
 //! other implementation.
 
-use dtyp::Guid;
+use dtyp::{Guid, Sid, SECURITY_NT_AUTHORITY};
 use ipc::{encode_frame, encode_payload, Direction};
 use ipc_dird_admin::{
     decode_request, operation_digest, wire_operation_digest, AccountExpires, Auth, KeyOperation,
-    KeyRef, LookupKey, Operation, PasswordSetOutcome, Request, WireAuth, ADMIN_CHANNEL,
-    OPERATION_DIGEST_LABEL, REQUEST_LIMIT,
+    KeyRef, LookupKey, Operation, PasswordSetOutcome, PolicyChange, PolicyTier, Request, WireAuth,
+    ADMIN_CHANNEL, OPERATION_DIGEST_LABEL, REQUEST_LIMIT,
 };
 use sha2::{Digest, Sha256};
 
@@ -98,7 +98,48 @@ fn operations() -> Vec<Operation> {
             id: 41,
             operation: KeyOperation::RotateKey { service: guid(30) },
         },
+        // Task A16: R2's digest covers the new kind with no code of its own
+        // (the payload after `auth`, like every other kind's).
+        change_policy(1201, PolicyTier::Tier1),
     ]
+}
+
+/// A `ChangePolicy` adding one SID row (task A16).
+fn change_policy(rid: u32, tier: PolicyTier) -> Operation {
+    Operation::ChangePolicy {
+        changes: vec![PolicyChange::AddPrincipal(
+            Sid::new(SECURITY_NT_AUTHORITY, &[21, 1, 2, 3, rid]).unwrap(),
+            tier,
+        )],
+    }
+}
+
+/// Task A16 (docs/52 §5 item 1; docs/questions/Q-592): an approval of a
+/// tier-map change is bound to the exact change — another SID, another
+/// tier, another change or one more change gives another digest.
+#[test]
+fn a_policy_change_digest_binds_every_change() {
+    let base = operation_digest(&change_policy(1201, PolicyTier::Tier1)).unwrap();
+    for other in [
+        change_policy(1202, PolicyTier::Tier1),
+        change_policy(1201, PolicyTier::Tier0),
+        Operation::ChangePolicy {
+            changes: vec![PolicyChange::RemovePrincipal(
+                Sid::new(SECURITY_NT_AUTHORITY, &[21, 1, 2, 3, 1201]).unwrap(),
+            )],
+        },
+        Operation::ChangePolicy {
+            changes: vec![
+                PolicyChange::AddPrincipal(
+                    Sid::new(SECURITY_NT_AUTHORITY, &[21, 1, 2, 3, 1201]).unwrap(),
+                    PolicyTier::Tier1,
+                ),
+                PolicyChange::RemoveSubtree(vec!["ou=Old".into()]),
+            ],
+        },
+    ] {
+        assert_ne!(operation_digest(&other).unwrap(), base, "{other:?}");
+    }
 }
 
 /// The request frame body (`magic ‖ version ‖ kind ‖ payload`).

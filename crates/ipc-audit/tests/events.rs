@@ -339,7 +339,11 @@ fn code_tables_are_closed() {
     assert_eq!(EventShape::WindowSummary.code(), 4);
     assert_eq!(EventShape::DirAdmin.code(), 5);
     assert_eq!(EventShape::Admind.code(), 6);
-    assert_eq!(table!(DirAdminOperation), 18);
+    // Task A16 appended `ChangePolicy` (docs/51 §5.10; docs/questions/Q-592):
+    // the earlier eighteen keep their codes.
+    assert_eq!(table!(DirAdminOperation), 19);
+    assert_eq!(DirAdminOperation::ListPendingDestruction.code(), 18);
+    assert_eq!(DirAdminOperation::ChangePolicy.code(), 19);
     // Task A3 appended `SelfLockout` (Q-295 item 4, P-22); task F4
     // appended `ObligationRefused` (A-91, Q-388 item 1, Q-397); task A10
     // appended `OperationMismatch` and `KeyOperationRefused` (Q-421).
@@ -379,7 +383,10 @@ fn code_tables_are_closed() {
     table!(AdminPhase);
     table!(DecisionResultCode);
     table!(OutcomeResultCode);
-    table!(AdminNameKind);
+    // Task A16 appended `PolicyChange` (Q-592): the earlier six keep theirs.
+    assert_eq!(table!(AdminNameKind), 7);
+    assert_eq!(AdminNameKind::DistinguishedName.code(), 6);
+    assert_eq!(AdminNameKind::PolicyChange.code(), 7);
     table!(AdmindActivityCode);
     table!(ConnectionRefusal);
     table!(PasswordResultCode);

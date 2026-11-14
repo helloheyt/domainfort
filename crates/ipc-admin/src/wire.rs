@@ -16,8 +16,8 @@
 //!   `ListPendingDestruction`, the only ones without `auth`) are retired by
 //!   A-102 (docs/52 §4.6; docs/questions/Q-460): their kinds are not in the
 //!   closed table, so admind refuses them like any unknown kind.
-//! * The replies `Created`, `Done`, `Found`, `Pong`, `KeyRequest` are
-//!   dird's (read and written by
+//! * The replies `Created`, `Done`, `Found`, `Pong`, `KeyRequest`,
+//!   `PolicyNext` (task A16) are dird's (read and written by
 //!   `ipc_dird_admin::AdminReply`); `Refused` carries this channel's status
 //!   table; `PasswordChanged` is `kvnos: seq<u32, 2> ‖ completion_recorded:
 //!   bool`.
@@ -207,6 +207,11 @@ pub enum AdminReply {
     },
     /// dird's `KeyRequest` (dird's layout).
     KeyRequest(WireKeyRequest),
+    /// dird's `PolicyNext` (dird's layout: `version:u64`; task A16).
+    PolicyNext {
+        /// The `policy_version` of `policy.next`.
+        version: u64,
+    },
 }
 
 impl MessageSet for AdminReply {
@@ -221,6 +226,7 @@ impl MessageSet for AdminReply {
             AdminReply::Pong => reply_kind::PONG,
             AdminReply::PasswordChanged { .. } => reply_kind::PASSWORD_CHANGED,
             AdminReply::KeyRequest(_) => reply_kind::KEY_REQUEST,
+            AdminReply::PolicyNext { .. } => reply_kind::POLICY_NEXT,
         }
     }
 
@@ -256,6 +262,9 @@ impl MessageSet for AdminReply {
             AdminReply::KeyRequest(request) => {
                 DirdReply::KeyRequest(request.clone()).write_payload(writer)
             }
+            AdminReply::PolicyNext { version } => {
+                DirdReply::PolicyNext { version: *version }.write_payload(writer)
+            }
         }
     }
 
@@ -290,6 +299,10 @@ impl MessageSet for AdminReply {
             },
             reply_kind::KEY_REQUEST => match DirdReply::read_payload(kind, reader)? {
                 DirdReply::KeyRequest(request) => AdminReply::KeyRequest(request),
+                _ => return Err(Error::UnknownKind),
+            },
+            reply_kind::POLICY_NEXT => match DirdReply::read_payload(kind, reader)? {
+                DirdReply::PolicyNext { version } => AdminReply::PolicyNext { version },
                 _ => return Err(Error::UnknownKind),
             },
             _ => return Err(Error::UnknownKind),

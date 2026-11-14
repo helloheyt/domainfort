@@ -265,6 +265,7 @@ pub fn input(dir: &TempDir, dird_uid: u32, keyadm_uid: u32) -> DomainInput {
             admin_socket: path(dir, "run/admind/admin.sock"),
             tls_certificate: path(dir, "etc/dc-cert.der"),
             tls_private_key: path(dir, "etc/dc-key.der"),
+            policy_next: path(dir, "var/dird-policy/policy.next"),
         },
         network: Network {
             kdc_listen: vec!["127.0.0.1:88".to_owned()],

@@ -276,6 +276,26 @@ impl EventBase {
         base
     }
 
+    /// The fields a `ChangePolicy` request determines (task A16): the
+    /// operation, and each tier-map change as a name of kind `PolicyChange`
+    /// in the edit's command-line spelling (crate policy-store `TierChange`'s
+    /// `Display`) — SIDs and DNs, not secret (docs/47 §2.3). A change whose
+    /// spelling is not kept by the `AuditText` rule (over 256 octets) is the
+    /// marker.
+    /// Spec: docs/51 §5.7 item 1, §5.10; crate ipc-audit
+    /// `AdminNameKind::PolicyChange`; docs/questions/Q-592.
+    pub(crate) fn of_policy_change(
+        operation_id: u64,
+        changes: &[policy_store::TierChange],
+    ) -> EventBase {
+        let mut base = EventBase::bare(operation_id, DirAdminOperation::ChangePolicy);
+        base.names = changes
+            .iter()
+            .map(|change| name(AdminNameKind::PolicyChange, &change.to_string()))
+            .collect();
+        base
+    }
+
     /// An event base with only the operation number and code (every other
     /// field empty): a key-operation step fills its own fields (task A10).
     /// Spec: crate ipc-audit `DirAdminEvent` field list.
