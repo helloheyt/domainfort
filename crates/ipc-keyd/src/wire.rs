@@ -6,7 +6,9 @@
 //!
 //! | value | encoding |
 //! |---|---|
-//! | `KeyHandle` | 16-octet `PrincipalId` ‖ purpose `u8` (closed table) |
+//! | `KeyHandle` | 16-octet `PrincipalId` ‖ purpose `u8` (closed table: 1 PrincipalLongterm, 2 Krbtgt, 3 Service, 4 AdminService) |
+//! | `AppBinding` (`open_and_verify_service_ticket`) | `u8 1` Unbound \| `u8 2` OperationDigest ‖ 32 octets — no purpose travels: keyd derives it from the binding (R2) |
+//! | `bound_operation` (`ServiceContext`) | `Option<[32]>` |
 //! | `ExchangeId` / `CtxId` / `ArmorId` / `ServiceCtxId` | `TOKEN_ID_LENGTH` octets |
 //! | `Kvno`, `nonce`, flags (`TicketFlags`, 32 bits) | `u32` |
 //! | `EncTypeId` | `u8` = the etype number, closed table of keyd-types (= krb-crypto's, pinned in keyd) |
@@ -52,9 +54,9 @@ use crate::channel::{
 };
 use ipc::{DerBlob, Error, MessageSet, Payload, Reader, Result, Secret, Writer};
 use keyd_types::{
-    AccountKind, ArmorId, AuthnError, CtxId, DecisionId, EncTypeId, ExchangeId, FastConversation,
-    IssueError, KeyHandle, KeyPurpose, Kvno, PendingDestruction, PrincipalId, Role, ServiceCtxId,
-    TicketPolicy, TOKEN_ID_LENGTH,
+    AccountKind, AppBinding, ArmorId, AuthnError, CtxId, DecisionId, EncTypeId, ExchangeId,
+    FastConversation, IssueError, KeyHandle, KeyPurpose, Kvno, OperationDigest, PendingDestruction,
+    PrincipalId, Role, ServiceCtxId, TicketPolicy, OPERATION_DIGEST_LEN, TOKEN_ID_LENGTH,
 };
 use krb_proto::{KerberosFlags, TicketFlags};
 
@@ -70,6 +72,7 @@ const fn purpose_code(purpose: KeyPurpose) -> u8 {
         KeyPurpose::PrincipalLongterm => 0x01,
         KeyPurpose::Krbtgt => 0x02,
         KeyPurpose::Service => 0x03,
+        KeyPurpose::AdminService => 0x04,
     }
 }
 
@@ -80,6 +83,7 @@ const fn purpose_from_code(code: u8) -> Option<KeyPurpose> {
         0x01 => Some(KeyPurpose::PrincipalLongterm),
         0x02 => Some(KeyPurpose::Krbtgt),
         0x03 => Some(KeyPurpose::Service),
+        0x04 => Some(KeyPurpose::AdminService),
         _ => None,
     }
 }
@@ -679,29 +683,72 @@ impl Payload for SealFastErrorRequest {
     }
 }
 
-/// `open_and_verify_service_ticket`. Spec: docs/50 §3.4 (`service`,
-/// `ap_req_octets: bytes`); docs/10 §5ב.
+/// Wire code of `AppBinding::Unbound`. Project choice (closed table).
+/// Spec: docs/52 §5 item 3 (R2).
+const BINDING_UNBOUND: u8 = 0x01;
+/// Wire code of `AppBinding::OperationDigest`, followed by the 32 octets.
+/// Spec: docs/52 §5 item 3 (R2).
+const BINDING_OPERATION_DIGEST: u8 = 0x02;
+
+/// `AppBinding` = `u8 1` Unbound | `u8 2` OperationDigest ‖ 32 octets.
+/// Spec: docs/52 §5 item 3; docs/50 §3.3 ("enum = `u8` from a closed
+/// table").
+fn write_binding(writer: &mut Writer, binding: &AppBinding) -> Result<()> {
+    match binding {
+        AppBinding::Unbound => writer.write_enum(BINDING_UNBOUND),
+        AppBinding::OperationDigest(digest) => {
+            writer.write_enum(BINDING_OPERATION_DIGEST)?;
+            writer.write_array(digest.as_bytes())
+        }
+    }
+}
+
+/// Spec: docs/52 §5 item 3; docs/50 §3.3.
+fn read_binding(reader: &mut Reader<'_>) -> Result<AppBinding> {
+    let tag = reader
+        .read_enum(|c| matches!(c, BINDING_UNBOUND | BINDING_OPERATION_DIGEST).then_some(c))?;
+    if tag == BINDING_OPERATION_DIGEST {
+        Ok(AppBinding::OperationDigest(OperationDigest::new(
+            reader.read_array()?,
+        )))
+    } else {
+        Ok(AppBinding::Unbound)
+    }
+}
+
+/// `open_and_verify_service_ticket`: the service principal, the binding
+/// (whose purpose the key set is — keyd derives it, R2: no purpose travels,
+/// so no request can pair the admin service key with an unbound
+/// verification), and the AP-REQ.
+/// Spec: docs/50 §3.4 (`service`, `ap_req_octets: bytes`); docs/10 §5ב;
+/// docs/52 §5 item 3 (A-102).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenAndVerifyServiceTicketRequest {
-    /// Service handle.
-    pub service: KeyHandle,
+    /// The service key set's principal.
+    pub service: PrincipalId,
+    /// What the Authenticator must be bound to (and so the key set's
+    /// purpose).
+    pub binding: AppBinding,
     /// The raw KRB_AP_REQ octets (keyd decodes them itself).
     pub ap_req_octets: Vec<u8>,
 }
 
 impl Payload for OpenAndVerifyServiceTicketRequest {
-    /// Spec: docs/50 §3.4.
+    /// Spec: docs/50 §3.4; docs/52 §5 item 3.
     fn write_fields(&self, writer: &mut Writer) -> Result<()> {
-        write_handle(writer, &self.service)?;
+        writer.write_array(self.service.as_bytes())?;
+        write_binding(writer, &self.binding)?;
         writer.write_bytes(&self.ap_req_octets, MAX_REQUEST_FIELD)
     }
 
-    /// Spec: docs/50 §3.4.
+    /// Spec: docs/50 §3.4; docs/52 §5 item 3.
     fn read_fields(reader: &mut Reader<'_>) -> Result<OpenAndVerifyServiceTicketRequest> {
-        let service = read_handle(reader)?;
+        let service = PrincipalId::from_bytes(reader.read_array()?);
+        let binding = read_binding(reader)?;
         let ap_req_octets = read_owned(reader, MAX_REQUEST_FIELD)?;
         Ok(OpenAndVerifyServiceTicketRequest {
             service,
+            binding,
             ap_req_octets,
         })
     }
@@ -1389,10 +1436,12 @@ pub struct WireServiceContext {
     pub flags: TicketFlags,
     /// Whether the authenticator offered a subkey.
     pub subkey_present: bool,
+    /// The operation digest keyd verified the `cksum` over (R2), if any.
+    pub bound_operation: Option<[u8; OPERATION_DIGEST_LEN]>,
 }
 
 impl Payload for WireServiceContext {
-    /// Spec: docs/50 §3.4.
+    /// Spec: docs/50 §3.4; docs/52 §5 items 3-4 (`bound_operation`).
     fn write_fields(&self, writer: &mut Writer) -> Result<()> {
         writer.write_array(self.ctx_id.as_bytes())?;
         writer.write_bytes(&self.crealm, MAX_REPLY_FIELD)?;
@@ -1400,7 +1449,8 @@ impl Payload for WireServiceContext {
         self.authtime.write_fields(writer)?;
         self.endtime.write_fields(writer)?;
         write_flags(writer, self.flags)?;
-        writer.write_bool(self.subkey_present)
+        writer.write_bool(self.subkey_present)?;
+        writer.write_option(self.bound_operation.as_ref(), |w, d| w.write_array(d))
     }
 
     /// Spec: docs/50 §3.4.
@@ -1412,6 +1462,7 @@ impl Payload for WireServiceContext {
         let endtime = WireTime::read_fields(reader)?;
         let flags = read_flags(reader)?;
         let subkey_present = reader.read_bool()?;
+        let bound_operation = reader.read_option(Reader::read_array)?;
         Ok(WireServiceContext {
             ctx_id,
             crealm,
@@ -1420,6 +1471,7 @@ impl Payload for WireServiceContext {
             endtime,
             flags,
             subkey_present,
+            bound_operation,
         })
     }
 }

@@ -323,7 +323,11 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
             }
             Ok(Some(service)) => service,
         };
-        if service.key.purpose != KeyPurpose::Service {
+        // A service ticket is sealed under the key set of its service's
+        // purpose: Service, or AdminService for the admin service's name —
+        // and only for that name (R2, docs/52 §5 item 3; keyd's binding
+        // check refuses any other pairing too, A-19).
+        if service.key.purpose != KeyPurpose::of_service_name(sname) {
             return Err(internal(AuditReason::AccountRecordInvalid));
         }
         if !service.state.usable_at(now) {

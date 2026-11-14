@@ -8,12 +8,15 @@
 //! # The AP-REQs
 //!
 //! keyd holds the admin service's key set — `(admind-svc$ objectGUID,
-//! Service)`, bound to `NT-SRV-HST admind/dc1.example.org` (A-73) — created
-//! with `create_key` from scripted test entropy, so the test, playing the
-//! Kerberos side, knows the key. The test seals each administrator's service
-//! ticket under it (RFC 4120 §5.3: EncTicketPart, key usage 2) and builds the
-//! AP-REQ with an authenticator under the ticket's session key (§5.5.1, key
-//! usage 11), with krb-crypto and the kdc integration fixtures
+//! AdminService)` (R2: its own purpose), bound to `NT-SRV-HST
+//! admind/dc1.example.org` (A-73) — created with `create_key` from scripted
+//! test entropy, so the test, playing the Kerberos side, knows the key. The
+//! test seals each administrator's service ticket under it (RFC 4120 §5.3:
+//! EncTicketPart, key usage 2) and builds the AP-REQ with an authenticator
+//! under the ticket's session key (§5.5.1, key usage 11) whose `cksum` is
+//! the session key's MIC (key usage 10, §7.5.1) over the operation digest of
+//! the request it accompanies (`ipc_dird_admin::operation_digest`; docs/52
+//! §5), with krb-crypto and the kdc integration fixtures
 //! (crates/kdc/tests/common: `usage`, `aes256`, the scripted entropy, the
 //! names and times) — the construction keyd's own service-ticket tests use.
 //! keyd then runs the whole of RFC 4120 §3.2.3 on it (the binding check,
@@ -33,9 +36,13 @@
 //! satisfies it, the same principal twice does not); a wrong peer uid ⇒
 //! closed; a full queue ⇒ `Busy`; an oversize frame ⇒ closed before the
 //! body; the admin service object absent ⇒ no admin service, dird's other
-//! services run.
+//! services run; **R2** — an administrator's valid AP-REQ made for one
+//! operation and attached to another (the Q-292 attack), an approval made
+//! for another operation, and an AP-REQ without its `cksum` are all
+//! `Denied`, the store unchanged.
 //!
-//! Sources: docs/51 §5.2, §5.3, §5.6, §5.7, §7.1-§7.5; docs/50 §3.3, §3.6,
+//! Sources: docs/51 §5.2, §5.3, §5.6, §5.7, §7.1-§7.5; docs/52 §3.2, §5;
+//! docs/50 §3.3, §3.6,
 //! §9; docs/10 §5ב; RFC 4120 §3.2.3, §5.3, §5.5.1, §6.2.1, §7.5.1; [MS-SAMR]
 //! 2.2.1.14 (RID 502); [MS-DTYP] 2.4.2.4 (SID layout); docs/11 §2, §8;
 //! A-26, A-56, A-73, A-85, A-89, A-91, P-22. Every value is constructed by
@@ -70,8 +77,8 @@ use ipc_audit::{
     DirAdminEvent, DirAdminOperation, DirAdminStage, EventBody, OutcomeResult, AUDIT_CHANNEL,
 };
 use ipc_dird_admin::{
-    AccountExpires, AccountKind, AdminClient, Auth, LookupKey, Operation, PasswordSetOutcome,
-    RefusalStatus, Reply, Request, Unserved, MAX_REQUEST_BODY,
+    operation_digest, AccountExpires, AccountKind, AdminClient, Auth, LookupKey, Operation,
+    PasswordSetOutcome, RefusalStatus, Reply, Request, Unserved, MAX_REQUEST_BODY,
 };
 use keyd::{DecisionId, InMemoryKeyStore, KeyHandle, KeyPurpose, Keyd, Kvno, Role};
 use keyd_daemon::{CallerMap, ExtraListener, RecordBuffer};
@@ -536,11 +543,20 @@ fn principal(sam: &str) -> PrincipalName {
     common::name(KRB_NT_PRINCIPAL, &[sam])
 }
 
-/// An AP-REQ of `sam` for the admin service: the ticket sealed under the
-/// admin service key (usage 2), ending at `endtime`; the authenticator at
-/// `now` with `cusec`, under the session key (usage 11).
-/// Spec: RFC 4120 §5.3, §5.5.1, §7.5.1.
-fn ap_req(sam: &str, cusec: u32, endtime: KerberosTime) -> Vec<u8> {
+/// An AP-REQ of `sam` for the admin service bound to `operation`: the
+/// ticket sealed under the admin service key (usage 2), ending at
+/// `endtime`; the authenticator at `now` with `cusec`, under the session key
+/// (usage 11), its `cksum` the session key's MIC over the operation's digest
+/// (key usage 10, the session key's required checksum type — R2).
+/// Spec: RFC 4120 §4, §5.3, §5.5.1, §7.5.1; RFC 3961 §3; docs/52 §5.
+fn ap_req(sam: &str, cusec: u32, endtime: KerberosTime, operation: &Operation) -> Vec<u8> {
+    let digest = operation_digest(operation).unwrap();
+    ap_req_with(sam, cusec, endtime, Some(digest.as_bytes()))
+}
+
+/// [`ap_req`] with `bound` (if any) as the application data the `cksum`
+/// covers — `None`: no `cksum` at all.
+fn ap_req_with(sam: &str, cusec: u32, endtime: KerberosTime, bound: Option<&[u8]>) -> Vec<u8> {
     let part = EncTicketPart {
         flags: TicketFlags::PRE_AUTHENT,
         key: EncryptionKey {
@@ -571,10 +587,16 @@ fn ap_req(sam: &str, cusec: u32, endtime: KerberosTime) -> Vec<u8> {
             cipher: krb_crypto::encrypt(&key, common::usage(2), &[0x88; 16], &plain).unwrap(),
         },
     };
+    let session = common::aes256(&SESSION_KEY);
+    let cksumtype = session.enc_type().checksum_type();
+    let cksum = bound.map(|data| krb_proto::Checksum {
+        cksumtype: cksumtype.number(),
+        checksum: krb_crypto::get_mic(&session, cksumtype, common::usage(10), data).unwrap(),
+    });
     let authenticator = Authenticator {
         crealm: common::realm(),
         cname: principal(sam),
-        cksum: None,
+        cksum,
         cusec: Microseconds::new(cusec).unwrap(),
         ctime: common::now(),
         subkey: None,
@@ -583,7 +605,6 @@ fn ap_req(sam: &str, cusec: u32, endtime: KerberosTime) -> Vec<u8> {
     }
     .encode()
     .unwrap();
-    let session = common::aes256(&SESSION_KEY);
     ApReq {
         ap_options: ApOptions::empty(),
         ticket,
@@ -601,19 +622,22 @@ fn ap_req(sam: &str, cusec: u32, endtime: KerberosTime) -> Vec<u8> {
 /// A fresh cusec for every AP-REQ (keyd's replay cache, RFC 4120 §3.2.3).
 static CUSEC: AtomicU32 = AtomicU32::new(1);
 
-fn fresh(sam: &str) -> Vec<u8> {
+/// A fresh AP-REQ of `sam` bound to `operation` (R2).
+fn fresh(sam: &str, operation: &Operation) -> Vec<u8> {
     ap_req(
         sam,
         CUSEC.fetch_add(1, Ordering::SeqCst),
         common::kt("20261113170000Z"),
+        operation,
     )
 }
 
+/// `operation` by `requester` with `approvers`, every AP-REQ bound to it.
 fn by(requester: &str, approvers: &[&str], operation: Operation) -> Request {
     Request::Operation {
         auth: Auth {
-            requester: fresh(requester),
-            approvals: approvers.iter().map(|a| fresh(a)).collect(),
+            requester: fresh(requester, &operation),
+            approvals: approvers.iter().map(|a| fresh(a, &operation)).collect(),
         },
         operation,
     }
@@ -1032,10 +1056,11 @@ struct RefusingDecisions(Box<dyn TicketVerifier>);
 impl TicketVerifier for RefusingDecisions {
     fn verify(
         &mut self,
-        service: &KeyHandle,
+        service: &keyd::PrincipalId,
+        operation: &keyd::OperationDigest,
         ap_req: &[u8],
     ) -> Result<keyd::ServiceContext, keyd::AuthnError> {
-        self.0.verify(service, ap_req)
+        self.0.verify(service, operation, ap_req)
     }
 
     fn register_decision(
@@ -1846,15 +1871,16 @@ fn bad_or_expired_tickets_and_keyd_down() {
         return;
     };
     let mut client = world.client();
+    let refused_ou = Operation::CreateOu {
+        parent: g(ROOT),
+        name: "Refused".into(),
+    };
     let create = |requester: Vec<u8>| Request::Operation {
         auth: Auth {
             requester,
             approvals: Vec::new(),
         },
-        operation: Operation::CreateOu {
-            parent: g(ROOT),
-            name: "Refused".into(),
-        },
+        operation: refused_ou.clone(),
     };
     let seq_before = change_seq_next(&world.store);
     // Not an AP-REQ at all.
@@ -1869,19 +1895,26 @@ fn bad_or_expired_tickets_and_keyd_down() {
         "admin1",
         CUSEC.fetch_add(1, Ordering::SeqCst),
         common::kt("20261113090000Z"),
+        &refused_ou,
     );
     assert_eq!(
         client.call(&create(expired)).unwrap(),
         Reply::Refused(RefusalStatus::Denied)
     );
-    // The same AP-REQ twice: keyd's replay cache (RFC 4120 §3.2.3).
-    let once = fresh("admin1");
+    // The same AP-REQ twice: keyd's replay cache (RFC 4120 §3.2.3) — the
+    // second time for the same operation, the third for another (which R2
+    // refuses before the replay cache: the binding does not match).
+    let once = fresh("admin1", &refused_ou);
     assert!(matches!(
         client.call(&create(once.clone())).unwrap(),
         Reply::Created { .. }
     ));
     let seq_after_one = change_seq_next(&world.store);
     assert_eq!(seq_after_one, seq_before + 1);
+    assert_eq!(
+        client.call(&create(once.clone())).unwrap(),
+        Reply::Refused(RefusalStatus::Denied)
+    );
     assert_eq!(
         client
             .call(&Request::Operation {
@@ -1915,7 +1948,7 @@ fn bad_or_expired_tickets_and_keyd_down() {
     assert_eq!(change_seq_next(&world.store), seq_after_one);
     assert_eq!(world.object_named(g(ROOT), "Replayed"), None);
     assert_eq!(world.object_named(g(ROOT), "KeydDown"), None);
-    let events = await_events(&world, DirAdminOperation::CreateOu, 6);
+    let events = await_events(&world, DirAdminOperation::CreateOu, 7);
     let decisions: Vec<&DirAdminStage> = events
         .iter()
         .filter(|e| matches!(e.stage, DirAdminStage::Decision(_)))
@@ -1928,6 +1961,7 @@ fn bad_or_expired_tickets_and_keyd_down() {
             &DirAdminStage::Decision(DecisionResult::Refused(AdminRefusal::Unauthenticated)),
             &DirAdminStage::Decision(DecisionResult::Refused(AdminRefusal::Unauthenticated)),
             &DirAdminStage::Decision(DecisionResult::Proceed),
+            &DirAdminStage::Decision(DecisionResult::Refused(AdminRefusal::Unauthenticated)),
             &DirAdminStage::Decision(DecisionResult::Refused(AdminRefusal::Unauthenticated)),
             &DirAdminStage::Decision(DecisionResult::Failed(AdminFailure::KeydUnavailable)),
         ]
@@ -1975,6 +2009,135 @@ fn dual_control() {
         DirAdminStage::Decision(DecisionResult::Proceed)
     );
     assert_eq!(approved.approvers.len(), 1);
+}
+
+/// R2 — the Q-292 attack (docs/52 §3.2, class C2; §5): admind forwards
+/// AP-REQs untouched, so a compromised admind could take an
+/// administrator's valid AP-REQ made for one operation and attach it to
+/// another. dird computes the digest of the operation it decoded and keyd
+/// verifies the Authenticator's `cksum` against it: the attached AP-REQ is
+/// `Denied` (`Unauthenticated`), the store unchanged — and the same AP-REQ
+/// still serves, once, the operation it was made for. An AP-REQ without
+/// any `cksum` (an admin ticket with no binding) cannot be used at all.
+#[test]
+fn an_ap_req_attached_to_another_operation_is_denied() {
+    let Some(world) = World::new(Options::default()) else {
+        return;
+    };
+    let mut client = world.client();
+    let meant = Operation::CreateOu {
+        parent: g(ROOT),
+        name: "Meant".into(),
+    };
+    let hijacked = Operation::CreateOu {
+        parent: g(ROOT),
+        name: "Hijacked".into(),
+    };
+    let ap_req = fresh("admin1", &meant);
+    let attach = |requester: Vec<u8>, operation: &Operation| Request::Operation {
+        auth: Auth {
+            requester,
+            approvals: Vec::new(),
+        },
+        operation: operation.clone(),
+    };
+    let seq = change_seq_next(&world.store);
+    assert_eq!(
+        client.call(&attach(ap_req.clone(), &hijacked)).unwrap(),
+        Reply::Refused(RefusalStatus::Denied)
+    );
+    // A delete of a user, from the same AP-REQ: refused too.
+    assert_eq!(
+        client
+            .call(&attach(
+                ap_req.clone(),
+                &Operation::Delete { target: g(BOB) }
+            ))
+            .unwrap(),
+        Reply::Refused(RefusalStatus::Denied)
+    );
+    // No cksum at all.
+    let unbound = ap_req_with(
+        "admin1",
+        CUSEC.fetch_add(1, Ordering::SeqCst),
+        common::kt("20261113170000Z"),
+        None,
+    );
+    assert_eq!(
+        client.call(&attach(unbound, &meant)).unwrap(),
+        Reply::Refused(RefusalStatus::Denied)
+    );
+    assert_eq!(change_seq_next(&world.store), seq);
+    assert_eq!(world.object_named(g(ROOT), "Hijacked"), None);
+    assert_eq!(world.object_named(g(ROOT), "Meant"), None);
+    // The operation it was made for: performed.
+    assert!(matches!(
+        client.call(&attach(ap_req, &meant)).unwrap(),
+        Reply::Created { .. }
+    ));
+    assert_eq!(change_seq_next(&world.store), seq + 1);
+    let events = await_events(&world, DirAdminOperation::CreateOu, 4);
+    use ipc_audit::AdminRefusal;
+    assert_eq!(
+        events[0].stage,
+        DirAdminStage::Decision(DecisionResult::Refused(AdminRefusal::Unauthenticated))
+    );
+    let deletes = await_events(&world, DirAdminOperation::Delete, 1);
+    assert_eq!(
+        deletes[0].stage,
+        DirAdminStage::Decision(DecisionResult::Refused(AdminRefusal::Unauthenticated))
+    );
+}
+
+/// R2 (docs/52 §5 items 1, 4): an approver's AP-REQ authorizes exactly the
+/// request it was made for. admin2's valid AP-REQ made for another
+/// operation does not approve this Tier-0 membership change (`Denied`,
+/// recorded `ApproverUnauthenticated`), nor does one made for the same
+/// change of another member; bound to this request it does.
+#[test]
+fn an_approval_bound_to_another_operation_is_refused() {
+    let Some(world) = World::new(Options::default()) else {
+        return;
+    };
+    let mut client = world.client();
+    let add = |member| Operation::AddMember {
+        group: g(TIER0_GROUP),
+        member: g(member),
+    };
+    let seq = change_seq_next(&world.store);
+    for elsewhere in [
+        Operation::CreateOu {
+            parent: g(ROOT),
+            name: "Elsewhere".into(),
+        },
+        add(STAFF_GROUP),
+    ] {
+        let request = Request::Operation {
+            auth: Auth {
+                requester: fresh("admin1", &add(BOB)),
+                approvals: vec![fresh("admin2", &elsewhere)],
+            },
+            operation: add(BOB),
+        };
+        assert_eq!(
+            client.call(&request).unwrap(),
+            Reply::Refused(RefusalStatus::Denied)
+        );
+    }
+    assert_eq!(change_seq_next(&world.store), seq);
+    assert_eq!(
+        client.call(&by("admin1", &["admin2"], add(BOB))).unwrap(),
+        Reply::Done
+    );
+    let events = await_events(&world, DirAdminOperation::AddMember, 3);
+    for event in &events[..2] {
+        assert_eq!(
+            event.stage,
+            DirAdminStage::Decision(DecisionResult::Refused(
+                ipc_audit::AdminRefusal::ApproverUnauthenticated
+            ))
+        );
+    }
 }
 
 /// docs/51 §7.1 ("the only peer = `admind_uid`; another uid ⇒ close +
@@ -2404,7 +2567,15 @@ fn approvals_must_be_distinct_and_allowed() {
     // An approver's AP-REQ that does not verify (expired ticket).
     let expired = Request::Operation {
         auth: Auth {
-            requester: ap_req("admin2", 999_001, common::kt("20261113090000Z")),
+            requester: ap_req(
+                "admin2",
+                999_001,
+                common::kt("20261113090000Z"),
+                &Operation::Approve {
+                    id: state.id,
+                    operation: KeyOperation::RotateKrbtgt,
+                },
+            ),
             approvals: Vec::new(),
         },
         operation: Operation::Approve {

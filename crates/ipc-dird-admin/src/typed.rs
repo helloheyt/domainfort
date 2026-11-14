@@ -757,7 +757,10 @@ fn key_target(wire: &WireKeyTarget) -> Result<KeyTarget, ConversionError> {
 
 /// A key target on the wire. Spec: docs/50 §3.3.
 fn wire_key_target(target: &KeyTarget) -> Result<WireKeyTarget, ConversionError> {
-    if target.handle.purpose == keyd_types::KeyPurpose::Krbtgt {
+    if matches!(
+        target.handle.purpose,
+        keyd_types::KeyPurpose::Krbtgt | keyd_types::KeyPurpose::AdminService
+    ) {
         return Err(ConversionError::NonCanonical);
     }
     let name = target

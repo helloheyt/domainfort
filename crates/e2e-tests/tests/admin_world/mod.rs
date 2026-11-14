@@ -756,10 +756,15 @@ fn workstation_fixture(plan: &Plan, input: &DomainInput, uid: u32) -> Workstatio
     .unwrap();
     let mut admin = DirectoryAdmin::new(config, &schema, FixtureRandom::default()).unwrap();
     let now = fixture_at();
+    // The fixture runs the PEP without dird or keyd: the verified ticket's
+    // facts are injected, its operation binding (R2) a made-up digest that
+    // every fixture request carries — what keyd would have verified.
+    let fixture_digest = keyd::OperationDigest::new([0xF1; 32]);
     let requester = VerifiedTicket {
         crealm: realm(),
         cname: principal(ALICE),
         authtime: KerberosTime::new(2026, 11, 13, 9, 29, 50).unwrap(),
+        bound_operation: Some(fixture_digest),
     };
     let mut next_id = 0u64;
     let mut run = |operation: PepOperation| -> PepReply {
@@ -767,6 +772,7 @@ fn workstation_fixture(plan: &Plan, input: &DomainInput, uid: u32) -> Workstatio
         let request = PepRequest {
             operation_id: next_id,
             operation,
+            operation_digest: fixture_digest,
             requester: requester.clone(),
             approvals: Vec::new(),
         };
@@ -1521,18 +1527,29 @@ impl World {
     // ---- the admin plane ------------------------------------------------------
 
     /// A fresh AP-REQ of `who` for the admin service at the world time
-    /// (RFC 4120 §3.2.2).
-    pub fn ap_req(&mut self, who: &Persona) -> Vec<u8> {
+    /// (RFC 4120 §3.2.2), bound to the dird request `operation`: the
+    /// Authenticator's `cksum` is the session key's MIC (key usage 10) over
+    /// its operation digest (RFC 4120 §5.5.1, §7.5.1; R2, docs/52 §5).
+    pub fn ap_req(&mut self, who: &Persona, operation: &ipc_dird_admin::Operation) -> Vec<u8> {
         let cusec = self.fresh();
-        who.ticket.ap_req(self.now, cusec)
+        let digest = ipc_dird_admin::operation_digest(operation).unwrap();
+        who.ticket.ap_req_bound(self.now, cusec, digest.as_bytes())
     }
 
-    /// The `auth` field: `requester`'s AP-REQ and one per approver
-    /// (docs/51 §7.2).
-    pub fn auth(&mut self, requester: &Persona, approvers: &[&Persona]) -> ipc_dird_admin::Auth {
+    /// The `auth` field of `operation`: `requester`'s AP-REQ and one per
+    /// approver (docs/51 §7.2), every one bound to `operation` (R2).
+    pub fn auth(
+        &mut self,
+        requester: &Persona,
+        approvers: &[&Persona],
+        operation: &ipc_dird_admin::Operation,
+    ) -> ipc_dird_admin::Auth {
         ipc_dird_admin::Auth {
-            requester: self.ap_req(requester),
-            approvals: approvers.iter().map(|a| self.ap_req(a)).collect(),
+            requester: self.ap_req(requester, operation),
+            approvals: approvers
+                .iter()
+                .map(|a| self.ap_req(a, operation))
+                .collect(),
         }
     }
 
@@ -1549,7 +1566,7 @@ impl World {
         approvers: &[&Persona],
         operation: ipc_dird_admin::Operation,
     ) -> Got {
-        let auth = self.auth(requester, approvers);
+        let auth = self.auth(requester, approvers, &operation);
         self.admin(&ipc_admin::Request::Forward { auth, operation })
     }
 
@@ -1562,8 +1579,23 @@ impl World {
         target: Guid,
         password: &str,
     ) -> Got {
-        let auth = self.auth(requester, approvers);
-        let completion = self.ap_req(requester);
+        // R2 (docs/51 §7.6; docs/52 §5 items 1, 5): `auth` is bound to the
+        // `BeginPasswordSet {target}` admind sends dird, `completion` to its
+        // `CompletePasswordSet {target, …}` (whose digest covers the target
+        // only — the outcome and kvnos are admind's report).
+        let auth = self.auth(
+            requester,
+            approvers,
+            &ipc_dird_admin::Operation::BeginPasswordSet { target },
+        );
+        let completion = self.ap_req(
+            requester,
+            &ipc_dird_admin::Operation::CompletePasswordSet {
+                target,
+                outcome: ipc_dird_admin::PasswordSetOutcome::Completed,
+                kvnos: Vec::new(),
+            },
+        );
         self.admin(&ipc_admin::Request::SetPassword(ipc_admin::SetPassword {
             auth,
             completion,

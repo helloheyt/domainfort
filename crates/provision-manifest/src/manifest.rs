@@ -276,14 +276,16 @@ impl Manifest {
                 &[LDAP_SERVICE_CLASS, dc_fqdn.as_str()],
             ),
         )?;
-        // RFC 4120 §6.2.1; A-73; docs/51 §4.3 step 11: (GUID_admin, Service),
-        // [admind, fqdn] — NT-SRV-HST, a service on a host
+        // RFC 4120 §6.2.1; A-73; docs/51 §4.3 step 11: (GUID_admin,
+        // AdminService) — the admin service's own purpose (R2, docs/52 §5
+        // item 3; A-102), so keyd opens its tickets only bound to an
+        // operation — [admind, fqdn], NT-SRV-HST, a service on a host
         // (docs/questions/Q-345 item 4).
         let admin_service = Self::object(
             &doc,
             keys::ADMIN_SERVICE,
             &mut seen,
-            KeyPurpose::Service,
+            KeyPurpose::AdminService,
             binding(
                 &realm,
                 KRB_NT_SRV_HST,

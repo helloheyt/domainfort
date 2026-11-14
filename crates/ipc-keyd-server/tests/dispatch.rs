@@ -510,9 +510,23 @@ fn admin_and_directory_operations_through_the_client() {
     for c in [&mut admin, &mut directory, &mut kdc, &mut ldap] {
         assert_eq!(c.ping(), Ok(()));
     }
-    // A service ticket that is not one is keyd's uniform Denied.
+    // A service ticket that is not one is keyd's uniform Denied — unbound,
+    // and bound to an operation digest (R2: the binding travels, keyd
+    // derives the purpose).
     assert_eq!(
-        ldap.open_and_verify_service_ticket(&service, &[0x30, 0x00]),
+        ldap.open_and_verify_service_ticket(
+            &service.principal,
+            &keyd::AppBinding::Unbound,
+            &[0x30, 0x00]
+        ),
+        Err(AuthnError::Denied)
+    );
+    assert_eq!(
+        ldap.open_and_verify_service_ticket(
+            &service.principal,
+            &keyd::AppBinding::OperationDigest(keyd::OperationDigest::new([0xD4; 32])),
+            &[0x30, 0x00]
+        ),
         Err(AuthnError::Denied)
     );
     // One connection per client, kept across calls (R50-7).

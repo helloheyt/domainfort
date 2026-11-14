@@ -33,7 +33,7 @@ use dtyp::{Guid, Sid};
 use ipc_audit::{
     AdminFailure, AdminRefusal, DirAdminEvent, EventBody, IntentRecord, MAX_APPROVERS,
 };
-use keyd_types::{KeyHandle, KeyPurpose, PrincipalBinding, PrincipalId};
+use keyd_types::{KeyHandle, KeyPurpose, OperationDigest, PrincipalBinding, PrincipalId};
 use krb_proto::constants::{KRB_NT_PRINCIPAL, KRB_NT_SRV_HST};
 use krb_proto::{KerberosString, KerberosTime, PrincipalName};
 use pdp::{
@@ -54,7 +54,8 @@ use directory_pip::{
 
 use crate::audit::{pdp_reason, sid_value, EventBase, Refusal, Stop};
 use crate::checks::{
-    domain_sid, fault_stop, malformed, store_failure, Cx, LockoutChange, Resolved,
+    domain_sid, fault_stop, local_ipc_security, malformed, store_failure, Cx, LockoutChange,
+    Resolved,
 };
 use crate::config::{AdminConfig, ConfigError, CHANGE_SEQ_COUNTER, RID_COUNTER};
 use crate::descriptor::new_object_sd;
@@ -68,7 +69,7 @@ use crate::operation::{
 use crate::random::RandomSource;
 use crate::record;
 use crate::reply::{KeyTarget, LookupResult, PasswordSetReply, Reply};
-use crate::subject::{AdminSubject, SubjectError, VerifiedTicket};
+use crate::subject::{all_bound, AdminSubject, SubjectError, VerifiedTicket};
 use crate::time;
 
 /// The control access right User-Force-Change-Password: rightsGuid
@@ -91,7 +92,8 @@ pub const USER_FORCE_CHANGE_PASSWORD: Guid = Guid {
 pub const ACCOUNT_EXPIRES_NEVER: i64 = i64::MAX;
 
 /// One admin request, after the caller verified every AP-REQ through keyd.
-/// Spec: docs/51 §7.2 (`auth := requester ‖ approvals`), §7.3.
+/// Spec: docs/51 §7.2 (`auth := requester ‖ approvals`), §7.3; docs/52 §5
+/// item 4 (the operation digest).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
     /// dird's number for the operation: its `Decision` and `Outcome`
@@ -99,6 +101,12 @@ pub struct Request {
     pub operation_id: u64,
     /// The operation.
     pub operation: Operation,
+    /// The operation digest dird computed from the request it decoded
+    /// (crate ipc-dird-admin `operation_digest`) and had keyd verify every
+    /// AP-REQ against. The PEP reports `channel_bound` to the PDP only when
+    /// every ticket below carries exactly this digest (R2).
+    /// Spec: docs/52 §5 items 1, 4; RFC 4120 §5.5.1.
+    pub operation_digest: OperationDigest,
     /// The requester's verified ticket.
     pub requester: VerifiedTicket,
     /// The approvers' verified tickets (at most two, docs/51 §7.2).
@@ -345,6 +353,12 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         {
             return Err(Stop::Failed(AdminFailure::InternalFailure));
         }
+        // R2 (docs/52 §5 item 4): the channel is bound only if keyd verified
+        // every ticket the request relies on bound to this very operation.
+        let bound = all_bound(
+            &request.operation_digest,
+            core::iter::once(&request.requester).chain(&request.approvals),
+        );
         let cx = Cx {
             config: &self.config,
             ids: &self.ids,
@@ -352,6 +366,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
             policy,
             now: *now,
             instant: time::instant(now).ok_or(Stop::Failed(AdminFailure::InternalFailure))?,
+            transport_sec: local_ipc_security(bound),
         };
         // Step 1 — the requester (docs/51 §5.3, §5.5; A-73; R51-10).
         let requester = subject_of(&cx, &request.requester).map_err(|e| match e {

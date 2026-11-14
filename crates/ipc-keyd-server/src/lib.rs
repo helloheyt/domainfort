@@ -221,12 +221,16 @@ fn run<S: KeyStore, A: AuditSink, E: EntropySource>(
         } => {
             Answer::SealFastError(keyd.seal_fast_error(caller, &conversation, &error, &padata, now))
         }
+        // R2 (docs/52 §5 item 3): the principal and the binding; keyd
+        // derives the key set's purpose from the binding.
         Call::OpenAndVerifyServiceTicket {
             service,
+            binding,
             ap_req_octets,
         } => Answer::OpenAndVerifyServiceTicket(keyd.open_and_verify_service_ticket(
             caller,
             &service,
+            &binding,
             &ap_req_octets,
             now,
         )),

@@ -157,7 +157,7 @@ mod from_keyd {
 
     fn purpose(purpose: &keyd::KeyPurpose) -> KeyPurposeCode {
         use keyd::KeyPurpose as Src;
-        map_units!(purpose, Src => KeyPurposeCode { PrincipalLongterm, Krbtgt, Service })
+        map_units!(purpose, Src => KeyPurposeCode { PrincipalLongterm, Krbtgt, Service, AdminService })
     }
 
     fn reason(reason: &keyd::AuditReason) -> KeydReason {
@@ -180,7 +180,8 @@ mod from_keyd {
             ArmorConversationMismatch, ServiceKeyNotRandom, TransitedNotLocal,
             ApChecksumUnsupported, StartupHoldDown, NoGrant, GrantMismatch, GrantInvalid,
             GrantTableFull, NoDecision, DecisionMismatch, DecisionInvalid, DecisionTableFull,
-            DecisionConflict, DecisionReplayed, CeremonySealed,
+            DecisionConflict, DecisionReplayed, CeremonySealed, OperationDigestMissing,
+            OperationDigestMismatch,
         }
             _ => KeydReason::Unlisted,
         )

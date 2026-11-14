@@ -21,6 +21,12 @@
 //! for a set-secret decision, at most `MAX_GRANT_TARGETS` targets (docs/52
 //! §4.6).
 //!
+//! A decoded `open_and_verify_service_ticket` (kind `0x07`) carries a
+//! principal and a binding from a closed table (`1` Unbound, `2`
+//! OperationDigest + 32 octets) and no key purpose — keyd derives it (R2,
+//! docs/52 §5 item 3); the reply's operation digest is an optional 32-octet
+//! field (the reply target covers it).
+//!
 //! Written, not run (PENDING-OWNER P-1).
 //!
 //! Spec: docs/50 §3.3, §3.4, §9; R50-4; A-59; docs/51 §5.8.

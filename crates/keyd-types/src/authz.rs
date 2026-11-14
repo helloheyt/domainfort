@@ -15,6 +15,7 @@
 //! docs/25 §3.2 (keyd is a PEP).
 
 use crate::model::KeyPurpose;
+use crate::service_ticket::{AppBinding, OperationDigest, OPERATION_DIGEST_LEN};
 
 /// The role a calling process holds.
 ///
@@ -418,18 +419,30 @@ pub enum HandleSlot {
 ///   (the purposes of a decided operation are checked through the operation
 ///   that will run it — `DecidedOperation::purposes_permitted`),
 ///   `seal_ceremony` and `list_destroy_decisions` (A-102).
-/// - `issue_tgs_rep`: Service only. Referral TGTs (Krbtgt in docs/10 §5) are
-///   cross-realm, which phase 1 does not implement.
-/// - `open_and_verify_service_ticket`: Service only — "only handles of type
-///   `Service`" (docs/questions/Q-165 item 3, A-46); a TGT is never opened
-///   here (that is the KDC's `open_and_verify_tgt`).
-/// - `set_secret`, `verify_secret`, `rotate_key`: PrincipalLongterm or
-///   Service. The krbtgt key is never password-derived and is rotated only
-///   through `rotate_krbtgt` (dual control, docs/10 §7).
-/// - `destroy_key_set`: PrincipalLongterm or Service — never Krbtgt (A-35).
+/// - `issue_tgs_rep`: Service or AdminService — a service ticket is sealed
+///   under the key set of its service's purpose (the admin service's own,
+///   R2). Referral TGTs (Krbtgt in docs/10 §5) are cross-realm, which phase
+///   1 does not implement.
+/// - `open_and_verify_service_ticket`: Service or AdminService — "only
+///   handles of type `Service`" (docs/questions/Q-165 item 3, A-46), split
+///   by R2: which of the two is not the caller's choice but the binding's
+///   (`AppBinding::key_purpose`: `Unbound` ⇒ Service, `OperationDigest` ⇒
+///   AdminService — pinned below); a TGT is never opened here (that is the
+///   KDC's `open_and_verify_tgt`).
+/// - `set_secret`, `verify_secret`: PrincipalLongterm or Service. The krbtgt
+///   key is never password-derived and is rotated only through
+///   `rotate_krbtgt` (dual control, docs/10 §7); the admin service key is
+///   drawn by keyd and never password-derived either (R2: no Role::Directory
+///   `set_secret` can replace the key admin tickets are verified under —
+///   the A-50 / Q-180 item 4 rule as a purpose).
+/// - `rotate_key`: PrincipalLongterm, Service or AdminService.
+/// - `destroy_key_set`: PrincipalLongterm or Service — never Krbtgt (A-35),
+///   never AdminService (a destroy decision names a deleted account's
+///   PrincipalLongterm and Service key sets only).
 /// - `rotate_krbtgt`: Krbtgt.
 /// - `create_key`, `retire_kvno`: any phase-1 purpose (docs/10 §7:
-///   create_key also initializes krbtgt).
+///   create_key also initializes krbtgt; the ceremony draws the admin
+///   service key, docs/51 §4.3 step 11).
 /// - `grant_set_secret`: PrincipalLongterm first (every account's password
 ///   key set), Service second (a computer's service key set) — the targets
 ///   dird's `BeginPasswordSet` returns (docs/51 §5.2 row 5, §7.3). Never
@@ -437,11 +450,15 @@ pub enum HandleSlot {
 ///
 /// Spec: docs/10 §2 ("(b) the KeyPurpose of the handle matches the
 /// operation"), §4, §5, §6, §7, §12 I3; docs/48 §2.3, §9.1 I3;
-/// docs/questions/Q-115 (A-35), Q-165 item 3 (A-46), Q-450 item 2.
+/// docs/questions/Q-115 (A-35), Q-165 item 3 (A-46), Q-450 item 2, Q-463
+/// item 4 (A-102; docs/52 §5 item 3).
 pub const fn purpose_permitted(op: Operation, slot: HandleSlot, purpose: KeyPurpose) -> bool {
-    use KeyPurpose::{Krbtgt, PrincipalLongterm, Service};
+    use KeyPurpose::{AdminService, Krbtgt, PrincipalLongterm, Service};
     match (op, slot) {
-        (Operation::OpenAndVerifyServiceTicket, HandleSlot::Primary) => matches!(purpose, Service),
+        (Operation::OpenAndVerifyServiceTicket, HandleSlot::Primary)
+        | (Operation::IssueTgsRep, HandleSlot::Primary) => {
+            matches!(purpose, Service | AdminService)
+        }
         (Operation::VerifyPreauth, HandleSlot::Primary)
         | (Operation::IssueAsRep, HandleSlot::Primary) => {
             matches!(purpose, PrincipalLongterm)
@@ -450,16 +467,17 @@ pub const fn purpose_permitted(op: Operation, slot: HandleSlot, purpose: KeyPurp
         | (Operation::OpenAndVerifyTgt, HandleSlot::Primary)
         | (Operation::OpenFastArmor, HandleSlot::Primary)
         | (Operation::RotateKrbtgt, HandleSlot::Primary) => matches!(purpose, Krbtgt),
-        (Operation::IssueTgsRep, HandleSlot::Primary) => matches!(purpose, Service),
         (Operation::SetSecret, HandleSlot::Primary)
         | (Operation::VerifySecret, HandleSlot::Primary)
-        | (Operation::RotateKey, HandleSlot::Primary)
         | (Operation::DestroyKeySet, HandleSlot::Primary) => {
             matches!(purpose, PrincipalLongterm | Service)
         }
+        (Operation::RotateKey, HandleSlot::Primary) => {
+            matches!(purpose, PrincipalLongterm | Service | AdminService)
+        }
         (Operation::CreateKey, HandleSlot::Primary)
         | (Operation::RetireKvno, HandleSlot::Primary) => {
-            matches!(purpose, PrincipalLongterm | Service | Krbtgt)
+            matches!(purpose, PrincipalLongterm | Service | Krbtgt | AdminService)
         }
         (Operation::GrantSetSecret, HandleSlot::Primary) => matches!(purpose, PrincipalLongterm),
         (Operation::GrantSetSecret, HandleSlot::Secondary) => matches!(purpose, Service),
@@ -541,8 +559,8 @@ const _: () = {
     // describe_config and ping, and — docs/52 §4.2, A-102 —
     // register_decision, and — task R6, A-105 — list_destroy_decisions (a
     // read of its own registrations), and nothing else; no other role may call
-    // open_and_verify_service_ticket, and it opens only Service-purpose
-    // handles.
+    // open_and_verify_service_ticket, and it opens only Service- or
+    // AdminService-purpose handles (which of the two: the binding's, R2).
     let mut i = 0;
     while i < Operation::ALL.len() {
         let op = Operation::ALL[i];
@@ -576,6 +594,7 @@ const _: () = {
         KeyPurpose::PrincipalLongterm,
         KeyPurpose::Krbtgt,
         KeyPurpose::Service,
+        KeyPurpose::AdminService,
     ];
     let mut p = 0;
     while p < purposes.len() {
@@ -739,6 +758,69 @@ const _: () = {
         Operation::OpenAndVerifyServiceTicket,
         HandleSlot::Krbtgt,
         KeyPurpose::Service
+    ));
+    // R2 (docs/52 §3.2, §5 item 3; docs/questions/Q-463, A-102): the admin
+    // service's key set opens only with an operation digest and the LDAP
+    // service's only unbound — the binding, not the caller, names the
+    // purpose (`AppBinding::key_purpose`), and each row is fixed here.
+    assert!(matches!(
+        AppBinding::Unbound.key_purpose(),
+        KeyPurpose::Service
+    ));
+    assert!(matches!(
+        AppBinding::OperationDigest(OperationDigest::new([0; OPERATION_DIGEST_LEN])).key_purpose(),
+        KeyPurpose::AdminService
+    ));
+    assert!(purpose_permitted(
+        Operation::OpenAndVerifyServiceTicket,
+        HandleSlot::Primary,
+        KeyPurpose::AdminService
+    ));
+    // The KDC seals the admin service's tickets under its own key set.
+    assert!(purpose_permitted(
+        Operation::IssueTgsRep,
+        HandleSlot::Primary,
+        KeyPurpose::AdminService
+    ));
+    // The admin service key is never password-derived, never granted and
+    // never destroyed by a decision: no `set_secret` (Role::Directory) can
+    // replace the key admin tickets are verified under (A-50 / Q-180 item 4
+    // as a purpose).
+    assert!(!purpose_permitted(
+        Operation::SetSecret,
+        HandleSlot::Primary,
+        KeyPurpose::AdminService
+    ));
+    assert!(!purpose_permitted(
+        Operation::VerifySecret,
+        HandleSlot::Primary,
+        KeyPurpose::AdminService
+    ));
+    assert!(!purpose_permitted(
+        Operation::GrantSetSecret,
+        HandleSlot::Primary,
+        KeyPurpose::AdminService
+    ));
+    assert!(!purpose_permitted(
+        Operation::GrantSetSecret,
+        HandleSlot::Secondary,
+        KeyPurpose::AdminService
+    ));
+    assert!(!purpose_permitted(
+        Operation::DestroyKeySet,
+        HandleSlot::Primary,
+        KeyPurpose::AdminService
+    ));
+    // Nothing of the AS opens it.
+    assert!(!purpose_permitted(
+        Operation::VerifyPreauth,
+        HandleSlot::Primary,
+        KeyPurpose::AdminService
+    ));
+    assert!(!purpose_permitted(
+        Operation::OpenAndVerifyTgt,
+        HandleSlot::Primary,
+        KeyPurpose::AdminService
     ));
 };
 

@@ -70,6 +70,11 @@ fn request_time() -> KerberosTime {
     at(10, 1, 0)
 }
 
+/// The operation binding every request here carries (R2, docs/52 §5 item
+/// 4): these tests run the write PEP without dird or keyd, so the digest is
+/// a made-up value standing for the one keyd would have verified.
+const BOUND: keyd_types::OperationDigest = keyd_types::OperationDigest::new([0xB7; 32]);
+
 fn ticket(name: &str, authtime: KerberosTime) -> VerifiedTicket {
     VerifiedTicket {
         crealm: Realm::new("EXAMPLE.TEST").unwrap(),
@@ -78,6 +83,7 @@ fn ticket(name: &str, authtime: KerberosTime) -> VerifiedTicket {
             name_string: vec![KerberosString::new(name).unwrap()],
         },
         authtime,
+        bound_operation: Some(BOUND),
     }
 }
 
@@ -197,6 +203,7 @@ impl Domain {
         let request = Request {
             operation_id: self.next_id,
             operation,
+            operation_digest: BOUND,
             requester: ticket(requester, self.authtime),
             approvals: approvers.iter().map(|a| ticket(a, self.authtime)).collect(),
         };
@@ -258,10 +265,12 @@ impl Domain {
                 src_net: IpScope::Internal,
                 time: Instant(1_794_650_460),
                 transport: Transport::LocalIpc,
+                // What the admin PEP reports once keyd verified the
+                // AP-REQs' operation binding (R2, docs/52 §5 item 4).
                 transport_sec: TransportSec {
                     encrypted: true,
                     sealed: true,
-                    channel_bound: false,
+                    channel_bound: true,
                 },
             },
         };

@@ -12,8 +12,10 @@
 //!    "auditd unavailable ⇒ the operation is refused before any commit"
 //!    (A-85). Every `DirAdmin` event is gating (Q-340 item 8).
 //! 1. **Verify the AP-REQs through keyd** (Role::Ldap,
-//!    `open_and_verify_service_ticket` on the admin service's key set) —
-//!    the requester's, then each approval's. keyd unreachable ⇒
+//!    `open_and_verify_service_ticket` on the admin service's key set,
+//!    bound to the request's operation digest — R2, docs/52 §5: computed
+//!    here from the decoded operation, `ipc_dird_admin::operation_digest`)
+//!    — the requester's, then each approval's. keyd unreachable ⇒
 //!    `Unavailable` (A-56); any other failure ⇒ the uniform `Denied`
 //!    (A-26) — `DirectoryAdmin::refuse_unverified` plans the refusal event.
 //! 2. **Begin the `WriteTxn`** (for a write) — dird's admin thread is the
@@ -162,8 +164,8 @@ use ipc_audit::{
     AdminFailure, AdminRefusal, DecisionResult, DirAdminEvent, DirAdminStage, OutcomeResult,
     Reservation,
 };
-use ipc_dird_admin::{Auth, Operation, RefusalStatus, Reply};
-use keyd_types::{AuthnError, DecisionId, KeyHandle};
+use ipc_dird_admin::{operation_digest, Auth, Operation, RefusalStatus, Reply};
+use keyd_types::{AuthnError, DecisionId, KeyHandle, OperationDigest};
 use krb_proto::KerberosTime;
 use ldap::RateLimiter;
 use pdp::{Constraint, Obligation, PolicySnapshot};
@@ -346,13 +348,17 @@ impl Running {
     }
 
     /// The one AP-REQ of a key-plane step (the requester's or the
-    /// approver's), through keyd.
-    /// Spec: docs/51 §7.4 step 1; A-26; A-56; A-73.
-    fn verify_one(&mut self, ap_req: &[u8]) -> Result<VerifiedTicket, VerificationFailure> {
-        let service = self.worker.service;
+    /// approver's), through keyd, bound to `digest` (R2).
+    /// Spec: docs/51 §7.4 step 1; docs/52 §5 item 4; A-26; A-56; A-73.
+    fn verify_one(
+        &mut self,
+        ap_req: &[u8],
+        digest: &OperationDigest,
+    ) -> Result<VerifiedTicket, VerificationFailure> {
+        let service = self.worker.service.principal;
         self.worker
             .verifier
-            .verify(&service, ap_req)
+            .verify(&service, digest, ap_req)
             .map(|context| VerifiedTicket::from_service_context(&context))
             .map_err(|e| match e {
                 AuthnError::Unavailable => VerificationFailure::KeydUnavailable,
@@ -360,17 +366,20 @@ impl Running {
             })
     }
 
-    /// Step 1: the requester's AP-REQ, then each approval's, through keyd.
-    /// Spec: docs/51 §7.4 step 1; A-26; A-56; A-73.
+    /// Step 1: the requester's AP-REQ, then each approval's, through keyd —
+    /// every one bound to `digest`, the request's own (R2: an approval
+    /// authorizes exactly this request).
+    /// Spec: docs/51 §7.4 step 1; docs/52 §5 item 4; A-26; A-56; A-73.
     fn verify(
         &mut self,
         auth: &Auth,
+        digest: &OperationDigest,
     ) -> Result<(VerifiedTicket, Vec<VerifiedTicket>), VerificationFailure> {
-        let service = self.worker.service;
+        let service = self.worker.service.principal;
         let requester = self
             .worker
             .verifier
-            .verify(&service, &auth.requester)
+            .verify(&service, digest, &auth.requester)
             .map_err(|e| match e {
                 AuthnError::Unavailable => VerificationFailure::KeydUnavailable,
                 _ => VerificationFailure::Requester,
@@ -380,7 +389,7 @@ impl Running {
             let context = self
                 .worker
                 .verifier
-                .verify(&service, approval)
+                .verify(&service, digest, approval)
                 .map_err(|e| match e {
                     AuthnError::Unavailable => VerificationFailure::KeydUnavailable,
                     _ => VerificationFailure::Approver,
@@ -433,20 +442,33 @@ impl Running {
     /// Spec: docs/51 §5.6, §6, §7.3, §7.4.
     fn handle(&mut self, work: &AdminWork) -> Reply {
         match work {
-            AdminWork::Operation { auth, operation } => match key_request_of(operation) {
-                Some(request) => self.handle_key(auth, request),
-                None => match pep_operation(operation) {
-                    Some(operation) => self.handle_directory(auth, operation),
-                    // Cannot happen: every other operation maps.
-                    None => Reply::Refused(RefusalStatus::Unavailable),
-                },
-            },
+            AdminWork::Operation { auth, operation } => {
+                // R2 (docs/52 §5 item 4): the digest of the operation dird
+                // decoded — what every AP-REQ must be bound to. A decoded
+                // operation always has one; fail closed if not.
+                let Ok(digest) = operation_digest(operation) else {
+                    return Reply::Refused(RefusalStatus::Unavailable);
+                };
+                match key_request_of(operation) {
+                    Some(request) => self.handle_key(auth, request, &digest),
+                    None => match pep_operation(operation) {
+                        Some(operation) => self.handle_directory(auth, operation, &digest),
+                        // Cannot happen: every other operation maps.
+                        None => Reply::Refused(RefusalStatus::Unavailable),
+                    },
+                }
+            }
         }
     }
 
     /// One key-plane step (module documentation, "The key-plane steps").
     /// Spec: docs/51 §5.6, §6, §7.4; A-85; A-89; docs/11 §2.
-    fn handle_key(&mut self, auth: &Auth, request: KeyAdminOperation) -> Reply {
+    fn handle_key(
+        &mut self,
+        auth: &Auth,
+        request: KeyAdminOperation,
+        digest: &OperationDigest,
+    ) -> Reply {
         let Some(now) = self.worker.clock.now() else {
             return Reply::Refused(RefusalStatus::Unavailable);
         };
@@ -460,8 +482,8 @@ impl Running {
         let second = slots.next();
         let operation_id = self.next_id();
 
-        // Step 1: the step's one AP-REQ.
-        let ticket = match self.verify_one(&auth.requester) {
+        // Step 1: the step's one AP-REQ, bound to this step (R2).
+        let ticket = match self.verify_one(&auth.requester, digest) {
             Ok(ticket) => ticket,
             Err(failure) => {
                 let refusal =
@@ -491,6 +513,7 @@ impl Running {
                         &mut worker.key_requests,
                         operation_id,
                         &request,
+                        digest,
                         Some(&ticket),
                         approvals_supplied,
                         &view,
@@ -663,7 +686,12 @@ impl Running {
 
     /// One operation on the directory (module documentation).
     /// Spec: docs/51 §7.4; A-85; A-89.
-    fn handle_directory(&mut self, auth: &Auth, operation: PepOperation) -> Reply {
+    fn handle_directory(
+        &mut self,
+        auth: &Auth,
+        operation: PepOperation,
+        digest: &OperationDigest,
+    ) -> Reply {
         let Some(now) = self.worker.clock.now() else {
             return Reply::Refused(RefusalStatus::Unavailable);
         };
@@ -678,8 +706,8 @@ impl Running {
         let second = slots.next();
         let operation_id = self.next_id();
 
-        // Step 1: the tickets.
-        let (requester, approvals) = match self.verify(auth) {
+        // Step 1: the tickets, each bound to this request (R2).
+        let (requester, approvals) = match self.verify(auth, digest) {
             Ok(verified) => verified,
             Err(failure) => {
                 let refusal =
@@ -697,6 +725,7 @@ impl Running {
         let request = PepRequest {
             operation_id,
             operation,
+            operation_digest: *digest,
             requester,
             approvals,
         };

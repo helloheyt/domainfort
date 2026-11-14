@@ -236,8 +236,10 @@ code_table! {
 }
 
 code_table! {
-    /// `keyd::KeyPurpose`. Spec: docs/10 §2 (I3); crates/keyd model.rs.
-    pub enum KeyPurposeCode { PrincipalLongterm, Krbtgt, Service }
+    /// `keyd::KeyPurpose`. `AdminService` (code 4) appended by R2 (A-102,
+    /// docs/52 §5 item 3); 1-3 keep their codes.
+    /// Spec: docs/10 §2 (I3); crates/keyd-types model.rs.
+    pub enum KeyPurposeCode { PrincipalLongterm, Krbtgt, Service, AdminService }
 }
 
 code_table! {
@@ -282,7 +284,10 @@ code_table! {
     /// (the table's rule for appended variants; nothing is deployed —
     /// docs/questions/Q-452 item 4). The seven decision reasons
     /// (`NoDecision` … `CeremonySealed`, codes 70-76) were appended by A-102
-    /// the same way; `Unlisted` moved from 70 to 77.
+    /// the same way; `Unlisted` moved from 70 to 77. The two operation-binding
+    /// reasons (`OperationDigestMissing`, `OperationDigestMismatch`, codes
+    /// 77-78) were appended by R2 (A-102, docs/52 §5 item 3) the same way;
+    /// `Unlisted` moved from 77 to 79.
     /// Spec: crates/keyd audit.rs; docs/10 §9, §10, I8.
     pub enum KeydReason {
         None,
@@ -361,6 +366,8 @@ code_table! {
         DecisionConflict,
         DecisionReplayed,
         CeremonySealed,
+        OperationDigestMissing,
+        OperationDigestMismatch,
         Unlisted,
     }
 }

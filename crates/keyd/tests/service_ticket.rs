@@ -18,8 +18,8 @@ mod common;
 
 use common::*;
 use keyd::{
-    AuditOutcome, AuditReason, AuthnError, DecidedOperation, KeyHandle, KeyPurpose, Kvno,
-    PrincipalId,
+    AppBinding, AuditOutcome, AuditReason, AuthnError, DecidedOperation, KeyHandle, KeyPurpose,
+    Kvno, PrincipalId,
 };
 use krb_crypto::{ChecksumType, EncType, ProtocolKey};
 use krb_proto::constants::{DOMAIN_X500_COMPRESS, KRB_NT_SRV_INST};
@@ -256,8 +256,13 @@ fn verify(
     ap: &[u8],
     when: KerberosTime,
 ) -> Result<keyd::ServiceContext, AuthnError> {
-    f.keyd
-        .open_and_verify_service_ticket(&LDAP, &LDAP_SERVICE, ap, &when)
+    f.keyd.open_and_verify_service_ticket(
+        &LDAP,
+        &LDAP_SERVICE.principal,
+        &AppBinding::Unbound,
+        ap,
+        &when,
+    )
 }
 
 fn last_reason(f: &Fixture) -> AuditReason {
@@ -485,8 +490,13 @@ fn ticket_for_another_sname_is_denied_before_decryption() {
     // still refuses).
     let ap = ap_octets(&ldap, now(), 523);
     assert_eq!(
-        f.keyd
-            .open_and_verify_service_ticket(&LDAP, &SERVICE, &ap, &now()),
+        f.keyd.open_and_verify_service_ticket(
+            &LDAP,
+            &SERVICE.principal,
+            &AppBinding::Unbound,
+            &ap,
+            &now()
+        ),
         Err(AuthnError::Denied)
     );
     assert_eq!(last_reason(&f), AuditReason::NameBindingMismatch);
@@ -558,8 +568,13 @@ fn wrong_role_is_denied() {
     let ap = ap_octets(&issued, now(), 550);
     for caller in [KDC, DIRECTORY, ADMIN] {
         assert_eq!(
-            f.keyd
-                .open_and_verify_service_ticket(&caller, &LDAP_SERVICE, &ap, &now()),
+            f.keyd.open_and_verify_service_ticket(
+                &caller,
+                &LDAP_SERVICE.principal,
+                &AppBinding::Unbound,
+                &ap,
+                &now()
+            ),
             Err(AuthnError::Denied)
         );
         let last = f.records().last().unwrap();
@@ -569,17 +584,19 @@ fn wrong_role_is_denied() {
     assert!(verify(&mut f, &ap, now()).is_ok());
 }
 
-/// Role::Ldap opens only Service-purpose handles: a Krbtgt or a
-/// PrincipalLongterm handle is refused before anything else. Source:
-/// docs/10 §2, §12 I3; docs/questions/Q-165 item 3 ("only handles of type
-/// `Service`").
+/// Role::Ldap opens only Service-purpose key sets, and the purpose is never
+/// the caller's to name (R2: the binding's, `AppBinding::key_purpose`):
+/// naming the krbtgt's or alice's principal looks up *their* `Service` key
+/// set — which does not exist — so neither alice's TGT nor her LDAP ticket
+/// is opened under the krbtgt or a long-term key. Source: docs/10 §2, §12
+/// I3; docs/questions/Q-165 item 3 ("only handles of type `Service`");
+/// docs/52 §5 item 3.
 #[test]
-fn krbtgt_and_principal_handles_are_denied() {
+fn krbtgt_and_principal_keys_are_never_opened() {
     let mut f = fixture();
     let tgt = obtain_tgt(&mut f, now(), &as_template());
     let issued = ldap_ticket(&mut f, &tgt, 1);
     let ap = ap_octets(&issued, now(), 560);
-    // Alice's TGT under the krbtgt handle: still refused (purpose).
     let tgt_ap = octets(
         &tgt.parts.ticket,
         seal_authenticator(&tgt.session, &ApAuth::new(now(), 561)),
@@ -587,13 +604,19 @@ fn krbtgt_and_principal_handles_are_denied() {
     );
     for (handle, request) in [(KRBTGT, &tgt_ap), (KRBTGT, &ap), (ALICE, &ap)] {
         assert_eq!(
-            f.keyd
-                .open_and_verify_service_ticket(&LDAP, &handle, request, &now()),
+            f.keyd.open_and_verify_service_ticket(
+                &LDAP,
+                &handle.principal,
+                &AppBinding::Unbound,
+                request,
+                &now()
+            ),
             Err(AuthnError::Denied)
         );
         let last = f.records().last().unwrap();
-        assert_eq!(last.reason, AuditReason::PurposeMismatch);
-        assert_eq!(last.purpose, Some(handle.purpose));
+        assert_eq!(last.reason, AuditReason::KeyNotFound);
+        assert_eq!(last.purpose, Some(KeyPurpose::Service));
+        assert_eq!(last.kvno, None, "no key was used");
     }
     assert!(verify(&mut f, &ap, now()).is_ok());
 }
@@ -607,9 +630,15 @@ fn unknown_handle_is_denied() {
     let issued = ldap_ticket(&mut f, &tgt, 1);
     let ap = ap_octets(&issued, now(), 570);
     let stranger = KeyHandle::new(PrincipalId::from_bytes([0xEE; 16]), KeyPurpose::Service);
+    // (The purpose is the binding's, R2: only the principal is named.)
     assert_eq!(
-        f.keyd
-            .open_and_verify_service_ticket(&LDAP, &stranger, &ap, &now()),
+        f.keyd.open_and_verify_service_ticket(
+            &LDAP,
+            &stranger.principal,
+            &AppBinding::Unbound,
+            &ap,
+            &now()
+        ),
         Err(AuthnError::Denied)
     );
     assert_eq!(last_reason(&f), AuditReason::KeyNotFound);
@@ -677,7 +706,8 @@ fn tampered_or_mis_keyed_authenticator_is_denied() {
 }
 
 /// The authenticator must name the ticket's client, carry no
-/// authorization-data, and — in task L6a — no application-data checksum.
+/// authorization-data, and — on an unbound verification (task L6a; R2) —
+/// no application-data checksum.
 /// Source: RFC 4120 §3.2.3 (KRB_AP_ERR_BADMATCH), §5.5.1 (cksum,
 /// authorization-data); docs/questions/Q-180 item 3.
 #[test]
@@ -838,8 +868,13 @@ fn replay_is_reported_after_the_chain() {
     assert_eq!(verify(&mut f, &ap, now()), Err(AuthnError::Replay));
     assert_eq!(last_reason(&f), AuditReason::Replay);
     assert_eq!(
-        f.keyd
-            .open_and_verify_service_ticket(&LDAP_OTHER, &LDAP_SERVICE, &ap, &now()),
+        f.keyd.open_and_verify_service_ticket(
+            &LDAP_OTHER,
+            &LDAP_SERVICE.principal,
+            &AppBinding::Unbound,
+            &ap,
+            &now()
+        ),
         Err(AuthnError::Replay)
     );
     // A tampered copy is Denied, not Replay: the class needs the chain.
@@ -981,7 +1016,8 @@ fn password_derived_service_key_never_verifies() {
     assert_eq!(
         f.keyd.open_and_verify_service_ticket(
             &LDAP,
-            &dc02,
+            &dc02.principal,
+            &AppBinding::Unbound,
             &ap_octets(&issued, now(), 662),
             &now()
         ),
@@ -1096,4 +1132,387 @@ fn no_key_octets_in_outputs_or_audit() {
     // The context id prints only a short prefix.
     let id = format!("{:?}", ctx.ctx_id);
     assert!(id.starts_with("ServiceCtxId(") && id.ends_with("..)"));
+}
+
+// ---------------------------------------------------------------------------
+// R2 (docs/52 §3.2, §5; docs/questions/Q-463, A-102): the admin service's
+// key set opens a ticket only bound to an operation digest — the
+// Authenticator's `cksum`, key usage 10, keyed with the ticket session key,
+// of the session key's required checksum type (RFC 4120 §4, 5.5.1, 7.5.1
+// item 10; RFC 3961 §3, §4). The digests are made-up 32-octet values: keyd
+// never interprets them.
+// ---------------------------------------------------------------------------
+
+/// The operation an admin AP-REQ is made for, and another one.
+const DIGEST_A: [u8; 32] = [0xA0; 32];
+const DIGEST_B: [u8; 32] = [0xB0; 32];
+
+fn digest(octets: [u8; 32]) -> keyd::OperationDigest {
+    keyd::OperationDigest::new(octets)
+}
+
+/// A fixture with the LDAP and the admin service key sets.
+fn admin_fixture() -> Fixture {
+    let mut f = fixture();
+    add_admin_service(&mut f);
+    f
+}
+
+/// Alice's admin service ticket, issued by keyd's own TGS under the
+/// AdminService key set (the KDC seals it there, R2).
+fn admin_ticket(f: &mut Fixture, tgt: &Tgt, cusec: u32) -> Issued {
+    issue(
+        f,
+        tgt,
+        &ADMIN_SERVICE,
+        admin_service_name(),
+        cusec,
+        kt("20261113170000Z"),
+    )
+}
+
+/// The client's `cksum` over `message` (RFC 4120 5.5.1): the session key's
+/// required checksum type and key usage 10 — or what the test changes.
+fn cksum_over(
+    key: &ProtocolKey,
+    cksumtype: ChecksumType,
+    usage_number: u32,
+    message: &[u8],
+) -> Checksum {
+    Checksum {
+        cksumtype: cksumtype.number(),
+        checksum: krb_crypto::get_mic(key, cksumtype, usage(usage_number), message).unwrap(),
+    }
+}
+
+/// An AP-REQ of `issued` bound to `bound` (key usage 10, the session key's
+/// checksum type), at `now()` with `cusec`.
+fn bound_octets(issued: &Issued, bound: &[u8; 32], cusec: u32) -> Vec<u8> {
+    let mut spec = ApAuth::new(now(), cusec);
+    spec.cksum = Some(cksum_over(
+        &issued.session,
+        issued.session.enc_type().checksum_type(),
+        10,
+        bound,
+    ));
+    octets(
+        &issued.ticket,
+        seal_authenticator(&issued.session, &spec),
+        ApOptions::empty(),
+    )
+}
+
+fn verify_bound(
+    f: &mut Fixture,
+    ap: &[u8],
+    bound: [u8; 32],
+) -> Result<keyd::ServiceContext, AuthnError> {
+    f.keyd.open_and_verify_service_ticket(
+        &LDAP,
+        &ADMIN_SERVICE_ID,
+        &AppBinding::OperationDigest(digest(bound)),
+        ap,
+        &now(),
+    )
+}
+
+/// The right digest ⇒ opened under the AdminService key set; the answer
+/// names the verified digest; one success record with purpose AdminService.
+/// The unbound LDAP verification answers no digest. Source: RFC 4120 §5.5.1
+/// ("a checksum of the application data that accompanies the KRB_AP_REQ,
+/// computed using a key usage value of 10"), §7.5.1 item 10; RFC 3961 §4
+/// (verify_mic); docs/52 §5 items 2-3.
+#[test]
+fn right_operation_digest_opens_the_admin_ticket() {
+    let mut f = admin_fixture();
+    let tgt = obtain_tgt(&mut f, now(), &as_template());
+    let issued = admin_ticket(&mut f, &tgt, 1);
+    let ctx = verify_bound(&mut f, &bound_octets(&issued, &DIGEST_A, 700), DIGEST_A).unwrap();
+    assert_eq!(ctx.cname, alice_name());
+    assert_eq!(ctx.bound_operation, Some(digest(DIGEST_A)));
+    let records = f.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].result, AuditOutcome::Success);
+    assert_eq!(records[0].principal, Some(ADMIN_SERVICE_ID));
+    assert_eq!(records[0].purpose, Some(KeyPurpose::AdminService));
+
+    let ldap = ldap_ticket(&mut f, &tgt, 2);
+    let ctx = verify(&mut f, &ap_octets(&ldap, now(), 701), now()).unwrap();
+    assert_eq!(ctx.bound_operation, None);
+}
+
+/// The Q-292 attack at keyd: an admin's AP-REQ made for operation A,
+/// presented for operation B, is the uniform `Denied` with its own reason —
+/// before the replay cache and with no service context, so it stays usable
+/// for the operation it was made for (and only once). Source: docs/52 §3.2
+/// (C2), §5 item 3; RFC 4120 §3.2.3 (replay cache after authentication);
+/// A-26.
+#[test]
+fn wrong_operation_digest_is_denied_uniformly() {
+    let mut f = admin_fixture();
+    let tgt = obtain_tgt(&mut f, now(), &as_template());
+    let issued = admin_ticket(&mut f, &tgt, 1);
+    let ap = bound_octets(&issued, &DIGEST_A, 710);
+    assert_eq!(verify_bound(&mut f, &ap, DIGEST_B), Err(AuthnError::Denied));
+    let last = f.records().last().unwrap();
+    assert_eq!(last.reason, AuditReason::OperationDigestMismatch);
+    assert_eq!(last.result, AuditOutcome::Denied);
+    assert_eq!(live_contexts(&f), "0");
+    // Not consumed: the operation it was made for verifies, once.
+    assert!(verify_bound(&mut f, &ap, DIGEST_A).is_ok());
+    assert_eq!(verify_bound(&mut f, &ap, DIGEST_A), Err(AuthnError::Replay));
+    // A mismatch is `Denied` even when the authenticator is also skewed:
+    // the class needs the whole chain (A-26).
+    let mut skewed = ApAuth::new(at(3600), 711);
+    skewed.cksum = Some(cksum_over(
+        &issued.session,
+        ChecksumType::HmacSha196Aes256,
+        10,
+        &DIGEST_A,
+    ));
+    let ap = octets(
+        &issued.ticket,
+        seal_authenticator(&issued.session, &skewed),
+        ApOptions::empty(),
+    );
+    assert_eq!(verify_bound(&mut f, &ap, DIGEST_B), Err(AuthnError::Denied));
+    assert_eq!(last_reason(&f), AuditReason::OperationDigestMismatch);
+}
+
+/// An admin AP-REQ without a `cksum` cannot be used at all; a `cksum` that
+/// is not exactly the session key's MIC with key usage 10 is refused: the
+/// wrong checksum type (another enctype's, RFC 3961 §3 / RFC 3962 §7), the
+/// TGS usage 6, the KRB-SAFE-style application usage 1025, keyed with the
+/// authenticator subkey instead of the session key (RFC 4120 §7.5.1 item
+/// 10: "keyed with the application session key"), or truncated. Source: RFC
+/// 4120 §4, §5.5.1, §7.5.1; RFC 3961 §3, §4; docs/52 §5 item 3.
+#[test]
+fn missing_or_malformed_cksum_is_denied() {
+    let mut f = admin_fixture();
+    let tgt = obtain_tgt(&mut f, now(), &as_template());
+    let issued = admin_ticket(&mut f, &tgt, 1);
+
+    let ap = ap_octets(&issued, now(), 720);
+    assert_eq!(verify_bound(&mut f, &ap, DIGEST_A), Err(AuthnError::Denied));
+    assert_eq!(last_reason(&f), AuditReason::OperationDigestMissing);
+
+    let subkey_octets = [0x5D; 32];
+    let subkey = krb_crypto::random_to_key(EncType::Aes256CtsHmacSha196, &subkey_octets).unwrap();
+    let aes128 = krb_crypto::random_to_key(EncType::Aes128CtsHmacSha196, &[0x12; 16]).unwrap();
+    let mut truncated = cksum_over(
+        &issued.session,
+        ChecksumType::HmacSha196Aes256,
+        10,
+        &DIGEST_A,
+    );
+    truncated.checksum.pop();
+    let cases = [
+        cksum_over(&aes128, ChecksumType::HmacSha196Aes128, 10, &DIGEST_A),
+        cksum_over(
+            &issued.session,
+            ChecksumType::HmacSha196Aes256,
+            6,
+            &DIGEST_A,
+        ),
+        cksum_over(
+            &issued.session,
+            ChecksumType::HmacSha196Aes256,
+            1025,
+            &DIGEST_A,
+        ),
+        cksum_over(&subkey, ChecksumType::HmacSha196Aes256, 10, &DIGEST_A),
+        truncated,
+    ];
+    for (i, cksum) in cases.into_iter().enumerate() {
+        let mut spec = ApAuth::new(now(), 721 + u32::try_from(i).unwrap());
+        spec.subkey = Some(EncryptionKey {
+            keytype: 18,
+            keyvalue: KeyValue::from_slice(&subkey_octets),
+        });
+        spec.cksum = Some(cksum);
+        let ap = octets(
+            &issued.ticket,
+            seal_authenticator(&issued.session, &spec),
+            ApOptions::empty(),
+        );
+        assert_eq!(
+            verify_bound(&mut f, &ap, DIGEST_A),
+            Err(AuthnError::Denied),
+            "case {i}"
+        );
+        assert_eq!(
+            last_reason(&f),
+            AuditReason::OperationDigestMismatch,
+            "case {i}"
+        );
+    }
+    assert_eq!(live_contexts(&f), "0");
+}
+
+/// The binding names the key set's purpose (R2): an LDAP-purpose key set is
+/// never opened with an operation digest (its principal names no
+/// AdminService key set), the admin service key set is never opened unbound
+/// (its principal names no Service key set), and an admin AP-REQ handed to
+/// the LDAP key unbound fails the A-19 binding before any key is used.
+/// Source: docs/52 §3.2 ("keyd will verify a ticket of this profile only
+/// with `OperationDigest`"), §5 item 3; docs/questions/Q-463 item 4; A-19.
+#[test]
+fn binding_and_purpose_cannot_be_mixed() {
+    let mut f = admin_fixture();
+    let tgt = obtain_tgt(&mut f, now(), &as_template());
+    let admin = admin_ticket(&mut f, &tgt, 1);
+    let ldap = ldap_ticket(&mut f, &tgt, 2);
+
+    // An LDAP-purpose key with a digest: the LDAP ticket, even carrying a
+    // valid usage-10 cksum over the digest.
+    let ldap_bound = bound_octets(&ldap, &DIGEST_A, 730);
+    assert_eq!(
+        f.keyd.open_and_verify_service_ticket(
+            &LDAP,
+            &LDAP_SERVICE_ID,
+            &AppBinding::OperationDigest(digest(DIGEST_A)),
+            &ldap_bound,
+            &now()
+        ),
+        Err(AuthnError::Denied)
+    );
+    let last = f.records().last().unwrap();
+    assert_eq!(last.reason, AuditReason::KeyNotFound);
+    assert_eq!(last.purpose, Some(KeyPurpose::AdminService));
+    assert_eq!(last.kvno, None, "no key was used");
+
+    // The admin service key unbound: a correctly bound admin AP-REQ, and one
+    // without a cksum.
+    for ap in [
+        bound_octets(&admin, &DIGEST_A, 731),
+        ap_octets(&admin, now(), 732),
+    ] {
+        assert_eq!(
+            f.keyd.open_and_verify_service_ticket(
+                &LDAP,
+                &ADMIN_SERVICE_ID,
+                &AppBinding::Unbound,
+                &ap,
+                &now()
+            ),
+            Err(AuthnError::Denied)
+        );
+        let last = f.records().last().unwrap();
+        assert_eq!(last.reason, AuditReason::KeyNotFound);
+        assert_eq!(last.purpose, Some(KeyPurpose::Service));
+    }
+
+    // An admin AP-REQ handed to the LDAP key set unbound: the binding check.
+    assert_eq!(
+        verify(&mut f, &bound_octets(&admin, &DIGEST_A, 733), now()),
+        Err(AuthnError::Denied)
+    );
+    assert_eq!(last_reason(&f), AuditReason::NameBindingMismatch);
+    assert_eq!(f.records().last().unwrap().kvno, None);
+
+    // None of these consumed anything: both verify as made.
+    assert!(verify_bound(&mut f, &bound_octets(&admin, &DIGEST_A, 731), DIGEST_A).is_ok());
+    assert!(verify(&mut f, &ap_octets(&ldap, now(), 734), now()).is_ok());
+}
+
+/// The admin service key set is keyd's alone: no `set_secret`, grant or
+/// set-secret decision may name it, no destroy decision touches it, and it
+/// is bound only to the admin service's name (and that name to it only).
+/// Source: docs/52 §5 item 3 (R2: the purpose); docs/questions/Q-180 item 4
+/// (A-50: a password-derived service key must never verify); A-19; RFC 4120
+/// 6.2, 7.3 (the reserved-name rule shape).
+#[test]
+fn admin_service_key_is_never_password_derived_or_misbound() {
+    let mut f = admin_fixture();
+    assert_eq!(
+        f.keyd.set_secret(
+            &DIRECTORY,
+            &ADMIN_SERVICE,
+            &bound(admin_service_name()),
+            Zeroizing::new("known outside keyd".to_owned()),
+            "EXAMPLE.ORGadminddc01.example.org",
+            &now(),
+        ),
+        Err(keyd::Error::Denied)
+    );
+    assert_eq!(last_reason(&f), AuditReason::PurposeMismatch);
+    // A set-secret decision naming it is refused at registration.
+    assert!(f
+        .decide(
+            DecidedOperation::SetSecret {
+                kind: keyd::AccountKind::User,
+                targets: vec![keyd::SetSecretTarget {
+                    handle: ADMIN_SERVICE,
+                    binding: bound(admin_service_name()),
+                    salt: String::from("EXAMPLE.ORGadminddc01.example.org"),
+                }],
+            },
+            &now(),
+        )
+        .is_err());
+    assert_eq!(last_reason(&f), AuditReason::DecisionInvalid);
+
+    // The name rule, both ways (create_key — the ceremony, before the seal).
+    let other = PrincipalId::from_bytes([0xAE; 16]);
+    f.entropy.push(&[0x01; 32]);
+    assert_eq!(
+        f.keyd.create_key(
+            &ADMIN,
+            &KeyHandle::new(other, KeyPurpose::AdminService),
+            &bound(ldap_service_name()),
+            &now()
+        ),
+        Err(keyd::Error::Denied)
+    );
+    assert_eq!(last_reason(&f), AuditReason::InvalidNameBinding);
+    assert_eq!(
+        f.keyd.create_key(
+            &ADMIN,
+            &KeyHandle::new(other, KeyPurpose::Service),
+            &bound(admin_service_name()),
+            &now()
+        ),
+        Err(keyd::Error::Denied)
+    );
+    assert_eq!(last_reason(&f), AuditReason::InvalidNameBinding);
+
+    // A destroy decision for its principal leaves it in place.
+    let tgt = obtain_tgt(&mut f, now(), &as_template());
+    let destroy = f
+        .decide(
+            DecidedOperation::DestroyKeySet {
+                principal: ADMIN_SERVICE_ID,
+            },
+            &now(),
+        )
+        .unwrap();
+    f.keyd.destroy_key_set(&ADMIN, destroy, &now()).unwrap();
+    let issued = admin_ticket(&mut f, &tgt, 1);
+    assert!(verify_bound(&mut f, &bound_octets(&issued, &DIGEST_A, 740), DIGEST_A).is_ok());
+}
+
+/// The admin service key rotates like any service key (a decision dird
+/// registered), and a ticket under the previous version still verifies
+/// bound. Source: docs/51 §6; docs/10 §1, §7; [MS-KILE] 3.4.5.
+#[test]
+fn admin_service_key_rotates_on_a_decision() {
+    let mut f = admin_fixture();
+    let tgt = obtain_tgt(&mut f, now(), &as_template());
+    let before = admin_ticket(&mut f, &tgt, 1);
+    let rotation = f
+        .decide(
+            DecidedOperation::RotateKey {
+                handle: ADMIN_SERVICE,
+            },
+            &now(),
+        )
+        .unwrap();
+    assert_eq!(
+        f.keyd.rotate_key(&ADMIN, rotation, &now()),
+        Ok(Kvno::new(2))
+    );
+    assert!(verify_bound(&mut f, &bound_octets(&before, &DIGEST_A, 750), DIGEST_A).is_ok());
+    let after = admin_ticket(&mut f, &tgt, 2);
+    assert_eq!(after.ticket.enc_part.kvno, Some(2));
+    assert!(verify_bound(&mut f, &bound_octets(&after, &DIGEST_B, 751), DIGEST_B).is_ok());
 }

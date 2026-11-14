@@ -222,6 +222,54 @@ fn a_blob_that_is_not_strict_der_is_malformed() {
     assert_eq!(rejection.refusal(), Some(ipc::Refused::Malformed));
 }
 
+/// R2 (docs/52 §5 item 3): `open_and_verify_service_ticket` carries the
+/// service principal and the binding — `u8 1` Unbound, or `u8 2` and the 32
+/// digest octets — and **no purpose**: keyd derives it. Any other binding
+/// code is refused `Malformed` (closed table); so is a digest cut short.
+/// The `AdminService` purpose has its own handle code (4) and round-trips.
+#[test]
+fn the_service_ticket_binding_is_a_closed_table() {
+    let digest = keyd_types::OperationDigest::new([0xD3; 32]);
+    let bound = Call::OpenAndVerifyServiceTicket {
+        service: keyd_types::PrincipalId::from_bytes([0xAD; 16]),
+        binding: keyd_types::AppBinding::OperationDigest(digest),
+        ap_req_octets: vec![0x30, 0x00],
+    };
+    let body = request_body(&bound);
+    // envelope 4 ‖ principal 16 ‖ binding code ‖ digest 32 ‖ ap_req.
+    assert_eq!(&body[4..20], &[0xAD; 16]);
+    assert_eq!(body[20], 0x02);
+    assert_eq!(&body[21..53], digest.as_bytes());
+    for code in [0x00, 0x03, 0xFF] {
+        let mut mutated = body.clone();
+        mutated[20] = code;
+        assert_eq!(
+            decode_request(&mutated).map(|_| ()).unwrap_err().refusal(),
+            Some(ipc::Refused::Malformed),
+            "binding code {code:#04x}"
+        );
+    }
+    // An unbound request is one octet shorter by 32: the same octets with
+    // code 1 and no digest.
+    let unbound = Call::OpenAndVerifyServiceTicket {
+        service: keyd_types::PrincipalId::from_bytes([0xAD; 16]),
+        binding: keyd_types::AppBinding::Unbound,
+        ap_req_octets: vec![0x30, 0x00],
+    };
+    let short = request_body(&unbound);
+    assert_eq!(short.len() + 32, body.len());
+    assert_eq!(short[20], 0x01);
+    // The admin purpose's handle code.
+    let call = Call::VerifyPreauth {
+        client: samples::handle(0xAD, keyd_types::KeyPurpose::AdminService),
+        padata: samples::padata(2),
+        armor: None,
+    };
+    let body = request_body(&call);
+    assert_eq!(body[20], 0x04);
+    assert_eq!(request_body(&decode_request(&body).unwrap()), body);
+}
+
 /// docs/50 §3.3 (strict decoding; AGENTS.md §6: never panic on input): a
 /// one-octet mutation sweep over every sample request never panics, and
 /// every mutated body that is accepted re-encodes to exactly itself — no

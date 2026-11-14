@@ -126,7 +126,10 @@ impl KeyStore for CustodyStore {
     /// production needs an HSM-backed store for krbtgt). TESTS ONLY.
     fn accepts(&self, purpose: KeyPurpose) -> bool {
         match purpose {
-            KeyPurpose::Krbtgt | KeyPurpose::PrincipalLongterm | KeyPurpose::Service => true,
+            KeyPurpose::Krbtgt
+            | KeyPurpose::PrincipalLongterm
+            | KeyPurpose::Service
+            | KeyPurpose::AdminService => true,
         }
     }
 

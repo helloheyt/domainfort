@@ -71,16 +71,19 @@ fn admind_keyd_client(world: &World) -> KeydClient<connectors::KeydConnector> {
 /// in keyd under the request's id (A-102). Returns that id.
 fn request_and_approve(world: &World, operation: KeyOperation) -> u64 {
     let mut conn = world.connect();
+    let request = Operation::RequestKeyOperation { operation };
     let id = match conn.call(&Request::Forward {
-        auth: auth("admin1", &[]),
-        operation: Operation::RequestKeyOperation { operation },
+        auth: auth("admin1", &[], &request),
+        operation: request,
     }) {
         Got::Reply(Reply::KeyRequest(state)) => state.id,
         other => panic!("{other:?}"),
     };
+    // R2: admin2's AP-REQ is bound to exactly this Approve.
+    let approve = Operation::Approve { id, operation };
     match conn.call(&Request::Forward {
-        auth: auth("admin2", &[]),
-        operation: Operation::Approve { id, operation },
+        auth: auth("admin2", &[], &approve),
+        operation: approve,
     }) {
         Got::Reply(Reply::KeyRequest(state)) => assert!(state.approved()),
         other => panic!("{other:?}"),
@@ -93,7 +96,7 @@ fn delete_ws9(world: &World) {
     let mut conn = world.connect();
     assert_eq!(
         conn.call(&Request::Forward {
-            auth: auth("admin1", &[]),
+            auth: auth("admin1", &[], &Operation::Delete { target: g(WS9) }),
             operation: Operation::Delete { target: g(WS9) },
         }),
         Got::Reply(Reply::Done)

@@ -359,7 +359,7 @@ impl WireOperation {
 
     /// The fields after `auth`, in the docs/51 §7.3 order.
     /// Spec: docs/51 §7.3.
-    fn write_fields(&self, writer: &mut Writer) -> Result<()> {
+    pub(crate) fn write_fields(&self, writer: &mut Writer) -> Result<()> {
         match self {
             WireOperation::CreateUser {
                 parent,
@@ -615,7 +615,9 @@ fn purpose_code(purpose: KeyPurpose) -> Result<u8> {
     match purpose {
         KeyPurpose::PrincipalLongterm => Ok(codes::PURPOSE_PRINCIPAL_LONGTERM),
         KeyPurpose::Service => Ok(codes::PURPOSE_SERVICE),
-        KeyPurpose::Krbtgt => Err(Error::UnknownCode),
+        // Never a password-set target: the krbtgt key and the admin service
+        // key (R2) are keyd-drawn only.
+        KeyPurpose::Krbtgt | KeyPurpose::AdminService => Err(Error::UnknownCode),
     }
 }
 

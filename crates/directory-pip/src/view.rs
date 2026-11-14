@@ -699,9 +699,13 @@ impl DirectoryView<'_> {
             return Ok(None);
         }
         let state = self.state_of(&obj, &account)?;
-        // 5. The key set (objectGUID, Service).
+        // 5. The key set (objectGUID, Service) — or, for the admin service's
+        // name (`admind/<host>`, A-73), (objectGUID, AdminService): its
+        // tickets are sealed under its own key set (R2, docs/52 §5 item 3).
+        // keyd binds an AdminService key set to that name only, and no other
+        // key set to it (A-19), so a mis-resolved purpose finds no key.
         Ok(Some(ServiceAccount {
-            key: KeyHandle::new(principal_id(guid), KeyPurpose::Service),
+            key: KeyHandle::new(principal_id(guid), KeyPurpose::of_service_name(name)),
             state,
             enctypes: self.ctx.enctypes.clone(),
         }))

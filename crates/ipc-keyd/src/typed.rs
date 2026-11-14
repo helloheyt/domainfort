@@ -30,10 +30,10 @@ use crate::wire::{
 use core::fmt;
 use ipc::{DerBlob, Secret};
 use keyd_types::{
-    AccountKind, ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof, ConfigDescription,
-    CtxId, DecidedOperation, DecisionId, DestructionPage, FastArmor, FastConversation, IssueError,
-    KeyHandle, Kvno, Operation, PrincipalBinding, PrincipalId, Role, ServiceContext,
-    SetSecretTarget, TgsRepParts, TgsTicketTemplate, TgtContext,
+    AccountKind, AppBinding, ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof,
+    ConfigDescription, CtxId, DecidedOperation, DecisionId, DestructionPage, FastArmor,
+    FastConversation, IssueError, KeyHandle, Kvno, Operation, OperationDigest, PrincipalBinding,
+    PrincipalId, Role, ServiceContext, SetSecretTarget, TgsRepParts, TgsTicketTemplate, TgtContext,
 };
 use krb_proto::{
     ApReq, EncryptedData, KerberosTime, KrbError, KrbFastArmoredReq, KrbFastReq, PaData,
@@ -289,10 +289,13 @@ pub enum Call {
         /// The KrbFastResponse padata.
         padata: Vec<PaData>,
     },
-    /// Spec: docs/10 §5ב.
+    /// Spec: docs/10 §5ב; docs/52 §5 item 3 (R2: the principal and the
+    /// binding; keyd derives the key set's purpose from the binding).
     OpenAndVerifyServiceTicket {
-        /// Service handle.
-        service: KeyHandle,
+        /// The service key set's principal.
+        service: PrincipalId,
+        /// What the Authenticator must be bound to.
+        binding: AppBinding,
         /// The raw KRB_AP_REQ octets.
         ap_req_octets: Vec<u8>,
     },
@@ -515,9 +518,11 @@ impl Call {
             }),
             Call::OpenAndVerifyServiceTicket {
                 service,
+                binding,
                 ap_req_octets,
             } => KeydRequest::OpenAndVerifyServiceTicket(OpenAndVerifyServiceTicketRequest {
                 service: *service,
+                binding: *binding,
                 ap_req_octets: ap_req_octets.clone(),
             }),
             Call::SetSecret {
@@ -642,6 +647,7 @@ impl Call {
             },
             KeydRequest::OpenAndVerifyServiceTicket(m) => Call::OpenAndVerifyServiceTicket {
                 service: m.service,
+                binding: m.binding,
                 ap_req_octets: m.ap_req_octets,
             },
             KeydRequest::SetSecret(m) => {
@@ -974,6 +980,7 @@ impl Answer {
                         endtime: wire_time(&c.endtime),
                         flags: c.flags,
                         subkey_present: c.subkey_present,
+                        bound_operation: c.bound_operation.map(|d| *d.as_bytes()),
                     }))
                 },
                 KeydReply::AuthnFailure,
@@ -1108,6 +1115,7 @@ impl Answer {
                     endtime: time(&c.endtime)?,
                     flags: c.flags,
                     subkey_present: c.subkey_present,
+                    bound_operation: c.bound_operation.map(OperationDigest::new),
                 }))
             }
             (Operation::OpenAndVerifyServiceTicket, R::AuthnFailure(e)) => {

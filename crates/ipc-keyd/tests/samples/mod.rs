@@ -256,8 +256,17 @@ pub fn calls() -> Vec<Call> {
             error: krb_error(),
             padata: Vec::new(),
         },
+        // R2: the principal and the binding (both variants).
         Call::OpenAndVerifyServiceTicket {
-            service,
+            service: service.principal,
+            binding: keyd_types::AppBinding::Unbound,
+            ap_req_octets: ap_req().encode().unwrap(),
+        },
+        Call::OpenAndVerifyServiceTicket {
+            service: PrincipalId::from_bytes([0xAD; 16]),
+            binding: keyd_types::AppBinding::OperationDigest(keyd_types::OperationDigest::new(
+                [0xD1; 32],
+            )),
             ap_req_octets: ap_req().encode().unwrap(),
         },
         Call::SetSecret {
@@ -506,6 +515,18 @@ pub fn answers() -> Vec<Answer> {
             endtime: time(45),
             flags: flags(0x0040_0000),
             subkey_present: true,
+            bound_operation: None,
+        })),
+        // R2: the operation digest keyd verified.
+        Answer::OpenAndVerifyServiceTicket(Ok(ServiceContext {
+            ctx_id: ServiceCtxId::from_bytes([0x5D; 16]),
+            crealm: realm(),
+            cname: name(1, &["alice"]),
+            authtime: time(5),
+            endtime: time(45),
+            flags: flags(0),
+            subkey_present: false,
+            bound_operation: Some(keyd_types::OperationDigest::new([0xD2; 32])),
         })),
         Answer::SetSecret(Ok(Kvno::INITIAL)),
         Answer::VerifySecret(Ok(())),

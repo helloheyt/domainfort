@@ -739,6 +739,38 @@ pub fn add_ldap_service(f: &mut Fixture) {
 }
 
 // ---------------------------------------------------------------------------
+// The DC's admin service (A-73; docs/52 §5, R2): its own key purpose,
+// `AdminService`, bound to ("admind", host), drawn by `create_key`. The key
+// bytes and the host name are made up for these tests.
+// ---------------------------------------------------------------------------
+
+pub const ADMIN_SERVICE_ID: PrincipalId = PrincipalId::from_bytes([0xAD; 16]);
+pub const ADMIN_SERVICE: KeyHandle = KeyHandle::new(ADMIN_SERVICE_ID, KeyPurpose::AdminService);
+pub const ADMIN_SERVICE_KEY: [u8; 32] = [0xA5; 32];
+
+/// RFC 4120 6.2.1 (NT-SRV-HST): ("admind", "dc01.example.org") — A-73.
+pub fn admin_service_name() -> PrincipalName {
+    PrincipalName {
+        name_type: KRB_NT_SRV_HST,
+        name_string: vec![kstr(keyd::ADMIN_SERVICE_CLASS), kstr("dc01.example.org")],
+    }
+}
+
+pub fn admin_service_key() -> ProtocolKey {
+    krb_crypto::random_to_key(EncType::Aes256CtsHmacSha196, &ADMIN_SERVICE_KEY).unwrap()
+}
+
+/// Create the admin service key set through `create_key` (Admin, the
+/// ceremony — docs/51 §4.3 step 11).
+pub fn add_admin_service(f: &mut Fixture) {
+    f.entropy.push(&ADMIN_SERVICE_KEY);
+    f.keyd
+        .create_key(&ADMIN, &ADMIN_SERVICE, &bound(admin_service_name()), &now())
+        .unwrap();
+    f.keyd.audit_sink_mut().records.clear();
+}
+
+// ---------------------------------------------------------------------------
 // FAST client side (RFC 6113 §5.1, §5.4.1.1, §5.4.2; RFC 4120 §5.5.1),
 // written from the RFC text for these tests. No vector comes from any other
 // implementation; the computer account and its key are made up here.

@@ -211,6 +211,63 @@ fn spn_lookup_on_computers() {
         .is_some());
 }
 
+/// R2 (docs/52 §5 item 3; A-73): the admin service's two-part name
+/// `admind/<host>` resolves to its object's `AdminService` key set — the
+/// KDC seals its tickets there — and every other service name (another
+/// class, more components) to the `Service` key set.
+#[test]
+fn the_admin_service_name_names_the_admin_service_key_set() {
+    let d = Dir::new("spn-admind");
+    let mut objects = d.standard_objects();
+    objects.push(d.computer(
+        60,
+        STAFF_OU,
+        "admind$",
+        &[
+            (
+                "userAccountControl",
+                vec![bits(uac::ADS_UF_WORKSTATION_TRUST_ACCOUNT)],
+            ),
+            ("pwdLastSet", vec![int64(PWD_LAST_SET)]),
+            (
+                "servicePrincipalName",
+                vec![b"admind/dc01.example.test".to_vec()],
+            ),
+        ],
+    ));
+    objects.push(d.computer(
+        61,
+        STAFF_OU,
+        "admindx$",
+        &[
+            (
+                "userAccountControl",
+                vec![bits(uac::ADS_UF_WORKSTATION_TRUST_ACCOUNT)],
+            ),
+            ("pwdLastSet", vec![int64(PWD_LAST_SET)]),
+            (
+                "servicePrincipalName",
+                vec![b"admind/dc01.example.test/x".to_vec()],
+            ),
+        ],
+    ));
+    d.create_all(objects);
+    let view = d.view();
+    let admin = service(&view, &["admind", "dc01.example.test"])
+        .unwrap()
+        .expect("the admin service");
+    assert_eq!(admin.key, key_of(60, KeyPurpose::AdminService));
+    // A third component makes it another (plain) service name.
+    let other = service(&view, &["admind", "dc01.example.test", "x"])
+        .unwrap()
+        .expect("a plain service");
+    assert_eq!(other.key, key_of(61, KeyPurpose::Service));
+    let ws01 = service(&view, &["host", "ws01.example.test"])
+        .unwrap()
+        .unwrap();
+    assert_eq!(ws01.key.purpose, KeyPurpose::Service);
+}
+
 /// docs/47 §1.3 TGS step 4, R47-13: an SPN can only be held by a computer
 /// (the schema refuses it on a user), so a user is never a service.
 #[test]

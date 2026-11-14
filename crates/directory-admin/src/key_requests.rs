@@ -81,7 +81,8 @@ use ipc_audit::{
     IntentRecord, KeydOperation, OutcomeResult,
 };
 use keyd_types::{
-    DecidedOperation, DecisionId, KeyHandle, KeyPurpose, Kvno, PrincipalId, MAX_KEY_DECISION_SECS,
+    DecidedOperation, DecisionId, KeyHandle, KeyPurpose, Kvno, OperationDigest, PrincipalId,
+    MAX_KEY_DECISION_SECS,
 };
 use krb_proto::KerberosTime;
 use pdp::{Action, Effect, Obligation, PolicyScope, PolicySnapshot, Resource};
@@ -89,7 +90,7 @@ use sha2::{Digest, Sha256};
 
 use crate::admin::{subject_of, DirectoryAdmin, VerificationFailure};
 use crate::audit::{pdp_reason, sid_value, EventBase, Refusal, Stop};
-use crate::checks::{malformed, Cx};
+use crate::checks::{local_ipc_security, malformed, Cx};
 use crate::config::ConfigError;
 use crate::random::RandomSource;
 use crate::record;
@@ -415,6 +416,9 @@ pub fn operation_digest(
         KeyPurpose::PrincipalLongterm => 0,
         KeyPurpose::Krbtgt => 1,
         KeyPurpose::Service => 2,
+        // Not named by a key request today (`KeyOperation::purpose`); a code
+        // of its own so that no two purposes share one (R2).
+        KeyPurpose::AdminService => 3,
     };
     let mut octets = Vec::with_capacity(DIGEST_LABEL.len() + 8 + 1 + 16 + 1 + 4 + 16 + 8);
     octets.extend_from_slice(DIGEST_LABEL);
@@ -659,6 +663,8 @@ pub struct DestructionTargets {
 #[derive(Clone, Copy)]
 struct StepInputs<'t, 'v, 'a, 'p> {
     ticket: Option<&'t VerifiedTicket>,
+    /// The step's operation digest (R2, docs/52 §5 item 4).
+    digest: &'p OperationDigest,
     approvals_supplied: usize,
     view: &'v DirectoryView<'a>,
     policy: &'p PolicySnapshot,
@@ -777,16 +783,23 @@ impl<R: RandomSource> DirectoryAdmin<R> {
     /// changes; `false` ⇒ refused `ObligationRefused` (docs/11 §2: "the PEP
     /// must honour obligations"; Q-388 item 2).
     ///
+    /// `operation_digest` is the digest dird computed from the request it
+    /// decoded (crate ipc-dird-admin `operation_digest`): the step reports
+    /// `channel_bound` to the PDP only if keyd verified `ticket` bound to it
+    /// (R2) — an approver's AP-REQ authorizes exactly this `Approve`.
+    ///
     /// `Err` carries the `Decision` event of the refusal and the
     /// client-visible status.
     ///
-    /// Spec: docs/51 §5.6, §6, §7.3, §7.4; docs/11 §2, §8; A-89; P-22.
+    /// Spec: docs/51 §5.6, §6, §7.3, §7.4; docs/11 §2, §8; docs/52 §5 item 4;
+    /// A-89; P-22.
     #[allow(clippy::too_many_arguments)]
     pub fn key_step(
         &self,
         table: &mut KeyRequests,
         operation_id: u64,
         request: &KeyAdminOperation,
+        operation_digest: &OperationDigest,
         ticket: Option<&VerifiedTicket>,
         approvals_supplied: usize,
         view: &DirectoryView<'_>,
@@ -797,6 +810,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         let mut base = key_base(operation_id, request);
         let inputs = StepInputs {
             ticket,
+            digest: operation_digest,
             approvals_supplied,
             view,
             policy,
@@ -826,6 +840,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
     ) -> Result<(KeyReply, Option<KeyDecision>), Stop> {
         let StepInputs {
             ticket,
+            digest,
             approvals_supplied,
             view,
             policy,
@@ -839,6 +854,8 @@ impl<R: RandomSource> DirectoryAdmin<R> {
             return Err(Stop::Failed(AdminFailure::InternalFailure));
         }
         let instant = time::instant(now).ok_or(Stop::Failed(AdminFailure::InternalFailure))?;
+        // R2 (docs/52 §5 item 4): bound only if keyd verified the step's
+        // one ticket bound to this very step.
         let cx = Cx {
             config: &self.config,
             ids: &self.ids,
@@ -846,6 +863,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
             policy,
             now: *now,
             instant,
+            transport_sec: local_ipc_security(ticket.is_some_and(|t| t.bound_to(digest))),
         };
         table.purge(instant.0);
         match request {

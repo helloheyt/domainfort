@@ -475,6 +475,7 @@ dependencies = [
  "keyd-types",
  "krb-proto",
  "rustix",
+ "sha2",
  "zeroize",
 ]
 

@@ -9,7 +9,7 @@
 //!   `admind` source, so the production binding table accepts admind's
 //!   `Admind` events; they are read back from the verified log.
 //! * **keyd** — crates/keyd-daemon's real daemon holding the admin
-//!   service's key set `(admind-svc$, Service)`, created by `create_key`
+//!   service's key set `(admind-svc$, AdminService)` (R2), created by `create_key`
 //!   from scripted test entropy so the test knows the key. On its socket
 //!   the test's uid is **Role::Ldap**: dird verifies the administrators'
 //!   AP-REQs through it (A-73) and registers the set_secret grant of every
@@ -542,9 +542,12 @@ pub fn principal(sam: &str) -> PrincipalName {
 
 /// An AP-REQ of `sam` for the admin service: the ticket sealed under the
 /// admin service key (usage 2); the authenticator at `now` with `cusec`,
-/// under the session key (usage 11).
-/// Spec: RFC 4120 §5.3, §5.5.1, §7.5.1.
-fn ap_req(sam: &str, cusec: u32) -> Vec<u8> {
+/// under the session key (usage 11), its `cksum` — when `bound` is given —
+/// the session key's MIC over `bound` (key usage 10, the session key's
+/// required checksum type; R2: the operation digest of the dird request it
+/// accompanies).
+/// Spec: RFC 4120 §4, §5.3, §5.5.1, §7.5.1; RFC 3961 §3; docs/52 §5.
+fn ap_req(sam: &str, cusec: u32, bound: Option<&[u8]>) -> Vec<u8> {
     let part = EncTicketPart {
         flags: TicketFlags::PRE_AUTHENT,
         key: EncryptionKey {
@@ -575,10 +578,16 @@ fn ap_req(sam: &str, cusec: u32) -> Vec<u8> {
             cipher: krb_crypto::encrypt(&key, common::usage(2), &[0x88; 16], &plain).unwrap(),
         },
     };
+    let session = common::aes256(&SESSION_KEY);
+    let cksumtype = session.enc_type().checksum_type();
+    let cksum = bound.map(|data| krb_proto::Checksum {
+        cksumtype: cksumtype.number(),
+        checksum: krb_crypto::get_mic(&session, cksumtype, common::usage(10), data).unwrap(),
+    });
     let authenticator = Authenticator {
         crealm: common::realm(),
         cname: principal(sam),
-        cksum: None,
+        cksum,
         cusec: Microseconds::new(cusec).unwrap(),
         ctime: common::now(),
         subkey: None,
@@ -587,7 +596,6 @@ fn ap_req(sam: &str, cusec: u32) -> Vec<u8> {
     }
     .encode()
     .unwrap();
-    let session = common::aes256(&SESSION_KEY);
     ApReq {
         ap_options: ApOptions::empty(),
         ticket,
@@ -605,17 +613,70 @@ fn ap_req(sam: &str, cusec: u32) -> Vec<u8> {
 /// A fresh cusec for every AP-REQ (keyd's replay cache, RFC 4120 §3.2.3).
 static CUSEC: AtomicU32 = AtomicU32::new(1);
 
-/// A fresh AP-REQ of `sam`.
-pub fn fresh(sam: &str) -> Vec<u8> {
-    ap_req(sam, CUSEC.fetch_add(1, Ordering::SeqCst))
+/// A fresh AP-REQ of `sam` bound to the dird request `operation` (R2).
+pub fn fresh(sam: &str, operation: &ipc_dird_admin::Operation) -> Vec<u8> {
+    let digest = ipc_dird_admin::operation_digest(operation).unwrap();
+    ap_req(
+        sam,
+        CUSEC.fetch_add(1, Ordering::SeqCst),
+        Some(digest.as_bytes()),
+    )
 }
 
-/// The auth field of an operation by `requester` with `approvers`.
-pub fn auth(requester: &str, approvers: &[&str]) -> ipc_dird_admin::Auth {
+/// A fresh AP-REQ of `sam` with no `cksum` (an admin ticket bound to no
+/// operation).
+pub fn fresh_unbound(sam: &str) -> Vec<u8> {
+    ap_req(sam, CUSEC.fetch_add(1, Ordering::SeqCst), None)
+}
+
+/// The auth field of `operation` by `requester` with `approvers`, every
+/// AP-REQ bound to it (R2).
+pub fn auth(
+    requester: &str,
+    approvers: &[&str],
+    operation: &ipc_dird_admin::Operation,
+) -> ipc_dird_admin::Auth {
     ipc_dird_admin::Auth {
-        requester: fresh(requester),
-        approvals: approvers.iter().map(|a| fresh(a)).collect(),
+        requester: fresh(requester, operation),
+        approvals: approvers.iter().map(|a| fresh(a, operation)).collect(),
     }
+}
+
+/// A `Forward` of `operation` by `requester` with `approvers`.
+pub fn forward(
+    requester: &str,
+    approvers: &[&str],
+    operation: ipc_dird_admin::Operation,
+) -> ipc_admin::Request {
+    ipc_admin::Request::Forward {
+        auth: auth(requester, approvers, &operation),
+        operation,
+    }
+}
+
+/// The `auth` of a `SetPassword` of `target`: bound to the
+/// `BeginPasswordSet {target}` admind sends dird (docs/51 §7.6; R2).
+pub fn begin_auth(requester: &str, approvers: &[&str], target: dtyp::Guid) -> ipc_dird_admin::Auth {
+    auth(
+        requester,
+        approvers,
+        &ipc_dird_admin::Operation::BeginPasswordSet { target },
+    )
+}
+
+/// The `completion` AP-REQ of a `SetPassword` of `target`: bound to the
+/// `CompletePasswordSet {target, …}` admind sends dird — its digest covers
+/// the target only (the outcome and kvnos are admind's report, docs/52 §5
+/// item 5), so any outcome stands in here.
+pub fn completion(requester: &str, target: dtyp::Guid) -> Vec<u8> {
+    fresh(
+        requester,
+        &ipc_dird_admin::Operation::CompletePasswordSet {
+            target,
+            outcome: ipc_dird_admin::PasswordSetOutcome::Completed,
+            kvnos: Vec::new(),
+        },
+    )
 }
 
 /// keyd (Role::Ldap) with the admin service's key set (`create_key`,

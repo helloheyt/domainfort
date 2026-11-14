@@ -218,6 +218,7 @@ fn step(
         table,
         id,
         request,
+        &common::TEST_DIGEST,
         Some(&ticket),
         0,
         &view,

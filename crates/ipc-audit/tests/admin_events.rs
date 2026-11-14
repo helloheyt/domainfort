@@ -691,7 +691,8 @@ fn admind_strict_decoding() {
         (at.activity, [0u8, 6, 0xFF]),
         (at.result, [0, 3, 0xFF]),
         (at.step, [0, 5, 0xFF]),
-        (at.purpose, [0, 4, 0xFF]),
+        // Purpose 4 (`AdminService`) was appended by R2 (A-102).
+        (at.purpose, [0, 5, 0xFF]),
         (at.cause, [0, 9, 0xFF]),
     ] {
         for code in codes {

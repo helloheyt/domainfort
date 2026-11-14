@@ -88,8 +88,13 @@
 //!   A-74): as Role::Directory it can set any account's secret without
 //!   dird's PDP; detection is the audit cross-check (keyd `SetSecret` vs dird
 //!   `BeginPasswordSet`); prevention is task A15 (a keyd grant).
-//! - `channel_bound` is not cryptographic until the AP-REQ `cksum` binds the
-//!   operation (A-74, A15).
+//! - admind forwards every AP-REQ untouched: each is bound by its client to
+//!   the exact dird request it accompanies (the Authenticator's `cksum`
+//!   over `ipc_dird_admin::operation_digest`, verified by keyd — R2, docs/52
+//!   §5), so admind cannot attach one to another operation. For
+//!   `SetPassword` the client binds `auth` to `BeginPasswordSet {target}`
+//!   and `completion` to `CompletePasswordSet {target}` (its outcome and
+//!   kvnos are admind's report, outside the digest — docs/52 §5 item 5).
 //! - admind cannot positively verify keyd's role for it (Role::Directory may
 //!   not call `DescribeConfig`, A-90): a cross-wired keyd refuses
 //!   `set_secret` (`Denied`) — docs/questions/Q-403.

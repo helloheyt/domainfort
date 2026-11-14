@@ -25,7 +25,8 @@ use ipc_audit::{
 use ipc_dird_admin::{Auth, Operation};
 use keyd::{KeyHandle, KeyPurpose, PrincipalId};
 use support::{
-    auth, eventually, fresh, g, DirdMode, Got, KeydMode, Options, World, BOB, JO, STAFF_OU, WS9,
+    auth, begin_auth, completion, eventually, forward, fresh_unbound, g, DirdMode, Got, KeydMode,
+    Options, World, BOB, JO, STAFF_OU, WS9,
 };
 use zeroize::Zeroizing;
 
@@ -40,8 +41,8 @@ fn password(text: &str) -> ipc_admin::Password {
 /// Complete's — docs/questions/Q-400).
 fn set_password(target: Guid, text: &str) -> Request {
     Request::SetPassword(SetPassword {
-        auth: auth("admin1", &[]),
-        completion: fresh("admin1"),
+        auth: begin_auth("admin1", &[], target),
+        completion: completion("admin1", target),
         target,
         password: password(text),
     })
@@ -425,15 +426,16 @@ fn dird_down_is_unavailable() {
         conn.call(&set_password(g(BOB), GOOD)),
         refused(RefusalStatus::Unavailable)
     );
-    let create = Request::Forward {
-        auth: auth("admin1", &[]),
-        operation: Operation::CreateUser {
+    let create = forward(
+        "admin1",
+        &[],
+        Operation::CreateUser {
             parent: g(STAFF_OU),
             sam: "carol".into(),
             upn: None,
             description: None,
         },
-    };
+    );
     assert_eq!(conn.call(&create), refused(RefusalStatus::Unavailable));
     assert!(
         keyd_verifies(&world, g(BOB), GOOD),
@@ -495,15 +497,16 @@ fn a_forwarded_create_user_round_trips() {
         return;
     };
     let mut conn = world.connect();
-    let create = Request::Forward {
-        auth: auth("admin1", &[]),
-        operation: Operation::CreateUser {
+    let create = forward(
+        "admin1",
+        &[],
+        Operation::CreateUser {
             parent: g(STAFF_OU),
             sam: "carol".into(),
             upn: Some("carol@example.org".into()),
             description: None,
         },
-    };
+    );
     let Got::Reply(Reply::Created { guid, sid }) = conn.call(&create) else {
         panic!("not created");
     };
@@ -517,10 +520,11 @@ fn a_forwarded_create_user_round_trips() {
         Some(guid)
     );
     assert!(sid.is_some());
-    let lookup = Request::Forward {
-        auth: auth("admin1", &[]),
-        operation: Operation::Lookup(ipc_dird_admin::LookupKey::SamAccountName("carol".into())),
-    };
+    let lookup = forward(
+        "admin1",
+        &[],
+        Operation::Lookup(ipc_dird_admin::LookupKey::SamAccountName("carol".into())),
+    );
     match conn.call(&lookup) {
         Got::Reply(Reply::Found(found)) => {
             assert_eq!(found.guid, guid);
@@ -538,6 +542,61 @@ fn a_forwarded_create_user_round_trips() {
         operation: Operation::Delete { target: guid },
     };
     assert_eq!(conn.call(&forged), refused(RefusalStatus::Denied));
+}
+
+/// R2 (docs/52 §3.2, §5; docs/questions/Q-292): admind forwards AP-REQs
+/// untouched and each is bound by its client to the exact dird request it
+/// accompanies — so an `auth` made for one operation and forwarded with
+/// another is `Denied` by dird through admind (nothing created), and a
+/// `SetPassword` whose `auth` is bound to another account's
+/// `BeginPasswordSet` sets no password; the same requests correctly bound
+/// succeed. (What a compromised admind could try: it holds the AP-REQs.)
+#[test]
+fn an_auth_bound_to_another_operation_is_refused_through_admind() {
+    let Some(world) = World::new(Options::default()) else {
+        return;
+    };
+    let mut conn = world.connect();
+    let meant = Operation::CreateUser {
+        parent: g(STAFF_OU),
+        sam: "carol".into(),
+        upn: None,
+        description: None,
+    };
+    let other = Operation::CreateUser {
+        parent: g(STAFF_OU),
+        sam: "mallory".into(),
+        upn: None,
+        description: None,
+    };
+    let rebound = Request::Forward {
+        auth: auth("admin1", &[], &meant),
+        operation: other,
+    };
+    assert_eq!(conn.call(&rebound), refused(RefusalStatus::Denied));
+    let store = world.store.as_ref().unwrap();
+    assert_eq!(
+        store
+            .snapshot()
+            .unwrap()
+            .lookup_child(Some(g(STAFF_OU)), b"mallory")
+            .unwrap(),
+        None
+    );
+    let wrong_target = Request::SetPassword(SetPassword {
+        auth: begin_auth("admin1", &[], g(WS9)),
+        completion: completion("admin1", g(BOB)),
+        target: g(BOB),
+        password: password(GOOD),
+    });
+    assert_eq!(conn.call(&wrong_target), refused(RefusalStatus::Denied));
+    assert!(!keyd_verifies(&world, g(BOB), GOOD), "no password was set");
+    assert!(matches!(
+        conn.call(&forward("admin1", &[], meant)),
+        Got::Reply(Reply::Created { .. })
+    ));
+    assert_eq!(conn.call(&set_password(g(BOB), GOOD)), changed(&[1], true));
+    assert!(keyd_verifies(&world, g(BOB), GOOD));
 }
 
 /// docs/51 §7.2, §7.6; A-70, A-73: the AP-REQs reach dird byte for byte as
@@ -894,7 +953,7 @@ fn a_refused_completion_still_reports_the_password_set() {
     };
     let mut conn = world.connect();
     let request = Request::SetPassword(SetPassword {
-        auth: auth("admin1", &[]),
+        auth: begin_auth("admin1", &[], g(BOB)),
         completion: vec![0x6E, 0x00],
         target: g(BOB),
         password: password(GOOD),
@@ -976,12 +1035,13 @@ fn the_retired_keyadm_requests_never_reach_dird() {
     }
     // The administrators' channel itself is unchanged.
     let mut conn = world.connect();
-    let request = Request::Forward {
-        auth: auth("admin1", &[]),
-        operation: Operation::RequestKeyOperation {
+    let request = forward(
+        "admin1",
+        &[],
+        Operation::RequestKeyOperation {
             operation: KeyOperation::RotateKrbtgt,
         },
-    };
+    );
     assert!(matches!(
         conn.call(&request),
         Got::Reply(Reply::KeyRequest(state)) if state.operation == KeyOperation::RotateKrbtgt
@@ -1038,7 +1098,7 @@ fn rate_limited_and_refused_values_have_their_own_codes() {
     // the typed layer (one spelling of "never", A-85). Hand-built from the
     // forwarded layout (docs/51 §7.3): auth, target, 2 ‖ u64.
     let mut body = vec![0x41, 0x4D, 1, 0x09];
-    let requester = fresh("admin1");
+    let requester = fresh_unbound("admin1");
     body.extend((requester.len() as u32).to_be_bytes());
     body.extend(&requester);
     body.extend(0u32.to_be_bytes());
@@ -1211,7 +1271,7 @@ fn dirds_grant_expires() {
     )
     .unwrap();
     let begin = || ipc_dird_admin::Request::Operation {
-        auth: auth("admin1", &[]),
+        auth: begin_auth("admin1", &[], g(BOB)),
         operation: Operation::BeginPasswordSet { target: g(BOB) },
     };
     assert!(matches!(

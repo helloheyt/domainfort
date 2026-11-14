@@ -266,13 +266,16 @@ fn code_tables_are_closed() {
     assert_eq!(table!(KdcReason), 66);
     // Task A15a appended the four grant reasons before `Unlisted`
     // (docs/questions/Q-452 item 4); A-102 the seven decision reasons
-    // (docs/52 §4.5), `Unlisted` last (77).
-    assert_eq!(table!(KeydReason), 77);
+    // (docs/52 §4.5); R2 the two operation-binding reasons (docs/52 §5),
+    // `Unlisted` last (79).
+    assert_eq!(table!(KeydReason), 79);
     assert_eq!(KeydReason::NoGrant.code(), 66);
     assert_eq!(KeydReason::GrantTableFull.code(), 69);
     assert_eq!(KeydReason::NoDecision.code(), 70);
     assert_eq!(KeydReason::CeremonySealed.code(), 76);
-    assert_eq!(KeydReason::Unlisted.code(), 77);
+    assert_eq!(KeydReason::OperationDigestMissing.code(), 77);
+    assert_eq!(KeydReason::OperationDigestMismatch.code(), 78);
+    assert_eq!(KeydReason::Unlisted.code(), 79);
     assert_eq!(table!(LdapReason), 53);
     assert_eq!(table!(CodecErrorCode), 35);
     assert_eq!(table!(CodecLimit), 12);
@@ -290,7 +293,10 @@ fn code_tables_are_closed() {
     table!(KdcOutcomeCode);
     table!(IpZone);
     table!(KeydRole);
-    table!(KeyPurposeCode);
+    // R2 appended `AdminService` (4); 1-3 keep their codes.
+    assert_eq!(table!(KeyPurposeCode), 4);
+    assert_eq!(KeyPurposeCode::Service.code(), 3);
+    assert_eq!(KeyPurposeCode::AdminService.code(), 4);
     // keyd's five outcomes keep their codes; A-86 appended two phases.
     assert_eq!(table!(KeydOutcome), 7);
     assert_eq!(

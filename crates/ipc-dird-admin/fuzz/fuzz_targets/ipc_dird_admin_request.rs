@@ -16,11 +16,17 @@
 //! `ListPendingDestruction` (`0x10`–`0x12`) were retired by A-102: nothing
 //! decodes with one of those kinds.
 //!
+//! R2 (docs/52 §5, A-102): every request that decodes has an operation
+//! digest (the application data its AP-REQs are bound to), the same from
+//! the typed and the wire form. Written, not run (PENDING-OWNER P-1).
+//!
 //! Spec: docs/51 §6, §7.1-§7.3, §7.5; docs/50 §3.3, §9; A-59;
-//! docs/questions/Q-422, Q-460 (A-102).
+//! docs/questions/Q-422, Q-460 (A-102); docs/52 §5 item 1.
 
 use ipc::{decode_body, encode_frame, Direction};
-use ipc_dird_admin::{decode_request, AdminRequest, Request, ADMIN_CHANNEL};
+use ipc_dird_admin::{
+    decode_request, operation_digest, wire_operation_digest, AdminRequest, Request, ADMIN_CHANNEL,
+};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -33,6 +39,14 @@ fuzz_target!(|data: &[u8]| {
             if let Ok(request) = Request::from_wire(&wire) {
                 let typed = request.to_wire().expect("a typed request re-encodes");
                 assert_eq!(typed, wire, "canonical typed round trip");
+                // R2 (docs/52 §5): every decoded operation has its operation
+                // digest, and the typed and wire forms give the same one.
+                if let Request::Operation { operation, .. } = &request {
+                    let digest = operation_digest(operation).expect("a decoded operation has a digest");
+                    if let AdminRequest::Operation { operation: w, .. } = &wire {
+                        assert_eq!(wire_operation_digest(w).ok(), Some(digest));
+                    }
+                }
             }
         }
         Err(error) => {

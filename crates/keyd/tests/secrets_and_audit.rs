@@ -136,11 +136,13 @@ fn operation_signatures_return_no_key_material() {
     ) -> Result<(), Error> = K::verify_secret;
     // docs/49 §3.3, A-46 (task L6a): the service AP-REQ goes in as octets;
     // out come non-secret facts and a one-time token — no key, no session
-    // key.
+    // key. R2: the service key set is named by its principal and the
+    // binding (whose purpose it is).
     let _: fn(
         &mut K,
         &CallerId,
-        &KeyHandle,
+        &keyd::PrincipalId,
+        &keyd::AppBinding,
         &[u8],
         &KerberosTime,
     ) -> Result<ServiceContext, AuthnError> = K::open_and_verify_service_ticket;
@@ -372,13 +374,21 @@ fn every_operation_emits_exactly_one_audit_record() {
 
     // Service-ticket verification (docs/49 §3.3, A-46): one record either
     // way. The successful path is audited in tests/service_ticket.rs.
-    let _ = f
-        .keyd
-        .open_and_verify_service_ticket(&LDAP, &SERVICE, &[0x30, 0x00], &n);
+    let _ = f.keyd.open_and_verify_service_ticket(
+        &LDAP,
+        &SERVICE.principal,
+        &keyd::AppBinding::Unbound,
+        &[0x30, 0x00],
+        &n,
+    );
     check(&f, Operation::OpenAndVerifyServiceTicket, &LDAP, false);
-    let _ = f
-        .keyd
-        .open_and_verify_service_ticket(&KDC, &SERVICE, &[0x30, 0x00], &n);
+    let _ = f.keyd.open_and_verify_service_ticket(
+        &KDC,
+        &SERVICE.principal,
+        &keyd::AppBinding::Unbound,
+        &[0x30, 0x00],
+        &n,
+    );
     check(&f, Operation::OpenAndVerifyServiceTicket, &KDC, false);
 
     // Daemon support (docs/50 §3.4): one record either way.

@@ -107,10 +107,10 @@ use core::fmt;
 use core::time::Duration;
 use ipc::{decode_reply, encode_frame, Direction, FrameLimit, Refused, Reply};
 use keyd_types::{
-    AccountKind, ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof, ConfigDescription,
-    CtxId, DecidedOperation, DecisionId, DestructionPage, FastArmor, FastConversation, IssueError,
-    KeyCustody, KeyHandle, Kvno, PrincipalBinding, PrincipalId, Role, ServiceContext,
-    SetSecretTarget, TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext,
+    AccountKind, AppBinding, ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof,
+    ConfigDescription, CtxId, DecidedOperation, DecisionId, DestructionPage, FastArmor,
+    FastConversation, IssueError, KeyCustody, KeyHandle, Kvno, PrincipalBinding, PrincipalId, Role,
+    ServiceContext, SetSecretTarget, TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext,
 };
 use krb_proto::{ApReq, EncryptedData, KerberosTime, KrbError, KrbFastArmoredReq, PaData};
 use std::time::Instant;
@@ -734,15 +734,19 @@ impl<C: Connector> KeydClient<C> {
         }
     }
 
-    /// docs/10 §5ב `open_and_verify_service_ticket` (Role::Ldap).
-    /// Spec: docs/50 §3.4.
+    /// docs/10 §5ב `open_and_verify_service_ticket` (Role::Ldap): the
+    /// service key set's principal and the binding, whose purpose the key
+    /// set is (R2).
+    /// Spec: docs/50 §3.4; docs/52 §5 item 3.
     pub fn open_and_verify_service_ticket(
         &mut self,
-        service: &KeyHandle,
+        service: &PrincipalId,
+        binding: &AppBinding,
         ap_req_octets: &[u8],
     ) -> Result<ServiceContext, AuthnError> {
         let call = Call::OpenAndVerifyServiceTicket {
             service: *service,
+            binding: *binding,
             ap_req_octets: ap_req_octets.to_vec(),
         };
         match self.call(&call) {

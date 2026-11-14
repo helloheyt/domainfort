@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use directory_pip::DirectoryView;
 use dtyp::{Guid, Sid};
 use kdc::AccountSource;
-use keyd_types::ServiceContext;
+use keyd_types::{OperationDigest, ServiceContext};
 use krb_proto::{KerberosTime, PrincipalName, Realm};
 use pdp::{AuthContext, AuthStrength, Subject};
 
@@ -39,19 +39,48 @@ pub struct VerifiedTicket {
     pub cname: PrincipalName,
     /// The time of the initial authentication (RFC 4120 §5.3 authtime).
     pub authtime: KerberosTime,
+    /// The operation digest keyd verified the AP-REQ's Authenticator `cksum`
+    /// over (RFC 4120 §5.5.1, key usage 10) — the operation the ticket's
+    /// holder bound it to; `None` if keyd reported no binding. Copied from
+    /// keyd's answer, never computed here.
+    /// Spec: docs/52 §5 items 3-4 (R2); crate keyd-types
+    /// `ServiceContext::bound_operation`.
+    pub bound_operation: Option<OperationDigest>,
 }
 
 impl VerifiedTicket {
     /// The facts of keyd's verification result (no key, no context id).
-    /// Spec: crate keyd-types `ServiceContext` (docs/49 §3.3).
+    /// Spec: crate keyd-types `ServiceContext` (docs/49 §3.3); docs/52 §5
+    /// item 4 (the verified binding).
     #[must_use]
     pub fn from_service_context(context: &ServiceContext) -> VerifiedTicket {
         VerifiedTicket {
             crealm: context.crealm.clone(),
             cname: context.cname.clone(),
             authtime: context.authtime,
+            bound_operation: context.bound_operation,
         }
     }
+
+    /// `true` if keyd verified this ticket's AP-REQ bound to `digest`.
+    /// Spec: docs/52 §5 item 4.
+    #[must_use]
+    pub fn bound_to(&self, digest: &OperationDigest) -> bool {
+        self.bound_operation.as_ref() == Some(digest)
+    }
+}
+
+/// `true` if every ticket a request relies on — the requester's and each
+/// approval's — was verified by keyd bound to `digest`, the digest of the
+/// request being decided. Only then does the PEP report `channel_bound` to
+/// the PDP (docs/11 §4: a write needs it).
+/// Spec: docs/52 §5 item 4 ("`transport_sec.channel_bound = true` only after
+/// verification"); docs/11 §1, §4.
+pub(crate) fn all_bound<'t>(
+    digest: &OperationDigest,
+    tickets: impl IntoIterator<Item = &'t VerifiedTicket>,
+) -> bool {
+    tickets.into_iter().all(|t| t.bound_to(digest))
 }
 
 /// Why no Subject was built. Both are refusals; neither says why to the

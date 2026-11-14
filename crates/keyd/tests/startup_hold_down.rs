@@ -140,9 +140,13 @@ fn every_held_operation_refused_at(f: &mut Fixture, tgt: &Tgt, when: KerberosTim
     assert_eq!(r.unwrap_err(), Error::Unavailable);
     assert_held(f, Operation::SealFastError);
 
-    let r = f
-        .keyd
-        .open_and_verify_service_ticket(&LDAP, &SERVICE, &[0x30, 0x00], &when);
+    let r = f.keyd.open_and_verify_service_ticket(
+        &LDAP,
+        &SERVICE.principal,
+        &keyd::AppBinding::Unbound,
+        &[0x30, 0x00],
+        &when,
+    );
     assert_eq!(r.unwrap_err(), AuthnError::Unavailable);
     assert_held(f, Operation::OpenAndVerifyServiceTicket);
 

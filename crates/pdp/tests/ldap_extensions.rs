@@ -727,8 +727,8 @@ fn nt_security_descriptor_rights_are_never_granted_together() {
 /// properties, both source networks, an open and a closed descriptor,
 /// policies with and without rules and an anonymous grant) gets exactly the
 /// same Decision under every `Transport` value as under `Transport::Ldaps` —
-/// every value except `Transport::LocalIpc`, the one transport whose write
-/// floor differs (A-74, Q-292; tests/local_ipc_transport.rs).
+/// `Transport::LocalIpc` included since its write exemption was removed (R2,
+/// A-102; tests/local_ipc_transport.rs).
 #[test]
 fn the_cleartext_ldap_transport_changes_no_decision() {
     use pdp::Transport;
@@ -741,6 +741,7 @@ fn the_cleartext_ldap_transport_changes_no_decision() {
         Transport::NcacnIpTcpPrivacy,
         Transport::Dns,
         Transport::Kerberos,
+        Transport::LocalIpc,
     ];
     let subjects = [the_user(), anonymous()];
     let object = |attr: Option<AttrId>| Resource::DirObject { dn: obj_dn(), attr };
@@ -802,5 +803,5 @@ fn the_cleartext_ldap_transport_changes_no_decision() {
             }
         }
     }
-    assert_eq!(compared, 2 * 6 * 8 * 2 * 2 * 4 * 8);
+    assert_eq!(compared, 2 * 6 * 8 * 2 * 2 * 4 * transports.len());
 }

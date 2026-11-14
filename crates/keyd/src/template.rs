@@ -15,6 +15,7 @@ use crate::config::TicketPolicy;
 use crate::error::{Deny, Internal};
 use crate::model::{KeyPurpose, PrincipalBinding};
 use crate::time::{kerberos_time_seconds, within_skew};
+use keyd_types::is_admin_service_name;
 use krb_proto::constants::KRB_NT_SRV_INST;
 use krb_proto::limits::MAX_NAME_COMPONENTS;
 use krb_proto::{KerberosFlags, KerberosString, KerberosTime, PrincipalName, Realm, TicketFlags};
@@ -50,14 +51,19 @@ pub(crate) fn is_tgs_name(name: &PrincipalName) -> bool {
 /// - the name has 1..=MAX_NAME_COMPONENTS components (krb-proto's bound);
 /// - a Krbtgt key is bound to a two-part TGS name ("krbtgt", X), and no other
 ///   key may be bound to a name starting with "krbtgt" (reserved for the
-///   TGS).
+///   TGS);
+/// - an AdminService key is bound to the admin service's two-part name
+///   (`admind`, host — `keyd_types::is_admin_service_name`), and no other
+///   key may be bound to such a name (R2: the same shape of reservation, for
+///   this project's own service).
 ///
 /// Failure is `Denied` (reason `InvalidNameBinding`).
 ///
 /// Spec: RFC 4120 6.2 ("Names of any type with an initial component of
 /// 'krbtgt' are reserved for the Kerberos ticket-granting service"), 7.3
 /// ("a two-part name ... with the first part 'krbtgt'"); docs/questions/
-/// Q-040 (A-19).
+/// Q-040 (A-19); A-73 (the admin service's name); docs/52 §5 item 3 (R2);
+/// docs/questions/Q-491.
 pub(crate) fn check_new_binding(
     realm: &Realm,
     purpose: KeyPurpose,
@@ -72,9 +78,16 @@ pub(crate) fn check_new_binding(
         return bad;
     }
     let reserved = is_tgs_name(&binding.name);
+    // R2: the admin service's name is bound only to the admin service's key
+    // set, and that key set to nothing else — so a ticket for `admind/<host>`
+    // is never sealed or opened under a plain Service key (the binding check
+    // of every issuance and verification, A-19), and the KDC's purpose rule
+    // (`KeyPurpose::of_service_name`) is enforced here too.
+    let admin = is_admin_service_name(&binding.name);
     let acceptable = match purpose {
         KeyPurpose::Krbtgt => reserved && components == 2,
-        KeyPurpose::PrincipalLongterm | KeyPurpose::Service => !reserved,
+        KeyPurpose::AdminService => admin,
+        KeyPurpose::PrincipalLongterm | KeyPurpose::Service => !reserved && !admin,
     };
     if acceptable {
         Ok(())

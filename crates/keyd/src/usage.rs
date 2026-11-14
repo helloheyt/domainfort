@@ -39,6 +39,14 @@ pub(crate) const TGS_REP_ENC_PART_SESSION_KEY: u32 = 8;
 /// A-32). Spec: RFC 4120 7.5.1, 5.4.2; RFC 6113 5.4.3.
 pub(crate) const TGS_REP_ENC_PART_SUBKEY: u32 = 9;
 
+/// Key usage 10 — AP-REQ Authenticator cksum, keyed with the application
+/// session key: "a checksum of the application data that accompanies the
+/// KRB_AP_REQ, computed using a key usage value of 10 in normal application
+/// exchanges". keyd verifies it for an `AppBinding::OperationDigest`
+/// verification (the admin channel, R2), over the operation digest.
+/// Spec: RFC 4120 7.5.1 item 10, 5.5.1; docs/52 §5 item 2.
+pub(crate) const AP_REQ_AUTHENTICATOR_CKSUM: u32 = 10;
+
 /// Key usage 11 — AP-REQ Authenticator, encrypted with the application session
 /// key: "a key usage value of 11 in normal application exchanges, or 7 when
 /// used as the PA-TGS-REQ PA-DATA field". keyd uses it for the authenticator
@@ -112,6 +120,7 @@ mod tests {
             TGS_REQ_AUTHENTICATOR,
             TGS_REP_ENC_PART_SESSION_KEY,
             TGS_REP_ENC_PART_SUBKEY,
+            AP_REQ_AUTHENTICATOR_CKSUM,
             AP_REQ_AUTHENTICATOR,
         ];
         for usage in fast {

@@ -72,6 +72,22 @@ fn binding_for(handle: &KeyHandle) -> keyd::PrincipalBinding {
         KeyPurpose::Krbtgt => krbtgt_binding(),
         KeyPurpose::PrincipalLongterm => alice_binding(),
         KeyPurpose::Service => service_binding(),
+        // R2: the admin service's name (A-73).
+        KeyPurpose::AdminService => bound(admin_service_name()),
+    }
+}
+
+/// The binding whose purpose is `handle`'s (R2: `open_and_verify_service_ticket`
+/// derives the purpose from the binding; a Krbtgt or PrincipalLongterm
+/// handle has none and is looked up as `Service`).
+fn app_binding_for(handle: &KeyHandle) -> keyd::AppBinding {
+    match handle.purpose {
+        KeyPurpose::AdminService => {
+            keyd::AppBinding::OperationDigest(keyd::OperationDigest::new([0x0D; 32]))
+        }
+        KeyPurpose::Krbtgt | KeyPurpose::PrincipalLongterm | KeyPurpose::Service => {
+            keyd::AppBinding::Unbound
+        }
     }
 }
 
@@ -84,7 +100,9 @@ const UNREGISTERED: DecisionId = DecisionId::new(0xDEAD_BEEF);
 fn decided_for(handle: &KeyHandle) -> DecidedOperation {
     match handle.purpose {
         KeyPurpose::Krbtgt => DecidedOperation::RotateKrbtgt { krbtgt: *handle },
-        KeyPurpose::Service => DecidedOperation::RotateKey { handle: *handle },
+        KeyPurpose::Service | KeyPurpose::AdminService => {
+            DecidedOperation::RotateKey { handle: *handle }
+        }
         KeyPurpose::PrincipalLongterm => DecidedOperation::DestroyKeySet {
             principal: handle.principal,
         },
@@ -169,9 +187,16 @@ fn invoke(f: &mut Fixture, op: Operation, caller: &CallerId, handle: &KeyHandle)
                 &n,
             )
             .is_ok(),
+        // R2: the principal and the binding; the purpose is the binding's.
         Operation::OpenAndVerifyServiceTicket => f
             .keyd
-            .open_and_verify_service_ticket(caller, handle, &dummy_ap_req().encode().unwrap(), &n)
+            .open_and_verify_service_ticket(
+                caller,
+                &handle.principal,
+                &app_binding_for(handle),
+                &dummy_ap_req().encode().unwrap(),
+                &n,
+            )
             .is_ok(),
         // No handle (docs/50 §3.4): `handle` is unused.
         Operation::DescribeConfig => f.keyd.describe_config(caller, &n).is_ok(),
@@ -283,6 +308,7 @@ fn wrong_purpose_is_denied_for_every_operation() {
         (KeyPurpose::PrincipalLongterm, ALICE),
         (KeyPurpose::Krbtgt, KRBTGT),
         (KeyPurpose::Service, SERVICE),
+        (KeyPurpose::AdminService, ADMIN_SERVICE),
     ];
     for op in Operation::ALL {
         // seal_fast_error takes no handle: the armor token is its authority
@@ -290,10 +316,14 @@ fn wrong_purpose_is_denied_for_every_operation() {
         // §3.4). There is no purpose to mismatch.
         // A-102: the decision operations take no handle either (a decided
         // handle's purpose is judged by `register_decision`, DecisionInvalid),
-        // and `verify_secret` has no role (docs/52 R4).
+        // and `verify_secret` has no role (docs/52 R4). R2:
+        // `open_and_verify_service_ticket` names a principal and a binding,
+        // never a purpose — no purpose can mismatch (crate service_ticket.rs
+        // `krbtgt_and_principal_keys_are_never_opened`).
         if matches!(
             op,
-            Operation::SealFastError
+            Operation::OpenAndVerifyServiceTicket
+                | Operation::SealFastError
                 | Operation::DescribeConfig
                 | Operation::Ping
                 | Operation::RotateKey

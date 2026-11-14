@@ -236,6 +236,18 @@ pub fn ou_dn(name: &str) -> Dn {
 /// A verified ticket of the account `sam`, first authenticated at
 /// [`authtime`] (the facts keyd's `open_and_verify_service_ticket` returns).
 pub fn ticket(sam: &str) -> VerifiedTicket {
+    ticket_bound_to(sam, Some(TEST_DIGEST))
+}
+
+/// The operation digest every test request carries, and every test ticket
+/// is bound to unless a test says otherwise: these PEP tests run without
+/// keyd and without the channel codec, so the digest is a made-up value —
+/// what matters to the PEP is that the tickets' verified binding equals the
+/// request's digest (R2, docs/52 §5 item 4).
+pub const TEST_DIGEST: keyd_types::OperationDigest = keyd_types::OperationDigest::new([0x0D; 32]);
+
+/// A ticket of `sam` whose AP-REQ keyd verified bound to `bound` (R2).
+pub fn ticket_bound_to(sam: &str, bound: Option<keyd_types::OperationDigest>) -> VerifiedTicket {
     VerifiedTicket {
         crealm: realm(),
         cname: PrincipalName {
@@ -243,6 +255,7 @@ pub fn ticket(sam: &str) -> VerifiedTicket {
             name_string: vec![KerberosString::new(sam).unwrap()],
         },
         authtime: authtime(),
+        bound_operation: bound,
     }
 }
 
@@ -793,6 +806,7 @@ impl Domain {
         Request {
             operation_id: id,
             operation: op,
+            operation_digest: TEST_DIGEST,
             requester: ticket(requester),
             approvals: approvers.iter().map(|a| ticket(a)).collect(),
         }

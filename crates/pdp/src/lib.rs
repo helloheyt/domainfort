@@ -11,9 +11,9 @@
 //! - the rule model of docs/11 §3 and the versioned [`PolicySnapshot`]
 //!   ([`policy`]) — explicit Deny wins, no matching Allow ⇒ Deny;
 //! - [`decide`], exactly the five layers of docs/11 §4 — authn, transport
-//!   floor (`required_sec`; on the admin plane's local socket,
-//!   [`Transport::LocalIpc`], a write needs no channel binding —
-//!   [`required_sec_on`], A-74 / Q-292), coarse global rules, the Tier-0
+//!   floor (`required_sec`, on every transport alike — [`required_sec_on`];
+//!   the `LocalIpc` exemption of A-74 was removed by R2, A-102), coarse
+//!   global rules, the Tier-0
 //!   write invariant *before* the ACL, then the object ACL and the attribute
 //!   class — each deny-by-default, an explicit Deny at any layer stopping
 //!   immediately;

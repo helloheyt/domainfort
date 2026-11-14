@@ -18,6 +18,7 @@
 //! | wire | [`wire`] | fixed-order fields through `ipc` (lengths, markers, closed tables, no trailing octet) |
 //! | typed | [`typed`] | UTF-8 text, GUIDs, SIDs (dtyp), realms / salts / binding names (krb-proto); one spelling per value |
 //! | server | [`server`] | [`decode_request`] (or how to refuse), [`encode_reply`] |
+//! | digest | [`digest`] | [`operation_digest`]: the application data an admin AP-REQ is bound to (R2, docs/52 §5) |
 //! | client | [`client`] | [`AdminClient`]: dird-uid check before sending, deadline, idle check, no resend, strict replies |
 //! | socket | `unix` | [`UnixConnector`]: blocking Unix stream, peer uid via rustix (Linux; elsewhere fail closed) |
 //!
@@ -28,6 +29,14 @@
 //! `auth := requester: bytes<64 KiB> ‖ approvals: seq<bytes<64 KiB>, 2>` —
 //! raw AP-REQs; there is no field in which admind could claim a name, SID,
 //! tier or "approved" (docs/51 §7.2; A-70).
+//!
+//! **Every AP-REQ is bound to its operation (R2; docs/52 §5; A-102):** the
+//! Authenticator's `cksum` (RFC 4120 §5.5.1, key usage 10) is the session
+//! key's MIC over the [`operation_digest`] of the request it accompanies —
+//! SHA-256 over a fixed label, this channel's magic, version and kind, and
+//! the payload after `auth` (for `CompletePasswordSet`, its `target` only).
+//! dird has keyd verify it; an AP-REQ attached to another operation is
+//! refused.
 //!
 //! | dir | kind | message | payload after `auth` | reply |
 //! |---|---|---|---|---|
@@ -88,13 +97,17 @@
 //! ipc-directory / ipc-ldap as the pattern); and the docs.rs API pages of
 //! rustix 1.1.6 and zeroize 1.9.1 (P-2). No other implementation,
 //! management plane, serializer or RPC framework was consulted or recalled
-//! (AGENTS.md §1-3).
+//! (AGENTS.md §1-3). The operation digest (R2) is written from RFC 4120 §4,
+//! §5.5.1, §7.5.1 (pinned copy, SHA-256 verified), docs/52 §3.2, §5 and
+//! docs/questions/Q-463 (A-102), calling the approved `sha2` through the
+//! one-shot `Digest::digest` this project's crates already use.
 //!
 //! Spec: docs/51 §7.1-§7.5, R51-15; docs/50 R50-3, R50-4, R50-7, §3, §7.5;
 //! A-59; A-63; A-70; A-72; A-73.
 
 pub mod channel;
 pub mod client;
+pub mod digest;
 pub mod server;
 pub mod typed;
 #[cfg(unix)]
@@ -109,6 +122,7 @@ pub use client::{
     answers, AdminClient, ClientConfigError, Connection, Connector, TransportError, Unserved,
     DEFAULT_DEADLINE,
 };
+pub use digest::{operation_digest, wire_operation_digest, DigestError, OPERATION_DIGEST_LABEL};
 pub use server::{decode_request, encode_refusal, encode_reply, EncodeError, Rejection};
 pub use typed::{
     AccountExpires, AccountKind, Auth, ConversionError, Found, KeyOperation, KeyRef,

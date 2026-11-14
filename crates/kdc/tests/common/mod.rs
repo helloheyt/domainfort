@@ -1795,10 +1795,40 @@ impl ServiceTicket {
     /// number (all OPTIONAL, 5.5.1) — encrypted in the ticket's session key
     /// with key usage 11 ("in normal application exchanges", 5.5.1; 7.5.1).
     pub fn ap_req(&self, ctime: KerberosTime, cusec: u32) -> Vec<u8> {
+        self.ap_req_with(ctime, cusec, None)
+    }
+
+    /// [`ServiceTicket::ap_req`] bound to `application_data`: the
+    /// Authenticator's `cksum` is "a checksum of the application data that
+    /// accompanies the KRB_AP_REQ, computed using a key usage value of 10"
+    /// (RFC 4120 §5.5.1), "keyed with the application session key" (§7.5.1
+    /// item 10) — the ticket session key, not a subkey — with the RFC 3961
+    /// `get_mic` (RFC 4120 §4) of the session key's required checksum type
+    /// (RFC 3961 §3; RFC 3962 §7; RFC 8009 §6). The admin channel's
+    /// application data is the operation digest (crate ipc-dird-admin
+    /// `operation_digest`; docs/52 §5).
+    pub fn ap_req_bound(
+        &self,
+        ctime: KerberosTime,
+        cusec: u32,
+        application_data: &[u8],
+    ) -> Vec<u8> {
+        let cksumtype = self.session.enc_type().checksum_type();
+        let cksum = Checksum {
+            cksumtype: cksumtype.number(),
+            checksum: krb_crypto::get_mic(&self.session, cksumtype, usage(10), application_data)
+                .unwrap(),
+        };
+        self.ap_req_with(ctime, cusec, Some(cksum))
+    }
+
+    /// The AP-REQ of [`ServiceTicket::ap_req`] with `cksum` in its
+    /// Authenticator (RFC 4120 §5.5.1: OPTIONAL).
+    pub fn ap_req_with(&self, ctime: KerberosTime, cusec: u32, cksum: Option<Checksum>) -> Vec<u8> {
         let authenticator = Authenticator {
             crealm: self.crealm.clone(),
             cname: self.cname.clone(),
-            cksum: None,
+            cksum,
             cusec: Microseconds::new(cusec).unwrap(),
             ctime,
             subkey: None,

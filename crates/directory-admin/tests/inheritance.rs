@@ -110,10 +110,12 @@ fn the_root_grant_reaches_a_user_two_levels_down() {
             // NOW_DSTIME in tests/common).
             time: Instant(1_794_564_000),
             transport: Transport::LocalIpc,
+            // What the admin PEP reports once keyd verified the AP-REQ's
+            // operation binding (R2, docs/52 §5 item 4).
             transport_sec: TransportSec {
                 encrypted: true,
                 sealed: true,
-                channel_bound: false,
+                channel_bound: true,
             },
         },
     };

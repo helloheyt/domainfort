@@ -13,10 +13,12 @@
 //!    touched.
 //! 2. **`create_key` ×3, in order** — `(GUID_krbtgt, Krbtgt)` with
 //!    NT-SRV-INST [krbtgt, REALM]; `(GUID_ldap, Service)` with NT-SRV-HST
-//!    [ldap, fqdn]; `(GUID_admin, Service)` with NT-SRV-HST [admind, fqdn]
-//!    (docs/51 §4.3 step 11; docs/47 §1.4, §9.1; docs/10 §5ב, §7; A-19,
-//!    A-73). keyd draws the keys and chooses the kvno (A-35); keyadm only
-//!    asks.
+//!    [ldap, fqdn]; `(GUID_admin, AdminService)` with NT-SRV-HST [admind,
+//!    fqdn] — the admin service's own purpose, whose tickets keyd opens only
+//!    bound to an operation (R2, docs/52 §5 item 3; A-102) (docs/51 §4.3
+//!    step 11; docs/47 §1.4, §9.1; docs/10 §5ב, §7; A-19, A-73). The purpose
+//!    comes from the manifest's key table. keyd draws the keys and chooses
+//!    the kvno (A-35); keyadm only asks.
 //! 3. **`grant_set_secret` for each first administrator, in the manifest's
 //!    order** (task A15a; docs/questions/Q-451) — a user's one key target,
 //!    `(GUID, PrincipalLongterm)` with its NT-PRINCIPAL [sAMAccountName]
@@ -97,7 +99,8 @@ pub enum Step {
     /// `(GUID_ldap, Service)`, NT-SRV-HST [ldap, fqdn]. Spec: docs/10 §5ב;
     /// RFC 4120 §6.2.1.
     LdapService,
-    /// `(GUID_admin, Service)`, NT-SRV-HST [admind, fqdn]. Spec: A-73;
+    /// `(GUID_admin, AdminService)`, NT-SRV-HST [admind, fqdn]. Spec: A-73;
+    /// docs/52 §5 item 3 (R2: the admin service's own purpose);
     /// RFC 4120 §6.2.1.
     AdminService,
 }

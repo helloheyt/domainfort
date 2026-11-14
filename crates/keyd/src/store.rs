@@ -294,7 +294,7 @@ impl KeyStore for InMemoryKeyStore {
     fn accepts(&self, purpose: KeyPurpose) -> bool {
         match purpose {
             KeyPurpose::Krbtgt => self.allow_krbtgt,
-            KeyPurpose::PrincipalLongterm | KeyPurpose::Service => true,
+            KeyPurpose::PrincipalLongterm | KeyPurpose::Service | KeyPurpose::AdminService => true,
         }
     }
 

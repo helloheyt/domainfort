@@ -87,8 +87,10 @@ fn evaluate<P: Pip + ?Sized>(
     };
 
     // Layer 2 — Transport. "if !meets(req.context.transport_sec,
-    // required_sec(req.action)) { return Deny(WeakTransport) }" — with the
-    // `LocalIpc` write exemption of `required_sec_on` (A-74, Q-292 (a)).
+    // required_sec(req.action)) { return Deny(WeakTransport) }" — on every
+    // transport alike: the `LocalIpc` write exemption of A-74 is gone (R2,
+    // A-102: the admin channel's PEP reports `channel_bound` only once keyd
+    // verified each AP-REQ's operation binding).
     if !req.context.transport_sec.meets(required) {
         return Err(ReasonCode::WeakTransport);
     }
@@ -313,34 +315,31 @@ pub fn required_sec(action: &Action) -> TransportSec {
 }
 
 /// The transport floor of an authenticated request that arrived on
-/// `transport`: exactly [`required_sec`], with one narrow exemption — on
-/// [`Transport::LocalIpc`], and on no other transport, `channel_bound` is not
-/// required. A write there needs `{encrypted, sealed}`; every other floor
-/// on it (reads, RPC, the `Kdc*` / `DnsUpdate` actions with no floor) is
-/// unchanged, because none of them asks for `channel_bound`.
+/// `transport`: exactly [`required_sec`], on **every** transport — the rule
+/// of docs/11 §4 with no exception.
 ///
-/// Why: the admin plane's local channel (`dird-admin.sock`, a Unix socket
-/// on the DC host) carries no channel binding until the Authenticator's
-/// `cksum` binds the operation digest (RFC 4120 §5.5.1, task A15); without
-/// the exemption every admin write would be refused at layer 2. Only a PEP
-/// on that socket reports `LocalIpc` — a network PEP never does — so no
-/// network write gains anything. Reporting `channel_bound: true` instead
-/// was rejected (an untrue report to the PDP, Q-292 option (c)).
+/// History: A-74 (Q-292 option (a)) exempted [`Transport::LocalIpc`] — the
+/// admin plane's `dird-admin.sock` — from `channel_bound`, because no admin
+/// AP-REQ was bound to its operation (a documented residual: a compromised
+/// admind could attach an administrator's AP-REQ to another operation). R2
+/// (docs/52 §3.2, §5 item 4; decision A-102) removed the cause: every admin
+/// AP-REQ's Authenticator `cksum` binds the operation digest (RFC 4120
+/// §5.5.1, key usage 10), keyd verifies it, and the admin PEP reports
+/// `channel_bound: true` only for a request every ticket of which keyd
+/// verified bound to it. So the exemption — an instance fix — is gone, and
+/// an unbound admin write is `WeakTransport` like any other.
 ///
 /// Every variant is listed, so a transport added later must take a
-/// position here rather than inherit the exemption by default.
+/// position here rather than inherit a floor by default.
 ///
-/// Spec: docs/11 §4 (`required_sec`); docs/51 §5.4 (R51-9); docs/questions/
-/// Q-292 (decided A-74: option (a), the exemption only for `LocalIpc`).
+/// Spec: docs/11 §4 (`required_sec`); docs/52 §3.2, §5 item 4 (R2);
+/// docs/questions/Q-463 (A-102, superseding Q-292 / A-74 option (a)).
 #[must_use]
 pub fn required_sec_on(action: &Action, transport: Transport) -> TransportSec {
     let floor = required_sec(action);
     match transport {
-        Transport::LocalIpc => TransportSec {
-            channel_bound: false,
-            ..floor
-        },
-        Transport::Ldap
+        Transport::LocalIpc
+        | Transport::Ldap
         | Transport::Ldaps
         | Transport::LdapSasl
         | Transport::Cldap

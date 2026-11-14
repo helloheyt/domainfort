@@ -366,10 +366,12 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
                 self.proofs
                     .discard_where(|entry| entry.principal() == principal);
             }
-            // A live service context opened under a destroyed Service key set
-            // goes with it (its session key zeroized): the key set it was
-            // verified under no longer exists (docs/49 §3.3, A-46).
-            KeyPurpose::Service => {
+            // A live service context opened under a destroyed Service (or
+            // AdminService) key set goes with it (its session key zeroized):
+            // the key set it was verified under no longer exists (docs/49
+            // §3.3, A-46). (A destroy decision never names an AdminService
+            // key set — crate authz `purpose_permitted`.)
+            KeyPurpose::Service | KeyPurpose::AdminService => {
                 let service = *handle;
                 self.service_contexts
                     .discard_where(|entry| entry.service() == service);

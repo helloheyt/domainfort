@@ -529,6 +529,8 @@ fn purpose_code(purpose: KeyPurpose) -> KeyPurposeCode {
         KeyPurpose::PrincipalLongterm => KeyPurposeCode::PrincipalLongterm,
         KeyPurpose::Krbtgt => KeyPurposeCode::Krbtgt,
         KeyPurpose::Service => KeyPurposeCode::Service,
+        // Never a `set_secret` target (R2) — named for completeness.
+        KeyPurpose::AdminService => KeyPurposeCode::AdminService,
     }
 }
 

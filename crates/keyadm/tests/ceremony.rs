@@ -285,7 +285,8 @@ fn the_ceremony_creates_the_three_key_sets_with_their_bindings() {
     let expected = [
         (guid(1), KeyPurposeCode::Krbtgt),
         (guid(2), KeyPurposeCode::Service),
-        (guid(3), KeyPurposeCode::Service),
+        // R2 (docs/52 §5 item 3): the admin service's own purpose.
+        (guid(3), KeyPurposeCode::AdminService),
     ];
     assert_eq!(records.len(), 3);
     for (record, (g, purpose)) in records.iter().zip(expected) {

@@ -47,6 +47,15 @@ ipc-keyd = { path = "../ipc-keyd" }
 # RustCrypto `zeroize` (OD-9; already in the lock): the reply buffers of the
 # blocking socket are wiped (docs/50 §3.3 discipline).
 zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
+# SHA-256 of the operation digest an admin AP-REQ is bound to (R2, docs/52
+# §5; A-102): computed by the client side and by dird from the same codec.
+# RustCrypto, OD-9; already in the workspace lock and already in dird's graph
+# (dirstore, directory-admin link it). License: MIT OR Apache-2.0. Called only
+# through its documented one-shot `Digest::digest` (docs.rs sha2 0.11.1, as
+# crates/audit-log cites it); no hash is implemented here (AGENTS.md §6). A
+# hash, not Kerberos crypto: the MIC over the digest is the client's and
+# keyd's (krb-crypto), never this crate's (D182).
+sha2 = { version = "0.11", default-features = false }
 
 # rustix — owner decision P-12. Peer credentials of the client's blocking
 # Unix socket (docs/50 R50-3: "the client verifies that the server's uid is

@@ -82,9 +82,9 @@ fn the_krbtgt_key_set_is_krbtgt_purpose_bound_to_krbtgt_realm() {
 }
 
 /// docs/51 §4.3 step 11 (`(GUID_ldap, Service)`, NT-SRV-HST [ldap, fqdn]
-/// and `(GUID_admin, Service)`, [admind, fqdn]); docs/10 §5ב; A-73
-/// (`admind/<fqdn>`); RFC 4120 §6.2.1 ("a two-component name of type
-/// NT-SRV-HST").
+/// and `(GUID_admin, AdminService)`, [admind, fqdn] — R2, docs/52 §5 item 3,
+/// the admin service's own purpose); docs/10 §5ב; A-73 (`admind/<fqdn>`);
+/// RFC 4120 §6.2.1 ("a two-component name of type NT-SRV-HST").
 #[test]
 fn the_service_key_sets_are_service_purpose_bound_to_class_and_host() {
     let manifest = Manifest::parse(SAMPLE.as_bytes()).unwrap();
@@ -94,7 +94,7 @@ fn the_service_key_sets_are_service_purpose_bound_to_class_and_host() {
     assert_eq!(ldap.binding.name.name_type, KRB_NT_SRV_HST);
     assert_eq!(components(ldap), ["ldap", "dc1.example.test"]);
     let admin = manifest.admin_service();
-    assert_eq!(admin.handle.purpose, KeyPurpose::Service);
+    assert_eq!(admin.handle.purpose, KeyPurpose::AdminService);
     assert_eq!(admin.handle.principal.as_bytes(), &guid(3).to_packet());
     assert_eq!(admin.binding.name.name_type, KRB_NT_SRV_HST);
     assert_eq!(components(admin), ["admind", "dc1.example.test"]);

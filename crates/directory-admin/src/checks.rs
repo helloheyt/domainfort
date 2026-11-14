@@ -49,14 +49,18 @@ use crate::invariants::{Fault, Graph, MAX_WALK_STEPS};
 use crate::record;
 
 /// The transport security of the admin plane's local socket: the bytes
-/// never leave the host's kernel, and the AP-REQ is not yet bound to the
-/// operation (no channel binding until task A15).
-/// Spec: docs/51 §5.4 (R51-9); Q-292 / A-74 option (a).
-pub(crate) const LOCAL_IPC_SECURITY: TransportSec = TransportSec {
-    encrypted: true,
-    sealed: true,
-    channel_bound: false,
-};
+/// never leave the host's kernel (`encrypted`, `sealed`), and
+/// `channel_bound` exactly when keyd verified every AP-REQ the request
+/// relies on bound to its operation (R2 — `subject::all_bound`).
+/// Spec: docs/51 §5.4 (R51-9); docs/52 §5 item 4; docs/questions/Q-463
+/// (A-102, superseding Q-292 / A-74 option (a)).
+pub(crate) const fn local_ipc_security(channel_bound: bool) -> TransportSec {
+    TransportSec {
+        encrypted: true,
+        sealed: true,
+        channel_bound,
+    }
+}
 
 /// The inputs every check reads: the configuration, the schema ids, ONE
 /// view, the policy of the same version, and the caller's `now`.
@@ -67,6 +71,8 @@ pub(crate) struct Cx<'c, 'v, 'a> {
     pub(crate) policy: &'v PolicySnapshot,
     pub(crate) now: KerberosTime,
     pub(crate) instant: Instant,
+    /// The request's transport security ([`local_ipc_security`]; R2).
+    pub(crate) transport_sec: TransportSec,
 }
 
 /// An object a request names that the requester may see, read from the
@@ -185,15 +191,16 @@ impl<'v, 'a> Cx<'_, 'v, 'a> {
     }
 
     /// The `Context` of every PDP request on the admin plane's local socket.
-    /// Spec: docs/51 §5.4 (`Transport::LocalIpc`, `{encrypted, sealed}`, no
-    /// channel binding — A-74); docs/11 §1, P9 (the PEP supplies the time);
-    /// docs/questions/Q-358 item 11.
+    /// Spec: docs/51 §5.4 (`Transport::LocalIpc`, `{encrypted, sealed}`);
+    /// docs/52 §5 item 4 (`channel_bound` once keyd verified the binding);
+    /// docs/11 §1, P9 (the PEP supplies the time); docs/questions/Q-358
+    /// item 11.
     fn context(&self) -> Context {
         Context {
             src_net: IpScope::Internal,
             time: self.instant,
             transport: Transport::LocalIpc,
-            transport_sec: LOCAL_IPC_SECURITY,
+            transport_sec: self.transport_sec,
         }
     }
 

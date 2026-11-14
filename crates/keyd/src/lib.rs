@@ -75,8 +75,16 @@
 //! a Service key set that keyd drew itself (`create_key`) and that never
 //! leaves — and returns only non-secret facts ([`ServiceContext`]) and a
 //! one-time [`ServiceCtxId`]; the session key and subkey stay in keyd. The
-//! GSS framing, the authenticator checksum, channel binding and the AP-REP
-//! are task L6b (docs/49 §12).
+//! GSS framing, the GSS authenticator checksum, channel binding and the
+//! AP-REP are task L6b (docs/49 §12). **R2 (docs/52 §3.2, §5; A-102):** the
+//! caller names the service key set by its principal and an
+//! [`AppBinding`]; the binding fixes the key set's purpose
+//! ([`AppBinding::key_purpose`]) — `Unbound` opens a `Service` key set
+//! (the LDAP service: no `cksum` allowed), `OperationDigest` an
+//! `AdminService` key set (the admin service: the Authenticator's `cksum`
+//! must be the session key's MIC over the operation digest, key usage 10,
+//! RFC 4120 §5.5.1 / §7.5.1). An admin ticket without its operation
+//! binding cannot be verified at all.
 //!
 //! **Key-state changes** (decision A-86, docs/questions/Q-346):
 //! [`changes_key_state`] names the six operations that install, rotate,
@@ -90,7 +98,8 @@
 //! account's key set is destroyed (zeroized) by `destroy_key_set`, never a
 //! krbtgt key set.
 //!
-//! Key purposes: PrincipalLongterm, Krbtgt, Service. Encryption types: the
+//! Key purposes: PrincipalLongterm, Krbtgt, Service, AdminService (R2: the
+//! admin service's key set, bound only to `admind/<host>`). Encryption types: the
 //! AES types of `krb-crypto` (17, 18, 19, 20) — no weak type is expressible.
 //!
 //! **FAST (RFC 6113)** (docs/48 tasks T1, T2, T3): the AS armor
@@ -229,11 +238,18 @@
 //! - Service-ticket verification interpretations awaiting review
 //!   (docs/questions/Q-180): the A-19 binding is checked before decryption;
 //!   INVALID is the uniform `Denied`; an authenticator checksum is refused
-//!   until task L6b; only keyd-drawn (never password-derived) service key
-//!   versions open a ticket; Role::Ldap may name any Service key set (keyd
-//!   has no notion of "the LDAP key set" — the binding check is what ties a
-//!   ticket to its key). In task L6a nothing consumes a service context: it
-//!   expires with the token lifetime.
+//!   on an unbound verification until task L6b; only keyd-drawn (never
+//!   password-derived) service key versions open a ticket; Role::Ldap may
+//!   name any Service key set (keyd has no notion of "the LDAP key set" —
+//!   the binding check is what ties a ticket to its key). In task L6a
+//!   nothing consumes a service context: it expires with the token
+//!   lifetime (and dird's admin verifications leave one each, Q-387 item 4).
+//! - The operation binding (R2) proves what the admin client's host signed,
+//!   not what its operator meant: a compromised administrator workstation
+//!   can still sign another operation (docs/52 §5 item 8). The binding's
+//!   `cksum` is keyed with the ticket session key, not a subkey (RFC 4120
+//!   §7.5.1 item 10: "keyed with the application session key";
+//!   docs/questions/Q-490).
 //!
 //! # Provenance
 //!
@@ -256,8 +272,12 @@
 //! §4.3, §5.2, §5.8, §7.3, §9, docs/47 §9.1-§9.2, docs/10 §2, §6, §8-§11,
 //! docs/questions/Q-291 (A-74), Q-365 (A-88) and Q-450..Q-453; for the
 //! decision table and the ceremony state (A-102), docs/52 §3.1, §3.3, §3.4,
-//! §3.10, §4, §7 and docs/questions/Q-460..Q-462, Q-465. No other
-//! implementation was consulted or recalled.
+//! §3.10, §4, §7 and docs/questions/Q-460..Q-462, Q-465; for the operation
+//! binding and the admin service purpose (R2, A-102), RFC 4120 §4, §3.3.3,
+//! §5.2.9, §5.5.1, §7.5.1, RFC 3961 §2-§4, §5.3, §5.4, §8, RFC 3962 §6, §7,
+//! RFC 8009 §1, §6, §7 (pinned copies, SHA-256 verified), docs/52 §3.2, §5
+//! and docs/questions/Q-463, Q-490..Q-493. No other implementation was
+//! consulted or recalled.
 //!
 //! Spec: docs/10; docs/09 א; RFC 4120 §3, §5.
 
@@ -294,6 +314,9 @@ pub use custody::LocalKeyd;
 pub use entropy::{EntropyError, EntropySource, OsEntropy};
 pub use keyd::Keyd;
 pub use keyd_types::kerberos_time_seconds;
+pub use keyd_types::{
+    is_admin_service_name, AppBinding, OperationDigest, ADMIN_SERVICE_CLASS, OPERATION_DIGEST_LEN,
+};
 pub use keyd_types::{
     AccountKind, SetSecretTarget, MAX_GRANT_TARGETS, MAX_INITIAL_SECRET_GRANT_SECS,
     MAX_SET_SECRET_GRANTS, MAX_SET_SECRET_GRANT_SECS,

@@ -1,14 +1,13 @@
-//! `Transport::LocalIpc` and the narrow write-floor exemption of
-//! `required_sec_on` (task A3 of docs/51 §12).
+//! `Transport::LocalIpc` and its write floor (task A3 of docs/51 §12; R2).
 //!
 //! Sources: docs/11 §4 (`required_sec`: "write / secret operation →
 //! {encrypted, sealed, channel_bound}; authenticated read → {encrypted}");
-//! docs/51 §5.4 (R51-9); docs/questions/Q-292, decided A-74 option (a): the
-//! admin plane's local socket reports `{encrypted, sealed}` with
-//! `channel_bound: false`, and the exemption from `channel_bound` applies to
-//! `LocalIpc` **only** — every other transport keeps the existing floor.
-//! Both halves are tested here. Fixtures are the hand-made ones of `common`;
-//! no vector comes from any other implementation.
+//! docs/51 §5.4 (R51-9); docs/52 §3.2, §5 item 4 and docs/questions/Q-463
+//! (decided A-102, superseding Q-292 / A-74 option (a)): the admin plane's
+//! local socket reports `{encrypted, sealed}` and `channel_bound` only once
+//! keyd verified each AP-REQ's operation binding, and its floor is the floor
+//! of every transport — no exemption. Fixtures are the hand-made ones of
+//! `common`; no vector comes from any other implementation.
 
 mod common;
 
@@ -20,11 +19,20 @@ use pdp::{
     TransportSec, ZoneId,
 };
 
-/// The security a PEP on the admin plane's local socket reports (A-74).
+/// The security a PEP on the admin plane's local socket reports when an
+/// AP-REQ was not verified bound to the operation (no binding).
 const LOCAL: TransportSec = TransportSec {
     encrypted: true,
     sealed: true,
     channel_bound: false,
+};
+
+/// The security it reports once keyd verified every AP-REQ's operation
+/// binding (R2, docs/52 §5 item 4).
+const BOUND: TransportSec = TransportSec {
+    encrypted: true,
+    sealed: true,
+    channel_bound: true,
 };
 
 /// Every transport other than `LocalIpc`.
@@ -109,82 +117,52 @@ fn request(
     req
 }
 
-/// docs/11 §4 + A-74: on `LocalIpc` a write's floor is `{encrypted,
-/// sealed}` (no `channel_bound`); every other floor on it equals
-/// `required_sec`. On every other transport `required_sec_on` IS
-/// `required_sec`, for every action.
+/// docs/11 §4 + R2 (A-102): `required_sec_on` IS `required_sec`, for every
+/// action, on every transport — `LocalIpc` included (the A-74 exemption is
+/// gone).
 #[test]
-fn the_floor_table_differs_only_for_writes_on_local_ipc() {
-    let write_without_binding = TransportSec {
-        encrypted: true,
-        sealed: true,
-        channel_bound: false,
-    };
+fn the_floor_table_is_the_same_on_every_transport() {
     for (action, _) in every_action() {
-        for transport in NETWORK_TRANSPORTS {
+        for transport in NETWORK_TRANSPORTS.into_iter().chain([Transport::LocalIpc]) {
             assert_eq!(
                 required_sec_on(&action, transport),
                 required_sec(&action),
                 "{action:?} on {transport:?}"
             );
         }
-        let local = required_sec_on(&action, Transport::LocalIpc);
-        if required_sec(&action).channel_bound {
-            assert!(pdp::is_write(&action), "{action:?}");
-            assert_eq!(local, write_without_binding, "{action:?}");
-        } else {
-            assert_eq!(local, required_sec(&action), "{action:?}");
-        }
-        assert!(!local.channel_bound, "{action:?}");
     }
-    // The write actions of the docs/11 §4 table all have the binding floor
-    // elsewhere, and lose only the binding on LocalIpc.
+    // The write actions of the docs/11 §4 table need the binding on the
+    // admin plane's local socket too.
     for action in [
         Action::DirWrite,
         Action::DirDelete,
         Action::FileWrite,
         Action::PolicyAdmin,
     ] {
-        assert!(required_sec(&action).channel_bound, "{action:?}");
-        assert_eq!(
-            required_sec_on(&action, Transport::LocalIpc),
-            write_without_binding,
+        assert!(
+            required_sec_on(&action, Transport::LocalIpc).channel_bound,
             "{action:?}"
         );
     }
 }
 
-/// A-74, first half: an authenticated write over `LocalIpc` with
-/// `{encrypted, sealed}` and `channel_bound: false` passes layer 2 — with an
-/// Allow-all policy and a granting descriptor it is allowed.
+/// R2 (docs/52 §5 item 4): an authenticated write over `LocalIpc` whose PEP
+/// could not report `channel_bound` (an AP-REQ keyd did not verify bound to
+/// the operation) is `WeakTransport` at layer 2; reads and the actions with
+/// no binding floor still pass. The same over every other transport.
 #[test]
-fn local_ipc_writes_are_accepted_without_channel_binding() {
-    let pip = MockPip::with_sd(sd(None, vec![allow(RIGHT_GENERIC_ALL, group())]));
-    let pol = policy(vec![allow_everything(1)]);
-    for (action, resource) in every_action() {
-        let d = decide(
-            &request(action.clone(), resource, Transport::LocalIpc, LOCAL),
-            &pol,
-            &pip,
-        );
-        assert_eq!(d.effect, Effect::Allow, "{action:?}: {d:?}");
-        assert_eq!(d.reason, ReasonCode::Allowed, "{action:?}");
-    }
-}
-
-/// A-74, second half: the same writes with the same transport security over
-/// any other transport are still refused at layer 2 (`WeakTransport`) — the
-/// exemption applies only to `LocalIpc`. Reads and the actions with no
-/// binding floor are unaffected (they pass on every transport).
-#[test]
-fn other_transports_without_channel_binding_still_refuse_writes() {
+fn writes_without_channel_binding_are_weak_transport_on_every_transport() {
     let pip = MockPip::with_sd(sd(None, vec![allow(RIGHT_GENERIC_ALL, group())]));
     let pol = policy(vec![allow_everything(1)]);
     let mut refused = 0usize;
-    for transport in NETWORK_TRANSPORTS {
+    let transports: Vec<Transport> = NETWORK_TRANSPORTS
+        .into_iter()
+        .chain([Transport::LocalIpc])
+        .collect();
+    for transport in &transports {
         for (action, resource) in every_action() {
             let d = decide(
-                &request(action.clone(), resource, transport, LOCAL),
+                &request(action.clone(), resource, *transport, LOCAL),
                 &pol,
                 &pip,
             );
@@ -202,12 +180,30 @@ fn other_transports_without_channel_binding_still_refuse_writes() {
         }
     }
     // Six actions have the binding floor (DirWrite, DirAddChild, DirDelete,
-    // DirControlRight, FileWrite, PolicyAdmin), each on eight transports.
-    assert_eq!(refused, 6 * NETWORK_TRANSPORTS.len());
+    // DirControlRight, FileWrite, PolicyAdmin), each on nine transports.
+    assert_eq!(refused, 6 * transports.len());
 }
 
-/// The exemption removes `channel_bound` only: a write over `LocalIpc`
-/// without `sealed`, or without `encrypted`, is still `WeakTransport`.
+/// R2: with the binding keyd verified — `{encrypted, sealed, channel_bound}`
+/// — every action over `LocalIpc` passes layer 2 (an Allow-all policy and a
+/// granting descriptor ⇒ allowed).
+#[test]
+fn local_ipc_writes_with_channel_binding_are_allowed() {
+    let pip = MockPip::with_sd(sd(None, vec![allow(RIGHT_GENERIC_ALL, group())]));
+    let pol = policy(vec![allow_everything(1)]);
+    for (action, resource) in every_action() {
+        let d = decide(
+            &request(action.clone(), resource, Transport::LocalIpc, BOUND),
+            &pol,
+            &pip,
+        );
+        assert_eq!(d.effect, Effect::Allow, "{action:?}: {d:?}");
+        assert_eq!(d.reason, ReasonCode::Allowed, "{action:?}");
+    }
+}
+
+/// The binding is not enough on its own: a write over `LocalIpc` without
+/// `sealed`, or without `encrypted`, is still `WeakTransport`.
 #[test]
 fn local_ipc_still_needs_encrypted_and_sealed_for_writes() {
     let pip = MockPip::with_sd(sd(None, vec![allow(RIGHT_GENERIC_ALL, group())]));
@@ -216,12 +212,12 @@ fn local_ipc_still_needs_encrypted_and_sealed_for_writes() {
         TransportSec {
             encrypted: true,
             sealed: false,
-            channel_bound: false,
+            channel_bound: true,
         },
         TransportSec {
             encrypted: false,
             sealed: true,
-            channel_bound: false,
+            channel_bound: true,
         },
         TransportSec::NONE,
     ] {
@@ -242,9 +238,8 @@ fn local_ipc_still_needs_encrypted_and_sealed_for_writes() {
     }
 }
 
-/// The exemption is part of the authenticated floor only (docs/11 §4 layer
-/// 1 runs first): an unauthenticated write over `LocalIpc` is still
-/// `Unauthenticated`.
+/// Layer 1 runs first (docs/11 §4): an unauthenticated write over
+/// `LocalIpc` is `Unauthenticated`, even with the binding reported.
 #[test]
 fn local_ipc_does_not_touch_layer_one() {
     let pip = MockPip::with_sd(sd(None, vec![allow(RIGHT_GENERIC_ALL, everyone())]));
@@ -256,7 +251,7 @@ fn local_ipc_does_not_touch_layer_one() {
             attr: Some(AttrId(attr_alone())),
         },
         Transport::LocalIpc,
-        LOCAL,
+        BOUND,
     );
     req.subject.auth.ticket_verified = false;
     let d = decide(&req, &pol, &pip);

@@ -27,7 +27,7 @@
 //! | `0x04` | `open_and_verify_tgt` | Kdc | `0x84` `TgtContext` | `0xF1` |
 //! | `0x05` | `issue_tgs_rep` | Kdc | `0x85` `TgsRepParts` | `0xF2` |
 //! | `0x06` | `seal_fast_error` | Kdc | `0x86` `EncryptedData` | `0xF3` `Error` |
-//! | `0x07` | `open_and_verify_service_ticket` | Ldap | `0x87` `ServiceContext` | `0xF1` |
+//! | `0x07` | `open_and_verify_service_ticket(principal, binding)` (R2: the binding names the key purpose) | Ldap | `0x87` `ServiceContext` (‖ the verified operation digest) | `0xF1` |
 //! | `0x08` | `set_secret` | Directory | `0x88` `Kvno` | `0xF3` |
 //! | `0x09` | `verify_secret` | — (no role since A-102, docs/52 R4) | `0x89` `()` | `0xF3` |
 //! | `0x0A` | `create_key` | Admin (before the seal) | `0x8A` `Kvno` | `0xF3` |

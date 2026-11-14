@@ -119,6 +119,7 @@ fn intent_then_success_where(
         keyd::KeyPurpose::PrincipalLongterm => KeyPurposeCode::PrincipalLongterm,
         keyd::KeyPurpose::Krbtgt => KeyPurposeCode::Krbtgt,
         keyd::KeyPurpose::Service => KeyPurposeCode::Service,
+        keyd::KeyPurpose::AdminService => KeyPurposeCode::AdminService,
     };
     let of = |result: KeydOutcome| {
         let found: Vec<u64> = records
@@ -274,13 +275,15 @@ fn provisioning_to_a_new_users_login() {
         let dave = w
             .forward(&alice, &[], create_user(workstations, "dave"))
             .created();
-        // A replayed AP-REQ (RFC 4120 §3.2.3; keyd's replay cache).
-        let once = w.ap_req(&alice);
+        // A replayed AP-REQ (RFC 4120 §3.2.3; keyd's replay cache) — and
+        // the same AP-REQ attached to another operation (R2: refused, the
+        // binding does not match; docs/52 §3.2, Q-292).
         let group = |sam: &str| Operation::CreateGroup {
             parent: workstations,
             sam: sam.to_owned(),
             group_type: None,
         };
+        let once = w.ap_req(&alice, &group("e2e-staff"));
         let staff = w
             .admin(&ipc_admin::Request::Forward {
                 auth: Auth {
@@ -293,6 +296,18 @@ fn provisioning_to_a_new_users_login() {
         assert_eq!(
             w.admin(&ipc_admin::Request::Forward {
                 auth: Auth {
+                    requester: once.clone(),
+                    approvals: Vec::new(),
+                },
+                operation: group("e2e-staff"),
+            })
+            .refusal(),
+            RefusalStatus::Denied,
+            "a replayed AP-REQ is refused"
+        );
+        assert_eq!(
+            w.admin(&ipc_admin::Request::Forward {
+                auth: Auth {
                     requester: once,
                     approvals: Vec::new(),
                 },
@@ -300,7 +315,23 @@ fn provisioning_to_a_new_users_login() {
             })
             .refusal(),
             RefusalStatus::Denied,
-            "a replayed AP-REQ is refused"
+            "an AP-REQ attached to another operation is refused (R2)"
+        );
+        // A fresh AP-REQ made for one operation and forwarded with another
+        // (what a compromised admind could try, Q-292): refused by keyd's
+        // check of the Authenticator's cksum (R2, docs/52 §5).
+        let made_for = w.ap_req(&alice, &group("e2e-meant"));
+        assert_eq!(
+            w.admin(&ipc_admin::Request::Forward {
+                auth: Auth {
+                    requester: made_for,
+                    approvals: Vec::new(),
+                },
+                operation: group("e2e-hijacked"),
+            })
+            .refusal(),
+            RefusalStatus::Denied,
+            "an AP-REQ bound to another operation is refused (R2)"
         );
         // SetPassword: two AP-REQs (A-94).
         match w.set_password(&alice, &[], dave, NEW_USER_PASSWORD).reply() {
@@ -720,6 +751,18 @@ fn provisioning_to_a_new_users_login() {
                     && r.reason == KeydReason::Replay),
             "keyd refused the replayed AP-REQ from its replay cache (RFC 4120 §3.2.3)"
         );
+        assert_eq!(
+            keyd.iter()
+                .filter(|(_, r)| r.op == KeydOperation::OpenAndVerifyServiceTicket
+                    && r.caller_role == KeydRole::Ldap
+                    && r.result == KeydOutcome::Denied
+                    && r.reason == KeydReason::OperationDigestMismatch
+                    && r.purpose == Some(KeyPurposeCode::AdminService))
+                .count(),
+            2,
+            "keyd refused both AP-REQs attached to another operation by their cksum, \
+             under the admin service's own key set (R2, docs/52 §5)"
+        );
 
         // dird's DirAdmin decision → outcome pairs (A-85), in dird's order.
         let admin = dir_admin_events(&events);
@@ -752,6 +795,10 @@ fn provisioning_to_a_new_users_login() {
             (Op::CreateUser, Committed),
             (Op::CreateGroup, Proceed),
             (Op::CreateGroup, Committed),
+            // The replayed AP-REQ, the same AP-REQ attached to another group
+            // and a fresh one bound to another operation (R2).
+            (Op::CreateGroup, Refused(AdminRefusal::Unauthenticated)),
+            (Op::CreateGroup, Refused(AdminRefusal::Unauthenticated)),
             (Op::CreateGroup, Refused(AdminRefusal::Unauthenticated)),
             (Op::BeginPasswordSet, Proceed),
             (Op::BeginPasswordSet, Committed),
@@ -1009,11 +1056,9 @@ fn auditd_down_refuses_admin_writes_and_leaves_the_store_unchanged() {
         // (ipc-admin `RefusalStatus::Unavailable`) — so the test retries
         // exactly those answers.
         let created_after = w.settled(|w| {
-            let auth = w.auth(&alice, &[]);
-            w.admin(&ipc_admin::Request::Forward {
-                auth,
-                operation: create_user(workstations, "after"),
-            })
+            let operation = create_user(workstations, "after");
+            let auth = w.auth(&alice, &[], &operation);
+            w.admin(&ipc_admin::Request::Forward { auth, operation })
         });
         assert!(
             matches!(created_after, Got::Reply(Reply::Created { .. })),
@@ -1124,11 +1169,9 @@ fn admind_down_the_client_sees_closure() {
 
         w.stop_admind();
         let workstations = w.guid(ObjectRole::WorkstationsOu);
-        let auth = w.auth(&alice, &[]);
-        let got = open.call(&ipc_admin::Request::Forward {
-            auth,
-            operation: create_user(workstations, "erin"),
-        });
+        let operation = create_user(workstations, "erin");
+        let auth = w.auth(&alice, &[], &operation);
+        let got = open.call(&ipc_admin::Request::Forward { auth, operation });
         assert_eq!(got, Got::Closed, "the open connection is closed");
         assert!(
             AdminConn::connect(&socket).is_err(),

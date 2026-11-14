@@ -19,7 +19,7 @@ mod support;
 
 use ipc_admin::{Request, SetPassword};
 use std::process::Command;
-use support::{auth, fresh, g, Got, Options, World, BOB, WS9};
+use support::{begin_auth, completion, g, Got, Options, World, BOB, WS9};
 use zeroize::Zeroizing;
 
 /// The marker that makes this test run the scenario (the child).
@@ -39,8 +39,8 @@ const PASSWORDS: [&str; 5] = [
 
 fn set_password(target: dtyp::Guid, text: &str) -> Request {
     Request::SetPassword(SetPassword {
-        auth: auth("admin1", &[]),
-        completion: fresh("admin1"),
+        auth: begin_auth("admin1", &[], target),
+        completion: completion("admin1", target),
         target,
         password: ipc_admin::Password::new(Zeroizing::new(text.to_owned())),
     })

@@ -7,11 +7,29 @@
 //!
 //! dird verifies every AP-REQ of an admin request through keyd
 //! `open_and_verify_service_ticket` under **Role::Ldap** (keyd's `uid_roles`
-//! maps dird's uid to `Ldap`), naming the admin service's key set — the
-//! admin service object's objectGUID with purpose `Service`. keyd runs RFC
-//! 4120 §3.2.3 under that key, which never leaves keyd, and answers the
-//! ticket's non-secret facts (crealm, cname, authtime); the write PEP builds
-//! the Subject from them through the directory (docs/51 §5.3, option D).
+//! maps dird's uid to `Ldap`), naming the admin service's principal — the
+//! admin service object's objectGUID — and **the operation digest** of the
+//! request (R2 below): keyd opens the ticket only under the admin service's
+//! own key set (purpose `AdminService`, which follows from the binding).
+//! keyd runs RFC 4120 §3.2.3 under that key, which never leaves keyd, and
+//! answers the ticket's non-secret facts (crealm, cname, authtime) and the
+//! digest it verified; the write PEP builds the Subject from them through
+//! the directory (docs/51 §5.3, option D).
+//!
+//! # Every AP-REQ is bound to its operation (R2; docs/52 §3.2, §5; A-102)
+//!
+//! Class C2 (confused deputy): an AP-REQ says who asks, not what — so a
+//! compromised admind could attach an administrator's AP-REQ to another
+//! operation. The client puts the session key's MIC over the request's
+//! operation digest into the Authenticator's `cksum` (RFC 4120 §5.5.1, key
+//! usage 10; crate ipc-dird-admin `operation_digest`: SHA-256 over a label,
+//! the channel header and the payload after `auth`). dird computes the
+//! digest from the request **it decoded** and passes it with the requester's
+//! and every approval's AP-REQ ([`TicketVerifier::verify`] takes a digest —
+//! dird cannot ask for an unbound admin verification). keyd verifies the
+//! `cksum` while it opens the ticket; a mismatch is the uniform `Denied`.
+//! The PEP reports `channel_bound` to the PDP only for a request whose every
+//! ticket carries that digest (docs/11 §4: a write needs it — no exemption).
 //!
 //! [`KeydTicketVerifier`] wraps ipc-keyd's `KeydClient` with F1's
 //! connection rules (A-87): a held connection is checked before reuse
@@ -66,7 +84,8 @@
 //! the KDC resolves a service principal (`AccountSource::service`, docs/47
 //! §1.3: the unique servicePrincipalName index, the single stored value
 //! compared octet for octet, a computer object): the handle is
-//! `(objectGUID, Service)`. Absent, multi-valued, or naming another object
+//! `(objectGUID, AdminService)` (R2: the admin service's own purpose,
+//! `KeyPurpose::of_service_name`). Absent, multi-valued, or naming another object
 //! than the manifest's admin service ⇒ the admin service does not start;
 //! dird's other services run (docs/questions/Q-386 item 3).
 //!
@@ -79,7 +98,8 @@
 //! docs/questions/Q-386.
 //!
 //! Spec: docs/51 §5.2 row 9, §5.3, §7, §12 (A8); docs/10 §2, §5ב, §7א;
-//! docs/50 §3.4, §3.6, §3.7; A-56; A-73; A-87; A-89.
+//! docs/50 §3.4, §3.6, §3.7; docs/52 §3.2, §5 (R2); RFC 4120 §5.5.1, §7.5.1;
+//! A-56; A-73; A-87; A-89; A-102.
 
 use crate::policy::DevelopmentPolicy;
 use crate::registration::DecisionRegistration;
@@ -102,8 +122,8 @@ use ipc_dird_admin::{
 };
 use kdc::AccountSource;
 use keyd_types::{
-    AccountKind as GrantKind, AuthnError, DecidedOperation, DecisionId, DestructionPage, KeyHandle,
-    ServiceContext, SetSecretTarget,
+    AccountKind as GrantKind, AppBinding, AuthnError, DecidedOperation, DecisionId,
+    DestructionPage, KeyHandle, OperationDigest, PrincipalId, ServiceContext, SetSecretTarget,
 };
 use krb_proto::Realm;
 use pdp::Dn;
@@ -280,16 +300,26 @@ impl RegistrationFailure {
 }
 
 /// dird's keyd client (Role::Ldap): one AP-REQ's verification — keyd's
-/// `open_and_verify_service_ticket` for the admin service's key set — and
-/// the registration of dird's decisions (task A15a; A-102).
+/// `open_and_verify_service_ticket` for the admin service's key set, bound
+/// to an operation digest — and the registration of dird's decisions (task
+/// A15a; A-102).
 /// Spec: docs/10 §5ב; docs/51 §5.8 option (b), §7.4 step 1; A-73; docs/52
-/// §4.2, §4.3.
+/// §4.2, §4.3, §5 items 3-4.
 pub trait TicketVerifier: Send {
-    /// Verify `ap_req` (the raw `KRB_AP_REQ` DER admind forwarded) under
-    /// `service`. keyd not reachable, not the configured keyd, or in its
-    /// start-up hold-down ⇒ `AuthnError::Unavailable` (A-56); every other
-    /// error is keyd's own answer.
-    fn verify(&mut self, service: &KeyHandle, ap_req: &[u8]) -> Result<ServiceContext, AuthnError>;
+    /// Verify `ap_req` (the raw `KRB_AP_REQ` DER admind forwarded) under the
+    /// admin service key set of `service`, bound to `operation` — the
+    /// operation digest dird computed from the request it decoded (R2: the
+    /// Authenticator's `cksum`, RFC 4120 §5.5.1). There is no unbound form:
+    /// an admin ticket is verified against an operation or not at all. keyd
+    /// not reachable, not the configured keyd, or in its start-up hold-down
+    /// ⇒ `AuthnError::Unavailable` (A-56); every other error is keyd's own
+    /// answer.
+    fn verify(
+        &mut self,
+        service: &PrincipalId,
+        operation: &OperationDigest,
+        ap_req: &[u8],
+    ) -> Result<ServiceContext, AuthnError>;
 
     /// Register in keyd dird's `decision` (keyd's `register_decision`,
     /// Role::Ldap): its id, operation, approvers and lifetime. A
@@ -372,14 +402,23 @@ where
     C: ipc_keyd::Connector + Send,
     C::Connection: Send,
 {
-    /// Spec: docs/10 §5ב, §7א; docs/50 §3.7, §7.5 step 4; A-56; A-87
-    /// (docs/questions/Q-311: the description required of every new
-    /// connection).
-    fn verify(&mut self, service: &KeyHandle, ap_req: &[u8]) -> Result<ServiceContext, AuthnError> {
+    /// Spec: docs/10 §5ב, §7א; docs/50 §3.7, §7.5 step 4; docs/52 §5 item 3;
+    /// A-56; A-87 (docs/questions/Q-311: the description required of every
+    /// new connection).
+    fn verify(
+        &mut self,
+        service: &PrincipalId,
+        operation: &OperationDigest,
+        ap_req: &[u8],
+    ) -> Result<ServiceContext, AuthnError> {
         if !self.keyd_identified() {
             return Err(AuthnError::Unavailable);
         }
-        self.client.open_and_verify_service_ticket(service, ap_req)
+        self.client.open_and_verify_service_ticket(
+            service,
+            &AppBinding::OperationDigest(*operation),
+            ap_req,
+        )
     }
 
     /// Through `call_with_fate` (A-90): a decision loosens keyd, so whether
@@ -576,9 +615,23 @@ pub(crate) fn check_manifest(
     Ok(())
 }
 
+// The admin service's class is one value: the manifest's binding and keyd's
+// purpose rule name the same service (R2; A-73).
+const _: () = {
+    let manifest = provision_manifest::ADMIN_SERVICE_CLASS.as_bytes();
+    let keyd = keyd_types::ADMIN_SERVICE_CLASS.as_bytes();
+    assert!(manifest.len() == keyd.len());
+    let mut i = 0;
+    while i < manifest.len() {
+        assert!(manifest[i] == keyd[i]);
+        i += 1;
+    }
+};
+
 /// The admin service's key set: the manifest's admin-service binding
 /// resolved as the KDC resolves a service principal, and the result must be
-/// the manifest's handle (module documentation).
+/// the manifest's handle — `(objectGUID, AdminService)` (module
+/// documentation).
 /// Spec: docs/47 §1.3 (`AccountSource::service`); docs/51 §5.3; A-73;
 /// docs/questions/Q-386 item 3.
 pub(crate) fn admin_service_handle(

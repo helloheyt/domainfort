@@ -249,7 +249,8 @@ fn keyd_outcomes_never_map_to_a_phase_code() {
 
 /// Task A15a (docs/questions/Q-452 item 4): the four grant reasons map to
 /// their own same-named codes, never `Unlisted`; likewise the seven decision
-/// reasons appended by A-102 (docs/52 §4.5).
+/// reasons appended by A-102 (docs/52 §4.5) and the two operation-binding
+/// reasons of R2 (docs/52 §5 item 3).
 #[test]
 fn keyd_grant_reasons_match() {
     for reason in [
@@ -264,6 +265,8 @@ fn keyd_grant_reasons_match() {
         keyd::AuditReason::DecisionConflict,
         keyd::AuditReason::DecisionReplayed,
         keyd::AuditReason::CeremonySealed,
+        keyd::AuditReason::OperationDigestMissing,
+        keyd::AuditReason::OperationDigestMismatch,
     ] {
         let record = keyd::AuditRecord {
             ts: ktime(),

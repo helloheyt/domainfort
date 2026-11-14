@@ -330,6 +330,24 @@ pub enum AuditReason {
     /// ceremony. Reported as the uniform `Denied`.
     /// Spec: docs/52 §4.4, §7 R3; docs/questions/Q-462 item 1 (A-102).
     CeremonySealed,
+    /// `open_and_verify_service_ticket` with an operation-digest binding
+    /// (the admin service key): the Authenticator carries no `cksum`, so
+    /// the AP-REQ is bound to no operation. Part of the cryptographic chain
+    /// — the uniform `Denied` (A-26), before the replay cache.
+    /// Spec: RFC 4120 5.5.1 (cksum), 7.5.1 item 10; docs/52 §5 item 3 (R2);
+    /// docs/questions/Q-463 (A-102).
+    OperationDigestMissing,
+    /// `open_and_verify_service_ticket` with an operation-digest binding:
+    /// the Authenticator's `cksum` is not the session key's MIC over the
+    /// operation digest dird computed — another checksum type than the
+    /// session key's required one, another length, or a MIC that does not
+    /// verify (an AP-REQ made for another operation: the confused-deputy
+    /// attempt of docs/52 §3.2, Q-292). The uniform `Denied` (A-26), before
+    /// the replay cache.
+    /// Spec: RFC 4120 3.3.3 (the KDC's rule for its own checksum: "rejected
+    /// if the checksums do not match"), 5.5.1, 7.5.1 item 10; RFC 3961 §3
+    /// ("required checksum mechanism"), §4 (verify_mic); docs/52 §5 item 3.
+    OperationDigestMismatch,
 }
 
 /// A key referenced by an operation, for audit (no key material).

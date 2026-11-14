@@ -80,11 +80,12 @@ impl Kvno {
 /// tagged for one purpose is usable only by the operations of that purpose
 /// (invariant I3).
 ///
-/// Phase 1 implements exactly these three purposes. The other purposes of
+/// Phase 1 implements exactly these four purposes. The other purposes of
 /// docs/10 §1 (GKDI root, backup key, DC identity) are out of scope and have
 /// no variant.
 ///
-/// Spec: docs/10 §1 (KeyPurpose), §2, §12 I3; docs/09 א.3 (2).
+/// Spec: docs/10 §1 (KeyPurpose), §2, §12 I3; docs/09 א.3 (2); docs/52 §3.2,
+/// §5 item 3 (R2, the admin service's own purpose; A-102).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum KeyPurpose {
@@ -96,6 +97,59 @@ pub enum KeyPurpose {
     /// A service long-term key (key a service ticket is sealed under).
     /// Spec: docs/10 §1; RFC 4120 5.3 ("the server's secret key").
     Service = 2,
+    /// The admin service's key set (`admind/<dc-fqdn>`, A-73): the key the
+    /// admin channel's tickets are sealed under. A purpose of its own so
+    /// that a ticket under it is opened **only** bound to the exact
+    /// operation it accompanies (the Authenticator's `cksum`, RFC 4120
+    /// 5.5.1, key usage 10 — `AppBinding::OperationDigest`) and never
+    /// unbound, and so that no `set_secret` can overwrite it (the A-50
+    /// follow-up for the admin service). Bound only to the admin service's
+    /// name ([`is_admin_service_name`]).
+    /// Spec: docs/52 §3.2 (C2), §5 items 2-3, §7 R2; docs/questions/Q-463
+    /// (A-102); A-50; A-73; RFC 4120 5.3.
+    AdminService = 3,
+}
+
+/// The service class — the first name component — of the admin service's
+/// principal `admind/<dc-fqdn>`. A project choice: no specification names
+/// this project's own admin service.
+/// Spec: PENDING-OWNER A-73 / docs/questions/Q-290 item 4 ("SPN
+/// `admind/<fqdn>`"); docs/51 §5.3 item 4.
+pub const ADMIN_SERVICE_CLASS: &str = "admind";
+
+/// `true` if `name` is the admin service's: exactly two components, the
+/// first [`ADMIN_SERVICE_CLASS`] (octet for octet; the name-type is a hint
+/// only, RFC 4120 6.2). The same shape of rule as the reserved TGS name
+/// ("a two-part name ... with the first part 'krbtgt'", RFC 4120 7.3):
+/// keyd binds an [`KeyPurpose::AdminService`] key set to such a name only,
+/// and no other key set to one.
+/// Spec: RFC 4120 6.2, 7.3; A-73; docs/52 §5 item 3 (R2).
+#[must_use]
+pub fn is_admin_service_name(name: &PrincipalName) -> bool {
+    name.name_string.len() == 2
+        && name
+            .name_string
+            .first()
+            .is_some_and(|c| c.as_bytes() == ADMIN_SERVICE_CLASS.as_bytes())
+}
+
+impl KeyPurpose {
+    /// The purpose of the key set a service ticket for `name` is sealed
+    /// under: [`KeyPurpose::AdminService`] for the admin service's name
+    /// ([`is_admin_service_name`]), [`KeyPurpose::Service`] for every other
+    /// service. The KDC's account source names the handle with it, and keyd
+    /// refuses any other pairing at the binding check (A-19), so a ticket
+    /// for the admin service is never sealed under a plain service key.
+    /// Spec: docs/47 §1.3 (`AccountSource::service`: the key set
+    /// `(objectGUID, Service)`), §9.1; docs/52 §5 item 3 (R2); A-73.
+    #[must_use]
+    pub fn of_service_name(name: &PrincipalName) -> KeyPurpose {
+        if is_admin_service_name(name) {
+            KeyPurpose::AdminService
+        } else {
+            KeyPurpose::Service
+        }
+    }
 }
 
 /// A reference to a stored key set — never the key material.

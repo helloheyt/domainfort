@@ -260,7 +260,7 @@ fn a_complete_report_prints_handles_bindings_and_kvnos() {
     for expected in [
         "created krbtgt: principal 00000000-0000-0000-0000-000000000001 purpose Krbtgt binding NT-SRV-INST:krbtgt/EXAMPLE.TEST kvno 1",
         "created ldap service: principal 00000000-0000-0000-0000-000000000002 purpose Service binding NT-SRV-HST:ldap/dc1.example.test kvno 1",
-        "created admin service: principal 00000000-0000-0000-0000-000000000003 purpose Service binding NT-SRV-HST:admind/dc1.example.test kvno 1",
+        "created admin service: principal 00000000-0000-0000-0000-000000000003 purpose AdminService binding NT-SRV-HST:admind/dc1.example.test kvno 1",
         "keyd's ceremony sealed",
         "ceremony complete and sealed: 3 of 3 key sets created",
         "keyd is sealed: create_key and initial-secret grants no longer exist in keyd until it restarts with an empty store",
