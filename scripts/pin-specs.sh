@@ -3,7 +3,10 @@
 # מוריד רק מ-hosts שב-agent-sandbox/egress-allowlist.txt (אכיפת SOURCES.md).
 # דורש: jq, curl, sha256sum (או shasum).
 # שימוש:  scripts/pin-specs.sh [--verify]
-#   ברירת מחדל: ממלא sha256 חסר ושומר ל-cache. שדה revision נעוץ ידנית מעמוד
+#   ברירת מחדל: ממלא sha256 **רק למסמך שעדיין לא הוצמד** ושומר ל-cache. מסמך שכבר
+#              הוצמד ותוכנו השתנה — לא מוצמד מחדש: ה-sha256 המוצמד נשאר, ה-cache לא
+#              נדרס, ההורדה החדשה נשמרת כ-<id>.unreviewed-<sha8> והסקריפט נכשל
+#              (הצמדה-מחדש = החלטה מתועדת אחרי קריאת ה-Change Tracking; 2026-11-15). שדה revision נעוץ ידנית מעמוד
 #              השער של המפרט (מזהה vYYYYMMDD) — ראו docs/17 SV; sha256 הוא עוגן
 #              השלמות האמיתי, ושינוי גרסה ממילא משנה sha256 וייתפס ב---verify.
 #   --verify:   בודק שה-sha256 הקיים עדיין תואם (ל-CI), בלי לשנות את המניפסט.
@@ -39,23 +42,31 @@ for i in $(seq 0 $((count-1))); do
   fi
 
   out="$cache/$id"
+  dl="$(mktemp)"
   echo "• $id ← $host"
-  if ! curl -fsSL "$url" -o "$out"; then
-    echo "  ✖ הורדה נכשלה" >&2; rc=1; continue
+  if ! curl -fsSL "$url" -o "$dl"; then
+    echo "  ✖ הורדה נכשלה" >&2; rc=1; rm -f "$dl"; continue
   fi
-  digest="$(sha < "$out")"
+  digest="$(sha < "$dl")"
   have="$(jq -r ".documents[$i].sha256 // empty" "$manifest")"
 
+  if [ -n "$have" ] && [ "$have" != "$digest" ]; then
+    # Pinned and changed upstream: never re-pin silently, never overwrite the
+    # pinned copy in the cache (both modes).
+    keep="$cache/$id.unreviewed-${digest:0:8}"
+    mv "$dl" "$keep"
+    echo "  ✖ sha256 השתנה! מוצמד=$have נוכחי=$digest — נשמר ל-$keep לסקירה; ההצמדה לא שונתה" >&2
+    rc=1; continue
+  fi
+  mv "$dl" "$out"
   if [ "$mode" = "--verify" ]; then
-    if [ -n "$have" ] && [ "$have" != "$digest" ]; then
-      echo "  ✖ sha256 השתנה! מוצמד=$have נוכחי=$digest" >&2; rc=1
-    else
-      echo "  ✓ תואם"
-    fi
-  else
+    echo "  ✓ תואם"
+  elif [ -z "$have" ]; then
     tmp2="$(mktemp)"
     jq --arg d "$digest" ".documents[$i].sha256 = \$d" "$tmp" > "$tmp2" && mv "$tmp2" "$tmp"
-    echo "  sha256=$digest"
+    echo "  sha256=$digest (הוצמד לראשונה)"
+  else
+    echo "  ✓ תואם"
   fi
 done
 

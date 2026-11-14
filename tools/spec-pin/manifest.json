@@ -1,7 +1,7 @@
 {
   "_comment": "ספריית המפרטים המוצמדת (specs/SOURCES.md §D, docs/17 SV-*). revision+sha256 ממולאים ע\"י scripts/pin-specs.sh. ללא הצמדה — אין לכתוב קוד מהמסמך (AGENTS.md).",
   "ms_openspec_pdf_host": "https://winprotocoldoc.z19.web.core.windows.net",
-  "generated_at": "2026-11-07T18:11:43Z",
+  "generated_at": "2026-11-14T23:29:52Z",
   "documents": [
     {
       "id": "MS-ADTS",
@@ -34,8 +34,8 @@
       "title": "Kerberos Protocol Extensions",
       "kind": "ms-openspec",
       "url": "https://winprotocoldoc.z19.web.core.windows.net/MS-KILE/%5bMS-KILE%5d.pdf",
-      "revision": "v20260928 (2026-09-28)",
-      "sha256": "8d172e6fb7b760812fba2e41b1bb591dc80fcfce441419153cc93622456e7a01",
+      "revision": "v20261110 (2026-11-10)",
+      "sha256": "58b84892bab847584e549c765beedf2754ac211fda752f9635f3721bd3a4e3c7",
       "phase": "1-2",
       "blocks": [
         "SV-2"
@@ -171,6 +171,16 @@
       "url": "https://www.rfc-editor.org/rfc/rfc4120.txt",
       "revision": "RFC4120",
       "sha256": "368d3cd1a4248e361799e3ebb2dbd124ec4fb14651e2188b77b392b66463f75b",
+      "phase": "1",
+      "blocks": []
+    },
+    {
+      "id": "RFC3244",
+      "title": "Microsoft Windows 2000 Kerberos Change Password and Set Password Protocols",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc3244.txt",
+      "revision": "RFC3244",
+      "sha256": "45b9130ff5488beb7244b38d737b061f8a473e7fb0e56028b04445b180dec378",
       "phase": "1",
       "blocks": []
     },
