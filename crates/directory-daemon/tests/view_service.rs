@@ -46,7 +46,7 @@ fn realm() -> Realm {
 
 /// The kdc's client of `dird` (the test is the kdc and runs as dird's uid).
 fn client(dird: &Dird, uid: u32, version: u64) -> DirectoryClient<connector::DirdConnector> {
-    DirectoryClient::new(
+    DirectoryClient::connect(
         connector::dird(&dird.socket),
         uid,
         ipc_directory::DEFAULT_DEADLINE,
@@ -111,12 +111,19 @@ fn a_peer_that_is_not_the_kdc_is_closed_without_a_reply() {
     let _ = raw.read_to_end(&mut octets);
     assert!(octets.is_empty(), "no reply to a refused peer");
     assert!(refused_peer_count() > before);
-    let mut kdc_side = client(&w.dird, w.uid, 1);
+    // The kdc's client of such a dird: its start-time DescribeDomain is
+    // closed unanswered — no client (task R9).
+    let kdc_side = DirectoryClient::connect(
+        connector::dird(&w.dird.socket),
+        w.uid,
+        ipc_directory::DEFAULT_DEADLINE,
+        PolicyVersion(1),
+    );
     assert!(matches!(
-        kdc_side.begin_view().err(),
-        Some(Unserved::Transport(
+        kdc_side.err(),
+        Some(ipc_directory::ConnectError::Unserved(Unserved::Transport(
             TransportError::Closed | TransportError::Io
-        ))
+        )))
     ));
 }
 
@@ -293,11 +300,20 @@ fn describe_domain_ping_and_the_policy_version() {
         &support::guid(support::KRBTGT).to_packet()
     );
     assert_eq!(kdc_side.ping(), Ok(()));
-    let mut other_version = client(&w.dird, w.uid, 2);
+    // A kdc of another policy version gets no client at all (task R9: its
+    // start-time DescribeDomain is refused).
+    let other_version = DirectoryClient::connect(
+        connector::dird(&w.dird.socket),
+        w.uid,
+        ipc_directory::DEFAULT_DEADLINE,
+        PolicyVersion(2),
+    );
     assert_eq!(
-        other_version.begin_view().err(),
-        Some(Unserved::PolicyVersionMismatch {
-            dird: PolicyVersion(1)
-        })
+        other_version.err(),
+        Some(ipc_directory::ConnectError::Unserved(
+            Unserved::PolicyVersionMismatch {
+                dird: PolicyVersion(1)
+            }
+        ))
     );
 }

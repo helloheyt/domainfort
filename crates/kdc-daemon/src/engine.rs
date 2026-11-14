@@ -10,10 +10,11 @@
 //!
 //! 1. the snapshot of the loaded policy (`policy_store`; a refused policy
 //!    cannot reach here — it was refused at load);
-//! 2. keyd: `IpcKeyd::connect` through the connector — the server uid
-//!    checked before anything is sent (R50-3), then `DescribeConfig`, whose
-//!    caller role must be `Kdc` (Q-351);
-//! 3. dird: `DirectoryClient` (server uid checked, R50-3) →
+//! 2. keyd: `IpcKeyd::connect` through a client that expects the caller
+//!    role `Kdc` (task R9, Q-466) — the server uid checked before anything
+//!    is sent (R50-3), the role by the connection's `Ping` probe — then
+//!    `DescribeConfig`, whose caller role must be `Kdc` too (Q-351);
+//! 3. dird: `DirectoryClient::connect` (server uid checked, R50-3) →
 //!    `DescribeDomain` → the realm and the krbtgt handle (§3.4, §7.5);
 //! 4. **the policy version**: dird's must equal the version of the policy
 //!    the kdc loaded (R50-2, §3.4, §7.2), else the daemon does not start;
@@ -26,7 +27,7 @@
 //! # Every new connection repeats the start checks (Q-311, Q-351)
 //!
 //! The keyd description and caller role (`IpcKeyd::connect`) and the
-//! domain description (`DirectoryClient::require_domain`) the engine started
+//! domain description (pinned by `DirectoryClient::connect`) the engine started
 //! from are required of **every new connection** the clients open later —
 //! after keyd or dird was restarted, say — before anything else is sent on
 //! it: keyd's `DescribeConfig` (callable only by the Kdc and Ldap roles)
@@ -77,8 +78,8 @@ use crate::queues::{Answer, RequestQueues, Work};
 use crate::rate::ObligationLimiter;
 use core::fmt;
 use core::time::Duration;
-use ipc_directory::{DirectoryClient, UnavailableDirectory, Unserved};
-use ipc_keyd::{IpcKeyd, KeydClient};
+use ipc_directory::{ConnectError, DirectoryClient, UnavailableDirectory, Unserved};
+use ipc_keyd::{ExpectedPeer, IpcKeyd, KeydClient, Role};
 use kdc::{Kdc, KdcConfig, KdcReply, Peer, PolicyInputs};
 use krb_proto::KerberosTime;
 use pdp::{PolicySnapshot, PolicyVersion};
@@ -186,22 +187,24 @@ where
     pub(crate) fn start(setup: EngineSetup<KC, DC, C>) -> Result<Self, StartError> {
         let snapshot = setup.policy.snapshot().map_err(StartError::Policy)?;
         let version = snapshot.version();
-        let client = KeydClient::new(setup.keyd, setup.keyd_uid, setup.keyd_deadline)
-            .map_err(|_| StartError::KeydUid)?;
+        // Task R9: the client expects keyd to give this process the Kdc role
+        // on every connection (`IpcKeyd::connect` then adds the description).
+        let peer = ExpectedPeer::new(setup.keyd_uid, Role::Kdc).map_err(|_| StartError::KeydUid)?;
+        let client = KeydClient::new(setup.keyd, peer, setup.keyd_deadline);
         let custody = IpcKeyd::connect(client).map_err(StartError::Keyd)?;
-        let mut directory =
-            DirectoryClient::new(setup.dird, setup.dird_uid, setup.dird_deadline, version)
-                .map_err(|_| StartError::DirdUid)?;
-        let domain = directory.describe_domain().map_err(StartError::Dird)?;
-        if domain.policy_version != version {
-            return Err(StartError::PolicyVersionMismatch {
-                kdc: version,
-                dird: domain.policy_version,
-            });
-        }
-        // Q-311: every later dird connection must describe the same domain
-        // (keyd's description is required by `IpcKeyd::connect`).
-        directory.require_domain(domain.clone());
+        // Q-311 / task R9: the client exists only with dird's domain pinned
+        // — every later dird connection must describe the same domain
+        // (keyd's description is expected by `IpcKeyd::connect`).
+        let directory =
+            DirectoryClient::connect(setup.dird, setup.dird_uid, setup.dird_deadline, version)
+                .map_err(|error| match error {
+                    ConnectError::Config(_) => StartError::DirdUid,
+                    ConnectError::Unserved(Unserved::PolicyVersionMismatch { dird }) => {
+                        StartError::PolicyVersionMismatch { kdc: version, dird }
+                    }
+                    ConnectError::Unserved(unserved) => StartError::Dird(unserved),
+                })?;
+        let domain = directory.domain().clone();
         let mut config = KdcConfig::new(domain.realm, domain.krbtgt);
         config.udp_max_reply_len = setup.udp_max_reply_len;
         let kdc = Kdc::new(

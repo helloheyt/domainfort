@@ -432,14 +432,17 @@ pub fn admin_params(
         let path = endpoint.socket().as_path().to_path_buf();
         let uid = endpoint.uid();
         let factory: VerifierFactory = Arc::new(move || {
-            let client = ipc_keyd::KeydClient::new(
-                ipc_keyd::UnixConnector::new(path.clone()),
-                uid,
-                ipc_keyd::DEFAULT_DEADLINE,
-            )
-            .ok()?;
-            let verifier: Box<dyn TicketVerifier> =
-                Box::new(KeydTicketVerifier::new(client, realm.clone()));
+            // Task R9: keyd's uid, the role Ldap and dird's realm, expected
+            // of every keyd connection.
+            let verifier: Box<dyn TicketVerifier> = Box::new(
+                KeydTicketVerifier::new(
+                    ipc_keyd::UnixConnector::new(path.clone()),
+                    uid,
+                    realm.clone(),
+                    ipc_keyd::DEFAULT_DEADLINE,
+                )
+                .ok()?,
+            );
             Some(verifier)
         });
         factory

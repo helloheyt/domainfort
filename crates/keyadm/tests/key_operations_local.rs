@@ -264,7 +264,8 @@ fn every_keyd_fate_is_reported() {
 #[test]
 fn the_sweep_runs_only_keyds_decisions_across_pages() {
     let mut keyd = ScriptedKeyd::default();
-    keyd.answers.push_back(Ok(Answer::Ping(Ok(()))));
+    keyd.answers
+        .push_back(Ok(Answer::Ping(Ok(keyd_types::Role::Admin))));
     keyd.answers
         .push_back(page(&[entry(10, 1), entry(11, 2)], Some(11)));
     keyd.answers.push_back(Ok(Answer::DestroyKeySet(Ok(()))));
@@ -301,7 +302,8 @@ fn the_sweep_runs_only_keyds_decisions_across_pages() {
 #[test]
 fn unavailable_stops_the_sweep_for_a_retry() {
     let mut keyd = ScriptedKeyd::default();
-    keyd.answers.push_back(Ok(Answer::Ping(Ok(()))));
+    keyd.answers
+        .push_back(Ok(Answer::Ping(Ok(keyd_types::Role::Admin))));
     keyd.answers
         .push_back(page(&[entry(10, 1), entry(11, 2)], None));
     keyd.answers.push_back(failure(
@@ -340,7 +342,8 @@ fn unavailable_stops_the_sweep_for_a_retry() {
 #[test]
 fn the_sweep_is_bounded_and_fails_closed() {
     let mut keyd = ScriptedKeyd::default();
-    keyd.answers.push_back(Ok(Answer::Ping(Ok(()))));
+    keyd.answers
+        .push_back(Ok(Answer::Ping(Ok(keyd_types::Role::Admin))));
     keyd.answers.push_back(page(&[], Some(8)));
     keyd.answers.push_back(page(&[], Some(8)));
     let report = sweep::run(&mut keyd);
@@ -348,7 +351,8 @@ fn the_sweep_is_bounded_and_fails_closed() {
     assert_eq!(keyd.asked.len(), 3);
 
     let mut keyd = ScriptedKeyd::default();
-    keyd.answers.push_back(Ok(Answer::Ping(Ok(()))));
+    keyd.answers
+        .push_back(Ok(Answer::Ping(Ok(keyd_types::Role::Admin))));
     keyd.answers
         .push_back(Ok(Answer::ListDestroyDecisions(Err(KeydError::Denied))));
     let report = sweep::run(&mut keyd);

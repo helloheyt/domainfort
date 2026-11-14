@@ -1138,14 +1138,15 @@ fn start_dird(
     let keyd_socket = keyd_socket.to_path_buf();
     let refuse_decisions = options.refuse_decisions;
     let factory: VerifierFactory = Arc::new(move || {
-        let client = ipc_keyd::KeydClient::new(
-            support::connector::keyd(&keyd_socket),
-            uid,
-            ipc_keyd::DEFAULT_DEADLINE,
-        )
-        .ok()?;
-        let verifier: Box<dyn TicketVerifier> =
-            Box::new(KeydTicketVerifier::new(client, realm.clone()));
+        let verifier: Box<dyn TicketVerifier> = Box::new(
+            KeydTicketVerifier::new(
+                support::connector::keyd(&keyd_socket),
+                uid,
+                realm.clone(),
+                ipc_keyd::DEFAULT_DEADLINE,
+            )
+            .ok()?,
+        );
         if refuse_decisions {
             let refusing: Box<dyn TicketVerifier> = Box::new(RefusingDecisions(verifier));
             return Some(refusing);
@@ -1258,27 +1259,28 @@ impl World {
         })
     }
 
-    /// A keyd client on `socket` (the test's uid, keyd's uid checked).
+    /// A keyd client on `socket` (the test's uid, keyd's uid checked), that
+    /// expects keyd to resolve it to `role` (task R9).
     fn keyd_client(
         &self,
         socket: &Path,
+        role: keyd::Role,
     ) -> ipc_keyd::KeydClient<support::connector::KeydConnector> {
         ipc_keyd::KeydClient::new(
             support::connector::keyd(socket),
-            self.uid,
+            ipc_keyd::ExpectedPeer::new(self.uid, role).unwrap(),
             ipc_keyd::DEFAULT_DEADLINE,
         )
-        .unwrap()
     }
 
     /// keyadm's view of keyd (Role::Admin).
     fn keyadm(&self) -> ipc_keyd::KeydClient<support::connector::KeydConnector> {
-        self.keyd_client(&self.keyd_admin_socket)
+        self.keyd_client(&self.keyd_admin_socket, keyd::Role::Admin)
     }
 
     /// admind's view of keyd (Role::Directory).
     fn admind_keyd(&self) -> ipc_keyd::KeydClient<support::connector::KeydConnector> {
-        self.keyd_client(&self.keyd_directory_socket)
+        self.keyd_client(&self.keyd_directory_socket, keyd::Role::Directory)
     }
 
     /// Stop keyd and start it again on the same sockets and auditd, built by
@@ -2254,13 +2256,14 @@ fn without_the_admin_service_object_dird_serves_on() {
     };
     assert!(!world.admin_socket.exists());
     assert!(matches!(world.client().ping(), Err(Unserved::Transport(_))));
-    let mut directory = ipc_directory::DirectoryClient::new(
+    let mut directory = ipc_directory::DirectoryClient::connect(
         support::connector::dird(&world.kdc_socket),
         world.uid,
         ipc_directory::DEFAULT_DEADLINE,
         PolicyVersion(1),
     )
     .unwrap();
+    assert_eq!(directory.domain().realm, common::realm());
     let domain = directory.describe_domain().unwrap();
     assert_eq!(domain.realm, common::realm());
 }
@@ -2328,7 +2331,7 @@ fn rotate_krbtgt_request_approve_registers_the_decision() {
     let mut keyadm = world.keyadm();
     assert_eq!(
         keyadm.rotate_krbtgt(DecisionId::new(id)),
-        Err(keyd::Error::Denied)
+        Ok(Err(keyd::Error::Denied))
     );
     // An approval naming another operation is refused (the digest binds).
     assert_eq!(
@@ -2361,8 +2364,14 @@ fn rotate_krbtgt_request_approve_registers_the_decision() {
     );
     // keyadm executes the decision by the request's id; a replay returns
     // the recorded kvno (docs/52 §3.10 (a)).
-    assert_eq!(keyadm.rotate_krbtgt(DecisionId::new(id)), Ok(Kvno::new(2)));
-    assert_eq!(keyadm.rotate_krbtgt(DecisionId::new(id)), Ok(Kvno::new(2)));
+    assert_eq!(
+        keyadm.rotate_krbtgt(DecisionId::new(id)),
+        Ok(Ok(Kvno::new(2)))
+    );
+    assert_eq!(
+        keyadm.rotate_krbtgt(DecisionId::new(id)),
+        Ok(Ok(Kvno::new(2)))
+    );
     assert_eq!(change_seq_next(&world.store), seq, "nothing written");
 
     // dird's trail: the completing approval's decision, then the
@@ -2448,8 +2457,8 @@ fn rotate_key_and_retire_kvno_decisions_are_executed_by_id() {
             .unwrap(),
     );
     let id = DecisionId::new(state.id);
-    assert_eq!(keyadm.retire_kvno(id), Err(keyd::Error::Denied));
-    assert_eq!(keyadm.rotate_key(id), Ok(Kvno::new(2)));
+    assert_eq!(keyadm.retire_kvno(id), Ok(Err(keyd::Error::Denied)));
+    assert_eq!(keyadm.rotate_key(id), Ok(Ok(Kvno::new(2))));
     // Not a service object (a user), and a kvno 0 to retire.
     for operation in [
         KeyOperation::RotateKey { service: g(BOB) },
@@ -2474,7 +2483,7 @@ fn rotate_key_and_retire_kvno_decisions_are_executed_by_id() {
             .call(&approve_op("admin2", state.id, retire))
             .unwrap(),
     );
-    assert_eq!(keyadm.retire_kvno(DecisionId::new(state.id)), Ok(()));
+    assert_eq!(keyadm.retire_kvno(DecisionId::new(state.id)), Ok(Ok(())));
     let approvals = await_events(&world, DirAdminOperation::Approve, 4);
     assert_eq!(
         approvals[1].stage,
@@ -2521,8 +2530,8 @@ fn the_admin_service_key_is_rotated_and_retired_through_the_admin_plane() {
         assert!(approved.approved());
         ids.push(DecisionId::new(state.id));
     }
-    assert_eq!(keyadm.rotate_key(ids[0]), Ok(Kvno::new(2)));
-    assert_eq!(keyadm.retire_kvno(ids[1]), Ok(()));
+    assert_eq!(keyadm.rotate_key(ids[0]), Ok(Ok(Kvno::new(2))));
+    assert_eq!(keyadm.retire_kvno(ids[1]), Ok(Ok(())));
     // keyd's trail: both registrations and both executions name the admin
     // service's own key set.
     for op in [
@@ -2585,7 +2594,7 @@ fn a_decision_keyd_does_not_register_withdraws_the_approval() {
     }
     assert_eq!(
         world.keyadm().rotate_krbtgt(DecisionId::new(state.id)),
-        Err(keyd::Error::Denied)
+        Ok(Err(keyd::Error::Denied))
     );
     let approvals = await_events(&world, DirAdminOperation::Approve, 4);
     assert_eq!(decision(&approvals[0]), PROCEED);
@@ -2671,7 +2680,7 @@ fn approvals_must_be_distinct_and_allowed() {
     // Nothing was approved: keyd holds no decision (A-102).
     assert_eq!(
         world.keyadm().rotate_krbtgt(DecisionId::new(state.id)),
-        Err(keyd::Error::Denied)
+        Ok(Err(keyd::Error::Denied))
     );
     let approvals = await_events(&world, DirAdminOperation::Approve, 3);
     assert_eq!(
@@ -2850,7 +2859,7 @@ fn a_delete_registers_a_destroy_decision_for_the_tombstone() {
             zeroize::Zeroizing::new(String::from("bob's first password")),
             set.salt.as_str(),
         ),
-        Ok(Kvno::new(1))
+        Ok(Ok(Kvno::new(1)))
     );
     assert_eq!(
         client
@@ -2879,7 +2888,10 @@ fn a_delete_registers_a_destroy_decision_for_the_tombstone() {
     );
     assert_eq!(listed.entries[0].decision, destroy_decision_id(g(BOB)));
     assert_eq!(listed.next, None);
-    assert_eq!(keyadm.destroy_key_set(listed.entries[0].decision), Ok(()));
+    assert_eq!(
+        keyadm.destroy_key_set(listed.entries[0].decision),
+        Ok(Ok(()))
+    );
     assert!(keyadm
         .list_destroy_decisions(None)
         .unwrap()
@@ -3011,7 +3023,7 @@ fn begin_password_set_registers_the_decision_for_its_key_targets() {
             password(),
             "EXAMPLE.ORGother"
         ),
-        Err(keyd::Error::Denied)
+        Ok(Err(keyd::Error::Denied))
     );
     assert_eq!(
         admind.set_secret(
@@ -3020,7 +3032,7 @@ fn begin_password_set_registers_the_decision_for_its_key_targets() {
             password(),
             set.salt.as_str()
         ),
-        Err(keyd::Error::Denied)
+        Ok(Err(keyd::Error::Denied))
     );
     let Reply::PasswordSet(set) = client
         .call(&by(
@@ -3039,7 +3051,7 @@ fn begin_password_set_registers_the_decision_for_its_key_targets() {
             password(),
             set.salt.as_str()
         ),
-        Ok(Kvno::new(1))
+        Ok(Ok(Kvno::new(1)))
     );
 }
 
@@ -3181,7 +3193,7 @@ fn lost_destroy_decisions_are_registered_again_until_keyd_ran_them() {
                 zeroize::Zeroizing::new(String::from("ws7's machine password")),
                 set.salt.as_str(),
             ),
-            Ok(Kvno::new(1))
+            Ok(Ok(Kvno::new(1)))
         );
     }
     let ws7_principal = keyd::PrincipalId::from_bytes(ws7.to_packet());
@@ -3291,7 +3303,7 @@ fn give_bob_a_key_set(world: &World) {
             zeroize::Zeroizing::new(String::from("bob's first password")),
             set.salt.as_str(),
         ),
-        Ok(Kvno::new(1))
+        Ok(Ok(Kvno::new(1)))
     );
 }
 
@@ -3452,7 +3464,7 @@ fn a_password_set_begun_before_the_delete_creates_no_key_set() {
             zeroize::Zeroizing::new(String::from("bob's first password")),
             set.salt.as_str(),
         ),
-        Err(keyd::Error::Denied)
+        Ok(Err(keyd::Error::Denied))
     );
     let set_secret_refused = || {
         world

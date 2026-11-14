@@ -7,10 +7,11 @@
 //!   connection serves the request; inside a view (whose state lived on the
 //!   dropped connection) the query fails `Unavailable` without being sent; a
 //!   request that failed after it was sent is never sent again.
-//! * **Q-311** — with `require_domain` (the kdc's start-time description,
-//!   A-69), every new connection must answer `DescribeDomain` with the same
-//!   realm, naming context, krbtgt handle and policy version before anything
-//!   else is sent on it.
+//! * **Q-311** (task R9: always) — the client exists only with the domain
+//!   its start-time `DescribeDomain` gave (`DirectoryClient::connect`, A-69);
+//!   every new connection must answer `DescribeDomain` with the same realm,
+//!   naming context, krbtgt handle and policy version before anything else
+//!   is sent on it.
 //!
 //! Tier 1 drives the client over a scripted in-process connection; tier 2
 //! over real Unix stream sockets in a private (0700) temporary directory
@@ -21,8 +22,8 @@
 //!
 //! Sources: docs/50 R50-2, R50-3, R50-7, R50-8, §3.3, §3.4 (views,
 //! `DescribeDomain`), §3.6 (idle connections held; one deadline per call),
-//! §3.7, §7.5 step 4, §9; A-69; docs/questions/Q-311, Q-312 (A-82). Every
-//! value is hand-made (tests/common).
+//! §3.7, §7.5 step 4, §9; A-69; docs/questions/Q-311, Q-312 (A-82), Q-466
+//! (A-102). Every value is hand-made (tests/common).
 #![cfg(unix)]
 
 mod common;
@@ -131,15 +132,19 @@ impl Connection for ScriptConnection {
     }
 }
 
+/// A client connected to the scripted dird: connection 0 carried the
+/// start-time `DescribeDomain`, answered with [`domain`] (task R9).
 fn scripted() -> (Rc<RefCell<Script>>, DirectoryClient<ScriptConnector>) {
     let script = Rc::new(RefCell::new(Script::default()));
-    let client = DirectoryClient::new(
+    reply(&script, DirectoryReply::from_domain(&domain()));
+    let client = DirectoryClient::connect(
         ScriptConnector(Rc::clone(&script)),
         DIRD_UID,
         Duration::from_secs(2),
         VERSION,
     )
     .unwrap();
+    assert_eq!(carried(&script, 0), [Kind::DescribeDomain]);
     (script, client)
 }
 
@@ -172,12 +177,20 @@ fn a_held_connection_failing_its_idle_check_is_replaced_before_begin_view() {
         reply(&script, DirectoryReply::Pong);
         assert_eq!(client.ping(), Ok(()));
         script.borrow_mut().stale.insert(0, failure);
+        reply(&script, DirectoryReply::from_domain(&domain()));
         reply(&script, begun(1));
         reply(&script, DirectoryReply::ViewEnded);
         let view = client.begin_view().expect("served on a fresh connection");
         drop(view);
-        assert_eq!(carried(&script, 0), [Kind::Ping], "{failure:?}");
-        assert_eq!(carried(&script, 1), [Kind::BeginView, Kind::EndView]);
+        assert_eq!(
+            carried(&script, 0),
+            [Kind::DescribeDomain, Kind::Ping],
+            "{failure:?}"
+        );
+        assert_eq!(
+            carried(&script, 1),
+            [Kind::DescribeDomain, Kind::BeginView, Kind::EndView]
+        );
     }
 }
 
@@ -198,7 +211,11 @@ fn inside_a_view_a_stale_connection_fails_the_query_without_sending_it() {
     assert!(!view.is_open());
     drop(view);
     assert_eq!(script.borrow().carried.len(), 1, "no new connection");
-    assert_eq!(carried(&script, 0), [Kind::BeginView], "nothing more sent");
+    assert_eq!(
+        carried(&script, 0),
+        [Kind::DescribeDomain, Kind::BeginView],
+        "nothing more sent"
+    );
     assert!(!client.is_connected());
 }
 
@@ -213,7 +230,11 @@ fn a_request_that_failed_after_it_was_sent_is_not_sent_again() {
         assert_eq!(client.ping(), Err(Unserved::Transport(failure)));
         assert!(!client.is_connected());
         assert_eq!(script.borrow().carried.len(), 1);
-        assert_eq!(carried(&script, 0), [Kind::Ping], "sent once");
+        assert_eq!(
+            carried(&script, 0),
+            [Kind::DescribeDomain, Kind::Ping],
+            "sent once"
+        );
     }
 }
 
@@ -224,13 +245,12 @@ fn changed(edit: impl FnOnce(&mut DomainDescription)) -> DomainDescription {
     domain
 }
 
-/// docs/50 R50-2, §3.4, §7.5 step 4; A-69; Q-311 (A-82): with the kdc's
-/// start-time description required, a new connection whose
-/// `DescribeDomain` answers another policy version is
-/// `PolicyVersionMismatch`, another realm / naming context / krbtgt handle
-/// `PeerMismatch` — dropped, with nothing but `DescribeDomain` sent on it;
-/// the same description lets the request through, and that connection is
-/// reused without asking again.
+/// docs/50 R50-2, §3.4, §7.5 step 4; A-69; Q-311 (A-82), Q-466 (task R9:
+/// always): a new connection whose `DescribeDomain` answers another policy
+/// version than the pinned domain's is `PolicyVersionMismatch`, another
+/// realm / naming context / krbtgt handle `PeerMismatch` — dropped, with
+/// nothing but `DescribeDomain` sent on it; the same description lets the
+/// request through, and that connection is reused without asking again.
 #[test]
 fn every_new_connection_must_describe_the_same_domain() {
     let refusals = [
@@ -260,16 +280,16 @@ fn every_new_connection_must_describe_the_same_domain() {
     ];
     for (n, (other, expected)) in refusals.into_iter().enumerate() {
         let (script, mut client) = scripted();
-        client.require_domain(domain());
+        script.borrow_mut().stale.insert(0, TransportError::Closed);
         reply(&script, DirectoryReply::from_domain(&other));
         assert_eq!(client.begin_view().err(), Some(expected), "{n}");
         assert!(!client.is_connected());
-        assert_eq!(carried(&script, 0), [Kind::DescribeDomain], "{n}");
+        assert_eq!(carried(&script, 1), [Kind::DescribeDomain], "{n}");
     }
 
     let (script, mut client) = scripted();
-    client.require_domain(domain());
-    assert_eq!(client.required_domain(), Some(&domain()));
+    assert_eq!(client.domain(), &domain());
+    script.borrow_mut().stale.insert(0, TransportError::Closed);
     reply(&script, DirectoryReply::from_domain(&domain()));
     reply(&script, begun(1));
     reply(&script, DirectoryReply::ViewEnded);
@@ -277,9 +297,9 @@ fn every_new_connection_must_describe_the_same_domain() {
     reply(&script, begun(2));
     reply(&script, DirectoryReply::ViewEnded);
     drop(client.begin_view().unwrap());
-    assert_eq!(script.borrow().carried.len(), 1);
+    assert_eq!(script.borrow().carried.len(), 2);
     assert_eq!(
-        carried(&script, 0),
+        carried(&script, 1),
         [
             Kind::DescribeDomain,
             Kind::BeginView,
@@ -295,7 +315,7 @@ fn every_new_connection_must_describe_the_same_domain() {
 #[test]
 fn a_failed_describe_domain_is_not_served() {
     let (script, mut client) = scripted();
-    client.require_domain(domain());
+    script.borrow_mut().stale.insert(0, TransportError::Closed);
     reply(
         &script,
         DirectoryReply::ViewFailure(ipc_directory::ViewFailure::Snapshot),
@@ -309,8 +329,8 @@ fn a_failed_describe_domain_is_not_served() {
         client.begin_view().err(),
         Some(Unserved::Transport(TransportError::Closed))
     );
-    assert_eq!(carried(&script, 0), [Kind::DescribeDomain]);
     assert_eq!(carried(&script, 1), [Kind::DescribeDomain]);
+    assert_eq!(carried(&script, 2), [Kind::DescribeDomain]);
 }
 
 // ---- tier 2: real sockets -----------------------------------------------------------
@@ -358,8 +378,10 @@ impl Connection for SocketConnection {
     }
 }
 
+/// A client connected over the socket (its start-time `DescribeDomain`
+/// served by the scripted dird, task R9).
 fn socket_client(path: &Path) -> DirectoryClient<SocketConnector> {
-    DirectoryClient::new(
+    DirectoryClient::connect(
         SocketConnector {
             path: path.to_path_buf(),
         },
@@ -433,8 +455,7 @@ fn after_a_dird_restart_the_first_request_is_served_on_a_fresh_connection() {
         kind(&request)
     });
     let mut client = socket_client(&path);
-    let domain = client.describe_domain().unwrap();
-    client.require_domain(domain);
+    assert_eq!(client.domain(), &domain());
     stop.send(()).unwrap();
     assert_eq!(old.join().unwrap(), Kind::DescribeDomain);
     std::fs::remove_file(&path).unwrap();
@@ -465,8 +486,12 @@ fn a_frame_waiting_on_an_idle_connection_is_never_read_as_a_reply() {
     let (written, wait_written) = mpsc::channel();
     let server = thread::spawn(move || {
         let (mut first, _) = listener.accept().unwrap();
-        let request = read_request(&mut first).unwrap();
-        write_reply(&mut first, &reply_to(&request));
+        let mut on_first = Vec::new();
+        for _ in 0..2 {
+            let request = read_request(&mut first).unwrap();
+            write_reply(&mut first, &reply_to(&request));
+            on_first.push(kind(&request));
+        }
         write_reply(
             &mut first,
             &DirectoryReply::ViewBegun {
@@ -477,7 +502,7 @@ fn a_frame_waiting_on_an_idle_connection_is_never_read_as_a_reply() {
         written.send(()).unwrap();
         let on_second = serve(listener.accept().unwrap().0);
         let more_on_first = read_request(&mut first).map(|request| kind(&request));
-        (kind(&request), more_on_first, on_second)
+        (on_first, more_on_first, on_second)
     });
     let mut client = socket_client(&path);
     assert_eq!(client.ping(), Ok(()));
@@ -486,10 +511,13 @@ fn a_frame_waiting_on_an_idle_connection_is_never_read_as_a_reply() {
     assert_eq!(view.id(), 1);
     drop(view);
     drop(client);
-    let (first, more_on_first, on_second) = server.join().unwrap();
-    assert_eq!(first, Kind::Ping);
+    let (on_first, more_on_first, on_second) = server.join().unwrap();
+    assert_eq!(on_first, [Kind::DescribeDomain, Kind::Ping]);
     assert_eq!(more_on_first, None, "nothing more was sent on it");
-    assert_eq!(on_second, [Kind::BeginView, Kind::EndView]);
+    assert_eq!(
+        on_second,
+        [Kind::DescribeDomain, Kind::BeginView, Kind::EndView]
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -503,6 +531,9 @@ fn a_request_lost_after_it_was_sent_is_not_resent_over_a_socket() {
     let (gone, wait_gone) = mpsc::channel::<()>();
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
+        // The start-time DescribeDomain (task R9), served.
+        let describe = read_request(&mut stream).unwrap();
+        write_reply(&mut stream, &reply_to(&describe));
         let request = read_request(&mut stream).unwrap();
         drop(stream);
         listener.set_nonblocking(true).unwrap();

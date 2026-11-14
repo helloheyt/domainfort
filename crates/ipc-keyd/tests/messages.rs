@@ -2,16 +2,19 @@
 //! and reply, the documented kind tables, strict decoding (truncation,
 //! trailing octets, a one-octet mutation sweep), no secret in `Debug`, no
 //! `now` on the wire and no role in any request — and the one role the
-//! wire does carry, the caller role of the `DescribeConfig` reply (its
-//! closed table, its bounds, its refusal of unknown values).
+//! wire does carry, the caller role of the `DescribeConfig` and `Ping`
+//! replies (its closed table, its bounds, its refusal of unknown values);
+//! and the split of the calls into state calls and issuance calls by
+//! keyd's one table (task R9).
 //!
 //! Sources: docs/50 §3.3 (layout; "a single encoding per value"; "every
 //! decoder checks `encode(decode(b)) == b` in property tests"; Kerberos
 //! values decoded by krb-proto; secret-bearing buffers; no trailing byte;
 //! "enum = `u8` from a closed table"; bound before allocation), §3.4 (the
 //! keyd rows; "no `now` field in any request"), §8.2 (no secret in debug
-//! output), §9 tier 1; R50-3, R50-5; A-56; A-59; docs/10 §2 (`enum Role`);
-//! docs/questions/Q-351 (A-87).
+//! output), §9 tier 1; R50-3, R50-5; A-56; A-59; docs/10 §2 (`enum Role`),
+//! §10 (the key-state changes); docs/52 §3.10 (c); docs/questions/Q-351
+//! (A-87), Q-466 items 2-3 (A-102).
 
 mod samples;
 
@@ -22,8 +25,8 @@ use ipc::{
 use ipc_keyd::channel::{reply_kind, request_kind, MAX_ENCTYPES, MAX_REPLY_BODY, MAX_REPLY_FIELD};
 use ipc_keyd::wire::WireConfigDescription;
 use ipc_keyd::{
-    decode_request, encode_answer, Answer, Call, DescribedConfig, KeydReply, KeydRequest,
-    Rejection, KEYD_CHANNEL, KEYD_MAGIC, KEYD_VERSION,
+    decode_request, encode_answer, Answer, Call, DescribedConfig, IssuanceCall, KeydReply,
+    KeydRequest, Rejection, RoutedCall, StateCall, KEYD_CHANNEL, KEYD_MAGIC, KEYD_VERSION,
 };
 use keyd_types::{EncTypeId, Operation, Role, TicketPolicy};
 use std::collections::BTreeSet;
@@ -378,9 +381,10 @@ fn code_identifiers(source: &str) -> Vec<String> {
 ///   requests (from the field helpers to the replies section) — no request
 ///   can carry a role;
 /// * among the replies, role identifiers only for the caller role of the
-///   `DescribeConfig` reply (Q-351, A-87): exactly one field names a role in
-///   the whole file, `pub caller_role: Role`, and it is
-///   `WireConfigDescription`'s;
+///   `DescribeConfig` reply (Q-351, A-87) and of the `Ping` reply (task R9,
+///   Q-466 — the tuple variant `Ping(Role)`, no named field): exactly one
+///   field names a role in the whole file, `pub caller_role: Role`, and it
+///   is `WireConfigDescription`'s;
 ///
 /// and every time field encoded is a ticket fact or a template time — never
 /// a value handed to keyd as its `now`. The type-level argument: `dispatch`
@@ -544,6 +548,130 @@ fn an_unknown_caller_role_is_refused() {
         decode_reply::<KeydReply>(KEYD_CHANNEL, &extended),
         Err(ipc::Error::TrailingBytes)
     ));
+}
+
+// ---- the caller role of the Ping reply (task R9, Q-466 item 2) ------------
+
+/// docs/50 §3.3 (envelope `magic ‖ version ‖ kind ‖ payload`; "enum = `u8`
+/// from a closed table"; round trip), §3.4 (`Ping` — every role); docs/10
+/// §2, §7א; Q-466 item 2 (A-102: "caller role in Ping"): the `Ping` reply is
+/// the envelope (kind `0x90`) and one octet, the caller role, from the
+/// table of the `DescribeConfig` reply; each body decodes to that role and
+/// re-encodes to itself.
+#[test]
+fn the_ping_reply_carries_each_caller_role() {
+    for (role, code) in ROLE_CODES {
+        let body = reply_body(&Answer::Ping(Ok(role)));
+        assert_eq!(body, [0x4B, 0x44, 0x01, 0x90, code], "{role:?}");
+        assert_eq!(
+            reply_round_trip_is_canonical::<KeydReply>(KEYD_CHANNEL, &body),
+            Ok(true)
+        );
+        let Ok(Reply::Message(reply)) = decode_reply::<KeydReply>(KEYD_CHANNEL, &body) else {
+            panic!("a reply message ({role:?})");
+        };
+        assert_eq!(reply, KeydReply::Ping(role));
+        assert_eq!(
+            Answer::from_wire(Operation::Ping, reply),
+            Ok(Answer::Ping(Ok(role)))
+        );
+    }
+}
+
+/// docs/50 §3.3 (closed tables; "after the last field — exactly the end of
+/// the body"; replies decoded with the same strictness); Q-466 item 2: a
+/// `Ping` reply whose role octet is outside the table is refused
+/// (`UnknownCode`); one without it — the reply's earlier, empty form — is
+/// `Truncated`, and one with an octet after it `TrailingBytes`. A client
+/// never takes a `Ping` reply it cannot read as a role.
+#[test]
+fn an_unknown_ping_caller_role_is_refused() {
+    for code in 0..=u8::MAX {
+        let body = [0x4B, 0x44, 0x01, 0x90, code];
+        let decoded = decode_reply::<KeydReply>(KEYD_CHANNEL, &body);
+        if ROLE_CODES.iter().any(|(_, known)| *known == code) {
+            assert!(matches!(decoded, Ok(Reply::Message(KeydReply::Ping(_)))));
+        } else {
+            assert!(
+                matches!(decoded, Err(ipc::Error::UnknownCode)),
+                "{code:#04x}: {decoded:?}"
+            );
+        }
+    }
+    assert!(matches!(
+        decode_reply::<KeydReply>(KEYD_CHANNEL, &[0x4B, 0x44, 0x01, 0x90]),
+        Err(ipc::Error::Truncated)
+    ));
+    assert!(matches!(
+        decode_reply::<KeydReply>(KEYD_CHANNEL, &[0x4B, 0x44, 0x01, 0x90, 0x01, 0x01]),
+        Err(ipc::Error::TrailingBytes)
+    ));
+}
+
+// ---- state calls and issuance calls (task R9, Q-466 item 3) ---------------
+
+/// docs/10 §10 (the six key-state changes; `grant_set_secret` and
+/// `register_decision` loosen keyd and take the same audit path); docs/52
+/// §3.10 (c); Q-466 item 3 (A-102: "state calls only through call_with_fate
+/// by type"): for every call of every operation (tests/samples), the split
+/// follows keyd's one table — `keyd_types::authz::requires_acknowledged_intent`,
+/// the table keyd-daemon's classification reads — and the expected eight
+/// operations are exactly the state calls: an `IssuanceCall` (the only
+/// argument `KeydClient::call` takes) can be made of every other call and
+/// of none of these, a `StateCall` of these and of no other.
+#[test]
+fn the_state_calls_are_keyds_table_and_never_issuance_calls() {
+    let state_operations = [
+        Operation::SetSecret,
+        Operation::CreateKey,
+        Operation::RotateKey,
+        Operation::RotateKrbtgt,
+        Operation::RetireKvno,
+        Operation::DestroyKeySet,
+        Operation::GrantSetSecret,
+        Operation::RegisterDecision,
+    ];
+    for operation in Operation::ALL {
+        assert_eq!(
+            keyd_types::authz::requires_acknowledged_intent(operation),
+            state_operations.contains(&operation),
+            "{operation:?}"
+        );
+    }
+    let mut seen = BTreeSet::new();
+    // `Call` is not `Clone` (a password has no second copy): three fresh
+    // sample lists, in the same order.
+    let samples = samples::calls()
+        .into_iter()
+        .zip(samples::calls())
+        .zip(samples::calls());
+    for ((call, for_issuance), for_state) in samples {
+        let operation = call.operation();
+        seen.insert(format!("{operation:?}"));
+        let state = state_operations.contains(&operation);
+        assert_eq!(call.is_state_call(), state, "{operation:?}");
+        match IssuanceCall::new(for_issuance) {
+            Some(issuance) => {
+                assert!(!state, "{operation:?} became an IssuanceCall");
+                assert_eq!(issuance.into_call().operation(), operation);
+            }
+            None => assert!(state, "{operation:?} refused as an IssuanceCall"),
+        }
+        match StateCall::new(for_state) {
+            Some(state_call) => {
+                assert!(state, "{operation:?} became a StateCall");
+                assert_eq!(state_call.into_call().operation(), operation);
+            }
+            None => assert!(!state, "{operation:?} refused as a StateCall"),
+        }
+        match call.route() {
+            RoutedCall::State(routed) => assert!(state && routed.call().operation() == operation),
+            RoutedCall::Issuance(routed) => {
+                assert!(!state && routed.call().operation() == operation)
+            }
+        }
+    }
+    assert_eq!(seen.len(), Operation::ALL.len(), "every operation sampled");
 }
 
 /// docs/50 §3.3 (bound before allocation; `bytes<max>` and `seq<T,max>` over

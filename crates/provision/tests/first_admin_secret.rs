@@ -55,7 +55,9 @@ use std::time::Duration;
 
 use ipc::{FrameReader, Refused};
 use ipc_audit::{EventBody, KeyPurposeCode, KeydOperation, KeydOutcome, KeydRecord};
-use ipc_keyd::{ClientConfigError, KeydClient, TransportError, Unserved, DEFAULT_DEADLINE};
+use ipc_keyd::{
+    ClientConfigError, ExpectedPeer, KeydClient, TransportError, Unserved, DEFAULT_DEADLINE,
+};
 use keyd_daemon::startup::development_keyd;
 use keyd_daemon::{CallerMap, ExtraListener, SystemClock};
 use keyd_types::{Error as KeydError, Kvno};
@@ -167,6 +169,12 @@ mod connector {
         ) -> Result<Zeroizing<Vec<u8>>, TransportError> {
             self.inner.exchange(frame, reply_limit, deadline)
         }
+
+        /// The wrapped connection's own idle check (docs/questions/Q-312;
+        /// no default since task R9, Q-466 item 4).
+        fn check_idle(&mut self) -> Result<(), TransportError> {
+            self.inner.check_idle()
+        }
     }
 }
 
@@ -241,7 +249,13 @@ impl KeydAccess for TestKeyd {
         _settings: &config::AdmindSettings,
     ) -> Result<KeydClient<connector::KeydConnector>, ClientConfigError> {
         self.clients += 1;
-        KeydClient::new(connector::new(&self.socket), self.uid, self.deadline)
+        // The command runs as admind's account: keyd must resolve it to
+        // Role::Directory on every connection (task R9).
+        Ok(KeydClient::new(
+            connector::new(&self.socket),
+            ExpectedPeer::new(self.uid, keyd_types::Role::Directory)?,
+            self.deadline,
+        ))
     }
 }
 
@@ -358,10 +372,9 @@ impl World {
     fn ceremony(&self) -> keyadm::ceremony::CeremonyReport {
         let mut client = KeydClient::new(
             connector::new(&self.admin_socket),
-            self.uid,
+            ExpectedPeer::new(self.uid, keyd_types::Role::Admin).unwrap(),
             DEFAULT_DEADLINE,
-        )
-        .unwrap();
+        );
         keyadm::ceremony::run(&mut client, &self.manifest)
     }
 
@@ -465,8 +478,11 @@ impl World {
         let mut sealed = krb_proto::EncryptedData::decode(&padata.padata_value).unwrap();
         sealed.kvno = None;
         padata.padata_value = sealed.encode().unwrap();
-        let mut client =
-            KeydClient::new(connector::new(&self.kdc_socket), self.uid, DEFAULT_DEADLINE).unwrap();
+        let mut client = KeydClient::new(
+            connector::new(&self.kdc_socket),
+            ExpectedPeer::new(self.uid, keyd_types::Role::Kdc).unwrap(),
+            DEFAULT_DEADLINE,
+        );
         let handle = KeyHandle::new(
             admin.key_set().handle.principal,
             KeyPurpose::PrincipalLongterm,
@@ -637,10 +653,9 @@ fn a_second_run_is_refused_without_a_new_grant() {
     // keyadm cannot grant alice another initial secret: her key set exists.
     let mut admin = KeydClient::new(
         connector::new(&world.admin_socket),
-        world.uid,
+        ExpectedPeer::new(world.uid, keyd_types::Role::Admin).unwrap(),
         DEFAULT_DEADLINE,
-    )
-    .unwrap();
+    );
     let alice = world.manifest.first_admins()[0].key_set();
     assert_eq!(
         admin.grant_set_secret(
@@ -652,7 +667,7 @@ fn a_second_run_is_refused_without_a_new_grant() {
             }],
             keyd_types::MAX_INITIAL_SECRET_GRANT_SECS,
         ),
-        Err(KeydError::Denied)
+        Ok(Err(KeydError::Denied))
     );
     assert!(support::eventually(Duration::from_secs(10), || world
         .grant_records()
@@ -1144,7 +1159,10 @@ fn scripted_keyd(
             received.push(call.operation());
             match (&call, mode) {
                 (ipc_keyd::Call::Ping, _) => {
-                    let answer = ipc_keyd::Answer::Ping(Ok(()));
+                    // The caller role keyd resolves for the command
+                    // (task R9): the client's probe and its contact both
+                    // ping.
+                    let answer = ipc_keyd::Answer::Ping(Ok(keyd_types::Role::Directory));
                     stream
                         .write_all(ipc_keyd::encode_answer(&answer).unwrap().as_bytes())
                         .unwrap();
@@ -1188,7 +1206,11 @@ fn keyd_refusing_is_not_performed() {
     let _ = done.send(());
     assert_eq!(
         keyd_thread.join().unwrap(),
-        [keyd::Operation::Ping, keyd::Operation::SetSecret]
+        [
+            keyd::Operation::Ping,
+            keyd::Operation::Ping,
+            keyd::Operation::SetSecret
+        ]
     );
     assert_eq!(report.steps.len(), 1, "{report:?}");
     assert_eq!(
@@ -1231,7 +1253,11 @@ fn a_keyd_that_never_answers_is_outcome_unknown() {
     let _ = done.send(());
     assert_eq!(
         keyd_thread.join().unwrap(),
-        [keyd::Operation::Ping, keyd::Operation::SetSecret]
+        [
+            keyd::Operation::Ping,
+            keyd::Operation::Ping,
+            keyd::Operation::SetSecret
+        ]
     );
     assert_eq!(report.steps.len(), 1);
     assert_eq!(
@@ -1248,10 +1274,14 @@ fn a_keyd_that_never_answers_is_outcome_unknown() {
     world.stop();
 }
 
-/// docs/10 §2, §9 (Q-403): admind's account mapped to another role in keyd
-/// ⇒ keyd's uniform Denied at the first set_secret, explained.
+/// **Attack test** — docs/10 §2; docs/50 R50-3, §3.7; docs/52 §3.12 (C12);
+/// docs/questions/Q-403 option (c), Q-466 items 1-2 (A-102): admind's
+/// account mapped to **another role** in keyd is found by the `Ping` probe
+/// of the command's keyd connection, before anything else is sent: the
+/// contact fails as not sent (the peer is not the expected keyd), **no
+/// password is sent** (no step is attempted), explained.
 #[test]
-fn a_keyd_role_other_than_directory_is_denied() {
+fn a_keyd_giving_another_role_receives_no_password() {
     let Some(mut world) = world() else {
         return;
     };
@@ -1272,16 +1302,14 @@ fn a_keyd_role_other_than_directory_is_denied() {
     world.daemon = Some(daemon);
     let (result, _) = run_files(&world, &world.both_files(ALICE_PW, BOB_PW));
     let report = result.unwrap();
-    assert_eq!(
-        report.steps[0].outcome,
-        Outcome::Answered(Err(KeydError::Denied))
-    );
+    assert_eq!(report.contact, Outcome::NotSent(Unserved::PeerMismatch));
+    assert!(report.steps.is_empty(), "no set_secret was sent");
     let text = render(&report).join("\n");
     assert!(
-        text.contains("alice: keyd refused (denied); password not set"),
+        text.contains("keyd does not give this account Role::Directory"),
         "{text}"
     );
-    assert!(text.contains("mapped to Directory"), "{text}");
+    assert!(text.contains("no password was sent"), "{text}");
     world.stop();
 }
 

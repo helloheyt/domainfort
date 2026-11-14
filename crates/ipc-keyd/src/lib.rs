@@ -14,7 +14,7 @@
 //! | wire | [`wire`] | fixed-order fields through `ipc` (lengths, markers, closed enum tables, no trailing octet); Kerberos values stay opaque DER |
 //! | typed | [`typed`] | every Kerberos value through `krb-proto`'s strict decoder; passwords and salt as UTF-8 |
 //! | server | [`server`] | [`decode_request`] / [`encode_answer`]; `ipc_keyd_server::dispatch` calls keyd with the **transport's** caller and the **daemon's** clock between them |
-//! | client | [`client`] | [`KeydClient`] / [`IpcKeyd`]: server-uid check, deadline, strict reply decoding, transport failure → `Unavailable`; a held connection checked before reuse, no resend (Q-312); `IpcKeyd`: `DescribeConfig` — the same description and the caller role `Kdc` — required of every new connection (Q-311, Q-351); [`KeydClient::call_with_fate`]: not sent / not performed / outcome unknown (Q-367) |
+//! | client | [`client`] | [`KeydClient`] / [`IpcKeyd`]: built only with an [`ExpectedPeer`] — on every connection keyd's uid, then the caller role keyd resolves for this process (`Ping`, or `DescribeConfig` when a description is expected) before anything else is sent (task R9, Q-466); deadline, strict reply decoding, transport failure → `Unavailable`; a held connection checked before reuse (no default), no resend (Q-312); `IpcKeyd`: the description it started with expected of every new connection (Q-311, Q-351); a state call only through [`KeydClient::call_with_fate`] — not sent / not performed / outcome unknown (Q-367) — since [`KeydClient::call`] takes only an [`IssuanceCall`] |
 //! | socket | `unix` | [`UnixConnector`]: blocking Unix stream, peer uid via rustix (Linux; elsewhere fail closed), non-blocking idle check |
 //!
 //! # Message kinds
@@ -36,7 +36,7 @@
 //! | `0x0D` | `retire_kvno(decision)` | Admin | `0x8D` `()` | `0xF3` |
 //! | `0x0E` | `destroy_key_set(decision)` | Admin | `0x8E` `()` | `0xF3` |
 //! | `0x0F` | `describe_config` | Kdc, Ldap | `0x8F` `ConfigDescription` ‖ caller `Role` ([`DescribedConfig`]) | `0xF3` |
-//! | `0x10` | `ping` | every role | `0x90` `()` | `0xF3` |
+//! | `0x10` | `ping` | every role | `0x90` caller `Role` (task R9) | `0xF3` |
 //! | `0x11` | `grant_set_secret` (task A15a) | Admin (before the seal, A-102) | `0x91` `()` | `0xF3` |
 //! | `0x12` | `register_decision` (A-102) | Ldap | `0x92` `()` | `0xF3` |
 //! | `0x13` | `seal_ceremony` (A-102) | Admin | `0x93` `()` | `0xF3` |
@@ -45,11 +45,12 @@
 //!
 //! No request carries a role: keyd checks the caller's role from the
 //! connection's peer credentials (docs/50 §3.2) against its compile-time
-//! capability table (docs/10 §2, I2). The `describe_config` reply reports
-//! that role back to the caller — not secret, never taken from the peer —
-//! so that a client can refuse a keyd that does not give it its own role
-//! (docs/questions/Q-351, A-87). No message has a `now` field (R50-5,
-//! A-56): the server passes the daemon's own clock to every operation.
+//! capability table (docs/10 §2, I2). The `describe_config` and `ping`
+//! replies report that role back to the caller — not secret, never taken
+//! from the peer — so that a client of any role refuses a keyd that does
+//! not give it its own role (docs/questions/Q-351, A-87; Q-466, A-102). No
+//! message has a `now` field (R50-5, A-56): the server passes the daemon's
+//! own clock to every operation.
 //!
 //! # Security
 //!
@@ -76,9 +77,15 @@
 //! docs/50 §3.4-§3.7. Task A15a added `grant_set_secret` (request `0x11`,
 //! reply `0x91`; the additive client method `KeydClient::grant_set_secret`)
 //! from docs/51 §5.8, docs/questions Q-291 and PENDING-OWNER A-74, A-88.
+//! Task R9 made the peer expectation mandatory ([`ExpectedPeer`]), added
+//! the caller role to the `ping` reply, split the client's call API by
+//! kind ([`IssuanceCall`] / [`StateCall`], from keyd-types' one table) and
+//! removed `Connection::check_idle`'s default, from docs/52 §2 rows 18, 19,
+//! 24, §3.10, §3.12, §7 R9, docs/questions Q-312, Q-350, Q-370, Q-403,
+//! Q-466 and PENDING-OWNER A-82, A-90, A-94, A-102.
 //!
 //! Spec: docs/50 §3, §10 (P5); R50-3, R50-4, R50-5, R50-7, R50-8; docs/10;
-//! A-56; A-59; A-62; D182; A-63; A-87; A-88.
+//! A-56; A-59; A-62; D182; A-63; A-87; A-88; docs/52 §7 R9 (A-102).
 
 pub mod channel;
 pub mod client;
@@ -90,11 +97,17 @@ pub mod wire;
 
 pub use channel::{KEYD_CHANNEL, KEYD_MAGIC, KEYD_VERSION, REPLY_LIMIT, REQUEST_LIMIT};
 pub use client::{
-    CallFailure, ClientConfigError, Connection, Connector, IpcKeyd, KeydClient, RequestFate,
-    TransportError, Unserved, DEFAULT_DEADLINE,
+    CallFailure, ClientConfigError, Connection, Connector, ExpectedDescription, ExpectedPeer,
+    IpcKeyd, KeydClient, RequestFate, StateOutcome, TransportError, Unserved, DEFAULT_DEADLINE,
 };
 pub use server::{decode_request, encode_answer, Rejection};
-pub use typed::{Answer, Call, ConversionError, DescribedConfig, Password, TgsFast};
+pub use typed::{
+    Answer, Call, ConversionError, DescribedConfig, IssuanceCall, Password, RoutedCall, StateCall,
+    TgsFast,
+};
+// The role a client expects keyd to resolve for it (task R9), re-exported
+// beside `ExpectedPeer` for its callers.
+pub use keyd_types::Role;
 #[cfg(unix)]
 pub use unix::{UnixConnection, UnixConnector};
 pub use wire::{KeydReply, KeydRequest, WireTime};

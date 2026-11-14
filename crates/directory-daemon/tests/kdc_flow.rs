@@ -241,18 +241,20 @@ fn the_full_kdc_flow_through_keyd_and_dird_equals_the_in_process_path() {
 
     // The remote kdc: custody and directory over the sockets; the krbtgt
     // handle and realm from DescribeDomain (docs/50 §7.5 step 4).
-    let custody = IpcKeyd::connect(
-        KeydClient::new(connector::keyd(&keyd_socket), uid, DEFAULT_DEADLINE).unwrap(),
-    )
+    let custody = IpcKeyd::connect(KeydClient::new(
+        connector::keyd(&keyd_socket),
+        ipc_keyd::ExpectedPeer::new(uid, Role::Kdc).unwrap(),
+        DEFAULT_DEADLINE,
+    ))
     .unwrap();
-    let mut dird_client = DirectoryClient::new(
+    let mut dird_client = DirectoryClient::connect(
         connector::dird(&dird.socket),
         uid,
         ipc_directory::DEFAULT_DEADLINE,
         policy().version(),
     )
     .unwrap();
-    let domain = dird_client.describe_domain().unwrap();
+    let domain = dird_client.domain().clone();
     assert_eq!(domain.krbtgt, handles.krbtgt);
     assert_eq!(domain.realm, realm());
     assert_eq!(domain.policy_version, PolicyVersion(1));
@@ -359,7 +361,7 @@ fn dird_down_or_past_its_deadline_reaches_the_client_as_29() {
         support::policy(1),
     )
     .unwrap();
-    let mut client = DirectoryClient::new(
+    let mut client = DirectoryClient::connect(
         connector::dird(&dird.socket),
         uid,
         ipc_directory::DEFAULT_DEADLINE,
@@ -396,7 +398,8 @@ fn dird_down_or_past_its_deadline_reaches_the_client_as_29() {
     assert_eq!(send(&mut kdc, &none, &bootstrap(4), udp), KdcReply::Silent);
 
     // A server (of the right uid) that accepts and never answers: the
-    // client's deadline passes — Unavailable, the connection dropped.
+    // client's deadline passes at its start-time DescribeDomain — no client
+    // (task R9: the domain is pinned at construction).
     let silent_path = dir.join("q.sock");
     let listener = UnixListener::bind(&silent_path).unwrap();
     let holder = std::thread::spawn(move || {
@@ -404,18 +407,18 @@ fn dird_down_or_past_its_deadline_reaches_the_client_as_29() {
         std::thread::sleep(Duration::from_secs(2));
         drop(held);
     });
-    let mut slow = DirectoryClient::new(
+    let slow = DirectoryClient::connect(
         connector::dird(&silent_path),
         uid,
         Duration::from_millis(300),
         policy().version(),
-    )
-    .unwrap();
-    assert_eq!(
-        slow.begin_view().err(),
-        Some(Unserved::Transport(TransportError::DeadlineExceeded))
     );
-    assert!(!slow.is_connected());
+    assert_eq!(
+        slow.err(),
+        Some(ipc_directory::ConnectError::Unserved(Unserved::Transport(
+            TransportError::DeadlineExceeded
+        )))
+    );
     assert_eq!(
         code_of(send(&mut kdc, &none, &bootstrap(5), tcp())),
         KDC_ERR_SVC_UNAVAILABLE

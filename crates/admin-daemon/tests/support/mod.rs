@@ -824,17 +824,24 @@ pub fn dird_link(socket: &Path, uid: u32) -> Box<dyn DirdLink> {
     )
 }
 
-/// admind's client of keyd at `socket` (the server must run as `uid`).
+/// admind's client of keyd at `socket` (the server must run as `uid` and
+/// resolve admind to Role::Directory — admind's own expectation, task R9).
 pub fn keyd_link(socket: &Path, uid: u32, deadline: Duration) -> Box<dyn KeydLink> {
-    Box::new(ipc_keyd::KeydClient::new(connectors::keyd(socket), uid, deadline).unwrap())
+    Box::new(ipc_keyd::KeydClient::new(
+        connectors::keyd(socket),
+        admin_daemon::links::expected_keyd(uid).unwrap(),
+        deadline,
+    ))
 }
 
 // ---------------------------------------------------------------------------
 // Fake servers: a silent keyd, a recording dird.
 // ---------------------------------------------------------------------------
 
-/// A "keyd" that accepts connections and reads requests but never answers
-/// (it holds the connections open until dropped).
+/// A "keyd" that accepts connections, answers each connection's first
+/// request — the client's `Ping` probe (task R9) — naming the caller role
+/// it was started with, then reads requests but never answers them (it
+/// holds the connections open until dropped).
 pub struct SilentServer {
     path: PathBuf,
     stop: Arc<AtomicBool>,
@@ -843,7 +850,7 @@ pub struct SilentServer {
 }
 
 impl SilentServer {
-    pub fn start(path: &Path) -> SilentServer {
+    pub fn start(path: &Path, role: keyd::Role) -> SilentServer {
         let _ = std::fs::remove_file(path);
         let listener = UnixListener::bind(path).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -854,7 +861,10 @@ impl SilentServer {
             std::thread::spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
                     match listener.accept() {
-                        Ok((stream, _)) => held.lock().unwrap().push(stream),
+                        Ok((mut stream, _)) => {
+                            answer_the_probe(&mut stream, role);
+                            held.lock().unwrap().push(stream);
+                        }
                         Err(e) if e.kind() == ErrorKind::WouldBlock => {
                             std::thread::sleep(Duration::from_millis(5));
                         }
@@ -887,6 +897,23 @@ impl Drop for SilentServer {
             let _ = stream.shutdown(std::net::Shutdown::Both);
         }
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Answer the first request of a fresh keyd connection — the client's
+/// `Ping` probe (task R9, docs/questions/Q-466) — with `role`; anything
+/// else, or nothing within 2 s, is left unanswered.
+fn answer_the_probe(stream: &mut UnixStream, role: keyd::Role) {
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let Some(body) = read_frame(stream, ipc_keyd::REQUEST_LIMIT) else {
+        return;
+    };
+    if matches!(ipc_keyd::decode_request(&body), Ok(ipc_keyd::Call::Ping)) {
+        let answer = ipc_keyd::Answer::Ping(Ok(role));
+        if let Ok(frame) = ipc_keyd::encode_answer(&answer) {
+            let _ = stream.write_all(frame.as_bytes());
+        }
     }
 }
 
@@ -1014,12 +1041,12 @@ fn register_grant(grants: &(PathBuf, u32), answer: &ipc_dird_admin::Reply) {
             salt: set.salt.as_str().to_owned(),
         })
         .collect();
+    // dird's role (Ldap) registers decisions (A-102; task R9: expected).
     let mut client = ipc_keyd::KeydClient::new(
         connectors::keyd(&grants.0),
-        grants.1,
+        ipc_keyd::ExpectedPeer::new(grants.1, keyd::Role::Ldap).unwrap(),
         ipc_keyd::DEFAULT_DEADLINE,
-    )
-    .unwrap();
+    );
     client
         .register_decision(
             keyd::DecisionId::new(1),
@@ -1027,6 +1054,7 @@ fn register_grant(grants: &(PathBuf, u32), answer: &ipc_dird_admin::Reply) {
             &[],
             keyd::MAX_SET_SECRET_GRANT_SECS,
         )
+        .unwrap()
         .unwrap();
 }
 
@@ -1433,7 +1461,7 @@ impl World {
         .unwrap();
         keyd_clock.set(common::now());
         let silent_keyd = match options.keyd {
-            KeydMode::Silent => Some(SilentServer::start(&keyd_dir_socket)),
+            KeydMode::Silent => Some(SilentServer::start(&keyd_dir_socket, keyd::Role::Directory)),
             KeydMode::Directory | KeydMode::Admin => None,
         };
 
@@ -1450,14 +1478,15 @@ impl World {
                 dird_auditd = Some(FakeAuditd::start(&params.audit.socket));
                 let realm = common::realm();
                 let factory: VerifierFactory = Arc::new(move || {
-                    let client = ipc_keyd::KeydClient::new(
-                        dird::connector::keyd(&keyd_socket),
-                        uid,
-                        ipc_keyd::DEFAULT_DEADLINE,
-                    )
-                    .ok()?;
-                    let verifier: Box<dyn TicketVerifier> =
-                        Box::new(KeydTicketVerifier::new(client, realm.clone()));
+                    let verifier: Box<dyn TicketVerifier> = Box::new(
+                        KeydTicketVerifier::new(
+                            dird::connector::keyd(&keyd_socket),
+                            uid,
+                            realm.clone(),
+                            ipc_keyd::DEFAULT_DEADLINE,
+                        )
+                        .ok()?,
+                    );
                     Some(verifier)
                 });
                 let admin = AdminParams {
@@ -1528,7 +1557,8 @@ impl World {
     }
 
     /// The one keyd's records of keyadm's calls (Role::Admin) so far (task
-    /// A10; A-102).
+    /// A10; A-102) — without the `Ping` with which the keyd client verifies
+    /// its role on each new connection (task R9).
     pub fn keyadm_records(&self) -> Vec<KeydRecord> {
         self.keyd_auditd
             .as_ref()
@@ -1537,7 +1567,8 @@ impl World {
                     .into_iter()
                     .filter_map(|e| match e {
                         EventBody::Keyd(record)
-                            if record.caller_role == ipc_audit::KeydRole::Admin =>
+                            if record.caller_role == ipc_audit::KeydRole::Admin
+                                && record.op != ipc_audit::KeydOperation::Ping =>
                         {
                             Some(*record)
                         }

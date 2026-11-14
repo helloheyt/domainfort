@@ -536,7 +536,7 @@ pub fn answers() -> Vec<Answer> {
         Answer::RetireKvno(Ok(())),
         Answer::DestroyKeySet(Ok(())),
         Answer::DescribeConfig(Ok(described(false, Role::Kdc))),
-        Answer::Ping(Ok(())),
+        Answer::Ping(Ok(Role::Directory)),
         Answer::GrantSetSecret(Ok(())),
         Answer::RegisterDecision(Ok(())),
         Answer::SealCeremony(Ok(())),
@@ -549,6 +549,11 @@ pub fn answers() -> Vec<Answer> {
     // Kdc and Ldap callers (docs/10 §2).
     for role in ROLES {
         answers.push(Answer::DescribeConfig(Ok(described(true, role))));
+    }
+    // The caller role of the Ping reply (task R9, Q-466 item 2): every value
+    // of the same closed table — every role may ping (docs/10 §2).
+    for role in ROLES {
+        answers.push(Answer::Ping(Ok(role)));
     }
     for error in [
         AuthnError::Denied,

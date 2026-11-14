@@ -132,6 +132,12 @@ mod connector {
         ) -> Result<Zeroizing<Vec<u8>>, TransportError> {
             self.inner.exchange(frame, reply_limit, deadline)
         }
+
+        /// The wrapped connection's own idle check (docs/questions/Q-312;
+        /// no default since task R9, Q-466 item 4).
+        fn check_idle(&mut self) -> Result<(), TransportError> {
+            self.inner.check_idle()
+        }
     }
 }
 
@@ -201,10 +207,9 @@ impl World {
     fn client(&self, keyd_uid: u32) -> KeydClient<connector::KeydConnector> {
         KeydClient::new(
             connector::new(&self.daemon.socket),
-            keyd_uid,
+            ipc_keyd::ExpectedPeer::new(keyd_uid, Role::Admin).unwrap(),
             DEFAULT_DEADLINE,
         )
-        .unwrap()
     }
 
     /// keyd's CreateKey audit records received so far.
@@ -356,7 +361,7 @@ fn a_repeated_ceremony_fails_closed_at_the_first_key_set() {
             }],
             keyd_types::MAX_INITIAL_SECRET_GRANT_SECS,
         ),
-        Err(KeydError::Denied)
+        Ok(Err(KeydError::Denied))
     );
     let sealed_grant = || {
         world.auditd.events().into_iter().any(|event| {
@@ -427,38 +432,37 @@ fn a_wrong_peer_uid_is_refused_before_anything_is_sent() {
     world.daemon.stop().unwrap();
 }
 
-/// docs/10 §2 (I2: only Role::Admin holds `create_key`); docs/50 §3.2 (the
-/// role comes from the uid map): a uid mapped to Directory reaches keyd
-/// (`ping` is every role's) but its first `create_key` gets keyd's uniform
-/// Denied, which is reported; nothing more is attempted.
+/// **Attack test** — docs/10 §2; docs/50 R50-3, §3.2, §3.7; docs/52 §3.12
+/// (C12); docs/questions/Q-466 items 1-2 (A-102): a keyd that maps
+/// keyadm's uid to **another role** (Directory) is found by the `Ping`
+/// probe of keyadm's connection, before anything else is sent: the contact
+/// fails as not sent (the peer is not the expected keyd), **no `create_key`
+/// reaches keyd** (it records none), nothing is attempted (exit 1).
 #[test]
-fn a_uid_mapped_to_another_role_gets_keyds_denied() {
+fn a_keyd_giving_keyadm_another_role_receives_no_create_key() {
     let Some(world) = world(Some(Role::Directory)) else {
         return;
     };
     let m = manifest();
     let report = ceremony::run(&mut world.client(world.uid), &m);
-    assert_eq!(report.contact, Outcome::Answered(Ok(())));
-    assert_eq!(report.steps.len(), 1);
-    assert_eq!(
-        report.steps[0].outcome,
-        Outcome::Answered(Err(KeydError::Denied))
-    );
-    assert_eq!(report::exit_code(&report), EXIT_INCOMPLETE);
+    assert_eq!(report.contact, Outcome::NotSent(NotSent::PeerMismatch));
+    assert!(report.steps.is_empty());
+    assert_eq!(report::exit_code(&report), EXIT_NOTHING_ATTEMPTED);
     let text = report::render(&report, &m).join("\n");
     assert!(
-        text.contains("krbtgt: keyd refused (denied); not created"),
+        text.contains("keyd does not give this account the Admin role (nothing was sent)"),
         "{text}"
     );
-
-    let records = world.wait_for_create_key_records(1);
-    assert_eq!(records[0].result, KeydOutcome::Denied);
-    assert_eq!(records[0].reason, KeydReason::RoleNotPermitted);
+    assert!(
+        world.create_key_records().is_empty(),
+        "keyd received no create_key"
+    );
     world.daemon.stop().unwrap();
 }
 
 /// docs/50 R50-3, §3.2 ("an unmapped uid ⇒ the connection is closed"): the
-/// contact fails, no create_key is sent.
+/// contact fails — keyd closes the new connection at its probe, so nothing
+/// was sent (task R9) — and no create_key is sent.
 #[test]
 fn an_unmapped_uid_attempts_no_key_set() {
     let Some(world) = world(None) else {
@@ -468,7 +472,7 @@ fn an_unmapped_uid_attempts_no_key_set() {
     let report = ceremony::run(&mut world.client(world.uid), &m);
     assert_eq!(
         report.contact,
-        Outcome::Unknown(Unknown::Transport(ipc_keyd::TransportError::Closed))
+        Outcome::NotSent(NotSent::Transport(ipc_keyd::TransportError::Closed))
     );
     assert!(report.steps.is_empty());
     assert_eq!(report::exit_code(&report), EXIT_NOTHING_ATTEMPTED);
@@ -604,8 +608,11 @@ fn keyds_unavailable_is_reported_as_not_performed() {
     )
     .unwrap();
     let m = manifest();
-    let mut client =
-        KeydClient::new(connector::new(&daemon.socket), uid, DEFAULT_DEADLINE).unwrap();
+    let mut client = KeydClient::new(
+        connector::new(&daemon.socket),
+        ipc_keyd::ExpectedPeer::new(uid, Role::Admin).unwrap(),
+        DEFAULT_DEADLINE,
+    );
     let report = ceremony::run(&mut client, &m);
     assert_eq!(report.contact, Outcome::Answered(Ok(())));
     assert_eq!(report.steps.len(), 1, "{report:?}");
@@ -650,7 +657,9 @@ fn a_create_key_keyd_never_answers_is_reported_as_outcome_unknown() {
             let call = ipc_keyd::decode_request(&body).unwrap();
             received.push(call.operation());
             if matches!(call, ipc_keyd::Call::Ping) {
-                let answer = ipc_keyd::Answer::Ping(Ok(()));
+                // The role keyd resolves for keyadm (task R9): the
+                // client's probe and keyadm's contact both ping.
+                let answer = ipc_keyd::Answer::Ping(Ok(Role::Admin));
                 stream
                     .write_all(ipc_keyd::encode_answer(&answer).unwrap().as_bytes())
                     .unwrap();
@@ -664,13 +673,20 @@ fn a_create_key_keyd_never_answers_is_reported_as_outcome_unknown() {
         received
     });
     let m = manifest();
-    let mut client =
-        KeydClient::new(connector::new(&path), uid, Duration::from_millis(500)).unwrap();
+    let mut client = KeydClient::new(
+        connector::new(&path),
+        ipc_keyd::ExpectedPeer::new(uid, Role::Admin).unwrap(),
+        Duration::from_millis(500),
+    );
     let report = ceremony::run(&mut client, &m);
     done.send(()).unwrap();
     assert_eq!(
         keyd.join().unwrap(),
-        [keyd::Operation::Ping, keyd::Operation::CreateKey]
+        [
+            keyd::Operation::Ping,
+            keyd::Operation::Ping,
+            keyd::Operation::CreateKey
+        ]
     );
     assert_eq!(report.contact, Outcome::Answered(Ok(())));
     assert_eq!(report.steps.len(), 1, "{report:?}");

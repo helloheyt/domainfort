@@ -128,10 +128,9 @@ fn keyd_verifies(world: &World, target: Guid, candidate: &str) -> bool {
     padata.padata_value = sealed.encode().unwrap();
     let mut client = ipc_keyd::KeydClient::new(
         support::connectors::keyd(&world.keyd_kdc_socket),
-        world.uid,
+        ipc_keyd::ExpectedPeer::new(world.uid, keyd::Role::Kdc).unwrap(),
         ipc_keyd::DEFAULT_DEADLINE,
-    )
-    .unwrap();
+    );
     client
         .verify_preauth(
             &KeyHandle::new(
@@ -339,12 +338,17 @@ fn every_password_rule_is_refused() {
     assert_eq!(sets[7].3, PasswordResult::Completed);
 }
 
-/// docs/10 §2, §9: keyd refusing `set_secret` (here the uid is mapped to
-/// Role::Admin, which may not call it) ⇒ the `SetPassword` fails at step
-/// `SetSecret(PrincipalLongterm)` with `Denied`; dird is told `Failed` with
-/// no kvno; the administrator gets `Denied`.
+/// **Attack test** — docs/10 §2; docs/50 R50-3, §3.7; docs/52 §3.12 (C12);
+/// docs/questions/Q-403 option (c), Q-466 items 1-2 (A-102): a keyd that
+/// maps admind's uid to **another role** (here Role::Admin) is found by the
+/// `Ping` probe of admind's keyd connection, before anything else is sent:
+/// **no `set_secret` reaches keyd** (keyd records no SetSecret at all — the
+/// residual A-94 accepted, a `Denied` from keyd's capability check, is gone),
+/// the `SetPassword` fails at step `SetSecret(PrincipalLongterm)` as keyd
+/// unavailable (not sent), dird is told `Failed` with no kvno, and the
+/// administrator gets `Unavailable`.
 #[test]
-fn keyd_refusing_fails_at_set_secret() {
+fn a_keyd_giving_admind_another_role_receives_no_set_secret() {
     let Some(mut world) = World::new(Options {
         keyd: KeydMode::Admin,
         ..Options::default()
@@ -354,10 +358,14 @@ fn keyd_refusing_fails_at_set_secret() {
     let mut conn = world.connect();
     assert_eq!(
         conn.call(&set_password(g(BOB), GOOD)),
-        refused(RefusalStatus::Denied)
+        refused(RefusalStatus::Unavailable)
     );
     let complete = await_events(&world, DirAdminOperation::CompletePasswordSet, g(BOB), 1);
     assert!(complete[0].reported_kvnos.as_slice().is_empty());
+    assert!(
+        bob_records(&world, KeydOperation::SetSecret).is_empty(),
+        "keyd received no set_secret"
+    );
     let events = world.finish();
     assert_eq!(
         password_events(&events),
@@ -367,7 +375,7 @@ fn keyd_refusing_fails_at_set_secret() {
             vec![],
             PasswordResult::Failed {
                 step: PasswordStep::SetSecret(KeyPurposeCode::PrincipalLongterm),
-                cause: PasswordFailure::Denied
+                cause: PasswordFailure::Unavailable
             }
         )]
     );
@@ -857,10 +865,9 @@ fn a_computer_set_in_part_is_incomplete() {
     // The Service key set of ws9$, created first under another name.
     let mut client = ipc_keyd::KeydClient::new(
         support::connectors::keyd(&world.keyd_dir_socket),
-        world.uid,
+        ipc_keyd::ExpectedPeer::new(world.uid, keyd::Role::Directory).unwrap(),
         ipc_keyd::DEFAULT_DEADLINE,
-    )
-    .unwrap();
+    );
     let other = keyd::PrincipalBinding::new(
         support::common::realm(),
         support::common::name(
@@ -873,10 +880,9 @@ fn a_computer_set_in_part_is_incomplete() {
     // ws9$'s two key sets, the Service one under the other name and salt.
     let mut ldap = ipc_keyd::KeydClient::new(
         support::connectors::keyd(&world.keyd_ldap_socket),
-        world.uid,
+        ipc_keyd::ExpectedPeer::new(world.uid, keyd::Role::Ldap).unwrap(),
         ipc_keyd::DEFAULT_DEADLINE,
-    )
-    .unwrap();
+    );
     ldap.register_decision(
         keyd::DecisionId::new(1),
         &keyd::DecidedOperation::SetSecret {
@@ -906,6 +912,7 @@ fn a_computer_set_in_part_is_incomplete() {
         &[],
         keyd::MAX_SET_SECRET_GRANT_SECS,
     )
+    .unwrap()
     .unwrap();
     let call = ipc_keyd::Call::SetSecret {
         handle: KeyHandle::new(
@@ -1146,10 +1153,9 @@ fn direct_set_secret(world: &World, password: &str) -> Option<Result<keyd::Kvno,
     let (handle, binding) = bob_key_set();
     let mut client = ipc_keyd::KeydClient::new(
         support::connectors::keyd(&world.keyd_dir_socket),
-        world.uid,
+        ipc_keyd::ExpectedPeer::new(world.uid, keyd::Role::Directory).unwrap(),
         ipc_keyd::DEFAULT_DEADLINE,
-    )
-    .unwrap();
+    );
     let call = ipc_keyd::Call::SetSecret {
         handle,
         binding,

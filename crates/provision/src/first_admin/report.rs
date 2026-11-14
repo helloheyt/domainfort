@@ -125,12 +125,17 @@ pub fn render(report: &SecretReport) -> Vec<String> {
     )];
     lines.push(match report.contact {
         Outcome::Answered(Ok(())) => {
-            "keyd reached; its peer uid is admind's configured keyd_uid".to_owned()
+            "keyd reached; its peer uid is admind's configured keyd_uid and it gives this account Role::Directory".to_owned()
         }
         Outcome::Answered(Err(error)) => format!(
             "keyd refused the contact ({}); no password was sent",
             keyd_error_text(error)
         ),
+        // Task R9: keyd closing the new connection at its probe — an
+        // unmapped uid (docs/50 §3.2) — nothing was sent.
+        Outcome::NotSent(ipc_keyd::Unserved::Transport(ipc_keyd::TransportError::Closed)) => {
+            "contact failed: keyd closed the connection before it answered (is admind's account mapped to Directory in keyd's uid_roles?); no password was sent".to_owned()
+        }
         Outcome::NotSent(reason) => format!(
             "contact failed: {} (nothing was sent); no password was sent",
             not_sent_text(reason)
@@ -211,7 +216,7 @@ pub fn render(report: &SecretReport) -> Vec<String> {
         .any(|s| s.outcome == Outcome::Answered(Err(KeydError::Denied)))
     {
         lines.push(
-            "keyd answers one uniform \"denied\" (docs/10 9): keyd holds no live grant for this administrator (task A15a: run keyadm ceremony first - its grants live 15 minutes and cover only key sets that do not exist yet), admind's account may not be mapped to Directory in keyd's uid_roles, or keyd refused the binding; keyd's audit record names the reason".to_owned(),
+            "keyd answers one uniform \"denied\" (docs/10 9): keyd holds no live grant for this administrator (task A15a: run keyadm ceremony first - its grants live 15 minutes and cover only key sets that do not exist yet), or keyd refused the binding; keyd's audit record names the reason".to_owned(),
         );
     }
     if report.steps.iter().any(|s| s.outcome.outcome_unknown()) {

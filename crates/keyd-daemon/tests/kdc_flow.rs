@@ -247,7 +247,11 @@ struct SocketWorld {
 
 impl SocketWorld {
     fn new(socket: &Path, keyd_uid: u32) -> SocketWorld {
-        let client = KeydClient::new(connector::new(socket), keyd_uid, DEFAULT_DEADLINE).unwrap();
+        let client = KeydClient::new(
+            connector::new(socket),
+            ipc_keyd::ExpectedPeer::new(keyd_uid, keyd::Role::Kdc).unwrap(),
+            DEFAULT_DEADLINE,
+        );
         let custody = IpcKeyd::connect(client).unwrap();
         let kdc = Kdc::new(
             KdcConfig::new(realm(), KRBTGT),

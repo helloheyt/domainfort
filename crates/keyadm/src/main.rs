@@ -13,7 +13,7 @@
 //!
 //! Spec: docs/51 §4.3 step 11, §6; docs/50 §8.2; A-60; docs/52 §4.6 (A-102).
 
-use ipc_keyd::{KeydClient, UnixConnector};
+use ipc_keyd::{ClientConfigError, ExpectedPeer, KeydClient, Role, UnixConnector};
 use keyadm::cli::{self, Approved, Command, USAGE};
 use keyadm::report::{self, EXIT_NOTHING_ATTEMPTED};
 use keyadm::{ceremony, execute, identity, settings, sweep};
@@ -62,11 +62,10 @@ fn ceremony(config_path: &Path, manifest_path: &Path) -> ExitCode {
         Err(error) => return fail("manifest", &error),
     };
     let connector = UnixConnector::new(settings.keyd().socket().as_path().to_path_buf());
-    let mut client =
-        match KeydClient::new(connector, settings.keyd().uid(), settings.keyd_deadline()) {
-            Ok(client) => client,
-            Err(_) => return fail("configuration", &"keyd_uid cannot be 0"),
-        };
+    let mut client = match admin_peer(settings.keyd().uid()) {
+        Ok(peer) => KeydClient::new(connector, peer, settings.keyd_deadline()),
+        Err(_) => return fail("configuration", &"keyd_uid cannot be 0"),
+    };
     // Every manifest names each first administrator's salt (A-105,
     // docs/questions/Q-473): nothing to refuse before contacting keyd.
     let outcome = ceremony::run(&mut client, &manifest);
@@ -85,12 +84,21 @@ fn keyd_client(config_path: &Path) -> Result<KeydClient<UnixConnector>, ExitCode
         Ok(settings) => settings,
         Err(error) => return Err(fail("configuration", &error)),
     };
-    KeydClient::new(
+    let peer = admin_peer(settings.keyd().uid())
+        .map_err(|_| fail("configuration", &"keyd_uid cannot be 0"))?;
+    Ok(KeydClient::new(
         UnixConnector::new(settings.keyd().socket().as_path().to_path_buf()),
-        settings.keyd().uid(),
+        peer,
         settings.keyd_deadline(),
-    )
-    .map_err(|_| fail("configuration", &"keyd_uid cannot be 0"))
+    ))
+}
+
+/// The keyd keyadm expects: `keyd_uid`, giving keyadm the Admin role —
+/// checked on every connection before anything else is sent (task R9).
+/// Spec: docs/10 §2 (Role `Admin`); docs/50 R50-3; docs/52 §3.12;
+/// docs/questions/Q-466 item 1 (A-102).
+fn admin_peer(keyd_uid: u32) -> Result<ExpectedPeer, ClientConfigError> {
+    ExpectedPeer::new(keyd_uid, Role::Admin)
 }
 
 /// Print `lines` to standard output.

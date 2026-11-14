@@ -117,13 +117,12 @@ pub trait Connection {
 
     /// Check, before this held connection is reused, that it is still usable
     /// — without blocking and without sending anything (end of stream, a
-    /// pending error or a waiting octet ⇒ `Err`). The default reports the
-    /// connection usable, for a transport that cannot tell.
+    /// pending error or a waiting octet ⇒ `Err`). **No default** (task R9;
+    /// docs/52 §2 row 19): every connection decides — a transport that
+    /// truly cannot tell says so in its own implementation.
     /// Spec: docs/50 §3.6, §3.7; docs/questions/Q-312 (A-82), Q-350 item 6
-    /// (A-87).
-    fn check_idle(&mut self) -> Result<(), TransportError> {
-        Ok(())
-    }
+    /// (A-87), Q-466 item 4 (A-102).
+    fn check_idle(&mut self) -> Result<(), TransportError>;
 }
 
 /// Opens connections to dird's admin socket.

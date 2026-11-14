@@ -8,8 +8,11 @@
 //! client verifies the server's uid), §3.3 (refusal table), §3.4, §3.5
 //! (R50-5: keyd fills `now` from its own clock), §3.6, §3.7 (R50-8:
 //! `Unavailable`, never a disguised wrong password), §9; docs/10 §2, §9;
-//! A-56; A-59; A-62 (two-interval hold-down). Every value is constructed by
-//! hand for these tests; no vector comes from any other implementation.
+//! A-56; A-59; A-62 (two-interval hold-down); docs/52 §3.12, §7 R9
+//! (docs/questions/Q-466: the client expects its role on every connection,
+//! the `Ping` reply names it, a state call carries its fate). Every value
+//! is constructed by hand for these tests; no vector comes from any other
+//! implementation.
 
 #[path = "../../ipc-keyd/tests/samples/mod.rs"]
 mod samples;
@@ -17,8 +20,8 @@ mod support;
 
 use ipc::{encode_frame, Direction, Refused};
 use ipc_keyd::{
-    ClientConfigError, KeydClient, KeydReply, TransportError, Unserved, DEFAULT_DEADLINE,
-    KEYD_CHANNEL,
+    CallFailure, ClientConfigError, ExpectedPeer, IssuanceCall, KeydClient, KeydReply, RequestFate,
+    TransportError, Unserved, DEFAULT_DEADLINE, KEYD_CHANNEL,
 };
 use ipc_keyd_server::{dispatch, Dispatch};
 use keyd::{
@@ -89,11 +92,17 @@ fn served() -> Shared<InMemoryKeyStore, Records, OsEntropy> {
     share(dev_keyd(), after(3600))
 }
 
+/// A client of `caller`'s role (task R9: it expects that role of keyd on
+/// every connection).
 fn client(
     server: &Shared<InMemoryKeyStore, Records, OsEntropy>,
     caller: CallerId,
 ) -> KeydClient<Loopback<InMemoryKeyStore, Records, OsEntropy>> {
-    KeydClient::new(Loopback::new(server, caller), KEYD_UID, DEFAULT_DEADLINE).unwrap()
+    KeydClient::new(
+        Loopback::new(server, caller),
+        ExpectedPeer::new(KEYD_UID, caller.role).unwrap(),
+        DEFAULT_DEADLINE,
+    )
 }
 
 /// The reply message of a `Dispatch::Reply`.
@@ -190,11 +199,13 @@ fn caller_identity_comes_from_the_transport() {
             }
         }
     }
+    // Task R9 (docs/questions/Q-466 item 2): every role may ping, and the
+    // reply names the role keyd resolved for the caller.
     let ping = body_of(&ipc_keyd::Call::Ping);
     for caller in [KDC, DIRECTORY, ADMIN, LDAP] {
         assert_eq!(
             reply_of(dispatch(&mut keyd, caller, now, &ping)),
-            KeydReply::Ping
+            KeydReply::Ping(caller.role)
         );
     }
 }
@@ -322,15 +333,15 @@ fn admin_and_directory_operations_through_the_client() {
     );
     assert_eq!(
         admin.create_key(&service, &service_binding),
-        Ok(Kvno::new(1))
+        Ok(Ok(Kvno::new(1)))
     );
     assert_eq!(
         admin.create_key(&service, &service_binding),
-        Err(keyd::Error::Denied)
+        Ok(Err(keyd::Error::Denied))
     );
     // No decision: refused (NoDecision).
     let rotate = keyd::DecisionId::new(11);
-    assert_eq!(admin.rotate_key(rotate), Err(keyd::Error::Denied));
+    assert_eq!(admin.rotate_key(rotate), Ok(Err(keyd::Error::Denied)));
     assert_eq!(
         ldap.register_decision(
             rotate,
@@ -338,11 +349,11 @@ fn admin_and_directory_operations_through_the_client() {
             &approvers,
             900
         ),
-        Ok(())
+        Ok(Ok(()))
     );
-    assert_eq!(admin.rotate_key(rotate), Ok(Kvno::new(2)));
+    assert_eq!(admin.rotate_key(rotate), Ok(Ok(Kvno::new(2))));
     // Presented again: the recorded result, no second rotation.
-    assert_eq!(admin.rotate_key(rotate), Ok(Kvno::new(2)));
+    assert_eq!(admin.rotate_key(rotate), Ok(Ok(Kvno::new(2))));
     let retire = keyd::DecisionId::new(12);
     assert_eq!(
         ldap.register_decision(
@@ -354,12 +365,12 @@ fn admin_and_directory_operations_through_the_client() {
             &approvers,
             900
         ),
-        Ok(())
+        Ok(Ok(()))
     );
     // The wrong execution for that id is refused (DecisionMismatch) and does
     // not consume it.
-    assert_eq!(admin.rotate_key(retire), Err(keyd::Error::Denied));
-    assert_eq!(admin.retire_kvno(retire), Ok(()));
+    assert_eq!(admin.rotate_key(retire), Ok(Err(keyd::Error::Denied)));
+    assert_eq!(admin.retire_kvno(retire), Ok(Ok(())));
     // Only dird (Ldap) registers decisions.
     assert_eq!(
         admin.register_decision(
@@ -368,7 +379,7 @@ fn admin_and_directory_operations_through_the_client() {
             &approvers,
             900
         ),
-        Err(keyd::Error::Denied)
+        Ok(Err(keyd::Error::Denied))
     );
 
     let krbtgt = samples::KRBTGT;
@@ -376,7 +387,10 @@ fn admin_and_directory_operations_through_the_client() {
         samples::realm(),
         samples::name(2, &["krbtgt", "EXAMPLE.ORG"]),
     );
-    assert_eq!(admin.create_key(&krbtgt, &krbtgt_binding), Ok(Kvno::new(1)));
+    assert_eq!(
+        admin.create_key(&krbtgt, &krbtgt_binding),
+        Ok(Ok(Kvno::new(1)))
+    );
     // Dual control: two distinct approvers or no decision at all.
     let rotate_krbtgt = keyd::DecisionId::new(14);
     assert_eq!(
@@ -386,9 +400,12 @@ fn admin_and_directory_operations_through_the_client() {
             &[approvers[0], approvers[0]],
             900
         ),
-        Err(keyd::Error::Denied)
+        Ok(Err(keyd::Error::Denied))
     );
-    assert_eq!(admin.rotate_krbtgt(rotate_krbtgt), Err(keyd::Error::Denied));
+    assert_eq!(
+        admin.rotate_krbtgt(rotate_krbtgt),
+        Ok(Err(keyd::Error::Denied))
+    );
     assert_eq!(
         ldap.register_decision(
             rotate_krbtgt,
@@ -396,9 +413,9 @@ fn admin_and_directory_operations_through_the_client() {
             &approvers,
             900
         ),
-        Ok(())
+        Ok(Ok(()))
     );
-    assert_eq!(admin.rotate_krbtgt(rotate_krbtgt), Ok(Kvno::new(2)));
+    assert_eq!(admin.rotate_krbtgt(rotate_krbtgt), Ok(Ok(Kvno::new(2))));
 
     let alice = samples::handle(0xA1, KeyPurpose::PrincipalLongterm);
     let pass = || Zeroizing::new(String::from(samples::PASSWORD));
@@ -414,7 +431,7 @@ fn admin_and_directory_operations_through_the_client() {
     };
     assert_eq!(
         directory.set_secret(&alice, &samples::binding(), pass(), "EXAMPLE.ORGalice"),
-        Err(keyd::Error::Denied)
+        Ok(Err(keyd::Error::Denied))
     );
     assert_eq!(
         directory.register_decision(
@@ -423,7 +440,7 @@ fn admin_and_directory_operations_through_the_client() {
             &[],
             keyd::MAX_SET_SECRET_GRANT_SECS
         ),
-        Err(keyd::Error::Denied)
+        Ok(Err(keyd::Error::Denied))
     );
     assert_eq!(
         ldap.register_decision(
@@ -432,31 +449,31 @@ fn admin_and_directory_operations_through_the_client() {
             &[],
             keyd::MAX_SET_SECRET_GRANT_SECS
         ),
-        Ok(())
+        Ok(Ok(()))
     );
     assert_eq!(
         directory.set_secret(&alice, &samples::binding(), pass(), "EXAMPLE.ORGalice"),
-        Ok(Kvno::INITIAL)
+        Ok(Ok(Kvno::INITIAL))
     );
     // The decision is spent.
     assert_eq!(
         directory.set_secret(&alice, &samples::binding(), pass(), "EXAMPLE.ORGalice"),
-        Err(keyd::Error::Denied)
+        Ok(Err(keyd::Error::Denied))
     );
     // The Directory role may not create keys; the Admin role may not set
     // secrets (docs/10 §2).
     assert_eq!(
         directory.create_key(&alice, &samples::binding()),
-        Err(keyd::Error::Denied)
+        Ok(Err(keyd::Error::Denied))
     );
     assert_eq!(
         admin.set_secret(&alice, &samples::binding(), pass(), "EXAMPLE.ORGalice"),
-        Err(keyd::Error::Denied)
+        Ok(Err(keyd::Error::Denied))
     );
     // Destruction: on dird's destroy decision only, listed for the sweep
     // until it runs; the id presented again gives the recorded result.
     let destroy = keyd::DecisionId::new(16);
-    assert_eq!(admin.destroy_key_set(destroy), Err(keyd::Error::Denied));
+    assert_eq!(admin.destroy_key_set(destroy), Ok(Err(keyd::Error::Denied)));
     assert_eq!(
         ldap.register_decision(
             destroy,
@@ -466,7 +483,7 @@ fn admin_and_directory_operations_through_the_client() {
             &[],
             3600
         ),
-        Ok(())
+        Ok(Ok(()))
     );
     let page = admin.list_destroy_decisions(None).unwrap();
     assert_eq!(
@@ -481,8 +498,8 @@ fn admin_and_directory_operations_through_the_client() {
         directory.list_destroy_decisions(None),
         Err(keyd::Error::Denied)
     );
-    assert_eq!(admin.destroy_key_set(destroy), Ok(()));
-    assert_eq!(admin.destroy_key_set(destroy), Ok(()));
+    assert_eq!(admin.destroy_key_set(destroy), Ok(Ok(())));
+    assert_eq!(admin.destroy_key_set(destroy), Ok(Ok(())));
     assert!(admin
         .list_destroy_decisions(None)
         .unwrap()
@@ -494,7 +511,7 @@ fn admin_and_directory_operations_through_the_client() {
     let other = samples::handle(0x77, KeyPurpose::Service);
     assert_eq!(
         admin.create_key(&other, &service_binding),
-        Err(keyd::Error::Denied)
+        Ok(Err(keyd::Error::Denied))
     );
 
     let description = kdc.describe_config().unwrap();
@@ -507,8 +524,13 @@ fn admin_and_directory_operations_through_the_client() {
         assert_eq!(described.caller_role, role);
         assert_eq!(described.description, description);
     }
-    for c in [&mut admin, &mut directory, &mut kdc, &mut ldap] {
-        assert_eq!(c.ping(), Ok(()));
+    for (c, role) in [
+        (&mut admin, Role::Admin),
+        (&mut directory, Role::Directory),
+        (&mut kdc, Role::Kdc),
+        (&mut ldap, Role::Ldap),
+    ] {
+        assert_eq!(c.ping(), Ok(role));
     }
     // A service ticket that is not one is keyd's uniform Denied — unbound,
     // and bound to an operation digest (R2: the binding travels, keyd
@@ -545,32 +567,34 @@ fn the_client_verifies_the_servers_uid_before_sending() {
             peer_uid: KEYD_UID + 1,
             ..Loopback::new(&server, DIRECTORY)
         },
-        KEYD_UID,
+        ExpectedPeer::new(KEYD_UID, Role::Directory).unwrap(),
         DEFAULT_DEADLINE,
-    )
-    .unwrap();
+    );
     let alice = samples::handle(0xA1, KeyPurpose::PrincipalLongterm);
     let pass = Zeroizing::new(String::from(samples::PASSWORD));
+    // A state call: not sent, and the fate says so (task R9).
     assert_eq!(
         impostor.set_secret(&alice, &samples::binding(), pass, "EXAMPLE.ORGalice"),
-        Err(keyd::Error::Unavailable)
+        Err(CallFailure {
+            unserved: Unserved::PeerMismatch,
+            fate: RequestFate::NotSent,
+        })
     );
-    assert_eq!(
-        impostor.call(&ipc_keyd::Call::Ping),
-        Err(Unserved::PeerMismatch)
-    );
+    let ping = || IssuanceCall::new(ipc_keyd::Call::Ping).unwrap();
+    assert_eq!(impostor.call(&ping()), Err(Unserved::PeerMismatch));
     server.borrow_mut().faults.peer_credentials_unreadable = true;
     let mut directory = client(&server, DIRECTORY);
     assert_eq!(
-        directory.call(&ipc_keyd::Call::Ping),
+        directory.call(&ping()),
         Err(Unserved::Transport(TransportError::PeerCredentials))
     );
     assert!(server.borrow().received.is_empty(), "nothing was sent");
     assert!(server.borrow().keyd.audit_sink().0.is_empty());
 
-    // uid 0 is never accepted as keyd's (docs/50 §3.2; Q-245 item 5).
+    // uid 0 is never accepted as keyd's (docs/50 §3.2; Q-245 item 5): no
+    // expectation, hence no client, can be made with it (task R9).
     assert_eq!(
-        KeydClient::new(Loopback::new(&server, KDC), 0, DEFAULT_DEADLINE).map(|_| ()),
+        ExpectedPeer::new(0, Role::Kdc),
         Err(ClientConfigError::RootServerUid)
     );
 }
@@ -580,7 +604,9 @@ fn the_client_verifies_the_servers_uid_before_sending() {
 /// a non-canonical reply and a reply of another operation each reach the
 /// caller as the `Unavailable` variant of the operation's error type —
 /// never `Denied` — and the connection is dropped (the next call
-/// reconnects).
+/// reconnects). A state call (`set_secret`) is never answered either: it
+/// ends in a `CallFailure` carrying its fate (task R9; the fates
+/// themselves: crates/ipc-keyd tests/connection_rules.rs).
 #[test]
 fn every_transport_failure_is_unavailable() {
     use support::Faults;
@@ -649,18 +675,20 @@ fn every_transport_failure_is_unavailable() {
             Err(keyd::Error::Unavailable),
             "{fault:?}"
         );
-        assert_eq!(
-            directory.set_secret(
-                &alice,
-                &samples::binding(),
-                Zeroizing::new(String::from("x")),
-                "EXAMPLE.ORGalice"
+        assert!(
+            matches!(
+                directory.set_secret(
+                    &alice,
+                    &samples::binding(),
+                    Zeroizing::new(String::from("x")),
+                    "EXAMPLE.ORGalice"
+                ),
+                Err(CallFailure { .. })
             ),
-            Err(keyd::Error::Unavailable),
             "{fault:?}"
         );
         // Once keyd is back, the same client reconnects and is served.
         server.borrow_mut().faults = Faults::default();
-        assert_eq!(kdc.ping(), Ok(()), "{fault:?}");
+        assert_eq!(kdc.ping(), Ok(Role::Kdc), "{fault:?}");
     }
 }

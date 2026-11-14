@@ -31,19 +31,19 @@
 //! The PEP reports `channel_bound` to the PDP only for a request whose every
 //! ticket carries that digest (docs/11 §4: a write needs it — no exemption).
 //!
-//! [`KeydTicketVerifier`] wraps ipc-keyd's `KeydClient` with F1's
-//! connection rules (A-87): a held connection is checked before reuse
-//! (inside `KeydClient`), and every new connection must answer
-//! `DescribeConfig` (Kdc and Ldap may call it, docs/10 §2) with the
-//! description the first connection gave — so a keyd restarted with dird's
-//! uid mapped to another role, or serving another realm, serves nothing
+//! [`KeydTicketVerifier`] owns ipc-keyd's `KeydClient`, built only with
+//! the keyd dird expects (task R9, docs/questions/Q-466): keyd's uid, the
+//! caller role **Ldap** and dird's **realm**. On every new connection —
+//! inside `KeydClient`, before anything else is sent — keyd's uid is
+//! checked and keyd must answer `DescribeConfig` (Kdc and Ldap may call it,
+//! docs/10 §2) naming the role Ldap and dird's realm; a held connection is
+//! checked before reuse (A-87). So a keyd restarted with dird's uid mapped
+//! to another role, or serving another realm, serves nothing
 //! (`Unavailable`) instead of answering every ticket with a uniform
-//! `Denied` that would read as "bad ticket". The first description is taken
-//! lazily, at the first request (keyd may still be in its start-up
-//! hold-down, or down, when dird starts); its realm must be dird's. Only
-//! ipc-keyd's public API is used, and the description is compared as a
-//! whole value, so a field added to it later (F3: the caller's role) is
-//! compared too (docs/questions/Q-387 item 2).
+//! `Denied` that would read as "bad ticket", and no decision is registered
+//! with it. There is no lazy first check to forget: the expectation exists
+//! from construction (it replaced the opt-in `require_description` /
+//! `require_caller_role` of A-87 / A-90, docs/52 §3.12 C12).
 //!
 //! # dird's decisions in keyd (task A15a; A-102, docs/52 R1, §4.3)
 //!
@@ -347,19 +347,36 @@ pub trait TicketVerifier: Send {
     }
 }
 
-/// The production verifier: ipc-keyd's client under Role::Ldap with F1's
-/// per-connection description check (module documentation).
-/// Spec: docs/51 §7.4 step 1; A-73; A-87.
+/// The production verifier: ipc-keyd's client expecting Role::Ldap and
+/// dird's realm on every connection (module documentation).
+/// Spec: docs/51 §7.4 step 1; A-73; A-87; docs/52 §3.12; docs/questions/
+/// Q-466 item 1 (A-102).
 pub struct KeydTicketVerifier<C: ipc_keyd::Connector> {
     client: ipc_keyd::KeydClient<C>,
-    realm: Realm,
 }
 
 impl<C: ipc_keyd::Connector> KeydTicketVerifier<C> {
-    /// A verifier over `client` for dird's `realm`.
-    #[must_use]
-    pub fn new(client: ipc_keyd::KeydClient<C>, realm: Realm) -> KeydTicketVerifier<C> {
-        KeydTicketVerifier { client, realm }
+    /// A verifier talking to keyd through `connector`: keyd runs as
+    /// `keyd_uid`, gives dird the role Ldap and serves `realm` — checked on
+    /// every connection before anything else is sent — with a per-call
+    /// `deadline` (`ipc_keyd::DEFAULT_DEADLINE` in dird).
+    ///
+    /// # Errors
+    /// `ipc_keyd::ClientConfigError` (a keyd uid of 0).
+    ///
+    /// Spec: docs/10 §2 (Role `Ldap`), §7א; docs/50 R50-3, §3.7, §7.5 step
+    /// 4; A-73; docs/questions/Q-311, Q-351, Q-466 item 1 (A-102).
+    pub fn new(
+        connector: C,
+        keyd_uid: u32,
+        realm: Realm,
+        deadline: Duration,
+    ) -> Result<KeydTicketVerifier<C>, ipc_keyd::ClientConfigError> {
+        let peer = ipc_keyd::ExpectedPeer::new(keyd_uid, keyd_types::Role::Ldap)?
+            .with_description(ipc_keyd::ExpectedDescription::Realm(realm))?;
+        Ok(KeydTicketVerifier {
+            client: ipc_keyd::KeydClient::new(connector, peer, deadline),
+        })
     }
 }
 
@@ -371,50 +388,22 @@ impl<C: ipc_keyd::Connector> fmt::Debug for KeydTicketVerifier<C> {
     }
 }
 
-impl<C: ipc_keyd::Connector> KeydTicketVerifier<C> {
-    /// The first time: keyd's description must be of dird's realm and name
-    /// dird's role Ldap; from then on both are required of every new
-    /// connection (inside `KeydClient`). `false` ⇒ not the keyd dird was
-    /// configured for, or keyd unreachable.
-    /// Spec: docs/10 §7א; docs/50 §3.7, §7.5 step 4; A-73; A-87; A-90
-    /// (docs/questions/Q-311, Q-351).
-    fn keyd_identified(&mut self) -> bool {
-        if self.client.required_description().is_some() {
-            return true;
-        }
-        let Ok(described) = self.client.describe_config_with_role() else {
-            return false;
-        };
-        // Another realm's keyd, or dird's uid mapped to another role than
-        // Ldap: a cross-wiring ⇒ unavailable.
-        if described.description.realm.as_bytes() != self.realm.as_bytes()
-            || described.caller_role != keyd_types::Role::Ldap
-        {
-            return false;
-        }
-        self.client.require_caller_role(keyd_types::Role::Ldap);
-        self.client.require_description(described.description);
-        true
-    }
-}
-
 impl<C> TicketVerifier for KeydTicketVerifier<C>
 where
     C: ipc_keyd::Connector + Send,
     C::Connection: Send,
 {
     /// Spec: docs/10 §5ב, §7א; docs/50 §3.7, §7.5 step 4; docs/52 §5 item 3;
-    /// A-56; A-87 (docs/questions/Q-311: the description required of every
-    /// new connection).
+    /// A-56; A-87 (docs/questions/Q-311); docs/questions/Q-466 (the role and
+    /// realm expected of every new connection).
     fn verify(
         &mut self,
         service: &PrincipalId,
         operation: &OperationDigest,
         ap_req: &[u8],
     ) -> Result<ServiceContext, AuthnError> {
-        if !self.keyd_identified() {
-            return Err(AuthnError::Unavailable);
-        }
+        // The client verifies keyd's uid, role and realm on every new
+        // connection before this is sent (task R9).
         self.client.open_and_verify_service_ticket(
             service,
             &AppBinding::OperationDigest(*operation),
@@ -430,9 +419,6 @@ where
         &mut self,
         decision: DecisionRegistration,
     ) -> Result<(), RegistrationFailure> {
-        if !self.keyd_identified() {
-            return Err(RegistrationFailure::NotPerformed);
-        }
         let call = ipc_keyd::Call::RegisterDecision {
             id: decision.id(),
             operation: decision.operation().clone(),
@@ -459,9 +445,6 @@ where
     /// A read: `call` (the fate is not needed — nothing changes either way).
     /// Spec: docs/52 §4.6; docs/questions/Q-470 (A-105), Q-501, Q-503.
     fn list_destroy_decisions(&mut self, after: Option<DecisionId>) -> Option<DestructionPage> {
-        if !self.keyd_identified() {
-            return None;
-        }
         self.client.list_destroy_decisions(after).ok()
     }
 }

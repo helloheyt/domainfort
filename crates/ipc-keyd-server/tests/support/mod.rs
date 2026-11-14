@@ -40,7 +40,8 @@ pub struct Faults {
     pub refuse: Option<Refused>,
     /// The server's reply gets one extra octet (not canonical / trailing).
     pub trailing_reply_octet: bool,
-    /// The server answers with a `ping` reply whatever the request.
+    /// The server answers with a `ping` reply (naming the connection's
+    /// role) whatever the request.
     pub foreign_reply: bool,
     /// When set, the exchange-level faults above (deadline, refusal,
     /// trailing octet, foreign reply) apply only to requests of this kind;
@@ -157,10 +158,12 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Connection for LoopbackConnect
         let reply = if let Some(refused) = faults.refuse {
             encode_refused(KEYD_CHANNEL, refused).map_err(|_| TransportError::Framing)?
         } else if faults.foreign_reply {
+            // A well-formed `ping` reply naming the connection's role
+            // (task R9): foreign to every operation but `ping`.
             ipc::encode_frame(
                 KEYD_CHANNEL,
                 ipc::Direction::Reply,
-                &ipc_keyd::KeydReply::Ping,
+                &ipc_keyd::KeydReply::Ping(self.caller.role),
             )
             .map_err(|_| TransportError::Framing)?
         } else {
@@ -175,5 +178,13 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Connection for LoopbackConnect
             body.push(0x00);
         }
         Ok(Zeroizing::new(body))
+    }
+
+    /// The in-process "server" lives as long as the connection and nothing
+    /// is ever written to it outside an exchange: always usable (the check
+    /// has no default since task R9 — this transport says so itself).
+    /// Spec: docs/questions/Q-312 (A-82), Q-466 item 4.
+    fn check_idle(&mut self) -> Result<(), TransportError> {
+        Ok(())
     }
 }

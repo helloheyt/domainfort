@@ -159,7 +159,7 @@ fn every_client_result_is_classified() {
     // An answer of another operation (never produced by the client, which
     // checks it) is unknown, not success.
     assert_eq!(
-        create(Ok(Answer::Ping(Ok(())))),
+        create(Ok(Answer::Ping(Ok(keyd_types::Role::Admin)))),
         Outcome::Unknown(Unknown::UnexpectedReply)
     );
     // A pairing the client never produces claims the least: "not

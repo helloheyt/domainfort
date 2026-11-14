@@ -692,6 +692,192 @@ impl Call {
     }
 }
 
+// ===========================================================================
+// The two kinds of call: state calls and issuance calls (task R9).
+// ===========================================================================
+
+impl Call {
+    /// Whether this is a **state call**: it changes keyd's key state or
+    /// loosens keyd's authorization, so keyd-daemon has its intent
+    /// acknowledged by auditd before keyd runs it, and only a request keyd
+    /// refused with the shared `Refused` is known "not performed" (A-88).
+    /// Decided by keyd's one table,
+    /// `keyd_types::authz::requires_acknowledged_intent` — the table
+    /// keyd-daemon's classification reads too (crate ipc-keyd-server
+    /// `classify`), so the client and the server cannot disagree on which
+    /// calls these are.
+    ///
+    /// Spec: docs/52 §3.10 (c), §7 R9; docs/10 §10; docs/questions/Q-365
+    /// (A-88), Q-466 item 3 (A-102).
+    #[must_use]
+    pub fn is_state_call(&self) -> bool {
+        keyd_types::authz::requires_acknowledged_intent(self.operation())
+    }
+
+    /// This call as its kind ([`RoutedCall`]), by [`Call::is_state_call`].
+    /// Spec: docs/questions/Q-466 item 3 (A-102).
+    #[must_use]
+    pub fn route(self) -> RoutedCall {
+        if self.is_state_call() {
+            RoutedCall::State(StateCall(self))
+        } else {
+            RoutedCall::Issuance(IssuanceCall(self))
+        }
+    }
+}
+
+/// A call that is **not** a state call ([`Call::is_state_call`]): issuance
+/// and verification (the Kdc and Ldap exchanges), `describe_config`,
+/// `ping`, `seal_ceremony`, `list_destroy_decisions` — and `verify_secret`,
+/// which no role holds. The only kind of call the fate-dropping
+/// `KeydClient::call` accepts.
+///
+/// Made only from a [`Call`] that is not a state call ([`Call::route`],
+/// [`IssuanceCall::new`]): the field is private, so a state call can never be an
+/// `IssuanceCall` — a state call sent through `KeydClient::call` does not
+/// compile (it is a [`StateCall`] or a [`Call`], neither of which `call`
+/// takes).
+///
+/// # The API shape, checked by the compiler
+///
+/// A state call passed to the fate-dropping `KeydClient::call` as a
+/// [`Call`] does not compile:
+///
+/// ```compile_fail
+/// fn send<C: ipc_keyd::Connector>(client: &mut ipc_keyd::KeydClient<C>) {
+///     let call = ipc_keyd::Call::RotateKey {
+///         decision: ipc_keyd::DecisionId::new(1),
+///     };
+///     let _ = client.call(&call);
+/// }
+/// ```
+///
+/// nor as a [`StateCall`]:
+///
+/// ```compile_fail
+/// fn send<C: ipc_keyd::Connector>(
+///     client: &mut ipc_keyd::KeydClient<C>,
+///     state: ipc_keyd::StateCall,
+/// ) {
+///     let _ = client.call(&state);
+/// }
+/// ```
+///
+/// and an `IssuanceCall` cannot be built around one (the field is private):
+///
+/// ```compile_fail
+/// let _ = ipc_keyd::IssuanceCall(ipc_keyd::Call::RotateKey {
+///     decision: ipc_keyd::DecisionId::new(1),
+/// });
+/// ```
+///
+/// The paths that exist compile: the state call through
+/// `KeydClient::call_with_fate` (which reports the fate), an issuance call
+/// through either.
+///
+/// ```
+/// fn send<C: ipc_keyd::Connector>(client: &mut ipc_keyd::KeydClient<C>) {
+///     let call = ipc_keyd::Call::RotateKey {
+///         decision: ipc_keyd::DecisionId::new(1),
+///     };
+///     let _ = client.call_with_fate(&call);
+///     if let Some(ping) = ipc_keyd::IssuanceCall::new(ipc_keyd::Call::Ping) {
+///         let _ = client.call(&ping);
+///     }
+/// }
+/// ```
+///
+/// Spec: docs/52 §3.10 (c), §7 R9; docs/questions/Q-367 (A-88), Q-466 item
+/// 3 (A-102).
+#[derive(Debug)]
+pub struct IssuanceCall(Call);
+
+impl IssuanceCall {
+    /// `call` as an issuance call; `None` for a state call (which is
+    /// dropped — send it with `KeydClient::call_with_fate`, or keep it with
+    /// [`Call::route`]).
+    /// Spec: docs/questions/Q-466 item 3 (A-102).
+    #[must_use]
+    pub fn new(call: Call) -> Option<IssuanceCall> {
+        match call.route() {
+            RoutedCall::Issuance(issuance) => Some(issuance),
+            RoutedCall::State(_) => None,
+        }
+    }
+
+    /// The call.
+    #[must_use]
+    pub fn call(&self) -> &Call {
+        &self.0
+    }
+
+    /// The call, by value.
+    #[must_use]
+    pub fn into_call(self) -> Call {
+        self.0
+    }
+}
+
+/// A **state call** ([`Call::is_state_call`]): `set_secret`, `create_key`,
+/// `rotate_key`, `rotate_krbtgt`, `retire_kvno`, `destroy_key_set`,
+/// `grant_set_secret`, `register_decision`. Its request's fate matters —
+/// "not performed" (keyd refused it before running it, A-88) and "outcome
+/// unknown" (it may have run) must not be folded into one `Unavailable` —
+/// so the keyd client sends it only through `KeydClient::call_with_fate`
+/// (or a typed method that returns the fate). `KeydClient::call` takes
+/// only an [`IssuanceCall`].
+///
+/// Spec: docs/52 §3.10 (c), §7 R9; docs/10 §10; docs/questions/Q-367
+/// (A-88), Q-466 item 3 (A-102).
+#[derive(Debug)]
+pub struct StateCall(Call);
+
+impl StateCall {
+    /// `call` as a state call; `None` for a call that is not one (it is
+    /// dropped — keep it with [`Call::route`]).
+    /// Spec: docs/questions/Q-466 item 3 (A-102).
+    #[must_use]
+    pub fn new(call: Call) -> Option<StateCall> {
+        match call.route() {
+            RoutedCall::State(state) => Some(state),
+            RoutedCall::Issuance(_) => None,
+        }
+    }
+
+    /// The call.
+    #[must_use]
+    pub fn call(&self) -> &Call {
+        &self.0
+    }
+
+    /// The call, by value.
+    #[must_use]
+    pub fn into_call(self) -> Call {
+        self.0
+    }
+}
+
+/// A call split into its kind by keyd's one table ([`Call::route`]).
+/// Spec: docs/questions/Q-466 item 3 (A-102).
+#[derive(Debug)]
+pub enum RoutedCall {
+    /// Not a state call: it may be sent with `KeydClient::call`.
+    Issuance(IssuanceCall),
+    /// A state call: only with `KeydClient::call_with_fate`.
+    State(StateCall),
+}
+
+impl RoutedCall {
+    /// The call.
+    #[must_use]
+    pub fn call(&self) -> &Call {
+        match self {
+            RoutedCall::Issuance(issuance) => issuance.call(),
+            RoutedCall::State(state) => state.call(),
+        }
+    }
+}
+
 /// Set-secret targets on the wire (the salt as its UTF-8 octets).
 /// Spec: docs/questions/Q-450 item 9; docs/52 §4.2 (N4).
 fn wire_targets(targets: &[SetSecretTarget]) -> Converted<Vec<WireSetSecretTarget>> {
@@ -791,10 +977,11 @@ fn proof(wire: &WireAuthnProof) -> Converted<AuthnProof> {
 /// (`ipc_keyd_server::execute`) adds the role from the same `CallerId` it
 /// handed keyd for the call — the identity keyd authorized with. The role
 /// is not secret, and it is only reported: no request carries a role, and
-/// keyd never takes one from a peer (docs/50 R50-3, §3.2). A client that
-/// requires its own role (`KeydClient::require_caller_role`) can thus tell
-/// the Kdc role from the Ldap role, which may both call `describe_config`
-/// (docs/10 §2) and which the description alone does not distinguish.
+/// keyd never takes one from a peer (docs/50 R50-3, §3.2). A client — which
+/// always expects its own role (`KeydClient`'s `ExpectedPeer`, task R9) —
+/// can thus tell the Kdc role from the Ldap role, which may both call
+/// `describe_config` (docs/10 §2) and which the description alone does not
+/// distinguish. The `Ping` answer carries the same role for every role.
 ///
 /// Spec: docs/10 §2, §7א; docs/50 §3.4 (`DescribeConfig`), §3.7;
 /// docs/questions/Q-351 (A-87).
@@ -841,8 +1028,14 @@ pub enum Answer {
     /// keyd's description and the caller's role ([`DescribedConfig`]).
     /// Spec: docs/10 §7א; docs/questions/Q-351 (A-87).
     DescribeConfig(Result<DescribedConfig, keyd_types::Error>),
-    /// Spec: docs/10 §7א.
-    Ping(Result<(), keyd_types::Error>),
+    /// keyd's health answer: on success the role keyd resolved for the
+    /// caller from the connection's peer uid (reported, never claimed —
+    /// the server side fills it from the `CallerId` keyd authorized the
+    /// call with). Every role may ping, so this is how a client of any
+    /// role verifies its own role (task R9).
+    /// Spec: docs/10 §2, §7א; docs/questions/Q-403 option (c), Q-466 item
+    /// 2 (A-102).
+    Ping(Result<Role, keyd_types::Error>),
     /// Spec: docs/51 §5.8 option (b); docs/questions/Q-450.
     GrantSetSecret(Result<(), keyd_types::Error>),
     /// Spec: docs/52 §4.2.
@@ -1020,7 +1213,7 @@ impl Answer {
                 },
                 KeydReply::Failure,
             ),
-            Answer::Ping(r) => outcome(r, |()| Ok(KeydReply::Ping), KeydReply::Failure),
+            Answer::Ping(r) => outcome(r, |role| Ok(KeydReply::Ping(*role)), KeydReply::Failure),
             Answer::GrantSetSecret(r) => {
                 outcome(r, |()| Ok(KeydReply::GrantSetSecret), KeydReply::Failure)
             }
@@ -1149,7 +1342,7 @@ impl Answer {
                 }))
             }
             (Operation::DescribeConfig, R::Failure(e)) => Answer::DescribeConfig(Err(e)),
-            (Operation::Ping, R::Ping) => Answer::Ping(Ok(())),
+            (Operation::Ping, R::Ping(role)) => Answer::Ping(Ok(role)),
             (Operation::Ping, R::Failure(e)) => Answer::Ping(Err(e)),
             (Operation::GrantSetSecret, R::GrantSetSecret) => Answer::GrantSetSecret(Ok(())),
             (Operation::GrantSetSecret, R::Failure(e)) => Answer::GrantSetSecret(Err(e)),

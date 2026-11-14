@@ -119,7 +119,8 @@ fn exchanges_over_a_real_socket_reach_dispatch() {
     let reply = connection
         .exchange(&frame_of(&Call::Ping), REPLY_LIMIT, deadline)
         .unwrap();
-    assert_eq!(reply_of(&reply), KeydReply::Ping);
+    // Task R9: the ping reply names the role keyd resolved for the caller.
+    assert_eq!(reply_of(&reply), KeydReply::Ping(keyd::Role::Kdc));
     let reply = connection
         .exchange(&frame_of(&Call::DescribeConfig), REPLY_LIMIT, deadline)
         .unwrap();
@@ -221,11 +222,14 @@ fn socket_server(test: &str, connections: usize) -> (PathBuf, PathBuf, thread::J
 #[test]
 fn without_peer_credentials_the_client_sends_nothing() {
     let (dir, path, server) = socket_server("nocred", 2);
-    let mut client =
-        KeydClient::new(UnixConnector::new(path), 900, Duration::from_secs(2)).unwrap();
+    let mut client = KeydClient::new(
+        UnixConnector::new(path),
+        ipc_keyd::ExpectedPeer::new(900, keyd::Role::Kdc).unwrap(),
+        Duration::from_secs(2),
+    );
     assert_eq!(client.ping(), Err(keyd::Error::Unavailable));
     assert_eq!(
-        client.call(&Call::Ping),
+        client.call(&ipc_keyd::IssuanceCall::new(Call::Ping).unwrap()),
         Err(ipc_keyd::Unserved::Transport(
             TransportError::PeerCredentials
         ))
@@ -257,15 +261,16 @@ fn peer_credentials_verify_the_server_uid() {
     if own_uid == 0 {
         // A root test process cannot play keyd: uid 0 is never accepted as
         // keyd's (docs/50 §3.2; Q-245 item 5). Release the server thread.
-        assert!(
-            KeydClient::new(UnixConnector::new(path2.clone()), 0, Duration::from_secs(2)).is_err()
-        );
+        assert!(ipc_keyd::ExpectedPeer::new(0, keyd::Role::Kdc).is_err());
         drop(UnixStream::connect(&path2).unwrap());
         assert_eq!(server.join().unwrap(), 0);
     } else {
-        let mut client =
-            KeydClient::new(UnixConnector::new(path2), own_uid, Duration::from_secs(2)).unwrap();
-        assert_eq!(client.ping(), Ok(()));
+        let mut client = KeydClient::new(
+            UnixConnector::new(path2),
+            ipc_keyd::ExpectedPeer::new(own_uid, keyd::Role::Kdc).unwrap(),
+            Duration::from_secs(2),
+        );
+        assert_eq!(client.ping(), Ok(keyd::Role::Kdc));
         assert!(client.describe_config().is_ok());
         drop(client);
         assert!(server.join().unwrap() > 0);
@@ -274,12 +279,11 @@ fn peer_credentials_verify_the_server_uid() {
     let (dir3, path3, server) = socket_server("cred-wrong", 1);
     let mut client = KeydClient::new(
         UnixConnector::new(path3),
-        own_uid.wrapping_add(1).max(1),
+        ipc_keyd::ExpectedPeer::new(own_uid.wrapping_add(1).max(1), keyd::Role::Kdc).unwrap(),
         Duration::from_secs(2),
-    )
-    .unwrap();
+    );
     assert_eq!(
-        client.call(&Call::Ping),
+        client.call(&ipc_keyd::IssuanceCall::new(Call::Ping).unwrap()),
         Err(ipc_keyd::Unserved::PeerMismatch)
     );
     drop(client);

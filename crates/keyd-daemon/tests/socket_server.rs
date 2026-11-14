@@ -97,7 +97,7 @@ fn a_mapped_kdc_uid_can_ping_and_describe_config() {
     for _ in 0..3 {
         assert!(matches!(
             client.call(&Call::Ping),
-            Some(Ok(Answer::Ping(Ok(()))))
+            Some(Ok(Answer::Ping(Ok(Role::Kdc))))
         ));
     }
     match client.call(&Call::DescribeConfig) {
@@ -146,7 +146,7 @@ fn a_wrong_role_gets_keyds_authorization_result() {
     ));
     assert!(matches!(
         client.call(&Call::Ping),
-        Some(Ok(Answer::Ping(Ok(()))))
+        Some(Ok(Answer::Ping(Ok(Role::Directory))))
     ));
     world.daemon.stop().unwrap();
 }
@@ -163,7 +163,7 @@ fn a_started_frame_must_finish_within_the_frame_timeout() {
     std::thread::sleep(Duration::from_millis(1500));
     assert!(matches!(
         idle.call(&Call::Ping),
-        Some(Ok(Answer::Ping(Ok(()))))
+        Some(Ok(Answer::Ping(Ok(_))))
     ));
     // Two octets of a length prefix, then nothing: closed after ~1 s.
     let mut slow = RawClient::connect(&world.daemon.socket);
@@ -205,7 +205,7 @@ fn the_connection_quota_per_uid_is_enforced() {
     for client in [&mut first, &mut second] {
         assert!(matches!(
             client.call(&Call::Ping),
-            Some(Ok(Answer::Ping(Ok(()))))
+            Some(Ok(Answer::Ping(Ok(_))))
         ));
     }
     let mut third = RawClient::connect(&world.daemon.socket);
@@ -248,7 +248,7 @@ fn audit_unreachable_refuses_issuance_while_ping_and_describe_work() {
     }));
     assert!(matches!(
         client.call(&Call::Ping),
-        Some(Ok(Answer::Ping(Ok(()))))
+        Some(Ok(Answer::Ping(Ok(_))))
     ));
     assert!(matches!(
         client.call(&Call::DescribeConfig),
@@ -332,7 +332,7 @@ fn stop_removes_the_socket_and_a_restart_replaces_a_stale_one() {
     let mut client = RawClient::connect(&socket);
     assert!(matches!(
         client.call(&Call::Ping),
-        Some(Ok(Answer::Ping(Ok(()))))
+        Some(Ok(Answer::Ping(Ok(_))))
     ));
     world.daemon.stop().unwrap();
     assert!(!socket.exists());
@@ -352,7 +352,7 @@ fn stop_removes_the_socket_and_a_restart_replaces_a_stale_one() {
     let mut client = RawClient::connect(&daemon.socket);
     assert!(matches!(
         client.call(&Call::Ping),
-        Some(Ok(Answer::Ping(Ok(()))))
+        Some(Ok(Answer::Ping(Ok(_))))
     ));
     daemon.stop().unwrap();
 }

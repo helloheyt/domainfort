@@ -415,7 +415,7 @@ fn a_mapped_kdc_caller_can_ping_and_describe_config() {
     let clock = TestClock::at(t0());
     let (mut engine, _gate) = engine(&clock, WindowConfig::DEFAULT, true);
     let (answer, open) = serve(&mut engine, KDC, &Call::Ping);
-    assert!(matches!(answer, Ok(Answer::Ping(Ok(())))));
+    assert!(matches!(answer, Ok(Answer::Ping(Ok(keyd::Role::Kdc)))));
     assert!(open);
     match serve(&mut engine, KDC, &Call::DescribeConfig).0 {
         Ok(Answer::DescribeConfig(Ok(described))) => {
@@ -473,7 +473,7 @@ fn the_hold_down_runs_on_keyds_clock_from_construction() {
     ));
     assert!(matches!(
         serve(&mut engine, KDC, &Call::Ping).0,
-        Ok(Answer::Ping(Ok(())))
+        Ok(Answer::Ping(Ok(keyd::Role::Kdc)))
     ));
     clock.set(Some(at(601)));
     // Served: the hold-down is over; the bogus PA-DATA is keyd's uniform
@@ -533,7 +533,7 @@ fn audit_unreachable_refuses_gating_operations_but_serves_ping_and_describe() {
     }
     assert!(matches!(
         serve(&mut engine, KDC, &Call::Ping).0,
-        Ok(Answer::Ping(Ok(())))
+        Ok(Answer::Ping(Ok(keyd::Role::Kdc)))
     ));
     assert!(matches!(
         serve(&mut engine, KDC, &Call::DescribeConfig).0,
@@ -589,7 +589,7 @@ fn a_full_window_refuses_gating_operations_until_acknowledged() {
     );
     assert!(matches!(
         serve(&mut engine, ADMIN, &Call::Ping).0,
-        Ok(Answer::Ping(Ok(())))
+        Ok(Answer::Ping(Ok(keyd::Role::Admin)))
     ));
     acknowledge_all(&gate);
     assert!(matches!(
@@ -1052,7 +1052,7 @@ fn a_full_queue_answers_busy_at_once() {
         let outcome = pending.blocking_recv().unwrap();
         assert!(matches!(
             reply(Operation::Ping, &outcome).0,
-            Ok(Answer::Ping(Ok(())))
+            Ok(Answer::Ping(Ok(_)))
         ));
     }
     drop(handle);
@@ -1084,7 +1084,7 @@ fn queued_requests_are_answered_before_the_engine_ends() {
         let outcome = receiver.blocking_recv().unwrap();
         assert!(matches!(
             reply(Operation::Ping, &outcome).0,
-            Ok(Answer::Ping(Ok(())))
+            Ok(Answer::Ping(Ok(_)))
         ));
     }
     thread.join().unwrap();

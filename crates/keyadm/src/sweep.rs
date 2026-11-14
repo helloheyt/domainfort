@@ -136,8 +136,10 @@ fn list(keyd: &mut dyn KeydPort, after: Option<DecisionId>) -> Result<Destructio
 ///
 /// Spec: docs/51 §6, §9; docs/52 §4.2, §4.3; docs/10 §7; A-35; A-88; A-90.
 pub fn run(keyd: &mut dyn KeydPort) -> SweepReport {
+    // Task R9: the role was checked by the client's probe of the new
+    // connection; the answer's role is that one.
     let contact = classify(keyd.call_with_fate(&Call::Ping), |answer| match answer {
-        Answer::Ping(result) => Some(result),
+        Answer::Ping(result) => Some(result.map(|_caller_role| ())),
         _ => None,
     });
     let mut report = SweepReport {

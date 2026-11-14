@@ -93,6 +93,12 @@ impl Connection for LoopConnection<'_, '_> {
             Dispatch::Close => Err(TransportError::Closed),
         }
     }
+
+    /// The in-process server outlives the connection: always usable
+    /// (docs/questions/Q-312; no default since task R9, Q-466 item 4).
+    fn check_idle(&mut self) -> Result<(), TransportError> {
+        Ok(())
+    }
 }
 
 impl Drop for LoopConnection<'_, '_> {
@@ -102,7 +108,7 @@ impl Drop for LoopConnection<'_, '_> {
 }
 
 fn client<'s, 'a>(server: &'s RefCell<DirectoryServer<'a>>) -> DirectoryClient<Loopback<'s, 'a>> {
-    DirectoryClient::new(
+    DirectoryClient::connect(
         Loopback {
             server,
             next: Rc::new(Cell::new(0)),
@@ -506,9 +512,10 @@ fn the_server_refuses_to_start_without_a_domain() {
     }
 }
 
-/// docs/50 R50-2: a view of another policy version is refused by the kdc's
-/// client (fail closed, the kdc reloads), and dird releases it when the
-/// client drops the connection.
+/// docs/50 R50-2, §7.5 step 4; docs/questions/Q-466 (task R9): a dird of
+/// another policy version is refused by the kdc's client at its start-time
+/// `DescribeDomain` (fail closed: no client, the kdc does not start), and
+/// no view is ever opened.
 #[test]
 fn the_kdc_refuses_a_view_of_another_policy_version() {
     let d = Dir::standard("ids_version");
@@ -516,12 +523,24 @@ fn the_kdc_refuses_a_view_of_another_policy_version() {
     let server = RefCell::new(
         DirectoryServer::new(&d.ctx, &d.store, &tiers, PolicyVersion(4), LIMITS).unwrap(),
     );
-    let mut kdc_side = client(&server);
+    // Task R9: the kdc's client checks the version at its start-time
+    // DescribeDomain — no client, and no view was opened.
+    let kdc_side = DirectoryClient::connect(
+        Loopback {
+            server: &server,
+            next: Rc::new(Cell::new(0)),
+        },
+        DIRD_UID,
+        Duration::from_secs(2),
+        VERSION,
+    );
     assert_eq!(
-        kdc_side.begin_view().err(),
-        Some(Unserved::PolicyVersionMismatch {
-            dird: PolicyVersion(4)
-        })
+        kdc_side.err(),
+        Some(ipc_directory::ConnectError::Unserved(
+            Unserved::PolicyVersionMismatch {
+                dird: PolicyVersion(4)
+            }
+        ))
     );
     assert_eq!(server.borrow().open_views(), 0);
 }

@@ -31,17 +31,22 @@
 //! without being sent. A request is never sent twice: once written, any
 //! failure ends the call.
 //!
-//! # Each new connection is checked with `DescribeDomain` (Q-311)
+//! # The domain is pinned at construction and checked on every connection (Q-311, task R9)
 //!
-//! With [`DirectoryClient::require_domain`] (set by the kdc daemon with the
-//! description it started from, docs/50 §7.5 step 4), every new connection,
-//! after its peer uid and before any other request, carries a
-//! `DescribeDomain` whose answer must be exactly that description — the
-//! realm, the naming context, the krbtgt handle and the policy version
-//! (A-69). Another policy version is
+//! A [`DirectoryClient`] exists only through [`DirectoryClient::connect`],
+//! which opens the first connection, checks its peer uid, and asks
+//! `DescribeDomain` — the description the kdc starts from (docs/50 §7.5
+//! step 4) — refusing a policy version other than the kdc's. That
+//! description is then the client's expected domain for its whole life:
+//! every **new** connection, after its peer uid and before any other
+//! request, carries a `DescribeDomain` whose answer must be exactly that
+//! description — the realm, the naming context, the krbtgt handle and the
+//! policy version (A-69). Another policy version is
 //! [`Unserved::PolicyVersionMismatch`]; any other difference, or any failure
 //! of that exchange, drops the connection and the call is not served
-//! (`Unavailable`, the KDC's 29).
+//! (`Unavailable`, the KDC's 29). There is no client without the expected
+//! domain and nothing to switch the check off (it replaces the opt-in
+//! `require_domain` of A-82, docs/52 §3.12 C12).
 //!
 //! # The view and the policy version (R50-2)
 //!
@@ -62,7 +67,7 @@
 //! |---|---|---|
 //! | connect failed, I/O error, peer closed, deadline exceeded | `Unavailable` | `PipError::Unavailable` |
 //! | peer uid unreadable or not dird's (nothing sent) | `Unavailable` | `PipError::Unavailable` |
-//! | the new connection's `DescribeDomain` different or not answered (when required) | `Unavailable` | `PipError::Unavailable` |
+//! | the new connection's `DescribeDomain` different or not answered | `Unavailable` | `PipError::Unavailable` |
 //! | the held connection failed its idle check inside a view (nothing sent) | `Unavailable` | `PipError::Unavailable` |
 //! | `Refused::{Busy, Unavailable, Malformed, VersionMismatch}` | `Unavailable` | `PipError::Unavailable` |
 //! | a reply that does not decode, or answers another request | `Unavailable` | `PipError::Unavailable` |
@@ -85,8 +90,8 @@
 //! PDP denies (D40; docs/50 §3.4).
 //!
 //! Spec: docs/50 R50-2, R50-3, R50-7, R50-8, §3.1-§3.7, §7.5, §10; docs/47
-//! §8.1, §8.2; docs/11 §6, §9; D40; A-56; A-69; docs/questions/Q-311,
-//! Q-312 (A-82).
+//! §8.1, §8.2; docs/11 §6, §9; D40; A-56; A-69; docs/52 §3.12, §7 R9;
+//! docs/questions/Q-311, Q-312 (A-82), Q-466 (A-102).
 
 use crate::channel::{ViewFailure, DIRECTORY_CHANNEL, REPLY_LIMIT};
 use crate::typed::{ConversionError, DomainDescription, Query, Request};
@@ -175,15 +180,15 @@ pub trait Connection {
     /// connection before the request is sent; nothing is ever sent on a
     /// connection that failed this check.
     ///
-    /// The default reports the connection usable — for a transport that
-    /// cannot tell (an in-process loopback): a dead connection is then found
-    /// by the exchange itself, as before.
+    /// **No default** (task R9; docs/52 §2 row 19): every connection
+    /// decides. A transport that truly cannot tell (an in-process loopback
+    /// whose server lives as long as the connection) says so in its own
+    /// implementation; the client runs the check before every reuse.
     ///
     /// Spec: docs/50 §3.6 ("an idle connection is allowed — clients hold a
-    /// permanent connection"), §3.7, R50-7; docs/questions/Q-312 (A-82).
-    fn check_idle(&mut self) -> Result<(), TransportError> {
-        Ok(())
-    }
+    /// permanent connection"), §3.7, R50-7; docs/questions/Q-312 (A-82),
+    /// Q-466 item 4 (A-102).
+    fn check_idle(&mut self) -> Result<(), TransportError>;
 }
 
 /// Opens connections to dird.
@@ -205,10 +210,10 @@ pub enum Unserved {
     /// The transport failed.
     Transport(TransportError),
     /// The peer is not the dird this client was configured for: its uid is
-    /// not dird's (nothing was sent), or — when the client requires a domain
-    /// description ([`DirectoryClient::require_domain`]) — the new
-    /// connection's `DescribeDomain` answered another realm, naming context
-    /// or krbtgt handle (nothing else was sent; docs/questions/Q-311).
+    /// not dird's (nothing was sent), or the new connection's
+    /// `DescribeDomain` answered another realm, naming context or krbtgt
+    /// handle than the domain pinned at construction (nothing else was
+    /// sent; docs/questions/Q-311, Q-466).
     PeerMismatch,
     /// dird answered with the shared transport refusal.
     Refused(Refused),
@@ -258,6 +263,19 @@ pub enum ClientConfigError {
     /// dird's uid cannot be 0: dird never runs as root after its hardening
     /// (docs/50 §6), and accepting uid 0 would accept any root process.
     RootServerUid,
+}
+
+/// Why [`DirectoryClient::connect`] gave no client.
+/// Spec: docs/50 §3.2, §3.7, §7.5 step 4; docs/questions/Q-466 (A-102).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectError {
+    /// The configuration is unacceptable.
+    Config(ClientConfigError),
+    /// dird did not serve the start-time `DescribeDomain`: not reachable,
+    /// not dird's uid, a refusal, a reply that does not decode — or a
+    /// policy version other than the kdc's
+    /// ([`Unserved::PolicyVersionMismatch`]).
+    Unserved(Unserved),
 }
 
 /// The time left of a call's `deadline` that started at `start`; none left
@@ -312,16 +330,16 @@ enum Reconnect {
 
 /// A synchronous client of the directory-view channel.
 /// Spec: docs/50 R50-2, R50-3, R50-7, R50-8, §3.4, §3.6, §10;
-/// docs/questions/Q-311, Q-312 (A-82).
+/// docs/questions/Q-311, Q-312 (A-82), Q-466 (A-102).
 pub struct DirectoryClient<C: Connector> {
     connector: C,
     expected_uid: u32,
     deadline: Duration,
     policy_version: PolicyVersion,
     connection: Option<C::Connection>,
-    /// When set, every new connection's `DescribeDomain` must answer
-    /// exactly this (Q-311).
-    domain: Option<DomainDescription>,
+    /// The domain dird described at construction: every new connection's
+    /// `DescribeDomain` must answer exactly this (Q-311; task R9 — always).
+    domain: DomainDescription,
 }
 
 impl<C: Connector> fmt::Debug for DirectoryClient<C> {
@@ -331,59 +349,76 @@ impl<C: Connector> fmt::Debug for DirectoryClient<C> {
             .field("deadline", &self.deadline)
             .field("policy_version", &self.policy_version)
             .field("connected", &self.connection.is_some())
-            .field("checks_domain", &self.domain.is_some())
+            .field("realm", &self.domain.realm)
             .finish()
     }
 }
 
 impl<C: Connector> DirectoryClient<C> {
-    /// A client of the dird process running as `expected_uid`, with a
-    /// per-call `deadline` ([`DEFAULT_DEADLINE`] in the kdc daemon), for a
-    /// kdc whose loaded policy has version `policy_version` (R50-2).
+    /// Connect to the dird process running as `expected_uid` and pin its
+    /// domain: the first connection's peer uid is checked before anything
+    /// is sent, then `DescribeDomain` gives the description the kdc starts
+    /// from (docs/50 §7.5 step 4) — refused unless its policy version is
+    /// `policy_version`, the version of the kdc's loaded policy (R50-2) —
+    /// and that description is expected, exactly, of every later new
+    /// connection ([`DirectoryClient::domain`]). The connection is kept for
+    /// the following calls. Per-call `deadline`: [`DEFAULT_DEADLINE`] in the
+    /// kdc daemon (the start-time exchange included).
     ///
     /// # Errors
-    /// [`ClientConfigError::RootServerUid`].
+    /// [`ConnectError::Config`] (a dird uid of 0);
+    /// [`ConnectError::Unserved`] (dird did not describe its domain, or
+    /// another policy version — [`Unserved::PolicyVersionMismatch`]).
     ///
-    /// Spec: docs/50 R50-2, R50-3, §3.6.
-    pub fn new(
-        connector: C,
+    /// Spec: docs/50 R50-2, R50-3, §3.4, §3.6, §7.5 step 4; A-69;
+    /// docs/questions/Q-311 (A-82), Q-466 (A-102).
+    pub fn connect(
+        mut connector: C,
         expected_uid: u32,
         deadline: Duration,
         policy_version: PolicyVersion,
-    ) -> Result<Self, ClientConfigError> {
+    ) -> Result<Self, ConnectError> {
         if expected_uid == 0 {
-            return Err(ClientConfigError::RootServerUid);
+            return Err(ConnectError::Config(ClientConfigError::RootServerUid));
+        }
+        let start = Instant::now();
+        let unserved = ConnectError::Unserved;
+        let mut connection = connector
+            .connect()
+            .map_err(|e| unserved(Unserved::Transport(e)))?;
+        let uid = connection
+            .peer_uid()
+            .map_err(|e| unserved(Unserved::Transport(e)))?;
+        if uid != expected_uid {
+            // Dropped here: nothing was sent on it.
+            return Err(unserved(Unserved::PeerMismatch));
+        }
+        let describe = encode_request(&Request::DescribeDomain).map_err(unserved)?;
+        let left = remaining(start, deadline).map_err(|e| unserved(Unserved::Transport(e)))?;
+        let reply = exchange_on(&mut connection, &describe, left).map_err(unserved)?;
+        let domain = reply
+            .into_domain()
+            .map_err(|e| unserved(Unserved::UnexpectedReply(e)))?;
+        if domain.policy_version != policy_version {
+            return Err(unserved(Unserved::PolicyVersionMismatch {
+                dird: domain.policy_version,
+            }));
         }
         Ok(DirectoryClient {
             connector,
             expected_uid,
             deadline,
             policy_version,
-            connection: None,
-            domain: None,
+            connection: Some(connection),
+            domain,
         })
     }
 
-    /// Require every **new** connection — after its peer uid, before any
-    /// other request is sent on it — to answer `DescribeDomain` with exactly
-    /// `domain` (the description the kdc started from, docs/50 §7.5 step 4).
-    /// Another policy version is [`Unserved::PolicyVersionMismatch`];
-    /// another realm, naming context or krbtgt handle is
-    /// [`Unserved::PeerMismatch`]; any failure of that exchange is that
-    /// failure. The connection is then dropped and the call is not served
-    /// (`Unavailable`). The connection held now, if any, is kept.
-    ///
-    /// Spec: docs/50 R50-2, R50-3, R50-8, §3.4, §7.5 step 4; A-69;
-    /// docs/questions/Q-311 (A-82).
-    pub fn require_domain(&mut self, domain: DomainDescription) {
-        self.domain = Some(domain);
-    }
-
-    /// The description every new connection must answer, if required.
-    /// Spec: docs/questions/Q-311 (A-82).
+    /// The domain pinned at construction — what every new connection must
+    /// describe. Spec: docs/50 §7.5 step 4; docs/questions/Q-311 (A-82).
     #[must_use]
-    pub fn required_domain(&self) -> Option<&DomainDescription> {
-        self.domain.as_ref()
+    pub fn domain(&self) -> &DomainDescription {
+        &self.domain
     }
 
     /// The policy version views must carry.
@@ -393,9 +428,11 @@ impl<C: Connector> DirectoryClient<C> {
     }
 
     /// Set the policy version views must carry (after the kdc reloaded its
-    /// policy). Spec: docs/50 §3.4 ("the kdc reloads").
+    /// policy) — and that the pinned domain's new connections must describe
+    /// (A-69). Spec: docs/50 §3.4 ("the kdc reloads").
     pub fn set_policy_version(&mut self, version: PolicyVersion) {
         self.policy_version = version;
+        self.domain.policy_version = version;
     }
 
     /// The connector (e.g. to inspect a test loopback).
@@ -415,9 +452,8 @@ impl<C: Connector> DirectoryClient<C> {
     }
 
     /// The held connection if it is still usable, or (outside a view) a new
-    /// one — its peer uid dird's and, when required, its `DescribeDomain`
-    /// answering the expected description — before anything else is sent on
-    /// it. A held connection that fails its idle check is dropped here,
+    /// one — its peer uid dird's and its `DescribeDomain` answering the
+    /// domain pinned at construction — before anything else is sent on it. A held connection that fails its idle check is dropped here,
     /// before the request is sent (nothing was sent on it in this call).
     /// Spec: docs/50 R50-3, §3.2, §3.4, §3.6, §3.7; docs/questions/Q-311,
     /// Q-312 (A-82).
@@ -447,22 +483,20 @@ impl<C: Connector> DirectoryClient<C> {
                 // Dropped here: nothing was sent on it.
                 return Err(Unserved::PeerMismatch);
             }
-            if let Some(expected) = self.domain.as_ref() {
-                // Q-311: the start-time check, repeated on this connection
-                // before anything else is sent on it. On any failure the
-                // connection is dropped here.
-                let describe = encode_request(&Request::DescribeDomain)?;
-                let left = remaining(start, self.deadline).map_err(Unserved::Transport)?;
-                let reply = exchange_on(&mut connection, &describe, left)?;
-                let domain = reply.into_domain().map_err(Unserved::UnexpectedReply)?;
-                if domain.policy_version != expected.policy_version {
-                    return Err(Unserved::PolicyVersionMismatch {
-                        dird: domain.policy_version,
-                    });
-                }
-                if domain != *expected {
-                    return Err(Unserved::PeerMismatch);
-                }
+            // Q-311 / task R9: the start-time check, repeated on this
+            // connection before anything else is sent on it — always. On
+            // any failure the connection is dropped here.
+            let describe = encode_request(&Request::DescribeDomain)?;
+            let left = remaining(start, self.deadline).map_err(Unserved::Transport)?;
+            let reply = exchange_on(&mut connection, &describe, left)?;
+            let domain = reply.into_domain().map_err(Unserved::UnexpectedReply)?;
+            if domain.policy_version != self.domain.policy_version {
+                return Err(Unserved::PolicyVersionMismatch {
+                    dird: domain.policy_version,
+                });
+            }
+            if domain != self.domain {
+                return Err(Unserved::PeerMismatch);
             }
             self.connection = Some(connection);
         }

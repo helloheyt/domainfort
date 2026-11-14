@@ -40,13 +40,15 @@
 //! clock (R50-5, A-56); the time fields below are ticket facts and template
 //! times only (`authtime`, `starttime`, `endtime`, `renew_till`,
 //! `armor_authtime`) — never passed to keyd as its `now`. The one role on the
-//! wire travels the other way: the `DescribeConfig` reply reports the role
-//! keyd resolved for the caller from its peer uid ([`WireConfigDescription`];
-//! docs/questions/Q-351, A-87), so that a client can refuse a keyd that does
-//! not give it its own role. No request field is ever read as a role.
+//! wire travels the other way: the `DescribeConfig` and `Ping` replies report
+//! the role keyd resolved for the caller from its peer uid
+//! ([`WireConfigDescription`]; [`KeydReply::Ping`]; docs/questions/Q-351,
+//! A-87; Q-466, A-102), so that a client of **any** role can refuse a keyd
+//! that does not give it its own role. No request field is ever read as a
+//! role.
 //!
 //! Spec: docs/50 §3.3, §3.4, R50-3, R50-4, R50-5; docs/10 §1-§9; A-56, A-59;
-//! docs/questions/Q-351 (A-87).
+//! docs/questions/Q-351 (A-87), Q-466 item 2 (A-102).
 
 use crate::channel::{
     reply_kind, request_kind, MAX_DECISION_APPROVERS, MAX_DESTROY_PAGE, MAX_ENCTYPES,
@@ -1476,12 +1478,13 @@ impl Payload for WireServiceContext {
     }
 }
 
-/// Wire code of the caller's role in the `DescribeConfig` reply. Project
-/// choice: a closed table in the order of `keyd_types::Role`; 0x00 and
-/// 0x05-0xFF name no role and are refused.
+/// Wire code of the caller's role in the `DescribeConfig` and `Ping`
+/// replies (one table for both). Project choice: a closed table in the
+/// order of `keyd_types::Role`; 0x00 and 0x05-0xFF name no role and are
+/// refused.
 /// Spec: docs/50 §3.3 ("enum = `u8` from a closed table"); docs/10 §2
 /// (`enum Role`, the phase-1 variants of keyd-types); docs/questions/Q-351
-/// (A-87).
+/// (A-87), Q-466 item 2 (A-102).
 const fn caller_role_code(role: Role) -> u8 {
     match role {
         Role::Kdc => 0x01,
@@ -1691,8 +1694,14 @@ pub enum KeydReply {
     /// keyd's description and the caller's role.
     /// Spec: docs/10 §7א; docs/questions/Q-351 (A-87).
     DescribeConfig(WireConfigDescription),
-    /// Spec: docs/10 §7א.
-    Ping,
+    /// keyd is serving, and the role keyd resolved for the caller from the
+    /// connection's peer uid — the only field, appended to what was an
+    /// empty payload (task R9). Every role may ping (docs/10 §2), so every
+    /// client can check its own role on each new connection before it
+    /// sends anything else, whatever operations its role may call.
+    /// Spec: docs/10 §2, §7א; docs/50 §3.4 (`Ping`), §3.7;
+    /// docs/questions/Q-403 option (c), Q-466 item 2 (A-102).
+    Ping(Role),
     /// The grant is registered. Spec: docs/51 §5.8 option (b);
     /// docs/questions/Q-450.
     GrantSetSecret,
@@ -1731,7 +1740,7 @@ impl MessageSet for KeydReply {
             KeydReply::RetireKvno => reply_kind::RETIRE_KVNO,
             KeydReply::DestroyKeySet => reply_kind::DESTROY_KEY_SET,
             KeydReply::DescribeConfig(_) => reply_kind::DESCRIBE_CONFIG,
-            KeydReply::Ping => reply_kind::PING,
+            KeydReply::Ping(_) => reply_kind::PING,
             KeydReply::GrantSetSecret => reply_kind::GRANT_SET_SECRET,
             KeydReply::RegisterDecision => reply_kind::REGISTER_DECISION,
             KeydReply::SealCeremony => reply_kind::SEAL_CEREMONY,
@@ -1758,12 +1767,14 @@ impl MessageSet for KeydReply {
             KeydReply::VerifySecret
             | KeydReply::RetireKvno
             | KeydReply::DestroyKeySet
-            | KeydReply::Ping
             | KeydReply::GrantSetSecret
             | KeydReply::RegisterDecision
             | KeydReply::SealCeremony => Ok(()),
             KeydReply::ListDestroyDecisions(m) => m.write_fields(writer),
             KeydReply::DescribeConfig(m) => m.write_fields(writer),
+            // Q-466 item 2 (A-102): the caller role, from the table of the
+            // `DescribeConfig` reply.
+            KeydReply::Ping(role) => writer.write_enum(caller_role_code(*role)),
             KeydReply::AuthnFailure(e) => writer.write_enum(authn_error_code(*e)),
             KeydReply::IssueFailure(e) => writer.write_enum(issue_error_code(*e)),
             KeydReply::Failure(e) => writer.write_enum(error_code(*e)),
@@ -1801,7 +1812,7 @@ impl MessageSet for KeydReply {
             reply_kind::DESCRIBE_CONFIG => {
                 KeydReply::DescribeConfig(WireConfigDescription::read_fields(reader)?)
             }
-            reply_kind::PING => KeydReply::Ping,
+            reply_kind::PING => KeydReply::Ping(reader.read_enum(caller_role_from_code)?),
             reply_kind::GRANT_SET_SECRET => KeydReply::GrantSetSecret,
             reply_kind::REGISTER_DECISION => KeydReply::RegisterDecision,
             reply_kind::SEAL_CEREMONY => KeydReply::SealCeremony,

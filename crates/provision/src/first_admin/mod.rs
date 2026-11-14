@@ -413,8 +413,10 @@ where
         .keyd
         .client(&settings)
         .map_err(|_| Refusal::KeydClient)?;
+    // Task R9: the client's probe of the new connection already checked
+    // the caller role (Directory); the answer's role is that one.
     let contact = classify(client.call_with_fate(&Call::Ping), |answer| match answer {
-        Answer::Ping(result) => Some(result),
+        Answer::Ping(result) => Some(result.map(|_caller_role| ())),
         _ => None,
     });
     let mut report = SecretReport {

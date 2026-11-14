@@ -9,7 +9,9 @@
 //! verifies the server's uid), R50-7, R50-8 (§3.7: not served ⇒
 //! `Unavailable`), §3.4 (the `Pip` subset; "the other `Pip` methods … return
 //! `PipError` locally without asking"), §3.6 (deadline); docs/47 §8.2; D40;
-//! A-56. Every value is hand-made (tests/common).
+//! A-56; docs/questions/Q-466 (task R9: the client exists only with dird's
+//! domain pinned — `DirectoryClient::connect`). Every value is hand-made
+//! (tests/common).
 
 mod common;
 
@@ -19,7 +21,7 @@ use ipc::{decode_body, encode_refused, Direction, FrameLimit, Refused};
 use ipc_directory::typed::{Query, Request};
 use ipc_directory::wire::{DirectoryReply, DirectoryRequest};
 use ipc_directory::{
-    ClientConfigError, Connection, Connector, DirectoryClient, TransportError,
+    ClientConfigError, ConnectError, Connection, Connector, DirectoryClient, TransportError,
     UnavailableDirectory, Unserved, ViewFailure, DIRECTORY_CHANNEL,
 };
 use kdc::{AccountSource, AccountSourceError};
@@ -75,20 +77,37 @@ impl Connection for ScriptConnection {
             .unwrap_or(Err(TransportError::Closed))
             .map(Zeroizing::new)
     }
+
+    /// The scripted connection lives as long as the script: always usable
+    /// (the check has no default since task R9).
+    fn check_idle(&mut self) -> Result<(), TransportError> {
+        Ok(())
+    }
 }
 
+/// A client connected to the scripted dird (its start-time
+/// `DescribeDomain` answered with [`domain`], task R9); the script's record
+/// starts after it.
 fn setup(uid: u32) -> (Rc<RefCell<Script>>, DirectoryClient<ScriptConnector>) {
     let script = Rc::new(RefCell::new(Script {
         uid,
         ..Script::default()
     }));
-    let client = DirectoryClient::new(
+    push(&script, &DirectoryReply::from_domain(&domain()));
+    let client = DirectoryClient::connect(
         ScriptConnector(Rc::clone(&script)),
         DIRD_UID,
         Duration::from_secs(2),
         VERSION,
     )
     .unwrap();
+    assert_eq!(client.domain(), &domain());
+    {
+        let mut script = script.borrow_mut();
+        assert_eq!(script.received, [Request::DescribeDomain]);
+        script.received.clear();
+        script.connects = 0;
+    }
     (script, client)
 }
 
@@ -121,18 +140,58 @@ fn alice() -> krb_proto::PrincipalName {
 fn a_root_server_uid_is_refused() {
     let script = Rc::new(RefCell::new(Script::default()));
     assert_eq!(
-        DirectoryClient::new(ScriptConnector(script), 0, Duration::from_secs(2), VERSION).err(),
-        Some(ClientConfigError::RootServerUid)
+        DirectoryClient::connect(ScriptConnector(script), 0, Duration::from_secs(2), VERSION).err(),
+        Some(ConnectError::Config(ClientConfigError::RootServerUid))
     );
 }
 
-/// docs/50 R50-3: a peer that is not dird's uid receives nothing.
+/// docs/50 R50-3; Q-466 (task R9): a peer that is not dird's uid receives
+/// nothing — there is no client at all.
 #[test]
 fn a_wrong_peer_uid_receives_nothing() {
-    let (script, mut client) = setup(DIRD_UID + 1);
-    assert_eq!(client.begin_view().err(), Some(Unserved::PeerMismatch));
-    assert_eq!(client.describe_domain().err(), Some(Unserved::PeerMismatch));
+    let script = Rc::new(RefCell::new(Script {
+        uid: DIRD_UID + 1,
+        ..Script::default()
+    }));
+    assert_eq!(
+        DirectoryClient::connect(
+            ScriptConnector(Rc::clone(&script)),
+            DIRD_UID,
+            Duration::from_secs(2),
+            VERSION
+        )
+        .err(),
+        Some(ConnectError::Unserved(Unserved::PeerMismatch))
+    );
     assert!(script.borrow().received.is_empty());
+}
+
+/// docs/50 R50-2, §3.4, §7.5 step 4; Q-466 (task R9): a dird whose
+/// start-time `DescribeDomain` names another policy version gives no client
+/// (`PolicyVersionMismatch`: the kdc does not start); only `DescribeDomain`
+/// was sent.
+#[test]
+fn a_dird_of_another_policy_version_gives_no_client() {
+    let script = Rc::new(RefCell::new(Script {
+        uid: DIRD_UID,
+        ..Script::default()
+    }));
+    let mut other = domain();
+    other.policy_version = PolicyVersion(8);
+    push(&script, &DirectoryReply::from_domain(&other));
+    assert_eq!(
+        DirectoryClient::connect(
+            ScriptConnector(Rc::clone(&script)),
+            DIRD_UID,
+            Duration::from_secs(2),
+            VERSION
+        )
+        .err(),
+        Some(ConnectError::Unserved(Unserved::PolicyVersionMismatch {
+            dird: PolicyVersion(8)
+        }))
+    );
+    assert_eq!(script.borrow().received, [Request::DescribeDomain]);
 }
 
 /// docs/50 R50-2, §3.4: a view carries the request's queries with its id,
@@ -211,10 +270,15 @@ fn a_different_policy_version_refuses_the_view() {
     );
     assert!(!client.is_connected());
     client.set_policy_version(PolicyVersion(8));
+    // The new connection describes the domain first (task R9) — now of the
+    // version the kdc reloaded.
+    let mut reloaded = domain();
+    reloaded.policy_version = PolicyVersion(8);
+    push(&script, &DirectoryReply::from_domain(&reloaded));
     push(&script, &begun(2, 8));
     push(&script, &DirectoryReply::ViewEnded);
     client.begin_view().unwrap().end().unwrap();
-    assert_eq!(script.borrow().connects, 2);
+    assert_eq!(script.borrow().connects, 1);
 }
 
 /// docs/50 R50-8, §3.6, §3.7; A-56: every way dird may not serve a query —
@@ -306,11 +370,15 @@ fn no_view_means_the_unavailable_directory() {
         client.begin_view().err(),
         Some(Unserved::Transport(TransportError::Closed))
     );
+    // Each later call opens a new connection, which describes the domain
+    // first (task R9).
+    push(&script, &DirectoryReply::from_domain(&domain()));
     push_refused(&script, Refused::Busy);
     assert_eq!(
         client.begin_view().err(),
         Some(Unserved::Refused(Refused::Busy))
     );
+    push(&script, &DirectoryReply::from_domain(&domain()));
     push(
         &script,
         &DirectoryReply::ViewFailure(ViewFailure::ViewLimit),

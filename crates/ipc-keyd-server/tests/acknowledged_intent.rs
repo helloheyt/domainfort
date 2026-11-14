@@ -207,3 +207,24 @@ fn reads_are_plain() {
         assert!(execute(&mut keyd, plain).is_ok());
     }
 }
+
+/// docs/52 §3.10 (c), §7 R9; docs/questions/Q-466 item 3 (A-102: one
+/// classification consistent with `classify` / `KeyStateIntent`, not a
+/// second, divergent list): for every call of every operation
+/// (crates/ipc-keyd tests/samples), the keyd client's split — a state call
+/// has no fate-dropping path (`ipc_keyd::Call::is_state_call`) — is exactly
+/// the set of calls this crate takes through the intent path: those
+/// `keyd::requires_acknowledged_intent` names (the one table, in
+/// keyd-types), which are those `KeyStateIntent::of` derives an intent from
+/// or that execute a decision by id.
+#[test]
+fn the_clients_state_calls_are_the_calls_classified_for_an_intent() {
+    for call in samples::calls() {
+        let operation = call.operation();
+        let server_side = keyd::requires_acknowledged_intent(operation);
+        assert_eq!(call.is_state_call(), server_side, "{operation:?}");
+        let derived = ipc_keyd_server::KeyStateIntent::of(ADMIN, now(), &call).is_some()
+            || call.decision().is_some();
+        assert_eq!(derived, server_side, "{operation:?}");
+    }
+}

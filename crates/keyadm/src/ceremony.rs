@@ -136,9 +136,10 @@ impl Step {
 /// `RequestFate::NotSent`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotSent {
-    /// The socket's peer uid is not the configured keyd uid (R50-3). (Also
-    /// a failed `DescribeConfig` check of a client that requires one —
-    /// keyadm's never does.)
+    /// The socket's peer is not the keyd expected: its uid is not the
+    /// configured keyd uid (R50-3), or the new connection's `Ping` probe
+    /// failed — keyd does not give this account the Admin role, or refused
+    /// or did not answer the probe (task R9; only the probe was sent).
     PeerMismatch,
     /// The socket could not be connected.
     Connect,
@@ -200,7 +201,7 @@ impl<T> Outcome<T> {
 /// The client's fate decides the class (it alone knows whether the request
 /// was written); the `Unserved` reason only chooses the text. A combination
 /// the client never produces — a refusal reported as not sent other than by
-/// the `DescribeConfig` check, or anything but a `Refused` reported as not
+/// the new connection's probe, or anything but a `Refused` reported as not
 /// performed — falls to the class that claims least: not sent ⇒ the peer
 /// check, not performed ⇒ outcome unknown.
 ///
@@ -362,8 +363,11 @@ impl CeremonyReport {
 /// docs/52 §4.2 (N4), §4.4 (R3); A-19; A-35; A-77; docs/questions/Q-367
 /// (A-88: each call's fate from the client), Q-451, Q-462 item 1.
 pub fn run<C: Connector>(client: &mut KeydClient<C>, manifest: &Manifest) -> CeremonyReport {
+    // Task R9: the client's probe of the new connection already checked
+    // that keyd gives this account the Admin role; the role in the answer
+    // is that one.
     let contact = classify(client.call_with_fate(&Call::Ping), |answer| match answer {
-        Answer::Ping(result) => Some(result),
+        Answer::Ping(result) => Some(result.map(|_caller_role| ())),
         _ => None,
     });
     let first_admins = manifest.first_admins().len();

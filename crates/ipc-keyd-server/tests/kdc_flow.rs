@@ -97,8 +97,11 @@ impl IpcWorld {
         )
         .unwrap();
         let server = share(keyd, keyd_clock);
-        let mut admin =
-            KeydClient::new(Loopback::new(&server, ADMIN), KEYD_UID, DEFAULT_DEADLINE).unwrap();
+        let mut admin = KeydClient::new(
+            Loopback::new(&server, ADMIN),
+            ipc_keyd::ExpectedPeer::new(KEYD_UID, ADMIN.role).unwrap(),
+            DEFAULT_DEADLINE,
+        );
         let enctypes: Vec<krb_crypto::EncType> = server
             .borrow()
             .keyd
@@ -117,22 +120,21 @@ impl IpcWorld {
             }
             admin
                 .create_key(&handle, &PrincipalBinding::new(realm(), binding))
+                .unwrap()
                 .unwrap();
         }
         let mut directory = KeydClient::new(
             Loopback::new(&server, DIRECTORY),
-            KEYD_UID,
+            ipc_keyd::ExpectedPeer::new(KEYD_UID, DIRECTORY.role).unwrap(),
             DEFAULT_DEADLINE,
-        )
-        .unwrap();
+        );
         // dird's set-secret decisions (Role::Ldap, after its PDP; task A15a,
         // A-102) over the channel too.
         let mut ldap = KeydClient::new(
             Loopback::new(&server, LDAP_CALLER),
-            KEYD_UID,
+            ipc_keyd::ExpectedPeer::new(KEYD_UID, LDAP_CALLER.role).unwrap(),
             DEFAULT_DEADLINE,
-        )
-        .unwrap();
+        );
         for (id, handle, who, password, salt) in [
             (1, ALICE, alice_name(), ALICE_PASSWORD, ALICE_SALT),
             (2, BOB, bob_name(), BOB_PASSWORD, BOB_SALT),
@@ -150,6 +152,7 @@ impl IpcWorld {
                 &[],
                 keyd::MAX_SET_SECRET_GRANT_SECS,
             )
+            .unwrap()
             .unwrap();
             directory
                 .set_secret(
@@ -158,16 +161,14 @@ impl IpcWorld {
                     String::from(password).into(),
                     salt,
                 )
+                .unwrap()
                 .unwrap();
         }
-        let custody = IpcKeyd::connect(
-            KeydClient::new(
-                Loopback::new(&server, KDC_CALLER),
-                KEYD_UID,
-                DEFAULT_DEADLINE,
-            )
-            .unwrap(),
-        )
+        let custody = IpcKeyd::connect(KeydClient::new(
+            Loopback::new(&server, KDC_CALLER),
+            ipc_keyd::ExpectedPeer::new(KEYD_UID, KDC_CALLER.role).unwrap(),
+            DEFAULT_DEADLINE,
+        ))
         .unwrap();
         let mut kdc = Kdc::new(
             KdcConfig::new(realm(), KRBTGT),
@@ -541,10 +542,9 @@ fn ipc_custody_describes_keyds_configuration() {
     server.borrow_mut().faults.refuse_connect = true;
     let client = KeydClient::new(
         Loopback::new(&server, KDC_CALLER),
-        KEYD_UID,
+        ipc_keyd::ExpectedPeer::new(KEYD_UID, KDC_CALLER.role).unwrap(),
         DEFAULT_DEADLINE,
-    )
-    .unwrap();
+    );
     assert_eq!(
         IpcKeyd::connect(client).map(|_| ()),
         Err(keyd::Error::Unavailable)

@@ -347,7 +347,7 @@ fn provisioning_to_a_new_users_login() {
         // with keyd's uniform Denied: dird's PDP never granted it. Nothing
         // changes (alice keeps her password; her later operations work).
         let alice_key_set = w.manifest.first_admins()[0].key_set().clone();
-        let mut rogue = key_state_client(&w.aux_keyd_socket, w.uid);
+        let mut rogue = key_state_client(&w.aux_keyd_socket, w.uid, keyd::Role::Directory);
         let rogue_call = ipc_keyd::Call::SetSecret {
             handle: alice_key_set.handle,
             binding: alice_key_set.binding.clone(),
@@ -497,7 +497,11 @@ fn provisioning_to_a_new_users_login() {
         // A-102 (docs/52 §4.3): dird registered a destroy decision for
         // dave's tombstone; keyadm's sweep (Role::Admin on the same keyd)
         // runs exactly it — keyadm destroys only what dird decided.
-        let swept = keyadm::sweep::run(&mut key_state_client(&w.grant_keyd_socket, w.uid));
+        let swept = keyadm::sweep::run(&mut key_state_client(
+            &w.grant_keyd_socket,
+            w.uid,
+            keyd::Role::Admin,
+        ));
         assert!(swept.is_complete(), "{swept:?}");
         assert_eq!(
             swept
@@ -542,7 +546,7 @@ fn provisioning_to_a_new_users_login() {
             other => panic!("Approve: {other:?}"),
         }
         let rotated = keyadm::execute::run(
-            &mut key_state_client(&w.grant_keyd_socket, w.uid),
+            &mut key_state_client(&w.grant_keyd_socket, w.uid, keyd::Role::Admin),
             keyadm::cli::Approved::RotateKrbtgt,
             request_id,
         );

@@ -53,7 +53,7 @@ pub fn exit_code(report: &CeremonyReport) -> u8 {
 const fn not_sent_text(reason: NotSent) -> &'static str {
     match reason {
         NotSent::PeerMismatch => {
-            "the keyd socket's peer uid is not the configured keyd_uid (nothing was sent)"
+            "the keyd socket's peer is not the expected keyd: its uid is not keyd_uid, or keyd does not give this account the Admin role (nothing was sent)"
         }
         NotSent::Connect => "the keyd socket could not be connected (nothing was sent)",
         NotSent::PeerCredentials => {
@@ -173,11 +173,18 @@ pub fn render(report: &CeremonyReport, manifest: &Manifest) -> Vec<String> {
         Step::ALL.len()
     )];
     let contact = match report.contact {
-        Outcome::Answered(Ok(())) => "keyd reached; its peer uid is the configured keyd_uid".to_owned(),
+        Outcome::Answered(Ok(())) => {
+            "keyd reached; its peer uid is the configured keyd_uid and it gives this account the Admin role".to_owned()
+        }
         Outcome::Answered(Err(error)) => format!(
             "keyd refused the contact ({}); no key set was touched",
             keyd_error_text(error)
         ),
+        // Task R9: keyd closing the new connection at its probe — an
+        // unmapped uid (docs/50 §3.2) — nothing was sent.
+        Outcome::NotSent(NotSent::Transport(TransportError::Closed)) => {
+            "contact failed: keyd closed the connection before it answered (is this account mapped to Admin in keyd's uid_roles?); nothing was sent".to_owned()
+        }
         Outcome::NotSent(reason) => format!("contact failed: {}", not_sent_text(reason)),
         Outcome::NotPerformed(refused) => format!(
             "contact failed: {}; no key set was touched",

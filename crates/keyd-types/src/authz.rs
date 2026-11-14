@@ -306,6 +306,109 @@ pub const fn requires_decision(op: Operation) -> bool {
     }
 }
 
+/// `true` if `op` installs, rotates, retires or destroys long-term key
+/// versions: keyd's key state, which cannot be undone once the operation
+/// ran. The throttles, the replay cache and the token tables are
+/// bookkeeping, not key state (crate keyd `state_change`, which re-exports
+/// this table).
+///
+/// **One table for both ends of the keyd channel (task R9, docs/52 §3.10
+/// (c)).** It lives here, in the crypto-free crate, so that keyd-daemon's
+/// classification of a call (crate ipc-keyd-server `classify`, through
+/// [`requires_acknowledged_intent`]) and the keyd client's split of its
+/// API (crate ipc-keyd: a state call has no fate-dropping path) read the
+/// same table — never two lists that could drift apart. Moved here from
+/// crate keyd unchanged.
+///
+/// The match is exhaustive: a new operation does not compile until it is
+/// classified here.
+///
+/// Spec: docs/10 §6 (`set_secret`), §7 (`create_key`, `rotate_key`,
+/// `rotate_krbtgt`, `retire_kvno`, `destroy_key_set`), §10;
+/// docs/questions/Q-346 (A-86), Q-466 item 3 (A-102).
+#[must_use]
+pub const fn changes_key_state(op: Operation) -> bool {
+    match op {
+        Operation::SetSecret
+        | Operation::CreateKey
+        | Operation::RotateKey
+        | Operation::RotateKrbtgt
+        | Operation::RetireKvno
+        | Operation::DestroyKeySet => true,
+        Operation::VerifyPreauth
+        | Operation::IssueAsRep
+        | Operation::OpenAndVerifyTgt
+        | Operation::IssueTgsRep
+        | Operation::VerifySecret
+        | Operation::OpenFastArmor
+        | Operation::SealFastError
+        | Operation::OpenAndVerifyServiceTicket
+        | Operation::DescribeConfig
+        | Operation::Ping
+        | Operation::GrantSetSecret
+        | Operation::RegisterDecision
+        | Operation::SealCeremony
+        | Operation::ListDestroyDecisions => false,
+    }
+}
+
+/// `true` if `op` makes keyd **less** strict without changing key state:
+/// `grant_set_secret` (task A15a) and `register_decision` (A-102), each of
+/// which lets Role::Directory or Role::Admin run a state change keyd would
+/// otherwise refuse. Every other change keyd makes to its in-memory tables
+/// only ever makes it stricter. Audited like a key-state change: intent
+/// acknowledged first, then the outcome ([`requires_acknowledged_intent`]).
+/// Moved here from crate keyd unchanged (see [`changes_key_state`]).
+///
+/// The match is exhaustive: a new operation does not compile until it is
+/// classified here.
+///
+/// Spec: docs/51 §5.8 option (b); docs/52 §4.5; docs/questions/Q-291
+/// (A-74), Q-365 item 2 (A-88), Q-452, Q-466 item 3 (A-102).
+#[must_use]
+pub const fn loosens_authorization(op: Operation) -> bool {
+    match op {
+        Operation::GrantSetSecret | Operation::RegisterDecision => true,
+        Operation::VerifyPreauth
+        | Operation::IssueAsRep
+        | Operation::OpenAndVerifyTgt
+        | Operation::IssueTgsRep
+        | Operation::SetSecret
+        | Operation::VerifySecret
+        | Operation::CreateKey
+        | Operation::RotateKey
+        | Operation::RotateKrbtgt
+        | Operation::RetireKvno
+        | Operation::OpenFastArmor
+        | Operation::SealFastError
+        | Operation::DestroyKeySet
+        | Operation::OpenAndVerifyServiceTicket
+        | Operation::DescribeConfig
+        | Operation::Ping
+        | Operation::SealCeremony
+        | Operation::ListDestroyDecisions => false,
+    }
+}
+
+/// `true` if the daemon must have the intent of `op` acknowledged by auditd
+/// before keyd runs it (A-86 / A-88): a key-state change
+/// ([`changes_key_state`]) or a change that loosens keyd's authorization
+/// ([`loosens_authorization`]).
+///
+/// The one classification of a keyd call as a **state call**: keyd-daemon
+/// runs such a call only with the proof of its acknowledged intent (crate
+/// ipc-keyd-server `classify`, `execute_acknowledged`), and the keyd client
+/// sends it only through the path that reports the request's fate (crate
+/// ipc-keyd `StateCall`, `KeydClient::call_with_fate`) — "not performed"
+/// and "outcome unknown" are never folded into one `Unavailable` for it.
+///
+/// Spec: docs/questions/Q-346 (A-86), Q-365 (A-88), Q-452 item 1, Q-466
+/// item 3 (A-102); docs/52 §3.10 (c), §7 R9.
+#[must_use]
+pub const fn requires_acknowledged_intent(op: Operation) -> bool {
+    changes_key_state(op) || loosens_authorization(op)
+}
+
 /// `true` if the operation is refused during keyd's startup hold-down: for
 /// two `clock_skew_secs` intervals after the start time given to `Keyd::new`
 /// (A-62: an authenticator accepted just before the restart may carry a

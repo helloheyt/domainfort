@@ -309,14 +309,6 @@ mod dird_admin_connector {
     }
 }
 
-/// A keyd client for `socket`, keyd running as `uid` (the host's
-/// connector: crates/directory-daemon tests support `connector::keyd`),
-/// with the production deadline (docs/50 §3.6) — for calls that change no
-/// key state.
-pub fn keyd_client(socket: &Path, uid: u32) -> KeydClient<connector::KeydConnector> {
-    KeydClient::new(connector::keyd(socket), uid, ipc_keyd::DEFAULT_DEADLINE).unwrap()
-}
-
 /// keyd's intent-acknowledgement budget in these tests: the ceiling
 /// (crates/keyd-daemon `MAX_INTENT_ACK_BUDGET`, 2 s) instead of the
 /// production 1 s — the real auditd syncs its log before it acknowledges,
@@ -334,9 +326,18 @@ pub const KEY_STATE_DEADLINE: Duration = Duration::from_secs(4);
 const _: () =
     assert!(keyd_daemon::MAX_INTENT_ACK_BUDGET.as_nanos() * 2 <= KEY_STATE_DEADLINE.as_nanos());
 
-/// A keyd client for key-state changes ([`KEY_STATE_DEADLINE`]).
-pub fn key_state_client(socket: &Path, uid: u32) -> KeydClient<connector::KeydConnector> {
-    KeydClient::new(connector::keyd(socket), uid, KEY_STATE_DEADLINE).unwrap()
+/// A keyd client for key-state changes ([`KEY_STATE_DEADLINE`]), expecting
+/// keyd to resolve this process to `role` (task R9).
+pub fn key_state_client(
+    socket: &Path,
+    uid: u32,
+    role: Role,
+) -> KeydClient<connector::KeydConnector> {
+    KeydClient::new(
+        connector::keyd(socket),
+        ipc_keyd::ExpectedPeer::new(uid, role).unwrap(),
+        KEY_STATE_DEADLINE,
+    )
 }
 
 /// dird's decision-acknowledgement wait in these tests: twice the
@@ -679,7 +680,12 @@ impl KeydAccess for TestKeyd {
     ) -> Result<KeydClient<connector::KeydConnector>, ipc_keyd::ClientConfigError> {
         assert_eq!(settings.keyd().socket().as_path(), self.produced);
         assert!(settings.keyd_deadline() <= KEY_STATE_DEADLINE);
-        KeydClient::new(connector::keyd(&self.socket), self.uid, KEY_STATE_DEADLINE)
+        // The command runs as admind's account: Role::Directory (task R9).
+        Ok(KeydClient::new(
+            connector::keyd(&self.socket),
+            ipc_keyd::ExpectedPeer::new(self.uid, Role::Directory)?,
+            KEY_STATE_DEADLINE,
+        ))
     }
 }
 
@@ -1099,7 +1105,8 @@ impl World {
             settings.keyd().socket().as_path(),
             self.input.paths.keyd_socket.as_path()
         );
-        let mut client = key_state_client(settings.keyd().socket().as_path(), self.uid);
+        let mut client =
+            key_state_client(settings.keyd().socket().as_path(), self.uid, Role::Admin);
         let report = keyadm::ceremony::run(&mut client, &self.manifest);
         self.captured
             .extend(keyadm::report::render(&report, &self.manifest));
@@ -1168,7 +1175,7 @@ impl World {
             self.keyd.as_ref().map(|k| k.phase),
             Some(KeydPhase::Provisioning)
         );
-        let mut ldap = key_state_client(&self.grant_keyd_socket, self.uid);
+        let mut ldap = key_state_client(&self.grant_keyd_socket, self.uid, Role::Ldap);
         // The fixture is a computer (`CreateComputer`, no SPN: one key set).
         let kind = keyd::AccountKind::Computer;
         let targets: Vec<keyd::SetSecretTarget> = self
@@ -1187,8 +1194,9 @@ impl World {
             &[],
             keyd::MAX_SET_SECRET_GRANT_SECS,
         )
+        .expect("keyd answered the workstation's decision")
         .expect("the workstation's decision");
-        let mut client = key_state_client(&self.aux_keyd_socket, self.uid);
+        let mut client = key_state_client(&self.aux_keyd_socket, self.uid, Role::Directory);
         let mut kvnos = Vec::new();
         for target in self.workstation.keys.clone() {
             let call = Call::SetSecret {
@@ -1241,10 +1249,17 @@ impl World {
         assert_eq!(keyd_socket, paths.keyd_socket.as_path());
         let uid = self.uid;
         let factory: VerifierFactory = Arc::new(move || {
-            let verifier: Box<dyn TicketVerifier> = Box::new(KeydTicketVerifier::new(
-                keyd_client(&keyd_socket, uid),
-                realm(),
-            ));
+            // Task R9: keyd's uid, the role Ldap and the realm, expected of
+            // every keyd connection.
+            let verifier: Box<dyn TicketVerifier> = Box::new(
+                KeydTicketVerifier::new(
+                    connector::keyd(&keyd_socket),
+                    uid,
+                    realm(),
+                    ipc_keyd::DEFAULT_DEADLINE,
+                )
+                .ok()?,
+            );
             Some(verifier)
         });
         admin.keyd = Some(factory);
@@ -1354,8 +1369,11 @@ impl World {
             )
             .unwrap(),
         );
-        let keyd: Box<dyn admin_daemon::KeydLink> =
-            Box::new(key_state_client(&self.aux_keyd_socket, self.uid));
+        let keyd: Box<dyn admin_daemon::KeydLink> = Box::new(key_state_client(
+            &self.aux_keyd_socket,
+            self.uid,
+            Role::Directory,
+        ));
         let params = admin_daemon::DaemonParams {
             admin_socket: settings.admin_socket().as_path().to_path_buf(),
             audit: admin_daemon::AuditEndpoint {

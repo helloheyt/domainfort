@@ -156,7 +156,10 @@ pub fn execute_acknowledged<S: KeyStore, A: AuditSink, E: EntropySource>(
 ///
 /// A described configuration also reports `caller.role` — the role keyd
 /// authorized this very call with — beside keyd's description
-/// ([`DescribedConfig`]; docs/questions/Q-351, A-87).
+/// ([`DescribedConfig`]; docs/questions/Q-351, A-87), and so does a
+/// successful ping (every role may ping: the probe with which every keyd
+/// client verifies its own role on each new connection — task R9,
+/// docs/questions/Q-466 item 2, A-102).
 ///
 /// Spec: docs/10 §2 (`CallerId` "derived from the connected peer … not
 /// claimed by the caller"), §4-§7א; docs/50 R50-3, R50-5; A-56;
@@ -275,7 +278,9 @@ fn run<S: KeyStore, A: AuditSink, E: EntropySource>(
                 }
             }))
         }
-        Call::Ping => Answer::Ping(keyd.ping(caller, now)),
+        // Q-466 item 2 (A-102, task R9): the same role, for every role —
+        // the one keyd's capability check just used for this ping.
+        Call::Ping => Answer::Ping(keyd.ping(caller, now).map(|()| caller.role)),
         // Task A15a (docs/51 §5.8 option (b)): the lifetime is relative; keyd
         // adds its own `now` — the daemon's clock, never the peer's (R50-5).
         Call::GrantSetSecret {

@@ -2,14 +2,16 @@
 //! (from admind's configuration — keyd's socket, keyd's uid, the deadline)
 //! and what each call's result means.
 //!
-//! The client is crates/ipc-keyd's `KeydClient`: before anything is sent on
-//! a new connection it checks that the socket's peer uid is keyd's
-//! configured uid (R50-3; A-63), so a process that took over the socket
-//! path receives no password. Role::Directory may not call
-//! `DescribeConfig` (docs/10 §2), so no description or caller role is
-//! required of the connection — a keyd that maps this uid to another role
-//! refuses `set_secret` with its uniform `Denied` before any intent (A-88;
-//! as admind, docs/questions/Q-403).
+//! The client is crates/ipc-keyd's `KeydClient`, built only with the keyd
+//! this command expects ([`expected_keyd`]: keyd's configured uid, the
+//! caller role **Directory** — this command runs as admind's account).
+//! Before anything else is sent on a new connection it checks that the
+//! socket's peer uid is keyd's (R50-3; A-63), so a process that took over
+//! the socket path receives no password, and that keyd resolves this
+//! process to Role::Directory — the connection's `Ping` probe, whose reply
+//! names the caller role (task R9; docs/questions/Q-403 option (c),
+//! Q-466). A keyd that maps this uid to another role is refused there: no
+//! `set_secret` is sent to it (**not sent**).
 //!
 //! # What each outcome means ([`classify`])
 //!
@@ -20,17 +22,18 @@
 //! |---|---|
 //! | keyd answered `Ok(kvno)` | yes, with that kvno (A-35: keyd chose it) |
 //! | keyd answered `Err(Denied / Unavailable / RateLimited)` | no |
-//! | **not sent** — connect failed, peer uid not keyd's, peer credentials unreadable, deadline before sending, unencodable | no — nothing left this process |
+//! | **not sent** — connect failed, peer uid not keyd's, keyd does not give this uid Role::Directory (or refused the probe), peer credentials unreadable, deadline before sending, unencodable | no — nothing but the probe left this process |
 //! | **not performed** — keyd's shared `Refused` (`Busy`, `Unavailable`, `Malformed`, `VersionMismatch`) | no — keyd-daemon refuses a key-state change only before keyd runs it (A-88) |
 //! | **outcome unknown** — the request was handed to the connection and no usable reply came | **maybe**: check keyd's audit log (it holds the intent and the outcome) before retrying |
 //!
 //! Spec: docs/51 §4.3 step 12; docs/10 §2, §6, §9, §10; docs/50 R50-3,
-//! §3.6, §3.7; A-63; A-88; A-90 (Q-367, Q-370); docs/questions/Q-403.
+//! §3.6, §3.7; A-63; A-88; A-90 (Q-367, Q-370); docs/questions/Q-403,
+//! Q-466 (A-102).
 
 use ipc::Refused;
 use ipc_keyd::{
-    Answer, CallFailure, ClientConfigError, Connector, KeydClient, RequestFate, TransportError,
-    UnixConnector, Unserved,
+    Answer, CallFailure, ClientConfigError, Connector, ExpectedPeer, KeydClient, RequestFate, Role,
+    TransportError, UnixConnector, Unserved,
 };
 use keyd_types::Error as KeydError;
 
@@ -48,6 +51,20 @@ pub trait KeydAccess {
         &mut self,
         settings: &config::AdmindSettings,
     ) -> Result<KeydClient<Self::Connector>, ClientConfigError>;
+}
+
+/// The keyd this command expects, from admind's configuration: keyd's uid,
+/// resolving this process (admind's account) to Role::Directory — verified
+/// on every connection before anything else is sent (task R9). Every
+/// [`KeydAccess`] builds its client with it.
+///
+/// # Errors
+/// [`ClientConfigError`] (a keyd uid of 0).
+///
+/// Spec: docs/10 §2 (Role `Directory`); docs/50 R50-3; docs/51 §4.3 step
+/// 12; docs/questions/Q-466 items 1-2 (A-102).
+pub fn expected_keyd(settings: &config::AdmindSettings) -> Result<ExpectedPeer, ClientConfigError> {
+    ExpectedPeer::new(settings.keyd().uid(), Role::Directory)
 }
 
 /// The production access: keyd's Unix socket, keyd's uid and the deadline
@@ -74,11 +91,11 @@ impl KeydAccess for UnixKeyd {
         &mut self,
         settings: &config::AdmindSettings,
     ) -> Result<KeydClient<UnixConnector>, ClientConfigError> {
-        KeydClient::new(
+        Ok(KeydClient::new(
             UnixConnector::new(settings.keyd().socket().as_path().to_path_buf()),
-            settings.keyd().uid(),
+            expected_keyd(settings)?,
             settings.keyd_deadline(),
-        )
+        ))
     }
 }
 
@@ -146,7 +163,9 @@ pub fn classify<T>(
 #[must_use]
 pub const fn not_sent_text(reason: Unserved) -> &'static str {
     match reason {
-        Unserved::PeerMismatch => "the keyd socket's peer uid is not the configured keyd_uid",
+        Unserved::PeerMismatch => {
+            "the keyd socket's peer is not the expected keyd: its uid is not keyd_uid, or keyd does not give this account Role::Directory"
+        }
         Unserved::Transport(TransportError::Connect) => "the keyd socket could not be connected",
         Unserved::Transport(TransportError::PeerCredentials) => {
             "the keyd socket's peer credentials could not be read (Linux only)"
@@ -217,7 +236,7 @@ mod tests {
             Outcome::Answered(Ok(Kvno::INITIAL))
         );
         assert_eq!(
-            classify(Ok(Answer::Ping(Ok(()))), pick),
+            classify(Ok(Answer::Ping(Ok(Role::Directory))), pick),
             Outcome::Unknown(Unserved::UnexpectedReply(
                 ipc_keyd::ConversionError::UnexpectedReply
             ))

@@ -14,17 +14,31 @@
 //! strictness"): never a panic; whatever decodes re-encodes to exactly the
 //! input. A decoded `DescribeConfig` reply carries the caller role as its
 //! last octet, from the closed table 0x01-0x04 (docs/questions/Q-351,
-//! A-87): every other value was refused.
+//! A-87): every other value was refused. A decoded `Ping` reply is the
+//! envelope and exactly that one octet (task R9, docs/questions/Q-466 item
+//! 2): the caller role, from the same table.
 //!
 //! Written, not run (PENDING-OWNER P-1).
 //!
-//! Spec: docs/50 §3.3, §3.4, §9; R50-4; A-59; docs/questions/Q-351 (A-87).
+//! Spec: docs/50 §3.3, §3.4, §9; R50-4; A-59; docs/questions/Q-351 (A-87),
+//! Q-466 (A-102).
 
 use ipc::{decode_reply, encode_refused, Reply};
 use ipc_keyd::channel::MAX_DESTROY_PAGE;
 use ipc_keyd::{encode_answer, Answer, KeydReply, KEYD_CHANNEL};
 use keyd::{Operation, Role};
 use libfuzzer_sys::fuzz_target;
+
+/// The wire code of a caller role (the closed table of crates/ipc-keyd
+/// wire.rs; Q-351, Q-466).
+fn role_code(role: Role) -> u8 {
+    match role {
+        Role::Kdc => 0x01,
+        Role::Directory => 0x02,
+        Role::Admin => 0x03,
+        Role::Ldap => 0x04,
+    }
+}
 
 fuzz_target!(|data: &[u8]| {
     let Some((&selector, body)) = data.split_first() else {
@@ -40,13 +54,13 @@ fuzz_target!(|data: &[u8]| {
             if let Ok(answer) = Answer::from_wire(operation, reply) {
                 assert_eq!(answer.operation(), operation);
                 if let Answer::DescribeConfig(Ok(described)) = &answer {
-                    let code = match described.caller_role {
-                        Role::Kdc => 0x01,
-                        Role::Directory => 0x02,
-                        Role::Admin => 0x03,
-                        Role::Ldap => 0x04,
-                    };
+                    let code = role_code(described.caller_role);
                     assert_eq!(body.last(), Some(&code), "the caller role, last");
+                }
+                if let Answer::Ping(Ok(caller_role)) = &answer {
+                    // Envelope (4 octets) ‖ the caller role (Q-466 item 2).
+                    assert_eq!(body.len(), 5, "the role is the whole payload");
+                    assert_eq!(body.last(), Some(&role_code(*caller_role)));
                 }
                 if let Answer::GrantSetSecret(Ok(())) = &answer {
                     // The registered grant answers with its kind alone: the

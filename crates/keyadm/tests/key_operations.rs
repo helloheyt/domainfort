@@ -50,20 +50,18 @@ use zeroize::Zeroizing;
 fn keyd_client(world: &World) -> KeydClient<connectors::KeydConnector> {
     KeydClient::new(
         connectors::keyd(&world.keyadm_keyd_socket),
-        world.uid,
+        ipc_keyd::ExpectedPeer::new(world.uid, keyd_types::Role::Admin).unwrap(),
         Duration::from_secs(1),
     )
-    .unwrap()
 }
 
 /// admind's client of the same keyd (Role::Directory on `kd.sock`).
 fn admind_keyd_client(world: &World) -> KeydClient<connectors::KeydConnector> {
     KeydClient::new(
         connectors::keyd(&world.keyd_dir_socket),
-        world.uid,
+        ipc_keyd::ExpectedPeer::new(world.uid, keyd_types::Role::Directory).unwrap(),
         Duration::from_secs(1),
     )
-    .unwrap()
 }
 
 /// admin1 requests `operation` through admind; admin2 approves it — the
@@ -256,7 +254,7 @@ fn a_keyd_that_never_answers_is_reported_as_outcome_unknown() {
     let Some(world) = World::new(Options::default()) else {
         return;
     };
-    let silent = SilentServer::start(&world.keyadm_keyd_socket);
+    let silent = SilentServer::start(&world.keyadm_keyd_socket, keyd_types::Role::Admin);
     let id = request_and_approve(&world, KeyOperation::RotateKrbtgt);
     let report = execute::run(&mut keyd_client(&world), Approved::RotateKrbtgt, id);
     assert!(matches!(report.keyd, Outcome::Unknown(_)), "{report:?}");
@@ -416,7 +414,7 @@ fn the_n1_takeover_is_refused_at_every_step() {
             }],
             MAX_INITIAL_SECRET_GRANT_SECS,
         ),
-        Err(KeydError::Denied)
+        Ok(Err(KeydError::Denied))
     );
     // Step 3: admind's uid sets the secret without a decision.
     assert_eq!(
@@ -426,7 +424,7 @@ fn the_n1_takeover_is_refused_at_every_step() {
             Zeroizing::new("attacker-chosen-1".to_owned()),
             "test-salt-ws9",
         ),
-        Err(KeydError::Denied)
+        Ok(Err(KeydError::Denied))
     );
     assert!(eventually(Duration::from_secs(10), || {
         !all_records(&world, KeydOperation::SetSecret).is_empty()

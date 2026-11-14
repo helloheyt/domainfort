@@ -12,25 +12,26 @@
 //!   a resend (A-87), replies decoded strictly and checked to answer the
 //!   request; deadline `ipc_dird_admin::DEFAULT_DEADLINE` (24 s, A-100; Q-389
 //!   item 5).
-//! * **keyd** — `ipc_keyd::KeydClient` under Role::Directory (keyd's
-//!   `uid_roles` maps admind's uid to Directory, A-57, A-73): keyd's uid
-//!   checked on every new connection before anything is sent (A-63);
-//!   `set_secret` always through `call_with_fate` (A-90), so a request that
-//!   reached keyd without a usable answer is reported as "outcome unknown",
-//!   never as "not done". Role::Directory may not call `DescribeConfig`
-//!   (docs/10 §2, A-90), so admind does not require a description: a keyd
-//!   that maps admind's uid to another role refuses `set_secret` at its
-//!   authorization step (role, docs/10 §2 I2) with `Denied` before any
-//!   intent — nothing changes, the `SetPassword` fails at its `SetSecret`
-//!   step, and keyd's own record says `RoleNotPermitted`
-//!   (docs/questions/Q-403).
+//! * **keyd** — `ipc_keyd::KeydClient` expecting Role::Directory (keyd's
+//!   `uid_roles` maps admind's uid to Directory, A-57, A-73): on every new
+//!   connection, before anything else is sent, keyd's uid (A-63) and then
+//!   the caller role keyd resolves for admind — the connection's `Ping`
+//!   probe, whose reply names it (task R9; docs/questions/Q-403 option (c),
+//!   Q-466). A keyd that maps admind's uid to another role is refused
+//!   there: no `set_secret` is sent to it, and the `SetPassword` fails at
+//!   its `SetSecret` step as **not sent** (keyd unavailable / misconfigured
+//!   — no longer keyd's `Denied`, the residual A-94 accepted).
+//!   `set_secret` always goes through `call_with_fate` (A-90), so a request
+//!   that reached keyd without a usable answer is reported as "outcome
+//!   unknown", never as "not done".
 //!
 //! Spec: docs/51 §5.1, §7.1, §7.6; docs/50 R50-3, §3.6, §3.7; docs/10 §2,
-//! §6; A-57; A-63; A-73; A-87; A-90.
+//! §6; docs/52 §3.12; A-57; A-63; A-73; A-87; A-90; docs/questions/Q-466
+//! (A-102).
 
 use core::time::Duration;
 use ipc_dird_admin::{AdminClient, Reply, Request, Unserved};
-use ipc_keyd::{Answer, Call, CallFailure, KeydClient};
+use ipc_keyd::{Answer, Call, CallFailure, ExpectedPeer, KeydClient, Role};
 use std::path::Path;
 
 /// One call on dird's admin channel.
@@ -98,23 +99,37 @@ pub fn unix_dird(socket: &Path, dird_uid: u32) -> Result<Box<dyn DirdLink>, Root
     .map_err(|_| RootServerUid)
 }
 
-/// admind's client of keyd over its Unix socket, with `deadline`
-/// (`keyd_deadline`, ≤ 2 s — docs/50 §3.6).
+/// The keyd admind expects: `keyd_uid`, resolving admind to
+/// Role::Directory — verified on every connection before anything else is
+/// sent (task R9). Every keyd client admind builds — its own and its
+/// tests' — starts here.
 ///
 /// # Errors
 /// [`RootServerUid`].
 ///
-/// Spec: docs/50 R50-3, §3.6; A-63.
+/// Spec: docs/10 §2 (Role `Directory`); docs/50 R50-3; docs/52 §3.12;
+/// docs/questions/Q-403 option (c), Q-466 items 1-2 (A-102).
+pub fn expected_keyd(keyd_uid: u32) -> Result<ExpectedPeer, RootServerUid> {
+    ExpectedPeer::new(keyd_uid, Role::Directory).map_err(|_| RootServerUid)
+}
+
+/// admind's client of keyd over its Unix socket, with `deadline`
+/// (`keyd_deadline`, ≤ 2 s — docs/50 §3.6), expecting
+/// [`expected_keyd`].
+///
+/// # Errors
+/// [`RootServerUid`].
+///
+/// Spec: docs/50 R50-3, §3.6; A-63; docs/questions/Q-466 (A-102).
 pub fn unix_keyd(
     socket: &Path,
     keyd_uid: u32,
     deadline: Duration,
 ) -> Result<Box<dyn KeydLink>, RootServerUid> {
-    KeydClient::new(
+    let client = KeydClient::new(
         ipc_keyd::UnixConnector::new(socket.to_path_buf()),
-        keyd_uid,
+        expected_keyd(keyd_uid)?,
         deadline,
-    )
-    .map(|client| Box::new(client) as Box<dyn KeydLink>)
-    .map_err(|_| RootServerUid)
+    );
+    Ok(Box::new(client))
 }

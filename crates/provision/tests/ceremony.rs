@@ -120,6 +120,12 @@ mod connector {
         ) -> Result<Zeroizing<Vec<u8>>, TransportError> {
             self.inner.exchange(frame, reply_limit, deadline)
         }
+
+        /// The wrapped connection's own idle check (docs/questions/Q-312;
+        /// no default since task R9, Q-466 item 4).
+        fn check_idle(&mut self) -> Result<(), TransportError> {
+            self.inner.check_idle()
+        }
     }
 }
 
@@ -161,8 +167,11 @@ fn keyadm_ceremony_completes_with_the_produced_manifest_and_role_map() {
     let realm = Realm::new(keyd_settings.realm()).unwrap();
     let daemon = Daemon::start(params, SystemClock, development_keyd(realm)).unwrap();
     // keyd runs in-process, as the test's uid.
-    let mut client =
-        KeydClient::new(connector::new(&daemon.socket), uid, DEFAULT_DEADLINE).unwrap();
+    let mut client = KeydClient::new(
+        connector::new(&daemon.socket),
+        ipc_keyd::ExpectedPeer::new(uid, keyd::Role::Admin).unwrap(),
+        DEFAULT_DEADLINE,
+    );
     // A-102 (N4): the produced manifest carries every first administrator's
     // salt (a required key — A-105), so the ceremony grants them and ends
     // with the seal (R3).

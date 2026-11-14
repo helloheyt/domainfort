@@ -76,87 +76,14 @@ use crate::model::KeyHandle;
 use crate::store::KeyStore;
 use krb_proto::KerberosTime;
 
-/// `true` if `op` installs, rotates, retires or destroys long-term key
-/// versions: keyd's key state, which cannot be undone once the operation ran
-/// (module documentation). The throttles, the replay cache and the token
-/// tables are bookkeeping, not key state.
-///
-/// The match is exhaustive: a new operation does not compile until it is
-/// classified here.
-///
-/// Spec: docs/10 §6 (`set_secret`), §7 (`create_key`, `rotate_key`,
-/// `rotate_krbtgt`, `retire_kvno`, `destroy_key_set`); docs/questions/Q-346
-/// (A-86).
-#[must_use]
-pub const fn changes_key_state(op: Operation) -> bool {
-    match op {
-        Operation::SetSecret
-        | Operation::CreateKey
-        | Operation::RotateKey
-        | Operation::RotateKrbtgt
-        | Operation::RetireKvno
-        | Operation::DestroyKeySet => true,
-        Operation::VerifyPreauth
-        | Operation::IssueAsRep
-        | Operation::OpenAndVerifyTgt
-        | Operation::IssueTgsRep
-        | Operation::VerifySecret
-        | Operation::OpenFastArmor
-        | Operation::SealFastError
-        | Operation::OpenAndVerifyServiceTicket
-        | Operation::DescribeConfig
-        | Operation::Ping
-        | Operation::GrantSetSecret
-        | Operation::RegisterDecision
-        | Operation::SealCeremony
-        | Operation::ListDestroyDecisions => false,
-    }
-}
-
-/// `true` if `op` makes keyd **less** strict without changing key state:
-/// `grant_set_secret`, which lets Role::Directory run one `set_secret` it
-/// would otherwise be refused (task A15a). Every other change keyd makes to
-/// its in-memory tables only ever makes it stricter (module documentation,
-/// "Not key state — bookkeeping").
-///
-/// A grant is not a key-state change — no key version is installed, rotated,
-/// retired or destroyed, and it expires by itself — but it is not
-/// bookkeeping either: the A-88 rule for bookkeeping ("only ever stricter,
-/// one record") does not cover it. It is audited like a key-state change:
-/// its intent is acknowledged by auditd before keyd registers it, then its
-/// outcome ([`requires_acknowledged_intent`]; docs/questions/Q-452 item 1).
-///
-/// The match is exhaustive: a new operation does not compile until it is
-/// classified here.
-///
-/// Spec: docs/51 §5.8 option (b); docs/questions/Q-291 (A-74), Q-365 item 2
-/// (A-88), Q-452.
-#[must_use]
-pub const fn loosens_authorization(op: Operation) -> bool {
-    match op {
-        // A-102 (docs/52 §4.5): a registered decision lets Directory or
-        // Admin run a state change keyd would otherwise refuse.
-        Operation::GrantSetSecret | Operation::RegisterDecision => true,
-        Operation::VerifyPreauth
-        | Operation::IssueAsRep
-        | Operation::OpenAndVerifyTgt
-        | Operation::IssueTgsRep
-        | Operation::SetSecret
-        | Operation::VerifySecret
-        | Operation::CreateKey
-        | Operation::RotateKey
-        | Operation::RotateKrbtgt
-        | Operation::RetireKvno
-        | Operation::OpenFastArmor
-        | Operation::SealFastError
-        | Operation::DestroyKeySet
-        | Operation::OpenAndVerifyServiceTicket
-        | Operation::DescribeConfig
-        | Operation::Ping
-        | Operation::SealCeremony
-        | Operation::ListDestroyDecisions => false,
-    }
-}
+// The three classifications live in the crypto-free keyd-types (`authz`),
+// so that the keyd client (crate ipc-keyd) and keyd-daemon's classification
+// (crate ipc-keyd-server) read one table (task R9, docs/52 §3.10 (c));
+// re-exported here unchanged. Every match there is exhaustive: a new
+// operation does not compile until it is classified.
+// Spec: docs/10 §6, §7, §10; docs/questions/Q-346 (A-86), Q-452, Q-466
+// item 3 (A-102).
+pub use crate::authz::{changes_key_state, loosens_authorization};
 
 // C1 impossible by construction (docs/52 §3.1, §4.2; A-102): every
 // Directory / Admin operation that changes key state or loosens keyd runs
@@ -179,15 +106,9 @@ const _: () = {
 };
 
 /// `true` if the daemon must have the intent of `op` acknowledged by auditd
-/// before keyd runs it (A-86 / A-88): a key-state change
-/// ([`changes_key_state`]) or a change that loosens keyd's authorization
-/// ([`loosens_authorization`]).
-///
-/// Spec: docs/questions/Q-346 (A-86), Q-365 (A-88), Q-452 item 1.
-#[must_use]
-pub const fn requires_acknowledged_intent(op: Operation) -> bool {
-    changes_key_state(op) || loosens_authorization(op)
-}
+/// before keyd runs it (A-86 / A-88) — keyd-types' table, re-exported (see
+/// above). Spec: docs/questions/Q-346 (A-86), Q-365 (A-88), Q-466 (A-102).
+pub use crate::authz::requires_acknowledged_intent;
 
 impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// Whether the first step of every operation — the role check (I2), the
