@@ -33,10 +33,11 @@ use ipc_audit::{
 };
 use ipc_keyd::{Answer, Call, KeydReply, KEYD_CHANNEL, REPLY_LIMIT};
 use keyd::{EntropySource, KeyStore, Keyd};
-use keyd_daemon::{
-    serve, AuditEndpoint, CallerMap, Clock, DaemonControl, DaemonParams, IntentAckBudget,
-    RecordBuffer,
-};
+// The full parameters and the generic `serve` are the daemon's test seams
+// (docs/52 C18, task R15; feature `test-seams`, enabled by the
+// dev-dependency).
+use keyd_daemon::test_seams::{serve, DaemonParams};
+use keyd_daemon::{AuditEndpoint, CallerMap, Clock, DaemonControl, IntentAckBudget, RecordBuffer};
 use krb_proto::KerberosTime;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};

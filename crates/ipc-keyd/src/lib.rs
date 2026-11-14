@@ -27,7 +27,7 @@
 //! | `0x04` | `open_and_verify_tgt` | Kdc | `0x84` `TgtContext` | `0xF1` |
 //! | `0x05` | `issue_tgs_rep` | Kdc | `0x85` `TgsRepParts` | `0xF2` |
 //! | `0x06` | `seal_fast_error` | Kdc | `0x86` `EncryptedData` | `0xF3` `Error` |
-//! | `0x07` | `open_and_verify_service_ticket(principal, binding)` (R2: the binding names the key purpose) | Ldap | `0x87` `ServiceContext` (‖ the verified operation digest) | `0xF1` |
+//! | `0x07` | `open_and_verify_service_ticket(principal)` — unbound only (R2: the binding names the key purpose; Q-523) | Ldap | `0x87` `ServiceContext` (with its context id) | `0xF1` |
 //! | `0x08` | `set_secret` | Directory | `0x88` `Kvno` | `0xF3` |
 //! | `0x09` | `verify_secret` | — (no role since A-102, docs/52 R4) | `0x89` `()` | `0xF3` |
 //! | `0x0A` | `create_key` | Admin (before the seal) | `0x8A` `Kvno` | `0xF3` |
@@ -41,6 +41,7 @@
 //! | `0x12` | `register_decision` (A-102) | Ldap | `0x92` `()` | `0xF3` |
 //! | `0x13` | `seal_ceremony` (A-102) | Admin | `0x93` `()` | `0xF3` |
 //! | `0x14` | `list_destroy_decisions` (A-102) | Admin | `0x94` `DestructionPage` | `0xF3` |
+//! | `0x15` | `verify_operation_ticket(principal, operation digest)` (Q-523: keeps no context) | Ldap | `0x95` `OperationTicket` (no context id) | `0xF1` |
 //! | — | (any) | — | `0xFF` shared `Refused` (A-59) | — |
 //!
 //! No request carries a role: keyd checks the caller's role from the
@@ -117,3 +118,6 @@ pub use wire::{KeydReply, KeydRequest, WireTime};
 pub use keyd_types::{
     AccountKind, DecidedOperation, DecisionId, DestructionPage, PendingDestruction, SetSecretTarget,
 };
+// The operation-bound verification's argument and answer (Q-523), for its
+// caller (dird).
+pub use keyd_types::{OperationDigest, OperationTicket};

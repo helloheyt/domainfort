@@ -139,8 +139,9 @@ pub struct KeydConfig {
     /// §10.1).
     pub max_armor_contexts: usize,
     /// Bound of the service-context table (`open_and_verify_service_ticket`:
-    /// the session keys of verified service tickets, held for the later GSS
-    /// steps; docs/49 §3.3, A-46).
+    /// the session keys of unbound verified service tickets, held for the
+    /// later GSS steps; docs/49 §3.3, A-46). An operation-bound verification
+    /// (`verify_operation_ticket`) takes no entry (Q-523).
     pub max_service_contexts: usize,
     /// Bound of the replay cache (docs/10 D33).
     pub replay_cache_capacity: usize,

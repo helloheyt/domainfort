@@ -47,7 +47,8 @@
 use crate::admin_engine::AdminWorker;
 use crate::admin_listener::{self, AdminServeContext};
 use crate::admin_service::{
-    admin_service_handle, check_manifest, key_targets, protected_objects, AdminParams, NotStarted,
+    admin_service_handle, check_manifest, key_targets, protected_objects, AdminParams,
+    AdminServeParams, NotStarted,
 };
 use crate::audit_link::{self, AuditEndpoint, AuditLinkError};
 use crate::clock::SharedClock;
@@ -120,10 +121,81 @@ pub const AUDIT_FLUSH_GRACE: Duration = ipc_audit::AUDIT_FLUSH_GRACE;
 /// Poll interval while draining. Project choice.
 const DRAIN_POLL: Duration = Duration::from_millis(10);
 
-/// What [`serve`] needs besides the store and the policy.
-/// Spec: docs/50 §2.4, §3.1, §3.2, §3.4, §3.6, §7.1.
+/// What dird's configuration file sets for the daemon — **and nothing
+/// else** (docs/52 C18, task R15): the product parameters. The values no
+/// configuration key sets (the view, connection and session bounds, the
+/// queues, the audit window, the LDAP engine's clock) are the daemon's
+/// production constants, supplied by [`serve`] / [`serve_with_admin`]; they
+/// are not fields here.
+/// Spec: docs/50 §2.4, §3.1, §3.2, §3.4, §3.6, §7.1; docs/52 §3.18.
 #[derive(Debug, Clone)]
 pub struct DaemonParams {
+    /// `dird_kdc_socket`.
+    pub kdc_socket: PathBuf,
+    /// `kdc_uid`: the only peer admitted on it (docs/50 §3.2).
+    pub kdc_uid: u32,
+    /// auditd's socket and uid.
+    pub audit: AuditEndpoint,
+    /// How long a started frame may take (docs/50 §3.6).
+    pub frame_timeout: Duration,
+    /// How long a pinned view lives (docs/50 §3.4).
+    pub view_lifetime: Duration,
+    /// The naming context (A-53).
+    pub naming_context: NamingContext,
+    /// keyd's (non-secret) configuration: the realm, the enctypes and the
+    /// s2kparams the account records advertise (docs/47 R47-10: one
+    /// configuration shared with keyd).
+    pub keyd: KeydConfig,
+    /// `dird_ldap_socket` (docs/50 §3.1, §4.2).
+    pub ldap_socket: PathBuf,
+    /// `ldap_front_uid`: the only peer admitted on it (docs/50 §3.2) — the
+    /// internal front; its connections' requests are decided under the
+    /// internal zone (docs/52 R14; ipc-ldap-server `Fronts`).
+    pub ldap_front_uid: u32,
+    /// The DC's DNS host name, reported by the rootDSE ([MS-ADTS]
+    /// 3.1.1.3.2.4).
+    pub dns_host_name: String,
+}
+
+impl From<DaemonParams> for ServeParams {
+    /// The product parameters with the daemon's production constants:
+    /// [`MAX_OPEN_VIEWS`], [`MAX_KDC_CONNECTIONS`], [`ENGINE_QUEUE_CAPACITY`],
+    /// [`MAX_LDAP_SESSIONS`], [`LDAP_QUEUE_CAPACITY`], `WindowConfig::DEFAULT`
+    /// and the system clock — the only values a product daemon runs with
+    /// (docs/52 C18, task R15).
+    /// Spec: docs/50 §3.4, §3.6, §8.1; docs/questions/Q-230 item 4, Q-280
+    /// item 4.
+    fn from(params: DaemonParams) -> ServeParams {
+        ServeParams {
+            kdc_socket: params.kdc_socket,
+            kdc_uid: params.kdc_uid,
+            audit: params.audit,
+            frame_timeout: params.frame_timeout,
+            view_lifetime: params.view_lifetime,
+            max_views: MAX_OPEN_VIEWS,
+            max_connections: MAX_KDC_CONNECTIONS,
+            queue_capacity: ENGINE_QUEUE_CAPACITY,
+            naming_context: params.naming_context,
+            keyd: params.keyd,
+            ldap_socket: params.ldap_socket,
+            ldap_front_uid: params.ldap_front_uid,
+            max_ldap_sessions: MAX_LDAP_SESSIONS,
+            ldap_queue_capacity: LDAP_QUEUE_CAPACITY,
+            dns_host_name: params.dns_host_name,
+            audit_window: WindowConfig::DEFAULT,
+            clock: SharedClock::system(),
+        }
+    }
+}
+
+/// Everything [`serve_with`] needs besides the store and the policy: the
+/// product [`DaemonParams`] plus the test seams. Built for a product daemon
+/// only by `From<DaemonParams>` (the production constants); reachable
+/// outside this crate only as `test_seams::DaemonParams` (docs/52 C18, task
+/// R15).
+/// Spec: docs/50 §2.4, §3.1, §3.2, §3.4, §3.6, §7.1; docs/52 §3.18.
+#[derive(Debug, Clone)]
+pub struct ServeParams {
     /// `dird_kdc_socket`.
     pub kdc_socket: PathBuf,
     /// `kdc_uid`: the only peer admitted on it (docs/50 §3.2).
@@ -184,10 +256,18 @@ pub enum StoreSource {
         /// dird's uid.
         owner_uid: u32,
     },
-    /// A store already opened in this process (a provisioning step that
-    /// runs before serving; the tests).
-    Opened(Arc<Store>),
+    /// A store already opened in this process — **a test seam** (docs/52
+    /// C18, task R15): it skips the file's owner, mode and path checks and
+    /// the integrity key of the configuration. [`OpenedStore`] is built only
+    /// by `test_seams::opened` (feature `test-seams`), so no product code can
+    /// pass one.
+    Opened(OpenedStore),
 }
+
+/// The payload of [`StoreSource::Opened`]: a store opened in this process.
+/// Its field is private to this crate — the one constructor is
+/// `test_seams::opened` (docs/52 C18, task R15).
+pub struct OpenedStore(pub(crate) Arc<Store>);
 
 impl fmt::Debug for StoreSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -447,8 +527,8 @@ struct AdminRunning {
 /// services run regardless (docs/51 §4.6).
 /// Spec: docs/51 §4.6, §5.3, §7.1, §7.5; A-73; docs/questions/Q-386.
 fn start_admin(
-    admin: AdminParams,
-    params: &DaemonParams,
+    admin: AdminServeParams,
+    params: &ServeParams,
     store: &Arc<Store>,
     policy: &DevelopmentPolicy,
     gate: &Arc<AuditGate>,
@@ -545,7 +625,9 @@ fn start_admin(
 }
 
 /// Run dird's directory-view service and its LDAP service until
-/// [`DaemonControl::stop`] (module documentation); no admin service.
+/// [`DaemonControl::stop`] (module documentation); no admin service. The
+/// product parameters run with the daemon's production constants (docs/52
+/// C18, task R15).
 ///
 /// # Errors
 /// [`DaemonError`] for a start-up failure (nothing is listening then).
@@ -558,7 +640,7 @@ pub async fn serve(
     policy: DevelopmentPolicy,
     control: DaemonControl,
 ) -> Result<Stopped, DaemonError> {
-    serve_with_admin(params, None, source, policy, control).await
+    serve_with(ServeParams::from(params), None, source, policy, control).await
 }
 
 /// [`serve`], plus — when `admin` is given — the admin service on
@@ -574,11 +656,39 @@ pub async fn serve(
 /// [`DaemonError`] for a start-up failure of the directory-view or LDAP
 /// service (nothing is listening then).
 ///
+/// The product parameters run with the daemon's production constants, and
+/// the admin service with its production keyd client
+/// (`KeydTicketVerifier` over `ipc_keyd::UnixConnector`, Role::Ldap, keyd's
+/// uid and dird's realm — task R9) and its production bounds (docs/52 C18,
+/// task R15).
+///
 /// Spec: docs/50 R50-2, R50-7, R50-10, R50-14, R50-16, R50-17, §3.1, §3.4,
-/// §4.2, §7.5, §8.1; docs/51 §4.6, §7.
+/// §4.2, §7.5, §8.1; docs/51 §4.6, §7; docs/52 §3.18.
 pub async fn serve_with_admin(
     params: DaemonParams,
     admin: Option<AdminParams>,
+    source: StoreSource,
+    policy: DevelopmentPolicy,
+    control: DaemonControl,
+) -> Result<Stopped, DaemonError> {
+    let admin = admin.map(|admin| AdminServeParams::production(admin, &params.keyd.realm));
+    serve_with(ServeParams::from(params), admin, source, policy, control).await
+}
+
+/// [`serve_with_admin`] with every value given: the parameters with their
+/// seams and the admin service's parameters with theirs. Reachable outside
+/// this crate only as `test_seams::serve_with_admin` (docs/52 C18, task
+/// R15).
+///
+/// # Errors
+/// [`DaemonError`] for a start-up failure of the directory-view or LDAP
+/// service (nothing is listening then).
+///
+/// Spec: docs/50 R50-2, R50-7, R50-10, R50-14, R50-16, R50-17, §3.1, §3.4,
+/// §4.2, §7.5, §8.1; docs/51 §4.6, §7.
+pub async fn serve_with(
+    params: ServeParams,
+    admin: Option<AdminServeParams>,
     source: StoreSource,
     policy: DevelopmentPolicy,
     control: DaemonControl,
@@ -597,7 +707,7 @@ pub async fn serve_with_admin(
             key,
             owner_uid,
         } => Arc::new(open_store(&path, key, owner_uid)?),
-        StoreSource::Opened(store) => store,
+        StoreSource::Opened(OpenedStore(store)) => store,
     };
     let schema = ad_schema::phase1().map_err(|_| DaemonError::Schema)?;
     let ctx = DirectoryContext::new(schema, &params.keyd, params.naming_context.clone())

@@ -14,7 +14,8 @@ use ipc_audit::{EventBody, EventSource, KeydOperation};
 use ipc_keyd::{Answer, Call};
 use keyd::{AuthnError, Error, KeyHandle, KeyPurpose, PrincipalId, Role};
 use keyd_daemon::startup::development_keyd;
-use keyd_daemon::{CallerMap, DaemonParams, SystemClock};
+use keyd_daemon::test_seams::DaemonParams;
+use keyd_daemon::{CallerMap, SystemClock};
 use krb_proto::{PaData, Realm};
 use std::time::{Duration, Instant};
 use support::{

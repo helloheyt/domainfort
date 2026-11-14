@@ -39,7 +39,7 @@
 
 use crate::audit::AuditGate;
 use crate::audit_link::{self, AuditEndpoint, AuditLinkError};
-use crate::links::{DirdLink, KeydLink};
+use crate::links::{DirdLink, KeydLink, UnixDird, UnixKeyd};
 use crate::listener::{accept_loop, ServeContext};
 use crate::log::{note, Note};
 use crate::rate::Limits;
@@ -84,9 +84,70 @@ pub const AUDIT_FLUSH_GRACE: Duration = ipc_audit::AUDIT_FLUSH_GRACE;
 /// Poll interval while draining. Project choice.
 const DRAIN_POLL: Duration = Duration::from_millis(10);
 
-/// What [`serve`] needs.
-/// Spec: docs/50 §2.4, §3.1, §3.2, §3.6, §7.1; docs/51 §5.1, §7.6; A-79.
+/// What admind's configuration file sets for the daemon — **and nothing
+/// else** (docs/52 C18, task R15): the product parameters. Its clients of
+/// dird and keyd are the production ones — concrete types over their Unix
+/// sockets ([`UnixDird`], [`UnixKeyd`]), not any [`DirdLink`] / [`KeydLink`];
+/// its per-uid limits, worker queue and audit window are the daemon's
+/// production constants, supplied by [`serve`].
+/// Spec: docs/50 §2.4, §3.1, §3.2, §3.6, §7.1; docs/51 §5.1, §7.6; A-79;
+/// docs/52 §3.18.
 pub struct DaemonParams {
+    /// `admin_socket`.
+    pub admin_socket: PathBuf,
+    /// auditd's socket and uid.
+    pub audit: AuditEndpoint,
+    /// How long a started frame may take (docs/50 §3.6).
+    pub frame_timeout: Duration,
+    /// `min_password_length` (A-79, P-24).
+    pub min_password_length: u32,
+    /// admind's client of dird over `dird_socket` (dird's uid checked on
+    /// every connection).
+    pub dird: UnixDird,
+    /// admind's client of keyd over `keyd_socket`, Role::Directory (keyd's
+    /// uid and role checked on every connection — task R9).
+    pub keyd: UnixKeyd,
+}
+
+impl fmt::Debug for DaemonParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DaemonParams")
+            .field("admin_socket", &self.admin_socket)
+            .field("audit", &self.audit)
+            .field("frame_timeout", &self.frame_timeout)
+            .field("min_password_length", &self.min_password_length)
+            .finish_non_exhaustive()
+    }
+}
+
+impl From<DaemonParams> for ServeParams {
+    /// The product parameters with the daemon's production values: the
+    /// production clients as the worker's links, `Limits::DEFAULT`,
+    /// [`WORKER_QUEUE_CAPACITY`] and `WindowConfig::DEFAULT` — the only
+    /// values a product admind runs with (docs/52 C18, task R15).
+    /// Spec: docs/50 §3.6, §8.1; docs/51 §5.1, §7.6.
+    fn from(params: DaemonParams) -> ServeParams {
+        ServeParams {
+            admin_socket: params.admin_socket,
+            audit: params.audit,
+            frame_timeout: params.frame_timeout,
+            min_password_length: params.min_password_length,
+            dird: Box::new(params.dird),
+            keyd: Box::new(params.keyd),
+            limits: Limits::DEFAULT,
+            queue_capacity: WORKER_QUEUE_CAPACITY,
+            audit_window: WindowConfig::DEFAULT,
+        }
+    }
+}
+
+/// Everything [`serve_with`] needs: the product [`DaemonParams`] plus the
+/// test seams (any dird / keyd link, the limits, the queue, the window).
+/// Built for a product admind only by `From<DaemonParams>`; reachable
+/// outside this crate only as `test_seams::DaemonParams` (docs/52 C18, task
+/// R15).
+/// Spec: docs/50 §2.4, §3.1, §3.2, §3.6, §7.1; docs/51 §5.1, §7.6; A-79.
+pub struct ServeParams {
     /// `admin_socket`.
     pub admin_socket: PathBuf,
     /// auditd's socket and uid.
@@ -108,9 +169,9 @@ pub struct DaemonParams {
     pub audit_window: WindowConfig,
 }
 
-impl fmt::Debug for DaemonParams {
+impl fmt::Debug for ServeParams {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DaemonParams")
+        f.debug_struct("ServeParams")
             .field("admin_socket", &self.admin_socket)
             .field("audit", &self.audit)
             .field("frame_timeout", &self.frame_timeout)
@@ -260,7 +321,9 @@ async fn wait_until(grace: Duration, done: impl Fn() -> bool) {
     }
 }
 
-/// Run admind until [`DaemonControl::stop`] (module documentation).
+/// Run the product admind until [`DaemonControl::stop`] (module
+/// documentation): the product parameters with the daemon's production
+/// values (docs/52 C18, task R15).
 ///
 /// Must run inside a tokio runtime with I/O and time enabled, built after
 /// the process hardening.
@@ -269,8 +332,24 @@ async fn wait_until(grace: Duration, done: impl Fn() -> bool) {
 /// [`DaemonError`] for a start-up failure (nothing is listening then).
 ///
 /// Spec: docs/51 §5.1, §5.7, §7.6; docs/50 R50-7, R50-14, R50-16, R50-17,
-/// §3.1, §3.6, §7.5, §8.1.
+/// §3.1, §3.6, §7.5, §8.1; docs/52 §3.18.
 pub async fn serve(params: DaemonParams, control: DaemonControl) -> Result<Stopped, DaemonError> {
+    serve_with(ServeParams::from(params), control).await
+}
+
+/// [`serve`] with every value given: the parameters with their seams.
+/// Reachable outside this crate only as `test_seams::serve` (docs/52 C18,
+/// task R15).
+///
+/// # Errors
+/// [`DaemonError`] for a start-up failure (nothing is listening then).
+///
+/// Spec: docs/51 §5.1, §5.7, §7.6; docs/50 R50-7, R50-14, R50-16, R50-17,
+/// §3.1, §3.6, §7.5, §8.1.
+pub async fn serve_with(
+    params: ServeParams,
+    control: DaemonControl,
+) -> Result<Stopped, DaemonError> {
     // 1. auditd first (R50-16): its uid and the source it records admind
     //    under (task R9b); the verified connection is kept for admind's
     //    events.

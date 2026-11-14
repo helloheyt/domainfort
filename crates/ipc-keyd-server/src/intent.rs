@@ -147,6 +147,7 @@ impl KeyStateIntent {
             | Call::IssueTgsRep { .. }
             | Call::SealFastError { .. }
             | Call::OpenAndVerifyServiceTicket { .. }
+            | Call::VerifyOperationTicket { .. }
             | Call::VerifySecret { .. }
             | Call::DescribeConfig
             | Call::Ping

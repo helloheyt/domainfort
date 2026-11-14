@@ -94,7 +94,10 @@ dird_deadline = 1s
 #[test]
 fn parameters_from_the_configuration() {
     let settings = KdcSettings::parse(kdc_config("10.0.0.5:88").as_bytes()).unwrap();
-    let p = DaemonParams::from_settings(&settings);
+    // docs/52 C18 (task R15): the product parameters carry only the file's
+    // values; the constants the product `serve` adds are read back through
+    // the test seam's conversion (the one `serve` uses).
+    let p = kdc_daemon::test_seams::DaemonParams::from(DaemonParams::from_settings(&settings));
     assert_eq!((p.keyd_uid, p.dird_uid, p.audit.uid), (61001, 61002, 61005));
     assert_eq!(p.audit.socket, Path::new("/run/auditd/audit.sock"));
     assert_eq!(p.keyd_deadline, Duration::from_secs(2));

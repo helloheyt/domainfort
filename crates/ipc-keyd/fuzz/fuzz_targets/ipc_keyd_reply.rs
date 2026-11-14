@@ -1,7 +1,7 @@
 #![no_main]
 //! Fuzz target for the keyd channel's client-side reply decoding: the first
 //! input octet picks the operation that was called (one of keyd's
-//! twenty — `grant_set_secret`, task A15a, included: its success reply
+//! twenty-one — `grant_set_secret`, task A15a, included: its success reply
 //! carries no payload; and A-102's `register_decision`, `seal_ceremony`,
 //! `list_destroy_decisions`, whose page is bounded by `MAX_DESTROY_PAGE`),
 //! the rest is the reply body, decoded as `KeydClient` decodes it —
@@ -16,12 +16,15 @@
 //! last octet, from the closed table 0x01-0x04 (docs/questions/Q-351,
 //! A-87): every other value was refused. A decoded `Ping` reply is the
 //! envelope and exactly that one octet (task R9, docs/questions/Q-466 item
-//! 2): the caller role, from the same table.
+//! 2): the caller role, from the same table. A decoded `ServiceContext`
+//! reply ends in the one-value octet `00` (no operation: the unbound
+//! verification), and a decoded `OperationTicket` reply ends in the 32
+//! digest octets it names (Q-523: the operation-bound answer, no context).
 //!
 //! Written, not run (PENDING-OWNER P-1).
 //!
 //! Spec: docs/50 §3.3, §3.4, §9; R50-4; A-59; docs/questions/Q-351 (A-87),
-//! Q-466 (A-102).
+//! Q-466 (A-102), Q-523.
 
 use ipc::{decode_reply, encode_refused, Reply};
 use ipc_keyd::channel::MAX_DESTROY_PAGE;
@@ -68,6 +71,13 @@ fuzz_target!(|data: &[u8]| {
                     let empty = encode_answer(&Answer::GrantSetSecret(Ok(())))
                         .expect("a unit answer encodes");
                     assert_eq!(empty.body(), body, "no payload");
+                }
+                if let Answer::OpenAndVerifyServiceTicket(Ok(_)) = &answer {
+                    assert_eq!(body.last(), Some(&0x00), "bound to no operation");
+                }
+                if let Answer::VerifyOperationTicket(Ok(ticket)) = &answer {
+                    let digest = ticket.operation.as_bytes();
+                    assert!(body.ends_with(digest), "the verified digest, last");
                 }
                 if let Answer::ListDestroyDecisions(Ok(page)) = &answer {
                     assert!(

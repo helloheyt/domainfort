@@ -127,19 +127,36 @@ impl ConnectionLimits {
     };
 }
 
-/// Everything [`serve`] needs besides the TLS configuration and the
-/// listeners.
-/// Spec: docs/50 §2.4, §3.6, §4.2.
+/// The timeouts ldap-front's configuration sets (the client write bound is
+/// the daemon's constant, [`CLIENT_WRITE_TIMEOUT`], added by [`serve`]).
+/// Spec: docs/50 §3.6, §4.2; crates/config `LdapFrontSettings`; docs/52
+/// §3.18.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfiguredTimeouts {
+    /// InitRecvTimeout.
+    pub init_recv: Duration,
+    /// MaxConnIdleTime.
+    pub max_idle: Duration,
+    /// The TLS handshake bound.
+    pub tls_handshake: Duration,
+    /// dird's answer to one request.
+    pub dird_deadline: Duration,
+}
+
+/// What ldap-front's configuration sets for the daemon — **and nothing
+/// else** (docs/52 C18, task R15): the product parameters. The client write
+/// bound and the connection bounds are the daemon's constants
+/// ([`CLIENT_WRITE_TIMEOUT`], [`ConnectionLimits::DEFAULT`]), supplied by
+/// [`serve`]; they are not fields here.
+/// Spec: docs/50 §2.4, §3.6, §4.2; docs/52 §3.18.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrontParams {
     /// dird's `dird-ldap.sock` and uid.
     pub dird: Endpoint,
     /// auditd's socket and uid.
     pub audit: Endpoint,
-    /// The timeouts.
-    pub timeouts: Timeouts,
-    /// The connection bounds.
-    pub limits: ConnectionLimits,
+    /// The configured timeouts.
+    pub timeouts: ConfiguredTimeouts,
     /// The zone table: every listener's address and every served client's
     /// source address lie in one of these networks (module documentation).
     /// Spec: docs/50 §4.1; docs/52 §7 R14; A-102 on docs/questions/Q-469.
@@ -147,7 +164,8 @@ pub struct FrontParams {
 }
 
 impl FrontParams {
-    /// The parameters of `settings`, with the daemon's constant bounds.
+    /// The parameters of `settings` — the one product constructor (docs/52
+    /// C18, task R15); the daemon's constant bounds are added by [`serve`].
     /// Spec: docs/50 §3.6, §4.1, §4.2, §7.1; crates/config
     /// `LdapFrontSettings`; docs/52 R14.
     #[must_use]
@@ -162,15 +180,54 @@ impl FrontParams {
                 socket: settings.audit().socket().as_path().to_path_buf(),
                 uid: settings.audit().uid(),
             },
-            timeouts: Timeouts {
+            timeouts: ConfiguredTimeouts {
                 init_recv: limits.init_recv_timeout(),
                 max_idle: limits.max_conn_idle_time(),
                 tls_handshake: limits.tls_handshake_timeout(),
                 dird_deadline: limits.dird_deadline(),
+            },
+            internal_networks: settings.internal_networks().to_vec(),
+        }
+    }
+}
+
+/// Everything [`serve_with`] needs besides the TLS configuration and the
+/// listeners: the product [`FrontParams`] plus the test seams. Built for a
+/// product front only by `From<FrontParams>`; reachable outside this crate
+/// only as `test_seams::FrontParams` (docs/52 C18, task R15).
+/// Spec: docs/50 §2.4, §3.6, §4.2; docs/52 §3.18.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServeParams {
+    /// dird's `dird-ldap.sock` and uid.
+    pub dird: Endpoint,
+    /// auditd's socket and uid.
+    pub audit: Endpoint,
+    /// The timeouts.
+    pub timeouts: Timeouts,
+    /// The connection bounds.
+    pub limits: ConnectionLimits,
+    /// The zone table (configured; docs/52 §7 R14).
+    pub internal_networks: Vec<Network>,
+}
+
+impl From<FrontParams> for ServeParams {
+    /// The product parameters with the daemon's constants:
+    /// [`CLIENT_WRITE_TIMEOUT`] and [`ConnectionLimits::DEFAULT`] — the only
+    /// values a product front runs with (docs/52 C18, task R15).
+    /// Spec: docs/50 §3.6, §4.2.
+    fn from(params: FrontParams) -> ServeParams {
+        ServeParams {
+            dird: params.dird,
+            audit: params.audit,
+            timeouts: Timeouts {
+                init_recv: params.timeouts.init_recv,
+                max_idle: params.timeouts.max_idle,
+                tls_handshake: params.timeouts.tls_handshake,
+                dird_deadline: params.timeouts.dird_deadline,
                 client_write: CLIENT_WRITE_TIMEOUT,
             },
             limits: ConnectionLimits::DEFAULT,
-            internal_networks: settings.internal_networks().to_vec(),
+            internal_networks: params.internal_networks,
         }
     }
 }
@@ -401,14 +458,33 @@ async fn accept_loop(
     }
 }
 
-/// Run ldap-front until [`DaemonControl::stop`] (module documentation).
+/// Run the product ldap-front until [`DaemonControl::stop`] (module
+/// documentation): the product parameters with the daemon's constants
+/// (docs/52 C18, task R15).
 ///
 /// # Errors
 /// [`DaemonError`] — a start-up check failed; nothing was served.
 ///
-/// Spec: docs/50 R50-10, R50-11, R50-16, §4.2, §7.5.
+/// Spec: docs/50 R50-10, R50-11, R50-16, §4.2, §7.5; docs/52 §3.18.
 pub async fn serve(
     params: FrontParams,
+    tls: Arc<ServerConfig>,
+    listeners: Listeners,
+    control: DaemonControl,
+) -> Result<(), DaemonError> {
+    serve_with(ServeParams::from(params), tls, listeners, control).await
+}
+
+/// [`serve`] with every value given: the parameters with their seams.
+/// Reachable outside this crate only as `test_seams::serve` (docs/52 C18,
+/// task R15).
+///
+/// # Errors
+/// [`DaemonError`] — a start-up check failed; nothing was served.
+///
+/// Spec: docs/50 R50-10, R50-11, R50-16, §4.2, §7.5; docs/52 §7 R14.
+pub async fn serve_with(
+    params: ServeParams,
     tls: Arc<ServerConfig>,
     listeners: Listeners,
     control: DaemonControl,

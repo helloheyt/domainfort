@@ -58,6 +58,7 @@
 //! | [`audit_client`] | keyd's expectation of auditd for the one ipc-audit client (R50-17; task R9b) |
 //! | `listener` | `keyd.sock`: identity, quota, framing, deadlines |
 //! | `daemon` | [`serve`], [`DaemonControl`] |
+//! | `test_seams` | feature `test-seams` only: the full parameters and the generic `serve` (docs/52 C18) |
 //! | [`startup`] | configuration, socket directory, hardening plan, the development keyd |
 //! | [`log`] | fixed stderr messages (docs/50 §8.2) |
 //!
@@ -159,9 +160,17 @@ pub use audit_client::{AuditEndpoint, AuditLinkError};
 pub use callers::{CallerMap, CallerMapError};
 pub use clock::{kerberos_time_from_unix, Clock, SystemClock};
 pub use daemon::{
-    serve, DaemonControl, DaemonError, DaemonParams, ExtraListener, Stopped, AUDIT_FLUSH_GRACE,
-    DRAIN_GRACE, ENGINE_QUEUE_CAPACITY, SOCKET_FILE_MODE,
+    serve, DaemonControl, DaemonError, DaemonParams, Stopped, AUDIT_FLUSH_GRACE, DRAIN_GRACE,
+    ENGINE_QUEUE_CAPACITY, SOCKET_FILE_MODE,
 };
+
+/// The test seams (docs/52 C18, task R15): the full parameters and the
+/// generic `serve`. Compiled only with the feature `test-seams`, which only
+/// dev-dependencies enable; no product source names this module
+/// (crates/e2e-tests `tests/no_test_seams_in_product.rs`).
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod test_seams;
 pub use engine::{
     EngineError, EngineHandle, EnginePanicked, EngineThread, IntentAckBudget,
     IntentAckBudgetOutOfRange, INTENT_ACK_BUDGET, MAX_INTENT_ACK_BUDGET, MAX_QUEUE_CAPACITY,

@@ -189,6 +189,7 @@ pub const fn is_gating(operation: Operation) -> bool {
         | Operation::SealFastError
         | Operation::DestroyKeySet
         | Operation::OpenAndVerifyServiceTicket
+        | Operation::VerifyOperationTicket
         | Operation::GrantSetSecret
         | Operation::RegisterDecision
         | Operation::SealCeremony

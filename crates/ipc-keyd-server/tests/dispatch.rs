@@ -532,21 +532,17 @@ fn admin_and_directory_operations_through_the_client() {
     ] {
         assert_eq!(c.ping(), Ok(role));
     }
-    // A service ticket that is not one is keyd's uniform Denied — unbound,
-    // and bound to an operation digest (R2: the binding travels, keyd
-    // derives the purpose).
+    // A service ticket that is not one is keyd's uniform Denied — unbound
+    // (0x07), and bound to an operation digest (0x15, Q-523); keyd derives
+    // the purpose from each operation's binding (R2).
     assert_eq!(
-        ldap.open_and_verify_service_ticket(
-            &service.principal,
-            &keyd::AppBinding::Unbound,
-            &[0x30, 0x00]
-        ),
+        ldap.open_and_verify_service_ticket(&service.principal, &[0x30, 0x00]),
         Err(AuthnError::Denied)
     );
     assert_eq!(
-        ldap.open_and_verify_service_ticket(
+        ldap.verify_operation_ticket(
             &service.principal,
-            &keyd::AppBinding::OperationDigest(keyd::OperationDigest::new([0xD4; 32])),
+            &keyd::OperationDigest::new([0xD4; 32]),
             &[0x30, 0x00]
         ),
         Err(AuthnError::Denied)

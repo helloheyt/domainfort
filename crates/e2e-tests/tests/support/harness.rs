@@ -112,6 +112,10 @@ pub use super::kdcd::keyd_support;
 use super::kdcd::{self, Handles, HeldClock, Kdcd};
 use super::tls::{client_config, server_config, test_pki, TestPki};
 use crate::common;
+// auditd runs with its product listener configuration (one listener per
+// sender since task R9b); the front's client write bound and connection
+// bounds are its test seams (docs/52 C18, task R15; feature `test-seams`,
+// enabled by the dev-dependencies).
 use audit_daemon::listener::ListenerConfig;
 use audit_daemon::segments::{list_segments, segment_path};
 use audit_log::{verify_log, Anchor, ChainHead, Record, SegmentLimit, SegmentReader};
@@ -124,7 +128,8 @@ use directory_pip::DirectoryContext;
 use keyd::Role;
 use keyd_daemon::CallerMap;
 use krb_proto::KerberosTime;
-use ldap_front::{ConnectionLimits, DaemonControl, Endpoint, FrontParams, Listeners, Timeouts};
+use ldap_front::test_seams::FrontParams;
+use ldap_front::{ConnectionLimits, DaemonControl, Endpoint, Listeners, Timeouts};
 use pdp::{
     Action, ActionMatch, AnonymousGrant, AuthMatch, ContextMatch, Effect, IpScope, Match,
     ResourceMatch, Rule, RuleId, SubjectMatch, TransportSec,
@@ -329,7 +334,9 @@ impl Front {
                     .enable_all()
                     .build()
                     .map_err(|e| e.to_string())?;
-                let result = runtime.block_on(ldap_front::serve(params, tls, listeners, control));
+                let result = runtime.block_on(ldap_front::test_seams::serve(
+                    params, tls, listeners, control,
+                ));
                 drop(runtime);
                 result.map_err(|e| e.to_string())
             })

@@ -1,5 +1,7 @@
 //! Service-ticket verification inside keyd: `open_and_verify_service_ticket`
-//! (task L6a). Role `Ldap` only.
+//! (task L6a — unbound, keeps a service context) and
+//! `verify_operation_ticket` (dird's admin channel — bound to one operation,
+//! keeps none; docs/questions/Q-523). Role `Ldap` only.
 //!
 //! "Compute, don't give" on the service side (docs/49 §3.3, R49-5; decision
 //! A-46, docs/questions/Q-165 option (c)): the LDAP front hands keyd the
@@ -21,14 +23,15 @@
 //!
 //! # The application binding (R2; docs/52 §3.2, §5; decision A-102)
 //!
-//! The caller names the service key set by its principal and an
-//! [`AppBinding`]; the key set's purpose is the binding's
-//! ([`AppBinding::key_purpose`]), never the caller's choice:
+//! The caller names the service key set by its principal; each binding has
+//! its own operation ([`AppBinding::operation`]), and the key set's purpose
+//! is the binding's ([`AppBinding::key_purpose`]), never the caller's
+//! choice:
 //!
-//! | binding | key set | the Authenticator's `cksum` |
-//! |---|---|---|
-//! | `Unbound` (the LDAP front, L6a) | `(principal, Service)` | must be absent (`ApChecksumUnsupported`) |
-//! | `OperationDigest(d)` (dird's admin channel) | `(principal, AdminService)` | must be present (`OperationDigestMissing`), of the session key's required checksum type, and verify as `get_mic(session key, usage 10, d)` (`OperationDigestMismatch`) |
+//! | binding | operation | key set | the Authenticator's `cksum` | answer / kept |
+//! |---|---|---|---|---|
+//! | `Unbound` (the LDAP front, L6a) | `open_and_verify_service_ticket` | `(principal, Service)` | must be absent (`ApChecksumUnsupported`) | [`ServiceContext`] / a service context |
+//! | `OperationDigest(d)` (dird's admin channel) | `verify_operation_ticket` | `(principal, AdminService)` | must be present (`OperationDigestMissing`), of the session key's required checksum type, and verify as `get_mic(session key, usage 10, d)` (`OperationDigestMismatch`) | [`OperationTicket`] / nothing |
 //!
 //! What is MIC'd: the 32 octets of the operation digest — the application
 //! data the admin channel defines for its AP-REQs (crate ipc-dird-admin
@@ -50,16 +53,28 @@
 //! channel binding, the sequence number, and `seal_ap_rep` (RFC 4120 3.2.4:
 //! the AP-REP is built in L6b, sealed by keyd with key usage 12). The
 //! service context is held now so that L6b can use the session key without
-//! it ever leaving keyd; in L6a nothing consumes it and it expires.
+//! it ever leaving keyd; in L6a nothing consumes it and it expires. An
+//! operation-bound verification keeps no context at all: dird never uses
+//! one (no KRB_AP_REP, no KRB_SAFE / KRB_PRIV on the admin channel), so
+//! keeping its session key would be a capability without a consumer
+//! (docs/52 §3.4, C4) and a table that fills faster (docs/questions/Q-387
+//! item 4, Q-493 item 3, Q-523). Its answer type has no field for a
+//! context id, and the one function that creates a context
+//! (`keep_service_context`) is reached only from the unbound operation.
+//!
+//! The split into two operations (Q-523) was written only from RFC 4120 (the
+//! pinned copy) §3.2.3, §3.2.4, §5.5.1, §7.5.1, docs/10 §5ב / §8, docs/52 §3.4
+//! / §5, docs/questions/Q-387, Q-493, Q-523 and this crate's own code; no other
+//! implementation was consulted or recalled (AGENTS.md §1-3).
 //!
 //! Spec: RFC 4120 §4, 2.2, 3.2.3, 3.3.3, 3.3.3.2, 5.3, 5.5.1, 6.2, 7.5.1;
 //! RFC 3961 §3, §4; RFC 3962 §7; RFC 8009 §6; [MS-KILE] 3.4.5 (retry with
 //! the previous server key); docs/10 §5ב, §8, §9, §12; docs/49 §3.3, §12;
-//! docs/52 §3.2, §5; docs/questions/Q-165 (A-46), Q-180, Q-463 (A-102);
-//! A-19 (docs/questions/Q-040); A-26 (docs/questions/Q-071).
+//! docs/52 §3.2, §3.4, §5; docs/questions/Q-165 (A-46), Q-180, Q-463
+//! (A-102), Q-523; A-19 (docs/questions/Q-040); A-26 (docs/questions/Q-071).
 
 use crate::audit::{AuditReason, AuditSink};
-use crate::authz::{CallerId, HandleSlot, Operation};
+use crate::authz::{CallerId, HandleSlot};
 use crate::chain::{self, BindingEvidence, ChainVerified};
 use crate::entropy::EntropySource;
 use crate::error::{AuthnError, Deny, Internal};
@@ -70,7 +85,7 @@ use crate::tgs_exchange::{check_ap_options, replay_key_for, subkey_protocol_key,
 use crate::time::kerberos_time_seconds;
 use crate::tokens::{ServiceCtxId, TOKEN_ID_LENGTH};
 use crate::usage::{AP_REQ_AUTHENTICATOR, AP_REQ_AUTHENTICATOR_CKSUM};
-use keyd_types::{AppBinding, ServiceContext};
+use keyd_types::{AppBinding, OperationDigest, OperationTicket, ServiceContext};
 use krb_crypto::{ChecksumType, ProtocolKey};
 use krb_proto::constants::DOMAIN_X500_COMPRESS;
 use krb_proto::{ApReq, Checksum, KerberosTime, TransitedEncoding};
@@ -202,25 +217,52 @@ fn verify_app_binding(
     }
 }
 
+/// What the shared verification steps 1-11 established about one AP-REQ:
+/// the ticket's non-secret facts, the keys a context could keep, and the
+/// digest the `cksum` MIC verified over (`None`: unbound). Never leaves
+/// keyd; each public operation turns it into its own answer — the unbound
+/// one keeps the keys under a context id, the operation-bound one drops them
+/// (Q-523).
+/// Spec: RFC 4120 3.2.3, 5.3, 5.5.1; docs/10 §5ב; docs/questions/Q-523.
+struct VerifiedApReq {
+    /// Client realm from the ticket. Spec: RFC 4120 5.3.
+    crealm: krb_proto::Realm,
+    /// Client name from the ticket. Spec: RFC 4120 5.3.
+    cname: krb_proto::PrincipalName,
+    /// Spec: RFC 4120 5.3 (authtime).
+    authtime: KerberosTime,
+    /// Spec: RFC 4120 5.3 (endtime).
+    endtime: KerberosTime,
+    /// Spec: RFC 4120 5.3 (flags).
+    flags: krb_proto::TicketFlags,
+    /// The ticket session key. Spec: RFC 4120 5.3 (key).
+    session: ProtocolKey,
+    /// The authenticator subkey, when offered. Spec: RFC 4120 5.5.1.
+    subkey: Option<ProtocolKey>,
+    /// The digest the `cksum` MIC verified over (`None`: unbound).
+    /// Spec: RFC 4120 5.5.1; docs/52 §5 item 3.
+    bound_operation: Option<OperationDigest>,
+}
+
 impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
-    /// `open_and_verify_service_ticket`: verify a service AP-REQ inside
-    /// keyd under the service key (RFC 4120 3.2.3) and return a one-time
-    /// [`ServiceContext`] — non-secret facts only.
+    /// `open_and_verify_service_ticket`: verify an **unbound** service
+    /// AP-REQ (the LDAP front, task L6a) inside keyd under the service key
+    /// (RFC 4120 3.2.3) and return a one-time [`ServiceContext`] —
+    /// non-secret facts only, and the id of the session key keyd keeps for
+    /// the later GSS steps.
     ///
     /// `ap_req_octets` is the DER of the KRB_AP_REQ as received: keyd
     /// decodes it itself, so the message keyd checks and the message keyd
     /// opens are the same octets (docs/49 §3.3 "like A-43").
     ///
-    /// The service key set is `(service, binding.key_purpose())`: the
-    /// caller names the principal and the [`AppBinding`]; the purpose
-    /// follows from the binding (R2, module documentation) — an admin
-    /// service ticket cannot be asked for unbound, nor an operation digest
-    /// verified under any other key set.
+    /// The service key set is `(service, Service)`: the binding is
+    /// `AppBinding::Unbound` and its purpose is the binding's (R2). An admin
+    /// service ticket is verified only by [`Keyd::verify_operation_ticket`]
+    /// (Q-523), never here.
     ///
     /// Checks failing as the uniform `AuthnError::Denied` (reason to audit
     /// only):
-    /// 1. authorize and admit (Ldap; the derived handle Service or
-    ///    AdminService — I2, I3);
+    /// 1. authorize and admit (Ldap; the derived handle Service — I2, I3);
     /// 2. the octets decode as a DER AP-REQ: pvno 5, msg-type KRB_AP_REQ
     ///    (RFC 4120 3.2.3 KRB_AP_ERR_MSG_TYPE);
     /// 3. no USE-SESSION-KEY ap-option (user-to-user has no code path; RFC
@@ -249,13 +291,9 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     ///    the ctime skew is RECORDED;
     /// 8. the transited field is that of local authentication
     ///    ([`check_transited`]);
-    /// 9. the authenticator's checksum as the binding requires
-    ///    ([`verify_app_binding`]): none when `Unbound` (task L6a has no
-    ///    application data to verify one over; the RFC 4121 checksum is task
-    ///    L6b — docs/questions/Q-180 item 3); for `OperationDigest(d)`
-    ///    present, of the session key's required checksum type, and the
-    ///    session key's MIC over `d` with key usage 10 (RFC 4120 5.5.1,
-    ///    7.5.1 item 10; RFC 3961 §3, §4);
+    /// 9. the authenticator carries no checksum ([`verify_app_binding`],
+    ///    `Unbound`: task L6a has no application data to verify one over;
+    ///    the RFC 4121 checksum is task L6b — docs/questions/Q-180 item 3);
     /// 10. a subkey, when present, is a configured enctype and a valid key
     ///     (I5).
     ///
@@ -271,8 +309,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     ///     passed");
     /// 12. the session key and the subkey are stored under a fresh
     ///     [`ServiceCtxId`] bound to this caller, for the token lifetime
-    ///     (table full: `Denied`); the answer names the verified operation
-    ///     digest ([`ServiceContext::bound_operation`]).
+    ///     (table full: `Denied`).
     ///
     /// Any cryptographic failure is `Denied` even when the ticket is also
     /// expired or the authenticator also skewed: the classes are reachable
@@ -284,41 +321,78 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// ("Applications MUST make a separate authorization decision") is the
     /// LDAP PEP's and the PDP's, on the returned facts (docs/49 §3.2).
     ///
-    /// Spec: RFC 4120 2.2, 3.2.3, 3.3.3.2, 5.3, 5.5.1, 6.2, 7.5.1; RFC 3961
-    /// §3, §4; [MS-KILE] 3.4.5; docs/10 §5ב, §9 (A-26); docs/49 §3.3;
-    /// docs/52 §5; docs/questions/Q-165 (A-46), Q-180, Q-463 (A-102); A-19
+    /// Spec: RFC 4120 2.2, 3.2.3, 3.3.3.2, 5.3, 5.5.1, 6.2, 7.5.1; [MS-KILE]
+    /// 3.4.5; docs/10 §5ב, §9 (A-26); docs/49 §3.3; docs/52 §5;
+    /// docs/questions/Q-165 (A-46), Q-180, Q-463 (A-102), Q-523; A-19
     /// (docs/questions/Q-040).
     pub fn open_and_verify_service_ticket(
         &mut self,
         caller: &CallerId,
         service: &PrincipalId,
-        binding: &AppBinding,
         ap_req_octets: &[u8],
         now: &KerberosTime,
     ) -> Result<ServiceContext, AuthnError> {
-        // The key set is named by the binding's purpose (R2): no caller can
-        // pair the admin service key with an unbound verification.
+        let binding = AppBinding::Unbound;
+        // The key set is named by the binding's purpose (R2).
         let handle = KeyHandle::new(*service, binding.key_purpose());
         let mut fields = AuditFields::for_handle(&handle);
-        let result = self.open_and_verify_service_ticket_inner(
-            caller,
-            &handle,
-            binding,
-            ap_req_octets,
-            now,
-            &mut fields,
-        );
-        self.emit(
-            caller,
-            Operation::OpenAndVerifyServiceTicket,
-            now,
-            &fields,
-            &result,
-        );
+        let result = self
+            .verify_service_ap_req(caller, &handle, &binding, ap_req_octets, now, &mut fields)
+            .and_then(|verified| self.keep_service_context(caller, &handle, verified, now));
+        self.emit(caller, binding.operation(), now, &fields, &result);
         result.map_err(AuthnError::from)
     }
 
-    fn open_and_verify_service_ticket_inner(
+    /// `verify_operation_ticket`: verify a service AP-REQ **bound to one
+    /// operation** (dird's admin channel) inside keyd under the admin
+    /// service key, and return its non-secret facts as an
+    /// [`OperationTicket`] — which has no context id: keyd keeps **no**
+    /// session key, subkey or token for it (Q-523; docs/52 §3.4, C4). The
+    /// only state it leaves is its replay-cache entry (RFC 4120 3.2.3).
+    ///
+    /// The service key set is `(service, AdminService)` — the purpose of
+    /// `AppBinding::OperationDigest` (R2). The checks are steps 1-11 of
+    /// [`Keyd::open_and_verify_service_ticket`], in the same order, except
+    /// step 9: the Authenticator's `cksum` must be present
+    /// (`OperationDigestMissing`), of the session key's required checksum
+    /// type, and the session key's MIC over the 32 octets of `operation`
+    /// with key usage 10 (`OperationDigestMismatch`) — RFC 4120 5.5.1,
+    /// 7.5.1 item 10; RFC 3961 §3, §4. A failure there is part of the
+    /// cryptographic chain: the uniform `Denied` (A-26), before the replay
+    /// cache, so an AP-REQ attached to another operation leaves no replay
+    /// entry (R2, R7's `ChainVerified` order). Step 12 does not exist: the
+    /// keys are dropped (zeroized) when the answer is built. RFC 4120 3.2.3
+    /// keeps a subkey "for later use" or for the KRB_AP_REP; the admin
+    /// channel has neither (RFC 4120 3.2.4: "the server need not explicitly
+    /// reply to the KRB_AP_REQ").
+    ///
+    /// Spec: RFC 4120 2.2, 3.2.3, 3.2.4, 3.3.3.2, 5.3, 5.5.1, 6.2, 7.5.1;
+    /// RFC 3961 §3, §4; RFC 3962 §7; RFC 8009 §6; [MS-KILE] 3.4.5; docs/10
+    /// §5ב, §9 (A-26); docs/52 §3.4, §5; docs/questions/Q-387 item 4, Q-463
+    /// (A-102), Q-493 item 3, Q-523.
+    pub fn verify_operation_ticket(
+        &mut self,
+        caller: &CallerId,
+        service: &PrincipalId,
+        operation: &OperationDigest,
+        ap_req_octets: &[u8],
+        now: &KerberosTime,
+    ) -> Result<OperationTicket, AuthnError> {
+        let binding = AppBinding::OperationDigest(*operation);
+        // The key set is named by the binding's purpose (R2).
+        let handle = KeyHandle::new(*service, binding.key_purpose());
+        let mut fields = AuditFields::for_handle(&handle);
+        let result = self
+            .verify_service_ap_req(caller, &handle, &binding, ap_req_octets, now, &mut fields)
+            .and_then(|verified| operation_ticket(verified, operation));
+        self.emit(caller, binding.operation(), now, &fields, &result);
+        result.map_err(AuthnError::from)
+    }
+
+    /// Steps 1-11 of both verifications (see
+    /// [`Keyd::open_and_verify_service_ticket`]), under `service` — the
+    /// handle of `binding`'s purpose — with step 9 as `binding` requires.
+    fn verify_service_ap_req(
         &mut self,
         caller: &CallerId,
         service: &KeyHandle,
@@ -326,12 +400,12 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         ap_req_octets: &[u8],
         now: &KerberosTime,
         fields: &mut AuditFields,
-    ) -> Internal<ServiceContext> {
-        // 1. Role Ldap, purpose Service or AdminService — the binding's
-        // (I2, I3).
+    ) -> Internal<VerifiedApReq> {
+        // 1. Role Ldap, purpose the binding's: Service for the unbound
+        // operation, AdminService for the operation-bound one (I2, I3).
         self.admit(
             caller,
-            Operation::OpenAndVerifyServiceTicket,
+            binding.operation(),
             &[(HandleSlot::Primary, service)],
             now,
         )?;
@@ -402,19 +476,53 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             now_s,
         )?;
 
-        // 12. The one-time service context. Spec: docs/10 §8, D36; docs/49
-        // §3.3.
-        let mut id = [0u8; TOKEN_ID_LENGTH];
-        draw(&mut self.entropy, &mut id)?;
-        let context = ServiceContext {
-            ctx_id: ServiceCtxId::from_bytes(id),
+        Ok(VerifiedApReq {
             crealm: ticket_part.crealm.clone(),
             cname: ticket_part.cname.clone(),
             authtime: ticket_part.authtime,
             endtime: ticket_part.endtime,
             flags: ticket_part.flags,
-            subkey_present: subkey.is_some(),
+            session,
+            subkey,
             bound_operation,
+        })
+    }
+
+    /// Step 12 of the unbound verification — the only place a service
+    /// context is created: the session key and the subkey under a fresh
+    /// [`ServiceCtxId`] bound to `caller`, for the token lifetime (table
+    /// full: `Denied`). The context id exists only in the answer this
+    /// returns (Q-523: the operation-bound answer has no field for one).
+    /// Spec: docs/10 §8, D36; docs/49 §3.3; RFC 4120 3.2.3 ("If a subkey is
+    /// present, the server either saves it for later use ...").
+    fn keep_service_context(
+        &mut self,
+        caller: &CallerId,
+        service: &KeyHandle,
+        verified: VerifiedApReq,
+        now: &KerberosTime,
+    ) -> Internal<ServiceContext> {
+        let now_s = kerberos_time_seconds(now);
+        let mut id = [0u8; TOKEN_ID_LENGTH];
+        draw(&mut self.entropy, &mut id)?;
+        let VerifiedApReq {
+            crealm,
+            cname,
+            authtime,
+            endtime,
+            flags,
+            session,
+            subkey,
+            bound_operation: _,
+        } = verified;
+        let context = ServiceContext {
+            ctx_id: ServiceCtxId::from_bytes(id),
+            crealm,
+            cname,
+            authtime,
+            endtime,
+            flags,
+            subkey_present: subkey.is_some(),
         };
         let entry = ServiceContextEntry {
             service: *service,
@@ -432,10 +540,45 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     }
 }
 
+/// The answer of an operation-bound verification: the ticket's facts and
+/// the digest keyd verified the `cksum` MIC over — the session key and the
+/// subkey are dropped here (zeroized: krb-crypto `ProtocolKey` wipes on
+/// drop) and no context is created (Q-523). The verified digest must be the
+/// one asked for; anything else is refused (fail closed — not reachable,
+/// since step 9 verified exactly `operation`).
+/// Spec: RFC 4120 3.2.3, 5.5.1; docs/52 §5 items 3-4; docs/questions/Q-523.
+fn operation_ticket(
+    verified: VerifiedApReq,
+    operation: &OperationDigest,
+) -> Internal<OperationTicket> {
+    let VerifiedApReq {
+        crealm,
+        cname,
+        authtime,
+        endtime,
+        flags,
+        session,
+        subkey,
+        bound_operation,
+    } = verified;
+    // Nothing of the session is kept: no consumer exists for it.
+    drop((session, subkey));
+    match bound_operation {
+        Some(digest) if digest == *operation => Ok(OperationTicket {
+            crealm,
+            cname,
+            authtime,
+            endtime,
+            flags,
+            operation: digest,
+        }),
+        _ => Err(Deny::denied(AuditReason::OperationDigestMismatch)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use keyd_types::OperationDigest;
     use krb_crypto::{EncType, KeyUsage};
 
     /// The four encryption types keyd's profile has (RFC 3962 §7; RFC 8009

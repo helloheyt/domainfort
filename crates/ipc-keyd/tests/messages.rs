@@ -106,12 +106,13 @@ fn kind_tables_are_as_documented() {
     assert_eq!(KEYD_VERSION, 1);
     // 0x11 `grant_set_secret` appended by task A15a (docs/questions/Q-450);
     // 0x12 `register_decision`, 0x13 `seal_ceremony`, 0x14
-    // `list_destroy_decisions` appended by A-102 (docs/52 §4.6).
-    assert_eq!(request_kind::ALL, (0x01..=0x14).collect::<Vec<u8>>());
+    // `list_destroy_decisions` appended by A-102 (docs/52 §4.6); 0x15
+    // `verify_operation_ticket` appended by Q-523.
+    assert_eq!(request_kind::ALL, (0x01..=0x15).collect::<Vec<u8>>());
     for (request, reply) in request_kind::ALL.iter().zip(reply_kind::ALL) {
         assert_eq!(*reply, 0x80 | request);
     }
-    assert_eq!(&reply_kind::ALL[20..], &[0xF1, 0xF2, 0xF3]);
+    assert_eq!(&reply_kind::ALL[21..], &[0xF1, 0xF2, 0xF3]);
     assert!(!request_kind::ALL.contains(&REFUSED_KIND));
     assert!(!reply_kind::ALL.contains(&REFUSED_KIND));
     let body = request_body(&Call::Ping);
@@ -126,7 +127,8 @@ fn error_type(operation: keyd_types::Operation) -> u8 {
         O::VerifyPreauth
         | O::OpenFastArmor
         | O::OpenAndVerifyTgt
-        | O::OpenAndVerifyServiceTicket => 1,
+        | O::OpenAndVerifyServiceTicket
+        | O::VerifyOperationTicket => 1,
         O::IssueAsRep | O::IssueTgsRep => 2,
         _ => 3,
     }
@@ -143,6 +145,7 @@ fn is_refusal(answer: &Answer) -> bool {
             | Answer::IssueTgsRep(Ok(_))
             | Answer::SealFastError(Ok(_))
             | Answer::OpenAndVerifyServiceTicket(Ok(_))
+            | Answer::VerifyOperationTicket(Ok(_))
             | Answer::SetSecret(Ok(_))
             | Answer::VerifySecret(Ok(_))
             | Answer::CreateKey(Ok(_))
@@ -225,25 +228,29 @@ fn a_blob_that_is_not_strict_der_is_malformed() {
     assert_eq!(rejection.refusal(), Some(ipc::Refused::Malformed));
 }
 
-/// R2 (docs/52 §5 item 3): `open_and_verify_service_ticket` carries the
-/// service principal and the binding — `u8 1` Unbound, or `u8 2` and the 32
-/// digest octets — and **no purpose**: keyd derives it. Any other binding
-/// code is refused `Malformed` (closed table); so is a digest cut short.
-/// The `AdminService` purpose has its own handle code (4) and round-trips.
+/// R2 (docs/52 §5 item 3) and Q-523 (append-only, docs/50 §3.3): kind 0x07
+/// (`open_and_verify_service_ticket`) keeps its layout — principal ‖ binding
+/// octet ‖ ap_req — but its binding octet now admits only `u8 1` (Unbound):
+/// the R2 operation-digest form (`u8 2` ‖ 32 octets) and every other code
+/// are refused `Malformed`, so no operation-bound verification can reach
+/// the context-keeping path. The operation-bound verification is kind 0x15
+/// (principal ‖ digest 32 ‖ ap_req), whose digest cut short is refused too.
+/// Neither carries a purpose: keyd derives it. The `AdminService` purpose
+/// has its own handle code (4) and round-trips.
 #[test]
 fn the_service_ticket_binding_is_a_closed_table() {
     let digest = keyd_types::OperationDigest::new([0xD3; 32]);
-    let bound = Call::OpenAndVerifyServiceTicket {
+    let unbound = Call::OpenAndVerifyServiceTicket {
         service: keyd_types::PrincipalId::from_bytes([0xAD; 16]),
-        binding: keyd_types::AppBinding::OperationDigest(digest),
         ap_req_octets: vec![0x30, 0x00],
     };
-    let body = request_body(&bound);
-    // envelope 4 ‖ principal 16 ‖ binding code ‖ digest 32 ‖ ap_req.
+    let body = request_body(&unbound);
+    // envelope 4 ‖ principal 16 ‖ binding code ‖ ap_req (u32 length ‖ DER).
+    assert_eq!(body[3], request_kind::OPEN_AND_VERIFY_SERVICE_TICKET);
     assert_eq!(&body[4..20], &[0xAD; 16]);
-    assert_eq!(body[20], 0x02);
-    assert_eq!(&body[21..53], digest.as_bytes());
-    for code in [0x00, 0x03, 0xFF] {
+    assert_eq!(body[20], 0x01);
+    assert_eq!(&body[21..], &[0, 0, 0, 2, 0x30, 0x00]);
+    for code in [0x00, 0x02, 0x03, 0xFF] {
         let mut mutated = body.clone();
         mutated[20] = code;
         assert_eq!(
@@ -252,16 +259,37 @@ fn the_service_ticket_binding_is_a_closed_table() {
             "binding code {code:#04x}"
         );
     }
-    // An unbound request is one octet shorter by 32: the same octets with
-    // code 1 and no digest.
-    let unbound = Call::OpenAndVerifyServiceTicket {
+    // The R2 layout of an operation-bound 0x07 (code 2 ‖ digest): refused.
+    let mut r2_bound = body[..20].to_vec();
+    r2_bound.push(0x02);
+    r2_bound.extend_from_slice(digest.as_bytes());
+    r2_bound.extend_from_slice(&body[21..]);
+    assert_eq!(
+        decode_request(&r2_bound).map(|_| ()).unwrap_err().refusal(),
+        Some(ipc::Refused::Malformed)
+    );
+    // Kind 0x15: principal ‖ digest ‖ ap_req.
+    let bound = Call::VerifyOperationTicket {
         service: keyd_types::PrincipalId::from_bytes([0xAD; 16]),
-        binding: keyd_types::AppBinding::Unbound,
+        operation: digest,
         ap_req_octets: vec![0x30, 0x00],
     };
-    let short = request_body(&unbound);
-    assert_eq!(short.len() + 32, body.len());
-    assert_eq!(short[20], 0x01);
+    let bound_body = request_body(&bound);
+    assert_eq!(bound_body[3], request_kind::VERIFY_OPERATION_TICKET);
+    assert_eq!(&bound_body[4..20], &[0xAD; 16]);
+    assert_eq!(&bound_body[20..52], digest.as_bytes());
+    assert_eq!(&bound_body[52..], &[0, 0, 0, 2, 0x30, 0x00]);
+    assert_eq!(
+        request_body(&decode_request(&bound_body).unwrap()),
+        bound_body
+    );
+    assert_eq!(
+        decode_request(&bound_body[..40])
+            .map(|_| ())
+            .unwrap_err()
+            .refusal(),
+        Some(ipc::Refused::Malformed)
+    );
     // The admin purpose's handle code.
     let call = Call::VerifyPreauth {
         client: samples::handle(0xAD, keyd_types::KeyPurpose::AdminService),
@@ -271,6 +299,45 @@ fn the_service_ticket_binding_is_a_closed_table() {
     let body = request_body(&call);
     assert_eq!(body[20], 0x04);
     assert_eq!(request_body(&decode_request(&body).unwrap()), body);
+}
+
+/// Q-523 (append-only, docs/50 §3.3): the `ServiceContext` reply (0x87)
+/// keeps its layout, and its last octet — the former `bound_operation`
+/// option marker — admits only `00` (absent): an unbound verification is
+/// bound to no operation, and the R2 present form (`01` ‖ 32 octets) is
+/// refused (`UnknownCode`). The operation-bound answer (0x95) carries the
+/// digest and no context id. Source: docs/50 §3.3 (closed tables, one
+/// encoding per value); docs/10 §5ב; docs/questions/Q-523.
+#[test]
+fn the_service_context_reply_names_no_operation() {
+    let answer = samples::answers()
+        .into_iter()
+        .find(|a| matches!(a, Answer::OpenAndVerifyServiceTicket(Ok(_))))
+        .expect("a ServiceContext sample");
+    let body = reply_body(&answer);
+    assert_eq!(body[3], reply_kind::OPEN_AND_VERIFY_SERVICE_TICKET);
+    assert_eq!(body.last(), Some(&0x00));
+    let mut present = body.clone();
+    *present.last_mut().unwrap() = 0x01;
+    assert!(matches!(
+        decode_reply::<KeydReply>(KEYD_CHANNEL, &present),
+        Err(ipc::Error::UnknownCode)
+    ));
+    present.extend_from_slice(&[0xD2; 32]);
+    assert!(matches!(
+        decode_reply::<KeydReply>(KEYD_CHANNEL, &present),
+        Err(ipc::Error::UnknownCode)
+    ));
+    // The operation-bound answer: ... ‖ flags ‖ the 32 digest octets, no
+    // context id anywhere (it starts with the realm's length).
+    let bound = samples::answers()
+        .into_iter()
+        .find(|a| matches!(a, Answer::VerifyOperationTicket(Ok(_))))
+        .expect("an OperationTicket sample");
+    let body = reply_body(&bound);
+    assert_eq!(body[3], reply_kind::VERIFY_OPERATION_TICKET);
+    assert_eq!(&body[body.len() - 32..], &[0xD2; 32]);
+    assert_eq!(&body[4..8], &[0, 0, 0, 11], "EXAMPLE.ORG first");
 }
 
 /// docs/50 §3.3 (strict decoding; AGENTS.md §6: never panic on input): a

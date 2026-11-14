@@ -18,8 +18,8 @@ mod common;
 
 use common::*;
 use keyd::{
-    AppBinding, AuditOutcome, AuditReason, AuthnError, DecidedOperation, KeyHandle, KeyPurpose,
-    Kvno, PrincipalId,
+    AuditOutcome, AuditReason, AuthnError, DecidedOperation, KeyHandle, KeyPurpose, Kvno,
+    PrincipalId,
 };
 use krb_crypto::{ChecksumType, EncType, ProtocolKey};
 use krb_proto::constants::{DOMAIN_X500_COMPRESS, KRB_NT_SRV_INST};
@@ -256,13 +256,8 @@ fn verify(
     ap: &[u8],
     when: KerberosTime,
 ) -> Result<keyd::ServiceContext, AuthnError> {
-    f.keyd.open_and_verify_service_ticket(
-        &LDAP,
-        &LDAP_SERVICE.principal,
-        &AppBinding::Unbound,
-        ap,
-        &when,
-    )
+    f.keyd
+        .open_and_verify_service_ticket(&LDAP, &LDAP_SERVICE.principal, ap, &when)
 }
 
 fn last_reason(f: &Fixture) -> AuditReason {
@@ -490,13 +485,8 @@ fn ticket_for_another_sname_is_denied_before_decryption() {
     // still refuses).
     let ap = ap_octets(&ldap, now(), 523);
     assert_eq!(
-        f.keyd.open_and_verify_service_ticket(
-            &LDAP,
-            &SERVICE.principal,
-            &AppBinding::Unbound,
-            &ap,
-            &now()
-        ),
+        f.keyd
+            .open_and_verify_service_ticket(&LDAP, &SERVICE.principal, &ap, &now()),
         Err(AuthnError::Denied)
     );
     assert_eq!(last_reason(&f), AuditReason::NameBindingMismatch);
@@ -568,13 +558,8 @@ fn wrong_role_is_denied() {
     let ap = ap_octets(&issued, now(), 550);
     for caller in [KDC, DIRECTORY, ADMIN] {
         assert_eq!(
-            f.keyd.open_and_verify_service_ticket(
-                &caller,
-                &LDAP_SERVICE.principal,
-                &AppBinding::Unbound,
-                &ap,
-                &now()
-            ),
+            f.keyd
+                .open_and_verify_service_ticket(&caller, &LDAP_SERVICE.principal, &ap, &now()),
             Err(AuthnError::Denied)
         );
         let last = f.records().last().unwrap();
@@ -604,13 +589,8 @@ fn krbtgt_and_principal_keys_are_never_opened() {
     );
     for (handle, request) in [(KRBTGT, &tgt_ap), (KRBTGT, &ap), (ALICE, &ap)] {
         assert_eq!(
-            f.keyd.open_and_verify_service_ticket(
-                &LDAP,
-                &handle.principal,
-                &AppBinding::Unbound,
-                request,
-                &now()
-            ),
+            f.keyd
+                .open_and_verify_service_ticket(&LDAP, &handle.principal, request, &now()),
             Err(AuthnError::Denied)
         );
         let last = f.records().last().unwrap();
@@ -632,13 +612,8 @@ fn unknown_handle_is_denied() {
     let stranger = KeyHandle::new(PrincipalId::from_bytes([0xEE; 16]), KeyPurpose::Service);
     // (The purpose is the binding's, R2: only the principal is named.)
     assert_eq!(
-        f.keyd.open_and_verify_service_ticket(
-            &LDAP,
-            &stranger.principal,
-            &AppBinding::Unbound,
-            &ap,
-            &now()
-        ),
+        f.keyd
+            .open_and_verify_service_ticket(&LDAP, &stranger.principal, &ap, &now()),
         Err(AuthnError::Denied)
     );
     assert_eq!(last_reason(&f), AuditReason::KeyNotFound);
@@ -868,13 +843,8 @@ fn replay_is_reported_after_the_chain() {
     assert_eq!(verify(&mut f, &ap, now()), Err(AuthnError::Replay));
     assert_eq!(last_reason(&f), AuditReason::Replay);
     assert_eq!(
-        f.keyd.open_and_verify_service_ticket(
-            &LDAP_OTHER,
-            &LDAP_SERVICE.principal,
-            &AppBinding::Unbound,
-            &ap,
-            &now()
-        ),
+        f.keyd
+            .open_and_verify_service_ticket(&LDAP_OTHER, &LDAP_SERVICE.principal, &ap, &now()),
         Err(AuthnError::Replay)
     );
     // A tampered copy is Denied, not Replay: the class needs the chain.
@@ -1017,7 +987,6 @@ fn password_derived_service_key_never_verifies() {
         f.keyd.open_and_verify_service_ticket(
             &LDAP,
             &dc02.principal,
-            &AppBinding::Unbound,
             &ap_octets(&issued, now(), 662),
             &now()
         ),
@@ -1206,39 +1175,88 @@ fn verify_bound(
     f: &mut Fixture,
     ap: &[u8],
     bound: [u8; 32],
-) -> Result<keyd::ServiceContext, AuthnError> {
-    f.keyd.open_and_verify_service_ticket(
-        &LDAP,
-        &ADMIN_SERVICE_ID,
-        &AppBinding::OperationDigest(digest(bound)),
-        ap,
-        &now(),
-    )
+) -> Result<keyd::OperationTicket, AuthnError> {
+    f.keyd
+        .verify_operation_ticket(&LDAP, &ADMIN_SERVICE_ID, &digest(bound), ap, &now())
 }
 
-/// The right digest ⇒ opened under the AdminService key set; the answer
-/// names the verified digest; one success record with purpose AdminService.
-/// The unbound LDAP verification answers no digest. Source: RFC 4120 §5.5.1
-/// ("a checksum of the application data that accompanies the KRB_AP_REQ,
-/// computed using a key usage value of 10"), §7.5.1 item 10; RFC 3961 §4
-/// (verify_mic); docs/52 §5 items 2-3.
+/// The right digest ⇒ verified under the AdminService key set; the answer
+/// names the verified digest; one success record with purpose AdminService
+/// and operation `VerifyOperationTicket` — and **no service context** is
+/// left in keyd (Q-523: the answer has no context id, and keyd's table of
+/// live contexts stays empty). The unbound LDAP verification still keeps
+/// its context and answers its id. Source: RFC 4120 §5.5.1 ("a checksum of
+/// the application data that accompanies the KRB_AP_REQ, computed using a
+/// key usage value of 10"), §7.5.1 item 10, §3.2.3 (a subkey is saved "for
+/// later use" — the admin channel has none); RFC 3961 §4 (verify_mic);
+/// docs/52 §3.4 (C4), §5 items 2-3; docs/questions/Q-523.
 #[test]
-fn right_operation_digest_opens_the_admin_ticket() {
+fn right_operation_digest_verifies_the_admin_ticket_and_keeps_no_context() {
     let mut f = admin_fixture();
     let tgt = obtain_tgt(&mut f, now(), &as_template());
     let issued = admin_ticket(&mut f, &tgt, 1);
-    let ctx = verify_bound(&mut f, &bound_octets(&issued, &DIGEST_A, 700), DIGEST_A).unwrap();
-    assert_eq!(ctx.cname, alice_name());
-    assert_eq!(ctx.bound_operation, Some(digest(DIGEST_A)));
+    let ticket = verify_bound(&mut f, &bound_octets(&issued, &DIGEST_A, 700), DIGEST_A).unwrap();
+    assert_eq!(ticket.cname, alice_name());
+    assert_eq!(ticket.crealm, realm());
+    assert_eq!(ticket.authtime, issued.authtime);
+    assert_eq!(ticket.operation, digest(DIGEST_A));
+    assert_eq!(
+        live_contexts(&f),
+        "0",
+        "an operation-bound verification keeps no context"
+    );
     let records = f.records();
     assert_eq!(records.len(), 1);
+    assert_eq!(records[0].op, keyd::Operation::VerifyOperationTicket);
     assert_eq!(records[0].result, AuditOutcome::Success);
     assert_eq!(records[0].principal, Some(ADMIN_SERVICE_ID));
     assert_eq!(records[0].purpose, Some(KeyPurpose::AdminService));
 
     let ldap = ldap_ticket(&mut f, &tgt, 2);
     let ctx = verify(&mut f, &ap_octets(&ldap, now(), 701), now()).unwrap();
-    assert_eq!(ctx.bound_operation, None);
+    assert_eq!(ctx.cname, alice_name());
+    assert_eq!(
+        live_contexts(&f),
+        "1",
+        "the unbound verification keeps its context"
+    );
+    let last = f.records().last().unwrap();
+    assert_eq!(last.op, keyd::Operation::OpenAndVerifyServiceTicket);
+    assert_eq!(last.purpose, Some(KeyPurpose::Service));
+}
+
+/// Q-523 at the table's bound: with room for ONE service context, any
+/// number of operation-bound verifications succeed and take no room — the
+/// next unbound verification still gets the one slot, and only a second
+/// unbound one meets the full table (`TokenTableFull`). So an admin request
+/// flood cannot fill the table the LDAP front's GSS verifications need
+/// (docs/questions/Q-387 item 4). Source: docs/10 §8, D36; docs/52 §3.4
+/// (C4); docs/questions/Q-387 item 4, Q-493 item 3, Q-523.
+#[test]
+fn operation_bound_verifications_never_fill_the_context_table() {
+    let mut config = config();
+    config.max_service_contexts = 1;
+    let mut f = Fixture::with_config(config);
+    add_ldap_service(&mut f);
+    add_admin_service(&mut f);
+    let tgt = obtain_tgt(&mut f, now(), &as_template());
+    let admin = admin_ticket(&mut f, &tgt, 1);
+    for cusec in 740..745 {
+        let ticket = verify_bound(&mut f, &bound_octets(&admin, &DIGEST_A, cusec), DIGEST_A);
+        assert_eq!(ticket.map(|t| t.operation), Ok(digest(DIGEST_A)), "{cusec}");
+    }
+    assert_eq!(live_contexts(&f), "0");
+    let ldap = ldap_ticket(&mut f, &tgt, 2);
+    assert!(verify(&mut f, &ap_octets(&ldap, now(), 746), now()).is_ok());
+    assert_eq!(live_contexts(&f), "1");
+    assert_eq!(
+        verify(&mut f, &ap_octets(&ldap, now(), 747), now()),
+        Err(AuthnError::Denied)
+    );
+    assert_eq!(last_reason(&f), AuditReason::TokenTableFull);
+    // A full table does not stop an operation-bound verification: it needs
+    // no slot.
+    assert!(verify_bound(&mut f, &bound_octets(&admin, &DIGEST_A, 748), DIGEST_A).is_ok());
 }
 
 /// The Q-292 attack at keyd: an admin's AP-REQ made for operation A,
@@ -1310,13 +1328,8 @@ fn an_expired_admin_ticket_bound_elsewhere_learns_no_class() {
         ApOptions::empty(),
     );
     let verify_at = |f: &mut Fixture, bound: [u8; 32]| {
-        f.keyd.open_and_verify_service_ticket(
-            &LDAP,
-            &ADMIN_SERVICE_ID,
-            &AppBinding::OperationDigest(digest(bound)),
-            &ap,
-            &late,
-        )
+        f.keyd
+            .verify_operation_ticket(&LDAP, &ADMIN_SERVICE_ID, &digest(bound), &ap, &late)
     };
     assert_eq!(verify_at(&mut f, DIGEST_B), Err(AuthnError::Denied));
     assert_eq!(last_reason(&f), AuditReason::OperationDigestMismatch);
@@ -1415,10 +1428,10 @@ fn binding_and_purpose_cannot_be_mixed() {
     // valid usage-10 cksum over the digest.
     let ldap_bound = bound_octets(&ldap, &DIGEST_A, 730);
     assert_eq!(
-        f.keyd.open_and_verify_service_ticket(
+        f.keyd.verify_operation_ticket(
             &LDAP,
             &LDAP_SERVICE_ID,
-            &AppBinding::OperationDigest(digest(DIGEST_A)),
+            &digest(DIGEST_A),
             &ldap_bound,
             &now()
         ),
@@ -1436,13 +1449,8 @@ fn binding_and_purpose_cannot_be_mixed() {
         ap_octets(&admin, now(), 732),
     ] {
         assert_eq!(
-            f.keyd.open_and_verify_service_ticket(
-                &LDAP,
-                &ADMIN_SERVICE_ID,
-                &AppBinding::Unbound,
-                &ap,
-                &now()
-            ),
+            f.keyd
+                .open_and_verify_service_ticket(&LDAP, &ADMIN_SERVICE_ID, &ap, &now()),
             Err(AuthnError::Denied)
         );
         let last = f.records().last().unwrap();

@@ -75,7 +75,7 @@ fn world(kdc_uid_offset: u32, lifetime: Duration, max_views: usize) -> Option<Wo
     let auditd = FakeAuditd::start_recording_as(&dir.join("a.sock"), ipc_audit::EventSource::Dird);
     let dird = Dird::start(
         support::params(&dir, uid + kdc_uid_offset, uid, lifetime, max_views),
-        StoreSource::Opened(Arc::clone(&directory.store)),
+        directory_daemon::test_seams::opened(Arc::clone(&directory.store)),
         support::policy(1),
     )
     .unwrap();
@@ -142,7 +142,7 @@ fn auditd_is_verified_first() {
     let start = |auditd_uid| {
         Dird::start(
             support::params(&dir, uid, auditd_uid, Duration::from_secs(5), 4),
-            StoreSource::Opened(Arc::clone(&directory.store)),
+            directory_daemon::test_seams::opened(Arc::clone(&directory.store)),
             support::policy(1),
         )
     };
@@ -175,7 +175,7 @@ fn an_auditd_recording_dird_under_another_source_is_refused() {
         let auditd = FakeAuditd::start_recording_as(&dir.join("a.sock"), other);
         let error = Dird::start(
             support::params(&dir, uid, uid, Duration::from_secs(5), 4),
-            StoreSource::Opened(Arc::clone(&directory.store)),
+            directory_daemon::test_seams::opened(Arc::clone(&directory.store)),
             support::policy(1),
         )
         .err()

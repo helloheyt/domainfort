@@ -167,8 +167,8 @@ pub mod startup;
 
 pub use admin_listener::admin_refused_peer_count;
 pub use admin_service::{
-    AdminParams, DecisionAckDeadline, DecisionAckDeadlineOutOfRange, KeydTicketVerifier,
-    NotStarted, RegistrationFailure, TicketVerifier, VerifierFactory, ADMIN_QUEUE_CAPACITY,
+    AdminParams, DecisionAckDeadline, DecisionAckDeadlineOutOfRange, KeydEndpoint,
+    KeydTicketVerifier, NotStarted, RegistrationFailure, TicketVerifier, ADMIN_QUEUE_CAPACITY,
     DECISION_ACK_DEADLINE, DESTROY_RECONCILE_INTERVAL, MAX_ADMIN_CONNECTIONS,
     MAX_DECISION_ACK_DEADLINE, MAX_DESTROY_RECONCILE_INTERVAL, MIN_DESTROY_RECONCILE_INTERVAL,
     SET_SECRET_GRANT_LIFETIME_SECS,
@@ -176,8 +176,8 @@ pub use admin_service::{
 pub use audit_link::{AuditEndpoint, AuditLinkError};
 pub use clock::{Clock, SharedClock, SystemClock};
 pub use daemon::{
-    serve, serve_with_admin, DaemonControl, DaemonError, DaemonParams, Stopped, StoreSource,
-    AUDIT_FLUSH_GRACE, DRAIN_GRACE, ENGINE_QUEUE_CAPACITY, LDAP_QUEUE_CAPACITY,
+    serve, serve_with_admin, DaemonControl, DaemonError, DaemonParams, OpenedStore, Stopped,
+    StoreSource, AUDIT_FLUSH_GRACE, DRAIN_GRACE, ENGINE_QUEUE_CAPACITY, LDAP_QUEUE_CAPACITY,
     MAX_KDC_CONNECTIONS, MAX_LDAP_SESSIONS, MAX_OPEN_VIEWS, SOCKET_FILE_MODE,
 };
 pub use engine::{DirectoryEngine, EngineError, EngineHandle, EnginePanicked, EngineThread};
@@ -186,3 +186,12 @@ pub use ldap_listener::ldap_refused_peer_count;
 pub use listener::refused_peer_count;
 pub use reconcile::{MAX_PAGES_PER_RUN, MAX_REGISTRATIONS_PER_RUN, MAX_SETTLED, TOMBSTONE_PAGE};
 pub use registration::{destroy_decision_id, DecisionRegistration};
+
+/// The test seams (docs/52 C18, task R15): the full parameters, the generic
+/// serve, an already-opened store and any keyd verifier. Compiled only with
+/// the feature `test-seams`, which only dev-dependencies enable; no product
+/// source names this module (crates/e2e-tests
+/// `tests/no_test_seams_in_product.rs`).
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod test_seams;

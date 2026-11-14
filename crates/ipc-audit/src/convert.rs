@@ -205,7 +205,7 @@ mod from_keyd {
                     VerifySecret, CreateKey, RotateKey, RotateKrbtgt, RetireKvno,
                     OpenFastArmor, SealFastError, DestroyKeySet, OpenAndVerifyServiceTicket,
                     DescribeConfig, Ping, GrantSetSecret, RegisterDecision, SealCeremony,
-                    ListDestroyDecisions,
+                    ListDestroyDecisions, VerifyOperationTicket,
                 }),
                 principal: record.principal.map(|id| *id.as_bytes()),
                 purpose: record.purpose.as_ref().map(purpose),

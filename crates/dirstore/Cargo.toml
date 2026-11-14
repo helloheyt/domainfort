@@ -42,5 +42,21 @@ sha2 = { version = "0.11", default-features = false, features = ["zeroize"] }
 # (AGENTS.md §6 "secrets"). Fixed-size array only, so no `alloc` feature.
 zeroize = { version = "1.9", default-features = false }
 
+[features]
+# docs/52 C18 (task R15; A-113): the path-taking `Store::open` — a test seam
+# (it resolves its path the platform's way, a link followed) — exists only in
+# a build that asks for it. Only `[dev-dependencies]` enable this feature
+# (cargo's resolver 2 turns a dev-dependency's features on only in builds of
+# test targets); product code opens a store with `Store::open_file` on a
+# descriptor crates/protected-file checked. crates/e2e-tests
+# tests/no_test_seams_in_product.rs checks every Cargo.toml. Never in
+# `default`.
+test-seams = []
+
+[dev-dependencies]
+# TESTS ONLY (docs/52 C18, task R15; A-113): the tests open their stores by
+# path (`Store::open`, feature `test-seams`).
+dirstore = { path = ".", features = ["test-seams"] }
+
 [lints]
 workspace = true

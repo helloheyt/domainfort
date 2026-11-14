@@ -48,9 +48,11 @@ use ldap::{
     DirectoryInputs, Engine, EngineConfig, RateLimiter, RequestInputs, RootDseConfig, SearchClock,
     Session, TransportReport,
 };
-use ldap_front::{
-    serve, ConnectionLimits, DaemonControl, Endpoint, FrontParams, Listeners, Timeouts,
-};
+// The full parameters (the client write bound, the connection bounds) and
+// their serve are the front's test seams (docs/52 C18, task R15; feature
+// `test-seams`, enabled by the dev-dependency).
+use ldap_front::test_seams::{serve, FrontParams};
+use ldap_front::{ConnectionLimits, DaemonControl, Endpoint, Listeners, Timeouts};
 use parse_ldap::{
     decode_message, encode_message, frame_length, AuthState, DecodeOptions,
     Direction as LdapDirection, Frame, LdapMessage, Profile, ProtocolOp, ResultCode,
@@ -267,7 +269,7 @@ pub fn world(tweak: impl FnOnce(&mut FrontParams)) -> Option<World> {
     params.clock = SharedClock::new(FixedTime);
     let dird = Dird::start(
         params,
-        StoreSource::Opened(Arc::clone(&directory.store)),
+        directory_daemon::test_seams::opened(Arc::clone(&directory.store)),
         ldap_policy(1),
     )
     .unwrap();

@@ -285,8 +285,10 @@ fn code_tables_are_closed() {
     assert_eq!(table!(PdpReasonCode), 12);
     // `GrantSetSecret` (17) appended by task A15a; `RegisterDecision`,
     // `SealCeremony`, `ListDestroyDecisions` (18-20) by A-102 (docs/52 §4);
-    // 1-16 keep their codes.
-    assert_eq!(table!(KeydOperation), 20);
+    // `VerifyOperationTicket` (21) by Q-523; 1-16 keep their codes.
+    assert_eq!(table!(KeydOperation), 21);
+    assert_eq!(KeydOperation::VerifyOperationTicket.code(), 21);
+    assert_eq!(KeydOperation::OpenAndVerifyServiceTicket.code(), 14);
     assert_eq!(KeydOperation::GrantSetSecret.code(), 17);
     assert_eq!(KeydOperation::RegisterDecision.code(), 18);
     assert_eq!(KeydOperation::ListDestroyDecisions.code(), 20);

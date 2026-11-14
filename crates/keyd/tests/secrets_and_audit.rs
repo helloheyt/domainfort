@@ -136,16 +136,24 @@ fn operation_signatures_return_no_key_material() {
     ) -> Result<(), Error> = K::verify_secret;
     // docs/49 §3.3, A-46 (task L6a): the service AP-REQ goes in as octets;
     // out come non-secret facts and a one-time token — no key, no session
-    // key. R2: the service key set is named by its principal and the
-    // binding (whose purpose it is).
+    // key. R2: the service key set is named by its principal; its purpose
+    // is the operation's binding's. Q-523: the operation-bound verification
+    // returns facts only — no context token either.
     let _: fn(
         &mut K,
         &CallerId,
         &keyd::PrincipalId,
-        &keyd::AppBinding,
         &[u8],
         &KerberosTime,
     ) -> Result<ServiceContext, AuthnError> = K::open_and_verify_service_ticket;
+    let _: fn(
+        &mut K,
+        &CallerId,
+        &keyd::PrincipalId,
+        &keyd::OperationDigest,
+        &[u8],
+        &KerberosTime,
+    ) -> Result<keyd::OperationTicket, AuthnError> = K::verify_operation_ticket;
 }
 
 /// I1 at the value level: nothing keyd returns contains a long-term key or
@@ -374,22 +382,22 @@ fn every_operation_emits_exactly_one_audit_record() {
 
     // Service-ticket verification (docs/49 §3.3, A-46): one record either
     // way. The successful path is audited in tests/service_ticket.rs.
-    let _ = f.keyd.open_and_verify_service_ticket(
+    let _ = f
+        .keyd
+        .open_and_verify_service_ticket(&LDAP, &SERVICE.principal, &[0x30, 0x00], &n);
+    check(&f, Operation::OpenAndVerifyServiceTicket, &LDAP, false);
+    let _ = f
+        .keyd
+        .open_and_verify_service_ticket(&KDC, &SERVICE.principal, &[0x30, 0x00], &n);
+    check(&f, Operation::OpenAndVerifyServiceTicket, &KDC, false);
+    let _ = f.keyd.verify_operation_ticket(
         &LDAP,
         &SERVICE.principal,
-        &keyd::AppBinding::Unbound,
+        &keyd::OperationDigest::new([0x0D; 32]),
         &[0x30, 0x00],
         &n,
     );
-    check(&f, Operation::OpenAndVerifyServiceTicket, &LDAP, false);
-    let _ = f.keyd.open_and_verify_service_ticket(
-        &KDC,
-        &SERVICE.principal,
-        &keyd::AppBinding::Unbound,
-        &[0x30, 0x00],
-        &n,
-    );
-    check(&f, Operation::OpenAndVerifyServiceTicket, &KDC, false);
+    check(&f, Operation::VerifyOperationTicket, &LDAP, false);
 
     // Daemon support (docs/50 §3.4): one record either way.
     f.keyd.describe_config(&KDC, &n).unwrap();

@@ -22,18 +22,19 @@
 use crate::wire::{
     CreateKeyRequest, GrantSetSecretRequest, IssueAsRepRequest, IssueTgsRepRequest, KeydReply,
     KeydRequest, OpenAndVerifyServiceTicketRequest, OpenAndVerifyTgtRequest, OpenFastArmorRequest,
-    RegisterDecisionRequest, SealFastErrorRequest, SetSecretRequest, VerifyPreauthRequest,
-    VerifySecretRequest, WireAsTemplate, WireAuthnProof, WireBinding, WireConfigDescription,
-    WireDecidedOperation, WireDestructionPage, WireFastArmor, WireRepParts, WireServiceContext,
-    WireSetSecretTarget, WireTgsFast, WireTgsTemplate, WireTgtContext, WireTime,
+    RegisterDecisionRequest, SealFastErrorRequest, SetSecretRequest, VerifyOperationTicketRequest,
+    VerifyPreauthRequest, VerifySecretRequest, WireAsTemplate, WireAuthnProof, WireBinding,
+    WireConfigDescription, WireDecidedOperation, WireDestructionPage, WireFastArmor,
+    WireOperationTicket, WireRepParts, WireServiceContext, WireSetSecretTarget, WireTgsFast,
+    WireTgsTemplate, WireTgtContext, WireTime,
 };
 use core::fmt;
 use ipc::{DerBlob, Secret};
 use keyd_types::{
-    AccountKind, AppBinding, ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof,
-    ConfigDescription, CtxId, DecidedOperation, DecisionId, DestructionPage, FastArmor,
-    FastConversation, IssueError, KeyHandle, Kvno, Operation, OperationDigest, PrincipalBinding,
-    PrincipalId, Role, ServiceContext, SetSecretTarget, TgsRepParts, TgsTicketTemplate, TgtContext,
+    AccountKind, ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof, ConfigDescription,
+    CtxId, DecidedOperation, DecisionId, DestructionPage, FastArmor, FastConversation, IssueError,
+    KeyHandle, Kvno, Operation, OperationDigest, OperationTicket, PrincipalBinding, PrincipalId,
+    Role, ServiceContext, SetSecretTarget, TgsRepParts, TgsTicketTemplate, TgtContext,
 };
 use krb_proto::{
     ApReq, EncryptedData, KerberosTime, KrbError, KrbFastArmoredReq, KrbFastReq, PaData,
@@ -289,13 +290,23 @@ pub enum Call {
         /// The KrbFastResponse padata.
         padata: Vec<PaData>,
     },
-    /// Spec: docs/10 §5ב; docs/52 §5 item 3 (R2: the principal and the
-    /// binding; keyd derives the key set's purpose from the binding).
+    /// The unbound verification (the LDAP front). Spec: docs/10 §5ב;
+    /// docs/52 §5 item 3 (R2: keyd derives the key set's purpose from the
+    /// binding); docs/questions/Q-523.
     OpenAndVerifyServiceTicket {
         /// The service key set's principal.
         service: PrincipalId,
-        /// What the Authenticator must be bound to.
-        binding: AppBinding,
+        /// The raw KRB_AP_REQ octets.
+        ap_req_octets: Vec<u8>,
+    },
+    /// The operation-bound verification (dird's admin channel): keeps no
+    /// service context. Spec: docs/10 §5ב; docs/52 §5 items 3-4;
+    /// docs/questions/Q-523.
+    VerifyOperationTicket {
+        /// The admin service key set's principal.
+        service: PrincipalId,
+        /// The operation the AP-REQ must be bound to.
+        operation: OperationDigest,
         /// The raw KRB_AP_REQ octets.
         ap_req_octets: Vec<u8>,
     },
@@ -408,6 +419,7 @@ impl Call {
             Call::IssueTgsRep { .. } => Operation::IssueTgsRep,
             Call::SealFastError { .. } => Operation::SealFastError,
             Call::OpenAndVerifyServiceTicket { .. } => Operation::OpenAndVerifyServiceTicket,
+            Call::VerifyOperationTicket { .. } => Operation::VerifyOperationTicket,
             Call::SetSecret { .. } => Operation::SetSecret,
             Call::VerifySecret { .. } => Operation::VerifySecret,
             Call::CreateKey { .. } => Operation::CreateKey,
@@ -518,11 +530,18 @@ impl Call {
             }),
             Call::OpenAndVerifyServiceTicket {
                 service,
-                binding,
                 ap_req_octets,
             } => KeydRequest::OpenAndVerifyServiceTicket(OpenAndVerifyServiceTicketRequest {
                 service: *service,
-                binding: *binding,
+                ap_req_octets: ap_req_octets.clone(),
+            }),
+            Call::VerifyOperationTicket {
+                service,
+                operation,
+                ap_req_octets,
+            } => KeydRequest::VerifyOperationTicket(VerifyOperationTicketRequest {
+                service: *service,
+                operation: *operation,
                 ap_req_octets: ap_req_octets.clone(),
             }),
             Call::SetSecret {
@@ -647,7 +666,11 @@ impl Call {
             },
             KeydRequest::OpenAndVerifyServiceTicket(m) => Call::OpenAndVerifyServiceTicket {
                 service: m.service,
-                binding: m.binding,
+                ap_req_octets: m.ap_req_octets,
+            },
+            KeydRequest::VerifyOperationTicket(m) => Call::VerifyOperationTicket {
+                service: m.service,
+                operation: m.operation,
                 ap_req_octets: m.ap_req_octets,
             },
             KeydRequest::SetSecret(m) => {
@@ -1011,6 +1034,8 @@ pub enum Answer {
     SealFastError(Result<EncryptedData, keyd_types::Error>),
     /// Spec: docs/10 §5ב.
     OpenAndVerifyServiceTicket(Result<ServiceContext, AuthnError>),
+    /// Spec: docs/10 §5ב; docs/questions/Q-523.
+    VerifyOperationTicket(Result<OperationTicket, AuthnError>),
     /// Spec: docs/10 §6.
     SetSecret(Result<Kvno, keyd_types::Error>),
     /// Spec: docs/10 §6.
@@ -1074,6 +1099,7 @@ impl Answer {
             Answer::IssueTgsRep(_) => Operation::IssueTgsRep,
             Answer::SealFastError(_) => Operation::SealFastError,
             Answer::OpenAndVerifyServiceTicket(_) => Operation::OpenAndVerifyServiceTicket,
+            Answer::VerifyOperationTicket(_) => Operation::VerifyOperationTicket,
             Answer::SetSecret(_) => Operation::SetSecret,
             Answer::VerifySecret(_) => Operation::VerifySecret,
             Answer::CreateKey(_) => Operation::CreateKey,
@@ -1173,7 +1199,20 @@ impl Answer {
                         endtime: wire_time(&c.endtime),
                         flags: c.flags,
                         subkey_present: c.subkey_present,
-                        bound_operation: c.bound_operation.map(|d| *d.as_bytes()),
+                    }))
+                },
+                KeydReply::AuthnFailure,
+            ),
+            Answer::VerifyOperationTicket(r) => outcome(
+                r,
+                |t| {
+                    Ok(KeydReply::VerifyOperationTicket(WireOperationTicket {
+                        crealm: t.crealm.as_bytes().to_vec(),
+                        cname: der(t.cname.encode())?,
+                        authtime: wire_time(&t.authtime),
+                        endtime: wire_time(&t.endtime),
+                        flags: t.flags,
+                        operation: *t.operation.as_bytes(),
                     }))
                 },
                 KeydReply::AuthnFailure,
@@ -1308,11 +1347,23 @@ impl Answer {
                     endtime: time(&c.endtime)?,
                     flags: c.flags,
                     subkey_present: c.subkey_present,
-                    bound_operation: c.bound_operation.map(OperationDigest::new),
                 }))
             }
             (Operation::OpenAndVerifyServiceTicket, R::AuthnFailure(e)) => {
                 Answer::OpenAndVerifyServiceTicket(Err(e))
+            }
+            (Operation::VerifyOperationTicket, R::VerifyOperationTicket(t)) => {
+                Answer::VerifyOperationTicket(Ok(OperationTicket {
+                    crealm: realm(&t.crealm)?,
+                    cname: decoded(&t.cname, PrincipalName::decode)?,
+                    authtime: time(&t.authtime)?,
+                    endtime: time(&t.endtime)?,
+                    flags: t.flags,
+                    operation: OperationDigest::new(t.operation),
+                }))
+            }
+            (Operation::VerifyOperationTicket, R::AuthnFailure(e)) => {
+                Answer::VerifyOperationTicket(Err(e))
             }
             (Operation::SetSecret, R::SetSecret(k)) => Answer::SetSecret(Ok(k)),
             (Operation::SetSecret, R::Failure(e)) => Answer::SetSecret(Err(e)),

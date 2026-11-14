@@ -365,7 +365,7 @@ fn dird_down_or_past_its_deadline_reaches_the_client_as_29() {
         support::FakeAuditd::start_recording_as(&dir.join("a.sock"), ipc_audit::EventSource::Dird);
     let dird = support::Dird::start(
         support::params(&dir, uid, uid, Duration::from_secs(5), 4),
-        StoreSource::Opened(std::sync::Arc::clone(&directory.store)),
+        directory_daemon::test_seams::opened(std::sync::Arc::clone(&directory.store)),
         support::policy(1),
     )
     .unwrap();

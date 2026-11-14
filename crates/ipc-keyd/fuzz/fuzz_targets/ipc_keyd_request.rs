@@ -22,17 +22,20 @@
 //! §4.6).
 //!
 //! A decoded `open_and_verify_service_ticket` (kind `0x07`) carries a
-//! principal and a binding from a closed table (`1` Unbound, `2`
-//! OperationDigest + 32 octets) and no key purpose — keyd derives it (R2,
-//! docs/52 §5 item 3); the reply's operation digest is an optional 32-octet
-//! field (the reply target covers it).
+//! principal and the binding octet, whose closed table is `1` (Unbound)
+//! alone since Q-523; a decoded `verify_operation_ticket` (kind `0x15`)
+//! carries a principal and a 32-octet operation digest. Neither carries a
+//! key purpose — keyd derives it (R2, docs/52 §5 item 3). The target checks
+//! that a decoded 0x07 is never operation-bound (Q-523: only the
+//! context-free kind 0x15 is).
 //!
 //! Written, not run (PENDING-OWNER P-1).
 //!
-//! Spec: docs/50 §3.3, §3.4, §9; R50-4; A-59; docs/51 §5.8.
+//! Spec: docs/50 §3.3, §3.4, §9; R50-4; A-59; docs/51 §5.8;
+//! docs/questions/Q-523.
 
 use ipc::{encode_frame, Direction};
-use ipc_keyd::channel::{MAX_DECISION_APPROVERS, MAX_GRANT_TARGETS};
+use ipc_keyd::channel::{request_kind, MAX_DECISION_APPROVERS, MAX_GRANT_TARGETS};
 use ipc_keyd::{decode_request, Call, DecidedOperation, KEYD_CHANNEL};
 use libfuzzer_sys::fuzz_target;
 
@@ -41,6 +44,14 @@ fuzz_target!(|body: &[u8]| {
         Ok(call) => {
             if let Call::GrantSetSecret { targets, .. } = &call {
                 assert!(targets.len() <= MAX_GRANT_TARGETS as usize, "count bound");
+            }
+            // Q-523: kind 0x07 decodes only as the unbound verification.
+            if matches!(call, Call::OpenAndVerifyServiceTicket { .. }) {
+                assert_eq!(
+                    body.get(3),
+                    Some(&request_kind::OPEN_AND_VERIFY_SERVICE_TICKET)
+                );
+                assert_eq!(body.get(20), Some(&0x01), "unbound binding octet");
             }
             if let Call::RegisterDecision {
                 operation,

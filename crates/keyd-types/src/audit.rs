@@ -333,14 +333,14 @@ pub enum AuditReason {
     /// ceremony. Reported as the uniform `Denied`.
     /// Spec: docs/52 §4.4, §7 R3; docs/questions/Q-462 item 1 (A-102).
     CeremonySealed,
-    /// `open_and_verify_service_ticket` with an operation-digest binding
-    /// (the admin service key): the Authenticator carries no `cksum`, so
+    /// `verify_operation_ticket` (the operation-digest binding, the admin
+    /// service key; Q-523): the Authenticator carries no `cksum`, so
     /// the AP-REQ is bound to no operation. Part of the cryptographic chain
     /// — the uniform `Denied` (A-26), before the replay cache.
     /// Spec: RFC 4120 5.5.1 (cksum), 7.5.1 item 10; docs/52 §5 item 3 (R2);
     /// docs/questions/Q-463 (A-102).
     OperationDigestMissing,
-    /// `open_and_verify_service_ticket` with an operation-digest binding:
+    /// `verify_operation_ticket` (the operation-digest binding; Q-523):
     /// the Authenticator's `cksum` is not the session key's MIC over the
     /// operation digest dird computed — another checksum type than the
     /// session key's required one, another length, or a MIC that does not

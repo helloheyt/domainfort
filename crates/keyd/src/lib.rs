@@ -15,7 +15,7 @@
 //! | `Kdc`       | [`Keyd::verify_preauth`], [`Keyd::issue_as_rep`], [`Keyd::open_and_verify_tgt`], [`Keyd::issue_tgs_rep`], [`Keyd::open_fast_armor`], [`Keyd::seal_fast_error`], [`Keyd::describe_config`], [`Keyd::ping`] |
 //! | `Directory` | [`Keyd::set_secret`] (on a dird decision), [`Keyd::ping`] |
 //! | `Admin`     | before the seal: [`Keyd::create_key`], [`Keyd::grant_set_secret`] (initial secrets of users); always: [`Keyd::rotate_key`], [`Keyd::rotate_krbtgt`], [`Keyd::retire_kvno`], [`Keyd::destroy_key_set`] (each by dird decision id), [`Keyd::seal_ceremony`], [`Keyd::list_destroy_decisions`], [`Keyd::ping`] |
-//! | `Ldap`      | [`Keyd::open_and_verify_service_ticket`], [`Keyd::register_decision`], [`Keyd::describe_config`], [`Keyd::ping`] |
+//! | `Ldap`      | [`Keyd::open_and_verify_service_ticket`], [`Keyd::verify_operation_ticket`], [`Keyd::register_decision`], [`Keyd::describe_config`], [`Keyd::ping`] |
 //!
 //! [`Keyd::verify_secret`] is in no role's row (A-102, docs/52 R4).
 //!
@@ -84,7 +84,13 @@
 //! `AdminService` key set (the admin service: the Authenticator's `cksum`
 //! must be the session key's MIC over the operation digest, key usage 10,
 //! RFC 4120 §5.5.1 / §7.5.1). An admin ticket without its operation
-//! binding cannot be verified at all.
+//! binding cannot be verified at all. **Q-523:** each binding is its own
+//! operation ([`AppBinding::operation`]) with its own answer type —
+//! [`Keyd::open_and_verify_service_ticket`] (unbound) answers a
+//! [`ServiceContext`] and keeps the session key under its id;
+//! [`Keyd::verify_operation_ticket`] (operation-bound, dird's admin
+//! channel) answers an [`OperationTicket`], which has no context id, and
+//! keeps nothing.
 //!
 //! **Key-state changes** (decision A-86, docs/questions/Q-346):
 //! [`changes_key_state`] names the six operations that install, rotate,
@@ -153,7 +159,8 @@
 //!   armor TGT, authenticator, subkey, armor key,
 //!   req-checksum and enc-fast-req all passed (`open_fast_armor`), or the
 //!   service ticket and its authenticator decrypted
-//!   (`open_and_verify_service_ticket`), may an
+//!   (`open_and_verify_service_ticket`; `verify_operation_ticket` also after
+//!   the operation digest's MIC), may an
 //!   [`AuthnError`] other than `Denied` be returned — `TicketExpired`,
 //!   `TicketNotYetValid`, `Skew`, `Replay`. A `verify_preauth` refused by its
 //!   failure throttle (A-34) is the uniform `Denied`. **By type since R7**
@@ -351,9 +358,9 @@ pub use keyd_types::{
     ArmorId, AsRepParts, AsTicketTemplate, AuditKeyRef, AuditOutcome, AuditReason, AuditRecord,
     AuditSink, AuthnError, AuthnProof, CallerId, ConfigDescription, ConfigError, CtxId, EncTypeId,
     Error, ExchangeId, FastArmor, FastConversation, IssueError, KeyCustody, KeyHandle, KeyPurpose,
-    KeydConfig, Kvno, Operation, PrincipalBinding, PrincipalId, Role, ServiceContext, ServiceCtxId,
-    TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext, ThrottlePolicy, TicketPolicy,
-    MAX_FX_COOKIE_LENGTH, TOKEN_ID_LENGTH,
+    KeydConfig, Kvno, Operation, OperationTicket, PrincipalBinding, PrincipalId, Role,
+    ServiceContext, ServiceCtxId, TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext,
+    ThrottlePolicy, TicketPolicy, MAX_FX_COOKIE_LENGTH, TOKEN_ID_LENGTH,
 };
 pub use keyd_types::{
     CeremonyState, DecidedOperation, DecisionId, DecisionIntent, DestructionPage,

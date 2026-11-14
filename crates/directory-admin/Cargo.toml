@@ -60,5 +60,10 @@ ipc-audit = { path = "../ipc-audit" }
 # implemented here (AGENTS.md §6). Not krb-crypto (D182).
 sha2 = { version = "0.11", default-features = false }
 
+[dev-dependencies]
+# TESTS ONLY (docs/52 C18, task R15; A-113): the tests open their stores by
+# path (`Store::open`, feature `test-seams`).
+dirstore = { path = "../dirstore", features = ["test-seams"] }
+
 [lints]
 workspace = true

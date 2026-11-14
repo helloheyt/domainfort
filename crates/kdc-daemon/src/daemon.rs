@@ -34,7 +34,7 @@
 
 use crate::audit::AuditGate;
 use crate::audit_client::{self, AuditEndpoint, AuditLinkError};
-use crate::clock::Clock;
+use crate::clock::{Clock, SystemClock};
 use crate::engine::{self, EngineSetup, EngineThread, StartError};
 use crate::log::{note, Note};
 use crate::queues::RequestQueues;
@@ -73,11 +73,38 @@ pub const AUDIT_FLUSH_GRACE: Duration = ipc_audit::AUDIT_FLUSH_GRACE;
 /// Poll interval while draining. Project choice.
 const DRAIN_POLL: Duration = Duration::from_millis(10);
 
-/// What [`serve`] needs besides the policy, the listeners, the connectors
-/// and the clock.
-/// Spec: docs/50 §2.4, §3.2, §3.6, §4.1, §7.1, §8.1.
+/// What the kdc's configuration file sets for the daemon — **and nothing
+/// else** (docs/52 C18, task R15): the product parameters. The values no
+/// configuration key sets (the UDP limits, the queue capacities, the audit
+/// window, the UDP reply bound) are the daemon's production constants,
+/// supplied by [`serve`]; they are not fields here.
+/// Spec: docs/50 §2.4, §3.2, §3.6, §4.1, §7.1, §8.1; docs/52 §3.18.
 #[derive(Debug, Clone)]
 pub struct DaemonParams {
+    /// keyd's uid (the keyd client checks it before sending, R50-3).
+    pub keyd_uid: u32,
+    /// The keyd client's deadline (docs/50 §3.6).
+    pub keyd_deadline: Duration,
+    /// dird's uid (R50-3).
+    pub dird_uid: u32,
+    /// The directory client's deadline (docs/50 §3.6).
+    pub dird_deadline: Duration,
+    /// auditd's socket and uid.
+    pub audit: AuditEndpoint,
+    /// The zone table for `Peer.src_net` (docs/50 §4.1).
+    pub zones: ZoneTable,
+    /// The TCP limits (docs/50 §4.1).
+    pub tcp: TcpLimits,
+}
+
+/// Everything [`serve_with`] needs besides the policy, the listeners, the
+/// connectors and the clock: the product [`DaemonParams`] plus the test
+/// seams. Built for a product daemon only by `From<DaemonParams>` (the
+/// production constants); reachable outside this crate only as
+/// `test_seams::DaemonParams` (docs/52 C18, task R15).
+/// Spec: docs/50 §2.4, §3.2, §3.6, §4.1, §7.1, §8.1; docs/52 §3.18.
+#[derive(Debug, Clone)]
+pub struct ServeParams {
     /// keyd's uid (the keyd client checks it before sending, R50-3).
     pub keyd_uid: u32,
     /// The keyd client's deadline (docs/50 §3.6).
@@ -106,8 +133,9 @@ pub struct DaemonParams {
 }
 
 impl DaemonParams {
-    /// The parameters of the kdc's configuration file, with the daemon's
-    /// constants for what the file does not set (Q-230 item 4 → A-60).
+    /// The parameters of the kdc's configuration file — the one product
+    /// constructor (docs/52 C18, task R15); the daemon's constants for what
+    /// the file does not set (Q-230 item 4 → A-60) are added by [`serve`].
     /// Spec: docs/50 §3.6, §4.1, §7.1.
     #[must_use]
     pub fn from_settings(settings: &KdcSettings) -> DaemonParams {
@@ -130,6 +158,25 @@ impl DaemonParams {
                 idle_timeout: limits.tcp_idle_timeout(),
                 max_requests: limits.max_requests_per_tcp_connection(),
             },
+        }
+    }
+}
+
+impl From<DaemonParams> for ServeParams {
+    /// The product parameters with the daemon's production constants:
+    /// `UdpLimits::DEFAULT`, [`AS_QUEUE_CAPACITY`], [`TGS_QUEUE_CAPACITY`],
+    /// `WindowConfig::DEFAULT` and `kdc::DEFAULT_UDP_MAX_REPLY_LEN` — the
+    /// only values a product daemon runs with (docs/52 C18, task R15).
+    /// Spec: docs/50 §3.6, §4.1, §8.1; docs/questions/Q-223, Q-230 item 4.
+    fn from(params: DaemonParams) -> ServeParams {
+        ServeParams {
+            keyd_uid: params.keyd_uid,
+            keyd_deadline: params.keyd_deadline,
+            dird_uid: params.dird_uid,
+            dird_deadline: params.dird_deadline,
+            audit: params.audit,
+            zones: params.zones,
+            tcp: params.tcp,
             udp: UdpLimits::DEFAULT,
             as_queue_capacity: AS_QUEUE_CAPACITY,
             tgs_queue_capacity: TGS_QUEUE_CAPACITY,
@@ -296,19 +343,51 @@ async fn wait_until(grace: Duration, done: impl Fn() -> bool) {
     }
 }
 
-/// Run the kdc daemon until [`DaemonControl::stop`] (module documentation).
+/// Run the product kdc daemon until [`DaemonControl::stop`] (module
+/// documentation): the product parameters with the daemon's production
+/// constants, the kdc's system clock, and the production connectors to
+/// keyd's and dird's sockets (`ipc_keyd::UnixConnector` /
+/// `ipc_directory::UnixConnector`: rustix peer credentials, R50-3) — the
+/// connector types are fixed here, so no other transport can be supplied;
+/// the alternatives exist only in `test_seams` (docs/52 C18, task R15). Must
+/// run inside a tokio runtime with I/O and time enabled, built after the
+/// process hardening.
 ///
-/// `keyd` / `dird` open connections to keyd's and dird's sockets — the
-/// daemon passes `ipc_keyd::UnixConnector` / `ipc_directory::UnixConnector`
-/// (rustix peer credentials, R50-3). Must run inside a tokio runtime with I/O
-/// and time enabled, built after the process hardening.
+/// # Errors
+/// [`DaemonError`] for a start-up failure (nothing is served then).
+///
+/// Spec: docs/50 R50-2, R50-3, R50-9, R50-14, R50-16, R50-17, §4.1, §7.5;
+/// docs/52 §3.18.
+pub async fn serve(
+    params: DaemonParams,
+    policy: DevelopmentPolicy,
+    listeners: Listeners,
+    keyd: ipc_keyd::UnixConnector,
+    dird: ipc_directory::UnixConnector,
+    control: DaemonControl,
+) -> Result<Stopped, DaemonError> {
+    serve_with(
+        ServeParams::from(params),
+        policy,
+        listeners,
+        keyd,
+        dird,
+        SystemClock,
+        control,
+    )
+    .await
+}
+
+/// [`serve`] with every value given: the parameters with their seams, any
+/// connectors and any clock. Reachable outside this crate only as
+/// `test_seams::serve` (docs/52 C18, task R15).
 ///
 /// # Errors
 /// [`DaemonError`] for a start-up failure (nothing is served then).
 ///
 /// Spec: docs/50 R50-2, R50-3, R50-9, R50-14, R50-16, R50-17, §4.1, §7.5.
-pub async fn serve<KC, DC, C>(
-    params: DaemonParams,
+pub async fn serve_with<KC, DC, C>(
+    params: ServeParams,
     policy: DevelopmentPolicy,
     listeners: Listeners,
     keyd: KC,

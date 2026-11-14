@@ -136,7 +136,8 @@ pub mod request_kind {
     pub const ISSUE_TGS_REP: u8 = 0x05;
     /// `seal_fast_error` (Kdc). Spec: docs/10 §5א.
     pub const SEAL_FAST_ERROR: u8 = 0x06;
-    /// `open_and_verify_service_ticket` (Ldap). Spec: docs/10 §5ב.
+    /// `open_and_verify_service_ticket` (Ldap) — the unbound verification
+    /// only since Q-523. Spec: docs/10 §5ב.
     pub const OPEN_AND_VERIFY_SERVICE_TICKET: u8 = 0x07;
     /// `set_secret` (Directory). Spec: docs/10 §6.
     pub const SET_SECRET: u8 = 0x08;
@@ -170,6 +171,10 @@ pub mod request_kind {
     /// `list_destroy_decisions` (Admin). Appended by A-102.
     /// Spec: docs/52 §4.3, §4.6.
     pub const LIST_DESTROY_DECISIONS: u8 = 0x14;
+    /// `verify_operation_ticket` (Ldap): the operation-bound service-ticket
+    /// verification, which keeps no service context. Appended by Q-523.
+    /// Spec: docs/10 §5ב; docs/52 §3.4, §5; docs/questions/Q-523.
+    pub const VERIFY_OPERATION_TICKET: u8 = 0x15;
 
     /// The closed request table. Spec: docs/50 §3.3, §3.4.
     pub const ALL: &[u8] = &[
@@ -193,6 +198,7 @@ pub mod request_kind {
         REGISTER_DECISION,
         SEAL_CEREMONY,
         LIST_DESTROY_DECISIONS,
+        VERIFY_OPERATION_TICKET,
     ];
 }
 
@@ -222,7 +228,7 @@ pub mod reply_kind {
     pub const ISSUE_TGS_REP: u8 = ok(rq::ISSUE_TGS_REP);
     /// The sealed `EncryptedData`. Spec: docs/10 §5א.
     pub const SEAL_FAST_ERROR: u8 = ok(rq::SEAL_FAST_ERROR);
-    /// `ServiceContext`. Spec: docs/10 §5ב.
+    /// `ServiceContext` (with its one-time context id). Spec: docs/10 §5ב.
     pub const OPEN_AND_VERIFY_SERVICE_TICKET: u8 = ok(rq::OPEN_AND_VERIFY_SERVICE_TICKET);
     /// The installed `Kvno`. Spec: docs/10 §6.
     pub const SET_SECRET: u8 = ok(rq::SET_SECRET);
@@ -251,6 +257,9 @@ pub mod reply_kind {
     pub const SEAL_CEREMONY: u8 = ok(rq::SEAL_CEREMONY);
     /// One page of pending destroy decisions. Spec: docs/52 §4.6.
     pub const LIST_DESTROY_DECISIONS: u8 = ok(rq::LIST_DESTROY_DECISIONS);
+    /// `OperationTicket` (no context id). Spec: docs/10 §5ב;
+    /// docs/questions/Q-523.
+    pub const VERIFY_OPERATION_TICKET: u8 = ok(rq::VERIFY_OPERATION_TICKET);
     /// A refusal of an authentication step: `keyd_types::AuthnError`.
     /// Spec: docs/10 §9; A-26; A-56.
     pub const AUTHN_FAILURE: u8 = 0xF1;
@@ -284,6 +293,7 @@ pub mod reply_kind {
         REGISTER_DECISION,
         SEAL_CEREMONY,
         LIST_DESTROY_DECISIONS,
+        VERIFY_OPERATION_TICKET,
         AUTHN_FAILURE,
         ISSUE_FAILURE,
         FAILURE,

@@ -139,11 +139,21 @@ pub enum Operation {
     /// Spec: docs/52 §4.3, §4.6; docs/51 §6, §9; docs/questions/Q-460
     /// (A-102).
     ListDestroyDecisions = 19,
+    /// Verify a service AP-REQ bound to one operation (the admin channel's
+    /// `AppBinding::OperationDigest`): RFC 4120 3.2.3 under the
+    /// AdminService key set, the Authenticator's `cksum` the session key's
+    /// MIC over the operation digest (key usage 10) — and **no service
+    /// context**: the answer (`OperationTicket`) has no context id and keyd
+    /// keeps no session key for it. Role::Ldap (dird). Appended by Q-523;
+    /// `OpenAndVerifyServiceTicket` is now the unbound verification only.
+    /// Spec: RFC 4120 3.2.3, 5.5.1, 7.5.1 item 10; docs/10 §5ב; docs/52
+    /// §3.4 (C4), §5; docs/questions/Q-387 item 4, Q-493 item 3, Q-523.
+    VerifyOperationTicket = 20,
 }
 
 impl Operation {
     /// Every operation, for exhaustive checks. Spec: docs/10 §2.
-    pub const ALL: [Operation; 20] = [
+    pub const ALL: [Operation; 21] = [
         Operation::VerifyPreauth,
         Operation::IssueAsRep,
         Operation::OpenAndVerifyTgt,
@@ -164,6 +174,7 @@ impl Operation {
         Operation::RegisterDecision,
         Operation::SealCeremony,
         Operation::ListDestroyDecisions,
+        Operation::VerifyOperationTicket,
     ];
 }
 
@@ -190,7 +201,10 @@ impl Operation {
 /// Q-503): Ldap may also read `ListDestroyDecisions` — the pending destroy
 /// decisions it registered itself — so that dird re-registers only the ones
 /// keyd lost (a read: decision ids and tombstones' GUIDs, nothing secret, no
-/// state changed).
+/// state changed). Q-523: Ldap's service-ticket verification is two
+/// operations, one per binding — `OpenAndVerifyServiceTicket` (unbound, the
+/// LDAP front; keeps a service context) and `VerifyOperationTicket` (bound
+/// to an operation digest, dird's admin channel; keeps none).
 pub const CAPABILITY_TABLE: [(Role, &[Operation]); 4] = [
     (
         Role::Kdc,
@@ -224,6 +238,7 @@ pub const CAPABILITY_TABLE: [(Role, &[Operation]); 4] = [
         Role::Ldap,
         &[
             Operation::OpenAndVerifyServiceTicket,
+            Operation::VerifyOperationTicket,
             Operation::RegisterDecision,
             Operation::ListDestroyDecisions,
             Operation::DescribeConfig,
@@ -261,6 +276,7 @@ pub const fn provisioning_only(op: Operation) -> bool {
         | Operation::SealFastError
         | Operation::DestroyKeySet
         | Operation::OpenAndVerifyServiceTicket
+        | Operation::VerifyOperationTicket
         | Operation::DescribeConfig
         | Operation::Ping
         | Operation::RegisterDecision
@@ -297,6 +313,7 @@ pub const fn requires_decision(op: Operation) -> bool {
         | Operation::OpenFastArmor
         | Operation::SealFastError
         | Operation::OpenAndVerifyServiceTicket
+        | Operation::VerifyOperationTicket
         | Operation::DescribeConfig
         | Operation::Ping
         | Operation::GrantSetSecret
@@ -343,6 +360,7 @@ pub const fn changes_key_state(op: Operation) -> bool {
         | Operation::OpenFastArmor
         | Operation::SealFastError
         | Operation::OpenAndVerifyServiceTicket
+        | Operation::VerifyOperationTicket
         | Operation::DescribeConfig
         | Operation::Ping
         | Operation::GrantSetSecret
@@ -383,6 +401,7 @@ pub const fn loosens_authorization(op: Operation) -> bool {
         | Operation::SealFastError
         | Operation::DestroyKeySet
         | Operation::OpenAndVerifyServiceTicket
+        | Operation::VerifyOperationTicket
         | Operation::DescribeConfig
         | Operation::Ping
         | Operation::SealCeremony
@@ -450,7 +469,8 @@ pub const fn startup_hold_down_applies(op: Operation) -> bool {
         | Operation::IssueTgsRep
         | Operation::OpenFastArmor
         | Operation::SealFastError
-        | Operation::OpenAndVerifyServiceTicket => true,
+        | Operation::OpenAndVerifyServiceTicket
+        | Operation::VerifyOperationTicket => true,
         Operation::SetSecret
         | Operation::VerifySecret
         | Operation::CreateKey
@@ -526,12 +546,14 @@ pub enum HandleSlot {
 ///   under the key set of its service's purpose (the admin service's own,
 ///   R2). Referral TGTs (Krbtgt in docs/10 §5) are cross-realm, which phase
 ///   1 does not implement.
-/// - `open_and_verify_service_ticket`: Service or AdminService — "only
-///   handles of type `Service`" (docs/questions/Q-165 item 3, A-46), split
-///   by R2: which of the two is not the caller's choice but the binding's
-///   (`AppBinding::key_purpose`: `Unbound` ⇒ Service, `OperationDigest` ⇒
-///   AdminService — pinned below); a TGT is never opened here (that is the
-///   KDC's `open_and_verify_tgt`).
+/// - `open_and_verify_service_ticket`: Service only — "only handles of
+///   type `Service`" (docs/questions/Q-165 item 3, A-46) — and
+///   `verify_operation_ticket`: AdminService only. R2 made the purpose the
+///   binding's (`AppBinding::key_purpose`: `Unbound` ⇒ Service,
+///   `OperationDigest` ⇒ AdminService); since Q-523 each binding is its own
+///   operation (`AppBinding::operation`), so each row holds exactly its
+///   binding's purpose (pinned below). A TGT is never opened here (that is
+///   the KDC's `open_and_verify_tgt`).
 /// - `set_secret`, `verify_secret`: PrincipalLongterm or Service. The krbtgt
 ///   key is never password-derived and is rotated only through
 ///   `rotate_krbtgt` (dual control, docs/10 §7); the admin service key is
@@ -554,14 +576,13 @@ pub enum HandleSlot {
 /// Spec: docs/10 §2 ("(b) the KeyPurpose of the handle matches the
 /// operation"), §4, §5, §6, §7, §12 I3; docs/48 §2.3, §9.1 I3;
 /// docs/questions/Q-115 (A-35), Q-165 item 3 (A-46), Q-450 item 2, Q-463
-/// item 4 (A-102; docs/52 §5 item 3).
+/// item 4 (A-102; docs/52 §5 item 3), Q-523.
 pub const fn purpose_permitted(op: Operation, slot: HandleSlot, purpose: KeyPurpose) -> bool {
     use KeyPurpose::{AdminService, Krbtgt, PrincipalLongterm, Service};
     match (op, slot) {
-        (Operation::OpenAndVerifyServiceTicket, HandleSlot::Primary)
-        | (Operation::IssueTgsRep, HandleSlot::Primary) => {
-            matches!(purpose, Service | AdminService)
-        }
+        (Operation::IssueTgsRep, HandleSlot::Primary) => matches!(purpose, Service | AdminService),
+        (Operation::OpenAndVerifyServiceTicket, HandleSlot::Primary) => matches!(purpose, Service),
+        (Operation::VerifyOperationTicket, HandleSlot::Primary) => matches!(purpose, AdminService),
         (Operation::VerifyPreauth, HandleSlot::Primary)
         | (Operation::IssueAsRep, HandleSlot::Primary) => {
             matches!(purpose, PrincipalLongterm)
@@ -662,12 +683,13 @@ const _: () = {
     // describe_config and ping, and — docs/52 §4.2, A-102 —
     // register_decision, and — task R6, A-105 — list_destroy_decisions (a
     // read of its own registrations), and nothing else; no other role may call
-    // open_and_verify_service_ticket, and it opens only Service- or
-    // AdminService-purpose handles (which of the two: the binding's, R2).
+    // either service-ticket verification (Q-523: the unbound one opens only
+    // Service-purpose handles, the operation-bound one only AdminService).
     let mut i = 0;
     while i < Operation::ALL.len() {
         let op = Operation::ALL[i];
-        let is_service_ticket = op as u8 == Operation::OpenAndVerifyServiceTicket as u8;
+        let is_service_ticket = op as u8 == Operation::OpenAndVerifyServiceTicket as u8
+            || op as u8 == Operation::VerifyOperationTicket as u8;
         let is_daemon_support =
             op as u8 == Operation::DescribeConfig as u8 || op as u8 == Operation::Ping as u8;
         let is_decision = op as u8 == Operation::RegisterDecision as u8
@@ -743,6 +765,8 @@ const _: () = {
     assert!(startup_hold_down_applies(
         Operation::OpenAndVerifyServiceTicket
     ));
+    // Q-523: the operation-bound verification enters the same replay cache.
+    assert!(startup_hold_down_applies(Operation::VerifyOperationTicket));
     assert!(!startup_hold_down_applies(Operation::DescribeConfig));
     assert!(!startup_hold_down_applies(Operation::Ping));
     // The Admin set_secret grant (docs/51 §5.8 option (b); A-74; Q-450;
@@ -866,18 +890,37 @@ const _: () = {
     // service's key set opens only with an operation digest and the LDAP
     // service's only unbound — the binding, not the caller, names the
     // purpose (`AppBinding::key_purpose`), and each row is fixed here.
+    // Q-523: each binding is its own operation (`AppBinding::operation`),
+    // which permits exactly the binding's purpose and no other.
+    let bound = AppBinding::OperationDigest(OperationDigest::new([0; OPERATION_DIGEST_LEN]));
     assert!(matches!(
         AppBinding::Unbound.key_purpose(),
         KeyPurpose::Service
     ));
-    assert!(matches!(
-        AppBinding::OperationDigest(OperationDigest::new([0; OPERATION_DIGEST_LEN])).key_purpose(),
-        KeyPurpose::AdminService
-    ));
-    assert!(purpose_permitted(
+    assert!(matches!(bound.key_purpose(), KeyPurpose::AdminService));
+    assert!(AppBinding::Unbound.operation() as u8 == Operation::OpenAndVerifyServiceTicket as u8);
+    assert!(bound.operation() as u8 == Operation::VerifyOperationTicket as u8);
+    let bindings = [AppBinding::Unbound, bound];
+    let mut b = 0;
+    while b < bindings.len() {
+        let op = bindings[b].operation();
+        let mut q = 0;
+        while q < purposes.len() {
+            let own = purposes[q] as u8 == bindings[b].key_purpose() as u8;
+            assert!(purpose_permitted(op, HandleSlot::Primary, purposes[q]) == own);
+            q += 1;
+        }
+        b += 1;
+    }
+    assert!(!purpose_permitted(
         Operation::OpenAndVerifyServiceTicket,
         HandleSlot::Primary,
         KeyPurpose::AdminService
+    ));
+    assert!(!purpose_permitted(
+        Operation::VerifyOperationTicket,
+        HandleSlot::Primary,
+        KeyPurpose::Service
     ));
     // The KDC seals the admin service's tickets under its own key set.
     assert!(purpose_permitted(

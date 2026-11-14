@@ -1,10 +1,11 @@
 //! The PDP `Subject` of an administrator, built from a service ticket keyd
 //! verified.
 //!
-//! The verified context is an **input** here: dird's admin service (task
-//! A8) has keyd run `open_and_verify_service_ticket` on the AP-REQ admind
-//! forwarded opaquely, and passes the ticket's facts (crealm, cname,
-//! authtime). This crate never accepts a SID, a name, groups or a tier that
+//! The verified ticket is an **input** here: dird's admin service (task
+//! A8) has keyd run `verify_operation_ticket` on the AP-REQ admind
+//! forwarded opaquely (bound to the request's operation digest; keyd keeps
+//! no context for it — docs/questions/Q-523), and passes the ticket's facts
+//! (crealm, cname, authtime, the verified digest). This crate never accepts a SID, a name, groups or a tier that
 //! the caller claims (A-73; docs/06 §2 and docs/11 §10 P3 as cited in
 //! docs/51 §5.3): the cname is resolved through the directory exactly as the
 //! KDC resolves an AS client (`AccountSource::client`, docs/47 §1.3), and
@@ -21,7 +22,7 @@ use std::collections::BTreeMap;
 
 use dtyp::{Guid, Sid};
 use kdc::AccountSource;
-use keyd_types::{OperationDigest, ServiceContext};
+use keyd_types::{OperationDigest, OperationTicket};
 use krb_proto::{KerberosTime, PrincipalName, Realm};
 use pdp::{AuthContext, AuthStrength, Subject};
 
@@ -29,7 +30,7 @@ use crate::time;
 
 /// The facts of a service ticket keyd verified (RFC 4120 §3.2.3 under the
 /// admin service's key), as the caller received them from keyd.
-/// Spec: docs/51 §5.3, §7.4 step 1; crate keyd-types `ServiceContext`.
+/// Spec: docs/51 §5.3, §7.4 step 1; crate keyd-types `OperationTicket`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedTicket {
     /// The client realm of the ticket.
@@ -43,21 +44,23 @@ pub struct VerifiedTicket {
     /// holder bound it to; `None` if keyd reported no binding. Copied from
     /// keyd's answer, never computed here.
     /// Spec: docs/52 §5 items 3-4 (R2); crate keyd-types
-    /// `ServiceContext::bound_operation`.
+    /// `OperationTicket::operation`.
     pub bound_operation: Option<OperationDigest>,
 }
 
 impl VerifiedTicket {
-    /// The facts of keyd's verification result (no key, no context id).
-    /// Spec: crate keyd-types `ServiceContext` (docs/49 §3.3); docs/52 §5
-    /// item 4 (the verified binding).
+    /// The facts of keyd's operation-bound verification (no key, no context
+    /// id — keyd keeps none, Q-523): the digest keyd verified the `cksum`
+    /// over is always present in that answer.
+    /// Spec: crate keyd-types `OperationTicket`; docs/52 §5 item 4 (the
+    /// verified binding); docs/questions/Q-523.
     #[must_use]
-    pub fn from_service_context(context: &ServiceContext) -> VerifiedTicket {
+    pub fn from_operation_ticket(ticket: &OperationTicket) -> VerifiedTicket {
         VerifiedTicket {
-            crealm: context.crealm.clone(),
-            cname: context.cname.clone(),
-            authtime: context.authtime,
-            bound_operation: context.bound_operation,
+            crealm: ticket.crealm.clone(),
+            cname: ticket.cname.clone(),
+            authtime: ticket.authtime,
+            bound_operation: Some(ticket.operation),
         }
     }
 

@@ -83,7 +83,12 @@ fn keyds_hardening_plan_is_the_baseline_plus_keyds_row() {
 #[test]
 fn daemon_parameters_come_from_the_file() {
     let settings = settings(KEYD);
-    let params = DaemonParams::from_settings(&settings).unwrap();
+    // docs/52 C18 (task R15): the product parameters carry only the file's
+    // values; the seams the product `serve` adds are read back through the
+    // test seam's conversion (the one `serve` uses).
+    let params = keyd_daemon::test_seams::DaemonParams::from(
+        DaemonParams::from_settings(&settings).unwrap(),
+    );
     assert_eq!(params.keyd_socket, Path::new("/run/keyd/keyd.sock"));
     assert_eq!(params.audit.socket, Path::new("/run/auditd/audit.sock"));
     assert_eq!(params.audit.uid, 805);

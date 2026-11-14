@@ -141,3 +141,11 @@ pub use daemon::{
 };
 pub use engine::{EnginePanicked, EngineThread, StartError};
 pub use tcp::TcpLimits;
+
+/// The test seams (docs/52 C18, task R15): the full parameters and the
+/// generic `serve`. Compiled only with the feature `test-seams`, which only
+/// dev-dependencies enable; no product source names this module
+/// (crates/e2e-tests `tests/no_test_seams_in_product.rs`).
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod test_seams;

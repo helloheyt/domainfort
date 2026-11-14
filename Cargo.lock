@@ -15,6 +15,7 @@ name = "admin-daemon"
 version = "0.0.0"
 dependencies = [
  "ad-schema",
+ "admin-daemon",
  "admin-password-policy",
  "audit-daemon",
  "audit-log",
@@ -250,6 +251,7 @@ dependencies = [
  "config",
  "daemon-sandbox",
  "directory-admin",
+ "directory-daemon",
  "directory-pip",
  "dirstore",
  "dtyp",
@@ -298,6 +300,7 @@ dependencies = [
 name = "dirstore"
 version = "0.0.0"
 dependencies = [
+ "dirstore",
  "dtyp",
  "hmac",
  "redb",
@@ -607,6 +610,7 @@ dependencies = [
  "ipc-directory",
  "ipc-keyd",
  "kdc",
+ "kdc-daemon",
  "keyd",
  "keyd-daemon",
  "keyd-types",
@@ -680,6 +684,7 @@ dependencies = [
  "ipc-keyd-server",
  "kdc",
  "keyd",
+ "keyd-daemon",
  "keyd-types",
  "krb-crypto",
  "krb-proto",
@@ -757,6 +762,7 @@ dependencies = [
  "keyd-types",
  "krb-proto",
  "ldap",
+ "ldap-front",
  "parse-asn1",
  "parse-ldap",
  "parse-x509",

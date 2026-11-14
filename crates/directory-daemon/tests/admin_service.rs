@@ -59,10 +59,12 @@ use ad_schema::{phase1, Phase1Schema};
 use core::time::Duration;
 use directory_admin::{wall_clock, CHANGE_SEQ_COUNTER, RID_COUNTER, RID_END_EXCLUSIVE, RID_FIRST};
 use directory_daemon::policy::{DevelopmentPolicy, MandatoryFast};
+// The full parameters, the generic serve and any keyd verifier are dird's
+// test seams (docs/52 C18, task R15; feature `test-seams`).
+use directory_daemon::test_seams::{serve_with_admin, AdminParams, DaemonParams, VerifierFactory};
 use directory_daemon::{
-    admin_refused_peer_count, destroy_decision_id, serve_with_admin, AdminParams, Clock,
-    DaemonControl, DaemonParams, DecisionAckDeadline, DecisionAckDeadlineOutOfRange,
-    KeydTicketVerifier, SharedClock, StoreSource, TicketVerifier, VerifierFactory,
+    admin_refused_peer_count, destroy_decision_id, Clock, DaemonControl, DecisionAckDeadline,
+    DecisionAckDeadlineOutOfRange, KeydTicketVerifier, SharedClock, TicketVerifier,
     DECISION_ACK_DEADLINE, MAX_DECISION_ACK_DEADLINE,
 };
 use dirstore::{AttrId, IntegrityKey, NewObject, NodeId, Origin, Store, WriteTxn};
@@ -81,7 +83,8 @@ use ipc_dird_admin::{
     PasswordSetOutcome, RefusalStatus, Reply, Request, Unserved, MAX_REQUEST_BODY,
 };
 use keyd::{DecisionId, InMemoryKeyStore, KeyHandle, KeyPurpose, Keyd, Kvno, Role};
-use keyd_daemon::{CallerMap, ExtraListener, RecordBuffer};
+use keyd_daemon::test_seams::ExtraListener;
+use keyd_daemon::{CallerMap, RecordBuffer};
 use krb_crypto::ProtocolKey;
 use krb_proto::constants::{DOMAIN_X500_COMPRESS, KRB_NT_PRINCIPAL};
 use krb_proto::{
@@ -893,7 +896,7 @@ impl DirdRun {
                 let result = runtime.block_on(serve_with_admin(
                     params,
                     Some(admin),
-                    StoreSource::Opened(store),
+                    directory_daemon::test_seams::opened(store),
                     policy,
                     control,
                 ));
@@ -1059,7 +1062,7 @@ impl TicketVerifier for RefusingDecisions {
         service: &keyd::PrincipalId,
         operation: &keyd::OperationDigest,
         ap_req: &[u8],
-    ) -> Result<keyd::ServiceContext, keyd::AuthnError> {
+    ) -> Result<keyd::OperationTicket, keyd::AuthnError> {
         self.0.verify(service, operation, ap_req)
     }
 
@@ -1083,7 +1086,7 @@ impl TicketVerifier for RefusingDecisions {
 /// (Admin, `kk.sock`) and admind's (Directory, `kd.sock`) roles on the same
 /// engine, so the decisions dird registers can be executed (the single-uid
 /// test seam of docs/questions/Q-453 item 3).
-fn keyd_params(dir: &support::TempDir, uid: u32) -> keyd_daemon::DaemonParams {
+fn keyd_params(dir: &support::TempDir, uid: u32) -> keyd_daemon::test_seams::DaemonParams {
     let mut params = support::keyd::params(dir, CallerMap::new(&[(uid, Role::Ldap)]).unwrap(), uid);
     params.audit.socket = dir.join("ka.sock");
     params.extra_listeners = vec![

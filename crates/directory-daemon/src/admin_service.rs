@@ -69,7 +69,7 @@
 //!   unreachable (no object ⇒ no handle, docs/51 §9 — fail closed);
 //! * again, for every tombstoned user or computer whose destruction is not
 //!   known complete — at the admin service's start and every
-//!   [`AdminParams::destroy_reconcile_interval`] — so that a destroy decision
+//!   [`DESTROY_RECONCILE_INTERVAL`] — so that a destroy decision
 //!   lost by a keyd restart or a failed registration is registered again
 //!   (A-105; crate::reconcile).
 //!
@@ -122,9 +122,8 @@ use ipc_dird_admin::{
 };
 use kdc::AccountSource;
 use keyd_types::{
-    AccountKind as GrantKind, AppBinding, AuthnError, DecidedOperation, DecisionId,
-    DestructionPage, KeyHandle, OperationDigest, PrincipalId, ServiceContext, ServiceKeyHandle,
-    SetSecretTarget,
+    AccountKind as GrantKind, AuthnError, DecidedOperation, DecisionId, DestructionPage, KeyHandle,
+    OperationDigest, OperationTicket, PrincipalId, ServiceKeyHandle, SetSecretTarget,
 };
 use krb_proto::Realm;
 use pdp::Dn;
@@ -200,7 +199,7 @@ const _: () = assert!(
 
 /// The decision-acknowledgement wait of one dird: more than zero and at
 /// most [`MAX_DECISION_ACK_DEADLINE`]. The range is checked when the value
-/// is built ([`DecisionAckDeadline::new`]), so an [`AdminParams`] can only
+/// is built ([`DecisionAckDeadline::new`]), so an `AdminServeParams` can only
 /// carry a wait within the ceiling. There is no configuration key for it:
 /// the parameters from dird's file always hold
 /// [`DecisionAckDeadline::PRODUCTION`].
@@ -301,9 +300,9 @@ impl RegistrationFailure {
 }
 
 /// dird's keyd client (Role::Ldap): one AP-REQ's verification — keyd's
-/// `open_and_verify_service_ticket` for the admin service's key set, bound
-/// to an operation digest — and the registration of dird's decisions (task
-/// A15a; A-102).
+/// `verify_operation_ticket` for the admin service's key set, bound to an
+/// operation digest, which leaves no service context in keyd (Q-523) — and
+/// the registration of dird's decisions (task A15a; A-102).
 /// Spec: docs/10 §5ב; docs/51 §5.8 option (b), §7.4 step 1; A-73; docs/52
 /// §4.2, §4.3, §5 items 3-4.
 pub trait TicketVerifier: Send {
@@ -314,13 +313,14 @@ pub trait TicketVerifier: Send {
     /// an admin ticket is verified against an operation or not at all. keyd
     /// not reachable, not the configured keyd, or in its start-up hold-down
     /// ⇒ `AuthnError::Unavailable` (A-56); every other error is keyd's own
-    /// answer.
+    /// answer. The answer carries no context id: dird has no use for one,
+    /// and keyd keeps none (docs/questions/Q-523).
     fn verify(
         &mut self,
         service: &PrincipalId,
         operation: &OperationDigest,
         ap_req: &[u8],
-    ) -> Result<ServiceContext, AuthnError>;
+    ) -> Result<OperationTicket, AuthnError>;
 
     /// Register in keyd dird's `decision` (keyd's `register_decision`,
     /// Role::Ldap): its id, operation, approvers and lifetime. A
@@ -395,20 +395,17 @@ where
 {
     /// Spec: docs/10 §5ב, §7א; docs/50 §3.7, §7.5 step 4; docs/52 §5 item 3;
     /// A-56; A-87 (docs/questions/Q-311); docs/questions/Q-466 (the role and
-    /// realm expected of every new connection).
+    /// realm expected of every new connection), Q-523 (no service context).
     fn verify(
         &mut self,
         service: &PrincipalId,
         operation: &OperationDigest,
         ap_req: &[u8],
-    ) -> Result<ServiceContext, AuthnError> {
+    ) -> Result<OperationTicket, AuthnError> {
         // The client verifies keyd's uid, role and realm on every new
         // connection before this is sent (task R9).
-        self.client.open_and_verify_service_ticket(
-            service,
-            &AppBinding::OperationDigest(*operation),
-            ap_req,
-        )
+        self.client
+            .verify_operation_ticket(service, operation, ap_req)
     }
 
     /// Through `call_with_fate` (A-90): a decision loosens keyd, so whether
@@ -450,14 +447,56 @@ where
 }
 
 /// Builds the admin thread's verifier when the admin service starts; `None`
-/// ⇒ the admin service does not start.
+/// ⇒ the admin service does not start. A product dird builds only the
+/// production one ([`AdminServeParams::production`]); any other is a test
+/// seam (docs/52 C18, task R15).
 pub type VerifierFactory = Arc<dyn Fn() -> Option<Box<dyn TicketVerifier>> + Send + Sync>;
 
-/// What dird's admin service needs (from dird's configuration and the
-/// provisioning manifest).
+/// keyd's socket and uid, as dird's configuration names them (`keyd_socket`,
+/// `keyd_uid`; docs/51 §4.6).
+/// Spec: docs/51 §4.6; docs/50 §3.2; A-73.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeydEndpoint {
+    /// `keyd_socket`.
+    pub socket: PathBuf,
+    /// `keyd_uid`: the only keyd dird accepts (task R9).
+    pub uid: u32,
+}
+
+/// What dird's configuration and the provisioning manifest set for the admin
+/// service — **and nothing else** (docs/52 C18, task R15): the product
+/// parameters. Its keyd client, its connection and queue bounds, the
+/// decision-acknowledgement wait, the key-request lifetime and the
+/// re-registration interval are the daemon's production values, supplied by
+/// `serve_with_admin` ([`AdminServeParams::production`]); they are not fields
+/// here.
+/// Spec: docs/51 §4.6, §5.5, §5.6, §7.1, §7.5; A-73; P-22; docs/52 §3.18.
+#[derive(Debug, Clone)]
+pub struct AdminParams {
+    /// `dird_admin_socket`.
+    pub socket: PathBuf,
+    /// `admind_uid`: the only peer admitted (docs/51 §7.1).
+    pub admind_uid: u32,
+    /// keyd (`keyd_socket` + `keyd_uid`); `None` ⇒ the admin service does
+    /// not start, the rest of dird runs (docs/51 §4.6).
+    pub keyd: Option<KeydEndpoint>,
+    /// `admin_ticket_age_max` (R51-10).
+    pub ticket_age_max: Duration,
+    /// `admin_quorum` (P-22).
+    pub quorum: usize,
+    /// `node_id` (docs/51 §4.6).
+    pub node_id: NodeId,
+    /// The provisioning manifest (docs/51 §4.3 step 8).
+    pub manifest: Manifest,
+}
+
+/// Everything the admin service runs with: the product [`AdminParams`] plus
+/// the test seams. Built for a product dird only by
+/// [`AdminServeParams::production`]; outside this crate only through
+/// `test_seams::AdminParams` (docs/52 C18, task R15).
 /// Spec: docs/51 §4.6, §5.5, §5.6, §7.1, §7.5; A-73; P-22.
 #[derive(Clone)]
-pub struct AdminParams {
+pub(crate) struct AdminServeParams {
     /// `dird_admin_socket`.
     pub socket: PathBuf,
     /// `admind_uid`: the only peer admitted (docs/51 §7.1).
@@ -509,9 +548,56 @@ pub const MIN_DESTROY_RECONCILE_INTERVAL: Duration = Duration::from_millis(100);
 /// (docs/questions/Q-501).
 pub const MAX_DESTROY_RECONCILE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
-impl fmt::Debug for AdminParams {
+impl AdminServeParams {
+    /// The product admin parameters with the production keyd client — a
+    /// fresh `KeydTicketVerifier` over `ipc_keyd::UnixConnector` to the
+    /// configured keyd, expecting its uid, Role::Ldap and dird's `realm`
+    /// (task R9; A-73), with the keyd channel's 2 s deadline — and the
+    /// daemon's constants: [`MAX_ADMIN_CONNECTIONS`],
+    /// [`ADMIN_QUEUE_CAPACITY`], [`DecisionAckDeadline::PRODUCTION`],
+    /// `directory_admin::KEY_REQUEST_LIFETIME` and
+    /// [`DESTROY_RECONCILE_INTERVAL`] (docs/52 C18, task R15).
+    /// Spec: docs/51 §4.6, §5.5, §5.6, §7.1, §7.5; A-73; docs/questions/Q-385,
+    /// Q-466 (A-102), Q-501.
+    pub(crate) fn production(admin: AdminParams, realm: &Realm) -> AdminServeParams {
+        let realm = realm.clone();
+        let keyd: Option<VerifierFactory> = admin.keyd.map(|endpoint| {
+            let factory: VerifierFactory = Arc::new(move || {
+                // Task R9: keyd's uid, the role Ldap and dird's realm,
+                // expected of every keyd connection.
+                let verifier: Box<dyn TicketVerifier> = Box::new(
+                    KeydTicketVerifier::new(
+                        ipc_keyd::UnixConnector::new(endpoint.socket.clone()),
+                        endpoint.uid,
+                        realm.clone(),
+                        ipc_keyd::DEFAULT_DEADLINE,
+                    )
+                    .ok()?,
+                );
+                Some(verifier)
+            });
+            factory
+        });
+        AdminServeParams {
+            socket: admin.socket,
+            admind_uid: admin.admind_uid,
+            keyd,
+            ticket_age_max: admin.ticket_age_max,
+            quorum: admin.quorum,
+            node_id: admin.node_id,
+            manifest: admin.manifest,
+            max_connections: MAX_ADMIN_CONNECTIONS,
+            queue_capacity: ADMIN_QUEUE_CAPACITY,
+            ack_deadline: DecisionAckDeadline::PRODUCTION,
+            key_request_lifetime: directory_admin::KEY_REQUEST_LIFETIME,
+            destroy_reconcile_interval: DESTROY_RECONCILE_INTERVAL,
+        }
+    }
+}
+
+impl fmt::Debug for AdminServeParams {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AdminParams")
+        f.debug_struct("AdminServeParams")
             .field("socket", &self.socket)
             .field("admind_uid", &self.admind_uid)
             .field("keyd", &self.keyd.is_some())

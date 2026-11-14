@@ -127,9 +127,9 @@ use core::time::Duration;
 use ipc::{decode_reply, encode_frame, Direction, FrameLimit, Refused, Reply};
 use keyd_types::authz::{requires_acknowledged_intent, role_permits};
 use keyd_types::{
-    AccountKind, AppBinding, ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof,
-    ConfigDescription, CtxId, DecidedOperation, DecisionId, DestructionPage, FastArmor,
-    FastConversation, IssueError, KeyCustody, KeyHandle, Kvno, Operation, PrincipalBinding,
+    AccountKind, ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof, ConfigDescription,
+    CtxId, DecidedOperation, DecisionId, DestructionPage, FastArmor, FastConversation, IssueError,
+    KeyCustody, KeyHandle, Kvno, Operation, OperationDigest, OperationTicket, PrincipalBinding,
     PrincipalId, Role, ServiceContext, SetSecretTarget, TgsFastRequest, TgsRepParts,
     TgsTicketTemplate, TgtContext,
 };
@@ -586,6 +586,7 @@ const _: () = {
         Operation::IssueTgsRep,
         Operation::SealFastError,
         Operation::OpenAndVerifyServiceTicket,
+        Operation::VerifyOperationTicket,
         Operation::DescribeConfig,
         Operation::Ping,
         Operation::SealCeremony,
@@ -957,25 +958,50 @@ impl<C: Connector> KeydClient<C> {
         )
     }
 
-    /// docs/10 §5ב `open_and_verify_service_ticket` (Role::Ldap): the
-    /// service key set's principal and the binding, whose purpose the key
-    /// set is (R2).
-    /// Spec: docs/50 §3.4; docs/52 §5 item 3.
+    /// docs/10 §5ב `open_and_verify_service_ticket` (Role::Ldap): an
+    /// **unbound** service AP-REQ under the `Service` key set of `service`
+    /// (the binding's purpose, R2); keyd keeps the session key under the
+    /// answer's one-time context id.
+    /// Spec: docs/50 §3.4; docs/52 §5 item 3; docs/questions/Q-523.
     pub fn open_and_verify_service_ticket(
         &mut self,
         service: &PrincipalId,
-        binding: &AppBinding,
         ap_req_octets: &[u8],
     ) -> Result<ServiceContext, AuthnError> {
         let call = Call::OpenAndVerifyServiceTicket {
             service: *service,
-            binding: *binding,
             ap_req_octets: ap_req_octets.to_vec(),
         };
         self.issuance(
             call,
             |answer| match answer {
                 Answer::OpenAndVerifyServiceTicket(result) => Some(result),
+                _ => None,
+            },
+            AuthnError::Unavailable,
+        )
+    }
+
+    /// docs/10 §5ב `verify_operation_ticket` (Role::Ldap): a service AP-REQ
+    /// **bound to `operation`** under the `AdminService` key set of
+    /// `service` (the binding's purpose, R2). The answer has no context id:
+    /// keyd keeps nothing for it (Q-523).
+    /// Spec: docs/50 §3.4; docs/52 §5 items 3-4; docs/questions/Q-523.
+    pub fn verify_operation_ticket(
+        &mut self,
+        service: &PrincipalId,
+        operation: &OperationDigest,
+        ap_req_octets: &[u8],
+    ) -> Result<OperationTicket, AuthnError> {
+        let call = Call::VerifyOperationTicket {
+            service: *service,
+            operation: *operation,
+            ap_req_octets: ap_req_octets.to_vec(),
+        };
+        self.issuance(
+            call,
+            |answer| match answer {
+                Answer::VerifyOperationTicket(result) => Some(result),
                 _ => None,
             },
             AuthnError::Unavailable,

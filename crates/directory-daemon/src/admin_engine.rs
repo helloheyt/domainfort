@@ -86,7 +86,7 @@
 //! # Re-registering lost destroy decisions (A-105)
 //!
 //! Between jobs — at the thread's start and every
-//! `AdminParams::destroy_reconcile_interval` — the thread registers again
+//! `destroy_reconcile_interval` (`DESTROY_RECONCILE_INTERVAL` in production) — the thread registers again
 //! the destroy decision of every tombstoned user or computer that keyd does
 //! not hold as pending; keyd refuses it once the account has no key set
 //! left, which settles it (crate::reconcile; docs/questions/Q-470 item 4,
@@ -362,7 +362,7 @@ impl Running {
         self.worker
             .verifier
             .verify(&service, digest, ap_req)
-            .map(|context| VerifiedTicket::from_service_context(&context))
+            .map(|ticket| VerifiedTicket::from_operation_ticket(&ticket))
             .map_err(|e| match e {
                 AuthnError::Unavailable => VerificationFailure::KeydUnavailable,
                 _ => VerificationFailure::Requester,
@@ -389,7 +389,7 @@ impl Running {
             })?;
         let mut approvals = Vec::with_capacity(auth.approvals.len());
         for approval in &auth.approvals {
-            let context = self
+            let ticket = self
                 .worker
                 .verifier
                 .verify(&service, digest, approval)
@@ -397,9 +397,9 @@ impl Running {
                     AuthnError::Unavailable => VerificationFailure::KeydUnavailable,
                     _ => VerificationFailure::Approver,
                 })?;
-            approvals.push(VerifiedTicket::from_service_context(&context));
+            approvals.push(VerifiedTicket::from_operation_ticket(&ticket));
         }
-        Ok((VerifiedTicket::from_service_context(&requester), approvals))
+        Ok((VerifiedTicket::from_operation_ticket(&requester), approvals))
     }
 
     /// The obligations of the requester's Allow: `RateLimit` through the

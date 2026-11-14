@@ -40,7 +40,7 @@ use core::fmt;
 
 /// Error of an authentication step (`verify_preauth`,
 /// `open_and_verify_tgt`, `open_fast_armor`,
-/// `open_and_verify_service_ticket`).
+/// `open_and_verify_service_ticket`, `verify_operation_ticket`).
 ///
 /// `Denied` is returned for every failure decided before the step's
 /// cryptographic chain completed. The other variants are returned only after
@@ -53,9 +53,11 @@ use core::fmt;
 /// subkey present, the armor key derived, the req-checksum verified and the
 /// enc-fast-req decrypted and decoded (docs/48 §6.3); for `verify_preauth`
 /// (only `Skew`): the PA-ENC-TIMESTAMP decrypted with the client key and
-/// decoded; for `open_and_verify_service_ticket`: the service ticket
-/// decrypted under the service key and the authenticator under the ticket
-/// session key (docs/49 §3.3; A-46). A `verify_preauth` refused by its
+/// decoded; for `open_and_verify_service_ticket` and
+/// `verify_operation_ticket`: the service ticket decrypted under the service
+/// key and the authenticator under the ticket session key (docs/49 §3.3;
+/// A-46), and — operation-bound — the operation digest's MIC verified
+/// (docs/52 §5; Q-523). A `verify_preauth` refused by its
 /// failure throttle is `Denied` (decided before the chain; A-34).
 ///
 /// Spec: docs/10 §9 as amended by A-26 (docs/questions/Q-071); RFC 4120

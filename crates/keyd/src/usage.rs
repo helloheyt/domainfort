@@ -43,7 +43,8 @@ pub(crate) const TGS_REP_ENC_PART_SUBKEY: u32 = 9;
 /// session key: "a checksum of the application data that accompanies the
 /// KRB_AP_REQ, computed using a key usage value of 10 in normal application
 /// exchanges". keyd verifies it for an `AppBinding::OperationDigest`
-/// verification (the admin channel, R2), over the operation digest.
+/// verification (`verify_operation_ticket`, the admin channel, R2; Q-523),
+/// over the operation digest.
 /// Spec: RFC 4120 7.5.1 item 10, 5.5.1; docs/52 §5 item 2.
 pub(crate) const AP_REQ_AUTHENTICATOR_CKSUM: u32 = 10;
 
@@ -52,8 +53,9 @@ pub(crate) const AP_REQ_AUTHENTICATOR_CKSUM: u32 = 10;
 /// used as the PA-TGS-REQ PA-DATA field". keyd uses it for the authenticator
 /// of the FX_FAST_ARMOR_AP_REQUEST armor AP-REQ, which is not a PA-TGS-REQ
 /// (docs/questions/Q-120 item 1, decided A-32), and for the authenticator of
-/// a service AP-REQ verified by `open_and_verify_service_ticket` — a normal
-/// application exchange (docs/49 §3.3, A-46). Spec: RFC 4120 7.5.1, 5.5.1;
+/// a service AP-REQ verified by `open_and_verify_service_ticket` or
+/// `verify_operation_ticket` — a normal application exchange (docs/49 §3.3,
+/// A-46; Q-523). Spec: RFC 4120 7.5.1, 5.5.1;
 /// RFC 6113 5.4.1.1.
 pub(crate) const AP_REQ_AUTHENTICATOR: u32 = 11;
 

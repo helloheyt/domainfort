@@ -41,16 +41,17 @@
 use crate::audit::{AuditGate, RecordBuffer};
 use crate::audit_client::{self, AuditEndpoint, AuditLinkError};
 use crate::callers::{CallerMap, CallerMapError};
-use crate::clock::Clock;
+use crate::clock::{Clock, SystemClock};
 use crate::engine::{Engine, EngineError, EnginePanicked, EngineThread, IntentAckBudget};
 use crate::listener::{accept_loop, ServeContext};
 use crate::log::{note, Note};
+use crate::startup::development_keyd;
 use config::KeydSettings;
 use core::fmt;
 use core::time::Duration;
 use ipc_audit::WindowConfig;
 use keyd::{ConfigError, EntropySource, KeyStore, Keyd};
-use krb_proto::KerberosTime;
+use krb_proto::{KerberosTime, Realm};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -87,10 +88,12 @@ const DRAIN_POLL: Duration = Duration::from_millis(10);
 /// and grant table — with its own `uid → Role` map (and its own connection
 /// quota).
 ///
-/// **Never built from keyd's configuration file**: `DaemonParams::from_settings`
-/// leaves [`DaemonParams::extra_listeners`] empty, and no configuration key
-/// sets it — a deployment serves `keyd_socket` alone (docs/50 §3.1, R50-3:
-/// one role per uid). It exists for the single-uid tier-2 harnesses (A-82),
+/// **A test seam (docs/52 C18, task R15): not part of the product API.** The
+/// product [`DaemonParams`] has no field for it and the product [`serve`]
+/// serves `keyd_socket` alone (docs/50 §3.1, R50-3: one role per uid); only
+/// [`ServeParams::extra_listeners`] carries it, and that type is reachable
+/// outside this crate only as `test_seams::DaemonParams` (feature
+/// `test-seams`, which only dev-dependencies enable). It exists for the single-uid tier-2 harnesses (A-82),
 /// which since task A15a need one keyd to serve the one test uid in two
 /// roles at once — dird's grant (Role::Ldap) must be in the grant table that
 /// admind's `set_secret` (Role::Directory) is checked against
@@ -107,11 +110,36 @@ pub struct ExtraListener {
     pub callers: CallerMap,
 }
 
-/// What [`serve`] needs besides the clock and keyd.
+/// What keyd's configuration file sets for the daemon — **and nothing
+/// else** (docs/52 C18, task R15): the product parameters. Every value no
+/// configuration key sets (the engine queue, the audit window, the
+/// intent-acknowledgement budget, extra listeners) is the daemon's own
+/// production constant, supplied by [`serve`]; it is not a field here, so no
+/// code that builds the product parameters can change it.
 ///
-/// Spec: docs/50 §2.4, §3.1, §3.2, §3.6, §7.1, §8.1.
+/// Spec: docs/50 §2.4, §3.1, §3.2, §3.6, §7.1, §8.1; docs/52 §3.18.
 #[derive(Debug, Clone)]
 pub struct DaemonParams {
+    /// `keyd_socket`.
+    pub keyd_socket: PathBuf,
+    /// The `uid → Role` map (R50-3).
+    pub callers: CallerMap,
+    /// auditd's socket and uid.
+    pub audit: AuditEndpoint,
+    /// How long a started frame may take (docs/50 §3.6).
+    pub frame_timeout: Duration,
+    /// Open connections per mapped uid (docs/50 §3.6).
+    pub max_connections_per_uid: u32,
+}
+
+/// Everything [`serve_with`] needs besides the clock and keyd: the product
+/// [`DaemonParams`] plus the test seams. Built for a product daemon only by
+/// `From<DaemonParams>` (the production constants); reachable outside this
+/// crate only as `test_seams::DaemonParams` (docs/52 C18, task R15).
+///
+/// Spec: docs/50 §2.4, §3.1, §3.2, §3.6, §7.1, §8.1; docs/52 §3.18.
+#[derive(Debug, Clone)]
+pub struct ServeParams {
     /// `keyd_socket`.
     pub keyd_socket: PathBuf,
     /// The `uid → Role` map (R50-3).
@@ -138,10 +166,11 @@ pub struct DaemonParams {
 }
 
 impl DaemonParams {
-    /// The parameters of keyd's configuration file, with the daemon's
-    /// constants for what the file does not set (Q-230 item 4) — among them
-    /// the production intent-acknowledgement budget, which no key of the
-    /// file sets (docs/questions/Q-415).
+    /// The parameters of keyd's configuration file — the one product
+    /// constructor (docs/52 C18, task R15). The daemon's constants for what
+    /// the file does not set (Q-230 item 4) — among them the production
+    /// intent-acknowledgement budget, which no key of the file sets
+    /// (docs/questions/Q-415) — are added by [`serve`].
     ///
     /// # Errors
     /// [`CallerMapError`] (not reachable for a parsed file).
@@ -158,11 +187,29 @@ impl DaemonParams {
             },
             frame_timeout: settings.frame_timeout(),
             max_connections_per_uid: settings.max_connections_per_uid(),
+        })
+    }
+}
+
+impl From<DaemonParams> for ServeParams {
+    /// The product parameters with the daemon's production constants: the
+    /// engine queue ([`ENGINE_QUEUE_CAPACITY`]), the audit window
+    /// (`WindowConfig::DEFAULT`), the intent budget
+    /// ([`IntentAckBudget::PRODUCTION`]) and no extra listener — the only
+    /// values a product daemon runs with (docs/52 C18, task R15).
+    /// Spec: docs/50 §3.6, §8.1; docs/questions/Q-230 item 4, Q-415, Q-453.
+    fn from(params: DaemonParams) -> ServeParams {
+        ServeParams {
+            keyd_socket: params.keyd_socket,
+            callers: params.callers,
+            audit: params.audit,
+            frame_timeout: params.frame_timeout,
+            max_connections_per_uid: params.max_connections_per_uid,
             queue_capacity: ENGINE_QUEUE_CAPACITY,
             window: WindowConfig::DEFAULT,
             intent_ack_budget: IntentAckBudget::PRODUCTION,
             extra_listeners: Vec::new(),
-        })
+        }
     }
 }
 
@@ -295,9 +342,12 @@ async fn wait_until(grace: Duration, done: impl Fn() -> bool) {
     }
 }
 
-/// Run the keyd daemon until [`DaemonControl::stop`] (module
-/// documentation). `build_keyd` receives the hold-down start read from
-/// `clock` and returns keyd (the development store in the daemon).
+/// Run the product keyd daemon until [`DaemonControl::stop`] (module
+/// documentation): the product parameters with the daemon's production
+/// constants, keyd's own system clock (R50-5), and keyd built on the
+/// development store for `realm` (R50-18; P-17) at the hold-down start read
+/// from that clock. Nothing else can be supplied: the alternatives exist only
+/// in `test_seams` (docs/52 C18, task R15).
 ///
 /// Must run inside a tokio runtime with I/O and time enabled, built after
 /// the process hardening.
@@ -306,9 +356,33 @@ async fn wait_until(grace: Duration, done: impl Fn() -> bool) {
 /// [`DaemonError`] for a start-up failure (nothing is listening then).
 ///
 /// Spec: docs/50 R50-3, R50-5, R50-6, R50-7, R50-14, R50-16, R50-17, R50-18,
-/// §3.1, §7.5.
-pub async fn serve<S, E, C, F>(
+/// §3.1, §7.5; docs/52 §3.18.
+pub async fn serve(
     params: DaemonParams,
+    realm: Realm,
+    control: DaemonControl,
+) -> Result<Stopped, DaemonError> {
+    serve_with(
+        ServeParams::from(params),
+        SystemClock,
+        development_keyd(realm),
+        control,
+    )
+    .await
+}
+
+/// [`serve`] with every value given: the parameters with their seams, the
+/// clock, and the keyd builder (which receives the hold-down start read from
+/// `clock`). Reachable outside this crate only as `test_seams::serve`
+/// (docs/52 C18, task R15).
+///
+/// # Errors
+/// [`DaemonError`] for a start-up failure (nothing is listening then).
+///
+/// Spec: docs/50 R50-3, R50-5, R50-6, R50-7, R50-14, R50-16, R50-17, R50-18,
+/// §3.1, §7.5.
+pub async fn serve_with<S, E, C, F>(
+    params: ServeParams,
     clock: C,
     build_keyd: F,
     control: DaemonControl,

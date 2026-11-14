@@ -78,7 +78,20 @@ daemon-sandbox = { path = "../daemon-sandbox" }
 # decision P-12), already in the lock — no new package.
 protected-file = { path = "../protected-file" }
 
+[features]
+# docs/52 C18 (task R15): the test seams — the module `test_seams` (the full
+# parameters, the generic `serve`) — exist only in a build that asks for them.
+# Only `[dev-dependencies]` enable this feature (cargo's resolver 2 turns a
+# dev-dependency's features on only in builds of test targets), so no product
+# build of the daemon contains a seam; crates/e2e-tests
+# tests/no_test_seams_in_product.rs checks every Cargo.toml and every product
+# source. Never in `default`.
+test-seams = []
+
 [dev-dependencies]
+# TESTS ONLY (docs/52 C18, task R15): this crate's own tests use its test
+# seams (`test_seams`).
+keyd-daemon = { path = ".", features = ["test-seams"] }
 # TESTS ONLY: the kdc AS → TGS flow through this daemon reuses the kdc
 # integration fixtures (crates/kdc/tests/common) through a `#[path]` module,
 # as crates/ipc-keyd-server does — workspace crates or already in the lock.

@@ -39,8 +39,9 @@ pub struct ArmorId([u8; TOKEN_ID_LENGTH]);
 
 /// The service-context token returned by `open_and_verify_service_ticket`:
 /// it names the session key (and authenticator subkey) of one verified
-/// AP-REQ, which keyd holds for the later GSS steps (task L6b: `seal_ap_rep`;
-/// phase 2: wrap / unwrap). Not secret by itself (useless to any other
+/// unbound AP-REQ, which keyd holds for the later GSS steps (task L6b:
+/// `seal_ap_rep`; phase 2: wrap / unwrap). An operation-bound verification
+/// (`verify_operation_ticket`) has none (docs/questions/Q-523). Not secret by itself (useless to any other
 /// caller); the keys it names never leave keyd.
 /// Spec: docs/49 §3.3 (`ServiceContext { ctx_id, … }`); docs/questions/Q-165
 /// item 2 (decided A-46).

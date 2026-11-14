@@ -33,7 +33,8 @@ mod support;
 use core::net::{IpAddr, Ipv4Addr};
 use core::time::Duration;
 use directory_daemon::policy::DevelopmentPolicy;
-use directory_daemon::{ldap_refused_peer_count, Clock, DaemonParams, SharedClock, StoreSource};
+use directory_daemon::test_seams::DaemonParams;
+use directory_daemon::{ldap_refused_peer_count, Clock, SharedClock};
 use directory_pip::{DirectoryContext, TierMap};
 use ipc::{encode_frame, Direction, FrameReader, Refused, Reply};
 use ipc_audit::EventBody;
@@ -235,7 +236,7 @@ fn world(front_uid_offset: u32, tweak: impl FnOnce(&mut DaemonParams)) -> Option
     tweak(&mut params);
     let dird = Dird::start(
         params,
-        StoreSource::Opened(Arc::clone(&directory.store)),
+        directory_daemon::test_seams::opened(Arc::clone(&directory.store)),
         ldap_policy(1),
     )
     .unwrap();

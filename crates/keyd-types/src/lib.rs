@@ -9,7 +9,7 @@
 //! | ids and handles | [`PrincipalId`], [`Kvno`], [`KeyPurpose`], [`KeyHandle`], [`PrincipalBinding`] |
 //! | caller model | [`CallerId`], [`Role`], [`Operation`], [`authz::CAPABILITY_TABLE`], [`authz::role_permits`], [`authz::purpose_permitted`] (with the compile-time pins) |
 //! | errors | [`AuthnError`], [`IssueError`], [`Error`], [`ConfigError`] |
-//! | operation arguments and results | [`AuthnProof`], [`AsTicketTemplate`], [`AsRepParts`], [`TgsFastRequest`], [`TgtContext`], [`TgsTicketTemplate`], [`TgsRepParts`], [`FastArmor`], [`FastConversation`], [`ServiceContext`], [`AppBinding`], [`OperationDigest`], [`AccountKind`], [`SetSecretTarget`] |
+//! | operation arguments and results | [`AuthnProof`], [`AsTicketTemplate`], [`AsRepParts`], [`TgsFastRequest`], [`TgtContext`], [`TgsTicketTemplate`], [`TgsRepParts`], [`FastArmor`], [`FastConversation`], [`ServiceContext`], [`OperationTicket`], [`AppBinding`], [`OperationDigest`], [`AccountKind`], [`SetSecretTarget`] |
 //! | the set_secret grant (task A15a) | [`grant`]: [`MAX_GRANT_TARGETS`], [`MAX_SET_SECRET_GRANT_SECS`], [`MAX_INITIAL_SECRET_GRANT_SECS`], [`MAX_SET_SECRET_GRANTS`], [`grant::max_grant_lifetime_secs`] |
 //! | the decision table and the ceremony (A-102, docs/52 R1, R3) | [`decision`]: [`DecisionId`], [`DecidedOperation`], [`DecisionIntent`], [`PendingDestruction`], [`DestructionPage`], [`CeremonyState`], the bounds |
 //! | one-time token ids | [`ExchangeId`], [`CtxId`], [`ArmorId`], [`ServiceCtxId`] |
@@ -97,7 +97,9 @@ pub use model::{
     is_admin_service_name, KeyHandle, KeyPurpose, Kvno, PrincipalBinding, PrincipalId,
     ServiceKeyHandle, ADMIN_SERVICE_CLASS,
 };
-pub use service_ticket::{AppBinding, OperationDigest, ServiceContext, OPERATION_DIGEST_LEN};
+pub use service_ticket::{
+    AppBinding, OperationDigest, OperationTicket, ServiceContext, OPERATION_DIGEST_LEN,
+};
 pub use tgs_exchange::{TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext};
 pub use time::kerberos_time_seconds;
 pub use tokens::{ArmorId, CtxId, ExchangeId, ServiceCtxId, TOKEN_ID_LENGTH};

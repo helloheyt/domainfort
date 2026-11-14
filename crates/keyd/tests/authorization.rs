@@ -77,20 +77,6 @@ fn binding_for(handle: &KeyHandle) -> keyd::PrincipalBinding {
     }
 }
 
-/// The binding whose purpose is `handle`'s (R2: `open_and_verify_service_ticket`
-/// derives the purpose from the binding; a Krbtgt or PrincipalLongterm
-/// handle has none and is looked up as `Service`).
-fn app_binding_for(handle: &KeyHandle) -> keyd::AppBinding {
-    match handle.purpose {
-        KeyPurpose::AdminService => {
-            keyd::AppBinding::OperationDigest(keyd::OperationDigest::new([0x0D; 32]))
-        }
-        KeyPurpose::Krbtgt | KeyPurpose::PrincipalLongterm | KeyPurpose::Service => {
-            keyd::AppBinding::Unbound
-        }
-    }
-}
-
 /// A decision id no test registered: the four Admin operations that run a
 /// decision take only an id (A-102), and the role check precedes the
 /// decision's lookup.
@@ -187,13 +173,23 @@ fn invoke(f: &mut Fixture, op: Operation, caller: &CallerId, handle: &KeyHandle)
                 &n,
             )
             .is_ok(),
-        // R2: the principal and the binding; the purpose is the binding's.
+        // R2 / Q-523: the principal only; the purpose is the operation's
+        // binding's (Service unbound, AdminService operation-bound).
         Operation::OpenAndVerifyServiceTicket => f
             .keyd
             .open_and_verify_service_ticket(
                 caller,
                 &handle.principal,
-                &app_binding_for(handle),
+                &dummy_ap_req().encode().unwrap(),
+                &n,
+            )
+            .is_ok(),
+        Operation::VerifyOperationTicket => f
+            .keyd
+            .verify_operation_ticket(
+                caller,
+                &handle.principal,
+                &keyd::OperationDigest::new([0x0D; 32]),
                 &dummy_ap_req().encode().unwrap(),
                 &n,
             )
@@ -245,6 +241,7 @@ fn valid_handle(op: Operation) -> KeyHandle {
         Operation::OpenFastArmor | Operation::SealFastError => KRBTGT,
         Operation::IssueTgsRep | Operation::RotateKey | Operation::RetireKvno => SERVICE,
         Operation::DestroyKeySet | Operation::OpenAndVerifyServiceTicket => SERVICE,
+        Operation::VerifyOperationTicket => ADMIN_SERVICE,
         Operation::SetSecret | Operation::VerifySecret | Operation::GrantSetSecret => ALICE,
         Operation::RegisterDecision => SERVICE,
         // No handle (docs/50 §3.4; A-102); unused.
@@ -319,10 +316,12 @@ fn wrong_purpose_is_denied_for_every_operation() {
         // and `verify_secret` has no role (docs/52 R4). R2:
         // `open_and_verify_service_ticket` names a principal and a binding,
         // never a purpose — no purpose can mismatch (crate service_ticket.rs
-        // `krbtgt_and_principal_keys_are_never_opened`).
+        // `krbtgt_and_principal_keys_are_never_opened`); Q-523: nor can
+        // `verify_operation_ticket`.
         if matches!(
             op,
             Operation::OpenAndVerifyServiceTicket
+                | Operation::VerifyOperationTicket
                 | Operation::SealFastError
                 | Operation::DescribeConfig
                 | Operation::Ping
@@ -443,6 +442,7 @@ fn capability_table_matches_design() {
             Role::Ldap,
             &[
                 OpenAndVerifyServiceTicket,
+                VerifyOperationTicket,
                 RegisterDecision,
                 ListDestroyDecisions,
                 DescribeConfig,

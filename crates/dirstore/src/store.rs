@@ -89,7 +89,6 @@ use redb::{
     TableDefinition, WriteTransaction,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 
 /// Raw byte keys and values: the codec and the tag are ours, the KV engine
 /// only stores bytes. Spec: docs/32 §1 (D5: the KV is a replaceable engine).
@@ -173,7 +172,18 @@ impl Store {
     /// Spec: docs/32 §3 (D135); docs/10 D34 (format version); std
     /// `fs::OpenOptions` (`read`, `write`, `create`); redb 4.5.0 docs.rs
     /// `DatabaseError` (`From<std::io::Error>`).
-    pub fn open(path: impl AsRef<Path>, key: IntegrityKey, schema: Schema) -> Result<Store> {
+    ///
+    /// **A test seam since docs/52 R15 (A-113):** compiled only with the
+    /// feature `test-seams`, which only `[dev-dependencies]` enable, so a
+    /// product build has no path-taking constructor at all (crates/e2e-tests
+    /// `tests/no_test_seams_in_product.rs`); product code opens a store only
+    /// with [`Store::open_file`] on a descriptor crates/protected-file checked.
+    #[cfg(feature = "test-seams")]
+    pub fn open(
+        path: impl AsRef<std::path::Path>,
+        key: IntegrityKey,
+        schema: Schema,
+    ) -> Result<Store> {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)

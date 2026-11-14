@@ -74,7 +74,7 @@ daemon-sandbox = { path = "../daemon-sandbox" }
 # crates/keyd-daemon/tests/support, as keyd-daemon's kdc_flow reuses
 # crates/kdc/tests/common.
 keyd = { path = "../keyd" }
-keyd-daemon = { path = "../keyd-daemon" }
+keyd-daemon = { path = "../keyd-daemon", features = ["test-seams"] }
 ipc-audit = { path = "../ipc-audit", default-features = false, features = ["keyd"] }
 krb-proto = { path = "../krb-proto" }
 # Off Linux the ipc-keyd connector cannot read peer credentials (fail
@@ -91,10 +91,10 @@ zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
 # TEST build alone (the tests seal AP-REQs under a known admin-service key,
 # as A8 / A9 do); keyadm's own graph stays crypto-free (the guard in
 # crates/keyd-types/tests/no_crypto_dependency.rs checks normal edges).
-admin-daemon = { path = "../admin-daemon" }
+admin-daemon = { path = "../admin-daemon", features = ["test-seams"] }
 audit-daemon = { path = "../audit-daemon" }
 audit-log = { path = "../audit-log" }
-directory-daemon = { path = "../directory-daemon" }
+directory-daemon = { path = "../directory-daemon", features = ["test-seams"] }
 directory-admin = { path = "../directory-admin" }
 directory-pip = { path = "../directory-pip" }
 dirstore = { path = "../dirstore" }

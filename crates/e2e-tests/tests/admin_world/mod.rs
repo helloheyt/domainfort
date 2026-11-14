@@ -85,6 +85,11 @@ use crate::support::keyd_support::{self, TestClock};
 use crate::support::tls::{server_config, test_pki, TestPki};
 use crate::support::{auditd as auditd_support, front_timeouts, labelled_auditd_settings, Front};
 use crate::support::{eventually, skip_as_root, verified_log, LONG};
+// auditd runs with its product listener configuration (one listener per
+// sender since task R9b). The other daemons' full parameters are their test
+// seams (docs/52 C18, task R15; feature `test-seams`, enabled by the
+// dev-dependencies): the world injects the single test uid, the clock, the
+// bounded waits and the harness's links.
 use audit_daemon::listener::ListenerConfig;
 use config::{
     AdmindSettings, AuditdSettings, DirdSettings, KeyadmSettings, KeydSettings, LdapFrontSettings,
@@ -96,20 +101,22 @@ use directory_admin::{
     RandomError, RandomSource, Reply as PepReply, Request as PepRequest, SetEnabled,
     VerifiedTicket,
 };
+use directory_daemon::test_seams::{serve_with_admin, AdminParams, VerifierFactory};
 use directory_daemon::{
-    serve_with_admin, AdminParams, DaemonControl as DirdControl, KeydTicketVerifier, SharedClock,
-    StoreSource, TicketVerifier, VerifierFactory,
+    DaemonControl as DirdControl, KeydTicketVerifier, SharedClock, StoreSource, TicketVerifier,
 };
 use directory_pip::{AccountKind, DirectoryContext, NamingContext};
 use dtyp::Guid;
 use ipc_audit::{decode_event, EventBody, WindowConfig};
 use ipc_keyd::{Answer, Call, KeydClient};
 use keyd::{Keyd, KeydConfig, Role};
-use keyd_daemon::{CallerMap, ExtraListener, RecordBuffer};
+use keyd_daemon::test_seams::ExtraListener;
+use keyd_daemon::{CallerMap, RecordBuffer};
 use keyd_types::Kvno;
 use krb_proto::constants::KRB_NT_PRINCIPAL;
 use krb_proto::{AsRep, KerberosTime, PrincipalName, Realm};
-use ldap_front::{ConnectionLimits, Endpoint, FrontParams};
+use ldap_front::test_seams::FrontParams;
+use ldap_front::{ConnectionLimits, Endpoint};
 use provision::first_admin::entry::{EntryError, Terminal};
 use provision::first_admin::keyd::KeydAccess;
 use provision::first_admin::privilege::{DropError, PrivilegeDrop};
@@ -409,7 +416,7 @@ pub struct DirdRun {
 
 impl DirdRun {
     pub fn start(
-        params: directory_daemon::DaemonParams,
+        params: directory_daemon::test_seams::DaemonParams,
         admin: AdminParams,
         source: StoreSource,
         policy: directory_daemon::policy::DevelopmentPolicy,
@@ -482,7 +489,7 @@ pub struct AdmindRun {
 }
 
 impl AdmindRun {
-    pub fn start(params: admin_daemon::DaemonParams) -> Result<AdmindRun, String> {
+    pub fn start(params: admin_daemon::test_seams::DaemonParams) -> Result<AdmindRun, String> {
         let control = admin_daemon::DaemonControl::new();
         let thread = {
             let control = control.clone();
@@ -491,7 +498,7 @@ impl AdmindRun {
                     .enable_all()
                     .build()
                     .map_err(|e| e.to_string())?;
-                let result = runtime.block_on(admin_daemon::serve(params, control));
+                let result = runtime.block_on(admin_daemon::test_seams::serve(params, control));
                 drop(runtime);
                 match result {
                     Ok(stopped) => {
@@ -1033,10 +1040,16 @@ impl World {
     /// socket with the test uid mapped to `role`, plus `extra` sockets of the
     /// same keyd with the test uid mapped to their roles (tests only,
     /// docs/questions/Q-453).
-    fn keyd_params(&self, role: Role, extra: &[(PathBuf, Role)]) -> keyd_daemon::DaemonParams {
+    fn keyd_params(
+        &self,
+        role: Role,
+        extra: &[(PathBuf, Role)],
+    ) -> keyd_daemon::test_seams::DaemonParams {
         let settings = KeydSettings::parse(&self.read(&self.input.paths.keyd_config)).unwrap();
         assert_eq!(settings.realm(), REALM);
-        let mut params = keyd_daemon::DaemonParams::from_settings(&settings).unwrap();
+        let mut params = keyd_daemon::test_seams::DaemonParams::from(
+            keyd_daemon::DaemonParams::from_settings(&settings).unwrap(),
+        );
         assert_eq!(params.keyd_socket, self.input.paths.keyd_socket.as_path());
         assert!(params.extra_listeners.is_empty(), "never from the file");
         params.callers = CallerMap::new(&[(self.uid, role)]).unwrap();
@@ -1245,7 +1258,9 @@ impl World {
     pub fn start_dird(&mut self) {
         let paths = &self.input.paths;
         let settings = DirdSettings::parse(&self.read(&paths.dird_config)).unwrap();
-        let mut params = directory_daemon::startup::params(&settings).unwrap();
+        let mut params = directory_daemon::test_seams::DaemonParams::from(
+            directory_daemon::startup::params(&settings).unwrap(),
+        );
         params.kdc_uid = self.uid;
         params.ldap_front_uid = self.uid;
         params.audit.uid = self.uid;
@@ -1260,9 +1275,12 @@ impl World {
             .to_path_buf();
         assert_eq!(manifest_path, paths.manifest.as_path());
         let manifest = first_admin::root_files::read_manifest(&manifest_path, self.uid).unwrap();
-        let mut admin = directory_daemon::startup::admin_params(&settings, Some(manifest))
-            .unwrap()
-            .expect("the admin channel is configured");
+        let mut admin = AdminParams::production(
+            directory_daemon::startup::admin_params(&settings, Some(manifest))
+                .unwrap()
+                .expect("the admin channel is configured"),
+            &realm(),
+        );
         admin.admind_uid = self.uid;
         // dird's bounded decision-ack deadline at its ceiling (A-95 / F7).
         admin.ack_deadline =
@@ -1407,7 +1425,7 @@ impl World {
             settings.audit().socket().as_path(),
             self.input.paths.audit_socket.as_path()
         );
-        let params = admin_daemon::DaemonParams {
+        let params = admin_daemon::test_seams::DaemonParams {
             admin_socket: settings.admin_socket().as_path().to_path_buf(),
             audit: admin_daemon::AuditEndpoint {
                 socket: self.audit_socket_of("admind"),

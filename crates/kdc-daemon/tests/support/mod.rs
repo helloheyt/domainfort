@@ -40,7 +40,11 @@ use directory_daemon::policy::{DevelopmentPolicy, MandatoryFast};
 use directory_pip::{DirectoryContext, TierMap};
 use dirstore::Store;
 use kdc_daemon::zones::{Network, ZoneTable};
-use kdc_daemon::{serve, AuditEndpoint, Clock, DaemonControl, DaemonParams, Listeners, TcpLimits};
+// The full parameters and the generic `serve` are the daemon's test seams
+// (docs/52 C18, task R15; feature `test-seams`, enabled by the
+// dev-dependency).
+use kdc_daemon::test_seams::{serve, DaemonParams};
+use kdc_daemon::{AuditEndpoint, Clock, DaemonControl, Listeners, TcpLimits};
 use keyd::{InMemoryKeyStore, KeyHandle, Keyd, PrincipalBinding};
 use keyd_daemon::RecordBuffer;
 use krb_proto::KerberosTime;
@@ -348,7 +352,7 @@ impl Drop for Kdcd {
 /// `params`), its audit socket `da.sock`: dird's own fake auditd, which
 /// records its peer under dird's source — one fake per daemon, since each
 /// expects its own source on every connection (task R9b).
-pub fn stack_dird_params(dir: &TempDir, uid: u32) -> directory_daemon::DaemonParams {
+pub fn stack_dird_params(dir: &TempDir, uid: u32) -> directory_daemon::test_seams::DaemonParams {
     let mut params = dird::params(dir, uid, uid, Duration::from_secs(5), 4);
     params.audit.socket = dir.join("da.sock");
     params
@@ -409,7 +413,7 @@ impl Stack {
         keyd_clock.set(now());
         let dird = dird::Dird::start(
             stack_dird_params(&dir, uid),
-            directory_daemon::StoreSource::Opened(Arc::clone(&directory.store)),
+            directory_daemon::test_seams::opened(Arc::clone(&directory.store)),
             shared_policy(dird_version, vec![crate::common::allow_kerberos()]),
         )?;
         let dird_socket = dird.socket.clone();

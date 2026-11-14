@@ -208,7 +208,7 @@ fn dird_down_or_on_another_policy_version_is_29() {
     let restart = |version: u64| {
         dird::Dird::start(
             support::stack_dird_params(&stack.dir, stack.uid),
-            directory_daemon::StoreSource::Opened(std::sync::Arc::clone(&stack.directory.store)),
+            directory_daemon::test_seams::opened(std::sync::Arc::clone(&stack.directory.store)),
             shared_policy(version, vec![common::allow_kerberos()]),
         )
         .unwrap()

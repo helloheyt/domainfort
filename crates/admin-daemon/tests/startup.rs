@@ -71,9 +71,9 @@ fn test_params(dir: &TempDir, audit: &Path, auditd_uid: u32) -> DaemonParams {
             Duration::from_secs(1),
         )
         .unwrap(),
-        limits: Limits::DEFAULT,
-        queue_capacity: WORKER_QUEUE_CAPACITY,
-        audit_window: ipc_audit::WindowConfig::DEFAULT,
+        // docs/52 C18 (task R15): the product parameters — the limits, the
+        // worker queue and the audit window are the product `serve`'s own
+        // constants, not fields.
     }
 }
 
@@ -315,7 +315,10 @@ fn the_hardening_plan_is_the_baseline_plus_admind_row() {
 /// rest.
 #[test]
 fn the_parameters_come_from_the_file() {
-    let params = params(&settings(ADMIND)).unwrap();
+    // docs/52 C18 (task R15): the product parameters carry only the file's
+    // values; the constants the product `serve` adds are read back through
+    // the test seam's conversion (the one `serve` uses).
+    let params = admin_daemon::test_seams::DaemonParams::from(params(&settings(ADMIND)).unwrap());
     assert_eq!(
         params.admin_socket,
         std::path::PathBuf::from("/run/admind/admin.sock")

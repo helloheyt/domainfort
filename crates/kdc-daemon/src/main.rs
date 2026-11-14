@@ -22,7 +22,7 @@
 use daemon_sandbox::{apply, SingleThreadProof};
 use kdc_daemon::log::{note, Note};
 use kdc_daemon::startup::{bind_listeners, hardening_plan, read_policy, read_settings};
-use kdc_daemon::{serve, DaemonControl, DaemonParams, SystemClock};
+use kdc_daemon::{serve, DaemonControl, DaemonParams};
 use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
@@ -110,15 +110,7 @@ fn main() -> ExitCode {
     let keyd = ipc_keyd::UnixConnector::new(settings.keyd().socket().as_path().to_path_buf());
     let dird = ipc_directory::UnixConnector::new(settings.dird().socket().as_path().to_path_buf());
     let control = DaemonControl::new();
-    let result = runtime.block_on(serve(
-        params,
-        policy,
-        listeners,
-        keyd,
-        dird,
-        SystemClock,
-        control,
-    ));
+    let result = runtime.block_on(serve(params, policy, listeners, keyd, dird, control));
     drop(runtime);
     match result {
         Ok(stopped) => {

@@ -14,7 +14,7 @@
 //! # One run (bounded)
 //!
 //! At the admin service's start and every
-//! `AdminParams::destroy_reconcile_interval`, between jobs on the admin
+//! `destroy_reconcile_interval` (`DESTROY_RECONCILE_INTERVAL` in production), between jobs on the admin
 //! thread (the admin service's one keyd client):
 //!
 //! 1. **The candidates** — dird's tombstones of the `user` class (users and

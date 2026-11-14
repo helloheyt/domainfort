@@ -38,9 +38,13 @@ pub use keyd::{eventually, my_uid, skip_as_root, FakeAuditd, TempDir, TestClock}
 use ad_schema::{flags::user_account_control as uac, phase1, Phase1Schema};
 use core::time::Duration;
 use directory_daemon::policy::{DevelopmentPolicy, MandatoryFast};
+// The full parameters and the generic `serve` are dird's test seams
+// (docs/52 C18, task R15; feature `test-seams`, enabled by the
+// dev-dependency).
+use directory_daemon::test_seams::{serve, DaemonParams};
 use directory_daemon::{
-    serve, AuditEndpoint, DaemonControl, DaemonParams, SharedClock, StoreSource,
-    ENGINE_QUEUE_CAPACITY, LDAP_QUEUE_CAPACITY, MAX_LDAP_SESSIONS,
+    AuditEndpoint, DaemonControl, SharedClock, StoreSource, ENGINE_QUEUE_CAPACITY,
+    LDAP_QUEUE_CAPACITY, MAX_LDAP_SESSIONS,
 };
 use directory_pip::NamingContext;
 use dirstore::{AttrId, IntegrityKey, NewObject, NodeId, Origin, Store, Timestamp};

@@ -50,9 +50,9 @@ use keyd::{
 };
 use keyd_daemon::audit::MAX_RECORDS_PER_OPERATION;
 use keyd_daemon::startup::development_keyd;
+use keyd_daemon::test_seams::ExtraListener;
 use keyd_daemon::{
-    CallerMap, ExtraListener, IntentAckBudget, SystemClock, INTENT_ACK_BUDGET,
-    MAX_INTENT_ACK_BUDGET,
+    CallerMap, IntentAckBudget, SystemClock, INTENT_ACK_BUDGET, MAX_INTENT_ACK_BUDGET,
 };
 use krb_proto::{KerberosString, KerberosTime, PrincipalName, Realm};
 use std::fs::File;

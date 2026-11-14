@@ -32,13 +32,16 @@ publish = false
 path = "src/lib.rs"
 
 [dev-dependencies]
-# The five daemons, started in-process through their public `serve`
-# functions with injected parameters (docs/50 §9 tier 2).
+# The five daemons, started in-process with injected parameters (docs/50 §9
+# tier 2) — keyd, dird, the kdc, ldap-front and admind through their test
+# seams (`test_seams`, feature `test-seams`; docs/52 C18, task R15), which
+# only dev-dependencies may enable (tests/no_test_seams_in_product.rs);
+# auditd through its product listener (it has no seam).
 audit-daemon = { path = "../audit-daemon" }
-keyd-daemon = { path = "../keyd-daemon" }
-directory-daemon = { path = "../directory-daemon" }
-kdc-daemon = { path = "../kdc-daemon" }
-ldap-front = { path = "../ldap-front" }
+keyd-daemon = { path = "../keyd-daemon", features = ["test-seams"] }
+directory-daemon = { path = "../directory-daemon", features = ["test-seams"] }
+kdc-daemon = { path = "../kdc-daemon", features = ["test-seams"] }
+ldap-front = { path = "../ldap-front", features = ["test-seams"] }
 # The channel crates and the libraries the fixtures are built from (the
 # same set the daemons' own tier-2 tests use).
 audit-log = { path = "../audit-log" }
@@ -60,7 +63,7 @@ krb-proto = { path = "../krb-proto" }
 krb-crypto = { path = "../krb-crypto" }
 pdp = { path = "../pdp" }
 dtyp = { path = "../dtyp" }
-dirstore = { path = "../dirstore" }
+dirstore = { path = "../dirstore", features = ["test-seams"] }
 directory-pip = { path = "../directory-pip" }
 ad-schema = { path = "../ad-schema" }
 ldap = { path = "../ldap" }
@@ -74,7 +77,7 @@ parse-ldap = { path = "../parse-ldap" }
 provision = { path = "../provision" }
 provision-manifest = { path = "../provision-manifest" }
 keyadm = { path = "../keyadm" }
-admin-daemon = { path = "../admin-daemon" }
+admin-daemon = { path = "../admin-daemon", features = ["test-seams"] }
 ipc-admin = { path = "../ipc-admin" }
 ipc-dird-admin = { path = "../ipc-dird-admin" }
 directory-admin = { path = "../directory-admin" }

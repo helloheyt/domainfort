@@ -234,7 +234,7 @@ pub fn ou_dn(name: &str) -> Dn {
 }
 
 /// A verified ticket of the account `sam`, first authenticated at
-/// [`authtime`] (the facts keyd's `open_and_verify_service_ticket` returns).
+/// [`authtime`] (the facts keyd's `verify_operation_ticket` returns, Q-523).
 pub fn ticket(sam: &str) -> VerifiedTicket {
     ticket_bound_to(sam, Some(TEST_DIGEST))
 }

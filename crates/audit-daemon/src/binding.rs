@@ -60,13 +60,15 @@ pub const fn bound_source(shape: EventShape) -> Option<Source> {
 /// The binding table a listener enforces: for each shape, the one source
 /// allowed to send it (`None` = any mapped source).
 ///
-/// The daemon always enforces [`PRODUCTION`] ([`crate::listener::ListenerConfig::from_settings`];
-/// the configuration file has no key for it). The table is a listener
-/// parameter only so that a test harness whose senders all share one uid —
-/// and therefore one mapped source (R50-3: one source per uid) — can enforce
-/// the table that matches its own single-label world; per-daemon binding
-/// with distinct uids is covered by this crate's tier-2 tests and the
-/// tier-3 e2e test (docs/questions/Q-310, Q-341).
+/// The daemon always enforces [`PRODUCTION`] and nothing else: the listener
+/// takes no table ([`crate::listener::serve`] uses [`PRODUCTION`] itself; the
+/// configuration file has no key). The table was a listener parameter for a
+/// harness whose senders shared one uid; since task R9b each test sender has
+/// its own listener and source, and docs/52 R15 (C18) removed the parameter.
+/// The pure functions below still take a table, so the numbering rule can be
+/// checked against other tables in this crate's tests.
+/// Spec: docs/50 §3.2, §8.1; docs/questions/Q-341 (option (a)), A-85,
+/// Q-570.
 ///
 /// Spec: docs/50 §3.2, §8.1; docs/questions/Q-341 (option (a)), A-85.
 pub type BindingTable = fn(EventShape) -> Option<Source>;

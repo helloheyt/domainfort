@@ -75,8 +75,9 @@
 //!   within the budget plus the queue's own work — inside its own 2 s
 //!   deadline.
 //!
-//! The budget is a daemon parameter (`DaemonParams::intent_ack_budget`,
-//! decision A-93's follow-up F5) only so that tests on a loaded machine can
+//! The budget is a daemon parameter (`test_seams::DaemonParams::intent_ack_budget`,
+//! decision A-93's follow-up F5; a test seam only since docs/52 R15 — the
+//! product parameters have no field for it) only so that tests on a loaded machine can
 //! give a slow auditd more time, together with a client that waits
 //! correspondingly longer. Production takes [`INTENT_ACK_BUDGET`] — there is
 //! no configuration key — and no budget above [`MAX_INTENT_ACK_BUDGET`] can

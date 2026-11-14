@@ -7,23 +7,15 @@
 //! §7.4, §7.5; docs/questions/Q-213, Q-219 (A-57), Q-230 (A-60), Q-235
 //! (A-61), Q-270.
 
-use crate::admin_service::{
-    AdminParams, DecisionAckDeadline, KeydTicketVerifier, TicketVerifier, VerifierFactory,
-    ADMIN_QUEUE_CAPACITY, DESTROY_RECONCILE_INTERVAL, MAX_ADMIN_CONNECTIONS,
-};
+use crate::admin_service::{AdminParams, KeydEndpoint};
 use crate::audit_link::AuditEndpoint;
-use crate::clock::SharedClock;
-use crate::daemon::{
-    DaemonParams, ENGINE_QUEUE_CAPACITY, LDAP_QUEUE_CAPACITY, MAX_KDC_CONNECTIONS,
-    MAX_LDAP_SESSIONS, MAX_OPEN_VIEWS,
-};
+use crate::daemon::{DaemonParams, MAX_KDC_CONNECTIONS, MAX_LDAP_SESSIONS};
 use crate::policy::{read_file, DevelopmentPolicy, LoadError, PolicyError};
 use config::{DirdSettings, IntegrityKeySource, PolicyStoreFormat};
 use core::fmt;
 use daemon_sandbox::{HardeningPlan, PlanError, ProcessIdentity};
 use directory_pip::NamingContext;
 use dirstore::{IntegrityKey, INTEGRITY_KEY_LEN};
-use ipc_audit::WindowConfig;
 use keyd_types::KeydConfig;
 use krb_proto::Realm;
 use protected_file::{
@@ -32,7 +24,6 @@ use protected_file::{
 };
 use std::io::Read;
 use std::path::Path;
-use std::sync::Arc;
 use zeroize::Zeroizing;
 
 /// The owner of the files dird reads before its drop: root.
@@ -343,10 +334,11 @@ pub fn hardening_plan(settings: &DirdSettings) -> Result<HardeningPlan, PlanErro
         .build()
 }
 
-/// The serving parameters from dird's configuration, with the daemon's
-/// constants for what the file does not set (Q-230 item 4) and keyd's
-/// non-secret configuration for the realm (library defaults, as keyd-daemon
-/// builds it — docs/47 R47-10; Q-270 item 7).
+/// The serving parameters from dird's configuration — the one product
+/// constructor (docs/52 C18, task R15) — with keyd's non-secret
+/// configuration for the realm (library defaults, as keyd-daemon builds it —
+/// docs/47 R47-10; Q-270 item 7). The daemon's constants for what the file
+/// does not set (Q-230 item 4) are added by `serve`.
 ///
 /// # Errors
 /// [`StartupError::Realm`], [`StartupError::NamingContext`].
@@ -365,18 +357,11 @@ pub fn params(settings: &DirdSettings) -> Result<DaemonParams, StartupError> {
         },
         frame_timeout: settings.frame_timeout(),
         view_lifetime: settings.view_lifetime(),
-        max_views: MAX_OPEN_VIEWS,
-        max_connections: MAX_KDC_CONNECTIONS,
-        queue_capacity: ENGINE_QUEUE_CAPACITY,
         naming_context,
         keyd: KeydConfig::new(realm),
         ldap_socket: settings.ldap_channel().socket().as_path().to_path_buf(),
         ldap_front_uid: settings.ldap_channel().peer_uid(),
-        max_ldap_sessions: MAX_LDAP_SESSIONS,
-        ldap_queue_capacity: LDAP_QUEUE_CAPACITY,
         dns_host_name: settings.dns_host_name().to_owned(),
-        audit_window: WindowConfig::DEFAULT,
-        clock: SharedClock::system(),
     })
 }
 
@@ -395,14 +380,15 @@ pub fn read_provision_manifest(path: &Path) -> Result<provision_manifest::Manife
 }
 
 /// The admin service's parameters (task A8), when the admin channel is
-/// configured: the socket and admind's uid, keyd's endpoint as a verifier
-/// factory (ipc-keyd's Unix connector, keyd's uid, the keyd channel's 2 s
-/// deadline — Role::Ldap, A-73), the ticket-age threshold, the quorum, the
-/// node-id, the manifest, and the daemon's constants for the connection
-/// bound, the queue and the acknowledgement wait.
+/// configured — the one product constructor (docs/52 C18, task R15): the
+/// socket and admind's uid, keyd's endpoint (its socket and uid — the
+/// production keyd client over it, Role::Ldap, A-73, is built by
+/// `serve_with_admin`), the ticket-age threshold, the quorum, the node-id
+/// and the manifest. The daemon's constants for the connection bound, the
+/// queue and the acknowledgement wait are added by `serve_with_admin`.
 ///
 /// # Errors
-/// [`StartupError::Realm`], [`StartupError::AdminSettings`].
+/// [`StartupError::AdminSettings`].
 ///
 /// Spec: docs/51 §4.6, §5.5, §5.6, §7.1, §7.5; A-73; P-22;
 /// docs/questions/Q-385.
@@ -419,25 +405,9 @@ pub fn admin_params(
     let node_id = settings.node_id().ok_or(StartupError::AdminSettings)?;
     let manifest = manifest.ok_or(StartupError::AdminSettings)?;
     let quorum = usize::try_from(service.quorum()).map_err(|_| StartupError::AdminSettings)?;
-    let realm = Realm::new(settings.realm()).map_err(|_| StartupError::Realm)?;
-    let keyd: Option<VerifierFactory> = settings.keyd().map(|endpoint| {
-        let path = endpoint.socket().as_path().to_path_buf();
-        let uid = endpoint.uid();
-        let factory: VerifierFactory = Arc::new(move || {
-            // Task R9: keyd's uid, the role Ldap and dird's realm, expected
-            // of every keyd connection.
-            let verifier: Box<dyn TicketVerifier> = Box::new(
-                KeydTicketVerifier::new(
-                    ipc_keyd::UnixConnector::new(path.clone()),
-                    uid,
-                    realm.clone(),
-                    ipc_keyd::DEFAULT_DEADLINE,
-                )
-                .ok()?,
-            );
-            Some(verifier)
-        });
-        factory
+    let keyd = settings.keyd().map(|endpoint| KeydEndpoint {
+        socket: endpoint.socket().as_path().to_path_buf(),
+        uid: endpoint.uid(),
     });
     Ok(Some(AdminParams {
         socket: channel.socket().as_path().to_path_buf(),
@@ -447,10 +417,5 @@ pub fn admin_params(
         quorum,
         node_id: dirstore::NodeId(node_id),
         manifest,
-        max_connections: MAX_ADMIN_CONNECTIONS,
-        queue_capacity: ADMIN_QUEUE_CAPACITY,
-        ack_deadline: DecisionAckDeadline::PRODUCTION,
-        key_request_lifetime: directory_admin::KEY_REQUEST_LIFETIME,
-        destroy_reconcile_interval: DESTROY_RECONCILE_INTERVAL,
     }))
 }

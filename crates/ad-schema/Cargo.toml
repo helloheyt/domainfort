@@ -30,5 +30,10 @@ dirstore = { path = "../dirstore" }
 # Our own Windows data types: the GUID type (schemaIDGUID values).
 dtyp = { path = "../dtyp" }
 
+[dev-dependencies]
+# TESTS ONLY (docs/52 C18, task R15; A-113): the tests open their stores by
+# path (`Store::open`, feature `test-seams`).
+dirstore = { path = "../dirstore", features = ["test-seams"] }
+
 [lints]
 workspace = true

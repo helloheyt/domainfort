@@ -47,7 +47,7 @@
 //!    resend → `Refused::Malformed` + close, counted for a `ResendsRefused`
 //!    record (decision A-98, follow-up F8; docs/questions/Q-445). Each job
 //!    carries the source's numbering ([`binding::numbering`] of the
-//!    configured table) and whether it is the connection's first `Append`.
+//!    production table) and whether it is the connection's first `Append`.
 //! 5. **Errors** follow `ipc::Error::refusal` (A-59): a wrong version →
 //!    `Refused::VersionMismatch` + close; a malformed payload →
 //!    `Refused::Malformed` + close; a bad length prefix, wrong magic or
@@ -101,34 +101,32 @@ const READ_CHUNK: usize = 4096;
 /// limit is reached), so a persistent failure does not spin. Project choice.
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
-/// The listener's limits.
+/// What auditd's configuration sets for the listener — **and nothing
+/// else** (docs/52 C18, task R15). The per-source connection quota and the
+/// shape↔source binding table are not parameters at all: [`serve`] enforces
+/// [`MAX_CONNECTIONS_PER_SOURCE`] and [`binding::PRODUCTION`] (A-85), so no
+/// code that builds a listener can weaken the binding. (The table was a
+/// parameter for the single-uid harness; since task R9b each test sender has
+/// its own listener and source, and the parameter had no user left — R15
+/// removed it instead of hiding it.)
 ///
-/// Spec: docs/50 §3.6; docs/questions/Q-265 item 5.
+/// Spec: docs/50 §3.6; docs/questions/Q-265 item 5; A-85; docs/52 §3.18;
+/// docs/questions/Q-570.
 #[derive(Debug, Clone, Copy)]
 pub struct ListenerConfig {
     /// How long a started frame may take to arrive, and how long writing a
     /// reply may take.
     pub frame_timeout: Duration,
-    /// Most simultaneous connections per mapped source.
-    pub max_connections_per_source: usize,
-    /// The shape↔source binding table. Always [`binding::PRODUCTION`] in
-    /// the daemon; see [`binding::BindingTable`] for why it is a parameter.
-    /// It also gives each source's numbering for the resend check
-    /// ([`binding::numbering`]): one sender per source under
-    /// [`binding::PRODUCTION`].
-    pub binding: binding::BindingTable,
 }
 
 impl ListenerConfig {
-    /// The daemon's limits: `frame_timeout` from the configuration, the
-    /// connection quota from [`MAX_CONNECTIONS_PER_SOURCE`].
+    /// The listener's configuration from auditd's settings — the one
+    /// product constructor (docs/52 C18, task R15).
     /// Spec: docs/50 §3.6, R50-15.
     #[must_use]
     pub fn from_settings(settings: &AuditdSettings) -> ListenerConfig {
         ListenerConfig {
             frame_timeout: settings.frame_timeout(),
-            max_connections_per_source: MAX_CONNECTIONS_PER_SOURCE,
-            binding: binding::PRODUCTION,
         }
     }
 }
@@ -256,9 +254,12 @@ impl Drop for QuotaSlot {
     }
 }
 
-/// Accept connections forever, each served by its own task.
+/// Accept connections forever, each served by its own task, with the
+/// daemon's connection quota ([`MAX_CONNECTIONS_PER_SOURCE`]) and binding
+/// table ([`binding::PRODUCTION`]) — neither is a parameter (docs/52 C18,
+/// task R15).
 ///
-/// Spec: this module's steps 1-2; docs/50 §3.2, R50-3.
+/// Spec: this module's steps 1-2; docs/50 §3.2, R50-3; A-85.
 pub async fn serve(
     listener: UnixListener,
     sources: Arc<SourceMap>,
@@ -284,7 +285,7 @@ pub async fn serve(
             continue;
         };
         let (source, slot) = log_source(source);
-        let Some(held) = Quota::acquire(&quota, slot, config.max_connections_per_source) else {
+        let Some(held) = Quota::acquire(&quota, slot, MAX_CONNECTIONS_PER_SOURCE) else {
             submitter.refusals().count_over_quota(uid);
             continue;
         };
@@ -345,15 +346,7 @@ async fn connection(
                 (reply, true)
             }
             AuditRequest::Append(append) => {
-                append_batch(
-                    &append,
-                    &mut cursor,
-                    source,
-                    uid,
-                    &submitter,
-                    config.binding,
-                )
-                .await
+                append_batch(&append, &mut cursor, source, uid, &submitter).await
             }
         };
         if !send(&mut stream, &reply, config.frame_timeout).await || !keep_open {
@@ -374,14 +367,13 @@ async fn append_batch(
     source: Source,
     uid: u32,
     submitter: &Submitter,
-    table: binding::BindingTable,
 ) -> (Reply<AuditReply>, bool) {
     let Ok(range) = cursor.check(append) else {
         return (Reply::Refused(Refused::Malformed), false);
     };
     // A shape this source may not send: nothing of the batch is persisted
     // (crate::binding; docs/51 §5.7).
-    if !binding::batch_permitted_under(table, source, append.events()) {
+    if !binding::batch_permitted(source, append.events()) {
         submitter.refusals().count_misbound(uid);
         return (Reply::Refused(Refused::Malformed), false);
     }
@@ -391,7 +383,7 @@ async fn append_batch(
         source_uid: uid,
         first_source_seq: append.first_seq(),
         events: append.events().to_vec(),
-        numbering: binding::numbering(table, source),
+        numbering: binding::numbering(binding::PRODUCTION, source),
         // No baseline yet: nothing has been acknowledged on this connection
         // (ipc-audit `AppendCursor`: "the first `Append` on a connection sets
         // the baseline").

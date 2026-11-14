@@ -742,14 +742,22 @@ fn provisioning_to_a_new_users_login() {
         assert_eq!(rogue[0].caller_role, KeydRole::Directory);
         assert!(
             keyd.iter()
-                .any(|(_, r)| r.op == KeydOperation::OpenAndVerifyServiceTicket
+                .any(|(_, r)| r.op == KeydOperation::VerifyOperationTicket
                     && r.caller_role == KeydRole::Ldap
                     && r.result == KeydOutcome::Success),
-            "dird verified the AP-REQs under Role::Ldap (A-73)"
+            "dird verified the AP-REQs under Role::Ldap (A-73), operation-bound (Q-523)"
+        );
+        // Q-523: dird's admin verifications never use the context-keeping
+        // operation — keyd kept no service context for any of them.
+        assert!(
+            !keyd
+                .iter()
+                .any(|(_, r)| r.op == KeydOperation::OpenAndVerifyServiceTicket),
+            "no admin AP-REQ was verified through the context-keeping operation"
         );
         assert!(
             keyd.iter()
-                .any(|(_, r)| r.op == KeydOperation::OpenAndVerifyServiceTicket
+                .any(|(_, r)| r.op == KeydOperation::VerifyOperationTicket
                     && r.caller_role == KeydRole::Ldap
                     && r.result == KeydOutcome::Denied
                     && r.reason == KeydReason::Replay),
@@ -757,7 +765,7 @@ fn provisioning_to_a_new_users_login() {
         );
         assert_eq!(
             keyd.iter()
-                .filter(|(_, r)| r.op == KeydOperation::OpenAndVerifyServiceTicket
+                .filter(|(_, r)| r.op == KeydOperation::VerifyOperationTicket
                     && r.caller_role == KeydRole::Ldap
                     && r.result == KeydOutcome::Denied
                     && r.reason == KeydReason::OperationDigestMismatch

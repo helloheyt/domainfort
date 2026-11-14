@@ -128,8 +128,17 @@ pub mod tls;
 pub use audit::{verify_auditd, AuditCheckError, AUDIT_CHECK_DEADLINE};
 pub use connection::{Timeouts, CLIENT_WRITE_TIMEOUT};
 pub use daemon::{
-    serve, ConnectionLimits, DaemonControl, DaemonError, FrontParams, Listeners, MAX_CONNECTIONS,
-    MAX_CONNECTIONS_PER_SOURCE, MAX_UNAUTHENTICATED_CONNECTIONS,
+    serve, ConfiguredTimeouts, ConnectionLimits, DaemonControl, DaemonError, FrontParams,
+    Listeners, MAX_CONNECTIONS, MAX_CONNECTIONS_PER_SOURCE, MAX_UNAUTHENTICATED_CONNECTIONS,
 };
+
+/// The test seams (docs/52 C18, task R15): the full parameters (the client
+/// write bound, the connection bounds) and their `serve`. Compiled only
+/// with the feature `test-seams`, which only dev-dependencies enable; no
+/// product source names this module (crates/e2e-tests
+/// `tests/no_test_seams_in_product.rs`).
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod test_seams;
 pub use dird::{DirdSession, Endpoint};
 pub use log::{counts, Counts};

@@ -21,10 +21,8 @@
 
 use daemon_sandbox::{apply, SingleThreadProof};
 use keyd_daemon::log::{note, Note};
-use keyd_daemon::startup::{
-    development_keyd, hardening_plan, prepare_socket_directory, read_settings, realm,
-};
-use keyd_daemon::{serve, DaemonControl, DaemonParams, SystemClock};
+use keyd_daemon::startup::{hardening_plan, prepare_socket_directory, read_settings, realm};
+use keyd_daemon::{serve, DaemonControl, DaemonParams};
 use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
@@ -108,7 +106,7 @@ fn main() -> ExitCode {
         Err(error) => return fail("runtime", &error),
     };
     let control = DaemonControl::new();
-    let result = runtime.block_on(serve(params, SystemClock, development_keyd(realm), control));
+    let result = runtime.block_on(serve(params, realm, control));
     // Dropping the runtime ends the connection tasks and with them the last
     // engine-queue senders; the engine thread then ends.
     drop(runtime);

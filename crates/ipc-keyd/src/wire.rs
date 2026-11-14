@@ -7,8 +7,9 @@
 //! | value | encoding |
 //! |---|---|
 //! | `KeyHandle` | 16-octet `PrincipalId` ‖ purpose `u8` (closed table: 1 PrincipalLongterm, 2 Krbtgt, 3 Service, 4 AdminService) |
-//! | `AppBinding` (`open_and_verify_service_ticket`) | `u8 1` Unbound \| `u8 2` OperationDigest ‖ 32 octets — no purpose travels: keyd derives it from the binding (R2) |
-//! | `bound_operation` (`ServiceContext`) | `Option<[32]>` |
+//! | binding of `open_and_verify_service_ticket` (0x07) | `u8 1` (Unbound) — the only value since Q-523; `u8 2` (OperationDigest) is refused: an operation-bound verification is its own kind, 0x15. No purpose travels: keyd derives it from the binding (R2) |
+//! | operation digest of `verify_operation_ticket` (0x15) / `OperationTicket` (0x95) | 32 octets |
+//! | end of the `ServiceContext` reply (0x87) | `u8 0` — the absent marker of the former `bound_operation: Option<[32]>`, the only value since Q-523 (an unbound verification is bound to no operation) |
 //! | `ExchangeId` / `CtxId` / `ArmorId` / `ServiceCtxId` | `TOKEN_ID_LENGTH` octets |
 //! | `Kvno`, `nonce`, flags (`TicketFlags`, 32 bits) | `u32` |
 //! | `EncTypeId` | `u8` = the etype number, closed table of keyd-types (= krb-crypto's, pinned in keyd) |
@@ -47,8 +48,16 @@
 //! that does not give it its own role. No request field is ever read as a
 //! role.
 //!
+//! **Q-523 (append-only, docs/50 §3.3):** the operation-bound service-ticket
+//! verification was moved out of kind 0x07 into the appended kinds 0x15 /
+//! 0x95, whose answer has no context id. Kind 0x07 / 0x87 keep their layout
+//! octet for octet: the binding octet and the reply's last octet now each
+//! admit one value (Unbound; absent), and any other value is refused
+//! (`UnknownCode`). `KEYD_VERSION` stays 1 (the precedent of F3, A15a,
+//! A-102, R2 and R9; a mismatched pair fails closed either way).
+//!
 //! Spec: docs/50 §3.3, §3.4, R50-3, R50-4, R50-5; docs/10 §1-§9; A-56, A-59;
-//! docs/questions/Q-351 (A-87), Q-466 item 2 (A-102).
+//! docs/questions/Q-351 (A-87), Q-466 item 2 (A-102), Q-523, Q-575.
 
 use crate::channel::{
     reply_kind, request_kind, MAX_DECISION_APPROVERS, MAX_DESTROY_PAGE, MAX_ENCTYPES,
@@ -56,9 +65,9 @@ use crate::channel::{
 };
 use ipc::{DerBlob, Error, MessageSet, Payload, Reader, Result, Secret, Writer};
 use keyd_types::{
-    AccountKind, AppBinding, ArmorId, AuthnError, CtxId, DecisionId, EncTypeId, ExchangeId,
-    FastConversation, IssueError, KeyHandle, KeyPurpose, Kvno, OperationDigest, PendingDestruction,
-    PrincipalId, Role, ServiceCtxId, TicketPolicy, OPERATION_DIGEST_LEN, TOKEN_ID_LENGTH,
+    AccountKind, ArmorId, AuthnError, CtxId, DecisionId, EncTypeId, ExchangeId, FastConversation,
+    IssueError, KeyHandle, KeyPurpose, Kvno, OperationDigest, PendingDestruction, PrincipalId,
+    Role, ServiceCtxId, TicketPolicy, OPERATION_DIGEST_LEN, TOKEN_ID_LENGTH,
 };
 use krb_proto::{KerberosFlags, TicketFlags};
 
@@ -685,72 +694,91 @@ impl Payload for SealFastErrorRequest {
     }
 }
 
-/// Wire code of `AppBinding::Unbound`. Project choice (closed table).
-/// Spec: docs/52 §5 item 3 (R2).
+/// The binding octet of kind 0x07: `AppBinding::Unbound`, the only value
+/// that kind carries since Q-523 (`0x02`, the operation digest, moved to
+/// kind 0x15 and is refused here). Project choice (closed table).
+/// Spec: docs/52 §5 item 3 (R2); docs/50 §3.3 ("enum = `u8` from a closed
+/// table"; append-only: the layout of 0x07 is unchanged); Q-523.
 const BINDING_UNBOUND: u8 = 0x01;
-/// Wire code of `AppBinding::OperationDigest`, followed by the 32 octets.
-/// Spec: docs/52 §5 item 3 (R2).
-const BINDING_OPERATION_DIGEST: u8 = 0x02;
 
-/// `AppBinding` = `u8 1` Unbound | `u8 2` OperationDigest ‖ 32 octets.
-/// Spec: docs/52 §5 item 3; docs/50 §3.3 ("enum = `u8` from a closed
-/// table").
-fn write_binding(writer: &mut Writer, binding: &AppBinding) -> Result<()> {
-    match binding {
-        AppBinding::Unbound => writer.write_enum(BINDING_UNBOUND),
-        AppBinding::OperationDigest(digest) => {
-            writer.write_enum(BINDING_OPERATION_DIGEST)?;
-            writer.write_array(digest.as_bytes())
-        }
-    }
+/// The last octet of the 0x87 reply: the absent marker of the former
+/// `bound_operation: Option<[32]>` — the only value since Q-523 (an unbound
+/// verification is bound to no operation). Project choice.
+/// Spec: docs/50 §3.3 (`Option<T>` = `00` | `01 T`; append-only); Q-523.
+const NO_BOUND_OPERATION: u8 = 0x00;
+
+/// Read a one-value field: `value` or `UnknownCode`.
+/// Spec: docs/50 §3.3 (closed tables; one encoding per value).
+fn read_fixed(reader: &mut Reader<'_>, value: u8) -> Result<()> {
+    reader.read_enum(|c| (c == value).then_some(()))
 }
 
-/// Spec: docs/52 §5 item 3; docs/50 §3.3.
-fn read_binding(reader: &mut Reader<'_>) -> Result<AppBinding> {
-    let tag = reader
-        .read_enum(|c| matches!(c, BINDING_UNBOUND | BINDING_OPERATION_DIGEST).then_some(c))?;
-    if tag == BINDING_OPERATION_DIGEST {
-        Ok(AppBinding::OperationDigest(OperationDigest::new(
-            reader.read_array()?,
-        )))
-    } else {
-        Ok(AppBinding::Unbound)
-    }
-}
-
-/// `open_and_verify_service_ticket`: the service principal, the binding
-/// (whose purpose the key set is — keyd derives it, R2: no purpose travels,
-/// so no request can pair the admin service key with an unbound
-/// verification), and the AP-REQ.
+/// `open_and_verify_service_ticket`: the service principal and the AP-REQ,
+/// verified **unbound** (keyd derives the key set's purpose from the
+/// binding, R2: no purpose travels, so no request can pair the admin service
+/// key with an unbound verification — that one is kind 0x15). On the wire
+/// the binding octet stays, with its one value (Q-523, append-only).
 /// Spec: docs/50 §3.4 (`service`, `ap_req_octets: bytes`); docs/10 §5ב;
-/// docs/52 §5 item 3 (A-102).
+/// docs/52 §5 item 3 (A-102); docs/questions/Q-523.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenAndVerifyServiceTicketRequest {
     /// The service key set's principal.
     pub service: PrincipalId,
-    /// What the Authenticator must be bound to (and so the key set's
-    /// purpose).
-    pub binding: AppBinding,
     /// The raw KRB_AP_REQ octets (keyd decodes them itself).
     pub ap_req_octets: Vec<u8>,
 }
 
 impl Payload for OpenAndVerifyServiceTicketRequest {
-    /// Spec: docs/50 §3.4; docs/52 §5 item 3.
+    /// Spec: docs/50 §3.4; docs/52 §5 item 3; Q-523.
     fn write_fields(&self, writer: &mut Writer) -> Result<()> {
         writer.write_array(self.service.as_bytes())?;
-        write_binding(writer, &self.binding)?;
+        writer.write_enum(BINDING_UNBOUND)?;
         writer.write_bytes(&self.ap_req_octets, MAX_REQUEST_FIELD)
     }
 
-    /// Spec: docs/50 §3.4; docs/52 §5 item 3.
+    /// Spec: docs/50 §3.4; docs/52 §5 item 3; Q-523.
     fn read_fields(reader: &mut Reader<'_>) -> Result<OpenAndVerifyServiceTicketRequest> {
         let service = PrincipalId::from_bytes(reader.read_array()?);
-        let binding = read_binding(reader)?;
+        read_fixed(reader, BINDING_UNBOUND)?;
         let ap_req_octets = read_owned(reader, MAX_REQUEST_FIELD)?;
         Ok(OpenAndVerifyServiceTicketRequest {
             service,
-            binding,
+            ap_req_octets,
+        })
+    }
+}
+
+/// `verify_operation_ticket`: the admin service principal, the operation
+/// digest the AP-REQ must be bound to (keyd derives the AdminService
+/// purpose from it, R2), and the AP-REQ. Appended by Q-523.
+/// Spec: docs/10 §5ב; docs/52 §5 items 1-3; docs/50 §3.3 (append-only),
+/// §3.4; docs/questions/Q-523.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyOperationTicketRequest {
+    /// The admin service key set's principal.
+    pub service: PrincipalId,
+    /// The operation digest (32 octets, never interpreted by keyd).
+    pub operation: OperationDigest,
+    /// The raw KRB_AP_REQ octets (keyd decodes them itself).
+    pub ap_req_octets: Vec<u8>,
+}
+
+impl Payload for VerifyOperationTicketRequest {
+    /// Spec: docs/50 §3.4; docs/52 §5 item 3; Q-523.
+    fn write_fields(&self, writer: &mut Writer) -> Result<()> {
+        writer.write_array(self.service.as_bytes())?;
+        writer.write_array(self.operation.as_bytes())?;
+        writer.write_bytes(&self.ap_req_octets, MAX_REQUEST_FIELD)
+    }
+
+    /// Spec: docs/50 §3.4; docs/52 §5 item 3; Q-523.
+    fn read_fields(reader: &mut Reader<'_>) -> Result<VerifyOperationTicketRequest> {
+        let service = PrincipalId::from_bytes(reader.read_array()?);
+        let operation = OperationDigest::new(reader.read_array()?);
+        let ap_req_octets = read_owned(reader, MAX_REQUEST_FIELD)?;
+        Ok(VerifyOperationTicketRequest {
+            service,
+            operation,
             ap_req_octets,
         })
     }
@@ -1154,6 +1182,8 @@ pub enum KeydRequest {
     SealCeremony,
     /// `after: Option<u64>`. Spec: docs/52 §4.6.
     ListDestroyDecisions(Option<DecisionId>),
+    /// Spec: docs/10 §5ב; docs/questions/Q-523.
+    VerifyOperationTicket(VerifyOperationTicketRequest),
 }
 
 impl MessageSet for KeydRequest {
@@ -1184,6 +1214,7 @@ impl MessageSet for KeydRequest {
             KeydRequest::RegisterDecision(_) => request_kind::REGISTER_DECISION,
             KeydRequest::SealCeremony => request_kind::SEAL_CEREMONY,
             KeydRequest::ListDestroyDecisions(_) => request_kind::LIST_DESTROY_DECISIONS,
+            KeydRequest::VerifyOperationTicket(_) => request_kind::VERIFY_OPERATION_TICKET,
         }
     }
 
@@ -1210,6 +1241,7 @@ impl MessageSet for KeydRequest {
             KeydRequest::ListDestroyDecisions(after) => {
                 writer.write_option(after.as_ref(), |w, id| write_decision(w, *id))
             }
+            KeydRequest::VerifyOperationTicket(m) => m.write_fields(writer),
         }
     }
 
@@ -1264,6 +1296,9 @@ impl MessageSet for KeydRequest {
             request_kind::LIST_DESTROY_DECISIONS => {
                 KeydRequest::ListDestroyDecisions(reader.read_option(read_decision)?)
             }
+            request_kind::VERIFY_OPERATION_TICKET => KeydRequest::VerifyOperationTicket(
+                VerifyOperationTicketRequest::read_fields(reader)?,
+            ),
             _ => return Err(Error::UnknownKind),
         })
     }
@@ -1420,8 +1455,10 @@ impl Payload for WireTgtContext {
     }
 }
 
-/// `ServiceContext`. Spec: docs/50 §3.4 (`ServiceContext { ctx_id, crealm,
-/// cname, authtime, endtime, flags, subkey_present }`); docs/10 §5ב.
+/// `ServiceContext` of an unbound verification. Spec: docs/50 §3.4
+/// (`ServiceContext { ctx_id, crealm, cname, authtime, endtime, flags,
+/// subkey_present }`); docs/10 §5ב. Its last octet is the one-value
+/// [`NO_BOUND_OPERATION`] (Q-523, append-only).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireServiceContext {
     /// The one-time service-context token.
@@ -1438,12 +1475,10 @@ pub struct WireServiceContext {
     pub flags: TicketFlags,
     /// Whether the authenticator offered a subkey.
     pub subkey_present: bool,
-    /// The operation digest keyd verified the `cksum` over (R2), if any.
-    pub bound_operation: Option<[u8; OPERATION_DIGEST_LEN]>,
 }
 
 impl Payload for WireServiceContext {
-    /// Spec: docs/50 §3.4; docs/52 §5 items 3-4 (`bound_operation`).
+    /// Spec: docs/50 §3.4; Q-523 (the one-value last octet).
     fn write_fields(&self, writer: &mut Writer) -> Result<()> {
         writer.write_array(self.ctx_id.as_bytes())?;
         writer.write_bytes(&self.crealm, MAX_REPLY_FIELD)?;
@@ -1452,7 +1487,7 @@ impl Payload for WireServiceContext {
         self.endtime.write_fields(writer)?;
         write_flags(writer, self.flags)?;
         writer.write_bool(self.subkey_present)?;
-        writer.write_option(self.bound_operation.as_ref(), |w, d| w.write_array(d))
+        writer.write_enum(NO_BOUND_OPERATION)
     }
 
     /// Spec: docs/50 §3.4.
@@ -1464,7 +1499,7 @@ impl Payload for WireServiceContext {
         let endtime = WireTime::read_fields(reader)?;
         let flags = read_flags(reader)?;
         let subkey_present = reader.read_bool()?;
-        let bound_operation = reader.read_option(Reader::read_array)?;
+        read_fixed(reader, NO_BOUND_OPERATION)?;
         Ok(WireServiceContext {
             ctx_id,
             crealm,
@@ -1473,7 +1508,57 @@ impl Payload for WireServiceContext {
             endtime,
             flags,
             subkey_present,
-            bound_operation,
+        })
+    }
+}
+
+/// `OperationTicket`: the facts of an operation-bound verification and the
+/// digest keyd verified the `cksum` MIC over — **no context id** (keyd keeps
+/// none, Q-523). Appended by Q-523.
+/// Spec: docs/10 §5ב; docs/52 §5 items 3-4; docs/50 §3.3 (append-only),
+/// §3.4; docs/questions/Q-523.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireOperationTicket {
+    /// Client realm, KerberosString octets.
+    pub crealm: Vec<u8>,
+    /// DER `PrincipalName` of the client.
+    pub cname: DerBlob,
+    /// Ticket authtime.
+    pub authtime: WireTime,
+    /// Ticket endtime.
+    pub endtime: WireTime,
+    /// Ticket flags.
+    pub flags: TicketFlags,
+    /// The operation digest keyd verified the `cksum` over.
+    pub operation: [u8; OPERATION_DIGEST_LEN],
+}
+
+impl Payload for WireOperationTicket {
+    /// Spec: docs/50 §3.4; Q-523.
+    fn write_fields(&self, writer: &mut Writer) -> Result<()> {
+        writer.write_bytes(&self.crealm, MAX_REPLY_FIELD)?;
+        writer.write_der(&self.cname, MAX_REPLY_FIELD)?;
+        self.authtime.write_fields(writer)?;
+        self.endtime.write_fields(writer)?;
+        write_flags(writer, self.flags)?;
+        writer.write_array(&self.operation)
+    }
+
+    /// Spec: docs/50 §3.4; Q-523.
+    fn read_fields(reader: &mut Reader<'_>) -> Result<WireOperationTicket> {
+        let crealm = read_owned(reader, MAX_REPLY_FIELD)?;
+        let cname = reader.read_der(MAX_REPLY_FIELD)?;
+        let authtime = WireTime::read_fields(reader)?;
+        let endtime = WireTime::read_fields(reader)?;
+        let flags = read_flags(reader)?;
+        let operation = reader.read_array()?;
+        Ok(WireOperationTicket {
+            crealm,
+            cname,
+            authtime,
+            endtime,
+            flags,
+            operation,
         })
     }
 }
@@ -1711,6 +1796,8 @@ pub enum KeydReply {
     SealCeremony,
     /// Spec: docs/52 §4.6.
     ListDestroyDecisions(WireDestructionPage),
+    /// Spec: docs/10 §5ב; docs/questions/Q-523.
+    VerifyOperationTicket(WireOperationTicket),
     /// Spec: docs/10 §9; A-26; A-56.
     AuthnFailure(AuthnError),
     /// Spec: docs/10 §9; A-56.
@@ -1745,6 +1832,7 @@ impl MessageSet for KeydReply {
             KeydReply::RegisterDecision => reply_kind::REGISTER_DECISION,
             KeydReply::SealCeremony => reply_kind::SEAL_CEREMONY,
             KeydReply::ListDestroyDecisions(_) => reply_kind::LIST_DESTROY_DECISIONS,
+            KeydReply::VerifyOperationTicket(_) => reply_kind::VERIFY_OPERATION_TICKET,
             KeydReply::AuthnFailure(_) => reply_kind::AUTHN_FAILURE,
             KeydReply::IssueFailure(_) => reply_kind::ISSUE_FAILURE,
             KeydReply::Failure(_) => reply_kind::FAILURE,
@@ -1771,6 +1859,7 @@ impl MessageSet for KeydReply {
             | KeydReply::RegisterDecision
             | KeydReply::SealCeremony => Ok(()),
             KeydReply::ListDestroyDecisions(m) => m.write_fields(writer),
+            KeydReply::VerifyOperationTicket(m) => m.write_fields(writer),
             KeydReply::DescribeConfig(m) => m.write_fields(writer),
             // Q-466 item 2 (A-102): the caller role, from the table of the
             // `DescribeConfig` reply.
@@ -1818,6 +1907,9 @@ impl MessageSet for KeydReply {
             reply_kind::SEAL_CEREMONY => KeydReply::SealCeremony,
             reply_kind::LIST_DESTROY_DECISIONS => {
                 KeydReply::ListDestroyDecisions(WireDestructionPage::read_fields(reader)?)
+            }
+            reply_kind::VERIFY_OPERATION_TICKET => {
+                KeydReply::VerifyOperationTicket(WireOperationTicket::read_fields(reader)?)
             }
             reply_kind::AUTHN_FAILURE => {
                 KeydReply::AuthnFailure(reader.read_enum(authn_error_from_code)?)

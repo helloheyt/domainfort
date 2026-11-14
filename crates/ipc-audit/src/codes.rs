@@ -209,7 +209,9 @@ code_table! {
     /// A15a (docs/51 §5.8 option (b); docs/questions/Q-450); codes 1-16 keep
     /// their meaning. `RegisterDecision`, `SealCeremony`,
     /// `ListDestroyDecisions` (codes 18-20) were appended by A-102 (docs/52
-    /// R1, R3).
+    /// R1, R3). `VerifyOperationTicket` (code 21) was appended by Q-523 (the
+    /// operation-bound service-ticket verification, which keeps no service
+    /// context); codes 1-20 keep their meaning.
     /// Spec: docs/10 §2-§7; crates/keyd authz.rs; docs/52 §4.
     pub enum KeydOperation {
         VerifyPreauth,
@@ -232,6 +234,7 @@ code_table! {
         RegisterDecision,
         SealCeremony,
         ListDestroyDecisions,
+        VerifyOperationTicket,
     }
 }
 

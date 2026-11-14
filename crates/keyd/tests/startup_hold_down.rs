@@ -140,18 +140,25 @@ fn every_held_operation_refused_at(f: &mut Fixture, tgt: &Tgt, when: KerberosTim
     assert_eq!(r.unwrap_err(), Error::Unavailable);
     assert_held(f, Operation::SealFastError);
 
-    let r = f.keyd.open_and_verify_service_ticket(
+    let r = f
+        .keyd
+        .open_and_verify_service_ticket(&LDAP, &SERVICE.principal, &[0x30, 0x00], &when);
+    assert_eq!(r.unwrap_err(), AuthnError::Unavailable);
+    assert_held(f, Operation::OpenAndVerifyServiceTicket);
+
+    // Q-523: the operation-bound verification shares the replay cache.
+    let r = f.keyd.verify_operation_ticket(
         &LDAP,
         &SERVICE.principal,
-        &keyd::AppBinding::Unbound,
+        &keyd::OperationDigest::new([0x0D; 32]),
         &[0x30, 0x00],
         &when,
     );
     assert_eq!(r.unwrap_err(), AuthnError::Unavailable);
-    assert_held(f, Operation::OpenAndVerifyServiceTicket);
+    assert_held(f, Operation::VerifyOperationTicket);
 
     // Exactly one record per call (I8), and every held operation was called.
-    assert_eq!(f.records().len() - before, 7);
+    assert_eq!(f.records().len() - before, 8);
     for op in Operation::ALL {
         if startup_hold_down_applies(op) {
             assert!(

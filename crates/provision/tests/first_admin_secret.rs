@@ -59,7 +59,8 @@ use ipc_keyd::{
     ClientConfigError, ExpectedPeer, KeydClient, TransportError, Unserved, DEFAULT_DEADLINE,
 };
 use keyd_daemon::startup::development_keyd;
-use keyd_daemon::{CallerMap, ExtraListener, SystemClock};
+use keyd_daemon::test_seams::ExtraListener;
+use keyd_daemon::{CallerMap, SystemClock};
 use keyd_types::{Error as KeydError, Kvno};
 use keyd_types::{KeyHandle, KeyPurpose};
 use krb_proto::Realm;

@@ -110,14 +110,17 @@ protected-file = { path = "../protected-file" }
 admin-password-policy = { path = "../admin-password-policy" }
 
 [dev-dependencies]
+# TESTS ONLY (docs/52 C18, task R15; A-113): the tests open their stores by
+# path (`Store::open`, feature `test-seams`).
+dirstore = { path = "../dirstore", features = ["test-seams"] }
 # The end-to-end checks of the produced files (tests only).
-directory-daemon = { path = "../directory-daemon" }
-kdc-daemon = { path = "../kdc-daemon" }
+directory-daemon = { path = "../directory-daemon", features = ["test-seams"] }
+kdc-daemon = { path = "../kdc-daemon", features = ["test-seams"] }
 ipc-directory-server = { path = "../ipc-directory-server" }
 kdc = { path = "../kdc" }
 keyadm = { path = "../keyadm" }
 keyd = { path = "../keyd" }
-keyd-daemon = { path = "../keyd-daemon" }
+keyd-daemon = { path = "../keyd-daemon", features = ["test-seams"] }
 ipc = { path = "../ipc" }
 ipc-keyd = { path = "../ipc-keyd" }
 ipc-audit = { path = "../ipc-audit", default-features = false, features = ["keyd"] }

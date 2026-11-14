@@ -303,7 +303,10 @@ fn the_socket_directories_are_prepared_by_descriptor() {
 #[test]
 fn parameters_plan_and_configuration_owner() {
     let settings = config::DirdSettings::parse(DIRD.as_bytes()).unwrap();
-    let p = params(&settings).unwrap();
+    // docs/52 C18 (task R15): the product parameters carry only the file's
+    // values; the constants the product `serve` adds are read back through
+    // the test seam's conversion (the one `serve` uses).
+    let p = directory_daemon::test_seams::DaemonParams::from(params(&settings).unwrap());
     assert_eq!(p.kdc_uid, 61003);
     assert_eq!(p.kdc_socket, Path::new("/run/dird/kdc/dird-kdc.sock"));
     assert_eq!(p.audit.uid, 61005);

@@ -105,7 +105,20 @@ protected-file = { path = "../protected-file" }
 # dependency is parse-asn1 — no third-party code.
 parse-x509 = { path = "../parse-x509" }
 
+[features]
+# docs/52 C18 (task R15): the test seams — the module `test_seams` (the full
+# parameters, the generic `serve`) — exist only in a build that asks for them.
+# Only `[dev-dependencies]` enable this feature (cargo's resolver 2 turns a
+# dev-dependency's features on only in builds of test targets), so no product
+# build of the daemon contains a seam; crates/e2e-tests
+# tests/no_test_seams_in_product.rs checks every Cargo.toml and every product
+# source. Never in `default`.
+test-seams = []
+
 [dev-dependencies]
+# TESTS ONLY (docs/52 C18, task R15): this crate's own tests use its test
+# seams (`test_seams`).
+ldap-front = { path = ".", features = ["test-seams"] }
 # TESTS ONLY. Tier 2 runs the real dird (crates/directory-daemon tests/
 # support, reused by `#[path]`) and the real auditd listener and writer
 # (crates/audit-daemon tests/common, reused by `#[path]`), and compares the
@@ -113,7 +126,7 @@ parse-x509 = { path = "../parse-x509" }
 # crate or already in the lock. The client side of the TLS tests is rustls
 # itself (docs/50 §9: "TLS client — rustls itself as client"), with the
 # test's own ECDSA P-256 key generated through aws-lc-rs.
-directory-daemon = { path = "../directory-daemon" }
+directory-daemon = { path = "../directory-daemon", features = ["test-seams"] }
 audit-daemon = { path = "../audit-daemon" }
 audit-log = { path = "../audit-log" }
 ldap = { path = "../ldap" }
@@ -125,7 +138,7 @@ pdp = { path = "../pdp" }
 dtyp = { path = "../dtyp" }
 keyd = { path = "../keyd" }
 keyd-types = { path = "../keyd-types" }
-keyd-daemon = { path = "../keyd-daemon" }
+keyd-daemon = { path = "../keyd-daemon", features = ["test-seams"] }
 ipc-keyd = { path = "../ipc-keyd" }
 ipc-directory = { path = "../ipc-directory" }
 krb-proto = { path = "../krb-proto" }

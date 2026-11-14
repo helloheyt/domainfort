@@ -7,13 +7,12 @@
 //! docs/questions/Q-230 (A-60), Q-235 (A-61).
 
 use crate::audit_link::AuditEndpoint;
-use crate::daemon::{DaemonParams, WORKER_QUEUE_CAPACITY};
+use crate::daemon::DaemonParams;
 use crate::links::{unix_dird, unix_keyd, RootServerUid};
-use crate::rate::{Limits, MAX_CONNECTIONS};
+use crate::rate::MAX_CONNECTIONS;
 use config::AdmindSettings;
 use core::fmt;
 use daemon_sandbox::{HardeningPlan, PlanError, ProcessIdentity};
-use ipc_audit::WindowConfig;
 use protected_file::{ExistingGroup, Refusal, SocketDirectoryError, SocketDirectoryOwner};
 use std::path::Path;
 
@@ -198,9 +197,10 @@ pub fn hardening_plan(settings: &AdmindSettings) -> Result<HardeningPlan, PlanEr
         .build()
 }
 
-/// The serving parameters from admind's configuration, with the daemon's
-/// constants for what the file does not set (Q-230 item 4) and the
-/// production clients of dird and keyd.
+/// The serving parameters from admind's configuration — the one product
+/// constructor (docs/52 C18, task R15) — with the production clients of
+/// dird and keyd. The daemon's constants for what the file does not set
+/// (Q-230 item 4) are added by `serve`.
 ///
 /// # Errors
 /// [`StartupError::ServerUid`].
@@ -225,8 +225,5 @@ pub fn params(settings: &AdmindSettings) -> Result<DaemonParams, StartupError> {
         min_password_length: settings.min_password_length(),
         dird,
         keyd,
-        limits: Limits::DEFAULT,
-        queue_capacity: WORKER_QUEUE_CAPACITY,
-        audit_window: WindowConfig::DEFAULT,
     })
 }

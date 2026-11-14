@@ -76,6 +76,18 @@ where
     }
 }
 
+/// admind's production client of dird: crate ipc-dird-admin's client over
+/// dird's Unix socket. The product parameters hold this concrete type, not
+/// any [`DirdLink`] (docs/52 C18, task R15).
+/// Spec: docs/51 §7.1, §7.5; docs/52 §3.18.
+pub type UnixDird = AdminClient<ipc_dird_admin::UnixConnector>;
+
+/// admind's production client of keyd: crate ipc-keyd's client over keyd's
+/// Unix socket, expecting [`expected_keyd`]. The product parameters hold
+/// this concrete type, not any [`KeydLink`] (docs/52 C18, task R15).
+/// Spec: docs/50 R50-3, §3.6; docs/52 §3.18.
+pub type UnixKeyd = KeydClient<ipc_keyd::UnixConnector>;
+
 /// Why a client could not be built (a server uid of 0 — the configuration
 /// refuses it already).
 /// Spec: docs/50 §3.2 ("uid 0 is never mapped").
@@ -89,13 +101,12 @@ pub struct RootServerUid;
 /// [`RootServerUid`].
 ///
 /// Spec: docs/51 §7.1, §7.5; docs/50 R50-3.
-pub fn unix_dird(socket: &Path, dird_uid: u32) -> Result<Box<dyn DirdLink>, RootServerUid> {
+pub fn unix_dird(socket: &Path, dird_uid: u32) -> Result<UnixDird, RootServerUid> {
     AdminClient::new(
         ipc_dird_admin::UnixConnector::new(socket.to_path_buf()),
         dird_uid,
         ipc_dird_admin::DEFAULT_DEADLINE,
     )
-    .map(|client| Box::new(client) as Box<dyn DirdLink>)
     .map_err(|_| RootServerUid)
 }
 
@@ -125,11 +136,10 @@ pub fn unix_keyd(
     socket: &Path,
     keyd_uid: u32,
     deadline: Duration,
-) -> Result<Box<dyn KeydLink>, RootServerUid> {
-    let client = KeydClient::new(
+) -> Result<UnixKeyd, RootServerUid> {
+    Ok(KeydClient::new(
         ipc_keyd::UnixConnector::new(socket.to_path_buf()),
         expected_keyd(keyd_uid)?,
         deadline,
-    );
-    Ok(Box::new(client))
+    ))
 }

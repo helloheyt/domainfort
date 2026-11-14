@@ -57,18 +57,23 @@ pub mod auditd;
 
 use ad_schema::flags::user_account_control as uac;
 use ad_schema::{phase1, Phase1Schema};
+// The full parameters (any dird / keyd link, the limits) and their serve
+// are admind's test seams; dird's full parameters, any keyd verifier and
+// its generic serve are dird's (docs/52 C18, task R15; feature
+// `test-seams`, enabled by the dev-dependencies).
+use admin_daemon::test_seams::{serve, DaemonParams};
 use admin_daemon::{
-    serve, AuditEndpoint, DaemonControl, DaemonParams, DirdLink, KeydLink, Limits,
-    WORKER_QUEUE_CAPACITY,
+    AuditEndpoint, DaemonControl, DirdLink, KeydLink, Limits, WORKER_QUEUE_CAPACITY,
 };
 use audit_daemon::listener::ListenerConfig;
 use audit_log::Anchor;
 use core::time::Duration;
 use directory_admin::{wall_clock, CHANGE_SEQ_COUNTER, RID_COUNTER, RID_END_EXCLUSIVE, RID_FIRST};
 use directory_daemon::policy::{DevelopmentPolicy, MandatoryFast};
+use directory_daemon::test_seams::{serve_with_admin, AdminParams, VerifierFactory};
 use directory_daemon::{
-    serve_with_admin, AdminParams, Clock, DaemonControl as DirdControl, DecisionAckDeadline,
-    KeydTicketVerifier, SharedClock, StoreSource, TicketVerifier, VerifierFactory,
+    Clock, DaemonControl as DirdControl, DecisionAckDeadline, KeydTicketVerifier, SharedClock,
+    StoreSource, TicketVerifier,
 };
 use dirstore::{AttrId, IntegrityKey, NewObject, NodeId, Origin, Store, WriteTxn};
 use dtyp::{
@@ -80,7 +85,8 @@ use ipc::{FrameReader, Refused};
 use ipc_audit::{AdmindEvent, DirAdminEvent, EventBody, KeydRecord};
 use ipc_dird_admin::Operation;
 use keyd::{InMemoryKeyStore, Keyd, Role};
-use keyd_daemon::{CallerMap, ExtraListener, RecordBuffer};
+use keyd_daemon::test_seams::ExtraListener;
+use keyd_daemon::{CallerMap, RecordBuffer};
 use krb_crypto::ProtocolKey;
 use krb_proto::constants::{DOMAIN_X500_COMPRESS, KRB_NT_PRINCIPAL};
 use krb_proto::{
@@ -1129,7 +1135,7 @@ pub struct DirdRun {
 
 impl DirdRun {
     fn start(
-        params: directory_daemon::DaemonParams,
+        params: directory_daemon::test_seams::DaemonParams,
         admin: AdminParams,
         store: Arc<Store>,
     ) -> DirdRun {
@@ -1144,7 +1150,7 @@ impl DirdRun {
                 let result = runtime.block_on(serve_with_admin(
                     params,
                     Some(admin),
-                    StoreSource::Opened(store),
+                    directory_daemon::test_seams::opened(store),
                     policy(),
                     control,
                 ));

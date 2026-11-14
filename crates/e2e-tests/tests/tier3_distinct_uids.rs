@@ -184,7 +184,7 @@ fn deploy_and_check(base: &Path) -> Result<(), String> {
     };
 
     // 2. keyd: the kdc's uid is its Kdc caller.
-    let keyd_params = keyd_daemon::DaemonParams {
+    let keyd_params = keyd_daemon::test_seams::DaemonParams {
         keyd_socket: keyd_socket.clone(),
         callers: CallerMap::new(&[(KDC_UID, Role::Kdc)]).map_err(|e| e.to_string())?,
         audit: audit(&audit_socket),
@@ -208,7 +208,7 @@ fn deploy_and_check(base: &Path) -> Result<(), String> {
     //    front's; the key and the policy read as root before it starts.
     // (the values of crates/directory-daemon support `params`, every uid
     // its own)
-    let dird_params = directory_daemon::DaemonParams {
+    let dird_params = directory_daemon::test_seams::DaemonParams {
         kdc_socket: dird_kdc_socket.clone(),
         kdc_uid: KDC_UID,
         audit: directory_daemon::AuditEndpoint {
@@ -263,7 +263,7 @@ fn deploy_and_check(base: &Path) -> Result<(), String> {
     // 5. ldap-front.
     let tls_pki = test_pki();
     let tls = server_config(&tls_pki);
-    let front_params = ldap_front::FrontParams {
+    let front_params = ldap_front::test_seams::FrontParams {
         dird: ldap_front::Endpoint {
             socket: dird_ldap_socket,
             uid: DIRD_UID,

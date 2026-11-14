@@ -146,5 +146,14 @@ pub use daemon::{
     serve, DaemonControl, DaemonError, DaemonParams, Stopped, WorkerPanicked, AUDIT_FLUSH_GRACE,
     DRAIN_GRACE, SOCKET_FILE_MODE, WORKER_QUEUE_CAPACITY,
 };
-pub use links::{DirdLink, KeydLink};
+pub use links::{DirdLink, KeydLink, UnixDird, UnixKeyd};
 pub use rate::Limits;
+
+/// The test seams (docs/52 C18, task R15): the full parameters (any dird /
+/// keyd link, the limits, the queue, the window) and their `serve`.
+/// Compiled only with the feature `test-seams`, which only dev-dependencies
+/// enable; no product source names this module (crates/e2e-tests
+/// `tests/no_test_seams_in_product.rs`).
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod test_seams;
