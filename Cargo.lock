@@ -15,6 +15,7 @@ name = "admin-daemon"
 version = "0.0.0"
 dependencies = [
  "ad-schema",
+ "admin-password-policy",
  "audit-daemon",
  "audit-log",
  "config",
@@ -41,6 +42,10 @@ dependencies = [
  "tokio",
  "zeroize",
 ]
+
+[[package]]
+name = "admin-password-policy"
+version = "0.0.0"
 
 [[package]]
 name = "aes"
@@ -808,7 +813,9 @@ name = "provision"
 version = "0.0.0"
 dependencies = [
  "ad-schema",
+ "admin-password-policy",
  "config",
+ "daemon-sandbox",
  "directory-admin",
  "directory-daemon",
  "directory-pip",

@@ -7,8 +7,16 @@
 # development integrity key, the unsigned development policy, every
 # daemon's configuration file and the non-secret manifest — all built in a
 # staging directory on the targets' filesystem and renamed into place with
-# the database last. No password and no Kerberos key exists in this tool
-# (keys are part B of R51-1: `keyadm ceremony` and A6).
+# the database last. `domain` and `policy` hold no password and no Kerberos
+# key (keys are part B of R51-1: `keyadm ceremony` and `first-admin-secret`);
+# no Kerberos key exists anywhere in this tool.
+#
+# Task A6 adds `provision first-admin-secret` (docs/51 §4.3 step 12): root,
+# after `keyadm ceremony`, drops to admind's account (daemon-sandbox) and
+# sets the first administrators' passwords through keyd's `set_secret`
+# (Role::Directory) — passwords from a terminal (no echo, twice) or a strict
+# password file, never argv or env; admind's own password rules (crate
+# admin-password-policy). Its provenance: src/first_admin/mod.rs.
 #
 # Written only from docs/51 (whole; decided A-72), docs/46, docs/47, docs/50,
 # docs/32, the decisions A-15, A-19, A-36, A-60, A-68, A-69, A-72..A-89,
@@ -73,8 +81,25 @@ zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
 # rustix — owner decision P-12 (already in the lock through daemon-sandbox):
 # O_EXCL | O_NOFOLLOW creation, fchmod, fchown, fsync, renameat /
 # renameat_with (RENAME_NOREPLACE), unlinkat, geteuid — through its
-# documented safe API only (docs.rs, P-2).
-rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "process"] }
+# documented safe API only (docs.rs, P-2). Feature `termios` (task A6):
+# `isatty`, `tcgetattr`, `tcsetattr` for the hidden password entry of
+# `first-admin-secret` (a feature of the same crate, no new package).
+rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "process", "termios"] }
+#
+# Task A6 (`provision first-admin-secret`) — workspace crates only, none
+# new from outside, none linking krb-crypto or keyd (D182):
+# keyd's channel, client side: `KeydClient::call_with_fate` (A-90), the
+# peer-uid check before sending (R50-3), `UnixConnector`, `Call::SetSecret`
+# with its zeroizing `Password`.
+ipc-keyd = { path = "../ipc-keyd" }
+# The shared `Refused` reply (A-59), named when an outcome is classified.
+ipc = { path = "../ipc" }
+# The privilege drop to admind's account (identity, no_new_privs,
+# capabilities, core 0, not dumpable, mlockall) with its read-back check.
+daemon-sandbox = { path = "../daemon-sandbox" }
+# admind's password rules ([MS-SAMR] 3.1.1.7.2 as A-79 / Q-401 read them),
+# shared with admin-daemon — the same functions, not a copy.
+admin-password-policy = { path = "../admin-password-policy" }
 
 [dev-dependencies]
 # The end-to-end checks of the produced files (tests only).

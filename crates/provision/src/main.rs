@@ -8,14 +8,26 @@
 //! nothing was written; 2 — stopped after writing (the message names what
 //! was left, module `install`).
 //!
-//! Spec: docs/51 §4.3 step 9 ("print a summary (without any secret)"),
-//! §4.4, §5.10; docs/50 §8.2; A-69; A-80.
+//! `first-admin-secret` (task A6) prints handles, bindings and kvnos only,
+//! never a password (module `provision::first_admin`); its exit status is 0
+//! — every password set; 1 — nothing was sent; 2 — stopped after a
+//! `set_secret` was attempted. The process's `SingleThreadProof` is claimed
+//! as the first statement of `main` (daemon-sandbox, R50-14) and used only
+//! by that command's privilege drop.
+//!
+//! Spec: docs/51 §4.3 steps 9, 12 ("print a summary (without any secret)"),
+//! §4.4, §5.10; docs/50 R50-14, §8.2; A-69; A-80.
 
 use std::io::Write;
 use std::process::ExitCode;
 
+use daemon_sandbox::{SingleThreadProof, ThreadGuardError};
 use directory_admin::OsRandom;
 use provision::cli::{self, Command};
+use provision::first_admin::keyd::UnixKeyd;
+use provision::first_admin::privilege::SandboxDrop;
+use provision::first_admin::terminal::StdinTerminal;
+use provision::first_admin::{execute, Environment, FirstAdminSecret};
 use provision::install::InstallState;
 use provision::update::{update_policy, RESTART_NOTICE};
 use provision::{provision_domain, Progress, RootOwnership, Step};
@@ -128,11 +140,55 @@ fn policy(path: &provision::FilePath, changes: &[provision::policy::TierChange])
     }
 }
 
+/// `provision first-admin-secret`: refuse unless root (the drop needs it),
+/// then run with the production drop, terminal and keyd access; the files
+/// it reads must be owned by root (uid 0), the password files by the
+/// running uid (root).
+/// Spec: docs/51 §4.3 step 12, §4.4; module `provision::first_admin`.
+fn first_admin_secret(
+    request: &FirstAdminSecret,
+    proof: Result<SingleThreadProof, ThreadGuardError>,
+) -> ExitCode {
+    let proof = match proof {
+        Ok(proof) => proof,
+        Err(e) => {
+            complain("first-admin-secret", &e);
+            return ExitCode::from(EXIT_REFUSED);
+        }
+    };
+    let mut privilege = match SandboxDrop::new(proof) {
+        Ok(drop) => drop,
+        Err(e) => {
+            complain("identity", &e);
+            return ExitCode::from(EXIT_REFUSED);
+        }
+    };
+    let mut terminal = StdinTerminal::new();
+    let mut keyd = UnixKeyd::new();
+    let mut env = Environment {
+        privilege: &mut privilege,
+        terminal: &mut terminal,
+        keyd: &mut keyd,
+        root_uid: 0,
+        running_uid: 0,
+    };
+    let code = execute(
+        request,
+        &mut env,
+        &mut std::io::stdout().lock(),
+        &mut std::io::stderr().lock(),
+    );
+    ExitCode::from(code)
+}
+
 fn main() -> ExitCode {
+    // First statement: the process has exactly one thread (R50-14).
+    let proof = SingleThreadProof::claim();
     install_panic_hook();
     match cli::parse(std::env::args_os().skip(1)) {
         Ok(Command::Domain(input)) => domain(&input),
         Ok(Command::Policy { path, changes }) => policy(&path, &changes),
+        Ok(Command::FirstAdminSecret(request)) => first_admin_secret(&request, proof),
         Err(e) => {
             complain("arguments", &e);
             ExitCode::from(EXIT_REFUSED)

@@ -65,6 +65,10 @@ krb-proto = { path = "../krb-proto" }
 dtyp = { path = "../dtyp" }
 # admind's configuration file.
 config = { path = "../config" }
+# The password rules of [MS-SAMR] 3.1.1.7.2 (module `password` re-exports
+# them), shared with `provision first-admin-secret` (task A6). A leaf crate
+# with no dependency.
+admin-password-policy = { path = "../admin-password-policy" }
 # The hardening plan (identity drop, no_new_privs, capabilities, core 0,
 # not dumpable, umask, mlockall).
 daemon-sandbox = { path = "../daemon-sandbox" }

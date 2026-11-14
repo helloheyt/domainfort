@@ -30,8 +30,22 @@
 //!    last — and remove the staging directory (module [`install`], with
 //!    the crash analysis).
 //!
-//! Part B (the online key ceremony) is `keyadm ceremony` (task A5) and
-//! `provision first-admin-secret` (task A6) — not in this crate.
+//! Part B (the online key ceremony) is `keyadm ceremony` (task A5, crate
+//! keyadm) and `provision first-admin-secret` (task A6, below).
+//!
+//! # `provision first-admin-secret` — docs/51 §4.3 step 12 (task A6)
+//!
+//! Module [`first_admin`]: root, after `keyadm ceremony`, keyd up, dird not
+//! required. Reads the manifest and admind's configuration as root, opens
+//! the password files (or uses the terminal: no echo, entered twice), drops
+//! to admind's account through daemon-sandbox (Role::Directory in keyd;
+//! not dumpable, memory locked), checks every password by admind's own
+//! rules (crate admin-password-policy), then calls keyd's `set_secret` for
+//! each first administrator with `call_with_fate` and prints handles,
+//! bindings and kvnos. The drop is behind [`first_admin::privilege::
+//! PrivilegeDrop`] (as the installer's [`Ownership`]); the binary uses
+//! [`first_admin::privilege::SandboxDrop`], which refuses to exist unless
+//! the effective uid is 0.
 //!
 //! # `provision policy` — the offline tier-map edit (R51-21, A-80)
 //!
@@ -52,7 +66,9 @@
 //!
 //! `#![forbid(unsafe_code)]`; no `unwrap`, `expect` or `panic!` outside
 //! tests. The integrity key lives in zeroizing buffers, is written only to
-//! its 0400 file, and never appears in a message or a `Debug` output. Every
+//! its 0400 file, and never appears in a message or a `Debug` output; so do
+//! the first administrators' passwords of `first-admin-secret`, which are
+//! never written anywhere (they go to keyd only). Every
 //! file is created exclusively without following links (O_EXCL |
 //! O_NOFOLLOW) and renamed without replacing (RENAME_NOREPLACE); nothing
 //! existing is ever overwritten (no `--force`). This crate does not link
@@ -91,11 +107,14 @@
 //! P-2). No other implementation and no existing provisioning tool was
 //! consulted or recalled (AGENTS.md §1-3).
 //!
-//! Interpretations and gaps: docs/questions/Q-375 … Q-379.
+//! Interpretations and gaps: docs/questions/Q-375 … Q-379; for
+//! `first-admin-secret` (task A6): Q-410 … Q-414 — that module's own
+//! provenance is in its documentation.
 
 pub mod cli;
 pub mod configs;
 mod descriptor;
+pub mod first_admin;
 mod fs;
 mod ids;
 pub mod input;

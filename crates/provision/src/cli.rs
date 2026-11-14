@@ -28,20 +28,30 @@
 //!             | --remove-principal <SID>
 //!             | --add-subtree <Tier0|Tier1|Tier2> <att=value> [<att=value> …]
 //!             | --remove-subtree <att=value> [<att=value> …]
+//!
+//! provision first-admin-secret --manifest-path <path> --admind-config <path> \
+//!     [--password-file <sAMAccountName>=<path> …]
 //! ```
 //!
 //! Every value is explicit: there is no default path, name, account or
 //! address, no environment variable and no input file. **No secret is ever
 //! an argument** (docs/21 D95 as cited in docs/51 §3: "secrets never in
-//! argv/env") — this tool takes none: no password, no key. Every flag of
-//! `domain` but the repeatable ones appears at most once; an unknown flag,
-//! a missing value or a value that starts with `--` is a usage error. A
-//! subtree's DN is given as its RDN components, leaf first, one argument
-//! each (an RDN value may hold a comma; an `att=value` component never
-//! starts with `-`).
+//! argv/env") — `domain` and `policy` take none, and `first-admin-secret`
+//! takes the first administrators' passwords only from a terminal (echo
+//! off, entered twice) or from a password **file** named by its path
+//! (docs/51 §4.4; module crate::first_admin). Every flag of `domain` and
+//! `first-admin-secret` but the repeatable ones appears at most once; an
+//! unknown flag, a missing value or a value that starts with `--` is a
+//! usage error. A subtree's DN is given as its RDN components, leaf first,
+//! one argument each (an RDN value may hold a comma; an `att=value`
+//! component never starts with `-`). A `--password-file` value is the
+//! sAMAccountName, `=`, and the file's absolute path; the name is matched
+//! against the manifest when the command runs (one file for every first
+//! administrator, or none).
 //!
-//! Spec: docs/51 §4.3 (the input), §5.10 (`provision policy`), §3 (D95);
-//! docs/50 §7.1 (numeric ids, no NSS); A-80; P-22.
+//! Spec: docs/51 §4.3 (the input; step 12), §4.4 (the password source),
+//! §5.10 (`provision policy`), §3 (D95); docs/50 §7.1 (numeric ids, no
+//! NSS); A-80; P-22; docs/questions/Q-411.
 
 use core::fmt;
 use std::collections::BTreeMap;
@@ -50,6 +60,7 @@ use std::ffi::OsString;
 use dtyp::Sid;
 use pdp::{Dn, Tier};
 
+use crate::first_admin::{FirstAdminSecret, PasswordFileArg};
 use crate::input::{
     Account, Accounts, DomainInput, FilePath, InputError, InputErrorKind, Names, Network, Paths,
 };
@@ -75,6 +86,8 @@ pub enum Command {
         /// The edits, in order.
         changes: Vec<TierChange>,
     },
+    /// `provision first-admin-secret …`.
+    FirstAdminSecret(FirstAdminSecret),
 }
 
 /// A command-line error. Fixed text; a flag name at most.
@@ -189,7 +202,12 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Command, CliEr
             parse_domain(rest).map(|input| Command::Domain(Box::new(input)))
         }
         Some((command, rest)) if command == "policy" => parse_policy(rest),
-        _ => Err(CliError::Usage("provision domain … | provision policy …")),
+        Some((command, rest)) if command == "first-admin-secret" => {
+            parse_first_admin_secret(rest).map(Command::FirstAdminSecret)
+        }
+        _ => Err(CliError::Usage(
+            "provision domain … | provision policy … | provision first-admin-secret …",
+        )),
     }
 }
 
@@ -429,4 +447,59 @@ fn parse_policy(args: &[String]) -> Result<Command, CliError> {
         return Err(CliError::Usage("at least one change is required"));
     }
     Ok(Command::Policy { path, changes })
+}
+
+/// `--password-file <sAMAccountName>=<path>`: split at the first `=`; the
+/// name is not empty (it is matched against the manifest when the command
+/// runs), the path is a [`FilePath`].
+/// Spec: docs/51 §4.4 (source (b)); module documentation.
+fn password_file_arg(text: &str) -> Result<PasswordFileArg, CliError> {
+    let (sam, path) = text
+        .split_once('=')
+        .filter(|(sam, _)| !sam.is_empty())
+        .ok_or(CliError::Usage(
+            "--password-file takes <sAMAccountName>=<path>",
+        ))?;
+    let path = FilePath::parse(path).map_err(|kind| {
+        CliError::Input(InputError {
+            field: "password-file",
+            kind,
+        })
+    })?;
+    Ok(PasswordFileArg {
+        sam: sam.to_owned(),
+        path,
+    })
+}
+
+/// `provision first-admin-secret …`.
+/// Spec: docs/51 §4.3 step 12, §4.4; module documentation.
+fn parse_first_admin_secret(args: &[String]) -> Result<FirstAdminSecret, CliError> {
+    let mut rest = args.iter().peekable();
+    let mut manifest = None;
+    let mut admind_config = None;
+    let mut password_files = Vec::new();
+    while let Some(flag) = rest.next() {
+        let (slot, field) = match flag.as_str() {
+            "--manifest-path" => (&mut manifest, "manifest-path"),
+            "--admind-config" => (&mut admind_config, "admind-config"),
+            "--password-file" => {
+                password_files.push(password_file_arg(value(&mut rest)?)?);
+                continue;
+            }
+            _ => return Err(CliError::Usage("unknown flag")),
+        };
+        if slot.is_some() {
+            return Err(CliError::Usage("a flag appears twice"));
+        }
+        *slot = Some(
+            FilePath::parse(value(&mut rest)?)
+                .map_err(|kind| CliError::Input(InputError { field, kind }))?,
+        );
+    }
+    Ok(FirstAdminSecret {
+        manifest: manifest.ok_or(CliError::Usage("--manifest-path is required"))?,
+        admind_config: admind_config.ok_or(CliError::Usage("--admind-config is required"))?,
+        password_files,
+    })
 }
