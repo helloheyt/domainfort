@@ -1,9 +1,16 @@
-//! The protected-file reader: the three steps, the bound, the
+//! The protected-file reader: the file's three steps, the bound, the
 //! configuration-file rule, and — the point of task F7 — a symbolic link to
-//! a file that would be accepted is refused.
+//! a file that would be accepted is refused. (The directories on the path:
+//! tests/directories.rs.)
 //!
 //! The tests run as an ordinary account, so the expected owner is the
 //! test's own uid (the readers take it as a parameter; root in production).
+//! Their files live inside the workspace (crates/test-scratch, Q-480): the
+//! walk from `/` accepts those directories, the test account's or root's and
+//! not writable by others, with the test account as the expected owner.
+//! With another expected owner it does not: "wrong owner" is then the
+//! scratch directory's break, which a configuration-file reader reports as
+//! the same `WrongOwner`.
 //!
 //! Sources: docs/50 §7.1 ("file root:0644"); docs/51 §4.3 step 8; A-86,
 //! A-96 (O_NOFOLLOW in every reader); AGENTS.md §6 (bounded reads). Test-only;
@@ -17,17 +24,16 @@ use protected_file::{
     configuration_file_rule, open, read_configuration_file, read_to_bound, FileFacts, OpenError,
     ReadError, Refusal, RuleBreak, GROUP_OR_OTHER_WRITE, PERMISSION_BITS,
 };
+use test_scratch::ScratchDir;
 
-/// A scratch directory, removed at the end of the test.
-struct Scratch(PathBuf);
+/// A scratch directory inside the workspace (crates/test-scratch), removed
+/// at the end of the test.
+struct Scratch(PathBuf, #[allow(dead_code)] ScratchDir);
 
 impl Scratch {
     fn new(tag: &str) -> Scratch {
-        let path =
-            std::env::temp_dir().join(format!("protected-file-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).unwrap();
-        Scratch(path)
+        let dir = ScratchDir::new(&format!("pf-{tag}")).unwrap();
+        Scratch(dir.path().to_path_buf(), dir)
     }
 
     /// A file named `name` with `content` and permission bits `mode`.
@@ -43,12 +49,6 @@ impl Scratch {
         let path = self.0.join(name);
         std::os::unix::fs::symlink(target, &path).unwrap();
         path
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -152,7 +152,7 @@ fn the_bound_is_enforced() {
         read_configuration_file(&over, uid, BOUND),
         Err(Refusal::TooLarge)
     );
-    let file = open(&over, |_| Ok::<(), ()>(())).unwrap();
+    let file = open(&over, uid, |_| Ok::<(), ()>(())).unwrap();
     assert_eq!(read_to_bound(file, BOUND), Err(ReadError::TooLarge));
 }
 
@@ -183,21 +183,21 @@ fn a_caller_rule_sees_the_facts() {
         }
     };
     let key = dir.file("key", &[7u8; 32], 0o400);
-    let file = open(&key, key_rule).unwrap();
+    let file = open(&key, uid, key_rule).unwrap();
     assert_eq!(read_to_bound(file, 32).unwrap(), [7u8; 32]);
     let loose = dir.file("loose", &[7u8; 32], 0o600);
     assert_eq!(
-        open(&loose, key_rule).err(),
+        open(&loose, uid, key_rule).err(),
         Some(OpenError::Refused("refused"))
     );
     let link = dir.link("key-link", &key);
     assert_eq!(
-        open(&link, key_rule).err(),
+        open(&link, uid, key_rule).err(),
         Some(OpenError::Refused("refused"))
     );
     // The facts a rule sees for a link are a link's, never its target's.
     let seen = std::cell::RefCell::new(Vec::new());
-    let _ = open(&link, |facts: &FileFacts| {
+    let _ = open(&link, uid, |facts: &FileFacts| {
         seen.borrow_mut().push(*facts);
         Err::<(), ()>(())
     });

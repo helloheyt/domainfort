@@ -40,6 +40,7 @@ dependencies = [
  "pdp",
  "protected-file",
  "provision-manifest",
+ "test-scratch",
  "tokio",
  "zeroize",
 ]
@@ -70,6 +71,7 @@ dependencies = [
  "ipc",
  "ipc-audit",
  "protected-file",
+ "test-scratch",
  "tokio",
 ]
 
@@ -271,6 +273,7 @@ dependencies = [
  "policy-store",
  "protected-file",
  "provision-manifest",
+ "test-scratch",
  "tokio",
  "zeroize",
 ]
@@ -351,6 +354,7 @@ dependencies = [
  "provision-manifest",
  "rustix",
  "rustls",
+ "test-scratch",
  "tokio",
  "zeroize",
 ]
@@ -606,6 +610,7 @@ dependencies = [
  "pdp",
  "policy-store",
  "protected-file",
+ "test-scratch",
  "tokio",
  "zeroize",
 ]
@@ -640,6 +645,7 @@ dependencies = [
  "pdp",
  "protected-file",
  "provision-manifest",
+ "test-scratch",
  "tokio",
  "zeroize",
 ]
@@ -674,6 +680,7 @@ dependencies = [
  "krb-proto",
  "pdp",
  "protected-file",
+ "test-scratch",
  "tokio",
  "zeroize",
 ]
@@ -751,6 +758,7 @@ dependencies = [
  "pdp",
  "protected-file",
  "rustls",
+ "test-scratch",
  "tokio",
  "zeroize",
 ]
@@ -836,6 +844,7 @@ dependencies = [
  "ipc",
  "pdp",
  "protected-file",
+ "test-scratch",
 ]
 
 [[package]]
@@ -843,6 +852,7 @@ name = "protected-file"
 version = "0.0.0"
 dependencies = [
  "rustix",
+ "test-scratch",
 ]
 
 [[package]]
@@ -874,6 +884,7 @@ dependencies = [
  "protected-file",
  "provision-manifest",
  "rustix",
+ "test-scratch",
  "tokio",
  "zeroize",
 ]
@@ -887,6 +898,7 @@ dependencies = [
  "keyd-types",
  "krb-proto",
  "protected-file",
+ "test-scratch",
 ]
 
 [[package]]
@@ -1009,6 +1021,10 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "test-scratch"
+version = "0.0.0"
 
 [[package]]
 name = "tokio"

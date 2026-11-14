@@ -195,8 +195,10 @@ fn unprivileged_apply_fails_closed() -> Outcome {
 /// process; the runtime builds and a thread starts.
 fn root_dird_plan_applies_then_key_is_unreadable() -> Outcome {
     let proof = SingleThreadProof::claim().map_err(|e| e.to_string())?;
-    let key_dir = env::temp_dir().join(format!("dird-t3-key-{}", std::process::id()));
-    std::fs::create_dir_all(&key_dir).map_err(|e| e.to_string())?;
+    // Inside the workspace (crates/test-scratch, Q-480): the protected-file
+    // walk from `/` must accept every directory for root's expectation — so
+    // the checkout must be root's (P-27).
+    let key_dir = test_scratch::ScratchDir::new("dird-t3-key").map_err(|e| e.to_string())?;
     let key_path = key_dir.join("integrity.key");
     std::fs::write(&key_path, [0x5D; 32]).map_err(|e| e.to_string())?;
     std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o400))

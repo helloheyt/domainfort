@@ -92,6 +92,10 @@ krb-crypto = { path = "../krb-crypto" }
 # the chain they wrote. Workspace crates — no third-party code.
 audit-daemon = { path = "../audit-daemon" }
 audit-log = { path = "../audit-log" }
+# The scratch directories, inside the workspace, of the tests whose files a
+# crates/protected-file reader opens — the walk from `/` accepts them (task
+# T; docs/questions/Q-480). Dev-only, no dependency.
+test-scratch = { path = "../test-scratch" }
 
 # Tier 3 (docs/50 R50-19): the hardening drop runs in a fresh child process of
 # a binary with its own `main`, as crates/daemon-sandbox does.

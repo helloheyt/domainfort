@@ -94,6 +94,10 @@ tokio = { version = "1.54.1", default-features = false, features = ["rt", "net",
 rustls = { version = "0.23.46", default-features = false, features = ["std", "aws_lc_rs"] }
 aws-lc-rs = { version = "1.19.0", default-features = false, features = ["non-fips"] }
 zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
+# The scratch directories, inside the workspace, of the tests whose files a
+# crates/protected-file reader opens — the walk from `/` accepts them (task
+# T; docs/questions/Q-480). Dev-only, no dependency.
+test-scratch = { path = "../test-scratch" }
 
 # rustix (owner decision P-12; already in the lock through daemon-sandbox,
 # ipc-keyd and ipc-directory): only the tier-3 test, which sets the

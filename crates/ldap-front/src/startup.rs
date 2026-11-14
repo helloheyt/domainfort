@@ -140,24 +140,37 @@ impl fmt::Display for StartupError {
 impl std::error::Error for StartupError {}
 
 /// Open the protected file at `path` through crates/protected-file (task F7,
-/// A-86 follow-up): the path is inspected without following a symbolic
-/// link, opened with O_NOFOLLOW, and `accepted` applied to the facts of the
-/// path and of the opened descriptor. A link (whose facts are never a
-/// regular file's) or a file `accepted` refuses is `refused`; a failure to
-/// inspect or open is `unreadable`.
-/// Spec: docs/50 §7.1, R50-12, §5.3; A-86.
+/// A-86 follow-up; task T, Q-468): every directory on the path is walked
+/// from `/` without following a link and must be root's or `owner`'s and
+/// not writable by group or others; the file is inspected without following
+/// a symbolic link, opened with O_NOFOLLOW, and `accepted` applied to the
+/// facts of the file and of the opened descriptor. A link (whose facts are
+/// never a regular file's), a directory breaking that rule or a file
+/// `accepted` refuses is `refused`; a failure to inspect or open is
+/// `unreadable`.
+/// Spec: docs/50 §7.1, R50-12, §5.3; A-86; Q-468 (A-102).
 fn open_protected(
     path: &Path,
+    owner: u32,
     accepted: impl Fn(&FileFacts) -> bool,
     unreadable: StartupError,
     refused: StartupError,
 ) -> Result<File, StartupError> {
-    protected_file::open(path, |facts| if accepted(facts) { Ok(()) } else { Err(()) }).map_err(
-        |error| match error {
-            OpenError::Io(_) => unreadable,
-            OpenError::Refused(()) => refused,
+    protected_file::open(
+        path,
+        owner,
+        |facts| {
+            if accepted(facts) {
+                Ok(())
+            } else {
+                Err(())
+            }
         },
     )
+    .map_err(|error| match error {
+        OpenError::Io(_) => unreadable,
+        OpenError::Path(_) | OpenError::Refused(()) => refused,
+    })
 }
 
 /// Read at most `bound` octets of `file` into `buffer`, which must be
@@ -199,6 +212,7 @@ fn read_bounded(mut file: File, bound: usize, buffer: &mut Vec<u8>) -> Result<()
 pub fn read_settings(path: &Path, owner: u32) -> Result<LdapFrontSettings, StartupError> {
     let file = open_protected(
         path,
+        owner,
         |facts| configuration_file_rule(facts, owner).is_ok(),
         StartupError::ConfigUnreadable,
         StartupError::ConfigPermissions,
@@ -225,6 +239,7 @@ pub fn read_settings(path: &Path, owner: u32) -> Result<LdapFrontSettings, Start
 pub fn read_certificate(path: &Path, owner: u32) -> Result<Vec<u8>, StartupError> {
     let file = open_protected(
         path,
+        owner,
         |facts| configuration_file_rule(facts, owner).is_ok(),
         StartupError::CertificateUnreadable,
         StartupError::CertificatePermissions,
@@ -251,6 +266,7 @@ pub fn read_certificate(path: &Path, owner: u32) -> Result<Vec<u8>, StartupError
 pub fn read_private_key(path: &Path, owner: u32) -> Result<Zeroizing<Vec<u8>>, StartupError> {
     let file = open_protected(
         path,
+        owner,
         |facts| {
             facts.regular_file
                 && facts.owner_uid == owner

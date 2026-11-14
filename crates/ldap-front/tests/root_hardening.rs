@@ -186,9 +186,11 @@ fn unprivileged_apply_fails_closed() -> Outcome {
 /// the socket still usable, and the runtime takes it.
 fn root_front_plan_applies_after_key_and_bind() -> Outcome {
     let proof = SingleThreadProof::claim().map_err(|e| e.to_string())?;
-    let root_dir = env::temp_dir().join(format!("lfront-t3-root-{}", std::process::id()));
-    std::fs::create_dir_all(&root_dir).map_err(|e| e.to_string())?;
-    std::fs::set_permissions(&root_dir, std::fs::Permissions::from_mode(0o755))
+    // Inside the workspace (crates/test-scratch, Q-480): the protected-file
+    // walk from `/` must accept every directory for root's expectation — so
+    // the checkout must be root's (P-27).
+    let root_dir = test_scratch::ScratchDir::new("lfront-t3-root").map_err(|e| e.to_string())?;
+    std::fs::set_permissions(root_dir.path(), std::fs::Permissions::from_mode(0o755))
         .map_err(|e| e.to_string())?;
     let key_path = root_dir.join("dc-key.der");
     std::fs::write(&key_path, [0x5Au8; 64]).map_err(|e| e.to_string())?;

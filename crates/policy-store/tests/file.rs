@@ -15,25 +15,17 @@ use common::sample_policy;
 use policy_store::{read_file, LoadError, PolicyError, MARKER, MAX_POLICY_FILE};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use test_scratch::ScratchDir;
 
-/// A unique temporary directory (0700), removed on drop.
-struct TempDir(PathBuf);
+/// A unique scratch directory (0700) inside the workspace (crates/
+/// test-scratch: the protected-file walk from `/` accepts it; Q-480),
+/// removed on drop.
+struct TempDir(PathBuf, #[allow(dead_code)] ScratchDir);
 
 impl TempDir {
     fn new(tag: &str) -> TempDir {
-        let path = std::env::temp_dir().join(format!("pst{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&path)
-            .unwrap();
-        TempDir(path)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let dir = ScratchDir::new(&format!("pst-{tag}")).unwrap();
+        TempDir(dir.path().to_path_buf(), dir)
     }
 }
 
@@ -98,4 +90,31 @@ fn a_symbolic_link_to_a_valid_policy_file_is_refused() {
     let link = dir.0.join("link.store");
     std::os::unix::fs::symlink(&path, &link).unwrap();
     assert_eq!(read_file(&link, uid).err(), Some(LoadError::Permissions));
+}
+
+/// Task T (docs/52 R11; Q-468 options 1, 2(b), A-102): every directory on
+/// the policy file's path is checked — a symbolic link in a directory
+/// component, or a directory writable by group or others, is refused as
+/// `Permissions`; the file through real, unwritable directories is read.
+#[test]
+fn a_link_or_a_writable_directory_on_the_path_is_refused() {
+    let dir = TempDir::new("dirs");
+    let uid = std::fs::metadata(&dir.0).unwrap().uid();
+    let real = dir.0.join("real");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&real)
+        .unwrap();
+    let path = real.join("policy.store");
+    write(&path, &sample_policy().encode().unwrap(), 0o644);
+    assert_eq!(read_file(&path, uid).unwrap(), sample_policy());
+    std::os::unix::fs::symlink(&real, dir.0.join("via")).unwrap();
+    assert_eq!(
+        read_file(&dir.0.join("via/policy.store"), uid).err(),
+        Some(LoadError::Permissions)
+    );
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o707)).unwrap();
+    assert_eq!(read_file(&path, uid).err(), Some(LoadError::Permissions));
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(read_file(&path, uid).unwrap(), sample_policy());
 }

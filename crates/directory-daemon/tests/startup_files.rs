@@ -35,6 +35,10 @@ use pdp::{Dn, PolicyVersion, RuleId, Tier};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use support::TempDir;
+// The files the tests read through crates/protected-file live in a scratch
+// directory the walk from `/` accepts (crates/test-scratch, Q-480); sockets
+// stay in `TempDir`.
+use test_scratch::ScratchDir;
 
 fn sid(rid: u32) -> Sid {
     Sid::new(SECURITY_NT_AUTHORITY, &[21, 7, 8, 9, rid]).unwrap()
@@ -99,8 +103,8 @@ fn the_shared_policy_gives_dird_its_tier_map() {
 /// no longer starts dird; it must be re-encoded as format 2.
 #[test]
 fn a_format_1_policy_file_is_refused_at_load() {
-    let dir = TempDir::new();
-    let uid = support::my_uid(&dir);
+    let dir = ScratchDir::new("dird-startup").unwrap();
+    let uid = dir.uid().unwrap();
     let mut v1 = MARKER.to_vec();
     v1.push(SUPERSEDED_FORMAT);
     v1.extend_from_slice(&1u64.to_be_bytes());
@@ -121,8 +125,8 @@ fn a_format_1_policy_file_is_refused_at_load() {
 /// (`Tamper`, docs/50 §7.5 step 3).
 #[test]
 fn the_integrity_key_file_is_checked_and_opens_its_store() {
-    let dir = TempDir::new();
-    let uid = support::my_uid(&dir);
+    let dir = ScratchDir::new("dird-startup").unwrap();
+    let uid = dir.uid().unwrap();
     let key_path = dir.join("integrity.key");
     write(&key_path, &support::TEST_KEY, 0o400);
     let store_path = dir.join("s.redb");
@@ -145,7 +149,7 @@ fn the_integrity_key_file_is_checked_and_opens_its_store() {
         Some(StartupError::KeyPermissions)
     );
     for mode in [0o600, 0o440, 0o404, 0o500, 0o4400] {
-        let path = dir.join(&format!("k{mode:o}"));
+        let path = dir.join(format!("k{mode:o}"));
         write(&path, &support::TEST_KEY, 0o600);
         // set_permissions may refuse the set-uid bit for a non-root user:
         // the mode actually set is what is checked.
@@ -157,7 +161,7 @@ fn the_integrity_key_file_is_checked_and_opens_its_store() {
         );
     }
     for length in [0usize, 31, 33, 64] {
-        let path = dir.join(&format!("len{length}"));
+        let path = dir.join(format!("len{length}"));
         write(&path, &vec![0x5D; length], 0o400);
         assert_eq!(
             read_integrity_key(&path, uid).err(),
@@ -185,8 +189,8 @@ fn the_integrity_key_file_is_checked_and_opens_its_store() {
 /// writable by group or others; absent is refused.
 #[test]
 fn the_policy_file_is_checked_and_absent_is_refused() {
-    let dir = TempDir::new();
-    let uid = support::my_uid(&dir);
+    let dir = ScratchDir::new("dird-startup").unwrap();
+    let uid = dir.uid().unwrap();
     let path = dir.join("policy.store");
     let file = sample_policy().encode().unwrap();
     write(&path, &file, 0o644);
@@ -303,8 +307,8 @@ fn parameters_plan_and_configuration_owner() {
 /// in crates/provision-manifest tests/no_follow.rs.)
 #[test]
 fn a_symbolic_link_to_a_valid_configuration_or_policy_is_refused() {
-    let dir = TempDir::new();
-    let uid = support::my_uid(&dir);
+    let dir = ScratchDir::new("dird-startup").unwrap();
+    let uid = dir.uid().unwrap();
     let config = dir.join("dird.conf");
     write(&config, DIRD.as_bytes(), 0o644);
     assert!(read_settings_owned_by(&config, uid).is_ok());
@@ -326,5 +330,60 @@ fn a_symbolic_link_to_a_valid_configuration_or_policy_is_refused() {
     assert_eq!(
         read_policy(&policy_link, uid).err(),
         Some(StartupError::PolicyPermissions)
+    );
+}
+
+/// Task T (docs/52 R11; Q-468 options 1, 2(b), A-102): every directory on
+/// the path of dird's configuration, policy and integrity key is checked —
+/// a symbolic link in a directory component, or a directory writable by
+/// group or others, is refused as that file's permissions error; the three
+/// files through real, unwritable directories are read, and another
+/// expected owner refuses the test account's directory.
+#[test]
+fn a_link_or_a_writable_directory_on_the_path_is_refused() {
+    let dir = ScratchDir::new("dird-startup").unwrap();
+    let uid = dir.uid().unwrap();
+    let real = dir.join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let config = real.join("dird.conf");
+    write(&config, DIRD.as_bytes(), 0o644);
+    let policy = real.join("policy.store");
+    write(&policy, &sample_policy().encode().unwrap(), 0o644);
+    let key = real.join("integrity.key");
+    write(&key, &support::TEST_KEY, 0o400);
+    assert!(read_settings_owned_by(&config, uid).is_ok());
+    assert_eq!(read_policy(&policy, uid).unwrap(), sample_policy());
+    assert!(read_integrity_key(&key, uid).is_ok());
+    let via = dir.join("via");
+    std::os::unix::fs::symlink(&real, &via).unwrap();
+    assert_eq!(
+        read_settings_owned_by(&via.join("dird.conf"), uid).err(),
+        Some(StartupError::ConfigPermissions)
+    );
+    assert_eq!(
+        read_policy(&via.join("policy.store"), uid).err(),
+        Some(StartupError::PolicyPermissions)
+    );
+    assert_eq!(
+        read_integrity_key(&via.join("integrity.key"), uid).err(),
+        Some(StartupError::KeyPermissions)
+    );
+    assert_eq!(
+        read_integrity_key(&key, uid + 1).err(),
+        Some(StartupError::KeyPermissions)
+    );
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o730)).unwrap();
+    assert_eq!(
+        read_settings_owned_by(&config, uid).err(),
+        Some(StartupError::ConfigPermissions)
+    );
+    assert_eq!(
+        read_policy(&policy, uid).err(),
+        Some(StartupError::PolicyPermissions)
+    );
+    assert_eq!(
+        read_integrity_key(&key, uid).err(),
+        Some(StartupError::KeyPermissions)
     );
 }

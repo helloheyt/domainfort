@@ -8,6 +8,9 @@
 crates/*/fuzz/Cargo.lock
 
 
+# ספריות-עבודה של בדיקות שקוראות דרך protected-file (crates/test-scratch; Q-480)
+/.test-scratch/
+
 # ספריית מפרטים — הקבצים שהורדו נשמרים מקומית; המניפסט (עם ה-sha256) כן ב-track.
 /tools/spec-pin/cache/
 

@@ -348,10 +348,13 @@ impl Drop for Front {
     }
 }
 
-/// Where everything lives, inside the one temporary directory (0700). The
-/// socket names are the daemons' tier-2 supports' (crates/keyd-daemon
-/// `params`, crates/directory-daemon `params`), so every sender reaches the
-/// one `a.sock`.
+/// Where everything lives, inside the one temporary directory (0700) —
+/// except the integrity key and the policy, which the daemons read through
+/// crates/protected-file and so live in [`Harness::files`] (crates/
+/// test-scratch: a directory the walk from `/` accepts; Q-480). The socket
+/// names are the daemons' tier-2 supports' (crates/keyd-daemon `params`,
+/// crates/directory-daemon `params`), so every sender reaches the one
+/// `a.sock`.
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub audit_socket: PathBuf,
@@ -367,6 +370,9 @@ pub struct Paths {
 /// The whole deployment of one test (module documentation).
 pub struct Harness {
     pub dir: TempDir,
+    /// The files read through crates/protected-file (the integrity key and
+    /// the policy files).
+    pub files: test_scratch::ScratchDir,
     pub uid: u32,
     pub paths: Paths,
     /// The local reference copy of dird's directory (identical content).
@@ -396,6 +402,7 @@ impl Harness {
         if skip_as_root(uid) {
             return None;
         }
+        let files = test_scratch::ScratchDir::new("e2e").expect("the scratch directory");
         let paths = Paths {
             audit_socket: dir.join("a.sock"),
             audit_log: dir.join("audit.log"),
@@ -403,8 +410,8 @@ impl Harness {
             dird_kdc_socket: dir.join("d.sock"),
             dird_ldap_socket: dir.join("l.sock"),
             database: dir.join("r.redb"),
-            integrity_key: dir.join("integrity.key"),
-            policy: dir.join("policy.store"),
+            integrity_key: files.join("integrity.key"),
+            policy: files.join("policy.store"),
         };
         // dird's own file (closed again: dird opens it), and the reference.
         drop(dird::Directory::standard(&paths.database));
@@ -422,6 +429,7 @@ impl Harness {
         let tls_client = client_config(&tls_pki);
         Some(Harness {
             dir,
+            files,
             uid,
             paths,
             local,
@@ -689,7 +697,7 @@ impl Harness {
     /// Write another policy file (version `version`) next to the shared one
     /// and return its path.
     pub fn policy_file(&self, name: &str, version: u64) -> PathBuf {
-        let path = self.dir.join(name);
+        let path = self.files.join(name);
         write_policy(&path, version);
         path
     }

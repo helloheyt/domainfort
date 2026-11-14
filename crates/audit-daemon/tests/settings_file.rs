@@ -14,6 +14,7 @@ use audit_daemon::startup::{read_settings, read_settings_owned_by, SettingsError
 use std::io::ErrorKind;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use test_scratch::ScratchDir;
 
 /// auditd's required keys (docs/50 §2.4, §8.1).
 const AUDITD: &str = "\
@@ -24,22 +25,14 @@ audit_log_path = /var/log/audit/domain-audit.log
 uid_sources = 801:keyd
 ";
 
-/// A scratch directory, removed on drop.
-struct Scratch(PathBuf);
+/// A scratch directory inside the workspace (crates/test-scratch: the
+/// protected-file walk from `/` accepts it; Q-480), removed on drop.
+struct Scratch(PathBuf, #[allow(dead_code)] ScratchDir);
 
 impl Scratch {
     fn new(tag: &str) -> Scratch {
-        let path =
-            std::env::temp_dir().join(format!("auditd-settings-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).unwrap();
-        Scratch(path)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let dir = ScratchDir::new(&format!("auditd-settings-{tag}")).unwrap();
+        Scratch(dir.path().to_path_buf(), dir)
     }
 }
 
@@ -64,10 +57,17 @@ fn the_configuration_file_checks() {
         Err(SettingsError::NotRootOwned)
     );
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
-    // Writable is checked before the owner (startup step 3's order).
+    assert_eq!(
+        read_settings_owned_by(&path, owner),
+        Err(SettingsError::Writable)
+    );
+    // With another expected owner, the first directory of the test account
+    // on the path is refused before the file's own checks (task T, Q-468) —
+    // so startup step 3's "writable before owner" order is only observable
+    // as root (Q-480).
     assert_eq!(
         read_settings_owned_by(&path, owner.wrapping_add(1)),
-        Err(SettingsError::Writable)
+        Err(SettingsError::NotRootOwned)
     );
     assert_eq!(
         read_settings_owned_by(&dir.0, owner),
@@ -90,8 +90,9 @@ fn the_configuration_file_checks() {
 }
 
 /// Task F7 (A-86 follow-up): a symbolic link to the valid file is refused as
-/// `NotAFile` — by the injected-owner reader and by `read_settings` (owner
-/// 0) alike — and never followed.
+/// `NotAFile` and never followed; `read_settings` (owner 0) refuses it too —
+/// already at the first directory of the test account on the path (task T,
+/// Q-468).
 #[test]
 fn a_symbolic_link_to_a_valid_configuration_is_refused() {
     let dir = Scratch::new("link");
@@ -105,5 +106,39 @@ fn a_symbolic_link_to_a_valid_configuration_is_refused() {
         read_settings_owned_by(&link, owner),
         Err(SettingsError::NotAFile)
     );
-    assert_eq!(read_settings(&link), Err(SettingsError::NotAFile));
+    let as_root = if owner == 0 {
+        SettingsError::NotAFile
+    } else {
+        SettingsError::NotRootOwned
+    };
+    assert_eq!(read_settings(&link), Err(as_root));
+}
+
+/// Task T (docs/52 R11; Q-468 options 1, 2(b), A-102): every directory on
+/// the path is checked — a symbolic link in a directory component is
+/// `NotAFile`, a directory writable by group or others is `Writable` (the
+/// file rule's refusal of the same kind); the file through real, unwritable
+/// directories is read.
+#[test]
+fn a_link_or_a_writable_directory_on_the_path_is_refused() {
+    let dir = Scratch::new("dirs");
+    let real = dir.0.join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = real.join("auditd.conf");
+    write(&path, AUDITD.as_bytes(), 0o644);
+    let owner = std::fs::metadata(&path).unwrap().uid();
+    assert!(read_settings_owned_by(&path, owner).is_ok());
+    std::os::unix::fs::symlink(&real, dir.0.join("via")).unwrap();
+    assert_eq!(
+        read_settings_owned_by(&dir.0.join("via/auditd.conf"), owner),
+        Err(SettingsError::NotAFile)
+    );
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o770)).unwrap();
+    assert_eq!(
+        read_settings_owned_by(&path, owner),
+        Err(SettingsError::Writable)
+    );
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(read_settings_owned_by(&path, owner).is_ok());
 }

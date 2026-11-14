@@ -11,25 +11,19 @@
 mod common;
 
 use common::SAMPLE;
-use provision_manifest::{check_file, read_manifest, FileFacts, ReadError};
+use provision_manifest::{check_file, read_manifest, read_manifest_owned_by, FileFacts, ReadError};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use test_scratch::ScratchDir;
 
-static NEXT: AtomicU32 = AtomicU32::new(0);
-
-/// A unique scratch directory under the system temporary directory,
-/// removed on drop.
-struct Scratch(PathBuf);
+/// A unique scratch directory inside the workspace (crates/test-scratch:
+/// the protected-file walk from `/` accepts it; Q-480), removed on drop.
+struct Scratch(PathBuf, #[allow(dead_code)] ScratchDir);
 
 impl Scratch {
     fn new() -> Scratch {
-        let n = NEXT.fetch_add(1, Ordering::SeqCst);
-        let path = std::env::temp_dir().join(format!("pm-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir(&path).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        Scratch(path)
+        let dir = ScratchDir::new("pm").unwrap();
+        Scratch(dir.path().to_path_buf(), dir)
     }
 
     fn file(&self, name: &str, contents: &[u8], mode: u32) -> PathBuf {
@@ -37,12 +31,6 @@ impl Scratch {
         std::fs::write(&path, contents).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
         path
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -101,12 +89,17 @@ fn a_file_not_owned_by_root_is_refused() {
         read_manifest(&writable).unwrap_err(),
         ReadError::NotRootOwned
     );
+    // A directory is not a regular file, and a missing file is unreadable —
+    // asked with the test account standing in for root: with root's
+    // expectation the walk refuses the first directory of the test account
+    // on the path (task T, Q-468), as it does for the two files above.
+    let uid = std::fs::metadata(&path).unwrap().uid();
     assert_eq!(
-        read_manifest(&scratch.0).unwrap_err(),
+        read_manifest_owned_by(&scratch.0, uid).unwrap_err(),
         ReadError::NotRegularFile
     );
     assert_eq!(
-        read_manifest(&scratch.0.join("absent")).unwrap_err(),
+        read_manifest_owned_by(&scratch.0.join("absent"), uid).unwrap_err(),
         ReadError::Unreadable
     );
 }

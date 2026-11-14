@@ -13,24 +13,16 @@ use common::SAMPLE;
 use provision_manifest::{read_manifest, read_manifest_owned_by, Manifest, ReadError};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
+use test_scratch::ScratchDir;
 
-/// A scratch directory under the system temporary directory, removed on
-/// drop.
-struct Scratch(PathBuf);
+/// A scratch directory inside the workspace (crates/test-scratch: the
+/// protected-file walk from `/` accepts it; Q-480), removed on drop.
+struct Scratch(PathBuf, #[allow(dead_code)] ScratchDir);
 
 impl Scratch {
     fn new(tag: &str) -> Scratch {
-        let path = std::env::temp_dir().join(format!("pm-nofollow-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir(&path).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        Scratch(path)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let dir = ScratchDir::new(&format!("pm-nofollow-{tag}")).unwrap();
+        Scratch(dir.path().to_path_buf(), dir)
     }
 }
 
@@ -54,9 +46,16 @@ fn a_symbolic_link_to_a_valid_manifest_is_refused() {
         read_manifest_owned_by(&link, uid).unwrap_err(),
         ReadError::NotRegularFile
     );
-    // The owner-0 reader refuses the link the same way (before any owner
-    // check: the link's own facts are not a regular file's).
-    assert_eq!(read_manifest(&link).unwrap_err(), ReadError::NotRegularFile);
+    // The owner-0 reader refuses it too — already at the first directory of
+    // the test account on the path, which root's expectation does not accept
+    // (task T: every directory on the path is root's or the file owner's,
+    // Q-468).
+    let as_root = if uid == 0 {
+        ReadError::NotRegularFile
+    } else {
+        ReadError::NotRootOwned
+    };
+    assert_eq!(read_manifest(&link).unwrap_err(), as_root);
     assert_eq!(
         read_manifest_owned_by(&path, uid.wrapping_add(1)).unwrap_err(),
         ReadError::NotRootOwned
@@ -87,4 +86,34 @@ fn an_oversized_manifest_is_refused() {
         read_manifest_owned_by(&path, uid).unwrap_err(),
         ReadError::TooLarge
     );
+}
+
+/// Task T (docs/52 R11; Q-468 options 1, 2(b), A-102): every directory on
+/// the manifest's path is checked, not only the file — a symbolic link in a
+/// directory component is `NotRegularFile`, a directory writable by group or
+/// others is `WritableByOthers`; the same manifest through real, unwritable
+/// directories is read.
+#[test]
+fn a_link_or_a_writable_directory_on_the_path_is_refused() {
+    let dir = Scratch::new("dirs");
+    let real = dir.0.join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = real.join("manifest");
+    std::fs::write(&path, SAMPLE).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let uid = std::fs::metadata(&path).unwrap().uid();
+    assert!(read_manifest_owned_by(&path, uid).is_ok());
+    std::os::unix::fs::symlink(&real, dir.0.join("via")).unwrap();
+    assert_eq!(
+        read_manifest_owned_by(&dir.0.join("via/manifest"), uid).unwrap_err(),
+        ReadError::NotRegularFile
+    );
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o775)).unwrap();
+    assert_eq!(
+        read_manifest_owned_by(&path, uid).unwrap_err(),
+        ReadError::WritableByOthers
+    );
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(read_manifest_owned_by(&path, uid).is_ok());
 }

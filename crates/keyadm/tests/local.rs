@@ -15,7 +15,7 @@ use keyadm::ceremony::{
 use keyadm::cli::{self, Command, UsageError};
 use keyadm::identity::{refuse_root, IdentityError};
 use keyadm::report::{self, EXIT_COMPLETE, EXIT_INCOMPLETE, EXIT_NOTHING_ATTEMPTED};
-use keyadm::settings::{read_settings, SettingsError};
+use keyadm::settings::{read_settings, read_settings_owned_by, SettingsError};
 use keyd_types::{Error as KeydError, Kvno};
 use provision_manifest::{Manifest, ManifestFields};
 use std::ffi::OsString;
@@ -478,9 +478,10 @@ fn a_failed_contact_attempts_nothing() {
 /// unreadable.
 #[test]
 fn a_configuration_file_not_owned_by_root_is_refused() {
-    let dir = std::env::temp_dir().join(format!("keyadm-local-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir(&dir).unwrap();
+    // Inside the workspace (crates/test-scratch): the protected-file walk
+    // from `/` accepts it for the test account (Q-480).
+    let scratch = test_scratch::ScratchDir::new("keyadm-local").unwrap();
+    let dir = scratch.path().to_path_buf();
     let path = dir.join("keyadm.conf");
     std::fs::write(
         &path,
@@ -492,8 +493,11 @@ fn a_configuration_file_not_owned_by_root_is_refused() {
     if owner != 0 {
         assert_eq!(read_settings(&path), Err(SettingsError::Permissions));
     }
+    // A missing file is unreadable (asked with the test account standing in
+    // for root: with root's expectation the walk refuses the test account's
+    // own scratch directory first — task T, Q-468).
     assert_eq!(
-        read_settings(&dir.join("absent")),
+        read_settings_owned_by(&dir.join("absent"), owner),
         Err(SettingsError::Unreadable)
     );
     assert_eq!(read_settings(&dir), Err(SettingsError::Permissions));

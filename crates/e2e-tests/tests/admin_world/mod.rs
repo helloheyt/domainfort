@@ -79,7 +79,7 @@ use crate::support::kdcd::{self, connector, Kdcd};
 use crate::support::keyd_support::{self, TestClock};
 use crate::support::tls::{server_config, test_pki, TestPki};
 use crate::support::{auditd as auditd_support, front_timeouts, single_label_binding, Front};
-use crate::support::{eventually, my_uid, skip_as_root, verified_log, TempDir, LONG};
+use crate::support::{eventually, skip_as_root, verified_log, LONG};
 use audit_daemon::listener::ListenerConfig;
 use config::{
     AdmindSettings, AuditdSettings, DirdSettings, KeyadmSettings, KeydSettings, LdapFrontSettings,
@@ -121,6 +121,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
+use test_scratch::ScratchDir;
 use zeroize::Zeroizing;
 
 // ---------------------------------------------------------------------------
@@ -817,7 +818,11 @@ pub struct Persona {
 
 /// The whole deployment of one test (module documentation).
 pub struct World {
-    pub dir: TempDir,
+    /// The provisioned deployment: files the daemons and tools read through
+    /// crates/protected-file and the sockets, in a scratch directory the
+    /// walk from `/` accepts and whose paths are valid configuration paths
+    /// (crates/test-scratch; Q-480). Socket paths under it stay short.
+    pub dir: ScratchDir,
     pub uid: u32,
     pub input: DomainInput,
     pub plan: Plan,
@@ -857,8 +862,8 @@ impl World {
     /// workstation fixture; nothing runs yet. `None` as root (uid 0 is never
     /// mapped — docs/50 R50-3).
     pub fn provisioned() -> Option<World> {
-        let dir = TempDir::new();
-        let uid = my_uid(&dir);
+        let dir = ScratchDir::new("e2e-world").expect("the scratch directory");
+        let uid = dir.uid().expect("the scratch directory's owner");
         if skip_as_root(uid) {
             return None;
         }
@@ -1094,7 +1099,7 @@ impl World {
         [(ALICE, ALICE_PASSWORD), (BOB, BOB_PASSWORD)]
             .into_iter()
             .map(|(sam, password)| {
-                let path = self.dir.join(&format!("etc/{sam}.pw"));
+                let path = self.dir.join(format!("etc/{sam}.pw"));
                 std::fs::write(&path, format!("{password}\n")).unwrap();
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
                 PasswordFileArg {
@@ -1679,7 +1684,7 @@ fn collect_files(dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
 /// docs/50 §6.4): realm EXAMPLE.ORG, two first administrators (P-22), the
 /// loopback network as the internal one, short socket paths (a Unix socket
 /// path is bounded in length).
-fn domain_input(dir: &TempDir, uid: u32) -> DomainInput {
+fn domain_input(dir: &ScratchDir, uid: u32) -> DomainInput {
     let path = |rest: &str| FilePath::parse(dir.join(rest).to_str().unwrap()).unwrap();
     let account = |n: u32| Account { uid: n, gid: n };
     let fake = [61001, 61003, 61004, 61005, 61006, 61007, 61010];

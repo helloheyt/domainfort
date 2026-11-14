@@ -25,20 +25,17 @@ use ldap_front::tls::CredentialError;
 use ldap_front::MAX_CONNECTIONS;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use test_scratch::ScratchDir;
 
-/// A unique temporary directory, removed on drop.
-struct TempDir(PathBuf);
-
-static NEXT: AtomicU32 = AtomicU32::new(0);
+/// A unique scratch directory inside the workspace (crates/test-scratch:
+/// the protected-file walk from `/` accepts it; Q-480), removed on drop. No
+/// socket is bound in it.
+struct TempDir(PathBuf, #[allow(dead_code)] ScratchDir);
 
 impl TempDir {
     fn new() -> TempDir {
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("lfs-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        TempDir(dir)
+        let dir = ScratchDir::new("lfs").unwrap();
+        TempDir(dir.path().to_path_buf(), dir)
     }
 
     fn join(&self, name: &str) -> PathBuf {
@@ -48,12 +45,6 @@ impl TempDir {
     /// The uid that owns files this process creates.
     fn uid(&self) -> u32 {
         std::fs::metadata(&self.0).unwrap().uid()
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -213,6 +204,64 @@ fn a_symbolic_link_to_a_valid_file_is_refused() {
     std::os::unix::fs::symlink(&key, &key_link).unwrap();
     assert_eq!(
         read_private_key(&key_link, owner).err(),
+        Some(StartupError::KeyPermissions)
+    );
+}
+
+/// Task T (docs/52 R11; Q-468 options 1, 2(b), A-102): every directory on
+/// each file's path is checked — a symbolic link in a directory component,
+/// or a directory writable by group or others, is refused as that file's
+/// permissions error; the three files through real, unwritable directories
+/// are read, and another expected owner refuses the test account's
+/// directory.
+#[test]
+fn a_link_or_a_writable_directory_on_the_path_is_refused() {
+    let dir = TempDir::new();
+    let owner = dir.uid();
+    let real = dir.join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let config = real.join("ldap-front.conf");
+    write(
+        &config,
+        settings_text(&dir, "10.0.0.5:636").as_bytes(),
+        0o644,
+    );
+    let cert = real.join("cert.der");
+    write(&cert, b"certificate octets", 0o644);
+    let key = real.join("key.der");
+    write(&key, &tls_support::p256_key(), 0o400);
+    assert!(read_settings(&config, owner).is_ok());
+    assert!(read_certificate(&cert, owner).is_ok());
+    assert!(read_private_key(&key, owner).is_ok());
+    std::os::unix::fs::symlink(&real, dir.join("via")).unwrap();
+    assert_eq!(
+        read_settings(&dir.join("via/ldap-front.conf"), owner).err(),
+        Some(StartupError::ConfigPermissions)
+    );
+    assert_eq!(
+        read_certificate(&dir.join("via/cert.der"), owner).err(),
+        Some(StartupError::CertificatePermissions)
+    );
+    assert_eq!(
+        read_private_key(&dir.join("via/key.der"), owner).err(),
+        Some(StartupError::KeyPermissions)
+    );
+    assert_eq!(
+        read_certificate(&cert, owner.wrapping_add(1)).err(),
+        Some(StartupError::CertificatePermissions)
+    );
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o775)).unwrap();
+    assert_eq!(
+        read_settings(&config, owner).err(),
+        Some(StartupError::ConfigPermissions)
+    );
+    assert_eq!(
+        read_certificate(&cert, owner).err(),
+        Some(StartupError::CertificatePermissions)
+    );
+    assert_eq!(
+        read_private_key(&key, owner).err(),
         Some(StartupError::KeyPermissions)
     );
 }

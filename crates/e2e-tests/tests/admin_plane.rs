@@ -210,7 +210,7 @@ fn provisioning_to_a_new_users_login() {
             "dropped to admind's account, as Role::Directory (docs/51 §4.3 step 12)"
         );
         for sam in [ALICE, BOB] {
-            assert!(!w.dir.join(&format!("etc/{sam}.pw")).exists());
+            assert!(!w.dir.join(format!("etc/{sam}.pw")).exists());
         }
         assert_eq!(w.workstation_secret(), vec![Kvno::INITIAL]);
 

@@ -1,0 +1,39 @@
+# test-scratch — a dev-only helper: a scratch directory **inside the
+# workspace** for the tests whose files a crates/protected-file reader opens
+# (task T; docs/questions/Q-480).
+#
+# protected-file walks every path from `/` and accepts a directory only if it
+# is root's or the expected owner's and not writable by group or others
+# (docs/52 R11; Q-468 options 1, 2(b), A-102). The system's temporary
+# directory never passes that rule for an unprivileged test (macOS: `/var` is
+# a link, `/private` group-writable; Linux: `/tmp` is 1777), and neither does
+# a target directory under it. The workspace checkout does: its ancestors
+# belong to root or to the account running the tests and are not writable by
+# others. So tests put such files under `<workspace>/.test-scratch/<unique>`
+# (mode 0700, ignored by git), and the production rule accepts them honestly
+# with the test account as the expected owner — no test seam in any product
+# crate (docs/52 C18).
+#
+# One exception: tests that provision a domain or write a TLS configuration
+# put these paths into configuration values, which admit only
+# `A-Z a-z 0-9 . _ - /` (Q-230 item 16). When the workspace path holds any
+# other octet (this development host's checkout is under `…/linux server/…`)
+# the root is `$HOME/.test-scratch` instead — the same properties.
+#
+# Used only from `[dev-dependencies]`. No dependency, no unsafe, no panic: the
+# constructor returns `io::Result` and the tests decide.
+#
+# Written only from this project's decided design (docs/52 §3.13, §3.18;
+# Q-468; Q-480) and the Rust standard library's API. No other implementation
+# consulted or recalled (AGENTS.md §1-3).
+
+[package]
+name = "test-scratch"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

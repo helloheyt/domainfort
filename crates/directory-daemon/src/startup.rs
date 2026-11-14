@@ -204,7 +204,9 @@ pub fn read_settings_owned_by(path: &Path, owner: u32) -> Result<DirdSettings, S
 pub fn read_integrity_key(path: &Path, owner: u32) -> Result<IntegrityKey, StartupError> {
     // Spec: docs/50 §7.4; Q-270 item 1 (root, mode exactly 0400); A-86
     // (crates/protected-file: no symbolic link is followed, the rule is
-    // applied to the path and to the opened descriptor).
+    // applied to the path and to the opened descriptor); Q-468 (A-102: every
+    // directory on the path is root's or `owner`'s and not writable by group
+    // or others — a directory that is not is the key's permission refusal).
     let key_file_rule = |facts: &FileFacts| {
         let exact = facts.mode & PERMISSION_BITS == INTEGRITY_KEY_FILE_MODE;
         if facts.regular_file && facts.owner_uid == owner && exact {
@@ -213,8 +215,9 @@ pub fn read_integrity_key(path: &Path, owner: u32) -> Result<IntegrityKey, Start
             Err(StartupError::KeyPermissions)
         }
     };
-    let file = protected_file::open(path, key_file_rule).map_err(|error| match error {
+    let file = protected_file::open(path, owner, key_file_rule).map_err(|error| match error {
         OpenError::Io(_) => StartupError::KeyUnreadable,
+        OpenError::Path(_) => StartupError::KeyPermissions,
         OpenError::Refused(refusal) => refusal,
     })?;
     let mut buffer = Zeroizing::new([0u8; INTEGRITY_KEY_LEN + 1]);

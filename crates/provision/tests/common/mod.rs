@@ -7,7 +7,7 @@
 
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use test_scratch::ScratchDir;
 
 use directory_admin::{RandomError, RandomSource};
 use krb_proto::KerberosTime;
@@ -17,37 +17,28 @@ use provision::{
     Paths, Progress, Staged, Step,
 };
 
-static NEXT_DIR: AtomicU32 = AtomicU32::new(0);
-
-/// A unique temporary directory (mode 0700), removed on drop.
+/// A unique scratch directory (mode 0700), removed on drop — inside the
+/// workspace (crates/test-scratch, Q-480): the products installed here are
+/// read back through crates/protected-file, whose walk from `/` accepts it
+/// with the test account as the owner, and its paths are valid
+/// configuration paths. Socket paths under it stay short.
 pub struct TempDir {
-    path: PathBuf,
+    scratch: ScratchDir,
 }
 
 impl TempDir {
     pub fn new() -> TempDir {
-        let n = NEXT_DIR.fetch_add(1, Ordering::SeqCst);
-        let path = std::env::temp_dir().join(format!("prv{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&path)
-            .unwrap();
-        TempDir { path }
+        TempDir {
+            scratch: ScratchDir::new("prv").unwrap(),
+        }
     }
 
     pub fn path(&self) -> &Path {
-        &self.path
+        self.scratch.path()
     }
 
     pub fn join(&self, name: &str) -> PathBuf {
-        self.path.join(name)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        self.scratch.join(name)
     }
 }
 

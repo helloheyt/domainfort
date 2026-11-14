@@ -23,6 +23,10 @@ use daemon_sandbox::Step;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use support::{my_uid, FakeAuditd, TempDir};
+// The files the tests read through crates/protected-file live in a scratch
+// directory the walk from `/` accepts (crates/test-scratch, Q-480); sockets
+// stay in `TempDir`.
+use test_scratch::ScratchDir;
 
 /// admind, every key present (docs/50 §2.4, §3.2, §3.6, §7.1; A-79).
 const ADMIND: &str = "\
@@ -145,8 +149,8 @@ fn a_file_in_the_way_of_the_socket_is_not_removed() {
 /// account than root is refused before it is parsed — as is a missing one.
 #[test]
 fn a_configuration_not_owned_by_root_is_refused() {
-    let dir = TempDir::new();
-    let uid = my_uid(&dir);
+    let dir = ScratchDir::new("admind-startup").unwrap();
+    let uid = dir.uid().unwrap();
     if uid == 0 {
         return; // the file would be root's
     }
@@ -155,8 +159,11 @@ fn a_configuration_not_owned_by_root_is_refused() {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
     assert_eq!(std::fs::metadata(&path).unwrap().uid(), uid);
     assert_eq!(read_settings(&path), Err(StartupError::ConfigPermissions));
+    // A missing file is unreadable (asked with the test account standing in
+    // for root: with root's expectation the walk refuses the test account's
+    // own scratch directory first — task T, Q-468).
     assert_eq!(
-        read_settings(&dir.join("absent.conf")),
+        read_settings_owned_by(&dir.join("absent.conf"), uid),
         Err(StartupError::ConfigUnreadable)
     );
 }
@@ -167,8 +174,8 @@ fn a_configuration_not_owned_by_root_is_refused() {
 /// `ConfigPermissions` (not a regular file) — never followed.
 #[test]
 fn a_symbolic_link_to_a_valid_configuration_is_refused() {
-    let dir = TempDir::new();
-    let uid = my_uid(&dir);
+    let dir = ScratchDir::new("admind-startup").unwrap();
+    let uid = dir.uid().unwrap();
     let path = dir.join("admind.conf");
     std::fs::write(&path, ADMIND).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -183,6 +190,36 @@ fn a_symbolic_link_to_a_valid_configuration_is_refused() {
         Err(StartupError::ConfigPermissions)
     );
     assert_eq!(read_settings(&link), Err(StartupError::ConfigPermissions));
+}
+
+/// Task T (docs/52 R11; Q-468 options 1, 2(b), A-102): every directory on
+/// the configuration's path is checked — a symbolic link in a directory
+/// component, or a directory writable by group or others, is refused as
+/// `ConfigPermissions`; the file through real, unwritable directories is
+/// read.
+#[test]
+fn a_link_or_a_writable_directory_on_the_path_is_refused() {
+    let dir = ScratchDir::new("admind-startup").unwrap();
+    let uid = dir.uid().unwrap();
+    let real = dir.join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = real.join("admind.conf");
+    std::fs::write(&path, ADMIND).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(read_settings_owned_by(&path, uid).is_ok());
+    std::os::unix::fs::symlink(&real, dir.join("via")).unwrap();
+    assert_eq!(
+        read_settings_owned_by(&dir.join("via/admind.conf"), uid),
+        Err(StartupError::ConfigPermissions)
+    );
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o720)).unwrap();
+    assert_eq!(
+        read_settings_owned_by(&path, uid),
+        Err(StartupError::ConfigPermissions)
+    );
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(read_settings_owned_by(&path, uid).is_ok());
 }
 
 /// docs/50 R50-14, §6.1, §6.4 (admind: `mlockall` — passwords in transit);

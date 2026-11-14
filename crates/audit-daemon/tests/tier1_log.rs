@@ -921,19 +921,31 @@ fn binary_without_argument_exits_with_usage() {
 /// modes are the daemon's checks).
 #[test]
 fn binary_refuses_a_writable_configuration() {
+    use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
     let dir = TempDir::new();
-    let path = dir.path().join("auditd.conf");
+    // The configuration inside the workspace (crates/test-scratch, Q-480),
+    // which the protected-file walk from `/` judges like any path.
+    let scratch = test_scratch::ScratchDir::new("auditd-binary").unwrap();
+    let path = scratch.join("auditd.conf");
     std::fs::write(&path, settings_text(&dir, 801, 5)).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+    let uid = std::fs::metadata(&path).unwrap().uid();
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_audit-daemon"))
         .arg(&path)
         .output()
         .expect("run");
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(
-        stderr.trim_end(),
-        "audit-daemon: configuration file is writable by group or others"
+    // The binary expects root: for an ordinary account the first directory
+    // of that account on the path is refused before the file's own mode
+    // (task T, Q-468); as root, with root's directories all the way, the
+    // file's mode is.
+    let not_root = "audit-daemon: configuration file is not owned by root";
+    let writable = "audit-daemon: configuration file is writable by group or others";
+    let shown = stderr.trim_end();
+    assert!(
+        shown == not_root || (uid == 0 && shown == writable),
+        "{shown}"
     );
 }

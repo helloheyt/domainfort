@@ -16,6 +16,7 @@
 use provision::first_admin::root_files::{read_admind_settings, read_manifest, RootFileError};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use test_scratch::ScratchDir;
 
 /// admind's required keys (docs/50 §2.4, §3.2; docs/51 §4.6; A-79).
 const ADMIND: &str = "\
@@ -46,22 +47,14 @@ admin_service = 00000000-0000-0000-0000-000000000003:NT-SRV-HST:admind/dc1.examp
 first_admins = 00000000-0000-0000-0000-000000000004:NT-PRINCIPAL:alice, 00000000-0000-0000-0000-000000000005:NT-PRINCIPAL:bob
 ";
 
-/// A scratch directory, removed on drop.
-struct Scratch(PathBuf);
+/// A scratch directory inside the workspace (crates/test-scratch: the
+/// protected-file walk from `/` accepts it; Q-480), removed on drop.
+struct Scratch(PathBuf, #[allow(dead_code)] ScratchDir);
 
 impl Scratch {
     fn new(tag: &str) -> Scratch {
-        let path =
-            std::env::temp_dir().join(format!("prov-rootfiles-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).unwrap();
-        Scratch(path)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let dir = ScratchDir::new(&format!("prov-rootfiles-{tag}")).unwrap();
+        Scratch(dir.path().to_path_buf(), dir)
     }
 }
 
@@ -107,5 +100,43 @@ fn a_symbolic_link_to_a_valid_root_file_is_refused() {
     assert_eq!(
         read_manifest(&manifest, uid.wrapping_add(1)).unwrap_err(),
         RootFileError::NotRootOwned
+    );
+}
+
+/// Task T (docs/52 R11; Q-468 options 1, 2(b), A-102): every directory on
+/// each file's path is checked — a symbolic link in a directory component is
+/// `NotRegular`, a directory writable by group or others is
+/// `WritableByOthers`; both files through real, unwritable directories are
+/// read.
+#[test]
+fn a_link_or_a_writable_directory_on_the_path_is_refused() {
+    let dir = Scratch::new("dirs");
+    let real = dir.0.join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let admind = real.join("admind.conf");
+    write(&admind, ADMIND);
+    let manifest = real.join("manifest");
+    write(&manifest, MANIFEST);
+    let uid = std::fs::metadata(&admind).unwrap().uid();
+    assert!(read_admind_settings(&admind, uid).is_ok());
+    assert!(read_manifest(&manifest, uid).is_ok());
+    std::os::unix::fs::symlink(&real, dir.0.join("via")).unwrap();
+    assert_eq!(
+        read_admind_settings(&dir.0.join("via/admind.conf"), uid).unwrap_err(),
+        RootFileError::NotRegular
+    );
+    assert_eq!(
+        read_manifest(&dir.0.join("via/manifest"), uid).unwrap_err(),
+        RootFileError::NotRegular
+    );
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o775)).unwrap();
+    assert_eq!(
+        read_admind_settings(&admind, uid).unwrap_err(),
+        RootFileError::WritableByOthers
+    );
+    assert_eq!(
+        read_manifest(&manifest, uid).unwrap_err(),
+        RootFileError::WritableByOthers
     );
 }

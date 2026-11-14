@@ -20,6 +20,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
 use support::{my_uid, TempDir};
+// The configuration files the tests read through crates/protected-file live
+// in a scratch directory the walk from `/` accepts (crates/test-scratch,
+// Q-480); sockets stay in `TempDir`.
+use test_scratch::ScratchDir;
 
 /// keyd, every key present (docs/50 §2.4, R50-3, R50-18, §3.6, §7.1).
 const KEYD: &str = "\
@@ -118,11 +122,11 @@ fn no_configuration_key_sets_the_intent_budget() {
 /// is refused before it is parsed; a missing file is unreadable.
 #[test]
 fn a_configuration_file_not_owned_by_root_is_refused() {
-    let dir = TempDir::new();
+    let dir = ScratchDir::new("kdd-startup").unwrap();
     let path = dir.join("keyd.conf");
     std::fs::write(&path, KEYD).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-    if my_uid(&dir) == 0 {
+    if dir.uid().unwrap() == 0 {
         // As root the owner check passes; the mode check must refuse.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
     }
@@ -130,8 +134,11 @@ fn a_configuration_file_not_owned_by_root_is_refused() {
         read_settings(&path).err(),
         Some(StartupError::ConfigPermissions)
     );
+    // A missing file is unreadable (asked with the test account standing in
+    // for root: with root's expectation the walk refuses the test account's
+    // own scratch directory first — task T, Q-468).
     assert_eq!(
-        read_settings(&dir.join("missing.conf")).err(),
+        read_settings_owned_by(&dir.join("missing.conf"), dir.uid().unwrap()).err(),
         Some(StartupError::ConfigUnreadable)
     );
 }
@@ -187,11 +194,11 @@ fn an_existing_socket_directory_must_belong_to_keyd() {
 /// `ConfigPermissions` (not a regular file) — never followed.
 #[test]
 fn a_symbolic_link_to_a_valid_configuration_is_refused() {
-    let dir = TempDir::new();
+    let dir = ScratchDir::new("kdd-startup").unwrap();
     let path = dir.join("keyd.conf");
     std::fs::write(&path, KEYD).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-    let owner = my_uid(&dir);
+    let owner = dir.uid().unwrap();
     assert_eq!(
         read_settings_owned_by(&path, owner).unwrap(),
         settings(KEYD)
@@ -206,4 +213,34 @@ fn a_symbolic_link_to_a_valid_configuration_is_refused() {
         read_settings(&link).err(),
         Some(StartupError::ConfigPermissions)
     );
+}
+
+/// Task T (docs/52 R11; Q-468 options 1, 2(b), A-102): every directory on
+/// the configuration's path is checked — a symbolic link in a directory
+/// component, or a directory writable by group or others, is refused as
+/// `ConfigPermissions`; the file through real, unwritable directories is
+/// read.
+#[test]
+fn a_link_or_a_writable_directory_on_the_path_is_refused() {
+    let dir = ScratchDir::new("kdd-startup").unwrap();
+    let owner = dir.uid().unwrap();
+    let real = dir.join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = real.join("keyd.conf");
+    std::fs::write(&path, KEYD).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(read_settings_owned_by(&path, owner).is_ok());
+    std::os::unix::fs::symlink(&real, dir.join("via")).unwrap();
+    assert_eq!(
+        read_settings_owned_by(&dir.join("via/keyd.conf"), owner).err(),
+        Some(StartupError::ConfigPermissions)
+    );
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o702)).unwrap();
+    assert_eq!(
+        read_settings_owned_by(&path, owner).err(),
+        Some(StartupError::ConfigPermissions)
+    );
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(read_settings_owned_by(&path, owner).is_ok());
 }

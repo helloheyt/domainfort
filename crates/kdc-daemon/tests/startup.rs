@@ -43,24 +43,17 @@ use pdp::IpScope;
 use policy_store::{LoadError, PolicyError, MARKER, SUPERSEDED_FORMAT};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use test_scratch::ScratchDir;
 
-struct TempDir(PathBuf);
+/// A unique scratch directory (0700) inside the workspace (crates/
+/// test-scratch: the protected-file walk from `/` accepts it; Q-480),
+/// removed on drop. No socket is bound in it.
+struct TempDir(PathBuf, #[allow(dead_code)] ScratchDir);
 
 impl TempDir {
     fn new(tag: &str) -> TempDir {
-        let path = std::env::temp_dir().join(format!("kdcs{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&path)
-            .unwrap();
-        TempDir(path)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let dir = ScratchDir::new(&format!("kdcs-{tag}")).unwrap();
+        TempDir(dir.path().to_path_buf(), dir)
     }
 }
 
@@ -235,6 +228,46 @@ fn a_symbolic_link_to_a_valid_configuration_or_policy_is_refused() {
     std::os::unix::fs::symlink(&policy, &policy_link).unwrap();
     assert_eq!(
         read_policy(&policy_link, uid).err(),
+        Some(StartupError::Policy(LoadError::Permissions))
+    );
+}
+
+/// Task T (docs/52 R11; Q-468 options 1, 2(b), A-102): every directory on
+/// the configuration's and the policy's path is checked — a symbolic link in
+/// a directory component, or a directory writable by group or others, is
+/// refused as the file's permissions error; both files through real,
+/// unwritable directories are read.
+#[test]
+fn a_link_or_a_writable_directory_on_the_path_is_refused() {
+    let dir = TempDir::new("dirs");
+    let uid = std::fs::metadata(&dir.0).unwrap().uid();
+    let real = dir.0.join("real");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&real)
+        .unwrap();
+    let config = real.join("kdc.conf");
+    write(&config, kdc_config("10.0.0.5:88").as_bytes(), 0o644);
+    let policy = real.join("policy.store");
+    write(&policy, &common_policy::policy(9).encode().unwrap(), 0o644);
+    assert!(read_settings(&config, uid).is_ok());
+    assert!(read_policy(&policy, uid).is_ok());
+    std::os::unix::fs::symlink(&real, dir.0.join("via")).unwrap();
+    assert_eq!(
+        read_settings(&dir.0.join("via/kdc.conf"), uid).err(),
+        Some(StartupError::ConfigPermissions)
+    );
+    assert_eq!(
+        read_policy(&dir.0.join("via/policy.store"), uid).err(),
+        Some(StartupError::Policy(LoadError::Permissions))
+    );
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o770)).unwrap();
+    assert_eq!(
+        read_settings(&config, uid).err(),
+        Some(StartupError::ConfigPermissions)
+    );
+    assert_eq!(
+        read_policy(&policy, uid).err(),
         Some(StartupError::Policy(LoadError::Permissions))
     );
 }

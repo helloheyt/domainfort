@@ -40,7 +40,7 @@ use crate::recovery::StartKind;
 use config::AuditdSettings;
 use core::fmt;
 use daemon_sandbox::{HardeningPlan, PlanError, ProcessIdentity};
-use protected_file::{FileFacts, OpenError, ReadError, GROUP_OR_OTHER_WRITE};
+use protected_file::{FileFacts, OpenError, PathBreak, ReadError, GROUP_OR_OTHER_WRITE};
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -150,12 +150,17 @@ pub fn read_settings(path: &Path) -> Result<AuditdSettings, SettingsError> {
 /// [`SettingsError::NotAFile`], before any open), opened with O_NOFOLLOW,
 /// and this module's checks (in their order: a regular file, not writable
 /// by group or others, owned by `owner`) applied again to the opened
-/// descriptor.
+/// descriptor. Every directory on the path is walked from `/` first and
+/// must be root's or `owner`'s, not writable by group or others, and not a
+/// link (task T, Q-468); a directory that is not is refused with the error
+/// of the same kind ([`SettingsError::NotAFile`], `Writable`,
+/// `NotRootOwned`).
 ///
 /// # Errors
 /// [`SettingsError`].
 ///
-/// Spec: docs/50 R50-15, §7.1; docs/questions/Q-230 item 16 (A-60); A-86.
+/// Spec: docs/50 R50-15, §7.1; docs/questions/Q-230 item 16 (A-60); A-86;
+/// Q-468 (A-102).
 pub fn read_settings_owned_by(path: &Path, owner: u32) -> Result<AuditdSettings, SettingsError> {
     let rule = |facts: &FileFacts| {
         if !facts.regular_file {
@@ -169,8 +174,9 @@ pub fn read_settings_owned_by(path: &Path, owner: u32) -> Result<AuditdSettings,
         }
         Ok(())
     };
-    let file = protected_file::open(path, rule).map_err(|error| match error {
+    let file = protected_file::open(path, owner, rule).map_err(|error| match error {
         OpenError::Io(kind) => SettingsError::Io(kind),
+        OpenError::Path(path) => path_refusal(path),
         OpenError::Refused(refusal) => refusal,
     })?;
     let octets =
@@ -181,6 +187,18 @@ pub fn read_settings_owned_by(path: &Path, owner: u32) -> Result<AuditdSettings,
             }
         })?;
     AuditdSettings::parse(&octets).map_err(SettingsError::Config)
+}
+
+/// A directory on the configuration file's path that breaks crates/protected-file's
+/// directory rule (root's or `owner`'s, not writable by group or others, not
+/// a link), as this module's refusal of the same kind.
+/// Spec: Q-468 option 2(b) (A-102); docs/50 §7.1.
+fn path_refusal(path: PathBreak) -> SettingsError {
+    match path {
+        PathBreak::NoFileName | PathBreak::NotADirectory => SettingsError::NotAFile,
+        PathBreak::DirectoryWritableByGroupOrOthers => SettingsError::Writable,
+        PathBreak::DirectoryWrongOwner => SettingsError::NotRootOwned,
+    }
 }
 
 /// The hardening plan: the docs/50 §6.4 baseline for `run_as_uid` /
