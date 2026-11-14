@@ -90,7 +90,8 @@ mod subject;
 mod time;
 
 pub use admin::{
-    DirectoryAdmin, Prepared, Request, VerificationFailure, USER_FORCE_CHANGE_PASSWORD,
+    DirectoryAdmin, Prepared, Request, VerificationFailure, ACCOUNT_EXPIRES_NEVER,
+    USER_FORCE_CHANGE_PASSWORD,
 };
 pub use apply::Applied;
 pub use audit::{Refusal, RefusalStatus};
@@ -98,9 +99,13 @@ pub use config::{
     AdminConfig, ConfigError, ProtectedObjects, CHANGE_SEQ_COUNTER, MAX_QUORUM, MIN_QUORUM,
     RID_COUNTER, RID_END_EXCLUSIVE, RID_FIRST,
 };
+pub use descriptor::{new_object_descriptor, DescriptorError};
+// The name and value rules, public for `provision domain` (task A4), which
+// must apply exactly these rules to the names it is given (A-79).
 pub use names::{
-    MAX_ACCOUNT_SAM_CHARS, MAX_DESCRIPTION_UNITS, MAX_DNS_HOST_NAME_CHARS, MAX_GROUP_SAM_CHARS,
-    MAX_PRINCIPAL_NAME_CHARS, MAX_RDN_VALUE_CHARS,
+    computer_name_ok, computer_sam, dns_host_name_ok, group_sam_ok, rdn_value_ok, spn_ok,
+    user_sam_ok, MAX_ACCOUNT_SAM_CHARS, MAX_DESCRIPTION_UNITS, MAX_DNS_HOST_NAME_CHARS,
+    MAX_GROUP_SAM_CHARS, MAX_PRINCIPAL_NAME_CHARS, MAX_RDN_VALUE_CHARS,
 };
 pub use operation::{
     CompletePasswordSet, CreateComputer, CreateContainerLike, CreateGroup, CreateUser, LookupKey,
@@ -109,4 +114,4 @@ pub use operation::{
 pub use random::{OsRandom, RandomError, RandomSource};
 pub use reply::{KeyTarget, LookupResult, PasswordSetReply, Reply};
 pub use subject::{AdminSubject, SubjectError, VerifiedTicket};
-pub use time::wall_clock;
+pub use time::{filetime, wall_clock};

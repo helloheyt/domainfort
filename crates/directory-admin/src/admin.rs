@@ -78,7 +78,7 @@ pub const USER_FORCE_CHANGE_PASSWORD: Guid = Guid {
 /// accountExpires "never". Spec: [MS-SAMR] 3.1.1.8.1 item 1.2
 /// ("0x7FFFFFFF FFFFFFFF (default value)"); docs/47 §4.2 (R47-5b: the admin
 /// plane writes "never" as this value only).
-pub(crate) const ACCOUNT_EXPIRES_NEVER: i64 = i64::MAX;
+pub const ACCOUNT_EXPIRES_NEVER: i64 = i64::MAX;
 
 /// One admin request, after the caller verified every AP-REQ through keyd.
 /// Spec: docs/51 §7.2 (`auth := requester ‖ approvals`), §7.3.

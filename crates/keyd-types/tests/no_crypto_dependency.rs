@@ -30,8 +30,10 @@ const CRYPTO_PROFILE: &str = "krb-crypto";
 /// server side is the separate crate `ipc-keyd-server`. `keyadm` is the
 /// Role::Admin tool on the DC host, which only asks keyd and needs no
 /// client crypto, and `provision-manifest` the manifest library it reads
-/// (docs/51 §6, §12 A5; A-73: D182 binds the DC's processes).
-const CRYPTO_FREE: [&str; 7] = [
+/// (docs/51 §6, §12 A5; A-73: D182 binds the DC's processes). `provision`
+/// is the offline provisioning tool (docs/51 §4, §12 A4): it writes the
+/// directory, configuration, policy and manifest and creates no key.
+const CRYPTO_FREE: [&str; 8] = [
     "keyd-types",
     "kdc",
     "ldap",
@@ -39,6 +41,7 @@ const CRYPTO_FREE: [&str; 7] = [
     "ipc-keyd",
     "keyadm",
     "provision-manifest",
+    "provision",
 ];
 
 /// The package names in `package`'s normal dependency graph (the package

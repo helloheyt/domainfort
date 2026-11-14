@@ -1412,3 +1412,111 @@ fn error_display_is_fixed_text() {
         )
     );
 }
+
+// ---- admind: keyadm_uid and admin_socket_group (docs/51 §4.6, task A4) -------
+
+/// Both new admind keys are required: without `keyadm_uid` admind could
+/// not tell keyadm from any other peer (docs/51 §6, §7.3), and without
+/// `admin_socket_group` the socket directory's group would be a default
+/// (docs/50 §3.1) — fail closed.
+/// Spec: docs/51 §4.6, §6, §7.3; docs/50 §3.1, §7.1 ("missing-required ⇒
+/// do not start").
+#[test]
+fn admind_keyadm_uid_and_socket_group_are_required() {
+    for key in ["keyadm_uid", "admin_socket_group"] {
+        let err = error(Daemon::Admind, &remove(ADMIND, key));
+        assert_eq!(err.kind(), ErrorKind::MissingKey, "{key}");
+        assert_eq!(err.key(), Some(key), "{key}");
+    }
+}
+
+/// `keyadm_uid` is an account id: never 0 ("uid 0 is never mapped"), never
+/// all-ones, canonical decimal only.
+/// Spec: docs/50 R50-3, §7.1; docs/questions/Q-230 item 6; docs/51 §4.6.
+#[test]
+fn admind_keyadm_uid_is_a_valid_account_id() {
+    rejects_value(
+        Daemon::Admind,
+        ADMIND,
+        "keyadm_uid",
+        "0",
+        ErrorKind::ReservedId,
+    );
+    rejects_value(
+        Daemon::Admind,
+        ADMIND,
+        "keyadm_uid",
+        "4294967295",
+        ErrorKind::ReservedId,
+    );
+    for value in ["-1", "0807", "8o7", "keyadm", "+807", "807s"] {
+        let text = set(ADMIND, "keyadm_uid", value);
+        assert!(
+            Daemon::Admind.parse(text.as_bytes()).is_err(),
+            "keyadm_uid = {value:?}"
+        );
+    }
+    accepts_value(Daemon::Admind, ADMIND, "keyadm_uid", "4294967294");
+}
+
+/// `keyadm_uid` takes part in the file's uid distinctness rule: one account
+/// per process (keyadm is Role::Admin, admind Role::Directory — A-57), so it
+/// can equal none of admind's own uid, dird's, keyd's or auditd's.
+/// Spec: docs/50 §2.4 ("a separate account per process"), §3.2; A-57;
+/// docs/51 §4.6.
+#[test]
+fn admind_keyadm_uid_is_distinct_from_every_other_uid() {
+    for (value, other) in [
+        ("806", "run_as_uid"),
+        ("802", "dird_uid"),
+        ("801", "keyd_uid"),
+        ("805", "auditd_uid"),
+    ] {
+        let text = set(ADMIND, "keyadm_uid", value);
+        let err = error(Daemon::Admind, &text);
+        assert_eq!(err.kind(), ErrorKind::DuplicateId, "{value} vs {other}");
+        let later = line_of(&text, "keyadm_uid").max(line_of(&text, other));
+        assert_eq!(err.line(), later, "{value} vs {other}");
+    }
+}
+
+/// `admin_socket_group` is a gid: never 0 or all-ones, but — as every gid of
+/// this format — it may equal another account's id (groups are shared for
+/// socket access, docs/50 §3.1).
+/// Spec: docs/50 §3.1, §7.1; docs/51 §4.6.
+#[test]
+fn admind_socket_group_is_a_valid_gid() {
+    rejects_value(
+        Daemon::Admind,
+        ADMIND,
+        "admin_socket_group",
+        "0",
+        ErrorKind::ReservedId,
+    );
+    rejects_value(
+        Daemon::Admind,
+        ADMIND,
+        "admin_socket_group",
+        "4294967295",
+        ErrorKind::ReservedId,
+    );
+    rejects_value(
+        Daemon::Admind,
+        ADMIND,
+        "admin_socket_group",
+        "wheel",
+        ErrorKind::InvalidInteger,
+    );
+    accepts_value(Daemon::Admind, ADMIND, "admin_socket_group", "806");
+    accepts_value(Daemon::Admind, ADMIND, "admin_socket_group", "807");
+}
+
+/// A second `keyadm_uid` line is refused like any duplicate key.
+/// Spec: docs/50 §7.1 ("duplicate … ⇒ do not start").
+#[test]
+fn admind_keyadm_uid_twice_is_rejected() {
+    let text = append(ADMIND, "keyadm_uid = 808");
+    let err = error(Daemon::Admind, &text);
+    assert_eq!(err.kind(), ErrorKind::DuplicateKey);
+    assert_eq!(err.key(), Some("keyadm_uid"));
+}

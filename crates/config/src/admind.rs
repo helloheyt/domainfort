@@ -12,8 +12,19 @@
 //! **No secrets.** Passwords pass through admind in memory only (`mlockall`,
 //! docs/50 §6.4) and never appear in its configuration.
 //!
-//! Spec: docs/50 R50-15, §2.4, §3.1, §3.2, §3.6, §6.4, §7.1; docs/questions/
-//! Q-220.
+//! **keyadm and the socket group** (docs/51 §4.6, task A4): `keyadm_uid` is
+//! the only peer uid for which admind forwards the operations reserved to
+//! keyadm (`FetchApproved`, `Complete`, `ListPendingDestruction` — docs/51
+//! §6, §7.3: "admind forwards only if the peer's uid = `keyadm_uid`"); it
+//! takes part in the file's uid distinctness rule (one account per process,
+//! docs/50 §2.4) and is never 0. `admin_socket_group` is the gid of the
+//! group that may enter `admin.sock`'s directory (docs/50 §3.1: "mode 0750,
+//! group = the channel's clients" — defence in depth only; the
+//! authorization itself is Kerberos, docs/51 §5.1, §5.3); a numeric gid,
+//! never 0 (docs/50 §7.1: no name-service lookup).
+//!
+//! Spec: docs/50 R50-15, §2.4, §3.1, §3.2, §3.6, §6.4, §7.1; docs/51 §4.6,
+//! §5.1, §6, §7.3; docs/questions/Q-220.
 
 use core::time::Duration;
 
@@ -24,10 +35,17 @@ use crate::schema::{
     self, Account, Distinct, Endpoint, AUDITD_UID, AUDIT_SOCKET, DIRD_ADMIN_SOCKET, DIRD_UID,
     FRAME_TIMEOUT, KEYD_DEADLINE, KEYD_SOCKET, KEYD_UID, RUN_AS_GID, RUN_AS_UID,
 };
-use crate::value::AbsolutePath;
+use crate::value::{self, AbsolutePath};
 
 /// Key: the local socket admind listens on. Spec: docs/50 §2.4, §3.1.
 const ADMIN_SOCKET: &str = "admin_socket";
+/// Key: the gid of the group admitted to `admin.sock`'s directory.
+/// Spec: docs/51 §4.6 ("gid of the access group for `admin.sock`
+/// (defence in depth, docs/50 §3.1)"); docs/50 §3.1.
+const ADMIN_SOCKET_GROUP: &str = "admin_socket_group";
+/// Key: the uid of keyadm, the only peer for which admind forwards the
+/// operations reserved to keyadm. Spec: docs/51 §4.6, §6, §7.3.
+const KEYADM_UID: &str = "keyadm_uid";
 
 /// admind's settings, as parsed and validated from its file.
 ///
@@ -36,6 +54,8 @@ const ADMIN_SOCKET: &str = "admin_socket";
 pub struct AdmindSettings {
     run_as: Account,
     admin_socket: AbsolutePath,
+    admin_socket_group: u32,
+    keyadm_uid: u32,
     dird: Endpoint,
     keyd: Endpoint,
     audit: Endpoint,
@@ -49,6 +69,8 @@ impl AdmindSettings {
         RUN_AS_UID,
         RUN_AS_GID,
         ADMIN_SOCKET,
+        ADMIN_SOCKET_GROUP,
+        KEYADM_UID,
         DIRD_ADMIN_SOCKET,
         DIRD_UID,
         KEYD_SOCKET,
@@ -60,9 +82,11 @@ impl AdmindSettings {
     ];
 
     /// Parses and validates admind's file. Required: `run_as_uid`,
-    /// `run_as_gid`, `admin_socket`, `dird_admin_socket` + `dird_uid`,
-    /// `keyd_socket` + `keyd_uid`, `audit_socket`, `auditd_uid`. Optional:
-    /// `frame_timeout` (5s), `keyd_deadline` (2s).
+    /// `run_as_gid`, `admin_socket`, `admin_socket_group` (a gid, never 0),
+    /// `keyadm_uid` (never 0, distinct from every other uid of the file),
+    /// `dird_admin_socket` + `dird_uid`, `keyd_socket` + `keyd_uid`,
+    /// `audit_socket`, `auditd_uid`. Optional: `frame_timeout` (5s),
+    /// `keyd_deadline` (2s).
     ///
     /// # Errors
     /// Any rule of the format or of this schema (see [`crate::ErrorKind`]).
@@ -73,6 +97,10 @@ impl AdmindSettings {
         let mut all = Distinct::default();
         let run_as = schema::account(&doc, &mut all)?;
         let admin_socket = schema::path(&doc, &mut all, ADMIN_SOCKET)?;
+        // A gid: not part of the uid distinctness rule (as `run_as_gid`,
+        // crate::schema::account), but never 0 or all-ones.
+        let admin_socket_group = doc.required(ADMIN_SOCKET_GROUP, value::account_id)?.value;
+        let keyadm_uid = schema::id(&doc, &mut all, KEYADM_UID)?;
         let dird = schema::endpoint(&doc, &mut all, DIRD_ADMIN_SOCKET, DIRD_UID)?;
         let keyd = schema::endpoint(&doc, &mut all, KEYD_SOCKET, KEYD_UID)?;
         let audit = schema::endpoint(&doc, &mut all, AUDIT_SOCKET, AUDITD_UID)?;
@@ -81,6 +109,8 @@ impl AdmindSettings {
         Ok(AdmindSettings {
             run_as,
             admin_socket,
+            admin_socket_group,
+            keyadm_uid,
             dird,
             keyd,
             audit,
@@ -99,6 +129,20 @@ impl AdmindSettings {
     #[must_use]
     pub fn admin_socket(&self) -> &AbsolutePath {
         &self.admin_socket
+    }
+
+    /// The gid of the group admitted to `admin.sock`'s directory (defence
+    /// in depth). Spec: docs/51 §4.6; docs/50 §3.1.
+    #[must_use]
+    pub const fn admin_socket_group(&self) -> u32 {
+        self.admin_socket_group
+    }
+
+    /// keyadm's uid: the only peer for which admind forwards the
+    /// operations reserved to keyadm. Spec: docs/51 §4.6, §6, §7.3.
+    #[must_use]
+    pub const fn keyadm_uid(&self) -> u32 {
+        self.keyadm_uid
     }
 
     /// dird's `dird-admin.sock` and uid. Spec: docs/50 §2.3, §3.2.

@@ -761,6 +761,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "provision"
+version = "0.0.0"
+dependencies = [
+ "ad-schema",
+ "config",
+ "directory-admin",
+ "directory-daemon",
+ "directory-pip",
+ "dirstore",
+ "dtyp",
+ "ipc",
+ "ipc-audit",
+ "ipc-directory-server",
+ "ipc-keyd",
+ "kdc",
+ "kdc-daemon",
+ "keyadm",
+ "keyd",
+ "keyd-daemon",
+ "keyd-types",
+ "krb-proto",
+ "pdp",
+ "policy-store",
+ "provision-manifest",
+ "rustix",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "provision-manifest"
 version = "0.0.0"
 dependencies = [

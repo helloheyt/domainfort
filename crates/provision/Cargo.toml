@@ -1,0 +1,94 @@
+# provision — the one-shot, offline domain-provisioning tool (docs/51 §4,
+# §12 task A4): `provision domain` (part A of R51-1, steps 1-9 of §4.3) and
+# `provision policy` (the offline tier-map edit of R51-21 / A-80).
+#
+# Run as root, before any daemon runs. It writes the directory database
+# (one WriteTxn holding every domain object and both named counters), the
+# development integrity key, the unsigned development policy, every
+# daemon's configuration file and the non-secret manifest — all built in a
+# staging directory on the targets' filesystem and renamed into place with
+# the database last. No password and no Kerberos key exists in this tool
+# (keys are part B of R51-1: `keyadm ceremony` and A6).
+#
+# Written only from docs/51 (whole; decided A-72), docs/46, docs/47, docs/50,
+# docs/32, the decisions A-15, A-19, A-36, A-60, A-68, A-69, A-72..A-89,
+# P-22, the questions Q-270, Q-293, Q-294, Q-296, Q-298, Q-299, Q-330,
+# Q-335, Q-336, Q-345, Q-355..Q-358, the public APIs of this workspace's
+# crates, the pinned [MS-DTYP] v20241119, [MS-ADTS] v20261026 and [MS-SAMR]
+# v20260427 sections cited in the source (opened in-session from
+# tools/spec-pin/cache/, SHA-256 verified against the manifest), and the
+# docs.rs API pages of rustix 1.1.6 and redb 4.5.0 (API documentation only,
+# never source — P-2). No other implementation and no existing provisioning
+# tool was consulted or recalled (AGENTS.md §1-3).
+
+[package]
+name = "provision"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "provision"
+path = "src/lib.rs"
+
+[[bin]]
+name = "provision"
+path = "src/main.rs"
+
+[dependencies]
+# Our own workspace crates (path dependencies). NOT krb-crypto, NOT keyd
+# (D182 / A-73: guarded in crates/keyd-types/tests/no_crypto_dependency.rs).
+#
+# The directory store: Store, WriteTxn, the named counters (A-83),
+# NewObject, Origin, NodeId, IntegrityKey.
+dirstore = { path = "../dirstore" }
+# The phase-1 schema: attribute / class ids, class chains, schemaIDGUIDs,
+# the userAccountControl / groupType flag values.
+ad-schema = { path = "../ad-schema" }
+# SID, GUID, ACE, ACL, SECURITY_DESCRIPTOR (the root's).
+dtyp = { path = "../dtyp" }
+# The rule language (Rule, Match, …), the access-right values pdp checks.
+pdp = { path = "../pdp" }
+# NamingContext, the DSTIME mapping, the view used to verify the staged
+# store (NC root SID, krbtgt handle).
+directory-pip = { path = "../directory-pip" }
+# The write PEP's shared constants (counter names and RID range, A-89), its
+# name rules (A-79), the child-descriptor computation (A-84) and the
+# CSPRNG source (A-15 / A-77).
+directory-admin = { path = "../directory-admin" }
+# The unsigned development policy format 2 (A-68 / A-69).
+policy-store = { path = "../policy-store" }
+# The non-secret manifest (A-86).
+provision-manifest = { path = "../provision-manifest" }
+# The daemons' configuration schemas: every generated file is parsed back
+# before anything is written.
+config = { path = "../config" }
+# KeydConfig (the realm's enctypes) for the staged-store check — crypto-free.
+keyd-types = { path = "../keyd-types" }
+# Realm, KerberosTime.
+krb-proto = { path = "../krb-proto" }
+# Already in the workspace lock (dirstore, directory-daemon): the integrity
+# key's buffers are wiped on drop. Not a new dependency.
+zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
+# rustix — owner decision P-12 (already in the lock through daemon-sandbox):
+# O_EXCL | O_NOFOLLOW creation, fchmod, fchown, fsync, renameat /
+# renameat_with (RENAME_NOREPLACE), unlinkat, geteuid — through its
+# documented safe API only (docs.rs, P-2).
+rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "process"] }
+
+[dev-dependencies]
+# The end-to-end checks of the produced files (tests only).
+directory-daemon = { path = "../directory-daemon" }
+kdc-daemon = { path = "../kdc-daemon" }
+ipc-directory-server = { path = "../ipc-directory-server" }
+kdc = { path = "../kdc" }
+keyadm = { path = "../keyadm" }
+keyd = { path = "../keyd" }
+keyd-daemon = { path = "../keyd-daemon" }
+ipc = { path = "../ipc" }
+ipc-keyd = { path = "../ipc-keyd" }
+ipc-audit = { path = "../ipc-audit", default-features = false, features = ["keyd"] }
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "net"] }
+
+[lints]
+workspace = true

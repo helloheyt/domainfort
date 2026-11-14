@@ -81,14 +81,14 @@ pub(crate) fn sam_ok(sam: &str, max_chars: usize) -> bool {
 /// the computer-account form (item 11), and a user holding a computer-shaped
 /// name invites confusion between the two (docs/questions/Q-355 item 2).
 /// Spec: [MS-SAMR] 3.1.1.6 items 8-12; A-79.
-pub(crate) fn user_sam_ok(sam: &str) -> bool {
+pub fn user_sam_ok(sam: &str) -> bool {
     sam_ok(sam, MAX_ACCOUNT_SAM_CHARS) && !sam.ends_with(COMPUTER_SUFFIX)
 }
 
 /// A group's sAMAccountName (also its cn, so also ≤ 64 characters —
 /// Q-355 item 1); no trailing "$" (Q-355 item 2).
 /// Spec: [MS-SAMR] 3.1.1.6 items 8-10, 13; docs/46 §5.4 (cn).
-pub(crate) fn group_sam_ok(sam: &str) -> bool {
+pub fn group_sam_ok(sam: &str) -> bool {
     sam_ok(sam, MAX_GROUP_SAM_CHARS.min(MAX_RDN_VALUE_CHARS)) && !sam.ends_with(COMPUTER_SUFFIX)
 }
 
@@ -96,7 +96,7 @@ pub(crate) fn group_sam_ok(sam: &str) -> bool {
 /// of at most 20 characters ending with a **single** "$", so `name` itself
 /// must not end with "$".
 /// Spec: [MS-SAMR] 3.1.1.6 items 8-12; docs/51 §5.2 row 2; A-79.
-pub(crate) fn computer_name_ok(name: &str) -> bool {
+pub fn computer_name_ok(name: &str) -> bool {
     !name.ends_with(COMPUTER_SUFFIX)
         && sam_ok(name, MAX_RDN_VALUE_CHARS)
         && sam_ok(&computer_sam(name), MAX_ACCOUNT_SAM_CHARS)
@@ -104,7 +104,7 @@ pub(crate) fn computer_name_ok(name: &str) -> bool {
 
 /// The sAMAccountName of a computer named `name`. Spec: docs/51 §5.2 row 2
 /// (`sAMAccountName = name ‖ "$"`).
-pub(crate) fn computer_sam(name: &str) -> String {
+pub fn computer_sam(name: &str) -> String {
     let mut sam = String::with_capacity(name.len() + 1);
     sam.push_str(name);
     sam.push(COMPUTER_SUFFIX);
@@ -113,7 +113,7 @@ pub(crate) fn computer_sam(name: &str) -> String {
 
 /// An OU / container name (`ou` / `cn`): 1..64 printable ASCII characters.
 /// Spec: docs/46 §5.4; P-6.
-pub(crate) fn rdn_value_ok(name: &str) -> bool {
+pub fn rdn_value_ok(name: &str) -> bool {
     !name.is_empty() && name.len() <= MAX_RDN_VALUE_CHARS && printable_ascii(name)
 }
 
@@ -129,7 +129,7 @@ pub(crate) fn upn_ok(upn: &str) -> bool {
 /// upper-case letter (RFC 4120 §6.2.1: the host component "MUST be
 /// lowercase"; docs/questions/Q-355 item 3).
 /// Spec: docs/46 §5.4; RFC 4120 §6.2.1; docs/47 §1.3; P-6.
-pub(crate) fn dns_host_name_ok(name: &str) -> bool {
+pub fn dns_host_name_ok(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_DNS_HOST_NAME_CHARS
         && printable_ascii(name)
@@ -148,7 +148,7 @@ pub(crate) fn dns_host_name_ok(name: &str) -> bool {
 /// host name is an Internet domain name"; host lowercase), §7.3; docs/47
 /// §1.3 (R47-1); docs/51 §5.2 row 2 (one SPN, host in lower case);
 /// docs/46 §5.4.
-pub(crate) fn spn_ok(spn: &str, dns_host_name: &str) -> bool {
+pub fn spn_ok(spn: &str, dns_host_name: &str) -> bool {
     if spn.is_empty() || spn.len() > MAX_PRINCIPAL_NAME_CHARS || !printable_ascii(spn) {
         return false;
     }

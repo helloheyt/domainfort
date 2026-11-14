@@ -33,9 +33,11 @@ pub(crate) fn dstime(now: &KerberosTime) -> Option<i64> {
     directory_pip::dstime_of(now)
 }
 
-/// The FILETIME of `now` (pwdLastSet). Spec: [MS-DTYP] 2.3.3 as cited in
-/// docs/47 §4.2, §4.5.
-pub(crate) fn filetime(now: &KerberosTime) -> Option<i64> {
+/// The FILETIME of `now` (pwdLastSet), whole seconds: the DSTIME of `now`
+/// times 10^7. Public so that `provision domain` (task A4) writes the first
+/// administrators' pwdLastSet in the same unit as `BeginPasswordSet`.
+/// Spec: [MS-DTYP] 2.3.3 as cited in docs/47 §4.2, §4.5.
+pub fn filetime(now: &KerberosTime) -> Option<i64> {
     dstime(now)?.checked_mul(FILETIME_TICKS_PER_SECOND)
 }
 
