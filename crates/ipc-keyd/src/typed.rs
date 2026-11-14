@@ -22,18 +22,18 @@
 use crate::wire::{
     CreateKeyRequest, GrantSetSecretRequest, IssueAsRepRequest, IssueTgsRepRequest, KeydReply,
     KeydRequest, OpenAndVerifyServiceTicketRequest, OpenAndVerifyTgtRequest, OpenFastArmorRequest,
-    RetireKvnoRequest, RotateKrbtgtRequest, SealFastErrorRequest, SetSecretRequest,
-    VerifyPreauthRequest, VerifySecretRequest, WireAsTemplate, WireAuthnProof, WireBinding,
-    WireConfigDescription, WireFastArmor, WireRepParts, WireServiceContext, WireSetSecretTarget,
-    WireTgsFast, WireTgsTemplate, WireTgtContext, WireTime,
+    RegisterDecisionRequest, SealFastErrorRequest, SetSecretRequest, VerifyPreauthRequest,
+    VerifySecretRequest, WireAsTemplate, WireAuthnProof, WireBinding, WireConfigDescription,
+    WireDecidedOperation, WireDestructionPage, WireFastArmor, WireRepParts, WireServiceContext,
+    WireSetSecretTarget, WireTgsFast, WireTgsTemplate, WireTgtContext, WireTime,
 };
 use core::fmt;
 use ipc::{DerBlob, Secret};
 use keyd_types::{
     AccountKind, ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof, ConfigDescription,
-    CtxId, DualControlToken, FastArmor, FastConversation, IssueError, KeyHandle, Kvno, Operation,
-    PrincipalBinding, Role, ServiceContext, SetSecretTarget, TgsRepParts, TgsTicketTemplate,
-    TgtContext,
+    CtxId, DecidedOperation, DecisionId, DestructionPage, FastArmor, FastConversation, IssueError,
+    KeyHandle, Kvno, Operation, PrincipalBinding, PrincipalId, Role, ServiceContext,
+    SetSecretTarget, TgsRepParts, TgsTicketTemplate, TgtContext,
 };
 use krb_proto::{
     ApReq, EncryptedData, KerberosTime, KrbError, KrbFastArmoredReq, KrbFastReq, PaData,
@@ -307,7 +307,8 @@ pub enum Call {
         /// The salt.
         salt: String,
     },
-    /// Spec: docs/10 §6.
+    /// No role may call it since A-102 (docs/52 R4); keyd refuses it at the
+    /// capability table, with its record. Spec: docs/10 §6.
     VerifySecret {
         /// The key set's handle.
         handle: KeyHandle,
@@ -321,29 +322,27 @@ pub enum Call {
         /// The principal name.
         binding: PrincipalBinding,
     },
-    /// Spec: docs/10 §7.
+    /// Run dird's `RotateKey` decision. Spec: docs/10 §7; docs/52 §4.2.
     RotateKey {
-        /// The key set's handle.
-        handle: KeyHandle,
+        /// The decision id.
+        decision: DecisionId,
     },
-    /// Spec: docs/10 §7.
+    /// Run dird's `RotateKrbtgt` decision (keyd builds the dual-control
+    /// token from its approvers). Spec: docs/10 §7; docs/52 §4.2.
     RotateKrbtgt {
-        /// Krbtgt handle.
-        krbtgt: KeyHandle,
-        /// The dual-control approval.
-        approval: DualControlToken,
+        /// The decision id.
+        decision: DecisionId,
     },
-    /// Spec: docs/10 §7.
+    /// Run dird's `RetireKvno` decision. Spec: docs/10 §7; docs/52 §4.2.
     RetireKvno {
-        /// The key set's handle.
-        handle: KeyHandle,
-        /// The kvno to retire.
-        kvno: Kvno,
+        /// The decision id.
+        decision: DecisionId,
     },
-    /// Spec: docs/10 §7; A-35.
+    /// Run dird's `DestroyKeySet` decision. Spec: docs/10 §7; A-35;
+    /// docs/52 §4.2.
     DestroyKeySet {
-        /// The key set's handle.
-        handle: KeyHandle,
+        /// The decision id.
+        decision: DecisionId,
     },
     /// Spec: docs/10 §7א.
     DescribeConfig,
@@ -358,9 +357,42 @@ pub enum Call {
         /// How long the grant stays live, in seconds (keyd's clock).
         lifetime_secs: u32,
     },
+    /// dird registers a decision (Role::Ldap). Spec: docs/52 §4.2.
+    RegisterDecision {
+        /// dird's decision id.
+        id: DecisionId,
+        /// What dird decided.
+        operation: DecidedOperation,
+        /// The approvers dird verified.
+        approvers: Vec<PrincipalId>,
+        /// How long the decision stays live, in seconds (keyd's clock).
+        lifetime_secs: u32,
+    },
+    /// End the provisioning ceremony (Role::Admin). Spec: docs/52 §4.4.
+    SealCeremony,
+    /// One page of pending destroy decisions (Role::Admin). Spec: docs/52
+    /// §4.6.
+    ListDestroyDecisions {
+        /// Resume strictly after this decision id.
+        after: Option<DecisionId>,
+    },
 }
 
 impl Call {
+    /// The decision id an execution names (`rotate_key`, `rotate_krbtgt`,
+    /// `retire_kvno`, `destroy_key_set`), else `None`.
+    /// Spec: docs/52 §4.2.
+    #[must_use]
+    pub fn decision(&self) -> Option<DecisionId> {
+        match self {
+            Call::RotateKey { decision }
+            | Call::RotateKrbtgt { decision }
+            | Call::RetireKvno { decision }
+            | Call::DestroyKeySet { decision } => Some(*decision),
+            _ => None,
+        }
+    }
+
     /// The keyd operation this call invokes.
     /// Spec: docs/10 §2 (`Operation`).
     #[must_use]
@@ -383,6 +415,9 @@ impl Call {
             Call::DescribeConfig => Operation::DescribeConfig,
             Call::Ping => Operation::Ping,
             Call::GrantSetSecret { .. } => Operation::GrantSetSecret,
+            Call::RegisterDecision { .. } => Operation::RegisterDecision,
+            Call::SealCeremony => Operation::SealCeremony,
+            Call::ListDestroyDecisions { .. } => Operation::ListDestroyDecisions,
         }
     }
 
@@ -506,18 +541,10 @@ impl Call {
                 handle: *handle,
                 binding: wire_binding(binding)?,
             }),
-            Call::RotateKey { handle } => KeydRequest::RotateKey(*handle),
-            Call::RotateKrbtgt { krbtgt, approval } => {
-                KeydRequest::RotateKrbtgt(RotateKrbtgtRequest {
-                    krbtgt: *krbtgt,
-                    approval: *approval,
-                })
-            }
-            Call::RetireKvno { handle, kvno } => KeydRequest::RetireKvno(RetireKvnoRequest {
-                handle: *handle,
-                kvno: *kvno,
-            }),
-            Call::DestroyKeySet { handle } => KeydRequest::DestroyKeySet(*handle),
+            Call::RotateKey { decision } => KeydRequest::RotateKey(*decision),
+            Call::RotateKrbtgt { decision } => KeydRequest::RotateKrbtgt(*decision),
+            Call::RetireKvno { decision } => KeydRequest::RetireKvno(*decision),
+            Call::DestroyKeySet { decision } => KeydRequest::DestroyKeySet(*decision),
             Call::DescribeConfig => KeydRequest::DescribeConfig,
             Call::Ping => KeydRequest::Ping,
             Call::GrantSetSecret {
@@ -526,17 +553,22 @@ impl Call {
                 lifetime_secs,
             } => KeydRequest::GrantSetSecret(GrantSetSecretRequest {
                 kind: *kind,
-                targets: targets
-                    .iter()
-                    .map(|t| {
-                        Ok(WireSetSecretTarget {
-                            handle: t.handle,
-                            binding: wire_binding(&t.binding)?,
-                        })
-                    })
-                    .collect::<Converted<Vec<WireSetSecretTarget>>>()?,
+                targets: wire_targets(targets)?,
                 lifetime_secs: *lifetime_secs,
             }),
+            Call::RegisterDecision {
+                id,
+                operation,
+                approvers,
+                lifetime_secs,
+            } => KeydRequest::RegisterDecision(RegisterDecisionRequest {
+                id: *id,
+                operation: wire_decided(operation)?,
+                approvers: approvers.clone(),
+                lifetime_secs: *lifetime_secs,
+            }),
+            Call::SealCeremony => KeydRequest::SealCeremony,
+            Call::ListDestroyDecisions { after } => KeydRequest::ListDestroyDecisions(*after),
         })
     }
 
@@ -631,34 +663,96 @@ impl Call {
                 handle: m.handle,
                 binding: binding(&m.binding)?,
             },
-            KeydRequest::RotateKey(handle) => Call::RotateKey { handle },
-            KeydRequest::RotateKrbtgt(m) => Call::RotateKrbtgt {
-                krbtgt: m.krbtgt,
-                approval: m.approval,
-            },
-            KeydRequest::RetireKvno(m) => Call::RetireKvno {
-                handle: m.handle,
-                kvno: m.kvno,
-            },
-            KeydRequest::DestroyKeySet(handle) => Call::DestroyKeySet { handle },
+            KeydRequest::RotateKey(decision) => Call::RotateKey { decision },
+            KeydRequest::RotateKrbtgt(decision) => Call::RotateKrbtgt { decision },
+            KeydRequest::RetireKvno(decision) => Call::RetireKvno { decision },
+            KeydRequest::DestroyKeySet(decision) => Call::DestroyKeySet { decision },
             KeydRequest::DescribeConfig => Call::DescribeConfig,
             KeydRequest::Ping => Call::Ping,
             KeydRequest::GrantSetSecret(m) => Call::GrantSetSecret {
                 kind: m.kind,
-                targets: m
-                    .targets
-                    .iter()
-                    .map(|t| {
-                        Ok(SetSecretTarget {
-                            handle: t.handle,
-                            binding: binding(&t.binding)?,
-                        })
-                    })
-                    .collect::<Converted<Vec<SetSecretTarget>>>()?,
+                targets: targets(&m.targets)?,
                 lifetime_secs: m.lifetime_secs,
             },
+            KeydRequest::RegisterDecision(m) => Call::RegisterDecision {
+                id: m.id,
+                operation: decided(&m.operation)?,
+                approvers: m.approvers,
+                lifetime_secs: m.lifetime_secs,
+            },
+            KeydRequest::SealCeremony => Call::SealCeremony,
+            KeydRequest::ListDestroyDecisions(after) => Call::ListDestroyDecisions { after },
         })
     }
+}
+
+/// Set-secret targets on the wire (the salt as its UTF-8 octets).
+/// Spec: docs/questions/Q-450 item 9; docs/52 §4.2 (N4).
+fn wire_targets(targets: &[SetSecretTarget]) -> Converted<Vec<WireSetSecretTarget>> {
+    targets
+        .iter()
+        .map(|t| {
+            Ok(WireSetSecretTarget {
+                handle: t.handle,
+                binding: wire_binding(&t.binding)?,
+                salt: t.salt.as_bytes().to_vec(),
+            })
+        })
+        .collect()
+}
+
+/// Set-secret targets from the wire: each binding through krb-proto, each
+/// salt as UTF-8.
+/// Spec: docs/questions/Q-450 item 9; docs/52 §4.2 (N4).
+fn targets(wire: &[WireSetSecretTarget]) -> Converted<Vec<SetSecretTarget>> {
+    wire.iter()
+        .map(|t| {
+            Ok(SetSecretTarget {
+                handle: t.handle,
+                binding: binding(&t.binding)?,
+                salt: text(&t.salt)?,
+            })
+        })
+        .collect()
+}
+
+/// A decided operation on the wire. Spec: docs/52 §4.2, §4.6.
+fn wire_decided(operation: &DecidedOperation) -> Converted<WireDecidedOperation> {
+    Ok(match operation {
+        DecidedOperation::SetSecret { kind, targets } => WireDecidedOperation::SetSecret {
+            kind: *kind,
+            targets: wire_targets(targets)?,
+        },
+        DecidedOperation::RotateKrbtgt { krbtgt } => WireDecidedOperation::RotateKrbtgt(*krbtgt),
+        DecidedOperation::RotateKey { handle } => WireDecidedOperation::RotateKey(*handle),
+        DecidedOperation::RetireKvno { handle, kvno } => {
+            WireDecidedOperation::RetireKvno(*handle, *kvno)
+        }
+        DecidedOperation::DestroyKeySet { principal } => {
+            WireDecidedOperation::DestroyKeySet(*principal)
+        }
+    })
+}
+
+/// A decided operation from the wire. Spec: docs/52 §4.2, §4.6.
+fn decided(wire: &WireDecidedOperation) -> Converted<DecidedOperation> {
+    Ok(match wire {
+        WireDecidedOperation::SetSecret { kind, targets: t } => DecidedOperation::SetSecret {
+            kind: *kind,
+            targets: targets(t)?,
+        },
+        WireDecidedOperation::RotateKrbtgt(krbtgt) => {
+            DecidedOperation::RotateKrbtgt { krbtgt: *krbtgt }
+        }
+        WireDecidedOperation::RotateKey(handle) => DecidedOperation::RotateKey { handle: *handle },
+        WireDecidedOperation::RetireKvno(handle, kvno) => DecidedOperation::RetireKvno {
+            handle: *handle,
+            kvno: *kvno,
+        },
+        WireDecidedOperation::DestroyKeySet(principal) => DecidedOperation::DestroyKeySet {
+            principal: *principal,
+        },
+    })
 }
 
 /// Spec: docs/50 §3.4 (`AuthnProof { exchange_id, client, authtime }`).
@@ -745,6 +839,12 @@ pub enum Answer {
     Ping(Result<(), keyd_types::Error>),
     /// Spec: docs/51 §5.8 option (b); docs/questions/Q-450.
     GrantSetSecret(Result<(), keyd_types::Error>),
+    /// Spec: docs/52 §4.2.
+    RegisterDecision(Result<(), keyd_types::Error>),
+    /// Spec: docs/52 §4.4.
+    SealCeremony(Result<(), keyd_types::Error>),
+    /// Spec: docs/52 §4.6.
+    ListDestroyDecisions(Result<DestructionPage, keyd_types::Error>),
 }
 
 /// A success payload, or keyd's error carried by `failure`.
@@ -785,6 +885,9 @@ impl Answer {
             Answer::DescribeConfig(_) => Operation::DescribeConfig,
             Answer::Ping(_) => Operation::Ping,
             Answer::GrantSetSecret(_) => Operation::GrantSetSecret,
+            Answer::RegisterDecision(_) => Operation::RegisterDecision,
+            Answer::SealCeremony(_) => Operation::SealCeremony,
+            Answer::ListDestroyDecisions(_) => Operation::ListDestroyDecisions,
         }
     }
 
@@ -914,6 +1017,22 @@ impl Answer {
             Answer::GrantSetSecret(r) => {
                 outcome(r, |()| Ok(KeydReply::GrantSetSecret), KeydReply::Failure)
             }
+            Answer::RegisterDecision(r) => {
+                outcome(r, |()| Ok(KeydReply::RegisterDecision), KeydReply::Failure)
+            }
+            Answer::SealCeremony(r) => {
+                outcome(r, |()| Ok(KeydReply::SealCeremony), KeydReply::Failure)
+            }
+            Answer::ListDestroyDecisions(r) => outcome(
+                r,
+                |page| {
+                    Ok(KeydReply::ListDestroyDecisions(WireDestructionPage {
+                        entries: page.entries.clone(),
+                        next: page.next,
+                    }))
+                },
+                KeydReply::Failure,
+            ),
         }
     }
 
@@ -1026,6 +1145,19 @@ impl Answer {
             (Operation::Ping, R::Failure(e)) => Answer::Ping(Err(e)),
             (Operation::GrantSetSecret, R::GrantSetSecret) => Answer::GrantSetSecret(Ok(())),
             (Operation::GrantSetSecret, R::Failure(e)) => Answer::GrantSetSecret(Err(e)),
+            (Operation::RegisterDecision, R::RegisterDecision) => Answer::RegisterDecision(Ok(())),
+            (Operation::RegisterDecision, R::Failure(e)) => Answer::RegisterDecision(Err(e)),
+            (Operation::SealCeremony, R::SealCeremony) => Answer::SealCeremony(Ok(())),
+            (Operation::SealCeremony, R::Failure(e)) => Answer::SealCeremony(Err(e)),
+            (Operation::ListDestroyDecisions, R::ListDestroyDecisions(page)) => {
+                Answer::ListDestroyDecisions(Ok(DestructionPage {
+                    entries: page.entries,
+                    next: page.next,
+                }))
+            }
+            (Operation::ListDestroyDecisions, R::Failure(e)) => {
+                Answer::ListDestroyDecisions(Err(e))
+            }
             _ => return Err(ConversionError::UnexpectedReply),
         })
     }

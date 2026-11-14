@@ -96,12 +96,25 @@ pub const MAX_ENCTYPES: u32 = 4;
 /// Spec: docs/51 §5.2 row 5, §7.3; docs/questions/Q-450 item 9.
 pub const MAX_GRANT_TARGETS: u32 = 2;
 
+/// Bound of the approvers of `register_decision`: keyd-types'
+/// `MAX_DECISION_APPROVERS` (the requester and at most two approvals). The
+/// codec refuses a longer list; keyd judges distinctness and the minimum.
+/// Spec: docs/52 §4.2 (A-102); docs/51 §7.2.
+pub const MAX_DECISION_APPROVERS: u32 = 3;
+
+/// Bound of the entries of one `list_destroy_decisions` page: keyd-types'
+/// `MAX_DESTROY_DECISION_PAGE`.
+/// Spec: docs/52 §4.6 (A-102); docs/50 §3.3 (bounded replies).
+pub const MAX_DESTROY_PAGE: u32 = 64;
+
 // The bounds agree with the values they are derived from; checked at compile
 // time, never at run time.
 const _: () = assert!(MAX_REQUEST_FIELD as usize == kdc::MAX_REQUEST_LEN);
 const _: () = assert!(MAX_REPLY_FIELD as usize == krb_proto::limits::MAX_MESSAGE_LEN);
 const _: () = assert!(MAX_SEAL_PADATA as usize == krb_proto::limits::MAX_PADATA);
 const _: () = assert!(MAX_GRANT_TARGETS as usize == keyd_types::MAX_GRANT_TARGETS);
+const _: () = assert!(MAX_DECISION_APPROVERS as usize == keyd_types::MAX_DECISION_APPROVERS);
+const _: () = assert!(MAX_DESTROY_PAGE as usize == keyd_types::MAX_DESTROY_DECISION_PAGE);
 const _: () = assert!(MAX_REQUEST_FIELD < MAX_REQUEST_BODY);
 const _: () = assert!(MAX_REPLY_FIELD < MAX_REPLY_BODY);
 
@@ -127,25 +140,36 @@ pub mod request_kind {
     pub const OPEN_AND_VERIFY_SERVICE_TICKET: u8 = 0x07;
     /// `set_secret` (Directory). Spec: docs/10 §6.
     pub const SET_SECRET: u8 = 0x08;
-    /// `verify_secret` (Directory). Spec: docs/10 §6.
+    /// `verify_secret` — **no role** holds it since A-102 (docs/52 R4); the
+    /// kind stays so that keyd records a refused call. Spec: docs/10 §6.
     pub const VERIFY_SECRET: u8 = 0x09;
     /// `create_key` (Admin). Spec: docs/10 §7.
     pub const CREATE_KEY: u8 = 0x0A;
-    /// `rotate_key` (Admin). Spec: docs/10 §7.
+    /// `rotate_key(decision)` (Admin). Spec: docs/10 §7; docs/52 §4.6.
     pub const ROTATE_KEY: u8 = 0x0B;
-    /// `rotate_krbtgt` (Admin). Spec: docs/10 §7.
+    /// `rotate_krbtgt(decision)` (Admin). Spec: docs/10 §7; docs/52 §4.6.
     pub const ROTATE_KRBTGT: u8 = 0x0C;
-    /// `retire_kvno` (Admin). Spec: docs/10 §7.
+    /// `retire_kvno(decision)` (Admin). Spec: docs/10 §7; docs/52 §4.6.
     pub const RETIRE_KVNO: u8 = 0x0D;
-    /// `destroy_key_set` (Admin). Spec: docs/10 §7.
+    /// `destroy_key_set(decision)` (Admin). Spec: docs/10 §7; docs/52 §4.6.
     pub const DESTROY_KEY_SET: u8 = 0x0E;
     /// `describe_config` (Kdc, Ldap). Spec: docs/10 §7א.
     pub const DESCRIBE_CONFIG: u8 = 0x0F;
     /// `ping` (every role). Spec: docs/10 §7א.
     pub const PING: u8 = 0x10;
-    /// `grant_set_secret` (Ldap, Admin). Appended by task A15a.
+    /// `grant_set_secret` (Admin, provisioning only since A-102). Appended
+    /// by task A15a.
     /// Spec: docs/51 §5.8 option (b); docs/questions/Q-450 item 9.
     pub const GRANT_SET_SECRET: u8 = 0x11;
+    /// `register_decision` (Ldap). Appended by A-102.
+    /// Spec: docs/52 §4.2, §4.6.
+    pub const REGISTER_DECISION: u8 = 0x12;
+    /// `seal_ceremony` (Admin). Appended by A-102.
+    /// Spec: docs/52 §4.4, §4.6.
+    pub const SEAL_CEREMONY: u8 = 0x13;
+    /// `list_destroy_decisions` (Admin). Appended by A-102.
+    /// Spec: docs/52 §4.3, §4.6.
+    pub const LIST_DESTROY_DECISIONS: u8 = 0x14;
 
     /// The closed request table. Spec: docs/50 §3.3, §3.4.
     pub const ALL: &[u8] = &[
@@ -166,6 +190,9 @@ pub mod request_kind {
         DESCRIBE_CONFIG,
         PING,
         GRANT_SET_SECRET,
+        REGISTER_DECISION,
+        SEAL_CEREMONY,
+        LIST_DESTROY_DECISIONS,
     ];
 }
 
@@ -218,6 +245,12 @@ pub mod reply_kind {
     /// `()`: the grant is registered. Spec: docs/51 §5.8 option (b);
     /// docs/questions/Q-450 item 9.
     pub const GRANT_SET_SECRET: u8 = ok(rq::GRANT_SET_SECRET);
+    /// `()`: the decision is registered. Spec: docs/52 §4.2.
+    pub const REGISTER_DECISION: u8 = ok(rq::REGISTER_DECISION);
+    /// `()`: the ceremony is sealed. Spec: docs/52 §4.4.
+    pub const SEAL_CEREMONY: u8 = ok(rq::SEAL_CEREMONY);
+    /// One page of pending destroy decisions. Spec: docs/52 §4.6.
+    pub const LIST_DESTROY_DECISIONS: u8 = ok(rq::LIST_DESTROY_DECISIONS);
     /// A refusal of an authentication step: `keyd_types::AuthnError`.
     /// Spec: docs/10 §9; A-26; A-56.
     pub const AUTHN_FAILURE: u8 = 0xF1;
@@ -248,6 +281,9 @@ pub mod reply_kind {
         DESCRIBE_CONFIG,
         PING,
         GRANT_SET_SECRET,
+        REGISTER_DECISION,
+        SEAL_CEREMONY,
+        LIST_DESTROY_DECISIONS,
         AUTHN_FAILURE,
         ISSUE_FAILURE,
         FAILURE,

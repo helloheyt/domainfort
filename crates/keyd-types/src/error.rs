@@ -108,7 +108,8 @@ pub enum IssueError {
 /// Error of a management, secret or daemon-support operation (`create_key`,
 /// `rotate_key`, `rotate_krbtgt`, `retire_kvno`, `destroy_key_set`,
 /// `set_secret`, `verify_secret`, `seal_fast_error`, `describe_config`,
-/// `ping`).
+/// `ping`, `grant_set_secret`, `register_decision`, `seal_ceremony`,
+/// `list_destroy_decisions`).
 /// Spec: docs/10 §9; docs/50 §3.4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {

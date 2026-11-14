@@ -11,12 +11,12 @@
 //! (docs/50 §3.3: "a single encoding per value"), and a rejection maps to
 //! the refusal table (a shared `Refused`, or a close without a reply).
 //!
-//! Task A10 added the forwarded key-operation requests and keyadm's three
-//! requests (dird's layouts, no `auth`): whatever decodes as a keyadm
-//! request has one of the keyadm kinds.
+//! Task A10 added the forwarded key-operation requests. keyadm's three
+//! requests (`0x10`–`0x12`) were retired by A-102: nothing decodes with one
+//! of those kinds (admind no longer forwards anything for keyadm, N2).
 //!
 //! Spec: docs/51 §6, §7.1, §7.2, §7.6; docs/50 §3.3, §9; A-59;
-//! docs/questions/Q-422.
+//! docs/questions/Q-422, Q-460 (A-102).
 
 use ipc::{decode_body, encode_frame, Direction};
 use ipc_admin::{decode_request, encode_request, AdminRequest, Request, ADMIN_CHANNEL};
@@ -28,12 +28,10 @@ fuzz_target!(|data: &[u8]| {
             let again = encode_frame(ADMIN_CHANNEL, Direction::Request, &wire)
                 .expect("a decoded request re-encodes");
             assert_eq!(again.body(), data, "canonical wire round trip");
+            assert!(!ipc_admin::channel::request_kind::RETIRED.contains(&data[3]));
             if let Ok(request) = Request::from_wire(wire) {
                 let typed = encode_request(&request).expect("a typed request re-encodes");
                 assert_eq!(typed.body(), data, "canonical typed round trip");
-                if let Request::Keyadm(_) = request {
-                    assert!(ipc_admin::channel::request_kind::KEYADM.contains(&data[3]));
-                }
             }
         }
         Err(error) => {

@@ -105,26 +105,42 @@ fn password_events(events: &[AdmindEvent]) -> Vec<PasswordEvent> {
         .collect()
 }
 
-/// keyd verifies `candidate` for `target`'s PrincipalLongterm key set
-/// (Role::Directory may call `verify_secret`, docs/10 §2, §6).
+/// keyd verifies `candidate` for `target`'s PrincipalLongterm key set, the
+/// way the KDC does: `verify_preauth` of a PA-ENC-TIMESTAMP under the key
+/// derived from `candidate` (RFC 4120 §5.2.7.2; docs/10 §4). No role holds
+/// `verify_secret` since A-102 (docs/52 R4, Q-465).
 fn keyd_verifies(world: &World, target: Guid, candidate: &str) -> bool {
+    // The account's string-to-key salt (dird's `account_salt`, [MS-KILE]
+    // 3.1.1.2 as docs/47 §9.1 applies it): a user's realm ‖ sAMAccountName;
+    // ws9$'s realm ‖ "host" ‖ name ‖ "." ‖ DNS domain.
+    let salt = if target == g(WS9) {
+        "EXAMPLE.ORGhostws9.example.org"
+    } else {
+        "EXAMPLE.ORGbob"
+    };
+    let key = support::common::password_key(support::common::AES256, candidate, salt);
+    // PA-ENC-TIMESTAMP (RFC 4120 §5.2.7.2) without a kvno, so that it names
+    // the current key whatever its version.
+    let mut padata = support::common::pa_enc_timestamp(&key, support::common::now());
+    let mut sealed = krb_proto::EncryptedData::decode(&padata.padata_value).unwrap();
+    sealed.kvno = None;
+    padata.padata_value = sealed.encode().unwrap();
     let mut client = ipc_keyd::KeydClient::new(
-        support::connectors::keyd(&world.keyd_dir_socket),
+        support::connectors::keyd(&world.keyd_kdc_socket),
         world.uid,
         ipc_keyd::DEFAULT_DEADLINE,
     )
     .unwrap();
-    let call = ipc_keyd::Call::VerifySecret {
-        handle: KeyHandle::new(
-            PrincipalId::from_bytes(target.to_packet()),
-            KeyPurpose::PrincipalLongterm,
-        ),
-        candidate: ipc_keyd::Password::new(Zeroizing::new(candidate.to_owned())),
-    };
-    matches!(
-        client.call_with_fate(&call),
-        Ok(ipc_keyd::Answer::VerifySecret(Ok(())))
-    )
+    client
+        .verify_preauth(
+            &KeyHandle::new(
+                PrincipalId::from_bytes(target.to_packet()),
+                KeyPurpose::PrincipalLongterm,
+            ),
+            &padata,
+            None,
+        )
+        .is_ok()
 }
 
 /// docs/51 §7.6, §5.2 row 5; docs/47 §9.2; A-90: a user's password —
@@ -793,36 +809,42 @@ fn a_computer_set_in_part_is_incomplete() {
             &["host", "elsewhere.example.org"],
         ),
     );
-    // keyd sets no secret without a grant (task A15a): the test registers
-    // one as dird would (Role::Ldap on keyd's own socket) for ws9$'s two
-    // key sets, the Service one under the other name.
+    // keyd sets no secret without a decision (task A15a; A-102): the test
+    // registers one as dird would (Role::Ldap on keyd's own socket) for
+    // ws9$'s two key sets, the Service one under the other name and salt.
     let mut ldap = ipc_keyd::KeydClient::new(
         support::connectors::keyd(&world.keyd_ldap_socket),
         world.uid,
         ipc_keyd::DEFAULT_DEADLINE,
     )
     .unwrap();
-    ldap.grant_set_secret(
-        keyd::AccountKind::Computer,
-        &[
-            keyd::SetSecretTarget {
-                handle: KeyHandle::new(
-                    PrincipalId::from_bytes(g(WS9).to_packet()),
-                    KeyPurpose::PrincipalLongterm,
-                ),
-                binding: keyd::PrincipalBinding::new(
-                    support::common::realm(),
-                    support::common::name(krb_proto::constants::KRB_NT_PRINCIPAL, &["ws9$"]),
-                ),
-            },
-            keyd::SetSecretTarget {
-                handle: KeyHandle::new(
-                    PrincipalId::from_bytes(g(WS9).to_packet()),
-                    KeyPurpose::Service,
-                ),
-                binding: other.clone(),
-            },
-        ],
+    ldap.register_decision(
+        keyd::DecisionId::new(1),
+        &keyd::DecidedOperation::SetSecret {
+            kind: keyd::AccountKind::Computer,
+            targets: vec![
+                keyd::SetSecretTarget {
+                    handle: KeyHandle::new(
+                        PrincipalId::from_bytes(g(WS9).to_packet()),
+                        KeyPurpose::PrincipalLongterm,
+                    ),
+                    binding: keyd::PrincipalBinding::new(
+                        support::common::realm(),
+                        support::common::name(krb_proto::constants::KRB_NT_PRINCIPAL, &["ws9$"]),
+                    ),
+                    salt: String::from("EXAMPLE.ORGhostws9.example.org"),
+                },
+                keyd::SetSecretTarget {
+                    handle: KeyHandle::new(
+                        PrincipalId::from_bytes(g(WS9).to_packet()),
+                        KeyPurpose::Service,
+                    ),
+                    binding: other.clone(),
+                    salt: String::from("EXAMPLE.ORGhostelsewhere.example.org"),
+                },
+            ],
+        },
+        &[],
         keyd::MAX_SET_SECRET_GRANT_SECS,
     )
     .unwrap();
@@ -895,46 +917,11 @@ fn a_refused_completion_still_reports_the_password_set() {
 }
 
 // ---------------------------------------------------------------------------
-// Task A10: the keyadm-only forwards; task F6: the appended codes.
+// A-102: keyadm's former channel is retired (N2); task F6: the appended
+// codes.
 // ---------------------------------------------------------------------------
 
-use ipc_audit::{ForwardDecision, KeyadmOperation};
-use ipc_dird_admin::{KeyOperation, KeyOperationOutcome, KeyadmRequest};
-
-/// The three keyadm requests (test data).
-fn keyadm_requests() -> Vec<(KeyadmRequest, KeyadmOperation)> {
-    vec![
-        (
-            KeyadmRequest::FetchApproved { id: 4242 },
-            KeyadmOperation::FetchApproved,
-        ),
-        (
-            KeyadmRequest::Complete {
-                id: 4242,
-                outcome: KeyOperationOutcome::NotPerformed,
-            },
-            KeyadmOperation::Complete,
-        ),
-        (
-            KeyadmRequest::ListPendingDestruction { cursor: None },
-            KeyadmOperation::ListPendingDestruction,
-        ),
-    ]
-}
-
-/// admind's `KeyadmForward` events: (peer uid, operation, decision).
-fn forward_events(events: &[AdmindEvent]) -> Vec<(Option<u32>, KeyadmOperation, ForwardDecision)> {
-    events
-        .iter()
-        .filter_map(|e| match &e.activity {
-            AdmindActivity::KeyadmForward {
-                operation,
-                decision,
-            } => Some((e.peer_uid, *operation, *decision)),
-            _ => None,
-        })
-        .collect()
-}
+use ipc_dird_admin::KeyOperation;
 
 /// The `DirAdmin` events of `operation` (any target).
 fn dird_events(world: &World, operation: DirAdminOperation) -> Vec<DirAdminEvent> {
@@ -945,70 +932,50 @@ fn dird_events(world: &World, operation: DirAdminOperation) -> Vec<DirAdminEvent
         .collect()
 }
 
-/// docs/51 §6, §7.3 ("admind forwards only if the peer's uid =
-/// `keyadm_uid`"; peer credentials, docs/50 §3.2): from keyadm's uid the
-/// three keyadm requests reach dird — dird answers (an unknown id: not
-/// found; an empty listing) and records them — and admind records each as
-/// `KeyadmForward{Forwarded}`.
+/// One frame of a retired keyadm kind (`0x10` `FetchApproved`, `0x11`
+/// `Complete`, `0x12` `ListPendingDestruction`) with its former payload (an
+/// id; an id and a "performed, kvno 3" outcome; no cursor) — what an
+/// attacker holding admind's channel would forge (test data).
+fn retired_frame(kind: u8) -> Vec<u8> {
+    let payload: Vec<u8> = match kind {
+        0x10 => 4242u64.to_be_bytes().to_vec(),
+        0x11 => [4242u64.to_be_bytes().to_vec(), vec![1, 1, 0, 0, 0, 3]].concat(),
+        _ => vec![0],
+    };
+    let mut body = ipc_admin::ADMIN_MAGIC.to_be_bytes().to_vec();
+    body.push(ipc_admin::ADMIN_VERSION);
+    body.push(kind);
+    body.extend(payload);
+    let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+    frame.extend(body);
+    frame
+}
+
+/// **The N2 attack** (docs/52 §3.1 N2, §4.6, §4.8; docs/questions/Q-460,
+/// A-102): admind used to forward keyadm's `FetchApproved` / `Complete` /
+/// `ListPendingDestruction` to dird and hand keyadm dird's answer — so a
+/// compromised admind could feed keyadm an "approved" operation with
+/// invented approvers, or a live account as a tombstone. The channel no
+/// longer exists: from the test's uid (what was `keyadm_uid`) each of the
+/// three kinds is an unknown kind of admin.sock's closed table — the
+/// connection is closed without a reply, admind records a
+/// `MalformedFrame{UnknownKind}` noise event and no `KeyadmForward`, dird is
+/// never asked (no `DirAdmin` event of those operations), and the
+/// administrators' own key-operation request still reaches dird. keyadm now
+/// takes nothing from admind or dird: it executes, in keyd, decisions only
+/// dird could register (crates/keyd tests/decisions.rs).
 #[test]
-fn keyadm_requests_from_keyadm_uid_are_forwarded() {
+fn the_retired_keyadm_requests_never_reach_dird() {
     let Some(mut world) = World::new(Options::default()) else {
         return;
     };
-    let mut conn = world.connect();
-    let answers: Vec<Got> = keyadm_requests()
-        .into_iter()
-        .map(|(request, _)| conn.call(&Request::Keyadm(request)))
-        .collect();
-    assert_eq!(answers[0], refused(RefusalStatus::NotFound));
-    assert_eq!(answers[1], refused(RefusalStatus::NotFound));
-    assert!(matches!(
-        &answers[2],
-        Got::Reply(Reply::PendingDestruction(page)) if page.entries.is_empty() && page.next.is_none()
-    ));
-    for operation in [
-        DirAdminOperation::FetchApproved,
-        DirAdminOperation::Complete,
-        DirAdminOperation::ListPendingDestruction,
-    ] {
-        assert!(
-            eventually(Duration::from_secs(10), || !dird_events(&world, operation)
-                .is_empty()),
-            "{operation:?} reached dird"
-        );
+    for kind in ipc_admin::channel::request_kind::RETIRED {
+        let mut conn = world.connect();
+        conn.send_raw(&retired_frame(*kind));
+        assert_eq!(conn.receive(), Got::Closed, "{kind:#x}");
     }
-    let uid = world.uid;
-    let events = world.finish();
-    assert_eq!(
-        forward_events(&events),
-        keyadm_requests()
-            .into_iter()
-            .map(|(_, op)| (Some(uid), op, ForwardDecision::Forwarded))
-            .collect::<Vec<_>>()
-    );
-}
-
-/// docs/51 §6, §7.3: from any other uid the keyadm requests are refused
-/// (`Denied`, the connection kept) and recorded as
-/// `KeyadmForward{PeerNotKeyadm}` — dird is never asked. The other forwards
-/// are unchanged: an administrator's `RequestKeyOperation` from that uid
-/// is forwarded (dird decides, by its Kerberos ticket).
-#[test]
-fn keyadm_requests_from_another_uid_are_refused() {
-    let Some(mut world) = World::new(Options {
-        keyadm_uid_offset: 1,
-        ..Options::default()
-    }) else {
-        return;
-    };
+    // The administrators' channel itself is unchanged.
     let mut conn = world.connect();
-    for (request, _) in keyadm_requests() {
-        assert_eq!(
-            conn.call(&Request::Keyadm(request)),
-            refused(RefusalStatus::Denied)
-        );
-    }
-    // Still open, and the other operations still reach dird.
     let request = Request::Forward {
         auth: auth("admin1", &[]),
         operation: Operation::RequestKeyOperation {
@@ -1034,15 +1001,20 @@ fn keyadm_requests_from_another_uid_are_refused() {
             "{operation:?} must not reach dird"
         );
     }
-    let uid = world.uid;
     let events = world.finish();
-    assert_eq!(
-        forward_events(&events),
-        keyadm_requests()
-            .into_iter()
-            .map(|(_, op)| (Some(uid), op, ForwardDecision::PeerNotKeyadm))
-            .collect::<Vec<_>>()
-    );
+    assert!(events
+        .iter()
+        .all(|e| !matches!(e.activity, AdmindActivity::KeyadmForward { .. })));
+    let unknown = events
+        .iter()
+        .filter(|e| {
+            e.activity
+                == AdmindActivity::MalformedFrame {
+                    error: ipc_audit::FrameErrorCode::UnknownKind,
+                }
+        })
+        .count();
+    assert_eq!(unknown, 3);
 }
 
 /// Task F6 (A-94; docs/questions/Q-406 item 3): a frame dropped by the
@@ -1140,7 +1112,7 @@ fn bob_records(world: &World, op: KeydOperation) -> Vec<ipc_audit::KeydRecord> {
 }
 
 /// docs/51 §5.8 option (b): a `SetPassword` works end to end with the grant
-/// dird registers — keyd records dird's `GrantSetSecret` (Role::Ldap) as an
+/// dird registers — keyd records dird's `RegisterDecision` (Role::Ldap, A-102) as an
 /// acknowledged intent and its success **before** admind's `set_secret`
 /// (Role::Directory) intent; the password is set.
 #[test]
@@ -1165,8 +1137,8 @@ fn set_password_runs_on_the_grant_dird_registers() {
             })
             .unwrap_or_else(|| panic!("{op:?} {result:?} in {records:?}"))
     };
-    let grant_intent = position(KeydOperation::GrantSetSecret, KeydOutcome::Intent);
-    let grant = position(KeydOperation::GrantSetSecret, KeydOutcome::Success);
+    let grant_intent = position(KeydOperation::RegisterDecision, KeydOutcome::Intent);
+    let grant = position(KeydOperation::RegisterDecision, KeydOutcome::Success);
     let set_intent = position(KeydOperation::SetSecret, KeydOutcome::Intent);
     assert!(grant_intent < grant && grant < set_intent, "{records:?}");
     assert_eq!(records[grant].caller_role, ipc_audit::KeydRole::Ldap);

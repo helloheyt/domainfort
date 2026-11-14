@@ -39,6 +39,29 @@ fn the_builder_writes_what_the_parser_reads() {
     assert_eq!(Manifest::parse(SAMPLE.as_bytes()), Ok(built));
 }
 
+/// docs/52 §2 row 37 (N4, A-102): `provision domain` adds each first
+/// administrator's salt; the manifest writes them as the last key, in
+/// `first_admins` order, parses back to itself, and hands each one out
+/// beside its administrator (values obviously fake).
+#[test]
+fn first_admin_salts_round_trip() {
+    let built = Manifest::new(&fields()).unwrap();
+    assert!(built.first_admins().iter().all(|a| a.salt().is_none()));
+    let salted = built
+        .with_first_admin_salts(&["salt-a".to_owned(), "salt-b".to_owned()])
+        .unwrap();
+    let text = salted.encode();
+    assert_eq!(
+        text,
+        format!("{SAMPLE}first_admin_salts = salt-a, salt-b\n")
+    );
+    assert_eq!(Manifest::parse(text.as_bytes()), Ok(salted.clone()));
+    let salts: Vec<Option<&str>> = salted.first_admins().iter().map(|a| a.salt()).collect();
+    assert_eq!(salts, [Some("salt-a"), Some("salt-b")]);
+    assert_eq!(salted.realm(), built.realm());
+    assert_eq!(keys::FIRST_ADMIN_SALTS, "first_admin_salts");
+}
+
 /// docs/51 §4.3 step 11 (`create_key((GUID_krbtgt, Krbtgt), NT-SRV-INST
 /// [krbtgt, REALM])`); docs/47 §1.4 (R47-2); RFC 4120 §7.3 ("a two-part name
 /// of type NT-SRV-INST, with the first part "krbtgt" and the second part the

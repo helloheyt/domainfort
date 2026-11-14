@@ -24,7 +24,7 @@ mod common;
 use common::*;
 use keyd::authz::startup_hold_down_applies;
 use keyd::{
-    ArmorId, AuditOutcome, AuditReason, AuthnError, AuthnProof, CtxId, DualControlToken, Error,
+    ArmorId, AuditOutcome, AuditReason, AuthnError, AuthnProof, CtxId, DecidedOperation, Error,
     ExchangeId, FastConversation, IssueError, KeyHandle, KeyPurpose, Kvno, Operation, PrincipalId,
 };
 use krb_proto::constants::FX_FAST_ARMOR_AP_REQUEST;
@@ -354,22 +354,44 @@ fn directory_admin_and_daemon_support_operations_are_not_held() {
         f.keyd.create_key(&ADMIN, &h, &h_binding, &n),
         Ok(Kvno::new(1))
     );
-    assert_eq!(f.keyd.rotate_key(&ADMIN, &h, &at(10)), Ok(Kvno::new(2)));
+    // A-102: the decisions dird registers, and their executions, are not
+    // held either.
+    let rotation = f
+        .decide(DecidedOperation::RotateKey { handle: h }, &at(10))
+        .unwrap();
     assert_eq!(
-        f.keyd.retire_kvno(&ADMIN, &h, Kvno::new(1), &at(20)),
-        Ok(())
-    );
-    let approval = DualControlToken {
-        approver_1: PrincipalId::from_bytes([1; 16]),
-        approver_2: PrincipalId::from_bytes([2; 16]),
-    };
-    assert_eq!(
-        f.keyd.rotate_krbtgt(&ADMIN, &KRBTGT, &approval, &at(30)),
+        f.keyd.rotate_key(&ADMIN, rotation, &at(10)),
         Ok(Kvno::new(2))
     );
-    assert_eq!(f.keyd.destroy_key_set(&ADMIN, &h, &at(40)), Ok(()));
-    // The set_secret grant (task A15a) is not held either.
-    assert_eq!(f.grant(&BOB, &bob_binding(), &at(50)), Ok(()));
+    let retirement = f
+        .decide(
+            DecidedOperation::RetireKvno {
+                handle: h,
+                kvno: Kvno::new(1),
+            },
+            &at(20),
+        )
+        .unwrap();
+    assert_eq!(f.keyd.retire_kvno(&ADMIN, retirement, &at(20)), Ok(()));
+    let krbtgt_rotation = f
+        .decide(DecidedOperation::RotateKrbtgt { krbtgt: KRBTGT }, &at(30))
+        .unwrap();
+    assert_eq!(
+        f.keyd.rotate_krbtgt(&ADMIN, krbtgt_rotation, &at(30)),
+        Ok(Kvno::new(2))
+    );
+    let destroy = f
+        .decide(
+            DecidedOperation::DestroyKeySet {
+                principal: h.principal,
+            },
+            &at(40),
+        )
+        .unwrap();
+    assert_eq!(f.keyd.destroy_key_set(&ADMIN, destroy, &at(40)), Ok(()));
+    assert!(f.keyd.list_destroy_decisions(&ADMIN, None, &at(40)).is_ok());
+    // The set_secret decision (task A15a) is not held either.
+    assert_eq!(f.grant(&BOB, &bob_binding(), BOB_SALT, &at(50)), Ok(()));
     assert_eq!(
         f.keyd.set_secret(
             &DIRECTORY,
@@ -381,15 +403,8 @@ fn directory_admin_and_daemon_support_operations_are_not_held() {
         ),
         Ok(Kvno::new(2))
     );
-    assert_eq!(
-        f.keyd.verify_secret(
-            &DIRECTORY,
-            &BOB,
-            Zeroizing::new("bob's next password".to_owned()),
-            &at(60)
-        ),
-        Ok(())
-    );
+    // The seal (A-102) is not held.
+    assert_eq!(f.keyd.seal_ceremony(&ADMIN, &at(60)), Ok(()));
     assert!(f.keyd.describe_config(&KDC, &at(70)).is_ok());
     assert!(f.keyd.describe_config(&LDAP, &at(70)).is_ok());
     for caller in [KDC, DIRECTORY, ADMIN, LDAP] {

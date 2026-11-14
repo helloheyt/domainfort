@@ -18,9 +18,8 @@
 
 use crate::channel::{codes, RefusalStatus, DIGEST_LEN};
 use crate::wire::{
-    AdminReply, AdminRequest, WireApproved, WireAuth, WireDestructionEntry, WireKeyOperation,
-    WireKeyOutcome, WireKeyRef, WireKeyRequest, WireKeyTarget, WireKeyadmRequest, WireLookupKey,
-    WireOperation,
+    AdminReply, AdminRequest, WireAuth, WireKeyOperation, WireKeyRef, WireKeyRequest,
+    WireKeyTarget, WireLookupKey, WireOperation,
 };
 use core::fmt;
 use dtyp::{Guid, Sid};
@@ -189,103 +188,6 @@ impl KeyOperation {
                 },
                 kvno: *kvno,
             },
-        }
-    }
-}
-
-/// How keyadm's call to keyd ended, as `Complete` reports it.
-/// Spec: docs/51 §6; docs/10 §9; A-88, A-90 (`RequestFate`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum KeyOperationOutcome {
-    /// keyd performed it; the kvno keyd answered (a rotation's new kvno).
-    Performed {
-        /// The new kvno of a rotation; `None` for `retire_kvno`.
-        kvno: Option<u32>,
-    },
-    /// keyd answered with a refusal (nothing stored, docs/10 §9).
-    Refused,
-    /// Not performed: never sent, or refused by keyd's transport (A-88).
-    NotPerformed,
-    /// Sent, and no usable answer came back (A-90): keyd's records say.
-    OutcomeUnknown,
-}
-
-impl KeyOperationOutcome {
-    fn from_wire(wire: WireKeyOutcome) -> KeyOperationOutcome {
-        match wire {
-            WireKeyOutcome::Performed { kvno } => KeyOperationOutcome::Performed { kvno },
-            WireKeyOutcome::Refused => KeyOperationOutcome::Refused,
-            WireKeyOutcome::NotPerformed => KeyOperationOutcome::NotPerformed,
-            WireKeyOutcome::OutcomeUnknown => KeyOperationOutcome::OutcomeUnknown,
-        }
-    }
-
-    fn to_wire(self) -> WireKeyOutcome {
-        match self {
-            KeyOperationOutcome::Performed { kvno } => WireKeyOutcome::Performed { kvno },
-            KeyOperationOutcome::Refused => WireKeyOutcome::Refused,
-            KeyOperationOutcome::NotPerformed => WireKeyOutcome::NotPerformed,
-            KeyOperationOutcome::OutcomeUnknown => WireKeyOutcome::OutcomeUnknown,
-        }
-    }
-}
-
-/// A request keyadm sends (through admind, which forwards it only from
-/// `keyadm_uid`): no `auth`.
-/// Spec: docs/51 §6, §7.3; docs/questions/Q-422.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum KeyadmRequest {
-    /// `FetchApproved {id}`.
-    FetchApproved {
-        /// The pending request's id.
-        id: u64,
-    },
-    /// `Complete {id, outcome}`.
-    Complete {
-        /// The pending request's id.
-        id: u64,
-        /// How keyd's call ended.
-        outcome: KeyOperationOutcome,
-    },
-    /// `ListPendingDestruction {cursor}`.
-    ListPendingDestruction {
-        /// Resume strictly after this objectGUID (`None`: from the start).
-        cursor: Option<Guid>,
-    },
-}
-
-impl KeyadmRequest {
-    /// The typed request of `wire`.
-    #[must_use]
-    pub fn from_wire(wire: &WireKeyadmRequest) -> KeyadmRequest {
-        match wire {
-            WireKeyadmRequest::FetchApproved { id } => KeyadmRequest::FetchApproved { id: *id },
-            WireKeyadmRequest::Complete { id, outcome } => KeyadmRequest::Complete {
-                id: *id,
-                outcome: KeyOperationOutcome::from_wire(*outcome),
-            },
-            WireKeyadmRequest::ListPendingDestruction { cursor } => {
-                KeyadmRequest::ListPendingDestruction {
-                    cursor: cursor.as_ref().map(guid),
-                }
-            }
-        }
-    }
-
-    /// The wire form.
-    #[must_use]
-    pub fn to_wire(&self) -> WireKeyadmRequest {
-        match self {
-            KeyadmRequest::FetchApproved { id } => WireKeyadmRequest::FetchApproved { id: *id },
-            KeyadmRequest::Complete { id, outcome } => WireKeyadmRequest::Complete {
-                id: *id,
-                outcome: outcome.to_wire(),
-            },
-            KeyadmRequest::ListPendingDestruction { cursor } => {
-                WireKeyadmRequest::ListPendingDestruction {
-                    cursor: cursor.map(|c| c.to_packet()),
-                }
-            }
         }
     }
 }
@@ -622,9 +524,6 @@ pub enum Request {
         /// The operation.
         operation: Operation,
     },
-    /// A keyadm request (no tickets: admind forwards it only from
-    /// `keyadm_uid`, docs/51 §6).
-    Keyadm(KeyadmRequest),
     /// The health check.
     Ping,
 }
@@ -641,7 +540,6 @@ impl Request {
                 auth: auth.clone(),
                 operation: Operation::from_wire(operation)?,
             }),
-            AdminRequest::Keyadm(request) => Ok(Request::Keyadm(KeyadmRequest::from_wire(request))),
         }
     }
 
@@ -656,7 +554,6 @@ impl Request {
                 auth: auth.clone(),
                 operation: operation.to_wire()?,
             }),
-            Request::Keyadm(request) => Ok(AdminRequest::Keyadm(request.to_wire())),
         }
     }
 }
@@ -732,48 +629,6 @@ impl KeyRequestState {
     }
 }
 
-/// The answer to `FetchApproved`: the approved operation, the key set it
-/// acts on, and who requested and approved it (objectGUIDs — what keyd's
-/// `DualControlToken` names).
-/// Spec: docs/51 §6 ("dird returns {operation, GUIDs of the requester and
-/// the approver}"); crates/keyd-types model.rs (`DualControlToken`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ApprovedKeyOperation {
-    /// The request's id.
-    pub id: u64,
-    /// The operation digest.
-    pub digest: [u8; DIGEST_LEN],
-    /// The operation.
-    pub operation: KeyOperation,
-    /// The principal id of the key set acted on (the krbtgt account's or
-    /// the service object's objectGUID).
-    pub principal: Guid,
-    /// The requester's objectGUID.
-    pub requester: Guid,
-    /// The approvers' objectGUIDs, in approval order.
-    pub approvers: Vec<Guid>,
-}
-
-/// One tombstone of a user or computer object.
-/// Spec: docs/51 §6, §9; A-18.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DestructionEntry {
-    /// The objectGUID (= the principal id of its key sets).
-    pub guid: Guid,
-    /// User or computer.
-    pub kind: AccountKind,
-}
-
-/// One page of `ListPendingDestruction`.
-/// Spec: docs/51 §6, §9.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DestructionPage {
-    /// The tombstones of this page.
-    pub entries: Vec<DestructionEntry>,
-    /// Where the next page starts; `None` when the listing is complete.
-    pub next: Option<Guid>,
-}
-
 /// One typed reply. Spec: docs/51 §7.3; docs/50 §7.5.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reply {
@@ -794,29 +649,10 @@ pub enum Reply {
     Refused(RefusalStatus),
     /// `Ping` answered.
     Pong,
-    /// `RequestKeyOperation` / `Approve`.
+    /// `RequestKeyOperation` / `Approve`. The request's id is also the id
+    /// of the decision dird registers in keyd when an `Approve` completes
+    /// the quorum (A-102, docs/52 §4.3) — what the operator gives keyadm.
     KeyRequest(KeyRequestState),
-    /// `FetchApproved`.
-    Approved(ApprovedKeyOperation),
-    /// `ListPendingDestruction`.
-    PendingDestruction(DestructionPage),
-}
-
-/// The account kind of a code (the wire layer admits only the two).
-fn kind_of(code: u8) -> AccountKind {
-    if code == codes::KIND_USER {
-        AccountKind::User
-    } else {
-        AccountKind::Computer
-    }
-}
-
-/// The code of an account kind.
-fn code_of(kind: AccountKind) -> u8 {
-    match kind {
-        AccountKind::User => codes::KIND_USER,
-        AccountKind::Computer => codes::KIND_COMPUTER,
-    }
 }
 
 impl Reply {
@@ -861,26 +697,6 @@ impl Reply {
                 approvals: request.approvals,
                 quorum: request.quorum,
             }),
-            AdminReply::Approved(approved) => Reply::Approved(ApprovedKeyOperation {
-                id: approved.id,
-                digest: approved.digest,
-                operation: KeyOperation::from_wire(&approved.operation),
-                principal: guid(&approved.principal),
-                requester: guid(&approved.requester),
-                approvers: approved.approvers.iter().map(guid).collect(),
-            }),
-            AdminReply::PendingDestruction { entries, next } => {
-                Reply::PendingDestruction(DestructionPage {
-                    entries: entries
-                        .iter()
-                        .map(|e| DestructionEntry {
-                            guid: guid(&e.guid),
-                            kind: kind_of(e.kind),
-                        })
-                        .collect(),
-                    next: next.as_ref().map(guid),
-                })
-            }
         })
     }
 
@@ -923,25 +739,6 @@ impl Reply {
                 approvals: request.approvals,
                 quorum: request.quorum,
             }),
-            Reply::Approved(approved) => AdminReply::Approved(WireApproved {
-                id: approved.id,
-                digest: approved.digest,
-                operation: approved.operation.to_wire(),
-                principal: approved.principal.to_packet(),
-                requester: approved.requester.to_packet(),
-                approvers: approved.approvers.iter().map(Guid::to_packet).collect(),
-            }),
-            Reply::PendingDestruction(page) => AdminReply::PendingDestruction {
-                entries: page
-                    .entries
-                    .iter()
-                    .map(|e| WireDestructionEntry {
-                        guid: e.guid.to_packet(),
-                        kind: code_of(e.kind),
-                    })
-                    .collect(),
-                next: page.next.map(|n| n.to_packet()),
-            },
         })
     }
 }

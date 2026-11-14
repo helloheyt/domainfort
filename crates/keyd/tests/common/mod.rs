@@ -8,9 +8,10 @@
 #![allow(dead_code)] // each test binary uses a different subset
 
 use keyd::{
-    AccountKind, AsRepParts, AsTicketTemplate, AuditRecord, AuditSink, CallerId, EntropyError,
-    EntropySource, InMemoryKeyStore, KeyHandle, KeyPurpose, KeyStore, Keyd, KeydConfig,
-    PrincipalBinding, PrincipalId, Role, SetSecretTarget, TgsTicketTemplate, TgtContext,
+    AccountKind, AsRepParts, AsTicketTemplate, AuditRecord, AuditSink, CallerId, DecidedOperation,
+    DecisionId, EntropyError, EntropySource, InMemoryKeyStore, KeyHandle, KeyPurpose, KeyStore,
+    Keyd, KeydConfig, PrincipalBinding, PrincipalId, Role, SetSecretTarget, TgsTicketTemplate,
+    TgtContext, MAX_DESTROY_DECISION_SECS, MAX_INITIAL_SECRET_GRANT_SECS, MAX_KEY_DECISION_SECS,
     MAX_SET_SECRET_GRANT_SECS,
 };
 use krb_crypto::{ChecksumType, EncType, KeyUsage, ProtocolKey};
@@ -24,6 +25,7 @@ use krb_proto::{
     Realm, Ticket, TicketFlags,
 };
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use zeroize::Zeroizing;
 
@@ -129,6 +131,12 @@ pub const ALICE_ID: PrincipalId = PrincipalId::from_bytes([0xA1; 16]);
 pub const BOB_ID: PrincipalId = PrincipalId::from_bytes([0xB0; 16]);
 pub const KRBTGT_ID: PrincipalId = PrincipalId::from_bytes([0x7B; 16]);
 pub const SERVICE_ID: PrincipalId = PrincipalId::from_bytes([0x5E; 16]);
+
+/// Two tier-0 administrators dird verified (the requester and the
+/// approver of a dual-controlled key operation, docs/51 §5.6) — the
+/// approvers a key-operation decision names (A-102). Made up here.
+pub const APPROVER_1: PrincipalId = PrincipalId::from_bytes([0xAA; 16]);
+pub const APPROVER_2: PrincipalId = PrincipalId::from_bytes([0xBB; 16]);
 
 pub const ALICE: KeyHandle = KeyHandle::new(ALICE_ID, KeyPurpose::PrincipalLongterm);
 pub const BOB: KeyHandle = KeyHandle::new(BOB_ID, KeyPurpose::PrincipalLongterm);
@@ -291,7 +299,7 @@ impl Fixture {
         }
         keyd.create_key(&ADMIN, &SERVICE, &service_binding(), &n)
             .unwrap();
-        grant(&mut keyd, &ALICE, &alice_binding(), &n).unwrap();
+        grant(&mut keyd, &ALICE, &alice_binding(), ALICE_SALT, &n).unwrap();
         keyd.set_secret(
             &DIRECTORY,
             &ALICE,
@@ -301,7 +309,7 @@ impl Fixture {
             &n,
         )
         .unwrap();
-        grant(&mut keyd, &BOB, &bob_binding(), &n).unwrap();
+        grant(&mut keyd, &BOB, &bob_binding(), BOB_SALT, &n).unwrap();
         keyd.set_secret(
             &DIRECTORY,
             &BOB,
@@ -319,13 +327,16 @@ impl Fixture {
         &self.keyd.audit_sink().records
     }
 
-    /// A user's one-target grant registered as `caller` (any role: a role
-    /// that may not register grants is refused, with its one record).
+    /// The ceremony's initial-secret grant of a user's one target
+    /// (`grant_set_secret`, Role::Admin before the seal — docs/51 §4.3
+    /// step 11, A-102) registered as `caller` (any role: a role that may not
+    /// call it is refused, with its one record).
     pub fn grant_as(
         &mut self,
         caller: &CallerId,
         handle: &KeyHandle,
         binding: &PrincipalBinding,
+        salt: &str,
         now: &KerberosTime,
     ) -> Result<(), keyd::Error> {
         self.keyd.grant_set_secret(
@@ -334,8 +345,9 @@ impl Fixture {
             &[SetSecretTarget {
                 handle: *handle,
                 binding: binding.clone(),
+                salt: salt.to_owned(),
             }],
-            MAX_SET_SECRET_GRANT_SECS,
+            MAX_INITIAL_SECRET_GRANT_SECS,
             now,
         )
     }
@@ -345,10 +357,81 @@ impl Fixture {
         &mut self,
         handle: &KeyHandle,
         binding: &PrincipalBinding,
+        salt: &str,
         now: &KerberosTime,
     ) -> Result<(), keyd::Error> {
-        grant(&mut self.keyd, handle, binding, now)
+        grant(&mut self.keyd, handle, binding, salt, now)
     }
+
+    /// [`decide`] on this fixture's keyd.
+    pub fn decide(
+        &mut self,
+        operation: DecidedOperation,
+        now: &KerberosTime,
+    ) -> Result<DecisionId, keyd::Error> {
+        decide(&mut self.keyd, operation, now)
+    }
+
+    /// Whether `password` (with `salt`) is the current long-term key of the
+    /// PrincipalLongterm key set `handle`: keyd's AS pre-authentication
+    /// (PA-ENC-TIMESTAMP, RFC 4120 5.2.7.2) succeeds with the key derived
+    /// from it (RFC 3961 §3). The oracle for "the password is (un)changed"
+    /// since `verify_secret` has no role (A-102, docs/52 R4). A failure is
+    /// counted by keyd's pre-authentication throttle (A-34).
+    pub fn password_works(&mut self, handle: &KeyHandle, password: &str, salt: &str) -> bool {
+        let enctype = EncType::from_number(self.keyd.config().enctypes[0].number()).unwrap();
+        let key = password_key(enctype, password, salt);
+        let n = now();
+        self.keyd
+            .verify_preauth(&KDC, handle, &pa_enc_timestamp(&key, None, n), None, &n)
+            .is_ok()
+    }
+}
+
+/// A fresh decision id for every decision a test registers (dird gives each
+/// decision its own id — docs/52 §4.2).
+pub fn next_decision_id() -> DecisionId {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    DecisionId::new(NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// The approvers dird records with `operation`: the dual-control pair for a
+/// key operation (docs/51 §5.6), none for a password set or a destruction.
+pub fn approvers_for(operation: &DecidedOperation) -> Vec<PrincipalId> {
+    match operation {
+        DecidedOperation::RotateKrbtgt { .. }
+        | DecidedOperation::RotateKey { .. }
+        | DecidedOperation::RetireKvno { .. } => vec![APPROVER_1, APPROVER_2],
+        DecidedOperation::SetSecret { .. } | DecidedOperation::DestroyKeySet { .. } => Vec::new(),
+    }
+}
+
+/// The longest lifetime of `operation`'s family (docs/52 §4.2; keyd-types
+/// decision.rs).
+pub fn ceiling_for(operation: &DecidedOperation) -> u32 {
+    match operation {
+        DecidedOperation::SetSecret { .. } => MAX_SET_SECRET_GRANT_SECS,
+        DecidedOperation::RotateKrbtgt { .. }
+        | DecidedOperation::RotateKey { .. }
+        | DecidedOperation::RetireKvno { .. } => MAX_KEY_DECISION_SECS,
+        DecidedOperation::DestroyKeySet { .. } => MAX_DESTROY_DECISION_SECS,
+    }
+}
+
+/// Register `operation` as dird would once its PDP decided it (Role::Ldap,
+/// `register_decision` — A-102, docs/52 §4.2, §4.3): a fresh id, the
+/// approvers of [`approvers_for`], the family's longest lifetime. Returns
+/// the decision id the Admin operation then names.
+pub fn decide<S: KeyStore, A: AuditSink, E: EntropySource>(
+    keyd: &mut Keyd<S, A, E>,
+    operation: DecidedOperation,
+    now: &KerberosTime,
+) -> Result<DecisionId, keyd::Error> {
+    let id = next_decision_id();
+    let approvers = approvers_for(&operation);
+    let lifetime = ceiling_for(&operation);
+    keyd.register_decision(&LDAP, id, &operation, &approvers, lifetime, now)
+        .map(|()| id)
 }
 
 /// The name of the computer account a Service key set's grant pairs it
@@ -361,10 +444,11 @@ pub fn grant_computer_name() -> PrincipalName {
 }
 
 /// Register, as dird would after its PDP allowed the password set
-/// (Role::Ldap; task A15a, docs/51 §5.8 option (b)), the grant that a
-/// `set_secret` of `handle` with `binding` needs: a user's one key target
-/// for a PrincipalLongterm handle; for a Service handle, a computer's two —
-/// its PrincipalLongterm key set (named [`grant_computer_name`]; a grant does
+/// (Role::Ldap; task A15a, docs/51 §5.8 option (b); A-102: a `SetSecret`
+/// decision), the decision that a `set_secret` of `handle` with `binding`
+/// and `salt` needs (N4: the salt is bound too): a user's one key target for
+/// a PrincipalLongterm handle; for a Service handle, a computer's two — its
+/// PrincipalLongterm key set (named [`grant_computer_name`]; a decision does
 /// not judge bindings, the redeeming `set_secret` does) and then the Service
 /// key set. Any other purpose is refused by keyd (the purposes of the
 /// grant's slots).
@@ -372,37 +456,35 @@ pub fn grant<S: KeyStore, A: AuditSink, E: EntropySource>(
     keyd: &mut Keyd<S, A, E>,
     handle: &KeyHandle,
     binding: &PrincipalBinding,
+    salt: &str,
     now: &KerberosTime,
 ) -> Result<(), keyd::Error> {
     let target = SetSecretTarget {
         handle: *handle,
         binding: binding.clone(),
+        salt: salt.to_owned(),
     };
-    match handle.purpose {
+    let operation = match handle.purpose {
         KeyPurpose::Service => {
             let account = KeyHandle::new(handle.principal, KeyPurpose::PrincipalLongterm);
-            keyd.grant_set_secret(
-                &LDAP,
-                AccountKind::Computer,
-                &[
+            DecidedOperation::SetSecret {
+                kind: AccountKind::Computer,
+                targets: vec![
                     SetSecretTarget {
                         handle: account,
                         binding: bound(grant_computer_name()),
+                        salt: salt.to_owned(),
                     },
                     target,
                 ],
-                MAX_SET_SECRET_GRANT_SECS,
-                now,
-            )
+            }
         }
-        _ => keyd.grant_set_secret(
-            &LDAP,
-            AccountKind::User,
-            &[target],
-            MAX_SET_SECRET_GRANT_SECS,
-            now,
-        ),
-    }
+        _ => DecidedOperation::SetSecret {
+            kind: AccountKind::User,
+            targets: vec![target],
+        },
+    };
+    decide(keyd, operation, now).map(|_| ())
 }
 
 // ---------------------------------------------------------------------------

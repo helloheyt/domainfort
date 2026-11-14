@@ -77,10 +77,9 @@ use ipc_audit::{
     AdmindActivity, AdmindEvent, BoundedSeq, KeyPurposeCode, PasswordFailure, PasswordResult,
     PasswordStep,
 };
-use ipc_audit::{ForwardDecision, KeyadmOperation};
 use ipc_dird_admin::{
-    AccountKind, Auth, KeyadmRequest, Operation, PasswordSet, PasswordSetOutcome,
-    Request as DirdRequest, TransportError as DirdTransport, Unserved as DirdUnserved,
+    AccountKind, Auth, Operation, PasswordSet, PasswordSetOutcome, Request as DirdRequest,
+    TransportError as DirdTransport, Unserved as DirdUnserved,
 };
 use ipc_keyd::{Answer as KeydAnswer, Call, CallFailure, RequestFate, Unserved as KeydUnserved};
 use keyd_types::KeyPurpose;
@@ -117,9 +116,6 @@ pub(crate) enum Work {
     },
     /// `SetPassword`.
     SetPassword(SetPassword),
-    /// A keyadm request from `keyadm_uid` (the listener checked the peer
-    /// uid), forwarded to dird unchanged (docs/51 §6).
-    Keyadm(KeyadmRequest),
 }
 
 impl Work {
@@ -133,10 +129,7 @@ impl Work {
             Work::Forward {
                 operation: Operation::Lookup(_),
                 ..
-            }
-            | Work::Keyadm(KeyadmRequest::ListPendingDestruction { .. }) => {
-                Reply::Refused(RefusalStatus::Unavailable)
-            }
+            } => Reply::Refused(RefusalStatus::Unavailable),
             _ => Reply::Refused(RefusalStatus::OutcomeUnknown),
         }
     }
@@ -227,7 +220,6 @@ impl Worker {
             let answer = match job.work {
                 Work::Forward { auth, operation } => self.forward(auth, operation),
                 Work::SetPassword(request) => self.set_password(job.peer_uid, request),
-                Work::Keyadm(request) => self.forward_keyadm(job.peer_uid, request),
             };
             let _ = job.reply.send(answer);
         }
@@ -251,51 +243,6 @@ impl Worker {
                 DirdFate::Unknown => Answer::Reply(Reply::Refused(unknown)),
             },
         }
-    }
-
-    /// A keyadm request from `keyadm_uid` (module documentation): its
-    /// gating `KeyadmForward{Forwarded}` event's slot first (none ⇒ `Busy`,
-    /// nothing forwarded), the request to dird unchanged, the event, dird's
-    /// reply. Without a usable answer: `ListPendingDestruction` (a read) ⇒
-    /// `Unavailable`; `FetchApproved` / `Complete` (they change dird's
-    /// pending request) ⇒ `OutcomeUnknown` once sent (A-88, A-90).
-    /// Spec: docs/51 §6, §7.3; A-85 (Q-340 item 8: gating).
-    fn forward_keyadm(&mut self, peer_uid: u32, request: KeyadmRequest) -> Answer {
-        let Some(slot) = self.gate.reserve() else {
-            AUDIT_UNAVAILABLE.hit(Some(peer_uid));
-            return Answer::Refused(Refused::Busy);
-        };
-        let operation = match request {
-            KeyadmRequest::FetchApproved { .. } => KeyadmOperation::FetchApproved,
-            KeyadmRequest::Complete { .. } => KeyadmOperation::Complete,
-            KeyadmRequest::ListPendingDestruction { .. } => KeyadmOperation::ListPendingDestruction,
-        };
-        let unknown = if operation == KeyadmOperation::ListPendingDestruction {
-            RefusalStatus::Unavailable
-        } else {
-            RefusalStatus::OutcomeUnknown
-        };
-        let answer = match self.dird.call(&DirdRequest::Keyadm(request)) {
-            Ok(reply) => Answer::Reply(Reply::from_dird(reply).unwrap_or(Reply::Refused(unknown))),
-            Err(unserved) => match dird_fate(unserved) {
-                DirdFate::Busy => Answer::Refused(Refused::Busy),
-                DirdFate::NotDone => Answer::Reply(Reply::Refused(RefusalStatus::Unavailable)),
-                DirdFate::Unknown => Answer::Reply(Reply::Refused(unknown)),
-            },
-        };
-        let event = AdmindEvent {
-            time: clock::event_time(),
-            peer_uid: Some(peer_uid),
-            activity: AdmindActivity::KeyadmForward {
-                operation,
-                decision: ForwardDecision::Forwarded,
-            },
-        };
-        if self.gate.commit(slot, &event).is_err() {
-            // The answer stays the true one; the gap is visible in the log.
-            EVENT_UNRECORDED.hit(Some(peer_uid));
-        }
-        answer
     }
 
     /// `SetPassword` (module documentation).

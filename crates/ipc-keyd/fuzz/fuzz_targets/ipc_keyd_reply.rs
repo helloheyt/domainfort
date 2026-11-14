@@ -1,8 +1,9 @@
 #![no_main]
 //! Fuzz target for the keyd channel's client-side reply decoding: the first
 //! input octet picks the operation that was called (one of keyd's
-//! seventeen — `grant_set_secret`, task A15a, included: its success reply
-//! carries no payload),
+//! twenty — `grant_set_secret`, task A15a, included: its success reply
+//! carries no payload; and A-102's `register_decision`, `seal_ceremony`,
+//! `list_destroy_decisions`, whose page is bounded by `MAX_DESTROY_PAGE`),
 //! the rest is the reply body, decoded as `KeydClient` decodes it —
 //! `ipc::decode_reply` (the shared `Refused` routed first, A-59), then
 //! `Answer::from_wire` (the reply must belong to the operation; every
@@ -20,6 +21,7 @@
 //! Spec: docs/50 §3.3, §3.4, §9; R50-4; A-59; docs/questions/Q-351 (A-87).
 
 use ipc::{decode_reply, encode_refused, Reply};
+use ipc_keyd::channel::MAX_DESTROY_PAGE;
 use ipc_keyd::{encode_answer, Answer, KeydReply, KEYD_CHANNEL};
 use keyd::{Operation, Role};
 use libfuzzer_sys::fuzz_target;
@@ -52,6 +54,12 @@ fuzz_target!(|data: &[u8]| {
                     let empty = encode_answer(&Answer::GrantSetSecret(Ok(())))
                         .expect("a unit answer encodes");
                     assert_eq!(empty.body(), body, "no payload");
+                }
+                if let Answer::ListDestroyDecisions(Ok(page)) = &answer {
+                    assert!(
+                        page.entries.len() <= MAX_DESTROY_PAGE as usize,
+                        "page bound"
+                    );
                 }
                 let frame = encode_answer(&answer).expect("a decoded answer re-encodes");
                 assert_eq!(frame.body(), body, "canonical round trip");

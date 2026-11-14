@@ -175,31 +175,6 @@ impl PrincipalBinding {
     }
 }
 
-/// The dual-control approval that `rotate_krbtgt` requires: two approver
-/// identities.
-///
-/// keyd verifies only that the two approvers are DISTINCT. Whether each
-/// approval is authentic (signed, fresh, from an authorized tier-0 approver)
-/// is the admin plane's job (docs/43 D175, docs/07 D21) — a documented
-/// residual: keyd trusts the Admin caller to have verified the approvals.
-///
-/// Spec: docs/10 §7 ("rotate_krbtgt באישור כפול"); docs/43 D175.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DualControlToken {
-    /// First approver.
-    pub approver_1: PrincipalId,
-    /// Second approver; must differ from the first.
-    pub approver_2: PrincipalId,
-}
-
-impl DualControlToken {
-    /// `true` if the two approvers are distinct (the only check keyd makes).
-    /// Spec: docs/10 §7; docs/43 D175.
-    pub fn has_distinct_approvers(&self) -> bool {
-        self.approver_1 != self.approver_2
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

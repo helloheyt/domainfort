@@ -258,8 +258,9 @@ fn malformed_requests_never_reach_keyd() {
         refusal_of(dispatch(&mut keyd, KDC, now, &bad_der)),
         Refused::Malformed
     );
-    let mut bad_purpose = body_of(&ipc_keyd::Call::RotateKey {
+    let mut bad_purpose = body_of(&ipc_keyd::Call::CreateKey {
         handle: samples::handle(0x5E, KeyPurpose::Service),
+        binding: samples::binding(),
     });
     bad_purpose[20] = 0x09; // purpose code outside the closed table
     assert_eq!(
@@ -299,6 +300,9 @@ fn malformed_requests_never_reach_keyd() {
 /// docs/50 §3.4: every Directory and Admin operation (and the Kdc / Ldap
 /// support operations) through the client and the loopback gives keyd's own
 /// results — kvnos keyd chose, the uniform `Denied`, dual control refused.
+/// Since A-102 (docs/52 §4.2, §4.4, §4.6) every Directory / Admin state
+/// change after `create_key` runs on a decision only dird (Ldap) registers,
+/// and the executions name only its id.
 #[test]
 fn admin_and_directory_operations_through_the_client() {
     let server = served();
@@ -306,6 +310,10 @@ fn admin_and_directory_operations_through_the_client() {
     let mut directory = client(&server, DIRECTORY);
     let mut kdc = client(&server, KDC);
     let mut ldap = client(&server, LDAP);
+    let approvers = [
+        keyd::PrincipalId::from_bytes([1; 16]),
+        keyd::PrincipalId::from_bytes([2; 16]),
+    ];
 
     let service = samples::handle(0x5E, KeyPurpose::Service);
     let service_binding = PrincipalBinding::new(
@@ -320,10 +328,46 @@ fn admin_and_directory_operations_through_the_client() {
         admin.create_key(&service, &service_binding),
         Err(keyd::Error::Denied)
     );
-    assert_eq!(admin.rotate_key(&service), Ok(Kvno::new(2)));
-    assert_eq!(admin.retire_kvno(&service, Kvno::new(1)), Ok(()));
+    // No decision: refused (NoDecision).
+    let rotate = keyd::DecisionId::new(11);
+    assert_eq!(admin.rotate_key(rotate), Err(keyd::Error::Denied));
     assert_eq!(
-        admin.retire_kvno(&service, Kvno::new(2)),
+        ldap.register_decision(
+            rotate,
+            &keyd::DecidedOperation::RotateKey { handle: service },
+            &approvers,
+            900
+        ),
+        Ok(())
+    );
+    assert_eq!(admin.rotate_key(rotate), Ok(Kvno::new(2)));
+    // Presented again: the recorded result, no second rotation.
+    assert_eq!(admin.rotate_key(rotate), Ok(Kvno::new(2)));
+    let retire = keyd::DecisionId::new(12);
+    assert_eq!(
+        ldap.register_decision(
+            retire,
+            &keyd::DecidedOperation::RetireKvno {
+                handle: service,
+                kvno: Kvno::new(1),
+            },
+            &approvers,
+            900
+        ),
+        Ok(())
+    );
+    // The wrong execution for that id is refused (DecisionMismatch) and does
+    // not consume it.
+    assert_eq!(admin.rotate_key(retire), Err(keyd::Error::Denied));
+    assert_eq!(admin.retire_kvno(retire), Ok(()));
+    // Only dird (Ldap) registers decisions.
+    assert_eq!(
+        admin.register_decision(
+            keyd::DecisionId::new(13),
+            &keyd::DecidedOperation::RotateKey { handle: service },
+            &approvers,
+            900
+        ),
         Err(keyd::Error::Denied)
     );
 
@@ -333,44 +377,59 @@ fn admin_and_directory_operations_through_the_client() {
         samples::name(2, &["krbtgt", "EXAMPLE.ORG"]),
     );
     assert_eq!(admin.create_key(&krbtgt, &krbtgt_binding), Ok(Kvno::new(1)));
-    let same = keyd::DualControlToken {
-        approver_1: keyd::PrincipalId::from_bytes([1; 16]),
-        approver_2: keyd::PrincipalId::from_bytes([1; 16]),
-    };
+    // Dual control: two distinct approvers or no decision at all.
+    let rotate_krbtgt = keyd::DecisionId::new(14);
     assert_eq!(
-        admin.rotate_krbtgt(&krbtgt, &same),
+        ldap.register_decision(
+            rotate_krbtgt,
+            &keyd::DecidedOperation::RotateKrbtgt { krbtgt },
+            &[approvers[0], approvers[0]],
+            900
+        ),
         Err(keyd::Error::Denied)
     );
-    let two = keyd::DualControlToken {
-        approver_2: keyd::PrincipalId::from_bytes([2; 16]),
-        ..same
-    };
-    assert_eq!(admin.rotate_krbtgt(&krbtgt, &two), Ok(Kvno::new(2)));
+    assert_eq!(admin.rotate_krbtgt(rotate_krbtgt), Err(keyd::Error::Denied));
+    assert_eq!(
+        ldap.register_decision(
+            rotate_krbtgt,
+            &keyd::DecidedOperation::RotateKrbtgt { krbtgt },
+            &approvers,
+            900
+        ),
+        Ok(())
+    );
+    assert_eq!(admin.rotate_krbtgt(rotate_krbtgt), Ok(Kvno::new(2)));
 
     let alice = samples::handle(0xA1, KeyPurpose::PrincipalLongterm);
     let pass = || Zeroizing::new(String::from(samples::PASSWORD));
-    // Task A15a (docs/51 §5.8 option (b)): no set_secret without a grant;
-    // the grant comes from Ldap (dird's role), never from Directory.
-    let targets = vec![keyd::SetSecretTarget {
-        handle: alice,
-        binding: samples::binding(),
-    }];
+    // Task A15a / A-102: no set_secret without dird's decision, which binds
+    // the binding and the salt (N4).
+    let set_alice = keyd::DecidedOperation::SetSecret {
+        kind: keyd::AccountKind::User,
+        targets: vec![keyd::SetSecretTarget {
+            handle: alice,
+            binding: samples::binding(),
+            salt: String::from("EXAMPLE.ORGalice"),
+        }],
+    };
     assert_eq!(
         directory.set_secret(&alice, &samples::binding(), pass(), "EXAMPLE.ORGalice"),
         Err(keyd::Error::Denied)
     );
     assert_eq!(
-        directory.grant_set_secret(
-            keyd::AccountKind::User,
-            &targets,
+        directory.register_decision(
+            keyd::DecisionId::new(15),
+            &set_alice,
+            &[],
             keyd::MAX_SET_SECRET_GRANT_SECS
         ),
         Err(keyd::Error::Denied)
     );
     assert_eq!(
-        ldap.grant_set_secret(
-            keyd::AccountKind::User,
-            &targets,
+        ldap.register_decision(
+            keyd::DecisionId::new(15),
+            &set_alice,
+            &[],
             keyd::MAX_SET_SECRET_GRANT_SECS
         ),
         Ok(())
@@ -379,14 +438,9 @@ fn admin_and_directory_operations_through_the_client() {
         directory.set_secret(&alice, &samples::binding(), pass(), "EXAMPLE.ORGalice"),
         Ok(Kvno::INITIAL)
     );
-    // The grant is spent.
+    // The decision is spent.
     assert_eq!(
         directory.set_secret(&alice, &samples::binding(), pass(), "EXAMPLE.ORGalice"),
-        Err(keyd::Error::Denied)
-    );
-    assert_eq!(directory.verify_secret(&alice, pass()), Ok(()));
-    assert_eq!(
-        directory.verify_secret(&alice, Zeroizing::new(String::from("wrong"))),
         Err(keyd::Error::Denied)
     );
     // The Directory role may not create keys; the Admin role may not set
@@ -399,8 +453,49 @@ fn admin_and_directory_operations_through_the_client() {
         admin.set_secret(&alice, &samples::binding(), pass(), "EXAMPLE.ORGalice"),
         Err(keyd::Error::Denied)
     );
-    assert_eq!(admin.destroy_key_set(&alice), Ok(()));
-    assert_eq!(admin.destroy_key_set(&alice), Err(keyd::Error::Denied));
+    // Destruction: on dird's destroy decision only, listed for the sweep
+    // until it runs; the id presented again gives the recorded result.
+    let destroy = keyd::DecisionId::new(16);
+    assert_eq!(admin.destroy_key_set(destroy), Err(keyd::Error::Denied));
+    assert_eq!(
+        ldap.register_decision(
+            destroy,
+            &keyd::DecidedOperation::DestroyKeySet {
+                principal: alice.principal,
+            },
+            &[],
+            3600
+        ),
+        Ok(())
+    );
+    let page = admin.list_destroy_decisions(None).unwrap();
+    assert_eq!(
+        page.entries,
+        vec![keyd::PendingDestruction {
+            decision: destroy,
+            principal: alice.principal,
+        }]
+    );
+    assert_eq!(page.next, None);
+    assert_eq!(
+        directory.list_destroy_decisions(None),
+        Err(keyd::Error::Denied)
+    );
+    assert_eq!(admin.destroy_key_set(destroy), Ok(()));
+    assert_eq!(admin.destroy_key_set(destroy), Ok(()));
+    assert!(admin
+        .list_destroy_decisions(None)
+        .unwrap()
+        .entries
+        .is_empty());
+    // The ceremony's end (R3): Admin only; afterwards no create_key.
+    assert_eq!(ldap.seal_ceremony(), Err(keyd::Error::Denied));
+    assert_eq!(admin.seal_ceremony(), Ok(()));
+    let other = samples::handle(0x77, KeyPurpose::Service);
+    assert_eq!(
+        admin.create_key(&other, &service_binding),
+        Err(keyd::Error::Denied)
+    );
 
     let description = kdc.describe_config().unwrap();
     assert_eq!(description, server.borrow().keyd.config().description());
@@ -541,7 +636,12 @@ fn every_transport_failure_is_unavailable() {
             "{fault:?}"
         );
         assert_eq!(
-            directory.verify_secret(&alice, Zeroizing::new(String::from("x"))),
+            directory.set_secret(
+                &alice,
+                &samples::binding(),
+                Zeroizing::new(String::from("x")),
+                "EXAMPLE.ORGalice"
+            ),
             Err(keyd::Error::Unavailable),
             "{fault:?}"
         );

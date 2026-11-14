@@ -203,7 +203,10 @@ impl KeyRef {
 
 /// One keyd audit record: `keyd::AuditRecord`, field for field
 /// (docs/10 §10: `{ ts, caller_role, caller_uid, op, principal, purpose,
-/// kvno, result }` + reason, secondary, approvers).
+/// kvno, result }` + reason, secondary, approvers, and — appended by A-102,
+/// docs/52 §4.5 — the `decision` a Directory / Admin state change
+/// registered or ran: the field a detection rule matches against dird's
+/// `DirAdmin` event).
 ///
 /// **Phase records** (decision A-86): around an operation that changes
 /// keyd's key state, keyd-daemon also writes, with the same layout, the
@@ -211,8 +214,10 @@ impl KeyRef {
 /// runs it and — only if that intent was not acknowledged in time — a
 /// [`KeydOutcome::NotPerformed`] outcome. Field use there: `ts`, the caller,
 /// `op`, the handle's `principal` / `purpose` as in keyd's record; `kvno`
-/// only for `RetireKvno` (the version named); `approvers` only for
-/// `RotateKrbtgt`; no `secondary`; `reason` = `None`. As for the other
+/// only for `RetireKvno` (the version named); `approvers` and `decision`
+/// from keyd's decision (A-102: never from the request); `secondary` for a
+/// computer's second set-secret target or a destroyed account's `Service`
+/// key set; `reason` = `None`. As for the other
 /// shapes, the codec checks the encoding, not the field use
 /// (docs/questions/Q-252 item 4); the layout is unchanged — the two phases
 /// are codes 6 and 7 of the closed outcome table.
@@ -243,6 +248,8 @@ pub struct KeydRecord {
     pub result: KeydOutcome,
     /// The internal reason.
     pub reason: KeydReason,
+    /// The decision id the operation registered or ran (A-102).
+    pub decision: Option<u64>,
 }
 
 impl KeydRecord {
@@ -266,7 +273,8 @@ impl KeydRecord {
             Ok(w.write_array(b)?)
         })?;
         writer.write_enum(self.result.code())?;
-        Ok(writer.write_enum(self.reason.code())?)
+        writer.write_enum(self.reason.code())?;
+        write_opt(writer, self.decision.as_ref(), |d, w| Ok(w.write_u64(*d)?))
     }
 
     fn read(reader: &mut Reader<'_>) -> Result<KeydRecord, EventError> {
@@ -283,6 +291,7 @@ impl KeydRecord {
         })?;
         let result = reader.read_enum(KeydOutcome::from_code)?;
         let reason = reader.read_enum(KeydReason::from_code)?;
+        let decision = read_opt(reader, |r| Ok(r.read_u64()?))?;
         Ok(KeydRecord {
             ts,
             caller_role,
@@ -295,6 +304,7 @@ impl KeydRecord {
             approvers,
             result,
             reason,
+            decision,
         })
     }
 }

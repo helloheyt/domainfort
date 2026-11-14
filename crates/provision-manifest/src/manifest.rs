@@ -6,7 +6,7 @@ use crate::format::{is_printable, Document};
 use crate::limits::{MAX_FIRST_ADMINS, MIN_FIRST_ADMINS};
 use crate::value::{
     self, binding, binding_text, first_admin_items, guid_text, names_realm, object_entry,
-    COMPONENT_SEPARATOR, ENTRY_SEPARATOR, LIST_SEPARATOR, MANIFEST_VERSION,
+    salt_items, COMPONENT_SEPARATOR, ENTRY_SEPARATOR, LIST_SEPARATOR, MANIFEST_VERSION,
 };
 use dtyp::{Guid, Sid};
 use keyd_types::{KeyHandle, KeyPurpose, PrincipalBinding, PrincipalId};
@@ -40,6 +40,14 @@ pub mod keys {
     /// The first administrators: GUID, sAMAccountName and binding of each.
     /// Spec: docs/51 §4.3 steps 5, 8, 12.
     pub const FIRST_ADMINS: &str = "first_admins";
+    /// Optional: each first administrator's string-to-key salt, in
+    /// `first_admins` order — computed by `provision domain` with the
+    /// directory's own salt function (`directory_pip::account_salt`,
+    /// docs/47 §3.3 R47-4), so that keyadm's ceremony grant binds exactly
+    /// the salt `provision first-admin-secret` presents (A-102, docs/52
+    /// §2 row 37, N4) without keyadm linking the directory code.
+    /// Spec: docs/51 §4.3 steps 8, 11, 12, §7.3; docs/52 §4.2.
+    pub const FIRST_ADMIN_SALTS: &str = "first_admin_salts";
 }
 
 /// The first component of the krbtgt binding.
@@ -102,6 +110,7 @@ impl KeySet {
 pub struct FirstAdmin {
     sam_account_name: KerberosString,
     key_set: KeySet,
+    salt: Option<String>,
 }
 
 impl FirstAdmin {
@@ -116,6 +125,16 @@ impl FirstAdmin {
     #[must_use]
     pub fn key_set(&self) -> &KeySet {
         &self.key_set
+    }
+
+    /// The string-to-key salt `provision domain` wrote for this
+    /// administrator (`first_admin_salts`), if the manifest carries it.
+    /// keyadm's ceremony grant binds it (A-102, N4); `first-admin-secret`
+    /// refuses a manifest whose salt is not the directory's.
+    /// Spec: docs/51 §4.3 steps 11, 12; docs/52 §4.2 (N4).
+    #[must_use]
+    pub fn salt(&self) -> Option<&str> {
+        self.salt.as_deref()
     }
 }
 
@@ -198,6 +217,7 @@ impl Manifest {
         keys::LDAP_SERVICE,
         keys::ADMIN_SERVICE,
         keys::FIRST_ADMINS,
+        keys::FIRST_ADMIN_SALTS,
     ];
 
     /// Parse and validate a manifest.
@@ -263,7 +283,21 @@ impl Manifest {
                 &[ADMIN_SERVICE_CLASS, dc_fqdn.as_str()],
             ),
         )?;
-        let first_admins = Self::parse_first_admins(&doc, &mut seen, &realm)?;
+        let mut first_admins = Self::parse_first_admins(&doc, &mut seen, &realm)?;
+        // A-102 (N4): optional, but when present one KerberosString per first
+        // administrator, in order.
+        if let Some((salts, line)) = doc.optional(keys::FIRST_ADMIN_SALTS, salt_items)? {
+            if salts.len() != first_admins.len() {
+                return Err(Error::at(
+                    line,
+                    keys::FIRST_ADMIN_SALTS,
+                    ErrorKind::InvalidSalt,
+                ));
+            }
+            for (admin, salt) in first_admins.iter_mut().zip(salts) {
+                admin.salt = Some(salt.to_owned());
+            }
+        }
         Ok(Manifest {
             realm,
             domain_sid,
@@ -334,6 +368,7 @@ impl Manifest {
                     handle: KeyHandle::new(principal, KeyPurpose::PrincipalLongterm),
                     binding: bound,
                 },
+                salt: None,
             });
         }
         Ok(admins)
@@ -434,8 +469,43 @@ impl Manifest {
         Manifest::parse(render(&lines).as_bytes())
     }
 
+    /// This manifest with `salts` as its first administrators' salts (one per
+    /// first administrator, in order) — what `provision domain` adds after
+    /// computing each salt with the directory's salt function. The result is
+    /// encoded and parsed back, so it holds exactly what
+    /// [`Manifest::parse`] accepts.
+    ///
+    /// # Errors
+    /// [`ErrorKind::InvalidSalt`] when the count differs from the first
+    /// administrators' or a salt is not a KerberosString;
+    /// [`ErrorKind::InvalidCharacter`] for a non-printable salt; otherwise any
+    /// error of [`Manifest::parse`].
+    ///
+    /// Spec: docs/51 §4.3 step 8; docs/52 §4.2 (N4); docs/50 §7.1.
+    pub fn with_first_admin_salts(&self, salts: &[String]) -> Result<Manifest, Error> {
+        if salts.len() != self.first_admins.len() {
+            return Err(Error::field(
+                keys::FIRST_ADMIN_SALTS,
+                ErrorKind::InvalidSalt,
+            ));
+        }
+        if !salts.iter().all(|salt| salt.bytes().all(is_printable)) {
+            return Err(Error::field(
+                keys::FIRST_ADMIN_SALTS,
+                ErrorKind::InvalidCharacter,
+            ));
+        }
+        let mut salted = self.clone();
+        for (admin, salt) in salted.first_admins.iter_mut().zip(salts) {
+            admin.salt = Some(salt.clone());
+        }
+        Manifest::parse(salted.encode().as_bytes())
+    }
+
     /// The canonical text: a header comment, then every key once, in
-    /// [`Manifest::KEYS`] order, one `key = value` line each, LF-terminated.
+    /// [`Manifest::KEYS`] order, one `key = value` line each, LF-terminated
+    /// (the optional `first_admin_salts` only when every first administrator
+    /// has a salt — all or none by construction).
     /// `Manifest::parse(m.encode().as_bytes()) == Ok(m)` for every manifest.
     /// Spec: docs/50 R50-15, §7.1; docs/51 §4.3 step 8.
     #[must_use]
@@ -459,7 +529,15 @@ impl Manifest {
             (keys::ADMIN_SERVICE, object_text(&self.admin_service)),
             (keys::FIRST_ADMINS, admins.join(LIST_SEPARATOR)),
         ];
-        render(&lines)
+        let salts: Option<Vec<&str>> = self.first_admins.iter().map(FirstAdmin::salt).collect();
+        match salts {
+            Some(salts) => {
+                let mut all = lines.to_vec();
+                all.push((keys::FIRST_ADMIN_SALTS, salts.join(LIST_SEPARATOR)));
+                render(&all)
+            }
+            None => render(&lines),
+        }
     }
 
     /// The realm. Spec: docs/51 §4.3 step 8.

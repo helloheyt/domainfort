@@ -62,9 +62,6 @@ pub enum Note {
     WorkerStopped,
     /// Stopped.
     Stopped,
-    /// A keyadm-only request from a peer whose uid is not `keyadm_uid`;
-    /// refused (task A10, docs/51 §6).
-    KeyadmRefused,
 }
 
 impl Note {
@@ -94,7 +91,6 @@ impl Note {
             }
             Note::WorkerStopped => "worker thread stopped unexpectedly",
             Note::Stopped => "stopped",
-            Note::KeyadmRefused => "keyadm-only request refused: peer uid is not keyadm_uid",
         }
     }
 }

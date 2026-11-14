@@ -878,6 +878,7 @@ dependencies = [
  "keyd",
  "keyd-daemon",
  "keyd-types",
+ "krb-crypto",
  "krb-proto",
  "pdp",
  "policy-store",

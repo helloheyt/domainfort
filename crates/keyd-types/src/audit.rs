@@ -18,6 +18,7 @@
 //! audit; SIEM forwarding is the sink's job).
 
 use crate::authz::{Operation, Role};
+use crate::decision::DecisionId;
 use crate::model::{KeyPurpose, Kvno, PrincipalId};
 use krb_proto::KerberosTime;
 
@@ -291,6 +292,44 @@ pub enum AuditReason {
     /// is refused (fail closed) rather than evicting a live one.
     /// Spec: docs/questions/Q-450 item 4; AGENTS.md §6 (bounded).
     GrantTableFull,
+    /// A Role::Admin key operation (`rotate_key`, `rotate_krbtgt`,
+    /// `retire_kvno`, `destroy_key_set`) named no live decision of its
+    /// family: none registered (dird never decided it), expired, or the id
+    /// is unknown. Decided at the authorization step — nothing changed, no
+    /// intent (A-88). Reported as the uniform `Denied`.
+    /// Spec: docs/52 §4.2, §7 R1; docs/questions/Q-460 (A-102).
+    NoDecision,
+    /// The decision the id names is of another kind than the operation that
+    /// presented it (e.g. `rotate_key` naming a `RetireKvno` decision). Not
+    /// executed and not consumed. Reported as the uniform `Denied`.
+    /// Spec: docs/52 §4.2 ("keyd … requires that the call's kind match").
+    DecisionMismatch,
+    /// `register_decision` refused its arguments: a malformed decided
+    /// operation (shape, kvno 0), a purpose the executing operation does not
+    /// accept, approvers out of range or not distinct, or a lifetime of zero
+    /// or above the family's ceiling.
+    /// Spec: docs/52 §4.2; crate decision `DecidedOperation`.
+    DecisionInvalid,
+    /// `register_decision`: the decision's family is full of live
+    /// decisions; refused (fail closed), never evicting one. Reported as
+    /// `Unavailable`.
+    /// Spec: docs/52 §4.2 ("bounded"); AGENTS.md §6.
+    DecisionTableFull,
+    /// `register_decision`: the id already names a different live decision
+    /// of the family (an identical one is accepted without change).
+    /// Spec: docs/52 §4.3 (re-registration is harmless only when it is the
+    /// same decision).
+    DecisionConflict,
+    /// A key operation presented the id of a decision keyd already executed:
+    /// the recorded result is returned again and nothing is run (exactly
+    /// once, docs/52 §3.10 (a)). The record's outcome is the recorded one.
+    /// Spec: docs/52 §3.10, §4.2.
+    DecisionReplayed,
+    /// `create_key` or Role::Admin's `grant_set_secret` after
+    /// `seal_ceremony`: those operations exist only in the provisioning
+    /// ceremony. Reported as the uniform `Denied`.
+    /// Spec: docs/52 §4.4, §7 R3; docs/questions/Q-462 item 1 (A-102).
+    CeremonySealed,
 }
 
 /// A key referenced by an operation, for audit (no key material).
@@ -310,8 +349,11 @@ pub struct AuditKeyRef {
 ///
 /// Fields follow docs/10 §10: `{ ts, caller_role, caller_uid, op, principal,
 /// purpose, kvno, result }`, plus the internal `reason`, the `secondary` key
-/// of two-key operations (the krbtgt key of `issue_as_rep`), and the
-/// dual-control `approvers` of `rotate_krbtgt`. None of them is secret.
+/// of two-key operations (the krbtgt key of `issue_as_rep`), the
+/// dual-control `approvers` of `rotate_krbtgt`, and the `decision` a
+/// Directory / Admin state change ran on (A-102, docs/52 §4.5 — the field a
+/// detection rule matches against dird's `DirAdmin` event). None of them is
+/// secret.
 ///
 /// Spec: docs/10 §10, §12 I8.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -332,8 +374,13 @@ pub struct AuditRecord {
     pub kvno: Option<Kvno>,
     /// A second key used by the operation (krbtgt in `issue_as_rep`).
     pub secondary: Option<AuditKeyRef>,
-    /// Dual-control approvers (`rotate_krbtgt`).
+    /// Dual-control approvers (`rotate_krbtgt`; the first two approvers of
+    /// any decision).
     pub approvers: Option<[PrincipalId; 2]>,
+    /// The decision the operation registered or ran (A-102): its id for a
+    /// key-operation or destroy decision; a set-secret decision's id at its
+    /// registration and on the `set_secret` that consumed it.
+    pub decision: Option<DecisionId>,
     /// The outcome.
     pub result: AuditOutcome,
     /// The internal reason (never shown to the caller).

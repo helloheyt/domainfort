@@ -19,8 +19,16 @@
 //!   only — docs/questions/Q-453).
 //!
 //! keyd offers no operation that reads a key (docs/10 §7), so what keyd set
-//! is checked through `set_secret`'s kvno, keyd's `verify_secret`
-//! (Role::Directory, docs/10 §6) and keyd's audit records (docs/10 §10).
+//! is checked through `set_secret`'s kvno, through keyd verifying the
+//! password the way the KDC does — `verify_preauth` of a PA-ENC-TIMESTAMP
+//! under the key derived from it, on a third socket of the same keyd where
+//! the test's uid is Role::Kdc (no role holds `verify_secret` since A-102,
+//! docs/52 R4; the keyd clock is a test clock past the startup hold-down,
+//! RFC 4120 §3.2.3) — and keyd's audit records (docs/10 §10).
+//!
+//! Since A-102 the ceremony ends with `seal_ceremony` (docs/52 R3) and its
+//! grants bind the manifest's salts (`first_admin_salts`, N4): the grants
+//! registered before the seal still redeem after it.
 //!
 //! Sources: docs/51 §4.3 steps 5, 7, 8, 12, §4.4, §4.5; docs/47 §3.3, §9.1;
 //! docs/10 §2, §6, §9, §10; A-35; A-73; A-77; A-79; A-88; A-90; Q-401.
@@ -29,6 +37,9 @@
 
 #[path = "../../keyd-daemon/tests/support/mod.rs"]
 mod support;
+
+#[path = "../../kdc/tests/common/mod.rs"]
+mod kdc_common;
 
 mod common;
 
@@ -48,6 +59,7 @@ use ipc_keyd::{ClientConfigError, KeydClient, TransportError, Unserved, DEFAULT_
 use keyd_daemon::startup::development_keyd;
 use keyd_daemon::{CallerMap, ExtraListener, SystemClock};
 use keyd_types::{Error as KeydError, Kvno};
+use keyd_types::{KeyHandle, KeyPurpose};
 use krb_proto::Realm;
 use provision::first_admin::entry::{EntryError, Terminal};
 use provision::first_admin::keyd::{KeydAccess, Outcome};
@@ -61,7 +73,7 @@ use provision::first_admin::{
 };
 use provision::{provision_domain, Account, DomainInput, FilePath};
 use provision_manifest::Manifest;
-use support::{params, Daemon, FakeAuditd};
+use support::{params, Daemon, FakeAuditd, TestClock};
 use zeroize::Zeroizing;
 
 #[cfg(target_os = "linux")]
@@ -248,6 +260,9 @@ struct World {
     /// The same keyd's second socket, where the test's uid is keyadm's
     /// Role::Admin (task A15a; tests only).
     admin_socket: PathBuf,
+    /// The same keyd's third socket, where the test's uid is the KDC's
+    /// Role::Kdc — the password check (A-102: `verify_preauth`).
+    kdc_socket: PathBuf,
 }
 
 /// The test passwords (constructed by hand; obviously test data).
@@ -297,13 +312,26 @@ fn world_without_ceremony() -> Option<World> {
     // cannot be admind's and keyadm's in one uid map (R50-3), and the
     // ceremony's grants must be in the keyd that first-admin-secret uses.
     let admin_socket = keyd_dir.join("kx.sock");
-    params.extra_listeners = vec![ExtraListener {
-        socket: admin_socket.clone(),
-        callers: CallerMap::new(&[(uid, keyd::Role::Admin)]).unwrap(),
-    }];
+    let kdc_socket = keyd_dir.join("kq.sock");
+    params.extra_listeners = vec![
+        ExtraListener {
+            socket: admin_socket.clone(),
+            callers: CallerMap::new(&[(uid, keyd::Role::Admin)]).unwrap(),
+        },
+        // The password check the KDC's way (A-102, docs/52 R4).
+        ExtraListener {
+            socket: kdc_socket.clone(),
+            callers: CallerMap::new(&[(uid, keyd::Role::Kdc)]).unwrap(),
+        },
+    ];
     let auditd = FakeAuditd::start(&params.audit.socket);
     let realm = Realm::new(keyd_settings.realm()).unwrap();
-    let daemon = Daemon::start(params, SystemClock, development_keyd(realm)).unwrap();
+    // keyd's own clock is a test clock: started at `keyd_started`, then
+    // moved to `now` — past the startup hold-down of `verify_preauth`
+    // (RFC 4120 §3.2.3, A-62), which the password check needs.
+    let clock = TestClock::at(kdc_common::keyd_started());
+    let daemon = Daemon::start(params, clock.clone(), development_keyd(realm)).unwrap();
+    clock.set(kdc_common::now());
     std::fs::DirBuilder::new()
         .recursive(true)
         .create(dir.join("secrets"))
@@ -317,6 +345,7 @@ fn world_without_ceremony() -> Option<World> {
         auditd,
         daemon: Some(daemon),
         admin_socket,
+        kdc_socket,
     })
 }
 
@@ -333,7 +362,7 @@ impl World {
             DEFAULT_DEADLINE,
         )
         .unwrap();
-        keyadm::ceremony::run(&mut client, &self.manifest)
+        keyadm::ceremony::run(&mut client, &self.manifest).unwrap()
     }
 
     /// keyd's GrantSetSecret outcome records so far (intents apart).
@@ -421,17 +450,32 @@ impl World {
             .collect()
     }
 
-    /// keyd's `verify_secret` for first administrator `index` (the test's
-    /// uid holds Role::Directory, which may call it — docs/10 §2).
+    /// keyd verifies `candidate` for first administrator `index` the way
+    /// the KDC does: `verify_preauth` of a PA-ENC-TIMESTAMP (RFC 4120
+    /// §5.2.7.2) under the key derived from `candidate` with the manifest's
+    /// salt — the salt first-admin-secret presented (A-102, N4) — on the
+    /// Role::Kdc socket (no role holds `verify_secret`, docs/52 R4). keyd's
+    /// uniform refusal is `Denied`.
     fn verify(&self, index: usize, candidate: &str) -> Result<(), KeydError> {
-        let mut client = KeydClient::new(
-            connector::new(&self.keyd_socket()),
-            self.uid,
-            DEFAULT_DEADLINE,
-        )
-        .unwrap();
-        let handle = self.manifest.first_admins()[index].key_set().handle;
-        client.verify_secret(&handle, Zeroizing::new(candidate.to_owned()))
+        let admin = &self.manifest.first_admins()[index];
+        let salt = admin.salt().unwrap();
+        let key = kdc_common::password_key(kdc_common::AES256, candidate, salt);
+        // No kvno: the PA-ENC-TIMESTAMP names the current key.
+        let mut padata = kdc_common::pa_enc_timestamp(&key, kdc_common::now());
+        let mut sealed = krb_proto::EncryptedData::decode(&padata.padata_value).unwrap();
+        sealed.kvno = None;
+        padata.padata_value = sealed.encode().unwrap();
+        let mut client =
+            KeydClient::new(connector::new(&self.kdc_socket), self.uid, DEFAULT_DEADLINE).unwrap();
+        let handle = KeyHandle::new(
+            admin.key_set().handle.principal,
+            KeyPurpose::PrincipalLongterm,
+        );
+        match client.verify_preauth(&handle, &padata, None) {
+            Ok(_) => Ok(()),
+            Err(keyd_types::AuthnError::Denied) => Err(KeydError::Denied),
+            Err(_) => Err(KeydError::Unavailable),
+        }
     }
 
     fn stop(mut self) {
@@ -496,9 +540,9 @@ fn run_files(world: &World, request: &FirstAdminSecret) -> (Result<SecretReport,
 
 /// docs/51 §4.3 step 12: each first administrator's `(GUID,
 /// PrincipalLongterm)` key set gets the password with its NT-PRINCIPAL
-/// binding — kvno 1 for a new key set (A-35) — and keyd's `verify_secret`
-/// accepts exactly that password (the salt is the AccountSource's,
-/// R47-4); the drop asked for admind's account (from admind's file);
+/// binding — kvno 1 for a new key set (A-35) — and keyd accepts exactly
+/// that password (`verify_preauth`; the salt is the AccountSource's, R47-4,
+/// the one the manifest carries — A-102); the drop asked for admind's account (from admind's file);
 /// keyd's audit records the two set_secret calls (docs/10 §10).
 #[test]
 fn both_first_admins_get_kvno_1_and_keyd_verifies_each_password() {
@@ -561,8 +605,9 @@ fn both_first_admins_get_kvno_1_and_keyd_verifies_each_password() {
 /// ceremony's grants are one-time and cover initial secrets only — a second
 /// run against a keyd that still holds the key sets is refused at the first
 /// administrator (keyd's uniform Denied, `NoGrant` in its audit), and
-/// keyadm cannot grant a replacement (`KeyExists`): the provisioning path
-/// never resets a password past dird's PDP. The first passwords stay.
+/// keyadm cannot grant a replacement (since A-102 the ceremony sealed keyd:
+/// `CeremonySealed`; docs/52 R3): the provisioning path never resets a
+/// password past dird's PDP. The first passwords stay.
 #[test]
 fn a_second_run_is_refused_without_a_new_grant() {
     let Some(world) = world() else {
@@ -603,11 +648,16 @@ fn a_second_run_is_refused_without_a_new_grant() {
             &[keyd_types::SetSecretTarget {
                 handle: alice.handle,
                 binding: alice.binding.clone(),
+                salt: world.manifest.first_admins()[0].salt().unwrap().to_owned(),
             }],
             keyd_types::MAX_INITIAL_SECRET_GRANT_SECS,
         ),
         Err(KeydError::Denied)
     );
+    assert!(support::eventually(Duration::from_secs(10), || world
+        .grant_records()
+        .iter()
+        .any(|r| r.reason == ipc_audit::KeydReason::CeremonySealed)));
     assert_eq!(world.verify(0, ALICE_PW), Ok(()));
     assert_eq!(world.verify(1, BOB_PW), Ok(()));
     assert_eq!(world.verify(0, alice2), Err(KeydError::Denied));
@@ -964,6 +1014,36 @@ fn the_manifest_and_admind_file_must_be_root_owned() {
         run_files(&world, &linked).0.unwrap_err(),
         Refusal::Manifest(provision::first_admin::root_files::RootFileError::NotRegular)
     ));
+    world.stop();
+}
+
+/// docs/52 §2 row 37 (N4, A-102): keyadm's ceremony grant binds the
+/// manifest's salt, so a manifest whose salt is not the directory's (or that
+/// names none) is refused before anything is entered or sent — keyd would
+/// refuse the `set_secret` (`GrantMismatch`) anyway.
+#[test]
+fn a_manifest_salt_other_than_the_directorys_is_refused() {
+    let Some(world) = world() else {
+        return;
+    };
+    let forged = world
+        .manifest
+        .with_first_admin_salts(&["not-the-salt".to_owned(), "nor-this".to_owned()])
+        .unwrap();
+    let path = world.dir.join("forged-manifest");
+    std::fs::write(&path, forged.encode()).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let mut request = world.both_files(ALICE_PW, BOB_PW);
+    request.manifest = FilePath::parse(path.to_str().unwrap()).unwrap();
+    let (result, clients) = run_files(&world, &request);
+    assert_eq!(
+        result.unwrap_err(),
+        Refusal::SaltMismatch {
+            sam: "alice".to_owned()
+        }
+    );
+    assert_eq!(clients, 0, "keyd was not contacted");
+    assert!(world.set_secret_records().is_empty());
     world.stop();
 }
 

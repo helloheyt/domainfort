@@ -6,11 +6,12 @@
 //!
 //! | what | items |
 //! |---|---|
-//! | ids and handles | [`PrincipalId`], [`Kvno`], [`KeyPurpose`], [`KeyHandle`], [`PrincipalBinding`], [`DualControlToken`] |
+//! | ids and handles | [`PrincipalId`], [`Kvno`], [`KeyPurpose`], [`KeyHandle`], [`PrincipalBinding`] |
 //! | caller model | [`CallerId`], [`Role`], [`Operation`], [`authz::CAPABILITY_TABLE`], [`authz::role_permits`], [`authz::purpose_permitted`] (with the compile-time pins) |
 //! | errors | [`AuthnError`], [`IssueError`], [`Error`], [`ConfigError`] |
 //! | operation arguments and results | [`AuthnProof`], [`AsTicketTemplate`], [`AsRepParts`], [`TgsFastRequest`], [`TgtContext`], [`TgsTicketTemplate`], [`TgsRepParts`], [`FastArmor`], [`FastConversation`], [`ServiceContext`], [`AccountKind`], [`SetSecretTarget`] |
 //! | the set_secret grant (task A15a) | [`grant`]: [`MAX_GRANT_TARGETS`], [`MAX_SET_SECRET_GRANT_SECS`], [`MAX_INITIAL_SECRET_GRANT_SECS`], [`MAX_SET_SECRET_GRANTS`], [`grant::max_grant_lifetime_secs`] |
+//! | the decision table and the ceremony (A-102, docs/52 R1, R3) | [`decision`]: [`DecisionId`], [`DecidedOperation`], [`DecisionIntent`], [`PendingDestruction`], [`DestructionPage`], [`CeremonyState`], the bounds |
 //! | one-time token ids | [`ExchangeId`], [`CtxId`], [`ArmorId`], [`ServiceCtxId`] |
 //! | configuration | [`KeydConfig`], [`TicketPolicy`], [`ThrottlePolicy`], [`ConfigDescription`], [`EncTypeId`] |
 //! | audit | [`AuditRecord`], [`AuditOutcome`], [`AuditReason`], [`AuditKeyRef`], [`AuditSink`] |
@@ -50,14 +51,20 @@
 //! manifest), opened in-session. No other implementation was consulted or
 //! recalled (AGENTS.md §1-3).
 //!
+//! The decision table's vocabulary ([`decision`], A-102) is written from
+//! this project's docs/52 §3.1, §3.4, §4 and docs/questions/Q-460..Q-462,
+//! Q-465, opened in-session; no other implementation was consulted or
+//! recalled.
+//!
 //! Spec: docs/10; docs/45 §10 (D182); docs/questions/Q-245 item 3 (A-63);
-//! docs/50 §1, §10.
+//! docs/50 §1, §10; docs/52 §4 (A-102).
 
 mod as_exchange;
 pub mod audit;
 pub mod authz;
 pub mod config;
 mod custody;
+pub mod decision;
 mod enctype;
 mod error;
 mod fast_armor;
@@ -73,6 +80,12 @@ pub use audit::{AuditKeyRef, AuditOutcome, AuditReason, AuditRecord, AuditSink};
 pub use authz::{CallerId, Operation, Role};
 pub use config::{ConfigDescription, KeydConfig, ThrottlePolicy, TicketPolicy};
 pub use custody::KeyCustody;
+pub use decision::{
+    CeremonyState, DecidedOperation, DecisionId, DecisionIntent, DestructionPage,
+    PendingDestruction, MAX_DECISION_APPROVERS, MAX_DESTROY_DECISIONS, MAX_DESTROY_DECISION_PAGE,
+    MAX_DESTROY_DECISION_SECS, MAX_KEY_DECISIONS, MAX_KEY_DECISION_SECS,
+    MIN_KEY_DECISION_APPROVERS,
+};
 pub use enctype::EncTypeId;
 pub use error::{AuthnError, ConfigError, Error, IssueError};
 pub use fast_armor::{FastArmor, FastConversation, MAX_FX_COOKIE_LENGTH};
@@ -80,7 +93,7 @@ pub use grant::{
     AccountKind, SetSecretTarget, MAX_GRANT_TARGETS, MAX_INITIAL_SECRET_GRANT_SECS,
     MAX_SET_SECRET_GRANTS, MAX_SET_SECRET_GRANT_SECS,
 };
-pub use model::{DualControlToken, KeyHandle, KeyPurpose, Kvno, PrincipalBinding, PrincipalId};
+pub use model::{KeyHandle, KeyPurpose, Kvno, PrincipalBinding, PrincipalId};
 pub use service_ticket::ServiceContext;
 pub use tgs_exchange::{TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext};
 pub use time::kerberos_time_seconds;

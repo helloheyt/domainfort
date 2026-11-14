@@ -85,10 +85,21 @@ pub enum Note {
     /// operation (its decision event documents it).
     AdminOutcomeUnrecorded,
     /// A committed `BeginPasswordSet` was answered `Unavailable`: keyd did
-    /// not register the set_secret grant (task A15a; docs/questions/Q-453
-    /// item 1). The id is the failure's class: 1 keyd refused it, 2 not
-    /// performed, 3 outcome unknown.
+    /// not register its `SetSecret` decision (task A15a; A-102;
+    /// docs/questions/Q-453 item 1). The id is the failure's class: 1 keyd
+    /// refused it, 2 not performed, 3 outcome unknown.
     AdminGrantNotRegistered,
+    /// An `Approve` completed a key request's quorum but its decision was
+    /// not registered in keyd (or its decision event was not acknowledged —
+    /// class 2): the approval was withdrawn and the answer is `Unavailable`
+    /// (A-102, docs/52 §4.3). The id is the failure's class as above.
+    AdminDecisionNotRegistered,
+    /// A `Delete` of a user or computer committed but keyd did not register
+    /// its `DestroyKeySet` decision (A-102, docs/52 §4.3): the account is
+    /// deleted and its key sets are unreachable (docs/51 §9); they wait for
+    /// a re-registration (docs/questions/Q-470). The id is the failure's
+    /// class as above, 4 when the tombstone could not be read.
+    AdminDestroyNotRegistered,
     /// Stopped.
     Stopped,
 }
@@ -137,8 +148,16 @@ impl Note {
                 "admin operation outcome event not recorded (its decision event was)"
             }
             Note::AdminGrantNotRegistered => {
-                "password set begun but keyd did not register its set_secret grant: answered \
+                "password set begun but keyd did not register its set_secret decision: answered \
                  unavailable (no password set); failure class"
+            }
+            Note::AdminDecisionNotRegistered => {
+                "approval completed a key request but keyd did not register its decision: \
+                 approval withdrawn, answered unavailable; failure class"
+            }
+            Note::AdminDestroyNotRegistered => {
+                "account deleted but keyd did not register its destroy decision (key sets \
+                 unreachable, awaiting re-registration); failure class"
             }
             Note::Stopped => "stopped",
         }

@@ -1,5 +1,10 @@
 //! Directory operations: set a principal's secret from a password, and
-//! verify a candidate password. Role `Directory` only.
+//! verify a candidate password. `set_secret`: Role `Directory`, on a
+//! decision dird registered (A-102). `verify_secret`: **no role** holds it
+//! (A-102, docs/52 R4 / N3 — no process calls it, and Directory holding it
+//! was a second, FAST-bypassing guess oracle); the operation stays for a
+//! future declared consumer (kpasswd / P-14) and is refused at the
+//! capability table until then.
 //!
 //! - The plaintext arrives in a RustCrypto `Zeroizing<String>` taken BY
 //!   VALUE: keyd owns it and it is wiped when the operation returns (I7).
@@ -63,21 +68,24 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// identify its existing binding (RFC 4120 6.2 equivalence) or the call
     /// is refused — a password change can never rename a principal.
     ///
-    /// **The grant** (task A15a; docs/51 §5.8 option (b)): a live grant for
-    /// the handle — registered by dird after its PDP, or by keyadm's
-    /// ceremony for a first administrator (`grant_set_secret`) — is required
-    /// at the authorization step (no grant ⇒ the uniform `Denied`, reason
+    /// **The decision** (task A15a; docs/51 §5.8 option (b); A-102): a live
+    /// set-secret entry for the handle — a `SetSecret` decision dird
+    /// registered after its PDP (`register_decision`), or keyadm's ceremony
+    /// grant for a first administrator (`grant_set_secret`) — is required at
+    /// the authorization step (none ⇒ the uniform `Denied`, reason
     /// `NoGrant`) and consumed right after it, whatever the rest decides.
-    /// Its binding must be `binding` exactly (else `GrantMismatch`); an
-    /// initial-secret grant also requires that the key set does not exist
-    /// yet (else `GrantMismatch`).
+    /// Its binding must be `binding` exactly and its salt `salt` exactly
+    /// (N4; else `GrantMismatch`); an initial-secret grant also requires
+    /// that the key set does not exist yet (else `GrantMismatch`). The
+    /// record names the decision's id.
     ///
     /// Spec: docs/10 §6 (`set_secret(principal, purpose, material, salt) ->
     /// Kvno`, "derives keys inside, zeroizes plaintext"), §12 I1, I7;
     /// docs/questions/Q-115 (A-35: "keyd chooses the next kvno and returns
     /// it"); RFC 4120 5.2.9 (kvno, UInt32); RFC 3961 §3; RFC 3962 §4;
     /// RFC 4120 6.2; docs/questions/Q-040 (A-19); docs/51 §5.8;
-    /// docs/questions/Q-291 (A-74), Q-450 items 1, 7, Q-451 item 2.
+    /// docs/questions/Q-291 (A-74), Q-450 items 1, 7, Q-451 item 2; docs/52
+    /// §4.2 (A-102, N4).
     pub fn set_secret(
         &mut self,
         caller: &CallerId,
@@ -88,6 +96,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         now: &KerberosTime,
     ) -> Result<Kvno, Error> {
         let mut fields = AuditFields::for_handle(handle);
+        fields.decision = self.decisions.secret_decision(handle);
         let result = self
             .admit(
                 caller,
@@ -103,7 +112,8 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         result.map_err(Error::from)
     }
 
-    /// `set_secret` after [`Keyd::admit`] passed (which found a live grant).
+    /// `set_secret` after [`Keyd::admit`] passed (which found a live
+    /// set-secret entry).
     fn set_secret_inner(
         &mut self,
         handle: &KeyHandle,
@@ -113,11 +123,12 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         now: &KerberosTime,
         fields: &mut AuditFields,
     ) -> Internal<Kvno> {
-        // The grant is consumed by this presentation, before anything else
-        // is decided (one attempt per grant; crate grant.rs).
-        let redeemed = self
-            .grants
-            .redeem(handle, binding, kerberos_time_seconds(now))?;
+        // The entry is consumed by this presentation, before anything else
+        // is decided (one attempt per decision; crate decision.rs).
+        let redeemed =
+            self.decisions
+                .redeem_secret(handle, binding, salt, kerberos_time_seconds(now))?;
+        fields.decision = redeemed.decision;
         if !self.store.accepts(handle.purpose) {
             return Err(Deny::denied(AuditReason::StoreRefusedCritical));
         }
@@ -169,6 +180,10 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// password-derived key? Constant-time comparison (krb-crypto
     /// `verify_mic`), throttled, plaintext zeroized on return.
     ///
+    /// **No role may call it** (A-102, docs/52 R4): every call is refused at
+    /// the capability table (`RoleNotPermitted`), one record. It returns
+    /// with a declared consumer (docs/questions/Q-465).
+    ///
     /// Returns `Ok(())` on a match; `Error::Denied` for a wrong password, an
     /// unknown principal, a non-password key or a wrong role — the caller
     /// cannot tell these apart; `Error::RateLimited` when the throttling
@@ -177,7 +192,8 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// `AuthnError`; `Error` is used so the throttle outcome of docs/10 §9
     /// is expressible, while `Denied` stays uniform.
     ///
-    /// Spec: docs/10 §6 ("constant-time, throttled"), §9, §12 I6, I7.
+    /// Spec: docs/10 §6 ("constant-time, throttled"), §9, §12 I6, I7;
+    /// docs/52 §3.4 (N3), §7 R4; docs/questions/Q-465 (A-102).
     pub fn verify_secret(
         &mut self,
         caller: &CallerId,
@@ -345,7 +361,7 @@ mod tests {
     use crate::authz::Role;
     use crate::model::{KeyPurpose, PrincipalId};
     use crate::store::InMemoryKeyStore;
-    use keyd_types::{AccountKind, EncTypeId, SetSecretTarget};
+    use keyd_types::{AccountKind, DecidedOperation, DecisionId, EncTypeId, SetSecretTarget};
     use krb_proto::{KerberosString, PrincipalName, Realm};
 
     #[derive(Default)]
@@ -406,21 +422,37 @@ mod tests {
         // held anyway) is long over.
         let started = KerberosTime::new(2026, 11, 12, 10, 0, 0).unwrap();
         let mut keyd = Keyd::new(config, store, Records::default(), &started).unwrap();
-        // The grants dird would register (task A15a): one for each handle.
+        // The decisions dird would register (task A15a, A-102): one for each
+        // handle.
         let target = |handle: KeyHandle| SetSecretTarget {
             handle,
             binding: binding(),
+            salt: SALT.to_owned(),
         };
         let below_max_account = KeyHandle::new(below_max.principal, KeyPurpose::PrincipalLongterm);
         assert_eq!(
-            keyd.grant_set_secret(&LDAP, AccountKind::User, &[target(at_max)], 30, &now),
+            keyd.register_decision(
+                &LDAP,
+                DecisionId::new(1),
+                &DecidedOperation::SetSecret {
+                    kind: AccountKind::User,
+                    targets: vec![target(at_max)],
+                },
+                &[],
+                30,
+                &now
+            ),
             Ok(())
         );
         assert_eq!(
-            keyd.grant_set_secret(
+            keyd.register_decision(
                 &LDAP,
-                AccountKind::Computer,
-                &[target(below_max_account), target(below_max)],
+                DecisionId::new(2),
+                &DecidedOperation::SetSecret {
+                    kind: AccountKind::Computer,
+                    targets: vec![target(below_max_account), target(below_max)],
+                },
+                &[],
                 30,
                 &now
             ),

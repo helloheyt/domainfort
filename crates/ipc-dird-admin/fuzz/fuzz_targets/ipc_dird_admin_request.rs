@@ -12,12 +12,12 @@
 //! without a reply).
 //!
 //! Task A10 added the key-operation kinds (`RequestKeyOperation`,
-//! `Approve`, and keyadm's `FetchApproved` / `Complete` /
-//! `ListPendingDestruction`, which carry no `auth`): whatever decodes as a
-//! keyadm request has one of the keyadm kinds.
+//! `Approve`). keyadm's `FetchApproved` / `Complete` /
+//! `ListPendingDestruction` (`0x10`–`0x12`) were retired by A-102: nothing
+//! decodes with one of those kinds.
 //!
 //! Spec: docs/51 §6, §7.1-§7.3, §7.5; docs/50 §3.3, §9; A-59;
-//! docs/questions/Q-422.
+//! docs/questions/Q-422, Q-460 (A-102).
 
 use ipc::{decode_body, encode_frame, Direction};
 use ipc_dird_admin::{decode_request, AdminRequest, Request, ADMIN_CHANNEL};
@@ -29,12 +29,10 @@ fuzz_target!(|data: &[u8]| {
             let again = encode_frame(ADMIN_CHANNEL, Direction::Request, &wire)
                 .expect("a decoded request re-encodes");
             assert_eq!(again.body(), data, "canonical wire round trip");
+            assert!(!ipc_dird_admin::channel::request_kind::RETIRED.contains(&data[3]));
             if let Ok(request) = Request::from_wire(&wire) {
                 let typed = request.to_wire().expect("a typed request re-encodes");
                 assert_eq!(typed, wire, "canonical typed round trip");
-                if let Request::Keyadm(_) = request {
-                    assert!(ipc_dird_admin::channel::request_kind::KEYADM.contains(&data[3]));
-                }
             }
         }
         Err(error) => {

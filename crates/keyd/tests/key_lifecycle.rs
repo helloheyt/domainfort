@@ -1,10 +1,13 @@
 //! Key-set lifecycle of decision A-35 (docs/questions/Q-115): keyd chooses
 //! the kvno of `set_secret` (initial for a new set, current + 1 otherwise)
 //! and returns it; `destroy_key_set` (Admin, never krbtgt) removes and
-//! zeroizes a deleted account's whole key set, leaving the handle unknown to
-//! every operation. Sources: docs/questions/Q-115 (A-35); docs/10 §6, §7,
-//! §8, §9, §10, §12 I2, I3, I4, I8; docs/47 §9.1 (a computer's two key sets
-//! share one id, password and salt). The kvno ceiling is tested inside the
+//! zeroizes a deleted account's key sets, leaving the handles unknown to
+//! every operation. Since A-102 (docs/52 §4.2, §4.3) every one of these
+//! runs on a decision dird registered (the `decide` / `grant` helpers), and
+//! `destroy_key_set` destroys a deleted principal's PrincipalLongterm and
+//! Service key sets together. Sources: docs/questions/Q-115 (A-35); docs/10
+//! §6, §7, §8, §9, §10, §12 I2, I3, I4, I8; docs/47 §9.1 (a computer's two
+//! key sets share one id, password and salt); docs/52 §4.2, §4.3. The kvno ceiling is tested inside the
 //! crate (src/directory.rs), since 2^32 changes are unreachable here. All
 //! values are constructed for these tests.
 
@@ -12,8 +15,8 @@ mod common;
 
 use common::*;
 use keyd::{
-    AuditOutcome, AuditReason, AuthnError, Error, IssueError, KeyHandle, KeyPurpose, Kvno,
-    Operation, PrincipalId,
+    AccountKind, AuditOutcome, AuditReason, AuthnError, DecidedOperation, DecisionId, Error,
+    IssueError, KeyHandle, KeyPurpose, Kvno, Operation, PrincipalId, SetSecretTarget,
 };
 use krb_crypto::EncType;
 use krb_proto::constants::{KRB_NT_PRINCIPAL, KRB_NT_SRV_HST};
@@ -38,6 +41,13 @@ fn carol_name() -> PrincipalName {
     }
 }
 
+/// The destroy decision dird registers after a `Delete` of `principal`
+/// committed (A-102, docs/52 §4.3).
+fn destroy_decision(f: &mut Fixture, principal: PrincipalId) -> DecisionId {
+    f.decide(DecidedOperation::DestroyKeySet { principal }, &now())
+        .unwrap()
+}
+
 fn pa_with(password: &str, salt: &str, kvno: u32) -> krb_proto::PaData {
     pa_enc_timestamp(
         &password_key(EncType::Aes256CtsHmacSha196, password, salt),
@@ -53,7 +63,8 @@ fn pa_with(password: &str, salt: &str, kvno: u32) -> krb_proto::PaData {
 #[test]
 fn set_secret_on_a_new_set_returns_the_initial_kvno() {
     let mut f = Fixture::new();
-    f.grant(&CAROL, &bound(carol_name()), &now()).unwrap();
+    f.grant(&CAROL, &bound(carol_name()), CAROL_SALT, &now())
+        .unwrap();
     assert_eq!(
         f.keyd.set_secret(
             &DIRECTORY,
@@ -91,7 +102,8 @@ fn set_secret_on_an_existing_set_returns_current_plus_one() {
     let mut f = Fixture::new();
     // alice was created at kvno 1 by the fixture.
     for (password, expected) in [("second", 2), ("third", 3)] {
-        f.grant(&ALICE, &alice_binding(), &now()).unwrap();
+        f.grant(&ALICE, &alice_binding(), ALICE_SALT, &now())
+            .unwrap();
         assert_eq!(
             f.keyd.set_secret(
                 &DIRECTORY,
@@ -122,11 +134,20 @@ fn set_secret_on_an_existing_set_returns_current_plus_one() {
     );
 
     // Service key: create_key gave 1, rotate_key gives 2, set_secret 3.
+    let rotation = f
+        .decide(DecidedOperation::RotateKey { handle: SERVICE }, &now())
+        .unwrap();
     assert_eq!(
-        f.keyd.rotate_key(&ADMIN, &SERVICE, &now()),
+        f.keyd.rotate_key(&ADMIN, rotation, &now()),
         Ok(Kvno::new(2))
     );
-    f.grant(&SERVICE, &service_binding(), &now()).unwrap();
+    f.grant(
+        &SERVICE,
+        &service_binding(),
+        "EXAMPLE.ORGhostfiles.example.org",
+        &now(),
+    )
+    .unwrap();
     assert_eq!(
         f.keyd.set_secret(
             &DIRECTORY,
@@ -141,17 +162,20 @@ fn set_secret_on_an_existing_set_returns_current_plus_one() {
 }
 
 /// A-35: after destroy_key_set the handle is unknown to every operation —
-/// verify_preauth, issue_as_rep, verify_secret, rotate_key, retire_kvno and
-/// destroy_key_set itself all give the uniform Denied — and set_secret on
-/// the same handle creates a NEW set, from the initial kvno, only with a
-/// binding that passes the creation rules. Other principals are untouched.
+/// verify_preauth, issue_as_rep, and a rotate_key / retire_kvno decision on
+/// it all give the uniform Denied (KeyNotFound); a second destroy decision
+/// finds nothing to destroy — and set_secret on the same handle creates a
+/// NEW set, from the initial kvno, only with a binding that passes the
+/// creation rules. Other principals are untouched.
 /// Source: docs/questions/Q-115 (A-35); docs/10 §7, §9 (uniform Denied);
-/// docs/questions/Q-040 (A-19, creation-time binding rules).
+/// docs/questions/Q-040 (A-19, creation-time binding rules); docs/52 §4.2
+/// (A-102).
 #[test]
 fn destroyed_handle_is_unknown_to_every_operation() {
     let mut f = Fixture::new();
     // Give alice a previous version too: the whole set must go.
-    f.grant(&ALICE, &alice_binding(), &now()).unwrap();
+    f.grant(&ALICE, &alice_binding(), ALICE_SALT, &now())
+        .unwrap();
     assert_eq!(
         f.keyd.set_secret(
             &DIRECTORY,
@@ -174,13 +198,15 @@ fn destroyed_handle_is_unknown_to_every_operation() {
         )
         .unwrap();
 
-    assert_eq!(f.keyd.destroy_key_set(&ADMIN, &ALICE, &now()), Ok(()));
+    let destroy = destroy_decision(&mut f, ALICE_ID);
+    assert_eq!(f.keyd.destroy_key_set(&ADMIN, destroy, &now()), Ok(()));
     let last = f.records().last().unwrap();
     assert_eq!(last.op, Operation::DestroyKeySet);
     assert_eq!(last.result, AuditOutcome::Success);
     assert_eq!(last.principal, Some(ALICE_ID));
     assert_eq!(last.purpose, Some(KeyPurpose::PrincipalLongterm));
     assert_eq!(last.kvno, Some(Kvno::new(2)));
+    assert_eq!(last.decision, Some(destroy));
 
     for (password, kvno) in [("second", 2), (ALICE_PASSWORD, 1)] {
         assert_eq!(
@@ -200,34 +226,40 @@ fn destroyed_handle_is_unknown_to_every_operation() {
             .issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, None, &as_template(), &now()),
         Err(IssueError::Denied)
     );
+    let rotation = f
+        .decide(DecidedOperation::RotateKey { handle: ALICE }, &now())
+        .unwrap();
     assert_eq!(
-        f.keyd
-            .verify_secret(&DIRECTORY, &ALICE, z("second"), &now()),
-        Err(Error::Denied)
-    );
-    assert_eq!(f.records().last().unwrap().reason, AuditReason::KeyNotFound);
-    assert_eq!(
-        f.keyd.rotate_key(&ADMIN, &ALICE, &now()),
+        f.keyd.rotate_key(&ADMIN, rotation, &now()),
         Err(Error::Denied)
     );
     assert_eq!(f.records().last().unwrap().reason, AuditReason::KeyNotFound);
     for kvno in [1, 2] {
+        let retirement = f
+            .decide(
+                DecidedOperation::RetireKvno {
+                    handle: ALICE,
+                    kvno: Kvno::new(kvno),
+                },
+                &now(),
+            )
+            .unwrap();
         assert_eq!(
-            f.keyd.retire_kvno(&ADMIN, &ALICE, Kvno::new(kvno), &now()),
+            f.keyd.retire_kvno(&ADMIN, retirement, &now()),
             Err(Error::Denied)
         );
         assert_eq!(f.records().last().unwrap().reason, AuditReason::KeyNotFound);
     }
-    assert_eq!(
-        f.keyd.destroy_key_set(&ADMIN, &ALICE, &now()),
-        Err(Error::Denied)
-    );
-    assert_eq!(f.records().last().unwrap().reason, AuditReason::KeyNotFound);
+    // A second destroy decision finds nothing to destroy: done, no kvno.
+    let again = destroy_decision(&mut f, ALICE_ID);
+    assert_eq!(f.keyd.destroy_key_set(&ADMIN, again, &now()), Ok(()));
+    assert_eq!(f.records().last().unwrap().kvno, None);
 
     // Recreating needs a creation-valid binding (a krbtgt name is refused,
     // and nothing is created) — even with a grant naming it (task A15a: the
     // grant does not judge bindings; set_secret does) ...
-    f.grant(&ALICE, &krbtgt_binding(), &now()).unwrap();
+    f.grant(&ALICE, &krbtgt_binding(), ALICE_SALT, &now())
+        .unwrap();
     assert_eq!(
         f.keyd.set_secret(
             &DIRECTORY,
@@ -243,13 +275,10 @@ fn destroyed_handle_is_unknown_to_every_operation() {
         f.records().last().unwrap().reason,
         AuditReason::InvalidNameBinding
     );
-    assert_eq!(
-        f.keyd.verify_secret(&DIRECTORY, &ALICE, z("new"), &now()),
-        Err(Error::Denied)
-    );
-    assert_eq!(f.records().last().unwrap().reason, AuditReason::KeyNotFound);
-    // ... and then starts again from the initial kvno.
-    f.grant(&ALICE, &alice_binding(), &now()).unwrap();
+    // ... and then starts again from the initial kvno (so the refused call
+    // created nothing).
+    f.grant(&ALICE, &alice_binding(), ALICE_SALT, &now())
+        .unwrap();
     assert_eq!(
         f.keyd.set_secret(
             &DIRECTORY,
@@ -308,8 +337,10 @@ fn destroy_discards_live_proofs_of_the_key_set() {
             &now(),
         )
         .unwrap();
-    f.keyd.destroy_key_set(&ADMIN, &ALICE, &now()).unwrap();
-    f.grant(&ALICE, &alice_binding(), &now()).unwrap();
+    let destroy = destroy_decision(&mut f, ALICE_ID);
+    f.keyd.destroy_key_set(&ADMIN, destroy, &now()).unwrap();
+    f.grant(&ALICE, &alice_binding(), ALICE_SALT, &now())
+        .unwrap();
     assert_eq!(
         f.keyd.set_secret(
             &DIRECTORY,
@@ -336,12 +367,14 @@ fn destroy_discards_live_proofs_of_the_key_set() {
 }
 
 /// A computer has two key sets under one id (PrincipalLongterm and Service,
-/// docs/47 §9.1). Destroying the Service set leaves the PrincipalLongterm
-/// set and its live proof alone; destroying the PrincipalLongterm set
-/// leaves the Service set alone. Source: docs/47 §9.1; docs/questions/Q-115
-/// (A-35); docs/10 §1 (a handle is principal + purpose).
+/// docs/47 §9.1). A destroy decision names the deleted principal, and
+/// `destroy_key_set` destroys both key sets (with the client set's live
+/// proof); the record names the client set and, as its secondary key, the
+/// Service set, each with its destroyed kvno. Another principal is
+/// untouched. Source: docs/47 §9.1; docs/questions/Q-115 (A-35); docs/52
+/// §4.2 (`DestroyKeySet { principal }` — both purposes), §4.3; docs/51 §6.
 #[test]
-fn destroy_is_per_handle_not_per_principal() {
+fn destroy_takes_both_key_sets_of_the_principal() {
     let mut f = Fixture::new();
     let id = PrincipalId::from_bytes([0xC5; 16]);
     let client = KeyHandle::new(id, KeyPurpose::PrincipalLongterm);
@@ -355,28 +388,28 @@ fn destroy_is_per_handle_not_per_principal() {
         name_type: KRB_NT_SRV_HST,
         name_string: vec![kstr("host"), kstr("ws05.example.org")],
     };
-    // One computer grant for both key sets, as dird registers it after
-    // BeginPasswordSet (task A15a; docs/47 §9.1).
-    assert_eq!(
-        f.keyd.grant_set_secret(
-            &LDAP,
-            keyd::AccountKind::Computer,
-            &[
-                keyd::SetSecretTarget {
-                    handle: client,
-                    binding: bound(client_name.clone()),
-                },
-                keyd::SetSecretTarget {
-                    handle: service,
-                    binding: bound(service_name.clone()),
-                },
-            ],
-            keyd::MAX_SET_SECRET_GRANT_SECS,
-            &now(),
-        ),
-        Ok(())
-    );
-    for (handle, name) in [(client, client_name), (service, service_name)] {
+    // One computer decision for both key sets, as dird registers it after
+    // BeginPasswordSet (task A15a; docs/47 §9.1; A-102).
+    let computer = DecidedOperation::SetSecret {
+        kind: AccountKind::Computer,
+        targets: vec![
+            SetSecretTarget {
+                handle: client,
+                binding: bound(client_name.clone()),
+                salt: salt.to_owned(),
+            },
+            SetSecretTarget {
+                handle: service,
+                binding: bound(service_name.clone()),
+                salt: salt.to_owned(),
+            },
+        ],
+    };
+    f.decide(computer.clone(), &now()).unwrap();
+    for (handle, name) in [
+        (client, client_name.clone()),
+        (service, service_name.clone()),
+    ] {
         assert_eq!(
             f.keyd.set_secret(
                 &DIRECTORY,
@@ -399,25 +432,25 @@ fn destroy_is_per_handle_not_per_principal() {
             &now(),
         )
         .unwrap();
-    assert_eq!(f.keyd.destroy_key_set(&ADMIN, &service, &now()), Ok(()));
-    assert_eq!(
-        f.keyd
-            .verify_secret(&DIRECTORY, &service, z("machine password"), &now()),
-        Err(Error::Denied)
-    );
-    assert_eq!(f.records().last().unwrap().reason, AuditReason::KeyNotFound);
-    // The client set and its proof are intact (the template names ws05$).
+    let destroy = destroy_decision(&mut f, id);
+    assert_eq!(f.keyd.destroy_key_set(&ADMIN, destroy, &now()), Ok(()));
+    let last = f.records().last().unwrap();
+    assert_eq!(last.principal, Some(id));
+    assert_eq!(last.purpose, Some(KeyPurpose::PrincipalLongterm));
+    assert_eq!(last.kvno, Some(Kvno::INITIAL));
+    let secondary = last.secondary.unwrap();
+    assert_eq!(secondary.principal, id);
+    assert_eq!(secondary.purpose, KeyPurpose::Service);
+    assert_eq!(secondary.kvno, Some(Kvno::INITIAL));
+    // The client set and its live proof are gone.
     let mut template = as_template();
     template.client = id;
-    template.cname = PrincipalName {
-        name_type: KRB_NT_PRINCIPAL,
-        name_string: vec![kstr("ws05$")],
-    };
-    assert!(f
-        .keyd
-        .issue_as_rep(&KDC, &client, &KRBTGT, &proof, None, &template, &now())
-        .is_ok());
-    assert_eq!(f.keyd.destroy_key_set(&ADMIN, &client, &now()), Ok(()));
+    template.cname = client_name.clone();
+    assert_eq!(
+        f.keyd
+            .issue_as_rep(&KDC, &client, &KRBTGT, &proof, None, &template, &now()),
+        Err(IssueError::Denied)
+    );
     assert_eq!(
         f.keyd.verify_preauth(
             &KDC,
@@ -428,6 +461,23 @@ fn destroy_is_per_handle_not_per_principal() {
         ),
         Err(AuthnError::Denied)
     );
+    // Both sets are recreated from the initial kvno: neither survived.
+    f.decide(computer, &now()).unwrap();
+    for (handle, name) in [(client, client_name), (service, service_name)] {
+        assert_eq!(
+            f.keyd.set_secret(
+                &DIRECTORY,
+                &handle,
+                &bound(name),
+                z("another machine password"),
+                salt,
+                &now(),
+            ),
+            Ok(Kvno::INITIAL)
+        );
+    }
+    // Bob was never touched.
+    assert!(f.password_works(&BOB, BOB_PASSWORD, BOB_SALT));
 }
 
 /// A-35: a destroyed Service key set seals no more service tickets; the
@@ -437,7 +487,8 @@ fn destroy_is_per_handle_not_per_principal() {
 fn destroyed_service_key_issues_no_ticket() {
     let mut f = Fixture::new();
     let tgt = obtain_tgt(&mut f, now(), &as_template());
-    assert_eq!(f.keyd.destroy_key_set(&ADMIN, &SERVICE, &now()), Ok(()));
+    let destroy = destroy_decision(&mut f, SERVICE_ID);
+    assert_eq!(f.keyd.destroy_key_set(&ADMIN, destroy, &now()), Ok(()));
     let ctx = open_tgt(&mut f, &tgt, 31, 31);
     assert_eq!(
         f.keyd
@@ -449,52 +500,48 @@ fn destroyed_service_key_issues_no_ticket() {
     open_tgt(&mut f, &tgt, 32, 32);
 }
 
-/// A-35: only Admin may destroy (Directory and Kdc: RoleNotPermitted), a
-/// Krbtgt key set never (PurposeMismatch — krbtgt is only rotated), and an
-/// unknown handle is the same uniform Denied (KeyNotFound only in audit).
-/// Nothing is destroyed by a refused call. Source: docs/questions/Q-115
-/// (A-35: "never for krbtgt"); docs/10 §2 (capability table), §7, §9,
-/// §12 I2, I3.
+/// A-35 / A-102: only Admin may run a destroy decision (Directory and Kdc:
+/// RoleNotPermitted, and the decision stays pending); a krbtgt key set is
+/// never destroyed (a destroy decision for the krbtgt principal touches
+/// only its PrincipalLongterm and Service handles, which it does not have);
+/// a principal without key sets is destroyed trivially (no kvno); an id no
+/// decision has is the uniform Denied (NoDecision). Nothing is destroyed by
+/// a refused call. Source: docs/questions/Q-115 (A-35: "never for
+/// krbtgt"); docs/10 §2 (capability table), §7, §9, §12 I2; docs/52 §4.2.
 #[test]
-fn destroy_key_set_role_purpose_and_unknown_handle() {
+fn destroy_key_set_role_krbtgt_and_unknown_decision() {
     let mut f = Fixture::new();
+    let destroy_alice = destroy_decision(&mut f, ALICE_ID);
     for caller in [DIRECTORY, KDC] {
-        for handle in [ALICE, SERVICE] {
-            assert_eq!(
-                f.keyd.destroy_key_set(&caller, &handle, &now()),
-                Err(Error::Denied)
-            );
-            let last = f.records().last().unwrap();
-            assert_eq!(last.op, Operation::DestroyKeySet);
-            assert_eq!(last.caller_role, caller.role);
-            assert_eq!(last.reason, AuditReason::RoleNotPermitted);
-        }
-    }
-    assert_eq!(
-        f.keyd.destroy_key_set(&ADMIN, &KRBTGT, &now()),
-        Err(Error::Denied)
-    );
-    assert_eq!(
-        f.records().last().unwrap().reason,
-        AuditReason::PurposeMismatch
-    );
-    for unknown in [
-        KeyHandle::new(
-            PrincipalId::from_bytes([0xEE; 16]),
-            KeyPurpose::PrincipalLongterm,
-        ),
-        KeyHandle::new(PrincipalId::from_bytes([0xEF; 16]), KeyPurpose::Service),
-        // alice has no Service key set.
-        KeyHandle::new(ALICE_ID, KeyPurpose::Service),
-    ] {
         assert_eq!(
-            f.keyd.destroy_key_set(&ADMIN, &unknown, &now()),
+            f.keyd.destroy_key_set(&caller, destroy_alice, &now()),
             Err(Error::Denied)
         );
         let last = f.records().last().unwrap();
-        assert_eq!(last.reason, AuditReason::KeyNotFound);
-        assert_eq!(last.kvno, None);
+        assert_eq!(last.op, Operation::DestroyKeySet);
+        assert_eq!(last.caller_role, caller.role);
+        assert_eq!(last.reason, AuditReason::RoleNotPermitted);
     }
+    // The refused calls consumed nothing: the decision is still pending.
+    let page = f.keyd.list_destroy_decisions(&ADMIN, None, &now()).unwrap();
+    assert!(page.entries.iter().any(|p| p.decision == destroy_alice));
+    let destroy_krbtgt = destroy_decision(&mut f, KRBTGT_ID);
+    assert_eq!(
+        f.keyd.destroy_key_set(&ADMIN, destroy_krbtgt, &now()),
+        Ok(())
+    );
+    assert_eq!(f.records().last().unwrap().kvno, None);
+    let nobody = destroy_decision(&mut f, PrincipalId::from_bytes([0xEE; 16]));
+    assert_eq!(f.keyd.destroy_key_set(&ADMIN, nobody, &now()), Ok(()));
+    let last = f.records().last().unwrap();
+    assert_eq!(last.kvno, None);
+    assert_eq!(last.secondary.unwrap().kvno, None);
+    assert_eq!(
+        f.keyd
+            .destroy_key_set(&ADMIN, DecisionId::new(0xDEAD_0001), &now()),
+        Err(Error::Denied)
+    );
+    assert_eq!(f.records().last().unwrap().reason, AuditReason::NoDecision);
     // Everything still works: the krbtgt, alice and the service key.
     let tgt = obtain_tgt(&mut f, now(), &as_template());
     let ctx = open_tgt(&mut f, &tgt, 33, 33);
@@ -529,20 +576,25 @@ fn renderings(secret: &[u8]) -> Vec<String> {
 #[test]
 fn destroy_key_set_audit_has_no_key_material() {
     let mut f = Fixture::new();
-    let calls: [(keyd::CallerId, KeyHandle, bool); 4] = [
-        (ADMIN, SERVICE, true),
-        (ADMIN, ALICE, true),
-        (ADMIN, ALICE, false),
-        (DIRECTORY, BOB, false),
+    let service = destroy_decision(&mut f, SERVICE_ID);
+    let alice = destroy_decision(&mut f, ALICE_ID);
+    let bob = destroy_decision(&mut f, BOB_ID);
+    let calls: [(keyd::CallerId, DecisionId, bool); 5] = [
+        (ADMIN, service, true),
+        (ADMIN, alice, true),
+        // The same decision again: its recorded result, nothing run.
+        (ADMIN, alice, true),
+        (ADMIN, DecisionId::new(0xDEAD_0002), false),
+        (DIRECTORY, bob, false),
     ];
-    for (caller, handle, ok) in calls {
+    for (caller, id, ok) in calls {
         let before = f.records().len();
-        assert_eq!(f.keyd.destroy_key_set(&caller, &handle, &now()).is_ok(), ok);
+        assert_eq!(f.keyd.destroy_key_set(&caller, id, &now()).is_ok(), ok);
         assert_eq!(f.records().len(), before + 1);
         let last = f.records().last().unwrap();
         assert_eq!(last.op, Operation::DestroyKeySet);
-        assert_eq!(last.secondary, None);
         assert_eq!(last.approvers, None);
+        assert_eq!(last.decision, Some(id));
     }
     let text = format!("{:?}", f.records());
     for password in [ALICE_PASSWORD, BOB_PASSWORD] {

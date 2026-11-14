@@ -179,7 +179,8 @@ mod from_keyd {
             ArmorProofMismatch, FastBindingMismatch, TgsExplicitArmor, FastApReqMismatch,
             ArmorConversationMismatch, ServiceKeyNotRandom, TransitedNotLocal,
             ApChecksumUnsupported, StartupHoldDown, NoGrant, GrantMismatch, GrantInvalid,
-            GrantTableFull,
+            GrantTableFull, NoDecision, DecisionMismatch, DecisionInvalid, DecisionTableFull,
+            DecisionConflict, DecisionReplayed, CeremonySealed,
         }
             _ => KeydReason::Unlisted,
         )
@@ -200,7 +201,8 @@ mod from_keyd {
                     VerifyPreauth, IssueAsRep, OpenAndVerifyTgt, IssueTgsRep, SetSecret,
                     VerifySecret, CreateKey, RotateKey, RotateKrbtgt, RetireKvno,
                     OpenFastArmor, SealFastError, DestroyKeySet, OpenAndVerifyServiceTicket,
-                    DescribeConfig, Ping, GrantSetSecret,
+                    DescribeConfig, Ping, GrantSetSecret, RegisterDecision, SealCeremony,
+                    ListDestroyDecisions,
                 }),
                 principal: record.principal.map(|id| *id.as_bytes()),
                 purpose: record.purpose.as_ref().map(purpose),
@@ -217,6 +219,7 @@ mod from_keyd {
                     Success, Denied, BadTemplate, Unavailable, RateLimited,
                 }),
                 reason: reason(&record.reason),
+                decision: record.decision.map(keyd::DecisionId::get),
             }
         }
     }

@@ -16,15 +16,18 @@
 //!
 //! A decoded `grant_set_secret` (task A15a, kind `0x11`) names at most
 //! `MAX_GRANT_TARGETS` key targets — the codec's count bound; keyd judges
-//! the rest (docs/questions/Q-450 item 9).
+//! the rest (docs/questions/Q-450 item 9). A decoded `register_decision`
+//! (A-102, kind `0x12`) names at most `MAX_DECISION_APPROVERS` approvers and,
+//! for a set-secret decision, at most `MAX_GRANT_TARGETS` targets (docs/52
+//! §4.6).
 //!
 //! Written, not run (PENDING-OWNER P-1).
 //!
 //! Spec: docs/50 §3.3, §3.4, §9; R50-4; A-59; docs/51 §5.8.
 
 use ipc::{encode_frame, Direction};
-use ipc_keyd::channel::MAX_GRANT_TARGETS;
-use ipc_keyd::{decode_request, Call, KEYD_CHANNEL};
+use ipc_keyd::channel::{MAX_DECISION_APPROVERS, MAX_GRANT_TARGETS};
+use ipc_keyd::{decode_request, Call, DecidedOperation, KEYD_CHANNEL};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|body: &[u8]| {
@@ -32,6 +35,20 @@ fuzz_target!(|body: &[u8]| {
         Ok(call) => {
             if let Call::GrantSetSecret { targets, .. } = &call {
                 assert!(targets.len() <= MAX_GRANT_TARGETS as usize, "count bound");
+            }
+            if let Call::RegisterDecision {
+                operation,
+                approvers,
+                ..
+            } = &call
+            {
+                assert!(
+                    approvers.len() <= MAX_DECISION_APPROVERS as usize,
+                    "approver bound"
+                );
+                if let DecidedOperation::SetSecret { targets, .. } = operation {
+                    assert!(targets.len() <= MAX_GRANT_TARGETS as usize, "count bound");
+                }
             }
             let request = call.to_wire().expect("a decoded call re-encodes");
             let frame = encode_frame(KEYD_CHANNEL, Direction::Request, &request)

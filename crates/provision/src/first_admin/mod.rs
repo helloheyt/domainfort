@@ -177,6 +177,14 @@ pub enum Refusal {
         /// Why.
         error: SaltError,
     },
+    /// The manifest names no salt, or another salt, for a first
+    /// administrator than the directory's salt function gives — keyadm's
+    /// ceremony grant binds the manifest's salt (A-102, N4), so keyd would
+    /// refuse the `set_secret`.
+    SaltMismatch {
+        /// The administrator.
+        sam: String,
+    },
     /// A `--password-file` names no first administrator of the manifest.
     UnknownPasswordFile {
         /// The name given.
@@ -229,6 +237,11 @@ impl fmt::Display for Refusal {
             Refusal::Salt { sam, error } => {
                 write!(f, "the salt of first administrator {sam} cannot be formed: {error}")
             }
+            Refusal::SaltMismatch { sam } => write!(
+                f,
+                "the manifest's salt of first administrator {sam} is missing or not the \
+                 directory's (re-run provision domain)"
+            ),
             Refusal::UnknownPasswordFile { sam } => write!(
                 f,
                 "--password-file names {sam}, which is not a first administrator of the manifest"
@@ -349,6 +362,14 @@ where
                 error,
             }
         })?;
+        // A-102 (N4): keyadm's ceremony grant bound the manifest's salt; a
+        // manifest that names another (or none) would only be refused by
+        // keyd later — refuse here, before anything is entered.
+        if admin.salt() != Some(salt.as_str()) {
+            return Err(Refusal::SaltMismatch {
+                sam: sam.to_owned(),
+            });
+        }
         salts.push(salt.as_str().to_owned());
     }
 

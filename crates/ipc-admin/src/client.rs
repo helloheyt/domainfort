@@ -1,5 +1,5 @@
-//! A synchronous client of `admin.sock` (task A10): keyadm's — and
-//! `adminctl`'s, when task A11 builds it.
+//! A synchronous client of `admin.sock` (task A10): `adminctl`'s, when
+//! task A11 builds it (keyadm's until A-102).
 //!
 //! # Connections
 //!
@@ -29,8 +29,11 @@
 //! * Replies are decoded with the same strictness as requests and must
 //!   answer the request ([`crate::answers`]).
 //!
-//! Spec: docs/51 §6 (keyadm sends `FetchApproved` / `Complete` /
-//! `ListPendingDestruction` to `admin.sock`), §7.6; docs/50 R50-3, R50-7,
+//! Since A-102 keyadm no longer uses this client (it talks to keyd only —
+//! docs/52 §4.6, §4.8; docs/questions/Q-460); `adminctl` (task A11) is its
+//! intended user.
+//!
+//! Spec: docs/51 §7.6; docs/50 R50-3, R50-7,
 //! §3.3, §3.6, §3.7; A-63; A-87; A-88; A-90; docs/questions/Q-404 item 10
 //! (the client deferred to its first user), Q-423.
 

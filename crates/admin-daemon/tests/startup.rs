@@ -34,7 +34,6 @@ run_as_uid = 806
 run_as_gid = 806
 admin_socket = /run/admind/admin.sock
 admin_socket_group = 810
-keyadm_uid = 807
 min_password_length = 14
 dird_admin_socket = /run/dird/admin/dird-admin.sock
 dird_uid = 802
@@ -62,7 +61,6 @@ fn test_params(dir: &TempDir, audit: &Path, auditd_uid: u32) -> DaemonParams {
         },
         frame_timeout: Duration::from_secs(1),
         min_password_length: 12,
-        keyadm_uid: uid + 1,
         // The production clients: never contacted at start (and they hold
         // no runtime of their own, unlike the tests' non-Linux connectors,
         // so the parameters may be dropped inside the runtime).

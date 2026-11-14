@@ -38,7 +38,19 @@
 //! key-state change is: intent acknowledged first, then the outcome
 //! ([`loosens_authorization`], [`requires_acknowledged_intent`];
 //! docs/questions/Q-452). Consuming a grant (inside `set_secret`, already a
-//! key-state change) only makes keyd stricter again.
+//! key-state change) only makes keyd stricter again. Since A-102 the same
+//! holds for `register_decision` (dird's decisions, the generalized grant
+//! table — docs/52 §4.5): intent, then outcome. `seal_ceremony` and
+//! `list_destroy_decisions` change no key state and loosen nothing (the
+//! seal only makes keyd stricter): one record.
+//!
+//! # No Directory / Admin state change without dird (A-102, docs/52 C1)
+//!
+//! A compile-time pin below: every operation Role::Directory or Role::Admin
+//! may call that changes key state or loosens keyd either runs only on a
+//! decision dird registered (`authz::requires_decision`) or exists only in
+//! the provisioning ceremony (`authz::provisioning_only`). A new operation
+//! that breaks this does not build.
 //!
 //! # The authorization step
 //!
@@ -55,7 +67,9 @@
 //! docs/questions/Q-218 (A-57), Q-252 item 8 (A-64).
 
 use crate::audit::AuditSink;
-use crate::authz::{CallerId, HandleSlot, Operation};
+use crate::authz::{
+    provisioning_only, requires_decision, role_permits, CallerId, HandleSlot, Operation, Role,
+};
 use crate::entropy::EntropySource;
 use crate::keyd::Keyd;
 use crate::model::KeyHandle;
@@ -92,7 +106,10 @@ pub const fn changes_key_state(op: Operation) -> bool {
         | Operation::OpenAndVerifyServiceTicket
         | Operation::DescribeConfig
         | Operation::Ping
-        | Operation::GrantSetSecret => false,
+        | Operation::GrantSetSecret
+        | Operation::RegisterDecision
+        | Operation::SealCeremony
+        | Operation::ListDestroyDecisions => false,
     }
 }
 
@@ -117,7 +134,9 @@ pub const fn changes_key_state(op: Operation) -> bool {
 #[must_use]
 pub const fn loosens_authorization(op: Operation) -> bool {
     match op {
-        Operation::GrantSetSecret => true,
+        // A-102 (docs/52 §4.5): a registered decision lets Directory or
+        // Admin run a state change keyd would otherwise refuse.
+        Operation::GrantSetSecret | Operation::RegisterDecision => true,
         Operation::VerifyPreauth
         | Operation::IssueAsRep
         | Operation::OpenAndVerifyTgt
@@ -133,9 +152,31 @@ pub const fn loosens_authorization(op: Operation) -> bool {
         | Operation::DestroyKeySet
         | Operation::OpenAndVerifyServiceTicket
         | Operation::DescribeConfig
-        | Operation::Ping => false,
+        | Operation::Ping
+        | Operation::SealCeremony
+        | Operation::ListDestroyDecisions => false,
     }
 }
+
+// C1 impossible by construction (docs/52 §3.1, §4.2; A-102): every
+// Directory / Admin operation that changes key state or loosens keyd runs
+// only on a decision dird registered, or exists only before the seal; the
+// one operation that registers decisions is Role::Ldap's (dird's) alone.
+const _: () = {
+    let mut i = 0;
+    while i < Operation::ALL.len() {
+        let op = Operation::ALL[i];
+        let directory_or_admin = role_permits(Role::Directory, op) || role_permits(Role::Admin, op);
+        if directory_or_admin && (changes_key_state(op) || loosens_authorization(op)) {
+            assert!(requires_decision(op) || provisioning_only(op));
+        }
+        i += 1;
+    }
+    assert!(role_permits(Role::Ldap, Operation::RegisterDecision));
+    assert!(!role_permits(Role::Directory, Operation::RegisterDecision));
+    assert!(!role_permits(Role::Admin, Operation::RegisterDecision));
+    assert!(!role_permits(Role::Kdc, Operation::RegisterDecision));
+};
 
 /// `true` if the daemon must have the intent of `op` acknowledged by auditd
 /// before keyd runs it (A-86 / A-88): a key-state change
@@ -151,8 +192,11 @@ pub const fn requires_acknowledged_intent(op: Operation) -> bool {
 impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// Whether the first step of every operation — the role check (I2), the
     /// purpose check of each `(slot, handle)` (I3), then the startup
-    /// hold-down, and for `set_secret` a live grant for the `Primary` handle
-    /// (task A15a) — passes for `caller` running `op` at `now`. It is the same
+    /// hold-down, the ceremony state (A-102), and for `set_secret` a live
+    /// set-secret entry for the `Primary` handle (task A15a) — passes for
+    /// `caller` running `op` at `now`. The four operations that run a
+    /// decision by id are never admitted here: their daemon asks
+    /// [`Keyd::decided_intent`] instead. It is the same
     /// check the operation itself runs first ([`Keyd::admit`]); here it runs
     /// alone: nothing is read or written beyond the compile-time tables and
     /// the hold-down's end, and **no audit record is emitted** (the

@@ -10,17 +10,20 @@
 //!    RFC 6113 §5.4); every admin operation through `admin.sock` (docs/51
 //!    §5.2), dual control (P-22), a replay, a self-approval; the new user's
 //!    login (AS, TGS for `ldap/<dc-fqdn>`), an ordinary user's writes, the
-//!    login after `SetEnabled(false)` and after `Delete`; then the verified
-//!    audit log of the whole run and the absence of every password from
-//!    every log and file.
+//!    login after `SetEnabled(false)` and after `Delete`; since A-102 the
+//!    ceremony's seal, keyadm's `destroy-sweep` running the destroy decision
+//!    dird registered for the deleted account, and a dual-controlled krbtgt
+//!    rotation (request, approve — dird registers the decision — keyadm by
+//!    decision id); then the verified audit log of the whole run and the
+//!    absence of every password from every log and file.
 //! 2. [`auditd_down_refuses_admin_writes_and_leaves_the_store_unchanged`].
 //! 3. [`admind_down_the_client_sees_closure`].
 //!
 //! Sources: docs/51 §4.3, §4.4, §5.2, §5.3, §5.6, §5.7, §7.2-§7.6, §9, §12;
 //! docs/50 §3.3, §7.5, §8.1, §9; docs/47 §4, §9.2; RFC 4120 §3.1.5, §3.2.2,
 //! §3.2.3, §3.3, §5.5.1, §7.5.1; RFC 6113 §5.4.1.1, §5.4.2, §5.4.4; A-26,
-//! A-57, A-64, A-85, A-86, A-88, A-91, A-94, A-96; P-10, P-22, P-23. Every
-//! value is hand-made test data.
+//! A-57, A-64, A-85, A-86, A-88, A-91, A-94, A-96; P-10, P-22, P-23;
+//! docs/52 §4.2-§4.5 (A-102). Every value is hand-made test data.
 
 #[path = "../../kdc/tests/common/mod.rs"]
 mod common;
@@ -100,6 +103,18 @@ fn intent_then_success(
     handle: &KeyHandle,
     role: KeydRole,
 ) -> (u64, u64) {
+    intent_then_success_where(records, op, handle, role, |_| true)
+}
+
+/// [`intent_then_success`] among the records `keep` admits (A-102: two
+/// decisions may name the same key set — a password set and a destruction).
+fn intent_then_success_where(
+    records: &[(u64, &KeydRecord)],
+    op: KeydOperation,
+    handle: &KeyHandle,
+    role: KeydRole,
+    keep: impl Fn(&KeydRecord) -> bool,
+) -> (u64, u64) {
     let purpose = match handle.purpose {
         keyd::KeyPurpose::PrincipalLongterm => KeyPurposeCode::PrincipalLongterm,
         keyd::KeyPurpose::Krbtgt => KeyPurposeCode::Krbtgt,
@@ -113,6 +128,7 @@ fn intent_then_success(
                     && r.result == result
                     && r.principal == Some(*handle.principal.as_bytes())
                     && r.purpose == Some(purpose)
+                    && keep(r)
             })
             .map(|(seq, r)| {
                 assert_eq!(r.caller_role, role, "{op:?} by {role:?}");
@@ -447,6 +463,63 @@ fn provisioning_to_a_new_users_login() {
                 .reply(),
             Reply::Done
         );
+        // A-102 (docs/52 §4.3): dird registered a destroy decision for
+        // dave's tombstone; keyadm's sweep (Role::Admin on the same keyd)
+        // runs exactly it — keyadm destroys only what dird decided.
+        let swept = keyadm::sweep::run(&mut key_state_client(&w.grant_keyd_socket, w.uid));
+        assert!(swept.is_complete(), "{swept:?}");
+        assert_eq!(
+            swept
+                .destroyed
+                .iter()
+                .map(|e| e.principal)
+                .collect::<Vec<_>>(),
+            [longterm(dave).principal],
+            "{swept:?}"
+        );
+        let destroy_decision = swept.destroyed[0].decision;
+        // A-102 (docs/52 §4.2): a dual-controlled key operation — alice
+        // requests, bob approves (the approval that completes the quorum
+        // makes dird register the decision in keyd), keyadm runs it by the
+        // request's id; keyd builds the dual-control token itself.
+        let rotation = ipc_dird_admin::KeyOperation::RotateKrbtgt;
+        let request_id = match w
+            .forward(
+                &alice,
+                &[],
+                Operation::RequestKeyOperation {
+                    operation: rotation,
+                },
+            )
+            .reply()
+        {
+            Reply::KeyRequest(state) => state.id,
+            other => panic!("RequestKeyOperation: {other:?}"),
+        };
+        match w
+            .forward(
+                &bob,
+                &[],
+                Operation::Approve {
+                    id: request_id,
+                    operation: rotation,
+                },
+            )
+            .reply()
+        {
+            Reply::KeyRequest(state) => assert!(state.approved()),
+            other => panic!("Approve: {other:?}"),
+        }
+        let rotated = keyadm::execute::run(
+            &mut key_state_client(&w.grant_keyd_socket, w.uid),
+            keyadm::cli::Approved::RotateKrbtgt,
+            request_id,
+        );
+        assert_eq!(
+            rotated.keyd,
+            keyadm::ceremony::Outcome::Answered(Ok(Some(Kvno::new(2)))),
+            "{rotated:?}"
+        );
         w.advance(10);
         w.keyd_phase(KeydPhase::Kerberos);
         let deleted = w
@@ -526,19 +599,92 @@ fn provisioning_to_a_new_users_login() {
                 )
             })
             .collect();
-        let fixture_grant = intent_then_success(
+        // A-102: dird's grants are `SetSecret` decisions (`RegisterDecision`,
+        // Role::Ldap); a user's names no second key set, the destroy decision
+        // of a deleted account names its Service key set as the second.
+        let fixture_grant = intent_then_success_where(
             &keyd,
-            KeydOperation::GrantSetSecret,
+            KeydOperation::RegisterDecision,
             &w.workstation.keys[0].handle,
             KeydRole::Ldap,
+            |_| true,
         );
-        let dave_grant = intent_then_success(
+        let dave_grant = intent_then_success_where(
             &keyd,
-            KeydOperation::GrantSetSecret,
+            KeydOperation::RegisterDecision,
             &longterm(dave),
             KeydRole::Ldap,
+            |r| r.secondary.is_none(),
         );
+        let dave_destroy_decision = intent_then_success_where(
+            &keyd,
+            KeydOperation::RegisterDecision,
+            &longterm(dave),
+            KeydRole::Ldap,
+            |r| r.secondary.is_some(),
+        );
+        let dave_destroyed = intent_then_success(
+            &keyd,
+            KeydOperation::DestroyKeySet,
+            &longterm(dave),
+            KeydRole::Admin,
+        );
+        assert!(dave_secret.1 < dave_destroy_decision.0);
+        assert!(
+            dave_destroy_decision.1 < dave_destroyed.0,
+            "dird's destroy decision, then keyadm's destroy_key_set (A-102)"
+        );
+        let destroyed = keyd
+            .iter()
+            .find(|(seq, _)| *seq == dave_destroyed.1)
+            .map(|(_, r)| *r)
+            .unwrap();
+        assert_eq!(destroyed.decision, Some(destroy_decision.get()));
+        // The krbtgt rotation: dird's decision, then keyadm's execution —
+        // keyd's records carry the decision id and alice's and bob's GUIDs
+        // from dird's decision (A-102, docs/52 §4.5).
+        let krbtgt_decision = intent_then_success(
+            &keyd,
+            KeydOperation::RegisterDecision,
+            &m.krbtgt().handle,
+            KeydRole::Ldap,
+        );
+        let krbtgt_rotation = intent_then_success(
+            &keyd,
+            KeydOperation::RotateKrbtgt,
+            &m.krbtgt().handle,
+            KeydRole::Admin,
+        );
+        assert!(krbtgt_decision.1 < krbtgt_rotation.0);
+        let rotation_record = keyd
+            .iter()
+            .find(|(seq, _)| *seq == krbtgt_rotation.1)
+            .map(|(_, r)| *r)
+            .unwrap();
+        assert_eq!(rotation_record.decision, Some(request_id));
+        assert_eq!(rotation_record.kvno, Some(2));
+        assert_eq!(
+            rotation_record.approvers,
+            Some([
+                packet(w.guid(ObjectRole::FirstAdmin(0))),
+                packet(w.guid(ObjectRole::FirstAdmin(1)))
+            ])
+        );
+        // The seal (A-102, docs/52 R3): after the ceremony's grants, before
+        // the first administrators' secrets — one record, no intent.
+        let seals: Vec<u64> = keyd
+            .iter()
+            .filter(|(_, r)| r.op == KeydOperation::SealCeremony)
+            .map(|(seq, r)| {
+                assert_eq!(r.result, KeydOutcome::Success);
+                assert_eq!(r.caller_role, KeydRole::Admin);
+                *seq
+            })
+            .collect();
+        assert_eq!(seals.len(), 1, "one seal, no intent");
         assert!(last(&ceremony) < first(&ceremony_grants));
+        assert!(last(&ceremony_grants) < seals[0]);
+        assert!(seals[0] < first(&first_admins));
         assert!(last(&ceremony_grants) < first(&first_admins));
         assert!(fixture_grant.1 < fixture.0);
         assert!(
@@ -635,6 +781,11 @@ fn provisioning_to_a_new_users_login() {
             (Op::SetEnabled, Committed),
             (Op::Delete, Proceed),
             (Op::Delete, Committed),
+            // A-102: the krbtgt rotation — the request, then the approval
+            // that completed the quorum and its registration in keyd.
+            (Op::RequestKeyOperation, Proceed),
+            (Op::Approve, Proceed),
+            (Op::Approve, Committed),
         ]);
         assert_eq!(trail, expected, "dird's admin trail of the run");
         let by_op = |op: Op, target: Guid, s: Said| -> u64 {
@@ -791,18 +942,20 @@ fn provisioning_to_a_new_users_login() {
                 "a password in {line}"
             );
         }
-        // The key sets the run left (not secret: kvnos only).
+        // The key sets the run left (not secret: kvnos only): krbtgt rotated
+        // once by dird's decision, dave's destroyed by keyadm's sweep of
+        // dird's destroy decision (A-102), the others untouched.
         for handle in [
-            m.krbtgt().handle,
             m.ldap_service().handle,
             m.admin_service().handle,
             m.first_admins()[0].key_set().handle,
             m.first_admins()[1].key_set().handle,
             w.workstation.keys[0].handle,
-            longterm(dave),
         ] {
             assert_eq!(w.custody.kvno(&handle), Some(Kvno::INITIAL), "{handle:?}");
         }
+        assert_eq!(w.custody.kvno(&m.krbtgt().handle), Some(Kvno::new(2)));
+        assert_eq!(w.custody.kvno(&longterm(dave)), None);
     });
 }
 

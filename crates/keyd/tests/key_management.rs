@@ -1,16 +1,17 @@
 //! Key lifecycle and secrets: D178 (krbtgt refused by the non-development
-//! store), create / rotate / rotate_krbtgt (dual control) / retire_kvno,
-//! set_secret / verify_secret (constant-time compare, throttling), and
-//! entropy failure (fail closed). Sources: docs/10 §6, §7, §12; docs/33 §5,
-//! §6.1; RFC 4120 3.2.3 (ticket decrypted with the kvno it names); AGENTS.md
-//! §6. All values are constructed for these tests.
+//! store), create / rotate / rotate_krbtgt (dual control) / retire_kvno —
+//! each rotation and retirement on a decision dird registered (A-102) —,
+//! set_secret, `verify_secret` in no role (A-102, docs/52 R4), and entropy
+//! failure (fail closed). Sources: docs/10 §6, §7, §12; docs/33 §5, §6.1;
+//! RFC 4120 3.2.3 (ticket decrypted with the kvno it names); docs/52 §4.2,
+//! §7 R1, R4; AGENTS.md §6. All values are constructed for these tests.
 
 mod common;
 
 use common::*;
 use keyd::{
-    AuditReason, AuthnError, DualControlToken, Error, InMemoryKeyStore, IssueError, KeyHandle,
-    KeyPurpose, Keyd, Kvno, PrincipalBinding, PrincipalId,
+    AuditReason, AuthnError, DecidedOperation, Error, InMemoryKeyStore, IssueError, KeyHandle,
+    KeyPurpose, Keyd, Kvno, PrincipalBinding, PrincipalId, MAX_KEY_DECISION_SECS,
 };
 use krb_crypto::EncType;
 use krb_proto::constants::{KRB_NT_PRINCIPAL, KRB_NT_SRV_INST, KRB_NT_UNKNOWN};
@@ -21,8 +22,24 @@ fn z(s: &str) -> Zeroizing<String> {
     Zeroizing::new(s.to_owned())
 }
 
-const APPROVER_1: PrincipalId = PrincipalId::from_bytes([0x01; 16]);
-const APPROVER_2: PrincipalId = PrincipalId::from_bytes([0x02; 16]);
+/// The krbtgt rotation dird registers at the `Approve` completing the
+/// quorum (A-102, docs/52 §4.3), with the dual-control pair.
+fn krbtgt_rotation(f: &mut Fixture) -> keyd::DecisionId {
+    f.decide(DecidedOperation::RotateKrbtgt { krbtgt: KRBTGT }, &now())
+        .unwrap()
+}
+
+/// The retirement of `kvno` of the krbtgt key set (A-102).
+fn krbtgt_retirement(f: &mut Fixture, kvno: u32) -> keyd::DecisionId {
+    f.decide(
+        DecidedOperation::RetireKvno {
+            handle: KRBTGT,
+            kvno: Kvno::new(kvno),
+        },
+        &now(),
+    )
+    .unwrap()
+}
 
 /// D178: the default in-memory store refuses to hold krbtgt keys, and keyd
 /// refuses to create one there. Source: docs/33 §6.1 (D178: critical signing
@@ -51,7 +68,7 @@ fn krbtgt_refused_by_non_development_store() {
         Ok(Kvno::new(1))
     );
     // And no TGT can ever be issued from it.
-    grant(&mut keyd, &ALICE, &alice_binding(), &now()).unwrap();
+    grant(&mut keyd, &ALICE, &alice_binding(), ALICE_SALT, &now()).unwrap();
     keyd.set_secret(
         &DIRECTORY,
         &ALICE,
@@ -146,7 +163,14 @@ fn create_key_validates_binding() {
         PrincipalId::from_bytes([0xCA; 16]),
         KeyPurpose::PrincipalLongterm,
     );
-    grant(&mut f.keyd, &carol, &krbtgt_binding(), &now()).unwrap();
+    grant(
+        &mut f.keyd,
+        &carol,
+        &krbtgt_binding(),
+        "EXAMPLE.ORGcarol",
+        &now(),
+    )
+    .unwrap();
     assert_eq!(
         f.keyd.set_secret(
             &DIRECTORY,
@@ -173,7 +197,7 @@ fn set_secret_cannot_rebind() {
     let mut f = Fixture::new();
     // Even with a grant naming the other binding (task A15a: the grant does
     // not judge bindings), set_secret refuses the rebinding.
-    f.grant(&ALICE, &bob_binding(), &now()).unwrap();
+    f.grant(&ALICE, &bob_binding(), ALICE_SALT, &now()).unwrap();
     assert_eq!(
         f.keyd.set_secret(
             &DIRECTORY,
@@ -210,7 +234,7 @@ fn set_secret_cannot_rebind() {
 
     let mut same = alice_binding();
     same.name.name_type = KRB_NT_UNKNOWN;
-    f.grant(&ALICE, &same, &now()).unwrap();
+    f.grant(&ALICE, &same, ALICE_SALT, &now()).unwrap();
     assert_eq!(
         f.keyd
             .set_secret(&DIRECTORY, &ALICE, &same, z("pw3"), ALICE_SALT, &now()),
@@ -229,12 +253,9 @@ fn krbtgt_rotation_and_retirement() {
     let old = obtain_tgt(&mut f, now(), &as_template());
     assert_eq!(old.parts.ticket.enc_part.kvno, Some(1));
 
-    let approval = DualControlToken {
-        approver_1: APPROVER_1,
-        approver_2: APPROVER_2,
-    };
+    let rotation = krbtgt_rotation(&mut f);
     assert_eq!(
-        f.keyd.rotate_krbtgt(&ADMIN, &KRBTGT, &approval, &now()),
+        f.keyd.rotate_krbtgt(&ADMIN, rotation, &now()),
         Ok(Kvno::new(2))
     );
     let last = f.records().last().unwrap();
@@ -254,19 +275,20 @@ fn krbtgt_rotation_and_retirement() {
     open_tgt(&mut f, &new, 2, 2);
 
     // The current kvno cannot be retired; an unknown one neither.
-    assert_eq!(
-        f.keyd.retire_kvno(&ADMIN, &KRBTGT, Kvno::new(2), &now()),
-        Err(Error::Denied)
-    );
-    assert_eq!(
-        f.keyd.retire_kvno(&ADMIN, &KRBTGT, Kvno::new(7), &now()),
-        Err(Error::Denied)
-    );
+    for kvno in [2, 7] {
+        let retirement = krbtgt_retirement(&mut f, kvno);
+        assert_eq!(
+            f.keyd.retire_kvno(&ADMIN, retirement, &now()),
+            Err(Error::Denied)
+        );
+        assert_eq!(
+            f.records().last().unwrap().reason,
+            AuditReason::KvnoNotRetirable
+        );
+    }
     // Retire kvno 1: the old TGT is refused, the new one still works.
-    assert_eq!(
-        f.keyd.retire_kvno(&ADMIN, &KRBTGT, Kvno::new(1), &now()),
-        Ok(())
-    );
+    let retirement = krbtgt_retirement(&mut f, 1);
+    assert_eq!(f.keyd.retire_kvno(&ADMIN, retirement, &now()), Ok(()));
     let (_, body) = tgs_req_body(3, service_name());
     let req = ap_req(
         &old.parts.ticket,
@@ -278,8 +300,9 @@ fn krbtgt_rotation_and_retirement() {
         Err(AuthnError::Denied)
     );
     open_tgt(&mut f, &new, 4, 4);
+    let again = krbtgt_retirement(&mut f, 1);
     assert_eq!(
-        f.keyd.retire_kvno(&ADMIN, &KRBTGT, Kvno::new(1), &now()),
+        f.keyd.retire_kvno(&ADMIN, again, &now()),
         Err(Error::Denied)
     );
 }
@@ -290,16 +313,12 @@ fn krbtgt_rotation_and_retirement() {
 fn double_rotation_drops_original_key() {
     let mut f = Fixture::new();
     let old = obtain_tgt(&mut f, now(), &as_template());
-    let approval = DualControlToken {
-        approver_1: APPROVER_1,
-        approver_2: APPROVER_2,
-    };
-    f.keyd
-        .rotate_krbtgt(&ADMIN, &KRBTGT, &approval, &now())
-        .unwrap();
-    f.keyd
-        .rotate_krbtgt(&ADMIN, &KRBTGT, &approval, &now())
-        .unwrap();
+    // Two rotations are two decisions (one decision, one execution —
+    // docs/52 §3.10).
+    for _ in 0..2 {
+        let rotation = krbtgt_rotation(&mut f);
+        f.keyd.rotate_krbtgt(&ADMIN, rotation, &now()).unwrap();
+    }
     let (_, body) = tgs_req_body(5, service_name());
     let req = ap_req(
         &old.parts.ticket,
@@ -312,43 +331,60 @@ fn double_rotation_drops_original_key() {
     );
 }
 
-/// Dual control needs two DISTINCT approvers (keyd checks distinctness only;
-/// authenticity is the admin plane's — docs/43 D175). Source: docs/10 §7.
+/// Dual control needs two DISTINCT approvers: a krbtgt rotation decision
+/// naming one approver, or the same one twice, is refused at registration
+/// (`DecisionInvalid`), so no token keyd could build from it ever exists
+/// (A-102: the dual-control token is built inside keyd from the decision's
+/// approvers; their authenticity is dird's — docs/43 D175). Source: docs/10
+/// §7; docs/51 §5.6; docs/52 §4.2.
 #[test]
 fn rotate_krbtgt_requires_distinct_approvers() {
     let mut f = Fixture::new();
-    let same = DualControlToken {
-        approver_1: APPROVER_1,
-        approver_2: APPROVER_1,
-    };
-    assert_eq!(
-        f.keyd.rotate_krbtgt(&ADMIN, &KRBTGT, &same, &now()),
-        Err(Error::Denied)
-    );
-    let last = f.records().last().unwrap();
-    assert_eq!(last.reason, AuditReason::DualControlRejected);
-    assert_eq!(last.approvers, Some([APPROVER_1, APPROVER_1]));
+    let rotation = DecidedOperation::RotateKrbtgt { krbtgt: KRBTGT };
+    for approvers in [vec![APPROVER_1, APPROVER_1], vec![APPROVER_1]] {
+        let id = next_decision_id();
+        assert_eq!(
+            f.keyd.register_decision(
+                &LDAP,
+                id,
+                &rotation,
+                &approvers,
+                MAX_KEY_DECISION_SECS,
+                &now()
+            ),
+            Err(Error::Denied)
+        );
+        let last = f.records().last().unwrap();
+        assert_eq!(last.reason, AuditReason::DecisionInvalid);
+        // Nothing was registered under that id.
+        assert_eq!(f.keyd.rotate_krbtgt(&ADMIN, id, &now()), Err(Error::Denied));
+        assert_eq!(f.records().last().unwrap().reason, AuditReason::NoDecision);
+    }
     // Nothing rotated: TGTs are still sealed under kvno 1.
     let tgt = obtain_tgt(&mut f, now(), &as_template());
     assert_eq!(tgt.parts.ticket.enc_part.kvno, Some(1));
 }
 
 /// rotate_key serves service keys (new service tickets use the new kvno);
-/// the krbtgt is reachable only through rotate_krbtgt (I3). Source: docs/10
-/// §7, §12 I3.
+/// the krbtgt is reachable only through rotate_krbtgt (I3): a RotateKey
+/// decision on the krbtgt handle is refused at registration. Source:
+/// docs/10 §7, §12 I3; docs/52 §4.2 (A-102).
 #[test]
 fn rotate_service_key() {
     let mut f = Fixture::new();
     assert_eq!(
-        f.keyd.rotate_key(&ADMIN, &KRBTGT, &now()),
+        f.decide(DecidedOperation::RotateKey { handle: KRBTGT }, &now()),
         Err(Error::Denied)
     );
     assert_eq!(
         f.records().last().unwrap().reason,
-        AuditReason::PurposeMismatch
+        AuditReason::DecisionInvalid
     );
+    let rotation = f
+        .decide(DecidedOperation::RotateKey { handle: SERVICE }, &now())
+        .unwrap();
     assert_eq!(
-        f.keyd.rotate_key(&ADMIN, &SERVICE, &now()),
+        f.keyd.rotate_key(&ADMIN, rotation, &now()),
         Ok(Kvno::new(2))
     );
     let tgt = obtain_tgt(&mut f, now(), &as_template());
@@ -394,50 +430,25 @@ fn set_secret_derives_every_configured_enctype() {
     }
 }
 
-/// verify_secret: right password Ok; wrong password, unknown principal and
-/// a random (non-password) key are the same uniform Denied. Source: docs/10
-/// §6, §9 (uniform), §12 I6.
+/// `verify_secret` is in no role's row (A-102; docs/52 §3.4 N3, §7 R4;
+/// docs/questions/Q-465): Directory — and every other role — is refused at
+/// the capability table, before any key is looked at (even the right
+/// password is the uniform Denied, reason RoleNotPermitted). Source:
+/// docs/52 §7 R4; docs/questions/Q-465.
 #[test]
-fn verify_secret_outcomes() {
+fn verify_secret_has_no_role() {
     let mut f = Fixture::new();
-    assert_eq!(
-        f.keyd
-            .verify_secret(&DIRECTORY, &ALICE, z(ALICE_PASSWORD), &now()),
-        Ok(())
-    );
-    assert_eq!(
-        f.keyd.verify_secret(&DIRECTORY, &ALICE, z("guess"), &now()),
-        Err(Error::Denied)
-    );
-    assert_eq!(
-        f.records().last().unwrap().reason,
-        AuditReason::SecretMismatch
-    );
-    let stranger = KeyHandle::new(
-        PrincipalId::from_bytes([0xEE; 16]),
-        KeyPurpose::PrincipalLongterm,
-    );
-    assert_eq!(
-        f.keyd
-            .verify_secret(&DIRECTORY, &stranger, z(ALICE_PASSWORD), &now()),
-        Err(Error::Denied)
-    );
-    assert_eq!(f.records().last().unwrap().reason, AuditReason::KeyNotFound);
-    assert_eq!(
-        f.keyd
-            .verify_secret(&DIRECTORY, &SERVICE, z(ALICE_PASSWORD), &now()),
-        Err(Error::Denied)
-    );
-    assert_eq!(
-        f.records().last().unwrap().reason,
-        AuditReason::NoPasswordKey
-    );
-    // Bob's password does not verify for alice (salted per principal).
-    assert_eq!(
-        f.keyd
-            .verify_secret(&DIRECTORY, &ALICE, z(BOB_PASSWORD), &now()),
-        Err(Error::Denied)
-    );
+    for caller in [DIRECTORY, KDC, ADMIN, LDAP] {
+        assert_eq!(
+            f.keyd
+                .verify_secret(&caller, &ALICE, z(ALICE_PASSWORD), &now()),
+            Err(Error::Denied)
+        );
+        let last = f.records().last().unwrap();
+        assert_eq!(last.op, keyd::Operation::VerifySecret);
+        assert_eq!(last.reason, AuditReason::RoleNotPermitted);
+        assert_eq!(last.kvno, None, "no key was looked at");
+    }
 }
 
 /// keyd chooses the kvno of set_secret (current + 1, or the initial kvno
@@ -446,7 +457,8 @@ fn verify_secret_outcomes() {
 #[test]
 fn set_secret_rules() {
     let mut f = Fixture::new();
-    f.grant(&ALICE, &alice_binding(), &now()).unwrap();
+    f.grant(&ALICE, &alice_binding(), ALICE_SALT, &now())
+        .unwrap();
     assert_eq!(
         f.keyd.set_secret(
             &DIRECTORY,
@@ -466,7 +478,8 @@ fn set_secret_rules() {
         name_type: KRB_NT_PRINCIPAL,
         name_string: vec![kstr("carol")],
     });
-    f.grant(&carol, &carol_binding, &now()).unwrap();
+    f.grant(&carol, &carol_binding, "EXAMPLE.ORGcarol", &now())
+        .unwrap();
     assert_eq!(
         f.keyd.set_secret(
             &DIRECTORY,
@@ -498,38 +511,6 @@ fn set_secret_rules() {
     let mut c = config();
     c.s2k_params = Some([0, 0, 0, 0]);
     assert!(c.validate().is_err());
-}
-
-/// verify_secret is throttled: after 5 failures within 5 minutes (default
-/// policy) attempts are RateLimited — even with the right password — until
-/// the window passes. Source: docs/10 §6 ("throttled"), §9 (RateLimited).
-#[test]
-fn verify_secret_throttled() {
-    let mut f = Fixture::new();
-    for _ in 0..5 {
-        assert_eq!(
-            f.keyd.verify_secret(&DIRECTORY, &ALICE, z("guess"), &now()),
-            Err(Error::Denied)
-        );
-    }
-    assert_eq!(
-        f.keyd
-            .verify_secret(&DIRECTORY, &ALICE, z(ALICE_PASSWORD), &now()),
-        Err(Error::RateLimited)
-    );
-    assert_eq!(f.records().last().unwrap().reason, AuditReason::Throttled);
-    // Other principals are unaffected.
-    assert_eq!(
-        f.keyd
-            .verify_secret(&DIRECTORY, &BOB, z(BOB_PASSWORD), &now()),
-        Ok(())
-    );
-    // After the window, the right password verifies again.
-    assert_eq!(
-        f.keyd
-            .verify_secret(&DIRECTORY, &ALICE, z(ALICE_PASSWORD), &at(300)),
-        Ok(())
-    );
 }
 
 /// Entropy failure fails closed in every operation that needs randomness;
@@ -565,8 +546,11 @@ fn entropy_failure_fails_closed() {
         f.records().last().unwrap().reason,
         AuditReason::EntropyFailure
     );
+    let rotation = f
+        .decide(DecidedOperation::RotateKey { handle: SERVICE }, &now())
+        .unwrap();
     assert_eq!(
-        f.keyd.rotate_key(&ADMIN, &SERVICE, &now()),
+        f.keyd.rotate_key(&ADMIN, rotation, &now()),
         Err(Error::Unavailable)
     );
     assert_eq!(
@@ -587,11 +571,6 @@ fn entropy_failure_fails_closed() {
             &now()
         ),
         Err(AuthnError::Denied)
-    );
-    assert_eq!(
-        f.keyd
-            .verify_secret(&DIRECTORY, &ALICE, z(ALICE_PASSWORD), &now()),
-        Err(Error::Unavailable)
     );
     // Nothing was created or rotated.
     f.entropy.set_fail(false);

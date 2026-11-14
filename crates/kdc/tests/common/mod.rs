@@ -38,9 +38,10 @@ use kdc::{
     KdcConfig, KdcReply, KeyCustody, Peer, PolicyInputs, RateLimiter, ServiceAccount, Transport,
 };
 use keyd::{
-    AuditRecord, AuditSink, CallerId, ConfigDescription, EncTypeId, EntropyError, EntropySource,
-    InMemoryKeyStore, KeyHandle, KeyPurpose, KeyStore, Keyd, KeydConfig, LocalKeyd,
-    PrincipalBinding, PrincipalId, Role, SetSecretTarget, TicketPolicy, MAX_SET_SECRET_GRANT_SECS,
+    AuditRecord, AuditSink, CallerId, ConfigDescription, DecidedOperation, DecisionId, EncTypeId,
+    EntropyError, EntropySource, InMemoryKeyStore, KeyHandle, KeyPurpose, KeyStore, Keyd,
+    KeydConfig, LocalKeyd, PrincipalBinding, PrincipalId, Role, SetSecretTarget, TicketPolicy,
+    MAX_SET_SECRET_GRANT_SECS,
 };
 use krb_crypto::{EncType, KeyUsage, ProtocolKey};
 use krb_proto::constants::{
@@ -250,22 +251,50 @@ pub const LDAP_CALLER: CallerId = CallerId {
     role: Role::Ldap,
 };
 
-/// Register the grant dird would (Role::Ldap, after its PDP; task A15a,
-/// docs/51 §5.8 option (b)) for a user's `set_secret` of `handle` with
-/// `binding` — keyd refuses Role::Directory's `set_secret` without one.
+/// A fresh decision id for the set-secret decisions these fixtures register
+/// (dird's ids are unique; any distinct values do here).
+fn next_decision_id() -> DecisionId {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    DecisionId::new(NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// The default salt of `binding`: its realm followed by its name
+/// components, with no separators (RFC 4120 §4: "the concatenation of the
+/// principal's realm and name components, in order, with no separators") —
+/// the salt these fixtures' users' passwords are set with (`ALICE_SALT`,
+/// `BOB_SALT`).
+fn default_salt(binding: &PrincipalBinding) -> String {
+    let mut salt = String::from_utf8_lossy(binding.realm.as_bytes()).into_owned();
+    for component in &binding.name.name_string {
+        salt.push_str(&String::from_utf8_lossy(component.as_bytes()));
+    }
+    salt
+}
+
+/// Register the set-secret decision dird would (Role::Ldap, after its PDP;
+/// task A15a, docs/51 §5.8 option (b); A-102, docs/52 §4.2) for a user's
+/// `set_secret` of `handle` with `binding` and the default salt of
+/// `binding` (N4: the salt is bound too) — keyd refuses Role::Directory's
+/// `set_secret` without one.
 pub fn grant_user<S: KeyStore, A: AuditSink, E: EntropySource>(
     keyd: &mut Keyd<S, A, E>,
     handle: &KeyHandle,
     binding: &PrincipalBinding,
     now: &KerberosTime,
 ) {
-    keyd.grant_set_secret(
+    keyd.register_decision(
         &LDAP_CALLER,
-        keyd::AccountKind::User,
-        &[SetSecretTarget {
-            handle: *handle,
-            binding: binding.clone(),
-        }],
+        next_decision_id(),
+        &DecidedOperation::SetSecret {
+            kind: keyd::AccountKind::User,
+            targets: vec![SetSecretTarget {
+                handle: *handle,
+                binding: binding.clone(),
+                salt: default_salt(binding),
+            }],
+        },
+        &[],
         MAX_SET_SECRET_GRANT_SECS,
         now,
     )
@@ -273,26 +302,34 @@ pub fn grant_user<S: KeyStore, A: AuditSink, E: EntropySource>(
 }
 
 /// As [`grant_user`] for a computer's two key sets (its PrincipalLongterm
-/// and its Service key set, docs/47 §9.1).
+/// and its Service key set, docs/47 §9.1), both set from one password with
+/// `salt`.
 pub fn grant_computer<S: KeyStore, A: AuditSink, E: EntropySource>(
     keyd: &mut Keyd<S, A, E>,
     account: (&KeyHandle, &PrincipalBinding),
     service: (&KeyHandle, &PrincipalBinding),
+    salt: &str,
     now: &KerberosTime,
 ) {
-    keyd.grant_set_secret(
+    keyd.register_decision(
         &LDAP_CALLER,
-        keyd::AccountKind::Computer,
-        &[
-            SetSecretTarget {
-                handle: *account.0,
-                binding: account.1.clone(),
-            },
-            SetSecretTarget {
-                handle: *service.0,
-                binding: service.1.clone(),
-            },
-        ],
+        next_decision_id(),
+        &DecidedOperation::SetSecret {
+            kind: keyd::AccountKind::Computer,
+            targets: vec![
+                SetSecretTarget {
+                    handle: *account.0,
+                    binding: account.1.clone(),
+                    salt: String::from(salt),
+                },
+                SetSecretTarget {
+                    handle: *service.0,
+                    binding: service.1.clone(),
+                    salt: String::from(salt),
+                },
+            ],
+        },
+        &[],
         MAX_SET_SECRET_GRANT_SECS,
         now,
     )

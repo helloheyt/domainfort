@@ -44,8 +44,9 @@ use ipc_audit::{
 };
 use ipc_keyd::{Answer, Call, Password};
 use keyd::{
-    AccountKind, CallerId, Error, KeyHandle, KeyPurpose, Kvno, PrincipalBinding, PrincipalId, Role,
-    SetSecretTarget, MAX_INITIAL_SECRET_GRANT_SECS, MAX_SET_SECRET_GRANT_SECS,
+    AccountKind, CallerId, DecidedOperation, DecisionId, Error, KeyHandle, KeyPurpose, Kvno,
+    PrincipalBinding, PrincipalId, Role, SetSecretTarget, MAX_INITIAL_SECRET_GRANT_SECS,
+    MAX_SET_SECRET_GRANT_SECS,
 };
 use keyd_daemon::audit::MAX_RECORDS_PER_OPERATION;
 use keyd_daemon::startup::development_keyd;
@@ -102,17 +103,43 @@ fn set_secret(octet: u8) -> Call {
     }
 }
 
-/// The grant dird registers for [`set_secret`]'s key set (task A15a: keyd
-/// refuses Directory's `set_secret` without one), sent by the test's uid as
-/// Role::Ldap on keyd's grant socket ([`grant_socket`]).
-fn grant(octet: u8) -> Call {
-    Call::GrantSetSecret {
-        kind: AccountKind::User,
-        targets: vec![SetSecretTarget {
-            handle: handle(octet),
-            binding: binding("bob"),
-        }],
+/// bob's key target with the salt [`set_secret`] presents (N4, A-102).
+fn bob_target(octet: u8) -> SetSecretTarget {
+    SetSecretTarget {
+        handle: handle(octet),
+        binding: binding("bob"),
+        salt: String::from("EXAMPLE.ORGbob"),
+    }
+}
+
+/// The set-secret decision dird registers for [`set_secret`]'s key set
+/// (task A15a; A-102: keyd refuses Directory's `set_secret` without one),
+/// sent by the test's uid as Role::Ldap on keyd's grant socket
+/// ([`grant_socket`]).
+fn grant(id: u64, octet: u8) -> Call {
+    Call::RegisterDecision {
+        id: DecisionId::new(id),
+        operation: DecidedOperation::SetSecret {
+            kind: AccountKind::User,
+            targets: vec![bob_target(octet)],
+        },
+        approvers: Vec::new(),
         lifetime_secs: MAX_SET_SECRET_GRANT_SECS,
+    }
+}
+
+/// A key-operation or destroy decision dird registers (A-102, docs/52
+/// §4.3), with the requester and one approver (dual control), sent as
+/// Role::Ldap on [`grant_socket`].
+fn decide(id: u64, operation: DecidedOperation) -> Call {
+    Call::RegisterDecision {
+        id: DecisionId::new(id),
+        operation,
+        approvers: vec![
+            PrincipalId::from_bytes([0x01; 16]),
+            PrincipalId::from_bytes([0x02; 16]),
+        ],
+        lifetime_secs: 900,
     }
 }
 
@@ -184,10 +211,7 @@ fn start_keyd_granted(dir: &TempDir, uid: u32, budget: IntentAckBudget) -> Daemo
         keyd.grant_set_secret(
             &keyadm,
             AccountKind::User,
-            &[SetSecretTarget {
-                handle: handle(0xB0),
-                binding: binding("bob"),
-            }],
+            &[bob_target(0xB0)],
             MAX_INITIAL_SECRET_GRANT_SECS,
             started,
         )
@@ -336,7 +360,11 @@ fn change_phases(
 /// both in the verified log, in order"), with every Admin key-state change
 /// (docs/10 §7): each answered with its true result, and in the verified
 /// log each intent (outcome `Intent`, reason `None`, the handle, the kvno a
-/// `retire_kvno` names) directly followed by keyd's own outcome. A refused
+/// `retire_kvno` names) directly followed by keyd's own outcome. Since
+/// A-102 (docs/52 §4.2, §4.5) each execution runs on a decision dird
+/// (Role::Ldap, the grant socket) registered first — a loosening, so its
+/// intent and outcome come first — and the execution's intent names the
+/// decided handle and kvno from keyd's table. A refused
 /// authorization (Admin may not `set_secret`, docs/10 §2) is one record and
 /// no intent. On a loaded machine an acknowledgement may still miss the
 /// budget: such an attempt is answered `Unavailable`, retried, and must be
@@ -357,25 +385,51 @@ fn every_admin_change_is_intent_then_outcome_in_the_verified_log() {
         matches!(&answer, Ok(Answer::CreateKey(Ok(kvno))) if *kvno == Kvno::INITIAL),
         "{answer:?}"
     );
+    let registered = |call: &Call| {
+        let (answer, unacknowledged) = call_until_performed(&grant_socket(&dir), call);
+        assert!(
+            matches!(&answer, Ok(Answer::RegisterDecision(Ok(())))),
+            "{answer:?}"
+        );
+        unacknowledged
+    };
+    let decided_rotate = registered(&decide(
+        1,
+        DecidedOperation::RotateKey {
+            handle: handle(0xA1),
+        },
+    ));
     let rotate = Call::RotateKey {
-        handle: handle(0xA1),
+        decision: DecisionId::new(1),
     };
     let (answer, rotated) = call_until_performed(&socket, &rotate);
     assert!(
         matches!(&answer, Ok(Answer::RotateKey(Ok(kvno))) if *kvno == Kvno::new(2)),
         "{answer:?}"
     );
+    let decided_retire = registered(&decide(
+        2,
+        DecidedOperation::RetireKvno {
+            handle: handle(0xA1),
+            kvno: Kvno::INITIAL,
+        },
+    ));
     let retire = Call::RetireKvno {
-        handle: handle(0xA1),
-        kvno: Kvno::INITIAL,
+        decision: DecisionId::new(2),
     };
     let (answer, retired) = call_until_performed(&socket, &retire);
     assert!(
         matches!(&answer, Ok(Answer::RetireKvno(Ok(())))),
         "{answer:?}"
     );
+    let decided_destroy = registered(&decide(
+        3,
+        DecidedOperation::DestroyKeySet {
+            principal: handle(0xA1).principal,
+        },
+    ));
     let destroy = Call::DestroyKeySet {
-        handle: handle(0xA1),
+        decision: DecisionId::new(3),
     };
     let (answer, destroyed) = call_until_performed(&socket, &destroy);
     assert!(
@@ -395,6 +449,13 @@ fn every_admin_change_is_intent_then_outcome_in_the_verified_log() {
     let records = keyd_records(&verified_log(&dir.join("audit.log")), uid);
     let mut expected = change_phases(Op::CreateKey, created, None, Out::Success, Some(1));
     expected.extend(change_phases(
+        Op::RegisterDecision,
+        decided_rotate,
+        None,
+        Out::Success,
+        None,
+    ));
+    expected.extend(change_phases(
         Op::RotateKey,
         rotated,
         None,
@@ -402,11 +463,25 @@ fn every_admin_change_is_intent_then_outcome_in_the_verified_log() {
         Some(2),
     ));
     expected.extend(change_phases(
+        Op::RegisterDecision,
+        decided_retire,
+        Some(1),
+        Out::Success,
+        Some(1),
+    ));
+    expected.extend(change_phases(
         Op::RetireKvno,
         retired,
         Some(1),
         Out::Success,
         Some(1),
+    ));
+    expected.extend(change_phases(
+        Op::RegisterDecision,
+        decided_destroy,
+        None,
+        Out::Success,
+        None,
     ));
     expected.extend(change_phases(
         Op::DestroyKeySet,
@@ -425,6 +500,12 @@ fn every_admin_change_is_intent_then_outcome_in_the_verified_log() {
         assert_eq!(phase.caller_uid, uid);
         assert_eq!(phase.principal, Some([0xA1; 16]));
         assert_eq!(phase.purpose, Some(KeyPurposeCode::PrincipalLongterm));
+        // A-102 (docs/52 §4.5): every phase but create_key's names its
+        // decision, and the decision's approvers.
+        if phase.op != Op::CreateKey {
+            assert!(phase.decision.is_some(), "{:?}", phase.op);
+            assert_eq!(phase.approvers, Some([[0x01; 16], [0x02; 16]]));
+        }
     }
     assert_eq!(
         records.last().map(|r| r.reason),
@@ -436,10 +517,10 @@ fn every_admin_change_is_intent_then_outcome_in_the_verified_log() {
 /// kvno 2, each preceded by its acknowledged intent in the verified log
 /// (and, on a loaded machine, by any attempt refused for a late
 /// acknowledgement — its intent and `NotPerformed`; Q-415). Since task A15a
-/// each `set_secret` follows the grant dird would register (Role::Ldap on
-/// the same keyd): a loosening, so its intent too is acknowledged first and
-/// the log holds grant intent, grant outcome, then the `set_secret` pair
-/// (docs/questions/Q-452).
+/// each `set_secret` follows the decision dird would register (Role::Ldap
+/// on the same keyd; A-102: `register_decision`): a loosening, so its intent
+/// too is acknowledged first and the log holds its intent, its outcome, then
+/// the `set_secret` pair (docs/questions/Q-452).
 #[test]
 fn set_secret_is_intent_then_outcome_in_the_verified_log() {
     let dir = TempDir::new();
@@ -451,13 +532,14 @@ fn set_secret_is_intent_then_outcome_in_the_verified_log() {
     let keyd = start_keyd(&dir, uid, Role::Directory, generous());
     let mut expected = Vec::new();
     for kvno in [1, 2] {
-        let (answer, unacknowledged) = call_until_performed(&grant_socket(&dir), &grant(0xB0));
+        let (answer, unacknowledged) =
+            call_until_performed(&grant_socket(&dir), &grant(u64::from(kvno), 0xB0));
         assert!(
-            matches!(&answer, Ok(Answer::GrantSetSecret(Ok(())))),
+            matches!(&answer, Ok(Answer::RegisterDecision(Ok(())))),
             "{answer:?}"
         );
         expected.extend(change_phases(
-            Op::GrantSetSecret,
+            Op::RegisterDecision,
             unacknowledged,
             None,
             Out::Success,

@@ -96,8 +96,8 @@ use ipc_audit::{
 use ipc_keyd::Call;
 use keyd::authz::HandleSlot;
 use keyd::{
-    AuditKeyRef, AuditOutcome, AuditReason, AuditRecord, AuditSink, CallerId, KeyHandle, Kvno,
-    Operation, PrincipalId,
+    AuditKeyRef, AuditOutcome, AuditReason, AuditRecord, AuditSink, CallerId, DecisionId,
+    DecisionIntent, KeyHandle, Kvno, Operation, PrincipalId,
 };
 use krb_proto::KerberosTime;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -175,7 +175,10 @@ pub const fn is_gating(operation: Operation) -> bool {
         | Operation::SealFastError
         | Operation::DestroyKeySet
         | Operation::OpenAndVerifyServiceTicket
-        | Operation::GrantSetSecret => true,
+        | Operation::GrantSetSecret
+        | Operation::RegisterDecision
+        | Operation::SealCeremony
+        | Operation::ListDestroyDecisions => true,
         Operation::DescribeConfig | Operation::Ping => false,
     }
 }
@@ -246,11 +249,19 @@ impl PendingOutcome {
 /// authorization and so takes the same path (`keyd::requires_acknowledged_intent`):
 /// its first key target is the record's handle, its second (a computer's
 /// `Service` key set) the record's secondary key, as keyd's own record of it
-/// (crates/keyd grant.rs); no binding and no lifetime.
+/// (crates/keyd decision.rs); no binding and no lifetime.
+///
+/// **A-102 (docs/52 §4.5):** `register_decision` takes the same path (it
+/// loosens keyd): the record names the decided key sets, the kvno a
+/// `RetireKvno` decision names, the first two approvers and the decision
+/// id. An **execution** of a decision (`rotate_key`, `rotate_krbtgt`,
+/// `retire_kvno`, `destroy_key_set`) names only its id: its intent is built
+/// from keyd's own table ([`KeyStateIntent::decided`],
+/// `keyd::Keyd::decided_intent`) — never from the request.
 ///
 /// Spec: docs/10 §10 (`{ ts, caller_role, caller_uid, op, principal,
 /// purpose, kvno, result }`), §12 I8; docs/questions/Q-346 (A-86), Q-365,
-/// Q-452 item 1.
+/// Q-452 item 1; docs/52 §4.5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KeyStateIntent {
     ts: KerberosTime,
@@ -263,42 +274,29 @@ pub(crate) struct KeyStateIntent {
     secondary: Option<KeyHandle>,
     kvno: Option<Kvno>,
     approvers: Option<[PrincipalId; 2]>,
+    /// The decision registered or run (A-102).
+    decision: Option<DecisionId>,
 }
 
 impl KeyStateIntent {
-    /// The intent of `call` by `caller` at `now` if `call` is one of the six
-    /// key-state changes or `grant_set_secret`, else `None`. The match is
-    /// exhaustive over [`Call`]: a new call does not compile until it is
-    /// classified here. The engine checks this against
-    /// `keyd::requires_acknowledged_intent` and refuses (fail closed) when
-    /// they disagree.
+    /// The intent of `call` by `caller` at `now` if `call` needs one and
+    /// names its parameters itself — `set_secret`, `create_key`,
+    /// `grant_set_secret`, `register_decision` — else `None`. An execution of
+    /// a decision names only its id: its intent is
+    /// [`KeyStateIntent::decided`]. The match is exhaustive over [`Call`]: a
+    /// new call does not compile until it is classified here. The engine
+    /// checks this against `keyd::requires_acknowledged_intent` and refuses
+    /// (fail closed) when they disagree.
     ///
-    /// Spec: docs/10 §6, §7; docs/questions/Q-346 (A-86), Q-452 item 1.
+    /// Spec: docs/10 §6, §7; docs/questions/Q-346 (A-86), Q-452 item 1;
+    /// docs/52 §4.5 (A-102).
     pub(crate) fn of(caller: CallerId, now: KerberosTime, call: &Call) -> Option<KeyStateIntent> {
-        let (op, primary, secondary, kvno, approvers) = match call {
+        let (op, primary, secondary, kvno, approvers, decision) = match call {
             Call::SetSecret { handle, .. } => {
-                (Operation::SetSecret, Some(*handle), None, None, None)
+                (Operation::SetSecret, Some(*handle), None, None, None, None)
             }
             Call::CreateKey { handle, .. } => {
-                (Operation::CreateKey, Some(*handle), None, None, None)
-            }
-            Call::RotateKey { handle } => (Operation::RotateKey, Some(*handle), None, None, None),
-            Call::RotateKrbtgt { krbtgt, approval } => (
-                Operation::RotateKrbtgt,
-                Some(*krbtgt),
-                None,
-                None,
-                Some([approval.approver_1, approval.approver_2]),
-            ),
-            Call::RetireKvno { handle, kvno } => (
-                Operation::RetireKvno,
-                Some(*handle),
-                None,
-                Some(*kvno),
-                None,
-            ),
-            Call::DestroyKeySet { handle } => {
-                (Operation::DestroyKeySet, Some(*handle), None, None, None)
+                (Operation::CreateKey, Some(*handle), None, None, None, None)
             }
             Call::GrantSetSecret { targets, .. } => (
                 Operation::GrantSetSecret,
@@ -306,8 +304,29 @@ impl KeyStateIntent {
                 targets.get(1).map(|t| t.handle),
                 None,
                 None,
+                None,
             ),
-            Call::VerifyPreauth { .. }
+            Call::RegisterDecision {
+                id,
+                operation,
+                approvers,
+                ..
+            } => (
+                Operation::RegisterDecision,
+                operation.primary(),
+                operation.secondary(),
+                operation.kvno(),
+                match approvers.as_slice() {
+                    [first, second, ..] => Some([*first, *second]),
+                    _ => None,
+                },
+                Some(*id),
+            ),
+            Call::RotateKey { .. }
+            | Call::RotateKrbtgt { .. }
+            | Call::RetireKvno { .. }
+            | Call::DestroyKeySet { .. }
+            | Call::VerifyPreauth { .. }
             | Call::IssueAsRep { .. }
             | Call::OpenFastArmor { .. }
             | Call::OpenAndVerifyTgt { .. }
@@ -316,7 +335,9 @@ impl KeyStateIntent {
             | Call::OpenAndVerifyServiceTicket { .. }
             | Call::VerifySecret { .. }
             | Call::DescribeConfig
-            | Call::Ping => return None,
+            | Call::Ping
+            | Call::SealCeremony
+            | Call::ListDestroyDecisions { .. } => return None,
         };
         Some(KeyStateIntent {
             ts: now,
@@ -326,7 +347,39 @@ impl KeyStateIntent {
             secondary,
             kvno,
             approvers,
+            decision,
         })
+    }
+
+    /// This intent naming `decision` — the set-secret decision a
+    /// `set_secret` will consume, as keyd's table names it
+    /// (`keyd::Keyd::secret_decision`; docs/52 §4.5).
+    #[must_use]
+    pub(crate) fn with_decision(self, decision: Option<DecisionId>) -> KeyStateIntent {
+        KeyStateIntent { decision, ..self }
+    }
+
+    /// The intent of executing a decision with `op` by `caller` at `now`,
+    /// from the facts keyd's own table holds (`keyd::Keyd::decided_intent`;
+    /// A-102, docs/52 §4.5): the decided key sets, kvno and approvers, and
+    /// the decision id.
+    /// Spec: docs/52 §4.2, §4.5; docs/questions/Q-346 (A-86).
+    pub(crate) fn decided(
+        caller: CallerId,
+        now: KerberosTime,
+        op: Operation,
+        facts: &DecisionIntent,
+    ) -> KeyStateIntent {
+        KeyStateIntent {
+            ts: now,
+            caller,
+            op,
+            primary: facts.primary,
+            secondary: facts.secondary,
+            kvno: facts.kvno,
+            approvers: facts.approvers,
+            decision: Some(facts.decision),
+        }
     }
 
     /// The operation.
@@ -336,9 +389,14 @@ impl KeyStateIntent {
 
     /// The handles the operation acts on, in their slots — for keyd's
     /// authorization step (`keyd::Keyd::admits`): the `Primary` handle, and a
-    /// grant's `Secondary` one.
-    /// Spec: docs/10 §2 (I3); docs/questions/Q-452 item 1.
+    /// grant's `Secondary` one. None for `register_decision`, whose
+    /// authorization step is the role alone (keyd judges the decided key
+    /// sets' purposes inside the operation, A-102).
+    /// Spec: docs/10 §2 (I3); docs/questions/Q-452 item 1; docs/52 §4.2.
     pub(crate) fn handles(&self) -> Vec<(HandleSlot, &KeyHandle)> {
+        if self.op == Operation::RegisterDecision {
+            return Vec::new();
+        }
         let mut handles = Vec::with_capacity(2);
         if let Some(primary) = &self.primary {
             handles.push((HandleSlot::Primary, primary));
@@ -371,6 +429,7 @@ impl KeyStateIntent {
                 kvno: None,
             }),
             approvers: self.approvers,
+            decision: self.decision,
             // keyd has no phase outcome; replaced by `phase` below.
             result: AuditOutcome::Success,
             reason: AuditReason::None,
@@ -835,6 +894,7 @@ mod tests {
             kvno: None,
             secondary: None,
             approvers: None,
+            decision: None,
             result: keyd::AuditOutcome::Success,
             reason: keyd::AuditReason::None,
         };

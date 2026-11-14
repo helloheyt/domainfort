@@ -13,16 +13,17 @@
 //! (docs/questions/Q-367, A-88).
 //!
 //! Spec: docs/51 §6; docs/10 §7, §9, §10; docs/50 §8.2 (fixed messages, no
-//! request octets); AGENTS.md §6; docs/questions/Q-367 (A-88).
+//! request octets); AGENTS.md §6; docs/questions/Q-367 (A-88); docs/52
+//! §3.10, §4.2, §4.4 (A-102).
 
-use crate::ceremony::{CeremonyReport, NotSent, Outcome, Step, Unknown};
+use crate::ceremony::{CeremonyReport, MissingSalt, NotSent, Outcome, Step, Unknown};
 use ipc::Refused;
 use ipc_keyd::TransportError;
 use keyd_types::{Error as KeydError, MAX_INITIAL_SECRET_GRANT_SECS};
 use provision_manifest::Manifest;
 
-/// Exit status: all three key sets created and every first administrator's
-/// initial secret granted.
+/// Exit status: all three key sets created, every first administrator's
+/// initial secret granted, and keyd's ceremony sealed (A-102).
 pub const EXIT_COMPLETE: u8 = 0;
 
 /// Exit status: nothing was attempted on keyd's key store — a usage,
@@ -216,6 +217,20 @@ pub fn render(report: &CeremonyReport, manifest: &Manifest) -> Vec<String> {
         });
     }
     render_grants(report, manifest, &mut lines);
+    if let Some(seal) = report.seal {
+        lines.push(match seal {
+            Outcome::Answered(Ok(())) => "keyd's ceremony sealed".to_owned(),
+            Outcome::Answered(Err(error)) => {
+                format!("keyd refused the seal ({})", keyd_error_text(error))
+            }
+            Outcome::NotSent(reason) => format!("seal: {}", not_sent_text(reason)),
+            Outcome::NotPerformed(refused) => format!("seal: {}", not_performed_text(refused)),
+            Outcome::Unknown(reason) => format!(
+                "seal: {} after the request was sent; outcome unknown, keyd MAY be sealed",
+                unknown_text(reason)
+            ),
+        });
+    }
     let created = report.created().len();
     let granted = report
         .grants
@@ -224,14 +239,28 @@ pub fn render(report: &CeremonyReport, manifest: &Manifest) -> Vec<String> {
         .count();
     if report.is_complete() {
         lines.push(format!(
-            "ceremony complete: {created} of {} key sets created; {granted} of {} first administrators' initial secrets granted",
+            "ceremony complete and sealed: {created} of {} key sets created; {granted} of {} first administrators' initial secrets granted",
             Step::ALL.len(),
             report.first_admins
         ));
+        lines.push(
+            "keyd is sealed: create_key and initial-secret grants no longer exist in keyd until it restarts with an empty store (development mode: every restart - P-17, A-77); from now on keyd changes keys only on decisions dird registers (docs/52 4.4, A-102)".to_owned(),
+        );
         lines.push(format!(
-            "run provision first-admin-secret within {} minutes: keyd refuses a set_secret without its grant, and grants only initial secrets to keyadm (docs/51 5.8, task A15a)",
+            "run provision first-admin-secret within {} minutes: the grants registered before the seal live that long, and keyd refuses a set_secret without its grant (docs/51 5.8)",
             MAX_INITIAL_SECRET_GRANT_SECS / 60
         ));
+        return lines;
+    }
+    if report.grants_registered() {
+        lines.push(format!(
+            "ceremony stopped at the seal: {created} of {} key sets created; {granted} of {} first administrators' initial secrets granted; keyd is NOT known to be sealed",
+            Step::ALL.len(),
+            report.first_admins
+        ));
+        lines.push(
+            "keyadm never retries: restart keyd before running the ceremony again (development mode: every key is lost - docs/51 4.5, A-77)".to_owned(),
+        );
         return lines;
     }
     if report.key_sets_created() {
@@ -250,12 +279,12 @@ pub fn render(report: &CeremonyReport, manifest: &Manifest) -> Vec<String> {
             );
         }
         lines.push(
-            "keyadm never retries: in development mode restart keyd (every key is lost) and run the whole ceremony again (docs/51 4.5, A-77)".to_owned(),
+            "keyd is NOT sealed; keyadm never retries: restart keyd (development mode: every key is lost) and run the whole ceremony again (docs/51 4.5, A-77)".to_owned(),
         );
         return lines;
     }
     if report.steps.is_empty() {
-        lines.push("ceremony not started: no create_key was sent".to_owned());
+        lines.push("ceremony not started: no create_key was sent; keyd is not sealed".to_owned());
         return lines;
     }
     let skipped: Vec<&str> = report.not_attempted().iter().map(|s| s.label()).collect();
@@ -287,67 +316,46 @@ pub fn render(report: &CeremonyReport, manifest: &Manifest) -> Vec<String> {
         );
     }
     lines.push(
-        "create_key never overwrites and keyadm never retries: in development mode restart keyd (every key is lost) and run the whole ceremony again (docs/51 4.5, A-77)".to_owned(),
+        "keyd is NOT sealed; create_key never overwrites and keyadm never retries: restart keyd (development mode: every key is lost) and run the whole ceremony again (docs/51 4.5, A-77)".to_owned(),
     );
     lines
 }
 
+/// The lines of a ceremony refused before anything was sent: the manifest
+/// names no salt for a first administrator (A-102, docs/52 N4).
+/// Spec: docs/52 §4.2; docs/51 §4.3 steps 8, 11.
+#[must_use]
+pub fn render_missing_salt(missing: MissingSalt, manifest: &Manifest) -> Vec<String> {
+    let who = manifest.first_admins().get(missing.admin).map_or_else(
+        || format!("#{}", missing.admin),
+        |admin| admin.sam_account_name().to_owned(),
+    );
+    vec![
+        format!(
+            "keyadm ceremony: the manifest names no salt for first administrator {who} (first_admin_salts); nothing was sent to keyd"
+        ),
+        "keyd binds each initial-secret grant's salt (docs/52 N4): re-run provision domain, which writes every first administrator's salt into the manifest".to_owned(),
+    ]
+}
+
 // ---------------------------------------------------------------------------
-// The approved-request commands and the sweep (task A10).
+// The decision commands and the sweep (task A10; A-102).
 // ---------------------------------------------------------------------------
 
-/// The text of a GUID, in the provisioning manifest's form: dtyp's one GUID
-/// text mapping (A-86 follow-up).
-/// Spec: [MS-DTYP] 2.5.1.1; [MS-DRSR] 5.16.3.16; A-31.
-fn guid_text(guid: &dtyp::Guid) -> String {
-    guid.to_text()
+/// The text of a principal id, in the provisioning manifest's GUID form:
+/// dtyp's one GUID text mapping (A-86 follow-up).
+/// Spec: [MS-DTYP] 2.5.1.1; [MS-DRSR] 5.16.3.16; A-31; docs/47 §2.3
+/// (`PrincipalId = objectGUID`).
+fn principal_text(principal: &keyd_types::PrincipalId) -> String {
+    dtyp::Guid::from_packet(principal.as_bytes()).to_text()
 }
 
-/// A refusal status of admind / dird, as a fixed text.
-/// Spec: crate ipc-admin `RefusalStatus`; A-26; A-55.
-const fn status_text(status: ipc_admin::RefusalStatus) -> &'static str {
-    use ipc_admin::RefusalStatus as S;
-    match status {
-        S::Denied => "denied (is this account keyadm_uid in admind's configuration?)",
-        S::ApprovalRequired => "not approved yet: the approvals do not reach the quorum",
-        S::NotFound => "no such pending request (unknown, expired, or dropped by a dird restart)",
-        S::Invalid => "the request was refused as invalid",
-        S::Conflict => "the request was already fetched (one approval, one execution)",
-        S::Unavailable => "dird or admind could not serve it now (nothing was done)",
-        S::OutcomeUnknown => "admind lost dird's answer: the request MAY have been consumed",
-        S::Incomplete => "partly carried out",
-    }
-}
-
-/// admind's failure, as a fixed text (with whether the request was sent).
-fn admind_failure_text(failure: &ipc_admin::AdmindFailure) -> String {
-    if failure.sent {
-        format!("{failure} after the request was sent; its outcome is unknown")
-    } else {
-        format!("{failure} (nothing was sent)")
-    }
-}
-
-/// The key operation, as identifiers.
-fn key_operation_text(operation: &ipc_dird_admin::KeyOperation) -> String {
-    use ipc_dird_admin::{KeyOperation as K, KeyRef};
-    match operation {
-        K::RotateKrbtgt => "rotate_krbtgt".to_owned(),
-        K::RotateKey { service } => format!("rotate_key of service object {}", guid_text(service)),
-        K::RetireKvno { key, kvno } => match key {
-            KeyRef::Krbtgt => format!("retire_kvno {kvno} of the krbtgt key set"),
-            KeyRef::Service(service) => format!(
-                "retire_kvno {kvno} of service object {}",
-                guid_text(service)
-            ),
-        },
-    }
-}
-
-/// The exit status of an execution: 0 performed and recorded; 1 keyd was
-/// not asked; 2 keyd was asked and something is left to check.
+/// The exit status of an execution: 0 keyd performed the decided operation;
+/// 1 keyd changed nothing it could have (not sent, not performed); 2 keyd
+/// received it and something is left to check (refused — keyd's audit
+/// names why — or outcome unknown).
 /// Spec: docs/51 §6; docs/questions/Q-370 item 12 (A-90: 2 = check keyd's
-/// audit log).
+/// audit log); docs/52 §3.10.
 #[must_use]
 pub fn execution_exit_code(report: &crate::execute::ExecutionReport) -> u8 {
     if report.is_complete() {
@@ -360,82 +368,31 @@ pub fn execution_exit_code(report: &crate::execute::ExecutionReport) -> u8 {
 }
 
 /// The lines of an execution's report.
-/// Spec: docs/51 §6; docs/10 §10 (identifiers only).
+/// Spec: docs/51 §6; docs/52 §3.10, §4.2; docs/10 §10 (identifiers only).
 #[must_use]
 pub fn render_execution(report: &crate::execute::ExecutionReport) -> Vec<String> {
-    use crate::execute::{Completion, Fetch, Mismatch};
     let mut lines = vec![format!(
-        "keyadm {}: approved request {}",
+        "keyadm {}: decision {}",
         report.command.name(),
-        report.id
+        report.decision.get()
     )];
-    let approved = match &report.fetch {
-        Fetch::Fetched(approved) => approved,
-        Fetch::Refused(status) => {
-            lines.push(format!("fetch refused: {}", status_text(*status)));
-            lines.push("keyd was not asked; no key set was touched".to_owned());
-            return lines;
-        }
-        Fetch::Failed(failure) => {
-            lines.push(format!("fetch failed: {}", admind_failure_text(failure)));
-            lines.push("keyd was not asked; no key set was touched".to_owned());
-            return lines;
-        }
-    };
-    let digest: String = approved.digest.iter().map(|b| format!("{b:02x}")).collect();
-    lines.push(format!(
-        "fetched: {} on principal {}; digest {digest}; requested by {}; approved by {}",
-        key_operation_text(&approved.operation),
-        guid_text(&approved.principal),
-        guid_text(&approved.requester),
-        approved
-            .approvers
-            .iter()
-            .map(guid_text)
-            .collect::<Vec<_>>()
-            .join(", ")
-    ));
-    match report.mismatch {
-        Some(Mismatch::Command(operation)) => lines.push(format!(
-            "not executed: the approved operation is {}, not {}; keyd was not asked",
-            key_operation_text(&operation),
-            report.command.name()
-        )),
-        Some(Mismatch::Incoherent) => lines.push(
-            "not executed: dird's answer is not coherent (purpose, approvers or object); keyd was not asked".to_owned(),
+    lines.push(match report.keyd {
+        Outcome::Answered(Ok(Some(kvno))) => format!(
+            "keyd ran the decided operation: new kvno {} (presenting this decision again returns this result; it never runs twice)",
+            kvno.get()
         ),
-        None => {}
-    }
-    if let Some(outcome) = &report.keyd {
-        lines.push(match outcome {
-            Outcome::Answered(Ok(Some(kvno))) => {
-                format!("keyd performed it: new kvno {}", kvno.get())
-            }
-            Outcome::Answered(Ok(None)) => "keyd performed it".to_owned(),
-            Outcome::Answered(Err(error)) => format!(
-                "keyd refused ({}); nothing was changed",
-                keyd_error_text(*error)
-            ),
-            Outcome::NotSent(reason) => format!("keyd: {}", not_sent_text(*reason)),
-            Outcome::NotPerformed(refused) => format!("keyd: {}", not_performed_text(*refused)),
-            Outcome::Unknown(reason) => format!(
-                "keyd: {} after the request was sent; outcome unknown - check keyd's audit log (intent + outcome, docs/10 10, A-88) before anything else",
-                unknown_text(*reason)
-            ),
-        });
-    }
-    match &report.completion {
-        Some(Completion::Recorded) => lines.push("completion recorded in dird".to_owned()),
-        Some(Completion::Refused(status)) => lines.push(format!(
-            "completion NOT recorded in dird: {}",
-            status_text(*status)
-        )),
-        Some(Completion::Failed(failure)) => lines.push(format!(
-            "completion NOT recorded in dird: {}",
-            admind_failure_text(failure)
-        )),
-        None => {}
-    }
+        Outcome::Answered(Ok(None)) => "keyd ran the decided operation (presenting this decision again returns this result; it never runs twice)".to_owned(),
+        Outcome::Answered(Err(error)) => format!(
+            "keyd refused ({}): no such decision, a decision of another kind, expired, or this account is not Role::Admin - keyd's audit record names the reason; nothing was changed",
+            keyd_error_text(error)
+        ),
+        Outcome::NotSent(reason) => format!("keyd: {}", not_sent_text(reason)),
+        Outcome::NotPerformed(refused) => format!("keyd: {}", not_performed_text(refused)),
+        Outcome::Unknown(reason) => format!(
+            "keyd: {} after the request was sent; outcome unknown - run the same command again: keyd returns the recorded result of the decision, it never runs it twice (docs/52 3.10)",
+            unknown_text(reason)
+        ),
+    });
     lines
 }
 
@@ -453,12 +410,26 @@ pub fn sweep_exit_code(report: &crate::sweep::SweepReport) -> u8 {
     }
 }
 
+/// An outcome without a success value, as a fixed text.
+fn outcome_text(outcome: &Outcome<()>) -> String {
+    match outcome {
+        Outcome::Answered(Ok(())) => "keyd answered ok".to_owned(),
+        Outcome::Answered(Err(error)) => format!("keyd answered {}", keyd_error_text(*error)),
+        Outcome::NotSent(reason) => not_sent_text(*reason).to_owned(),
+        Outcome::NotPerformed(refused) => not_performed_text(*refused).to_owned(),
+        Outcome::Unknown(reason) => format!(
+            "{} after the request was sent; outcome unknown",
+            unknown_text(*reason)
+        ),
+    }
+}
+
 /// The lines of a sweep's report.
-/// Spec: docs/51 §6, §9; docs/10 §7, §10 (identifiers only).
+/// Spec: docs/51 §6, §9; docs/52 §4.3; docs/10 §7, §10 (identifiers only).
 #[must_use]
 pub fn render_sweep(report: &crate::sweep::SweepReport) -> Vec<String> {
     use crate::sweep::Stopped;
-    let mut lines = vec!["keyadm destroy-sweep".to_owned()];
+    let mut lines = vec!["keyadm destroy-sweep: the destroy decisions dird registered".to_owned()];
     match report.contact {
         Outcome::Answered(Ok(())) => {}
         Outcome::Answered(Err(error)) => {
@@ -481,53 +452,41 @@ pub fn render_sweep(report: &crate::sweep::SweepReport) -> Vec<String> {
             return lines;
         }
     }
-    for (guid, purpose) in &report.destroyed {
+    for entry in &report.destroyed {
         lines.push(format!(
-            "destroyed: principal {} purpose {purpose:?}",
-            guid_text(guid)
+            "destroyed: decision {} principal {} (its PrincipalLongterm and Service key sets)",
+            entry.decision.get(),
+            principal_text(&entry.principal)
+        ));
+    }
+    for entry in &report.skipped {
+        lines.push(format!(
+            "skipped: decision {} principal {}: keyd answered denied (expired or no longer pending - keyd's audit names the reason)",
+            entry.decision.get(),
+            principal_text(&entry.principal)
         ));
     }
     lines.push(format!(
-        "{} deleted account(s) listed; {} key set(s) destroyed now; {} already absent",
-        report.accounts,
+        "{} pending destroy decision(s) listed; {} run now; {} skipped",
+        report.listed,
         report.destroyed.len(),
-        report.absent
+        report.skipped.len()
     ));
     match &report.stopped {
         None => lines.push("sweep complete".to_owned()),
-        Some(Stopped::ListingRefused(status)) => lines.push(format!(
-            "sweep stopped: the listing was refused: {}",
-            status_text(*status)
-        )),
-        Some(Stopped::ListingFailed(failure)) => lines.push(format!(
+        Some(Stopped::Listing(outcome)) => lines.push(format!(
             "sweep stopped: the listing failed: {}; run the sweep again later",
-            admind_failure_text(failure)
+            outcome_text(outcome)
         )),
         Some(Stopped::ListingLooped) => lines.push(
             "sweep stopped: the listing did not move forward; nothing more was asked".to_owned(),
         ),
-        Some(Stopped::RetryLater {
-            guid,
-            purpose,
-            outcome,
-        }) => {
-            let why = match outcome {
-                Outcome::Answered(Err(error)) => {
-                    format!("keyd answered {}", keyd_error_text(*error))
-                }
-                Outcome::Answered(Ok(())) => "keyd answered ok".to_owned(),
-                Outcome::NotSent(reason) => not_sent_text(*reason).to_owned(),
-                Outcome::NotPerformed(refused) => not_performed_text(*refused).to_owned(),
-                Outcome::Unknown(reason) => format!(
-                    "{} after the request was sent; outcome unknown",
-                    unknown_text(*reason)
-                ),
-            };
-            lines.push(format!(
-                "sweep stopped at principal {} purpose {purpose:?}: {why}; retry later - the sweep is idempotent",
-                guid_text(guid)
-            ));
-        }
+        Some(Stopped::RetryLater { entry, outcome }) => lines.push(format!(
+            "sweep stopped at decision {} principal {}: {}; retry later - the sweep is idempotent",
+            entry.decision.get(),
+            principal_text(&entry.principal),
+            outcome_text(outcome)
+        )),
     }
     lines
 }

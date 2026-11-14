@@ -122,6 +122,12 @@ tokio = { version = "1.54.1", default-features = false, features = ["rt", "net"]
 # crates/protected-file reader opens — the walk from `/` accepts them (task
 # T; docs/questions/Q-480). Dev-only, no dependency.
 test-scratch = { path = "../test-scratch" }
+# TESTS ONLY (A-102, docs/52 R4): first-admin-secret's tests check a password
+# the way the KDC does (`verify_preauth` of a PA-ENC-TIMESTAMP built by the
+# kdc integration fixtures, reused by `#[path]`), since no role holds
+# `verify_secret` any more. A workspace crate; never a normal dependency
+# (crates/keyd-types/tests/no_crypto_dependency.rs checks normal edges).
+krb-crypto = { path = "../krb-crypto" }
 
 [lints]
 workspace = true

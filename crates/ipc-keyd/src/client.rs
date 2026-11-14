@@ -108,9 +108,9 @@ use core::time::Duration;
 use ipc::{decode_reply, encode_frame, Direction, FrameLimit, Refused, Reply};
 use keyd_types::{
     AccountKind, ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof, ConfigDescription,
-    CtxId, DualControlToken, FastArmor, FastConversation, IssueError, KeyCustody, KeyHandle, Kvno,
-    PrincipalBinding, Role, ServiceContext, SetSecretTarget, TgsFastRequest, TgsRepParts,
-    TgsTicketTemplate, TgtContext,
+    CtxId, DecidedOperation, DecisionId, DestructionPage, FastArmor, FastConversation, IssueError,
+    KeyCustody, KeyHandle, Kvno, PrincipalBinding, PrincipalId, Role, ServiceContext,
+    SetSecretTarget, TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext,
 };
 use krb_proto::{ApReq, EncryptedData, KerberosTime, KrbError, KrbFastArmoredReq, PaData};
 use std::time::Instant;
@@ -782,27 +782,10 @@ impl<C: Connector> KeydClient<C> {
         }
     }
 
-    /// docs/10 §6 `verify_secret` (Role::Directory). Spec: docs/50 §3.3,
-    /// §3.4; docs/10 I6, I7.
-    pub fn verify_secret(
-        &mut self,
-        handle: &KeyHandle,
-        candidate: Zeroizing<String>,
-    ) -> Result<(), keyd_types::Error> {
-        let call = Call::VerifySecret {
-            handle: *handle,
-            candidate: Password::new(candidate),
-        };
-        match self.call(&call) {
-            Ok(Answer::VerifySecret(result)) => result,
-            _ => Err(keyd_types::Error::Unavailable),
-        }
-    }
-
-    /// docs/10 §7 `create_key` (Role::Admin). A key-state change: see
-    /// [`KeydClient::set_secret`] on `Unavailable` and
-    /// [`KeydClient::call_with_fate`]. Spec: docs/50 §3.4; docs/10 §10;
-    /// docs/questions/Q-367 (A-88).
+    /// docs/10 §7 `create_key` (Role::Admin; the provisioning ceremony only,
+    /// A-102). A key-state change: see [`KeydClient::set_secret`] on
+    /// `Unavailable` and [`KeydClient::call_with_fate`]. Spec: docs/50 §3.4;
+    /// docs/10 §10; docs/questions/Q-367 (A-88).
     pub fn create_key(
         &mut self,
         handle: &KeyHandle,
@@ -818,50 +801,96 @@ impl<C: Connector> KeydClient<C> {
         }
     }
 
-    /// docs/10 §7 `rotate_key` (Role::Admin). A key-state change: see
-    /// [`KeydClient::set_secret`]. Spec: docs/50 §3.4; docs/10 §10.
-    pub fn rotate_key(&mut self, handle: &KeyHandle) -> Result<Kvno, keyd_types::Error> {
-        match self.call(&Call::RotateKey { handle: *handle }) {
+    /// docs/10 §7 `rotate_key` (Role::Admin): run dird's `RotateKey`
+    /// decision `decision` (A-102). A key-state change: see
+    /// [`KeydClient::set_secret`]. Spec: docs/50 §3.4; docs/10 §10; docs/52
+    /// §4.2.
+    pub fn rotate_key(&mut self, decision: DecisionId) -> Result<Kvno, keyd_types::Error> {
+        match self.call(&Call::RotateKey { decision }) {
             Ok(Answer::RotateKey(result)) => result,
             _ => Err(keyd_types::Error::Unavailable),
         }
     }
 
-    /// docs/10 §7 `rotate_krbtgt` (Role::Admin). A key-state change: see
-    /// [`KeydClient::set_secret`]. Spec: docs/50 §3.4; docs/10 §10.
-    pub fn rotate_krbtgt(
-        &mut self,
-        krbtgt: &KeyHandle,
-        approval: &DualControlToken,
-    ) -> Result<Kvno, keyd_types::Error> {
-        let call = Call::RotateKrbtgt {
-            krbtgt: *krbtgt,
-            approval: *approval,
-        };
-        match self.call(&call) {
+    /// docs/10 §7 `rotate_krbtgt` (Role::Admin): run dird's `RotateKrbtgt`
+    /// decision `decision` (A-102; keyd builds the dual-control token from
+    /// the decision's approvers). A key-state change: see
+    /// [`KeydClient::set_secret`]. Spec: docs/50 §3.4; docs/10 §10; docs/52
+    /// §4.2.
+    pub fn rotate_krbtgt(&mut self, decision: DecisionId) -> Result<Kvno, keyd_types::Error> {
+        match self.call(&Call::RotateKrbtgt { decision }) {
             Ok(Answer::RotateKrbtgt(result)) => result,
             _ => Err(keyd_types::Error::Unavailable),
         }
     }
 
-    /// docs/10 §7 `retire_kvno` (Role::Admin). A key-state change: see
-    /// [`KeydClient::set_secret`]. Spec: docs/50 §3.4; docs/10 §10.
-    pub fn retire_kvno(&mut self, handle: &KeyHandle, kvno: Kvno) -> Result<(), keyd_types::Error> {
-        let call = Call::RetireKvno {
-            handle: *handle,
-            kvno,
-        };
-        match self.call(&call) {
+    /// docs/10 §7 `retire_kvno` (Role::Admin): run dird's `RetireKvno`
+    /// decision `decision` (A-102). A key-state change: see
+    /// [`KeydClient::set_secret`]. Spec: docs/50 §3.4; docs/10 §10; docs/52
+    /// §4.2.
+    pub fn retire_kvno(&mut self, decision: DecisionId) -> Result<(), keyd_types::Error> {
+        match self.call(&Call::RetireKvno { decision }) {
             Ok(Answer::RetireKvno(result)) => result,
             _ => Err(keyd_types::Error::Unavailable),
         }
     }
 
-    /// docs/10 §7 `destroy_key_set` (Role::Admin). A key-state change: see
-    /// [`KeydClient::set_secret`]. Spec: docs/50 §3.4; docs/10 §10; A-35.
-    pub fn destroy_key_set(&mut self, handle: &KeyHandle) -> Result<(), keyd_types::Error> {
-        match self.call(&Call::DestroyKeySet { handle: *handle }) {
+    /// docs/10 §7 `destroy_key_set` (Role::Admin): run dird's
+    /// `DestroyKeySet` decision `decision` (A-102). A key-state change: see
+    /// [`KeydClient::set_secret`]. Spec: docs/50 §3.4; docs/10 §10; A-35;
+    /// docs/52 §4.2.
+    pub fn destroy_key_set(&mut self, decision: DecisionId) -> Result<(), keyd_types::Error> {
+        match self.call(&Call::DestroyKeySet { decision }) {
             Ok(Answer::DestroyKeySet(result)) => result,
+            _ => Err(keyd_types::Error::Unavailable),
+        }
+    }
+
+    /// `seal_ceremony` (Role::Admin): end keyd's provisioning ceremony
+    /// (A-102, docs/52 R3). Spec: docs/52 §4.4.
+    pub fn seal_ceremony(&mut self) -> Result<(), keyd_types::Error> {
+        match self.call(&Call::SealCeremony) {
+            Ok(Answer::SealCeremony(result)) => result,
+            _ => Err(keyd_types::Error::Unavailable),
+        }
+    }
+
+    /// `list_destroy_decisions` (Role::Admin): one page of the pending
+    /// destroy decisions dird registered, strictly after `after` (A-102).
+    /// Spec: docs/52 §4.6.
+    pub fn list_destroy_decisions(
+        &mut self,
+        after: Option<DecisionId>,
+    ) -> Result<DestructionPage, keyd_types::Error> {
+        match self.call(&Call::ListDestroyDecisions { after }) {
+            Ok(Answer::ListDestroyDecisions(result)) => result,
+            _ => Err(keyd_types::Error::Unavailable),
+        }
+    }
+
+    /// `register_decision` (Role::Ldap — dird): record decision `id` to run
+    /// `operation`, approved by `approvers`, live for `lifetime_secs` by
+    /// keyd's clock (A-102, docs/52 R1). It loosens keyd, so keyd-daemon has
+    /// its intent acknowledged by auditd first: `Err(Unavailable)` here is
+    /// keyd's own answer **or** any failure of the call; a caller that must
+    /// tell "not registered" from "outcome unknown" sends
+    /// [`Call::RegisterDecision`] with [`KeydClient::call_with_fate`].
+    /// Spec: docs/52 §4.2, §4.5; docs/questions/Q-460.
+    pub fn register_decision(
+        &mut self,
+        id: DecisionId,
+        operation: &DecidedOperation,
+        approvers: &[PrincipalId],
+        lifetime_secs: u32,
+    ) -> Result<(), keyd_types::Error> {
+        let call = Call::RegisterDecision {
+            id,
+            operation: operation.clone(),
+            approvers: approvers.to_vec(),
+            lifetime_secs,
+        };
+        match self.call(&call) {
+            Ok(Answer::RegisterDecision(result)) => result,
             _ => Err(keyd_types::Error::Unavailable),
         }
     }
@@ -892,10 +921,11 @@ impl<C: Connector> KeydClient<C> {
         }
     }
 
-    /// `grant_set_secret` (Role::Ldap — dird after its PDP; Role::Admin —
-    /// keyadm's ceremony): register a one-time grant, live for
-    /// `lifetime_secs` by keyd's clock, that lets Role::Directory run one
-    /// `set_secret` on each of `targets` with exactly its binding.
+    /// `grant_set_secret` (Role::Admin — keyadm's ceremony, before the seal;
+    /// A-102): register a one-time grant, live for `lifetime_secs` by keyd's
+    /// clock, that lets Role::Directory run one `set_secret` on each of
+    /// `targets` with exactly its binding and salt. dird registers
+    /// `SetSecret` decisions instead ([`KeydClient::register_decision`]).
     ///
     /// It loosens keyd, so keyd-daemon has its intent acknowledged by auditd
     /// before keyd registers it (as for a key-state change, A-88):

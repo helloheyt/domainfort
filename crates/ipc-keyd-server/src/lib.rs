@@ -175,15 +175,17 @@ pub fn execute<S: KeyStore, A: AuditSink, E: EntropySource>(
         Call::CreateKey { handle, binding } => {
             Answer::CreateKey(keyd.create_key(caller, &handle, &binding, now))
         }
-        Call::RotateKey { handle } => Answer::RotateKey(keyd.rotate_key(caller, &handle, now)),
-        Call::RotateKrbtgt { krbtgt, approval } => {
-            Answer::RotateKrbtgt(keyd.rotate_krbtgt(caller, &krbtgt, &approval, now))
+        // A-102 (docs/52 §4.2): the executions name only dird's decision;
+        // keyd runs the registered parameters.
+        Call::RotateKey { decision } => Answer::RotateKey(keyd.rotate_key(caller, decision, now)),
+        Call::RotateKrbtgt { decision } => {
+            Answer::RotateKrbtgt(keyd.rotate_krbtgt(caller, decision, now))
         }
-        Call::RetireKvno { handle, kvno } => {
-            Answer::RetireKvno(keyd.retire_kvno(caller, &handle, kvno, now))
+        Call::RetireKvno { decision } => {
+            Answer::RetireKvno(keyd.retire_kvno(caller, decision, now))
         }
-        Call::DestroyKeySet { handle } => {
-            Answer::DestroyKeySet(keyd.destroy_key_set(caller, &handle, now))
+        Call::DestroyKeySet { decision } => {
+            Answer::DestroyKeySet(keyd.destroy_key_set(caller, decision, now))
         }
         // Q-351 (A-87): the role keyd resolved from the peer uid — the one
         // its capability check just used — travels with the description.
@@ -209,6 +211,25 @@ pub fn execute<S: KeyStore, A: AuditSink, E: EntropySource>(
             lifetime_secs,
             now,
         )),
+        // A-102 (docs/52 §4.2): dird's decision; the lifetime is relative and
+        // keyd adds the daemon's clock (R50-5).
+        Call::RegisterDecision {
+            id,
+            operation,
+            approvers,
+            lifetime_secs,
+        } => Answer::RegisterDecision(keyd.register_decision(
+            caller,
+            id,
+            &operation,
+            &approvers,
+            lifetime_secs,
+            now,
+        )),
+        Call::SealCeremony => Answer::SealCeremony(keyd.seal_ceremony(caller, now)),
+        Call::ListDestroyDecisions { after } => {
+            Answer::ListDestroyDecisions(keyd.list_destroy_decisions(caller, after, now))
+        }
     }
 }
 

@@ -204,7 +204,8 @@ fn strict_decoding() {
 /// Decision A-86 (docs/questions/Q-365): the intent and not-performed
 /// records use keyd's record layout unchanged — the same record with
 /// `result` = `Intent` differs from one with `Success` in exactly the
-/// outcome octet (the last but one: outcome, then reason) — and the first
+/// outcome octet (the third from the end: outcome, reason, then the absent
+/// decision's marker — A-102) — and the first
 /// code past the table (8) is refused (docs/50 §3.3: closed tables).
 #[test]
 fn keyd_phase_codes_change_only_the_outcome_octet() {
@@ -221,8 +222,8 @@ fn keyd_phase_codes_change_only_the_outcome_octet() {
     let (a, b) = (encode(&success), encode(&intent));
     assert_eq!(a.len(), b.len());
     let differing: Vec<usize> = (0..a.len()).filter(|&i| a[i] != b[i]).collect();
-    assert_eq!(differing, [a.len() - 2]);
-    let at = a.len() - 2;
+    assert_eq!(differing, [a.len() - 3]);
+    let at = a.len() - 3;
     assert_eq!(b[at], KeydOutcome::Intent.code());
     let mut other = b.clone();
     other[at] = KeydOutcome::NotPerformed.code();
@@ -264,17 +265,25 @@ fn code_tables_are_closed() {
     use ipc_audit::*;
     assert_eq!(table!(KdcReason), 66);
     // Task A15a appended the four grant reasons before `Unlisted`
-    // (docs/questions/Q-452 item 4).
-    assert_eq!(table!(KeydReason), 70);
+    // (docs/questions/Q-452 item 4); A-102 the seven decision reasons
+    // (docs/52 §4.5), `Unlisted` last (77).
+    assert_eq!(table!(KeydReason), 77);
     assert_eq!(KeydReason::NoGrant.code(), 66);
     assert_eq!(KeydReason::GrantTableFull.code(), 69);
+    assert_eq!(KeydReason::NoDecision.code(), 70);
+    assert_eq!(KeydReason::CeremonySealed.code(), 76);
+    assert_eq!(KeydReason::Unlisted.code(), 77);
     assert_eq!(table!(LdapReason), 53);
     assert_eq!(table!(CodecErrorCode), 35);
     assert_eq!(table!(CodecLimit), 12);
     assert_eq!(table!(PdpReasonCode), 12);
-    // `GrantSetSecret` (17) appended by task A15a; 1-16 keep their codes.
-    assert_eq!(table!(KeydOperation), 17);
+    // `GrantSetSecret` (17) appended by task A15a; `RegisterDecision`,
+    // `SealCeremony`, `ListDestroyDecisions` (18-20) by A-102 (docs/52 §4);
+    // 1-16 keep their codes.
+    assert_eq!(table!(KeydOperation), 20);
     assert_eq!(KeydOperation::GrantSetSecret.code(), 17);
+    assert_eq!(KeydOperation::RegisterDecision.code(), 18);
+    assert_eq!(KeydOperation::ListDestroyDecisions.code(), 20);
     assert_eq!(KeydOperation::Ping.code(), 16);
     table!(KdcTransport);
     table!(KdcExchange);
@@ -414,6 +423,7 @@ fn field_inventory_holds_no_secret() {
         approvers: _,   // principal ids
         result: _,      // code
         reason: _,      // code
+        decision: _,    // decision id (an identifier dird assigned, A-102)
     } = keyd_record();
     let LdapEvent {
         time: _,          // caller time

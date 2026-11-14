@@ -214,15 +214,16 @@ fn list(items: &[String]) -> String {
 ///   certificate and key paths (ldap-front, R50-12).
 /// - auditd: `uid_sources` = every daemon's uid with its source name
 ///   (docs/50 §3.2).
-/// - admind: `keyadm_uid`, `admin_socket_group` (docs/51 §4.6),
-///   `min_password_length` = [`MIN_PASSWORD_LENGTH`] (A-79 / P-24; required
-///   by admind's schema since task A9).
-/// - keyadm: keyd's socket and uid, and admind's (`admin_socket` +
-///   `admind_uid`, the optional pair of crates/config keyadm.rs that the
-///   approved-request commands and the sweep require — A-97 / Q-423 item 2).
+/// - admind: `admin_socket_group` (docs/51 §4.6), `min_password_length` =
+///   [`MIN_PASSWORD_LENGTH`] (A-79 / P-24; required by admind's schema since
+///   task A9). No `keyadm_uid`: admind forwards nothing for keyadm since
+///   A-102 (docs/52 §4.6).
+/// - keyadm: keyd's socket and uid — and nothing else: keyadm talks to keyd
+///   only and runs dird's decisions by id (A-102; docs/51 §6, docs/52 §4.6);
+///   the `admin_socket` + `admind_uid` pair of A-97 is gone.
 ///
 /// Spec: docs/51 §4.3 step 7, §4.6, §6; docs/50 §2.4, §3.1, §3.2, §7.1;
-/// A-60; A-68; A-73; A-97.
+/// A-60; A-68; A-73; A-97; docs/52 §4.6 (A-102).
 #[must_use]
 pub fn domain_configs(input: &DomainInput, node_id: &NodeId) -> Vec<ConfigFile> {
     let a = &input.accounts;
@@ -343,7 +344,6 @@ pub fn domain_configs(input: &DomainInput, node_id: &NodeId) -> Vec<ConfigFile> 
         ("run_as_gid", id(a.admind.gid)),
         ("admin_socket", path(&p.admin_socket)),
         ("admin_socket_group", id(a.admin_socket_group)),
-        ("keyadm_uid", id(a.keyadm_uid)),
         ("min_password_length", MIN_PASSWORD_LENGTH.to_string()),
         ("dird_admin_socket", path(&p.dird_admin_socket)),
         ("dird_uid", id(a.dird.uid)),
@@ -352,17 +352,11 @@ pub fn domain_configs(input: &DomainInput, node_id: &NodeId) -> Vec<ConfigFile> 
         ("audit_socket", path(&p.audit_socket)),
         ("auditd_uid", id(a.auditd.uid)),
     ];
-    // keyadm's admin-channel pair (A-97 / Q-423 item 2): `admin.sock` — the
-    // socket admind's own file names — and admind's uid, which keyadm checks
-    // before it sends `FetchApproved` / `Complete` / `ListPendingDestruction`
-    // (docs/51 §6; docs/50 R50-3). Both are known here; the `rotate-*`,
-    // `retire-kvno` and `destroy-sweep` commands require them.
-    // Spec: docs/51 §6; docs/50 R50-3, §3.1, §3.2; A-97.
+    // keyadm talks to keyd only (A-102; docs/51 §6, docs/52 §4.6): its
+    // socket and the uid keyd must present (docs/50 R50-3).
     let keyadm = vec![
         ("keyd_socket", path(&p.keyd_socket)),
         ("keyd_uid", id(a.keyd.uid)),
-        ("admin_socket", path(&p.admin_socket)),
-        ("admind_uid", id(a.admind.uid)),
     ];
     let file = |daemon, path: &FilePath, lines| ConfigFile {
         daemon,

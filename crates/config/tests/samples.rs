@@ -290,7 +290,6 @@ fn admind_sample_parses() {
     assert_eq!((s.run_as().uid(), s.run_as().gid()), (806, 806));
     assert_eq!(s.admin_socket().as_str(), "/run/admind/admin.sock");
     assert_eq!(s.admin_socket_group(), 810);
-    assert_eq!(s.keyadm_uid(), 807);
     assert_eq!(s.min_password_length(), 14);
     assert_eq!(
         s.dird().socket().as_str(),

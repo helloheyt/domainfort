@@ -5,19 +5,97 @@
 //! None of these returns key material — only the resulting kvno. "There is
 //! no read-key operation — in any role."
 //!
+//! **A-102 (docs/52 R1, R3):** `create_key` exists only in the provisioning
+//! ceremony (before `seal_ceremony`). `rotate_key`, `rotate_krbtgt`,
+//! `retire_kvno` and `destroy_key_set` take **a decision id**, never a
+//! handle, kvno or approval: keyd runs the parameters dird registered
+//! (crate decision.rs), and builds `rotate_krbtgt`'s dual-control token
+//! itself from the decision's approvers ([`DualControlToken`] is private to
+//! this crate — a fabricated token is unrepresentable).
+//!
 //! Spec: docs/10 §7; docs/09 א.7 (D32 current + previous); docs/33 §5
 //! (double krbtgt rotation after compromise, D20), §6.1 (D178);
-//! docs/questions/Q-115 (A-35, `destroy_key_set`).
+//! docs/questions/Q-115 (A-35, `destroy_key_set`); docs/52 §4.2, §4.4;
+//! docs/questions/Q-460, Q-462 item 1 (A-102).
 
-use crate::audit::{AuditReason, AuditSink};
+use crate::audit::{AuditKeyRef, AuditReason, AuditSink};
 use crate::authz::{CallerId, HandleSlot, Operation};
+use crate::decision::Recorded;
 use crate::entropy::EntropySource;
 use crate::error::{Deny, Error, Internal};
 use crate::keyd::{new_random_keys, store_deny, AuditFields, Keyd};
-use crate::model::{DualControlToken, KeyHandle, KeyPurpose, Kvno, PrincipalBinding};
+use crate::model::{KeyHandle, KeyPurpose, Kvno, PrincipalBinding, PrincipalId};
 use crate::store::{KeyStore, KvnoKeys, StoredKeySet};
 use crate::template::check_new_binding;
+use keyd_types::{DecidedOperation, DecisionId};
 use krb_proto::KerberosTime;
+
+/// The dual-control approval `rotate_krbtgt` requires: two approver
+/// identities, **built only inside keyd** from the approvers of a decision
+/// dird registered (A-102, docs/52 §4.2: "`DualControlToken` leaves the
+/// public API and the wire") — dird verified each approver's AP-REQ and
+/// PDP decision (docs/51 §5.6). keyd still checks that the two are
+/// distinct (registration already did).
+///
+/// Spec: docs/10 §7 ("rotate_krbtgt באישור כפול"); docs/43 D175; docs/52
+/// §4.2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DualControlToken {
+    approver_1: PrincipalId,
+    approver_2: PrincipalId,
+}
+
+impl DualControlToken {
+    /// The token of a decision's approvers: the first two (the requester and
+    /// the first approver), or `None` with fewer than two.
+    /// Spec: docs/51 §5.6 (`DualControlToken { approver_1: the requester,
+    /// approver_2: the approver }`).
+    fn of(approvers: &[PrincipalId]) -> Option<DualControlToken> {
+        match approvers {
+            [approver_1, approver_2, ..] => Some(DualControlToken {
+                approver_1: *approver_1,
+                approver_2: *approver_2,
+            }),
+            _ => None,
+        }
+    }
+
+    /// `true` if the two approvers are distinct.
+    /// Spec: docs/10 §7; docs/43 D175.
+    fn has_distinct_approvers(&self) -> bool {
+        self.approver_1 != self.approver_2
+    }
+}
+
+/// The recorded result of a rotation (docs/52 §3.10 (a)).
+fn rotation_recorded(kvno: &Kvno) -> Recorded {
+    Recorded::Kvno(*kvno)
+}
+
+/// A rotation's recorded result, returned again.
+fn rotation_replayed(recorded: Recorded) -> Result<Kvno, Error> {
+    match recorded {
+        Recorded::Kvno(kvno) => Ok(kvno),
+        Recorded::Refused(error) => Err(error),
+        // Cannot happen: a rotation records a kvno (fail closed).
+        Recorded::Done => Err(Error::Denied),
+    }
+}
+
+/// The recorded result of `retire_kvno` / `destroy_key_set`.
+fn unit_recorded(_: &()) -> Recorded {
+    Recorded::Done
+}
+
+/// A unit operation's recorded result, returned again.
+fn unit_replayed(recorded: Recorded) -> Result<(), Error> {
+    match recorded {
+        Recorded::Done => Ok(()),
+        Recorded::Refused(error) => Err(error),
+        // Cannot happen: a unit operation records `Done` (fail closed).
+        Recorded::Kvno(_) => Err(Error::Denied),
+    }
+}
 
 impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// `create_key`: fresh random keys (one per configured enctype) for a
@@ -33,6 +111,9 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// `create_key` from bypassing `rotate_krbtgt`'s dual control, and keeps
     /// the binding immutable), and refused for krbtgt when the store does not
     /// accept critical keys (D178).
+    ///
+    /// **Provisioning only** (A-102, docs/52 R3): after `seal_ceremony` it is
+    /// refused at the authorization step (`CeremonySealed`).
     ///
     /// Spec: docs/10 §7 (`create_key`, "draws a key (gMSA, krbtgt init)");
     /// docs/33 §6.1 (D178); RFC 3961 §3 (random-to-key); RFC 4120 6.2, 7.3;
@@ -79,69 +160,73 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         Ok(kvno)
     }
 
-    /// `rotate_key`: new random keys under the next kvno; the current
-    /// version becomes previous (still usable to decrypt tickets until
-    /// `retire_kvno`), the old previous is dropped and zeroized.
+    /// `rotate_key`: run the `RotateKey` decision `id` dird registered —
+    /// new random keys under the next kvno for the decided key set; the
+    /// current version becomes previous (still usable to decrypt tickets
+    /// until `retire_kvno`), the old previous is dropped and zeroized.
+    /// Returns the new kvno; a second presentation of `id` returns the same
+    /// result without rotating again (crate decision.rs).
     ///
     /// Not for krbtgt — that is `rotate_krbtgt`, under dual control.
     ///
     /// Spec: docs/10 §7 (`rotate_key`: "new; the current goes down to
-    /// previous"), §1; docs/09 D32.
+    /// previous"), §1; docs/09 D32; docs/52 §4.2 (A-102).
     pub fn rotate_key(
         &mut self,
         caller: &CallerId,
-        handle: &KeyHandle,
+        id: DecisionId,
         now: &KerberosTime,
     ) -> Result<Kvno, Error> {
-        let mut fields = AuditFields::for_handle(handle);
-        let result = self
-            .admit(
-                caller,
-                Operation::RotateKey,
-                &[(HandleSlot::Primary, handle)],
-                now,
-            )
-            .and_then(|()| self.rotate_inner(handle, &mut fields));
-        self.emit(caller, Operation::RotateKey, now, &fields, &result);
-        result.map_err(Error::from)
+        self.execute_decision(
+            caller,
+            Operation::RotateKey,
+            id,
+            now,
+            |keyd, operation, _, fields| match operation {
+                DecidedOperation::RotateKey { handle } => keyd.rotate_inner(handle, fields),
+                _ => Err(Deny::denied(AuditReason::DecisionMismatch)),
+            },
+            rotation_recorded,
+            rotation_replayed,
+        )
     }
 
-    /// `rotate_krbtgt`: rotate the krbtgt key set (as `rotate_key`) under
-    /// dual control. The token must name two DISTINCT approvers; keyd checks
-    /// distinctness only — the authenticity of the approvals is verified by
-    /// the admin plane (docs/43 D175), a documented residual.
+    /// `rotate_krbtgt`: run the `RotateKrbtgt` decision `id` — rotate the
+    /// krbtgt key set (as `rotate_key`) under dual control. The
+    /// dual-control token is built **here** from the decision's approvers
+    /// (dird verified each one's AP-REQ and PDP decision); keyd checks that
+    /// the two are distinct.
     ///
     /// Recovery after a suspected compromise is a double rotation followed
-    /// by `retire_kvno` (docs/33 §5, D20).
+    /// by `retire_kvno` (docs/33 §5, D20), each its own decision.
     ///
     /// Spec: docs/10 §7 (`rotate_krbtgt`, "dual approval"); docs/43 D175;
-    /// docs/33 §5, §6.1.
+    /// docs/33 §5, §6.1; docs/51 §5.6; docs/52 §4.2 (A-102).
     pub fn rotate_krbtgt(
         &mut self,
         caller: &CallerId,
-        krbtgt: &KeyHandle,
-        approval: &DualControlToken,
+        id: DecisionId,
         now: &KerberosTime,
     ) -> Result<Kvno, Error> {
-        let mut fields = AuditFields::for_handle(krbtgt);
-        fields.approvers = Some([approval.approver_1, approval.approver_2]);
-        let result = self
-            .admit(
-                caller,
-                Operation::RotateKrbtgt,
-                &[(HandleSlot::Primary, krbtgt)],
-                now,
-            )
-            .and_then(|()| {
-                if approval.has_distinct_approvers() {
-                    Ok(())
-                } else {
-                    Err(Deny::denied(AuditReason::DualControlRejected))
+        self.execute_decision(
+            caller,
+            Operation::RotateKrbtgt,
+            id,
+            now,
+            |keyd, operation, approvers, fields| {
+                let DecidedOperation::RotateKrbtgt { krbtgt } = operation else {
+                    return Err(Deny::denied(AuditReason::DecisionMismatch));
+                };
+                match DualControlToken::of(approvers) {
+                    Some(token) if token.has_distinct_approvers() => {
+                        keyd.rotate_inner(krbtgt, fields)
+                    }
+                    _ => Err(Deny::denied(AuditReason::DualControlRejected)),
                 }
-            })
-            .and_then(|()| self.rotate_inner(krbtgt, &mut fields));
-        self.emit(caller, Operation::RotateKrbtgt, now, &fields, &result);
-        result.map_err(Error::from)
+            },
+            rotation_recorded,
+            rotation_replayed,
+        )
     }
 
     /// Shared rotation body (after authorization).
@@ -168,99 +253,113 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         Ok(next)
     }
 
-    /// `retire_kvno`: remove the retained previous key version from the
+    /// `retire_kvno`: run the `RetireKvno` decision `id` — remove the
+    /// decided retained previous key version from the decided key set's
     /// decryption set. The current version can never be retired.
     ///
     /// Spec: docs/10 §7 (`retire_kvno`: "removes an old kvno from the decrypt
-    /// set"); docs/33 §5 (D20).
+    /// set"); docs/33 §5 (D20); docs/52 §4.2 (A-102).
     pub fn retire_kvno(
         &mut self,
         caller: &CallerId,
-        handle: &KeyHandle,
-        kvno: Kvno,
+        id: DecisionId,
         now: &KerberosTime,
     ) -> Result<(), Error> {
-        let mut fields = AuditFields::for_handle(handle);
-        fields.kvno = Some(kvno);
-        let result = self
-            .admit(
-                caller,
-                Operation::RetireKvno,
-                &[(HandleSlot::Primary, handle)],
-                now,
-            )
-            .and_then(|()| {
-                let set = self
+        self.execute_decision(
+            caller,
+            Operation::RetireKvno,
+            id,
+            now,
+            |keyd, operation, _, _| {
+                let DecidedOperation::RetireKvno { handle, kvno } = operation else {
+                    return Err(Deny::denied(AuditReason::DecisionMismatch));
+                };
+                let set = keyd
                     .store
                     .get_mut(handle)
                     .ok_or(Deny::denied(AuditReason::KeyNotFound))?;
-                if set.current_kvno() == kvno || !set.retire_previous(kvno) {
+                if set.current_kvno() == *kvno || !set.retire_previous(*kvno) {
                     return Err(Deny::denied(AuditReason::KvnoNotRetirable));
                 }
                 Ok(())
-            });
-        self.emit(caller, Operation::RetireKvno, now, &fields, &result);
-        result.map_err(Error::from)
+            },
+            unit_recorded,
+            unit_replayed,
+        )
     }
 
-    /// `destroy_key_set`: remove the whole key set of `handle` — current
-    /// and previous versions — and zeroize it, when the account is deleted.
-    /// Afterwards the handle is unknown to every operation; a later
-    /// `set_secret` on it creates a NEW key set (from `Kvno::INITIAL`, with
-    /// a binding that must pass the creation rules again).
+    /// `destroy_key_set`: run the `DestroyKeySet` decision `id` dird
+    /// registered after it committed the account's deletion — remove every
+    /// key set of the decided principal, its `PrincipalLongterm` and its
+    /// `Service` key set (whichever exist), current and previous versions,
+    /// and zeroize them. `Ok` means: no key set of the principal exists
+    /// afterwards (also when none existed). Afterwards the handles are
+    /// unknown to every operation; a later `set_secret` on one (on a new
+    /// decision) creates a NEW key set (from `Kvno::INITIAL`, with a binding
+    /// that must pass the creation rules again).
     ///
-    /// Purposes: PrincipalLongterm or Service only — a krbtgt key set is
-    /// never destroyed, only rotated (purpose table, and the store refuses
-    /// it too). An unknown handle is the uniform `Denied`.
+    /// A krbtgt key set is never destroyed, only rotated: a destroy decision
+    /// names a principal, and only its `PrincipalLongterm` and `Service`
+    /// handles are touched (the store refuses krbtgt too).
     ///
     /// A live AuthnProof issued for a destroyed PrincipalLongterm key set is
     /// discarded with it: it attests a key that no longer exists, and must
     /// not redeem against a key set later recreated on the same handle. A
     /// live service context opened under a destroyed Service key set
     /// (`open_and_verify_service_ticket`) is discarded likewise, its session
-    /// key zeroized. A live `set_secret` grant for the handle (task A15a) is
-    /// dropped too.
+    /// key zeroized. A live set-secret decision for either handle is dropped
+    /// too.
     ///
-    /// The audit record carries the destroyed current kvno (not secret).
+    /// The audit record carries the destroyed current kvno of each key set
+    /// (not secret).
     ///
     /// Spec: docs/questions/Q-115 (A-35: "an Admin `destroy_key_set`
     /// (zeroize + audit) called on account deletion; never for krbtgt");
-    /// docs/10 §7 (Admin operations), §8 / §12 I4 (tokens), §10, §12 I8.
+    /// docs/10 §7 (Admin operations), §8 / §12 I4 (tokens), §10, §12 I8;
+    /// docs/51 §6, §9; docs/52 §4.2, §4.3 (A-102).
     pub fn destroy_key_set(
         &mut self,
         caller: &CallerId,
-        handle: &KeyHandle,
+        id: DecisionId,
         now: &KerberosTime,
     ) -> Result<(), Error> {
-        let mut fields = AuditFields::for_handle(handle);
-        let result = self.destroy_key_set_inner(caller, handle, now, &mut fields);
-        self.emit(caller, Operation::DestroyKeySet, now, &fields, &result);
-        result.map_err(Error::from)
-    }
-
-    fn destroy_key_set_inner(
-        &mut self,
-        caller: &CallerId,
-        handle: &KeyHandle,
-        now: &KerberosTime,
-        fields: &mut AuditFields,
-    ) -> Internal<()> {
-        self.admit(
+        self.execute_decision(
             caller,
             Operation::DestroyKeySet,
-            &[(HandleSlot::Primary, handle)],
+            id,
             now,
-        )?;
-        let current = self
-            .store
-            .get(handle)
-            .ok_or(Deny::denied(AuditReason::KeyNotFound))?
-            .current_kvno();
-        fields.kvno = Some(current);
+            |keyd, operation, _, fields| {
+                let DecidedOperation::DestroyKeySet { principal } = operation else {
+                    return Err(Deny::denied(AuditReason::DecisionMismatch));
+                };
+                let account = KeyHandle::new(*principal, KeyPurpose::PrincipalLongterm);
+                let service = KeyHandle::new(*principal, KeyPurpose::Service);
+                fields.kvno = keyd.destroy_one(&account)?;
+                let service_kvno = keyd.destroy_one(&service)?;
+                fields.secondary = Some(AuditKeyRef {
+                    principal: *principal,
+                    purpose: KeyPurpose::Service,
+                    kvno: service_kvno,
+                });
+                Ok(())
+            },
+            unit_recorded,
+            unit_replayed,
+        )
+    }
+
+    /// Destroy the key set of `handle` if it exists, with everything bound
+    /// to it (proofs, service contexts, a set-secret decision); its
+    /// destroyed current kvno, or `None` when there was none.
+    /// Spec: docs/10 §7, §8; docs/questions/Q-115 (A-35), Q-450 item 8.
+    fn destroy_one(&mut self, handle: &KeyHandle) -> Internal<Option<Kvno>> {
+        // A live set-secret decision for the destroyed key set goes with it:
+        // the handle is unknown afterwards (docs/questions/Q-450 item 8).
+        self.decisions.discard_secret(handle);
+        let Some(current) = self.store.get(handle).map(StoredKeySet::current_kvno) else {
+            return Ok(None);
+        };
         self.store.destroy(handle).map_err(store_deny)?;
-        // A live set_secret grant for the destroyed key set goes with it: the
-        // handle is unknown afterwards (docs/questions/Q-450 item 8).
-        self.grants.discard(handle);
         match handle.purpose {
             KeyPurpose::PrincipalLongterm => {
                 let principal = handle.principal;
@@ -277,6 +376,6 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             }
             KeyPurpose::Krbtgt => {}
         }
-        Ok(())
+        Ok(Some(current))
     }
 }

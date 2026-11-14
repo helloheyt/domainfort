@@ -125,24 +125,29 @@ impl IpcWorld {
             DEFAULT_DEADLINE,
         )
         .unwrap();
-        // dird's grants (Role::Ldap, after its PDP; task A15a) over the
-        // channel too.
+        // dird's set-secret decisions (Role::Ldap, after its PDP; task A15a,
+        // A-102) over the channel too.
         let mut ldap = KeydClient::new(
             Loopback::new(&server, LDAP_CALLER),
             KEYD_UID,
             DEFAULT_DEADLINE,
         )
         .unwrap();
-        for (handle, who, password, salt) in [
-            (ALICE, alice_name(), ALICE_PASSWORD, ALICE_SALT),
-            (BOB, bob_name(), BOB_PASSWORD, BOB_SALT),
+        for (id, handle, who, password, salt) in [
+            (1, ALICE, alice_name(), ALICE_PASSWORD, ALICE_SALT),
+            (2, BOB, bob_name(), BOB_PASSWORD, BOB_SALT),
         ] {
-            ldap.grant_set_secret(
-                keyd::AccountKind::User,
-                &[keyd::SetSecretTarget {
-                    handle,
-                    binding: PrincipalBinding::new(realm(), who.clone()),
-                }],
+            ldap.register_decision(
+                keyd::DecisionId::new(id),
+                &keyd::DecidedOperation::SetSecret {
+                    kind: keyd::AccountKind::User,
+                    targets: vec![keyd::SetSecretTarget {
+                        handle,
+                        binding: PrincipalBinding::new(realm(), who.clone()),
+                        salt: String::from(salt),
+                    }],
+                },
+                &[],
                 keyd::MAX_SET_SECRET_GRANT_SECS,
             )
             .unwrap();

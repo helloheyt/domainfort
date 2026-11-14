@@ -189,6 +189,7 @@ fn keyd_record_converts() {
             kvno: None,
         }),
         approvers: Some([p(3), p(4)]),
+        decision: Some(keyd::DecisionId::new(0x0123_4567_89AB_CDEF)),
         result: keyd::AuditOutcome::Denied,
         reason: keyd::AuditReason::DualControlRejected,
     };
@@ -206,6 +207,7 @@ fn keyd_record_converts() {
     assert_eq!(wire.approvers, Some([[3; 16], [4; 16]]));
     assert_eq!(wire.result, KeydOutcome::Denied);
     assert_eq!(wire.reason, KeydReason::DualControlRejected);
+    assert_eq!(wire.decision, Some(0x0123_4567_89AB_CDEF));
     round_trip(EventBody::Keyd(Box::new(wire)));
 }
 
@@ -232,6 +234,7 @@ fn keyd_outcomes_never_map_to_a_phase_code() {
             kvno: None,
             secondary: None,
             approvers: None,
+            decision: None,
             result: outcome,
             reason: keyd::AuditReason::None,
         };
@@ -245,7 +248,8 @@ fn keyd_outcomes_never_map_to_a_phase_code() {
 }
 
 /// Task A15a (docs/questions/Q-452 item 4): the four grant reasons map to
-/// their own same-named codes, never `Unlisted`.
+/// their own same-named codes, never `Unlisted`; likewise the seven decision
+/// reasons appended by A-102 (docs/52 §4.5).
 #[test]
 fn keyd_grant_reasons_match() {
     for reason in [
@@ -253,6 +257,13 @@ fn keyd_grant_reasons_match() {
         keyd::AuditReason::GrantMismatch,
         keyd::AuditReason::GrantInvalid,
         keyd::AuditReason::GrantTableFull,
+        keyd::AuditReason::NoDecision,
+        keyd::AuditReason::DecisionMismatch,
+        keyd::AuditReason::DecisionInvalid,
+        keyd::AuditReason::DecisionTableFull,
+        keyd::AuditReason::DecisionConflict,
+        keyd::AuditReason::DecisionReplayed,
+        keyd::AuditReason::CeremonySealed,
     ] {
         let record = keyd::AuditRecord {
             ts: ktime(),
@@ -264,6 +275,7 @@ fn keyd_grant_reasons_match() {
             kvno: None,
             secondary: None,
             approvers: None,
+            decision: None,
             result: keyd::AuditOutcome::Denied,
             reason,
         };
@@ -287,6 +299,7 @@ fn keyd_operations_and_roles_match() {
             kvno: None,
             secondary: None,
             approvers: None,
+            decision: None,
             result: keyd::AuditOutcome::Success,
             reason: keyd::AuditReason::StartupHoldDown,
         };
@@ -310,6 +323,7 @@ fn keyd_operations_and_roles_match() {
             kvno: None,
             secondary: None,
             approvers: None,
+            decision: None,
             result: keyd::AuditOutcome::Unavailable,
             reason: keyd::AuditReason::None,
         };

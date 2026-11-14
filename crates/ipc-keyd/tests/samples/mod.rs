@@ -9,12 +9,15 @@
 //! tests; no vector comes from any other implementation.
 #![allow(dead_code)] // each test binary uses a different subset
 
-use ipc_keyd::{AccountKind, Answer, Call, DescribedConfig, Password, SetSecretTarget, TgsFast};
+use ipc_keyd::{
+    AccountKind, Answer, Call, DecidedOperation, DecisionId, DescribedConfig, DestructionPage,
+    Password, PendingDestruction, SetSecretTarget, TgsFast,
+};
 use keyd_types::{
     ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof, ConfigDescription, CtxId,
-    DualControlToken, EncTypeId, ExchangeId, FastArmor, FastConversation, IssueError, KeyHandle,
-    KeyPurpose, Kvno, PrincipalBinding, PrincipalId, Role, ServiceContext, ServiceCtxId,
-    TgsRepParts, TgsTicketTemplate, TgtContext, TicketPolicy,
+    EncTypeId, ExchangeId, FastArmor, FastConversation, IssueError, KeyHandle, KeyPurpose, Kvno,
+    PrincipalBinding, PrincipalId, Role, ServiceContext, ServiceCtxId, TgsRepParts,
+    TgsTicketTemplate, TgtContext, TicketPolicy,
 };
 use krb_proto::{
     ApOptions, ApReq, Checksum, EncryptedData, FastOptions, KdcOptions, KdcReqBody, KerberosString,
@@ -271,19 +274,19 @@ pub fn calls() -> Vec<Call> {
             handle: service,
             binding: PrincipalBinding::new(realm(), name(3, &["host", "files.example.org"])),
         },
-        Call::RotateKey { handle: service },
+        // A-102 (docs/52 §4.6): the executions carry only dird's decision id.
+        Call::RotateKey {
+            decision: DecisionId::new(1),
+        },
         Call::RotateKrbtgt {
-            krbtgt: KRBTGT,
-            approval: DualControlToken {
-                approver_1: PrincipalId::from_bytes([0x01; 16]),
-                approver_2: PrincipalId::from_bytes([0x02; 16]),
-            },
+            decision: DecisionId::new(u64::MAX),
         },
         Call::RetireKvno {
-            handle: service,
-            kvno: Kvno::new(7),
+            decision: DecisionId::new(0x0102_0304_0506_0708),
         },
-        Call::DestroyKeySet { handle: alice },
+        Call::DestroyKeySet {
+            decision: DecisionId::new(0),
+        },
         Call::DescribeConfig,
         Call::Ping,
         // Task A15a: a user's grant, a computer's (two targets), and the
@@ -291,24 +294,12 @@ pub fn calls() -> Vec<Call> {
         // lifetime).
         Call::GrantSetSecret {
             kind: AccountKind::User,
-            targets: vec![SetSecretTarget {
-                handle: alice,
-                binding: binding(),
-            }],
+            targets: vec![alice_target()],
             lifetime_secs: 30,
         },
         Call::GrantSetSecret {
             kind: AccountKind::Computer,
-            targets: vec![
-                SetSecretTarget {
-                    handle: handle(0xC7, KeyPurpose::PrincipalLongterm),
-                    binding: PrincipalBinding::new(realm(), name(1, &["ws7$"])),
-                },
-                SetSecretTarget {
-                    handle: handle(0xC7, KeyPurpose::Service),
-                    binding: PrincipalBinding::new(realm(), name(3, &["host", "ws7.example.org"])),
-                },
-            ],
+            targets: computer_targets(),
             lifetime_secs: 900,
         },
         Call::GrantSetSecret {
@@ -316,7 +307,123 @@ pub fn calls() -> Vec<Call> {
             targets: Vec::new(),
             lifetime_secs: 0,
         },
+        // A-102 (docs/52 §4.2, §4.6): every decided operation, and the
+        // shapes the codec carries for keyd to judge (no target, no
+        // approver, a kvno 0, a zero lifetime).
+        Call::RegisterDecision {
+            id: DecisionId::new(7),
+            operation: DecidedOperation::SetSecret {
+                kind: AccountKind::User,
+                targets: vec![alice_target()],
+            },
+            approvers: Vec::new(),
+            lifetime_secs: 30,
+        },
+        Call::RegisterDecision {
+            id: DecisionId::new(8),
+            operation: DecidedOperation::SetSecret {
+                kind: AccountKind::Computer,
+                targets: computer_targets(),
+            },
+            approvers: vec![approver(0x0A)],
+            lifetime_secs: 30,
+        },
+        Call::RegisterDecision {
+            id: DecisionId::new(9),
+            operation: DecidedOperation::SetSecret {
+                kind: AccountKind::Computer,
+                targets: Vec::new(),
+            },
+            approvers: Vec::new(),
+            lifetime_secs: 0,
+        },
+        Call::RegisterDecision {
+            id: DecisionId::new(10),
+            operation: DecidedOperation::RotateKrbtgt { krbtgt: KRBTGT },
+            approvers: vec![approver(0x01), approver(0x02)],
+            lifetime_secs: 900,
+        },
+        Call::RegisterDecision {
+            id: DecisionId::new(11),
+            operation: DecidedOperation::RotateKey { handle: service },
+            approvers: vec![approver(0x01), approver(0x02), approver(0x03)],
+            lifetime_secs: 3600,
+        },
+        Call::RegisterDecision {
+            id: DecisionId::new(12),
+            operation: DecidedOperation::RetireKvno {
+                handle: service,
+                kvno: Kvno::new(7),
+            },
+            approvers: vec![approver(0x01), approver(0x02)],
+            lifetime_secs: 900,
+        },
+        Call::RegisterDecision {
+            id: DecisionId::new(u64::MAX),
+            operation: DecidedOperation::RetireKvno {
+                handle: KRBTGT,
+                kvno: Kvno::new(0),
+            },
+            approvers: Vec::new(),
+            lifetime_secs: u32::MAX,
+        },
+        Call::RegisterDecision {
+            id: DecisionId::new(13),
+            operation: DecidedOperation::DestroyKeySet {
+                principal: alice.principal,
+            },
+            approvers: Vec::new(),
+            lifetime_secs: 604_800,
+        },
+        Call::SealCeremony,
+        Call::ListDestroyDecisions { after: None },
+        Call::ListDestroyDecisions {
+            after: Some(DecisionId::new(42)),
+        },
     ]
+}
+
+/// An approver's principal id (made up for these tests).
+pub fn approver(octet: u8) -> PrincipalId {
+    PrincipalId::from_bytes([octet; 16])
+}
+
+/// alice's one key target: handle, binding and salt (N4, A-102).
+pub fn alice_target() -> SetSecretTarget {
+    SetSecretTarget {
+        handle: handle(0xA1, KeyPurpose::PrincipalLongterm),
+        binding: binding(),
+        salt: String::from("EXAMPLE.ORGalice"),
+    }
+}
+
+/// A computer's two key targets (docs/47 §9.1), each with its salt.
+pub fn computer_targets() -> Vec<SetSecretTarget> {
+    vec![
+        SetSecretTarget {
+            handle: handle(0xC7, KeyPurpose::PrincipalLongterm),
+            binding: PrincipalBinding::new(realm(), name(1, &["ws7$"])),
+            salt: String::from("EXAMPLE.ORGhostws7.example.org"),
+        },
+        SetSecretTarget {
+            handle: handle(0xC7, KeyPurpose::Service),
+            binding: PrincipalBinding::new(realm(), name(3, &["host", "ws7.example.org"])),
+            salt: String::from("EXAMPLE.ORGhostws7.example.org"),
+        },
+    ]
+}
+
+/// A page of pending destroy decisions: `count` entries from id `first`.
+pub fn destruction_page(first: u64, count: u64, next: Option<u64>) -> DestructionPage {
+    DestructionPage {
+        entries: (0..count)
+            .map(|i| PendingDestruction {
+                decision: DecisionId::new(first + i),
+                principal: PrincipalId::from_bytes([i as u8; 16]),
+            })
+            .collect(),
+        next: next.map(DecisionId::new),
+    }
 }
 
 pub fn description(s2k: bool) -> ConfigDescription {
@@ -410,6 +517,11 @@ pub fn answers() -> Vec<Answer> {
         Answer::DescribeConfig(Ok(described(false, Role::Kdc))),
         Answer::Ping(Ok(())),
         Answer::GrantSetSecret(Ok(())),
+        Answer::RegisterDecision(Ok(())),
+        Answer::SealCeremony(Ok(())),
+        Answer::ListDestroyDecisions(Ok(destruction_page(1, 0, None))),
+        Answer::ListDestroyDecisions(Ok(destruction_page(5, 3, Some(7)))),
+        Answer::ListDestroyDecisions(Ok(destruction_page(1, 64, Some(64)))),
     ];
     // The caller role of the DescribeConfig reply: every value of the closed
     // table (Q-351, A-87) — the codec carries any role; keyd answers only
@@ -454,6 +566,9 @@ pub fn answers() -> Vec<Answer> {
         answers.push(Answer::DescribeConfig(Err(error)));
         answers.push(Answer::Ping(Err(error)));
         answers.push(Answer::GrantSetSecret(Err(error)));
+        answers.push(Answer::RegisterDecision(Err(error)));
+        answers.push(Answer::SealCeremony(Err(error)));
+        answers.push(Answer::ListDestroyDecisions(Err(error)));
     }
     answers
 }

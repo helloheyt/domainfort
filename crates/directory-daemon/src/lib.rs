@@ -155,8 +155,8 @@ pub mod zones;
 
 pub use admin_listener::admin_refused_peer_count;
 pub use admin_service::{
-    AdminParams, DecisionAckDeadline, DecisionAckDeadlineOutOfRange, GrantFailure,
-    KeydTicketVerifier, NotStarted, TicketVerifier, VerifierFactory, ADMIN_QUEUE_CAPACITY,
+    AdminParams, DecisionAckDeadline, DecisionAckDeadlineOutOfRange, KeydTicketVerifier,
+    NotStarted, RegistrationFailure, TicketVerifier, VerifierFactory, ADMIN_QUEUE_CAPACITY,
     DECISION_ACK_DEADLINE, MAX_ADMIN_CONNECTIONS, MAX_DECISION_ACK_DEADLINE,
     SET_SECRET_GRANT_LIFETIME_SECS,
 };

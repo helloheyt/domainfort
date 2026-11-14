@@ -94,10 +94,6 @@ pub struct DaemonParams {
     pub frame_timeout: Duration,
     /// `min_password_length` (A-79, P-24).
     pub min_password_length: u32,
-    /// `keyadm_uid`: the only peer for which admind forwards the keyadm
-    /// requests (`FetchApproved`, `Complete`, `ListPendingDestruction` —
-    /// docs/51 §6, §7.3; task A10).
-    pub keyadm_uid: u32,
     /// admind's client of dird (dird's uid checked on every connection).
     pub dird: Box<dyn DirdLink>,
     /// admind's client of keyd, Role::Directory (keyd's uid checked on every
@@ -118,7 +114,6 @@ impl fmt::Debug for DaemonParams {
             .field("audit", &self.audit)
             .field("frame_timeout", &self.frame_timeout)
             .field("min_password_length", &self.min_password_length)
-            .field("keyadm_uid", &self.keyadm_uid)
             .field("limits", &self.limits)
             .field("queue_capacity", &self.queue_capacity)
             .finish_non_exhaustive()
@@ -319,7 +314,6 @@ pub async fn serve(params: DaemonParams, control: DaemonControl) -> Result<Stopp
     let context = Arc::new(ServeContext::new(
         params.frame_timeout,
         params.limits,
-        params.keyadm_uid,
         Arc::clone(&gate),
         handle,
     ));

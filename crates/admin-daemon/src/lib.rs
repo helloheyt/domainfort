@@ -17,13 +17,16 @@
 //!   `set_secret` (Role::Directory, ×1 for a user, ×2 for a computer) ⇒
 //!   dird's `CompletePasswordSet` itself, so **the password never reaches
 //!   dird** (docs/51 §7.6, §9; docs/47 §9.2) — crate::worker;
-//! * forwards **keyadm's requests** (`FetchApproved`, `Complete`,
-//!   `ListPendingDestruction` — task A10) **only** when the peer's uid is
-//!   `keyadm_uid`; from any other uid they are refused (`Denied`) and
-//!   recorded (docs/51 §6, §7.3);
+//! * is **not** in keyadm's path (A-102, docs/52 §4.6, §4.8;
+//!   docs/questions/Q-460): keyadm's former requests (`FetchApproved`,
+//!   `Complete`, `ListPendingDestruction`, task A10) and admind's
+//!   `keyadm_uid` forward are gone — their kinds are not in admin.sock's
+//!   closed table, so a frame of one is refused like any unknown kind and
+//!   dird is never asked. keyadm executes, in keyd, the decisions dird
+//!   registered there (N2: admind can no longer shape what keyadm runs);
 //! * sends **its own audit events** to auditd (shape `Admind`): refused
 //!   connections, malformed frames and rate-limited frames as noise, every
-//!   `SetPassword` outcome and every keyadm forward or refusal gating
+//!   `SetPassword` outcome gating
 //!   (docs/51 §5.7 item 3; A-85; task F6) — crate::audit.
 //!
 //! # Start-up (as built)

@@ -101,12 +101,14 @@ fn round_trip_is_canonical_for_every_reply() {
 fn kind_tables_are_as_documented() {
     assert_eq!(KEYD_MAGIC, 0x4B44);
     assert_eq!(KEYD_VERSION, 1);
-    // 0x11 `grant_set_secret` appended by task A15a (docs/questions/Q-450).
-    assert_eq!(request_kind::ALL, (0x01..=0x11).collect::<Vec<u8>>());
+    // 0x11 `grant_set_secret` appended by task A15a (docs/questions/Q-450);
+    // 0x12 `register_decision`, 0x13 `seal_ceremony`, 0x14
+    // `list_destroy_decisions` appended by A-102 (docs/52 §4.6).
+    assert_eq!(request_kind::ALL, (0x01..=0x14).collect::<Vec<u8>>());
     for (request, reply) in request_kind::ALL.iter().zip(reply_kind::ALL) {
         assert_eq!(*reply, 0x80 | request);
     }
-    assert_eq!(&reply_kind::ALL[17..], &[0xF1, 0xF2, 0xF3]);
+    assert_eq!(&reply_kind::ALL[20..], &[0xF1, 0xF2, 0xF3]);
     assert!(!request_kind::ALL.contains(&REFUSED_KIND));
     assert!(!reply_kind::ALL.contains(&REFUSED_KIND));
     let body = request_body(&Call::Ping);
@@ -146,6 +148,9 @@ fn is_refusal(answer: &Answer) -> bool {
             | Answer::RetireKvno(Ok(_))
             | Answer::DestroyKeySet(Ok(_))
             | Answer::GrantSetSecret(Ok(_))
+            | Answer::RegisterDecision(Ok(_))
+            | Answer::SealCeremony(Ok(_))
+            | Answer::ListDestroyDecisions(Ok(_))
             | Answer::DescribeConfig(Ok(_))
             | Answer::Ping(Ok(_))
     )
@@ -546,9 +551,10 @@ fn the_describe_config_reply_is_bounded() {
 /// Task A15a (docs/50 §3.3; docs/questions/Q-450 item 9): the
 /// `grant_set_secret` request is strict and canonical — kind `0x11`, then
 /// the account kind from its closed table (1 User, 2 Computer), the targets
-/// counted up to `MAX_GRANT_TARGETS`, the lifetime; another account-kind
-/// code, a count over the bound, a missing or a trailing octet are refused
-/// `Malformed`, never decoded.
+/// (handle, binding, salt — the salt since A-102, N4) counted up to
+/// `MAX_GRANT_TARGETS`, the lifetime; another account-kind code, a count
+/// over the bound, a missing or a trailing octet are refused `Malformed`,
+/// never decoded.
 #[test]
 fn the_grant_request_is_strict() {
     let computer = samples::calls()
@@ -579,4 +585,124 @@ fn the_grant_request_is_strict() {
     assert_eq!(malformed(&trailing), Some(Refused::Malformed));
     let short = &body[..body.len() - 1];
     assert_eq!(malformed(short), Some(Refused::Malformed));
+}
+
+/// The `Malformed` refusal of a request body, if it is refused that way.
+fn refusal_of(body: &[u8]) -> Option<Refused> {
+    decode_request(body)
+        .err()
+        .and_then(|rejection| rejection.refusal())
+}
+
+/// A-102 (docs/52 §4.2, §4.6): `rotate_key`, `rotate_krbtgt`, `retire_kvno`
+/// and `destroy_key_set` carry **only** the decision id — the envelope, then
+/// eight octets (`u64`, big-endian), nothing else: no handle, kvno or
+/// dual-control token can travel. One octet more or less is `Malformed`.
+#[test]
+fn the_executions_carry_only_a_decision_id() {
+    let id = ipc_keyd::DecisionId::new(0x0102_0304_0506_0708);
+    for (call, kind) in [
+        (Call::RotateKey { decision: id }, request_kind::ROTATE_KEY),
+        (
+            Call::RotateKrbtgt { decision: id },
+            request_kind::ROTATE_KRBTGT,
+        ),
+        (Call::RetireKvno { decision: id }, request_kind::RETIRE_KVNO),
+        (
+            Call::DestroyKeySet { decision: id },
+            request_kind::DESTROY_KEY_SET,
+        ),
+    ] {
+        let body = request_body(&call);
+        let mut expected = vec![0x4B, 0x44, 0x01, kind];
+        expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_be_bytes());
+        assert_eq!(body, expected, "{:?}", call.operation());
+        let decoded = decode_request(&body).expect("decodes");
+        assert_eq!(decoded.decision(), Some(id));
+        let mut long = body.clone();
+        long.push(0);
+        assert_eq!(refusal_of(&long), Some(Refused::Malformed));
+        assert_eq!(
+            refusal_of(&body[..body.len() - 1]),
+            Some(Refused::Malformed)
+        );
+    }
+    assert_eq!(Call::SealCeremony.decision(), None);
+}
+
+/// A-102 (docs/52 §4.6; docs/50 §3.3 — closed tables, bounded counts): the
+/// `register_decision` request is strict — the decided operation's code is
+/// one of 1-5 (another code is `Malformed`), and at most three approvers
+/// are carried (a fourth is `Malformed` before anything is allocated for
+/// it).
+#[test]
+fn the_register_decision_request_is_strict() {
+    let rotate_key = samples::calls()
+        .into_iter()
+        .find(|c| {
+            matches!(
+                c,
+                Call::RegisterDecision {
+                    operation: ipc_keyd::DecidedOperation::RotateKey { .. },
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    let body = request_body(&rotate_key);
+    // Envelope (4) ‖ id (8) ‖ operation code (1) ‖ handle (17) ‖ approver
+    // count (u32) ‖ 3 × 16 ‖ lifetime (u32).
+    assert_eq!(body[3], request_kind::REGISTER_DECISION);
+    assert_eq!(body[12], 0x03, "RotateKey");
+    assert_eq!(body[30..34], 3u32.to_be_bytes());
+    assert_eq!(body.len(), 86);
+    assert!(decode_request(&body).is_ok());
+    for code in [0x00, 0x06, 0xFF] {
+        let mut bad = body.clone();
+        bad[12] = code;
+        assert_eq!(refusal_of(&bad), Some(Refused::Malformed), "code {code:#x}");
+    }
+    let mut four = body.clone();
+    four[30..34].copy_from_slice(&4u32.to_be_bytes());
+    four.splice(82..82, [0x04; 16]);
+    assert_eq!(refusal_of(&four), Some(Refused::Malformed));
+    let mut trailing = body.clone();
+    trailing.push(0);
+    assert_eq!(refusal_of(&trailing), Some(Refused::Malformed));
+    // `list_destroy_decisions`: the envelope and an optional id only.
+    assert_eq!(
+        request_body(&Call::ListDestroyDecisions { after: None }),
+        vec![0x4B, 0x44, 0x01, request_kind::LIST_DESTROY_DECISIONS, 0x00]
+    );
+    assert_eq!(
+        request_body(&Call::SealCeremony),
+        vec![0x4B, 0x44, 0x01, request_kind::SEAL_CEREMONY]
+    );
+}
+
+/// A-102 (docs/52 §4.6; docs/50 §3.3 — "bound before allocation"): a
+/// `list_destroy_decisions` reply carries at most `MAX_DESTROY_PAGE` (64)
+/// entries; a count of 65 is refused before the entries are read.
+#[test]
+fn the_destroy_page_is_bounded() {
+    assert_eq!(ipc_keyd::channel::MAX_DESTROY_PAGE, 64);
+    let full = encode_answer(&Answer::ListDestroyDecisions(Ok(
+        samples::destruction_page(1, 64, Some(64)),
+    )))
+    .expect("64 entries fit");
+    let mut body = full.body().to_vec();
+    assert_eq!(body[3], reply_kind::LIST_DESTROY_DECISIONS);
+    assert_eq!(body[4..8], 64u32.to_be_bytes());
+    body[4..8].copy_from_slice(&65u32.to_be_bytes());
+    let insert_at = 8 + 64 * 24;
+    body.splice(insert_at..insert_at, [0x41; 24]);
+    assert!(matches!(
+        decode_reply::<KeydReply>(KEYD_CHANNEL, &body),
+        Err(ipc::Error::CountOverBound)
+    ));
+    // Writing 65 is refused too: the encoder keeps the same bound.
+    assert!(encode_answer(&Answer::ListDestroyDecisions(Ok(
+        samples::destruction_page(1, 65, None)
+    )))
+    .is_err());
 }

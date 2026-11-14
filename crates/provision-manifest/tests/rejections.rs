@@ -57,13 +57,60 @@ fn an_unknown_key_is_rejected() {
 }
 
 /// docs/50 §7.1 ("missing-required ⇒ refuse"): every manifest key is
-/// required.
+/// required — except the optional `first_admin_salts` (A-102), whose
+/// absence the sample shows.
 #[test]
 fn every_missing_key_is_rejected() {
-    for key in Manifest::KEYS {
+    for key in Manifest::KEYS
+        .iter()
+        .filter(|key| **key != keys::FIRST_ADMIN_SALTS)
+    {
         let err = error(&remove(SAMPLE, key));
         assert_eq!(err.kind(), ErrorKind::MissingKey, "{key}");
         assert_eq!(err.key(), Some(*key));
+    }
+    assert!(Manifest::parse(SAMPLE.as_bytes()).is_ok());
+}
+
+/// docs/52 §2 row 37 (N4: the salt keyadm's grant binds) — strict when
+/// present: one KerberosString per first administrator, separated by
+/// exactly ", "; another count, a broken separator or a non-printable salt
+/// is refused, at its line and key (or, from the builder, its key).
+#[test]
+fn first_admin_salts_are_strict() {
+    let two = format!("{SAMPLE}first_admin_salts = salt-a, salt-b\n");
+    assert!(Manifest::parse(two.as_bytes()).is_ok());
+    for (bad, kind) in [
+        ("salt-a", ErrorKind::InvalidSalt),
+        ("salt-a, salt-b, salt-c", ErrorKind::InvalidSalt),
+        ("salt-a,salt-b", ErrorKind::InvalidList),
+        ("salt-a,  salt-b", ErrorKind::InvalidList),
+        ("salt-a, , salt-b", ErrorKind::InvalidList),
+    ] {
+        let text = format!("{SAMPLE}first_admin_salts = {bad}\n");
+        let err = error(&text);
+        assert_eq!(err.kind(), kind, "{bad:?}");
+        assert_eq!(err.key(), Some(keys::FIRST_ADMIN_SALTS));
+        assert_eq!(err.line(), line_of(&text, keys::FIRST_ADMIN_SALTS));
+    }
+    let built = Manifest::new(&fields()).unwrap();
+    for (salts, kind) in [
+        (vec!["one".to_owned()], ErrorKind::InvalidSalt),
+        (
+            vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
+            ErrorKind::InvalidSalt,
+        ),
+        (
+            vec!["a".to_owned(), "b\u{1}".to_owned()],
+            ErrorKind::InvalidCharacter,
+        ),
+        (
+            vec!["a b".to_owned(), "c".to_owned()],
+            ErrorKind::InvalidList,
+        ),
+    ] {
+        let err = built.with_first_admin_salts(&salts).unwrap_err();
+        assert_eq!(err.kind(), kind, "{salts:?}");
     }
 }
 

@@ -274,6 +274,29 @@ pub(crate) fn first_admin_items(text: &str) -> Result<Vec<&str>, ErrorKind> {
     Ok(items)
 }
 
+/// The items of `first_admin_salts`: 1 ..= [`MAX_FIRST_ADMINS`] non-empty
+/// parts separated by exactly `", "`, each a KerberosString (the salt of
+/// `set_secret` is text, docs/10 §6). The count is checked against the
+/// first administrators by the caller.
+/// Spec: docs/50 §7.1; docs/52 §2 row 37 (N4: the salt is bound); RFC 4120
+/// §5.2.1 (KerberosString).
+pub(crate) fn salt_items(text: &str) -> Result<Vec<&str>, ErrorKind> {
+    let mut items: Vec<&str> = Vec::new();
+    for part in text.split(LIST_SEPARATOR) {
+        if items.len() == MAX_FIRST_ADMINS {
+            return Err(ErrorKind::InvalidSalt);
+        }
+        if part.is_empty() || part.contains([' ', ',']) {
+            return Err(ErrorKind::InvalidList);
+        }
+        if KerberosString::new(part).is_err() {
+            return Err(ErrorKind::InvalidSalt);
+        }
+        items.push(part);
+    }
+    Ok(items)
+}
+
 /// The separator between an object's GUID and its binding, and between a
 /// binding's name type and its components.
 pub(crate) const ENTRY_SEPARATOR: char = ':';

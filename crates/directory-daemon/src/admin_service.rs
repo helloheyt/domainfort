@@ -27,15 +27,28 @@
 //! whole value, so a field added to it later (F3: the caller's role) is
 //! compared too (docs/questions/Q-387 item 2).
 //!
-//! # The set_secret grant (task A15a; docs/51 §5.8 option (b))
+//! # dird's decisions in keyd (task A15a; A-102, docs/52 R1, §4.3)
 //!
-//! keyd refuses admind's `set_secret` (Role::Directory) unless a live,
-//! one-time grant names the key set. After a `BeginPasswordSet` is decided,
-//! acknowledged and committed, dird registers that grant through the same
-//! client (Role::Ldap, `grant_set_secret`) for exactly the key targets its
-//! reply hands admind, live [`SET_SECRET_GRANT_LIFETIME_SECS`]; any failure
-//! answers the `BeginPasswordSet` `Unavailable` (crate admin_engine, step 8a;
-//! docs/questions/Q-453 item 1).
+//! keyd performs no Directory / Admin state change without a decision dird
+//! registered (Role::Ldap, `register_decision`, through
+//! [`TicketVerifier::register_decision`]). dird registers three kinds
+//! (crate admin_engine):
+//!
+//! * after a `BeginPasswordSet` is decided, acknowledged and committed — a
+//!   `SetSecret` decision for exactly the key targets **and salt** its reply
+//!   hands admind ([`secret_decision_of`]), live
+//!   [`SET_SECRET_GRANT_LIFETIME_SECS`]; any failure answers the
+//!   `BeginPasswordSet` `Unavailable` (step 8a; docs/questions/Q-453 item 1);
+//! * at the `Approve` that completes a key request's quorum — the request's
+//!   decision (`RotateKrbtgt` / `RotateKey` / `RetireKvno`, the approvers,
+//!   the request's remaining lifetime), after the step's decision event was
+//!   acknowledged; any failure withdraws the approval and answers
+//!   `Unavailable`;
+//! * after a `Delete` of a user or computer committed — a `DestroyKeySet`
+//!   decision for its tombstone, live `keyd_types::MAX_DESTROY_DECISION_SECS`;
+//!   a failure is noted (`AdminDestroyNotRegistered`) and the `Delete` still
+//!   answers its success: the account is deleted and its key sets are
+//!   unreachable (no object ⇒ no handle, docs/51 §9 — fail closed).
 //!
 //! # The admin service's key set (A-73)
 //!
@@ -64,23 +77,23 @@ use core::fmt;
 use core::time::Duration;
 use directory_admin::{
     CompletePasswordSet, CreateComputer, CreateContainerLike, CreateGroup, CreateUser,
-    KeyAdminOperation, KeyOperation as PepKeyOperation, KeyOperationOutcome as PepKeyOutcome,
-    KeyRef as PepKeyRef, KeyReply, KeyTargets, LookupKey as PepLookupKey, Membership,
-    Operation as PepOperation, PasswordSetOutcome as PepOutcome, ProtectedObjects,
-    RefusalStatus as PepStatus, Reply as PepReply, SetAccountExpires, SetEnabled,
+    KeyAdminOperation, KeyOperation as PepKeyOperation, KeyRef as PepKeyRef, KeyReply, KeyTargets,
+    LookupKey as PepLookupKey, Membership, Operation as PepOperation,
+    PasswordSetOutcome as PepOutcome, ProtectedObjects, RefusalStatus as PepStatus,
+    Reply as PepReply, SetAccountExpires, SetEnabled,
 };
 use directory_pip::{AccountKind as PipKind, DirectoryView};
 use dirstore::NodeId;
 use dtyp::Guid;
 use ipc_audit::AccountExpiresValue;
 use ipc_dird_admin::{
-    AccountExpires, AccountKind, ApprovedKeyOperation, DestructionEntry, DestructionPage, Found,
-    KeyOperation, KeyOperationOutcome, KeyRef, KeyRequestState, KeyTarget, KeyadmRequest,
+    AccountExpires, AccountKind, Found, KeyOperation, KeyRef, KeyRequestState, KeyTarget,
     LookupKey, Operation, PasswordSet, PasswordSetOutcome, RefusalStatus, Reply,
 };
 use kdc::AccountSource;
 use keyd_types::{
-    AccountKind as GrantKind, AuthnError, KeyHandle, ServiceContext, SetSecretTarget,
+    AccountKind as GrantKind, AuthnError, DecidedOperation, DecisionId, KeyHandle, PrincipalId,
+    ServiceContext, SetSecretTarget,
 };
 use krb_proto::Realm;
 use pdp::Dn;
@@ -118,8 +131,10 @@ pub const DECISION_ACK_DEADLINE: Duration = Duration::from_secs(2);
 const MAX_VERIFICATIONS_PER_REQUEST: u32 = 1 + ipc_dird_admin::channel::MAX_APPROVALS;
 
 /// The keyd calls one admin request may make: its AP-REQ verifications plus
-/// the set_secret grant a `BeginPasswordSet` registers after its commit
-/// (task A15a; docs/51 §5.8 option (b)).
+/// the one decision it may register after its commit or its acknowledged
+/// decision event (task A15a; A-102: a `BeginPasswordSet`'s `SetSecret`, an
+/// `Approve`'s key decision — one verification —, a `Delete`'s
+/// `DestroyKeySet`).
 const MAX_KEYD_CALLS_PER_REQUEST: u32 = MAX_VERIFICATIONS_PER_REQUEST + 1;
 
 /// The ceiling of any dird's decision-acknowledgement wait: 4 s.
@@ -129,7 +144,7 @@ const MAX_KEYD_CALLS_PER_REQUEST: u32 = MAX_VERIFICATIONS_PER_REQUEST + 1;
 /// for one request queued behind one other ([`MAX_ADMIN_CONNECTIONS`]
 /// connections, one request in flight on each, docs/51 §7.5): for each,
 /// [`MAX_KEYD_CALLS_PER_REQUEST`] keyd calls (the AP-REQ verifications and
-/// the set_secret grant) at keyd's client deadline
+/// the decision's registration) at keyd's client deadline
 /// ([`ipc_keyd::DEFAULT_DEADLINE`], 2 s, docs/50 §3.6) and one
 /// decision-acknowledgement wait. 2 × (4 × 2 s + 4 s) = 24 s: a longer wait
 /// could let dird decide — and commit — an operation after admind gave up
@@ -206,11 +221,13 @@ impl DecisionAckDeadline {
     }
 }
 
-/// How long a set_secret grant dird registers stays live: keyd's ceiling for
-/// Role::Ldap (`keyd_types::MAX_SET_SECRET_GRANT_SECS`, 30 s). dird registers
-/// it right before it answers `BeginPasswordSet`; admind's two `set_secret`
-/// calls follow at once, each within the keyd client's 2 s deadline.
-/// Spec: docs/51 §5.8 option (b); docs/50 §3.6; docs/questions/Q-450 item 3.
+/// How long a `SetSecret` decision dird registers stays live: keyd's ceiling
+/// for the set-secret family (`keyd_types::MAX_SET_SECRET_GRANT_SECS`,
+/// 30 s). dird registers it right before it answers `BeginPasswordSet`;
+/// admind's two `set_secret` calls follow at once, each within the keyd
+/// client's 2 s deadline.
+/// Spec: docs/51 §5.8 option (b); docs/50 §3.6; docs/questions/Q-450
+/// item 3; docs/52 §4.3 (A-102).
 pub const SET_SECRET_GRANT_LIFETIME_SECS: u32 = keyd_types::MAX_SET_SECRET_GRANT_SECS;
 
 // More than the two keyd deadlines of admind's set_secret calls (docs/50
@@ -220,41 +237,43 @@ const _: () = assert!(
         && SET_SECRET_GRANT_LIFETIME_SECS <= keyd_types::MAX_SET_SECRET_GRANT_SECS
 );
 
-/// Why dird's set_secret grant was not registered (task A15a). Every case
-/// answers the `BeginPasswordSet` `Unavailable`; the class only goes to
-/// dird's log note.
+/// Why a decision dird registers in keyd was not registered (task A15a;
+/// A-102). The class goes to dird's log note (and, for an `Approve`'s
+/// decision, to its `Outcome` event).
 /// Spec: docs/51 §5.8 option (b); docs/questions/Q-367 (A-88, A-90: the
-/// three fates), Q-453 item 1.
+/// three fates), Q-453 item 1; docs/52 §4.3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GrantFailure {
+pub enum RegistrationFailure {
     /// keyd answered and refused it (its own `Denied`, `Unavailable` — a
-    /// full grant table — or `RateLimited`).
+    /// full decision family — or `RateLimited`).
     Refused(keyd_types::Error),
     /// keyd did not register it: nothing was sent, or keyd-daemon refused it
     /// before keyd ran it (A-88), or keyd is not the keyd dird was
     /// configured for.
     NotPerformed,
-    /// Sent, and no usable answer came back: keyd may hold the grant — it
-    /// expires by itself within [`SET_SECRET_GRANT_LIFETIME_SECS`].
+    /// Sent, and no usable answer came back: keyd may hold the decision —
+    /// it expires by itself, and an identical re-registration is accepted
+    /// unchanged.
     OutcomeUnknown,
 }
 
-impl GrantFailure {
+impl RegistrationFailure {
     /// The class number of the log note (docs/50 §8.2: a code, no content).
     #[must_use]
     pub const fn code(self) -> u64 {
         match self {
-            GrantFailure::Refused(_) => 1,
-            GrantFailure::NotPerformed => 2,
-            GrantFailure::OutcomeUnknown => 3,
+            RegistrationFailure::Refused(_) => 1,
+            RegistrationFailure::NotPerformed => 2,
+            RegistrationFailure::OutcomeUnknown => 3,
         }
     }
 }
 
 /// dird's keyd client (Role::Ldap): one AP-REQ's verification — keyd's
 /// `open_and_verify_service_ticket` for the admin service's key set — and
-/// the set_secret grant after a `BeginPasswordSet` (task A15a).
-/// Spec: docs/10 §5ב; docs/51 §5.8 option (b), §7.4 step 1; A-73.
+/// the registration of dird's decisions (task A15a; A-102).
+/// Spec: docs/10 §5ב; docs/51 §5.8 option (b), §7.4 step 1; A-73; docs/52
+/// §4.2, §4.3.
 pub trait TicketVerifier: Send {
     /// Verify `ap_req` (the raw `KRB_AP_REQ` DER admind forwarded) under
     /// `service`. keyd not reachable, not the configured keyd, or in its
@@ -262,16 +281,18 @@ pub trait TicketVerifier: Send {
     /// error is keyd's own answer.
     fn verify(&mut self, service: &KeyHandle, ap_req: &[u8]) -> Result<ServiceContext, AuthnError>;
 
-    /// Register in keyd the one-time grant that lets admind's `set_secret`
-    /// run on exactly `targets` (keyd's `grant_set_secret`, live for
-    /// `lifetime_secs` by keyd's clock).
-    /// Spec: docs/51 §5.8 option (b); docs/questions/Q-291 (A-74), Q-450.
-    fn grant_set_secret(
+    /// Register in keyd dird's decision `id` to run `operation`, approved by
+    /// `approvers`, live for `lifetime_secs` by keyd's clock (keyd's
+    /// `register_decision`, Role::Ldap).
+    /// Spec: docs/52 §4.2, §4.3 (A-102); docs/51 §5.8 option (b);
+    /// docs/questions/Q-291 (A-74), Q-450, Q-460.
+    fn register_decision(
         &mut self,
-        kind: GrantKind,
-        targets: &[SetSecretTarget],
+        id: DecisionId,
+        operation: &DecidedOperation,
+        approvers: &[PrincipalId],
         lifetime_secs: u32,
-    ) -> Result<(), GrantFailure>;
+    ) -> Result<(), RegistrationFailure>;
 }
 
 /// The production verifier: ipc-keyd's client under Role::Ldap with F1's
@@ -340,35 +361,39 @@ where
         self.client.open_and_verify_service_ticket(service, ap_req)
     }
 
-    /// Through `call_with_fate` (A-90): the grant loosens keyd, so whether a
-    /// failed call may still have registered it is told apart.
-    /// Spec: docs/51 §5.8 option (b); docs/questions/Q-367 (A-88), Q-450,
-    /// Q-453 item 1.
-    fn grant_set_secret(
+    /// Through `call_with_fate` (A-90): a decision loosens keyd, so whether
+    /// a failed call may still have registered it is told apart.
+    /// Spec: docs/52 §4.2, §4.3; docs/51 §5.8 option (b);
+    /// docs/questions/Q-367 (A-88), Q-450, Q-453 item 1, Q-460.
+    fn register_decision(
         &mut self,
-        kind: GrantKind,
-        targets: &[SetSecretTarget],
+        id: DecisionId,
+        operation: &DecidedOperation,
+        approvers: &[PrincipalId],
         lifetime_secs: u32,
-    ) -> Result<(), GrantFailure> {
+    ) -> Result<(), RegistrationFailure> {
         if !self.keyd_identified() {
-            return Err(GrantFailure::NotPerformed);
+            return Err(RegistrationFailure::NotPerformed);
         }
-        let call = ipc_keyd::Call::GrantSetSecret {
-            kind,
-            targets: targets.to_vec(),
+        let call = ipc_keyd::Call::RegisterDecision {
+            id,
+            operation: operation.clone(),
+            approvers: approvers.to_vec(),
             lifetime_secs,
         };
         match self.client.call_with_fate(&call) {
-            Ok(ipc_keyd::Answer::GrantSetSecret(Ok(()))) => Ok(()),
-            Ok(ipc_keyd::Answer::GrantSetSecret(Err(error))) => Err(GrantFailure::Refused(error)),
+            Ok(ipc_keyd::Answer::RegisterDecision(Ok(()))) => Ok(()),
+            Ok(ipc_keyd::Answer::RegisterDecision(Err(error))) => {
+                Err(RegistrationFailure::Refused(error))
+            }
             // The client checks that a reply answers its call; anything
-            // else cannot arrive — and would say nothing of the grant.
-            Ok(_) => Err(GrantFailure::OutcomeUnknown),
+            // else cannot arrive — and would say nothing of the decision.
+            Ok(_) => Err(RegistrationFailure::OutcomeUnknown),
             Err(failure) => Err(match failure.fate {
                 ipc_keyd::RequestFate::NotSent | ipc_keyd::RequestFate::NotPerformed => {
-                    GrantFailure::NotPerformed
+                    RegistrationFailure::NotPerformed
                 }
-                ipc_keyd::RequestFate::OutcomeUnknown => GrantFailure::OutcomeUnknown,
+                ipc_keyd::RequestFate::OutcomeUnknown => RegistrationFailure::OutcomeUnknown,
             }),
         }
     }
@@ -597,27 +622,6 @@ pub fn key_request_of(operation: &Operation) -> Option<KeyAdminOperation> {
     }
 }
 
-/// The PEP's key-plane request of a keyadm request.
-/// Spec: docs/51 §6, §7.3.
-#[must_use]
-pub fn keyadm_request(request: &KeyadmRequest) -> KeyAdminOperation {
-    match request {
-        KeyadmRequest::FetchApproved { id } => KeyAdminOperation::FetchApproved { id: *id },
-        KeyadmRequest::Complete { id, outcome } => KeyAdminOperation::Complete {
-            id: *id,
-            outcome: match outcome {
-                KeyOperationOutcome::Performed { kvno } => PepKeyOutcome::Performed { kvno: *kvno },
-                KeyOperationOutcome::Refused => PepKeyOutcome::Refused,
-                KeyOperationOutcome::NotPerformed => PepKeyOutcome::NotPerformed,
-                KeyOperationOutcome::OutcomeUnknown => PepKeyOutcome::OutcomeUnknown,
-            },
-        },
-        KeyadmRequest::ListPendingDestruction { cursor } => {
-            KeyAdminOperation::ListPendingDestruction { cursor: *cursor }
-        }
-    }
-}
-
 /// The typed reply of a key-plane step. A count that cannot be one octet
 /// (never: at most two approvals, a quorum of at most three) is answered
 /// `Unavailable`.
@@ -637,29 +641,6 @@ pub fn wire_key_reply(reply: &KeyReply) -> Reply {
                 _ => Reply::Refused(RefusalStatus::Unavailable),
             }
         }
-        KeyReply::Approved(approved) => Reply::Approved(ApprovedKeyOperation {
-            id: approved.id,
-            digest: approved.digest,
-            operation: wire_key_operation(&approved.operation),
-            principal: guid_of(&approved.handle),
-            requester: approved.requester,
-            approvers: approved.approvers.clone(),
-        }),
-        KeyReply::Done => Reply::Done,
-        KeyReply::Page(page) => Reply::PendingDestruction(DestructionPage {
-            entries: page
-                .entries
-                .iter()
-                .map(|e| DestructionEntry {
-                    guid: e.guid,
-                    kind: match e.kind {
-                        PipKind::User => AccountKind::User,
-                        PipKind::Computer => AccountKind::Computer,
-                    },
-                })
-                .collect(),
-            next: page.next,
-        }),
     }
 }
 
@@ -771,13 +752,15 @@ pub fn wire_status(status: PepStatus) -> RefusalStatus {
     }
 }
 
-/// The set_secret grant a committed `BeginPasswordSet` asks keyd for: the
-/// account kind and exactly the key targets — handles and bindings — the
-/// reply hands admind (task A15a). `None` for any other reply.
+/// The `SetSecret` decision a committed `BeginPasswordSet` registers in
+/// keyd: the account kind and exactly the key targets — handles, bindings
+/// **and the salt** — the reply hands admind (task A15a; N4, A-102). `None`
+/// for any other reply.
 /// Spec: docs/51 §5.2 row 5, §5.8 option (b), §7.3; docs/47 §9.1;
-/// docs/questions/Q-450 item 2.
+/// docs/questions/Q-450 item 2; docs/52 §4.2 (`SetSecret { kind, targets:
+/// [(handle, binding, salt)] }`).
 #[must_use]
-pub fn grant_of(reply: &PepReply) -> Option<(GrantKind, Vec<SetSecretTarget>)> {
+pub fn secret_decision_of(reply: &PepReply) -> Option<DecidedOperation> {
     let PepReply::PasswordSet(set) = reply else {
         return None;
     };
@@ -785,15 +768,17 @@ pub fn grant_of(reply: &PepReply) -> Option<(GrantKind, Vec<SetSecretTarget>)> {
         PipKind::User => GrantKind::User,
         PipKind::Computer => GrantKind::Computer,
     };
+    let salt = set.salt.as_str().to_owned();
     let targets = set
         .keys
         .iter()
         .map(|k| SetSecretTarget {
             handle: k.handle,
             binding: k.binding.clone(),
+            salt: salt.clone(),
         })
         .collect();
-    Some((kind, targets))
+    Some(DecidedOperation::SetSecret { kind, targets })
 }
 
 /// The typed reply of the PEP's reply.
@@ -853,9 +838,5 @@ const _: () =
     assert!(ipc_dird_admin::channel::MAX_DN_COMPONENTS as usize == directory_pip::MAX_DN_DEPTH);
 const _: () = assert!(ipc_dird_admin::channel::MAX_APPROVALS as usize == ipc_audit::MAX_APPROVERS);
 const _: () = assert!(ipc_dird_admin::channel::MAX_KVNOS as usize == ipc_audit::MAX_REPORTED_KVNOS);
-const _: () = assert!(
-    ipc_dird_admin::channel::MAX_DESTRUCTION_ENTRIES as usize
-        == directory_admin::MAX_DESTRUCTION_PAGE
-);
 const _: () = assert!(ipc_dird_admin::channel::DIGEST_LEN == directory_admin::DIGEST_LEN);
 const _: () = assert!(directory_admin::MAX_QUORUM <= u8::MAX as usize);

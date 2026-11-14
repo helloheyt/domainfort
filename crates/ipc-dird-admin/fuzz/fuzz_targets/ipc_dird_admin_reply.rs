@@ -9,7 +9,7 @@
 //! Arbitrary bytes → decoder; never a panic, bounded allocation; whatever
 //! decodes re-encodes to exactly the input.
 //!
-//! Task A10 added the replies `KeyRequest`, `Approved`, `PendingDestruction`
+//! Task A10 added the replies `KeyRequest` and (retired by A-102) `Approved`, `PendingDestruction`
 //! (closed tables for their operation, key reference and account kind).
 //!
 //! Spec: docs/51 §6, §7.3, §7.5; docs/50 §3.3, §9; A-59; docs/questions/

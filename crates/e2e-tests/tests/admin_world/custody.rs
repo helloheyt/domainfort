@@ -130,6 +130,13 @@ impl KeyStore for CustodyStore {
         }
     }
 
+    /// docs/52 §4.4 (A-102): a keyd whose store is empty at start is in its
+    /// provisioning ceremony; the later phases' keyds start with the
+    /// carried key sets and so are operational.
+    fn is_empty(&self) -> bool {
+        self.sets.is_empty()
+    }
+
     fn get(&self, handle: &KeyHandle) -> Option<&StoredKeySet> {
         self.sets.get(handle)
     }

@@ -445,8 +445,11 @@ fn every_configuration_parses_with_its_schema() {
     assert_eq!(auditd.uid_sources().len(), 5);
     let admind =
         config::AdmindSettings::parse(text_of(provision::Daemon::Admind).as_bytes()).unwrap();
-    assert_eq!(admind.keyadm_uid(), 61007);
     assert_eq!(admind.admin_socket_group(), 61010);
+    // A-102 (docs/52 §4.6): admind's file names no keyadm uid any more.
+    assert!(!text_of(provision::Daemon::Admind)
+        .lines()
+        .any(|l| l.starts_with("keyadm_uid")));
     // A9 made `min_password_length` required (A-79 / P-24): provisioning
     // emits the floor, 12 (A-92, docs/questions/Q-378 item 3).
     assert_eq!(admind.min_password_length(), 12);
@@ -504,43 +507,27 @@ fn every_configuration_parses_with_its_schema() {
     assert_eq!(m.naming_context_labels(), ["example", "test"]);
 }
 
-/// docs/51 §6; A-97 (Q-423 item 2, follow-up F7): keyadm's file parses back
-/// with keyadm's own schema and carries the admin-channel pair the
-/// approved-request commands and the sweep require — `admin_socket` = the
-/// `admin.sock` admind's own file names, `admind_uid` = admind's uid (the
-/// one keyd maps to Directory and dird admits on its admin channel) —
-/// besides keyd's socket and uid.
+/// docs/51 §6 ("keyadm talks to keyd only"); A-102 (docs/52 §4.6): keyadm's
+/// file parses back with keyadm's own schema and names keyd's socket and uid
+/// — and nothing of admind (the A-97 `admin_socket` + `admind_uid` pair went
+/// with the keyadm channel).
 #[test]
-fn keyadms_configuration_names_admind() {
+fn keyadms_configuration_names_keyd_only() {
     let dir = TempDir::new();
     let input = input(&dir, 61002, 61007);
     let p = plan(&input);
     let text_of = |d: provision::Daemon| p.configs.iter().find(|f| f.daemon == d).unwrap().text();
     let keyadm =
         config::KeyadmSettings::parse(text_of(provision::Daemon::Keyadm).as_bytes()).unwrap();
-    let admind_endpoint = keyadm.admind().expect("admin_socket + admind_uid");
-    assert_eq!(
-        admind_endpoint.socket().as_str(),
-        input.paths.admin_socket.as_str()
-    );
-    assert_eq!(admind_endpoint.uid(), 61006);
     assert_eq!(
         keyadm.keyd().socket().as_str(),
         input.paths.keyd_socket.as_str()
     );
     assert_eq!(keyadm.keyd().uid(), 61001);
-    // The same socket and uid as admind's own file and dird's admin channel.
-    let admind =
-        config::AdmindSettings::parse(text_of(provision::Daemon::Admind).as_bytes()).unwrap();
-    assert_eq!(admind.admin_socket(), admind_endpoint.socket());
-    assert_eq!(admind.run_as().uid(), admind_endpoint.uid());
-    let dird = text_of(provision::Daemon::Dird);
-    assert!(dird.lines().any(|l| l == "admind_uid = 61006"));
     let text = text_of(provision::Daemon::Keyadm);
-    assert!(text
-        .lines()
-        .any(|l| l == format!("admin_socket = {}", input.paths.admin_socket.as_str())));
-    assert!(text.lines().any(|l| l == "admind_uid = 61006"));
+    assert_eq!(text.lines().filter(|l| l.contains(" = ")).count(), 2);
+    assert!(!text.lines().any(|l| l.starts_with("admin_socket")));
+    assert!(!text.lines().any(|l| l.starts_with("admind_uid")));
 }
 
 /// docs/51 §4.3 step 8; A-86: the manifest parses back, and names the
@@ -558,6 +545,35 @@ fn the_manifest_parses_back() {
     );
     assert_eq!(m.first_admins().len(), 2);
     assert_eq!(m.first_admins()[0].sam_account_name(), "alice");
+}
+
+/// docs/52 §2 row 37 (N4, A-102): the manifest carries each first
+/// administrator's salt, and it is exactly what the directory's salt
+/// function gives (`directory_pip::account_salt`, R47-4) — the salt
+/// `first-admin-secret` presents and keyadm's ceremony grant binds.
+#[test]
+fn the_manifest_carries_the_directorys_salts() {
+    let dir = TempDir::new();
+    let p = plan(&input(&dir, 61002, 61007));
+    for admin in p.manifest.first_admins() {
+        let expected = directory_pip::account_salt(
+            p.manifest.realm(),
+            directory_pip::AccountKind::User,
+            admin.sam_account_name(),
+        )
+        .unwrap();
+        assert_eq!(
+            admin.salt(),
+            Some(expected.as_str()),
+            "{}",
+            admin.sam_account_name()
+        );
+    }
+    assert!(p
+        .manifest
+        .encode()
+        .lines()
+        .any(|l| l.starts_with("first_admin_salts = ")));
 }
 
 /// AGENTS.md §6: the plan's debug output never shows the integrity key.

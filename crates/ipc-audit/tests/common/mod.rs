@@ -119,6 +119,7 @@ pub fn keyd_record() -> KeydRecord {
         approvers: None,
         result: KeydOutcome::Success,
         reason: KeydReason::None,
+        decision: None,
     }
 }
 
@@ -138,6 +139,7 @@ pub fn keyd_intent_record() -> KeydRecord {
         approvers: None,
         result: KeydOutcome::Intent,
         reason: KeydReason::None,
+        decision: None,
     }
 }
 
@@ -163,6 +165,7 @@ pub fn largest_keyd_record() -> KeydRecord {
         caller_role: KeydRole::Admin,
         result: KeydOutcome::Denied,
         reason: KeydReason::DualControlRejected,
+        decision: Some(u64::MAX),
         ..keyd_record()
     }
 }

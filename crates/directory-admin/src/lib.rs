@@ -33,12 +33,15 @@
 //!
 //! # Dual-controlled key operations (task A10)
 //!
-//! [`DirectoryAdmin::key_step`] serves `RequestKeyOperation`, `Approve`,
-//! `FetchApproved`, `Complete` and `ListPendingDestruction` over the
-//! pending requests dird holds in memory ([`KeyRequests`]): `PolicyAdmin`
-//! on the policy scope `keys` for the requester and every approver, the
-//! approval bound to the request's operation digest, one fetch per approved
-//! request (module `key_requests`; docs/51 §5.6, §6).
+//! [`DirectoryAdmin::key_step`] serves `RequestKeyOperation` and `Approve`
+//! over the pending requests dird holds in memory ([`KeyRequests`]):
+//! `PolicyAdmin` on the policy scope `keys` for the requester and every
+//! approver, the approval bound to the request's operation digest; the
+//! `Approve` that completes the quorum yields the [`KeyDecision`] dird
+//! registers in keyd (A-102, docs/52 §4.3). keyadm's `FetchApproved`,
+//! `Complete` and `ListPendingDestruction` are retired (docs/52 §4.6);
+//! [`DirectoryAdmin::destruction_target`] names the key sets a committed
+//! `Delete` leaves to destroy (module `key_requests`; docs/51 §5.6, §6).
 //!
 //! # The operations (docs/51 §5.2, §7.3)
 //!
@@ -124,10 +127,9 @@ pub use config::{
 pub use descriptor::{new_object_descriptor, DescriptorError};
 // Dual-controlled key operations (task A10, docs/51 §5.6, §6).
 pub use key_requests::{
-    operation_digest, ApprovedKeyOperation, DestructionEntry, DestructionPage, KeyAdminOperation,
-    KeyOperation, KeyOperationOutcome, KeyRef, KeyReply, KeyRequestView, KeyRequests, KeyStep,
-    KeyTargets, DIGEST_LEN, KEY_POLICY_SCOPE, KEY_REQUEST_LIFETIME, MAX_DESTRUCTION_PAGE,
-    MAX_KEY_REQUEST_LIFETIME, MAX_PENDING_KEY_REQUESTS,
+    operation_digest, KeyAdminOperation, KeyDecision, KeyOperation, KeyRef, KeyReply,
+    KeyRequestView, KeyRequests, KeyStep, KeyTargets, RegistrationOutcome, DIGEST_LEN,
+    KEY_POLICY_SCOPE, KEY_REQUEST_LIFETIME, MAX_KEY_REQUEST_LIFETIME, MAX_PENDING_KEY_REQUESTS,
 };
 // The name and value rules, public for `provision domain` (task A4), which
 // must apply exactly these rules to the names it is given (A-79).

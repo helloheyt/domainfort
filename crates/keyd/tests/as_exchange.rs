@@ -225,7 +225,8 @@ fn preauth_rejects_other_padata_types() {
 #[test]
 fn preauth_superseded_password_denied() {
     let mut f = Fixture::new();
-    f.grant(&ALICE, &alice_binding(), &now()).unwrap();
+    f.grant(&ALICE, &alice_binding(), ALICE_SALT, &now())
+        .unwrap();
     f.keyd
         .set_secret(
             &DIRECTORY,
@@ -529,7 +530,8 @@ fn template_names_bad_template() {
 fn key_change_between_steps_denied() {
     let mut f = Fixture::new();
     let p = proof(&mut f);
-    f.grant(&ALICE, &alice_binding(), &now()).unwrap();
+    f.grant(&ALICE, &alice_binding(), ALICE_SALT, &now())
+        .unwrap();
     f.keyd
         .set_secret(
             &DIRECTORY,

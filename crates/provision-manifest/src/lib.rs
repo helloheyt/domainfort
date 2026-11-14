@@ -30,6 +30,7 @@
 //! | `ldap_service` | `<guid>:NT-SRV-HST:ldap/<dc_fqdn>` | RFC 4120 §6.2.1; docs/10 §5ב |
 //! | `admin_service` | `<guid>:NT-SRV-HST:admind/<dc_fqdn>` | RFC 4120 §6.2.1; A-73 |
 //! | `first_admins` | 2–8 × `<guid>:NT-PRINCIPAL:<sAMAccountName>`, `", "`-separated | docs/47 §9.1; [MS-SAMR] 3.1.1.6; Q-295 |
+//! | `first_admin_salts` (optional) | one salt per first administrator, in `first_admins` order, `", "`-separated | the salt `provision domain` computed with `directory_pip::account_salt` (R47-4) — the one keyadm's ceremony grant binds and `first-admin-secret` presents (A-102, docs/52 N4) |
 //!
 //! A `<guid>` is the lower-case `8-4-4-4-12` form ([MS-DTYP] 2.5.1.1 layout,
 //! field order from [MS-DRSR] 5.16.3.16 — the A-31 route; dtyp's

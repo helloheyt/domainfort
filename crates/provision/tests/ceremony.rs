@@ -163,8 +163,12 @@ fn keyadm_ceremony_completes_with_the_produced_manifest_and_role_map() {
     // keyd runs in-process, as the test's uid.
     let mut client =
         KeydClient::new(connector::new(&daemon.socket), uid, DEFAULT_DEADLINE).unwrap();
-    let report = ceremony::run(&mut client, &manifest);
+    // A-102 (N4): the produced manifest carries every first administrator's
+    // salt, so the ceremony grants them and ends with the seal (R3).
+    assert!(manifest.first_admins().iter().all(|a| a.salt().is_some()));
+    let report = ceremony::run(&mut client, &manifest).unwrap();
     assert!(report.is_complete(), "{report:?}");
+    assert!(report.is_sealed());
     assert_eq!(report.created().len(), 3);
     daemon.stop().unwrap();
 }

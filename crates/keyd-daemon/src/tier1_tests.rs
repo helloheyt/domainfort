@@ -22,8 +22,9 @@ use ipc_keyd::{Answer, Call, KeydReply, Password, KEYD_CHANNEL};
 use ipc_keyd_server::Dispatch;
 use keyd::{
     kerberos_time_seconds, requires_acknowledged_intent, AccountKind, AuthnError, CallerId,
-    DualControlToken, Error, InMemoryKeyStore, KeyHandle, KeyPurpose, Kvno, Operation, OsEntropy,
-    PrincipalBinding, PrincipalId, Role, SetSecretTarget, MAX_SET_SECRET_GRANT_SECS,
+    DecidedOperation, DecisionId, Error, InMemoryKeyStore, KeyHandle, KeyPurpose, Kvno, Operation,
+    OsEntropy, PrincipalBinding, PrincipalId, Role, SetSecretTarget, MAX_INITIAL_SECRET_GRANT_SECS,
+    MAX_SET_SECRET_GRANT_SECS,
 };
 use krb_proto::{KerberosString, KerberosTime, PaData, PrincipalName, Realm};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -291,19 +292,39 @@ fn set_secret() -> Call {
     }
 }
 
-/// The grant dird would register for [`set_secret`]'s key set (task A15a;
-/// keyd refuses Directory's `set_secret` without one), put straight into
-/// the engine's keyd as Role::Ldap at `now`, its record drained — so each
-/// test's window holds only what the test serves.
+/// A user's key target, with the salt its `set_secret` presents (N4,
+/// A-102).
+fn target(octet: u8, name: &str) -> SetSecretTarget {
+    SetSecretTarget {
+        handle: client(octet),
+        binding: binding(name),
+        salt: format!("{REALM}{name}"),
+    }
+}
+
+/// The two approvers of these tests' key-operation decisions (dual control,
+/// docs/51 §5.6).
+fn approvers() -> Vec<PrincipalId> {
+    vec![
+        PrincipalId::from_bytes([0x01; 16]),
+        PrincipalId::from_bytes([0x02; 16]),
+    ]
+}
+
+/// The set-secret decision dird would register for [`set_secret`]'s key
+/// set (task A15a; A-102: keyd refuses Directory's `set_secret` without
+/// one), put straight into the engine's keyd as Role::Ldap at `now`, its
+/// record drained — so each test's window holds only what the test serves.
 fn grant_bob(engine: &mut TestEngine, now: &KerberosTime) {
     let keyd = engine.keyd_mut();
-    keyd.grant_set_secret(
+    keyd.register_decision(
         &LDAP,
-        AccountKind::User,
-        &[SetSecretTarget {
-            handle: client(0xB0),
-            binding: binding("bob"),
-        }],
+        DecisionId::new(1),
+        &DecidedOperation::SetSecret {
+            kind: AccountKind::User,
+            targets: vec![target(0xB0, "bob")],
+        },
+        &[],
         MAX_SET_SECRET_GRANT_SECS,
         now,
     )
@@ -311,22 +332,43 @@ fn grant_bob(engine: &mut TestEngine, now: &KerberosTime) {
     let _ = keyd.audit_sink_mut().take();
 }
 
-/// `grant_set_secret` for one user key target (a loosening: intent first,
-/// task A15a).
+/// The ceremony's `grant_set_secret` for one user key target (Role::Admin,
+/// before the seal; a loosening: intent first, task A15a, A-102).
 fn grant(octet: u8, name: &str) -> Call {
     Call::GrantSetSecret {
         kind: AccountKind::User,
-        targets: vec![SetSecretTarget {
-            handle: client(octet),
-            binding: binding(name),
-        }],
-        lifetime_secs: MAX_SET_SECRET_GRANT_SECS,
+        targets: vec![target(octet, name)],
+        lifetime_secs: MAX_INITIAL_SECRET_GRANT_SECS,
     }
+}
+
+/// dird's `register_decision` (Role::Ldap; a loosening — intent first,
+/// A-102, docs/52 §4.5).
+fn register(id: u64, operation: DecidedOperation, approvers: Vec<PrincipalId>) -> Call {
+    Call::RegisterDecision {
+        id: DecisionId::new(id),
+        operation,
+        approvers,
+        lifetime_secs: 900,
+    }
+}
+
+/// A randomized `Service` key set in the engine's keyd, created straight in
+/// it as the ceremony would (Role::Admin, before the seal), its record
+/// drained.
+fn service_key(engine: &mut TestEngine, octet: u8, now: &KerberosTime) -> KeyHandle {
+    let handle = KeyHandle::new(PrincipalId::from_bytes([octet; 16]), KeyPurpose::Service);
+    let keyd = engine.keyd_mut();
+    keyd.create_key(&ADMIN, &handle, &binding("svc"), now)
+        .unwrap();
+    let _ = keyd.audit_sink_mut().take();
+    handle
 }
 
 /// A gating Directory call that changes no key state (docs/10 §6): a
 /// candidate password for a handle with no key set — keyd's uniform
-/// `Denied`.
+/// `Denied` (since A-102 at the capability table: no role holds
+/// `verify_secret`, docs/52 R4).
 fn verify_secret(octet: u8) -> Call {
     Call::VerifySecret {
         handle: client(octet),
@@ -580,6 +622,9 @@ fn a_gating_operation_commits_its_record_before_the_reply() {
     assert_eq!(records[0].caller_uid, DIRECTORY.uid);
     assert_eq!(records[0].result, KeydOutcome::Denied);
     assert_eq!(records[0].principal, Some([0xA1; 16]));
+    // docs/52 §7 R4, Q-465 (A-102): refused at the capability table — the
+    // Directory role no longer holds `verify_secret`.
+    assert_eq!(records[0].reason, KeydReason::RoleNotPermitted);
 }
 
 /// The intent record of a key-state change as keyd-daemon writes it
@@ -805,40 +850,47 @@ fn issuance_operations_take_no_intent_and_do_not_wait() {
 
 /// The daemon's call classification agrees with keyd's
 /// (`requires_acknowledged_intent`: the key-state calls and, since task
-/// A15a, the grant) for every such call and a sample of the others, and an
-/// intent
-/// carries exactly what keyd's own record carries before keyd resolves
-/// anything: the kvno a `retire_kvno` names, the approvers of a
-/// `rotate_krbtgt`, nothing secret. Spec: docs/10 §6, §7, §10; A-86.
+/// A15a, the grant; since A-102 the decision registration) for every such
+/// call and a sample of the others, and an intent carries exactly what
+/// keyd's own record carries before keyd resolves anything: the kvno and
+/// approvers of a decision being registered, its id, nothing secret. An
+/// **execution** of a decision names only its id: `KeyStateIntent::of` has
+/// no intent for it — the engine builds it from keyd's table
+/// ([`KeyStateIntent::decided`]). Spec: docs/10 §6, §7, §10; A-86; docs/52
+/// §4.5.
 #[test]
 fn key_state_intents_match_keyd_and_carry_no_secret() {
-    let krbtgt = KeyHandle::new(PrincipalId::from_bytes([0x7B; 16]), KeyPurpose::Krbtgt);
-    let approval = DualControlToken {
-        approver_1: PrincipalId::from_bytes([0x01; 16]),
-        approver_2: PrincipalId::from_bytes([0x02; 16]),
-    };
+    let id = DecisionId::new(0x55);
     let calls = [
         set_secret(),
         create_key(0xA1, "alice"),
-        Call::RotateKey {
-            handle: client(0xA1),
-        },
-        Call::RotateKrbtgt { krbtgt, approval },
-        Call::RetireKvno {
-            handle: client(0xA1),
-            kvno: Kvno::new(4),
-        },
-        Call::DestroyKeySet {
-            handle: client(0xA1),
-        },
+        Call::RotateKey { decision: id },
+        Call::RotateKrbtgt { decision: id },
+        Call::RetireKvno { decision: id },
+        Call::DestroyKeySet { decision: id },
         grant(0xA2, "carol"),
+        register(
+            0x55,
+            DecidedOperation::RetireKvno {
+                handle: client(0xA1),
+                kvno: Kvno::new(4),
+            },
+            approvers(),
+        ),
         verify_secret(0xA1),
         verify_preauth(),
         Call::DescribeConfig,
         Call::Ping,
+        Call::SealCeremony,
+        Call::ListDestroyDecisions { after: None },
     ];
     for call in &calls {
         let intent = KeyStateIntent::of(ADMIN, t0(), call);
+        if call.decision().is_some() {
+            assert!(requires_acknowledged_intent(call.operation()));
+            assert!(intent.is_none(), "{:?}", call.operation());
+            continue;
+        }
         assert_eq!(
             intent.is_some(),
             requires_acknowledged_intent(call.operation()),
@@ -850,17 +902,16 @@ fn key_state_intents_match_keyd_and_carry_no_secret() {
         let EventBody::Keyd(record) = intent.event(KeydOutcome::Intent) else {
             panic!("a keyd record");
         };
+        let registration = matches!(call, Call::RegisterDecision { .. });
         assert_eq!(record.result, KeydOutcome::Intent);
         assert_eq!(record.reason, KeydReason::None);
         assert_eq!(record.secondary, None);
-        assert_eq!(
-            record.kvno,
-            matches!(call, Call::RetireKvno { .. }).then_some(4)
-        );
+        assert_eq!(record.kvno, registration.then_some(4));
         assert_eq!(
             record.approvers,
-            matches!(call, Call::RotateKrbtgt { .. }).then_some([[0x01; 16], [0x02; 16]])
+            registration.then_some([[0x01; 16], [0x02; 16]])
         );
+        assert_eq!(record.decision, registration.then_some(0x55));
         let EventBody::Keyd(not_performed) = intent.event(KeydOutcome::NotPerformed) else {
             panic!("a keyd record");
         };
@@ -1086,19 +1137,21 @@ fn the_intent_budget_is_bounded_when_built() {
     }
 }
 
-/// Task A15a (docs/questions/Q-452 items 1, 3): a grant loosens keyd, so the
-/// daemon has its intent acknowledged before keyd registers it (intent,
-/// then keyd's own outcome); the `set_secret` it allows is intent and
-/// outcome as before; a second `set_secret` finds no grant and is refused
-/// at keyd's authorization step — one record (`Denied`, `NoGrant`), no
-/// intent. A grant from Role::Directory is refused the same way.
+/// Task A15a (docs/questions/Q-452 items 1, 3) as amended by A-102 (docs/52
+/// §4.2, §4.4): the ceremony's grant (Role::Admin, before the seal) loosens
+/// keyd, so the daemon has its intent acknowledged before keyd registers it
+/// (intent, then keyd's own outcome); the `set_secret` it allows is intent
+/// and outcome as before; a second `set_secret` finds no grant and is
+/// refused at keyd's authorization step — one record (`Denied`, `NoGrant`),
+/// no intent. A grant from Role::Directory or Role::Ldap (dird registers
+/// decisions instead) is refused the same way.
 #[test]
 fn a_grant_takes_the_intent_path_and_a_set_secret_without_one_does_not() {
     let clock = TestClock::at(t0());
     let (mut engine, gate) = engine(&clock, WindowConfig::DEFAULT, true);
     let auditd = AutoAck::start(&gate);
     assert!(matches!(
-        serve(&mut engine, LDAP, &grant(0xB0, "bob")).0,
+        serve(&mut engine, ADMIN, &grant(0xB0, "bob")).0,
         Ok(Answer::GrantSetSecret(Ok(())))
     ));
     assert!(matches!(
@@ -1113,7 +1166,11 @@ fn a_grant_takes_the_intent_path_and_a_set_secret_without_one_does_not() {
         serve(&mut engine, DIRECTORY, &grant(0xB0, "bob")).0,
         Ok(Answer::GrantSetSecret(Err(Error::Denied)))
     ));
-    let records = auditd.wait_for(6);
+    assert!(matches!(
+        serve(&mut engine, LDAP, &grant(0xB0, "bob")).0,
+        Ok(Answer::GrantSetSecret(Err(Error::Denied)))
+    ));
+    let records = auditd.wait_for(7);
     let phases: Vec<_> = records.iter().map(|r| (r.op, r.result, r.reason)).collect();
     assert_eq!(
         phases,
@@ -1148,49 +1205,58 @@ fn a_grant_takes_the_intent_path_and_a_set_secret_without_one_does_not() {
                 KeydOutcome::Denied,
                 KeydReason::RoleNotPermitted
             ),
+            (
+                KeydOperation::GrantSetSecret,
+                KeydOutcome::Denied,
+                KeydReason::RoleNotPermitted
+            ),
         ]
     );
-    assert_eq!(records[0].caller_role, KeydRole::Ldap);
+    assert_eq!(records[0].caller_role, KeydRole::Admin);
     assert_eq!(records[0].principal, Some([0xB0; 16]));
     assert_eq!(records[4].caller_role, KeydRole::Directory);
+    assert_eq!(records[6].caller_role, KeydRole::Ldap);
     assert_eq!(gate.unrecorded_outcomes(), 0);
 }
 
-/// Task A15a (docs/questions/Q-452 item 2): a computer grant's intent names
-/// its first key target as the record's handle and its second (the Service
-/// key set) as the secondary key — as keyd's own record of it — and no
-/// binding; an unacknowledged grant intent is `NotPerformed` and registers
+/// Task A15a (docs/questions/Q-452 item 2), for dird's set-secret decision
+/// (A-102, docs/52 §4.2): a computer decision's intent names its first key
+/// target as the record's handle and its second (the Service key set) as
+/// the secondary key — as keyd's own record of it — and no binding; an
+/// unacknowledged registration intent is `NotPerformed` and registers
 /// nothing.
 #[test]
-fn a_computer_grant_intent_carries_its_second_target() {
+fn a_computer_decision_intent_carries_its_second_target() {
     let host = KeyHandle::new(PrincipalId::from_bytes([0xC7; 16]), KeyPurpose::Service);
-    let call = Call::GrantSetSecret {
-        kind: AccountKind::Computer,
-        targets: vec![
-            SetSecretTarget {
-                handle: client(0xC7),
-                binding: binding("ws7$"),
-            },
-            SetSecretTarget {
-                handle: host,
-                binding: binding("host-ws7"),
-            },
-        ],
-        lifetime_secs: MAX_SET_SECRET_GRANT_SECS,
-    };
+    let call = register(
+        7,
+        DecidedOperation::SetSecret {
+            kind: AccountKind::Computer,
+            targets: vec![
+                target(0xC7, "ws7$"),
+                SetSecretTarget {
+                    handle: host,
+                    binding: binding("host-ws7"),
+                    salt: String::from("EXAMPLE.ORGhostws7"),
+                },
+            ],
+        },
+        Vec::new(),
+    );
     let intent = KeyStateIntent::of(LDAP, t0(), &call).unwrap();
     let EventBody::Keyd(record) = intent.event(KeydOutcome::Intent) else {
         panic!("a keyd record");
     };
-    assert_eq!(record.op, KeydOperation::GrantSetSecret);
+    assert_eq!(record.op, KeydOperation::RegisterDecision);
     assert_eq!(record.principal, Some([0xC7; 16]));
     assert_eq!(record.purpose, Some(KeyPurposeCode::PrincipalLongterm));
+    assert_eq!(record.decision, Some(7));
     let secondary = record.secondary.unwrap();
     assert_eq!(secondary.principal, [0xC7; 16]);
     assert_eq!(secondary.purpose, KeyPurposeCode::Service);
     assert_eq!(secondary.kvno, None);
 
-    // Not acknowledged in time: Unavailable, NotPerformed, nothing granted.
+    // Not acknowledged in time: Unavailable, NotPerformed, nothing decided.
     let clock = TestClock::at(t0());
     let (mut engine, gate) = engine_with(
         &clock,
@@ -1207,8 +1273,8 @@ fn a_computer_grant_intent_carries_its_second_target() {
     assert_eq!(
         phases,
         [
-            (KeydOperation::GrantSetSecret, KeydOutcome::Intent),
-            (KeydOperation::GrantSetSecret, KeydOutcome::NotPerformed),
+            (KeydOperation::RegisterDecision, KeydOutcome::Intent),
+            (KeydOperation::RegisterDecision, KeydOutcome::NotPerformed),
         ]
     );
     let _auditd = AutoAck::start(&gate);
@@ -1216,10 +1282,240 @@ fn a_computer_grant_intent_carries_its_second_target() {
         handle: client(0xC7),
         binding: binding("ws7$"),
         password: Password::new(Zeroizing::new(String::from("tier-one-test-pass"))),
-        salt: String::from("EXAMPLE.ORGhostws7"),
+        salt: String::from("EXAMPLE.ORGws7$"),
     };
     assert!(matches!(
         serve(&mut engine, DIRECTORY, &ws7).0,
         Ok(Answer::SetSecret(Err(Error::Denied)))
     ));
+}
+
+/// A-102 (docs/52 §4.2, §4.5; Q-460): dird's `register_decision` takes the
+/// intent path — the intent names the decided key set, the decision id and
+/// the approvers **from the request** (the registration is what is being
+/// recorded) — then keyd's own outcome; an unacknowledged registration is
+/// `Unavailable` and registers nothing: the execution it would allow is
+/// then refused at keyd's authorization step (`NoDecision`, one record).
+#[test]
+fn a_decision_registration_takes_the_intent_path() {
+    let clock = TestClock::at(t0());
+    let (mut engine, gate) = engine_with(
+        &clock,
+        WindowConfig::DEFAULT,
+        true,
+        IntentAckBudget::PRODUCTION,
+    );
+    let service = service_key(&mut engine, 0x5E, &t0());
+    let call = register(
+        21,
+        DecidedOperation::RotateKey { handle: service },
+        approvers(),
+    );
+    let (answer, _) = serve_queued(&mut engine, LDAP, &call, long_ago());
+    assert_eq!(answer.err(), Some(Refused::Unavailable));
+    let records = window_records(&gate);
+    let phases: Vec<_> = records.iter().map(|r| (r.op, r.result)).collect();
+    assert_eq!(
+        phases,
+        [
+            (KeydOperation::RegisterDecision, KeydOutcome::Intent),
+            (KeydOperation::RegisterDecision, KeydOutcome::NotPerformed),
+        ]
+    );
+    assert_eq!(records[0].decision, Some(21));
+    assert_eq!(records[0].approvers, Some([[0x01; 16], [0x02; 16]]));
+    assert_eq!(records[0].principal, Some([0x5E; 16]));
+    assert_eq!(records[0].purpose, Some(KeyPurposeCode::Service));
+    assert_eq!(records[0].caller_role, KeydRole::Ldap);
+
+    let auditd = AutoAck::start(&gate);
+    // Nothing was registered: the execution has no decision.
+    assert!(matches!(
+        serve(
+            &mut engine,
+            ADMIN,
+            &Call::RotateKey {
+                decision: DecisionId::new(21)
+            }
+        )
+        .0,
+        Ok(Answer::RotateKey(Err(Error::Denied)))
+    ));
+    // Registered now: intent, then keyd's outcome carrying the id.
+    assert!(matches!(
+        serve(&mut engine, LDAP, &call).0,
+        Ok(Answer::RegisterDecision(Ok(())))
+    ));
+    let acked = auditd.wait_for(5);
+    let phases: Vec<_> = acked[2..]
+        .iter()
+        .map(|r| (r.op, r.result, r.reason))
+        .collect();
+    assert_eq!(
+        phases,
+        [
+            (
+                KeydOperation::RotateKey,
+                KeydOutcome::Denied,
+                KeydReason::NoDecision
+            ),
+            (
+                KeydOperation::RegisterDecision,
+                KeydOutcome::Intent,
+                KeydReason::None
+            ),
+            (
+                KeydOperation::RegisterDecision,
+                KeydOutcome::Success,
+                KeydReason::None
+            ),
+        ]
+    );
+    assert_eq!(acked[4].decision, Some(21));
+    assert_eq!(acked[4].approvers, Some([[0x01; 16], [0x02; 16]]));
+    assert_eq!(gate.unrecorded_outcomes(), 0);
+}
+
+/// A-102 (docs/52 §3.10 (a), §4.2, §4.5): an execution names only its
+/// decision id. For a pending decision the intent record carries the id,
+/// the decided key set and the approvers **from keyd's table**, then keyd's
+/// outcome (kvno 2); presented again, the recorded result is returned — one
+/// record, reason `DecisionReplayed`, no intent and no second rotation; an
+/// unknown id is refused at keyd's authorization step — one record
+/// (`Denied`, `NoDecision`), no intent, no wait.
+#[test]
+fn an_execution_takes_its_intent_from_keyds_table() {
+    let clock = TestClock::at(t0());
+    let (mut engine, gate) = engine(&clock, WindowConfig::DEFAULT, true);
+    let service = service_key(&mut engine, 0x5E, &t0());
+    {
+        let keyd = engine.keyd_mut();
+        keyd.register_decision(
+            &LDAP,
+            DecisionId::new(31),
+            &DecidedOperation::RotateKey { handle: service },
+            &approvers(),
+            900,
+            &t0(),
+        )
+        .unwrap();
+        let _ = keyd.audit_sink_mut().take();
+    }
+    // An unknown id: one record, no intent, no wait (nothing acknowledges
+    // yet).
+    let started = Instant::now();
+    assert!(matches!(
+        serve(
+            &mut engine,
+            ADMIN,
+            &Call::RotateKey {
+                decision: DecisionId::new(999)
+            }
+        )
+        .0,
+        Ok(Answer::RotateKey(Err(Error::Denied)))
+    ));
+    assert!(started.elapsed() < generous().get(), "no wait");
+    let refused = window_records(&gate);
+    assert_eq!(refused.len(), 1);
+    assert_eq!(refused[0].result, KeydOutcome::Denied);
+    assert_eq!(refused[0].reason, KeydReason::NoDecision);
+    assert_eq!(refused[0].decision, Some(999));
+    acknowledge_all(&gate);
+
+    let auditd = AutoAck::start(&gate);
+    let rotate = Call::RotateKey {
+        decision: DecisionId::new(31),
+    };
+    assert!(matches!(
+        serve(&mut engine, ADMIN, &rotate).0,
+        Ok(Answer::RotateKey(Ok(kvno))) if kvno == Kvno::new(2)
+    ));
+    // Presented again: the recorded result, nothing run.
+    assert!(matches!(
+        serve(&mut engine, ADMIN, &rotate).0,
+        Ok(Answer::RotateKey(Ok(kvno))) if kvno == Kvno::new(2)
+    ));
+    let records = auditd.wait_for(3);
+    let phases: Vec<_> = records
+        .iter()
+        .map(|r| (r.op, r.result, r.reason, r.kvno))
+        .collect();
+    assert_eq!(
+        phases,
+        [
+            (
+                KeydOperation::RotateKey,
+                KeydOutcome::Intent,
+                KeydReason::None,
+                None
+            ),
+            (
+                KeydOperation::RotateKey,
+                KeydOutcome::Success,
+                KeydReason::None,
+                Some(2)
+            ),
+            (
+                KeydOperation::RotateKey,
+                KeydOutcome::Success,
+                KeydReason::DecisionReplayed,
+                Some(2)
+            ),
+        ]
+    );
+    for record in &records {
+        assert_eq!(record.decision, Some(31));
+        assert_eq!(record.principal, Some([0x5E; 16]));
+        assert_eq!(record.purpose, Some(KeyPurposeCode::Service));
+        assert_eq!(record.approvers, Some([[0x01; 16], [0x02; 16]]));
+        assert_eq!(record.caller_role, KeydRole::Admin);
+    }
+    assert_eq!(gate.unrecorded_outcomes(), 0);
+}
+
+/// A-102 (docs/52 §4.4, §7 R3; Q-462 item 1): `seal_ceremony` by Admin is
+/// one record (it only makes keyd stricter: no intent); afterwards
+/// `create_key` is refused at keyd's authorization step (`CeremonySealed`)
+/// — one record, no intent, no wait. The seal is Admin's alone.
+#[test]
+fn the_seal_is_one_record_and_ends_create_key_without_an_intent() {
+    let clock = TestClock::at(t0());
+    let (mut engine, gate) = engine(&clock, WindowConfig::DEFAULT, true);
+    let started = Instant::now();
+    assert!(matches!(
+        serve(&mut engine, LDAP, &Call::SealCeremony).0,
+        Ok(Answer::SealCeremony(Err(Error::Denied)))
+    ));
+    assert!(matches!(
+        serve(&mut engine, ADMIN, &Call::SealCeremony).0,
+        Ok(Answer::SealCeremony(Ok(())))
+    ));
+    assert!(matches!(
+        serve(&mut engine, ADMIN, &create_key(0xA1, "alice")).0,
+        Ok(Answer::CreateKey(Err(Error::Denied)))
+    ));
+    assert!(started.elapsed() < generous().get(), "no wait");
+    let records = window_records(&gate);
+    let phases: Vec<_> = records.iter().map(|r| (r.op, r.result, r.reason)).collect();
+    assert_eq!(
+        phases,
+        [
+            (
+                KeydOperation::SealCeremony,
+                KeydOutcome::Denied,
+                KeydReason::RoleNotPermitted
+            ),
+            (
+                KeydOperation::SealCeremony,
+                KeydOutcome::Success,
+                KeydReason::None
+            ),
+            (
+                KeydOperation::CreateKey,
+                KeydOutcome::Denied,
+                KeydReason::CeremonySealed
+            ),
+        ]
+    );
 }

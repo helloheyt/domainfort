@@ -29,11 +29,14 @@ pub enum Role {
     /// The KDC process: AS / TGS issuance. Spec: docs/10 §2.
     Kdc = 0,
     /// The directory process (management plane / SAMR / kpasswd front): set
-    /// and verify secrets. Not the LDAP front, which holds [`Role::Ldap`]
+    /// secrets, each on a decision dird registered (A-102; `verify_secret`
+    /// was removed from it, docs/52 R4). Not the LDAP front, which holds [`Role::Ldap`]
     /// (docs/questions/Q-165 item 3: "not `Directory`, which holds
     /// `set_secret`"). Spec: docs/10 §2.
     Directory = 1,
-    /// Tier-0 key administration. Spec: docs/10 §2, §7.
+    /// Tier-0 key administration: before the seal the ceremony
+    /// (`create_key`, the first administrators' grants); always, only the
+    /// decisions dird registered (A-102). Spec: docs/10 §2, §7; docs/52 §4.
     Admin = 2,
     /// The LDAP front: verifies the AP-REQ of a GSSAPI Bind inside keyd and
     /// receives only non-secret facts — no key, no session key (D29 strict).
@@ -110,12 +113,36 @@ pub enum Operation {
     /// ceremony.
     /// Spec: docs/51 §5.8 (option (b)); docs/questions/Q-291 (A-74: task
     /// A15 before any deployment), Q-450.
+    ///
+    /// Since A-102 (docs/52 R3) this is Role::Admin's **provisioning-only**
+    /// operation ([`provisioning_only`]): keyadm's ceremony grants the first
+    /// administrators' initial secrets before the ceremony is sealed. dird's
+    /// grants are `SetSecret` decisions registered through
+    /// [`Operation::RegisterDecision`].
     GrantSetSecret = 16,
+    /// Register a one-time, operation-bound decision: the only way a
+    /// state-changing operation of Role::Directory or Role::Admin can run
+    /// after the ceremony (docs/52 §4.2). Role::Ldap (dird) only — the PDP
+    /// that owns the decision.
+    /// Spec: docs/52 §4.2, §4.3, §7 R1; docs/questions/Q-460 (A-102).
+    RegisterDecision = 17,
+    /// End the provisioning ceremony: keyd moves from `Provisioning` to
+    /// `Operational`, after which [`provisioning_only`] operations do not
+    /// exist (until the next start of a keyd with an empty store).
+    /// Role::Admin (keyadm's ceremony ends with it).
+    /// Spec: docs/52 §4.4, §7 R3; docs/questions/Q-462 item 1 (A-102).
+    SealCeremony = 18,
+    /// List the pending destroy decisions dird registered (decision id and
+    /// principal id — not secret), one bounded page at a time: what keyadm's
+    /// `destroy-sweep` executes. Role::Admin.
+    /// Spec: docs/52 §4.3, §4.6; docs/51 §6, §9; docs/questions/Q-460
+    /// (A-102).
+    ListDestroyDecisions = 19,
 }
 
 impl Operation {
     /// Every operation, for exhaustive checks. Spec: docs/10 §2.
-    pub const ALL: [Operation; 17] = [
+    pub const ALL: [Operation; 20] = [
         Operation::VerifyPreauth,
         Operation::IssueAsRep,
         Operation::OpenAndVerifyTgt,
@@ -133,6 +160,9 @@ impl Operation {
         Operation::DescribeConfig,
         Operation::Ping,
         Operation::GrantSetSecret,
+        Operation::RegisterDecision,
+        Operation::SealCeremony,
+        Operation::ListDestroyDecisions,
     ];
 }
 
@@ -147,10 +177,15 @@ impl Operation {
 /// operations — in task L6a, `open_and_verify_service_ticket` alone;
 /// `seal_ap_rep` arrives with task L6b, docs/49 §12); docs/50 §3.4
 /// (`DescribeConfig`: roles Kdc and Ldap; `Ping`: every mapped role), §7.5;
-/// docs/51 §5.8 option (b), docs/questions/Q-291 (A-74), Q-450 items 1, 6
-/// (`GrantSetSecret`: Ldap — dird after its PDP — and Admin — keyadm's
-/// ceremony, for the manifest's first administrators only; never
-/// Directory, the role the grant is for).
+/// docs/51 §5.8 option (b), docs/questions/Q-291 (A-74), Q-450 items 1, 6;
+/// docs/52 §3.4, §4, §7 R1, R3, R4 and docs/questions/Q-460, Q-462, Q-465
+/// (A-102): **`RegisterDecision` is Ldap's alone** (dird, the PDP that owns
+/// every decision); `GrantSetSecret` is Admin's alone and exists only before
+/// the seal ([`provisioning_only`]); `VerifySecret` is in **no** row (N3:
+/// no process calls it, and Directory holding it was an AS-bypassing guess
+/// oracle — docs/51 §5.3 option B, rejected); Admin's rotations, retirement
+/// and destruction run only a decision dird registered
+/// ([`requires_decision`]).
 pub const CAPABILITY_TABLE: [(Role, &[Operation]); 4] = [
     (
         Role::Kdc,
@@ -165,14 +200,7 @@ pub const CAPABILITY_TABLE: [(Role, &[Operation]); 4] = [
             Operation::Ping,
         ],
     ),
-    (
-        Role::Directory,
-        &[
-            Operation::SetSecret,
-            Operation::VerifySecret,
-            Operation::Ping,
-        ],
-    ),
+    (Role::Directory, &[Operation::SetSecret, Operation::Ping]),
     (
         Role::Admin,
         &[
@@ -182,6 +210,8 @@ pub const CAPABILITY_TABLE: [(Role, &[Operation]); 4] = [
             Operation::RetireKvno,
             Operation::DestroyKeySet,
             Operation::GrantSetSecret,
+            Operation::SealCeremony,
+            Operation::ListDestroyDecisions,
             Operation::Ping,
         ],
     ),
@@ -189,12 +219,86 @@ pub const CAPABILITY_TABLE: [(Role, &[Operation]); 4] = [
         Role::Ldap,
         &[
             Operation::OpenAndVerifyServiceTicket,
-            Operation::GrantSetSecret,
+            Operation::RegisterDecision,
             Operation::DescribeConfig,
             Operation::Ping,
         ],
     ),
 ];
+
+/// `true` if `op` exists only while keyd is in its provisioning ceremony
+/// (before `seal_ceremony`): `create_key` (the ceremony draws krbtgt and the
+/// two service keys) and Role::Admin's `grant_set_secret` (the first
+/// administrators' initial secrets). After the seal both are refused at the
+/// authorization step (`CeremonySealed`): Admin can then do nothing that is
+/// not a decision dird registered.
+///
+/// The match is exhaustive: a new operation does not compile until it is
+/// decided here.
+///
+/// Spec: docs/52 §3.4 (C4), §4.4, §7 R3; docs/51 §4.3 steps 11-12, §6;
+/// docs/questions/Q-451, Q-462 item 1 (A-102).
+#[must_use]
+pub const fn provisioning_only(op: Operation) -> bool {
+    match op {
+        Operation::CreateKey | Operation::GrantSetSecret => true,
+        Operation::VerifyPreauth
+        | Operation::IssueAsRep
+        | Operation::OpenAndVerifyTgt
+        | Operation::IssueTgsRep
+        | Operation::SetSecret
+        | Operation::VerifySecret
+        | Operation::RotateKey
+        | Operation::RotateKrbtgt
+        | Operation::RetireKvno
+        | Operation::OpenFastArmor
+        | Operation::SealFastError
+        | Operation::DestroyKeySet
+        | Operation::OpenAndVerifyServiceTicket
+        | Operation::DescribeConfig
+        | Operation::Ping
+        | Operation::RegisterDecision
+        | Operation::SealCeremony
+        | Operation::ListDestroyDecisions => false,
+    }
+}
+
+/// `true` if `op` runs only on a live decision dird registered
+/// (`register_decision`): `set_secret` (matched by handle, binding and
+/// salt), and Role::Admin's `rotate_key`, `rotate_krbtgt`, `retire_kvno`
+/// and `destroy_key_set` (named by decision id; keyd runs the **registered**
+/// parameters, never the caller's). No decision ⇒ the uniform `Denied` at
+/// the authorization step (`NoDecision` / `NoGrant`).
+///
+/// The match is exhaustive: a new operation does not compile until it is
+/// decided here.
+///
+/// Spec: docs/52 §3.1 (C1), §4.2, §7 R1; docs/questions/Q-460 (A-102).
+#[must_use]
+pub const fn requires_decision(op: Operation) -> bool {
+    match op {
+        Operation::SetSecret
+        | Operation::RotateKey
+        | Operation::RotateKrbtgt
+        | Operation::RetireKvno
+        | Operation::DestroyKeySet => true,
+        Operation::VerifyPreauth
+        | Operation::IssueAsRep
+        | Operation::OpenAndVerifyTgt
+        | Operation::IssueTgsRep
+        | Operation::VerifySecret
+        | Operation::CreateKey
+        | Operation::OpenFastArmor
+        | Operation::SealFastError
+        | Operation::OpenAndVerifyServiceTicket
+        | Operation::DescribeConfig
+        | Operation::Ping
+        | Operation::GrantSetSecret
+        | Operation::RegisterDecision
+        | Operation::SealCeremony
+        | Operation::ListDestroyDecisions => false,
+    }
+}
 
 /// `true` if the operation is refused during keyd's startup hold-down: for
 /// two `clock_skew_secs` intervals after the start time given to `Keyd::new`
@@ -218,7 +322,11 @@ pub const CAPABILITY_TABLE: [(Role, &[Operation]); 4] = [
 /// interpretation recorded in docs/questions/Q-240 item 1. Nor
 /// `grant_set_secret`: its grant table lives in memory too, but losing it
 /// at a start only makes keyd stricter (a `set_secret` without its grant is
-/// refused), so nothing needs holding (docs/questions/Q-450 item 5).
+/// refused), so nothing needs holding (docs/questions/Q-450 item 5). Nor the
+/// decision operations (`register_decision`, `seal_ceremony`,
+/// `list_destroy_decisions`, A-102): the decision table is lost at a start
+/// like the grant table (stricter); the ceremony state restarts as
+/// `Provisioning` only for an empty store — docs/52 §4.4 (P-17).
 ///
 /// The match is exhaustive: a new operation does not compile until it is
 /// decided here.
@@ -243,7 +351,10 @@ pub const fn startup_hold_down_applies(op: Operation) -> bool {
         | Operation::DestroyKeySet
         | Operation::DescribeConfig
         | Operation::Ping
-        | Operation::GrantSetSecret => false,
+        | Operation::GrantSetSecret
+        | Operation::RegisterDecision
+        | Operation::SealCeremony
+        | Operation::ListDestroyDecisions => false,
     }
 }
 
@@ -298,7 +409,10 @@ pub enum HandleSlot {
 /// - `seal_fast_error` takes no handle: the armor token is its authority
 ///   (docs/48 §2.3), so no slot of it is permitted.
 /// - `describe_config`, `ping` take no handle (docs/50 §3.4: no request
-///   fields), so no slot of them is permitted.
+///   fields), so no slot of them is permitted; nor do `register_decision`
+///   (the purposes of a decided operation are checked through the operation
+///   that will run it — `DecidedOperation::purposes_permitted`),
+///   `seal_ceremony` and `list_destroy_decisions` (A-102).
 /// - `issue_tgs_rep`: Service only. Referral TGTs (Krbtgt in docs/10 §5) are
 ///   cross-realm, which phase 1 does not implement.
 /// - `open_and_verify_service_ticket`: Service only — "only handles of type
@@ -358,6 +472,12 @@ const _: () = {
     assert!(!role_permits(Role::Directory, Operation::RotateKrbtgt));
     assert!(!role_permits(Role::Admin, Operation::VerifyPreauth));
     assert!(!role_permits(Role::Admin, Operation::VerifySecret));
+    // R4 (docs/52 §3.4 N3; docs/questions/Q-465, A-102): no role holds
+    // `verify_secret` — in particular not Directory (admind), for which it
+    // was a second, FAST-bypassing password-guess oracle.
+    assert!(!role_permits(Role::Directory, Operation::VerifySecret));
+    assert!(!role_permits(Role::Kdc, Operation::VerifySecret));
+    assert!(!role_permits(Role::Ldap, Operation::VerifySecret));
     assert!(!purpose_permitted(
         Operation::SetSecret,
         HandleSlot::Primary,
@@ -413,8 +533,8 @@ const _: () = {
     ));
     // Service-ticket verification (docs/questions/Q-165 item 3, A-46):
     // `Ldap` may call open_and_verify_service_ticket and — docs/50 §3.4 —
-    // describe_config and ping, and — docs/51 §5.8 option (b), Q-450 —
-    // grant_set_secret, and nothing else; no other role may call
+    // describe_config and ping, and — docs/52 §4.2, A-102 —
+    // register_decision, and nothing else; no other role may call
     // open_and_verify_service_ticket, and it opens only Service-purpose
     // handles.
     let mut i = 0;
@@ -423,9 +543,9 @@ const _: () = {
         let is_service_ticket = op as u8 == Operation::OpenAndVerifyServiceTicket as u8;
         let is_daemon_support =
             op as u8 == Operation::DescribeConfig as u8 || op as u8 == Operation::Ping as u8;
-        let is_grant = op as u8 == Operation::GrantSetSecret as u8;
+        let is_decision = op as u8 == Operation::RegisterDecision as u8;
         assert!(
-            role_permits(Role::Ldap, op) == (is_service_ticket || is_daemon_support || is_grant)
+            role_permits(Role::Ldap, op) == (is_service_ticket || is_daemon_support || is_decision)
         );
         if is_service_ticket {
             assert!(!role_permits(Role::Kdc, op));
@@ -496,14 +616,44 @@ const _: () = {
     ));
     assert!(!startup_hold_down_applies(Operation::DescribeConfig));
     assert!(!startup_hold_down_applies(Operation::Ping));
-    // The set_secret grant (docs/51 §5.8 option (b); A-74; Q-450): never
-    // the role it is for (Directory), never the KDC; registered by dird
-    // (Ldap) and by keyadm's ceremony (Admin); its targets are a
-    // PrincipalLongterm key set, then a computer's Service key set — never
-    // krbtgt; it is not held after a start (a lost grant table only makes
-    // keyd stricter).
-    assert!(role_permits(Role::Ldap, Operation::GrantSetSecret));
+    // The Admin set_secret grant (docs/51 §5.8 option (b); A-74; Q-450;
+    // A-102): never the role it is for (Directory), never the KDC, and since
+    // A-102 not dird either (dird registers `SetSecret` decisions); keyadm's
+    // ceremony only, before the seal; its targets are a PrincipalLongterm
+    // key set, then a computer's Service key set — never krbtgt; it is not
+    // held after a start (a lost grant table only makes keyd stricter).
+    assert!(!role_permits(Role::Ldap, Operation::GrantSetSecret));
     assert!(role_permits(Role::Admin, Operation::GrantSetSecret));
+    assert!(provisioning_only(Operation::GrantSetSecret));
+    assert!(provisioning_only(Operation::CreateKey));
+    // The decision table (docs/52 §4.2, R1; A-102): only dird (Ldap)
+    // registers a decision; the seal and the destroy listing are Admin's.
+    assert!(role_permits(Role::Ldap, Operation::RegisterDecision));
+    assert!(!role_permits(Role::Kdc, Operation::RegisterDecision));
+    assert!(!role_permits(Role::Directory, Operation::RegisterDecision));
+    assert!(!role_permits(Role::Admin, Operation::RegisterDecision));
+    assert!(role_permits(Role::Admin, Operation::SealCeremony));
+    assert!(role_permits(Role::Admin, Operation::ListDestroyDecisions));
+    assert!(!startup_hold_down_applies(Operation::RegisterDecision));
+    assert!(!startup_hold_down_applies(Operation::SealCeremony));
+    assert!(!startup_hold_down_applies(Operation::ListDestroyDecisions));
+    // C1 closed by construction (docs/52 §3.1, A-102): every operation
+    // Directory or Admin may call either runs only on a dird decision, or
+    // exists only before the seal, or is one of the three that change no
+    // key state and loosen nothing (ping, the seal, the destroy listing).
+    // keyd's state_change.rs pins the same against `changes_key_state` /
+    // `loosens_authorization`.
+    let mut c = 0;
+    while c < Operation::ALL.len() {
+        let op = Operation::ALL[c];
+        if role_permits(Role::Directory, op) || role_permits(Role::Admin, op) {
+            let harmless = op as u8 == Operation::Ping as u8
+                || op as u8 == Operation::SealCeremony as u8
+                || op as u8 == Operation::ListDestroyDecisions as u8;
+            assert!(requires_decision(op) || provisioning_only(op) || harmless);
+        }
+        c += 1;
+    }
     assert!(!role_permits(Role::Directory, Operation::GrantSetSecret));
     assert!(!role_permits(Role::Kdc, Operation::GrantSetSecret));
     assert!(!startup_hold_down_applies(Operation::GrantSetSecret));
@@ -589,7 +739,10 @@ mod tests {
     /// `DescribeConfig` — Kdc and Ldap; `Ping` — every mapped role. The
     /// set_secret grant, which touches no key either, is registered by
     /// dird after its PDP (Ldap) and by keyadm's ceremony for the first
-    /// administrators (Admin) — docs/51 §5.8 option (b), Q-450 items 1, 6.
+    /// administrators (Admin) — docs/51 §5.8 option (b), Q-450 items 1, 6;
+    /// since A-102 the grant is Admin's alone and dird registers decisions
+    /// (`RegisterDecision`, Ldap alone). `VerifySecret` has **no** role
+    /// (docs/52 R4, Q-465).
     #[test]
     fn each_key_operation_has_exactly_one_role() {
         for op in Operation::ALL {
@@ -601,7 +754,7 @@ mod tests {
             match op {
                 Operation::DescribeConfig => assert_eq!(roles, [Role::Kdc, Role::Ldap]),
                 Operation::Ping => assert_eq!(roles, ROLES),
-                Operation::GrantSetSecret => assert_eq!(roles, [Role::Admin, Role::Ldap]),
+                Operation::VerifySecret => assert!(roles.is_empty()),
                 _ => assert_eq!(roles.len(), 1, "{op:?}"),
             }
         }
@@ -609,15 +762,15 @@ mod tests {
 
     /// RFC 4120 3.2.3 / docs/50 R50-6, §3.5: exactly the operations of the
     /// Kerberos exchanges (roles Kdc and Ldap, except the daemon-support
-    /// operations — Q-240 item 1 — and the set_secret grant — Q-450 item 5)
-    /// are held after start.
+    /// operations — Q-240 item 1 — and the decision registration — Q-450
+    /// item 5, A-102) are held after start.
     #[test]
     fn hold_down_covers_exactly_the_kerberos_operations() {
         for op in Operation::ALL {
             let kerberos = (role_permits(Role::Kdc, op) || role_permits(Role::Ldap, op))
                 && !matches!(
                     op,
-                    Operation::DescribeConfig | Operation::Ping | Operation::GrantSetSecret
+                    Operation::DescribeConfig | Operation::Ping | Operation::RegisterDecision
                 );
             assert_eq!(startup_hold_down_applies(op), kerberos, "{op:?}");
         }

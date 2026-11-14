@@ -38,11 +38,12 @@
 //!    committed is counted into the window's next `WindowSummary`
 //!    (`unrecorded_outcomes`, A-88) and noted on stderr.
 //!
-//!    8a. **The set_secret grant** (task A15a; docs/51 §5.8 option (b)) —
-//!    only for a committed `BeginPasswordSet`: keyd (Role::Ldap)
-//!    `grant_set_secret` for exactly the key targets of the reply, live for
-//!    [`SET_SECRET_GRANT_LIFETIME_SECS`]. Its place is the last before the
-//!    reply, so that a grant exists only once the PDP's decision is
+//!    8a. **The `SetSecret` decision** (task A15a; docs/51 §5.8 option
+//!    (b); A-102) — only for a committed `BeginPasswordSet`: keyd
+//!    (Role::Ldap) `register_decision` of exactly the key targets and salt
+//!    of the reply, live for [`SET_SECRET_GRANT_LIFETIME_SECS`]. Its place
+//!    is the last before the reply, so that a grant exists only once the
+//!    PDP's decision is
 //!    acknowledged by auditd (step 5), `pwdLastSet` is committed (step 7 —
 //!    docs/47 §9.2: before any `set_secret`, so a password can never be set
 //!    with the old tickets still valid, even by a compromised admind racing
@@ -55,6 +56,19 @@
 //!    event stays `Committed` — the write did commit; keyd's own records of
 //!    the grant (intent and outcome, A-88) and admind's event say the rest
 //!    (docs/questions/Q-453 item 1).
+//!
+//!    8b. **The `DestroyKeySet` decision** (A-102, docs/52 §4.3 row
+//!    `destroy_key_set` option (a)) — only for a committed `Delete` whose
+//!    tombstone is of the `user` class (users and computers): keyd
+//!    `register_decision(operation id, DestroyKeySet { the tombstone's
+//!    GUID }, no approvers, keyd_types::MAX_DESTROY_DECISION_SECS)`, after
+//!    the outcome event, so a destroy decision exists only for an account
+//!    whose deletion is durably recorded and committed. keyadm's
+//!    `destroy-sweep` executes it in keyd. A failure is noted
+//!    (`AdminDestroyNotRegistered`) and the reply stays the `Delete`'s
+//!    success: the account is deleted, and its key sets are unreachable (no
+//!    object ⇒ no handle — docs/51 §9, fail closed); a re-registration path
+//!    is docs/questions/Q-470.
 //! 9. **Reply.**
 //!
 //! An operation that commits nothing (`Lookup`, `CompletePasswordSet`) has
@@ -66,20 +80,31 @@
 //!
 //! # The key-plane steps (task A10; docs/51 §5.6, §6)
 //!
-//! `RequestKeyOperation`, `Approve` (each with exactly one AP-REQ — the
-//! requester's, the approver's) and keyadm's `FetchApproved`, `Complete`,
-//! `ListPendingDestruction` (no AP-REQ: admind forwards them only from
-//! `keyadm_uid`) act on the pending requests this thread holds **in
-//! memory** (`directory_admin::KeyRequests`; a dird restart drops them):
-//! 0. `now`; the audit slots — two for `Complete` (its decision, keyd's
-//!    outcome as reported), one otherwise — all or none, auditd reachable;
-//! 1. the AP-REQ through keyd, for a step that carries one;
+//! `RequestKeyOperation` and `Approve` (each with exactly one AP-REQ — the
+//! requester's, the approver's) act on the pending requests this thread
+//! holds **in memory** (`directory_admin::KeyRequests`; a dird restart
+//! drops them). keyadm's former `FetchApproved`, `Complete`,
+//! `ListPendingDestruction` are retired (A-102, docs/52 §4.6, §4.8):
+//! 0. `now`; the audit slots — two for `Approve` (its decision and the
+//!    outcome of its decision's registration), one for
+//!    `RequestKeyOperation` — all or none, auditd reachable;
+//! 1. the AP-REQ through keyd;
 //! 2. one view (no `WriteTxn`: nothing of the directory is written);
 //! 3. `DirectoryAdmin::key_step` — the Subject, `PolicyAdmin` on the `keys`
 //!    scope, the obligations honoured before the table changes, the step;
-//! 4. its events committed into the reserved slots before the reply (they
-//!    commit nothing to the directory: no acknowledgement wait — Q-340
-//!    item 1, the LDAP rule).
+//! 4. its decision event committed into the first slot before the reply
+//!    (it commits nothing to the directory: no acknowledgement wait —
+//!    Q-340 item 1, the LDAP rule) — **except** for the `Approve` that
+//!    completed the quorum (A-102, docs/52 §4.3): its decision event is
+//!    **acknowledged** by auditd first (no loosening of keyd without the
+//!    decision durably recorded — A-85, Q-453 item 1), then the decision is
+//!    registered in keyd (`register_decision`, Role::Ldap,
+//!    `call_with_fate`), then the registration's `Outcome` event goes into
+//!    the second slot. No acknowledgement in time, or any registration
+//!    failure ⇒ the approval is **withdrawn** (`KeyRequests::withdraw`: the
+//!    approver may approve again; keyd accepts an identical decision again
+//!    unchanged) and the answer is `Unavailable`. An `Approve` that does not
+//!    complete the quorum releases the second slot.
 //!
 //! # The three events the PEP does not plan
 //!
@@ -99,8 +124,8 @@
 //! Q-388; A-88 (Q-366, Q-395); A-91 (Q-397); docs/11 §2, §8.
 
 use crate::admin_service::{
-    grant_of, key_request_of, keyadm_request, pep_operation, wire_key_reply, wire_reply,
-    wire_status, TicketVerifier, SET_SECRET_GRANT_LIFETIME_SECS,
+    key_request_of, pep_operation, secret_decision_of, wire_key_reply, wire_reply, wire_status,
+    RegistrationFailure, TicketVerifier, SET_SECRET_GRANT_LIFETIME_SECS,
 };
 use crate::clock::SharedClock;
 use crate::engine::{EngineError, EngineThread, OnExit, SubmitError};
@@ -109,8 +134,9 @@ use crate::log::{note, Note, Thinned};
 use crate::rate::ObligationLimiter;
 use core::time::Duration;
 use directory_admin::{
-    DirectoryAdmin, KeyAdminOperation, KeyRequests, Operation as PepOperation, OsRandom, Prepared,
-    Request as PepRequest, VerificationFailure, VerifiedTicket,
+    DirectoryAdmin, KeyAdminOperation, KeyDecision, KeyRequests, KeyStep,
+    Operation as PepOperation, OsRandom, Prepared, RegistrationOutcome, Request as PepRequest,
+    VerificationFailure, VerifiedTicket,
 };
 use directory_pip::{DirectoryContext, TierMap};
 use dirstore::{Store, WriteTxn};
@@ -118,8 +144,8 @@ use ipc_audit::{
     AdminFailure, AdminRefusal, DecisionResult, DirAdminEvent, DirAdminStage, OutcomeResult,
     Reservation,
 };
-use ipc_dird_admin::{Auth, KeyadmRequest, Operation, RefusalStatus, Reply};
-use keyd_types::{AuthnError, KeyHandle};
+use ipc_dird_admin::{Auth, Operation, RefusalStatus, Reply};
+use keyd_types::{AuthnError, DecidedOperation, DecisionId, KeyHandle, MAX_DESTROY_DECISION_SECS};
 use krb_proto::KerberosTime;
 use ldap::RateLimiter;
 use pdp::{Constraint, Obligation, PolicySnapshot};
@@ -151,9 +177,6 @@ pub(crate) enum AdminWork {
         /// The operation.
         operation: Operation,
     },
-    /// A keyadm request (no tickets; admind forwards it only from
-    /// `keyadm_uid`, docs/51 §6).
-    Keyadm(KeyadmRequest),
 }
 
 /// One job for the admin thread.
@@ -386,9 +409,8 @@ impl Running {
     /// Spec: docs/51 §5.6, §6, §7.3, §7.4.
     fn handle(&mut self, work: &AdminWork) -> Reply {
         match work {
-            AdminWork::Keyadm(request) => self.handle_key(None, keyadm_request(request)),
             AdminWork::Operation { auth, operation } => match key_request_of(operation) {
-                Some(request) => self.handle_key(Some(auth), request),
+                Some(request) => self.handle_key(auth, request),
                 None => match pep_operation(operation) {
                     Some(operation) => self.handle_directory(auth, operation),
                     // Cannot happen: every other operation maps.
@@ -400,7 +422,7 @@ impl Running {
 
     /// One key-plane step (module documentation, "The key-plane steps").
     /// Spec: docs/51 §5.6, §6, §7.4; A-85; A-89; docs/11 §2.
-    fn handle_key(&mut self, auth: Option<&Auth>, request: KeyAdminOperation) -> Reply {
+    fn handle_key(&mut self, auth: &Auth, request: KeyAdminOperation) -> Reply {
         let Some(now) = self.worker.clock.now() else {
             return Reply::Refused(RefusalStatus::Unavailable);
         };
@@ -414,34 +436,14 @@ impl Running {
         let second = slots.next();
         let operation_id = self.next_id();
 
-        // Step 1: the step's one AP-REQ (keyadm's steps carry none).
-        let ticket = match (request.takes_ticket(), auth) {
-            (false, _) => None,
-            (true, Some(auth)) => match self.verify_one(&auth.requester) {
-                Ok(ticket) => Some(ticket),
-                Err(failure) => {
-                    let refusal = self.worker.admin.refuse_unverified_key(
-                        operation_id,
-                        &request,
-                        failure,
-                        &now,
-                    );
-                    return self.refuse(
-                        first,
-                        second,
-                        refusal.event(),
-                        wire_status(refusal.status()),
-                    );
-                }
-            },
-            // Cannot happen: such a request always arrives with `auth`.
-            (true, None) => {
-                let refusal = self.worker.admin.refuse_unverified_key(
-                    operation_id,
-                    &request,
-                    VerificationFailure::Requester,
-                    &now,
-                );
+        // Step 1: the step's one AP-REQ.
+        let ticket = match self.verify_one(&auth.requester) {
+            Ok(ticket) => ticket,
+            Err(failure) => {
+                let refusal =
+                    self.worker
+                        .admin
+                        .refuse_unverified_key(operation_id, &request, failure, &now);
                 return self.refuse(
                     first,
                     second,
@@ -450,7 +452,7 @@ impl Running {
                 );
             }
         };
-        let approvals_supplied = auth.map_or(0, |a| a.approvals.len());
+        let approvals_supplied = auth.approvals.len();
 
         // Steps 2-3: one view (nothing is written), then the step.
         let store = Arc::clone(&self.worker.store);
@@ -465,7 +467,7 @@ impl Running {
                         &mut worker.key_requests,
                         operation_id,
                         &request,
-                        ticket.as_ref(),
+                        Some(&ticket),
                         approvals_supplied,
                         &view,
                         &worker.policy,
@@ -492,6 +494,10 @@ impl Running {
                 refusal.event(),
                 wire_status(refusal.status()),
             ),
+            // Step 4 (A-102): the Approve that completed the quorum.
+            Some(Ok(step)) if step.decision().is_some() => {
+                self.register_key_decision(&step, first, second)
+            }
             // Step 4: the events into their slots, then the reply.
             Some(Ok(step)) => {
                 let mut slots = [first, second].into_iter();
@@ -513,6 +519,107 @@ impl Running {
                     Reply::Refused(RefusalStatus::Unavailable)
                 }
             }
+        }
+    }
+
+    /// Step 4 of an `Approve` that completed its request's quorum (module
+    /// documentation, "The key-plane steps"): its decision event committed
+    /// and acknowledged ⇒ the decision registered in keyd ⇒ the
+    /// registration's `Outcome` event ⇒ the reply. Any failure withdraws the
+    /// approval and answers `Unavailable`.
+    /// Spec: docs/52 §4.2, §4.3, §4.5 (A-102); docs/51 §5.6, §5.7 item 2;
+    /// A-85; docs/questions/Q-453 item 1, Q-460.
+    fn register_key_decision(
+        &mut self,
+        step: &KeyStep,
+        first: Option<Reservation>,
+        second: Option<Reservation>,
+    ) -> Reply {
+        let Some(decision) = step.decision().cloned() else {
+            // Cannot happen (the caller checked); nothing to register.
+            self.release(first);
+            self.release(second);
+            return Reply::Refused(RefusalStatus::Unavailable);
+        };
+        let Some(event) = step.events().first() else {
+            self.release(first);
+            self.release(second);
+            return self.withdraw(&decision);
+        };
+        let Some(seq) = self.commit(first, event) else {
+            // Cannot happen (the slot was reserved); no answer leaves
+            // unaudited, and keyd was not asked.
+            OUTCOME_UNRECORDED.hit(None);
+            self.release(second);
+            return self.withdraw(&decision);
+        };
+        let deadline = Instant::now() + self.worker.ack_deadline;
+        if !self.worker.gate.wait_acknowledged(seq, deadline) {
+            self.commit_outcome(
+                second,
+                &step.registration_event(RegistrationOutcome::NotPerformed),
+            );
+            note(
+                Note::AdminDecisionNotRegistered,
+                Some(RegistrationFailure::NotPerformed.code()),
+            );
+            return self.withdraw(&decision);
+        }
+        let registered = self.worker.verifier.register_decision(
+            decision.id,
+            &decision.operation,
+            &decision.approvers,
+            decision.lifetime_secs,
+        );
+        let outcome = match registered {
+            Ok(()) => RegistrationOutcome::Registered,
+            Err(RegistrationFailure::Refused(_)) => RegistrationOutcome::Refused,
+            Err(RegistrationFailure::NotPerformed) => RegistrationOutcome::NotPerformed,
+            Err(RegistrationFailure::OutcomeUnknown) => RegistrationOutcome::OutcomeUnknown,
+        };
+        self.commit_outcome(second, &step.registration_event(outcome));
+        match registered {
+            Ok(()) => wire_key_reply(step.reply()),
+            Err(failure) => {
+                note(Note::AdminDecisionNotRegistered, Some(failure.code()));
+                self.withdraw(&decision)
+            }
+        }
+    }
+
+    /// Withdraw the approval that completed `decision`'s quorum and answer
+    /// `Unavailable` (module documentation, "The key-plane steps", step 4).
+    /// Spec: docs/52 §4.3; docs/questions/Q-453 item 1 (fail closed).
+    fn withdraw(&mut self, decision: &KeyDecision) -> Reply {
+        let _ = self.worker.key_requests.withdraw(decision);
+        Reply::Refused(RefusalStatus::Unavailable)
+    }
+
+    /// Step 8b (module documentation): after a committed `Delete`, the
+    /// `DestroyKeySet` decision of its tombstone when it is a user or a
+    /// computer. Never changes the reply: a failure is noted only.
+    /// Spec: docs/52 §4.3 (A-102); docs/51 §6, §9; docs/questions/Q-470.
+    fn register_destruction(&mut self, operation_id: u64, target: dtyp::Guid) {
+        let store = Arc::clone(&self.worker.store);
+        let principal = match self.worker.ctx.view(&store, &self.worker.tiers) {
+            Ok(view) => self.worker.admin.destruction_target(&view, target),
+            Err(_) => Err(AdminFailure::ViewUnavailable),
+        };
+        let principal = match principal {
+            Ok(Some(principal)) => principal,
+            Ok(None) => return,
+            Err(_) => {
+                note(Note::AdminDestroyNotRegistered, Some(4));
+                return;
+            }
+        };
+        if let Err(failure) = self.worker.verifier.register_decision(
+            DecisionId::new(operation_id),
+            &DecidedOperation::DestroyKeySet { principal },
+            &[],
+            MAX_DESTROY_DECISION_SECS,
+        ) {
+            note(Note::AdminDestroyNotRegistered, Some(failure.code()));
         }
     }
 
@@ -642,15 +749,17 @@ impl Running {
                 self.commit_outcome(second, refusal.event());
                 Reply::Refused(wire_status(refusal.status()))
             }
-            // Steps 7-9: commit, the outcome event, (8a) the set_secret
-            // grant of a BeginPasswordSet, the reply.
+            // Steps 7-9: commit, the outcome event, (8a) the SetSecret
+            // decision of a BeginPasswordSet, (8b) the DestroyKeySet
+            // decision of a Delete, the reply.
             Ok(applied) => match txn.commit() {
                 Ok(()) => {
                     self.commit_outcome(second, applied.outcome_event());
-                    if let Some((kind, targets)) = grant_of(applied.reply()) {
-                        if let Err(failure) = self.worker.verifier.grant_set_secret(
-                            kind,
-                            &targets,
+                    if let Some(operation) = secret_decision_of(applied.reply()) {
+                        if let Err(failure) = self.worker.verifier.register_decision(
+                            DecisionId::new(operation_id),
+                            &operation,
+                            &[],
                             SET_SECRET_GRANT_LIFETIME_SECS,
                         ) {
                             // Fail closed: admind is told Unavailable and
@@ -659,6 +768,9 @@ impl Running {
                             note(Note::AdminGrantNotRegistered, Some(failure.code()));
                             return Reply::Refused(RefusalStatus::Unavailable);
                         }
+                    }
+                    if let PepOperation::Delete { target } = request.operation {
+                        self.register_destruction(operation_id, target);
                     }
                     wire_reply(applied.reply())
                 }

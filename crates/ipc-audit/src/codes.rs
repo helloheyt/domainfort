@@ -207,8 +207,10 @@ code_table! {
 code_table! {
     /// `keyd::Operation`. `GrantSetSecret` (code 17) was appended by task
     /// A15a (docs/51 §5.8 option (b); docs/questions/Q-450); codes 1-16 keep
-    /// their meaning.
-    /// Spec: docs/10 §2-§7; crates/keyd authz.rs.
+    /// their meaning. `RegisterDecision`, `SealCeremony`,
+    /// `ListDestroyDecisions` (codes 18-20) were appended by A-102 (docs/52
+    /// R1, R3).
+    /// Spec: docs/10 §2-§7; crates/keyd authz.rs; docs/52 §4.
     pub enum KeydOperation {
         VerifyPreauth,
         IssueAsRep,
@@ -227,6 +229,9 @@ code_table! {
         DescribeConfig,
         Ping,
         GrantSetSecret,
+        RegisterDecision,
+        SealCeremony,
+        ListDestroyDecisions,
     }
 }
 
@@ -244,7 +249,7 @@ code_table! {
     /// `SetSecret`, `CreateKey`, `RotateKey`, `RotateKrbtgt`, `RetireKvno`,
     /// `DestroyKeySet`) or one that loosens keyd's authorization
     /// (`keyd::loosens_authorization`: `GrantSetSecret`, task A15a —
-    /// docs/questions/Q-452):
+    /// docs/questions/Q-452; `RegisterDecision`, A-102):
     ///
     /// * `Intent` — the record of the intent, committed and **acknowledged
     ///   by auditd before keyd runs the operation**; keyd does not run it
@@ -275,7 +280,9 @@ code_table! {
     /// grant reasons (`NoGrant` … `GrantTableFull`, codes 66-69) were
     /// appended by task A15a before `Unlisted`, which moved from 66 to 70
     /// (the table's rule for appended variants; nothing is deployed —
-    /// docs/questions/Q-452 item 4).
+    /// docs/questions/Q-452 item 4). The seven decision reasons
+    /// (`NoDecision` … `CeremonySealed`, codes 70-76) were appended by A-102
+    /// the same way; `Unlisted` moved from 70 to 77.
     /// Spec: crates/keyd audit.rs; docs/10 §9, §10, I8.
     pub enum KeydReason {
         None,
@@ -347,6 +354,13 @@ code_table! {
         GrantMismatch,
         GrantInvalid,
         GrantTableFull,
+        NoDecision,
+        DecisionMismatch,
+        DecisionInvalid,
+        DecisionTableFull,
+        DecisionConflict,
+        DecisionReplayed,
+        CeremonySealed,
         Unlisted,
     }
 }
@@ -577,6 +591,10 @@ code_table! {
     /// §1 as cited in docs/51 §5.7), as every LDAP read is (A-70). `Ping` is
     /// a health check, not an operation; `IssueJoinToken` is deferred with
     /// task A12 (A-78) and is appended when that is built.
+    /// `FetchApproved`, `Complete` and `ListPendingDestruction` are
+    /// **retired** by A-102 (docs/52 §4.6; docs/questions/Q-460): no
+    /// producer sends them any more; their codes keep their meaning and are
+    /// never reused.
     /// Spec: docs/51 §5.2, §5.7, §6, §7.3; docs/questions/Q-340 item 2.
     pub enum DirAdminOperation {
         CreateUser,
@@ -875,7 +893,9 @@ code_table! {
     /// What admind recorded: the wire tag of [`crate::AdmindActivity`].
     /// Spec: docs/51 §5.7 item 3 (refused connection, malformed frame,
     /// `SetPassword` completed / failed), §6 and §7.3 (the keyadm-only
-    /// requests admind forwards only from `keyadm_uid`). `RateLimited` (a
+    /// requests admind forwarded only from `keyadm_uid` — `KeyadmForward`,
+    /// **retired** by A-102: admind is no longer in keyadm's path, docs/52
+    /// §4.6; no producer sends it; its code is never reused). `RateLimited` (a
     /// frame dropped undecoded because its peer uid is over admind's
     /// request rate, docs/50 §3.6; noise) was appended by task F6 (A-94,
     /// docs/questions/Q-406 item 3).
@@ -1015,16 +1035,19 @@ code_table! {
 }
 
 code_table! {
-    /// The `admin.sock` requests admind forwards **only** when the peer uid
-    /// is `keyadm_uid` (docs/51 §6, §7.3 row "admind forwards only from
-    /// `keyadm_uid`").
+    /// The `admin.sock` requests admind forwarded **only** when the peer uid
+    /// was `keyadm_uid` (docs/51 §6, §7.3 row "admind forwards only from
+    /// `keyadm_uid`"). **Retired** by A-102 (docs/52 §4.6; docs/questions/
+    /// Q-460) with the `KeyadmForward` activity: kept so that a log written
+    /// before still decodes; never produced, never reused.
     /// Spec: docs/51 §6, §7.3.
     pub enum KeyadmOperation { FetchApproved, Complete, ListPendingDestruction }
 }
 
 code_table! {
     /// What admind did with a keyadm-only request: forwarded it to dird, or
-    /// refused it because the peer uid is not `keyadm_uid`.
+    /// refused it because the peer uid is not `keyadm_uid`. **Retired** by
+    /// A-102 with `KeyadmForward` (never produced, never reused).
     /// Spec: docs/51 §6 ("admind forwards only if the peer uid =
     /// `keyadm_uid`", peer credentials, docs/50 §3.2).
     pub enum ForwardDecision { Forwarded, PeerNotKeyadm }

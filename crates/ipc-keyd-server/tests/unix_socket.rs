@@ -126,7 +126,7 @@ fn exchanges_over_a_real_socket_reach_dispatch() {
     assert!(matches!(reply_of(&reply), KeydReply::DescribeConfig(_)));
     // A Kdc caller may not rotate keys (docs/10 §2): keyd's own Denied.
     let rotate = Call::RotateKey {
-        handle: samples::KRBTGT,
+        decision: ipc_keyd::DecisionId::new(1),
     };
     let reply = connection
         .exchange(&frame_of(&rotate), REPLY_LIMIT, deadline)

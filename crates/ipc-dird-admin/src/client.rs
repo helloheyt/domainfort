@@ -41,7 +41,7 @@
 //! §3.7; A-63; A-87 (docs/questions/Q-312: idle check, no resend).
 
 use crate::channel::{ADMIN_CHANNEL, REPLY_LIMIT};
-use crate::typed::{ConversionError, KeyadmRequest, Operation, Reply, Request};
+use crate::typed::{ConversionError, Operation, Reply, Request};
 use crate::wire::AdminReply;
 use core::fmt;
 use core::time::Duration;
@@ -176,32 +176,17 @@ fn remaining(start: Instant, deadline: Duration) -> Result<Duration, TransportEr
 /// Whether `reply` is an answer `request` can receive (the closed reply
 /// column of docs/51 §7.3: `GUID, SID` for a create, the key targets for
 /// `BeginPasswordSet`, `()` for the others, `Found` for `Lookup`, the
-/// pending request for `RequestKeyOperation` / `Approve`, the approved
-/// operation for `FetchApproved`, `()` for `Complete`, a page for
-/// `ListPendingDestruction`; a refusal for any operation; `Pong` for
-/// `Ping`).
+/// pending request for `RequestKeyOperation` / `Approve`; a refusal for
+/// any operation; `Pong` for `Ping`).
 /// Spec: docs/51 §7.3; docs/50 §3.3 (replies decoded with the same
 /// strictness).
 #[must_use]
 pub fn answers(request: &Request, reply: &Reply) -> bool {
     match request {
         Request::Ping => matches!(reply, Reply::Pong),
-        Request::Keyadm(keyadm) => match reply {
-            Reply::Refused(_) => true,
-            Reply::Approved(_) => matches!(keyadm, KeyadmRequest::FetchApproved { .. }),
-            Reply::Done => matches!(keyadm, KeyadmRequest::Complete { .. }),
-            Reply::PendingDestruction(_) => {
-                matches!(keyadm, KeyadmRequest::ListPendingDestruction { .. })
-            }
-            Reply::Created { .. }
-            | Reply::PasswordSet(_)
-            | Reply::Found(_)
-            | Reply::Pong
-            | Reply::KeyRequest(_) => false,
-        },
         Request::Operation { operation, .. } => match reply {
             Reply::Refused(_) => true,
-            Reply::Pong | Reply::Approved(_) | Reply::PendingDestruction(_) => false,
+            Reply::Pong => false,
             Reply::KeyRequest(_) => matches!(
                 operation,
                 Operation::RequestKeyOperation { .. } | Operation::Approve { .. }

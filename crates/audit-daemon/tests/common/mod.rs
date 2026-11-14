@@ -367,6 +367,7 @@ pub fn keyd_record() -> EventBody {
         approvers: None,
         result: ipc_audit::KeydOutcome::Success,
         reason: ipc_audit::KeydReason::None,
+        decision: None,
     }))
 }
 

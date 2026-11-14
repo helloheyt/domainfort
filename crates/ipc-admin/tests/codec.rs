@@ -26,9 +26,8 @@ use ipc_admin::{
 };
 use ipc_dird_admin::channel::{MAX_AP_REQ, MAX_DN_COMPONENT, MAX_DN_COMPONENTS};
 use ipc_dird_admin::{
-    AccountExpires, AccountKind, ApprovedKeyOperation, Auth, DestructionEntry, DestructionPage,
-    Found, KeyOperation, KeyOperationOutcome, KeyRef, KeyRequestState, KeyadmRequest, LookupKey,
-    Operation, PasswordSetOutcome,
+    AccountExpires, Auth, Found, KeyOperation, KeyRef, KeyRequestState, LookupKey, Operation,
+    PasswordSetOutcome,
 };
 use zeroize::Zeroizing;
 
@@ -160,25 +159,6 @@ fn forwarded() -> Vec<Operation> {
     ]
 }
 
-/// The keyadm requests (task A10): dird's layouts, no `auth`.
-fn keyadm_requests() -> Vec<KeyadmRequest> {
-    vec![
-        KeyadmRequest::FetchApproved { id: 77 },
-        KeyadmRequest::Complete {
-            id: 77,
-            outcome: KeyOperationOutcome::Performed { kvno: Some(4) },
-        },
-        KeyadmRequest::Complete {
-            id: 78,
-            outcome: KeyOperationOutcome::OutcomeUnknown,
-        },
-        KeyadmRequest::ListPendingDestruction { cursor: None },
-        KeyadmRequest::ListPendingDestruction {
-            cursor: Some(guid(40)),
-        },
-    ]
-}
-
 /// One sample of every request kind.
 fn requests() -> Vec<Request> {
     let mut all: Vec<Request> = forwarded().into_iter().map(forward).collect();
@@ -192,7 +172,6 @@ fn requests() -> Vec<Request> {
     });
     all.push(set_password(PASSWORD, 0));
     all.push(set_password("ünïcødé-passwörd-☃-𝄞", 2));
-    all.extend(keyadm_requests().into_iter().map(Request::Keyadm));
     all.push(Request::Ping);
     all
 }
@@ -245,21 +224,6 @@ fn replies() -> Vec<Reply> {
             operation: KeyOperation::RotateKey { service: guid(41) },
             approvals: 0,
             quorum: 2,
-        }),
-        Reply::Approved(ApprovedKeyOperation {
-            id: 77,
-            digest: [0xA2; 32],
-            operation: KeyOperation::RotateKrbtgt,
-            principal: guid(42),
-            requester: guid(43),
-            approvers: vec![guid(44)],
-        }),
-        Reply::PendingDestruction(DestructionPage {
-            entries: vec![DestructionEntry {
-                guid: guid(45),
-                kind: AccountKind::Computer,
-            }],
-            next: None,
         }),
     ]
 }
@@ -319,7 +283,6 @@ fn every_request_round_trips_canonically() {
                 assert_eq!(d.target, s.target);
                 assert_eq!(d.password.expose(), s.password.expose());
             }
-            (Request::Keyadm(s), Request::Keyadm(d)) => assert_eq!(d, s),
             (Request::Ping, Request::Ping) => {}
             other => panic!("{other:?}"),
         }
@@ -355,32 +318,38 @@ fn forwarded_operations_are_dirds_layout_byte_for_byte() {
     }
 }
 
-/// Task A10 (docs/51 §6): a keyadm request's payload is exactly dird's
-/// (no `auth`), byte for byte, under dird's kind number.
+/// A-102 (docs/52 §4.6, §4.8; docs/questions/Q-460): keyadm's former
+/// requests `FetchApproved` / `Complete` / `ListPendingDestruction`
+/// (`0x10`–`0x12`) are retired from admin.sock — unknown kinds of the closed
+/// table, so a frame of one (with the former payloads) closes the
+/// connection whatever it holds; their replies (`0x89`, `0x8A`) are not in
+/// the reply table either. admind cannot be asked to forward anything for
+/// keyadm (N2).
 #[test]
-fn keyadm_requests_are_dirds_layout_byte_for_byte() {
-    for request in keyadm_requests() {
-        let ours = request_body(&Request::Keyadm(request));
-        let theirs = encode_frame(
-            ipc_dird_admin::ADMIN_CHANNEL,
-            Direction::Request,
-            &ipc_dird_admin::Request::Keyadm(request).to_wire().unwrap(),
-        )
-        .unwrap();
-        let theirs = theirs.body();
-        assert_eq!(ours[3], theirs[3], "the kind is dird's");
-        assert_eq!(&ours[4..], &theirs[4..], "the payload is dird's");
+fn retired_keyadm_kinds_close() {
+    assert_eq!(request_kind::RETIRED, &[0x10, 0x11, 0x12]);
+    for (kind, payload) in [
+        (0x10u8, 77u64.to_be_bytes().to_vec()),
+        (0x11, [77u64.to_be_bytes().to_vec(), vec![2]].concat()),
+        (0x12, vec![0]),
+    ] {
+        assert!(!request_kind::ALL.contains(&kind));
+        let mut body = request_body(&Request::Ping);
+        body[3] = kind;
+        body.extend(payload);
+        assert_eq!(
+            disposition(&body),
+            closed(ipc::Error::UnknownKind),
+            "{kind:#x}"
+        );
     }
-    // A keyadm request answers only its own reply.
-    let fetch = Request::Keyadm(KeyadmRequest::FetchApproved { id: 1 });
-    assert!(answers(&fetch, &Reply::Refused(RefusalStatus::Denied)));
-    assert!(!answers(&fetch, &Reply::Done));
-    let complete = Request::Keyadm(KeyadmRequest::Complete {
-        id: 1,
-        outcome: KeyOperationOutcome::Refused,
-    });
-    assert!(answers(&complete, &Reply::Done));
-    assert!(!answers(&complete, &Reply::Pong));
+    assert_eq!(reply_kind::RETIRED, &[0x89, 0x8A]);
+    for kind in reply_kind::RETIRED {
+        assert!(!reply_kind::ALL.contains(kind));
+        let mut body = reply_body(&Reply::Pong);
+        body[3] = *kind;
+        assert!(decode_reply(&body).is_err(), "{kind:#x}");
+    }
 }
 
 /// docs/50 §3.3, §9; docs/51 §7.6: every reply kind round-trips.
@@ -461,11 +430,24 @@ fn dirds_password_set_steps_are_not_on_this_channel() {
 /// docs/50 §3.3 ("kind closed: unknown op ⇒ close"); A-59: unknown kinds,
 /// the unused numbers (dird's password-set steps, the join token), and the
 /// reserved `REFUSED_KIND` close the connection without a reply. (The key
-/// operations and keyadm requests `0x0E`–`0x12` are this channel's since
-/// task A10.)
+/// operations `0x0E`, `0x0F` are this channel's since task A10; keyadm's
+/// `0x10`–`0x12` are retired by A-102 and close too.)
 #[test]
 fn unknown_kinds_close() {
-    for kind in [0x00, 0x06, 0x07, 0x13, 0x16, 0x81, 0x87, 0x7F, REFUSED_KIND] {
+    for kind in [
+        0x00,
+        0x06,
+        0x07,
+        0x10,
+        0x11,
+        0x12,
+        0x13,
+        0x16,
+        0x81,
+        0x87,
+        0x7F,
+        REFUSED_KIND,
+    ] {
         let mut body = request_body(&Request::Ping);
         body[3] = kind;
         assert_eq!(

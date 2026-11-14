@@ -19,9 +19,7 @@ use crate::wire::{AdminReply, AdminRequest, WireSetPassword};
 use core::fmt;
 use dtyp::{Guid, Sid};
 use ipc::Secret;
-use ipc_dird_admin::{
-    ApprovedKeyOperation, Auth, DestructionPage, Found, KeyRequestState, KeyadmRequest, Operation,
-};
+use ipc_dird_admin::{Auth, Found, KeyRequestState, Operation};
 use zeroize::Zeroizing;
 
 /// A value on the wire did not pass its strict decoder, or a typed value has
@@ -167,8 +165,6 @@ pub enum Request {
     },
     /// `SetPassword`.
     SetPassword(SetPassword),
-    /// A keyadm request, forwarded only from `keyadm_uid` (docs/51 §6).
-    Keyadm(KeyadmRequest),
     /// admind's health check.
     Ping,
 }
@@ -202,9 +198,6 @@ impl Request {
                 target: Guid::from_packet(&target),
                 password: Password::from_secret(password)?,
             })),
-            AdminRequest::Keyadm(request) => {
-                Ok(Request::Keyadm(KeyadmRequest::from_wire(&request)))
-            }
         }
     }
 
@@ -233,7 +226,6 @@ impl Request {
                 target: set.target.to_packet(),
                 password: set.password.to_secret(),
             })),
-            Request::Keyadm(request) => Ok(AdminRequest::Keyadm(request.to_wire())),
         }
     }
 }
@@ -272,12 +264,9 @@ pub enum Reply {
     /// `Ping` answered.
     Pong,
     /// dird's pending key-operation request (`RequestKeyOperation`,
-    /// `Approve`).
+    /// `Approve`); its id is the id of the decision dird registers in keyd
+    /// when an `Approve` completes the quorum (A-102, docs/52 §4.3).
     KeyRequest(KeyRequestState),
-    /// dird's approved key operation (`FetchApproved`).
-    Approved(ApprovedKeyOperation),
-    /// dird's page of tombstones (`ListPendingDestruction`).
-    PendingDestruction(DestructionPage),
 }
 
 impl Reply {
@@ -349,39 +338,6 @@ impl Reply {
                     }
                 }
             }
-            AdminReply::Approved(approved) => {
-                match ipc_dird_admin::Reply::from_wire(&ipc_dird_admin::AdminReply::Approved(
-                    approved.clone(),
-                ))
-                .map_err(ConversionError::Reply)?
-                {
-                    ipc_dird_admin::Reply::Approved(approved) => Reply::Approved(approved),
-                    _ => {
-                        return Err(ConversionError::Reply(
-                            ipc_dird_admin::ConversionError::UnexpectedReply,
-                        ))
-                    }
-                }
-            }
-            AdminReply::PendingDestruction { entries, next } => {
-                match ipc_dird_admin::Reply::from_wire(
-                    &ipc_dird_admin::AdminReply::PendingDestruction {
-                        entries: entries.clone(),
-                        next: *next,
-                    },
-                )
-                .map_err(ConversionError::Reply)?
-                {
-                    ipc_dird_admin::Reply::PendingDestruction(page) => {
-                        Reply::PendingDestruction(page)
-                    }
-                    _ => {
-                        return Err(ConversionError::Reply(
-                            ipc_dird_admin::ConversionError::UnexpectedReply,
-                        ))
-                    }
-                }
-            }
         })
     }
 
@@ -411,29 +367,14 @@ impl Reply {
             },
             Reply::Refused(status) => AdminReply::Refused(*status),
             Reply::Pong => AdminReply::Pong,
-            Reply::KeyRequest(_) | Reply::Approved(_) | Reply::PendingDestruction(_) => {
-                // dird's typed layer writes them, byte for byte.
-                let dird = match self {
-                    Reply::KeyRequest(state) => ipc_dird_admin::Reply::KeyRequest(state.clone()),
-                    Reply::Approved(approved) => ipc_dird_admin::Reply::Approved(approved.clone()),
-                    Reply::PendingDestruction(page) => {
-                        ipc_dird_admin::Reply::PendingDestruction(page.clone())
-                    }
-                    _ => {
-                        return Err(ConversionError::Reply(
-                            ipc_dird_admin::ConversionError::UnexpectedReply,
-                        ))
-                    }
-                };
-                match dird.to_wire().map_err(ConversionError::Reply)? {
+            Reply::KeyRequest(state) => {
+                // dird's typed layer writes it, byte for byte.
+                match ipc_dird_admin::Reply::KeyRequest(state.clone())
+                    .to_wire()
+                    .map_err(ConversionError::Reply)?
+                {
                     ipc_dird_admin::AdminReply::KeyRequest(request) => {
                         AdminReply::KeyRequest(request)
-                    }
-                    ipc_dird_admin::AdminReply::Approved(approved) => {
-                        AdminReply::Approved(approved)
-                    }
-                    ipc_dird_admin::AdminReply::PendingDestruction { entries, next } => {
-                        AdminReply::PendingDestruction { entries, next }
                     }
                     _ => {
                         return Err(ConversionError::Reply(
@@ -461,10 +402,6 @@ impl Reply {
             }
             ipc_dird_admin::Reply::Pong => Some(Reply::Pong),
             ipc_dird_admin::Reply::KeyRequest(state) => Some(Reply::KeyRequest(state)),
-            ipc_dird_admin::Reply::Approved(approved) => Some(Reply::Approved(approved)),
-            ipc_dird_admin::Reply::PendingDestruction(page) => {
-                Some(Reply::PendingDestruction(page))
-            }
             ipc_dird_admin::Reply::PasswordSet(_) => None,
         }
     }
@@ -473,9 +410,8 @@ impl Reply {
 /// Whether `reply` is an answer `request` can receive: `Created` for a
 /// create, `Found` for `Lookup`, `KeyRequest` for `RequestKeyOperation` /
 /// `Approve`, `Done` for the other forwarded operations,
-/// `PasswordChanged` for `SetPassword`, `Approved` / `Done` /
-/// `PendingDestruction` for the keyadm requests, a refusal for any
-/// operation, `Pong` for `Ping` (the closed reply column, docs/51 §7.3,
+/// `PasswordChanged` for `SetPassword`, a refusal for any operation, `Pong`
+/// for `Ping` (the closed reply column, docs/51 §7.3,
 /// §7.6).
 /// Spec: docs/51 §7.3, §7.6; docs/50 §3.3 (replies decoded with the same
 /// strictness).
@@ -486,25 +422,9 @@ pub fn answers(request: &Request, reply: &Reply) -> bool {
         Request::SetPassword(_) => {
             matches!(reply, Reply::PasswordChanged(_) | Reply::Refused(_))
         }
-        Request::Keyadm(keyadm) => match reply {
-            Reply::Refused(_) => true,
-            Reply::Approved(_) => matches!(keyadm, KeyadmRequest::FetchApproved { .. }),
-            Reply::Done => matches!(keyadm, KeyadmRequest::Complete { .. }),
-            Reply::PendingDestruction(_) => {
-                matches!(keyadm, KeyadmRequest::ListPendingDestruction { .. })
-            }
-            Reply::Created { .. }
-            | Reply::Found(_)
-            | Reply::PasswordChanged(_)
-            | Reply::Pong
-            | Reply::KeyRequest(_) => false,
-        },
         Request::Forward { operation, .. } => match reply {
             Reply::Refused(_) => true,
-            Reply::Pong
-            | Reply::PasswordChanged(_)
-            | Reply::Approved(_)
-            | Reply::PendingDestruction(_) => false,
+            Reply::Pong | Reply::PasswordChanged(_) => false,
             Reply::KeyRequest(_) => matches!(
                 operation,
                 Operation::RequestKeyOperation { .. } | Operation::Approve { .. }

@@ -13,21 +13,32 @@
 //! | Role        | Operations |
 //! |-------------|------------|
 //! | `Kdc`       | [`Keyd::verify_preauth`], [`Keyd::issue_as_rep`], [`Keyd::open_and_verify_tgt`], [`Keyd::issue_tgs_rep`], [`Keyd::open_fast_armor`], [`Keyd::seal_fast_error`], [`Keyd::describe_config`], [`Keyd::ping`] |
-//! | `Directory` | [`Keyd::set_secret`], [`Keyd::verify_secret`], [`Keyd::ping`] |
-//! | `Admin`     | [`Keyd::create_key`], [`Keyd::rotate_key`], [`Keyd::rotate_krbtgt`], [`Keyd::retire_kvno`], [`Keyd::destroy_key_set`], [`Keyd::grant_set_secret`] (initial secrets of users), [`Keyd::ping`] |
-//! | `Ldap`      | [`Keyd::open_and_verify_service_ticket`], [`Keyd::grant_set_secret`], [`Keyd::describe_config`], [`Keyd::ping`] |
+//! | `Directory` | [`Keyd::set_secret`] (on a dird decision), [`Keyd::ping`] |
+//! | `Admin`     | before the seal: [`Keyd::create_key`], [`Keyd::grant_set_secret`] (initial secrets of users); always: [`Keyd::rotate_key`], [`Keyd::rotate_krbtgt`], [`Keyd::retire_kvno`], [`Keyd::destroy_key_set`] (each by dird decision id), [`Keyd::seal_ceremony`], [`Keyd::list_destroy_decisions`], [`Keyd::ping`] |
+//! | `Ldap`      | [`Keyd::open_and_verify_service_ticket`], [`Keyd::register_decision`], [`Keyd::describe_config`], [`Keyd::ping`] |
 //!
-//! **Set-secret grants** (task A15a; docs/51 §5.8 option (b), decision
-//! A-74; docs/questions/Q-450..Q-452): Role::Directory's
-//! [`Keyd::set_secret`] is refused (the uniform `Denied`, reason `NoGrant`)
-//! unless a live, one-time grant names its handle — registered by
-//! [`Keyd::grant_set_secret`] from dird (Role::Ldap, after its PDP allowed
-//! the `BeginPasswordSet`, ≤ [`MAX_SET_SECRET_GRANT_SECS`]) or from keyadm's
-//! ceremony (Role::Admin: a first administrator's initial secret only, ≤
-//! [`MAX_INITIAL_SECRET_GRANT_SECS`]) — with exactly its binding; the grant
-//! is consumed. The table is in memory and bounded
-//! ([`MAX_SET_SECRET_GRANTS`]). A grant loosens keyd, so it is audited like a
-//! key-state change ([`requires_acknowledged_intent`]).
+//! [`Keyd::verify_secret`] is in no role's row (A-102, docs/52 R4).
+//!
+//! **The decision table** (A-102; docs/52 R1, §4; docs/questions/Q-460,
+//! Q-461): keyd performs **no** state change for Role::Directory or
+//! Role::Admin without a one-time, operation-bound decision that dird
+//! (Role::Ldap, the PDP that owns it) registered with
+//! [`Keyd::register_decision`] — a [`DecidedOperation`]: a password set
+//! (handle, binding **and salt**; A-100's grant generalized, N4), a krbtgt
+//! or key rotation, a kvno retirement, or the destruction of a deleted
+//! account's key sets. keyd runs exactly the registered parameters; Admin's
+//! operations name only the [`DecisionId`]; `rotate_krbtgt`'s dual-control
+//! token is built inside keyd from the decision's approvers. A decision is
+//! consumed by its first presentation and its result kept until it
+//! expires: presenting the id again returns that result. Bounded, in
+//! memory, lost at every start (stricter). Registration loosens keyd, so it
+//! is audited like a key-state change ([`requires_acknowledged_intent`]).
+//!
+//! **The ceremony state** (A-102; docs/52 R3; docs/questions/Q-462 item 1):
+//! keyd starts in [`CeremonyState::Provisioning`] only with an empty key
+//! store; [`Keyd::create_key`] and Admin's [`Keyd::grant_set_secret`] (a
+//! first administrator's initial secret, ≤ [`MAX_INITIAL_SECRET_GRANT_SECS`],
+//! docs/questions/Q-451) exist only there; [`Keyd::seal_ceremony`] ends it.
 //!
 //! **Types and seam** (D182; decision A-63): every crypto-free type of this
 //! interface — ids and handles, roles, operations and the capability table,
@@ -178,13 +189,20 @@
 //!   the key set. There is no rename in phase 1 (follow-up: a rename
 //!   interface, docs/10 §7).
 //! - keyd trusts the caller's `now` and start time (the daemon's own clock,
-//!   docs/50 R50-5) and the Admin caller's dual-control approvals
-//!   (authenticity is the admin plane's, docs/43).
+//!   docs/50 R50-5) and dird's decisions — the approvers a decision names
+//!   were verified by dird, not by keyd (dird ≡ tier-0 for keyd's
+//!   mutations, docs/52 §4.7, C16; docs/questions/Q-464, R5).
+//! - The ceremony state is held in memory: a keyd started with an empty
+//!   store — in development mode, every start (A-77, P-17) — is
+//!   `Provisioning` again until the next seal, and while dird runs every
+//!   account then has no key set, so keyadm + admind could set initial
+//!   secrets until the seal (docs/52 §4.4 residual; closed with a
+//!   persistent store, P-17).
 //! - The startup hold-down makes every Kerberos operation unavailable for
 //!   two clock-skew intervals after each start (10 minutes with the RFC 4120
 //!   §8.2 default skew) — the availability price of closing the replay
-//!   window (A-62). The `verify_secret` failure throttle (Directory, not
-//!   held) restarts empty, so a keyd restart grants fresh guesses there.
+//!   window (A-62). (The `verify_secret` failure throttle has no caller
+//!   since A-102 — no role holds the operation.)
 //! - A full replay cache or token table refuses new requests (fail closed),
 //!   a denial-of-service trade-off (D33).
 //! - The `verify_preauth` failure throttle (A-34) lets anyone who can reach
@@ -236,7 +254,9 @@
 //! `Keyd::admits` (task F2), docs/51 §5.7 and decision A-86 (Q-346, as
 //! stated in the task; Q-365); for the set_secret grant (task A15a), docs/51
 //! §4.3, §5.2, §5.8, §7.3, §9, docs/47 §9.1-§9.2, docs/10 §2, §6, §8-§11,
-//! docs/questions/Q-291 (A-74), Q-365 (A-88) and Q-450..Q-453. No other
+//! docs/questions/Q-291 (A-74), Q-365 (A-88) and Q-450..Q-453; for the
+//! decision table and the ceremony state (A-102), docs/52 §3.1, §3.3, §3.4,
+//! §3.10, §4, §7 and docs/questions/Q-460..Q-462, Q-465. No other
 //! implementation was consulted or recalled.
 //!
 //! Spec: docs/10; docs/09 א; RFC 4120 §3, §5.
@@ -244,12 +264,12 @@
 mod admin;
 mod as_exchange;
 mod custody;
+mod decision;
 mod directory;
 mod enctype;
 pub mod entropy;
 mod error;
 mod fast_armor;
-mod grant;
 #[allow(clippy::module_inception)]
 mod keyd;
 mod replay;
@@ -280,11 +300,17 @@ pub use keyd_types::{
 };
 pub use keyd_types::{
     ArmorId, AsRepParts, AsTicketTemplate, AuditKeyRef, AuditOutcome, AuditReason, AuditRecord,
-    AuditSink, AuthnError, AuthnProof, CallerId, ConfigDescription, ConfigError, CtxId,
-    DualControlToken, EncTypeId, Error, ExchangeId, FastArmor, FastConversation, IssueError,
-    KeyCustody, KeyHandle, KeyPurpose, KeydConfig, Kvno, Operation, PrincipalBinding, PrincipalId,
-    Role, ServiceContext, ServiceCtxId, TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext,
-    ThrottlePolicy, TicketPolicy, MAX_FX_COOKIE_LENGTH, TOKEN_ID_LENGTH,
+    AuditSink, AuthnError, AuthnProof, CallerId, ConfigDescription, ConfigError, CtxId, EncTypeId,
+    Error, ExchangeId, FastArmor, FastConversation, IssueError, KeyCustody, KeyHandle, KeyPurpose,
+    KeydConfig, Kvno, Operation, PrincipalBinding, PrincipalId, Role, ServiceContext, ServiceCtxId,
+    TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext, ThrottlePolicy, TicketPolicy,
+    MAX_FX_COOKIE_LENGTH, TOKEN_ID_LENGTH,
+};
+pub use keyd_types::{
+    CeremonyState, DecidedOperation, DecisionId, DecisionIntent, DestructionPage,
+    PendingDestruction, MAX_DECISION_APPROVERS, MAX_DESTROY_DECISIONS, MAX_DESTROY_DECISION_PAGE,
+    MAX_DESTROY_DECISION_SECS, MAX_KEY_DECISIONS, MAX_KEY_DECISION_SECS,
+    MIN_KEY_DECISION_APPROVERS,
 };
 pub use state_change::{changes_key_state, loosens_authorization, requires_acknowledged_intent};
 pub use store::{InMemoryKeyStore, KeyStore, StoreError, StoredKeySet};

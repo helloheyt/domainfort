@@ -2,8 +2,8 @@
 //! operations that change keyd's key state, and `Keyd::admits` — an
 //! operation's authorization step run on its own. Sources: docs/10 §2
 //! (capability table; role, purpose, then the hold-down), §6, §7, §11,
-//! §12 I2, I3, I8; docs/questions/Q-346 (A-86), Q-365. All values are
-//! constructed for these tests.
+//! §12 I2, I3, I8; docs/questions/Q-346 (A-86), Q-365; docs/52 §4.2, §4.5
+//! (A-102: decisions). All values are constructed for these tests.
 
 mod common;
 
@@ -11,7 +11,7 @@ use common::*;
 use keyd::authz::{purpose_permitted, role_permits, HandleSlot};
 use keyd::{
     changes_key_state, loosens_authorization, requires_acknowledged_intent, AuditReason, CallerId,
-    Error, KeyHandle, KeyPurpose, Kvno, Operation, PrincipalId, Role,
+    DecidedOperation, Error, KeyHandle, KeyPurpose, Kvno, Operation, PrincipalId, Role,
 };
 use zeroize::Zeroizing;
 
@@ -46,21 +46,33 @@ fn exactly_the_key_lifecycle_operations_change_key_state() {
     );
 }
 
-/// Task A15a (docs/questions/Q-452 item 1): `grant_set_secret` is the one
-/// operation that loosens keyd's authorization; it is not a key-state
-/// change, but it needs an acknowledged intent like one.
+/// Task A15a (docs/questions/Q-452 item 1) and A-102 (docs/52 §4.5):
+/// `grant_set_secret` and `register_decision` are the operations that
+/// loosen keyd's authorization; neither is a key-state change, but each
+/// needs an acknowledged intent like one. The seal and the destroy listing
+/// change nothing that loosens keyd.
 #[test]
-fn the_grant_loosens_authorization_and_needs_an_intent() {
+fn the_grant_and_the_decision_loosen_authorization_and_need_an_intent() {
     let loosening: Vec<Operation> = Operation::ALL
         .into_iter()
         .filter(|op| loosens_authorization(*op))
         .collect();
-    assert_eq!(loosening, [Operation::GrantSetSecret]);
+    assert_eq!(
+        loosening,
+        [Operation::GrantSetSecret, Operation::RegisterDecision]
+    );
     assert!(!changes_key_state(Operation::GrantSetSecret));
+    assert!(!changes_key_state(Operation::RegisterDecision));
+    assert!(!requires_acknowledged_intent(Operation::SealCeremony));
+    assert!(!requires_acknowledged_intent(
+        Operation::ListDestroyDecisions
+    ));
     for op in Operation::ALL {
         assert_eq!(
             requires_acknowledged_intent(op),
-            changes_key_state(op) || op == Operation::GrantSetSecret,
+            changes_key_state(op)
+                || op == Operation::GrantSetSecret
+                || op == Operation::RegisterDecision,
             "{op:?}"
         );
     }
@@ -69,7 +81,9 @@ fn the_grant_loosens_authorization_and_needs_an_intent() {
 /// docs/10 §2, §12 I2, I3: `admits` is the role check and the purpose check
 /// of the capability tables, for every role × purpose of every key-state
 /// operation (none of which is held, docs/10 §11) — and for `set_secret`
-/// also a live grant (task A15a), of which none is registered here.
+/// also a live grant (task A15a), of which none is registered here. The
+/// four operations that run a decision by id are never admitted by
+/// `admits` (A-102: their daemon asks `decided_intent`).
 #[test]
 fn admits_is_the_role_and_purpose_check() {
     let f = Fixture::new();
@@ -86,7 +100,7 @@ fn admits_is_the_role_and_purpose_check() {
                         .admits(&caller, op, &[(HandleSlot::Primary, &handle)], &now()),
                     role_permits(role, op)
                         && purpose_permitted(op, HandleSlot::Primary, purpose)
-                        && op != Operation::SetSecret,
+                        && op == Operation::CreateKey,
                     "{op:?} {role:?} {purpose:?}"
                 );
             }
@@ -116,7 +130,7 @@ fn admits_includes_the_hold_down() {
     assert!(!f
         .keyd
         .admits(&DIRECTORY, Operation::SetSecret, &set_bob, &now()));
-    f.grant(&BOB, &bob_binding(), &now()).unwrap();
+    f.grant(&BOB, &bob_binding(), BOB_SALT, &now()).unwrap();
     assert!(f.keyd.admits(
         &DIRECTORY,
         Operation::SetSecret,
@@ -178,18 +192,19 @@ fn admits_agrees_with_the_operations_own_refusal() {
         f.records().last().map(|r| r.reason),
         Some(AuditReason::RoleNotPermitted)
     );
-    // A krbtgt handle in rotate_key: the purpose check refuses.
+    // A krbtgt handle in rotate_key: never admitted, and the decision that
+    // would name it is refused at registration (A-102).
     let handles = [(HandleSlot::Primary, &KRBTGT)];
     assert!(!f
         .keyd
         .admits(&ADMIN, Operation::RotateKey, &handles, &now()));
     assert_eq!(
-        f.keyd.rotate_key(&ADMIN, &KRBTGT, &now()),
+        f.decide(DecidedOperation::RotateKey { handle: KRBTGT }, &now()),
         Err(Error::Denied)
     );
     assert_eq!(
         f.records().last().map(|r| r.reason),
-        Some(AuditReason::PurposeMismatch)
+        Some(AuditReason::DecisionInvalid)
     );
     // Admitted, then refused by a later step: the key set exists.
     let handles = [(HandleSlot::Primary, &SERVICE)];
@@ -206,7 +221,7 @@ fn admits_agrees_with_the_operations_own_refusal() {
         Some(AuditReason::KeyExists)
     );
     // Bob's password was never changed: his next set_secret is kvno 2.
-    f.grant(&BOB, &bob_binding(), &now()).unwrap();
+    f.grant(&BOB, &bob_binding(), BOB_SALT, &now()).unwrap();
     assert_eq!(
         f.keyd.set_secret(
             &DIRECTORY,

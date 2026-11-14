@@ -84,6 +84,9 @@ pub enum ErrorKind {
     TooFewFirstAdmins,
     /// More first administrators than [`crate::limits::MAX_FIRST_ADMINS`].
     TooManyFirstAdmins,
+    /// A `first_admin_salts` item that is not a KerberosString, or a salt
+    /// list whose count is not the number of first administrators (A-102).
+    InvalidSalt,
 }
 
 impl ErrorKind {
@@ -118,6 +121,9 @@ impl ErrorKind {
             ErrorKind::InvalidList => "list items must be non-empty and separated by \", \"",
             ErrorKind::TooFewFirstAdmins => "fewer first administrators than required",
             ErrorKind::TooManyFirstAdmins => "more first administrators than allowed",
+            ErrorKind::InvalidSalt => {
+                "first-administrator salts do not match the first administrators"
+            }
         }
     }
 }

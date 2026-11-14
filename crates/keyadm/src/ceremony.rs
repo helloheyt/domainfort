@@ -1,5 +1,7 @@
 //! `keyadm ceremony`: create the krbtgt key set and the two service key sets
-//! the provisioning manifest names (docs/51 §4.3 step 11).
+//! the provisioning manifest names, grant the first administrators' initial
+//! secrets, and **seal** keyd's ceremony (docs/51 §4.3 step 11; A-102,
+//! docs/52 R3).
 //!
 //! # The steps
 //!
@@ -19,12 +21,25 @@
 //!    order** (task A15a; docs/questions/Q-451) — a user's one key target,
 //!    `(GUID, PrincipalLongterm)` with its NT-PRINCIPAL [sAMAccountName]
 //!    binding exactly as the manifest gives it to `provision
-//!    first-admin-secret`, live for `MAX_INITIAL_SECRET_GRANT_SECS` (15
-//!    minutes). keyd refuses Role::Directory's `set_secret` without such a
-//!    grant (docs/51 §5.8 option (b)); dird, which registers the grants of
-//!    every later password set, does not run yet. keyd grants Role::Admin
-//!    only a user's **initial** secret (no key set yet) — so this step can
-//!    never be used to reset an existing password past dird's PDP.
+//!    first-admin-secret` **and the salt the manifest names for it**
+//!    (`first_admin_salts`, written by `provision domain` with the
+//!    directory's salt function — A-102, docs/52 N4: keyd binds the salt
+//!    too), live for `MAX_INITIAL_SECRET_GRANT_SECS` (15 minutes). keyd
+//!    refuses Role::Directory's `set_secret` without such a grant (docs/51
+//!    §5.8 option (b)); dird, which registers the decisions of every later
+//!    password set, does not run yet. keyd grants Role::Admin only a user's
+//!    **initial** secret (no key set yet) — so this step can never be used to
+//!    reset an existing password past dird's PDP. A manifest that names no
+//!    salt for a first administrator is refused before anything is sent
+//!    ([`MissingSalt`]).
+//! 4. **`seal_ceremony`** (A-102, docs/52 R3; docs/questions/Q-462 item 1)
+//!    — keyd moves from `Provisioning` to `Operational`: `create_key` and
+//!    Role::Admin's grants **no longer exist** in keyd until it restarts
+//!    with an empty store (in development mode, every restart — P-17,
+//!    A-77). After the seal keyadm can do nothing in keyd that is not a
+//!    decision dird registered. The grants registered in step 3 live until
+//!    they expire, so `provision first-admin-secret` still runs after the
+//!    seal, within their 15 minutes.
 //!
 //! # Stop at the first failure, never retry
 //!
@@ -36,9 +51,11 @@
 //! created" from "refused", and does not guess: it stops at the first step
 //! that did not succeed, and never repeats a request whose fate it does not
 //! know (a repeat could only be refused — `create_key` never overwrites —
-//! but a blind repeat would hide the earlier outcome). A partial ceremony is
-//! recovered in development mode by restarting keyd, which loses every key
-//! (P-17), and running the whole ceremony again (A-77; docs/51 §4.5).
+//! but a blind repeat would hide the earlier outcome). A ceremony that stops
+//! before the seal leaves keyd **not sealed** (the report says so): restart
+//! keyd, which loses every key in development mode (P-17) and starts in
+//! `Provisioning` again, and run the whole ceremony again (A-77; docs/51
+//! §4.5).
 //!
 //! # What each outcome means
 //!
@@ -55,9 +72,10 @@
 //! | not performed: `Refused::Busy` / `Unavailable` / `Malformed` / `VersionMismatch` | no — keyd-daemon refuses a key-state change only before keyd runs it (A-88: `Busy` while auditd is away, `Unavailable` when the intent was not acknowledged in time — keyd's audit then holds the intent and a `NotPerformed` outcome) |
 //! | outcome unknown: the request was sent and the connection failed, the deadline passed, or the reply could not be read | **maybe** — keyd's audit log holds the intent and the outcome; check it before anything else |
 //!
-//! Spec: docs/51 §4.3 steps 10-11, §4.5, §6; docs/10 §2, §7, §9, §10;
-//! docs/50 R50-3, §3.4, §3.6, §3.7; A-19; A-35; A-63; A-73; A-77;
-//! docs/questions/Q-365, Q-367 (A-88).
+//! Spec: docs/51 §4.3 steps 10-12, §4.5, §6; docs/10 §2, §7, §9, §10;
+//! docs/50 R50-3, §3.4, §3.6, §3.7; docs/52 §4.2 (N4), §4.4 (R3); A-19;
+//! A-35; A-63; A-73; A-77; docs/questions/Q-365, Q-367 (A-88), Q-462 item
+//! 1 (A-102).
 
 use ipc::Refused;
 use ipc_keyd::{
@@ -252,9 +270,20 @@ pub struct GrantReport {
     pub outcome: Outcome<()>,
 }
 
+/// A first administrator for whom the manifest names no salt: the ceremony
+/// sends nothing (A-102, docs/52 N4 — keyd binds each grant's salt, and only
+/// the manifest's salt, written by `provision domain` with the directory's
+/// salt function, is the one `first-admin-secret` presents).
+/// Spec: docs/52 §4.2; docs/51 §4.3 steps 8, 11, 12.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissingSalt {
+    /// The administrator's position in the manifest's `first_admins`.
+    pub admin: usize,
+}
+
 /// What the ceremony did: the contact, then the steps attempted (in order;
-/// it stops after the first that did not succeed): the three key sets, then
-/// the first administrators' grants.
+/// it stops after the first that did not succeed): the three key sets, the
+/// first administrators' grants, then the seal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CeremonyReport {
     /// The `ping` that opened (and verified) the connection.
@@ -267,18 +296,34 @@ pub struct CeremonyReport {
     /// How many first administrators the manifest names (each needs its
     /// grant for the ceremony to be complete).
     pub first_admins: usize,
+    /// The `seal_ceremony` call (A-102), sent once every key set was created
+    /// and every grant registered; `None` when the ceremony stopped before.
+    pub seal: Option<Outcome<()>>,
 }
 
 impl CeremonyReport {
-    /// `true` if all three key sets were created and every first
-    /// administrator's initial secret was granted.
+    /// `true` if all three key sets were created, every first
+    /// administrator's initial secret was granted, and keyd's ceremony was
+    /// sealed (A-102).
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        self.contact.succeeded()
-            && self.steps.len() == Step::ALL.len()
-            && self.steps.iter().all(|step| step.outcome.succeeded())
+        self.grants_registered() && self.is_sealed()
+    }
+
+    /// `true` if all three key sets were created and every first
+    /// administrator's initial secret was granted (the seal may still be
+    /// missing).
+    #[must_use]
+    pub fn grants_registered(&self) -> bool {
+        self.key_sets_created()
             && self.grants.len() == self.first_admins
             && self.grants.iter().all(|grant| grant.outcome.succeeded())
+    }
+
+    /// `true` if keyd answered the seal `Ok` (A-102, docs/52 R3).
+    #[must_use]
+    pub fn is_sealed(&self) -> bool {
+        self.seal.as_ref().is_some_and(Outcome::succeeded)
     }
 
     /// `true` if all three key sets were created (the grants may still be
@@ -315,13 +360,28 @@ impl CeremonyReport {
 
 /// Run the ceremony for `manifest` through `client` (see the module
 /// documentation): contact, then `create_key` for each [`Step`] in order,
-/// then `grant_set_secret` for each first administrator in order, stopping
-/// at the first call that does not succeed. Never retries.
+/// then `grant_set_secret` for each first administrator in order, then
+/// `seal_ceremony` — stopping at the first call that does not succeed.
+/// Never retries.
+///
+/// # Errors
+/// [`MissingSalt`] — before anything is sent — when the manifest names no
+/// salt for a first administrator.
 ///
 /// Spec: docs/51 §4.3 step 11, §5.8 option (b); docs/10 §7; docs/50 R50-3;
-/// A-19; A-35; A-77; docs/questions/Q-367 (A-88: each call's fate from the
-/// client), Q-451.
-pub fn run<C: Connector>(client: &mut KeydClient<C>, manifest: &Manifest) -> CeremonyReport {
+/// docs/52 §4.2 (N4), §4.4 (R3); A-19; A-35; A-77; docs/questions/Q-367
+/// (A-88: each call's fate from the client), Q-451, Q-462 item 1.
+pub fn run<C: Connector>(
+    client: &mut KeydClient<C>,
+    manifest: &Manifest,
+) -> Result<CeremonyReport, MissingSalt> {
+    // A-102 (N4): every grant binds its salt; refuse before contacting keyd.
+    let salts = manifest
+        .first_admins()
+        .iter()
+        .enumerate()
+        .map(|(admin, first_admin)| first_admin.salt().ok_or(MissingSalt { admin }))
+        .collect::<Result<Vec<&str>, MissingSalt>>()?;
     let contact = classify(client.call_with_fate(&Call::Ping), |answer| match answer {
         Answer::Ping(result) => Some(result),
         _ => None,
@@ -330,12 +390,13 @@ pub fn run<C: Connector>(client: &mut KeydClient<C>, manifest: &Manifest) -> Cer
     let mut steps = Vec::with_capacity(Step::ALL.len());
     let mut grants = Vec::with_capacity(first_admins);
     if !contact.succeeded() {
-        return CeremonyReport {
+        return Ok(CeremonyReport {
             contact,
             steps,
             grants,
             first_admins,
-        };
+            seal: None,
+        });
     }
     for step in Step::ALL {
         let key_set = step.key_set(manifest);
@@ -350,21 +411,23 @@ pub fn run<C: Connector>(client: &mut KeydClient<C>, manifest: &Manifest) -> Cer
         let stop = !outcome.succeeded();
         steps.push(StepReport { step, outcome });
         if stop {
-            return CeremonyReport {
+            return Ok(CeremonyReport {
                 contact,
                 steps,
                 grants,
                 first_admins,
-            };
+                seal: None,
+            });
         }
     }
-    for (admin, first_admin) in manifest.first_admins().iter().enumerate() {
+    for (admin, (first_admin, salt)) in manifest.first_admins().iter().zip(salts).enumerate() {
         let key_set = first_admin.key_set();
         let call = Call::GrantSetSecret {
             kind: AccountKind::User,
             targets: vec![SetSecretTarget {
                 handle: key_set.handle,
                 binding: key_set.binding.clone(),
+                salt: salt.to_owned(),
             }],
             lifetime_secs: MAX_INITIAL_SECRET_GRANT_SECS,
         };
@@ -375,13 +438,29 @@ pub fn run<C: Connector>(client: &mut KeydClient<C>, manifest: &Manifest) -> Cer
         let stop = !outcome.succeeded();
         grants.push(GrantReport { admin, outcome });
         if stop {
-            break;
+            return Ok(CeremonyReport {
+                contact,
+                steps,
+                grants,
+                first_admins,
+                seal: None,
+            });
         }
     }
-    CeremonyReport {
+    // A-102 (docs/52 R3): the ceremony ends with the seal — after it keyd
+    // offers Role::Admin nothing that is not a dird decision.
+    let seal = classify(
+        client.call_with_fate(&Call::SealCeremony),
+        |answer| match answer {
+            Answer::SealCeremony(result) => Some(result),
+            _ => None,
+        },
+    );
+    Ok(CeremonyReport {
         contact,
         steps,
         grants,
         first_admins,
-    }
+        seal: Some(seal),
+    })
 }

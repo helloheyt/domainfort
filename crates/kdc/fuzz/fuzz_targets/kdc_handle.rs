@@ -461,18 +461,24 @@ fn build() -> FuzzState {
             MACHINE_SALT,
         ),
     ] {
-        // The grant dird registers after its PDP (task A15a; docs/51 §5.8).
-        keyd.grant_set_secret(
+        // The set-secret decision dird registers after its PDP (task A15a;
+        // docs/51 §5.8; A-102: binding and salt bound, N4).
+        keyd.register_decision(
             &LDAP,
-            kind,
-            &[SetSecretTarget {
-                handle,
-                binding: PrincipalBinding::new(realm.clone(), binding.clone()),
-            }],
+            keyd::DecisionId::new(u64::from(handle.principal.as_bytes()[0])),
+            &keyd::DecidedOperation::SetSecret {
+                kind,
+                targets: vec![SetSecretTarget {
+                    handle,
+                    binding: PrincipalBinding::new(realm.clone(), binding.clone()),
+                    salt: String::from(salt),
+                }],
+            },
+            &[],
             MAX_SET_SECRET_GRANT_SECS,
             &n,
         )
-        .expect("grant registered");
+        .expect("decision registered");
         keyd.set_secret(
             &DIRECTORY,
             &handle,

@@ -72,8 +72,8 @@ use ipc_dird_admin::{
     AccountExpires, AccountKind, AdminClient, Auth, LookupKey, Operation, PasswordSetOutcome,
     RefusalStatus, Reply, Request, Unserved, MAX_REQUEST_BODY,
 };
-use keyd::{InMemoryKeyStore, KeyHandle, KeyPurpose, Keyd, Role};
-use keyd_daemon::{CallerMap, RecordBuffer};
+use keyd::{DecisionId, InMemoryKeyStore, KeyHandle, KeyPurpose, Keyd, Kvno, Role};
+use keyd_daemon::{CallerMap, ExtraListener, RecordBuffer};
 use krb_crypto::ProtocolKey;
 use krb_proto::constants::{DOMAIN_X500_COMPRESS, KRB_NT_PRINCIPAL};
 use krb_proto::{
@@ -618,14 +618,16 @@ fn by(requester: &str, approvers: &[&str], operation: Operation) -> Request {
 
 /// keyd with the admin service's key set (`create_key`, docs/51 §4.3 step
 /// 11) — the scripted entropy gives it [`ADMIN_SERVICE_KEY`] for each of
-/// keyd's enctypes.
+/// keyd's enctypes — and, as the ceremony makes them, the krbtgt and LDAP
+/// service key sets (counter-drawn keys: the key-operation decisions of
+/// A-102 run on them). The store holds krbtgt: tests only (D178).
 fn admin_keyd(
     started: &KerberosTime,
 ) -> Result<Keyd<InMemoryKeyStore, RecordBuffer, common::TestEntropy>, keyd::ConfigError> {
     let entropy = common::TestEntropy::default();
     let mut keyd = Keyd::with_entropy(
         support::keyd_config(),
-        InMemoryKeyStore::new(64),
+        InMemoryKeyStore::new_insecure_development_allowing_krbtgt(64),
         RecordBuffer::new(),
         entropy.clone(),
         started,
@@ -651,6 +653,18 @@ fn admin_keyd(
         &common::now(),
     )
     .unwrap();
+    for target in [
+        manifest().krbtgt().clone(),
+        manifest().ldap_service().clone(),
+    ] {
+        keyd.create_key(
+            &common::ADMIN,
+            &target.handle,
+            &target.binding,
+            &common::now(),
+        )
+        .unwrap();
+    }
     let _ = keyd.audit_sink_mut().take();
     Ok(keyd)
 }
@@ -970,9 +984,10 @@ struct Options {
     key_request_lifetime: Duration,
     /// dird's decision-acknowledgement wait (A-95 follow-up, Q-441).
     ack_deadline: DecisionAckDeadline,
-    /// dird's keyd client refuses every set_secret grant (task A15a: the
-    /// fail-closed path of `BeginPasswordSet`).
-    refuse_grants: bool,
+    /// dird's keyd client registers no decision (task A15a, A-102: the
+    /// fail-closed paths of `BeginPasswordSet` and of the quorum-completing
+    /// `Approve`).
+    refuse_decisions: bool,
 }
 
 /// The decision-acknowledgement wait of the tests that expect auditd to
@@ -994,17 +1009,17 @@ impl Default for Options {
             hook: false,
             key_request_lifetime: directory_admin::KEY_REQUEST_LIFETIME,
             ack_deadline: generous(),
-            refuse_grants: false,
+            refuse_decisions: false,
         }
     }
 }
 
-/// dird's keyd client with every set_secret grant refused as "not
-/// performed" — the real verifier otherwise (task A15a; a keyd that cannot
-/// register the grant).
-struct RefusingGrants(Box<dyn TicketVerifier>);
+/// dird's keyd client with every decision's registration refused as "not
+/// performed" — the real verifier otherwise (task A15a, A-102; a keyd that
+/// cannot register it).
+struct RefusingDecisions(Box<dyn TicketVerifier>);
 
-impl TicketVerifier for RefusingGrants {
+impl TicketVerifier for RefusingDecisions {
     fn verify(
         &mut self,
         service: &KeyHandle,
@@ -1013,13 +1028,14 @@ impl TicketVerifier for RefusingGrants {
         self.0.verify(service, ap_req)
     }
 
-    fn grant_set_secret(
+    fn register_decision(
         &mut self,
-        _kind: keyd::AccountKind,
-        _targets: &[keyd::SetSecretTarget],
+        _id: DecisionId,
+        _operation: &keyd::DecidedOperation,
+        _approvers: &[keyd::PrincipalId],
         _lifetime_secs: u32,
-    ) -> Result<(), directory_daemon::GrantFailure> {
-        Err(directory_daemon::GrantFailure::NotPerformed)
+    ) -> Result<(), directory_daemon::RegistrationFailure> {
+        Err(directory_daemon::RegistrationFailure::NotPerformed)
     }
 }
 
@@ -1039,6 +1055,10 @@ struct World {
     /// dird's clock offset in seconds (task A10).
     clock_offset: Arc<std::sync::atomic::AtomicI64>,
     keyd_socket: PathBuf,
+    /// The same keyd, the test's uid as Role::Admin (keyadm's — A-102).
+    keyd_admin_socket: PathBuf,
+    /// The same keyd, the test's uid as Role::Directory (admind's).
+    keyd_directory_socket: PathBuf,
     options: Options,
 }
 
@@ -1056,7 +1076,7 @@ fn start_dird(
     params.clock = SharedClock::new(FixedNow(Arc::clone(clock_offset)));
     let realm = common::realm();
     let keyd_socket = keyd_socket.to_path_buf();
-    let refuse_grants = options.refuse_grants;
+    let refuse_decisions = options.refuse_decisions;
     let factory: VerifierFactory = Arc::new(move || {
         let client = ipc_keyd::KeydClient::new(
             support::connector::keyd(&keyd_socket),
@@ -1066,8 +1086,8 @@ fn start_dird(
         .ok()?;
         let verifier: Box<dyn TicketVerifier> =
             Box::new(KeydTicketVerifier::new(client, realm.clone()));
-        if refuse_grants {
-            let refusing: Box<dyn TicketVerifier> = Box::new(RefusingGrants(verifier));
+        if refuse_decisions {
+            let refusing: Box<dyn TicketVerifier> = Box::new(RefusingDecisions(verifier));
             return Some(refusing);
         }
         Some(verifier)
@@ -1122,6 +1142,21 @@ impl World {
             support::keyd::params(&dir, CallerMap::new(&[(uid, Role::Ldap)]).unwrap(), uid);
         keyd_params.audit.socket = dir.join("ka.sock");
         let keyd_socket = keyd_params.keyd_socket.clone();
+        // A-102: keyadm's (Admin) and admind's (Directory) roles on the same
+        // engine, so the decisions dird registers can be executed (the
+        // single-uid test seam of docs/questions/Q-453 item 3).
+        let keyd_admin_socket = dir.join("kk.sock");
+        let keyd_directory_socket = dir.join("kd.sock");
+        keyd_params.extra_listeners = vec![
+            ExtraListener {
+                socket: keyd_admin_socket.clone(),
+                callers: CallerMap::new(&[(uid, Role::Admin)]).unwrap(),
+            },
+            ExtraListener {
+                socket: keyd_directory_socket.clone(),
+                callers: CallerMap::new(&[(uid, Role::Directory)]).unwrap(),
+            },
+        ];
         let keyd_auditd = support::FakeAuditd::start(&keyd_params.audit.socket);
         let clock = support::TestClock::at(common::keyd_started());
         let keyd = support::keyd::Daemon::start(keyd_params, clock.clone(), admin_keyd).unwrap();
@@ -1171,8 +1206,33 @@ impl World {
             seen_at_decision,
             clock_offset,
             keyd_socket,
+            keyd_admin_socket,
+            keyd_directory_socket,
             options,
         })
+    }
+
+    /// A keyd client on `socket` (the test's uid, keyd's uid checked).
+    fn keyd_client(
+        &self,
+        socket: &Path,
+    ) -> ipc_keyd::KeydClient<support::connector::KeydConnector> {
+        ipc_keyd::KeydClient::new(
+            support::connector::keyd(socket),
+            self.uid,
+            ipc_keyd::DEFAULT_DEADLINE,
+        )
+        .unwrap()
+    }
+
+    /// keyadm's view of keyd (Role::Admin).
+    fn keyadm(&self) -> ipc_keyd::KeydClient<support::connector::KeydConnector> {
+        self.keyd_client(&self.keyd_admin_socket)
+    }
+
+    /// admind's view of keyd (Role::Directory).
+    fn admind_keyd(&self) -> ipc_keyd::KeydClient<support::connector::KeydConnector> {
+        self.keyd_client(&self.keyd_directory_socket)
     }
 
     /// Stop dird and start it again over the same store, keyd and auditd
@@ -2000,17 +2060,13 @@ fn without_the_admin_service_object_dird_serves_on() {
 // Task A10: dual-controlled key operations (docs/51 §5.6, §6).
 // ---------------------------------------------------------------------------
 
-use ipc_dird_admin::{KeyOperation, KeyOperationOutcome, KeyRef, KeyRequestState, KeyadmRequest};
+use ipc_dird_admin::{KeyOperation, KeyRef, KeyRequestState};
 
 fn key_state(reply: Reply) -> KeyRequestState {
     match reply {
         Reply::KeyRequest(state) => state,
         other => panic!("expected KeyRequest, got {other:?}"),
     }
-}
-
-fn keyadm(request: KeyadmRequest) -> Request {
-    Request::Keyadm(request)
 }
 
 fn request_op(requester: &str, operation: KeyOperation) -> Request {
@@ -2035,16 +2091,17 @@ fn sid_value(sid: &Sid) -> ipc_audit::SidValue {
     ipc_audit::SidValue::new(sid.identifier_authority(), sid.sub_authority().to_vec()).unwrap()
 }
 
-/// docs/51 §5.6, §6 (R51-11, R51-14); P-22; A-85: `rotate_krbtgt` from
-/// request to completion — admin1 requests (PolicyAdmin on `keys`), admin2
-/// approves the exact operation (the digest is shown back), keyadm fetches
-/// it once (the krbtgt handle, admin1 and admin2 by objectGUID — what keyd's
-/// `DualControlToken` names) and reports the new kvno; every step has its
-/// `DirAdmin` event with the request id, the keyd operation, the target and
-/// the parties; `Complete` adds an `Outcome` with the reported kvno. Nothing
-/// of the directory is written.
+/// docs/51 §5.6, §6 (R51-11, R51-14); P-22; A-85; docs/52 §4.2, §4.3, §4.5
+/// (A-102): `rotate_krbtgt` from request to execution — admin1 requests
+/// (PolicyAdmin on `keys`), an approval naming another operation is refused
+/// (the digest binds), admin2's approval completes the quorum and **dird
+/// registers the decision in keyd** (Role::Ldap, its decision event
+/// acknowledged first, then an `Outcome` event of the registration); keyadm
+/// (Role::Admin on the same keyd) executes it by the request's id — kvno 2
+/// with the approvers keyd took from the decision — and a replay returns the
+/// recorded result. Nothing of the directory is written.
 #[test]
-fn rotate_krbtgt_request_approve_fetch_complete() {
+fn rotate_krbtgt_request_approve_registers_the_decision() {
     let Some(world) = World::new(Options::default()) else {
         return;
     };
@@ -2058,12 +2115,11 @@ fn rotate_krbtgt_request_approve_fetch_complete() {
     assert_eq!(state.operation, KeyOperation::RotateKrbtgt);
     assert_eq!((state.approvals, state.quorum), (0, 2));
     let id = state.id;
-    // Fetched before approval ⇒ refused (not approved).
+    // Not approved yet: keyd holds no decision.
+    let mut keyadm = world.keyadm();
     assert_eq!(
-        client
-            .call(&keyadm(KeyadmRequest::FetchApproved { id }))
-            .unwrap(),
-        Reply::Refused(RefusalStatus::ApprovalRequired)
+        keyadm.rotate_krbtgt(DecisionId::new(id)),
+        Err(keyd::Error::Denied)
     );
     // An approval naming another operation is refused (the digest binds).
     assert_eq!(
@@ -2086,8 +2142,6 @@ fn rotate_krbtgt_request_approve_fetch_complete() {
     );
     assert_eq!(approved.id, id);
     assert_eq!(approved.digest, state.digest);
-    assert_eq!(approved.operation, KeyOperation::RotateKrbtgt);
-    assert_eq!((approved.approvals, approved.quorum), (1, 2));
     assert!(approved.approved());
     // A further approval after the quorum ⇒ refused.
     assert_eq!(
@@ -2096,75 +2150,19 @@ fn rotate_krbtgt_request_approve_fetch_complete() {
             .unwrap(),
         Reply::Refused(RefusalStatus::Denied)
     );
-    // Complete before the fetch ⇒ refused.
-    assert_eq!(
-        client
-            .call(&keyadm(KeyadmRequest::Complete {
-                id,
-                outcome: KeyOperationOutcome::Performed { kvno: Some(2) },
-            }))
-            .unwrap(),
-        Reply::Refused(RefusalStatus::ApprovalRequired)
-    );
-    let fetched = match client
-        .call(&keyadm(KeyadmRequest::FetchApproved { id }))
-        .unwrap()
-    {
-        Reply::Approved(fetched) => fetched,
-        other => panic!("{other:?}"),
-    };
-    assert_eq!(fetched.id, id);
-    assert_eq!(fetched.digest, state.digest);
-    assert_eq!(fetched.operation, KeyOperation::RotateKrbtgt);
-    assert_eq!(fetched.principal, g(KRBTGT));
-    assert_eq!(fetched.requester, g(ADMIN1));
-    assert_eq!(fetched.approvers, vec![g(ADMIN2)]);
-    // Once only.
-    assert_eq!(
-        client
-            .call(&keyadm(KeyadmRequest::FetchApproved { id }))
-            .unwrap(),
-        Reply::Refused(RefusalStatus::Conflict)
-    );
-    // A rotation reports its new kvno: a report without one is refused.
-    assert_eq!(
-        client
-            .call(&keyadm(KeyadmRequest::Complete {
-                id,
-                outcome: KeyOperationOutcome::Performed { kvno: None },
-            }))
-            .unwrap(),
-        Reply::Refused(RefusalStatus::Invalid)
-    );
-    assert_eq!(
-        client
-            .call(&keyadm(KeyadmRequest::Complete {
-                id,
-                outcome: KeyOperationOutcome::Performed { kvno: Some(2) },
-            }))
-            .unwrap(),
-        Reply::Done
-    );
-    // The request is gone.
-    assert_eq!(
-        client
-            .call(&keyadm(KeyadmRequest::FetchApproved { id }))
-            .unwrap(),
-        Reply::Refused(RefusalStatus::NotFound)
-    );
+    // keyadm executes the decision by the request's id; a replay returns
+    // the recorded kvno (docs/52 §3.10 (a)).
+    assert_eq!(keyadm.rotate_krbtgt(DecisionId::new(id)), Ok(Kvno::new(2)));
+    assert_eq!(keyadm.rotate_krbtgt(DecisionId::new(id)), Ok(Kvno::new(2)));
     assert_eq!(change_seq_next(&world.store), seq, "nothing written");
 
-    // The audit trail.
+    // dird's trail: the completing approval's decision, then the
+    // registration's outcome.
     let requested = await_events(&world, DirAdminOperation::RequestKeyOperation, 1);
     assert_eq!(decision(&requested[0]), PROCEED);
     assert_eq!(requested[0].key_request, Some(id));
-    assert_eq!(
-        requested[0].key_operation,
-        Some(ipc_audit::KeydOperation::RotateKrbtgt)
-    );
     assert_eq!(requested[0].target, Some(g(KRBTGT).to_packet()));
-    assert_eq!(requested[0].requester, Some(sid_value(&sid_of(ADMIN1))));
-    let approvals = await_events(&world, DirAdminOperation::Approve, 3);
+    let approvals = await_events(&world, DirAdminOperation::Approve, 4);
     assert_eq!(
         decision(&approvals[0]),
         refused(ipc_audit::AdminRefusal::OperationMismatch)
@@ -2176,50 +2174,61 @@ fn rotate_krbtgt_request_approve_fetch_complete() {
         &[sid_value(&sid_of(ADMIN2))]
     );
     assert_eq!(
-        decision(&approvals[2]),
-        refused(ipc_audit::AdminRefusal::ApproverNotDistinct)
-    );
-    let fetches = await_events(&world, DirAdminOperation::FetchApproved, 4);
-    assert_eq!(
-        fetches.iter().map(decision).collect::<Vec<_>>(),
-        vec![
-            refused(ipc_audit::AdminRefusal::NotApproved),
-            PROCEED,
-            refused(ipc_audit::AdminRefusal::Conflict),
-            refused(ipc_audit::AdminRefusal::PendingUnknown),
-        ]
-    );
-    let completes = await_events(&world, DirAdminOperation::Complete, 4);
-    assert_eq!(
-        decision(&completes[0]),
-        refused(ipc_audit::AdminRefusal::NotApproved)
-    );
-    assert_eq!(
-        decision(&completes[1]),
-        refused(ipc_audit::AdminRefusal::ValueInvalid)
-    );
-    assert_eq!(decision(&completes[2]), PROCEED);
-    assert_eq!(
-        completes[3].stage,
+        approvals[2].stage,
         DirAdminStage::Outcome(OutcomeResult::Committed { allocated: None })
     );
-    assert_eq!(completes[2].operation_id, completes[3].operation_id);
-    assert_eq!(completes[3].reported_kvnos.as_slice(), &[2]);
-    assert_eq!(completes[3].key_request, Some(id));
-    assert_eq!(completes[3].approvers.len(), 1);
+    assert_eq!(approvals[1].operation_id, approvals[2].operation_id);
+    assert_eq!(approvals[2].key_request, Some(id));
+    assert_eq!(
+        decision(&approvals[3]),
+        refused(ipc_audit::AdminRefusal::ApproverNotDistinct)
+    );
+    // keyd's trail: dird registered it (intent, then success) with the
+    // requester and approver from the decision; keyadm's execution carries
+    // the decision id and those approvers.
+    let registered = keyd_records_for(
+        &world,
+        ipc_audit::KeydOperation::RegisterDecision,
+        g(KRBTGT),
+    );
+    assert_eq!(registered.len(), 2);
+    assert_eq!(registered[0].result, ipc_audit::KeydOutcome::Intent);
+    assert_eq!(registered[1].result, ipc_audit::KeydOutcome::Success);
+    assert_eq!(registered[1].caller_role, ipc_audit::KeydRole::Ldap);
+    assert_eq!(registered[1].decision, Some(id));
+    assert_eq!(
+        registered[1].approvers,
+        Some([g(ADMIN1).to_packet(), g(ADMIN2).to_packet()])
+    );
+    let rotations = keyd_records_for(&world, ipc_audit::KeydOperation::RotateKrbtgt, g(KRBTGT));
+    let performed: Vec<_> = rotations
+        .iter()
+        .filter(|r| r.result == ipc_audit::KeydOutcome::Success && r.decision == Some(id))
+        .collect();
+    assert_eq!(performed.len(), 2, "the execution and its replay");
+    assert_eq!(performed[0].kvno, Some(2));
+    assert_eq!(performed[0].caller_role, ipc_audit::KeydRole::Admin);
+    assert_eq!(
+        performed[0].approvers,
+        Some([g(ADMIN1).to_packet(), g(ADMIN2).to_packet()])
+    );
+    assert_eq!(performed[1].reason, ipc_audit::KeydReason::DecisionReplayed);
 }
 
-/// docs/51 §6 (`rotate-key` of a service object's randomized key set):
-/// request → approve → fetch → complete for the LDAP service object; a
-/// computer that is not a service object, and a kvno 0 to retire, are
-/// refused at the request; keyadm's other outcomes are recorded in the
-/// `Outcome` event (task A10's appended codes, Q-421).
+/// docs/51 §6 (`rotate-key` of a service object's randomized key set,
+/// `retire-kvno` after it); docs/52 §4.3 (A-102): each approved request
+/// becomes a decision keyadm executes in keyd by its id — the LDAP service
+/// key set rotated to kvno 2, then its kvno 1 retired; a computer that is
+/// not a service object, and a kvno 0 to retire, are refused at the
+/// request; executing a decision with the wrong operation is refused and
+/// does not consume it (keyd's rule, through dird's decision).
 #[test]
-fn rotate_key_request_approve_fetch_complete() {
+fn rotate_key_and_retire_kvno_decisions_are_executed_by_id() {
     let Some(world) = World::new(Options::default()) else {
         return;
     };
     let mut client = world.client();
+    let mut keyadm = world.keyadm();
     let rotate = KeyOperation::RotateKey {
         service: g(LDAP_SVC),
     };
@@ -2229,23 +2238,9 @@ fn rotate_key_request_approve_fetch_complete() {
             .call(&approve_op("admin2", state.id, rotate))
             .unwrap(),
     );
-    let fetched = match client
-        .call(&keyadm(KeyadmRequest::FetchApproved { id: state.id }))
-        .unwrap()
-    {
-        Reply::Approved(fetched) => fetched,
-        other => panic!("{other:?}"),
-    };
-    assert_eq!(fetched.principal, g(LDAP_SVC));
-    assert_eq!(
-        client
-            .call(&keyadm(KeyadmRequest::Complete {
-                id: state.id,
-                outcome: KeyOperationOutcome::Performed { kvno: Some(2) },
-            }))
-            .unwrap(),
-        Reply::Done
-    );
+    let id = DecisionId::new(state.id);
+    assert_eq!(keyadm.retire_kvno(id), Err(keyd::Error::Denied));
+    assert_eq!(keyadm.rotate_key(id), Ok(Kvno::new(2)));
     // Not a service object (a user), and a kvno 0 to retire.
     for operation in [
         KeyOperation::RotateKey { service: g(BOB) },
@@ -2259,9 +2254,9 @@ fn rotate_key_request_approve_fetch_complete() {
             Reply::Refused(RefusalStatus::Invalid)
         );
     }
-    // retire_kvno of the krbtgt key set, reported refused by keyd.
+    // retire_kvno of the LDAP service key set's kvno 1, now previous.
     let retire = KeyOperation::RetireKvno {
-        key: KeyRef::Krbtgt,
+        key: KeyRef::Service(g(LDAP_SVC)),
         kvno: 1,
     };
     let state = key_state(client.call(&request_op("admin1", retire)).unwrap());
@@ -2270,34 +2265,60 @@ fn rotate_key_request_approve_fetch_complete() {
             .call(&approve_op("admin2", state.id, retire))
             .unwrap(),
     );
-    assert!(matches!(
-        client
-            .call(&keyadm(KeyadmRequest::FetchApproved { id: state.id }))
-            .unwrap(),
-        Reply::Approved(_)
-    ));
+    assert_eq!(keyadm.retire_kvno(DecisionId::new(state.id)), Ok(()));
+    let approvals = await_events(&world, DirAdminOperation::Approve, 4);
     assert_eq!(
-        client
-            .call(&keyadm(KeyadmRequest::Complete {
-                id: state.id,
-                outcome: KeyOperationOutcome::OutcomeUnknown,
-            }))
-            .unwrap(),
-        Reply::Done
-    );
-    let completes = await_events(&world, DirAdminOperation::Complete, 4);
-    assert_eq!(
-        completes[1].stage,
+        approvals[1].stage,
         DirAdminStage::Outcome(OutcomeResult::Committed { allocated: None })
     );
-    assert_eq!(completes[1].target, Some(g(LDAP_SVC).to_packet()));
+    assert_eq!(approvals[1].target, Some(g(LDAP_SVC).to_packet()));
     assert_eq!(
-        completes[3].stage,
+        approvals[3].stage,
+        DirAdminStage::Outcome(OutcomeResult::Committed { allocated: None })
+    );
+}
+
+/// docs/52 §4.3 (A-102); docs/questions/Q-453 item 1 (fail closed): when
+/// keyd does not register the decision of the quorum-completing `Approve`,
+/// dird records the registration's failure (`Outcome(Failed(
+/// KeyOperationNotPerformed))`), withdraws the approval and answers
+/// `Unavailable` — keyd holds no decision, and the approver may approve
+/// again (answered `Unavailable` again here, not `Conflict`).
+#[test]
+fn a_decision_keyd_does_not_register_withdraws_the_approval() {
+    let Some(world) = World::new(Options {
+        refuse_decisions: true,
+        ..Options::default()
+    }) else {
+        return;
+    };
+    let mut client = world.client();
+    let state = key_state(
+        client
+            .call(&request_op("admin1", KeyOperation::RotateKrbtgt))
+            .unwrap(),
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            client
+                .call(&approve_op("admin2", state.id, KeyOperation::RotateKrbtgt))
+                .unwrap(),
+            Reply::Refused(RefusalStatus::Unavailable)
+        );
+    }
+    assert_eq!(
+        world.keyadm().rotate_krbtgt(DecisionId::new(state.id)),
+        Err(keyd::Error::Denied)
+    );
+    let approvals = await_events(&world, DirAdminOperation::Approve, 4);
+    assert_eq!(decision(&approvals[0]), PROCEED);
+    assert_eq!(
+        approvals[1].stage,
         DirAdminStage::Outcome(OutcomeResult::Failed(
-            ipc_audit::AdminFailure::KeyOperationOutcomeUnknown
+            ipc_audit::AdminFailure::KeyOperationNotPerformed
         ))
     );
-    assert!(completes[3].reported_kvnos.is_empty());
+    assert_eq!(decision(&approvals[2]), PROCEED);
 }
 
 /// docs/51 §5.6 (distinct, `decide` = Allow for the same Action and
@@ -2362,11 +2383,10 @@ fn approvals_must_be_distinct_and_allowed() {
             .unwrap(),
         Reply::Refused(RefusalStatus::Invalid)
     );
+    // Nothing was approved: keyd holds no decision (A-102).
     assert_eq!(
-        client
-            .call(&keyadm(KeyadmRequest::FetchApproved { id: state.id }))
-            .unwrap(),
-        Reply::Refused(RefusalStatus::ApprovalRequired)
+        world.keyadm().rotate_krbtgt(DecisionId::new(state.id)),
+        Err(keyd::Error::Denied)
     );
     let approvals = await_events(&world, DirAdminOperation::Approve, 3);
     assert_eq!(
@@ -2458,8 +2478,9 @@ fn pending_requests_are_bounded_in_time_and_number() {
 }
 
 /// docs/51 §5.6 ("a restart of dird ⇒ the requests vanish (fail closed)"):
-/// an approved request is gone after dird restarts — neither its fetch nor
-/// a further approval finds it.
+/// an approved request is gone after dird restarts — a further approval
+/// does not find it (the decision its approval registered lives on in keyd
+/// until it expires — keyd's table, A-102).
 #[test]
 fn a_dird_restart_drops_pending_requests() {
     let Some(mut world) = World::new(Options::default()) else {
@@ -2486,7 +2507,7 @@ fn a_dird_restart_drops_pending_requests() {
     let mut client = world.client();
     assert_eq!(
         client
-            .call(&keyadm(KeyadmRequest::FetchApproved { id }))
+            .call(&approve_op("admin2", id, KeyOperation::RotateKrbtgt))
             .unwrap(),
         Reply::Refused(RefusalStatus::NotFound)
     );
@@ -2497,33 +2518,54 @@ fn a_dird_restart_drops_pending_requests() {
             .unwrap(),
     );
     assert_ne!(state.id, id);
-    let fetches = await_events(&world, DirAdminOperation::FetchApproved, 1);
+    let approvals = await_events(&world, DirAdminOperation::Approve, 3);
     assert_eq!(
-        decision(&fetches[0]),
+        decision(&approvals[2]),
         refused(ipc_audit::AdminRefusal::PendingUnknown)
     );
 }
 
 /// docs/51 §6, §9 (`destroy-sweep`: the tombstones of user / computer
-/// objects, GUID + classes — A-18): after a `Delete` of bob, the listing
-/// names him as a user; a group or OU tombstone is not listed; the listing
-/// is audited.
+/// objects, GUID + classes — A-18); docs/52 §4.3 row `destroy_key_set`
+/// option (a) (A-102): after a committed `Delete` of bob, dird registers a
+/// `DestroyKeySet` decision for his tombstone under the `Delete`'s
+/// operation id — keyadm's listing (Role::Admin) shows exactly it (the
+/// deleted group, which has no key sets, gets none); executing it destroys
+/// the key set admind set for bob earlier (on dird's `SetSecret` decision).
 #[test]
-fn the_pending_destruction_listing_names_deleted_accounts() {
+fn a_delete_registers_a_destroy_decision_for_the_tombstone() {
     let Some(world) = World::new(Options::default()) else {
         return;
     };
     let mut client = world.client();
-    let page = |client: &mut AdminClient<AdminConnector>| match client
-        .call(&keyadm(KeyadmRequest::ListPendingDestruction {
-            cursor: None,
-        }))
+    let mut keyadm = world.keyadm();
+    assert!(keyadm
+        .list_destroy_decisions(None)
         .unwrap()
-    {
-        Reply::PendingDestruction(page) => page,
-        other => panic!("{other:?}"),
+        .entries
+        .is_empty());
+    // bob gets a key set first: dird's SetSecret decision, admind's
+    // set_secret with exactly its binding and salt.
+    let Reply::PasswordSet(set) = client
+        .call(&by(
+            "admin1",
+            &[],
+            Operation::BeginPasswordSet { target: g(BOB) },
+        ))
+        .unwrap()
+    else {
+        panic!("a PasswordSet reply");
     };
-    assert!(page(&mut client).entries.is_empty());
+    let target = &set.keys[0];
+    assert_eq!(
+        world.admind_keyd().set_secret(
+            &target.handle,
+            &target.binding,
+            zeroize::Zeroizing::new(String::from("bob's first password")),
+            set.salt.as_str(),
+        ),
+        Ok(Kvno::new(1))
+    );
     assert_eq!(
         client
             .call(&by("admin1", &[], Operation::Delete { target: g(BOB) }))
@@ -2542,17 +2584,28 @@ fn the_pending_destruction_listing_names_deleted_accounts() {
             .unwrap(),
         Reply::Done
     );
-    let listed = page(&mut client);
+    let deletes = await_events(&world, DirAdminOperation::Delete, 4);
+    let listed = keyadm.list_destroy_decisions(None).unwrap();
+    assert_eq!(listed.entries.len(), 1);
     assert_eq!(
-        listed.entries,
-        vec![ipc_dird_admin::DestructionEntry {
-            guid: g(BOB),
-            kind: AccountKind::User,
-        }]
+        listed.entries[0].principal,
+        keyd::PrincipalId::from_bytes(g(BOB).to_packet())
     );
+    assert_eq!(listed.entries[0].decision.get(), deletes[0].operation_id);
     assert_eq!(listed.next, None);
-    let events = await_events(&world, DirAdminOperation::ListPendingDestruction, 2);
-    assert!(events.iter().all(|e| decision(e) == PROCEED));
+    assert_eq!(keyadm.destroy_key_set(listed.entries[0].decision), Ok(()));
+    assert!(keyadm
+        .list_destroy_decisions(None)
+        .unwrap()
+        .entries
+        .is_empty());
+    let destroyed = keyd_records_for(&world, ipc_audit::KeydOperation::DestroyKeySet, g(BOB));
+    let done = destroyed
+        .iter()
+        .find(|r| r.result == ipc_audit::KeydOutcome::Success)
+        .unwrap();
+    assert_eq!(done.kvno, Some(1));
+    assert_eq!(done.decision, Some(deletes[0].operation_id));
 }
 
 /// A-95 follow-up (docs/questions/Q-417 item 3, Q-441): dird's
@@ -2591,17 +2644,18 @@ fn the_decision_ack_deadline_is_bounded() {
             Err(DecisionAckDeadlineOutOfRange)
         );
     }
-    // Three AP-REQ verifications and the set_secret grant (A15a).
+    // Three AP-REQ verifications and one decision's registration (A15a,
+    // A-102).
     let worst = 2 * (4 * ipc_keyd::DEFAULT_DEADLINE + MAX_DECISION_ACK_DEADLINE);
     assert!(worst <= ipc_dird_admin::DEFAULT_DEADLINE);
 }
 
 // ---------------------------------------------------------------------------
-// The set_secret grant (task A15a; docs/51 §5.8 option (b); docs/questions/
-// Q-450, Q-453).
+// The SetSecret decision (task A15a; docs/51 §5.8 option (b); docs/questions/
+// Q-450, Q-453; A-102: a decision of keyd's table, the salt bound — N4).
 // ---------------------------------------------------------------------------
 
-/// keyd's records (Role::Ldap: dird's client) of `op` for `target`.
+/// keyd's records (every role of the one keyd) of `op` for `target`.
 fn keyd_records_for(
     world: &World,
     op: ipc_audit::KeydOperation,
@@ -2618,12 +2672,15 @@ fn keyd_records_for(
         .collect()
 }
 
-/// Q-453 item 1: a committed `BeginPasswordSet` registers keyd's grant for
-/// exactly the key targets of the reply — under Role::Ldap, an intent first
-/// (a loosening, Q-452) — after dird's decision and outcome events
-/// (`Proceed`, then `Committed`).
+/// Q-453 item 1; docs/52 §4.2, §4.3 (A-102, N4): a committed
+/// `BeginPasswordSet` registers keyd's `SetSecret` decision for exactly the
+/// key targets and salt of the reply — under Role::Ldap, an intent first (a
+/// loosening, Q-452), the decision id = the operation's id — after dird's
+/// decision and outcome events (`Proceed`, then `Committed`). admind's
+/// `set_secret` with another salt is refused and consumes it; a new
+/// `BeginPasswordSet` and the right salt then succeed.
 #[test]
-fn begin_password_set_registers_the_grant_for_its_key_targets() {
+fn begin_password_set_registers_the_decision_for_its_key_targets() {
     let Some(world) = World::new(Options::default()) else {
         return;
     };
@@ -2640,9 +2697,9 @@ fn begin_password_set_registers_the_grant_for_its_key_targets() {
     };
     assert_eq!(set.keys.len(), 1);
     assert!(support::eventually(Duration::from_secs(10), || {
-        keyd_records_for(&world, ipc_audit::KeydOperation::GrantSetSecret, g(BOB)).len() >= 2
+        keyd_records_for(&world, ipc_audit::KeydOperation::RegisterDecision, g(BOB)).len() >= 2
     }));
-    let grants = keyd_records_for(&world, ipc_audit::KeydOperation::GrantSetSecret, g(BOB));
+    let grants = keyd_records_for(&world, ipc_audit::KeydOperation::RegisterDecision, g(BOB));
     assert_eq!(grants[0].result, ipc_audit::KeydOutcome::Intent);
     assert_eq!(grants[1].result, ipc_audit::KeydOutcome::Success);
     assert_eq!(grants[1].caller_role, ipc_audit::KeydRole::Ldap);
@@ -2656,16 +2713,59 @@ fn begin_password_set_registers_the_grant_for_its_key_targets() {
         DirAdminStage::Decision(DecisionResult::Proceed)
     );
     assert!(is_committed(&events[1]));
+    assert_eq!(grants[1].decision, Some(events[0].operation_id));
+    // N4: another salt is refused, and consumes the decision.
+    let target = &set.keys[0];
+    let mut admind = world.admind_keyd();
+    let password = || zeroize::Zeroizing::new(String::from("bob's next password"));
+    assert_eq!(
+        admind.set_secret(
+            &target.handle,
+            &target.binding,
+            password(),
+            "EXAMPLE.ORGother"
+        ),
+        Err(keyd::Error::Denied)
+    );
+    assert_eq!(
+        admind.set_secret(
+            &target.handle,
+            &target.binding,
+            password(),
+            set.salt.as_str()
+        ),
+        Err(keyd::Error::Denied)
+    );
+    let Reply::PasswordSet(set) = client
+        .call(&by(
+            "admin1",
+            &[],
+            Operation::BeginPasswordSet { target: g(BOB) },
+        ))
+        .unwrap()
+    else {
+        panic!("a PasswordSet reply");
+    };
+    assert_eq!(
+        admind.set_secret(
+            &target.handle,
+            &target.binding,
+            password(),
+            set.salt.as_str()
+        ),
+        Ok(Kvno::new(1))
+    );
 }
 
-/// Q-453 item 1 (fail closed): when keyd does not register the grant, the
-/// `BeginPasswordSet` is answered `Unavailable` — admind then sets no
-/// password. The write did commit (`pwdLastSet` moved; dird's outcome event
-/// says `Committed`): the begun-but-not-set state docs/51 §9 names as safe.
+/// Q-453 item 1 (fail closed; A-102): when keyd does not register the
+/// `SetSecret` decision, the `BeginPasswordSet` is answered `Unavailable` —
+/// admind then sets no password. The write did commit (`pwdLastSet` moved;
+/// dird's outcome event says `Committed`): the begun-but-not-set state
+/// docs/51 §9 names as safe.
 #[test]
-fn a_grant_keyd_does_not_register_answers_unavailable() {
+fn a_secret_decision_keyd_does_not_register_answers_unavailable() {
     let Some(world) = World::new(Options {
-        refuse_grants: true,
+        refuse_decisions: true,
         ..Options::default()
     }) else {
         return;
@@ -2689,7 +2789,9 @@ fn a_grant_keyd_does_not_register_answers_unavailable() {
         DirAdminStage::Decision(DecisionResult::Proceed)
     );
     assert!(is_committed(&events[1]));
-    // keyd holds no grant: dird's client never sent one.
+    // keyd holds no decision: dird's client never sent one.
     std::thread::sleep(Duration::from_millis(100));
-    assert!(keyd_records_for(&world, ipc_audit::KeydOperation::GrantSetSecret, g(BOB)).is_empty());
+    assert!(
+        keyd_records_for(&world, ipc_audit::KeydOperation::RegisterDecision, g(BOB)).is_empty()
+    );
 }

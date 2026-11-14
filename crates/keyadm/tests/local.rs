@@ -231,9 +231,10 @@ fn step(step: Step, outcome: Outcome<Kvno>) -> StepReport {
 }
 
 /// docs/51 §4.3 step 11; docs/10 §10 (handles, bindings and kvnos are not
-/// secret): a complete ceremony prints each key set's handle, binding and
-/// kvno — and, since task A15a, each first administrator's grant — and
-/// exits 0.
+/// secret); docs/52 §4.4 (A-102: the ceremony ends with the seal): a
+/// complete ceremony prints each key set's handle, binding and kvno — and,
+/// since task A15a, each first administrator's grant, and since A-102 that
+/// keyd is sealed — and exits 0.
 #[test]
 fn a_complete_report_prints_handles_bindings_and_kvnos() {
     let m = manifest();
@@ -250,6 +251,7 @@ fn a_complete_report_prints_handles_bindings_and_kvnos() {
             })
             .collect(),
         first_admins: m.first_admins().len(),
+        seal: Some(Outcome::Answered(Ok(()))),
     };
     assert!(report.is_complete());
     assert_eq!(report::exit_code(&report), EXIT_COMPLETE);
@@ -258,7 +260,9 @@ fn a_complete_report_prints_handles_bindings_and_kvnos() {
         "created krbtgt: principal 00000000-0000-0000-0000-000000000001 purpose Krbtgt binding NT-SRV-INST:krbtgt/EXAMPLE.TEST kvno 1",
         "created ldap service: principal 00000000-0000-0000-0000-000000000002 purpose Service binding NT-SRV-HST:ldap/dc1.example.test kvno 1",
         "created admin service: principal 00000000-0000-0000-0000-000000000003 purpose Service binding NT-SRV-HST:admind/dc1.example.test kvno 1",
-        "ceremony complete: 3 of 3 key sets created",
+        "keyd's ceremony sealed",
+        "ceremony complete and sealed: 3 of 3 key sets created",
+        "keyd is sealed: create_key and initial-secret grants no longer exist in keyd until it restarts with an empty store",
         "granted the initial secret of first administrator alice: principal 00000000-0000-0000-0000-000000000004 purpose PrincipalLongterm binding NT-PRINCIPAL:alice; live for 900 s",
         "2 of 2 first administrators' initial secrets granted",
         "run provision first-admin-secret within 15 minutes",
@@ -268,11 +272,82 @@ fn a_complete_report_prints_handles_bindings_and_kvnos() {
     // Without the grants the ceremony is not complete (task A15a).
     let without = CeremonyReport {
         grants: Vec::new(),
+        seal: None,
         ..report.clone()
     };
     assert!(!without.is_complete());
     assert!(without.key_sets_created());
     assert_eq!(report::exit_code(&without), EXIT_INCOMPLETE);
+    assert!(report::render(&without, &m)
+        .join("\n")
+        .contains("keyd is NOT sealed"));
+}
+
+/// docs/52 §4.4 (A-102, R3: the ceremony ends with the seal; a ceremony that
+/// did not seal says so): key sets created and grants registered but the
+/// seal refused, not performed or of unknown outcome ⇒ not complete, exit
+/// 2, the report says keyd is NOT known to be sealed and to restart keyd.
+#[test]
+fn a_ceremony_without_its_seal_is_incomplete() {
+    let m = manifest();
+    for (seal, text) in [
+        (
+            Outcome::Answered(Err(KeydError::Denied)),
+            "keyd refused the seal (denied)",
+        ),
+        (
+            Outcome::NotPerformed(Refused::Busy),
+            "seal: keyd is busy or cannot reach auditd (not performed)",
+        ),
+        (
+            Outcome::Unknown(Unknown::Transport(TransportError::Closed)),
+            "outcome unknown, keyd MAY be sealed",
+        ),
+    ] {
+        let report = CeremonyReport {
+            contact: Outcome::Answered(Ok(())),
+            steps: Step::ALL
+                .iter()
+                .map(|s| step(*s, Outcome::Answered(Ok(Kvno::new(1)))))
+                .collect(),
+            grants: (0..m.first_admins().len())
+                .map(|admin| GrantReport {
+                    admin,
+                    outcome: Outcome::Answered(Ok(())),
+                })
+                .collect(),
+            first_admins: m.first_admins().len(),
+            seal: Some(seal),
+        };
+        assert!(report.grants_registered());
+        assert!(!report.is_sealed());
+        assert!(!report.is_complete());
+        assert_eq!(report::exit_code(&report), EXIT_INCOMPLETE);
+        let rendered = report::render(&report, &m).join("\n");
+        assert!(rendered.contains(text), "{text}\n---\n{rendered}");
+        assert!(
+            rendered.contains("keyd is NOT known to be sealed"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("restart keyd"), "{rendered}");
+    }
+}
+
+/// docs/52 §2 row 37 (N4: the ceremony grant binds the salt) — the salt is
+/// the manifest's (`first_admin_salts`): a manifest without it is refused
+/// before anything is sent, and the report says to re-run provision domain.
+#[test]
+fn a_manifest_without_salts_is_refused_before_keyd() {
+    let m = manifest();
+    assert!(m.first_admins().iter().all(|a| a.salt().is_none()));
+    let lines = report::render_missing_salt(keyadm::ceremony::MissingSalt { admin: 1 }, &m);
+    let text = lines.join("\n");
+    assert!(
+        text.contains("no salt for first administrator bob"),
+        "{text}"
+    );
+    assert!(text.contains("nothing was sent to keyd"), "{text}");
+    assert!(text.contains("re-run provision domain"), "{text}");
 }
 
 /// Task A15a (docs/questions/Q-451): a grant keyd refuses stops the
@@ -294,6 +369,7 @@ fn a_refused_grant_stops_after_the_key_sets() {
             outcome: Outcome::Answered(Err(KeydError::Denied)),
         }],
         first_admins: m.first_admins().len(),
+        seal: None,
     };
     assert!(!report.is_complete());
     assert_eq!(report::exit_code(&report), EXIT_INCOMPLETE);
@@ -304,6 +380,7 @@ fn a_refused_grant_stops_after_the_key_sets() {
     );
     assert!(text.contains("0 of 2 first administrators' initial secrets granted"));
     assert!(text.contains("initial secret of a user that has no key set yet"));
+    assert!(text.contains("keyd is NOT sealed"), "{text}");
     let unknown = CeremonyReport {
         grants: vec![GrantReport {
             admin: 0,
@@ -332,6 +409,7 @@ fn a_refused_first_step_stops_and_explains() {
         )],
         grants: Vec::new(),
         first_admins: m.first_admins().len(),
+        seal: None,
     };
     assert_eq!(report::exit_code(&report), EXIT_INCOMPLETE);
     assert_eq!(
@@ -346,6 +424,7 @@ fn a_refused_first_step_stops_and_explains() {
     assert!(text.contains("0 of 3 key sets created; not attempted: ldap service, admin service"));
     assert!(text.contains("may already exist"));
     assert!(text.contains("restart keyd"));
+    assert!(text.contains("keyd is NOT sealed"));
 }
 
 /// The ceremony.rs table; Q-367 (A-88: "outcome unknown — check before
@@ -366,6 +445,7 @@ fn an_unknown_outcome_says_the_key_set_may_exist() {
         ],
         grants: Vec::new(),
         first_admins: m.first_admins().len(),
+        seal: None,
     };
     assert_eq!(report::exit_code(&report), EXIT_INCOMPLETE);
     assert_eq!(report.created(), [(Step::Krbtgt, Kvno::new(1))]);
@@ -419,6 +499,7 @@ fn the_three_fates_are_reported_apart() {
             steps: vec![step(Step::Krbtgt, outcome)],
             grants: Vec::new(),
             first_admins: m.first_admins().len(),
+            seal: None,
         };
         assert_eq!(report::exit_code(&report), EXIT_INCOMPLETE, "{expected}");
         assert_eq!(report.created(), []);
@@ -438,6 +519,7 @@ fn the_three_fates_are_reported_apart() {
             steps: Vec::new(),
             grants: Vec::new(),
             first_admins: m.first_admins().len(),
+            seal: None,
         };
         assert_eq!(report::exit_code(&contact), EXIT_NOTHING_ATTEMPTED);
         let text = report::render(&contact, &m).join("\n");
@@ -464,6 +546,7 @@ fn a_failed_contact_attempts_nothing() {
             steps: Vec::new(),
             grants: Vec::new(),
             first_admins: m.first_admins().len(),
+            seal: None,
         };
         assert_eq!(report::exit_code(&report), EXIT_NOTHING_ATTEMPTED);
         let text = report::render(&report, &m).join("\n");

@@ -19,12 +19,11 @@ use ipc_dird_admin::channel::{
     MAX_DN_COMPONENTS, MAX_NAME, MAX_PRINCIPAL_NAME,
 };
 use ipc_dird_admin::{
-    decode_request, encode_reply, AccountExpires, AccountKind, AdminReply, AdminRequest,
-    ApprovedKeyOperation, Auth, DestructionEntry, DestructionPage, Found, KeyOperation,
-    KeyOperationOutcome, KeyRef, KeyRequestState, KeyTarget, KeyadmRequest, LookupKey, Operation,
-    PasswordSet, PasswordSetOutcome, RefusalStatus, Rejection, Reply, Request,
-    ACCOUNT_EXPIRES_NEVER, ADMIN_CHANNEL, ADMIN_MAGIC, ADMIN_VERSION, MAX_REPLY_BODY,
-    MAX_REQUEST_BODY, REPLY_LIMIT, REQUEST_LIMIT,
+    decode_request, encode_reply, AccountExpires, AccountKind, AdminReply, AdminRequest, Auth,
+    Found, KeyOperation, KeyRef, KeyRequestState, KeyTarget, LookupKey, Operation, PasswordSet,
+    PasswordSetOutcome, RefusalStatus, Rejection, Reply, Request, ACCOUNT_EXPIRES_NEVER,
+    ADMIN_CHANNEL, ADMIN_MAGIC, ADMIN_VERSION, MAX_REPLY_BODY, MAX_REQUEST_BODY, REPLY_LIMIT,
+    REQUEST_LIMIT,
 };
 use keyd_types::{KeyHandle, KeyPurpose, PrincipalBinding, PrincipalId};
 use krb_proto::constants::{KRB_NT_PRINCIPAL, KRB_NT_SRV_HST};
@@ -176,31 +175,6 @@ fn requests() -> Vec<Request> {
                 kvno: u32::MAX,
             },
         }),
-        Request::Keyadm(KeyadmRequest::FetchApproved { id: 9 }),
-        Request::Keyadm(KeyadmRequest::Complete {
-            id: 9,
-            outcome: KeyOperationOutcome::Performed { kvno: Some(2) },
-        }),
-        Request::Keyadm(KeyadmRequest::Complete {
-            id: 9,
-            outcome: KeyOperationOutcome::Performed { kvno: None },
-        }),
-        Request::Keyadm(KeyadmRequest::Complete {
-            id: 10,
-            outcome: KeyOperationOutcome::Refused,
-        }),
-        Request::Keyadm(KeyadmRequest::Complete {
-            id: 11,
-            outcome: KeyOperationOutcome::NotPerformed,
-        }),
-        Request::Keyadm(KeyadmRequest::Complete {
-            id: 12,
-            outcome: KeyOperationOutcome::OutcomeUnknown,
-        }),
-        Request::Keyadm(KeyadmRequest::ListPendingDestruction { cursor: None }),
-        Request::Keyadm(KeyadmRequest::ListPendingDestruction {
-            cursor: Some(guid(32)),
-        }),
         Request::Ping,
     ]
 }
@@ -278,31 +252,6 @@ fn replies() -> Vec<Reply> {
             approvals: 1,
             quorum: 2,
         }),
-        Reply::Approved(ApprovedKeyOperation {
-            id: 17,
-            digest: [0xD2; 32],
-            operation: KeyOperation::RotateKey { service: guid(33) },
-            principal: guid(33),
-            requester: guid(34),
-            approvers: vec![guid(35), guid(36)],
-        }),
-        Reply::PendingDestruction(DestructionPage {
-            entries: vec![
-                DestructionEntry {
-                    guid: guid(37),
-                    kind: AccountKind::User,
-                },
-                DestructionEntry {
-                    guid: guid(38),
-                    kind: AccountKind::Computer,
-                },
-            ],
-            next: Some(guid(38)),
-        }),
-        Reply::PendingDestruction(DestructionPage {
-            entries: Vec::new(),
-            next: None,
-        }),
     ]
 }
 
@@ -363,10 +312,9 @@ fn every_reply_round_trips_canonically() {
 /// Task A10 (docs/51 §5.6, §6; docs/questions/Q-422): the key-operation
 /// layouts, octet for octet, assembled here by hand from the decided
 /// layout — `RequestKeyOperation := auth ‖ KeyOperation`; `Approve := auth ‖
-/// id:u64 ‖ KeyOperation`; the keyadm requests carry **no** `auth`;
-/// `KeyOperation := u8 1 | u8 2 ‖ [16] | u8 3 ‖ KeyRef ‖ u32`; `KeyRef :=
-/// u8 1 | u8 2 ‖ [16]`; `Complete := id ‖ (u8 1 ‖ Option<u32> | u8 2 |
-/// u8 3 | u8 4)`; `ListPendingDestruction := Option<[16]>`.
+/// id:u64 ‖ KeyOperation`; `KeyOperation := u8 1 | u8 2 ‖ [16] | u8 3 ‖
+/// KeyRef ‖ u32`; `KeyRef := u8 1 | u8 2 ‖ [16]`. keyadm's requests are
+/// retired (A-102): see [`retired_keyadm_kinds_are_unknown`].
 #[test]
 fn key_operation_layouts() {
     let auth_octets = |a: &Auth| {
@@ -409,60 +357,9 @@ fn key_operation_layouts() {
     expected.extend(guid(40).to_packet());
     expected.extend(9u32.to_be_bytes());
     assert_eq!(request_body(&request), expected);
-    // FetchApproved: the id only.
-    let mut expected = envelope(0x10);
-    expected.extend(5u64.to_be_bytes());
-    assert_eq!(
-        request_body(&Request::Keyadm(KeyadmRequest::FetchApproved { id: 5 })),
-        expected
-    );
-    // Complete(Performed(Some 3)) and Complete(OutcomeUnknown).
-    let mut expected = envelope(0x11);
-    expected.extend(5u64.to_be_bytes());
-    expected.extend([1, 1]);
-    expected.extend(3u32.to_be_bytes());
-    assert_eq!(
-        request_body(&Request::Keyadm(KeyadmRequest::Complete {
-            id: 5,
-            outcome: KeyOperationOutcome::Performed { kvno: Some(3) },
-        })),
-        expected
-    );
-    let mut expected = envelope(0x11);
-    expected.extend(5u64.to_be_bytes());
-    expected.push(4);
-    assert_eq!(
-        request_body(&Request::Keyadm(KeyadmRequest::Complete {
-            id: 5,
-            outcome: KeyOperationOutcome::OutcomeUnknown,
-        })),
-        expected
-    );
-    // ListPendingDestruction(None).
-    let mut expected = envelope(0x12);
-    expected.push(0);
-    assert_eq!(
-        request_body(&Request::Keyadm(KeyadmRequest::ListPendingDestruction {
-            cursor: None
-        })),
-        expected
-    );
-    // Strictness: unknown codes and a trailing octet are malformed.
-    for (kind, payload) in [
-        (0x10u8, vec![0u8; 7]),                                     // truncated id
-        (0x11, [5u64.to_be_bytes().to_vec(), vec![5]].concat()),    // outcome 5
-        (0x11, [5u64.to_be_bytes().to_vec(), vec![2, 0]].concat()), // trailing
-        (0x12, vec![2]),                                            // option marker 2
-    ] {
-        let mut body = envelope(kind);
-        body.extend(payload);
-        assert_eq!(
-            decode_request(&body),
-            Err(Rejection::Refuse(Refused::Malformed)),
-            "{kind:#x}"
-        );
-    }
     let mut body = envelope(0x0E);
+    body.extend(auth_octets(&auth(0)));
+    body.push(4); // KeyOperation 4    let mut body = envelope(0x0E);
     body.extend(auth_octets(&auth(0)));
     body.push(4); // KeyOperation 4
     assert_eq!(
@@ -477,19 +374,47 @@ fn key_operation_layouts() {
         decode_request(&body),
         Err(Rejection::Refuse(Refused::Malformed))
     );
-    // A destruction entry's kind is closed (1 User, 2 Computer).
-    let page = reply_body(&Reply::PendingDestruction(DestructionPage {
-        entries: vec![DestructionEntry {
-            guid: guid(41),
-            kind: AccountKind::User,
-        }],
-        next: None,
-    }));
-    let mut bad = page.clone();
-    let kind_at = 4 + 4 + 16;
-    assert_eq!(bad[kind_at], 1);
-    bad[kind_at] = 3;
-    assert!(decode_reply::<AdminReply>(ADMIN_CHANNEL, &bad).is_err());
+}
+
+/// A-102 (docs/52 §4.6, §4.8; docs/questions/Q-460): keyadm's
+/// `FetchApproved` / `Complete` / `ListPendingDestruction` (`0x10`–`0x12`)
+/// are retired — they are not in the closed request table, so a frame of
+/// one closes the connection without a reply, whatever its payload (the
+/// former layouts: an id; an id and an outcome; a cursor); their replies
+/// `Approved` / `PendingDestruction` (`0x89`, `0x8A`) are not in the reply
+/// table either. The numbers stay unused.
+#[test]
+fn retired_keyadm_kinds_are_unknown() {
+    let envelope = |kind: u8| {
+        let mut out = ADMIN_MAGIC.to_be_bytes().to_vec();
+        out.push(ADMIN_VERSION);
+        out.push(kind);
+        out
+    };
+    assert_eq!(request_kind::RETIRED, &[0x10, 0x11, 0x12]);
+    for kind in request_kind::RETIRED {
+        assert!(!request_kind::ALL.contains(kind), "{kind:#x}");
+    }
+    for (kind, payload) in [
+        (0x10u8, 5u64.to_be_bytes().to_vec()),
+        (
+            0x11,
+            [5u64.to_be_bytes().to_vec(), vec![1, 1, 0, 0, 0, 3]].concat(),
+        ),
+        (0x12, vec![0]),
+    ] {
+        let mut body = envelope(kind);
+        body.extend(payload);
+        assert_eq!(decode_request(&body), Err(Rejection::Close), "{kind:#x}");
+    }
+    let replies = ipc_dird_admin::channel::reply_kind::RETIRED;
+    assert_eq!(replies, &[0x89, 0x8A]);
+    for kind in replies {
+        assert!(!ipc_dird_admin::channel::reply_kind::ALL.contains(kind));
+        let mut body = envelope(*kind);
+        body.extend(17u64.to_be_bytes());
+        assert!(decode_reply::<AdminReply>(ADMIN_CHANNEL, &body).is_err());
+    }
 }
 
 /// docs/51 §7.2: the auth field carries at most two approvals.

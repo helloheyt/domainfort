@@ -46,8 +46,8 @@ use kdc::{
     AccountSource, AuditEvent, Kdc, KdcConfig, KdcReply, Peer, PolicyInputs, RateLimiter, Transport,
 };
 use keyd::{
-    AuditRecord, CallerId, InMemoryKeyStore, Keyd, LocalKeyd, OsEntropy, PrincipalBinding, Role,
-    SetSecretTarget, MAX_SET_SECRET_GRANT_SECS,
+    AuditRecord, CallerId, DecidedOperation, DecisionId, InMemoryKeyStore, Keyd, LocalKeyd,
+    OsEntropy, PrincipalBinding, Role, SetSecretTarget, MAX_SET_SECRET_GRANT_SECS,
 };
 use krb_crypto::{EncType, KeyUsage, ProtocolKey};
 use krb_proto::constants::{
@@ -195,31 +195,44 @@ fn kdc_for(d: &Dir) -> TestKdc {
     )
     .unwrap();
     let alice_salt = account_salt(&realm(), AccountKind::User, "alice").unwrap();
-    // The grants dird registers after its PDP (task A15a).
-    keyd.grant_set_secret(
+    let ws01_salt = account_salt(&realm(), AccountKind::Computer, "ws01$").unwrap();
+    // The set-secret decisions dird registers after its PDP (task A15a;
+    // A-102: binding and salt bound, N4).
+    keyd.register_decision(
         &LDAP,
-        keyd::AccountKind::User,
-        &[SetSecretTarget {
-            handle: alice.key,
-            binding: PrincipalBinding::new(realm(), alice_name()),
-        }],
+        DecisionId::new(1),
+        &DecidedOperation::SetSecret {
+            kind: keyd::AccountKind::User,
+            targets: vec![SetSecretTarget {
+                handle: alice.key,
+                binding: PrincipalBinding::new(realm(), alice_name()),
+                salt: alice_salt.as_str().to_owned(),
+            }],
+        },
+        &[],
         MAX_SET_SECRET_GRANT_SECS,
         &n,
     )
     .unwrap();
-    keyd.grant_set_secret(
+    keyd.register_decision(
         &LDAP,
-        keyd::AccountKind::Computer,
-        &[
-            SetSecretTarget {
-                handle: ws01_client.key,
-                binding: PrincipalBinding::new(realm(), ws01_name()),
-            },
-            SetSecretTarget {
-                handle: ws01.key,
-                binding: PrincipalBinding::new(realm(), service_name()),
-            },
-        ],
+        DecisionId::new(2),
+        &DecidedOperation::SetSecret {
+            kind: keyd::AccountKind::Computer,
+            targets: vec![
+                SetSecretTarget {
+                    handle: ws01_client.key,
+                    binding: PrincipalBinding::new(realm(), ws01_name()),
+                    salt: ws01_salt.as_str().to_owned(),
+                },
+                SetSecretTarget {
+                    handle: ws01.key,
+                    binding: PrincipalBinding::new(realm(), service_name()),
+                    salt: ws01_salt.as_str().to_owned(),
+                },
+            ],
+        },
+        &[],
         MAX_SET_SECRET_GRANT_SECS,
         &n,
     )
@@ -233,7 +246,6 @@ fn kdc_for(d: &Dir) -> TestKdc {
         &n,
     )
     .unwrap();
-    let ws01_salt = account_salt(&realm(), AccountKind::Computer, "ws01$").unwrap();
     for (handle, binding) in [(ws01.key, service_name()), (ws01_client.key, ws01_name())] {
         keyd.set_secret(
             &DIRECTORY,

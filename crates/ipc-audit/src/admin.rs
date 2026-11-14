@@ -333,7 +333,7 @@ impl AccountExpiresValue {
 ///   `SetEnabled`, `Delete`, the group of `AddMember`, the object `Lookup`
 ///   found, the key's account of `RequestKeyOperation`, …); `None` for a
 ///   create (its object is `Committed { allocated }`), a `Lookup` that found
-///   nothing, and `ListPendingDestruction`.
+///   nothing, and `ListPendingDestruction` (retired by A-102).
 /// * `parent` — the container of a create. `member` — the member of
 ///   `AddMember` / `RemoveMember`.
 /// * `requester` — the objectSid of the principal whose AP-REQ dird
@@ -585,7 +585,9 @@ pub enum AdmindActivity {
         result: PasswordResult,
     },
     /// A keyadm-only request: forwarded to dird, or refused because the
-    /// peer uid is not `keyadm_uid`.
+    /// peer uid is not `keyadm_uid`. **Retired** by A-102 (docs/52 §4.6;
+    /// docs/questions/Q-460): admind no longer has keyadm requests, so it
+    /// never sends this; the shape stays so that earlier logs decode.
     KeyadmForward {
         /// The request.
         operation: KeyadmOperation,

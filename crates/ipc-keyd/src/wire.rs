@@ -17,7 +17,14 @@
 //! | password / candidate | [`Secret`] (zeroizing; `Debug` redacted) |
 //! | salt | `bytes<max>`, UTF-8 checked after the ipc layer |
 //! | `AccountKind` of a grant | `u8` (closed table: 1 User, 2 Computer) |
-//! | grant lifetime | `u32` seconds, relative — keyd adds its own clock's `now` |
+//! | grant / decision lifetime | `u32` seconds, relative — keyd adds its own clock's `now` |
+//! | `DecisionId` | `u64` |
+//! | `DecidedOperation` | `u8` (closed table: 1 SetSecret, 2 RotateKrbtgt, 3 RotateKey, 4 RetireKvno, 5 DestroyKeySet) ‖ its fields ([`WireDecidedOperation`]) |
+//!
+//! **A-102 (docs/52 §4.6):** `rotate_key`, `rotate_krbtgt`, `retire_kvno`
+//! and `destroy_key_set` carry **only a decision id** — no handle, kvno or
+//! dual-control token travels: keyd runs the parameters dird registered
+//! (`register_decision`, Role::Ldap) and builds the token itself.
 //!
 //! The ipc layer here checks only what it can check without interpreting a
 //! Kerberos value (lengths, markers, closed tables); every Kerberos value is
@@ -40,13 +47,13 @@
 //! docs/questions/Q-351 (A-87).
 
 use crate::channel::{
-    reply_kind, request_kind, MAX_ENCTYPES, MAX_GRANT_TARGETS, MAX_REPLY_FIELD, MAX_REQUEST_FIELD,
-    MAX_SALT, MAX_SEAL_PADATA, MAX_SECRET,
+    reply_kind, request_kind, MAX_DECISION_APPROVERS, MAX_DESTROY_PAGE, MAX_ENCTYPES,
+    MAX_GRANT_TARGETS, MAX_REPLY_FIELD, MAX_REQUEST_FIELD, MAX_SALT, MAX_SEAL_PADATA, MAX_SECRET,
 };
 use ipc::{DerBlob, Error, MessageSet, Payload, Reader, Result, Secret, Writer};
 use keyd_types::{
-    AccountKind, ArmorId, AuthnError, CtxId, DualControlToken, EncTypeId, ExchangeId,
-    FastConversation, IssueError, KeyHandle, KeyPurpose, Kvno, PrincipalId, Role, ServiceCtxId,
+    AccountKind, ArmorId, AuthnError, CtxId, DecisionId, EncTypeId, ExchangeId, FastConversation,
+    IssueError, KeyHandle, KeyPurpose, Kvno, PendingDestruction, PrincipalId, Role, ServiceCtxId,
     TicketPolicy, TOKEN_ID_LENGTH,
 };
 use krb_proto::{KerberosFlags, TicketFlags};
@@ -791,62 +798,14 @@ impl Payload for CreateKeyRequest {
     }
 }
 
-/// `rotate_krbtgt`. Spec: docs/50 §3.4 (`krbtgt`, `approval:
-/// DualControlToken { approver_1, approver_2 }`); docs/10 §7.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RotateKrbtgtRequest {
-    /// Krbtgt handle.
-    pub krbtgt: KeyHandle,
-    /// The dual-control approval.
-    pub approval: DualControlToken,
+/// A decision id (`u64`). Spec: docs/52 §4.2, §4.6 (A-102).
+fn write_decision(writer: &mut Writer, id: DecisionId) -> Result<()> {
+    writer.write_u64(id.get())
 }
 
-impl Payload for RotateKrbtgtRequest {
-    /// Spec: docs/50 §3.4.
-    fn write_fields(&self, writer: &mut Writer) -> Result<()> {
-        write_handle(writer, &self.krbtgt)?;
-        writer.write_array(self.approval.approver_1.as_bytes())?;
-        writer.write_array(self.approval.approver_2.as_bytes())
-    }
-
-    /// Spec: docs/50 §3.4.
-    fn read_fields(reader: &mut Reader<'_>) -> Result<RotateKrbtgtRequest> {
-        let krbtgt = read_handle(reader)?;
-        let approver_1 = PrincipalId::from_bytes(reader.read_array()?);
-        let approver_2 = PrincipalId::from_bytes(reader.read_array()?);
-        Ok(RotateKrbtgtRequest {
-            krbtgt,
-            approval: DualControlToken {
-                approver_1,
-                approver_2,
-            },
-        })
-    }
-}
-
-/// `retire_kvno`. Spec: docs/50 §3.4 (admin.rs signature: handle, kvno);
-/// docs/10 §7.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RetireKvnoRequest {
-    /// The key set's handle.
-    pub handle: KeyHandle,
-    /// The key version to retire.
-    pub kvno: Kvno,
-}
-
-impl Payload for RetireKvnoRequest {
-    /// Spec: docs/50 §3.4.
-    fn write_fields(&self, writer: &mut Writer) -> Result<()> {
-        write_handle(writer, &self.handle)?;
-        writer.write_u32(self.kvno.get())
-    }
-
-    /// Spec: docs/50 §3.4.
-    fn read_fields(reader: &mut Reader<'_>) -> Result<RetireKvnoRequest> {
-        let handle = read_handle(reader)?;
-        let kvno = Kvno::new(reader.read_u32()?);
-        Ok(RetireKvnoRequest { handle, kvno })
-    }
+/// Spec: docs/52 §4.6.
+fn read_decision(reader: &mut Reader<'_>) -> Result<DecisionId> {
+    Ok(DecisionId::new(reader.read_u64()?))
 }
 
 /// Wire code of a grant's account kind. Project choice (closed table).
@@ -869,29 +828,39 @@ const fn account_kind_from_code(code: u8) -> Option<AccountKind> {
     }
 }
 
-/// One key target of `grant_set_secret`: `KeyHandle` ‖ `PrincipalBinding`.
-/// Spec: docs/51 §7.3 ("handles (1 or 2), bindings"); docs/questions/Q-450
-/// item 9.
+/// One key target of a grant or a set-secret decision: `KeyHandle` ‖
+/// `PrincipalBinding` ‖ salt (`bytes<MAX_SALT>`, UTF-8 checked after the ipc
+/// layer — the salt is bound too since A-102, N4).
+/// Spec: docs/51 §7.3 ("handles (1 or 2), bindings, salt");
+/// docs/questions/Q-450 item 9; docs/52 §4.2.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireSetSecretTarget {
     /// The key set's handle.
     pub handle: KeyHandle,
     /// The principal name the `set_secret` must name.
     pub binding: WireBinding,
+    /// The salt the `set_secret` must present.
+    pub salt: Vec<u8>,
 }
 
 impl Payload for WireSetSecretTarget {
-    /// Spec: docs/questions/Q-450 item 9.
+    /// Spec: docs/questions/Q-450 item 9; docs/52 §4.2.
     fn write_fields(&self, writer: &mut Writer) -> Result<()> {
         write_handle(writer, &self.handle)?;
-        self.binding.write_fields(writer)
+        self.binding.write_fields(writer)?;
+        writer.write_bytes(&self.salt, MAX_SALT)
     }
 
-    /// Spec: docs/questions/Q-450 item 9.
+    /// Spec: docs/questions/Q-450 item 9; docs/52 §4.2.
     fn read_fields(reader: &mut Reader<'_>) -> Result<WireSetSecretTarget> {
         let handle = read_handle(reader)?;
         let binding = WireBinding::read_fields(reader)?;
-        Ok(WireSetSecretTarget { handle, binding })
+        let salt = read_owned(reader, MAX_SALT)?;
+        Ok(WireSetSecretTarget {
+            handle,
+            binding,
+            salt,
+        })
     }
 }
 
@@ -935,6 +904,160 @@ impl Payload for GrantSetSecretRequest {
     }
 }
 
+/// A decided operation on the wire (A-102, docs/52 §4.2): its code (`u8`,
+/// closed table) and its fields. The codec checks structure only (the
+/// closed tables, the target bound); keyd judges the shape, the purposes and
+/// the kvno, and records its refusal (as docs/questions/Q-389 item 3).
+/// Spec: docs/52 §4.2, §4.6; docs/50 §3.3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireDecidedOperation {
+    /// Code 1: kind ‖ `seq<WireSetSecretTarget, MAX_GRANT_TARGETS>`.
+    SetSecret {
+        /// The account kind.
+        kind: AccountKind,
+        /// The key targets.
+        targets: Vec<WireSetSecretTarget>,
+    },
+    /// Code 2: the krbtgt handle.
+    RotateKrbtgt(KeyHandle),
+    /// Code 3: the handle.
+    RotateKey(KeyHandle),
+    /// Code 4: the handle ‖ kvno (`u32`).
+    RetireKvno(KeyHandle, Kvno),
+    /// Code 5: the principal id (16 octets).
+    DestroyKeySet(PrincipalId),
+}
+
+impl Payload for WireDecidedOperation {
+    /// Spec: docs/52 §4.6.
+    fn write_fields(&self, writer: &mut Writer) -> Result<()> {
+        match self {
+            WireDecidedOperation::SetSecret { kind, targets } => {
+                writer.write_enum(0x01)?;
+                writer.write_enum(account_kind_code(*kind))?;
+                writer.write_seq(targets, MAX_GRANT_TARGETS, |w, t| t.write_fields(w))
+            }
+            WireDecidedOperation::RotateKrbtgt(handle) => {
+                writer.write_enum(0x02)?;
+                write_handle(writer, handle)
+            }
+            WireDecidedOperation::RotateKey(handle) => {
+                writer.write_enum(0x03)?;
+                write_handle(writer, handle)
+            }
+            WireDecidedOperation::RetireKvno(handle, kvno) => {
+                writer.write_enum(0x04)?;
+                write_handle(writer, handle)?;
+                writer.write_u32(kvno.get())
+            }
+            WireDecidedOperation::DestroyKeySet(principal) => {
+                writer.write_enum(0x05)?;
+                writer.write_array(principal.as_bytes())
+            }
+        }
+    }
+
+    /// Spec: docs/52 §4.6; docs/50 §3.3 (closed tables, bounded counts).
+    fn read_fields(reader: &mut Reader<'_>) -> Result<WireDecidedOperation> {
+        let code = reader.read_enum(|c| (1..=5).contains(&c).then_some(c))?;
+        Ok(match code {
+            0x01 => {
+                let kind = reader.read_enum(account_kind_from_code)?;
+                let targets =
+                    reader.read_seq(MAX_GRANT_TARGETS, WireSetSecretTarget::read_fields)?;
+                WireDecidedOperation::SetSecret { kind, targets }
+            }
+            0x02 => WireDecidedOperation::RotateKrbtgt(read_handle(reader)?),
+            0x03 => WireDecidedOperation::RotateKey(read_handle(reader)?),
+            0x04 => {
+                let handle = read_handle(reader)?;
+                WireDecidedOperation::RetireKvno(handle, Kvno::new(reader.read_u32()?))
+            }
+            _ => WireDecidedOperation::DestroyKeySet(PrincipalId::from_bytes(reader.read_array()?)),
+        })
+    }
+}
+
+/// `register_decision` = id (`u64`) ‖ operation ([`WireDecidedOperation`])
+/// ‖ approvers (`seq<[16], MAX_DECISION_APPROVERS>`) ‖ lifetime in seconds
+/// (`u32`, relative — keyd adds its own clock, R50-5).
+/// Spec: docs/52 §4.2, §4.6 (A-102); docs/50 §3.3, R50-5.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisterDecisionRequest {
+    /// dird's decision id.
+    pub id: DecisionId,
+    /// What dird decided.
+    pub operation: WireDecidedOperation,
+    /// The approvers dird verified.
+    pub approvers: Vec<PrincipalId>,
+    /// How long the decision stays live, in seconds.
+    pub lifetime_secs: u32,
+}
+
+impl Payload for RegisterDecisionRequest {
+    /// Spec: docs/52 §4.6.
+    fn write_fields(&self, writer: &mut Writer) -> Result<()> {
+        write_decision(writer, self.id)?;
+        self.operation.write_fields(writer)?;
+        writer.write_seq(&self.approvers, MAX_DECISION_APPROVERS, |w, a| {
+            w.write_array(a.as_bytes())
+        })?;
+        writer.write_u32(self.lifetime_secs)
+    }
+
+    /// Spec: docs/52 §4.6.
+    fn read_fields(reader: &mut Reader<'_>) -> Result<RegisterDecisionRequest> {
+        let id = read_decision(reader)?;
+        let operation = WireDecidedOperation::read_fields(reader)?;
+        let approvers = reader.read_seq(MAX_DECISION_APPROVERS, |r| {
+            Ok(PrincipalId::from_bytes(r.read_array()?))
+        })?;
+        let lifetime_secs = reader.read_u32()?;
+        Ok(RegisterDecisionRequest {
+            id,
+            operation,
+            approvers,
+            lifetime_secs,
+        })
+    }
+}
+
+/// One page of pending destroy decisions: `seq<(id u64 ‖ principal [16]),
+/// MAX_DESTROY_PAGE>` ‖ next (`Option<u64>`).
+/// Spec: docs/52 §4.6 (A-102); docs/50 §3.3 (bounded replies).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireDestructionPage {
+    /// The entries, ascending by id.
+    pub entries: Vec<PendingDestruction>,
+    /// Where the next page starts.
+    pub next: Option<DecisionId>,
+}
+
+impl Payload for WireDestructionPage {
+    /// Spec: docs/52 §4.6.
+    fn write_fields(&self, writer: &mut Writer) -> Result<()> {
+        writer.write_seq(&self.entries, MAX_DESTROY_PAGE, |w, e| {
+            write_decision(w, e.decision)?;
+            w.write_array(e.principal.as_bytes())
+        })?;
+        writer.write_option(self.next.as_ref(), |w, id| write_decision(w, *id))
+    }
+
+    /// Spec: docs/52 §4.6.
+    fn read_fields(reader: &mut Reader<'_>) -> Result<WireDestructionPage> {
+        let entries = reader.read_seq(MAX_DESTROY_PAGE, |r| {
+            let decision = read_decision(r)?;
+            let principal = PrincipalId::from_bytes(r.read_array()?);
+            Ok(PendingDestruction {
+                decision,
+                principal,
+            })
+        })?;
+        let next = reader.read_option(read_decision)?;
+        Ok(WireDestructionPage { entries, next })
+    }
+}
+
 /// Every request of the keyd channel. There is no field for the caller's
 /// role or for `now` in any of them (module docs).
 ///
@@ -962,20 +1085,26 @@ pub enum KeydRequest {
     VerifySecret(VerifySecretRequest),
     /// Spec: docs/10 §7.
     CreateKey(CreateKeyRequest),
-    /// `rotate_key(handle)`. Spec: docs/10 §7.
-    RotateKey(KeyHandle),
-    /// Spec: docs/10 §7.
-    RotateKrbtgt(RotateKrbtgtRequest),
-    /// Spec: docs/10 §7.
-    RetireKvno(RetireKvnoRequest),
-    /// `destroy_key_set(handle)`. Spec: docs/10 §7; A-35.
-    DestroyKeySet(KeyHandle),
+    /// `rotate_key(decision)`. Spec: docs/10 §7; docs/52 §4.6.
+    RotateKey(DecisionId),
+    /// `rotate_krbtgt(decision)`. Spec: docs/10 §7; docs/52 §4.6.
+    RotateKrbtgt(DecisionId),
+    /// `retire_kvno(decision)`. Spec: docs/10 §7; docs/52 §4.6.
+    RetireKvno(DecisionId),
+    /// `destroy_key_set(decision)`. Spec: docs/10 §7; A-35; docs/52 §4.6.
+    DestroyKeySet(DecisionId),
     /// No field. Spec: docs/10 §7א.
     DescribeConfig,
     /// No field. Spec: docs/10 §7א.
     Ping,
     /// Spec: docs/51 §5.8 option (b); docs/questions/Q-450.
     GrantSetSecret(GrantSetSecretRequest),
+    /// Spec: docs/52 §4.2, §4.6.
+    RegisterDecision(RegisterDecisionRequest),
+    /// No field. Spec: docs/52 §4.4.
+    SealCeremony,
+    /// `after: Option<u64>`. Spec: docs/52 §4.6.
+    ListDestroyDecisions(Option<DecisionId>),
 }
 
 impl MessageSet for KeydRequest {
@@ -1003,6 +1132,9 @@ impl MessageSet for KeydRequest {
             KeydRequest::DescribeConfig => request_kind::DESCRIBE_CONFIG,
             KeydRequest::Ping => request_kind::PING,
             KeydRequest::GrantSetSecret(_) => request_kind::GRANT_SET_SECRET,
+            KeydRequest::RegisterDecision(_) => request_kind::REGISTER_DECISION,
+            KeydRequest::SealCeremony => request_kind::SEAL_CEREMONY,
+            KeydRequest::ListDestroyDecisions(_) => request_kind::LIST_DESTROY_DECISIONS,
         }
     }
 
@@ -1019,13 +1151,16 @@ impl MessageSet for KeydRequest {
             KeydRequest::SetSecret(m) => m.write_fields(writer),
             KeydRequest::VerifySecret(m) => m.write_fields(writer),
             KeydRequest::CreateKey(m) => m.write_fields(writer),
-            KeydRequest::RotateKey(handle) | KeydRequest::DestroyKeySet(handle) => {
-                write_handle(writer, handle)
-            }
-            KeydRequest::RotateKrbtgt(m) => m.write_fields(writer),
-            KeydRequest::RetireKvno(m) => m.write_fields(writer),
-            KeydRequest::DescribeConfig | KeydRequest::Ping => Ok(()),
+            KeydRequest::RotateKey(id)
+            | KeydRequest::RotateKrbtgt(id)
+            | KeydRequest::RetireKvno(id)
+            | KeydRequest::DestroyKeySet(id) => write_decision(writer, *id),
+            KeydRequest::DescribeConfig | KeydRequest::Ping | KeydRequest::SealCeremony => Ok(()),
             KeydRequest::GrantSetSecret(m) => m.write_fields(writer),
+            KeydRequest::RegisterDecision(m) => m.write_fields(writer),
+            KeydRequest::ListDestroyDecisions(after) => {
+                writer.write_option(after.as_ref(), |w, id| write_decision(w, *id))
+            }
         }
     }
 
@@ -1064,18 +1199,21 @@ impl MessageSet for KeydRequest {
             request_kind::CREATE_KEY => {
                 KeydRequest::CreateKey(CreateKeyRequest::read_fields(reader)?)
             }
-            request_kind::ROTATE_KEY => KeydRequest::RotateKey(read_handle(reader)?),
-            request_kind::ROTATE_KRBTGT => {
-                KeydRequest::RotateKrbtgt(RotateKrbtgtRequest::read_fields(reader)?)
-            }
-            request_kind::RETIRE_KVNO => {
-                KeydRequest::RetireKvno(RetireKvnoRequest::read_fields(reader)?)
-            }
-            request_kind::DESTROY_KEY_SET => KeydRequest::DestroyKeySet(read_handle(reader)?),
+            request_kind::ROTATE_KEY => KeydRequest::RotateKey(read_decision(reader)?),
+            request_kind::ROTATE_KRBTGT => KeydRequest::RotateKrbtgt(read_decision(reader)?),
+            request_kind::RETIRE_KVNO => KeydRequest::RetireKvno(read_decision(reader)?),
+            request_kind::DESTROY_KEY_SET => KeydRequest::DestroyKeySet(read_decision(reader)?),
             request_kind::DESCRIBE_CONFIG => KeydRequest::DescribeConfig,
             request_kind::PING => KeydRequest::Ping,
             request_kind::GRANT_SET_SECRET => {
                 KeydRequest::GrantSetSecret(GrantSetSecretRequest::read_fields(reader)?)
+            }
+            request_kind::REGISTER_DECISION => {
+                KeydRequest::RegisterDecision(RegisterDecisionRequest::read_fields(reader)?)
+            }
+            request_kind::SEAL_CEREMONY => KeydRequest::SealCeremony,
+            request_kind::LIST_DESTROY_DECISIONS => {
+                KeydRequest::ListDestroyDecisions(reader.read_option(read_decision)?)
             }
             _ => return Err(Error::UnknownKind),
         })
@@ -1506,6 +1644,12 @@ pub enum KeydReply {
     /// The grant is registered. Spec: docs/51 §5.8 option (b);
     /// docs/questions/Q-450.
     GrantSetSecret,
+    /// The decision is registered. Spec: docs/52 §4.2.
+    RegisterDecision,
+    /// The ceremony is sealed. Spec: docs/52 §4.4.
+    SealCeremony,
+    /// Spec: docs/52 §4.6.
+    ListDestroyDecisions(WireDestructionPage),
     /// Spec: docs/10 §9; A-26; A-56.
     AuthnFailure(AuthnError),
     /// Spec: docs/10 §9; A-56.
@@ -1537,6 +1681,9 @@ impl MessageSet for KeydReply {
             KeydReply::DescribeConfig(_) => reply_kind::DESCRIBE_CONFIG,
             KeydReply::Ping => reply_kind::PING,
             KeydReply::GrantSetSecret => reply_kind::GRANT_SET_SECRET,
+            KeydReply::RegisterDecision => reply_kind::REGISTER_DECISION,
+            KeydReply::SealCeremony => reply_kind::SEAL_CEREMONY,
+            KeydReply::ListDestroyDecisions(_) => reply_kind::LIST_DESTROY_DECISIONS,
             KeydReply::AuthnFailure(_) => reply_kind::AUTHN_FAILURE,
             KeydReply::IssueFailure(_) => reply_kind::ISSUE_FAILURE,
             KeydReply::Failure(_) => reply_kind::FAILURE,
@@ -1560,7 +1707,10 @@ impl MessageSet for KeydReply {
             | KeydReply::RetireKvno
             | KeydReply::DestroyKeySet
             | KeydReply::Ping
-            | KeydReply::GrantSetSecret => Ok(()),
+            | KeydReply::GrantSetSecret
+            | KeydReply::RegisterDecision
+            | KeydReply::SealCeremony => Ok(()),
+            KeydReply::ListDestroyDecisions(m) => m.write_fields(writer),
             KeydReply::DescribeConfig(m) => m.write_fields(writer),
             KeydReply::AuthnFailure(e) => writer.write_enum(authn_error_code(*e)),
             KeydReply::IssueFailure(e) => writer.write_enum(issue_error_code(*e)),
@@ -1601,6 +1751,11 @@ impl MessageSet for KeydReply {
             }
             reply_kind::PING => KeydReply::Ping,
             reply_kind::GRANT_SET_SECRET => KeydReply::GrantSetSecret,
+            reply_kind::REGISTER_DECISION => KeydReply::RegisterDecision,
+            reply_kind::SEAL_CEREMONY => KeydReply::SealCeremony,
+            reply_kind::LIST_DESTROY_DECISIONS => {
+                KeydReply::ListDestroyDecisions(WireDestructionPage::read_fields(reader)?)
+            }
             reply_kind::AUTHN_FAILURE => {
                 KeydReply::AuthnFailure(reader.read_enum(authn_error_from_code)?)
             }

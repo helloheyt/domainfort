@@ -376,9 +376,10 @@ pub enum KeydPhase {
     /// The test uid is Kdc: the kdc's AS and TGS exchanges.
     Kerberos,
     /// The test uid is Ldap on keyd's socket (dird verifies AP-REQs and
-    /// registers the set_secret grants) and Directory on the second socket
-    /// (admind's `set_secret`) — one keyd, so dird's grant is where
-    /// admind's `set_secret` is checked (task A15a).
+    /// registers its decisions), Directory on the second socket (admind's
+    /// `set_secret`) and Admin on the third (keyadm's sweep and key
+    /// operations by decision id) — one keyd, so dird's decision is where
+    /// admind's and keyadm's calls are checked (task A15a, A-102).
     Admin,
 }
 
@@ -833,9 +834,11 @@ pub struct World {
     /// `set_secret`, first-admin-secret, the workstation's `set_secret`);
     /// not a provisioned path (docs/questions/Q-430, Q-453).
     pub aux_keyd_socket: PathBuf,
-    /// keyd's third socket in the provisioning phase — the test uid as
-    /// Ldap, to register the workstation's grant as dird would (task A15a);
-    /// not a provisioned path.
+    /// keyd's third socket — in the provisioning phase the test uid as
+    /// Ldap, to register the workstation's decision as dird would (task
+    /// A15a, A-102); in the admin phase the test uid as Admin, keyadm's role
+    /// on the keyd dird registers its decisions in (A-102: keyadm runs them
+    /// by id); not a provisioned path.
     pub grant_keyd_socket: PathBuf,
     pub workstation: Workstation,
     pub tls: TestPki,
@@ -1029,7 +1032,10 @@ impl World {
             KeydPhase::Kerberos => (Role::Kdc, Vec::new()),
             KeydPhase::Admin => (
                 Role::Ldap,
-                vec![(self.aux_keyd_socket.clone(), Role::Directory)],
+                vec![
+                    (self.aux_keyd_socket.clone(), Role::Directory),
+                    (self.grant_keyd_socket.clone(), Role::Admin),
+                ],
             ),
         };
         let params = self.keyd_params(role, &extra);
@@ -1078,7 +1084,8 @@ impl World {
     /// `keyadm ceremony` (library, over keyd's socket, Role::Admin):
     /// `create_key` for krbtgt and the two service objects of the manifest
     /// (docs/51 §4.3 step 11), then the first administrators' initial-secret
-    /// grants (task A15a). keyadm's file names keyd's socket.
+    /// grants (task A15a; their salts from the manifest — A-102, N4), then
+    /// the seal (A-102, docs/52 R3). keyadm's file names keyd's socket.
     pub fn ceremony(&mut self) -> keyadm::ceremony::CeremonyReport {
         self.keyd_phase(KeydPhase::Provisioning);
         let settings = KeyadmSettings::parse(&self.read(&self.input.paths.keyadm_config)).unwrap();
@@ -1087,7 +1094,8 @@ impl World {
             self.input.paths.keyd_socket.as_path()
         );
         let mut client = key_state_client(settings.keyd().socket().as_path(), self.uid);
-        let report = keyadm::ceremony::run(&mut client, &self.manifest);
+        let report = keyadm::ceremony::run(&mut client, &self.manifest)
+            .expect("the produced manifest names every first administrator's salt");
         self.captured
             .extend(keyadm::report::render(&report, &self.manifest));
         report
@@ -1146,8 +1154,10 @@ impl World {
 
     /// The test-only workstation's key sets through keyd `set_secret`
     /// (Role::Directory; docs/47 §9.2 step 3), the targets and salt its
-    /// `BeginPasswordSet` named — after the grant dird would have registered
-    /// for them (Role::Ldap, task A15a), which the test registers here.
+    /// `BeginPasswordSet` named — after the `SetSecret` decision dird would
+    /// have registered for them (Role::Ldap; task A15a, A-102 — the salt
+    /// bound too, N4), which the test registers here. (The ceremony sealed
+    /// keyd; a decision dird registers is exactly what still works.)
     pub fn workstation_secret(&mut self) -> Vec<Kvno> {
         assert_eq!(
             self.keyd.as_ref().map(|k| k.phase),
@@ -1163,10 +1173,16 @@ impl World {
             .map(|k| keyd::SetSecretTarget {
                 handle: k.handle,
                 binding: k.binding.clone(),
+                salt: self.workstation.salt.clone(),
             })
             .collect();
-        ldap.grant_set_secret(kind, &targets, keyd::MAX_SET_SECRET_GRANT_SECS)
-            .expect("the workstation's grant");
+        ldap.register_decision(
+            keyd::DecisionId::new(1),
+            &keyd::DecidedOperation::SetSecret { kind, targets },
+            &[],
+            keyd::MAX_SET_SECRET_GRANT_SECS,
+        )
+        .expect("the workstation's decision");
         let mut client = key_state_client(&self.aux_keyd_socket, self.uid);
         let mut kvnos = Vec::new();
         for target in self.workstation.keys.clone() {
@@ -1343,9 +1359,6 @@ impl World {
             },
             frame_timeout: settings.frame_timeout(),
             min_password_length: settings.min_password_length(),
-            // The produced admind file's keyadm uid (A-92); this test runs
-            // no keyadm forwards (key operations are A10's own tests).
-            keyadm_uid: settings.keyadm_uid(),
             dird,
             keyd,
             limits: admin_daemon::Limits::DEFAULT,

@@ -1,79 +1,45 @@
-//! `keyadm rotate-krbtgt | rotate-key | retire-kvno <request id>`: execute
-//! a key operation dird approved (docs/51 §5.6, §6; task A10).
+//! `keyadm rotate-krbtgt | rotate-key | retire-kvno <decision id>`: run a
+//! key operation dird decided (docs/51 §5.6, §6; A-102, docs/52 §4.2).
 //!
-//! # The steps
+//! # The flow (A-102)
 //!
-//! 1. **Fetch** — `FetchApproved {id}` to `admin.sock` (admind forwards it
-//!    only because this process runs as `keyadm_uid`). dird answers the
-//!    approved operation, the key set it acts on and the requester's and
-//!    approvers' objectGUIDs — once: a fetched request cannot be fetched
-//!    again (one approval, one execution).
-//! 2. **Check** — the approved operation must be the one the command names
-//!    (`rotate-krbtgt` executes only a `rotate_krbtgt`, …), and the reply
-//!    must be coherent (a `rotate_krbtgt` names the krbtgt purpose and at
-//!    least one approver; a service operation names its own object). Any
-//!    mismatch ⇒ keyd is **not** called and dird is told "not performed".
-//! 3. **keyd** — as Role::Admin, through `call_with_fate` (A-90):
-//!    `rotate_krbtgt(DualControlToken { approver_1: requester, approver_2:
-//!    first approver })`, `rotate_key(handle)` or `retire_kvno(handle,
-//!    kvno)` (docs/10 §7). keyd still trusts keyadm for the token's
-//!    truthfulness — the residual of crates/keyd-types model.rs — but the
-//!    token comes from approvals dird verified (docs/51 §6).
-//! 4. **Complete** — `Complete {id, outcome}`: performed (with the new kvno
-//!    of a rotation), refused by keyd, not performed, or outcome unknown —
-//!    exactly what the ipc-keyd client knows (A-88, A-90). dird records it
-//!    and drops the request.
+//! 1. A requester opens a request through admind; an approver approves it.
+//!    The `Approve` that completes the quorum makes **dird** register the
+//!    decision in keyd (Role::Ldap, `register_decision`): the operation,
+//!    the key set it acts on and the approvers dird verified — under the
+//!    request's id, which the `Approve` reply shows the operator.
+//! 2. The operator runs `keyadm <command> <that id>`. keyadm sends keyd
+//!    **only the decision id**, as Role::Admin, through `call_with_fate`
+//!    (A-90): `rotate_krbtgt(id)`, `rotate_key(id)` or `retire_kvno(id)`.
+//!    keyd runs the operation **it** holds under that id — never a handle,
+//!    kvno or approval from keyadm; `rotate_krbtgt`'s dual-control token is
+//!    built inside keyd from the decision's approvers (docs/52 §4.2).
+//! 3. keyd answers the result. A decision of another kind than the command
+//!    (`rotate-key` naming a `RetireKvno` decision), an unknown id, an
+//!    expired decision or a wrong role is keyd's one uniform `Denied`; keyd's
+//!    audit record names the reason (`NoDecision` / `DecisionMismatch`).
 //!
-//! keyadm never retries a keyd call and never resends a request (A-87); an
-//! unknown outcome is reported as such, with where to look (keyd's audit
-//! log holds the intent and the outcome, A-88).
+//! **Exactly once** (docs/52 §3.10 (a)): keyd consumes a decision at its
+//! first presentation and keeps the result until the decision expires; the
+//! same id presented again returns that recorded result and runs nothing.
+//! So after an unknown outcome the operator runs **the same command again**
+//! and learns what keyd did — keyadm itself never retries and never
+//! resends (A-87).
 //!
-//! Spec: docs/51 §5.6, §6, §9 (the "krbtgt rotation" row); docs/10 §7, §9,
-//! §10; docs/33 §5; A-87; A-88; A-90.
+//! keyadm has no channel to admind or dird any more (A-102: the
+//! `FetchApproved` / `Complete` forwards of task A10 are retired): nothing a
+//! compromised admind answers reaches keyadm (N2), and keyd's own records
+//! — intent and outcome, with the decision id and its approvers — are the
+//! record of what happened (docs/52 §3.3, §4.5).
+//!
+//! Spec: docs/51 §5.6, §6, §9; docs/52 §3.1, §3.3, §3.10, §4.2, §4.5, §4.6;
+//! docs/10 §7, §9, §10; docs/33 §5; A-87; A-88; A-90; A-102.
 
 use crate::ceremony::{classify, Outcome};
 use crate::cli::Approved;
-use crate::ports::{AdmindPort, KeydPort};
-use ipc_admin::{AdmindFailure, RefusalStatus, Reply, Request};
-use ipc_dird_admin::{ApprovedKeyOperation, KeyOperation, KeyOperationOutcome, KeyadmRequest};
+use crate::ports::KeydPort;
 use ipc_keyd::{Answer, Call};
-use keyd_types::{DualControlToken, KeyPurpose, Kvno, PrincipalId};
-
-/// How the fetch ended.
-/// Spec: docs/51 §6.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Fetch {
-    /// dird answered the approved operation.
-    Fetched(ApprovedKeyOperation),
-    /// dird (or admind) refused it: unknown or expired id (`NotFound`), not
-    /// yet approved (`ApprovalRequired`), already fetched (`Conflict`), this
-    /// account not `keyadm_uid` (`Denied`), … Nothing was fetched.
-    Refused(RefusalStatus),
-    /// admind did not answer usably.
-    Failed(AdmindFailure),
-}
-
-/// Why an approved operation was not executed.
-/// Spec: module documentation, step 2.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mismatch {
-    /// The approved operation is not the one the command names.
-    Command(KeyOperation),
-    /// dird's reply is not coherent (purpose, approvers, object).
-    Incoherent,
-}
-
-/// How dird took the completion report.
-/// Spec: docs/51 §6 (`Complete {id, outcome, kvno}`, recorded in dird).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Completion {
-    /// dird recorded it.
-    Recorded,
-    /// dird refused it (status).
-    Refused(RefusalStatus),
-    /// admind did not answer usably.
-    Failed(AdmindFailure),
-}
+use keyd_types::{DecisionId, Kvno};
 
 /// What one execution did.
 /// Spec: module documentation.
@@ -81,181 +47,64 @@ pub enum Completion {
 pub struct ExecutionReport {
     /// The command.
     pub command: Approved,
-    /// The request's id.
-    pub id: u64,
-    /// The fetch.
-    pub fetch: Fetch,
-    /// Why keyd was not called after a successful fetch, if so.
-    pub mismatch: Option<Mismatch>,
+    /// The decision id the command named.
+    pub decision: DecisionId,
     /// keyd's call: the kvno of a rotation, `None` for `retire_kvno`.
-    pub keyd: Option<Outcome<Option<Kvno>>>,
-    /// The completion report, if one was sent.
-    pub completion: Option<Completion>,
+    pub keyd: Outcome<Option<Kvno>>,
 }
 
 impl ExecutionReport {
-    /// keyd performed the operation and dird recorded it.
+    /// keyd performed the decided operation (now, or — for a replayed id —
+    /// earlier, its recorded result).
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        matches!(self.keyd, Some(Outcome::Answered(Ok(_))))
-            && self.completion == Some(Completion::Recorded)
+        self.keyd.succeeded()
     }
 
-    /// keyd was asked (whatever came of it): something may have changed.
+    /// keyd received the request and something is left to check: it
+    /// refused (its audit record names why) or its outcome is unknown.
+    /// Not sent and not performed mean keyd changed nothing (A-88).
     #[must_use]
     pub fn keyd_attempted(&self) -> bool {
-        matches!(
-            self.keyd,
-            Some(Outcome::Answered(_) | Outcome::NotPerformed(_) | Outcome::Unknown(_))
-        )
+        matches!(self.keyd, Outcome::Answered(Err(_)) | Outcome::Unknown(_))
     }
 }
 
-/// Whether `operation` is the command's. Spec: docs/51 §6.
-fn same_command(command: Approved, operation: &KeyOperation) -> bool {
-    matches!(
-        (command, operation),
-        (Approved::RotateKrbtgt, KeyOperation::RotateKrbtgt)
-            | (Approved::RotateKey, KeyOperation::RotateKey { .. })
-            | (Approved::RetireKvno, KeyOperation::RetireKvno { .. })
-    )
-}
-
-/// The keyd call of an approved operation, if dird's reply is coherent.
-/// Spec: docs/10 §7 (`rotate_krbtgt(DualControlToken)`, `rotate_key`,
-/// `retire_kvno`); crates/keyd-types model.rs (`DualControlToken`: two
-/// distinct approvers); docs/51 §6 (`approver_1` = the requester,
-/// `approver_2` = the approver).
-fn keyd_call(approved: &ApprovedKeyOperation) -> Option<Call> {
-    let principal = PrincipalId::from_bytes(approved.principal.to_packet());
-    match approved.operation {
-        KeyOperation::RotateKrbtgt => {
-            let approver = approved.approvers.first()?;
-            if *approver == approved.requester {
-                return None;
-            }
-            Some(Call::RotateKrbtgt {
-                krbtgt: keyd_types::KeyHandle::new(principal, KeyPurpose::Krbtgt),
-                approval: DualControlToken {
-                    approver_1: PrincipalId::from_bytes(approved.requester.to_packet()),
-                    approver_2: PrincipalId::from_bytes(approver.to_packet()),
-                },
-            })
-        }
-        KeyOperation::RotateKey { service } => {
-            (service == approved.principal).then(|| Call::RotateKey {
-                handle: keyd_types::KeyHandle::new(principal, KeyPurpose::Service),
-            })
-        }
-        KeyOperation::RetireKvno { key, kvno } => {
-            let purpose = match key {
-                ipc_dird_admin::KeyRef::Krbtgt => KeyPurpose::Krbtgt,
-                ipc_dird_admin::KeyRef::Service(service) => {
-                    if service != approved.principal {
-                        return None;
-                    }
-                    KeyPurpose::Service
-                }
-            };
-            (kvno != 0).then(|| Call::RetireKvno {
-                handle: keyd_types::KeyHandle::new(principal, purpose),
-                kvno: Kvno::new(kvno),
-            })
-        }
+/// The keyd call of a command: the operation it names, with only the
+/// decision id.
+/// Spec: docs/52 §4.2, §4.6; docs/10 §7.
+#[must_use]
+pub fn call_of(command: Approved, decision: DecisionId) -> Call {
+    match command {
+        Approved::RotateKrbtgt => Call::RotateKrbtgt { decision },
+        Approved::RotateKey => Call::RotateKey { decision },
+        Approved::RetireKvno => Call::RetireKvno { decision },
     }
 }
 
 /// keyd's answer to the call, as an outcome carrying the kvno of a rotation.
 /// Spec: docs/10 §7; crates/keyadm ceremony.rs (`classify`).
-fn classify_call(result: Result<Answer, ipc_keyd::CallFailure>) -> Outcome<Option<Kvno>> {
-    classify(result, |answer| match answer {
-        Answer::RotateKrbtgt(result) | Answer::RotateKey(result) => Some(result.map(Some)),
-        Answer::RetireKvno(result) => Some(result.map(|()| None)),
+fn classify_call(
+    command: Approved,
+    result: Result<Answer, ipc_keyd::CallFailure>,
+) -> Outcome<Option<Kvno>> {
+    classify(result, |answer| match (command, answer) {
+        (Approved::RotateKrbtgt, Answer::RotateKrbtgt(result))
+        | (Approved::RotateKey, Answer::RotateKey(result)) => Some(result.map(Some)),
+        (Approved::RetireKvno, Answer::RetireKvno(result)) => Some(result.map(|()| None)),
         _ => None,
     })
 }
 
-/// What dird is told: the outcome as the ipc-keyd client classified it.
-/// Spec: docs/51 §6; A-88, A-90.
-fn reported(outcome: &Outcome<Option<Kvno>>) -> KeyOperationOutcome {
-    match outcome {
-        Outcome::Answered(Ok(kvno)) => KeyOperationOutcome::Performed {
-            kvno: kvno.map(Kvno::get),
-        },
-        Outcome::Answered(Err(_)) => KeyOperationOutcome::Refused,
-        Outcome::NotSent(_) | Outcome::NotPerformed(_) => KeyOperationOutcome::NotPerformed,
-        Outcome::Unknown(_) => KeyOperationOutcome::OutcomeUnknown,
-    }
-}
-
-/// Send `Complete {id, outcome}`.
-/// Spec: docs/51 §6.
-fn complete(admind: &mut dyn AdmindPort, id: u64, outcome: KeyOperationOutcome) -> Completion {
-    let request = Request::Keyadm(KeyadmRequest::Complete { id, outcome });
-    match admind.call(&request) {
-        Ok(Reply::Done) => Completion::Recorded,
-        Ok(Reply::Refused(status)) => Completion::Refused(status),
-        // The client checks the reply answers the request: unreachable.
-        Ok(_) => Completion::Refused(RefusalStatus::OutcomeUnknown),
-        Err(failure) => Completion::Failed(failure),
-    }
-}
-
-/// Execute approved request `id` with `command` (module documentation).
-/// Never retries.
+/// Run decision `id` with `command` (module documentation). Never retries.
 ///
-/// Spec: docs/51 §5.6, §6; docs/10 §7; A-87; A-88; A-90.
-pub fn run(
-    admind: &mut dyn AdmindPort,
-    keyd: &mut dyn KeydPort,
-    command: Approved,
-    id: u64,
-) -> ExecutionReport {
-    let mut report = ExecutionReport {
+/// Spec: docs/52 §3.10, §4.2; docs/51 §6; docs/10 §7; A-87; A-88; A-90.
+pub fn run(keyd: &mut dyn KeydPort, command: Approved, id: u64) -> ExecutionReport {
+    let decision = DecisionId::new(id);
+    let outcome = classify_call(command, keyd.call_with_fate(&call_of(command, decision)));
+    ExecutionReport {
         command,
-        id,
-        fetch: Fetch::Refused(RefusalStatus::Unavailable),
-        mismatch: None,
-        keyd: None,
-        completion: None,
-    };
-    let approved = match admind.call(&Request::Keyadm(KeyadmRequest::FetchApproved { id })) {
-        Ok(Reply::Approved(approved)) if approved.id == id => approved,
-        Ok(Reply::Approved(_)) => {
-            report.fetch = Fetch::Refused(RefusalStatus::OutcomeUnknown);
-            return report;
-        }
-        Ok(Reply::Refused(status)) => {
-            report.fetch = Fetch::Refused(status);
-            return report;
-        }
-        Ok(_) => {
-            report.fetch = Fetch::Refused(RefusalStatus::OutcomeUnknown);
-            return report;
-        }
-        Err(failure) => {
-            report.fetch = Fetch::Failed(failure);
-            return report;
-        }
-    };
-    report.fetch = Fetch::Fetched(approved.clone());
-    let call = if !same_command(command, &approved.operation) {
-        report.mismatch = Some(Mismatch::Command(approved.operation));
-        None
-    } else {
-        let call = keyd_call(&approved);
-        if call.is_none() {
-            report.mismatch = Some(Mismatch::Incoherent);
-        }
-        call
-    };
-    let Some(call) = call else {
-        // Not executed: dird is told so, and drops the request.
-        report.completion = Some(complete(admind, id, KeyOperationOutcome::NotPerformed));
-        return report;
-    };
-    let outcome = classify_call(keyd.call_with_fate(&call));
-    report.completion = Some(complete(admind, id, reported(&outcome)));
-    report.keyd = Some(outcome);
-    report
+        decision,
+        keyd: outcome,
+    }
 }

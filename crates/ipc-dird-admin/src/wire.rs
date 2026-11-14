@@ -16,13 +16,12 @@
 //! | outcome, expiry, lookup key, account kind, status | `u8` from a closed table |
 //! | `KeyOperation` | `u8 1 RotateKrbtgt` / `u8 2 RotateKey ‖ service:[16]` / `u8 3 RetireKvno ‖ KeyRef ‖ kvno:u32` |
 //! | `KeyRef` | `u8 1 Krbtgt` / `u8 2 Service ‖ principal:[16]` |
-//! | key-operation outcome | `u8 1 Performed ‖ kvno:Option<u32>` / `u8 2 Refused` / `u8 3 NotPerformed` / `u8 4 OutcomeUnknown` |
 //! | digest | 32 octets (a SHA-256 output, computed in dird) |
 //!
-//! The keyadm requests (`FetchApproved`, `Complete`,
-//! `ListPendingDestruction`) carry **no** `auth`: keyadm has no Kerberos
-//! client; admind forwards them only from `keyadm_uid` (docs/51 §6;
-//! docs/questions/Q-422).
+//! Every request but `Ping` carries `auth`. keyadm's former requests
+//! (`FetchApproved`, `Complete`, `ListPendingDestruction` — the only ones
+//! without `auth`) were retired by A-102 (docs/52 §4.6; docs/questions/
+//! Q-460): keyadm talks to keyd only.
 //!
 //! Spec: docs/51 §7.1 (the `crates/ipc` codec), §7.2 (`auth`), §7.3 (the
 //! fields of each operation and reply), §5.6, §6 (the key operations);
@@ -31,9 +30,9 @@
 
 use crate::channel::{
     codes, reply_kind, request_kind, RefusalStatus, DIGEST_LEN, MAX_APPROVALS, MAX_AP_REQ,
-    MAX_BINDING_NAME, MAX_CLASS_NAME, MAX_DESCRIPTION, MAX_DESTRUCTION_ENTRIES, MAX_DNS_HOST_NAME,
-    MAX_DN_COMPONENT, MAX_DN_COMPONENTS, MAX_KEY_TARGETS, MAX_KVNOS, MAX_NAME, MAX_PRINCIPAL_NAME,
-    MAX_REALM, MAX_SALT, MAX_SID,
+    MAX_BINDING_NAME, MAX_CLASS_NAME, MAX_DESCRIPTION, MAX_DNS_HOST_NAME, MAX_DN_COMPONENT,
+    MAX_DN_COMPONENTS, MAX_KEY_TARGETS, MAX_KVNOS, MAX_NAME, MAX_PRINCIPAL_NAME, MAX_REALM,
+    MAX_SALT, MAX_SID,
 };
 use ipc::{DerBlob, Error, MessageSet, Payload, Reader, Result, Writer};
 use keyd_types::KeyPurpose;
@@ -218,61 +217,6 @@ impl WireKeyOperation {
                 kvno: reader.read_u32()?,
             },
             _ => WireKeyOperation::RotateKrbtgt,
-        })
-    }
-}
-
-/// How keyadm's call to keyd ended, as `Complete` reports it.
-/// Spec: docs/51 §6 (`Complete {id, outcome, kvno}`); docs/10 §9, §10;
-/// A-88, A-90 (`RequestFate`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WireKeyOutcome {
-    /// keyd performed it; the new kvno of a rotation.
-    Performed {
-        /// The kvno keyd answered (a rotation), if any.
-        kvno: Option<u32>,
-    },
-    /// keyd answered with a refusal.
-    Refused,
-    /// Not performed (never sent, or refused by keyd's transport).
-    NotPerformed,
-    /// Sent; no usable answer came back.
-    OutcomeUnknown,
-}
-
-impl WireKeyOutcome {
-    /// Spec: crate::channel `codes::KEY_OUTCOME_*`.
-    fn write(&self, writer: &mut Writer) -> Result<()> {
-        match self {
-            WireKeyOutcome::Performed { kvno } => {
-                writer.write_enum(codes::KEY_OUTCOME_PERFORMED)?;
-                writer.write_option(kvno.as_ref(), |w, k| w.write_u32(*k))
-            }
-            WireKeyOutcome::Refused => writer.write_enum(codes::KEY_OUTCOME_REFUSED),
-            WireKeyOutcome::NotPerformed => writer.write_enum(codes::KEY_OUTCOME_NOT_PERFORMED),
-            WireKeyOutcome::OutcomeUnknown => writer.write_enum(codes::KEY_OUTCOME_UNKNOWN),
-        }
-    }
-
-    /// Spec: crate::channel `codes::KEY_OUTCOME_*`.
-    fn read(reader: &mut Reader<'_>) -> Result<WireKeyOutcome> {
-        let tag = reader.read_enum(|c| {
-            matches!(
-                c,
-                codes::KEY_OUTCOME_PERFORMED
-                    | codes::KEY_OUTCOME_REFUSED
-                    | codes::KEY_OUTCOME_NOT_PERFORMED
-                    | codes::KEY_OUTCOME_UNKNOWN
-            )
-            .then_some(c)
-        })?;
-        Ok(match tag {
-            codes::KEY_OUTCOME_PERFORMED => WireKeyOutcome::Performed {
-                kvno: reader.read_option(Reader::read_u32)?,
-            },
-            codes::KEY_OUTCOME_REFUSED => WireKeyOutcome::Refused,
-            codes::KEY_OUTCOME_NOT_PERFORMED => WireKeyOutcome::NotPerformed,
-            _ => WireKeyOutcome::OutcomeUnknown,
         })
     }
 }
@@ -596,82 +540,6 @@ impl WireOperation {
     }
 }
 
-/// A request keyadm sends through admind (no `auth`: keyadm has no Kerberos
-/// client; admind forwards these only from `keyadm_uid`).
-/// Spec: docs/51 §6, §7.3; docs/questions/Q-422.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WireKeyadmRequest {
-    /// `FetchApproved {id}`.
-    FetchApproved {
-        /// The pending request's id.
-        id: u64,
-    },
-    /// `Complete {id, outcome}`.
-    Complete {
-        /// The pending request's id.
-        id: u64,
-        /// How keyd's call ended.
-        outcome: WireKeyOutcome,
-    },
-    /// `ListPendingDestruction {cursor}`.
-    ListPendingDestruction {
-        /// Resume strictly after this objectGUID packet (`None`: from the
-        /// start).
-        cursor: Option<GuidPacket>,
-    },
-}
-
-impl WireKeyadmRequest {
-    /// The request kind. Spec: crate::channel `request_kind`.
-    #[must_use]
-    pub fn kind(&self) -> u8 {
-        match self {
-            WireKeyadmRequest::FetchApproved { .. } => request_kind::FETCH_APPROVED,
-            WireKeyadmRequest::Complete { .. } => request_kind::COMPLETE,
-            WireKeyadmRequest::ListPendingDestruction { .. } => {
-                request_kind::LIST_PENDING_DESTRUCTION
-            }
-        }
-    }
-
-    /// The fields. Spec: docs/51 §6, §7.3.
-    ///
-    /// # Errors
-    /// `ipc::Error` (a field over its bound — cannot happen for these).
-    pub fn write_fields(&self, writer: &mut Writer) -> Result<()> {
-        match self {
-            WireKeyadmRequest::FetchApproved { id } => writer.write_u64(*id),
-            WireKeyadmRequest::Complete { id, outcome } => {
-                writer.write_u64(*id)?;
-                outcome.write(writer)
-            }
-            WireKeyadmRequest::ListPendingDestruction { cursor } => {
-                writer.write_option(cursor.as_ref(), |w, c| w.write_array(c))
-            }
-        }
-    }
-
-    /// The fields of a frame of kind `kind`. Spec: docs/51 §6, §7.3.
-    ///
-    /// # Errors
-    /// `ipc::Error` (unknown kind, field rules).
-    pub fn read_fields(kind: u8, reader: &mut Reader<'_>) -> Result<WireKeyadmRequest> {
-        Ok(match kind {
-            request_kind::FETCH_APPROVED => WireKeyadmRequest::FetchApproved {
-                id: reader.read_u64()?,
-            },
-            request_kind::COMPLETE => WireKeyadmRequest::Complete {
-                id: reader.read_u64()?,
-                outcome: WireKeyOutcome::read(reader)?,
-            },
-            request_kind::LIST_PENDING_DESTRUCTION => WireKeyadmRequest::ListPendingDestruction {
-                cursor: reader.read_option(Reader::read_array)?,
-            },
-            _ => return Err(Error::UnknownKind),
-        })
-    }
-}
-
 /// One request of the admin channel.
 /// Spec: docs/51 §7.2, §7.3; docs/50 §7.5 (`Ping`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -683,8 +551,6 @@ pub enum AdminRequest {
         /// The operation.
         operation: WireOperation,
     },
-    /// A keyadm request (no `auth`).
-    Keyadm(WireKeyadmRequest),
     /// The health check (no `auth`, no field).
     Ping,
 }
@@ -695,36 +561,29 @@ impl MessageSet for AdminRequest {
     fn kind(&self) -> u8 {
         match self {
             AdminRequest::Operation { operation, .. } => operation.kind(),
-            AdminRequest::Keyadm(request) => request.kind(),
             AdminRequest::Ping => request_kind::PING,
         }
     }
 
-    /// Spec: docs/51 §7.2 (`auth` on every operation), §7.3, §6 (keyadm's
-    /// requests carry none).
+    /// Spec: docs/51 §7.2 (`auth` on every operation), §7.3.
     fn write_payload(&self, writer: &mut Writer) -> Result<()> {
         match self {
             AdminRequest::Operation { auth, operation } => {
                 auth.write_fields(writer)?;
                 operation.write_fields(writer)
             }
-            AdminRequest::Keyadm(request) => request.write_fields(writer),
             AdminRequest::Ping => Ok(()),
         }
     }
 
-    /// Spec: docs/51 §7.2, §7.3, §6.
+    /// Spec: docs/51 §7.2, §7.3; docs/52 §4.6 (the retired kinds are not
+    /// in the closed table).
     fn read_payload(kind: u8, reader: &mut Reader<'_>) -> Result<AdminRequest> {
         if kind == request_kind::PING {
             return Ok(AdminRequest::Ping);
         }
         if !request_kind::ALL.contains(&kind) {
             return Err(Error::UnknownKind);
-        }
-        if request_kind::KEYADM.contains(&kind) {
-            return Ok(AdminRequest::Keyadm(WireKeyadmRequest::read_fields(
-                kind, reader,
-            )?));
         }
         let auth = WireAuth::read_fields(reader)?;
         let operation = WireOperation::read_fields(kind, reader)?;
@@ -811,36 +670,6 @@ pub struct WireKeyRequest {
     pub quorum: u8,
 }
 
-/// The answer to `FetchApproved`.
-/// Spec: docs/51 §6 ("dird returns {operation, GUIDs of the requester and
-/// approver}").
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WireApproved {
-    /// The id.
-    pub id: u64,
-    /// The operation digest.
-    pub digest: [u8; DIGEST_LEN],
-    /// The operation.
-    pub operation: WireKeyOperation,
-    /// The principal id (objectGUID packet) of the key set acted on.
-    pub principal: GuidPacket,
-    /// The requester's objectGUID packet.
-    pub requester: GuidPacket,
-    /// The approvers' objectGUID packets.
-    pub approvers: Vec<GuidPacket>,
-}
-
-/// One tombstone of a user or computer object.
-/// Spec: docs/51 §6 (`destroy-sweep`), §9; A-18 (a tombstone keeps GUID +
-/// classes).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WireDestructionEntry {
-    /// The objectGUID packet (= the principal id of its key sets).
-    pub guid: GuidPacket,
-    /// [`codes::KIND_USER`] or [`codes::KIND_COMPUTER`].
-    pub kind: u8,
-}
-
 /// One reply of the admin channel (the shared `Refused` travels separately,
 /// `ipc::Reply::Refused`).
 /// Spec: docs/51 §7.3 (the reply column); docs/50 §7.5.
@@ -881,20 +710,6 @@ pub enum AdminReply {
     Pong,
     /// `RequestKeyOperation` / `Approve`: the pending request.
     KeyRequest(WireKeyRequest),
-    /// `FetchApproved`: the approved operation.
-    Approved(WireApproved),
-    /// `ListPendingDestruction`: one page.
-    PendingDestruction {
-        /// The tombstones of this page.
-        entries: Vec<WireDestructionEntry>,
-        /// Where the next page starts (`None`: the listing is complete).
-        next: Option<GuidPacket>,
-    },
-}
-
-/// The kind code of a destruction entry (closed table).
-fn kind_code(c: u8) -> Option<u8> {
-    matches!(c, codes::KIND_USER | codes::KIND_COMPUTER).then_some(c)
 }
 
 impl MessageSet for AdminReply {
@@ -909,8 +724,6 @@ impl MessageSet for AdminReply {
             AdminReply::Refused(_) => reply_kind::REFUSED,
             AdminReply::Pong => reply_kind::PONG,
             AdminReply::KeyRequest(_) => reply_kind::KEY_REQUEST,
-            AdminReply::Approved(_) => reply_kind::APPROVED,
-            AdminReply::PendingDestruction { .. } => reply_kind::PENDING_DESTRUCTION,
         }
     }
 
@@ -946,21 +759,6 @@ impl MessageSet for AdminReply {
                 writer.write_u8(request.approvals)?;
                 writer.write_u8(request.quorum)
             }
-            AdminReply::Approved(approved) => {
-                writer.write_u64(approved.id)?;
-                writer.write_array(&approved.digest)?;
-                approved.operation.write(writer)?;
-                writer.write_array(&approved.principal)?;
-                writer.write_array(&approved.requester)?;
-                writer.write_seq(&approved.approvers, MAX_APPROVALS, |w, a| w.write_array(a))
-            }
-            AdminReply::PendingDestruction { entries, next } => {
-                writer.write_seq(entries, MAX_DESTRUCTION_ENTRIES, |w, e| {
-                    w.write_array(&e.guid)?;
-                    w.write_enum(e.kind)
-                })?;
-                writer.write_option(next.as_ref(), |w, n| w.write_array(n))
-            }
         }
     }
 
@@ -995,23 +793,6 @@ impl MessageSet for AdminReply {
                 approvals: reader.read_u8()?,
                 quorum: reader.read_u8()?,
             }),
-            reply_kind::APPROVED => AdminReply::Approved(WireApproved {
-                id: reader.read_u64()?,
-                digest: reader.read_array()?,
-                operation: WireKeyOperation::read(reader)?,
-                principal: reader.read_array()?,
-                requester: reader.read_array()?,
-                approvers: reader.read_seq(MAX_APPROVALS, Reader::read_array)?,
-            }),
-            reply_kind::PENDING_DESTRUCTION => AdminReply::PendingDestruction {
-                entries: reader.read_seq(MAX_DESTRUCTION_ENTRIES, |r| {
-                    Ok(WireDestructionEntry {
-                        guid: r.read_array()?,
-                        kind: r.read_enum(kind_code)?,
-                    })
-                })?,
-                next: reader.read_option(Reader::read_array)?,
-            },
             _ => return Err(Error::UnknownKind),
         })
     }

@@ -29,15 +29,18 @@
 //! | `0x06` | `seal_fast_error` | Kdc | `0x86` `EncryptedData` | `0xF3` `Error` |
 //! | `0x07` | `open_and_verify_service_ticket` | Ldap | `0x87` `ServiceContext` | `0xF1` |
 //! | `0x08` | `set_secret` | Directory | `0x88` `Kvno` | `0xF3` |
-//! | `0x09` | `verify_secret` | Directory | `0x89` `()` | `0xF3` |
-//! | `0x0A` | `create_key` | Admin | `0x8A` `Kvno` | `0xF3` |
-//! | `0x0B` | `rotate_key` | Admin | `0x8B` `Kvno` | `0xF3` |
-//! | `0x0C` | `rotate_krbtgt` | Admin | `0x8C` `Kvno` | `0xF3` |
-//! | `0x0D` | `retire_kvno` | Admin | `0x8D` `()` | `0xF3` |
-//! | `0x0E` | `destroy_key_set` | Admin | `0x8E` `()` | `0xF3` |
+//! | `0x09` | `verify_secret` | — (no role since A-102, docs/52 R4) | `0x89` `()` | `0xF3` |
+//! | `0x0A` | `create_key` | Admin (before the seal) | `0x8A` `Kvno` | `0xF3` |
+//! | `0x0B` | `rotate_key(decision)` | Admin | `0x8B` `Kvno` | `0xF3` |
+//! | `0x0C` | `rotate_krbtgt(decision)` | Admin | `0x8C` `Kvno` | `0xF3` |
+//! | `0x0D` | `retire_kvno(decision)` | Admin | `0x8D` `()` | `0xF3` |
+//! | `0x0E` | `destroy_key_set(decision)` | Admin | `0x8E` `()` | `0xF3` |
 //! | `0x0F` | `describe_config` | Kdc, Ldap | `0x8F` `ConfigDescription` ‖ caller `Role` ([`DescribedConfig`]) | `0xF3` |
 //! | `0x10` | `ping` | every role | `0x90` `()` | `0xF3` |
-//! | `0x11` | `grant_set_secret` (task A15a) | Ldap, Admin | `0x91` `()` | `0xF3` |
+//! | `0x11` | `grant_set_secret` (task A15a) | Admin (before the seal, A-102) | `0x91` `()` | `0xF3` |
+//! | `0x12` | `register_decision` (A-102) | Ldap | `0x92` `()` | `0xF3` |
+//! | `0x13` | `seal_ceremony` (A-102) | Admin | `0x93` `()` | `0xF3` |
+//! | `0x14` | `list_destroy_decisions` (A-102) | Admin | `0x94` `DestructionPage` | `0xF3` |
 //! | — | (any) | — | `0xFF` shared `Refused` (A-59) | — |
 //!
 //! No request carries a role: keyd checks the caller's role from the
@@ -95,6 +98,9 @@ pub use typed::{Answer, Call, ConversionError, DescribedConfig, Password, TgsFas
 #[cfg(unix)]
 pub use unix::{UnixConnection, UnixConnector};
 pub use wire::{KeydReply, KeydRequest, WireTime};
-// The arguments of `grant_set_secret`, re-exported for its callers (dird,
-// keyadm) beside the client method (task A15a).
-pub use keyd_types::{AccountKind, SetSecretTarget};
+// The arguments of `grant_set_secret` and `register_decision`, re-exported
+// for their callers (dird, keyadm) beside the client methods (task A15a,
+// A-102).
+pub use keyd_types::{
+    AccountKind, DecidedOperation, DecisionId, DestructionPage, PendingDestruction, SetSecretTarget,
+};

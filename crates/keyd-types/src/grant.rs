@@ -23,14 +23,23 @@
 //!
 //! # Who may register one
 //!
-//! * **Role::Ldap** (dird): any account kind, lifetime at most
-//!   [`MAX_SET_SECRET_GRANT_SECS`].
-//! * **Role::Admin** (keyadm's ceremony, docs/51 §4.3 step 11): the
-//!   provisioning manifest's first administrators, before dird exists —
-//!   user accounts only, only for a key set that does not exist yet (an
-//!   **initial** secret: never a replacement of a password, which only
-//!   dird's PDP may allow), lifetime at most [`MAX_INITIAL_SECRET_GRANT_SECS`]
-//!   (docs/questions/Q-451).
+//! * **Role::Ldap** (dird): a `SetSecret` **decision** through
+//!   `register_decision` (A-102, docs/52 §4.2 — crate decision.rs): any
+//!   account kind, lifetime at most [`MAX_SET_SECRET_GRANT_SECS`].
+//! * **Role::Admin** (keyadm's ceremony, docs/51 §4.3 step 11) through
+//!   `grant_set_secret`, and **only before the ceremony is sealed**
+//!   (A-102, docs/52 §4.4): the provisioning manifest's first
+//!   administrators, before dird exists — user accounts only, only for a key
+//!   set that does not exist yet (an **initial** secret: never a
+//!   replacement of a password, which only dird's PDP may allow), lifetime
+//!   at most [`MAX_INITIAL_SECRET_GRANT_SECS`] (docs/questions/Q-451).
+//!
+//! # The salt is bound too (N4)
+//!
+//! Each target names the string-to-key salt the `set_secret` must present,
+//! octet for octet (docs/52 §2 row 37, N4: "bind every decided
+//! parameter"): the salt is dird's (`account_salt`, docs/51 §7.3), and an
+//! admind that passed another salt would install keys no client derives.
 //!
 //! Spec: docs/51 §4.3 steps 11-12, §5.2 row 5, §5.8, §7.3, §9; docs/47
 //! §9.1, §9.2; docs/10 §2, §6, §8; docs/questions/Q-291 (A-74), Q-450,
@@ -58,17 +67,22 @@ pub enum AccountKind {
     Computer,
 }
 
-/// One key target of a grant: the handle `set_secret` will name and the
-/// binding it must name with it. Not secret.
+/// One key target of a grant: the handle `set_secret` will name, and the
+/// binding and salt it must name with it. Not secret.
 ///
-/// Spec: docs/51 §7.3 ("handles (1 or 2), bindings"); docs/10 §6
-/// (`set_secret(principal, purpose, …)`, with the binding of A-19).
+/// Spec: docs/51 §7.3 ("handles (1 or 2), bindings, salt"); docs/10 §6
+/// (`set_secret(principal, purpose, …, salt)`, with the binding of A-19);
+/// docs/52 §4.2 (`SetSecret { kind, targets: [(handle, binding, salt)] }`,
+/// N4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetSecretTarget {
     /// The key set's handle.
     pub handle: KeyHandle,
     /// The principal name the `set_secret` must name, octet for octet.
     pub binding: PrincipalBinding,
+    /// The string-to-key salt the `set_secret` must present, octet for
+    /// octet (N4).
+    pub salt: String,
 }
 
 /// Most key targets one grant names: a computer's `PrincipalLongterm` and
@@ -107,24 +121,26 @@ pub const MAX_INITIAL_SECRET_GRANT_SECS: u32 = 900;
 /// (docs/questions/Q-450 item 4).
 pub const MAX_SET_SECRET_GRANTS: usize = 64;
 
-/// The longest grant lifetime `role` may ask for, or `None` for a role that
-/// may not register grants.
+/// The longest lifetime of a `grant_set_secret` that `role` may ask for, or
+/// `None` for a role that may not call it. Since A-102 only Role::Admin
+/// (the ceremony) calls `grant_set_secret`; dird's grants are `SetSecret`
+/// decisions, whose ceiling is [`MAX_SET_SECRET_GRANT_SECS`]
+/// (`crate::decision::max_decision_lifetime_secs`).
 ///
 /// The match is exhaustive: a new role does not compile until it is decided
 /// here.
 ///
-/// Spec: docs/questions/Q-450 item 3, Q-451 item 3.
+/// Spec: docs/questions/Q-450 item 3, Q-451 item 3; docs/52 §4.2 (A-102).
 #[must_use]
 pub const fn max_grant_lifetime_secs(role: Role) -> Option<u32> {
     match role {
-        Role::Ldap => Some(MAX_SET_SECRET_GRANT_SECS),
         Role::Admin => Some(MAX_INITIAL_SECRET_GRANT_SECS),
-        Role::Kdc | Role::Directory => None,
+        Role::Kdc | Role::Directory | Role::Ldap => None,
     }
 }
 
-// Every role that may register a grant has a lifetime ceiling, and no other
-// role has one (docs/10 §2, the capability table).
+// Every role that may call `grant_set_secret` has a lifetime ceiling, and no
+// other role has one (docs/10 §2, the capability table).
 const _: () = {
     let roles = [Role::Kdc, Role::Directory, Role::Admin, Role::Ldap];
     let mut i = 0;

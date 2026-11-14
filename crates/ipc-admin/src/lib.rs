@@ -38,7 +38,7 @@
 //! | → | `0x08`–`0x0D` | `SetEnabled`, `SetAccountExpires`, `AddMember`, `RemoveMember`, `Delete`, `Lookup` | dird's (`auth` ‖ fields) |
 //! | → | `0x14` | `Ping` | — (no `auth`) |
 //! | → | `0x0E`, `0x0F` | `RequestKeyOperation`, `Approve` | dird's (`auth` ‖ fields) |
-//! | → | `0x10`–`0x12` | `FetchApproved`, `Complete`, `ListPendingDestruction` | dird's (**no `auth`**) — forwarded only from `keyadm_uid` |
+//! | → | `0x10`–`0x12` | (retired by A-102: keyadm's `FetchApproved`, `Complete`, `ListPendingDestruction`) | — |
 //! | → | `0x15` | `SetPassword` | `auth ‖ completion:bytes<64 KiB> ‖ target:[16] ‖ password:secret bytes<1024>` |
 //! | ← | `0x81` | `Created` | dird's: `guid:[16] ‖ sid:Option<bytes<68>>` |
 //! | ← | `0x83` | `Done` | — |
@@ -46,14 +46,15 @@
 //! | ← | `0x85` | `Refused` | `status:u8{1 Denied, 2 ApprovalRequired, 3 NotFound, 4 Invalid, 5 Conflict, 6 Unavailable, 7 OutcomeUnknown, 8 Incomplete}` |
 //! | ← | `0x86` | `Pong` | — |
 //! | ← | `0x87` | `PasswordChanged` | `kvnos:seq<u32,2> ‖ completion_recorded:bool` |
-//! | ← | `0x88`–`0x8A` | `KeyRequest`, `Approved`, `PendingDestruction` | dird's |
+//! | ← | `0x88` | `KeyRequest` | dird's |
+//! | ← | `0x89`, `0x8A` | (retired by A-102: `Approved`, `PendingDestruction`) | — |
 //! | ← | `0xFF` | shared `Refused` (A-59) | `code` |
 //!
 //! Unused kinds: `0x06` / `0x07` (dird's password-set steps — only admind
 //! sends them, to dird), `0x13` (the join token, task A12). Request body
 //! ≤ 288 KiB, reply body ≤ 16 KiB ([`channel`]). The synchronous client
-//! ([`client`], task A10) is keyadm's — and `adminctl`'s when task A11
-//! builds it.
+//! ([`client`], task A10) is `adminctl`'s when task A11 builds it (keyadm
+//! used it until A-102, which took admind out of keyadm's path).
 //!
 //! `completion` is a second AP-REQ of the requester for dird's
 //! `CompletePasswordSet`: dird verifies every request's AP-REQs through

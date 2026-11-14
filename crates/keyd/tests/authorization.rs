@@ -2,15 +2,16 @@
 //! capability table) and I3 (every handle's purpose matches the operation),
 //! exhaustively over all operations, roles and purposes. Source: docs/10 §2
 //! (capability table; "mismatch -> Denied, recorded"), §12 I2, I3; docs/09
-//! א.6 (D31).
+//! א.6 (D31); docs/52 §4, §7 R1, R3, R4 (A-102: the decision operations,
+//! `verify_secret` in no role).
 
 mod common;
 
 use common::*;
 use keyd::authz::{purpose_permitted, role_permits, HandleSlot, CAPABILITY_TABLE};
 use keyd::{
-    AccountKind, ArmorId, AuditOutcome, AuditReason, AuthnProof, CallerId, CtxId, DualControlToken,
-    ExchangeId, FastConversation, KeyHandle, KeyPurpose, Kvno, Operation, PrincipalId, Role,
+    AccountKind, ArmorId, AuditOutcome, AuditReason, AuthnProof, CallerId, CtxId, DecidedOperation,
+    DecisionId, ExchangeId, FastConversation, KeyHandle, KeyPurpose, Operation, PrincipalId, Role,
     SetSecretTarget,
 };
 use krb_proto::constants::FX_FAST_ARMOR_AP_REQUEST;
@@ -74,6 +75,22 @@ fn binding_for(handle: &KeyHandle) -> keyd::PrincipalBinding {
     }
 }
 
+/// A decision id no test registered: the four Admin operations that run a
+/// decision take only an id (A-102), and the role check precedes the
+/// decision's lookup.
+const UNREGISTERED: DecisionId = DecisionId::new(0xDEAD_BEEF);
+
+/// A decided operation acting on `handle` (A-102, docs/52 §4.2).
+fn decided_for(handle: &KeyHandle) -> DecidedOperation {
+    match handle.purpose {
+        KeyPurpose::Krbtgt => DecidedOperation::RotateKrbtgt { krbtgt: *handle },
+        KeyPurpose::Service => DecidedOperation::RotateKey { handle: *handle },
+        KeyPurpose::PrincipalLongterm => DecidedOperation::DestroyKeySet {
+            principal: handle.principal,
+        },
+    }
+}
+
 /// Invoke `op` with `caller` on `handle` (other arguments are plausible but
 /// irrelevant: authorization is the first step). Returns whether it
 /// succeeded.
@@ -133,21 +150,10 @@ fn invoke(f: &mut Fixture, op: Operation, caller: &CallerId, handle: &KeyHandle)
             .keyd
             .create_key(caller, handle, &binding_for(handle), &n)
             .is_ok(),
-        Operation::RotateKey => f.keyd.rotate_key(caller, handle, &n).is_ok(),
-        Operation::RotateKrbtgt => f
-            .keyd
-            .rotate_krbtgt(
-                caller,
-                handle,
-                &DualControlToken {
-                    approver_1: PrincipalId::from_bytes([1; 16]),
-                    approver_2: PrincipalId::from_bytes([2; 16]),
-                },
-                &n,
-            )
-            .is_ok(),
-        Operation::RetireKvno => f.keyd.retire_kvno(caller, handle, Kvno::new(1), &n).is_ok(),
-        Operation::DestroyKeySet => f.keyd.destroy_key_set(caller, handle, &n).is_ok(),
+        Operation::RotateKey => f.keyd.rotate_key(caller, UNREGISTERED, &n).is_ok(),
+        Operation::RotateKrbtgt => f.keyd.rotate_krbtgt(caller, UNREGISTERED, &n).is_ok(),
+        Operation::RetireKvno => f.keyd.retire_kvno(caller, UNREGISTERED, &n).is_ok(),
+        Operation::DestroyKeySet => f.keyd.destroy_key_set(caller, UNREGISTERED, &n).is_ok(),
         Operation::OpenFastArmor => f
             .keyd
             .open_fast_armor(caller, handle, &dummy_armored_req(), &[0x30, 0x00], &n)
@@ -179,11 +185,30 @@ fn invoke(f: &mut Fixture, op: Operation, caller: &CallerId, handle: &KeyHandle)
                 &[SetSecretTarget {
                     handle: *handle,
                     binding: binding_for(handle),
+                    salt: String::from("salt"),
                 }],
                 keyd::MAX_SET_SECRET_GRANT_SECS,
                 &n,
             )
             .is_ok(),
+        // A-102: a decision acting on `handle`.
+        Operation::RegisterDecision => {
+            let operation = decided_for(handle);
+            let approvers = approvers_for(&operation);
+            f.keyd
+                .register_decision(
+                    caller,
+                    next_decision_id(),
+                    &operation,
+                    &approvers,
+                    ceiling_for(&operation),
+                    &n,
+                )
+                .is_ok()
+        }
+        // No handle (A-102): `handle` is unused.
+        Operation::SealCeremony => f.keyd.seal_ceremony(caller, &n).is_ok(),
+        Operation::ListDestroyDecisions => f.keyd.list_destroy_decisions(caller, None, &n).is_ok(),
     }
 }
 
@@ -196,8 +221,12 @@ fn valid_handle(op: Operation) -> KeyHandle {
         Operation::IssueTgsRep | Operation::RotateKey | Operation::RetireKvno => SERVICE,
         Operation::DestroyKeySet | Operation::OpenAndVerifyServiceTicket => SERVICE,
         Operation::SetSecret | Operation::VerifySecret | Operation::GrantSetSecret => ALICE,
-        // No handle (docs/50 §3.4); unused.
-        Operation::DescribeConfig | Operation::Ping => ALICE,
+        Operation::RegisterDecision => SERVICE,
+        // No handle (docs/50 §3.4; A-102); unused.
+        Operation::DescribeConfig
+        | Operation::Ping
+        | Operation::SealCeremony
+        | Operation::ListDestroyDecisions => ALICE,
         Operation::CreateKey => {
             KeyHandle::new(PrincipalId::from_bytes([0x99; 16]), KeyPurpose::Service)
         }
@@ -244,7 +273,9 @@ fn wrong_role_is_denied_for_every_operation() {
 
 /// I3: with the permitted role, a handle of a purpose the operation does not
 /// accept is refused with PurposeMismatch. Source: docs/10 §2 ("(b) the
-/// KeyPurpose of the handle matches the operation"), §12 I3.
+/// KeyPurpose of the handle matches the operation"), §12 I3. The operations
+/// that run a decision take no handle since A-102 — the decided handle's
+/// purpose is judged at registration (crate decisions.rs tests).
 #[test]
 fn wrong_purpose_is_denied_for_every_operation() {
     let mut f = Fixture::new();
@@ -257,9 +288,22 @@ fn wrong_purpose_is_denied_for_every_operation() {
         // seal_fast_error takes no handle: the armor token is its authority
         // (docs/48 §2.3); describe_config and ping take none either (docs/50
         // §3.4). There is no purpose to mismatch.
+        // A-102: the decision operations take no handle either (a decided
+        // handle's purpose is judged by `register_decision`, DecisionInvalid),
+        // and `verify_secret` has no role (docs/52 R4).
         if matches!(
             op,
-            Operation::SealFastError | Operation::DescribeConfig | Operation::Ping
+            Operation::SealFastError
+                | Operation::DescribeConfig
+                | Operation::Ping
+                | Operation::RotateKey
+                | Operation::RotateKrbtgt
+                | Operation::RetireKvno
+                | Operation::DestroyKeySet
+                | Operation::RegisterDecision
+                | Operation::SealCeremony
+                | Operation::ListDestroyDecisions
+                | Operation::VerifySecret
         ) {
             continue;
         }
@@ -318,16 +362,20 @@ fn issue_as_rep_krbtgt_slot_purpose() {
 
 /// The compile-time capability table is exactly the phase-1 subset of
 /// docs/10 §2: Kdc -> AS/TGS operations (and the FAST armor operations of
-/// docs/48 §2.3); Directory -> set/verify secret; Admin -> key lifecycle;
-/// Ldap -> service-ticket verification; plus the daemon-support operations
-/// of docs/50 §3.4 — describe_config for Kdc and Ldap, ping for every role.
+/// docs/48 §2.3); Directory -> set secret (no longer verify — A-102, R4);
+/// Admin -> key lifecycle, the seal, the destroy listing; Ldap ->
+/// service-ticket verification and decision registration; plus the
+/// daemon-support operations of docs/50 §3.4 — describe_config for Kdc and
+/// Ldap, ping for every role.
 /// No role holds a read-key operation (none exists).
 /// Source: docs/10 §2, §7 ("no read operation for a key — in any role");
 /// docs/48 §2.3, §9.1 I2; docs/questions/Q-115 (A-35: destroy_key_set is
 /// an Admin operation); docs/questions/Q-165 item 3 (A-46: Role::Ldap);
 /// docs/50 §3.4 (`DescribeConfig`: Kdc, Ldap; `Ping`: every mapped role);
-/// docs/51 §5.8 option (b), docs/questions/Q-450 (`GrantSetSecret`: Admin,
-/// Ldap — task A15a).
+/// docs/51 §5.8 option (b), docs/questions/Q-450 (`GrantSetSecret` — task
+/// A15a); docs/52 §4, §7 R1, R3, R4 and docs/questions/Q-460, Q-462, Q-465
+/// (A-102: `RegisterDecision` Ldap only, `GrantSetSecret` Admin only,
+/// `SealCeremony` / `ListDestroyDecisions` Admin, `VerifySecret` nobody).
 #[test]
 fn capability_table_matches_design() {
     use Operation::*;
@@ -345,7 +393,7 @@ fn capability_table_matches_design() {
                 Ping,
             ],
         ),
-        (Role::Directory, &[SetSecret, VerifySecret, Ping]),
+        (Role::Directory, &[SetSecret, Ping]),
         (
             Role::Admin,
             &[
@@ -355,6 +403,8 @@ fn capability_table_matches_design() {
                 RetireKvno,
                 DestroyKeySet,
                 GrantSetSecret,
+                SealCeremony,
+                ListDestroyDecisions,
                 Ping,
             ],
         ),
@@ -362,7 +412,7 @@ fn capability_table_matches_design() {
             Role::Ldap,
             &[
                 OpenAndVerifyServiceTicket,
-                GrantSetSecret,
+                RegisterDecision,
                 DescribeConfig,
                 Ping,
             ],

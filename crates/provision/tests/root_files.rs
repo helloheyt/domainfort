@@ -24,7 +24,6 @@ run_as_uid = 806
 run_as_gid = 806
 admin_socket = /run/admind/admin.sock
 admin_socket_group = 810
-keyadm_uid = 807
 min_password_length = 14
 dird_admin_socket = /run/dird/admin/dird-admin.sock
 dird_uid = 802
@@ -74,8 +73,10 @@ fn a_symbolic_link_to_a_valid_root_file_is_refused() {
     write(&manifest, MANIFEST);
     let uid = std::fs::metadata(&admind).unwrap().uid();
     assert_eq!(
-        read_admind_settings(&admind, uid).unwrap().keyadm_uid(),
-        807
+        read_admind_settings(&admind, uid)
+            .unwrap()
+            .admin_socket_group(),
+        810
     );
     assert_eq!(
         read_manifest(&manifest, uid).unwrap().first_admins().len(),

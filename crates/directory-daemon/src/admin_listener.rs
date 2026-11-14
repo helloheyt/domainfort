@@ -248,7 +248,6 @@ async fn connection(mut stream: UnixStream, context: Arc<AdminServeContext>) {
                 continue;
             }
             Ok(Request::Operation { auth, operation }) => AdminWork::Operation { auth, operation },
-            Ok(Request::Keyadm(request)) => AdminWork::Keyadm(request),
         };
         let counted = InFlight::new(&context.in_flight);
         let pending = match context.engine.submit(work) {

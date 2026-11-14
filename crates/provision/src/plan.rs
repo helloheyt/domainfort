@@ -57,7 +57,7 @@ use directory_admin::{
     computer_sam, filetime, new_object_descriptor, RandomSource, ACCOUNT_EXPIRES_NEVER,
     RID_END_EXCLUSIVE, RID_FIRST,
 };
-use directory_pip::{dstime_of, NamingContext, NC_RDN_ATTRIBUTE};
+use directory_pip::{account_salt, dstime_of, AccountKind, NamingContext, NC_RDN_ATTRIBUTE};
 use dirstore::{AttrId, ClassId, NodeId, INTEGRITY_KEY_LEN};
 use dtyp::{Guid, SecurityDescriptor, Sid, GUID_PACKET_LEN, SECURITY_NT_AUTHORITY};
 use krb_proto::{KerberosTime, Realm};
@@ -206,6 +206,9 @@ pub enum PlanError {
     Manifest(provision_manifest::Error),
     /// The manifest's canonical text did not parse back to itself.
     ManifestRoundTrip,
+    /// A first administrator's salt could not be formed by the directory's
+    /// salt function (A-102: the manifest carries it, docs/52 N4).
+    Salt,
     /// A planned RID or SID could not be formed.
     Sid,
 }
@@ -227,6 +230,7 @@ impl fmt::Display for PlanError {
             }
             PlanError::Manifest(e) => write!(f, "manifest refused: {e}"),
             PlanError::ManifestRoundTrip => f.write_str("manifest did not parse back"),
+            PlanError::Salt => f.write_str("a first administrator's salt cannot be formed"),
             PlanError::Sid => f.write_str("a SID could not be formed"),
         }
     }
@@ -740,6 +744,27 @@ impl Plan {
                 .collect(),
         })
         .map_err(PlanError::Manifest)?;
+        // A-102 (docs/52 §2 row 37, N4): each first administrator's
+        // string-to-key salt, by the directory's own function (R47-4) — the
+        // salt `first-admin-secret` derives the same way and presents — is
+        // written into the manifest, so that keyadm's ceremony grant binds
+        // exactly it without keyadm linking the directory code (D104).
+        let salts = manifest
+            .first_admins()
+            .iter()
+            .map(|admin| {
+                account_salt(
+                    manifest.realm(),
+                    AccountKind::User,
+                    admin.sam_account_name(),
+                )
+                .map(|salt| salt.as_str().to_owned())
+            })
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(|_| PlanError::Salt)?;
+        let manifest = manifest
+            .with_first_admin_salts(&salts)
+            .map_err(PlanError::Manifest)?;
         if Manifest::parse(manifest.encode().as_bytes()).as_ref() != Ok(&manifest) {
             return Err(PlanError::ManifestRoundTrip);
         }

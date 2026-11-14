@@ -30,10 +30,13 @@
 //! # Key-state changes: intent acknowledged, then the change (decision A-86)
 //!
 //! A call that changes keyd's key state (`keyd::changes_key_state`) — or
-//! loosens keyd's authorization (`grant_set_secret`, task A15a; both:
-//! `keyd::requires_acknowledged_intent`, docs/questions/Q-452) — and that
-//! keyd's own authorization step admits (`keyd::Keyd::admits`: role,
-//! purpose, and for `set_secret` a live grant) takes another path
+//! loosens keyd's authorization (`grant_set_secret`, task A15a;
+//! `register_decision`, A-102; both: `keyd::requires_acknowledged_intent`,
+//! docs/questions/Q-452) — and that keyd's own authorization step admits
+//! (`keyd::Keyd::admits`: role, purpose, the ceremony state, and for
+//! `set_secret` a live decision; for an execution by decision id,
+//! `keyd::Keyd::decided_intent`: a pending decision of its kind, whose
+//! registered parameters fill the intent — A-102) takes another path
 //! (crate::audit, steps 1-3): the intent record
 //! is committed and **acknowledged by auditd before keyd runs the call**; no
 //! acknowledgement in time ⇒ `Refused::Unavailable` and keyd does not run
@@ -408,18 +411,37 @@ where
         // before).
         let operation = call.operation();
         if requires_acknowledged_intent(operation) {
-            let Some(intent) =
-                KeyStateIntent::of(caller, now, &call).filter(|intent| intent.op() == operation)
-            else {
-                // keyd and the daemon disagree on what needs an intent:
-                // not served (fail closed; AGENTS.md §6).
-                return refuse(Refused::Unavailable);
-            };
-            if self
-                .keyd
-                .admits(&caller, operation, &intent.handles(), &now)
-            {
-                return self.change_key_state(caller, now, call, &intent, queued);
+            if let Some(decision) = call.decision() {
+                // A-102 (docs/52 §4.5): an execution names only dird's
+                // decision; its intent is built from keyd's table. No pending
+                // decision (refused, or already run and replayed) changes
+                // nothing: the ordinary path below, one record.
+                if let Some(facts) = self.keyd.decided_intent(&caller, operation, decision, &now) {
+                    let intent = KeyStateIntent::decided(caller, now, operation, &facts);
+                    return self.change_key_state(caller, now, call, &intent, queued);
+                }
+            } else {
+                let Some(intent) = KeyStateIntent::of(caller, now, &call)
+                    .filter(|intent| intent.op() == operation)
+                else {
+                    // keyd and the daemon disagree on what needs an intent:
+                    // not served (fail closed; AGENTS.md §6).
+                    return refuse(Refused::Unavailable);
+                };
+                if self
+                    .keyd
+                    .admits(&caller, operation, &intent.handles(), &now)
+                {
+                    // A-102 (docs/52 §4.5): a `set_secret` names its handle;
+                    // the decision it will consume is keyd's to say.
+                    let intent = match &call {
+                        Call::SetSecret { handle, .. } => {
+                            intent.with_decision(self.keyd.secret_decision(handle))
+                        }
+                        _ => intent,
+                    };
+                    return self.change_key_state(caller, now, call, &intent, queued);
+                }
             }
         }
         // A-57: a gating operation reserves its record's slot before keyd

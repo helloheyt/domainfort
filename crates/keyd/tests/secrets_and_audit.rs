@@ -2,15 +2,17 @@
 //! constant-time comparison facilities), I7 (plaintext taken in zeroizing
 //! containers) and I8 (every operation audited, no secret in audit), plus
 //! redacted Debug output. Source: docs/10 §9, §10, §12; docs/09 א.1, א.5;
-//! AGENTS.md §6. All values are constructed for these tests.
+//! docs/52 §4 (A-102: the decision operations); AGENTS.md §6. All values
+//! are constructed for these tests.
 
 mod common;
 
 use common::*;
 use keyd::{
-    ArmorId, AsRepParts, AsTicketTemplate, AuditOutcome, AuthnError, AuthnProof, CallerId, CtxId,
-    DualControlToken, Error, IssueError, KeyHandle, Kvno, Operation, PrincipalBinding, PrincipalId,
-    ServiceContext, TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext,
+    AccountKind, ArmorId, AsRepParts, AsTicketTemplate, AuditOutcome, AuthnError, AuthnProof,
+    CallerId, CtxId, DecidedOperation, DecisionId, DestructionPage, Error, IssueError, KeyHandle,
+    Kvno, Operation, PrincipalBinding, PrincipalId, ServiceContext, SetSecretTarget,
+    TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext,
 };
 use krb_proto::{ApReq, KerberosTime, PaData};
 use zeroize::Zeroizing;
@@ -78,19 +80,41 @@ fn operation_signatures_return_no_key_material() {
         &PrincipalBinding,
         &KerberosTime,
     ) -> Result<Kvno, Error> = K::create_key;
-    let _: fn(&mut K, &CallerId, &KeyHandle, &KerberosTime) -> Result<Kvno, Error> = K::rotate_key;
+    // A-102 (docs/52 §4.2): the Admin operations that run a decision take
+    // only its id — never a handle, kvno or approval.
+    let _: fn(&mut K, &CallerId, DecisionId, &KerberosTime) -> Result<Kvno, Error> = K::rotate_key;
+    let _: fn(&mut K, &CallerId, DecisionId, &KerberosTime) -> Result<Kvno, Error> =
+        K::rotate_krbtgt;
+    let _: fn(&mut K, &CallerId, DecisionId, &KerberosTime) -> Result<(), Error> = K::retire_kvno;
+    // A-35 (docs/questions/Q-115): destroy_key_set returns nothing.
+    let _: fn(&mut K, &CallerId, DecisionId, &KerberosTime) -> Result<(), Error> =
+        K::destroy_key_set;
+    // A-102: registering a decision, sealing the ceremony and listing the
+    // pending destructions return nothing secret (unit, or ids).
     let _: fn(
         &mut K,
         &CallerId,
-        &KeyHandle,
-        &DualControlToken,
+        DecisionId,
+        &DecidedOperation,
+        &[PrincipalId],
+        u32,
         &KerberosTime,
-    ) -> Result<Kvno, Error> = K::rotate_krbtgt;
-    let _: fn(&mut K, &CallerId, &KeyHandle, Kvno, &KerberosTime) -> Result<(), Error> =
-        K::retire_kvno;
-    // A-35 (docs/questions/Q-115): destroy_key_set returns nothing.
-    let _: fn(&mut K, &CallerId, &KeyHandle, &KerberosTime) -> Result<(), Error> =
-        K::destroy_key_set;
+    ) -> Result<(), Error> = K::register_decision;
+    let _: fn(&mut K, &CallerId, &KerberosTime) -> Result<(), Error> = K::seal_ceremony;
+    let _: fn(
+        &mut K,
+        &CallerId,
+        Option<DecisionId>,
+        &KerberosTime,
+    ) -> Result<DestructionPage, Error> = K::list_destroy_decisions;
+    let _: fn(
+        &mut K,
+        &CallerId,
+        AccountKind,
+        &[SetSecretTarget],
+        u32,
+        &KerberosTime,
+    ) -> Result<(), Error> = K::grant_set_secret;
     // I7: plaintext enters as Zeroizing<String> BY VALUE — keyd owns it and
     // it is wiped when the call returns (docs/10 §12 I7). A-35: keyd chooses
     // the kvno and returns it (not secret).
@@ -217,11 +241,27 @@ fn every_operation_emits_exactly_one_audit_record() {
         .issue_tgs_rep(&ADMIN, &SERVICE, &ctx.ctx_id, &tgs_template(70), &n);
     check(&f, Operation::IssueTgsRep, &ADMIN, false);
 
-    // The set_secret grant (task A15a): one record either way.
-    let _ = f.grant_as(&DIRECTORY, &ALICE, &alice_binding(), &n);
+    // The ceremony's grant (task A15a; Admin before the seal, A-102): one
+    // record either way.
+    let _ = f.grant_as(&DIRECTORY, &ALICE, &alice_binding(), ALICE_SALT, &n);
     check(&f, Operation::GrantSetSecret, &DIRECTORY, false);
-    f.grant(&ALICE, &alice_binding(), &n).unwrap();
-    check(&f, Operation::GrantSetSecret, &LDAP, true);
+    let dave = KeyHandle::new(
+        PrincipalId::from_bytes([0xDA; 16]),
+        keyd::KeyPurpose::PrincipalLongterm,
+    );
+    f.grant_as(&ADMIN, &dave, &alice_binding(), "EXAMPLE.ORGdave", &n)
+        .unwrap();
+    check(&f, Operation::GrantSetSecret, &ADMIN, true);
+    // A decision (A-102): one record either way.
+    f.grant(&ALICE, &alice_binding(), ALICE_SALT, &n).unwrap();
+    check(&f, Operation::RegisterDecision, &LDAP, true);
+    let refused = DecidedOperation::DestroyKeySet {
+        principal: ALICE_ID,
+    };
+    let _ = f
+        .keyd
+        .register_decision(&ADMIN, next_decision_id(), &refused, &[], 60, &n);
+    check(&f, Operation::RegisterDecision, &ADMIN, false);
     f.keyd
         .set_secret(
             &DIRECTORY,
@@ -233,11 +273,8 @@ fn every_operation_emits_exactly_one_audit_record() {
         )
         .unwrap();
     check(&f, Operation::SetSecret, &DIRECTORY, true);
-    f.keyd
-        .verify_secret(&DIRECTORY, &ALICE, z("next"), &n)
-        .unwrap();
-    check(&f, Operation::VerifySecret, &DIRECTORY, true);
-    let _ = f.keyd.verify_secret(&DIRECTORY, &ALICE, z("wrong"), &n);
+    // No role holds verify_secret (A-102, docs/52 R4): one record, refused.
+    let _ = f.keyd.verify_secret(&DIRECTORY, &ALICE, z("next"), &n);
     check(&f, Operation::VerifySecret, &DIRECTORY, false);
 
     let h = KeyHandle::new(
@@ -250,27 +287,61 @@ fn every_operation_emits_exactly_one_audit_record() {
     });
     f.keyd.create_key(&ADMIN, &h, &h_binding, &n).unwrap();
     check(&f, Operation::CreateKey, &ADMIN, true);
-    f.keyd.rotate_key(&ADMIN, &h, &n).unwrap();
-    check(&f, Operation::RotateKey, &ADMIN, true);
-    f.keyd.retire_kvno(&ADMIN, &h, Kvno::new(1), &n).unwrap();
-    check(&f, Operation::RetireKvno, &ADMIN, true);
-    let approval = DualControlToken {
-        approver_1: PrincipalId::from_bytes([1; 16]),
-        approver_2: PrincipalId::from_bytes([2; 16]),
-    };
-    f.keyd
-        .rotate_krbtgt(&ADMIN, &KRBTGT, &approval, &n)
+    // A-102: each Admin key operation runs a decision (its registration is
+    // one record, the execution another).
+    let rotation = f
+        .decide(DecidedOperation::RotateKey { handle: h }, &n)
         .unwrap();
-    check(&f, Operation::RotateKrbtgt, &ADMIN, true);
-    let _ = f.keyd.rotate_krbtgt(&KDC, &KRBTGT, &approval, &n);
+    check(&f, Operation::RegisterDecision, &LDAP, true);
+    f.keyd.rotate_key(&ADMIN, rotation, &n).unwrap();
+    check(&f, Operation::RotateKey, &ADMIN, true);
+    let retirement = f
+        .decide(
+            DecidedOperation::RetireKvno {
+                handle: h,
+                kvno: Kvno::new(1),
+            },
+            &n,
+        )
+        .unwrap();
+    check(&f, Operation::RegisterDecision, &LDAP, true);
+    f.keyd.retire_kvno(&ADMIN, retirement, &n).unwrap();
+    check(&f, Operation::RetireKvno, &ADMIN, true);
+    let krbtgt_rotation = f
+        .decide(DecidedOperation::RotateKrbtgt { krbtgt: KRBTGT }, &n)
+        .unwrap();
+    check(&f, Operation::RegisterDecision, &LDAP, true);
+    let _ = f.keyd.rotate_krbtgt(&KDC, krbtgt_rotation, &n);
     check(&f, Operation::RotateKrbtgt, &KDC, false);
+    f.keyd.rotate_krbtgt(&ADMIN, krbtgt_rotation, &n).unwrap();
+    check(&f, Operation::RotateKrbtgt, &ADMIN, true);
     // destroy_key_set (A-35, docs/questions/Q-115): one record either way.
-    let _ = f.keyd.destroy_key_set(&DIRECTORY, &h, &n);
+    let destroy = f
+        .decide(
+            DecidedOperation::DestroyKeySet {
+                principal: h.principal,
+            },
+            &n,
+        )
+        .unwrap();
+    check(&f, Operation::RegisterDecision, &LDAP, true);
+    let _ = f.keyd.destroy_key_set(&DIRECTORY, destroy, &n);
     check(&f, Operation::DestroyKeySet, &DIRECTORY, false);
-    f.keyd.destroy_key_set(&ADMIN, &h, &n).unwrap();
+    f.keyd.list_destroy_decisions(&ADMIN, None, &n).unwrap();
+    check(&f, Operation::ListDestroyDecisions, &ADMIN, true);
+    let _ = f.keyd.list_destroy_decisions(&KDC, None, &n);
+    check(&f, Operation::ListDestroyDecisions, &KDC, false);
+    f.keyd.destroy_key_set(&ADMIN, destroy, &n).unwrap();
     check(&f, Operation::DestroyKeySet, &ADMIN, true);
-    let _ = f.keyd.destroy_key_set(&ADMIN, &h, &n);
+    let _ = f
+        .keyd
+        .destroy_key_set(&ADMIN, DecisionId::new(0xDEAD_0003), &n);
     check(&f, Operation::DestroyKeySet, &ADMIN, false);
+    // The seal (A-102, docs/52 R3): one record either way.
+    let _ = f.keyd.seal_ceremony(&DIRECTORY, &n);
+    check(&f, Operation::SealCeremony, &DIRECTORY, false);
+    f.keyd.seal_ceremony(&ADMIN, &n).unwrap();
+    check(&f, Operation::SealCeremony, &ADMIN, true);
 
     // FAST (docs/48 §2.4: one record per call, success or failure). The
     // successful paths are audited in tests/fast_armor.rs.
@@ -357,7 +428,7 @@ fn audit_records_contain_no_secret_bytes() {
         .unwrap()
         .0
         .key;
-    f.grant(&BOB, &bob_binding(), &now()).unwrap();
+    f.grant(&BOB, &bob_binding(), BOB_SALT, &now()).unwrap();
     f.keyd
         .set_secret(
             &DIRECTORY,

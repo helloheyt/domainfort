@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 //! The keyadm binary: `keyadm <configuration file> ceremony <manifest file>`,
-//! `… rotate-krbtgt | rotate-key | retire-kvno <request id>`, `…
-//! destroy-sweep` (crates/keyadm cli.rs).
+//! `… rotate-krbtgt | rotate-key | retire-kvno <decision id>`, `…
+//! destroy-sweep` (crates/keyadm cli.rs). keyadm talks to keyd only (A-102,
+//! docs/52 §4.6).
 //!
 //! Every message is a fixed text, at most followed by an error's own fixed
 //! description (configuration and manifest errors never echo input, A-60)
@@ -10,9 +11,8 @@
 //! command stopped after an attempt: check keyd's audit log (crates/keyadm
 //! report.rs).
 //!
-//! Spec: docs/51 §4.3 step 11, §6; docs/50 §8.2; A-60.
+//! Spec: docs/51 §4.3 step 11, §6; docs/50 §8.2; A-60; docs/52 §4.6 (A-102).
 
-use ipc_admin::AdmindClient;
 use ipc_keyd::{KeydClient, UnixConnector};
 use keyadm::cli::{self, Approved, Command, USAGE};
 use keyadm::report::{self, EXIT_NOTHING_ATTEMPTED};
@@ -67,26 +67,21 @@ fn ceremony(config_path: &Path, manifest_path: &Path) -> ExitCode {
             Ok(client) => client,
             Err(_) => return fail("configuration", &"keyd_uid cannot be 0"),
         };
-    let outcome = ceremony::run(&mut client, &manifest);
-    let mut out = std::io::stdout().lock();
-    for line in report::render(&outcome, &manifest) {
-        let _ = writeln!(out, "keyadm: {line}");
-    }
-    ExitCode::from(report::exit_code(&outcome))
+    let lines = match ceremony::run(&mut client, &manifest) {
+        Ok(outcome) => {
+            print(report::render(&outcome, &manifest));
+            return ExitCode::from(report::exit_code(&outcome));
+        }
+        Err(missing) => report::render_missing_salt(missing, &manifest),
+    };
+    print(lines);
+    ExitCode::from(EXIT_NOTHING_ATTEMPTED)
 }
 
-/// The clients of the approved-request commands and the sweep: keyd (its
-/// uid checked before anything is sent) and admind (likewise — both
-/// `admin_socket` and `admind_uid` must be configured).
-/// Spec: docs/51 §6; docs/50 R50-3.
-type Clients = (
-    KeydClient<UnixConnector>,
-    AdmindClient<ipc_dird_admin::UnixConnector>,
-);
-
-/// Refuse root, read the configuration, build both clients.
-/// Spec: docs/51 §6; docs/50 R50-3.
-fn clients(config_path: &Path) -> Result<Clients, ExitCode> {
+/// Refuse root, read the configuration, build keyd's client (its uid
+/// checked before anything is sent). keyadm talks to keyd only (A-102).
+/// Spec: docs/51 §6; docs/50 R50-3; docs/52 §4.6.
+fn keyd_client(config_path: &Path) -> Result<KeydClient<UnixConnector>, ExitCode> {
     if let Err(error) = identity::check_current_process() {
         return Err(fail("identity", &error));
     }
@@ -94,25 +89,12 @@ fn clients(config_path: &Path) -> Result<Clients, ExitCode> {
         Ok(settings) => settings,
         Err(error) => return Err(fail("configuration", &error)),
     };
-    let Some(admind) = settings.admind() else {
-        return Err(fail(
-            "configuration",
-            &"admin_socket and admind_uid are required for this command",
-        ));
-    };
-    let keyd = KeydClient::new(
+    KeydClient::new(
         UnixConnector::new(settings.keyd().socket().as_path().to_path_buf()),
         settings.keyd().uid(),
         settings.keyd_deadline(),
     )
-    .map_err(|_| fail("configuration", &"keyd_uid cannot be 0"))?;
-    let admind = AdmindClient::new(
-        ipc_dird_admin::UnixConnector::new(admind.socket().as_path().to_path_buf()),
-        admind.uid(),
-        ipc_admin::DEFAULT_DEADLINE,
-    )
-    .map_err(|_| fail("configuration", &"admind_uid cannot be 0"))?;
-    Ok((keyd, admind))
+    .map_err(|_| fail("configuration", &"keyd_uid cannot be 0"))
 }
 
 /// Print `lines` to standard output.
@@ -123,25 +105,25 @@ fn print(lines: Vec<String>) {
     }
 }
 
-/// `rotate-krbtgt` / `rotate-key` / `retire-kvno <request id>`.
-/// Spec: docs/51 §6.
-fn execute_approved(config_path: &Path, command: Approved, id: u64) -> ExitCode {
-    let (mut keyd, mut admind) = match clients(config_path) {
-        Ok(clients) => clients,
+/// `rotate-krbtgt` / `rotate-key` / `retire-kvno <decision id>`.
+/// Spec: docs/51 §6; docs/52 §4.2.
+fn execute_decision(config_path: &Path, command: Approved, id: u64) -> ExitCode {
+    let mut keyd = match keyd_client(config_path) {
+        Ok(client) => client,
         Err(code) => return code,
     };
-    let outcome = execute::run(&mut admind, &mut keyd, command, id);
+    let outcome = execute::run(&mut keyd, command, id);
     print(report::render_execution(&outcome));
     ExitCode::from(report::execution_exit_code(&outcome))
 }
 
-/// `destroy-sweep`. Spec: docs/51 §6, §9.
+/// `destroy-sweep`. Spec: docs/51 §6, §9; docs/52 §4.3.
 fn destroy_sweep(config_path: &Path) -> ExitCode {
-    let (mut keyd, mut admind) = match clients(config_path) {
-        Ok(clients) => clients,
+    let mut keyd = match keyd_client(config_path) {
+        Ok(client) => client,
         Err(code) => return code,
     };
-    let outcome = sweep::run(&mut admind, &mut keyd);
+    let outcome = sweep::run(&mut keyd);
     print(report::render_sweep(&outcome));
     ExitCode::from(report::sweep_exit_code(&outcome))
 }
@@ -154,7 +136,7 @@ fn main() -> ExitCode {
             config,
             command,
             id,
-        }) => execute_approved(&config, command, id),
+        }) => execute_decision(&config, command, id),
         Ok(Command::DestroySweep { config }) => destroy_sweep(&config),
         Err(_) => fail("usage", &USAGE),
     }

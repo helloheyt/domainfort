@@ -2,9 +2,9 @@
 //!
 //! ```text
 //! keyadm <configuration file> ceremony <manifest file>
-//! keyadm <configuration file> rotate-krbtgt <request id>
-//! keyadm <configuration file> rotate-key <request id>
-//! keyadm <configuration file> retire-kvno <request id>
+//! keyadm <configuration file> rotate-krbtgt <decision id>
+//! keyadm <configuration file> rotate-key <decision id>
+//! keyadm <configuration file> retire-kvno <decision id>
 //! keyadm <configuration file> destroy-sweep
 //! ```
 //!
@@ -12,24 +12,26 @@
 //! its configuration path as its argument (crates/keyd-daemon
 //! `keyd-daemon <configuration file>`); then the command and its operand
 //! (docs/51 §6: `ceremony <manifest>`, `rotate-key`, `rotate-krbtgt`,
-//! `retire-kvno`, `destroy-sweep`). The three commands that execute an
-//! approved request name it by the id dird gave it (docs/51 §6:
-//! `FetchApproved {id}`) — the operation itself (which key set, which kvno)
-//! comes from dird, as it was approved, never from the command line. The
+//! `retire-kvno`, `destroy-sweep`). The three commands that run a key
+//! operation name dird's **decision** by its id — the request id the
+//! `Approve` reply shows, under which dird registered the decision in keyd
+//! (A-102, docs/52 §4.2). The operation itself (which key set, which kvno,
+//! which approvers) is the one keyd holds under that id, never anything on
+//! the command line. The
 //! command is matched exactly; there are no options. No secret is ever an
 //! argument (docs/51 §3, citing D95: "no secrets in argv/env") — keyadm has
 //! none.
 //!
-//! A request id is written in decimal: digits only, no sign, no leading
+//! A decision id is written in decimal: digits only, no sign, no leading
 //! zero (one spelling per value), at most a `u64`.
 //!
-//! Spec: docs/51 §3 (D95), §6, §12 (A5, A10); docs/50 §7.1.
+//! Spec: docs/51 §3 (D95), §6, §12 (A5, A10); docs/50 §7.1; docs/52 §4.2.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
 
 /// The usage lines.
-pub const USAGE: &str = "usage: keyadm <configuration file> ceremony <manifest file>\n       keyadm <configuration file> rotate-krbtgt|rotate-key|retire-kvno <request id>\n       keyadm <configuration file> destroy-sweep";
+pub const USAGE: &str = "usage: keyadm <configuration file> ceremony <manifest file>\n       keyadm <configuration file> rotate-krbtgt|rotate-key|retire-kvno <decision id>\n       keyadm <configuration file> destroy-sweep";
 
 /// The command name of the ceremony. Spec: docs/51 §6.
 pub const CEREMONY: &str = "ceremony";
@@ -42,15 +44,15 @@ pub const RETIRE_KVNO: &str = "retire-kvno";
 /// `destroy-sweep`. Spec: docs/51 §6.
 pub const DESTROY_SWEEP: &str = "destroy-sweep";
 
-/// The key operation an approved-request command executes.
-/// Spec: docs/51 §6 (the table: "approved request (dual)").
+/// The key operation a decision command runs.
+/// Spec: docs/51 §6 (the table: "approved request (dual)"); docs/52 §4.2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Approved {
-    /// `rotate-krbtgt`: `rotate_krbtgt(DualControlToken)`.
+    /// `rotate-krbtgt`: `rotate_krbtgt(decision)`.
     RotateKrbtgt,
-    /// `rotate-key`: `rotate_key` of a service object's key set.
+    /// `rotate-key`: `rotate_key(decision)`.
     RotateKey,
-    /// `retire-kvno`: `retire_kvno`.
+    /// `retire-kvno`: `retire_kvno(decision)`.
     RetireKvno,
 }
 
@@ -77,18 +79,18 @@ pub enum Command {
         /// The provisioning manifest.
         manifest: PathBuf,
     },
-    /// `rotate-krbtgt` / `rotate-key` / `retire-kvno <request id>`: execute
-    /// an approved request. Spec: docs/51 §6.
+    /// `rotate-krbtgt` / `rotate-key` / `retire-kvno <decision id>`: run
+    /// dird's decision. Spec: docs/51 §6; docs/52 §4.2.
     Execute {
         /// keyadm's configuration file.
         config: PathBuf,
-        /// Which operation the operator means to execute.
+        /// Which operation the operator means to run.
         command: Approved,
-        /// The approved request's id.
+        /// dird's decision id (the approved request's id).
         id: u64,
     },
-    /// `destroy-sweep`: destroy the key sets of deleted accounts.
-    /// Spec: docs/51 §6, §9.
+    /// `destroy-sweep`: run the destroy decisions dird registered.
+    /// Spec: docs/51 §6, §9; docs/52 §4.3.
     DestroySweep {
         /// keyadm's configuration file.
         config: PathBuf,
@@ -99,7 +101,7 @@ pub enum Command {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UsageError;
 
-/// A request id: decimal digits, no sign, no leading zero, within `u64`.
+/// A decision id: decimal digits, no sign, no leading zero, within `u64`.
 /// Spec: module documentation (one spelling per value, docs/50 §7.1's rule
 /// for integers).
 fn request_id(text: &OsString) -> Result<u64, UsageError> {

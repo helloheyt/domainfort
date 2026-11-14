@@ -17,7 +17,10 @@
 mod common;
 
 use common::*;
-use keyd::{AuditOutcome, AuditReason, AuthnError, KeyHandle, KeyPurpose, Kvno, PrincipalId};
+use keyd::{
+    AuditOutcome, AuditReason, AuthnError, DecidedOperation, KeyHandle, KeyPurpose, Kvno,
+    PrincipalId,
+};
 use krb_crypto::{ChecksumType, EncType, ProtocolKey};
 use krb_proto::constants::{DOMAIN_X500_COMPRESS, KRB_NT_SRV_INST};
 use krb_proto::{
@@ -380,8 +383,17 @@ fn ticket_opens_under_current_or_previous_kvno() {
     let tgt = obtain_tgt(&mut f, now(), &as_template());
     let issued = ldap_ticket(&mut f, &tgt, 1);
     assert_eq!(issued.ticket.enc_part.kvno, Some(1));
+    // A-102: the rotation runs on a decision dird registered.
+    let rotation = f
+        .decide(
+            DecidedOperation::RotateKey {
+                handle: LDAP_SERVICE,
+            },
+            &now(),
+        )
+        .unwrap();
     assert_eq!(
-        f.keyd.rotate_key(&ADMIN, &LDAP_SERVICE, &now()),
+        f.keyd.rotate_key(&ADMIN, rotation, &now()),
         Ok(Kvno::new(2))
     );
 
@@ -404,9 +416,16 @@ fn ticket_opens_under_current_or_previous_kvno() {
     assert_eq!(fresh.ticket.enc_part.kvno, Some(2));
     assert!(verify(&mut f, &ap_octets(&fresh, now(), 512), now()).is_ok());
 
-    f.keyd
-        .retire_kvno(&ADMIN, &LDAP_SERVICE, Kvno::new(1), &now())
+    let retirement = f
+        .decide(
+            DecidedOperation::RetireKvno {
+                handle: LDAP_SERVICE,
+                kvno: Kvno::new(1),
+            },
+            &now(),
+        )
         .unwrap();
+    f.keyd.retire_kvno(&ADMIN, retirement, &now()).unwrap();
     assert_eq!(
         verify(&mut f, &ap_octets(&issued, now(), 513), now()),
         Err(AuthnError::Denied)
@@ -908,8 +927,13 @@ fn password_derived_service_key_never_verifies() {
     let mut f = fixture();
     let tgt = obtain_tgt(&mut f, now(), &as_template());
     let before = ldap_ticket(&mut f, &tgt, 1);
-    f.grant(&LDAP_SERVICE, &bound(ldap_service_name()), &now())
-        .unwrap();
+    f.grant(
+        &LDAP_SERVICE,
+        &bound(ldap_service_name()),
+        "EXAMPLE.ORGldapdc01.example.org",
+        &now(),
+    )
+    .unwrap();
     assert_eq!(
         f.keyd.set_secret(
             &DIRECTORY,
@@ -936,7 +960,13 @@ fn password_derived_service_key_never_verifies() {
         name_type: KRB_NT_SRV_INST,
         name_string: vec![kstr("ldap"), kstr("dc02.example.org")],
     };
-    f.grant(&dc02, &bound(dc02_name.clone()), &now()).unwrap();
+    f.grant(
+        &dc02,
+        &bound(dc02_name.clone()),
+        "EXAMPLE.ORGldapdc02.example.org",
+        &now(),
+    )
+    .unwrap();
     f.keyd
         .set_secret(
             &DIRECTORY,
@@ -991,7 +1021,8 @@ fn service_context_table_is_bounded() {
 
 /// Destroying the service key set discards the contexts opened under it
 /// (their session keys zeroized), and the handle is unknown afterwards.
-/// Source: docs/questions/Q-115 (A-35: destroy_key_set); docs/49 §3.3.
+/// Source: docs/questions/Q-115 (A-35: destroy_key_set); docs/49 §3.3;
+/// docs/52 §4.2 (A-102: by decision, per principal).
 #[test]
 fn destroying_the_service_key_set_discards_its_contexts() {
     let mut f = fixture();
@@ -999,12 +1030,26 @@ fn destroying_the_service_key_set_discards_its_contexts() {
     let issued = ldap_ticket(&mut f, &tgt, 1);
     assert!(verify(&mut f, &ap_octets(&issued, now(), 680), now()).is_ok());
     assert_eq!(live_contexts(&f), "1");
-    // Destroying another Service key set leaves it alone.
-    f.keyd.destroy_key_set(&ADMIN, &SERVICE, &now()).unwrap();
-    assert_eq!(live_contexts(&f), "1");
-    f.keyd
-        .destroy_key_set(&ADMIN, &LDAP_SERVICE, &now())
+    // Destroying another principal's key sets leaves it alone.
+    let other = f
+        .decide(
+            DecidedOperation::DestroyKeySet {
+                principal: SERVICE_ID,
+            },
+            &now(),
+        )
         .unwrap();
+    f.keyd.destroy_key_set(&ADMIN, other, &now()).unwrap();
+    assert_eq!(live_contexts(&f), "1");
+    let destroy = f
+        .decide(
+            DecidedOperation::DestroyKeySet {
+                principal: LDAP_SERVICE.principal,
+            },
+            &now(),
+        )
+        .unwrap();
+    f.keyd.destroy_key_set(&ADMIN, destroy, &now()).unwrap();
     assert_eq!(live_contexts(&f), "0");
     assert_eq!(
         verify(&mut f, &ap_octets(&issued, now(), 681), now()),

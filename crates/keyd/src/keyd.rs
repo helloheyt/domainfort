@@ -17,14 +17,15 @@
 use crate::as_exchange::ProofEntry;
 use crate::audit::{AuditKeyRef, AuditOutcome, AuditReason, AuditRecord, AuditSink};
 use crate::authz::{
-    purpose_permitted, role_permits, startup_hold_down_applies, CallerId, HandleSlot, Operation,
+    provisioning_only, purpose_permitted, role_permits, startup_hold_down_applies, CallerId,
+    HandleSlot, Operation,
 };
 use crate::config::KeydConfig;
+use crate::decision::DecisionTable;
 use crate::enctype::to_crypto;
 use crate::entropy::{EntropySource, OsEntropy};
 use crate::error::{ConfigError, Deny, Internal};
 use crate::fast_armor::ArmorEntry;
-use crate::grant::GrantTable;
 use crate::model::{KeyHandle, KeyPurpose, Kvno, PrincipalId};
 use crate::replay::ReplayCache;
 use crate::service_ticket::ServiceContextEntry;
@@ -34,6 +35,7 @@ use crate::throttle::{FailureWindowThrottle, SecretThrottle};
 use crate::time::kerberos_time_seconds;
 use crate::tokens::TokenTable;
 use core::fmt;
+use keyd_types::{CeremonyState, DecisionId};
 use krb_crypto::{EncType, KeyUsage, ProtocolKey, CONFOUNDER_LENGTH};
 use krb_proto::KerberosTime;
 use zeroize::Zeroizing;
@@ -67,9 +69,14 @@ pub struct Keyd<S: KeyStore, A: AuditSink, E: EntropySource = OsEntropy> {
     pub(crate) service_contexts: TokenTable<ServiceContextEntry>,
     /// The one replay cache of every AP-REQ keyd verifies (RFC 4120 3.2.3).
     pub(crate) replay: ReplayCache,
-    /// The set_secret grants (task A15a; docs/51 §5.8 option (b);
-    /// docs/questions/Q-450): in memory, bounded, lost at every start.
-    pub(crate) grants: GrantTable,
+    /// The decision table (A-102, docs/52 R1 — generalizing A-100's grant
+    /// table): every Directory / Admin state change runs only on an entry
+    /// dird registered (crate decision.rs). In memory, bounded, lost at
+    /// every start.
+    pub(crate) decisions: DecisionTable,
+    /// The ceremony state (A-102, docs/52 R3): `Provisioning` only when the
+    /// store was empty at construction, until `seal_ceremony`.
+    pub(crate) ceremony: CeremonyState,
     /// The last second (on the [`kerberos_time_seconds`] scale) of the
     /// startup hold-down: the start time given at construction plus
     /// [`STARTUP_HOLD_DOWN_SKEW_INTERVALS`] × `clock_skew_secs`
@@ -161,14 +168,23 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         let throttle = Box::new(FailureWindowThrottle::new(config.throttle));
         let startup_hold_down_until =
             startup_hold_down_until(kerberos_time_seconds(started_at), config.clock_skew_secs);
+        // R3 (docs/52 §4.4): the ceremony exists only for an empty store; a
+        // store that holds keys at start is operational (P-17: a persistent
+        // store; the development store is empty at every start).
+        let ceremony = if store.is_empty() {
+            CeremonyState::Provisioning
+        } else {
+            CeremonyState::Operational
+        };
         Ok(Keyd {
             startup_hold_down_until,
+            ceremony,
             proofs: TokenTable::new(config.max_authn_proofs),
             contexts: TokenTable::new(config.max_tgt_contexts),
             armors: TokenTable::new(config.max_armor_contexts),
             service_contexts: TokenTable::new(config.max_service_contexts),
             replay: ReplayCache::new(config.replay_cache_capacity),
-            grants: GrantTable::new(keyd_types::MAX_SET_SECRET_GRANTS),
+            decisions: DecisionTable::new(),
             preauth_throttle: FailureWindowThrottle::new(config.preauth_throttle),
             throttle,
             enctypes,
@@ -215,15 +231,23 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// before the start (a clock stepped back) is held too: the elapsed time
     /// cannot be established (fail closed).
     ///
-    /// Then, for `set_secret` only, the **grant** (task A15a; docs/51 §5.8
-    /// option (b)): a live grant must name the handle in the `Primary` slot
-    /// — registered by dird (Role::Ldap) after its PDP allowed the password
-    /// set, or by keyadm's ceremony (Role::Admin) for a first administrator.
-    /// None ⇒ the uniform `Denied`, reason `NoGrant`: decided from the grant
-    /// table alone, before any key set is read, so it is an authorization
-    /// refusal like the role check — one record, no intent (A-88), nothing
-    /// changed. The grant is consumed by the operation right after this step
-    /// (crate grant.rs, "Matching").
+    /// Then the **ceremony state** (A-102, docs/52 R3): a
+    /// `provisioning_only` operation (`create_key`, Admin's grant) after the
+    /// seal is the uniform `Denied`, reason `CeremonySealed`.
+    ///
+    /// Then the **decision** (A-102, docs/52 R1; task A15a for
+    /// `set_secret`): for `set_secret`, a live set-secret entry must name the
+    /// handle in the `Primary` slot — a decision dird (Role::Ldap) registered
+    /// after its PDP allowed the password set, or the ceremony's grant
+    /// (Role::Admin) for a first administrator. None ⇒ the uniform `Denied`,
+    /// reason `NoGrant`: decided from the table alone, before any key set is
+    /// read, so it is an authorization refusal like the role check — one
+    /// record, no intent (A-88), nothing changed. The entry is consumed by
+    /// the operation right after this step (crate decision.rs). The four
+    /// Admin operations that run a decision by id (`rotate_key`,
+    /// `rotate_krbtgt`, `retire_kvno`, `destroy_key_set`) are never admitted
+    /// here (`NoDecision`): their authorization step is
+    /// `Keyd::admit_decision`, which finds the decision.
     ///
     /// Spec: docs/10 §2, §11, §12 I2, I3; RFC 4120 3.2.3 ("MUST reject all
     /// requests until the clock skew interval has passed, providing assurance
@@ -238,19 +262,47 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         handles: &[(HandleSlot, &KeyHandle)],
         now: &KerberosTime,
     ) -> Internal<()> {
+        self.admit_base(caller, op, handles, now)?;
+        match op {
+            Operation::SetSecret => {
+                let now_s = kerberos_time_seconds(now);
+                let granted = handles
+                    .iter()
+                    .find(|(slot, _)| *slot == HandleSlot::Primary)
+                    .is_some_and(|(_, handle)| self.decisions.is_live_secret(handle, now_s));
+                if granted {
+                    Ok(())
+                } else {
+                    Err(Deny::denied(AuditReason::NoGrant))
+                }
+            }
+            // Only by decision id (`Keyd::admit_decision`), never here.
+            Operation::RotateKey
+            | Operation::RotateKrbtgt
+            | Operation::RetireKvno
+            | Operation::DestroyKeySet => Err(Deny::denied(AuditReason::NoDecision)),
+            _ => Ok(()),
+        }
+    }
+
+    /// The role and purpose checks ([`authorize`]), the startup hold-down
+    /// and the ceremony state — the part of [`Keyd::admit`] every
+    /// operation shares, decision or not.
+    /// Spec: docs/10 §2, §11, §12 I2, I3; docs/52 §4.4 (A-102).
+    pub(crate) fn admit_base(
+        &self,
+        caller: &CallerId,
+        op: Operation,
+        handles: &[(HandleSlot, &KeyHandle)],
+        now: &KerberosTime,
+    ) -> Internal<()> {
         authorize(caller, op, handles)?;
         let now_s = kerberos_time_seconds(now);
         if startup_hold_down_applies(op) && now_s <= self.startup_hold_down_until {
             return Err(Deny::startup_hold_down());
         }
-        if op == Operation::SetSecret {
-            let granted = handles
-                .iter()
-                .find(|(slot, _)| *slot == HandleSlot::Primary)
-                .is_some_and(|(_, handle)| self.grants.is_live(handle, now_s));
-            if !granted {
-                return Err(Deny::denied(AuditReason::NoGrant));
-            }
+        if provisioning_only(op) && self.ceremony == CeremonyState::Operational {
+            return Err(Deny::denied(AuditReason::CeremonySealed));
         }
         Ok(())
     }
@@ -278,6 +330,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             kvno: fields.kvno,
             secondary: fields.secondary,
             approvers: fields.approvers,
+            decision: fields.decision,
             result: outcome,
             reason,
         });
@@ -294,7 +347,8 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> fmt::Debug for Keyd<S, A, E> {
             .field("live_tgt_contexts", &self.contexts.len())
             .field("live_armor_contexts", &self.armors.len())
             .field("live_service_contexts", &self.service_contexts.len())
-            .field("set_secret_grants", &self.grants.len())
+            .field("decisions", &self.decisions.len())
+            .field("ceremony", &self.ceremony)
             .finish()
     }
 }
@@ -308,6 +362,7 @@ pub(crate) struct AuditFields {
     pub(crate) kvno: Option<Kvno>,
     pub(crate) secondary: Option<AuditKeyRef>,
     pub(crate) approvers: Option<[PrincipalId; 2]>,
+    pub(crate) decision: Option<DecisionId>,
 }
 
 impl AuditFields {

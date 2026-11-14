@@ -1,14 +1,20 @@
 #![forbid(unsafe_code)]
 //! `keyadm`: the Role::Admin one-shot tool (docs/51 §6; docs/50 §2.4;
-//! decisions A-57, A-72) — in this task, the `ceremony` command.
+//! decisions A-57, A-72, A-102).
 //!
 //! keyadm runs by hand under its own uid, which keyd maps to `Role::Admin`
 //! ("Tier-0 key administration", crates/keyd-types authz.rs). It talks to
-//! keyd through the ipc-keyd client and — for the approved-request commands
-//! and the sweep — to admind on `admin.sock` through the ipc-admin client;
-//! it has no Kerberos client, no access to dird's store, and links no
-//! crypto (D182; A-73). keyd computes every key; keyadm asks, and prints
-//! handles, bindings and kvnos.
+//! **keyd only**, through the ipc-keyd client (docs/51 §6; A-102, docs/52
+//! §4.6 — the admind forwards of task A10 are retired); it has no Kerberos
+//! client, no access to dird, and links no crypto (D182; A-73). keyd
+//! computes every key; keyadm asks, and prints handles, bindings, decision
+//! ids and kvnos.
+//!
+//! **What keyadm can do** (A-102, docs/52 R1, R3): before keyd's ceremony
+//! is sealed, `create_key` and the first administrators' initial-secret
+//! grants; after it, nothing that is not a decision dird registered in keyd
+//! — and keyadm names a decision only by its id: keyd runs the parameters it
+//! holds.
 //!
 //! # `keyadm <configuration file> ceremony <manifest file>`
 //!
@@ -23,30 +29,29 @@
 //! Order of the run (the binary, src/main.rs): parse the
 //! command line → refuse root ([`identity`]) → read the configuration
 //! ([`settings`]: root-owned, not group/other-writable) → read the manifest
-//! (`provision_manifest::read_manifest`: the same rule) → connect to keyd,
-//! verify its peer uid before anything is sent → `ping` → three
-//! `create_key` → one `grant_set_secret` per first administrator (task A15a:
-//! the initial-secret grants without which keyd refuses `provision
-//! first-admin-secret`'s `set_secret`, live 15 minutes — docs/51 §5.8,
-//! docs/questions/Q-451) → print the [`report`] → exit 0 (complete), 1
-//! (nothing attempted) or 2 (stopped after an attempt).
+//! (`provision_manifest::read_manifest`: the same rule; every first
+//! administrator must have its salt, A-102 / N4) → connect to keyd, verify
+//! its peer uid before anything is sent → `ping` → three `create_key` → one
+//! `grant_set_secret` per first administrator, binding the manifest's salt
+//! (task A15a: the initial-secret grants without which keyd refuses
+//! `provision first-admin-secret`'s `set_secret`, live 15 minutes — docs/51
+//! §5.8, docs/questions/Q-451) → `seal_ceremony` (A-102, docs/52 R3) →
+//! print the [`report`] → exit 0 (complete and sealed), 1 (nothing
+//! attempted) or 2 (stopped after an attempt).
 //!
-//! # `keyadm <configuration file> rotate-krbtgt | rotate-key | retire-kvno <request id>`
+//! # `keyadm <configuration file> rotate-krbtgt | rotate-key | retire-kvno <decision id>`
 //!
-//! Task A10 (docs/51 §5.6, §6): execute a key operation dird approved —
-//! `FetchApproved {id}` from `admin.sock` (admind forwards it only from
-//! `keyadm_uid`), the keyd call as Role::Admin, then `Complete {id,
-//! outcome}` ([`execute`]).
+//! A-102 (docs/52 §4.2): run the key operation dird decided — dird registered
+//! it in keyd at the `Approve` that completed the quorum, under the request
+//! id the operator read from the `Approve` reply. keyadm sends keyd only that
+//! id; keyd runs its registered operation once and keeps the result
+//! ([`execute`]).
 //!
 //! # `keyadm <configuration file> destroy-sweep`
 //!
-//! Task A10 (docs/51 §6, §9): destroy the `PrincipalLongterm` and `Service`
-//! key sets of every deleted user and computer, from dird's
-//! `ListPendingDestruction` pages; idempotent ([`sweep`]).
-//!
-//! Both need `admin_socket` + `admind_uid` in keyadm's configuration
-//! (crates/config keyadm.rs); keyadm checks admind's uid before it sends
-//! anything (R50-3), as it checks keyd's.
+//! A-102 (docs/52 §4.3): run the destroy decisions dird registered after each
+//! `Delete` of a user or computer — keyd's `list_destroy_decisions` pages,
+//! then `destroy_key_set(decision id)` for each; idempotent ([`sweep`]).
 //!
 //! # Security
 //!
@@ -68,8 +73,13 @@
 //! existing key-administration or provisioning tool — its commands, names,
 //! file formats or messages — was consulted or recalled (AGENTS.md §1-3).
 //!
+//! The decision commands, the sweep over keyd's destroy decisions and the
+//! seal (A-102) are written from docs/52 §3.1, §3.3, §3.10, §4 and
+//! docs/questions/Q-460..Q-462, opened in-session, and the API of this
+//! project's keyd-types / ipc-keyd as changed by A-102.
+//!
 //! Spec: docs/51 §4.3 step 11, §4.5, §6, §12 (A5); docs/50 §2.4, R50-3;
-//! A-57; A-72; A-73; A-77.
+//! A-57; A-72; A-73; A-77; docs/52 §4 (A-102).
 
 pub mod ceremony;
 pub mod cli;

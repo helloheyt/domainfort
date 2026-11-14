@@ -212,6 +212,12 @@ pub enum StoreError {
 pub trait KeyStore {
     /// `true` if this store may hold keys of `purpose`. Spec: D178.
     fn accepts(&self, purpose: KeyPurpose) -> bool;
+
+    /// Whether the store holds no key set at all — keyd then starts in its
+    /// provisioning ceremony (A-102, docs/52 §4.4: "keyd comes up in
+    /// `Provisioning` only when the store is empty").
+    fn is_empty(&self) -> bool;
+
     /// The key set of `handle`, if stored.
     fn get(&self, handle: &KeyHandle) -> Option<&StoredKeySet>;
     /// Mutable access for rotation / retirement of an existing set.
@@ -290,6 +296,11 @@ impl KeyStore for InMemoryKeyStore {
             KeyPurpose::Krbtgt => self.allow_krbtgt,
             KeyPurpose::PrincipalLongterm | KeyPurpose::Service => true,
         }
+    }
+
+    /// Spec: docs/52 §4.4 (A-102).
+    fn is_empty(&self) -> bool {
+        self.sets.is_empty()
     }
 
     fn get(&self, handle: &KeyHandle) -> Option<&StoredKeySet> {

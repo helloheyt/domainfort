@@ -48,16 +48,9 @@ ipc = { path = "../ipc" }
 # is sent, R50-3 / A-63), `UnixConnector`, `Call` / `Answer`, `Unserved`.
 # The client side links no crypto (D182, A-63).
 ipc-keyd = { path = "../ipc-keyd" }
-# admin.sock's codec and client (task A10: `FetchApproved`, `Complete`,
-# `ListPendingDestruction`, docs/51 §6) — admind's uid checked before
-# anything is sent. No store, PEP or crypto (crates/admin-daemon
-# tests/no_store_or_crypto.rs guards ipc-admin).
-ipc-admin = { path = "../ipc-admin" }
-# The typed key operations and replies of dird's admin channel, and its
-# blocking Unix connector (rustix peer credentials on Linux) that the
-# ipc-admin client runs over. No store, PEP or crypto (its own guard).
-ipc-dird-admin = { path = "../ipc-dird-admin" }
-# `Guid` (the objectGUIDs of the approved request and the tombstones).
+# (A-102, docs/52 §4.6: keyadm talks to keyd only — the ipc-admin and
+# ipc-dird-admin clients of task A10 are no longer linked.)
+# `Guid` (the text of a destroy decision's principal id).
 dtyp = { path = "../dtyp" }
 # `Kvno`, `Error` (keyd's answer), `KeyHandle`, `KeyPurpose`.
 keyd-types = { path = "../keyd-types" }
@@ -114,6 +107,11 @@ ipc-directory = { path = "../ipc-directory" }
 # crates/protected-file reader opens — the walk from `/` accepts them (task
 # T; docs/questions/Q-480). Dev-only, no dependency.
 test-scratch = { path = "../test-scratch" }
+# TESTS ONLY (A-102): the administrators' steps of the tier-2 world (request,
+# approve, delete through admind) — keyadm itself no longer links these
+# clients (it talks to keyd only, docs/52 §4.6). Workspace crates.
+ipc-admin = { path = "../ipc-admin" }
+ipc-dird-admin = { path = "../ipc-dird-admin" }
 
 [lints]
 workspace = true

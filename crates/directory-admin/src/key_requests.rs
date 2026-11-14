@@ -1,7 +1,8 @@
 //! Dual-controlled key operations (docs/51 §5.6, §6; R51-11, R51-14; task
-//! A10): the pending requests dird holds **in memory**, and the steps that
-//! act on them — `RequestKeyOperation`, `Approve`, `FetchApproved`,
-//! `Complete` — plus `ListPendingDestruction` for keyadm's `destroy-sweep`.
+//! A10; A-102): the pending requests dird holds **in memory**, and the two
+//! steps that act on them — `RequestKeyOperation` and `Approve`. The
+//! `Approve` that completes the quorum yields the **decision** dird
+//! registers in keyd ([`KeyDecision`]; docs/52 R1, §4.3).
 //!
 //! # The flow (docs/51 §6, as decided)
 //!
@@ -19,17 +20,22 @@
 //!    digest (docs/24 §6 principle "sign the exact operation, not a general
 //!    approve", as docs/51 §5.6 cites it). The quorum is `admin_quorum`
 //!    (P-22: the requester plus one approver).
-//! 3. keyadm fetches the approved request (`FetchApproved`, through admind,
-//!    which forwards it only from `keyadm_uid`): it gets the operation, the
-//!    key set's handle and the requester's and approvers' objectGUIDs — what
-//!    keyd's `DualControlToken` names. A request is fetched **once**: one
-//!    approval, one execution.
-//! 4. keyadm calls keyd as Role::Admin, then reports `Complete {id,
-//!    outcome}`; dird records it and drops the request.
-//!
-//! keyd still trusts keyadm for the token's truthfulness (the residual of
-//! crates/keyd-types model.rs), but the token now comes from approvals dird
-//! verified cryptographically (docs/51 §6).
+//! 3. **(A-102)** The `Approve` that completes the quorum yields a
+//!    [`KeyDecision`]: the decision id (the request's id), the decided
+//!    operation with its key set, the requester's and the approvers'
+//!    objectGUIDs, and the request's remaining lifetime. dird has the
+//!    step's `Decision` event acknowledged by auditd, then registers the
+//!    decision in keyd (Role::Ldap, `register_decision`), then records an
+//!    `Outcome` event of the registration ([`KeyStep::registration_event`]);
+//!    if any of it fails the approval is withdrawn
+//!    ([`KeyRequests::withdraw`]) so the approver may approve again.
+//! 4. keyadm runs `rotate_krbtgt(id)` / `rotate_key(id)` / `retire_kvno(id)`
+//!    in keyd as Role::Admin: keyd runs the parameters **dird registered**
+//!    and builds the dual-control token itself from the registered
+//!    approvers. keyadm takes nothing from dird or admind — the former
+//!    `FetchApproved` / `Complete` / `ListPendingDestruction` channel is
+//!    retired (docs/52 §4.6, §4.8; docs/questions/Q-460: N2 is impossible
+//!    by construction).
 //!
 //! # The pending table
 //!
@@ -52,33 +58,38 @@
 //!
 //! Every step has a `DirAdmin` `Decision` event — `key_request` (the id),
 //! `key_operation` (the keyd operation), `target` (the key set's account),
-//! `requester` / `approvers` (objectSids). `Complete` has, after its
-//! `Decision`, an `Outcome` event saying what keyd did as keyadm reports it
-//! (`Committed` with the reported kvno, or the appended codes
+//! `requester` / `approvers` (objectSids). The `Approve` that completes the
+//! quorum has, after its `Decision`, an `Outcome` event saying how the
+//! registration of its decision in keyd ended (`Committed`, or the codes
 //! `KeyOperationRefused` / `KeyOperationNotPerformed` /
-//! `KeyOperationOutcomeUnknown` — docs/questions/Q-421).
+//! `KeyOperationOutcomeUnknown` of docs/questions/Q-421, reused for the
+//! registration — A-102). keyd's own records (intent + outcome, the
+//! decision id) say what keyd executed (docs/52 §4.5).
 //!
 //! Spec: docs/51 §5.2 row 11, §5.6, §6, §7.3, §9; docs/24 §6; docs/10 §7;
 //! docs/33 §5; A-73; A-85; A-89; P-22; FIPS 180-4 (SHA-256, as provided by
-//! the approved `sha2`); docs/questions/Q-420..Q-422.
+//! the approved `sha2`); docs/questions/Q-420..Q-422; docs/52 §4.2, §4.3
+//! (A-102); docs/questions/Q-460.
 
 use core::time::Duration;
 use std::collections::{BTreeMap, BTreeSet};
 
-use directory_pip::{AccountKind, DirectoryView};
+use directory_pip::DirectoryView;
 use dtyp::{Guid, Sid};
 use ipc_audit::{
     AdminFailure, AdminRefusal, DirAdminEvent, DirAdminOperation, DirAdminStage, KeydOperation,
     OutcomeResult,
 };
-use keyd_types::{KeyHandle, KeyPurpose, PrincipalId};
+use keyd_types::{
+    DecidedOperation, DecisionId, KeyHandle, KeyPurpose, Kvno, PrincipalId, MAX_KEY_DECISION_SECS,
+};
 use krb_proto::KerberosTime;
 use pdp::{Action, Effect, Obligation, PolicyScope, PolicySnapshot, Resource};
 use sha2::{Digest, Sha256};
 
 use crate::admin::{subject_of, DirectoryAdmin, VerificationFailure};
 use crate::audit::{pdp_reason, sid_value, EventBase, Refusal, Stop};
-use crate::checks::{malformed, store_failure, Cx};
+use crate::checks::{malformed, Cx};
 use crate::config::ConfigError;
 use crate::random::RandomSource;
 use crate::record;
@@ -93,8 +104,8 @@ use crate::time;
 /// crates/pdp policy.rs (`ResourceMatch::Policy`); docs/questions/Q-420.
 pub const KEY_POLICY_SCOPE: &str = "keys";
 
-/// Most pending key-operation requests dird holds at once (fetched ones
-/// awaiting their `Complete` included). Project choice: key operations are
+/// Most pending key-operation requests dird holds at once (approved ones
+/// included, until they expire). Project choice: key operations are
 /// rare and human-paced. Spec: docs/51 §5.6 ("bounded in number");
 /// AGENTS.md §6.
 pub const MAX_PENDING_KEY_REQUESTS: usize = 16;
@@ -113,11 +124,6 @@ pub const MAX_KEY_REQUEST_LIFETIME: Duration = Duration::from_secs(60 * 60);
 /// Octets of an operation digest (SHA-256). Spec: FIPS 180-4 §6.2 (a 256-bit
 /// message digest), as provided by the approved `sha2`.
 pub const DIGEST_LEN: usize = 32;
-
-/// Most entries of one `ListPendingDestruction` page: the admin channel's
-/// bound (crates/ipc-dird-admin `MAX_DESTRUCTION_ENTRIES`, pinned in dird).
-/// Spec: docs/51 §6, §7.5.
-pub const MAX_DESTRUCTION_PAGE: usize = 256;
 
 /// The digest's domain-separation label: no other digest of this project
 /// starts with it. Project choice.
@@ -218,24 +224,6 @@ impl KeyOperation {
     }
 }
 
-/// How keyadm's call to keyd ended, as `Complete` reports it.
-/// Spec: docs/51 §6 (`Complete {id, outcome, kvno}`); docs/10 §9; A-88,
-/// A-90.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum KeyOperationOutcome {
-    /// keyd performed it; the new kvno of a rotation.
-    Performed {
-        /// The kvno keyd answered (a rotation), `None` for `retire_kvno`.
-        kvno: Option<u32>,
-    },
-    /// keyd answered with a refusal.
-    Refused,
-    /// Not performed (never sent, or refused by keyd's transport).
-    NotPerformed,
-    /// Sent; no usable answer came back.
-    OutcomeUnknown,
-}
-
 /// One key-plane request dird serves (docs/51 §7.3, the key-operation
 /// rows).
 /// Spec: docs/51 §6, §7.3.
@@ -253,23 +241,6 @@ pub enum KeyAdminOperation {
         /// The exact operation approved.
         operation: KeyOperation,
     },
-    /// `FetchApproved {id}` (keyadm; no AP-REQ).
-    FetchApproved {
-        /// The request.
-        id: u64,
-    },
-    /// `Complete {id, outcome}` (keyadm; no AP-REQ).
-    Complete {
-        /// The request.
-        id: u64,
-        /// How keyd's call ended.
-        outcome: KeyOperationOutcome,
-    },
-    /// `ListPendingDestruction {cursor}` (keyadm; no AP-REQ).
-    ListPendingDestruction {
-        /// Resume strictly after this objectGUID.
-        cursor: Option<Guid>,
-    },
 }
 
 impl KeyAdminOperation {
@@ -279,33 +250,28 @@ impl KeyAdminOperation {
         match self {
             KeyAdminOperation::RequestKeyOperation { .. } => DirAdminOperation::RequestKeyOperation,
             KeyAdminOperation::Approve { .. } => DirAdminOperation::Approve,
-            KeyAdminOperation::FetchApproved { .. } => DirAdminOperation::FetchApproved,
-            KeyAdminOperation::Complete { .. } => DirAdminOperation::Complete,
-            KeyAdminOperation::ListPendingDestruction { .. } => {
-                DirAdminOperation::ListPendingDestruction
-            }
         }
     }
 
     /// Whether the request carries an administrator's AP-REQ (the
-    /// requester's or the approver's); keyadm's requests carry none.
-    /// Spec: docs/51 §6; docs/questions/Q-422.
+    /// requester's or the approver's): both steps do (keyadm's requests,
+    /// which carried none, are retired — A-102).
+    /// Spec: docs/51 §6; docs/questions/Q-422, Q-460.
     #[must_use]
     pub fn takes_ticket(&self) -> bool {
-        matches!(
-            self,
-            KeyAdminOperation::RequestKeyOperation { .. } | KeyAdminOperation::Approve { .. }
-        )
+        true
     }
 
-    /// The `DirAdmin` events it records: two for `Complete` (its decision
-    /// and keyd's outcome as reported), one for every other step.
-    /// Spec: module documentation; Q-340 item 1.
+    /// The `DirAdmin` events it may record: two for `Approve` (its decision
+    /// and, when it completes the quorum, the outcome of the decision's
+    /// registration in keyd — the second slot is released otherwise), one
+    /// for `RequestKeyOperation`.
+    /// Spec: module documentation; Q-340 item 1; docs/52 §4.3 (A-102).
     #[must_use]
     pub fn audit_events(&self) -> usize {
         match self {
-            KeyAdminOperation::Complete { .. } => 2,
-            _ => 1,
+            KeyAdminOperation::Approve { .. } => 2,
+            KeyAdminOperation::RequestKeyOperation { .. } => 1,
         }
     }
 }
@@ -339,7 +305,6 @@ struct Pending {
     requester: Party,
     approvals: Vec<Party>,
     expires: u64,
-    fetched: bool,
 }
 
 /// The pending key-operation requests (module documentation).
@@ -400,6 +365,31 @@ impl KeyRequests {
     fn principal_of(&self, operation: &KeyOperation) -> Guid {
         operation.service().unwrap_or(self.targets.krbtgt)
     }
+
+    /// Withdraw the approval that completed `decision`'s quorum, after the
+    /// decision could not be recorded or registered in keyd (module
+    /// documentation, step 3): the request's last approval is removed when
+    /// it is that decision's last approver, so the approver may approve
+    /// again. `true` if one was removed. keyd accepts the same decision
+    /// again unchanged (an identical re-registration — keyd decision.rs), so
+    /// a second `Approve` after "outcome unknown" is harmless.
+    /// Spec: docs/52 §4.3 ("failure to register ⇒ dird answers
+    /// `Unavailable`"); A-85 / docs/questions/Q-453 item 1 (fail closed).
+    pub fn withdraw(&mut self, decision: &KeyDecision) -> bool {
+        let Some(pending) = self.pending.get_mut(&decision.id.get()) else {
+            return false;
+        };
+        let last = pending
+            .approvals
+            .last()
+            .map(|p| PrincipalId::from_bytes(p.guid.to_packet()));
+        if last.is_some() && last == decision.approvers.last().copied() {
+            pending.approvals.pop();
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// The operation digest of a request (module documentation): SHA-256 over
@@ -454,43 +444,43 @@ pub struct KeyRequestView {
     pub quorum: usize,
 }
 
-/// The answer to `FetchApproved`: what keyadm needs to call keyd.
-/// Spec: docs/51 §6 ("dird returns {operation, GUIDs of the requester and
-/// approver}"); crates/keyd-types model.rs (`DualControlToken`).
+/// The decision an `Approve` completing the quorum yields: what dird
+/// registers in keyd (`register_decision`, Role::Ldap) so that keyadm can
+/// run it there by its id (A-102, docs/52 §4.2, §4.3).
+/// Spec: docs/52 §4.2 (`register_decision(id, op, approvers, lifetime)`),
+/// §4.3 (the key-operation rows); docs/51 §5.6 (`DualControlToken
+/// { approver_1: the requester, approver_2: the approver }`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ApprovedKeyOperation {
-    /// The id.
-    pub id: u64,
-    /// The operation digest.
-    pub digest: [u8; DIGEST_LEN],
-    /// The operation.
-    pub operation: KeyOperation,
-    /// The key set it acts on.
-    pub handle: KeyHandle,
-    /// The requester's objectGUID.
-    pub requester: Guid,
-    /// The approvers' objectGUIDs, in approval order.
-    pub approvers: Vec<Guid>,
+pub struct KeyDecision {
+    /// The decision id: the request's id (unique across dird's runs,
+    /// docs/questions/Q-421 item 3) — the id the operator gives keyadm.
+    pub id: DecisionId,
+    /// The decided operation, with the key set it acts on.
+    pub operation: DecidedOperation,
+    /// The requester's objectGUID, then the approvers' in approval order.
+    pub approvers: Vec<PrincipalId>,
+    /// The request's remaining lifetime, in seconds (1 to keyd's
+    /// `MAX_KEY_DECISION_SECS`): the decision lives no longer than the
+    /// request it came from (docs/questions/Q-460 parameters).
+    pub lifetime_secs: u32,
 }
 
-/// One tombstone of a user or computer object.
-/// Spec: docs/51 §6, §9; A-18.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DestructionEntry {
-    /// The objectGUID (= the principal id of its key sets).
-    pub guid: Guid,
-    /// User or computer.
-    pub kind: AccountKind,
-}
-
-/// One page of `ListPendingDestruction`.
-/// Spec: docs/51 §6, §9.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DestructionPage {
-    /// The tombstones of this page (ascending by GUID packet).
-    pub entries: Vec<DestructionEntry>,
-    /// Where the next page starts; `None` when complete.
-    pub next: Option<Guid>,
+/// How the registration of a [`KeyDecision`] in keyd ended (its `Outcome`
+/// event, [`KeyStep::registration_event`]).
+/// Spec: docs/52 §4.3, §4.5; docs/10 §9, §10; A-88, A-90 (the fates).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RegistrationOutcome {
+    /// keyd registered it.
+    Registered,
+    /// keyd answered with a refusal.
+    Refused,
+    /// Not performed: never sent, keyd's transport refused it, or the
+    /// step's `Decision` event was not acknowledged in time (nothing was
+    /// asked of keyd).
+    NotPerformed,
+    /// Sent; no usable answer came back (keyd may hold it — its records
+    /// say).
+    OutcomeUnknown,
 }
 
 /// The reply of a key-plane step.
@@ -499,21 +489,19 @@ pub struct DestructionPage {
 pub enum KeyReply {
     /// `RequestKeyOperation` / `Approve`.
     Request(KeyRequestView),
-    /// `FetchApproved`.
-    Approved(ApprovedKeyOperation),
-    /// `Complete`.
-    Done,
-    /// `ListPendingDestruction`.
-    Page(DestructionPage),
 }
 
-/// A key-plane step that succeeded: its reply and its events (the
-/// `Decision`, and for `Complete` the `Outcome` after it).
+/// A key-plane step that succeeded: its reply, its `Decision` event, and —
+/// for an `Approve` that completed the quorum — the decision to register in
+/// keyd and what its registration's `Outcome` event is built from.
 /// Spec: module documentation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyStep {
     reply: KeyReply,
     events: Vec<DirAdminEvent>,
+    decision: Option<KeyDecision>,
+    base: EventBase,
+    now: KerberosTime,
 }
 
 impl KeyStep {
@@ -523,10 +511,42 @@ impl KeyStep {
         &self.reply
     }
 
-    /// The events to commit, in order, before the reply.
+    /// The events to commit, in order, before the reply (the `Decision`).
     #[must_use]
     pub fn events(&self) -> &[DirAdminEvent] {
         &self.events
+    }
+
+    /// The decision to register in keyd: `Some` only for an `Approve` that
+    /// completed the quorum.
+    /// Spec: docs/52 §4.3 (A-102).
+    #[must_use]
+    pub fn decision(&self) -> Option<&KeyDecision> {
+        self.decision.as_ref()
+    }
+
+    /// The `Outcome` event of the decision's registration (module
+    /// documentation, step 3): `Committed` when keyd registered it, else the
+    /// codes of docs/questions/Q-421 item 7, reused for the registration.
+    /// Spec: docs/52 §4.3, §4.5; docs/51 §5.7 item 2 (decision ⇒ change ⇒
+    /// outcome); A-85.
+    #[must_use]
+    pub fn registration_event(&self, outcome: RegistrationOutcome) -> DirAdminEvent {
+        let stage = match outcome {
+            RegistrationOutcome::Registered => {
+                DirAdminStage::Outcome(OutcomeResult::Committed { allocated: None })
+            }
+            RegistrationOutcome::Refused => {
+                DirAdminStage::Outcome(OutcomeResult::Refused(AdminRefusal::KeyOperationRefused))
+            }
+            RegistrationOutcome::NotPerformed => DirAdminStage::Outcome(OutcomeResult::Failed(
+                AdminFailure::KeyOperationNotPerformed,
+            )),
+            RegistrationOutcome::OutcomeUnknown => DirAdminStage::Outcome(OutcomeResult::Failed(
+                AdminFailure::KeyOperationOutcomeUnknown,
+            )),
+        };
+        self.base.staged(&self.now, stage)
     }
 }
 
@@ -572,10 +592,6 @@ fn key_base(operation_id: u64, request: &KeyAdminOperation) -> EventBase {
             base.key_request = Some(*id);
             base.key_operation = Some(operation.keyd_operation());
         }
-        KeyAdminOperation::FetchApproved { id } | KeyAdminOperation::Complete { id, .. } => {
-            base.key_request = Some(*id);
-        }
-        KeyAdminOperation::ListPendingDestruction { .. } => {}
     }
     base
 }
@@ -682,19 +698,19 @@ impl<R: RandomSource> DirectoryAdmin<R> {
             now,
         };
         match self.key_checked(table, request, &inputs, honour, &mut base) {
-            Ok((reply, outcome)) => {
-                let mut events = vec![base.proceed(now)];
-                if let Some(stage) = outcome {
-                    events.push(base.staged(now, stage));
-                }
-                Ok(KeyStep { reply, events })
-            }
+            Ok((reply, decision)) => Ok(KeyStep {
+                reply,
+                events: vec![base.proceed(now)],
+                decision,
+                base,
+                now: *now,
+            }),
             Err(stop) => Err(base.decision_refusal(now, stop)),
         }
     }
 
-    /// The checks of one step; `Ok` carries the reply and, for `Complete`,
-    /// the stage of its `Outcome` event.
+    /// The checks of one step; `Ok` carries the reply and, for an `Approve`
+    /// that completed the quorum, the decision to register (A-102).
     fn key_checked(
         &self,
         table: &mut KeyRequests,
@@ -702,7 +718,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         inputs: &StepInputs<'_, '_, '_, '_>,
         honour: &mut dyn FnMut(&[Obligation]) -> bool,
         base: &mut EventBase,
-    ) -> Result<(KeyReply, Option<DirAdminStage>), Stop> {
+    ) -> Result<(KeyReply, Option<KeyDecision>), Stop> {
         let StepInputs {
             ticket,
             approvals_supplied,
@@ -750,16 +766,6 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                     approvals_supplied,
                 };
                 self.approve_key(&cx, table, &approval, honour, base)
-                    .map(|reply| (reply, None))
-            }
-            KeyAdminOperation::FetchApproved { id } => self
-                .fetch_key(table, *id, instant.0, base)
-                .map(|r| (r, None)),
-            KeyAdminOperation::Complete { id, outcome } => self
-                .complete_key(table, *id, *outcome, base)
-                .map(|stage| (KeyReply::Done, Some(stage))),
-            KeyAdminOperation::ListPendingDestruction { cursor } => {
-                self.list_destruction(&cx, *cursor).map(|r| (r, None))
             }
         }
     }
@@ -878,7 +884,6 @@ impl<R: RandomSource> DirectoryAdmin<R> {
             },
             approvals: Vec::new(),
             expires,
-            fetched: false,
         };
         table.next_id = id;
         base.key_request = Some(id);
@@ -887,10 +892,12 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         Ok(KeyReply::Request(view))
     }
 
-    /// `Approve` (module documentation, step 2).
+    /// `Approve` (module documentation, steps 2-3): the approval is
+    /// recorded; when it completes the quorum, the decision to register in
+    /// keyd is returned with the reply.
     /// Spec: docs/51 §5.6 (distinct, `decide` = Allow for the same Action
     /// and Resource), §6; docs/24 §6 (the exact operation); P-22;
-    /// docs/questions/Q-357 items 3-4.
+    /// docs/questions/Q-357 items 3-4; docs/52 §4.3 (A-102).
     fn approve_key(
         &self,
         cx: &Cx<'_, '_, '_>,
@@ -898,7 +905,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         approval: &Approval<'_>,
         honour: &mut dyn FnMut(&[Obligation]) -> bool,
         base: &mut EventBase,
-    ) -> Result<KeyReply, Stop> {
+    ) -> Result<(KeyReply, Option<KeyDecision>), Stop> {
         let Approval {
             id,
             operation,
@@ -959,7 +966,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         {
             return Err(Stop::Refused(AdminRefusal::ApproverNotDistinct));
         }
-        if pending.fetched || pending.approvals.len() + 1 >= quorum {
+        if pending.approvals.len() + 1 >= quorum {
             return Err(Stop::Refused(AdminRefusal::Conflict));
         }
         if !honour(&caller_obligations(&decision)) {
@@ -969,127 +976,67 @@ impl<R: RandomSource> DirectoryAdmin<R> {
             guid: approver.guid(),
             sid: *approver.sid(),
         });
-        Ok(KeyReply::Request(view_of(id, pending, quorum)))
+        let completed = (pending.approvals.len() + 1 >= quorum)
+            .then(|| key_decision(id, pending, cx.instant.0));
+        Ok((KeyReply::Request(view_of(id, pending, quorum)), completed))
     }
 
-    /// `FetchApproved` (module documentation, step 3): once, and only for a
-    /// request whose approvals reach the quorum. A fetched request awaits
-    /// its `Complete` for one more lifetime.
-    /// Spec: docs/51 §6.
-    fn fetch_key(
+    /// The principal id of the key sets a committed `Delete` leaves to
+    /// destroy: `target`'s tombstone, when its classes include `user` (users
+    /// and computers — the objects with key sets, docs/47 §9.1). dird
+    /// registers a `DestroyKeySet` decision for it after the commit (A-102,
+    /// docs/52 §4.3 row "destroy_key_set" option (a)). `None` for any other
+    /// object or when there is no tombstone.
+    ///
+    /// # Errors
+    /// [`AdminFailure::StoreFailure`]-class failure of the snapshot read.
+    ///
+    /// Spec: docs/51 §6, §9 ("the tombstones of the user / computer classes
+    /// (a tombstone keeps GUID + classes, A-18)"); docs/52 §4.3; dirstore
+    /// `Snapshot::get_tombstone`.
+    pub fn destruction_target(
         &self,
-        table: &mut KeyRequests,
-        id: u64,
-        now: u64,
-        base: &mut EventBase,
-    ) -> Result<KeyReply, Stop> {
-        let lifetime = table.lifetime;
-        let quorum = self.config.quorum();
-        let pending = table
-            .pending
-            .get_mut(&id)
-            .ok_or(Stop::Refused(AdminRefusal::PendingUnknown))?;
-        describe(base, pending);
-        if pending.approvals.len() + 1 < quorum {
-            return Err(Stop::Refused(AdminRefusal::NotApproved));
-        }
-        if pending.fetched {
-            return Err(Stop::Refused(AdminRefusal::Conflict));
-        }
-        pending.fetched = true;
-        pending.expires = now
-            .checked_add(lifetime)
-            .ok_or(Stop::Failed(AdminFailure::InternalFailure))?;
-        Ok(KeyReply::Approved(ApprovedKeyOperation {
-            id,
-            digest: pending.digest,
-            operation: pending.operation,
-            handle: KeyHandle::new(
-                PrincipalId::from_bytes(pending.principal.to_packet()),
-                pending.operation.purpose(),
-            ),
-            requester: pending.requester.guid,
-            approvers: pending.approvals.iter().map(|p| p.guid).collect(),
-        }))
-    }
-
-    /// `Complete` (module documentation, step 4): only for a fetched
-    /// request; the report must fit the operation (a rotation reports its
-    /// new kvno, `retire_kvno` none). The request is dropped; the stage of
-    /// the `Outcome` event says what keyd did, as keyadm reports it.
-    /// Spec: docs/51 §6, §9 (the "krbtgt rotation" row: "keyd rotated, the
-    /// completion was not reported" is the detection signal); A-88; A-90;
-    /// docs/questions/Q-421.
-    fn complete_key(
-        &self,
-        table: &mut KeyRequests,
-        id: u64,
-        outcome: KeyOperationOutcome,
-        base: &mut EventBase,
-    ) -> Result<DirAdminStage, Stop> {
-        let pending = table
-            .pending
-            .get(&id)
-            .ok_or(Stop::Refused(AdminRefusal::PendingUnknown))?;
-        describe(base, pending);
-        if !pending.fetched {
-            return Err(Stop::Refused(AdminRefusal::NotApproved));
-        }
-        let stage = match outcome {
-            KeyOperationOutcome::Performed { kvno } => {
-                if kvno.is_some() != pending.operation.answers_kvno() {
-                    return Err(Stop::Refused(AdminRefusal::ValueInvalid));
-                }
-                base.reported_kvnos = kvno.into_iter().collect();
-                DirAdminStage::Outcome(OutcomeResult::Committed { allocated: None })
-            }
-            KeyOperationOutcome::Refused => {
-                DirAdminStage::Outcome(OutcomeResult::Refused(AdminRefusal::KeyOperationRefused))
-            }
-            KeyOperationOutcome::NotPerformed => DirAdminStage::Outcome(OutcomeResult::Failed(
-                AdminFailure::KeyOperationNotPerformed,
-            )),
-            KeyOperationOutcome::OutcomeUnknown => DirAdminStage::Outcome(OutcomeResult::Failed(
-                AdminFailure::KeyOperationOutcomeUnknown,
-            )),
-        };
-        table.pending.remove(&id);
-        Ok(stage)
-    }
-
-    /// `ListPendingDestruction`: one page of the tombstones whose classes
-    /// include `user` (users and computers — the objects with key sets,
-    /// docs/47 §9.1), ascending by GUID packet.
-    /// Spec: docs/51 §6 ("the tombstones of the user / computer classes
-    /// (a tombstone keeps GUID + classes, A-18)"), §9; dirstore
-    /// `Snapshot::tombstones`.
-    fn list_destruction(
-        &self,
-        cx: &Cx<'_, '_, '_>,
-        cursor: Option<Guid>,
-    ) -> Result<KeyReply, Stop> {
-        let page = cx
-            .view
+        view: &DirectoryView<'_>,
+        target: Guid,
+    ) -> Result<Option<PrincipalId>, AdminFailure> {
+        let tombstone = view
             .snapshot()
-            .tombstones(cursor, MAX_DESTRUCTION_PAGE)
-            .map_err(|e| store_failure(&e))?;
-        let entries = page
-            .tombstones
-            .iter()
+            .get_tombstone(target)
+            .map_err(|_| AdminFailure::StoreFailure)?;
+        Ok(tombstone
             .filter(|t| t.classes.contains(&self.ids.user.id))
-            .map(|t| DestructionEntry {
-                guid: t.guid,
-                kind: if t.classes.contains(&self.ids.computer.id) {
-                    AccountKind::Computer
-                } else {
-                    AccountKind::User
-                },
-            })
-            .collect();
-        Ok(KeyReply::Page(DestructionPage {
-            entries,
-            next: page.next,
-        }))
+            .map(|t| PrincipalId::from_bytes(t.guid.to_packet())))
+    }
+}
+
+/// The decision of the request `id`, whose approvals just reached the
+/// quorum (module documentation, step 3): the decided operation on the
+/// request's key set, the requester then the approvers, and the request's
+/// remaining lifetime at `now` (1 to keyd's ceiling).
+/// Spec: docs/52 §4.2, §4.3; docs/51 §5.6; docs/questions/Q-460.
+fn key_decision(id: u64, pending: &Pending, now: u64) -> KeyDecision {
+    let principal = PrincipalId::from_bytes(pending.principal.to_packet());
+    let handle = KeyHandle::new(principal, pending.operation.purpose());
+    let operation = match pending.operation {
+        KeyOperation::RotateKrbtgt => DecidedOperation::RotateKrbtgt { krbtgt: handle },
+        KeyOperation::RotateKey { .. } => DecidedOperation::RotateKey { handle },
+        KeyOperation::RetireKvno { kvno, .. } => DecidedOperation::RetireKvno {
+            handle,
+            kvno: Kvno::new(kvno),
+        },
+    };
+    let approvers = core::iter::once(&pending.requester)
+        .chain(pending.approvals.iter())
+        .map(|party| PrincipalId::from_bytes(party.guid.to_packet()))
+        .collect();
+    let remaining = pending.expires.saturating_sub(now);
+    let lifetime_secs =
+        u32::try_from(remaining.clamp(1, u64::from(MAX_KEY_DECISION_SECS))).unwrap_or(1);
+    KeyDecision {
+        id: DecisionId::new(id),
+        operation,
+        approvers,
+        lifetime_secs,
     }
 }
 

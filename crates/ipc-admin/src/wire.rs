@@ -12,12 +12,12 @@
 //!   for `CompletePasswordSet` (keyd's replay cache makes each AP-REQ
 //!   single-use — docs/questions/Q-400); the password is an `ipc::Secret`
 //!   (zeroizing buffer, no `Debug` content, no `Clone`).
-//! * The **keyadm requests** (`FetchApproved`, `Complete`,
-//!   `ListPendingDestruction`) are dird's layouts with no `auth` (keyadm
-//!   has no Kerberos client); admind forwards them only from `keyadm_uid`
-//!   (docs/51 §6).
-//! * The replies `Created`, `Done`, `Found`, `Pong`, `KeyRequest`,
-//!   `Approved`, `PendingDestruction` are dird's (read and written by
+//! * keyadm's former requests (`FetchApproved`, `Complete`,
+//!   `ListPendingDestruction`, the only ones without `auth`) are retired by
+//!   A-102 (docs/52 §4.6; docs/questions/Q-460): their kinds are not in the
+//!   closed table, so admind refuses them like any unknown kind.
+//! * The replies `Created`, `Done`, `Found`, `Pong`, `KeyRequest` are
+//!   dird's (read and written by
 //!   `ipc_dird_admin::AdminReply`); `Refused` carries this channel's status
 //!   table; `PasswordChanged` is `kvnos: seq<u32, 2> ‖ completion_recorded:
 //!   bool`.
@@ -31,9 +31,7 @@ use crate::channel::{
 use core::fmt;
 use ipc::{Error, MessageSet, Payload, Reader, Result, Secret, Writer};
 use ipc_dird_admin::wire::{AdminReply as DirdReply, AdminRequest as DirdRequest};
-use ipc_dird_admin::{
-    WireApproved, WireAuth, WireDestructionEntry, WireKeyRequest, WireKeyadmRequest, WireOperation,
-};
+use ipc_dird_admin::{WireAuth, WireKeyRequest, WireOperation};
 
 /// A 16-octet objectGUID packet.
 pub type GuidPacket = [u8; 16];
@@ -109,9 +107,6 @@ pub enum AdminRequest {
     },
     /// `SetPassword`.
     SetPassword(WireSetPassword),
-    /// A keyadm request (dird's layout, no `auth`), forwarded only from
-    /// `keyadm_uid` (docs/51 §6).
-    Keyadm(WireKeyadmRequest),
     /// admind's health check (no `auth`, no field).
     Ping,
 }
@@ -123,7 +118,6 @@ impl MessageSet for AdminRequest {
         match self {
             AdminRequest::Forward { operation, .. } => operation.kind(),
             AdminRequest::SetPassword(_) => request_kind::SET_PASSWORD,
-            AdminRequest::Keyadm(request) => request.kind(),
             AdminRequest::Ping => request_kind::PING,
         }
     }
@@ -144,7 +138,6 @@ impl MessageSet for AdminRequest {
                 .write_payload(writer)
             }
             AdminRequest::SetPassword(set) => set.write_fields(writer),
-            AdminRequest::Keyadm(request) => request.write_fields(writer),
             AdminRequest::Ping => Ok(()),
         }
     }
@@ -156,17 +149,14 @@ impl MessageSet for AdminRequest {
             request_kind::SET_PASSWORD => Ok(AdminRequest::SetPassword(
                 WireSetPassword::read_fields(reader)?,
             )),
-            _ if request_kind::KEYADM.contains(&kind) => Ok(AdminRequest::Keyadm(
-                WireKeyadmRequest::read_fields(kind, reader)?,
-            )),
             _ if request_kind::FORWARDED.contains(&kind) => {
                 match DirdRequest::read_payload(kind, reader)? {
                     DirdRequest::Operation { auth, operation } => {
                         Ok(AdminRequest::Forward { auth, operation })
                     }
-                    // A forwarded kind is never dird's `Ping` or a keyadm
-                    // request (those kinds are matched above).
-                    DirdRequest::Ping | DirdRequest::Keyadm(_) => Err(Error::UnknownKind),
+                    // A forwarded kind is never dird's `Ping` (matched
+                    // above).
+                    DirdRequest::Ping => Err(Error::UnknownKind),
                 }
             }
             _ => Err(Error::UnknownKind),
@@ -217,15 +207,6 @@ pub enum AdminReply {
     },
     /// dird's `KeyRequest` (dird's layout).
     KeyRequest(WireKeyRequest),
-    /// dird's `Approved` (dird's layout).
-    Approved(WireApproved),
-    /// dird's `PendingDestruction` (dird's layout).
-    PendingDestruction {
-        /// The tombstones of this page.
-        entries: Vec<WireDestructionEntry>,
-        /// Where the next page starts.
-        next: Option<GuidPacket>,
-    },
 }
 
 impl MessageSet for AdminReply {
@@ -240,8 +221,6 @@ impl MessageSet for AdminReply {
             AdminReply::Pong => reply_kind::PONG,
             AdminReply::PasswordChanged { .. } => reply_kind::PASSWORD_CHANGED,
             AdminReply::KeyRequest(_) => reply_kind::KEY_REQUEST,
-            AdminReply::Approved(_) => reply_kind::APPROVED,
-            AdminReply::PendingDestruction { .. } => reply_kind::PENDING_DESTRUCTION,
         }
     }
 
@@ -277,14 +256,6 @@ impl MessageSet for AdminReply {
             AdminReply::KeyRequest(request) => {
                 DirdReply::KeyRequest(request.clone()).write_payload(writer)
             }
-            AdminReply::Approved(approved) => {
-                DirdReply::Approved(approved.clone()).write_payload(writer)
-            }
-            AdminReply::PendingDestruction { entries, next } => DirdReply::PendingDestruction {
-                entries: entries.clone(),
-                next: *next,
-            }
-            .write_payload(writer),
         }
     }
 
@@ -317,16 +288,10 @@ impl MessageSet for AdminReply {
                 kvnos: reader.read_seq(MAX_KVNOS, Reader::read_u32)?,
                 completion_recorded: reader.read_bool()?,
             },
-            reply_kind::KEY_REQUEST | reply_kind::APPROVED | reply_kind::PENDING_DESTRUCTION => {
-                match DirdReply::read_payload(kind, reader)? {
-                    DirdReply::KeyRequest(request) => AdminReply::KeyRequest(request),
-                    DirdReply::Approved(approved) => AdminReply::Approved(approved),
-                    DirdReply::PendingDestruction { entries, next } => {
-                        AdminReply::PendingDestruction { entries, next }
-                    }
-                    _ => return Err(Error::UnknownKind),
-                }
-            }
+            reply_kind::KEY_REQUEST => match DirdReply::read_payload(kind, reader)? {
+                DirdReply::KeyRequest(request) => AdminReply::KeyRequest(request),
+                _ => return Err(Error::UnknownKind),
+            },
             _ => return Err(Error::UnknownKind),
         })
     }

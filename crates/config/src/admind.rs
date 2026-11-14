@@ -2,7 +2,8 @@
 //!
 //! admind is the management plane: it listens on the local `admin.sock` and
 //! talks to dird (writes, over `dird-admin.sock`), to keyd as `Role::Directory`
-//! (`set_secret`, `verify_secret`) and to auditd (docs/50 §2.4). The daemon
+//! (`set_secret`, on a decision dird registered — A-102) and to auditd
+//! (docs/50 §2.4). The daemon
 //! itself is blocked on Q-220 (task P13): how administrators authenticate to
 //! `admin.sock` (A-57: Kerberos through a dedicated keyd role, two uids for
 //! admind and keyadm) is not decided in a form this schema can carry, so the
@@ -12,16 +13,16 @@
 //! **No secrets.** Passwords pass through admind in memory only (`mlockall`,
 //! docs/50 §6.4) and never appear in its configuration.
 //!
-//! **keyadm and the socket group** (docs/51 §4.6, task A4): `keyadm_uid` is
-//! the only peer uid for which admind forwards the operations reserved to
-//! keyadm (`FetchApproved`, `Complete`, `ListPendingDestruction` — docs/51
-//! §6, §7.3: "admind forwards only if the peer's uid = `keyadm_uid`"); it
-//! takes part in the file's uid distinctness rule (one account per process,
-//! docs/50 §2.4) and is never 0. `admin_socket_group` is the gid of the
-//! group that may enter `admin.sock`'s directory (docs/50 §3.1: "mode 0750,
-//! group = the channel's clients" — defence in depth only; the
+//! **The socket group** (docs/51 §4.6, task A4): `admin_socket_group` is the
+//! gid of the group that may enter `admin.sock`'s directory (docs/50 §3.1:
+//! "mode 0750, group = the channel's clients" — defence in depth only; the
 //! authorization itself is Kerberos, docs/51 §5.1, §5.3); a numeric gid,
 //! never 0 (docs/50 §7.1: no name-service lookup).
+//!
+//! **No `keyadm_uid`** (A-102, docs/52 §4.6): admind forwards nothing for
+//! keyadm any more — keyadm talks to keyd only and runs dird's decisions by
+//! id — so the key that named keyadm's uid is gone (an unknown key is
+//! refused, docs/50 R50-15).
 //!
 //! **The minimum password length** (task A9; decision A-79 / P-24):
 //! `min_password_length` is the least number of characters admind accepts
@@ -33,7 +34,7 @@
 //!
 //! Spec: docs/50 R50-15, §2.4, §3.1, §3.2, §3.6, §6.4, §7.1; docs/51 §4.6,
 //! §5.1, §6, §7.3, §11; [MS-SAMR] 3.1.1.7.2; A-79; P-24;
-//! docs/questions/Q-220, Q-401.
+//! docs/questions/Q-220, Q-401; docs/52 §4.6 (A-102).
 
 use core::time::Duration;
 
@@ -52,9 +53,6 @@ const ADMIN_SOCKET: &str = "admin_socket";
 /// Spec: docs/51 §4.6 ("gid of the access group for `admin.sock`
 /// (defence in depth, docs/50 §3.1)"); docs/50 §3.1.
 const ADMIN_SOCKET_GROUP: &str = "admin_socket_group";
-/// Key: the uid of keyadm, the only peer for which admind forwards the
-/// operations reserved to keyadm. Spec: docs/51 §4.6, §6, §7.3.
-const KEYADM_UID: &str = "keyadm_uid";
 /// Key: the least number of characters of a password admind sets.
 /// Spec: [MS-SAMR] 3.1.1.7.2 item 3.2.1; A-79; P-24.
 const MIN_PASSWORD_LENGTH_KEY: &str = "min_password_length";
@@ -67,7 +65,6 @@ pub struct AdmindSettings {
     run_as: Account,
     admin_socket: AbsolutePath,
     admin_socket_group: u32,
-    keyadm_uid: u32,
     dird: Endpoint,
     keyd: Endpoint,
     audit: Endpoint,
@@ -83,7 +80,6 @@ impl AdmindSettings {
         RUN_AS_GID,
         ADMIN_SOCKET,
         ADMIN_SOCKET_GROUP,
-        KEYADM_UID,
         MIN_PASSWORD_LENGTH_KEY,
         DIRD_ADMIN_SOCKET,
         DIRD_UID,
@@ -97,7 +93,6 @@ impl AdmindSettings {
 
     /// Parses and validates admind's file. Required: `run_as_uid`,
     /// `run_as_gid`, `admin_socket`, `admin_socket_group` (a gid, never 0),
-    /// `keyadm_uid` (never 0, distinct from every other uid of the file),
     /// `min_password_length` (12 ..= 256, no default), `dird_admin_socket` +
     /// `dird_uid`, `keyd_socket` + `keyd_uid`, `audit_socket`,
     /// `auditd_uid`. Optional: `frame_timeout` (5s), `keyd_deadline` (2s).
@@ -114,7 +109,6 @@ impl AdmindSettings {
         // A gid: not part of the uid distinctness rule (as `run_as_gid`,
         // crate::schema::account), but never 0 or all-ones.
         let admin_socket_group = doc.required(ADMIN_SOCKET_GROUP, value::account_id)?.value;
-        let keyadm_uid = schema::id(&doc, &mut all, KEYADM_UID)?;
         // Required, never defaulted (A-79: "a required configuration key").
         let min_password_length = doc
             .required(MIN_PASSWORD_LENGTH_KEY, |text| {
@@ -130,7 +124,6 @@ impl AdmindSettings {
             run_as,
             admin_socket,
             admin_socket_group,
-            keyadm_uid,
             dird,
             keyd,
             audit,
@@ -164,13 +157,6 @@ impl AdmindSettings {
     #[must_use]
     pub const fn admin_socket_group(&self) -> u32 {
         self.admin_socket_group
-    }
-
-    /// keyadm's uid: the only peer for which admind forwards the
-    /// operations reserved to keyadm. Spec: docs/51 §4.6, §6, §7.3.
-    #[must_use]
-    pub const fn keyadm_uid(&self) -> u32 {
-        self.keyadm_uid
     }
 
     /// dird's `dird-admin.sock` and uid. Spec: docs/50 §2.3, §3.2.

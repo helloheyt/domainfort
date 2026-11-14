@@ -617,11 +617,17 @@ pub fn auth(requester: &str, approvers: &[&str]) -> ipc_dird_admin::Auth {
 /// [`ADMIN_SERVICE_KEY`] for each of keyd's enctypes.
 fn admin_keyd(
     started: &KerberosTime,
+    keyadm_keys: bool,
 ) -> Result<Keyd<InMemoryKeyStore, RecordBuffer, common::TestEntropy>, keyd::ConfigError> {
     let entropy = common::TestEntropy::default();
+    let store = if keyadm_keys {
+        InMemoryKeyStore::new_insecure_development_allowing_krbtgt(64)
+    } else {
+        InMemoryKeyStore::new(64)
+    };
     let mut keyd = Keyd::with_entropy(
         dird::keyd_config(),
-        InMemoryKeyStore::new(64),
+        store,
         RecordBuffer::new(),
         entropy.clone(),
         started,
@@ -647,6 +653,9 @@ fn admin_keyd(
         &common::now(),
     )
     .unwrap();
+    if keyadm_keys {
+        keyadm_key_sets(&mut keyd);
+    }
     let _ = keyd.audit_sink_mut().take();
     Ok(keyd)
 }
@@ -918,8 +927,9 @@ fn bob_key_targets(target: Guid) -> ipc_dird_admin::Reply {
     })
 }
 
-/// The grant dird registers for a `PasswordSet` answer (task A15a): keyd
-/// (Role::Ldap) `grant_set_secret` for exactly its key targets.
+/// The decision dird registers for a `PasswordSet` answer (task A15a;
+/// A-102): keyd (Role::Ldap) `register_decision` of a `SetSecret` for
+/// exactly its key targets and salt.
 fn register_grant(grants: &(PathBuf, u32), answer: &ipc_dird_admin::Reply) {
     let ipc_dird_admin::Reply::PasswordSet(set) = answer else {
         return;
@@ -934,6 +944,7 @@ fn register_grant(grants: &(PathBuf, u32), answer: &ipc_dird_admin::Reply) {
         .map(|k| keyd::SetSecretTarget {
             handle: k.handle,
             binding: k.binding.clone(),
+            salt: set.salt.as_str().to_owned(),
         })
         .collect();
     let mut client = ipc_keyd::KeydClient::new(
@@ -943,7 +954,12 @@ fn register_grant(grants: &(PathBuf, u32), answer: &ipc_dird_admin::Reply) {
     )
     .unwrap();
     client
-        .grant_set_secret(kind, &targets, keyd::MAX_SET_SECRET_GRANT_SECS)
+        .register_decision(
+            keyd::DecisionId::new(1),
+            &keyd::DecidedOperation::SetSecret { kind, targets },
+            &[],
+            keyd::MAX_SET_SECRET_GRANT_SECS,
+        )
         .unwrap();
 }
 
@@ -1185,12 +1201,11 @@ pub struct Options {
     pub min_password_length: u32,
     pub keyd_deadline: Duration,
     pub frame_timeout: Duration,
-    /// admind's `keyadm_uid` = the test's uid + this (0: the test's uid is
-    /// keyadm's; 1: it is not — task A10).
-    pub keyadm_uid_offset: u32,
-    /// Start keyadm's keyd (task A10): a real keyd, the test's uid mapped
-    /// to Role::Admin, a store that accepts krbtgt, holding the krbtgt key
-    /// set and ws9's two key sets.
+    /// keyadm's view of the one keyd (task A10; A-102): one more socket on
+    /// the same engine (`kk.sock`), the test's uid mapped to Role::Admin, so
+    /// keyadm executes the decisions dird registers there; and the store
+    /// accepts krbtgt and holds the krbtgt key set and ws9's two key sets
+    /// (made with `create_key`, as the ceremony makes them).
     pub keyadm_keyd: bool,
     /// dird's pending key-operation request lifetime.
     pub key_request_lifetime: Duration,
@@ -1205,27 +1220,19 @@ impl Default for Options {
             min_password_length: 12,
             keyd_deadline: Duration::from_secs(2),
             frame_timeout: Duration::from_secs(2),
-            keyadm_uid_offset: 0,
             keyadm_keyd: false,
             key_request_lifetime: directory_admin::KEY_REQUEST_LIFETIME,
         }
     }
 }
 
-/// keyadm's keyd (task A10): the krbtgt key set (`create_key`, as the
-/// ceremony makes it — docs/51 §4.3 step 11) and ws9's `PrincipalLongterm`
-/// and `Service` key sets (made here with `create_key` too: the test needs
-/// key sets to destroy, not their passwords), all with random keys.
+/// keyadm's key sets on the one keyd (task A10; A-102): the krbtgt key set
+/// (`create_key`, as the ceremony makes it — docs/51 §4.3 step 11) and
+/// ws9's `PrincipalLongterm` and `Service` key sets (made here with
+/// `create_key` too: the test needs key sets to destroy, not their
+/// passwords), all with drawn keys.
 /// Spec: docs/10 §7; docs/47 §1.4, §9.1; A-19.
-fn keyadm_keyd(
-    started: &KerberosTime,
-) -> Result<Keyd<InMemoryKeyStore, RecordBuffer>, keyd::ConfigError> {
-    let mut keyd = Keyd::new(
-        dird::keyd_config(),
-        InMemoryKeyStore::new_insecure_development_allowing_krbtgt(64),
-        RecordBuffer::new(),
-        started,
-    )?;
+fn keyadm_key_sets(keyd: &mut Keyd<InMemoryKeyStore, RecordBuffer, common::TestEntropy>) {
     let krbtgt = manifest().krbtgt().clone();
     keyd.create_key(
         &common::ADMIN,
@@ -1258,8 +1265,6 @@ fn keyadm_keyd(
         &common::now(),
     )
     .unwrap();
-    let _ = keyd.audit_sink_mut().take();
-    Ok(keyd)
 }
 
 /// Everything of one test.
@@ -1288,10 +1293,13 @@ pub struct World {
     pub keyd_dir_socket: PathBuf,
     /// dird's admin socket (the real dird's or the recording one's).
     pub dird_socket: PathBuf,
-    /// keyadm's keyd (task A10), when started.
-    pub keyadm_keyd: Option<dird::keyd::Daemon>,
-    pub keyadm_keyd_auditd: Option<FakeAuditd>,
+    /// keyadm's socket on the one keyd (Role::Admin; task A10, A-102),
+    /// when `Options::keyadm_keyd` (its records are the one keyd's,
+    /// `keyd_auditd`).
     pub keyadm_keyd_socket: PathBuf,
+    /// The KDC's socket on the one keyd (Role::Kdc): the tests' password
+    /// check (`verify_preauth`, A-102 / docs/52 R4).
+    pub keyd_kdc_socket: PathBuf,
 }
 
 impl World {
@@ -1332,10 +1340,30 @@ impl World {
                 callers: CallerMap::new(&[(uid, role)]).unwrap(),
             }];
         }
+        // The KDC's role on the same engine (A-102, docs/52 R4: no role
+        // holds `verify_secret` any more, so the tests check a password the
+        // way the KDC does — PA-ENC-TIMESTAMP, `verify_preauth`).
+        let keyd_kdc_socket = dir.join("kq.sock");
+        keyd_params.extra_listeners.push(ExtraListener {
+            socket: keyd_kdc_socket.clone(),
+            callers: CallerMap::new(&[(uid, Role::Kdc)]).unwrap(),
+        });
+        // keyadm's role on the same engine (A-102: keyadm executes the
+        // decisions dird registers in this keyd).
+        let keyadm_keyd_socket = dir.join("kk.sock");
+        let keyadm_keys = options.keyadm_keyd;
+        if keyadm_keys {
+            keyd_params.extra_listeners.push(ExtraListener {
+                socket: keyadm_keyd_socket.clone(),
+                callers: CallerMap::new(&[(uid, Role::Admin)]).unwrap(),
+            });
+        }
         let keyd_auditd = FakeAuditd::start(&keyd_params.audit.socket);
         let keyd_clock = TestClock::at(common::keyd_started());
-        let keyd_run =
-            dird::keyd::Daemon::start(keyd_params, keyd_clock.clone(), admin_keyd).unwrap();
+        let keyd_run = dird::keyd::Daemon::start(keyd_params, keyd_clock.clone(), move |started| {
+            admin_keyd(started, keyadm_keys)
+        })
+        .unwrap();
         keyd_clock.set(common::now());
         let silent_keyd = match options.keyd {
             KeydMode::Silent => Some(SilentServer::start(&keyd_dir_socket)),
@@ -1391,21 +1419,6 @@ impl World {
             }
         }
 
-        // keyadm's keyd (task A10).
-        let keyadm_keyd_socket = dir.join("kk.sock");
-        let (mut keyadm_keyd_auditd, mut keyadm_keyd_run) = (None, None);
-        if options.keyadm_keyd {
-            let mut keyd_params =
-                dird::keyd::params(&dir, CallerMap::new(&[(uid, Role::Admin)]).unwrap(), uid);
-            keyd_params.keyd_socket = keyadm_keyd_socket.clone();
-            keyd_params.audit.socket = dir.join("kc.sock");
-            keyadm_keyd_auditd = Some(FakeAuditd::start(&keyd_params.audit.socket));
-            keyadm_keyd_run = Some(
-                dird::keyd::Daemon::start(keyd_params, TestClock::at(common::now()), keyadm_keyd)
-                    .unwrap(),
-            );
-        }
-
         // admind.
         let admin_socket = dir.join("am.sock");
         let params = DaemonParams {
@@ -1416,7 +1429,6 @@ impl World {
             },
             frame_timeout: options.frame_timeout,
             min_password_length: options.min_password_length,
-            keyadm_uid: uid + options.keyadm_uid_offset,
             dird: dird_link(&dird_socket, uid),
             keyd: keyd_link(&keyd_dir_socket, uid, options.keyd_deadline),
             limits: options.limits,
@@ -1442,21 +1454,25 @@ impl World {
             keyd_ldap_socket: keyd_socket,
             keyd_dir_socket,
             dird_socket,
-            keyadm_keyd: keyadm_keyd_run,
-            keyadm_keyd_auditd,
             keyadm_keyd_socket,
+            keyd_kdc_socket,
         })
     }
 
-    /// keyadm's keyd's records so far (task A10).
+    /// The one keyd's records of keyadm's calls (Role::Admin) so far (task
+    /// A10; A-102).
     pub fn keyadm_records(&self) -> Vec<KeydRecord> {
-        self.keyadm_keyd_auditd
+        self.keyd_auditd
             .as_ref()
             .map(|a| {
                 a.events()
                     .into_iter()
                     .filter_map(|e| match e {
-                        EventBody::Keyd(record) => Some(*record),
+                        EventBody::Keyd(record)
+                            if record.caller_role == ipc_audit::KeydRole::Admin =>
+                        {
+                            Some(*record)
+                        }
                         _ => None,
                     })
                     .collect()
@@ -1563,9 +1579,6 @@ impl Drop for World {
             let _ = dird.stop();
         }
         if let Some(keyd) = self.keyd.take() {
-            let _ = keyd.stop();
-        }
-        if let Some(keyd) = self.keyadm_keyd.take() {
             let _ = keyd.stop();
         }
         if let Some(server) = self.auditd.take() {
