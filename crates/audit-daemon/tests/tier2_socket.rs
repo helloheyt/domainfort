@@ -583,3 +583,150 @@ fn older_shapes_are_bound_to_their_sender() {
         assert_eq!(refused, 5 - own_shapes.len() as u64, "{source}");
     }
 }
+
+// ---- resent batches (task F8) ----------------------------------------------------
+
+/// Source: decision A-98 (follow-up F8), docs/questions/Q-432 item 5 (auditd
+/// stopped after the sync, before the sender saw the `Ack`), Q-445; docs/50
+/// §3.7 (reconnect), §7.5 (the log verified at start), §8.1;
+/// ipc-audit `SendWindow::connection_lost` (resend with the same numbers),
+/// `SendWindow::new` (a restarted sender numbers from 1). The test reads
+/// the `Ack` only to know the batch was synced, then acts as the sender that
+/// lost it: auditd stops and starts again (the real start-up, `open_log`),
+/// the sender resends on a new connection and gets an `Ack` naming the
+/// record that already holds its last event — one copy in the log; then a
+/// restarted sender's numbering from 1 is accepted.
+#[test]
+fn a_batch_resent_after_auditd_restarts_is_acknowledged_once() {
+    let Some(uid) = mappable_uid() else { return };
+    let dir = TempDir::new();
+    let settings = settings(&dir, uid, 5);
+    let server = Server::start(&settings, config(&settings), 8, true);
+    let mut client = connect(&server.socket);
+    send(&mut client, &append(1, 3, 1));
+    assert_eq!(expect_ack(receive(&mut client)).through_seq, 3);
+    send(&mut client, &append(4, 2, 2));
+    let synced = expect_ack(receive(&mut client));
+    assert_eq!(synced.through_seq, 5);
+    // From here the sender behaves as if that Ack never arrived.
+    drop(client);
+    assert_eq!(server.stop(), Some(Ok(())));
+
+    let server = Server::start(&settings, config(&settings), 8, true);
+    let mut resend = connect(&server.socket);
+    send(&mut resend, &append(4, 2, 2));
+    let ack = expect_ack(receive(&mut resend));
+    assert_eq!(
+        ack, synced,
+        "the same Ack: through 5, the record holding it"
+    );
+    drop(resend);
+    // A restarted sender: a new numbering from 1, other events.
+    let mut restarted = connect(&server.socket);
+    send(&mut restarted, &append(1, 2, 7));
+    assert_eq!(expect_ack(receive(&mut restarted)).through_seq, 2);
+    drop(restarted);
+    assert_eq!(server.stop(), Some(Ok(())));
+
+    let (records, head) = read_segment(&dir.base(), 1, Anchor::Genesis);
+    let numbers: Vec<u64> = records.iter().map(|r| r.source_seq).collect();
+    assert_eq!(numbers, [1, 2, 3, 4, 5, 1, 2], "one copy of 4 and 5");
+    assert_eq!(records[3].payload, events(2, 64, 2)[0].as_bytes());
+    assert_eq!(records[5].payload, events(2, 64, 7)[0].as_bytes());
+    let reopened = audit_daemon::recovery::open_log(
+        &dir.base(),
+        audit_log::SegmentLimit::DEFAULT,
+        settings.run_as().uid(),
+    )
+    .expect("the log verifies at the next start");
+    assert_eq!(reopened.sink.head(), head);
+}
+
+/// Source: crate `audit_daemon::resend` rule 2 (a partly persisted batch);
+/// ipc-audit `SendWindow::next_batch` (the resent batch carries the events
+/// committed since); docs/questions/Q-445 item 2. Over the socket: only the
+/// events after the last persisted number are appended; the `Ack` names the
+/// last event.
+#[test]
+fn a_partly_persisted_resend_is_completed() {
+    let Some(uid) = mappable_uid() else { return };
+    let dir = TempDir::new();
+    let settings = settings(&dir, uid, 5);
+    let server = Server::start(&settings, config(&settings), 8, true);
+    let mut client = connect(&server.socket);
+    send(&mut client, &append(1, 2, 1));
+    assert_eq!(expect_ack(receive(&mut client)).through_seq, 2);
+    send(&mut client, &append(3, 2, 2));
+    assert_eq!(expect_ack(receive(&mut client)).through_seq, 4);
+    drop(client); // that Ack counts as lost
+
+    let mut resend = connect(&server.socket);
+    let mut batch = events(2, 64, 2);
+    batch.extend(events(2, 64, 3));
+    send(
+        &mut resend,
+        &AuditRequest::Append(Append::new(3, batch.clone()).unwrap()),
+    );
+    let ack = expect_ack(receive(&mut resend));
+    assert_eq!(ack.through_seq, 6);
+    drop(resend);
+    assert_eq!(server.stop(), Some(Ok(())));
+
+    let (records, head) = read_segment(&dir.base(), 1, Anchor::Genesis);
+    assert_eq!(head.hash.as_bytes(), &ack.head_hash);
+    let numbers: Vec<u64> = records.iter().map(|r| r.source_seq).collect();
+    assert_eq!(numbers, [1, 2, 3, 4, 5, 6]);
+    for (record, event) in records[2..].iter().zip(&batch) {
+        assert_eq!(record.payload, event.as_bytes());
+    }
+}
+
+/// Source: decision A-98 / the F8 brief (a resent event must be
+/// byte-identical; a mismatch is refused and counted); docs/50 §3.2
+/// ("closed + an audit record"); docs/questions/Q-265 item 3 (refusal of a
+/// numbering error: `Refused::Malformed` + close), Q-445 items 3, 6. A
+/// resend whose last event differs is refused and closed, nothing appended;
+/// the true resend is acknowledged; a `ResendsRefused` record counts the
+/// refusal.
+#[test]
+fn a_resend_that_differs_is_refused_and_recorded() {
+    let Some(uid) = mappable_uid() else { return };
+    let dir = TempDir::new();
+    let settings = settings(&dir, uid, 5);
+    let server = Server::start(&settings, config(&settings), 8, true);
+    let mut client = connect(&server.socket);
+    send(&mut client, &append(1, 3, 1));
+    assert_eq!(expect_ack(receive(&mut client)).through_seq, 3);
+    drop(client);
+
+    let mut forged = events(3, 64, 1)[1..].to_vec();
+    forged[1] = events(1, 64, 9).remove(0);
+    let mut client = connect(&server.socket);
+    send(
+        &mut client,
+        &AuditRequest::Append(Append::new(2, forged).unwrap()),
+    );
+    assert_eq!(
+        receive(&mut client),
+        Got::Reply(Reply::Refused(Refused::Malformed))
+    );
+    assert_eq!(receive(&mut client), Got::Closed);
+
+    let mut client = connect(&server.socket);
+    send(
+        &mut client,
+        &AuditRequest::Append(Append::new(2, events(3, 64, 1)[1..].to_vec()).unwrap()),
+    );
+    assert_eq!(expect_ack(receive(&mut client)).through_seq, 3);
+    drop(client);
+    assert_eq!(server.stop(), Some(Ok(())));
+
+    let (records, _) = read_segment(&dir.base(), 1, Anchor::Genesis);
+    assert_eq!(records.len(), 4);
+    for (record, event) in records.iter().zip(&events(3, 64, 1)) {
+        assert_eq!(record.source, Source::Kdc);
+        assert_eq!(record.payload, event.as_bytes());
+    }
+    assert_eq!(records[3].source, Source::Auditd);
+    assert_eq!(records[3].payload, expected_resends(1, 0, uid));
+}

@@ -12,6 +12,7 @@
 //! | [`writer`] | the single writer thread, its bounded queue, ack after sync, rotation | docs/50 §3.6, §8.1; A-57 |
 //! | [`listener`] | `audit.sock`: peer uid → source, frames, deadlines, `Append` / `Ping` | docs/50 R50-3, §3.1-§3.3, §3.6 |
 //! | [`binding`] | each event shape only from its one sender (Kdc ⇐ kdc, Keyd ⇐ keyd, Ldap / DirAdmin ⇐ dird, Admind ⇐ admind) | docs/50 §3.2, §4.2; docs/51 §5.7; Q-341 |
+//! | [`resend`] | a batch resent after a lost acknowledgement is acknowledged without being appended again; a reused number with other octets is refused | docs/50 §8.1; Q-252 item 7; A-98; Q-445 |
 //! | [`own_event`] | the payload of auditd's own records | docs/50 §3.2; Q-250 items 5, 8 |
 //! | [`signing`] | the chain-head signing hook, UNSIGNED until P-20 | docs/37 §2; Q-251 |
 //!
@@ -40,17 +41,23 @@
 //! were written only from docs/51 §5.7 (A-72), docs/50 §3.2 / §8.1 and
 //! PENDING-OWNER (A-57, A-64, A-66). The last summary of a clean stop (task
 //! F4) was written only from PENDING-OWNER (A-85, A-88), docs/questions
-//! Q-341, Q-366, Q-265, docs/50 §3.2 / §8 and docs/37. No existing log
-//! daemon, journal or audit implementation was consulted or recalled
-//! (AGENTS.md §1-3).
+//! Q-341, Q-366, Q-265, docs/50 §3.2 / §8 and docs/37. The resend check
+//! (task F8) was written only from PENDING-OWNER (A-64, A-66, A-85, A-98),
+//! docs/questions Q-218, Q-252, Q-260, Q-265, Q-341, Q-395..Q-397, Q-432,
+//! docs/50 §3.2 / §3.7 / §8, docs/37 §2, and the code of this repository's
+//! crates audit-log, ipc-audit (`SendWindow`, `Append`, `AppendCursor`) and
+//! the four senders' audit links. No existing log daemon, journal or audit
+//! implementation was consulted or recalled (AGENTS.md §1-3).
 //!
 //! Spec: docs/50 R50-17, §8, §10 (P6b); docs/37 §2; Q-218 (A-57);
-//! Q-250 / Q-252 (A-64); Q-251 (P-20); Q-265; docs/51 §5.7; Q-341; Q-396.
+//! Q-250 / Q-252 (A-64); Q-251 (P-20); Q-265; docs/51 §5.7; Q-341; Q-396;
+//! Q-432 (A-98); Q-445.
 
 pub mod binding;
 pub mod listener;
 pub mod own_event;
 pub mod recovery;
+pub mod resend;
 pub mod segments;
 pub mod signing;
 pub mod startup;

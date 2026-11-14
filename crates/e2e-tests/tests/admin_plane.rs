@@ -890,8 +890,13 @@ fn auditd_down_refuses_admin_writes_and_leaves_the_store_unchanged() {
             );
         }
         // auditd stopped once: a sender may have resent what it had not seen
-        // acknowledged (Q-252 item 7) — folded by `finish_counting_duplicates`.
-        let (events, _duplicates) = w.finish_counting_duplicates();
+        // acknowledged (Q-252 item 7). auditd recognises a batch it already
+        // persisted — its per-source state recovered from the verified log
+        // at the restart — and acknowledges it without appending it again
+        // (A-98 follow-up F8; crates/audit-daemon `resend`; Q-445): the log
+        // holds no duplicate.
+        let (events, duplicates) = w.finish_counting_duplicates();
+        assert_eq!(duplicates, 0, "no batch persisted twice across the restart");
         let creates: Vec<(Vec<String>, DirAdminStage)> = dir_admin_events(&events)
             .iter()
             .filter(|(_, e)| e.operation == DirAdminOperation::CreateUser)

@@ -35,15 +35,23 @@
 //!    A-57); writer
 //!    failed → `Refused::Unavailable`; persisted → `Ack { through_seq,
 //!    head_hash }` and only then the cursor advances (docs/50 §8.1;
-//!    docs/questions/Q-252 item 7).
+//!    docs/questions/Q-252 item 7). The writer's resend check
+//!    (crate::resend) appends only the events not yet persisted: a batch
+//!    resent after a lost acknowledgement — on the sender's next connection
+//!    — is acknowledged the same way, with nothing appended twice; a batch
+//!    that reuses persisted numbers without being their byte-identical
+//!    resend → `Refused::Malformed` + close, counted for a `ResendsRefused`
+//!    record (decision A-98, follow-up F8; docs/questions/Q-445). Each job
+//!    carries the source's numbering ([`binding::numbering`] of the
+//!    configured table) and whether it is the connection's first `Append`.
 //! 5. **Errors** follow `ipc::Error::refusal` (A-59): a wrong version →
 //!    `Refused::VersionMismatch` + close; a malformed payload →
 //!    `Refused::Malformed` + close; a bad length prefix, wrong magic or
 //!    unknown kind → close with no reply.
 //!
 //! Spec: docs/50 R50-3, R50-7, R50-17, §3.1-§3.3, §3.6, §7.5, §8.1;
-//! docs/questions/Q-218 (A-57), Q-225 (A-59), Q-252 (A-64), Q-265, Q-341;
-//! docs/51 §5.7;
+//! docs/questions/Q-218 (A-57), Q-225 (A-59), Q-252 (A-64), Q-265, Q-341,
+//! Q-432 (A-98), Q-445; docs/51 §5.7;
 //! tokio 1.54.1 docs.rs: `net::UnixListener` (`bind`, `accept`),
 //! `net::UnixStream` (`peer_cred`), `net::unix::UCred`, `time::timeout_at`,
 //! `time::Instant`, `time::sleep`, `sync::oneshot`, `io::AsyncReadExt`,
@@ -100,6 +108,9 @@ pub struct ListenerConfig {
     pub max_connections_per_source: usize,
     /// The shape↔source binding table. Always [`binding::PRODUCTION`] in
     /// the daemon; see [`binding::BindingTable`] for why it is a parameter.
+    /// It also gives each source's numbering for the resend check
+    /// ([`binding::numbering`]): one sender per source under
+    /// [`binding::PRODUCTION`].
     pub binding: binding::BindingTable,
 }
 
@@ -322,11 +333,11 @@ async fn connection(
 }
 
 /// Check the numbering and the source binding, queue the batch, wait for
-/// the writer, and build the reply; the flag says whether the connection
-/// stays open.
+/// the writer (which runs the resend check), and build the reply; the flag
+/// says whether the connection stays open.
 ///
 /// Spec: docs/50 §3.2, §8.1; docs/questions/Q-218 (A-57), Q-252 item 7,
-/// Q-265 item 3, Q-341; docs/51 §5.7.
+/// Q-265 item 3, Q-341, Q-445; docs/51 §5.7.
 async fn append_batch(
     append: &Append,
     cursor: &mut AppendCursor,
@@ -350,6 +361,11 @@ async fn append_batch(
         source_uid: uid,
         first_source_seq: append.first_seq(),
         events: append.events().to_vec(),
+        numbering: binding::numbering(table, source),
+        // No baseline yet: nothing has been acknowledged on this connection
+        // (ipc-audit `AppendCursor`: "the first `Append` on a connection sets
+        // the baseline").
+        first_on_connection: *cursor == AppendCursor::new(),
         reply: reply_to,
     };
     match submitter.submit(job) {
@@ -358,13 +374,17 @@ async fn append_batch(
         Err(SubmitError::Unavailable) => return (Reply::Refused(Refused::Unavailable), true),
     }
     match outcome.await {
-        Ok(JobOutcome::Persisted(head)) => {
+        // Appended now, or (a resend) already persisted: the same Ack.
+        Ok(JobOutcome::Persisted(head) | JobOutcome::AlreadyPersisted(head)) => {
             // Advanced only now that the batch is persisted. If no number
             // can follow, the Ack is still sent, then the connection closes.
             let keep_open = cursor.advance(range).is_ok();
             let ack = AppendCursor::ack(range, *head.hash.as_bytes());
             (Reply::Message(AuditReply::Ack(ack)), keep_open)
         }
+        // The writer counted it (crate::resend; Q-445): the same answer as a
+        // numbering error (Q-265 item 3).
+        Ok(JobOutcome::ResendRefused(_)) => (Reply::Refused(Refused::Malformed), false),
         Ok(JobOutcome::Unavailable) | Err(_) => (Reply::Refused(Refused::Unavailable), true),
     }
 }

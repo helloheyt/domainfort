@@ -245,6 +245,16 @@ pub fn expected_misbound(refused_batches: u64, last_uid: u32) -> Vec<u8> {
     out
 }
 
+/// The expected payload of a `ResendsRefused` auditd record (kind 0x04,
+/// task F8).
+pub fn expected_resends(mismatched: u64, unverifiable: u64, last_uid: u32) -> Vec<u8> {
+    let mut out = vec![0xAD, 0x04];
+    out.extend_from_slice(&mismatched.to_be_bytes());
+    out.extend_from_slice(&unverifiable.to_be_bytes());
+    out.extend_from_slice(&last_uid.to_be_bytes());
+    out
+}
+
 // ---- admin-plane events (docs/51 §5.7), encoded with ipc-audit --------------
 
 /// A `DirAdmin` event of `CreateUser` in `stage` (docs/51 §5.2 row 1).

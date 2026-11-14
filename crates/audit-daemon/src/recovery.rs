@@ -40,11 +40,21 @@
 //! out of bounds and is refused too: the verifier cannot tell it from
 //! tampering (docs/questions/Q-265 item 1).
 //!
+//! # The resend check's state
+//!
+//! The same walk hands every sender record that verifies — in log order,
+//! including the records of a torn segment before its break — to the
+//! resend check ([`crate::resend::PersistedTails::observe`], the function
+//! the writer calls after each sync), so each source's last persisted
+//! `source_seq` and remembered events survive a restart (decision A-98,
+//! follow-up F8; docs/questions/Q-445).
+//!
 //! Spec: docs/50 R50-16 ("nothing binds until its dependencies are
 //! verified"), §7.5 ("auditd — opens the file, verifies the hash chain");
 //! docs/37 §2; docs/questions/Q-250 items 6, 8, 10 (A-64); Q-265 item 1.
 
 use crate::own_event::{AuditdEvent, SegmentRecovered, TornKind};
+use crate::resend::PersistedTails;
 use crate::segments::{list_segments, FileSegments, ListingError, SegmentFactory, FIRST_SEGMENT};
 use crate::writer::{LogSink, PersistError};
 use audit_log::{
@@ -206,15 +216,20 @@ fn torn_or_refused(
 }
 
 /// Verify one segment against `anchor`; if `pending` is set, its first
-/// record must be that recovery record.
+/// record must be that recovery record. Every sender record that verifies
+/// — in a torn segment, every record before the break — is handed to the
+/// resend check's state (`tails`), in log order.
 ///
-/// Spec: docs/37 §2; docs/questions/Q-250 item 8; this module's rules.
+/// Spec: docs/37 §2; docs/questions/Q-250 item 8; this module's rules;
+/// crate::resend (the state is recovered from the verified log; A-66,
+/// A-98).
 fn walk_segment<R: Read>(
     reader: R,
     segment: u64,
     anchor: Anchor,
     limit: SegmentLimit,
     pending: Option<&SegmentRecovered>,
+    tails: &mut PersistedTails,
 ) -> Result<Walk, StartupError> {
     let mut walk = match SegmentReader::open(reader, anchor, limit, None) {
         Ok(walk) => walk,
@@ -242,6 +257,21 @@ fn walk_segment<R: Read>(
             Err(_) => return Err(missing),
         }
     }
+    // Every record, as it verifies, to the resend check; the head after a
+    // record is that record's own (auditd's own records are ignored there).
+    loop {
+        match walk.next_record() {
+            Ok(Some(record)) => tails.observe(
+                record.source,
+                record.source_uid,
+                record.source_seq,
+                &record.payload,
+                Some(walk.head()),
+            ),
+            Ok(None) => break,
+            Err(error) => return torn_or_refused(error, segment, None),
+        }
+    }
     match walk.finish() {
         Ok(verified) => Ok(Walk::Complete(verified)),
         Err(error) => torn_or_refused(error, segment, None),
@@ -255,24 +285,41 @@ fn walk_file(
     anchor: Anchor,
     limit: SegmentLimit,
     pending: Option<&SegmentRecovered>,
+    tails: &mut PersistedTails,
 ) -> Result<(Walk, u64), StartupError> {
     let file = File::open(files.path(index)).map_err(|e| io_error(&e))?;
     let octets = file.metadata().map_err(|e| io_error(&e))?.len();
-    let walk = walk_segment(BufReader::new(file), index, anchor, limit, pending)?;
+    let walk = walk_segment(BufReader::new(file), index, anchor, limit, pending, tails)?;
     Ok((walk, octets))
 }
 
 /// Verify the log based at `base` (`audit_log_path`) and return a sink at
 /// its head, recovering a torn last segment. `limit` bounds every segment,
-/// read and written; auditd's own records carry `own_uid`.
+/// read and written; auditd's own records carry `own_uid`. The sink's
+/// resend check holds the per-source state the walk recovered from every
+/// verified record (crate::resend), so a batch persisted before a stop and
+/// resent after it is recognised.
 ///
 /// # Errors
 /// [`StartupError`]; [`StartupError::is_chain_break`] tells a damaged or
 /// altered log from an operational failure.
 ///
 /// Spec: docs/50 R50-16, §7.5; docs/37 §2; docs/questions/Q-250 items 6, 8;
-/// this module's rules.
+/// this module's rules; crate::resend (A-98; Q-445).
 pub fn open_log(base: &Path, limit: SegmentLimit, own_uid: u32) -> Result<OpenedLog, StartupError> {
+    let mut tails = PersistedTails::new();
+    let mut opened = open_walked(base, limit, own_uid, &mut tails)?;
+    opened.sink.set_tails(tails);
+    Ok(opened)
+}
+
+/// [`open_log`]'s walk, handing every verified record to `tails`.
+fn open_walked(
+    base: &Path,
+    limit: SegmentLimit,
+    own_uid: u32,
+    tails: &mut PersistedTails,
+) -> Result<OpenedLog, StartupError> {
     let mut files = FileSegments::new(base.to_path_buf());
     let indexes = list_segments(base).map_err(StartupError::Listing)?;
     let Some((&last, earlier)) = indexes.split_last() else {
@@ -289,7 +336,7 @@ pub fn open_log(base: &Path, limit: SegmentLimit, own_uid: u32) -> Result<Opened
     let mut anchor = Anchor::Genesis;
     let mut pending: Option<SegmentRecovered> = None;
     for &index in earlier {
-        let (walk, octets) = walk_file(&files, index, anchor, limit, pending.as_ref())?;
+        let (walk, octets) = walk_file(&files, index, anchor, limit, pending.as_ref(), tails)?;
         match walk {
             Walk::Complete(verified) => {
                 pending = None;
@@ -315,7 +362,7 @@ pub fn open_log(base: &Path, limit: SegmentLimit, own_uid: u32) -> Result<Opened
         }
     }
 
-    let (walk, octets) = walk_file(&files, last, anchor, limit, pending.as_ref())?;
+    let (walk, octets) = walk_file(&files, last, anchor, limit, pending.as_ref(), tails)?;
     match walk {
         Walk::Complete(verified) => {
             let storage = FileStorage::open_append(&files.path(last)).map_err(|e| io_error(&e))?;

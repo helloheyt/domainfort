@@ -8,11 +8,13 @@
 //!                               ‖ segment_octets:u64
 //! kind 0x02 PeersRefused     := unmapped:u64 ‖ over_quota:u64 ‖ last_uid:u32
 //! kind 0x03 EventsMisbound   := refused_batches:u64 ‖ last_uid:u32
+//! kind 0x04 ResendsRefused   := mismatched:u64 ‖ unverifiable:u64 ‖ last_uid:u32
 //! torn := 0x01 HeaderTruncated | 0x02 RecordTruncated
 //! ```
 //!
 //! Kind `0x03` was appended for the source binding of the admin-plane
-//! shapes (task A7, crate::binding); kinds `0x01` and `0x02` are unchanged.
+//! shapes (task A7, crate::binding); kind `0x04` for the resend check
+//! (task F8, crate::resend); kinds `0x01` and `0x02` are unchanged.
 //!
 //! Fixed width, big-endian (the convention of the IPC codec and of the log,
 //! docs/50 §3.3; crates/audit-log `format`). Only identifiers and metadata:
@@ -46,6 +48,8 @@ pub const KIND_SEGMENT_RECOVERED: u8 = 0x01;
 pub const KIND_PEERS_REFUSED: u8 = 0x02;
 /// Kind code: [`EventsMisbound`]. Project choice (docs/questions/Q-341).
 pub const KIND_EVENTS_MISBOUND: u8 = 0x03;
+/// Kind code: [`ResendsRefused`]. Project choice (docs/questions/Q-445).
+pub const KIND_RESENDS_REFUSED: u8 = 0x04;
 
 /// Octets of an encoded [`SegmentRecovered`].
 pub const SEGMENT_RECOVERED_LEN: usize = 2 + 8 + 1 + 8 + audit_log::HASH_LEN + 8 + 8;
@@ -53,6 +57,8 @@ pub const SEGMENT_RECOVERED_LEN: usize = 2 + 8 + 1 + 8 + audit_log::HASH_LEN + 8
 pub const PEERS_REFUSED_LEN: usize = 2 + 8 + 8 + 4;
 /// Octets of an encoded [`EventsMisbound`].
 pub const EVENTS_MISBOUND_LEN: usize = 2 + 8 + 4;
+/// Octets of an encoded [`ResendsRefused`].
+pub const RESENDS_REFUSED_LEN: usize = 2 + 8 + 8 + 4;
 
 /// How a segment ends early: the two verifier breaks that mean "the file
 /// stops inside a structure" — a torn write (docs/questions/Q-250 item 8).
@@ -146,6 +152,35 @@ pub struct EventsMisbound {
     pub last_uid: u32,
 }
 
+/// `Append` batches refused since the previous summary because they carry
+/// sequence numbers of their source that auditd has already persisted
+/// without being a byte-identical resend of those events (crate::resend):
+///
+/// * `mismatched` — an event under an already-persisted number differs in
+///   its octets from the persisted one: a forgery or corruption signal;
+/// * `unverifiable` — the batch reuses a number auditd has no persisted
+///   event for in the source's current numbering (a number inside a gap),
+///   or stops short of the last persisted number — no sender's resend does
+///   either.
+///
+/// Counted, like refused connections and misbound batches, so a sender
+/// repeating a refused batch cannot fill the log (A-57: "summarised in
+/// counters").
+///
+/// Spec: docs/50 §8.1 (numbered events, "auditd acknowledges the last
+/// sequence number persisted"), §3.2 ("closed + an audit record");
+/// docs/questions/Q-218 (A-57), Q-252 item 7, Q-432 (A-98, follow-up F8),
+/// Q-445.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResendsRefused {
+    /// Batches refused because an event differs from the persisted one.
+    pub mismatched: u64,
+    /// Batches refused because the overlap could not be verified.
+    pub unverifiable: u64,
+    /// The peer uid of the most recent refused batch.
+    pub last_uid: u32,
+}
+
 /// One auditd record payload.
 ///
 /// Spec: this module's layout.
@@ -157,6 +192,8 @@ pub enum AuditdEvent {
     PeersRefused(PeersRefused),
     /// A summary of batches refused by the source binding.
     EventsMisbound(EventsMisbound),
+    /// A summary of batches refused by the resend check.
+    ResendsRefused(ResendsRefused),
 }
 
 impl AuditdEvent {
@@ -195,6 +232,15 @@ impl AuditdEvent {
                 out.extend_from_slice(&event.last_uid.to_be_bytes());
                 out
             }
+            AuditdEvent::ResendsRefused(event) => {
+                let mut out = Vec::with_capacity(RESENDS_REFUSED_LEN);
+                out.push(AUDITD_EVENT_FORMAT);
+                out.push(KIND_RESENDS_REFUSED);
+                out.extend_from_slice(&event.mismatched.to_be_bytes());
+                out.extend_from_slice(&event.unverifiable.to_be_bytes());
+                out.extend_from_slice(&event.last_uid.to_be_bytes());
+                out
+            }
         }
     }
 }
@@ -207,3 +253,5 @@ const _: () = assert!(SEGMENT_RECOVERED_LEN <= audit_log::MAX_PAYLOAD_LEN);
 const _: () = assert!(PEERS_REFUSED_LEN >= audit_log::MIN_PAYLOAD_LEN);
 const _: () = assert!(EVENTS_MISBOUND_LEN >= audit_log::MIN_PAYLOAD_LEN);
 const _: () = assert!(EVENTS_MISBOUND_LEN <= audit_log::MAX_PAYLOAD_LEN);
+const _: () = assert!(RESENDS_REFUSED_LEN >= audit_log::MIN_PAYLOAD_LEN);
+const _: () = assert!(RESENDS_REFUSED_LEN <= audit_log::MAX_PAYLOAD_LEN);

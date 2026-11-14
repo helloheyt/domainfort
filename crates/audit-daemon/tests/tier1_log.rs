@@ -40,6 +40,8 @@ fn make_job(
             source_uid: 803,
             first_source_seq: first,
             events,
+            numbering: audit_daemon::resend::Numbering::Single,
+            first_on_connection: true,
             reply,
         },
         outcome,
@@ -550,7 +552,7 @@ fn segment_full_rotates_and_the_chain_continues() {
         submitter.submit(job).expect("queued");
         match outcome.blocking_recv().expect("answered") {
             JobOutcome::Persisted(head) => last = head,
-            JobOutcome::Unavailable => panic!("batch {batch} refused"),
+            other => panic!("batch {batch}: {other:?}"),
         }
     }
     drop(submitter);

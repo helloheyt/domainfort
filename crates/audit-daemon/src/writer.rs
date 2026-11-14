@@ -39,6 +39,18 @@
 //!   A-57: noise "summarised in counters"). Batches refused by the source
 //!   binding of the event shapes (crate::binding) are counted and
 //!   summarised the same way, in their own `EventsMisbound` record.
+//! * **Resent batches.** Before appending, the writer asks the resend check
+//!   ([`crate::resend`]) which events of the batch are already persisted —
+//!   a sender resends, with the same numbers, a batch whose acknowledgement
+//!   it lost. Events already persisted are not appended again; a batch that
+//!   is wholly persisted is answered [`JobOutcome::AlreadyPersisted`]; a
+//!   batch that reuses persisted numbers without being their byte-identical
+//!   resend is refused ([`JobOutcome::ResendRefused`]) and counted into an
+//!   `Auditd` `ResendsRefused` record like the other refusals. The check
+//!   runs here, on the one thread that owns the log, so it always sees
+//!   exactly what is persisted (a job still queued from a connection that
+//!   broke is persisted first, and its resend, queued after it, then finds
+//!   it) — decision A-98, follow-up F8; docs/questions/Q-445.
 //! * **A last summary at a clean stop.** When every [`Submitter`] is gone
 //!   (the listener ended: no connection is left to count anything more),
 //!   the counts still pending — refused within the last
@@ -48,9 +60,11 @@
 //!   a [`WriterFailure`] writes nothing more (the segment's tail is unknown).
 //!
 //! Spec: docs/50 R50-7, R50-17, §3.6, §8.1; docs/37 §2, §5; docs/07 §8;
-//! docs/questions/Q-218 (A-57), Q-250 (A-64), Q-265, Q-341 (A-85), Q-396.
+//! docs/questions/Q-218 (A-57), Q-250 (A-64), Q-265, Q-341 (A-85), Q-396,
+//! Q-432 (A-98), Q-445.
 
-use crate::own_event::{AuditdEvent, EventsMisbound, PeersRefused};
+use crate::own_event::{AuditdEvent, EventsMisbound, PeersRefused, ResendsRefused};
+use crate::resend::{Numbering, PersistedTails, Plan, ResendRefusal};
 use crate::segments::SegmentFactory;
 use crate::signing::{NoSignature, UnsignedHeads};
 use audit_log::{AppendError, ChainHead, Entry, LogWriter, Persisted, Source, Timestamp};
@@ -79,7 +93,7 @@ pub const SUMMARY_INTERVAL: Duration = Duration::from_secs(1);
 /// `source` and `source_uid` come from the connection's peer credentials,
 /// never from the payload (docs/50 §3.2).
 ///
-/// Spec: docs/50 §3.2, §8.1; ipc-audit `Append`.
+/// Spec: docs/50 §3.2, §8.1; ipc-audit `Append`; crate::resend.
 pub struct AppendJob {
     /// The sending process, from the `uid → source` map.
     pub source: Source,
@@ -89,6 +103,12 @@ pub struct AppendJob {
     pub first_source_seq: u64,
     /// The events (1 ..= 16, each 1 ..= 8192 octets — ipc-audit `Append`).
     pub events: Vec<EventBytes>,
+    /// Whose numbering the source carries (crate::binding::numbering).
+    pub numbering: Numbering,
+    /// Whether this is the first `Append` on its connection (no batch
+    /// acknowledged on it yet) — the only one a reconnecting sender's resend
+    /// can be.
+    pub first_on_connection: bool,
     /// Where the outcome goes.
     pub reply: oneshot::Sender<JobOutcome>,
 }
@@ -101,18 +121,29 @@ impl fmt::Debug for AppendJob {
             .field("source_uid", &self.source_uid)
             .field("first_source_seq", &self.first_source_seq)
             .field("events", &self.events.len())
+            .field("numbering", &self.numbering)
+            .field("first_on_connection", &self.first_on_connection)
             .finish()
     }
 }
 
 /// What the writer did with a job.
 ///
-/// Spec: docs/50 §8.1.
+/// Spec: docs/50 §8.1; crate::resend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobOutcome {
-    /// Every event is on stable storage; the head is the record holding the
-    /// last event.
+    /// Every event is on stable storage — appended now, except leading
+    /// events that were already persisted; the head is the record holding
+    /// the last event.
     Persisted(ChainHead),
+    /// Every event was already persisted (a resend after a lost
+    /// acknowledgement): nothing was appended; the head is the record
+    /// holding the last event.
+    AlreadyPersisted(ChainHead),
+    /// The batch reuses persisted numbers without being their byte-identical
+    /// resend, for this reason: nothing was appended (the connection answers
+    /// `Refused::Malformed` and closes; the refusal is counted).
+    ResendRefused(ResendRefusal),
     /// Nothing is acknowledged (the connection answers `Unavailable`).
     Unavailable,
 }
@@ -176,6 +207,11 @@ pub struct PeerRefusals {
     /// of the last one.
     misbound: AtomicU64,
     misbound_uid: AtomicU32,
+    /// Batches refused by the resend check (crate::resend), by reason, and
+    /// the uid of the last one.
+    resend_mismatched: AtomicU64,
+    resend_unverifiable: AtomicU64,
+    resend_uid: AtomicU32,
 }
 
 /// Add one to a counter without wrapping.
@@ -205,6 +241,33 @@ impl PeerRefusals {
     pub fn count_misbound(&self, uid: u32) {
         self.misbound_uid.store(uid, Ordering::Relaxed);
         bump(&self.misbound, 1);
+    }
+
+    /// Count an `Append` refused by the resend check (crate::resend).
+    /// Spec: docs/50 §3.2, §8.1; docs/questions/Q-445.
+    pub fn count_resend_refused(&self, uid: u32, reason: ResendRefusal) {
+        self.resend_uid.store(uid, Ordering::Relaxed);
+        match reason {
+            ResendRefusal::Mismatched => bump(&self.resend_mismatched, 1),
+            ResendRefusal::Unverifiable => bump(&self.resend_unverifiable, 1),
+        }
+    }
+
+    /// Take the resend-refusal counts (resetting them), if any.
+    fn take_resends(&self) -> Option<ResendsRefused> {
+        let mismatched = self.resend_mismatched.swap(0, Ordering::Relaxed);
+        let unverifiable = self.resend_unverifiable.swap(0, Ordering::Relaxed);
+        (mismatched > 0 || unverifiable > 0).then(|| ResendsRefused {
+            mismatched,
+            unverifiable,
+            last_uid: self.resend_uid.load(Ordering::Relaxed),
+        })
+    }
+
+    /// Put back resend-refusal counts that could not be recorded.
+    fn restore_resends(&self, summary: ResendsRefused) {
+        bump(&self.resend_mismatched, summary.mismatched);
+        bump(&self.resend_unverifiable, summary.unverifiable);
     }
 
     /// Take the misbound-batch count (resetting it), if any.
@@ -322,7 +385,8 @@ pub fn queue(capacity: usize) -> (Submitter, Inbox) {
 /// number, the factory for the next one, and auditd's own identity for its
 /// records.
 ///
-/// Spec: docs/50 R50-17, §8.1; docs/questions/Q-250 items 5, 6.
+/// Spec: docs/50 R50-17, §8.1; docs/questions/Q-250 items 5, 6;
+/// crate::resend.
 pub struct LogSink<F: SegmentFactory> {
     writer: LogWriter<F::Storage>,
     segment: u64,
@@ -330,22 +394,27 @@ pub struct LogSink<F: SegmentFactory> {
     own_uid: u32,
     own_seq: u64,
     signer: UnsignedHeads,
+    /// The resend check's per-source state (crate::resend).
+    tails: PersistedTails,
 }
 
 impl<F: SegmentFactory> fmt::Debug for LogSink<F> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The resend state holds digests and numbers only (no payload).
         f.debug_struct("LogSink")
             .field("writer", &self.writer)
             .field("segment", &self.segment)
             .field("own_uid", &self.own_uid)
             .field("own_seq", &self.own_seq)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
 impl<F: SegmentFactory> LogSink<F> {
     /// A sink appending to `writer`, which writes segment `segment`; new
-    /// segments come from `factory`; auditd's records carry `own_uid`.
+    /// segments come from `factory`; auditd's records carry `own_uid`. The
+    /// resend check starts empty; a sink opened on an existing log gets the
+    /// state recovered from it ([`crate::recovery::open_log`]).
     #[must_use]
     pub fn new(writer: LogWriter<F::Storage>, segment: u64, factory: F, own_uid: u32) -> Self {
         LogSink {
@@ -355,7 +424,20 @@ impl<F: SegmentFactory> LogSink<F> {
             own_uid,
             own_seq: 0,
             signer: UnsignedHeads,
+            tails: PersistedTails::new(),
         }
+    }
+
+    /// Replace the resend check's state with the one recovered from the
+    /// verified log. Spec: crate::resend; docs/50 §7.5 (A-66).
+    pub(crate) fn set_tails(&mut self, tails: PersistedTails) {
+        self.tails = tails;
+    }
+
+    /// The resend check's per-source state.
+    #[must_use]
+    pub fn tails(&self) -> &PersistedTails {
+        &self.tails
     }
 
     /// The persisted head.
@@ -371,12 +453,14 @@ impl<F: SegmentFactory> LogSink<F> {
     }
 
     /// Append one batch of a sender's events (numbered from
-    /// `first_source_seq`) and sync it.
+    /// `first_source_seq`) and sync it, as given — without the resend check
+    /// ([`LogSink::persist_batch`] runs it first). Once synced, the resend
+    /// check learns the events.
     ///
     /// # Errors
     /// [`PersistError`].
     ///
-    /// Spec: docs/50 §3.2 (source from the transport), §8.1.
+    /// Spec: docs/50 §3.2 (source from the transport), §8.1; crate::resend.
     pub fn append_events(
         &mut self,
         source: Source,
@@ -393,7 +477,58 @@ impl<F: SegmentFactory> LogSink<F> {
                 payload: event.as_bytes(),
             })
             .collect();
-        self.persist(&entries)
+        let persisted = self.persist(&entries)?;
+        // Only now, synced, does the resend check learn the events. The head
+        // the writer returns is the batch's last record's.
+        let last = entries.len().saturating_sub(1);
+        for (index, entry) in entries.iter().enumerate() {
+            self.tails.observe(
+                entry.source,
+                entry.source_uid,
+                entry.source_seq,
+                entry.payload,
+                (index == last).then_some(persisted.head),
+            );
+        }
+        Ok(persisted)
+    }
+
+    /// Persist one `Append` after the resend check (crate::resend): append
+    /// the events not yet persisted; append nothing if every event already
+    /// is; refuse a batch that reuses persisted numbers without being their
+    /// byte-identical resend.
+    ///
+    /// # Errors
+    /// [`PersistError`] (only when something had to be appended).
+    ///
+    /// Spec: docs/50 §8.1; crate::resend; decision A-98 (follow-up F8);
+    /// docs/questions/Q-445.
+    pub fn persist_batch(&mut self, job: &AppendJob) -> Result<JobOutcome, PersistError> {
+        let plan = self.tails.plan(
+            job.source,
+            job.source_uid,
+            job.first_source_seq,
+            &job.events,
+            job.numbering,
+            job.first_on_connection,
+        );
+        match plan {
+            Plan::AlreadyPersisted(head) => Ok(JobOutcome::AlreadyPersisted(head)),
+            Plan::Refuse(reason) => Ok(JobOutcome::ResendRefused(reason)),
+            Plan::Append { skip } => {
+                let rest = job.events.get(skip..).filter(|rest| !rest.is_empty());
+                let first = u64::try_from(skip)
+                    .ok()
+                    .and_then(|skip| job.first_source_seq.checked_add(skip));
+                // `plan` keeps `skip` below the batch's length, so neither is
+                // missing; nothing is appended if one were.
+                let (Some(rest), Some(first)) = (rest, first) else {
+                    return Err(PersistError::Unavailable);
+                };
+                let persisted = self.append_events(job.source, job.source_uid, first, rest)?;
+                Ok(JobOutcome::Persisted(persisted.head))
+            }
+        }
     }
 
     /// Append one of auditd's own records (source `Auditd`, auditd's uid,
@@ -514,18 +649,20 @@ pub fn run<F: SegmentFactory>(mut sink: LogSink<F>, inbox: Inbox) -> Result<(), 
     let result = loop {
         match inbox.queue.recv_timeout(SUMMARY_INTERVAL) {
             Ok(job) => {
-                let outcome = sink.append_events(
-                    job.source,
-                    job.source_uid,
-                    job.first_source_seq,
-                    &job.events,
-                );
+                let outcome = sink.persist_batch(&job);
                 // A dropped receiver means the connection closed: the batch
-                // is persisted anyway, and the sender resends it (Q-252
-                // item 7: twice, never zero times).
+                // is persisted anyway, and the sender resends it — which the
+                // resend check then acknowledges without appending it again
+                // (crate::resend; A-98).
                 match outcome {
-                    Ok(persisted) => {
-                        let _ = job.reply.send(JobOutcome::Persisted(persisted.head));
+                    Ok(answer) => {
+                        if let JobOutcome::ResendRefused(reason) = answer {
+                            inbox
+                                .shared
+                                .refusals
+                                .count_resend_refused(job.source_uid, reason);
+                        }
+                        let _ = job.reply.send(answer);
                     }
                     Err(PersistError::Unavailable) => {
                         let _ = job.reply.send(JobOutcome::Unavailable);
@@ -557,12 +694,13 @@ pub fn run<F: SegmentFactory>(mut sink: LogSink<F>, inbox: Inbox) -> Result<(), 
     result
 }
 
-/// Write a refused-connection summary if any connection was refused, and a
+/// Write a refused-connection summary if any connection was refused, a
 /// misbound-batch summary if any batch was refused by the source binding,
-/// when the last summary is at least [`SUMMARY_INTERVAL`] old.
+/// and a resend summary if any batch was refused by the resend check, when
+/// the last summary is at least [`SUMMARY_INTERVAL`] old.
 ///
 /// Spec: docs/50 §3.2; docs/questions/Q-218 (A-57); docs/questions/Q-265
-/// item 8; docs/51 §5.7; docs/questions/Q-341.
+/// item 8; docs/51 §5.7; docs/questions/Q-341, Q-445.
 fn record_refusals<F: SegmentFactory>(
     sink: &mut LogSink<F>,
     refusals: &PeerRefusals,
@@ -578,8 +716,9 @@ fn record_refusals<F: SegmentFactory>(
 }
 
 /// The last summary of a clean stop: write every non-zero pending count —
-/// refused connections (`PeersRefused`) and misbound batches
-/// (`EventsMisbound`) — now, regardless of [`SUMMARY_INTERVAL`] (the
+/// refused connections (`PeersRefused`), misbound batches
+/// (`EventsMisbound`) and batches refused by the resend check
+/// (`ResendsRefused`) — now, regardless of [`SUMMARY_INTERVAL`] (the
 /// interval bounds how often a flood is written while auditd serves; after
 /// the stop there is no flood left to bound). Nothing pending ⇒ nothing is
 /// written, so a stop adds no record of its own.
@@ -602,13 +741,14 @@ fn record_last_refusals<F: SegmentFactory>(
     write_refusal_summaries(sink, refusals).map(|_| ())
 }
 
-/// Append a `PeersRefused` record if any connection was refused and an
-/// `EventsMisbound` record if any batch was refused, taking (resetting) the
-/// counts; a count whose record is refused transiently is put back. `true`
-/// if anything was recorded.
+/// Append a `PeersRefused` record if any connection was refused, an
+/// `EventsMisbound` record if any batch was refused by the source binding,
+/// and a `ResendsRefused` record if any batch was refused by the resend
+/// check, taking (resetting) the counts; a count whose record is refused
+/// transiently is put back. `true` if anything was recorded.
 ///
 /// Spec: docs/50 §3.2; docs/questions/Q-218 (A-57); docs/questions/Q-265
-/// item 8; docs/51 §5.7; docs/questions/Q-341.
+/// item 8; docs/51 §5.7; docs/questions/Q-341, Q-445.
 fn write_refusal_summaries<F: SegmentFactory>(
     sink: &mut LogSink<F>,
     refusals: &PeerRefusals,
@@ -625,6 +765,13 @@ fn write_refusal_summaries<F: SegmentFactory>(
         match sink.append_own(&AuditdEvent::EventsMisbound(summary)) {
             Ok(_) => recorded = true,
             Err(PersistError::Unavailable) => refusals.restore_misbound(summary),
+            Err(PersistError::Fatal(failure)) => return Err(failure),
+        }
+    }
+    if let Some(summary) = refusals.take_resends() {
+        match sink.append_own(&AuditdEvent::ResendsRefused(summary)) {
+            Ok(_) => recorded = true,
+            Err(PersistError::Unavailable) => refusals.restore_resends(summary),
             Err(PersistError::Fatal(failure)) => return Err(failure),
         }
     }

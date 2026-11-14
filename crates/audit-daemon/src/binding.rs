@@ -29,9 +29,15 @@
 //! **not** bound and is stored as before (decided on docs/questions/Q-341:
 //! option (a) — "opaque payloads keep their current behaviour").
 //!
+//! The table also says whose sequence numbering a source carries, for the
+//! resend check (crate::resend): under [`PRODUCTION`] every source is one
+//! sender's; a table that binds to one source the shapes of senders
+//! [`PRODUCTION`] keeps apart declares that source shared ([`numbering`]).
+//!
 //! Spec: docs/50 §3.2, §4.2, §8.1, R50-3; docs/51 §5.7 (R51-12, A-72);
-//! docs/questions/Q-252 item 8, Q-341 (option (a)).
+//! docs/questions/Q-252 item 8, Q-341 (option (a)), Q-445.
 
+use crate::resend::Numbering;
 use audit_log::Source;
 use ipc_audit::{peek_shape, EventBytes, EventShape};
 
@@ -110,4 +116,37 @@ pub fn batch_permitted_under(table: BindingTable, source: Source, events: &[Even
     events
         .iter()
         .all(|event| permits_under(table, source, event))
+}
+
+/// Whose sequence numbering `source` carries under `table`, for the resend
+/// check (crate::resend).
+///
+/// [`Numbering::Shared`] when `table` binds to `source` two shapes whose
+/// senders differ under [`PRODUCTION`] — several processes then send under
+/// the one label, each numbering its events from 1 (the single-uid test
+/// harness, docs/questions/Q-432 residual). Otherwise
+/// [`Numbering::Single`]; under [`PRODUCTION`] itself every source is
+/// `Single` (R50-3: one source per uid; each daemon has one window —
+/// dird's LDAP and admin events share it, A-85).
+///
+/// Spec: this module's table; docs/50 §3.2, R50-3; docs/questions/Q-341
+/// (A-85), Q-432, Q-445 item 5.
+#[must_use]
+pub fn numbering(table: BindingTable, source: Source) -> Numbering {
+    let mut sender: Option<Source> = None;
+    for &shape in EventShape::ALL {
+        if table(shape) != Some(source) {
+            continue;
+        }
+        // `WindowSummary` comes from every sender: it names none.
+        let Some(own) = PRODUCTION(shape) else {
+            continue;
+        };
+        match sender {
+            Some(first) if first != own => return Numbering::Shared,
+            Some(_) => {}
+            None => sender = Some(own),
+        }
+    }
+    Numbering::Single
 }
