@@ -392,6 +392,10 @@ pub fn ldap_event() -> EventBody {
         time: calendar(),
         connection_id: 7,
         source_zone: ipc_audit::IpZone::Internal,
+        // The address ldap-front reported (docs/52 R14; test data).
+        reported_peer: ipc_audit::ReportedAddress::new(core::net::IpAddr::V4(
+            core::net::Ipv4Addr::new(10, 0, 0, 7),
+        )),
         transport: ipc_audit::LdapTransport::Ldaps,
         transport_sec: ipc_audit::TransportSecurity {
             encrypted: true,

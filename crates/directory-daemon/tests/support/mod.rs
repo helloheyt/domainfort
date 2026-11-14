@@ -38,9 +38,8 @@ pub use keyd::{eventually, my_uid, skip_as_root, FakeAuditd, TempDir, TestClock}
 use ad_schema::{flags::user_account_control as uac, phase1, Phase1Schema};
 use core::time::Duration;
 use directory_daemon::policy::{DevelopmentPolicy, MandatoryFast};
-use directory_daemon::zones::Network;
 use directory_daemon::{
-    serve, AuditEndpoint, DaemonControl, DaemonParams, SharedClock, StoreSource, ZoneTable,
+    serve, AuditEndpoint, DaemonControl, DaemonParams, SharedClock, StoreSource,
     ENGINE_QUEUE_CAPACITY, LDAP_QUEUE_CAPACITY, MAX_LDAP_SESSIONS,
 };
 use directory_pip::NamingContext;
@@ -353,15 +352,6 @@ pub fn policy(version: u64) -> DevelopmentPolicy {
     }
 }
 
-/// dird's zone table in the tests: 10.0.0.0/8 is internal (test data).
-pub fn zones() -> ZoneTable {
-    ZoneTable::new(vec![Network::new(
-        core::net::IpAddr::V4(core::net::Ipv4Addr::new(10, 0, 0, 0)),
-        8,
-    )
-    .unwrap()])
-}
-
 /// dird's parameters in `dir`: `d.sock`, kdc uid `kdc_uid`, auditd at
 /// `a.sock` as `auditd_uid`, view lifetime `lifetime`, `max_views` views;
 /// the LDAP channel at `l.sock` for the same uid as the kdc's, the daemon's
@@ -392,7 +382,6 @@ pub fn params(
         max_ldap_sessions: MAX_LDAP_SESSIONS,
         ldap_queue_capacity: LDAP_QUEUE_CAPACITY,
         dns_host_name: String::from("dc1.example.org"),
-        zones: zones(),
         audit_window: ipc_audit::WindowConfig::DEFAULT,
         clock: SharedClock::system(),
     }

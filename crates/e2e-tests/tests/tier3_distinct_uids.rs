@@ -227,7 +227,6 @@ fn deploy_and_check(base: &Path) -> Result<(), String> {
         max_ldap_sessions: directory_daemon::MAX_LDAP_SESSIONS,
         ldap_queue_capacity: directory_daemon::LDAP_QUEUE_CAPACITY,
         dns_host_name: String::from(DNS_HOST_NAME),
-        zones: loopback_internal(),
         audit_window: ipc_audit::WindowConfig::DEFAULT,
         clock: SharedClock::new(FixedTime),
     };
@@ -275,6 +274,7 @@ fn deploy_and_check(base: &Path) -> Result<(), String> {
         },
         timeouts: front_timeouts(),
         limits: ldap_front::ConnectionLimits::DEFAULT,
+        internal_networks: loopback_internal(),
     };
     let front = as_account(FRONT_UID, move || Front::start(front_params, tls))?;
 

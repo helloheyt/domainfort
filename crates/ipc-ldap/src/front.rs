@@ -56,7 +56,7 @@
 use crate::channel::{
     ConnectionAction, Listener, LDAP_CHANNEL, MAX_REPLY_OCTETS, MAX_RESPONSES, MAX_RESPONSE_MESSAGE,
 };
-use crate::wire::{LdapReply, LdapRequest, MessageRequest, TransportFacts};
+use crate::wire::{LdapReply, LdapRequest, MessageRequest, ReportedPeer, TransportFacts};
 use core::fmt;
 use core::net::IpAddr;
 use ipc::{decode_reply, encode_frame, Direction, EncodedFrame, Refused, Reply};
@@ -322,12 +322,14 @@ impl FrontChannel {
         }
     }
 
-    /// `Open { listener, peer_addr }` — the first request.
+    /// `Open { listener, reported_peer }` — the first request. `peer_addr`
+    /// is the client address the front's socket gave it; dird keeps it for
+    /// the audit record only (crate::wire `ReportedPeer`; docs/52 R14).
     ///
     /// # Errors
     /// [`ChannelFailure::OutOfSequence`] unless the channel is new.
     ///
-    /// Spec: docs/50 §4.2.
+    /// Spec: docs/50 §4.2; docs/52 §7 R14.
     pub fn encode_open(
         &mut self,
         listener: Listener,
@@ -338,7 +340,7 @@ impl FrontChannel {
             State::AwaitOpened,
             &LdapRequest::Open {
                 listener,
-                peer_addr,
+                reported_peer: ReportedPeer::new(peer_addr),
             },
         )
     }

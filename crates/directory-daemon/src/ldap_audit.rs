@@ -9,7 +9,10 @@
 //! PEP, not by the front"): dird moves it into the sender window
 //! (`ipc_audit::SendWindow`) as an `LdapEvent` (ipc-audit's `ldap` feature),
 //! from which the audit client (crate::audit_link) delivers it to auditd
-//! over `audit.sock` (R50-17, §8.1).
+//! over `audit.sock` (R50-17, §8.1). The record also keeps the client
+//! address the front reported in `Open` — as `reported_peer`, an unverified
+//! observation: the event's zone is the front's, from its peer uid, and
+//! the engine never saw the address (docs/52 R14).
 //!
 //! # LDAP operations are gating
 //!
@@ -60,8 +63,9 @@ use core::future::Future;
 use core::time::Duration;
 use ipc_audit::{
     Ack, AckedIntent, Append, DirAdminEvent, EventBody, FlushWait, IntentRecord, LdapEvent,
-    PendingIntent, Reservation, Unflushed, WindowConfig, WindowError,
+    PendingIntent, ReportedAddress, Reservation, Unflushed, WindowConfig, WindowError,
 };
+use ipc_ldap::ReportedPeer;
 use ldap::{AuditEvent, AuditOperation};
 use std::time::Instant;
 use tokio::sync::Notify;
@@ -78,9 +82,14 @@ pub fn is_noise(event: &AuditEvent) -> bool {
     )
 }
 
-/// The wire event of one LDAP event. Spec: crates/ipc-audit convert.rs.
-fn event_of(event: &AuditEvent) -> EventBody {
-    EventBody::Ldap(Box::new(LdapEvent::from(event)))
+/// The wire event of one LDAP event, with the address the front reported
+/// for the connection (unverified — docs/52 R14).
+/// Spec: crates/ipc-audit convert.rs; docs/52 §7 R14.
+fn event_of(event: &AuditEvent, reported_peer: ReportedPeer) -> EventBody {
+    EventBody::Ldap(Box::new(LdapEvent::from_engine(
+        event,
+        ReportedAddress::new(reported_peer.unverified_address()),
+    )))
 }
 
 /// The event of an operation could not be put into the window: its
@@ -126,22 +135,30 @@ impl AuditGate {
         self.core.release(reservation);
     }
 
-    /// Put the event of the operation that just ran into the window (module
+    /// Put the event of the operation that just ran into the window, with
+    /// the client address the front reported for the connection (module
     /// documentation).
     ///
     /// # Errors
     /// [`RecordLost`]: the event could not be committed — its responses
     /// must not be sent.
     ///
-    /// Spec: docs/questions/Q-218 (A-57), Q-252 items 8, 9 (A-64).
-    pub fn record(&self, reservation: Reservation, event: &AuditEvent) -> Result<(), RecordLost> {
+    /// Spec: docs/questions/Q-218 (A-57), Q-252 items 8, 9 (A-64); docs/52
+    /// R14.
+    pub fn record(
+        &self,
+        reservation: Reservation,
+        event: &AuditEvent,
+        reported_peer: ReportedPeer,
+    ) -> Result<(), RecordLost> {
+        let body = event_of(event, reported_peer);
         let result = if is_noise(event) {
             self.core.release(reservation);
-            self.core.offer_noise(&event_of(event));
+            self.core.offer_noise(&body);
             Ok(())
         } else {
             self.core
-                .commit(reservation, &event_of(event))
+                .commit(reservation, &body)
                 .map(|_sequence| ())
                 .map_err(|_| RecordLost)
         };

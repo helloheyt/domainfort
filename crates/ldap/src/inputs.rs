@@ -20,7 +20,8 @@ use kdc::AccountSource;
 use krb_proto::KerberosTime;
 use pdp::{IpScope, Pip, PolicySnapshot, RlKey};
 
-/// What the front observed about the transport when it framed this message.
+/// The transport facts of this message: the zone the caller derived, and
+/// what the front observed when it framed the message.
 ///
 /// Deliberately absent: any "channel binding verified" fact. Only keyd's
 /// verification of the channel binding inside a GSSAPI bind may set
@@ -33,8 +34,11 @@ use pdp::{IpScope, Pip, PolicySnapshot, RlKey};
 /// Spec: docs/49 §4.3, §4.4, §11; RFC 4511 §4.14.1; A-47.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransportReport {
-    /// The network zone of the peer. Spec: docs/11 §1 (`Context.src_net`);
-    /// docs/15 §6.
+    /// The network zone of the peer, as the **caller** derives it — never a
+    /// value the front reports: dird gives the zone of the front the client
+    /// came through, from the front's peer uid (docs/52 §3.3 C3, §7 R14;
+    /// crates/ipc-ldap-server `FrontZone`). Spec: docs/11 §1
+    /// (`Context.src_net`); docs/15 §6.
     pub src_net: IpScope,
     /// A TLS layer with an AEAD cipher suite (docs/02 §4) protects the
     /// octets of this message. Must agree with the session's state, which

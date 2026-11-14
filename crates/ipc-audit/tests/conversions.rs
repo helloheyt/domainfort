@@ -13,7 +13,8 @@ use ipc_audit::{
     decode_event, encode_event, BindMechanism, CodecErrorCode, CodecLimit, EventBody, IpZone,
     KdcEvent, KdcExchange, KdcOutcome, KdcReason, KdcTransport, KeyPurposeCode, KeydOperation,
     KeydOutcome, KeydReason, KeydRecord, KeydRole, LdapAction, LdapEvent, LdapOperation,
-    LdapReason, LdapTarget, LdapTransport, PdpReasonCode, SearchScope, UnsupportedOpCode,
+    LdapReason, LdapTarget, LdapTransport, PdpReasonCode, ReportedAddress, SearchScope,
+    UnsupportedOpCode,
 };
 use krb_proto::{KerberosString, KerberosTime, PrincipalName};
 
@@ -370,12 +371,28 @@ fn ldap_source() -> ldap::AuditEvent {
     }
 }
 
-/// crates/ldap `AuditEvent` → [`LdapEvent`]: every field.
+/// The client address ldap-front reported (test data): dird passes it
+/// beside the engine's event (docs/52 R14).
+fn reported() -> ReportedAddress {
+    ReportedAddress::new(core::net::IpAddr::V6(core::net::Ipv6Addr::new(
+        0xfd00, 0x1234, 0, 0, 0, 0, 0, 9,
+    )))
+}
+
+/// The conversion of `event` with [`reported`].
+fn convert(event: &ldap::AuditEvent) -> LdapEvent {
+    LdapEvent::from_engine(event, reported())
+}
+
+/// crates/ldap `AuditEvent` → [`LdapEvent`]: every field, and the reported
+/// client address beside it (docs/52 R14: an unverified observation, kept
+/// as given and independent of the zone).
 #[test]
 fn ldap_event_converts() {
-    let wire = LdapEvent::from(&ldap_source());
+    let wire = convert(&ldap_source());
     assert_eq!(wire.connection_id, 99);
     assert_eq!(wire.source_zone, IpZone::External);
+    assert_eq!(wire.reported_peer, reported());
     assert_eq!(wire.transport, LdapTransport::Ldaps);
     assert!(wire.transport_sec.encrypted);
     assert!(!wire.transport_sec.sealed);
@@ -419,7 +436,7 @@ fn ldap_bind_converts() {
         reason: ldap::AuditReason::SaslWithoutTls,
         ..ldap_source()
     };
-    let wire = LdapEvent::from(&source);
+    let wire = convert(&source);
     let bind = wire.bind.as_ref().unwrap();
     assert_eq!(bind.version, 3);
     match &bind.mechanism {
@@ -439,7 +456,7 @@ fn ldap_bind_converts() {
         reason: ldap::AuditReason::SimplePasswordBind,
         ..ldap_source()
     };
-    let wire = LdapEvent::from(&source);
+    let wire = convert(&source);
     assert_eq!(
         wire.bind.as_ref().unwrap().mechanism,
         BindMechanism::SimplePassword
@@ -457,7 +474,7 @@ fn ldap_details_convert() {
         )),
         ..ldap_source()
     };
-    let wire = LdapEvent::from(&source);
+    let wire = convert(&source);
     assert_eq!(wire.reason, LdapReason::Malformed);
     let codec = wire.codec_error.unwrap();
     assert_eq!(codec.error, CodecErrorCode::LimitExceeded);
@@ -468,7 +485,7 @@ fn ldap_details_convert() {
         reason: ldap::AuditReason::Malformed(parse_ldap::Error::NonCanonical),
         ..ldap_source()
     };
-    let codec = LdapEvent::from(&source).codec_error.unwrap();
+    let codec = convert(&source).codec_error.unwrap();
     assert_eq!(codec.error, CodecErrorCode::NonCanonical);
     assert_eq!(codec.limit, None);
 
@@ -477,7 +494,7 @@ fn ldap_details_convert() {
         reason: ldap::AuditReason::PolicyDenied(pdp::ReasonCode::Acl),
         ..ldap_source()
     };
-    let wire = LdapEvent::from(&source);
+    let wire = convert(&source);
     assert_eq!(
         wire.operation,
         LdapOperation::NotSupported(UnsupportedOpCode::DelRequest)
@@ -494,7 +511,7 @@ fn ldap_details_convert() {
 fn ldap_filter_attrs_truncate() {
     let mut source = ldap_source();
     source.search.as_mut().unwrap().filter_attrs = vec!["cn"; 20];
-    let wire = LdapEvent::from(&source);
+    let wire = convert(&source);
     let search = wire.search.as_ref().unwrap();
     assert_eq!(search.filter_attrs().len(), ipc_audit::MAX_FILTER_ATTRS);
     assert!(search.filter_attrs_truncated());
@@ -522,6 +539,6 @@ fn ldap_reason_names_match_the_source() {
             reason,
             ..ldap_source()
         };
-        assert_eq!(LdapEvent::from(&event).reason.name(), format!("{reason:?}"));
+        assert_eq!(convert(&event).reason.name(), format!("{reason:?}"));
     }
 }

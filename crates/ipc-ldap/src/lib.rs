@@ -28,7 +28,7 @@
 //!
 //! | dir | kind | message | fields | reply |
 //! |---|---|---|---|---|
-//! | → dird | `0x01` | `Open` | `listener: Ldap\|Ldaps`, `peer_addr: IPv4\|IPv6` | `0x81` `Opened { framing }` |
+//! | → dird | `0x01` | `Open` | `listener: Ldap\|Ldaps`, `reported_peer: IPv4\|IPv6` | `0x81` `Opened { framing }` |
 //! | → dird | `0x02` | `Message` | `canonical: bytes<1 MiB>`, `tls_established: bool`, `input_pending: bool` | `0x82` `Response { part, more }` × n, then `0x83` `Done { action, framing }` |
 //! | → dird | `0x03` | `TlsEstablished` | — | `0x84` `TlsAccepted { framing }` |
 //! | → dird | `0x04` | `Close` | — | none |
@@ -41,10 +41,14 @@
 //! a bound identity or a channel binding** (A-47; A-54 / Q-190 item 11: "no
 //! `channel_binding_verified` flag from the front; only keyd decides"): the
 //! front reports only whether TLS protects the message and whether more
-//! octets are pending; the client's zone is derived by dird from the peer
-//! address through **its own** zone table (docs/50 §4.2); the
-//! tls-server-end-point value is computed by dird from the configured
-//! certificate (R50-13, L6b — not in phase 1).
+//! octets are pending. **No field lets the front assert the client's zone**
+//! (docs/52 §3.3 C3, §7 R14; A-102 on docs/questions/Q-469 (b)): dird takes
+//! the zone from the peer uid of the channel connection (the front's
+//! identity, R50-3) — phase 1 has one front, the internal one — and the
+//! client address in `Open` is a [`ReportedPeer`], an unverified observation
+//! kept for the audit record only. The tls-server-end-point value is
+//! computed by dird from the configured certificate (R50-13, L6b — not in
+//! phase 1).
 //!
 //! # Bounds (crate::channel)
 //!
@@ -100,5 +104,6 @@ pub use front::{
 #[cfg(unix)]
 pub use unix::{UnixConnection, UnixConnector};
 pub use wire::{
-    split_response, LdapReply, LdapRequest, MessageRequest, ResponsePart, TransportFacts,
+    split_response, LdapReply, LdapRequest, MessageRequest, ReportedPeer, ResponsePart,
+    TransportFacts,
 };

@@ -46,6 +46,10 @@ pub enum Note {
     /// A connection was closed at once: the global, per-source or
     /// unauthenticated connection bound is reached.
     ConnectionLimited,
+    /// A connection was closed at once: its source address is outside every
+    /// internal network (phase 1 has no external LDAP connection — docs/52
+    /// R14; A-102 on docs/questions/Q-469 (b)).
+    SourceNotInternal,
     /// A TLS handshake failed or did not finish in time.
     HandshakeFailed,
     /// A TLS handshake finished with parameters outside docs/50 R50-11.
@@ -78,6 +82,9 @@ impl Note {
             Note::DirdVerified => "dird LDAP channel verified",
             Note::Listening => "listening",
             Note::ConnectionLimited => "connection closed: connection limit reached",
+            Note::SourceNotInternal => {
+                "connection closed: source address outside the internal networks"
+            }
             Note::HandshakeFailed => "connection closed: TLS handshake failed or timed out",
             Note::TlsParametersRefused => {
                 "connection closed: negotiated TLS parameters outside the configured profile"
@@ -141,6 +148,7 @@ impl Thinned {
 
 /// The front's counters (process-wide).
 pub(crate) static CONNECTION_LIMITED: Thinned = Thinned::new(Note::ConnectionLimited);
+pub(crate) static SOURCE_NOT_INTERNAL: Thinned = Thinned::new(Note::SourceNotInternal);
 pub(crate) static HANDSHAKE_FAILED: Thinned = Thinned::new(Note::HandshakeFailed);
 pub(crate) static TLS_PARAMETERS_REFUSED: Thinned = Thinned::new(Note::TlsParametersRefused);
 pub(crate) static NOT_LDAP: Thinned = Thinned::new(Note::NotLdap);
@@ -155,6 +163,9 @@ pub(crate) static ACCEPT_FAILED: Thinned = Thinned::new(Note::AcceptFailed);
 pub struct Counts {
     /// Connections closed at a connection bound.
     pub connection_limited: u64,
+    /// Connections closed because their source is not internal (docs/52
+    /// R14).
+    pub source_not_internal: u64,
     /// TLS handshakes that failed or timed out.
     pub handshake_failed: u64,
     /// Handshakes whose parameters were refused.
@@ -174,6 +185,7 @@ pub struct Counts {
 pub fn counts() -> Counts {
     Counts {
         connection_limited: CONNECTION_LIMITED.count(),
+        source_not_internal: SOURCE_NOT_INTERNAL.count(),
         handshake_failed: HANDSHAKE_FAILED.count(),
         tls_parameters_refused: TLS_PARAMETERS_REFUSED.count(),
         not_ldap: NOT_LDAP.count(),

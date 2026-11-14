@@ -482,6 +482,7 @@ fn the_start_up_checks() {
         },
         timeouts: test_timeouts(),
         limits: ldap_front::ConnectionLimits::DEFAULT,
+        internal_networks: world::loopback_internal(),
     };
     let no_auditd = Front::start(params.clone(), tls_support::server_config_for(&pki));
     assert!(no_auditd.err().unwrap().contains("auditd"));
@@ -498,6 +499,88 @@ fn the_start_up_checks() {
         refused.err(),
         Some(DaemonError::TlsPolicy(ldap_front::tls::PolicyField::Tickets).to_string())
     );
+}
+
+/// docs/52 §7 R14; A-102 on docs/questions/Q-469 (b) ("one front per zone;
+/// external LDAP connections are not in phase 1"): a listener whose local
+/// address is outside every internal network is not served — `serve`
+/// refuses before it contacts anything, whoever bound the listener (here
+/// the test, on loopback, with a zone table of 10.0.0.0/8 only — test
+/// data).
+#[test]
+fn a_listener_outside_the_internal_networks_is_not_served() {
+    let dir = world::dird_support::TempDir::new();
+    let uid = world::dird_support::my_uid(&dir);
+    if world::dird_support::skip_as_root(uid) {
+        return;
+    }
+    let pki = tls_support::pki();
+    let params = FrontParams {
+        dird: Endpoint {
+            socket: dir.join("l.sock"),
+            uid,
+        },
+        audit: Endpoint {
+            socket: dir.join("a.sock"),
+            uid,
+        },
+        timeouts: test_timeouts(),
+        limits: ldap_front::ConnectionLimits::DEFAULT,
+        internal_networks: vec![config::Network::new(
+            core::net::IpAddr::V4(core::net::Ipv4Addr::new(10, 0, 0, 0)),
+            8,
+        )
+        .unwrap()],
+    };
+    let refused = Front::start(params, tls_support::server_config_for(&pki));
+    assert_eq!(
+        refused.err(),
+        Some(DaemonError::ListenerNotInternal.to_string())
+    );
+}
+
+/// docs/52 §7 R14; A-102 on docs/questions/Q-469 (b); docs/50 §4.1 (CIDR →
+/// Internal): with a zone table of exactly 127.0.0.1/32 (test data), a
+/// client whose source is 127.0.0.1 is served, and one whose source is
+/// 127.0.0.2 — outside the table — is closed at once without a byte and
+/// counted (`source_not_internal`), before any slot or dird session.
+/// 127.0.0.2 is a local address where the whole 127/8 is (Linux); where it
+/// is not (macOS has only 127.0.0.1 without extra configuration), only the
+/// served half runs. tokio 1.54.1 docs.rs: `net::TcpSocket::{new_v4, bind,
+/// connect}`, `net::TcpStream::into_std`.
+#[test]
+fn a_source_outside_the_internal_networks_is_closed() {
+    let host = |last| core::net::IpAddr::V4(core::net::Ipv4Addr::new(127, 0, 0, last));
+    let Some(w) = world(|p| {
+        p.internal_networks = vec![config::Network::new(host(1), 32).unwrap()];
+    }) else {
+        return;
+    };
+    let mut inside = tcp(w.front.ldap);
+    inside.write_all(&root_dse(1)).unwrap();
+    let mut reader = LdapReader::default();
+    let _ = reader.next(&mut inside).unwrap();
+    assert_eq!(
+        result_code(&reader.next(&mut inside).unwrap()),
+        ResultCode::Success
+    );
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    if socket.bind(core::net::SocketAddr::new(host(2), 0)).is_err() {
+        return; // no second loopback address on this host
+    }
+    let before = counts().source_not_internal;
+    let outside = runtime.block_on(socket.connect(w.front.ldap)).unwrap();
+    let mut outside = outside.into_std().unwrap();
+    outside.set_nonblocking(false).unwrap();
+    outside.set_read_timeout(Some(LONG)).unwrap();
+    let _ = outside.write_all(&root_dse(2));
+    assert_eq!(closed(&mut outside), Ok(()));
+    assert!(counts().source_not_internal > before);
 }
 
 /// Repeat `attempt` until it returns `true` or `limit` passes.

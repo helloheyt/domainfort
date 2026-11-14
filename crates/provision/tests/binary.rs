@@ -78,6 +78,9 @@ fn args(input: &provision::DomainInput) -> Vec<String> {
     }
     push("--kdc-listen", input.network.kdc_listen[0].clone());
     push("--ldaps-listen", input.network.ldaps_listen[0].clone());
+    for network in &input.network.internal_networks {
+        push("--internal-network", network.clone());
+    }
     v
 }
 

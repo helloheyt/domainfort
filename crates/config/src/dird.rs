@@ -4,7 +4,12 @@
 //! R50-1, R50-2). It serves three channels — `dird-kdc.sock`,
 //! `dird-ldap.sock`, `dird-admin.sock` — each admitting exactly one peer uid
 //! (§3.2), loads the signed policy store (which carries the TierMap, A-36)
-//! (§7.2), and maps LDAP peer addresses through its **own** zone table (§4.2).
+//! (§7.2). dird has **no zone table**: the zone of an LDAP client is the zone
+//! of the front it came through, derived from the peer uid of the
+//! `dird-ldap.sock` connection — phase 1 has one front, the internal one
+//! (docs/52 §7 R14; A-102 on docs/questions/Q-469 (b)) — never from an address
+//! the front reports, so `internal_networks` is not a dird key
+//! (docs/questions/Q-580).
 //!
 //! **No secrets.** The dirstore `IntegrityKey` is never a setting (docs/50
 //! §7.4: "never in a readable file next to the DB"). Q-213 → A-57 decided
@@ -29,10 +34,10 @@ use crate::format::Document;
 use crate::limits::{Bound, ADMIN_QUORUM, ADMIN_TICKET_AGE_MAX_SECS, FRAME_TIMEOUT_SECS};
 use crate::schema::{
     self, Account, Distinct, Endpoint, AUDITD_UID, AUDIT_SOCKET, DIRD_ADMIN_SOCKET,
-    DIRD_KDC_SOCKET, DIRD_LDAP_SOCKET, FRAME_TIMEOUT, INTERNAL_NETWORKS, KEYD_SOCKET, KEYD_UID,
-    POLICY_STORE_PATH, RUN_AS_GID, RUN_AS_UID,
+    DIRD_KDC_SOCKET, DIRD_LDAP_SOCKET, FRAME_TIMEOUT, KEYD_SOCKET, KEYD_UID, POLICY_STORE_PATH,
+    RUN_AS_GID, RUN_AS_UID,
 };
-use crate::value::{self, AbsolutePath, NamingContextLabels, Network, NODE_ID_OCTETS};
+use crate::value::{self, AbsolutePath, NamingContextLabels, NODE_ID_OCTETS};
 
 /// Key: the realm. Spec: docs/50 §7.1; A-55 (must match the naming context).
 const REALM: &str = "realm";
@@ -197,7 +202,6 @@ pub struct DirdSettings {
     keyd: Option<Endpoint>,
     node_id: Option<[u8; NODE_ID_OCTETS]>,
     admin_service: Option<AdminServiceSettings>,
-    internal_networks: Vec<Network>,
     audit: Endpoint,
     frame_timeout: Duration,
     view_lifetime: Duration,
@@ -240,7 +244,6 @@ impl DirdSettings {
         ADMIN_TICKET_AGE_MAX,
         ADMIN_QUORUM_KEY,
         PROVISION_MANIFEST,
-        INTERNAL_NETWORKS,
         AUDIT_SOCKET,
         AUDITD_UID,
         FRAME_TIMEOUT,
@@ -261,8 +264,9 @@ impl DirdSettings {
     /// (`IncompletePair`); `keyd_socket` with `keyd_uid` (both or neither —
     /// without them dird's admin service does not start, the rest of dird
     /// runs); `node_id` (32 lower-case hex digits, not all zero);
-    /// `internal_networks` (absent ⇒ every peer is `External`),
-    /// `frame_timeout` (5s), `view_lifetime` (5s).
+    /// `frame_timeout` (5s), `view_lifetime` (5s). `internal_networks` is
+    /// not a dird key (no zone table — docs/52 R14): it is refused as an
+    /// unknown key.
     ///
     /// # Errors
     /// Any rule of the format or of this schema (see [`crate::ErrorKind`]).
@@ -382,9 +386,6 @@ impl DirdSettings {
             }
             None
         };
-        let internal_networks = doc
-            .optional(INTERNAL_NETWORKS, |text| value::list(text, value::network))?
-            .map_or_else(Vec::new, |located| located.value);
         let audit = schema::endpoint(&doc, &mut all, AUDIT_SOCKET, AUDITD_UID)?;
         let frame_timeout = schema::duration(&doc, FRAME_TIMEOUT, FRAME_TIMEOUT_SECS)?;
         let view_lifetime = schema::duration(&doc, VIEW_LIFETIME, VIEW_LIFETIME_SECS)?;
@@ -404,7 +405,6 @@ impl DirdSettings {
             keyd,
             node_id: node_id.map(|located| located.value),
             admin_service,
-            internal_networks,
             audit,
             frame_timeout,
             view_lifetime,
@@ -511,13 +511,6 @@ impl DirdSettings {
     #[must_use]
     pub fn admin_service(&self) -> Option<&AdminServiceSettings> {
         self.admin_service.as_ref()
-    }
-
-    /// dird's zone table: peers inside these networks are `Internal`, all
-    /// others `External`. Spec: docs/50 §4.2.
-    #[must_use]
-    pub fn internal_networks(&self) -> &[Network] {
-        &self.internal_networks
     }
 
     /// auditd's socket and uid. Spec: docs/50 §2.4, R50-17.

@@ -272,9 +272,8 @@ pub fn domain_configs(input: &DomainInput, node_id: &NodeId) -> Vec<ConfigFile> 
         ("dird_admin_socket", path(&p.dird_admin_socket)),
         ("admind_uid", id(a.admind.uid)),
     ];
-    if !n.internal_networks.is_empty() {
-        dird.push(("internal_networks", list(&n.internal_networks)));
-    }
+    // No `internal_networks` for dird: the LDAP zone is the front's, from
+    // its peer uid (docs/52 R14).
     dird.extend([
         ("audit_socket", path(&p.audit_socket)),
         ("auditd_uid", id(a.auditd.uid)),
@@ -318,6 +317,10 @@ pub fn domain_configs(input: &DomainInput, node_id: &NodeId) -> Vec<ConfigFile> 
     if !n.ldaps_listen.is_empty() {
         ldap_front.push(("ldaps_listen", list(&n.ldaps_listen)));
     }
+    // Required: every LDAP listener lies in an internal network, and the
+    // front serves only internal sources (docs/52 §7 R14; A-102 on
+    // docs/questions/Q-469 (b)). The input check guarantees one entry.
+    ldap_front.push(("internal_networks", list(&n.internal_networks)));
     ldap_front.extend([
         ("tls_certificate_path", path(&p.tls_certificate)),
         ("tls_private_key_path", path(&p.tls_private_key)),

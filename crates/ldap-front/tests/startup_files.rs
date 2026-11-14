@@ -54,10 +54,13 @@ fn write(path: &Path, octets: &[u8], mode: u32) {
 }
 
 /// A configuration for `dir` (the crates/config sample's shape, with the
-/// certificate and key paths in `dir` and the given listener).
+/// certificate and key paths in `dir` and the given listener; the zone
+/// table covers the test addresses — 10.0.0.0/8 and the loopback network,
+/// docs/52 R14).
 fn settings_text(dir: &TempDir, listen: &str) -> String {
     format!(
         "run_as_uid = 61004\nrun_as_gid = 61004\nldaps_listen = {listen}\n\
+         internal_networks = 10.0.0.0/8, 127.0.0.0/8\n\
          tls_certificate_path = {}\ntls_private_key_path = {}\n\
          dird_ldap_socket = /run/dird/ldap/dird-ldap.sock\ndird_uid = 61002\n\
          audit_socket = /run/auditd/audit.sock\nauditd_uid = 61005\n",

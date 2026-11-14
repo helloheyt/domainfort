@@ -18,6 +18,7 @@
 //! Spec: docs/50 §3.3, §8.1, §8.2; docs/37 §2; docs/49 §10.1.
 
 use crate::error::EventError;
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use ipc::{Reader, Writer};
 
 /// Longest client-supplied string kept: 256 octets of printable ASCII.
@@ -341,6 +342,67 @@ impl SidValue {
             authority,
             sub_authorities,
         })
+    }
+}
+
+/// Family code of an IPv4 [`ReportedAddress`] (the IP version number).
+const FAMILY_V4: u8 = 4;
+/// Family code of an IPv6 [`ReportedAddress`] (the IP version number).
+const FAMILY_V6: u8 = 6;
+
+/// A network address that another process **reported** and the recording
+/// process could not verify — kept as an observation, never as a fact the
+/// record vouches for. Its one use: the LDAP client address ldap-front
+/// reports to dird (`Open`), which dird no longer turns into a zone (the
+/// zone is the front's, from its peer uid — docs/52 §3.3 C3, §7 R14), but
+/// which the log keeps for the investigator, labelled as reported.
+///
+/// ```text
+/// ReportedAddress := family:u8 (4 | 6) ‖ [u8; 4] | [u8; 16]
+/// ```
+///
+/// An address is an identifier of an endpoint, not a secret (docs/37 §2:
+/// "only identifiers and metadata").
+/// Spec: docs/52 §7 R14; A-102 on docs/questions/Q-469; docs/50 §3.3 (a
+/// closed code table, one encoding per value); docs/questions/Q-581.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReportedAddress(IpAddr);
+
+impl ReportedAddress {
+    /// The address as it was reported.
+    #[must_use]
+    pub const fn new(address: IpAddr) -> ReportedAddress {
+        ReportedAddress(address)
+    }
+
+    /// The reported address (unverified).
+    #[must_use]
+    pub const fn address(&self) -> IpAddr {
+        self.0
+    }
+
+    pub(crate) fn write(&self, writer: &mut Writer) -> Result<(), EventError> {
+        match self.0 {
+            IpAddr::V4(v4) => {
+                writer.write_enum(FAMILY_V4)?;
+                Ok(writer.write_array(&v4.octets())?)
+            }
+            IpAddr::V6(v6) => {
+                writer.write_enum(FAMILY_V6)?;
+                Ok(writer.write_array(&v6.octets())?)
+            }
+        }
+    }
+
+    pub(crate) fn read(reader: &mut Reader<'_>) -> Result<ReportedAddress, EventError> {
+        let family =
+            reader.read_enum(|code| (code == FAMILY_V4 || code == FAMILY_V6).then_some(code))?;
+        let address = if family == FAMILY_V4 {
+            IpAddr::V4(Ipv4Addr::from(reader.read_array::<4>()?))
+        } else {
+            IpAddr::V6(Ipv6Addr::from(reader.read_array::<16>()?))
+        };
+        Ok(ReportedAddress(address))
     }
 }
 

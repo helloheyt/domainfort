@@ -54,7 +54,8 @@ fn largest_events_fit_the_bound() {
     }
     // Measured at the time of writing: KDC 3971, keyd 97, LDAP 4856,
     // summary 26 octets (18 before F4 appended its third counter) — the LDAP
-    // shape is the largest; keep the margin visible.
+    // shape is the largest (17 octets more since docs/52 R14 added the
+    // reported client address, an IPv6 one here); keep the margin visible.
     let ldap = encode_event(&EventBody::Ldap(Box::new(largest_ldap_event())))
         .unwrap()
         .len();
@@ -437,6 +438,7 @@ fn field_inventory_holds_no_secret() {
         time: _,          // caller time
         connection_id: _, // identifier
         source_zone: _,   // code
+        reported_peer: _, // IP address as ldap-front reported it (an endpoint identifier)
         transport: _,     // code
         transport_sec: _, // flags
         operation: _,     // code
@@ -598,5 +600,46 @@ fn reason_details_round_trip() {
     ] {
         let bytes = encode_event(&event).unwrap();
         assert_eq!(decode_event(bytes.as_bytes()).unwrap(), event);
+    }
+}
+
+/// docs/52 §7 R14 (the client address ldap-front reported, kept as an
+/// unverified observation); docs/50 §3.3 (a closed code table, one encoding
+/// per value): `family:u8 (4 | 6) ‖ 4 | 16 octets` right after the zone
+/// code; an IPv6 address is 12 octets longer than an IPv4 one; another
+/// family code is refused; the address survives the round trip as given.
+#[test]
+fn reported_address_layout() {
+    use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let v4 = ldap_event();
+    let v4_bytes = encode_event(&EventBody::Ldap(Box::new(v4.clone()))).unwrap();
+    let needle = [4u8, 10, 0, 0, 9];
+    let at = v4_bytes
+        .as_bytes()
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .expect("family 4 then the octets");
+    let v6 = LdapEvent {
+        reported_peer: ipc_audit::ReportedAddress::new(IpAddr::V6(Ipv6Addr::new(
+            0xfd00, 0, 0, 0, 0, 0, 0, 9,
+        ))),
+        ..v4.clone()
+    };
+    let v6_bytes = encode_event(&EventBody::Ldap(Box::new(v6.clone()))).unwrap();
+    assert_eq!(v6_bytes.len(), v4_bytes.len() + 12);
+    assert_eq!(v6_bytes.as_bytes()[at], 6);
+    assert_eq!(
+        decode_event(v6_bytes.as_bytes()).unwrap(),
+        EventBody::Ldap(Box::new(v6))
+    );
+    let mut wrong = v4_bytes.as_bytes().to_vec();
+    wrong[at] = 5;
+    assert!(decode_event(&wrong).is_err());
+    match decode_event(v4_bytes.as_bytes()).unwrap() {
+        EventBody::Ldap(event) => assert_eq!(
+            event.reported_peer.address(),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9))
+        ),
+        other => panic!("{other:?}"),
     }
 }

@@ -18,7 +18,6 @@ use crate::daemon::{
     MAX_LDAP_SESSIONS, MAX_OPEN_VIEWS,
 };
 use crate::policy::{read_file, DevelopmentPolicy, LoadError, PolicyError};
-use crate::zones::ZoneTable;
 use config::{DirdSettings, IntegrityKeySource, PolicyStoreFormat};
 use core::fmt;
 use daemon_sandbox::{HardeningPlan, PlanError, ProcessIdentity};
@@ -376,7 +375,6 @@ pub fn params(settings: &DirdSettings) -> Result<DaemonParams, StartupError> {
         max_ldap_sessions: MAX_LDAP_SESSIONS,
         ldap_queue_capacity: LDAP_QUEUE_CAPACITY,
         dns_host_name: settings.dns_host_name().to_owned(),
-        zones: ZoneTable::from_settings(settings.internal_networks()),
         audit_window: WindowConfig::DEFAULT,
         clock: SharedClock::system(),
     })

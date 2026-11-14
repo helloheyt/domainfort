@@ -3,11 +3,15 @@
 //!
 //! Per connection, in this order:
 //!
-//! 1. **Identity** — the peer uid from the kernel's peer credentials (tokio
-//!    `UnixStream::peer_cred`) must be exactly the configured
-//!    `ldap_front_uid`; anything else (or unreadable credentials) ⇒ the
+//! 1. **Identity and zone** — the peer uid from the kernel's peer
+//!    credentials (tokio `UnixStream::peer_cred`) must be a front's
+//!    ([`Fronts::zone_of`]: phase 1 has one, the internal front,
+//!    `ldap_front_uid`); anything else (or unreadable credentials) ⇒ the
 //!    connection is closed **without a reply** (docs/50 §3.2:
-//!    "dird-ldap.sock ← ldap-front"). Counted on stderr (thinned).
+//!    "dird-ldap.sock ← ldap-front"). Counted on stderr (thinned). The
+//!    front's zone becomes the connection's — fixed before any frame is
+//!    read, so nothing the front sends can change it (docs/52 §3.3 C3,
+//!    §7 R14; A-102 on docs/questions/Q-469 (b)).
 //! 2. **Session bound** — at most `max_sessions` LDAP sessions at once; one
 //!    more has its first request (which must arrive within `frame_timeout`)
 //!    answered `Refused::Busy`, then is closed (the front closes its client
@@ -37,7 +41,8 @@
 //! down"; App. A).
 //!
 //! Spec: docs/50 R50-3, R50-7, R50-10, §3.1, §3.2, §3.3, §3.6, §3.7, §4.2;
-//! RFC 4511 §4.4.1, App. A; tokio 1.54.1 docs.rs: `net::UnixListener::accept`,
+//! docs/52 §7 R14; RFC 4511 §4.4.1, App. A; tokio 1.54.1 docs.rs:
+//! `net::UnixListener::accept`,
 //! `net::UnixStream::peer_cred`, `net::unix::UCred::uid`, `time::timeout`,
 //! `spawn`, `io::{AsyncReadExt::read, AsyncWriteExt::write_all}`.
 
@@ -47,7 +52,7 @@ use crate::log::{note, Note, Thinned};
 use core::time::Duration;
 use ipc::{FrameReader, Refused};
 use ipc_ldap::REQUEST_LIMIT;
-use ipc_ldap_server::{refuse, Dispatch, LdapConnection};
+use ipc_ldap_server::{refuse, Dispatch, Fronts, LdapConnection};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -71,7 +76,7 @@ static BUSY: Thinned = Thinned::new(Note::LdapBusy);
 /// What every LDAP connection task shares.
 /// Spec: docs/50 §3.2, §3.6, §4.2.
 pub(crate) struct LdapServeContext {
-    front_uid: u32,
+    fronts: Fronts,
     frame_timeout: Duration,
     max_sessions: usize,
     engine: LdapEngineHandle,
@@ -82,15 +87,15 @@ pub(crate) struct LdapServeContext {
 }
 
 impl LdapServeContext {
-    /// Spec: docs/50 §3.2, §3.6, §4.2.
+    /// Spec: docs/50 §3.2, §3.6, §4.2; docs/52 R14.
     pub(crate) fn new(
-        front_uid: u32,
+        fronts: Fronts,
         frame_timeout: Duration,
         max_sessions: usize,
         engine: LdapEngineHandle,
     ) -> LdapServeContext {
         LdapServeContext {
-            front_uid,
+            fronts,
             frame_timeout,
             max_sessions,
             engine,
@@ -197,10 +202,12 @@ async fn connection(mut stream: UnixStream, context: Arc<LdapServeContext>) {
             return;
         }
     };
-    if uid != context.front_uid {
+    // The zone of the connection: its front's, from the kernel's peer
+    // credentials. Spec: docs/50 R50-3, §3.2; docs/52 R14.
+    let Some(zone) = context.fronts.zone_of(uid) else {
         REFUSED_PEERS.hit(Some(uid));
         return;
-    }
+    };
     let mut reader = FrameReader::new(REQUEST_LIMIT);
     let Some(slot) = context.acquire() else {
         SESSION_LIMIT.hit(Some(uid));
@@ -220,7 +227,7 @@ async fn connection(mut stream: UnixStream, context: Arc<LdapServeContext>) {
         }
         return;
     };
-    let mut state = Box::new(LdapConnection::new(slot.connection));
+    let mut state = Box::new(LdapConnection::new(slot.connection, zone));
     loop {
         let Ok(body) = read_frame(&mut stream, &mut reader, context.frame_timeout).await else {
             return;

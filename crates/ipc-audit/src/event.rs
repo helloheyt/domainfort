@@ -45,7 +45,7 @@ use crate::codes::{
 use crate::error::EventError;
 use crate::values::{
     read_opt, read_seq, write_opt, write_seq, AuditText, CalendarTime, CodecError, PdpReason,
-    Principal, SidValue,
+    Principal, ReportedAddress, SidValue,
 };
 use core::fmt;
 use ipc::{FrameLimit, Reader, Writer};
@@ -587,16 +587,25 @@ impl LdapSearch {
     }
 }
 
-/// One LDAP audit event: `ldap::AuditEvent`, field for field.
-/// Spec: crates/ldap audit.rs; docs/49 §10.1 (R49-14).
+/// One LDAP audit event: `ldap::AuditEvent`, field for field, plus the
+/// client address ldap-front reported, which dird adds (the engine never
+/// sees it — docs/52 R14).
+/// Spec: crates/ldap audit.rs; docs/49 §10.1 (R49-14); docs/52 §7 R14.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LdapEvent {
     /// The caller-supplied time.
     pub time: CalendarTime,
     /// The engine's connection identifier.
     pub connection_id: u64,
-    /// The source zone.
+    /// The source zone the decision was made under: the zone of the front
+    /// the client came through, derived by dird from the front's peer uid
+    /// (docs/52 R14) — not from [`LdapEvent::reported_peer`].
     pub source_zone: IpZone,
+    /// The client address **as ldap-front reported it** — an unverified
+    /// observation (the front owns the TCP socket), kept for the
+    /// investigator; no decision was derived from it.
+    /// Spec: docs/52 §7 R14; docs/questions/Q-581.
+    pub reported_peer: ReportedAddress,
     /// How the connection is carried.
     pub transport: LdapTransport,
     /// The transport security attributed to the request.
@@ -632,6 +641,7 @@ impl LdapEvent {
         self.time.write(writer)?;
         writer.write_u64(self.connection_id)?;
         writer.write_enum(self.source_zone.code())?;
+        self.reported_peer.write(writer)?;
         writer.write_enum(self.transport.code())?;
         writer.write_bool(self.transport_sec.encrypted)?;
         writer.write_bool(self.transport_sec.sealed)?;
@@ -660,6 +670,7 @@ impl LdapEvent {
         let time = CalendarTime::read(reader)?;
         let connection_id = reader.read_u64()?;
         let source_zone = reader.read_enum(IpZone::from_code)?;
+        let reported_peer = ReportedAddress::read(reader)?;
         let transport = reader.read_enum(LdapTransport::from_code)?;
         let transport_sec = TransportSecurity {
             encrypted: reader.read_bool()?,
@@ -682,6 +693,7 @@ impl LdapEvent {
             time,
             connection_id,
             source_zone,
+            reported_peer,
             transport,
             transport_sec,
             operation,

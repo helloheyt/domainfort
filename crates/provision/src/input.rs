@@ -185,7 +185,8 @@ pub struct Network {
     pub ldap_listen: Vec<String>,
     /// ldap-front's `ldaps_listen` addresses.
     pub ldaps_listen: Vec<String>,
-    /// `internal_networks` (dird and kdc).
+    /// `internal_networks` (ldap-front, required — every LDAP listener lies
+    /// inside one of them, docs/52 R14; and kdc). dird has no zone table.
     pub internal_networks: Vec<String>,
 }
 
@@ -275,6 +276,9 @@ pub enum InputErrorKind {
     NetworkItem,
     /// No kdc listener, or neither LDAP nor LDAPS listener.
     MissingListener,
+    /// No internal network: ldap-front listens only inside the internal
+    /// networks (docs/52 §7 R14; A-102 on docs/questions/Q-469 (b)).
+    MissingInternalNetwork,
 }
 
 /// An input error: the field (the command-line flag's name) and the rule.
@@ -314,6 +318,9 @@ impl fmt::Display for InputError {
             InputErrorKind::SharedSocketDirectory => "two sockets share a directory",
             InputErrorKind::NetworkItem => "network item empty or holds a separator",
             InputErrorKind::MissingListener => "listener missing",
+            InputErrorKind::MissingInternalNetwork => {
+                "at least one internal network is required (LDAP listens only inside them)"
+            }
         };
         write!(f, "{}: {rule}", self.field)
     }
@@ -599,9 +606,10 @@ impl DomainInput {
 
     /// Network items are non-empty and hold no list separator (they are
     /// written as `", "`-separated lists, crates/config); kdc needs a
-    /// listener, ldap-front at least one of LDAP / LDAPS (crates/config
-    /// re-checks every address).
-    /// Spec: docs/50 §4.1, §4.2, §7.1.
+    /// listener, ldap-front at least one of LDAP / LDAPS and at least one
+    /// internal network (crates/config re-checks every address, and that
+    /// every LDAP listener lies in an internal network).
+    /// Spec: docs/50 §4.1, §4.2, §7.1; docs/52 §7 R14.
     fn check_network(&self) -> Result<(), InputError> {
         let n = &self.network;
         let lists: [(&'static str, &Vec<String>); 4] = [
@@ -628,6 +636,12 @@ impl DomainInput {
             return Err(InputError::new(
                 "ldaps-listen",
                 InputErrorKind::MissingListener,
+            ));
+        }
+        if n.internal_networks.is_empty() {
+            return Err(InputError::new(
+                "internal-network",
+                InputErrorKind::MissingInternalNetwork,
             ));
         }
         Ok(())

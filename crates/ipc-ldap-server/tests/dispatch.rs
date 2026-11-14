@@ -14,14 +14,19 @@
 //!   before the engine;
 //! * host refusals (`Busy`, `Unavailable`); a response split into parts and
 //!   reassembled; an outcome over the reply bounds refused;
-//! * exactly one audit event per engine call, equal to the direct call's.
+//! * exactly one audit event per engine call, equal to the direct call's;
+//! * **the zone is the connection's, never the front's word** (docs/52 R14,
+//!   attack tests): a front that reports an internal or an external address
+//!   gets the same decision, and the reported address reaches the host only
+//!   beside the inputs, for the audit record; the zone comes from the peer
+//!   uid through `Fronts` (uid 0 and other uids are no front).
 //!
 //! Sources: docs/50 R50-10, §3.3, §4.2, §4.3, §9; docs/49 R49-14, R49-15,
 //! R49-16, §4.3, §4.4, §5.2, §6; RFC 4511 §4.2, §4.5.1, §4.14.1 (requests
 //! built by hand from the ASN.1 of App. B); RFC 4513 §3.1.1, §5.1; [MS-ADTS]
 //! 5.1.3.2 (LC, RP); [MS-DTYP] 2.4.2.4 (S-1-5-7), 2.4.4.2, 2.4.6; A-47,
-//! A-48, A-51, A-59; Q-190, Q-200. Every value is hand-made (the fixtures'
-//! own data).
+//! A-48, A-51, A-59; Q-190, Q-200; docs/52 §3.3, §7 R14; A-102 on
+//! docs/questions/Q-469. Every value is hand-made (the fixtures' own data).
 
 #[path = "../../directory-pip/tests/common/mod.rs"]
 mod common;
@@ -33,10 +38,10 @@ use dtyp::{AccessMask, Ace, Acl, Control, MaskSidAce, SecurityDescriptor, Sid, A
 use ipc::{decode_body, encode_frame, Direction, EncodedFrame, Refused};
 use ipc_ldap::{
     ChannelFailure, ConnectionAction as WireAction, Exchange, FrontChannel, LdapReply, LdapRequest,
-    Listener as WireListener, MessageRequest, Progress, TransportFacts, LDAP_CHANNEL,
+    Listener as WireListener, MessageRequest, Progress, ReportedPeer, TransportFacts, LDAP_CHANNEL,
     MAX_RESPONSES, MAX_RESPONSE_PART,
 };
-use ipc_ldap_server::{Dispatch, LdapConnection, RequestHost, Unserved};
+use ipc_ldap_server::{Dispatch, FrontZone, Fronts, LdapConnection, RequestHost, Unserved};
 use krb_proto::KerberosTime;
 use ldap::{
     AuditEvent, AuditOperation, ConnectionAction, DirectoryInputs, Engine, EngineConfig, Listener,
@@ -206,20 +211,15 @@ fn with_inputs<R>(
     })
 }
 
-/// 10.0.0.0/8 is internal (the test's own zone table).
-fn zone_of(peer: IpAddr) -> IpScope {
-    match peer {
-        IpAddr::V4(v4) if v4.octets()[0] == 10 => IpScope::Internal,
-        _ => IpScope::External,
-    }
-}
-
-/// The dispatcher's host: inputs as [`with_inputs`], every event kept.
+/// The dispatcher's host: inputs as [`with_inputs`], every event kept with
+/// the transport it was decided under and the address the front reported.
 struct Host<'a> {
     d: &'a Dir,
     tiers: &'a TierMap,
     policy: &'a PolicySnapshot,
     events: Vec<AuditEvent>,
+    transports: Vec<TransportReport>,
+    reported: Vec<ReportedPeer>,
     refuse: Option<Unserved>,
     replace: Option<Vec<Vec<u8>>>,
 }
@@ -231,6 +231,8 @@ impl<'a> Host<'a> {
             tiers,
             policy,
             events: Vec::new(),
+            transports: Vec::new(),
+            reported: Vec::new(),
             refuse: None,
             replace: None,
         }
@@ -238,18 +240,17 @@ impl<'a> Host<'a> {
 }
 
 impl RequestHost for Host<'_> {
-    fn zone(&self, peer: IpAddr) -> IpScope {
-        zone_of(peer)
-    }
-
     fn serve(
         &mut self,
         transport: TransportReport,
+        reported_peer: ReportedPeer,
         run: &mut dyn FnMut(RequestInputs<'_>) -> Outcome,
     ) -> Result<Outcome, Unserved> {
         if let Some(refused) = self.refuse {
             return Err(refused);
         }
+        self.transports.push(transport);
+        self.reported.push(reported_peer);
         let mut outcome = with_inputs(self.d, self.tiers, self.policy, transport, |inputs| {
             run(inputs)
         });
@@ -297,7 +298,7 @@ impl<'a> Channel<'a> {
     fn new(d: &'a Dir, tiers: &'a TierMap, policy: &'a PolicySnapshot) -> Channel<'a> {
         Channel {
             engine: engine(),
-            connection: LdapConnection::new(CONNECTION),
+            connection: LdapConnection::new(CONNECTION, FrontZone::Internal),
             front: FrontChannel::new(),
             host: Host::new(d, tiers, policy),
         }
@@ -753,7 +754,7 @@ fn the_channel_order() {
     let (tiers, policy) = (TierMap::empty(), policy());
     let open = request_frame(&LdapRequest::Open {
         listener: WireListener::Ldap,
-        peer_addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+        reported_peer: ReportedPeer::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))),
     });
 
     let mut channel = Channel::new(&d, &tiers, &policy);
@@ -884,11 +885,11 @@ fn one_session_per_connection() {
     let (tiers, policy) = (TierMap::empty(), policy());
     let engine = engine();
     let host = RefCell::new(Host::new(&d, &tiers, &policy));
-    let mut first = LdapConnection::new(1);
-    let mut second = LdapConnection::new(2);
+    let mut first = LdapConnection::new(1, FrontZone::Internal);
+    let mut second = LdapConnection::new(2, FrontZone::Internal);
     let open = request_frame(&LdapRequest::Open {
         listener: WireListener::Ldap,
-        peer_addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+        reported_peer: ReportedPeer::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))),
     });
     let _ = first.handle(&engine, open.body(), &mut *host.borrow_mut());
     let _ = second.handle(&engine, open.body(), &mut *host.borrow_mut());
@@ -909,4 +910,126 @@ fn one_session_per_connection() {
     assert_eq!(events[0].connection_id, 1);
     assert_eq!(events[1].connection_id, 2);
     assert_eq!(events[1].transport, ldap::AuditTransport::Ldap);
+}
+
+// ---- the zone is the connection's (docs/52 R14) -------------------------
+
+/// The channel path with the front's `Open` reporting `reported` as the
+/// client address.
+fn opened_reporting<'a>(
+    d: &'a Dir,
+    tiers: &'a TierMap,
+    policy: &'a PolicySnapshot,
+    reported: IpAddr,
+) -> Channel<'a> {
+    let mut channel = Channel::new(d, tiers, policy);
+    let frame = channel
+        .front
+        .encode_open(WireListener::Ldap, reported)
+        .unwrap();
+    let (progress, closes) = channel.exchange(&frame);
+    assert!(matches!(progress, Ok(Progress::Opened { .. })));
+    assert!(!closes);
+    channel
+}
+
+/// **Attack test** — docs/52 §3.3 (C3: "a security fact asserted by a
+/// component that does not own it"), §7 R14; A-102 on docs/questions/Q-469
+/// (b); A-51 (the anonymous grant is internal-only): a front that reports
+/// an address inside the old internal table (10.0.0.5), one outside it
+/// (192.0.2.9 — test data), an IPv6 address and the IPv4-mapped form of an
+/// internal address gets the **same** decision for the anonymous rootDSE —
+/// the internal-only grant applies to each, because the zone is the
+/// connection's (`FrontZone::Internal`, from the peer uid) and the host sees
+/// `src_net: Internal` every time. The reported address reaches the host
+/// only beside the inputs (for the audit record), exactly as reported. The
+/// control: the same request decided directly under `External` is
+/// refused — so the equal decisions are not a policy that ignores the zone.
+#[test]
+fn the_reported_address_cannot_change_the_decision() {
+    let d = directory("ldap-zone-attack");
+    let (tiers, policy) = (TierMap::empty(), policy());
+    let reports = [
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9)),
+        IpAddr::V6(core::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+        IpAddr::V6(Ipv4Addr::new(10, 0, 0, 5).to_ipv6_mapped()),
+    ];
+    let mut replies = Vec::new();
+    for reported in reports {
+        let mut channel = opened_reporting(&d, &tiers, &policy, reported);
+        let (exchange, closes) = channel.send(&root_dse(1), false);
+        assert!(!closes);
+        assert_eq!(channel.host.transports.len(), 1);
+        assert_eq!(channel.host.transports[0].src_net, IpScope::Internal);
+        assert_eq!(
+            channel.host.reported,
+            [ReportedPeer::new(reported)],
+            "the report reaches the host as reported, beside the inputs"
+        );
+        assert_eq!(channel.host.events[0].source_zone, IpScope::Internal);
+        replies.push(exchange.responses);
+    }
+    assert!(replies.windows(2).all(|pair| pair[0] == pair[1]));
+
+    // The decision does depend on the zone: under External the same
+    // request is refused (A-51: no anonymous grant outside Internal).
+    let mut internal = Direct {
+        d: &d,
+        tiers: &tiers,
+        policy: &policy,
+        engine: engine(),
+        session: Session::new(CONNECTION, Listener::Ldap),
+        src_net: IpScope::Internal,
+    };
+    let mut external = Direct {
+        d: &d,
+        tiers: &tiers,
+        policy: &policy,
+        engine: engine(),
+        session: Session::new(CONNECTION, Listener::Ldap),
+        src_net: IpScope::External,
+    };
+    let granted = internal.send(&root_dse(1), false);
+    let refused = external.send(&root_dse(1), false);
+    assert_eq!(replies[0], granted.responses);
+    assert_ne!(granted.responses, refused.responses);
+}
+
+/// **Attack test** — docs/52 §7 R14: the reported address cannot follow a
+/// message either: a `Message` carries no address, and a second `Open`
+/// (which could report another one) is refused before the engine
+/// (`Malformed`, close) — the zone of every request is fixed at the
+/// connection's construction.
+#[test]
+fn a_second_report_is_refused() {
+    let d = directory("ldap-zone-reopen");
+    let (tiers, policy) = (TierMap::empty(), policy());
+    let mut channel = opened_reporting(&d, &tiers, &policy, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)));
+    let again = request_frame(&LdapRequest::Open {
+        listener: WireListener::Ldap,
+        reported_peer: ReportedPeer::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9))),
+    });
+    assert_eq!(refusal(&channel.dispatch(&again)), Some(Refused::Malformed));
+    assert!(channel.connection.is_closed());
+    assert!(channel.host.events.is_empty(), "the engine was not called");
+    assert_eq!(channel.connection.zone(), FrontZone::Internal);
+}
+
+/// docs/50 R50-3 ("uid 0 is never mapped"), §3.2 ("dird-ldap.sock ←
+/// ldap-front"); docs/52 R14: the zone comes from the peer uid — the
+/// configured front's uid is the internal front; any other uid, and uid 0
+/// even when configured, is no front (the connection is refused); the
+/// internal front's requests are decided under `Internal`. uids are test
+/// data.
+#[test]
+fn the_zone_comes_from_the_peer_uid() {
+    let fronts = Fronts::new(61_004);
+    assert_eq!(fronts.zone_of(61_004), Some(FrontZone::Internal));
+    assert_eq!(fronts.zone_of(61_005), None);
+    assert_eq!(fronts.zone_of(0), None);
+    assert_eq!(Fronts::new(0).zone_of(0), None);
+    assert_eq!(FrontZone::Internal.src_net(), IpScope::Internal);
+    let connection = LdapConnection::new(7, fronts.zone_of(61_004).unwrap());
+    assert_eq!(connection.zone(), FrontZone::Internal);
 }

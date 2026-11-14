@@ -114,8 +114,7 @@ use config::AuditdSettings;
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use core::time::Duration;
 use directory_daemon::policy::DevelopmentPolicy;
-use directory_daemon::zones::Network;
-use directory_daemon::{SharedClock, StoreSource, ZoneTable};
+use directory_daemon::{SharedClock, StoreSource};
 use directory_pip::DirectoryContext;
 use keyd::Role;
 use keyd_daemon::CallerMap;
@@ -241,15 +240,14 @@ pub fn harness_policy(version: u64) -> DevelopmentPolicy {
     policy
 }
 
-/// dird's zone table here: the loopback network is internal, so the A-51
-/// internal anonymous rootDSE grant applies to the loopback client. Test
-/// data.
-pub fn loopback_internal() -> ZoneTable {
-    ZoneTable::new(vec![Network::new(
-        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0)),
-        8,
-    )
-    .unwrap()])
+/// ldap-front's zone table here: the loopback network is internal, so the
+/// front serves its loopback listeners and client (docs/52 R14: it listens
+/// only inside the internal networks and serves only internal sources);
+/// dird decides the front's requests under the internal zone — the front's,
+/// from its peer uid — so the A-51 internal anonymous rootDSE grant
+/// applies. Test data.
+pub fn loopback_internal() -> Vec<config::Network> {
+    vec![config::Network::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0)), 8).unwrap()]
 }
 
 /// ldap-front's timeouts in the tests: short, but well above a loopback
@@ -565,7 +563,6 @@ impl Harness {
         assert_eq!(params.audit.socket, self.paths.audit_socket);
         assert_eq!(params.dns_host_name, DNS_HOST_NAME);
         params.ldap_front_uid = front_uid;
-        params.zones = loopback_internal();
         params.clock = SharedClock::new(FixedTime);
         let policy = directory_daemon::startup::read_policy(policy_path, self.uid)
             .map_err(|e| e.to_string())?;
@@ -653,6 +650,7 @@ impl Harness {
             },
             timeouts: front_timeouts(),
             limits: ConnectionLimits::DEFAULT,
+            internal_networks: loopback_internal(),
         };
         self.front = Some(Front::start(params, server_config(&self.tls_pki))?);
         Ok(())

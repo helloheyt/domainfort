@@ -47,6 +47,7 @@ run_as_uid = 61004
 run_as_gid = 61004
 ldap_listen = 10.0.0.5:389
 ldaps_listen = 10.0.0.5:636
+internal_networks = 10.0.0.0/8
 tls_certificate_path = /etc/ldap-front/dc-cert.der
 tls_private_key_path = /etc/ldap-front/dc-key.der
 dird_ldap_socket = /run/dird/ldap/dird-ldap.sock

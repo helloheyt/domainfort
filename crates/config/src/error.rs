@@ -150,6 +150,12 @@ pub enum ErrorKind {
     /// The daemon would have no network listener at all.
     /// Spec: docs/50 §4.2; docs/questions/Q-230 item 7.
     NoListener,
+    /// A listener address outside every network of the file's zone table
+    /// (`internal_networks`): phase 1 has no external LDAP listener — one
+    /// front per zone, the internal one.
+    /// Spec: docs/52 §7 R14; A-102 on docs/questions/Q-469 (b); docs/50
+    /// §4.1 (CIDR → Internal); docs/questions/Q-580.
+    ListenerNotInternal,
     /// Two limits contradict each other (a per-source bound above the global
     /// bound). Spec: docs/50 §4.1.
     InconsistentLimits,
@@ -196,6 +202,9 @@ impl ErrorKind {
             ErrorKind::DuplicateId => "uid appears more than once in this file",
             ErrorKind::DuplicatePath => "path is used by more than one setting",
             ErrorKind::NoListener => "no network listener is configured",
+            ErrorKind::ListenerNotInternal => {
+                "listener address is outside every configured internal network"
+            }
             ErrorKind::InconsistentLimits => "per-source limit exceeds the global limit",
             ErrorKind::InvalidNodeId => "value is not 32 lower-case hex digits, not all zero",
         }

@@ -109,5 +109,6 @@ pub use ldap_front::{
 };
 pub use schema::{Account, Endpoint};
 pub use value::{
-    AbsolutePath, NamingContextLabels, Network, MAX_NAMING_CONTEXT_LABELS, NODE_ID_OCTETS,
+    is_internal, AbsolutePath, NamingContextLabels, Network, MAX_NAMING_CONTEXT_LABELS,
+    NODE_ID_OCTETS,
 };

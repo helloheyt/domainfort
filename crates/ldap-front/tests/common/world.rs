@@ -13,9 +13,11 @@
 //! * [`Front`] — the real `ldap_front::serve` on its own thread with its
 //!   own current-thread runtime; its two listeners bound on 127.0.0.1 at
 //!   ports the system picks (never a privileged port).
-//! * [`World`] — auditd, dird (whose zone table makes 127.0.0.0/8 internal,
-//!   so the A-51 internal anonymous rootDSE grant applies to the loopback
-//!   client), the front with the product's TLS configuration serving a
+//! * [`World`] — auditd, dird (which decides the front's requests under the
+//!   internal zone — the zone of the front, from its peer uid, docs/52 R14 —
+//!   so the A-51 internal anonymous rootDSE grant applies), the front (whose
+//!   zone table makes 127.0.0.0/8 internal: its loopback listeners and
+//!   client are inside it) with the product's TLS configuration serving a
 //!   real per-run certificate (tests/common/cert.rs, tests/common/tls.rs:
 //!   rustls' standard verifier on the client side).
 //! * [`direct`] — the LDAP engine called in-process over the same store,
@@ -39,8 +41,7 @@ use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use core::time::Duration;
 use dird_support::{Dird, Directory, TempDir};
 use directory_daemon::policy::DevelopmentPolicy;
-use directory_daemon::zones::Network;
-use directory_daemon::{Clock, SharedClock, StoreSource, ZoneTable};
+use directory_daemon::{Clock, SharedClock, StoreSource};
 use directory_pip::{DirectoryContext, TierMap};
 use krb_proto::KerberosTime;
 use ldap::{
@@ -115,13 +116,10 @@ pub fn ldap_policy(version: u64) -> DevelopmentPolicy {
     policy
 }
 
-/// dird's zone table here: the loopback network is internal (test data).
-fn loopback_internal() -> ZoneTable {
-    ZoneTable::new(vec![Network::new(
-        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0)),
-        8,
-    )
-    .unwrap()])
+/// The front's zone table here: the loopback network is internal (test
+/// data; docs/50 §4.1, docs/52 R14).
+pub fn loopback_internal() -> Vec<config::Network> {
+    vec![config::Network::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0)), 8).unwrap()]
 }
 
 /// The real auditd (listener + writer) with its socket in `dir` and its
@@ -250,7 +248,6 @@ pub fn world(tweak: impl FnOnce(&mut FrontParams)) -> Option<World> {
     let directory = Directory::standard(&dir.join("s.redb"));
     let mut params = dird_support::params(&dir, uid, uid, Duration::from_secs(5), 4);
     params.ldap_front_uid = uid;
-    params.zones = loopback_internal();
     params.clock = SharedClock::new(FixedTime);
     let dird = Dird::start(
         params,
@@ -270,6 +267,7 @@ pub fn world(tweak: impl FnOnce(&mut FrontParams)) -> Option<World> {
         },
         timeouts: test_timeouts(),
         limits: ConnectionLimits::DEFAULT,
+        internal_networks: loopback_internal(),
     };
     tweak(&mut front_params);
     let front = Front::start(front_params, server_config_for(&pki)).unwrap();

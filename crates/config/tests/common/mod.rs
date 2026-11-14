@@ -63,7 +63,6 @@ node_id = 0123456789abcdef00112233445566ff
 admin_ticket_age_max = 600s
 admin_quorum = 2
 provision_manifest = /etc/domain/provision.manifest
-internal_networks = 10.0.0.0/8, 192.168.10.0/24, fd00:1234::/32
 audit_socket = /run/auditd/audit.sock
 auditd_uid = 805
 frame_timeout = 5s
@@ -130,13 +129,15 @@ audit_socket = /run/auditd/audit.sock
 auditd_uid = 805
 ";
 
-/// ldap-front, every key present. Spec: docs/50 §2.4, §3.6, §4.2, §5.3.
+/// ldap-front, every key present. Spec: docs/50 §2.4, §3.6, §4.1, §4.2,
+/// §5.3; docs/52 R14 (the zone table, every listener inside it).
 pub const LDAP_FRONT: &str = "\
 # ldap-front - docs/50 s2.4, s4.2, s5.3
 run_as_uid = 804
 run_as_gid = 804
 ldap_listen = 10.0.0.5:389
 ldaps_listen = 10.0.0.5:636, [fd00:1234::5]:636
+internal_networks = 10.0.0.0/8, 192.168.10.0/24, fd00:1234::/32
 tls_certificate_path = /etc/ldap-front/dc-cert.der
 tls_private_key_path = /etc/ldap-front/dc-key.der
 dird_ldap_socket = /run/dird/ldap/dird-ldap.sock
@@ -149,11 +150,13 @@ tls_handshake_timeout = 10s
 dird_deadline = 62s
 ";
 
-/// ldap-front, required keys only (LDAPS only). Spec: docs/50 §7.1, §4.2.
+/// ldap-front, required keys only (LDAPS only). Spec: docs/50 §7.1, §4.2;
+/// docs/52 R14 (`internal_networks` required).
 pub const LDAP_FRONT_MINIMAL: &str = "\
 run_as_uid = 804
 run_as_gid = 804
 ldaps_listen = 10.0.0.5:636
+internal_networks = 10.0.0.0/8
 tls_certificate_path = /etc/ldap-front/dc-cert.der
 tls_private_key_path = /etc/ldap-front/dc-key.der
 dird_ldap_socket = /run/dird/ldap/dird-ldap.sock

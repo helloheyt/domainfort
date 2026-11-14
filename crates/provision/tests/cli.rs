@@ -61,6 +61,8 @@ fn domain_args() -> Vec<String> {
         "127.0.0.1:636",
         "--internal-network",
         "10.0.0.0/8",
+        "--internal-network",
+        "127.0.0.0/8",
     ];
     let paths = [
         ("--staging-dir", "/srv/p/etc/staging"),

@@ -227,7 +227,8 @@ impl SearchClock for FixedSearchClock {
 /// The LDAP engine called in-process over `store` with the snapshot and
 /// tier map of `policy` at `now`, as dird calls it (the reference of
 /// docs/50 §9; crates/ldap-front/tests/common/world.rs `direct`). The
-/// loopback client is internal (dird's zone table in the harness).
+/// requests are decided under the internal zone (dird derives it from the
+/// front's peer uid — docs/52 R14).
 /// Spec: docs/49 R49-16; docs/50 §4.2.
 pub fn direct(
     store: &Store,

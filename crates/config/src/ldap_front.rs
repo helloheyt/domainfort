@@ -15,7 +15,18 @@
 //! private key, and whose validity contains the start-up time (docs/50
 //! R50-12, §5.3, §6.4; Q-221 → A-57 option A; Q-320).
 //!
-//! Spec: docs/50 R50-10, R50-12, R50-15, §2.4, §3.6, §4.2, §5.3, §7.1.
+//! **Internal listeners only** (docs/52 §7 R14; A-102 on docs/questions/Q-469
+//! (b): "one front per zone; external LDAP connections are not in phase 1").
+//! The file carries the zone table (`internal_networks`, required: CIDR →
+//! Internal, everything else External — docs/50 §4.1, the same entries and
+//! match rule as the kdc's) and every `ldap_listen` / `ldaps_listen` address
+//! must lie in one of its networks (`ListenerNotInternal`). The front owns
+//! the TCP socket, so the table is read here — for its listeners and for
+//! the source of every accepted connection (crates/ldap-front) — and dird
+//! no longer maps a reported address at all (docs/questions/Q-580).
+//!
+//! Spec: docs/50 R50-10, R50-12, R50-15, §2.4, §3.6, §4.1, §4.2, §5.3, §7.1;
+//! docs/52 §7 R14.
 
 use core::net::SocketAddr;
 use core::time::Duration;
@@ -25,9 +36,9 @@ use crate::format::{Document, Located};
 use crate::limits::Bound;
 use crate::schema::{
     self, Account, Distinct, Endpoint, AUDITD_UID, AUDIT_SOCKET, DIRD_DEADLINE, DIRD_LDAP_SOCKET,
-    DIRD_UID, RUN_AS_GID, RUN_AS_UID,
+    DIRD_UID, INTERNAL_NETWORKS, RUN_AS_GID, RUN_AS_UID,
 };
-use crate::value::{self, AbsolutePath};
+use crate::value::{self, is_internal, AbsolutePath, Network};
 
 /// Key: TCP listeners for LDAP with StartTLS (port 389). Spec: docs/50 §4.2.
 const LDAP_LISTEN: &str = "ldap_listen";
@@ -108,6 +119,7 @@ pub struct LdapFrontSettings {
     run_as: Account,
     ldap_listen: Vec<SocketAddr>,
     ldaps_listen: Vec<SocketAddr>,
+    internal_networks: Vec<Network>,
     tls_certificate_path: AbsolutePath,
     tls_private_key_path: AbsolutePath,
     dird: Endpoint,
@@ -140,6 +152,34 @@ fn check_disjoint(
     Ok(())
 }
 
+/// Every listener address lies in a network of the zone table; reported at
+/// the first list (by line) that holds one outside it.
+/// Spec: docs/52 §7 R14; A-102 on docs/questions/Q-469 (b); docs/50 §4.1
+/// (CIDR → Internal), §4.2; docs/questions/Q-580.
+fn check_internal(
+    lists: [(Option<&Located<Vec<SocketAddr>>>, &'static str); 2],
+    internal: &[Network],
+) -> Result<(), Error> {
+    let mut outside: Option<(u32, &'static str)> = None;
+    for (list, key) in lists {
+        let Some(list) = list else {
+            continue;
+        };
+        if list
+            .value
+            .iter()
+            .any(|address| !is_internal(internal, address.ip()))
+            && outside.is_none_or(|(line, _)| list.line < line)
+        {
+            outside = Some((list.line, key));
+        }
+    }
+    match outside {
+        Some((line, key)) => Err(Error::at(line, key, ErrorKind::ListenerNotInternal)),
+        None => Ok(()),
+    }
+}
+
 impl LdapFrontSettings {
     /// The closed key table of ldap-front's file. Spec: docs/50 R50-15.
     pub const KEYS: &'static [&'static str] = &[
@@ -147,6 +187,7 @@ impl LdapFrontSettings {
         RUN_AS_GID,
         LDAP_LISTEN,
         LDAPS_LISTEN,
+        INTERNAL_NETWORKS,
         TLS_CERTIFICATE_PATH,
         TLS_PRIVATE_KEY_PATH,
         DIRD_LDAP_SOCKET,
@@ -161,7 +202,8 @@ impl LdapFrontSettings {
 
     /// Parses and validates ldap-front's file. Required: `run_as_uid`,
     /// `run_as_gid`, at least one of `ldap_listen` / `ldaps_listen` (no
-    /// address in both), `tls_certificate_path`, `tls_private_key_path`,
+    /// address in both), `internal_networks` (every listener address inside
+    /// one of them), `tls_certificate_path`, `tls_private_key_path`,
     /// `dird_ldap_socket` + `dird_uid`, `audit_socket`, `auditd_uid`.
     /// Optional: the timeouts (docs/50 value as default and ceiling) and
     /// `dird_deadline` (61s ..= 65s, default 65s).
@@ -169,7 +211,8 @@ impl LdapFrontSettings {
     /// # Errors
     /// Any rule of the format or of this schema (see [`crate::ErrorKind`]).
     ///
-    /// Spec: docs/50 R50-10, R50-12, R50-15, §3.6, §4.2, §5.3, §7.1.
+    /// Spec: docs/50 R50-10, R50-12, R50-15, §3.6, §4.1, §4.2, §5.3, §7.1;
+    /// docs/52 §7 R14.
     pub fn parse(input: &[u8]) -> Result<Self, Error> {
         let doc = Document::parse(input, Self::KEYS)?;
         let mut all = Distinct::default();
@@ -184,6 +227,13 @@ impl LdapFrontSettings {
             return Err(Error::file(ErrorKind::NoListener));
         }
         check_disjoint(ldap.as_ref(), ldaps.as_ref())?;
+        let internal_networks = doc
+            .required(INTERNAL_NETWORKS, |text| value::list(text, value::network))?
+            .value;
+        check_internal(
+            [(ldap.as_ref(), LDAP_LISTEN), (ldaps.as_ref(), LDAPS_LISTEN)],
+            &internal_networks,
+        )?;
         let tls_certificate_path = schema::path(&doc, &mut all, TLS_CERTIFICATE_PATH)?;
         let tls_private_key_path = schema::path(&doc, &mut all, TLS_PRIVATE_KEY_PATH)?;
         let dird = schema::endpoint(&doc, &mut all, DIRD_LDAP_SOCKET, DIRD_UID)?;
@@ -206,6 +256,7 @@ impl LdapFrontSettings {
             run_as,
             ldap_listen: ldap.map_or_else(Vec::new, |located| located.value),
             ldaps_listen: ldaps.map_or_else(Vec::new, |located| located.value),
+            internal_networks,
             tls_certificate_path,
             tls_private_key_path,
             dird,
@@ -233,6 +284,15 @@ impl LdapFrontSettings {
     #[must_use]
     pub fn ldaps_listen(&self) -> &[SocketAddr] {
         &self.ldaps_listen
+    }
+
+    /// The zone table: the internal networks. Every listener address lies
+    /// in one of them, and the front serves only clients whose source
+    /// address does (crates/ldap-front).
+    /// Spec: docs/50 §4.1; docs/52 §7 R14; A-102 on docs/questions/Q-469.
+    #[must_use]
+    pub fn internal_networks(&self) -> &[Network] {
+        &self.internal_networks
     }
 
     /// Path of the operator-supplied DC certificate (DER).

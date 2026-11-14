@@ -1341,6 +1341,8 @@ impl World {
             },
             timeouts: front_timeouts(),
             limits: ConnectionLimits::DEFAULT,
+            // The produced zone table (docs/52 R14), as provisioned.
+            internal_networks: settings.internal_networks().to_vec(),
         };
         self.front = Some(Front::start(params, server_config(&self.tls)).expect("ldap-front"));
     }

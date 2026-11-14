@@ -320,9 +320,11 @@ pub(crate) fn listener_address(text: &str) -> Result<SocketAddr, ErrorKind> {
 /// A network of the zone table: an address and a prefix length.
 ///
 /// Spec: docs/50 §4.1 ("a zone table in the configuration — CIDR →
-/// `IpScope::Internal`, everything else `External`"), §4.2 (dird's own zone
-/// table). Mapping a peer address through the table is the PEP's job (§4.2:
-/// "the mapping belongs to the PEP"), so this type only carries the entry.
+/// `IpScope::Internal`, everything else `External`"), §4.2. The table is
+/// read by the process that owns the socket the address comes from — the
+/// kdc for its UDP/TCP peers (§4.1), ldap-front for its listeners and its
+/// TCP peers (docs/52 R14; A-102 on docs/questions/Q-469) — never by a
+/// process that is only *told* an address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Network {
     address: IpAddr,
@@ -330,6 +332,26 @@ pub struct Network {
 }
 
 impl Network {
+    /// A network, or `None` under the parser's rules: prefix 0 (it would
+    /// make every address internal), a prefix longer than the address, or a
+    /// bit set past the prefix.
+    /// Spec: docs/50 §7.1 ("CIDR"), §4.1; docs/questions/Q-230 item 8.
+    #[must_use]
+    pub fn new(address: IpAddr, prefix_len: u8) -> Option<Network> {
+        let width = match address {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        if prefix_len == 0 || prefix_len > width {
+            return None;
+        }
+        let network = Network {
+            address,
+            prefix_len,
+        };
+        network.contains(address).then_some(network)
+    }
+
     /// The network address (all bits past the prefix are zero).
     #[must_use]
     pub const fn address(&self) -> IpAddr {
@@ -341,6 +363,37 @@ impl Network {
     pub const fn prefix_len(&self) -> u8 {
         self.prefix_len
     }
+
+    /// Whether `ip` lies in this network. An address matches a network of
+    /// its own family only: an IPv4-mapped IPv6 address is not rewritten,
+    /// so nothing becomes internal through a translation the operator did
+    /// not write.
+    /// Spec: docs/50 §4.1 (CIDR match); docs/questions/Q-275 item 9 (A-69).
+    #[must_use]
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (self.address, ip) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                let mask = u32::MAX
+                    .checked_shl(32 - u32::from(self.prefix_len))
+                    .unwrap_or(0);
+                u32::from(ip) & mask == u32::from(net)
+            }
+            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                let mask = u128::MAX
+                    .checked_shl(128 - u32::from(self.prefix_len))
+                    .unwrap_or(0);
+                u128::from(ip) & mask == u128::from(net)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Whether `ip` lies in one of `networks` (an empty table holds nothing).
+/// Spec: docs/50 §4.1; docs/questions/Q-230 item 8, Q-275 item 9.
+#[must_use]
+pub fn is_internal(networks: &[Network], ip: IpAddr) -> bool {
+    networks.iter().any(|network| network.contains(ip))
 }
 
 /// Parses a [`Network`] `<address>/<prefix>`: the address in the standard

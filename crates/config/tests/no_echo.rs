@@ -81,7 +81,12 @@ fn bad_values_are_not_echoed() {
         (Daemon::Keyd, KEYD, "uid_roles", format!("{m}:Kdc")),
         (Daemon::Keyd, KEYD, "key_store", m.to_owned()),
         (Daemon::Dird, DIRD, "naming_context", format!("dc={m}!")),
-        (Daemon::Dird, DIRD, "internal_networks", format!("{m}/8")),
+        (
+            Daemon::LdapFront,
+            LDAP_FRONT,
+            "internal_networks",
+            format!("{m}/8"),
+        ),
         (Daemon::Kdc, KDC, "listen", format!("{m}:88")),
         (Daemon::Kdc, KDC, "listen", format!("10.0.0.5:88,{m}")),
         (

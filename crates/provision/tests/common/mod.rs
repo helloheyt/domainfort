@@ -270,7 +270,9 @@ pub fn input(dir: &TempDir, dird_uid: u32, keyadm_uid: u32) -> DomainInput {
             kdc_listen: vec!["127.0.0.1:88".to_owned()],
             ldap_listen: Vec::new(),
             ldaps_listen: vec!["127.0.0.1:636".to_owned()],
-            internal_networks: vec!["10.0.0.0/8".to_owned()],
+            // The LDAPS listener (127.0.0.1) lies inside the internal
+            // networks (docs/52 R14: ldap-front listens only there).
+            internal_networks: vec!["10.0.0.0/8".to_owned(), "127.0.0.0/8".to_owned()],
         },
         names: Names {
             tier0_ou: "Tier0".to_owned(),

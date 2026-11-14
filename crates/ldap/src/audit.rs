@@ -404,8 +404,9 @@ pub struct AuditEvent {
     pub time: KerberosTime,
     /// The caller's connection identifier.
     pub connection_id: u64,
-    /// The source zone the front observed. Spec: docs/49 §10.1
-    /// (`source_zone`).
+    /// The source zone the request was decided under (the caller's
+    /// `TransportReport::src_net` — in dird, the zone of the front, from its
+    /// peer uid; docs/52 R14). Spec: docs/49 §10.1 (`source_zone`).
     pub source_zone: IpScope,
     /// How the connection is carried.
     pub transport: AuditTransport,

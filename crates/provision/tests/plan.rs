@@ -589,6 +589,49 @@ fn refused(input: &provision::DomainInput) -> PlanError {
     Plan::build(input, now(), &mut CountingRandom::default()).unwrap_err()
 }
 
+/// docs/52 §7 R14; A-102 on docs/questions/Q-469 (b) ("one front per zone;
+/// external LDAP connections are not in phase 1"): the zone table goes to
+/// ldap-front's file (required there — every LDAP listener inside it) and
+/// no longer to dird's (dird derives the LDAP zone from the front's peer
+/// uid); without an internal network provisioning refuses; an LDAP listener
+/// outside the internal networks fails the parse-back by ldap-front's own
+/// schema. Addresses are test data.
+#[test]
+fn the_zone_table_is_ldap_fronts() {
+    let dir = TempDir::new();
+    let input = input(&dir, 61002, 61007);
+    let p = plan(&input);
+    let text_of = |d: provision::Daemon| p.configs.iter().find(|f| f.daemon == d).unwrap().text();
+    let front =
+        config::LdapFrontSettings::parse(text_of(provision::Daemon::LdapFront).as_bytes()).unwrap();
+    assert_eq!(front.internal_networks().len(), 2);
+    assert!(text_of(provision::Daemon::LdapFront)
+        .lines()
+        .any(|l| l == "internal_networks = 10.0.0.0/8, 127.0.0.0/8"));
+    assert!(!text_of(provision::Daemon::Dird)
+        .lines()
+        .any(|l| l.starts_with("internal_networks")));
+
+    let mut none = input.clone();
+    none.network.internal_networks.clear();
+    let error = match refused(&none) {
+        PlanError::Input(error) => error,
+        other => panic!("not an input error: {other:?}"),
+    };
+    assert_eq!(error.kind, InputErrorKind::MissingInternalNetwork);
+    assert_eq!(error.field, "internal-network");
+
+    let mut outside = input.clone();
+    outside.network.internal_networks = vec!["10.0.0.0/8".to_owned()];
+    match refused(&outside) {
+        PlanError::Config(daemon, error) => {
+            assert_eq!(daemon, provision::Daemon::LdapFront);
+            assert_eq!(error.kind(), config::ErrorKind::ListenerNotInternal);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
 fn input_kind(e: PlanError) -> InputErrorKind {
     match e {
         PlanError::Input(i) => i.kind,

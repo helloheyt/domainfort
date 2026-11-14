@@ -87,5 +87,11 @@ fuzz_target!(|data: &[u8]| {
     }
     if let Ok(settings) = LdapFrontSettings::parse(data) {
         assert!(!(settings.ldap_listen().is_empty() && settings.ldaps_listen().is_empty()));
+        // docs/52 R14: every accepted listener lies in the zone table.
+        assert!(settings
+            .ldap_listen()
+            .iter()
+            .chain(settings.ldaps_listen())
+            .all(|address| config::is_internal(settings.internal_networks(), address.ip())));
     }
 });

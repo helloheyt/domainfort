@@ -13,8 +13,8 @@
 //!    — then spawn the engine thread (R50-7).
 //! 3. **the LDAP service** (task P10) — the engine (`ldap::Engine` with the
 //!    naming context and `dns_host_name`), the PDP snapshot of the same
-//!    policy file, its own directory context and tier map, dird's zone
-//!    table, the audit gate (the connection verified in step 1 now delivers
+//!    policy file, its own directory context and tier map, the audit gate
+//!    (the connection verified in step 1 now delivers
 //!    the LDAP events, crate::audit_link) — then the LDAP engine thread and
 //!    its own bounded queue (crate::ldap_engine).
 //! 4. **the listeners** — for `dird_kdc_socket` and `dird_ldap_socket`:
@@ -58,13 +58,13 @@ use crate::ldap_listener::{self, LdapServeContext};
 use crate::listener::{accept_loop, ServeContext};
 use crate::log::{note, Note};
 use crate::policy::{tier_map, DevelopmentPolicy};
-use crate::zones::ZoneTable;
 use core::fmt;
 use core::time::Duration;
 use directory_pip::{DirectoryContext, NamingContext};
 use dirstore::{IntegrityKey, Store};
 use ipc_audit::WindowConfig;
 use ipc_directory_server::ViewLimits;
+use ipc_ldap_server::Fronts;
 use keyd_types::KeydConfig;
 use ldap::{Engine, EngineConfig, RootDseConfig};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -148,7 +148,9 @@ pub struct DaemonParams {
     pub keyd: KeydConfig,
     /// `dird_ldap_socket` (docs/50 §3.1, §4.2).
     pub ldap_socket: PathBuf,
-    /// `ldap_front_uid`: the only peer admitted on it (docs/50 §3.2).
+    /// `ldap_front_uid`: the only peer admitted on it (docs/50 §3.2) — the
+    /// internal front; its connections' requests are decided under the
+    /// internal zone (docs/52 R14; ipc-ldap-server `Fronts`).
     pub ldap_front_uid: u32,
     /// LDAP sessions open at once ([`MAX_LDAP_SESSIONS`]).
     pub max_ldap_sessions: usize,
@@ -157,8 +159,6 @@ pub struct DaemonParams {
     /// The DC's DNS host name, reported by the rootDSE ([MS-ADTS]
     /// 3.1.1.3.2.4).
     pub dns_host_name: String,
-    /// dird's zone table (docs/50 §4.2).
-    pub zones: ZoneTable,
     /// The LDAP events' sender window (A-57; `WindowConfig::DEFAULT`).
     pub audit_window: WindowConfig,
     /// The LDAP engine's clock (the system clock; tests inject one).
@@ -613,7 +613,8 @@ pub async fn serve_with_admin(
 
     // 3. The LDAP service (task P10): its own directory context and tier
     //    map of the same policy, the PDP snapshot of the same file (A-68),
-    //    the engine, the zone table, the audit gate.
+    //    the engine, the audit gate. No zone table: the zone is the
+    //    front's, from its peer uid (docs/52 R14).
     let ldap_schema = ad_schema::phase1().map_err(|_| DaemonError::Schema)?;
     let ldap_ctx = DirectoryContext::new(ldap_schema, &params.keyd, params.naming_context.clone())
         .map_err(|_| DaemonError::Context)?;
@@ -636,7 +637,6 @@ pub async fn serve_with_admin(
         tiers: ldap_tiers,
         policy: snapshot,
         engine: ldap_engine,
-        zones: params.zones.clone(),
         gate: Arc::clone(&gate),
         clock: params.clock.clone(),
     };
@@ -699,7 +699,7 @@ pub async fn serve_with_admin(
         handle,
     ));
     let ldap_context = Arc::new(LdapServeContext::new(
-        params.ldap_front_uid,
+        Fronts::new(params.ldap_front_uid),
         params.frame_timeout,
         params.max_ldap_sessions,
         ldap_handle,

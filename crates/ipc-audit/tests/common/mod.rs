@@ -18,8 +18,8 @@ use ipc_audit::{
     IpZone, KdcEvent, KdcExchange, KdcOutcome, KdcReason, KdcTransport, KeyPurposeCode, KeyRef,
     KeydOperation, KeydOutcome, KeydReason, KeydRecord, KeydRole, LdapAction, LdapBind, LdapEvent,
     LdapOperation, LdapReason, LdapSearch, LdapTarget, LdapTransport, PdpReason, PdpReasonCode,
-    Principal, SearchScope, SidValue, TransportSecurity, UnsupportedOpCode, WindowSummary,
-    MAX_FILTER_ATTRS, MAX_NAME_COMPONENTS, MAX_SID_SUB_AUTHORITIES, MAX_TEXT_OCTETS,
+    Principal, ReportedAddress, SearchScope, SidValue, TransportSecurity, UnsupportedOpCode,
+    WindowSummary, MAX_FILTER_ATTRS, MAX_NAME_COMPONENTS, MAX_SID_SUB_AUTHORITIES, MAX_TEXT_OCTETS,
 };
 
 pub fn time() -> CalendarTime {
@@ -175,6 +175,9 @@ pub fn ldap_event() -> LdapEvent {
         time: time(),
         connection_id: 4242,
         source_zone: IpZone::Internal,
+        reported_peer: ReportedAddress::new(core::net::IpAddr::V4(core::net::Ipv4Addr::new(
+            10, 0, 0, 9,
+        ))),
         transport: LdapTransport::StartTls,
         transport_sec: TransportSecurity {
             encrypted: true,
@@ -226,6 +229,10 @@ pub fn largest_ldap_event() -> LdapEvent {
         time: time(),
         connection_id: u64::MAX,
         source_zone: IpZone::External,
+        // The longer family (docs/52 R14: 1 + 16 octets).
+        reported_peer: ReportedAddress::new(core::net::IpAddr::V6(core::net::Ipv6Addr::new(
+            0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+        ))),
         transport: LdapTransport::Ldaps,
         transport_sec: TransportSecurity {
             encrypted: true,

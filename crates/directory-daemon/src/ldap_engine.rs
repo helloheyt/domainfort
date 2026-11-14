@@ -25,9 +25,14 @@
 //!   store as the PIP, the account source and the directory (docs/49 §4.4,
 //!   R49-15: authorization derived again for every operation from a fresh
 //!   view; docs/47 §8.1: one view serves as both), reads `now` from dird's
-//!   clock, runs the engine, and commits the event before the reply leaves
-//!   (Q-252 item 9). The bound-identity re-check uses this view's own
+//!   clock, runs the engine, and commits the event — with the client address
+//!   the front reported, as an unverified observation — before the reply
+//!   leaves (Q-252 item 9). The bound-identity re-check uses this view's own
 //!   `AccountSource` — in process, since dird owns the store.
+//! * **No zone table** (docs/52 R14): the request's zone arrives fixed in
+//!   its `TransportReport` — the zone of the front the connection came
+//!   from, derived from the peer uid by the listener. Nothing here can turn
+//!   the reported address into a zone.
 //!
 //! # Threads and hardening
 //!
@@ -43,14 +48,13 @@ use crate::clock::{SearchTime, SharedClock};
 use crate::engine::{EngineError, EngineThread, OnExit, SubmitError};
 use crate::ldap_audit::AuditGate;
 use crate::rate::ObligationLimiter;
-use crate::zones::ZoneTable;
 use core::fmt;
-use core::net::IpAddr;
 use directory_pip::{DirectoryContext, PepView, TierMap};
 use dirstore::Store;
+use ipc_ldap::ReportedPeer;
 use ipc_ldap_server::{Dispatch, LdapConnection, RequestHost, Unserved};
 use ldap::{DirectoryInputs, Engine, Outcome, RequestInputs, TransportReport};
-use pdp::{IpScope, PolicySnapshot};
+use pdp::PolicySnapshot;
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -106,7 +110,7 @@ impl LdapEngineHandle {
 
 /// What the LDAP engine thread owns: the store, its own directory context
 /// and tier map (of the loaded policy), the policy snapshot, the engine,
-/// the zone table, the audit gate and the clock.
+/// the audit gate and the clock — no zone table (docs/52 R14).
 /// Spec: docs/50 R50-2, §4.2, §7.2; docs/49 §11.
 pub struct LdapService {
     /// The store (shared with the directory-view engine; read-only here).
@@ -119,8 +123,6 @@ pub struct LdapService {
     pub policy: PolicySnapshot,
     /// The engine (docs/49 §11).
     pub engine: Engine,
-    /// dird's zone table (docs/50 §4.2).
-    pub zones: ZoneTable,
     /// The A-57 gate (crate::ldap_audit).
     pub gate: Arc<AuditGate>,
     /// dird's clock.
@@ -142,23 +144,19 @@ struct LdapHost<'a> {
     ctx: &'a DirectoryContext,
     tiers: &'a TierMap,
     policy: &'a PolicySnapshot,
-    zones: &'a ZoneTable,
     gate: &'a AuditGate,
     clock: &'a SharedClock,
     rate: &'a mut ObligationLimiter,
 }
 
 impl RequestHost for LdapHost<'_> {
-    /// Spec: docs/50 §4.2.
-    fn zone(&self, peer: IpAddr) -> IpScope {
-        self.zones.scope(peer)
-    }
-
     /// Spec: docs/49 §4.4 (R49-15), §10.1 (R49-14), §11; docs/50 §8.1;
-    /// docs/questions Q-218 (A-57), Q-252 item 9 (A-64).
+    /// docs/questions Q-218 (A-57), Q-252 item 9 (A-64); docs/52 R14 (the
+    /// reported address goes to the record, never into the inputs).
     fn serve(
         &mut self,
         transport: TransportReport,
+        reported_peer: ReportedPeer,
         run: &mut dyn FnMut(RequestInputs<'_>) -> Outcome,
     ) -> Result<Outcome, Unserved> {
         // The audit slot first: no slot, no operation (A-57).
@@ -194,7 +192,7 @@ impl RequestHost for LdapHost<'_> {
         });
         // Commit, then reply (Q-252 item 9).
         self.gate
-            .record(reservation, &outcome.audit)
+            .record(reservation, &outcome.audit, reported_peer)
             .map_err(|_| Unserved::Unavailable)?;
         Ok(outcome)
     }
@@ -239,7 +237,6 @@ impl LdapService {
                         ctx: &service.ctx,
                         tiers: &service.tiers,
                         policy: &service.policy,
-                        zones: &service.zones,
                         gate: &service.gate,
                         clock: &service.clock,
                         rate: &mut rate,

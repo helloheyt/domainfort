@@ -12,7 +12,11 @@
 //! * dird down → the front's client reports the closure (and its Notice of
 //!   Disconnection says unavailable);
 //! * `TlsEstablished` before StartTLS is refused (the session rules);
-//! * auditd unreachable → LDAP operations refused (A-57).
+//! * auditd unreachable → LDAP operations refused (A-57);
+//! * **the zone is the front's, from its peer uid** (docs/52 R14, attack
+//!   test): fronts reporting an internal and an external client address get
+//!   the same decision, and auditd records the zone dird derived beside the
+//!   address as reported.
 //!
 //! Real peer credentials on both sides; the only injection is dird's clock
 //! (a clock that can hold the LDAP engine thread, the kdc daemon's tier-2
@@ -21,7 +25,8 @@
 //! Sources: docs/50 R50-3, R50-7, R50-10, R50-16, R50-17, §3.2, §3.3, §3.6,
 //! §3.7, §4.2, §4.3, §8.1, §9; docs/49 R49-14, R49-16, §4.4, §5.2; RFC 4511
 //! §4.4.1, §4.5.1, §4.14.1, App. A; docs/questions Q-218 (A-57), Q-252
-//! item 8 (A-64), Q-280. Every value is hand-made.
+//! item 8 (A-64), Q-280; docs/52 §3.3, §7 R14; A-102 on docs/questions/Q-469.
+//! Every value is hand-made.
 
 mod support;
 
@@ -34,7 +39,7 @@ use ipc::{encode_frame, Direction, FrameReader, Refused, Reply};
 use ipc_audit::EventBody;
 use ipc_ldap::{
     notice_of_disconnection, ChannelFailure, ConnectionAction, LdapChannelClient, LdapReply,
-    LdapRequest, Listener, TransportError, TransportFacts, LDAP_CHANNEL, REPLY_LIMIT,
+    LdapRequest, Listener, ReportedPeer, TransportError, TransportFacts, LDAP_CHANNEL, REPLY_LIMIT,
 };
 use krb_proto::KerberosTime;
 use ldap::{
@@ -251,8 +256,17 @@ fn peer() -> IpAddr {
 type Client = LdapChannelClient<<connector::LdapConnector as ipc_ldap::Connector>::Connection>;
 
 fn open(w: &World, listener: Listener) -> Result<Client, ChannelFailure> {
+    open_reporting(w, listener, peer())
+}
+
+/// A session whose `Open` reports `reported` as the client address.
+fn open_reporting(
+    w: &World,
+    listener: Listener,
+    reported: IpAddr,
+) -> Result<Client, ChannelFailure> {
     let mut connector = connector::ldap(&w.dird.ldap_socket);
-    LdapChannelClient::open(&mut connector, w.uid, listener, peer(), LONG)
+    LdapChannelClient::open(&mut connector, w.uid, listener, reported, LONG)
         .map(|(client, _framing)| client)
 }
 
@@ -442,6 +456,48 @@ fn the_anonymous_root_dse_over_the_socket() {
     w.dird.stop().unwrap();
 }
 
+/// **Attack test** — docs/52 §3.3 (C3), §7 R14; A-102 on
+/// docs/questions/Q-469 (b); A-51 (the anonymous rootDSE grant is
+/// internal-only): over the real socket, a front reporting an address
+/// inside the old internal table (10.0.0.9), one outside it (192.0.2.44)
+/// and an IPv6 one (test data) gets the **same** answer — Success, octet for
+/// octet — because dird derives the zone from the front's peer uid, not
+/// from the report. auditd records `source_zone: Internal` for each, beside
+/// `reported_peer` exactly as reported (an unverified observation).
+#[test]
+fn the_reported_address_cannot_change_the_decision() {
+    let Some(w) = world(0, |_| {}) else {
+        return;
+    };
+    let reports = [
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)),
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 44)),
+        IpAddr::V6(core::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 44)),
+    ];
+    let mut answers = Vec::new();
+    for (n, reported) in reports.iter().enumerate() {
+        let mut client = open_reporting(&w, Listener::Ldap, *reported).unwrap();
+        let exchange = client.message(&root_dse(1), CLEAR).unwrap();
+        assert_eq!(last_code(&exchange.responses), ResultCode::Success);
+        answers.push(exchange.responses);
+        client.close();
+        assert!(eventually(LONG, || ldap_events(&w).len() == n + 1));
+    }
+    assert!(answers.windows(2).all(|pair| pair[0] == pair[1]));
+    let mut recorded: Vec<(ipc_audit::IpZone, IpAddr)> = ldap_events(&w)
+        .iter()
+        .map(|event| (event.source_zone, event.reported_peer.address()))
+        .collect();
+    let mut expected: Vec<(ipc_audit::IpZone, IpAddr)> = reports
+        .iter()
+        .map(|reported| (ipc_audit::IpZone::Internal, *reported))
+        .collect();
+    recorded.sort_by_key(|(_, address)| address.to_string());
+    expected.sort_by_key(|(_, address)| address.to_string());
+    assert_eq!(recorded, expected);
+    w.dird.stop().unwrap();
+}
+
 /// docs/50 R50-3, §3.2 ("dird-ldap.sock ← ldap-front"; an unmapped uid ⇒
 /// the connection is closed): dird configured for another front uid closes
 /// the test's connection without any reply; the front's client sees the
@@ -456,7 +512,7 @@ fn a_peer_that_is_not_the_front_is_closed_without_a_reply() {
     raw.set_read_timeout(Some(LONG)).unwrap();
     let _ = raw.write_all(&request_frame(&LdapRequest::Open {
         listener: Listener::Ldap,
-        peer_addr: peer(),
+        reported_peer: ReportedPeer::new(peer()),
     }));
     let mut octets = Vec::new();
     let _ = raw.read_to_end(&mut octets);
@@ -619,7 +675,7 @@ fn tls_established_before_start_tls_is_refused() {
     raw.set_read_timeout(Some(LONG)).unwrap();
     raw.write_all(&request_frame(&LdapRequest::Open {
         listener: Listener::Ldap,
-        peer_addr: peer(),
+        reported_peer: ReportedPeer::new(peer()),
     }))
     .unwrap();
     let opened = read_reply(&mut raw).unwrap();

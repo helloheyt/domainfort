@@ -120,34 +120,16 @@ fn dird_sample_parses() {
         service.provision_manifest().as_str(),
         "/etc/domain/provision.manifest"
     );
-    let networks: Vec<_> = s
-        .internal_networks()
-        .iter()
-        .map(|n| (n.address(), n.prefix_len()))
-        .collect();
-    assert_eq!(
-        networks,
-        [
-            (IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8),
-            (IpAddr::V4(Ipv4Addr::new(192, 168, 10, 0)), 24),
-            (
-                IpAddr::V6(Ipv6Addr::new(0xfd00, 0x1234, 0, 0, 0, 0, 0, 0)),
-                32
-            ),
-        ]
-    );
     assert_eq!(s.audit().uid(), 805);
     assert_eq!(s.frame_timeout(), secs(5));
     assert_eq!(s.view_lifetime(), secs(3));
 }
 
-/// Without a zone table every peer is `External` (empty list); without the
-/// admin pair there is no admin channel. Spec: docs/50 §4.2; §3.6 / §3.4
-/// defaults; docs/questions/Q-230 items 8, 11.
+/// Without the admin pair there is no admin channel. Spec: docs/50 §3.6 /
+/// §3.4 defaults; docs/questions/Q-230 item 11.
 #[test]
 fn dird_minimal_sample_takes_defaults() {
     let s = DirdSettings::parse(common::DIRD_MINIMAL.as_bytes()).expect("valid dird file");
-    assert!(s.internal_networks().is_empty());
     assert!(s.admin_channel().is_none());
     assert!(s.admin_service().is_none());
     assert!(s.keyd().is_none());
@@ -204,13 +186,30 @@ fn kdc_minimal_sample_takes_defaults() {
 }
 
 /// Spec: docs/50 §2.4 (ldap-front), §4.2 (389 / 636, the timeouts), §3.6
-/// (dird-ldap deadline), R50-12 / §5.3 (certificate and key paths).
+/// (dird-ldap deadline), R50-12 / §5.3 (certificate and key paths), §4.1
+/// (the zone table — ldap-front's since docs/52 R14).
 #[test]
 fn ldap_front_sample_parses() {
     let s = LdapFrontSettings::parse(common::LDAP_FRONT.as_bytes()).expect("valid file");
     assert_eq!((s.run_as().uid(), s.run_as().gid()), (804, 804));
     assert_eq!(s.ldap_listen(), [v4(10, 0, 0, 5, 389)]);
     assert_eq!(s.ldaps_listen(), [v4(10, 0, 0, 5, 636), fd00_1234(5, 636)]);
+    let networks: Vec<_> = s
+        .internal_networks()
+        .iter()
+        .map(|n| (n.address(), n.prefix_len()))
+        .collect();
+    assert_eq!(
+        networks,
+        [
+            (IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8),
+            (IpAddr::V4(Ipv4Addr::new(192, 168, 10, 0)), 24),
+            (
+                IpAddr::V6(Ipv6Addr::new(0xfd00, 0x1234, 0, 0, 0, 0, 0, 0)),
+                32
+            ),
+        ]
+    );
     assert_eq!(
         s.tls_certificate_path().as_str(),
         "/etc/ldap-front/dc-cert.der"
@@ -393,4 +392,39 @@ fn order_comments_and_empty_lines_do_not_matter() {
         }
         assert_eq!(daemon.parse(shuffled.as_bytes()), Ok(()), "{daemon:?}");
     }
+}
+
+/// The zone table's match (docs/50 §4.1: CIDR → Internal, everything else
+/// External; docs/questions/Q-230 item 8: host bits zero, prefix ≥ 1, an
+/// empty table holds nothing; Q-275 item 9: within one address family, no
+/// IPv4-mapped translation) — the one implementation ldap-front's listener
+/// rule and its source check read (docs/52 R14). Every address is test data.
+#[test]
+fn network_containment() {
+    let ten = config::Network::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8).unwrap();
+    let ula =
+        config::Network::new(IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 0)), 16).unwrap();
+    let table = [ten, ula];
+    let inside = |ip| config::is_internal(&table, ip);
+    assert!(inside(IpAddr::V4(Ipv4Addr::new(10, 200, 3, 4))));
+    assert!(!inside(IpAddr::V4(Ipv4Addr::new(11, 0, 0, 1))));
+    assert!(inside(IpAddr::V6(Ipv6Addr::new(
+        0xfd00, 1, 2, 3, 4, 5, 6, 7
+    ))));
+    assert!(!inside(IpAddr::V6(Ipv6Addr::new(
+        0xfd01, 0, 0, 0, 0, 0, 0, 1
+    ))));
+    let mapped = IpAddr::V6(Ipv4Addr::new(10, 1, 1, 1).to_ipv6_mapped());
+    assert!(!inside(mapped));
+    assert!(!config::is_internal(
+        &[],
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))
+    ));
+    let host = config::Network::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), 32).unwrap();
+    assert!(host.contains(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))));
+    assert!(!host.contains(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 6))));
+    assert!(config::Network::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 8).is_none());
+    assert!(config::Network::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 0).is_none());
+    assert!(config::Network::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 33).is_none());
+    assert!(config::Network::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 129).is_none());
 }

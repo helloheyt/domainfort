@@ -144,7 +144,7 @@ const _: () = assert!(MAX_RESPONSE_MESSAGE <= MAX_REPLY_OCTETS);
 /// connection to dird"). Values are a project choice.
 /// Spec: docs/50 §3.3 ("`kind` closed"), §4.2, §4.3, §7.5.
 pub mod request_kind {
-    /// `Open { listener, peer_addr }`: the first message of a session.
+    /// `Open { listener, reported_peer }`: the first message of a session.
     /// Spec: docs/50 §4.2.
     pub const OPEN: u8 = 0x01;
     /// `Message { canonical, tls_established, input_pending }`.

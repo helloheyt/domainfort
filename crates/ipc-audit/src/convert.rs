@@ -1,8 +1,10 @@
 //! Conversions from each source crate's audit type to its wire shape
 //! (features `kdc`, `keyd`, `ldap`).
 //!
-//! A sender calls `KdcEvent::from(&event)` (or the keyd / ldap equivalent),
-//! wraps it in an [`crate::EventBody`] and commits it to its
+//! A sender calls `KdcEvent::from(&event)` (or the keyd equivalent;
+//! `LdapEvent::from_engine(&event, reported_peer)` for ldap, whose wire shape
+//! adds the client address ldap-front reported — docs/52 R14), wraps it in
+//! an [`crate::EventBody`] and commits it to its
 //! [`crate::SendWindow`]. Every field of the source type is carried; none of
 //! them is secret (the source types were built without any field that could
 //! hold one — crates/kdc, keyd, ldap audit.rs). Client strings pass the
@@ -231,8 +233,8 @@ mod from_ldap {
     use super::{calendar_time, from_pdp};
     use crate::{
         AuditText, BindMechanism, CodecError, CodecErrorCode, CodecLimit, LdapAction, LdapBind,
-        LdapEvent, LdapOperation, LdapReason, LdapSearch, LdapTarget, LdapTransport, SearchScope,
-        SidValue, TransportSecurity, UnsupportedOpCode,
+        LdapEvent, LdapOperation, LdapReason, LdapSearch, LdapTarget, LdapTransport,
+        ReportedAddress, SearchScope, SidValue, TransportSecurity, UnsupportedOpCode,
     };
 
     /// `ldap::AuditText` → [`AuditText`] (the same rule, applied again).
@@ -352,10 +354,15 @@ mod from_ldap {
         )
     }
 
-    impl From<&ldap::AuditEvent> for LdapEvent {
-        /// Every field of the LDAP engine's event. Spec: crates/ldap
-        /// audit.rs; docs/49 §10.1.
-        fn from(event: &ldap::AuditEvent) -> LdapEvent {
+    impl LdapEvent {
+        /// Every field of the LDAP engine's event, and the client address
+        /// ldap-front reported for the connection (`reported_peer`, an
+        /// unverified observation the engine never received — dird passes
+        /// it beside the event). There is no conversion without it, so no
+        /// LDAP record lacks the reported address.
+        /// Spec: crates/ldap audit.rs; docs/49 §10.1; docs/52 §7 R14.
+        #[must_use]
+        pub fn from_engine(event: &ldap::AuditEvent, reported_peer: ReportedAddress) -> LdapEvent {
             use ldap::{AuditTarget, AuditTransport, ConnectionAction};
             let policy_reason = match &event.reason {
                 ldap::AuditReason::PolicyDenied(code) => Some(from_pdp::reason(code)),
@@ -369,6 +376,7 @@ mod from_ldap {
                 time: calendar_time(&event.time),
                 connection_id: event.connection_id,
                 source_zone: from_pdp::zone(&event.source_zone),
+                reported_peer,
                 transport: map_units!(&event.transport, AuditTransport => LdapTransport {
                     Ldap, Ldaps, StartTls,
                 }),

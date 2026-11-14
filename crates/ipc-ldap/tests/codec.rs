@@ -16,8 +16,9 @@ use ipc::{
 use ipc_ldap::channel::{codes, reply_kind, request_kind};
 use ipc_ldap::{
     split_response, ConnectionAction, LdapReply, LdapRequest, Listener, MessageRequest,
-    ResponsePart, TransportFacts, LDAP_CHANNEL, LDAP_MAGIC, LDAP_VERSION, MAX_CANONICAL_MESSAGE,
-    MAX_REPLY_BODY, MAX_REQUEST_BODY, MAX_RESPONSE_MESSAGE, MAX_RESPONSE_PART,
+    ReportedPeer, ResponsePart, TransportFacts, LDAP_CHANNEL, LDAP_MAGIC, LDAP_VERSION,
+    MAX_CANONICAL_MESSAGE, MAX_REPLY_BODY, MAX_REQUEST_BODY, MAX_RESPONSE_MESSAGE,
+    MAX_RESPONSE_PART,
 };
 use parse_ldap::AuthState;
 use zeroize::Zeroizing;
@@ -38,11 +39,13 @@ fn every_request() -> Vec<LdapRequest> {
     vec![
         LdapRequest::Open {
             listener: Listener::Ldap,
-            peer_addr: IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)),
+            reported_peer: ReportedPeer::new(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3))),
         },
         LdapRequest::Open {
             listener: Listener::Ldaps,
-            peer_addr: IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 7)),
+            reported_peer: ReportedPeer::new(IpAddr::V6(Ipv6Addr::new(
+                0xfd00, 0, 0, 0, 0, 0, 0, 7,
+            ))),
         },
         message(&[0x30, 0x05, 0x02, 0x01, 0x01, 0x42, 0x00], false, false),
         message(&[0x30, 0x00], true, true),
@@ -118,7 +121,7 @@ fn hand_written_octets() {
         Direction::Request,
         &LdapRequest::Open {
             listener: Listener::Ldaps,
-            peer_addr: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9)),
+            reported_peer: ReportedPeer::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9))),
         },
     )
     .unwrap();
@@ -131,7 +134,7 @@ fn hand_written_octets() {
         Direction::Request,
         &LdapRequest::Open {
             listener: Listener::Ldap,
-            peer_addr: IpAddr::V6(Ipv6Addr::LOCALHOST),
+            reported_peer: ReportedPeer::new(IpAddr::V6(Ipv6Addr::LOCALHOST)),
         },
     )
     .unwrap();

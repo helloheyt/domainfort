@@ -6,23 +6,28 @@
 //!
 //! | message | fields |
 //! |---|---|
-//! | `Open` | `listener: u8`, `peer_addr: family u8 ‖ [u8; 4] or [u8; 16]` |
+//! | `Open` | `listener: u8`, `reported_peer: family u8 ‖ [u8; 4] or [u8; 16]` |
 //! | `Message` | `canonical: bytes<MAX_CANONICAL_MESSAGE>`, `tls_established: bool`, `input_pending: bool` |
 //! | `TlsEstablished`, `Close`, `Ping`, `Pong` | — |
 //! | `Opened`, `TlsAccepted` | `framing: u8` |
 //! | `Response` | `part: bytes<MAX_RESPONSE_PART>` (never empty), `more: bool` (`true` only on a part of exactly `MAX_RESPONSE_PART`) |
 //! | `Done` | `action: u8`, `framing: u8` |
 //!
-//! **No field lets the front claim an identity or a channel binding** (A-47,
-//! A-54): `Message` carries only the two transport facts the engine's
-//! `TransportReport` defines besides the zone — and the zone itself is not
-//! sent: the front sends the peer **address** and dird maps it through its
-//! own zone table (docs/50 §4.2: "the mapping belongs to the PEP"). The
-//! channel-binding value is computed by dird from the configured certificate
-//! (docs/50 R50-13), never by the front.
+//! **No field lets the front claim an identity, a channel binding or a
+//! zone** (A-47, A-54; docs/52 R14): `Message` carries only the two
+//! transport facts the engine's `TransportReport` defines besides the zone.
+//! The zone is not sent and not derived from anything sent: dird takes it
+//! from the peer uid of the channel connection — the front's identity, a
+//! kernel fact (docs/50 R50-3) — and phase 1 has one front, the internal one
+//! (A-102 on docs/questions/Q-469 (b)). The client address the front reports
+//! in `Open` is a [`ReportedPeer`]: an unverified observation for the audit
+//! record, with no conversion to a zone. The channel-binding value is
+//! computed by dird from the configured certificate (docs/50 R50-13), never
+//! by the front.
 //!
 //! Spec: docs/50 §3.3 (primitives, one encoding per value), §4.2, §4.3,
-//! R50-13; docs/49 R49-16; A-47; A-54 (Q-190 item 11).
+//! R50-3, R50-13; docs/49 R49-16; A-47; A-54 (Q-190 item 11); docs/52 §3.3,
+//! §7 R14.
 
 use crate::channel::{
     codes, reply_kind, request_kind, ConnectionAction, Listener, MAX_CANONICAL_MESSAGE,
@@ -39,7 +44,7 @@ const PART: usize = MAX_RESPONSE_PART as usize;
 
 /// What the front observed about the transport when it framed the message —
 /// exactly the engine's `TransportReport` minus the zone (which dird derives
-/// from the peer address, docs/50 §4.2).
+/// from the front's peer uid, never from this channel — docs/52 R14).
 /// Spec: docs/50 §4.2 (`Message { canonical, tls_established, input_pending
 /// }`), §4.3 step 1; crates/ldap inputs.rs; A-47.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -76,17 +81,45 @@ impl fmt::Debug for MessageRequest {
     }
 }
 
+/// The client's IP address **as the front reports it** in `Open`: an
+/// unverified observation. The front owns the TCP socket (docs/50 §4.2), so
+/// a compromised front can report any address; dird therefore never derives
+/// a zone or any other access fact from it (C3, "a security fact asserted by
+/// a component that does not own it" — docs/52 §3.3, R14). The type has no
+/// conversion to a zone; its one reader is the audit record, which keeps it
+/// labelled as reported (crates/ipc-audit `LdapEvent::reported_peer`).
+/// Spec: docs/52 §3.3, §7 R14; A-102 on docs/questions/Q-469; docs/50 §4.2;
+/// docs/questions/Q-581.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReportedPeer(IpAddr);
+
+impl ReportedPeer {
+    /// The address the front reports for its client.
+    #[must_use]
+    pub const fn new(address: IpAddr) -> ReportedPeer {
+        ReportedPeer(address)
+    }
+
+    /// The reported address, for the audit record only — it is whatever the
+    /// front said, not a verified fact (type documentation).
+    #[must_use]
+    pub const fn unverified_address(&self) -> IpAddr {
+        self.0
+    }
+}
+
 /// The messages the front sends.
 /// Spec: docs/50 §4.2, §4.3, §7.5.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LdapRequest {
     /// The first message of a session: which listener accepted the client,
-    /// and the client's address (dird maps it to a zone, docs/50 §4.2).
+    /// and the client's address as the front reports it (for the audit
+    /// record only — docs/52 R14).
     Open {
         /// The listener.
         listener: Listener,
-        /// The client's IP address as the front's socket reports it.
-        peer_addr: IpAddr,
+        /// The client's IP address as the front reports it (unverified).
+        reported_peer: ReportedPeer,
     },
     /// One canonical LDAPMessage.
     Message(MessageRequest),
@@ -99,10 +132,10 @@ pub enum LdapRequest {
     Ping,
 }
 
-/// A peer address: `family: u8` (closed table) then the octets.
+/// A reported peer address: `family: u8` (closed table) then the octets.
 /// Spec: docs/50 §3.3 ("enum = `u8` from a closed table"), §4.2.
-fn write_peer_addr(writer: &mut Writer, peer: &IpAddr) -> Result<()> {
-    match peer {
+fn write_reported_peer(writer: &mut Writer, peer: &ReportedPeer) -> Result<()> {
+    match peer.unverified_address() {
         IpAddr::V4(v4) => {
             writer.write_enum(codes::FAMILY_V4)?;
             writer.write_array(&v4.octets())
@@ -115,14 +148,15 @@ fn write_peer_addr(writer: &mut Writer, peer: &IpAddr) -> Result<()> {
 }
 
 /// Spec: docs/50 §3.3, §4.2.
-fn read_peer_addr(reader: &mut Reader<'_>) -> Result<IpAddr> {
+fn read_reported_peer(reader: &mut Reader<'_>) -> Result<ReportedPeer> {
     let family = reader
         .read_enum(|code| (code == codes::FAMILY_V4 || code == codes::FAMILY_V6).then_some(code))?;
-    if family == codes::FAMILY_V4 {
-        Ok(IpAddr::V4(Ipv4Addr::from(reader.read_array::<4>()?)))
+    let address = if family == codes::FAMILY_V4 {
+        IpAddr::V4(Ipv4Addr::from(reader.read_array::<4>()?))
     } else {
-        Ok(IpAddr::V6(Ipv6Addr::from(reader.read_array::<16>()?)))
-    }
+        IpAddr::V6(Ipv6Addr::from(reader.read_array::<16>()?))
+    };
+    Ok(ReportedPeer::new(address))
 }
 
 impl MessageSet for LdapRequest {
@@ -143,10 +177,10 @@ impl MessageSet for LdapRequest {
         match self {
             LdapRequest::Open {
                 listener,
-                peer_addr,
+                reported_peer,
             } => {
                 writer.write_enum(codes::listener(*listener))?;
-                write_peer_addr(writer, peer_addr)
+                write_reported_peer(writer, reported_peer)
             }
             LdapRequest::Message(message) => {
                 writer.write_bytes(&message.canonical, MAX_CANONICAL_MESSAGE)?;
@@ -162,10 +196,10 @@ impl MessageSet for LdapRequest {
         match kind {
             request_kind::OPEN => {
                 let listener = reader.read_enum(codes::listener_from)?;
-                let peer_addr = read_peer_addr(reader)?;
+                let reported_peer = read_reported_peer(reader)?;
                 Ok(LdapRequest::Open {
                     listener,
-                    peer_addr,
+                    reported_peer,
                 })
             }
             request_kind::MESSAGE => {

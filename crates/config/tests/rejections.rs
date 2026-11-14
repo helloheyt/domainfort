@@ -1352,6 +1352,67 @@ fn ldap_front_listeners() {
     assert!(s.ldaps_listen().is_empty());
 }
 
+/// docs/52 §7 R14; A-102 on docs/questions/Q-469 (b) ("one front per zone;
+/// external LDAP connections are not in phase 1"); docs/50 §4.1 (CIDR →
+/// Internal; the match within one address family — Q-275 item 9): a
+/// listener address outside every configured internal network is refused
+/// (`ListenerNotInternal`, at the list that holds it), whichever list holds
+/// it; an IPv4-mapped IPv6 address does not match an IPv4 network; the
+/// zone table is required; dird has no zone table any more (the key is
+/// unknown there). Every address is test data.
+#[test]
+fn ldap_front_listeners_must_be_internal() {
+    // An LDAPS address outside 10.0.0.0/8, 192.168.10.0/24, fd00:1234::/32.
+    let text = set(LDAP_FRONT, "ldaps_listen", "10.0.0.5:636, 192.168.11.5:636");
+    let err = error(Daemon::LdapFront, &text);
+    assert_eq!(err.kind(), ErrorKind::ListenerNotInternal);
+    assert_eq!(err.key(), Some("ldaps_listen"));
+    // A StartTLS address outside them.
+    let text = set(LDAP_FRONT, "ldap_listen", "172.16.0.5:389");
+    let err = error(Daemon::LdapFront, &text);
+    assert_eq!(err.kind(), ErrorKind::ListenerNotInternal);
+    assert_eq!(err.key(), Some("ldap_listen"));
+    // An IPv6 address outside fd00:1234::/32.
+    let text = set(LDAP_FRONT, "ldaps_listen", "[fd00:1235::5]:636");
+    assert_eq!(
+        error(Daemon::LdapFront, &text).kind(),
+        ErrorKind::ListenerNotInternal
+    );
+    // 10.0.0.5 written as an IPv4-mapped IPv6 address: not rewritten.
+    let text = set(LDAP_FRONT, "ldaps_listen", "[::ffff:10.0.0.5]:636");
+    assert_eq!(
+        error(Daemon::LdapFront, &text).kind(),
+        ErrorKind::ListenerNotInternal
+    );
+    // A narrower table that leaves one configured listener outside.
+    let text = set(LDAP_FRONT, "internal_networks", "10.0.0.0/8");
+    let err = error(Daemon::LdapFront, &text);
+    assert_eq!(err.kind(), ErrorKind::ListenerNotInternal);
+    assert_eq!(err.key(), Some("ldaps_listen"));
+    // The table is required.
+    let err = error(Daemon::LdapFront, &remove(LDAP_FRONT, "internal_networks"));
+    assert_eq!(err.kind(), ErrorKind::MissingKey);
+    assert_eq!(err.key(), Some("internal_networks"));
+    // Inside: a host route of exactly the listener address.
+    let text = set(
+        &set(
+            LDAP_FRONT,
+            "internal_networks",
+            "10.0.0.5/32, fd00:1234::5/128",
+        ),
+        "ldap_listen",
+        "10.0.0.5:3389",
+    );
+    let s = LdapFrontSettings::parse(text.as_bytes()).expect("every listener inside");
+    assert_eq!(s.internal_networks().len(), 2);
+    // dird: no zone table.
+    let err = error(
+        Daemon::Dird,
+        &append(DIRD, "internal_networks = 10.0.0.0/8"),
+    );
+    assert_eq!(err.kind(), ErrorKind::UnknownKey);
+}
+
 /// The dird-ldap deadline stays above the engine's 60-second query bound and
 /// at most 65 s. Spec: docs/50 §3.6; crates/ldap `MAX_QUERY_SECONDS`.
 #[test]

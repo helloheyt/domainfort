@@ -8,19 +8,35 @@
 //! certificate, key and listeners are handled as root by `main` before the
 //! drop (crate::startup); here, after the drop and with the runtime up:
 //!
-//! 1. the TLS configuration is checked against docs/50 R50-11
+//! 1. every listener's local address lies in an internal network of the
+//!    zone table ([`FrontParams::internal_networks`]) — else no start
+//!    ([`DaemonError::ListenerNotInternal`]): this front is the internal
+//!    zone's (docs/52 R14), whatever bound the listeners;
+//! 2. the TLS configuration is checked against docs/50 R50-11
 //!    ([`crate::tls::check_policy`]) — any difference ⇒ no start;
-//! 2. auditd is verified (peer uid, `Ping` → `Pong`) — R50-16;
-//! 3. dird is verified on the LDAP channel (peer uid, `Ping` → `Pong`) —
+//! 3. auditd is verified (peer uid, `Ping` → `Pong`) — R50-16;
+//! 4. dird is verified on the LDAP channel (peer uid, `Ping` → `Pong`) —
 //!    §7.5 step 5;
-//! 4. only now are the listeners served. Until then nothing is read from
+//! 5. only now are the listeners served. Until then nothing is read from
 //!    them (a TCP handshake can complete into the kernel's backlog; a failed
 //!    start closes it) — the kdc daemon's arrangement (Q-275 item 3).
 //!
+//! # One front per zone: the internal one (docs/52 §3.3 C3, §7 R14)
+//!
+//! dird decides every request of this front under the internal zone — it
+//! derives the zone from this process's uid, never from the client address
+//! sent in `Open` (that is kept for the audit record only). So the front
+//! makes "internal" true where it owns the facts — its sockets: it listens
+//! only on internal addresses (step 1; crates/config refuses any other
+//! listener) and closes, without a byte, every accepted connection whose
+//! source address — the kernel's, from `accept` — is outside the internal
+//! networks (counted, [`crate::log::Note::SourceNotInternal`]). Phase 1 has
+//! no external LDAP connection (A-102 on docs/questions/Q-469 (b)).
+//!
 //! # Connection limits (docs/50 §4.1, §4.2; docs/07 §1)
 //!
-//! Each accepted connection must take, at once (or it is closed without a
-//! byte and counted):
+//! Each accepted connection must come from an internal source (above) and
+//! take, at once (or it is closed without a byte and counted):
 //!
 //! * a slot of the global bound ([`MAX_CONNECTIONS`]);
 //! * a slot of its source address' bound ([`MAX_CONNECTIONS_PER_SOURCE`]);
@@ -41,15 +57,16 @@
 //! SIGTERM is not handled (as the other daemons, Q-260 item 9).
 //!
 //! Spec: docs/50 R50-10, R50-11, R50-16, §4.1, §4.2, §6.2, §7.5; docs/07 §1;
-//! tokio 1.54.1 docs.rs: `net::TcpListener::{from_std, accept}`,
-//! `sync::{Semaphore, Notify}`, `task::JoinSet`, `spawn`.
+//! docs/52 §7 R14; tokio 1.54.1 docs.rs: `net::TcpListener::{from_std,
+//! accept}`, `sync::{Semaphore, Notify}`, `task::JoinSet`, `spawn`; std
+//! `net::TcpListener::local_addr`.
 
 use crate::audit::{verify_auditd, AuditCheckError};
 use crate::connection::{self, ConnectionContext, Slots, Timeouts, CLIENT_WRITE_TIMEOUT};
 use crate::dird::{ping, Endpoint};
-use crate::log::{note, Note, ACCEPT_FAILED, CONNECTION_LIMITED};
+use crate::log::{note, Note, ACCEPT_FAILED, CONNECTION_LIMITED, SOURCE_NOT_INTERNAL};
 use crate::tls::{check_policy, PolicyField};
-use config::LdapFrontSettings;
+use config::{is_internal, LdapFrontSettings, Network};
 use core::fmt;
 use core::net::IpAddr;
 use core::time::Duration;
@@ -123,11 +140,16 @@ pub struct FrontParams {
     pub timeouts: Timeouts,
     /// The connection bounds.
     pub limits: ConnectionLimits,
+    /// The zone table: every listener's address and every served client's
+    /// source address lie in one of these networks (module documentation).
+    /// Spec: docs/50 §4.1; docs/52 §7 R14; A-102 on docs/questions/Q-469.
+    pub internal_networks: Vec<Network>,
 }
 
 impl FrontParams {
     /// The parameters of `settings`, with the daemon's constant bounds.
-    /// Spec: docs/50 §3.6, §4.2, §7.1; crates/config `LdapFrontSettings`.
+    /// Spec: docs/50 §3.6, §4.1, §4.2, §7.1; crates/config
+    /// `LdapFrontSettings`; docs/52 R14.
     #[must_use]
     pub fn from_settings(settings: &LdapFrontSettings) -> FrontParams {
         let limits = settings.limits();
@@ -148,6 +170,7 @@ impl FrontParams {
                 client_write: CLIENT_WRITE_TIMEOUT,
             },
             limits: ConnectionLimits::DEFAULT,
+            internal_networks: settings.internal_networks().to_vec(),
         }
     }
 }
@@ -166,6 +189,10 @@ pub struct Listeners {
 /// Spec: docs/50 §7.5 (fail closed).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonError {
+    /// A listener's local address is outside every internal network (or
+    /// cannot be read): phase 1 has no external LDAP listener.
+    /// Spec: docs/52 §7 R14; A-102 on docs/questions/Q-469 (b).
+    ListenerNotInternal,
     /// The TLS configuration is outside docs/50 R50-11.
     TlsPolicy(PolicyField),
     /// auditd did not answer the check.
@@ -179,6 +206,9 @@ pub enum DaemonError {
 impl fmt::Display for DaemonError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            DaemonError::ListenerNotInternal => {
+                f.write_str("listener address outside every internal network")
+            }
             DaemonError::TlsPolicy(field) => {
                 write!(f, "TLS configuration outside the profile: {field:?}")
             }
@@ -308,6 +338,21 @@ impl Admission {
     }
 }
 
+/// Every listener's local address lies in an internal network (an address
+/// that cannot be read fails closed).
+/// Spec: docs/52 §7 R14; docs/50 §4.1.
+fn check_listeners(listeners: &Listeners, internal: &[Network]) -> Result<(), DaemonError> {
+    for listener in listeners.ldap.iter().chain(&listeners.ldaps) {
+        let local = listener
+            .local_addr()
+            .map_err(|_| DaemonError::ListenerNotInternal)?;
+        if !is_internal(internal, local.ip()) {
+            return Err(DaemonError::ListenerNotInternal);
+        }
+    }
+    Ok(())
+}
+
 /// Accept connections on one listener until aborted.
 /// Spec: module documentation.
 async fn accept_loop(
@@ -315,6 +360,7 @@ async fn accept_loop(
     kind: Listener,
     context: Arc<ConnectionContext>,
     admission: Arc<Admission>,
+    internal: Arc<[Network]>,
 ) {
     let mut tasks = JoinSet::new();
     loop {
@@ -322,6 +368,14 @@ async fn accept_loop(
         match listener.accept().await {
             Ok((stream, peer)) => {
                 let accepted = Instant::now();
+                // An external source has no path in phase 1: closed before
+                // any slot is taken or any byte is read. Spec: docs/52 R14;
+                // A-102 on docs/questions/Q-469 (b).
+                if !is_internal(&internal, peer.ip()) {
+                    SOURCE_NOT_INTERNAL.hit();
+                    drop(stream);
+                    continue;
+                }
                 match admission.admit(peer.ip()) {
                     Some(slots) => {
                         tasks.spawn(connection::run(
@@ -359,6 +413,7 @@ pub async fn serve(
     listeners: Listeners,
     control: DaemonControl,
 ) -> Result<(), DaemonError> {
+    check_listeners(&listeners, &params.internal_networks)?;
     check_policy(&tls).map_err(DaemonError::TlsPolicy)?;
     verify_auditd(&params.audit)
         .await
@@ -370,6 +425,7 @@ pub async fn serve(
     note(Note::DirdVerified, None);
 
     let admission = Arc::new(Admission::new(params.limits));
+    let internal: Arc<[Network]> = Arc::from(params.internal_networks);
     let context = Arc::new(ConnectionContext {
         dird: params.dird,
         timeouts: params.timeouts,
@@ -399,6 +455,7 @@ pub async fn serve(
                 kind,
                 Arc::clone(&context),
                 Arc::clone(&admission),
+                Arc::clone(&internal),
             ))
         })
         .collect();

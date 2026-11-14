@@ -40,7 +40,7 @@
 //!    exist, owned by dird, no group/other access), build the directory
 //!    context and the tier map, check the domain (naming-context root,
 //!    domain SID, krbtgt account), build the LDAP service (the engine, the
-//!    PDP snapshot of the same policy file, dird's zone table, the audit
+//!    PDP snapshot of the same policy file, the audit
 //!    gate), spawn the directory-view engine thread and the LDAP engine
 //!    thread (R50-7), bind `dird-kdc.sock` and `dird-ldap.sock`, accept.
 //!
@@ -78,7 +78,6 @@
 //! | `ldap_engine` | the LDAP engine thread, its bounded queue, the per-request host |
 //! | `ldap_listener` | `dird-ldap.sock`: identity, session bound, framing, deadlines |
 //! | [`ldap_audit`] | the A-57 gate for LDAP events |
-//! | [`zones`] | dird's zone table (docs/50 §4.2) |
 //! | [`clock`] | dird's clock for the LDAP engine |
 //! | [`rate`] | the PDP's `RateLimit` obligation for LDAP |
 //! | `daemon` | [`serve`], [`DaemonControl`], [`StoreSource`] |
@@ -104,9 +103,13 @@
 //!   Q-270 item 6. A refusal of the LDAP channel's order (`TlsEstablished`
 //!   out of turn, a TLS report the channel never accepted) never reaches
 //!   the engine and has no event either (docs/questions/Q-280 item 7).
-//! - The LDAP client's zone is derived from the address the front reports
-//!   (docs/50 §4.2); a compromised front can report any address (Q-280
-//!   item 3).
+//! - The LDAP client's zone is the zone of the front it came through,
+//!   derived from the peer uid of the `dird-ldap.sock` connection — never
+//!   from the address the front reports, which only the audit record keeps
+//!   (docs/52 R14; A-102 on docs/questions/Q-469 (b): one front per zone,
+//!   phase 1 has only the internal one). The residual: a compromised
+//!   internal front can relay any party's requests — they get what the
+//!   front itself is entitled to (docs/questions/Q-580).
 //! - keyd's configuration is assumed to be the library default for the
 //!   realm (as keyd-daemon builds it); dird cannot ask keyd (Q-270 item 7).
 //! - SIGTERM is not handled (Q-260 item 9); no chroot, no seccomp /
@@ -161,7 +164,6 @@ pub mod rate;
 mod reconcile;
 mod registration;
 pub mod startup;
-pub mod zones;
 
 pub use admin_listener::admin_refused_peer_count;
 pub use admin_service::{
@@ -184,4 +186,3 @@ pub use ldap_listener::ldap_refused_peer_count;
 pub use listener::refused_peer_count;
 pub use reconcile::{MAX_PAGES_PER_RUN, MAX_REGISTRATIONS_PER_RUN, MAX_SETTLED, TOMBSTONE_PAGE};
 pub use registration::{destroy_decision_id, DecisionRegistration};
-pub use zones::ZoneTable;

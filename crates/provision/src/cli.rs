@@ -21,7 +21,7 @@
 //!     --tls-certificate-path <path> --tls-private-key-path <path> \
 //!     --kdc-listen <addr:port> [--kdc-listen …] \
 //!     [--ldap-listen <addr:port> …] [--ldaps-listen <addr:port> …] \
-//!     [--internal-network <addr/prefix> …]
+//!     --internal-network <addr/prefix> [--internal-network …]
 //!
 //! provision policy --policy-path <path> <change> [<change> …]
 //!   <change> := --add-principal <SID> <Tier0|Tier1|Tier2>

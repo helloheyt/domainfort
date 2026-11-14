@@ -160,7 +160,7 @@ pub use gate::{
     AUDIT_FLUSH_GRACE, FLUSH_POLL,
 };
 pub use values::{
-    AuditText, BoundedSeq, CalendarTime, CodecError, PdpReason, Principal, SidValue,
-    MAX_NAME_COMPONENTS, MAX_SID_SUB_AUTHORITIES, MAX_TEXT_OCTETS,
+    AuditText, BoundedSeq, CalendarTime, CodecError, PdpReason, Principal, ReportedAddress,
+    SidValue, MAX_NAME_COMPONENTS, MAX_SID_SUB_AUTHORITIES, MAX_TEXT_OCTETS,
 };
 pub use window::{NoiseAdmission, Reservation, SendWindow, WindowConfig, WindowError, WindowFull};
