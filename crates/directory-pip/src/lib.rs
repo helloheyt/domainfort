@@ -43,6 +43,16 @@
 //! Every failure fails closed: `AccountSourceError` (the KDC refuses) or a
 //! `PipError` (the PDP denies).
 //!
+//! # The visibility gate (docs/52 R10, A-102)
+//!
+//! A PEP that shows directory content to a requester, or acts on an object
+//! a requester names, obtains it as a [`VisibleObject`] — which only the
+//! [`VisibilityGate`] builds, after the PDP's visibility decision over this
+//! view — and gets "absent" and "not visible" as one verdict,
+//! [`Visibility::NotFound`] (docs/11 §7, §8; A-55). The LDAP search and the
+//! admin plane use it; the KDC's account source does not (it is the
+//! authority's own lookup, not a requester's read — module `visible`).
+//!
 //! # Residuals and follow-ups (documented, not hidden)
 //!
 //! - The tier map is trusted as given: verifying the signed policy store
@@ -72,7 +82,12 @@
 //! 3.1.5.14.4; [MS-DRSR] v20260309 4.1.8.2.2, 4.1.8.2.6, 4.1.8.3, 5.51;
 //! [MS-DTYP] v20241119 2.3.3, 2.4.2.4; RFC 4120 3.3.3.1, 6.2. The source and
 //! documentation of this project's own crates dirstore, ad-schema, kdc, pdp,
-//! keyd, krb-proto and dtyp were read for their APIs. No other
+//! keyd, krb-proto and dtyp were read for their APIs. The visibility gate
+//! (module `visible`, task U) only from docs/52 §3.6 and §7 (R10), docs/11
+//! §4, §6-§8, docs/49 §6.1 and §9, docs/51 §5.2 row 10, PENDING-OWNER A-51,
+//! A-55, A-89, A-102, docs/questions/Q-200 and Q-358, and [MS-ADTS]
+//! v20261026 3.1.1.4.3 and 5.1.3.3.6 (pinned PDF, SHA-256 55b59eb1…b2b1
+//! verified), with this repository's ldap and directory-admin code. No other
 //! implementation was consulted or recalled (AGENTS.md §1-3).
 //!
 //! Spec: docs/47 §1-§12; docs/11 §6; docs/06 §8-§10.
@@ -87,6 +102,7 @@ mod state;
 mod tier;
 mod time;
 mod view;
+mod visible;
 
 pub use error::ViewError;
 pub use groups::{MAX_EXPANDED_GROUPS, MAX_NESTING_DEPTH};
@@ -95,3 +111,7 @@ pub use salt::{account_salt, AccountKind, SaltError};
 pub use tier::TierMap;
 pub use time::{dstime_of, time_of_dstime};
 pub use view::{DirectoryContext, DirectoryView, MAX_DN_DEPTH};
+pub use visible::{
+    hides, GateFault, Unseen, UnseenCause, Visibility, VisibilityGate, VisibilityProof,
+    VisibilityRule, VisibleObject,
+};

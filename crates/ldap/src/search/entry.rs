@@ -40,6 +40,7 @@
 
 use std::collections::BTreeMap;
 
+use directory_pip::Visibility;
 use dirstore::{AttrId, Object, ValueSyntax};
 use dtyp::Guid;
 use parse_ldap::dn::Dn as LdapDn;
@@ -67,7 +68,7 @@ fn malformed() -> Stop {
     Stop::Fail(AuditReason::DirectoryUnavailable)
 }
 
-impl Search<'_> {
+impl<'r> Search<'r> {
     /// The value of the object's RDN attribute ([MS-ADTS] 3.1.1.1.4: "An
     /// object's value of name equals the value of the object's RDN
     /// attribute"). Spec: docs/46 §5.4 (name).
@@ -86,28 +87,15 @@ impl Search<'_> {
     }
 
     /// The canonical DN of `target` if it is a live object of the NC that
-    /// the requester can see, else `None`; within the DN-value bound.
-    /// Spec: docs/49 §6.5; [MS-ADTS] 5.1.3.3.6.
+    /// the requester can see (the visibility gate's verdict), else `None` —
+    /// absent and hidden alike; within the DN-value bound.
+    /// Spec: docs/49 §6.5; [MS-ADTS] 5.1.3.3.6; docs/52 R10.
     pub(super) fn visible_ref(&mut self, target: Guid) -> Result<Option<Dn>, Stop> {
         self.count_dn_value()?;
-        let snapshot = self.view.snapshot();
-        let Some(obj) = snapshot
-            .get_object(target)
-            .map_err(|_| Stop::Fail(AuditReason::DirectoryUnavailable))?
-        else {
-            return Ok(None);
-        };
-        let Some(dn) = self
-            .view
-            .dn_of(target)
-            .map_err(|_| Stop::Fail(AuditReason::DirectoryUnavailable))?
-        else {
-            return Ok(None);
-        };
-        if self.access.visible(&dn, obj.parent.is_none()) {
-            Ok(Some(dn))
-        } else {
-            Ok(None)
+        match self.gate.visible(target) {
+            Ok(Visibility::Visible { object, .. }) => Ok(Some(object.dn().clone())),
+            Ok(Visibility::NotFound(_) | Visibility::Refused(_)) => Ok(None),
+            Err(_) => Err(Stop::Fail(AuditReason::DirectoryUnavailable)),
         }
     }
 
@@ -129,9 +117,9 @@ impl Search<'_> {
 
     /// The entry of a matching candidate (module documentation).
     /// Spec: RFC 4511 §4.5.2.
-    pub(super) fn entry(&mut self, cand: &mut Candidate) -> Result<SearchResultEntry, Stop> {
-        let object_name = encode_dn(&cand.dn).ok_or(Stop::Fail(AuditReason::UnrepresentableDn))?;
-        let class = self.class_of(&cand.obj)?;
+    pub(super) fn entry(&mut self, cand: &mut Candidate<'r>) -> Result<SearchResultEntry, Stop> {
+        let object_name = encode_dn(cand.dn()).ok_or(Stop::Fail(AuditReason::UnrepresentableDn))?;
+        let class = self.class_of(cand.obj())?;
         let mut wanted: BTreeMap<AttrId, Attr> = BTreeMap::new();
         if self.selection.all_user {
             for id in &class.class_attributes {
@@ -186,12 +174,12 @@ impl Search<'_> {
     /// §6.4.
     fn returned_values(
         &mut self,
-        cand: &Candidate,
+        cand: &Candidate<'_>,
         a: &Attr,
         object_name: &str,
     ) -> Result<Vec<Vec<u8>>, Stop> {
         let stored: Vec<&[u8]> = cand
-            .obj
+            .obj()
             .attribute(a.id)
             .map(|x| x.values.iter().map(|v| v.value.as_slice()).collect())
             .unwrap_or_default();
@@ -258,7 +246,7 @@ impl Search<'_> {
             // specific class last. Spec: [MS-ADTS] 3.1.1.2.4.3, 3.1.1.2.2.2
             // note ††† rule 3; docs/46 §5.4.
             Kind::ObjectClass => self
-                .class_of(&cand.obj)?
+                .class_of(cand.obj())?
                 .object_class
                 .iter()
                 .filter_map(|c| self.p1.class(*c))
@@ -268,9 +256,9 @@ impl Search<'_> {
             Kind::InstanceType => vec![render_integer(instance_type(cand))],
             // objectGUID: the 16 octets of the record key ([MS-DTYP] 2.3.4.2
             // packet). Spec: docs/46 §5.4; [MS-ADTS] 3.1.1.1.3.
-            Kind::ObjectGuid => vec![cand.obj.guid.to_packet().to_vec()],
+            Kind::ObjectGuid => vec![cand.obj().guid.to_packet().to_vec()],
             // name: the RDN attribute's value. Spec: [MS-ADTS] 3.1.1.1.4.
-            Kind::Name => vec![self.rdn_value(&cand.obj)?.to_vec()],
+            Kind::Name => vec![self.rdn_value(cand.obj())?.to_vec()],
             // distinguishedName: the object's DN. Spec: [MS-ADTS] 3.1.1.1.4.
             Kind::DistinguishedName => vec![object_name.as_bytes().to_vec()],
             // memberOf: the back link, filtered to visible groups.
@@ -279,7 +267,7 @@ impl Search<'_> {
                 let groups = self
                     .view
                     .snapshot()
-                    .back_links(cand.obj.guid, a.id)
+                    .back_links(cand.obj().guid, a.id)
                     .map_err(|_| Stop::Fail(AuditReason::DirectoryUnavailable))?;
                 self.visible_dns(groups)?
             }

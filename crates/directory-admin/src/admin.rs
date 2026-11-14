@@ -8,9 +8,12 @@
 //!    configured threshold ⇒ `TicketAge` (R51-10).
 //! 2. The request's own values (names, groupType, accountExpires, …), which
 //!    reveal nothing about the directory (§11).
-//! 3. The objects the request names, read from the view; absent ⇒
-//!    `NotFound`; not readable by the requester (`DirRead`, docs/11 §7) ⇒
-//!    `NotVisible` — the client is told `NotFound` either way (A-55).
+//! 3. The objects the request names, through the visibility gate
+//!    (`directory_pip::VisibilityGate`, docs/52 R10) — the only source of a
+//!    [`Resolved`]: absent ⇒ `NotFound`; not visible to the requester
+//!    (`DirList` on the parent, [MS-ADTS] 5.1.3.3.6) or not readable by it
+//!    (`DirRead`, docs/11 §7) ⇒ `NotVisible` — one verdict, the client is
+//!    told `NotFound` either way (A-55; docs/questions/Q-485).
 //! 4. `decide` for the requester on the operation's Action and Resource
 //!    (§5.2) ⇒ `PolicyDenied`.
 //! 5. The semantic checks of §11 and §5.2 (protected objects, classes,
@@ -32,8 +35,8 @@ use keyd_types::{KeyHandle, KeyPurpose, PrincipalBinding, PrincipalId};
 use krb_proto::constants::{KRB_NT_PRINCIPAL, KRB_NT_SRV_HST};
 use krb_proto::{KerberosString, KerberosTime, PrincipalName};
 use pdp::{
-    Action, AttrId as PdpAttrId, ControlRightId, Effect, ObjClass, Obligation, PolicySnapshot,
-    Resource, Tier,
+    Action, AttrId as PdpAttrId, ControlRightId, Decision, Effect, ObjClass, Obligation,
+    PolicySnapshot, Resource, Tier,
 };
 
 use ad_schema::flags::group_type::{
@@ -43,7 +46,9 @@ use ad_schema::flags::user_account_control::{
     ADS_UF_ACCOUNT_DISABLE, ADS_UF_NORMAL_ACCOUNT, ADS_UF_WORKSTATION_TRUST_ACCOUNT,
 };
 use ad_schema::Phase1Schema;
-use directory_pip::{account_salt, AccountKind, DirectoryView, MAX_DN_DEPTH};
+use directory_pip::{
+    account_salt, AccountKind, DirectoryView, GateFault, UnseenCause, Visibility, MAX_DN_DEPTH,
+};
 
 use crate::audit::{pdp_reason, sid_value, EventBase, Refusal, Stop};
 use crate::checks::{domain_sid, malformed, store_failure, Cx, LockoutChange, Resolved};
@@ -423,22 +428,45 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         Ok(decision.obligations)
     }
 
-    /// `r` must be readable by the requester; otherwise `NotVisible` (told
-    /// to the client as `NotFound`, A-55) — for every object a request
-    /// names, not only for `Lookup` (docs/questions/Q-358 item 3).
-    /// Spec: docs/11 §7 as cited in docs/51 §5.2 row 10; A-55.
-    fn visible(
+    /// The object `guid` a request names, through the visibility gate —
+    /// the only way to a [`Resolved`]: absent ⇒ `NotFound`; present but its
+    /// parent not listable ([MS-ADTS] 5.1.3.3.6) or the object not readable
+    /// by the requester ⇒ `NotVisible`, the PDP's reason in the event — one
+    /// verdict, told to the client as `NotFound` either way
+    /// (A-55) — for every object a request names, not only for `Lookup`
+    /// (docs/questions/Q-358 item 3). Also returned: the decision that made
+    /// the object visible (`Lookup`'s authorising decision).
+    /// Spec: [MS-ADTS] 5.1.3.3.6; docs/11 §7 as cited in docs/51 §5.2 row
+    /// 10; docs/52 R10; A-55; docs/questions/Q-485.
+    fn named<'v>(
         &self,
-        ctx: &OpCx<'_, '_, '_, '_>,
+        ctx: &OpCx<'_, '_, 'v, '_>,
         base: &mut EventBase,
-        r: &Resolved,
-    ) -> Result<(), Stop> {
-        let decision = ctx.cx.read_decision(ctx.requester.subject(), r);
-        if decision.effect != Effect::Allow {
-            base.pdp = Some(pdp_reason(decision.reason));
-            return Err(Stop::Refused(AdminRefusal::NotVisible));
+        guid: Guid,
+    ) -> Result<(Resolved<'v>, Decision), Stop> {
+        let cx = ctx.cx;
+        match cx.gate(ctx.requester.subject()).visible(guid) {
+            Ok(Visibility::Visible { object, decision }) => {
+                Ok((Resolved::from_visible(cx, object)?, decision))
+            }
+            Ok(Visibility::NotFound(unseen)) => match unseen.audit_cause() {
+                UnseenCause::Absent => Err(Stop::Refused(AdminRefusal::NotFound)),
+                UnseenCause::Hidden(reason) => {
+                    base.pdp = Some(pdp_reason(reason));
+                    Err(Stop::Refused(AdminRefusal::NotVisible))
+                }
+            },
+            // Any denial of a named object is `NotVisible` on the admin
+            // plane (A-55: the client hears `NotFound`).
+            Ok(Visibility::Refused(decision)) => {
+                base.pdp = Some(pdp_reason(decision.reason));
+                Err(Stop::Refused(AdminRefusal::NotVisible))
+            }
+            Err(GateFault::Store(e)) => Err(store_failure(&e)),
+            Err(GateFault::Name | GateFault::TooDeep) => {
+                Err(Stop::Failed(AdminFailure::StoreFailure))
+            }
         }
-        Ok(())
     }
 
     /// Dual control (docs/51 §5.6, R51-11; P-22 items 1-2): every supplied
@@ -699,8 +727,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
             NewObject::Group(c) => c.parent,
             NewObject::Ou(c) | NewObject::Container(c) => c.parent,
         };
-        let parent = cx.resolve(parent_guid)?;
-        self.visible(ctx, base, &parent)?;
+        let (parent, _) = self.named(ctx, base, parent_guid)?;
         let action = Action::DirAddChild(ObjClass(values.class.guid));
         let resource = Resource::DirObject {
             dn: parent.dn.clone(),
@@ -877,8 +904,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         target: Guid,
     ) -> Result<(Plan, Vec<Obligation>), Stop> {
         let cx = ctx.cx;
-        let t = cx.resolve(target)?;
-        self.visible(ctx, base, &t)?;
+        let (t, _) = self.named(ctx, base, target)?;
         let (action, resource) = password_request(&t);
         let obligations = self.authorize(ctx, base, &action, &resource)?;
         let reply = self.password_targets(cx, &t)?;
@@ -908,8 +934,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         c: &CompletePasswordSet,
     ) -> Result<(Plan, Vec<Obligation>), Stop> {
         let cx = ctx.cx;
-        let t = cx.resolve(c.target)?;
-        self.visible(ctx, base, &t)?;
+        let (t, _) = self.named(ctx, base, c.target)?;
         let (action, resource) = password_request(&t);
         let obligations = self.authorize(ctx, base, &action, &resource)?;
         let reply = self.password_targets(cx, &t)?;
@@ -950,8 +975,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         s: &SetEnabled,
     ) -> Result<(Plan, Vec<Obligation>), Stop> {
         let cx = ctx.cx;
-        let t = cx.resolve(s.target)?;
-        self.visible(ctx, base, &t)?;
+        let (t, _) = self.named(ctx, base, s.target)?;
         let action = Action::DirWrite;
         let resource = attr_resource(&t, self.ids.uac_guid);
         let obligations = self.authorize(ctx, base, &action, &resource)?;
@@ -1003,8 +1027,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                 i64::try_from(filetime).map_err(|_| Stop::Refused(AdminRefusal::ValueInvalid))?
             }
         };
-        let t = cx.resolve(s.target)?;
-        self.visible(ctx, base, &t)?;
+        let (t, _) = self.named(ctx, base, s.target)?;
         let action = Action::DirWrite;
         let resource = attr_resource(&t, self.ids.account_expires_guid);
         let obligations = self.authorize(ctx, base, &action, &resource)?;
@@ -1049,10 +1072,8 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         add: bool,
     ) -> Result<(Plan, Vec<Obligation>), Stop> {
         let cx = ctx.cx;
-        let group = cx.resolve(m.group)?;
-        self.visible(ctx, base, &group)?;
-        let member = cx.resolve(m.member)?;
-        self.visible(ctx, base, &member)?;
+        let (group, _) = self.named(ctx, base, m.group)?;
+        let (member, _) = self.named(ctx, base, m.member)?;
         let action = Action::DirWrite;
         let resource = attr_resource(&group, self.ids.member_guid);
         let obligations = self.authorize(ctx, base, &action, &resource)?;
@@ -1124,8 +1145,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         target: Guid,
     ) -> Result<(Plan, Vec<Obligation>), Stop> {
         let cx = ctx.cx;
-        let t = cx.resolve(target)?;
-        self.visible(ctx, base, &t)?;
+        let (t, _) = self.named(ctx, base, target)?;
         let action = Action::DirDelete;
         let resource = Resource::DirObject {
             dn: t.dn.clone(),
@@ -1157,10 +1177,14 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         ))
     }
 
-    /// `Lookup`: the object the key names, if the requester may read it
-    /// (`DirRead`); otherwise — and when nothing has the key — the same
-    /// `NotFound` (A-55: no existence oracle).
-    /// Spec: docs/51 §5.2 row 10, §7.3; docs/11 §7; A-55.
+    /// `Lookup`: the object the key names, if the requester may see it
+    /// (`DirList` on its parent, [MS-ADTS] 5.1.3.3.6) and read it
+    /// (`DirRead`) — the visibility gate's verdict; otherwise — and when
+    /// nothing has the key — the same `NotFound` (A-55: no existence
+    /// oracle). The `DirRead` decision authorises the reply (its
+    /// obligations are the operation's).
+    /// Spec: docs/51 §5.2 row 10, §7.3; docs/11 §7; [MS-ADTS] 5.1.3.3.6;
+    /// docs/52 R10; A-55; docs/questions/Q-485.
     fn lookup(
         &self,
         ctx: &OpCx<'_, '_, '_, '_>,
@@ -1172,12 +1196,8 @@ impl<R: RandomSource> DirectoryAdmin<R> {
             .find(cx, key)?
             .ok_or(Stop::Refused(AdminRefusal::NotFound))?;
         base.target = Some(guid);
-        let found = cx.resolve(guid)?;
-        let decision = cx.read_decision(ctx.requester.subject(), &found);
+        let (found, decision) = self.named(ctx, base, guid)?;
         base.pdp = Some(pdp_reason(decision.reason));
-        if decision.effect != Effect::Allow {
-            return Err(Stop::Refused(AdminRefusal::NotVisible));
-        }
         let class = self
             .ids
             .class(found.class)

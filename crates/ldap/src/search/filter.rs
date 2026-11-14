@@ -361,7 +361,7 @@ fn assertion<'f, E: EntryView>(
 /// schema behind each step (crate::search).
 struct CandidateEntry<'a, 'r> {
     search: &'a mut Search<'r>,
-    cand: &'a mut Candidate,
+    cand: &'a mut Candidate<'r>,
 }
 
 impl EntryView for CandidateEntry<'_, '_> {
@@ -398,10 +398,10 @@ impl EntryView for CandidateEntry<'_, '_> {
     }
 }
 
-impl Search<'_> {
+impl<'r> Search<'r> {
     /// Evaluate `filter` for the candidate (module documentation).
     /// Spec: RFC 4511 §4.5.1.7.
-    pub(super) fn eval(&mut self, cand: &mut Candidate, filter: &Filter) -> Result<Tri, Stop> {
+    pub(super) fn eval(&mut self, cand: &mut Candidate<'r>, filter: &Filter) -> Result<Tri, Stop> {
         evaluate(&mut CandidateEntry { search: self, cand }, filter)
     }
 
@@ -475,9 +475,9 @@ impl Search<'_> {
 
     /// The candidate's values of a readable attribute, as its rule compares
     /// them (step 6). Spec: docs/46 §1, §5.4; docs/49 §6.4, §6.5.
-    fn values(&mut self, cand: &Candidate, attr: &Attr) -> Result<Values, Stop> {
+    fn values(&mut self, cand: &Candidate<'_>, attr: &Attr) -> Result<Values, Stop> {
         let stored: Vec<&[u8]> = cand
-            .obj
+            .obj()
             .attribute(attr.id)
             .map(|a| a.values.iter().map(|v| v.value.as_slice()).collect())
             .unwrap_or_default();
@@ -536,13 +536,13 @@ impl Search<'_> {
                 }
                 Values::Guids(visible)
             }
-            Kind::Name => Values::Bytes(vec![self.rdn_value(&cand.obj)?.to_vec()]),
-            Kind::ObjectGuid => Values::Bytes(vec![cand.obj.guid.to_packet().to_vec()]),
+            Kind::Name => Values::Bytes(vec![self.rdn_value(cand.obj())?.to_vec()]),
+            Kind::ObjectGuid => Values::Bytes(vec![cand.obj().guid.to_packet().to_vec()]),
             Kind::InstanceType => Values::Integers(vec![i128::from(instance_type(cand))]),
-            Kind::DistinguishedName => Values::Guids(vec![cand.obj.guid]),
-            Kind::ObjectClass => Values::Classes(self.class_of(&cand.obj)?.object_class.clone()),
+            Kind::DistinguishedName => Values::Guids(vec![cand.obj().guid]),
+            Kind::ObjectClass => Values::Classes(self.class_of(cand.obj())?.object_class.clone()),
             Kind::ObjectCategory => {
-                Values::Classes(vec![self.class_of(&cand.obj)?.default_object_category])
+                Values::Classes(vec![self.class_of(cand.obj())?.default_object_category])
             }
             // Unreachable: handled by the rule (steps 2-3).
             Kind::Never | Kind::MemberOf | Kind::Stored(ValueSyntax::SecurityDescriptor) => {
@@ -554,7 +554,7 @@ impl Search<'_> {
 
 /// instanceType: "writable on this directory" (0x4), plus "head of naming
 /// context" (0x1) for the NC root. Spec: docs/46 §5.4 ([MS-ADA1] 2.309).
-pub(super) fn instance_type(cand: &Candidate) -> i64 {
+pub(super) fn instance_type(cand: &Candidate<'_>) -> i64 {
     const WRITABLE: i64 = 0x4;
     const NC_HEAD: i64 = 0x1;
     if cand.is_nc_root() {

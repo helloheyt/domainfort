@@ -11,9 +11,11 @@
 //!    that no answer below depends on whether a DN exists: the caller's time
 //!    is a PDP instant; the view's naming context is the engine's (one
 //!    source of truth, A-53); the requester's subject (crate::subject); and
-//!    a `DirList` question on the NC root — if the PDP refuses it for a
-//!    reason that does not depend on the object (layer 1 `Unauthenticated`
-//!    → operationsError, Q-169 item 3; layer 2 `WeakTransport` →
+//!    the visibility gate's request-level refusal
+//!    (`directory_pip::VisibilityGate::request_refusal`: a `DirList`
+//!    question on the NC root) — if the PDP refuses it for a reason that
+//!    does not depend on the object (layer 1 `Unauthenticated` →
+//!    operationsError, Q-169 item 3; layer 2 `WeakTransport` →
 //!    confidentialityRequired / strongerAuthRequired; the subject's tier or
 //!    a PIP failure → other), the search ends here with that code
 //!    (docs/questions/Q-200 item 5). Otherwise an anonymous requester would
@@ -30,19 +32,24 @@
 //!    No such object, or one outside the NC → noSuchObject (R49-17: no
 //!    referral). The PDP then only ever sees the directory's canonical DN
 //!    (`dn_of`), never the client's spelling.
-//! 2. **The base's visibility** = `DirList` on its parent (on the base itself
-//!    for the NC root) — the operation-level decision, whose obligations are
-//!    honoured (RateLimit → the caller's limiter, busy if refused;
-//!    Constrain(MaxPageSize) → the page bound) and which the one audit event
-//!    records. Denied → noSuchObject, identical to a nonexistent base
-//!    (R49-13, A-48), except for the object-independent reasons of step 0.
+//! 2. **The base's visibility** = the gate's verdict
+//!    (`VisibilityGate::visible`, rule `ListParent`: `DirList` on its parent,
+//!    on the base itself for the NC root) — the operation-level decision,
+//!    whose obligations are honoured (RateLimit → the caller's limiter, busy
+//!    if refused; Constrain(MaxPageSize) → the page bound) and which the one
+//!    audit event records. Not found (absent or hidden — one verdict) →
+//!    noSuchObject, identical to a nonexistent base (R49-13, A-48); refused
+//!    for an object-independent reason → that reason's code (step 0).
 //! 3. **Candidates by scope** (RFC 4511 §4.5.1.2): baseObject = the base;
 //!    singleLevel = its children (`Snapshot::children`, in pages of
 //!    [`limits::CHILD_PAGE_SIZE`]); wholeSubtree = the base and every
 //!    descendant, depth first in name-index order (deterministic).
 //!    **Visibility before the filter:** a container's children are
 //!    enumerated only if the requester may list it ([MS-ADTS] 5.1.3.3.6),
-//!    so an invisible object is never read as a candidate, and a container
+//!    and every candidate is a `directory_pip::VisibleObject` — built only by
+//!    the gate (`VisibilityGate::child` / `visible`), never from a raw store
+//!    read (docs/52 R10) — so an invisible object is never read as a
+//!    candidate, and a container
 //!    it may not list is not descended into at all — the whole subtree is
 //!    pruned (docs/49 §6.1 item 3: a subset, never more; counted in the
 //!    audit). **Fast path:** a filter that is, or whose top-level AND holds,
@@ -68,12 +75,26 @@
 //! derefAliases is ignored: "Aliases are not supported in Active Directory"
 //! ([MS-ADTS] 3.1.1.3.1.8; R49-17).
 //!
+//! # The visibility gate (docs/52 R10, A-102)
+//!
+//! Every PDP question of a search is asked through one
+//! `directory_pip::VisibilityGate` (rule `ListParent`) over the request's
+//! view: the request-level refusal (step 0), the base (step 2), the
+//! containers of the walk (step 3), each candidate and each member /
+//! memberOf value (crate::search::entry), each attribute read. A
+//! container's list decision, the same for all its children (`decide` is
+//! pure, P9), is taken once per search; the read decisions of the filter
+//! are taken lazily, only for the attributes a filter item reaches. The
+//! per-object and per-attribute decisions are not audited one by one and
+//! their obligations are not applied (pdp visibility.rs: "Visibility
+//! filtering is not itself an access decision"); the base's decision
+//! authorises and is audited for the operation.
+//!
 //! Spec: RFC 4511 §4.5.1-§4.5.3, A.2; [MS-ADTS] v20261026 3.1.1.3.1.2.4,
 //! 3.1.1.3.1.3.1, 3.1.1.3.1.8, 3.1.1.3.4.6, 3.1.1.4.3, 3.1.1.5.1.4,
 //! 5.1.3.3.6; docs/49 §6 (R49-9), §7 (R49-11), §9 (R49-13), §10 (R49-14);
-//! A-48, A-49, A-53; Q-168, Q-169, Q-195.
+//! docs/52 R10; A-48, A-49, A-53, A-55; Q-168, Q-169, Q-195, Q-200.
 
-mod access;
 mod attrs;
 mod entry;
 mod filter;
@@ -85,22 +106,24 @@ mod syntax;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use ad_schema::{ClassInfo, Phase1Schema};
-use directory_pip::{DirectoryView, NamingContext, MAX_DN_DEPTH};
+use directory_pip::{
+    DirectoryView, GateFault, NamingContext, UnseenCause, Visibility, VisibilityGate,
+    VisibilityRule, VisibleObject, MAX_DN_DEPTH,
+};
 use dirstore::{AttrId, ChildCursor, ChildPage, Object};
 use dtyp::Guid;
 use krb_proto::KerberosTime;
 use parse_ldap::dn::{parse_ldap_dn, DnError, LdapDn};
 use parse_ldap::{Filter, MessageId, ResultCode, Scope, SearchRequest};
-use pdp::{Context, Dn, Effect, IpScope, Obligation, PolicySnapshot, ReasonCode, TransportSec};
+use pdp::{Context, Dn, IpScope, Obligation, PolicySnapshot, TransportSec};
 
 use crate::audit::{AuditReason, SearchAudit};
 use crate::inputs::{RateLimiter, SearchClock};
 use crate::respond;
 use crate::session::Channel;
-use crate::subject::{context_transport, denial_code, subject, visibility_denial_code, Requester};
+use crate::subject::{context_transport, denial_code, subject, Requester};
 use crate::time::{seconds_between, unix_instant};
 
-use access::{list_target, Access};
 use attrs::{describe, Attr, Known};
 pub(crate) use limits::SearchLimits;
 
@@ -158,35 +181,43 @@ struct Selection {
     named: Vec<Attr>,
 }
 
-/// A candidate: a live object of the NC, its canonical DN, and the read
-/// decisions taken for it so far.
-pub(crate) struct Candidate {
-    pub(crate) obj: Object,
-    pub(crate) dn: Dn,
+/// A candidate: a live object of the NC that the requester may see — a
+/// `VisibleObject`, which only the visibility gate builds (docs/52 R10) —
+/// and the read decisions taken for it so far.
+pub(crate) struct Candidate<'r> {
+    object: VisibleObject<'r>,
     readable: BTreeMap<AttrId, bool>,
 }
 
-impl Candidate {
-    fn new(obj: Object, dn: Dn) -> Candidate {
+impl<'r> Candidate<'r> {
+    fn new(object: VisibleObject<'r>) -> Candidate<'r> {
         Candidate {
-            obj,
-            dn,
+            object,
             readable: BTreeMap::new(),
         }
+    }
+
+    /// The object as the view's snapshot holds it.
+    pub(crate) fn obj(&self) -> &Object {
+        self.object.object()
+    }
+
+    /// Its canonical DN (`DirectoryView::dn_of`). Spec: docs/47 §8.2.
+    pub(crate) fn dn(&self) -> &Dn {
+        self.object.dn()
     }
 
     /// The NC root has no parent (A-53: the only parentless object with a
     /// DN). Spec: [MS-ADTS] 3.1.1.1.5.
     pub(crate) fn is_nc_root(&self) -> bool {
-        self.obj.parent.is_none()
+        self.object.is_nc_root()
     }
 }
 
-/// One frame of the depth-first walk: a listable container and the rest of
-/// its current page of children.
-struct Frame {
-    guid: Guid,
-    dn: Dn,
+/// One frame of the depth-first walk: a listable (visible) container and
+/// the rest of its current page of children.
+struct Frame<'r> {
+    container: VisibleObject<'r>,
     page: VecDeque<Guid>,
     next: Option<ChildCursor>,
 }
@@ -196,7 +227,8 @@ pub(crate) struct Search<'r> {
     view: &'r DirectoryView<'r>,
     p1: &'r Phase1Schema,
     known: Known,
-    access: Access<'r>,
+    /// Every PDP question of the search (module documentation).
+    gate: VisibilityGate<'r, 'r>,
     request: &'r SearchRequest,
     message_id: MessageId,
     clock: &'r dyn SearchClock,
@@ -245,11 +277,17 @@ pub(crate) fn run(p: SearchParams<'_>) -> SearchOutcome {
         transport: context_transport(p.channel),
         transport_sec: p.transport_sec,
     };
-    let mut access = Access::new(subject, context, p.policy, p.view);
+    let mut gate = VisibilityGate::new(
+        p.view,
+        p.policy,
+        subject,
+        context,
+        VisibilityRule::ListParent,
+    );
     // The object-independent refusals, before the base is looked at
-    // (module documentation, step 0). Spec: Q-169 item 3; docs/49 §9.
-    let probe = access.decide_list(p.naming_context.dn());
-    if probe.effect != Effect::Allow && object_independent(probe.reason) {
+    // (module documentation, step 0). Spec: Q-169 item 3; docs/49 §9;
+    // docs/questions/Q-200 item 5.
+    if let Some(probe) = gate.request_refusal() {
         return out.end(
             denial_code(probe.reason, p.transport_sec),
             AuditReason::PolicyDenied(probe.reason),
@@ -270,29 +308,28 @@ pub(crate) fn run(p: SearchParams<'_>) -> SearchOutcome {
         Err(()) => return out.end(ResultCode::Other, AuditReason::DirectoryUnavailable),
     };
     out.target = Some(base);
-    let base_obj = match p.view.snapshot().get_object(base) {
-        Ok(Some(obj)) => obj,
-        Ok(None) => return out.end(ResultCode::NoSuchObject, AuditReason::BaseNotFound),
-        Err(_) => return out.end(ResultCode::Other, AuditReason::DirectoryUnavailable),
-    };
-    let base_dn = match p.view.dn_of(base) {
-        Ok(Some(dn)) => dn,
-        Ok(None) => return out.end(ResultCode::NoSuchObject, AuditReason::BaseNotFound),
-        Err(_) => return out.end(ResultCode::Other, AuditReason::DirectoryUnavailable),
-    };
 
-    // 2. The base's visibility: the operation-level decision.
-    // Spec: docs/49 §6.1 item 2; [MS-ADTS] 5.1.3.3.6; docs/11 §2, §8.
-    let decision = access.decide_list(&list_target(&base_dn, base_obj.parent.is_none()));
-    if decision.effect != Effect::Allow {
-        let code = visibility_denial_code(decision.reason, p.transport_sec);
-        let reason = if code == ResultCode::NoSuchObject {
-            AuditReason::BaseNotVisible
-        } else {
-            AuditReason::PolicyDenied(decision.reason)
-        };
-        return out.end(code, reason);
-    }
+    // 2. The base's visibility: the operation-level decision. Absent and
+    // hidden are one verdict, answered alike (the audit keeps them apart).
+    // Spec: docs/49 §6.1 item 2, §9 (R49-13); [MS-ADTS] 5.1.3.3.6; docs/11
+    // §2, §7, §8; docs/52 R10; A-48, A-55.
+    let (base_object, decision) = match gate.visible(base) {
+        Ok(Visibility::Visible { object, decision }) => (object, decision),
+        Ok(Visibility::NotFound(unseen)) => {
+            let reason = match unseen.audit_cause() {
+                UnseenCause::Absent => AuditReason::BaseNotFound,
+                UnseenCause::Hidden(_) => AuditReason::BaseNotVisible,
+            };
+            return out.end(ResultCode::NoSuchObject, reason);
+        }
+        Ok(Visibility::Refused(refused)) => {
+            return out.end(
+                denial_code(refused.reason, p.transport_sec),
+                AuditReason::PolicyDenied(refused.reason),
+            );
+        }
+        Err(_) => return out.end(ResultCode::Other, AuditReason::DirectoryUnavailable),
+    };
     let mut server_page = p.limits.max_page_size;
     for obligation in &decision.obligations {
         match obligation {
@@ -314,7 +351,7 @@ pub(crate) fn run(p: SearchParams<'_>) -> SearchOutcome {
         view: p.view,
         p1,
         known,
-        access,
+        gate,
         request: p.request,
         message_id: p.message_id,
         clock: p.clock,
@@ -329,7 +366,7 @@ pub(crate) fn run(p: SearchParams<'_>) -> SearchOutcome {
         pruned: 0,
         dn_values: 0,
     };
-    let status = search.scan(Candidate::new(base_obj, base_dn));
+    let status = search.scan(Candidate::new(base_object));
     out.audit.entries_returned = u32::try_from(search.entries.len()).unwrap_or(u32::MAX);
     out.audit.candidates_visited = search.visited;
     out.audit.pruned_subtrees = search.pruned;
@@ -347,22 +384,6 @@ impl SearchOutcome {
         self.reason = reason;
         self
     }
-}
-
-/// The PDP reasons that do not depend on the object asked about: layer 1,
-/// layer 2, the subject's tier, a malformed request, and a PIP failure
-/// (which, on the NC root, means the directory or the PIP is broken).
-/// Spec: docs/11 §4 (layers 1-2 precede every object lookup; P3);
-/// Q-169 item 3; docs/49 §9.
-fn object_independent(reason: ReasonCode) -> bool {
-    matches!(
-        reason,
-        ReasonCode::Unauthenticated
-            | ReasonCode::WeakTransport
-            | ReasonCode::SubjectMismatch
-            | ReasonCode::InvalidRequest
-            | ReasonCode::PipFailure
-    )
 }
 
 /// A DnError that marks a well-formed DN no phase-1 object can carry
@@ -513,19 +534,20 @@ impl<'r> Search<'r> {
     }
 
     /// Whether the requester may read `attr` of the candidate, decided once
-    /// per candidate and attribute. Spec: crate::search::access.
-    fn readable(&mut self, cand: &mut Candidate, attr: &Attr) -> bool {
+    /// per candidate and attribute, through the gate. Spec: [MS-ADTS]
+    /// 3.1.1.4.3 ("RIGHT_DS_READ_PROPERTY on OA"); docs/49 §6.1 item 4.
+    fn readable(&mut self, cand: &mut Candidate<'r>, attr: &Attr) -> bool {
         if let Some(r) = cand.readable.get(&attr.id) {
             return *r;
         }
-        let r = self.access.may_read(&cand.dn, attr.guid);
+        let r = self.gate.may_read(&cand.object, attr.guid);
         cand.readable.insert(attr.id, r);
         r
     }
 
     /// Steps 3-5 of the module documentation: the candidates of the scope,
     /// starting from the (visible) base.
-    fn scan(&mut self, base: Candidate) -> Result<(), Stop> {
+    fn scan(&mut self, mut base: Candidate<'r>) -> Result<(), Stop> {
         let request = self.request;
         let scope = request.scope;
         if self.limits.unique_index {
@@ -534,7 +556,7 @@ impl<'r> Search<'r> {
             }
         }
         match scope {
-            Scope::BaseObject => self.visit(base),
+            Scope::BaseObject => self.visit(&mut base),
             Scope::SingleLevel => self.one_level(base),
             Scope::WholeSubtree => self.subtree(base),
             // Refused by the dispatcher before the search (docs/49 E14).
@@ -548,7 +570,7 @@ impl<'r> Search<'r> {
     /// One candidate: the visit budget, the time limits, the filter, and on
     /// TRUE the entry. Spec: docs/49 §6.1 items 3-7; RFC 4511 §4.5.1.5,
     /// §4.5.1.7.
-    fn visit(&mut self, mut cand: Candidate) -> Result<(), Stop> {
+    fn visit(&mut self, cand: &mut Candidate<'r>) -> Result<(), Stop> {
         self.check_time()?;
         if self.visited >= self.limits.visit_budget {
             return Err(Stop::Limit(
@@ -558,8 +580,8 @@ impl<'r> Search<'r> {
         }
         self.visited += 1;
         let request = self.request;
-        if self.eval(&mut cand, &request.filter)? == syntax::Tri::True {
-            self.emit(&mut cand)?;
+        if self.eval(cand, &request.filter)? == syntax::Tri::True {
+            self.emit(cand)?;
         }
         Ok(())
     }
@@ -594,7 +616,7 @@ impl<'r> Search<'r> {
     /// Send the entry of a matching candidate, within the page bound and the
     /// response octet bound. Spec: RFC 4511 §4.5.1.4, §4.5.2; docs/49 §6.1
     /// item 7.
-    fn emit(&mut self, cand: &mut Candidate) -> Result<(), Stop> {
+    fn emit(&mut self, cand: &mut Candidate<'r>) -> Result<(), Stop> {
         if self.entries.len() as u64 >= self.cap.limit {
             return Err(Stop::Limit(self.cap.code, self.cap.reason));
         }
@@ -627,45 +649,44 @@ impl<'r> Search<'r> {
             .map_err(|_| Stop::Fail(AuditReason::DirectoryUnavailable))
     }
 
-    /// The candidate for a child `guid` of the container `parent_dn`: its DN
-    /// is its RDN followed by the parent's DN ([MS-ADTS] 3.1.1.1.4).
-    fn child(&self, guid: Guid, parent_dn: &Dn) -> Result<Candidate, Stop> {
-        let obj = self
-            .view
-            .snapshot()
-            .get_object(guid)
-            .map_err(|_| Stop::Fail(AuditReason::DirectoryUnavailable))?
-            .ok_or(Stop::Fail(AuditReason::DirectoryUnavailable))?;
-        let component = self
-            .view
-            .rdn_component(&obj)
-            .map_err(|_| Stop::Fail(AuditReason::DirectoryUnavailable))?;
-        if parent_dn.rdns().len() >= MAX_DN_DEPTH {
-            return Err(Stop::Limit(
+    /// The candidate for a child `guid` of the listable container `parent`,
+    /// through the gate: its DN is its RDN followed by the parent's DN
+    /// ([MS-ADTS] 3.1.1.1.4). Every caller has found the container listable
+    /// and the store's name index names `guid` as its child, so anything but
+    /// a visible object is a directory failure (fail closed); a DN deeper
+    /// than the bound is adminLimitExceeded.
+    /// Spec: [MS-ADTS] 5.1.3.3.6, 3.1.1.1.4; docs/49 §6.1 item 3; docs/52
+    /// R10.
+    fn child(&mut self, parent: &VisibleObject<'r>, guid: Guid) -> Result<Candidate<'r>, Stop> {
+        match self.gate.child(parent, guid) {
+            Ok(Visibility::Visible { object, .. }) => Ok(Candidate::new(object)),
+            Ok(Visibility::NotFound(_) | Visibility::Refused(_)) => {
+                Err(Stop::Fail(AuditReason::DirectoryUnavailable))
+            }
+            Err(GateFault::TooDeep) => Err(Stop::Limit(
                 ResultCode::AdminLimitExceeded,
                 AuditReason::DepthExceeded,
-            ));
+            )),
+            Err(GateFault::Store(_) | GateFault::Name) => {
+                Err(Stop::Fail(AuditReason::DirectoryUnavailable))
+            }
         }
-        let mut rdns = Vec::with_capacity(parent_dn.rdns().len() + 1);
-        rdns.push(component);
-        rdns.extend(parent_dn.rdns().iter().cloned());
-        Ok(Candidate::new(obj, Dn::new(rdns)))
     }
 
     /// singleLevel: the children of the base, if the requester may list it.
     /// Spec: RFC 4511 §4.5.1.2 ("the immediate subordinates"); [MS-ADTS]
     /// 5.1.3.3.6; docs/49 §6.1 item 3.
-    fn one_level(&mut self, base: Candidate) -> Result<(), Stop> {
-        if !self.access.may_list(&base.dn) {
+    fn one_level(&mut self, base: Candidate<'r>) -> Result<(), Stop> {
+        if !self.gate.may_list(base.dn()) {
             self.pruned += 1;
             return Ok(());
         }
         let mut cursor: Option<ChildCursor> = None;
         loop {
-            let page = self.page(base.obj.guid, cursor.as_ref(), self.limits.child_page)?;
+            let page = self.page(base.obj().guid, cursor.as_ref(), self.limits.child_page)?;
             for guid in page.children {
-                let cand = self.child(guid, &base.dn)?;
-                self.visit(cand)?;
+                let mut cand = self.child(&base.object, guid)?;
+                self.visit(&mut cand)?;
             }
             match page.next {
                 Some(next) => cursor = Some(next),
@@ -679,20 +700,17 @@ impl<'r> Search<'r> {
     /// descended into (pruned). Spec: RFC 4511 §4.5.1.2 ("the entry named
     /// by baseObject and ... all its subordinates"); [MS-ADTS] 5.1.3.3.6;
     /// docs/49 §6.1 item 3.
-    fn subtree(&mut self, base: Candidate) -> Result<(), Stop> {
-        let (guid, dn) = (base.obj.guid, base.dn.clone());
-        self.visit(base)?;
-        let mut stack: Vec<Frame> = Vec::new();
-        self.descend(guid, dn, &mut stack)?;
+    fn subtree(&mut self, mut base: Candidate<'r>) -> Result<(), Stop> {
+        self.visit(&mut base)?;
+        let mut stack: Vec<Frame<'r>> = Vec::new();
+        self.descend(base.object, &mut stack)?;
         while let Some(top) = stack.last_mut() {
             if let Some(child) = top.page.pop_front() {
-                let parent_dn = top.dn.clone();
-                let cand = self.child(child, &parent_dn)?;
-                let (guid, dn) = (cand.obj.guid, cand.dn.clone());
-                self.visit(cand)?;
-                self.descend(guid, dn, &mut stack)?;
+                let mut cand = self.child(&top.container, child)?;
+                self.visit(&mut cand)?;
+                self.descend(cand.object, &mut stack)?;
             } else if let Some(next) = top.next.take() {
-                let page = self.page(top.guid, Some(&next), self.limits.child_page)?;
+                let page = self.page(top.container.guid(), Some(&next), self.limits.child_page)?;
                 top.page = page.children.into();
                 top.next = page.next;
             } else {
@@ -702,17 +720,22 @@ impl<'r> Search<'r> {
         Ok(())
     }
 
-    /// Push a frame for the container `guid` if it has children and the
-    /// requester may list it; a non-empty container it may not list is
-    /// pruned. Emptiness is probed with a one-entry page first, so a pruned
-    /// container costs one index read, not a page.
+    /// Push a frame for the visible container `container` if it has
+    /// children and the requester may list it; a non-empty container it may
+    /// not list is pruned. Emptiness is probed with a one-entry page first,
+    /// so a pruned container costs one index read, not a page.
     /// Spec: docs/49 §6.1 item 3; [MS-ADTS] 5.1.3.3.6.
-    fn descend(&mut self, guid: Guid, dn: Dn, stack: &mut Vec<Frame>) -> Result<(), Stop> {
+    fn descend(
+        &mut self,
+        container: VisibleObject<'r>,
+        stack: &mut Vec<Frame<'r>>,
+    ) -> Result<(), Stop> {
+        let guid = container.guid();
         let probe = self.page(guid, None, 1)?;
         if probe.children.is_empty() {
             return Ok(());
         }
-        if !self.access.may_list(&dn) {
+        if !self.gate.may_list(container.dn()) {
             self.pruned += 1;
             return Ok(());
         }
@@ -724,8 +747,7 @@ impl<'r> Search<'r> {
         }
         let first = self.page(guid, None, self.limits.child_page)?;
         stack.push(Frame {
-            guid,
-            dn,
+            container,
             page: first.children.into(),
             next: first.next,
         });
@@ -757,7 +779,7 @@ impl<'r> Search<'r> {
     /// 5.1.3.3.6.
     fn unique_path(
         &mut self,
-        base: Candidate,
+        mut base: Candidate<'r>,
         scope: Scope,
         id: AttrId,
         value: &[u8],
@@ -770,27 +792,29 @@ impl<'r> Search<'r> {
             Ok(None) | Err(dirstore::Error::Rejected(_)) => return Ok(()),
             Err(_) => return Err(Stop::Fail(AuditReason::DirectoryUnavailable)),
         };
-        if guid == base.obj.guid {
+        if guid == base.obj().guid {
             return match scope {
-                Scope::BaseObject | Scope::WholeSubtree => self.visit(base),
+                Scope::BaseObject | Scope::WholeSubtree => self.visit(&mut base),
                 _ => Ok(()),
             };
         }
+        // Only the parent pointer of this read is used: the candidate itself
+        // comes from the gate.
         let obj = snapshot
             .get_object(guid)
             .map_err(|_| Stop::Fail(AuditReason::DirectoryUnavailable))?
             .ok_or(Stop::Fail(AuditReason::DirectoryUnavailable))?;
         match scope {
             Scope::SingleLevel => {
-                if obj.parent != Some(base.obj.guid) {
+                if obj.parent != Some(base.obj().guid) {
                     return Ok(());
                 }
-                if !self.access.may_list(&base.dn) {
+                if !self.gate.may_list(base.dn()) {
                     self.pruned += 1;
                     return Ok(());
                 }
-                let cand = self.child(guid, &base.dn)?;
-                self.visit(cand)
+                let mut cand = self.child(&base.object, guid)?;
+                self.visit(&mut cand)
             }
             Scope::WholeSubtree => {
                 // The distance from the object up to the base, if the base is
@@ -810,7 +834,7 @@ impl<'r> Search<'r> {
                             AuditReason::DepthExceeded,
                         ));
                     }
-                    if ancestor == base.obj.guid {
+                    if ancestor == base.obj().guid {
                         break;
                     }
                     at = snapshot
@@ -819,24 +843,36 @@ impl<'r> Search<'r> {
                         .ok_or(Stop::Fail(AuditReason::DirectoryUnavailable))?
                         .parent;
                 }
-                let dn = self
-                    .view
-                    .dn_of(guid)
-                    .map_err(|_| Stop::Fail(AuditReason::DirectoryUnavailable))?
-                    .ok_or(Stop::Fail(AuditReason::DirectoryUnavailable))?;
-                for k in 1..=distance {
+                // The object's own visibility (k = 1: the list decision on
+                // its parent), through the gate; a hidden object is pruned
+                // like any container on the way that may not be listed.
+                let mut cand = match self.gate.visible(guid) {
+                    Ok(Visibility::Visible { object, .. }) => Candidate::new(object),
+                    Ok(Visibility::NotFound(unseen))
+                        if unseen.audit_cause() == UnseenCause::Absent =>
+                    {
+                        return Err(Stop::Fail(AuditReason::DirectoryUnavailable));
+                    }
+                    Ok(Visibility::NotFound(_) | Visibility::Refused(_)) => {
+                        self.pruned += 1;
+                        return Ok(());
+                    }
+                    Err(_) => return Err(Stop::Fail(AuditReason::DirectoryUnavailable)),
+                };
+                for k in 2..=distance {
                     let container = Dn::new(
-                        dn.rdns()
+                        cand.dn()
+                            .rdns()
                             .get(k..)
                             .map(<[String]>::to_vec)
                             .unwrap_or_default(),
                     );
-                    if !self.access.may_list(&container) {
+                    if !self.gate.may_list(&container) {
                         self.pruned += 1;
                         return Ok(());
                     }
                 }
-                self.visit(Candidate::new(obj, dn))
+                self.visit(&mut cand)
             }
             Scope::BaseObject | Scope::Unrecognized(_) => Ok(()),
         }

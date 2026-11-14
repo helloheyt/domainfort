@@ -41,6 +41,11 @@
 //! | `CoarseDeny`, `NoGrant`, `Acl`, `TierViolation`, `Sensitive`, `NoSuchPath` | insufficientAccessRights (50) — the target is visible (the rootDSE always is) |
 //! | `PipFailure`, `InvalidRequest`, `SubjectMismatch`, anything else | other (80) — fail closed |
 //!
+//! A search base the PDP hides (a denial for an object-dependent reason —
+//! `directory_pip::hides`) never reaches this table: the visibility gate
+//! answers it as not found, and the search answers noSuchObject, exactly as
+//! for an absent base (R49-13; A-48; docs/52 R10; crate::search step 2).
+//!
 //! Spec: docs/11 §1, §2, §4; docs/49 §3.2, §4.3, §9; [MS-DTYP] v20241119
 //! 2.4.2.4; A-47; Q-169; Q-170 item 5.
 
@@ -148,28 +153,6 @@ fn security(channel: Channel, keyd_verified_channel_binding: bool) -> TransportS
         encrypted,
         sealed: bound,
         channel_bound: bound,
-    }
-}
-
-/// The result code of a denial of a search base's visibility: an invisible
-/// base is answered exactly like a nonexistent one, noSuchObject (R49-13;
-/// A-48; [MS-ADTS] 5.1.3.3.6 — no existence disclosure). The reasons that do
-/// not depend on the object (layer 1, layer 2, the subject's tier) keep the
-/// codes of [`denial_code`]; a PIP failure or a malformed request is other
-/// (docs/49 §9, fail closed).
-/// Spec: docs/49 §6.1 item 2, §9 (R49-13); Q-169 items 3, 4.
-pub(crate) fn visibility_denial_code(
-    reason: ReasonCode,
-    transport_sec: TransportSec,
-) -> ResultCode {
-    match reason {
-        ReasonCode::CoarseDeny(_)
-        | ReasonCode::NoGrant
-        | ReasonCode::Acl
-        | ReasonCode::TierViolation
-        | ReasonCode::Sensitive
-        | ReasonCode::NoSuchPath => ResultCode::NoSuchObject,
-        other => denial_code(other, transport_sec),
     }
 }
 

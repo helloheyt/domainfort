@@ -53,6 +53,12 @@
 //! | `Delete` | `DirDelete` on the object | object explicitly Tier0 |
 //! | `Lookup` | `DirRead` on the object | never |
 //!
+//! Before any of these, every object the request names must be visible to
+//! the requester through `directory_pip::VisibilityGate`, rule
+//! `ListAndRead`: `DirList` on its parent ([MS-ADTS] 5.1.3.3.6, the LDAP
+//! search's rule) and `DirRead` on the object; otherwise it is answered
+//! exactly like an absent object (A-55; docs/52 R10; docs/questions/Q-485).
+//!
 //! "Explicitly Tier0" = classified Tier0 by a tier-map subtree, a tier-map
 //! entry of its SID or groups, or a structural rule (NC root, krbtgt, DC
 //! account) — not merely unclassified (A-36 makes unclassified Tier0 for

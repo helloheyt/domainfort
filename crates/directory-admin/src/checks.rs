@@ -4,10 +4,25 @@
 //! expansion (nesting depth and closure size), and the count the
 //! self-lockout guard needs.
 //!
+//! # Visibility (docs/52 R10, A-102)
+//!
+//! Every object a request names is a [`Resolved`], which can be built only
+//! from the visibility gate's `directory_pip::VisibleObject` (rule
+//! `ListAndRead`: `DirList` on the parent as [MS-ADTS] 5.1.3.3.6 — the LDAP
+//! search's rule — **and** `DirRead` on the whole object, docs/51 §5.2 row
+//! 10; docs/questions/Q-485) — so every check here that takes a `Resolved`
+//! runs on an object the requester may see, the admin plane never names an
+//! object the LDAP search hides, and "absent" and "not visible" were
+//! answered alike before (A-55; docs/questions/Q-358 item 3). The membership walks read further
+//! objects the requester may not see — they check invariants of the whole
+//! directory and hand nothing back; their refusal codes are a residual
+//! (docs/questions/Q-487). [`Cx::resolve`] reads a key-operation target for
+//! crate::key_requests, after its `PolicyAdmin` decision (Q-486).
+//!
 //! Spec: docs/51 §7.4 steps 2-4 (one view: snapshot + tier map of the same
 //! policy version, docs/47 §8.1), §5.2, §5.6, §11; docs/11 §4, §7; A-55;
-//! [MS-SAMR] 3.1.1.8.9; docs/47 §5.3 items 1, 3, 4; Q-295 item 4 (P-22);
-//! docs/questions/Q-356 item 5, Q-416.
+//! docs/52 R10; [MS-SAMR] 3.1.1.8.9; docs/47 §5.3 items 1, 3, 4; Q-295 item
+//! 4 (P-22); docs/questions/Q-356 item 5, Q-416.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -16,7 +31,10 @@ use ad_schema::flags::group_type::{
     GROUP_TYPE_UNIVERSAL_GROUP,
 };
 use ad_schema::flags::user_account_control::ADS_UF_SERVER_TRUST_ACCOUNT;
-use directory_pip::{DirectoryView, MAX_EXPANDED_GROUPS, MAX_NESTING_DEPTH};
+use directory_pip::{
+    DirectoryView, VisibilityGate, VisibilityProof, VisibilityRule, VisibleObject,
+    MAX_EXPANDED_GROUPS, MAX_NESTING_DEPTH,
+};
 use dirstore::{ClassId, Object};
 use dtyp::{Guid, Sid};
 use ipc_audit::{AdminFailure, AdminRefusal};
@@ -126,9 +144,46 @@ pub(crate) struct Cx<'c, 'v, 'a> {
     pub(crate) instant: Instant,
 }
 
-/// An object a request names, read from the view.
+/// An object a request names that the requester may see, read from the
+/// view. Built only by [`Resolved::from_visible`], from the visibility
+/// gate's `VisibleObject` (module documentation): the proof field has no
+/// constructor outside directory-pip.
+/// Spec: docs/52 R10; docs/51 §5.2 row 10; A-55.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Resolved {
+pub(crate) struct Resolved<'v> {
+    pub(crate) guid: Guid,
+    pub(crate) obj: Object,
+    pub(crate) dn: Dn,
+    pub(crate) class: ClassId,
+    _visible: VisibilityProof<'v>,
+}
+
+impl<'v> Resolved<'v> {
+    /// The record of a visible object, with its most specific class.
+    /// Spec: docs/46 §8.3 item 1; docs/52 R10.
+    pub(crate) fn from_visible(
+        cx: &Cx<'_, 'v, '_>,
+        visible: VisibleObject<'v>,
+    ) -> Result<Resolved<'v>, Stop> {
+        let class = cx.class_of(visible.object())?;
+        let (obj, dn, proof) = visible.into_parts();
+        Ok(Resolved {
+            guid: proof.guid(),
+            obj,
+            dn,
+            class,
+            _visible: proof,
+        })
+    }
+}
+
+/// A key-operation target read for crate::key_requests: the manifest's
+/// krbtgt account or one of its service objects, read only after the
+/// requester's `PolicyAdmin` decision on the `keys` scope (docs/51 §5.2 row
+/// 11). Not a [`Resolved`]: no check that needs a visible object accepts it
+/// (docs/questions/Q-486).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KeyTargetRecord {
     pub(crate) guid: Guid,
     pub(crate) obj: Object,
     pub(crate) dn: Dn,
@@ -153,7 +208,7 @@ pub(crate) fn malformed(_: record::Malformed) -> Stop {
     Stop::Failed(AdminFailure::IntegrityFailure)
 }
 
-impl Cx<'_, '_, '_> {
+impl<'v, 'a> Cx<'_, 'v, 'a> {
     /// The most specific class of a stored object. Spec: docs/46 §8.3 item
     /// 1; [MS-ADTS] 3.1.1.2.4.3 (as cited there).
     pub(crate) fn class_of(&self, obj: &Object) -> Result<ClassId, Stop> {
@@ -165,10 +220,10 @@ impl Cx<'_, '_, '_> {
             .ok_or(Stop::Failed(AdminFailure::IntegrityFailure))
     }
 
-    /// The live object `guid` with its canonical DN; absent, or outside
-    /// the naming context ⇒ `NotFound`.
-    /// Spec: docs/51 §5.2 row 10 ("not found"); docs/47 §8.2 (`dn_of`).
-    pub(crate) fn resolve(&self, guid: Guid) -> Result<Resolved, Stop> {
+    /// The live key-operation target `guid` with its canonical DN; absent,
+    /// or outside the naming context ⇒ `NotFound` ([`KeyTargetRecord`]).
+    /// Spec: docs/51 §5.2 rows 10-11 ("not found"); docs/47 §8.2 (`dn_of`).
+    pub(crate) fn resolve(&self, guid: Guid) -> Result<KeyTargetRecord, Stop> {
         let obj = self
             .view
             .snapshot()
@@ -181,7 +236,7 @@ impl Cx<'_, '_, '_> {
             .map_err(|_| Stop::Failed(AdminFailure::StoreFailure))?
             .ok_or(Stop::Refused(AdminRefusal::NotFound))?;
         let class = self.class_of(&obj)?;
-        Ok(Resolved {
+        Ok(KeyTargetRecord {
             guid,
             obj,
             dn,
@@ -189,37 +244,45 @@ impl Cx<'_, '_, '_> {
         })
     }
 
+    /// The `Context` of every PDP request on the admin plane's local socket.
+    /// Spec: docs/51 §5.4 (`Transport::LocalIpc`, `{encrypted, sealed}`, no
+    /// channel binding — A-74); docs/11 §1, P9 (the PEP supplies the time);
+    /// docs/questions/Q-358 item 11.
+    fn context(&self) -> Context {
+        Context {
+            src_net: IpScope::Internal,
+            time: self.instant,
+            transport: Transport::LocalIpc,
+            transport_sec: LOCAL_IPC_SECURITY,
+        }
+    }
+
     /// `pdp::decide` for `subject` on the admin plane's local socket.
     /// Spec: docs/11 §1 (the PEP builds the request from the verified
-    /// identity and the wire only), §4; docs/51 §5.4 (`Transport::LocalIpc`,
-    /// `{encrypted, sealed}`, no channel binding — A-74); docs/11 P9 (the
-    /// PEP supplies the time).
+    /// identity and the wire only), §4; docs/51 §5.4.
     pub(crate) fn decide(&self, subject: &Subject, action: Action, resource: Resource) -> Decision {
         let request = AccessRequest {
             subject: subject.clone(),
             resource,
             action,
-            context: Context {
-                src_net: IpScope::Internal,
-                time: self.instant,
-                transport: Transport::LocalIpc,
-                transport_sec: LOCAL_IPC_SECURITY,
-            },
+            context: self.context(),
         };
         pdp::decide(&request, self.policy, self.view)
     }
 
-    /// The whole-object read decision on `r` (its visibility).
-    /// Spec: docs/11 §7 (as cited in docs/51 §5.2 row 10: `DirRead` on the
-    /// object = its visibility).
-    pub(crate) fn read_decision(&self, subject: &Subject, r: &Resolved) -> Decision {
-        self.decide(
-            subject,
-            Action::DirRead,
-            Resource::DirObject {
-                dn: r.dn.clone(),
-                attr: None,
-            },
+    /// The visibility gate of `subject` over this view, in the same context
+    /// as every other decision of the request: an object is visible when
+    /// the requester may list its parent ([MS-ADTS] 5.1.3.3.6 — the LDAP
+    /// search's rule) **and** read the whole object (docs/51 §5.2 row 10).
+    /// Spec: [MS-ADTS] 5.1.3.3.6; docs/51 §5.2 row 10 (`DirRead` on the
+    /// object, docs/11 §7); docs/52 R10; A-55; docs/questions/Q-485.
+    pub(crate) fn gate(&self, subject: &Subject) -> VisibilityGate<'v, 'a> {
+        VisibilityGate::new(
+            self.view,
+            self.policy,
+            subject.clone(),
+            self.context(),
+            VisibilityRule::ListAndRead,
         )
     }
 
