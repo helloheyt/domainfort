@@ -52,6 +52,13 @@ keyd-types = { path = "../keyd-types" }
 krb-proto = { path = "../krb-proto" }
 # The `DirAdmin` audit event this crate plans (A-85). No conversion feature.
 ipc-audit = { path = "../ipc-audit" }
+# SHA-256 of a pending key-operation request's operation digest (task A10,
+# docs/51 §5.6; docs/questions/Q-420). RustCrypto, OD-9; already in the
+# workspace lock and already in dird's graph (dirstore links it). License:
+# MIT OR Apache-2.0. Called only through its documented `Digest` API
+# (docs.rs sha2 0.11.1, as crates/audit-log cites it); no hash is
+# implemented here (AGENTS.md §6). Not krb-crypto (D182).
+sha2 = { version = "0.11", default-features = false }
 
 [lints]
 workspace = true

@@ -446,7 +446,9 @@ pub fn provision(path: &Path) -> Arc<Store> {
 }
 
 /// The policy: tier map {tier0 group → Tier0}, {ou=Tier0 → Tier0}; the
-/// Tier-0 group may run every Directory action under the NC root; the
+/// Tier-0 group may run every Directory action under the NC root and
+/// `PolicyAdmin` on every policy scope (the key operations' `keys` scope
+/// included — the rule `provision domain` writes, task A10, Q-420); the
 /// bootstrap group is the FAST bootstrap set (docs/51 §4.3 step 6).
 pub fn policy() -> DevelopmentPolicy {
     DevelopmentPolicy {
@@ -457,20 +459,34 @@ pub fn policy() -> DevelopmentPolicy {
             bootstrap_group: sid_of(BOOTSTRAP),
             first_rule_id: RuleId(100),
         },
-        rules: vec![Rule {
-            id: RuleId(1),
-            effect: Effect::Allow,
-            when: Match {
-                action: ActionMatch::Class(pdp::ActionClass::Directory),
-                resource: ResourceMatch::DirSubtree {
-                    base: SubtreeBase::new(nc_dn()).unwrap(),
+        rules: vec![
+            Rule {
+                id: RuleId(1),
+                effect: Effect::Allow,
+                when: Match {
+                    action: ActionMatch::Class(pdp::ActionClass::Directory),
+                    resource: ResourceMatch::DirSubtree {
+                        base: SubtreeBase::new(nc_dn()).unwrap(),
+                    },
+                    subject: SubjectMatch::MemberOf(sid_of(TIER0_GROUP)),
+                    context: ContextMatch::ANY,
+                    auth: AuthMatch::ANY,
                 },
-                subject: SubjectMatch::MemberOf(sid_of(TIER0_GROUP)),
-                context: ContextMatch::ANY,
-                auth: AuthMatch::ANY,
+                obligations: vec![],
             },
-            obligations: vec![],
-        }],
+            Rule {
+                id: RuleId(2),
+                effect: Effect::Allow,
+                when: Match {
+                    action: ActionMatch::Exact(pdp::Action::PolicyAdmin),
+                    resource: ResourceMatch::Policy { scope: None },
+                    subject: SubjectMatch::MemberOf(sid_of(TIER0_GROUP)),
+                    context: ContextMatch::ANY,
+                    auth: AuthMatch::ANY,
+                },
+                obligations: vec![],
+            },
+        ],
         anonymous: Vec::new(),
     }
 }
@@ -1116,6 +1132,15 @@ pub struct Options {
     pub min_password_length: u32,
     pub keyd_deadline: Duration,
     pub frame_timeout: Duration,
+    /// admind's `keyadm_uid` = the test's uid + this (0: the test's uid is
+    /// keyadm's; 1: it is not — task A10).
+    pub keyadm_uid_offset: u32,
+    /// Start keyadm's keyd (task A10): a real keyd, the test's uid mapped
+    /// to Role::Admin, a store that accepts krbtgt, holding the krbtgt key
+    /// set and ws9's two key sets.
+    pub keyadm_keyd: bool,
+    /// dird's pending key-operation request lifetime.
+    pub key_request_lifetime: Duration,
 }
 
 impl Default for Options {
@@ -1127,8 +1152,61 @@ impl Default for Options {
             min_password_length: 12,
             keyd_deadline: Duration::from_secs(2),
             frame_timeout: Duration::from_secs(2),
+            keyadm_uid_offset: 0,
+            keyadm_keyd: false,
+            key_request_lifetime: directory_admin::KEY_REQUEST_LIFETIME,
         }
     }
+}
+
+/// keyadm's keyd (task A10): the krbtgt key set (`create_key`, as the
+/// ceremony makes it — docs/51 §4.3 step 11) and ws9's `PrincipalLongterm`
+/// and `Service` key sets (made here with `create_key` too: the test needs
+/// key sets to destroy, not their passwords), all with random keys.
+/// Spec: docs/10 §7; docs/47 §1.4, §9.1; A-19.
+fn keyadm_keyd(
+    started: &KerberosTime,
+) -> Result<Keyd<InMemoryKeyStore, RecordBuffer>, keyd::ConfigError> {
+    let mut keyd = Keyd::new(
+        dird::keyd_config(),
+        InMemoryKeyStore::new_insecure_development_allowing_krbtgt(64),
+        RecordBuffer::new(),
+        started,
+    )?;
+    let krbtgt = manifest().krbtgt().clone();
+    keyd.create_key(
+        &common::ADMIN,
+        &krbtgt.handle,
+        &krbtgt.binding,
+        &common::now(),
+    )
+    .unwrap();
+    let ws9 = keyd_types::PrincipalId::from_bytes(g(WS9).to_packet());
+    keyd.create_key(
+        &common::ADMIN,
+        &keyd_types::KeyHandle::new(ws9, keyd_types::KeyPurpose::PrincipalLongterm),
+        &keyd_types::PrincipalBinding::new(
+            common::realm(),
+            common::name(KRB_NT_PRINCIPAL, &["ws9$"]),
+        ),
+        &common::now(),
+    )
+    .unwrap();
+    keyd.create_key(
+        &common::ADMIN,
+        &keyd_types::KeyHandle::new(ws9, keyd_types::KeyPurpose::Service),
+        &keyd_types::PrincipalBinding::new(
+            common::realm(),
+            common::name(
+                krb_proto::constants::KRB_NT_SRV_HST,
+                &["host", "ws9.example.org"],
+            ),
+        ),
+        &common::now(),
+    )
+    .unwrap();
+    let _ = keyd.audit_sink_mut().take();
+    Ok(keyd)
 }
 
 /// Everything of one test.
@@ -1149,6 +1227,10 @@ pub struct World {
     pub admind: Option<AdmindRun>,
     pub admin_socket: PathBuf,
     pub keyd_dir_socket: PathBuf,
+    /// keyadm's keyd (task A10), when started.
+    pub keyadm_keyd: Option<dird::keyd::Daemon>,
+    pub keyadm_keyd_auditd: Option<FakeAuditd>,
+    pub keyadm_keyd_socket: PathBuf,
 }
 
 impl World {
@@ -1215,6 +1297,7 @@ impl World {
                     max_connections: directory_daemon::MAX_ADMIN_CONNECTIONS,
                     queue_capacity: directory_daemon::ADMIN_QUEUE_CAPACITY,
                     ack_deadline: DECISION_ACK_DEADLINE,
+                    key_request_lifetime: options.key_request_lifetime,
                 };
                 dird_run = Some(DirdRun::start(params, admin, Arc::clone(&provisioned)));
                 store = Some(provisioned);
@@ -1262,6 +1345,21 @@ impl World {
             KeydMode::Silent => silent_keyd = Some(SilentServer::start(&keyd_dir_socket)),
         }
 
+        // keyadm's keyd (task A10).
+        let keyadm_keyd_socket = dir.join("kk.sock");
+        let (mut keyadm_keyd_auditd, mut keyadm_keyd_run) = (None, None);
+        if options.keyadm_keyd {
+            let mut keyd_params =
+                dird::keyd::params(&dir, CallerMap::new(&[(uid, Role::Admin)]).unwrap(), uid);
+            keyd_params.keyd_socket = keyadm_keyd_socket.clone();
+            keyd_params.audit.socket = dir.join("kc.sock");
+            keyadm_keyd_auditd = Some(FakeAuditd::start(&keyd_params.audit.socket));
+            keyadm_keyd_run = Some(
+                dird::keyd::Daemon::start(keyd_params, TestClock::at(common::now()), keyadm_keyd)
+                    .unwrap(),
+            );
+        }
+
         // admind.
         let admin_socket = dir.join("am.sock");
         let params = DaemonParams {
@@ -1272,6 +1370,7 @@ impl World {
             },
             frame_timeout: options.frame_timeout,
             min_password_length: options.min_password_length,
+            keyadm_uid: uid + options.keyadm_uid_offset,
             dird: dird_link(&dird_socket, uid),
             keyd: keyd_link(&keyd_dir_socket, uid, options.keyd_deadline),
             limits: options.limits,
@@ -1296,7 +1395,26 @@ impl World {
             admind: Some(admind),
             admin_socket,
             keyd_dir_socket,
+            keyadm_keyd: keyadm_keyd_run,
+            keyadm_keyd_auditd,
+            keyadm_keyd_socket,
         })
+    }
+
+    /// keyadm's keyd's records so far (task A10).
+    pub fn keyadm_records(&self) -> Vec<KeydRecord> {
+        self.keyadm_keyd_auditd
+            .as_ref()
+            .map(|a| {
+                a.events()
+                    .into_iter()
+                    .filter_map(|e| match e {
+                        EventBody::Keyd(record) => Some(*record),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// A new connection to admind.
@@ -1400,6 +1518,9 @@ impl Drop for World {
             let _ = keyd.stop();
         }
         if let Some(keyd) = self.keyd_dir.take() {
+            let _ = keyd.stop();
+        }
+        if let Some(keyd) = self.keyadm_keyd.take() {
             let _ = keyd.stop();
         }
         if let Some(server) = self.auditd.take() {

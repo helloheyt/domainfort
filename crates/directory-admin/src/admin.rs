@@ -360,7 +360,10 @@ impl<R: RandomSource> DirectoryAdmin<R> {
 }
 
 /// The Subject of a verified ticket. Spec: docs/51 §5.3.
-fn subject_of(cx: &Cx<'_, '_, '_>, ticket: &VerifiedTicket) -> Result<AdminSubject, SubjectError> {
+pub(crate) fn subject_of(
+    cx: &Cx<'_, '_, '_>,
+    ticket: &VerifiedTicket,
+) -> Result<AdminSubject, SubjectError> {
     AdminSubject::from_verified_ticket(
         cx.view,
         &ticket.crealm,

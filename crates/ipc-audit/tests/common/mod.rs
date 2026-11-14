@@ -529,6 +529,15 @@ pub fn admind_keyadm_refused() -> AdmindEvent {
     }
 }
 
+/// Task F6 (docs/questions/Q-406 item 3): a frame dropped by the per-uid
+/// request rate (noise).
+pub fn admind_rate_limited() -> AdmindEvent {
+    AdmindEvent {
+        activity: AdmindActivity::RateLimited,
+        ..admind_connection_refused()
+    }
+}
+
 /// The largest `Admind` event.
 pub fn largest_admind() -> AdmindEvent {
     AdmindEvent {
@@ -586,6 +595,32 @@ pub fn admin_samples() -> Vec<EventBody> {
             operation: DirAdminOperation::SetEnabled,
             ..dir_admin_refused()
         },
+        // Task A10 (Q-421): the appended key-request codes.
+        DirAdminEvent {
+            stage: DirAdminStage::Decision(DecisionResult::Refused(
+                AdminRefusal::OperationMismatch,
+            )),
+            operation: DirAdminOperation::Approve,
+            ..dir_admin_key_complete()
+        },
+        DirAdminEvent {
+            stage: DirAdminStage::Outcome(OutcomeResult::Refused(
+                AdminRefusal::KeyOperationRefused,
+            )),
+            ..dir_admin_key_complete()
+        },
+        DirAdminEvent {
+            stage: DirAdminStage::Outcome(OutcomeResult::Failed(
+                AdminFailure::KeyOperationNotPerformed,
+            )),
+            ..dir_admin_key_complete()
+        },
+        DirAdminEvent {
+            stage: DirAdminStage::Outcome(OutcomeResult::Failed(
+                AdminFailure::KeyOperationOutcomeUnknown,
+            )),
+            ..dir_admin_key_complete()
+        },
     ];
     let admind = [
         admind_connection_refused(),
@@ -608,6 +643,25 @@ pub fn admin_samples() -> Vec<EventBody> {
                 result: PasswordResult::Failed {
                     step: PasswordStep::Validation,
                     cause: PasswordFailure::PasswordPolicy,
+                },
+            },
+            ..admind_connection_refused()
+        },
+        // Task F6 (A-94, Q-406): the three appended codes.
+        admind_rate_limited(),
+        AdmindEvent {
+            activity: AdmindActivity::MalformedFrame {
+                error: FrameErrorCode::ValueRefused,
+            },
+            ..admind_connection_refused()
+        },
+        AdmindEvent {
+            activity: AdmindActivity::SetPassword {
+                target: [2; 16],
+                kvnos: BoundedSeq::empty(),
+                result: PasswordResult::Failed {
+                    step: PasswordStep::SetSecret(KeyPurposeCode::PrincipalLongterm),
+                    cause: PasswordFailure::OutcomeUnknown,
                 },
             },
             ..admind_connection_refused()

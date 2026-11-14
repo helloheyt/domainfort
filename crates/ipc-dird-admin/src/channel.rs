@@ -153,6 +153,17 @@ pub const MAX_SALT: u32 = 1024;
 /// `organizationalUnit`).
 pub const MAX_CLASS_NAME: u32 = 64;
 
+/// Octets of a key-operation request's digest: a SHA-256 output.
+/// Spec: docs/51 §5.6 ("the operation digest"); FIPS 180-4 (SHA-256, as
+/// computed by the approved RustCrypto `sha2` in dird); docs/questions/
+/// Q-420.
+pub const DIGEST_LEN: usize = 32;
+
+/// Most entries one `PendingDestruction` page carries. Project choice: a
+/// page stays far under the 16 KiB reply bound (checked below).
+/// Spec: docs/51 §6, §7.5; docs/questions/Q-422.
+pub const MAX_DESTRUCTION_ENTRIES: u32 = 256;
+
 /// Body octets of the `auth` field at its largest.
 pub const MAX_AUTH: usize =
     4 + MAX_AP_REQ as usize + 4 + MAX_APPROVALS as usize * (4 + MAX_AP_REQ as usize);
@@ -182,8 +193,23 @@ const FOUND: usize = ENVELOPE
     + (4 + MAX_CLASS_NAME as usize)
     + (1 + 4 + MAX_SID as usize);
 
+/// The largest `KeyOperation`: tag, key-reference tag, objectGUID, kvno.
+const KEY_OPERATION_SIZE: usize = 1 + 1 + 16 + 4;
+/// Payload octets of the largest `Approve` after `auth`.
+const APPROVE_SIZE: usize = 8 + KEY_OPERATION_SIZE;
+/// Body octets of the largest key-request replies.
+const KEY_REQUEST_SIZE: usize = ENVELOPE + 8 + DIGEST_LEN + KEY_OPERATION_SIZE + 1 + 1;
+const APPROVED_SIZE: usize =
+    ENVELOPE + 8 + DIGEST_LEN + KEY_OPERATION_SIZE + 16 + 16 + 4 + MAX_APPROVALS as usize * 16;
+const PENDING_DESTRUCTION_SIZE: usize =
+    ENVELOPE + 4 + MAX_DESTRUCTION_ENTRIES as usize * (16 + 1) + (1 + 16);
+
 // The bounds agree with the values they are derived from and fit the body
 // bounds; checked at compile time, never at run time.
+const _: () = assert!(APPROVE_SIZE <= MAX_PAYLOAD);
+const _: () = assert!(KEY_REQUEST_SIZE <= MAX_REPLY_BODY as usize);
+const _: () = assert!(APPROVED_SIZE <= MAX_REPLY_BODY as usize);
+const _: () = assert!(PENDING_DESTRUCTION_SIZE <= MAX_REPLY_BODY as usize);
 const _: () = assert!(MAX_AP_REQ == ipc_keyd::channel::MAX_REQUEST_FIELD);
 const _: () = assert!(MAX_SALT <= ipc_keyd::channel::MAX_SALT);
 const _: () = assert!(MAX_REALM <= ipc_keyd::channel::MAX_REQUEST_FIELD);
@@ -198,12 +224,14 @@ const _: () = assert!(FOUND <= MAX_REPLY_BODY as usize);
 
 // ---- kinds -----------------------------------------------------------------
 
-/// Request kinds (admind → dird): the closed operation set of docs/51 §7.3
-/// that this task builds, numbered in the table's order, and `Ping`. The
-/// key-operation requests and the join token of that table (tasks A10, A12)
-/// are not part of this set: the numbers `0x0E`–`0x13` between `Lookup` and
-/// `Ping` are simply unused. Values are a project choice.
-/// Spec: docs/51 §7.3; docs/50 §3.3 ("`kind` closed"), §7.5 (`Ping`).
+/// Request kinds (admind → dird): the closed operation set of docs/51 §7.3,
+/// numbered in the table's order, and `Ping`. The key-operation rows of that
+/// table (task A10) take `0x0E`–`0x12` in the same order —
+/// `RequestKeyOperation`, `Approve`, `FetchApproved`, `Complete`,
+/// `ListPendingDestruction`; `0x13` (the table's `IssueJoinToken`, task A12
+/// — deferred, A-78) stays unused. Values are a project choice.
+/// Spec: docs/51 §7.3; docs/50 §3.3 ("`kind` closed"), §7.5 (`Ping`);
+/// docs/questions/Q-389 item 1 (A-91), Q-422.
 pub mod request_kind {
     /// `CreateUser`. Spec: docs/51 §7.3; §5.2 row 1.
     pub const CREATE_USER: u8 = 0x01;
@@ -231,8 +259,29 @@ pub mod request_kind {
     pub const DELETE: u8 = 0x0C;
     /// `Lookup`. Spec: docs/51 §7.3; §5.2 row 10.
     pub const LOOKUP: u8 = 0x0D;
+    /// `RequestKeyOperation {operation}`: a requester opens a pending
+    /// key-operation request. Spec: docs/51 §5.2 row 11, §5.6, §6, §7.3.
+    pub const REQUEST_KEY_OPERATION: u8 = 0x0E;
+    /// `Approve {id, operation}`: an approver approves the exact operation
+    /// of a pending request. Spec: docs/51 §5.6, §6, §7.3.
+    pub const APPROVE: u8 = 0x0F;
+    /// `FetchApproved {id}` — keyadm's, forwarded by admind only from
+    /// `keyadm_uid`; no `auth`. Spec: docs/51 §6, §7.3.
+    pub const FETCH_APPROVED: u8 = 0x10;
+    /// `Complete {id, outcome}` — keyadm's; no `auth`. Spec: docs/51 §6,
+    /// §7.3.
+    pub const COMPLETE: u8 = 0x11;
+    /// `ListPendingDestruction {cursor}` — keyadm's; no `auth`.
+    /// Spec: docs/51 §6, §7.3, §9.
+    pub const LIST_PENDING_DESTRUCTION: u8 = 0x12;
     /// `Ping`: the health check, no `auth`. Spec: docs/51 §7.3; docs/50 §7.5.
     pub const PING: u8 = 0x14;
+
+    /// The requests keyadm sends (through admind, which forwards them only
+    /// when its peer's uid is `keyadm_uid`): they carry no `auth` — keyadm
+    /// has no Kerberos client (docs/51 §6). Spec: docs/51 §6, §7.3;
+    /// docs/questions/Q-422.
+    pub const KEYADM: &[u8] = &[FETCH_APPROVED, COMPLETE, LIST_PENDING_DESTRUCTION];
 
     /// The closed request table. Spec: docs/51 §7.3; docs/50 §3.3.
     pub const ALL: &[u8] = &[
@@ -249,6 +298,11 @@ pub mod request_kind {
         REMOVE_MEMBER,
         DELETE,
         LOOKUP,
+        REQUEST_KEY_OPERATION,
+        APPROVE,
+        FETCH_APPROVED,
+        COMPLETE,
+        LIST_PENDING_DESTRUCTION,
         PING,
     ];
 }
@@ -271,10 +325,32 @@ pub mod reply_kind {
     pub const REFUSED: u8 = 0x85;
     /// `Pong`: the reply to `Ping`. Spec: docs/50 §7.5.
     pub const PONG: u8 = 0x86;
+    /// `KeyRequest { id, digest, operation, approvals, quorum }`: the
+    /// pending request as dird holds it, shown back to the requester and to
+    /// every approver. (`0x87` is admin.sock's `PasswordChanged`, never
+    /// dird's — the two channels share their common reply numbers.)
+    /// Spec: docs/51 §5.6, §7.3 (`id / state`); docs/questions/Q-422.
+    pub const KEY_REQUEST: u8 = 0x88;
+    /// `Approved { id, digest, operation, principal, requester, approvers }`:
+    /// the answer to `FetchApproved`. Spec: docs/51 §6, §7.3.
+    pub const APPROVED: u8 = 0x89;
+    /// `PendingDestruction { entries, next }`: one page of the tombstones of
+    /// user / computer objects. Spec: docs/51 §6, §7.3, §9; A-18.
+    pub const PENDING_DESTRUCTION: u8 = 0x8A;
 
     /// The closed reply table (without the reserved `REFUSED_KIND`).
     /// Spec: docs/51 §7.3; docs/50 §3.3; A-59.
-    pub const ALL: &[u8] = &[CREATED, PASSWORD_SET, DONE, FOUND, REFUSED, PONG];
+    pub const ALL: &[u8] = &[
+        CREATED,
+        PASSWORD_SET,
+        DONE,
+        FOUND,
+        REFUSED,
+        PONG,
+        KEY_REQUEST,
+        APPROVED,
+        PENDING_DESTRUCTION,
+    ];
 }
 
 /// Whether `kinds` lists no value twice. Compile-time helper.
@@ -337,6 +413,36 @@ pub mod codes {
     pub const PURPOSE_PRINCIPAL_LONGTERM: u8 = 0x01;
     /// A key target's purpose: `Service` (a computer's SPN key set).
     pub const PURPOSE_SERVICE: u8 = 0x02;
+
+    /// `KeyOperation`: `rotate_krbtgt` (no field; dird names the krbtgt key
+    /// set). Spec: docs/51 §6; docs/10 §7.
+    pub const KEY_OP_ROTATE_KRBTGT: u8 = 0x01;
+    /// `KeyOperation`: `rotate_key` of a service object's randomized
+    /// `Service` key set; its objectGUID follows. Spec: docs/51 §6; docs/10
+    /// §7, §5ב.
+    pub const KEY_OP_ROTATE_KEY: u8 = 0x02;
+    /// `KeyOperation`: `retire_kvno`; a key reference and the kvno follow.
+    /// Spec: docs/51 §6; docs/10 §7; docs/33 §5.
+    pub const KEY_OP_RETIRE_KVNO: u8 = 0x03;
+
+    /// `KeyRef`: the krbtgt key set (dird names it). Spec: docs/51 §6.
+    pub const KEY_REF_KRBTGT: u8 = 0x01;
+    /// `KeyRef`: a service object's `Service` key set; its objectGUID
+    /// follows. Spec: docs/51 §6.
+    pub const KEY_REF_SERVICE: u8 = 0x02;
+
+    /// `Complete.outcome`: keyd performed the operation; an optional kvno
+    /// (the new one, for a rotation) follows. Spec: docs/51 §6 (`Complete
+    /// {id, outcome, kvno}`); A-88, A-90.
+    pub const KEY_OUTCOME_PERFORMED: u8 = 0x01;
+    /// `Complete.outcome`: keyd answered with a refusal (nothing stored,
+    /// docs/10 §9).
+    pub const KEY_OUTCOME_REFUSED: u8 = 0x02;
+    /// `Complete.outcome`: not performed — never sent, or refused by keyd's
+    /// transport before keyd ran it (A-88).
+    pub const KEY_OUTCOME_NOT_PERFORMED: u8 = 0x03;
+    /// `Complete.outcome`: sent, and no usable answer came back (A-90).
+    pub const KEY_OUTCOME_UNKNOWN: u8 = 0x04;
 }
 
 /// What the client is told about a refused or failed operation (the reason

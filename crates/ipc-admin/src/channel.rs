@@ -107,10 +107,14 @@ const _: () = assert!(PASSWORD_CHANGED <= MAX_REPLY_BODY as usize);
 /// numbers of dird's admin channel (their layouts are that channel's);
 /// `0x06` / `0x07` — dird's `BeginPasswordSet` / `CompletePasswordSet` —
 /// are never assigned here (only admind calls them, inside `SetPassword`);
-/// `0x0E`–`0x13` stay unused as on dird's channel (the key-operation
-/// requests, the keyadm-only forwards and the join token — tasks A10, A12);
-/// `SetPassword` is `0x15`. Values are a project choice.
-/// Spec: docs/51 §7.3, §7.6; docs/50 §3.3 ("`kind` closed"), §7.5 (`Ping`).
+/// the key-operation requests `RequestKeyOperation` / `Approve` (`0x0E`,
+/// `0x0F`) are forwarded like every other operation; the keyadm requests
+/// `FetchApproved` / `Complete` / `ListPendingDestruction` (`0x10`–`0x12`)
+/// are forwarded **only** when the peer's uid is `keyadm_uid` (task A10);
+/// `0x13` (the join token, task A12) stays unused; `SetPassword` is `0x15`.
+/// Values are a project choice.
+/// Spec: docs/51 §6, §7.3, §7.6; docs/50 §3.3 ("`kind` closed"), §7.5
+/// (`Ping`); docs/questions/Q-422.
 pub mod request_kind {
     use ipc_dird_admin::channel::request_kind as dird;
 
@@ -136,6 +140,16 @@ pub mod request_kind {
     pub const DELETE: u8 = dird::DELETE;
     /// `Lookup`. Spec: docs/51 §7.3; §5.2 row 10.
     pub const LOOKUP: u8 = dird::LOOKUP;
+    /// `RequestKeyOperation`. Spec: docs/51 §5.6, §6, §7.3.
+    pub const REQUEST_KEY_OPERATION: u8 = dird::REQUEST_KEY_OPERATION;
+    /// `Approve`. Spec: docs/51 §5.6, §6, §7.3.
+    pub const APPROVE: u8 = dird::APPROVE;
+    /// `FetchApproved` (keyadm only). Spec: docs/51 §6, §7.3.
+    pub const FETCH_APPROVED: u8 = dird::FETCH_APPROVED;
+    /// `Complete` (keyadm only). Spec: docs/51 §6, §7.3.
+    pub const COMPLETE: u8 = dird::COMPLETE;
+    /// `ListPendingDestruction` (keyadm only). Spec: docs/51 §6, §7.3.
+    pub const LIST_PENDING_DESTRUCTION: u8 = dird::LIST_PENDING_DESTRUCTION;
     /// `Ping`: admind's health check, no `auth`. Spec: docs/50 §7.5.
     pub const PING: u8 = dird::PING;
     /// `SetPassword {auth, completion, target, password}`.
@@ -156,7 +170,14 @@ pub mod request_kind {
         REMOVE_MEMBER,
         DELETE,
         LOOKUP,
+        REQUEST_KEY_OPERATION,
+        APPROVE,
     ];
+
+    /// The keyadm requests: dird's layouts (no `auth`), forwarded only from
+    /// `keyadm_uid`. Spec: docs/51 §6, §7.3 ("admind forwards only from
+    /// `keyadm_uid`").
+    pub const KEYADM: &[u8] = dird::KEYADM;
 
     /// The closed request table. Spec: docs/51 §7.6; docs/50 §3.3.
     pub const ALL: &[u8] = &[
@@ -171,6 +192,11 @@ pub mod request_kind {
         REMOVE_MEMBER,
         DELETE,
         LOOKUP,
+        REQUEST_KEY_OPERATION,
+        APPROVE,
+        FETCH_APPROVED,
+        COMPLETE,
+        LIST_PENDING_DESTRUCTION,
         PING,
         SET_PASSWORD,
     ];
@@ -199,10 +225,28 @@ pub mod reply_kind {
     /// `PasswordChanged { kvnos, completion_recorded }`: every `set_secret`
     /// of a `SetPassword` succeeded. Spec: docs/51 §7.6.
     pub const PASSWORD_CHANGED: u8 = 0x87;
+    /// `KeyRequest`: dird's answer to `RequestKeyOperation` / `Approve`.
+    /// Spec: docs/51 §5.6, §7.3.
+    pub const KEY_REQUEST: u8 = dird::KEY_REQUEST;
+    /// `Approved`: dird's answer to `FetchApproved`. Spec: docs/51 §6.
+    pub const APPROVED: u8 = dird::APPROVED;
+    /// `PendingDestruction`: dird's answer to `ListPendingDestruction`.
+    /// Spec: docs/51 §6, §9.
+    pub const PENDING_DESTRUCTION: u8 = dird::PENDING_DESTRUCTION;
 
     /// The closed reply table (without the reserved `REFUSED_KIND`).
     /// Spec: docs/51 §7.6; docs/50 §3.3; A-59.
-    pub const ALL: &[u8] = &[CREATED, DONE, FOUND, REFUSED, PONG, PASSWORD_CHANGED];
+    pub const ALL: &[u8] = &[
+        CREATED,
+        DONE,
+        FOUND,
+        REFUSED,
+        PONG,
+        PASSWORD_CHANGED,
+        KEY_REQUEST,
+        APPROVED,
+        PENDING_DESTRUCTION,
+    ];
 }
 
 /// Whether `kinds` lists no value twice. Compile-time helper.

@@ -416,3 +416,64 @@ fn purge_by_lifetime() {
     assert_eq!(snap.get_tombstone(guid(3)).unwrap(), None);
     assert!(snap.get_object(guid(4)).unwrap().is_some());
 }
+
+#[test]
+fn tombstones_are_listed_in_bounded_pages() {
+    // Source: docs/51 §6, §9 (destroy-sweep lists every tombstone; phase 1
+    // never purges them); docs/32 §8 (bounded pages); A-18 (a tombstone is
+    // GUID + classes + deletion stamp). Task A10.
+    let dir = TempDir::new("tombstone-pages");
+    let store = open_store(&dir);
+    create_all(
+        &store,
+        vec![
+            root(1, "root"),
+            principal(2, guid(1), "alice"),
+            principal(3, guid(1), "bob"),
+            container(4, guid(1), "box"),
+            principal(5, guid(1), "carol"),
+        ],
+    );
+    // Nothing deleted: an empty, complete listing.
+    let page = store.snapshot().unwrap().tombstones(None, 10).unwrap();
+    assert!(page.tombstones.is_empty());
+    assert_eq!(page.next, None);
+    let mut txn = store.begin_write().unwrap();
+    for (seq, id) in [(10u64, 2u32), (11, 4), (12, 5)] {
+        txn.delete_object(guid(id), &origin(NODE_1, 2000, seq))
+            .unwrap();
+    }
+    txn.commit().unwrap();
+    let snap = store.snapshot().unwrap();
+    // One page holds all three, in GUID-packet order, live objects skipped.
+    let page = snap.tombstones(None, 10).unwrap();
+    let listed: Vec<_> = page.tombstones.iter().map(|t| t.guid).collect();
+    let mut expected = vec![guid(2), guid(4), guid(5)];
+    expected.sort_by_key(|g| g.to_packet());
+    assert_eq!(listed, expected);
+    assert_eq!(page.next, None);
+    for tombstone in &page.tombstones {
+        assert_eq!(
+            Some(tombstone.clone()),
+            snap.get_tombstone(tombstone.guid).unwrap()
+        );
+    }
+    // Pages of one: each resumes strictly after the cursor and the listing
+    // ends with `next == None`.
+    let mut seen = Vec::new();
+    let mut after = None;
+    for _ in 0..10 {
+        let page = snap.tombstones(after, 1).unwrap();
+        seen.extend(page.tombstones.iter().map(|t| t.guid));
+        match page.next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(seen, expected);
+    // limit 0 is refused before any storage work.
+    assert!(matches!(
+        snap.tombstones(None, 0),
+        Err(Error::Rejected(dirstore::Violation::PageLimitZero))
+    ));
+}

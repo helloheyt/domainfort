@@ -87,6 +87,9 @@ pub enum ConfigError {
     NodeId,
     /// An attribute or class this crate needs is missing from the schema.
     Schema,
+    /// The lifetime of a pending key-operation request is zero or above
+    /// `MAX_KEY_REQUEST_LIFETIME` (task A10).
+    KeyRequestLifetime,
 }
 
 impl core::fmt::Display for ConfigError {
@@ -97,6 +100,7 @@ impl core::fmt::Display for ConfigError {
             ConfigError::Realm => "realm is not the naming context's DNS name in upper case",
             ConfigError::NodeId => "node id is all zero",
             ConfigError::Schema => "schema lacks a definition the admin plane needs",
+            ConfigError::KeyRequestLifetime => "key-operation request lifetime is out of range",
         })
     }
 }

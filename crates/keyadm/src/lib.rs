@@ -3,10 +3,12 @@
 //! decisions A-57, A-72) — in this task, the `ceremony` command.
 //!
 //! keyadm runs by hand under its own uid, which keyd maps to `Role::Admin`
-//! ("Tier-0 key administration", crates/keyd-types authz.rs). It talks only
-//! to keyd, through the ipc-keyd client; it has no Kerberos client, no
-//! access to dird, and links no crypto (D182; A-73). keyd computes every
-//! key; keyadm asks, and prints handles, bindings and kvnos.
+//! ("Tier-0 key administration", crates/keyd-types authz.rs). It talks to
+//! keyd through the ipc-keyd client and — for the approved-request commands
+//! and the sweep — to admind on `admin.sock` through the ipc-admin client;
+//! it has no Kerberos client, no access to dird's store, and links no
+//! crypto (D182; A-73). keyd computes every key; keyadm asks, and prints
+//! handles, bindings and kvnos.
 //!
 //! # `keyadm <configuration file> ceremony <manifest file>`
 //!
@@ -26,12 +28,22 @@
 //! `create_key` → print the [`report`] → exit 0 (complete), 1 (nothing
 //! attempted) or 2 (stopped after an attempt).
 //!
-//! # Not in this task
+//! # `keyadm <configuration file> rotate-krbtgt | rotate-key | retire-kvno <request id>`
 //!
-//! `destroy-sweep`, `rotate-key`, `rotate-krbtgt`, `retire-kvno` (docs/51
-//! §6) arrive with tasks A9 / A10 (they need admind's `FetchApproved` /
-//! `ListPendingDestruction`, docs/51 §6, §7.3); there is no code path for
-//! them yet.
+//! Task A10 (docs/51 §5.6, §6): execute a key operation dird approved —
+//! `FetchApproved {id}` from `admin.sock` (admind forwards it only from
+//! `keyadm_uid`), the keyd call as Role::Admin, then `Complete {id,
+//! outcome}` ([`execute`]).
+//!
+//! # `keyadm <configuration file> destroy-sweep`
+//!
+//! Task A10 (docs/51 §6, §9): destroy the `PrincipalLongterm` and `Service`
+//! key sets of every deleted user and computer, from dird's
+//! `ListPendingDestruction` pages; idempotent ([`sweep`]).
+//!
+//! Both need `admin_socket` + `admind_uid` in keyadm's configuration
+//! (crates/config keyadm.rs); keyadm checks admind's uid before it sends
+//! anything (R50-3), as it checks keyd's.
 //!
 //! # Security
 //!
@@ -58,6 +70,9 @@
 
 pub mod ceremony;
 pub mod cli;
+pub mod execute;
 pub mod identity;
+pub mod ports;
 pub mod report;
 pub mod settings;
+pub mod sweep;

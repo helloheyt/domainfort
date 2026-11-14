@@ -77,9 +77,10 @@ use ipc_audit::{
     AdmindActivity, AdmindEvent, BoundedSeq, KeyPurposeCode, PasswordFailure, PasswordResult,
     PasswordStep,
 };
+use ipc_audit::{ForwardDecision, KeyadmOperation};
 use ipc_dird_admin::{
-    AccountKind, Auth, Operation, PasswordSet, PasswordSetOutcome, Request as DirdRequest,
-    TransportError as DirdTransport, Unserved as DirdUnserved,
+    AccountKind, Auth, KeyadmRequest, Operation, PasswordSet, PasswordSetOutcome,
+    Request as DirdRequest, TransportError as DirdTransport, Unserved as DirdUnserved,
 };
 use ipc_keyd::{Answer as KeydAnswer, Call, CallFailure, RequestFate, Unserved as KeydUnserved};
 use keyd_types::KeyPurpose;
@@ -116,6 +117,9 @@ pub(crate) enum Work {
     },
     /// `SetPassword`.
     SetPassword(SetPassword),
+    /// A keyadm request from `keyadm_uid` (the listener checked the peer
+    /// uid), forwarded to dird unchanged (docs/51 §6).
+    Keyadm(KeyadmRequest),
 }
 
 impl Work {
@@ -129,7 +133,10 @@ impl Work {
             Work::Forward {
                 operation: Operation::Lookup(_),
                 ..
-            } => Reply::Refused(RefusalStatus::Unavailable),
+            }
+            | Work::Keyadm(KeyadmRequest::ListPendingDestruction { .. }) => {
+                Reply::Refused(RefusalStatus::Unavailable)
+            }
             _ => Reply::Refused(RefusalStatus::OutcomeUnknown),
         }
     }
@@ -220,6 +227,7 @@ impl Worker {
             let answer = match job.work {
                 Work::Forward { auth, operation } => self.forward(auth, operation),
                 Work::SetPassword(request) => self.set_password(job.peer_uid, request),
+                Work::Keyadm(request) => self.forward_keyadm(job.peer_uid, request),
             };
             let _ = job.reply.send(answer);
         }
@@ -243,6 +251,51 @@ impl Worker {
                 DirdFate::Unknown => Answer::Reply(Reply::Refused(unknown)),
             },
         }
+    }
+
+    /// A keyadm request from `keyadm_uid` (module documentation): its
+    /// gating `KeyadmForward{Forwarded}` event's slot first (none ⇒ `Busy`,
+    /// nothing forwarded), the request to dird unchanged, the event, dird's
+    /// reply. Without a usable answer: `ListPendingDestruction` (a read) ⇒
+    /// `Unavailable`; `FetchApproved` / `Complete` (they change dird's
+    /// pending request) ⇒ `OutcomeUnknown` once sent (A-88, A-90).
+    /// Spec: docs/51 §6, §7.3; A-85 (Q-340 item 8: gating).
+    fn forward_keyadm(&mut self, peer_uid: u32, request: KeyadmRequest) -> Answer {
+        let Some(slot) = self.gate.reserve() else {
+            AUDIT_UNAVAILABLE.hit(Some(peer_uid));
+            return Answer::Refused(Refused::Busy);
+        };
+        let operation = match request {
+            KeyadmRequest::FetchApproved { .. } => KeyadmOperation::FetchApproved,
+            KeyadmRequest::Complete { .. } => KeyadmOperation::Complete,
+            KeyadmRequest::ListPendingDestruction { .. } => KeyadmOperation::ListPendingDestruction,
+        };
+        let unknown = if operation == KeyadmOperation::ListPendingDestruction {
+            RefusalStatus::Unavailable
+        } else {
+            RefusalStatus::OutcomeUnknown
+        };
+        let answer = match self.dird.call(&DirdRequest::Keyadm(request)) {
+            Ok(reply) => Answer::Reply(Reply::from_dird(reply).unwrap_or(Reply::Refused(unknown))),
+            Err(unserved) => match dird_fate(unserved) {
+                DirdFate::Busy => Answer::Refused(Refused::Busy),
+                DirdFate::NotDone => Answer::Reply(Reply::Refused(RefusalStatus::Unavailable)),
+                DirdFate::Unknown => Answer::Reply(Reply::Refused(unknown)),
+            },
+        };
+        let event = AdmindEvent {
+            time: clock::event_time(),
+            peer_uid: Some(peer_uid),
+            activity: AdmindActivity::KeyadmForward {
+                operation,
+                decision: ForwardDecision::Forwarded,
+            },
+        };
+        if self.gate.commit(slot, &event).is_err() {
+            // The answer stays the true one; the gap is visible in the log.
+            EVENT_UNRECORDED.hit(Some(peer_uid));
+        }
+        answer
     }
 
     /// `SetPassword` (module documentation).
@@ -581,19 +634,29 @@ fn dird_status_cause(status: ipc_dird_admin::RefusalStatus) -> PasswordFailure {
     }
 }
 
-/// The event class of a dird client failure.
-/// Spec: crate ipc-audit `PasswordFailure` (the shared refusal by name; a
-/// transport failure or deadline is `Unavailable`; a reply that did not
-/// decode is `Malformed`).
+/// The event class of a dird client failure: the shared refusal by name; a
+/// reply that did not decode is `Malformed`; a transport failure **after**
+/// the request was handed to dird (deadline, close, I/O, framing) is
+/// `OutcomeUnknown` (task F6 — dird may have acted on it, A-88 / A-90);
+/// one before sending (connect, peer credentials, peer uid, unencodable) is
+/// `Unavailable`.
+/// Spec: crate ipc-audit `PasswordFailure`; docs/questions/Q-404 item 5,
+/// Q-406 item 2 (A-94).
 fn dird_unserved_cause(unserved: DirdUnserved) -> PasswordFailure {
     match unserved {
         DirdUnserved::Refused(refused) => refused_cause(refused),
         DirdUnserved::MalformedReply(_) | DirdUnserved::UnexpectedReply(_) => {
             PasswordFailure::Malformed
         }
-        DirdUnserved::Transport(_) | DirdUnserved::PeerMismatch | DirdUnserved::Unencodable => {
-            PasswordFailure::Unavailable
-        }
+        DirdUnserved::Transport(
+            DirdTransport::DeadlineExceeded
+            | DirdTransport::Closed
+            | DirdTransport::Io
+            | DirdTransport::Framing,
+        ) => PasswordFailure::OutcomeUnknown,
+        DirdUnserved::Transport(DirdTransport::Connect | DirdTransport::PeerCredentials)
+        | DirdUnserved::PeerMismatch
+        | DirdUnserved::Unencodable => PasswordFailure::Unavailable,
     }
 }
 
@@ -632,13 +695,18 @@ fn keyd_error_status(error: keyd_types::Error) -> RefusalStatus {
 
 /// A `set_secret` keyd did not answer with a result: the event class and
 /// what the administrator is told — "outcome unknown" whenever the request
-/// may have reached keyd, never "not done" (A-88, A-90).
-/// Spec: docs/50 §3.7; docs/questions/Q-367, Q-370 (`RequestFate`).
+/// may have reached keyd, never "not done" (A-88, A-90). The event records
+/// a transport failure of a request whose fate is unknown as
+/// `OutcomeUnknown` (task F6; before it, `Unavailable` — Q-406 item 2).
+/// Spec: docs/50 §3.7; docs/questions/Q-367, Q-370 (`RequestFate`), Q-406.
 fn keyd_failure(failure: CallFailure) -> (PasswordFailure, RefusalStatus) {
     let cause = match failure.unserved {
         KeydUnserved::Refused(refused) => refused_cause(refused),
         KeydUnserved::MalformedReply(_) | KeydUnserved::UnexpectedReply(_) => {
             PasswordFailure::Malformed
+        }
+        KeydUnserved::Transport(_) if failure.fate == RequestFate::OutcomeUnknown => {
+            PasswordFailure::OutcomeUnknown
         }
         KeydUnserved::Transport(_) | KeydUnserved::PeerMismatch | KeydUnserved::Unencodable => {
             PasswordFailure::Unavailable
@@ -839,12 +907,33 @@ mod tests {
             )),
             (PasswordFailure::Busy, RefusalStatus::Unavailable)
         );
+        // Task F6 (Q-406 item 2): the event says "outcome unknown" too.
         assert_eq!(
             keyd_failure(failure(
                 KeydUnserved::Transport(ipc_keyd::TransportError::DeadlineExceeded),
                 RequestFate::OutcomeUnknown
             )),
-            (PasswordFailure::Unavailable, RefusalStatus::OutcomeUnknown)
+            (
+                PasswordFailure::OutcomeUnknown,
+                RefusalStatus::OutcomeUnknown
+            )
+        );
+        // Not sent: the event says "unavailable".
+        assert_eq!(
+            keyd_failure(failure(
+                KeydUnserved::Transport(ipc_keyd::TransportError::DeadlineExceeded),
+                RequestFate::NotSent
+            )),
+            (PasswordFailure::Unavailable, RefusalStatus::Unavailable)
+        );
+        // dird: after sending ⇒ OutcomeUnknown, before ⇒ Unavailable.
+        assert_eq!(
+            dird_unserved_cause(DirdUnserved::Transport(DirdTransport::Closed)),
+            PasswordFailure::OutcomeUnknown
+        );
+        assert_eq!(
+            dird_unserved_cause(DirdUnserved::Transport(DirdTransport::Connect)),
+            PasswordFailure::Unavailable
         );
         assert_eq!(
             keyd_failure(failure(

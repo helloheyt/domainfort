@@ -104,6 +104,8 @@
 //! | bytes in an RDN key | [`MAX_RDN_KEY_LEN`] |
 //! | bytes in one encoded record body | [`MAX_RECORD_BODY_LEN`] |
 //! | children in one listing page (a read bound: larger limits are capped) | [`MAX_CHILDREN_PER_PAGE`] |
+//! | tombstones in one listing page (capped) | [`MAX_TOMBSTONES_PER_PAGE`] |
+//! | object records one tombstone-listing call examines | [`MAX_TOMBSTONE_SCAN`] |
 //! | bytes in a counter name | [`MAX_COUNTER_NAME_LEN`] |
 //!
 //! # Out of scope
@@ -152,7 +154,7 @@ pub use schema::{
 pub use store::{Snapshot, Store, WriteTxn};
 pub use types::{
     AttrId, AttrStamp, Attribute, AttributeChange, ChildCursor, ChildPage, ClassId, CounterState,
-    NewObject, NodeId, Object, Origin, StampedValue, Timestamp, Tombstone,
+    NewObject, NodeId, Object, Origin, StampedValue, Timestamp, Tombstone, TombstonePage,
 };
 
 /// Largest attribute value, in bytes. A schema attribute's own bound may only
@@ -201,6 +203,18 @@ pub const MAX_RECORD_BODY_LEN: usize = 16 * 1024 * 1024;
 /// which the caller enforces across pages. Spec: docs/32 §8 (bounds; no
 /// number fixed there), docs/49 §6.1 item 3; project choice.
 pub const MAX_CHILDREN_PER_PAGE: usize = 1000;
+
+/// Most tombstones one page of [`Snapshot::tombstones`] returns; a larger
+/// `limit` is capped to this. Spec: docs/32 §8 (bounds); docs/51 §6, §9
+/// (`destroy-sweep` lists the tombstones); project choice.
+pub const MAX_TOMBSTONES_PER_PAGE: usize = 1000;
+
+/// Most object records one call of [`Snapshot::tombstones`] examines (live
+/// objects and tombstones alike, each authenticated): the work of one call
+/// is bounded however few of them are tombstones; the caller continues from
+/// [`TombstonePage::next`]. Spec: docs/32 §8 (bounded work; no number
+/// fixed there); AGENTS.md §6; project choice.
+pub const MAX_TOMBSTONE_SCAN: usize = 4096;
 
 /// Longest counter name, in bytes (at least one byte is required). A name is
 /// made only of the bytes `a`–`z`, `0`–`9`, `.`, `-` and `_`.

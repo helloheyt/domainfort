@@ -17,9 +17,14 @@
 //!   `set_secret` (Role::Directory, ×1 for a user, ×2 for a computer) ⇒
 //!   dird's `CompletePasswordSet` itself, so **the password never reaches
 //!   dird** (docs/51 §7.6, §9; docs/47 §9.2) — crate::worker;
+//! * forwards **keyadm's requests** (`FetchApproved`, `Complete`,
+//!   `ListPendingDestruction` — task A10) **only** when the peer's uid is
+//!   `keyadm_uid`; from any other uid they are refused (`Denied`) and
+//!   recorded (docs/51 §6, §7.3);
 //! * sends **its own audit events** to auditd (shape `Admind`): refused
-//!   connections and malformed frames as noise, every `SetPassword` outcome
-//!   gating (docs/51 §5.7 item 3; A-85) — crate::audit.
+//!   connections, malformed frames and rate-limited frames as noise, every
+//!   `SetPassword` outcome and every keyadm forward or refusal gating
+//!   (docs/51 §5.7 item 3; A-85; task F6) — crate::audit.
 //!
 //! # Start-up (as built)
 //!

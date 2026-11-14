@@ -33,7 +33,7 @@
 //! `net::UnixStream::peer_cred`, `time::timeout`, `spawn`,
 //! `io::AsyncWriteExt::write_all`.
 
-use crate::admin_engine::AdminEngineHandle;
+use crate::admin_engine::{AdminEngineHandle, AdminWork};
 use crate::engine::SubmitError;
 use crate::ldap_listener::read_frame;
 use crate::log::{note, Note, Thinned};
@@ -235,7 +235,7 @@ async fn connection(mut stream: UnixStream, context: Arc<AdminServeContext>) {
         }
         let request = decode_request(&body);
         drop(body);
-        let (auth, operation) = match request {
+        let work = match request {
             Err(Rejection::Close) => return,
             Err(Rejection::Refuse(refused)) => {
                 let _ = write_refusal(&mut stream, refused, limit).await;
@@ -247,10 +247,11 @@ async fn connection(mut stream: UnixStream, context: Arc<AdminServeContext>) {
                 }
                 continue;
             }
-            Ok(Request::Operation { auth, operation }) => (auth, operation),
+            Ok(Request::Operation { auth, operation }) => AdminWork::Operation { auth, operation },
+            Ok(Request::Keyadm(request)) => AdminWork::Keyadm(request),
         };
         let counted = InFlight::new(&context.in_flight);
-        let pending = match context.engine.submit(auth, operation) {
+        let pending = match context.engine.submit(work) {
             Ok(pending) => pending,
             Err(SubmitError::Busy) => {
                 drop(counted);

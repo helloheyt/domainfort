@@ -592,6 +592,14 @@ pub enum AdmindActivity {
         /// Forwarded or refused.
         decision: ForwardDecision,
     },
+    /// An `admin.sock` frame dropped undecoded because its peer uid is over
+    /// admind's request rate (answered with the shared `Busy`, the
+    /// connection kept). Noise: nothing was asked of dird or keyd. The uid
+    /// is the event's `peer_uid`. Appended by task F6 (A-94;
+    /// docs/questions/Q-406 item 3).
+    /// Spec: docs/50 §3.6 ("a rate limiter"); docs/21 D98 (as cited in
+    /// docs/51 §3); A-57; A-85 (Q-340 item 8 → a per-uid rate limit).
+    RateLimited,
 }
 
 impl AdmindActivity {
@@ -601,6 +609,7 @@ impl AdmindActivity {
             AdmindActivity::MalformedFrame { .. } => AdmindActivityCode::MalformedFrame,
             AdmindActivity::SetPassword { .. } => AdmindActivityCode::SetPassword,
             AdmindActivity::KeyadmForward { .. } => AdmindActivityCode::KeyadmForward,
+            AdmindActivity::RateLimited => AdmindActivityCode::RateLimited,
         }
     }
 
@@ -625,6 +634,7 @@ impl AdmindActivity {
                 writer.write_enum(operation.code())?;
                 writer.write_enum(decision.code())?;
             }
+            AdmindActivity::RateLimited => {}
         }
         Ok(())
     }
@@ -651,6 +661,7 @@ impl AdmindActivity {
                 operation: reader.read_enum(KeyadmOperation::from_code)?,
                 decision: reader.read_enum(ForwardDecision::from_code)?,
             },
+            AdmindActivityCode::RateLimited => AdmindActivity::RateLimited,
         })
     }
 }
@@ -672,8 +683,8 @@ pub struct AdmindEvent {
 
 impl AdmindEvent {
     /// Whether this event is noise under the A-57 rule: a refused
-    /// connection or a frame that did not decode — nothing was asked of dird
-    /// or keyd. Offer it with [`crate::SendWindow::offer_noise`] (queued
+    /// connection, a frame that did not decode, or a frame dropped by the
+    /// per-uid request rate (task F6) — nothing was asked of dird or keyd. Offer it with [`crate::SendWindow::offer_noise`] (queued
     /// within the noise share, otherwise counted into a
     /// [`crate::WindowSummary`]), so a flood of them never takes the slots
     /// gating events need and never stops admind. Every other admind event
@@ -682,12 +693,14 @@ impl AdmindEvent {
     ///
     /// Spec: docs/questions/Q-218 (a) (A-57: "unauthenticated noise events
     /// (… malformed frame) summarised in counters and rate-limited"), Q-252
-    /// item 8 (A-64); docs/51 §5.7.
+    /// item 8 (A-64); docs/51 §5.7; docs/questions/Q-406 item 3 (A-94).
     #[must_use]
     pub fn is_noise(&self) -> bool {
         matches!(
             self.activity,
-            AdmindActivity::ConnectionRefused { .. } | AdmindActivity::MalformedFrame { .. }
+            AdmindActivity::ConnectionRefused { .. }
+                | AdmindActivity::MalformedFrame { .. }
+                | AdmindActivity::RateLimited
         )
     }
 

@@ -668,6 +668,15 @@ code_table! {
     ///   (A-91): before it, dird recorded this as `PolicyDenied` with an
     ///   `Allowed` PDP reason — a refusal no reader could tell apart from a
     ///   PDP deny without comparing two fields.
+    /// * `OperationMismatch` — an `Approve` names an operation other than
+    ///   the one the pending key-operation request holds: the operation
+    ///   digest of what the approver approves differs from the request's
+    ///   (docs/51 §5.6; docs/24 §6 principle "sign the exact operation, not
+    ///   a general approve"). Appended by task A10 (docs/questions/Q-421).
+    /// * `KeyOperationRefused` — in the `Outcome` event of a `Complete`:
+    ///   keyadm reports that keyd answered the approved key operation with
+    ///   a refusal (`Denied` / `RateLimited` / `Unavailable` — keyd stores
+    ///   nothing then, docs/10 §9). Appended by task A10 (Q-421).
     ///
     /// Spec: docs/51 §5.2, §5.5, §5.6, §6, §7.4, §8.3, §11;
     /// docs/questions/Q-340 item 3; Q-295 item 4 (P-22); docs/11 §2, §8;
@@ -693,6 +702,8 @@ code_table! {
         NotApproved,
         SelfLockout,
         ObligationRefused,
+        OperationMismatch,
+        KeyOperationRefused,
     }
 }
 
@@ -727,6 +738,15 @@ code_table! {
     ///   counterpart of keyd-daemon's `NotPerformed` (A-86). Appended by task
     ///   F4 (A-91; Q-388 item 1): before it, dird recorded this as
     ///   `InternalFailure`.
+    /// * `KeyOperationNotPerformed` — in the `Outcome` event of a
+    ///   `Complete`: keyadm reports that the approved key operation was not
+    ///   performed (never sent to keyd, or refused by keyd's transport
+    ///   before keyd ran it — A-88). Appended by task A10
+    ///   (docs/questions/Q-421).
+    /// * `KeyOperationOutcomeUnknown` — in the `Outcome` event of a
+    ///   `Complete`: keyadm sent the approved key operation to keyd and no
+    ///   usable answer came back; keyd's own records (intent + outcome)
+    ///   say whether it ran (A-88, A-90). Appended by task A10 (Q-421).
     ///
     /// Spec: docs/51 §5.7 item 2, §7.4; A-56; A-85; A-89; docs/questions/
     /// Q-340 item 3, Q-358 item 1, Q-388 item 1 (A-91), Q-397.
@@ -737,6 +757,8 @@ code_table! {
         InternalFailure,
         ViewUnavailable,
         AuditUnacknowledged,
+        KeyOperationNotPerformed,
+        KeyOperationOutcomeUnknown,
     }
 }
 
@@ -838,12 +860,16 @@ code_table! {
     /// What admind recorded: the wire tag of [`crate::AdmindActivity`].
     /// Spec: docs/51 §5.7 item 3 (refused connection, malformed frame,
     /// `SetPassword` completed / failed), §6 and §7.3 (the keyadm-only
-    /// requests admind forwards only from `keyadm_uid`).
+    /// requests admind forwards only from `keyadm_uid`). `RateLimited` (a
+    /// frame dropped undecoded because its peer uid is over admind's
+    /// request rate, docs/50 §3.6; noise) was appended by task F6 (A-94,
+    /// docs/questions/Q-406 item 3).
     pub enum AdmindActivityCode {
         ConnectionRefused,
         MalformedFrame,
         SetPassword,
         KeyadmForward,
+        RateLimited,
     }
 }
 
@@ -861,11 +887,19 @@ code_table! {
 }
 
 code_table! {
-    /// `ipc::Error` (non-exhaustive: ends in `Unlisted`): which framing,
-    /// envelope or field rule an `admin.sock` frame broke. The class only —
-    /// never an octet of the frame (docs/50 §8.2; the frame may hold a
-    /// password, docs/51 §7.6).
-    /// Spec: crates/ipc error.rs; docs/50 §3.3, §8.2; docs/51 §5.7 item 3.
+    /// `ipc::Error` (non-exhaustive: `Unlisted` after its variants): which
+    /// framing, envelope or field rule an `admin.sock` frame broke. The
+    /// class only — never an octet of the frame (docs/50 §8.2; the frame
+    /// may hold a password, docs/51 §7.6).
+    ///
+    /// `ValueRefused` is not an `ipc::Error`: the frame passed every wire
+    /// rule and the typed layer refused a value (text that is not UTF-8, a
+    /// second spelling of "never", a password that is not UTF-8). Appended
+    /// by task F6 **after** `Unlisted`, so every earlier code — `Unlisted`'s
+    /// included — keeps its meaning (A-94, docs/questions/Q-406 item 3).
+    ///
+    /// Spec: crates/ipc error.rs; docs/50 §3.3, §8.2; docs/51 §5.7 item 3;
+    /// docs/questions/Q-406 item 3.
     pub enum FrameErrorCode {
         FrameTooShort,
         FrameTooLarge,
@@ -882,6 +916,7 @@ code_table! {
         NestingTooDeep,
         BodyOverBound,
         Unlisted,
+        ValueRefused,
     }
 }
 
@@ -943,9 +978,15 @@ code_table! {
     ///   `ipc::Refused` reply by name, or (`Unavailable`) a transport failure
     ///   or deadline, or (`Malformed`) a reply that did not decode (docs/50
     ///   §3.3, §3.7; A-59, A-63).
+    /// * `OutcomeUnknown` — the step's request was handed to dird or keyd
+    ///   and no usable answer came back (a transport failure or deadline
+    ///   after sending): it may have been carried out — the peer's own
+    ///   records say (A-88, A-90: "check before retrying"). Appended by task
+    ///   F6 (A-94, docs/questions/Q-406 item 2): before it, admind recorded
+    ///   this as `Unavailable`.
     ///
     /// Spec: docs/51 §5.7 item 3, §7.6; crates/keyd-types error.rs; crates/ipc
-    /// refused.rs; docs/questions/Q-340 item 7.
+    /// refused.rs; docs/questions/Q-340 item 7, Q-406 item 2.
     pub enum PasswordFailure {
         PasswordPolicy,
         Denied,
@@ -954,6 +995,7 @@ code_table! {
         Unavailable,
         Malformed,
         VersionMismatch,
+        OutcomeUnknown,
     }
 }
 

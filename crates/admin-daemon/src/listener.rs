@@ -22,16 +22,26 @@
 //!    `frame_timeout` (docs/50 §3.6). The frame body is a zeroizing buffer,
 //!    wiped as soon as it is decoded (docs/50 §3.3).
 //! 4. **Request rate** per uid (crate::rate): over it ⇒ `Refused::Busy`,
-//!    the connection kept, the frame dropped undecoded.
+//!    the connection kept, the frame dropped undecoded — with a noise event
+//!    `RateLimited` (task F6, Q-406 item 3).
 //! 5. **Decoding** (`ipc_admin::decode_request`): a wrong magic or unknown
 //!    kind ⇒ close; another version ⇒ `Refused{VersionMismatch}` + close; a
 //!    malformed payload ⇒ `Refused{Malformed}` + close — each with a noise
-//!    event `MalformedFrame` naming the rule (never an octet: the frame may
+//!    event `MalformedFrame` naming the rule, or `ValueRefused` when the
+//!    typed layer refused a value (task F6; never an octet: the frame may
 //!    hold a password).
-//! 6. **Dispatch** — `Ping` answered here; a forwarded operation or a
-//!    `SetPassword` goes to the worker's bounded queue (full ⇒
-//!    `Refused::Busy`, the connection kept), and its answer is written
-//!    before the next frame is read (one request in flight, R50-7).
+//! 6. **The keyadm requests** (`FetchApproved`, `Complete`,
+//!    `ListPendingDestruction` — task A10): only from `keyadm_uid` (docs/51
+//!    §6: "admind forwards only if the peer's uid = `keyadm_uid`"). From any
+//!    other uid: a gating event `KeyadmForward{PeerNotKeyadm}` (its slot
+//!    reserved first; none ⇒ `Busy`), then `Refused{Denied}`, the
+//!    connection kept. The uid is the kernel's (peer credentials) — the one
+//!    place where it is an authority, as decided (docs/51 §5.1, §6).
+//! 7. **Dispatch** — `Ping` answered here; a forwarded operation, a
+//!    keyadm request from `keyadm_uid` or a `SetPassword` goes to the
+//!    worker's bounded queue (full ⇒ `Refused::Busy`, the connection kept),
+//!    and its answer is written before the next frame is read (one request
+//!    in flight, R50-7).
 //!
 //! While admind stops, a new request is answered `Refused::Unavailable` and
 //! the connection closes.
@@ -52,7 +62,7 @@ use ipc_admin::{
     decode_request, encode_refusal, encode_reply, RefusalStatus, Rejection, Reply, Request,
     REQUEST_LIMIT,
 };
-use ipc_audit::{AdmindActivity, AdmindEvent, ConnectionRefusal, FrameErrorCode};
+use ipc_audit::{AdmindActivity, AdmindEvent, ConnectionRefusal, ForwardDecision, FrameErrorCode};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -75,12 +85,15 @@ static MALFORMED: Thinned = Thinned::new(Note::MalformedFrame);
 static FRAME_TIMEOUT: Thinned = Thinned::new(Note::FrameTimeout);
 static BUSY: Thinned = Thinned::new(Note::WorkerBusy);
 static WORKER_LOST: Thinned = Thinned::new(Note::WorkerLost);
+static KEYADM_REFUSED: Thinned = Thinned::new(Note::KeyadmRefused);
+static AUDIT_UNAVAILABLE: Thinned = Thinned::new(Note::AuditUnavailable);
 
 /// What every connection task shares.
 /// Spec: docs/51 §5.1, §7.5; docs/50 §3.6.
 pub(crate) struct ServeContext {
     frame_timeout: Duration,
     limits: Limits,
+    keyadm_uid: u32,
     gate: Arc<AuditGate>,
     worker: WorkerHandle,
     quota: Mutex<ConnectionQuota>,
@@ -94,12 +107,14 @@ impl ServeContext {
     pub(crate) fn new(
         frame_timeout: Duration,
         limits: Limits,
+        keyadm_uid: u32,
         gate: Arc<AuditGate>,
         worker: WorkerHandle,
     ) -> ServeContext {
         ServeContext {
             frame_timeout,
             limits,
+            keyadm_uid,
             gate,
             worker,
             quota: Mutex::new(ConnectionQuota::default()),
@@ -291,9 +306,24 @@ async fn write_reply(stream: &mut UnixStream, reply: &Reply, limit: Duration) ->
 }
 
 /// The audit code of a frame that did not decode: the `ipc` rule, or
-/// `Unlisted` for a value the typed layer refused (docs/questions/Q-406).
+/// `ValueRefused` for a value the typed layer refused (task F6; before it,
+/// `Unlisted` — docs/questions/Q-406 item 3).
 fn frame_error(error: Option<ipc::Error>) -> FrameErrorCode {
-    error.map_or(FrameErrorCode::Unlisted, FrameErrorCode::of)
+    error.map_or(FrameErrorCode::ValueRefused, FrameErrorCode::of)
+}
+
+/// The audit code of a keyadm request. Spec: crate ipc-audit
+/// `KeyadmOperation` (docs/51 §6, §7.3).
+pub(crate) fn keyadm_code(request: &ipc_dird_admin::KeyadmRequest) -> ipc_audit::KeyadmOperation {
+    match request {
+        ipc_dird_admin::KeyadmRequest::FetchApproved { .. } => {
+            ipc_audit::KeyadmOperation::FetchApproved
+        }
+        ipc_dird_admin::KeyadmRequest::Complete { .. } => ipc_audit::KeyadmOperation::Complete,
+        ipc_dird_admin::KeyadmRequest::ListPendingDestruction { .. } => {
+            ipc_audit::KeyadmOperation::ListPendingDestruction
+        }
+    }
 }
 
 /// Serve one connection (module documentation).
@@ -355,6 +385,9 @@ async fn connection(mut stream: UnixStream, context: Arc<ServeContext>) {
         if !context.admit(uid) {
             drop(body);
             RATE_LIMITED.hit(Some(uid));
+            // Noise (task F6, Q-406 item 3): nothing was asked of dird or
+            // keyd; a flood is counted into a summary, never blocking.
+            context.noise(Some(uid), AdmindActivity::RateLimited);
             if !write_refusal(&mut stream, Refused::Busy, limit).await {
                 return;
             }
@@ -388,6 +421,47 @@ async fn connection(mut stream: UnixStream, context: Arc<ServeContext>) {
             }
             Request::Forward { auth, operation } => Work::Forward { auth, operation },
             Request::SetPassword(set) => Work::SetPassword(set),
+            Request::Keyadm(request) => {
+                if uid == context.keyadm_uid {
+                    Work::Keyadm(request)
+                } else {
+                    // docs/51 §6: forwarded only from keyadm_uid. A gating
+                    // event, its slot first (no slot ⇒ Busy, nothing else).
+                    let refusal = match context.gate.reserve() {
+                        Some(slot) => {
+                            KEYADM_REFUSED.hit(Some(uid));
+                            let event = AdmindEvent {
+                                time: clock::event_time(),
+                                peer_uid: Some(uid),
+                                activity: AdmindActivity::KeyadmForward {
+                                    operation: keyadm_code(&request),
+                                    decision: ForwardDecision::PeerNotKeyadm,
+                                },
+                            };
+                            if context.gate.commit(slot, &event).is_ok() {
+                                Answer::Reply(Reply::Refused(RefusalStatus::Denied))
+                            } else {
+                                // No answer leaves unaudited.
+                                Answer::Reply(Reply::Refused(RefusalStatus::Unavailable))
+                            }
+                        }
+                        None => {
+                            AUDIT_UNAVAILABLE.hit(Some(uid));
+                            Answer::Refused(Refused::Busy)
+                        }
+                    };
+                    let written = match refusal {
+                        Answer::Reply(reply) => write_reply(&mut stream, &reply, limit).await,
+                        Answer::Refused(refused) => {
+                            write_refusal(&mut stream, refused, limit).await
+                        }
+                    };
+                    if !written {
+                        return;
+                    }
+                    continue;
+                }
+            }
         };
         let lost = work.lost_answer();
         let counted = InFlight::new(&context.in_flight);

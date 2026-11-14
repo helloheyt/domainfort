@@ -31,6 +31,15 @@
 //! `Lookup` and `CompletePasswordSet` commit nothing: their decision event
 //! is the only one, and their reply is [`Prepared::reply`].
 //!
+//! # Dual-controlled key operations (task A10)
+//!
+//! [`DirectoryAdmin::key_step`] serves `RequestKeyOperation`, `Approve`,
+//! `FetchApproved`, `Complete` and `ListPendingDestruction` over the
+//! pending requests dird holds in memory ([`KeyRequests`]): `PolicyAdmin`
+//! on the policy scope `keys` for the requester and every approver, the
+//! approval bound to the request's operation digest, one fetch per approved
+//! request (module `key_requests`; docs/51 §5.6, §6).
+//!
 //! # The operations (docs/51 §5.2, §7.3)
 //!
 //! | operation | PDP Action on Resource | dual control (P-22) |
@@ -87,6 +96,7 @@ mod checks;
 mod config;
 mod descriptor;
 mod ids;
+mod key_requests;
 mod names;
 mod operation;
 mod random;
@@ -106,6 +116,13 @@ pub use config::{
     RID_COUNTER, RID_END_EXCLUSIVE, RID_FIRST,
 };
 pub use descriptor::{new_object_descriptor, DescriptorError};
+// Dual-controlled key operations (task A10, docs/51 §5.6, §6).
+pub use key_requests::{
+    operation_digest, ApprovedKeyOperation, DestructionEntry, DestructionPage, KeyAdminOperation,
+    KeyOperation, KeyOperationOutcome, KeyRef, KeyReply, KeyRequestView, KeyRequests, KeyStep,
+    KeyTargets, DIGEST_LEN, KEY_POLICY_SCOPE, KEY_REQUEST_LIFETIME, MAX_DESTRUCTION_PAGE,
+    MAX_KEY_REQUEST_LIFETIME, MAX_PENDING_KEY_REQUESTS,
+};
 // The name and value rules, public for `provision domain` (task A4), which
 // must apply exactly these rules to the names it is given (A-79).
 pub use names::{

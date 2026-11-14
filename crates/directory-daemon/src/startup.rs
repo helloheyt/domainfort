@@ -433,5 +433,6 @@ pub fn admin_params(
         max_connections: MAX_ADMIN_CONNECTIONS,
         queue_capacity: ADMIN_QUEUE_CAPACITY,
         ack_deadline: DECISION_ACK_DEADLINE,
+        key_request_lifetime: directory_admin::KEY_REQUEST_LIFETIME,
     }))
 }

@@ -216,6 +216,18 @@ pub struct ChildPage {
     pub next: Option<ChildCursor>,
 }
 
+/// One page of a tombstone listing ([`crate::Snapshot::tombstones`]).
+/// Spec: docs/51 §6, §9 (`destroy-sweep`); docs/29 §5; A-18; docs/32 §8.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TombstonePage {
+    /// The tombstones found, ascending by GUID packet (the object table's
+    /// key order) — GUID, classes and deletion stamp only (A-18).
+    pub tombstones: Vec<Tombstone>,
+    /// `Some(g)` when records after `g` remain unexamined: pass it as
+    /// `after` to continue. `None` when the listing is complete.
+    pub next: Option<Guid>,
+}
+
 /// A new object to create. Values are raw bytes; the engine sorts them,
 /// rejects duplicates and stamps each with `version` 1. There is no RDN key
 /// field: the engine computes it from the value of the RDN attribute of the

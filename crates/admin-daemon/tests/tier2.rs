@@ -386,7 +386,8 @@ fn keyd_never_answering_is_outcome_unknown() {
             vec![],
             PasswordResult::Failed {
                 step: PasswordStep::SetSecret(KeyPurposeCode::PrincipalLongterm),
-                cause: PasswordFailure::Unavailable
+                // Task F6 (A-94, Q-406 item 2): the event says so too.
+                cause: PasswordFailure::OutcomeUnknown
             }
         )]
     );
@@ -858,4 +859,201 @@ fn a_refused_completion_still_reports_the_password_set() {
             }
         )]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Task A10: the keyadm-only forwards; task F6: the appended codes.
+// ---------------------------------------------------------------------------
+
+use ipc_audit::{ForwardDecision, KeyadmOperation};
+use ipc_dird_admin::{KeyOperation, KeyOperationOutcome, KeyadmRequest};
+
+/// The three keyadm requests (test data).
+fn keyadm_requests() -> Vec<(KeyadmRequest, KeyadmOperation)> {
+    vec![
+        (
+            KeyadmRequest::FetchApproved { id: 4242 },
+            KeyadmOperation::FetchApproved,
+        ),
+        (
+            KeyadmRequest::Complete {
+                id: 4242,
+                outcome: KeyOperationOutcome::NotPerformed,
+            },
+            KeyadmOperation::Complete,
+        ),
+        (
+            KeyadmRequest::ListPendingDestruction { cursor: None },
+            KeyadmOperation::ListPendingDestruction,
+        ),
+    ]
+}
+
+/// admind's `KeyadmForward` events: (peer uid, operation, decision).
+fn forward_events(events: &[AdmindEvent]) -> Vec<(Option<u32>, KeyadmOperation, ForwardDecision)> {
+    events
+        .iter()
+        .filter_map(|e| match &e.activity {
+            AdmindActivity::KeyadmForward {
+                operation,
+                decision,
+            } => Some((e.peer_uid, *operation, *decision)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The `DirAdmin` events of `operation` (any target).
+fn dird_events(world: &World, operation: DirAdminOperation) -> Vec<DirAdminEvent> {
+    world
+        .dir_admin_events()
+        .into_iter()
+        .filter(|e| e.operation == operation)
+        .collect()
+}
+
+/// docs/51 §6, §7.3 ("admind forwards only if the peer's uid =
+/// `keyadm_uid`"; peer credentials, docs/50 §3.2): from keyadm's uid the
+/// three keyadm requests reach dird — dird answers (an unknown id: not
+/// found; an empty listing) and records them — and admind records each as
+/// `KeyadmForward{Forwarded}`.
+#[test]
+fn keyadm_requests_from_keyadm_uid_are_forwarded() {
+    let Some(mut world) = World::new(Options::default()) else {
+        return;
+    };
+    let mut conn = world.connect();
+    let answers: Vec<Got> = keyadm_requests()
+        .into_iter()
+        .map(|(request, _)| conn.call(&Request::Keyadm(request)))
+        .collect();
+    assert_eq!(answers[0], refused(RefusalStatus::NotFound));
+    assert_eq!(answers[1], refused(RefusalStatus::NotFound));
+    assert!(matches!(
+        &answers[2],
+        Got::Reply(Reply::PendingDestruction(page)) if page.entries.is_empty() && page.next.is_none()
+    ));
+    for operation in [
+        DirAdminOperation::FetchApproved,
+        DirAdminOperation::Complete,
+        DirAdminOperation::ListPendingDestruction,
+    ] {
+        assert!(
+            eventually(Duration::from_secs(10), || !dird_events(&world, operation)
+                .is_empty()),
+            "{operation:?} reached dird"
+        );
+    }
+    let uid = world.uid;
+    let events = world.finish();
+    assert_eq!(
+        forward_events(&events),
+        keyadm_requests()
+            .into_iter()
+            .map(|(_, op)| (Some(uid), op, ForwardDecision::Forwarded))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// docs/51 §6, §7.3: from any other uid the keyadm requests are refused
+/// (`Denied`, the connection kept) and recorded as
+/// `KeyadmForward{PeerNotKeyadm}` — dird is never asked. The other forwards
+/// are unchanged: an administrator's `RequestKeyOperation` from that uid
+/// is forwarded (dird decides, by its Kerberos ticket).
+#[test]
+fn keyadm_requests_from_another_uid_are_refused() {
+    let Some(mut world) = World::new(Options {
+        keyadm_uid_offset: 1,
+        ..Options::default()
+    }) else {
+        return;
+    };
+    let mut conn = world.connect();
+    for (request, _) in keyadm_requests() {
+        assert_eq!(
+            conn.call(&Request::Keyadm(request)),
+            refused(RefusalStatus::Denied)
+        );
+    }
+    // Still open, and the other operations still reach dird.
+    let request = Request::Forward {
+        auth: auth("admin1", &[]),
+        operation: Operation::RequestKeyOperation {
+            operation: KeyOperation::RotateKrbtgt,
+        },
+    };
+    assert!(matches!(
+        conn.call(&request),
+        Got::Reply(Reply::KeyRequest(state)) if state.operation == KeyOperation::RotateKrbtgt
+    ));
+    assert!(eventually(Duration::from_secs(10), || !dird_events(
+        &world,
+        DirAdminOperation::RequestKeyOperation
+    )
+    .is_empty()));
+    for operation in [
+        DirAdminOperation::FetchApproved,
+        DirAdminOperation::Complete,
+        DirAdminOperation::ListPendingDestruction,
+    ] {
+        assert!(
+            dird_events(&world, operation).is_empty(),
+            "{operation:?} must not reach dird"
+        );
+    }
+    let uid = world.uid;
+    let events = world.finish();
+    assert_eq!(
+        forward_events(&events),
+        keyadm_requests()
+            .into_iter()
+            .map(|(_, op)| (Some(uid), op, ForwardDecision::PeerNotKeyadm))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Task F6 (A-94; docs/questions/Q-406 item 3): a frame dropped by the
+/// per-uid request rate is recorded as the noise activity `RateLimited`
+/// (with the peer uid); a frame whose value the typed layer refuses (a
+/// second spelling of "never") as `MalformedFrame{ValueRefused}`.
+#[test]
+fn rate_limited_and_refused_values_have_their_own_codes() {
+    let Some(mut world) = World::new(Options {
+        limits: admin_daemon::Limits {
+            requests_per_window: 2,
+            ..admin_daemon::Limits::DEFAULT
+        },
+        ..Options::default()
+    }) else {
+        return;
+    };
+    let mut conn = world.connect();
+    assert_eq!(conn.call(&Request::Ping), Got::Reply(Reply::Pong));
+    // A SetAccountExpires `At(0x7FFFFFFFFFFFFFFF)`: wire-valid, refused by
+    // the typed layer (one spelling of "never", A-85). Hand-built from the
+    // forwarded layout (docs/51 §7.3): auth, target, 2 ‖ u64.
+    let mut body = vec![0x41, 0x4D, 1, 0x09];
+    let requester = fresh("admin1");
+    body.extend((requester.len() as u32).to_be_bytes());
+    body.extend(&requester);
+    body.extend(0u32.to_be_bytes());
+    body.extend(g(BOB).to_packet());
+    body.push(2);
+    body.extend(0x7FFF_FFFF_FFFF_FFFFu64.to_be_bytes());
+    let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+    frame.extend(body);
+    conn.send_raw(&frame);
+    assert_eq!(conn.receive(), Got::Refused(Refused::Malformed));
+    let mut conn = world.connect();
+    assert_eq!(conn.call(&Request::Ping), Got::Refused(Refused::Busy));
+    let uid = world.uid;
+    let events = world.finish();
+    assert!(events.iter().any(|e| e.peer_uid == Some(uid)
+        && e.activity
+            == AdmindActivity::MalformedFrame {
+                error: FrameErrorCode::ValueRefused
+            }));
+    assert!(events
+        .iter()
+        .any(|e| e.peer_uid == Some(uid) && e.activity == AdmindActivity::RateLimited));
 }

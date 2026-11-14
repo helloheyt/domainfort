@@ -398,8 +398,10 @@ fn dir_admin_phase_and_result_tables() {
     b[at.result] = 1;
     assert_eq!(decode_event(&b), codec(ipc::Error::InvalidBoolean));
     // Codes past the refusal table (19 entries since task A3 appended
-    // `SelfLockout`, 20 since task F4 appended `ObligationRefused`, A-91).
-    for code in [0u8, 21, 0xFF] {
+    // `SelfLockout`, 20 since task F4 appended `ObligationRefused`, A-91,
+    // 22 since task A10 appended `OperationMismatch` and
+    // `KeyOperationRefused`, Q-421).
+    for code in [0u8, 23, 0xFF] {
         assert_eq!(
             decode_event(&patched(at.detail, code)),
             codec(ipc::Error::UnknownCode)
@@ -434,8 +436,24 @@ fn dir_admin_phase_and_result_tables() {
         }
         assert_eq!(event_round_trip_is_canonical(&b), Ok(true));
     }
+    // Failures 7 and 8 (task A10, Q-421) decode; 9 is past the table.
+    for (code, failure) in [
+        (7u8, AdminFailure::KeyOperationNotPerformed),
+        (8, AdminFailure::KeyOperationOutcomeUnknown),
+    ] {
+        let mut b = patched(at.result, 3);
+        b[at.detail] = code;
+        match decode_event(&b).unwrap() {
+            EventBody::DirAdmin(e) => assert_eq!(
+                e.stage,
+                DirAdminStage::Decision(DecisionResult::Failed(failure))
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(event_round_trip_is_canonical(&b), Ok(true));
+    }
     let mut b = patched(at.result, 3);
-    b[at.detail] = 7;
+    b[at.detail] = 9;
     assert_eq!(decode_event(&b), codec(ipc::Error::UnknownCode));
 }
 
@@ -668,11 +686,13 @@ fn admind_strict_decoding() {
         b
     };
     for (position, codes) in [
-        (at.activity, [0u8, 5, 0xFF]),
+        // Activity 5 (`RateLimited`) and cause 8 (`OutcomeUnknown`) were
+        // appended by task F6 (Q-406).
+        (at.activity, [0u8, 6, 0xFF]),
         (at.result, [0, 3, 0xFF]),
         (at.step, [0, 5, 0xFF]),
         (at.purpose, [0, 4, 0xFF]),
-        (at.cause, [0, 8, 0xFF]),
+        (at.cause, [0, 9, 0xFF]),
     ] {
         for code in codes {
             assert_eq!(
@@ -714,7 +734,7 @@ fn admind_strict_decoding() {
     for bad in [
         short(1, &[0]),
         short(1, &[3]),    // ConnectionRefusal has 2 codes
-        short(2, &[16]),   // FrameErrorCode has 15
+        short(2, &[17]),   // FrameErrorCode has 16 (F6: ValueRefused)
         short(4, &[4, 1]), // KeyadmOperation has 3
         short(4, &[1, 3]), // ForwardDecision has 2
     ] {
@@ -722,6 +742,12 @@ fn admind_strict_decoding() {
     }
     assert!(decode_event(&short(1, &[2])).is_ok());
     assert!(decode_event(&short(2, &[15])).is_ok()); // Unlisted
+    assert!(decode_event(&short(2, &[16])).is_ok()); // ValueRefused (F6)
+    assert!(decode_event(&short(5, &[])).is_ok()); // RateLimited (F6)
+    assert_eq!(
+        decode_event(&short(5, &[0])),
+        codec(ipc::Error::TrailingBytes)
+    );
     assert!(decode_event(&short(4, &[3, 1])).is_ok());
 }
 
@@ -759,6 +785,8 @@ fn admind_noise_classification() {
     assert!(!admind_set_password().is_noise());
     assert!(!admind_set_password_failed().is_noise());
     assert!(!admind_keyadm_refused().is_noise());
+    // Task F6 (Q-406 item 3): a rate-limited frame is noise.
+    assert!(admind_rate_limited().is_noise());
     assert!(!largest_admind().is_noise());
 }
 
@@ -850,8 +878,49 @@ fn frame_error_code_mirrors_ipc_error() {
         let code = FrameErrorCode::of(error);
         assert_eq!(code.name(), format!("{error:?}"));
         assert_ne!(code, FrameErrorCode::Unlisted);
+        assert_ne!(code, FrameErrorCode::ValueRefused);
     }
-    assert_eq!(FrameErrorCode::ALL.len(), all.len() + 1);
+    // `Unlisted` keeps code 15; `ValueRefused` (task F6, Q-406 item 3) is
+    // appended after it as 16 — no earlier code moved.
+    assert_eq!(FrameErrorCode::ALL.len(), all.len() + 2);
+    assert_eq!(FrameErrorCode::Unlisted.code(), 15);
+    assert_eq!(FrameErrorCode::ValueRefused.code(), 16);
+}
+
+/// Task F6 (A-94; docs/questions/Q-406): the three appended admind codes
+/// take the next free code of their tables; every earlier code is unchanged.
+#[test]
+fn f6_codes_are_appended() {
+    assert_eq!(PasswordFailure::VersionMismatch.code(), 7);
+    assert_eq!(PasswordFailure::OutcomeUnknown.code(), 8);
+    assert_eq!(PasswordFailure::ALL.len(), 8);
+    assert_eq!(ipc_audit::AdmindActivityCode::KeyadmForward.code(), 4);
+    assert_eq!(ipc_audit::AdmindActivityCode::RateLimited.code(), 5);
+    assert_eq!(ipc_audit::AdmindActivityCode::ALL.len(), 5);
+    // The rate-limited activity is noise and carries no field.
+    assert!(admind_rate_limited().is_noise());
+    let bytes = encode_event(&EventBody::Admind(Box::new(admind_rate_limited()))).unwrap();
+    assert_eq!(
+        decode_event(bytes.as_bytes()).unwrap(),
+        EventBody::Admind(Box::new(admind_rate_limited()))
+    );
+    // time(7) ‖ peer marker + uid ‖ activity 5, nothing after it.
+    assert_eq!(bytes.as_bytes().len(), 2 + 7 + 5 + 1);
+    assert_eq!(bytes.as_bytes().last(), Some(&5));
+}
+
+/// Task A10 (docs/questions/Q-421): the key-request codes appended to the
+/// DirAdmin tables take the next free codes; earlier codes are unchanged.
+#[test]
+fn a10_codes_are_appended() {
+    assert_eq!(AdminRefusal::ObligationRefused.code(), 20);
+    assert_eq!(AdminRefusal::OperationMismatch.code(), 21);
+    assert_eq!(AdminRefusal::KeyOperationRefused.code(), 22);
+    assert_eq!(AdminRefusal::ALL.len(), 22);
+    assert_eq!(AdminFailure::AuditUnacknowledged.code(), 6);
+    assert_eq!(AdminFailure::KeyOperationNotPerformed.code(), 7);
+    assert_eq!(AdminFailure::KeyOperationOutcomeUnknown.code(), 8);
+    assert_eq!(AdminFailure::ALL.len(), 8);
 }
 
 // ---- peek_shape ---------------------------------------------------------------

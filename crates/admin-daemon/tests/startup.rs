@@ -58,6 +58,7 @@ fn test_params(dir: &TempDir, audit: &Path, auditd_uid: u32) -> DaemonParams {
         },
         frame_timeout: Duration::from_secs(1),
         min_password_length: 12,
+        keyadm_uid: uid + 1,
         // The production clients: never contacted at start (and they hold
         // no runtime of their own, unlike the tests' non-Linux connectors,
         // so the parameters may be dropped inside the runtime).

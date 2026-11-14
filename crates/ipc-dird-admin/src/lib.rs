@@ -44,6 +44,11 @@
 //! | → | `0x0B` | `RemoveMember` | `group ‖ member` | `Done` |
 //! | → | `0x0C` | `Delete` | `target` | `Done` |
 //! | → | `0x0D` | `Lookup` | `u8 1 ‖ sam:bytes<256> \| u8 2 ‖ spn:bytes<1024> \| u8 3 ‖ dn:seq<bytes<128>,64>` | `Found` |
+//! | → | `0x0E` | `RequestKeyOperation` | `operation:KeyOperation` | `KeyRequest` |
+//! | → | `0x0F` | `Approve` | `id:u64 ‖ operation:KeyOperation` | `KeyRequest` |
+//! | → | `0x10` | `FetchApproved` | **no `auth`**: `id:u64` | `Approved` |
+//! | → | `0x11` | `Complete` | **no `auth`**: `id:u64 ‖ outcome:KeyOutcome` | `Done` |
+//! | → | `0x12` | `ListPendingDestruction` | **no `auth`**: `cursor:Option<[16]>` | `PendingDestruction` |
 //! | → | `0x14` | `Ping` | (no `auth`, empty) | `Pong` |
 //! | ← | `0x81` | `Created` | `guid:[16] ‖ sid:Option<bytes<68>>` | — |
 //! | ← | `0x82` | `PasswordSet` | `kind:u8{1 User, 2 Computer} ‖ keys:seq<(principal:[16] ‖ purpose:u8{1 Longterm, 2 Service} ‖ realm:bytes<255> ‖ name:bytes<4096> DER), 2> ‖ salt:bytes<1024>` | — |
@@ -51,11 +56,21 @@
 //! | ← | `0x84` | `Found` | `guid:[16] ‖ dn:seq<bytes<128>,64> ‖ class:bytes<64> ‖ sid:Option<bytes<68>>` | — |
 //! | ← | `0x85` | `Refused` | `status:u8{1 Denied, 2 ApprovalRequired, 3 NotFound, 4 Invalid, 5 Conflict, 6 Unavailable}` | — |
 //! | ← | `0x86` | `Pong` | — | — |
+//! | ← | `0x88` | `KeyRequest` | `id:u64 ‖ digest:[32] ‖ operation:KeyOperation ‖ approvals:u8 ‖ quorum:u8` | — |
+//! | ← | `0x89` | `Approved` | `id:u64 ‖ digest:[32] ‖ operation:KeyOperation ‖ principal:[16] ‖ requester:[16] ‖ approvers:seq<[16],2>` | — |
+//! | ← | `0x8A` | `PendingDestruction` | `entries:seq<(guid:[16] ‖ kind:u8{1 User, 2 Computer}),256> ‖ next:Option<[16]>` | — |
 //! | ← | `0xFF` | shared `Refused` (A-59) | `code` | — |
 //!
-//! Kinds `0x0E`–`0x13` are unused: the key-operation requests and the join
-//! token of docs/51 §7.3 belong to tasks A10 / A12 and are not part of this
-//! set. Request body ≤ 256 KiB, reply body ≤ 16 KiB ([`channel`]).
+//! `KeyOperation := u8 1 RotateKrbtgt | u8 2 RotateKey ‖ service:[16] |
+//! u8 3 RetireKvno ‖ KeyRef ‖ kvno:u32`; `KeyRef := u8 1 Krbtgt | u8 2
+//! Service ‖ principal:[16]`; `KeyOutcome := u8 1 Performed ‖
+//! kvno:Option<u32> | u8 2 Refused | u8 3 NotPerformed | u8 4
+//! OutcomeUnknown` (task A10, docs/questions/Q-422). The three keyadm
+//! requests carry no `auth`: keyadm has no Kerberos client, and admind
+//! forwards them only when its peer's uid is `keyadm_uid` (docs/51 §6).
+//! Kind `0x13` (the join token of docs/51 §7.3, task A12) is unused. Reply
+//! `0x87` is admin.sock's `PasswordChanged`, never dird's. Request body
+//! ≤ 256 KiB, reply body ≤ 16 KiB ([`channel`]).
 //!
 //! # Security
 //!
@@ -99,9 +114,15 @@ pub use client::{
 };
 pub use server::{decode_request, encode_refusal, encode_reply, EncodeError, Rejection};
 pub use typed::{
-    AccountExpires, AccountKind, Auth, ConversionError, Found, KeyTarget, LookupKey, Operation,
-    PasswordSet, PasswordSetOutcome, Reply, Request, ACCOUNT_EXPIRES_NEVER,
+    AccountExpires, AccountKind, ApprovedKeyOperation, Auth, ConversionError, DestructionEntry,
+    DestructionPage, Found, KeyOperation, KeyOperationOutcome, KeyRef, KeyRequestState, KeyTarget,
+    KeyadmRequest, LookupKey, Operation, PasswordSet, PasswordSetOutcome, Reply, Request,
+    ACCOUNT_EXPIRES_NEVER,
 };
 #[cfg(unix)]
 pub use unix::{UnixConnection, UnixConnector};
-pub use wire::{AdminReply, AdminRequest, WireAuth, WireKeyTarget, WireLookupKey, WireOperation};
+pub use wire::{
+    AdminReply, AdminRequest, WireApproved, WireAuth, WireDestructionEntry, WireKeyOperation,
+    WireKeyOutcome, WireKeyRef, WireKeyRequest, WireKeyTarget, WireKeyadmRequest, WireLookupKey,
+    WireOperation,
+};

@@ -48,6 +48,17 @@ ipc = { path = "../ipc" }
 # is sent, R50-3 / A-63), `UnixConnector`, `Call` / `Answer`, `Unserved`.
 # The client side links no crypto (D182, A-63).
 ipc-keyd = { path = "../ipc-keyd" }
+# admin.sock's codec and client (task A10: `FetchApproved`, `Complete`,
+# `ListPendingDestruction`, docs/51 §6) — admind's uid checked before
+# anything is sent. No store, PEP or crypto (crates/admin-daemon
+# tests/no_store_or_crypto.rs guards ipc-admin).
+ipc-admin = { path = "../ipc-admin" }
+# The typed key operations and replies of dird's admin channel, and its
+# blocking Unix connector (rustix peer credentials on Linux) that the
+# ipc-admin client runs over. No store, PEP or crypto (its own guard).
+ipc-dird-admin = { path = "../ipc-dird-admin" }
+# `Guid` (the objectGUIDs of the approved request and the tombstones).
+dtyp = { path = "../dtyp" }
 # `Kvno`, `Error` (keyd's answer), `KeyHandle`, `KeyPurpose`.
 keyd-types = { path = "../keyd-types" }
 # The manifest: format, file check, and the handles and bindings of the
@@ -70,12 +81,32 @@ keyd = { path = "../keyd" }
 keyd-daemon = { path = "../keyd-daemon" }
 ipc-audit = { path = "../ipc-audit", default-features = false, features = ["keyd"] }
 krb-proto = { path = "../krb-proto" }
-dtyp = { path = "../dtyp" }
 # Off Linux the ipc-keyd connector cannot read peer credentials (fail
 # closed), so the tests read keyd's uid with tokio `UnixStream::peer_cred`,
 # as crates/keyd-daemon/tests/kdc_flow.rs does (tokio 1.54.1 docs.rs, P-2).
-tokio = { version = "1.54.1", default-features = false, features = ["rt", "net"] }
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "rt-multi-thread", "net", "time", "sync", "io-util"] }
 zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
+# TESTS ONLY (task A10, docs/50 §9 tier 2): the approved-request commands
+# and the sweep against a real keyd, dird (with its admin service) and
+# admind, all in this process over real sockets — crates/admin-daemon's
+# tier-2 world reused by `#[path]` (it reuses crates/directory-daemon's,
+# crates/keyd-daemon's, crates/audit-daemon's and crates/kdc's test
+# support in turn). Workspace crates only. krb-crypto is linked by the
+# TEST build alone (the tests seal AP-REQs under a known admin-service key,
+# as A8 / A9 do); keyadm's own graph stays crypto-free (the guard in
+# crates/keyd-types/tests/no_crypto_dependency.rs checks normal edges).
+admin-daemon = { path = "../admin-daemon" }
+audit-daemon = { path = "../audit-daemon" }
+audit-log = { path = "../audit-log" }
+directory-daemon = { path = "../directory-daemon" }
+directory-admin = { path = "../directory-admin" }
+directory-pip = { path = "../directory-pip" }
+dirstore = { path = "../dirstore" }
+ad-schema = { path = "../ad-schema" }
+pdp = { path = "../pdp" }
+kdc = { path = "../kdc" }
+krb-crypto = { path = "../krb-crypto" }
+ipc-directory = { path = "../ipc-directory" }
 
 [lints]
 workspace = true

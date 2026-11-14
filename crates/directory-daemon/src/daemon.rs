@@ -47,7 +47,7 @@
 use crate::admin_engine::AdminWorker;
 use crate::admin_listener::{self, AdminServeContext};
 use crate::admin_service::{
-    admin_service_handle, check_manifest, protected_objects, AdminParams, NotStarted,
+    admin_service_handle, check_manifest, key_targets, protected_objects, AdminParams, NotStarted,
 };
 use crate::audit_link::{self, AuditEndpoint, AuditLinkError};
 use crate::clock::SharedClock;
@@ -456,6 +456,20 @@ fn start_admin(
         directory_admin::DirectoryAdmin::new(config, &schema, directory_admin::OsRandom::new())
             .map_err(|_| NotStarted::Configuration)?;
     let verifier = factory().ok_or(NotStarted::NoKeyd)?;
+    // The pending key-operation requests (task A10): their ids start after
+    // the start's DSTIME seconds × 2^20, as the operation numbers do
+    // (docs/questions/Q-388 item 4).
+    let first_key_id = params
+        .clock
+        .now()
+        .and_then(|now| directory_admin::wall_clock(&now))
+        .map_or(0, |seconds| seconds.0.wrapping_shl(20));
+    let key_requests = directory_admin::KeyRequests::new(
+        key_targets(&admin.manifest),
+        admin.key_request_lifetime,
+        first_key_id,
+    )
+    .map_err(|_| NotStarted::Configuration)?;
     let worker = AdminWorker {
         store: Arc::clone(store),
         ctx,
@@ -467,6 +481,7 @@ fn start_admin(
         gate: Arc::clone(gate),
         clock: params.clock.clone(),
         ack_deadline: admin.ack_deadline,
+        key_requests,
     };
     let ended = Arc::clone(state);
     let (handle, thread) = worker

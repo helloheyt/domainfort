@@ -14,16 +14,26 @@
 //! | `KeyHandle` | 16-octet `PrincipalId` ‖ purpose `u8` (closed table) |
 //! | binding | realm `bytes<255>` ‖ name `bytes<4096>` holding the `PrincipalName` DER |
 //! | outcome, expiry, lookup key, account kind, status | `u8` from a closed table |
+//! | `KeyOperation` | `u8 1 RotateKrbtgt` / `u8 2 RotateKey ‖ service:[16]` / `u8 3 RetireKvno ‖ KeyRef ‖ kvno:u32` |
+//! | `KeyRef` | `u8 1 Krbtgt` / `u8 2 Service ‖ principal:[16]` |
+//! | key-operation outcome | `u8 1 Performed ‖ kvno:Option<u32>` / `u8 2 Refused` / `u8 3 NotPerformed` / `u8 4 OutcomeUnknown` |
+//! | digest | 32 octets (a SHA-256 output, computed in dird) |
+//!
+//! The keyadm requests (`FetchApproved`, `Complete`,
+//! `ListPendingDestruction`) carry **no** `auth`: keyadm has no Kerberos
+//! client; admind forwards them only from `keyadm_uid` (docs/51 §6;
+//! docs/questions/Q-422).
 //!
 //! Spec: docs/51 §7.1 (the `crates/ipc` codec), §7.2 (`auth`), §7.3 (the
-//! fields of each operation and reply); docs/50 §3.3 (primitives; "Kerberos
-//! values … as `bytes<max>` containing DER"; "`KeyHandle` = 16 octets
-//! `PrincipalId` + `u8` purpose").
+//! fields of each operation and reply), §5.6, §6 (the key operations);
+//! docs/50 §3.3 (primitives; "Kerberos values … as `bytes<max>` containing
+//! DER"; "`KeyHandle` = 16 octets `PrincipalId` + `u8` purpose").
 
 use crate::channel::{
-    codes, reply_kind, request_kind, RefusalStatus, MAX_APPROVALS, MAX_AP_REQ, MAX_BINDING_NAME,
-    MAX_CLASS_NAME, MAX_DESCRIPTION, MAX_DNS_HOST_NAME, MAX_DN_COMPONENT, MAX_DN_COMPONENTS,
-    MAX_KEY_TARGETS, MAX_KVNOS, MAX_NAME, MAX_PRINCIPAL_NAME, MAX_REALM, MAX_SALT, MAX_SID,
+    codes, reply_kind, request_kind, RefusalStatus, DIGEST_LEN, MAX_APPROVALS, MAX_AP_REQ,
+    MAX_BINDING_NAME, MAX_CLASS_NAME, MAX_DESCRIPTION, MAX_DESTRUCTION_ENTRIES, MAX_DNS_HOST_NAME,
+    MAX_DN_COMPONENT, MAX_DN_COMPONENTS, MAX_KEY_TARGETS, MAX_KVNOS, MAX_NAME, MAX_PRINCIPAL_NAME,
+    MAX_REALM, MAX_SALT, MAX_SID,
 };
 use ipc::{DerBlob, Error, MessageSet, Payload, Reader, Result, Writer};
 use keyd_types::KeyPurpose;
@@ -116,6 +126,155 @@ pub enum WireLookupKey {
     ServicePrincipalName(Vec<u8>),
     /// A DN as components, leaf first.
     Dn(Vec<Vec<u8>>),
+}
+
+/// Which key set a `retire_kvno` names.
+/// Spec: docs/51 §6 (`retire-kvno`: after a rotation); docs/10 §7.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireKeyRef {
+    /// The krbtgt key set (dird names it).
+    Krbtgt,
+    /// A service object's `Service` key set (its objectGUID packet).
+    Service(GuidPacket),
+}
+
+impl WireKeyRef {
+    /// Spec: crate::channel `codes::KEY_REF_*`.
+    fn write(&self, writer: &mut Writer) -> Result<()> {
+        match self {
+            WireKeyRef::Krbtgt => writer.write_enum(codes::KEY_REF_KRBTGT),
+            WireKeyRef::Service(principal) => {
+                writer.write_enum(codes::KEY_REF_SERVICE)?;
+                writer.write_array(principal)
+            }
+        }
+    }
+
+    /// Spec: crate::channel `codes::KEY_REF_*`.
+    fn read(reader: &mut Reader<'_>) -> Result<WireKeyRef> {
+        match reader.read_enum(|c| {
+            matches!(c, codes::KEY_REF_KRBTGT | codes::KEY_REF_SERVICE).then_some(c)
+        })? {
+            codes::KEY_REF_SERVICE => Ok(WireKeyRef::Service(reader.read_array()?)),
+            _ => Ok(WireKeyRef::Krbtgt),
+        }
+    }
+}
+
+/// The key operation of a pending request: exactly the three Admin
+/// operations that need dual control (docs/51 §6 table — `rotate-key`,
+/// `rotate-krbtgt`, `retire-kvno`).
+/// Spec: docs/51 §5.2 row 11, §5.6, §6; docs/10 §7.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireKeyOperation {
+    /// `rotate_krbtgt` (the krbtgt key set; dird names it).
+    RotateKrbtgt,
+    /// `rotate_key` of a service object's `Service` key set.
+    RotateKey {
+        /// The service object's objectGUID packet.
+        service: GuidPacket,
+    },
+    /// `retire_kvno`.
+    RetireKvno {
+        /// The key set.
+        key: WireKeyRef,
+        /// The key version to retire.
+        kvno: u32,
+    },
+}
+
+impl WireKeyOperation {
+    /// Spec: crate::channel `codes::KEY_OP_*`.
+    fn write(&self, writer: &mut Writer) -> Result<()> {
+        match self {
+            WireKeyOperation::RotateKrbtgt => writer.write_enum(codes::KEY_OP_ROTATE_KRBTGT),
+            WireKeyOperation::RotateKey { service } => {
+                writer.write_enum(codes::KEY_OP_ROTATE_KEY)?;
+                writer.write_array(service)
+            }
+            WireKeyOperation::RetireKvno { key, kvno } => {
+                writer.write_enum(codes::KEY_OP_RETIRE_KVNO)?;
+                key.write(writer)?;
+                writer.write_u32(*kvno)
+            }
+        }
+    }
+
+    /// Spec: crate::channel `codes::KEY_OP_*`.
+    fn read(reader: &mut Reader<'_>) -> Result<WireKeyOperation> {
+        let tag = reader.read_enum(|c| {
+            matches!(
+                c,
+                codes::KEY_OP_ROTATE_KRBTGT | codes::KEY_OP_ROTATE_KEY | codes::KEY_OP_RETIRE_KVNO
+            )
+            .then_some(c)
+        })?;
+        Ok(match tag {
+            codes::KEY_OP_ROTATE_KEY => WireKeyOperation::RotateKey {
+                service: reader.read_array()?,
+            },
+            codes::KEY_OP_RETIRE_KVNO => WireKeyOperation::RetireKvno {
+                key: WireKeyRef::read(reader)?,
+                kvno: reader.read_u32()?,
+            },
+            _ => WireKeyOperation::RotateKrbtgt,
+        })
+    }
+}
+
+/// How keyadm's call to keyd ended, as `Complete` reports it.
+/// Spec: docs/51 §6 (`Complete {id, outcome, kvno}`); docs/10 §9, §10;
+/// A-88, A-90 (`RequestFate`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireKeyOutcome {
+    /// keyd performed it; the new kvno of a rotation.
+    Performed {
+        /// The kvno keyd answered (a rotation), if any.
+        kvno: Option<u32>,
+    },
+    /// keyd answered with a refusal.
+    Refused,
+    /// Not performed (never sent, or refused by keyd's transport).
+    NotPerformed,
+    /// Sent; no usable answer came back.
+    OutcomeUnknown,
+}
+
+impl WireKeyOutcome {
+    /// Spec: crate::channel `codes::KEY_OUTCOME_*`.
+    fn write(&self, writer: &mut Writer) -> Result<()> {
+        match self {
+            WireKeyOutcome::Performed { kvno } => {
+                writer.write_enum(codes::KEY_OUTCOME_PERFORMED)?;
+                writer.write_option(kvno.as_ref(), |w, k| w.write_u32(*k))
+            }
+            WireKeyOutcome::Refused => writer.write_enum(codes::KEY_OUTCOME_REFUSED),
+            WireKeyOutcome::NotPerformed => writer.write_enum(codes::KEY_OUTCOME_NOT_PERFORMED),
+            WireKeyOutcome::OutcomeUnknown => writer.write_enum(codes::KEY_OUTCOME_UNKNOWN),
+        }
+    }
+
+    /// Spec: crate::channel `codes::KEY_OUTCOME_*`.
+    fn read(reader: &mut Reader<'_>) -> Result<WireKeyOutcome> {
+        let tag = reader.read_enum(|c| {
+            matches!(
+                c,
+                codes::KEY_OUTCOME_PERFORMED
+                    | codes::KEY_OUTCOME_REFUSED
+                    | codes::KEY_OUTCOME_NOT_PERFORMED
+                    | codes::KEY_OUTCOME_UNKNOWN
+            )
+            .then_some(c)
+        })?;
+        Ok(match tag {
+            codes::KEY_OUTCOME_PERFORMED => WireKeyOutcome::Performed {
+                kvno: reader.read_option(Reader::read_u32)?,
+            },
+            codes::KEY_OUTCOME_REFUSED => WireKeyOutcome::Refused,
+            codes::KEY_OUTCOME_NOT_PERFORMED => WireKeyOutcome::NotPerformed,
+            _ => WireKeyOutcome::OutcomeUnknown,
+        })
+    }
 }
 
 /// The fields of one operation after `auth`.
@@ -216,6 +375,19 @@ pub enum WireOperation {
     },
     /// `Lookup {sam | spn | dn}`.
     Lookup(WireLookupKey),
+    /// `RequestKeyOperation {operation}`.
+    RequestKeyOperation {
+        /// The key operation asked for.
+        operation: WireKeyOperation,
+    },
+    /// `Approve {id, operation}`: the approver names the exact operation it
+    /// approves (docs/24 §6 principle, as docs/51 §5.6 cites it).
+    Approve {
+        /// The pending request's id.
+        id: u64,
+        /// The operation the approver approves.
+        operation: WireKeyOperation,
+    },
 }
 
 impl WireOperation {
@@ -236,6 +408,8 @@ impl WireOperation {
             WireOperation::RemoveMember { .. } => request_kind::REMOVE_MEMBER,
             WireOperation::Delete { .. } => request_kind::DELETE,
             WireOperation::Lookup(_) => request_kind::LOOKUP,
+            WireOperation::RequestKeyOperation { .. } => request_kind::REQUEST_KEY_OPERATION,
+            WireOperation::Approve { .. } => request_kind::APPROVE,
         }
     }
 
@@ -324,6 +498,11 @@ impl WireOperation {
                     write_dn(writer, dn)
                 }
             },
+            WireOperation::RequestKeyOperation { operation } => operation.write(writer),
+            WireOperation::Approve { id, operation } => {
+                writer.write_u64(*id)?;
+                operation.write(writer)
+            }
         }
     }
 
@@ -405,6 +584,89 @@ impl WireOperation {
                     _ => WireLookupKey::Dn(read_dn(reader)?),
                 })
             }
+            request_kind::REQUEST_KEY_OPERATION => WireOperation::RequestKeyOperation {
+                operation: WireKeyOperation::read(reader)?,
+            },
+            request_kind::APPROVE => WireOperation::Approve {
+                id: reader.read_u64()?,
+                operation: WireKeyOperation::read(reader)?,
+            },
+            _ => return Err(Error::UnknownKind),
+        })
+    }
+}
+
+/// A request keyadm sends through admind (no `auth`: keyadm has no Kerberos
+/// client; admind forwards these only from `keyadm_uid`).
+/// Spec: docs/51 §6, §7.3; docs/questions/Q-422.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireKeyadmRequest {
+    /// `FetchApproved {id}`.
+    FetchApproved {
+        /// The pending request's id.
+        id: u64,
+    },
+    /// `Complete {id, outcome}`.
+    Complete {
+        /// The pending request's id.
+        id: u64,
+        /// How keyd's call ended.
+        outcome: WireKeyOutcome,
+    },
+    /// `ListPendingDestruction {cursor}`.
+    ListPendingDestruction {
+        /// Resume strictly after this objectGUID packet (`None`: from the
+        /// start).
+        cursor: Option<GuidPacket>,
+    },
+}
+
+impl WireKeyadmRequest {
+    /// The request kind. Spec: crate::channel `request_kind`.
+    #[must_use]
+    pub fn kind(&self) -> u8 {
+        match self {
+            WireKeyadmRequest::FetchApproved { .. } => request_kind::FETCH_APPROVED,
+            WireKeyadmRequest::Complete { .. } => request_kind::COMPLETE,
+            WireKeyadmRequest::ListPendingDestruction { .. } => {
+                request_kind::LIST_PENDING_DESTRUCTION
+            }
+        }
+    }
+
+    /// The fields. Spec: docs/51 §6, §7.3.
+    ///
+    /// # Errors
+    /// `ipc::Error` (a field over its bound — cannot happen for these).
+    pub fn write_fields(&self, writer: &mut Writer) -> Result<()> {
+        match self {
+            WireKeyadmRequest::FetchApproved { id } => writer.write_u64(*id),
+            WireKeyadmRequest::Complete { id, outcome } => {
+                writer.write_u64(*id)?;
+                outcome.write(writer)
+            }
+            WireKeyadmRequest::ListPendingDestruction { cursor } => {
+                writer.write_option(cursor.as_ref(), |w, c| w.write_array(c))
+            }
+        }
+    }
+
+    /// The fields of a frame of kind `kind`. Spec: docs/51 §6, §7.3.
+    ///
+    /// # Errors
+    /// `ipc::Error` (unknown kind, field rules).
+    pub fn read_fields(kind: u8, reader: &mut Reader<'_>) -> Result<WireKeyadmRequest> {
+        Ok(match kind {
+            request_kind::FETCH_APPROVED => WireKeyadmRequest::FetchApproved {
+                id: reader.read_u64()?,
+            },
+            request_kind::COMPLETE => WireKeyadmRequest::Complete {
+                id: reader.read_u64()?,
+                outcome: WireKeyOutcome::read(reader)?,
+            },
+            request_kind::LIST_PENDING_DESTRUCTION => WireKeyadmRequest::ListPendingDestruction {
+                cursor: reader.read_option(Reader::read_array)?,
+            },
             _ => return Err(Error::UnknownKind),
         })
     }
@@ -421,6 +683,8 @@ pub enum AdminRequest {
         /// The operation.
         operation: WireOperation,
     },
+    /// A keyadm request (no `auth`).
+    Keyadm(WireKeyadmRequest),
     /// The health check (no `auth`, no field).
     Ping,
 }
@@ -431,28 +695,36 @@ impl MessageSet for AdminRequest {
     fn kind(&self) -> u8 {
         match self {
             AdminRequest::Operation { operation, .. } => operation.kind(),
+            AdminRequest::Keyadm(request) => request.kind(),
             AdminRequest::Ping => request_kind::PING,
         }
     }
 
-    /// Spec: docs/51 §7.2 (`auth` on every operation), §7.3.
+    /// Spec: docs/51 §7.2 (`auth` on every operation), §7.3, §6 (keyadm's
+    /// requests carry none).
     fn write_payload(&self, writer: &mut Writer) -> Result<()> {
         match self {
             AdminRequest::Operation { auth, operation } => {
                 auth.write_fields(writer)?;
                 operation.write_fields(writer)
             }
+            AdminRequest::Keyadm(request) => request.write_fields(writer),
             AdminRequest::Ping => Ok(()),
         }
     }
 
-    /// Spec: docs/51 §7.2, §7.3.
+    /// Spec: docs/51 §7.2, §7.3, §6.
     fn read_payload(kind: u8, reader: &mut Reader<'_>) -> Result<AdminRequest> {
         if kind == request_kind::PING {
             return Ok(AdminRequest::Ping);
         }
         if !request_kind::ALL.contains(&kind) {
             return Err(Error::UnknownKind);
+        }
+        if request_kind::KEYADM.contains(&kind) {
+            return Ok(AdminRequest::Keyadm(WireKeyadmRequest::read_fields(
+                kind, reader,
+            )?));
         }
         let auth = WireAuth::read_fields(reader)?;
         let operation = WireOperation::read_fields(kind, reader)?;
@@ -521,6 +793,54 @@ impl Payload for WireKeyTarget {
     }
 }
 
+/// The pending request as dird holds it (`RequestKeyOperation` and
+/// `Approve` reply with it): shown back so the requester and every approver
+/// see the exact operation and its digest.
+/// Spec: docs/51 §5.6, §7.3; docs/24 §6 (principle).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireKeyRequest {
+    /// The id.
+    pub id: u64,
+    /// The operation digest.
+    pub digest: [u8; DIGEST_LEN],
+    /// The operation.
+    pub operation: WireKeyOperation,
+    /// Approvals recorded so far.
+    pub approvals: u8,
+    /// The quorum (requester included).
+    pub quorum: u8,
+}
+
+/// The answer to `FetchApproved`.
+/// Spec: docs/51 §6 ("dird returns {operation, GUIDs of the requester and
+/// approver}").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireApproved {
+    /// The id.
+    pub id: u64,
+    /// The operation digest.
+    pub digest: [u8; DIGEST_LEN],
+    /// The operation.
+    pub operation: WireKeyOperation,
+    /// The principal id (objectGUID packet) of the key set acted on.
+    pub principal: GuidPacket,
+    /// The requester's objectGUID packet.
+    pub requester: GuidPacket,
+    /// The approvers' objectGUID packets.
+    pub approvers: Vec<GuidPacket>,
+}
+
+/// One tombstone of a user or computer object.
+/// Spec: docs/51 §6 (`destroy-sweep`), §9; A-18 (a tombstone keeps GUID +
+/// classes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireDestructionEntry {
+    /// The objectGUID packet (= the principal id of its key sets).
+    pub guid: GuidPacket,
+    /// [`codes::KIND_USER`] or [`codes::KIND_COMPUTER`].
+    pub kind: u8,
+}
+
 /// One reply of the admin channel (the shared `Refused` travels separately,
 /// `ipc::Reply::Refused`).
 /// Spec: docs/51 §7.3 (the reply column); docs/50 §7.5.
@@ -559,6 +879,22 @@ pub enum AdminReply {
     Refused(RefusalStatus),
     /// `Ping` answered.
     Pong,
+    /// `RequestKeyOperation` / `Approve`: the pending request.
+    KeyRequest(WireKeyRequest),
+    /// `FetchApproved`: the approved operation.
+    Approved(WireApproved),
+    /// `ListPendingDestruction`: one page.
+    PendingDestruction {
+        /// The tombstones of this page.
+        entries: Vec<WireDestructionEntry>,
+        /// Where the next page starts (`None`: the listing is complete).
+        next: Option<GuidPacket>,
+    },
+}
+
+/// The kind code of a destruction entry (closed table).
+fn kind_code(c: u8) -> Option<u8> {
+    matches!(c, codes::KIND_USER | codes::KIND_COMPUTER).then_some(c)
 }
 
 impl MessageSet for AdminReply {
@@ -572,6 +908,9 @@ impl MessageSet for AdminReply {
             AdminReply::Found { .. } => reply_kind::FOUND,
             AdminReply::Refused(_) => reply_kind::REFUSED,
             AdminReply::Pong => reply_kind::PONG,
+            AdminReply::KeyRequest(_) => reply_kind::KEY_REQUEST,
+            AdminReply::Approved(_) => reply_kind::APPROVED,
+            AdminReply::PendingDestruction { .. } => reply_kind::PENDING_DESTRUCTION,
         }
     }
 
@@ -600,6 +939,28 @@ impl MessageSet for AdminReply {
             }
             AdminReply::Refused(status) => writer.write_enum(status.code()),
             AdminReply::Done | AdminReply::Pong => Ok(()),
+            AdminReply::KeyRequest(request) => {
+                writer.write_u64(request.id)?;
+                writer.write_array(&request.digest)?;
+                request.operation.write(writer)?;
+                writer.write_u8(request.approvals)?;
+                writer.write_u8(request.quorum)
+            }
+            AdminReply::Approved(approved) => {
+                writer.write_u64(approved.id)?;
+                writer.write_array(&approved.digest)?;
+                approved.operation.write(writer)?;
+                writer.write_array(&approved.principal)?;
+                writer.write_array(&approved.requester)?;
+                writer.write_seq(&approved.approvers, MAX_APPROVALS, |w, a| w.write_array(a))
+            }
+            AdminReply::PendingDestruction { entries, next } => {
+                writer.write_seq(entries, MAX_DESTRUCTION_ENTRIES, |w, e| {
+                    w.write_array(&e.guid)?;
+                    w.write_enum(e.kind)
+                })?;
+                writer.write_option(next.as_ref(), |w, n| w.write_array(n))
+            }
         }
     }
 
@@ -627,6 +988,30 @@ impl MessageSet for AdminReply {
             },
             reply_kind::REFUSED => AdminReply::Refused(reader.read_enum(RefusalStatus::from_code)?),
             reply_kind::PONG => AdminReply::Pong,
+            reply_kind::KEY_REQUEST => AdminReply::KeyRequest(WireKeyRequest {
+                id: reader.read_u64()?,
+                digest: reader.read_array()?,
+                operation: WireKeyOperation::read(reader)?,
+                approvals: reader.read_u8()?,
+                quorum: reader.read_u8()?,
+            }),
+            reply_kind::APPROVED => AdminReply::Approved(WireApproved {
+                id: reader.read_u64()?,
+                digest: reader.read_array()?,
+                operation: WireKeyOperation::read(reader)?,
+                principal: reader.read_array()?,
+                requester: reader.read_array()?,
+                approvers: reader.read_seq(MAX_APPROVALS, Reader::read_array)?,
+            }),
+            reply_kind::PENDING_DESTRUCTION => AdminReply::PendingDestruction {
+                entries: reader.read_seq(MAX_DESTRUCTION_ENTRIES, |r| {
+                    Ok(WireDestructionEntry {
+                        guid: r.read_array()?,
+                        kind: r.read_enum(kind_code)?,
+                    })
+                })?,
+                next: reader.read_option(Reader::read_array)?,
+            },
             _ => return Err(Error::UnknownKind),
         })
     }

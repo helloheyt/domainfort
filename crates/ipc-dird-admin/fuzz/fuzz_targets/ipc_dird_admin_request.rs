@@ -11,7 +11,13 @@
 //! rejection maps to the refusal table (a shared `Refused`, or a close
 //! without a reply).
 //!
-//! Spec: docs/51 §7.1-§7.3, §7.5; docs/50 §3.3, §9; A-59.
+//! Task A10 added the key-operation kinds (`RequestKeyOperation`,
+//! `Approve`, and keyadm's `FetchApproved` / `Complete` /
+//! `ListPendingDestruction`, which carry no `auth`): whatever decodes as a
+//! keyadm request has one of the keyadm kinds.
+//!
+//! Spec: docs/51 §6, §7.1-§7.3, §7.5; docs/50 §3.3, §9; A-59;
+//! docs/questions/Q-422.
 
 use ipc::{decode_body, encode_frame, Direction};
 use ipc_dird_admin::{decode_request, AdminRequest, Request, ADMIN_CHANNEL};
@@ -26,6 +32,9 @@ fuzz_target!(|data: &[u8]| {
             if let Ok(request) = Request::from_wire(&wire) {
                 let typed = request.to_wire().expect("a typed request re-encodes");
                 assert_eq!(typed, wire, "canonical typed round trip");
+                if let Request::Keyadm(_) = request {
+                    assert!(ipc_dird_admin::channel::request_kind::KEYADM.contains(&data[3]));
+                }
             }
         }
         Err(error) => {

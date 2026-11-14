@@ -177,8 +177,9 @@ fn every_client_result_is_classified() {
 // ---- command line --------------------------------------------------------------
 
 /// docs/51 §6 (`ceremony <manifest>`), the configuration path first as the
-/// daemons take it; exactly three arguments, no options; the A9/A10
-/// commands have no code path yet.
+/// daemons take it; exactly three arguments, no options; the A10 commands
+/// take a decimal request id (`destroy-sweep` nothing) — the rest of their
+/// grammar is in tests/key_operations_local.rs.
 #[test]
 fn the_command_line_is_exact() {
     let args = |list: &[&str]| list.iter().map(OsString::from).collect::<Vec<_>>();

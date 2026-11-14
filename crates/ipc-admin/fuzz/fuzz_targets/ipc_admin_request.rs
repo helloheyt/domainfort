@@ -11,7 +11,12 @@
 //! (docs/50 §3.3: "a single encoding per value"), and a rejection maps to
 //! the refusal table (a shared `Refused`, or a close without a reply).
 //!
-//! Spec: docs/51 §7.1, §7.2, §7.6; docs/50 §3.3, §9; A-59.
+//! Task A10 added the forwarded key-operation requests and keyadm's three
+//! requests (dird's layouts, no `auth`): whatever decodes as a keyadm
+//! request has one of the keyadm kinds.
+//!
+//! Spec: docs/51 §6, §7.1, §7.2, §7.6; docs/50 §3.3, §9; A-59;
+//! docs/questions/Q-422.
 
 use ipc::{decode_body, encode_frame, Direction};
 use ipc_admin::{decode_request, encode_request, AdminRequest, Request, ADMIN_CHANNEL};
@@ -26,6 +31,9 @@ fuzz_target!(|data: &[u8]| {
             if let Ok(request) = Request::from_wire(wire) {
                 let typed = encode_request(&request).expect("a typed request re-encodes");
                 assert_eq!(typed.body(), data, "canonical typed round trip");
+                if let Request::Keyadm(_) = request {
+                    assert!(ipc_admin::channel::request_kind::KEYADM.contains(&data[3]));
+                }
             }
         }
         Err(error) => {

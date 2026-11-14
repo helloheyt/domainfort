@@ -54,17 +54,19 @@ use core::fmt;
 use core::time::Duration;
 use directory_admin::{
     CompletePasswordSet, CreateComputer, CreateContainerLike, CreateGroup, CreateUser,
-    LookupKey as PepLookupKey, Membership, Operation as PepOperation,
-    PasswordSetOutcome as PepOutcome, ProtectedObjects, RefusalStatus as PepStatus,
-    Reply as PepReply, SetAccountExpires, SetEnabled,
+    KeyAdminOperation, KeyOperation as PepKeyOperation, KeyOperationOutcome as PepKeyOutcome,
+    KeyRef as PepKeyRef, KeyReply, KeyTargets, LookupKey as PepLookupKey, Membership,
+    Operation as PepOperation, PasswordSetOutcome as PepOutcome, ProtectedObjects,
+    RefusalStatus as PepStatus, Reply as PepReply, SetAccountExpires, SetEnabled,
 };
 use directory_pip::{AccountKind as PipKind, DirectoryView};
 use dirstore::NodeId;
 use dtyp::Guid;
 use ipc_audit::AccountExpiresValue;
 use ipc_dird_admin::{
-    AccountExpires, AccountKind, Found, KeyTarget, LookupKey, Operation, PasswordSet,
-    PasswordSetOutcome, RefusalStatus, Reply,
+    AccountExpires, AccountKind, ApprovedKeyOperation, DestructionEntry, DestructionPage, Found,
+    KeyOperation, KeyOperationOutcome, KeyRef, KeyRequestState, KeyTarget, KeyadmRequest,
+    LookupKey, Operation, PasswordSet, PasswordSetOutcome, RefusalStatus, Reply,
 };
 use kdc::AccountSource;
 use keyd_types::{AuthnError, KeyHandle, ServiceContext};
@@ -192,6 +194,9 @@ pub struct AdminParams {
     pub queue_capacity: usize,
     /// The decision-acknowledgement wait ([`DECISION_ACK_DEADLINE`]).
     pub ack_deadline: Duration,
+    /// The lifetime of a pending key-operation request
+    /// (`directory_admin::KEY_REQUEST_LIFETIME`; docs/51 §5.6, task A10).
+    pub key_request_lifetime: Duration,
 }
 
 impl fmt::Debug for AdminParams {
@@ -204,6 +209,7 @@ impl fmt::Debug for AdminParams {
             .field("quorum", &self.quorum)
             .field("max_connections", &self.max_connections)
             .field("queue_capacity", &self.queue_capacity)
+            .field("key_request_lifetime", &self.key_request_lifetime)
             .finish_non_exhaustive()
     }
 }
@@ -296,6 +302,21 @@ pub(crate) fn admin_service_handle(
     }
 }
 
+/// The key sets a key-operation request may name: the manifest's krbtgt
+/// account and its two service objects (the randomized `Service` key sets
+/// of the ceremony, docs/51 §4.3 step 11).
+/// Spec: docs/51 §4.3 steps 8, 11, §6; docs/questions/Q-420.
+#[must_use]
+pub fn key_targets(manifest: &Manifest) -> KeyTargets {
+    KeyTargets {
+        krbtgt: guid_of(&manifest.krbtgt().handle),
+        services: BTreeSet::from([
+            guid_of(&manifest.ldap_service().handle),
+            guid_of(&manifest.admin_service().handle),
+        ]),
+    }
+}
+
 /// The protected objects (module documentation).
 /// Spec: docs/51 §5.2 row 9, §4.3 step 5; A-39; A-44; docs/questions/Q-356
 /// item 2, Q-386 item 1.
@@ -314,12 +335,129 @@ pub fn protected_objects(manifest: &Manifest, policy: &DevelopmentPolicy) -> Pro
 // The channel's typed messages ↔ the write PEP's.
 // ---------------------------------------------------------------------------
 
+/// The PEP's key operation of a typed one (field for field).
+/// Spec: docs/51 §6, §7.3; crate directory-admin `KeyOperation`.
+fn pep_key_operation(operation: &KeyOperation) -> PepKeyOperation {
+    match operation {
+        KeyOperation::RotateKrbtgt => PepKeyOperation::RotateKrbtgt,
+        KeyOperation::RotateKey { service } => PepKeyOperation::RotateKey { service: *service },
+        KeyOperation::RetireKvno { key, kvno } => PepKeyOperation::RetireKvno {
+            key: match key {
+                KeyRef::Krbtgt => PepKeyRef::Krbtgt,
+                KeyRef::Service(service) => PepKeyRef::Service(*service),
+            },
+            kvno: *kvno,
+        },
+    }
+}
+
+/// The typed key operation of the PEP's (field for field).
+fn wire_key_operation(operation: &PepKeyOperation) -> KeyOperation {
+    match operation {
+        PepKeyOperation::RotateKrbtgt => KeyOperation::RotateKrbtgt,
+        PepKeyOperation::RotateKey { service } => KeyOperation::RotateKey { service: *service },
+        PepKeyOperation::RetireKvno { key, kvno } => KeyOperation::RetireKvno {
+            key: match key {
+                PepKeyRef::Krbtgt => KeyRef::Krbtgt,
+                PepKeyRef::Service(service) => KeyRef::Service(*service),
+            },
+            kvno: *kvno,
+        },
+    }
+}
+
+/// The PEP's key-plane request of a typed operation, if it is one
+/// (`RequestKeyOperation`, `Approve`).
+/// Spec: docs/51 §5.6, §6, §7.3.
+#[must_use]
+pub fn key_request_of(operation: &Operation) -> Option<KeyAdminOperation> {
+    match operation {
+        Operation::RequestKeyOperation { operation } => {
+            Some(KeyAdminOperation::RequestKeyOperation {
+                operation: pep_key_operation(operation),
+            })
+        }
+        Operation::Approve { id, operation } => Some(KeyAdminOperation::Approve {
+            id: *id,
+            operation: pep_key_operation(operation),
+        }),
+        _ => None,
+    }
+}
+
+/// The PEP's key-plane request of a keyadm request.
+/// Spec: docs/51 §6, §7.3.
+#[must_use]
+pub fn keyadm_request(request: &KeyadmRequest) -> KeyAdminOperation {
+    match request {
+        KeyadmRequest::FetchApproved { id } => KeyAdminOperation::FetchApproved { id: *id },
+        KeyadmRequest::Complete { id, outcome } => KeyAdminOperation::Complete {
+            id: *id,
+            outcome: match outcome {
+                KeyOperationOutcome::Performed { kvno } => PepKeyOutcome::Performed { kvno: *kvno },
+                KeyOperationOutcome::Refused => PepKeyOutcome::Refused,
+                KeyOperationOutcome::NotPerformed => PepKeyOutcome::NotPerformed,
+                KeyOperationOutcome::OutcomeUnknown => PepKeyOutcome::OutcomeUnknown,
+            },
+        },
+        KeyadmRequest::ListPendingDestruction { cursor } => {
+            KeyAdminOperation::ListPendingDestruction { cursor: *cursor }
+        }
+    }
+}
+
+/// The typed reply of a key-plane step. A count that cannot be one octet
+/// (never: at most two approvals, a quorum of at most three) is answered
+/// `Unavailable`.
+/// Spec: docs/51 §6, §7.3.
+#[must_use]
+pub fn wire_key_reply(reply: &KeyReply) -> Reply {
+    match reply {
+        KeyReply::Request(view) => {
+            match (u8::try_from(view.approvals), u8::try_from(view.quorum)) {
+                (Ok(approvals), Ok(quorum)) => Reply::KeyRequest(KeyRequestState {
+                    id: view.id,
+                    digest: view.digest,
+                    operation: wire_key_operation(&view.operation),
+                    approvals,
+                    quorum,
+                }),
+                _ => Reply::Refused(RefusalStatus::Unavailable),
+            }
+        }
+        KeyReply::Approved(approved) => Reply::Approved(ApprovedKeyOperation {
+            id: approved.id,
+            digest: approved.digest,
+            operation: wire_key_operation(&approved.operation),
+            principal: guid_of(&approved.handle),
+            requester: approved.requester,
+            approvers: approved.approvers.clone(),
+        }),
+        KeyReply::Done => Reply::Done,
+        KeyReply::Page(page) => Reply::PendingDestruction(DestructionPage {
+            entries: page
+                .entries
+                .iter()
+                .map(|e| DestructionEntry {
+                    guid: e.guid,
+                    kind: match e.kind {
+                        PipKind::User => AccountKind::User,
+                        PipKind::Computer => AccountKind::Computer,
+                    },
+                })
+                .collect(),
+            next: page.next,
+        }),
+    }
+}
+
 /// The PEP's operation of a typed request (field for field; no rule is
-/// applied here — the PEP checks every value and audits a refusal).
+/// applied here — the PEP checks every value and audits a refusal); `None`
+/// for a key-plane request ([`key_request_of`]).
 /// Spec: docs/51 §7.3; crate directory-admin `Operation`.
 #[must_use]
-pub fn pep_operation(operation: &Operation) -> PepOperation {
-    match operation {
+pub fn pep_operation(operation: &Operation) -> Option<PepOperation> {
+    Some(match operation {
         Operation::CreateUser {
             parent,
             sam,
@@ -403,7 +541,8 @@ pub fn pep_operation(operation: &Operation) -> PepOperation {
             LookupKey::ServicePrincipalName(spn) => PepLookupKey::ServicePrincipalName(spn.clone()),
             LookupKey::Dn(dn) => PepLookupKey::Dn(Dn::new(dn.clone())),
         }),
-    }
+        Operation::RequestKeyOperation { .. } | Operation::Approve { .. } => return None,
+    })
 }
 
 /// The wire status of the PEP's status (the same six values by name).
@@ -477,3 +616,9 @@ const _: () =
     assert!(ipc_dird_admin::channel::MAX_DN_COMPONENTS as usize == directory_pip::MAX_DN_DEPTH);
 const _: () = assert!(ipc_dird_admin::channel::MAX_APPROVALS as usize == ipc_audit::MAX_APPROVERS);
 const _: () = assert!(ipc_dird_admin::channel::MAX_KVNOS as usize == ipc_audit::MAX_REPORTED_KVNOS);
+const _: () = assert!(
+    ipc_dird_admin::channel::MAX_DESTRUCTION_ENTRIES as usize
+        == directory_admin::MAX_DESTRUCTION_PAGE
+);
+const _: () = assert!(ipc_dird_admin::channel::DIGEST_LEN == directory_admin::DIGEST_LEN);
+const _: () = assert!(directory_admin::MAX_QUORUM <= u8::MAX as usize);

@@ -448,7 +448,9 @@ fn origin(txn: &mut WriteTxn<'_>) -> Origin {
 }
 
 /// The policy: tier map {tier0 group → Tier0}, {ou=Tier0 → Tier0}; the
-/// Tier-0 group may run every Directory action under the NC root; the
+/// Tier-0 group may run every Directory action under the NC root, and
+/// `PolicyAdmin` on every policy scope (the rule `provision domain` writes
+/// — the key operations' `keys` scope included, task A10, Q-420); the
 /// bootstrap group is the FAST bootstrap set (docs/51 §4.3 step 6).
 fn policy() -> DevelopmentPolicy {
     DevelopmentPolicy {
@@ -459,20 +461,34 @@ fn policy() -> DevelopmentPolicy {
             bootstrap_group: sid_of(BOOTSTRAP),
             first_rule_id: RuleId(100),
         },
-        rules: vec![Rule {
-            id: RuleId(1),
-            effect: Effect::Allow,
-            when: Match {
-                action: ActionMatch::Class(pdp::ActionClass::Directory),
-                resource: ResourceMatch::DirSubtree {
-                    base: SubtreeBase::new(nc_dn()).unwrap(),
+        rules: vec![
+            Rule {
+                id: RuleId(1),
+                effect: Effect::Allow,
+                when: Match {
+                    action: ActionMatch::Class(pdp::ActionClass::Directory),
+                    resource: ResourceMatch::DirSubtree {
+                        base: SubtreeBase::new(nc_dn()).unwrap(),
+                    },
+                    subject: SubjectMatch::MemberOf(sid_of(TIER0_GROUP)),
+                    context: ContextMatch::ANY,
+                    auth: AuthMatch::ANY,
                 },
-                subject: SubjectMatch::MemberOf(sid_of(TIER0_GROUP)),
-                context: ContextMatch::ANY,
-                auth: AuthMatch::ANY,
+                obligations: vec![],
             },
-            obligations: vec![],
-        }],
+            Rule {
+                id: RuleId(2),
+                effect: Effect::Allow,
+                when: Match {
+                    action: ActionMatch::Exact(pdp::Action::PolicyAdmin),
+                    resource: ResourceMatch::Policy { scope: None },
+                    subject: SubjectMatch::MemberOf(sid_of(TIER0_GROUP)),
+                    context: ContextMatch::ANY,
+                    auth: AuthMatch::ANY,
+                },
+                obligations: vec![],
+            },
+        ],
         anonymous: Vec::new(),
     }
 }
@@ -798,12 +814,14 @@ fn serve_audit(
 // dird with its admin service.
 // ---------------------------------------------------------------------------
 
-/// dird's clock: the kdc fixtures' `now` (the tickets' time base).
-struct FixedNow;
+/// dird's clock: the kdc fixtures' `now` (the tickets' time base), moved
+/// by the test's offset in seconds (0 unless a test moves it — task A10's
+/// expiry test).
+struct FixedNow(Arc<std::sync::atomic::AtomicI64>);
 
 impl Clock for FixedNow {
     fn now(&self) -> Option<KerberosTime> {
-        Some(common::now())
+        Some(common::at(self.0.load(Ordering::SeqCst)))
     }
 }
 
@@ -941,12 +959,15 @@ mod admin_connector {
 use admin_connector::AdminConnector;
 
 /// What a world is built with.
+#[derive(Clone)]
 struct Options {
     with_admin_service: bool,
     admind_uid_offset: u32,
     max_connections: usize,
     queue_capacity: usize,
     hook: bool,
+    /// The pending key-operation request lifetime (task A10).
+    key_request_lifetime: Duration,
 }
 
 impl Default for Options {
@@ -957,6 +978,7 @@ impl Default for Options {
             max_connections: directory_daemon::MAX_ADMIN_CONNECTIONS,
             queue_capacity: directory_daemon::ADMIN_QUEUE_CAPACITY,
             hook: false,
+            key_request_lifetime: directory_admin::KEY_REQUEST_LIFETIME,
         }
     }
 }
@@ -974,6 +996,51 @@ struct World {
     kdc_socket: PathBuf,
     /// (change-seq next value when each Decision(Proceed) arrived, op id).
     seen_at_decision: Arc<Mutex<Vec<(u64, u64)>>>,
+    /// dird's clock offset in seconds (task A10).
+    clock_offset: Arc<std::sync::atomic::AtomicI64>,
+    keyd_socket: PathBuf,
+    options: Options,
+}
+
+/// dird with its admin service (the world's parameters).
+fn start_dird(
+    dir: &support::TempDir,
+    uid: u32,
+    store: &Arc<Store>,
+    admin_socket: &Path,
+    keyd_socket: &Path,
+    options: &Options,
+    clock_offset: &Arc<std::sync::atomic::AtomicI64>,
+) -> DirdRun {
+    let mut params = support::params(dir, uid, uid, Duration::from_secs(5), 4);
+    params.clock = SharedClock::new(FixedNow(Arc::clone(clock_offset)));
+    let realm = common::realm();
+    let keyd_socket = keyd_socket.to_path_buf();
+    let factory: VerifierFactory = Arc::new(move || {
+        let client = ipc_keyd::KeydClient::new(
+            support::connector::keyd(&keyd_socket),
+            uid,
+            ipc_keyd::DEFAULT_DEADLINE,
+        )
+        .ok()?;
+        let verifier: Box<dyn TicketVerifier> =
+            Box::new(KeydTicketVerifier::new(client, realm.clone()));
+        Some(verifier)
+    });
+    let admin = AdminParams {
+        socket: admin_socket.to_path_buf(),
+        admind_uid: uid + options.admind_uid_offset,
+        keyd: Some(factory),
+        ticket_age_max: TICKET_AGE_MAX,
+        quorum: QUORUM,
+        node_id: NODE_ID,
+        manifest: manifest(),
+        max_connections: options.max_connections,
+        queue_capacity: options.queue_capacity,
+        ack_deadline: DECISION_ACK_DEADLINE,
+        key_request_lifetime: options.key_request_lifetime,
+    };
+    DirdRun::start(params, admin, Arc::clone(store), policy())
 }
 
 fn change_seq_next(store: &Store) -> u64 {
@@ -1034,35 +1101,18 @@ impl World {
         };
         let auditd = AdminAuditd::start(&dir.join("a.sock"), hook);
 
-        let mut params = support::params(&dir, uid, uid, Duration::from_secs(5), 4);
-        params.clock = SharedClock::new(FixedNow);
-        let kdc_socket = params.kdc_socket.clone();
+        let clock_offset = Arc::new(std::sync::atomic::AtomicI64::new(0));
         let admin_socket = dir.join("m.sock");
-        let realm = common::realm();
-        let factory: VerifierFactory = Arc::new(move || {
-            let client = ipc_keyd::KeydClient::new(
-                support::connector::keyd(&keyd_socket),
-                uid,
-                ipc_keyd::DEFAULT_DEADLINE,
-            )
-            .ok()?;
-            let verifier: Box<dyn TicketVerifier> =
-                Box::new(KeydTicketVerifier::new(client, realm.clone()));
-            Some(verifier)
-        });
-        let admin = AdminParams {
-            socket: admin_socket.clone(),
-            admind_uid: uid + options.admind_uid_offset,
-            keyd: Some(factory),
-            ticket_age_max: TICKET_AGE_MAX,
-            quorum: QUORUM,
-            node_id: NODE_ID,
-            manifest: manifest(),
-            max_connections: options.max_connections,
-            queue_capacity: options.queue_capacity,
-            ack_deadline: DECISION_ACK_DEADLINE,
-        };
-        let dird = DirdRun::start(params, admin, Arc::clone(&store), policy());
+        let kdc_socket = dir.join("d.sock");
+        let dird = start_dird(
+            &dir,
+            uid,
+            &store,
+            &admin_socket,
+            &keyd_socket,
+            &options,
+            &clock_offset,
+        );
         Some(World {
             dir,
             uid,
@@ -1074,7 +1124,27 @@ impl World {
             admin_socket,
             kdc_socket,
             seen_at_decision,
+            clock_offset,
+            keyd_socket,
+            options,
         })
+    }
+
+    /// Stop dird and start it again over the same store, keyd and auditd
+    /// (task A10: a restart drops the pending key-operation requests).
+    fn restart_dird(&mut self) {
+        if let Some(dird) = self.dird.take() {
+            dird.stop().unwrap();
+        }
+        self.dird = Some(start_dird(
+            &self.dir,
+            self.uid,
+            &self.store,
+            &self.admin_socket,
+            &self.keyd_socket,
+            &self.options,
+            &self.clock_offset,
+        ));
     }
 
     fn client(&self) -> AdminClient<AdminConnector> {
@@ -1871,4 +1941,563 @@ fn without_the_admin_service_object_dird_serves_on() {
     .unwrap();
     let domain = directory.describe_domain().unwrap();
     assert_eq!(domain.realm, common::realm());
+}
+
+// ---------------------------------------------------------------------------
+// Task A10: dual-controlled key operations (docs/51 §5.6, §6).
+// ---------------------------------------------------------------------------
+
+use ipc_dird_admin::{KeyOperation, KeyOperationOutcome, KeyRef, KeyRequestState, KeyadmRequest};
+
+fn key_state(reply: Reply) -> KeyRequestState {
+    match reply {
+        Reply::KeyRequest(state) => state,
+        other => panic!("expected KeyRequest, got {other:?}"),
+    }
+}
+
+fn keyadm(request: KeyadmRequest) -> Request {
+    Request::Keyadm(request)
+}
+
+fn request_op(requester: &str, operation: KeyOperation) -> Request {
+    by(requester, &[], Operation::RequestKeyOperation { operation })
+}
+
+fn approve_op(approver: &str, id: u64, operation: KeyOperation) -> Request {
+    by(approver, &[], Operation::Approve { id, operation })
+}
+
+fn decision(event: &DirAdminEvent) -> DirAdminStage {
+    event.stage
+}
+
+fn refused(refusal: ipc_audit::AdminRefusal) -> DirAdminStage {
+    DirAdminStage::Decision(DecisionResult::Refused(refusal))
+}
+
+const PROCEED: DirAdminStage = DirAdminStage::Decision(DecisionResult::Proceed);
+
+fn sid_value(sid: &Sid) -> ipc_audit::SidValue {
+    ipc_audit::SidValue::new(sid.identifier_authority(), sid.sub_authority().to_vec()).unwrap()
+}
+
+/// docs/51 §5.6, §6 (R51-11, R51-14); P-22; A-85: `rotate_krbtgt` from
+/// request to completion — admin1 requests (PolicyAdmin on `keys`), admin2
+/// approves the exact operation (the digest is shown back), keyadm fetches
+/// it once (the krbtgt handle, admin1 and admin2 by objectGUID — what keyd's
+/// `DualControlToken` names) and reports the new kvno; every step has its
+/// `DirAdmin` event with the request id, the keyd operation, the target and
+/// the parties; `Complete` adds an `Outcome` with the reported kvno. Nothing
+/// of the directory is written.
+#[test]
+fn rotate_krbtgt_request_approve_fetch_complete() {
+    let Some(world) = World::new(Options::default()) else {
+        return;
+    };
+    let mut client = world.client();
+    let seq = change_seq_next(&world.store);
+    let state = key_state(
+        client
+            .call(&request_op("admin1", KeyOperation::RotateKrbtgt))
+            .unwrap(),
+    );
+    assert_eq!(state.operation, KeyOperation::RotateKrbtgt);
+    assert_eq!((state.approvals, state.quorum), (0, 2));
+    let id = state.id;
+    // Fetched before approval ⇒ refused (not approved).
+    assert_eq!(
+        client
+            .call(&keyadm(KeyadmRequest::FetchApproved { id }))
+            .unwrap(),
+        Reply::Refused(RefusalStatus::ApprovalRequired)
+    );
+    // An approval naming another operation is refused (the digest binds).
+    assert_eq!(
+        client
+            .call(&approve_op(
+                "admin2",
+                id,
+                KeyOperation::RotateKey {
+                    service: g(LDAP_SVC)
+                }
+            ))
+            .unwrap(),
+        Reply::Refused(RefusalStatus::Invalid)
+    );
+    // The approval: the digest and the operation are shown back.
+    let approved = key_state(
+        client
+            .call(&approve_op("admin2", id, KeyOperation::RotateKrbtgt))
+            .unwrap(),
+    );
+    assert_eq!(approved.id, id);
+    assert_eq!(approved.digest, state.digest);
+    assert_eq!(approved.operation, KeyOperation::RotateKrbtgt);
+    assert_eq!((approved.approvals, approved.quorum), (1, 2));
+    assert!(approved.approved());
+    // A further approval after the quorum ⇒ refused.
+    assert_eq!(
+        client
+            .call(&approve_op("admin1", id, KeyOperation::RotateKrbtgt))
+            .unwrap(),
+        Reply::Refused(RefusalStatus::Denied)
+    );
+    // Complete before the fetch ⇒ refused.
+    assert_eq!(
+        client
+            .call(&keyadm(KeyadmRequest::Complete {
+                id,
+                outcome: KeyOperationOutcome::Performed { kvno: Some(2) },
+            }))
+            .unwrap(),
+        Reply::Refused(RefusalStatus::ApprovalRequired)
+    );
+    let fetched = match client
+        .call(&keyadm(KeyadmRequest::FetchApproved { id }))
+        .unwrap()
+    {
+        Reply::Approved(fetched) => fetched,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(fetched.id, id);
+    assert_eq!(fetched.digest, state.digest);
+    assert_eq!(fetched.operation, KeyOperation::RotateKrbtgt);
+    assert_eq!(fetched.principal, g(KRBTGT));
+    assert_eq!(fetched.requester, g(ADMIN1));
+    assert_eq!(fetched.approvers, vec![g(ADMIN2)]);
+    // Once only.
+    assert_eq!(
+        client
+            .call(&keyadm(KeyadmRequest::FetchApproved { id }))
+            .unwrap(),
+        Reply::Refused(RefusalStatus::Conflict)
+    );
+    // A rotation reports its new kvno: a report without one is refused.
+    assert_eq!(
+        client
+            .call(&keyadm(KeyadmRequest::Complete {
+                id,
+                outcome: KeyOperationOutcome::Performed { kvno: None },
+            }))
+            .unwrap(),
+        Reply::Refused(RefusalStatus::Invalid)
+    );
+    assert_eq!(
+        client
+            .call(&keyadm(KeyadmRequest::Complete {
+                id,
+                outcome: KeyOperationOutcome::Performed { kvno: Some(2) },
+            }))
+            .unwrap(),
+        Reply::Done
+    );
+    // The request is gone.
+    assert_eq!(
+        client
+            .call(&keyadm(KeyadmRequest::FetchApproved { id }))
+            .unwrap(),
+        Reply::Refused(RefusalStatus::NotFound)
+    );
+    assert_eq!(change_seq_next(&world.store), seq, "nothing written");
+
+    // The audit trail.
+    let requested = await_events(&world, DirAdminOperation::RequestKeyOperation, 1);
+    assert_eq!(decision(&requested[0]), PROCEED);
+    assert_eq!(requested[0].key_request, Some(id));
+    assert_eq!(
+        requested[0].key_operation,
+        Some(ipc_audit::KeydOperation::RotateKrbtgt)
+    );
+    assert_eq!(requested[0].target, Some(g(KRBTGT).to_packet()));
+    assert_eq!(requested[0].requester, Some(sid_value(&sid_of(ADMIN1))));
+    let approvals = await_events(&world, DirAdminOperation::Approve, 3);
+    assert_eq!(
+        decision(&approvals[0]),
+        refused(ipc_audit::AdminRefusal::OperationMismatch)
+    );
+    assert_eq!(decision(&approvals[1]), PROCEED);
+    assert_eq!(approvals[1].requester, Some(sid_value(&sid_of(ADMIN1))));
+    assert_eq!(
+        approvals[1].approvers.as_slice(),
+        &[sid_value(&sid_of(ADMIN2))]
+    );
+    assert_eq!(
+        decision(&approvals[2]),
+        refused(ipc_audit::AdminRefusal::ApproverNotDistinct)
+    );
+    let fetches = await_events(&world, DirAdminOperation::FetchApproved, 4);
+    assert_eq!(
+        fetches.iter().map(decision).collect::<Vec<_>>(),
+        vec![
+            refused(ipc_audit::AdminRefusal::NotApproved),
+            PROCEED,
+            refused(ipc_audit::AdminRefusal::Conflict),
+            refused(ipc_audit::AdminRefusal::PendingUnknown),
+        ]
+    );
+    let completes = await_events(&world, DirAdminOperation::Complete, 4);
+    assert_eq!(
+        decision(&completes[0]),
+        refused(ipc_audit::AdminRefusal::NotApproved)
+    );
+    assert_eq!(
+        decision(&completes[1]),
+        refused(ipc_audit::AdminRefusal::ValueInvalid)
+    );
+    assert_eq!(decision(&completes[2]), PROCEED);
+    assert_eq!(
+        completes[3].stage,
+        DirAdminStage::Outcome(OutcomeResult::Committed { allocated: None })
+    );
+    assert_eq!(completes[2].operation_id, completes[3].operation_id);
+    assert_eq!(completes[3].reported_kvnos.as_slice(), &[2]);
+    assert_eq!(completes[3].key_request, Some(id));
+    assert_eq!(completes[3].approvers.len(), 1);
+}
+
+/// docs/51 §6 (`rotate-key` of a service object's randomized key set):
+/// request → approve → fetch → complete for the LDAP service object; a
+/// computer that is not a service object, and a kvno 0 to retire, are
+/// refused at the request; keyadm's other outcomes are recorded in the
+/// `Outcome` event (task A10's appended codes, Q-421).
+#[test]
+fn rotate_key_request_approve_fetch_complete() {
+    let Some(world) = World::new(Options::default()) else {
+        return;
+    };
+    let mut client = world.client();
+    let rotate = KeyOperation::RotateKey {
+        service: g(LDAP_SVC),
+    };
+    let state = key_state(client.call(&request_op("admin1", rotate)).unwrap());
+    key_state(
+        client
+            .call(&approve_op("admin2", state.id, rotate))
+            .unwrap(),
+    );
+    let fetched = match client
+        .call(&keyadm(KeyadmRequest::FetchApproved { id: state.id }))
+        .unwrap()
+    {
+        Reply::Approved(fetched) => fetched,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(fetched.principal, g(LDAP_SVC));
+    assert_eq!(
+        client
+            .call(&keyadm(KeyadmRequest::Complete {
+                id: state.id,
+                outcome: KeyOperationOutcome::Performed { kvno: Some(2) },
+            }))
+            .unwrap(),
+        Reply::Done
+    );
+    // Not a service object (a user), and a kvno 0 to retire.
+    for operation in [
+        KeyOperation::RotateKey { service: g(BOB) },
+        KeyOperation::RetireKvno {
+            key: KeyRef::Krbtgt,
+            kvno: 0,
+        },
+    ] {
+        assert_eq!(
+            client.call(&request_op("admin1", operation)).unwrap(),
+            Reply::Refused(RefusalStatus::Invalid)
+        );
+    }
+    // retire_kvno of the krbtgt key set, reported refused by keyd.
+    let retire = KeyOperation::RetireKvno {
+        key: KeyRef::Krbtgt,
+        kvno: 1,
+    };
+    let state = key_state(client.call(&request_op("admin1", retire)).unwrap());
+    key_state(
+        client
+            .call(&approve_op("admin2", state.id, retire))
+            .unwrap(),
+    );
+    assert!(matches!(
+        client
+            .call(&keyadm(KeyadmRequest::FetchApproved { id: state.id }))
+            .unwrap(),
+        Reply::Approved(_)
+    ));
+    assert_eq!(
+        client
+            .call(&keyadm(KeyadmRequest::Complete {
+                id: state.id,
+                outcome: KeyOperationOutcome::OutcomeUnknown,
+            }))
+            .unwrap(),
+        Reply::Done
+    );
+    let completes = await_events(&world, DirAdminOperation::Complete, 4);
+    assert_eq!(
+        completes[1].stage,
+        DirAdminStage::Outcome(OutcomeResult::Committed { allocated: None })
+    );
+    assert_eq!(completes[1].target, Some(g(LDAP_SVC).to_packet()));
+    assert_eq!(
+        completes[3].stage,
+        DirAdminStage::Outcome(OutcomeResult::Failed(
+            ipc_audit::AdminFailure::KeyOperationOutcomeUnknown
+        ))
+    );
+    assert!(completes[3].reported_kvnos.is_empty());
+}
+
+/// docs/51 §5.6 (distinct, `decide` = Allow for the same Action and
+/// Resource); P-22: the requester cannot approve its own request; a usable
+/// account the PDP does not allow `PolicyAdmin` (bob, not Tier-0) is
+/// refused — as an approver and as a requester; an unverifiable approver
+/// AP-REQ is refused; nothing was approved, so nothing can be fetched.
+#[test]
+fn approvals_must_be_distinct_and_allowed() {
+    let Some(world) = World::new(Options::default()) else {
+        return;
+    };
+    let mut client = world.client();
+    let state = key_state(
+        client
+            .call(&request_op("admin1", KeyOperation::RotateKrbtgt))
+            .unwrap(),
+    );
+    assert_eq!(
+        client
+            .call(&approve_op("admin1", state.id, KeyOperation::RotateKrbtgt))
+            .unwrap(),
+        Reply::Refused(RefusalStatus::Denied)
+    );
+    assert_eq!(
+        client
+            .call(&approve_op("bob", state.id, KeyOperation::RotateKrbtgt))
+            .unwrap(),
+        Reply::Refused(RefusalStatus::Denied)
+    );
+    assert_eq!(
+        client
+            .call(&request_op("bob", KeyOperation::RotateKrbtgt))
+            .unwrap(),
+        Reply::Refused(RefusalStatus::Denied)
+    );
+    // An approver's AP-REQ that does not verify (expired ticket).
+    let expired = Request::Operation {
+        auth: Auth {
+            requester: ap_req("admin2", 999_001, common::kt("20261113090000Z")),
+            approvals: Vec::new(),
+        },
+        operation: Operation::Approve {
+            id: state.id,
+            operation: KeyOperation::RotateKrbtgt,
+        },
+    };
+    assert_eq!(
+        client.call(&expired).unwrap(),
+        Reply::Refused(RefusalStatus::Denied)
+    );
+    // One step, one AP-REQ: approvals inside a request are refused.
+    assert_eq!(
+        client
+            .call(&by(
+                "admin1",
+                &["admin2"],
+                Operation::RequestKeyOperation {
+                    operation: KeyOperation::RotateKrbtgt
+                }
+            ))
+            .unwrap(),
+        Reply::Refused(RefusalStatus::Invalid)
+    );
+    assert_eq!(
+        client
+            .call(&keyadm(KeyadmRequest::FetchApproved { id: state.id }))
+            .unwrap(),
+        Reply::Refused(RefusalStatus::ApprovalRequired)
+    );
+    let approvals = await_events(&world, DirAdminOperation::Approve, 3);
+    assert_eq!(
+        approvals.iter().map(decision).collect::<Vec<_>>(),
+        vec![
+            refused(ipc_audit::AdminRefusal::ApproverNotDistinct),
+            refused(ipc_audit::AdminRefusal::ApproverDenied),
+            refused(ipc_audit::AdminRefusal::ApproverUnauthenticated),
+        ]
+    );
+    // The PDP reason of the denied approver is recorded.
+    assert!(matches!(
+        approvals[1].pdp,
+        Some(ipc_audit::PdpReason {
+            code: ipc_audit::PdpReasonCode::NoGrant,
+            ..
+        })
+    ));
+    let requested = await_events(&world, DirAdminOperation::RequestKeyOperation, 3);
+    assert_eq!(
+        decision(&requested[1]),
+        refused(ipc_audit::AdminRefusal::PolicyDenied)
+    );
+    assert_eq!(
+        decision(&requested[2]),
+        refused(ipc_audit::AdminRefusal::ValueInvalid)
+    );
+}
+
+/// docs/51 §5.6 ("bounded in number and in time"): a request expires after
+/// its lifetime (dird's clock moved past it) — its approval is refused as
+/// unknown; the table holds at most `MAX_PENDING_KEY_REQUESTS` requests,
+/// one more is refused (`PendingLimit`, answered `Unavailable`) until one
+/// expires.
+#[test]
+fn pending_requests_are_bounded_in_time_and_number() {
+    let Some(world) = World::new(Options {
+        key_request_lifetime: Duration::from_secs(60),
+        ..Options::default()
+    }) else {
+        return;
+    };
+    let mut client = world.client();
+    let state = key_state(
+        client
+            .call(&request_op("admin1", KeyOperation::RotateKrbtgt))
+            .unwrap(),
+    );
+    world.clock_offset.store(61, Ordering::SeqCst);
+    assert_eq!(
+        client
+            .call(&approve_op("admin2", state.id, KeyOperation::RotateKrbtgt))
+            .unwrap(),
+        Reply::Refused(RefusalStatus::NotFound)
+    );
+    // Fill the table (the expired request was dropped).
+    for _ in 0..directory_admin::MAX_PENDING_KEY_REQUESTS {
+        key_state(
+            client
+                .call(&request_op("admin1", KeyOperation::RotateKrbtgt))
+                .unwrap(),
+        );
+    }
+    assert_eq!(
+        client
+            .call(&request_op("admin1", KeyOperation::RotateKrbtgt))
+            .unwrap(),
+        Reply::Refused(RefusalStatus::Unavailable)
+    );
+    // Once they expire, a request is accepted again.
+    world.clock_offset.store(122, Ordering::SeqCst);
+    key_state(
+        client
+            .call(&request_op("admin1", KeyOperation::RotateKrbtgt))
+            .unwrap(),
+    );
+    let approvals = await_events(&world, DirAdminOperation::Approve, 1);
+    assert_eq!(
+        decision(&approvals[0]),
+        refused(ipc_audit::AdminRefusal::PendingUnknown)
+    );
+    let n = directory_admin::MAX_PENDING_KEY_REQUESTS;
+    let requested = await_events(&world, DirAdminOperation::RequestKeyOperation, n + 3);
+    assert_eq!(
+        decision(&requested[n + 1]),
+        refused(ipc_audit::AdminRefusal::PendingLimit)
+    );
+    assert_eq!(decision(&requested[n + 2]), PROCEED);
+}
+
+/// docs/51 §5.6 ("a restart of dird ⇒ the requests vanish (fail closed)"):
+/// an approved request is gone after dird restarts — neither its fetch nor
+/// a further approval finds it.
+#[test]
+fn a_dird_restart_drops_pending_requests() {
+    let Some(mut world) = World::new(Options::default()) else {
+        return;
+    };
+    let id = {
+        let mut client = world.client();
+        let state = key_state(
+            client
+                .call(&request_op("admin1", KeyOperation::RotateKrbtgt))
+                .unwrap(),
+        );
+        key_state(
+            client
+                .call(&approve_op("admin2", state.id, KeyOperation::RotateKrbtgt))
+                .unwrap(),
+        );
+        state.id
+    };
+    // A restart happens at least a second later (the ids of a run start at
+    // its start's DSTIME seconds x 2^20, docs/questions/Q-388 item 4).
+    world.clock_offset.store(1, Ordering::SeqCst);
+    world.restart_dird();
+    let mut client = world.client();
+    assert_eq!(
+        client
+            .call(&keyadm(KeyadmRequest::FetchApproved { id }))
+            .unwrap(),
+        Reply::Refused(RefusalStatus::NotFound)
+    );
+    // The ids of the new run do not reuse the old one.
+    let state = key_state(
+        client
+            .call(&request_op("admin1", KeyOperation::RotateKrbtgt))
+            .unwrap(),
+    );
+    assert_ne!(state.id, id);
+    let fetches = await_events(&world, DirAdminOperation::FetchApproved, 1);
+    assert_eq!(
+        decision(&fetches[0]),
+        refused(ipc_audit::AdminRefusal::PendingUnknown)
+    );
+}
+
+/// docs/51 §6, §9 (`destroy-sweep`: the tombstones of user / computer
+/// objects, GUID + classes — A-18): after a `Delete` of bob, the listing
+/// names him as a user; a group or OU tombstone is not listed; the listing
+/// is audited.
+#[test]
+fn the_pending_destruction_listing_names_deleted_accounts() {
+    let Some(world) = World::new(Options::default()) else {
+        return;
+    };
+    let mut client = world.client();
+    let page = |client: &mut AdminClient<AdminConnector>| match client
+        .call(&keyadm(KeyadmRequest::ListPendingDestruction {
+            cursor: None,
+        }))
+        .unwrap()
+    {
+        Reply::PendingDestruction(page) => page,
+        other => panic!("{other:?}"),
+    };
+    assert!(page(&mut client).entries.is_empty());
+    assert_eq!(
+        client
+            .call(&by("admin1", &[], Operation::Delete { target: g(BOB) }))
+            .unwrap(),
+        Reply::Done
+    );
+    assert_eq!(
+        client
+            .call(&by(
+                "admin1",
+                &[],
+                Operation::Delete {
+                    target: g(STAFF_GROUP)
+                }
+            ))
+            .unwrap(),
+        Reply::Done
+    );
+    let listed = page(&mut client);
+    assert_eq!(
+        listed.entries,
+        vec![ipc_dird_admin::DestructionEntry {
+            guid: g(BOB),
+            kind: AccountKind::User,
+        }]
+    );
+    assert_eq!(listed.next, None);
+    let events = await_events(&world, DirAdminOperation::ListPendingDestruction, 2);
+    assert!(events.iter().all(|e| decision(e) == PROCEED));
 }

@@ -235,6 +235,7 @@ dependencies = [
  "keyd-types",
  "krb-proto",
  "pdp",
+ "sha2",
 ]
 
 [[package]]
@@ -602,16 +603,30 @@ dependencies = [
 name = "keyadm"
 version = "0.0.0"
 dependencies = [
+ "ad-schema",
+ "admin-daemon",
+ "audit-daemon",
+ "audit-log",
  "config",
  "daemon-sandbox",
+ "directory-admin",
+ "directory-daemon",
+ "directory-pip",
+ "dirstore",
  "dtyp",
  "ipc",
+ "ipc-admin",
  "ipc-audit",
+ "ipc-dird-admin",
+ "ipc-directory",
  "ipc-keyd",
+ "kdc",
  "keyd",
  "keyd-daemon",
  "keyd-types",
+ "krb-crypto",
  "krb-proto",
+ "pdp",
  "provision-manifest",
  "tokio",
  "zeroize",

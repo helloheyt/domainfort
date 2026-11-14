@@ -46,6 +46,23 @@
 //! Every refusal sends its event (into the reserved slot) before the reply.
 //! AP-REQ octets are never logged; the thread logs fixed notes only.
 //!
+//! # The key-plane steps (task A10; docs/51 §5.6, §6)
+//!
+//! `RequestKeyOperation`, `Approve` (each with exactly one AP-REQ — the
+//! requester's, the approver's) and keyadm's `FetchApproved`, `Complete`,
+//! `ListPendingDestruction` (no AP-REQ: admind forwards them only from
+//! `keyadm_uid`) act on the pending requests this thread holds **in
+//! memory** (`directory_admin::KeyRequests`; a dird restart drops them):
+//! 0. `now`; the audit slots — two for `Complete` (its decision, keyd's
+//!    outcome as reported), one otherwise — all or none, auditd reachable;
+//! 1. the AP-REQ through keyd, for a step that carries one;
+//! 2. one view (no `WriteTxn`: nothing of the directory is written);
+//! 3. `DirectoryAdmin::key_step` — the Subject, `PolicyAdmin` on the `keys`
+//!    scope, the obligations honoured before the table changes, the step;
+//! 4. its events committed into the reserved slots before the reply (they
+//!    commit nothing to the directory: no acknowledgement wait — Q-340
+//!    item 1, the LDAP rule).
+//!
 //! # The three events the PEP does not plan
 //!
 //! Each has its own code, appended to ipc-audit's closed tables by task F4
@@ -63,7 +80,10 @@
 //! (docs/questions/Q-358 items 1, 7); docs/50 R50-7, §3.6; docs/questions/
 //! Q-388; A-88 (Q-366, Q-395); A-91 (Q-397); docs/11 §2, §8.
 
-use crate::admin_service::{pep_operation, wire_reply, wire_status, TicketVerifier};
+use crate::admin_service::{
+    key_request_of, keyadm_request, pep_operation, wire_key_reply, wire_reply, wire_status,
+    TicketVerifier,
+};
 use crate::clock::SharedClock;
 use crate::engine::{EngineError, EngineThread, OnExit, SubmitError};
 use crate::ldap_audit::AuditGate;
@@ -71,8 +91,8 @@ use crate::log::{Note, Thinned};
 use crate::rate::ObligationLimiter;
 use core::time::Duration;
 use directory_admin::{
-    DirectoryAdmin, Operation as PepOperation, OsRandom, Prepared, Request as PepRequest,
-    VerificationFailure, VerifiedTicket,
+    DirectoryAdmin, KeyAdminOperation, KeyRequests, Operation as PepOperation, OsRandom, Prepared,
+    Request as PepRequest, VerificationFailure, VerifiedTicket,
 };
 use directory_pip::{DirectoryContext, TierMap};
 use dirstore::{Store, WriteTxn};
@@ -80,7 +100,7 @@ use ipc_audit::{
     AdminFailure, AdminRefusal, DecisionResult, DirAdminEvent, DirAdminStage, OutcomeResult,
     Reservation,
 };
-use ipc_dird_admin::{Auth, Operation, RefusalStatus, Reply};
+use ipc_dird_admin::{Auth, KeyadmRequest, Operation, RefusalStatus, Reply};
 use keyd_types::{AuthnError, KeyHandle};
 use krb_proto::KerberosTime;
 use ldap::RateLimiter;
@@ -103,11 +123,25 @@ static OUTCOME_UNRECORDED: Thinned = Thinned::new(Note::AdminOutcomeUnrecorded);
 /// second it lasted. Project choice (docs/questions/Q-388 item 4).
 const OPERATION_ID_SHIFT: u32 = 20;
 
+/// What a job asks of the admin thread.
+/// Spec: docs/51 §6, §7.3.
+pub(crate) enum AdminWork {
+    /// An operation with its tickets (`auth`).
+    Operation {
+        /// The raw AP-REQs.
+        auth: Auth,
+        /// The operation.
+        operation: Operation,
+    },
+    /// A keyadm request (no tickets; admind forwards it only from
+    /// `keyadm_uid`, docs/51 §6).
+    Keyadm(KeyadmRequest),
+}
+
 /// One job for the admin thread.
 /// Spec: docs/51 §7.5; docs/50 R50-7.
 pub(crate) struct AdminJob {
-    auth: Auth,
-    operation: Operation,
+    work: AdminWork,
     reply: oneshot::Sender<Reply>,
 }
 
@@ -121,17 +155,9 @@ impl AdminEngineHandle {
     /// Queue one request without waiting: a full queue is
     /// [`SubmitError::Busy`].
     /// Spec: docs/51 §7.5 ("full ⇒ `Busy`"); docs/50 R50-7.
-    pub(crate) fn submit(
-        &self,
-        auth: Auth,
-        operation: Operation,
-    ) -> Result<oneshot::Receiver<Reply>, SubmitError> {
+    pub(crate) fn submit(&self, work: AdminWork) -> Result<oneshot::Receiver<Reply>, SubmitError> {
         let (reply, answer) = oneshot::channel();
-        match self.queue.try_send(AdminJob {
-            auth,
-            operation,
-            reply,
-        }) {
+        match self.queue.try_send(AdminJob { work, reply }) {
             Ok(()) => Ok(answer),
             Err(TrySendError::Full(_)) => Err(SubmitError::Busy),
             Err(TrySendError::Disconnected(_)) => Err(SubmitError::Stopped),
@@ -162,6 +188,8 @@ pub(crate) struct AdminWorker {
     pub(crate) clock: SharedClock,
     /// How long a decision event may wait for its acknowledgement.
     pub(crate) ack_deadline: Duration,
+    /// The pending key-operation requests (memory only; docs/51 §5.6).
+    pub(crate) key_requests: KeyRequests,
 }
 
 /// The running state of the admin thread.
@@ -252,6 +280,21 @@ impl Running {
         }
     }
 
+    /// The one AP-REQ of a key-plane step (the requester's or the
+    /// approver's), through keyd.
+    /// Spec: docs/51 §7.4 step 1; A-26; A-56; A-73.
+    fn verify_one(&mut self, ap_req: &[u8]) -> Result<VerifiedTicket, VerificationFailure> {
+        let service = self.worker.service;
+        self.worker
+            .verifier
+            .verify(&service, ap_req)
+            .map(|context| VerifiedTicket::from_service_context(&context))
+            .map_err(|e| match e {
+                AuthnError::Unavailable => VerificationFailure::KeydUnavailable,
+                _ => VerificationFailure::Requester,
+            })
+    }
+
     /// Step 1: the requester's AP-REQ, then each approval's, through keyd.
     /// Spec: docs/51 §7.4 step 1; A-26; A-56; A-73.
     fn verify(
@@ -294,22 +337,12 @@ impl Running {
         operation: &PepOperation,
         now: &KerberosTime,
     ) -> bool {
-        for obligation in prepared.obligations() {
-            match obligation {
-                Obligation::RateLimit(key) => {
-                    if !self.rate.admit(key, now) {
-                        return false;
-                    }
-                }
-                Obligation::Constrain(Constraint::MaxPageSize(size)) => {
-                    if *size == 0 && matches!(operation, PepOperation::Lookup(_)) {
-                        return false;
-                    }
-                }
-                Obligation::Audit => {}
-            }
-        }
-        true
+        honour_obligations(
+            &mut self.rate,
+            prepared.obligations(),
+            matches!(operation, PepOperation::Lookup(_)),
+            now,
+        )
     }
 
     /// The decision event of a request whose `WriteTxn` could not begin or
@@ -331,10 +364,143 @@ impl Running {
         restage(base.event(), VIEW_UNAVAILABLE)
     }
 
-    /// One request (module documentation).
+    /// One job: a key-plane step, or an operation on the directory.
+    /// Spec: docs/51 §5.6, §6, §7.3, §7.4.
+    fn handle(&mut self, work: &AdminWork) -> Reply {
+        match work {
+            AdminWork::Keyadm(request) => self.handle_key(None, keyadm_request(request)),
+            AdminWork::Operation { auth, operation } => match key_request_of(operation) {
+                Some(request) => self.handle_key(Some(auth), request),
+                None => match pep_operation(operation) {
+                    Some(operation) => self.handle_directory(auth, operation),
+                    // Cannot happen: every other operation maps.
+                    None => Reply::Refused(RefusalStatus::Unavailable),
+                },
+            },
+        }
+    }
+
+    /// One key-plane step (module documentation, "The key-plane steps").
+    /// Spec: docs/51 §5.6, §6, §7.4; A-85; A-89; docs/11 §2.
+    fn handle_key(&mut self, auth: Option<&Auth>, request: KeyAdminOperation) -> Reply {
+        let Some(now) = self.worker.clock.now() else {
+            return Reply::Refused(RefusalStatus::Unavailable);
+        };
+        // Step 0: the audit slots, before anything is done.
+        let Some(slots) = self.worker.gate.admit_slots(request.audit_events()) else {
+            AUDIT_UNAVAILABLE.hit(None);
+            return Reply::Refused(RefusalStatus::Unavailable);
+        };
+        let mut slots = slots.into_iter();
+        let first = slots.next();
+        let second = slots.next();
+        let operation_id = self.next_id();
+
+        // Step 1: the step's one AP-REQ (keyadm's steps carry none).
+        let ticket = match (request.takes_ticket(), auth) {
+            (false, _) => None,
+            (true, Some(auth)) => match self.verify_one(&auth.requester) {
+                Ok(ticket) => Some(ticket),
+                Err(failure) => {
+                    let refusal = self.worker.admin.refuse_unverified_key(
+                        operation_id,
+                        &request,
+                        failure,
+                        &now,
+                    );
+                    return self.refuse(
+                        first,
+                        second,
+                        refusal.event(),
+                        wire_status(refusal.status()),
+                    );
+                }
+            },
+            // Cannot happen: such a request always arrives with `auth`.
+            (true, None) => {
+                let refusal = self.worker.admin.refuse_unverified_key(
+                    operation_id,
+                    &request,
+                    VerificationFailure::Requester,
+                    &now,
+                );
+                return self.refuse(
+                    first,
+                    second,
+                    refusal.event(),
+                    wire_status(refusal.status()),
+                );
+            }
+        };
+        let approvals_supplied = auth.map_or(0, |a| a.approvals.len());
+
+        // Steps 2-3: one view (nothing is written), then the step.
+        let store = Arc::clone(&self.worker.store);
+        let step = {
+            let Running { worker, rate, .. } = self;
+            match worker.ctx.view(&store, &worker.tiers) {
+                Ok(view) => {
+                    let mut honour = |obligations: &[Obligation]| {
+                        honour_obligations(rate, obligations, false, &now)
+                    };
+                    Some(worker.admin.key_step(
+                        &mut worker.key_requests,
+                        operation_id,
+                        &request,
+                        ticket.as_ref(),
+                        approvals_supplied,
+                        &view,
+                        &worker.policy,
+                        &now,
+                        &mut honour,
+                    ))
+                }
+                Err(_) => None,
+            }
+        };
+        match step {
+            None => {
+                let refusal = self.worker.admin.refuse_failed_key(
+                    operation_id,
+                    &request,
+                    AdminFailure::ViewUnavailable,
+                    &now,
+                );
+                self.refuse(first, second, refusal.event(), RefusalStatus::Unavailable)
+            }
+            Some(Err(refusal)) => self.refuse(
+                first,
+                second,
+                refusal.event(),
+                wire_status(refusal.status()),
+            ),
+            // Step 4: the events into their slots, then the reply.
+            Some(Ok(step)) => {
+                let mut slots = [first, second].into_iter();
+                let mut recorded = true;
+                for event in step.events() {
+                    if self.commit(slots.next().flatten(), event).is_none() {
+                        recorded = false;
+                    }
+                }
+                for unused in slots {
+                    self.release(unused);
+                }
+                if recorded {
+                    wire_key_reply(step.reply())
+                } else {
+                    // Cannot happen (the slots were reserved); no answer
+                    // leaves unaudited.
+                    OUTCOME_UNRECORDED.hit(None);
+                    Reply::Refused(RefusalStatus::Unavailable)
+                }
+            }
+        }
+    }
+
+    /// One operation on the directory (module documentation).
     /// Spec: docs/51 §7.4; A-85; A-89.
-    fn handle(&mut self, auth: &Auth, operation: &Operation) -> Reply {
-        let operation = pep_operation(operation);
+    fn handle_directory(&mut self, auth: &Auth, operation: PepOperation) -> Reply {
         let Some(now) = self.worker.clock.now() else {
             return Reply::Refused(RefusalStatus::Unavailable);
         };
@@ -473,6 +639,36 @@ impl Running {
     }
 }
 
+/// The obligations of an Allow: `RateLimit` through the same fixed-window
+/// limiter (and constants) as the LDAP engine's; `Constrain(MaxPageSize)` is
+/// met by every admin answer (at most one entry) unless it is 0 for a
+/// `Lookup`. `false` ⇒ refused.
+/// Spec: docs/11 §2 ("the PEP must honour obligations"), §8;
+/// docs/questions/Q-358 item 7, Q-388 item 2.
+fn honour_obligations(
+    rate: &mut ObligationLimiter,
+    obligations: &[Obligation],
+    lookup: bool,
+    now: &KerberosTime,
+) -> bool {
+    for obligation in obligations {
+        match obligation {
+            Obligation::RateLimit(key) => {
+                if !rate.admit(key, now) {
+                    return false;
+                }
+            }
+            Obligation::Constrain(Constraint::MaxPageSize(size)) => {
+                if *size == 0 && lookup {
+                    return false;
+                }
+            }
+            Obligation::Audit => {}
+        }
+    }
+    true
+}
+
 /// Abort a transaction (nothing of it is committed; a failure to abort
 /// leaves nothing committed either — the transaction is dropped).
 /// Spec: dirstore `WriteTxn::abort`; A-83 ("abort the transaction when the
@@ -520,13 +716,9 @@ impl AdminWorker {
             .spawn(move || {
                 let _exit = OnExit(Some(on_exit));
                 while let Ok(job) = jobs.recv() {
-                    let AdminJob {
-                        auth,
-                        operation,
-                        reply,
-                    } = job;
-                    let answer = running.handle(&auth, &operation);
-                    drop(auth);
+                    let AdminJob { work, reply } = job;
+                    let answer = running.handle(&work);
+                    drop(work);
                     // The connection may be gone; its answer is dropped.
                     let _ = reply.send(answer);
                 }

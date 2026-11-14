@@ -153,3 +153,36 @@ fn errors_do_not_echo_values() {
     assert!(!err.to_string().contains("SECRET-LOOKING-VALUE"), "{err}");
     assert_eq!(err.key(), Some("keyd_socket"));
 }
+
+/// Task A10 (docs/51 §6: keyadm sends `FetchApproved` / `Complete` /
+/// `ListPendingDestruction` to `admin.sock`; docs/50 R50-3: the client
+/// checks the server's uid): `admin_socket` + `admind_uid` are an optional
+/// pair — absent ⇒ none; both ⇒ the endpoint; one alone ⇒ `IncompletePair`;
+/// the uid never 0 and distinct from keyd's; the path distinct from keyd's
+/// socket (Q-230 item 6, A-60).
+#[test]
+fn the_admind_endpoint_is_an_optional_pair() {
+    let settings = KeyadmSettings::parse(SAMPLE.as_bytes()).unwrap();
+    assert!(settings.admind().is_none());
+    let both = format!("{SAMPLE}admin_socket = /run/test-admind/admin.sock\nadmind_uid = 4105\n");
+    let settings = KeyadmSettings::parse(both.as_bytes()).unwrap();
+    let admind = settings.admind().unwrap();
+    assert_eq!(admind.socket().as_str(), "/run/test-admind/admin.sock");
+    assert_eq!(admind.uid(), 4105);
+    for (line, key) in [
+        ("admin_socket = /run/test-admind/admin.sock", "admin_socket"),
+        ("admind_uid = 4105", "admind_uid"),
+    ] {
+        let text = format!("{SAMPLE}{line}\n");
+        let err = KeyadmSettings::parse(text.as_bytes()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::IncompletePair, "{line}");
+        assert_eq!(err.key(), Some(key));
+    }
+    let root = format!("{SAMPLE}admin_socket = /run/test-admind/admin.sock\nadmind_uid = 0\n");
+    assert_eq!(kind(&root), ErrorKind::ReservedId);
+    let same_uid =
+        format!("{SAMPLE}admin_socket = /run/test-admind/admin.sock\nadmind_uid = 4101\n");
+    assert!(KeyadmSettings::parse(same_uid.as_bytes()).is_err());
+    let same_path = format!("{SAMPLE}admin_socket = /run/test-keyd/keyd.sock\nadmind_uid = 4105\n");
+    assert!(KeyadmSettings::parse(same_path.as_bytes()).is_err());
+}

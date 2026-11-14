@@ -220,6 +220,7 @@ pub fn params(settings: &AdmindSettings) -> Result<DaemonParams, StartupError> {
         },
         frame_timeout: settings.frame_timeout(),
         min_password_length: settings.min_password_length(),
+        keyadm_uid: settings.keyadm_uid(),
         dird,
         keyd,
         limits: Limits::DEFAULT,

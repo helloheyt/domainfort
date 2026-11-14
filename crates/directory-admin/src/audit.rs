@@ -26,8 +26,8 @@ use dtyp::{Guid, Sid};
 use ipc_audit::{
     AccountExpiresValue, AdminFailure, AdminNameKind, AdminRefusal, Allocation, AuditText,
     BoundedSeq, CalendarTime, DecisionResult, DirAdminEvent, DirAdminOperation, DirAdminStage,
-    EnableDirection, GroupTypeCode, OutcomeResult, PdpReason, PdpReasonCode, SidValue, TargetName,
-    MAX_APPROVERS, MAX_REPORTED_KVNOS, MAX_TARGET_NAMES,
+    EnableDirection, GroupTypeCode, KeydOperation, OutcomeResult, PdpReason, PdpReasonCode,
+    SidValue, TargetName, MAX_APPROVERS, MAX_REPORTED_KVNOS, MAX_TARGET_NAMES,
 };
 use krb_proto::KerberosTime;
 
@@ -70,13 +70,26 @@ impl Stop {
     pub(crate) fn status(self) -> RefusalStatus {
         match self {
             Stop::Refused(refusal) => match refusal {
-                AdminRefusal::ApprovalRequired => RefusalStatus::ApprovalRequired,
-                AdminRefusal::NotFound | AdminRefusal::NotVisible => RefusalStatus::NotFound,
+                // A key operation fetched before its approvals reach the
+                // quorum (task A10).
+                AdminRefusal::ApprovalRequired | AdminRefusal::NotApproved => {
+                    RefusalStatus::ApprovalRequired
+                }
+                // An unknown or expired pending key-operation request is
+                // "not found" too (task A10, docs/questions/Q-421).
+                AdminRefusal::NotFound | AdminRefusal::NotVisible | AdminRefusal::PendingUnknown => {
+                    RefusalStatus::NotFound
+                }
                 AdminRefusal::AccountNameInvalid
                 | AdminRefusal::ValueInvalid
-                | AdminRefusal::MembershipInvalid => RefusalStatus::Invalid,
+                | AdminRefusal::MembershipInvalid
+                | AdminRefusal::OperationMismatch => RefusalStatus::Invalid,
                 AdminRefusal::Conflict => RefusalStatus::Conflict,
-                AdminRefusal::RidExhausted => RefusalStatus::Unavailable,
+                // The bounded pending table is full: retrying later (after a
+                // request expires or completes) may succeed (task A10).
+                AdminRefusal::RidExhausted | AdminRefusal::PendingLimit => {
+                    RefusalStatus::Unavailable
+                }
                 AdminRefusal::Unauthenticated
                 | AdminRefusal::TicketAge
                 | AdminRefusal::PolicyDenied
@@ -84,10 +97,10 @@ impl Stop {
                 | AdminRefusal::ApproverNotDistinct
                 | AdminRefusal::ApproverDenied
                 | AdminRefusal::TargetProtected
-                | AdminRefusal::PendingUnknown
-                | AdminRefusal::PendingLimit
-                | AdminRefusal::NotApproved
                 | AdminRefusal::SelfLockout
+                // Recorded in a `Complete`'s outcome event only; never a
+                // refusal of a request (task A10).
+                | AdminRefusal::KeyOperationRefused
                 // Not planned by this crate: dird refuses an obligation it
                 // cannot honour after `prepare`, answering `Denied` as for a
                 // PDP deny (docs/questions/Q-388 item 2, Q-397; A-91).
@@ -173,7 +186,9 @@ pub(crate) struct EventBase {
     enable: Option<EnableDirection>,
     account_expires: Option<AccountExpiresValue>,
     group_type: Option<GroupTypeCode>,
-    reported_kvnos: Vec<u32>,
+    pub(crate) key_request: Option<u64>,
+    pub(crate) key_operation: Option<KeydOperation>,
+    pub(crate) reported_kvnos: Vec<u32>,
 }
 
 /// One name of the request, kept by the `AuditText` rule.
@@ -190,21 +205,7 @@ impl EventBase {
     /// and the three request values A-85 records.
     /// Spec: crate ipc-audit `DirAdminEvent` field list; Q-340 items 4-5.
     pub(crate) fn of_request(operation_id: u64, op: &Operation) -> EventBase {
-        let mut base = EventBase {
-            operation_id,
-            operation: op.code(),
-            target: None,
-            parent: None,
-            member: None,
-            requester: None,
-            approvers: Vec::new(),
-            pdp: None,
-            names: Vec::new(),
-            enable: None,
-            account_expires: None,
-            group_type: None,
-            reported_kvnos: Vec::new(),
-        };
+        let mut base = EventBase::bare(operation_id, op.code());
         match op {
             Operation::CreateUser(c) => {
                 base.parent = Some(c.parent);
@@ -275,6 +276,29 @@ impl EventBase {
         base
     }
 
+    /// An event base with only the operation number and code (every other
+    /// field empty): a key-operation step fills its own fields (task A10).
+    /// Spec: crate ipc-audit `DirAdminEvent` field list.
+    pub(crate) fn bare(operation_id: u64, operation: DirAdminOperation) -> EventBase {
+        EventBase {
+            operation_id,
+            operation,
+            target: None,
+            parent: None,
+            member: None,
+            requester: None,
+            approvers: Vec::new(),
+            pdp: None,
+            names: Vec::new(),
+            enable: None,
+            account_expires: None,
+            group_type: None,
+            key_request: None,
+            key_operation: None,
+            reported_kvnos: Vec::new(),
+        }
+    }
+
     /// Build the event of `stage`, recorded at `now`. A bounded field that
     /// would overflow its bound (never, by construction) is left empty.
     fn event(&self, now: &KerberosTime, stage: DirAdminStage) -> DirAdminEvent {
@@ -301,8 +325,8 @@ impl EventBase {
             enable: self.enable,
             account_expires: self.account_expires,
             group_type: self.group_type,
-            key_request: None,
-            key_operation: None,
+            key_request: self.key_request,
+            key_operation: self.key_operation,
             reported_kvnos: BoundedSeq::new(kvnos).unwrap_or_default(),
         }
     }
@@ -310,6 +334,12 @@ impl EventBase {
     /// The `Decision` event: proceed.
     pub(crate) fn proceed(&self, now: &KerberosTime) -> DirAdminEvent {
         self.event(now, DirAdminStage::Decision(DecisionResult::Proceed))
+    }
+
+    /// The event of an explicit `stage` (a `Complete`'s `Outcome`, task
+    /// A10).
+    pub(crate) fn staged(&self, now: &KerberosTime, stage: DirAdminStage) -> DirAdminEvent {
+        self.event(now, stage)
     }
 
     /// The refusal of `prepare`: a `Decision` event.

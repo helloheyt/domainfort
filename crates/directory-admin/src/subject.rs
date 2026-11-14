@@ -20,7 +20,7 @@ use core::time::Duration;
 use std::collections::BTreeMap;
 
 use directory_pip::DirectoryView;
-use dtyp::Sid;
+use dtyp::{Guid, Sid};
 use kdc::AccountSource;
 use keyd_types::ServiceContext;
 use krb_proto::{KerberosTime, PrincipalName, Realm};
@@ -72,6 +72,7 @@ pub enum SubjectError {
 pub struct AdminSubject {
     subject: Subject,
     ticket_age: Duration,
+    guid: Guid,
 }
 
 impl AdminSubject {
@@ -108,6 +109,9 @@ impl AdminSubject {
             return Err(SubjectError::NotUsable);
         }
         let ticket_age = time::ticket_age(now, authtime);
+        // The account's objectGUID: the principal id of its key set handle
+        // (docs/47 §1.3: the handle is `(objectGUID, PrincipalLongterm)`).
+        let guid = Guid::from_packet(account.key.principal.as_bytes());
         Ok(AdminSubject {
             subject: Subject {
                 principal: account.sid,
@@ -122,7 +126,16 @@ impl AdminSubject {
                 tier: account.tier,
             },
             ticket_age,
+            guid,
         })
+    }
+
+    /// The account's objectGUID — what keyd's `DualControlToken` names an
+    /// approver by (crates/keyd-types model.rs; docs/51 §6). Spec: docs/47
+    /// §1.3 (the key handle's principal is the objectGUID).
+    #[must_use]
+    pub fn guid(&self) -> Guid {
+        self.guid
     }
 
     /// The Subject for `pdp::decide`.

@@ -74,11 +74,12 @@ use crate::record;
 use crate::schema::{AttributeDefinition, Link, Schema};
 use crate::types::{
     AttrId, Attribute, AttributeChange, ChildCursor, ChildPage, ClassId, CounterState, NewObject,
-    Object, Origin, StampedValue, Timestamp, Tombstone,
+    Object, Origin, StampedValue, Timestamp, Tombstone, TombstonePage,
 };
 use crate::{
     MAX_ATTRIBUTES_PER_OBJECT, MAX_CHILDREN_PER_PAGE, MAX_CLASSES_PER_OBJECT, MAX_RDN_KEY_LEN,
-    MAX_RECORD_BODY_LEN, MAX_VALUES_PER_ATTRIBUTE, MAX_VALUE_LEN,
+    MAX_RECORD_BODY_LEN, MAX_TOMBSTONES_PER_PAGE, MAX_TOMBSTONE_SCAN, MAX_VALUES_PER_ATTRIBUTE,
+    MAX_VALUE_LEN,
 };
 use core::num::NonZeroU64;
 use dtyp::{Guid, GUID_PACKET_LEN};
@@ -269,6 +270,36 @@ impl Snapshot<'_> {
         let names = self.txn.open_table(NAME_INDEX_TABLE)?;
         let objects = self.txn.open_table(OBJECT_TABLE)?;
         lookup_child(&names, &objects, &self.store.key, parent, rdn_value)
+    }
+
+    /// One page of the store's tombstones, ascending by GUID packet,
+    /// starting strictly after `after` (or at the first record, for `None`)
+    /// — the source of keyadm's `destroy-sweep` (docs/51 §6, §9: phase 1
+    /// never purges tombstones, so a sweep sees every deleted object).
+    ///
+    /// **Bounded.** `limit` 0 is refused ([`Violation::PageLimitZero`]); a
+    /// `limit` above [`crate::MAX_TOMBSTONES_PER_PAGE`] is capped to it. One
+    /// call examines at most [`crate::MAX_TOMBSTONE_SCAN`] object records,
+    /// however few of them are tombstones, and stops early once `limit`
+    /// tombstones were found. When records remain unexamined,
+    /// [`TombstonePage::next`] names the last record examined: pass it as
+    /// `after` to continue (a page may then hold fewer than `limit`
+    /// tombstones, even none).
+    ///
+    /// **Authenticated.** Every record examined — live or tombstone — has
+    /// its tag verified and is decoded within its bounds; a tombstone is
+    /// checked on the tombstone validation path before it is returned
+    /// (exactly as [`Snapshot::get_tombstone`]). Any failure fails the whole
+    /// call: nothing partial is returned.
+    ///
+    /// A tombstone is GUID + classes + deletion stamp only (A-18): nothing
+    /// else of the deleted object is read or returned.
+    ///
+    /// Spec: docs/51 §6, §9; docs/29 §5; docs/32 §3 (D135), §6 (D39), §8;
+    /// Q-062 / A-18.
+    pub fn tombstones(&self, after: Option<Guid>, limit: usize) -> Result<TombstonePage> {
+        let objects = self.txn.open_table(OBJECT_TABLE)?;
+        list_tombstones(&objects, self.store, after, limit)
     }
 
     /// One page of the live children of `parent` — or of the naming-context
@@ -1143,6 +1174,68 @@ fn get_live<T: ReadableTable<Raw, Raw>>(
         }
         None => Ok(None),
     }
+}
+
+/// One page of tombstones (see [`Snapshot::tombstones`]).
+/// Spec: docs/51 §6, §9; docs/29 §5; docs/32 §3, §8; A-18.
+fn list_tombstones<T: ReadableTable<Raw, Raw>>(
+    objects: &T,
+    store: &Store,
+    after: Option<Guid>,
+    limit: usize,
+) -> Result<TombstonePage> {
+    // The arguments are checked before any storage work. Spec: docs/32 §8.
+    if limit == 0 {
+        return Err(Error::Rejected(Violation::PageLimitZero));
+    }
+    let limit = limit.min(MAX_TOMBSTONES_PER_PAGE);
+    // Keys compare as byte strings and every key is a 16-octet GUID packet,
+    // so the smallest key above `after` is its packet followed by one 0x00
+    // octet: the scan resumes strictly after the cursor (the rule of the
+    // children listing). Spec: docs/32 §2 (objects by GUID).
+    let start: Vec<u8> = match after {
+        None => Vec::new(),
+        Some(guid) => {
+            let mut start = guid.to_packet().to_vec();
+            start.push(0x00);
+            start
+        }
+    };
+    let mut tombstones = Vec::new();
+    let mut examined = 0usize;
+    let mut last: Option<Guid> = None;
+    let mut entries = objects.range::<&[u8]>(start.as_slice()..)?;
+    for entry in entries.by_ref() {
+        let (k, v) = entry?;
+        let record_key = k.value();
+        let guid = Guid::decode(record_key).map_err(|_| Error::Tamper(RecordKind::Object))?;
+        // Tag first, then the bounded decode. Spec: docs/32 §3; D135.
+        let body = integrity::open(&store.key, RecordKind::Object, record_key, v.value())?;
+        let obj = record::decode_object_body(guid, body)
+            .map_err(|e| Error::RecordMalformed(RecordKind::Object, e))?;
+        if let Some(deletion) = obj.tombstone {
+            store
+                .schema
+                .validate_tombstone(&obj)
+                .map_err(Error::StoredObjectRejected)?;
+            tombstones.push(Tombstone {
+                guid: obj.guid,
+                classes: obj.classes,
+                deletion,
+            });
+        }
+        examined += 1;
+        last = Some(guid);
+        if tombstones.len() >= limit || examined >= MAX_TOMBSTONE_SCAN {
+            break;
+        }
+    }
+    // More records follow the last one examined: the caller continues.
+    let next = match last {
+        Some(guid) if entries.next().is_some() => Some(guid),
+        _ => None,
+    };
+    Ok(TombstonePage { tombstones, next })
 }
 
 /// A tombstone, checked on the tombstone validation path (never the

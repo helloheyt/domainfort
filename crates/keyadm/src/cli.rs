@@ -1,26 +1,70 @@
-//! The command line: `keyadm <configuration file> ceremony <manifest file>`.
+//! The command line:
+//!
+//! ```text
+//! keyadm <configuration file> ceremony <manifest file>
+//! keyadm <configuration file> rotate-krbtgt <request id>
+//! keyadm <configuration file> rotate-key <request id>
+//! keyadm <configuration file> retire-kvno <request id>
+//! keyadm <configuration file> destroy-sweep
+//! ```
 //!
 //! The configuration file comes first, as every daemon of this project takes
 //! its configuration path as its argument (crates/keyd-daemon
 //! `keyd-daemon <configuration file>`); then the command and its operand
-//! (docs/51 §6: `ceremony <manifest>`). Exactly three arguments; the command
-//! is matched exactly; there are no options. No secret is ever an argument
-//! (docs/51 §3, citing D95: "no secrets in argv/env") — keyadm has none.
+//! (docs/51 §6: `ceremony <manifest>`, `rotate-key`, `rotate-krbtgt`,
+//! `retire-kvno`, `destroy-sweep`). The three commands that execute an
+//! approved request name it by the id dird gave it (docs/51 §6:
+//! `FetchApproved {id}`) — the operation itself (which key set, which kvno)
+//! comes from dird, as it was approved, never from the command line. The
+//! command is matched exactly; there are no options. No secret is ever an
+//! argument (docs/51 §3, citing D95: "no secrets in argv/env") — keyadm has
+//! none.
 //!
-//! This task builds `ceremony` only. `destroy-sweep`, `rotate-key`,
-//! `rotate-krbtgt` and `retire-kvno` (docs/51 §6) come with tasks A9 / A10
-//! and have no code path yet: any other command is a usage error.
+//! A request id is written in decimal: digits only, no sign, no leading
+//! zero (one spelling per value), at most a `u64`.
 //!
-//! Spec: docs/51 §3 (D95), §6, §12 (A5, A9, A10); docs/50 §7.1.
+//! Spec: docs/51 §3 (D95), §6, §12 (A5, A10); docs/50 §7.1.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-/// The usage line.
-pub const USAGE: &str = "usage: keyadm <configuration file> ceremony <manifest file>";
+/// The usage lines.
+pub const USAGE: &str = "usage: keyadm <configuration file> ceremony <manifest file>\n       keyadm <configuration file> rotate-krbtgt|rotate-key|retire-kvno <request id>\n       keyadm <configuration file> destroy-sweep";
 
 /// The command name of the ceremony. Spec: docs/51 §6.
 pub const CEREMONY: &str = "ceremony";
+/// `rotate-krbtgt`. Spec: docs/51 §6.
+pub const ROTATE_KRBTGT: &str = "rotate-krbtgt";
+/// `rotate-key`. Spec: docs/51 §6.
+pub const ROTATE_KEY: &str = "rotate-key";
+/// `retire-kvno`. Spec: docs/51 §6.
+pub const RETIRE_KVNO: &str = "retire-kvno";
+/// `destroy-sweep`. Spec: docs/51 §6.
+pub const DESTROY_SWEEP: &str = "destroy-sweep";
+
+/// The key operation an approved-request command executes.
+/// Spec: docs/51 §6 (the table: "approved request (dual)").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Approved {
+    /// `rotate-krbtgt`: `rotate_krbtgt(DualControlToken)`.
+    RotateKrbtgt,
+    /// `rotate-key`: `rotate_key` of a service object's key set.
+    RotateKey,
+    /// `retire-kvno`: `retire_kvno`.
+    RetireKvno,
+}
+
+impl Approved {
+    /// The command's name. Spec: docs/51 §6.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Approved::RotateKrbtgt => ROTATE_KRBTGT,
+            Approved::RotateKey => ROTATE_KEY,
+            Approved::RetireKvno => RETIRE_KVNO,
+        }
+    }
+}
 
 /// A parsed command line.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,28 +77,75 @@ pub enum Command {
         /// The provisioning manifest.
         manifest: PathBuf,
     },
+    /// `rotate-krbtgt` / `rotate-key` / `retire-kvno <request id>`: execute
+    /// an approved request. Spec: docs/51 §6.
+    Execute {
+        /// keyadm's configuration file.
+        config: PathBuf,
+        /// Which operation the operator means to execute.
+        command: Approved,
+        /// The approved request's id.
+        id: u64,
+    },
+    /// `destroy-sweep`: destroy the key sets of deleted accounts.
+    /// Spec: docs/51 §6, §9.
+    DestroySweep {
+        /// keyadm's configuration file.
+        config: PathBuf,
+    },
 }
 
-/// The command line was not `<configuration file> ceremony <manifest file>`.
+/// The command line was not one of the forms of [`USAGE`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UsageError;
+
+/// A request id: decimal digits, no sign, no leading zero, within `u64`.
+/// Spec: module documentation (one spelling per value, docs/50 §7.1's rule
+/// for integers).
+fn request_id(text: &OsString) -> Result<u64, UsageError> {
+    let text = text.to_str().ok_or(UsageError)?;
+    if text.is_empty()
+        || !text.bytes().all(|b| b.is_ascii_digit())
+        || (text.len() > 1 && text.starts_with('0'))
+    {
+        return Err(UsageError);
+    }
+    text.parse::<u64>().map_err(|_| UsageError)
+}
 
 /// Parse the arguments after the program name.
 ///
 /// # Errors
-/// [`UsageError`] unless there are exactly three arguments with `ceremony`
-/// in the middle.
+/// [`UsageError`] unless the arguments are exactly one of the forms of
+/// [`USAGE`].
 ///
 /// Spec: docs/51 §6.
 pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Command, UsageError> {
-    let mut args = args.into_iter();
-    match (args.next(), args.next(), args.next(), args.next()) {
-        (Some(config), Some(command), Some(manifest), None) if command == CEREMONY => {
-            Ok(Command::Ceremony {
+    let args: Vec<OsString> = args.into_iter().take(4).collect();
+    match args.as_slice() {
+        [config, command, manifest] if command == CEREMONY => Ok(Command::Ceremony {
+            config: PathBuf::from(config),
+            manifest: PathBuf::from(manifest),
+        }),
+        [config, command, id] => {
+            let command = if command == ROTATE_KRBTGT {
+                Approved::RotateKrbtgt
+            } else if command == ROTATE_KEY {
+                Approved::RotateKey
+            } else if command == RETIRE_KVNO {
+                Approved::RetireKvno
+            } else {
+                return Err(UsageError);
+            };
+            Ok(Command::Execute {
                 config: PathBuf::from(config),
-                manifest: PathBuf::from(manifest),
+                command,
+                id: request_id(id)?,
             })
         }
+        [config, command] if command == DESTROY_SWEEP => Ok(Command::DestroySweep {
+            config: PathBuf::from(config),
+        }),
         _ => Err(UsageError),
     }
 }

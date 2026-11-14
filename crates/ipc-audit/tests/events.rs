@@ -314,17 +314,21 @@ fn code_tables_are_closed() {
     assert_eq!(EventShape::Admind.code(), 6);
     assert_eq!(table!(DirAdminOperation), 18);
     // Task A3 appended `SelfLockout` (Q-295 item 4, P-22); task F4
-    // appended `ObligationRefused` (A-91, Q-388 item 1, Q-397).
-    assert_eq!(table!(AdminRefusal), 20);
+    // appended `ObligationRefused` (A-91, Q-388 item 1, Q-397); task A10
+    // appended `OperationMismatch` and `KeyOperationRefused` (Q-421).
+    assert_eq!(table!(AdminRefusal), 22);
     assert_eq!(AdminRefusal::SelfLockout.code(), 19);
     assert_eq!(AdminRefusal::ObligationRefused.code(), 20);
+    assert_eq!(AdminRefusal::OperationMismatch.code(), 21);
     assert_eq!(
         AdminRefusal::ALL.last(),
-        Some(&AdminRefusal::ObligationRefused)
+        Some(&AdminRefusal::KeyOperationRefused)
     );
     // Task F4 appended `ViewUnavailable` and `AuditUnacknowledged`; the
     // first four keep their codes (A-91, Q-397; append only).
-    assert_eq!(table!(AdminFailure), 6);
+    // Task A10 appended `KeyOperationNotPerformed` and
+    // `KeyOperationOutcomeUnknown` (Q-421).
+    assert_eq!(table!(AdminFailure), 8);
     assert_eq!(
         AdminFailure::ALL
             .iter()
@@ -337,9 +341,14 @@ fn code_tables_are_closed() {
             (4, "InternalFailure"),
             (5, "ViewUnavailable"),
             (6, "AuditUnacknowledged"),
+            (7, "KeyOperationNotPerformed"),
+            (8, "KeyOperationOutcomeUnknown"),
         ]
     );
-    assert_eq!(table!(FrameErrorCode), 15);
+    // `ipc::Error` mirrored (1-14), `Unlisted` (15), then `ValueRefused`
+    // (16) appended by task F6 after it — not an `ipc::Error` variant, so
+    // the mirror and its `Unlisted` keep their codes (Q-406 item 3).
+    assert_eq!(table!(FrameErrorCode), 16);
     table!(AdminPhase);
     table!(DecisionResultCode);
     table!(OutcomeResultCode);
@@ -354,7 +363,11 @@ fn code_tables_are_closed() {
     table!(EnableDirection);
     table!(AccountExpiresCode);
     assert_eq!(table!(GroupTypeCode), 6);
-    assert_eq!(FrameErrorCode::ALL.last(), Some(&FrameErrorCode::Unlisted));
+    assert_eq!(FrameErrorCode::Unlisted.code(), 15);
+    assert_eq!(
+        FrameErrorCode::ALL.last(),
+        Some(&FrameErrorCode::ValueRefused)
+    );
     // Non-exhaustive sources end in Unlisted.
     assert_eq!(KdcReason::ALL.last(), Some(&KdcReason::Unlisted));
     assert_eq!(LdapReason::ALL.last(), Some(&LdapReason::Unlisted));
@@ -449,6 +462,7 @@ fn field_inventory_holds_no_secret() {
         admind_malformed().activity,
         admind_set_password().activity,
         admind_keyadm_refused().activity,
+        admind_rate_limited().activity,
     ] {
         match activity {
             ipc_audit::AdmindActivity::ConnectionRefused { reason: _ } => {} // code
@@ -462,6 +476,7 @@ fn field_inventory_holds_no_secret() {
                 operation: _, // code
                 decision: _,  // code
             } => {}
+            ipc_audit::AdmindActivity::RateLimited => {} // no field (task F6)
         }
     }
     // Every sender's window summary: three counters, nothing else (A-57;
