@@ -572,8 +572,10 @@ fn serve_stuck(mut stream: UnixStream) {
     while let Some(body) = read_one_frame(&mut stream, AUDIT_CHANNEL.limit(Direction::Request)) {
         match ipc_audit::decode_request(&body) {
             Ok(AuditRequest::Ping) => {
-                let frame =
-                    ipc_audit::encode_reply(&ipc::Reply::Message(AuditReply::Pong)).unwrap();
+                let frame = ipc_audit::encode_reply(&ipc::Reply::Message(AuditReply::Pong(
+                    ipc_audit::EventSource::Keyd,
+                )))
+                .unwrap();
                 if stream.write_all(frame.as_bytes()).is_err() {
                     return;
                 }

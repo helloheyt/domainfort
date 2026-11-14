@@ -354,10 +354,15 @@ where
     )
     .map_err(|_| DaemonError::Engine)?;
 
-    // 2. auditd first (R50-16). On failure `go` is dropped: the engine
-    //    thread ends without contacting keyd or dird.
-    let first = match audit_client::connect_verified(&params.audit).await {
-        Ok(first) => first,
+    // 2. auditd first (R50-16): its uid and the source it records the kdc
+    //    under (task R9b). On failure `go` is dropped: the engine thread
+    //    ends without contacting keyd or dird.
+    let verified = match audit_client::link(&params.audit) {
+        Ok(link) => link.connect().await.map(|first| (link, first)),
+        Err(error) => Err(error),
+    };
+    let (link, first) = match verified {
+        Ok(verified) => verified,
         Err(error) => {
             drop(go);
             let _ = started.await;
@@ -383,12 +388,8 @@ where
     };
     note(Note::DependenciesVerified, Some(policy_version.0));
 
-    // 4. The audit client.
-    let audit_task = tokio::spawn(audit_client::run(
-        Arc::clone(&gate),
-        params.audit.clone(),
-        first,
-    ));
+    // 4. The audit client (the one of ipc-audit, task R9b).
+    let audit_task = tokio::spawn(link.run(Arc::clone(&gate), first));
 
     // 5. The listeners, served only now.
     let shared = Arc::new(Shared {

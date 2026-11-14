@@ -227,7 +227,7 @@ fn world(front_uid_offset: u32, tweak: impl FnOnce(&mut DaemonParams)) -> Option
         return None;
     }
     let directory = Directory::standard(&dir.join("s.redb"));
-    let auditd = FakeAuditd::start(&dir.join("a.sock"));
+    let auditd = FakeAuditd::start_recording_as(&dir.join("a.sock"), ipc_audit::EventSource::Dird);
     let clock = HoldClock::default();
     let mut params = support::params(&dir, uid, uid, Duration::from_secs(5), 4);
     params.ldap_front_uid = uid + front_uid_offset;
@@ -837,7 +837,9 @@ fn serve_slowly(
             }
         };
         let reply = match ipc_audit::decode_request(&body) {
-            Ok(ipc_audit::AuditRequest::Ping) => ipc_audit::AuditReply::Pong,
+            Ok(ipc_audit::AuditRequest::Ping) => {
+                ipc_audit::AuditReply::Pong(ipc_audit::EventSource::Dird)
+            }
             Ok(ipc_audit::AuditRequest::Append(append)) => {
                 appends.fetch_add(1, Ordering::SeqCst);
                 let Some(delay) = ack_delay else {

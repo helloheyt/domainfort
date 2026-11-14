@@ -26,11 +26,10 @@
 //! Spec: docs/51 §5.7 (R51-12); docs/50 R50-17, §8.1; docs/questions Q-218
 //! (A-57), Q-252 items 8, 9 (A-64), Q-340 items 6-8 (A-85).
 
+use crate::log::{note, Note};
 use core::future::Future;
 use core::time::Duration;
-use ipc_audit::{
-    Ack, AdmindEvent, Append, EventBody, FlushWait, Reservation, Unflushed, WindowConfig,
-};
+use ipc_audit::{AdmindEvent, EventBody, FlushWait, Reservation, Unflushed, WindowConfig};
 use tokio::sync::Notify;
 
 /// An event could not be put into its reserved slot (cannot happen for an
@@ -105,22 +104,6 @@ impl AuditGate {
         self.core.is_reachable()
     }
 
-    /// The next batch to send, if nothing is in flight and anything is
-    /// pending. Spec: docs/50 §3.6, §8.1.
-    pub(crate) fn next_batch(&self) -> Option<Append> {
-        self.core.next_batch()
-    }
-
-    /// auditd's acknowledgement of the batch in flight.
-    pub(crate) fn acknowledge(&self, ack: &Ack) -> Result<usize, ipc_audit::WindowError> {
-        self.core.acknowledge(ack)
-    }
-
-    /// The audit connection dropped: the batch in flight goes back.
-    pub(crate) fn connection_lost(&self) {
-        self.core.connection_lost();
-    }
-
     /// Events not yet acknowledged plus outstanding reservations.
     #[must_use]
     pub fn outstanding(&self) -> usize {
@@ -148,9 +131,26 @@ impl AuditGate {
             )
             .await
     }
+}
 
-    /// Wait until an event was recorded (or a stored wake-up is pending).
-    pub(crate) async fn recorded(&self) {
-        self.wake.notified().await;
+/// What admind's gate gives the one audit client (`ipc_audit::client`, task
+/// R9b): the shared gate, the wake-up of a recorded event, and admind's
+/// notes when the link is restored or lost.
+/// Spec: docs/52 §3.11 R6, §3.12; docs/questions/Q-512, Q-560 item 4.
+impl ipc_audit::client::LinkedGate for AuditGate {
+    fn audit_gate(&self) -> &ipc_audit::AuditGate {
+        &self.core
+    }
+
+    fn recorded(&self) -> impl Future<Output = ()> + Send + '_ {
+        self.wake.notified()
+    }
+
+    fn link_restored(&self) {
+        note(Note::AuditRestored, None);
+    }
+
+    fn link_lost(&self) {
+        note(Note::AuditLost, None);
     }
 }

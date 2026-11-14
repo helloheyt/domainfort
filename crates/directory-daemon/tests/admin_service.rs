@@ -829,7 +829,7 @@ fn serve_audit(
 ) {
     while let Some(body) = read_frame(&mut stream, AUDIT_CHANNEL.limit(Direction::Request)) {
         let reply = match decode_request(&body) {
-            Ok(AuditRequest::Ping) => AuditReply::Pong,
+            Ok(AuditRequest::Ping) => AuditReply::Pong(ipc_audit::EventSource::Dird),
             Ok(AuditRequest::Append(append)) => {
                 if withhold.load(Ordering::SeqCst) {
                     continue;

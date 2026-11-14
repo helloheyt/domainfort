@@ -10,7 +10,7 @@
 mod support;
 
 use ipc::Refused;
-use ipc_audit::{EventBody, KeydOperation};
+use ipc_audit::{EventBody, EventSource, KeydOperation};
 use ipc_keyd::{Answer, Call};
 use keyd::{AuthnError, Error, KeyHandle, KeyPurpose, PrincipalId, Role};
 use keyd_daemon::startup::development_keyd;
@@ -300,6 +300,71 @@ fn an_auditd_of_the_wrong_uid_is_refused() {
     let error = start(params).err().unwrap();
     assert!(error.contains("auditd uid"), "{error}");
     assert!(auditd.events().is_empty());
+}
+
+/// Attack — task R9b (docs/questions/Q-512, Q-560; docs/50 §3.2: the source
+/// is set from the uid): an auditd whose map gives keyd's uid another source
+/// is refused at its first `Pong`, before any event is sent; keyd does not
+/// start and nothing listens.
+#[test]
+fn an_auditd_recording_keyd_under_another_source_is_refused() {
+    let dir = TempDir::new();
+    let uid = my_uid(&dir);
+    if skip_as_root(uid) {
+        return;
+    }
+    for other in EventSource::ALL
+        .into_iter()
+        .filter(|s| *s != EventSource::Keyd)
+    {
+        let params = params(&dir, CallerMap::new(&[(uid, Role::Kdc)]).unwrap(), uid);
+        let socket = params.keyd_socket.clone();
+        let auditd = FakeAuditd::start_recording_as(&params.audit.socket, other);
+        let error = start(params).err().unwrap();
+        assert!(error.contains("another source"), "{other:?}: {error}");
+        assert!(auditd.events().is_empty(), "{other:?}: nothing sent");
+        assert!(!socket.exists(), "{other:?}: nothing listens");
+    }
+}
+
+/// Attack — task R9b (docs/questions/Q-512, Q-560; A-57, A-67 item 2): when
+/// auditd is replaced by one whose map gives keyd's uid another source, keyd
+/// reconnects, sees the other source, sends it nothing, and keeps auditd
+/// unreachable — gating operations are refused `Busy`; once an auditd that
+/// records keyd as keyd is back, they are served again.
+#[test]
+fn a_cross_wired_auditd_after_a_restart_gets_nothing_and_gating_is_refused() {
+    let Some(mut world) = world(Some(Role::Kdc), |_| {}) else {
+        return;
+    };
+    let mut client = RawClient::connect(&world.daemon.socket);
+    assert!(matches!(
+        client.call(&verify_preauth()),
+        Some(Ok(Answer::VerifyPreauth(Err(AuthnError::Unavailable))))
+    ));
+    world.auditd.stop();
+    world.auditd = FakeAuditd::start_recording_as(&world.dir.join("a.sock"), EventSource::Kdc);
+    assert!(eventually(Duration::from_secs(10), || {
+        matches!(client.call(&verify_preauth()), Some(Err(Refused::Busy)))
+    }));
+    // Several reconnection attempts later (the backoff starts at 100 ms):
+    // still refused, and the cross-wired auditd received no event.
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(matches!(
+        client.call(&verify_preauth()),
+        Some(Err(Refused::Busy))
+    ));
+    assert!(world.auditd.events().is_empty(), "nothing sent to it");
+
+    world.auditd.stop();
+    world.auditd = FakeAuditd::start(&world.dir.join("a.sock"));
+    assert!(eventually(Duration::from_secs(15), || {
+        matches!(
+            client.call(&verify_preauth()),
+            Some(Ok(Answer::VerifyPreauth(Err(AuthnError::Unavailable))))
+        )
+    }));
+    world.daemon.stop().unwrap();
 }
 
 /// docs/50 §3.1 (the daemon manages the socket file explicitly): a stale

@@ -108,7 +108,8 @@ fn without_auditd_admind_does_not_start() {
     );
     assert!(!dir.join("am.sock").exists());
 
-    let auditd = FakeAuditd::start(&dir.join("a.sock"));
+    let auditd =
+        FakeAuditd::start_recording_as(&dir.join("a.sock"), ipc_audit::EventSource::Admind);
     let params = test_params(&dir, &dir.join("a.sock"), uid + 1);
     assert_eq!(
         run(params),
@@ -126,6 +127,57 @@ fn without_auditd_admind_does_not_start() {
     drop(auditd);
 }
 
+/// Attack — task R9b (docs/questions/Q-512, Q-560; docs/50 §3.2: "the source
+/// is set from the uid"): the real auditd (crates/audit-daemon's listener and
+/// writer) whose map gives admind's uid another source is refused at its
+/// first `Pong`: admind does not start, `admin.sock` is never bound, and
+/// auditd records nothing from admind's uid; the one auditd that records
+/// admind as admind is served (a positive control).
+#[test]
+fn an_auditd_recording_admind_under_another_source_is_refused() {
+    let dir = TempDir::new();
+    let uid = my_uid(&dir);
+    if support::skip_as_root(uid) {
+        return;
+    }
+    for (name, expected) in [
+        (
+            "keyd",
+            Err(DaemonError::Audit(AuditLinkError::SourceMismatch)),
+        ),
+        (
+            "dird",
+            Err(DaemonError::Audit(AuditLinkError::SourceMismatch)),
+        ),
+        (
+            "kdc",
+            Err(DaemonError::Audit(AuditLinkError::SourceMismatch)),
+        ),
+        (
+            "ldap-front",
+            Err(DaemonError::Audit(AuditLinkError::SourceMismatch)),
+        ),
+        ("admind", Ok(())),
+    ] {
+        let logs = support::auditd::TempDir::new();
+        let settings = support::auditd::settings_for(&logs, uid, name, 5);
+        let auditd = support::auditd::Server::start(
+            &settings,
+            audit_daemon::listener::ListenerConfig::from_settings(&settings),
+            8,
+            true,
+        );
+        let params = test_params(&dir, &logs.socket(), uid);
+        assert_eq!(run(params), expected, "{name}");
+        assert!(!dir.join("am.sock").exists(), "{name}");
+        assert_eq!(auditd.stop(), Some(Ok(())), "{name}");
+        let (records, _) =
+            support::auditd::read_segment(&logs.base(), 1, audit_log::Anchor::Genesis);
+        let from_admind = records.iter().filter(|r| r.source_uid == uid).count();
+        assert_eq!(from_admind, 0, "{name}: nothing recorded from admind");
+    }
+}
+
 /// docs/50 §3.1 ("the daemon manages this explicitly"): a file that is not
 /// a socket in the way of `admin_socket` is never removed — admind does not
 /// start.
@@ -136,7 +188,8 @@ fn a_file_in_the_way_of_the_socket_is_not_removed() {
     if support::skip_as_root(uid) {
         return;
     }
-    let _auditd = FakeAuditd::start(&dir.join("a.sock"));
+    let _auditd =
+        FakeAuditd::start_recording_as(&dir.join("a.sock"), ipc_audit::EventSource::Admind);
     std::fs::write(dir.join("am.sock"), b"not a socket").unwrap();
     let params = test_params(&dir, &dir.join("a.sock"), uid);
     assert_eq!(run(params), Err(DaemonError::SocketPathOccupied));

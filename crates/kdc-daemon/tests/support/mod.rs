@@ -344,16 +344,27 @@ impl Drop for Kdcd {
     }
 }
 
-/// The whole stack of a tier-2 test in its own directory: keyd's auditd
-/// (also dird's), the kdc's own auditd, the real keyd daemon, the real dird
-/// over an opened directory of the fixtures' identities, and the kdc
-/// daemon.
+/// dird's parameters in a stack's `dir` (crates/directory-daemon support
+/// `params`), its audit socket `da.sock`: dird's own fake auditd, which
+/// records its peer under dird's source — one fake per daemon, since each
+/// expects its own source on every connection (task R9b).
+pub fn stack_dird_params(dir: &TempDir, uid: u32) -> directory_daemon::DaemonParams {
+    let mut params = dird::params(dir, uid, uid, Duration::from_secs(5), 4);
+    params.audit.socket = dir.join("da.sock");
+    params
+}
+
+/// The whole stack of a tier-2 test in its own directory: keyd's auditd,
+/// dird's auditd, the kdc's own auditd (each records its peer under that
+/// daemon's source — task R9b), the real keyd daemon, the real dird over an
+/// opened directory of the fixtures' identities, and the kdc daemon.
 pub struct Stack {
     pub dir: TempDir,
     pub uid: u32,
     pub directory: dird::Directory,
     pub handles: Handles,
     pub keyd_auditd: FakeAuditd,
+    pub dird_auditd: FakeAuditd,
     pub kdc_auditd: FakeAuditd,
     pub keyd: Option<keyd_support::Daemon>,
     pub keyd_socket: PathBuf,
@@ -387,14 +398,17 @@ impl Stack {
         );
         let keyd_socket = keyd_params.keyd_socket.clone();
         let keyd_auditd = FakeAuditd::start(&keyd_params.audit.socket);
-        let kdc_auditd = FakeAuditd::start(&dir.join("ka.sock"));
+        let dird_auditd =
+            FakeAuditd::start_recording_as(&dir.join("da.sock"), ipc_audit::EventSource::Dird);
+        let kdc_auditd =
+            FakeAuditd::start_recording_as(&dir.join("ka.sock"), ipc_audit::EventSource::Kdc);
         let keyd_clock = TestClock::at(crate::common::keyd_started());
         let keyd = keyd_support::Daemon::start(keyd_params, keyd_clock.clone(), move |started| {
             directory_keyd(started, handles)
         })?;
         keyd_clock.set(now());
         let dird = dird::Dird::start(
-            dird::params(&dir, uid, uid, Duration::from_secs(5), 4),
+            stack_dird_params(&dir, uid),
             directory_daemon::StoreSource::Opened(Arc::clone(&directory.store)),
             shared_policy(dird_version, vec![crate::common::allow_kerberos()]),
         )?;
@@ -415,6 +429,7 @@ impl Stack {
             directory,
             handles,
             keyd_auditd,
+            dird_auditd,
             kdc_auditd,
             keyd: Some(keyd),
             keyd_socket,

@@ -28,8 +28,10 @@
 //!    A-81), dird's LDAP socket.
 //!
 //! Every daemon talks to the others **only** through those sockets — the
-//! channels of docs/50 §3.1: `audit.sock` shared by every sender (file
-//! `a.sock`), `keyd.sock` (`k.sock`), `dird-kdc.sock` (`d.sock`),
+//! channels of docs/50 §3.1: `audit.sock` — one listener of the one auditd
+//! per sender (files `a.sock` keyd's, `ad.sock` dird's, `ak.sock` the kdc's,
+//! `af.sock` ldap-front's; "Identity" below) — `keyd.sock` (`k.sock`),
+//! `dird-kdc.sock` (`d.sock`),
 //! `dird-ldap.sock` (`l.sock`) — all in **one unique temporary directory,
 //! mode 0700** (crates/keyd-daemon's `TempDir`). Each daemon can be stopped
 //! and started again ([`Harness::stop_keyd`], [`Harness::start_keyd`], …);
@@ -60,17 +62,20 @@
 //!   keyd only from task L7 on, P-13 — no other role is needed);
 //! * dird: `kdc_uid = ldap_front_uid = uid`; the kdc: `keyd_uid = dird_uid
 //!   = uid`; ldap-front: `dird.uid = uid`; every daemon: `audit.uid = uid`;
-//! * auditd: its `uid → source` map comes from its configuration text
-//!   (crates/config `AuditdSettings::parse`, every rule kept) and maps the
-//!   one uid to **one** source label ([`AUDIT_SOURCE_NAME`]); its connection
-//!   quota per source is injected through its public `ListenerConfig` as
-//!   [`AUDIT_CONNECTIONS_PER_SOURCE`] = 4 daemons × the daemon's quota of 4
-//!   (crates/audit-daemon `MAX_CONNECTIONS_PER_SOURCE`), the quota each
-//!   sender has in production under its own uid.
+//! * auditd: one writer behind **one listener per sender** (crates/
+//!   audit-daemon tier-2 harness `Server::start_many`), each with its own
+//!   `uid → source` map from configuration text (crates/config
+//!   `AuditdSettings::parse`, every rule kept) naming the one uid as **that
+//!   sender** ([`AUDIT_LABELS`]). One uid carries one source per map
+//!   (R50-3), and every sender requires its own source on each connection
+//!   (task R9b, docs/questions/Q-512, Q-560): so each daemon's audit socket
+//!   is its own listener, the production binding table and quota apply
+//!   unchanged (`ListenerConfig::from_settings`), and every record carries
+//!   its sender's own source, as in production.
 //!
-//! What a single uid cannot show — auditd labelling each daemon with its
-//! own source, the production rustix peer-credential connectors on Linux —
-//! is the tier-3 test (tests/tier3_distinct_uids.rs, ignored by default;
+//! What a single uid cannot show — distinct peer uids on one audit socket,
+//! the production rustix peer-credential connectors on Linux — is the
+//! tier-3 test (tests/tier3_distinct_uids.rs, ignored by default;
 //! docs/questions/Q-310).
 //!
 //! # Clocks
@@ -143,27 +148,54 @@ pub const POLICY_VERSION: u64 = 7;
 /// support `params`). Test data.
 pub const DNS_HOST_NAME: &str = "dc1.example.org";
 
-/// The single source label auditd's map gives the one test uid (module
-/// documentation, "Identity"). Project choice; per-daemon labels need
-/// distinct uids (tier 3, docs/questions/Q-310).
-pub const AUDIT_SOURCE_NAME: &str = "kdc";
+/// The sources auditd's listeners name the one test uid as (module
+/// documentation, "Identity"): each sender's own process name of docs/50
+/// §2.4 (crates/config `AuditSource`).
+pub const AUDIT_LABELS: [&str; 5] = ["keyd", "dird", "kdc", "ldap-front", "admind"];
 
-/// auditd's connection quota for the one test uid: the four senders (keyd,
-/// dird, kdc, ldap-front's start-up check) × the daemon's per-source quota
-/// of 4 (crates/audit-daemon `MAX_CONNECTIONS_PER_SOURCE`) — what each has
-/// under its own uid in production. Injected through `ListenerConfig`
-/// (module documentation).
-pub const AUDIT_CONNECTIONS_PER_SOURCE: usize =
-    4 * audit_daemon::listener::MAX_CONNECTIONS_PER_SOURCE;
+/// auditd's configuration texts for the one-uid world: one per `(socket,
+/// source name)` listener, all naming `mapped_uid` as that source, with one
+/// log at `log`, run-as `run_as` (uid, gid) and `frame_timeout_secs`.
+/// Spec: docs/50 §3.2, §7.1; crates/config `AuditdSettings`; task R9b.
+pub fn labelled_auditd_settings(
+    listeners: &[(PathBuf, &str)],
+    mapped_uid: u32,
+    run_as: (u32, u32),
+    log: &Path,
+    frame_timeout_secs: u64,
+) -> Vec<AuditdSettings> {
+    listeners
+        .iter()
+        .map(|(socket, source)| {
+            assert!(AUDIT_LABELS.contains(source), "a sender's source: {source}");
+            let text = format!(
+                "run_as_uid = {}\nrun_as_gid = {}\naudit_socket = {}\naudit_log_path = {}\n\
+                 uid_sources = {mapped_uid}:{source}\nframe_timeout = {frame_timeout_secs}s\n",
+                run_as.0,
+                run_as.1,
+                socket.display(),
+                log.display()
+            );
+            AuditdSettings::parse(text.as_bytes()).expect("valid auditd settings")
+        })
+        .collect()
+}
 
-/// auditd's shape↔source binding for the one test uid: every shape that
-/// production binds to one sender is bound here to the single label
-/// ([`AUDIT_SOURCE_NAME`] = kdc), because every sender shares that uid
-/// (R50-3: one source per uid). Same shapes, same "any source" rows as
-/// `audit_daemon::binding::PRODUCTION`; per-daemon binding is covered by
-/// audit-daemon's tier-2 tests and tier 3 (docs/questions/Q-310, Q-341, A-85).
-pub fn single_label_binding(shape: ipc_audit::EventShape) -> Option<audit_log::Source> {
-    audit_daemon::binding::bound_source(shape).map(|_| audit_log::Source::Kdc)
+/// Every daemon record of `records` was recorded under its sender's own
+/// source (A-85: a shape bound to one sender came from that sender's
+/// listener; `WindowSummary` names none), from the one test uid; auditd's
+/// own records are skipped. Spec: docs/50 §3.2, §8.1; task R9b.
+pub fn assert_recorded_under_their_senders(records: &[Record], uid: u32) {
+    for record in records
+        .iter()
+        .filter(|record| record.source != audit_log::Source::Auditd)
+    {
+        assert_eq!(record.source_uid, uid, "the sender's peer uid");
+        let shape = ipc_audit::peek_shape(&record.payload).expect("an event shape");
+        if let Some(sender) = audit_daemon::binding::bound_source(shape) {
+            assert_eq!(record.source, sender, "recorded under its sender's source");
+        }
+    }
 }
 
 /// The bound of every wait for a condition in the tests. Project choice:
@@ -352,11 +384,15 @@ impl Drop for Front {
 /// R11b) — which live in [`Harness::files`] (crates/test-scratch: a
 /// directory the walk from `/` accepts; Q-480, Q-530). The socket
 /// names are the daemons' tier-2 supports' (crates/keyd-daemon `params`,
-/// crates/directory-daemon `params`), so every sender reaches the one
-/// `a.sock`.
+/// crates/directory-daemon `params`); each sender's audit socket is its own
+/// listener of the one auditd (module documentation, "Identity"): keyd's
+/// `a.sock` (its support's), dird's, the kdc's and ldap-front's.
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub audit_socket: PathBuf,
+    pub dird_audit_socket: PathBuf,
+    pub kdc_audit_socket: PathBuf,
+    pub front_audit_socket: PathBuf,
     pub audit_log: PathBuf,
     pub keyd_socket: PathBuf,
     pub dird_kdc_socket: PathBuf,
@@ -404,6 +440,9 @@ impl Harness {
         let files = test_scratch::ScratchDir::new("e2e").expect("the scratch directory");
         let paths = Paths {
             audit_socket: dir.join("a.sock"),
+            dird_audit_socket: dir.join("ad.sock"),
+            kdc_audit_socket: dir.join("ak.sock"),
+            front_audit_socket: dir.join("af.sock"),
             audit_log: files.join("audit.log"),
             keyd_socket: dir.join("k.sock"),
             dird_kdc_socket: dir.join("d.sock"),
@@ -459,32 +498,52 @@ impl Harness {
 
     // ---- auditd -------------------------------------------------------------------
 
-    /// auditd's configuration text: the socket and log in the directory,
-    /// `mapped_uid` mapped to [`AUDIT_SOURCE_NAME`], an account of its own
-    /// (another uid). Spec: docs/50 §7.1; crates/config `AuditdSettings`.
-    fn auditd_settings(&self, mapped_uid: u32) -> AuditdSettings {
+    /// auditd's listeners: each sender's audit socket naming `mapped_uid`
+    /// as that sender ([`labelled_auditd_settings`]), the log in the
+    /// directory, an account of its own (another uid).
+    /// Spec: docs/50 §3.2, §7.1; crates/config `AuditdSettings`; task R9b.
+    fn auditd_settings(&self, mapped_uid: u32, labels: [&str; 4]) -> Vec<AuditdSettings> {
         let run_as = auditd_support::other_uid(&[self.uid, mapped_uid]);
-        let text = format!(
-            "run_as_uid = {run_as}\nrun_as_gid = {run_as}\naudit_socket = {}\n\
-             audit_log_path = {}\nuid_sources = {mapped_uid}:{AUDIT_SOURCE_NAME}\n\
-             frame_timeout = 5s\n",
-            self.paths.audit_socket.display(),
-            self.paths.audit_log.display()
-        );
-        AuditdSettings::parse(text.as_bytes()).expect("valid auditd settings")
+        let [keyd, dird, kdc, front] = labels;
+        let listeners = [
+            (self.paths.audit_socket.clone(), keyd),
+            (self.paths.dird_audit_socket.clone(), dird),
+            (self.paths.kdc_audit_socket.clone(), kdc),
+            (self.paths.front_audit_socket.clone(), front),
+        ];
+        labelled_auditd_settings(
+            &listeners,
+            mapped_uid,
+            (run_as, run_as),
+            &self.paths.audit_log,
+            5,
+        )
     }
 
     /// Start auditd mapping `mapped_uid` (the test's uid unless a test
-    /// cross-wires it). The log is verified at start (docs/50 §7.5 step 1).
+    /// cross-wires it) on every sender's listener, with the production
+    /// limits and binding table. The log is verified at start (docs/50 §7.5
+    /// step 1).
     pub fn start_auditd_mapping(&mut self, mapped_uid: u32) {
+        self.start_auditd_with(mapped_uid, ["keyd", "dird", "kdc", "ldap-front"]);
+    }
+
+    /// Start auditd for the test's uid with `labels` — the source each
+    /// sender's listener records it as, in the order keyd, dird, the kdc,
+    /// ldap-front: a cross-wired map when a label is not that sender's
+    /// (task R9b attack tests).
+    pub fn start_auditd_labelled(&mut self, labels: [&str; 4]) {
+        let uid = self.uid;
+        self.start_auditd_with(uid, labels);
+    }
+
+    fn start_auditd_with(&mut self, mapped_uid: u32, labels: [&str; 4]) {
         assert!(self.auditd.is_none(), "auditd already runs");
-        let settings = self.auditd_settings(mapped_uid);
-        let config = ListenerConfig {
-            frame_timeout: settings.frame_timeout(),
-            max_connections_per_source: AUDIT_CONNECTIONS_PER_SOURCE,
-            binding: single_label_binding,
-        };
-        self.auditd = Some(auditd_support::Server::start(&settings, config, 64, true));
+        let settings = self.auditd_settings(mapped_uid, labels);
+        let config = ListenerConfig::from_settings(&settings[0]);
+        self.auditd = Some(auditd_support::Server::start_many(
+            &settings, config, 64, true,
+        ));
     }
 
     /// Start auditd for the test's uid.
@@ -560,8 +619,9 @@ impl Harness {
         let mut params = dird::params(&self.dir, kdc_uid, self.uid, Duration::from_secs(5), 4);
         assert_eq!(params.kdc_socket, self.paths.dird_kdc_socket);
         assert_eq!(params.ldap_socket, self.paths.dird_ldap_socket);
-        assert_eq!(params.audit.socket, self.paths.audit_socket);
         assert_eq!(params.dns_host_name, DNS_HOST_NAME);
+        // dird's own audit listener (module documentation, "Identity").
+        params.audit.socket = self.paths.dird_audit_socket.clone();
         params.ldap_front_uid = front_uid;
         params.clock = SharedClock::new(FixedTime);
         let policy = directory_daemon::startup::read_policy(policy_path, self.uid)
@@ -597,12 +657,12 @@ impl Harness {
 
     /// Start the kdc reading the policy at `policy_path` (crates/kdc-daemon
     /// support `kdc_params`: 127.0.0.0/8 internal, keyd / dird / auditd as
-    /// the test's uid, every audit event to the shared `a.sock`).
+    /// the test's uid, every audit event to the kdc's own audit listener).
     pub fn start_kdc_with(&mut self, policy_path: &Path) -> Result<(), String> {
         assert!(self.kdcd.is_none(), "the kdc already runs");
         let policy =
             kdc_daemon::startup::read_policy(policy_path, self.uid).map_err(|e| e.to_string())?;
-        let params = kdcd::kdc_params(&self.paths.audit_socket, self.uid);
+        let params = kdcd::kdc_params(&self.paths.kdc_audit_socket, self.uid);
         self.kdcd = Some(Kdcd::start(
             params,
             policy,
@@ -645,7 +705,7 @@ impl Harness {
                 uid: self.uid,
             },
             audit: Endpoint {
-                socket: self.paths.audit_socket.clone(),
+                socket: self.paths.front_audit_socket.clone(),
                 uid: self.uid,
             },
             timeouts: front_timeouts(),
@@ -712,18 +772,17 @@ impl Harness {
 
     /// The decoded events of every daemon record of the verified log (auditd
     /// stopped), each checked to carry the transport identity auditd gave it
-    /// (docs/50 §3.2: the connection's peer uid, the source of its map).
-    /// auditd's own records are skipped.
+    /// (docs/50 §3.2: the connection's peer uid, and the source its
+    /// listener's map gives that uid — its sender's own,
+    /// [`assert_recorded_under_their_senders`]). auditd's own records are
+    /// skipped.
     pub fn audit_events(&self) -> Vec<ipc_audit::EventBody> {
         let (_, records) = self.verified_audit_log().expect("the log verifies");
+        assert_recorded_under_their_senders(&records, self.uid);
         records
             .iter()
             .filter(|record| record.source != audit_log::Source::Auditd)
-            .map(|record| {
-                assert_eq!(record.source_uid, self.uid, "the sender's peer uid");
-                assert_eq!(record.source, audit_log::Source::Kdc, "the one uid's label");
-                ipc_audit::decode_event(&record.payload).expect("every payload decodes")
-            })
+            .map(|record| ipc_audit::decode_event(&record.payload).expect("every payload decodes"))
             .collect()
     }
 

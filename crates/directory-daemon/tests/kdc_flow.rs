@@ -217,11 +217,18 @@ fn the_full_kdc_flow_through_keyd_and_dird_equals_the_in_process_path() {
     let local = support::Directory::standard(&dir.join("l.redb"));
     let handles = Handles::read(&local.store);
 
-    // auditd (one fake for both daemons, uid = the test's), keyd, dird.
+    // auditd (a fake for each daemon, uid = the test's: each records its
+    // peer under that daemon's own source — task R9b), keyd, dird.
     let keyd_params =
         support::keyd::params(&dir, CallerMap::new(&[(uid, Role::Kdc)]).unwrap(), uid);
     let keyd_socket = keyd_params.keyd_socket.clone();
     let _auditd = support::FakeAuditd::start(&keyd_params.audit.socket);
+    let mut dird_params = support::params(&dir, uid, uid, Duration::from_secs(5), 4);
+    dird_params.audit.socket = dir.join("da.sock");
+    let _dird_auditd = support::FakeAuditd::start_recording_as(
+        &dird_params.audit.socket,
+        ipc_audit::EventSource::Dird,
+    );
     let clock = support::TestClock::at(keyd_started());
     let keyd_daemon = support::keyd::Daemon::start(keyd_params, clock.clone(), move |started| {
         directory_keyd(started, handles)
@@ -229,7 +236,7 @@ fn the_full_kdc_flow_through_keyd_and_dird_equals_the_in_process_path() {
     .unwrap();
     clock.set(now());
     let dird = support::Dird::start(
-        support::params(&dir, uid, uid, Duration::from_secs(5), 4),
+        dird_params,
         StoreSource::File {
             path: remote_path,
             key: IntegrityKey::from_bytes(&support::TEST_KEY),
@@ -354,7 +361,8 @@ fn dird_down_or_past_its_deadline_reaches_the_client_as_29() {
         spec.nonce = nonce;
         spec.encode()
     };
-    let _auditd = support::FakeAuditd::start(&dir.join("a.sock"));
+    let _auditd =
+        support::FakeAuditd::start_recording_as(&dir.join("a.sock"), ipc_audit::EventSource::Dird);
     let dird = support::Dird::start(
         support::params(&dir, uid, uid, Duration::from_secs(5), 4),
         StoreSource::Opened(std::sync::Arc::clone(&directory.store)),

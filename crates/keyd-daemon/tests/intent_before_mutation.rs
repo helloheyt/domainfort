@@ -745,7 +745,7 @@ fn serve_once(
             let body = body.to_vec();
             reader = FrameReader::new(AUDIT_CHANNEL.limit(Direction::Request));
             let (reply, last) = match decode_request(&body).unwrap() {
-                AuditRequest::Ping => (AuditReply::Pong, false),
+                AuditRequest::Ping => (AuditReply::Pong(ipc_audit::EventSource::Keyd), false),
                 AuditRequest::Append(append) => {
                     let mut held = events.lock().unwrap();
                     for event in append.events() {

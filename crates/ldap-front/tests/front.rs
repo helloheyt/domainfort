@@ -461,8 +461,10 @@ fn tls_handshake_timeout() {
 
 /// docs/50 R50-16 ("a daemon does not bind a network port until its
 /// dependencies are verified"), §7.5: without auditd, `serve` fails and
-/// serves nothing; with auditd but without dird, the same; with both up but
-/// a TLS configuration outside R50-11, the same.
+/// serves nothing; with an auditd that records the front under another
+/// source (dird's listener), the same — task R9b, docs/questions/Q-560
+/// item 5 (attack); with auditd but without dird, the same; with both up
+/// but a TLS configuration outside R50-11, the same.
 #[test]
 fn the_start_up_checks() {
     let dir = world::dird_support::TempDir::new();
@@ -477,7 +479,7 @@ fn the_start_up_checks() {
             uid,
         },
         audit: Endpoint {
-            socket: dir.join("a.sock"),
+            socket: front_audit_socket(&dir),
             uid,
         },
         timeouts: test_timeouts(),
@@ -489,6 +491,22 @@ fn the_start_up_checks() {
 
     let logs = auditd_support::TempDir::new();
     let _auditd = start_auditd(&dir, &logs, uid);
+    let cross_wired = FrontParams {
+        audit: Endpoint {
+            socket: dir.join("a.sock"),
+            uid,
+        },
+        ..params.clone()
+    };
+    let refused = Front::start(cross_wired, tls_support::server_config_for(&pki));
+    assert!(
+        refused
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.contains("another source")),
+        "{:?}",
+        refused.err()
+    );
     let no_dird = Front::start(params.clone(), tls_support::server_config_for(&pki));
     assert!(no_dird.err().unwrap().contains("dird"));
 

@@ -583,11 +583,11 @@ pub async fn serve_with_admin(
     policy: DevelopmentPolicy,
     control: DaemonControl,
 ) -> Result<Stopped, DaemonError> {
-    // 1. auditd first (R50-16); the verified connection is kept for the
-    //    LDAP events (crate::audit_link).
-    let audit = audit_link::connect_verified(&params.audit)
-        .await
-        .map_err(DaemonError::Audit)?;
+    // 1. auditd first (R50-16): its uid and the source it records dird
+    //    under (task R9b); the verified connection is kept for the LDAP
+    //    events (crate::audit_link).
+    let link = audit_link::link(&params.audit).map_err(DaemonError::Audit)?;
+    let audit = link.connect().await.map_err(DaemonError::Audit)?;
     note(Note::AuditVerified, None);
 
     // 2. The directory, the policy's tier map, the domain check, the engine.
@@ -663,11 +663,7 @@ pub async fn serve_with_admin(
             return Err(DaemonError::Engine(error));
         }
     };
-    let audit_task = tokio::spawn(audit_link::run(
-        Arc::clone(&gate),
-        params.audit.clone(),
-        audit,
-    ));
+    let audit_task = tokio::spawn(link.run(Arc::clone(&gate), audit));
 
     // 4. The listeners.
     let listeners = match bind(&params.kdc_socket) {

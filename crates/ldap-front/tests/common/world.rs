@@ -64,6 +64,7 @@ use rustls::server::ServerConfig;
 use rustls::{ClientConfig, ClientConnection, StreamOwned};
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -122,25 +123,40 @@ pub fn loopback_internal() -> Vec<config::Network> {
     vec![config::Network::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0)), 8).unwrap()]
 }
 
-/// The real auditd (listener + writer) with its socket in `dir` and its
-/// log in `logs` (a scratch directory the protected-file walk accepts:
-/// crates/audit-daemon `segments`, task R11b), mapping `uid` to dird.
+/// The front's audit socket in `dir`: auditd's listener that records the
+/// test's uid as ldap-front ([`start_auditd`]).
+pub fn front_audit_socket(dir: &TempDir) -> PathBuf {
+    dir.join("af.sock")
+}
+
+/// The real auditd (one writer) with its log in `logs` (a scratch directory
+/// the protected-file walk accepts: crates/audit-daemon `segments`, task
+/// R11b) and two listeners in `dir`: `a.sock` mapping `uid` to dird, and
+/// [`front_audit_socket`] mapping `uid` to ldap-front — one uid carries one
+/// source per map (docs/50 R50-3, §3.2), and the front requires its own
+/// source (task R9b, docs/questions/Q-560 item 5).
 pub fn start_auditd(
     dir: &TempDir,
     logs: &auditd_support::TempDir,
     uid: u32,
 ) -> auditd_support::Server {
     let run_as = auditd_support::other_uid(&[uid]);
-    let text = format!(
-        "run_as_uid = {run_as}\nrun_as_gid = {run_as}\naudit_socket = {}\n\
-         audit_log_path = {}\nuid_sources = {uid}:dird\nframe_timeout = 5s\n",
-        dir.join("a.sock").display(),
-        logs.base().display()
-    );
-    let settings = config::AuditdSettings::parse(text.as_bytes()).unwrap();
-    auditd_support::Server::start(
-        &settings,
-        audit_daemon::listener::ListenerConfig::from_settings(&settings),
+    let settings = |socket: PathBuf, source: &str| {
+        let text = format!(
+            "run_as_uid = {run_as}\nrun_as_gid = {run_as}\naudit_socket = {}\n\
+             audit_log_path = {}\nuid_sources = {uid}:{source}\nframe_timeout = 5s\n",
+            socket.display(),
+            logs.base().display()
+        );
+        config::AuditdSettings::parse(text.as_bytes()).unwrap()
+    };
+    let listeners = [
+        settings(dir.join("a.sock"), "dird"),
+        settings(front_audit_socket(dir), "ldap-front"),
+    ];
+    auditd_support::Server::start_many(
+        &listeners,
+        audit_daemon::listener::ListenerConfig::from_settings(&listeners[0]),
         64,
         true,
     )
@@ -262,7 +278,7 @@ pub fn world(tweak: impl FnOnce(&mut FrontParams)) -> Option<World> {
             uid,
         },
         audit: Endpoint {
-            socket: dir.join("a.sock"),
+            socket: front_audit_socket(&dir),
             uid,
         },
         timeouts: test_timeouts(),

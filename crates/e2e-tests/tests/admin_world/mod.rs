@@ -44,8 +44,13 @@
 //! naming context, timeouts and settings**, and the uids are injected:
 //! keyd's `callers = [(uid, role)]`, dird's `kdc_uid` / `ldap_front_uid` /
 //! `admind_uid`, every audit endpoint's uid, the clients' server uids. auditd
-//! maps the one uid to one source label and binds every shape to it
-//! (`support::single_label_binding`; Q-310 item 2). The produced files are
+//! serves one listener per sender — the produced audit socket is keyd's,
+//! a sibling in its directory each other sender's ([`World::audit_socket_of`])
+//! — each naming the one uid as that sender, with the production binding
+//! table: one uid carries one source per map (R50-3), and every sender
+//! requires its own source on each connection (task R9b, docs/questions/
+//! Q-560 item 6); each daemon's produced audit socket is checked, then its
+//! listener injected. The produced files are
 //! read through the daemons' own readers where those take the owner as a
 //! parameter (the integrity key, the policy, the kdc's file, the manifest
 //! and admind's file through provision's root-file reader), and parsed by
@@ -78,7 +83,7 @@ use crate::common::{self, Armor, AsReqSpec, FastError, ServiceTicket, TgsReqSpec
 use crate::support::kdcd::{self, connector, Kdcd};
 use crate::support::keyd_support::{self, TestClock};
 use crate::support::tls::{server_config, test_pki, TestPki};
-use crate::support::{auditd as auditd_support, front_timeouts, single_label_binding, Front};
+use crate::support::{auditd as auditd_support, front_timeouts, labelled_auditd_settings, Front};
 use crate::support::{eventually, skip_as_root, verified_log, LONG};
 use audit_daemon::listener::ListenerConfig;
 use config::{
@@ -970,33 +975,49 @@ impl World {
 
     // ---- auditd -----------------------------------------------------------
 
-    /// auditd on the produced socket and log, the one test uid mapped to one
-    /// source label (module documentation, "Identity"); its run-as account
-    /// and frame timeout are the produced file's.
+    /// The audit listener of `sender` (one of `support::AUDIT_LABELS`;
+    /// module documentation, "Identity"): the produced audit socket for
+    /// keyd, a sibling in its directory for each other sender.
+    pub fn audit_socket_of(&self, sender: &str) -> PathBuf {
+        let produced = self.input.paths.audit_socket.as_path();
+        let name = match sender {
+            "keyd" => return produced.to_path_buf(),
+            "dird" => "ad.sock",
+            "kdc" => "ak.sock",
+            "ldap-front" => "af.sock",
+            "admind" => "am.sock",
+            other => panic!("not a sender: {other}"),
+        };
+        produced.with_file_name(name)
+    }
+
+    /// auditd on the produced log, one listener per sender
+    /// ([`World::audit_socket_of`]) naming the one test uid as that sender
+    /// (module documentation, "Identity"), the production limits and
+    /// binding table; its run-as account and frame timeout are the produced
+    /// file's.
     pub fn start_auditd(&mut self) {
         assert!(self.auditd.is_none());
         let produced = AuditdSettings::parse(&self.read(&self.input.paths.auditd_config)).unwrap();
-        let text = format!(
-            "run_as_uid = {}\nrun_as_gid = {}\naudit_socket = {}\naudit_log_path = {}\n\
-             uid_sources = {}:{}\nframe_timeout = {}s\n",
-            produced.run_as().uid(),
-            produced.run_as().gid(),
-            produced.audit_socket().as_path().display(),
-            produced.audit_log_path().as_path().display(),
+        assert_eq!(
+            produced.audit_socket().as_path(),
+            self.input.paths.audit_socket.as_path()
+        );
+        let listeners: Vec<(PathBuf, &str)> = crate::support::AUDIT_LABELS
+            .iter()
+            .map(|sender| (self.audit_socket_of(sender), *sender))
+            .collect();
+        let settings = labelled_auditd_settings(
+            &listeners,
             self.uid,
-            crate::support::AUDIT_SOURCE_NAME,
+            (produced.run_as().uid(), produced.run_as().gid()),
+            produced.audit_log_path().as_path(),
             produced.frame_timeout().as_secs(),
         );
-        let settings = AuditdSettings::parse(text.as_bytes()).unwrap();
-        let config = ListenerConfig {
-            frame_timeout: settings.frame_timeout(),
-            // Six senders share the one uid (keyd ×2, dird, kdc, ldap-front,
-            // admind), each with the daemon's quota under its own uid in
-            // production (Q-310 item 3).
-            max_connections_per_source: 8 * audit_daemon::listener::MAX_CONNECTIONS_PER_SOURCE,
-            binding: single_label_binding,
-        };
-        self.auditd = Some(auditd_support::Server::start(&settings, config, 64, true));
+        let config = ListenerConfig::from_settings(&settings[0]);
+        self.auditd = Some(auditd_support::Server::start_many(
+            &settings, config, 64, true,
+        ));
     }
 
     pub fn stop_auditd(&mut self) {
@@ -1228,6 +1249,8 @@ impl World {
         params.kdc_uid = self.uid;
         params.ldap_front_uid = self.uid;
         params.audit.uid = self.uid;
+        assert_eq!(params.audit.socket, paths.audit_socket.as_path());
+        params.audit.socket = self.audit_socket_of("dird");
         params.clock = SharedClock::new(self.clock.clone());
         let manifest_path = settings
             .admin_service()
@@ -1312,7 +1335,7 @@ impl World {
         let policy =
             kdc_daemon::startup::read_policy(settings.policy_store_path().as_path(), self.uid)
                 .unwrap();
-        let params = kdcd::kdc_params(paths.audit_socket.as_path(), self.uid);
+        let params = kdcd::kdc_params(&self.audit_socket_of("kdc"), self.uid);
         self.kdcd = Some(
             Kdcd::start(
                 params,
@@ -1330,13 +1353,17 @@ impl World {
     pub fn start_front(&mut self) {
         let settings =
             LdapFrontSettings::parse(&self.read(&self.input.paths.ldap_front_config)).unwrap();
+        assert_eq!(
+            settings.audit().socket().as_path(),
+            self.input.paths.audit_socket.as_path()
+        );
         let params = FrontParams {
             dird: Endpoint {
                 socket: settings.dird().socket().as_path().to_path_buf(),
                 uid: self.uid,
             },
             audit: Endpoint {
-                socket: settings.audit().socket().as_path().to_path_buf(),
+                socket: self.audit_socket_of("ldap-front"),
                 uid: self.uid,
             },
             timeouts: front_timeouts(),
@@ -1376,10 +1403,14 @@ impl World {
             self.uid,
             Role::Directory,
         ));
+        assert_eq!(
+            settings.audit().socket().as_path(),
+            self.input.paths.audit_socket.as_path()
+        );
         let params = admin_daemon::DaemonParams {
             admin_socket: settings.admin_socket().as_path().to_path_buf(),
             audit: admin_daemon::AuditEndpoint {
-                socket: settings.audit().socket().as_path().to_path_buf(),
+                socket: self.audit_socket_of("admind"),
                 uid: self.uid,
             },
             frame_timeout: settings.frame_timeout(),
@@ -1669,6 +1700,8 @@ impl World {
         let (head, records) =
             verified_log(self.input.paths.audit_log.as_path()).expect("the audit log verifies");
         assert_eq!(head.seq, records.len() as u64, "one chain from genesis");
+        // Each record under its sender's own source (task R9b).
+        crate::support::assert_recorded_under_their_senders(&records, self.uid);
         let mut seen: Vec<(u64, &[u8])> = Vec::new();
         let mut duplicates = 0usize;
         let mut events = Vec::new();

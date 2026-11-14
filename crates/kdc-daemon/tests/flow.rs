@@ -94,11 +94,17 @@ fn the_full_flow_through_the_kdc_daemon_equals_the_in_process_path() {
     let loaded = policy_store::DevelopmentPolicy::decode(&file).unwrap();
     let snapshot = loaded.snapshot().unwrap();
 
-    // auditd for keyd and dird; another for the kdc; keyd; dird.
+    // An auditd for each of keyd, dird and the kdc (each records its peer
+    // under that daemon's own source — task R9b); keyd; dird.
     let keyd_params = keyd_support::params(&dir, CallerMap::new(&[(uid, Role::Kdc)]).unwrap(), uid);
     let keyd_socket = keyd_params.keyd_socket.clone();
     let _auditd = FakeAuditd::start(&keyd_params.audit.socket);
-    let kdc_auditd = FakeAuditd::start(&dir.join("ka.sock"));
+    let mut dird_params = dird::params(&dir, uid, uid, Duration::from_secs(5), 4);
+    dird_params.audit.socket = dir.join("da.sock");
+    let _dird_auditd =
+        FakeAuditd::start_recording_as(&dird_params.audit.socket, ipc_audit::EventSource::Dird);
+    let kdc_auditd =
+        FakeAuditd::start_recording_as(&dir.join("ka.sock"), ipc_audit::EventSource::Kdc);
     let clock = TestClock::at(keyd_started());
     let keyd_daemon = keyd_support::Daemon::start(keyd_params, clock.clone(), move |started| {
         directory_keyd(started, handles)
@@ -106,7 +112,7 @@ fn the_full_flow_through_the_kdc_daemon_equals_the_in_process_path() {
     .unwrap();
     clock.set(now());
     let dird_daemon = dird::Dird::start(
-        dird::params(&dir, uid, uid, Duration::from_secs(5), 4),
+        dird_params,
         StoreSource::File {
             path: remote_path,
             key: IntegrityKey::from_bytes(&dird::TEST_KEY),

@@ -13,13 +13,28 @@
 //! | request | `0x01` | [`Append`] | `first_seq: u64`, `events: seq<bytes<8192>, 16>` |
 //! | request | `0x02` | `Ping` | — |
 //! | reply | `0x01` | [`Ack`] | `through_seq: u64`, `head_hash: [u8; 32]` |
-//! | reply | `0x02` | `Pong` | — |
+//! | reply | `0x02` | `Pong` | `source: u8` ([`EventSource`]) |
 //! | reply | `0xFF` | `ipc::Refused` | shared, every channel (A-59) |
 //!
 //! `Ack` comes only after auditd synced the batch (crate `audit-log`):
 //! `through_seq` is the sender's number of the last event persisted,
-//! `head_hash` the chain hash of its record. No message carries the source:
-//! auditd takes it from the connection's peer uid (docs/50 §3.2).
+//! `head_hash` the chain hash of its record. No request carries the source:
+//! auditd takes it from the connection's peer uid (docs/50 §3.2) — and
+//! reports it in `Pong`, so that every sender checks on each new connection
+//! that auditd records it under its own source (task R9b, docs/questions/
+//! Q-512, Q-560).
+//!
+//! # The audit client (feature `client`)
+//!
+//! [`client`]: the one implementation of a sender's link to auditd (task
+//! R9b) — an [`client::AuditLink`] is built only with an
+//! [`client::ExpectedAuditd`] (auditd's uid and the source it must record
+//! this process under), verifies both on every new connection before any
+//! batch, and delivers a daemon's [`AuditGate`] window. Used by keyd-daemon,
+//! kdc-daemon, directory-daemon, admin-daemon and ldap-front's start-up
+//! check; behind the feature `client` (it needs tokio — owner decision
+//! P-12), which auditd does not enable, so the core keeps its one
+//! dependency.
 //!
 //! # Events
 //!
@@ -110,16 +125,23 @@
 //! docs/52 (§2, §3.10, §3.11, §7 R6), docs/50 §3.6 / §8.1, docs/51 §5.7,
 //! PENDING-OWNER (A-85, A-87, A-88, A-93, A-102, A-105), docs/questions
 //! Q-313, Q-350, Q-365, Q-395, and this repository's four daemon gates
-//! they replace. No other implementation,
-//! serializer, RPC framework or audit format was consulted or recalled
-//! (AGENTS.md §1-3).
+//! they replace. The source in `Pong` and the one client (task R9b) were
+//! written only from docs/50 (R50-3, R50-16, R50-17, §2.4, §3.2, §3.3,
+//! §3.6, §3.7, §7.5, §8.1), docs/52 (§3.11, §3.12, §7), PENDING-OWNER
+//! (A-57, A-67, A-85, A-87, A-101, A-107, A-112), docs/questions Q-500,
+//! Q-502, Q-510, Q-512, this repository's four daemon audit clients they
+//! replace, and the docs.rs API pages of tokio 1.54.1. No other
+//! implementation, serializer, RPC framework or audit format was consulted
+//! or recalled (AGENTS.md §1-3).
 //!
 //! Spec: docs/50 R50-17, §3.3, §8.1, §10; docs/37 §2; Q-218 (A-57); A-59;
 //! docs/51 §5.7 (A-72); A-88 (Q-366, Q-395); A-91 (Q-388, Q-397); docs/52
-//! §3.11 R6 (A-102).
+//! §3.11 R6 (A-102), §3.12 (task R9b, A-112; Q-512, Q-560).
 
 mod admin;
 mod channel;
+#[cfg(feature = "client")]
+pub mod client;
 mod codes;
 mod convert;
 mod error;
@@ -135,8 +157,8 @@ pub use admin::{
 };
 pub use channel::{
     decode_reply, decode_request, encode_reply, encode_request, Ack, Append, AppendCursor,
-    AuditReply, AuditRequest, SeqRange, SequenceError, AUDIT_CHANNEL, AUDIT_MAGIC, AUDIT_VERSION,
-    KIND_ACK, KIND_APPEND, KIND_PING, KIND_PONG, MAX_BATCH_EVENTS, REPLY_BODY_LIMIT,
+    AuditReply, AuditRequest, EventSource, SeqRange, SequenceError, AUDIT_CHANNEL, AUDIT_MAGIC,
+    AUDIT_VERSION, KIND_ACK, KIND_APPEND, KIND_PING, KIND_PONG, MAX_BATCH_EVENTS, REPLY_BODY_LIMIT,
     REQUEST_BODY_LIMIT,
 };
 pub use codes::{

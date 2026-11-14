@@ -60,8 +60,9 @@ ipc-directory = { path = "../ipc-directory" }
 ipc-directory-server = { path = "../ipc-directory-server" }
 # The audit channel (auditd verified first, R50-16) and the LDAP engine's
 # events (R49-14, R50-17): the `ldap` conversion only — each daemon enables
-# only the conversion it sends (A-66).
-ipc-audit = { path = "../ipc-audit", features = ["ldap"] }
+# only the conversion it sends (A-66) — and the one audit client (`client`,
+# task R9b — docs/questions/Q-560).
+ipc-audit = { path = "../ipc-audit", features = ["ldap", "client"] }
 # The LDAP engine — the PEP hosted in dird (docs/50 R50-1, R50-10; docs/49
 # R49-16): `Engine`, `RequestInputs`, the audit event.
 ldap = { path = "../ldap" }

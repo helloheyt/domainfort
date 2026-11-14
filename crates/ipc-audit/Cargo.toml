@@ -42,6 +42,12 @@ kdc = ["dep:kdc", "dep:pdp", "dep:krb-proto"]
 keyd = ["dep:keyd", "dep:krb-proto"]
 # ldap::AuditEvent -> LdapEvent.
 ldap = ["dep:ldap", "dep:pdp", "dep:krb-proto", "dep:dtyp", "dep:parse-ldap"]
+# The one audit client (task R9b, docs/questions/Q-512, Q-560): a sender's
+# link to auditd over `audit.sock` (src/client.rs). Enabled by the senders
+# (keyd-daemon, kdc-daemon, directory-daemon, admin-daemon) and by
+# ldap-front's start-up check; NOT by auditd, whose ipc-audit stays the
+# one-dependency core.
+client = ["dep:tokio"]
 
 [dependencies]
 # Framing, field primitives, the `MessageSet` pattern and `REFUSED_KIND`.
@@ -55,6 +61,11 @@ pdp = { path = "../pdp", optional = true }
 krb-proto = { path = "../krb-proto", optional = true }
 dtyp = { path = "../dtyp", optional = true }
 parse-ldap = { path = "../parse-ldap", optional = true }
+# tokio — owner decision P-12 (2026-11-13), already in the lock and used by
+# every daemon with these features: the client's Unix socket, deadlines and
+# reads/writes (feature `client` only; no new package). Usage documentation
+# only (docs.rs, P-2), never its source.
+tokio = { version = "1.54.1", default-features = false, features = ["net", "time", "io-util"], optional = true }
 
 [dev-dependencies]
 # TESTS ONLY: this crate itself with every conversion turned on, so that the
@@ -63,8 +74,12 @@ parse-ldap = { path = "../parse-ldap", optional = true }
 # built and run by a plain `cargo test --all` (scripts/check-rust.sh) although
 # no feature is on by default (A-66). Dev-dependencies take part only in the
 # builds of test targets, so this turns no conversion on for a daemon binary
-# (checked: `cargo tree -p audit-daemon -e normal`).
-ipc-audit = { path = ".", features = ["kdc", "keyd", "ldap"] }
+# (checked: `cargo tree -p audit-daemon -e normal`). `client` likewise, for
+# the client's tests (tests/client.rs).
+ipc-audit = { path = ".", features = ["kdc", "keyd", "ldap", "client"] }
+# TESTS ONLY: a tokio runtime for the client's tests (tests/client.rs) —
+# the package and features the daemons already use (P-12).
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "net", "time", "io-util", "sync"] }
 # TESTS ONLY: this project's schema crate, so that a test checks the six
 # `GroupTypeCode` values against `ad_schema::flags::group_type::ALLOWED_VALUES`
 # — the repository's one statement of the phase-1 groupType values

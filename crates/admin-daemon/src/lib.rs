@@ -67,7 +67,7 @@
 //! | [`password`] | the password rules of [MS-SAMR] 3.1.1.7.2 |
 //! | [`links`] | the dird and keyd clients behind two traits |
 //! | [`audit`] | the audit window, noise and gating events |
-//! | [`audit_link`] | auditd verified first (R50-16), events delivered |
+//! | [`audit_link`] | auditd verified first (R50-16), events delivered: admind's expectation for the one ipc-audit client (task R9b) |
 //! | [`clock`] | the time of admind's events |
 //! | [`log`] | fixed stderr messages (docs/50 §8.2) |
 //!

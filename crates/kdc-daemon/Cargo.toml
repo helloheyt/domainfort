@@ -62,10 +62,9 @@ ipc-keyd = { path = "../ipc-keyd" }
 # `UnavailableDirectory`, `UnixConnector`).
 ipc-directory = { path = "../ipc-directory" }
 # The audit channel and the sender window (A-57), with the kdc event
-# conversion only (A-66: each daemon enables only its own).
-ipc-audit = { path = "../ipc-audit", default-features = false, features = ["kdc"] }
-# Framing of the audit channel's replies (`FrameReader`).
-ipc = { path = "../ipc" }
+# conversion only (A-66: each daemon enables only its own), and the one
+# audit client (`client`, task R9b — docs/questions/Q-560).
+ipc-audit = { path = "../ipc-audit", default-features = false, features = ["kdc", "client"] }
 # The shared policy file (A-68).
 policy-store = { path = "../policy-store" }
 # `PolicySnapshot`, `IpScope`, `RlKey`.
@@ -97,6 +96,10 @@ directory-pip = { path = "../directory-pip" }
 ad-schema = { path = "../ad-schema" }
 dtyp = { path = "../dtyp" }
 zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
+# Framing and the shared `Refused` for the reused supports' fake auditd and
+# raw clients (it was a normal dependency for the kdc's own audit client,
+# which is now crate ipc-audit's — task R9b).
+ipc = { path = "../ipc" }
 # The scratch directories, inside the workspace, of the tests whose files a
 # crates/protected-file reader opens — the walk from `/` accepts them (task
 # T; docs/questions/Q-480). Dev-only, no dependency.

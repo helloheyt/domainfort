@@ -10,9 +10,9 @@
 use ipc::{decode_frame, Direction, FrameStatus, Refused, Reply, REFUSED_KIND};
 use ipc_audit::{
     decode_reply, decode_request, encode_reply, encode_request, Ack, Append, AppendCursor,
-    AuditReply, AuditRequest, EventBytes, SeqRange, SequenceError, AUDIT_CHANNEL, AUDIT_MAGIC,
-    AUDIT_VERSION, KIND_ACK, KIND_APPEND, KIND_PING, KIND_PONG, MAX_BATCH_EVENTS, MAX_EVENT_OCTETS,
-    REPLY_BODY_LIMIT, REQUEST_BODY_LIMIT,
+    AuditReply, AuditRequest, EventBytes, EventSource, SeqRange, SequenceError, AUDIT_CHANNEL,
+    AUDIT_MAGIC, AUDIT_VERSION, KIND_ACK, KIND_APPEND, KIND_PING, KIND_PONG, MAX_BATCH_EVENTS,
+    MAX_EVENT_OCTETS, REPLY_BODY_LIMIT, REQUEST_BODY_LIMIT,
 };
 
 fn event(len: usize, fill: u8) -> EventBytes {
@@ -68,7 +68,7 @@ fn reply_round_trips() {
             through_seq: 42,
             head_hash: [0xA5; 32],
         })),
-        Reply::Message(AuditReply::Pong),
+        Reply::Message(AuditReply::Pong(EventSource::Kdc)),
         Reply::Refused(Refused::Busy),
         Reply::Refused(Refused::Unavailable),
     ] {
@@ -77,6 +77,77 @@ fn reply_round_trips() {
         assert_eq!(decode_reply(&body).unwrap(), reply);
         assert!(ipc::reply_round_trip_is_canonical::<AuditReply>(AUDIT_CHANNEL, &body).unwrap());
     }
+}
+
+/// The `Pong` body of `code`: the envelope and one octet.
+fn pong_body(code: u8) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&AUDIT_MAGIC.to_be_bytes());
+    body.push(AUDIT_VERSION);
+    body.push(KIND_PONG);
+    body.push(code);
+    body
+}
+
+/// Task R9b (docs/questions/Q-560 item 1; docs/50 §3.2, §3.3 "enum = `u8`
+/// from a closed table", canonical round trip): the `Pong` carries the
+/// source auditd records the connection under, for every source of the
+/// closed table — its code is the one octet after the envelope, and the
+/// codes are the audit log's (keyd 1, dird 2, kdc 3, ldap-front 4, admind 5;
+/// crates/audit-log `Source::code`).
+#[test]
+fn pong_carries_every_source() {
+    let codes = [
+        (EventSource::Keyd, 1u8),
+        (EventSource::Dird, 2),
+        (EventSource::Kdc, 3),
+        (EventSource::LdapFront, 4),
+        (EventSource::Admind, 5),
+    ];
+    assert_eq!(
+        EventSource::ALL.to_vec(),
+        codes.iter().map(|&(s, _)| s).collect::<Vec<_>>()
+    );
+    for (source, code) in codes {
+        assert_eq!(source.code(), code);
+        assert_eq!(EventSource::from_code(code), Some(source));
+        let reply = Reply::Message(AuditReply::Pong(source));
+        let frame = encode_reply(&reply).unwrap();
+        assert_eq!(frame.body(), &pong_body(code)[..], "{source:?}");
+        assert_eq!(decode_reply(frame.body()).unwrap(), reply);
+        assert!(
+            ipc::reply_round_trip_is_canonical::<AuditReply>(AUDIT_CHANNEL, frame.body()).unwrap()
+        );
+    }
+}
+
+/// Task R9b (docs/questions/Q-560 item 2; docs/50 §3.3 "enum = `u8` from a
+/// closed table"): every code outside the table — 0, auditd's own source
+/// (6 in the log, which names no peer) and everything above — is refused.
+#[test]
+fn pong_with_an_unknown_source_is_refused() {
+    for code in (0u8..=u8::MAX).filter(|code| !(1..=5).contains(code)) {
+        assert_eq!(EventSource::from_code(code), None, "{code}");
+        assert_eq!(
+            decode_reply(&pong_body(code)),
+            Err(ipc::Error::UnknownCode),
+            "{code}"
+        );
+    }
+}
+
+/// Task R9b (docs/questions/Q-560 items 1, 3; docs/50 §3.3 fixed fields,
+/// "no trailing byte"): the empty `Pong` of before is refused (an auditd of
+/// the old form fails a new sender closed), and so is an octet after the
+/// source (a new `Pong` to an old sender fails it closed the same way).
+#[test]
+fn pong_old_empty_form_and_trailing_octet_are_refused() {
+    let mut empty = pong_body(3);
+    empty.pop();
+    assert_eq!(decode_reply(&empty), Err(ipc::Error::Truncated));
+    let mut trailing = pong_body(3);
+    trailing.push(0x00);
+    assert_eq!(decode_reply(&trailing), Err(ipc::Error::TrailingBytes));
 }
 
 /// The exact field layout of Append and Ack (docs/50 §3.3 primitives).
@@ -224,7 +295,7 @@ fn envelope_checks() {
         );
     }
     // A reply kind 0x03 is unknown too; 0xFF is the shared refusal.
-    let pong = encode_reply(&Reply::Message(AuditReply::Pong)).unwrap();
+    let pong = encode_reply(&Reply::Message(AuditReply::Pong(EventSource::Kdc))).unwrap();
     let mut b = pong.body().to_vec();
     b[3] = 0x03;
     assert_eq!(decode_reply(&b), Err(ipc::Error::UnknownKind));

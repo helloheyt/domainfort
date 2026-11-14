@@ -55,11 +55,11 @@
 //! (A-64), Q-260 items 1-2 (A-67); docs/37 §2 (D63); docs/07 §8;
 //! crates/kdc audit.rs.
 
+use crate::log::{note, Note};
 use core::future::Future;
 use core::time::Duration;
 use ipc_audit::{
-    Ack, Append, EventBody, FlushWait, KdcEvent, Reservation, Unflushed, WindowConfig, WindowError,
-    WindowSteps,
+    EventBody, FlushWait, KdcEvent, Reservation, Unflushed, WindowConfig, WindowSteps,
 };
 use kdc::{AuditEvent, AuditOutcome, AuditSink};
 use tokio::sync::Notify;
@@ -264,22 +264,6 @@ impl AuditGate {
         self.core.is_reachable()
     }
 
-    /// The next batch to send, if nothing is in flight and anything is
-    /// pending. Spec: docs/50 §3.6, §8.1.
-    pub(crate) fn next_batch(&self) -> Option<Append> {
-        self.core.next_batch()
-    }
-
-    /// auditd's acknowledgement of the batch in flight.
-    pub(crate) fn acknowledge(&self, ack: &Ack) -> Result<usize, WindowError> {
-        self.core.acknowledge(ack)
-    }
-
-    /// The audit connection dropped: the batch in flight goes back.
-    pub(crate) fn connection_lost(&self) {
-        self.core.connection_lost();
-    }
-
     /// Events not yet acknowledged plus outstanding reservations.
     #[must_use]
     pub fn outstanding(&self) -> usize {
@@ -306,10 +290,27 @@ impl AuditGate {
             )
             .await
     }
+}
 
-    /// Wait until an event was recorded (or a stored wake-up is pending).
-    pub(crate) async fn recorded(&self) {
-        self.wake.notified().await;
+/// What the kdc's gate gives the one audit client (`ipc_audit::client`,
+/// task R9b): the shared gate, the wake-up of a recorded event, and the
+/// kdc's notes when the link is restored or lost.
+/// Spec: docs/52 §3.11 R6, §3.12; docs/questions/Q-512, Q-560 item 4.
+impl ipc_audit::client::LinkedGate for AuditGate {
+    fn audit_gate(&self) -> &ipc_audit::AuditGate {
+        &self.core
+    }
+
+    fn recorded(&self) -> impl Future<Output = ()> + Send + '_ {
+        self.wake.notified()
+    }
+
+    fn link_restored(&self) {
+        note(Note::AuditRestored, None);
+    }
+
+    fn link_lost(&self) {
+        note(Note::AuditLost, None);
     }
 }
 

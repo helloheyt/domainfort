@@ -72,7 +72,7 @@ fn world(kdc_uid_offset: u32, lifetime: Duration, max_views: usize) -> Option<Wo
         return None;
     }
     let directory = Directory::standard(&dir.join("s.redb"));
-    let auditd = FakeAuditd::start(&dir.join("a.sock"));
+    let auditd = FakeAuditd::start_recording_as(&dir.join("a.sock"), ipc_audit::EventSource::Dird);
     let dird = Dird::start(
         support::params(&dir, uid + kdc_uid_offset, uid, lifetime, max_views),
         StoreSource::Opened(Arc::clone(&directory.store)),
@@ -149,11 +149,41 @@ fn auditd_is_verified_first() {
     let error = start(uid).err().unwrap();
     assert!(error.contains("auditd not verified"), "{error}");
     assert!(!dir.join("d.sock").exists());
-    let _auditd = FakeAuditd::start(&dir.join("a.sock"));
+    let _auditd = FakeAuditd::start_recording_as(&dir.join("a.sock"), ipc_audit::EventSource::Dird);
     let error = start(uid + 1).err().unwrap();
     assert!(error.contains("not the configured auditd uid"), "{error}");
     assert!(!dir.join("d.sock").exists());
     start(uid).unwrap().stop().unwrap();
+}
+
+/// Attack — task R9b (docs/questions/Q-512, Q-560; docs/50 §3.2: the source
+/// is set from the uid): an auditd whose map gives dird's uid another
+/// source is refused at its first `Pong`, before any event is sent; dird
+/// does not start and the dird-kdc socket is never created.
+#[test]
+fn an_auditd_recording_dird_under_another_source_is_refused() {
+    let dir = TempDir::new();
+    let uid = support::my_uid(&dir);
+    if support::skip_as_root(uid) {
+        return;
+    }
+    let directory = Directory::standard(&dir.join("s.redb"));
+    for other in ipc_audit::EventSource::ALL
+        .into_iter()
+        .filter(|s| *s != ipc_audit::EventSource::Dird)
+    {
+        let auditd = FakeAuditd::start_recording_as(&dir.join("a.sock"), other);
+        let error = Dird::start(
+            support::params(&dir, uid, uid, Duration::from_secs(5), 4),
+            StoreSource::Opened(Arc::clone(&directory.store)),
+            support::policy(1),
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("another source"), "{other:?}: {error}");
+        assert!(!dir.join("d.sock").exists(), "{other:?}");
+        assert!(auditd.events().is_empty(), "{other:?}: nothing sent");
+    }
 }
 
 /// docs/50 R50-2, §6.4 ("the redb file owned by dird, 0600"), §7.5 step 3
@@ -172,7 +202,7 @@ fn the_redb_file_must_be_dirds_own_and_the_key_the_stores() {
     let files = test_scratch::ScratchDir::new("dird-store").unwrap();
     let path = files.join("s.redb");
     drop(Directory::standard(&path));
-    let _auditd = FakeAuditd::start(&dir.join("a.sock"));
+    let _auditd = FakeAuditd::start_recording_as(&dir.join("a.sock"), ipc_audit::EventSource::Dird);
     let start = |path: std::path::PathBuf, key: [u8; 32], owner_uid: u32| {
         Dird::start(
             support::params(&dir, uid, uid, Duration::from_secs(5), 4),

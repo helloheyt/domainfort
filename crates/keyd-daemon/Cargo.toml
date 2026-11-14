@@ -61,8 +61,9 @@ ipc-keyd = { path = "../ipc-keyd" }
 # only this daemon depends on it).
 ipc-keyd-server = { path = "../ipc-keyd-server" }
 # The audit channel and the sender window (A-57). Only the keyd record
-# conversion is needed (docs/questions/Q-252 item 1).
-ipc-audit = { path = "../ipc-audit", default-features = false, features = ["keyd"] }
+# conversion is needed (docs/questions/Q-252 item 1), and the one audit
+# client (`client`, task R9b — docs/questions/Q-560).
+ipc-audit = { path = "../ipc-audit", default-features = false, features = ["keyd", "client"] }
 # The custody engine and its in-memory development store (R50-18).
 keyd = { path = "../keyd" }
 # `KerberosTime`, `Realm`.

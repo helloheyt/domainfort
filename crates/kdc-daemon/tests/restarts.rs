@@ -57,7 +57,7 @@ fn restart_keyd(stack: &mut Stack, callers: CallerMap) {
 fn restart_dird(stack: &mut Stack) {
     stack.dird = Some(
         dird::Dird::start(
-            dird::params(&stack.dir, stack.uid, stack.uid, Duration::from_secs(5), 4),
+            support::stack_dird_params(&stack.dir, stack.uid),
             directory_daemon::StoreSource::Opened(std::sync::Arc::clone(&stack.directory.store)),
             shared_policy(7, vec![common::allow_kerberos()]),
         )

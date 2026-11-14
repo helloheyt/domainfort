@@ -12,7 +12,7 @@ use audit_daemon::listener::{self, BindError, ListenerConfig, MAX_CONNECTIONS_PE
 use audit_log::{Anchor, Source};
 use common::*;
 use ipc::{Refused, Reply};
-use ipc_audit::{Ack, Append, AuditReply, AuditRequest, EventBody};
+use ipc_audit::{Ack, Append, AuditReply, AuditRequest, EventBody, EventSource};
 use std::io::Write;
 use std::time::{Duration, Instant};
 
@@ -167,15 +167,79 @@ fn ping_gets_pong() {
     send(&mut client, &AuditRequest::Ping);
     assert_eq!(
         receive(&mut client),
-        Got::Reply(Reply::Message(AuditReply::Pong))
+        Got::Reply(Reply::Message(AuditReply::Pong(EventSource::Kdc)))
     );
     send(&mut client, &AuditRequest::Ping);
     assert_eq!(
         receive(&mut client),
-        Got::Reply(Reply::Message(AuditReply::Pong))
+        Got::Reply(Reply::Message(AuditReply::Pong(EventSource::Kdc)))
     );
     drop(client);
     assert_eq!(server.stop(), Some(Ok(())));
+}
+
+/// Source: docs/50 §3.2 ("each marked as the event's source — the source is
+/// set from the uid"), §8.1; task R9b (docs/questions/Q-512, Q-560): the
+/// `Pong` names the source the connection's events are recorded under — for
+/// every source a uid can be mapped to — and an `Append` on the same
+/// connection is recorded under exactly that source.
+#[test]
+fn pong_names_the_source_the_connection_is_recorded_under() {
+    let Some(uid) = mappable_uid() else { return };
+    for (name, reported, recorded) in [
+        ("keyd", EventSource::Keyd, Source::Keyd),
+        ("dird", EventSource::Dird, Source::Dird),
+        ("kdc", EventSource::Kdc, Source::Kdc),
+        ("ldap-front", EventSource::LdapFront, Source::LdapFront),
+        ("admind", EventSource::Admind, Source::Admind),
+    ] {
+        let dir = TempDir::new();
+        let settings = settings_for(&dir, uid, name, 5);
+        let server = Server::start(&settings, config(&settings), 8, true);
+        let mut client = connect(&server.socket);
+        send(&mut client, &AuditRequest::Ping);
+        assert_eq!(
+            receive(&mut client),
+            Got::Reply(Reply::Message(AuditReply::Pong(reported))),
+            "{name}"
+        );
+        // Arbitrary payloads name no shape, so the binding lets them
+        // through from any source (crate::binding; Q-341 option (a)).
+        send(&mut client, &append(1, 1, 7));
+        assert_eq!(expect_ack(receive(&mut client)).through_seq, 1, "{name}");
+        drop(client);
+        assert_eq!(server.stop(), Some(Ok(())));
+        let (records, _) = read_segment(&dir.base(), 1, Anchor::Genesis);
+        let mine: Vec<_> = records.iter().filter(|r| r.source_uid == uid).collect();
+        assert_eq!(mine.len(), 1, "{name}");
+        assert_eq!(mine[0].source, recorded, "{name}: reported = recorded");
+    }
+}
+
+/// Source: docs/questions/Q-560 item 2 (the wire source codes are the log's
+/// source codes); crates/audit-log `Source::code`, crates/ipc-audit
+/// `EventSource::code`: the listener's `reported_source` maps every source
+/// a peer can be recorded under to the channel value with the same code,
+/// and auditd's own source to none.
+#[test]
+fn reported_sources_carry_the_log_codes() {
+    for source in Source::ALL {
+        match listener::reported_source(source) {
+            Some(reported) => {
+                assert_eq!(reported.code(), source.code(), "{source:?}");
+                assert_eq!(EventSource::from_code(source.code()), Some(reported));
+            }
+            None => {
+                assert_eq!(source, Source::Auditd);
+                assert_eq!(EventSource::from_code(source.code()), None);
+            }
+        }
+    }
+    assert_eq!(
+        EventSource::ALL.len(),
+        Source::ALL.len() - 1,
+        "every peer source"
+    );
 }
 
 /// Source: docs/questions/Q-218 (A-57: a full queue answers `Busy`, the
@@ -215,7 +279,10 @@ fn full_queue_answers_busy() {
     // A connection answered Busy stays open.
     let open = &mut clients[busy[0]];
     send(open, &AuditRequest::Ping);
-    assert_eq!(receive(open), Got::Reply(Reply::Message(AuditReply::Pong)));
+    assert_eq!(
+        receive(open),
+        Got::Reply(Reply::Message(AuditReply::Pong(EventSource::Kdc)))
+    );
     drop(clients);
     assert_eq!(server.stop(), None);
 }
@@ -235,7 +302,7 @@ fn started_frame_must_finish_before_the_deadline() {
     send(&mut idle, &AuditRequest::Ping);
     assert_eq!(
         receive(&mut idle),
-        Got::Reply(Reply::Message(AuditReply::Pong))
+        Got::Reply(Reply::Message(AuditReply::Pong(EventSource::Kdc)))
     );
 
     // Three octets of a length prefix, then silence: closed.
@@ -294,7 +361,7 @@ fn connections_over_the_quota_are_closed() {
         send(&mut client, &AuditRequest::Ping);
         assert_eq!(
             receive(&mut client),
-            Got::Reply(Reply::Message(AuditReply::Pong))
+            Got::Reply(Reply::Message(AuditReply::Pong(EventSource::Kdc)))
         );
         held.push(client);
     }
@@ -310,7 +377,7 @@ fn connections_over_the_quota_are_closed() {
     send(&mut next, &AuditRequest::Ping);
     assert_eq!(
         receive(&mut next),
-        Got::Reply(Reply::Message(AuditReply::Pong))
+        Got::Reply(Reply::Message(AuditReply::Pong(EventSource::Kdc)))
     );
 
     std::thread::sleep(Duration::from_millis(1600));

@@ -28,6 +28,7 @@
 //! | `dird_kdc_channel_for_another_uid_…` | dird's kdc channel for another uid | 29 / silence; LDAP unaffected |
 //! | `dird_ldap_channel_for_another_uid_…` | dird's LDAP channel for another uid | the notice, close; Kerberos unaffected |
 //! | `auditd_not_mapping_the_senders_…` | auditd's map names another uid | 29 / silence, the notice; auditd's own record of the refused uid |
+//! | `an_auditd_recording_the_kdc_as_keyd_…` | auditd's map gives the kdc's uid keyd's source, the front's dird's (task R9b) | the kdc and the front refuse to start; no kdc event in the log |
 //!
 //! Already covered per daemon (and not repeated): keyd closes an unmapped
 //! uid with no reply and answers a wrong role keyd's uniform `Denied`
@@ -191,6 +192,46 @@ fn the_kdc_does_not_start_when_keyd_gives_its_uid_another_role() {
         let refused = h.start_kdc().expect_err("refused to start (Ldap)");
         assert!(refused.contains("keyd not verified"), "{refused}");
         h.stop_all();
+    });
+}
+
+/// Attack — task R9b (docs/questions/Q-512, Q-560; docs/50 §3.2, §8.1):
+/// the real auditd whose map gives the kdc's uid keyd's source (the kdc's
+/// listener cross-wired) is refused by the kdc at its first `Pong` — the kdc
+/// does not start, and the log holds no event of the kdc's (the same for
+/// ldap-front, recorded as dird); keyd and dird, recorded under their own
+/// sources, run and are recorded as before. With the map put right, the kdc
+/// starts and is recorded under its own source.
+#[test]
+fn an_auditd_recording_the_kdc_as_keyd_receives_nothing_from_it() {
+    within(TEST_BOUND, || {
+        let Some(mut h) = Harness::fixtures() else {
+            return;
+        };
+        h.start_auditd_labelled(["keyd", "dird", "keyd", "dird"]);
+        h.start_keyd_serving().unwrap();
+        h.start_dird().unwrap();
+        let refused = h.start_kdc().expect_err("the kdc refused to start");
+        assert!(refused.contains("another source"), "{refused}");
+        let refused = h.start_front().expect_err("the front refused to start");
+        assert!(refused.contains("another source"), "{refused}");
+        h.stop_all();
+        let events = h.audit_events();
+        assert!(
+            !events.iter().any(|e| matches!(e, EventBody::Kdc(_))),
+            "nothing recorded from the kdc"
+        );
+
+        h.start_auditd();
+        h.start_keyd_serving().unwrap();
+        h.start_dird().unwrap();
+        h.start_kdc().unwrap();
+        assert!(bootstrap_issued(&h, 1));
+        h.stop_all();
+        assert!(h
+            .audit_events()
+            .iter()
+            .any(|e| matches!(e, EventBody::Kdc(_))));
     });
 }
 

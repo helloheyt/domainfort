@@ -52,7 +52,7 @@
 //! | `engine` | the engine thread: start checks, per-request path |
 //! | [`custody`] | keyd behind the A-57 gate |
 //! | [`audit`] | the event buffer and the A-57 gate (the kdc gates) |
-//! | `audit_client` | the connection to auditd (R50-17) |
+//! | `audit_client` | the kdc's expectation of auditd for the one ipc-audit client (R50-17; task R9b) |
 //! | `udp` / `tcp` | the listeners (RFC 4120 §7.2.1 / §7.2.2) |
 //! | [`rate`] | UDP per-source / global limits; the PDP's RateLimit obligation |
 //! | [`zones`] | source address → `Peer.src_net` (docs/50 §4.1) |

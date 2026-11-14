@@ -55,7 +55,7 @@
 //! | [`callers`] | the `uid → Role` map (R50-3) |
 //! | `engine` | the engine thread and its bounded queue (R50-7) |
 //! | [`audit`] | the record buffer and the A-57 gate |
-//! | [`audit_client`] | the connection to auditd (R50-17) |
+//! | [`audit_client`] | keyd's expectation of auditd for the one ipc-audit client (R50-17; task R9b) |
 //! | `listener` | `keyd.sock`: identity, quota, framing, deadlines |
 //! | `daemon` | [`serve`], [`DaemonControl`] |
 //! | [`startup`] | configuration, socket directory, hardening plan, the development keyd |

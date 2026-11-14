@@ -23,7 +23,11 @@
 //!    frame that has started must finish within 5 s … otherwise close; an
 //!    idle connection is allowed"). Writing a reply has the same deadline.
 //! 4. **Requests.** `Ping` → `Pong` while the writer is available, otherwise
-//!    `Refused::Unavailable` (docs/50 §7.5). `Append` → the connection's
+//!    `Refused::Unavailable` (docs/50 §7.5). The `Pong` names the source
+//!    this connection's events are recorded under — the very [`Source`] of
+//!    step 1, so what auditd reports is what it records ([`reported_source`];
+//!    task R9b: every sender requires its own source before its first
+//!    batch, docs/questions/Q-512, Q-560). `Append` → the connection's
 //!    `AppendCursor` must accept its numbering (else `Refused::Malformed` +
 //!    close, docs/questions/Q-265 item 3); every event's shape must be one
 //!    its source may send — `Kdc` only from kdc, `Keyd` only from keyd,
@@ -51,7 +55,7 @@
 //!
 //! Spec: docs/50 R50-3, R50-7, R50-17, §3.1-§3.3, §3.6, §7.5, §8.1;
 //! docs/questions/Q-218 (A-57), Q-225 (A-59), Q-252 (A-64), Q-265, Q-341,
-//! Q-432 (A-98), Q-445; docs/51 §5.7;
+//! Q-432 (A-98), Q-445, Q-512 (A-112), Q-560; docs/51 §5.7;
 //! tokio 1.54.1 docs.rs: `net::UnixListener` (`bind`, `accept`),
 //! `net::UnixStream` (`peer_cred`), `net::unix::UCred`, `time::timeout_at`,
 //! `time::Instant`, `time::sleep`, `sync::oneshot`, `io::AsyncReadExt`,
@@ -64,7 +68,8 @@ use config::{AuditSource, AuditdSettings, SourceMap};
 use core::fmt;
 use ipc::{Direction, FrameReader, Refused, Reply};
 use ipc_audit::{
-    decode_request, encode_reply, Append, AppendCursor, AuditReply, AuditRequest, AUDIT_CHANNEL,
+    decode_request, encode_reply, Append, AppendCursor, AuditReply, AuditRequest, EventSource,
+    AUDIT_CHANNEL,
 };
 use std::io;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -192,6 +197,25 @@ const fn log_source(source: AuditSource) -> (Source, usize) {
     }
 }
 
+/// The source a `Pong` reports for a connection whose events are recorded
+/// under `source`: the same process, named in the channel's closed table
+/// (ipc-audit `EventSource`, whose codes are the log's — pinned by this
+/// crate's tests). `None` for auditd's own source, which no peer is ever
+/// mapped to (crates/config `SourceMap`), so no `Pong` can name it.
+///
+/// Spec: docs/50 §3.2, §8.1; docs/questions/Q-512 (A-112), Q-560 item 2.
+#[must_use]
+pub const fn reported_source(source: Source) -> Option<EventSource> {
+    match source {
+        Source::Keyd => Some(EventSource::Keyd),
+        Source::Dird => Some(EventSource::Dird),
+        Source::Kdc => Some(EventSource::Kdc),
+        Source::LdapFront => Some(EventSource::LdapFront),
+        Source::Admind => Some(EventSource::Admind),
+        Source::Auditd => None,
+    }
+}
+
 /// Open connections per source slot.
 #[derive(Debug, Default)]
 struct Quota {
@@ -286,6 +310,12 @@ async fn connection(
     config: ListenerConfig,
     _held: QuotaSlot,
 ) {
+    // What every `Pong` on this connection reports: derived from the source
+    // its records go under. No peer maps to auditd's own source; if one did,
+    // the connection closes with no reply (fail closed).
+    let Some(reported) = reported_source(source) else {
+        return;
+    };
     let mut frames = FrameReader::new(AUDIT_CHANNEL.limit(Direction::Request));
     let mut cursor = AppendCursor::new();
     loop {
@@ -308,7 +338,7 @@ async fn connection(
         let (reply, keep_open) = match request {
             AuditRequest::Ping => {
                 let reply = if submitter.is_available() {
-                    Reply::Message(AuditReply::Pong)
+                    Reply::Message(AuditReply::Pong(reported))
                 } else {
                     Reply::Refused(Refused::Unavailable)
                 };

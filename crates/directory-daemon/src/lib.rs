@@ -72,7 +72,7 @@
 //! | module | what |
 //! |---|---|
 //! | [`policy`] | the shared unsigned development policy file (crates/policy-store, A-68) and its tier map |
-//! | [`audit_link`] | auditd verified first (R50-16) |
+//! | [`audit_link`] | auditd verified first (R50-16): dird's expectation for the one ipc-audit client (task R9b) |
 //! | `engine` | the engine thread, its bounded queue, the view sweep |
 //! | `listener` | `dird-kdc.sock`: identity, quota, framing, deadlines |
 //! | `ldap_engine` | the LDAP engine thread, its bounded queue, the per-request host |

@@ -8,13 +8,16 @@
 //! exactly the input; and a decoded `Ack` fed to a sender window that has a
 //! batch in flight is either applied (only when it names that batch's last
 //! number) or refused — never a panic, never a release of events that were
-//! not acknowledged.
+//! not acknowledged. A decoded `Pong` is exactly the envelope and one octet,
+//! the code of the source it names, inside the closed table (task R9b,
+//! docs/questions/Q-560: every sender compares that source with its own).
 //!
-//! Spec: docs/50 §3.3, §8.1; A-59.
+//! Spec: docs/50 §3.3, §8.1; A-59; docs/questions/Q-560.
 
 use ipc::Reply;
 use ipc_audit::{
-    decode_reply, AuditReply, EventBody, SendWindow, WindowConfig, WindowSummary, AUDIT_CHANNEL,
+    decode_reply, AuditReply, EventBody, EventSource, SendWindow, WindowConfig, WindowSummary,
+    AUDIT_CHANNEL,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -26,6 +29,11 @@ fuzz_target!(|data: &[u8]| {
         ipc::reply_round_trip_is_canonical::<AuditReply>(AUDIT_CHANNEL, data).unwrap_or(false),
         "canonical round trip"
     );
+    if let Reply::Message(AuditReply::Pong(source)) = reply {
+        assert_eq!(data.len(), ipc::BODY_HEADER_LEN + 1, "the envelope and one octet");
+        assert_eq!(data.last().copied(), Some(source.code()), "the source's code");
+        assert_eq!(EventSource::from_code(source.code()), Some(source));
+    }
     if let Reply::Message(AuditReply::Ack(ack)) = reply {
         let mut window = SendWindow::new(WindowConfig::DEFAULT);
         let event = EventBody::WindowSummary(WindowSummary {

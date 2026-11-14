@@ -14,7 +14,7 @@ use common::*;
 use ipc::{Direction, Reply};
 use ipc_audit::{
     decode_event, decode_reply, decode_request, encode_event, encode_reply, encode_request,
-    event_round_trip_is_canonical, Ack, Append, AuditReply, AuditRequest, EventBytes,
+    event_round_trip_is_canonical, Ack, Append, AuditReply, AuditRequest, EventBytes, EventSource,
     AUDIT_CHANNEL,
 };
 
@@ -92,7 +92,7 @@ fn reply_mutations() {
             through_seq: 0x0102_0304_0506_0708,
             head_hash: [0x5C; 32],
         })),
-        Reply::Message(AuditReply::Pong),
+        Reply::Message(AuditReply::Pong(EventSource::Kdc)),
         Reply::Refused(ipc::Refused::Unavailable),
     ] {
         let frame = encode_reply(&reply).unwrap();

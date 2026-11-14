@@ -104,11 +104,14 @@
 //! docs/37 §2 (D63: no code path disables audit for a sensitive operation),
 //! §5; docs/07 §8; docs/51 §5.7 item 2 (A-85); docs/52 §3.11 R6.
 
+use crate::log::{note, Note};
 use core::future::Future;
 use core::time::Duration;
+#[cfg(test)]
+use ipc_audit::{Ack, Append, WindowError};
 use ipc_audit::{
-    Ack, AckedIntent, Append, EventBody, FlushWait, KeydRecord, PendingIntent, Reservation,
-    Unflushed, WindowConfig, WindowError, WindowSteps,
+    AckedIntent, EventBody, FlushWait, KeydRecord, PendingIntent, Reservation, Unflushed,
+    WindowConfig, WindowSteps,
 };
 use ipc_keyd_server::KeyStateCall;
 use keyd::{AuditRecord, AuditSink, Operation};
@@ -559,25 +562,32 @@ impl AuditGate {
     }
 
     /// The next batch to send, if nothing is in flight and anything is
-    /// pending. Spec: docs/50 §3.6, §8.1.
+    /// pending (unit tests play the audit client — in the daemon the shared
+    /// client takes it from the shared gate, `ipc_audit::client`).
+    /// Spec: docs/50 §3.6, §8.1.
+    #[cfg(test)]
     pub(crate) fn next_batch(&self) -> Option<Append> {
         self.core.next_batch()
     }
 
     /// auditd's acknowledgement of the batch in flight; wakes the engine
-    /// thread waiting for an intent's acknowledgement (A-86).
+    /// thread waiting for an intent's acknowledgement (A-86). Unit tests
+    /// play auditd with it (in the daemon: the shared client).
     ///
     /// # Errors
     /// The window's [`WindowError`] (an acknowledgement that does not match;
     /// the connection is then closed).
     ///
     /// Spec: docs/50 §8.1.
+    #[cfg(test)]
     pub(crate) fn acknowledge(&self, ack: &Ack) -> Result<usize, WindowError> {
         self.core.acknowledge(ack)
     }
 
     /// The audit connection dropped: the batch in flight goes back to the
-    /// front. Spec: docs/50 §3.7, §8.1.
+    /// front (unit tests; in the daemon: the shared client).
+    /// Spec: docs/50 §3.7, §8.1.
+    #[cfg(test)]
     pub(crate) fn connection_lost(&self) {
         self.core.connection_lost();
     }
@@ -610,15 +620,32 @@ impl AuditGate {
             .await
     }
 
-    /// Wait until an event was committed (or a stored wake-up is pending).
-    pub(crate) async fn committed(&self) {
-        self.wake.notified().await;
-    }
-
     /// Read the window (unit tests).
     #[cfg(test)]
     pub(crate) fn inspect<T>(&self, read: impl FnOnce(&ipc_audit::SendWindow) -> T) -> Option<T> {
         self.core.inspect(read)
+    }
+}
+
+/// What keyd's gate gives the one audit client (`ipc_audit::client`, task
+/// R9b): the shared gate, the wake-up of a committed event, and keyd's
+/// notes when the link is restored or lost.
+/// Spec: docs/52 §3.11 R6, §3.12; docs/questions/Q-512, Q-560 item 4.
+impl ipc_audit::client::LinkedGate for AuditGate {
+    fn audit_gate(&self) -> &ipc_audit::AuditGate {
+        &self.core
+    }
+
+    fn recorded(&self) -> impl Future<Output = ()> + Send + '_ {
+        self.wake.notified()
+    }
+
+    fn link_restored(&self) {
+        note(Note::AuditRestored, None);
+    }
+
+    fn link_lost(&self) {
+        note(Note::AuditLost, None);
     }
 }
 

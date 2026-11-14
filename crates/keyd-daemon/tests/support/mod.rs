@@ -6,9 +6,10 @@
 //! * [`my_uid`] — the test process's uid, read from the owner of a directory
 //!   it created (std only, no `unsafe`).
 //! * [`FakeAuditd`] — a minimal audit server written from the audit channel's
-//!   own message set (crates/ipc-audit): `Ping` → `Pong`, `Append` → `Ack`
-//!   of its last number; it records the events it received and can be
-//!   stopped to play "auditd unreachable".
+//!   own message set (crates/ipc-audit): `Ping` → `Pong` naming the source
+//!   it records its peers under (keyd's unless told otherwise — task R9b),
+//!   `Append` → `Ack` of its last number; it records the events it received
+//!   and can be stopped to play "auditd unreachable".
 //! * [`Daemon`] — the real `keyd_daemon::serve` on its own thread with its
 //!   own current-thread runtime, stopped through `DaemonControl`.
 //! * [`RawClient`] — a blocking client of the keyd channel over a real
@@ -28,7 +29,7 @@
 use ipc::{decode_reply, encode_frame, Direction, FrameReader, Refused, Reply};
 use ipc_audit::{
     decode_event, decode_request, encode_reply, Ack, AuditReply, AuditRequest, EventBody,
-    AUDIT_CHANNEL,
+    EventSource, AUDIT_CHANNEL,
 };
 use ipc_keyd::{Answer, Call, KeydReply, KEYD_CHANNEL, REPLY_LIMIT};
 use keyd::{EntropySource, KeyStore, Keyd};
@@ -141,7 +142,10 @@ fn read_frame(stream: &mut UnixStream, limit: ipc::FrameLimit) -> Option<Vec<u8>
     }
 }
 
-/// A minimal auditd for the tests (module documentation).
+/// A minimal auditd for the tests (module documentation). Its `Pong` names
+/// the source it records its peers under (task R9b, docs/questions/Q-560):
+/// keyd's ([`FakeAuditd::start`]) unless started for another sender
+/// ([`FakeAuditd::start_recording_as`]) — or cross-wired by a test.
 pub struct FakeAuditd {
     path: PathBuf,
     stop: Arc<AtomicBool>,
@@ -151,7 +155,16 @@ pub struct FakeAuditd {
 }
 
 impl FakeAuditd {
+    /// An auditd that records its peers as keyd (the sender this support
+    /// was written for).
     pub fn start(path: &Path) -> FakeAuditd {
+        FakeAuditd::start_recording_as(path, EventSource::Keyd)
+    }
+
+    /// An auditd whose `Pong` names `source`: the source it records every
+    /// peer under (docs/50 §3.2) — a sender's own source, or another one to
+    /// play an auditd whose map is cross-wired (task R9b).
+    pub fn start_recording_as(path: &Path, source: EventSource) -> FakeAuditd {
         let _ = std::fs::remove_file(path);
         let listener = UnixListener::bind(path).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -174,7 +187,7 @@ impl FakeAuditd {
                                 .unwrap()
                                 .push(stream.try_clone().unwrap());
                             let events = Arc::clone(&events);
-                            std::thread::spawn(move || serve_audit(stream, &events));
+                            std::thread::spawn(move || serve_audit(stream, source, &events));
                         }
                         Err(e) if e.kind() == ErrorKind::WouldBlock => {
                             std::thread::sleep(Duration::from_millis(5));
@@ -219,12 +232,12 @@ impl Drop for FakeAuditd {
     }
 }
 
-/// One audit connection: `Ping` → `Pong`, `Append` → `Ack` (crates/ipc-audit
-/// channel; docs/50 §8.1). Anything else closes it.
-fn serve_audit(mut stream: UnixStream, events: &Mutex<Vec<EventBody>>) {
+/// One audit connection: `Ping` → `Pong` naming `source`, `Append` → `Ack`
+/// (crates/ipc-audit channel; docs/50 §8.1). Anything else closes it.
+fn serve_audit(mut stream: UnixStream, source: EventSource, events: &Mutex<Vec<EventBody>>) {
     while let Some(body) = read_frame(&mut stream, AUDIT_CHANNEL.limit(Direction::Request)) {
         let reply = match decode_request(&body) {
-            Ok(AuditRequest::Ping) => AuditReply::Pong,
+            Ok(AuditRequest::Ping) => AuditReply::Pong(source),
             Ok(AuditRequest::Append(append)) => {
                 let mut held = events.lock().unwrap();
                 for event in append.events() {

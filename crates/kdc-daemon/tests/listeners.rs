@@ -207,7 +207,7 @@ fn dird_down_or_on_another_policy_version_is_29() {
 
     let restart = |version: u64| {
         dird::Dird::start(
-            dird::params(&stack.dir, stack.uid, stack.uid, Duration::from_secs(5), 4),
+            support::stack_dird_params(&stack.dir, stack.uid),
             directory_daemon::StoreSource::Opened(std::sync::Arc::clone(&stack.directory.store)),
             shared_policy(version, vec![common::allow_kerberos()]),
         )
@@ -269,6 +269,40 @@ fn no_auditd_refuses_to_start() {
     stack.stop();
 }
 
+/// Attack — task R9b (docs/questions/Q-512, Q-560; docs/50 §3.2: the source
+/// is set from the uid): an auditd whose map gives the kdc's uid another
+/// source is refused at its first `Pong`, before any event is sent; the kdc
+/// does not start.
+#[test]
+fn an_auditd_recording_the_kdc_under_another_source_is_refused() {
+    let Some(mut stack) = Stack::start(7, 7, |_| {}).unwrap() else {
+        return;
+    };
+    stack.kdcd.take().unwrap().stop().unwrap();
+    stack.kdc_auditd.stop();
+    for other in ipc_audit::EventSource::ALL
+        .into_iter()
+        .filter(|s| *s != ipc_audit::EventSource::Kdc)
+    {
+        let mut cross_wired = FakeAuditd::start_recording_as(&stack.dir.join("ka.sock"), other);
+        let result = Kdcd::start(
+            kdc_params(&stack.dir.join("ka.sock"), stack.uid),
+            shared_policy(7, vec![common::allow_kerberos()]),
+            &stack.keyd_socket,
+            &stack.dird_socket,
+            HeldClock::at(common::now()),
+        );
+        assert!(
+            matches!(&result, Err(m) if m.contains("another source")),
+            "{other:?}: {:?}",
+            result.as_ref().err()
+        );
+        assert!(cross_wired.events().is_empty(), "{other:?}: nothing sent");
+        cross_wired.stop();
+    }
+    stack.stop();
+}
+
 /// docs/questions/Q-218 (A-57: "the kdc refuses every request that would
 /// produce issuance"), Q-252 item 8 (a) (A-64): the kdc's auditd stopped —
 /// requests are answered 29 over TCP and silence over UDP, and keyd is not
@@ -323,7 +357,8 @@ fn the_kdc_does_not_serve_without_its_audit() {
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(keyd_records(&stack), before, "keyd was not asked");
 
-    stack.kdc_auditd = FakeAuditd::start(&stack.dir.join("ka.sock"));
+    stack.kdc_auditd =
+        FakeAuditd::start_recording_as(&stack.dir.join("ka.sock"), ipc_audit::EventSource::Kdc);
     let mut nonce = 200u32;
     assert!(
         eventually(Duration::from_secs(15), || {

@@ -464,8 +464,30 @@ impl Server {
         queue_capacity: usize,
         run_writer: bool,
     ) -> Server {
+        Server::start_many(
+            std::slice::from_ref(settings),
+            config,
+            queue_capacity,
+            run_writer,
+        )
+    }
+
+    /// As [`Server::start`], with one writer (on the log of the first
+    /// settings) behind one listener per settings — each on its own
+    /// `audit_socket` with its own `uid → source` map. A single-uid test
+    /// world labels each sender with its own source this way: one uid
+    /// carries one source per map (docs/50 R50-3, §3.2), and every sender
+    /// requires its own source on each connection (task R9b,
+    /// docs/questions/Q-560 item 6). Each listener has its own quota.
+    pub fn start_many(
+        listeners: &[AuditdSettings],
+        config: ListenerConfig,
+        queue_capacity: usize,
+        run_writer: bool,
+    ) -> Server {
+        let first = listeners.first().expect("at least one listener");
         let opened = open_log(
-            settings.audit_log_path().as_path(),
+            first.audit_log_path().as_path(),
             SegmentLimit::DEFAULT,
             log_uid(),
         )
@@ -477,17 +499,20 @@ impl Server {
             .enable_time()
             .build()
             .expect("runtime");
-        let socket = settings.audit_socket().as_path().to_path_buf();
-        let bound = {
-            let _context = runtime.enter();
-            listener::bind(&socket).expect("bind")
-        };
-        let _serving = runtime.spawn(listener::serve(
-            bound,
-            Arc::new(settings.uid_sources().clone()),
-            submitter,
-            config,
-        ));
+        let socket = first.audit_socket().as_path().to_path_buf();
+        for settings in listeners {
+            let bound = {
+                let _context = runtime.enter();
+                listener::bind(settings.audit_socket().as_path()).expect("bind")
+            };
+            let _serving = runtime.spawn(listener::serve(
+                bound,
+                Arc::new(settings.uid_sources().clone()),
+                submitter.clone(),
+                config,
+            ));
+        }
+        drop(submitter);
         let (writer, held_inbox) = if run_writer {
             let sink = opened.sink;
             (

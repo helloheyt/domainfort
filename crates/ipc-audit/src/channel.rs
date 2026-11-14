@@ -5,7 +5,7 @@
 //! request kinds (sender → auditd)       reply kinds (auditd → sender)
 //!   0x01 Append { first_seq: u64,         0x01 Ack { through_seq: u64,
 //!                 events: seq<bytes<8192>, 16> }      head_hash: [u8; 32] }
-//!   0x02 Ping   { }                       0x02 Pong { }
+//!   0x02 Ping   { }                       0x02 Pong { source: u8 }
 //!                                         0xFF Refused (ipc, every channel)
 //! ```
 //!
@@ -20,10 +20,17 @@
 //! (docs/50 §7.5).
 //!
 //! The source of the events is the connection's peer uid, never a field
-//! (docs/50 §3.2): no message carries a source.
+//! (docs/50 §3.2): no request carries a source. auditd **reports** it: the
+//! `Pong` names the [`EventSource`] auditd records this connection's events
+//! under — the one its own map gives the peer uid — so that a sender can
+//! check, on every new connection and before its first batch, that auditd
+//! records it under its own source (task R9b, docs/52 §3.12 C12,
+//! docs/questions/Q-512, Q-560). The field was appended to the `Pong` that
+//! was empty before (docs/50 §3.3: append-only; the channel version stays
+//! 1 — docs/questions/Q-560 item 3).
 //!
-//! Spec: docs/50 R50-17, §3.3, §3.6, §7.5, §8.1, §10; A-59 (REFUSED_KIND);
-//! docs/questions/Q-252 items 1, 2.
+//! Spec: docs/50 R50-17, §3.2, §3.3, §3.6, §7.5, §8.1, §10; A-59
+//! (REFUSED_KIND); docs/questions/Q-252 items 1, 2, Q-512 (A-112), Q-560.
 
 use crate::event::{EventBytes, MAX_EVENT_OCTETS};
 use ipc::{
@@ -184,6 +191,79 @@ impl Payload for Ack {
     }
 }
 
+/// The source auditd records a connection's events under: the process the
+/// connection's peer uid is mapped to in auditd's own `uid → source` map
+/// (docs/50 §3.2: "auditd: every service's uid, each marked as the event's
+/// source — the source is set from the uid, not from the event body";
+/// §8.1: "the record's source is set from the connection's uid").
+///
+/// auditd names it in every `Pong` ([`AuditReply::Pong`]); a sender expects
+/// its own on every new connection before it sends a batch (task R9b,
+/// docs/52 §3.12 C12, docs/questions/Q-512).
+///
+/// Closed table: the processes that can be mapped to a uid (docs/50 §2.4;
+/// crates/config `AuditSource`). The codes are the audit log's own source
+/// codes (crates/audit-log `Source::code`: keyd 1, dird 2, kdc 3,
+/// ldap-front 4, admind 5) — one numbering for "the source" on the wire and
+/// on disk; crates/audit-daemon's tests pin them equal. auditd's own source
+/// (code 6 in the log) names no peer, so it has no value here: 6, like 0 and
+/// every other code, is outside the table (docs/questions/Q-560 item 2).
+///
+/// Spec: docs/50 §2.4, §3.2, §3.3 ("enum = `u8` from a closed table"), §8.1;
+/// docs/52 §3.12; docs/questions/Q-512 (A-112), Q-560.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EventSource {
+    /// keyd. Spec: docs/50 §2.4.
+    Keyd,
+    /// dird (the LDAP engine's and the admin plane's events). Spec: docs/50
+    /// §2.4, §4.2; docs/51 §5.7.
+    Dird,
+    /// The kdc. Spec: docs/50 §2.4.
+    Kdc,
+    /// ldap-front (sends no events; verifies auditd at start). Spec: docs/50
+    /// §2.4, §4.2.
+    LdapFront,
+    /// admind. Spec: docs/51 §5.7 item 3.
+    Admind,
+}
+
+impl EventSource {
+    /// Every source, in code order.
+    pub const ALL: [EventSource; 5] = [
+        EventSource::Keyd,
+        EventSource::Dird,
+        EventSource::Kdc,
+        EventSource::LdapFront,
+        EventSource::Admind,
+    ];
+
+    /// The wire code (the audit log's source code). Project choice; 0 is
+    /// never a code.
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        match self {
+            EventSource::Keyd => 1,
+            EventSource::Dird => 2,
+            EventSource::Kdc => 3,
+            EventSource::LdapFront => 4,
+            EventSource::Admind => 5,
+        }
+    }
+
+    /// The source for a wire code, or `None` outside the closed table.
+    #[must_use]
+    pub const fn from_code(code: u8) -> Option<EventSource> {
+        match code {
+            1 => Some(EventSource::Keyd),
+            2 => Some(EventSource::Dird),
+            3 => Some(EventSource::Kdc),
+            4 => Some(EventSource::LdapFront),
+            5 => Some(EventSource::Admind),
+            _ => None,
+        }
+    }
+}
+
 /// The request direction (sender → auditd). Spec: docs/50 §3.3, §7.5, §8.1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuditRequest {
@@ -225,8 +305,9 @@ impl MessageSet for AuditRequest {
 pub enum AuditReply {
     /// Persistence acknowledgement.
     Ack(Ack),
-    /// Health check answer.
-    Pong,
+    /// Health check answer: the source auditd records this connection's
+    /// events under ([`EventSource`]; task R9b, docs/questions/Q-560).
+    Pong(EventSource),
 }
 
 impl MessageSet for AuditReply {
@@ -235,21 +316,34 @@ impl MessageSet for AuditReply {
     fn kind(&self) -> u8 {
         match self {
             AuditReply::Ack(_) => KIND_ACK,
-            AuditReply::Pong => KIND_PONG,
+            AuditReply::Pong(_) => KIND_PONG,
         }
     }
 
+    /// `Pong`: `source: u8` — the one field, appended to the reply that was
+    /// empty before (docs/50 §3.3: positional fields, enum = `u8` from a
+    /// closed table). Spec: docs/questions/Q-560 item 1.
     fn write_payload(&self, writer: &mut Writer) -> ipc::Result<()> {
         match self {
             AuditReply::Ack(ack) => ack.write_fields(writer),
-            AuditReply::Pong => Ok(()),
+            AuditReply::Pong(source) => writer.write_u8(source.code()),
         }
     }
 
+    /// The same fields. A `Pong` without its octet (the empty form of
+    /// before) is `Truncated`, a code outside [`EventSource`]'s table
+    /// `UnknownCode`, an octet after it `TrailingBytes` (ipc `decode_reply`)
+    /// — the sender drops the connection (docs/50 §3.3). Spec: docs/50 §3.3;
+    /// docs/questions/Q-560 item 1.
     fn read_payload(kind: u8, reader: &mut Reader<'_>) -> ipc::Result<AuditReply> {
         match kind {
             KIND_ACK => Ack::read_fields(reader).map(AuditReply::Ack),
-            KIND_PONG => Ok(AuditReply::Pong),
+            KIND_PONG => {
+                let code = reader.read_u8()?;
+                EventSource::from_code(code)
+                    .map(AuditReply::Pong)
+                    .ok_or(ipc::Error::UnknownCode)
+            }
             _ => Err(ipc::Error::UnknownKind),
         }
     }

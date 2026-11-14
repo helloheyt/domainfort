@@ -319,10 +319,10 @@ where
     C: Clock,
     F: FnOnce(&KerberosTime) -> Result<Keyd<S, RecordBuffer, E>, ConfigError>,
 {
-    // 1. auditd first (R50-16).
-    let first = audit_client::connect_verified(&params.audit)
-        .await
-        .map_err(DaemonError::Audit)?;
+    // 1. auditd first (R50-16): its uid and the source it records keyd
+    //    under (task R9b), both verified before anything else is sent.
+    let link = audit_client::link(&params.audit).map_err(DaemonError::Audit)?;
+    let first = link.connect().await.map_err(DaemonError::Audit)?;
     note(Note::AuditVerified, None);
     let gate = Arc::new(AuditGate::new(params.window));
     gate.set_reachable(true);
@@ -346,12 +346,8 @@ where
         })
         .map_err(DaemonError::Engine)?;
 
-    // 3. The audit client.
-    let audit_task = tokio::spawn(audit_client::run(
-        Arc::clone(&gate),
-        params.audit.clone(),
-        first,
-    ));
+    // 3. The audit client (the one of ipc-audit, task R9b).
+    let audit_task = tokio::spawn(link.run(Arc::clone(&gate), first));
 
     // 4. The listener — `keyd_socket`, then any extra listener on the same
     // engine (tests only, docs/questions/Q-453). All are bound before any

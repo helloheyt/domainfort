@@ -1475,7 +1475,10 @@ impl World {
                 let keyd_socket = keyd_socket.clone();
                 let mut params = dird::params(&dir, uid, uid, Duration::from_secs(5), 4);
                 params.clock = SharedClock::new(FixedNow);
-                dird_auditd = Some(FakeAuditd::start(&params.audit.socket));
+                dird_auditd = Some(FakeAuditd::start_recording_as(
+                    &params.audit.socket,
+                    ipc_audit::EventSource::Dird,
+                ));
                 let realm = common::realm();
                 let factory: VerifierFactory = Arc::new(move || {
                     let verifier: Box<dyn TicketVerifier> = Box::new(

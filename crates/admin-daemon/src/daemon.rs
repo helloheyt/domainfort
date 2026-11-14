@@ -271,11 +271,11 @@ async fn wait_until(grace: Duration, done: impl Fn() -> bool) {
 /// Spec: docs/51 §5.1, §5.7, §7.6; docs/50 R50-7, R50-14, R50-16, R50-17,
 /// §3.1, §3.6, §7.5, §8.1.
 pub async fn serve(params: DaemonParams, control: DaemonControl) -> Result<Stopped, DaemonError> {
-    // 1. auditd first (R50-16); the verified connection is kept for
-    //    admind's events.
-    let audit = audit_link::connect_verified(&params.audit)
-        .await
-        .map_err(DaemonError::Audit)?;
+    // 1. auditd first (R50-16): its uid and the source it records admind
+    //    under (task R9b); the verified connection is kept for admind's
+    //    events.
+    let link = audit_link::link(&params.audit).map_err(DaemonError::Audit)?;
+    let audit = link.connect().await.map_err(DaemonError::Audit)?;
     note(Note::AuditVerified, None);
     let gate = Arc::new(AuditGate::new(params.audit_window));
     gate.set_reachable(true);
@@ -295,11 +295,7 @@ pub async fn serve(params: DaemonParams, control: DaemonControl) -> Result<Stopp
             ended.stop.notify_one();
         })
         .map_err(|_| DaemonError::Worker)?;
-    let audit_task = tokio::spawn(audit_link::run(
-        Arc::clone(&gate),
-        params.audit.clone(),
-        audit,
-    ));
+    let audit_task = tokio::spawn(link.run(Arc::clone(&gate), audit));
 
     // 3. The listener.
     let listener = match bind(&params.admin_socket) {

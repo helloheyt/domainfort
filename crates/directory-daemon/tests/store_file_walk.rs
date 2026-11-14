@@ -60,7 +60,7 @@ fn the_store_path_is_walked_before_dird_starts() {
     let path = real.join("directory.redb");
     drop(Directory::standard(&path));
     std::os::unix::fs::symlink(&real, files.join("via")).unwrap();
-    let _auditd = FakeAuditd::start(&dir.join("a.sock"));
+    let _auditd = FakeAuditd::start_recording_as(&dir.join("a.sock"), ipc_audit::EventSource::Dird);
 
     let through_link = start(&dir, uid, files.join("via/directory.redb"))
         .err()

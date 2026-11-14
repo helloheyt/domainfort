@@ -255,6 +255,10 @@ fn the_audit_log_verifies_and_holds_every_daemons_events() {
         assert_eq!(head.seq, records.len() as u64, "one chain from genesis");
         assert_eq!(records.last().map(|r| r.seq), Some(head.seq));
 
+        // The transport identity (docs/50 §3.2): the peer uid auditd read,
+        // and the source its listener's map gives that uid — each sender's
+        // own, the one every sender verified on each connection (task R9b).
+        assert_recorded_under_their_senders(&records, h.uid);
         let mut kdc_events = Vec::new();
         let mut keyd_records = Vec::new();
         let mut ldap_events = Vec::new();
@@ -262,10 +266,6 @@ fn the_audit_log_verifies_and_holds_every_daemons_events() {
             if record.source == Source::Auditd {
                 continue;
             }
-            // The transport identity (docs/50 §3.2): the peer uid auditd
-            // read, and the one source its map gives that uid.
-            assert_eq!(record.source_uid, h.uid, "the sender's peer uid");
-            assert_eq!(record.source, Source::Kdc, "the label of the one uid");
             match decode_event(&record.payload).expect("every payload decodes") {
                 EventBody::Kdc(event) => kdc_events.push(*event),
                 EventBody::Keyd(record) => keyd_records.push(*record),
