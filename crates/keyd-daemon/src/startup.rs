@@ -11,8 +11,7 @@ use core::fmt;
 use daemon_sandbox::{HardeningPlan, PlanError, ProcessIdentity};
 use keyd::{ConfigError, InMemoryKeyStore, Keyd, KeydConfig, OsEntropy};
 use krb_proto::{KerberosTime, Realm};
-use protected_file::Refusal;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use protected_file::{ExistingGroup, Refusal, SocketDirectoryError, SocketDirectoryOwner};
 use std::path::Path;
 
 /// The owner keyd's configuration file must have: root.
@@ -38,10 +37,11 @@ pub const LOCKED_MEMORY_LIMIT: u64 = 256 * 1024 * 1024;
 /// quotas"; §6.4: keyd "small nofile").
 pub const OPEN_FILES_HEADROOM: u64 = 32;
 
-/// Mode of the socket directory: owner all, group enter, other nothing.
+/// Mode of the socket directory: owner all, group enter, other nothing —
+/// the one value crates/protected-file creates every socket directory with.
 /// Spec: docs/50 §3.1 ("each socket in its own directory, owned by the
 /// server's uid, mode 0750").
-pub const SOCKET_DIRECTORY_MODE: u32 = 0o750;
+pub const SOCKET_DIRECTORY_MODE: u32 = protected_file::SOCKET_DIRECTORY_MODE;
 
 /// Why start-up failed. Carries no file content (docs/50 §8.2; the
 /// configuration's own errors never echo a value, A-60).
@@ -64,7 +64,9 @@ pub enum StartupError {
     /// The socket path has no parent directory.
     SocketDirectory,
     /// The socket directory exists but is not a directory owned by the
-    /// account keyd drops to with no access for others and no group write.
+    /// account keyd drops to with no access for others and no group write,
+    /// or a directory on its path is a symbolic link, owned by neither root
+    /// nor keyd's account, or writable by group or others (task R11c).
     SocketDirectoryPermissions,
     /// The socket directory could not be created or handed to keyd's
     /// account.
@@ -151,47 +153,42 @@ pub fn realm(settings: &KeydSettings) -> Result<Realm, StartupError> {
 }
 
 /// The privileged set-up (as root, before the drop): the socket's own
-/// directory. Missing ⇒ created with mode 0750 and handed to keyd's account
-/// (uid and gid); present ⇒ it must be a directory owned by keyd's uid with
-/// no group write and no access for others. The socket file itself is bound
-/// later, after the drop, by keyd's account.
+/// directory, through the one implementation every socket-serving daemon
+/// shares (`protected_file::prepare_socket_directory`, task R11c): its
+/// parent walked from `/` (no link, every directory root's or keyd's, none
+/// writable by group or others); missing ⇒ created relative to the parent,
+/// mode exactly 0750, handed to keyd's account (uid and gid) with `fchmod` /
+/// `fchown` on its own descriptor — never by path; present ⇒ it must be a
+/// directory (not a link) owned by keyd's uid with no group write and no
+/// access for others (its group is the operator's choice of the channel's
+/// clients); a stale socket in it is removed relative to its descriptor.
+/// The socket file itself is bound later, after the drop, by keyd's
+/// account.
 ///
 /// # Errors
 /// [`StartupError`].
 ///
 /// Spec: docs/50 §3.1 ("each socket in its own directory, owned by the
 /// server's uid, mode 0750, group = the channel's clients" — the group is not
-/// a setting: docs/questions/Q-260 item 6), §6.2.
+/// a setting: docs/questions/Q-260 item 6), §6.2; docs/52 §3.13 (C13);
+/// docs/questions/Q-532 item 1 (A-109), Q-550.
 pub fn prepare_socket_directory(settings: &KeydSettings) -> Result<(), StartupError> {
-    let directory = settings
-        .keyd_socket()
-        .as_path()
-        .parent()
-        .ok_or(StartupError::SocketDirectory)?;
     let account = settings.run_as();
-    match std::fs::symlink_metadata(directory) {
-        Ok(metadata) => {
-            if !metadata.is_dir() || metadata.uid() != account.uid() || metadata.mode() & 0o027 != 0
-            {
-                return Err(StartupError::SocketDirectoryPermissions);
-            }
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::DirBuilder::new()
-                .mode(SOCKET_DIRECTORY_MODE)
-                .create(directory)
-                .map_err(|_| StartupError::SocketDirectoryCreate)?;
-            std::fs::set_permissions(
-                directory,
-                std::fs::Permissions::from_mode(SOCKET_DIRECTORY_MODE),
-            )
-            .map_err(|_| StartupError::SocketDirectoryCreate)?;
-            std::os::unix::fs::chown(directory, Some(account.uid()), Some(account.gid()))
-                .map_err(|_| StartupError::SocketDirectoryCreate)
-        }
-        Err(_) => Err(StartupError::SocketDirectoryCreate),
-    }
+    protected_file::prepare_socket_directory(
+        settings.keyd_socket().as_path(),
+        SocketDirectoryOwner {
+            uid: account.uid(),
+            gid: account.gid(),
+            existing_group: ExistingGroup::ChosenByOperator,
+        },
+    )
+    .map_err(|error| match error {
+        SocketDirectoryError::NoSocketDirectory => StartupError::SocketDirectory,
+        SocketDirectoryError::NotAnAccount
+        | SocketDirectoryError::Path(_)
+        | SocketDirectoryError::Directory(_) => StartupError::SocketDirectoryPermissions,
+        SocketDirectoryError::Io(_) => StartupError::SocketDirectoryCreate,
+    })
 }
 
 /// keyd's hardening plan: the docs/50 §6.4 baseline (drop to `run_as_uid` /

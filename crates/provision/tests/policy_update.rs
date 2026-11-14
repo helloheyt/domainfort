@@ -112,12 +112,15 @@ fn files_the_daemons_would_refuse_are_refused() {
     let path = &input.paths.policy;
     let original = std::fs::read(path.as_path()).unwrap();
     let change = [TierChange::AddSubtree(staff_dn(), Tier::Tier1)];
-    // Not owned by "root" (the recorder's root uid is another uid).
+    // Not owned by "root" (the recorder's root uid is another uid): the
+    // walk from `/` refuses the first directory of the test account before
+    // the file is looked at (task R11c: the policy's path goes through
+    // crates/protected-file — Q-468 option 2(b)).
     let err = update_policy(path, &change, &mut Recorder::new(uid + 1)).unwrap_err();
-    assert!(matches!(
+    assert_eq!(
         err,
-        UpdateError::Load(policy_store::LoadError::Permissions)
-    ));
+        UpdateError::Path(protected_file::PathBreak::DirectoryWrongOwner)
+    );
     // Group-writable.
     std::fs::set_permissions(path.as_path(), std::fs::Permissions::from_mode(0o664)).unwrap();
     let err = update_policy(path, &change, &mut Recorder::new(uid)).unwrap_err();
@@ -135,6 +138,18 @@ fn files_the_daemons_would_refuse_are_refused() {
         err,
         UpdateError::Load(policy_store::LoadError::Policy(_))
     ));
+    // A link in a directory component (task R11c: the policy's path is
+    // walked from `/`): refused before the file is read; nothing is created
+    // beside the link's target.
+    std::fs::create_dir(dir.join("etc-alias-real")).unwrap();
+    std::fs::copy(path.as_path(), dir.join("etc-alias-real/policy.store")).unwrap();
+    std::os::unix::fs::symlink(dir.join("etc-alias-real"), dir.join("etc-alias")).unwrap();
+    let through_link = common::path(&dir, "etc-alias/policy.store");
+    assert_eq!(
+        update_policy(&through_link, &change, &mut Recorder::new(uid)).unwrap_err(),
+        UpdateError::Path(protected_file::PathBreak::NotADirectory)
+    );
+    assert!(!dir.join("etc-alias-real/policy.store.next").exists());
     // A link to the real file.
     let link = common::path(&dir, "etc/link.store");
     std::os::unix::fs::symlink(path.as_path(), link.as_path()).unwrap();

@@ -75,7 +75,40 @@
 //! descriptor — and gives each entry's facts without following a link. No
 //! entry point takes a directory descriptor or a path from outside the walk,
 //! so every open of a protected or data file passes the walk
-//! (docs/questions/Q-481 items a-c; Q-530).
+//! (docs/questions/Q-481 items a-c; Q-530). An existing data file a daemon
+//! keeps after its drop is judged by [`data_file_rule`] (a regular file, the
+//! daemon's, no access at all for group or others — created 0600; task
+//! R11c, Q-531 item 4).
+//!
+//! # Creating, renaming and removing entries (task R11c)
+//!
+//! The privileged path operations that are not opens go through the same
+//! walk and are made **relative to the walked directory's descriptor**, so
+//! no directory component is ever followed through a link and nothing is
+//! changed by path after it was checked (docs/52 C13; Q-532 items 1, 2, 5;
+//! A-109):
+//!
+//! * [`prepare_socket_directory`] (`src/socket_directory.rs`): a daemon's
+//!   socket directory, as root before the privilege drop — the parent
+//!   walked, the directory created with `mkdirat` relative to it if absent,
+//!   opened without following a link, its mode and owner set with `fchmod` /
+//!   `fchown` **on that descriptor**, its facts checked; and a stale socket
+//!   in it removed with `unlinkat` relative to it;
+//! * the installer's operations (`src/entries.rs`; provision, docs/51 §4.3
+//!   steps 3-9, A-92): [`entry_facts`], [`directory_device`],
+//!   [`create_new_directory`], [`create_new_file`],
+//!   [`create_new_read_write`], [`rename_no_replace`], [`rename_replace`],
+//!   [`remove_empty_directory`], [`sync_directory`] — each walks its path(s)
+//!   and acts with the `*at` call relative to the walked descriptor.
+//!
+//! Every mode a created entry gets is one of a closed set (0400, 0600, 0644
+//! for files; 0700 for the installer's staging directory; 0750 for a socket
+//! directory), set exactly with `fchmod` whatever the umask. No entry point
+//! hands out a directory descriptor: the one place a caller sees one is the
+//! owner-change step of [`create_new_directory`] (a borrowed descriptor of
+//! the directory just created, for provision's `Ownership`), and the source
+//! scans (`tests/single_open_path.rs`, `tests/single_path_operation.rs`)
+//! make any `*at` call outside this crate fail a test.
 //!
 //! # Residuals
 //!
@@ -87,6 +120,13 @@
 //! * A non-regular file swapped in between the file's inspection and its open
 //!   makes the open itself block on a FIFO (Q-442 item 7); the `fstat` check
 //!   refuses anything else.
+//! * A Unix socket is bound by path (there is no descriptor-relative bind),
+//!   and its mode cannot be set by name without following a link on Linux
+//!   (`chmodat` with `SYMLINK_NOFOLLOW` is not implemented there): the
+//!   daemons bind and set the socket's mode by path after the drop, inside
+//!   the socket directory [`prepare_socket_directory`] checked at start —
+//!   so only root or the daemon's own account can change any component of
+//!   that path (docs/questions/Q-550 item 2).
 //! * The Linux behaviour (the `openat` error for a link under `O_NOFOLLOW`,
 //!   the `Stat` field types) is taken from the docs.rs pages and has run on
 //!   macOS only (P-27).
@@ -126,16 +166,39 @@
 //! `Dir` that reads entries from the given directory file descriptor"),
 //! `fs::Dir::read` ("`None` means the end of the directory"),
 //! `fs::DirEntry::file_name` and the crate's feature list (`std` enables
-//! `alloc`, which `Dir` needs) — no feature added. No other implementation
-//! consulted or recalled (AGENTS.md §1-3).
+//! `alloc`, which `Dir` needs) — no feature added; for task R11c (read in
+//! that session) `fs::mkdirat` ("Creates a directory"), `fs::fchown` ("Sets
+//! open file or directory ownership"), `fs::Uid::from_raw` /
+//! `fs::Gid::from_raw` ("must be the value of a valid Unix user ID, and not
+//! `-1`"), `fs::unlinkat` (with `AtFlags::REMOVEDIR` "this removes a
+//! directory"), `fs::renameat`, `fs::renameat_with`, `fs::RenameFlags`
+//! (`NOREPLACE` = `RENAME_NOREPLACE`), `fs::fsync`, `fs::chmodat` (on Linux
+//! `AtFlags::SYMLINK_NOFOLLOW` "is not implemented" — so a socket's mode
+//! cannot be set by name without following a link; not used),
+//! `fs::Stat` (`st_dev`, `st_gid`), `fs::FileType::is_socket`, `fs::Mode`
+//! (`RWXU`, `RGRP`, `XGRP`, `ROTH`), `io::Errno::kind` — all under the `fs`
+//! (and `std`) features already enabled: none added. No other
+//! implementation consulted or recalled (AGENTS.md §1-3).
 //!
-//! Spec: docs/50 §7.1, §7.2, R50-12, §6.4; docs/51 §4.3 steps 7, 8, §4.4;
-//! docs/52 §3.13 (R11); A-86; A-96; A-99; A-102; A-104; Q-468; Q-481.
+//! Spec: docs/50 §3.1, §7.1, §7.2, R50-12, §6.4; docs/51 §4.3 steps 3-9,
+//! §4.4; docs/52 §3.13 (R11); A-86; A-92; A-96; A-99; A-102; A-104; A-109;
+//! Q-468; Q-481; Q-531; Q-532.
 
+mod entries;
 mod listing;
+mod socket_directory;
 mod write;
 
+pub use entries::{
+    create_new_directory, create_new_file, create_new_read_write, directory_device, entry_facts,
+    remove_empty_directory, rename_no_replace, rename_replace, sync_directory, Device, EntryError,
+    NewFileMode,
+};
 pub use listing::for_each_entry_beside;
+pub use socket_directory::{
+    prepare_socket_directory, ExistingGroup, SocketDirectoryBreak, SocketDirectoryError,
+    SocketDirectoryOwner, SOCKET_DIRECTORY_MODE,
+};
 pub use write::{create_new_append, open_append, open_read_write};
 
 use core::fmt;
@@ -152,6 +215,12 @@ use rustix::fs::{AtFlags, FileType, Mode, OFlags, RawMode, Stat, CWD};
 /// file, and every directory on a protected path, must not have.
 /// Spec: docs/50 §7.1 ("file root:0644"); Q-468 option 2(b).
 pub const GROUP_OR_OTHER_WRITE: u32 = 0o022;
+
+/// Every permission bit for group and for others: the bits a data file a
+/// daemon keeps after its privilege drop must not have at all (created
+/// 0600). Spec: docs/50 §6.4 ("owned by dird, 0600"); docs/questions Q-531
+/// item 4 (A-109: "no group/other access; no reader group in the design").
+pub const GROUP_OR_OTHER_ACCESS: u32 = 0o077;
 
 /// Every permission bit of a mode (owner, group, other, and the set-user-id,
 /// set-group-id and sticky bits), for a rule that requires an exact mode
@@ -220,23 +289,26 @@ impl FileFacts {
 /// (its name in the directory before it, then its opened descriptor).
 /// Spec: Q-468 options 1, 2(b).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DirectoryFacts {
+pub(crate) struct DirectoryFacts {
     /// The facts are a directory's (a link's facts never are).
-    directory: bool,
+    pub(crate) directory: bool,
     /// The owner uid.
-    owner_uid: u32,
+    pub(crate) owner_uid: u32,
+    /// The group gid (the socket-directory rule's, task R11c).
+    pub(crate) group_gid: u32,
     /// The whole `st_mode`.
-    mode: u32,
+    pub(crate) mode: u32,
 }
 
 impl DirectoryFacts {
     /// The facts of a `stat` result.
     /// Spec: rustix docs.rs `fs::FileType::from_raw_mode`, `is_dir`
-    /// ("Returns true if this is a directory").
-    fn of(stat: &Stat) -> DirectoryFacts {
+    /// ("Returns true if this is a directory"), `fs::Stat` (`st_gid`).
+    pub(crate) fn of(stat: &Stat) -> DirectoryFacts {
         DirectoryFacts {
             directory: FileType::from_raw_mode(stat.st_mode).is_dir(),
             owner_uid: stat.st_uid,
+            group_gid: stat.st_gid,
             mode: raw_mode_bits(stat.st_mode),
         }
     }
@@ -426,6 +498,47 @@ pub(crate) fn absolute(path: &Path) -> io::Result<Cow<'_, Path>> {
     }
 }
 
+/// Steps 0 and 1 of the walk for a path that names a **directory**: every
+/// component, the last included, entered under the directory rule (with
+/// `file_owner_uid` as the owner it admits besides root); the last one's
+/// descriptor is returned.
+///
+/// # Errors
+/// [`OpenError::Path`], [`OpenError::Io`].
+///
+/// Spec: Q-468 options 1, 2(b) (A-102); task R11c (the installer's
+/// directories, docs/51 §4.3 step 9: `fsync` of each target directory).
+pub(crate) fn walk_to_directory<E>(
+    absolute: &[u8],
+    file_owner_uid: u32,
+) -> Result<OwnedFd, OpenError<E>> {
+    let (parent, name) = walk(absolute, file_owner_uid)?;
+    enter(&parent, name, file_owner_uid)
+}
+
+/// Create a directory named `name` relative to `parent` (`mkdirat` fails on
+/// any existing name, a dangling link included — nothing is followed), open
+/// it without following a link, and set its mode exactly to `mode` on that
+/// descriptor (the umask can neither widen nor narrow it). The descriptor
+/// is returned for the owner change and the checks.
+///
+/// # Errors
+/// The failing system call's [`rustix::io::Errno`].
+///
+/// Spec: docs/52 §3.13 (C13), Q-532 items 1, 2 (A-109); rustix docs.rs
+/// `fs::mkdirat` ("Creates a directory"), `fs::openat`, `fs::fchmod` ("Sets
+/// open file or directory permissions").
+pub(crate) fn make_directory(
+    parent: impl AsFd,
+    name: &[u8],
+    mode: Mode,
+) -> Result<OwnedFd, rustix::io::Errno> {
+    rustix::fs::mkdirat(&parent, name, mode)?;
+    let directory = open_directory_no_follow(&parent, name)?;
+    rustix::fs::fchmod(&directory, mode)?;
+    Ok(directory)
+}
+
 /// The directory part and the file name of an absolute path's octets: the
 /// name is what follows the last separator, and must be a file name.
 ///
@@ -434,7 +547,7 @@ pub(crate) fn absolute(path: &Path) -> io::Result<Cow<'_, Path>> {
 ///
 /// Spec: Q-468 option 1 (the file is opened relative to the last directory
 /// descriptor).
-fn split(absolute: &[u8]) -> Result<(&[u8], &[u8]), PathBreak> {
+pub(crate) fn split(absolute: &[u8]) -> Result<(&[u8], &[u8]), PathBreak> {
     let mut parts = absolute.rsplitn(2, |octet| *octet == SEPARATOR);
     let name = parts.next().unwrap_or_default();
     let directories = parts.next().unwrap_or_default();
@@ -469,7 +582,7 @@ fn root<E>(file_owner_uid: u32) -> Result<OwnedFd, OpenError<E>> {
 ///
 /// Spec: Q-468 options 1, 2(b); rustix docs.rs `fs::statat` with
 /// `AtFlags::SYMLINK_NOFOLLOW`, `fs::openat`, `fs::fstat`.
-fn enter<E>(
+pub(crate) fn enter<E>(
     parent: impl AsFd,
     component: &[u8],
     file_owner_uid: u32,
@@ -487,7 +600,7 @@ fn enter<E>(
 /// Spec: Q-468 option 1 (`O_RDONLY | O_NOFOLLOW | O_DIRECTORY |
 /// O_CLOEXEC`); rustix docs.rs `fs::openat` (the mode is only significant
 /// when creating a file).
-fn open_directory_no_follow(
+pub(crate) fn open_directory_no_follow(
     parent: impl AsFd,
     component: &[u8],
 ) -> Result<OwnedFd, rustix::io::Errno> {
@@ -612,6 +725,56 @@ pub fn configuration_file_rule(facts: &FileFacts, owner_uid: u32) -> Result<(), 
     }
     if facts.mode & GROUP_OR_OTHER_WRITE != 0 {
         return Err(RuleBreak::WritableByGroupOrOthers);
+    }
+    Ok(())
+}
+
+/// Which part of the data-file rule a file broke.
+/// Spec: docs/50 §6.4; docs/questions Q-531 item 4 (A-109).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataFileBreak {
+    /// Not a regular file — a symbolic link, a directory, a FIFO, a device
+    /// or a socket.
+    NotRegularFile,
+    /// Not owned by the daemon's account.
+    WrongOwner,
+    /// Any permission bit for its group or for others is set (readable,
+    /// writable or executable by them).
+    AccessibleByGroupOrOthers,
+}
+
+impl fmt::Display for DataFileBreak {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            DataFileBreak::NotRegularFile => "not a regular file",
+            DataFileBreak::WrongOwner => "not owned by the daemon's account",
+            DataFileBreak::AccessibleByGroupOrOthers => "accessible by group or others",
+        })
+    }
+}
+
+/// The data-file rule on a file's facts — the files a daemon keeps with its
+/// own account after the privilege drop (auditd's log segments, dird's
+/// directory store), which this crate creates 0600: a regular file, owned
+/// by `owner_uid`, **no** permission bit for group or others — checked in
+/// that order. No reader group exists in the design, so none is admitted
+/// (fail closed).
+///
+/// # Errors
+/// [`DataFileBreak`].
+///
+/// Spec: docs/50 §2.4, §6.4 ("owned by dird, 0600"; "auditd: append write
+/// access to the audit file only"); docs/questions Q-531 item 4 (A-109:
+/// "mode & 0o077 == 0, matching the 0600 it creates").
+pub fn data_file_rule(facts: &FileFacts, owner_uid: u32) -> Result<(), DataFileBreak> {
+    if !facts.regular_file {
+        return Err(DataFileBreak::NotRegularFile);
+    }
+    if facts.owner_uid != owner_uid {
+        return Err(DataFileBreak::WrongOwner);
+    }
+    if facts.mode & GROUP_OR_OTHER_ACCESS != 0 {
+        return Err(DataFileBreak::AccessibleByGroupOrOthers);
     }
     Ok(())
 }
@@ -744,6 +907,7 @@ mod tests {
         let facts = |directory, owner_uid, mode| DirectoryFacts {
             directory,
             owner_uid,
+            group_gid: 0,
             mode,
         };
         let owner = 1000;
@@ -796,6 +960,45 @@ mod tests {
         let walked: Vec<&[u8]> = components(b"/etc//kdcd/./..").collect();
         assert_eq!(walked, [&b"etc"[..], b"kdcd", b".", b".."]);
         assert_eq!(components(b"").count(), 0);
+    }
+
+    // Source: docs/questions Q-531 item 4 (A-109) — the data-file rule on
+    // facts, in its order (regular, owner, no group or other access at
+    // all): 0600 and 0400 pass; 0640, 0604, 0620, 0601 and 0660 are refused.
+    #[test]
+    fn the_data_file_rule_on_facts() {
+        const REGULAR: u32 = 0o100_000;
+        const LINK: u32 = 0o120_000;
+        let owner = 1000;
+        let facts = |regular_file, owner_uid, mode| FileFacts {
+            regular_file,
+            symbolic_link: !regular_file,
+            owner_uid,
+            mode,
+            size: 0,
+        };
+        for accepted in [0o600, 0o400, 0o200, 0o700] {
+            assert_eq!(
+                data_file_rule(&facts(true, owner, REGULAR | accepted), owner),
+                Ok(()),
+                "{accepted:o}"
+            );
+        }
+        assert_eq!(
+            data_file_rule(&facts(false, owner, LINK | 0o777), owner),
+            Err(DataFileBreak::NotRegularFile)
+        );
+        assert_eq!(
+            data_file_rule(&facts(true, owner + 1, REGULAR | 0o777), owner),
+            Err(DataFileBreak::WrongOwner)
+        );
+        for refused in [0o640, 0o604, 0o620, 0o601, 0o660, 0o610] {
+            assert_eq!(
+                data_file_rule(&facts(true, owner, REGULAR | refused), owner),
+                Err(DataFileBreak::AccessibleByGroupOrOthers),
+                "{refused:o}"
+            );
+        }
     }
 
     // Source: Q-468 option 2(b) — a directory break is reported to a

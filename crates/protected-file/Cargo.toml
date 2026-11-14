@@ -2,7 +2,11 @@
 # (task R11b, docs/52 R11, A-104: also the data files a daemon keeps after
 # its privilege drop — auditd's log segments, dird's redb file — and
 # provision's password files; `src/write.rs`, `src/listing.rs`, pinned by
-# tests/single_open_path.rs). Originally the one reader of the files a
+# tests/single_open_path.rs; task R11c, A-109: also every privileged path
+# operation that is not an open — the daemons' socket directories
+# (`src/socket_directory.rs`) and provision's installer (`src/entries.rs`),
+# relative to walked directories, pinned by tests/single_path_operation.rs).
+# Originally the one reader of the files a
 # daemon or a tool reads as root to decide what it does (task F7; the
 # A-86 / A-96 follow-up "open
 # configuration / manifest / policy files without following symlinks, in
@@ -59,9 +63,12 @@ publish = false
 [dependencies]
 # rustix — owner decision P-12, already in the workspace lock (daemon-
 # sandbox, provision); not a new package. Features: `fs` (openat, statat,
-# fstat, fchmod, AtFlags, OFlags, Mode, FileType, Dir) and `std` (`&Path` as
-# a path argument, `Errno::kind`; it enables `alloc`, which `Dir` needs —
-# docs.rs feature list). Default features off; none added by task R11b.
+# fstat, fchmod, AtFlags, OFlags, Mode, FileType, Dir; task R11c: mkdirat,
+# fchown, Uid, Gid, unlinkat, renameat, renameat_with, RenameFlags, fsync —
+# each page reads "Available on crate feature `fs` only") and `std` (`&Path`
+# as a path argument, `Errno::kind`; it enables `alloc`, which `Dir` needs —
+# docs.rs feature list). Default features off; none added by tasks R11b and
+# R11c.
 rustix = { version = "1.1.6", default-features = false, features = ["std", "fs"] }
 
 [dev-dependencies]

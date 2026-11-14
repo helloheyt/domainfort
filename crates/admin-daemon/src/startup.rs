@@ -14,8 +14,7 @@ use config::AdmindSettings;
 use core::fmt;
 use daemon_sandbox::{HardeningPlan, PlanError, ProcessIdentity};
 use ipc_audit::WindowConfig;
-use protected_file::Refusal;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use protected_file::{ExistingGroup, Refusal, SocketDirectoryError, SocketDirectoryOwner};
 use std::path::Path;
 
 /// The owner admind's configuration file must have: root.
@@ -35,10 +34,11 @@ pub const LOCKED_MEMORY_LIMIT: u64 = 256 * 1024 * 1024;
 /// (docs/50 §6.1: "nofile according to the connection quotas").
 pub const OPEN_FILES_HEADROOM: u64 = 32;
 
-/// Mode of the socket directory: owner all, group enter, other nothing.
+/// Mode of the socket directory: owner all, group enter, other nothing —
+/// the one value crates/protected-file creates every socket directory with.
 /// Spec: docs/50 §3.1 ("each socket in its own directory, owned by the
 /// server's uid, mode 0750, group = the channel's clients"); docs/51 §5.1.
-pub const SOCKET_DIRECTORY_MODE: u32 = 0o750;
+pub const SOCKET_DIRECTORY_MODE: u32 = protected_file::SOCKET_DIRECTORY_MODE;
 
 /// Why start-up failed. Carries no file content (docs/50 §8.2; the
 /// configuration's own errors never echo a value, A-60).
@@ -59,7 +59,9 @@ pub enum StartupError {
     SocketDirectory,
     /// The socket directory exists but is not a directory owned by admind's
     /// account with group `admin_socket_group`, no group write and no
-    /// access for others.
+    /// access for others, or a directory on its path is a symbolic link,
+    /// owned by neither root nor admind's account, or writable by group or
+    /// others (task R11c).
     SocketDirectoryPermissions,
     /// The socket directory could not be created or handed over.
     SocketDirectoryCreate,
@@ -129,51 +131,40 @@ pub fn read_settings_owned_by(path: &Path, owner: u32) -> Result<AdmindSettings,
 }
 
 /// The privileged set-up (as root, before the drop): `admin.sock`'s own
-/// directory. Missing ⇒ created with mode 0750, owner admind's uid, group
-/// `admin_socket_group`; present ⇒ it must be a directory with exactly that
-/// owner and group, no group write and no access for others. The socket
-/// file is bound later, after the drop, by admind's account.
+/// directory, through the one implementation every socket-serving daemon
+/// shares (`protected_file::prepare_socket_directory`, task R11c): its
+/// parent walked from `/` (no link, every directory root's or admind's,
+/// none writable by group or others); missing ⇒ created relative to the
+/// parent, mode exactly 0750, owner admind's uid, group
+/// `admin_socket_group`, set with `fchmod` / `fchown` on its own descriptor —
+/// never by path; present ⇒ it must be a directory (not a link) with exactly
+/// that owner and group, no group write and no access for others; a stale
+/// socket in it is removed relative to its descriptor. The socket file is
+/// bound later, after the drop, by admind's account.
 ///
 /// # Errors
 /// [`StartupError`].
 ///
 /// Spec: docs/50 §3.1 ("each socket in its own directory, owned by the
 /// server's uid, mode 0750, group = the channel's clients — defence in
-/// depth only"), §6.2; docs/51 §4.6 (`admin_socket_group`), §5.1.
+/// depth only"), §6.2; docs/51 §4.6 (`admin_socket_group`), §5.1; docs/52
+/// §3.13 (C13); docs/questions/Q-532 item 1 (A-109), Q-550.
 pub fn prepare_socket_directory(settings: &AdmindSettings) -> Result<(), StartupError> {
-    let directory = settings
-        .admin_socket()
-        .as_path()
-        .parent()
-        .ok_or(StartupError::SocketDirectory)?;
-    let uid = settings.run_as().uid();
-    let group = settings.admin_socket_group();
-    match std::fs::symlink_metadata(directory) {
-        Ok(metadata) => {
-            if !metadata.is_dir()
-                || metadata.uid() != uid
-                || metadata.gid() != group
-                || metadata.mode() & 0o027 != 0
-            {
-                return Err(StartupError::SocketDirectoryPermissions);
-            }
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::DirBuilder::new()
-                .mode(SOCKET_DIRECTORY_MODE)
-                .create(directory)
-                .map_err(|_| StartupError::SocketDirectoryCreate)?;
-            std::fs::set_permissions(
-                directory,
-                std::fs::Permissions::from_mode(SOCKET_DIRECTORY_MODE),
-            )
-            .map_err(|_| StartupError::SocketDirectoryCreate)?;
-            std::os::unix::fs::chown(directory, Some(uid), Some(group))
-                .map_err(|_| StartupError::SocketDirectoryCreate)
-        }
-        Err(_) => Err(StartupError::SocketDirectoryCreate),
-    }
+    protected_file::prepare_socket_directory(
+        settings.admin_socket().as_path(),
+        SocketDirectoryOwner {
+            uid: settings.run_as().uid(),
+            gid: settings.admin_socket_group(),
+            existing_group: ExistingGroup::Configured,
+        },
+    )
+    .map_err(|error| match error {
+        SocketDirectoryError::NoSocketDirectory => StartupError::SocketDirectory,
+        SocketDirectoryError::NotAnAccount
+        | SocketDirectoryError::Path(_)
+        | SocketDirectoryError::Directory(_) => StartupError::SocketDirectoryPermissions,
+        SocketDirectoryError::Io(_) => StartupError::SocketDirectoryCreate,
+    })
 }
 
 /// admind's hardening plan: the docs/50 §6.4 baseline (drop to `run_as_uid`

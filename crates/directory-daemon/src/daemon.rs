@@ -359,14 +359,13 @@ impl Stopped {
 }
 
 /// The rule on the redb file's facts: a regular file (a link's facts never
-/// are), owned by dird's account, no permission for group or others.
+/// are), owned by dird's account, no permission for group or others — the
+/// one data-file rule (crates/protected-file `data_file_rule`, shared with
+/// auditd's segments; task R11c).
 /// Spec: docs/50 §6.4 ("access to the redb file only (owned by dird,
-/// 0600)"); Q-270 item 3.
+/// 0600)"); Q-270 item 3; docs/questions Q-531 item 4 (A-109).
 fn store_file_rule(facts: &protected_file::FileFacts, owner_uid: u32) -> Result<(), DaemonError> {
-    if !facts.regular_file || facts.owner_uid != owner_uid || facts.mode & 0o077 != 0 {
-        return Err(DaemonError::StoreFile);
-    }
-    Ok(())
+    protected_file::data_file_rule(facts, owner_uid).map_err(|_| DaemonError::StoreFile)
 }
 
 /// Open the redb file (dird's own, never created here): walk its path from

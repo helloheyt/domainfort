@@ -13,16 +13,15 @@ use daemon_sandbox::Step;
 use keyd::Role;
 use keyd_daemon::startup::{
     hardening_plan, prepare_socket_directory, read_settings, read_settings_owned_by, realm,
-    StartupError, LOCKED_MEMORY_LIMIT, OPEN_FILES_HEADROOM,
+    StartupError, LOCKED_MEMORY_LIMIT, OPEN_FILES_HEADROOM, SOCKET_DIRECTORY_MODE,
 };
 use keyd_daemon::{DaemonParams, IntentAckBudget, ENGINE_QUEUE_CAPACITY, INTENT_ACK_BUDGET};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::time::Duration;
-use support::{my_uid, TempDir};
-// The configuration files the tests read through crates/protected-file live
-// in a scratch directory the walk from `/` accepts (crates/test-scratch,
-// Q-480); sockets stay in `TempDir`.
+// The configuration files the tests read through crates/protected-file, and
+// the socket directories it prepares (task R11c), live in a scratch
+// directory the walk from `/` accepts (crates/test-scratch, Q-480).
 use test_scratch::ScratchDir;
 
 /// keyd, every key present (docs/50 §2.4, R50-3, R50-18, §3.6, §7.1).
@@ -146,27 +145,20 @@ fn a_configuration_file_not_owned_by_root_is_refused() {
 /// docs/50 §3.1 ("each socket in its own directory, owned by the server's
 /// uid, mode 0750"): an existing socket directory is accepted only when it is
 /// owned by keyd's account with no group write and no access for others.
+/// The directory lives in a scratch directory inside the workspace
+/// (crates/test-scratch, Q-480): since task R11c the preparation walks its
+/// parent from `/` (crates/protected-file `prepare_socket_directory`).
 #[test]
 fn an_existing_socket_directory_must_belong_to_keyd() {
-    let dir = TempDir::new();
-    let uid = my_uid(&dir);
+    let dir = ScratchDir::new("kdd-sock").unwrap();
+    let uid = dir.uid().unwrap();
     if uid == 0 {
         return; // run_as_uid may not be 0 (docs/50 §6.1).
     }
     let socket_dir = dir.join("run");
     std::fs::create_dir(&socket_dir).unwrap();
-    let text = |run_as: u32| {
-        format!(
-            "run_as_uid = {run_as}\nrun_as_gid = {run_as}\nrealm = EXAMPLE.TEST\n\
-             keyd_socket = {}/keyd.sock\nuid_roles = {}:Kdc\n\
-             key_store = insecure-development\naudit_socket = {}/audit.sock\n\
-             auditd_uid = {}\n",
-            socket_dir.display(),
-            run_as + 1,
-            dir.path().display(),
-            run_as + 2
-        )
-    };
+    let gid = std::fs::metadata(dir.path()).unwrap().gid();
+    let text = |run_as: u32| keyd_text(&socket_dir, dir.path(), run_as, gid);
     let mine = settings(&text(uid));
     std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o750)).unwrap();
     assert_eq!(prepare_socket_directory(&mine), Ok(()));
@@ -186,6 +178,74 @@ fn an_existing_socket_directory_must_belong_to_keyd() {
         prepare_socket_directory(&someone_else),
         Err(StartupError::SocketDirectoryPermissions)
     );
+}
+
+/// A keyd configuration whose socket lies in `socket_dir` and whose account
+/// is `run_as` with group `gid` (the audit socket, never touched here, in
+/// `audit_dir`). A test passes its scratch directory's group — one the test
+/// account belongs to, so the owner change of a created directory is one an
+/// unprivileged process may make.
+fn keyd_text(socket_dir: &Path, audit_dir: &Path, run_as: u32, gid: u32) -> String {
+    format!(
+        "run_as_uid = {run_as}\nrun_as_gid = {gid}\nrealm = EXAMPLE.TEST\n\
+         keyd_socket = {}/keyd.sock\nuid_roles = {}:Kdc\n\
+         key_store = insecure-development\naudit_socket = {}/audit.sock\n\
+         auditd_uid = {}\n",
+        socket_dir.display(),
+        run_as + 1,
+        audit_dir.display(),
+        run_as + 2
+    )
+}
+
+/// Task R11c (docs/52 C13; docs/questions Q-532 item 1, A-109): the socket
+/// directory is created by descriptor — mode 0750 exactly, owned by keyd's
+/// account — and a symbolic link at its name, or in a directory component
+/// above it, is refused without anything being changed through it (the
+/// link's target keeps its mode; nothing is created under it). The test
+/// account stands in for keyd's.
+#[test]
+fn the_socket_directory_is_prepared_by_descriptor_and_never_through_a_link() {
+    let dir = ScratchDir::new("kdd-sock").unwrap();
+    let uid = dir.uid().unwrap();
+    if uid == 0 {
+        return;
+    }
+    let gid = std::fs::metadata(dir.path()).unwrap().gid();
+    let created = dir.join("keyd");
+    assert_eq!(
+        prepare_socket_directory(&settings(&keyd_text(&created, dir.path(), uid, gid))),
+        Ok(())
+    );
+    let metadata = std::fs::symlink_metadata(&created).unwrap();
+    assert!(metadata.is_dir());
+    assert_eq!(metadata.mode() & 0o7777, SOCKET_DIRECTORY_MODE);
+    assert_eq!((metadata.uid(), metadata.gid()), (uid, gid));
+
+    let real = dir.join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let link = dir.join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert_eq!(
+        prepare_socket_directory(&settings(&keyd_text(&link, dir.path(), uid, gid))),
+        Err(StartupError::SocketDirectoryPermissions)
+    );
+    assert_eq!(
+        std::fs::metadata(&real).unwrap().mode() & 0o7777,
+        0o700,
+        "no chmod through the link"
+    );
+    assert_eq!(
+        prepare_socket_directory(&settings(&keyd_text(
+            &link.join("keyd"),
+            dir.path(),
+            uid,
+            gid
+        ))),
+        Err(StartupError::SocketDirectoryPermissions)
+    );
+    assert!(std::fs::symlink_metadata(real.join("keyd")).is_err());
 }
 
 /// Task F7 (A-86 follow-up, "O_NOFOLLOW in every reader"): with the test

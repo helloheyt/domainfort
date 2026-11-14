@@ -27,9 +27,11 @@ use dirstore::{IntegrityKey, INTEGRITY_KEY_LEN};
 use ipc_audit::WindowConfig;
 use keyd_types::KeydConfig;
 use krb_proto::Realm;
-use protected_file::{FileFacts, OpenError, Refusal, PERMISSION_BITS};
+use protected_file::{
+    ExistingGroup, FileFacts, OpenError, Refusal, SocketDirectoryError, SocketDirectoryOwner,
+    PERMISSION_BITS,
+};
 use std::io::Read;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 use zeroize::Zeroizing;
@@ -50,10 +52,11 @@ const INTEGRITY_KEY_FILE_MODE: u32 = 0o400;
 /// to the connection quotas").
 pub const OPEN_FILES_HEADROOM: u64 = 32;
 
-/// Mode of the socket directory: owner all, group enter, other nothing.
+/// Mode of the socket directory: owner all, group enter, other nothing —
+/// the one value crates/protected-file creates every socket directory with.
 /// Spec: docs/50 §3.1 ("each socket in its own directory, owned by the
 /// server's uid, mode 0750").
-pub const SOCKET_DIRECTORY_MODE: u32 = 0o750;
+pub const SOCKET_DIRECTORY_MODE: u32 = protected_file::SOCKET_DIRECTORY_MODE;
 
 /// Why start-up failed. Carries no file content (docs/50 §8.2; the
 /// configuration's own errors never echo a value, A-60; the key never
@@ -92,7 +95,9 @@ pub enum StartupError {
     /// The socket path has no parent directory.
     SocketDirectory,
     /// The socket directory exists but is not a directory owned by dird's
-    /// account with no group write and no access for others.
+    /// account with no group write and no access for others, or a directory
+    /// on its path is a symbolic link, owned by neither root nor dird's
+    /// account, or writable by group or others (task R11c).
     SocketDirectoryPermissions,
     /// The socket directory could not be created or handed to dird's
     /// account.
@@ -267,17 +272,31 @@ pub fn read_policy(path: &Path, owner: u32) -> Result<DevelopmentPolicy, Startup
 }
 
 /// The privileged set-up (as root, before the drop): the directories of
-/// `dird_kdc_socket` and `dird_ldap_socket` (docs/50 §3.1: "each socket in
-/// its own directory"). Missing ⇒ created with mode 0750 and handed to
-/// dird's account; present ⇒ it must be a directory owned by dird's uid
-/// with no group write and no access for others.
+/// `dird_kdc_socket`, `dird_ldap_socket` and, when the admin channel is
+/// configured, `dird_admin_socket` (docs/50 §3.1: "each socket in its own
+/// directory"), each through the one implementation every socket-serving
+/// daemon shares (`protected_file::prepare_socket_directory`, task R11c):
+/// its parent walked from `/` (no link, every directory root's or dird's,
+/// none writable by group or others); missing ⇒ created relative to the
+/// parent, mode exactly 0750, handed to dird's account with `fchmod` /
+/// `fchown` on its own descriptor — never by path; present ⇒ it must be a
+/// directory (not a link) owned by dird's uid with no group write and no
+/// access for others (its group is the operator's choice of the channel's
+/// clients); a stale socket in it is removed relative to its descriptor.
 ///
 /// # Errors
 /// [`StartupError`].
 ///
 /// Spec: docs/50 §3.1, §6.2; docs/questions/Q-260 item 6 (the group is not
-/// a setting).
+/// a setting); docs/52 §3.13 (C13); docs/questions/Q-532 item 1 (A-109),
+/// Q-550.
 pub fn prepare_socket_directory(settings: &DirdSettings) -> Result<(), StartupError> {
+    let account = settings.run_as();
+    let owner = SocketDirectoryOwner {
+        uid: account.uid(),
+        gid: account.gid(),
+        existing_group: ExistingGroup::ChosenByOperator,
+    };
     let admin_socket = settings.admin_channel().map(config::Channel::socket);
     for socket in [
         Some(settings.kdc_channel().socket()),
@@ -287,42 +306,17 @@ pub fn prepare_socket_directory(settings: &DirdSettings) -> Result<(), StartupEr
     .into_iter()
     .flatten()
     {
-        let directory = socket
-            .as_path()
-            .parent()
-            .ok_or(StartupError::SocketDirectory)?;
-        prepare_directory(directory, settings)?;
+        protected_file::prepare_socket_directory(socket.as_path(), owner).map_err(|error| {
+            match error {
+                SocketDirectoryError::NoSocketDirectory => StartupError::SocketDirectory,
+                SocketDirectoryError::NotAnAccount
+                | SocketDirectoryError::Path(_)
+                | SocketDirectoryError::Directory(_) => StartupError::SocketDirectoryPermissions,
+                SocketDirectoryError::Io(_) => StartupError::SocketDirectoryCreate,
+            }
+        })?;
     }
     Ok(())
-}
-
-/// One socket directory (see [`prepare_socket_directory`]).
-/// Spec: docs/50 §3.1, §6.2.
-fn prepare_directory(directory: &Path, settings: &DirdSettings) -> Result<(), StartupError> {
-    let account = settings.run_as();
-    match std::fs::symlink_metadata(directory) {
-        Ok(metadata) => {
-            if !metadata.is_dir() || metadata.uid() != account.uid() || metadata.mode() & 0o027 != 0
-            {
-                return Err(StartupError::SocketDirectoryPermissions);
-            }
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::DirBuilder::new()
-                .mode(SOCKET_DIRECTORY_MODE)
-                .create(directory)
-                .map_err(|_| StartupError::SocketDirectoryCreate)?;
-            std::fs::set_permissions(
-                directory,
-                std::fs::Permissions::from_mode(SOCKET_DIRECTORY_MODE),
-            )
-            .map_err(|_| StartupError::SocketDirectoryCreate)?;
-            std::os::unix::fs::chown(directory, Some(account.uid()), Some(account.gid()))
-                .map_err(|_| StartupError::SocketDirectoryCreate)
-        }
-        Err(_) => Err(StartupError::SocketDirectoryCreate),
-    }
 }
 
 /// dird's hardening plan: the docs/50 §6.4 baseline (drop to `run_as_uid` /

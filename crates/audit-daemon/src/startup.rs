@@ -12,6 +12,9 @@
 //!    item 16: file modes are the daemon's checks), reached without
 //!    following a symbolic link (crates/protected-file, A-86), at most
 //!    `config::limits::MAX_FILE_OCTETS`; parse `AuditdSettings`.
+//!    3b. Prepare the socket's directory as root ([`prepare_socket_directory`]:
+//!    walked, created or checked by descriptor, a stale socket removed —
+//!    task R11c).
 //! 4. Harden ([`hardening_plan`]: the docs/50 §6.4 baseline — drop to
 //!    `run_as_uid` / `run_as_gid` with no supplementary groups, no_new_privs,
 //!    no capabilities, core limit 0, not dumpable, umask 077 — plus an
@@ -27,7 +30,8 @@
 //! 6. Print the start notice and the signing mode (UNSIGNED, P-20).
 //! 7. Build the tokio runtime with an explicit worker count (docs/50 §6.2:
 //!    overrides `TOKIO_WORKER_THREADS`).
-//! 8. Bind `audit_socket` (stale socket removed; mode 0660) — only now,
+//! 8. Bind `audit_socket` (a stale socket left since step 3b removed; mode
+//!    0660, set by path inside the directory step 3b checked) — only now,
 //!    after the log verified (docs/50 R50-16, §7.5).
 //! 9. Spawn the listener; the main thread becomes the writer
 //!    (crate::writer). If the writer fails, the daemon exits
@@ -40,7 +44,10 @@ use crate::recovery::StartKind;
 use config::AuditdSettings;
 use core::fmt;
 use daemon_sandbox::{HardeningPlan, PlanError, ProcessIdentity};
-use protected_file::{FileFacts, OpenError, PathBreak, ReadError, GROUP_OR_OTHER_WRITE};
+use protected_file::{
+    ExistingGroup, FileFacts, OpenError, PathBreak, ReadError, SocketDirectoryError,
+    SocketDirectoryOwner, GROUP_OR_OTHER_WRITE,
+};
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -199,6 +206,42 @@ fn path_refusal(path: PathBreak) -> SettingsError {
         PathBreak::DirectoryWritableByGroupOrOthers => SettingsError::Writable,
         PathBreak::DirectoryWrongOwner => SettingsError::NotRootOwned,
     }
+}
+
+/// The privileged set-up (as root, before the drop — step 3b): the
+/// directory of `audit_socket`, through the one implementation every
+/// socket-serving daemon shares (`protected_file::prepare_socket_directory`,
+/// task R11c): its parent walked from `/` (no link, every directory root's
+/// or auditd's, none writable by group or others); missing ⇒ created
+/// relative to the parent, mode exactly 0750, handed to auditd's account
+/// (uid and gid) with `fchmod` / `fchown` on its own descriptor — never by
+/// path; present ⇒ it must be a directory (not a link) owned by auditd's uid
+/// with no group write and no access for others (its group is the
+/// operator's choice of the channel's clients — every daemon); a stale
+/// socket in it is removed relative to its descriptor. Before task R11c
+/// auditd bound into whatever directory it found: this is what makes the
+/// socket's later bind and mode change (by path, after the drop) safe from
+/// every account but root and auditd's own (docs/questions/Q-550 item 2).
+///
+/// # Errors
+/// crates/protected-file's [`SocketDirectoryError`] (its `Display` is the
+/// fixed text `main` prints).
+///
+/// Spec: docs/50 §3.1 ("each socket in its own directory, owned by the
+/// server's uid, mode 0750, group = the channel's clients"; "deleting a
+/// stale socket file before bind … the daemon manages this explicitly"),
+/// §6.2; docs/questions/Q-260 item 6 (the group is not a setting); docs/52
+/// §3.13 (C13); docs/questions/Q-532 items 1, 5 (A-109), Q-550.
+pub fn prepare_socket_directory(settings: &AuditdSettings) -> Result<(), SocketDirectoryError> {
+    let account = settings.run_as();
+    protected_file::prepare_socket_directory(
+        settings.audit_socket().as_path(),
+        SocketDirectoryOwner {
+            uid: account.uid(),
+            gid: account.gid(),
+            existing_group: ExistingGroup::ChosenByOperator,
+        },
+    )
 }
 
 /// The hardening plan: the docs/50 §6.4 baseline for `run_as_uid` /

@@ -641,8 +641,18 @@ fn torn_record_starts_a_new_segment_at_last_good() {
 fn torn_header_after_rotation_is_recovered() {
     let dir = TempDir::new();
     let built = build_log(&dir.base(), &[3], 20);
-    // Segment 2 was created but its header never reached the disk.
+    // Segment 2 was created (0600, as auditd creates every segment — the
+    // segment rule admits no group or other access, Q-531 item 4) but its
+    // header never reached the disk.
     std::fs::write(segment_path(&dir.base(), 2), [b'A', b'U', b'D']).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            segment_path(&dir.base(), 2),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
     let head = built.heads[2];
 
     let opened = open_log(&dir.base(), SegmentLimit::DEFAULT, log_uid()).expect("recovered");

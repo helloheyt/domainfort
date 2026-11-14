@@ -5,21 +5,25 @@
 //!
 //! 1. **Pre-check** ([`precheck`]): the staging directory and every file
 //!    target are absent (of any kind — a dangling link counts as present);
-//!    each one's parent is an existing directory, not a link, writable by
-//!    its owner only, and on the staging directory's filesystem (same
-//!    device), so every rename is a same-filesystem rename. Re-run at the
-//!    start of [`install`].
+//!    each one's parent is on the staging directory's filesystem (same
+//!    device), so every rename is a same-filesystem rename. Every path is
+//!    walked from `/` (crates/protected-file, task R11c): no directory
+//!    component may be a link, and every directory must be owned by root
+//!    and not be writable by group or others — the database's too (its
+//!    file is dird's, its directories root's: dird needs only the file,
+//!    docs/50 §6.4). Re-run at the start of [`install`].
 //! 2. **Staging** (step 3): a new directory, mode 0700, owner root.
 //! 3. **Staged files**, each created exclusively without following links,
 //!    its mode set exactly, its owner set through [`Ownership`], written,
 //!    `fsync`ed: the integrity key (root:0400, 32 octets — step 4); the
-//!    database (an empty 0600 file that redb initialises — "if the file
-//!    does not exist, or is an empty file, a new database will be
-//!    initialized in it", redb 4.5.0 docs.rs — then **one** `WriteTxn` with
-//!    every object, committed and read back, module `store`; owner dird,
-//!    0600 — step 5); the policy (root:0644 — step 6); every configuration
-//!    file (root:0644 — step 7); the manifest (root:0644 — step 8). Then
-//!    the staging directory is `fsync`ed.
+//!    database (an empty 0600 file created for reading and writing, handed
+//!    **as that descriptor** to dirstore `Store::open_file` — redb's
+//!    `create_with_backend` initialises it, "Open an existing or create a
+//!    new database with the given backend", redb 4.5.0 docs.rs — then
+//!    **one** `WriteTxn` with every object, committed and read back, module
+//!    `store`; owner dird, 0600 — step 5); the policy (root:0644 — step
+//!    6); every configuration file (root:0644 — step 7); the manifest
+//!    (root:0644 — step 8). Then the staging directory is `fsync`ed.
 //! 4. **Install** (step 9): rename into place, never replacing an existing
 //!    path (`RENAME_NOREPLACE`): the configuration files, the policy, the
 //!    key, the manifest; `fsync` of each target directory; **then the
@@ -41,21 +45,33 @@
 //! Every domain object is in the one committed transaction (D136): there
 //! is never half a domain inside the database.
 //!
+//! # Every operation relative to a walked directory (task R11c)
+//!
+//! Each creation, rename, removal and `fsync` goes through
+//! crates/protected-file (`entry_facts`, `directory_device`,
+//! `create_new_directory`, `create_new_file`, `create_new_read_write`,
+//! `rename_no_replace`, `remove_empty_directory`, `sync_directory`): the
+//! path is walked from `/` under the directory rule and the operation is the
+//! `*at` call relative to the walked directory's descriptor — never a lookup
+//! of the path from the current directory, so no directory component is
+//! followed through a link (docs/52 C13; docs/questions Q-532 item 2,
+//! A-109). The database is staged on a descriptor and never reopened by
+//! path.
+//!
 //! Spec: docs/51 §4.3 steps 1, 3-9, §4.4 (R51-2); docs/50 §6.4, §7.1;
-//! Q-270 items 1, 3; A-68; A-86 (O_NOFOLLOW); redb 4.5.0 docs.rs
-//! `Database::create`.
+//! Q-270 items 1, 3; A-68; A-86 (O_NOFOLLOW); A-109 (Q-532 item 2, task
+//! R11c); docs/questions Q-468 option 2(b); redb 4.5.0 docs.rs
+//! `Builder::create_with_backend`; std `File::try_clone`.
 
 use core::fmt;
-use std::io::Write;
+use std::io::{self, Write};
 use std::os::fd::AsFd;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use dirstore::{IntegrityKey, Store};
-use rustix::io::Errno;
+use protected_file::{EntryError, NewFileMode, OpenError, PathBreak};
 
 use crate::configs::Daemon;
-use crate::fs;
 use crate::input::{FilePath, Paths};
 use crate::ownership::{Ownership, OwnershipError, Staged};
 use crate::plan::{Owner, Plan};
@@ -208,18 +224,20 @@ impl fmt::Display for InstallState {
 pub enum InstallCause {
     /// A path that must be absent exists (the flag's name).
     Exists(PathBuf),
-    /// A parent directory is missing, is not a directory, or is a link.
+    /// A directory on the path is missing, is not a directory, or is a
+    /// link — or the path does not end in a file name.
     Parent(PathBuf),
-    /// A parent directory is writable by its group or by others.
+    /// A directory on the path is writable by its group or by others.
     ParentWritable(PathBuf),
+    /// A directory on the path is owned by neither root nor the account the
+    /// file ends up owned by (task R11c).
+    ParentOwner(PathBuf),
     /// A parent directory is not on the staging directory's filesystem.
     OtherFilesystem(PathBuf),
-    /// A filesystem operation failed.
-    Io(&'static str, Errno),
+    /// A filesystem operation failed (the system's error kind).
+    Io(&'static str, io::ErrorKind),
     /// Writing a staged file failed.
     Write(std::io::ErrorKind),
-    /// A file was not a regular file where one was expected.
-    NotRegular(PathBuf),
     /// The owner of a staged file could not be changed.
     Ownership(OwnershipError),
     /// The database could not be written or did not check out.
@@ -236,13 +254,20 @@ impl fmt::Display for InstallCause {
             }
             InstallCause::Parent(p) => write!(
                 f,
-                "{}: parent directory missing or not a directory",
+                "{}: a directory on its path is missing, a symbolic link or not a directory",
                 p.display()
             ),
             InstallCause::ParentWritable(p) => {
                 write!(
                     f,
-                    "{}: parent directory is writable by group or others",
+                    "{}: a directory on its path is writable by group or others",
+                    p.display()
+                )
+            }
+            InstallCause::ParentOwner(p) => {
+                write!(
+                    f,
+                    "{}: a directory on its path is owned by neither root nor the file's owner",
                     p.display()
                 )
             }
@@ -255,7 +280,6 @@ impl fmt::Display for InstallCause {
             }
             InstallCause::Io(op, e) => write!(f, "{op} failed: {e}"),
             InstallCause::Write(kind) => write!(f, "write failed: {kind}"),
-            InstallCause::NotRegular(p) => write!(f, "{}: not a regular file", p.display()),
             InstallCause::Ownership(e) => write!(f, "{e}"),
             InstallCause::Store(e) => write!(f, "{e}"),
             InstallCause::Halted(step) => write!(f, "halted at {step:?}"),
@@ -287,54 +311,73 @@ pub struct Installed {
     pub targets: Vec<(Target, FilePath)>,
 }
 
-/// `true` if something (anything, a dangling link included) is at `path`.
-fn present(path: &Path) -> Result<bool, InstallCause> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(_) => Err(InstallCause::Parent(path.to_path_buf())),
+/// The cause for a directory on `path` that broke crates/protected-file's
+/// directory rule.
+/// Spec: Q-468 options 1, 2(b) (A-102); docs/51 §4.4.
+fn path_cause(path: &Path, broken: PathBreak) -> InstallCause {
+    let path = path.to_path_buf();
+    match broken {
+        PathBreak::NoFileName | PathBreak::NotADirectory => InstallCause::Parent(path),
+        PathBreak::DirectoryWrongOwner => InstallCause::ParentOwner(path),
+        PathBreak::DirectoryWritableByGroupOrOthers => InstallCause::ParentWritable(path),
     }
 }
 
-/// The parent directory's device, after checking it is an existing
-/// directory, not a link, and not writable by group or others.
-fn parent_device(parent: &Path) -> Result<u64, InstallCause> {
-    let metadata = std::fs::symlink_metadata(parent)
-        .map_err(|_| InstallCause::Parent(parent.to_path_buf()))?;
-    if !metadata.file_type().is_dir() {
-        return Err(InstallCause::Parent(parent.to_path_buf()));
+/// The cause for a failed walk of `path` before anything was written: a
+/// directory rule broken, or a directory missing or uninspectable.
+fn walk_cause(path: &Path, error: EntryError) -> InstallCause {
+    match error {
+        EntryError::Path(broken) => path_cause(path, broken),
+        EntryError::Io(_) => InstallCause::Parent(path.to_path_buf()),
     }
-    if metadata.mode() & 0o022 != 0 {
-        return Err(InstallCause::ParentWritable(parent.to_path_buf()));
-    }
-    Ok(metadata.dev())
+}
+
+/// `true` if something (anything, a dangling link included) is at `path` —
+/// inspected relative to its walked directory, with `owner_uid` as the
+/// owner the directory rule admits besides root.
+/// Spec: docs/51 §4.3 step 1; crates/protected-file `entry_facts`.
+fn present(path: &Path, owner_uid: u32) -> Result<bool, InstallCause> {
+    protected_file::entry_facts(path, owner_uid)
+        .map(|facts| facts.is_some())
+        .map_err(|error| walk_cause(path, error))
+}
+
+/// The device of the walked directory `parent` (every directory on its
+/// path checked, itself included).
+/// Spec: docs/51 §4.3 step 3; crates/protected-file `directory_device`.
+fn parent_device(parent: &Path, owner_uid: u32) -> Result<protected_file::Device, InstallCause> {
+    protected_file::directory_device(parent, owner_uid).map_err(|error| walk_cause(parent, error))
 }
 
 /// The filesystem half of step 1 (module documentation, item 1): nothing is
-/// written.
+/// written. `root_uid` is the account root-owned files belong to (0 in
+/// production; [`Ownership::root_uid`]): every directory on every path must
+/// be root's (or, in a test, that stand-in's) — the directory rule's "root or
+/// the file's owner" with root as the owner of everything the installer
+/// writes until the last owner change (Q-468 option 2(b)).
 ///
 /// # Errors
 /// [`InstallError`] in state [`InstallState::NothingWritten`].
 ///
 /// Spec: docs/51 §4.3 step 1 ("every target path absent (including the
 /// staging directory)"), step 3 ("on the same filesystem as the targets"),
-/// §4.4 (no `--force`).
-pub fn precheck(paths: &Paths) -> Result<(), InstallError> {
+/// §4.4 (no `--force`); Q-468 (A-102); Q-532 item 2 (A-109).
+pub fn precheck(paths: &Paths, root_uid: u32) -> Result<(), InstallError> {
     let stop = |cause| InstallError {
         state: InstallState::NothingWritten,
         cause,
     };
     let staging = paths.staging.as_path();
-    if present(staging).map_err(stop)? {
+    if present(staging, root_uid).map_err(stop)? {
         return Err(stop(InstallCause::Exists(staging.to_path_buf())));
     }
-    let device = parent_device(paths.staging.parent()).map_err(stop)?;
+    let device = parent_device(paths.staging.parent(), root_uid).map_err(stop)?;
     for target in Target::installation_order() {
         let path = target.path(paths);
-        if present(path.as_path()).map_err(stop)? {
+        if present(path.as_path(), root_uid).map_err(stop)? {
             return Err(stop(InstallCause::Exists(path.as_path().to_path_buf())));
         }
-        if parent_device(path.parent()).map_err(stop)? != device {
+        if parent_device(path.parent(), root_uid).map_err(stop)? != device {
             return Err(stop(InstallCause::OtherFilesystem(
                 path.as_path().to_path_buf(),
             )));
@@ -349,6 +392,8 @@ struct Run<'p, O: Ownership, P: Progress> {
     ownership: &'p mut O,
     progress: &'p mut P,
     state: InstallState,
+    /// The account root-owned files belong to ([`Ownership::root_uid`]).
+    root_uid: u32,
 }
 
 impl<O: Ownership, P: Progress> Run<'_, O, P> {
@@ -367,9 +412,21 @@ impl<O: Ownership, P: Progress> Run<'_, O, P> {
             .map_err(|Halt| self.fail(InstallCause::Halted(step)))
     }
 
-    /// A filesystem result in the current state.
-    fn io<T>(&self, op: &'static str, result: Result<T, Errno>) -> Result<T, InstallError> {
-        result.map_err(|e| self.fail(InstallCause::Io(op, e)))
+    /// The result of a crates/protected-file operation on `path`, in the
+    /// current state: a directory rule broken names the path; a system
+    /// failure names the operation.
+    fn entry<T>(
+        &self,
+        op: &'static str,
+        path: &Path,
+        result: Result<T, EntryError>,
+    ) -> Result<T, InstallError> {
+        result.map_err(|error| {
+            self.fail(match error {
+                EntryError::Path(broken) => path_cause(path, broken),
+                EntryError::Io(kind) => InstallCause::Io(op, kind),
+            })
+        })
     }
 
     /// The staged path of `target`.
@@ -384,12 +441,16 @@ impl<O: Ownership, P: Progress> Run<'_, O, P> {
         &mut self,
         target: Target,
         staged: Staged,
-        mode: rustix::fs::Mode,
+        mode: NewFileMode,
         owner: Owner,
         bytes: &[u8],
     ) -> Result<(), InstallError> {
         let path = self.staged(target);
-        let mut file = self.io("create", fs::create_new_file(&path, mode))?;
+        let mut file = self.entry(
+            "create",
+            &path,
+            protected_file::create_new_file(&path, self.root_uid, mode),
+        )?;
         file.write_all(bytes)
             .map_err(|e| self.fail(InstallCause::Write(e.kind())))?;
         self.ownership
@@ -398,44 +459,54 @@ impl<O: Ownership, P: Progress> Run<'_, O, P> {
                 state: self.state,
                 cause: InstallCause::Ownership(e),
             })?;
-        self.io("fsync", fs::sync(&file))?;
+        self.sync(&file)?;
         drop(file);
         self.reached(Step::Staged(target))
     }
 
-    /// Stage the database (module documentation item 3).
+    /// `fsync` a staged file's descriptor.
+    /// Spec: rustix docs.rs `fs::fsync` ("Ensures that file data and
+    /// metadata is written to the underlying storage device").
+    fn sync(&self, file: &std::fs::File) -> Result<(), InstallError> {
+        rustix::fs::fsync(file).map_err(|errno| self.fail(InstallCause::Io("fsync", errno.kind())))
+    }
+
+    /// Stage the database (module documentation item 3): one descriptor,
+    /// created exclusively (0600, read and write), from which redb builds
+    /// the store and on which — after the store is closed — the owner is
+    /// changed and the data synced. The file is never reopened by path.
     /// Spec: docs/51 §4.3 step 5; Q-270 item 3 (dird's account, no group /
-    /// other access); module `store`.
+    /// other access); module `store`; docs/questions Q-532 item 3 (A-109);
+    /// dirstore `Store::open_file`; std `File::try_clone` (a second handle
+    /// to the same open file).
     fn stage_store(&mut self) -> Result<(), InstallError> {
         let path = self.staged(Target::Store);
-        let empty = self.io("create", fs::create_new_file(&path, fs::mode_0600()))?;
-        drop(empty);
+        let file = self.entry(
+            "create",
+            &path,
+            protected_file::create_new_read_write(&path, self.root_uid),
+        )?;
+        let kept = file
+            .try_clone()
+            .map_err(|e| self.fail(InstallCause::Io("dup", e.kind())))?;
         {
             let schema = ad_schema::phase1()
                 .map_err(|_| self.fail(InstallCause::Store(StoreError::Store("schema"))))?;
             let key = IntegrityKey::from_bytes(self.plan.integrity_key().bytes());
-            let store = Store::open(&path, key, schema.schema().clone())
+            let store = Store::open_file(file, key, schema.schema().clone())
                 .map_err(|_| self.fail(InstallCause::Store(StoreError::Store("open"))))?;
             write_domain(&store, self.plan).map_err(|e| self.fail(InstallCause::Store(e)))?;
             check_domain(&store, self.plan).map_err(|e| self.fail(InstallCause::Store(e)))?;
         }
-        let file = self.io("open", fs::open_no_follow(&path))?;
-        let metadata = file
-            .metadata()
-            .map_err(|_| self.fail(InstallCause::NotRegular(path.clone())))?;
-        if !metadata.file_type().is_file() {
-            return Err(self.fail(InstallCause::NotRegular(path)));
-        }
-        self.io("fchmod", rustix::fs::fchmod(&file, fs::mode_0600()))?;
         let owner = self.plan.store_owner;
         self.ownership
-            .change_owner(file.as_fd(), Staged::Store, owner)
+            .change_owner(kept.as_fd(), Staged::Store, owner)
             .map_err(|e| InstallError {
                 state: self.state,
                 cause: InstallCause::Ownership(e),
             })?;
-        self.io("fsync", fs::sync(&file))?;
-        drop(file);
+        self.sync(&kept)?;
+        drop(kept);
         self.reached(Step::Staged(Target::Store))
     }
 
@@ -444,7 +515,11 @@ impl<O: Ownership, P: Progress> Run<'_, O, P> {
     fn install_one(&mut self, target: Target) -> Result<(), InstallError> {
         let from = self.staged(target);
         let to = target.path(&self.plan.paths).as_path().to_path_buf();
-        self.io("rename", fs::rename_no_replace(&from, &to))?;
+        self.entry(
+            "rename",
+            &to,
+            protected_file::rename_no_replace(&from, self.root_uid, &to, self.root_uid),
+        )?;
         self.state = if target == Target::Store {
             InstallState::InstalledStagingLeft
         } else {
@@ -465,40 +540,42 @@ pub fn install<O: Ownership, P: Progress>(
     ownership: &mut O,
     progress: &mut P,
 ) -> Result<Installed, InstallError> {
-    precheck(&plan.paths)?;
+    let root_uid = ownership.root_uid();
+    precheck(&plan.paths, root_uid)?;
     let mut run = Run {
         plan,
         ownership,
         progress,
         state: InstallState::NothingWritten,
+        root_uid,
     };
     let staging = plan.paths.staging.as_path();
 
-    // Step 3: the staging directory (root, 0700).
-    let dir = match fs::create_new_dir(staging, fs::mode_0700()) {
-        Ok(dir) => dir,
-        Err(e) => {
-            // If mkdir itself failed nothing exists; otherwise the
-            // directory was created and is left (fail closed: never
-            // removed here).
-            let state = match present(staging) {
-                Ok(false) => InstallState::NothingWritten,
-                _ => InstallState::StagingOnly,
-            };
-            return Err(InstallError {
-                state,
-                cause: InstallCause::Io("mkdir", e),
-            });
-        }
+    // Step 3: the staging directory (root, 0700), created relative to its
+    // walked parent; its owner given on its own descriptor.
+    let created = {
+        let ownership = &mut *run.ownership;
+        protected_file::create_new_directory(staging, root_uid, |fd| {
+            ownership.change_owner(fd, Staged::StagingDirectory, Owner::ROOT)
+        })
     };
+    if let Err(error) = created {
+        // If mkdir itself failed nothing exists; otherwise the directory
+        // was created and is left (fail closed: never removed here).
+        let state = match present(staging, root_uid) {
+            Ok(false) => InstallState::NothingWritten,
+            _ => InstallState::StagingOnly,
+        };
+        return Err(InstallError {
+            state,
+            cause: match error {
+                OpenError::Io(kind) => InstallCause::Io("mkdir", kind),
+                OpenError::Path(broken) => path_cause(staging, broken),
+                OpenError::Refused(e) => InstallCause::Ownership(e),
+            },
+        });
+    }
     run.state = InstallState::StagingOnly;
-    run.ownership
-        .change_owner(dir.as_fd(), Staged::StagingDirectory, Owner::ROOT)
-        .map_err(|e| InstallError {
-            state: InstallState::StagingOnly,
-            cause: InstallCause::Ownership(e),
-        })?;
-    drop(dir);
     run.reached(Step::StagingCreated)?;
 
     // Step 4: the integrity key (root:0400, 32 octets), written straight
@@ -506,7 +583,7 @@ pub fn install<O: Ownership, P: Progress>(
     run.stage_file(
         Target::IntegrityKey,
         Staged::IntegrityKey,
-        fs::mode_0400(),
+        NewFileMode::OwnerRead,
         Owner::ROOT,
         plan.integrity_key().bytes().as_slice(),
     )?;
@@ -516,7 +593,7 @@ pub fn install<O: Ownership, P: Progress>(
     run.stage_file(
         Target::Policy,
         Staged::Policy,
-        fs::mode_0644(),
+        NewFileMode::OwnerWriteEveryoneRead,
         Owner::ROOT,
         &plan.policy_file,
     )?;
@@ -525,7 +602,7 @@ pub fn install<O: Ownership, P: Progress>(
         run.stage_file(
             Target::Config(file.daemon),
             Staged::Config(file.daemon),
-            fs::mode_0644(),
+            NewFileMode::OwnerWriteEveryoneRead,
             Owner::ROOT,
             file.text().as_bytes(),
         )?;
@@ -534,11 +611,15 @@ pub fn install<O: Ownership, P: Progress>(
     run.stage_file(
         Target::Manifest,
         Staged::Manifest,
-        fs::mode_0644(),
+        NewFileMode::OwnerWriteEveryoneRead,
         Owner::ROOT,
         plan.manifest.encode().as_bytes(),
     )?;
-    run.io("fsync", fs::sync_dir(staging))?;
+    run.entry(
+        "fsync",
+        staging,
+        protected_file::sync_directory(staging, root_uid),
+    )?;
     run.reached(Step::StagingSynced)?;
 
     // Step 9: rename into place, the database last.
@@ -551,19 +632,37 @@ pub fn install<O: Ownership, P: Progress>(
     for target in before {
         let parent = target.path(&plan.paths).parent();
         if !synced.contains(&parent) {
-            run.io("fsync", fs::sync_dir(parent))?;
+            run.entry(
+                "fsync",
+                parent,
+                protected_file::sync_directory(parent, root_uid),
+            )?;
             synced.push(parent);
         }
     }
     run.reached(Step::TargetsSynced)?;
     for target in last {
         run.install_one(*target)?;
-        run.io("fsync", fs::sync_dir(target.path(&plan.paths).parent()))?;
+        let parent = target.path(&plan.paths).parent();
+        run.entry(
+            "fsync",
+            parent,
+            protected_file::sync_directory(parent, root_uid),
+        )?;
     }
 
     // The empty staging directory.
-    run.io("rmdir", fs::remove_dir(staging))?;
-    run.io("fsync", fs::sync_dir(plan.paths.staging.parent()))?;
+    run.entry(
+        "rmdir",
+        staging,
+        protected_file::remove_empty_directory(staging, root_uid),
+    )?;
+    let staging_parent = plan.paths.staging.parent();
+    run.entry(
+        "fsync",
+        staging_parent,
+        protected_file::sync_directory(staging_parent, root_uid),
+    )?;
     run.reached(Step::StagingRemoved)?;
 
     Ok(Installed {

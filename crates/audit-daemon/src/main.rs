@@ -27,7 +27,7 @@ fn main() -> ExitCode {
     run(proof)
 }
 
-/// Steps 3-9 (crate::startup documents each).
+/// Steps 3-9 (crate::startup documents each, 3b included).
 fn run(proof: SingleThreadProof) -> ExitCode {
     // Step 3 — configuration (docs/50 R50-15, §7.1).
     let settings = match startup::config_path(std::env::args_os())
@@ -39,6 +39,13 @@ fn run(proof: SingleThreadProof) -> ExitCode {
             return ExitCode::from(EXIT_STARTUP);
         }
     };
+
+    // Step 3b — the socket's directory, as root, by descriptor (docs/50
+    // §3.1; docs/52 C13; task R11c).
+    if let Err(error) = startup::prepare_socket_directory(&settings) {
+        eprintln!("audit-daemon: {error}");
+        return ExitCode::from(EXIT_STARTUP);
+    }
 
     // Step 4 — hardening, before any thread (docs/50 R50-14, §6.2, §6.4).
     let plan = match startup::hardening_plan(&settings) {

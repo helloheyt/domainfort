@@ -73,7 +73,7 @@ use audit_log::{
     VerifiedSegment, VerifyError,
 };
 use core::fmt;
-use protected_file::{OpenError, PathBreak, RuleBreak};
+use protected_file::{DataFileBreak, OpenError, PathBreak};
 use std::io::{self, BufReader, Read};
 use std::path::Path;
 
@@ -116,9 +116,10 @@ pub enum StartupError {
     /// directory, is owned by neither root nor auditd's account, or is
     /// writable by group or others (crates/protected-file walk; task R11b).
     SegmentPath(PathBreak),
-    /// An existing segment is not a regular file, not auditd's, or writable
-    /// by group or others (crate::segments `segment_rule`; task R11b).
-    SegmentRule(RuleBreak),
+    /// An existing segment is not a regular file, not auditd's, or has any
+    /// permission for group or others (crate::segments `segment_rule`; tasks
+    /// R11b, R11c).
+    SegmentRule(DataFileBreak),
     /// A break that is not a recoverable torn tail.
     ChainBreak {
         /// The segment it is in.
@@ -179,14 +180,14 @@ impl fmt::Display for StartupError {
             StartupError::SegmentPath(path) => {
                 write!(f, "audit log segment refused: its path {path}")
             }
-            StartupError::SegmentRule(RuleBreak::NotRegularFile) => {
+            StartupError::SegmentRule(DataFileBreak::NotRegularFile) => {
                 f.write_str("audit log segment refused: not a regular file")
             }
-            StartupError::SegmentRule(RuleBreak::WrongOwner) => {
+            StartupError::SegmentRule(DataFileBreak::WrongOwner) => {
                 f.write_str("audit log segment refused: not owned by auditd's account")
             }
-            StartupError::SegmentRule(RuleBreak::WritableByGroupOrOthers) => {
-                f.write_str("audit log segment refused: writable by group or others")
+            StartupError::SegmentRule(DataFileBreak::AccessibleByGroupOrOthers) => {
+                f.write_str("audit log segment refused: accessible by group or others")
             }
             StartupError::ChainBreak {
                 segment,
@@ -222,7 +223,7 @@ enum Walk {
 /// The start-up refusal for a segment the walk or the segment rule refused,
 /// or the system's error kind.
 /// Spec: this module's documentation (task R11b); crate::segments.
-fn segment_error(error: OpenError<RuleBreak>) -> StartupError {
+fn segment_error(error: OpenError<DataFileBreak>) -> StartupError {
     match error {
         OpenError::Io(kind) => StartupError::Io(kind),
         OpenError::Path(path) => StartupError::SegmentPath(path),

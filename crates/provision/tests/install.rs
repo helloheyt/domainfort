@@ -281,6 +281,62 @@ fn unsafe_or_missing_parents_refuse_with_nothing_written() {
     std::fs::set_permissions(dir.join("var"), std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// Task R11c (docs/52 C13; docs/questions Q-532 item 2, A-109): every path
+/// is walked from `/` — a symbolic link in a directory component of a
+/// target (here `etc`, a link to a real directory) or of the staging
+/// directory refuses the run with nothing written, and nothing is created
+/// under the link's target.
+#[test]
+fn a_link_in_a_directory_component_refuses_with_nothing_written() {
+    let dir = TempDir::new();
+    let uid = my_uid(&dir);
+    if skip_as_root(uid) {
+        return;
+    }
+    let i = input(&dir, uid, 61007);
+    std::fs::remove_dir(dir.join("etc")).unwrap();
+    std::fs::create_dir(dir.join("etc-real")).unwrap();
+    std::os::unix::fs::symlink(dir.join("etc-real"), dir.join("etc")).unwrap();
+    let mut rng = CountingRandom::default();
+    let mut recorder = Recorder::new(uid);
+    let err =
+        provision_domain(&i, now(), &mut rng, &mut recorder, &mut HaltAt::never()).unwrap_err();
+    assert_eq!(err.state(), InstallState::NothingWritten);
+    assert!(matches!(
+        err,
+        ProvisionError::Install(provision::InstallError {
+            cause: InstallCause::Parent(_),
+            ..
+        })
+    ));
+    assert_eq!(rng.fills, 0);
+    assert!(recorder.records.is_empty());
+    assert_eq!(std::fs::read_dir(dir.join("etc-real")).unwrap().count(), 0);
+}
+
+/// Task R11c (Q-468 option 2(b), A-102): every directory on every path
+/// must be root's — with another account standing in for root, the test
+/// account's own directories are refused before anything is written.
+#[test]
+fn a_directory_not_owned_by_root_refuses_with_nothing_written() {
+    let dir = TempDir::new();
+    let uid = my_uid(&dir);
+    if skip_as_root(uid) {
+        return;
+    }
+    let i = input(&dir, uid, 61007);
+    let err = run(&i, &mut Recorder::new(uid + 1), &mut HaltAt::never()).unwrap_err();
+    assert_eq!(err.state(), InstallState::NothingWritten);
+    assert!(matches!(
+        err,
+        ProvisionError::Install(provision::InstallError {
+            cause: InstallCause::ParentOwner(_),
+            ..
+        })
+    ));
+    assert!(nothing_written(&i));
+}
+
 /// A-15 / A-77: a CSPRNG failure stops the run before anything is
 /// written.
 #[test]

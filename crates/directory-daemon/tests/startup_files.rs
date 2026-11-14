@@ -11,7 +11,10 @@
 //!   and no other (docs/50 §7.4; Q-213 → A-57; Q-270 item 1);
 //! * the policy file's owner / mode checks and its absence (fail closed);
 //! * the configuration's owner check; the serving parameters and the
-//!   hardening plan derived from a configuration (docs/50 §6.4, §7.1).
+//!   hardening plan derived from a configuration (docs/50 §6.4, §7.1);
+//! * the socket directories, prepared by descriptor through
+//!   crates/protected-file (docs/50 §3.1; task R11c, docs/questions Q-532
+//!   item 1).
 //!
 //! The root-owned case cannot be made by an unprivileged test: the reading
 //! functions take the expected owner, and `main` passes uid 0.
@@ -26,13 +29,13 @@ use directory_daemon::policy::{
     tier_map, DevelopmentPolicy, MandatoryFast, PolicyError, MARKER, SUPERSEDED_FORMAT,
 };
 use directory_daemon::startup::{
-    hardening_plan, params, read_integrity_key, read_policy, read_settings, read_settings_owned_by,
-    StartupError,
+    hardening_plan, params, prepare_socket_directory, read_integrity_key, read_policy,
+    read_settings, read_settings_owned_by, StartupError, SOCKET_DIRECTORY_MODE,
 };
 use dirstore::Store;
 use dtyp::{Sid, SECURITY_NT_AUTHORITY};
 use pdp::{Dn, PolicyVersion, RuleId, Tier};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use support::TempDir;
 // The files the tests read through crates/protected-file live in a scratch
@@ -240,6 +243,57 @@ audit_socket = /run/auditd/audit.sock
 auditd_uid = 61005
 view_lifetime = 3s
 ";
+
+/// Task R11c (docs/50 §3.1; docs/52 C13; docs/questions Q-532 item 1,
+/// A-109): dird's socket directories are created by descriptor — mode 0750
+/// exactly, owned by dird's account (the test account stands in) — and a
+/// symbolic link at one of their names is refused without anything being
+/// changed through it.
+#[test]
+fn the_socket_directories_are_prepared_by_descriptor() {
+    let dir = ScratchDir::new("dird-sock").unwrap();
+    let uid = dir.uid().unwrap();
+    if uid == 0 {
+        return;
+    }
+    // The scratch directory's group: one the test account belongs to, so
+    // the owner change of a created directory is allowed unprivileged.
+    let gid = std::fs::metadata(dir.path()).unwrap().gid();
+    let text = |kdc: &Path, ldap: &Path| {
+        DIRD.replace("run_as_uid = 61002", &format!("run_as_uid = {uid}"))
+            .replace("run_as_gid = 61002", &format!("run_as_gid = {gid}"))
+            .replace(
+                "dird_kdc_socket = /run/dird/kdc/dird-kdc.sock",
+                &format!("dird_kdc_socket = {}/dird-kdc.sock", kdc.display()),
+            )
+            .replace(
+                "dird_ldap_socket = /run/dird/ldap/dird-ldap.sock",
+                &format!("dird_ldap_socket = {}/dird-ldap.sock", ldap.display()),
+            )
+    };
+    let settings = |text: String| config::DirdSettings::parse(text.as_bytes()).unwrap();
+    let (kdc, ldap) = (dir.join("kdc"), dir.join("ldap"));
+    assert_eq!(
+        prepare_socket_directory(&settings(text(&kdc, &ldap))),
+        Ok(())
+    );
+    for created in [&kdc, &ldap] {
+        let metadata = std::fs::symlink_metadata(created).unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.mode() & 0o7777, SOCKET_DIRECTORY_MODE);
+        assert_eq!((metadata.uid(), metadata.gid()), (uid, gid));
+    }
+    let real = dir.join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let link = dir.join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert_eq!(
+        prepare_socket_directory(&settings(text(&kdc, &link))),
+        Err(StartupError::SocketDirectoryPermissions)
+    );
+    assert_eq!(std::fs::metadata(&real).unwrap().mode() & 0o7777, 0o700);
+}
 
 /// docs/50 §3.2, §3.4, §6.4, §7.1; Q-230 item 4: the serving parameters
 /// come from the configuration and the daemon's constants; the hardening

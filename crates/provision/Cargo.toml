@@ -80,8 +80,8 @@ krb-proto = { path = "../krb-proto" }
 # key's buffers are wiped on drop. Not a new dependency.
 zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
 # rustix — owner decision P-12 (already in the lock through daemon-sandbox):
-# O_EXCL | O_NOFOLLOW creation, fchmod, fchown, fsync, renameat /
-# renameat_with (RENAME_NOREPLACE), unlinkat, geteuid — through its
+# fchown and fsync on descriptors, geteuid (the creations, renames and
+# removals moved into crates/protected-file, task R11c) — through its
 # documented safe API only (docs.rs, P-2). Feature `termios` (task A6):
 # `isatty`, `tcgetattr`, `tcsetattr` for the hidden password entry of
 # `first-admin-secret` (a feature of the same crate, no new package).
@@ -100,7 +100,10 @@ ipc = { path = "../ipc" }
 daemon-sandbox = { path = "../daemon-sandbox" }
 # The protected-file reader (task F7, A-86 / A-96 follow-up): admind's
 # configuration for `first-admin-secret` (the manifest goes through
-# provision-manifest's reader, built on it). No new package.
+# provision-manifest's reader, built on it). No new package. Task R11c
+# (A-109, Q-532 item 2): also every filesystem step of the installer and of
+# `provision policy` — creations, renames, the staging directory's removal,
+# directory fsyncs — relative to directories it walks from `/`.
 protected-file = { path = "../protected-file" }
 # admind's password rules ([MS-SAMR] 3.1.1.7.2 as A-79 / Q-401 read them),
 # shared with admin-daemon — the same functions, not a copy.

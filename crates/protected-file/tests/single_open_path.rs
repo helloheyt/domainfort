@@ -42,22 +42,16 @@ const RAW_OPENS: [&str; 12] = [
 ];
 
 /// The source files outside this crate allowed to reach a file by path,
-/// relative to `crates/`, with the reason (docs/questions/Q-532).
-const ALLOWED: [(&str, &str); 5] = [
+/// relative to `crates/`, with the reason (docs/questions/Q-532; task R11c
+/// removed provision's installer from this list — it goes through this
+/// crate's walk now, Q-550 item 3).
+const ALLOWED: [(&str, &str); 3] = [
     (
         "dirstore/src/store.rs",
-        "Store::open(path): the library's path form, used by tests and by \
-         provision's staging (Q-532 item 3); dird uses Store::open_file",
-    ),
-    (
-        "provision/src/fs.rs",
-        "the installer's exclusive-create / no-follow helpers in its own \
-         staging directory (A-92; Q-532 item 2)",
-    ),
-    (
-        "provision/src/install.rs",
-        "the staged store opened by path inside the installer's staging \
-         directory (A-92; Q-532 item 2)",
+        "Store::open(path): the library's path form, for tests only — it \
+         opens the file and builds the store through Store::open_file, the \
+         one construction path (Q-531 item 7); dird and provision use \
+         Store::open_file on a descriptor this crate checked (Q-550)",
     ),
     (
         "keyd/src/entropy.rs",

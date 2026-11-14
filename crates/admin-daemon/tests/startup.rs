@@ -280,8 +280,10 @@ fn the_parameters_come_from_the_file() {
 /// group, group write or access for others is refused.
 #[test]
 fn the_socket_directory_rule() {
-    let dir = TempDir::new();
-    let uid = my_uid(&dir);
+    // Inside the workspace (crates/test-scratch, Q-480): since task R11c the
+    // preparation walks the directory's parent from `/`.
+    let dir = ScratchDir::new("adm-sock").unwrap();
+    let uid = dir.uid().unwrap();
     if uid == 0 {
         return;
     }
@@ -325,4 +327,47 @@ fn the_socket_directory_rule() {
             "{mode:o}"
         );
     }
+}
+
+/// Task R11c (docs/52 C13; docs/questions Q-532 item 1, A-109): a missing
+/// socket directory is created by descriptor with mode 0750, admind's
+/// account and `admin_socket_group`; a symbolic link at its name is refused
+/// and nothing is changed through it. The test account stands in for
+/// admind's, its scratch directory's group for the configured group.
+#[test]
+fn the_socket_directory_is_created_by_descriptor_and_never_through_a_link() {
+    let dir = ScratchDir::new("adm-sock").unwrap();
+    let uid = dir.uid().unwrap();
+    if uid == 0 {
+        return;
+    }
+    let gid = std::fs::metadata(dir.path()).unwrap().gid();
+    let text = |socket_dir: &Path| {
+        ADMIND
+            .replace("run_as_uid = 806", &format!("run_as_uid = {uid}"))
+            .replace(
+                "admin_socket = /run/admind/admin.sock",
+                &format!("admin_socket = {}/admin.sock", socket_dir.display()),
+            )
+            .replace(
+                "admin_socket_group = 810",
+                &format!("admin_socket_group = {gid}"),
+            )
+    };
+    let created = dir.join("admind");
+    assert_eq!(prepare_socket_directory(&settings(&text(&created))), Ok(()));
+    let metadata = std::fs::symlink_metadata(&created).unwrap();
+    assert_eq!(metadata.mode() & 0o7777, SOCKET_DIRECTORY_MODE);
+    assert_eq!((metadata.uid(), metadata.gid()), (uid, gid));
+
+    let real = dir.join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let link = dir.join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert_eq!(
+        prepare_socket_directory(&settings(&text(&link))),
+        Err(StartupError::SocketDirectoryPermissions)
+    );
+    assert_eq!(std::fs::metadata(&real).unwrap().mode() & 0o7777, 0o700);
 }

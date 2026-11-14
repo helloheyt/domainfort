@@ -5,9 +5,10 @@
 //! link in a directory component, a directory writable by group or others,
 //! or a directory owned by neither root nor auditd's account refuses the
 //! start (an operational refusal, not a chain break) and nothing is created
-//! through it; an existing segment that is not auditd's, or is writable by
-//! group or others, is refused; a rotation into a directory that has become
-//! writable fails; the happy path still creates, appends and resumes.
+//! through it; an existing segment that is not auditd's, or has any
+//! permission for group or others (task R11c: a group-readable segment
+//! too), is refused; a rotation into a directory that has become writable
+//! fails; the happy path still creates, appends and resumes.
 //!
 //! The tests run as an ordinary account: auditd's account is the test's own
 //! (`common::log_uid`), and the log lives in a scratch directory inside the
@@ -15,15 +16,18 @@
 //!
 //! Sources: docs/50 §2.4 (auditd "holds the audit file"), §6.4 ("append
 //! write access to the audit file only"), §7.5; docs/37 §2; Q-468 options 1,
-//! 2(b) (A-102); Q-481 (A-104). Payloads are arbitrary test octets.
+//! 2(b) (A-102); Q-481 (A-104); Q-531 item 4 (A-109: "no group/other
+//! access at all, matching the 0600 it creates"). Payloads are arbitrary
+//! test octets.
 
 mod common;
 
 use audit_daemon::recovery::{open_log, StartKind, StartupError};
 use audit_daemon::segments::{segment_path, FileSegments, ListingError, SegmentFactory};
+use audit_daemon::startup::prepare_socket_directory;
 use audit_log::SegmentLimit;
 use common::*;
-use protected_file::{PathBreak, RuleBreak};
+use protected_file::{DataFileBreak, PathBreak, SocketDirectoryBreak, SocketDirectoryError};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
@@ -122,26 +126,31 @@ fn a_writable_or_foreign_log_directory_refuses_the_start() {
     assert!(open_log(&dir.base(), SegmentLimit::DEFAULT, log_uid()).is_ok());
 }
 
-// docs/50 §2.4, §6.4; crate::segments `segment_rule`: an existing segment
-// writable by group or others is refused when it is opened (an
-// operational refusal); a segment readable by a group is not.
+// docs/50 §2.4, §6.4; Q-531 item 4 (A-109); crate::segments
+// `segment_rule`: an existing segment with any permission for group or
+// others — writable by them, or only readable (0640), or readable by others
+// (0604) — is refused when it is opened (an operational refusal, not a
+// chain break); the 0600 auditd creates is accepted.
 #[test]
-fn a_writable_segment_refuses_the_start() {
+fn a_segment_accessible_by_group_or_others_refuses_the_start() {
     let dir = TempDir::new();
     build_log(&dir.base(), &[2, 1], 64);
     let second = segment_path(&dir.base(), 2);
-    chmod(&second, 0o620);
-    let error = start_error(&dir.base(), log_uid());
-    assert_eq!(
-        error,
-        StartupError::SegmentRule(RuleBreak::WritableByGroupOrOthers)
-    );
-    assert!(!error.is_chain_break());
-    assert_eq!(
-        error.to_string(),
-        "audit log segment refused: writable by group or others"
-    );
-    chmod(&second, 0o640);
+    for refused in [0o620, 0o640, 0o604, 0o660] {
+        chmod(&second, refused);
+        let error = start_error(&dir.base(), log_uid());
+        assert_eq!(
+            error,
+            StartupError::SegmentRule(DataFileBreak::AccessibleByGroupOrOthers),
+            "{refused:o}"
+        );
+        assert!(!error.is_chain_break());
+        assert_eq!(
+            error.to_string(),
+            "audit log segment refused: accessible by group or others"
+        );
+    }
+    chmod(&second, 0o600);
     assert_eq!(
         open_log(&dir.base(), SegmentLimit::DEFAULT, log_uid())
             .expect("resumed")
@@ -172,4 +181,63 @@ fn a_new_segment_needs_a_directory_that_passes_the_walk() {
     chmod(dir.path(), 0o700);
     assert!(!segment_path(&dir.base(), 2).exists());
     assert!(files.create(2).is_ok());
+}
+
+// Task R11c (docs/50 §3.1; docs/52 C13; docs/questions Q-532 items 1, 5,
+// A-109): auditd now prepares its socket directory as root before the drop,
+// through the same crates/protected-file implementation as keyd, dird and
+// admind — created by descriptor (mode 0750, auditd's account), a stale
+// socket removed relative to it; a symbolic link at its name is refused and
+// nothing is changed through it. The test account stands in for auditd's.
+#[test]
+fn the_socket_directory_is_prepared_by_descriptor() {
+    use std::os::unix::fs::FileTypeExt;
+    let dir = TempDir::new();
+    let uid = log_uid();
+    if uid == 0 {
+        return;
+    }
+    // The scratch directory's group: one the test account belongs to, so
+    // the owner change of a created directory is allowed unprivileged.
+    let gid = std::fs::metadata(dir.path()).unwrap().gid();
+    let settings = |socket_dir: &Path| {
+        let text = format!(
+            "run_as_uid = {uid}\nrun_as_gid = {gid}\naudit_socket = {}/audit.sock\n\
+             audit_log_path = {}\nuid_sources = {}:kdc\n",
+            socket_dir.display(),
+            dir.base().display(),
+            other_uid(&[uid])
+        );
+        config::AuditdSettings::parse(text.as_bytes()).unwrap()
+    };
+    let run = dir.path().join("run");
+    assert_eq!(prepare_socket_directory(&settings(&run)), Ok(()));
+    let metadata = std::fs::symlink_metadata(&run).unwrap();
+    assert!(metadata.is_dir());
+    assert_eq!(
+        metadata.mode() & 0o7777,
+        protected_file::SOCKET_DIRECTORY_MODE
+    );
+    assert_eq!((metadata.uid(), metadata.gid()), (uid, gid));
+    // A socket left by an earlier run is removed.
+    drop(std::os::unix::net::UnixListener::bind(run.join("audit.sock")).unwrap());
+    assert!(std::fs::symlink_metadata(run.join("audit.sock"))
+        .unwrap()
+        .file_type()
+        .is_socket());
+    assert_eq!(prepare_socket_directory(&settings(&run)), Ok(()));
+    assert!(std::fs::symlink_metadata(run.join("audit.sock")).is_err());
+    // A link at the directory's name: refused, not followed.
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    chmod(&real, 0o700);
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert_eq!(
+        prepare_socket_directory(&settings(&link)),
+        Err(SocketDirectoryError::Directory(
+            SocketDirectoryBreak::NotADirectory
+        ))
+    );
+    assert_eq!(std::fs::metadata(&real).unwrap().mode() & 0o7777, 0o700);
 }

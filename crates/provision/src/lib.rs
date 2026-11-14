@@ -12,7 +12,8 @@
 //!    own [MS-SAMR] rules, at least two first administrators — P-22, each
 //!    socket in its own directory) and the filesystem
 //!    ([`install::precheck`]: every target and the staging directory
-//!    absent, parents real directories on one filesystem);
+//!    absent, parents real directories on one filesystem, every directory
+//!    on every path walked from `/` — crates/protected-file, task R11c);
 //! 2. **draws** from the CSPRNG — the domain SID, every objectGUID, the
 //!    NodeId, the integrity key ([`Plan`]); the source is
 //!    `directory_admin::OsRandom`, keyd's (A-15 / A-77) behind
@@ -71,7 +72,11 @@
 //! never written anywhere (they go to keyd only). Every
 //! file is created exclusively without following links (O_EXCL |
 //! O_NOFOLLOW) and renamed without replacing (RENAME_NOREPLACE); nothing
-//! existing is ever overwritten (no `--force`). This crate does not link
+//! existing is ever overwritten (no `--force`). Every creation, rename,
+//! removal and directory `fsync` is made relative to a directory walked
+//! from `/` by crates/protected-file — no directory component is followed
+//! through a link, every directory is root's and not writable by group or
+//! others (task R11c, A-109). This crate does not link
 //! krb-crypto or keyd (D182; guarded by
 //! crates/keyd-types/tests/no_crypto_dependency.rs).
 //!
@@ -115,7 +120,6 @@ pub mod cli;
 pub mod configs;
 mod descriptor;
 pub mod first_admin;
-mod fs;
 mod ids;
 pub mod input;
 pub mod install;
@@ -191,7 +195,7 @@ pub fn provision_domain<R: RandomSource, O: Ownership, P: Progress>(
     input
         .check()
         .map_err(|e| ProvisionError::Plan(PlanError::Input(e)))?;
-    precheck(&input.paths).map_err(ProvisionError::Install)?;
+    precheck(&input.paths, ownership.root_uid()).map_err(ProvisionError::Install)?;
     let plan = Plan::build(input, now, rng).map_err(ProvisionError::Plan)?;
     let installed = install(&plan, ownership, progress).map_err(ProvisionError::Install)?;
     Ok((plan, installed))

@@ -34,16 +34,17 @@
 //! (`protected_file::open`), for appending to the verified last segment
 //! (`open_append`), and created exclusively, mode 0600, for a new one
 //! (`create_new_append`). An existing segment must satisfy
-//! [`segment_rule`]: a regular file, auditd's, not writable by group or
-//! others. The reads and writes happen after the privilege drop, so the
-//! owner is auditd's uid (docs/50 §2.4: auditd "holds the audit file").
+//! [`segment_rule`]: a regular file, auditd's, with no permission at all for
+//! group or others — the 0600 it creates (task R11c, Q-531 item 4). The
+//! reads and writes happen after the privilege drop, so the owner is
+//! auditd's uid (docs/50 §2.4: auditd "holds the audit file").
 //!
 //! Spec: docs/37 §2 (append-only, hash-chain); docs/50 §2.4, §6.4, §8.1;
 //! docs/52 §3.13 (C13), §7 R11; docs/questions/Q-250 items 6, 8;
 //! docs/questions/Q-265 item 2; Q-468 (A-102); Q-481 (A-104); Q-530.
 
 use audit_log::{FileStorage, Storage};
-use protected_file::{FileFacts, OpenError, PathBreak, RuleBreak};
+use protected_file::{DataFileBreak, FileFacts, OpenError, PathBreak};
 use std::fs::File;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -148,18 +149,21 @@ pub fn list_segments(base: &Path, owner_uid: u32) -> Result<Vec<u64>, ListingErr
 
 /// The rule every existing segment file must satisfy when it is opened —
 /// read at start or appended to: a regular file (a link's facts never
-/// are), owned by auditd's account, not writable by group or others (no
-/// other account can change the log). Read access for a group is not
-/// refused: the log holds no secret (docs/37 §2: "only identifiers and
-/// metadata"). New segments are created 0600 (`create_new_append`).
+/// are), owned by auditd's account, **no** permission bit for group or
+/// others — exactly the 0600 auditd creates (`create_new_append`). No reader
+/// group exists in the design, so a group-readable segment is refused too
+/// (fail closed; task R11c — before it, read access for a group was
+/// admitted).
 ///
 /// # Errors
-/// The [`RuleBreak`] of the first condition broken, in that order.
+/// The [`DataFileBreak`] of the first condition broken, in that order.
 ///
-/// Spec: docs/50 §2.4, §6.4; docs/37 §2; crates/protected-file
-/// `configuration_file_rule` (the same three conditions); Q-530.
-pub fn segment_rule(facts: &FileFacts, owner_uid: u32) -> Result<(), RuleBreak> {
-    protected_file::configuration_file_rule(facts, owner_uid)
+/// Spec: docs/50 §2.4, §6.4; docs/37 §2; docs/questions Q-531 item 4
+/// (A-109: "no group/other access at all (mode & 0o077 == 0), matching the
+/// 0600 it creates"); crates/protected-file `data_file_rule` (the one rule
+/// for a daemon's data files, dird's store included).
+pub fn segment_rule(facts: &FileFacts, owner_uid: u32) -> Result<(), DataFileBreak> {
+    protected_file::data_file_rule(facts, owner_uid)
 }
 
 /// The segment number in a name suffix: exactly [`SEGMENT_DIGITS`] ASCII
@@ -237,10 +241,10 @@ impl FileSegments {
     /// [`segment_rule`].
     ///
     /// # Errors
-    /// crates/protected-file's [`OpenError`] with the [`RuleBreak`].
+    /// crates/protected-file's [`OpenError`] with the [`DataFileBreak`].
     ///
     /// Spec: module documentation; crates/protected-file `open`.
-    pub fn open_read(&self, index: u64) -> Result<File, OpenError<RuleBreak>> {
+    pub fn open_read(&self, index: u64) -> Result<File, OpenError<DataFileBreak>> {
         protected_file::open(&self.path(index), self.owner_uid, |facts| {
             segment_rule(facts, self.owner_uid)
         })
@@ -250,11 +254,11 @@ impl FileSegments {
     /// walk and under [`segment_rule`].
     ///
     /// # Errors
-    /// crates/protected-file's [`OpenError`] with the [`RuleBreak`].
+    /// crates/protected-file's [`OpenError`] with the [`DataFileBreak`].
     ///
     /// Spec: module documentation; docs/50 §6.4 ("append write access to the
     /// audit file only"); crates/protected-file `open_append`.
-    pub fn open_append(&self, index: u64) -> Result<FileStorage, OpenError<RuleBreak>> {
+    pub fn open_append(&self, index: u64) -> Result<FileStorage, OpenError<DataFileBreak>> {
         protected_file::open_append(&self.path(index), self.owner_uid, |facts| {
             segment_rule(facts, self.owner_uid)
         })
@@ -265,12 +269,12 @@ impl FileSegments {
     /// the walk, exclusively, mode 0600, under [`segment_rule`].
     ///
     /// # Errors
-    /// crates/protected-file's [`OpenError`] with the [`RuleBreak`] (an
+    /// crates/protected-file's [`OpenError`] with the [`DataFileBreak`] (an
     /// existing name is an [`OpenError::Io`]).
     ///
     /// Spec: module documentation; crates/protected-file
     /// `create_new_append`.
-    pub fn create_segment(&self, index: u64) -> Result<FileStorage, OpenError<RuleBreak>> {
+    pub fn create_segment(&self, index: u64) -> Result<FileStorage, OpenError<DataFileBreak>> {
         protected_file::create_new_append(&self.path(index), self.owner_uid, |facts| {
             segment_rule(facts, self.owner_uid)
         })

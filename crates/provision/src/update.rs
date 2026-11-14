@@ -15,8 +15,16 @@
 //! 4. dird and kdc must both be restarted: there is no reload, and the kdc
 //!    refuses to start with a policy version different from dird's (A-69).
 //!
+//! Every filesystem step goes through crates/protected-file (task R11c,
+//! docs/questions Q-532 item 2): the policy's path is walked from `/` (no
+//! link in any directory component; every directory root's and not writable
+//! by group or others), its facts are taken relative to the walked
+//! directory, the `.next` file is created and renamed relative to it, and
+//! the directory is `fsync`ed through the walk — never a lookup of the path
+//! from the current directory.
+//!
 //! Spec: docs/51 §5.10 (R51-21); A-80; A-69; Q-270 item 2(b); Q-299;
-//! policy-store `read_file`; rustix docs.rs (P-2).
+//! policy-store `read_file`; A-109 (Q-532 item 2); rustix docs.rs (P-2).
 
 use core::fmt;
 use std::io::Write;
@@ -24,9 +32,8 @@ use std::os::fd::AsFd;
 use std::path::PathBuf;
 
 use pdp::PolicyVersion;
-use rustix::io::Errno;
+use protected_file::{EntryError, NewFileMode, PathBreak};
 
-use crate::fs;
 use crate::input::FilePath;
 use crate::ownership::{Ownership, OwnershipError, Staged};
 use crate::plan::Owner;
@@ -39,17 +46,21 @@ pub const RESTART_NOTICE: &str =
 /// Why the edit was refused or failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateError {
-    /// The policy path is not a regular file (or is a link).
+    /// The policy path is not a regular file (or is a link), or nothing is
+    /// there.
     NotRegular,
+    /// A directory on the policy's path is a link or not a directory, is not
+    /// root's, or is writable by group or others (task R11c).
+    Path(PathBreak),
     /// The policy file could not be loaded (permissions, decoding).
     Load(policy_store::LoadError),
     /// The edit was refused.
     Edit(EditError),
     /// The `.next` file could not be created (it may exist from an
     /// interrupted run).
-    Next(PathBuf, Errno),
+    Next(PathBuf, EntryError),
     /// Another filesystem step failed; the `.next` file may remain.
-    Io(&'static str, Errno),
+    Io(&'static str, EntryError),
     /// Writing the `.next` file failed; it remains.
     Write(std::io::ErrorKind),
     /// The owner of the `.next` file could not be changed; it remains.
@@ -60,6 +71,7 @@ impl fmt::Display for UpdateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             UpdateError::NotRegular => f.write_str("the policy path is not a regular file"),
+            UpdateError::Path(path) => write!(f, "the policy file's path {path}"),
             UpdateError::Load(e) => write!(f, "{e}"),
             UpdateError::Edit(e) => write!(f, "{e}"),
             UpdateError::Next(p, e) => write!(
@@ -99,24 +111,28 @@ pub fn update_policy<O: Ownership>(
     changes: &[TierChange],
     ownership: &mut O,
 ) -> Result<PolicyVersion, UpdateError> {
-    let link = std::fs::symlink_metadata(path.as_path()).map_err(|_| UpdateError::NotRegular)?;
-    if !link.file_type().is_file() {
-        return Err(UpdateError::NotRegular);
+    let root = ownership.root_uid();
+    match protected_file::entry_facts(path.as_path(), root) {
+        Ok(Some(facts)) if facts.regular_file => {}
+        Ok(_) | Err(EntryError::Io(_)) => return Err(UpdateError::NotRegular),
+        Err(EntryError::Path(broken)) => return Err(UpdateError::Path(broken)),
     }
-    let policy =
-        policy_store::read_file(path.as_path(), ownership.root_uid()).map_err(UpdateError::Load)?;
+    let policy = policy_store::read_file(path.as_path(), root).map_err(UpdateError::Load)?;
     let (next, bytes) = edit_tier_map(&policy, changes).map_err(UpdateError::Edit)?;
     let staged = next_path(path);
-    let mut file = fs::create_new_file(&staged, fs::mode_0644())
-        .map_err(|e| UpdateError::Next(staged.clone(), e))?;
+    let mut file =
+        protected_file::create_new_file(&staged, root, NewFileMode::OwnerWriteEveryoneRead)
+            .map_err(|e| UpdateError::Next(staged.clone(), e))?;
     file.write_all(&bytes)
         .map_err(|e| UpdateError::Write(e.kind()))?;
     ownership
         .change_owner(file.as_fd(), Staged::PolicyUpdate, Owner::ROOT)
         .map_err(UpdateError::Ownership)?;
-    fs::sync(&file).map_err(|e| UpdateError::Io("fsync", e))?;
+    rustix::fs::fsync(&file)
+        .map_err(|errno| UpdateError::Io("fsync", EntryError::Io(errno.kind())))?;
     drop(file);
-    fs::rename_replace(&staged, path.as_path()).map_err(|e| UpdateError::Io("rename", e))?;
-    fs::sync_dir(path.parent()).map_err(|e| UpdateError::Io("fsync", e))?;
+    protected_file::rename_replace(&staged, root, path.as_path(), root)
+        .map_err(|e| UpdateError::Io("rename", e))?;
+    protected_file::sync_directory(path.parent(), root).map_err(|e| UpdateError::Io("fsync", e))?;
     Ok(next.version)
 }

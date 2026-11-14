@@ -151,27 +151,52 @@ pub struct Store {
 }
 
 impl Store {
-    /// Open (or create) the store at `path`.
+    /// Open (or create) the store at `path`: the file is opened for reading
+    /// and writing (created empty if absent, never truncated) and handed to
+    /// [`Store::open_file`] — the **one** construction path, so a store
+    /// opened by path (tests) and one opened on a checked descriptor (dird,
+    /// provision's staging) are built by the same builder with the same
+    /// defaults (task R11c; docs/questions Q-531 item 7: the redb pages do
+    /// not say that `Database::create(path)` uses `Builder::new()`'s
+    /// defaults, so it is no longer used).
+    ///
+    /// The path is resolved the platform's default way (a link is followed):
+    /// this form is for tests. No product code calls it — dird and provision
+    /// reach their files through crates/protected-file and use
+    /// [`Store::open_file`] (pinned by that crate's
+    /// `tests/single_open_path.rs`, which allows the call only here).
     ///
     /// On a new database this creates the tables and a tagged meta record. On
     /// an existing one it verifies the meta record's tag first: a wrong
     /// `key` is reported here as [`Error::Tamper`]`(`[`RecordKind::Meta`]`)`,
     /// as is a missing meta record in a database that holds other records.
-    /// Spec: docs/32 §3 (D135); docs/10 D34 (format version).
+    /// Spec: docs/32 §3 (D135); docs/10 D34 (format version); std
+    /// `fs::OpenOptions` (`read`, `write`, `create`); redb 4.5.0 docs.rs
+    /// `DatabaseError` (`From<std::io::Error>`).
     pub fn open(path: impl AsRef<Path>, key: IntegrityKey, schema: Schema) -> Result<Store> {
-        Store::with_database(Database::create(path)?, key, schema)
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(redb::DatabaseError::from)?;
+        Store::open_file(file, key, schema)
     }
 
     /// Open (or create) the store in `file`, a regular file the caller has
     /// already opened for reading and writing — no path is looked up again,
     /// so the file redb works on is exactly the descriptor the caller
     /// checked (dird: crates/protected-file `open_read_write`, docs/52 R11,
-    /// docs/questions/Q-481 item c, Q-530). Otherwise as [`Store::open`]: an
-    /// empty file becomes a new store; an existing one is authenticated by
-    /// its meta record first.
+    /// docs/questions/Q-481 item c, Q-530; provision's staged store:
+    /// crates/protected-file `create_new_read_write`, task R11c). An empty
+    /// file becomes a new store; an existing one is authenticated by its
+    /// meta record first. Every store is built here ([`Store::open`] too):
+    /// `Database::builder()` with its defaults, nothing set.
     ///
     /// Spec: docs/32 §3 (D135); docs/50 R50-2, §6.4; redb 4.5.0 docs.rs
     /// `Database::builder` ("Convenience method for Builder::new"),
+    /// `Builder::new` ("Construct a new Builder with sensible defaults"),
     /// `Builder::create_with_backend` ("Open an existing or create a new
     /// database with the given backend"), `backends::FileBackend::new`
     /// ("Creates a new backend which stores data to the given file").
