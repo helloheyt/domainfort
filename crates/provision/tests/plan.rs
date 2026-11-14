@@ -564,7 +564,7 @@ fn the_manifest_carries_the_directorys_salts() {
         .unwrap();
         assert_eq!(
             admin.salt(),
-            Some(expected.as_str()),
+            expected.as_str(),
             "{}",
             admin.sam_account_name()
         );

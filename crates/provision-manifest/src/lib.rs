@@ -30,7 +30,7 @@
 //! | `ldap_service` | `<guid>:NT-SRV-HST:ldap/<dc_fqdn>` | RFC 4120 §6.2.1; docs/10 §5ב |
 //! | `admin_service` | `<guid>:NT-SRV-HST:admind/<dc_fqdn>` | RFC 4120 §6.2.1; A-73 |
 //! | `first_admins` | 2–8 × `<guid>:NT-PRINCIPAL:<sAMAccountName>`, `", "`-separated | docs/47 §9.1; [MS-SAMR] 3.1.1.6; Q-295 |
-//! | `first_admin_salts` (optional) | one salt per first administrator, in `first_admins` order, `", "`-separated | the salt `provision domain` computed with `directory_pip::account_salt` (R47-4) — the one keyadm's ceremony grant binds and `first-admin-secret` presents (A-102, docs/52 N4) |
+//! | `first_admin_salts` | one salt per first administrator, in `first_admins` order, `", "`-separated | the salt `provision domain` computed with `directory_pip::account_salt` (R47-4) — the one keyadm's ceremony grant binds and `first-admin-secret` presents (A-102, docs/52 N4); required since A-105 (Q-473) |
 //!
 //! A `<guid>` is the lower-case `8-4-4-4-12` form ([MS-DTYP] 2.5.1.1 layout,
 //! field order from [MS-DRSR] 5.16.3.16 — the A-31 route; dtyp's
@@ -44,7 +44,8 @@
 //! (docs/47 §1.3, R47-1), so the entry states it once.
 //!
 //! An example (obviously fake values; the SID is the [MS-DTYP] 2.4.2.4
-//! example domain):
+//! example domain; the salts are placeholders, not the directory's salt
+//! rule):
 //!
 //! ```text
 //! # provisioning manifest (docs/51 4.3 step 8): identifiers only, no secret
@@ -57,6 +58,7 @@
 //! ldap_service = 00000000-0000-0000-0000-000000000002:NT-SRV-HST:ldap/dc1.example.test
 //! admin_service = 00000000-0000-0000-0000-000000000003:NT-SRV-HST:admind/dc1.example.test
 //! first_admins = 00000000-0000-0000-0000-000000000004:NT-PRINCIPAL:alice, 00000000-0000-0000-0000-000000000005:NT-PRINCIPAL:bob
+//! first_admin_salts = salt-a, salt-b
 //! ```
 //!
 //! # Security

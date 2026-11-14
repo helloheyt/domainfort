@@ -42,6 +42,18 @@ pub(crate) fn flags(obj: &Object, id: AttrId) -> Result<Option<u32>, Malformed> 
         .transpose()
 }
 
+/// A 64-bit value stored as Integer / DsTime (accountExpires, pwdLastSet).
+/// Spec: docs/46 §8.1 (8 octets, big-endian), §5.4.
+pub(crate) fn int64(obj: &Object, id: AttrId) -> Result<Option<i64>, Malformed> {
+    single(obj, id)?
+        .map(|v| {
+            <[u8; 8]>::try_from(v)
+                .map(i64::from_be_bytes)
+                .map_err(|_| Malformed)
+        })
+        .transpose()
+}
+
 /// A SID value. Spec: [MS-DTYP] 2.4.2.2; docs/46 §1.
 pub(crate) fn sid(obj: &Object, id: AttrId) -> Result<Option<Sid>, Malformed> {
     single(obj, id)?

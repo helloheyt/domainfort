@@ -32,6 +32,9 @@ pub(crate) struct ClassIds {
 pub(crate) struct Ids {
     pub(crate) cn: AttrId,
     pub(crate) ou: AttrId,
+    /// dc, the NC root's RDN attribute (the write invariants know it —
+    /// docs/51 §4.3 step 5; docs/46 §4.4).
+    pub(crate) dc: AttrId,
     pub(crate) sam_account_name: AttrId,
     pub(crate) object_sid: AttrId,
     pub(crate) user_account_control: AttrId,
@@ -87,6 +90,7 @@ impl Ids {
         Ok(Ids {
             cn: attr("cn")?,
             ou: attr("ou")?,
+            dc: attr("dc")?,
             sam_account_name: attr("sAMAccountName")?,
             object_sid: attr("objectSid")?,
             user_account_control,

@@ -93,6 +93,22 @@
 //! Q-356 and Q-357, and this repository's crate directory-pip
 //! (`MAX_EXPANDED_GROUPS`, `groups.rs`).
 //!
+//! # One checker for every write path (docs/52 R13, A-102)
+//!
+//! Module `invariants` holds the rules every directory write must keep —
+//! the [MS-SAMR] constraints and name rules (A-79), the membership rules,
+//! the cycle refusal and the expansion bounds (A-89, A-95) — and the only
+//! code in the workspace that calls dirstore's mutating API: `apply`
+//! commits a `CheckedWrite` of it, and `provision domain` writes the new
+//! domain through its [`Provisioning`] session, the one place the named
+//! provisioning exceptions (NC root, krbtgt, DC account, service objects)
+//! exist. Pinned by `tests/single_write_path.rs`. Written only from
+//! docs/52 (§3.14, §7), docs/51 (§4.3, §11), docs/46 (§4-§5, §8), docs/47
+//! (§5.3), the decisions A-79, A-83, A-89, A-92, A-95, A-102, the questions
+//! Q-298, Q-355..Q-358, Q-376, Q-416, the pinned [MS-SAMR] v20260427
+//! (083fe00a…8a4e) 2.2.1.14, 3.1.1.6, 3.1.1.8.9, 3.1.1.9.2 and this
+//! repository's code; interpretations in docs/questions/Q-505..Q-507.
+//!
 //! Interpretations and gaps: docs/questions/Q-355 (names and values),
 //! Q-356 (membership and protected objects), Q-357 (dual control and the
 //! self-lockout guard), Q-358 (two-phase contract and re-verification),
@@ -105,6 +121,7 @@ mod checks;
 mod config;
 mod descriptor;
 mod ids;
+mod invariants;
 mod key_requests;
 mod names;
 mod operation;
@@ -121,10 +138,14 @@ pub use admin::{
 pub use apply::Applied;
 pub use audit::{Refusal, RefusalStatus};
 pub use config::{
-    AdminConfig, ConfigError, ProtectedObjects, CHANGE_SEQ_COUNTER, MAX_QUORUM, MIN_QUORUM,
-    RID_COUNTER, RID_END_EXCLUSIVE, RID_FIRST,
+    AdminConfig, ConfigError, ProtectedObjects, CHANGE_SEQ_COUNTER, CHANGE_SEQ_END_EXCLUSIVE,
+    CHANGE_SEQ_FIRST, MAX_QUORUM, MIN_QUORUM, RID_COUNTER, RID_END_EXCLUSIVE, RID_FIRST,
 };
 pub use descriptor::{new_object_descriptor, DescriptorError};
+// The write invariants' provisioning session (docs/52 R13): the only way
+// `provision domain` writes the new domain, and the only place the named
+// provisioning exceptions exist.
+pub use invariants::{InvariantViolation, Provisioning, ProvisioningError, ProvisioningRole};
 // Dual-controlled key operations (task A10, docs/51 §5.6, §6).
 pub use key_requests::{
     operation_digest, KeyAdminOperation, KeyDecision, KeyOperation, KeyRef, KeyReply,

@@ -1094,8 +1094,7 @@ impl World {
             self.input.paths.keyd_socket.as_path()
         );
         let mut client = key_state_client(settings.keyd().socket().as_path(), self.uid);
-        let report = keyadm::ceremony::run(&mut client, &self.manifest)
-            .expect("the produced manifest names every first administrator's salt");
+        let report = keyadm::ceremony::run(&mut client, &self.manifest);
         self.captured
             .extend(keyadm::report::render(&report, &self.manifest));
         report

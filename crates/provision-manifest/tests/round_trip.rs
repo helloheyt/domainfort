@@ -39,26 +39,28 @@ fn the_builder_writes_what_the_parser_reads() {
     assert_eq!(Manifest::parse(SAMPLE.as_bytes()), Ok(built));
 }
 
-/// docs/52 §2 row 37 (N4, A-102): `provision domain` adds each first
-/// administrator's salt; the manifest writes them as the last key, in
-/// `first_admins` order, parses back to itself, and hands each one out
-/// beside its administrator (values obviously fake).
+/// docs/52 §2 row 37 (N4, A-102; required — A-105, Q-473): `provision
+/// domain` writes each first administrator's salt; the manifest writes them
+/// as the last key, in `first_admins` order, parses back to itself, and
+/// hands each one out beside its administrator; replacing them gives the
+/// same manifest with the new salts (values obviously fake).
 #[test]
 fn first_admin_salts_round_trip() {
     let built = Manifest::new(&fields()).unwrap();
-    assert!(built.first_admins().iter().all(|a| a.salt().is_none()));
-    let salted = built
-        .with_first_admin_salts(&["salt-a".to_owned(), "salt-b".to_owned()])
+    let salts: Vec<&str> = built.first_admins().iter().map(|a| a.salt()).collect();
+    assert_eq!(salts, ["salt-a", "salt-b"]);
+    assert!(built
+        .encode()
+        .ends_with("first_admin_salts = salt-a, salt-b\n"));
+    let resalted = built
+        .with_first_admin_salts(&["salt-c".to_owned(), "salt-d".to_owned()])
         .unwrap();
-    let text = salted.encode();
-    assert_eq!(
-        text,
-        format!("{SAMPLE}first_admin_salts = salt-a, salt-b\n")
-    );
-    assert_eq!(Manifest::parse(text.as_bytes()), Ok(salted.clone()));
-    let salts: Vec<Option<&str>> = salted.first_admins().iter().map(|a| a.salt()).collect();
-    assert_eq!(salts, [Some("salt-a"), Some("salt-b")]);
-    assert_eq!(salted.realm(), built.realm());
+    let text = resalted.encode();
+    assert_eq!(text, SAMPLE.replace("salt-a, salt-b", "salt-c, salt-d"));
+    assert_eq!(Manifest::parse(text.as_bytes()), Ok(resalted.clone()));
+    let salts: Vec<&str> = resalted.first_admins().iter().map(|a| a.salt()).collect();
+    assert_eq!(salts, ["salt-c", "salt-d"]);
+    assert_eq!(resalted.realm(), built.realm());
     assert_eq!(keys::FIRST_ADMIN_SALTS, "first_admin_salts");
 }
 
@@ -182,6 +184,7 @@ fn two_to_eight_first_admins_with_twenty_character_names_fit() {
         f.first_admins = (0..count)
             .map(|i| (guid(0x10 + i), format!("admin{i}{}", "x".repeat(14))))
             .collect();
+        f.first_admin_salts = (0..count).map(|i| format!("salt-{i}")).collect();
         let manifest = Manifest::new(&f).unwrap();
         assert_eq!(manifest.first_admins().len(), usize::from(count));
         assert!(manifest

@@ -90,15 +90,10 @@ pub const DOMAIN_USER_RID_KRBTGT: u32 = 0x0000_01F6;
 /// ACCOUNT); docs/51 §4.3 step 5 ("`0x80000002`").
 pub const PROVISIONED_GROUP_TYPE: u32 = GROUP_TYPE_SECURITY_ENABLED | GROUP_TYPE_ACCOUNT_GROUP;
 
-/// The first value of the change-seq counter. Project choice (docs/29 §2
-/// gives no origin; 0 is left meaning "no write"); its range ends at
-/// `u64::MAX` (exclusive) — the change-seq is a u64 (dirstore
-/// `Origin.origin_seq`). docs/questions/Q-376 item 4.
-pub const CHANGE_SEQ_FIRST: u64 = 1;
-
-/// One past the last change-seq value. Spec: dirstore `CounterState`
-/// (half-open range); Q-376 item 4.
-pub const CHANGE_SEQ_END_EXCLUSIVE: u64 = u64::MAX;
+/// The change-seq counter's range, `[1, u64::MAX)` (docs/questions/Q-376
+/// item 4). Defined by crate directory-admin, whose provisioning session
+/// creates the counter (docs/52 R13; A-83); re-exported here unchanged.
+pub use directory_admin::{CHANGE_SEQ_END_EXCLUSIVE, CHANGE_SEQ_FIRST};
 
 /// The integrity key: wiped on drop, never printed.
 /// Spec: docs/51 §4.3 step 4, §4.4 ("the integrity key only in the 0400
@@ -729,6 +724,21 @@ impl Plan {
                 .map(|o| o.guid)
                 .ok_or(PlanError::RandomUnusable)
         };
+        // A-102 (docs/52 §2 row 37, N4): each first administrator's
+        // string-to-key salt, by the directory's own function (R47-4) — the
+        // salt `first-admin-secret` derives the same way and presents — is
+        // written into the manifest (a required key — A-105, Q-473), so that
+        // keyadm's ceremony grant binds exactly it without keyadm linking the
+        // directory code (D104).
+        let first_admin_salts = n
+            .first_admins
+            .iter()
+            .map(|sam| {
+                account_salt(&checked.realm, AccountKind::User, sam)
+                    .map(|salt| salt.as_str().to_owned())
+            })
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(|_| PlanError::Salt)?;
         let manifest = Manifest::new(&ManifestFields {
             realm: realm_text,
             domain_sid,
@@ -742,29 +752,9 @@ impl Plan {
                 .copied()
                 .zip(n.first_admins.clone())
                 .collect(),
+            first_admin_salts,
         })
         .map_err(PlanError::Manifest)?;
-        // A-102 (docs/52 §2 row 37, N4): each first administrator's
-        // string-to-key salt, by the directory's own function (R47-4) — the
-        // salt `first-admin-secret` derives the same way and presents — is
-        // written into the manifest, so that keyadm's ceremony grant binds
-        // exactly it without keyadm linking the directory code (D104).
-        let salts = manifest
-            .first_admins()
-            .iter()
-            .map(|admin| {
-                account_salt(
-                    manifest.realm(),
-                    AccountKind::User,
-                    admin.sam_account_name(),
-                )
-                .map(|salt| salt.as_str().to_owned())
-            })
-            .collect::<Result<Vec<String>, _>>()
-            .map_err(|_| PlanError::Salt)?;
-        let manifest = manifest
-            .with_first_admin_salts(&salts)
-            .map_err(PlanError::Manifest)?;
         if Manifest::parse(manifest.encode().as_bytes()).as_ref() != Ok(&manifest) {
             return Err(PlanError::ManifestRoundTrip);
         }

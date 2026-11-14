@@ -67,15 +67,11 @@ fn ceremony(config_path: &Path, manifest_path: &Path) -> ExitCode {
             Ok(client) => client,
             Err(_) => return fail("configuration", &"keyd_uid cannot be 0"),
         };
-    let lines = match ceremony::run(&mut client, &manifest) {
-        Ok(outcome) => {
-            print(report::render(&outcome, &manifest));
-            return ExitCode::from(report::exit_code(&outcome));
-        }
-        Err(missing) => report::render_missing_salt(missing, &manifest),
-    };
-    print(lines);
-    ExitCode::from(EXIT_NOTHING_ATTEMPTED)
+    // Every manifest names each first administrator's salt (A-105,
+    // docs/questions/Q-473): nothing to refuse before contacting keyd.
+    let outcome = ceremony::run(&mut client, &manifest);
+    print(report::render(&outcome, &manifest));
+    ExitCode::from(report::exit_code(&outcome))
 }
 
 /// Refuse root, read the configuration, build keyd's client (its uid

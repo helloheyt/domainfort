@@ -512,6 +512,12 @@ pub fn manifest() -> Manifest {
             (g(ADMIN1), String::from("admin1")),
             (g(ADMIN2), String::from("admin2")),
         ],
+        // Required since A-105 (Q-473); obviously fake — these tests read
+        // the manifest's service objects only.
+        first_admin_salts: vec![
+            String::from("test-salt-admin1"),
+            String::from("test-salt-admin2"),
+        ],
     })
     .unwrap()
 }

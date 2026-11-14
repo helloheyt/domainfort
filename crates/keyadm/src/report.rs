@@ -16,7 +16,7 @@
 //! request octets); AGENTS.md §6; docs/questions/Q-367 (A-88); docs/52
 //! §3.10, §4.2, §4.4 (A-102).
 
-use crate::ceremony::{CeremonyReport, MissingSalt, NotSent, Outcome, Step, Unknown};
+use crate::ceremony::{CeremonyReport, NotSent, Outcome, Step, Unknown};
 use ipc::Refused;
 use ipc_keyd::TransportError;
 use keyd_types::{Error as KeydError, MAX_INITIAL_SECRET_GRANT_SECS};
@@ -319,23 +319,6 @@ pub fn render(report: &CeremonyReport, manifest: &Manifest) -> Vec<String> {
         "keyd is NOT sealed; create_key never overwrites and keyadm never retries: restart keyd (development mode: every key is lost) and run the whole ceremony again (docs/51 4.5, A-77)".to_owned(),
     );
     lines
-}
-
-/// The lines of a ceremony refused before anything was sent: the manifest
-/// names no salt for a first administrator (A-102, docs/52 N4).
-/// Spec: docs/52 §4.2; docs/51 §4.3 steps 8, 11.
-#[must_use]
-pub fn render_missing_salt(missing: MissingSalt, manifest: &Manifest) -> Vec<String> {
-    let who = manifest.first_admins().get(missing.admin).map_or_else(
-        || format!("#{}", missing.admin),
-        |admin| admin.sam_account_name().to_owned(),
-    );
-    vec![
-        format!(
-            "keyadm ceremony: the manifest names no salt for first administrator {who} (first_admin_salts); nothing was sent to keyd"
-        ),
-        "keyd binds each initial-secret grant's salt (docs/52 N4): re-run provision domain, which writes every first administrator's salt into the manifest".to_owned(),
-    ]
 }
 
 // ---------------------------------------------------------------------------

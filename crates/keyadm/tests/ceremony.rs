@@ -145,16 +145,10 @@ fn guid(last: u8) -> Guid {
 
 /// An obviously fake manifest whose realm is keyd's, with obviously fake
 /// first-administrator salts (keyd binds whatever salt the grant names; no
-/// `set_secret` follows in these tests — A-102, N4).
+/// `set_secret` follows in these tests — A-102, N4; the key is required —
+/// A-105).
 /// Source: docs/51 §4.3 step 8; [MS-DTYP] 2.4.2.4 (example domain SID).
 fn manifest() -> Manifest {
-    unsalted()
-        .with_first_admin_salts(&["test-salt-alice".to_owned(), "test-salt-bob".to_owned()])
-        .unwrap()
-}
-
-/// The same manifest without `first_admin_salts`.
-fn unsalted() -> Manifest {
     Manifest::new(&ManifestFields {
         realm: REALM.to_owned(),
         domain_sid: Sid::parse_sid_string("S-1-5-21-1-2-3").unwrap(),
@@ -164,6 +158,7 @@ fn unsalted() -> Manifest {
         ldap_service: guid(2),
         admin_service: guid(3),
         first_admins: vec![(guid(4), "alice".to_owned()), (guid(5), "bob".to_owned())],
+        first_admin_salts: vec!["test-salt-alice".to_owned(), "test-salt-bob".to_owned()],
     })
     .unwrap()
 }
@@ -266,7 +261,7 @@ fn the_ceremony_creates_the_three_key_sets_with_their_bindings() {
     };
     let m = manifest();
     let mut client = world.client(world.uid);
-    let report = ceremony::run(&mut client, &m).unwrap();
+    let report = ceremony::run(&mut client, &m);
     assert_eq!(report.contact, Outcome::Answered(Ok(())));
     assert!(report.is_complete(), "{report:?}");
     assert_eq!(
@@ -318,10 +313,8 @@ fn a_repeated_ceremony_fails_closed_at_the_first_key_set() {
         return;
     };
     let m = manifest();
-    assert!(ceremony::run(&mut world.client(world.uid), &m)
-        .unwrap()
-        .is_complete());
-    let again = ceremony::run(&mut world.client(world.uid), &m).unwrap();
+    assert!(ceremony::run(&mut world.client(world.uid), &m).is_complete());
+    let again = ceremony::run(&mut world.client(world.uid), &m);
     assert_eq!(again.contact, Outcome::Answered(Ok(())));
     assert_eq!(again.steps.len(), 1);
     assert_eq!(again.steps[0].step, Step::Krbtgt);
@@ -375,28 +368,19 @@ fn a_repeated_ceremony_fails_closed_at_the_first_key_set() {
     world.daemon.stop().unwrap();
 }
 
-/// docs/52 §2 row 37 (N4) — the ceremony binds the manifest's salt: a
-/// manifest without `first_admin_salts` is refused before anything is sent
-/// (no ping, no create_key); with them, every grant names its salt and the
-/// ceremony ends with the seal (one `SealCeremony` record, success, no
-/// intent: the seal only makes keyd stricter — A-88).
+/// docs/52 §2 row 37 (N4) — the ceremony binds the manifest's salt (every
+/// manifest names one: `first_admin_salts` is required, A-105 — a manifest
+/// without it does not parse, crates/provision-manifest
+/// tests/rejections.rs): every grant names its salt and the ceremony ends
+/// with the seal (one `SealCeremony` record, success, no intent: the seal
+/// only makes keyd stricter — A-88).
 #[test]
-fn the_ceremony_needs_the_manifests_salts_and_ends_sealed() {
+fn the_ceremony_binds_the_manifests_salts_and_ends_sealed() {
     let Some(world) = world(Some(Role::Admin)) else {
         return;
     };
-    let refused = ceremony::run(&mut world.client(world.uid), &unsalted());
-    assert_eq!(refused, Err(ceremony::MissingSalt { admin: 0 }));
-    assert!(
-        !world
-            .auditd
-            .events()
-            .iter()
-            .any(|event| matches!(event, EventBody::Keyd(_))),
-        "nothing was sent"
-    );
     let m = manifest();
-    let report = ceremony::run(&mut world.client(world.uid), &m).unwrap();
+    let report = ceremony::run(&mut world.client(world.uid), &m);
     assert!(report.is_sealed(), "{report:?}");
     assert!(report.is_complete());
     let seals = || -> Vec<KeydRecord> {
@@ -431,13 +415,13 @@ fn a_wrong_peer_uid_is_refused_before_anything_is_sent() {
     };
     let m = manifest();
     let wrong = world.uid.wrapping_add(1000).max(1);
-    let report = ceremony::run(&mut world.client(wrong), &m).unwrap();
+    let report = ceremony::run(&mut world.client(wrong), &m);
     assert_eq!(report.contact, Outcome::NotSent(NotSent::PeerMismatch));
     assert!(report.steps.is_empty());
     assert_eq!(report::exit_code(&report), EXIT_NOTHING_ATTEMPTED);
     assert!(world.create_key_records().is_empty());
 
-    let right = ceremony::run(&mut world.client(world.uid), &m).unwrap();
+    let right = ceremony::run(&mut world.client(world.uid), &m);
     assert!(right.is_complete(), "{right:?}");
     world.daemon.stop().unwrap();
 }
@@ -452,7 +436,7 @@ fn a_uid_mapped_to_another_role_gets_keyds_denied() {
         return;
     };
     let m = manifest();
-    let report = ceremony::run(&mut world.client(world.uid), &m).unwrap();
+    let report = ceremony::run(&mut world.client(world.uid), &m);
     assert_eq!(report.contact, Outcome::Answered(Ok(())));
     assert_eq!(report.steps.len(), 1);
     assert_eq!(
@@ -480,7 +464,7 @@ fn an_unmapped_uid_attempts_no_key_set() {
         return;
     };
     let m = manifest();
-    let report = ceremony::run(&mut world.client(world.uid), &m).unwrap();
+    let report = ceremony::run(&mut world.client(world.uid), &m);
     assert_eq!(
         report.contact,
         Outcome::Unknown(Unknown::Transport(ipc_keyd::TransportError::Closed))
@@ -621,7 +605,7 @@ fn keyds_unavailable_is_reported_as_not_performed() {
     let m = manifest();
     let mut client =
         KeydClient::new(connector::new(&daemon.socket), uid, DEFAULT_DEADLINE).unwrap();
-    let report = ceremony::run(&mut client, &m).unwrap();
+    let report = ceremony::run(&mut client, &m);
     assert_eq!(report.contact, Outcome::Answered(Ok(())));
     assert_eq!(report.steps.len(), 1, "{report:?}");
     assert_eq!(
@@ -681,7 +665,7 @@ fn a_create_key_keyd_never_answers_is_reported_as_outcome_unknown() {
     let m = manifest();
     let mut client =
         KeydClient::new(connector::new(&path), uid, Duration::from_millis(500)).unwrap();
-    let report = ceremony::run(&mut client, &m).unwrap();
+    let report = ceremony::run(&mut client, &m);
     done.send(()).unwrap();
     assert_eq!(
         keyd.join().unwrap(),
@@ -717,7 +701,7 @@ fn the_ceremony_grants_each_first_administrator_its_initial_secret() {
         return;
     };
     let m = manifest();
-    let report = ceremony::run(&mut world.client(world.uid), &m).unwrap();
+    let report = ceremony::run(&mut world.client(world.uid), &m);
     assert!(report.is_complete(), "{report:?}");
     assert_eq!(report.grants.len(), 2);
     assert!(report.grants.iter().all(|g| g.outcome.succeeded()));

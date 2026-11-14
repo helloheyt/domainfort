@@ -362,10 +362,11 @@ where
                 error,
             }
         })?;
-        // A-102 (N4): keyadm's ceremony grant bound the manifest's salt; a
-        // manifest that names another (or none) would only be refused by
-        // keyd later — refuse here, before anything is entered.
-        if admin.salt() != Some(salt.as_str()) {
+        // A-102 (N4): keyadm's ceremony grant bound the manifest's salt (every
+        // manifest names one — A-105, Q-473); a manifest that names another
+        // would only be refused by keyd later — refuse here, before anything
+        // is entered.
+        if admin.salt() != salt.as_str() {
             return Err(Refusal::SaltMismatch {
                 sam: sam.to_owned(),
             });

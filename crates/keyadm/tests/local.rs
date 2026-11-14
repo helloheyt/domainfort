@@ -40,6 +40,7 @@ fn manifest() -> Manifest {
         ldap_service: guid(2),
         admin_service: guid(3),
         first_admins: vec![(guid(4), "alice".to_owned()), (guid(5), "bob".to_owned())],
+        first_admin_salts: vec!["test-salt-alice".to_owned(), "test-salt-bob".to_owned()],
     })
     .unwrap()
 }
@@ -331,23 +332,6 @@ fn a_ceremony_without_its_seal_is_incomplete() {
         );
         assert!(rendered.contains("restart keyd"), "{rendered}");
     }
-}
-
-/// docs/52 §2 row 37 (N4: the ceremony grant binds the salt) — the salt is
-/// the manifest's (`first_admin_salts`): a manifest without it is refused
-/// before anything is sent, and the report says to re-run provision domain.
-#[test]
-fn a_manifest_without_salts_is_refused_before_keyd() {
-    let m = manifest();
-    assert!(m.first_admins().iter().all(|a| a.salt().is_none()));
-    let lines = report::render_missing_salt(keyadm::ceremony::MissingSalt { admin: 1 }, &m);
-    let text = lines.join("\n");
-    assert!(
-        text.contains("no salt for first administrator bob"),
-        "{text}"
-    );
-    assert!(text.contains("nothing was sent to keyd"), "{text}");
-    assert!(text.contains("re-run provision domain"), "{text}");
 }
 
 /// Task A15a (docs/questions/Q-451): a grant keyd refuses stops the

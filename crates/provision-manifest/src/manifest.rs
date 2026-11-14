@@ -40,13 +40,15 @@ pub mod keys {
     /// The first administrators: GUID, sAMAccountName and binding of each.
     /// Spec: docs/51 §4.3 steps 5, 8, 12.
     pub const FIRST_ADMINS: &str = "first_admins";
-    /// Optional: each first administrator's string-to-key salt, in
-    /// `first_admins` order — computed by `provision domain` with the
-    /// directory's own salt function (`directory_pip::account_salt`,
-    /// docs/47 §3.3 R47-4), so that keyadm's ceremony grant binds exactly
-    /// the salt `provision first-admin-secret` presents (A-102, docs/52
-    /// §2 row 37, N4) without keyadm linking the directory code.
-    /// Spec: docs/51 §4.3 steps 8, 11, 12, §7.3; docs/52 §4.2.
+    /// Each first administrator's string-to-key salt, in `first_admins`
+    /// order — computed by `provision domain` with the directory's own salt
+    /// function (`directory_pip::account_salt`, docs/47 §3.3 R47-4), so that
+    /// keyadm's ceremony grant binds exactly the salt `provision
+    /// first-admin-secret` presents (A-102, docs/52 §2 row 37, N4) without
+    /// keyadm linking the directory code. Required like every other key
+    /// (A-105, the Q-473 follow-up): a manifest without it does not parse.
+    /// Spec: docs/51 §4.3 steps 8, 11, 12, §7.3; docs/52 §4.2;
+    /// docs/questions/Q-473 item 2.
     pub const FIRST_ADMIN_SALTS: &str = "first_admin_salts";
 }
 
@@ -110,7 +112,7 @@ impl KeySet {
 pub struct FirstAdmin {
     sam_account_name: KerberosString,
     key_set: KeySet,
-    salt: Option<String>,
+    salt: String,
 }
 
 impl FirstAdmin {
@@ -128,13 +130,14 @@ impl FirstAdmin {
     }
 
     /// The string-to-key salt `provision domain` wrote for this
-    /// administrator (`first_admin_salts`), if the manifest carries it.
-    /// keyadm's ceremony grant binds it (A-102, N4); `first-admin-secret`
-    /// refuses a manifest whose salt is not the directory's.
-    /// Spec: docs/51 §4.3 steps 11, 12; docs/52 §4.2 (N4).
+    /// administrator (`first_admin_salts` — every manifest carries it,
+    /// A-105). keyadm's ceremony grant binds it (A-102, N4);
+    /// `first-admin-secret` refuses a manifest whose salt is not the
+    /// directory's.
+    /// Spec: docs/51 §4.3 steps 11, 12; docs/52 §4.2 (N4); Q-473.
     #[must_use]
-    pub fn salt(&self) -> Option<&str> {
-        self.salt.as_deref()
+    pub fn salt(&self) -> &str {
+        &self.salt
     }
 }
 
@@ -159,6 +162,10 @@ pub struct ManifestFields {
     pub admin_service: Guid,
     /// Each first administrator's GUID and sAMAccountName.
     pub first_admins: Vec<(Guid, String)>,
+    /// Each first administrator's string-to-key salt, in `first_admins`
+    /// order (the directory's `account_salt`, R47-4; A-102, N4; required —
+    /// A-105, Q-473).
+    pub first_admin_salts: Vec<String>,
 }
 
 /// The provisioning manifest (docs/51 §4.3 step 8): the realm, the domain
@@ -283,21 +290,26 @@ impl Manifest {
                 &[ADMIN_SERVICE_CLASS, dc_fqdn.as_str()],
             ),
         )?;
-        let mut first_admins = Self::parse_first_admins(&doc, &mut seen, &realm)?;
-        // A-102 (N4): optional, but when present one KerberosString per first
+        let admins = Self::parse_first_admins(&doc, &mut seen, &realm)?;
+        // A-102 (N4), A-105 (Q-473: required): one KerberosString per first
         // administrator, in order.
-        if let Some((salts, line)) = doc.optional(keys::FIRST_ADMIN_SALTS, salt_items)? {
-            if salts.len() != first_admins.len() {
-                return Err(Error::at(
-                    line,
-                    keys::FIRST_ADMIN_SALTS,
-                    ErrorKind::InvalidSalt,
-                ));
-            }
-            for (admin, salt) in first_admins.iter_mut().zip(salts) {
-                admin.salt = Some(salt.to_owned());
-            }
+        let (salts, line) = doc.required(keys::FIRST_ADMIN_SALTS, salt_items)?;
+        if salts.len() != admins.len() {
+            return Err(Error::at(
+                line,
+                keys::FIRST_ADMIN_SALTS,
+                ErrorKind::InvalidSalt,
+            ));
         }
+        let first_admins = admins
+            .into_iter()
+            .zip(salts)
+            .map(|((sam_account_name, key_set), salt)| FirstAdmin {
+                sam_account_name,
+                key_set,
+                salt: salt.to_owned(),
+            })
+            .collect();
         Ok(Manifest {
             realm,
             domain_sid,
@@ -333,21 +345,23 @@ impl Manifest {
         })
     }
 
-    /// The `first_admins` list: entries `<guid>:NT-PRINCIPAL:<sAMAccountName>`.
+    /// The `first_admins` list: entries `<guid>:NT-PRINCIPAL:<sAMAccountName>`
+    /// — each administrator's name and key set (its salt is the matching
+    /// item of `first_admin_salts`).
     /// Spec: docs/51 §4.3 steps 5, 8, 12; docs/47 §1.1 (uniqueness folds
     /// A-Z), §1.3, §9.1; docs/questions/Q-295 (P-22).
     fn parse_first_admins(
         doc: &Document<'_>,
         seen: &mut SeenGuids,
         realm: &Realm,
-    ) -> Result<Vec<FirstAdmin>, Error> {
+    ) -> Result<Vec<(KerberosString, KeySet)>, Error> {
         let (items, line) = doc.required(keys::FIRST_ADMINS, first_admin_items)?;
         let at = |kind| Error::at(line, keys::FIRST_ADMINS, kind);
         let prefix = match value::name_type_label(KRB_NT_PRINCIPAL) {
             Some(label) => format!("{label}{ENTRY_SEPARATOR}"),
             None => return Err(at(ErrorKind::BindingMismatch)),
         };
-        let mut admins: Vec<FirstAdmin> = Vec::with_capacity(items.len());
+        let mut admins: Vec<(KerberosString, KeySet)> = Vec::with_capacity(items.len());
         for item in items {
             let (guid, written) = object_entry(item).map_err(at)?;
             let name = written
@@ -356,20 +370,19 @@ impl Manifest {
             let sam = value::account_name(name).map_err(at)?;
             let repeated = admins
                 .iter()
-                .any(|admin| admin.sam_account_name().eq_ignore_ascii_case(sam.as_str()));
+                .any(|(name, _)| name.as_str().eq_ignore_ascii_case(sam.as_str()));
             if repeated {
                 return Err(at(ErrorKind::DuplicateAccountName));
             }
             let principal = seen.admit(&guid).map_err(at)?;
             let bound = binding(realm, KRB_NT_PRINCIPAL, &[sam.as_str()]).map_err(at)?;
-            admins.push(FirstAdmin {
-                sam_account_name: sam,
-                key_set: KeySet {
+            admins.push((
+                sam,
+                KeySet {
                     handle: KeyHandle::new(principal, KeyPurpose::PrincipalLongterm),
                     binding: bound,
                 },
-                salt: None,
-            });
+            ));
         }
         Ok(admins)
     }
@@ -390,7 +403,7 @@ impl Manifest {
     /// Spec: docs/51 §4.3 step 8; docs/50 §7.1.
     pub fn new(fields: &ManifestFields) -> Result<Manifest, Error> {
         let printable = |text: &str| text.bytes().all(is_printable);
-        let checks: [(&'static str, bool); 4] = [
+        let checks: [(&'static str, bool); 5] = [
             (keys::REALM, printable(&fields.realm)),
             (
                 keys::NAMING_CONTEXT,
@@ -400,6 +413,10 @@ impl Manifest {
             (
                 keys::FIRST_ADMINS,
                 fields.first_admins.iter().all(|(_, sam)| printable(sam)),
+            ),
+            (
+                keys::FIRST_ADMIN_SALTS,
+                fields.first_admin_salts.iter().all(|salt| printable(salt)),
             ),
         ];
         if let Some(&(key, _)) = checks.iter().find(|(_, ok)| !ok) {
@@ -431,7 +448,13 @@ impl Manifest {
             .iter()
             .map(|(guid, sam)| entry(guid, KRB_NT_PRINCIPAL, &[sam.as_str()]))
             .collect();
-        let lines: [(&str, String); 9] = [
+        if fields.first_admin_salts.len() != count {
+            return Err(Error::field(
+                keys::FIRST_ADMIN_SALTS,
+                ErrorKind::InvalidSalt,
+            ));
+        }
+        let lines: [(&str, String); 10] = [
             (keys::MANIFEST_VERSION, MANIFEST_VERSION.to_owned()),
             (keys::REALM, fields.realm.clone()),
             (keys::DOMAIN_SID, fields.domain_sid.to_sid_string()),
@@ -465,15 +488,18 @@ impl Manifest {
                 ),
             ),
             (keys::FIRST_ADMINS, admins.join(LIST_SEPARATOR)),
+            (
+                keys::FIRST_ADMIN_SALTS,
+                fields.first_admin_salts.join(LIST_SEPARATOR),
+            ),
         ];
         Manifest::parse(render(&lines).as_bytes())
     }
 
-    /// This manifest with `salts` as its first administrators' salts (one per
-    /// first administrator, in order) — what `provision domain` adds after
-    /// computing each salt with the directory's salt function. The result is
-    /// encoded and parsed back, so it holds exactly what
-    /// [`Manifest::parse`] accepts.
+    /// This manifest with `salts` in place of its first administrators'
+    /// salts (one per first administrator, in order). The result is encoded
+    /// and parsed back, so it holds exactly what [`Manifest::parse`]
+    /// accepts.
     ///
     /// # Errors
     /// [`ErrorKind::InvalidSalt`] when the count differs from the first
@@ -497,15 +523,13 @@ impl Manifest {
         }
         let mut salted = self.clone();
         for (admin, salt) in salted.first_admins.iter_mut().zip(salts) {
-            admin.salt = Some(salt.clone());
+            admin.salt = salt.clone();
         }
         Manifest::parse(salted.encode().as_bytes())
     }
 
     /// The canonical text: a header comment, then every key once, in
-    /// [`Manifest::KEYS`] order, one `key = value` line each, LF-terminated
-    /// (the optional `first_admin_salts` only when every first administrator
-    /// has a salt — all or none by construction).
+    /// [`Manifest::KEYS`] order, one `key = value` line each, LF-terminated.
     /// `Manifest::parse(m.encode().as_bytes()) == Ok(m)` for every manifest.
     /// Spec: docs/50 R50-15, §7.1; docs/51 §4.3 step 8.
     #[must_use]
@@ -515,7 +539,8 @@ impl Manifest {
             .iter()
             .map(|admin| object_text(admin.key_set()))
             .collect();
-        let lines: [(&str, String); 9] = [
+        let salts: Vec<&str> = self.first_admins.iter().map(FirstAdmin::salt).collect();
+        let lines: [(&str, String); 10] = [
             (keys::MANIFEST_VERSION, MANIFEST_VERSION.to_owned()),
             (keys::REALM, self.realm.as_str().to_owned()),
             (keys::DOMAIN_SID, self.domain_sid.to_sid_string()),
@@ -528,16 +553,9 @@ impl Manifest {
             (keys::LDAP_SERVICE, object_text(&self.ldap_service)),
             (keys::ADMIN_SERVICE, object_text(&self.admin_service)),
             (keys::FIRST_ADMINS, admins.join(LIST_SEPARATOR)),
+            (keys::FIRST_ADMIN_SALTS, salts.join(LIST_SEPARATOR)),
         ];
-        let salts: Option<Vec<&str>> = self.first_admins.iter().map(FirstAdmin::salt).collect();
-        match salts {
-            Some(salts) => {
-                let mut all = lines.to_vec();
-                all.push((keys::FIRST_ADMIN_SALTS, salts.join(LIST_SEPARATOR)));
-                render(&all)
-            }
-            None => render(&lines),
-        }
+        render(&lines)
     }
 
     /// The realm. Spec: docs/51 §4.3 step 8.

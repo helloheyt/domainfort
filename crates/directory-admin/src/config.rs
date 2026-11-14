@@ -44,6 +44,18 @@ pub const RID_FIRST: u64 = 1101;
 /// closed). Spec: docs/51 §8.1, §8.3; A-75.
 pub const RID_END_EXCLUSIVE: u64 = 0x3FFF_FFFF;
 
+/// The first value of the change-seq counter. Project choice (docs/29 §2
+/// gives no origin; 0 is left meaning "no write"); its range ends at
+/// `u64::MAX` (exclusive) — the change-seq is a u64 (dirstore
+/// `Origin.origin_seq`). Created with it by the provisioning session only
+/// (`crate::Provisioning`, A-83). Moved here from crate provision with the
+/// counter's creation (docs/52 R13). docs/questions/Q-376 item 4.
+pub const CHANGE_SEQ_FIRST: u64 = 1;
+
+/// One past the last change-seq value. Spec: dirstore `CounterState`
+/// (half-open range); docs/questions/Q-376 item 4.
+pub const CHANGE_SEQ_END_EXCLUSIVE: u64 = u64::MAX;
+
 /// The smallest dual-control quorum: the requester plus one other approver.
 /// There is no "single administrator" mode — a weak option has no code path
 /// (P-22 item 3, A-72 "no code path for the weak option").

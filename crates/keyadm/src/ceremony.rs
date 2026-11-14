@@ -29,9 +29,10 @@
 //!    §5.8 option (b)); dird, which registers the decisions of every later
 //!    password set, does not run yet. keyd grants Role::Admin only a user's
 //!    **initial** secret (no key set yet) — so this step can never be used to
-//!    reset an existing password past dird's PDP. A manifest that names no
-//!    salt for a first administrator is refused before anything is sent
-//!    ([`MissingSalt`]).
+//!    reset an existing password past dird's PDP. Every manifest names each
+//!    first administrator's salt — `first_admin_salts` is a required key
+//!    (A-105, docs/questions/Q-473) — so a manifest without one never
+//!    reaches the ceremony: it does not parse.
 //! 4. **`seal_ceremony`** (A-102, docs/52 R3; docs/questions/Q-462 item 1)
 //!    — keyd moves from `Provisioning` to `Operational`: `create_key` and
 //!    Role::Admin's grants **no longer exist** in keyd until it restarts
@@ -270,17 +271,6 @@ pub struct GrantReport {
     pub outcome: Outcome<()>,
 }
 
-/// A first administrator for whom the manifest names no salt: the ceremony
-/// sends nothing (A-102, docs/52 N4 — keyd binds each grant's salt, and only
-/// the manifest's salt, written by `provision domain` with the directory's
-/// salt function, is the one `first-admin-secret` presents).
-/// Spec: docs/52 §4.2; docs/51 §4.3 steps 8, 11, 12.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MissingSalt {
-    /// The administrator's position in the manifest's `first_admins`.
-    pub admin: usize,
-}
-
 /// What the ceremony did: the contact, then the steps attempted (in order;
 /// it stops after the first that did not succeed): the three key sets, the
 /// first administrators' grants, then the seal.
@@ -362,26 +352,13 @@ impl CeremonyReport {
 /// documentation): contact, then `create_key` for each [`Step`] in order,
 /// then `grant_set_secret` for each first administrator in order, then
 /// `seal_ceremony` — stopping at the first call that does not succeed.
-/// Never retries.
-///
-/// # Errors
-/// [`MissingSalt`] — before anything is sent — when the manifest names no
-/// salt for a first administrator.
+/// Never retries. Each grant binds the salt the manifest names for its
+/// administrator (every manifest names one — A-105, Q-473).
 ///
 /// Spec: docs/51 §4.3 step 11, §5.8 option (b); docs/10 §7; docs/50 R50-3;
 /// docs/52 §4.2 (N4), §4.4 (R3); A-19; A-35; A-77; docs/questions/Q-367
 /// (A-88: each call's fate from the client), Q-451, Q-462 item 1.
-pub fn run<C: Connector>(
-    client: &mut KeydClient<C>,
-    manifest: &Manifest,
-) -> Result<CeremonyReport, MissingSalt> {
-    // A-102 (N4): every grant binds its salt; refuse before contacting keyd.
-    let salts = manifest
-        .first_admins()
-        .iter()
-        .enumerate()
-        .map(|(admin, first_admin)| first_admin.salt().ok_or(MissingSalt { admin }))
-        .collect::<Result<Vec<&str>, MissingSalt>>()?;
+pub fn run<C: Connector>(client: &mut KeydClient<C>, manifest: &Manifest) -> CeremonyReport {
     let contact = classify(client.call_with_fate(&Call::Ping), |answer| match answer {
         Answer::Ping(result) => Some(result),
         _ => None,
@@ -390,13 +367,13 @@ pub fn run<C: Connector>(
     let mut steps = Vec::with_capacity(Step::ALL.len());
     let mut grants = Vec::with_capacity(first_admins);
     if !contact.succeeded() {
-        return Ok(CeremonyReport {
+        return CeremonyReport {
             contact,
             steps,
             grants,
             first_admins,
             seal: None,
-        });
+        };
     }
     for step in Step::ALL {
         let key_set = step.key_set(manifest);
@@ -411,23 +388,23 @@ pub fn run<C: Connector>(
         let stop = !outcome.succeeded();
         steps.push(StepReport { step, outcome });
         if stop {
-            return Ok(CeremonyReport {
+            return CeremonyReport {
                 contact,
                 steps,
                 grants,
                 first_admins,
                 seal: None,
-            });
+            };
         }
     }
-    for (admin, (first_admin, salt)) in manifest.first_admins().iter().zip(salts).enumerate() {
+    for (admin, first_admin) in manifest.first_admins().iter().enumerate() {
         let key_set = first_admin.key_set();
         let call = Call::GrantSetSecret {
             kind: AccountKind::User,
             targets: vec![SetSecretTarget {
                 handle: key_set.handle,
                 binding: key_set.binding.clone(),
-                salt: salt.to_owned(),
+                salt: first_admin.salt().to_owned(),
             }],
             lifetime_secs: MAX_INITIAL_SECRET_GRANT_SECS,
         };
@@ -438,13 +415,13 @@ pub fn run<C: Connector>(
         let stop = !outcome.succeeded();
         grants.push(GrantReport { admin, outcome });
         if stop {
-            return Ok(CeremonyReport {
+            return CeremonyReport {
                 contact,
                 steps,
                 grants,
                 first_admins,
                 seal: None,
-            });
+            };
         }
     }
     // A-102 (docs/52 R3): the ceremony ends with the seal — after it keyd
@@ -456,11 +433,11 @@ pub fn run<C: Connector>(
             _ => None,
         },
     );
-    Ok(CeremonyReport {
+    CeremonyReport {
         contact,
         steps,
         grants,
         first_admins,
         seal: Some(seal),
-    })
+    }
 }

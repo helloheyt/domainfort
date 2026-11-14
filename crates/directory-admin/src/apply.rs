@@ -35,6 +35,15 @@
 //!    refuse a duplicate in the same transaction (`Conflict`); a GUID held
 //!    by any live object or tombstone is never reused.
 //!
+//! 6. **The write invariants** (crate::invariants, docs/52 R13): the write
+//!    itself is a `CheckedWrite` of the one checker every write path passes
+//!    — the per-object rules on the record it produces and, for a new
+//!    `member` link, the store-wide rules (the link walks replaced by the
+//!    proof `prepare` kept for the same state). The commit takes the
+//!    write's change-seq and a new principal's RID itself. These rules ran
+//!    in `prepare` against the same state, so they refuse nothing `prepare`
+//!    passed; they are the door every write path must go through.
+//!
 //! The policy version is not re-verified: the caller passes `apply` the
 //! operation `prepare` decided against its policy snapshot, and a policy
 //! change needs a restart in phase 1 (A-69, A-80).
@@ -45,21 +54,25 @@
 //! (A-83: "abort the transaction when the object create is refused").
 //!
 //! Spec: docs/51 §7.4 step 5, §8.3, §10; A-75; A-83 (caller rules); A-84;
+//! docs/52 R13 (A-102);
 //! docs/questions/Q-358 items 1-2;
 //! [MS-ADTS] 3.1.1.5.2.4 (objectGUID, never NULL; whenCreated = the current
 //! time); [MS-SAMR] 3.1.1.9.2 (objectSid = domain SID ‖ RID), 3.1.1.9.2.1
 //! item 1.2.
 
-use dirstore::{AttributeChange, NewObject, Origin, WriteTxn};
+use dirstore::{AttributeChange, NewObject, WriteTxn};
 use dtyp::{Guid, Sid, GUID_PACKET_LEN};
 use ipc_audit::{AdminFailure, AdminRefusal, Allocation, DirAdminEvent};
 use krb_proto::KerberosTime;
 
 use crate::admin::{CreatePlan, DirectoryAdmin, Plan, Prepared, WriteKind, WritePlan};
 use crate::audit::{Refusal, Stop};
-use crate::checks::{domain_sid, store_failure};
-use crate::config::{CHANGE_SEQ_COUNTER, RID_COUNTER, RID_END_EXCLUSIVE, RID_FIRST};
+use crate::checks::{domain_sid, fault_stop, store_failure};
+use crate::config::CHANGE_SEQ_COUNTER;
 use crate::descriptor::new_object_sd;
+use crate::invariants::{
+    CheckedWrite, CommitError, Committed, InvariantViolation, LinkProof, Refused as Unchecked,
+};
 use crate::random::RandomSource;
 use crate::record;
 use crate::reply::Reply;
@@ -120,6 +133,48 @@ fn counter_failure(e: &dirstore::Error, exhausted: Stop) -> Stop {
         dirstore::Error::CounterExhausted => exhausted,
         dirstore::Error::NoSuchCounter => Stop::Failed(AdminFailure::StoreFailure),
         other => store_failure(other),
+    }
+}
+
+/// A refusal of the write invariants at the write, as the outcome reports
+/// it — the code `prepare` gives the same rule (module documentation, item
+/// 6: never reached by a write `prepare` passed).
+/// Spec: crate::invariants `InvariantViolation`; crate ipc-audit
+/// `AdminRefusal`; docs/51 §5.2.
+fn invariant_stop(unchecked: Unchecked) -> Stop {
+    match unchecked {
+        Unchecked::Fault(fault) => fault_stop(&fault),
+        Unchecked::Rule(rule) => Stop::Refused(match rule {
+            InvariantViolation::Name | InvariantViolation::ReservedName => {
+                AdminRefusal::AccountNameInvalid
+            }
+            InvariantViolation::Protected => AdminRefusal::TargetProtected,
+            InvariantViolation::Membership => AdminRefusal::MembershipInvalid,
+            InvariantViolation::NoSuchObject => AdminRefusal::NotFound,
+            InvariantViolation::Class
+            | InvariantViolation::Exception
+            | InvariantViolation::AccountControl
+            | InvariantViolation::Value
+            | InvariantViolation::Sid
+            | InvariantViolation::NotModifiable => AdminRefusal::ValueInvalid,
+        }),
+    }
+}
+
+/// A checked write that did not commit, as the outcome reports it — the
+/// mapping of the RID, change-seq and write errors from before the write
+/// went through crate::invariants.
+/// Spec: A-83 ("NoSuchCounter / CounterExhausted / Tamper ⇒ refusal");
+/// docs/51 §8.3 (`[1101, 0x3FFFFFFF)`; exhaustion ⇒ `RidExhausted`);
+/// dirstore `Error`.
+fn commit_stop(e: CommitError) -> Stop {
+    match e {
+        CommitError::Stale => Stop::Refused(AdminRefusal::Conflict),
+        CommitError::Counter(e) => store_failure(&e),
+        CommitError::Rid(e) => counter_failure(&e, Stop::Refused(AdminRefusal::RidExhausted)),
+        CommitError::RidRange | CommitError::Sid => Stop::Failed(AdminFailure::InternalFailure),
+        CommitError::ChangeSeq(e) => counter_failure(&e, Stop::Failed(AdminFailure::StoreFailure)),
+        CommitError::Write(e) => write_failure(&e),
     }
 }
 
@@ -210,7 +265,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                     },
                     when_changed,
                 ];
-                self.modify(txn, now, target, changes)?;
+                self.modify(txn, now, target, changes, None)?;
                 Ok((None, Reply::PasswordSet(reply)))
             }
             WriteKind::SetUac { target, uac } => {
@@ -221,7 +276,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                     },
                     when_changed,
                 ];
-                self.modify(txn, now, target, changes)?;
+                self.modify(txn, now, target, changes, None)?;
                 Ok((None, Reply::Done))
             }
             WriteKind::SetAccountExpires { target, value } => {
@@ -232,10 +287,14 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                     },
                     when_changed,
                 ];
-                self.modify(txn, now, target, changes)?;
+                self.modify(txn, now, target, changes, None)?;
                 Ok((None, Reply::Done))
             }
-            WriteKind::SetMembers { group, members } => {
+            WriteKind::SetMembers {
+                group,
+                members,
+                proof,
+            } => {
                 let changes = vec![
                     AttributeChange::Replace {
                         id: self.ids.member,
@@ -243,46 +302,55 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                     },
                     when_changed,
                 ];
-                self.modify(txn, now, group, changes)?;
+                self.modify(txn, now, group, changes, proof.as_ref())?;
                 Ok((None, Reply::Done))
             }
             WriteKind::Delete { target } => {
-                let origin = self.origin(txn, now)?;
-                txn.delete_object(target, &origin)
-                    .map_err(|e| write_failure(&e))?;
+                let checked = self
+                    .invariants
+                    .check_delete(txn, target)
+                    .map_err(invariant_stop)?;
+                self.commit(checked, txn, now)?;
                 Ok((None, Reply::Done))
             }
         }
     }
 
-    /// The `Origin` of this write: `now`'s wall clock, this DC's node-id,
-    /// and the next change-seq, taken in `txn`.
+    /// Commit a checked write (crate::invariants): `now`'s wall clock and
+    /// this DC's node-id; the commit takes the write's change-seq (and a
+    /// new principal's RID) itself, in `txn`.
     /// Spec: docs/51 §8.3 ("change-seq — the same mechanism"); docs/29 §2
-    /// as cited there; A-75; dirstore `Origin`.
-    fn origin(&self, txn: &mut WriteTxn<'_>, now: &KerberosTime) -> Result<Origin, Stop> {
+    /// as cited there; A-75; A-89; docs/52 R13; dirstore `Origin`.
+    fn commit(
+        &self,
+        checked: CheckedWrite,
+        txn: &mut WriteTxn<'_>,
+        now: &KerberosTime,
+    ) -> Result<Committed, Stop> {
         let wall_clock =
             time::wall_clock(now).ok_or(Stop::Failed(AdminFailure::InternalFailure))?;
-        let origin_seq = txn
-            .take_counter_value(CHANGE_SEQ_COUNTER)
-            .map_err(|e| counter_failure(&e, Stop::Failed(AdminFailure::StoreFailure)))?;
-        Ok(Origin {
-            wall_clock,
-            origin_node: self.config.node_id(),
-            origin_seq,
-        })
+        checked
+            .commit(txn, wall_clock, self.config.node_id())
+            .map_err(commit_stop)
     }
 
-    /// One modify of `target`. Spec: dirstore `WriteTxn::modify_object`.
+    /// One modify of `target`, through the write invariants (`proof`: the
+    /// link walks `prepare` ran for an `AddMember`).
+    /// Spec: dirstore `WriteTxn::modify_object`; docs/52 R13.
     fn modify(
         &self,
         txn: &mut WriteTxn<'_>,
         now: &KerberosTime,
         target: Guid,
         changes: Vec<AttributeChange>,
+        proof: Option<&LinkProof>,
     ) -> Result<(), Stop> {
-        let origin = self.origin(txn, now)?;
-        txn.modify_object(target, changes, &origin)
-            .map_err(|e| write_failure(&e))
+        let proofs = proof.map(core::slice::from_ref).unwrap_or_default();
+        let checked = self
+            .invariants
+            .check_modify(txn, target, changes, proofs)
+            .map_err(invariant_stop)?;
+        self.commit(checked, txn, now).map(|_| ())
     }
 
     /// A new objectGUID: 16 octets from the random source, never the NULL
@@ -306,23 +374,12 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         Ok(guid)
     }
 
-    /// The next RID, taken in `txn`, checked against the range.
-    /// Spec: docs/51 §8.3 (`[1101, 0x3FFFFFFF)`); A-75; [MS-SAMR] 3.1.1.9.2.
-    fn new_rid(txn: &mut WriteTxn<'_>) -> Result<u32, Stop> {
-        let value = txn
-            .take_counter_value(RID_COUNTER)
-            .map_err(|e| counter_failure(&e, Stop::Refused(AdminRefusal::RidExhausted)))?;
-        if !(RID_FIRST..RID_END_EXCLUSIVE).contains(&value) {
-            return Err(Stop::Failed(AdminFailure::InternalFailure));
-        }
-        u32::try_from(value).map_err(|_| Stop::Failed(AdminFailure::InternalFailure))
-    }
-
-    /// The create of a new object.
+    /// The create of a new object, through the write invariants (the
+    /// commit takes the RID and forms the objectSid of a principal).
     /// Spec: [MS-ADTS] 3.1.1.5.2.4 (objectGUID; objectSid for a security
     /// principal; nTSecurityDescriptor per 6.1.3; whenCreated = the current
     /// time); [MS-SAMR] 3.1.1.9.2; docs/46 §5.4 (whenChanged set by every
-    /// originating write); docs/51 §5.2 rows 1-4, §10.
+    /// originating write); docs/51 §5.2 rows 1-4, §10; docs/52 R13.
     fn write_create(
         &mut self,
         requester: &Sid,
@@ -345,33 +402,31 @@ impl<R: RandomSource> DirectoryAdmin<R> {
             .map_err(|_| Stop::Failed(AdminFailure::InternalFailure))?;
         let guid = self.new_guid(txn)?;
         let mut attributes = plan.attributes;
-        let (rid, sid) = match plan.domain_root {
-            Some(root) => {
-                let domain = domain_sid(&self.ids, read(root)?)?;
-                let rid = Self::new_rid(txn)?;
-                let mut sub = domain.sub_authority().to_vec();
-                sub.push(rid);
-                let sid = Sid::new(domain.identifier_authority(), &sub)
-                    .map_err(|_| Stop::Failed(AdminFailure::InternalFailure))?;
-                attributes.push((self.ids.object_sid, vec![sid.encode()]));
-                (Some(rid), Some(sid))
-            }
-            None => (None, None),
-        };
+        // A security principal: the NC root (unchanged since `prepare`)
+        // must hold the domain SID its objectSid extends; the commit takes
+        // the RID and forms the objectSid ([MS-SAMR] 3.1.1.9.2;
+        // crate::invariants).
+        if let Some(root) = plan.domain_root {
+            domain_sid(&self.ids, read(root)?)?;
+        }
         attributes.push((self.ids.when_created, vec![record::encode_int64(dstime)]));
         attributes.push((self.ids.when_changed, vec![record::encode_int64(dstime)]));
         attributes.push((self.ids.nt_security_descriptor, vec![sd]));
-        let origin = self.origin(txn, now)?;
-        txn.create_object(
-            NewObject {
-                guid,
-                parent: Some(plan.parent),
-                classes: plan.class.chain,
-                attributes,
-            },
-            &origin,
-        )
-        .map_err(|e| write_failure(&e))?;
+        let checked = self
+            .invariants
+            .check_create(
+                txn,
+                NewObject {
+                    guid,
+                    parent: Some(plan.parent),
+                    classes: plan.class.chain,
+                    attributes,
+                },
+                None,
+                &[],
+            )
+            .map_err(invariant_stop)?;
+        let Committed { rid, sid } = self.commit(checked, txn, now)?;
         Ok((
             Some(Allocation {
                 guid: guid.to_packet(),

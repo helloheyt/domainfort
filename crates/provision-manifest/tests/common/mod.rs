@@ -3,7 +3,9 @@
 //! Every value is constructed by hand for these tests and obviously fake:
 //! the realm EXAMPLE.TEST (".test"), the [MS-DTYP] 2.4.2.4 example domain
 //! SID S-1-5-21-1-2-3, GUIDs ...0001 to ...0005, administrators alice and
-//! bob. No vector comes from any other implementation.
+//! bob with the placeholder salts `salt-a` and `salt-b` (not the
+//! directory's salt rule — the manifest only carries the text). No vector
+//! comes from any other implementation.
 #![allow(dead_code)] // each test binary uses a different subset
 
 use dtyp::{Guid, Sid};
@@ -23,6 +25,7 @@ krbtgt = 00000000-0000-0000-0000-000000000001:NT-SRV-INST:krbtgt/EXAMPLE.TEST
 ldap_service = 00000000-0000-0000-0000-000000000002:NT-SRV-HST:ldap/dc1.example.test
 admin_service = 00000000-0000-0000-0000-000000000003:NT-SRV-HST:admind/dc1.example.test
 first_admins = 00000000-0000-0000-0000-000000000004:NT-PRINCIPAL:alice, 00000000-0000-0000-0000-000000000005:NT-PRINCIPAL:bob
+first_admin_salts = salt-a, salt-b
 ";
 
 /// The GUID whose packet is fifteen zero octets and then `last`.
@@ -48,6 +51,7 @@ pub fn fields() -> ManifestFields {
         ldap_service: guid(2),
         admin_service: guid(3),
         first_admins: vec![(guid(4), "alice".to_owned()), (guid(5), "bob".to_owned())],
+        first_admin_salts: vec!["salt-a".to_owned(), "salt-b".to_owned()],
     }
 }
 

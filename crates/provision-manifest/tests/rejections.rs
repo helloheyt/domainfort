@@ -43,7 +43,7 @@ fn a_duplicate_key_is_rejected() {
     let err = error(&text);
     assert_eq!(err.kind(), ErrorKind::DuplicateKey);
     assert_eq!(err.key(), Some(keys::REALM));
-    assert_eq!(err.line(), Some(11));
+    assert_eq!(err.line(), Some(12));
 }
 
 /// docs/50 R50-15 ("a closed key table"), §7.1 ("unknown key ⇒ refuse").
@@ -53,18 +53,16 @@ fn an_unknown_key_is_rejected() {
     let err = error(&text);
     assert_eq!(err.kind(), ErrorKind::UnknownKey);
     assert_eq!(err.key(), None);
-    assert_eq!(err.line(), Some(11));
+    assert_eq!(err.line(), Some(12));
 }
 
 /// docs/50 §7.1 ("missing-required ⇒ refuse"): every manifest key is
-/// required — except the optional `first_admin_salts` (A-102), whose
-/// absence the sample shows.
+/// required — `first_admin_salts` too (A-105, the follow-up of
+/// docs/questions/Q-473 item 2).
 #[test]
 fn every_missing_key_is_rejected() {
-    for key in Manifest::KEYS
-        .iter()
-        .filter(|key| **key != keys::FIRST_ADMIN_SALTS)
-    {
+    assert!(Manifest::KEYS.contains(&keys::FIRST_ADMIN_SALTS));
+    for key in Manifest::KEYS {
         let err = error(&remove(SAMPLE, key));
         assert_eq!(err.kind(), ErrorKind::MissingKey, "{key}");
         assert_eq!(err.key(), Some(*key));
@@ -72,14 +70,13 @@ fn every_missing_key_is_rejected() {
     assert!(Manifest::parse(SAMPLE.as_bytes()).is_ok());
 }
 
-/// docs/52 §2 row 37 (N4: the salt keyadm's grant binds) — strict when
-/// present: one KerberosString per first administrator, separated by
-/// exactly ", "; another count, a broken separator or a non-printable salt
-/// is refused, at its line and key (or, from the builder, its key).
+/// docs/52 §2 row 37 (N4: the salt keyadm's grant binds): one
+/// KerberosString per first administrator, separated by exactly ", ";
+/// another count, a broken separator or a non-printable salt is refused, at
+/// its line and key (or, from the builder, its key).
 #[test]
 fn first_admin_salts_are_strict() {
-    let two = format!("{SAMPLE}first_admin_salts = salt-a, salt-b\n");
-    assert!(Manifest::parse(two.as_bytes()).is_ok());
+    assert!(Manifest::parse(SAMPLE.as_bytes()).is_ok());
     for (bad, kind) in [
         ("salt-a", ErrorKind::InvalidSalt),
         ("salt-a, salt-b, salt-c", ErrorKind::InvalidSalt),
@@ -87,7 +84,7 @@ fn first_admin_salts_are_strict() {
         ("salt-a,  salt-b", ErrorKind::InvalidList),
         ("salt-a, , salt-b", ErrorKind::InvalidList),
     ] {
-        let text = format!("{SAMPLE}first_admin_salts = {bad}\n");
+        let text = set(SAMPLE, keys::FIRST_ADMIN_SALTS, bad);
         let err = error(&text);
         assert_eq!(err.kind(), kind, "{bad:?}");
         assert_eq!(err.key(), Some(keys::FIRST_ADMIN_SALTS));
@@ -111,6 +108,10 @@ fn first_admin_salts_are_strict() {
     ] {
         let err = built.with_first_admin_salts(&salts).unwrap_err();
         assert_eq!(err.kind(), kind, "{salts:?}");
+        // The builder refuses the same salts (A-105: it writes them).
+        let mut f = fields();
+        f.first_admin_salts = salts.clone();
+        assert_eq!(Manifest::new(&f).unwrap_err().kind(), kind, "{salts:?}");
     }
 }
 
@@ -145,7 +146,7 @@ fn oversize_inputs_are_rejected() {
     let long = format!("{SAMPLE}#{}\n", "x".repeat(MAX_LINE_OCTETS));
     let err = error(&long);
     assert_eq!(err.kind(), ErrorKind::LineTooLong);
-    assert_eq!(err.line(), Some(11));
+    assert_eq!(err.line(), Some(12));
 
     let many = SAMPLE.to_owned() + &"\n".repeat(MAX_LINES);
     assert_eq!(error(&many).kind(), ErrorKind::TooManyLines);

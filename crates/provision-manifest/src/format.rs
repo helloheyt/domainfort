@@ -81,23 +81,6 @@ impl<'a> Document<'a> {
             .map_err(error_of)
     }
 
-    /// The value of the optional `key`, parsed by `parse`, with its line, or
-    /// `None` when the key is absent; a parse failure is reported at the
-    /// key's line, naming the key.
-    /// Spec: docs/50 §7.1.
-    pub(crate) fn optional<T>(
-        &self,
-        key: &'static str,
-        parse: impl FnOnce(&'a str) -> Result<T, ErrorKind>,
-    ) -> Result<Option<(T, u32)>, Error> {
-        match self.entries.find(key) {
-            None => Ok(None),
-            Some(entry) => parse(entry.value())
-                .map(|value| Some((value, entry.line())))
-                .map_err(|kind| Error::at(entry.line(), key, kind)),
-        }
-    }
-
     /// The value of the required `key`, parsed by `parse`, with its line; a
     /// parse failure is reported at the key's line, naming the key.
     /// Spec: docs/50 §7.1 ("missing-required ⇒ refuse").

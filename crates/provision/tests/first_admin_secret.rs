@@ -362,7 +362,7 @@ impl World {
             DEFAULT_DEADLINE,
         )
         .unwrap();
-        keyadm::ceremony::run(&mut client, &self.manifest).unwrap()
+        keyadm::ceremony::run(&mut client, &self.manifest)
     }
 
     /// keyd's GrantSetSecret outcome records so far (intents apart).
@@ -458,7 +458,7 @@ impl World {
     /// uniform refusal is `Denied`.
     fn verify(&self, index: usize, candidate: &str) -> Result<(), KeydError> {
         let admin = &self.manifest.first_admins()[index];
-        let salt = admin.salt().unwrap();
+        let salt = admin.salt();
         let key = kdc_common::password_key(kdc_common::AES256, candidate, salt);
         // No kvno: the PA-ENC-TIMESTAMP names the current key.
         let mut padata = kdc_common::pa_enc_timestamp(&key, kdc_common::now());
@@ -648,7 +648,7 @@ fn a_second_run_is_refused_without_a_new_grant() {
             &[keyd_types::SetSecretTarget {
                 handle: alice.handle,
                 binding: alice.binding.clone(),
-                salt: world.manifest.first_admins()[0].salt().unwrap().to_owned(),
+                salt: world.manifest.first_admins()[0].salt().to_owned(),
             }],
             keyd_types::MAX_INITIAL_SECRET_GRANT_SECS,
         ),
@@ -1018,9 +1018,10 @@ fn the_manifest_and_admind_file_must_be_root_owned() {
 }
 
 /// docs/52 §2 row 37 (N4, A-102): keyadm's ceremony grant binds the
-/// manifest's salt, so a manifest whose salt is not the directory's (or that
-/// names none) is refused before anything is entered or sent — keyd would
-/// refuse the `set_secret` (`GrantMismatch`) anyway.
+/// manifest's salt, so a manifest whose salt is not the directory's is
+/// refused before anything is entered or sent — keyd would refuse the
+/// `set_secret` (`GrantMismatch`) anyway. (A manifest naming none does not
+/// parse — `first_admin_salts` is required, A-105.)
 #[test]
 fn a_manifest_salt_other_than_the_directorys_is_refused() {
     let Some(world) = world() else {

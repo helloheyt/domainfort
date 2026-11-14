@@ -61,8 +61,9 @@ pdp = { path = "../pdp" }
 # store (NC root SID, krbtgt handle).
 directory-pip = { path = "../directory-pip" }
 # The write PEP's shared constants (counter names and RID range, A-89), its
-# name rules (A-79), the child-descriptor computation (A-84) and the
-# CSPRNG source (A-15 / A-77).
+# name rules (A-79), the child-descriptor computation (A-84), the CSPRNG
+# source (A-15 / A-77), and the write invariants' provisioning session —
+# the only way this tool writes the store (docs/52 R13).
 directory-admin = { path = "../directory-admin" }
 # The unsigned development policy format 2 (A-68 / A-69).
 policy-store = { path = "../policy-store" }

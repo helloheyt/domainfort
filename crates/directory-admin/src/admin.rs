@@ -28,7 +28,7 @@
 //! Spec: docs/51 §5.2-§5.7, §7.4, §8, §9, §10, §11; A-72..A-79, A-83..A-85,
 //! P-22.
 
-use dirstore::{AttrId, CounterState, Object, MAX_VALUES_PER_ATTRIBUTE};
+use dirstore::{AttrId, CounterState, Object};
 use dtyp::{Guid, Sid};
 use ipc_audit::{AdminFailure, AdminRefusal, DirAdminEvent, MAX_APPROVERS};
 use keyd_types::{KeyHandle, KeyPurpose, PrincipalBinding, PrincipalId};
@@ -51,10 +51,13 @@ use directory_pip::{
 };
 
 use crate::audit::{pdp_reason, sid_value, EventBase, Refusal, Stop};
-use crate::checks::{domain_sid, malformed, store_failure, Cx, LockoutChange, Resolved};
+use crate::checks::{
+    domain_sid, fault_stop, malformed, store_failure, Cx, LockoutChange, Resolved,
+};
 use crate::config::{AdminConfig, ConfigError, CHANGE_SEQ_COUNTER, RID_COUNTER};
 use crate::descriptor::new_object_sd;
 use crate::ids::{ClassIds, Ids};
+use crate::invariants::{End, Invariants, LinkProof};
 use crate::names;
 use crate::operation::{
     CompletePasswordSet, CreateComputer, CreateContainerLike, CreateGroup, CreateUser, LookupKey,
@@ -155,6 +158,10 @@ pub(crate) enum WriteKind {
     SetMembers {
         group: Guid,
         members: Vec<Guid>,
+        /// For an `AddMember`: the write invariants' proof of the link walks
+        /// against `prepare`'s snapshot (crate::invariants, "Links checked
+        /// once"); `None` for a removal.
+        proof: Option<LinkProof>,
     },
     Delete {
         target: Guid,
@@ -217,11 +224,13 @@ impl Prepared {
     }
 }
 
-/// The write PEP: its configuration, the schema identifiers, and the random
-/// source for objectGUIDs. Spec: docs/51 §12 task A3.
+/// The write PEP: its configuration, the schema identifiers, the write
+/// invariants every write passes (docs/52 R13), and the random source for
+/// objectGUIDs. Spec: docs/51 §12 task A3.
 pub struct DirectoryAdmin<R: RandomSource> {
     pub(crate) config: AdminConfig,
     pub(crate) ids: Ids,
+    pub(crate) invariants: Invariants,
     pub(crate) rng: R,
 }
 
@@ -234,9 +243,11 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         schema: &Phase1Schema,
         rng: R,
     ) -> Result<DirectoryAdmin<R>, ConfigError> {
+        let invariants = Invariants::new(schema, config.protected().service_objects.clone())?;
         Ok(DirectoryAdmin {
             config,
             ids: Ids::resolve(schema)?,
+            invariants,
             rng,
         })
     }
@@ -1085,18 +1096,35 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         }
         let mut members = record::refs(&group.obj, self.ids.member).map_err(malformed)?;
         let present = members.contains(&member.guid);
+        let mut proof = None;
         if add {
             let group_type = record::flags(&group.obj, self.ids.group_type)
                 .map_err(malformed)?
                 .ok_or(Stop::Failed(AdminFailure::IntegrityFailure))?;
-            if present
-                || !cx.member_allowed(group_type, &member)?
-                || members.len() >= MAX_VALUES_PER_ATTRIBUTE
-                || cx.closes_cycle(group.guid, member.guid)?
-                || !cx.expansion_allowed(&group, &member)?
-            {
+            if present {
                 return Err(Stop::Refused(AdminRefusal::MembershipInvalid));
             }
+            // The membership rule of the group's type, the member limit,
+            // the cycle and the expansion bounds: the write invariants'
+            // link check (crate::invariants, docs/52 R13), in that order.
+            let checked = self
+                .invariants
+                .check_link(
+                    cx.view.snapshot(),
+                    End {
+                        guid: group.guid,
+                        obj: &group.obj,
+                    },
+                    group_type,
+                    End {
+                        guid: member.guid,
+                        obj: &member.obj,
+                    },
+                    member.class,
+                    members.len(),
+                )
+                .map_err(|f| fault_stop(&f))?;
+            proof = Some(checked.ok_or(Stop::Refused(AdminRefusal::MembershipInvalid))?);
             members.push(member.guid);
         } else {
             if !present {
@@ -1123,6 +1151,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                 kind: WriteKind::SetMembers {
                     group: m.group,
                     members,
+                    proof,
                 },
             }),
             obligations,
