@@ -30,7 +30,9 @@
 
 use dirstore::{AttrId, CounterState, Object};
 use dtyp::{Guid, Sid};
-use ipc_audit::{AdminFailure, AdminRefusal, DirAdminEvent, MAX_APPROVERS};
+use ipc_audit::{
+    AdminFailure, AdminRefusal, DirAdminEvent, EventBody, IntentRecord, MAX_APPROVERS,
+};
 use keyd_types::{KeyHandle, KeyPurpose, PrincipalBinding, PrincipalId};
 use krb_proto::constants::{KRB_NT_PRINCIPAL, KRB_NT_SRV_HST};
 use krb_proto::{KerberosString, KerberosTime, PrincipalName};
@@ -180,8 +182,17 @@ pub(crate) enum Plan {
 
 /// A prepared operation: the decision event to send (and have acknowledged)
 /// before anything is committed, and everything `apply` needs.
-/// Spec: docs/51 §5.7 item 2, §7.4 step 5; A-85.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// **Not `Clone`** (docs/52 N5, R6): its decision event is its
+/// [`IntentRecord`]; `apply` takes it only as an
+/// `ipc_audit::AckedIntent<Prepared>` — which only the caller's
+/// `ipc_audit::AuditGate` produces, after auditd acknowledged **this**
+/// prepared operation's decision event — so a write cannot be applied before
+/// the acknowledgement, and one acknowledgement applies one write.
+///
+/// Spec: docs/51 §5.7 item 2, §7.4 step 5; A-85; docs/52 §2 row 38 (N5),
+/// §3.11 R6 (a).
+#[derive(Debug, PartialEq, Eq)]
 pub struct Prepared {
     pub(crate) base: EventBase,
     decision: DirAdminEvent,
@@ -221,6 +232,15 @@ impl Prepared {
             Plan::Read(reply) => Some(reply),
             Plan::Write(_) => None,
         }
+    }
+}
+
+impl IntentRecord for Prepared {
+    /// The `Decision` event (`Proceed`): what auditd must acknowledge before
+    /// `apply` (A-85).
+    /// Spec: docs/51 §5.7 item 2; docs/52 §3.11 R6 (a).
+    fn intent_event(&self) -> EventBody {
+        EventBody::DirAdmin(Box::new(self.decision.clone()))
     }
 }
 

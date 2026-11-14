@@ -40,16 +40,29 @@
 //! "auditd unreachable" is the audit client's view: no verified connection,
 //! or the last exchange failed (A-67 item 2: refused even with free slots).
 //!
+//! # The shared gate (docs/52 R6, A-102)
+//!
+//! The window, the reachability, the acknowledgement wait and the stop's
+//! flush are `ipc_audit::AuditGate`'s — one implementation for every
+//! sending daemon. This wrapper adds what is dird's: the LDAP and admin
+//! event shapes, and the tokio wake-up of the audit link. The admin thread's
+//! "decision acknowledged ⇒ apply / register" goes through
+//! [`AuditGate::begin_intent`] and [`AuditGate::wait_acknowledged`], whose
+//! `ipc_audit::AckedIntent` is the only way into `DirectoryAdmin::apply`
+//! and into a decision's registration (crate::admin_engine,
+//! crate::registration).
+//!
 //! Spec: docs/50 R50-17, §4.2, §8.1; docs/49 R49-14; docs/questions Q-218
 //! (A-57), Q-252 items 8, 9 (A-64), Q-260 item 2 (A-67), Q-275 item 6
-//! (A-69).
+//! (A-69); docs/52 §3.11 R6.
 
+use core::future::Future;
+use core::time::Duration;
 use ipc_audit::{
-    Ack, Append, DirAdminEvent, EventBody, LdapEvent, Reservation, SendWindow, WindowConfig,
-    WindowError,
+    Ack, AckedIntent, Append, DirAdminEvent, EventBody, FlushWait, IntentRecord, LdapEvent,
+    PendingIntent, Reservation, Unflushed, WindowConfig, WindowError,
 };
 use ldap::{AuditEvent, AuditOperation};
-use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::Instant;
 use tokio::sync::Notify;
 
@@ -76,25 +89,18 @@ fn event_of(event: &AuditEvent) -> EventBody {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordLost;
 
-#[derive(Debug)]
-struct GateState {
-    window: SendWindow,
-    reachable: bool,
-}
-
 /// Shared by the LDAP engine thread (admit, record), the admin thread
 /// (reserve, commit, wait for an acknowledgement — crate::admin_engine) and
 /// the audit client task (batches, acknowledgements, reachability): one
 /// window, one link to auditd for every event dird sends (A-85: "reuse
-/// dird's existing audit link and window").
-/// Spec: docs/50 R50-17, §8.1; docs/questions/Q-218 (A-57); docs/51 §5.7.
+/// dird's existing audit link and window"). The core is
+/// `ipc_audit::AuditGate` (module documentation).
+/// Spec: docs/50 R50-17, §8.1; docs/questions/Q-218 (A-57); docs/51 §5.7;
+/// docs/52 §3.11 R6.
 #[derive(Debug)]
 pub struct AuditGate {
-    state: Mutex<GateState>,
+    core: ipc_audit::AuditGate,
     wake: Notify,
-    /// Wakes the admin thread waiting for a decision event's
-    /// acknowledgement (docs/51 §5.7 item 2); paired with `state`.
-    acked: Condvar,
 }
 
 impl AuditGate {
@@ -103,36 +109,21 @@ impl AuditGate {
     #[must_use]
     pub fn new(window: WindowConfig) -> AuditGate {
         AuditGate {
-            state: Mutex::new(GateState {
-                window: SendWindow::new(window),
-                reachable: false,
-            }),
+            core: ipc_audit::AuditGate::new(window),
             wake: Notify::new(),
-            acked: Condvar::new(),
         }
-    }
-
-    /// The state, or `None` if a holder panicked (no slot: fail closed).
-    fn lock(&self) -> Option<MutexGuard<'_, GateState>> {
-        self.state.lock().ok()
     }
 
     /// Reserve the slot of the next operation's event, or `None` (auditd
     /// unreachable, the window full): the operation is then not served.
     /// Spec: docs/questions/Q-218 (A-57), Q-252 item 8 (A-64).
     pub fn admit(&self) -> Option<Reservation> {
-        let mut state = self.lock()?;
-        if !state.reachable {
-            return None;
-        }
-        state.window.reserve().ok()
+        self.core.reserve()
     }
 
     /// Give back a slot whose operation did not run.
     pub fn release(&self, reservation: Reservation) {
-        if let Some(mut state) = self.lock() {
-            state.window.release(reservation);
-        }
+        self.core.release(reservation);
     }
 
     /// Put the event of the operation that just ran into the window (module
@@ -144,21 +135,15 @@ impl AuditGate {
     ///
     /// Spec: docs/questions/Q-218 (A-57), Q-252 items 8, 9 (A-64).
     pub fn record(&self, reservation: Reservation, event: &AuditEvent) -> Result<(), RecordLost> {
-        let result = match self.lock() {
-            Some(mut state) => {
-                if is_noise(event) {
-                    state.window.release(reservation);
-                    let _ = state.window.offer_noise(&event_of(event));
-                    Ok(())
-                } else {
-                    state
-                        .window
-                        .commit(reservation, &event_of(event))
-                        .map(|_sequence| ())
-                        .map_err(|_| RecordLost)
-                }
-            }
-            None => Err(RecordLost),
+        let result = if is_noise(event) {
+            self.core.release(reservation);
+            self.core.offer_noise(&event_of(event));
+            Ok(())
+        } else {
+            self.core
+                .commit(reservation, &event_of(event))
+                .map(|_sequence| ())
+                .map_err(|_| RecordLost)
         };
         self.wake.notify_one();
         result
@@ -166,32 +151,25 @@ impl AuditGate {
 
     /// Record the audit client's view of auditd.
     pub fn set_reachable(&self, reachable: bool) {
-        if let Some(mut state) = self.lock() {
-            state.reachable = reachable;
-        }
+        self.core.set_reachable(reachable);
     }
 
     /// Whether auditd is reachable (the audit client's view).
     #[must_use]
     pub fn is_reachable(&self) -> bool {
-        self.lock().is_some_and(|state| state.reachable)
+        self.core.is_reachable()
     }
 
     /// The next batch to send, if nothing is in flight and anything is
     /// pending. Spec: docs/50 §3.6, §8.1.
     pub(crate) fn next_batch(&self) -> Option<Append> {
-        self.lock().and_then(|mut state| state.window.next_batch())
+        self.core.next_batch()
     }
 
     /// auditd's acknowledgement of the batch in flight; wakes a thread
     /// waiting for one ([`AuditGate::wait_acknowledged`]).
     pub(crate) fn acknowledge(&self, ack: &Ack) -> Result<usize, WindowError> {
-        let result = match self.lock() {
-            Some(mut state) => state.window.acknowledge(ack),
-            None => Err(WindowError::UnexpectedAck),
-        };
-        self.acked.notify_all();
-        result
+        self.core.acknowledge(ack)
     }
 
     /// Reserve `count` slots for the gating events of one admin operation —
@@ -203,23 +181,7 @@ impl AuditGate {
     /// item 8 (every `DirAdmin` event is gating); keyd-daemon's two-slot
     /// intent rule (A-88) as the pattern.
     pub(crate) fn admit_slots(&self, count: usize) -> Option<Vec<Reservation>> {
-        let mut state = self.lock()?;
-        if !state.reachable {
-            return None;
-        }
-        let mut slots = Vec::with_capacity(count);
-        for _ in 0..count {
-            match state.window.reserve() {
-                Ok(slot) => slots.push(slot),
-                Err(_) => {
-                    for slot in slots {
-                        state.window.release(slot);
-                    }
-                    return None;
-                }
-            }
-        }
-        Some(slots)
+        self.core.reserve_all(count)
     }
 
     /// Put one admin event into its reserved slot; returns its sequence
@@ -236,13 +198,10 @@ impl AuditGate {
         reservation: Reservation,
         event: &DirAdminEvent,
     ) -> Result<u64, RecordLost> {
-        let result = match self.lock() {
-            Some(mut state) => state
-                .window
-                .commit(reservation, &EventBody::DirAdmin(Box::new(event.clone())))
-                .map_err(|_| RecordLost),
-            None => Err(RecordLost),
-        };
+        let result = self
+            .core
+            .commit(reservation, &EventBody::DirAdmin(Box::new(event.clone())))
+            .map_err(|_| RecordLost);
         self.wake.notify_one();
         result
     }
@@ -257,60 +216,73 @@ impl AuditGate {
     /// docs/questions/Q-366 option (a) ("dird's `DirAdmin` outcome … would
     /// use the same counter"), Q-388 item 6, Q-395.
     pub(crate) fn count_unrecorded_outcome(&self) {
-        if let Some(mut state) = self.lock() {
-            state.window.count_unrecorded_outcome();
-        }
+        self.core.count_unrecorded_outcome();
         self.wake.notify_one();
     }
 
-    /// Wait until auditd acknowledged the event numbered `seq` — persisted
-    /// it (docs/50 §8.1: `Ack` only after the sync) — or `deadline` passed.
-    /// Acknowledgements are cumulative and in order (one batch in flight,
-    /// oldest first), so `seq` is acknowledged once the last `Ack` reaches
-    /// it. A poisoned lock answers `false` (fail closed). Blocks the calling
-    /// thread (the admin thread, never the runtime's).
+    /// Commit the decision event of `value` (its `IntentRecord`) into
+    /// `slot` and wake the audit client to send it.
+    ///
+    /// # Errors
+    /// The value back (cannot happen for an event built from ipc-audit's
+    /// types).
+    ///
+    /// Spec: docs/51 §5.7 item 2 (A-85); docs/52 §3.11 R6 (a).
+    pub(crate) fn begin_intent<T: IntentRecord>(
+        &self,
+        slot: Reservation,
+        value: T,
+    ) -> Result<PendingIntent<T>, T> {
+        let result = self.core.begin_intent(slot, value);
+        self.wake.notify_one();
+        result
+    }
+
+    /// Wait until auditd acknowledged the decision event of `pending` —
+    /// persisted it (docs/50 §8.1) — or `deadline` passed: the proof, or the
+    /// value back without one (fail closed). Blocks the calling thread (the
+    /// admin thread, never the runtime's).
     /// Spec: docs/51 §5.7 item 2 ("a decision event acknowledged by auditd
-    /// before the commit"); A-85; docs/50 §3.6 (bounded waits); the same
-    /// rule in keyd-daemon (A-88).
-    pub(crate) fn wait_acknowledged(&self, seq: u64, deadline: Instant) -> bool {
-        let Some(mut state) = self.lock() else {
-            return false;
-        };
-        loop {
-            if state
-                .window
-                .last_ack()
-                .is_some_and(|ack| ack.through_seq >= seq)
-            {
-                return true;
-            }
-            let left = match deadline.checked_duration_since(Instant::now()) {
-                Some(left) if !left.is_zero() => left,
-                _ => return false,
-            };
-            state = match self.acked.wait_timeout(state, left) {
-                Ok((guard, _)) => guard,
-                Err(_) => return false,
-            };
-        }
+    /// before the commit"); A-85; docs/50 §3.6 (bounded waits); docs/52
+    /// §3.11 R6 (a).
+    pub(crate) fn wait_acknowledged<T>(
+        &self,
+        pending: PendingIntent<T>,
+        deadline: Instant,
+    ) -> Result<AckedIntent<T>, T> {
+        self.core.wait_acknowledged(pending, deadline)
     }
 
     /// The audit connection dropped: the batch in flight goes back.
     pub(crate) fn connection_lost(&self) {
-        if let Some(mut state) = self.lock() {
-            state.window.connection_lost();
-        }
+        self.core.connection_lost();
     }
 
     /// Events not yet acknowledged plus outstanding reservations.
     #[must_use]
     pub fn outstanding(&self) -> usize {
-        self.lock().map_or(0, |state| {
-            state
-                .window
-                .unacknowledged()
-                .saturating_add(usize::try_from(state.window.reserved()).unwrap_or(usize::MAX))
-        })
+        self.core.outstanding()
+    }
+
+    /// The stop's flush (`ipc_audit::AuditGate::close`): dird waits the
+    /// whole `grace` for the acknowledgements even while its link counts as
+    /// unreachable (`FlushWait::UntilAcknowledged`, A-87), then ends the
+    /// link (`end_link`), then reports what is left.
+    /// Spec: docs/questions/Q-313 (A-82), Q-350 item 11 (A-87); docs/52
+    /// §3.11 R6 (b).
+    pub(crate) async fn close<E: Future<Output = ()>>(
+        &self,
+        grace: Duration,
+        end_link: E,
+    ) -> Unflushed {
+        self.core
+            .close(
+                grace,
+                FlushWait::UntilAcknowledged,
+                tokio::time::sleep,
+                end_link,
+            )
+            .await
     }
 
     /// Wait until an event was recorded (or a stored wake-up is pending).

@@ -92,6 +92,10 @@ krb-crypto = { path = "../krb-crypto" }
 # the chain they wrote. Workspace crates — no third-party code.
 audit-daemon = { path = "../audit-daemon" }
 audit-log = { path = "../audit-log" }
+# TESTS ONLY (task R6, docs/52 §3.11): ipc-keyd-server's unaudited loopback
+# `dispatch`, which the tier-1 tests compare the engine with — behind its
+# `loopback` feature, which no daemon build enables.
+ipc-keyd-server = { path = "../ipc-keyd-server", features = ["loopback"] }
 # The scratch directories, inside the workspace, of the tests whose files a
 # crates/protected-file reader opens — the walk from `/` accepts them (task
 # T; docs/questions/Q-480). Dev-only, no dependency.

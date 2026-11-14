@@ -75,9 +75,10 @@ pub const SOCKET_FILE_MODE: u32 = 0o660;
 /// How long a stop waits for queued requests to be answered. Project choice.
 pub const DRAIN_GRACE: Duration = Duration::from_secs(5);
 
-/// How long a stop waits for auditd to acknowledge the window. Project
-/// choice.
-pub const AUDIT_FLUSH_GRACE: Duration = Duration::from_secs(5);
+/// How long a stop waits for auditd to acknowledge the window: the one
+/// bound of every daemon, `ipc_audit::AUDIT_FLUSH_GRACE` (5 s; a project
+/// choice). Spec: docs/52 §3.11 R6 (b); docs/questions/Q-313 (A-82).
+pub const AUDIT_FLUSH_GRACE: Duration = ipc_audit::AUDIT_FLUSH_GRACE;
 
 /// Poll interval while draining. Project choice.
 const DRAIN_POLL: Duration = Duration::from_millis(10);
@@ -419,16 +420,18 @@ where
     for (path, _) in &contexts {
         let _ = std::fs::remove_file(path);
     }
-    wait_until(AUDIT_FLUSH_GRACE, || {
-        gate.outstanding() == 0 || !gate.is_reachable()
-    })
-    .await;
-    audit_task.abort();
-    let _ = audit_task.await;
-    // What auditd did not acknowledge is lost with this process (Q-252 item
-    // 9) — among it, perhaps, the outcome of a key-state change whose intent
-    // is in the log (A-86): say so, with the count.
-    let unflushed = gate.outstanding();
+    // The one flush of every daemon (`ipc_audit::AuditGate::close`, docs/52
+    // R6): keyd's rule ends the wait early when auditd counts as unreachable
+    // (A-87 kept it). What auditd did not acknowledge is lost with this
+    // process (Q-252 item 9) — among it, perhaps, the outcome of a key-state
+    // change whose intent is in the log (A-86): say so, with the count.
+    let unflushed = gate
+        .close(AUDIT_FLUSH_GRACE, async {
+            audit_task.abort();
+            let _ = audit_task.await;
+        })
+        .await
+        .events();
     if unflushed > 0 {
         note(
             Note::AuditUnflushed,

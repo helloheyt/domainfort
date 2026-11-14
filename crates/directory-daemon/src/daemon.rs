@@ -112,10 +112,10 @@ pub const SOCKET_FILE_MODE: u32 = 0o660;
 pub const DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 /// How long a stop waits for auditd to acknowledge the LDAP audit window:
-/// the same bound as keyd-daemon's and kdc-daemon's `AUDIT_FLUSH_GRACE`
-/// (5 s; a project choice there). docs/questions/Q-313 (A-82: "the same
-/// bound keyd and the kdc use").
-pub const AUDIT_FLUSH_GRACE: Duration = Duration::from_secs(5);
+/// the one bound of every daemon, `ipc_audit::AUDIT_FLUSH_GRACE` (5 s).
+/// docs/questions/Q-313 (A-82: "the same bound keyd and the kdc use");
+/// docs/52 §3.11 R6 (b).
+pub const AUDIT_FLUSH_GRACE: Duration = ipc_audit::AUDIT_FLUSH_GRACE;
 
 /// Poll interval while draining. Project choice.
 const DRAIN_POLL: Duration = Duration::from_millis(10);
@@ -482,6 +482,7 @@ fn start_admin(
         clock: params.clock.clone(),
         ack_deadline: admin.ack_deadline.get(),
         key_requests,
+        reconcile_interval: admin.destroy_reconcile_interval,
     };
     let ended = Arc::clone(state);
     let (handle, thread) = worker
@@ -734,11 +735,15 @@ pub async fn serve_with_admin(
     // The wait does not end early when the link counts as unreachable — the
     // audit task keeps reconnecting (crate::audit_link) and a link that
     // dropped just before the stop can still deliver within the bound
-    // (docs/questions/Q-350 item 11).
-    wait_until(AUDIT_FLUSH_GRACE, || gate.outstanding() == 0).await;
-    audit_task.abort();
-    let _ = audit_task.await;
-    let unacknowledged = gate.outstanding();
+    // (docs/questions/Q-350 item 11). The one flush of every daemon
+    // (`ipc_audit::AuditGate::close`, docs/52 R6).
+    let unacknowledged = gate
+        .close(AUDIT_FLUSH_GRACE, async {
+            audit_task.abort();
+            let _ = audit_task.await;
+        })
+        .await
+        .events();
     if unacknowledged > 0 {
         note(
             Note::AuditUnacknowledged,

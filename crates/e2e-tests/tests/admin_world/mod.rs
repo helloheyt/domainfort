@@ -777,7 +777,7 @@ fn workstation_fixture(plan: &Plan, input: &DomainInput, uid: u32) -> Workstatio
             .unwrap_or_else(|r| panic!("fixture refused: {:?}", r.event()));
         drop(view);
         let applied = admin
-            .apply(prepared, &mut txn, &now)
+            .apply(acknowledged(prepared), &mut txn, &now)
             .unwrap_or_else(|r| panic!("fixture not applied: {:?}", r.event()));
         txn.commit().unwrap();
         applied.reply().clone()
@@ -1758,4 +1758,25 @@ fn domain_input(dir: &ScratchDir, uid: u32) -> DomainInput {
             first_admins: vec![ALICE.to_owned(), BOB.to_owned()],
         },
     }
+}
+
+/// Play auditd for one prepared write (docs/51 §5.7 item 2, A-85; docs/52
+/// §3.11 R6): commit its decision event into an `ipc_audit::AuditGate`,
+/// acknowledge it as auditd does once it synced it (docs/50 §8.1), and take
+/// the proof `apply` requires — the only way to obtain one.
+fn acknowledged(
+    prepared: directory_admin::Prepared,
+) -> ipc_audit::AckedIntent<directory_admin::Prepared> {
+    let gate = ipc_audit::AuditGate::new(ipc_audit::WindowConfig::DEFAULT);
+    gate.set_reachable(true);
+    let slot = gate.reserve().expect("a slot");
+    let pending = gate.begin_intent(slot, prepared).expect("committed");
+    let batch = gate.next_batch().expect("the decision event is sent");
+    gate.acknowledge(&ipc_audit::Ack {
+        through_seq: batch.last_seq(),
+        head_hash: [0; 32],
+    })
+    .expect("auditd acknowledges");
+    gate.wait_acknowledged(pending, std::time::Instant::now())
+        .expect("acknowledged")
 }

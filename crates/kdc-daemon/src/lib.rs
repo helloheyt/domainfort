@@ -108,6 +108,14 @@
 //! daemon, server framework or RPC system was consulted or recalled
 //! (AGENTS.md §1-3).
 //!
+//! The shared gate, the proof of an acknowledged intent and the one stop
+//! flush (task R6, decision A-102) were written only from docs/52 (§2,
+//! §3.10, §3.11, §4.3, §7 R6), docs/50 §3.6 / §8.1, docs/51 §5.7,
+//! PENDING-OWNER (A-85, A-87, A-88, A-93, A-102, A-105), docs/questions
+//! Q-313, Q-350, Q-365, Q-470, Q-471 and this repository's own code
+//! (docs/questions/Q-500..Q-503). No other implementation was consulted
+//! or recalled (AGENTS.md §1-3).
+//!
 //! Spec: docs/50 §10 (P9), R50-2, R50-3, R50-8, R50-9, R50-14, R50-16,
 //! R50-17; RFC 4120 §7.2; A-56; A-57; A-58; A-68.
 

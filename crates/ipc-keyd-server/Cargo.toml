@@ -12,6 +12,12 @@
 # keyd-daemon would also reach the kdc-daemon built with it. Only the
 # keyd-daemon (task P7) depends on this crate.
 #
+# Task R6 (docs/52 §3.11, A-102): `classify` decides which calls need their
+# intent acknowledged by auditd first; such a call runs only through
+# `execute_acknowledged`, which takes an `ipc_audit::AckedIntent` by value
+# (ipc-audit's gate is the only source of one). The unaudited `dispatch` is
+# behind the `loopback` feature, which no daemon enables (tests only).
+#
 # Moved unchanged from ipc-keyd's `server` module (written from docs/50,
 # docs/10 §2, A-56, A-59 and this project's own crates). No other
 # implementation, serializer or RPC framework was consulted or recalled
@@ -37,6 +43,17 @@ ipc-keyd = { path = "../ipc-keyd" }
 keyd = { path = "../keyd" }
 # `KerberosTime` (the daemon's clock, R50-5).
 krb-proto = { path = "../krb-proto" }
+# The proof of an acknowledged intent (`AckedIntent`, `IntentRecord`) and
+# keyd's record layout for the intent record (feature `keyd`: the conversion
+# from keyd's `AuditRecord`, already linked by keyd-daemon). Task R6.
+ipc-audit = { path = "../ipc-audit", default-features = false, features = ["keyd"] }
+
+[features]
+# The unaudited in-process loopback `dispatch` (keyd run directly, no audit
+# gate): tests only — this crate's own tests and keyd-daemon's comparison of
+# its engine with it enable it as a dev-dependency feature. No daemon does
+# (docs/52 C18: no test seam in a production build).
+loopback = []
 
 [dev-dependencies]
 # TESTS ONLY, moved with the dispatcher from ipc-keyd: the loopback and
@@ -51,6 +68,9 @@ pdp = { path = "../pdp" }
 dtyp = { path = "../dtyp" }
 krb-crypto = { path = "../krb-crypto" }
 zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
+# TESTS ONLY: this crate with the loopback `dispatch` (the pattern ipc-audit
+# uses for its conversions); dev-dependencies are not linked into a daemon.
+ipc-keyd-server = { path = ".", features = ["loopback"] }
 
 [lints]
 workspace = true

@@ -133,6 +133,14 @@
 //! directory server, daemon or RPC system was consulted or recalled
 //! (AGENTS.md §1-3).
 //!
+//! The shared gate, the proof of an acknowledged intent and the one stop
+//! flush (task R6, decision A-102) were written only from docs/52 (§2,
+//! §3.10, §3.11, §4.3, §7 R6), docs/50 §3.6 / §8.1, docs/51 §5.7,
+//! PENDING-OWNER (A-85, A-87, A-88, A-93, A-102, A-105), docs/questions
+//! Q-313, Q-350, Q-365, Q-470, Q-471 and this repository's own code
+//! (docs/questions/Q-500..Q-503). No other implementation was consulted
+//! or recalled (AGENTS.md §1-3).
+//!
 //! Spec: docs/50 §10 (P8), R50-2, R50-3, R50-7, R50-14, R50-16, R50-17;
 //! docs/47 §8; A-57; A-58.
 
@@ -150,6 +158,8 @@ mod listener;
 pub mod log;
 pub mod policy;
 pub mod rate;
+mod reconcile;
+mod registration;
 pub mod startup;
 pub mod zones;
 
@@ -157,7 +167,8 @@ pub use admin_listener::admin_refused_peer_count;
 pub use admin_service::{
     AdminParams, DecisionAckDeadline, DecisionAckDeadlineOutOfRange, KeydTicketVerifier,
     NotStarted, RegistrationFailure, TicketVerifier, VerifierFactory, ADMIN_QUEUE_CAPACITY,
-    DECISION_ACK_DEADLINE, MAX_ADMIN_CONNECTIONS, MAX_DECISION_ACK_DEADLINE,
+    DECISION_ACK_DEADLINE, DESTROY_RECONCILE_INTERVAL, MAX_ADMIN_CONNECTIONS,
+    MAX_DECISION_ACK_DEADLINE, MAX_DESTROY_RECONCILE_INTERVAL, MIN_DESTROY_RECONCILE_INTERVAL,
     SET_SECRET_GRANT_LIFETIME_SECS,
 };
 pub use audit_link::{AuditEndpoint, AuditLinkError};
@@ -171,4 +182,6 @@ pub use engine::{DirectoryEngine, EngineError, EngineHandle, EnginePanicked, Eng
 pub use ldap_engine::{LdapEngineHandle, LdapService, MAX_LDAP_QUEUE_CAPACITY};
 pub use ldap_listener::ldap_refused_peer_count;
 pub use listener::refused_peer_count;
+pub use reconcile::{MAX_PAGES_PER_RUN, MAX_REGISTRATIONS_PER_RUN, MAX_SETTLED, TOMBSTONE_PAGE};
+pub use registration::{destroy_decision_id, DecisionRegistration};
 pub use zones::ZoneTable;

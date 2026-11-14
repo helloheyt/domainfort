@@ -1,5 +1,8 @@
 //! `apply`: the write of a prepared operation, inside the caller's
-//! `WriteTxn`, after auditd acknowledged the decision event.
+//! `WriteTxn`, after auditd acknowledged the decision event — `apply` takes
+//! the prepared operation only with that proof
+//! (`ipc_audit::AckedIntent<Prepared>`, docs/52 §3.11 R6 (a)): a write
+//! whose decision is not durably recorded does not compile.
 //!
 //! # What `apply` re-verifies
 //!
@@ -62,7 +65,7 @@
 
 use dirstore::{AttributeChange, NewObject, WriteTxn};
 use dtyp::{Guid, Sid, GUID_PACKET_LEN};
-use ipc_audit::{AdminFailure, AdminRefusal, Allocation, DirAdminEvent};
+use ipc_audit::{AckedIntent, AdminFailure, AdminRefusal, Allocation, DirAdminEvent};
 use krb_proto::KerberosTime;
 
 use crate::admin::{CreatePlan, DirectoryAdmin, Plan, Prepared, WriteKind, WritePlan};
@@ -81,8 +84,15 @@ use crate::time;
 /// A write that was applied in the caller's transaction (not yet
 /// committed): the outcome event to send **after** the commit, the event to
 /// send instead if the commit fails, and the reply.
+///
+/// Made only by [`DirectoryAdmin::apply`] — that is, only for a prepared
+/// operation whose decision event auditd acknowledged — and not `Clone`: a
+/// step that must follow an acknowledged write (dird's registration of a
+/// `BeginPasswordSet`'s set-secret decision) takes it as its evidence
+/// (docs/52 §3.11 R6 (a)).
+///
 /// Spec: docs/51 §5.7 item 2, §7.4 steps 5-6; A-85.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Applied {
     outcome: DirAdminEvent,
     commit_failure: DirAdminEvent,
@@ -185,16 +195,19 @@ impl<R: RandomSource> DirectoryAdmin<R> {
     /// delete. `now` is the time of the write (whenCreated, whenChanged,
     /// pwdLastSet, the outcome event).
     ///
-    /// Call it only after auditd acknowledged the decision event; commit
-    /// `txn` on `Ok` and send [`Applied::outcome_event`] (or
-    /// [`Applied::commit_failure_event`] if the commit fails); on `Err`
-    /// abort `txn` and send the refusal's event. An operation that commits
-    /// nothing (`Prepared::writes` is `false`) is refused here.
+    /// `prepared` comes with its proof: auditd acknowledged its decision
+    /// event (`ipc_audit::AuditGate::wait_acknowledged` is the only source
+    /// of an `AckedIntent`; module documentation). Commit `txn` on `Ok` and
+    /// send [`Applied::outcome_event`] (or [`Applied::commit_failure_event`]
+    /// if the commit fails); on `Err` abort `txn` and send the refusal's
+    /// event. An operation that commits nothing (`Prepared::writes` is
+    /// `false`) is refused here.
     ///
-    /// Spec: docs/51 §7.4 step 5; A-75; A-83; A-84; A-85.
+    /// Spec: docs/51 §7.4 step 5; A-75; A-83; A-84; A-85; docs/52 §3.11 R6
+    /// (a).
     pub fn apply(
         &mut self,
-        prepared: Prepared,
+        prepared: AckedIntent<Prepared>,
         txn: &mut WriteTxn<'_>,
         now: &KerberosTime,
     ) -> Result<Applied, Refusal> {
@@ -203,7 +216,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
             requester,
             plan,
             ..
-        } = prepared;
+        } = prepared.into_inner();
         let Plan::Write(write) = plan else {
             return Err(base.outcome_refusal(now, Stop::Failed(AdminFailure::InternalFailure)));
         };

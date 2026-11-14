@@ -48,7 +48,16 @@
 //!   decision for its tombstone, live `keyd_types::MAX_DESTROY_DECISION_SECS`;
 //!   a failure is noted (`AdminDestroyNotRegistered`) and the `Delete` still
 //!   answers its success: the account is deleted and its key sets are
-//!   unreachable (no object ⇒ no handle, docs/51 §9 — fail closed).
+//!   unreachable (no object ⇒ no handle, docs/51 §9 — fail closed);
+//! * again, for every tombstoned user or computer whose destruction is not
+//!   known complete — at the admin service's start and every
+//!   [`AdminParams::destroy_reconcile_interval`] — so that a destroy decision
+//!   lost by a keyd restart or a failed registration is registered again
+//!   (A-105; crate::reconcile).
+//!
+//! Each registration is a [`crate::DecisionRegistration`], which dird builds
+//! only from its evidence — an acknowledged decision event, an applied write,
+//! or a tombstone (docs/52 §3.11 R6; crate::registration).
 //!
 //! # The admin service's key set (A-73)
 //!
@@ -73,6 +82,7 @@
 //! docs/50 §3.4, §3.6, §3.7; A-56; A-73; A-87; A-89.
 
 use crate::policy::DevelopmentPolicy;
+use crate::registration::DecisionRegistration;
 use core::fmt;
 use core::time::Duration;
 use directory_admin::{
@@ -92,7 +102,7 @@ use ipc_dird_admin::{
 };
 use kdc::AccountSource;
 use keyd_types::{
-    AccountKind as GrantKind, AuthnError, DecidedOperation, DecisionId, KeyHandle, PrincipalId,
+    AccountKind as GrantKind, AuthnError, DecidedOperation, DecisionId, DestructionPage, KeyHandle,
     ServiceContext, SetSecretTarget,
 };
 use krb_proto::Realm;
@@ -281,18 +291,29 @@ pub trait TicketVerifier: Send {
     /// error is keyd's own answer.
     fn verify(&mut self, service: &KeyHandle, ap_req: &[u8]) -> Result<ServiceContext, AuthnError>;
 
-    /// Register in keyd dird's decision `id` to run `operation`, approved by
-    /// `approvers`, live for `lifetime_secs` by keyd's clock (keyd's
-    /// `register_decision`, Role::Ldap).
-    /// Spec: docs/52 §4.2, §4.3 (A-102); docs/51 §5.8 option (b);
-    /// docs/questions/Q-291 (A-74), Q-450, Q-460.
+    /// Register in keyd dird's `decision` (keyd's `register_decision`,
+    /// Role::Ldap): its id, operation, approvers and lifetime. A
+    /// [`DecisionRegistration`] is built only from its evidence (an
+    /// acknowledged decision event, an applied write, a tombstone —
+    /// crate::registration), so this cannot be reached for a decision auditd
+    /// has not durably recorded.
+    /// Spec: docs/52 §4.2, §4.3 (A-102), §3.11 R6 (a); docs/51 §5.8 option
+    /// (b); docs/questions/Q-291 (A-74), Q-450, Q-460.
     fn register_decision(
         &mut self,
-        id: DecisionId,
-        operation: &DecidedOperation,
-        approvers: &[PrincipalId],
-        lifetime_secs: u32,
+        decision: DecisionRegistration,
     ) -> Result<(), RegistrationFailure>;
+
+    /// One page of keyd's pending destroy decisions strictly after `after`
+    /// (keyd's `list_destroy_decisions`, Role::Ldap since task R6), for the
+    /// re-registration of lost ones (crate::reconcile); `None` when keyd
+    /// did not answer with a page. Reads only. The default answers `None`
+    /// (a verifier that cannot list: nothing is re-registered).
+    /// Spec: docs/52 §4.3, §4.6; docs/questions/Q-470 (A-105), Q-501, Q-503.
+    fn list_destroy_decisions(&mut self, after: Option<DecisionId>) -> Option<DestructionPage> {
+        let _ = after;
+        None
+    }
 }
 
 /// The production verifier: ipc-keyd's client under Role::Ldap with F1's
@@ -367,19 +388,16 @@ where
     /// docs/questions/Q-367 (A-88), Q-450, Q-453 item 1, Q-460.
     fn register_decision(
         &mut self,
-        id: DecisionId,
-        operation: &DecidedOperation,
-        approvers: &[PrincipalId],
-        lifetime_secs: u32,
+        decision: DecisionRegistration,
     ) -> Result<(), RegistrationFailure> {
         if !self.keyd_identified() {
             return Err(RegistrationFailure::NotPerformed);
         }
         let call = ipc_keyd::Call::RegisterDecision {
-            id,
-            operation: operation.clone(),
-            approvers: approvers.to_vec(),
-            lifetime_secs,
+            id: decision.id(),
+            operation: decision.operation().clone(),
+            approvers: decision.approvers().to_vec(),
+            lifetime_secs: decision.lifetime_secs(),
         };
         match self.client.call_with_fate(&call) {
             Ok(ipc_keyd::Answer::RegisterDecision(Ok(()))) => Ok(()),
@@ -396,6 +414,15 @@ where
                 ipc_keyd::RequestFate::OutcomeUnknown => RegistrationFailure::OutcomeUnknown,
             }),
         }
+    }
+
+    /// A read: `call` (the fate is not needed — nothing changes either way).
+    /// Spec: docs/52 §4.6; docs/questions/Q-470 (A-105), Q-501, Q-503.
+    fn list_destroy_decisions(&mut self, after: Option<DecisionId>) -> Option<DestructionPage> {
+        if !self.keyd_identified() {
+            return None;
+        }
+        self.client.list_destroy_decisions(after).ok()
     }
 }
 
@@ -433,7 +460,31 @@ pub struct AdminParams {
     /// The lifetime of a pending key-operation request
     /// (`directory_admin::KEY_REQUEST_LIFETIME`; docs/51 §5.6, task A10).
     pub key_request_lifetime: Duration,
+    /// How often the admin thread re-registers lost destroy decisions
+    /// ([`DESTROY_RECONCILE_INTERVAL`] in every production dird; kept
+    /// within [`MIN_DESTROY_RECONCILE_INTERVAL`] ..=
+    /// [`MAX_DESTROY_RECONCILE_INTERVAL`]); it also does so once at start
+    /// (A-105, crate::reconcile).
+    pub destroy_reconcile_interval: Duration,
 }
+
+/// How often dird re-registers the destroy decisions keyd lost (A-105):
+/// every 10 minutes, and once at the admin service's start. A lost decision
+/// costs hygiene only — the key sets of a deleted account are unreachable
+/// (docs/51 §9) — and `destroy-sweep` runs by hand, so minutes are enough;
+/// each run is bounded (crate::reconcile). Project choice
+/// (docs/questions/Q-501).
+pub const DESTROY_RECONCILE_INTERVAL: Duration = Duration::from_secs(600);
+
+/// The shortest re-registration interval dird accepts (a shorter one is
+/// raised to it): the bound on how much of the admin thread the
+/// re-registration may take. Project choice (docs/questions/Q-501).
+pub const MIN_DESTROY_RECONCILE_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The longest re-registration interval dird accepts (a longer one is
+/// lowered to it): a lost decision waits at most a day. Project choice
+/// (docs/questions/Q-501).
+pub const MAX_DESTROY_RECONCILE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 impl fmt::Debug for AdminParams {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -447,6 +498,10 @@ impl fmt::Debug for AdminParams {
             .field("queue_capacity", &self.queue_capacity)
             .field("ack_deadline", &self.ack_deadline)
             .field("key_request_lifetime", &self.key_request_lifetime)
+            .field(
+                "destroy_reconcile_interval",
+                &self.destroy_reconcile_interval,
+            )
             .finish_non_exhaustive()
     }
 }

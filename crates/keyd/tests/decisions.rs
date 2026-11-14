@@ -562,7 +562,9 @@ fn a_store_with_keys_starts_operational() {
 
 /// docs/52 §4.3, §4.6; docs/51 §6, §9: Admin lists the pending destroy
 /// decisions dird registered (id and principal), ascending, without the
-/// executed ones; no other role may list.
+/// executed ones; since task R6 (A-105, docs/questions/Q-503) dird (Ldap)
+/// reads the same listing back, to re-register only what keyd lost; no
+/// other role may list.
 #[test]
 fn the_destroy_listing_shows_pending_decisions_only() {
     let mut f = Fixture::new();
@@ -603,7 +605,8 @@ fn the_destroy_listing_shows_pending_decisions_only() {
     let page = f.keyd.list_destroy_decisions(&ADMIN, None, &now()).unwrap();
     assert_eq!(page.entries.len(), 1);
     assert_eq!(page.entries[0].decision, second);
-    for caller in [KDC, DIRECTORY, LDAP] {
+    assert_eq!(f.keyd.list_destroy_decisions(&LDAP, None, &now()), Ok(page));
+    for caller in [KDC, DIRECTORY] {
         assert_eq!(
             f.keyd.list_destroy_decisions(&caller, None, &now()),
             Err(Error::Denied)

@@ -2,7 +2,7 @@
 //! `ipc-keyd-server`: the server side of the keyd channel — one request body
 //! in, one reply frame (or a close) out — against the real, in-process keyd.
 //!
-//! [`dispatch`] is a pure function of the keyd engine, the caller identity
+//! The server side is a pure function of the keyd engine, the caller identity
 //! the **transport** established, the keyd daemon's **own clock**, and the
 //! request body. No socket, queue or thread lives here — that is the
 //! keyd-daemon (task P7), which also maps peer credentials to a
@@ -11,7 +11,7 @@
 //!
 //! # Why a separate crate (D182; decision A-63)
 //!
-//! [`execute`] and [`dispatch`] call keyd's operations, so they need the
+//! [`execute`], [`execute_acknowledged`] and `dispatch` call keyd's operations, so they need the
 //! real `keyd::Keyd` — and with it the crypto profile (`krb-crypto`), which
 //! only the keyd process may link (D182). The rest of the channel — the
 //! message set, the codec, `ipc_keyd::decode_request` /
@@ -27,6 +27,24 @@
 //!
 //! Moved unchanged from `ipc-keyd`'s `server` module (task P5).
 //!
+//! # Running a call: plain, or with the proof of its acknowledged intent
+//!
+//! (docs/52 §3.11 R6, decision A-102.) [`classify`] decides, from keyd's
+//! own authorization step, whether a call needs its intent acknowledged by
+//! auditd first (module `intent`). A plain call runs with [`execute`]; a
+//! key-state change (or a loosening) that keyd admits is a [`KeyStateCall`]
+//! and runs **only** with [`execute_acknowledged`], which takes an
+//! `ipc_audit::AckedIntent<KeyStateCall>` by value — obtainable only from
+//! the daemon's `ipc_audit::AuditGate` after auditd acknowledged that
+//! call's intent record. [`execute`] checks again when it runs and refuses
+//! ([`NotRun`]) to run a call that now needs the proof.
+//!
+//! The unaudited `dispatch` (one body in, one frame out, keyd run directly)
+//! exists only with the `loopback` feature, which no daemon enables: it is
+//! the in-process loopback of the tests (this crate's, and keyd-daemon's
+//! comparison of its engine with it) — not a path a production build has
+//! (docs/52 C18).
+//!
 //! # Provenance
 //!
 //! Written only from this project's decided design — docs/50 (§3.2-§3.7,
@@ -36,13 +54,23 @@
 //! (AGENTS.md §1-3).
 //!
 //! Spec: docs/50 §3.2, §3.3, §3.4, §3.5, R50-3, R50-5, R50-7; docs/10 §2;
-//! A-56; A-59; D182; A-63.
+//! A-56; A-59; D182; A-63; docs/52 §3.11 R6 (A-102).
+
+mod intent;
+
+pub use intent::{classify, Classified, KeyStateCall, KeyStateIntent, PlainCall};
 
 use core::fmt;
-use ipc::{encode_refused, EncodedFrame, Refused};
-use ipc_keyd::{decode_request, encode_answer, Answer, Call, DescribedConfig, KEYD_CHANNEL};
+use ipc::EncodedFrame;
+use ipc_audit::AckedIntent;
+use ipc_keyd::{Answer, Call, DescribedConfig};
 use keyd::{AuditSink, CallerId, EntropySource, KeyStore, Keyd, TgsFastRequest};
 use krb_proto::KerberosTime;
+#[cfg(feature = "loopback")]
+use {
+    ipc::{encode_refused, Refused},
+    ipc_keyd::{decode_request, encode_answer, KEYD_CHANNEL},
+};
 
 /// What the connection does with the result of one request.
 ///
@@ -73,8 +101,54 @@ impl fmt::Debug for Dispatch {
     }
 }
 
+/// A plain call was not run: keyd's authorization step now admits it as a
+/// change that needs an acknowledged intent (its classification went
+/// stale). keyd was not called; the daemon answers `Refused::Unavailable`
+/// ("not done", A-86).
+/// Spec: docs/52 §3.11 R6 (a); docs/questions/Q-365 (A-88).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotRun;
+
+/// Run a [`PlainCall`] on `keyd` (module documentation): keyd's outcome
+/// unchanged — after checking that the call still needs no acknowledged
+/// intent.
+///
+/// # Errors
+/// [`NotRun`]: keyd's authorization step now admits it as a key-state
+/// change or a loosening — it runs only with its proof
+/// ([`execute_acknowledged`]); keyd was not called.
+///
+/// Spec: docs/52 §3.11 R6 (a); docs/10 §2; docs/50 R50-3, R50-5; A-56;
+/// docs/questions/Q-365 (A-88).
+pub fn execute<S: KeyStore, A: AuditSink, E: EntropySource>(
+    keyd: &mut Keyd<S, A, E>,
+    plain: PlainCall,
+) -> Result<Answer, NotRun> {
+    if !intent::still_plain(keyd, &plain) {
+        return Err(NotRun);
+    }
+    let PlainCall { caller, now, call } = plain;
+    Ok(run(keyd, caller, now, call))
+}
+
+/// Run a key-state change (or a loosening) whose intent auditd acknowledged:
+/// the only way keyd runs one (module documentation). The proof is consumed:
+/// one acknowledgement, one change.
+/// Spec: docs/52 §3.11 R6 (a); docs/questions/Q-346 (A-86), Q-365 (A-88).
+pub fn execute_acknowledged<S: KeyStore, A: AuditSink, E: EntropySource>(
+    keyd: &mut Keyd<S, A, E>,
+    change: AckedIntent<KeyStateCall>,
+) -> Answer {
+    let KeyStateCall {
+        caller, now, call, ..
+    } = change.into_inner();
+    run(keyd, caller, now, call)
+}
+
 /// Perform one decoded call on `keyd` as `caller` at `now`, returning keyd's
-/// outcome unchanged.
+/// outcome unchanged. Private: reached only through [`execute`] (a plain
+/// call), [`execute_acknowledged`] (with the proof), and the test-only
+/// loopback `dispatch`.
 ///
 /// `caller` is the identity of the connection (peer credentials mapped to a
 /// role by the daemon, docs/50 §3.2) and `now` is the daemon's own clock
@@ -87,7 +161,7 @@ impl fmt::Debug for Dispatch {
 /// Spec: docs/10 §2 (`CallerId` "derived from the connected peer … not
 /// claimed by the caller"), §4-§7א; docs/50 R50-3, R50-5; A-56;
 /// docs/questions/Q-351 (A-87).
-pub fn execute<S: KeyStore, A: AuditSink, E: EntropySource>(
+fn run<S: KeyStore, A: AuditSink, E: EntropySource>(
     keyd: &mut Keyd<S, A, E>,
     caller: CallerId,
     now: KerberosTime,
@@ -236,6 +310,7 @@ pub fn execute<S: KeyStore, A: AuditSink, E: EntropySource>(
 /// A transport refusal frame, then close; a refusal that cannot even be
 /// encoded (never, given ipc's `MIN_BODY_LIMIT`) closes without a reply.
 /// Spec: docs/50 §3.3; A-59.
+#[cfg(feature = "loopback")]
 fn refuse(refused: Refused) -> Dispatch {
     match encode_refused(KEYD_CHANNEL, refused) {
         Ok(frame) => Dispatch::ReplyAndClose(frame),
@@ -243,12 +318,15 @@ fn refuse(refused: Refused) -> Dispatch {
     }
 }
 
-/// Serve one request body of the keyd channel.
+/// Serve one request body of the keyd channel — **without** the audit gate:
+/// the in-process loopback of the tests (feature `loopback`, which no
+/// daemon enables; module documentation). keyd-daemon serves through its
+/// engine (`classify`, the gate, [`execute`] / [`execute_acknowledged`]).
 ///
 /// 1. [`decode_request`]; a rejected body is answered as
 ///    [`ipc_keyd::Rejection::refusal`] says (`Malformed` / `VersionMismatch`
 ///    then close, or close without a reply). keyd is not called.
-/// 2. [`execute`] with `caller` (from the transport) and `now` (the
+/// 2. keyd runs the call with `caller` (from the transport) and `now` (the
 ///    daemon's clock).
 /// 3. The answer is encoded as the operation's reply. A reply that cannot be
 ///    encoded (krb-proto refuses keyd's own output, or the reply bound is
@@ -259,7 +337,8 @@ fn refuse(refused: Refused) -> Dispatch {
 /// Spec: docs/50 §3.2 ("`CallerId { uid, role }` built once per connection
 /// and handed to every operation"), §3.3, §3.4, §3.5 (R50-5: "keyd-daemon
 /// fills `now` of every operation from its own system clock; the field does
-/// not exist on the wire"), §3.7; docs/10 §2; A-56; A-59.
+/// not exist on the wire"), §3.7; docs/10 §2; A-56; A-59; docs/52 C18.
+#[cfg(feature = "loopback")]
 pub fn dispatch<S: KeyStore, A: AuditSink, E: EntropySource>(
     keyd: &mut Keyd<S, A, E>,
     caller: CallerId,
@@ -275,7 +354,7 @@ pub fn dispatch<S: KeyStore, A: AuditSink, E: EntropySource>(
             }
         }
     };
-    let answer = execute(keyd, caller, now, call);
+    let answer = run(keyd, caller, now, call);
     match encode_answer(&answer) {
         Ok(frame) => Dispatch::Reply(frame),
         Err(_) => refuse(Refused::Unavailable),

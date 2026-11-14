@@ -38,10 +38,22 @@
 //! `PolicyAdmin` on the policy scope `keys` for the requester and every
 //! approver, the approval bound to the request's operation digest; the
 //! `Approve` that completes the quorum yields the [`KeyDecision`] dird
-//! registers in keyd (A-102, docs/52 §4.3). keyadm's `FetchApproved`,
-//! `Complete` and `ListPendingDestruction` are retired (docs/52 §4.6);
-//! [`DirectoryAdmin::destruction_target`] names the key sets a committed
-//! `Delete` leaves to destroy (module `key_requests`; docs/51 §5.6, §6).
+//! registers in keyd (A-102, docs/52 §4.3) — as a [`QuorumStep`], whose
+//! `Decision` event auditd must acknowledge first (an
+//! `ipc_audit::AckedIntent<QuorumStep>`, docs/52 R6). keyadm's
+//! `FetchApproved`, `Complete` and `ListPendingDestruction` are retired
+//! (docs/52 §4.6); [`DirectoryAdmin::destruction_target`] and
+//! [`DirectoryAdmin::destruction_targets`] name the key sets a committed
+//! `Delete` leaves to destroy, as [`TombstonedPrincipal`]s — the only input
+//! of a destroy decision (module `key_requests`; docs/51 §5.6, §6; A-105).
+//!
+//! # The proof of an acknowledged decision (docs/52 §3.11 R6, A-102)
+//!
+//! [`Prepared`] is not `Clone` and is its own `ipc_audit::IntentRecord`
+//! (its `Decision` event); [`DirectoryAdmin::apply`] takes it only as an
+//! `ipc_audit::AckedIntent<Prepared>`, which only the caller's
+//! `ipc_audit::AuditGate` produces after auditd acknowledged that event. The
+//! "decision acknowledged ⇒ commit" rule of A-85 is a type, not a comment.
 //!
 //! # The operations (docs/51 §5.2, §7.3)
 //!
@@ -109,6 +121,14 @@
 //! (083fe00a…8a4e) 2.2.1.14, 3.1.1.6, 3.1.1.8.9, 3.1.1.9.2 and this
 //! repository's code; interpretations in docs/questions/Q-505..Q-507.
 //!
+//! The shared gate, the proof of an acknowledged intent and the one stop
+//! flush (task R6, decision A-102) were written only from docs/52 (§2,
+//! §3.10, §3.11, §4.3, §7 R6), docs/50 §3.6 / §8.1, docs/51 §5.7,
+//! PENDING-OWNER (A-85, A-87, A-88, A-93, A-102, A-105), docs/questions
+//! Q-313, Q-350, Q-365, Q-470, Q-471 and this repository's own code
+//! (docs/questions/Q-500..Q-503). No other implementation was consulted
+//! or recalled (AGENTS.md §1-3).
+//!
 //! Interpretations and gaps: docs/questions/Q-355 (names and values),
 //! Q-356 (membership and protected objects), Q-357 (dual control and the
 //! self-lockout guard), Q-358 (two-phase contract and re-verification),
@@ -148,9 +168,10 @@ pub use descriptor::{new_object_descriptor, DescriptorError};
 pub use invariants::{InvariantViolation, Provisioning, ProvisioningError, ProvisioningRole};
 // Dual-controlled key operations (task A10, docs/51 §5.6, §6).
 pub use key_requests::{
-    operation_digest, KeyAdminOperation, KeyDecision, KeyOperation, KeyRef, KeyReply,
-    KeyRequestView, KeyRequests, KeyStep, KeyTargets, RegistrationOutcome, DIGEST_LEN,
-    KEY_POLICY_SCOPE, KEY_REQUEST_LIFETIME, MAX_KEY_REQUEST_LIFETIME, MAX_PENDING_KEY_REQUESTS,
+    operation_digest, DestructionTargets, KeyAdminOperation, KeyDecision, KeyOperation, KeyRef,
+    KeyReply, KeyRequestView, KeyRequests, KeyStep, KeyTargets, QuorumStep, RegistrationOutcome,
+    TombstonedPrincipal, DIGEST_LEN, KEY_POLICY_SCOPE, KEY_REQUEST_LIFETIME,
+    MAX_KEY_REQUEST_LIFETIME, MAX_PENDING_KEY_REQUESTS,
 };
 // The name and value rules, public for `provision domain` (task A4), which
 // must apply exactly these rules to the names it is given (A-79).

@@ -65,9 +65,10 @@ pub const TGS_QUEUE_CAPACITY: usize = 64;
 /// How long a stop waits for the requests in flight. Project choice.
 pub const DRAIN_GRACE: Duration = Duration::from_secs(5);
 
-/// How long a stop waits for auditd to acknowledge the window. Project
-/// choice.
-pub const AUDIT_FLUSH_GRACE: Duration = Duration::from_secs(5);
+/// How long a stop waits for auditd to acknowledge the window: the one
+/// bound of every daemon, `ipc_audit::AUDIT_FLUSH_GRACE` (5 s; a project
+/// choice). Spec: docs/52 §3.11 R6 (b); docs/questions/Q-313 (A-82).
+pub const AUDIT_FLUSH_GRACE: Duration = ipc_audit::AUDIT_FLUSH_GRACE;
 
 /// Poll interval while draining. Project choice.
 const DRAIN_POLL: Duration = Duration::from_millis(10);
@@ -250,6 +251,7 @@ pub struct Stopped {
     engine: EngineThread,
     engine_failed: bool,
     policy_version: PolicyVersion,
+    unacknowledged: usize,
 }
 
 impl Stopped {
@@ -263,6 +265,18 @@ impl Stopped {
     #[must_use]
     pub fn policy_version(&self) -> PolicyVersion {
         self.policy_version
+    }
+
+    /// The audit events auditd had not acknowledged when the stop ended the
+    /// audit task (after waiting up to [`AUDIT_FLUSH_GRACE`], or less once
+    /// auditd counted as unreachable): lost with the process (Q-252 item 9).
+    /// The shared flush's report (`ipc_audit::AuditGate::close`, docs/52
+    /// R6), as dird and admind expose it; the kdc writes no log note for it,
+    /// as before.
+    /// Spec: docs/50 R50-17, §8.1; docs/questions/Q-313 (A-82).
+    #[must_use]
+    pub fn unacknowledged_audit_events(&self) -> usize {
+        self.unacknowledged
     }
 
     /// Wait for the engine thread; call after the runtime was dropped.
@@ -442,12 +456,16 @@ where
     control.state.serving.store(false, Ordering::SeqCst);
     wait_until(DRAIN_GRACE, || shared.in_flight.load(Ordering::SeqCst) == 0).await;
     queues.close();
-    wait_until(AUDIT_FLUSH_GRACE, || {
-        gate.outstanding() == 0 || !gate.is_reachable()
-    })
-    .await;
-    audit_task.abort();
-    let _ = audit_task.await;
+    // The one flush of every daemon (`ipc_audit::AuditGate::close`, docs/52
+    // R6): the kdc's rule ends the wait early when auditd counts as
+    // unreachable (A-87 kept it).
+    let unacknowledged = gate
+        .close(AUDIT_FLUSH_GRACE, async {
+            audit_task.abort();
+            let _ = audit_task.await;
+        })
+        .await
+        .events();
     if engine_failed {
         note(Note::EngineStopped, None);
     }
@@ -456,5 +474,6 @@ where
         engine: engine_thread,
         engine_failed,
         policy_version,
+        unacknowledged,
     })
 }

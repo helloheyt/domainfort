@@ -28,7 +28,10 @@
 //!    No acknowledgement in time ⇒ the transaction is aborted, the outcome
 //!    slot records the operation as not performed
 //!    (`Outcome(Failed(AuditUnacknowledged))`), and the answer is
-//!    `Unavailable`.
+//!    `Unavailable`. The prepared write goes into the gate with its
+//!    decision event and comes back as an `ipc_audit::AckedIntent<Prepared>`
+//!    only after the acknowledgement (docs/52 R6) — the only form `apply`
+//!    takes.
 //! 6. **`apply`** inside the transaction (it re-verifies what could have
 //!    changed); a refusal ⇒ abort, its `Outcome` event.
 //! 7. **Commit.**
@@ -60,16 +63,29 @@
 //!    8b. **The `DestroyKeySet` decision** (A-102, docs/52 §4.3 row
 //!    `destroy_key_set` option (a)) — only for a committed `Delete` whose
 //!    tombstone is of the `user` class (users and computers): keyd
-//!    `register_decision(operation id, DestroyKeySet { the tombstone's
-//!    GUID }, no approvers, keyd_types::MAX_DESTROY_DECISION_SECS)`, after
-//!    the outcome event, so a destroy decision exists only for an account
-//!    whose deletion is durably recorded and committed. keyadm's
-//!    `destroy-sweep` executes it in keyd. A failure is noted
-//!    (`AdminDestroyNotRegistered`) and the reply stays the `Delete`'s
+//!    `register_decision(the tombstone's stable id, DestroyKeySet { the
+//!    tombstone's GUID }, no approvers, keyd_types::MAX_DESTROY_DECISION_SECS)`
+//!    (crate::registration), after the outcome event, so a destroy decision
+//!    exists only for an account whose deletion is durably recorded and
+//!    committed. keyadm's `destroy-sweep` executes it in keyd. A failure is
+//!    noted (`AdminDestroyNotRegistered`) and the reply stays the `Delete`'s
 //!    success: the account is deleted, and its key sets are unreachable (no
-//!    object ⇒ no handle — docs/51 §9, fail closed); a re-registration path
-//!    is docs/questions/Q-470.
+//!    object ⇒ no handle — docs/51 §9, fail closed); the re-registration
+//!    (below) registers it later.
 //! 9. **Reply.**
+//!
+//! Every registration in keyd is a `crate::DecisionRegistration`, built only
+//! from its evidence — the `AckedIntent<QuorumStep>` of an `Approve`, the
+//! `Applied` of a `BeginPasswordSet`, a `TombstonedPrincipal` (docs/52 R6;
+//! crate::registration).
+//!
+//! # Re-registering lost destroy decisions (A-105)
+//!
+//! Between jobs — at the thread's start and every
+//! `AdminParams::destroy_reconcile_interval` — the thread registers again
+//! the destroy decision of every tombstoned user or computer that keyd does
+//! not hold as pending and has not executed (crate::reconcile;
+//! docs/questions/Q-470 item 4, Q-501).
 //!
 //! An operation that commits nothing (`Lookup`, `CompletePasswordSet`) has
 //! its decision event only, committed into the window before the reply
@@ -124,14 +140,16 @@
 //! Q-388; A-88 (Q-366, Q-395); A-91 (Q-397); docs/11 §2, §8.
 
 use crate::admin_service::{
-    key_request_of, pep_operation, secret_decision_of, wire_key_reply, wire_reply, wire_status,
-    RegistrationFailure, TicketVerifier, SET_SECRET_GRANT_LIFETIME_SECS,
+    key_request_of, pep_operation, wire_key_reply, wire_reply, wire_status, RegistrationFailure,
+    TicketVerifier, MAX_DESTROY_RECONCILE_INTERVAL, MIN_DESTROY_RECONCILE_INTERVAL,
 };
 use crate::clock::SharedClock;
 use crate::engine::{EngineError, EngineThread, OnExit, SubmitError};
 use crate::ldap_audit::AuditGate;
 use crate::log::{note, Note, Thinned};
 use crate::rate::ObligationLimiter;
+use crate::reconcile::Reconciler;
+use crate::registration::DecisionRegistration;
 use core::time::Duration;
 use directory_admin::{
     DirectoryAdmin, KeyAdminOperation, KeyDecision, KeyRequests, KeyStep,
@@ -145,11 +163,11 @@ use ipc_audit::{
     Reservation,
 };
 use ipc_dird_admin::{Auth, Operation, RefusalStatus, Reply};
-use keyd_types::{AuthnError, DecidedOperation, DecisionId, KeyHandle, MAX_DESTROY_DECISION_SECS};
+use keyd_types::{AuthnError, DecisionId, KeyHandle};
 use krb_proto::KerberosTime;
 use ldap::RateLimiter;
 use pdp::{Constraint, Obligation, PolicySnapshot};
-use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::oneshot;
@@ -231,6 +249,10 @@ pub(crate) struct AdminWorker {
     pub(crate) ack_deadline: Duration,
     /// The pending key-operation requests (memory only; docs/51 §5.6).
     pub(crate) key_requests: KeyRequests,
+    /// How often lost destroy decisions are re-registered (A-105;
+    /// crate::reconcile), kept within [`MIN_DESTROY_RECONCILE_INTERVAL`] ..=
+    /// [`MAX_DESTROY_RECONCILE_INTERVAL`].
+    pub(crate) reconcile_interval: Duration,
 }
 
 /// The running state of the admin thread.
@@ -238,6 +260,8 @@ struct Running {
     worker: AdminWorker,
     next_operation: u64,
     rate: ObligationLimiter,
+    /// The re-registration of lost destroy decisions (A-105).
+    reconciler: Reconciler,
 }
 
 /// The stage of a request whose `WriteTxn` could not begin, or whose view
@@ -496,7 +520,7 @@ impl Running {
             ),
             // Step 4 (A-102): the Approve that completed the quorum.
             Some(Ok(step)) if step.decision().is_some() => {
-                self.register_key_decision(&step, first, second)
+                self.register_key_decision(step, first, second)
             }
             // Step 4: the events into their slots, then the reply.
             Some(Ok(step)) => {
@@ -531,58 +555,69 @@ impl Running {
     /// A-85; docs/questions/Q-453 item 1, Q-460.
     fn register_key_decision(
         &mut self,
-        step: &KeyStep,
+        step: KeyStep,
         first: Option<Reservation>,
         second: Option<Reservation>,
     ) -> Reply {
-        let Some(decision) = step.decision().cloned() else {
-            // Cannot happen (the caller checked); nothing to register.
-            self.release(first);
-            self.release(second);
-            return Reply::Refused(RefusalStatus::Unavailable);
+        let quorum = match step.into_quorum() {
+            Ok(quorum) => quorum,
+            Err(step) => {
+                // Cannot happen (the caller checked): nothing to register.
+                self.release(first);
+                self.release(second);
+                if let Some(decision) = step.decision() {
+                    return self.withdraw(decision);
+                }
+                return Reply::Refused(RefusalStatus::Unavailable);
+            }
         };
-        let Some(event) = step.events().first() else {
-            self.release(first);
+        // docs/52 R6: the step's decision event into the first slot; the
+        // registration needs its acknowledgement as a value
+        // (`AckedIntent<QuorumStep>` ⇒ `DecisionRegistration::of_quorum`).
+        let Some(slot) = first else {
+            // Cannot happen (two slots were reserved).
             self.release(second);
-            return self.withdraw(&decision);
+            return self.withdraw(quorum.decision());
         };
-        let Some(seq) = self.commit(first, event) else {
-            // Cannot happen (the slot was reserved); no answer leaves
-            // unaudited, and keyd was not asked.
-            OUTCOME_UNRECORDED.hit(None);
-            self.release(second);
-            return self.withdraw(&decision);
+        let pending = match self.worker.gate.begin_intent(slot, quorum) {
+            Ok(pending) => pending,
+            Err(quorum) => {
+                // Cannot happen (the slot was reserved); no answer leaves
+                // unaudited, and keyd was not asked.
+                OUTCOME_UNRECORDED.hit(None);
+                self.release(second);
+                return self.withdraw(quorum.decision());
+            }
         };
         let deadline = Instant::now() + self.worker.ack_deadline;
-        if !self.worker.gate.wait_acknowledged(seq, deadline) {
-            self.commit_outcome(
-                second,
-                &step.registration_event(RegistrationOutcome::NotPerformed),
-            );
-            note(
-                Note::AdminDecisionNotRegistered,
-                Some(RegistrationFailure::NotPerformed.code()),
-            );
-            return self.withdraw(&decision);
-        }
-        let registered = self.worker.verifier.register_decision(
-            decision.id,
-            &decision.operation,
-            &decision.approvers,
-            decision.lifetime_secs,
-        );
+        let acked = match self.worker.gate.wait_acknowledged(pending, deadline) {
+            Ok(acked) => acked,
+            Err(quorum) => {
+                self.commit_outcome(
+                    second,
+                    &quorum.registration_event(RegistrationOutcome::NotPerformed),
+                );
+                note(
+                    Note::AdminDecisionNotRegistered,
+                    Some(RegistrationFailure::NotPerformed.code()),
+                );
+                return self.withdraw(quorum.decision());
+            }
+        };
+        let (registration, quorum) = DecisionRegistration::of_quorum(acked);
+        let registered = self.worker.verifier.register_decision(registration);
         let outcome = match registered {
             Ok(()) => RegistrationOutcome::Registered,
             Err(RegistrationFailure::Refused(_)) => RegistrationOutcome::Refused,
             Err(RegistrationFailure::NotPerformed) => RegistrationOutcome::NotPerformed,
             Err(RegistrationFailure::OutcomeUnknown) => RegistrationOutcome::OutcomeUnknown,
         };
-        self.commit_outcome(second, &step.registration_event(outcome));
+        self.commit_outcome(second, &quorum.registration_event(outcome));
         match registered {
-            Ok(()) => wire_key_reply(step.reply()),
+            Ok(()) => wire_key_reply(quorum.reply()),
             Err(failure) => {
                 note(Note::AdminDecisionNotRegistered, Some(failure.code()));
-                self.withdraw(&decision)
+                self.withdraw(quorum.decision())
             }
         }
     }
@@ -597,28 +632,31 @@ impl Running {
 
     /// Step 8b (module documentation): after a committed `Delete`, the
     /// `DestroyKeySet` decision of its tombstone when it is a user or a
-    /// computer. Never changes the reply: a failure is noted only.
-    /// Spec: docs/52 §4.3 (A-102); docs/51 §6, §9; docs/questions/Q-470.
-    fn register_destruction(&mut self, operation_id: u64, target: dtyp::Guid) {
+    /// computer — from the tombstone itself (`TombstonedPrincipal`, under
+    /// its stable id, crate::registration). Never changes the reply: a
+    /// failure is noted only, and the re-registration (crate::reconcile)
+    /// registers it later.
+    /// Spec: docs/52 §4.3 (A-102), §3.11 R6; docs/51 §6, §9;
+    /// docs/questions/Q-470 (A-105).
+    fn register_destruction(&mut self, target: dtyp::Guid) {
         let store = Arc::clone(&self.worker.store);
-        let principal = match self.worker.ctx.view(&store, &self.worker.tiers) {
+        let tombstoned = match self.worker.ctx.view(&store, &self.worker.tiers) {
             Ok(view) => self.worker.admin.destruction_target(&view, target),
             Err(_) => Err(AdminFailure::ViewUnavailable),
         };
-        let principal = match principal {
-            Ok(Some(principal)) => principal,
+        let tombstoned = match tombstoned {
+            Ok(Some(tombstoned)) => tombstoned,
             Ok(None) => return,
             Err(_) => {
                 note(Note::AdminDestroyNotRegistered, Some(4));
                 return;
             }
         };
-        if let Err(failure) = self.worker.verifier.register_decision(
-            DecisionId::new(operation_id),
-            &DecidedOperation::DestroyKeySet { principal },
-            &[],
-            MAX_DESTROY_DECISION_SECS,
-        ) {
+        if let Err(failure) = self
+            .worker
+            .verifier
+            .register_decision(DecisionRegistration::of_tombstone(&tombstoned))
+        {
             note(Note::AdminDestroyNotRegistered, Some(failure.code()));
         }
     }
@@ -728,22 +766,35 @@ impl Running {
             return Reply::Refused(RefusalStatus::Unavailable);
         };
 
-        // Step 5: the decision event, acknowledged before anything commits.
-        let decision = prepared.decision_event().clone();
-        let Some(seq) = self.commit(first, &decision) else {
+        // Step 5: the decision event, acknowledged before anything commits —
+        // `apply` takes the prepared write only with that proof (docs/52
+        // R6: `AckedIntent<Prepared>`, made only by the gate).
+        let Some(slot) = first else {
+            // Cannot happen: a write reserved two slots.
             abort(Some(txn));
             self.release(second);
             return Reply::Refused(RefusalStatus::Unavailable);
         };
+        let pending = match self.worker.gate.begin_intent(slot, prepared) {
+            Ok(pending) => pending,
+            Err(_) => {
+                abort(Some(txn));
+                self.release(second);
+                return Reply::Refused(RefusalStatus::Unavailable);
+            }
+        };
         let deadline = Instant::now() + self.worker.ack_deadline;
-        if !self.worker.gate.wait_acknowledged(seq, deadline) {
-            abort(Some(txn));
-            self.commit_outcome(second, &restage(&decision, NOT_PERFORMED));
-            return Reply::Refused(RefusalStatus::Unavailable);
-        }
+        let acked = match self.worker.gate.wait_acknowledged(pending, deadline) {
+            Ok(acked) => acked,
+            Err(prepared) => {
+                abort(Some(txn));
+                self.commit_outcome(second, &restage(prepared.decision_event(), NOT_PERFORMED));
+                return Reply::Refused(RefusalStatus::Unavailable);
+            }
+        };
 
         // Step 6: apply in the transaction.
-        match self.worker.admin.apply(prepared, &mut txn, &now) {
+        match self.worker.admin.apply(acked, &mut txn, &now) {
             Err(refusal) => {
                 abort(Some(txn));
                 self.commit_outcome(second, refusal.event());
@@ -755,13 +806,11 @@ impl Running {
             Ok(applied) => match txn.commit() {
                 Ok(()) => {
                     self.commit_outcome(second, applied.outcome_event());
-                    if let Some(operation) = secret_decision_of(applied.reply()) {
-                        if let Err(failure) = self.worker.verifier.register_decision(
-                            DecisionId::new(operation_id),
-                            &operation,
-                            &[],
-                            SET_SECRET_GRANT_LIFETIME_SECS,
-                        ) {
+                    if let Some(registration) = DecisionRegistration::of_password_set(
+                        DecisionId::new(operation_id),
+                        &applied,
+                    ) {
+                        if let Err(failure) = self.worker.verifier.register_decision(registration) {
                             // Fail closed: admind is told Unavailable and
                             // sets no password; the begun password set is
                             // the documented safe state (docs/51 §9).
@@ -770,7 +819,7 @@ impl Running {
                         }
                     }
                     if let PepOperation::Delete { target } = request.operation {
-                        self.register_destruction(operation_id, target);
+                        self.register_destruction(target);
                     }
                     wire_reply(applied.reply())
                 }
@@ -850,16 +899,36 @@ impl AdminWorker {
             .now()
             .and_then(|now| directory_admin::wall_clock(&now))
             .map_or(0, |seconds| seconds.0.wrapping_shl(OPERATION_ID_SHIFT));
+        let interval = self.reconcile_interval.clamp(
+            MIN_DESTROY_RECONCILE_INTERVAL,
+            MAX_DESTROY_RECONCILE_INTERVAL,
+        );
         let mut running = Running {
             worker: self,
             next_operation: first_id,
             rate: ObligationLimiter::new(),
+            reconciler: Reconciler::new(),
         };
         let thread = std::thread::Builder::new()
             .name(String::from("dird-admin"))
             .spawn(move || {
                 let _exit = OnExit(Some(on_exit));
-                while let Ok(job) = jobs.recv() {
+                // A-105: the lost destroy decisions are registered again at
+                // start and every `interval`, between jobs (this thread is
+                // the one keyd client of the admin service).
+                let mut due = Instant::now();
+                loop {
+                    let now = Instant::now();
+                    if now >= due {
+                        running.reconciler.run(&mut running.worker);
+                        due = Instant::now().checked_add(interval).unwrap_or(now);
+                        continue;
+                    }
+                    let job = match jobs.recv_timeout(due.saturating_duration_since(now)) {
+                        Ok(job) => job,
+                        Err(RecvTimeoutError::Timeout) => continue,
+                        Err(RecvTimeoutError::Disconnected) => break,
+                    };
                     let AdminJob { work, reply } = job;
                     let answer = running.handle(&work);
                     drop(work);

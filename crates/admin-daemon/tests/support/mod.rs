@@ -1411,6 +1411,7 @@ impl World {
                     queue_capacity: directory_daemon::ADMIN_QUEUE_CAPACITY,
                     ack_deadline: DecisionAckDeadline::PRODUCTION,
                     key_request_lifetime: options.key_request_lifetime,
+                    destroy_reconcile_interval: directory_daemon::DESTROY_RECONCILE_INTERVAL,
                 };
                 dird_run = Some(DirdRun::start(params, admin, Arc::clone(&provisioned)));
                 store = Some(provisioned);

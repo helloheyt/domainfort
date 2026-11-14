@@ -68,6 +68,18 @@
 //! noise exactly when it records a refused connection or a malformed frame
 //! ([`AdmindEvent::is_noise`]), so neither can make admind unavailable.
 //!
+//! # The gate and the proof of an acknowledged intent (docs/52 R6, A-102)
+//!
+//! [`AuditGate`]: the window and the audit client's view of auditd behind
+//! one lock — the one gate every sending daemon (keyd, the kdc, dird,
+//! admind) builds its own wrapper on. [`AckedIntent<T>`] is obtainable only
+//! from [`AuditGate::wait_acknowledged`], after auditd acknowledged the
+//! intent record ([`IntentRecord`]) of that very value: a mutation entry
+//! point that takes it by value cannot run before the acknowledgement
+//! (dird's `apply`, keyd's key-state changes, dird's decision
+//! registrations). [`AuditGate::close`] is the one bounded flush at stop
+//! ([`AUDIT_FLUSH_GRACE`], [`FlushWait`], [`Unflushed`]).
+//!
 //! # Security
 //!
 //! No `unsafe`; no panic, `unwrap` or indexing on a decode path; every
@@ -94,12 +106,17 @@
 //! and the three appended admin codes (task F4) were written only from
 //! PENDING-OWNER (A-85, A-88, A-91), docs/questions Q-341, Q-366, Q-388,
 //! Q-358, docs/50 §8, docs/37, docs/51 §5.7 / §7.4 and docs/11 §2 / §8 (as
-//! cited there). No other implementation,
+//! cited there). The gate and the proof (task R6) were written only from
+//! docs/52 (§2, §3.10, §3.11, §7 R6), docs/50 §3.6 / §8.1, docs/51 §5.7,
+//! PENDING-OWNER (A-85, A-87, A-88, A-93, A-102, A-105), docs/questions
+//! Q-313, Q-350, Q-365, Q-395, and this repository's four daemon gates
+//! they replace. No other implementation,
 //! serializer, RPC framework or audit format was consulted or recalled
 //! (AGENTS.md §1-3).
 //!
 //! Spec: docs/50 R50-17, §3.3, §8.1, §10; docs/37 §2; Q-218 (A-57); A-59;
-//! docs/51 §5.7 (A-72); A-88 (Q-366, Q-395); A-91 (Q-388, Q-397).
+//! docs/51 §5.7 (A-72); A-88 (Q-366, Q-395); A-91 (Q-388, Q-397); docs/52
+//! §3.11 R6 (A-102).
 
 mod admin;
 mod channel;
@@ -107,6 +124,7 @@ mod codes;
 mod convert;
 mod error;
 mod event;
+mod gate;
 mod values;
 mod window;
 
@@ -136,6 +154,10 @@ pub use event::{
     EventBody, EventBytes, KdcEvent, KdcOutcome, KeyRef, KeydRecord, LdapBind, LdapEvent,
     LdapOperation, LdapSearch, LdapTarget, TransportSecurity, WindowSummary, EVENT_FORMAT,
     MAX_EVENT_OCTETS, MAX_FILTER_ATTRS,
+};
+pub use gate::{
+    AckedIntent, AuditGate, FlushWait, IntentRecord, PendingIntent, Unflushed, WindowSteps,
+    AUDIT_FLUSH_GRACE, FLUSH_POLL,
 };
 pub use values::{
     AuditText, BoundedSeq, CalendarTime, CodecError, PdpReason, Principal, SidValue,

@@ -77,8 +77,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use directory_pip::DirectoryView;
 use dtyp::{Guid, Sid};
 use ipc_audit::{
-    AdminFailure, AdminRefusal, DirAdminEvent, DirAdminOperation, DirAdminStage, KeydOperation,
-    OutcomeResult,
+    AdminFailure, AdminRefusal, DirAdminEvent, DirAdminOperation, DirAdminStage, EventBody,
+    IntentRecord, KeydOperation, OutcomeResult,
 };
 use keyd_types::{
     DecidedOperation, DecisionId, KeyHandle, KeyPurpose, Kvno, PrincipalId, MAX_KEY_DECISION_SECS,
@@ -550,6 +550,111 @@ impl KeyStep {
     }
 }
 
+impl KeyStep {
+    /// The `Approve` that completed its request's quorum, as a
+    /// [`QuorumStep`] — its `Decision` event and the decision to register —
+    /// or the step back (no decision, or no event to record it with).
+    /// Spec: docs/52 §4.3 (A-102), §3.11 R6 (a).
+    ///
+    /// # Errors
+    /// The step back (boxed: it is large) when it is not such an `Approve`.
+    pub fn into_quorum(self) -> Result<QuorumStep, Box<KeyStep>> {
+        match (self.events.first().cloned(), self.decision.clone()) {
+            (Some(event), Some(decision)) => Ok(QuorumStep {
+                event,
+                decision,
+                step: self,
+            }),
+            _ => Err(Box::new(self)),
+        }
+    }
+}
+
+/// The `Approve` that completed its request's quorum (A-102, docs/52 §4.3):
+/// its `Decision` event — its [`IntentRecord`], which auditd must
+/// acknowledge before dird registers the decision in keyd (A-85: no
+/// loosening of keyd without the PDP's decision durably recorded) — and the
+/// [`KeyDecision`]. dird's registration takes it only as an
+/// `ipc_audit::AckedIntent<QuorumStep>` (docs/52 §3.11 R6 (a)). Not `Clone`.
+/// Spec: docs/52 §4.3, §3.11 R6 (a); docs/51 §5.6, §5.7 item 2; A-85.
+#[derive(Debug, PartialEq, Eq)]
+pub struct QuorumStep {
+    event: DirAdminEvent,
+    decision: KeyDecision,
+    step: KeyStep,
+}
+
+impl QuorumStep {
+    /// The decision to register in keyd.
+    #[must_use]
+    pub fn decision(&self) -> &KeyDecision {
+        &self.decision
+    }
+
+    /// The reply.
+    #[must_use]
+    pub fn reply(&self) -> &KeyReply {
+        self.step.reply()
+    }
+
+    /// The `Outcome` event of the registration ([`KeyStep::registration_event`]).
+    #[must_use]
+    pub fn registration_event(&self, outcome: RegistrationOutcome) -> DirAdminEvent {
+        self.step.registration_event(outcome)
+    }
+}
+
+impl IntentRecord for QuorumStep {
+    /// The `Approve`'s `Decision` event.
+    /// Spec: docs/51 §5.7 item 2; docs/52 §4.3.
+    fn intent_event(&self) -> EventBody {
+        EventBody::DirAdmin(Box::new(self.event.clone()))
+    }
+}
+
+/// The principal of a deleted user or computer: a tombstone of the `user`
+/// class (users and computers — the objects with key sets, docs/47 §9.1)
+/// read from dird's store. Made only by
+/// [`DirectoryAdmin::destruction_target`] and
+/// [`DirectoryAdmin::destruction_targets`]; the only input from which dird
+/// registers a `DestroyKeySet` decision, so a destroy decision can name only
+/// an account whose `Delete` committed — after its decision event was
+/// acknowledged (A-85) — and never a live account ("harmless by
+/// construction: tombstones only", docs/52 §4.3). Not `Clone`.
+/// Spec: docs/52 §4.3, §3.11 R6; docs/51 §6, §9; A-18; docs/questions/Q-470
+/// (A-105: re-registration).
+#[derive(Debug, PartialEq, Eq)]
+pub struct TombstonedPrincipal {
+    guid: Guid,
+}
+
+impl TombstonedPrincipal {
+    /// The deleted object's GUID (its tombstone's key).
+    #[must_use]
+    pub fn guid(&self) -> Guid {
+        self.guid
+    }
+
+    /// The principal id of its key sets: the objectGUID's packet form
+    /// (docs/51 §5.5: keyd's handle of an account is its objectGUID).
+    #[must_use]
+    pub fn principal(&self) -> PrincipalId {
+        PrincipalId::from_bytes(self.guid.to_packet())
+    }
+}
+
+/// One page of [`DirectoryAdmin::destruction_targets`]: the tombstoned
+/// users and computers found, ascending by GUID, and where to resume.
+/// Spec: dirstore `TombstonePage`; docs/32 §8 (bounded paging).
+#[derive(Debug, PartialEq, Eq)]
+pub struct DestructionTargets {
+    /// The tombstones of the `user` class on this page.
+    pub targets: Vec<TombstonedPrincipal>,
+    /// `Some(g)`: records after `g` remain — pass it as `after`; `None`: the
+    /// listing is complete.
+    pub next: Option<Guid>,
+}
+
 /// The per-request inputs of a step.
 #[derive(Clone, Copy)]
 struct StepInputs<'t, 'v, 'a, 'p> {
@@ -998,14 +1103,47 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         &self,
         view: &DirectoryView<'_>,
         target: Guid,
-    ) -> Result<Option<PrincipalId>, AdminFailure> {
+    ) -> Result<Option<TombstonedPrincipal>, AdminFailure> {
         let tombstone = view
             .snapshot()
             .get_tombstone(target)
             .map_err(|_| AdminFailure::StoreFailure)?;
         Ok(tombstone
             .filter(|t| t.classes.contains(&self.ids.user.id))
-            .map(|t| PrincipalId::from_bytes(t.guid.to_packet())))
+            .map(|t| TombstonedPrincipal { guid: t.guid }))
+    }
+
+    /// One page of the tombstoned users and computers (classes include
+    /// `user`), strictly after `after`, ascending by GUID — at most `limit`
+    /// tombstones of any class examined per page, as dirstore bounds its own
+    /// listing — for dird's re-registration of destroy decisions keyd lost
+    /// (A-105, docs/questions/Q-470 item 4).
+    ///
+    /// # Errors
+    /// [`AdminFailure::StoreFailure`]-class failure of the snapshot read.
+    ///
+    /// Spec: docs/51 §6, §9; docs/52 §4.3 ("`RegisterPendingDestructions` —
+    /// dird registers for every tombstone of a user/computer, page by
+    /// page"); dirstore `Snapshot::tombstones`; A-18.
+    pub fn destruction_targets(
+        &self,
+        view: &DirectoryView<'_>,
+        after: Option<Guid>,
+        limit: usize,
+    ) -> Result<DestructionTargets, AdminFailure> {
+        let page = view
+            .snapshot()
+            .tombstones(after, limit)
+            .map_err(|_| AdminFailure::StoreFailure)?;
+        Ok(DestructionTargets {
+            targets: page
+                .tombstones
+                .into_iter()
+                .filter(|t| t.classes.contains(&self.ids.user.id))
+                .map(|t| TombstonedPrincipal { guid: t.guid })
+                .collect(),
+            next: page.next,
+        })
     }
 }
 

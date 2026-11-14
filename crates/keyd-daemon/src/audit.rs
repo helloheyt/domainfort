@@ -84,24 +84,35 @@
 //! into free slots while auditd is away (task P7 brief; docs/questions/Q-260
 //! item 2).
 //!
+//! # The proof, and the shared gate (docs/52 §3.11 R6, A-102)
+//!
+//! Step 3 is no longer the engine's discipline: keyd runs an admitted
+//! key-state change only through `ipc_keyd_server::execute_acknowledged`,
+//! which takes an `ipc_audit::AckedIntent<ipc_keyd_server::KeyStateCall>`
+//! by value — and [`AuditGate::wait_acknowledged`] is where it comes from:
+//! the shared `ipc_audit::AuditGate`, after auditd acknowledged that very
+//! call's intent record. Which calls need it is `ipc_keyd_server::classify`'s
+//! decision (from keyd's own authorization step), not this crate's. The
+//! window, the reachability, the acknowledgement wait and the stop's flush
+//! ([`AuditGate::close`]) are the shared gate's; this wrapper adds keyd's
+//! operation classification ([`is_gating`]), its record shape, the tokio
+//! wake-up of the audit client and the daemon's own count of lost
+//! outcomes.
+//!
 //! Spec: docs/50 R50-17, §8.1; docs/questions/Q-218 (A-57), Q-252 items 8, 9
 //! (A-64), Q-346 (A-86), Q-365, Q-366 (A-88), Q-395; docs/10 §10, I8;
 //! docs/37 §2 (D63: no code path disables audit for a sensitive operation),
-//! §5; docs/07 §8; docs/51 §5.7 item 2 (A-85).
+//! §5; docs/07 §8; docs/51 §5.7 item 2 (A-85); docs/52 §3.11 R6.
 
+use core::future::Future;
+use core::time::Duration;
 use ipc_audit::{
-    Ack, Append, EventBody, KeydOutcome, KeydReason, KeydRecord, Reservation, SendWindow,
-    WindowConfig, WindowError,
+    Ack, AckedIntent, Append, EventBody, FlushWait, KeydRecord, PendingIntent, Reservation,
+    Unflushed, WindowConfig, WindowError, WindowSteps,
 };
-use ipc_keyd::Call;
-use keyd::authz::HandleSlot;
-use keyd::{
-    AuditKeyRef, AuditOutcome, AuditReason, AuditRecord, AuditSink, CallerId, DecisionId,
-    DecisionIntent, KeyHandle, Kvno, Operation, PrincipalId,
-};
-use krb_proto::KerberosTime;
+use ipc_keyd_server::KeyStateCall;
+use keyd::{AuditRecord, AuditSink, Operation};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::Instant;
 use tokio::sync::Notify;
 
@@ -217,249 +228,61 @@ pub(crate) enum IntentRefused {
     NotRecorded,
 }
 
-/// A key-state change whose intent is in the window: the intent's sequence
-/// number, to wait for its acknowledgement, and the outcome's reserved slot.
-/// Finish it ([`AuditGate::finish_key_state_change`]) after keyd ran the
-/// operation, or abandon it ([`AuditGate::abandon_key_state_change`]) if the
-/// intent was not acknowledged in time.
-/// Spec: docs/questions/Q-346 (A-86), Q-365.
+/// A key-state change whose intent is in the window: the change waiting for
+/// auditd's acknowledgement ([`AuditGate::wait_acknowledged`]) and the
+/// outcome's reserved slot. Finish it ([`AuditGate::finish_key_state_change`])
+/// after keyd ran the change, or abandon it
+/// ([`AuditGate::abandon_key_state_change`]) if the intent was not
+/// acknowledged in time.
+/// Spec: docs/questions/Q-346 (A-86), Q-365; docs/52 §3.11 R6 (a).
+#[must_use = "the change must be waited for and its outcome slot filled"]
+#[derive(Debug)]
+pub(crate) struct PendingChange {
+    pending: PendingIntent<KeyStateCall>,
+    outcome: Reservation,
+}
+
+impl PendingChange {
+    /// The intent record's sequence number in the window (unit tests).
+    #[cfg(test)]
+    pub(crate) fn intent_seq(&self) -> u64 {
+        self.pending.seq()
+    }
+}
+
+/// The outcome slot of a key-state change whose intent was acknowledged (or
+/// not): filled by [`AuditGate::finish_key_state_change`] or
+/// [`AuditGate::abandon_key_state_change`].
 #[must_use = "the outcome slot must be filled"]
 #[derive(Debug)]
-pub(crate) struct PendingOutcome {
-    intent_seq: u64,
-    slot: Reservation,
-}
+pub(crate) struct OutcomeSlot(Reservation);
 
-impl PendingOutcome {
-    /// The intent record's sequence number in the window.
-    pub(crate) fn intent_seq(&self) -> u64 {
-        self.intent_seq
-    }
-}
-
-/// The non-secret identity of a key-state change, from which the daemon
-/// writes its intent and, if keyd never ran it, its not-performed outcome:
-/// the fields keyd's own record of the operation carries before keyd resolves
-/// anything — the time, the caller, the operation, the handle, the kvno a
-/// `retire_kvno` names, the approvers of a `rotate_krbtgt` (crates/keyd
-/// admin.rs, directory.rs: `AuditFields::for_handle`, then those two). No
-/// password, binding or key: the call's other arguments are not kept.
-///
-/// The same holds for `grant_set_secret` (task A15a), which loosens keyd's
-/// authorization and so takes the same path (`keyd::requires_acknowledged_intent`):
-/// its first key target is the record's handle, its second (a computer's
-/// `Service` key set) the record's secondary key, as keyd's own record of it
-/// (crates/keyd decision.rs); no binding and no lifetime.
-///
-/// **A-102 (docs/52 §4.5):** `register_decision` takes the same path (it
-/// loosens keyd): the record names the decided key sets, the kvno a
-/// `RetireKvno` decision names, the first two approvers and the decision
-/// id. An **execution** of a decision (`rotate_key`, `rotate_krbtgt`,
-/// `retire_kvno`, `destroy_key_set`) names only its id: its intent is built
-/// from keyd's own table ([`KeyStateIntent::decided`],
-/// `keyd::Keyd::decided_intent`) — never from the request.
-///
-/// Spec: docs/10 §10 (`{ ts, caller_role, caller_uid, op, principal,
-/// purpose, kvno, result }`), §12 I8; docs/questions/Q-346 (A-86), Q-365,
-/// Q-452 item 1; docs/52 §4.5.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct KeyStateIntent {
-    ts: KerberosTime,
-    caller: CallerId,
-    op: Operation,
-    /// The handle in the operation's `Primary` slot (`None` only for a grant
-    /// that names no key target — keyd refuses it as its outcome).
-    primary: Option<KeyHandle>,
-    /// A grant's second key target (`Secondary` slot).
-    secondary: Option<KeyHandle>,
-    kvno: Option<Kvno>,
-    approvers: Option<[PrincipalId; 2]>,
-    /// The decision registered or run (A-102).
-    decision: Option<DecisionId>,
-}
-
-impl KeyStateIntent {
-    /// The intent of `call` by `caller` at `now` if `call` needs one and
-    /// names its parameters itself — `set_secret`, `create_key`,
-    /// `grant_set_secret`, `register_decision` — else `None`. An execution of
-    /// a decision names only its id: its intent is
-    /// [`KeyStateIntent::decided`]. The match is exhaustive over [`Call`]: a
-    /// new call does not compile until it is classified here. The engine
-    /// checks this against `keyd::requires_acknowledged_intent` and refuses
-    /// (fail closed) when they disagree.
-    ///
-    /// Spec: docs/10 §6, §7; docs/questions/Q-346 (A-86), Q-452 item 1;
-    /// docs/52 §4.5 (A-102).
-    pub(crate) fn of(caller: CallerId, now: KerberosTime, call: &Call) -> Option<KeyStateIntent> {
-        let (op, primary, secondary, kvno, approvers, decision) = match call {
-            Call::SetSecret { handle, .. } => {
-                (Operation::SetSecret, Some(*handle), None, None, None, None)
-            }
-            Call::CreateKey { handle, .. } => {
-                (Operation::CreateKey, Some(*handle), None, None, None, None)
-            }
-            Call::GrantSetSecret { targets, .. } => (
-                Operation::GrantSetSecret,
-                targets.first().map(|t| t.handle),
-                targets.get(1).map(|t| t.handle),
-                None,
-                None,
-                None,
-            ),
-            Call::RegisterDecision {
-                id,
-                operation,
-                approvers,
-                ..
-            } => (
-                Operation::RegisterDecision,
-                operation.primary(),
-                operation.secondary(),
-                operation.kvno(),
-                match approvers.as_slice() {
-                    [first, second, ..] => Some([*first, *second]),
-                    _ => None,
-                },
-                Some(*id),
-            ),
-            Call::RotateKey { .. }
-            | Call::RotateKrbtgt { .. }
-            | Call::RetireKvno { .. }
-            | Call::DestroyKeySet { .. }
-            | Call::VerifyPreauth { .. }
-            | Call::IssueAsRep { .. }
-            | Call::OpenFastArmor { .. }
-            | Call::OpenAndVerifyTgt { .. }
-            | Call::IssueTgsRep { .. }
-            | Call::SealFastError { .. }
-            | Call::OpenAndVerifyServiceTicket { .. }
-            | Call::VerifySecret { .. }
-            | Call::DescribeConfig
-            | Call::Ping
-            | Call::SealCeremony
-            | Call::ListDestroyDecisions { .. } => return None,
-        };
-        Some(KeyStateIntent {
-            ts: now,
-            caller,
-            op,
-            primary,
-            secondary,
-            kvno,
-            approvers,
-            decision,
-        })
-    }
-
-    /// This intent naming `decision` — the set-secret decision a
-    /// `set_secret` will consume, as keyd's table names it
-    /// (`keyd::Keyd::secret_decision`; docs/52 §4.5).
-    #[must_use]
-    pub(crate) fn with_decision(self, decision: Option<DecisionId>) -> KeyStateIntent {
-        KeyStateIntent { decision, ..self }
-    }
-
-    /// The intent of executing a decision with `op` by `caller` at `now`,
-    /// from the facts keyd's own table holds (`keyd::Keyd::decided_intent`;
-    /// A-102, docs/52 §4.5): the decided key sets, kvno and approvers, and
-    /// the decision id.
-    /// Spec: docs/52 §4.2, §4.5; docs/questions/Q-346 (A-86).
-    pub(crate) fn decided(
-        caller: CallerId,
-        now: KerberosTime,
-        op: Operation,
-        facts: &DecisionIntent,
-    ) -> KeyStateIntent {
-        KeyStateIntent {
-            ts: now,
-            caller,
-            op,
-            primary: facts.primary,
-            secondary: facts.secondary,
-            kvno: facts.kvno,
-            approvers: facts.approvers,
-            decision: Some(facts.decision),
-        }
-    }
-
-    /// The operation.
-    pub(crate) fn op(&self) -> Operation {
-        self.op
-    }
-
-    /// The handles the operation acts on, in their slots — for keyd's
-    /// authorization step (`keyd::Keyd::admits`): the `Primary` handle, and a
-    /// grant's `Secondary` one. None for `register_decision`, whose
-    /// authorization step is the role alone (keyd judges the decided key
-    /// sets' purposes inside the operation, A-102).
-    /// Spec: docs/10 §2 (I3); docs/questions/Q-452 item 1; docs/52 §4.2.
-    pub(crate) fn handles(&self) -> Vec<(HandleSlot, &KeyHandle)> {
-        if self.op == Operation::RegisterDecision {
-            return Vec::new();
-        }
-        let mut handles = Vec::with_capacity(2);
-        if let Some(primary) = &self.primary {
-            handles.push((HandleSlot::Primary, primary));
-        }
-        if let Some(secondary) = &self.secondary {
-            handles.push((HandleSlot::Secondary, secondary));
-        }
-        handles
-    }
-
-    /// The wire record of this change in `phase` (`Intent` or
-    /// `NotPerformed`): keyd's record layout, filled as keyd fills its own
-    /// record of the operation and converted by ipc-audit; its outcome is the
-    /// phase and its reason `None` (ipc-audit `KeydOutcome`: the phases are
-    /// the daemon's codes, not keyd's).
-    ///
-    /// Spec: docs/10 §10; docs/questions/Q-346 (A-86), Q-365.
-    pub(crate) fn event(&self, phase: KeydOutcome) -> EventBody {
-        let record = AuditRecord {
-            ts: self.ts,
-            caller_role: self.caller.role,
-            caller_uid: self.caller.uid,
-            op: self.op,
-            principal: self.primary.map(|h| h.principal),
-            purpose: self.primary.map(|h| h.purpose),
-            kvno: self.kvno,
-            secondary: self.secondary.map(|h| AuditKeyRef {
-                principal: h.principal,
-                purpose: h.purpose,
-                kvno: None,
-            }),
-            approvers: self.approvers,
-            decision: self.decision,
-            // keyd has no phase outcome; replaced by `phase` below.
-            result: AuditOutcome::Success,
-            reason: AuditReason::None,
-        };
-        let mut wire = KeydRecord::from(&record);
-        wire.result = phase;
-        wire.reason = KeydReason::None;
-        EventBody::Keyd(Box::new(wire))
-    }
-}
-
-/// The window and the audit client's view of auditd.
+/// How the wait for a key-state change's intent ended
+/// ([`AuditGate::wait_acknowledged`]).
+/// Spec: docs/questions/Q-365 items 5, 8 (A-88); docs/52 §3.11 R6 (a).
+#[must_use = "the outcome slot must be filled"]
 #[derive(Debug)]
-struct GateState {
-    window: SendWindow,
-    reachable: bool,
+pub(crate) enum Waited {
+    /// auditd acknowledged the intent: the proof keyd's change needs.
+    Acknowledged(AckedIntent<KeyStateCall>, OutcomeSlot),
+    /// Not acknowledged by the deadline: no proof — the change back, to be
+    /// abandoned (`NotPerformed`), never run.
+    NotAcknowledged(KeyStateCall, OutcomeSlot),
 }
 
-/// Shared by the engine thread (admit, record) and the audit client task
-/// (batches, acknowledgements, reachability).
+/// Shared by the engine thread (admit, record, the intent path) and the
+/// audit client task (batches, acknowledgements, reachability): the shared
+/// `ipc_audit::AuditGate` (module documentation), keyd's operation
+/// classification, the tokio wake-up of the audit client, and the daemon's
+/// own total of lost outcomes.
 ///
-/// Spec: docs/50 R50-17, §8.1; docs/questions/Q-218 (A-57).
+/// Spec: docs/50 R50-17, §8.1; docs/questions/Q-218 (A-57); docs/52 §3.11
+/// R6.
 #[derive(Debug)]
 pub(crate) struct AuditGate {
-    state: Mutex<GateState>,
+    core: ipc_audit::AuditGate,
     /// Wakes the audit client when an event was committed.
     wake: Notify,
-    /// Wakes the engine thread waiting for an intent's acknowledgement
-    /// (A-86); paired with `state`.
-    acked: Condvar,
     /// Outcome records of key-state changes that could not be committed
     /// since start (A-86: the gap is counted) — the daemon's running total
     /// for stderr; each is also counted into the window's next summary
@@ -477,20 +300,10 @@ impl AuditGate {
     /// audit client says otherwise (fail closed).
     pub(crate) fn new(window: WindowConfig) -> AuditGate {
         AuditGate {
-            state: Mutex::new(GateState {
-                window: SendWindow::new(window),
-                reachable: false,
-            }),
+            core: ipc_audit::AuditGate::new(window),
             wake: Notify::new(),
-            acked: Condvar::new(),
             unrecorded: AtomicU64::new(0),
         }
-    }
-
-    /// The state, or `None` if a holder panicked (treated as "audit not
-    /// available": gating operations are refused).
-    fn lock(&self) -> Option<MutexGuard<'_, GateState>> {
-        self.state.lock().ok()
     }
 
     /// Admit `operation` before keyd runs it: a gating operation reserves a
@@ -501,15 +314,14 @@ impl AuditGate {
         if !is_gating(operation) {
             return Ok(Admission::NotGating);
         }
-        let mut state = self.lock().ok_or(GateClosed)?;
-        if !state.reachable {
-            return Err(GateClosed);
+        self.core.reserve().map(Admission::Gating).ok_or(GateClosed)
+    }
+
+    /// Give back the slot of an operation keyd did not run.
+    pub(crate) fn release(&self, admission: Admission) {
+        if let Admission::Gating(reservation) = admission {
+            self.core.release(reservation);
         }
-        state
-            .window
-            .reserve()
-            .map(Admission::Gating)
-            .map_err(|_| GateClosed)
     }
 
     /// Put the records of the operation that just ran into the window: the
@@ -528,24 +340,19 @@ impl AuditGate {
         records: &[AuditRecord],
         overflowed: bool,
     ) -> Result<(), RecordLost> {
-        let result = match self.lock() {
-            Some(mut state) => match admission {
-                Admission::Gating(reservation) => {
-                    Self::commit_all(&mut state.window, reservation, records, overflowed)
+        let result = match admission {
+            Admission::Gating(reservation) => self
+                .core
+                .with_steps(|steps| Self::commit_all(steps, reservation, records, overflowed))
+                .unwrap_or(Err(RecordLost)),
+            Admission::NotGating => {
+                for record in records {
+                    // Queued within the noise share, or counted for the
+                    // next summary; an encoding failure is counted too.
+                    self.core.offer_noise(&event_of(record));
                 }
-                Admission::NotGating => {
-                    for record in records {
-                        // Queued within the noise share, or counted for the
-                        // next summary; an encoding failure is counted too.
-                        let _ = state.window.offer_noise(&event_of(record));
-                    }
-                    Ok(())
-                }
-            },
-            None => match admission {
-                Admission::Gating(_) => Err(RecordLost),
-                Admission::NotGating => Ok(()),
-            },
+                Ok(())
+            }
         };
         self.wake.notify_one();
         result
@@ -554,7 +361,7 @@ impl AuditGate {
     /// Commit the records of a gating operation. Spec: docs/10 I8;
     /// docs/questions/Q-252 item 9.
     fn commit_all(
-        window: &mut SendWindow,
+        steps: &mut WindowSteps<'_>,
         reservation: Reservation,
         records: &[AuditRecord],
         overflowed: bool,
@@ -562,15 +369,15 @@ impl AuditGate {
         let mut records = records.iter();
         let Some(first) = records.next() else {
             // keyd emitted no record (I8 broken): no unaudited result leaves.
-            window.release(reservation);
+            steps.release(reservation);
             return Err(RecordLost);
         };
-        window
+        steps
             .commit(reservation, &event_of(first))
             .map_err(|_| RecordLost)?;
         for extra in records {
-            let slot = window.reserve().map_err(|_| RecordLost)?;
-            window
+            let slot = steps.reserve().map_err(|_| RecordLost)?;
+            steps
                 .commit(slot, &event_of(extra))
                 .map_err(|_| RecordLost)?;
         }
@@ -582,8 +389,8 @@ impl AuditGate {
 
     /// Start a key-state change (module documentation, step 1): with auditd
     /// reachable, reserve the intent's and the outcome's slots — both or
-    /// neither — and commit `intent` into the first; then wake the audit
-    /// client to send it.
+    /// neither — and commit `change`'s intent record into the first; then
+    /// wake the audit client to send it.
     ///
     /// # Errors
     /// [`IntentRefused::GateClosed`] (auditd unreachable, or fewer than two
@@ -592,16 +399,23 @@ impl AuditGate {
     /// left reserved or committed on an error.
     ///
     /// Spec: docs/questions/Q-346 (A-86), Q-365; Q-218 (A-57), Q-252 item 8
-    /// (A-64).
+    /// (A-64); docs/52 §3.11 R6 (a).
     pub(crate) fn begin_key_state_change(
         &self,
-        intent: &EventBody,
-    ) -> Result<PendingOutcome, IntentRefused> {
-        let result = match self.lock() {
-            None => Err(IntentRefused::GateClosed),
-            Some(mut state) => {
-                let reachable = state.reachable;
-                Self::reserve_and_commit_intent(&mut state.window, reachable, intent)
+        change: KeyStateCall,
+    ) -> Result<PendingChange, IntentRefused> {
+        let Some(slots) = self.core.reserve_all(2) else {
+            return Err(IntentRefused::GateClosed);
+        };
+        let mut slots = slots.into_iter();
+        let (Some(intent), Some(outcome)) = (slots.next(), slots.next()) else {
+            return Err(IntentRefused::GateClosed);
+        };
+        let result = match self.core.begin_intent(intent, change) {
+            Ok(pending) => Ok(PendingChange { pending, outcome }),
+            Err(_) => {
+                self.core.release(outcome);
+                Err(IntentRefused::NotRecorded)
             }
         };
         if result.is_ok() {
@@ -610,65 +424,32 @@ impl AuditGate {
         result
     }
 
-    /// The two reservations and the intent's commit, under one lock.
-    /// Spec: docs/questions/Q-346 (A-86).
-    fn reserve_and_commit_intent(
-        window: &mut SendWindow,
-        reachable: bool,
-        intent: &EventBody,
-    ) -> Result<PendingOutcome, IntentRefused> {
-        if !reachable {
-            return Err(IntentRefused::GateClosed);
-        }
-        let intent_slot = window.reserve().map_err(|_| IntentRefused::GateClosed)?;
-        let slot = match window.reserve() {
-            Ok(slot) => slot,
-            Err(_) => {
-                window.release(intent_slot);
-                return Err(IntentRefused::GateClosed);
-            }
-        };
-        match window.commit(intent_slot, intent) {
-            Ok(intent_seq) => Ok(PendingOutcome { intent_seq, slot }),
-            Err(_) => {
-                window.release(slot);
-                Err(IntentRefused::NotRecorded)
-            }
-        }
-    }
-
-    /// Wait until auditd acknowledged the event numbered `seq` — persisted
-    /// it (docs/50 §8.1: `Ack` only after the sync) — or `deadline` passed.
-    /// Acknowledgements are cumulative and in order (one batch in flight,
-    /// oldest first), so `seq` is acknowledged once the last `Ack` reaches
-    /// it. A gate whose lock is poisoned answers `false` (fail closed).
-    ///
-    /// Blocks the calling thread (the engine's) on a condition variable that
-    /// [`AuditGate::acknowledge`] signals; never past `deadline`.
+    /// Wait until auditd acknowledged the intent of `pending` — persisted it
+    /// (docs/50 §8.1) — or `deadline` passed: the proof keyd's change needs
+    /// (`ipc_keyd_server::execute_acknowledged`) with the outcome slot, or
+    /// the change back without a proof (it is then abandoned, not run). A
+    /// gate whose lock is poisoned gives no proof (fail closed). Blocks the
+    /// engine thread on the shared gate's condition variable; never past
+    /// `deadline`.
     ///
     /// Spec: docs/questions/Q-346 (A-86: "the record of the intent is
     /// acknowledged by auditd before the mutation"), Q-365; docs/50 §3.6
-    /// (bounded waits), §8.1.
-    pub(crate) fn wait_acknowledged(&self, seq: u64, deadline: Instant) -> bool {
-        let Some(mut state) = self.lock() else {
-            return false;
-        };
-        loop {
-            if state
-                .window
-                .last_ack()
-                .is_some_and(|ack| ack.through_seq >= seq)
-            {
-                return true;
-            }
-            let left = match deadline.checked_duration_since(Instant::now()) {
-                Some(left) if !left.is_zero() => left,
-                _ => return false,
-            };
-            state = match self.acked.wait_timeout(state, left) {
-                Ok((guard, _)) => guard,
-                Err(_) => return false,
-            };
+    /// (bounded waits), §8.1; docs/52 §3.11 R6 (a).
+    pub(crate) fn wait_acknowledged(&self, pending: PendingChange, deadline: Instant) -> Waited {
+        let PendingChange { pending, outcome } = pending;
+        match self.core.wait_acknowledged(pending, deadline) {
+            Ok(acked) => Waited::Acknowledged(acked, OutcomeSlot(outcome)),
+            Err(change) => Waited::NotAcknowledged(change, OutcomeSlot(outcome)),
+        }
+    }
+
+    /// A change whose wait could not even start (its deadline cannot be
+    /// represented): no proof, the change back (fail closed).
+    pub(crate) fn give_up(&self, pending: PendingChange) -> (KeyStateCall, OutcomeSlot) {
+        match self.wait_acknowledged(pending, Instant::now()) {
+            // Already acknowledged: still not run — the caller abandons it.
+            Waited::Acknowledged(acked, slot) => (acked.into_inner(), slot),
+            Waited::NotAcknowledged(change, slot) => (change, slot),
         }
     }
 
@@ -687,18 +468,18 @@ impl AuditGate {
     /// Spec: docs/questions/Q-346 (A-86), Q-365, Q-366 (A-88); docs/10 I8.
     pub(crate) fn finish_key_state_change(
         &self,
-        pending: PendingOutcome,
+        slot: OutcomeSlot,
         records: &[AuditRecord],
         overflowed: bool,
     ) -> Result<(), RecordLost> {
-        let PendingOutcome { slot, .. } = pending;
-        let result = match self.lock() {
-            Some(mut state) => {
-                let committed = Self::commit_all(&mut state.window, slot, records, overflowed);
-                Self::count_if_lost(&mut state.window, committed)
-            }
-            None => Err(RecordLost),
-        };
+        let OutcomeSlot(reservation) = slot;
+        let result = self
+            .core
+            .with_steps(|steps| {
+                let committed = Self::commit_all(steps, reservation, records, overflowed);
+                Self::count_if_lost(steps, committed)
+            })
+            .unwrap_or(Err(RecordLost));
         self.settle_outcome(result)
     }
 
@@ -713,21 +494,20 @@ impl AuditGate {
     /// Unavailable, and nothing changed"), Q-365.
     pub(crate) fn abandon_key_state_change(
         &self,
-        pending: PendingOutcome,
+        slot: OutcomeSlot,
         not_performed: &EventBody,
     ) -> Result<(), RecordLost> {
-        let PendingOutcome { slot, .. } = pending;
-        let result = match self.lock() {
-            Some(mut state) => {
-                let committed = state
-                    .window
-                    .commit(slot, not_performed)
+        let OutcomeSlot(reservation) = slot;
+        let result = self
+            .core
+            .with_steps(|steps| {
+                let committed = steps
+                    .commit(reservation, not_performed)
                     .map(|_| ())
                     .map_err(|_| RecordLost);
-                Self::count_if_lost(&mut state.window, committed)
-            }
-            None => Err(RecordLost),
-        };
+                Self::count_if_lost(steps, committed)
+            })
+            .unwrap_or(Err(RecordLost));
         self.settle_outcome(result)
     }
 
@@ -739,11 +519,11 @@ impl AuditGate {
     /// Spec: decision A-88 (a lost-outcome count in the shared summary);
     /// docs/questions/Q-366 option (a), Q-395.
     fn count_if_lost(
-        window: &mut SendWindow,
+        steps: &mut WindowSteps<'_>,
         result: Result<(), RecordLost>,
     ) -> Result<(), RecordLost> {
         if result.is_err() {
-            window.count_unrecorded_outcome();
+            steps.count_unrecorded_outcome();
         }
         result
     }
@@ -768,23 +548,24 @@ impl AuditGate {
 
     /// Record the audit client's view of auditd.
     pub(crate) fn set_reachable(&self, reachable: bool) {
-        if let Some(mut state) = self.lock() {
-            state.reachable = reachable;
-        }
+        self.core.set_reachable(reachable);
     }
 
-    /// Whether auditd is reachable (the audit client's view).
+    /// Whether auditd is reachable (the audit client's view; tests — the
+    /// stop's rule reads it inside the shared gate).
+    #[cfg(test)]
     pub(crate) fn is_reachable(&self) -> bool {
-        self.lock().is_some_and(|state| state.reachable)
+        self.core.is_reachable()
     }
 
     /// The next batch to send, if nothing is in flight and anything is
     /// pending. Spec: docs/50 §3.6, §8.1.
     pub(crate) fn next_batch(&self) -> Option<Append> {
-        self.lock().and_then(|mut state| state.window.next_batch())
+        self.core.next_batch()
     }
 
-    /// auditd's acknowledgement of the batch in flight.
+    /// auditd's acknowledgement of the batch in flight; wakes the engine
+    /// thread waiting for an intent's acknowledgement (A-86).
     ///
     /// # Errors
     /// The window's [`WindowError`] (an acknowledgement that does not match;
@@ -792,34 +573,41 @@ impl AuditGate {
     ///
     /// Spec: docs/50 §8.1.
     pub(crate) fn acknowledge(&self, ack: &Ack) -> Result<usize, WindowError> {
-        let result = match self.lock() {
-            Some(mut state) => state.window.acknowledge(ack),
-            None => Err(WindowError::UnexpectedAck),
-        };
-        if result.is_ok() {
-            // The engine thread may be waiting for this acknowledgement
-            // (A-86, `wait_acknowledged`).
-            self.acked.notify_all();
-        }
-        result
+        self.core.acknowledge(ack)
     }
 
     /// The audit connection dropped: the batch in flight goes back to the
     /// front. Spec: docs/50 §3.7, §8.1.
     pub(crate) fn connection_lost(&self) {
-        if let Some(mut state) = self.lock() {
-            state.window.connection_lost();
-        }
+        self.core.connection_lost();
     }
 
-    /// Events not yet acknowledged plus outstanding reservations.
+    /// Events not yet acknowledged plus outstanding reservations (tests —
+    /// the stop's report comes from the shared gate's close).
+    #[cfg(test)]
     pub(crate) fn outstanding(&self) -> usize {
-        self.lock().map_or(0, |state| {
-            state
-                .window
-                .unacknowledged()
-                .saturating_add(usize::try_from(state.window.reserved()).unwrap_or(usize::MAX))
-        })
+        self.core.outstanding()
+    }
+
+    /// The stop's flush (`ipc_audit::AuditGate::close`): keyd stops waiting
+    /// as soon as its link counts auditd as unreachable
+    /// (`FlushWait::UntilAcknowledgedOrUnreachable` — the rule A-87 kept for
+    /// keyd), then ends the link (`end_link`), then reports what is left.
+    /// Spec: docs/questions/Q-313 (A-82), Q-350 item 11 (A-87); docs/52
+    /// §3.11 R6 (b).
+    pub(crate) async fn close<E: Future<Output = ()>>(
+        &self,
+        grace: Duration,
+        end_link: E,
+    ) -> Unflushed {
+        self.core
+            .close(
+                grace,
+                FlushWait::UntilAcknowledgedOrUnreachable,
+                tokio::time::sleep,
+                end_link,
+            )
+            .await
     }
 
     /// Wait until an event was committed (or a stored wake-up is pending).
@@ -827,16 +615,20 @@ impl AuditGate {
         self.wake.notified().await;
     }
 
-    /// Run `f` on the window (unit tests).
+    /// Read the window (unit tests).
     #[cfg(test)]
-    pub(crate) fn with_window<T>(&self, f: impl FnOnce(&mut SendWindow) -> T) -> Option<T> {
-        self.lock().map(|mut state| f(&mut state.window))
+    pub(crate) fn inspect<T>(&self, read: impl FnOnce(&ipc_audit::SendWindow) -> T) -> Option<T> {
+        self.core.inspect(read)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ipc_audit::KeydOutcome;
+    use ipc_keyd::Call;
+    use ipc_keyd_server::{classify, Classified};
+    use keyd::{CallerId, KeyHandle, PrincipalId};
 
     /// docs/10 §7א (`describe_config`, `ping`: no key, no secret) and A-57 /
     /// A-64 (every operation that touches a key, token or secret gates).
@@ -907,9 +699,11 @@ mod tests {
         assert_eq!(buffer.take(), (Vec::new(), false));
     }
 
-    /// An intent built for these tests: `create_key` by the admin (uid 807)
-    /// on a PrincipalLongterm handle.
-    fn intent() -> EventBody {
+    /// A key-state change built for these tests: `create_key` by the admin
+    /// (uid 807) on a PrincipalLongterm handle, classified against the
+    /// development keyd (admitted: Provisioning, the Admin role, the
+    /// purpose).
+    fn change() -> KeyStateCall {
         let call = Call::CreateKey {
             handle: KeyHandle::new(
                 PrincipalId::from_bytes([0xA1; 16]),
@@ -927,10 +721,16 @@ mod tests {
             uid: 807,
             role: keyd::Role::Admin,
         };
+        let started = krb_proto::KerberosTime::new(2026, 11, 13, 9, 0, 0).unwrap();
         let now = krb_proto::KerberosTime::new(2026, 11, 13, 10, 0, 0).unwrap();
-        KeyStateIntent::of(caller, now, &call)
-            .unwrap()
-            .event(KeydOutcome::Intent)
+        let keyd = crate::startup::development_keyd(krb_proto::Realm::new("EXAMPLE.ORG").unwrap())(
+            &started,
+        )
+        .unwrap();
+        match classify(&keyd, caller, now, call) {
+            Classified::KeyStateChange(change) => change,
+            other => panic!("{other:?}"),
+        }
     }
 
     /// A-86 step 1: a key-state change takes its two slots (intent and
@@ -940,25 +740,23 @@ mod tests {
     fn a_key_state_change_takes_two_slots_or_none() {
         let gate = AuditGate::new(WindowConfig::new(2, 1).unwrap());
         assert_eq!(
-            gate.begin_key_state_change(&intent()).map(|_| ()),
+            gate.begin_key_state_change(change()).map(|_| ()),
             Err(IntentRefused::GateClosed)
         );
         gate.set_reachable(true);
         let first = gate.admit(Operation::VerifySecret).unwrap();
         assert_eq!(
-            gate.begin_key_state_change(&intent()).map(|_| ()),
+            gate.begin_key_state_change(change()).map(|_| ()),
             Err(IntentRefused::GateClosed)
         );
         assert_eq!(gate.outstanding(), 1, "only the other operation's slot");
-        let Admission::Gating(first) = first else {
-            panic!("gating");
-        };
-        gate.with_window(|window| window.release(first));
-        let pending = gate.begin_key_state_change(&intent()).unwrap();
+        gate.release(first);
+        let pending = gate.begin_key_state_change(change()).unwrap();
         assert_eq!(pending.intent_seq(), 1);
         assert_eq!(gate.outstanding(), 2, "the intent and the outcome's slot");
+        let (_change, slot) = gate.give_up(pending);
         assert_eq!(
-            gate.finish_key_state_change(pending, &[], false),
+            gate.finish_key_state_change(slot, &[], false),
             Err(RecordLost)
         );
         assert_eq!(gate.unrecorded_outcomes(), 1, "the gap is counted");
@@ -966,7 +764,7 @@ mod tests {
         // A-88: and into the window's next summary, after the intent (the
         // summary takes the slot the lost outcome left free).
         assert_eq!(
-            gate.with_window(|window| window.unrecorded_outcomes()),
+            gate.inspect(ipc_audit::SendWindow::unrecorded_outcomes),
             Some(1)
         );
         let append = gate.next_batch().unwrap();
@@ -989,16 +787,25 @@ mod tests {
         );
     }
 
-    /// A-86 step 2: `wait_acknowledged` returns once auditd acknowledged the
-    /// intent — signalled from another thread, as the audit client does —
-    /// and returns `false` at the deadline otherwise.
+    /// A-86 step 2 / docs/52 R6 (a): `wait_acknowledged` gives the proof
+    /// once auditd acknowledged the intent — signalled from another thread,
+    /// as the audit client does — and the change back, without a proof, at
+    /// the deadline otherwise.
     #[test]
-    fn the_wait_ends_at_the_acknowledgement_or_the_deadline() {
+    fn the_proof_comes_only_with_the_acknowledgement() {
         let gate = std::sync::Arc::new(AuditGate::new(WindowConfig::DEFAULT));
         gate.set_reachable(true);
-        let pending = gate.begin_key_state_change(&intent()).unwrap();
+        let pending = gate.begin_key_state_change(change()).unwrap();
         let soon = Instant::now() + core::time::Duration::from_millis(50);
-        assert!(!gate.wait_acknowledged(pending.intent_seq(), soon));
+        let Waited::NotAcknowledged(change, slot) = gate.wait_acknowledged(pending, soon) else {
+            panic!("not acknowledged");
+        };
+        assert_eq!(change.operation(), Operation::CreateKey);
+        assert_eq!(
+            gate.abandon_key_state_change(slot, &change.not_performed_event()),
+            Ok(())
+        );
+        let pending = gate.begin_key_state_change(change).unwrap();
         let auditd = {
             let gate = std::sync::Arc::clone(&gate);
             std::thread::spawn(move || {
@@ -1012,13 +819,15 @@ mod tests {
             })
         };
         let later = Instant::now() + core::time::Duration::from_secs(10);
-        assert!(gate.wait_acknowledged(pending.intent_seq(), later));
+        let Waited::Acknowledged(acked, slot) = gate.wait_acknowledged(pending, later) else {
+            panic!("acknowledged");
+        };
         auditd.join().unwrap();
-        let not_performed = intent();
+        assert_eq!(acked.get().operation(), Operation::CreateKey);
         assert_eq!(
-            gate.abandon_key_state_change(pending, &not_performed),
-            Ok(())
+            gate.finish_key_state_change(slot, &[], false),
+            Err(RecordLost)
         );
-        assert_eq!(gate.unrecorded_outcomes(), 0);
+        assert_eq!(gate.unrecorded_outcomes(), 1);
     }
 }

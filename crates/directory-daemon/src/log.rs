@@ -100,6 +100,16 @@ pub enum Note {
     /// a re-registration (docs/questions/Q-470). The id is the failure's
     /// class as above, 4 when the tombstone could not be read.
     AdminDestroyNotRegistered,
+    /// The re-registration of lost destroy decisions (A-105) registered
+    /// decisions keyd did not hold for tombstoned users or computers. The id
+    /// is how many.
+    AdminDestroyReregistered,
+    /// A re-registration run stopped early; it runs again at the next
+    /// interval (A-105). The id is the class: 1 keyd's listing failed, 2 a
+    /// registration was not performed or its outcome is unknown, 3 keyd
+    /// refused one as unavailable (its table full), 4 the tombstones could
+    /// not be read.
+    AdminDestroyReconcileStopped,
     /// Stopped.
     Stopped,
 }
@@ -158,6 +168,12 @@ impl Note {
             Note::AdminDestroyNotRegistered => {
                 "account deleted but keyd did not register its destroy decision (key sets \
                  unreachable, awaiting re-registration); failure class"
+            }
+            Note::AdminDestroyReregistered => {
+                "destroy decisions keyd had lost registered again for deleted accounts; count"
+            }
+            Note::AdminDestroyReconcileStopped => {
+                "re-registration of destroy decisions stopped early (runs again later); class"
             }
             Note::Stopped => "stopped",
         }

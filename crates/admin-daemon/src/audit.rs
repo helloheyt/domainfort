@@ -26,8 +26,11 @@
 //! Spec: docs/51 §5.7 (R51-12); docs/50 R50-17, §8.1; docs/questions Q-218
 //! (A-57), Q-252 items 8, 9 (A-64), Q-340 items 6-8 (A-85).
 
-use ipc_audit::{Ack, AdmindEvent, Append, EventBody, Reservation, SendWindow, WindowConfig};
-use std::sync::{Mutex, MutexGuard};
+use core::future::Future;
+use core::time::Duration;
+use ipc_audit::{
+    Ack, AdmindEvent, Append, EventBody, FlushWait, Reservation, Unflushed, WindowConfig,
+};
 use tokio::sync::Notify;
 
 /// An event could not be put into its reserved slot (cannot happen for an
@@ -36,18 +39,16 @@ use tokio::sync::Notify;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordLost;
 
-#[derive(Debug)]
-struct GateState {
-    window: SendWindow,
-    reachable: bool,
-}
-
 /// Shared by the admin listener (noise), the worker (reserve, commit) and
-/// the audit client task (batches, acknowledgements, reachability).
-/// Spec: docs/50 R50-17, §8.1; docs/questions/Q-218 (A-57).
+/// the audit client task (batches, acknowledgements, reachability): the
+/// shared `ipc_audit::AuditGate` (its window, the reachability, the stop's
+/// flush — docs/52 §3.11 R6) plus admind's event shape and the tokio
+/// wake-up of the audit client.
+/// Spec: docs/50 R50-17, §8.1; docs/questions/Q-218 (A-57); docs/52 §3.11
+/// R6.
 #[derive(Debug)]
 pub struct AuditGate {
-    state: Mutex<GateState>,
+    core: ipc_audit::AuditGate,
     wake: Notify,
 }
 
@@ -57,28 +58,16 @@ impl AuditGate {
     #[must_use]
     pub fn new(window: WindowConfig) -> AuditGate {
         AuditGate {
-            state: Mutex::new(GateState {
-                window: SendWindow::new(window),
-                reachable: false,
-            }),
+            core: ipc_audit::AuditGate::new(window),
             wake: Notify::new(),
         }
-    }
-
-    /// The state, or `None` if a holder panicked (no slot: fail closed).
-    fn lock(&self) -> Option<MutexGuard<'_, GateState>> {
-        self.state.lock().ok()
     }
 
     /// Reserve the slot of a gating event, or `None` (auditd unreachable,
     /// the window full — counted for the next `WindowSummary`).
     /// Spec: docs/questions/Q-218 (A-57), Q-252 item 8 (A-64).
     pub fn reserve(&self) -> Option<Reservation> {
-        let mut state = self.lock()?;
-        if !state.reachable {
-            return None;
-        }
-        state.window.reserve().ok()
+        self.core.reserve()
     }
 
     /// Put a gating event into its reserved slot, and wake the audit client.
@@ -88,13 +77,10 @@ impl AuditGate {
     ///
     /// Spec: docs/questions/Q-252 item 9 ("commit, then reply").
     pub fn commit(&self, reservation: Reservation, event: &AdmindEvent) -> Result<u64, RecordLost> {
-        let result = match self.lock() {
-            Some(mut state) => state
-                .window
-                .commit(reservation, &EventBody::Admind(Box::new(event.clone())))
-                .map_err(|_| RecordLost),
-            None => Err(RecordLost),
-        };
+        let result = self
+            .core
+            .commit(reservation, &EventBody::Admind(Box::new(event.clone())))
+            .map_err(|_| RecordLost);
         self.wake.notify_one();
         result
     }
@@ -103,57 +89,64 @@ impl AuditGate {
     /// counted), and wake the audit client.
     /// Spec: docs/questions/Q-218 (A-57); ipc-audit `AdmindEvent::is_noise`.
     pub fn noise(&self, event: &AdmindEvent) {
-        if let Some(mut state) = self.lock() {
-            let _ = state
-                .window
-                .offer_noise(&EventBody::Admind(Box::new(event.clone())));
-        }
+        self.core
+            .offer_noise(&EventBody::Admind(Box::new(event.clone())));
         self.wake.notify_one();
     }
 
     /// Record the audit client's view of auditd.
     pub fn set_reachable(&self, reachable: bool) {
-        if let Some(mut state) = self.lock() {
-            state.reachable = reachable;
-        }
+        self.core.set_reachable(reachable);
     }
 
     /// Whether auditd is reachable (the audit client's view).
     #[must_use]
     pub fn is_reachable(&self) -> bool {
-        self.lock().is_some_and(|state| state.reachable)
+        self.core.is_reachable()
     }
 
     /// The next batch to send, if nothing is in flight and anything is
     /// pending. Spec: docs/50 §3.6, §8.1.
     pub(crate) fn next_batch(&self) -> Option<Append> {
-        self.lock().and_then(|mut state| state.window.next_batch())
+        self.core.next_batch()
     }
 
     /// auditd's acknowledgement of the batch in flight.
     pub(crate) fn acknowledge(&self, ack: &Ack) -> Result<usize, ipc_audit::WindowError> {
-        match self.lock() {
-            Some(mut state) => state.window.acknowledge(ack),
-            None => Err(ipc_audit::WindowError::UnexpectedAck),
-        }
+        self.core.acknowledge(ack)
     }
 
     /// The audit connection dropped: the batch in flight goes back.
     pub(crate) fn connection_lost(&self) {
-        if let Some(mut state) = self.lock() {
-            state.window.connection_lost();
-        }
+        self.core.connection_lost();
     }
 
     /// Events not yet acknowledged plus outstanding reservations.
     #[must_use]
     pub fn outstanding(&self) -> usize {
-        self.lock().map_or(0, |state| {
-            state
-                .window
-                .unacknowledged()
-                .saturating_add(usize::try_from(state.window.reserved()).unwrap_or(usize::MAX))
-        })
+        self.core.outstanding()
+    }
+
+    /// The stop's flush (`ipc_audit::AuditGate::close`): admind waits the
+    /// whole `grace` for the acknowledgements even while its link counts as
+    /// unreachable (`FlushWait::UntilAcknowledged` — the wait it was built
+    /// with, as dird's, A-87), then ends the link (`end_link`), then reports
+    /// what is left.
+    /// Spec: docs/questions/Q-313 (A-82), Q-350 item 11 (A-87); docs/51
+    /// §5.7; docs/52 §3.11 R6 (b).
+    pub(crate) async fn close<E: Future<Output = ()>>(
+        &self,
+        grace: Duration,
+        end_link: E,
+    ) -> Unflushed {
+        self.core
+            .close(
+                grace,
+                FlushWait::UntilAcknowledged,
+                tokio::time::sleep,
+                end_link,
+            )
+            .await
     }
 
     /// Wait until an event was recorded (or a stored wake-up is pending).

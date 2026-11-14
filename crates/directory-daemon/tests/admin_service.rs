@@ -53,9 +53,10 @@ use core::time::Duration;
 use directory_admin::{wall_clock, CHANGE_SEQ_COUNTER, RID_COUNTER, RID_END_EXCLUSIVE, RID_FIRST};
 use directory_daemon::policy::{DevelopmentPolicy, MandatoryFast};
 use directory_daemon::{
-    admin_refused_peer_count, serve_with_admin, AdminParams, Clock, DaemonControl, DaemonParams,
-    DecisionAckDeadline, DecisionAckDeadlineOutOfRange, KeydTicketVerifier, SharedClock,
-    StoreSource, TicketVerifier, VerifierFactory, DECISION_ACK_DEADLINE, MAX_DECISION_ACK_DEADLINE,
+    admin_refused_peer_count, destroy_decision_id, serve_with_admin, AdminParams, Clock,
+    DaemonControl, DaemonParams, DecisionAckDeadline, DecisionAckDeadlineOutOfRange,
+    KeydTicketVerifier, SharedClock, StoreSource, TicketVerifier, VerifierFactory,
+    DECISION_ACK_DEADLINE, MAX_DECISION_ACK_DEADLINE,
 };
 use dirstore::{AttrId, IntegrityKey, NewObject, NodeId, Origin, Store, WriteTxn};
 use dtyp::{
@@ -994,6 +995,8 @@ struct Options {
     /// fail-closed paths of `BeginPasswordSet` and of the quorum-completing
     /// `Approve`).
     refuse_decisions: bool,
+    /// How often dird re-registers lost destroy decisions (A-105).
+    reconcile_interval: Duration,
 }
 
 /// The decision-acknowledgement wait of the tests that expect auditd to
@@ -1016,6 +1019,7 @@ impl Default for Options {
             key_request_lifetime: directory_admin::KEY_REQUEST_LIFETIME,
             ack_deadline: generous(),
             refuse_decisions: false,
+            reconcile_interval: directory_daemon::DESTROY_RECONCILE_INTERVAL,
         }
     }
 }
@@ -1036,13 +1040,38 @@ impl TicketVerifier for RefusingDecisions {
 
     fn register_decision(
         &mut self,
-        _id: DecisionId,
-        _operation: &keyd::DecidedOperation,
-        _approvers: &[keyd::PrincipalId],
-        _lifetime_secs: u32,
+        _decision: directory_daemon::DecisionRegistration,
     ) -> Result<(), directory_daemon::RegistrationFailure> {
         Err(directory_daemon::RegistrationFailure::NotPerformed)
     }
+
+    fn list_destroy_decisions(
+        &mut self,
+        after: Option<DecisionId>,
+    ) -> Option<keyd_types::DestructionPage> {
+        self.0.list_destroy_decisions(after)
+    }
+}
+
+/// keyd's parameters in a world: the test's uid as Role::Ldap (A-73) on
+/// `keyd_socket`, its own fake auditd at `ka.sock`, and — A-102 — keyadm's
+/// (Admin, `kk.sock`) and admind's (Directory, `kd.sock`) roles on the same
+/// engine, so the decisions dird registers can be executed (the single-uid
+/// test seam of docs/questions/Q-453 item 3).
+fn keyd_params(dir: &support::TempDir, uid: u32) -> keyd_daemon::DaemonParams {
+    let mut params = support::keyd::params(dir, CallerMap::new(&[(uid, Role::Ldap)]).unwrap(), uid);
+    params.audit.socket = dir.join("ka.sock");
+    params.extra_listeners = vec![
+        ExtraListener {
+            socket: dir.join("kk.sock"),
+            callers: CallerMap::new(&[(uid, Role::Admin)]).unwrap(),
+        },
+        ExtraListener {
+            socket: dir.join("kd.sock"),
+            callers: CallerMap::new(&[(uid, Role::Directory)]).unwrap(),
+        },
+    ];
+    params
 }
 
 /// keyd, both auditds, dird with its admin service, and admind's client.
@@ -1110,6 +1139,7 @@ fn start_dird(
         queue_capacity: options.queue_capacity,
         ack_deadline: options.ack_deadline,
         key_request_lifetime: options.key_request_lifetime,
+        destroy_reconcile_interval: options.reconcile_interval,
     };
     DirdRun::start(params, admin, Arc::clone(store), policy())
 }
@@ -1144,25 +1174,10 @@ impl World {
         let store = provision(&dir.join("s.redb"), options.with_admin_service);
 
         // keyd: the test's uid is Role::Ldap (A-73); its own fake auditd.
-        let mut keyd_params =
-            support::keyd::params(&dir, CallerMap::new(&[(uid, Role::Ldap)]).unwrap(), uid);
-        keyd_params.audit.socket = dir.join("ka.sock");
+        let keyd_params = keyd_params(&dir, uid);
         let keyd_socket = keyd_params.keyd_socket.clone();
-        // A-102: keyadm's (Admin) and admind's (Directory) roles on the same
-        // engine, so the decisions dird registers can be executed (the
-        // single-uid test seam of docs/questions/Q-453 item 3).
         let keyd_admin_socket = dir.join("kk.sock");
         let keyd_directory_socket = dir.join("kd.sock");
-        keyd_params.extra_listeners = vec![
-            ExtraListener {
-                socket: keyd_admin_socket.clone(),
-                callers: CallerMap::new(&[(uid, Role::Admin)]).unwrap(),
-            },
-            ExtraListener {
-                socket: keyd_directory_socket.clone(),
-                callers: CallerMap::new(&[(uid, Role::Directory)]).unwrap(),
-            },
-        ];
         let keyd_auditd = support::FakeAuditd::start(&keyd_params.audit.socket);
         let clock = support::TestClock::at(common::keyd_started());
         let keyd = support::keyd::Daemon::start(keyd_params, clock.clone(), admin_keyd).unwrap();
@@ -1239,6 +1254,31 @@ impl World {
     /// admind's view of keyd (Role::Directory).
     fn admind_keyd(&self) -> ipc_keyd::KeydClient<support::connector::KeydConnector> {
         self.keyd_client(&self.keyd_directory_socket)
+    }
+
+    /// Stop keyd and start it again on the same sockets and auditd, built by
+    /// `build` — its decision table empty, as after every keyd start (A-102;
+    /// the key sets are whatever `build` makes: a persistent store, P-17,
+    /// would keep them).
+    fn restart_keyd<F>(&mut self, build: F)
+    where
+        F: FnOnce(
+                &KerberosTime,
+            ) -> Result<
+                Keyd<InMemoryKeyStore, RecordBuffer, common::TestEntropy>,
+                keyd::ConfigError,
+            > + Send
+            + 'static,
+    {
+        if let Some(keyd) = self.keyd.take() {
+            keyd.stop().unwrap();
+        }
+        let clock = support::TestClock::at(common::keyd_started());
+        let keyd =
+            support::keyd::Daemon::start(keyd_params(&self.dir, self.uid), clock.clone(), build)
+                .unwrap();
+        clock.set(common::now());
+        self.keyd = Some(keyd);
     }
 
     /// Stop dird and start it again over the same store, keyd and auditd
@@ -2534,8 +2574,9 @@ fn a_dird_restart_drops_pending_requests() {
 /// docs/51 §6, §9 (`destroy-sweep`: the tombstones of user / computer
 /// objects, GUID + classes — A-18); docs/52 §4.3 row `destroy_key_set`
 /// option (a) (A-102): after a committed `Delete` of bob, dird registers a
-/// `DestroyKeySet` decision for his tombstone under the `Delete`'s
-/// operation id — keyadm's listing (Role::Admin) shows exactly it (the
+/// `DestroyKeySet` decision for his tombstone under its stable id (task R6,
+/// A-105: `destroy_decision_id` of the GUID, so a re-registration names the
+/// same decision) — keyadm's listing (Role::Admin) shows exactly it (the
 /// deleted group, which has no key sets, gets none); executing it destroys
 /// the key set admind set for bob earlier (on dird's `SetSecret` decision).
 #[test]
@@ -2590,14 +2631,14 @@ fn a_delete_registers_a_destroy_decision_for_the_tombstone() {
             .unwrap(),
         Reply::Done
     );
-    let deletes = await_events(&world, DirAdminOperation::Delete, 4);
+    let _deletes = await_events(&world, DirAdminOperation::Delete, 4);
     let listed = keyadm.list_destroy_decisions(None).unwrap();
     assert_eq!(listed.entries.len(), 1);
     assert_eq!(
         listed.entries[0].principal,
         keyd::PrincipalId::from_bytes(g(BOB).to_packet())
     );
-    assert_eq!(listed.entries[0].decision.get(), deletes[0].operation_id);
+    assert_eq!(listed.entries[0].decision, destroy_decision_id(g(BOB)));
     assert_eq!(listed.next, None);
     assert_eq!(keyadm.destroy_key_set(listed.entries[0].decision), Ok(()));
     assert!(keyadm
@@ -2611,7 +2652,7 @@ fn a_delete_registers_a_destroy_decision_for_the_tombstone() {
         .find(|r| r.result == ipc_audit::KeydOutcome::Success)
         .unwrap();
     assert_eq!(done.kvno, Some(1));
-    assert_eq!(done.decision, Some(deletes[0].operation_id));
+    assert_eq!(done.decision, Some(destroy_decision_id(g(BOB)).get()));
 }
 
 /// A-95 follow-up (docs/questions/Q-417 item 3, Q-441): dird's
@@ -2800,4 +2841,214 @@ fn a_secret_decision_keyd_does_not_register_answers_unavailable() {
     assert!(
         keyd_records_for(&world, ipc_audit::KeydOperation::RegisterDecision, g(BOB)).is_empty()
     );
+}
+
+// ---------------------------------------------------------------------------
+// The re-registration of lost destroy decisions (A-105; docs/questions/Q-470
+// item 4, Q-501; task R6).
+// ---------------------------------------------------------------------------
+
+/// How long the re-registration tests wait for a run and for keyd's records
+/// to reach its auditd (a loaded machine).
+const RECONCILE_WAIT: Duration = Duration::from_secs(20);
+
+/// keyd's successful `register_decision` records of `target`'s destroy
+/// decision (its stable id; the set-secret decision of the same account is
+/// not counted, nor the intent record every registration also has, A-88).
+fn registrations_for(world: &World, target: Guid) -> usize {
+    let id = destroy_decision_id(target).get();
+    keyd_records_for(world, ipc_audit::KeydOperation::RegisterDecision, target)
+        .iter()
+        .filter(|r| r.result == ipc_audit::KeydOutcome::Success && r.decision == Some(id))
+        .count()
+}
+
+/// The pending destroy decisions keyadm sees (Role::Admin), as principals.
+fn pending_destructions(world: &World) -> Vec<keyd::PrincipalId> {
+    world
+        .keyadm()
+        .list_destroy_decisions(None)
+        .map(|page| page.entries.iter().map(|e| e.principal).collect())
+        .unwrap_or_default()
+}
+
+/// A-105 (docs/questions/Q-470 item 4; docs/52 §4.3, §3.10 (a); docs/51 §6,
+/// §9): a computer with both key sets is deleted — dird registers its
+/// destroy decision — then keyd restarts and loses its decision table while
+/// the key sets remain (as a persistent store, P-17, would keep them). dird's
+/// periodic re-registration registers the decision again under the same id;
+/// keyadm's `destroy-sweep` then destroys **both** key sets (keyd's record
+/// names the two destroyed kvnos). The next run finds keyd holding the
+/// executed decision (accepted unchanged, nothing pending, nothing to sweep)
+/// and settles it; the runs after that ask keyd nothing more for it.
+#[test]
+fn lost_destroy_decisions_are_registered_again_until_keyd_ran_them() {
+    let Some(mut world) = World::new(Options {
+        reconcile_interval: Duration::from_millis(300),
+        ..Options::default()
+    }) else {
+        return;
+    };
+    let mut client = world.client();
+    // ws7: a computer with its SPN — two key sets, set by admind on dird's
+    // SetSecret decision.
+    let (ws7, _) = created(
+        client
+            .call(&by(
+                "admin1",
+                &[],
+                Operation::CreateComputer {
+                    parent: g(STAFF_OU),
+                    name: "ws7".into(),
+                    dns_host_name: "ws7.example.org".into(),
+                    spn: Some("host/ws7.example.org".into()),
+                },
+            ))
+            .unwrap(),
+    );
+    let Reply::PasswordSet(set) = client
+        .call(&by(
+            "admin1",
+            &[],
+            Operation::BeginPasswordSet { target: ws7 },
+        ))
+        .unwrap()
+    else {
+        panic!("a PasswordSet reply");
+    };
+    assert_eq!(set.keys.len(), 2);
+    for target in &set.keys {
+        assert_eq!(
+            world.admind_keyd().set_secret(
+                &target.handle,
+                &target.binding,
+                zeroize::Zeroizing::new(String::from("ws7's machine password")),
+                set.salt.as_str(),
+            ),
+            Ok(Kvno::new(1))
+        );
+    }
+    let ws7_principal = keyd::PrincipalId::from_bytes(ws7.to_packet());
+    let key_sets: Vec<(KeyHandle, keyd::PrincipalBinding)> = set
+        .keys
+        .iter()
+        .map(|k| (k.handle, k.binding.clone()))
+        .collect();
+
+    // The Delete registers the destroy decision under the tombstone's id.
+    assert_eq!(
+        client
+            .call(&by("admin1", &[], Operation::Delete { target: ws7 }))
+            .unwrap(),
+        Reply::Done
+    );
+    assert_eq!(pending_destructions(&world), vec![ws7_principal]);
+    assert!(support::eventually(RECONCILE_WAIT, || registrations_for(
+        &world, ws7
+    ) == 1));
+
+    // keyd restarts: its decisions are gone, ws7's two key sets are not.
+    world.restart_keyd(move |started| {
+        let mut keyd = admin_keyd(started)?;
+        for (handle, binding) in &key_sets {
+            keyd.create_key(&common::ADMIN, handle, binding, &common::now())
+                .unwrap();
+        }
+        let _ = keyd.audit_sink_mut().take();
+        Ok(keyd)
+    });
+
+    // dird registers it again (the same id), and only once.
+    assert!(support::eventually(RECONCILE_WAIT, || {
+        pending_destructions(&world) == vec![ws7_principal]
+    }));
+    assert!(support::eventually(RECONCILE_WAIT, || registrations_for(
+        &world, ws7
+    ) == 2));
+    let listed = world.keyadm().list_destroy_decisions(None).unwrap();
+    assert_eq!(listed.entries[0].decision, destroy_decision_id(ws7));
+
+    // keyadm's destroy-sweep destroys both key sets.
+    let report = keyadm::sweep::run(&mut world.keyadm());
+    assert!(report.is_complete(), "{report:?}");
+    assert_eq!(report.destroyed.len(), 1);
+    assert_eq!(report.destroyed[0].principal, ws7_principal);
+    let destroyed_record = || {
+        keyd_records_for(&world, ipc_audit::KeydOperation::DestroyKeySet, ws7)
+            .into_iter()
+            .find(|r| r.result == ipc_audit::KeydOutcome::Success)
+    };
+    assert!(support::eventually(RECONCILE_WAIT, || destroyed_record().is_some()));
+    let done = destroyed_record().unwrap();
+    assert_eq!(done.kvno, Some(1), "the account key set");
+    assert_eq!(
+        done.secondary.map(|k| (k.purpose, k.kvno)),
+        Some((ipc_audit::KeyPurposeCode::Service, Some(1))),
+        "the Service key set"
+    );
+    assert_eq!(done.decision, Some(destroy_decision_id(ws7).get()));
+
+    // The next run: keyd holds the executed decision — accepted unchanged,
+    // nothing pending, nothing for keyadm to sweep — and dird settles it.
+    assert!(support::eventually(RECONCILE_WAIT, || registrations_for(
+        &world, ws7
+    ) == 3));
+    assert!(pending_destructions(&world).is_empty());
+    let report = keyadm::sweep::run(&mut world.keyadm());
+    assert!(report.is_complete());
+    assert_eq!(report.listed, 0);
+    // The runs after it ask keyd nothing more for ws7.
+    std::thread::sleep(Duration::from_millis(1200));
+    assert_eq!(registrations_for(&world, ws7), 3);
+    assert_eq!(
+        keyd_records_for(&world, ipc_audit::KeydOperation::DestroyKeySet, ws7)
+            .iter()
+            .filter(|r| r.result == ipc_audit::KeydOutcome::Success)
+            .count(),
+        1
+    );
+}
+
+/// A-105 at the admin service's start (docs/questions/Q-470 item 4): a
+/// destroy decision whose registration failed at the `Delete` (keyd refused
+/// to register it — the fail-closed path of A-102: the `Delete` still
+/// answers `Done`) is registered when dird starts again with a keyd that
+/// registers decisions; a dird with no tombstone to settle asks keyd
+/// nothing (no listing in keyd's records).
+#[test]
+fn a_destroy_decision_not_registered_at_the_delete_is_registered_at_start() {
+    let Some(mut world) = World::new(Options {
+        refuse_decisions: true,
+        ..Options::default()
+    }) else {
+        return;
+    };
+    let listings = |world: &World| {
+        world
+            ._keyd_auditd
+            .events()
+            .iter()
+            .filter(|e| {
+                matches!(e, EventBody::Keyd(r)
+                    if r.op == ipc_audit::KeydOperation::ListDestroyDecisions)
+            })
+            .count()
+    };
+    // No tombstone yet: the start-time run asked keyd nothing.
+    assert_eq!(listings(&world), 0);
+    assert_eq!(
+        world
+            .client()
+            .call(&by("admin1", &[], Operation::Delete { target: g(BOB) }))
+            .unwrap(),
+        Reply::Done
+    );
+    assert!(pending_destructions(&world).is_empty());
+    world.options.refuse_decisions = false;
+    world.restart_dird();
+    assert!(support::eventually(RECONCILE_WAIT, || {
+        pending_destructions(&world) == vec![keyd::PrincipalId::from_bytes(g(BOB).to_packet())]
+    }));
+    let listed = world.keyadm().list_destroy_decisions(None).unwrap();
+    assert_eq!(listed.entries[0].decision, destroy_decision_id(g(BOB)));
 }

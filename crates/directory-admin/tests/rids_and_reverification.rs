@@ -83,7 +83,10 @@ fn an_aborted_transaction_consumes_nothing() {
         let view = d.ctx.view(&d.store, &d.tiers).unwrap();
         let prepared = d.admin.prepare(&request, &view, &d.policy, &now()).unwrap();
         drop(view);
-        let applied = d.admin.apply(prepared, &mut txn, &now()).unwrap();
+        let applied = d
+            .admin
+            .apply(acknowledged(prepared), &mut txn, &now())
+            .unwrap();
         assert_eq!(rid_of(applied.reply()), FIRST_ADMIN_RID);
         txn.abort().unwrap();
     }
@@ -140,7 +143,10 @@ fn apply_refuses_a_write_prepared_against_a_stale_view() {
     )
     .applied();
     let mut txn = d.store.begin_write().unwrap();
-    let r = d.admin.apply(prepared, &mut txn, &now()).unwrap_err();
+    let r = d
+        .admin
+        .apply(acknowledged(prepared), &mut txn, &now())
+        .unwrap_err();
     txn.abort().unwrap();
     assert_eq!(
         r.event().stage,
@@ -185,12 +191,45 @@ fn apply_compares_the_records_it_depends_on() {
         },
     )
     .unwrap();
-    let r = d.admin.apply(prepared, &mut txn, &now()).unwrap_err();
+    let r = d
+        .admin
+        .apply(acknowledged(prepared), &mut txn, &now())
+        .unwrap_err();
     txn.abort().unwrap();
     assert_eq!(
         r.event().stage,
         DirAdminStage::Outcome(OutcomeResult::Refused(AdminRefusal::Conflict))
     );
+}
+
+/// docs/52 §3.11 R6 (a), N5; A-85: a prepared write whose decision event
+/// auditd has not acknowledged gets no proof — the gate hands the prepared
+/// operation back at the deadline (sent, never acknowledged) — so `apply`,
+/// which takes only the proof, cannot run: nothing is written.
+#[test]
+fn without_auditds_acknowledgement_there_is_no_proof_and_no_write() {
+    let d = Domain::new("no-ack");
+    let seq_before = d.counter_next(directory_admin::CHANGE_SEQ_COUNTER);
+    let request = d.request(create_user("u1"), "admin1", &[]);
+    let prepared = {
+        let view = d.ctx.view(&d.store, &d.tiers).unwrap();
+        d.admin.prepare(&request, &view, &d.policy, &now()).unwrap()
+    };
+    let gate = ipc_audit::AuditGate::new(ipc_audit::WindowConfig::DEFAULT);
+    gate.set_reachable(true);
+    let pending = gate
+        .begin_intent(gate.reserve().unwrap(), prepared)
+        .unwrap();
+    let _sent = gate.next_batch().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+    let back = gate.wait_acknowledged(pending, deadline).unwrap_err();
+    assert!(back.writes());
+    assert_eq!(back.decision_event().operation_id, request.operation_id);
+    assert_eq!(
+        d.counter_next(directory_admin::CHANGE_SEQ_COUNTER),
+        seq_before
+    );
+    assert!(d.object(drawn_guid(1)).is_none());
 }
 
 /// A prepared operation that commits nothing has nothing to apply: `apply`
@@ -209,10 +248,70 @@ fn a_read_only_operation_has_nothing_to_apply() {
     };
     assert!(!prepared.writes());
     let mut txn = d.store.begin_write().unwrap();
-    let r = d.admin.apply(prepared, &mut txn, &now()).unwrap_err();
+    let r = d
+        .admin
+        .apply(acknowledged(prepared), &mut txn, &now())
+        .unwrap_err();
     txn.abort().unwrap();
     assert!(matches!(
         r.event().stage,
         DirAdminStage::Outcome(OutcomeResult::Failed(_))
     ));
+}
+
+/// docs/52 §4.3 ("tombstones only"), docs/51 §6, §9, A-18, A-105
+/// (docs/questions/Q-470 item 4): the destroy decisions dird may register
+/// come only from tombstones of the `user` class — a deleted user, never a
+/// live account and never a deleted OU — read one at a time
+/// (`destruction_target`) or page by page (`destruction_targets`), with the
+/// principal id = the objectGUID's packet form.
+#[test]
+fn destruction_targets_are_the_tombstoned_users_and_computers() {
+    let mut d = Domain::new("destruction-targets");
+    let (_, applied) = d.run(create_user("u1"), "admin1", &[]).applied();
+    let Reply::Created { guid: user, .. } = applied.reply() else {
+        panic!();
+    };
+    let user = *user;
+    let ou = Operation::CreateOu(CreateContainerLike {
+        parent: guid(STAFF_OU),
+        name: "Lab".into(),
+    });
+    let (_, applied) = d.run(ou, "admin1", &[]).applied();
+    let Reply::Created { guid: ou, .. } = applied.reply() else {
+        panic!();
+    };
+    let ou = *ou;
+    {
+        let view = d.ctx.view(&d.store, &d.tiers).unwrap();
+        // Live: no target.
+        assert_eq!(d.admin.destruction_target(&view, user).unwrap(), None);
+    }
+    d.run(Operation::Delete { target: user }, "admin1", &[])
+        .applied();
+    d.run(Operation::Delete { target: ou }, "admin1", &[])
+        .applied();
+    let view = d.ctx.view(&d.store, &d.tiers).unwrap();
+    let target = d.admin.destruction_target(&view, user).unwrap().unwrap();
+    assert_eq!(target.guid(), user);
+    assert_eq!(
+        target.principal(),
+        keyd_types::PrincipalId::from_bytes(user.to_packet())
+    );
+    assert_eq!(d.admin.destruction_target(&view, ou).unwrap(), None);
+    let mut found = Vec::new();
+    let mut after = None;
+    loop {
+        let page = d.admin.destruction_targets(&view, after, 1).unwrap();
+        found.extend(
+            page.targets
+                .iter()
+                .map(directory_admin::TombstonedPrincipal::guid),
+        );
+        match page.next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(found, vec![user]);
 }

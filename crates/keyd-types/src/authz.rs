@@ -185,7 +185,11 @@ impl Operation {
 /// no process calls it, and Directory holding it was an AS-bypassing guess
 /// oracle — docs/51 §5.3 option B, rejected); Admin's rotations, retirement
 /// and destruction run only a decision dird registered
-/// ([`requires_decision`]).
+/// ([`requires_decision`]). Task R6 (A-105, docs/questions/Q-470 item 4,
+/// Q-503): Ldap may also read `ListDestroyDecisions` — the pending destroy
+/// decisions it registered itself — so that dird re-registers only the ones
+/// keyd lost (a read: decision ids and tombstones' GUIDs, nothing secret, no
+/// state changed).
 pub const CAPABILITY_TABLE: [(Role, &[Operation]); 4] = [
     (
         Role::Kdc,
@@ -220,6 +224,7 @@ pub const CAPABILITY_TABLE: [(Role, &[Operation]); 4] = [
         &[
             Operation::OpenAndVerifyServiceTicket,
             Operation::RegisterDecision,
+            Operation::ListDestroyDecisions,
             Operation::DescribeConfig,
             Operation::Ping,
         ],
@@ -534,7 +539,8 @@ const _: () = {
     // Service-ticket verification (docs/questions/Q-165 item 3, A-46):
     // `Ldap` may call open_and_verify_service_ticket and — docs/50 §3.4 —
     // describe_config and ping, and — docs/52 §4.2, A-102 —
-    // register_decision, and nothing else; no other role may call
+    // register_decision, and — task R6, A-105 — list_destroy_decisions (a
+    // read of its own registrations), and nothing else; no other role may call
     // open_and_verify_service_ticket, and it opens only Service-purpose
     // handles.
     let mut i = 0;
@@ -543,7 +549,8 @@ const _: () = {
         let is_service_ticket = op as u8 == Operation::OpenAndVerifyServiceTicket as u8;
         let is_daemon_support =
             op as u8 == Operation::DescribeConfig as u8 || op as u8 == Operation::Ping as u8;
-        let is_decision = op as u8 == Operation::RegisterDecision as u8;
+        let is_decision = op as u8 == Operation::RegisterDecision as u8
+            || op as u8 == Operation::ListDestroyDecisions as u8;
         assert!(
             role_permits(Role::Ldap, op) == (is_service_ticket || is_daemon_support || is_decision)
         );
@@ -634,6 +641,14 @@ const _: () = {
     assert!(!role_permits(Role::Admin, Operation::RegisterDecision));
     assert!(role_permits(Role::Admin, Operation::SealCeremony));
     assert!(role_permits(Role::Admin, Operation::ListDestroyDecisions));
+    // Task R6 (A-105, Q-503): dird reads its own registrations back, to
+    // re-register the destroy decisions keyd lost; never Kdc or Directory.
+    assert!(role_permits(Role::Ldap, Operation::ListDestroyDecisions));
+    assert!(!role_permits(Role::Kdc, Operation::ListDestroyDecisions));
+    assert!(!role_permits(
+        Role::Directory,
+        Operation::ListDestroyDecisions
+    ));
     assert!(!startup_hold_down_applies(Operation::RegisterDecision));
     assert!(!startup_hold_down_applies(Operation::SealCeremony));
     assert!(!startup_hold_down_applies(Operation::ListDestroyDecisions));
@@ -742,7 +757,9 @@ mod tests {
     /// administrators (Admin) — docs/51 §5.8 option (b), Q-450 items 1, 6;
     /// since A-102 the grant is Admin's alone and dird registers decisions
     /// (`RegisterDecision`, Ldap alone). `VerifySecret` has **no** role
-    /// (docs/52 R4, Q-465).
+    /// (docs/52 R4, Q-465). The destroy listing, which reads decisions and
+    /// touches no key, is keyadm's (Admin) and — task R6, Q-503 — dird's
+    /// (Ldap), which reads back what it registered.
     #[test]
     fn each_key_operation_has_exactly_one_role() {
         for op in Operation::ALL {
@@ -755,6 +772,7 @@ mod tests {
                 Operation::DescribeConfig => assert_eq!(roles, [Role::Kdc, Role::Ldap]),
                 Operation::Ping => assert_eq!(roles, ROLES),
                 Operation::VerifySecret => assert!(roles.is_empty()),
+                Operation::ListDestroyDecisions => assert_eq!(roles, [Role::Admin, Role::Ldap]),
                 _ => assert_eq!(roles.len(), 1, "{op:?}"),
             }
         }
@@ -762,15 +780,18 @@ mod tests {
 
     /// RFC 4120 3.2.3 / docs/50 R50-6, §3.5: exactly the operations of the
     /// Kerberos exchanges (roles Kdc and Ldap, except the daemon-support
-    /// operations — Q-240 item 1 — and the decision registration — Q-450
-    /// item 5, A-102) are held after start.
+    /// operations — Q-240 item 1 — and the decision registration and its
+    /// listing — Q-450 item 5, A-102, task R6) are held after start.
     #[test]
     fn hold_down_covers_exactly_the_kerberos_operations() {
         for op in Operation::ALL {
             let kerberos = (role_permits(Role::Kdc, op) || role_permits(Role::Ldap, op))
                 && !matches!(
                     op,
-                    Operation::DescribeConfig | Operation::Ping | Operation::RegisterDecision
+                    Operation::DescribeConfig
+                        | Operation::Ping
+                        | Operation::RegisterDecision
+                        | Operation::ListDestroyDecisions
                 );
             assert_eq!(startup_hold_down_applies(op), kerberos, "{op:?}");
         }

@@ -375,7 +375,8 @@ fn issue_as_rep_krbtgt_slot_purpose() {
 /// docs/51 §5.8 option (b), docs/questions/Q-450 (`GrantSetSecret` — task
 /// A15a); docs/52 §4, §7 R1, R3, R4 and docs/questions/Q-460, Q-462, Q-465
 /// (A-102: `RegisterDecision` Ldap only, `GrantSetSecret` Admin only,
-/// `SealCeremony` / `ListDestroyDecisions` Admin, `VerifySecret` nobody).
+/// `SealCeremony` Admin, `VerifySecret` nobody); task R6 (A-105,
+/// docs/questions/Q-503): `ListDestroyDecisions` Admin and Ldap.
 #[test]
 fn capability_table_matches_design() {
     use Operation::*;
@@ -413,6 +414,7 @@ fn capability_table_matches_design() {
             &[
                 OpenAndVerifyServiceTicket,
                 RegisterDecision,
+                ListDestroyDecisions,
                 DescribeConfig,
                 Ping,
             ],

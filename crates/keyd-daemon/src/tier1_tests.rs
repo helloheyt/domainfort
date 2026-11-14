@@ -6,7 +6,7 @@
 //! Every test names its source. Every value is constructed by hand for these
 //! tests; no vector comes from any other implementation.
 
-use crate::audit::{AuditGate, KeyStateIntent};
+use crate::audit::AuditGate;
 use crate::clock::{kerberos_time_from_unix, Clock};
 use crate::engine::{
     Engine, EngineError, IntentAckBudget, IntentAckBudgetOutOfRange, SubmitError,
@@ -19,7 +19,7 @@ use ipc_audit::{
     KeydRecord, KeydRole, WindowConfig,
 };
 use ipc_keyd::{Answer, Call, KeydReply, Password, KEYD_CHANNEL};
-use ipc_keyd_server::Dispatch;
+use ipc_keyd_server::{Dispatch, KeyStateIntent};
 use keyd::{
     kerberos_time_seconds, requires_acknowledged_intent, AccountKind, AuthnError, CallerId,
     DecidedOperation, DecisionId, Error, InMemoryKeyStore, KeyHandle, KeyPurpose, Kvno, Operation,
@@ -378,7 +378,7 @@ fn verify_secret(octet: u8) -> Call {
 
 /// The keyd records in the window, in order (acknowledging nothing).
 fn window_records(gate: &AuditGate) -> Vec<ipc_audit::KeydRecord> {
-    let batch = gate.with_window(|window| window.next_batch()).unwrap();
+    let batch = gate.next_batch();
     let records = batch
         .map(|append| {
             append
@@ -391,13 +391,13 @@ fn window_records(gate: &AuditGate) -> Vec<ipc_audit::KeydRecord> {
                 .collect()
         })
         .unwrap_or_default();
-    gate.with_window(|window| window.connection_lost());
+    gate.connection_lost();
     records
 }
 
 /// Acknowledge every event in the window, as auditd would.
 fn acknowledge_all(gate: &AuditGate) {
-    while let Some(append) = gate.with_window(|window| window.next_batch()).unwrap() {
+    while let Some(append) = gate.next_batch() {
         let ack = Ack {
             through_seq: append.last_seq(),
             head_hash: [0; 32],

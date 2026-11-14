@@ -127,6 +127,11 @@ parse-ldap = { path = "../parse-ldap" }
 # crates/protected-file reader opens — the walk from `/` accepts them (task
 # T; docs/questions/Q-480). Dev-only, no dependency.
 test-scratch = { path = "../test-scratch" }
+# TESTS ONLY (task R6, A-105): keyadm's `destroy-sweep` as a library
+# (`keyadm::sweep::run`), run against the test's keyd after dird
+# re-registered a lost destroy decision (tests/admin_service.rs). A workspace
+# crate, no third-party code; not linked into the daemon.
+keyadm = { path = "../keyadm" }
 
 # Tier 3 (docs/50 R50-19): the hardening drop runs in a fresh child process of
 # a binary with its own `main`, as crates/keyd-daemon does.

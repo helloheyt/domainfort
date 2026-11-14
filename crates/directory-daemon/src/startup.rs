@@ -9,7 +9,7 @@
 
 use crate::admin_service::{
     AdminParams, DecisionAckDeadline, KeydTicketVerifier, TicketVerifier, VerifierFactory,
-    ADMIN_QUEUE_CAPACITY, MAX_ADMIN_CONNECTIONS,
+    ADMIN_QUEUE_CAPACITY, DESTROY_RECONCILE_INTERVAL, MAX_ADMIN_CONNECTIONS,
 };
 use crate::audit_link::AuditEndpoint;
 use crate::clock::SharedClock;
@@ -456,5 +456,6 @@ pub fn admin_params(
         queue_capacity: ADMIN_QUEUE_CAPACITY,
         ack_deadline: DecisionAckDeadline::PRODUCTION,
         key_request_lifetime: directory_admin::KEY_REQUEST_LIFETIME,
+        destroy_reconcile_interval: DESTROY_RECONCILE_INTERVAL,
     }))
 }

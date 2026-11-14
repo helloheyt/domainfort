@@ -262,6 +262,7 @@ dependencies = [
  "ipc-ldap",
  "ipc-ldap-server",
  "kdc",
+ "keyadm",
  "keyd",
  "keyd-daemon",
  "keyd-types",
@@ -526,7 +527,9 @@ version = "0.0.0"
 dependencies = [
  "dtyp",
  "ipc",
+ "ipc-audit",
  "ipc-keyd",
+ "ipc-keyd-server",
  "kdc",
  "keyd",
  "keyd-types",

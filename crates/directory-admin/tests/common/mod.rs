@@ -39,7 +39,7 @@ use dtyp::{
     GenericMapping, Guid, MaskSidAce, SecurityDescriptor, Sid, Token, ACL_REVISION_DS,
     SECURITY_NT_AUTHORITY,
 };
-use ipc_audit::DirAdminEvent;
+use ipc_audit::{Ack, AckedIntent, AuditGate, DirAdminEvent, WindowConfig};
 use keyd_types::KeydConfig;
 use krb_proto::constants::KRB_NT_PRINCIPAL;
 use krb_proto::{KerberosString, KerberosTime, PrincipalName, Realm};
@@ -817,7 +817,7 @@ impl Domain {
             return Ran::Read(Box::new(prepared));
         }
         let decision = Box::new(prepared.decision_event().clone());
-        match self.admin.apply(prepared, &mut txn, &now()) {
+        match self.admin.apply(acknowledged(prepared), &mut txn, &now()) {
             Ok(applied) => {
                 txn.commit().expect("commit");
                 Ran::Applied {
@@ -831,4 +831,24 @@ impl Domain {
             }
         }
     }
+}
+
+/// Play auditd for one prepared write (docs/51 §5.7 item 2, A-85; docs/52
+/// §3.11 R6): commit its decision event into an `ipc_audit::AuditGate`,
+/// acknowledge it as auditd does once it synced it (docs/50 §8.1), and take
+/// the proof `apply` requires. The only way the tests obtain one is the way
+/// dird does: through the gate, after the acknowledgement.
+pub fn acknowledged(prepared: Prepared) -> AckedIntent<Prepared> {
+    let gate = AuditGate::new(WindowConfig::DEFAULT);
+    gate.set_reachable(true);
+    let slot = gate.reserve().expect("a slot");
+    let pending = gate.begin_intent(slot, prepared).expect("committed");
+    let batch = gate.next_batch().expect("the decision event is sent");
+    gate.acknowledge(&Ack {
+        through_seq: batch.last_seq(),
+        head_hash: [0; 32],
+    })
+    .expect("auditd acknowledges");
+    gate.wait_acknowledged(pending, std::time::Instant::now())
+        .expect("acknowledged")
 }

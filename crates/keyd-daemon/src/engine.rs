@@ -14,15 +14,19 @@
 //!   never `spawn_blocking` (whose queue has no back-pressure, per the tokio
 //!   `runtime::Builder` page).
 //! * Per request the engine reads **its own clock** (R50-5), decodes the
-//!   body ([`ipc_keyd::decode_request`]), passes the A-57 audit gate
-//!   (`crate::audit`), runs the call on keyd ([`ipc_keyd_server::execute`])
-//!   with the transport's caller and that `now`, commits keyd's record, and
-//!   encodes the answer ([`ipc_keyd::encode_answer`]). This is the sequence of
-//!   [`ipc_keyd_server::dispatch`] with the gate inserted between decoding and
-//!   running — `dispatch` has no point at which a slot could be reserved
-//!   after the operation is known and before keyd runs it, and decoding the
-//!   body twice would double the strict DER work on the one engine thread
-//!   (docs/questions/Q-260 item 3). The refusal rules are `dispatch`'s.
+//!   body ([`ipc_keyd::decode_request`]), classifies it
+//!   ([`ipc_keyd_server::classify`]: does keyd's authorization step admit a
+//!   change that needs an acknowledged intent?), passes the A-57 audit gate
+//!   (`crate::audit`), runs the call on keyd ([`ipc_keyd_server::execute`],
+//!   or [`ipc_keyd_server::execute_acknowledged`] with the proof) with the
+//!   transport's caller and that `now`, commits keyd's record, and encodes
+//!   the answer ([`ipc_keyd::encode_answer`]). This is the sequence of
+//!   ipc-keyd-server's loopback `dispatch` with the gate inserted between
+//!   decoding and running — `dispatch` has no point at which a slot could be
+//!   reserved after the operation is known and before keyd runs it, and
+//!   decoding the body twice would double the strict DER work on the one
+//!   engine thread (docs/questions/Q-260 item 3). The refusal rules are
+//!   `dispatch`'s.
 //! * The hold-down start (`started_at`) is read from the same clock when the
 //!   engine is constructed ([`Engine::start`], A-62: `Keyd::new(…,
 //!   started_at)`).
@@ -44,6 +48,14 @@
 //! the true result is the reply, even if that record could not be committed
 //! (the gap is counted). An authorization refusal takes the ordinary path:
 //! one record, no intent, no wait.
+//!
+//! **By construction (docs/52 §3.11 R6):** the classification is
+//! [`ipc_keyd_server::classify`]'s; an admitted change is a
+//! `ipc_keyd_server::KeyStateCall` that only
+//! [`ipc_keyd_server::execute_acknowledged`] runs, and only with the
+//! `ipc_audit::AckedIntent` the shared gate gives after auditd's
+//! acknowledgement; [`ipc_keyd_server::execute`] refuses (`NotRun`) to run
+//! a plain call that keyd would now admit as such a change.
 //!
 //! **The wait and issuance.** The wait blocks this thread — the one that
 //! serves every keyd call, the Kerberos exchanges included — so it is
@@ -89,16 +101,17 @@
 //! docs/questions/Q-218 (A-57), Q-222 (A-56), Q-240 item 7 (A-62), Q-245
 //! item 12 (A-63), Q-346 (A-86), Q-365, Q-415.
 
-use crate::audit::{AuditGate, IntentRefused, KeyStateIntent, PendingOutcome, RecordBuffer};
+use crate::audit::{AuditGate, IntentRefused, RecordBuffer, Waited};
 use crate::clock::Clock;
 use crate::log::{Note, Thinned};
 use core::fmt;
 use core::time::Duration;
 use ipc::{encode_refused, Refused};
-use ipc_audit::KeydOutcome;
-use ipc_keyd::{decode_request, encode_answer, Call, KEYD_CHANNEL};
-use ipc_keyd_server::{execute, Dispatch};
-use keyd::{requires_acknowledged_intent, CallerId, ConfigError, EntropySource, KeyStore, Keyd};
+use ipc_keyd::{decode_request, encode_answer, KEYD_CHANNEL};
+use ipc_keyd_server::{
+    classify, execute, execute_acknowledged, Classified, Dispatch, KeyStateCall,
+};
+use keyd::{CallerId, ConfigError, EntropySource, KeyStore, Keyd};
 use krb_proto::KerberosTime;
 use std::sync::Arc;
 use std::time::Instant;
@@ -405,53 +418,34 @@ where
                 }
             }
         };
-        // A-86: a key-state change keyd's authorization step admits has its
-        // intent acknowledged before keyd runs it. An authorization refusal
-        // changes nothing and takes the ordinary path below (one record, as
-        // before).
-        let operation = call.operation();
-        if requires_acknowledged_intent(operation) {
-            if let Some(decision) = call.decision() {
-                // A-102 (docs/52 §4.5): an execution names only dird's
-                // decision; its intent is built from keyd's table. No pending
-                // decision (refused, or already run and replayed) changes
-                // nothing: the ordinary path below, one record.
-                if let Some(facts) = self.keyd.decided_intent(&caller, operation, decision, &now) {
-                    let intent = KeyStateIntent::decided(caller, now, operation, &facts);
-                    return self.change_key_state(caller, now, call, &intent, queued);
-                }
-            } else {
-                let Some(intent) = KeyStateIntent::of(caller, now, &call)
-                    .filter(|intent| intent.op() == operation)
-                else {
-                    // keyd and the daemon disagree on what needs an intent:
-                    // not served (fail closed; AGENTS.md §6).
-                    return refuse(Refused::Unavailable);
-                };
-                if self
-                    .keyd
-                    .admits(&caller, operation, &intent.handles(), &now)
-                {
-                    // A-102 (docs/52 §4.5): a `set_secret` names its handle;
-                    // the decision it will consume is keyd's to say.
-                    let intent = match &call {
-                        Call::SetSecret { handle, .. } => {
-                            intent.with_decision(self.keyd.secret_decision(handle))
-                        }
-                        _ => intent,
-                    };
-                    return self.change_key_state(caller, now, call, &intent, queued);
-                }
-            }
-        }
+        // A-86 / docs/52 R6: a key-state change keyd's authorization step
+        // admits has its intent acknowledged before keyd runs it — and can
+        // only be run with that proof. An authorization refusal changes
+        // nothing and takes the ordinary path below (one record, as before).
+        let plain = match classify(&self.keyd, caller, now, call) {
+            Classified::Plain(plain) => plain,
+            Classified::KeyStateChange(change) => return self.change_key_state(change, queued),
+            // keyd and the classification disagree on what needs an intent:
+            // not served (fail closed; AGENTS.md §6).
+            Classified::Inconsistent => return refuse(Refused::Unavailable),
+        };
         // A-57: a gating operation reserves its record's slot before keyd
         // runs it; auditd unreachable or the window full ⇒ Busy, keyd not
         // called. The connection stays open (Busy is not a protocol error).
-        let admission = match self.gate.admit(call.operation()) {
+        let admission = match self.gate.admit(plain.operation()) {
             Ok(admission) => admission,
             Err(_) => return refuse_and_stay(Refused::Busy),
         };
-        let answer = execute(&mut self.keyd, caller, now, call);
+        let answer = match execute(&mut self.keyd, plain) {
+            Ok(answer) => answer,
+            Err(_) => {
+                // Cannot happen (classified just above, on this thread):
+                // keyd would admit it as a change needing its proof — not
+                // run, "not done".
+                self.gate.release(admission);
+                return refuse(Refused::Unavailable);
+            }
+        };
         let (records, overflowed) = self.keyd.audit_sink_mut().take();
         if self.gate.record(admission, &records, overflowed).is_err() {
             // Never a gating result without its record in the window.
@@ -480,40 +474,43 @@ where
     ///
     /// Spec: docs/questions/Q-346 (A-86), Q-365; docs/51 §5.7 item 2 (A-85);
     /// docs/50 §3.6 (bounded waits), §3.7.
-    fn change_key_state(
-        &mut self,
-        caller: CallerId,
-        now: KerberosTime,
-        call: Call,
-        intent: &KeyStateIntent,
-        queued: Instant,
-    ) -> Dispatch {
-        let pending = match self
-            .gate
-            .begin_key_state_change(&intent.event(KeydOutcome::Intent))
-        {
+    fn change_key_state(&mut self, change: KeyStateCall, queued: Instant) -> Dispatch {
+        let caller = change.caller();
+        let pending = match self.gate.begin_key_state_change(change) {
             Ok(pending) => pending,
             Err(IntentRefused::GateClosed) => return refuse_and_stay(Refused::Busy),
             Err(IntentRefused::NotRecorded) => return refuse(Refused::Unavailable),
         };
-        if !self.intent_acknowledged(&pending, queued) {
-            // "Unavailable" means "not done": keyd is not called. The
-            // outcome record says so; if even it cannot be committed, the
-            // gate counts it.
-            if self
-                .gate
-                .abandon_key_state_change(pending, &intent.event(KeydOutcome::NotPerformed))
-                .is_err()
-            {
-                OUTCOME_UNRECORDED.hit(Some(caller.uid));
+        // The proof, within the engine's budget of `queued`; a deadline that
+        // cannot be represented is "not acknowledged" (fail closed).
+        let waited = match queued.checked_add(self.budget.get()) {
+            Some(deadline) => self.gate.wait_acknowledged(pending, deadline),
+            None => {
+                let (change, slot) = self.gate.give_up(pending);
+                Waited::NotAcknowledged(change, slot)
             }
-            return refuse(Refused::Unavailable);
-        }
-        let answer = execute(&mut self.keyd, caller, now, call);
+        };
+        let (acked, slot) = match waited {
+            Waited::Acknowledged(acked, slot) => (acked, slot),
+            Waited::NotAcknowledged(change, slot) => {
+                // "Unavailable" means "not done": keyd is not called. The
+                // outcome record says so; if even it cannot be committed,
+                // the gate counts it.
+                if self
+                    .gate
+                    .abandon_key_state_change(slot, &change.not_performed_event())
+                    .is_err()
+                {
+                    OUTCOME_UNRECORDED.hit(Some(caller.uid));
+                }
+                return refuse(Refused::Unavailable);
+            }
+        };
+        let answer = execute_acknowledged(&mut self.keyd, acked);
         let (records, overflowed) = self.keyd.audit_sink_mut().take();
         if self
             .gate
-            .finish_key_state_change(pending, &records, overflowed)
+            .finish_key_state_change(slot, &records, overflowed)
             .is_err()
         {
             OUTCOME_UNRECORDED.hit(Some(caller.uid));
@@ -522,16 +519,6 @@ where
             Ok(frame) => Dispatch::Reply(frame),
             Err(_) => Dispatch::Close,
         }
-    }
-
-    /// Whether the intent of `pending` was acknowledged within the engine's
-    /// [`IntentAckBudget`] of `queued`. A deadline that cannot be
-    /// represented is "not acknowledged" (fail closed).
-    /// Spec: docs/questions/Q-346 (A-86), Q-365, Q-415.
-    fn intent_acknowledged(&self, pending: &PendingOutcome, queued: Instant) -> bool {
-        queued
-            .checked_add(self.budget.get())
-            .is_some_and(|deadline| self.gate.wait_acknowledged(pending.intent_seq(), deadline))
     }
 
     /// Move the engine onto its own OS thread behind a queue of `capacity`

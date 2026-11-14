@@ -55,10 +55,13 @@
 //! (A-64), Q-260 items 1-2 (A-67); docs/37 §2 (D63); docs/07 §8;
 //! crates/kdc audit.rs.
 
-use ipc_audit::WindowError;
-use ipc_audit::{Ack, Append, EventBody, KdcEvent, Reservation, SendWindow, WindowConfig};
+use core::future::Future;
+use core::time::Duration;
+use ipc_audit::{
+    Ack, Append, EventBody, FlushWait, KdcEvent, Reservation, Unflushed, WindowConfig, WindowError,
+    WindowSteps,
+};
 use kdc::{AuditEvent, AuditOutcome, AuditSink};
-use std::sync::{Mutex, MutexGuard};
 use tokio::sync::Notify;
 
 /// Most events [`EventBuffer`] holds for one request. The KDC emits exactly
@@ -138,18 +141,16 @@ pub enum Recorded {
     Noise,
 }
 
-#[derive(Debug)]
-struct GateState {
-    window: SendWindow,
-    reachable: bool,
-}
-
 /// Shared by the engine thread (admit, record) and the audit client task
-/// (batches, acknowledgements, reachability).
-/// Spec: docs/50 R50-17, §8.1; docs/questions/Q-218 (A-57).
+/// (batches, acknowledgements, reachability): the shared
+/// `ipc_audit::AuditGate` (its window, the reachability, the stop's flush —
+/// docs/52 §3.11 R6) plus the kdc's event shape and the tokio wake-up of the
+/// audit client.
+/// Spec: docs/50 R50-17, §8.1; docs/questions/Q-218 (A-57); docs/52 §3.11
+/// R6.
 #[derive(Debug)]
 pub struct AuditGate {
-    state: Mutex<GateState>,
+    core: ipc_audit::AuditGate,
     wake: Notify,
 }
 
@@ -159,28 +160,16 @@ impl AuditGate {
     #[must_use]
     pub fn new(window: WindowConfig) -> AuditGate {
         AuditGate {
-            state: Mutex::new(GateState {
-                window: SendWindow::new(window),
-                reachable: false,
-            }),
+            core: ipc_audit::AuditGate::new(window),
             wake: Notify::new(),
         }
-    }
-
-    /// The state, or `None` if a holder panicked (no slot: fail closed).
-    fn lock(&self) -> Option<MutexGuard<'_, GateState>> {
-        self.state.lock().ok()
     }
 
     /// Reserve the slot of the next request's event, or `None` (auditd
     /// unreachable, the window full): the request is then not served.
     /// Spec: docs/questions/Q-218 (A-57), Q-252 item 8 (a) (A-64).
     pub fn admit(&self) -> Option<Reservation> {
-        let mut state = self.lock()?;
-        if !state.reachable {
-            return None;
-        }
-        state.window.reserve().ok()
+        self.core.reserve()
     }
 
     /// Put the events of the request that just ran into the window (module
@@ -198,36 +187,40 @@ impl AuditGate {
         events: &[AuditEvent],
         overflowed: bool,
     ) -> Result<Recorded, RecordLost> {
-        let result = match self.lock() {
-            Some(mut state) => match admission {
+        let gating = admission.is_some();
+        let result = self
+            .core
+            .with_steps(|steps| match admission {
                 Some(reservation) => {
                     if !overflowed && !events.is_empty() && events.iter().all(is_noise) {
-                        state.window.release(reservation);
-                        Self::offer_all(&mut state.window, events);
+                        steps.release(reservation);
+                        Self::offer_all(steps, events);
                         Ok(Recorded::Noise)
                     } else {
-                        Self::commit_all(&mut state.window, reservation, events, overflowed)
+                        Self::commit_all(steps, reservation, events, overflowed)
                     }
                 }
                 None => {
-                    Self::offer_all(&mut state.window, events);
+                    Self::offer_all(steps, events);
                     Ok(Recorded::Noise)
                 }
-            },
-            None => match admission {
-                Some(_) => Err(RecordLost),
-                None => Ok(Recorded::Noise),
-            },
-        };
+            })
+            // A poisoned lock: no event in the window — a reply that needed
+            // one must not leave (fail closed).
+            .unwrap_or(if gating {
+                Err(RecordLost)
+            } else {
+                Ok(Recorded::Noise)
+            });
         self.wake.notify_one();
         result
     }
 
     /// Offer events as noise (queued within the noise share, or counted; an
     /// encoding failure is counted too).
-    fn offer_all(window: &mut SendWindow, events: &[AuditEvent]) {
+    fn offer_all(steps: &mut WindowSteps<'_>, events: &[AuditEvent]) {
         for event in events {
-            let _ = window.offer_noise(&event_of(event));
+            let _ = steps.offer_noise(&event_of(event));
         }
     }
 
@@ -235,22 +228,22 @@ impl AuditGate {
     /// Spec: crates/kdc audit.rs (exactly one per request);
     /// docs/questions/Q-252 item 9.
     fn commit_all(
-        window: &mut SendWindow,
+        steps: &mut WindowSteps<'_>,
         reservation: Reservation,
         events: &[AuditEvent],
         overflowed: bool,
     ) -> Result<Recorded, RecordLost> {
         let mut events = events.iter();
         let Some(first) = events.next() else {
-            window.release(reservation);
+            steps.release(reservation);
             return Err(RecordLost);
         };
-        window
+        steps
             .commit(reservation, &event_of(first))
             .map_err(|_| RecordLost)?;
         for extra in events {
-            let slot = window.reserve().map_err(|_| RecordLost)?;
-            window
+            let slot = steps.reserve().map_err(|_| RecordLost)?;
+            steps
                 .commit(slot, &event_of(extra))
                 .map_err(|_| RecordLost)?;
         }
@@ -262,47 +255,56 @@ impl AuditGate {
 
     /// Record the audit client's view of auditd.
     pub fn set_reachable(&self, reachable: bool) {
-        if let Some(mut state) = self.lock() {
-            state.reachable = reachable;
-        }
+        self.core.set_reachable(reachable);
     }
 
     /// Whether auditd is reachable (the audit client's view).
     #[must_use]
     pub fn is_reachable(&self) -> bool {
-        self.lock().is_some_and(|state| state.reachable)
+        self.core.is_reachable()
     }
 
     /// The next batch to send, if nothing is in flight and anything is
     /// pending. Spec: docs/50 §3.6, §8.1.
     pub(crate) fn next_batch(&self) -> Option<Append> {
-        self.lock().and_then(|mut state| state.window.next_batch())
+        self.core.next_batch()
     }
 
     /// auditd's acknowledgement of the batch in flight.
     pub(crate) fn acknowledge(&self, ack: &Ack) -> Result<usize, WindowError> {
-        match self.lock() {
-            Some(mut state) => state.window.acknowledge(ack),
-            None => Err(WindowError::UnexpectedAck),
-        }
+        self.core.acknowledge(ack)
     }
 
     /// The audit connection dropped: the batch in flight goes back.
     pub(crate) fn connection_lost(&self) {
-        if let Some(mut state) = self.lock() {
-            state.window.connection_lost();
-        }
+        self.core.connection_lost();
     }
 
     /// Events not yet acknowledged plus outstanding reservations.
     #[must_use]
     pub fn outstanding(&self) -> usize {
-        self.lock().map_or(0, |state| {
-            state
-                .window
-                .unacknowledged()
-                .saturating_add(usize::try_from(state.window.reserved()).unwrap_or(usize::MAX))
-        })
+        self.core.outstanding()
+    }
+
+    /// The stop's flush (`ipc_audit::AuditGate::close`): the kdc stops
+    /// waiting as soon as its link counts auditd as unreachable
+    /// (`FlushWait::UntilAcknowledgedOrUnreachable` — the rule A-87 kept for
+    /// the kdc), then ends the link (`end_link`), then reports what is left.
+    /// Spec: docs/questions/Q-313 (A-82), Q-350 item 11 (A-87); docs/52
+    /// §3.11 R6 (b).
+    pub(crate) async fn close<E: Future<Output = ()>>(
+        &self,
+        grace: Duration,
+        end_link: E,
+    ) -> Unflushed {
+        self.core
+            .close(
+                grace,
+                FlushWait::UntilAcknowledgedOrUnreachable,
+                tokio::time::sleep,
+                end_link,
+            )
+            .await
     }
 
     /// Wait until an event was recorded (or a stored wake-up is pending).
