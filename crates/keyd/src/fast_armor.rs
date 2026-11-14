@@ -61,9 +61,10 @@
 use crate::as_exchange::token_deny;
 use crate::audit::{AuditReason, AuditSink};
 use crate::authz::{CallerId, HandleSlot, Operation};
+use crate::chain::{self, ArmorOpened, ChainVerified};
 use crate::entropy::EntropySource;
 use crate::error::{AuthnError, Deny, Error, Internal};
-use crate::keyd::{draw, key_usage, new_random_key, open, seal, AuditFields, Keyd};
+use crate::keyd::{draw, key_usage, new_random_key, seal, AuditFields, Keyd};
 use crate::model::KeyHandle;
 use crate::store::KeyStore;
 use crate::template::tgs_name;
@@ -215,30 +216,37 @@ pub(crate) fn open_armored_request(
     armor_key: &ProtocolKey,
     armored_req: &KrbFastArmoredReq,
     checksummed: &[u8],
-) -> Internal<KrbFastReq> {
+) -> Internal<(KrbFastReq, ArmorOpened)> {
     // 1. The req-checksum (usage 50).
     let req_checksum = &armored_req.req_checksum;
     let cksumtype = ChecksumType::from_number(req_checksum.cksumtype)
         .ok()
         .filter(|t| *t == armor_key.enc_type().checksum_type())
         .ok_or(Deny::denied(AuditReason::ChecksumUnsupported))?;
-    krb_crypto::verify_mic(
+    let checksum_verified = chain::verify_mic(
         armor_key,
         cksumtype,
-        key_usage(KEY_USAGE_FAST_REQ_CHKSUM)?,
+        KEY_USAGE_FAST_REQ_CHKSUM,
         checksummed,
         &req_checksum.checksum,
-    )
-    .map_err(|_| Deny::denied(AuditReason::FastChecksumMismatch))?;
+        AuditReason::FastChecksumMismatch,
+    )?;
 
     // 2. enc-fast-req (usage 51).
     let enc_fast_req = &armored_req.enc_fast_req;
     if enc_fast_req.etype != armor_key.enc_type().number() {
         return Err(Deny::denied(AuditReason::UnsupportedEncType));
     }
-    let fast_req_plain: Zeroizing<Vec<u8>> =
-        open(armor_key, KEY_USAGE_FAST_ENC, &enc_fast_req.cipher)?;
-    KrbFastReq::decode(&fast_req_plain).map_err(|_| Deny::denied(AuditReason::MalformedInput))
+    let (fast_req_plain, fast_req_decrypted): (Zeroizing<Vec<u8>>, _) =
+        chain::open(armor_key, KEY_USAGE_FAST_ENC, &enc_fast_req.cipher)?;
+    let fast_req = KrbFastReq::decode(&fast_req_plain)
+        .map_err(|_| Deny::denied(AuditReason::MalformedInput))?;
+    // The evidence of both steps, for the caller's `ChainVerified`
+    // (crate::chain, R7).
+    Ok((
+        fast_req,
+        ArmorOpened::new(checksum_verified, fast_req_decrypted),
+    ))
 }
 
 /// The strengthened reply key and the enc-part sealed in it (docs/48 §4.3,
@@ -659,6 +667,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             authenticator,
             ctime,
             findings,
+            evidence,
         } = self.open_local_tgt(krbtgt, &ap_req, AP_REQ_AUTHENTICATOR, now_s, fields)?;
 
         // 5. No checksum (Q-120 item 3); the subkey is mandatory (RFC 6113
@@ -680,12 +689,15 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
 
         // 7-8. The req-checksum over the outer KDC-REQ-BODY (usage 50), then
         // enc-fast-req (usage 51). Spec: RFC 6113 5.4.2; RFC 3961 §3.
-        let fast_req = open_armored_request(&armor_key, armored_req, outer_req_body)?;
+        let (fast_req, armor_evidence) =
+            open_armored_request(&armor_key, armored_req, outer_req_body)?;
 
         // The chain is complete: armor TGT, authenticator, subkey, armor key,
-        // req-checksum, enc-fast-req. Findings, then the replay cache
-        // (Q-120 item 2; A-26).
+        // req-checksum, enc-fast-req — its proof from that evidence; then the
+        // findings, then the replay cache (Q-120 item 2; A-26; crate::chain).
+        let verified = ChainVerified::fast_armor(evidence, armor_evidence);
         self.complete_chain(
+            verified,
             findings,
             replay_key_for(&ap_req.ticket, &authenticator, ctime),
             now_s,

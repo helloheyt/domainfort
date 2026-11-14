@@ -266,16 +266,18 @@ fn code_tables_are_closed() {
     assert_eq!(table!(KdcReason), 66);
     // Task A15a appended the four grant reasons before `Unlisted`
     // (docs/questions/Q-452 item 4); A-102 the seven decision reasons
-    // (docs/52 §4.5); R2 the two operation-binding reasons (docs/52 §5),
-    // `Unlisted` last (79).
-    assert_eq!(table!(KeydReason), 79);
+    // (docs/52 §4.5); R2 the two operation-binding reasons (docs/52 §5);
+    // R6b the discard of a deleted principal's set-secret entries
+    // (docs/questions/Q-520), `Unlisted` last (80).
+    assert_eq!(table!(KeydReason), 80);
     assert_eq!(KeydReason::NoGrant.code(), 66);
     assert_eq!(KeydReason::GrantTableFull.code(), 69);
     assert_eq!(KeydReason::NoDecision.code(), 70);
     assert_eq!(KeydReason::CeremonySealed.code(), 76);
     assert_eq!(KeydReason::OperationDigestMissing.code(), 77);
     assert_eq!(KeydReason::OperationDigestMismatch.code(), 78);
-    assert_eq!(KeydReason::Unlisted.code(), 79);
+    assert_eq!(KeydReason::SecretDecisionDiscarded.code(), 79);
+    assert_eq!(KeydReason::Unlisted.code(), 80);
     assert_eq!(table!(LdapReason), 53);
     assert_eq!(table!(CodecErrorCode), 35);
     assert_eq!(table!(CodecLimit), 12);

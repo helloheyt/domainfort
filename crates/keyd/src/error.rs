@@ -17,18 +17,25 @@
 //! AGENTS.md §6 (no secrets in errors).
 
 use crate::audit::{AuditOutcome, AuditReason};
+use crate::chain::{ChainClass, ChainVerified};
 pub use keyd_types::{AuthnError, ConfigError, Error, IssueError};
 
 /// Internal refusal: the public error kind plus the audit-only reason, and
 /// the non-secret class reported to the caller — set only for a refusal
 /// decided after an authentication step's cryptographic chain completed
-/// ([`Deny::classified`], A-26), or for the startup hold-down
-/// ([`Deny::startup_hold_down`], A-56: decided before any secret work).
+/// ([`Deny::after_chain`], which needs the chain's proof, A-26 — R7), or for
+/// the startup hold-down ([`Deny::startup_hold_down`], A-56: decided before
+/// any secret work).
+///
+/// The `class` field is private to this module, so no refusal outside it
+/// can carry a class except through those two constructors: without a
+/// [`ChainVerified`] every refusal is the uniform `Denied` by type
+/// (docs/52 §3.6 (a), crate::chain).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Deny {
     pub(crate) outcome: AuditOutcome,
     pub(crate) reason: AuditReason,
-    pub(crate) class: Option<AuthnError>,
+    class: Option<AuthnError>,
 }
 
 impl Deny {
@@ -40,10 +47,13 @@ impl Deny {
         }
     }
 
-    /// A refusal reported as `class`. Call ONLY where every cryptographic
-    /// check of the authentication step has already passed (A-26).
-    /// Spec: docs/questions/Q-071 (A-26).
-    pub(crate) const fn classified(reason: AuditReason, class: AuthnError) -> Self {
+    /// A refusal reported as `class` — buildable only with the proof that
+    /// the authentication step's cryptographic chain completed (A-26;
+    /// crate::chain, docs/52 §3.6 (a), R7). Called through
+    /// `ChainVerified::refuse`.
+    /// Spec: docs/questions/Q-071 (A-26); docs/10 §9.
+    pub(crate) const fn after_chain(_chain: &ChainVerified, class: ChainClass) -> Self {
+        let (reason, class) = class.parts();
         Deny {
             outcome: AuditOutcome::Denied,
             reason,
@@ -96,7 +106,7 @@ pub(crate) type Internal<T> = core::result::Result<T, Deny>;
 
 impl From<Deny> for AuthnError {
     /// Every refusal of an authentication step is `Denied` (docs/10 §9),
-    /// except one built with [`Deny::classified`] after the cryptographic
+    /// except one built with [`Deny::after_chain`] after the cryptographic
     /// chain completed (A-26), and the startup hold-down (`Unavailable`,
     /// A-56). Other `Unavailable` outcomes (entropy, a full table) stay the
     /// uniform `Denied`: some are decided inside the chain, where telling

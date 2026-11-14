@@ -41,6 +41,45 @@
 //! stricter, so nothing is held after a start; dird re-registers on demand
 //! (docs/52 §4.3, §4.4).
 //!
+//! # Destroy decisions and the key store (R6b)
+//!
+//! **A destroy registration is dird's statement that the principal is
+//! deleted** (it registers one only after the `Delete` committed, or for a
+//! tombstone). So, before anything else is decided about it, it discards
+//! every live set-secret entry for the principal's two handles
+//! (`PrincipalLongterm`, `Service`) — a dird decision or the ceremony's grant
+//! — and records one `SecretDecisionDiscarded` record per entry discarded
+//! (after the registration's own record). Without that, a password set begun
+//! before the `Delete` (its decision live for 30 s) could still create a key
+//! set for the deleted principal after the registration read "no key set ⇒
+//! complete". The discard happens on a refused registration too: it is the
+//! effect of the `Delete` decision, not of the destroy table. Afterwards no
+//! key set can come to exist for the principal: `set_secret` needs a live
+//! set-secret entry (none is left; dird registers new ones only for live
+//! objects), `create_key` and Admin's grants exist only before the seal
+//! (`authz::provisioning_only`), and the key-operation decisions (`rotate_*`,
+//! `retire_kvno`) act only on an existing key set (`KeyNotFound`).
+//!
+//! A `DestroyKeySet` decision is registered only for a principal that still
+//! has a key set it would destroy (its `PrincipalLongterm` or `Service` key
+//! set); for any other principal the registration is the uniform `Denied`,
+//! reason `KeyNotFound`, in its one record (after the intent, A-88), and it
+//! takes no table slot. So "this principal's destruction is complete" is
+//! read from keyd's **key store** — which survives a keyd start once it is
+//! persistent (P-17) — and not from the decision table (memory only, an
+//! executed entry kept 7 days at most): dird's re-registration of a
+//! tombstone keyd already destroyed is refused, and nothing is scheduled
+//! (docs/questions/Q-501 decision; Q-520).
+//!
+//! **The order of the two checks:** the key-store check comes **before** the
+//! table. A principal without a key set is refused whatever the table holds
+//! — also when it holds an identical decision (an executed one, kept for its
+//! replay): the answer depends on the store alone, the one durable source.
+//! While a key set exists, an identical live registration is still accepted
+//! unchanged (Q-471 item 5), which is the case in which a retry after an
+//! unknown outcome has anything left to do; without one, the retry's refusal
+//! is just as harmless — nothing is left to destroy.
+//!
 //! # Audit
 //!
 //! A registration loosens keyd, so it takes the daemon's intent path (A-88,
@@ -59,7 +98,7 @@ use crate::authz::{CallerId, HandleSlot, Operation, Role};
 use crate::entropy::EntropySource;
 use crate::error::{Deny, Error, Internal};
 use crate::keyd::{AuditFields, Keyd};
-use crate::model::{KeyHandle, Kvno, PrincipalBinding, PrincipalId};
+use crate::model::{KeyHandle, KeyPurpose, Kvno, PrincipalBinding, PrincipalId};
 use crate::store::KeyStore;
 use crate::time::kerberos_time_seconds;
 use keyd_types::decision::{set_secret_shape_fits, DecisionFamily};
@@ -277,6 +316,16 @@ impl DecisionTable {
         self.secrets.remove(handle);
     }
 
+    /// Drop the set-secret entry of `handle` (its principal was deleted —
+    /// a destroy registration, R6b) and say whether a **live** one was
+    /// dropped: `Some(its decision id)` (`Some(None)` for the ceremony's
+    /// grant), `None` if there was none or it had expired.
+    /// Spec: docs/questions/Q-501 (R6b), Q-520; docs/questions/Q-450 item 4.
+    fn withdraw_secret(&mut self, handle: &KeyHandle, now: i64) -> Option<Option<DecisionId>> {
+        let entry = self.secrets.remove(handle)?;
+        (now <= entry.expires_at).then_some(entry.decision)
+    }
+
     /// Register a key-operation or destroy decision. An identical live
     /// decision under the same id is accepted unchanged (a re-registration
     /// after an unknown outcome is harmless — docs/52 §4.3); a different
@@ -475,18 +524,27 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// 3. the approvers: at most three, pairwise distinct, at least two for
     ///    a key operation — `DecisionInvalid`;
     /// 4. the lifetime: 1 to the family's ceiling — `DecisionInvalid`;
-    /// 5. the table: a full family ⇒ `Unavailable` (`DecisionTableFull`); an
+    /// 5. a `DestroyKeySet` decision: first every live set-secret entry for
+    ///    the principal's two handles is discarded (one
+    ///    `SecretDecisionDiscarded` record each, after this call's own
+    ///    record), whatever follows; then the principal must still have a
+    ///    `PrincipalLongterm` or `Service` key set — else `KeyNotFound`,
+    ///    whatever the table holds, and no slot is taken (R6b; module
+    ///    documentation, "Destroy decisions and the key store");
+    /// 6. the table: a full family ⇒ `Unavailable` (`DecisionTableFull`); an
     ///    id that names a different live decision ⇒ `DecisionConflict`; the
     ///    same decision again ⇒ accepted, nothing changes.
     ///
     /// Bindings are not judged here: the `set_secret` that consumes a
     /// set-secret decision judges its binding as before (A-19), so a
     /// decision can only narrow what keyd accepts (docs/questions/Q-450
-    /// item 7). No key is read or written; nothing secret is taken or
-    /// returned.
+    /// item 7). No key is read or written (step 5 asks the store only
+    /// whether a key set exists, and drops set-secret entries — names,
+    /// salts, no key); nothing secret is taken or returned.
     ///
     /// Spec: docs/52 §4.2, §4.3, §4.5, §7 R1; docs/10 §2, §6א, §9, §10;
-    /// docs/50 R50-5; docs/questions/Q-460 (A-102), Q-450, Q-452.
+    /// docs/50 R50-5; docs/questions/Q-460 (A-102), Q-450, Q-452, Q-471 item
+    /// 5, Q-501 (R6b).
     pub fn register_decision(
         &mut self,
         caller: &CallerId,
@@ -497,12 +555,29 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         now: &KerberosTime,
     ) -> Result<(), Error> {
         let fields = decision_fields(Some(id), operation, approvers);
-        let result =
-            self.register_decision_inner(caller, id, operation, approvers, lifetime_secs, now);
+        let mut discarded = Vec::new();
+        let result = self.register_decision_inner(
+            caller,
+            id,
+            operation,
+            approvers,
+            lifetime_secs,
+            now,
+            &mut discarded,
+        );
+        // The registration's own record first (the daemon commits the first
+        // record into the slot it reserved for the outcome), then one record
+        // per set-secret entry the destroy registration discarded (R6b).
         self.emit(caller, Operation::RegisterDecision, now, &fields, &result);
+        for (handle, decision) in discarded {
+            self.emit_discard(caller, now, &handle, decision);
+        }
         result.map_err(Error::from)
     }
 
+    // The arguments of `register_decision`, plus where the destroy
+    // registration lists the set-secret entries it discarded.
+    #[allow(clippy::too_many_arguments)]
     fn register_decision_inner(
         &mut self,
         caller: &CallerId,
@@ -511,6 +586,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         approvers: &[PrincipalId],
         lifetime_secs: u32,
         now: &KerberosTime,
+        discarded: &mut Vec<(KeyHandle, Option<DecisionId>)>,
     ) -> Internal<()> {
         self.admit(caller, Operation::RegisterDecision, &[], now)?;
         if !operation.is_well_formed() || !operation.purposes_permitted() {
@@ -527,6 +603,27 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         let expires_at = now_s
             .checked_add(i64::from(lifetime_secs))
             .ok_or(Deny::denied(AuditReason::DecisionInvalid))?;
+        if let DecidedOperation::DestroyKeySet { principal } = operation {
+            // R6b: the registration is dird's statement that the principal is
+            // deleted — first, every live set-secret entry for its two
+            // handles goes, whatever the rest decides, so no key set can come
+            // to exist for it from here on (module documentation, "Destroy
+            // decisions and the key store").
+            for purpose in [KeyPurpose::PrincipalLongterm, KeyPurpose::Service] {
+                let handle = KeyHandle::new(*principal, purpose);
+                if let Some(decision) = self.decisions.withdraw_secret(&handle, now_s) {
+                    discarded.push((handle, decision));
+                }
+            }
+            // Then a destroy decision only for a principal that still has a
+            // key set — before the table is looked at, so the answer for a
+            // principal without one is the refusal whatever the table holds
+            // (keyd's key store is the one source of "destroyed"), and it
+            // takes no slot.
+            if !self.holds_destroyable_key_set(principal) {
+                return Err(Deny::denied(AuditReason::KeyNotFound));
+            }
+        }
         match operation {
             DecidedOperation::SetSecret { targets, .. } => self.decisions.register_secrets(
                 Some(id),
@@ -543,6 +640,22 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
                 .decisions
                 .register_op(id, operation, approvers, expires_at, now_s),
         }
+    }
+
+    /// Whether `principal` has a key set a destroy decision would destroy —
+    /// its `PrincipalLongterm` or its `Service` key set (the two purposes
+    /// `destroy_key_set` touches; never Krbtgt or AdminService). Reads the
+    /// store only (no key is read).
+    /// Spec: docs/questions/Q-501 item 5 and its decision (R6b); docs/10 §7
+    /// (`destroy_key_set`: "the PrincipalLongterm and the Service of it").
+    fn holds_destroyable_key_set(&self, principal: &PrincipalId) -> bool {
+        [KeyPurpose::PrincipalLongterm, KeyPurpose::Service]
+            .into_iter()
+            .any(|purpose| {
+                self.store
+                    .get(&KeyHandle::new(*principal, purpose))
+                    .is_some()
+            })
     }
 
     /// `grant_set_secret`: the provisioning ceremony's grant of a first
@@ -811,6 +924,34 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         }
     }
 
+    /// The record of one set-secret entry a destroy registration discarded
+    /// (R6b): operation `RegisterDecision` (the call that discarded it),
+    /// outcome `Success`, reason `SecretDecisionDiscarded`, the handle, and
+    /// the discarded entry's decision id (`None`: the ceremony's grant).
+    /// Spec: docs/10 §10, I8; docs/questions/Q-520.
+    fn emit_discard(
+        &mut self,
+        caller: &CallerId,
+        now: &KerberosTime,
+        handle: &KeyHandle,
+        decision: Option<DecisionId>,
+    ) {
+        self.audit.record(&AuditRecord {
+            ts: *now,
+            caller_role: caller.role,
+            caller_uid: caller.uid,
+            op: Operation::RegisterDecision,
+            principal: Some(handle.principal),
+            purpose: Some(handle.purpose),
+            kvno: None,
+            secondary: None,
+            approvers: None,
+            decision,
+            result: AuditOutcome::Success,
+            reason: AuditReason::SecretDecisionDiscarded,
+        });
+    }
+
     /// The one record of a replayed decision: the recorded outcome, reason
     /// `DecisionReplayed`.
     /// Spec: docs/10 §10, I8; docs/52 §3.10.
@@ -851,7 +992,6 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::KeyPurpose;
     use krb_proto::{KerberosString, PrincipalName, Realm};
 
     fn target(byte: u8, purpose: KeyPurpose, name: &str) -> SetSecretTarget {

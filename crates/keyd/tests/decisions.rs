@@ -574,11 +574,11 @@ fn the_destroy_listing_shows_pending_decisions_only() {
             &now(),
         )
         .unwrap();
-    let carol_id = CAROL.principal;
+    // (R6b: a destroy decision needs a principal with a key set — alice's.)
     let second = f
         .decide(
             DecidedOperation::DestroyKeySet {
-                principal: carol_id,
+                principal: ALICE_ID,
             },
             &now(),
         )
@@ -591,7 +591,7 @@ fn the_destroy_listing_shows_pending_decisions_only() {
         .iter()
         .map(|p| (p.decision, p.principal))
         .collect();
-    assert_eq!(listed, [(first, BOB_ID), (second, carol_id)]);
+    assert_eq!(listed, [(first, BOB_ID), (second, ALICE_ID)]);
     assert_eq!(page.next, None);
     // Strictly after the first.
     let after = f
@@ -670,6 +670,224 @@ fn a_destroy_decision_removes_both_key_sets() {
         assert_eq!(record.kvno, Some(Kvno::INITIAL));
         assert_eq!(record.secondary.unwrap().kvno, Some(Kvno::INITIAL));
     }
+}
+
+/// Attack test (R6b; docs/questions/Q-501 decision, Q-520): a destroy
+/// decision cannot be registered for a principal that has no key set a
+/// destruction would remove — an unknown principal, the krbtgt principal
+/// (only a Krbtgt key set) — however dird (Role::Ldap) asks: the uniform
+/// `Denied`, reason `KeyNotFound`, one record, and **no table slot**: the
+/// listing stays empty, the id names no decision (an execution is
+/// `NoDecision`), and the same id is free for a decision on a principal
+/// with a key set (no `DecisionConflict`).
+#[test]
+fn a_destroy_decision_cannot_be_registered_without_a_key_set() {
+    let mut f = Fixture::new();
+    let id = DecisionId::new(0x0BAD_0001);
+    for principal in [PrincipalId::from_bytes([0xEE; 16]), KRBTGT_ID] {
+        let refused = DecidedOperation::DestroyKeySet { principal };
+        let before = f.records().len();
+        assert_eq!(
+            f.keyd
+                .register_decision(&LDAP, id, &refused, &[], MAX_DESTROY_DECISION_SECS, &now()),
+            Err(Error::Denied)
+        );
+        assert_eq!(f.records().len(), before + 1);
+        let record = last(&f);
+        assert_eq!(record.op, Operation::RegisterDecision);
+        assert_eq!(record.result, AuditOutcome::Denied);
+        assert_eq!(record.reason, AuditReason::KeyNotFound);
+        assert_eq!(record.principal, Some(principal));
+        assert_eq!(record.decision, Some(id));
+    }
+    assert!(f
+        .keyd
+        .list_destroy_decisions(&ADMIN, None, &now())
+        .unwrap()
+        .entries
+        .is_empty());
+    assert_eq!(
+        f.keyd.destroy_key_set(&ADMIN, id, &now()),
+        Err(Error::Denied)
+    );
+    assert_eq!(last(&f).reason, AuditReason::NoDecision);
+    // The refusals took no slot: the id registers a decision for bob.
+    let bob = DecidedOperation::DestroyKeySet { principal: BOB_ID };
+    assert_eq!(
+        f.keyd
+            .register_decision(&LDAP, id, &bob, &[], MAX_DESTROY_DECISION_SECS, &now()),
+        Ok(())
+    );
+}
+
+/// Attack test (R6b follow-up; docs/questions/Q-520): a password set begun
+/// before the `Delete` must not create a key set for the deleted principal.
+/// carol has no key set; dird registers her `SetSecret` decision (its
+/// `BeginPasswordSet`), then — her `Delete` committed — her destroy
+/// decision. The registration is refused (no key set: `KeyNotFound`) **and**
+/// discards her live set-secret decision, with one `SecretDecisionDiscarded`
+/// record after the registration's own; admind's `set_secret` with exactly
+/// the decided binding and salt is then refused (`NoGrant`) and creates no key
+/// set — the "complete" dird read is true. The same for a computer's two
+/// handles (two discard records), for the ceremony's grant (no decision id),
+/// and for an accepted registration (alice has a key set and a password
+/// change in flight: accepted, the change discarded, the old password still
+/// works until the destruction runs).
+#[test]
+fn a_destroy_registration_discards_the_principals_set_secret_decisions() {
+    let mut f = Fixture::new();
+    let destroy = |f: &mut Fixture, principal: PrincipalId| {
+        f.keyd.register_decision(
+            &LDAP,
+            next_decision_id(),
+            &DecidedOperation::DestroyKeySet { principal },
+            &[],
+            MAX_DESTROY_DECISION_SECS,
+            &now(),
+        )
+    };
+    let discards = |f: &Fixture, since: usize| -> Vec<(KeyHandle, Option<DecisionId>)> {
+        f.records()[since..]
+            .iter()
+            .filter(|r| r.reason == AuditReason::SecretDecisionDiscarded)
+            .map(|r| {
+                assert_eq!(r.op, Operation::RegisterDecision);
+                assert_eq!(r.result, AuditOutcome::Success);
+                (
+                    KeyHandle::new(r.principal.unwrap(), r.purpose.unwrap()),
+                    r.decision,
+                )
+            })
+            .collect()
+    };
+
+    // carol: the decision of her BeginPasswordSet, then her destroy decision.
+    let carol_decision = f
+        .decide(
+            DecidedOperation::SetSecret {
+                kind: AccountKind::User,
+                targets: vec![SetSecretTarget {
+                    handle: CAROL,
+                    binding: carol_binding(),
+                    salt: CAROL_SALT.to_owned(),
+                }],
+            },
+            &now(),
+        )
+        .unwrap();
+    let before = f.records().len();
+    assert_eq!(destroy(&mut f, CAROL.principal), Err(Error::Denied));
+    // The registration's own record first, then the discard.
+    assert_eq!(f.records().len(), before + 2);
+    assert_eq!(f.records()[before].reason, AuditReason::KeyNotFound);
+    assert_eq!(discards(&f, before), [(CAROL, Some(carol_decision))]);
+    // admind's set_secret with exactly what dird decided: no decision left.
+    assert_eq!(
+        f.keyd.set_secret(
+            &DIRECTORY,
+            &CAROL,
+            &carol_binding(),
+            z("carol's first password"),
+            CAROL_SALT,
+            &now()
+        ),
+        Err(Error::Denied)
+    );
+    assert_eq!(last(&f).reason, AuditReason::NoGrant);
+    // No key set came to exist: still nothing to destroy, nothing to log in
+    // with.
+    assert_eq!(destroy(&mut f, CAROL.principal), Err(Error::Denied));
+    assert_eq!(
+        f.records()[f.records().len() - 1].reason,
+        AuditReason::KeyNotFound
+    );
+    assert!(!f.password_works(&CAROL, "carol's first password", CAROL_SALT));
+
+    // A computer: both handles' entries go, two records (PrincipalLongterm,
+    // then Service).
+    let ws = PrincipalId::from_bytes([0xC8; 16]);
+    let service = KeyHandle::new(ws, KeyPurpose::Service);
+    f.grant(&service, &service_binding(), "EXAMPLE.ORGhostws", &now())
+        .unwrap();
+    let before = f.records().len();
+    assert_eq!(destroy(&mut f, ws), Err(Error::Denied));
+    let found = discards(&f, before);
+    assert_eq!(found.len(), 2);
+    assert_eq!(
+        found[0].0,
+        KeyHandle::new(ws, KeyPurpose::PrincipalLongterm)
+    );
+    assert_eq!(found[1].0, service);
+
+    // The ceremony's grant (Role::Admin, before the seal): discarded too,
+    // its record without a decision id.
+    let dave = KeyHandle::new(
+        PrincipalId::from_bytes([0xDA; 16]),
+        KeyPurpose::PrincipalLongterm,
+    );
+    f.grant_as(&ADMIN, &dave, &carol_binding(), CAROL_SALT, &now())
+        .unwrap();
+    let before = f.records().len();
+    assert_eq!(destroy(&mut f, dave.principal), Err(Error::Denied));
+    assert_eq!(discards(&f, before), [(dave, None)]);
+
+    // Accepted: alice has a key set and a password change in flight.
+    grant(&mut f.keyd, &ALICE, &alice_binding(), ALICE_SALT, &now()).unwrap();
+    let before = f.records().len();
+    assert_eq!(destroy(&mut f, ALICE_ID), Ok(()));
+    assert_eq!(f.records()[before].result, AuditOutcome::Success);
+    assert_eq!(f.records()[before].reason, AuditReason::None);
+    assert_eq!(discards(&f, before).len(), 1);
+    assert_eq!(
+        f.keyd.set_secret(
+            &DIRECTORY,
+            &ALICE,
+            &alice_binding(),
+            z("a new password"),
+            ALICE_SALT,
+            &now()
+        ),
+        Err(Error::Denied)
+    );
+    assert_eq!(last(&f).reason, AuditReason::NoGrant);
+    assert!(f.password_works(&ALICE, ALICE_PASSWORD, ALICE_SALT));
+}
+
+/// R6b, the order of the two checks (docs/questions/Q-471 item 5, Q-501,
+/// Q-520): while the principal has a key set, the identical registration
+/// is accepted unchanged (a retry after an unknown outcome); once its
+/// decision ran and destroyed the key sets, the identical registration is
+/// **refused** (`KeyNotFound`) although keyd still holds the executed
+/// decision — the key store, not the table, says "destroyed" — and the
+/// executed decision's recorded result is still returned to keyadm.
+#[test]
+fn a_destroy_registration_reads_the_key_store_before_the_table() {
+    let mut f = Fixture::new();
+    let id = DecisionId::new(0x0BAD_0002);
+    let destroy = DecidedOperation::DestroyKeySet { principal: BOB_ID };
+    let register = |f: &mut Fixture| {
+        f.keyd
+            .register_decision(&LDAP, id, &destroy, &[], MAX_DESTROY_DECISION_SECS, &now())
+    };
+    assert_eq!(register(&mut f), Ok(()));
+    // The identical retry: accepted unchanged, one pending decision.
+    assert_eq!(register(&mut f), Ok(()));
+    let page = f.keyd.list_destroy_decisions(&ADMIN, None, &now()).unwrap();
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(f.keyd.destroy_key_set(&ADMIN, id, &now()), Ok(()));
+    // Executed: bob has no key set left — the identical registration is
+    // refused, nothing becomes pending.
+    assert_eq!(register(&mut f), Err(Error::Denied));
+    assert_eq!(last(&f).reason, AuditReason::KeyNotFound);
+    assert!(f
+        .keyd
+        .list_destroy_decisions(&ADMIN, None, &now())
+        .unwrap()
+        .entries
+        .is_empty());
+    // keyadm presenting the id again still gets the recorded result.
+    assert_eq!(f.keyd.destroy_key_set(&ADMIN, id, &now()), Ok(()));
+    assert_eq!(last(&f).reason, AuditReason::DecisionReplayed);
 }
 
 /// docs/52 §3.4 (N3), §7 R4; Q-465 (A-102): `verify_secret` from Directory

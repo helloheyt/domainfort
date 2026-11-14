@@ -69,7 +69,9 @@
 //!    tombstone's GUID }, no approvers, keyd_types::MAX_DESTROY_DECISION_SECS)`
 //!    (crate::registration), after the outcome event, so a destroy decision
 //!    exists only for an account whose deletion is durably recorded and
-//!    committed. keyadm's `destroy-sweep` executes it in keyd. A failure is
+//!    committed. keyadm's `destroy-sweep` executes it in keyd. keyd's
+//!    refusal (`Denied`) means the account has no key set to destroy (R6b)
+//!    and is no failure; any other failure is
 //!    noted (`AdminDestroyNotRegistered`) and the reply stays the `Delete`'s
 //!    success: the account is deleted, and its key sets are unreachable (no
 //!    object ⇒ no handle — docs/51 §9, fail closed); the re-registration
@@ -86,8 +88,9 @@
 //! Between jobs — at the thread's start and every
 //! `AdminParams::destroy_reconcile_interval` — the thread registers again
 //! the destroy decision of every tombstoned user or computer that keyd does
-//! not hold as pending and has not executed (crate::reconcile;
-//! docs/questions/Q-470 item 4, Q-501).
+//! not hold as pending; keyd refuses it once the account has no key set
+//! left, which settles it (crate::reconcile; docs/questions/Q-470 item 4,
+//! Q-501, R6b).
 //!
 //! An operation that commits nothing (`Lookup`, `CompletePasswordSet`) has
 //! its decision event only, committed into the window before the reply
@@ -675,12 +678,15 @@ impl Running {
                 return;
             }
         };
-        if let Err(failure) = self
+        match self
             .worker
             .verifier
             .register_decision(DecisionRegistration::of_tombstone(&tombstoned))
         {
-            note(Note::AdminDestroyNotRegistered, Some(failure.code()));
+            // keyd refuses a destroy decision for an account with no key set
+            // (R6b, docs/questions/Q-501): nothing to destroy — not a failure.
+            Ok(()) | Err(RegistrationFailure::Refused(keyd_types::Error::Denied)) => {}
+            Err(failure) => note(Note::AdminDestroyNotRegistered, Some(failure.code())),
         }
     }
 

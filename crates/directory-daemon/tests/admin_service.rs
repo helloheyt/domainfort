@@ -3034,6 +3034,21 @@ fn registrations_for(world: &World, target: Guid) -> usize {
         .count()
 }
 
+/// keyd's refusals of `target`'s destroy decision because the account has
+/// no key set left (R6b: `KeyNotFound` — the "destruction complete" answer,
+/// docs/questions/Q-501, Q-520).
+fn refused_for_no_key_set(world: &World, target: Guid) -> usize {
+    let id = destroy_decision_id(target).get();
+    keyd_records_for(world, ipc_audit::KeydOperation::RegisterDecision, target)
+        .iter()
+        .filter(|r| {
+            r.result == ipc_audit::KeydOutcome::Denied
+                && r.reason == ipc_audit::KeydReason::KeyNotFound
+                && r.decision == Some(id)
+        })
+        .count()
+}
+
 /// The pending destroy decisions keyadm sees (Role::Admin), as principals.
 fn pending_destructions(world: &World) -> Vec<keyd::PrincipalId> {
     world
@@ -3049,9 +3064,11 @@ fn pending_destructions(world: &World) -> Vec<keyd::PrincipalId> {
 /// the key sets remain (as a persistent store, P-17, would keep them). dird's
 /// periodic re-registration registers the decision again under the same id;
 /// keyadm's `destroy-sweep` then destroys **both** key sets (keyd's record
-/// names the two destroyed kvnos). The next run finds keyd holding the
-/// executed decision (accepted unchanged, nothing pending, nothing to sweep)
-/// and settles it; the runs after that ask keyd nothing more for it.
+/// names the two destroyed kvnos). The next run's registration is refused
+/// by keyd — ws7 has no key set left (R6b: `KeyNotFound`, though keyd still
+/// holds the executed decision) — so nothing is pending, nothing is left
+/// to sweep, and dird settles it; the runs after that ask keyd nothing more
+/// for it.
 #[test]
 fn lost_destroy_decisions_are_registered_again_until_keyd_ran_them() {
     let Some(mut world) = World::new(Options {
@@ -3159,18 +3176,22 @@ fn lost_destroy_decisions_are_registered_again_until_keyd_ran_them() {
     );
     assert_eq!(done.decision, Some(destroy_decision_id(ws7).get()));
 
-    // The next run: keyd holds the executed decision — accepted unchanged,
-    // nothing pending, nothing for keyadm to sweep — and dird settles it.
-    assert!(support::eventually(RECONCILE_WAIT, || registrations_for(
-        &world, ws7
-    ) == 3));
+    // The next run: ws7 has no key set left, so keyd refuses the
+    // registration from its key store (R6b) — nothing pending, nothing for
+    // keyadm to sweep — and dird settles it.
+    assert!(support::eventually(
+        RECONCILE_WAIT,
+        || refused_for_no_key_set(&world, ws7) == 1
+    ));
+    assert_eq!(registrations_for(&world, ws7), 2);
     assert!(pending_destructions(&world).is_empty());
     let report = keyadm::sweep::run(&mut world.keyadm());
     assert!(report.is_complete());
     assert_eq!(report.listed, 0);
     // The runs after it ask keyd nothing more for ws7.
     std::thread::sleep(Duration::from_millis(1200));
-    assert_eq!(registrations_for(&world, ws7), 3);
+    assert_eq!(registrations_for(&world, ws7), 2);
+    assert_eq!(refused_for_no_key_set(&world, ws7), 1);
     assert_eq!(
         keyd_records_for(&world, ipc_audit::KeydOperation::DestroyKeySet, ws7)
             .iter()
@@ -3180,18 +3201,42 @@ fn lost_destroy_decisions_are_registered_again_until_keyd_ran_them() {
     );
 }
 
+/// bob gets a key set: dird's `SetSecret` decision for the `BeginPasswordSet`,
+/// admind's `set_secret` with exactly its binding and salt.
+fn give_bob_a_key_set(world: &World) {
+    let Reply::PasswordSet(set) = world
+        .client()
+        .call(&by(
+            "admin1",
+            &[],
+            Operation::BeginPasswordSet { target: g(BOB) },
+        ))
+        .unwrap()
+    else {
+        panic!("a PasswordSet reply");
+    };
+    let target = &set.keys[0];
+    assert_eq!(
+        world.admind_keyd().set_secret(
+            &target.handle,
+            &target.binding,
+            zeroize::Zeroizing::new(String::from("bob's first password")),
+            set.salt.as_str(),
+        ),
+        Ok(Kvno::new(1))
+    );
+}
+
 /// A-105 at the admin service's start (docs/questions/Q-470 item 4): a
-/// destroy decision whose registration failed at the `Delete` (keyd refused
-/// to register it — the fail-closed path of A-102: the `Delete` still
-/// answers `Done`) is registered when dird starts again with a keyd that
-/// registers decisions; a dird with no tombstone to settle asks keyd
+/// destroy decision whose registration failed at the `Delete` (keyd did not
+/// register it — the fail-closed path of A-102: the `Delete` still answers
+/// `Done`) is registered when dird starts again with a keyd that registers
+/// decisions — bob still has his key set (R6b: keyd registers a destroy
+/// decision only then); a dird with no tombstone to settle asks keyd
 /// nothing (no listing in keyd's records).
 #[test]
 fn a_destroy_decision_not_registered_at_the_delete_is_registered_at_start() {
-    let Some(mut world) = World::new(Options {
-        refuse_decisions: true,
-        ..Options::default()
-    }) else {
+    let Some(mut world) = World::new(Options::default()) else {
         return;
     };
     let listings = |world: &World| {
@@ -3206,6 +3251,11 @@ fn a_destroy_decision_not_registered_at_the_delete_is_registered_at_start() {
             .count()
     };
     // No tombstone yet: the start-time run asked keyd nothing.
+    assert_eq!(listings(&world), 0);
+    give_bob_a_key_set(&world);
+    // dird's keyd client now registers nothing (A-102's fail-closed path).
+    world.options.refuse_decisions = true;
+    world.restart_dird();
     assert_eq!(listings(&world), 0);
     assert_eq!(
         world
@@ -3222,4 +3272,146 @@ fn a_destroy_decision_not_registered_at_the_delete_is_registered_at_start() {
     }));
     let listed = world.keyadm().list_destroy_decisions(None).unwrap();
     assert_eq!(listed.entries[0].decision, destroy_decision_id(g(BOB)));
+}
+
+/// R6b (docs/questions/Q-501 decision; Q-520): "destruction complete" is
+/// read from keyd's key store, not from dird's memory. bob is deleted (his
+/// destroy decision registered at the `Delete`) and keyadm's sweep destroys
+/// his key set; then dird restarts — its settled cache empty, as after any
+/// dird start — and its start-time run registers bob's decision once more:
+/// keyd refuses it (no key set left: `KeyNotFound`), dird settles it, no
+/// destroy decision is scheduled, and keyadm's next sweep has nothing to
+/// run. (Before R6b keyd accepted it — unchanged while it held the executed
+/// decision, as a new pending one after that — and the sweep then ran a
+/// destroy of nothing.)
+#[test]
+fn after_the_sweep_a_dird_restart_schedules_no_destroy() {
+    let Some(mut world) = World::new(Options::default()) else {
+        return;
+    };
+    let bob = keyd::PrincipalId::from_bytes(g(BOB).to_packet());
+    give_bob_a_key_set(&world);
+    assert_eq!(
+        world
+            .client()
+            .call(&by("admin1", &[], Operation::Delete { target: g(BOB) }))
+            .unwrap(),
+        Reply::Done
+    );
+    assert_eq!(pending_destructions(&world), vec![bob]);
+    let report = keyadm::sweep::run(&mut world.keyadm());
+    assert!(report.is_complete(), "{report:?}");
+    assert_eq!(report.destroyed.len(), 1);
+    assert!(pending_destructions(&world).is_empty());
+
+    // dird restarts: its start-time run presents bob's tombstone again.
+    world.restart_dird();
+    assert!(support::eventually(
+        RECONCILE_WAIT,
+        || refused_for_no_key_set(&world, g(BOB)) == 1
+    ));
+    assert!(pending_destructions(&world).is_empty());
+    let report = keyadm::sweep::run(&mut world.keyadm());
+    assert!(report.is_complete(), "{report:?}");
+    assert_eq!(report.listed, 0);
+    assert!(report.destroyed.is_empty());
+    // One destruction in keyd's records, ever; one successful registration
+    // (the Delete's).
+    let destroyed = keyd_records_for(&world, ipc_audit::KeydOperation::DestroyKeySet, g(BOB))
+        .iter()
+        .filter(|r| r.result == ipc_audit::KeydOutcome::Success)
+        .count();
+    assert_eq!(destroyed, 1);
+    assert_eq!(registrations_for(&world, g(BOB)), 1);
+}
+
+/// Attack test (R6b follow-up; docs/questions/Q-520): the window between a
+/// password set and a `Delete`. bob has no key set; admin1's
+/// `BeginPasswordSet` commits — dird registers bob's `SetSecret` decision —
+/// and before admind's `set_secret` arrives, admin1 deletes bob. The
+/// `Delete`'s destroy registration is refused (no key set) and discards the
+/// live decision (keyd's `SecretDecisionDiscarded` record for bob's handle);
+/// admind's `set_secret` with exactly the decided binding and salt is then
+/// refused (`NoGrant`) and creates no key set. So the tombstone is truly
+/// settled: a dird restart's run is refused again (`KeyNotFound`), nothing
+/// is pending, keyadm's sweep has nothing to run, nothing was destroyed.
+#[test]
+fn a_password_set_begun_before_the_delete_creates_no_key_set() {
+    let Some(mut world) = World::new(Options::default()) else {
+        return;
+    };
+    let Reply::PasswordSet(set) = world
+        .client()
+        .call(&by(
+            "admin1",
+            &[],
+            Operation::BeginPasswordSet { target: g(BOB) },
+        ))
+        .unwrap()
+    else {
+        panic!("a PasswordSet reply");
+    };
+    assert_eq!(
+        world
+            .client()
+            .call(&by("admin1", &[], Operation::Delete { target: g(BOB) }))
+            .unwrap(),
+        Reply::Done
+    );
+    // keyd discarded bob's set-secret decision at the destroy registration
+    // (refused: no key set yet).
+    let discarded = || {
+        keyd_records_for(&world, ipc_audit::KeydOperation::RegisterDecision, g(BOB))
+            .into_iter()
+            .filter(|r| {
+                r.result == ipc_audit::KeydOutcome::Success
+                    && r.reason == ipc_audit::KeydReason::SecretDecisionDiscarded
+                    && r.purpose == Some(ipc_audit::KeyPurposeCode::PrincipalLongterm)
+            })
+            .count()
+    };
+    assert!(support::eventually(RECONCILE_WAIT, || discarded() == 1));
+    assert!(support::eventually(
+        RECONCILE_WAIT,
+        || refused_for_no_key_set(&world, g(BOB)) == 1
+    ));
+    // admind's set_secret, exactly as dird decided it: refused, no key set.
+    let target = &set.keys[0];
+    assert_eq!(
+        world.admind_keyd().set_secret(
+            &target.handle,
+            &target.binding,
+            zeroize::Zeroizing::new(String::from("bob's first password")),
+            set.salt.as_str(),
+        ),
+        Err(keyd::Error::Denied)
+    );
+    let set_secret_refused = || {
+        world
+            ._keyd_auditd
+            .events()
+            .iter()
+            .filter(|e| {
+                matches!(e, EventBody::Keyd(r)
+                    if r.op == ipc_audit::KeydOperation::SetSecret
+                        && r.principal == Some(g(BOB).to_packet())
+                        && r.reason == ipc_audit::KeydReason::NoGrant)
+            })
+            .count()
+    };
+    assert!(support::eventually(RECONCILE_WAIT, || set_secret_refused() == 1));
+
+    // Truly settled: a dird restart presents the tombstone again — refused,
+    // nothing pending, nothing to sweep, nothing destroyed.
+    world.restart_dird();
+    assert!(support::eventually(
+        RECONCILE_WAIT,
+        || refused_for_no_key_set(&world, g(BOB)) == 2
+    ));
+    assert!(pending_destructions(&world).is_empty());
+    let report = keyadm::sweep::run(&mut world.keyadm());
+    assert!(report.is_complete(), "{report:?}");
+    assert_eq!(report.listed, 0);
+    assert!(keyd_records_for(&world, ipc_audit::KeydOperation::DestroyKeySet, g(BOB)).is_empty());
+    assert_eq!(registrations_for(&world, g(BOB)), 0);
 }

@@ -60,17 +60,17 @@
 
 use crate::audit::{AuditReason, AuditSink};
 use crate::authz::{CallerId, HandleSlot, Operation};
+use crate::chain::{self, BindingEvidence, ChainVerified};
 use crate::entropy::EntropySource;
 use crate::error::{AuthnError, Deny, Internal};
-use crate::keyd::{draw, key_usage, AuditFields, Keyd};
+use crate::keyd::{draw, AuditFields, Keyd};
 use crate::model::{KeyHandle, PrincipalId};
-use crate::store::{KeyStore, KvnoKeys, StoredKeySet};
-use crate::template::check_binding;
+use crate::store::{BoundKeys, KeyStore, KeyVersion};
 use crate::tgs_exchange::{check_ap_options, replay_key_for, subkey_protocol_key, OpenedApReq};
 use crate::time::kerberos_time_seconds;
 use crate::tokens::{ServiceCtxId, TOKEN_ID_LENGTH};
 use crate::usage::{AP_REQ_AUTHENTICATOR, AP_REQ_AUTHENTICATOR_CKSUM};
-use keyd_types::{AppBinding, OperationDigest, ServiceContext};
+use keyd_types::{AppBinding, ServiceContext};
 use krb_crypto::{ChecksumType, ProtocolKey};
 use krb_proto::constants::DOMAIN_X500_COMPRESS;
 use krb_proto::{ApReq, Checksum, KerberosTime, TransitedEncoding};
@@ -126,9 +126,10 @@ impl ServiceContextEntry {
 ///
 /// Spec: docs/questions/Q-165 item 4 (A-46); docs/10 §1 (current + previous
 /// kvno), §12 I1.
-fn random_versions(set: &StoredKeySet) -> Internal<[Option<&KvnoKeys>; 2]> {
-    let versions =
-        [Some(set.current()), set.previous()].map(|version| version.filter(|v| v.salt().is_none()));
+fn random_versions(bound: BoundKeys<'_>) -> Internal<[Option<KeyVersion<'_>>; 2]> {
+    let versions = bound
+        .versions()
+        .map(|version| version.filter(|v| !v.is_password_derived()));
     if versions.iter().all(Option::is_none) {
         return Err(Deny::denied(AuditReason::ServiceKeyNotRandom));
     }
@@ -156,9 +157,9 @@ fn check_transited(transited: &TransitedEncoding) -> Internal<()> {
 
 /// Step 9: the Authenticator's application-data checksum, as `binding`
 /// requires (module documentation, "The application binding"). `Ok` carries
-/// the operation digest the `cksum` was verified over (`None` for an unbound
-/// verification). Every failure is the uniform `Denied` with its own audit
-/// reason.
+/// the evidence: the operation digest the `cksum` was verified over, with the
+/// MIC's evidence (crate::chain), or `Unbound`. Every failure is the uniform
+/// `Denied` with its own audit reason.
 ///
 /// Spec: RFC 4120 §4 ("the corresponding ... get_mic operations described in
 /// [RFC3961], with implicit 'specific key' generation using the 'key usage'
@@ -171,9 +172,9 @@ fn verify_app_binding(
     session: &ProtocolKey,
     cksum: Option<&Checksum>,
     binding: &AppBinding,
-) -> Internal<Option<OperationDigest>> {
+) -> Internal<BindingEvidence> {
     match (binding, cksum) {
-        (AppBinding::Unbound, None) => Ok(None),
+        (AppBinding::Unbound, None) => Ok(BindingEvidence::Unbound),
         // L6a has no application data to verify a checksum over; ignoring it
         // would waive a binding the client asked for (Q-180 item 3).
         (AppBinding::Unbound, Some(_)) => Err(Deny::denied(AuditReason::ApChecksumUnsupported)),
@@ -188,15 +189,15 @@ fn verify_app_binding(
                 .ok()
                 .filter(|t| *t == session.enc_type().checksum_type())
                 .ok_or(Deny::denied(AuditReason::OperationDigestMismatch))?;
-            krb_crypto::verify_mic(
+            let verified = chain::verify_mic(
                 session,
                 cksumtype,
-                key_usage(AP_REQ_AUTHENTICATOR_CKSUM)?,
+                AP_REQ_AUTHENTICATOR_CKSUM,
                 digest.as_bytes(),
                 &cksum.checksum,
-            )
-            .map_err(|_| Deny::denied(AuditReason::OperationDigestMismatch))?;
-            Ok(Some(*digest))
+                AuditReason::OperationDigestMismatch,
+            )?;
+            Ok(BindingEvidence::OperationDigest(*digest, verified))
         }
     }
 }
@@ -350,21 +351,24 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         if ap_req.ticket.realm != *realm {
             return Err(Deny::denied(AuditReason::WrongRealm));
         }
-        let set = self
+        // The key set is used only through the proof that it is bound to
+        // the ticket's (srealm, sname) (A-19; crate::store, R7).
+        let bound = self
             .store
             .get(service)
-            .ok_or(Deny::denied(AuditReason::KeyNotFound))?;
-        check_binding(set.binding(), &ap_req.ticket.realm, &ap_req.ticket.sname)?;
+            .ok_or(Deny::denied(AuditReason::KeyNotFound))?
+            .bound_to(&ap_req.ticket.realm, &ap_req.ticket.sname)?;
 
         // 5-7. Only keyd-drawn versions (A-46); the ticket under usage 2,
         // the authenticator under usage 11 (shared steps).
-        let versions = random_versions(set)?;
+        let versions = random_versions(bound)?;
         let OpenedApReq {
             ticket_part,
             session,
             authenticator,
             ctime,
             findings,
+            evidence,
         } = self.open_ap_req(versions, &ap_req, AP_REQ_AUTHENTICATOR, now_s, fields)?;
 
         // 8. Transited: local authentication only. Spec: RFC 4120 3.3.3.2,
@@ -373,7 +377,8 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
 
         // 9. The application-data checksum, as the binding requires (R2).
         // Spec: RFC 4120 5.5.1 (cksum), 7.5.1 item 10; RFC 3961 §3, §4.
-        let bound_operation = verify_app_binding(&session, authenticator.cksum.as_ref(), binding)?;
+        let binding_evidence = verify_app_binding(&session, authenticator.cksum.as_ref(), binding)?;
+        let bound_operation = binding_evidence.digest();
 
         // 10. The subkey: a configured enctype and a valid key (I5).
         // Spec: RFC 4120 5.5.1; docs/10 §12 I5.
@@ -384,10 +389,14 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             .transpose()?;
 
         // The cryptographic chain is complete: the ticket decrypted under the
-        // service key and the authenticator under the session key. Only now
-        // are the recorded findings reported, then the replay cache (step 11)
-        // consulted (A-26). Spec: RFC 4120 3.2.3.
+        // service key, the authenticator under the session key and — bound —
+        // the operation digest's MIC verified. Its proof is made from that
+        // evidence; only now are the recorded findings reported, then the
+        // replay cache (step 11) consulted (A-26; crate::chain). Spec: RFC
+        // 4120 3.2.3.
+        let verified = ChainVerified::service_ticket(evidence, binding_evidence);
         self.complete_chain(
+            verified,
             findings,
             replay_key_for(&ap_req.ticket, &authenticator, ctime),
             now_s,
@@ -426,6 +435,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use keyd_types::OperationDigest;
     use krb_crypto::{EncType, KeyUsage};
 
     /// The four encryption types keyd's profile has (RFC 3962 §7; RFC 8009
@@ -448,8 +458,13 @@ mod tests {
         }
     }
 
-    fn reason(result: Internal<Option<OperationDigest>>) -> Option<AuditReason> {
+    fn reason(result: Internal<BindingEvidence>) -> Option<AuditReason> {
         result.err().map(|deny| deny.reason)
+    }
+
+    /// The digest an accepted binding names (`None`: unbound).
+    fn accepted(result: Internal<BindingEvidence>) -> Result<Option<OperationDigest>, AuditReason> {
+        result.map(|e| e.digest()).map_err(|deny| deny.reason)
     }
 
     /// The operation binding as a round trip over every enctype: the
@@ -471,7 +486,7 @@ mod tests {
             let own = key.enc_type().checksum_type();
             let good = mic(key, own, 10, digest.as_bytes());
             assert_eq!(
-                verify_app_binding(key, Some(&good), &bound),
+                accepted(verify_app_binding(key, Some(&good), &bound)),
                 Ok(Some(digest)),
                 "{:?}",
                 key.enc_type()
@@ -505,7 +520,7 @@ mod tests {
                 Some(AuditReason::OperationDigestMissing)
             );
             assert_eq!(
-                verify_app_binding(key, None, &AppBinding::Unbound),
+                accepted(verify_app_binding(key, None, &AppBinding::Unbound)),
                 Ok(None)
             );
             assert_eq!(

@@ -27,13 +27,14 @@
 
 use crate::audit::{AuditKeyRef, AuditReason, AuditSink};
 use crate::authz::{CallerId, HandleSlot, Operation};
+use crate::chain::{self, ChainClass, ChainVerified};
 use crate::enctype::to_crypto;
 use crate::entropy::EntropySource;
 use crate::error::{AuthnError, Deny, Internal, IssueError};
-use crate::keyd::{draw, new_random_key, open, seal, AuditFields, Keyd};
+use crate::keyd::{draw, new_random_key, seal, AuditFields, Keyd};
 use crate::model::{KeyHandle, KeyPurpose, Kvno, PrincipalId};
-use crate::store::{KeyStore, KvnoKeys};
-use crate::template::{as_ticket_flags, check_binding, check_times, tgs_name, TemplateTimes};
+use crate::store::{KeyStore, KeyVersion, UnboundUse};
+use crate::template::{as_ticket_flags, check_times, tgs_name, TemplateTimes};
 use crate::throttle::SecretThrottle;
 use crate::time::{kerberos_time_seconds, within_skew};
 use crate::tokens::{ArmorId, ExchangeId, TokenRefusal, TOKEN_ID_LENGTH};
@@ -106,7 +107,7 @@ pub(crate) fn token_deny(refusal: TokenRefusal) -> Deny {
 /// for which an encryption key is available"); RFC 6113 2.1, 5.4.6;
 /// docs/48 §4.5 step 3.
 fn challenge_long_term_key<'a>(
-    version: &'a KvnoKeys,
+    version: KeyVersion<'a>,
     requested: &[i32],
     supported: &[EncType],
 ) -> Option<(EncType, &'a ProtocolKey)> {
@@ -275,11 +276,13 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             .ok()
             .filter(|e| self.enctypes.contains(e))
             .ok_or(Deny::denied(AuditReason::UnsupportedEncType))?;
+        // A declared unbound use (crate::store `UnboundUse`, R7): the proof
+        // is bound to the handle; `issue_as_rep` binds the name.
         let current = self
             .store
             .get(client)
             .ok_or(Deny::denied(AuditReason::KeyNotFound))?
-            .current();
+            .unbound_current(UnboundUse::Preauthentication);
         fields.kvno = Some(current.kvno());
         if enc.kvno.is_some_and(|k| k != current.kvno().get()) {
             return Err(Deny::denied(AuditReason::KvnoMismatch));
@@ -289,8 +292,8 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             .ok_or(Deny::denied(AuditReason::KeyNotFound))?;
         // The cryptographic check: the only refusal the throttle counts (a
         // wrong key or an undecryptable timestamp — A-34).
-        let plaintext = match open(key, AS_REQ_PA_ENC_TIMESTAMP, &enc.cipher) {
-            Ok(plaintext) => plaintext,
+        let (plaintext, decrypted) = match chain::open(key, AS_REQ_PA_ENC_TIMESTAMP, &enc.cipher) {
+            Ok(opened) => opened,
             Err(deny) => {
                 self.preauth_throttle
                     .record(&client.principal, false, now_s);
@@ -300,13 +303,14 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         let timestamp = PaEncTsEnc::decode(&plaintext)
             .map_err(|_| Deny::denied(AuditReason::MalformedInput))?;
         // The cryptographic chain is complete (decrypted under the client key,
-        // decoded): the skew finding may be reported as a class (A-26).
+        // decoded): its proof, the only maker of a class (A-26; crate::chain).
+        let verified = ChainVerified::preauthentication(decrypted);
         if !within_skew(
             kerberos_time_seconds(&timestamp.patimestamp),
             now_s,
             self.config.clock_skew_secs,
         ) {
-            return Err(Deny::classified(AuditReason::ClockSkew, AuthnError::Skew));
+            return Err(verified.refuse(ChainClass::Skew));
         }
         Ok(PreauthKey {
             enctype,
@@ -344,12 +348,14 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             return Err(Deny::denied(AuditReason::ChallengeEncTypeMismatch));
         }
 
-        // 3. The long-term key K2, chosen by keyd (Q-123), current version.
+        // 3. The long-term key K2, chosen by keyd (Q-123), current version —
+        // a declared unbound use (crate::store `UnboundUse`, R7): the proof
+        // is bound to the handle; `issue_as_rep` binds the name.
         let current = self
             .store
             .get(client)
             .ok_or(Deny::denied(AuditReason::KeyNotFound))?
-            .current();
+            .unbound_current(UnboundUse::Preauthentication);
         fields.kvno = Some(current.kvno());
         // The challenge key is derived per conversation, not a long-lasting
         // key: a kvno "is only present in messages encrypted under long
@@ -365,12 +371,12 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         // 4. The challenge key; the cryptographic check (usage 54) — the only
         // refusal the throttle counts, exactly as for PA-ENC-TIMESTAMP (A-34).
         let challenge_key = armor.client_challenge_key(long_term)?;
-        let plaintext = match open(
+        let (plaintext, decrypted) = match chain::open(
             &challenge_key,
             KEY_USAGE_ENC_CHALLENGE_CLIENT,
             &challenge.cipher,
         ) {
-            Ok(plaintext) => plaintext,
+            Ok(opened) => opened,
             Err(deny) => {
                 self.preauth_throttle
                     .record(&client.principal, false, now_s);
@@ -383,13 +389,15 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         drop(plaintext);
 
         // 5. The chain is complete (decrypted under the challenge key,
-        // decoded): only now the skew class (A-26).
+        // decoded): its proof, and only now the skew class (A-26;
+        // crate::chain).
+        let verified = ChainVerified::preauthentication(decrypted);
         if !within_skew(
             kerberos_time_seconds(&timestamp.patimestamp),
             now_s,
             self.config.clock_skew_secs,
         ) {
-            return Err(Deny::classified(AuditReason::ClockSkew, AuthnError::Skew));
+            return Err(verified.refuse(ChainClass::Skew));
         }
         Ok(PreauthKey {
             enctype,
@@ -537,16 +545,18 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
                 )?;
         }
 
-        // Keys: the client key that pre-authenticated, the current krbtgt key.
+        // Keys: the client key that pre-authenticated, the current krbtgt key
+        // — each only through the proof of its name binding (Q-040, A-19;
+        // crate::store, R7).
         let client_set = self
             .store
             .get(client)
             .ok_or(Deny::denied(AuditReason::KeyNotFound))?;
-        let client_version = client_set.current();
-        fields.kvno = Some(client_version.kvno());
-        // Name binding (Q-040, A-19): the ticket may only name the principal
-        // the client key is bound to.
-        check_binding(client_set.binding(), &template.crealm, &template.cname)?;
+        fields.kvno = Some(client_set.current_kvno());
+        // The ticket may only name the principal the client key is bound to.
+        let client_version = client_set
+            .bound_to(&template.crealm, &template.cname)?
+            .current();
         if client_version.kvno() != entry.reply_kvno {
             return Err(Deny::denied(AuditReason::KvnoMismatch));
         }
@@ -557,17 +567,15 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             .store
             .get(krbtgt)
             .ok_or(Deny::denied(AuditReason::KeyNotFound))?;
-        let tgs_version = tgs_set.current();
         fields.secondary = Some(AuditKeyRef {
             principal: krbtgt.principal,
             purpose: KeyPurpose::Krbtgt,
-            kvno: Some(tgs_version.kvno()),
+            kvno: Some(tgs_set.current_kvno()),
         });
-        // Name binding (Q-040, A-19): the krbtgt key must be bound to this
-        // realm's TGS name (RFC 4120 7.3), and the ticket's sname must be that
-        // bound name.
-        check_binding(tgs_set.binding(), realm, &tgs_name(realm))?;
-        check_binding(tgs_set.binding(), realm, &template.sname)?;
+        // The krbtgt key must be bound to the ticket's sname — which step 2
+        // found equal to this realm's TGS name (RFC 4120 7.3), so the key is
+        // bound to krbtgt/realm.
+        let tgs_version = tgs_set.bound_to(realm, &template.sname)?.current();
         let tgs_key = tgs_version
             .preferred()
             .ok_or(Deny::denied(AuditReason::KeyNotFound))?;

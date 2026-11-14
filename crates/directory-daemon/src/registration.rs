@@ -34,11 +34,12 @@
 //!
 //! [`destroy_decision_id`]: the objectGUID's two 8-octet halves XORed —
 //! the same id for the same tombstone at the `Delete` and at every
-//! re-registration, so keyd accepts a re-registration of a decision it holds
-//! unchanged (A-105; keyd keeps an executed decision's result until it
-//! expires, docs/52 §3.10 (a)) and dird can tell "keyd ran it" from "keyd
-//! lost it" (crate::reconcile; docs/questions/Q-501). Before task R6 it was
-//! the `Delete`'s operation id, which a re-registration cannot know.
+//! re-registration, so keyd accepts a re-registration of a pending decision
+//! it holds unchanged (A-105) instead of a second decision for the same key
+//! sets; once the key sets are destroyed keyd refuses any registration for
+//! the principal (R6b), which tells dird "complete" (crate::reconcile;
+//! docs/questions/Q-501). Before task R6 it was the `Delete`'s operation id,
+//! which a re-registration cannot know.
 //!
 //! Spec: docs/52 §3.1, §3.10, §3.11 R6 (a), §4.2, §4.3; docs/51 §5.6, §5.7
 //! item 2, §5.8 option (b), §6, §9; A-85; A-102; A-105; docs/questions/

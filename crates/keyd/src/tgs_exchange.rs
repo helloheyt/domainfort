@@ -46,19 +46,20 @@
 use crate::as_exchange::token_deny;
 use crate::audit::{AuditReason, AuditSink};
 use crate::authz::{CallerId, HandleSlot, Operation};
+use crate::chain::{
+    self, ApReqOpened, ArmorOpened, ChainClass, ChainVerified, Decrypted, TicketTime, TimeFindings,
+};
 use crate::enctype::to_crypto;
 use crate::entropy::EntropySource;
 use crate::error::{AuthnError, Deny, Internal, IssueError};
 use crate::fast_armor::{
     open_armored_request, seal_fast_reply, seal_strengthened, ticket_armor_key, ArmoredConversation,
 };
-use crate::keyd::{draw, key_usage, new_random_key, open, seal, AuditFields, Keyd};
+use crate::keyd::{draw, new_random_key, seal, AuditFields, Keyd};
 use crate::model::KeyHandle;
 use crate::replay::{ReplayKey, ReplayRefusal};
-use crate::store::{KeyStore, KvnoKeys};
-use crate::template::{
-    check_binding, check_times, is_tgs_name, tgs_name, tgs_ticket_flags, TemplateTimes,
-};
+use crate::store::{KeyStore, KeyVersion};
+use crate::template::{check_times, is_tgs_name, tgs_name, tgs_ticket_flags, TemplateTimes};
 use crate::time::{kerberos_time_seconds, within_skew};
 use crate::tokens::{CtxId, TOKEN_ID_LENGTH};
 use crate::usage::{
@@ -131,16 +132,6 @@ fn configured_enctype(number: i32, supported: &[EncType], deny: Deny) -> Interna
         .ok_or(deny)
 }
 
-/// The time findings of an opened TGT and authenticator, recorded during the
-/// cryptographic chain and reported only once it completed (A-26).
-/// Spec: RFC 4120 3.2.3; docs/questions/Q-071 (A-26).
-pub(crate) struct TimeFindings {
-    /// The authenticator's ctime is outside the clock skew.
-    skew: Option<Deny>,
-    /// The ticket is not yet valid, or has expired.
-    ticket_time: Option<Deny>,
-}
-
 /// What opening an AP-REQ — its ticket and its authenticator — yields;
 /// shared by `open_and_verify_tgt` (PA-TGS-REQ), `open_fast_armor` (the
 /// armor AP-REQ) and `open_and_verify_service_ticket` (a service AP-REQ).
@@ -157,8 +148,12 @@ pub(crate) struct OpenedApReq {
     pub(crate) authenticator: Authenticator,
     /// The authenticator's ctime in seconds (keyd's time scale).
     pub(crate) ctime: i64,
-    /// Findings to report after the caller completes its chain.
+    /// Findings to report after the caller completes its chain — readable
+    /// only by its `ChainVerified` (crate::chain, A-26).
     pub(crate) findings: TimeFindings,
+    /// The evidence of the two decryptions, for the caller's
+    /// `ChainVerified` (crate::chain, R7).
+    pub(crate) evidence: ApReqOpened,
 }
 
 /// Step 2 of opening an AP-REQ: USE-SESSION-KEY (user-to-user) has no code
@@ -209,10 +204,10 @@ pub(crate) fn replay_key_for(
 /// specified by the ticket"); docs/10 §1 ("decrypt may try a set of kvnos");
 /// [MS-KILE] 3.4.5 (retry with older versions of the server key).
 fn open_ticket<'a>(
-    versions: [Option<&'a KvnoKeys>; 2],
+    versions: [Option<KeyVersion<'a>>; 2],
     enc_part: &EncryptedData,
     enctype: EncType,
-) -> Internal<(Zeroizing<Vec<u8>>, &'a KvnoKeys)> {
+) -> Internal<(Zeroizing<Vec<u8>>, KeyVersion<'a>, Decrypted)> {
     let mut reason = AuditReason::KvnoMismatch;
     for version in versions.into_iter().flatten() {
         if enc_part.kvno.is_some_and(|k| k != version.kvno().get()) {
@@ -221,8 +216,8 @@ fn open_ticket<'a>(
         let Some(key) = version.key_for(enctype) else {
             continue;
         };
-        match open(key, TICKET_ENC_PART, &enc_part.cipher) {
-            Ok(plaintext) => return Ok((plaintext, version)),
+        match chain::open(key, TICKET_ENC_PART, &enc_part.cipher) {
+            Ok((plaintext, decrypted)) => return Ok((plaintext, version, decrypted)),
             Err(deny) => reason = deny.reason,
         }
     }
@@ -276,9 +271,10 @@ fn open_implicit_armor(
     subkey: &ProtocolKey,
     session: &ProtocolKey,
     realm: &Realm,
-) -> Internal<(ProtocolKey, KrbFastReq)> {
+) -> Internal<(ProtocolKey, KrbFastReq, ArmorOpened)> {
     let armor_key = ticket_armor_key(subkey, session)?;
-    let fast_req = open_armored_request(&armor_key, fast.armored_req, fast.ap_req_octets)?;
+    let (fast_req, evidence) =
+        open_armored_request(&armor_key, fast.armored_req, fast.ap_req_octets)?;
     let inner = &fast_req.req_body;
     if inner.realm != *realm {
         return Err(Deny::denied(AuditReason::WrongRealm));
@@ -286,7 +282,7 @@ fn open_implicit_armor(
     if inner.enc_authorization_data.is_some() {
         return Err(Deny::denied(AuditReason::UnsupportedContent));
     }
-    Ok((armor_key, fast_req))
+    Ok((armor_key, fast_req, evidence))
 }
 
 impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
@@ -423,6 +419,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             authenticator,
             ctime,
             findings,
+            evidence,
         } = self.open_local_tgt(krbtgt, ap_req, TGS_REQ_AUTHENTICATOR, now_s, fields)?;
 
         // 8. The checksum over the raw KDC-REQ-BODY.
@@ -434,14 +431,14 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             .ok()
             .filter(|t| *t == session.enc_type().checksum_type())
             .ok_or(Deny::denied(AuditReason::ChecksumUnsupported))?;
-        krb_crypto::verify_mic(
+        let req_body_verified = chain::verify_mic(
             &session,
             cksumtype,
-            key_usage(TGS_REQ_AUTHENTICATOR_CKSUM)?,
+            TGS_REQ_AUTHENTICATOR_CKSUM,
             req_body,
             &cksum.checksum,
-        )
-        .map_err(|_| Deny::denied(AuditReason::ChecksumMismatch))?;
+            AuditReason::ChecksumMismatch,
+        )?;
 
         // 9. The subkey: a configured enctype and a valid key (I5); optional
         // without FAST, mandatory with it. Spec: RFC 4120 5.5.1; RFC 6113
@@ -481,9 +478,18 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         // The cryptographic chain is complete: the TGT decrypted, the
         // authenticator decrypted and its req-body checksum verified, and —
         // under FAST — the req-checksum verified and the KrbFastReq decrypted
-        // and decoded. Only now are the recorded findings reported, then the
-        // replay cache (step 11) consulted (A-26; docs/48 §6.3).
+        // and decoded. Its proof is made from that evidence; only now are the
+        // recorded findings reported, then the replay cache (step 11)
+        // consulted (A-26; docs/48 §6.3; crate::chain).
+        let (armor_key, fast_req, armor_evidence) = match armored {
+            Some((armor_key, fast_req, armor_evidence)) => {
+                (Some(armor_key), Some(fast_req), Some(armor_evidence))
+            }
+            None => (None, None, None),
+        };
+        let verified = ChainVerified::tgs_request(evidence, req_body_verified, armor_evidence);
         self.complete_chain(
+            verified,
             findings,
             replay_key_for(&ap_req.ticket, &authenticator, ctime),
             now_s,
@@ -492,10 +498,6 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         // 12. The one-time context. Under FAST the nonce and sname are the
         // inner request's (docs/48 §3.4; RFC 6113 5.4.2 "This req-body field
         // is preferred over the outer field").
-        let (armor_key, fast_req) = match armored {
-            Some((armor_key, fast_req)) => (Some(armor_key), Some(fast_req)),
-            None => (None, None),
-        };
         let (req_nonce, req_sname) = match &fast_req {
             Some(fast_req) => (fast_req.req_body.nonce, fast_req.req_body.sname.clone()),
             None => (body.nonce, body.sname),
@@ -571,22 +573,17 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         if tgt.realm != *realm || tgt.sname != tgs_name(realm) {
             return Err(Deny::denied(AuditReason::NotLocalTgt));
         }
-        let set = self
+        // Name binding (Q-040, A-19): the krbtgt key is used only through the
+        // proof that it is bound to the ticket's sname — this realm's TGS name
+        // (RFC 4120 7.3), checked above (crate::store, R7).
+        let bound = self
             .store
             .get(krbtgt)
-            .ok_or(Deny::denied(AuditReason::KeyNotFound))?;
-        // Name binding (Q-040, A-19): the krbtgt key must be bound to this
-        // realm's TGS name (RFC 4120 7.3).
-        check_binding(set.binding(), realm, &tgs_name(realm))?;
+            .ok_or(Deny::denied(AuditReason::KeyNotFound))?
+            .bound_to(&tgt.realm, &tgt.sname)?;
 
         // 5-7. Decrypt under krbtgt, then the ticket and the authenticator.
-        self.open_ap_req(
-            [Some(set.current()), set.previous()],
-            ap_req,
-            authenticator_usage,
-            now_s,
-            fields,
-        )
+        self.open_ap_req(bound.versions(), ap_req, authenticator_usage, now_s, fields)
     }
 
     /// Steps 5-7 of opening an AP-REQ under the server key `versions` (the
@@ -610,7 +607,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// (docs/questions/Q-071).
     pub(crate) fn open_ap_req(
         &self,
-        versions: [Option<&KvnoKeys>; 2],
+        versions: [Option<KeyVersion<'_>>; 2],
         ap_req: &ApReq,
         authenticator_usage: u32,
         now_s: i64,
@@ -626,7 +623,8 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             &self.enctypes,
             Deny::denied(AuditReason::UnsupportedEncType),
         )?;
-        let (ticket_plain, version) = open_ticket(versions, &ticket.enc_part, ticket_enctype)?;
+        let (ticket_plain, version, ticket_decrypted) =
+            open_ticket(versions, &ticket.enc_part, ticket_enctype)?;
         fields.kvno = Some(version.kvno());
         let ticket_part = EncTicketPart::decode(&ticket_plain)
             .map_err(|_| Deny::denied(AuditReason::MalformedInput))?;
@@ -647,15 +645,9 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
                 .unwrap_or(&ticket_part.authtime),
         );
         let ticket_time_finding = if start > now_s + i64::from(skew) {
-            Some(Deny::classified(
-                AuditReason::TicketNotYetValid,
-                AuthnError::TicketNotYetValid,
-            ))
+            Some(TicketTime::NotYetValid)
         } else if now_s > kerberos_time_seconds(&ticket_part.endtime) + i64::from(skew) {
-            Some(Deny::classified(
-                AuditReason::TicketExpired,
-                AuthnError::TicketExpired,
-            ))
+            Some(TicketTime::Expired)
         } else {
             None
         };
@@ -675,8 +667,8 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         if ap_req.authenticator.etype != session_enctype.number() {
             return Err(Deny::denied(AuditReason::UnsupportedEncType));
         }
-        let authenticator_plain: Zeroizing<Vec<u8>> =
-            open(&session, authenticator_usage, &ap_req.authenticator.cipher)?;
+        let (authenticator_plain, authenticator_decrypted): (Zeroizing<Vec<u8>>, _) =
+            chain::open(&session, authenticator_usage, &ap_req.authenticator.cipher)?;
         let authenticator = Authenticator::decode(&authenticator_plain)
             .map_err(|_| Deny::denied(AuditReason::MalformedInput))?;
         drop(authenticator_plain);
@@ -685,8 +677,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         }
         let ctime = kerberos_time_seconds(&authenticator.ctime);
         // Recorded; reported only after the caller's chain completed (A-26).
-        let skew_finding = (!within_skew(ctime, now_s, skew))
-            .then_some(Deny::classified(AuditReason::ClockSkew, AuthnError::Skew));
+        let skew_finding = !within_skew(ctime, now_s, skew);
         if authenticator.authorization_data.is_some() {
             return Err(Deny::denied(AuditReason::UnsupportedContent));
         }
@@ -695,39 +686,38 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             session,
             authenticator,
             ctime,
-            findings: TimeFindings {
-                skew: skew_finding,
-                ticket_time: ticket_time_finding,
-            },
+            findings: TimeFindings::recorded(skew_finding, ticket_time_finding),
+            evidence: ApReqOpened::new(ticket_decrypted, authenticator_decrypted),
         })
     }
 
     /// The end of an AP-REQ chain, shared by `open_and_verify_tgt`,
     /// `open_fast_armor` and `open_and_verify_service_ticket` (one replay
     /// cache for every server name keyd verifies for — RFC 4120 3.2.3 "they
-    /// MUST share this replay cache"). Call ONLY once every cryptographic
-    /// check of the
-    /// caller's chain has passed: the recorded findings are reported as
-    /// non-secret classes in RFC 4120 3.2.3 order (skew, then the ticket's
-    /// age) — before the replay cache, so a refused request never enters it —
-    /// then the replay cache must accept `replay_key` (a replay is the
-    /// `Replay` class; a full cache stays the uniform `Denied`, fail closed).
+    /// MUST share this replay cache"). It takes the proof that every
+    /// cryptographic check of the caller's chain has passed (`verified`,
+    /// crate::chain — R7: without it there is no way to report a class): the
+    /// recorded findings are reported as non-secret classes in RFC 4120 3.2.3
+    /// order (skew, then the ticket's age) — before the replay cache, so a
+    /// refused request never enters it — then the replay cache must accept
+    /// `replay_key` (a replay is the `Replay` class; a full cache stays the
+    /// uniform `Denied`, fail closed).
     ///
-    /// Spec: RFC 4120 3.2.3; docs/10 D33; A-26 (docs/questions/Q-071).
+    /// Spec: RFC 4120 3.2.3; docs/10 D33; A-26 (docs/questions/Q-071);
+    /// docs/52 §3.6 (a).
     pub(crate) fn complete_chain(
         &mut self,
+        verified: ChainVerified,
         findings: TimeFindings,
         replay_key: ReplayKey,
         now_s: i64,
     ) -> Internal<()> {
-        if let Some(finding) = findings.skew.or(findings.ticket_time) {
-            return Err(finding);
-        }
+        verified.report(findings)?;
         // 10. Replay cache (D33).
         self.replay
             .check_and_insert(replay_key, self.config.clock_skew_secs, now_s)
             .map_err(|refusal| match refusal {
-                ReplayRefusal::Replay => Deny::classified(AuditReason::Replay, AuthnError::Replay),
+                ReplayRefusal::Replay => verified.refuse(ChainClass::Replay),
                 ReplayRefusal::Full => Deny::denied(AuditReason::ReplayCacheFull),
             })
     }
@@ -882,12 +872,14 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
                 .store
                 .get(service)
                 .ok_or(Deny::denied(AuditReason::KeyNotFound))?;
-            let version = service_set.current();
-            fields.kvno = Some(version.kvno());
+            fields.kvno = Some(service_set.current_kvno());
             // Name binding (Q-040, A-19): the ticket for sname may only be
             // sealed under the key bound to sname in this realm — otherwise
-            // service X could receive tickets naming service S.
-            check_binding(service_set.binding(), &self.config.realm, &template.sname)?;
+            // service X could receive tickets naming service S. The key is
+            // reached only through that proof (crate::store, R7).
+            let version = service_set
+                .bound_to(&self.config.realm, &template.sname)?
+                .current();
             let service_key = version
                 .preferred()
                 .ok_or(Deny::denied(AuditReason::KeyNotFound))?;

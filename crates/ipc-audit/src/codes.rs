@@ -287,7 +287,9 @@ code_table! {
     /// the same way; `Unlisted` moved from 70 to 77. The two operation-binding
     /// reasons (`OperationDigestMissing`, `OperationDigestMismatch`, codes
     /// 77-78) were appended by R2 (A-102, docs/52 §5 item 3) the same way;
-    /// `Unlisted` moved from 77 to 79.
+    /// `Unlisted` moved from 77 to 79. `SecretDecisionDiscarded` (code 79)
+    /// was appended by R6b (docs/questions/Q-520) the same way; `Unlisted`
+    /// moved from 79 to 80.
     /// Spec: crates/keyd audit.rs; docs/10 §9, §10, I8.
     pub enum KeydReason {
         None,
@@ -368,6 +370,7 @@ code_table! {
         CeremonySealed,
         OperationDigestMissing,
         OperationDigestMismatch,
+        SecretDecisionDiscarded,
         Unlisted,
     }
 }

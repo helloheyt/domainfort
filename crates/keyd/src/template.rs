@@ -4,8 +4,11 @@
 //! itself and accepts from the caller only template values that pass these
 //! structural checks (anti-oracle, docs/09 א.3 (3); docs/10 §4 step 2).
 //! Failures are `BadTemplate` — the rules are public policy, nothing secret.
-//! The principal-name binding checks (a name must be the one the key set is
-//! bound to) are authorization failures and are `Denied`.
+//! The principal-name binding checks are authorization failures and are
+//! `Denied`: the creation rule here ([`check_new_binding`], whose proof is
+//! the only way to create a key set), and the use rule — a name must be the
+//! one the key set is bound to — in `StoredKeySet::bound_to` (crate::store,
+//! R7).
 //!
 //! Spec: RFC 4120 2.1-2.6, 3.1.3, 3.3.3, 5.3, 5.4.1, 6.2, 7.3; docs/10 §4,
 //! §5; docs/questions/Q-040 (A-19).
@@ -13,7 +16,7 @@
 use crate::audit::AuditReason;
 use crate::config::TicketPolicy;
 use crate::error::{Deny, Internal};
-use crate::model::{KeyPurpose, PrincipalBinding};
+use crate::model::{KeyHandle, KeyPurpose, PrincipalBinding};
 use crate::time::{kerberos_time_seconds, within_skew};
 use keyd_types::is_admin_service_name;
 use krb_proto::constants::KRB_NT_SRV_INST;
@@ -46,7 +49,29 @@ pub(crate) fn is_tgs_name(name: &PrincipalName) -> bool {
         .is_some_and(|c| c.as_str() == KRBTGT)
 }
 
-/// Validate the name binding supplied when a key set is created:
+/// The creation proof of a key set: a binding that passed the creation rule
+/// ([`check_new_binding`]) for one handle. Built only there (its fields are
+/// private to this module); consumed by `StoredKeySet::create`, the only
+/// constructor of a stored key set — so a key set bound to a name the rule
+/// refuses cannot be made (docs/52 §3.5, R7: the class C5 on the creation
+/// side). Not `Clone`: one proof, one key set.
+///
+/// Spec: docs/questions/Q-040 (A-19); docs/52 §3.5 (R7).
+#[derive(Debug)]
+pub(crate) struct NewBinding {
+    handle: KeyHandle,
+    binding: PrincipalBinding,
+}
+
+impl NewBinding {
+    /// The handle the rule was checked for, and the binding.
+    pub(crate) fn into_parts(self) -> (KeyHandle, PrincipalBinding) {
+        (self.handle, self.binding)
+    }
+}
+
+/// Validate the name binding supplied when the key set of `handle` is
+/// created, and return its creation proof ([`NewBinding`]):
 /// - the realm is this keyd's realm (phase 1 is single-realm);
 /// - the name has 1..=MAX_NAME_COMPONENTS components (krb-proto's bound);
 /// - a Krbtgt key is bound to a two-part TGS name ("krbtgt", X), and no other
@@ -66,9 +91,10 @@ pub(crate) fn is_tgs_name(name: &PrincipalName) -> bool {
 /// docs/questions/Q-491.
 pub(crate) fn check_new_binding(
     realm: &Realm,
-    purpose: KeyPurpose,
+    handle: &KeyHandle,
     binding: &PrincipalBinding,
-) -> Internal<()> {
+) -> Internal<NewBinding> {
+    let purpose = handle.purpose;
     let bad = Err(Deny::denied(AuditReason::InvalidNameBinding));
     let components = binding.name.name_string.len();
     if binding.realm.as_bytes() != realm.as_bytes()
@@ -90,26 +116,18 @@ pub(crate) fn check_new_binding(
         KeyPurpose::PrincipalLongterm | KeyPurpose::Service => !reserved && !admin,
     };
     if acceptable {
-        Ok(())
+        Ok(NewBinding {
+            handle: *handle,
+            binding: binding.clone(),
+        })
     } else {
         bad
     }
 }
 
-/// The key set's binding must identify (`realm`, `name`); otherwise
-/// `Denied` (reason `NameBindingMismatch`).
-/// Spec: RFC 4120 6.2; docs/questions/Q-040 (A-19).
-pub(crate) fn check_binding(
-    binding: &PrincipalBinding,
-    realm: &Realm,
-    name: &PrincipalName,
-) -> Internal<()> {
-    if binding.matches(realm, name) {
-        Ok(())
-    } else {
-        Err(Deny::denied(AuditReason::NameBindingMismatch))
-    }
-}
+// The check that an EXISTING key set is bound to a name — A-19 at every use
+// of a key — is no longer a function here: it is `StoredKeySet::bound_to`,
+// the only way to a stored key (crate::store, docs/52 §3.5, R7).
 
 /// The bits set in both masks.
 fn intersect(a: TicketFlags, b: TicketFlags) -> TicketFlags {

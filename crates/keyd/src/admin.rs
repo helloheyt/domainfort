@@ -151,12 +151,13 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         if self.store.get(handle).is_some() {
             return Err(Deny::denied(AuditReason::KeyExists));
         }
-        check_new_binding(&self.config.realm, handle.purpose, binding)?;
+        // The creation proof of A-19 — the only way to a new key set (R7).
+        let new_binding = check_new_binding(&self.config.realm, handle, binding)?;
         let keys = new_random_keys(&mut self.entropy, &self.enctypes)?;
         let kvno = Kvno::INITIAL;
         fields.kvno = Some(kvno);
-        let set = StoredKeySet::new(binding.clone(), KvnoKeys::new(kvno, keys, None, None));
-        self.store.insert(*handle, set).map_err(store_deny)?;
+        let (handle, set) = StoredKeySet::create(new_binding, KvnoKeys::random(kvno, keys));
+        self.store.insert(handle, set).map_err(store_deny)?;
         Ok(kvno)
     }
 
@@ -248,7 +249,9 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             .store
             .get_mut(handle)
             .ok_or(Deny::denied(AuditReason::KeyNotFound))?;
-        set.rotate(KvnoKeys::new(next, keys, None, None));
+        // Keys keyd drew itself, the binding unchanged: no name involved
+        // (crate::store, R7).
+        set.rotate_random(next, keys);
         fields.kvno = Some(next);
         Ok(next)
     }

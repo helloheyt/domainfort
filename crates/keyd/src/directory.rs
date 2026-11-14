@@ -36,8 +36,8 @@ use crate::entropy::EntropySource;
 use crate::error::{Deny, Error, Internal};
 use crate::keyd::{draw, key_usage, new_random_key, store_deny, AuditFields, Keyd};
 use crate::model::{KeyHandle, Kvno, PrincipalBinding};
-use crate::store::{KeyStore, KvnoKeys, StoredKeySet};
-use crate::template::{check_binding, check_new_binding};
+use crate::store::{KeyStore, KvnoKeys, StoredKeySet, UnboundUse};
+use crate::template::check_new_binding;
 use crate::time::kerberos_time_seconds;
 use crate::usage::KEYD_INTERNAL_SECRET_COMPARE;
 use krb_crypto::{EncType, ProtocolKey};
@@ -138,10 +138,18 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             // password (docs/questions/Q-451 item 2).
             return Err(Deny::denied(AuditReason::GrantMismatch));
         }
-        match existing {
-            Some(set) => check_binding(set.binding(), &binding.realm, &binding.name)?,
-            None => check_new_binding(&self.config.realm, handle.purpose, binding)?,
-        }
+        // A-19, before any derivation work: an existing set must be bound to
+        // `binding` (its proof — the installer below checks it again, so the
+        // version cannot land under another name); a new set's binding must
+        // pass the creation rule, whose proof is the only way to create it
+        // (crate::store, R7).
+        let creation = match existing {
+            Some(set) => {
+                set.bound_to(&binding.realm, &binding.name)?;
+                None
+            }
+            None => Some(check_new_binding(&self.config.realm, handle, binding)?),
+        };
         // keyd chooses the kvno (A-35), before any derivation work.
         let new_kvno = match existing.map(StoredKeySet::current_kvno) {
             None => Kvno::INITIAL,
@@ -160,18 +168,18 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
                 self.config.s2k_params,
             )?);
         }
-        let version = KvnoKeys::new(
-            new_kvno,
-            keys,
-            Some(salt.to_owned()),
-            self.config.s2k_params,
-        );
-        match self.store.get_mut(handle) {
-            Some(set) => set.rotate(version),
-            None => self
-                .store
-                .insert(*handle, StoredKeySet::new(binding.clone(), version))
-                .map_err(store_deny)?,
+        let version =
+            KvnoKeys::password_derived(new_kvno, keys, salt.to_owned(), self.config.s2k_params);
+        match (creation, self.store.get_mut(handle)) {
+            (None, Some(set)) => set.install_password_version(binding, version)?,
+            (Some(creation), None) => {
+                let (handle, set) = StoredKeySet::create(creation, version);
+                self.store.insert(handle, set).map_err(store_deny)?;
+            }
+            // The store changed between the check and the install: keyd is
+            // single-threaded (`&mut self`), so this cannot happen — refuse
+            // (fail closed).
+            _ => return Err(Deny::unavailable(AuditReason::InternalFailure)),
         }
         Ok(new_kvno)
     }
@@ -298,7 +306,11 @@ fn compare_secret<S: KeyStore, E: EntropySource>(
     candidate: &str,
     fields: &mut AuditFields,
 ) -> Internal<()> {
-    let stored = store.get(handle).map(StoredKeySet::current);
+    // A declared unbound use (crate::store `UnboundUse`, R7): nothing is
+    // issued under any name here.
+    let stored = store
+        .get(handle)
+        .map(|set| set.unbound_current(UnboundUse::SecretComparison));
     let real = stored.and_then(|version| {
         fields.kvno = Some(version.kvno());
         match (version.salt(), version.preferred()) {
@@ -393,11 +405,15 @@ mod tests {
         )
     }
 
-    fn seeded(kvno: u32) -> StoredKeySet {
+    /// The key set of `handle` at `kvno`, created through its creation proof
+    /// (R7: the only way to a key set).
+    fn seeded(handle: &KeyHandle, kvno: u32) -> (KeyHandle, StoredKeySet) {
         let key = krb_crypto::random_to_key(EncType::Aes256CtsHmacSha196, &[0x4C; 32]).unwrap();
-        StoredKeySet::new(
-            binding(),
-            KvnoKeys::new(Kvno::new(kvno), vec![key], Some(SALT.to_owned()), None),
+        let creation =
+            check_new_binding(&Realm::new("EXAMPLE.ORG").unwrap(), handle, &binding()).unwrap();
+        StoredKeySet::create(
+            creation,
+            KvnoKeys::password_derived(Kvno::new(kvno), vec![key], SALT.to_owned(), None),
         )
     }
 
@@ -413,8 +429,10 @@ mod tests {
         );
         let below_max = KeyHandle::new(PrincipalId::from_bytes([0x4D; 16]), KeyPurpose::Service);
         let mut store = InMemoryKeyStore::new(4);
-        store.insert(at_max, seeded(u32::MAX)).unwrap();
-        store.insert(below_max, seeded(u32::MAX - 1)).unwrap();
+        for (handle, kvno) in [(at_max, u32::MAX), (below_max, u32::MAX - 1)] {
+            let (handle, set) = seeded(&handle, kvno);
+            store.insert(handle, set).unwrap();
+        }
         let mut config = KeydConfig::new(Realm::new("EXAMPLE.ORG").unwrap());
         config.enctypes = vec![EncTypeId::Aes256CtsHmacSha196];
         let now = KerberosTime::new(2026, 11, 13, 10, 0, 0).unwrap();

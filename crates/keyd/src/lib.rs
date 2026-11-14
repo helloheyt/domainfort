@@ -156,10 +156,16 @@
 //!   (`open_and_verify_service_ticket`), may an
 //!   [`AuthnError`] other than `Denied` be returned — `TicketExpired`,
 //!   `TicketNotYetValid`, `Skew`, `Replay`. A `verify_preauth` refused by its
-//!   failure throttle (A-34) is the uniform `Denied`.
+//!   failure throttle (A-34) is the uniform `Denied`. **By type since R7**
+//!   (docs/52 §3.6 (a)): a classified refusal is built only by a
+//!   `ChainVerified` (crate::chain), which is minted only from the evidence
+//!   of the chain's cryptographic steps — each made by one real decryption or
+//!   checksum verification — so no refusal before the chain completes can
+//!   carry a class.
 //! - **I7** plaintext secrets are taken as `Zeroizing<String>` by value.
 //! - **I8** every operation emits exactly one [`AuditRecord`], with no
-//!   field able to hold a secret.
+//!   field able to hold a secret — plus, for a `DestroyKeySet` registration
+//!   only, one record per set-secret entry it discarded (R6b, Q-520).
 //!
 //! Name binding (docs/questions/Q-040, decided A-19): every key set is bound,
 //! at creation and for good, to one principal name ([`PrincipalBinding`]).
@@ -167,7 +173,22 @@
 //! key's bound name, to seal a service ticket for an sname other than the
 //! service key's bound name, and to use a krbtgt key not bound to
 //! krbtgt/REALM. Name equivalence follows RFC 4120 6.2 (realm and
-//! components octet for octet; name-type not significant).
+//! components octet for octet; name-type not significant). **By type since
+//! R7** (docs/52 §3.5; [`store`]): a stored key is reachable only through
+//! the proof of its binding (`StoredKeySet::bound_to`) or a declared
+//! `UnboundUse` (the pre-authentication check and `verify_secret`, which
+//! issue nothing under a name); a password-derived version is installed only
+//! under its binding, and a key set is created only from the creation rule's
+//! proof — an operation that skips the check does not compile.
+//!
+//! Destroy decisions (R6b; docs/questions/Q-501, Q-520): a `DestroyKeySet`
+//! registration first discards every live set-secret entry of the
+//! principal's two handles (one `SecretDecisionDiscarded` record each — the
+//! deleted principal can get no key set afterwards), then is refused for a
+//! principal that has no `PrincipalLongterm` or `Service` key set
+//! (`KeyNotFound`, no table slot), checked before the table — so "destroyed"
+//! is read from the key store, and a re-registration after the destruction
+//! schedules nothing.
 //!
 //! # Time and randomness
 //!
@@ -276,13 +297,18 @@
 //! binding and the admin service purpose (R2, A-102), RFC 4120 §4, §3.3.3,
 //! §5.2.9, §5.5.1, §7.5.1, RFC 3961 §2-§4, §5.3, §5.4, §8, RFC 3962 §6, §7,
 //! RFC 8009 §1, §6, §7 (pinned copies, SHA-256 verified), docs/52 §3.2, §5
-//! and docs/questions/Q-463, Q-490..Q-493. No other implementation was
-//! consulted or recalled.
+//! and docs/questions/Q-463, Q-490..Q-493; for the binding and chain proof
+//! types (R7) and the destroy-registration rule (R6b), docs/52 §3.5, §3.6,
+//! §7, docs/10 §6א, §7, §9, §12 I6, docs/25 §3.2, RFC 4120 §3.2.3, §6.2
+//! (pinned copy, SHA-256 verified), docs/questions/Q-040, Q-071, Q-470,
+//! Q-471, Q-501, Q-503 and decisions A-19, A-26, A-105, A-107. No other
+//! implementation was consulted or recalled.
 //!
 //! Spec: docs/10; docs/09 א; RFC 4120 §3, §5.
 
 mod admin;
 mod as_exchange;
+mod chain;
 mod custody;
 mod decision;
 mod directory;

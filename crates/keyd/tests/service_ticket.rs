@@ -1279,6 +1279,54 @@ fn wrong_operation_digest_is_denied_uniformly() {
     assert_eq!(last_reason(&f), AuditReason::OperationDigestMismatch);
 }
 
+/// Attack test (R7, `ChainVerified`; A-26 with R2): an EXPIRED admin ticket
+/// presented with an AP-REQ bound to ANOTHER operation is the uniform
+/// `Denied` (`OperationDigestMismatch`), never `TicketExpired` — the
+/// operation binding is a step of the cryptographic chain, and a class is
+/// built only from the chain's proof. Bound to its own operation, the same
+/// AP-REQ is `TicketExpired` (only a holder of the session key gets there),
+/// and neither presentation leaves a replay entry (the class comes before
+/// the replay cache). Source: RFC 4120 §3.2.3 (KRB_AP_ERR_TKT_EXPIRED;
+/// replay cache), §5.5.1, §7.5.1 item 10; A-26 (docs/questions/Q-071);
+/// docs/52 §3.6 (a), §5.
+#[test]
+fn an_expired_admin_ticket_bound_elsewhere_learns_no_class() {
+    let mut f = admin_fixture();
+    let tgt = obtain_tgt(&mut f, now(), &as_template());
+    // The ticket ends at 17:00:00; 17:05:01 is past it by more than the
+    // skew (300 s).
+    let issued = admin_ticket(&mut f, &tgt, 1);
+    let late = at(7 * 3600 + 301);
+    let mut spec = ApAuth::new(late, 760);
+    spec.cksum = Some(cksum_over(
+        &issued.session,
+        issued.session.enc_type().checksum_type(),
+        10,
+        &DIGEST_A,
+    ));
+    let ap = octets(
+        &issued.ticket,
+        seal_authenticator(&issued.session, &spec),
+        ApOptions::empty(),
+    );
+    let verify_at = |f: &mut Fixture, bound: [u8; 32]| {
+        f.keyd.open_and_verify_service_ticket(
+            &LDAP,
+            &ADMIN_SERVICE_ID,
+            &AppBinding::OperationDigest(digest(bound)),
+            &ap,
+            &late,
+        )
+    };
+    assert_eq!(verify_at(&mut f, DIGEST_B), Err(AuthnError::Denied));
+    assert_eq!(last_reason(&f), AuditReason::OperationDigestMismatch);
+    assert_eq!(verify_at(&mut f, DIGEST_A), Err(AuthnError::TicketExpired));
+    assert_eq!(last_reason(&f), AuditReason::TicketExpired);
+    // Again: refused for its age, never as a replay (no entry was made).
+    assert_eq!(verify_at(&mut f, DIGEST_A), Err(AuthnError::TicketExpired));
+    assert_eq!(live_contexts(&f), "0");
+}
+
 /// An admin AP-REQ without a `cksum` cannot be used at all; a `cksum` that
 /// is not exactly the session key's MIC with key usage 10 is refused: the
 /// wrong checksum type (another enctype's, RFC 3961 §3 / RFC 3962 §7), the
@@ -1476,17 +1524,20 @@ fn admin_service_key_is_never_password_derived_or_misbound() {
     );
     assert_eq!(last_reason(&f), AuditReason::InvalidNameBinding);
 
-    // A destroy decision for its principal leaves it in place.
+    // A destroy decision for its principal is not even registered — the
+    // principal has no PrincipalLongterm or Service key set, the only ones a
+    // destruction touches (R6b: KeyNotFound) — and the key set stays.
     let tgt = obtain_tgt(&mut f, now(), &as_template());
-    let destroy = f
-        .decide(
+    assert_eq!(
+        f.decide(
             DecidedOperation::DestroyKeySet {
                 principal: ADMIN_SERVICE_ID,
             },
             &now(),
-        )
-        .unwrap();
-    f.keyd.destroy_key_set(&ADMIN, destroy, &now()).unwrap();
+        ),
+        Err(keyd::Error::Denied)
+    );
+    assert_eq!(last_reason(&f), AuditReason::KeyNotFound);
     let issued = admin_ticket(&mut f, &tgt, 1);
     assert!(verify_bound(&mut f, &bound_octets(&issued, &DIGEST_A, 740), DIGEST_A).is_ok());
 }

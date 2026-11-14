@@ -181,7 +181,7 @@ mod from_keyd {
             ApChecksumUnsupported, StartupHoldDown, NoGrant, GrantMismatch, GrantInvalid,
             GrantTableFull, NoDecision, DecisionMismatch, DecisionInvalid, DecisionTableFull,
             DecisionConflict, DecisionReplayed, CeremonySealed, OperationDigestMissing,
-            OperationDigestMismatch,
+            OperationDigestMismatch, SecretDecisionDiscarded,
         }
             _ => KeydReason::Unlisted,
         )

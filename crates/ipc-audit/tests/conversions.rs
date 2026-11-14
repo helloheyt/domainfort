@@ -267,6 +267,7 @@ fn keyd_grant_reasons_match() {
         keyd::AuditReason::CeremonySealed,
         keyd::AuditReason::OperationDigestMissing,
         keyd::AuditReason::OperationDigestMismatch,
+        keyd::AuditReason::SecretDecisionDiscarded,
     ] {
         let record = keyd::AuditRecord {
             ts: ktime(),

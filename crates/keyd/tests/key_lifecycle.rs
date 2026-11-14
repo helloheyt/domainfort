@@ -164,7 +164,8 @@ fn set_secret_on_an_existing_set_returns_current_plus_one() {
 /// A-35: after destroy_key_set the handle is unknown to every operation —
 /// verify_preauth, issue_as_rep, and a rotate_key / retire_kvno decision on
 /// it all give the uniform Denied (KeyNotFound); a second destroy decision
-/// finds nothing to destroy — and set_secret on the same handle creates a
+/// is refused at its registration (R6b: no key set left, KeyNotFound) — and
+/// set_secret on the same handle creates a
 /// NEW set, from the initial kvno, only with a binding that passes the
 /// creation rules. Other principals are untouched.
 /// Source: docs/questions/Q-115 (A-35); docs/10 §7, §9 (uniform Denied);
@@ -250,10 +251,25 @@ fn destroyed_handle_is_unknown_to_every_operation() {
         );
         assert_eq!(f.records().last().unwrap().reason, AuditReason::KeyNotFound);
     }
-    // A second destroy decision finds nothing to destroy: done, no kvno.
-    let again = destroy_decision(&mut f, ALICE_ID);
-    assert_eq!(f.keyd.destroy_key_set(&ADMIN, again, &now()), Ok(()));
-    assert_eq!(f.records().last().unwrap().kvno, None);
+    // A second destroy decision is not even registered: alice has no key
+    // set left, so the destruction is complete as keyd's store says (R6b,
+    // docs/questions/Q-501) — refused, KeyNotFound, nothing scheduled.
+    assert_eq!(
+        f.decide(
+            DecidedOperation::DestroyKeySet {
+                principal: ALICE_ID
+            },
+            &now()
+        ),
+        Err(Error::Denied)
+    );
+    assert_eq!(f.records().last().unwrap().reason, AuditReason::KeyNotFound);
+    assert!(f
+        .keyd
+        .list_destroy_decisions(&ADMIN, None, &now())
+        .unwrap()
+        .entries
+        .is_empty());
 
     // Recreating needs a creation-valid binding (a krbtgt name is refused,
     // and nothing is created) — even with a grant naming it (task A15a: the
@@ -502,12 +518,14 @@ fn destroyed_service_key_issues_no_ticket() {
 
 /// A-35 / A-102: only Admin may run a destroy decision (Directory and Kdc:
 /// RoleNotPermitted, and the decision stays pending); a krbtgt key set is
-/// never destroyed (a destroy decision for the krbtgt principal touches
-/// only its PrincipalLongterm and Service handles, which it does not have);
-/// a principal without key sets is destroyed trivially (no kvno); an id no
+/// never destroyed (a destroy decision names a principal's PrincipalLongterm
+/// and Service handles only — the krbtgt principal has neither, so since
+/// R6b its destroy decision is not even registered), nor is a decision
+/// registered for a principal without key sets (KeyNotFound); an id no
 /// decision has is the uniform Denied (NoDecision). Nothing is destroyed by
 /// a refused call. Source: docs/questions/Q-115 (A-35: "never for
-/// krbtgt"); docs/10 §2 (capability table), §7, §9, §12 I2; docs/52 §4.2.
+/// krbtgt"); docs/10 §2 (capability table), §7, §9, §12 I2; docs/52 §4.2;
+/// docs/questions/Q-501 (R6b).
 #[test]
 fn destroy_key_set_role_krbtgt_and_unknown_decision() {
     let mut f = Fixture::new();
@@ -525,17 +543,18 @@ fn destroy_key_set_role_krbtgt_and_unknown_decision() {
     // The refused calls consumed nothing: the decision is still pending.
     let page = f.keyd.list_destroy_decisions(&ADMIN, None, &now()).unwrap();
     assert!(page.entries.iter().any(|p| p.decision == destroy_alice));
-    let destroy_krbtgt = destroy_decision(&mut f, KRBTGT_ID);
-    assert_eq!(
-        f.keyd.destroy_key_set(&ADMIN, destroy_krbtgt, &now()),
-        Ok(())
-    );
-    assert_eq!(f.records().last().unwrap().kvno, None);
-    let nobody = destroy_decision(&mut f, PrincipalId::from_bytes([0xEE; 16]));
-    assert_eq!(f.keyd.destroy_key_set(&ADMIN, nobody, &now()), Ok(()));
-    let last = f.records().last().unwrap();
-    assert_eq!(last.kvno, None);
-    assert_eq!(last.secondary.unwrap().kvno, None);
+    // R6b: the krbtgt principal (only a Krbtgt key set, which no
+    // destruction touches) and a principal without key sets get no destroy
+    // decision at all — refused at the registration, KeyNotFound.
+    for principal in [KRBTGT_ID, PrincipalId::from_bytes([0xEE; 16])] {
+        assert_eq!(
+            f.decide(DecidedOperation::DestroyKeySet { principal }, &now()),
+            Err(Error::Denied)
+        );
+        let last = f.records().last().unwrap();
+        assert_eq!(last.op, Operation::RegisterDecision);
+        assert_eq!(last.reason, AuditReason::KeyNotFound);
+    }
     assert_eq!(
         f.keyd
             .destroy_key_set(&ADMIN, DecisionId::new(0xDEAD_0001), &now()),

@@ -1,5 +1,8 @@
 //! Audit records: every operation emits exactly one record, success or
-//! failure, and no record ever carries a secret (invariant I8).
+//! failure, and no record ever carries a secret (invariant I8). The one
+//! exception adds records, never removes one: a `DestroyKeySet` registration
+//! also emits one record per set-secret entry it discarded
+//! ([`AuditReason::SecretDecisionDiscarded`], R6b — docs/questions/Q-520).
 //!
 //! A record holds only fixed-shape, non-secret data: the caller's timestamp,
 //! role and uid, the operation, principal ids, purposes, key version numbers,
@@ -348,6 +351,15 @@ pub enum AuditReason {
     /// if the checksums do not match"), 5.5.1, 7.5.1 item 10; RFC 3961 §3
     /// ("required checksum mechanism"), §4 (verify_mic); docs/52 §5 item 3.
     OperationDigestMismatch,
+    /// `register_decision` of a `DestroyKeySet`: a live set-secret entry
+    /// (a dird decision, or the ceremony's grant) for one of the deleted
+    /// principal's two handles was discarded — the registration is dird's
+    /// statement that the principal is deleted, so no key set may come to
+    /// exist for it afterwards. One extra record per discarded entry, after
+    /// the registration's own record: the handle, and the discarded entry's
+    /// decision id (none for the ceremony's grant). Outcome `Success`.
+    /// Spec: docs/questions/Q-501 (R6b), Q-520; docs/10 §6א, §7.
+    SecretDecisionDiscarded,
 }
 
 /// A key referenced by an operation, for audit (no key material).

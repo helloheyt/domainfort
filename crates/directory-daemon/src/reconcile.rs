@@ -29,31 +29,31 @@
 //!    alone (keyadm will run it) — no duplicate.
 //! 3. **Register** each other candidate's decision
 //!    (`DecisionRegistration::of_tombstone`) under its **stable id**
-//!    (crate::registration `destroy_decision_id`): keyd either takes it as a
-//!    new pending decision (it had lost it: re-registered), or accepts it
-//!    unchanged because it still holds that very decision — which, not being
-//!    pending, it has **executed** (A-105: identical re-registration is
-//!    accepted; docs/52 §3.10 (a): an executed decision's result is kept
-//!    until it expires).
-//! 4. **List again**: a registered candidate that keyd does not show as
-//!    pending is one keyd ran — its destruction is complete: **settled**,
-//!    and never registered again by this dird. One shown as pending was
-//!    re-registered.
+//!    (crate::registration `destroy_decision_id`). keyd answers from its
+//!    **key store** (R6b): while the principal still has a key set the
+//!    registration is accepted — a pending decision, new or the identical
+//!    one (A-105) — and the candidate was **re-registered**; when it has
+//!    none, keyd refuses (its uniform `Denied`, `KeyNotFound` in its own
+//!    record): the destruction is **complete** — the candidate is
+//!    **settled**, and nothing is scheduled.
 //!
 //! keyd unreachable, a listing that fails, a registration not performed or
 //! with an unknown outcome, or keyd's table full ⇒ the run stops where it
-//! is (a log note); the next run starts from the same place. A refusal of
-//! one registration (keyd's uniform `Denied`: another decision holds the
-//! id) settles that candidate: nothing dird can register would change it.
+//! is (a log note); the next run starts from the same place. keyd's
+//! `Denied` settles the candidate whatever its reason — no key set left (the
+//! normal end), or another decision holding the id (a GUID-halves collision,
+//! docs/questions/Q-501 item 3): nothing dird can register would change it;
+//! keyd's record names which.
 //!
-//! **How dird learns "complete"** (docs/questions/Q-501): from keyd's
-//! recorded result of the executed decision, read as "registered, accepted,
-//! not pending". It is known in memory only: after a dird restart each
-//! tombstone is registered once more; keyd accepts it unchanged while it
-//! still holds the executed decision (≤ 7 days after its registration),
-//! otherwise it becomes a new pending decision whose execution destroys
-//! nothing (keyd's `destroy_key_set` of absent key sets succeeds) — bounded,
-//! harmless, and recorded by keyd.
+//! **How dird learns "complete"** (docs/questions/Q-501 decision, R6b;
+//! Q-520): from keyd's key store, through the refusal — not from dird's
+//! memory, and not from the executed decision keyd keeps for a replay (a
+//! table entry, memory only, gone after 7 days or a keyd start). The
+//! **settled** set below is a bounded cache that spares keyd a registration
+//! per run; it is not the source of truth: after a dird restart (cache
+//! empty) each tombstone keyd already destroyed is registered once, refused,
+//! and settled again — no destroy decision is scheduled, nothing is left
+//! for keyadm's `destroy-sweep`.
 //!
 //! keyd records every registration and listing (intent and outcome for a
 //! registration, A-88); dird logs how many decisions a run re-registered.
@@ -61,7 +61,8 @@
 //! Spec: docs/52 §3.10 (a), §4.2, §4.3 ("`RegisterPendingDestructions` —
 //! dird registers for every tombstone of a user/computer, page by page …
 //! harmless by construction"), §4.6, §4.7; docs/51 §6, §9; A-18; A-102;
-//! A-105; docs/questions/Q-470, Q-471 items 3, 5, Q-501, Q-503.
+//! A-105; A-107; docs/questions/Q-470, Q-471 items 3, 5, Q-501 (items 4–5
+//! and the decision: R6b), Q-503, Q-520.
 
 use crate::admin_engine::AdminWorker;
 use crate::admin_service::RegistrationFailure;
@@ -90,8 +91,8 @@ pub const MAX_PAGES_PER_RUN: usize = 4;
 pub const MAX_REGISTRATIONS_PER_RUN: usize = 32;
 
 /// Settled tombstones remembered at most; past it the memory starts again
-/// empty (the cost: one more harmless registration each). Project bound
-/// (AGENTS.md §6).
+/// empty (the cost: one more registration each, which keyd refuses — R6b).
+/// Project bound (AGENTS.md §6).
 pub const MAX_SETTLED: usize = 4096;
 
 /// Pages of keyd's pending destroy decisions one listing reads at most:
@@ -120,8 +121,10 @@ pub(crate) struct Reconciler {
     /// Where the candidate listing resumes; `None`: from the first
     /// tombstone.
     cursor: Option<Guid>,
-    /// Tombstones whose destruction keyd ran (or that cannot be
-    /// registered): never registered again by this dird.
+    /// Tombstones keyd refused a destroy decision for — no key set left
+    /// (R6b), or the id held by another decision: not registered again by
+    /// this run of dird. A bounded cache, not the source of truth (module
+    /// documentation).
     settled: BTreeSet<Guid>,
 }
 
@@ -133,7 +136,7 @@ impl Reconciler {
 
     /// One run (module documentation). Never fails: a stop is noted and the
     /// next run resumes from the same place.
-    /// Spec: A-105; docs/52 §4.3.
+    /// Spec: A-105; docs/52 §4.3; docs/questions/Q-501 (R6b).
     pub(crate) fn run(&mut self, worker: &mut AdminWorker) {
         let mut reregistered: usize = 0;
         let (candidates, resume) = match self.candidates(worker) {
@@ -154,7 +157,6 @@ impl Reconciler {
             );
             return;
         };
-        let mut registered = Vec::new();
         let mut stopped = None;
         for target in candidates {
             if pending.contains(&target.principal()) {
@@ -164,9 +166,17 @@ impl Reconciler {
                 .verifier
                 .register_decision(DecisionRegistration::of_tombstone(&target))
             {
-                Ok(()) => registered.push(target),
+                // keyd accepted: the principal still has a key set, so the
+                // decision is pending (an executed one leaves no key set,
+                // and nothing recreates a tombstone's) — re-registered.
+                Ok(()) => reregistered += 1,
+                // keyd refused from its key store: no key set left — the
+                // destruction is complete (R6b), and stays so: every
+                // registration (the `Delete`'s first) also discarded any live
+                // set-secret decision for the principal, so none can be
+                // created later — or the id is another decision's; either way
+                // there is nothing to register.
                 Err(RegistrationFailure::Refused(KeydError::Denied)) => {
-                    note(Note::AdminDestroyNotRegistered, Some(1));
                     self.settle(target.guid());
                 }
                 Err(RegistrationFailure::Refused(_)) => {
@@ -176,19 +186,6 @@ impl Reconciler {
                 Err(RegistrationFailure::NotPerformed | RegistrationFailure::OutcomeUnknown) => {
                     stopped = Some(Stop::NotRegistered);
                     break;
-                }
-            }
-        }
-        if !registered.is_empty() {
-            // Step 4: what keyd now shows as pending was re-registered; the
-            // rest it had executed already (module documentation).
-            if let Some(pending) = pending_principals(worker) {
-                for target in registered {
-                    if pending.contains(&target.principal()) {
-                        reregistered += 1;
-                    } else {
-                        self.settle(target.guid());
-                    }
                 }
             }
         }
