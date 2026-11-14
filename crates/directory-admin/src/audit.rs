@@ -87,7 +87,11 @@ impl Stop {
                 | AdminRefusal::PendingUnknown
                 | AdminRefusal::PendingLimit
                 | AdminRefusal::NotApproved
-                | AdminRefusal::SelfLockout => RefusalStatus::Denied,
+                | AdminRefusal::SelfLockout
+                // Not planned by this crate: dird refuses an obligation it
+                // cannot honour after `prepare`, answering `Denied` as for a
+                // PDP deny (docs/questions/Q-388 item 2, Q-397; A-91).
+                | AdminRefusal::ObligationRefused => RefusalStatus::Denied,
             },
             Stop::Failed(_) => RefusalStatus::Unavailable,
         }

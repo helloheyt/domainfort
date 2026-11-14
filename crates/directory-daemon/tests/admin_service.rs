@@ -23,7 +23,11 @@
 //!
 //! Every operation end to end with its reply; the decision event
 //! acknowledged **before** the commit and the outcome event after it; an
-//! auditd that withholds acknowledgements ⇒ `Unavailable`, store unchanged;
+//! auditd that withholds acknowledgements ⇒ `Unavailable`, store unchanged,
+//! the outcome `AuditUnacknowledged`; the `RateLimit` obligation past its
+//! limit ⇒ `Denied`, the decision `ObligationRefused` (A-91, Q-397 — the
+//! third F4 code, `ViewUnavailable`, has no injection point here: the store
+//! dird holds cannot be made to fail to begin a transaction or a snapshot);
 //! a bad or expired AP-REQ ⇒ `Denied` and keyd down ⇒ `Unavailable`, store
 //! unchanged; dual control (a second Tier-0 administrator's approval
 //! satisfies it, the same principal twice does not); a wrong peer uid ⇒
@@ -33,8 +37,9 @@
 //!
 //! Sources: docs/51 §5.2, §5.3, §5.6, §5.7, §7.1-§7.5; docs/50 §3.3, §3.6,
 //! §9; docs/10 §5ב; RFC 4120 §3.2.3, §5.3, §5.5.1, §6.2.1, §7.5.1; [MS-SAMR]
-//! 2.2.1.14 (RID 502); [MS-DTYP] 2.4.2.4 (SID layout); A-26, A-56, A-73,
-//! A-85, A-89, P-22. Every value is constructed by hand for these tests (the
+//! 2.2.1.14 (RID 502); [MS-DTYP] 2.4.2.4 (SID layout); docs/11 §2, §8;
+//! A-26, A-56, A-73, A-85, A-89, A-91, P-22. Every value is constructed by
+//! hand for these tests (the
 //! times are those of the kdc fixtures); no vector comes from any other
 //! implementation.
 
@@ -1531,14 +1536,80 @@ fn no_acknowledgement_means_nothing_is_committed() {
         events[0].stage,
         DirAdminStage::Decision(DecisionResult::Proceed)
     );
+    // Its own code (A-91, Q-397): not performed because the decision was
+    // not acknowledged — not an `InternalFailure`.
     assert_eq!(
         events[1].stage,
         DirAdminStage::Outcome(OutcomeResult::Failed(
-            ipc_audit::AdminFailure::InternalFailure
+            ipc_audit::AdminFailure::AuditUnacknowledged
         ))
     );
     assert_eq!(events[0].operation_id, events[1].operation_id);
     assert_eq!(world.object_named(g(STAFF_OU), "withheld"), None);
+}
+
+/// docs/11 §2 ("the PEP must honour obligations"), §8 (`RateLimit` with a
+/// request-derived key); docs/questions/Q-358 item 7, Q-388 item 2; A-91
+/// (Q-397: the refusal has its own code). Every Allow carries the PDP's
+/// `RateLimit(requester, Directory)` obligation, which dird's admin thread
+/// honours with its fixed-window limiter (`OBLIGATION_LIMIT` requests per
+/// key per `OBLIGATION_WINDOW_SECS` of the request's `now`; dird's clock is
+/// fixed in these tests, so every request falls in one window). An
+/// administrator's `Lookup`s are served up to the limit; the next one is
+/// answered `Denied`, and its decision event says
+/// `Refused(ObligationRefused)` with the PDP reason still `Allowed` — not a
+/// PDP deny. Another administrator (another key) is still served.
+#[test]
+fn an_obligation_dird_cannot_honour_is_refused_with_its_own_code() {
+    let Some(world) = World::new(Options::default()) else {
+        return;
+    };
+    let mut client = world.client();
+    client.ping().unwrap();
+    let lookup = || Operation::Lookup(LookupKey::SamAccountName("bob".into()));
+    for i in 0..directory_daemon::rate::OBLIGATION_LIMIT {
+        assert!(
+            matches!(
+                client.call(&by("admin1", &[], lookup())).unwrap(),
+                Reply::Found(_)
+            ),
+            "lookup {i}"
+        );
+    }
+    assert_eq!(
+        client.call(&by("admin1", &[], lookup())).unwrap(),
+        Reply::Refused(RefusalStatus::Denied)
+    );
+    // Another requester is another rate-limit key.
+    assert!(matches!(
+        client.call(&by("admin2", &[], lookup())).unwrap(),
+        Reply::Found(_)
+    ));
+    let count = usize::try_from(directory_daemon::rate::OBLIGATION_LIMIT).unwrap() + 2;
+    let events = await_events(&world, DirAdminOperation::Lookup, count);
+    assert_eq!(events.len(), count, "one decision event per Lookup");
+    let refused = &events[count - 2];
+    assert_eq!(
+        refused.stage,
+        DirAdminStage::Decision(DecisionResult::Refused(
+            ipc_audit::AdminRefusal::ObligationRefused
+        ))
+    );
+    assert_eq!(
+        refused.pdp.map(|reason| reason.code),
+        Some(ipc_audit::PdpReasonCode::Allowed),
+        "the PDP allowed it"
+    );
+    for (i, event) in events.iter().enumerate() {
+        if i != count - 2 {
+            assert_eq!(
+                event.stage,
+                DirAdminStage::Decision(DecisionResult::Proceed),
+                "event {i}"
+            );
+        }
+    }
+    assert_ne!(events[count - 1].requester, refused.requester);
 }
 
 /// docs/51 §7.4 step 1; A-26; A-56: a bad AP-REQ and an expired one ⇒

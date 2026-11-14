@@ -22,6 +22,15 @@
 //!   share, noise is counted, not queued ([`SendWindow::offer_noise`]), and
 //!   the count goes into the next [`WindowSummary`]: summarised in counters,
 //!   and limited to the share of the window that acknowledgements free.
+//! * **Lost outcomes** — for an operation recorded in two events (an intent
+//!   or decision acknowledged first, then its outcome: keyd-daemon's
+//!   key-state changes, dird's admin writes), an outcome record that could
+//!   not be committed into its reserved slot — is counted by the caller
+//!   ([`SendWindow::count_unrecorded_outcome`]) and the count goes into the
+//!   next [`WindowSummary`] beside the other two (decision A-88;
+//!   docs/questions/Q-366 option (a), Q-395). A refused reservation means
+//!   "not done"; a lost outcome means "an intent without its outcome — the
+//!   operation may have been done": they are kept apart.
 //! * **No shutdown.** Nothing here stops the process or signals that it
 //!   should: a full window only refuses new gating reservations and counts
 //!   noise. The service stays up and answers; it just does not issue without
@@ -47,7 +56,8 @@
 //! Spec: docs/50 R50-17 ("processes deliver events in a bounded window and
 //! wait for persistence acknowledgements"), §8.1, §3.6; docs/questions/Q-218
 //! (A-57); docs/07 §8; docs/37 §2 (no code path disables audit for a
-//! sensitive operation, D63).
+//! sensitive operation, D63); docs/questions/Q-366 (A-88), Q-395 (the
+//! lost-outcome count).
 
 use crate::channel::{Ack, Append, MAX_BATCH_EVENTS};
 use crate::error::EventError;
@@ -189,6 +199,8 @@ pub struct SendWindow {
     noise_held: u32,
     suppressed_noise: u64,
     refused_gating: u64,
+    /// Lost outcome records counted since the last summary (A-88).
+    unrecorded_outcomes: u64,
     last_ack: Option<Ack>,
 }
 
@@ -205,6 +217,7 @@ impl SendWindow {
             noise_held: 0,
             suppressed_noise: 0,
             refused_gating: 0,
+            unrecorded_outcomes: 0,
             last_ack: None,
         }
     }
@@ -293,6 +306,24 @@ impl SendWindow {
         Ok(NoiseAdmission::Queued { seq })
     }
 
+    /// Count an outcome record that could not be committed (its
+    /// [`SendWindow::commit`] failed, or the caller had no record to commit)
+    /// although its operation's intent or decision is already recorded: the
+    /// count goes into the next [`WindowSummary`] (`unrecorded_outcomes`), so
+    /// the log says that an intent there has no outcome. Additive to the
+    /// window's other counters; takes no slot. Saturates instead of
+    /// wrapping.
+    ///
+    /// Not for a refused reservation — [`SendWindow::reserve`] counts that
+    /// itself, as `refused_gating` ("not done").
+    ///
+    /// Spec: decision A-88 (a lost-outcome count in the shared summary);
+    /// docs/questions/Q-366 option (a), Q-346 (A-86: "the gap is
+    /// surfaced"), Q-395; docs/37 §5.
+    pub fn count_unrecorded_outcome(&mut self) {
+        self.unrecorded_outcomes = self.unrecorded_outcomes.saturating_add(1);
+    }
+
     /// Append an encoded event to the pending queue.
     fn push(&mut self, event: EventBytes, noise: bool) -> Result<u64, WindowError> {
         let seq = self.next_seq;
@@ -304,19 +335,25 @@ impl SendWindow {
         Ok(seq)
     }
 
-    /// If anything was counted and a slot is free, queue the summary event.
+    /// If anything was counted and a slot is free, queue the summary event
+    /// (the three counters together; each starts again from 0 once queued).
+    /// Spec: docs/questions/Q-218 (A-57), Q-366 (A-88), Q-395.
     fn queue_summary(&mut self) {
-        if (self.suppressed_noise == 0 && self.refused_gating == 0) || self.is_full() {
+        let nothing_counted =
+            self.suppressed_noise == 0 && self.refused_gating == 0 && self.unrecorded_outcomes == 0;
+        if nothing_counted || self.is_full() {
             return;
         }
         let summary = EventBody::WindowSummary(WindowSummary {
             suppressed_noise: self.suppressed_noise,
             refused_gating: self.refused_gating,
+            unrecorded_outcomes: self.unrecorded_outcomes,
         });
         if let Ok(event) = encode_event(&summary) {
             if self.push(event, false).is_ok() {
                 self.suppressed_noise = 0;
                 self.refused_gating = 0;
+                self.unrecorded_outcomes = 0;
             }
         }
     }
@@ -407,6 +444,13 @@ impl SendWindow {
     #[must_use]
     pub fn refused_gating(&self) -> u64 {
         self.refused_gating
+    }
+
+    /// Lost outcome records counted since the last summary
+    /// ([`SendWindow::count_unrecorded_outcome`]).
+    #[must_use]
+    pub fn unrecorded_outcomes(&self) -> u64 {
+        self.unrecorded_outcomes
     }
 
     /// The last acknowledgement received.

@@ -42,7 +42,8 @@
 //! **acknowledge** it, else a `NotPerformed` record and `Unavailable`, keyd
 //! not called → keyd → commit keyd's record (the outcome) → reply with the
 //! true result, even if that record could not be committed (the gap is
-//! counted and noted on stderr). "Unavailable" always means "not done".
+//! counted into the next `WindowSummary` — A-88 — and noted on stderr).
+//! "Unavailable" always means "not done".
 //!
 //! # Modules
 //!
@@ -86,8 +87,10 @@
 //!   behind it wait that long too (A-86; Q-365). A caller whose reply is
 //!   lost or later than its own deadline still cannot tell a performed
 //!   change from an unperformed one — the log can (intent + outcome).
-//! - A lost outcome record is counted on stderr, not in the audit log's
-//!   `WindowSummary` (that shape has no field for it; Q-366).
+//! - A lost outcome record is counted into the next `WindowSummary` of the
+//!   window (`unrecorded_outcomes`, decision A-88; Q-366, Q-395) and on
+//!   stderr; the summary itself waits in the window like every event, so it
+//!   is lost only if keyd ends before auditd acknowledged it (Q-252 item 9).
 //!
 //! # Provenance
 //!
@@ -116,9 +119,12 @@
 //! statement of A-86 / Q-346, and the public API of this project's crates
 //! (ipc-audit `SendWindow`, keyd, ipc-keyd); the wait uses `std::sync::
 //! Condvar` from the Rust standard library. Nothing else was consulted.
+//! Counting a lost outcome into the window's summary (decision A-88, task
+//! F4) was written only from PENDING-OWNER (A-88), docs/questions Q-366,
+//! docs/50 §8, docs/37 and the public API of ipc-audit `SendWindow`.
 //!
 //! Spec: docs/50 §10 (P7), R50-3, R50-5, R50-6, R50-7, R50-14, R50-16,
-//! R50-17, R50-18; docs/10; A-56; A-57; A-62; A-64; A-86.
+//! R50-17, R50-18; docs/10; A-56; A-57; A-62; A-64; A-86; A-88.
 
 pub mod audit;
 pub mod audit_client;

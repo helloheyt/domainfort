@@ -60,7 +60,11 @@
 //! issue; keyd answers `Busy`); unauthenticated noise may hold only a share
 //! of the window and is otherwise counted into a [`WindowSummary`]; nothing
 //! stops the process. "No unaudited issuance, and log overflow does not turn
-//! into shutdown." Every `DirAdmin` event is gating; an `Admind` event is
+//! into shutdown." The summary also counts outcome records that could not be
+//! committed after their intent or decision was recorded
+//! ([`SendWindow::count_unrecorded_outcome`]; decision A-88,
+//! docs/questions/Q-366, Q-395), so a lost outcome is in the log, not only
+//! on stderr. Every `DirAdmin` event is gating; an `Admind` event is
 //! noise exactly when it records a refused connection or a malformed frame
 //! ([`AdmindEvent::is_noise`]), so neither can make admind unavailable.
 //!
@@ -86,12 +90,16 @@
 //! §5.1-§5.8, §6, §7, §8.3, §9, §11, §12 and decision A-72), docs/50 §3, §8,
 //! docs/37, docs/43 (D175), PENDING-OWNER (A-57, A-64, A-66..A-80),
 //! docs/questions Q-218, Q-252, and the public API of crates/ipc (error,
-//! refused) and crates/keyd-types (error). No other implementation,
+//! refused) and crates/keyd-types (error). The third `WindowSummary` counter
+//! and the three appended admin codes (task F4) were written only from
+//! PENDING-OWNER (A-85, A-88, A-91), docs/questions Q-341, Q-366, Q-388,
+//! Q-358, docs/50 §8, docs/37, docs/51 §5.7 / §7.4 and docs/11 §2 / §8 (as
+//! cited there). No other implementation,
 //! serializer, RPC framework or audit format was consulted or recalled
 //! (AGENTS.md §1-3).
 //!
 //! Spec: docs/50 R50-17, §3.3, §8.1, §10; docs/37 §2; Q-218 (A-57); A-59;
-//! docs/51 §5.7 (A-72).
+//! docs/51 §5.7 (A-72); A-88 (Q-366, Q-395); A-91 (Q-388, Q-397).
 
 mod admin;
 mod channel;

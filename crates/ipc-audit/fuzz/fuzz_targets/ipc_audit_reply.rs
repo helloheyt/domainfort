@@ -31,6 +31,7 @@ fuzz_target!(|data: &[u8]| {
         let event = EventBody::WindowSummary(WindowSummary {
             suppressed_noise: 0,
             refused_gating: 0,
+            unrecorded_outcomes: 0,
         });
         for _ in 0..3 {
             let slot = window.reserve().expect("room in a new window");

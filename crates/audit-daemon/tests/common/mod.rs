@@ -393,6 +393,7 @@ pub fn window_summary() -> EventBody {
     EventBody::WindowSummary(ipc_audit::WindowSummary {
         suppressed_noise: 1,
         refused_gating: 0,
+        unrecorded_outcomes: 0,
     })
 }
 

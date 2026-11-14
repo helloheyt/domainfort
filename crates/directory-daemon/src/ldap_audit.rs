@@ -247,6 +247,22 @@ impl AuditGate {
         result
     }
 
+    /// Count an admin outcome event that could not be committed after its
+    /// decision event was (the log then holds the decision without its
+    /// outcome) into the window's next `WindowSummary`
+    /// (`unrecorded_outcomes`), and wake the audit client to send it. A
+    /// poisoned lock cannot count it; the caller's thinned stderr note still
+    /// records it.
+    /// Spec: decision A-88 (a lost-outcome count in the shared summary);
+    /// docs/questions/Q-366 option (a) ("dird's `DirAdmin` outcome … would
+    /// use the same counter"), Q-388 item 6, Q-395.
+    pub(crate) fn count_unrecorded_outcome(&self) {
+        if let Some(mut state) = self.lock() {
+            state.window.count_unrecorded_outcome();
+        }
+        self.wake.notify_one();
+    }
+
     /// Wait until auditd acknowledged the event numbered `seq` — persisted
     /// it (docs/50 §8.1: `Ack` only after the sync) — or `deadline` passed.
     /// Acknowledgements are cumulative and in order (one batch in flight,

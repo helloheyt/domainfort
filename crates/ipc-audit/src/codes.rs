@@ -658,9 +658,20 @@ code_table! {
     ///   or membership removal that would leave fewer enabled Tier-0
     ///   administrators than the dual-control quorum (Q-295 item 4, owner
     ///   item P-22). Appended by task A3: no earlier code names this check.
+    /// * `ObligationRefused` — the PDP **allowed** the requester (the PDP
+    ///   reason in [`crate::DirAdminEvent::pdp`] stays `Allowed`), but dird
+    ///   could not honour an obligation of that Allow: the `RateLimit`
+    ///   obligation's limit for the requester is reached, or a
+    ///   `Constrain(MaxPageSize(0))` leaves a `Lookup` no entry to answer
+    ///   with (docs/11 §2: "the PEP must honour obligations", §8;
+    ///   docs/questions/Q-358 item 7, Q-388 item 2). Appended by task F4
+    ///   (A-91): before it, dird recorded this as `PolicyDenied` with an
+    ///   `Allowed` PDP reason — a refusal no reader could tell apart from a
+    ///   PDP deny without comparing two fields.
     ///
     /// Spec: docs/51 §5.2, §5.5, §5.6, §6, §7.4, §8.3, §11;
-    /// docs/questions/Q-340 item 3; Q-295 item 4 (P-22).
+    /// docs/questions/Q-340 item 3; Q-295 item 4 (P-22); docs/11 §2, §8;
+    /// docs/questions/Q-388 items 1-2 (A-91), Q-397.
     pub enum AdminRefusal {
         Unauthenticated,
         TicketAge,
@@ -681,6 +692,7 @@ code_table! {
         PendingLimit,
         NotApproved,
         SelfLockout,
+        ObligationRefused,
     }
 }
 
@@ -690,14 +702,42 @@ code_table! {
     ///
     /// * `KeydUnavailable` — the AP-REQ could not be verified because keyd
     ///   did not answer (§7.4 step 1: "keyd down ⇒ `Unavailable`", A-56).
-    /// * `StoreFailure` — reading the directory view or the `WriteTxn` /
-    ///   commit failed (§7.4 step 5).
+    /// * `StoreFailure` — a read of the directory during the checks, or the
+    ///   `WriteTxn`'s writes / commit, failed (§7.4 step 5). (Failing to
+    ///   begin the transaction or take the view at all, before any check,
+    ///   is `ViewUnavailable`.)
     /// * `IntegrityFailure` — the store refused a record whose integrity tag
     ///   did not verify (docs/32, as cited in §5.8).
     /// * `InternalFailure` — any other local failure.
+    /// * `ViewUnavailable` — dird could not begin the operation's `WriteTxn`
+    ///   or take the one view its checks run on (§7.4 steps 2-3 in the
+    ///   order A-89 fixed: the transaction first, so the view is its
+    ///   starting state — docs/questions/Q-358 item 1): **no check ran and
+    ///   nothing was decided**. dird sends it in a `Decision` event (like
+    ///   `KeydUnavailable`, the codec does not tie a failure code to a
+    ///   phase). Appended by task F4
+    ///   (A-91; docs/questions/Q-388 item 1): before it, dird recorded this
+    ///   as `StoreFailure`, the code of a read that fails inside the checks.
+    /// * `AuditUnacknowledged` — the operation's `Decision` event was
+    ///   committed but auditd did not acknowledge it within dird's deadline,
+    ///   so dird did **not** perform the operation (the transaction was
+    ///   aborted; nothing was written): docs/51 §5.7 item 2 ("decision
+    ///   acknowledged ⇒ commit"), A-85. dird sends it in the `Outcome`
+    ///   event, with the decision's operation number — the admin plane's
+    ///   counterpart of keyd-daemon's `NotPerformed` (A-86). Appended by task
+    ///   F4 (A-91; Q-388 item 1): before it, dird recorded this as
+    ///   `InternalFailure`.
     ///
-    /// Spec: docs/51 §7.4; A-56; docs/questions/Q-340 item 3.
-    pub enum AdminFailure { KeydUnavailable, StoreFailure, IntegrityFailure, InternalFailure }
+    /// Spec: docs/51 §5.7 item 2, §7.4; A-56; A-85; A-89; docs/questions/
+    /// Q-340 item 3, Q-358 item 1, Q-388 item 1 (A-91), Q-397.
+    pub enum AdminFailure {
+        KeydUnavailable,
+        StoreFailure,
+        IntegrityFailure,
+        InternalFailure,
+        ViewUnavailable,
+        AuditUnacknowledged,
+    }
 }
 
 code_table! {

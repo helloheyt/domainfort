@@ -58,7 +58,10 @@
 //!    ([`AuditGate::finish_key_state_change`]) and replies with the true
 //!    result. If that record cannot be committed, the intent already
 //!    documents the attempt: the reply is still the true result, and the gap
-//!    is counted ([`AuditGate::unrecorded_outcomes`]) and noted on stderr.
+//!    is counted **into the window's next `WindowSummary`**
+//!    (`unrecorded_outcomes`, decision A-88; docs/questions/Q-366,
+//!    Q-395) — so it reaches the audit log — as well as in the daemon's own
+//!    total ([`AuditGate::unrecorded_outcomes`]) and on stderr.
 //!    The outcome slot was reserved in step 1, so only a fault can make this
 //!    happen (keyd emitted no record, or more than [`RecordBuffer`] keeps).
 //!    An outcome committed while auditd is away is not lost: it waits in the
@@ -79,9 +82,9 @@
 //! item 2).
 //!
 //! Spec: docs/50 R50-17, §8.1; docs/questions/Q-218 (A-57), Q-252 items 8, 9
-//! (A-64), Q-346 (A-86), Q-365; docs/10 §10, I8; docs/37 §2 (D63: no code
-//! path disables audit for a sensitive operation); docs/07 §8; docs/51 §5.7
-//! item 2 (A-85).
+//! (A-64), Q-346 (A-86), Q-365, Q-366 (A-88), Q-395; docs/10 §10, I8;
+//! docs/37 §2 (D63: no code path disables audit for a sensitive operation),
+//! §5; docs/07 §8; docs/51 §5.7 item 2 (A-85).
 
 use ipc_audit::{
     Ack, Append, EventBody, KeydOutcome, KeydReason, KeydRecord, Reservation, SendWindow,
@@ -349,7 +352,9 @@ pub(crate) struct AuditGate {
     /// (A-86); paired with `state`.
     acked: Condvar,
     /// Outcome records of key-state changes that could not be committed
-    /// since start (A-86: the gap is counted).
+    /// since start (A-86: the gap is counted) — the daemon's running total
+    /// for stderr; each is also counted into the window's next summary
+    /// (A-88).
     unrecorded: AtomicU64,
 }
 
@@ -567,9 +572,10 @@ impl AuditGate {
     /// [`RecordLost`] when the records could not all be committed (none, too
     /// many, or no slot for an extra one). The caller still replies with the
     /// operation's true result — the intent documents the attempt — and the
-    /// gap is counted here ([`AuditGate::unrecorded_outcomes`]).
+    /// gap is counted here: into the window's next `WindowSummary` (A-88)
+    /// and into [`AuditGate::unrecorded_outcomes`].
     ///
-    /// Spec: docs/questions/Q-346 (A-86), Q-365; docs/10 I8.
+    /// Spec: docs/questions/Q-346 (A-86), Q-365, Q-366 (A-88); docs/10 I8.
     pub(crate) fn finish_key_state_change(
         &self,
         pending: PendingOutcome,
@@ -578,7 +584,10 @@ impl AuditGate {
     ) -> Result<(), RecordLost> {
         let PendingOutcome { slot, .. } = pending;
         let result = match self.lock() {
-            Some(mut state) => Self::commit_all(&mut state.window, slot, records, overflowed),
+            Some(mut state) => {
+                let committed = Self::commit_all(&mut state.window, slot, records, overflowed);
+                Self::count_if_lost(&mut state.window, committed)
+            }
             None => Err(RecordLost),
         };
         self.settle_outcome(result)
@@ -600,18 +609,40 @@ impl AuditGate {
     ) -> Result<(), RecordLost> {
         let PendingOutcome { slot, .. } = pending;
         let result = match self.lock() {
-            Some(mut state) => state
-                .window
-                .commit(slot, not_performed)
-                .map(|_| ())
-                .map_err(|_| RecordLost),
+            Some(mut state) => {
+                let committed = state
+                    .window
+                    .commit(slot, not_performed)
+                    .map(|_| ())
+                    .map_err(|_| RecordLost);
+                Self::count_if_lost(&mut state.window, committed)
+            }
             None => Err(RecordLost),
         };
         self.settle_outcome(result)
     }
 
-    /// Count an outcome that could not be committed, and wake the audit
-    /// client. Spec: docs/questions/Q-346 (A-86: "the gap is surfaced").
+    /// A lost outcome record goes into the window's next `WindowSummary`
+    /// (`unrecorded_outcomes`), under the same lock as the failed commit, so
+    /// the summary the audit client sends next carries it. A gate whose lock
+    /// is poisoned cannot count it there; [`AuditGate::settle_outcome`]
+    /// still counts it for stderr.
+    /// Spec: decision A-88 (a lost-outcome count in the shared summary);
+    /// docs/questions/Q-366 option (a), Q-395.
+    fn count_if_lost(
+        window: &mut SendWindow,
+        result: Result<(), RecordLost>,
+    ) -> Result<(), RecordLost> {
+        if result.is_err() {
+            window.count_unrecorded_outcome();
+        }
+        result
+    }
+
+    /// Count an outcome that could not be committed in the daemon's total
+    /// (for stderr), and wake the audit client (to send the summary that
+    /// now counts it). Spec: docs/questions/Q-346 (A-86: "the gap is
+    /// surfaced"), Q-366 (A-88).
     fn settle_outcome(&self, result: Result<(), RecordLost>) -> Result<(), RecordLost> {
         if result.is_err() {
             self.unrecorded.fetch_add(1, Ordering::Relaxed);
@@ -822,6 +853,30 @@ mod tests {
         );
         assert_eq!(gate.unrecorded_outcomes(), 1, "the gap is counted");
         assert_eq!(gate.outstanding(), 1, "the intent alone");
+        // A-88: and into the window's next summary, after the intent (the
+        // summary takes the slot the lost outcome left free).
+        assert_eq!(
+            gate.with_window(|window| window.unrecorded_outcomes()),
+            Some(1)
+        );
+        let append = gate.next_batch().unwrap();
+        let events: Vec<EventBody> = append
+            .events()
+            .iter()
+            .map(|e| ipc_audit::decode_event(e.as_bytes()).unwrap())
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], EventBody::Keyd(r) if r.result == KeydOutcome::Intent));
+        // The refused second reservation above is counted apart: a refusal
+        // ("not done") is not a lost outcome ("done, record lost").
+        assert_eq!(
+            events[1],
+            EventBody::WindowSummary(ipc_audit::WindowSummary {
+                suppressed_noise: 0,
+                refused_gating: 1,
+                unrecorded_outcomes: 1,
+            })
+        );
     }
 
     /// A-86 step 2: `wait_acknowledged` returns once auditd acknowledged the

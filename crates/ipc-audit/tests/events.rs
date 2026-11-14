@@ -53,8 +53,8 @@ fn largest_events_fit_the_bound() {
         );
     }
     // Measured at the time of writing: KDC 3971, keyd 97, LDAP 4856,
-    // summary 18 octets — the LDAP shape is the largest; keep the margin
-    // visible.
+    // summary 26 octets (18 before F4 appended its third counter) — the LDAP
+    // shape is the largest; keep the margin visible.
     let ldap = encode_event(&EventBody::Ldap(Box::new(largest_ldap_event())))
         .unwrap()
         .len();
@@ -313,9 +313,32 @@ fn code_tables_are_closed() {
     assert_eq!(EventShape::DirAdmin.code(), 5);
     assert_eq!(EventShape::Admind.code(), 6);
     assert_eq!(table!(DirAdminOperation), 18);
-    // Task A3 appended `SelfLockout` (Q-295 item 4, P-22).
-    assert_eq!(table!(AdminRefusal), 19);
-    assert_eq!(table!(AdminFailure), 4);
+    // Task A3 appended `SelfLockout` (Q-295 item 4, P-22); task F4
+    // appended `ObligationRefused` (A-91, Q-388 item 1, Q-397).
+    assert_eq!(table!(AdminRefusal), 20);
+    assert_eq!(AdminRefusal::SelfLockout.code(), 19);
+    assert_eq!(AdminRefusal::ObligationRefused.code(), 20);
+    assert_eq!(
+        AdminRefusal::ALL.last(),
+        Some(&AdminRefusal::ObligationRefused)
+    );
+    // Task F4 appended `ViewUnavailable` and `AuditUnacknowledged`; the
+    // first four keep their codes (A-91, Q-397; append only).
+    assert_eq!(table!(AdminFailure), 6);
+    assert_eq!(
+        AdminFailure::ALL
+            .iter()
+            .map(|f| (f.code(), f.name()))
+            .collect::<Vec<_>>(),
+        [
+            (1, "KeydUnavailable"),
+            (2, "StoreFailure"),
+            (3, "IntegrityFailure"),
+            (4, "InternalFailure"),
+            (5, "ViewUnavailable"),
+            (6, "AuditUnacknowledged"),
+        ]
+    );
     assert_eq!(table!(FrameErrorCode), 15);
     table!(AdminPhase);
     table!(DecisionResultCode);
@@ -441,6 +464,85 @@ fn field_inventory_holds_no_secret() {
             } => {}
         }
     }
+    // Every sender's window summary: three counters, nothing else (A-57;
+    // A-88 appended the third, Q-395).
+    let ipc_audit::WindowSummary {
+        suppressed_noise: _,    // count
+        refused_gating: _,      // count
+        unrecorded_outcomes: _, // count
+    } = summary();
+}
+
+/// docs/50 §3.3 (fixed width, big-endian; one encoding per value; strict
+/// decoding) and the layout decided for task F4 (A-88; docs/questions/Q-366
+/// option (a), Q-395): `WindowSummary := suppressed_noise:u64 ‖
+/// refused_gating:u64 ‖ unrecorded_outcomes:u64` after the format and shape
+/// octets. The octets are assembled here by hand from that layout; every
+/// counter value, the extremes included, round-trips canonically and in its
+/// own position; the 16-octet form of before F4, every other truncation and
+/// a trailing octet are refused.
+#[test]
+fn window_summary_layout_and_bounds() {
+    let expected = |noise: u64, refused: u64, lost: u64| {
+        let mut out = vec![EVENT_FORMAT, 4];
+        out.extend_from_slice(&noise.to_be_bytes());
+        out.extend_from_slice(&refused.to_be_bytes());
+        out.extend_from_slice(&lost.to_be_bytes());
+        out
+    };
+    for (noise, refused, lost) in [
+        (0, 0, 0),
+        (12, 3, 2),
+        (0, 0, 1),
+        (u64::MAX, 0, 0),
+        (0, u64::MAX, 0),
+        (0, 0, u64::MAX),
+        (u64::MAX, u64::MAX, u64::MAX),
+        (
+            0x0102_0304_0506_0708,
+            0x1112_1314_1516_1718,
+            0x2122_2324_2526_2728,
+        ),
+    ] {
+        let summary = EventBody::WindowSummary(ipc_audit::WindowSummary {
+            suppressed_noise: noise,
+            refused_gating: refused,
+            unrecorded_outcomes: lost,
+        });
+        let bytes = encode_event(&summary).unwrap();
+        assert_eq!(bytes.as_bytes(), expected(noise, refused, lost).as_slice());
+        assert_eq!(bytes.len(), 2 + 3 * 8);
+        assert_eq!(decode_event(bytes.as_bytes()).unwrap(), summary);
+        assert_eq!(event_round_trip_is_canonical(bytes.as_bytes()), Ok(true));
+    }
+    let good = expected(12, 3, 2);
+    // Every shorter form — the two-counter layout of before F4 (18 octets)
+    // among them — is truncated.
+    for len in 0..good.len() {
+        let refused = decode_event(&good[..len]);
+        assert!(refused.is_err(), "{len} octets accepted");
+        if len >= 2 {
+            assert_eq!(refused, Err(EventError::Codec(ipc::Error::Truncated)));
+        }
+    }
+    let mut longer = good.clone();
+    longer.push(0);
+    assert_eq!(
+        decode_event(&longer),
+        Err(EventError::Codec(ipc::Error::TrailingBytes))
+    );
+    // The counters are not interchangeable: each lands in its own field.
+    let EventBody::WindowSummary(decoded) = decode_event(&expected(1, 2, 3)).unwrap() else {
+        panic!("not a summary");
+    };
+    assert_eq!(
+        (
+            decoded.suppressed_noise,
+            decoded.refused_gating,
+            decoded.unrecorded_outcomes
+        ),
+        (1, 2, 3)
+    );
 }
 
 /// Reasons with detail: the detail travels in its own optional field.

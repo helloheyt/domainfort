@@ -96,6 +96,41 @@ fn unmapped_uid_is_closed_without_reply_and_counted() {
     assert_eq!(records[0].payload, expected_refused(1, 0, uid));
 }
 
+/// Source: docs/50 §3.2 ("an unmapped uid ⇒ the connection is closed + an
+/// audit record"); docs/questions/Q-341 residual (A-85), decision A-88,
+/// Q-396 (a last summary at a clean stop). A connection refused just before
+/// the server stops — no summary interval has passed — is still in the log:
+/// the stop writes the pending count before the log closes. The next start
+/// (the daemon's start-up verification, `open_log`) verifies the log and
+/// resumes after that record.
+#[test]
+fn a_refusal_just_before_a_stop_is_written() {
+    let uid = own_uid();
+    let dir = TempDir::new();
+    let settings = settings(&dir, other_uid(&[uid]), 5);
+    let server = Server::start(&settings, config(&settings), 8, true);
+
+    let mut client = connect(&server.socket);
+    let frame = ipc_audit::encode_request(&AuditRequest::Ping).unwrap();
+    let _ = client.write_all(frame.as_bytes());
+    assert_eq!(receive(&mut client), Got::Closed);
+    // No wait for the summary interval: stop at once.
+    assert_eq!(server.stop(), Some(Ok(())));
+
+    let (records, head) = read_segment(&dir.base(), 1, Anchor::Genesis);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].source, Source::Auditd);
+    assert_eq!(records[0].payload, expected_refused(1, 0, uid));
+    let reopened = audit_daemon::recovery::open_log(
+        &dir.base(),
+        audit_log::SegmentLimit::DEFAULT,
+        settings.run_as().uid(),
+    )
+    .expect("the log verifies at the next start");
+    assert_eq!(reopened.start, audit_daemon::recovery::StartKind::Resumed);
+    assert_eq!(reopened.sink.head(), head);
+}
+
 /// Source: docs/questions/Q-252 item 7 (contiguous numbering per
 /// connection; a new connection sets a new baseline), Q-265 item 3
 /// (`Refused::Malformed` + close).
@@ -531,11 +566,10 @@ fn older_shapes_are_bound_to_their_sender() {
             })
             .collect();
         assert_eq!(stored, accepted, "{source}: only its own shapes");
-        // The refusals are summarised at most once per summary interval, so
-        // the last ones may still be pending when the server stops (the
-        // exact count of a single refusal is checked in
-        // `misbound_shape_is_refused_and_recorded`); what was written counts
-        // refused batches only, from this uid.
+        // The refusals are summarised at most once per summary interval
+        // while auditd serves, and what is still pending at the stop is
+        // written then (Q-396): the records count every refused batch,
+        // only refused batches, from this uid.
         let counted: u64 = records
             .iter()
             .filter(|r| r.source == Source::Auditd)
@@ -545,7 +579,7 @@ fn older_shapes_are_bound_to_their_sender() {
                 u64::from_be_bytes(r.payload[2..10].try_into().unwrap())
             })
             .sum();
-        assert!((1..=refused).contains(&counted), "{source}: {counted}");
+        assert_eq!(counted, refused, "{source}");
         assert_eq!(refused, 5 - own_shapes.len() as u64, "{source}");
     }
 }

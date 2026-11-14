@@ -13,14 +13,19 @@
 //! sequence of the admin-plane shapes stays within its bound. A keyd record's
 //! outcome is one of the closed table's seven codes — keyd's five outcomes
 //! or keyd-daemon's two phases of a key-state change (`Intent`,
-//! `NotPerformed`; decision A-86) — and nothing else.
+//! `NotPerformed`; decision A-86) — and nothing else. A window summary is
+//! exactly its three fixed-width counters (decision A-88 appended the
+//! third, `unrecorded_outcomes`; docs/questions/Q-395): 2 + 3 × 8 octets,
+//! the counters in their declared order. A `DirAdmin` refusal or failure
+//! code is one of its closed table's (A-91 appended three; Q-397).
 //!
 //! Spec: docs/50 §3.3, §8.1, §8.2; docs/51 §5.7; docs/questions/Q-340,
-//! Q-341, Q-346 (A-86), Q-365.
+//! Q-341, Q-346 (A-86), Q-365, Q-366 (A-88), Q-388 (A-91), Q-395, Q-397.
 
 use ipc_audit::{
-    decode_event, encode_event, peek_shape, AdmindActivity, AuditText, EventBody, KeydOutcome,
-    Principal, MAX_APPROVERS, MAX_REPORTED_KVNOS, MAX_TARGET_NAMES, MAX_TEXT_OCTETS,
+    decode_event, encode_event, peek_shape, AdminFailure, AdminRefusal, AdmindActivity, AuditText,
+    DecisionResult, DirAdminStage, EventBody, KeydOutcome, OutcomeResult, Principal,
+    MAX_APPROVERS, MAX_REPORTED_KVNOS, MAX_TARGET_NAMES, MAX_TEXT_OCTETS,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -65,6 +70,23 @@ fuzz_target!(|data: &[u8]| {
             assert!(admin.names.len() <= MAX_TARGET_NAMES);
             assert!(admin.approvers.len() <= MAX_APPROVERS);
             assert!(admin.reported_kvnos.len() <= MAX_REPORTED_KVNOS);
+            // Closed tables (A-91 appended `ObligationRefused` = 20,
+            // `ViewUnavailable` = 5, `AuditUnacknowledged` = 6; nothing past
+            // them).
+            match admin.stage {
+                DirAdminStage::Decision(DecisionResult::Refused(refusal))
+                | DirAdminStage::Outcome(OutcomeResult::Refused(refusal)) => {
+                    assert!((1..=20).contains(&refusal.code()));
+                    assert_eq!(AdminRefusal::from_code(refusal.code()), Some(refusal));
+                }
+                DirAdminStage::Decision(DecisionResult::Failed(failure))
+                | DirAdminStage::Outcome(OutcomeResult::Failed(failure)) => {
+                    assert!((1..=6).contains(&failure.code()));
+                    assert_eq!(AdminFailure::from_code(failure.code()), Some(failure));
+                }
+                DirAdminStage::Decision(DecisionResult::Proceed)
+                | DirAdminStage::Outcome(OutcomeResult::Committed { .. }) => {}
+            }
         }
         EventBody::Admind(admind) => {
             if let AdmindActivity::SetPassword { kvnos, .. } = &admind.activity {
@@ -77,6 +99,12 @@ fuzz_target!(|data: &[u8]| {
             assert!((1..=7).contains(&code));
             assert_eq!(KeydOutcome::from_code(code), Some(keyd.result));
         }
-        EventBody::WindowSummary(_) => {}
+        EventBody::WindowSummary(summary) => {
+            // Fixed width: format, shape, then the three counters in order.
+            assert_eq!(data.len(), 2 + 3 * 8);
+            assert_eq!(&data[2..10], &summary.suppressed_noise.to_be_bytes()[..]);
+            assert_eq!(&data[10..18], &summary.refused_gating.to_be_bytes()[..]);
+            assert_eq!(&data[18..26], &summary.unrecorded_outcomes.to_be_bytes()[..]);
+        }
     }
 });

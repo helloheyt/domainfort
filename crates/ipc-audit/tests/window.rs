@@ -89,9 +89,93 @@ fn window_recovers_and_reports() {
         EventBody::WindowSummary(WindowSummary {
             suppressed_noise: 0,
             refused_gating: 1,
+            unrecorded_outcomes: 0,
         })
     );
     assert_eq!(window.refused_gating(), 0);
+}
+
+/// Decision A-88 (docs/questions/Q-366 option (a), Q-395): the outcome
+/// record of a performed operation that could not be committed is counted
+/// apart from refused reservations — "done, record lost" is not "refused,
+/// not done" — takes no slot, and is reported in the next summary beside the
+/// other counts; the counters start again from 0 once the summary is queued.
+#[test]
+fn lost_outcomes_are_counted_into_the_next_summary() {
+    let config = WindowConfig::new(4, 1).unwrap();
+    let mut window = SendWindow::new(config);
+    // Two slots for one operation (as keyd-daemon's intent and outcome):
+    // the intent is committed, the outcome's slot is given back without its
+    // record — the record was lost.
+    let intent = window.reserve().unwrap();
+    let outcome = window.reserve().unwrap();
+    window.commit(intent, &kdc()).unwrap();
+    window.release(outcome);
+    window.count_unrecorded_outcome();
+    window.count_unrecorded_outcome();
+    assert_eq!(window.unrecorded_outcomes(), 2);
+    assert_eq!(window.refused_gating(), 0, "not a refusal");
+    assert_eq!(window.used(), 1, "the count takes no slot");
+    // A refusal and a counted noise event join the same summary.
+    for _ in 0..3 {
+        let slot = window.reserve().unwrap();
+        window.commit(slot, &kdc()).unwrap();
+    }
+    assert_eq!(window.reserve(), Err(WindowFull));
+    assert_eq!(window.offer_noise(&noise()), Ok(NoiseAdmission::Counted));
+
+    // The full window drains first (no slot for a summary yet) …
+    let full = window.next_batch().unwrap();
+    assert_eq!(full.events().len(), 4);
+    assert!(full
+        .events()
+        .iter()
+        .all(|e| !matches!(decode_event(e.as_bytes()), Ok(EventBody::WindowSummary(_)))));
+    window
+        .acknowledge(&Ack {
+            through_seq: full.last_seq(),
+            head_hash: [0; 32],
+        })
+        .unwrap();
+    // … then the summary carries the three counts, in its own slot.
+    let batch = window.next_batch().unwrap();
+    assert_eq!(batch.events().len(), 1);
+    assert_eq!(
+        decode_event(batch.events()[0].as_bytes()).unwrap(),
+        EventBody::WindowSummary(WindowSummary {
+            suppressed_noise: 1,
+            refused_gating: 1,
+            unrecorded_outcomes: 2,
+        })
+    );
+    assert_eq!(
+        (
+            window.suppressed_noise(),
+            window.refused_gating(),
+            window.unrecorded_outcomes()
+        ),
+        (0, 0, 0)
+    );
+    window
+        .acknowledge(&Ack {
+            through_seq: batch.last_seq(),
+            head_hash: [0; 32],
+        })
+        .unwrap();
+    // Nothing counted since: no further summary.
+    assert!(window.next_batch().is_none());
+
+    // A lost outcome alone is enough for a summary of its own.
+    window.count_unrecorded_outcome();
+    let batch = window.next_batch().unwrap();
+    assert_eq!(
+        decode_event(batch.events()[0].as_bytes()).unwrap(),
+        EventBody::WindowSummary(WindowSummary {
+            suppressed_noise: 0,
+            refused_gating: 0,
+            unrecorded_outcomes: 1,
+        })
+    );
 }
 
 /// Reservations count against the window before their events exist (the
@@ -150,6 +234,7 @@ fn noise_never_starves_gating() {
         EventBody::WindowSummary(WindowSummary {
             suppressed_noise: 99,
             refused_gating: 1,
+            unrecorded_outcomes: 0,
         })
     );
     // Noise slots were freed with the acknowledgement.

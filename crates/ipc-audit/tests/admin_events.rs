@@ -365,7 +365,8 @@ fn dir_admin_phase_and_result_tables() {
             codec(ipc::Error::UnknownCode)
         );
     }
-    // Decision ‖ Failed ‖ 12: no failure code 12 (the table has 4).
+    // Decision ‖ Failed ‖ 12: no failure code 12 (the table has 6 since task
+    // F4 appended two, A-91).
     assert_eq!(
         decode_event(&patched(at.result, 3)),
         codec(ipc::Error::UnknownCode)
@@ -397,13 +398,45 @@ fn dir_admin_phase_and_result_tables() {
     b[at.result] = 1;
     assert_eq!(decode_event(&b), codec(ipc::Error::InvalidBoolean));
     // Codes past the refusal table (19 entries since task A3 appended
-    // `SelfLockout`).
-    for code in [0u8, 20, 0xFF] {
+    // `SelfLockout`, 20 since task F4 appended `ObligationRefused`, A-91).
+    for code in [0u8, 21, 0xFF] {
         assert_eq!(
             decode_event(&patched(at.detail, code)),
             codec(ipc::Error::UnknownCode)
         );
     }
+    // The appended codes decode and re-encode canonically in place: refusal
+    // 20 after `Decision ‖ Refused`, failures 5 and 6 after `Decision ‖
+    // Failed` (Q-397).
+    match decode_event(&patched(at.detail, 20)).unwrap() {
+        EventBody::DirAdmin(e) => assert_eq!(
+            e.stage,
+            DirAdminStage::Decision(DecisionResult::Refused(AdminRefusal::ObligationRefused))
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        event_round_trip_is_canonical(&patched(at.detail, 20)),
+        Ok(true)
+    );
+    for (code, failure) in [
+        (5u8, AdminFailure::ViewUnavailable),
+        (6, AdminFailure::AuditUnacknowledged),
+    ] {
+        let mut b = patched(at.result, 3);
+        b[at.detail] = code;
+        match decode_event(&b).unwrap() {
+            EventBody::DirAdmin(e) => assert_eq!(
+                e.stage,
+                DirAdminStage::Decision(DecisionResult::Failed(failure))
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(event_round_trip_is_canonical(&b), Ok(true));
+    }
+    let mut b = patched(at.result, 3);
+    b[at.detail] = 7;
+    assert_eq!(decode_event(&b), codec(ipc::Error::UnknownCode));
 }
 
 /// docs/50 §3.3: unknown operation and name-kind codes are refused.
@@ -787,6 +820,7 @@ fn admind_noise_flood_never_blocks_gating() {
         EventBody::WindowSummary(WindowSummary {
             suppressed_noise: 999,
             refused_gating: 1,
+            unrecorded_outcomes: 0,
         })
     );
 }

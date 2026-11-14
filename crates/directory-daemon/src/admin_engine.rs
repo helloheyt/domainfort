@@ -26,14 +26,17 @@
 //! 5. **The decision event, acknowledged**: committed into its slot, and
 //!    the thread waits (bounded) until auditd acknowledged it — persisted it.
 //!    No acknowledgement in time ⇒ the transaction is aborted, the outcome
-//!    slot records the operation as not performed, and the answer is
+//!    slot records the operation as not performed
+//!    (`Outcome(Failed(AuditUnacknowledged))`), and the answer is
 //!    `Unavailable`.
 //! 6. **`apply`** inside the transaction (it re-verifies what could have
 //!    changed); a refusal ⇒ abort, its `Outcome` event.
 //! 7. **Commit.**
 //! 8. **The outcome event** (`Committed`), or `commit_failure_event` when
 //!    the commit failed — into the slot reserved in step 0, so it is never
-//!    refused for want of room.
+//!    refused for want of room. An outcome event that still cannot be
+//!    committed is counted into the window's next `WindowSummary`
+//!    (`unrecorded_outcomes`, A-88) and noted on stderr.
 //! 9. **Reply.**
 //!
 //! An operation that commits nothing (`Lookup`, `CompletePasswordSet`) has
@@ -43,9 +46,22 @@
 //! Every refusal sends its event (into the reserved slot) before the reply.
 //! AP-REQ octets are never logged; the thread logs fixed notes only.
 //!
+//! # The three events the PEP does not plan
+//!
+//! Each has its own code, appended to ipc-audit's closed tables by task F4
+//! (A-91; docs/questions/Q-388 item 1, Q-397); the event is one the PEP
+//! planned for the same request with only its stage replaced (the
+//! request-derived fields stay):
+//!
+//! | case | stage |
+//! |---|---|
+//! | the `WriteTxn` cannot begin, or the view cannot be taken, before `prepare` | `Decision(Failed(ViewUnavailable))` |
+//! | an obligation of the requester's Allow cannot be honoured | `Decision(Refused(ObligationRefused))` — the PDP reason stays `Allowed` |
+//! | auditd did not acknowledge the decision in time (not performed) | `Outcome(Failed(AuditUnacknowledged))`, the decision's number |
+//!
 //! Spec: docs/51 §5.7 (R51-12), §7.4, §7.5; A-26; A-56; A-73; A-85; A-89
 //! (docs/questions/Q-358 items 1, 7); docs/50 R50-7, §3.6; docs/questions/
-//! Q-388.
+//! Q-388; A-88 (Q-366, Q-395); A-91 (Q-397); docs/11 §2, §8.
 
 use crate::admin_service::{pep_operation, wire_reply, wire_status, TicketVerifier};
 use crate::clock::SharedClock;
@@ -155,10 +171,31 @@ struct Running {
     rate: ObligationLimiter,
 }
 
+/// The stage of a request whose `WriteTxn` could not begin, or whose view
+/// could not be taken, before `prepare`: no check ran, nothing was decided.
+/// Spec: docs/51 §7.4 steps 2-3; docs/questions/Q-358 item 1 (A-89),
+/// Q-388 item 1, Q-397 (A-91: its own code).
+const VIEW_UNAVAILABLE: DirAdminStage =
+    DirAdminStage::Decision(DecisionResult::Failed(AdminFailure::ViewUnavailable));
+
+/// The stage of a request the PDP allowed whose obligations dird cannot
+/// honour (the PDP reason stays `Allowed`).
+/// Spec: docs/11 §2 ("the PEP must honour obligations"), §8;
+/// docs/questions/Q-358 item 7, Q-388 item 2, Q-397 (A-91: its own code).
+const OBLIGATION_REFUSED: DirAdminStage =
+    DirAdminStage::Decision(DecisionResult::Refused(AdminRefusal::ObligationRefused));
+
+/// The outcome stage of a write whose decision event auditd did not
+/// acknowledge in time: not performed (the transaction was aborted).
+/// Spec: docs/51 §5.7 item 2 ("decision acknowledged ⇒ commit"); A-85;
+/// docs/questions/Q-388 items 1, 3, Q-397 (A-91: its own code).
+const NOT_PERFORMED: DirAdminStage =
+    DirAdminStage::Outcome(OutcomeResult::Failed(AdminFailure::AuditUnacknowledged));
+
 /// An event with another stage (the request-derived fields kept): used for
-/// the three cases the PEP has no planner for — a store failure before
-/// `prepare`, an obligation that refuses, a decision auditd did not
-/// acknowledge (docs/questions/Q-388 items 1-2).
+/// the three cases the PEP has no planner for — [`VIEW_UNAVAILABLE`],
+/// [`OBLIGATION_REFUSED`], [`NOT_PERFORMED`] (module documentation;
+/// docs/questions/Q-388 items 1-2, Q-397).
 fn restage(event: &DirAdminEvent, stage: DirAdminStage) -> DirAdminEvent {
     let mut event = event.clone();
     event.stage = stage;
@@ -181,6 +218,19 @@ impl Running {
     fn release(&self, slot: Option<Reservation>) {
         if let Some(slot) = slot {
             self.worker.gate.release(slot);
+        }
+    }
+
+    /// Commit the outcome event of a write whose decision event is already
+    /// in the window; if it cannot be committed (cannot happen for an event
+    /// built from ipc-audit's types into its reserved slot), the gap is
+    /// counted into the next `WindowSummary` and noted on stderr.
+    /// Spec: docs/51 §5.7 item 2; docs/questions/Q-388 item 6; A-88
+    /// (Q-366 option (a), Q-395).
+    fn commit_outcome(&self, slot: Option<Reservation>, event: &DirAdminEvent) {
+        if self.commit(slot, event).is_none() {
+            self.worker.gate.count_unrecorded_outcome();
+            OUTCOME_UNRECORDED.hit(None);
         }
     }
 
@@ -262,13 +312,14 @@ impl Running {
         true
     }
 
-    /// The decision event of a failure before `prepare` (no planner in the
-    /// PEP for it): the request's fields, stage `Decision(Failed(failure))`.
-    fn failed_decision(
+    /// The decision event of a request whose `WriteTxn` could not begin or
+    /// whose view could not be taken (no planner in the PEP for it): the
+    /// request's fields, stage [`VIEW_UNAVAILABLE`].
+    /// Spec: docs/51 §7.4 steps 2-3; docs/questions/Q-388 item 1, Q-397.
+    fn view_unavailable_decision(
         &self,
         operation_id: u64,
         operation: &PepOperation,
-        failure: AdminFailure,
         now: &KerberosTime,
     ) -> DirAdminEvent {
         let base = self.worker.admin.refuse_unverified(
@@ -277,10 +328,7 @@ impl Running {
             VerificationFailure::KeydUnavailable,
             now,
         );
-        restage(
-            base.event(),
-            DirAdminStage::Decision(DecisionResult::Failed(failure)),
-        )
+        restage(base.event(), VIEW_UNAVAILABLE)
     }
 
     /// One request (module documentation).
@@ -331,12 +379,8 @@ impl Running {
             match store.begin_write() {
                 Ok(begun) => txn = Some(begun),
                 Err(_) => {
-                    let event = self.failed_decision(
-                        operation_id,
-                        &request.operation,
-                        AdminFailure::StoreFailure,
-                        &now,
-                    );
+                    let event =
+                        self.view_unavailable_decision(operation_id, &request.operation, &now);
                     return self.refuse(first, second, &event, RefusalStatus::Unavailable);
                 }
             }
@@ -349,12 +393,7 @@ impl Running {
                 .prepare(&request, &view, &self.worker.policy, &now),
             Err(_) => {
                 abort(txn);
-                let event = self.failed_decision(
-                    operation_id,
-                    &request.operation,
-                    AdminFailure::StoreFailure,
-                    &now,
-                );
+                let event = self.view_unavailable_decision(operation_id, &request.operation, &now);
                 return self.refuse(first, second, &event, RefusalStatus::Unavailable);
             }
         };
@@ -372,10 +411,7 @@ impl Running {
         };
         if !self.honour(&prepared, &request.operation, &now) {
             abort(txn);
-            let event = restage(
-                prepared.decision_event(),
-                DirAdminStage::Decision(DecisionResult::Refused(AdminRefusal::PolicyDenied)),
-            );
+            let event = restage(prepared.decision_event(), OBLIGATION_REFUSED);
             return self.refuse(first, second, &event, RefusalStatus::Denied);
         }
 
@@ -411,13 +447,7 @@ impl Running {
         let deadline = Instant::now() + self.worker.ack_deadline;
         if !self.worker.gate.wait_acknowledged(seq, deadline) {
             abort(Some(txn));
-            let not_performed = restage(
-                &decision,
-                DirAdminStage::Outcome(OutcomeResult::Failed(AdminFailure::InternalFailure)),
-            );
-            if self.commit(second, &not_performed).is_none() {
-                OUTCOME_UNRECORDED.hit(None);
-            }
+            self.commit_outcome(second, &restage(&decision, NOT_PERFORMED));
             return Reply::Refused(RefusalStatus::Unavailable);
         }
 
@@ -425,26 +455,17 @@ impl Running {
         match self.worker.admin.apply(prepared, &mut txn, &now) {
             Err(refusal) => {
                 abort(Some(txn));
-                if self.commit(second, refusal.event()).is_none() {
-                    OUTCOME_UNRECORDED.hit(None);
-                }
+                self.commit_outcome(second, refusal.event());
                 Reply::Refused(wire_status(refusal.status()))
             }
             // Steps 7-9: commit, the outcome event, the reply.
             Ok(applied) => match txn.commit() {
                 Ok(()) => {
-                    if self.commit(second, applied.outcome_event()).is_none() {
-                        OUTCOME_UNRECORDED.hit(None);
-                    }
+                    self.commit_outcome(second, applied.outcome_event());
                     wire_reply(applied.reply())
                 }
                 Err(_) => {
-                    if self
-                        .commit(second, applied.commit_failure_event())
-                        .is_none()
-                    {
-                        OUTCOME_UNRECORDED.hit(None);
-                    }
+                    self.commit_outcome(second, applied.commit_failure_event());
                     Reply::Refused(RefusalStatus::Unavailable)
                 }
             },

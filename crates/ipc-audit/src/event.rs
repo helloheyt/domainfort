@@ -693,31 +693,59 @@ impl LdapEvent {
 // ---- the window summary ------------------------------------------------------
 
 /// What a sender's window could not record one by one since its last
-/// summary: unauthenticated noise counted instead of queued, and
-/// issuance-gating operations refused because the window was full.
+/// summary: unauthenticated noise counted instead of queued,
+/// issuance-gating operations refused because the window was full, and
+/// outcome records that could not be put into the window although their
+/// operation's intent or decision was already recorded (keyd-daemon's
+/// key-state changes, A-86; dird's admin writes, A-85) — the log then holds
+/// that intent or decision without the outcome that should follow it.
+///
+/// ```text
+/// WindowSummary := suppressed_noise:u64 ‖ refused_gating:u64
+///                  ‖ unrecorded_outcomes:u64
+/// ```
+///
+/// Three fixed-width counters, every value valid, so each summary has
+/// exactly one encoding (24 octets after the format and shape octets) and
+/// any other length is refused (docs/50 §3.3). The third counter was
+/// appended by task F4 (decision A-88; docs/questions/Q-366 option (a),
+/// Q-395): before it, a lost outcome could only be noted on stderr, and
+/// counting it as `refused_gating` would have told a reader the operation
+/// was refused — not done — when it may well have been done. A sender with
+/// no two-record operations (kdc-daemon; dird's LDAP events) leaves it 0.
 ///
 /// Spec: docs/questions/Q-218 option (a), decided A-57 ("unauthenticated
 /// noise events … are summarised in counters and rate-limited"; "no
 /// unaudited issuance"); docs/37 §5 (the visibility gap is itself a
-/// signal).
+/// signal); docs/questions/Q-366 (A-88), Q-395.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WindowSummary {
     /// Noise events counted, not queued.
     pub suppressed_noise: u64,
     /// Gating reservations refused (window full).
     pub refused_gating: u64,
+    /// Outcome records that could not be committed after their intent or
+    /// decision was recorded: each is an intent (keyd-daemon, A-86) or a
+    /// decision (dird, A-85) in the log with no outcome after it. Not a
+    /// refusal (A-88).
+    pub unrecorded_outcomes: u64,
 }
 
 impl WindowSummary {
+    /// Spec: this type's layout; docs/50 §3.3 (fixed width, big-endian).
     fn write(&self, writer: &mut Writer) -> Result<(), EventError> {
         writer.write_u64(self.suppressed_noise)?;
-        Ok(writer.write_u64(self.refused_gating)?)
+        writer.write_u64(self.refused_gating)?;
+        Ok(writer.write_u64(self.unrecorded_outcomes)?)
     }
 
+    /// Spec: this type's layout; docs/50 §3.3 (strict; the caller refuses
+    /// trailing octets).
     fn read(reader: &mut Reader<'_>) -> Result<WindowSummary, EventError> {
         Ok(WindowSummary {
             suppressed_noise: reader.read_u64()?,
             refused_gating: reader.read_u64()?,
+            unrecorded_outcomes: reader.read_u64()?,
         })
     }
 }

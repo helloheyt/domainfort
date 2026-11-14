@@ -38,11 +38,14 @@
 //! daemon-sandbox; and the docs.rs API pages of tokio 1.54.1 (P-2; never its
 //! source). The source binding and the `EventsMisbound` record (task A7)
 //! were written only from docs/51 §5.7 (A-72), docs/50 §3.2 / §8.1 and
-//! PENDING-OWNER (A-57, A-64, A-66). No existing log daemon, journal or
-//! audit implementation was consulted or recalled (AGENTS.md §1-3).
+//! PENDING-OWNER (A-57, A-64, A-66). The last summary of a clean stop (task
+//! F4) was written only from PENDING-OWNER (A-85, A-88), docs/questions
+//! Q-341, Q-366, Q-265, docs/50 §3.2 / §8 and docs/37. No existing log
+//! daemon, journal or audit implementation was consulted or recalled
+//! (AGENTS.md §1-3).
 //!
 //! Spec: docs/50 R50-17, §8, §10 (P6b); docs/37 §2; Q-218 (A-57);
-//! Q-250 / Q-252 (A-64); Q-251 (P-20); Q-265; docs/51 §5.7; Q-341.
+//! Q-250 / Q-252 (A-64); Q-251 (P-20); Q-265; docs/51 §5.7; Q-341; Q-396.
 
 pub mod binding;
 pub mod listener;

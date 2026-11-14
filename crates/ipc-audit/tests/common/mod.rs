@@ -268,6 +268,7 @@ pub fn summary() -> WindowSummary {
     WindowSummary {
         suppressed_noise: 12,
         refused_gating: 3,
+        unrecorded_outcomes: 2,
     }
 }
 

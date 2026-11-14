@@ -39,9 +39,16 @@
 //!   A-57: noise "summarised in counters"). Batches refused by the source
 //!   binding of the event shapes (crate::binding) are counted and
 //!   summarised the same way, in their own `EventsMisbound` record.
+//! * **A last summary at a clean stop.** When every [`Submitter`] is gone
+//!   (the listener ended: no connection is left to count anything more),
+//!   the counts still pending — refused within the last
+//!   [`SUMMARY_INTERVAL`] — are written at once as the same records, before
+//!   [`run`] returns and the log is closed; so a stop drops no refusal
+//!   (decisions A-85, A-88; docs/questions/Q-341 residual, Q-396). A stop on
+//!   a [`WriterFailure`] writes nothing more (the segment's tail is unknown).
 //!
-//! Spec: docs/50 R50-7, R50-17, §3.6, §8.1; docs/37 §2; docs/07 §8;
-//! docs/questions/Q-218 (A-57), Q-250 (A-64), Q-265.
+//! Spec: docs/50 R50-7, R50-17, §3.6, §8.1; docs/37 §2, §5; docs/07 §8;
+//! docs/questions/Q-218 (A-57), Q-250 (A-64), Q-265, Q-341 (A-85), Q-396.
 
 use crate::own_event::{AuditdEvent, EventsMisbound, PeersRefused};
 use crate::segments::SegmentFactory;
@@ -489,13 +496,19 @@ impl<F: SegmentFactory> LogSink<F> {
 /// Run the writer until every [`Submitter`] is gone (`Ok`) or the log fails
 /// ([`WriterFailure`]). Blocks the calling thread.
 ///
+/// When every [`Submitter`] is gone — a clean stop — the refusal counts not
+/// yet written are written first, whatever the summary interval (module
+/// documentation; `record_last_refusals`); only then does `run` return and
+/// the sink (the log) close.
+///
 /// # Errors
 /// [`WriterFailure`]: the job in hand is answered `Unavailable`, the queue
 /// is dropped (its jobs' connections answer `Unavailable`), and `Ping` is
-/// refused from then on.
+/// refused from then on. Also when the last summary of a clean stop hits a
+/// write, flush or sync failure.
 ///
 /// Spec: this module's design; docs/50 §3.6, §8.1; docs/questions/Q-218
-/// (A-57); docs/questions/Q-265 items 5, 7, 8.
+/// (A-57); docs/questions/Q-265 items 5, 7, 8; Q-341 (A-85), Q-396.
 pub fn run<F: SegmentFactory>(mut sink: LogSink<F>, inbox: Inbox) -> Result<(), WriterFailure> {
     let mut last_summary: Option<Instant> = None;
     let result = loop {
@@ -525,7 +538,13 @@ pub fn run<F: SegmentFactory>(mut sink: LogSink<F>, inbox: Inbox) -> Result<(), 
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break Ok(()),
+            // A clean stop: every connection and the listener are gone, so
+            // nothing more can be counted (and the queue is empty — a
+            // disconnected receiver still hands out what was queued first).
+            // What is pending is written now, before the log closes.
+            Err(RecvTimeoutError::Disconnected) => {
+                break record_last_refusals(&mut sink, &inbox.shared.refusals);
+            }
         }
         if let Err(failure) = record_refusals(&mut sink, &inbox.shared.refusals, &mut last_summary)
         {
@@ -552,6 +571,48 @@ fn record_refusals<F: SegmentFactory>(
     if last_summary.is_some_and(|at| at.elapsed() < SUMMARY_INTERVAL) {
         return Ok(());
     }
+    if write_refusal_summaries(sink, refusals)? {
+        *last_summary = Some(Instant::now());
+    }
+    Ok(())
+}
+
+/// The last summary of a clean stop: write every non-zero pending count —
+/// refused connections (`PeersRefused`) and misbound batches
+/// (`EventsMisbound`) — now, regardless of [`SUMMARY_INTERVAL`] (the
+/// interval bounds how often a flood is written while auditd serves; after
+/// the stop there is no flood left to bound). Nothing pending ⇒ nothing is
+/// written, so a stop adds no record of its own.
+///
+/// A count whose record cannot be appended on a transient refusal
+/// ([`PersistError::Unavailable`]: auditd's clock unreadable, or the next
+/// segment file not creatable) is lost with the process — the one residual
+/// (docs/questions/Q-396 item 4); a write, flush or sync failure is a
+/// [`WriterFailure`] as anywhere else.
+///
+/// Spec: docs/50 §3.2 ("closed + an audit record"); docs/questions/Q-218
+/// (A-57: "summarised in counters"); Q-341 residual (A-85: "pending refusal
+/// counts are dropped when the writer stops — follow-up: write a last
+/// summary on stop"), Q-366 (A-88), Q-396; docs/37 §5 (the visibility gap
+/// is itself a signal).
+fn record_last_refusals<F: SegmentFactory>(
+    sink: &mut LogSink<F>,
+    refusals: &PeerRefusals,
+) -> Result<(), WriterFailure> {
+    write_refusal_summaries(sink, refusals).map(|_| ())
+}
+
+/// Append a `PeersRefused` record if any connection was refused and an
+/// `EventsMisbound` record if any batch was refused, taking (resetting) the
+/// counts; a count whose record is refused transiently is put back. `true`
+/// if anything was recorded.
+///
+/// Spec: docs/50 §3.2; docs/questions/Q-218 (A-57); docs/questions/Q-265
+/// item 8; docs/51 §5.7; docs/questions/Q-341.
+fn write_refusal_summaries<F: SegmentFactory>(
+    sink: &mut LogSink<F>,
+    refusals: &PeerRefusals,
+) -> Result<bool, WriterFailure> {
     let mut recorded = false;
     if let Some(summary) = refusals.take() {
         match sink.append_own(&AuditdEvent::PeersRefused(summary)) {
@@ -567,8 +628,5 @@ fn record_refusals<F: SegmentFactory>(
             Err(PersistError::Fatal(failure)) => return Err(failure),
         }
     }
-    if recorded {
-        *last_summary = Some(Instant::now());
-    }
-    Ok(())
+    Ok(recorded)
 }

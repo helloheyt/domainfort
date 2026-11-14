@@ -1,6 +1,8 @@
 //! Tier 2 (docs/50 §9) for decision A-86 (docs/questions/Q-346, Q-365):
 //! a key-state change has the record of its intent **acknowledged by auditd
-//! before keyd runs it**, so "unavailable" always means "not done".
+//! before keyd runs it**, so "unavailable" always means "not done" — and,
+//! for decision A-88 (docs/questions/Q-366, Q-395), an outcome record that
+//! could not be committed is counted into a window summary in the log.
 //!
 //! The real daemon (`keyd_daemon::serve`) on a real Unix socket, the real
 //! auditd listener and writer (crates/audit-daemon tests/common, reused by
@@ -23,13 +25,15 @@ use audit_log::{verify_log, Anchor, Record, SegmentLimit, SegmentReader, Source}
 use ipc::{Direction, FrameReader, Refused, Reply};
 use ipc_audit::{
     decode_event, decode_request, encode_reply, Ack, AuditReply, AuditRequest, EventBody,
-    KeyPurposeCode, KeydOperation, KeydOutcome, KeydReason, KeydRecord, AUDIT_CHANNEL,
+    KeyPurposeCode, KeydOperation, KeydOutcome, KeydReason, KeydRecord, WindowSummary,
+    AUDIT_CHANNEL,
 };
 use ipc_keyd::{Answer, Call, Password};
-use keyd::{Error, KeyHandle, KeyPurpose, Kvno, PrincipalBinding, PrincipalId, Role};
+use keyd::{CallerId, Error, KeyHandle, KeyPurpose, Kvno, PrincipalBinding, PrincipalId, Role};
+use keyd_daemon::audit::MAX_RECORDS_PER_OPERATION;
 use keyd_daemon::startup::development_keyd;
 use keyd_daemon::{CallerMap, SystemClock, INTENT_ACK_BUDGET};
-use krb_proto::{KerberosString, PrincipalName, Realm};
+use krb_proto::{KerberosString, KerberosTime, PrincipalName, Realm};
 use std::fs::File;
 use std::io::{BufReader, ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -536,4 +540,99 @@ fn auditd_gone_between_intent_and_outcome_keeps_the_true_result() {
     assert!(matches!(auditd.stop(), Some(Ok(()))));
     let records = keyd_records(&verified_log(&base), uid);
     assert_eq!(phases(&records), [(Op::CreateKey, Out::Success, Some(1))]);
+}
+
+// ---- a lost outcome, counted in the log (decision A-88) ----------------------
+
+/// The window summaries among the sender records of `records`, each with its
+/// position in the log (docs/50 §3.2: every one from the one peer uid).
+fn window_summaries(records: &[Record], uid: u32) -> Vec<(usize, WindowSummary)> {
+    records
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| record.source != Source::Auditd)
+        .filter_map(|(at, record)| {
+            assert_eq!(record.source_uid, uid, "the sender's peer uid");
+            match decode_event(&record.payload).unwrap() {
+                EventBody::WindowSummary(summary) => Some((at, summary)),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Decision A-88 (docs/questions/Q-366 option (a), Q-395): the outcome
+/// record of a key-state change keyd **performed** but whose record could not
+/// be committed is counted into keyd's next `WindowSummary`, and that summary
+/// reaches auditd's verified log. The lost outcome is forced as tier 1 does
+/// (`an_unrecorded_outcome_answers_the_true_result_and_is_counted`): keyd's
+/// sink already holds the most records it keeps when the change runs (four
+/// `ping` records left by the builder — injected, no seam in the daemon), so
+/// the change's own record overflows. The reply is the true result (kvno 1);
+/// the verified log holds the acknowledged intent, the four left-over
+/// records, no `CreateKey` outcome, and — after the intent — one window
+/// summary counting exactly one unrecorded outcome, with nothing refused or
+/// suppressed (a lost outcome is not a refusal).
+#[test]
+fn a_lost_outcome_is_counted_in_a_window_summary_of_the_verified_log() {
+    let dir = TempDir::new();
+    let uid = my_uid(&dir);
+    if skip_as_root(uid) {
+        return;
+    }
+    let auditd = start_auditd(&dir, uid, "audit.log", true);
+    let caller = CallerId {
+        uid,
+        role: Role::Admin,
+    };
+    let params = params(&dir, CallerMap::new(&[(uid, Role::Admin)]).unwrap(), uid);
+    let keyd = Daemon::start(params, SystemClock, move |started: &KerberosTime| {
+        let mut keyd = development_keyd(realm())(started)?;
+        for _ in 0..MAX_RECORDS_PER_OPERATION {
+            let _ = keyd.ping(&caller, started);
+        }
+        Ok(keyd)
+    })
+    .unwrap();
+    assert!(matches!(
+        RawClient::connect(&keyd.socket).call(&create_key(0xA1)),
+        Some(Ok(Answer::CreateKey(Ok(kvno)))) if kvno == Kvno::INITIAL
+    ));
+    // keyd waits (bounded) for auditd to acknowledge its window at stop.
+    keyd.stop().unwrap();
+    assert!(matches!(auditd.stop(), Some(Ok(()))));
+
+    let log = verified_log(&dir.join("audit.log"));
+    let records = keyd_records(&log, uid);
+    assert_eq!(records.len(), 1 + MAX_RECORDS_PER_OPERATION);
+    assert_eq!(phases(&records)[0], (Op::CreateKey, Out::Intent, None));
+    assert!(records[1..].iter().all(|r| r.op == Op::Ping));
+    assert!(
+        !records
+            .iter()
+            .any(|r| r.op == Op::CreateKey && r.result != Out::Intent),
+        "the change's own outcome is lost"
+    );
+    let intent_at = log
+        .iter()
+        .position(|record| {
+            record.source != Source::Auditd
+                && matches!(
+                    decode_event(&record.payload),
+                    Ok(EventBody::Keyd(r)) if r.result == Out::Intent
+                )
+        })
+        .unwrap();
+    let summaries = window_summaries(&log, uid);
+    assert_eq!(summaries.len(), 1, "{summaries:?}");
+    let (at, summary) = summaries[0];
+    assert!(at > intent_at, "the summary follows the intent");
+    assert_eq!(
+        summary,
+        WindowSummary {
+            suppressed_noise: 0,
+            refused_gating: 0,
+            unrecorded_outcomes: 1,
+        }
+    );
 }

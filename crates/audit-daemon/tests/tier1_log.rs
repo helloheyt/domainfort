@@ -390,6 +390,148 @@ fn failed_sync_answers_unavailable_and_stops_the_writer() {
     assert_eq!(submitter.submit(job), Err(SubmitError::Unavailable));
 }
 
+// ---- the last summary of a clean stop (A-85 residual, A-88; Q-396) ---------
+
+/// Source: docs/questions/Q-341 residual (A-85: "pending refusal counts are
+/// dropped when the writer stops — follow-up: write a last summary on
+/// stop"), decision A-88, Q-396; docs/50 §3.2 ("closed + an audit record");
+/// the record layouts of `audit_daemon::own_event`. Counts that never had a
+/// periodic summary — refused connections (unmapped and over quota) and a
+/// misbound batch, counted before the writer ever ran — are written when
+/// the writer stops cleanly (every submitter gone): a `PeersRefused` and an
+/// `EventsMisbound` record, auditd's own (source `Auditd`, its uid, its own
+/// numbering), before the log closes. The next start verifies the whole log
+/// and resumes after them.
+#[test]
+fn pending_refusals_are_written_at_a_clean_stop() {
+    let dir = TempDir::new();
+    let sink = open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID)
+        .expect("created")
+        .sink;
+    let (submitter, inbox) = writer::queue(4);
+    submitter.refusals().count_unmapped(501);
+    submitter.refusals().count_over_quota(502);
+    submitter.refusals().count_unmapped(503);
+    submitter.refusals().count_misbound(803);
+    drop(submitter);
+    // No submitter is left: the writer stops at once — a clean stop.
+    assert_eq!(writer::run(sink, inbox), Ok(()));
+
+    let reopened = open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID).expect("verifies");
+    assert_eq!(reopened.start, StartKind::Resumed);
+    let resumed_head = reopened.sink.head();
+    drop(reopened);
+    let (records, head) = read_segment(&dir.base(), 1, Anchor::Genesis);
+    assert_eq!(head, resumed_head);
+    assert_eq!(records.len(), 2);
+    for (i, record) in records.iter().enumerate() {
+        assert_eq!(record.source, Source::Auditd);
+        assert_eq!(record.source_uid, OWN_UID);
+        assert_eq!(record.source_seq, i as u64 + 1);
+    }
+    assert_eq!(records[0].payload, expected_refused(2, 1, 503));
+    assert_eq!(records[1].payload, expected_misbound(1, 803));
+}
+
+/// Source: as above, and docs/questions/Q-265 item 8 (at most one summary
+/// per interval while auditd serves). A refusal counted right after a
+/// periodic summary was written waits for the next interval; the stop comes
+/// first, and the count is written as a last summary instead of being
+/// dropped — after the events persisted before it. (Should the machine stall
+/// for a whole interval, the periodic path writes the same record; the log
+/// is the same either way.) A stop with nothing pending adds no record.
+#[test]
+fn a_refusal_inside_the_summary_interval_is_written_at_the_stop() {
+    let dir = TempDir::new();
+    let sink = open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID)
+        .expect("created")
+        .sink;
+    let (submitter, inbox) = writer::queue(4);
+
+    // A refusal, then a batch, both before the writer runs: its first round
+    // persists the batch, then writes the summary of the refusal (the first
+    // summary is due at once).
+    submitter.refusals().count_unmapped(601);
+    let (job, outcome) = make_job(1, events(1, 16, 1));
+    submitter.submit(job).expect("queued");
+    let thread = std::thread::spawn(move || writer::run(sink, inbox));
+    assert!(matches!(
+        outcome.blocking_recv(),
+        Ok(JobOutcome::Persisted(_))
+    ));
+    // A second batch: answered only after the writer finished the round of
+    // the first one (its summary included); the next summary is now not due
+    // for an interval.
+    let (job, outcome) = make_job(2, events(1, 16, 2));
+    submitter.submit(job).expect("queued");
+    assert!(matches!(
+        outcome.blocking_recv(),
+        Ok(JobOutcome::Persisted(_))
+    ));
+    // Refused inside the interval, then the stop.
+    submitter.refusals().count_unmapped(602);
+    drop(submitter);
+    assert_eq!(thread.join().unwrap(), Ok(()));
+
+    let reopened = open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID).expect("verifies");
+    assert_eq!(reopened.start, StartKind::Resumed);
+    drop(reopened);
+    let (records, _) = read_segment(&dir.base(), 1, Anchor::Genesis);
+    let shape: Vec<(Source, Vec<u8>)> = records
+        .iter()
+        .map(|r| (r.source, r.payload.clone()))
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            (Source::Kdc, events(1, 16, 1)[0].as_bytes().to_vec()),
+            (Source::Auditd, expected_refused(1, 0, 601)),
+            (Source::Kdc, events(1, 16, 2)[0].as_bytes().to_vec()),
+            (Source::Auditd, expected_refused(1, 0, 602)),
+        ]
+    );
+
+    // A clean stop with nothing pending writes nothing.
+    let sink = open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID)
+        .expect("verifies")
+        .sink;
+    let before = sink.head();
+    let (submitter, inbox) = writer::queue(4);
+    drop(submitter);
+    assert_eq!(writer::run(sink, inbox), Ok(()));
+    let reopened = open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID).expect("verifies");
+    assert_eq!(reopened.sink.head(), before);
+}
+
+/// Source: docs/questions/Q-250 item 7, Q-265 item 7 (a poisoned writer's
+/// segment tail is unknown: nothing more is written), Q-396 item 3. A stop
+/// on a [`WriterFailure`] is not a clean stop: the refusal pending when the
+/// sync failed gets no last summary — no write follows the failed sync.
+#[test]
+fn a_failed_writer_writes_no_last_summary() {
+    let storage = GateStorage::new();
+    let log = LogWriter::create(storage.clone(), SegmentLimit::DEFAULT).expect("header");
+    let sink = LogSink::new(log, 1, GateFactory, OWN_UID);
+    let (submitter, inbox) = writer::queue(4);
+    submitter.refusals().count_unmapped(701);
+    storage.set(|s| {
+        s.ops.clear();
+        s.fail_sync = true;
+    });
+    // Queued before the writer runs, so its first round takes the batch.
+    let (job, outcome) = make_job(1, events(1, 16, 3));
+    submitter.submit(job).expect("queued");
+    let thread = std::thread::spawn(move || writer::run(sink, inbox));
+    assert_eq!(outcome.blocking_recv(), Ok(JobOutcome::Unavailable));
+    drop(submitter);
+    assert_eq!(thread.join().unwrap(), Err(WriterFailure::Poisoned));
+    assert_eq!(
+        storage.ops(),
+        ["write", "flush"],
+        "nothing after the failure"
+    );
+}
+
 /// Source: docs/07 §8 ("the log does not bring the service down when it
 /// fills"); docs/questions/Q-250 item 6 (rotate to a new segment anchored
 /// at the current head; one chain across files); A-57.
