@@ -1008,10 +1008,28 @@ impl AsReqSpec {
         }
     }
 
+    /// The request of [`AsReqSpec::alice`] for another client `cname` of
+    /// `realm` (RFC 4120 §5.4.1: cname and realm name the client; the
+    /// sname stays this realm's TGS, 7.3).
+    pub fn for_client(realm: Realm, cname: PrincipalName) -> Self {
+        AsReqSpec {
+            cname: Some(cname),
+            sname: Some(name(KRB_NT_SRV_INST, &["krbtgt", realm.as_str()])),
+            realm,
+            ..AsReqSpec::alice()
+        }
+    }
+
     /// The same request with a PA-ENC-TIMESTAMP made with `key` at `now`
     /// (the unarmored path).
-    pub fn with_timestamp(mut self, key: &ProtocolKey) -> Self {
-        self.padata = Some(vec![pa_enc_timestamp(key, now())]);
+    pub fn with_timestamp(self, key: &ProtocolKey) -> Self {
+        self.with_timestamp_at(key, now())
+    }
+
+    /// The same request with a PA-ENC-TIMESTAMP made with `key` at `ts`
+    /// (the unarmored path; RFC 4120 5.2.7.2: the client's current time).
+    pub fn with_timestamp_at(mut self, key: &ProtocolKey, ts: KerberosTime) -> Self {
+        self.padata = Some(vec![pa_enc_timestamp(key, ts)]);
         self
     }
 
@@ -1441,9 +1459,15 @@ pub fn open_fast_error(reply: KdcReply, armor_key: &ProtocolKey) -> FastError {
 /// A TGS-REQ under construction. `body()` is the INNER req-body; `outer` —
 /// default: the inner body — the outer one, which the authenticator checksum
 /// covers (A-17, docs/questions/Q-124 item 1). Armored by default (implicit
-/// armor, RFC 6113 5.4.2): the subkey is then mandatory.
+/// armor, RFC 6113 5.4.2): the subkey is then mandatory. `crealm` / `cname`
+/// name the client in the PA-TGS-REQ authenticator — "the same as those
+/// described for the ticket" (RFC 4120 5.5.1) — alice by default
+/// ([`TgsReqSpec::service`]); [`TgsReqSpec::for_client_of`] takes them from
+/// the TGT the request is made with.
 #[derive(Clone)]
 pub struct TgsReqSpec {
+    pub crealm: Realm,
+    pub cname: PrincipalName,
     pub sname: Option<PrincipalName>,
     pub realm: Realm,
     pub options: KdcOptions,
@@ -1464,9 +1488,12 @@ pub struct TgsReqSpec {
 }
 
 impl TgsReqSpec {
-    /// A service ticket for host/files.example.org until 17:00.
+    /// A service ticket for host/files.example.org until 17:00, asked by
+    /// alice.
     pub fn service() -> Self {
         TgsReqSpec {
+            crealm: realm(),
+            cname: alice_name(),
             sname: Some(service_name()),
             realm: realm(),
             options: KdcOptions::empty(),
@@ -1485,6 +1512,17 @@ impl TgsReqSpec {
             fast_options: FastOptions::empty(),
             outer: None,
         }
+    }
+
+    /// The same request made by the client of `tgt`: the authenticator's
+    /// crealm and cname are the TGT's (RFC 4120 5.5.1; 3.3.1: the TGS-REQ
+    /// carries the TGT and an authenticator of its client), and the request
+    /// is for a service of that client's realm.
+    pub fn for_client_of(mut self, tgt: &Tgt) -> Self {
+        self.crealm = tgt.rep.0.crealm.clone();
+        self.cname = tgt.rep.0.cname.clone();
+        self.realm = tgt.rep.0.crealm.clone();
+        self
     }
 
     pub fn body(&self) -> KdcReqBody {
@@ -1571,14 +1609,15 @@ impl TgsReqSpec {
     }
 }
 
-/// The PA-TGS-REQ authenticator (RFC 4120 5.5.1): checksum over the
-/// KDC-REQ-BODY octets keyed with the session key (usage 6), the whole
-/// authenticator encrypted with the session key (usage 7).
+/// The PA-TGS-REQ authenticator (RFC 4120 5.5.1): the client named by the
+/// spec's `crealm` / `cname`, checksum over the KDC-REQ-BODY octets keyed
+/// with the session key (usage 6), the whole authenticator encrypted with
+/// the session key (usage 7).
 pub fn authenticator(session: &ProtocolKey, spec: &TgsReqSpec, body: &[u8]) -> EncryptedData {
     let cksumtype = session.enc_type().checksum_type();
     let a = Authenticator {
-        crealm: realm(),
-        cname: alice_name(),
+        crealm: spec.crealm.clone(),
+        cname: spec.cname.clone(),
         cksum: Some(Checksum {
             cksumtype: cksumtype.number(),
             checksum: krb_crypto::get_mic(session, cksumtype, usage(6), body).unwrap(),
@@ -1620,6 +1659,67 @@ pub fn open_tgs_rep(bytes: &[u8], tgt: &Tgt, spec: &TgsReqSpec) -> (TgsRep, EncT
     assert_eq!(part.0.nonce, spec.nonce);
     check_finished(&response, &armor_key, &rep.0);
     (rep, part)
+}
+
+// ---------------------------------------------------------------------------
+// The client/server exchange (RFC 4120 §3.2, §5.5.1).
+// ---------------------------------------------------------------------------
+
+/// A service ticket the client holds after a TGS exchange: the Ticket, its
+/// session key from the opened enc-part (RFC 4120 §3.3.4 / 5.4.2: the key
+/// field of EncTGSRepPart) and the client it was issued to (the reply's
+/// crealm / cname, 5.4.2).
+pub struct ServiceTicket {
+    pub ticket: Ticket,
+    pub session: ProtocolKey,
+    pub crealm: Realm,
+    pub cname: PrincipalName,
+    pub authtime: KerberosTime,
+}
+
+/// The service ticket of an opened TGS-REP (see [`open_tgs_rep`]).
+pub fn service_ticket(rep: &TgsRep, part: &EncTgsRepPart) -> ServiceTicket {
+    ServiceTicket {
+        ticket: rep.0.ticket.clone(),
+        session: key_from(&part.0.key),
+        crealm: rep.0.crealm.clone(),
+        cname: rep.0.cname.clone(),
+        authtime: part.0.authtime,
+    }
+}
+
+impl ServiceTicket {
+    /// A KRB_AP_REQ for the service, made at `ctime` / `cusec` (RFC 4120
+    /// §3.2.2: "a new Authenticator from the system time and its name"; each
+    /// authenticator used once — the caller varies `cusec`, §3.2.3): no
+    /// ap-options, the ticket as issued, and the Authenticator — crealm and
+    /// cname of the ticket's client, no checksum, no subkey, no sequence
+    /// number (all OPTIONAL, 5.5.1) — encrypted in the ticket's session key
+    /// with key usage 11 ("in normal application exchanges", 5.5.1; 7.5.1).
+    pub fn ap_req(&self, ctime: KerberosTime, cusec: u32) -> Vec<u8> {
+        let authenticator = Authenticator {
+            crealm: self.crealm.clone(),
+            cname: self.cname.clone(),
+            cksum: None,
+            cusec: Microseconds::new(cusec).unwrap(),
+            ctime,
+            subkey: None,
+            seq_number: None,
+            authorization_data: None,
+        };
+        let plain = authenticator.encode().unwrap();
+        ApReq {
+            ap_options: ApOptions::empty(),
+            ticket: self.ticket.clone(),
+            authenticator: EncryptedData {
+                etype: self.session.enc_type().number(),
+                kvno: None,
+                cipher: krb_crypto::encrypt(&self.session, usage(11), &[0x4B; 16], &plain).unwrap(),
+            },
+        }
+        .encode()
+        .unwrap()
+    }
 }
 
 /// `true` if `needle` occurs in `haystack`.

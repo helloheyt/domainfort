@@ -163,7 +163,7 @@ pub const AUDIT_CONNECTIONS_PER_SOURCE: usize =
 /// (R50-3: one source per uid). Same shapes, same "any source" rows as
 /// `audit_daemon::binding::PRODUCTION`; per-daemon binding is covered by
 /// audit-daemon's tier-2 tests and tier 3 (docs/questions/Q-310, Q-341, A-85).
-fn single_label_binding(shape: ipc_audit::EventShape) -> Option<audit_log::Source> {
+pub fn single_label_binding(shape: ipc_audit::EventShape) -> Option<audit_log::Source> {
     audit_daemon::binding::bound_source(shape).map(|_| audit_log::Source::Kdc)
 }
 

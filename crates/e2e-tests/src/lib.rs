@@ -13,5 +13,6 @@
 //! | `tests/fail_closed.rs` | scenario 4 (keyd, dird, auditd stopped and restarted) |
 //! | `tests/policy_and_identity.rs` | scenario 5 (policy versions) and 6 (cross-wired channels) |
 //! | `tests/tier3_distinct_uids.rs` | tier 3: distinct uids per daemon (root on Linux, ignored by default) |
+//! | `tests/admin_plane.rs`, `tests/admin_world/` | task A13 (docs/51 §12): `provision domain` ⇒ key ceremony ⇒ every daemon ⇒ admin operations through `admin.sock` ⇒ a new user's login; auditd down; admind down |
 //!
 //! Spec: docs/50 §9 (tier 2), §10 (P12).

@@ -65,6 +65,19 @@ directory-pip = { path = "../directory-pip" }
 ad-schema = { path = "../ad-schema" }
 ldap = { path = "../ldap" }
 parse-ldap = { path = "../parse-ldap" }
+# The admin plane end to end (task A13, docs/51 §12; tests/admin_plane.rs):
+# `provision domain` and `provision first-admin-secret` run as libraries,
+# `keyadm ceremony` as a library, dird's admin service (directory-daemon
+# above), admind (`admin_daemon::serve`) and the clients of their channels,
+# and directory-admin for the test-only workstation fixture. All workspace
+# crates, already in the lock — no third-party package is added.
+provision = { path = "../provision" }
+provision-manifest = { path = "../provision-manifest" }
+keyadm = { path = "../keyadm" }
+admin-daemon = { path = "../admin-daemon" }
+ipc-admin = { path = "../ipc-admin" }
+ipc-dird-admin = { path = "../ipc-dird-admin" }
+directory-admin = { path = "../directory-admin" }
 # The DER encoder (`encode`, `encode_element`) under the test certificates
 # of tests/support/tls.rs (crates/parse-x509 tests/common/build.rs, reused
 # by `#[path]`, as crates/ldap-front's tests do; docs/questions/Q-320,
