@@ -118,3 +118,22 @@ pub const ADMIN_QUORUM: Bound = Bound {
 /// A client's deadline for an answer on the keyd channel: 2 s.
 /// Spec: docs/50 §3.6 ("deadline in the client — keyd: 2 s").
 pub const KEYD_DEADLINE_SECS: Bound = Bound::up_to(2);
+
+/// admind's minimum password length (`min_password_length`), in characters:
+/// required in admind's file — no default is ever used (the `default` field
+/// below only fills the struct). Range 12 ..= 256:
+/// * the floor — decision A-79 / owner item P-24: "a required configuration
+///   key `min_password_length` in admind, with a temporary hard floor of 12
+///   characters (project choice)" — the phase-1 schema has no
+///   minPwdLength, so [MS-SAMR] 3.1.1.7.2 item 3.2.1's
+///   Effective-MinimumPasswordLength is this setting;
+/// * the ceiling — [MS-SAMR] 3.1.1.7.2 item 2: a password is at most 256
+///   characters, so a larger minimum would refuse every password.
+///
+/// Spec: [MS-SAMR] 3.1.1.7.2 items 2, 3.2.1; docs/51 §11 (the password row);
+/// A-79; P-24; docs/questions/Q-298 item 5, Q-401.
+pub const MIN_PASSWORD_LENGTH: Bound = Bound {
+    min: 12,
+    max: 256,
+    default: 12,
+};

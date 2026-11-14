@@ -23,14 +23,23 @@
 //! authorization itself is Kerberos, docs/51 §5.1, §5.3); a numeric gid,
 //! never 0 (docs/50 §7.1: no name-service lookup).
 //!
+//! **The minimum password length** (task A9; decision A-79 / P-24):
+//! `min_password_length` is the least number of characters admind accepts
+//! in a `SetPassword` — **required**, 12 ..= 256, never a default
+//! ([`crate::limits::MIN_PASSWORD_LENGTH`]). [MS-SAMR] 3.1.1.7.2 item 3.2.1
+//! takes it from the domain's Effective-MinimumPasswordLength; the phase-1
+//! schema has no minPwdLength (docs/51 §11, §14), so admind's file carries
+//! it.
+//!
 //! Spec: docs/50 R50-15, §2.4, §3.1, §3.2, §3.6, §6.4, §7.1; docs/51 §4.6,
-//! §5.1, §6, §7.3; docs/questions/Q-220.
+//! §5.1, §6, §7.3, §11; [MS-SAMR] 3.1.1.7.2; A-79; P-24;
+//! docs/questions/Q-220, Q-401.
 
 use core::time::Duration;
 
 use crate::error::Error;
 use crate::format::Document;
-use crate::limits::{FRAME_TIMEOUT_SECS, KEYD_DEADLINE_SECS};
+use crate::limits::{FRAME_TIMEOUT_SECS, KEYD_DEADLINE_SECS, MIN_PASSWORD_LENGTH};
 use crate::schema::{
     self, Account, Distinct, Endpoint, AUDITD_UID, AUDIT_SOCKET, DIRD_ADMIN_SOCKET, DIRD_UID,
     FRAME_TIMEOUT, KEYD_DEADLINE, KEYD_SOCKET, KEYD_UID, RUN_AS_GID, RUN_AS_UID,
@@ -46,6 +55,9 @@ const ADMIN_SOCKET_GROUP: &str = "admin_socket_group";
 /// Key: the uid of keyadm, the only peer for which admind forwards the
 /// operations reserved to keyadm. Spec: docs/51 §4.6, §6, §7.3.
 const KEYADM_UID: &str = "keyadm_uid";
+/// Key: the least number of characters of a password admind sets.
+/// Spec: [MS-SAMR] 3.1.1.7.2 item 3.2.1; A-79; P-24.
+const MIN_PASSWORD_LENGTH_KEY: &str = "min_password_length";
 
 /// admind's settings, as parsed and validated from its file.
 ///
@@ -59,6 +71,7 @@ pub struct AdmindSettings {
     dird: Endpoint,
     keyd: Endpoint,
     audit: Endpoint,
+    min_password_length: u32,
     frame_timeout: Duration,
     keyd_deadline: Duration,
 }
@@ -71,6 +84,7 @@ impl AdmindSettings {
         ADMIN_SOCKET,
         ADMIN_SOCKET_GROUP,
         KEYADM_UID,
+        MIN_PASSWORD_LENGTH_KEY,
         DIRD_ADMIN_SOCKET,
         DIRD_UID,
         KEYD_SOCKET,
@@ -84,14 +98,14 @@ impl AdmindSettings {
     /// Parses and validates admind's file. Required: `run_as_uid`,
     /// `run_as_gid`, `admin_socket`, `admin_socket_group` (a gid, never 0),
     /// `keyadm_uid` (never 0, distinct from every other uid of the file),
-    /// `dird_admin_socket` + `dird_uid`, `keyd_socket` + `keyd_uid`,
-    /// `audit_socket`, `auditd_uid`. Optional: `frame_timeout` (5s),
-    /// `keyd_deadline` (2s).
+    /// `min_password_length` (12 ..= 256, no default), `dird_admin_socket` +
+    /// `dird_uid`, `keyd_socket` + `keyd_uid`, `audit_socket`,
+    /// `auditd_uid`. Optional: `frame_timeout` (5s), `keyd_deadline` (2s).
     ///
     /// # Errors
     /// Any rule of the format or of this schema (see [`crate::ErrorKind`]).
     ///
-    /// Spec: docs/50 R50-15, §2.4, §3.2, §3.6, §7.1.
+    /// Spec: docs/50 R50-15, §2.4, §3.2, §3.6, §7.1; A-79; P-24.
     pub fn parse(input: &[u8]) -> Result<Self, Error> {
         let doc = Document::parse(input, Self::KEYS)?;
         let mut all = Distinct::default();
@@ -101,6 +115,12 @@ impl AdmindSettings {
         // crate::schema::account), but never 0 or all-ones.
         let admin_socket_group = doc.required(ADMIN_SOCKET_GROUP, value::account_id)?.value;
         let keyadm_uid = schema::id(&doc, &mut all, KEYADM_UID)?;
+        // Required, never defaulted (A-79: "a required configuration key").
+        let min_password_length = doc
+            .required(MIN_PASSWORD_LENGTH_KEY, |text| {
+                value::bounded(text, MIN_PASSWORD_LENGTH)
+            })?
+            .value;
         let dird = schema::endpoint(&doc, &mut all, DIRD_ADMIN_SOCKET, DIRD_UID)?;
         let keyd = schema::endpoint(&doc, &mut all, KEYD_SOCKET, KEYD_UID)?;
         let audit = schema::endpoint(&doc, &mut all, AUDIT_SOCKET, AUDITD_UID)?;
@@ -114,9 +134,17 @@ impl AdmindSettings {
             dird,
             keyd,
             audit,
+            min_password_length,
             frame_timeout,
             keyd_deadline,
         })
+    }
+
+    /// The least number of characters of a password admind sets (12 ..=
+    /// 256). Spec: [MS-SAMR] 3.1.1.7.2 item 3.2.1; A-79; P-24.
+    #[must_use]
+    pub const fn min_password_length(&self) -> u32 {
+        self.min_password_length
     }
 
     /// The account admind drops to. Spec: docs/50 §6.1, §6.4.

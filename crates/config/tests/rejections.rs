@@ -10,7 +10,8 @@ mod common;
 use common::{append, remove, replace, set, Daemon, ADMIND, AUDITD, DIRD, KDC, KEYD, LDAP_FRONT};
 use config::limits::{MAX_FILE_OCTETS, MAX_KEY_OCTETS, MAX_LINES, MAX_LINE_OCTETS};
 use config::{
-    AuditdSettings, DirdSettings, Error, ErrorKind, KdcSettings, KeydSettings, LdapFrontSettings,
+    AdmindSettings, AuditdSettings, DirdSettings, Error, ErrorKind, KdcSettings, KeydSettings,
+    LdapFrontSettings,
 };
 
 /// The 1-based line of `key` in `text`.
@@ -1519,4 +1520,64 @@ fn admind_keyadm_uid_twice_is_rejected() {
     let err = error(Daemon::Admind, &text);
     assert_eq!(err.kind(), ErrorKind::DuplicateKey);
     assert_eq!(err.key(), Some("keyadm_uid"));
+}
+
+// ---- admind: min_password_length (task A9; A-79, P-24) -----------------------
+
+/// `min_password_length` is required — no default is ever used (A-79: "a
+/// required configuration key `min_password_length` in admind").
+/// Spec: A-79; P-24; docs/50 §7.1 ("missing-required ⇒ do not start").
+#[test]
+fn admind_min_password_length_is_required() {
+    let err = error(Daemon::Admind, &remove(ADMIND, "min_password_length"));
+    assert_eq!(err.kind(), ErrorKind::MissingKey);
+    assert_eq!(err.key(), Some("min_password_length"));
+}
+
+/// The hard floor is 12 (A-79 / P-24: "a temporary hard floor of 12
+/// characters"); the ceiling is 256, the most characters a password may
+/// have ([MS-SAMR] 3.1.1.7.2 item 2) — a larger minimum would refuse every
+/// password. Both ends are accepted; one past either end is `OutOfRange`.
+/// Spec: [MS-SAMR] 3.1.1.7.2 items 2, 3.2.1; A-79; P-24.
+#[test]
+fn admind_min_password_length_range() {
+    for value in ["0", "1", "8", "11", "257", "1024", "4294967295"] {
+        rejects_value(
+            Daemon::Admind,
+            ADMIND,
+            "min_password_length",
+            value,
+            ErrorKind::OutOfRange,
+        );
+    }
+    for value in ["12", "13", "64", "255", "256"] {
+        accepts_value(Daemon::Admind, ADMIND, "min_password_length", value);
+    }
+    let s = AdmindSettings::parse(set(ADMIND, "min_password_length", "256").as_bytes()).unwrap();
+    assert_eq!(s.min_password_length(), 256);
+}
+
+/// One spelling per value: a canonical decimal only (no sign, no leading
+/// zero, no unit, no hex).
+/// Spec: docs/50 §7.1 ("typed values"); docs/questions/Q-230.
+#[test]
+fn admind_min_password_length_spelling() {
+    for value in ["012", "+12", "12s", "0x0c", "twelve", "12.0", "-12"] {
+        rejects_value(
+            Daemon::Admind,
+            ADMIND,
+            "min_password_length",
+            value,
+            ErrorKind::InvalidInteger,
+        );
+    }
+}
+
+/// A second `min_password_length` line is refused like any duplicate key.
+/// Spec: docs/50 §7.1 ("duplicate … ⇒ do not start").
+#[test]
+fn admind_min_password_length_twice_is_rejected() {
+    let err = error(Daemon::Admind, &append(ADMIND, "min_password_length = 16"));
+    assert_eq!(err.kind(), ErrorKind::DuplicateKey);
+    assert_eq!(err.key(), Some("min_password_length"));
 }

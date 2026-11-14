@@ -11,6 +11,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "admin-daemon"
+version = "0.0.0"
+dependencies = [
+ "ad-schema",
+ "audit-daemon",
+ "audit-log",
+ "config",
+ "daemon-sandbox",
+ "directory-admin",
+ "directory-daemon",
+ "directory-pip",
+ "dirstore",
+ "dtyp",
+ "ipc",
+ "ipc-admin",
+ "ipc-audit",
+ "ipc-dird-admin",
+ "ipc-directory",
+ "ipc-keyd",
+ "kdc",
+ "keyd",
+ "keyd-daemon",
+ "keyd-types",
+ "krb-crypto",
+ "krb-proto",
+ "pdp",
+ "provision-manifest",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "aes"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -382,6 +414,17 @@ dependencies = [
 name = "ipc"
 version = "0.0.0"
 dependencies = [
+ "zeroize",
+]
+
+[[package]]
+name = "ipc-admin"
+version = "0.0.0"
+dependencies = [
+ "dtyp",
+ "ipc",
+ "ipc-dird-admin",
+ "ipc-keyd",
  "zeroize",
 ]
 

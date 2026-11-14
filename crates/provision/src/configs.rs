@@ -63,6 +63,18 @@ pub const ADMIN_TICKET_AGE_MAX_SECS: u32 = 600;
 /// `MIN_QUORUM`.
 pub const ADMIN_QUORUM: usize = directory_admin::MIN_QUORUM;
 
+/// admind's `min_password_length`: the hard floor of 12 characters (A-79 /
+/// owner item P-24: "a required configuration key `min_password_length` in
+/// admind, with a temporary hard floor of 12 characters"). admind's schema
+/// requires the key (task A9), so every generated admind file carries it;
+/// the operator raises it by editing the file. docs/questions/Q-378 item 3
+/// (decided A-92: "provisioning must emit it (floor 12)").
+/// Spec: A-79; P-24; A-92; [MS-SAMR] 3.1.1.7.2 item 3.2.1.
+pub const MIN_PASSWORD_LENGTH: u32 = 12;
+
+// The value provisioning writes is the schema's own floor.
+const _: () = assert!(MIN_PASSWORD_LENGTH == config::limits::MIN_PASSWORD_LENGTH.min);
+
 /// The process a configuration file belongs to.
 /// Spec: docs/50 §2.4 (the process table).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -202,7 +214,9 @@ fn list(items: &[String]) -> String {
 ///   certificate and key paths (ldap-front, R50-12).
 /// - auditd: `uid_sources` = every daemon's uid with its source name
 ///   (docs/50 §3.2).
-/// - admind: `keyadm_uid`, `admin_socket_group` (docs/51 §4.6).
+/// - admind: `keyadm_uid`, `admin_socket_group` (docs/51 §4.6),
+///   `min_password_length` = [`MIN_PASSWORD_LENGTH`] (A-79 / P-24; required
+///   by admind's schema since task A9).
 /// - keyadm: keyd's socket and uid (crates/config keyadm.rs).
 ///
 /// Spec: docs/51 §4.3 step 7, §4.6; docs/50 §2.4, §3.1, §3.2, §7.1;
@@ -328,6 +342,7 @@ pub fn domain_configs(input: &DomainInput, node_id: &NodeId) -> Vec<ConfigFile> 
         ("admin_socket", path(&p.admin_socket)),
         ("admin_socket_group", id(a.admin_socket_group)),
         ("keyadm_uid", id(a.keyadm_uid)),
+        ("min_password_length", MIN_PASSWORD_LENGTH.to_string()),
         ("dird_admin_socket", path(&p.dird_admin_socket)),
         ("dird_uid", id(a.dird.uid)),
         ("keyd_socket", path(&p.keyd_socket)),

@@ -1,0 +1,56 @@
+# ipc-admin — the administrators' channel to admind (`admin.sock`): its
+# message set, the typed requests and replies, admind's request decoding and
+# reply encoding, and a client's request encoding and reply decoding
+# (docs/51 §7.6, R51-7; docs/50 §3.1-§3.3, the channel-magic registry;
+# decisions A-59, A-72, A-73, A-90).
+#
+# A library: no daemon, no listener, no socket. admind (crates/admin-daemon)
+# serves it; `adminctl` (task A11) will be a client. The operations are those
+# of dird's admin channel (crate ipc-dird-admin) — the same field layouts,
+# encoded by that crate — except that `BeginPasswordSet` /
+# `CompletePasswordSet` are replaced by `SetPassword`, the one message that
+# carries a password (docs/51 §7.6: "the password never reaches dird").
+#
+# THIS crate must never link dirstore / redb / directory-pip /
+# directory-admin, keyd or krb-crypto (admind never opens the directory and
+# links no Kerberos crypto: docs/51 §5.1; D182, A-73 — checked by
+# crates/admin-daemon tests/no_store_or_crypto.rs).
+#
+# Provenance: written only from docs/51 §5, §7, §9, docs/50 §3, §8.2, §9 and
+# the channel-magic registry, the decisions in
+# docs/questions/PENDING-OWNER.md (A-59, A-63, A-64, A-72, A-73, A-79, A-85,
+# A-88, A-90, A-91) and the public API of this workspace's crates. No other
+# implementation was consulted or recalled (AGENTS.md §1-3).
+
+[package]
+name = "ipc-admin"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Our own workspace crates (path dependencies).
+#
+# The framing, the envelope, the field primitives, the secret byte string
+# and the shared `Refused` reply (docs/50 §3.3; A-59).
+ipc = { path = "../ipc" }
+# dird's admin channel: the forwarded operations travel in exactly its field
+# layouts (its `MessageSet` reads and writes them) and its typed values
+# (docs/51 §7.6: "the same operations"). It links no store, PEP or crypto
+# (its own guard, crates/ipc-dird-admin tests/no_store_dependency.rs).
+ipc-dird-admin = { path = "../ipc-dird-admin" }
+# `Guid` ([MS-DTYP] 2.3.4.2 packet form) and `Sid` ([MS-DTYP] 2.4.2.2) of
+# the replies.
+dtyp = { path = "../dtyp" }
+# Only for `ipc_keyd::channel::MAX_SECRET`, to which the password bound is
+# pinned at compile time (admind hands the password to keyd `set_secret`).
+# The client side of the keyd channel links no crypto (A-63).
+ipc-keyd = { path = "../ipc-keyd" }
+# RustCrypto `zeroize` (OD-9; already in the lock): the password's typed
+# buffer (docs/50 §3.3).
+zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
+
+# No dev-dependency: the codec tests need only the crates above.
+
+[lints]
+workspace = true

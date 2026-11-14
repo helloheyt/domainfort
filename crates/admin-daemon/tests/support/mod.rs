@@ -1,0 +1,1481 @@
+//! Tier-2 support for admind (docs/50 §9: "real servers run in the test's
+//! threads; Unix sockets in a unique temporary directory (0700); the uid map
+//! is injected with the test's own uid for the role under test").
+//!
+//! The world of one test, all in this process over real sockets:
+//!
+//! * **auditd** — crates/audit-daemon's listener and writer (its tier-2
+//!   harness, reused through `#[path]`), the test's uid mapped to the
+//!   `admind` source, so the production binding table accepts admind's
+//!   `Admind` events; they are read back from the verified log.
+//! * **keyd (Role::Ldap)** — crates/keyd-daemon's real daemon holding the
+//!   admin service's key set `(admind-svc$, Service)`, created by
+//!   `create_key` from scripted test entropy so the test knows the key; dird
+//!   verifies the administrators' AP-REQs through it (A-73).
+//! * **keyd (Role::Directory)** — a second real keyd daemon, the test's uid
+//!   mapped to Directory: admind's `set_secret` goes there (A-57). (One uid
+//!   has one role, R50-3, so the single-uid harness runs two keyds.) Or, by
+//!   option, the same with the uid mapped to Admin (keyd refuses
+//!   `set_secret`), or a silent keyd that accepts and never answers.
+//! * **dird** — crates/directory-daemon's `serve_with_admin` with its admin
+//!   service over a provisioned directory, its own fake auditd recording the
+//!   `DirAdmin` events (crates/keyd-daemon's tier-2 `FakeAuditd`).
+//! * **admind** — `admin_daemon::serve` on its own thread, its dird and keyd
+//!   clients built from this crate's public `DirdLink` / `KeydLink` with the
+//!   connectors of the host (Linux: the production connectors; elsewhere a
+//!   connector that reads the server's uid through tokio
+//!   `UnixStream::peer_cred`, as crates/directory-daemon's tests do).
+//!
+//! The AP-REQs are built here, as crates/directory-daemon's tier-2 tests
+//! build them (accepted for tier 2 in A-91): the service ticket sealed under
+//! the admin service key (RFC 4120 §5.3, key usage 2), the authenticator
+//! under the session key (§5.5.1, key usage 11), with krb-crypto (a
+//! dev-dependency) and the kdc integration fixtures.
+//!
+//! Sources: docs/51 §4.3, §5.2, §5.3, §7; docs/50 §3, §9; docs/47 §9.1;
+//! RFC 4120 §3.2.3, §5.3, §5.5.1, §7.5.1; [MS-SAMR] 2.2.1.14; [MS-DTYP]
+//! 2.4.2.4. Every value is constructed by hand for these tests (the times
+//! are those of the kdc fixtures); no vector comes from any other
+//! implementation.
+#![allow(dead_code, unused_imports)]
+
+#[path = "../../../kdc/tests/common/mod.rs"]
+pub mod common;
+
+#[path = "../../../directory-daemon/tests/support/mod.rs"]
+pub mod dird;
+
+#[path = "../../../audit-daemon/tests/common/mod.rs"]
+pub mod auditd;
+
+use ad_schema::flags::user_account_control as uac;
+use ad_schema::{phase1, Phase1Schema};
+use admin_daemon::{
+    serve, AuditEndpoint, DaemonControl, DaemonParams, DirdLink, KeydLink, Limits,
+    WORKER_QUEUE_CAPACITY,
+};
+use audit_daemon::listener::ListenerConfig;
+use audit_log::Anchor;
+use core::time::Duration;
+use directory_admin::{wall_clock, CHANGE_SEQ_COUNTER, RID_COUNTER, RID_END_EXCLUSIVE, RID_FIRST};
+use directory_daemon::policy::{DevelopmentPolicy, MandatoryFast};
+use directory_daemon::{
+    serve_with_admin, AdminParams, Clock, DaemonControl as DirdControl, KeydTicketVerifier,
+    SharedClock, StoreSource, TicketVerifier, VerifierFactory, DECISION_ACK_DEADLINE,
+};
+use dirstore::{AttrId, IntegrityKey, NewObject, NodeId, Origin, Store, WriteTxn};
+use dtyp::{
+    ace_flags, create_security_descriptor, AccessMask, Ace, Acl, AutoInheritFlags, Control,
+    GenericMapping, Guid, MaskSidAce, SecurityDescriptor, Sid, Token, ACL_REVISION_DS,
+    SECURITY_NT_AUTHORITY,
+};
+use ipc::{FrameReader, Refused};
+use ipc_audit::{AdmindEvent, DirAdminEvent, EventBody, KeydRecord};
+use ipc_dird_admin::Operation;
+use keyd::{InMemoryKeyStore, Keyd, Role};
+use keyd_daemon::{CallerMap, RecordBuffer};
+use krb_crypto::ProtocolKey;
+use krb_proto::constants::{DOMAIN_X500_COMPRESS, KRB_NT_PRINCIPAL};
+use krb_proto::{
+    ApOptions, ApReq, Authenticator, EncTicketPart, EncryptedData, EncryptionKey, KerberosTime,
+    KeyValue, Microseconds, PrincipalName, Ticket, TicketFlags, TransitedEncoding,
+};
+use pdp::access_check::rights::{
+    RIGHT_DELETE, RIGHT_DS_CONTROL_ACCESS, RIGHT_DS_CREATE_CHILD, RIGHT_DS_DELETE_CHILD,
+    RIGHT_DS_LIST_CONTENTS, RIGHT_DS_READ_PROPERTY, RIGHT_DS_WRITE_PROPERTY, RIGHT_READ_CONTROL,
+};
+use pdp::{
+    ActionMatch, AuthMatch, ContextMatch, Dn, Effect, Match, PolicyVersion, ResourceMatch, Rule,
+    RuleId, SubjectMatch, SubtreeBase, Tier,
+};
+use provision_manifest::{Manifest, ManifestFields};
+use std::collections::BTreeMap;
+use std::io::{ErrorKind, Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Instant;
+
+pub use dird::{eventually, my_uid, skip_as_root, FakeAuditd, TempDir, TestClock};
+
+// ---------------------------------------------------------------------------
+// The domain (test data).
+// ---------------------------------------------------------------------------
+
+/// The DC's host name (dird's `dns_host_name` in the support `params`).
+pub const DC_FQDN: &str = "dc1.example.org";
+
+/// The admin service's key (scripted into keyd's `create_key`).
+pub const ADMIN_SERVICE_KEY: [u8; 32] = [0xA9; 32];
+
+/// The session key of the test tickets.
+pub const SESSION_KEY: [u8; 32] = [0x5E; 32];
+
+/// dird's node-id (test data).
+pub const NODE_ID: NodeId = NodeId([0xA9; 16]);
+
+pub const ROOT: u32 = 1;
+pub const TIER0_OU: u32 = 2;
+pub const STAFF_OU: u32 = 3;
+pub const KRBTGT: u32 = 10;
+pub const LDAP_SVC: u32 = 11;
+pub const ADMIND_SVC: u32 = 12;
+pub const ADMIN1: u32 = 13;
+pub const ADMIN2: u32 = 14;
+pub const TIER0_GROUP: u32 = 20;
+pub const BOOTSTRAP: u32 = 21;
+pub const BOB: u32 = 30;
+pub const STAFF_GROUP: u32 = 31;
+pub const WS9: u32 = 32;
+pub const JO: u32 = 33;
+
+/// The principals in the order provisioning takes their RIDs (krbtgt is
+/// RID 502 and takes none).
+const RID_ORDER: [u32; 10] = [
+    TIER0_GROUP,
+    BOOTSTRAP,
+    ADMIN1,
+    ADMIN2,
+    BOB,
+    STAFF_GROUP,
+    LDAP_SVC,
+    ADMIND_SVC,
+    WS9,
+    JO,
+];
+
+/// whenCreated / pwdLastSet: 2026-11-01T00:00:00Z as DSTIME (derivation in
+/// crates/directory-admin tests/common `PROVISIONED_DSTIME`).
+const PROVISIONED_DSTIME: i64 = 13_437_964_800;
+
+/// A distinct, non-NULL GUID per small integer (test data).
+pub fn g(n: u32) -> Guid {
+    Guid {
+        data1: n,
+        data2: 0xA9,
+        data3: 0x00AD,
+        data4: [0xA, 9, 0xA, 9, 0xA, 9, 0xA, 9],
+    }
+}
+
+/// S-1-5-21-7-8-9 ([MS-DTYP] 2.4.2.4 layout).
+pub fn domain_sid() -> Sid {
+    Sid::new(SECURITY_NT_AUTHORITY, &[21, 7, 8, 9]).unwrap()
+}
+
+pub fn rid(id: u32) -> u32 {
+    if id == KRBTGT {
+        return 502;
+    }
+    let position = RID_ORDER.iter().position(|p| *p == id).unwrap();
+    1101 + u32::try_from(position).unwrap()
+}
+
+pub fn sid_of(id: u32) -> Sid {
+    Sid::new(SECURITY_NT_AUTHORITY, &[21, 7, 8, 9, rid(id)]).unwrap()
+}
+
+fn dn(rdns: &[&str]) -> Dn {
+    Dn::new(rdns.iter().map(|s| (*s).to_owned()).collect())
+}
+
+fn nc_dn() -> Dn {
+    dn(&["dc=example", "dc=org"])
+}
+
+/// The rights the root SD grants the Tier-0 group, inheritable (docs/51
+/// §10): the rights the operations of §5.2 need.
+const ADMIN_RIGHTS: u32 = RIGHT_DS_CREATE_CHILD
+    | RIGHT_DS_DELETE_CHILD
+    | RIGHT_DS_READ_PROPERTY
+    | RIGHT_DS_WRITE_PROPERTY
+    | RIGHT_DELETE
+    | RIGHT_DS_CONTROL_ACCESS
+    | RIGHT_DS_LIST_CONTENTS
+    | RIGHT_READ_CONTROL;
+
+fn root_sd() -> SecurityDescriptor {
+    SecurityDescriptor {
+        sbz1: 0,
+        control: Control(Control::SELF_RELATIVE | Control::DACL_PRESENT),
+        owner_sid: Some(sid_of(TIER0_GROUP)),
+        group_sid: Some(sid_of(TIER0_GROUP)),
+        sacl: None,
+        dacl: Some(Acl {
+            acl_revision: ACL_REVISION_DS,
+            aces: vec![Ace::AccessAllowed(MaskSidAce {
+                ace_flags: ace_flags::CONTAINER_INHERIT_ACE,
+                mask: AccessMask(ADMIN_RIGHTS),
+                sid: sid_of(TIER0_GROUP),
+            })],
+        }),
+    }
+}
+
+/// A child's SD as provisioning computes it ([MS-DTYP] 2.5.3.4 through
+/// dtyp, A-84).
+fn child_sd(parent: &SecurityDescriptor, class_guid: Guid) -> SecurityDescriptor {
+    create_security_descriptor(
+        Some(parent),
+        None,
+        true,
+        Some(&[class_guid]),
+        AutoInheritFlags::default(),
+        &Token {
+            owner: sid_of(TIER0_GROUP),
+            primary_group: sid_of(TIER0_GROUP),
+            default_dacl: None,
+        },
+        &GenericMapping::ACTIVE_DIRECTORY,
+    )
+    .unwrap()
+}
+
+struct Planned {
+    id: u32,
+    parent: Option<u32>,
+    class: &'static str,
+    attrs: Vec<(&'static str, Vec<Vec<u8>>)>,
+}
+
+fn text(s: &str) -> Vec<Vec<u8>> {
+    vec![s.as_bytes().to_vec()]
+}
+
+fn int64(v: i64) -> Vec<Vec<u8>> {
+    vec![v.to_be_bytes().to_vec()]
+}
+
+fn flags(v: u32) -> Vec<Vec<u8>> {
+    vec![v.to_be_bytes().to_vec()]
+}
+
+/// The plan: the shape docs/51 §4.3 step 5 gives `provision domain`
+/// (parents first, members before groups), plus the accounts these tests
+/// set passwords for: bob (a user), ws9$ (a computer with one SPN) and jo
+/// (a user whose sAMAccountName has two characters).
+fn plan() -> Vec<Planned> {
+    let account = |id: u32, sam: &str, uac_value: u32, password: bool| {
+        let mut attrs = vec![
+            ("cn", text(sam)),
+            ("sAMAccountName", text(sam)),
+            ("objectSid", vec![sid_of(id).encode()]),
+            ("userAccountControl", flags(uac_value)),
+            ("accountExpires", int64(i64::MAX)),
+            ("whenCreated", int64(PROVISIONED_DSTIME)),
+        ];
+        if password {
+            attrs.push(("pwdLastSet", int64(PROVISIONED_DSTIME * 10_000_000)));
+        }
+        attrs
+    };
+    let computer = |id: u32, sam: &str, host: &str, spn: &str| {
+        let mut attrs = account(id, sam, uac::ADS_UF_WORKSTATION_TRUST_ACCOUNT, false);
+        attrs.push(("dNSHostName", text(host)));
+        attrs.push(("servicePrincipalName", text(spn)));
+        attrs
+    };
+    let group = |id: u32, sam: &str, members: &[u32]| {
+        let mut attrs = vec![
+            ("cn", text(sam)),
+            ("sAMAccountName", text(sam)),
+            ("objectSid", vec![sid_of(id).encode()]),
+            ("groupType", flags(0x8000_0002)),
+        ];
+        if !members.is_empty() {
+            attrs.push((
+                "member",
+                members.iter().map(|m| g(*m).to_packet().to_vec()).collect(),
+            ));
+        }
+        attrs
+    };
+    let n = uac::ADS_UF_NORMAL_ACCOUNT;
+    let p = |id, parent, class, attrs| Planned {
+        id,
+        parent,
+        class,
+        attrs,
+    };
+    vec![
+        p(
+            ROOT,
+            None,
+            "domainDNS",
+            vec![
+                ("dc", text("example")),
+                ("objectSid", vec![domain_sid().encode()]),
+            ],
+        ),
+        p(
+            TIER0_OU,
+            Some(ROOT),
+            "organizationalUnit",
+            vec![("ou", text("Tier0"))],
+        ),
+        p(
+            STAFF_OU,
+            Some(ROOT),
+            "organizationalUnit",
+            vec![("ou", text("Staff"))],
+        ),
+        p(
+            KRBTGT,
+            Some(TIER0_OU),
+            "user",
+            account(KRBTGT, "krbtgt", n, false),
+        ),
+        p(
+            LDAP_SVC,
+            Some(TIER0_OU),
+            "computer",
+            computer(LDAP_SVC, "ldap-svc$", DC_FQDN, "ldap/dc1.example.org"),
+        ),
+        p(
+            ADMIND_SVC,
+            Some(TIER0_OU),
+            "computer",
+            computer(ADMIND_SVC, "admind-svc$", DC_FQDN, "admind/dc1.example.org"),
+        ),
+        p(
+            ADMIN1,
+            Some(TIER0_OU),
+            "user",
+            account(ADMIN1, "admin1", n, true),
+        ),
+        p(
+            ADMIN2,
+            Some(TIER0_OU),
+            "user",
+            account(ADMIN2, "admin2", n, true),
+        ),
+        p(BOB, Some(STAFF_OU), "user", account(BOB, "bob", n, true)),
+        p(
+            WS9,
+            Some(STAFF_OU),
+            "computer",
+            computer(WS9, "ws9$", "ws9.example.org", "host/ws9.example.org"),
+        ),
+        p(JO, Some(STAFF_OU), "user", account(JO, "jo", n, true)),
+        p(
+            TIER0_GROUP,
+            Some(TIER0_OU),
+            "group",
+            group(TIER0_GROUP, "tier0", &[ADMIN1, ADMIN2]),
+        ),
+        p(
+            BOOTSTRAP,
+            Some(STAFF_OU),
+            "group",
+            group(BOOTSTRAP, "bootstrap", &[]),
+        ),
+        p(
+            STAFF_GROUP,
+            Some(STAFF_OU),
+            "group",
+            group(STAFF_GROUP, "staff", &[]),
+        ),
+    ]
+}
+
+fn provisioned_at() -> KerberosTime {
+    common::kt("20261101000000Z")
+}
+
+fn origin(txn: &mut WriteTxn<'_>) -> Origin {
+    Origin {
+        wall_clock: wall_clock(&provisioned_at()).unwrap(),
+        origin_node: NODE_ID,
+        origin_seq: txn.take_counter_value(CHANGE_SEQ_COUNTER).unwrap(),
+    }
+}
+
+/// Provision the directory in ONE transaction, with the two counters
+/// (docs/51 §4.3 step 5, §8.3; A-83).
+pub fn provision(path: &Path) -> Arc<Store> {
+    let p1: Phase1Schema = phase1().unwrap();
+    let store = Store::open(
+        path,
+        IntegrityKey::from_bytes(&dird::TEST_KEY),
+        p1.schema().clone(),
+    )
+    .unwrap();
+    let attr = |name: &str| -> AttrId { p1.attribute_by_name(name).unwrap() };
+    let mut txn = store.begin_write().unwrap();
+    txn.create_counter(RID_COUNTER, RID_FIRST, RID_END_EXCLUSIVE)
+        .unwrap();
+    txn.create_counter(CHANGE_SEQ_COUNTER, 1, u64::MAX).unwrap();
+    for id in RID_ORDER {
+        assert_eq!(
+            txn.take_counter_value(RID_COUNTER).unwrap(),
+            u64::from(rid(id))
+        );
+    }
+    let mut sds: BTreeMap<u32, SecurityDescriptor> = BTreeMap::new();
+    for planned in plan() {
+        let class_id = p1.class_by_name(planned.class).unwrap();
+        let class = p1.class(class_id).unwrap();
+        let sd = match planned.parent {
+            None => root_sd(),
+            Some(parent) => child_sd(&sds[&parent], class.schema_id_guid),
+        };
+        let mut attributes: Vec<(AttrId, Vec<Vec<u8>>)> = planned
+            .attrs
+            .iter()
+            .map(|(name, values)| (attr(name), values.clone()))
+            .collect();
+        attributes.push((attr("nTSecurityDescriptor"), vec![sd.encode().unwrap()]));
+        let origin = origin(&mut txn);
+        txn.create_object(
+            NewObject {
+                guid: g(planned.id),
+                parent: planned.parent.map(g),
+                classes: class.object_class.clone(),
+                attributes,
+            },
+            &origin,
+        )
+        .unwrap();
+        sds.insert(planned.id, sd);
+    }
+    txn.commit().unwrap();
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    Arc::new(store)
+}
+
+/// The policy: tier map {tier0 group → Tier0}, {ou=Tier0 → Tier0}; the
+/// Tier-0 group may run every Directory action under the NC root; the
+/// bootstrap group is the FAST bootstrap set (docs/51 §4.3 step 6).
+pub fn policy() -> DevelopmentPolicy {
+    DevelopmentPolicy {
+        version: PolicyVersion(1),
+        principals: BTreeMap::from([(sid_of(TIER0_GROUP), Tier::Tier0)]),
+        subtrees: vec![(dn(&["ou=Tier0", "dc=example", "dc=org"]), Tier::Tier0)],
+        mandatory_fast: MandatoryFast {
+            bootstrap_group: sid_of(BOOTSTRAP),
+            first_rule_id: RuleId(100),
+        },
+        rules: vec![Rule {
+            id: RuleId(1),
+            effect: Effect::Allow,
+            when: Match {
+                action: ActionMatch::Class(pdp::ActionClass::Directory),
+                resource: ResourceMatch::DirSubtree {
+                    base: SubtreeBase::new(nc_dn()).unwrap(),
+                },
+                subject: SubjectMatch::MemberOf(sid_of(TIER0_GROUP)),
+                context: ContextMatch::ANY,
+                auth: AuthMatch::ANY,
+            },
+            obligations: vec![],
+        }],
+        anonymous: Vec::new(),
+    }
+}
+
+/// The provisioning manifest of the domain (docs/51 §4.3 step 8).
+pub fn manifest() -> Manifest {
+    Manifest::new(&ManifestFields {
+        realm: String::from(dird::REALM),
+        domain_sid: domain_sid(),
+        naming_context: vec![String::from("example"), String::from("org")],
+        dc_fqdn: String::from(DC_FQDN),
+        krbtgt: g(KRBTGT),
+        ldap_service: g(LDAP_SVC),
+        admin_service: g(ADMIND_SVC),
+        first_admins: vec![
+            (g(ADMIN1), String::from("admin1")),
+            (g(ADMIN2), String::from("admin2")),
+        ],
+    })
+    .unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// The Kerberos side (RFC 4120 §5.3, §5.5.1).
+// ---------------------------------------------------------------------------
+
+fn admin_service_key() -> ProtocolKey {
+    common::aes256(&ADMIN_SERVICE_KEY)
+}
+
+/// When every test ticket was first authenticated: one minute before the
+/// kdc fixtures' `now`.
+fn authtime() -> KerberosTime {
+    common::kt("20261113095900Z")
+}
+
+pub fn principal(sam: &str) -> PrincipalName {
+    common::name(KRB_NT_PRINCIPAL, &[sam])
+}
+
+/// An AP-REQ of `sam` for the admin service: the ticket sealed under the
+/// admin service key (usage 2); the authenticator at `now` with `cusec`,
+/// under the session key (usage 11).
+/// Spec: RFC 4120 §5.3, §5.5.1, §7.5.1.
+fn ap_req(sam: &str, cusec: u32) -> Vec<u8> {
+    let part = EncTicketPart {
+        flags: TicketFlags::PRE_AUTHENT,
+        key: EncryptionKey {
+            keytype: common::AES256,
+            keyvalue: KeyValue::from_slice(&SESSION_KEY),
+        },
+        crealm: common::realm(),
+        cname: principal(sam),
+        transited: TransitedEncoding {
+            tr_type: DOMAIN_X500_COMPRESS,
+            contents: Vec::new(),
+        },
+        authtime: authtime(),
+        starttime: Some(authtime()),
+        endtime: common::kt("20261113170000Z"),
+        renew_till: None,
+        caddr: None,
+        authorization_data: None,
+    };
+    let plain = part.encode().unwrap();
+    let key = admin_service_key();
+    let ticket = Ticket {
+        realm: common::realm(),
+        sname: manifest().admin_service().binding.name.clone(),
+        enc_part: EncryptedData {
+            etype: key.enc_type().number(),
+            kvno: None,
+            cipher: krb_crypto::encrypt(&key, common::usage(2), &[0x88; 16], &plain).unwrap(),
+        },
+    };
+    let authenticator = Authenticator {
+        crealm: common::realm(),
+        cname: principal(sam),
+        cksum: None,
+        cusec: Microseconds::new(cusec).unwrap(),
+        ctime: common::now(),
+        subkey: None,
+        seq_number: None,
+        authorization_data: None,
+    }
+    .encode()
+    .unwrap();
+    let session = common::aes256(&SESSION_KEY);
+    ApReq {
+        ap_options: ApOptions::empty(),
+        ticket,
+        authenticator: EncryptedData {
+            etype: session.enc_type().number(),
+            kvno: None,
+            cipher: krb_crypto::encrypt(&session, common::usage(11), &[0x77; 16], &authenticator)
+                .unwrap(),
+        },
+    }
+    .encode()
+    .unwrap()
+}
+
+/// A fresh cusec for every AP-REQ (keyd's replay cache, RFC 4120 §3.2.3).
+static CUSEC: AtomicU32 = AtomicU32::new(1);
+
+/// A fresh AP-REQ of `sam`.
+pub fn fresh(sam: &str) -> Vec<u8> {
+    ap_req(sam, CUSEC.fetch_add(1, Ordering::SeqCst))
+}
+
+/// The auth field of an operation by `requester` with `approvers`.
+pub fn auth(requester: &str, approvers: &[&str]) -> ipc_dird_admin::Auth {
+    ipc_dird_admin::Auth {
+        requester: fresh(requester),
+        approvals: approvers.iter().map(|a| fresh(a)).collect(),
+    }
+}
+
+/// keyd (Role::Ldap) with the admin service's key set (`create_key`,
+/// docs/51 §4.3 step 11) — the scripted entropy gives it
+/// [`ADMIN_SERVICE_KEY`] for each of keyd's enctypes.
+fn admin_keyd(
+    started: &KerberosTime,
+) -> Result<Keyd<InMemoryKeyStore, RecordBuffer, common::TestEntropy>, keyd::ConfigError> {
+    let entropy = common::TestEntropy::default();
+    let mut keyd = Keyd::with_entropy(
+        dird::keyd_config(),
+        InMemoryKeyStore::new(64),
+        RecordBuffer::new(),
+        entropy.clone(),
+        started,
+    )?;
+    let lengths: Vec<usize> = keyd
+        .config()
+        .enctypes
+        .iter()
+        .map(|e| {
+            krb_crypto::EncType::from_number(e.number())
+                .unwrap()
+                .key_length()
+        })
+        .collect();
+    for length in lengths {
+        entropy.push(&ADMIN_SERVICE_KEY[..length]);
+    }
+    let service = manifest().admin_service().clone();
+    keyd.create_key(
+        &common::ADMIN,
+        &service.handle,
+        &service.binding,
+        &common::now(),
+    )
+    .unwrap();
+    let _ = keyd.audit_sink_mut().take();
+    Ok(keyd)
+}
+
+// ---------------------------------------------------------------------------
+// Connectors: the host's way to read the server's uid.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+pub mod connectors {
+    //! Linux: admind's own connectors (rustix peer credentials).
+    use std::path::Path;
+
+    pub type DirdAdminConnector = ipc_dird_admin::UnixConnector;
+    pub type KeydConnector = ipc_keyd::UnixConnector;
+
+    pub fn dird_admin(path: &Path) -> DirdAdminConnector {
+        ipc_dird_admin::UnixConnector::new(path.to_path_buf())
+    }
+
+    pub fn keyd(path: &Path) -> KeydConnector {
+        ipc_keyd::UnixConnector::new(path.to_path_buf())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub mod connectors {
+    //! Other hosts: the server's uid through tokio `UnixStream::peer_cred`
+    //! (crates/directory-daemon tests support `connector::connect_checked`),
+    //! then the blocking connection.
+    use super::dird::connector::{connect_checked, runtime};
+    use ipc::FrameLimit;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+    use zeroize::Zeroizing;
+
+    pub use super::dird::connector::KeydConnector;
+
+    pub fn keyd(path: &Path) -> KeydConnector {
+        super::dird::connector::keyd(path)
+    }
+
+    pub struct DirdAdminConnector {
+        path: PathBuf,
+        runtime: tokio::runtime::Runtime,
+    }
+
+    pub struct DirdAdminChecked {
+        uid: u32,
+        inner: ipc_dird_admin::UnixConnection,
+    }
+
+    pub fn dird_admin(path: &Path) -> DirdAdminConnector {
+        DirdAdminConnector {
+            path: path.to_path_buf(),
+            runtime: runtime(),
+        }
+    }
+
+    impl ipc_dird_admin::Connector for DirdAdminConnector {
+        type Connection = DirdAdminChecked;
+        fn connect(&mut self) -> Result<DirdAdminChecked, ipc_dird_admin::TransportError> {
+            let (uid, stream) = connect_checked(&self.path, &self.runtime)
+                .ok_or(ipc_dird_admin::TransportError::Connect)?;
+            Ok(DirdAdminChecked {
+                uid,
+                inner: ipc_dird_admin::UnixConnection::from_stream(stream),
+            })
+        }
+    }
+
+    impl ipc_dird_admin::Connection for DirdAdminChecked {
+        fn peer_uid(&self) -> Result<u32, ipc_dird_admin::TransportError> {
+            Ok(self.uid)
+        }
+        fn exchange(
+            &mut self,
+            frame: &[u8],
+            reply_limit: FrameLimit,
+            deadline: Duration,
+        ) -> Result<Zeroizing<Vec<u8>>, ipc_dird_admin::TransportError> {
+            ipc_dird_admin::Connection::exchange(&mut self.inner, frame, reply_limit, deadline)
+        }
+        fn check_idle(&mut self) -> Result<(), ipc_dird_admin::TransportError> {
+            ipc_dird_admin::Connection::check_idle(&mut self.inner)
+        }
+    }
+}
+
+/// admind's client of dird at `socket` (the server must run as `uid`).
+pub fn dird_link(socket: &Path, uid: u32) -> Box<dyn DirdLink> {
+    Box::new(
+        ipc_dird_admin::AdminClient::new(
+            connectors::dird_admin(socket),
+            uid,
+            ipc_dird_admin::DEFAULT_DEADLINE,
+        )
+        .unwrap(),
+    )
+}
+
+/// admind's client of keyd at `socket` (the server must run as `uid`).
+pub fn keyd_link(socket: &Path, uid: u32, deadline: Duration) -> Box<dyn KeydLink> {
+    Box::new(ipc_keyd::KeydClient::new(connectors::keyd(socket), uid, deadline).unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// Fake servers: a silent keyd, a recording dird.
+// ---------------------------------------------------------------------------
+
+/// A "keyd" that accepts connections and reads requests but never answers
+/// (it holds the connections open until dropped).
+pub struct SilentServer {
+    path: PathBuf,
+    stop: Arc<AtomicBool>,
+    held: Arc<Mutex<Vec<UnixStream>>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl SilentServer {
+    pub fn start(path: &Path) -> SilentServer {
+        let _ = std::fs::remove_file(path);
+        let listener = UnixListener::bind(path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let held = Arc::new(Mutex::new(Vec::new()));
+        let thread = {
+            let (stop, held) = (Arc::clone(&stop), Arc::clone(&held));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _)) => held.lock().unwrap().push(stream),
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => return,
+                    }
+                }
+            })
+        };
+        SilentServer {
+            path: path.to_path_buf(),
+            stop,
+            held,
+            thread: Some(thread),
+        }
+    }
+
+    /// Connections accepted so far.
+    pub fn accepted(&self) -> usize {
+        self.held.lock().unwrap().len()
+    }
+}
+
+impl Drop for SilentServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        for stream in self.held.lock().unwrap().drain(..) {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Read one frame from a blocking stream with `limit`.
+fn read_frame(stream: &mut UnixStream, limit: ipc::FrameLimit) -> Option<Vec<u8>> {
+    let mut reader = FrameReader::new(limit);
+    let mut chunk = [0u8; 4096];
+    loop {
+        if let Some(body) = reader.body() {
+            return Some(body.to_vec());
+        }
+        let wanted = reader.wanted().min(chunk.len());
+        if wanted == 0 {
+            return None;
+        }
+        match stream.read(&mut chunk[..wanted]) {
+            Ok(0) => return None,
+            Ok(n) => {
+                reader.push(&chunk[..n]).ok()?;
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    }
+}
+
+/// A "dird" for the forwarding tests: records every request it receives
+/// (decoded with dird's own channel decoder) and answers each operation
+/// with `reply`, `Ping` with `Pong` — except, with `key_targets`,
+/// `BeginPasswordSet`, answered as dird answers it for the user bob (one
+/// `PrincipalLongterm` key set bound to `NT-PRINCIPAL [bob]`, the salt
+/// `EXAMPLE.ORGbob` — docs/47 §9.1; [MS-KILE] 3.1.1.2 as cited there), and
+/// `CompletePasswordSet`, answered `Done`.
+pub struct RecordingDird {
+    path: PathBuf,
+    stop: Arc<AtomicBool>,
+    pub received: Arc<Mutex<Vec<ipc_dird_admin::Request>>>,
+    held: Arc<Mutex<Vec<UnixStream>>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl RecordingDird {
+    pub fn start(path: &Path, reply: ipc_dird_admin::Reply, key_targets: bool) -> RecordingDird {
+        let _ = std::fs::remove_file(path);
+        let listener = UnixListener::bind(path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let held = Arc::new(Mutex::new(Vec::new()));
+        let thread = {
+            let (stop, received, held) =
+                (Arc::clone(&stop), Arc::clone(&received), Arc::clone(&held));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            stream.set_nonblocking(false).unwrap();
+                            held.lock().unwrap().push(stream.try_clone().unwrap());
+                            let (received, reply) = (Arc::clone(&received), reply.clone());
+                            std::thread::spawn(move || {
+                                serve_dird(stream, &received, &reply, key_targets)
+                            });
+                        }
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => return,
+                    }
+                }
+            })
+        };
+        RecordingDird {
+            path: path.to_path_buf(),
+            stop,
+            received,
+            held,
+            thread: Some(thread),
+        }
+    }
+}
+
+/// dird's `BeginPasswordSet` answer for the user bob (test data shaped as
+/// docs/47 §9.1 gives it).
+fn bob_key_targets(target: Guid) -> ipc_dird_admin::Reply {
+    ipc_dird_admin::Reply::PasswordSet(ipc_dird_admin::PasswordSet {
+        kind: ipc_dird_admin::AccountKind::User,
+        keys: vec![ipc_dird_admin::KeyTarget {
+            handle: keyd::KeyHandle::new(
+                keyd::PrincipalId::from_bytes(target.to_packet()),
+                keyd::KeyPurpose::PrincipalLongterm,
+            ),
+            binding: keyd::PrincipalBinding::new(common::realm(), principal("bob")),
+        }],
+        salt: krb_proto::KerberosString::new("EXAMPLE.ORGbob").unwrap(),
+    })
+}
+
+fn serve_dird(
+    mut stream: UnixStream,
+    received: &Mutex<Vec<ipc_dird_admin::Request>>,
+    reply: &ipc_dird_admin::Reply,
+    key_targets: bool,
+) {
+    while let Some(body) = read_frame(&mut stream, ipc_dird_admin::REQUEST_LIMIT) {
+        let Ok(request) = ipc_dird_admin::decode_request(&body) else {
+            return;
+        };
+        let answer = match &request {
+            ipc_dird_admin::Request::Ping => ipc_dird_admin::Reply::Pong,
+            ipc_dird_admin::Request::Operation {
+                operation: Operation::BeginPasswordSet { target },
+                ..
+            } if key_targets => bob_key_targets(*target),
+            ipc_dird_admin::Request::Operation {
+                operation: Operation::CompletePasswordSet { .. },
+                ..
+            } if key_targets => ipc_dird_admin::Reply::Done,
+            _ => reply.clone(),
+        };
+        received.lock().unwrap().push(request);
+        let frame = ipc_dird_admin::encode_reply(&answer).unwrap();
+        if stream.write_all(frame.as_bytes()).is_err() {
+            return;
+        }
+    }
+}
+
+impl Drop for RecordingDird {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        for stream in self.held.lock().unwrap().drain(..) {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// dird and admind on their own threads.
+// ---------------------------------------------------------------------------
+
+/// dird's clock: the kdc fixtures' `now` (the tickets' time base).
+struct FixedNow;
+
+impl Clock for FixedNow {
+    fn now(&self) -> Option<KerberosTime> {
+        Some(common::now())
+    }
+}
+
+/// dird with its admin service on its own thread.
+pub struct DirdRun {
+    control: DirdControl,
+    thread: Option<JoinHandle<Result<(), String>>>,
+}
+
+impl DirdRun {
+    fn start(
+        params: directory_daemon::DaemonParams,
+        admin: AdminParams,
+        store: Arc<Store>,
+    ) -> DirdRun {
+        let control = DirdControl::new();
+        let thread = {
+            let control = control.clone();
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                let result = runtime.block_on(serve_with_admin(
+                    params,
+                    Some(admin),
+                    StoreSource::Opened(store),
+                    policy(),
+                    control,
+                ));
+                drop(runtime);
+                match result {
+                    Ok(stopped) => stopped.join().map_err(|_| String::from("engine panicked")),
+                    Err(error) => Err(error.to_string()),
+                }
+            })
+        };
+        let start = Instant::now();
+        while !control.is_serving() {
+            assert!(!thread.is_finished(), "dird did not start");
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "dird did not start"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        DirdRun {
+            control,
+            thread: Some(thread),
+        }
+    }
+
+    pub fn stop(mut self) -> Result<(), String> {
+        self.control.stop();
+        self.thread.take().unwrap().join().unwrap()
+    }
+}
+
+impl Drop for DirdRun {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            self.control.stop();
+            let _ = thread.join();
+        }
+    }
+}
+
+/// admind on its own thread.
+pub struct AdmindRun {
+    control: DaemonControl,
+    thread: Option<JoinHandle<Result<usize, String>>>,
+}
+
+impl AdmindRun {
+    /// Start `serve` and wait until it listens; a start-up failure is
+    /// returned as its message.
+    pub fn start(params: DaemonParams) -> Result<AdmindRun, String> {
+        let control = DaemonControl::new();
+        let thread = {
+            let control = control.clone();
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                let result = runtime.block_on(serve(params, control));
+                drop(runtime);
+                match result {
+                    Ok(stopped) => {
+                        let unacknowledged = stopped.unacknowledged_audit_events();
+                        let failed = stopped.worker_failed();
+                        stopped
+                            .join()
+                            .map_err(|_| String::from("worker panicked"))?;
+                        if failed {
+                            Err(String::from("worker stopped early"))
+                        } else {
+                            Ok(unacknowledged)
+                        }
+                    }
+                    Err(error) => Err(error.to_string()),
+                }
+            })
+        };
+        let start = Instant::now();
+        while !control.is_serving() {
+            if thread.is_finished() {
+                return Err(thread.join().unwrap().err().unwrap_or_default());
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "admind did not start"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(AdmindRun {
+            control,
+            thread: Some(thread),
+        })
+    }
+
+    /// Stop admind; the audit events it could not deliver (0 after a clean
+    /// stop).
+    pub fn stop(mut self) -> Result<usize, String> {
+        self.control.stop();
+        self.thread.take().unwrap().join().unwrap()
+    }
+}
+
+impl Drop for AdmindRun {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            self.control.stop();
+            let _ = thread.join();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The world.
+// ---------------------------------------------------------------------------
+
+/// How admind's keyd behaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeydMode {
+    /// A real keyd, the test's uid mapped to Role::Directory.
+    Directory,
+    /// A real keyd, the test's uid mapped to Role::Admin: `set_secret` is
+    /// refused at keyd's authorization step.
+    Admin,
+    /// Accepts and never answers.
+    Silent,
+}
+
+/// How admind's dird is played.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirdMode {
+    /// The real dird with its admin service.
+    Real,
+    /// A recording fake answering every operation with this reply (and,
+    /// when `key_targets`, the password-set steps as dird would for bob).
+    Recording {
+        /// The reply to every other operation.
+        reply: ipc_dird_admin::Reply,
+        /// Whether `BeginPasswordSet` gets bob's key targets.
+        key_targets: bool,
+    },
+}
+
+/// What a world is built with.
+#[derive(Debug, Clone)]
+pub struct Options {
+    pub keyd: KeydMode,
+    pub dird: DirdMode,
+    pub limits: Limits,
+    pub min_password_length: u32,
+    pub keyd_deadline: Duration,
+    pub frame_timeout: Duration,
+}
+
+impl Default for Options {
+    fn default() -> Options {
+        Options {
+            keyd: KeydMode::Directory,
+            dird: DirdMode::Real,
+            limits: Limits::DEFAULT,
+            min_password_length: 12,
+            keyd_deadline: Duration::from_secs(2),
+            frame_timeout: Duration::from_secs(2),
+        }
+    }
+}
+
+/// Everything of one test.
+pub struct World {
+    pub dir: TempDir,
+    pub uid: u32,
+    pub store: Option<Arc<Store>>,
+    pub auditd_dir: auditd::TempDir,
+    pub auditd: Option<auditd::Server>,
+    pub dird_auditd: Option<FakeAuditd>,
+    pub keyd_ldap_auditd: Option<FakeAuditd>,
+    pub keyd_dir_auditd: Option<FakeAuditd>,
+    pub keyd_ldap: Option<dird::keyd::Daemon>,
+    pub keyd_dir: Option<dird::keyd::Daemon>,
+    pub silent_keyd: Option<SilentServer>,
+    pub recording: Option<RecordingDird>,
+    pub dird: Option<DirdRun>,
+    pub admind: Option<AdmindRun>,
+    pub admin_socket: PathBuf,
+    pub keyd_dir_socket: PathBuf,
+}
+
+impl World {
+    /// Build the world; `None` when running as root (tier 2 needs a
+    /// non-root uid: uid 0 is never mapped, R50-3).
+    pub fn new(options: Options) -> Option<World> {
+        let dir = TempDir::new();
+        let uid = my_uid(&dir);
+        if skip_as_root(uid) {
+            return None;
+        }
+        // auditd for admind: the real listener and writer, the test's uid
+        // mapped to `admind`.
+        let auditd_dir = auditd::TempDir::new();
+        let settings = auditd::settings_for(&auditd_dir, uid, "admind", 5);
+        let auditd_server = auditd::Server::start(
+            &settings,
+            ListenerConfig::from_settings(&settings),
+            64,
+            true,
+        );
+
+        // The dird side.
+        let mut store = None;
+        let (mut dird_auditd, mut keyd_ldap_auditd, mut keyd_ldap, mut dird_run, mut recording) =
+            (None, None, None, None, None);
+        let dird_socket = dir.join("m.sock");
+        match &options.dird {
+            DirdMode::Real => {
+                let provisioned = provision(&dir.join("s.redb"));
+                let mut keyd_params =
+                    dird::keyd::params(&dir, CallerMap::new(&[(uid, Role::Ldap)]).unwrap(), uid);
+                keyd_params.audit.socket = dir.join("ka.sock");
+                let keyd_socket = keyd_params.keyd_socket.clone();
+                keyd_ldap_auditd = Some(FakeAuditd::start(&keyd_params.audit.socket));
+                let clock = TestClock::at(common::keyd_started());
+                keyd_ldap = Some(
+                    dird::keyd::Daemon::start(keyd_params, clock.clone(), admin_keyd).unwrap(),
+                );
+                clock.set(common::now());
+                let mut params = dird::params(&dir, uid, uid, Duration::from_secs(5), 4);
+                params.clock = SharedClock::new(FixedNow);
+                dird_auditd = Some(FakeAuditd::start(&params.audit.socket));
+                let realm = common::realm();
+                let factory: VerifierFactory = Arc::new(move || {
+                    let client = ipc_keyd::KeydClient::new(
+                        dird::connector::keyd(&keyd_socket),
+                        uid,
+                        ipc_keyd::DEFAULT_DEADLINE,
+                    )
+                    .ok()?;
+                    let verifier: Box<dyn TicketVerifier> =
+                        Box::new(KeydTicketVerifier::new(client, realm.clone()));
+                    Some(verifier)
+                });
+                let admin = AdminParams {
+                    socket: dird_socket.clone(),
+                    admind_uid: uid,
+                    keyd: Some(factory),
+                    ticket_age_max: Duration::from_secs(600),
+                    quorum: 2,
+                    node_id: NODE_ID,
+                    manifest: manifest(),
+                    max_connections: directory_daemon::MAX_ADMIN_CONNECTIONS,
+                    queue_capacity: directory_daemon::ADMIN_QUEUE_CAPACITY,
+                    ack_deadline: DECISION_ACK_DEADLINE,
+                };
+                dird_run = Some(DirdRun::start(params, admin, Arc::clone(&provisioned)));
+                store = Some(provisioned);
+            }
+            DirdMode::Recording { reply, key_targets } => {
+                recording = Some(RecordingDird::start(
+                    &dird_socket,
+                    reply.clone(),
+                    *key_targets,
+                ));
+            }
+        }
+
+        // admind's keyd.
+        let keyd_dir_socket = dir.join("kd.sock");
+        let (mut keyd_dir_auditd, mut keyd_dir, mut silent_keyd) = (None, None, None);
+        match options.keyd {
+            KeydMode::Directory | KeydMode::Admin => {
+                let role = if options.keyd == KeydMode::Directory {
+                    Role::Directory
+                } else {
+                    Role::Admin
+                };
+                let mut keyd_params =
+                    dird::keyd::params(&dir, CallerMap::new(&[(uid, role)]).unwrap(), uid);
+                keyd_params.keyd_socket = keyd_dir_socket.clone();
+                keyd_params.audit.socket = dir.join("kb.sock");
+                keyd_dir_auditd = Some(FakeAuditd::start(&keyd_params.audit.socket));
+                keyd_dir = Some(
+                    dird::keyd::Daemon::start(
+                        keyd_params,
+                        TestClock::at(common::now()),
+                        |started: &KerberosTime| {
+                            Keyd::new(
+                                dird::keyd_config(),
+                                InMemoryKeyStore::new(64),
+                                RecordBuffer::new(),
+                                started,
+                            )
+                        },
+                    )
+                    .unwrap(),
+                );
+            }
+            KeydMode::Silent => silent_keyd = Some(SilentServer::start(&keyd_dir_socket)),
+        }
+
+        // admind.
+        let admin_socket = dir.join("am.sock");
+        let params = DaemonParams {
+            admin_socket: admin_socket.clone(),
+            audit: AuditEndpoint {
+                socket: auditd_dir.socket(),
+                uid,
+            },
+            frame_timeout: options.frame_timeout,
+            min_password_length: options.min_password_length,
+            dird: dird_link(&dird_socket, uid),
+            keyd: keyd_link(&keyd_dir_socket, uid, options.keyd_deadline),
+            limits: options.limits,
+            queue_capacity: WORKER_QUEUE_CAPACITY,
+            audit_window: ipc_audit::WindowConfig::DEFAULT,
+        };
+        let admind = AdmindRun::start(params).unwrap();
+        Some(World {
+            dir,
+            uid,
+            store,
+            auditd_dir,
+            auditd: Some(auditd_server),
+            dird_auditd,
+            keyd_ldap_auditd,
+            keyd_dir_auditd,
+            keyd_ldap,
+            keyd_dir,
+            silent_keyd,
+            recording,
+            dird: dird_run,
+            admind: Some(admind),
+            admin_socket,
+            keyd_dir_socket,
+        })
+    }
+
+    /// A new connection to admind.
+    pub fn connect(&self) -> AdminConn {
+        AdminConn::connect(&self.admin_socket)
+    }
+
+    /// dird's `DirAdmin` events so far.
+    pub fn dir_admin_events(&self) -> Vec<DirAdminEvent> {
+        self.dird_auditd
+            .as_ref()
+            .map(|a| {
+                a.events()
+                    .into_iter()
+                    .filter_map(|e| match e {
+                        EventBody::DirAdmin(event) => Some(*event),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// admind's keyd's records so far.
+    pub fn keyd_records(&self) -> Vec<KeydRecord> {
+        self.keyd_dir_auditd
+            .as_ref()
+            .map(|a| {
+                a.events()
+                    .into_iter()
+                    .filter_map(|e| match e {
+                        EventBody::Keyd(record) => Some(*record),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Stop admind (it flushes its audit window), then auditd, and read
+    /// admind's events back from the verified log.
+    pub fn finish(&mut self) -> Vec<AdmindEvent> {
+        if let Some(admind) = self.admind.take() {
+            assert_eq!(admind.stop(), Ok(0), "admind delivered every event");
+        }
+        if let Some(server) = self.auditd.take() {
+            let _ = server.stop();
+        }
+        let (records, _) = auditd::read_segment(&self.auditd_dir.base(), 1, Anchor::Genesis);
+        records
+            .into_iter()
+            .filter_map(|record| match ipc_audit::decode_event(&record.payload) {
+                Ok(EventBody::Admind(event)) => {
+                    assert_eq!(record.source, audit_log::Source::Admind);
+                    assert_eq!(record.source_uid, self.uid);
+                    Some(*event)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every octet of every file under the world's directories.
+    pub fn all_file_octets(&self) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut files = Vec::new();
+        for root in [self.dir.path(), self.auditd_dir.path()] {
+            collect_files(root, &mut files);
+        }
+        files
+    }
+}
+
+fn collect_files(dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            collect_files(&path, out);
+        } else if kind.is_file() {
+            if let Ok(octets) = std::fs::read(&path) {
+                out.push((path, octets));
+            }
+        }
+    }
+}
+
+impl Drop for World {
+    fn drop(&mut self) {
+        if let Some(admind) = self.admind.take() {
+            let _ = admind.stop();
+        }
+        if let Some(dird) = self.dird.take() {
+            let _ = dird.stop();
+        }
+        if let Some(keyd) = self.keyd_ldap.take() {
+            let _ = keyd.stop();
+        }
+        if let Some(keyd) = self.keyd_dir.take() {
+            let _ = keyd.stop();
+        }
+        if let Some(server) = self.auditd.take() {
+            let _ = server.stop();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A raw client of admin.sock.
+// ---------------------------------------------------------------------------
+
+/// What one exchange got.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Got {
+    /// One of the channel's replies.
+    Reply(ipc_admin::Reply),
+    /// The shared refusal.
+    Refused(Refused),
+    /// admind closed the connection without a reply.
+    Closed,
+    /// No reply within the read timeout.
+    Nothing,
+}
+
+/// A blocking client of admin.sock built from crate ipc-admin's codec.
+pub struct AdminConn {
+    pub stream: UnixStream,
+}
+
+impl AdminConn {
+    pub fn connect(path: &Path) -> AdminConn {
+        let stream = UnixStream::connect(path).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        AdminConn { stream }
+    }
+
+    pub fn send_raw(&mut self, octets: &[u8]) {
+        let _ = self.stream.write_all(octets);
+    }
+
+    pub fn send(&mut self, request: &ipc_admin::Request) {
+        let frame = ipc_admin::encode_request(request).unwrap();
+        self.send_raw(frame.as_bytes());
+    }
+
+    pub fn receive(&mut self) -> Got {
+        let mut reader = FrameReader::new(ipc_admin::REPLY_LIMIT);
+        let mut chunk = [0u8; 4096];
+        loop {
+            if let Some(body) = reader.body() {
+                return match ipc_admin::decode_reply(body).unwrap() {
+                    ipc::Reply::Message(reply) => Got::Reply(reply),
+                    ipc::Reply::Refused(refused) => Got::Refused(refused),
+                };
+            }
+            let wanted = reader.wanted().min(chunk.len());
+            match self.stream.read(&mut chunk[..wanted]) {
+                Ok(0) => return Got::Closed,
+                Ok(n) => {
+                    reader.push(&chunk[..n]).unwrap();
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == ErrorKind::ConnectionReset => return Got::Closed,
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    return Got::Nothing
+                }
+                Err(e) => panic!("read failed: {e}"),
+            }
+        }
+    }
+
+    pub fn call(&mut self, request: &ipc_admin::Request) -> Got {
+        self.send(request);
+        self.receive()
+    }
+}

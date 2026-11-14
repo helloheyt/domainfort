@@ -1,0 +1,94 @@
+# admin-daemon — admind, the management-plane process (docs/51 §5, §7.6,
+# R51-7, R51-12, R51-13, §12 task A9; docs/50 §2.4, §6.4 row admind, §7.5).
+#
+# admind is local-only (`admin.sock`, no network API in phase 1 — A-57),
+# stateless and has no store: it checks each request syntactically,
+# forwards it to dird over `dird-admin.sock` (crate ipc-dird-admin) with the
+# administrators' AP-REQs untouched, and for `SetPassword` runs dird's
+# `BeginPasswordSet` ⇒ keyd `set_secret` (Role::Directory, ×1 / ×2) ⇒
+# dird's `CompletePasswordSet` itself, so the password never reaches dird.
+# Its own audit events go to auditd (crate ipc-audit, shape `Admind`).
+#
+# admind must never link dirstore / redb / directory-pip / directory-admin,
+# keyd or krb-crypto (D182, A-73: D182 binds the DC's processes, admind
+# among them; docs/51 §5.1: no store) — checked by
+# tests/no_store_or_crypto.rs. Its tests do run a real keyd and dird.
+#
+# Provenance: written only from docs/51 (whole), docs/50 (§2.4, §3, §6.4,
+# §7, §8, §9, the channel-magic registry), docs/47 §9, docs/10 §2, §6, §10,
+# [MS-SAMR] v20260427 3.1.1.7.2 (pinned, SHA-256 verified), the decisions in
+# docs/questions/PENDING-OWNER.md and the public API of this workspace's
+# crates, and the docs.rs API pages of tokio 1.54.1 and rustix 1.1.6 as
+# already cited in the daemons this crate follows (P-2). No other
+# implementation, management daemon or password service was consulted or
+# recalled (AGENTS.md §1-3).
+
+[package]
+name = "admin-daemon"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "admin_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "admin-daemon"
+path = "src/main.rs"
+
+[dependencies]
+# tokio — owner decision P-12; the features of docs/50 §10 P0 only (no
+# `macros`, no `full`): the current-thread runtime, the Unix listener and
+# streams with their peer credentials, timeouts, `oneshot` / `Notify`,
+# the async read / write helpers.
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "net", "time", "sync", "io-util"] }
+# RustCrypto `zeroize` (OD-9; already in the lock): frame buffers.
+zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
+# Our own workspace crates (path dependencies).
+ipc = { path = "../ipc" }
+# admin.sock's codec (this task).
+ipc-admin = { path = "../ipc-admin" }
+# dird's admin channel: admind's client of dird (dird's uid checked first).
+ipc-dird-admin = { path = "../ipc-dird-admin" }
+# keyd's channel: admind's client of keyd (Role::Directory; keyd's uid
+# checked first; `call_with_fate`, A-90). Links no keyd and no crypto.
+ipc-keyd = { path = "../ipc-keyd" }
+# The audit channel and the `Admind` event shape; no conversion feature
+# (A-66: admind's events have no source crate).
+ipc-audit = { path = "../ipc-audit", default-features = false }
+# keyd's crypto-free types (`KeyPurpose`, `Error`, the time scale).
+keyd-types = { path = "../keyd-types" }
+# `KerberosTime` (the clock), `KRB_NT_PRINCIPAL`.
+krb-proto = { path = "../krb-proto" }
+# `Guid`.
+dtyp = { path = "../dtyp" }
+# admind's configuration file.
+config = { path = "../config" }
+# The hardening plan (identity drop, no_new_privs, capabilities, core 0,
+# not dumpable, umask, mlockall).
+daemon-sandbox = { path = "../daemon-sandbox" }
+
+[dev-dependencies]
+# Tier 2 runs the real daemons in-process: auditd (admind's events,
+# verified from the log), two keyd daemons (Role::Ldap for dird's ticket
+# verification, Role::Directory for admind's `set_secret`) and dird with its
+# admin service; the tests seal AP-REQs under a known admin-service key.
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "rt-multi-thread", "net", "time", "sync", "io-util"] }
+audit-daemon = { path = "../audit-daemon" }
+audit-log = { path = "../audit-log" }
+keyd-daemon = { path = "../keyd-daemon" }
+keyd = { path = "../keyd" }
+krb-crypto = { path = "../krb-crypto" }
+directory-daemon = { path = "../directory-daemon" }
+directory-admin = { path = "../directory-admin" }
+directory-pip = { path = "../directory-pip" }
+dirstore = { path = "../dirstore" }
+ad-schema = { path = "../ad-schema" }
+pdp = { path = "../pdp" }
+kdc = { path = "../kdc" }
+provision-manifest = { path = "../provision-manifest" }
+ipc-directory = { path = "../ipc-directory" }
+
+[lints]
+workspace = true

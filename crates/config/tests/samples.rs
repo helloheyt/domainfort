@@ -291,6 +291,7 @@ fn admind_sample_parses() {
     assert_eq!(s.admin_socket().as_str(), "/run/admind/admin.sock");
     assert_eq!(s.admin_socket_group(), 810);
     assert_eq!(s.keyadm_uid(), 807);
+    assert_eq!(s.min_password_length(), 14);
     assert_eq!(
         s.dird().socket().as_str(),
         "/run/dird/admin/dird-admin.sock"
@@ -309,6 +310,8 @@ fn admind_minimal_sample_takes_defaults() {
     let s = AdmindSettings::parse(common::ADMIND_MINIMAL.as_bytes()).expect("valid");
     assert_eq!(s.frame_timeout(), secs(5));
     assert_eq!(s.keyd_deadline(), secs(2));
+    // Required, so the minimal sample carries it: the floor (A-79, P-24).
+    assert_eq!(s.min_password_length(), 12);
 }
 
 /// Every key of every closed table appears in that daemon's full sample, so
