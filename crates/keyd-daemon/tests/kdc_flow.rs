@@ -187,6 +187,12 @@ fn fixture_keyd(
         (ALICE, alice_name(), ALICE_PASSWORD, ALICE_SALT),
         (BOB, bob_name(), BOB_PASSWORD, BOB_SALT),
     ] {
+        grant_user(
+            &mut keyd,
+            &handle,
+            &PrincipalBinding::new(realm(), who.clone()),
+            &now(),
+        );
         keyd.set_secret(
             &DIRECTORY,
             &handle,

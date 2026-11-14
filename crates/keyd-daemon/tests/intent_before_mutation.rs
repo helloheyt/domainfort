@@ -43,11 +43,15 @@ use ipc_audit::{
     AUDIT_CHANNEL,
 };
 use ipc_keyd::{Answer, Call, Password};
-use keyd::{CallerId, Error, KeyHandle, KeyPurpose, Kvno, PrincipalBinding, PrincipalId, Role};
+use keyd::{
+    AccountKind, CallerId, Error, KeyHandle, KeyPurpose, Kvno, PrincipalBinding, PrincipalId, Role,
+    SetSecretTarget, MAX_INITIAL_SECRET_GRANT_SECS, MAX_SET_SECRET_GRANT_SECS,
+};
 use keyd_daemon::audit::MAX_RECORDS_PER_OPERATION;
 use keyd_daemon::startup::development_keyd;
 use keyd_daemon::{
-    CallerMap, IntentAckBudget, SystemClock, INTENT_ACK_BUDGET, MAX_INTENT_ACK_BUDGET,
+    CallerMap, ExtraListener, IntentAckBudget, SystemClock, INTENT_ACK_BUDGET,
+    MAX_INTENT_ACK_BUDGET,
 };
 use krb_proto::{KerberosString, KerberosTime, PrincipalName, Realm};
 use std::fs::File;
@@ -98,6 +102,26 @@ fn set_secret(octet: u8) -> Call {
     }
 }
 
+/// The grant dird registers for [`set_secret`]'s key set (task A15a: keyd
+/// refuses Directory's `set_secret` without one), sent by the test's uid as
+/// Role::Ldap on keyd's grant socket ([`grant_socket`]).
+fn grant(octet: u8) -> Call {
+    Call::GrantSetSecret {
+        kind: AccountKind::User,
+        targets: vec![SetSecretTarget {
+            handle: handle(octet),
+            binding: binding("bob"),
+        }],
+        lifetime_secs: MAX_SET_SECRET_GRANT_SECS,
+    }
+}
+
+/// keyd's second socket in these tests, where the test's uid is Role::Ldap
+/// (keyd-daemon `ExtraListener`, tests only — docs/questions/Q-453).
+fn grant_socket(dir: &TempDir) -> PathBuf {
+    dir.join("g.sock")
+}
+
 /// The real auditd (listener + writer) in `dir` at `a.sock`, writing the log
 /// based at `log`, mapping `uid` to keyd. With `acknowledging == false` the
 /// writer never runs: auditd answers `Ping` but never acknowledges an
@@ -128,10 +152,50 @@ fn generous() -> IntentAckBudget {
 /// keyd with the development store on the system clock (Admin and Directory
 /// calls are not held, docs/10 §11), the test's uid holding `role`, with the
 /// intent budget `budget`.
+///
+/// A second socket of the same keyd maps the test's uid to Role::Ldap, for
+/// the grants a Directory `set_secret` needs (task A15a; [`grant_socket`]).
 fn start_keyd(dir: &TempDir, uid: u32, role: Role, budget: IntentAckBudget) -> Daemon {
     let mut params = params(dir, CallerMap::new(&[(uid, role)]).unwrap(), uid);
     params.intent_ack_budget = budget;
+    params.extra_listeners = vec![ExtraListener {
+        socket: grant_socket(dir),
+        callers: CallerMap::new(&[(uid, Role::Ldap)]).unwrap(),
+    }];
     Daemon::start(params, SystemClock, development_keyd(realm())).unwrap()
+}
+
+/// As [`start_keyd`] (Role::Directory), with a grant for
+/// [`set_secret`]'s key set already in keyd when it starts — registered
+/// there by the keyadm role at keyd's start time (an initial secret, 15
+/// minutes: this test's auditd never acknowledges a grant's intent), its
+/// record drained before the engine runs, so the log holds only the
+/// `set_secret` phases. Test setup only (task A15a).
+fn start_keyd_granted(dir: &TempDir, uid: u32, budget: IntentAckBudget) -> Daemon {
+    let mut params = params(dir, CallerMap::new(&[(uid, Role::Directory)]).unwrap(), uid);
+    params.intent_ack_budget = budget;
+    let build = development_keyd(realm());
+    Daemon::start(params, SystemClock, move |started: &KerberosTime| {
+        let mut keyd = build(started)?;
+        let keyadm = CallerId {
+            uid: uid.wrapping_add(1),
+            role: Role::Admin,
+        };
+        keyd.grant_set_secret(
+            &keyadm,
+            AccountKind::User,
+            &[SetSecretTarget {
+                handle: handle(0xB0),
+                binding: binding("bob"),
+            }],
+            MAX_INITIAL_SECRET_GRANT_SECS,
+            started,
+        )
+        .expect("the grant is registered");
+        let _ = keyd.audit_sink_mut().take();
+        Ok(keyd)
+    })
+    .unwrap()
 }
 
 /// The open segment files of the log based at `base`.
@@ -371,7 +435,11 @@ fn every_admin_change_is_intent_then_outcome_in_the_verified_log() {
 /// The same for the Directory's `set_secret` (docs/10 §6): kvno 1, then
 /// kvno 2, each preceded by its acknowledged intent in the verified log
 /// (and, on a loaded machine, by any attempt refused for a late
-/// acknowledgement — its intent and `NotPerformed`; Q-415).
+/// acknowledgement — its intent and `NotPerformed`; Q-415). Since task A15a
+/// each `set_secret` follows the grant dird would register (Role::Ldap on
+/// the same keyd): a loosening, so its intent too is acknowledged first and
+/// the log holds grant intent, grant outcome, then the `set_secret` pair
+/// (docs/questions/Q-452).
 #[test]
 fn set_secret_is_intent_then_outcome_in_the_verified_log() {
     let dir = TempDir::new();
@@ -383,6 +451,18 @@ fn set_secret_is_intent_then_outcome_in_the_verified_log() {
     let keyd = start_keyd(&dir, uid, Role::Directory, generous());
     let mut expected = Vec::new();
     for kvno in [1, 2] {
+        let (answer, unacknowledged) = call_until_performed(&grant_socket(&dir), &grant(0xB0));
+        assert!(
+            matches!(&answer, Ok(Answer::GrantSetSecret(Ok(())))),
+            "{answer:?}"
+        );
+        expected.extend(change_phases(
+            Op::GrantSetSecret,
+            unacknowledged,
+            None,
+            Out::Success,
+            None,
+        ));
         let (answer, unacknowledged) = call_until_performed(&keyd.socket, &set_secret(0xB0));
         assert!(
             matches!(&answer, Ok(Answer::SetSecret(Ok(set))) if *set == Kvno::new(kvno)),
@@ -420,7 +500,14 @@ fn unacknowledged_intent_changes_nothing(role: Role, call: &Call, op: KeydOperat
         return;
     }
     let stuck = start_auditd(&dir, uid, "stuck.log", false);
-    let keyd = start_keyd(&dir, uid, role, IntentAckBudget::PRODUCTION);
+    // A set_secret passes keyd's authorization step only with its grant
+    // (task A15a) — already in keyd here, since this auditd acknowledges no
+    // grant intent either.
+    let keyd = if op == Op::SetSecret {
+        start_keyd_granted(&dir, uid, IntentAckBudget::PRODUCTION)
+    } else {
+        start_keyd(&dir, uid, role, IntentAckBudget::PRODUCTION)
+    };
     let started = Instant::now();
     assert_eq!(
         RawClient::connect(&keyd.socket).call(call),

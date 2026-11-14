@@ -37,6 +37,7 @@
 //! | `0x0E` | `destroy_key_set` | Admin | `0x8E` `()` | `0xF3` |
 //! | `0x0F` | `describe_config` | Kdc, Ldap | `0x8F` `ConfigDescription` ‖ caller `Role` ([`DescribedConfig`]) | `0xF3` |
 //! | `0x10` | `ping` | every role | `0x90` `()` | `0xF3` |
+//! | `0x11` | `grant_set_secret` (task A15a) | Ldap, Admin | `0x91` `()` | `0xF3` |
 //! | — | (any) | — | `0xFF` shared `Refused` (A-59) | — |
 //!
 //! No request carries a role: keyd checks the caller's role from the
@@ -69,7 +70,9 @@
 //! (AGENTS.md §1-3). Task F3 added the caller role of the `describe_config`
 //! reply and the client's request fate from docs/questions Q-351, Q-365,
 //! Q-367 and PENDING-OWNER A-87, A-88, with docs/10 §2, §7א, §9, §10 and
-//! docs/50 §3.4-§3.7.
+//! docs/50 §3.4-§3.7. Task A15a added `grant_set_secret` (request `0x11`,
+//! reply `0x91`; the additive client method `KeydClient::grant_set_secret`)
+//! from docs/51 §5.8, docs/questions Q-291 and PENDING-OWNER A-74, A-88.
 //!
 //! Spec: docs/50 §3, §10 (P5); R50-3, R50-4, R50-5, R50-7, R50-8; docs/10;
 //! A-56; A-59; A-62; D182; A-63; A-87; A-88.
@@ -92,3 +95,6 @@ pub use typed::{Answer, Call, ConversionError, DescribedConfig, Password, TgsFas
 #[cfg(unix)]
 pub use unix::{UnixConnection, UnixConnector};
 pub use wire::{KeydReply, KeydRequest, WireTime};
+// The arguments of `grant_set_secret`, re-exported for its callers (dird,
+// keyadm) beside the client method (task A15a).
+pub use keyd_types::{AccountKind, SetSecretTarget};

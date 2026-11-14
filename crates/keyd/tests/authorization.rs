@@ -9,8 +9,9 @@ mod common;
 use common::*;
 use keyd::authz::{purpose_permitted, role_permits, HandleSlot, CAPABILITY_TABLE};
 use keyd::{
-    ArmorId, AuditOutcome, AuditReason, AuthnProof, CallerId, CtxId, DualControlToken, ExchangeId,
-    FastConversation, KeyHandle, KeyPurpose, Kvno, Operation, PrincipalId, Role,
+    AccountKind, ArmorId, AuditOutcome, AuditReason, AuthnProof, CallerId, CtxId, DualControlToken,
+    ExchangeId, FastConversation, KeyHandle, KeyPurpose, Kvno, Operation, PrincipalId, Role,
+    SetSecretTarget,
 };
 use krb_proto::constants::FX_FAST_ARMOR_AP_REQUEST;
 use krb_proto::{
@@ -169,6 +170,20 @@ fn invoke(f: &mut Fixture, op: Operation, caller: &CallerId, handle: &KeyHandle)
         // No handle (docs/50 §3.4): `handle` is unused.
         Operation::DescribeConfig => f.keyd.describe_config(caller, &n).is_ok(),
         Operation::Ping => f.keyd.ping(caller, &n).is_ok(),
+        // Task A15a: one key target in the Primary slot.
+        Operation::GrantSetSecret => f
+            .keyd
+            .grant_set_secret(
+                caller,
+                AccountKind::User,
+                &[SetSecretTarget {
+                    handle: *handle,
+                    binding: binding_for(handle),
+                }],
+                keyd::MAX_SET_SECRET_GRANT_SECS,
+                &n,
+            )
+            .is_ok(),
     }
 }
 
@@ -180,7 +195,7 @@ fn valid_handle(op: Operation) -> KeyHandle {
         Operation::OpenFastArmor | Operation::SealFastError => KRBTGT,
         Operation::IssueTgsRep | Operation::RotateKey | Operation::RetireKvno => SERVICE,
         Operation::DestroyKeySet | Operation::OpenAndVerifyServiceTicket => SERVICE,
-        Operation::SetSecret | Operation::VerifySecret => ALICE,
+        Operation::SetSecret | Operation::VerifySecret | Operation::GrantSetSecret => ALICE,
         // No handle (docs/50 §3.4); unused.
         Operation::DescribeConfig | Operation::Ping => ALICE,
         Operation::CreateKey => {
@@ -310,7 +325,9 @@ fn issue_as_rep_krbtgt_slot_purpose() {
 /// Source: docs/10 §2, §7 ("no read operation for a key — in any role");
 /// docs/48 §2.3, §9.1 I2; docs/questions/Q-115 (A-35: destroy_key_set is
 /// an Admin operation); docs/questions/Q-165 item 3 (A-46: Role::Ldap);
-/// docs/50 §3.4 (`DescribeConfig`: Kdc, Ldap; `Ping`: every mapped role).
+/// docs/50 §3.4 (`DescribeConfig`: Kdc, Ldap; `Ping`: every mapped role);
+/// docs/51 §5.8 option (b), docs/questions/Q-450 (`GrantSetSecret`: Admin,
+/// Ldap — task A15a).
 #[test]
 fn capability_table_matches_design() {
     use Operation::*;
@@ -337,12 +354,18 @@ fn capability_table_matches_design() {
                 RotateKrbtgt,
                 RetireKvno,
                 DestroyKeySet,
+                GrantSetSecret,
                 Ping,
             ],
         ),
         (
             Role::Ldap,
-            &[OpenAndVerifyServiceTicket, DescribeConfig, Ping],
+            &[
+                OpenAndVerifyServiceTicket,
+                GrantSetSecret,
+                DescribeConfig,
+                Ping,
+            ],
         ),
     ];
     assert_eq!(CAPABILITY_TABLE.len(), expected.len());

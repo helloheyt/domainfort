@@ -20,16 +20,22 @@
 //!    bootstrap group, its password set, enabled. Its key set is set later
 //!    through keyd's `set_secret` (Role::Directory). **Never part of
 //!    provision.**
-//! 3. **auditd → keyd (Admin) → `keyadm ceremony`** (library, over keyd's
-//!    socket) → **keyd (Directory) → `provision first-admin-secret`**
-//!    (library, password files, the privilege drop recorded) and the
-//!    workstation's `set_secret` → **keyd (Kdc) → dird (with its admin
+//! 3. **auditd → keyd (`Provisioning`: Admin on its socket) → `keyadm
+//!    ceremony`** (library, over keyd's socket: the key sets and the first
+//!    administrators' initial-secret grants, task A15a) → **`provision
+//!    first-admin-secret`** (library, password files, the privilege drop
+//!    recorded) against the **same** keyd under Directory on a second socket
+//!    (the grants live in that keyd's memory), and the workstation's
+//!    `set_secret` there too, after the test registers its grant as dird
+//!    would (Ldap, a third socket) → **keyd (Kdc) → dird (with its admin
 //!    service) → kdc → ldap-front → admind**.
 //! 4. Then the phases of the run alternate keyd's role ([`KeydPhase`]):
 //!    `Kerberos` (the kdc's AS / TGS) and `Admin` (dird verifies AP-REQs
-//!    under Ldap while admind's `set_secret` goes to a second keyd under
-//!    Directory). How the keys survive: module [`custody`]
-//!    (docs/questions/Q-430).
+//!    and registers the set_secret grants under Ldap on keyd's socket while
+//!    admind's `set_secret` goes to the same keyd under Directory on a
+//!    second socket — keyd-daemon `ExtraListener`, tests only,
+//!    docs/questions/Q-453). How the keys survive keyd's restarts between
+//!    phases: module [`custody`] (docs/questions/Q-430).
 //!
 //! # Identity: one test uid (A-82)
 //!
@@ -94,7 +100,7 @@ use dtyp::Guid;
 use ipc_audit::{decode_event, EventBody, WindowConfig};
 use ipc_keyd::{Answer, Call, KeydClient};
 use keyd::{Keyd, KeydConfig, Role};
-use keyd_daemon::{CallerMap, RecordBuffer};
+use keyd_daemon::{CallerMap, ExtraListener, RecordBuffer};
 use keyd_types::Kvno;
 use krb_proto::constants::KRB_NT_PRINCIPAL;
 use krb_proto::{AsRep, KerberosTime, PrincipalName, Realm};
@@ -147,12 +153,16 @@ pub const WORKSTATION_PASSWORD: &str = "Workstation-Fixture-Secret-W9";
 pub const NEW_USER_PASSWORD: &str = "Unclassified-User-Phrase-D4";
 /// A password sent in a `SetPassword` that is refused (auditd down).
 pub const REFUSED_PASSWORD: &str = "Another-Phrase-77";
-pub const PASSWORDS: [&str; 5] = [
+/// A password a rogue Directory client sends straight to keyd with no
+/// `BeginPasswordSet` before it — refused for want of a grant (task A15a).
+pub const ROGUE_PASSWORD: &str = "Ungranted-Rogue-Phrase-R5";
+pub const PASSWORDS: [&str; 6] = [
     ALICE_PASSWORD,
     BOB_PASSWORD,
     WORKSTATION_PASSWORD,
     NEW_USER_PASSWORD,
     REFUSED_PASSWORD,
+    ROGUE_PASSWORD,
 ];
 
 /// When `provision domain` ran (the day of the kdc fixtures' `now`).
@@ -350,19 +360,24 @@ pub fn serial() -> std::sync::MutexGuard<'static, ()> {
 // keyd lifetimes.
 // ---------------------------------------------------------------------------
 
-/// keyd's role in a phase of the run (module documentation; docs/10 §2,
-/// the capability table).
+/// keyd's roles in a phase of the run (module documentation; docs/10 §2,
+/// the capability table). One keyd per phase; its first socket is the
+/// produced `keyd_socket`, the others are test-only sockets of the same
+/// keyd (keyd-daemon `ExtraListener`, docs/questions/Q-453).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeydPhase {
-    /// The test uid is Admin: `keyadm ceremony` (`create_key`).
-    Ceremony,
-    /// The test uid is Directory: `provision first-admin-secret` and the
-    /// workstation's `set_secret`.
-    Secrets,
+    /// The test uid is Admin on keyd's socket (`keyadm ceremony`:
+    /// `create_key`, the first administrators' grants), Directory on the
+    /// second socket (`provision first-admin-secret`, the workstation's
+    /// `set_secret`) and Ldap on the third (the workstation's grant, as
+    /// dird would register it — task A15a).
+    Provisioning,
     /// The test uid is Kdc: the kdc's AS and TGS exchanges.
     Kerberos,
-    /// The test uid is Ldap on the main keyd (dird verifies AP-REQs) and
-    /// Directory on admind's keyd (admind's `set_secret`).
+    /// The test uid is Ldap on keyd's socket (dird verifies AP-REQs and
+    /// registers the set_secret grants) and Directory on the second socket
+    /// (admind's `set_secret`) — one keyd, so dird's grant is where
+    /// admind's `set_secret` is checked (task A15a).
     Admin,
 }
 
@@ -370,7 +385,7 @@ pub enum KeydPhase {
 pub struct KeydRun {
     pub daemon: keyd_support::Daemon,
     pub clock: TestClock,
-    pub role: Role,
+    pub phase: KeydPhase,
 }
 
 // ---------------------------------------------------------------------------
@@ -646,7 +661,10 @@ impl Terminal for NoTerminal {
 /// keyd for `first-admin-secret`: the socket admind's file names (checked
 /// to be the produced keyd socket), keyd running as the test uid.
 pub struct TestKeyd {
+    /// The socket connected to (keyd's Directory socket of the phase).
     pub socket: PathBuf,
+    /// The keyd socket admind's produced file names (asserted).
+    pub produced: PathBuf,
     pub uid: u32,
 }
 
@@ -657,7 +675,7 @@ impl KeydAccess for TestKeyd {
         &mut self,
         settings: &AdmindSettings,
     ) -> Result<KeydClient<connector::KeydConnector>, ipc_keyd::ClientConfigError> {
-        assert_eq!(settings.keyd().socket().as_path(), self.socket);
+        assert_eq!(settings.keyd().socket().as_path(), self.produced);
         assert!(settings.keyd_deadline() <= KEY_STATE_DEADLINE);
         KeydClient::new(connector::keyd(&self.socket), self.uid, KEY_STATE_DEADLINE)
     }
@@ -806,9 +824,14 @@ pub struct World {
     /// The manifest as installed (read back through provision's root-file
     /// reader, owner = the test uid).
     pub manifest: Manifest,
-    /// admind's keyd during admin phases (the second keyd of the single-uid
-    /// role split; not a provisioned path — docs/questions/Q-430).
+    /// keyd's second socket — the test uid as Directory (admind's
+    /// `set_secret`, first-admin-secret, the workstation's `set_secret`);
+    /// not a provisioned path (docs/questions/Q-430, Q-453).
     pub aux_keyd_socket: PathBuf,
+    /// keyd's third socket in the provisioning phase — the test uid as
+    /// Ldap, to register the workstation's grant as dird would (task A15a);
+    /// not a provisioned path.
+    pub grant_keyd_socket: PathBuf,
     pub workstation: Workstation,
     pub tls: TestPki,
     /// The world time (module documentation, "Time").
@@ -817,9 +840,7 @@ pub struct World {
     pub clock: SimClock,
     /// The key sets between keyd lifetimes (module `custody`).
     pub custody: Custody,
-    aux_custody: Option<Custody>,
     pub keyd: Option<KeydRun>,
-    pub aux_keyd: Option<KeydRun>,
     pub auditd: Option<auditd_support::Server>,
     pub dird: Option<DirdRun>,
     pub kdcd: Option<Kdcd>,
@@ -862,6 +883,7 @@ impl World {
         // Each socket in its own directory (docs/50 §3.1), 0700 here: the
         // daemons' privileged set-up would create them as root.
         let aux_keyd_socket = dir.join("r/x/k.sock");
+        let grant_keyd_socket = dir.join("r/y/k.sock");
         for socket in [
             input.paths.keyd_socket.as_path(),
             input.paths.dird_kdc_socket.as_path(),
@@ -870,6 +892,7 @@ impl World {
             input.paths.audit_socket.as_path(),
             input.paths.admin_socket.as_path(),
             aux_keyd_socket.as_path(),
+            grant_keyd_socket.as_path(),
         ] {
             std::fs::DirBuilder::new()
                 .recursive(true)
@@ -886,15 +909,14 @@ impl World {
             plan,
             manifest,
             aux_keyd_socket,
+            grant_keyd_socket,
             workstation,
             tls: test_pki(),
             now,
             offset: 0,
             clock: SimClock::at(now),
             custody: Custody::new(),
-            aux_custody: None,
             keyd: None,
-            aux_keyd: None,
             auditd: None,
             dird: None,
             kdcd: None,
@@ -917,7 +939,7 @@ impl World {
         self.offset += secs;
         self.now = common::at(self.offset);
         self.clock.set(self.now);
-        for run in [&self.keyd, &self.aux_keyd].into_iter().flatten() {
+        if let Some(run) = &self.keyd {
             run.clock.set(self.now);
         }
     }
@@ -966,24 +988,47 @@ impl World {
 
     // ---- keyd -------------------------------------------------------------
 
-    /// keyd's parameters from the produced keyd file, on `socket`, the test
-    /// uid mapped to `role`.
-    fn keyd_params(&self, socket: &Path, role: Role) -> keyd_daemon::DaemonParams {
+    /// keyd's parameters from the produced keyd file, on the produced
+    /// socket with the test uid mapped to `role`, plus `extra` sockets of the
+    /// same keyd with the test uid mapped to their roles (tests only,
+    /// docs/questions/Q-453).
+    fn keyd_params(&self, role: Role, extra: &[(PathBuf, Role)]) -> keyd_daemon::DaemonParams {
         let settings = KeydSettings::parse(&self.read(&self.input.paths.keyd_config)).unwrap();
         assert_eq!(settings.realm(), REALM);
         let mut params = keyd_daemon::DaemonParams::from_settings(&settings).unwrap();
         assert_eq!(params.keyd_socket, self.input.paths.keyd_socket.as_path());
-        params.keyd_socket = socket.to_path_buf();
+        assert!(params.extra_listeners.is_empty(), "never from the file");
         params.callers = CallerMap::new(&[(self.uid, role)]).unwrap();
+        params.extra_listeners = extra
+            .iter()
+            .map(|(socket, role)| ExtraListener {
+                socket: socket.clone(),
+                callers: CallerMap::new(&[(self.uid, *role)]).unwrap(),
+            })
+            .collect();
         params.audit.uid = self.uid;
         params.intent_ack_budget = intent_ack_budget();
         params
     }
 
-    /// One keyd lifetime on `custody`'s key sets.
-    fn start_keyd_on(&self, socket: &Path, role: Role, custody: &Custody) -> KeydRun {
-        let params = self.keyd_params(socket, role);
-        let store = custody.lend();
+    /// One keyd lifetime for `phase` on the custody's key sets.
+    fn start_keyd(&self, phase: KeydPhase) -> KeydRun {
+        let (role, extra) = match phase {
+            KeydPhase::Provisioning => (
+                Role::Admin,
+                vec![
+                    (self.aux_keyd_socket.clone(), Role::Directory),
+                    (self.grant_keyd_socket.clone(), Role::Ldap),
+                ],
+            ),
+            KeydPhase::Kerberos => (Role::Kdc, Vec::new()),
+            KeydPhase::Admin => (
+                Role::Ldap,
+                vec![(self.aux_keyd_socket.clone(), Role::Directory)],
+            ),
+        };
+        let params = self.keyd_params(role, &extra);
+        let store = self.custody.lend();
         let clock = TestClock::at(common::keyd_started());
         let daemon = keyd_support::Daemon::start(params, clock.clone(), move |started| {
             Keyd::new(
@@ -998,16 +1043,12 @@ impl World {
         KeydRun {
             daemon,
             clock,
-            role,
+            phase,
         }
     }
 
-    /// Stop every keyd and bring their key sets home (admind's keyd's into
-    /// the main custody).
+    /// Stop keyd and bring its key sets home.
     pub fn stop_keyds(&mut self) {
-        if let Some(run) = self.aux_keyd.take() {
-            run.daemon.stop().expect("admind's keyd stopped cleanly");
-        }
         if let Some(run) = self.keyd.take() {
             run.daemon.stop().expect("keyd stopped cleanly");
         }
@@ -1015,37 +1056,26 @@ impl World {
             eventually(LONG, || self.custody.is_home()),
             "keyd handed its key sets back"
         );
-        if let Some(aux) = self.aux_custody.take() {
-            assert!(eventually(LONG, || aux.is_home()));
-            self.custody.merge_from(&aux);
-        }
     }
 
-    /// Restart keyd for `phase` (module documentation).
+    /// Restart keyd for `phase` (module documentation) — unless it already
+    /// runs in the provisioning phase (the provisioning keyd serves the ceremony, the
+    /// first administrators' secrets and the workstation's in one lifetime:
+    /// their grants live in its memory).
     pub fn keyd_phase(&mut self, phase: KeydPhase) {
-        self.stop_keyds();
-        let main = self.input.paths.keyd_socket.as_path().to_path_buf();
-        let role = match phase {
-            KeydPhase::Ceremony => Role::Admin,
-            KeydPhase::Secrets => Role::Directory,
-            KeydPhase::Kerberos => Role::Kdc,
-            KeydPhase::Admin => Role::Ldap,
-        };
-        let custody = self.custody.clone();
-        self.keyd = Some(self.start_keyd_on(&main, role, &custody));
-        if phase == KeydPhase::Admin {
-            let aux = Custody::new();
-            let socket = self.aux_keyd_socket.clone();
-            self.aux_keyd = Some(self.start_keyd_on(&socket, Role::Directory, &aux));
-            self.aux_custody = Some(aux);
+        if phase == KeydPhase::Provisioning && self.keyd.as_ref().map(|k| k.phase) == Some(phase) {
+            return;
         }
+        self.stop_keyds();
+        self.keyd = Some(self.start_keyd(phase));
     }
 
     /// `keyadm ceremony` (library, over keyd's socket, Role::Admin):
     /// `create_key` for krbtgt and the two service objects of the manifest
-    /// (docs/51 §4.3 step 11). keyadm's file names keyd's socket.
+    /// (docs/51 §4.3 step 11), then the first administrators' initial-secret
+    /// grants (task A15a). keyadm's file names keyd's socket.
     pub fn ceremony(&mut self) -> keyadm::ceremony::CeremonyReport {
-        self.keyd_phase(KeydPhase::Ceremony);
+        self.keyd_phase(KeydPhase::Provisioning);
         let settings = KeyadmSettings::parse(&self.read(&self.input.paths.keyadm_config)).unwrap();
         assert_eq!(
             settings.keyd().socket().as_path(),
@@ -1075,13 +1105,14 @@ impl World {
             .collect()
     }
 
-    /// `provision first-admin-secret` (library, Role::Directory): admind's
-    /// file and the manifest read through its root-file reader (owner = the
-    /// test uid), the password files, the drop recorded; then the files are
-    /// removed (the operator's step). Returns the report and the recorded
-    /// drop.
+    /// `provision first-admin-secret` (library, Role::Directory on the
+    /// provisioning keyd's second socket — the keyd that holds the
+    /// ceremony's grants): admind's file and the manifest read through its
+    /// root-file reader (owner = the test uid), the password files, the drop
+    /// recorded; then the files are removed (the operator's step). Returns
+    /// the report and the recorded drop.
     pub fn first_admin_secret(&mut self) -> (first_admin::report::SecretReport, Vec<(u32, u32)>) {
-        self.keyd_phase(KeydPhase::Secrets);
+        self.keyd_phase(KeydPhase::Provisioning);
         let request = FirstAdminSecret {
             manifest: self.input.paths.manifest.clone(),
             admind_config: self.input.paths.admind_config.clone(),
@@ -1089,7 +1120,8 @@ impl World {
         };
         let mut drop = RecordedDrop::default();
         let mut keyd = TestKeyd {
-            socket: self.input.paths.keyd_socket.as_path().to_path_buf(),
+            socket: self.aux_keyd_socket.clone(),
+            produced: self.input.paths.keyd_socket.as_path().to_path_buf(),
             uid: self.uid,
         };
         let mut env = Environment {
@@ -1109,10 +1141,28 @@ impl World {
 
     /// The test-only workstation's key sets through keyd `set_secret`
     /// (Role::Directory; docs/47 §9.2 step 3), the targets and salt its
-    /// `BeginPasswordSet` named.
+    /// `BeginPasswordSet` named — after the grant dird would have registered
+    /// for them (Role::Ldap, task A15a), which the test registers here.
     pub fn workstation_secret(&mut self) -> Vec<Kvno> {
-        assert_eq!(self.keyd.as_ref().map(|k| k.role), Some(Role::Directory));
-        let mut client = key_state_client(self.input.paths.keyd_socket.as_path(), self.uid);
+        assert_eq!(
+            self.keyd.as_ref().map(|k| k.phase),
+            Some(KeydPhase::Provisioning)
+        );
+        let mut ldap = key_state_client(&self.grant_keyd_socket, self.uid);
+        // The fixture is a computer (`CreateComputer`, no SPN: one key set).
+        let kind = keyd::AccountKind::Computer;
+        let targets: Vec<keyd::SetSecretTarget> = self
+            .workstation
+            .keys
+            .iter()
+            .map(|k| keyd::SetSecretTarget {
+                handle: k.handle,
+                binding: k.binding.clone(),
+            })
+            .collect();
+        ldap.grant_set_secret(kind, &targets, keyd::MAX_SET_SECRET_GRANT_SECS)
+            .expect("the workstation's grant");
+        let mut client = key_state_client(&self.aux_keyd_socket, self.uid);
         let mut kvnos = Vec::new();
         for target in self.workstation.keys.clone() {
             let call = Call::SetSecret {
@@ -1320,7 +1370,7 @@ impl World {
         if let Some(dird) = self.dird.take() {
             dird.stop().expect("dird stopped cleanly");
         }
-        if self.keyd.is_some() || self.aux_keyd.is_some() {
+        if self.keyd.is_some() {
             self.stop_keyds();
         }
         if self.auditd.is_some() {
@@ -1600,7 +1650,6 @@ impl Drop for World {
         drop(self.front.take());
         drop(self.kdcd.take());
         drop(self.dird.take());
-        drop(self.aux_keyd.take());
         drop(self.keyd.take());
         drop(self.auditd.take());
     }

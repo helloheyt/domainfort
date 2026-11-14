@@ -82,6 +82,30 @@ pub const AUDIT_FLUSH_GRACE: Duration = Duration::from_secs(5);
 /// Poll interval while draining. Project choice.
 const DRAIN_POLL: Duration = Duration::from_millis(10);
 
+/// One more socket served by the **same** engine — the same keyd, key store
+/// and grant table — with its own `uid → Role` map (and its own connection
+/// quota).
+///
+/// **Never built from keyd's configuration file**: `DaemonParams::from_settings`
+/// leaves [`DaemonParams::extra_listeners`] empty, and no configuration key
+/// sets it — a deployment serves `keyd_socket` alone (docs/50 §3.1, R50-3:
+/// one role per uid). It exists for the single-uid tier-2 harnesses (A-82),
+/// which since task A15a need one keyd to serve the one test uid in two
+/// roles at once — dird's grant (Role::Ldap) must be in the grant table that
+/// admind's `set_secret` (Role::Directory) is checked against
+/// (docs/questions/Q-430 "follow-up", Q-453). Each listener still maps the
+/// peer's uid from the kernel's peer credentials to its role; nothing is
+/// taken from the peer.
+///
+/// Spec: docs/50 §3.1, §3.2, §3.6, R50-3; docs/questions/Q-430, Q-453.
+#[derive(Debug, Clone)]
+pub struct ExtraListener {
+    /// The socket path (bound, moded and removed as `keyd_socket` is).
+    pub socket: PathBuf,
+    /// Its `uid → Role` map.
+    pub callers: CallerMap,
+}
+
 /// What [`serve`] needs besides the clock and keyd.
 ///
 /// Spec: docs/50 §2.4, §3.1, §3.2, §3.6, §7.1, §8.1.
@@ -107,6 +131,9 @@ pub struct DaemonParams {
     /// operator cannot widen it; the type refuses anything above
     /// `MAX_INTENT_ACK_BUDGET` when it is built (docs/questions/Q-415).
     pub intent_ack_budget: IntentAckBudget,
+    /// More sockets on the same engine ([`ExtraListener`]): always empty in
+    /// production (no configuration key; docs/questions/Q-453).
+    pub extra_listeners: Vec<ExtraListener>,
 }
 
 impl DaemonParams {
@@ -133,6 +160,7 @@ impl DaemonParams {
             queue_capacity: ENGINE_QUEUE_CAPACITY,
             window: WindowConfig::DEFAULT,
             intent_ack_budget: IntentAckBudget::PRODUCTION,
+            extra_listeners: Vec::new(),
         })
     }
 }
@@ -324,36 +352,73 @@ where
         first,
     ));
 
-    // 4. The listener.
-    let listener = match bind(&params.keyd_socket) {
-        Ok(listener) => listener,
-        Err(error) => {
-            audit_task.abort();
-            drop(handle);
-            // The only sender is gone: the engine thread ends at once.
-            let _ = engine_thread.join();
-            return Err(error);
+    // 4. The listener — `keyd_socket`, then any extra listener on the same
+    // engine (tests only, docs/questions/Q-453). All are bound before any
+    // accepts; a failure removes what was bound and stops.
+    let sockets: Vec<(PathBuf, CallerMap)> =
+        core::iter::once((params.keyd_socket.clone(), params.callers.clone()))
+            .chain(
+                params
+                    .extra_listeners
+                    .iter()
+                    .map(|extra| (extra.socket.clone(), extra.callers.clone())),
+            )
+            .collect();
+    let mut bound = Vec::with_capacity(sockets.len());
+    for (path, callers) in sockets {
+        match bind(&path) {
+            Ok(listener) => bound.push((path, callers, listener)),
+            Err(error) => {
+                for (done, _, _) in &bound {
+                    let _ = std::fs::remove_file(done);
+                }
+                drop(bound);
+                audit_task.abort();
+                drop(handle);
+                // The only sender is gone: the engine thread ends at once.
+                let _ = engine_thread.join();
+                return Err(error);
+            }
         }
-    };
-    let context = Arc::new(ServeContext::new(
-        params.callers,
-        params.frame_timeout,
-        params.max_connections_per_uid,
-        handle,
-    ));
-    let accept_task = tokio::spawn(accept_loop(listener, Arc::clone(&context)));
+    }
+    let mut served = Vec::with_capacity(bound.len());
+    for (path, callers, listener) in bound {
+        let context = Arc::new(ServeContext::new(
+            callers,
+            params.frame_timeout,
+            params.max_connections_per_uid,
+            handle.clone(),
+        ));
+        let accept_task = tokio::spawn(accept_loop(listener, Arc::clone(&context)));
+        served.push((path, context, accept_task));
+    }
+    // Only the connection contexts hold queue senders from here on.
+    drop(handle);
     control.state.serving.store(true, Ordering::SeqCst);
     note(Note::Listening, None);
 
     // 5. Until stopped.
     control.state.stop.notified().await;
     note(Note::Draining, None);
-    accept_task.abort();
-    let _ = accept_task.await;
+    for (_, _, accept_task) in &served {
+        accept_task.abort();
+    }
+    let mut contexts = Vec::with_capacity(served.len());
+    for (path, context, accept_task) in served {
+        let _ = accept_task.await;
+        contexts.push((path, context));
+    }
     control.state.serving.store(false, Ordering::SeqCst);
-    context.start_draining();
-    wait_until(DRAIN_GRACE, || context.in_flight() == 0).await;
-    let _ = std::fs::remove_file(&params.keyd_socket);
+    for (_, context) in &contexts {
+        context.start_draining();
+    }
+    wait_until(DRAIN_GRACE, || {
+        contexts.iter().all(|(_, context)| context.in_flight() == 0)
+    })
+    .await;
+    for (path, _) in &contexts {
+        let _ = std::fs::remove_file(path);
+    }
     wait_until(AUDIT_FLUSH_GRACE, || {
         gate.outstanding() == 0 || !gate.is_reachable()
     })

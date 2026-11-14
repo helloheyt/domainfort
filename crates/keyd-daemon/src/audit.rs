@@ -39,8 +39,11 @@
 //! An issuing operation's reply can be withheld; a key-state change cannot be
 //! undone once keyd ran it (`keyd::changes_key_state`: `set_secret`,
 //! `create_key`, `rotate_key`, `rotate_krbtgt`, `retire_kvno`,
-//! `destroy_key_set`). For those — once keyd's own authorization step admits
-//! them (`keyd::Keyd::admits`) — the engine:
+//! `destroy_key_set`) — nor can a grant that loosens keyd's authorization be
+//! taken back once keyd registered it (`grant_set_secret`, task A15a;
+//! `keyd::requires_acknowledged_intent` covers both — docs/questions/Q-452).
+//! For those — once keyd's own authorization step admits them
+//! (`keyd::Keyd::admits`) — the engine:
 //!
 //! 1. reserves **two** slots (intent and outcome) and commits the **intent**
 //!    record ([`KeyStateIntent`], outcome code `Intent`) into the first
@@ -91,9 +94,10 @@ use ipc_audit::{
     WindowConfig, WindowError,
 };
 use ipc_keyd::Call;
+use keyd::authz::HandleSlot;
 use keyd::{
-    AuditOutcome, AuditReason, AuditRecord, AuditSink, CallerId, KeyHandle, Kvno, Operation,
-    PrincipalId,
+    AuditKeyRef, AuditOutcome, AuditReason, AuditRecord, AuditSink, CallerId, KeyHandle, Kvno,
+    Operation, PrincipalId,
 };
 use krb_proto::KerberosTime;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -170,7 +174,8 @@ pub const fn is_gating(operation: Operation) -> bool {
         | Operation::OpenFastArmor
         | Operation::SealFastError
         | Operation::DestroyKeySet
-        | Operation::OpenAndVerifyServiceTicket => true,
+        | Operation::OpenAndVerifyServiceTicket
+        | Operation::GrantSetSecret => true,
         Operation::DescribeConfig | Operation::Ping => false,
     }
 }
@@ -237,41 +242,71 @@ impl PendingOutcome {
 /// admin.rs, directory.rs: `AuditFields::for_handle`, then those two). No
 /// password, binding or key: the call's other arguments are not kept.
 ///
+/// The same holds for `grant_set_secret` (task A15a), which loosens keyd's
+/// authorization and so takes the same path (`keyd::requires_acknowledged_intent`):
+/// its first key target is the record's handle, its second (a computer's
+/// `Service` key set) the record's secondary key, as keyd's own record of it
+/// (crates/keyd grant.rs); no binding and no lifetime.
+///
 /// Spec: docs/10 §10 (`{ ts, caller_role, caller_uid, op, principal,
-/// purpose, kvno, result }`), §12 I8; docs/questions/Q-346 (A-86), Q-365.
+/// purpose, kvno, result }`), §12 I8; docs/questions/Q-346 (A-86), Q-365,
+/// Q-452 item 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KeyStateIntent {
     ts: KerberosTime,
     caller: CallerId,
     op: Operation,
-    handle: KeyHandle,
+    /// The handle in the operation's `Primary` slot (`None` only for a grant
+    /// that names no key target — keyd refuses it as its outcome).
+    primary: Option<KeyHandle>,
+    /// A grant's second key target (`Secondary` slot).
+    secondary: Option<KeyHandle>,
     kvno: Option<Kvno>,
     approvers: Option<[PrincipalId; 2]>,
 }
 
 impl KeyStateIntent {
     /// The intent of `call` by `caller` at `now` if `call` is one of the six
-    /// key-state changes, else `None`. The match is exhaustive over
-    /// [`Call`]: a new call does not compile until it is classified here.
-    /// The engine checks this against `keyd::changes_key_state` and refuses
-    /// (fail closed) when they disagree.
+    /// key-state changes or `grant_set_secret`, else `None`. The match is
+    /// exhaustive over [`Call`]: a new call does not compile until it is
+    /// classified here. The engine checks this against
+    /// `keyd::requires_acknowledged_intent` and refuses (fail closed) when
+    /// they disagree.
     ///
-    /// Spec: docs/10 §6, §7; docs/questions/Q-346 (A-86).
+    /// Spec: docs/10 §6, §7; docs/questions/Q-346 (A-86), Q-452 item 1.
     pub(crate) fn of(caller: CallerId, now: KerberosTime, call: &Call) -> Option<KeyStateIntent> {
-        let (op, handle, kvno, approvers) = match call {
-            Call::SetSecret { handle, .. } => (Operation::SetSecret, *handle, None, None),
-            Call::CreateKey { handle, .. } => (Operation::CreateKey, *handle, None, None),
-            Call::RotateKey { handle } => (Operation::RotateKey, *handle, None, None),
+        let (op, primary, secondary, kvno, approvers) = match call {
+            Call::SetSecret { handle, .. } => {
+                (Operation::SetSecret, Some(*handle), None, None, None)
+            }
+            Call::CreateKey { handle, .. } => {
+                (Operation::CreateKey, Some(*handle), None, None, None)
+            }
+            Call::RotateKey { handle } => (Operation::RotateKey, Some(*handle), None, None, None),
             Call::RotateKrbtgt { krbtgt, approval } => (
                 Operation::RotateKrbtgt,
-                *krbtgt,
+                Some(*krbtgt),
+                None,
                 None,
                 Some([approval.approver_1, approval.approver_2]),
             ),
-            Call::RetireKvno { handle, kvno } => {
-                (Operation::RetireKvno, *handle, Some(*kvno), None)
+            Call::RetireKvno { handle, kvno } => (
+                Operation::RetireKvno,
+                Some(*handle),
+                None,
+                Some(*kvno),
+                None,
+            ),
+            Call::DestroyKeySet { handle } => {
+                (Operation::DestroyKeySet, Some(*handle), None, None, None)
             }
-            Call::DestroyKeySet { handle } => (Operation::DestroyKeySet, *handle, None, None),
+            Call::GrantSetSecret { targets, .. } => (
+                Operation::GrantSetSecret,
+                targets.first().map(|t| t.handle),
+                targets.get(1).map(|t| t.handle),
+                None,
+                None,
+            ),
             Call::VerifyPreauth { .. }
             | Call::IssueAsRep { .. }
             | Call::OpenFastArmor { .. }
@@ -287,7 +322,8 @@ impl KeyStateIntent {
             ts: now,
             caller,
             op,
-            handle,
+            primary,
+            secondary,
             kvno,
             approvers,
         })
@@ -298,9 +334,19 @@ impl KeyStateIntent {
         self.op
     }
 
-    /// The handle the operation acts on (its one handle slot, `Primary`).
-    pub(crate) fn handle(&self) -> &KeyHandle {
-        &self.handle
+    /// The handles the operation acts on, in their slots — for keyd's
+    /// authorization step (`keyd::Keyd::admits`): the `Primary` handle, and a
+    /// grant's `Secondary` one.
+    /// Spec: docs/10 §2 (I3); docs/questions/Q-452 item 1.
+    pub(crate) fn handles(&self) -> Vec<(HandleSlot, &KeyHandle)> {
+        let mut handles = Vec::with_capacity(2);
+        if let Some(primary) = &self.primary {
+            handles.push((HandleSlot::Primary, primary));
+        }
+        if let Some(secondary) = &self.secondary {
+            handles.push((HandleSlot::Secondary, secondary));
+        }
+        handles
     }
 
     /// The wire record of this change in `phase` (`Intent` or
@@ -316,10 +362,14 @@ impl KeyStateIntent {
             caller_role: self.caller.role,
             caller_uid: self.caller.uid,
             op: self.op,
-            principal: Some(self.handle.principal),
-            purpose: Some(self.handle.purpose),
+            principal: self.primary.map(|h| h.principal),
+            purpose: self.primary.map(|h| h.purpose),
             kvno: self.kvno,
-            secondary: None,
+            secondary: self.secondary.map(|h| AuditKeyRef {
+                principal: h.principal,
+                purpose: h.purpose,
+                kvno: None,
+            }),
             approvers: self.approvers,
             // keyd has no phase outcome; replaced by `phase` below.
             result: AuditOutcome::Success,

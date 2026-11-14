@@ -14,8 +14,20 @@
 //! |-------------|------------|
 //! | `Kdc`       | [`Keyd::verify_preauth`], [`Keyd::issue_as_rep`], [`Keyd::open_and_verify_tgt`], [`Keyd::issue_tgs_rep`], [`Keyd::open_fast_armor`], [`Keyd::seal_fast_error`], [`Keyd::describe_config`], [`Keyd::ping`] |
 //! | `Directory` | [`Keyd::set_secret`], [`Keyd::verify_secret`], [`Keyd::ping`] |
-//! | `Admin`     | [`Keyd::create_key`], [`Keyd::rotate_key`], [`Keyd::rotate_krbtgt`], [`Keyd::retire_kvno`], [`Keyd::destroy_key_set`], [`Keyd::ping`] |
-//! | `Ldap`      | [`Keyd::open_and_verify_service_ticket`], [`Keyd::describe_config`], [`Keyd::ping`] |
+//! | `Admin`     | [`Keyd::create_key`], [`Keyd::rotate_key`], [`Keyd::rotate_krbtgt`], [`Keyd::retire_kvno`], [`Keyd::destroy_key_set`], [`Keyd::grant_set_secret`] (initial secrets of users), [`Keyd::ping`] |
+//! | `Ldap`      | [`Keyd::open_and_verify_service_ticket`], [`Keyd::grant_set_secret`], [`Keyd::describe_config`], [`Keyd::ping`] |
+//!
+//! **Set-secret grants** (task A15a; docs/51 §5.8 option (b), decision
+//! A-74; docs/questions/Q-450..Q-452): Role::Directory's
+//! [`Keyd::set_secret`] is refused (the uniform `Denied`, reason `NoGrant`)
+//! unless a live, one-time grant names its handle — registered by
+//! [`Keyd::grant_set_secret`] from dird (Role::Ldap, after its PDP allowed
+//! the `BeginPasswordSet`, ≤ [`MAX_SET_SECRET_GRANT_SECS`]) or from keyadm's
+//! ceremony (Role::Admin: a first administrator's initial secret only, ≤
+//! [`MAX_INITIAL_SECRET_GRANT_SECS`]) — with exactly its binding; the grant
+//! is consumed. The table is in memory and bounded
+//! ([`MAX_SET_SECRET_GRANTS`]). A grant loosens keyd, so it is audited like a
+//! key-state change ([`requires_acknowledged_intent`]).
 //!
 //! **Types and seam** (D182; decision A-63): every crypto-free type of this
 //! interface — ids and handles, roles, operations and the capability table,
@@ -222,8 +234,10 @@
 //! (A-46), Q-180, Q-217 and Q-222 (A-56), Q-240 (A-62), Q-245 item 3 (A-63:
 //! the keyd-types split, D182); for the key-state classification and
 //! `Keyd::admits` (task F2), docs/51 §5.7 and decision A-86 (Q-346, as
-//! stated in the task; Q-365). No other implementation was consulted or
-//! recalled.
+//! stated in the task; Q-365); for the set_secret grant (task A15a), docs/51
+//! §4.3, §5.2, §5.8, §7.3, §9, docs/47 §9.1-§9.2, docs/10 §2, §6, §8-§11,
+//! docs/questions/Q-291 (A-74), Q-365 (A-88) and Q-450..Q-453. No other
+//! implementation was consulted or recalled.
 //!
 //! Spec: docs/10; docs/09 א; RFC 4120 §3, §5.
 
@@ -235,6 +249,7 @@ mod enctype;
 pub mod entropy;
 mod error;
 mod fast_armor;
+mod grant;
 #[allow(clippy::module_inception)]
 mod keyd;
 mod replay;
@@ -260,6 +275,10 @@ pub use entropy::{EntropyError, EntropySource, OsEntropy};
 pub use keyd::Keyd;
 pub use keyd_types::kerberos_time_seconds;
 pub use keyd_types::{
+    AccountKind, SetSecretTarget, MAX_GRANT_TARGETS, MAX_INITIAL_SECRET_GRANT_SECS,
+    MAX_SET_SECRET_GRANTS, MAX_SET_SECRET_GRANT_SECS,
+};
+pub use keyd_types::{
     ArmorId, AsRepParts, AsTicketTemplate, AuditKeyRef, AuditOutcome, AuditReason, AuditRecord,
     AuditSink, AuthnError, AuthnProof, CallerId, ConfigDescription, ConfigError, CtxId,
     DualControlToken, EncTypeId, Error, ExchangeId, FastArmor, FastConversation, IssueError,
@@ -267,6 +286,6 @@ pub use keyd_types::{
     Role, ServiceContext, ServiceCtxId, TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext,
     ThrottlePolicy, TicketPolicy, MAX_FX_COOKIE_LENGTH, TOKEN_ID_LENGTH,
 };
-pub use state_change::changes_key_state;
+pub use state_change::{changes_key_state, loosens_authorization, requires_acknowledged_intent};
 pub use store::{InMemoryKeyStore, KeyStore, StoreError, StoredKeySet};
 pub use throttle::{FailureWindowThrottle, SecretThrottle};

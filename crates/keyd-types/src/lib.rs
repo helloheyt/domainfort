@@ -9,7 +9,8 @@
 //! | ids and handles | [`PrincipalId`], [`Kvno`], [`KeyPurpose`], [`KeyHandle`], [`PrincipalBinding`], [`DualControlToken`] |
 //! | caller model | [`CallerId`], [`Role`], [`Operation`], [`authz::CAPABILITY_TABLE`], [`authz::role_permits`], [`authz::purpose_permitted`] (with the compile-time pins) |
 //! | errors | [`AuthnError`], [`IssueError`], [`Error`], [`ConfigError`] |
-//! | operation arguments and results | [`AuthnProof`], [`AsTicketTemplate`], [`AsRepParts`], [`TgsFastRequest`], [`TgtContext`], [`TgsTicketTemplate`], [`TgsRepParts`], [`FastArmor`], [`FastConversation`], [`ServiceContext`] |
+//! | operation arguments and results | [`AuthnProof`], [`AsTicketTemplate`], [`AsRepParts`], [`TgsFastRequest`], [`TgtContext`], [`TgsTicketTemplate`], [`TgsRepParts`], [`FastArmor`], [`FastConversation`], [`ServiceContext`], [`AccountKind`], [`SetSecretTarget`] |
+//! | the set_secret grant (task A15a) | [`grant`]: [`MAX_GRANT_TARGETS`], [`MAX_SET_SECRET_GRANT_SECS`], [`MAX_INITIAL_SECRET_GRANT_SECS`], [`MAX_SET_SECRET_GRANTS`], [`grant::max_grant_lifetime_secs`] |
 //! | one-time token ids | [`ExchangeId`], [`CtxId`], [`ArmorId`], [`ServiceCtxId`] |
 //! | configuration | [`KeydConfig`], [`TicketPolicy`], [`ThrottlePolicy`], [`ConfigDescription`], [`EncTypeId`] |
 //! | audit | [`AuditRecord`], [`AuditOutcome`], [`AuditReason`], [`AuditKeyRef`], [`AuditSink`] |
@@ -60,6 +61,7 @@ mod custody;
 mod enctype;
 mod error;
 mod fast_armor;
+pub mod grant;
 pub mod model;
 mod service_ticket;
 mod tgs_exchange;
@@ -74,6 +76,10 @@ pub use custody::KeyCustody;
 pub use enctype::EncTypeId;
 pub use error::{AuthnError, ConfigError, Error, IssueError};
 pub use fast_armor::{FastArmor, FastConversation, MAX_FX_COOKIE_LENGTH};
+pub use grant::{
+    AccountKind, SetSecretTarget, MAX_GRANT_TARGETS, MAX_INITIAL_SECRET_GRANT_SECS,
+    MAX_SET_SECRET_GRANTS, MAX_SET_SECRET_GRANT_SECS,
+};
 pub use model::{DualControlToken, KeyHandle, KeyPurpose, Kvno, PrincipalBinding, PrincipalId};
 pub use service_ticket::ServiceContext;
 pub use tgs_exchange::{TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext};

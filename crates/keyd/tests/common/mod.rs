@@ -8,9 +8,10 @@
 #![allow(dead_code)] // each test binary uses a different subset
 
 use keyd::{
-    AsRepParts, AsTicketTemplate, AuditRecord, AuditSink, CallerId, EntropyError, EntropySource,
-    InMemoryKeyStore, KeyHandle, KeyPurpose, Keyd, KeydConfig, PrincipalBinding, PrincipalId, Role,
-    TgsTicketTemplate, TgtContext,
+    AccountKind, AsRepParts, AsTicketTemplate, AuditRecord, AuditSink, CallerId, EntropyError,
+    EntropySource, InMemoryKeyStore, KeyHandle, KeyPurpose, KeyStore, Keyd, KeydConfig,
+    PrincipalBinding, PrincipalId, Role, SetSecretTarget, TgsTicketTemplate, TgtContext,
+    MAX_SET_SECRET_GRANT_SECS,
 };
 use krb_crypto::{ChecksumType, EncType, KeyUsage, ProtocolKey};
 use krb_proto::constants::{
@@ -290,6 +291,7 @@ impl Fixture {
         }
         keyd.create_key(&ADMIN, &SERVICE, &service_binding(), &n)
             .unwrap();
+        grant(&mut keyd, &ALICE, &alice_binding(), &n).unwrap();
         keyd.set_secret(
             &DIRECTORY,
             &ALICE,
@@ -299,6 +301,7 @@ impl Fixture {
             &n,
         )
         .unwrap();
+        grant(&mut keyd, &BOB, &bob_binding(), &n).unwrap();
         keyd.set_secret(
             &DIRECTORY,
             &BOB,
@@ -314,6 +317,91 @@ impl Fixture {
 
     pub fn records(&self) -> &[AuditRecord] {
         &self.keyd.audit_sink().records
+    }
+
+    /// A user's one-target grant registered as `caller` (any role: a role
+    /// that may not register grants is refused, with its one record).
+    pub fn grant_as(
+        &mut self,
+        caller: &CallerId,
+        handle: &KeyHandle,
+        binding: &PrincipalBinding,
+        now: &KerberosTime,
+    ) -> Result<(), keyd::Error> {
+        self.keyd.grant_set_secret(
+            caller,
+            AccountKind::User,
+            &[SetSecretTarget {
+                handle: *handle,
+                binding: binding.clone(),
+            }],
+            MAX_SET_SECRET_GRANT_SECS,
+            now,
+        )
+    }
+
+    /// [`grant`] on this fixture's keyd.
+    pub fn grant(
+        &mut self,
+        handle: &KeyHandle,
+        binding: &PrincipalBinding,
+        now: &KerberosTime,
+    ) -> Result<(), keyd::Error> {
+        grant(&mut self.keyd, handle, binding, now)
+    }
+}
+
+/// The name of the computer account a Service key set's grant pairs it
+/// with ([`grant`]); test data.
+pub fn grant_computer_name() -> PrincipalName {
+    PrincipalName {
+        name_type: KRB_NT_PRINCIPAL,
+        name_string: vec![kstr("granted$")],
+    }
+}
+
+/// Register, as dird would after its PDP allowed the password set
+/// (Role::Ldap; task A15a, docs/51 §5.8 option (b)), the grant that a
+/// `set_secret` of `handle` with `binding` needs: a user's one key target
+/// for a PrincipalLongterm handle; for a Service handle, a computer's two —
+/// its PrincipalLongterm key set (named [`grant_computer_name`]; a grant does
+/// not judge bindings, the redeeming `set_secret` does) and then the Service
+/// key set. Any other purpose is refused by keyd (the purposes of the
+/// grant's slots).
+pub fn grant<S: KeyStore, A: AuditSink, E: EntropySource>(
+    keyd: &mut Keyd<S, A, E>,
+    handle: &KeyHandle,
+    binding: &PrincipalBinding,
+    now: &KerberosTime,
+) -> Result<(), keyd::Error> {
+    let target = SetSecretTarget {
+        handle: *handle,
+        binding: binding.clone(),
+    };
+    match handle.purpose {
+        KeyPurpose::Service => {
+            let account = KeyHandle::new(handle.principal, KeyPurpose::PrincipalLongterm);
+            keyd.grant_set_secret(
+                &LDAP,
+                AccountKind::Computer,
+                &[
+                    SetSecretTarget {
+                        handle: account,
+                        binding: bound(grant_computer_name()),
+                    },
+                    target,
+                ],
+                MAX_SET_SECRET_GRANT_SECS,
+                now,
+            )
+        }
+        _ => keyd.grant_set_secret(
+            &LDAP,
+            AccountKind::User,
+            &[target],
+            MAX_SET_SECRET_GRANT_SECS,
+            now,
+        ),
     }
 }
 

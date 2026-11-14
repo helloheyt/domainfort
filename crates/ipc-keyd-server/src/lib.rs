@@ -196,6 +196,19 @@ pub fn execute<S: KeyStore, A: AuditSink, E: EntropySource>(
             }))
         }
         Call::Ping => Answer::Ping(keyd.ping(caller, now)),
+        // Task A15a (docs/51 §5.8 option (b)): the lifetime is relative; keyd
+        // adds its own `now` — the daemon's clock, never the peer's (R50-5).
+        Call::GrantSetSecret {
+            kind,
+            targets,
+            lifetime_secs,
+        } => Answer::GrantSetSecret(keyd.grant_set_secret(
+            caller,
+            kind,
+            &targets,
+            lifetime_secs,
+            now,
+        )),
     }
 }
 

@@ -103,11 +103,19 @@ pub enum Operation {
     DescribeConfig = 14,
     /// Health check. Spec: docs/50 §3.4 (`Ping`), §7.5.
     Ping = 15,
+    /// Register a one-time, short-lived grant that lets Role::Directory run
+    /// `set_secret` on exactly the named key targets: dird (Role::Ldap)
+    /// after its PDP allowed a `BeginPasswordSet`; keyadm (Role::Admin) for
+    /// the provisioning manifest's first administrators during the
+    /// ceremony.
+    /// Spec: docs/51 §5.8 (option (b)); docs/questions/Q-291 (A-74: task
+    /// A15 before any deployment), Q-450.
+    GrantSetSecret = 16,
 }
 
 impl Operation {
     /// Every operation, for exhaustive checks. Spec: docs/10 §2.
-    pub const ALL: [Operation; 16] = [
+    pub const ALL: [Operation; 17] = [
         Operation::VerifyPreauth,
         Operation::IssueAsRep,
         Operation::OpenAndVerifyTgt,
@@ -124,6 +132,7 @@ impl Operation {
         Operation::OpenAndVerifyServiceTicket,
         Operation::DescribeConfig,
         Operation::Ping,
+        Operation::GrantSetSecret,
     ];
 }
 
@@ -137,7 +146,11 @@ impl Operation {
 /// docs/questions/Q-165 item 3 (A-46: `Ldap` holds only the service-ticket
 /// operations — in task L6a, `open_and_verify_service_ticket` alone;
 /// `seal_ap_rep` arrives with task L6b, docs/49 §12); docs/50 §3.4
-/// (`DescribeConfig`: roles Kdc and Ldap; `Ping`: every mapped role), §7.5.
+/// (`DescribeConfig`: roles Kdc and Ldap; `Ping`: every mapped role), §7.5;
+/// docs/51 §5.8 option (b), docs/questions/Q-291 (A-74), Q-450 items 1, 6
+/// (`GrantSetSecret`: Ldap — dird after its PDP — and Admin — keyadm's
+/// ceremony, for the manifest's first administrators only; never
+/// Directory, the role the grant is for).
 pub const CAPABILITY_TABLE: [(Role, &[Operation]); 4] = [
     (
         Role::Kdc,
@@ -168,6 +181,7 @@ pub const CAPABILITY_TABLE: [(Role, &[Operation]); 4] = [
             Operation::RotateKrbtgt,
             Operation::RetireKvno,
             Operation::DestroyKeySet,
+            Operation::GrantSetSecret,
             Operation::Ping,
         ],
     ),
@@ -175,6 +189,7 @@ pub const CAPABILITY_TABLE: [(Role, &[Operation]); 4] = [
         Role::Ldap,
         &[
             Operation::OpenAndVerifyServiceTicket,
+            Operation::GrantSetSecret,
             Operation::DescribeConfig,
             Operation::Ping,
         ],
@@ -200,7 +215,10 @@ pub const CAPABILITY_TABLE: [(Role, &[Operation]); 4] = [
 /// ("Directory/Admin are not dependent on the replay cache and are allowed",
 /// docs/50 §3.5), and `describe_config` / `ping`, which use neither and
 /// which the daemons need at start and for health (docs/50 §7.5) —
-/// interpretation recorded in docs/questions/Q-240 item 1.
+/// interpretation recorded in docs/questions/Q-240 item 1. Nor
+/// `grant_set_secret`: its grant table lives in memory too, but losing it
+/// at a start only makes keyd stricter (a `set_secret` without its grant is
+/// refused), so nothing needs holding (docs/questions/Q-450 item 5).
 ///
 /// The match is exhaustive: a new operation does not compile until it is
 /// decided here.
@@ -224,7 +242,8 @@ pub const fn startup_hold_down_applies(op: Operation) -> bool {
         | Operation::RetireKvno
         | Operation::DestroyKeySet
         | Operation::DescribeConfig
-        | Operation::Ping => false,
+        | Operation::Ping
+        | Operation::GrantSetSecret => false,
     }
 }
 
@@ -261,6 +280,11 @@ pub enum HandleSlot {
     Primary = 0,
     /// The krbtgt handle of `issue_as_rep`.
     Krbtgt = 1,
+    /// The second key target of `grant_set_secret`: a computer's `Service`
+    /// key set (docs/47 §9.1: a computer's password sets its
+    /// `PrincipalLongterm` and its `Service` key set).
+    /// Spec: docs/51 §5.2 row 5, §7.3; docs/questions/Q-450 item 2.
+    Secondary = 2,
 }
 
 /// The purposes an operation accepts in a handle slot. Anything else is
@@ -287,10 +311,14 @@ pub enum HandleSlot {
 /// - `rotate_krbtgt`: Krbtgt.
 /// - `create_key`, `retire_kvno`: any phase-1 purpose (docs/10 §7:
 ///   create_key also initializes krbtgt).
+/// - `grant_set_secret`: PrincipalLongterm first (every account's password
+///   key set), Service second (a computer's service key set) — the targets
+///   dird's `BeginPasswordSet` returns (docs/51 §5.2 row 5, §7.3). Never
+///   Krbtgt: its key is never password-derived.
 ///
 /// Spec: docs/10 §2 ("(b) the KeyPurpose of the handle matches the
 /// operation"), §4, §5, §6, §7, §12 I3; docs/48 §2.3, §9.1 I3;
-/// docs/questions/Q-115 (A-35), Q-165 item 3 (A-46).
+/// docs/questions/Q-115 (A-35), Q-165 item 3 (A-46), Q-450 item 2.
 pub const fn purpose_permitted(op: Operation, slot: HandleSlot, purpose: KeyPurpose) -> bool {
     use KeyPurpose::{Krbtgt, PrincipalLongterm, Service};
     match (op, slot) {
@@ -314,6 +342,8 @@ pub const fn purpose_permitted(op: Operation, slot: HandleSlot, purpose: KeyPurp
         | (Operation::RetireKvno, HandleSlot::Primary) => {
             matches!(purpose, PrincipalLongterm | Service | Krbtgt)
         }
+        (Operation::GrantSetSecret, HandleSlot::Primary) => matches!(purpose, PrincipalLongterm),
+        (Operation::GrantSetSecret, HandleSlot::Secondary) => matches!(purpose, Service),
         _ => false,
     }
 }
@@ -383,7 +413,8 @@ const _: () = {
     ));
     // Service-ticket verification (docs/questions/Q-165 item 3, A-46):
     // `Ldap` may call open_and_verify_service_ticket and — docs/50 §3.4 —
-    // describe_config and ping, and nothing else; no other role may call
+    // describe_config and ping, and — docs/51 §5.8 option (b), Q-450 —
+    // grant_set_secret, and nothing else; no other role may call
     // open_and_verify_service_ticket, and it opens only Service-purpose
     // handles.
     let mut i = 0;
@@ -392,7 +423,10 @@ const _: () = {
         let is_service_ticket = op as u8 == Operation::OpenAndVerifyServiceTicket as u8;
         let is_daemon_support =
             op as u8 == Operation::DescribeConfig as u8 || op as u8 == Operation::Ping as u8;
-        assert!(role_permits(Role::Ldap, op) == (is_service_ticket || is_daemon_support));
+        let is_grant = op as u8 == Operation::GrantSetSecret as u8;
+        assert!(
+            role_permits(Role::Ldap, op) == (is_service_ticket || is_daemon_support || is_grant)
+        );
         if is_service_ticket {
             assert!(!role_permits(Role::Kdc, op));
             assert!(!role_permits(Role::Directory, op));
@@ -462,6 +496,65 @@ const _: () = {
     ));
     assert!(!startup_hold_down_applies(Operation::DescribeConfig));
     assert!(!startup_hold_down_applies(Operation::Ping));
+    // The set_secret grant (docs/51 §5.8 option (b); A-74; Q-450): never
+    // the role it is for (Directory), never the KDC; registered by dird
+    // (Ldap) and by keyadm's ceremony (Admin); its targets are a
+    // PrincipalLongterm key set, then a computer's Service key set — never
+    // krbtgt; it is not held after a start (a lost grant table only makes
+    // keyd stricter).
+    assert!(role_permits(Role::Ldap, Operation::GrantSetSecret));
+    assert!(role_permits(Role::Admin, Operation::GrantSetSecret));
+    assert!(!role_permits(Role::Directory, Operation::GrantSetSecret));
+    assert!(!role_permits(Role::Kdc, Operation::GrantSetSecret));
+    assert!(!startup_hold_down_applies(Operation::GrantSetSecret));
+    assert!(purpose_permitted(
+        Operation::GrantSetSecret,
+        HandleSlot::Primary,
+        KeyPurpose::PrincipalLongterm
+    ));
+    assert!(!purpose_permitted(
+        Operation::GrantSetSecret,
+        HandleSlot::Primary,
+        KeyPurpose::Service
+    ));
+    assert!(!purpose_permitted(
+        Operation::GrantSetSecret,
+        HandleSlot::Primary,
+        KeyPurpose::Krbtgt
+    ));
+    assert!(purpose_permitted(
+        Operation::GrantSetSecret,
+        HandleSlot::Secondary,
+        KeyPurpose::Service
+    ));
+    assert!(!purpose_permitted(
+        Operation::GrantSetSecret,
+        HandleSlot::Secondary,
+        KeyPurpose::PrincipalLongterm
+    ));
+    assert!(!purpose_permitted(
+        Operation::GrantSetSecret,
+        HandleSlot::Secondary,
+        KeyPurpose::Krbtgt
+    ));
+    assert!(!purpose_permitted(
+        Operation::GrantSetSecret,
+        HandleSlot::Krbtgt,
+        KeyPurpose::Krbtgt
+    ));
+    // Only grant_set_secret has a Secondary slot.
+    let mut s = 0;
+    while s < Operation::ALL.len() {
+        let op = Operation::ALL[s];
+        if op as u8 != Operation::GrantSetSecret as u8 {
+            let mut q = 0;
+            while q < purposes.len() {
+                assert!(!purpose_permitted(op, HandleSlot::Secondary, purposes[q]));
+                q += 1;
+            }
+        }
+        s += 1;
+    }
     assert!(purpose_permitted(
         Operation::OpenAndVerifyServiceTicket,
         HandleSlot::Primary,
@@ -493,7 +586,10 @@ mod tests {
     /// Every key operation is granted to exactly one role (docs/10 §2: each
     /// process holds only its own operations); the two daemon-support
     /// operations, which touch no key, are shared as docs/50 §3.4 lists:
-    /// `DescribeConfig` — Kdc and Ldap; `Ping` — every mapped role.
+    /// `DescribeConfig` — Kdc and Ldap; `Ping` — every mapped role. The
+    /// set_secret grant, which touches no key either, is registered by
+    /// dird after its PDP (Ldap) and by keyadm's ceremony for the first
+    /// administrators (Admin) — docs/51 §5.8 option (b), Q-450 items 1, 6.
     #[test]
     fn each_key_operation_has_exactly_one_role() {
         for op in Operation::ALL {
@@ -505,6 +601,7 @@ mod tests {
             match op {
                 Operation::DescribeConfig => assert_eq!(roles, [Role::Kdc, Role::Ldap]),
                 Operation::Ping => assert_eq!(roles, ROLES),
+                Operation::GrantSetSecret => assert_eq!(roles, [Role::Admin, Role::Ldap]),
                 _ => assert_eq!(roles.len(), 1, "{op:?}"),
             }
         }
@@ -512,12 +609,16 @@ mod tests {
 
     /// RFC 4120 3.2.3 / docs/50 R50-6, §3.5: exactly the operations of the
     /// Kerberos exchanges (roles Kdc and Ldap, except the daemon-support
-    /// operations — Q-240 item 1) are held after start.
+    /// operations — Q-240 item 1 — and the set_secret grant — Q-450 item 5)
+    /// are held after start.
     #[test]
     fn hold_down_covers_exactly_the_kerberos_operations() {
         for op in Operation::ALL {
             let kerberos = (role_permits(Role::Kdc, op) || role_permits(Role::Ldap, op))
-                && !matches!(op, Operation::DescribeConfig | Operation::Ping);
+                && !matches!(
+                    op,
+                    Operation::DescribeConfig | Operation::Ping | Operation::GrantSetSecret
+                );
             assert_eq!(startup_hold_down_applies(op), kerberos, "{op:?}");
         }
     }

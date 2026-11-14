@@ -9,7 +9,9 @@
 use dtyp::{Guid, Sid};
 use ipc::Refused;
 use ipc_keyd::{Answer, CallFailure, ConversionError, RequestFate, TransportError, Unserved};
-use keyadm::ceremony::{classify, CeremonyReport, NotSent, Outcome, Step, StepReport, Unknown};
+use keyadm::ceremony::{
+    classify, CeremonyReport, GrantReport, NotSent, Outcome, Step, StepReport, Unknown,
+};
 use keyadm::cli::{self, Command, UsageError};
 use keyadm::identity::{refuse_root, IdentityError};
 use keyadm::report::{self, EXIT_COMPLETE, EXIT_INCOMPLETE, EXIT_NOTHING_ATTEMPTED};
@@ -230,7 +232,8 @@ fn step(step: Step, outcome: Outcome<Kvno>) -> StepReport {
 
 /// docs/51 §4.3 step 11; docs/10 §10 (handles, bindings and kvnos are not
 /// secret): a complete ceremony prints each key set's handle, binding and
-/// kvno and exits 0.
+/// kvno — and, since task A15a, each first administrator's grant — and
+/// exits 0.
 #[test]
 fn a_complete_report_prints_handles_bindings_and_kvnos() {
     let m = manifest();
@@ -240,6 +243,13 @@ fn a_complete_report_prints_handles_bindings_and_kvnos() {
             .iter()
             .map(|s| step(*s, Outcome::Answered(Ok(Kvno::new(1)))))
             .collect(),
+        grants: (0..m.first_admins().len())
+            .map(|admin| GrantReport {
+                admin,
+                outcome: Outcome::Answered(Ok(())),
+            })
+            .collect(),
+        first_admins: m.first_admins().len(),
     };
     assert!(report.is_complete());
     assert_eq!(report::exit_code(&report), EXIT_COMPLETE);
@@ -249,9 +259,63 @@ fn a_complete_report_prints_handles_bindings_and_kvnos() {
         "created ldap service: principal 00000000-0000-0000-0000-000000000002 purpose Service binding NT-SRV-HST:ldap/dc1.example.test kvno 1",
         "created admin service: principal 00000000-0000-0000-0000-000000000003 purpose Service binding NT-SRV-HST:admind/dc1.example.test kvno 1",
         "ceremony complete: 3 of 3 key sets created",
+        "granted the initial secret of first administrator alice: principal 00000000-0000-0000-0000-000000000004 purpose PrincipalLongterm binding NT-PRINCIPAL:alice; live for 900 s",
+        "2 of 2 first administrators' initial secrets granted",
+        "run provision first-admin-secret within 15 minutes",
     ] {
         assert!(text.contains(expected), "{expected}\n---\n{text}");
     }
+    // Without the grants the ceremony is not complete (task A15a).
+    let without = CeremonyReport {
+        grants: Vec::new(),
+        ..report.clone()
+    };
+    assert!(!without.is_complete());
+    assert!(without.key_sets_created());
+    assert_eq!(report::exit_code(&without), EXIT_INCOMPLETE);
+}
+
+/// Task A15a (docs/questions/Q-451): a grant keyd refuses stops the
+/// ceremony after the key sets — exit 2 — and the report says that keyd
+/// grants keyadm only the initial secret of a user with no key set yet; an
+/// unknown outcome says the grant MAY exist.
+#[test]
+fn a_refused_grant_stops_after_the_key_sets() {
+    let m = manifest();
+    let created: Vec<StepReport> = Step::ALL
+        .iter()
+        .map(|s| step(*s, Outcome::Answered(Ok(Kvno::new(1)))))
+        .collect();
+    let report = CeremonyReport {
+        contact: Outcome::Answered(Ok(())),
+        steps: created.clone(),
+        grants: vec![GrantReport {
+            admin: 0,
+            outcome: Outcome::Answered(Err(KeydError::Denied)),
+        }],
+        first_admins: m.first_admins().len(),
+    };
+    assert!(!report.is_complete());
+    assert_eq!(report::exit_code(&report), EXIT_INCOMPLETE);
+    let text = report::render(&report, &m).join("\n");
+    assert!(
+        text.contains("first administrator alice: principal 00000000-0000-0000-0000-000000000004 purpose PrincipalLongterm binding NT-PRINCIPAL:alice: keyd refused the grant (denied); not granted"),
+        "{text}"
+    );
+    assert!(text.contains("0 of 2 first administrators' initial secrets granted"));
+    assert!(text.contains("initial secret of a user that has no key set yet"));
+    let unknown = CeremonyReport {
+        grants: vec![GrantReport {
+            admin: 0,
+            outcome: Outcome::Unknown(Unknown::Transport(TransportError::Closed)),
+        }],
+        ..report
+    };
+    let text = report::render(&unknown, &m).join("\n");
+    assert!(
+        text.contains("the grant MAY have been registered"),
+        "{text}"
+    );
 }
 
 /// docs/51 §4.3 step 11 ("a repeated ceremony on a keyd that was not
@@ -266,6 +330,8 @@ fn a_refused_first_step_stops_and_explains() {
             Step::Krbtgt,
             Outcome::Answered(Err(KeydError::Denied)),
         )],
+        grants: Vec::new(),
+        first_admins: m.first_admins().len(),
     };
     assert_eq!(report::exit_code(&report), EXIT_INCOMPLETE);
     assert_eq!(
@@ -298,6 +364,8 @@ fn an_unknown_outcome_says_the_key_set_may_exist() {
                 Outcome::Unknown(Unknown::Transport(TransportError::DeadlineExceeded)),
             ),
         ],
+        grants: Vec::new(),
+        first_admins: m.first_admins().len(),
     };
     assert_eq!(report::exit_code(&report), EXIT_INCOMPLETE);
     assert_eq!(report.created(), [(Step::Krbtgt, Kvno::new(1))]);
@@ -349,6 +417,8 @@ fn the_three_fates_are_reported_apart() {
         let report = CeremonyReport {
             contact: Outcome::Answered(Ok(())),
             steps: vec![step(Step::Krbtgt, outcome)],
+            grants: Vec::new(),
+            first_admins: m.first_admins().len(),
         };
         assert_eq!(report::exit_code(&report), EXIT_INCOMPLETE, "{expected}");
         assert_eq!(report.created(), []);
@@ -366,6 +436,8 @@ fn the_three_fates_are_reported_apart() {
                 Outcome::Answered(_) => unreachable!("only the three fates"),
             },
             steps: Vec::new(),
+            grants: Vec::new(),
+            first_admins: m.first_admins().len(),
         };
         assert_eq!(report::exit_code(&contact), EXIT_NOTHING_ATTEMPTED);
         let text = report::render(&contact, &m).join("\n");
@@ -390,6 +462,8 @@ fn a_failed_contact_attempts_nothing() {
         let report = CeremonyReport {
             contact,
             steps: Vec::new(),
+            grants: Vec::new(),
+            first_admins: m.first_admins().len(),
         };
         assert_eq!(report::exit_code(&report), EXIT_NOTHING_ATTEMPTED);
         let text = report::render(&report, &m).join("\n");

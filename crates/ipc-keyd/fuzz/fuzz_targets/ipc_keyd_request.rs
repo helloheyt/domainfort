@@ -14,15 +14,25 @@
 //! own operations, reached through the kdc fuzz target) and the reply
 //! encoding.
 //!
-//! Spec: docs/50 §3.3, §3.4, §9; R50-4; A-59.
+//! A decoded `grant_set_secret` (task A15a, kind `0x11`) names at most
+//! `MAX_GRANT_TARGETS` key targets — the codec's count bound; keyd judges
+//! the rest (docs/questions/Q-450 item 9).
+//!
+//! Written, not run (PENDING-OWNER P-1).
+//!
+//! Spec: docs/50 §3.3, §3.4, §9; R50-4; A-59; docs/51 §5.8.
 
 use ipc::{encode_frame, Direction};
-use ipc_keyd::{decode_request, KEYD_CHANNEL};
+use ipc_keyd::channel::MAX_GRANT_TARGETS;
+use ipc_keyd::{decode_request, Call, KEYD_CHANNEL};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|body: &[u8]| {
     match decode_request(body) {
         Ok(call) => {
+            if let Call::GrantSetSecret { targets, .. } = &call {
+                assert!(targets.len() <= MAX_GRANT_TARGETS as usize, "count bound");
+            }
             let request = call.to_wire().expect("a decoded call re-encodes");
             let frame = encode_frame(KEYD_CHANNEL, Direction::Request, &request)
                 .expect("a decoded request fits its own bound");

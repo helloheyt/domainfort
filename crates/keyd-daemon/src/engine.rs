@@ -29,9 +29,12 @@
 //!
 //! # Key-state changes: intent acknowledged, then the change (decision A-86)
 //!
-//! A call that changes keyd's key state (`keyd::changes_key_state`) and that
+//! A call that changes keyd's key state (`keyd::changes_key_state`) — or
+//! loosens keyd's authorization (`grant_set_secret`, task A15a; both:
+//! `keyd::requires_acknowledged_intent`, docs/questions/Q-452) — and that
 //! keyd's own authorization step admits (`keyd::Keyd::admits`: role,
-//! purpose) takes another path (crate::audit, steps 1-3): the intent record
+//! purpose, and for `set_secret` a live grant) takes another path
+//! (crate::audit, steps 1-3): the intent record
 //! is committed and **acknowledged by auditd before keyd runs the call**; no
 //! acknowledgement in time ⇒ `Refused::Unavailable` and keyd does not run
 //! it; after the change keyd's own record (the true result) is committed and
@@ -92,8 +95,7 @@ use ipc::{encode_refused, Refused};
 use ipc_audit::KeydOutcome;
 use ipc_keyd::{decode_request, encode_answer, Call, KEYD_CHANNEL};
 use ipc_keyd_server::{execute, Dispatch};
-use keyd::authz::HandleSlot;
-use keyd::{changes_key_state, CallerId, ConfigError, EntropySource, KeyStore, Keyd};
+use keyd::{requires_acknowledged_intent, CallerId, ConfigError, EntropySource, KeyStore, Keyd};
 use krb_proto::KerberosTime;
 use std::sync::Arc;
 use std::time::Instant;
@@ -374,6 +376,13 @@ where
         })
     }
 
+    /// The engine's keyd, for tier-1 tests that set up state (a set_secret
+    /// grant) straight in it. Tests only.
+    #[cfg(test)]
+    pub(crate) fn keyd_mut(&mut self) -> &mut Keyd<S, RecordBuffer, E> {
+        &mut self.keyd
+    }
+
     /// Serve one request body as `caller`, queued at `queued` (module
     /// documentation).
     ///
@@ -398,16 +407,18 @@ where
         // changes nothing and takes the ordinary path below (one record, as
         // before).
         let operation = call.operation();
-        if changes_key_state(operation) {
+        if requires_acknowledged_intent(operation) {
             let Some(intent) =
                 KeyStateIntent::of(caller, now, &call).filter(|intent| intent.op() == operation)
             else {
-                // keyd and the daemon disagree on what changes key state:
+                // keyd and the daemon disagree on what needs an intent:
                 // not served (fail closed; AGENTS.md §6).
                 return refuse(Refused::Unavailable);
             };
-            let handles = [(HandleSlot::Primary, intent.handle())];
-            if self.keyd.admits(&caller, operation, &handles, &now) {
+            if self
+                .keyd
+                .admits(&caller, operation, &intent.handles(), &now)
+            {
                 return self.change_key_state(caller, now, call, &intent, queued);
             }
         }

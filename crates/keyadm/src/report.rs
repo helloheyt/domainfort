@@ -18,10 +18,11 @@
 use crate::ceremony::{CeremonyReport, NotSent, Outcome, Step, Unknown};
 use ipc::Refused;
 use ipc_keyd::TransportError;
-use keyd_types::Error as KeydError;
+use keyd_types::{Error as KeydError, MAX_INITIAL_SECRET_GRANT_SECS};
 use provision_manifest::Manifest;
 
-/// Exit status: all three key sets created.
+/// Exit status: all three key sets created and every first administrator's
+/// initial secret granted.
 pub const EXIT_COMPLETE: u8 = 0;
 
 /// Exit status: nothing was attempted on keyd's key store — a usage,
@@ -29,7 +30,8 @@ pub const EXIT_COMPLETE: u8 = 0;
 pub const EXIT_NOTHING_ATTEMPTED: u8 = 1;
 
 /// Exit status: at least one `create_key` was attempted and the ceremony did
-/// not complete (see the report for which key sets exist).
+/// not complete (see the report for which key sets exist and which grants
+/// were registered).
 pub const EXIT_INCOMPLETE: u8 = 2;
 
 /// The exit status of a ceremony.
@@ -111,6 +113,55 @@ fn identifiers(step: Step, manifest: &Manifest) -> String {
     )
 }
 
+/// The identifiers of a first administrator's grant: `<sam>: principal
+/// <guid> purpose PrincipalLongterm binding <b>`.
+fn grant_identifiers(admin: usize, manifest: &Manifest) -> String {
+    match manifest.first_admins().get(admin) {
+        Some(first_admin) => {
+            let key_set = first_admin.key_set();
+            format!(
+                "{}: principal {} purpose {:?} binding {}",
+                first_admin.sam_account_name(),
+                key_set.guid_text(),
+                key_set.handle.purpose,
+                key_set.binding_text()
+            )
+        }
+        // Cannot happen: the report's indexes come from this manifest.
+        None => format!("administrator #{admin}"),
+    }
+}
+
+/// The lines of the first administrators' grants (task A15a).
+/// Spec: docs/51 §4.3 steps 11-12, §5.8 option (b); docs/questions/Q-451.
+fn render_grants(report: &CeremonyReport, manifest: &Manifest, lines: &mut Vec<String>) {
+    for grant in &report.grants {
+        let ids = grant_identifiers(grant.admin, manifest);
+        lines.push(match grant.outcome {
+            Outcome::Answered(Ok(())) => format!(
+                "granted the initial secret of first administrator {ids}; live for {} s",
+                MAX_INITIAL_SECRET_GRANT_SECS
+            ),
+            Outcome::Answered(Err(error)) => format!(
+                "first administrator {ids}: keyd refused the grant ({}); not granted",
+                keyd_error_text(error)
+            ),
+            Outcome::NotSent(reason) => format!(
+                "first administrator {ids}: {}; not granted",
+                not_sent_text(reason)
+            ),
+            Outcome::NotPerformed(refused) => format!(
+                "first administrator {ids}: {}; not granted",
+                not_performed_text(refused)
+            ),
+            Outcome::Unknown(reason) => format!(
+                "first administrator {ids}: {} after the request was sent; outcome unknown, the grant MAY have been registered",
+                unknown_text(reason)
+            ),
+        });
+    }
+}
+
 /// The report's lines, for standard output.
 /// Spec: module documentation.
 #[must_use]
@@ -164,12 +215,43 @@ pub fn render(report: &CeremonyReport, manifest: &Manifest) -> Vec<String> {
             ),
         });
     }
+    render_grants(report, manifest, &mut lines);
     let created = report.created().len();
+    let granted = report
+        .grants
+        .iter()
+        .filter(|grant| grant.outcome.succeeded())
+        .count();
     if report.is_complete() {
         lines.push(format!(
-            "ceremony complete: {created} of {} key sets created",
-            Step::ALL.len()
+            "ceremony complete: {created} of {} key sets created; {granted} of {} first administrators' initial secrets granted",
+            Step::ALL.len(),
+            report.first_admins
         ));
+        lines.push(format!(
+            "run provision first-admin-secret within {} minutes: keyd refuses a set_secret without its grant, and grants only initial secrets to keyadm (docs/51 5.8, task A15a)",
+            MAX_INITIAL_SECRET_GRANT_SECS / 60
+        ));
+        return lines;
+    }
+    if report.key_sets_created() {
+        lines.push(format!(
+            "ceremony stopped after the key sets: {created} of {} key sets created; {granted} of {} first administrators' initial secrets granted",
+            Step::ALL.len(),
+            report.first_admins
+        ));
+        if report
+            .grants
+            .iter()
+            .any(|grant| grant.outcome == Outcome::Answered(Err(KeydError::Denied)))
+        {
+            lines.push(
+                "keyd answers one uniform \"denied\": keyd grants keyadm only the initial secret of a user that has no key set yet; keyd's audit record names the reason".to_owned(),
+            );
+        }
+        lines.push(
+            "keyadm never retries: in development mode restart keyd (every key is lost) and run the whole ceremony again (docs/51 4.5, A-77)".to_owned(),
+        );
         return lines;
     }
     if report.steps.is_empty() {

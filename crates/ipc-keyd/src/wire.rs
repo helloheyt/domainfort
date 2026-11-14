@@ -16,6 +16,8 @@
 //! | raw octets keyd itself parses (`outer_req_body`, `req_body`, `ap_req_octets`) | `bytes<max>`, opaque |
 //! | password / candidate | [`Secret`] (zeroizing; `Debug` redacted) |
 //! | salt | `bytes<max>`, UTF-8 checked after the ipc layer |
+//! | `AccountKind` of a grant | `u8` (closed table: 1 User, 2 Computer) |
+//! | grant lifetime | `u32` seconds, relative — keyd adds its own clock's `now` |
 //!
 //! The ipc layer here checks only what it can check without interpreting a
 //! Kerberos value (lengths, markers, closed tables); every Kerberos value is
@@ -38,14 +40,14 @@
 //! docs/questions/Q-351 (A-87).
 
 use crate::channel::{
-    reply_kind, request_kind, MAX_ENCTYPES, MAX_REPLY_FIELD, MAX_REQUEST_FIELD, MAX_SALT,
-    MAX_SEAL_PADATA, MAX_SECRET,
+    reply_kind, request_kind, MAX_ENCTYPES, MAX_GRANT_TARGETS, MAX_REPLY_FIELD, MAX_REQUEST_FIELD,
+    MAX_SALT, MAX_SEAL_PADATA, MAX_SECRET,
 };
 use ipc::{DerBlob, Error, MessageSet, Payload, Reader, Result, Secret, Writer};
 use keyd_types::{
-    ArmorId, AuthnError, CtxId, DualControlToken, EncTypeId, ExchangeId, FastConversation,
-    IssueError, KeyHandle, KeyPurpose, Kvno, PrincipalId, Role, ServiceCtxId, TicketPolicy,
-    TOKEN_ID_LENGTH,
+    AccountKind, ArmorId, AuthnError, CtxId, DualControlToken, EncTypeId, ExchangeId,
+    FastConversation, IssueError, KeyHandle, KeyPurpose, Kvno, PrincipalId, Role, ServiceCtxId,
+    TicketPolicy, TOKEN_ID_LENGTH,
 };
 use krb_proto::{KerberosFlags, TicketFlags};
 
@@ -847,6 +849,92 @@ impl Payload for RetireKvnoRequest {
     }
 }
 
+/// Wire code of a grant's account kind. Project choice (closed table).
+/// Spec: docs/50 §3.3 ("enum = `u8` from a closed table"); docs/51 §7.3
+/// (`kind` User/Computer).
+const fn account_kind_code(kind: AccountKind) -> u8 {
+    match kind {
+        AccountKind::User => 0x01,
+        AccountKind::Computer => 0x02,
+    }
+}
+
+/// The account kind of a wire code, or `None` outside the closed table.
+/// Spec: docs/50 §3.3; docs/51 §7.3.
+const fn account_kind_from_code(code: u8) -> Option<AccountKind> {
+    match code {
+        0x01 => Some(AccountKind::User),
+        0x02 => Some(AccountKind::Computer),
+        _ => None,
+    }
+}
+
+/// One key target of `grant_set_secret`: `KeyHandle` ‖ `PrincipalBinding`.
+/// Spec: docs/51 §7.3 ("handles (1 or 2), bindings"); docs/questions/Q-450
+/// item 9.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireSetSecretTarget {
+    /// The key set's handle.
+    pub handle: KeyHandle,
+    /// The principal name the `set_secret` must name.
+    pub binding: WireBinding,
+}
+
+impl Payload for WireSetSecretTarget {
+    /// Spec: docs/questions/Q-450 item 9.
+    fn write_fields(&self, writer: &mut Writer) -> Result<()> {
+        write_handle(writer, &self.handle)?;
+        self.binding.write_fields(writer)
+    }
+
+    /// Spec: docs/questions/Q-450 item 9.
+    fn read_fields(reader: &mut Reader<'_>) -> Result<WireSetSecretTarget> {
+        let handle = read_handle(reader)?;
+        let binding = WireBinding::read_fields(reader)?;
+        Ok(WireSetSecretTarget { handle, binding })
+    }
+}
+
+/// `grant_set_secret` = kind (`u8`: 1 User, 2 Computer) ‖ targets
+/// (`seq<WireSetSecretTarget, MAX_GRANT_TARGETS>`) ‖ lifetime in seconds
+/// (`u32`). The lifetime is relative: keyd computes the expiry from its own
+/// clock (no time from the peer, R50-5). The codec checks structure only —
+/// the count bound and the closed kind table; keyd judges the shape, the
+/// purposes and the lifetime, and records its refusal.
+/// Spec: docs/51 §5.8 option (b) ("`(handle, binding, expiry)`"); docs/50
+/// §3.3, R50-5; docs/questions/Q-389 item 3 (precedent), Q-450 item 9.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantSetSecretRequest {
+    /// The account kind.
+    pub kind: AccountKind,
+    /// The key targets (1 or 2 for keyd to accept them).
+    pub targets: Vec<WireSetSecretTarget>,
+    /// How long the grant stays live, in seconds.
+    pub lifetime_secs: u32,
+}
+
+impl Payload for GrantSetSecretRequest {
+    /// Spec: docs/questions/Q-450 item 9.
+    fn write_fields(&self, writer: &mut Writer) -> Result<()> {
+        writer.write_enum(account_kind_code(self.kind))?;
+        writer.write_seq(&self.targets, MAX_GRANT_TARGETS, |w, t| t.write_fields(w))?;
+        writer.write_u32(self.lifetime_secs)
+    }
+
+    /// Spec: docs/50 §3.3 (closed tables, bounded counts); docs/questions/
+    /// Q-450 item 9.
+    fn read_fields(reader: &mut Reader<'_>) -> Result<GrantSetSecretRequest> {
+        let kind = reader.read_enum(account_kind_from_code)?;
+        let targets = reader.read_seq(MAX_GRANT_TARGETS, WireSetSecretTarget::read_fields)?;
+        let lifetime_secs = reader.read_u32()?;
+        Ok(GrantSetSecretRequest {
+            kind,
+            targets,
+            lifetime_secs,
+        })
+    }
+}
+
 /// Every request of the keyd channel. There is no field for the caller's
 /// role or for `now` in any of them (module docs).
 ///
@@ -886,6 +974,8 @@ pub enum KeydRequest {
     DescribeConfig,
     /// No field. Spec: docs/10 §7א.
     Ping,
+    /// Spec: docs/51 §5.8 option (b); docs/questions/Q-450.
+    GrantSetSecret(GrantSetSecretRequest),
 }
 
 impl MessageSet for KeydRequest {
@@ -912,6 +1002,7 @@ impl MessageSet for KeydRequest {
             KeydRequest::DestroyKeySet(_) => request_kind::DESTROY_KEY_SET,
             KeydRequest::DescribeConfig => request_kind::DESCRIBE_CONFIG,
             KeydRequest::Ping => request_kind::PING,
+            KeydRequest::GrantSetSecret(_) => request_kind::GRANT_SET_SECRET,
         }
     }
 
@@ -934,6 +1025,7 @@ impl MessageSet for KeydRequest {
             KeydRequest::RotateKrbtgt(m) => m.write_fields(writer),
             KeydRequest::RetireKvno(m) => m.write_fields(writer),
             KeydRequest::DescribeConfig | KeydRequest::Ping => Ok(()),
+            KeydRequest::GrantSetSecret(m) => m.write_fields(writer),
         }
     }
 
@@ -982,6 +1074,9 @@ impl MessageSet for KeydRequest {
             request_kind::DESTROY_KEY_SET => KeydRequest::DestroyKeySet(read_handle(reader)?),
             request_kind::DESCRIBE_CONFIG => KeydRequest::DescribeConfig,
             request_kind::PING => KeydRequest::Ping,
+            request_kind::GRANT_SET_SECRET => {
+                KeydRequest::GrantSetSecret(GrantSetSecretRequest::read_fields(reader)?)
+            }
             _ => return Err(Error::UnknownKind),
         })
     }
@@ -1408,6 +1503,9 @@ pub enum KeydReply {
     DescribeConfig(WireConfigDescription),
     /// Spec: docs/10 §7א.
     Ping,
+    /// The grant is registered. Spec: docs/51 §5.8 option (b);
+    /// docs/questions/Q-450.
+    GrantSetSecret,
     /// Spec: docs/10 §9; A-26; A-56.
     AuthnFailure(AuthnError),
     /// Spec: docs/10 §9; A-56.
@@ -1438,6 +1536,7 @@ impl MessageSet for KeydReply {
             KeydReply::DestroyKeySet => reply_kind::DESTROY_KEY_SET,
             KeydReply::DescribeConfig(_) => reply_kind::DESCRIBE_CONFIG,
             KeydReply::Ping => reply_kind::PING,
+            KeydReply::GrantSetSecret => reply_kind::GRANT_SET_SECRET,
             KeydReply::AuthnFailure(_) => reply_kind::AUTHN_FAILURE,
             KeydReply::IssueFailure(_) => reply_kind::ISSUE_FAILURE,
             KeydReply::Failure(_) => reply_kind::FAILURE,
@@ -1460,7 +1559,8 @@ impl MessageSet for KeydReply {
             KeydReply::VerifySecret
             | KeydReply::RetireKvno
             | KeydReply::DestroyKeySet
-            | KeydReply::Ping => Ok(()),
+            | KeydReply::Ping
+            | KeydReply::GrantSetSecret => Ok(()),
             KeydReply::DescribeConfig(m) => m.write_fields(writer),
             KeydReply::AuthnFailure(e) => writer.write_enum(authn_error_code(*e)),
             KeydReply::IssueFailure(e) => writer.write_enum(issue_error_code(*e)),
@@ -1500,6 +1600,7 @@ impl MessageSet for KeydReply {
                 KeydReply::DescribeConfig(WireConfigDescription::read_fields(reader)?)
             }
             reply_kind::PING => KeydReply::Ping,
+            reply_kind::GRANT_SET_SECRET => KeydReply::GrantSetSecret,
             reply_kind::AUTHN_FAILURE => {
                 KeydReply::AuthnFailure(reader.read_enum(authn_error_from_code)?)
             }

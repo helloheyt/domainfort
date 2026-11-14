@@ -21,9 +21,9 @@ use ipc_audit::{
 use ipc_keyd::{Answer, Call, KeydReply, Password, KEYD_CHANNEL};
 use ipc_keyd_server::Dispatch;
 use keyd::{
-    changes_key_state, kerberos_time_seconds, AuthnError, CallerId, DualControlToken, Error,
-    InMemoryKeyStore, KeyHandle, KeyPurpose, Kvno, Operation, OsEntropy, PrincipalBinding,
-    PrincipalId, Role,
+    kerberos_time_seconds, requires_acknowledged_intent, AccountKind, AuthnError, CallerId,
+    DualControlToken, Error, InMemoryKeyStore, KeyHandle, KeyPurpose, Kvno, Operation, OsEntropy,
+    PrincipalBinding, PrincipalId, Role, SetSecretTarget, MAX_SET_SECRET_GRANT_SECS,
 };
 use krb_proto::{KerberosString, KerberosTime, PaData, PrincipalName, Realm};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,6 +43,10 @@ const DIRECTORY: CallerId = CallerId {
 const ADMIN: CallerId = CallerId {
     uid: 807,
     role: Role::Admin,
+};
+const LDAP: CallerId = CallerId {
+    uid: 808,
+    role: Role::Ldap,
 };
 
 const REALM: &str = "EXAMPLE.ORG";
@@ -287,6 +291,39 @@ fn set_secret() -> Call {
     }
 }
 
+/// The grant dird would register for [`set_secret`]'s key set (task A15a;
+/// keyd refuses Directory's `set_secret` without one), put straight into
+/// the engine's keyd as Role::Ldap at `now`, its record drained — so each
+/// test's window holds only what the test serves.
+fn grant_bob(engine: &mut TestEngine, now: &KerberosTime) {
+    let keyd = engine.keyd_mut();
+    keyd.grant_set_secret(
+        &LDAP,
+        AccountKind::User,
+        &[SetSecretTarget {
+            handle: client(0xB0),
+            binding: binding("bob"),
+        }],
+        MAX_SET_SECRET_GRANT_SECS,
+        now,
+    )
+    .unwrap();
+    let _ = keyd.audit_sink_mut().take();
+}
+
+/// `grant_set_secret` for one user key target (a loosening: intent first,
+/// task A15a).
+fn grant(octet: u8, name: &str) -> Call {
+    Call::GrantSetSecret {
+        kind: AccountKind::User,
+        targets: vec![SetSecretTarget {
+            handle: client(octet),
+            binding: binding(name),
+        }],
+        lifetime_secs: MAX_SET_SECRET_GRANT_SECS,
+    }
+}
+
 /// A gating Directory call that changes no key state (docs/10 §6): a
 /// candidate password for a handle with no key set — keyd's uniform
 /// `Denied`.
@@ -473,6 +510,7 @@ fn audit_unreachable_refuses_gating_operations_but_serves_ping_and_describe() {
         serve(&mut engine, ADMIN, &create_key(0xA1, "alice")).0,
         Ok(Answer::CreateKey(Ok(kvno))) if kvno == Kvno::INITIAL
     ));
+    grant_bob(&mut engine, &at(601));
     assert!(matches!(
         serve(&mut engine, DIRECTORY, &set_secret()).0,
         Ok(Answer::SetSecret(Ok(kvno))) if kvno == Kvno::INITIAL
@@ -566,10 +604,12 @@ fn a_key_state_change_is_intent_then_outcome() {
     let clock = TestClock::at(t0());
     let (mut engine, gate) = engine(&clock, WindowConfig::DEFAULT, true);
     let auditd = AutoAck::start(&gate);
+    grant_bob(&mut engine, &t0());
     assert!(matches!(
         serve(&mut engine, DIRECTORY, &set_secret()).0,
         Ok(Answer::SetSecret(Ok(kvno))) if kvno == Kvno::INITIAL
     ));
+    grant_bob(&mut engine, &t0());
     assert!(matches!(
         serve(&mut engine, DIRECTORY, &set_secret()).0,
         Ok(Answer::SetSecret(Ok(kvno))) if kvno == Kvno::new(2)
@@ -613,6 +653,9 @@ fn an_unacknowledged_intent_is_unavailable_and_changes_nothing() {
         started.elapsed() >= INTENT_ACK_BUDGET,
         "the wait is the budget"
     );
+    // dird's grant (task A15a): the set_secret passes keyd's authorization
+    // step, so it takes the intent path; not run, it does not consume it.
+    grant_bob(&mut engine, &t0());
     let (answer, _) = serve_queued(&mut engine, DIRECTORY, &set_secret(), long_ago());
     assert_eq!(answer.err(), Some(Refused::Unavailable));
     let records = window_records(&gate);
@@ -760,8 +803,10 @@ fn issuance_operations_take_no_intent_and_do_not_wait() {
     assert_eq!(records[0].result, KeydOutcome::Denied);
 }
 
-/// The daemon's call classification agrees with keyd's (`changes_key_state`)
-/// for every key-state call and a sample of the others, and an intent
+/// The daemon's call classification agrees with keyd's
+/// (`requires_acknowledged_intent`: the key-state calls and, since task
+/// A15a, the grant) for every such call and a sample of the others, and an
+/// intent
 /// carries exactly what keyd's own record carries before keyd resolves
 /// anything: the kvno a `retire_kvno` names, the approvers of a
 /// `rotate_krbtgt`, nothing secret. Spec: docs/10 §6, §7, §10; A-86.
@@ -786,6 +831,7 @@ fn key_state_intents_match_keyd_and_carry_no_secret() {
         Call::DestroyKeySet {
             handle: client(0xA1),
         },
+        grant(0xA2, "carol"),
         verify_secret(0xA1),
         verify_preauth(),
         Call::DescribeConfig,
@@ -795,7 +841,7 @@ fn key_state_intents_match_keyd_and_carry_no_secret() {
         let intent = KeyStateIntent::of(ADMIN, t0(), call);
         assert_eq!(
             intent.is_some(),
-            changes_key_state(call.operation()),
+            requires_acknowledged_intent(call.operation()),
             "{:?}",
             call.operation()
         );
@@ -1038,4 +1084,142 @@ fn the_intent_budget_is_bounded_when_built() {
             Err(IntentAckBudgetOutOfRange)
         );
     }
+}
+
+/// Task A15a (docs/questions/Q-452 items 1, 3): a grant loosens keyd, so the
+/// daemon has its intent acknowledged before keyd registers it (intent,
+/// then keyd's own outcome); the `set_secret` it allows is intent and
+/// outcome as before; a second `set_secret` finds no grant and is refused
+/// at keyd's authorization step — one record (`Denied`, `NoGrant`), no
+/// intent. A grant from Role::Directory is refused the same way.
+#[test]
+fn a_grant_takes_the_intent_path_and_a_set_secret_without_one_does_not() {
+    let clock = TestClock::at(t0());
+    let (mut engine, gate) = engine(&clock, WindowConfig::DEFAULT, true);
+    let auditd = AutoAck::start(&gate);
+    assert!(matches!(
+        serve(&mut engine, LDAP, &grant(0xB0, "bob")).0,
+        Ok(Answer::GrantSetSecret(Ok(())))
+    ));
+    assert!(matches!(
+        serve(&mut engine, DIRECTORY, &set_secret()).0,
+        Ok(Answer::SetSecret(Ok(kvno))) if kvno == Kvno::INITIAL
+    ));
+    assert!(matches!(
+        serve(&mut engine, DIRECTORY, &set_secret()).0,
+        Ok(Answer::SetSecret(Err(Error::Denied)))
+    ));
+    assert!(matches!(
+        serve(&mut engine, DIRECTORY, &grant(0xB0, "bob")).0,
+        Ok(Answer::GrantSetSecret(Err(Error::Denied)))
+    ));
+    let records = auditd.wait_for(6);
+    let phases: Vec<_> = records.iter().map(|r| (r.op, r.result, r.reason)).collect();
+    assert_eq!(
+        phases,
+        [
+            (
+                KeydOperation::GrantSetSecret,
+                KeydOutcome::Intent,
+                KeydReason::None
+            ),
+            (
+                KeydOperation::GrantSetSecret,
+                KeydOutcome::Success,
+                KeydReason::None
+            ),
+            (
+                KeydOperation::SetSecret,
+                KeydOutcome::Intent,
+                KeydReason::None
+            ),
+            (
+                KeydOperation::SetSecret,
+                KeydOutcome::Success,
+                KeydReason::None
+            ),
+            (
+                KeydOperation::SetSecret,
+                KeydOutcome::Denied,
+                KeydReason::NoGrant
+            ),
+            (
+                KeydOperation::GrantSetSecret,
+                KeydOutcome::Denied,
+                KeydReason::RoleNotPermitted
+            ),
+        ]
+    );
+    assert_eq!(records[0].caller_role, KeydRole::Ldap);
+    assert_eq!(records[0].principal, Some([0xB0; 16]));
+    assert_eq!(records[4].caller_role, KeydRole::Directory);
+    assert_eq!(gate.unrecorded_outcomes(), 0);
+}
+
+/// Task A15a (docs/questions/Q-452 item 2): a computer grant's intent names
+/// its first key target as the record's handle and its second (the Service
+/// key set) as the secondary key — as keyd's own record of it — and no
+/// binding; an unacknowledged grant intent is `NotPerformed` and registers
+/// nothing.
+#[test]
+fn a_computer_grant_intent_carries_its_second_target() {
+    let host = KeyHandle::new(PrincipalId::from_bytes([0xC7; 16]), KeyPurpose::Service);
+    let call = Call::GrantSetSecret {
+        kind: AccountKind::Computer,
+        targets: vec![
+            SetSecretTarget {
+                handle: client(0xC7),
+                binding: binding("ws7$"),
+            },
+            SetSecretTarget {
+                handle: host,
+                binding: binding("host-ws7"),
+            },
+        ],
+        lifetime_secs: MAX_SET_SECRET_GRANT_SECS,
+    };
+    let intent = KeyStateIntent::of(LDAP, t0(), &call).unwrap();
+    let EventBody::Keyd(record) = intent.event(KeydOutcome::Intent) else {
+        panic!("a keyd record");
+    };
+    assert_eq!(record.op, KeydOperation::GrantSetSecret);
+    assert_eq!(record.principal, Some([0xC7; 16]));
+    assert_eq!(record.purpose, Some(KeyPurposeCode::PrincipalLongterm));
+    let secondary = record.secondary.unwrap();
+    assert_eq!(secondary.principal, [0xC7; 16]);
+    assert_eq!(secondary.purpose, KeyPurposeCode::Service);
+    assert_eq!(secondary.kvno, None);
+
+    // Not acknowledged in time: Unavailable, NotPerformed, nothing granted.
+    let clock = TestClock::at(t0());
+    let (mut engine, gate) = engine_with(
+        &clock,
+        WindowConfig::DEFAULT,
+        true,
+        IntentAckBudget::PRODUCTION,
+    );
+    let (answer, _) = serve_queued(&mut engine, LDAP, &call, long_ago());
+    assert_eq!(answer.err(), Some(Refused::Unavailable));
+    let phases: Vec<_> = window_records(&gate)
+        .iter()
+        .map(|r| (r.op, r.result))
+        .collect();
+    assert_eq!(
+        phases,
+        [
+            (KeydOperation::GrantSetSecret, KeydOutcome::Intent),
+            (KeydOperation::GrantSetSecret, KeydOutcome::NotPerformed),
+        ]
+    );
+    let _auditd = AutoAck::start(&gate);
+    let ws7 = Call::SetSecret {
+        handle: client(0xC7),
+        binding: binding("ws7$"),
+        password: Password::new(Zeroizing::new(String::from("tier-one-test-pass"))),
+        salt: String::from("EXAMPLE.ORGhostws7"),
+    };
+    assert!(matches!(
+        serve(&mut engine, DIRECTORY, &ws7).0,
+        Ok(Answer::SetSecret(Err(Error::Denied)))
+    ));
 }

@@ -88,11 +88,20 @@ pub const MAX_SEAL_PADATA: u32 = 32;
 /// Spec: docs/10 §1 (EncType list); docs/50 §3.4 (`DescribeConfig`).
 pub const MAX_ENCTYPES: u32 = 4;
 
+/// Bound of the key-target list of `grant_set_secret`: keyd-types'
+/// `MAX_GRANT_TARGETS` (a computer's two key sets). The codec refuses a
+/// longer list; keyd judges the shape of a shorter one (and records why it
+/// refuses it), as the dird-admin codec leaves semantic checks to its PEP
+/// (docs/questions/Q-389 item 3).
+/// Spec: docs/51 §5.2 row 5, §7.3; docs/questions/Q-450 item 9.
+pub const MAX_GRANT_TARGETS: u32 = 2;
+
 // The bounds agree with the values they are derived from; checked at compile
 // time, never at run time.
 const _: () = assert!(MAX_REQUEST_FIELD as usize == kdc::MAX_REQUEST_LEN);
 const _: () = assert!(MAX_REPLY_FIELD as usize == krb_proto::limits::MAX_MESSAGE_LEN);
 const _: () = assert!(MAX_SEAL_PADATA as usize == krb_proto::limits::MAX_PADATA);
+const _: () = assert!(MAX_GRANT_TARGETS as usize == keyd_types::MAX_GRANT_TARGETS);
 const _: () = assert!(MAX_REQUEST_FIELD < MAX_REQUEST_BODY);
 const _: () = assert!(MAX_REPLY_FIELD < MAX_REPLY_BODY);
 
@@ -134,6 +143,9 @@ pub mod request_kind {
     pub const DESCRIBE_CONFIG: u8 = 0x0F;
     /// `ping` (every role). Spec: docs/10 §7א.
     pub const PING: u8 = 0x10;
+    /// `grant_set_secret` (Ldap, Admin). Appended by task A15a.
+    /// Spec: docs/51 §5.8 option (b); docs/questions/Q-450 item 9.
+    pub const GRANT_SET_SECRET: u8 = 0x11;
 
     /// The closed request table. Spec: docs/50 §3.3, §3.4.
     pub const ALL: &[u8] = &[
@@ -153,6 +165,7 @@ pub mod request_kind {
         DESTROY_KEY_SET,
         DESCRIBE_CONFIG,
         PING,
+        GRANT_SET_SECRET,
     ];
 }
 
@@ -202,6 +215,9 @@ pub mod reply_kind {
     pub const DESCRIBE_CONFIG: u8 = ok(rq::DESCRIBE_CONFIG);
     /// `()`. Spec: docs/10 §7א.
     pub const PING: u8 = ok(rq::PING);
+    /// `()`: the grant is registered. Spec: docs/51 §5.8 option (b);
+    /// docs/questions/Q-450 item 9.
+    pub const GRANT_SET_SECRET: u8 = ok(rq::GRANT_SET_SECRET);
     /// A refusal of an authentication step: `keyd_types::AuthnError`.
     /// Spec: docs/10 §9; A-26; A-56.
     pub const AUTHN_FAILURE: u8 = 0xF1;
@@ -231,6 +247,7 @@ pub mod reply_kind {
         DESTROY_KEY_SET,
         DESCRIBE_CONFIG,
         PING,
+        GRANT_SET_SECRET,
         AUTHN_FAILURE,
         ISSUE_FAILURE,
         FAILURE,

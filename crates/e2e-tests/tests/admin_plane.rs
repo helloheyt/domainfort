@@ -294,6 +294,26 @@ fn provisioning_to_a_new_users_login() {
             }
             other => panic!("SetPassword: {other:?}"),
         }
+        // Task A15a (the attack of docs/questions/Q-291): a Directory client
+        // like admind that calls keyd's set_secret with no BeginPasswordSet
+        // before it — here for alice, a Tier-0 administrator — is refused
+        // with keyd's uniform Denied: dird's PDP never granted it. Nothing
+        // changes (alice keeps her password; her later operations work).
+        let alice_key_set = w.manifest.first_admins()[0].key_set().clone();
+        let mut rogue = key_state_client(&w.aux_keyd_socket, w.uid);
+        let rogue_call = ipc_keyd::Call::SetSecret {
+            handle: alice_key_set.handle,
+            binding: alice_key_set.binding.clone(),
+            password: ipc_keyd::Password::new(zeroize::Zeroizing::new(ROGUE_PASSWORD.to_owned())),
+            salt: format!("{REALM}{ALICE}"),
+        };
+        assert!(
+            matches!(
+                rogue.call_with_fate(&rogue_call),
+                Ok(ipc_keyd::Answer::SetSecret(Err(keyd_types::Error::Denied)))
+            ),
+            "a set_secret without dird's grant is refused (task A15a)"
+        );
         // CreateUser makes N|D (docs/51 §5.2 row 1): enable before the login.
         assert_eq!(
             w.forward(
@@ -490,6 +510,55 @@ fn provisioning_to_a_new_users_login() {
             "then the workstation fixture"
         );
         assert!(fixture.1 < dave_secret.0, "then admind's set_secret");
+        // The grants (task A15a): the ceremony's for each first
+        // administrator (Admin), then — after dird's PDP — dird's for dave
+        // (Ldap), each acknowledged as an intent first and before the
+        // set_secret it allows.
+        let ceremony_grants: Vec<(u64, u64)> = m
+            .first_admins()
+            .iter()
+            .map(|a| {
+                intent_then_success(
+                    &keyd,
+                    KeydOperation::GrantSetSecret,
+                    &a.key_set().handle,
+                    KeydRole::Admin,
+                )
+            })
+            .collect();
+        let fixture_grant = intent_then_success(
+            &keyd,
+            KeydOperation::GrantSetSecret,
+            &w.workstation.keys[0].handle,
+            KeydRole::Ldap,
+        );
+        let dave_grant = intent_then_success(
+            &keyd,
+            KeydOperation::GrantSetSecret,
+            &longterm(dave),
+            KeydRole::Ldap,
+        );
+        assert!(last(&ceremony) < first(&ceremony_grants));
+        assert!(last(&ceremony_grants) < first(&first_admins));
+        assert!(fixture_grant.1 < fixture.0);
+        assert!(
+            dave_grant.1 < dave_secret.0,
+            "dird's grant, then admind's set_secret"
+        );
+        // The rogue set_secret: one record, refused at keyd's authorization
+        // step for want of a grant — no intent (A-88).
+        let rogue: Vec<&KeydRecord> = keyd
+            .iter()
+            .filter(|(_, r)| {
+                r.op == KeydOperation::SetSecret
+                    && r.reason == KeydReason::NoGrant
+                    && r.principal == Some(*alice_key_set.handle.principal.as_bytes())
+            })
+            .map(|(_, r)| *r)
+            .collect();
+        assert_eq!(rogue.len(), 1, "{rogue:?}");
+        assert_eq!(rogue[0].result, KeydOutcome::Denied);
+        assert_eq!(rogue[0].caller_role, KeydRole::Directory);
         assert!(
             keyd.iter()
                 .any(|(_, r)| r.op == KeydOperation::OpenAndVerifyServiceTicket

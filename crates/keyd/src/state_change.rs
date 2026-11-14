@@ -31,6 +31,15 @@
 //! would put an auditd round trip (a disk sync) in front of every step of
 //! every Kerberos exchange.
 //!
+//! **Not key state, not bookkeeping — a grant.** `grant_set_secret` (task
+//! A15a) changes no key either, and its table is in memory and lost at every
+//! start; but a grant makes keyd *less* strict — Role::Directory may then run
+//! a `set_secret` keyd would otherwise refuse. So it is audited as a
+//! key-state change is: intent acknowledged first, then the outcome
+//! ([`loosens_authorization`], [`requires_acknowledged_intent`];
+//! docs/questions/Q-452). Consuming a grant (inside `set_secret`, already a
+//! key-state change) only makes keyd stricter again.
+//!
 //! # The authorization step
 //!
 //! [`Keyd::admits`] runs exactly the first step of every operation
@@ -82,14 +91,68 @@ pub const fn changes_key_state(op: Operation) -> bool {
         | Operation::SealFastError
         | Operation::OpenAndVerifyServiceTicket
         | Operation::DescribeConfig
+        | Operation::Ping
+        | Operation::GrantSetSecret => false,
+    }
+}
+
+/// `true` if `op` makes keyd **less** strict without changing key state:
+/// `grant_set_secret`, which lets Role::Directory run one `set_secret` it
+/// would otherwise be refused (task A15a). Every other change keyd makes to
+/// its in-memory tables only ever makes it stricter (module documentation,
+/// "Not key state — bookkeeping").
+///
+/// A grant is not a key-state change — no key version is installed, rotated,
+/// retired or destroyed, and it expires by itself — but it is not
+/// bookkeeping either: the A-88 rule for bookkeeping ("only ever stricter,
+/// one record") does not cover it. It is audited like a key-state change:
+/// its intent is acknowledged by auditd before keyd registers it, then its
+/// outcome ([`requires_acknowledged_intent`]; docs/questions/Q-452 item 1).
+///
+/// The match is exhaustive: a new operation does not compile until it is
+/// classified here.
+///
+/// Spec: docs/51 §5.8 option (b); docs/questions/Q-291 (A-74), Q-365 item 2
+/// (A-88), Q-452.
+#[must_use]
+pub const fn loosens_authorization(op: Operation) -> bool {
+    match op {
+        Operation::GrantSetSecret => true,
+        Operation::VerifyPreauth
+        | Operation::IssueAsRep
+        | Operation::OpenAndVerifyTgt
+        | Operation::IssueTgsRep
+        | Operation::SetSecret
+        | Operation::VerifySecret
+        | Operation::CreateKey
+        | Operation::RotateKey
+        | Operation::RotateKrbtgt
+        | Operation::RetireKvno
+        | Operation::OpenFastArmor
+        | Operation::SealFastError
+        | Operation::DestroyKeySet
+        | Operation::OpenAndVerifyServiceTicket
+        | Operation::DescribeConfig
         | Operation::Ping => false,
     }
+}
+
+/// `true` if the daemon must have the intent of `op` acknowledged by auditd
+/// before keyd runs it (A-86 / A-88): a key-state change
+/// ([`changes_key_state`]) or a change that loosens keyd's authorization
+/// ([`loosens_authorization`]).
+///
+/// Spec: docs/questions/Q-346 (A-86), Q-365 (A-88), Q-452 item 1.
+#[must_use]
+pub const fn requires_acknowledged_intent(op: Operation) -> bool {
+    changes_key_state(op) || loosens_authorization(op)
 }
 
 impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// Whether the first step of every operation — the role check (I2), the
     /// purpose check of each `(slot, handle)` (I3), then the startup
-    /// hold-down — passes for `caller` running `op` at `now`. It is the same
+    /// hold-down, and for `set_secret` a live grant for the `Primary` handle
+    /// (task A15a) — passes for `caller` running `op` at `now`. It is the same
     /// check the operation itself runs first ([`Keyd::admit`]); here it runs
     /// alone: nothing is read or written beyond the compile-time tables and
     /// the hold-down's end, and **no audit record is emitted** (the

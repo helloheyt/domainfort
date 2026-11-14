@@ -24,6 +24,7 @@ use crate::enctype::to_crypto;
 use crate::entropy::{EntropySource, OsEntropy};
 use crate::error::{ConfigError, Deny, Internal};
 use crate::fast_armor::ArmorEntry;
+use crate::grant::GrantTable;
 use crate::model::{KeyHandle, KeyPurpose, Kvno, PrincipalId};
 use crate::replay::ReplayCache;
 use crate::service_ticket::ServiceContextEntry;
@@ -66,6 +67,9 @@ pub struct Keyd<S: KeyStore, A: AuditSink, E: EntropySource = OsEntropy> {
     pub(crate) service_contexts: TokenTable<ServiceContextEntry>,
     /// The one replay cache of every AP-REQ keyd verifies (RFC 4120 3.2.3).
     pub(crate) replay: ReplayCache,
+    /// The set_secret grants (task A15a; docs/51 §5.8 option (b);
+    /// docs/questions/Q-450): in memory, bounded, lost at every start.
+    pub(crate) grants: GrantTable,
     /// The last second (on the [`kerberos_time_seconds`] scale) of the
     /// startup hold-down: the start time given at construction plus
     /// [`STARTUP_HOLD_DOWN_SKEW_INTERVALS`] × `clock_skew_secs`
@@ -164,6 +168,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             armors: TokenTable::new(config.max_armor_contexts),
             service_contexts: TokenTable::new(config.max_service_contexts),
             replay: ReplayCache::new(config.replay_cache_capacity),
+            grants: GrantTable::new(keyd_types::MAX_SET_SECRET_GRANTS),
             preauth_throttle: FailureWindowThrottle::new(config.preauth_throttle),
             throttle,
             enctypes,
@@ -210,11 +215,22 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// before the start (a clock stepped back) is held too: the elapsed time
     /// cannot be established (fail closed).
     ///
+    /// Then, for `set_secret` only, the **grant** (task A15a; docs/51 §5.8
+    /// option (b)): a live grant must name the handle in the `Primary` slot
+    /// — registered by dird (Role::Ldap) after its PDP allowed the password
+    /// set, or by keyadm's ceremony (Role::Admin) for a first administrator.
+    /// None ⇒ the uniform `Denied`, reason `NoGrant`: decided from the grant
+    /// table alone, before any key set is read, so it is an authorization
+    /// refusal like the role check — one record, no intent (A-88), nothing
+    /// changed. The grant is consumed by the operation right after this step
+    /// (crate grant.rs, "Matching").
+    ///
     /// Spec: docs/10 §2, §11, §12 I2, I3; RFC 4120 3.2.3 ("MUST reject all
     /// requests until the clock skew interval has passed, providing assurance
     /// that any lost or replayed authenticators will fall outside the
     /// allowable clock skew"); docs/50 R50-6, §3.5; docs/questions/Q-222
-    /// (A-56), Q-240 items 1, 3 (A-62); AGENTS.md §6 (fail closed).
+    /// (A-56), Q-240 items 1, 3 (A-62); AGENTS.md §6 (fail closed); docs/51
+    /// §5.8; docs/questions/Q-291 (A-74), Q-450 items 1, 7.
     pub(crate) fn admit(
         &self,
         caller: &CallerId,
@@ -223,10 +239,18 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         now: &KerberosTime,
     ) -> Internal<()> {
         authorize(caller, op, handles)?;
-        if startup_hold_down_applies(op)
-            && kerberos_time_seconds(now) <= self.startup_hold_down_until
-        {
+        let now_s = kerberos_time_seconds(now);
+        if startup_hold_down_applies(op) && now_s <= self.startup_hold_down_until {
             return Err(Deny::startup_hold_down());
+        }
+        if op == Operation::SetSecret {
+            let granted = handles
+                .iter()
+                .find(|(slot, _)| *slot == HandleSlot::Primary)
+                .is_some_and(|(_, handle)| self.grants.is_live(handle, now_s));
+            if !granted {
+                return Err(Deny::denied(AuditReason::NoGrant));
+            }
         }
         Ok(())
     }
@@ -270,6 +294,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> fmt::Debug for Keyd<S, A, E> {
             .field("live_tgt_contexts", &self.contexts.len())
             .field("live_armor_contexts", &self.armors.len())
             .field("live_service_contexts", &self.service_contexts.len())
+            .field("set_secret_grants", &self.grants.len())
             .finish()
     }
 }

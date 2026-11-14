@@ -84,6 +84,11 @@ pub enum Note {
     /// An admin operation's outcome event could not be committed after the
     /// operation (its decision event documents it).
     AdminOutcomeUnrecorded,
+    /// A committed `BeginPasswordSet` was answered `Unavailable`: keyd did
+    /// not register the set_secret grant (task A15a; docs/questions/Q-453
+    /// item 1). The id is the failure's class: 1 keyd refused it, 2 not
+    /// performed, 3 outcome unknown.
+    AdminGrantNotRegistered,
     /// Stopped.
     Stopped,
 }
@@ -130,6 +135,10 @@ impl Note {
             Note::AdminAuditUnavailable => "admin operation refused: auditd cannot take its events",
             Note::AdminOutcomeUnrecorded => {
                 "admin operation outcome event not recorded (its decision event was)"
+            }
+            Note::AdminGrantNotRegistered => {
+                "password set begun but keyd did not register its set_secret grant: answered \
+                 unavailable (no password set); failure class"
             }
             Note::Stopped => "stopped",
         }

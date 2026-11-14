@@ -10,7 +10,7 @@
 //!   new connection before anything is sent (A-63, docs/51 §7.1), one
 //!   request in flight, the held connection checked before reuse and never
 //!   a resend (A-87), replies decoded strictly and checked to answer the
-//!   request; deadline `ipc_dird_admin::DEFAULT_DEADLINE` (20 s, Q-389
+//!   request; deadline `ipc_dird_admin::DEFAULT_DEADLINE` (24 s, A-100; Q-389
 //!   item 5).
 //! * **keyd** — `ipc_keyd::KeydClient` under Role::Directory (keyd's
 //!   `uid_roles` maps admind's uid to Directory, A-57, A-73): keyd's uid

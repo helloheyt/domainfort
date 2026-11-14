@@ -53,6 +53,7 @@ fn pa_with(password: &str, salt: &str, kvno: u32) -> krb_proto::PaData {
 #[test]
 fn set_secret_on_a_new_set_returns_the_initial_kvno() {
     let mut f = Fixture::new();
+    f.grant(&CAROL, &bound(carol_name()), &now()).unwrap();
     assert_eq!(
         f.keyd.set_secret(
             &DIRECTORY,
@@ -90,6 +91,7 @@ fn set_secret_on_an_existing_set_returns_current_plus_one() {
     let mut f = Fixture::new();
     // alice was created at kvno 1 by the fixture.
     for (password, expected) in [("second", 2), ("third", 3)] {
+        f.grant(&ALICE, &alice_binding(), &now()).unwrap();
         assert_eq!(
             f.keyd.set_secret(
                 &DIRECTORY,
@@ -124,6 +126,7 @@ fn set_secret_on_an_existing_set_returns_current_plus_one() {
         f.keyd.rotate_key(&ADMIN, &SERVICE, &now()),
         Ok(Kvno::new(2))
     );
+    f.grant(&SERVICE, &service_binding(), &now()).unwrap();
     assert_eq!(
         f.keyd.set_secret(
             &DIRECTORY,
@@ -148,6 +151,7 @@ fn set_secret_on_an_existing_set_returns_current_plus_one() {
 fn destroyed_handle_is_unknown_to_every_operation() {
     let mut f = Fixture::new();
     // Give alice a previous version too: the whole set must go.
+    f.grant(&ALICE, &alice_binding(), &now()).unwrap();
     assert_eq!(
         f.keyd.set_secret(
             &DIRECTORY,
@@ -221,7 +225,9 @@ fn destroyed_handle_is_unknown_to_every_operation() {
     assert_eq!(f.records().last().unwrap().reason, AuditReason::KeyNotFound);
 
     // Recreating needs a creation-valid binding (a krbtgt name is refused,
-    // and nothing is created) ...
+    // and nothing is created) — even with a grant naming it (task A15a: the
+    // grant does not judge bindings; set_secret does) ...
+    f.grant(&ALICE, &krbtgt_binding(), &now()).unwrap();
     assert_eq!(
         f.keyd.set_secret(
             &DIRECTORY,
@@ -243,6 +249,7 @@ fn destroyed_handle_is_unknown_to_every_operation() {
     );
     assert_eq!(f.records().last().unwrap().reason, AuditReason::KeyNotFound);
     // ... and then starts again from the initial kvno.
+    f.grant(&ALICE, &alice_binding(), &now()).unwrap();
     assert_eq!(
         f.keyd.set_secret(
             &DIRECTORY,
@@ -302,6 +309,7 @@ fn destroy_discards_live_proofs_of_the_key_set() {
         )
         .unwrap();
     f.keyd.destroy_key_set(&ADMIN, &ALICE, &now()).unwrap();
+    f.grant(&ALICE, &alice_binding(), &now()).unwrap();
     assert_eq!(
         f.keyd.set_secret(
             &DIRECTORY,
@@ -347,6 +355,27 @@ fn destroy_is_per_handle_not_per_principal() {
         name_type: KRB_NT_SRV_HST,
         name_string: vec![kstr("host"), kstr("ws05.example.org")],
     };
+    // One computer grant for both key sets, as dird registers it after
+    // BeginPasswordSet (task A15a; docs/47 §9.1).
+    assert_eq!(
+        f.keyd.grant_set_secret(
+            &LDAP,
+            keyd::AccountKind::Computer,
+            &[
+                keyd::SetSecretTarget {
+                    handle: client,
+                    binding: bound(client_name.clone()),
+                },
+                keyd::SetSecretTarget {
+                    handle: service,
+                    binding: bound(service_name.clone()),
+                },
+            ],
+            keyd::MAX_SET_SECRET_GRANT_SECS,
+            &now(),
+        ),
+        Ok(())
+    );
     for (handle, name) in [(client, client_name), (service, service_name)] {
         assert_eq!(
             f.keyd.set_secret(

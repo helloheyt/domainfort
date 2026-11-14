@@ -10,7 +10,13 @@
 //!   `uid → Role` map is built from that file;
 //! - the privilege drop replaced by a recorder (the tests never run as
 //!   root — task A6: "the privilege drop goes behind a trait"), and the
-//!   terminal by a scripted one (a real TTY cannot be driven in CI).
+//!   terminal by a scripted one (a real TTY cannot be driven in CI);
+//! - `keyadm ceremony` first (task A15a: keyd refuses Role::Directory's
+//!   `set_secret` without a grant, and the ceremony grants each first
+//!   administrator's initial secret — docs/51 §5.8, docs/questions/Q-451),
+//!   through keyadm's public API on a second socket of the same keyd where
+//!   the test's uid holds Role::Admin (keyd-daemon `ExtraListener`, tests
+//!   only — docs/questions/Q-453).
 //!
 //! keyd offers no operation that reads a key (docs/10 §7), so what keyd set
 //! is checked through `set_secret`'s kvno, keyd's `verify_secret`
@@ -40,7 +46,7 @@ use ipc::{FrameReader, Refused};
 use ipc_audit::{EventBody, KeyPurposeCode, KeydOperation, KeydOutcome, KeydRecord};
 use ipc_keyd::{ClientConfigError, KeydClient, TransportError, Unserved, DEFAULT_DEADLINE};
 use keyd_daemon::startup::development_keyd;
-use keyd_daemon::{CallerMap, SystemClock};
+use keyd_daemon::{CallerMap, ExtraListener, SystemClock};
 use keyd_types::{Error as KeydError, Kvno};
 use krb_proto::Realm;
 use provision::first_admin::entry::{EntryError, Terminal};
@@ -239,13 +245,26 @@ struct World {
     manifest: Manifest,
     auditd: FakeAuditd,
     daemon: Option<Daemon>,
+    /// The same keyd's second socket, where the test's uid is keyadm's
+    /// Role::Admin (task A15a; tests only).
+    admin_socket: PathBuf,
 }
 
 /// The test passwords (constructed by hand; obviously test data).
 const ALICE_PW: &str = "Velvet-Harbor-Quince-58";
 const BOB_PW: &str = "Cobalt-Meadow-Ferry-17";
 
+/// The world after `keyadm ceremony` (its three key sets and the first
+/// administrators' initial-secret grants, task A15a).
 fn world() -> Option<World> {
+    let world = world_without_ceremony()?;
+    let report = world.ceremony();
+    assert!(report.is_complete(), "{report:?}");
+    Some(world)
+}
+
+/// The world before `keyadm ceremony`: keyd holds no key set and no grant.
+fn world_without_ceremony() -> Option<World> {
     let dir = common::TempDir::new();
     let uid = common::my_uid(&dir);
     if common::skip_as_root(uid) {
@@ -273,7 +292,15 @@ fn world() -> Option<World> {
     );
     let callers = CallerMap::from_role_map(keyd_settings.uid_roles()).unwrap();
     let keyd_dir = support::TempDir::new();
-    let params = params(&keyd_dir, callers, uid);
+    let mut params = params(&keyd_dir, callers, uid);
+    // keyadm's role on a second socket of the same keyd: one test uid
+    // cannot be admind's and keyadm's in one uid map (R50-3), and the
+    // ceremony's grants must be in the keyd that first-admin-secret uses.
+    let admin_socket = keyd_dir.join("kx.sock");
+    params.extra_listeners = vec![ExtraListener {
+        socket: admin_socket.clone(),
+        callers: CallerMap::new(&[(uid, keyd::Role::Admin)]).unwrap(),
+    }];
     let auditd = FakeAuditd::start(&params.audit.socket);
     let realm = Realm::new(keyd_settings.realm()).unwrap();
     let daemon = Daemon::start(params, SystemClock, development_keyd(realm)).unwrap();
@@ -289,12 +316,41 @@ fn world() -> Option<World> {
         manifest,
         auditd,
         daemon: Some(daemon),
+        admin_socket,
     })
 }
 
 impl World {
     fn keyd_socket(&self) -> PathBuf {
         self.daemon.as_ref().unwrap().socket.clone()
+    }
+
+    /// `keyadm ceremony` (its public API) as Role::Admin on the same keyd.
+    fn ceremony(&self) -> keyadm::ceremony::CeremonyReport {
+        let mut client = KeydClient::new(
+            connector::new(&self.admin_socket),
+            self.uid,
+            DEFAULT_DEADLINE,
+        )
+        .unwrap();
+        keyadm::ceremony::run(&mut client, &self.manifest)
+    }
+
+    /// keyd's GrantSetSecret outcome records so far (intents apart).
+    fn grant_records(&self) -> Vec<KeydRecord> {
+        self.auditd
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                EventBody::Keyd(record)
+                    if record.op == KeydOperation::GrantSetSecret
+                        && record.result != KeydOutcome::Intent =>
+                {
+                    Some(*record)
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     fn keyd(&self) -> TestKeyd {
@@ -475,6 +531,8 @@ fn both_first_admins_get_kvno_1_and_keyd_verifies_each_password() {
     assert!(text.contains("complete: 2 of 2"), "{text}");
     assert!(text.contains("development mode (A-77)"), "{text}");
     assert!(!text.contains("note: keyd already held"), "{text}");
+    let debug = format!("{report:?}");
+    assert!(!debug.contains(ALICE_PW) && !debug.contains(BOB_PW));
 
     assert_eq!(world.verify(0, ALICE_PW), Ok(()));
     assert_eq!(world.verify(1, BOB_PW), Ok(()));
@@ -499,11 +557,14 @@ fn both_first_admins_get_kvno_1_and_keyd_verifies_each_password() {
     world.stop();
 }
 
-/// A-77 / A-35 (docs/51 §4.5): a second run against a keyd that still
-/// holds the key sets installs kvno 2 for each — and says so; keyd then
-/// verifies the new passwords.
+/// Task A15a (docs/51 §5.8 option (b); docs/questions/Q-451): the
+/// ceremony's grants are one-time and cover initial secrets only — a second
+/// run against a keyd that still holds the key sets is refused at the first
+/// administrator (keyd's uniform Denied, `NoGrant` in its audit), and
+/// keyadm cannot grant a replacement (`KeyExists`): the provisioning path
+/// never resets a password past dird's PDP. The first passwords stay.
 #[test]
-fn a_second_run_gives_kvno_2_and_says_so() {
+fn a_second_run_is_refused_without_a_new_grant() {
     let Some(world) = world() else {
         return;
     };
@@ -513,16 +574,93 @@ fn a_second_run_gives_kvno_2_and_says_so() {
     let bob2 = "Saffron-Pylon-Delta-93";
     let (second, _) = run_files(&world, &world.both_files(alice2, bob2));
     let second = second.unwrap();
-    let two = Kvno::INITIAL.next().unwrap();
-    assert_eq!(second.set(), [("alice", two), ("bob", two)]);
-    let text = render(&second).join("\n");
-    assert!(
-        text.contains("note: keyd already held a key set for alice, so this run installed kvno 2 - a re-run against a keyd that still holds the keys simply sets a new kvno (A-35)"),
-        "{text}"
+    assert_eq!(second.steps.len(), 1, "stopped at the first administrator");
+    assert_eq!(
+        second.steps[0].outcome,
+        Outcome::Answered(Err(KeydError::Denied))
     );
-    assert!(text.contains("set bob: "), "{text}");
-    assert_eq!(world.verify(0, alice2), Ok(()));
-    assert_eq!(world.verify(1, bob2), Ok(()));
+    assert_eq!(exit_code(&second), EXIT_INCOMPLETE);
+    let text = render(&second).join("\n");
+    assert!(text.contains("no live grant"), "{text}");
+    assert!(support::eventually(Duration::from_secs(10), || world
+        .auditd
+        .events()
+        .iter()
+        .any(|e| matches!(e, EventBody::Keyd(r)
+            if r.op == KeydOperation::SetSecret
+                && r.reason == ipc_audit::KeydReason::NoGrant))));
+    // keyadm cannot grant alice another initial secret: her key set exists.
+    let mut admin = KeydClient::new(
+        connector::new(&world.admin_socket),
+        world.uid,
+        DEFAULT_DEADLINE,
+    )
+    .unwrap();
+    let alice = world.manifest.first_admins()[0].key_set();
+    assert_eq!(
+        admin.grant_set_secret(
+            keyd_types::AccountKind::User,
+            &[keyd_types::SetSecretTarget {
+                handle: alice.handle,
+                binding: alice.binding.clone(),
+            }],
+            keyd_types::MAX_INITIAL_SECRET_GRANT_SECS,
+        ),
+        Err(KeydError::Denied)
+    );
+    assert_eq!(world.verify(0, ALICE_PW), Ok(()));
+    assert_eq!(world.verify(1, BOB_PW), Ok(()));
+    assert_eq!(world.verify(0, alice2), Err(KeydError::Denied));
+    world.stop();
+}
+
+/// Task A15a (the attack Q-291 describes, on the provisioning path): without
+/// keyadm ceremony's grant a Directory client cannot set a first
+/// administrator's secret — keyd's uniform Denied, `NoGrant` in its audit,
+/// no key set created; the report explains it. After the ceremony the same
+/// command succeeds, and the ceremony recorded one grant per administrator.
+#[test]
+fn without_the_ceremony_grant_the_first_admin_secret_is_denied() {
+    let Some(world) = world_without_ceremony() else {
+        return;
+    };
+    let (result, _) = run_files(&world, &world.both_files(ALICE_PW, BOB_PW));
+    let report = result.unwrap();
+    assert_eq!(report.steps.len(), 1);
+    assert_eq!(
+        report.steps[0].outcome,
+        Outcome::Answered(Err(KeydError::Denied))
+    );
+    assert_eq!(exit_code(&report), EXIT_INCOMPLETE);
+    let text = render(&report).join("\n");
+    assert!(text.contains("run keyadm ceremony first"), "{text}");
+    assert!(support::eventually(Duration::from_secs(10), || !world
+        .set_secret_records()
+        .is_empty()));
+    let refused = &world.set_secret_records()[0];
+    assert_eq!(refused.result, KeydOutcome::Denied);
+    assert_eq!(refused.reason, ipc_audit::KeydReason::NoGrant);
+    assert_eq!(world.verify(0, ALICE_PW), Err(KeydError::Denied));
+
+    let ceremony = world.ceremony();
+    assert!(ceremony.is_complete(), "{ceremony:?}");
+    assert!(support::eventually(Duration::from_secs(10), || world
+        .grant_records()
+        .len()
+        >= 2));
+    let grants = world.grant_records();
+    for (record, admin) in grants.iter().zip(world.manifest.first_admins()) {
+        assert_eq!(record.result, KeydOutcome::Success);
+        assert_eq!(record.caller_role, ipc_audit::KeydRole::Admin);
+        assert_eq!(
+            record.principal,
+            Some(*admin.key_set().handle.principal.as_bytes())
+        );
+        assert_eq!(record.purpose, Some(KeyPurposeCode::PrincipalLongterm));
+    }
+    let (result, _) = run_files(&world, &world.both_files(ALICE_PW, BOB_PW));
+    assert!(result.unwrap().is_complete());
+    assert_eq!(world.verify(0, ALICE_PW), Ok(()));
     world.stop();
 }
 
@@ -1076,11 +1214,15 @@ fn no_password_appears_in_any_output() {
     let mut out = Vec::new();
     let mut err = Vec::new();
     let mut debug = String::new();
+    // `twice`: run the command once for its Debug text, then printed. The
+    // successful run is printed only: the ceremony's grants are one-time
+    // (task A15a), so a second run would be refused.
     let mut run_one = |request: &FirstAdminSecret,
                        lines: &[&str],
                        keyd: &mut TestKeyd,
                        out: &mut Vec<u8>,
-                       err: &mut Vec<u8>| {
+                       err: &mut Vec<u8>,
+                       twice: bool| {
         let log: Log = Rc::default();
         let mut drop = recorder(&log);
         let mut term = if lines.is_empty() {
@@ -1089,7 +1231,9 @@ fn no_password_appears_in_any_output() {
             terminal(&log, lines)
         };
         let mut e = env(&world, &mut drop, &mut term, keyd);
-        debug.push_str(&format!("{:?}", run(request, &mut e)));
+        if twice {
+            debug.push_str(&format!("{:?}", run(request, &mut e)));
+        }
         execute(request, &mut e, out, err)
     };
     let pw_short = "Short-pw-11";
@@ -1097,11 +1241,15 @@ fn no_password_appears_in_any_output() {
     let pw_mismatch = "Cobalt-Meadow-Ferry-18";
     let files = world.pair("ok", ALICE_PW, BOB_PW);
     let mut keyd = world.keyd();
-    // Success, then a re-run (kvno 2) — each `run_one` runs the command
-    // twice (once for the Debug text, once printed).
+    // Success (printed), then a re-run refused for want of a grant (task
+    // A15a) — run twice.
     assert_eq!(
-        run_one(&files, &[], &mut keyd, &mut out, &mut err),
+        run_one(&files, &[], &mut keyd, &mut out, &mut err, false),
         EXIT_COMPLETE
+    );
+    assert_eq!(
+        run_one(&files, &[], &mut keyd, &mut out, &mut err, true),
+        EXIT_INCOMPLETE
     );
     // Rule refusals.
     run_one(
@@ -1110,6 +1258,7 @@ fn no_password_appears_in_any_output() {
         &mut keyd,
         &mut out,
         &mut err,
+        true,
     );
     run_one(
         &world.pair("name", ALICE_PW, pw_name),
@@ -1117,6 +1266,7 @@ fn no_password_appears_in_any_output() {
         &mut keyd,
         &mut out,
         &mut err,
+        true,
     );
     // A terminal mismatch, and terminal entries that succeed.
     let terminal_request = world.request(Vec::new());
@@ -1126,11 +1276,12 @@ fn no_password_appears_in_any_output() {
         &mut keyd,
         &mut out,
         &mut err,
+        true,
     );
     // keyd unreachable, refusing, silent.
     let mut gone = world.keyd();
     gone.socket = world.dir.join("gone.sock");
-    run_one(&files, &[], &mut gone, &mut out, &mut err);
+    run_one(&files, &[], &mut gone, &mut out, &mut err, true);
     for (name, mode) in [
         ("r1.sock", OnSetSecret::Refuse(Refused::Unavailable)),
         ("s1.sock", OnSetSecret::Silence),

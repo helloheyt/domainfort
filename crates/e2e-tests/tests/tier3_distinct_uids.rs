@@ -193,6 +193,7 @@ fn deploy_and_check(base: &Path) -> Result<(), String> {
         queue_capacity: 16,
         window: ipc_audit::WindowConfig::DEFAULT,
         intent_ack_budget: keyd_daemon::IntentAckBudget::PRODUCTION,
+        extra_listeners: Vec::new(),
     };
     let keyd_clock = TestClock::at(keyd_started());
     let clock = keyd_clock.clone();

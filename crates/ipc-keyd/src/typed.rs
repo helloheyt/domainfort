@@ -20,19 +20,20 @@
 //! Q-245 item 1.
 
 use crate::wire::{
-    CreateKeyRequest, IssueAsRepRequest, IssueTgsRepRequest, KeydReply, KeydRequest,
-    OpenAndVerifyServiceTicketRequest, OpenAndVerifyTgtRequest, OpenFastArmorRequest,
+    CreateKeyRequest, GrantSetSecretRequest, IssueAsRepRequest, IssueTgsRepRequest, KeydReply,
+    KeydRequest, OpenAndVerifyServiceTicketRequest, OpenAndVerifyTgtRequest, OpenFastArmorRequest,
     RetireKvnoRequest, RotateKrbtgtRequest, SealFastErrorRequest, SetSecretRequest,
     VerifyPreauthRequest, VerifySecretRequest, WireAsTemplate, WireAuthnProof, WireBinding,
-    WireConfigDescription, WireFastArmor, WireRepParts, WireServiceContext, WireTgsFast,
-    WireTgsTemplate, WireTgtContext, WireTime,
+    WireConfigDescription, WireFastArmor, WireRepParts, WireServiceContext, WireSetSecretTarget,
+    WireTgsFast, WireTgsTemplate, WireTgtContext, WireTime,
 };
 use core::fmt;
 use ipc::{DerBlob, Secret};
 use keyd_types::{
-    ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof, ConfigDescription, CtxId,
-    DualControlToken, FastArmor, FastConversation, IssueError, KeyHandle, Kvno, Operation,
-    PrincipalBinding, Role, ServiceContext, TgsRepParts, TgsTicketTemplate, TgtContext,
+    AccountKind, ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof, ConfigDescription,
+    CtxId, DualControlToken, FastArmor, FastConversation, IssueError, KeyHandle, Kvno, Operation,
+    PrincipalBinding, Role, ServiceContext, SetSecretTarget, TgsRepParts, TgsTicketTemplate,
+    TgtContext,
 };
 use krb_proto::{
     ApReq, EncryptedData, KerberosTime, KrbError, KrbFastArmoredReq, KrbFastReq, PaData,
@@ -348,6 +349,15 @@ pub enum Call {
     DescribeConfig,
     /// Spec: docs/10 §7א.
     Ping,
+    /// Spec: docs/51 §5.8 option (b); docs/questions/Q-450.
+    GrantSetSecret {
+        /// The account kind.
+        kind: AccountKind,
+        /// The key targets.
+        targets: Vec<SetSecretTarget>,
+        /// How long the grant stays live, in seconds (keyd's clock).
+        lifetime_secs: u32,
+    },
 }
 
 impl Call {
@@ -372,6 +382,7 @@ impl Call {
             Call::DestroyKeySet { .. } => Operation::DestroyKeySet,
             Call::DescribeConfig => Operation::DescribeConfig,
             Call::Ping => Operation::Ping,
+            Call::GrantSetSecret { .. } => Operation::GrantSetSecret,
         }
     }
 
@@ -509,6 +520,23 @@ impl Call {
             Call::DestroyKeySet { handle } => KeydRequest::DestroyKeySet(*handle),
             Call::DescribeConfig => KeydRequest::DescribeConfig,
             Call::Ping => KeydRequest::Ping,
+            Call::GrantSetSecret {
+                kind,
+                targets,
+                lifetime_secs,
+            } => KeydRequest::GrantSetSecret(GrantSetSecretRequest {
+                kind: *kind,
+                targets: targets
+                    .iter()
+                    .map(|t| {
+                        Ok(WireSetSecretTarget {
+                            handle: t.handle,
+                            binding: wire_binding(&t.binding)?,
+                        })
+                    })
+                    .collect::<Converted<Vec<WireSetSecretTarget>>>()?,
+                lifetime_secs: *lifetime_secs,
+            }),
         })
     }
 
@@ -615,6 +643,20 @@ impl Call {
             KeydRequest::DestroyKeySet(handle) => Call::DestroyKeySet { handle },
             KeydRequest::DescribeConfig => Call::DescribeConfig,
             KeydRequest::Ping => Call::Ping,
+            KeydRequest::GrantSetSecret(m) => Call::GrantSetSecret {
+                kind: m.kind,
+                targets: m
+                    .targets
+                    .iter()
+                    .map(|t| {
+                        Ok(SetSecretTarget {
+                            handle: t.handle,
+                            binding: binding(&t.binding)?,
+                        })
+                    })
+                    .collect::<Converted<Vec<SetSecretTarget>>>()?,
+                lifetime_secs: m.lifetime_secs,
+            },
         })
     }
 }
@@ -701,6 +743,8 @@ pub enum Answer {
     DescribeConfig(Result<DescribedConfig, keyd_types::Error>),
     /// Spec: docs/10 §7א.
     Ping(Result<(), keyd_types::Error>),
+    /// Spec: docs/51 §5.8 option (b); docs/questions/Q-450.
+    GrantSetSecret(Result<(), keyd_types::Error>),
 }
 
 /// A success payload, or keyd's error carried by `failure`.
@@ -740,6 +784,7 @@ impl Answer {
             Answer::DestroyKeySet(_) => Operation::DestroyKeySet,
             Answer::DescribeConfig(_) => Operation::DescribeConfig,
             Answer::Ping(_) => Operation::Ping,
+            Answer::GrantSetSecret(_) => Operation::GrantSetSecret,
         }
     }
 
@@ -866,6 +911,9 @@ impl Answer {
                 KeydReply::Failure,
             ),
             Answer::Ping(r) => outcome(r, |()| Ok(KeydReply::Ping), KeydReply::Failure),
+            Answer::GrantSetSecret(r) => {
+                outcome(r, |()| Ok(KeydReply::GrantSetSecret), KeydReply::Failure)
+            }
         }
     }
 
@@ -976,6 +1024,8 @@ impl Answer {
             (Operation::DescribeConfig, R::Failure(e)) => Answer::DescribeConfig(Err(e)),
             (Operation::Ping, R::Ping) => Answer::Ping(Ok(())),
             (Operation::Ping, R::Failure(e)) => Answer::Ping(Err(e)),
+            (Operation::GrantSetSecret, R::GrantSetSecret) => Answer::GrantSetSecret(Ok(())),
+            (Operation::GrantSetSecret, R::Failure(e)) => Answer::GrantSetSecret(Err(e)),
             _ => return Err(ConversionError::UnexpectedReply),
         })
     }

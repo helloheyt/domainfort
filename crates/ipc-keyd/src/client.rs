@@ -107,10 +107,10 @@ use core::fmt;
 use core::time::Duration;
 use ipc::{decode_reply, encode_frame, Direction, FrameLimit, Refused, Reply};
 use keyd_types::{
-    ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof, ConfigDescription, CtxId,
-    DualControlToken, FastArmor, FastConversation, IssueError, KeyCustody, KeyHandle, Kvno,
-    PrincipalBinding, Role, ServiceContext, TgsFastRequest, TgsRepParts, TgsTicketTemplate,
-    TgtContext,
+    AccountKind, ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof, ConfigDescription,
+    CtxId, DualControlToken, FastArmor, FastConversation, IssueError, KeyCustody, KeyHandle, Kvno,
+    PrincipalBinding, Role, ServiceContext, SetSecretTarget, TgsFastRequest, TgsRepParts,
+    TgsTicketTemplate, TgtContext,
 };
 use krb_proto::{ApReq, EncryptedData, KerberosTime, KrbError, KrbFastArmoredReq, PaData};
 use std::time::Instant;
@@ -888,6 +888,37 @@ impl<C: Connector> KeydClient<C> {
     pub fn ping(&mut self) -> Result<(), keyd_types::Error> {
         match self.call(&Call::Ping) {
             Ok(Answer::Ping(result)) => result,
+            _ => Err(keyd_types::Error::Unavailable),
+        }
+    }
+
+    /// `grant_set_secret` (Role::Ldap — dird after its PDP; Role::Admin —
+    /// keyadm's ceremony): register a one-time grant, live for
+    /// `lifetime_secs` by keyd's clock, that lets Role::Directory run one
+    /// `set_secret` on each of `targets` with exactly its binding.
+    ///
+    /// It loosens keyd, so keyd-daemon has its intent acknowledged by auditd
+    /// before keyd registers it (as for a key-state change, A-88):
+    /// `Err(Unavailable)` here is keyd's own answer **or** any failure of the
+    /// call; a caller that must tell "not registered" from "outcome unknown"
+    /// sends [`Call::GrantSetSecret`] with [`KeydClient::call_with_fate`].
+    /// Added by task A15a; every existing method is unchanged.
+    ///
+    /// Spec: docs/51 §5.8 option (b); docs/50 §3.4; docs/questions/Q-291
+    /// (A-74), Q-450, Q-452.
+    pub fn grant_set_secret(
+        &mut self,
+        kind: AccountKind,
+        targets: &[SetSecretTarget],
+        lifetime_secs: u32,
+    ) -> Result<(), keyd_types::Error> {
+        let call = Call::GrantSetSecret {
+            kind,
+            targets: targets.to_vec(),
+            lifetime_secs,
+        };
+        match self.call(&call) {
+            Ok(Answer::GrantSetSecret(result)) => result,
             _ => Err(keyd_types::Error::Unavailable),
         }
     }

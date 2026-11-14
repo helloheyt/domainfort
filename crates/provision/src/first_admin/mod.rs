@@ -9,8 +9,21 @@
 //! order holds because `provision domain` already wrote the first
 //! administrators' `pwdLastSet` (step 5). In development mode keyd keeps
 //! keys in memory only (P-17), so steps 11-12 are repeated after every
-//! keyd restart (A-77); against a keyd that still holds the key sets the
-//! command simply installs the next kvno (A-35) and says so.
+//! keyd restart (A-77).
+//!
+//! **The ceremony's grants** (task A15a; docs/51 §5.8 option (b);
+//! docs/questions/Q-451): keyd refuses Role::Directory's `set_secret`
+//! unless a live, one-time grant names the key set — and dird, which
+//! registers the grants of every later password set, does not run yet. So
+//! `keyadm ceremony` (Role::Admin) grants each first administrator's
+//! **initial** secret, live 15 minutes (`MAX_INITIAL_SECRET_GRANT_SECS`);
+//! this command consumes them. Without the ceremony's grant — never run,
+//! expired, already consumed, or a key set that exists already — keyd
+//! answers its uniform `Denied`, and the report says why that may be. This
+//! command itself needs no change: it never names a grant; keyd matches the
+//! handle and binding the manifest gives both tools. Against a keyd that
+//! still holds the key sets a second run is therefore refused: later
+//! password changes go through admind and dird's PDP.
 //!
 //! # The run ([`run`])
 //!

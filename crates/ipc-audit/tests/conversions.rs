@@ -244,6 +244,35 @@ fn keyd_outcomes_never_map_to_a_phase_code() {
     }
 }
 
+/// Task A15a (docs/questions/Q-452 item 4): the four grant reasons map to
+/// their own same-named codes, never `Unlisted`.
+#[test]
+fn keyd_grant_reasons_match() {
+    for reason in [
+        keyd::AuditReason::NoGrant,
+        keyd::AuditReason::GrantMismatch,
+        keyd::AuditReason::GrantInvalid,
+        keyd::AuditReason::GrantTableFull,
+    ] {
+        let record = keyd::AuditRecord {
+            ts: ktime(),
+            caller_role: keyd::Role::Directory,
+            caller_uid: 1,
+            op: keyd::Operation::SetSecret,
+            principal: None,
+            purpose: None,
+            kvno: None,
+            secondary: None,
+            approvers: None,
+            result: keyd::AuditOutcome::Denied,
+            reason,
+        };
+        let wire = KeydRecord::from(&record).reason;
+        assert_eq!(wire.name(), format!("{reason:?}"));
+        assert_ne!(wire, KeydReason::Unlisted);
+    }
+}
+
 /// Every keyd operation and role maps to the same-named code.
 #[test]
 fn keyd_operations_and_roles_match() {

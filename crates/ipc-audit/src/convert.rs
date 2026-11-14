@@ -178,7 +178,8 @@ mod from_keyd {
             FastErrorPadataRefused, ArmorAlreadyAttempted, ChallengeEncTypeMismatch,
             ArmorProofMismatch, FastBindingMismatch, TgsExplicitArmor, FastApReqMismatch,
             ArmorConversationMismatch, ServiceKeyNotRandom, TransitedNotLocal,
-            ApChecksumUnsupported, StartupHoldDown,
+            ApChecksumUnsupported, StartupHoldDown, NoGrant, GrantMismatch, GrantInvalid,
+            GrantTableFull,
         }
             _ => KeydReason::Unlisted,
         )
@@ -199,7 +200,7 @@ mod from_keyd {
                     VerifyPreauth, IssueAsRep, OpenAndVerifyTgt, IssueTgsRep, SetSecret,
                     VerifySecret, CreateKey, RotateKey, RotateKrbtgt, RetireKvno,
                     OpenFastArmor, SealFastError, DestroyKeySet, OpenAndVerifyServiceTicket,
-                    DescribeConfig, Ping,
+                    DescribeConfig, Ping, GrantSetSecret,
                 }),
                 principal: record.principal.map(|id| *id.as_bytes()),
                 purpose: record.purpose.as_ref().map(purpose),

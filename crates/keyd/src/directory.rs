@@ -63,11 +63,21 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// identify its existing binding (RFC 4120 6.2 equivalence) or the call
     /// is refused — a password change can never rename a principal.
     ///
+    /// **The grant** (task A15a; docs/51 §5.8 option (b)): a live grant for
+    /// the handle — registered by dird after its PDP, or by keyadm's
+    /// ceremony for a first administrator (`grant_set_secret`) — is required
+    /// at the authorization step (no grant ⇒ the uniform `Denied`, reason
+    /// `NoGrant`) and consumed right after it, whatever the rest decides.
+    /// Its binding must be `binding` exactly (else `GrantMismatch`); an
+    /// initial-secret grant also requires that the key set does not exist
+    /// yet (else `GrantMismatch`).
+    ///
     /// Spec: docs/10 §6 (`set_secret(principal, purpose, material, salt) ->
     /// Kvno`, "derives keys inside, zeroizes plaintext"), §12 I1, I7;
     /// docs/questions/Q-115 (A-35: "keyd chooses the next kvno and returns
     /// it"); RFC 4120 5.2.9 (kvno, UInt32); RFC 3961 §3; RFC 3962 §4;
-    /// RFC 4120 6.2; docs/questions/Q-040 (A-19).
+    /// RFC 4120 6.2; docs/questions/Q-040 (A-19); docs/51 §5.8;
+    /// docs/questions/Q-291 (A-74), Q-450 items 1, 7, Q-451 item 2.
     pub fn set_secret(
         &mut self,
         caller: &CallerId,
@@ -85,25 +95,38 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
                 &[(HandleSlot::Primary, handle)],
                 now,
             )
-            .and_then(|()| self.set_secret_inner(handle, binding, &password, salt, &mut fields));
+            .and_then(|()| {
+                self.set_secret_inner(handle, binding, &password, salt, now, &mut fields)
+            });
         drop(password);
         self.emit(caller, Operation::SetSecret, now, &fields, &result);
         result.map_err(Error::from)
     }
 
-    /// `set_secret` after [`Keyd::admit`] passed.
+    /// `set_secret` after [`Keyd::admit`] passed (which found a live grant).
     fn set_secret_inner(
         &mut self,
         handle: &KeyHandle,
         binding: &PrincipalBinding,
         password: &str,
         salt: &str,
+        now: &KerberosTime,
         fields: &mut AuditFields,
     ) -> Internal<Kvno> {
+        // The grant is consumed by this presentation, before anything else
+        // is decided (one attempt per grant; crate grant.rs).
+        let redeemed = self
+            .grants
+            .redeem(handle, binding, kerberos_time_seconds(now))?;
         if !self.store.accepts(handle.purpose) {
             return Err(Deny::denied(AuditReason::StoreRefusedCritical));
         }
         let existing = self.store.get(handle);
+        if redeemed.initial_only && existing.is_some() {
+            // An initial-secret grant (Role::Admin) never replaces a
+            // password (docs/questions/Q-451 item 2).
+            return Err(Deny::denied(AuditReason::GrantMismatch));
+        }
         match existing {
             Some(set) => check_binding(set.binding(), &binding.realm, &binding.name)?,
             None => check_new_binding(&self.config.realm, handle.purpose, binding)?,
@@ -322,7 +345,7 @@ mod tests {
     use crate::authz::Role;
     use crate::model::{KeyPurpose, PrincipalId};
     use crate::store::InMemoryKeyStore;
-    use keyd_types::EncTypeId;
+    use keyd_types::{AccountKind, EncTypeId, SetSecretTarget};
     use krb_proto::{KerberosString, PrincipalName, Realm};
 
     #[derive(Default)]
@@ -337,6 +360,10 @@ mod tests {
     const DIRECTORY: CallerId = CallerId {
         uid: 200,
         role: Role::Directory,
+    };
+    const LDAP: CallerId = CallerId {
+        uid: 400,
+        role: Role::Ldap,
     };
     const SALT: &str = "EXAMPLE.ORGcarol";
 
@@ -379,6 +406,26 @@ mod tests {
         // held anyway) is long over.
         let started = KerberosTime::new(2026, 11, 12, 10, 0, 0).unwrap();
         let mut keyd = Keyd::new(config, store, Records::default(), &started).unwrap();
+        // The grants dird would register (task A15a): one for each handle.
+        let target = |handle: KeyHandle| SetSecretTarget {
+            handle,
+            binding: binding(),
+        };
+        let below_max_account = KeyHandle::new(below_max.principal, KeyPurpose::PrincipalLongterm);
+        assert_eq!(
+            keyd.grant_set_secret(&LDAP, AccountKind::User, &[target(at_max)], 30, &now),
+            Ok(())
+        );
+        assert_eq!(
+            keyd.grant_set_secret(
+                &LDAP,
+                AccountKind::Computer,
+                &[target(below_max_account), target(below_max)],
+                30,
+                &now
+            ),
+            Ok(())
+        );
 
         let refused = keyd.set_secret(
             &DIRECTORY,

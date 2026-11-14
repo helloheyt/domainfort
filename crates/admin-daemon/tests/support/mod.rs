@@ -8,18 +8,25 @@
 //!   harness, reused through `#[path]`), the test's uid mapped to the
 //!   `admind` source, so the production binding table accepts admind's
 //!   `Admind` events; they are read back from the verified log.
-//! * **keyd (Role::Ldap)** — crates/keyd-daemon's real daemon holding the
-//!   admin service's key set `(admind-svc$, Service)`, created by
-//!   `create_key` from scripted test entropy so the test knows the key; dird
-//!   verifies the administrators' AP-REQs through it (A-73).
-//! * **keyd (Role::Directory)** — a second real keyd daemon, the test's uid
-//!   mapped to Directory: admind's `set_secret` goes there (A-57). (One uid
-//!   has one role, R50-3, so the single-uid harness runs two keyds.) Or, by
-//!   option, the same with the uid mapped to Admin (keyd refuses
-//!   `set_secret`), or a silent keyd that accepts and never answers.
+//! * **keyd** — crates/keyd-daemon's real daemon holding the admin
+//!   service's key set `(admind-svc$, Service)`, created by `create_key`
+//!   from scripted test entropy so the test knows the key. On its socket
+//!   the test's uid is **Role::Ldap**: dird verifies the administrators'
+//!   AP-REQs through it (A-73) and registers the set_secret grant of every
+//!   `BeginPasswordSet` (task A15a). On a **second socket of the same
+//!   keyd** (`kd.sock`; keyd-daemon `ExtraListener`, tests only —
+//!   docs/questions/Q-453) the test's uid is **Role::Directory**: admind's
+//!   `set_secret` goes there (A-57) and is checked against the very grant
+//!   table dird's grant went into. (One uid has one role per map, R50-3;
+//!   before task A15a the harness ran two keyds, which a grant cannot
+//!   cross.) Or, by option, `kd.sock` maps the uid to Admin (keyd refuses
+//!   `set_secret`), or `kd.sock` is a silent server that accepts and never
+//!   answers.
 //! * **dird** — crates/directory-daemon's `serve_with_admin` with its admin
 //!   service over a provisioned directory, its own fake auditd recording the
-//!   `DirAdmin` events (crates/keyd-daemon's tier-2 `FakeAuditd`).
+//!   `DirAdmin` events (crates/keyd-daemon's tier-2 `FakeAuditd`). In the
+//!   recording-dird mode the same keyd runs (without the admin service's
+//!   key set), and the recording dird registers bob's grant as dird would.
 //! * **admind** — `admin_daemon::serve` on its own thread, its dird and keyd
 //!   clients built from this crate's public `DirdLink` / `KeydLink` with the
 //!   connectors of the host (Linux: the production connectors; elsewhere a
@@ -73,7 +80,7 @@ use ipc::{FrameReader, Refused};
 use ipc_audit::{AdmindEvent, DirAdminEvent, EventBody, KeydRecord};
 use ipc_dird_admin::Operation;
 use keyd::{InMemoryKeyStore, Keyd, Role};
-use keyd_daemon::{CallerMap, RecordBuffer};
+use keyd_daemon::{CallerMap, ExtraListener, RecordBuffer};
 use krb_crypto::ProtocolKey;
 use krb_proto::constants::{DOMAIN_X500_COMPRESS, KRB_NT_PRINCIPAL};
 use krb_proto::{
@@ -837,6 +844,10 @@ fn read_frame(stream: &mut UnixStream, limit: ipc::FrameLimit) -> Option<Vec<u8>
 /// `PrincipalLongterm` key set bound to `NT-PRINCIPAL [bob]`, the salt
 /// `EXAMPLE.ORGbob` — docs/47 §9.1; [MS-KILE] 3.1.1.2 as cited there), and
 /// `CompletePasswordSet`, answered `Done`.
+///
+/// With `grants` (keyd's socket where the test's uid is Role::Ldap), it
+/// registers the set_secret grant of bob's key targets before it answers
+/// `BeginPasswordSet` — as dird does after its PDP (task A15a).
 pub struct RecordingDird {
     path: PathBuf,
     stop: Arc<AtomicBool>,
@@ -846,7 +857,12 @@ pub struct RecordingDird {
 }
 
 impl RecordingDird {
-    pub fn start(path: &Path, reply: ipc_dird_admin::Reply, key_targets: bool) -> RecordingDird {
+    pub fn start(
+        path: &Path,
+        reply: ipc_dird_admin::Reply,
+        key_targets: bool,
+        grants: Option<(PathBuf, u32)>,
+    ) -> RecordingDird {
         let _ = std::fs::remove_file(path);
         let listener = UnixListener::bind(path).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -863,8 +879,9 @@ impl RecordingDird {
                             stream.set_nonblocking(false).unwrap();
                             held.lock().unwrap().push(stream.try_clone().unwrap());
                             let (received, reply) = (Arc::clone(&received), reply.clone());
+                            let grants = grants.clone();
                             std::thread::spawn(move || {
-                                serve_dird(stream, &received, &reply, key_targets)
+                                serve_dird(stream, &received, &reply, key_targets, grants)
                             });
                         }
                         Err(e) if e.kind() == ErrorKind::WouldBlock => {
@@ -901,11 +918,41 @@ fn bob_key_targets(target: Guid) -> ipc_dird_admin::Reply {
     })
 }
 
+/// The grant dird registers for a `PasswordSet` answer (task A15a): keyd
+/// (Role::Ldap) `grant_set_secret` for exactly its key targets.
+fn register_grant(grants: &(PathBuf, u32), answer: &ipc_dird_admin::Reply) {
+    let ipc_dird_admin::Reply::PasswordSet(set) = answer else {
+        return;
+    };
+    let kind = match set.kind {
+        ipc_dird_admin::AccountKind::User => keyd::AccountKind::User,
+        ipc_dird_admin::AccountKind::Computer => keyd::AccountKind::Computer,
+    };
+    let targets: Vec<keyd::SetSecretTarget> = set
+        .keys
+        .iter()
+        .map(|k| keyd::SetSecretTarget {
+            handle: k.handle,
+            binding: k.binding.clone(),
+        })
+        .collect();
+    let mut client = ipc_keyd::KeydClient::new(
+        connectors::keyd(&grants.0),
+        grants.1,
+        ipc_keyd::DEFAULT_DEADLINE,
+    )
+    .unwrap();
+    client
+        .grant_set_secret(kind, &targets, keyd::MAX_SET_SECRET_GRANT_SECS)
+        .unwrap();
+}
+
 fn serve_dird(
     mut stream: UnixStream,
     received: &Mutex<Vec<ipc_dird_admin::Request>>,
     reply: &ipc_dird_admin::Reply,
     key_targets: bool,
+    grants: Option<(PathBuf, u32)>,
 ) {
     while let Some(body) = read_frame(&mut stream, ipc_dird_admin::REQUEST_LIMIT) {
         let Ok(request) = ipc_dird_admin::decode_request(&body) else {
@@ -916,7 +963,13 @@ fn serve_dird(
             ipc_dird_admin::Request::Operation {
                 operation: Operation::BeginPasswordSet { target },
                 ..
-            } if key_targets => bob_key_targets(*target),
+            } if key_targets => {
+                let answer = bob_key_targets(*target);
+                if let Some(grants) = &grants {
+                    register_grant(grants, &answer);
+                }
+                answer
+            }
             ipc_dird_admin::Request::Operation {
                 operation: Operation::CompletePasswordSet { .. },
                 ..
@@ -1217,16 +1270,24 @@ pub struct World {
     pub auditd_dir: auditd::TempDir,
     pub auditd: Option<auditd::Server>,
     pub dird_auditd: Option<FakeAuditd>,
-    pub keyd_ldap_auditd: Option<FakeAuditd>,
-    pub keyd_dir_auditd: Option<FakeAuditd>,
-    pub keyd_ldap: Option<dird::keyd::Daemon>,
-    pub keyd_dir: Option<dird::keyd::Daemon>,
+    /// The fake auditd of the one keyd (both of its sockets).
+    pub keyd_auditd: Option<FakeAuditd>,
+    /// The one keyd: Role::Ldap on its socket, admind's role on `kd.sock`.
+    pub keyd: Option<dird::keyd::Daemon>,
+    /// The keyd's clock (the grant tests move it).
+    pub keyd_clock: Option<TestClock>,
     pub silent_keyd: Option<SilentServer>,
     pub recording: Option<RecordingDird>,
     pub dird: Option<DirdRun>,
     pub admind: Option<AdmindRun>,
     pub admin_socket: PathBuf,
+    /// The keyd socket where the test's uid is Role::Ldap (dird's).
+    pub keyd_ldap_socket: PathBuf,
+    /// The keyd socket where the test's uid is admind's role (or the silent
+    /// server's).
     pub keyd_dir_socket: PathBuf,
+    /// dird's admin socket (the real dird's or the recording one's).
+    pub dird_socket: PathBuf,
     /// keyadm's keyd (task A10), when started.
     pub keyadm_keyd: Option<dird::keyd::Daemon>,
     pub keyadm_keyd_auditd: Option<FakeAuditd>,
@@ -1253,24 +1314,42 @@ impl World {
             true,
         );
 
+        // The one keyd: Role::Ldap on its socket (dird's), admind's role
+        // on `kd.sock` — unless admind's keyd is the silent server.
+        let keyd_dir_socket = dir.join("kd.sock");
+        let mut keyd_params =
+            dird::keyd::params(&dir, CallerMap::new(&[(uid, Role::Ldap)]).unwrap(), uid);
+        keyd_params.audit.socket = dir.join("ka.sock");
+        let keyd_socket = keyd_params.keyd_socket.clone();
+        let admind_role = match options.keyd {
+            KeydMode::Directory => Some(Role::Directory),
+            KeydMode::Admin => Some(Role::Admin),
+            KeydMode::Silent => None,
+        };
+        if let Some(role) = admind_role {
+            keyd_params.extra_listeners = vec![ExtraListener {
+                socket: keyd_dir_socket.clone(),
+                callers: CallerMap::new(&[(uid, role)]).unwrap(),
+            }];
+        }
+        let keyd_auditd = FakeAuditd::start(&keyd_params.audit.socket);
+        let keyd_clock = TestClock::at(common::keyd_started());
+        let keyd_run =
+            dird::keyd::Daemon::start(keyd_params, keyd_clock.clone(), admin_keyd).unwrap();
+        keyd_clock.set(common::now());
+        let silent_keyd = match options.keyd {
+            KeydMode::Silent => Some(SilentServer::start(&keyd_dir_socket)),
+            KeydMode::Directory | KeydMode::Admin => None,
+        };
+
         // The dird side.
         let mut store = None;
-        let (mut dird_auditd, mut keyd_ldap_auditd, mut keyd_ldap, mut dird_run, mut recording) =
-            (None, None, None, None, None);
+        let (mut dird_auditd, mut dird_run, mut recording) = (None, None, None);
         let dird_socket = dir.join("m.sock");
         match &options.dird {
             DirdMode::Real => {
                 let provisioned = provision(&dir.join("s.redb"));
-                let mut keyd_params =
-                    dird::keyd::params(&dir, CallerMap::new(&[(uid, Role::Ldap)]).unwrap(), uid);
-                keyd_params.audit.socket = dir.join("ka.sock");
-                let keyd_socket = keyd_params.keyd_socket.clone();
-                keyd_ldap_auditd = Some(FakeAuditd::start(&keyd_params.audit.socket));
-                let clock = TestClock::at(common::keyd_started());
-                keyd_ldap = Some(
-                    dird::keyd::Daemon::start(keyd_params, clock.clone(), admin_keyd).unwrap(),
-                );
-                clock.set(common::now());
+                let keyd_socket = keyd_socket.clone();
                 let mut params = dird::params(&dir, uid, uid, Duration::from_secs(5), 4);
                 params.clock = SharedClock::new(FixedNow);
                 dird_auditd = Some(FakeAuditd::start(&params.audit.socket));
@@ -1307,42 +1386,9 @@ impl World {
                     &dird_socket,
                     reply.clone(),
                     *key_targets,
+                    Some((keyd_socket.clone(), uid)),
                 ));
             }
-        }
-
-        // admind's keyd.
-        let keyd_dir_socket = dir.join("kd.sock");
-        let (mut keyd_dir_auditd, mut keyd_dir, mut silent_keyd) = (None, None, None);
-        match options.keyd {
-            KeydMode::Directory | KeydMode::Admin => {
-                let role = if options.keyd == KeydMode::Directory {
-                    Role::Directory
-                } else {
-                    Role::Admin
-                };
-                let mut keyd_params =
-                    dird::keyd::params(&dir, CallerMap::new(&[(uid, role)]).unwrap(), uid);
-                keyd_params.keyd_socket = keyd_dir_socket.clone();
-                keyd_params.audit.socket = dir.join("kb.sock");
-                keyd_dir_auditd = Some(FakeAuditd::start(&keyd_params.audit.socket));
-                keyd_dir = Some(
-                    dird::keyd::Daemon::start(
-                        keyd_params,
-                        TestClock::at(common::now()),
-                        |started: &KerberosTime| {
-                            Keyd::new(
-                                dird::keyd_config(),
-                                InMemoryKeyStore::new(64),
-                                RecordBuffer::new(),
-                                started,
-                            )
-                        },
-                    )
-                    .unwrap(),
-                );
-            }
-            KeydMode::Silent => silent_keyd = Some(SilentServer::start(&keyd_dir_socket)),
         }
 
         // keyadm's keyd (task A10).
@@ -1385,16 +1431,17 @@ impl World {
             auditd_dir,
             auditd: Some(auditd_server),
             dird_auditd,
-            keyd_ldap_auditd,
-            keyd_dir_auditd,
-            keyd_ldap,
-            keyd_dir,
+            keyd_auditd: Some(keyd_auditd),
+            keyd: Some(keyd_run),
+            keyd_clock: Some(keyd_clock),
             silent_keyd,
             recording,
             dird: dird_run,
             admind: Some(admind),
             admin_socket,
+            keyd_ldap_socket: keyd_socket,
             keyd_dir_socket,
+            dird_socket,
             keyadm_keyd: keyadm_keyd_run,
             keyadm_keyd_auditd,
             keyadm_keyd_socket,
@@ -1438,9 +1485,10 @@ impl World {
             .unwrap_or_default()
     }
 
-    /// admind's keyd's records so far.
+    /// keyd's records so far (both of its sockets: dird's verifications and
+    /// grants under Ldap, admind's set_secret calls under its role).
     pub fn keyd_records(&self) -> Vec<KeydRecord> {
-        self.keyd_dir_auditd
+        self.keyd_auditd
             .as_ref()
             .map(|a| {
                 a.events()
@@ -1514,10 +1562,7 @@ impl Drop for World {
         if let Some(dird) = self.dird.take() {
             let _ = dird.stop();
         }
-        if let Some(keyd) = self.keyd_ldap.take() {
-            let _ = keyd.stop();
-        }
-        if let Some(keyd) = self.keyd_dir.take() {
+        if let Some(keyd) = self.keyd.take() {
             let _ = keyd.stop();
         }
         if let Some(keyd) = self.keyadm_keyd.take() {

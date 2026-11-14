@@ -43,11 +43,13 @@ use ipc::Refused;
 use ipc_dird_admin::{Connection, Connector, TransportError};
 use std::time::Instant;
 
-/// The default per-call deadline: 30 s — admind's own worst case is dird's
-/// client deadline (`ipc_dird_admin::DEFAULT_DEADLINE`, 20 s) behind at most
-/// one queued request of keyd's 2 s deadline, plus margin. Project choice.
+/// The default per-call deadline: 60 s — admind's own worst case is a
+/// `SetPassword`: two dird calls (`BeginPasswordSet`, `CompletePasswordSet`),
+/// each up to dird's client deadline (`ipc_dird_admin::DEFAULT_DEADLINE`,
+/// 24 s), and two keyd `set_secret` calls at keyd's 2 s deadline: 52 s, plus
+/// margin. Project choice (was 30 s before A15a — A-100).
 /// Spec: docs/51 §7.5; docs/50 §3.6; docs/questions/Q-389 item 5.
-pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(30);
+pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Why admind did not serve a call. Carries no frame octet.
 /// Spec: docs/50 §3.7 (R50-8), §8.2.

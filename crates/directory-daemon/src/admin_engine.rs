@@ -37,6 +37,24 @@
 //!    refused for want of room. An outcome event that still cannot be
 //!    committed is counted into the window's next `WindowSummary`
 //!    (`unrecorded_outcomes`, A-88) and noted on stderr.
+//!
+//!    8a. **The set_secret grant** (task A15a; docs/51 §5.8 option (b)) —
+//!    only for a committed `BeginPasswordSet`: keyd (Role::Ldap)
+//!    `grant_set_secret` for exactly the key targets of the reply, live for
+//!    [`SET_SECRET_GRANT_LIFETIME_SECS`]. Its place is the last before the
+//!    reply, so that a grant exists only once the PDP's decision is
+//!    acknowledged by auditd (step 5), `pwdLastSet` is committed (step 7 —
+//!    docs/47 §9.2: before any `set_secret`, so a password can never be set
+//!    with the old tickets still valid, even by a compromised admind racing
+//!    the reply) and dird's own trail of the write is complete (step 8).
+//!    Any failure — keyd refusing, keyd down, not performed, outcome unknown
+//!    — answers `Unavailable`: admind sets no password (a failed
+//!    `BeginPasswordSet` is followed by no `set_secret` and no completion),
+//!    and the account is in the begun-but-not-set state docs/51 §9 already
+//!    names as safe (old password valid, old tickets revoked). The outcome
+//!    event stays `Committed` — the write did commit; keyd's own records of
+//!    the grant (intent and outcome, A-88) and admind's event say the rest
+//!    (docs/questions/Q-453 item 1).
 //! 9. **Reply.**
 //!
 //! An operation that commits nothing (`Lookup`, `CompletePasswordSet`) has
@@ -81,13 +99,13 @@
 //! Q-388; A-88 (Q-366, Q-395); A-91 (Q-397); docs/11 §2, §8.
 
 use crate::admin_service::{
-    key_request_of, keyadm_request, pep_operation, wire_key_reply, wire_reply, wire_status,
-    TicketVerifier,
+    grant_of, key_request_of, keyadm_request, pep_operation, wire_key_reply, wire_reply,
+    wire_status, TicketVerifier, SET_SECRET_GRANT_LIFETIME_SECS,
 };
 use crate::clock::SharedClock;
 use crate::engine::{EngineError, EngineThread, OnExit, SubmitError};
 use crate::ldap_audit::AuditGate;
-use crate::log::{Note, Thinned};
+use crate::log::{note, Note, Thinned};
 use crate::rate::ObligationLimiter;
 use core::time::Duration;
 use directory_admin::{
@@ -624,10 +642,24 @@ impl Running {
                 self.commit_outcome(second, refusal.event());
                 Reply::Refused(wire_status(refusal.status()))
             }
-            // Steps 7-9: commit, the outcome event, the reply.
+            // Steps 7-9: commit, the outcome event, (8a) the set_secret
+            // grant of a BeginPasswordSet, the reply.
             Ok(applied) => match txn.commit() {
                 Ok(()) => {
                     self.commit_outcome(second, applied.outcome_event());
+                    if let Some((kind, targets)) = grant_of(applied.reply()) {
+                        if let Err(failure) = self.worker.verifier.grant_set_secret(
+                            kind,
+                            &targets,
+                            SET_SECRET_GRANT_LIFETIME_SECS,
+                        ) {
+                            // Fail closed: admind is told Unavailable and
+                            // sets no password; the begun password set is
+                            // the documented safe state (docs/51 §9).
+                            note(Note::AdminGrantNotRegistered, Some(failure.code()));
+                            return Reply::Refused(RefusalStatus::Unavailable);
+                        }
+                    }
                     wire_reply(applied.reply())
                 }
                 Err(_) => {

@@ -793,6 +793,39 @@ fn a_computer_set_in_part_is_incomplete() {
             &["host", "elsewhere.example.org"],
         ),
     );
+    // keyd sets no secret without a grant (task A15a): the test registers
+    // one as dird would (Role::Ldap on keyd's own socket) for ws9$'s two
+    // key sets, the Service one under the other name.
+    let mut ldap = ipc_keyd::KeydClient::new(
+        support::connectors::keyd(&world.keyd_ldap_socket),
+        world.uid,
+        ipc_keyd::DEFAULT_DEADLINE,
+    )
+    .unwrap();
+    ldap.grant_set_secret(
+        keyd::AccountKind::Computer,
+        &[
+            keyd::SetSecretTarget {
+                handle: KeyHandle::new(
+                    PrincipalId::from_bytes(g(WS9).to_packet()),
+                    KeyPurpose::PrincipalLongterm,
+                ),
+                binding: keyd::PrincipalBinding::new(
+                    support::common::realm(),
+                    support::common::name(krb_proto::constants::KRB_NT_PRINCIPAL, &["ws9$"]),
+                ),
+            },
+            keyd::SetSecretTarget {
+                handle: KeyHandle::new(
+                    PrincipalId::from_bytes(g(WS9).to_packet()),
+                    KeyPurpose::Service,
+                ),
+                binding: other.clone(),
+            },
+        ],
+        keyd::MAX_SET_SECRET_GRANT_SECS,
+    )
+    .unwrap();
     let call = ipc_keyd::Call::SetSecret {
         handle: KeyHandle::new(
             PrincipalId::from_bytes(g(WS9).to_packet()),
@@ -1056,4 +1089,185 @@ fn rate_limited_and_refused_values_have_their_own_codes() {
     assert!(events
         .iter()
         .any(|e| e.peer_uid == Some(uid) && e.activity == AdmindActivity::RateLimited));
+}
+
+// ---------------------------------------------------------------------------
+// The set_secret grant (task A15a; docs/51 §5.8 option (b); docs/questions/
+// Q-291, Q-450..Q-453).
+// ---------------------------------------------------------------------------
+
+/// bob's `(GUID, PrincipalLongterm)` handle and the NT-PRINCIPAL binding dird
+/// answers for it (docs/47 §9.1).
+fn bob_key_set() -> (KeyHandle, keyd::PrincipalBinding) {
+    (
+        KeyHandle::new(
+            PrincipalId::from_bytes(g(BOB).to_packet()),
+            KeyPurpose::PrincipalLongterm,
+        ),
+        keyd::PrincipalBinding::new(support::common::realm(), support::principal("bob")),
+    )
+}
+
+/// An admind-like Directory client's `set_secret` of bob's key set, sent
+/// straight to keyd (`kd.sock`); keyd's answer.
+fn direct_set_secret(world: &World, password: &str) -> Option<Result<keyd::Kvno, keyd::Error>> {
+    let (handle, binding) = bob_key_set();
+    let mut client = ipc_keyd::KeydClient::new(
+        support::connectors::keyd(&world.keyd_dir_socket),
+        world.uid,
+        ipc_keyd::DEFAULT_DEADLINE,
+    )
+    .unwrap();
+    let call = ipc_keyd::Call::SetSecret {
+        handle,
+        binding,
+        password: ipc_keyd::Password::new(Zeroizing::new(password.to_owned())),
+        salt: String::from("EXAMPLE.ORGbob"),
+    };
+    match client.call_with_fate(&call) {
+        Ok(ipc_keyd::Answer::SetSecret(result)) => Some(result),
+        _ => None,
+    }
+}
+
+/// keyd's records of `op` for bob's key set, in order.
+fn bob_records(world: &World, op: KeydOperation) -> Vec<ipc_audit::KeydRecord> {
+    world
+        .keyd_records()
+        .into_iter()
+        .filter(|r| r.op == op && r.principal == Some(g(BOB).to_packet()))
+        .collect()
+}
+
+/// docs/51 §5.8 option (b): a `SetPassword` works end to end with the grant
+/// dird registers — keyd records dird's `GrantSetSecret` (Role::Ldap) as an
+/// acknowledged intent and its success **before** admind's `set_secret`
+/// (Role::Directory) intent; the password is set.
+#[test]
+fn set_password_runs_on_the_grant_dird_registers() {
+    let Some(world) = World::new(Options::default()) else {
+        return;
+    };
+    let mut conn = world.connect();
+    assert_eq!(conn.call(&set_password(g(BOB), GOOD)), changed(&[1], true));
+    assert!(keyd_verifies(&world, g(BOB), GOOD));
+    assert!(eventually(Duration::from_secs(10), || {
+        bob_records(&world, KeydOperation::SetSecret)
+            .iter()
+            .any(|r| r.result == KeydOutcome::Success)
+    }));
+    let records = world.keyd_records();
+    let position = |op: KeydOperation, result: KeydOutcome| {
+        records
+            .iter()
+            .position(|r| {
+                r.op == op && r.result == result && r.principal == Some(g(BOB).to_packet())
+            })
+            .unwrap_or_else(|| panic!("{op:?} {result:?} in {records:?}"))
+    };
+    let grant_intent = position(KeydOperation::GrantSetSecret, KeydOutcome::Intent);
+    let grant = position(KeydOperation::GrantSetSecret, KeydOutcome::Success);
+    let set_intent = position(KeydOperation::SetSecret, KeydOutcome::Intent);
+    assert!(grant_intent < grant && grant < set_intent, "{records:?}");
+    assert_eq!(records[grant].caller_role, ipc_audit::KeydRole::Ldap);
+    assert_eq!(
+        records[grant].purpose,
+        Some(KeyPurposeCode::PrincipalLongterm)
+    );
+    assert_eq!(
+        records[set_intent].caller_role,
+        ipc_audit::KeydRole::Directory
+    );
+}
+
+/// docs/questions/Q-291 (the attack): an admind-like Directory client that
+/// calls keyd's `set_secret` with no `BeginPasswordSet` before it — so no
+/// PDP decision and no grant — is refused with keyd's uniform `Denied`
+/// (`NoGrant`, one record, no intent: A-88), and nothing changes. A grant
+/// is consumed by one `set_secret`: dird's grant does not allow a second.
+#[test]
+fn a_set_secret_without_dirds_grant_is_denied() {
+    let Some(world) = World::new(Options::default()) else {
+        return;
+    };
+    assert_eq!(
+        direct_set_secret(&world, "Rogue-Phrase-Without-Grant-1"),
+        Some(Err(keyd::Error::Denied))
+    );
+    assert!(eventually(Duration::from_secs(10), || !bob_records(
+        &world,
+        KeydOperation::SetSecret
+    )
+    .is_empty()));
+    let records = bob_records(&world, KeydOperation::SetSecret);
+    assert_eq!(records.len(), 1, "one record, no intent: {records:?}");
+    assert_eq!(records[0].result, KeydOutcome::Denied);
+    assert_eq!(records[0].reason, ipc_audit::KeydReason::NoGrant);
+    assert_eq!(records[0].caller_role, ipc_audit::KeydRole::Directory);
+    assert!(!keyd_verifies(
+        &world,
+        g(BOB),
+        "Rogue-Phrase-Without-Grant-1"
+    ));
+    // No BeginPasswordSet reached dird.
+    assert!(events_for(&world, DirAdminOperation::BeginPasswordSet, g(BOB)).is_empty());
+
+    // After a SetPassword the grant is spent: a direct set_secret is
+    // refused again.
+    let mut conn = world.connect();
+    assert_eq!(conn.call(&set_password(g(BOB), GOOD)), changed(&[1], true));
+    assert_eq!(
+        direct_set_secret(&world, "Rogue-Phrase-Without-Grant-2"),
+        Some(Err(keyd::Error::Denied))
+    );
+    assert!(keyd_verifies(&world, g(BOB), GOOD), "the password stays");
+}
+
+/// Q-450 item 3: dird's grant lives 30 s by keyd's clock. A
+/// `BeginPasswordSet` sent to dird as admind would send it registers the
+/// grant; 31 s later (keyd's clock moved) the `set_secret` finds none
+/// (`NoGrant`); a fresh `BeginPasswordSet` followed at once works.
+#[test]
+fn dirds_grant_expires() {
+    let Some(world) = World::new(Options::default()) else {
+        return;
+    };
+    let mut dird = ipc_dird_admin::AdminClient::new(
+        support::connectors::dird_admin(&world.dird_socket),
+        world.uid,
+        ipc_dird_admin::DEFAULT_DEADLINE,
+    )
+    .unwrap();
+    let begin = || ipc_dird_admin::Request::Operation {
+        auth: auth("admin1", &[]),
+        operation: Operation::BeginPasswordSet { target: g(BOB) },
+    };
+    assert!(matches!(
+        dird.call(&begin()),
+        Ok(ipc_dird_admin::Reply::PasswordSet(_))
+    ));
+    let clock = world.keyd_clock.as_ref().unwrap();
+    clock.set(support::common::at(
+        i64::from(directory_daemon::SET_SECRET_GRANT_LIFETIME_SECS) + 1,
+    ));
+    assert_eq!(
+        direct_set_secret(&world, GOOD),
+        Some(Err(keyd::Error::Denied))
+    );
+    assert!(eventually(Duration::from_secs(10), || {
+        bob_records(&world, KeydOperation::SetSecret)
+            .last()
+            .is_some_and(|r| r.reason == ipc_audit::KeydReason::NoGrant)
+    }));
+    assert!(!keyd_verifies(&world, g(BOB), GOOD));
+
+    assert!(matches!(
+        dird.call(&begin()),
+        Ok(ipc_dird_admin::Reply::PasswordSet(_))
+    ));
+    assert_eq!(
+        direct_set_secret(&world, GOOD),
+        Some(Ok(keyd::Kvno::INITIAL))
+    );
+    assert!(keyd_verifies(&world, g(BOB), GOOD));
 }

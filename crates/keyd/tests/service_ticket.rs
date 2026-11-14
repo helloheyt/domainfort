@@ -908,6 +908,8 @@ fn password_derived_service_key_never_verifies() {
     let mut f = fixture();
     let tgt = obtain_tgt(&mut f, now(), &as_template());
     let before = ldap_ticket(&mut f, &tgt, 1);
+    f.grant(&LDAP_SERVICE, &bound(ldap_service_name()), &now())
+        .unwrap();
     assert_eq!(
         f.keyd.set_secret(
             &DIRECTORY,
@@ -934,6 +936,7 @@ fn password_derived_service_key_never_verifies() {
         name_type: KRB_NT_SRV_INST,
         name_string: vec![kstr("ldap"), kstr("dc02.example.org")],
     };
+    f.grant(&dc02, &bound(dc02_name.clone()), &now()).unwrap();
     f.keyd
         .set_secret(
             &DIRECTORY,

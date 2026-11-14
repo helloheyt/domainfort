@@ -17,7 +17,7 @@ mod samples;
 
 use ipc::{
     decode_body, decode_reply, encode_frame, reply_round_trip_is_canonical,
-    round_trip_is_canonical, Direction, Reply, REFUSED_KIND,
+    round_trip_is_canonical, Direction, Refused, Reply, REFUSED_KIND,
 };
 use ipc_keyd::channel::{reply_kind, request_kind, MAX_ENCTYPES, MAX_REPLY_BODY, MAX_REPLY_FIELD};
 use ipc_keyd::wire::WireConfigDescription;
@@ -101,11 +101,12 @@ fn round_trip_is_canonical_for_every_reply() {
 fn kind_tables_are_as_documented() {
     assert_eq!(KEYD_MAGIC, 0x4B44);
     assert_eq!(KEYD_VERSION, 1);
-    assert_eq!(request_kind::ALL, (0x01..=0x10).collect::<Vec<u8>>());
+    // 0x11 `grant_set_secret` appended by task A15a (docs/questions/Q-450).
+    assert_eq!(request_kind::ALL, (0x01..=0x11).collect::<Vec<u8>>());
     for (request, reply) in request_kind::ALL.iter().zip(reply_kind::ALL) {
         assert_eq!(*reply, 0x80 | request);
     }
-    assert_eq!(&reply_kind::ALL[16..], &[0xF1, 0xF2, 0xF3]);
+    assert_eq!(&reply_kind::ALL[17..], &[0xF1, 0xF2, 0xF3]);
     assert!(!request_kind::ALL.contains(&REFUSED_KIND));
     assert!(!reply_kind::ALL.contains(&REFUSED_KIND));
     let body = request_body(&Call::Ping);
@@ -144,6 +145,7 @@ fn is_refusal(answer: &Answer) -> bool {
             | Answer::RotateKrbtgt(Ok(_))
             | Answer::RetireKvno(Ok(_))
             | Answer::DestroyKeySet(Ok(_))
+            | Answer::GrantSetSecret(Ok(_))
             | Answer::DescribeConfig(Ok(_))
             | Answer::Ping(Ok(_))
     )
@@ -539,4 +541,42 @@ fn the_describe_config_reply_is_bounded() {
         decode_reply::<KeydReply>(KEYD_CHANNEL, &body),
         Err(ipc::Error::CountOverBound)
     ));
+}
+
+/// Task A15a (docs/50 §3.3; docs/questions/Q-450 item 9): the
+/// `grant_set_secret` request is strict and canonical — kind `0x11`, then
+/// the account kind from its closed table (1 User, 2 Computer), the targets
+/// counted up to `MAX_GRANT_TARGETS`, the lifetime; another account-kind
+/// code, a count over the bound, a missing or a trailing octet are refused
+/// `Malformed`, never decoded.
+#[test]
+fn the_grant_request_is_strict() {
+    let computer = samples::calls()
+        .into_iter()
+        .find(|c| matches!(c, Call::GrantSetSecret { targets, .. } if targets.len() == 2))
+        .unwrap();
+    let body = request_body(&computer);
+    // Envelope (4) ‖ account kind (1) ‖ target count (u32) ‖ …
+    assert_eq!(body[3], 0x11);
+    assert_eq!(body[4], 0x02, "Computer");
+    assert_eq!(body[5..9], 2u32.to_be_bytes());
+    assert!(decode_request(&body).is_ok());
+    let malformed = |body: &[u8]| {
+        decode_request(body)
+            .err()
+            .and_then(|rejection| rejection.refusal())
+    };
+    for code in [0x00, 0x03, 0xFF] {
+        let mut bad = body.clone();
+        bad[4] = code;
+        assert_eq!(malformed(&bad), Some(Refused::Malformed), "kind {code:#x}");
+    }
+    let mut three = body.clone();
+    three[5..9].copy_from_slice(&3u32.to_be_bytes());
+    assert_eq!(malformed(&three), Some(Refused::Malformed));
+    let mut trailing = body.clone();
+    trailing.push(0);
+    assert_eq!(malformed(&trailing), Some(Refused::Malformed));
+    let short = &body[..body.len() - 1];
+    assert_eq!(malformed(short), Some(Refused::Malformed));
 }

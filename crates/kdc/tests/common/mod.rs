@@ -38,9 +38,9 @@ use kdc::{
     KdcConfig, KdcReply, KeyCustody, Peer, PolicyInputs, RateLimiter, ServiceAccount, Transport,
 };
 use keyd::{
-    AuditRecord, CallerId, ConfigDescription, EncTypeId, EntropyError, EntropySource,
-    InMemoryKeyStore, KeyHandle, KeyPurpose, Keyd, KeydConfig, LocalKeyd, PrincipalBinding,
-    PrincipalId, Role, TicketPolicy,
+    AuditRecord, AuditSink, CallerId, ConfigDescription, EncTypeId, EntropyError, EntropySource,
+    InMemoryKeyStore, KeyHandle, KeyPurpose, KeyStore, Keyd, KeydConfig, LocalKeyd,
+    PrincipalBinding, PrincipalId, Role, SetSecretTarget, TicketPolicy, MAX_SET_SECRET_GRANT_SECS,
 };
 use krb_crypto::{EncType, KeyUsage, ProtocolKey};
 use krb_proto::constants::{
@@ -243,6 +243,61 @@ pub const ADMIN: CallerId = CallerId {
     uid: 300,
     role: Role::Admin,
 };
+/// dird's role in keyd (A-73), which registers the set_secret grant after
+/// its PDP allowed a password set (task A15a).
+pub const LDAP_CALLER: CallerId = CallerId {
+    uid: 400,
+    role: Role::Ldap,
+};
+
+/// Register the grant dird would (Role::Ldap, after its PDP; task A15a,
+/// docs/51 §5.8 option (b)) for a user's `set_secret` of `handle` with
+/// `binding` — keyd refuses Role::Directory's `set_secret` without one.
+pub fn grant_user<S: KeyStore, A: AuditSink, E: EntropySource>(
+    keyd: &mut Keyd<S, A, E>,
+    handle: &KeyHandle,
+    binding: &PrincipalBinding,
+    now: &KerberosTime,
+) {
+    keyd.grant_set_secret(
+        &LDAP_CALLER,
+        keyd::AccountKind::User,
+        &[SetSecretTarget {
+            handle: *handle,
+            binding: binding.clone(),
+        }],
+        MAX_SET_SECRET_GRANT_SECS,
+        now,
+    )
+    .unwrap();
+}
+
+/// As [`grant_user`] for a computer's two key sets (its PrincipalLongterm
+/// and its Service key set, docs/47 §9.1).
+pub fn grant_computer<S: KeyStore, A: AuditSink, E: EntropySource>(
+    keyd: &mut Keyd<S, A, E>,
+    account: (&KeyHandle, &PrincipalBinding),
+    service: (&KeyHandle, &PrincipalBinding),
+    now: &KerberosTime,
+) {
+    keyd.grant_set_secret(
+        &LDAP_CALLER,
+        keyd::AccountKind::Computer,
+        &[
+            SetSecretTarget {
+                handle: *account.0,
+                binding: account.1.clone(),
+            },
+            SetSecretTarget {
+                handle: *service.0,
+                binding: service.1.clone(),
+            },
+        ],
+        MAX_SET_SECRET_GRANT_SECS,
+        now,
+    )
+    .unwrap();
+}
 
 pub const ALICE: KeyHandle = KeyHandle::new(
     PrincipalId::from_bytes([0xA1; 16]),
@@ -649,6 +704,12 @@ impl Fixture {
             (ALICE, alice_name(), ALICE_PASSWORD, ALICE_SALT),
             (BOB, bob_name(), BOB_PASSWORD, BOB_SALT),
         ] {
+            grant_user(
+                &mut keyd,
+                &handle,
+                &PrincipalBinding::new(realm(), who.clone()),
+                &n,
+            );
             keyd.set_secret(
                 &DIRECTORY,
                 &handle,

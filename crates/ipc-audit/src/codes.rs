@@ -205,7 +205,10 @@ code_table! {
 }
 
 code_table! {
-    /// `keyd::Operation`. Spec: docs/10 §2-§7; crates/keyd authz.rs.
+    /// `keyd::Operation`. `GrantSetSecret` (code 17) was appended by task
+    /// A15a (docs/51 §5.8 option (b); docs/questions/Q-450); codes 1-16 keep
+    /// their meaning.
+    /// Spec: docs/10 §2-§7; crates/keyd authz.rs.
     pub enum KeydOperation {
         VerifyPreauth,
         IssueAsRep,
@@ -223,6 +226,7 @@ code_table! {
         OpenAndVerifyServiceTicket,
         DescribeConfig,
         Ping,
+        GrantSetSecret,
     }
 }
 
@@ -234,10 +238,13 @@ code_table! {
 code_table! {
     /// `keyd::AuditOutcome` (codes 1-5, by name), then two **phase** codes
     /// appended for decision A-86 (codes 6-7), which no `keyd::AuditOutcome`
-    /// maps to: keyd-daemon writes them itself around an operation that
-    /// changes keyd's key state (`keyd::changes_key_state`: `SetSecret`,
-    /// `CreateKey`, `RotateKey`, `RotateKrbtgt`, `RetireKvno`,
-    /// `DestroyKeySet`):
+    /// maps to: keyd-daemon writes them itself around an operation whose
+    /// intent must be acknowledged first (`keyd::requires_acknowledged_intent`):
+    /// one that changes keyd's key state (`keyd::changes_key_state`:
+    /// `SetSecret`, `CreateKey`, `RotateKey`, `RotateKrbtgt`, `RetireKvno`,
+    /// `DestroyKeySet`) or one that loosens keyd's authorization
+    /// (`keyd::loosens_authorization`: `GrantSetSecret`, task A15a —
+    /// docs/questions/Q-452):
     ///
     /// * `Intent` — the record of the intent, committed and **acknowledged
     ///   by auditd before keyd runs the operation**; keyd does not run it
@@ -264,7 +271,11 @@ code_table! {
 }
 
 code_table! {
-    /// `keyd::AuditReason` (non-exhaustive: ends in `Unlisted`).
+    /// `keyd::AuditReason` (non-exhaustive: ends in `Unlisted`). The four
+    /// grant reasons (`NoGrant` … `GrantTableFull`, codes 66-69) were
+    /// appended by task A15a before `Unlisted`, which moved from 66 to 70
+    /// (the table's rule for appended variants; nothing is deployed —
+    /// docs/questions/Q-452 item 4).
     /// Spec: crates/keyd audit.rs; docs/10 §9, §10, I8.
     pub enum KeydReason {
         None,
@@ -332,6 +343,10 @@ code_table! {
         TransitedNotLocal,
         ApChecksumUnsupported,
         StartupHoldDown,
+        NoGrant,
+        GrantMismatch,
+        GrantInvalid,
+        GrantTableFull,
         Unlisted,
     }
 }

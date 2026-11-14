@@ -217,6 +217,11 @@ fn every_operation_emits_exactly_one_audit_record() {
         .issue_tgs_rep(&ADMIN, &SERVICE, &ctx.ctx_id, &tgs_template(70), &n);
     check(&f, Operation::IssueTgsRep, &ADMIN, false);
 
+    // The set_secret grant (task A15a): one record either way.
+    let _ = f.grant_as(&DIRECTORY, &ALICE, &alice_binding(), &n);
+    check(&f, Operation::GrantSetSecret, &DIRECTORY, false);
+    f.grant(&ALICE, &alice_binding(), &n).unwrap();
+    check(&f, Operation::GrantSetSecret, &LDAP, true);
     f.keyd
         .set_secret(
             &DIRECTORY,
@@ -352,6 +357,7 @@ fn audit_records_contain_no_secret_bytes() {
         .unwrap()
         .0
         .key;
+    f.grant(&BOB, &bob_binding(), &now()).unwrap();
     f.keyd
         .set_secret(
             &DIRECTORY,

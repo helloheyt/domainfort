@@ -266,6 +266,31 @@ pub enum AuditReason {
     /// Spec: RFC 4120 3.2.3; docs/50 R50-6, §3.5; docs/questions/Q-222
     /// (A-56), Q-240 item 3 (A-62).
     StartupHoldDown,
+    /// `set_secret`: no live grant names the handle — none was registered
+    /// (dird's PDP never allowed this password set), it expired, or it was
+    /// already consumed. Reported as the uniform `Denied` (A-26: decided
+    /// before any secret work). Decided at the operation's authorization
+    /// step, so it changes nothing and has no intent record (A-88).
+    /// Spec: docs/51 §5.8 option (b); docs/questions/Q-291 (A-74), Q-450
+    /// items 1, 7.
+    NoGrant,
+    /// `set_secret`: the live grant of the handle names another binding, or
+    /// it is an initial-secret grant (Role::Admin) and the key set exists by
+    /// now. The grant is consumed (treated as misused). Reported as the
+    /// uniform `Denied`.
+    /// Spec: docs/51 §5.8 option (b); docs/questions/Q-450 item 7, Q-451
+    /// item 2.
+    GrantMismatch,
+    /// `grant_set_secret` refused its arguments: no key target, too many,
+    /// targets that do not fit the account kind (one for a user; one or two
+    /// of the same principal for a computer), a lifetime of zero or above
+    /// the caller's ceiling, or — for Role::Admin — an account that is not a
+    /// user. Spec: docs/questions/Q-450 items 2, 3, Q-451 items 2, 3.
+    GrantInvalid,
+    /// `grant_set_secret`: the grant table is full of live grants; the grant
+    /// is refused (fail closed) rather than evicting a live one.
+    /// Spec: docs/questions/Q-450 item 4; AGENTS.md §6 (bounded).
+    GrantTableFull,
 }
 
 /// A key referenced by an operation, for audit (no key material).

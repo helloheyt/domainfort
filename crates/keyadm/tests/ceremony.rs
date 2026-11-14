@@ -615,3 +615,53 @@ fn a_create_key_keyd_never_answers_is_reported_as_outcome_unknown() {
     );
     assert!(text.contains("check keyd's audit log"), "{text}");
 }
+
+/// Task A15a (docs/51 §4.3 steps 11-12, §5.8 option (b); docs/questions/
+/// Q-451): after the three key sets the ceremony grants each first
+/// administrator's initial secret — one `grant_set_secret` per
+/// administrator, in the manifest's order, by Role::Admin, each an
+/// acknowledged intent then keyd's success, naming the administrator's
+/// `(GUID, PrincipalLongterm)` key set; the report prints each grant and the
+/// 15-minute window. Without the grants the ceremony is not complete.
+#[test]
+fn the_ceremony_grants_each_first_administrator_its_initial_secret() {
+    let Some(world) = world(Some(Role::Admin)) else {
+        return;
+    };
+    let m = manifest();
+    let report = ceremony::run(&mut world.client(world.uid), &m);
+    assert!(report.is_complete(), "{report:?}");
+    assert_eq!(report.grants.len(), 2);
+    assert!(report.grants.iter().all(|g| g.outcome.succeeded()));
+    let text = report::render(&report, &m).join("\n");
+    assert!(
+        text.contains("granted the initial secret of first administrator alice"),
+        "{text}"
+    );
+    assert!(text.contains("granted the initial secret of first administrator bob"));
+    assert!(text.contains("within 15 minutes"));
+
+    let grants = || -> Vec<KeydRecord> {
+        world
+            .auditd
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                EventBody::Keyd(record) if record.op == KeydOperation::GrantSetSecret => {
+                    Some(*record)
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    assert!(eventually(Duration::from_secs(10), || grants().len() >= 4));
+    let records = grants();
+    for (pair, last) in records.chunks(2).zip([4u8, 5u8]) {
+        assert_eq!(pair[0].result, KeydOutcome::Intent);
+        assert_eq!(pair[1].result, KeydOutcome::Success);
+        assert_eq!(pair[1].principal, Some(guid(last).to_packet()));
+        assert_eq!(pair[1].purpose, Some(KeyPurposeCode::PrincipalLongterm));
+        assert_eq!(pair[1].caller_uid, world.uid);
+    }
+    world.daemon.stop().unwrap();
+}

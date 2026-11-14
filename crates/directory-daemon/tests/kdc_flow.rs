@@ -137,6 +137,12 @@ fn directory_keyd(
         )
         .unwrap();
     }
+    crate::common::grant_user(
+        &mut keyd,
+        &handles.alice,
+        &PrincipalBinding::new(realm(), alice_name()),
+        &now(),
+    );
     keyd.set_secret(
         &DIRECTORY,
         &handles.alice,

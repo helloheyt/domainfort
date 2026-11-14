@@ -15,6 +15,16 @@
 //!    (docs/51 §4.3 step 11; docs/47 §1.4, §9.1; docs/10 §5ב, §7; A-19,
 //!    A-73). keyd draws the keys and chooses the kvno (A-35); keyadm only
 //!    asks.
+//! 3. **`grant_set_secret` for each first administrator, in the manifest's
+//!    order** (task A15a; docs/questions/Q-451) — a user's one key target,
+//!    `(GUID, PrincipalLongterm)` with its NT-PRINCIPAL [sAMAccountName]
+//!    binding exactly as the manifest gives it to `provision
+//!    first-admin-secret`, live for `MAX_INITIAL_SECRET_GRANT_SECS` (15
+//!    minutes). keyd refuses Role::Directory's `set_secret` without such a
+//!    grant (docs/51 §5.8 option (b)); dird, which registers the grants of
+//!    every later password set, does not run yet. keyd grants Role::Admin
+//!    only a user's **initial** secret (no key set yet) — so this step can
+//!    never be used to reset an existing password past dird's PDP.
 //!
 //! # Stop at the first failure, never retry
 //!
@@ -53,7 +63,9 @@ use ipc::Refused;
 use ipc_keyd::{
     Answer, Call, CallFailure, Connector, KeydClient, RequestFate, TransportError, Unserved,
 };
-use keyd_types::{Error as KeydError, Kvno};
+use keyd_types::{
+    AccountKind, Error as KeydError, Kvno, SetSecretTarget, MAX_INITIAL_SECRET_GRANT_SECS,
+};
 use provision_manifest::{KeySet, Manifest};
 
 /// The ceremony's key sets, in the order they are created.
@@ -229,20 +241,50 @@ pub struct StepReport {
     pub outcome: Outcome<Kvno>,
 }
 
+/// One first administrator's initial-secret grant and how it ended (task
+/// A15a).
+/// Spec: docs/51 §4.3 steps 11-12, §5.8 option (b); docs/questions/Q-451.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantReport {
+    /// The administrator's position in the manifest's `first_admins`.
+    pub admin: usize,
+    /// How the `grant_set_secret` call ended.
+    pub outcome: Outcome<()>,
+}
+
 /// What the ceremony did: the contact, then the steps attempted (in order;
-/// it stops after the first that did not succeed).
+/// it stops after the first that did not succeed): the three key sets, then
+/// the first administrators' grants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CeremonyReport {
     /// The `ping` that opened (and verified) the connection.
     pub contact: Outcome<()>,
     /// The `create_key` steps attempted.
     pub steps: Vec<StepReport>,
+    /// The `grant_set_secret` steps attempted (task A15a), after all three
+    /// key sets were created.
+    pub grants: Vec<GrantReport>,
+    /// How many first administrators the manifest names (each needs its
+    /// grant for the ceremony to be complete).
+    pub first_admins: usize,
 }
 
 impl CeremonyReport {
-    /// `true` if all three key sets were created.
+    /// `true` if all three key sets were created and every first
+    /// administrator's initial secret was granted.
     #[must_use]
     pub fn is_complete(&self) -> bool {
+        self.contact.succeeded()
+            && self.steps.len() == Step::ALL.len()
+            && self.steps.iter().all(|step| step.outcome.succeeded())
+            && self.grants.len() == self.first_admins
+            && self.grants.iter().all(|grant| grant.outcome.succeeded())
+    }
+
+    /// `true` if all three key sets were created (the grants may still be
+    /// missing).
+    #[must_use]
+    pub fn key_sets_created(&self) -> bool {
         self.contact.succeeded()
             && self.steps.len() == Step::ALL.len()
             && self.steps.iter().all(|step| step.outcome.succeeded())
@@ -273,18 +315,27 @@ impl CeremonyReport {
 
 /// Run the ceremony for `manifest` through `client` (see the module
 /// documentation): contact, then `create_key` for each [`Step`] in order,
-/// stopping at the first that does not succeed. Never retries.
+/// then `grant_set_secret` for each first administrator in order, stopping
+/// at the first call that does not succeed. Never retries.
 ///
-/// Spec: docs/51 §4.3 step 11; docs/10 §7; docs/50 R50-3; A-19; A-35; A-77;
-/// docs/questions/Q-367 (A-88: each call's fate from the client).
+/// Spec: docs/51 §4.3 step 11, §5.8 option (b); docs/10 §7; docs/50 R50-3;
+/// A-19; A-35; A-77; docs/questions/Q-367 (A-88: each call's fate from the
+/// client), Q-451.
 pub fn run<C: Connector>(client: &mut KeydClient<C>, manifest: &Manifest) -> CeremonyReport {
     let contact = classify(client.call_with_fate(&Call::Ping), |answer| match answer {
         Answer::Ping(result) => Some(result),
         _ => None,
     });
+    let first_admins = manifest.first_admins().len();
     let mut steps = Vec::with_capacity(Step::ALL.len());
+    let mut grants = Vec::with_capacity(first_admins);
     if !contact.succeeded() {
-        return CeremonyReport { contact, steps };
+        return CeremonyReport {
+            contact,
+            steps,
+            grants,
+            first_admins,
+        };
     }
     for step in Step::ALL {
         let key_set = step.key_set(manifest);
@@ -299,8 +350,38 @@ pub fn run<C: Connector>(client: &mut KeydClient<C>, manifest: &Manifest) -> Cer
         let stop = !outcome.succeeded();
         steps.push(StepReport { step, outcome });
         if stop {
+            return CeremonyReport {
+                contact,
+                steps,
+                grants,
+                first_admins,
+            };
+        }
+    }
+    for (admin, first_admin) in manifest.first_admins().iter().enumerate() {
+        let key_set = first_admin.key_set();
+        let call = Call::GrantSetSecret {
+            kind: AccountKind::User,
+            targets: vec![SetSecretTarget {
+                handle: key_set.handle,
+                binding: key_set.binding.clone(),
+            }],
+            lifetime_secs: MAX_INITIAL_SECRET_GRANT_SECS,
+        };
+        let outcome = classify(client.call_with_fate(&call), |answer| match answer {
+            Answer::GrantSetSecret(result) => Some(result),
+            _ => None,
+        });
+        let stop = !outcome.succeeded();
+        grants.push(GrantReport { admin, outcome });
+        if stop {
             break;
         }
     }
-    CeremonyReport { contact, steps }
+    CeremonyReport {
+        contact,
+        steps,
+        grants,
+        first_admins,
+    }
 }

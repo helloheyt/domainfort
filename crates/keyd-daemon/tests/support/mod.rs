@@ -261,6 +261,7 @@ pub fn params(dir: &TempDir, callers: CallerMap, auditd_uid: u32) -> DaemonParam
         queue_capacity: 16,
         window: ipc_audit::WindowConfig::DEFAULT,
         intent_ack_budget: IntentAckBudget::PRODUCTION,
+        extra_listeners: Vec::new(),
     }
 }
 

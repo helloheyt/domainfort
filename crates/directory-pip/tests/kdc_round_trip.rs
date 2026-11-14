@@ -47,6 +47,7 @@ use kdc::{
 };
 use keyd::{
     AuditRecord, CallerId, InMemoryKeyStore, Keyd, LocalKeyd, OsEntropy, PrincipalBinding, Role,
+    SetSecretTarget, MAX_SET_SECRET_GRANT_SECS,
 };
 use krb_crypto::{EncType, KeyUsage, ProtocolKey};
 use krb_proto::constants::{
@@ -102,6 +103,12 @@ const ADMIN: CallerId = CallerId {
 const DIRECTORY: CallerId = CallerId {
     uid: 200,
     role: Role::Directory,
+};
+/// dird's role in keyd, which registers the set_secret grant after its PDP
+/// (task A15a; docs/51 §5.8 option (b)).
+const LDAP: CallerId = CallerId {
+    uid: 400,
+    role: Role::Ldap,
 };
 const KDC_CALLER: CallerId = CallerId {
     uid: 100,
@@ -188,6 +195,35 @@ fn kdc_for(d: &Dir) -> TestKdc {
     )
     .unwrap();
     let alice_salt = account_salt(&realm(), AccountKind::User, "alice").unwrap();
+    // The grants dird registers after its PDP (task A15a).
+    keyd.grant_set_secret(
+        &LDAP,
+        keyd::AccountKind::User,
+        &[SetSecretTarget {
+            handle: alice.key,
+            binding: PrincipalBinding::new(realm(), alice_name()),
+        }],
+        MAX_SET_SECRET_GRANT_SECS,
+        &n,
+    )
+    .unwrap();
+    keyd.grant_set_secret(
+        &LDAP,
+        keyd::AccountKind::Computer,
+        &[
+            SetSecretTarget {
+                handle: ws01_client.key,
+                binding: PrincipalBinding::new(realm(), ws01_name()),
+            },
+            SetSecretTarget {
+                handle: ws01.key,
+                binding: PrincipalBinding::new(realm(), service_name()),
+            },
+        ],
+        MAX_SET_SECRET_GRANT_SECS,
+        &n,
+    )
+    .unwrap();
     keyd.set_secret(
         &DIRECTORY,
         &alice.key,

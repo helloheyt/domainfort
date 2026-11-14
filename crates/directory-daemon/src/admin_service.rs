@@ -27,6 +27,16 @@
 //! whole value, so a field added to it later (F3: the caller's role) is
 //! compared too (docs/questions/Q-387 item 2).
 //!
+//! # The set_secret grant (task A15a; docs/51 §5.8 option (b))
+//!
+//! keyd refuses admind's `set_secret` (Role::Directory) unless a live,
+//! one-time grant names the key set. After a `BeginPasswordSet` is decided,
+//! acknowledged and committed, dird registers that grant through the same
+//! client (Role::Ldap, `grant_set_secret`) for exactly the key targets its
+//! reply hands admind, live [`SET_SECRET_GRANT_LIFETIME_SECS`]; any failure
+//! answers the `BeginPasswordSet` `Unavailable` (crate admin_engine, step 8a;
+//! docs/questions/Q-453 item 1).
+//!
 //! # The admin service's key set (A-73)
 //!
 //! At start, dird resolves the SPN `admind/<dc-fqdn>` — the binding the
@@ -69,7 +79,9 @@ use ipc_dird_admin::{
     LookupKey, Operation, PasswordSet, PasswordSetOutcome, RefusalStatus, Reply,
 };
 use kdc::AccountSource;
-use keyd_types::{AuthnError, KeyHandle, ServiceContext};
+use keyd_types::{
+    AccountKind as GrantKind, AuthnError, KeyHandle, ServiceContext, SetSecretTarget,
+};
 use krb_proto::Realm;
 use pdp::Dn;
 use provision_manifest::Manifest;
@@ -105,15 +117,21 @@ pub const DECISION_ACK_DEADLINE: Duration = Duration::from_secs(2);
 /// before the decision event (docs/51 §7.4 steps 1-2, §7.2).
 const MAX_VERIFICATIONS_PER_REQUEST: u32 = 1 + ipc_dird_admin::channel::MAX_APPROVALS;
 
+/// The keyd calls one admin request may make: its AP-REQ verifications plus
+/// the set_secret grant a `BeginPasswordSet` registers after its commit
+/// (task A15a; docs/51 §5.8 option (b)).
+const MAX_KEYD_CALLS_PER_REQUEST: u32 = MAX_VERIFICATIONS_PER_REQUEST + 1;
+
 /// The ceiling of any dird's decision-acknowledgement wait: 4 s.
 ///
-/// admind waits [`ipc_dird_admin::DEFAULT_DEADLINE`] (20 s, A-91) for each
+/// admind waits [`ipc_dird_admin::DEFAULT_DEADLINE`] (24 s, A-91, A-100) for each
 /// answer on `dird-admin.sock`, and that deadline covers dird's worst case
 /// for one request queued behind one other ([`MAX_ADMIN_CONNECTIONS`]
 /// connections, one request in flight on each, docs/51 §7.5): for each,
-/// [`MAX_VERIFICATIONS_PER_REQUEST`] AP-REQ verifications at keyd's client
-/// deadline ([`ipc_keyd::DEFAULT_DEADLINE`], 2 s, docs/50 §3.6) and one
-/// decision-acknowledgement wait. 2 × (3 × 2 s + 4 s) = 20 s: a longer wait
+/// [`MAX_KEYD_CALLS_PER_REQUEST`] keyd calls (the AP-REQ verifications and
+/// the set_secret grant) at keyd's client deadline
+/// ([`ipc_keyd::DEFAULT_DEADLINE`], 2 s, docs/50 §3.6) and one
+/// decision-acknowledgement wait. 2 × (4 × 2 s + 4 s) = 24 s: a longer wait
 /// could let dird decide — and commit — an operation after admind gave up
 /// on it and reported it unavailable (the ambiguity A-86 / A-90 avoid), and
 /// would hold the request queued behind it past admind's deadline as well.
@@ -129,7 +147,7 @@ const _: () = assert!(DECISION_ACK_DEADLINE.as_nanos() <= MAX_DECISION_ACK_DEADL
 // queued behind another (docs/51 §7.5; A-91; docs/questions/Q-441).
 const _: () = assert!(
     (MAX_ADMIN_CONNECTIONS as u128)
-        * (MAX_VERIFICATIONS_PER_REQUEST as u128 * ipc_keyd::DEFAULT_DEADLINE.as_nanos()
+        * (MAX_KEYD_CALLS_PER_REQUEST as u128 * ipc_keyd::DEFAULT_DEADLINE.as_nanos()
             + MAX_DECISION_ACK_DEADLINE.as_nanos())
         <= ipc_dird_admin::DEFAULT_DEADLINE.as_nanos()
 );
@@ -188,15 +206,72 @@ impl DecisionAckDeadline {
     }
 }
 
-/// One AP-REQ's verification: keyd's `open_and_verify_service_ticket` for
-/// the admin service's key set.
-/// Spec: docs/10 §5ב; docs/51 §7.4 step 1; A-73.
+/// How long a set_secret grant dird registers stays live: keyd's ceiling for
+/// Role::Ldap (`keyd_types::MAX_SET_SECRET_GRANT_SECS`, 30 s). dird registers
+/// it right before it answers `BeginPasswordSet`; admind's two `set_secret`
+/// calls follow at once, each within the keyd client's 2 s deadline.
+/// Spec: docs/51 §5.8 option (b); docs/50 §3.6; docs/questions/Q-450 item 3.
+pub const SET_SECRET_GRANT_LIFETIME_SECS: u32 = keyd_types::MAX_SET_SECRET_GRANT_SECS;
+
+// More than the two keyd deadlines of admind's set_secret calls (docs/50
+// §3.6: 2 s each), with margin.
+const _: () = assert!(
+    SET_SECRET_GRANT_LIFETIME_SECS as u64 > 4 * ipc_keyd::DEFAULT_DEADLINE.as_secs()
+        && SET_SECRET_GRANT_LIFETIME_SECS <= keyd_types::MAX_SET_SECRET_GRANT_SECS
+);
+
+/// Why dird's set_secret grant was not registered (task A15a). Every case
+/// answers the `BeginPasswordSet` `Unavailable`; the class only goes to
+/// dird's log note.
+/// Spec: docs/51 §5.8 option (b); docs/questions/Q-367 (A-88, A-90: the
+/// three fates), Q-453 item 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantFailure {
+    /// keyd answered and refused it (its own `Denied`, `Unavailable` — a
+    /// full grant table — or `RateLimited`).
+    Refused(keyd_types::Error),
+    /// keyd did not register it: nothing was sent, or keyd-daemon refused it
+    /// before keyd ran it (A-88), or keyd is not the keyd dird was
+    /// configured for.
+    NotPerformed,
+    /// Sent, and no usable answer came back: keyd may hold the grant — it
+    /// expires by itself within [`SET_SECRET_GRANT_LIFETIME_SECS`].
+    OutcomeUnknown,
+}
+
+impl GrantFailure {
+    /// The class number of the log note (docs/50 §8.2: a code, no content).
+    #[must_use]
+    pub const fn code(self) -> u64 {
+        match self {
+            GrantFailure::Refused(_) => 1,
+            GrantFailure::NotPerformed => 2,
+            GrantFailure::OutcomeUnknown => 3,
+        }
+    }
+}
+
+/// dird's keyd client (Role::Ldap): one AP-REQ's verification — keyd's
+/// `open_and_verify_service_ticket` for the admin service's key set — and
+/// the set_secret grant after a `BeginPasswordSet` (task A15a).
+/// Spec: docs/10 §5ב; docs/51 §5.8 option (b), §7.4 step 1; A-73.
 pub trait TicketVerifier: Send {
     /// Verify `ap_req` (the raw `KRB_AP_REQ` DER admind forwarded) under
     /// `service`. keyd not reachable, not the configured keyd, or in its
     /// start-up hold-down ⇒ `AuthnError::Unavailable` (A-56); every other
     /// error is keyd's own answer.
     fn verify(&mut self, service: &KeyHandle, ap_req: &[u8]) -> Result<ServiceContext, AuthnError>;
+
+    /// Register in keyd the one-time grant that lets admind's `set_secret`
+    /// run on exactly `targets` (keyd's `grant_set_secret`, live for
+    /// `lifetime_secs` by keyd's clock).
+    /// Spec: docs/51 §5.8 option (b); docs/questions/Q-291 (A-74), Q-450.
+    fn grant_set_secret(
+        &mut self,
+        kind: GrantKind,
+        targets: &[SetSecretTarget],
+        lifetime_secs: u32,
+    ) -> Result<(), GrantFailure>;
 }
 
 /// The production verifier: ipc-keyd's client under Role::Ldap with F1's
@@ -223,6 +298,33 @@ impl<C: ipc_keyd::Connector> fmt::Debug for KeydTicketVerifier<C> {
     }
 }
 
+impl<C: ipc_keyd::Connector> KeydTicketVerifier<C> {
+    /// The first time: keyd's description must be of dird's realm and name
+    /// dird's role Ldap; from then on both are required of every new
+    /// connection (inside `KeydClient`). `false` ⇒ not the keyd dird was
+    /// configured for, or keyd unreachable.
+    /// Spec: docs/10 §7א; docs/50 §3.7, §7.5 step 4; A-73; A-87; A-90
+    /// (docs/questions/Q-311, Q-351).
+    fn keyd_identified(&mut self) -> bool {
+        if self.client.required_description().is_some() {
+            return true;
+        }
+        let Ok(described) = self.client.describe_config_with_role() else {
+            return false;
+        };
+        // Another realm's keyd, or dird's uid mapped to another role than
+        // Ldap: a cross-wiring ⇒ unavailable.
+        if described.description.realm.as_bytes() != self.realm.as_bytes()
+            || described.caller_role != keyd_types::Role::Ldap
+        {
+            return false;
+        }
+        self.client.require_caller_role(keyd_types::Role::Ldap);
+        self.client.require_description(described.description);
+        true
+    }
+}
+
 impl<C> TicketVerifier for KeydTicketVerifier<C>
 where
     C: ipc_keyd::Connector + Send,
@@ -232,25 +334,43 @@ where
     /// (docs/questions/Q-311: the description required of every new
     /// connection).
     fn verify(&mut self, service: &KeyHandle, ap_req: &[u8]) -> Result<ServiceContext, AuthnError> {
-        if self.client.required_description().is_none() {
-            let described = self
-                .client
-                .describe_config_with_role()
-                .map_err(|_| AuthnError::Unavailable)?;
-            if described.description.realm.as_bytes() != self.realm.as_bytes() {
-                // Another realm's keyd: not the keyd dird was configured for.
-                return Err(AuthnError::Unavailable);
-            }
-            // dird verifies tickets under Role::Ldap (A-73); keyd mapping
-            // dird's uid to any other role is a cross-wiring ⇒ Unavailable,
-            // and every new connection must name Ldap again (A-90; Q-351).
-            if described.caller_role != keyd_types::Role::Ldap {
-                return Err(AuthnError::Unavailable);
-            }
-            self.client.require_caller_role(keyd_types::Role::Ldap);
-            self.client.require_description(described.description);
+        if !self.keyd_identified() {
+            return Err(AuthnError::Unavailable);
         }
         self.client.open_and_verify_service_ticket(service, ap_req)
+    }
+
+    /// Through `call_with_fate` (A-90): the grant loosens keyd, so whether a
+    /// failed call may still have registered it is told apart.
+    /// Spec: docs/51 §5.8 option (b); docs/questions/Q-367 (A-88), Q-450,
+    /// Q-453 item 1.
+    fn grant_set_secret(
+        &mut self,
+        kind: GrantKind,
+        targets: &[SetSecretTarget],
+        lifetime_secs: u32,
+    ) -> Result<(), GrantFailure> {
+        if !self.keyd_identified() {
+            return Err(GrantFailure::NotPerformed);
+        }
+        let call = ipc_keyd::Call::GrantSetSecret {
+            kind,
+            targets: targets.to_vec(),
+            lifetime_secs,
+        };
+        match self.client.call_with_fate(&call) {
+            Ok(ipc_keyd::Answer::GrantSetSecret(Ok(()))) => Ok(()),
+            Ok(ipc_keyd::Answer::GrantSetSecret(Err(error))) => Err(GrantFailure::Refused(error)),
+            // The client checks that a reply answers its call; anything
+            // else cannot arrive — and would say nothing of the grant.
+            Ok(_) => Err(GrantFailure::OutcomeUnknown),
+            Err(failure) => Err(match failure.fate {
+                ipc_keyd::RequestFate::NotSent | ipc_keyd::RequestFate::NotPerformed => {
+                    GrantFailure::NotPerformed
+                }
+                ipc_keyd::RequestFate::OutcomeUnknown => GrantFailure::OutcomeUnknown,
+            }),
+        }
     }
 }
 
@@ -649,6 +769,31 @@ pub fn wire_status(status: PepStatus) -> RefusalStatus {
         PepStatus::Conflict => RefusalStatus::Conflict,
         PepStatus::Unavailable => RefusalStatus::Unavailable,
     }
+}
+
+/// The set_secret grant a committed `BeginPasswordSet` asks keyd for: the
+/// account kind and exactly the key targets — handles and bindings — the
+/// reply hands admind (task A15a). `None` for any other reply.
+/// Spec: docs/51 §5.2 row 5, §5.8 option (b), §7.3; docs/47 §9.1;
+/// docs/questions/Q-450 item 2.
+#[must_use]
+pub fn grant_of(reply: &PepReply) -> Option<(GrantKind, Vec<SetSecretTarget>)> {
+    let PepReply::PasswordSet(set) = reply else {
+        return None;
+    };
+    let kind = match set.kind {
+        PipKind::User => GrantKind::User,
+        PipKind::Computer => GrantKind::Computer,
+    };
+    let targets = set
+        .keys
+        .iter()
+        .map(|k| SetSecretTarget {
+            handle: k.handle,
+            binding: k.binding.clone(),
+        })
+        .collect();
+    Some((kind, targets))
 }
 
 /// The typed reply of the PEP's reply.

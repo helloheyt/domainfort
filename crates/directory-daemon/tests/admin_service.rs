@@ -970,6 +970,9 @@ struct Options {
     key_request_lifetime: Duration,
     /// dird's decision-acknowledgement wait (A-95 follow-up, Q-441).
     ack_deadline: DecisionAckDeadline,
+    /// dird's keyd client refuses every set_secret grant (task A15a: the
+    /// fail-closed path of `BeginPasswordSet`).
+    refuse_grants: bool,
 }
 
 /// The decision-acknowledgement wait of the tests that expect auditd to
@@ -991,7 +994,32 @@ impl Default for Options {
             hook: false,
             key_request_lifetime: directory_admin::KEY_REQUEST_LIFETIME,
             ack_deadline: generous(),
+            refuse_grants: false,
         }
+    }
+}
+
+/// dird's keyd client with every set_secret grant refused as "not
+/// performed" — the real verifier otherwise (task A15a; a keyd that cannot
+/// register the grant).
+struct RefusingGrants(Box<dyn TicketVerifier>);
+
+impl TicketVerifier for RefusingGrants {
+    fn verify(
+        &mut self,
+        service: &KeyHandle,
+        ap_req: &[u8],
+    ) -> Result<keyd::ServiceContext, keyd::AuthnError> {
+        self.0.verify(service, ap_req)
+    }
+
+    fn grant_set_secret(
+        &mut self,
+        _kind: keyd::AccountKind,
+        _targets: &[keyd::SetSecretTarget],
+        _lifetime_secs: u32,
+    ) -> Result<(), directory_daemon::GrantFailure> {
+        Err(directory_daemon::GrantFailure::NotPerformed)
     }
 }
 
@@ -1028,6 +1056,7 @@ fn start_dird(
     params.clock = SharedClock::new(FixedNow(Arc::clone(clock_offset)));
     let realm = common::realm();
     let keyd_socket = keyd_socket.to_path_buf();
+    let refuse_grants = options.refuse_grants;
     let factory: VerifierFactory = Arc::new(move || {
         let client = ipc_keyd::KeydClient::new(
             support::connector::keyd(&keyd_socket),
@@ -1037,6 +1066,10 @@ fn start_dird(
         .ok()?;
         let verifier: Box<dyn TicketVerifier> =
             Box::new(KeydTicketVerifier::new(client, realm.clone()));
+        if refuse_grants {
+            let refusing: Box<dyn TicketVerifier> = Box::new(RefusingGrants(verifier));
+            return Some(refusing);
+        }
         Some(verifier)
     });
     let admin = AdminParams {
@@ -2558,6 +2591,105 @@ fn the_decision_ack_deadline_is_bounded() {
             Err(DecisionAckDeadlineOutOfRange)
         );
     }
-    let worst = 2 * (3 * ipc_keyd::DEFAULT_DEADLINE + MAX_DECISION_ACK_DEADLINE);
+    // Three AP-REQ verifications and the set_secret grant (A15a).
+    let worst = 2 * (4 * ipc_keyd::DEFAULT_DEADLINE + MAX_DECISION_ACK_DEADLINE);
     assert!(worst <= ipc_dird_admin::DEFAULT_DEADLINE);
+}
+
+// ---------------------------------------------------------------------------
+// The set_secret grant (task A15a; docs/51 §5.8 option (b); docs/questions/
+// Q-450, Q-453).
+// ---------------------------------------------------------------------------
+
+/// keyd's records (Role::Ldap: dird's client) of `op` for `target`.
+fn keyd_records_for(
+    world: &World,
+    op: ipc_audit::KeydOperation,
+    target: Guid,
+) -> Vec<ipc_audit::KeydRecord> {
+    world
+        ._keyd_auditd
+        .events()
+        .into_iter()
+        .filter_map(|e| match e {
+            EventBody::Keyd(r) if r.op == op && r.principal == Some(target.to_packet()) => Some(*r),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Q-453 item 1: a committed `BeginPasswordSet` registers keyd's grant for
+/// exactly the key targets of the reply — under Role::Ldap, an intent first
+/// (a loosening, Q-452) — after dird's decision and outcome events
+/// (`Proceed`, then `Committed`).
+#[test]
+fn begin_password_set_registers_the_grant_for_its_key_targets() {
+    let Some(world) = World::new(Options::default()) else {
+        return;
+    };
+    let mut client = world.client();
+    let Reply::PasswordSet(set) = client
+        .call(&by(
+            "admin1",
+            &[],
+            Operation::BeginPasswordSet { target: g(BOB) },
+        ))
+        .unwrap()
+    else {
+        panic!("a PasswordSet reply");
+    };
+    assert_eq!(set.keys.len(), 1);
+    assert!(support::eventually(Duration::from_secs(10), || {
+        keyd_records_for(&world, ipc_audit::KeydOperation::GrantSetSecret, g(BOB)).len() >= 2
+    }));
+    let grants = keyd_records_for(&world, ipc_audit::KeydOperation::GrantSetSecret, g(BOB));
+    assert_eq!(grants[0].result, ipc_audit::KeydOutcome::Intent);
+    assert_eq!(grants[1].result, ipc_audit::KeydOutcome::Success);
+    assert_eq!(grants[1].caller_role, ipc_audit::KeydRole::Ldap);
+    assert_eq!(
+        grants[1].purpose,
+        Some(ipc_audit::KeyPurposeCode::PrincipalLongterm)
+    );
+    let events = await_events(&world, DirAdminOperation::BeginPasswordSet, 2);
+    assert_eq!(
+        events[0].stage,
+        DirAdminStage::Decision(DecisionResult::Proceed)
+    );
+    assert!(is_committed(&events[1]));
+}
+
+/// Q-453 item 1 (fail closed): when keyd does not register the grant, the
+/// `BeginPasswordSet` is answered `Unavailable` — admind then sets no
+/// password. The write did commit (`pwdLastSet` moved; dird's outcome event
+/// says `Committed`): the begun-but-not-set state docs/51 §9 names as safe.
+#[test]
+fn a_grant_keyd_does_not_register_answers_unavailable() {
+    let Some(world) = World::new(Options {
+        refuse_grants: true,
+        ..Options::default()
+    }) else {
+        return;
+    };
+    let mut client = world.client();
+    let seq_before = change_seq_next(&world.store);
+    assert_eq!(
+        client
+            .call(&by(
+                "admin1",
+                &[],
+                Operation::BeginPasswordSet { target: g(BOB) },
+            ))
+            .unwrap(),
+        Reply::Refused(RefusalStatus::Unavailable)
+    );
+    assert_eq!(change_seq_next(&world.store), seq_before + 1, "committed");
+    let events = await_events(&world, DirAdminOperation::BeginPasswordSet, 2);
+    assert_eq!(
+        events[0].stage,
+        DirAdminStage::Decision(DecisionResult::Proceed)
+    );
+    assert!(is_committed(&events[1]));
+    // keyd holds no grant: dird's client never sent one.
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(keyd_records_for(&world, ipc_audit::KeydOperation::GrantSetSecret, g(BOB)).is_empty());
 }

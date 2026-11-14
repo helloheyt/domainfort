@@ -25,8 +25,11 @@
 //! ([`settings`]: root-owned, not group/other-writable) → read the manifest
 //! (`provision_manifest::read_manifest`: the same rule) → connect to keyd,
 //! verify its peer uid before anything is sent → `ping` → three
-//! `create_key` → print the [`report`] → exit 0 (complete), 1 (nothing
-//! attempted) or 2 (stopped after an attempt).
+//! `create_key` → one `grant_set_secret` per first administrator (task A15a:
+//! the initial-secret grants without which keyd refuses `provision
+//! first-admin-secret`'s `set_secret`, live 15 minutes — docs/51 §5.8,
+//! docs/questions/Q-451) → print the [`report`] → exit 0 (complete), 1
+//! (nothing attempted) or 2 (stopped after an attempt).
 //!
 //! # `keyadm <configuration file> rotate-krbtgt | rotate-key | retire-kvno <request id>`
 //!

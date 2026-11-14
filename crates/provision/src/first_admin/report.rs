@@ -188,7 +188,7 @@ pub fn render(report: &SecretReport) -> Vec<String> {
             "complete: {done} of {total} first administrators' passwords set"
         ));
         lines.push(
-            "development mode (A-77): keyd keeps keys in memory only - after every keyd restart run keyadm ceremony and then this command again; against a keyd that still holds the key sets this command sets the next kvno (A-35)".to_owned(),
+            "development mode (A-77): keyd keeps keys in memory only - after every keyd restart run keyadm ceremony and then this command again; the ceremony grants each first administrator's initial secret only, so against a keyd that still holds the key sets this command is refused - later password changes go through admind (docs/51 5.8, task A15a)".to_owned(),
         );
         return lines;
     }
@@ -211,7 +211,7 @@ pub fn render(report: &SecretReport) -> Vec<String> {
         .any(|s| s.outcome == Outcome::Answered(Err(KeydError::Denied)))
     {
         lines.push(
-            "keyd answers one uniform \"denied\" (docs/10 9): admind's account may not be mapped to Directory in keyd's uid_roles, or keyd refused the binding; keyd's audit record names the reason".to_owned(),
+            "keyd answers one uniform \"denied\" (docs/10 9): keyd holds no live grant for this administrator (task A15a: run keyadm ceremony first - its grants live 15 minutes and cover only key sets that do not exist yet), admind's account may not be mapped to Directory in keyd's uid_roles, or keyd refused the binding; keyd's audit record names the reason".to_owned(),
         );
     }
     if report.steps.iter().any(|s| s.outcome.outcome_unknown()) {
@@ -220,7 +220,7 @@ pub fn render(report: &SecretReport) -> Vec<String> {
         );
     }
     lines.push(
-        "this command never retries: run it again for every first administrator once the cause is fixed (keyd chooses the next kvno, A-35)".to_owned(),
+        "this command never retries: run it again for every first administrator once the cause is fixed and keyadm ceremony granted the initial secrets again (in development mode: restart keyd first, A-77)".to_owned(),
     );
     lines
 }

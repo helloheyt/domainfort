@@ -349,9 +349,40 @@ fn admin_and_directory_operations_through_the_client() {
 
     let alice = samples::handle(0xA1, KeyPurpose::PrincipalLongterm);
     let pass = || Zeroizing::new(String::from(samples::PASSWORD));
+    // Task A15a (docs/51 §5.8 option (b)): no set_secret without a grant;
+    // the grant comes from Ldap (dird's role), never from Directory.
+    let targets = vec![keyd::SetSecretTarget {
+        handle: alice,
+        binding: samples::binding(),
+    }];
+    assert_eq!(
+        directory.set_secret(&alice, &samples::binding(), pass(), "EXAMPLE.ORGalice"),
+        Err(keyd::Error::Denied)
+    );
+    assert_eq!(
+        directory.grant_set_secret(
+            keyd::AccountKind::User,
+            &targets,
+            keyd::MAX_SET_SECRET_GRANT_SECS
+        ),
+        Err(keyd::Error::Denied)
+    );
+    assert_eq!(
+        ldap.grant_set_secret(
+            keyd::AccountKind::User,
+            &targets,
+            keyd::MAX_SET_SECRET_GRANT_SECS
+        ),
+        Ok(())
+    );
     assert_eq!(
         directory.set_secret(&alice, &samples::binding(), pass(), "EXAMPLE.ORGalice"),
         Ok(Kvno::INITIAL)
+    );
+    // The grant is spent.
+    assert_eq!(
+        directory.set_secret(&alice, &samples::binding(), pass(), "EXAMPLE.ORGalice"),
+        Err(keyd::Error::Denied)
     );
     assert_eq!(directory.verify_secret(&alice, pass()), Ok(()));
     assert_eq!(

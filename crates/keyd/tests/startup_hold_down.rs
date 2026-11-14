@@ -368,6 +368,8 @@ fn directory_admin_and_daemon_support_operations_are_not_held() {
         Ok(Kvno::new(2))
     );
     assert_eq!(f.keyd.destroy_key_set(&ADMIN, &h, &at(40)), Ok(()));
+    // The set_secret grant (task A15a) is not held either.
+    assert_eq!(f.grant(&BOB, &bob_binding(), &at(50)), Ok(()));
     assert_eq!(
         f.keyd.set_secret(
             &DIRECTORY,

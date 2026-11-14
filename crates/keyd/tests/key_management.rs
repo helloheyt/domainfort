@@ -51,6 +51,7 @@ fn krbtgt_refused_by_non_development_store() {
         Ok(Kvno::new(1))
     );
     // And no TGT can ever be issued from it.
+    grant(&mut keyd, &ALICE, &alice_binding(), &now()).unwrap();
     keyd.set_secret(
         &DIRECTORY,
         &ALICE,
@@ -139,11 +140,13 @@ fn create_key_validates_binding() {
             AuditReason::InvalidNameBinding
         );
     }
-    // set_secret applies the same rules when it creates a key set.
+    // set_secret applies the same rules when it creates a key set (with the
+    // grant it needs since task A15a, which does not judge bindings).
     let carol = KeyHandle::new(
         PrincipalId::from_bytes([0xCA; 16]),
         KeyPurpose::PrincipalLongterm,
     );
+    grant(&mut f.keyd, &carol, &krbtgt_binding(), &now()).unwrap();
     assert_eq!(
         f.keyd.set_secret(
             &DIRECTORY,
@@ -168,6 +171,9 @@ fn create_key_validates_binding() {
 #[test]
 fn set_secret_cannot_rebind() {
     let mut f = Fixture::new();
+    // Even with a grant naming the other binding (task A15a: the grant does
+    // not judge bindings), set_secret refuses the rebinding.
+    f.grant(&ALICE, &bob_binding(), &now()).unwrap();
     assert_eq!(
         f.keyd.set_secret(
             &DIRECTORY,
@@ -204,6 +210,7 @@ fn set_secret_cannot_rebind() {
 
     let mut same = alice_binding();
     same.name.name_type = KRB_NT_UNKNOWN;
+    f.grant(&ALICE, &same, &now()).unwrap();
     assert_eq!(
         f.keyd
             .set_secret(&DIRECTORY, &ALICE, &same, z("pw3"), ALICE_SALT, &now()),
@@ -439,6 +446,7 @@ fn verify_secret_outcomes() {
 #[test]
 fn set_secret_rules() {
     let mut f = Fixture::new();
+    f.grant(&ALICE, &alice_binding(), &now()).unwrap();
     assert_eq!(
         f.keyd.set_secret(
             &DIRECTORY,
@@ -458,6 +466,7 @@ fn set_secret_rules() {
         name_type: KRB_NT_PRINCIPAL,
         name_string: vec![kstr("carol")],
     });
+    f.grant(&carol, &carol_binding, &now()).unwrap();
     assert_eq!(
         f.keyd.set_secret(
             &DIRECTORY,

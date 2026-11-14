@@ -9,7 +9,7 @@
 //! tests; no vector comes from any other implementation.
 #![allow(dead_code)] // each test binary uses a different subset
 
-use ipc_keyd::{Answer, Call, DescribedConfig, Password, TgsFast};
+use ipc_keyd::{AccountKind, Answer, Call, DescribedConfig, Password, SetSecretTarget, TgsFast};
 use keyd_types::{
     ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof, ConfigDescription, CtxId,
     DualControlToken, EncTypeId, ExchangeId, FastArmor, FastConversation, IssueError, KeyHandle,
@@ -286,6 +286,36 @@ pub fn calls() -> Vec<Call> {
         Call::DestroyKeySet { handle: alice },
         Call::DescribeConfig,
         Call::Ping,
+        // Task A15a: a user's grant, a computer's (two targets), and the
+        // shapes the codec carries for keyd to judge (none; a zero
+        // lifetime).
+        Call::GrantSetSecret {
+            kind: AccountKind::User,
+            targets: vec![SetSecretTarget {
+                handle: alice,
+                binding: binding(),
+            }],
+            lifetime_secs: 30,
+        },
+        Call::GrantSetSecret {
+            kind: AccountKind::Computer,
+            targets: vec![
+                SetSecretTarget {
+                    handle: handle(0xC7, KeyPurpose::PrincipalLongterm),
+                    binding: PrincipalBinding::new(realm(), name(1, &["ws7$"])),
+                },
+                SetSecretTarget {
+                    handle: handle(0xC7, KeyPurpose::Service),
+                    binding: PrincipalBinding::new(realm(), name(3, &["host", "ws7.example.org"])),
+                },
+            ],
+            lifetime_secs: 900,
+        },
+        Call::GrantSetSecret {
+            kind: AccountKind::Computer,
+            targets: Vec::new(),
+            lifetime_secs: 0,
+        },
     ]
 }
 
@@ -379,6 +409,7 @@ pub fn answers() -> Vec<Answer> {
         Answer::DestroyKeySet(Ok(())),
         Answer::DescribeConfig(Ok(described(false, Role::Kdc))),
         Answer::Ping(Ok(())),
+        Answer::GrantSetSecret(Ok(())),
     ];
     // The caller role of the DescribeConfig reply: every value of the closed
     // table (Q-351, A-87) — the codec carries any role; keyd answers only
@@ -422,6 +453,7 @@ pub fn answers() -> Vec<Answer> {
         answers.push(Answer::DestroyKeySet(Err(error)));
         answers.push(Answer::DescribeConfig(Err(error)));
         answers.push(Answer::Ping(Err(error)));
+        answers.push(Answer::GrantSetSecret(Err(error)));
     }
     answers
 }

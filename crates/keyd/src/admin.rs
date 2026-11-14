@@ -218,7 +218,8 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// not redeem against a key set later recreated on the same handle. A
     /// live service context opened under a destroyed Service key set
     /// (`open_and_verify_service_ticket`) is discarded likewise, its session
-    /// key zeroized.
+    /// key zeroized. A live `set_secret` grant for the handle (task A15a) is
+    /// dropped too.
     ///
     /// The audit record carries the destroyed current kvno (not secret).
     ///
@@ -257,6 +258,9 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             .current_kvno();
         fields.kvno = Some(current);
         self.store.destroy(handle).map_err(store_deny)?;
+        // A live set_secret grant for the destroyed key set goes with it: the
+        // handle is unknown afterwards (docs/questions/Q-450 item 8).
+        self.grants.discard(handle);
         match handle.purpose {
             KeyPurpose::PrincipalLongterm => {
                 let principal = handle.principal;

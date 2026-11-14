@@ -49,8 +49,9 @@ use kdc::{
     TcpFrame, Transport,
 };
 use keyd::{
-    AuditRecord, CallerId, InMemoryKeyStore, KeyHandle, KeyPurpose, Keyd, KeydConfig, LocalKeyd,
-    OsEntropy, PrincipalBinding, PrincipalId, Role,
+    AccountKind, AuditRecord, CallerId, InMemoryKeyStore, KeyHandle, KeyPurpose, Keyd, KeydConfig,
+    LocalKeyd, OsEntropy, PrincipalBinding, PrincipalId, Role, SetSecretTarget,
+    MAX_SET_SECRET_GRANT_SECS,
 };
 use krb_crypto::{EncType, KeyUsage, ProtocolKey};
 use krb_proto::constants::{
@@ -62,8 +63,8 @@ use krb_proto::{
     ApOptions, ApReq, AsRep, AsReq, Authenticator, Checksum, EncAsRepPart, EncryptedData,
     EncryptionKey, EtypeInfo2Entry, FastOptions, KdcOptions, KdcReq, KdcReqBody, KerberosFlags,
     KerberosString, KerberosTime, KeyValue, KrbError, KrbFastArmor, KrbFastArmoredReq, KrbFastReq,
-    KrbFastResponse, MethodData, Microseconds, PaData, PaEncTsEnc, PaFxFastReply,
-    PaFxFastRequest, PrincipalName, Realm, TgsRep, TgsReq, Ticket,
+    KrbFastResponse, MethodData, Microseconds, PaData, PaEncTsEnc, PaFxFastReply, PaFxFastRequest,
+    PrincipalName, Realm, TgsRep, TgsReq, Ticket,
 };
 use libfuzzer_sys::fuzz_target;
 use pdp::{
@@ -154,6 +155,11 @@ const DIRECTORY: CallerId = CallerId {
     uid: 2,
     role: Role::Directory,
 };
+/// dird's role, which registers the set_secret grant (task A15a).
+const LDAP: CallerId = CallerId {
+    uid: 4,
+    role: Role::Ldap,
+};
 const KDC_CALLER: CallerId = CallerId {
     uid: 1,
     role: Role::Kdc,
@@ -218,8 +224,7 @@ fn seal(key: &ProtocolKey, usage_number: u32, plain: &[u8]) -> EncryptedData {
     EncryptedData {
         etype: key.enc_type().number(),
         kvno: None,
-        cipher: krb_crypto::encrypt(key, usage(usage_number), &[0x46; 16], plain)
-            .expect("encrypt"),
+        cipher: krb_crypto::encrypt(key, usage(usage_number), &[0x46; 16], plain).expect("encrypt"),
     }
 }
 
@@ -384,7 +389,11 @@ fn armored_as(
 
 /// The encrypted challenge of `long_term` under `armor_key` at `ts`
 /// (RFC 6113 5.4.6, key usage 54).
-fn encrypted_challenge(armor_key: &ProtocolKey, long_term: &ProtocolKey, ts: KerberosTime) -> PaData {
+fn encrypted_challenge(
+    armor_key: &ProtocolKey,
+    long_term: &ProtocolKey,
+    ts: KerberosTime,
+) -> PaData {
     let key = cf2(
         armor_key,
         long_term,
@@ -436,15 +445,34 @@ fn build() -> FuzzState {
         )
         .expect("key created");
     }
-    for (handle, binding, password, salt) in [
-        (client, client_name.clone(), USER_PASSWORD, USER_SALT),
+    for (kind, handle, binding, password, salt) in [
         (
+            AccountKind::User,
+            client,
+            client_name.clone(),
+            USER_PASSWORD,
+            USER_SALT,
+        ),
+        (
+            AccountKind::Computer,
             machine_handle,
             machine_name.clone(),
             MACHINE_PASSWORD,
             MACHINE_SALT,
         ),
     ] {
+        // The grant dird registers after its PDP (task A15a; docs/51 §5.8).
+        keyd.grant_set_secret(
+            &LDAP,
+            kind,
+            &[SetSecretTarget {
+                handle,
+                binding: PrincipalBinding::new(realm.clone(), binding.clone()),
+            }],
+            MAX_SET_SECRET_GRANT_SECS,
+            &n,
+        )
+        .expect("grant registered");
         keyd.set_secret(
             &DIRECTORY,
             &handle,
@@ -606,7 +634,12 @@ fn build() -> FuzzState {
         panic!("armored AS answered");
     };
     let rep = AsRep::decode(&bytes).expect("armored AS-REP");
-    let fx = rep.0.padata.as_ref().and_then(|p| p.first()).expect("PA-FX-FAST");
+    let fx = rep
+        .0
+        .padata
+        .as_ref()
+        .and_then(|p| p.first())
+        .expect("PA-FX-FAST");
     let PaFxFastReply::ArmoredData(armored) =
         PaFxFastReply::decode(&fx.padata_value).expect("PA-FX-FAST-REPLY");
     let response = KrbFastResponse::decode(&open(&armor_key, 52, &armored.enc_fast_rep))

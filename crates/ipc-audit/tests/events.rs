@@ -263,12 +263,19 @@ fn code_tables_are_closed() {
     }
     use ipc_audit::*;
     assert_eq!(table!(KdcReason), 66);
-    assert_eq!(table!(KeydReason), 66);
+    // Task A15a appended the four grant reasons before `Unlisted`
+    // (docs/questions/Q-452 item 4).
+    assert_eq!(table!(KeydReason), 70);
+    assert_eq!(KeydReason::NoGrant.code(), 66);
+    assert_eq!(KeydReason::GrantTableFull.code(), 69);
     assert_eq!(table!(LdapReason), 53);
     assert_eq!(table!(CodecErrorCode), 35);
     assert_eq!(table!(CodecLimit), 12);
     assert_eq!(table!(PdpReasonCode), 12);
-    assert_eq!(table!(KeydOperation), 16);
+    // `GrantSetSecret` (17) appended by task A15a; 1-16 keep their codes.
+    assert_eq!(table!(KeydOperation), 17);
+    assert_eq!(KeydOperation::GrantSetSecret.code(), 17);
+    assert_eq!(KeydOperation::Ping.code(), 16);
     table!(KdcTransport);
     table!(KdcExchange);
     table!(KdcOutcomeCode);

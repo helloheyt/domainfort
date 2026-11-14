@@ -49,15 +49,16 @@ use ipc::{decode_reply, encode_frame, Direction, FrameLimit, Refused};
 use std::time::Instant;
 use zeroize::Zeroizing;
 
-/// The default per-call deadline of the admin client: 20 s. dird's admin
-/// path, worst case, verifies three AP-REQs through keyd (keyd's deadline
-/// 2 s each) and waits for auditd's acknowledgement of the decision event
-/// (2 s): 8 s; with ≤ 2 connections a request may wait behind one other
-/// request in dird's queue — twice that, plus margin. docs/51 §7.5 asks for
-/// a deadline "above keyd's deadline (2 s) × 3" (⚠ a project choice; admind,
-/// task A9, may pass another).
+/// The default per-call deadline of the admin client: 24 s. dird's admin
+/// path, worst case, makes four keyd calls — three AP-REQ verifications and
+/// the set_secret grant of a `BeginPasswordSet` (task A15a) — at keyd's 2 s
+/// deadline each, and waits for auditd's acknowledgement of the decision
+/// event (at most dird's 4 s ceiling): 12 s; with ≤ 2 connections a request
+/// may wait behind one other request in dird's queue — twice that. dird
+/// const-asserts this bound. docs/51 §7.5 asks for a deadline "above keyd's
+/// deadline (2 s) × 3" (⚠ a project choice; was 20 s before A15a — A-100).
 /// Spec: docs/51 §7.5; docs/50 §3.6.
-pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(20);
+pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(24);
 
 /// A transport failure. Carries no octet of any frame.
 /// Spec: docs/50 §3.6, §3.7, §8.2.
