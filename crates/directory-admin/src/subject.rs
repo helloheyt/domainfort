@@ -19,7 +19,6 @@
 use core::time::Duration;
 use std::collections::BTreeMap;
 
-use directory_pip::DirectoryView;
 use dtyp::{Guid, Sid};
 use kdc::AccountSource;
 use keyd_types::{OperationDigest, ServiceContext};
@@ -107,7 +106,9 @@ pub struct AdminSubject {
 impl AdminSubject {
     /// Build the Subject of the ticket's client (module documentation):
     ///
-    /// 1. `AccountSource::client(crealm, cname)` on `view` — the configured
+    /// 1. `AccountSource::client(crealm, cname)` on `accounts` (the
+    ///    request's view — a `DirectoryView`, or the PEP's
+    ///    `PepView::accounts`, docs/52 R-a) — the configured
     ///    realm, exactly one component, the sAMAccountName index and an
     ///    octet-for-octet compare, user or computer, never krbtgt (docs/47
     ///    §1.3). No account ⇒ [`SubjectError::NotUsable`].
@@ -121,13 +122,13 @@ impl AdminSubject {
     ///
     /// Spec: docs/51 §5.3; docs/47 §1.3, §4, §4.5; A-73.
     pub fn from_verified_ticket(
-        view: &DirectoryView<'_>,
+        accounts: &dyn AccountSource,
         crealm: &Realm,
         cname: &PrincipalName,
         authtime: &KerberosTime,
         now: &KerberosTime,
     ) -> Result<AdminSubject, SubjectError> {
-        let account = match view.client(crealm, cname) {
+        let account = match accounts.client(crealm, cname) {
             Ok(Some(account)) => account,
             Ok(None) => return Err(SubjectError::NotUsable),
             Err(_) => return Err(SubjectError::Unavailable),

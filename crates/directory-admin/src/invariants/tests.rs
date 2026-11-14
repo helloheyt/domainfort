@@ -574,3 +574,125 @@ fn structural_objects_and_unwritten_attributes_are_refused() {
     inv.check_modify(&txn, guid(62), uac(ADS_UF_NORMAL_ACCOUNT), &[])
         .unwrap();
 }
+
+/// A computer `name$` on `host`, WT without pwdLastSet (a service object's
+/// shape), with the servicePrincipalName `spn` if any.
+fn service(ids: &Ids, g: Guid, name: &str, host: &str, spn: Option<&str>) -> NewObject {
+    let mut object = computer(ids, g, guid(OU), name, ADS_UF_WORKSTATION_TRUST_ACCOUNT);
+    for (id, values) in &mut object.attributes {
+        if *id == ids.dns_host_name {
+            *values = text(host);
+        }
+    }
+    if let Some(spn) = spn {
+        object
+            .attributes
+            .push((ids.service_principal_name, text(spn)));
+    }
+    object
+}
+
+/// docs/52 R2b follow-up; docs/questions/Q-491 item 1, Q-541; A-73: a
+/// principal name from which the admin service's key-set purpose derives
+/// (`admind/<host>`) is the admin service object's alone. On the online
+/// path's call (no role — what `apply` asks) and under the plain
+/// service-object claim it is refused (`Value`, the SPN rule's code); a
+/// user carrying it is refused too (the rule is judged on every object);
+/// the admin service's claim on an object without that name is
+/// `Exception`; the claim with it passes once — a second admin service
+/// object is `Exception`; the LDAP service object is unaffected; no write
+/// path changes an SPN afterwards (`NotModifiable`). Nothing refused is
+/// written.
+#[test]
+fn the_admin_service_name_is_the_admin_service_objects_alone() {
+    let ids = ids();
+    let t = TempStore::new("admind-name");
+    let mut txn = t.store.begin_write().unwrap();
+    let host = "dc01.example.test";
+    let admind = "admind/dc01.example.test";
+    {
+        let mut s = begin(&mut txn);
+        assert_eq!(
+            rule(s.create(None, service(&ids, guid(70), "ws70", host, Some(admind)))),
+            InvariantViolation::Value
+        );
+        assert_eq!(
+            rule(s.create(
+                Some(ProvisioningRole::ServiceObject),
+                service(&ids, guid(70), "ws70", host, Some(admind))
+            )),
+            InvariantViolation::Value
+        );
+        let mut named_user = user(&ids, guid(71), guid(OU), "carol", ADS_UF_NORMAL_ACCOUNT);
+        named_user
+            .attributes
+            .push((ids.service_principal_name, text(admind)));
+        assert_eq!(rule(s.create(None, named_user)), InvariantViolation::Value);
+        for spn in [Some("ldap/dc01.example.test"), None] {
+            assert_eq!(
+                rule(s.create(
+                    Some(ProvisioningRole::AdminServiceObject),
+                    service(&ids, guid(72), "adm72", host, spn)
+                )),
+                InvariantViolation::Exception
+            );
+        }
+        // The two real service objects.
+        s.create(
+            Some(ProvisioningRole::ServiceObject),
+            service(
+                &ids,
+                guid(73),
+                "ldap-svc",
+                host,
+                Some("ldap/dc01.example.test"),
+            ),
+        )
+        .unwrap();
+        s.create(
+            Some(ProvisioningRole::AdminServiceObject),
+            service(&ids, guid(74), "admind-svc", host, Some(admind)),
+        )
+        .unwrap();
+        // A second admin service object, even on another host.
+        assert_eq!(
+            rule(s.create(
+                Some(ProvisioningRole::AdminServiceObject),
+                service(
+                    &ids,
+                    guid(75),
+                    "admind2",
+                    "dc02.example.test",
+                    Some("admind/dc02.example.test")
+                )
+            )),
+            InvariantViolation::Exception
+        );
+        s.create(
+            None,
+            service(&ids, guid(76), "ws76", host, Some("host/dc01.example.test")),
+        )
+        .unwrap();
+    }
+    for refused in [70, 71, 72, 75] {
+        assert_eq!(StoreRead::object(&txn, guid(refused)).unwrap(), None);
+    }
+    assert!(StoreRead::object(&txn, guid(74)).unwrap().is_some());
+    let inv = Invariants::new(&p1(), BTreeSet::new()).unwrap();
+    let renamed = inv.check_modify(
+        &txn,
+        guid(76),
+        vec![AttributeChange::Replace {
+            id: ids.service_principal_name,
+            values: text(admind),
+        }],
+        &[],
+    );
+    assert!(
+        matches!(
+            renamed,
+            Err(Refused::Rule(InvariantViolation::NotModifiable))
+        ),
+        "{renamed:?}"
+    );
+}

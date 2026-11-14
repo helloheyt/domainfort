@@ -95,7 +95,7 @@ pub use grant::{
 };
 pub use model::{
     is_admin_service_name, KeyHandle, KeyPurpose, Kvno, PrincipalBinding, PrincipalId,
-    ADMIN_SERVICE_CLASS,
+    ServiceKeyHandle, ADMIN_SERVICE_CLASS,
 };
 pub use service_ticket::{AppBinding, OperationDigest, ServiceContext, OPERATION_DIGEST_LEN};
 pub use tgs_exchange::{TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext};

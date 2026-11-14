@@ -380,7 +380,7 @@ fn direct(w: &World, session: &mut Session, message: &[u8], tls: bool) -> ldap::
                 input_pending: false,
             },
             directory: Some(DirectoryInputs {
-                view: &view,
+                view: directory_pip::PepView::new(&view),
                 clock: &FixedClock,
             }),
         },

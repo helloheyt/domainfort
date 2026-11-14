@@ -4,12 +4,15 @@
 //! provisioned test domain (tests/common): the `Approve` that completes the
 //! quorum yields the decision dird registers in keyd (docs/52 §4.3), one
 //! that does not yields none, and an approval after the quorum is a
-//! conflict. The registration itself runs against the real dird and keyd in
-//! crates/directory-daemon tests/admin_service.rs.
+//! conflict. The key set of a service object carries the purpose its name
+//! derives — `AdminService` for the admin service, `Service` for the LDAP
+//! service (docs/52 R2b). The registration itself runs against the real
+//! dird and keyd in crates/directory-daemon tests/admin_service.rs.
 //!
 //! Sources: docs/51 §5.6 ("the operation digest", "bounded in time"), §6;
 //! docs/24 §6 (principle: sign the exact operation); docs/10 §1, §7;
-//! docs/questions/Q-420, Q-460; docs/52 §4.2, §4.3 (A-102). Every value is
+//! docs/questions/Q-420, Q-460, Q-491 item 1, Q-493 item 1; docs/52 §4.2,
+//! §4.3 (A-102), R2b. Every value is
 //! constructed by hand for these tests; no vector comes from any other
 //! implementation (SHA-256 itself is the approved `sha2`'s — only its use is
 //! checked here).
@@ -26,7 +29,11 @@ use ipc_audit::{
     AdminFailure, AdminRefusal, DecisionResult, DirAdminOperation, DirAdminStage, KeydOperation,
     OutcomeResult,
 };
-use keyd_types::{DecidedOperation, DecisionId, KeyHandle, KeyPurpose, Kvno, PrincipalId};
+use keyd_types::{
+    DecidedOperation, DecisionId, KeyHandle, KeyPurpose, Kvno, PrincipalId, ServiceKeyHandle,
+};
+use krb_proto::constants::KRB_NT_SRV_HST;
+use krb_proto::{KerberosString, PrincipalName};
 use std::collections::BTreeSet;
 
 fn guid(n: u8) -> Guid {
@@ -36,56 +43,112 @@ fn guid(n: u8) -> Guid {
     Guid::from_packet(&packet)
 }
 
+/// The NT-SRV-HST name `class/host` (RFC 4120 §6.2.1).
+fn spn(class: &str, host: &str) -> PrincipalName {
+    PrincipalName {
+        name_type: KRB_NT_SRV_HST,
+        name_string: vec![
+            KerberosString::new(class).unwrap(),
+            KerberosString::new(host).unwrap(),
+        ],
+    }
+}
+
+/// The key set of the service object `g` named `class/host`, as the one
+/// derivation names it (docs/52 R2b).
+fn service_key(g: Guid, class: &str, host: &str) -> ServiceKeyHandle {
+    ServiceKeyHandle::of_service(PrincipalId::from_bytes(g.to_packet()), &spn(class, host))
+}
+
+/// The krbtgt key set of the account `g`.
+fn krbtgt_key(g: Guid) -> KeyHandle {
+    KeyHandle::new(PrincipalId::from_bytes(g.to_packet()), KeyPurpose::Krbtgt)
+}
+
 /// docs/51 §5.6; docs/24 §6: the digest is a function of the request — the
 /// same inputs give the same digest; changing the id, the operation, its
 /// kvno, the key set, the requester or the expiry changes it.
 #[test]
 fn the_digest_binds_every_field() {
-    let base = operation_digest(7, &KeyOperation::RotateKrbtgt, guid(1), guid(2), 1000);
+    let k = krbtgt_key;
+    let base = operation_digest(7, &KeyOperation::RotateKrbtgt, k(guid(1)), guid(2), 1000);
     assert_eq!(
         base,
-        operation_digest(7, &KeyOperation::RotateKrbtgt, guid(1), guid(2), 1000)
+        operation_digest(7, &KeyOperation::RotateKrbtgt, k(guid(1)), guid(2), 1000)
     );
     let retire = |kvno| KeyOperation::RetireKvno {
         key: KeyRef::Krbtgt,
         kvno,
     };
+    let rotate = KeyOperation::RotateKey { service: guid(1) };
     let variants = [
-        operation_digest(8, &KeyOperation::RotateKrbtgt, guid(1), guid(2), 1000),
-        operation_digest(7, &retire(0), guid(1), guid(2), 1000),
-        operation_digest(7, &retire(1), guid(1), guid(2), 1000),
-        operation_digest(7, &retire(2), guid(1), guid(2), 1000),
+        operation_digest(8, &KeyOperation::RotateKrbtgt, k(guid(1)), guid(2), 1000),
+        operation_digest(7, &retire(0), k(guid(1)), guid(2), 1000),
+        operation_digest(7, &retire(1), k(guid(1)), guid(2), 1000),
+        operation_digest(7, &retire(2), k(guid(1)), guid(2), 1000),
         operation_digest(
             7,
-            &KeyOperation::RotateKey { service: guid(1) },
-            guid(1),
+            &rotate,
+            service_key(guid(1), "ldap", "dc01.example.test").handle(),
             guid(2),
             1000,
         ),
-        operation_digest(7, &KeyOperation::RotateKrbtgt, guid(3), guid(2), 1000),
-        operation_digest(7, &KeyOperation::RotateKrbtgt, guid(1), guid(4), 1000),
-        operation_digest(7, &KeyOperation::RotateKrbtgt, guid(1), guid(2), 1001),
+        // The same object and operation under the other service purpose
+        // (docs/52 R2b): the digest binds the purpose too.
+        operation_digest(
+            7,
+            &rotate,
+            service_key(guid(1), "admind", "dc01.example.test").handle(),
+            guid(2),
+            1000,
+        ),
+        operation_digest(7, &KeyOperation::RotateKrbtgt, k(guid(3)), guid(2), 1000),
+        operation_digest(7, &KeyOperation::RotateKrbtgt, k(guid(1)), guid(4), 1000),
+        operation_digest(7, &KeyOperation::RotateKrbtgt, k(guid(1)), guid(2), 1001),
     ];
     let mut all: BTreeSet<[u8; 32]> = variants.iter().copied().collect();
     assert_eq!(all.len(), variants.len());
     assert!(all.insert(base), "every variant differs from the base");
 }
 
-/// docs/10 §1, §7: the keyd operation and the key purpose of each request.
+/// docs/10 §1, §7: the keyd operation of each request, and the key set it
+/// acts on — the krbtgt's `Krbtgt` key set, or the service object's key set
+/// with the purpose its name derives (docs/52 R2b; Q-493 item 1): `Service`
+/// for `ldap/<host>`, `AdminService` for `admind/<host>`; a service object
+/// that is no target names no key set.
 #[test]
 fn operations_name_their_keyd_operation_and_purpose() {
-    let service = guid(5);
-    for (operation, keyd, purpose, kvno) in [
+    let (ldap, admin, other) = (guid(5), guid(6), guid(9));
+    let targets = KeyTargets {
+        krbtgt: guid(1),
+        services: BTreeSet::from([
+            service_key(ldap, "ldap", "dc01.example.test"),
+            service_key(admin, "admind", "dc01.example.test"),
+        ]),
+    };
+    for (operation, keyd, key, kvno) in [
         (
             KeyOperation::RotateKrbtgt,
             KeydOperation::RotateKrbtgt,
-            KeyPurpose::Krbtgt,
+            Some((guid(1), KeyPurpose::Krbtgt)),
             true,
         ),
         (
-            KeyOperation::RotateKey { service },
+            KeyOperation::RotateKey { service: ldap },
             KeydOperation::RotateKey,
-            KeyPurpose::Service,
+            Some((ldap, KeyPurpose::Service)),
+            true,
+        ),
+        (
+            KeyOperation::RotateKey { service: admin },
+            KeydOperation::RotateKey,
+            Some((admin, KeyPurpose::AdminService)),
+            true,
+        ),
+        (
+            KeyOperation::RotateKey { service: other },
+            KeydOperation::RotateKey,
+            None,
             true,
         ),
         (
@@ -94,21 +157,33 @@ fn operations_name_their_keyd_operation_and_purpose() {
                 kvno: 1,
             },
             KeydOperation::RetireKvno,
-            KeyPurpose::Krbtgt,
+            Some((guid(1), KeyPurpose::Krbtgt)),
             false,
         ),
         (
             KeyOperation::RetireKvno {
-                key: KeyRef::Service(service),
+                key: KeyRef::Service(ldap),
                 kvno: 1,
             },
             KeydOperation::RetireKvno,
-            KeyPurpose::Service,
+            Some((ldap, KeyPurpose::Service)),
+            false,
+        ),
+        (
+            KeyOperation::RetireKvno {
+                key: KeyRef::Service(admin),
+                kvno: 1,
+            },
+            KeydOperation::RetireKvno,
+            Some((admin, KeyPurpose::AdminService)),
             false,
         ),
     ] {
         assert_eq!(operation.keyd_operation(), keyd);
-        assert_eq!(operation.purpose(), purpose);
+        assert_eq!(
+            targets.handle_of(&operation),
+            key.map(|(g, purpose)| KeyHandle::new(PrincipalId::from_bytes(g.to_packet()), purpose))
+        );
         assert_eq!(operation.answers_kvno(), kvno);
     }
     // Both steps carry a ticket (keyadm's ticketless steps are retired —
@@ -146,7 +221,10 @@ fn operations_name_their_keyd_operation_and_purpose() {
 fn the_lifetime_is_bounded() {
     let targets = || KeyTargets {
         krbtgt: guid(1),
-        services: BTreeSet::from([guid(2), guid(3)]),
+        services: BTreeSet::from([
+            service_key(guid(2), "ldap", "dc01.example.test"),
+            service_key(guid(3), "admind", "dc01.example.test"),
+        ]),
     };
     for lifetime in [
         Duration::ZERO,
@@ -192,13 +270,19 @@ fn with_policy_admin(d: &mut common::Domain) {
     d.policy = pdp::PolicySnapshot::new(d.policy.version(), rules, vec![]);
 }
 
-/// The domain's key sets: its krbtgt (RID 502) and its two service objects.
+/// The domain's key sets: its krbtgt (RID 502) and its two service objects,
+/// each named by the SPN tests/common gives it (`ldap/dc01.example.test`,
+/// `admind/dc01.example.test`) through the one derivation (docs/52 R2b).
 fn domain_targets() -> KeyTargets {
     KeyTargets {
         krbtgt: common::guid(common::KRBTGT),
         services: BTreeSet::from([
-            common::guid(common::LDAP_SVC),
-            common::guid(common::ADMIND_SVC),
+            service_key(common::guid(common::LDAP_SVC), "ldap", "dc01.example.test"),
+            service_key(
+                common::guid(common::ADMIND_SVC),
+                "admind",
+                "dc01.example.test",
+            ),
         ]),
     }
 }
@@ -406,4 +490,154 @@ fn a_non_completing_approve_yields_no_decision() {
     assert!(approved.decision().is_none());
     let KeyReply::Request(view) = approved.reply();
     assert_eq!((view.approvals, view.quorum), (1, 3));
+}
+
+/// The decision of a quorum-completing `Approve` of `operation`, requested
+/// by admin1 and approved by admin2 against the test domain.
+fn decided(table_seed: u64, operation: KeyOperation) -> DecidedOperation {
+    let mut d = common::Domain::new("kr-r2b");
+    with_policy_admin(&mut d);
+    let mut table = KeyRequests::new(domain_targets(), KEY_REQUEST_LIFETIME, table_seed).unwrap();
+    let opened = step(
+        &d,
+        &mut table,
+        1,
+        &KeyAdminOperation::RequestKeyOperation { operation },
+        "admin1",
+    )
+    .unwrap();
+    let KeyReply::Request(view) = opened.reply();
+    let approved = step(
+        &d,
+        &mut table,
+        2,
+        &KeyAdminOperation::Approve {
+            id: view.id,
+            operation,
+        },
+        "admin2",
+    )
+    .unwrap();
+    approved.decision().unwrap().operation.clone()
+}
+
+/// docs/52 R2b; docs/questions/Q-493 item 1 (the fix): `rotate_key` and
+/// `retire_kvno` of the admin service object decide on its
+/// `AdminService` key set — the key set keyd holds for `admind/<host>` and
+/// the KDC seals admin tickets under (Q-491 item 1) — so keyd can run them
+/// (the end-to-end run against keyd: crates/directory-daemon
+/// tests/admin_service.rs); the LDAP service object's stay `Service`.
+#[test]
+fn the_admin_service_key_operations_name_its_admin_service_key_set() {
+    let admin = KeyHandle::new(
+        principal(common::guid(common::ADMIND_SVC)),
+        KeyPurpose::AdminService,
+    );
+    let ldap = KeyHandle::new(
+        principal(common::guid(common::LDAP_SVC)),
+        KeyPurpose::Service,
+    );
+    assert_eq!(
+        decided(
+            4000,
+            KeyOperation::RotateKey {
+                service: common::guid(common::ADMIND_SVC)
+            }
+        ),
+        DecidedOperation::RotateKey { handle: admin }
+    );
+    assert_eq!(
+        decided(
+            5000,
+            KeyOperation::RetireKvno {
+                key: KeyRef::Service(common::guid(common::ADMIND_SVC)),
+                kvno: 1,
+            }
+        ),
+        DecidedOperation::RetireKvno {
+            handle: admin,
+            kvno: Kvno::new(1),
+        }
+    );
+    assert_eq!(
+        decided(
+            6000,
+            KeyOperation::RotateKey {
+                service: common::guid(common::LDAP_SVC)
+            }
+        ),
+        DecidedOperation::RotateKey { handle: ldap }
+    );
+}
+
+/// Attack (docs/52 R2b, class "one fact derived in two places"): a key
+/// operation cannot name a purpose that contradicts the service's name.
+/// The operation carries no purpose at all; the only purpose it gets is the
+/// target's, which only the derivation from the name builds — so whatever
+/// table a caller assembles, the admin service's object is `AdminService`
+/// and nothing else is (the type has no other constructor: a hand-built
+/// `(admind GUID, Service)` target does not compile). An approval naming a
+/// service object outside the targets matches no request
+/// (`OperationMismatch`), and a request for it is `ValueInvalid`.
+#[test]
+fn a_key_operation_cannot_name_a_purpose_against_the_name() {
+    let admin = common::guid(common::ADMIND_SVC);
+    // Whatever name a caller hands the derivation, the purpose follows it.
+    for (class, purpose) in [
+        ("admind", KeyPurpose::AdminService),
+        ("ldap", KeyPurpose::Service),
+    ] {
+        let targets = KeyTargets {
+            krbtgt: common::guid(common::KRBTGT),
+            services: BTreeSet::from([service_key(admin, class, "dc01.example.test")]),
+        };
+        assert_eq!(
+            targets
+                .handle_of(&KeyOperation::RotateKey { service: admin })
+                .map(|h| h.purpose),
+            Some(purpose)
+        );
+    }
+    // A service object that is not a target.
+    let mut d = common::Domain::new("kr-r2b-attack");
+    with_policy_admin(&mut d);
+    let mut table = KeyRequests::new(domain_targets(), KEY_REQUEST_LIFETIME, 7000).unwrap();
+    let outsider = KeyOperation::RotateKey {
+        service: common::guid(common::BOB),
+    };
+    assert!(step(
+        &d,
+        &mut table,
+        1,
+        &KeyAdminOperation::RequestKeyOperation {
+            operation: outsider
+        },
+        "admin1",
+    )
+    .is_err());
+    let rotate = KeyOperation::RotateKey { service: admin };
+    let opened = step(
+        &d,
+        &mut table,
+        2,
+        &KeyAdminOperation::RequestKeyOperation { operation: rotate },
+        "admin1",
+    )
+    .unwrap();
+    let KeyReply::Request(view) = opened.reply();
+    let refused = step(
+        &d,
+        &mut table,
+        3,
+        &KeyAdminOperation::Approve {
+            id: view.id,
+            operation: outsider,
+        },
+        "admin2",
+    )
+    .unwrap_err();
+    assert_eq!(
+        refused.event().stage,
+        DirAdminStage::Decision(DecisionResult::Refused(AdminRefusal::OperationMismatch))
+    );
 }

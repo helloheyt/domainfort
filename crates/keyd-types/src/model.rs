@@ -170,6 +170,64 @@ impl KeyHandle {
     }
 }
 
+/// The handle of a service object's key set: `(objectGUID, purpose)`, the
+/// purpose derived from the service's name by
+/// [`KeyPurpose::of_service_name`] — the one derivation — and by nothing
+/// else. There is no other constructor, so a component that holds one names
+/// exactly the key set the KDC seals that service's tickets under, and
+/// cannot name a purpose that contradicts the name: the admin service
+/// (`admind/<host>`) is always [`KeyPurpose::AdminService`], every other
+/// service [`KeyPurpose::Service`].
+///
+/// Class closed (docs/52 R2b, AGENTS.md §6.1): one fact — the purpose of a
+/// service object's key set — chosen in several places (the KDC's account
+/// source from the name, but the admin plane's key operations, the
+/// password-set targets and the provisioning manifest each by a literal), so
+/// that a divergence failed open or closed by luck (docs/questions/Q-493
+/// item 1: the admin service key could not be rotated).
+///
+/// Spec: docs/47 §1.3 (TGS step 5: the key set of the service), §9.1 (the
+/// "computer (service)" row); docs/52 §3.2, §5 item 3; docs/questions/Q-491
+/// item 1, Q-493 item 1; A-73.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ServiceKeyHandle {
+    handle: KeyHandle,
+}
+
+impl ServiceKeyHandle {
+    /// The key set of the service object `principal` whose principal name
+    /// is `name` (its servicePrincipalName split on "/", or the manifest's
+    /// binding of it): the purpose is [`KeyPurpose::of_service_name`]`(name)`.
+    /// Spec: docs/47 §1.3, §9.1; docs/52 §5 item 3; docs/questions/Q-491
+    /// item 1.
+    #[must_use]
+    pub fn of_service(principal: PrincipalId, name: &PrincipalName) -> ServiceKeyHandle {
+        ServiceKeyHandle {
+            handle: KeyHandle::new(principal, KeyPurpose::of_service_name(name)),
+        }
+    }
+
+    /// The handle. Spec: docs/10 §1.
+    #[must_use]
+    pub const fn handle(&self) -> KeyHandle {
+        self.handle
+    }
+
+    /// The service object's principal id (its objectGUID). Spec: docs/47
+    /// §2.3.
+    #[must_use]
+    pub const fn principal(&self) -> PrincipalId {
+        self.handle.principal
+    }
+
+    /// The derived purpose: `Service` or `AdminService`. Spec: docs/52 §5
+    /// item 3.
+    #[must_use]
+    pub const fn purpose(&self) -> KeyPurpose {
+        self.handle.purpose
+    }
+}
+
 /// The Kerberos principal name a key set is bound to: realm plus
 /// PrincipalName. Fixed when the key set is created (by `create_key`, or by
 /// `set_secret` when it creates the set) and never changed afterwards —
@@ -290,5 +348,45 @@ mod tests {
         ));
         // Joining components differently is a different name.
         assert!(!b.matches(&realm("EXAMPLE.ORG"), &name(3, &["host/files.example.org"])));
+    }
+
+    /// docs/52 R2b; docs/questions/Q-491 item 1 (the rule as decided):
+    /// `admind/<host>` — exactly two components, the first "admind" octet
+    /// for octet, whatever the name-type (RFC 4120 6.2: a hint only) — is
+    /// the admin service's key set; every other service name is a plain
+    /// `Service` key set. `ServiceKeyHandle` carries the principal given and
+    /// exactly the purpose `KeyPurpose::of_service_name` derives.
+    #[test]
+    fn a_service_key_handle_takes_its_purpose_from_the_name() {
+        let p = PrincipalId::from_bytes([7; 16]);
+        let admin = ServiceKeyHandle::of_service(p, &name(3, &["admind", "dc01.example.org"]));
+        assert_eq!(admin.purpose(), KeyPurpose::AdminService);
+        assert_eq!(admin.principal(), p);
+        assert_eq!(admin.handle(), KeyHandle::new(p, KeyPurpose::AdminService));
+        // The name-type does not change it.
+        for name_type in [0, 1, 2] {
+            assert_eq!(
+                ServiceKeyHandle::of_service(p, &name(name_type, &["admind", "dc01.example.org"]))
+                    .purpose(),
+                KeyPurpose::AdminService
+            );
+        }
+        // Every other name: the LDAP service, another class, a case
+        // variant, one or three components.
+        for parts in [
+            &["ldap", "dc01.example.org"][..],
+            &["host", "dc01.example.org"][..],
+            &["ADMIND", "dc01.example.org"][..],
+            &["admind"][..],
+            &["admind", "dc01.example.org", "x"][..],
+            &["dc01.example.org", "admind"][..],
+        ] {
+            let service = ServiceKeyHandle::of_service(p, &name(3, parts));
+            assert_eq!(service.purpose(), KeyPurpose::Service, "{parts:?}");
+            assert_eq!(
+                service.purpose(),
+                KeyPurpose::of_service_name(&name(3, parts))
+            );
+        }
     }
 }

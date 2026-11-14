@@ -5,7 +5,11 @@
 //! Every read comes from the request's directory view: one dirstore
 //! snapshot, which is also the PIP of every PDP question ([MS-ADTS]
 //! 3.1.1.5.1.4: "Each Search request ... is performed as a transaction";
-//! docs/11 §6 P9).
+//! docs/11 §6 P9). The engine receives that view as a
+//! `directory_pip::PepView` — the visibility gate, the locators of its
+//! questions and the PIP — and never the raw snapshot, so no object reaches
+//! an entry except through the gate (docs/52 R-a; A-103 on
+//! docs/questions/Q-486).
 //!
 //! 0. **The operation's preconditions**, before the base is even parsed, so
 //!    that no answer below depends on whether a DN exists: the caller's time
@@ -26,9 +30,10 @@
 //!    other than `<GUID=hex>`) → invalidDNSyntax; a well-formed DN no
 //!    phase-1 object can carry (a value that is not printable ASCII, empty,
 //!    too long, or a hexstring) → noSuchObject (Q-195 item 4). The DN is
-//!    resolved by `DirectoryView::lookup_dn` (the NC suffix compared by its
+//!    resolved by `PepView::lookup_dn` (the NC suffix compared by its
 //!    case-folded key and stripped, then the name index from the NC root —
-//!    A-53); `<GUID=hex>` through `get_object` ([MS-ADTS] 3.1.1.3.1.2.4).
+//!    A-53); `<GUID=hex>` through `PepView::names_object` ([MS-ADTS]
+//!    3.1.1.3.1.2.4).
 //!    No such object, or one outside the NC → noSuchObject (R49-17: no
 //!    referral). The PDP then only ever sees the directory's canonical DN
 //!    (`dn_of`), never the client's spelling.
@@ -41,7 +46,7 @@
 //!    noSuchObject, identical to a nonexistent base (R49-13, A-48); refused
 //!    for an object-independent reason → that reason's code (step 0).
 //! 3. **Candidates by scope** (RFC 4511 §4.5.1.2): baseObject = the base;
-//!    singleLevel = its children (`Snapshot::children`, in pages of
+//!    singleLevel = its children (`PepView::children`, in pages of
 //!    [`limits::CHILD_PAGE_SIZE`]); wholeSubtree = the base and every
 //!    descendant, depth first in name-index order (deterministic).
 //!    **Visibility before the filter:** a container's children are
@@ -107,8 +112,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use ad_schema::{ClassInfo, Phase1Schema};
 use directory_pip::{
-    DirectoryView, GateFault, NamingContext, UnseenCause, Visibility, VisibilityGate,
-    VisibilityRule, VisibleObject, MAX_DN_DEPTH,
+    GateFault, NamingContext, PepView, UnseenCause, Visibility, VisibilityGate, VisibilityRule,
+    VisibleObject, MAX_DN_DEPTH,
 };
 use dirstore::{AttrId, ChildCursor, ChildPage, Object};
 use dtyp::Guid;
@@ -138,7 +143,8 @@ pub(crate) struct SearchParams<'r> {
     pub(crate) src_net: IpScope,
     pub(crate) channel: Channel,
     pub(crate) transport_sec: TransportSec,
-    pub(crate) view: &'r DirectoryView<'r>,
+    /// The request's directory as a PEP receives it (docs/52 R-a).
+    pub(crate) view: PepView<'r, 'r>,
     pub(crate) clock: &'r dyn SearchClock,
     pub(crate) naming_context: &'r NamingContext,
     pub(crate) limits: SearchLimits,
@@ -202,7 +208,7 @@ impl<'r> Candidate<'r> {
         self.object.object()
     }
 
-    /// Its canonical DN (`DirectoryView::dn_of`). Spec: docs/47 §8.2.
+    /// Its canonical DN (the gate's). Spec: docs/47 §8.2.
     pub(crate) fn dn(&self) -> &Dn {
         self.object.dn()
     }
@@ -224,7 +230,7 @@ struct Frame<'r> {
 
 /// The state of one search.
 pub(crate) struct Search<'r> {
-    view: &'r DirectoryView<'r>,
+    view: PepView<'r, 'r>,
     p1: &'r Phase1Schema,
     known: Known,
     /// Every PDP question of the search (module documentation).
@@ -268,7 +274,7 @@ pub(crate) fn run(p: SearchParams<'_>) -> SearchOutcome {
     if p.view.context().naming_context() != p.naming_context {
         return out.end(ResultCode::Other, AuditReason::NamingContextMismatch);
     }
-    let Ok(subject) = subject(p.requester, p.view) else {
+    let Ok(subject) = subject(p.requester, p.view.pip()) else {
         return out.end(ResultCode::Other, AuditReason::SubjectUnavailable);
     };
     let context = Context {
@@ -277,13 +283,9 @@ pub(crate) fn run(p: SearchParams<'_>) -> SearchOutcome {
         transport: context_transport(p.channel),
         transport_sec: p.transport_sec,
     };
-    let mut gate = VisibilityGate::new(
-        p.view,
-        p.policy,
-        subject,
-        context,
-        VisibilityRule::ListParent,
-    );
+    let mut gate = p
+        .view
+        .gate(p.policy, subject, context, VisibilityRule::ListParent);
     // The object-independent refusals, before the base is looked at
     // (module documentation, step 0). Spec: Q-169 item 3; docs/49 §9;
     // docs/questions/Q-200 item 5.
@@ -405,7 +407,7 @@ pub(crate) fn names_nothing(error: DnError) -> bool {
 /// Spec: RFC 4511 §4.1.3; docs/49 §7 (R49-11); [MS-ADTS] 3.1.1.3.1.2.4;
 /// Q-195 items 1, 4; A-53.
 pub(crate) fn resolve_ldap_dn(
-    view: &DirectoryView<'_>,
+    view: PepView<'_, '_>,
     text: &str,
 ) -> Result<Result<Guid, ResultCode>, ()> {
     match parse_ldap_dn(text) {
@@ -425,9 +427,9 @@ pub(crate) fn resolve_ldap_dn(
         // ([MS-DTYP] 2.3.4.2 packet). Spec: [MS-ADTS] 3.1.1.3.1.2.4.
         Ok(LdapDn::ObjectGuid(octets)) => {
             let guid = Guid::from_packet(&octets);
-            match view.dn_of(guid) {
-                Ok(Some(_)) => Ok(Ok(guid)),
-                Ok(None) => Ok(Err(ResultCode::NoSuchObject)),
+            match view.names_object(guid) {
+                Ok(true) => Ok(Ok(guid)),
+                Ok(false) => Ok(Err(ResultCode::NoSuchObject)),
                 Err(_) => Err(()),
             }
         }
@@ -437,7 +439,7 @@ pub(crate) fn resolve_ldap_dn(
 }
 
 /// The search base, resolved (step 1 of the module documentation).
-fn resolve_base(view: &DirectoryView<'_>, base: &str) -> Result<Result<Guid, ResultCode>, ()> {
+fn resolve_base(view: PepView<'_, '_>, base: &str) -> Result<Result<Guid, ResultCode>, ()> {
     resolve_ldap_dn(view, base)
 }
 
@@ -635,17 +637,17 @@ impl<'r> Search<'r> {
         Ok(())
     }
 
-    /// One page of the children of `parent`. Spec: A-49 (`children`:
-    /// authenticated, cross-checked, complete on the final page).
+    /// One page of the children of the visible container `parent`.
+    /// Spec: A-49 (`children`: authenticated, cross-checked, complete on the
+    /// final page); docs/52 R-a (`PepView::children`).
     fn page(
         &self,
-        parent: Guid,
+        parent: &VisibleObject<'r>,
         after: Option<&ChildCursor>,
         limit: usize,
     ) -> Result<ChildPage, Stop> {
         self.view
-            .snapshot()
-            .children(Some(parent), after, limit)
+            .children(parent, after, limit)
             .map_err(|_| Stop::Fail(AuditReason::DirectoryUnavailable))
     }
 
@@ -683,7 +685,7 @@ impl<'r> Search<'r> {
         }
         let mut cursor: Option<ChildCursor> = None;
         loop {
-            let page = self.page(base.obj().guid, cursor.as_ref(), self.limits.child_page)?;
+            let page = self.page(&base.object, cursor.as_ref(), self.limits.child_page)?;
             for guid in page.children {
                 let mut cand = self.child(&base.object, guid)?;
                 self.visit(&mut cand)?;
@@ -710,7 +712,7 @@ impl<'r> Search<'r> {
                 self.visit(&mut cand)?;
                 self.descend(cand.object, &mut stack)?;
             } else if let Some(next) = top.next.take() {
-                let page = self.page(top.container.guid(), Some(&next), self.limits.child_page)?;
+                let page = self.page(&top.container, Some(&next), self.limits.child_page)?;
                 top.page = page.children.into();
                 top.next = page.next;
             } else {
@@ -730,8 +732,7 @@ impl<'r> Search<'r> {
         container: VisibleObject<'r>,
         stack: &mut Vec<Frame<'r>>,
     ) -> Result<(), Stop> {
-        let guid = container.guid();
-        let probe = self.page(guid, None, 1)?;
+        let probe = self.page(&container, None, 1)?;
         if probe.children.is_empty() {
             return Ok(());
         }
@@ -745,7 +746,7 @@ impl<'r> Search<'r> {
                 AuditReason::DepthExceeded,
             ));
         }
-        let first = self.page(guid, None, self.limits.child_page)?;
+        let first = self.page(&container, None, self.limits.child_page)?;
         stack.push(Frame {
             container,
             page: first.children.into(),
@@ -784,8 +785,7 @@ impl<'r> Search<'r> {
         id: AttrId,
         value: &[u8],
     ) -> Result<(), Stop> {
-        let snapshot = self.view.snapshot();
-        let guid = match snapshot.lookup_unique(id, value) {
+        let guid = match self.view.lookup_unique(id, value) {
             Ok(Some(guid)) => guid,
             // A value no stored value can equal (too long, or a string that
             // has no comparison key): no candidate. Spec: Q-080.
@@ -798,15 +798,16 @@ impl<'r> Search<'r> {
                 _ => Ok(()),
             };
         }
-        // Only the parent pointer of this read is used: the candidate itself
-        // comes from the gate.
-        let obj = snapshot
-            .get_object(guid)
+        // Only the parent pointer is located: the candidate itself comes
+        // from the gate.
+        let parent = self
+            .view
+            .parent_of(guid)
             .map_err(|_| Stop::Fail(AuditReason::DirectoryUnavailable))?
             .ok_or(Stop::Fail(AuditReason::DirectoryUnavailable))?;
         match scope {
             Scope::SingleLevel => {
-                if obj.parent != Some(base.obj().guid) {
+                if parent != Some(base.obj().guid) {
                     return Ok(());
                 }
                 if !self.gate.may_list(base.dn()) {
@@ -822,7 +823,7 @@ impl<'r> Search<'r> {
                 // component, so the k-th ancestor's DN is the object's DN
                 // without its first k components ([MS-ADTS] 3.1.1.1.4).
                 let mut distance = 0usize;
-                let mut at = obj.parent;
+                let mut at = parent;
                 loop {
                     let Some(ancestor) = at else {
                         return Ok(());
@@ -837,11 +838,11 @@ impl<'r> Search<'r> {
                     if ancestor == base.obj().guid {
                         break;
                     }
-                    at = snapshot
-                        .get_object(ancestor)
+                    at = self
+                        .view
+                        .parent_of(ancestor)
                         .map_err(|_| Stop::Fail(AuditReason::DirectoryUnavailable))?
-                        .ok_or(Stop::Fail(AuditReason::DirectoryUnavailable))?
-                        .parent;
+                        .ok_or(Stop::Fail(AuditReason::DirectoryUnavailable))?;
                 }
                 // The object's own visibility (k = 1: the list decision on
                 // its parent), through the gate; a hidden object is pruned

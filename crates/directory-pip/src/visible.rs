@@ -66,13 +66,14 @@
 //!
 //! # Out of scope (documented, not hidden)
 //!
-//! - The raw snapshot ([`DirectoryView::snapshot`]) stays public: the
-//!   authority's own reads go through it — the PDP's PIP, the KDC's account
-//!   source, the admin plane's membership-graph invariants and its
-//!   re-verification, enumeration of child GUIDs. None of them hands
-//!   directory content to a requester; a new PEP that did would have to
-//!   produce a `VisibleObject` to use any typed content function of the
-//!   LDAP engine or the admin plane (docs/questions/Q-486).
+//! - The raw snapshot is not public (docs/52 R-a; A-103 on
+//!   docs/questions/Q-486): a PEP receives a [`crate::PepView`] — this gate,
+//!   the locators of its questions, the PIP — never the view's snapshot.
+//!   The authority's own reads (the PDP's PIP, the KDC's account source,
+//!   the admin plane's membership-graph invariants and internal checks,
+//!   provision) use [`DirectoryView::authority_snapshot`] on the view a PEP
+//!   never receives; none of them hands directory content to a requester
+//!   (module `pep`).
 //! - A `VisibleObject` is bound to its view, not to one gate: two gates for
 //!   two subjects over the same view could exchange objects. No PEP builds
 //!   two gates over one view (Q-486).

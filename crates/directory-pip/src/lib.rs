@@ -53,6 +53,14 @@
 //! admin plane use it; the KDC's account source does not (it is the
 //! authority's own lookup, not a requester's read — module `visible`).
 //!
+//! A PEP receives the directory as a [`PepView`] — the gate, the locators
+//! of gate questions, the PIP and the account source — never the
+//! [`DirectoryView`] or its snapshot, so a new PEP cannot put a raw object on
+//! the wire (docs/52 R-a; decision A-103 on docs/questions/Q-486). The raw
+//! snapshot is reachable only through
+//! [`DirectoryView::authority_snapshot`], for the authority's own reads
+//! (module `pep`).
+//!
 //! # Residuals and follow-ups (documented, not hidden)
 //!
 //! - The tier map is trusted as given: verifying the signed policy store
@@ -96,6 +104,7 @@ mod error;
 mod groups;
 mod names;
 mod naming;
+mod pep;
 mod record;
 mod salt;
 mod state;
@@ -107,6 +116,7 @@ mod visible;
 pub use error::ViewError;
 pub use groups::{MAX_EXPANDED_GROUPS, MAX_NESTING_DEPTH};
 pub use naming::{NamingContext, MAX_NC_LABELS, NC_RDN_ATTRIBUTE};
+pub use pep::PepView;
 pub use salt::{account_salt, AccountKind, SaltError};
 pub use tier::TierMap;
 pub use time::{dstime_of, time_of_dstime};

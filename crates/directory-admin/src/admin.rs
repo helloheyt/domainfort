@@ -33,7 +33,9 @@ use dtyp::{Guid, Sid};
 use ipc_audit::{
     AdminFailure, AdminRefusal, DirAdminEvent, EventBody, IntentRecord, MAX_APPROVERS,
 };
-use keyd_types::{KeyHandle, KeyPurpose, OperationDigest, PrincipalBinding, PrincipalId};
+use keyd_types::{
+    KeyHandle, KeyPurpose, OperationDigest, PrincipalBinding, PrincipalId, ServiceKeyHandle,
+};
 use krb_proto::constants::{KRB_NT_PRINCIPAL, KRB_NT_SRV_HST};
 use krb_proto::{KerberosString, KerberosTime, PrincipalName};
 use pdp::{
@@ -54,8 +56,7 @@ use directory_pip::{
 
 use crate::audit::{pdp_reason, sid_value, EventBase, Refusal, Stop};
 use crate::checks::{
-    domain_sid, fault_stop, local_ipc_security, malformed, store_failure, Cx, LockoutChange,
-    Resolved,
+    domain_sid, local_ipc_security, malformed, store_failure, Cx, LockoutChange, Resolved,
 };
 use crate::config::{AdminConfig, ConfigError, CHANGE_SEQ_COUNTER, RID_COUNTER};
 use crate::descriptor::new_object_sd;
@@ -359,15 +360,14 @@ impl<R: RandomSource> DirectoryAdmin<R> {
             &request.operation_digest,
             core::iter::once(&request.requester).chain(&request.approvals),
         );
-        let cx = Cx {
-            config: &self.config,
-            ids: &self.ids,
+        let cx = Cx::new(
+            &self.config,
+            &self.ids,
             view,
             policy,
-            now: *now,
-            instant: time::instant(now).ok_or(Stop::Failed(AdminFailure::InternalFailure))?,
-            transport_sec: local_ipc_security(bound),
-        };
+            now,
+            local_ipc_security(bound),
+        )?;
         // Step 1 — the requester (docs/51 §5.3, §5.5; A-73; R51-10).
         let requester = subject_of(&cx, &request.requester).map_err(|e| match e {
             SubjectError::NotUsable => Stop::Refused(AdminRefusal::Unauthenticated),
@@ -416,7 +416,7 @@ pub(crate) fn subject_of(
     ticket: &VerifiedTicket,
 ) -> Result<AdminSubject, SubjectError> {
     AdminSubject::from_verified_ticket(
-        cx.view,
+        cx.pep.accounts(),
         &ticket.crealm,
         &ticket.cname,
         &ticket.authtime,
@@ -579,10 +579,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
     /// Spec: docs/51 §8.3; A-75; A-83.
     fn change_seq(&self, cx: &Cx<'_, '_, '_>) -> Result<CounterState, Stop> {
         let state = cx
-            .view
-            .snapshot()
-            .counter(CHANGE_SEQ_COUNTER)
-            .map_err(|e| store_failure(&e))?
+            .counter(CHANGE_SEQ_COUNTER)?
             .ok_or(Stop::Failed(AdminFailure::StoreFailure))?;
         if state.is_exhausted() {
             return Err(Stop::Failed(AdminFailure::StoreFailure));
@@ -595,10 +592,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
     /// A-83.
     fn rid_available(&self, cx: &Cx<'_, '_, '_>) -> Result<(), Stop> {
         let state = cx
-            .view
-            .snapshot()
-            .counter(RID_COUNTER)
-            .map_err(|e| store_failure(&e))?
+            .counter(RID_COUNTER)?
             .ok_or(Stop::Failed(AdminFailure::StoreFailure))?;
         if state.is_exhausted() {
             return Err(Stop::Refused(AdminRefusal::RidExhausted));
@@ -782,35 +776,20 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         let obligations = self.authorize(ctx, base, &action, &resource)?;
         // The parent's class must be a possible superior of the new class
         // (docs/46 §4.4, §8.3 item 2; dirstore refuses it too).
-        let schema = cx.view.context().schema().schema();
+        let schema = cx.pep.context().schema().schema();
         let definition = schema
             .class(values.class.id)
             .ok_or(Stop::Failed(AdminFailure::InternalFailure))?;
         if !definition.poss_superiors.contains(&parent.class) {
             return Err(Stop::Refused(AdminRefusal::ValueInvalid));
         }
-        let snapshot = cx.view.snapshot();
         // A live child of the parent with the same RDN (docs/46 §8.3 item
         // 3; dirstore `NameExists`).
-        match snapshot.lookup_child(Some(parent.guid), values.rdn.as_bytes()) {
-            Ok(None) => {}
-            Ok(Some(_)) => return Err(Stop::Refused(AdminRefusal::Conflict)),
-            Err(dirstore::Error::Rejected(_)) => {
-                return Err(Stop::Refused(AdminRefusal::ValueInvalid))
-            }
-            Err(e) => return Err(store_failure(&e)),
-        }
+        cx.name_free(parent.guid, &values.rdn)?;
         // A value the unique index already holds ([MS-SAMR] 3.1.1.8.4 item
         // 2; docs/46 §8.5).
         for (attr, value) in &values.uniques {
-            match snapshot.lookup_unique(*attr, value.as_bytes()) {
-                Ok(None) => {}
-                Ok(Some(_)) => return Err(Stop::Refused(AdminRefusal::Conflict)),
-                Err(dirstore::Error::Rejected(_)) => {
-                    return Err(Stop::Refused(AdminRefusal::ValueInvalid))
-                }
-                Err(e) => return Err(store_failure(&e)),
-            }
+            cx.unique_free(*attr, value)?;
         }
         // The new object's descriptor must have a DACL ([MS-ADTS] 6.1.3
         // item 7; A-84).
@@ -822,7 +801,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         )?;
         let mut seen = vec![(parent.guid, parent.obj.clone())];
         let domain_root = if values.principal {
-            let (guid, root) = self.domain_root(cx)?;
+            let (guid, root) = cx.domain_root()?;
             domain_sid(&self.ids, &root)?;
             seen.push((guid, root));
             self.rid_available(cx)?;
@@ -833,7 +812,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         let change_seq = self.change_seq(cx)?;
         // P-22 item 1: "create inside an explicitly Tier0 subtree of the
         // tier map".
-        let required = cx.view.tier_map().subtree_tier(&parent.dn) == Some(Tier::Tier0);
+        let required = cx.tier_map().subtree_tier(&parent.dn) == Some(Tier::Tier0);
         self.dual_control(ctx, base, required, &action, &resource)?;
         Ok((
             Plan::Write(WritePlan {
@@ -848,28 +827,6 @@ impl<R: RandomSource> DirectoryAdmin<R> {
             }),
             obligations,
         ))
-    }
-
-    /// The NC root: the object the naming context's DN names.
-    /// Spec: A-53; docs/47 §8.2; docs/51 §8.3.
-    fn domain_root(&self, cx: &Cx<'_, '_, '_>) -> Result<(Guid, Object), Stop> {
-        let labels = self.config.naming_context().labels();
-        let rdns: Vec<(&str, &str)> = labels
-            .iter()
-            .map(|l| (directory_pip::NC_RDN_ATTRIBUTE, l.as_str()))
-            .collect();
-        let guid = cx
-            .view
-            .lookup_dn(&rdns)
-            .map_err(|_| Stop::Failed(AdminFailure::StoreFailure))?
-            .ok_or(Stop::Failed(AdminFailure::StoreFailure))?;
-        let root = cx
-            .view
-            .snapshot()
-            .get_object(guid)
-            .map_err(|e| store_failure(&e))?
-            .ok_or(Stop::Failed(AdminFailure::StoreFailure))?;
-        Ok((guid, root))
     }
 
     /// The account a password operation names, and the key sets admind
@@ -922,15 +879,24 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                     .into_iter()
                     .map(|c| KerberosString::new(c).map_err(|_| internal()))
                     .collect::<Result<Vec<_>, Stop>>()?;
+                let name = PrincipalName {
+                    name_type: KRB_NT_SRV_HST,
+                    name_string,
+                };
+                // The service key set's purpose is derived from its name —
+                // the one derivation the KDC's account source uses (docs/52
+                // R2b). A name that derives the admin service's key set is
+                // never a password-set target: that key set is keyd-drawn
+                // only (no `set_secret` may name it — docs/questions/Q-491
+                // item 3), so the request is refused here rather than at
+                // keyd.
+                let service = ServiceKeyHandle::of_service(principal, &name);
+                if service.purpose() != KeyPurpose::Service {
+                    return Err(Stop::Refused(AdminRefusal::TargetProtected));
+                }
                 keys.push(KeyTarget {
-                    handle: KeyHandle::new(principal, KeyPurpose::Service),
-                    binding: PrincipalBinding::new(
-                        realm.clone(),
-                        PrincipalName {
-                            name_type: KRB_NT_SRV_HST,
-                            name_string,
-                        },
-                    ),
+                    handle: service.handle(),
+                    binding: PrincipalBinding::new(realm.clone(), name),
                 });
             }
         }
@@ -1142,23 +1108,20 @@ impl<R: RandomSource> DirectoryAdmin<R> {
             // The membership rule of the group's type, the member limit,
             // the cycle and the expansion bounds: the write invariants'
             // link check (crate::invariants, docs/52 R13), in that order.
-            let checked = self
-                .invariants
-                .check_link(
-                    cx.view.snapshot(),
-                    End {
-                        guid: group.guid,
-                        obj: &group.obj,
-                    },
-                    group_type,
-                    End {
-                        guid: member.guid,
-                        obj: &member.obj,
-                    },
-                    member.class,
-                    members.len(),
-                )
-                .map_err(|f| fault_stop(&f))?;
+            let checked = cx.check_link(
+                &self.invariants,
+                End {
+                    guid: group.guid,
+                    obj: &group.obj,
+                },
+                group_type,
+                End {
+                    guid: member.guid,
+                    obj: &member.obj,
+                },
+                member.class,
+                members.len(),
+            )?;
             proof = Some(checked.ok_or(Stop::Refused(AdminRefusal::MembershipInvalid))?);
             members.push(member.guid);
         } else {
@@ -1219,12 +1182,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         if cx.is_structural(&t)? || cx.is_policy_named(&t)? {
             return Err(Stop::Refused(AdminRefusal::TargetProtected));
         }
-        let children = cx
-            .view
-            .snapshot()
-            .children(Some(t.guid), None, 1)
-            .map_err(|e| store_failure(&e))?;
-        if !children.children.is_empty() {
+        if cx.has_children(t.guid)? {
             return Err(Stop::Refused(AdminRefusal::Conflict));
         }
         let change_seq = self.change_seq(cx)?;
@@ -1286,35 +1244,18 @@ impl<R: RandomSource> DirectoryAdmin<R> {
 
     /// The object a `Lookup` key names, if any: a sAMAccountName or SPN
     /// through the unique index and then compared octet for octet (A-27, as
-    /// the account source does), a DN through `lookup_dn`. A key that cannot
-    /// name anything (not printable ASCII, too long) names nothing.
+    /// the account source does — `Cx::locate_exact`), a DN through the PEP
+    /// view's `lookup_dn`. A key that cannot name anything (not printable
+    /// ASCII, too long) names nothing. Only a GUID: the object reaches the
+    /// reply only through the gate (docs/52 R-a).
     /// Spec: docs/47 §1.3 steps 3-4 (R47-1); docs/49 §7 (R49-11, DN
     /// resolution); docs/46 §5.4 (bounds).
     fn find(&self, cx: &Cx<'_, '_, '_>, key: &LookupKey) -> Result<Option<Guid>, Stop> {
-        let snapshot = cx.view.snapshot();
-        let exact = |attr: AttrId, value: &str, max: usize| -> Result<Option<Guid>, Stop> {
-            if value.is_empty()
-                || value.len() > max
-                || !value.bytes().all(|b| (0x20..=0x7E).contains(&b))
-            {
-                return Ok(None);
-            }
-            let guid = match snapshot.lookup_unique(attr, value.as_bytes()) {
-                Ok(Some(guid)) => guid,
-                Ok(None) | Err(dirstore::Error::Rejected(_)) => return Ok(None),
-                Err(e) => return Err(store_failure(&e)),
-            };
-            let Some(obj) = snapshot.get_object(guid).map_err(|e| store_failure(&e))? else {
-                return Ok(None);
-            };
-            let stored = record::text(&obj, attr).map_err(malformed)?;
-            Ok((stored == Some(value)).then_some(guid))
-        };
         match key {
             LookupKey::SamAccountName(sam) => {
-                exact(self.ids.sam_account_name, sam, names::MAX_GROUP_SAM_CHARS)
+                cx.locate_exact(self.ids.sam_account_name, sam, names::MAX_GROUP_SAM_CHARS)
             }
-            LookupKey::ServicePrincipalName(spn) => exact(
+            LookupKey::ServicePrincipalName(spn) => cx.locate_exact(
                 self.ids.service_principal_name,
                 spn,
                 names::MAX_PRINCIPAL_NAME_CHARS,
@@ -1330,7 +1271,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                         None => return Ok(None),
                     }
                 }
-                cx.view
+                cx.pep
                     .lookup_dn(&rdns)
                     .map_err(|_| Stop::Failed(AdminFailure::StoreFailure))
             }

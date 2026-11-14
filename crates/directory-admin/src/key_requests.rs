@@ -7,8 +7,8 @@
 //! # The flow (docs/51 §6, as decided)
 //!
 //! 1. A requester opens a request for one key operation —
-//!    `rotate_krbtgt`, `rotate_key` of a service object's randomized
-//!    `Service` key set, or `retire_kvno` — with a fresh AP-REQ that dird
+//!    `rotate_krbtgt`, `rotate_key` of a service object's randomized key
+//!    set, or `retire_kvno` — with a fresh AP-REQ that dird
 //!    verified through keyd (A-73). dird builds the Subject from the
 //!    directory and asks the PDP for `PolicyAdmin` on the policy scope
 //!    `keys` ([`KEY_POLICY_SCOPE`]; docs/51 §5.2 row 11 — docs/questions/
@@ -40,7 +40,11 @@
 //! # The pending table
 //!
 //! A request = {id, the operation, the key set it acts on, the operation
-//! digest, the requester, the approvals, the expiry, fetched?}. In dird's
+//! digest, the requester, the approvals, the expiry, fetched?}. The key set
+//! of a service object is the target's [`ServiceKeyHandle`] — its purpose
+//! derived from the service's name, `Service` for the LDAP service and
+//! `AdminService` for the admin service (docs/52 R2b; docs/questions/Q-493
+//! item 1): an operation names an object, never a purpose. In dird's
 //! memory only, bounded in number ([`MAX_PENDING_KEY_REQUESTS`]) and in
 //! time (the configured lifetime, at most [`MAX_KEY_REQUEST_LIFETIME`];
 //! expired requests are dropped before every step). A dird restart drops
@@ -82,7 +86,7 @@ use ipc_audit::{
 };
 use keyd_types::{
     DecidedOperation, DecisionId, KeyHandle, KeyPurpose, Kvno, OperationDigest, PrincipalId,
-    MAX_KEY_DECISION_SECS,
+    ServiceKeyHandle, MAX_KEY_DECISION_SECS,
 };
 use krb_proto::KerberosTime;
 use pdp::{Action, Effect, Obligation, PolicyScope, PolicySnapshot, Resource};
@@ -90,12 +94,11 @@ use sha2::{Digest, Sha256};
 
 use crate::admin::{subject_of, DirectoryAdmin, VerificationFailure};
 use crate::audit::{pdp_reason, sid_value, EventBase, Refusal, Stop};
-use crate::checks::{local_ipc_security, malformed, Cx};
+use crate::checks::{self, local_ipc_security, malformed, Cx};
 use crate::config::ConfigError;
 use crate::random::RandomSource;
 use crate::record;
 use crate::subject::{AdminSubject, SubjectError, VerifiedTicket};
-use crate::time;
 
 /// The policy scope of the key operations: `PolicyAdmin` on `Policy {scope:
 /// "keys"}`. The policy language already matches every scope (`scope:
@@ -135,7 +138,8 @@ const DIGEST_LABEL: &[u8] = b"dird key-operation request, layout 1";
 pub enum KeyRef {
     /// The krbtgt key set (the provisioning manifest's).
     Krbtgt,
-    /// The `Service` key set of a service object.
+    /// The key set of a service object (its purpose: the target's
+    /// [`ServiceKeyHandle`], [`KeyTargets::handle_of`]).
     Service(Guid),
 }
 
@@ -146,9 +150,10 @@ pub enum KeyRef {
 pub enum KeyOperation {
     /// `rotate_krbtgt(DualControlToken)`.
     RotateKrbtgt,
-    /// `rotate_key` of a service object's randomized `Service` key set
-    /// (created by `create_key` in the ceremony — docs/10 §5ב; not a
-    /// computer's password-derived one).
+    /// `rotate_key` of a service object's randomized key set (created by
+    /// `create_key` in the ceremony — docs/10 §5ב; not a computer's
+    /// password-derived one) — `Service` or `AdminService`, as the
+    /// service's name derives it ([`KeyTargets::handle_of`]).
     RotateKey {
         /// The service object's objectGUID.
         service: Guid,
@@ -175,24 +180,9 @@ impl KeyOperation {
         }
     }
 
-    /// The purpose of the key set it acts on. Spec: docs/10 §1, §7.
-    #[must_use]
-    pub fn purpose(&self) -> KeyPurpose {
-        match self {
-            KeyOperation::RotateKrbtgt
-            | KeyOperation::RetireKvno {
-                key: KeyRef::Krbtgt,
-                ..
-            } => KeyPurpose::Krbtgt,
-            KeyOperation::RotateKey { .. }
-            | KeyOperation::RetireKvno {
-                key: KeyRef::Service(_),
-                ..
-            } => KeyPurpose::Service,
-        }
-    }
-
-    /// The service object it names, if any.
+    /// The service object it names, if any. (An operation names an object,
+    /// never a purpose: the purpose of a service object's key set is
+    /// derived from its name — [`KeyTargets::handle_of`]; docs/52 R2b.)
     fn service(&self) -> Option<Guid> {
         match self {
             KeyOperation::RotateKey { service }
@@ -278,15 +268,46 @@ impl KeyAdminOperation {
 }
 
 /// The key sets a request may name: the krbtgt account's objectGUID and the
-/// service objects' (the provisioning manifest's — the only randomized
-/// `Service` key sets of phase 1, docs/51 §4.3 step 11).
-/// Spec: docs/51 §4.3 steps 8, 11, §6; docs/questions/Q-386 item 1.
+/// service objects' key sets (the provisioning manifest's — the only
+/// randomized service key sets of phase 1, docs/51 §4.3 step 11).
+///
+/// A service object's key set is a [`ServiceKeyHandle`], which only the
+/// derivation from the service's name builds (`Service` for `ldap/<fqdn>`,
+/// `AdminService` for `admind/<fqdn>`): the table cannot hold — and a key
+/// operation cannot name — a purpose that contradicts the name (docs/52
+/// R2b; docs/questions/Q-493 item 1).
+/// Spec: docs/51 §4.3 steps 8, 11, §6; docs/questions/Q-386 item 1; docs/47
+/// §1.3; docs/52 §5 item 3.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyTargets {
     /// The krbtgt account's objectGUID.
     pub krbtgt: Guid,
-    /// The service objects' objectGUIDs.
-    pub services: BTreeSet<Guid>,
+    /// The service objects' key sets, each named by its derived handle.
+    pub services: BTreeSet<ServiceKeyHandle>,
+}
+
+impl KeyTargets {
+    /// The key set `operation` acts on: the krbtgt account's `Krbtgt` key
+    /// set, or the named service object's key set as its
+    /// [`ServiceKeyHandle`] derives it; `None` when the operation names a
+    /// service object that is not one of the targets.
+    /// Spec: docs/51 §6; docs/10 §1, §7; docs/52 R2b.
+    #[must_use]
+    pub fn handle_of(&self, operation: &KeyOperation) -> Option<KeyHandle> {
+        match operation.service() {
+            None => Some(KeyHandle::new(
+                PrincipalId::from_bytes(self.krbtgt.to_packet()),
+                KeyPurpose::Krbtgt,
+            )),
+            Some(service) => {
+                let principal = PrincipalId::from_bytes(service.to_packet());
+                self.services
+                    .iter()
+                    .find(|target| target.principal() == principal)
+                    .map(ServiceKeyHandle::handle)
+            }
+        }
+    }
 }
 
 /// A principal of a pending request: its objectGUID (keyd's token) and its
@@ -301,7 +322,8 @@ struct Party {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Pending {
     operation: KeyOperation,
-    principal: Guid,
+    /// The key set it acts on ([`KeyTargets::handle_of`]).
+    handle: KeyHandle,
     digest: [u8; DIGEST_LEN],
     requester: Party,
     approvals: Vec<Party>,
@@ -362,11 +384,6 @@ impl KeyRequests {
         self.pending.retain(|_, pending| pending.expires > now);
     }
 
-    /// The principal id of the key set `operation` acts on.
-    fn principal_of(&self, operation: &KeyOperation) -> Guid {
-        operation.service().unwrap_or(self.targets.krbtgt)
-    }
-
     /// Withdraw the approval that completed `decision`'s quorum, after the
     /// decision could not be recorded or registered in keyd (module
     /// documentation, step 3): the request's last approval is removed when
@@ -396,15 +413,17 @@ impl KeyRequests {
 /// The operation digest of a request (module documentation): SHA-256 over
 /// `label ‖ id:u64 ‖ code:u8 ‖ principal:[16] ‖ purpose:u8 ‖ kvno:u32 ‖
 /// requester:[16] ‖ expires:u64` (integers big-endian; the kvno 0 when the
-/// operation names none). Public so that a client can show or check it.
+/// operation names none). `key` is the key set the operation acts on
+/// ([`KeyTargets::handle_of`]): its principal and its purpose. Public so
+/// that a client can show or check it.
 /// Spec: docs/51 §5.6 ("the operation digest"); docs/24 §6 (principle);
 /// FIPS 180-4 via the approved `sha2` (`Digest::digest`, docs.rs sha2
-/// 0.11.1 as crates/audit-log cites it); docs/questions/Q-420.
+/// 0.11.1 as crates/audit-log cites it); docs/questions/Q-420; docs/52 R2b.
 #[must_use]
 pub fn operation_digest(
     id: u64,
     operation: &KeyOperation,
-    principal: Guid,
+    key: KeyHandle,
     requester: Guid,
     expires: u64,
 ) -> [u8; DIGEST_LEN] {
@@ -412,19 +431,19 @@ pub fn operation_digest(
         KeyOperation::RetireKvno { kvno, .. } => *kvno,
         KeyOperation::RotateKrbtgt | KeyOperation::RotateKey { .. } => 0,
     };
-    let purpose: u8 = match operation.purpose() {
+    let purpose: u8 = match key.purpose {
         KeyPurpose::PrincipalLongterm => 0,
         KeyPurpose::Krbtgt => 1,
         KeyPurpose::Service => 2,
-        // Not named by a key request today (`KeyOperation::purpose`); a code
-        // of its own so that no two purposes share one (R2).
+        // The admin service's key set (R2, R2b): a code of its own so that
+        // no two purposes share one.
         KeyPurpose::AdminService => 3,
     };
     let mut octets = Vec::with_capacity(DIGEST_LABEL.len() + 8 + 1 + 16 + 1 + 4 + 16 + 8);
     octets.extend_from_slice(DIGEST_LABEL);
     octets.extend_from_slice(&id.to_be_bytes());
     octets.push(operation.code());
-    octets.extend_from_slice(&principal.to_packet());
+    octets.extend_from_slice(key.principal.as_bytes());
     octets.push(purpose);
     octets.extend_from_slice(&kvno.to_be_bytes());
     octets.extend_from_slice(&requester.to_packet());
@@ -707,10 +726,16 @@ fn key_base(operation_id: u64, request: &KeyAdminOperation) -> EventBase {
     base
 }
 
+/// The objectGUID of the account a key set belongs to (the audit target).
+/// Spec: docs/47 §2.3 (R47-3: `PrincipalId = objectGUID`).
+fn account_of(handle: &KeyHandle) -> Guid {
+    Guid::from_packet(handle.principal.as_bytes())
+}
+
 /// Record a pending request's parties and target in `base`.
 fn describe(base: &mut EventBase, pending: &Pending) {
     base.key_operation = Some(pending.operation.keyd_operation());
-    base.target = Some(pending.principal);
+    base.target = Some(account_of(&pending.handle));
     base.requester = sid_value(&pending.requester.sid);
     base.approvers = pending
         .approvals
@@ -853,19 +878,17 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         {
             return Err(Stop::Failed(AdminFailure::InternalFailure));
         }
-        let instant = time::instant(now).ok_or(Stop::Failed(AdminFailure::InternalFailure))?;
         // R2 (docs/52 §5 item 4): bound only if keyd verified the step's
         // one ticket bound to this very step.
-        let cx = Cx {
-            config: &self.config,
-            ids: &self.ids,
+        let cx = Cx::new(
+            &self.config,
+            &self.ids,
             view,
             policy,
-            now: *now,
-            instant,
-            transport_sec: local_ipc_security(ticket.is_some_and(|t| t.bound_to(digest))),
-        };
-        table.purge(instant.0);
+            now,
+            local_ipc_security(ticket.is_some_and(|t| t.bound_to(digest))),
+        )?;
+        table.purge(cx.instant.0);
         match request {
             KeyAdminOperation::RequestKeyOperation { operation } => {
                 let ticket = ticket.ok_or(Stop::Refused(AdminRefusal::Unauthenticated))?;
@@ -909,15 +932,17 @@ impl<R: RandomSource> DirectoryAdmin<R> {
     /// The key set `operation` names must be one the request may act on:
     /// the krbtgt account (its objectSid ends in RID 502) or a service
     /// object (the manifest's, a live computer object); a kvno to retire is
-    /// never 0. Returns the key set's principal id.
+    /// never 0. Returns the key set's handle — for a service object the
+    /// target's [`ServiceKeyHandle`], its purpose derived from its name
+    /// ([`KeyTargets::handle_of`]; docs/52 R2b).
     /// Spec: docs/51 §4.3 steps 5, 8, 11, §6; [MS-SAMR] 2.2.1.14 (RID 502);
-    /// docs/10 §5ב, §7; docs/questions/Q-420.
+    /// docs/10 §5ב, §7; docs/questions/Q-420, Q-493 item 1.
     fn key_target(
         &self,
         cx: &Cx<'_, '_, '_>,
         targets: &KeyTargets,
         operation: &KeyOperation,
-    ) -> Result<Guid, Stop> {
+    ) -> Result<KeyHandle, Stop> {
         if let KeyOperation::RetireKvno { kvno: 0, .. } = operation {
             return Err(Stop::Refused(AdminRefusal::ValueInvalid));
         }
@@ -934,17 +959,19 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                 if sid.sub_authority().last() != Some(&DOMAIN_USER_RID_KRBTGT) {
                     return Err(Stop::Failed(AdminFailure::IntegrityFailure));
                 }
-                Ok(targets.krbtgt)
+                targets
+                    .handle_of(operation)
+                    .ok_or(Stop::Failed(AdminFailure::InternalFailure))
             }
             Some(service) => {
-                if !targets.services.contains(&service) {
-                    return Err(Stop::Refused(AdminRefusal::ValueInvalid));
-                }
+                let handle = targets
+                    .handle_of(operation)
+                    .ok_or(Stop::Refused(AdminRefusal::ValueInvalid))?;
                 let object = cx.resolve(service)?;
                 if object.class != self.ids.computer.id {
                     return Err(Stop::Refused(AdminRefusal::ValueInvalid));
                 }
-                Ok(service)
+                Ok(handle)
             }
         }
     }
@@ -983,8 +1010,8 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         if !honour(&caller_obligations(&decision)) {
             return Err(Stop::Refused(AdminRefusal::ObligationRefused));
         }
-        let principal = self.key_target(cx, &table.targets, operation)?;
-        base.target = Some(principal);
+        let handle = self.key_target(cx, &table.targets, operation)?;
+        base.target = Some(account_of(&handle));
         if table.pending.len() >= MAX_PENDING_KEY_REQUESTS {
             return Err(Stop::Refused(AdminRefusal::PendingLimit));
         }
@@ -999,8 +1026,8 @@ impl<R: RandomSource> DirectoryAdmin<R> {
             .ok_or(Stop::Failed(AdminFailure::InternalFailure))?;
         let pending = Pending {
             operation: *operation,
-            principal,
-            digest: operation_digest(id, operation, principal, requester.guid(), expires),
+            handle,
+            digest: operation_digest(id, operation, handle, requester.guid(), expires),
             requester: Party {
                 guid: requester.guid(),
                 sid: *requester.sid(),
@@ -1057,7 +1084,9 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         if decision.effect != Effect::Allow {
             return Err(Stop::Refused(AdminRefusal::ApproverDenied));
         }
-        let principal = table.principal_of(operation);
+        // The key set the presented operation acts on; a service object
+        // that is no target matches no pending request (below).
+        let handle = table.targets.handle_of(operation);
         let quorum = self.config.quorum();
         let pending = table
             .pending
@@ -1070,14 +1099,10 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         // The approval is bound to the request's operation digest: the
         // operation the approver names, under this request's id, requester
         // and expiry, must give the same digest.
-        let presented = operation_digest(
-            id,
-            operation,
-            principal,
-            pending.requester.guid,
-            pending.expires,
-        );
-        if presented != pending.digest {
+        let presented = handle.map(|key| {
+            operation_digest(id, operation, key, pending.requester.guid, pending.expires)
+        });
+        if presented != Some(pending.digest) {
             return Err(Stop::Refused(AdminRefusal::OperationMismatch));
         }
         if approver.guid() == pending.requester.guid
@@ -1122,10 +1147,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         view: &DirectoryView<'_>,
         target: Guid,
     ) -> Result<Option<TombstonedPrincipal>, AdminFailure> {
-        let tombstone = view
-            .snapshot()
-            .get_tombstone(target)
-            .map_err(|_| AdminFailure::StoreFailure)?;
+        let tombstone = checks::tombstone(view, target).map_err(|_| AdminFailure::StoreFailure)?;
         Ok(tombstone
             .filter(|t| t.classes.contains(&self.ids.user.id))
             .map(|t| TombstonedPrincipal { guid: t.guid }))
@@ -1149,10 +1171,8 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         after: Option<Guid>,
         limit: usize,
     ) -> Result<DestructionTargets, AdminFailure> {
-        let page = view
-            .snapshot()
-            .tombstones(after, limit)
-            .map_err(|_| AdminFailure::StoreFailure)?;
+        let page =
+            checks::tombstones(view, after, limit).map_err(|_| AdminFailure::StoreFailure)?;
         Ok(DestructionTargets {
             targets: page
                 .tombstones
@@ -1171,8 +1191,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
 /// remaining lifetime at `now` (1 to keyd's ceiling).
 /// Spec: docs/52 §4.2, §4.3; docs/51 §5.6; docs/questions/Q-460.
 fn key_decision(id: u64, pending: &Pending, now: u64) -> KeyDecision {
-    let principal = PrincipalId::from_bytes(pending.principal.to_packet());
-    let handle = KeyHandle::new(principal, pending.operation.purpose());
+    let handle = pending.handle;
     let operation = match pending.operation {
         KeyOperation::RotateKrbtgt => DecidedOperation::RotateKrbtgt { krbtgt: handle },
         KeyOperation::RotateKey { .. } => DecidedOperation::RotateKey { handle },

@@ -176,9 +176,9 @@ pub use key_requests::{
 // The name and value rules, public for `provision domain` (task A4), which
 // must apply exactly these rules to the names it is given (A-79).
 pub use names::{
-    computer_name_ok, computer_sam, dns_host_name_ok, group_sam_ok, rdn_value_ok, spn_ok,
-    user_sam_ok, MAX_ACCOUNT_SAM_CHARS, MAX_DESCRIPTION_UNITS, MAX_DNS_HOST_NAME_CHARS,
-    MAX_GROUP_SAM_CHARS, MAX_PRINCIPAL_NAME_CHARS, MAX_RDN_VALUE_CHARS,
+    admin_service_spn_ok, computer_name_ok, computer_sam, dns_host_name_ok, group_sam_ok,
+    rdn_value_ok, spn_ok, user_sam_ok, MAX_ACCOUNT_SAM_CHARS, MAX_DESCRIPTION_UNITS,
+    MAX_DNS_HOST_NAME_CHARS, MAX_GROUP_SAM_CHARS, MAX_PRINCIPAL_NAME_CHARS, MAX_RDN_VALUE_CHARS,
 };
 pub use operation::{
     CompletePasswordSet, CreateComputer, CreateContainerLike, CreateGroup, CreateUser, LookupKey,

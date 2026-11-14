@@ -34,7 +34,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use common::{guid, int64, sid_of, Dir, GLOBAL_SECURITY, WHEN_CREATED};
 use directory_pip::{
-    hides, DirectoryView, UnseenCause, Visibility, VisibilityGate, VisibilityRule, VisibleObject,
+    hides, DirectoryView, PepView, UnseenCause, Visibility, VisibilityGate, VisibilityRule,
+    VisibleObject,
 };
 use dirstore::{AttrId, NewObject};
 use dtyp::{
@@ -545,4 +546,92 @@ fn the_proof_names_the_object() {
     assert_eq!(proof.guid(), guid(ALICE));
     assert_eq!(object.guid, guid(ALICE));
     assert_eq!(Some(dn), view.dn_of(guid(ALICE)).unwrap());
+}
+
+// ------------------------------------------------------ the PEP's view (R-a) --
+
+/// docs/52 R-a (A-103 on docs/questions/Q-486): the gate a PEP gets from its
+/// `PepView` is the gate — for every object of the directory (and an
+/// absent one), under both rules and both policies, its verdicts are the
+/// ones `VisibilityGate::new` over the same view gives. Behaviour is
+/// unchanged; only the way a PEP reaches the gate is.
+#[test]
+fn the_pep_views_gate_is_the_gate() {
+    let d = directory("pep-view-gate");
+    let view = d.view();
+    let pep = PepView::new(&view);
+    for policy in [allow_reads(), allow_nothing()] {
+        for rule in [VisibilityRule::ListParent, VisibilityRule::ListAndRead] {
+            let mut direct = gate(&view, &policy, rule);
+            let mut through = pep.gate(&policy, alice(&view), context(true), rule);
+            assert_eq!(through.rule(), rule);
+            assert_eq!(through.request_refusal(), direct.request_refusal());
+            for id in [ROOT, STAFF_OU, VAULT, ALICE, SECRET, VAULTED, STAFF, NOBODY] {
+                assert_eq!(
+                    through.visible(guid(id)).unwrap(),
+                    direct.visible(guid(id)).unwrap(),
+                    "{id} under {rule:?}"
+                );
+            }
+        }
+    }
+}
+
+/// docs/52 R-a: a `PepView` locates — it names GUIDs a gate question can be
+/// asked about — but hands out no object: `vaulted`, under a container
+/// alice may not list, is found by its unique sAMAccountName and its parent
+/// pointer, yet its content is reachable only through the gate, which
+/// answers it exactly like an identity nobody has. The two locators that
+/// act on an object take it visible (a container's children, an object's
+/// back links). Source: docs/questions/Q-486 R-a; docs/49 §6.1 item 3;
+/// docs/questions/Q-485 (the list rule); A-55.
+#[test]
+fn a_pep_view_locates_but_hands_out_no_object() {
+    let d = directory("pep-view-locators");
+    let view = d.view();
+    let pep = PepView::new(&view);
+    let policy = allow_reads();
+    let mut g = pep.gate(
+        &policy,
+        alice(&view),
+        context(true),
+        VisibilityRule::ListParent,
+    );
+    // Locators.
+    let located = pep
+        .lookup_unique(d.attr("sAMAccountName"), b"vaulted")
+        .unwrap();
+    assert_eq!(located, Some(guid(VAULTED)));
+    assert_eq!(
+        pep.parent_of(guid(VAULTED)).unwrap(),
+        Some(Some(guid(VAULT)))
+    );
+    assert_eq!(pep.parent_of(guid(ROOT)).unwrap(), Some(None));
+    assert_eq!(pep.parent_of(guid(NOBODY)).unwrap(), None);
+    assert!(pep.names_object(guid(VAULTED)).unwrap());
+    assert!(!pep.names_object(guid(NOBODY)).unwrap());
+    // ... but the content of what was located comes only through the gate:
+    // hidden, answered like an absent identity.
+    assert_eq!(
+        unseen(g.visible(guid(VAULTED)).unwrap()),
+        UnseenCause::Hidden(ReasonCode::Acl)
+    );
+    assert_eq!(
+        unseen(g.visible(guid(NOBODY)).unwrap()),
+        UnseenCause::Absent
+    );
+    // A visible container's children; a visible object's back links.
+    let root = seen(g.visible(guid(ROOT)).unwrap());
+    let page = pep.children(&root, None, 16).unwrap();
+    let mut children = page.children.clone();
+    children.sort();
+    let mut expected = vec![guid(STAFF_OU), guid(VAULT)];
+    expected.sort();
+    assert_eq!(children, expected);
+    assert!(page.next.is_none());
+    let alice_object = seen(g.visible(guid(ALICE)).unwrap());
+    assert_eq!(
+        pep.back_links(&alice_object, d.attr("memberOf")).unwrap(),
+        vec![guid(STAFF)]
+    );
 }

@@ -200,7 +200,7 @@ fn with_inputs<R>(
         now: now(),
         transport,
         directory: Some(DirectoryInputs {
-            view: &view,
+            view: directory_pip::PepView::new(&view),
             clock: &FixedClock,
         }),
     })

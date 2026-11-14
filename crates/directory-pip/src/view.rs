@@ -548,12 +548,31 @@ impl DirectoryView<'_> {
         self.ctx
     }
 
-    /// The view's dirstore snapshot (read-only): the LDAP engine enumerates
-    /// candidates with `children` / `lookup_unique` / `back_links` /
-    /// `get_object` over the same snapshot the PDP's answers come from
-    /// (docs/49 §6.1: "against one snapshot"; docs/11 §6 P9).
+    /// The view's dirstore snapshot (read-only), inside this crate: the
+    /// account source, the PIP, the visibility gate and the PEP's locators
+    /// ([`crate::PepView`]) read the same snapshot the PDP's answers come
+    /// from (docs/49 §6.1: "against one snapshot"; docs/11 §6 P9). Not
+    /// public (docs/questions/Q-486 R-a, A-103).
+    pub(crate) fn snapshot(&self) -> &Snapshot<'_> {
+        &self.snapshot
+    }
+
+    /// The view's dirstore snapshot for the **authority's own reads** only
+    /// — the ones docs/questions/Q-486 puts outside the visibility gate
+    /// (items 1-6): the admin plane's write invariants and internal checks
+    /// (crate directory-admin, its `checks` module only) and provision
+    /// verifying its own store. None of them hands directory content to a
+    /// requester.
+    ///
+    /// A PEP never receives a `DirectoryView`: it receives a
+    /// [`crate::PepView`], which has no way back to this. Rust cannot
+    /// restrict a public item to named crates, so the callers of this
+    /// function are pinned by a source scan
+    /// (crates/directory-pip/tests/pep_receives_only_the_gate.rs) — the
+    /// residual of docs/questions/Q-540.
+    /// Spec: docs/questions/Q-486 (R-a, A-103); docs/52 R-a; docs/11 §6.
     #[must_use]
-    pub fn snapshot(&self) -> &Snapshot<'_> {
+    pub fn authority_snapshot(&self) -> &Snapshot<'_> {
         &self.snapshot
     }
 

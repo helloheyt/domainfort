@@ -12,6 +12,13 @@
 //! reach are the named provisioning exceptions ([`ProvisioningRole`]).
 //!
 //! The name rules are the online path's own functions (crate::names, A-79).
+//! One of them is judged on every object whatever its class: no principal
+//! name it forms may derive the admin service's key-set purpose
+//! (`admind/<host>`, by the one derivation `KeyPurpose::of_service_name`),
+//! except the admin service object's own claim
+//! (`ProvisioningRole::AdminServiceObject`) — the privileged name is a
+//! state rule of the directory, not only a key that keyd refuses to make
+//! (docs/52 R2b follow-up; docs/questions/Q-541).
 //!
 //! Spec: [MS-SAMR] v20260427 (pinned, sha256 083fe00a…8a4e) 3.1.1.6 items
 //! 8-14, 20-24, 3.1.1.8.9; docs/51 §4.3 step 5, §5.2 rows 1-8, §11 (decided
@@ -125,6 +132,19 @@ pub(crate) fn check_new(
     if obj.attributes.iter().any(|a| !known(ids, a.id)) {
         return Err(V::NotModifiable);
     }
+    // A name from which the admin service's purpose derives is the admin
+    // service object's alone (docs/52 R2b follow-up; Q-541): carried by
+    // anything else ⇒ the value is refused (`Value` — the code `prepare`
+    // gives for the same SPN rule, `names::spn_ok`); the admin service's
+    // claim on an object that does not carry one ⇒ `Exception`.
+    let admin_named = forms_admin_service_name(ids, obj)?;
+    let admin_claim = role == Some(ProvisioningRole::AdminServiceObject);
+    if admin_named && !admin_claim {
+        return Err(V::Value);
+    }
+    if admin_claim && !admin_named {
+        return Err(V::Exception);
+    }
     // The NC root: a domainDNS without parent, only as the provisioning
     // exception (docs/51 §4.3 step 5; docs/46 §4.4: "NC root only" — the
     // admin plane never creates a domainDNS).
@@ -172,6 +192,40 @@ pub(crate) fn check_new(
         // Not a class any write path creates (docs/46 §4.1, §4.4).
         Err(V::Class)
     }
+}
+
+/// `true` if a principal name the object forms derives the admin service's
+/// key-set purpose by the one derivation (`keyd_types::KeyPurpose::
+/// of_service_name`, through crate::names): any of its
+/// servicePrincipalName values (a service name, NT-SRV-HST — docs/47 §1.3
+/// TGS), or its sAMAccountName as a one-component client name (docs/47
+/// §1.3 AS). Judged on every object of every class, whatever the class rules
+/// below would say of the value. A value that is not UTF-8 ⇒ `Value`.
+/// Spec: docs/52 R2b; docs/questions/Q-491 item 1, Q-541; docs/47 §1.3.
+fn forms_admin_service_name(ids: &Ids, obj: &Object) -> Result<bool, V> {
+    let values = |id: AttrId| {
+        obj.attribute(id)
+            .map(|a| {
+                a.values
+                    .iter()
+                    .map(|v| v.value.as_slice())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    for value in values(ids.service_principal_name) {
+        let spn = core::str::from_utf8(value).map_err(|_| V::Value)?;
+        if names::spn_derives_admin_service(spn) {
+            return Ok(true);
+        }
+    }
+    for value in values(ids.sam_account_name) {
+        let sam = core::str::from_utf8(value).map_err(|_| V::Value)?;
+        if names::client_name_derives_admin_service(sam) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// description, when present: 1..1024 UTF-16 units, no control character.
@@ -252,14 +306,23 @@ fn check_user(ids: &Ids, obj: &Object, role: Option<ProvisioningRole>) -> Result
 /// alone, without SPN or pwdLastSet (the provisioning exception: ST is
 /// never set by the admin plane, A-79 / Q-298 item 2; docs/51 §4.3 step 5);
 /// a service object WT without pwdLastSet (its keys come from
-/// `create_key`, Q-376 item 6).
+/// `create_key`, Q-376 item 6); the admin service object likewise, its one
+/// SPN the admin service's name (`names::admin_service_spn_ok` — the only
+/// object that may carry it, docs/questions/Q-541).
 /// Spec: [MS-SAMR] 3.1.1.6 items 8-12, 20, 23, 24; docs/51 §4.3 step 5,
 /// §5.2 row 2, §11; docs/47 §1.3; RFC 4120 §6.2.1; A-79.
 fn check_computer(ids: &Ids, obj: &Object, role: Option<ProvisioningRole>) -> Result<(), V> {
-    let (account_type, dc, service) = match role {
-        None => (ADS_UF_WORKSTATION_TRUST_ACCOUNT, false, false),
-        Some(ProvisioningRole::ServiceObject) => (ADS_UF_WORKSTATION_TRUST_ACCOUNT, false, true),
-        Some(ProvisioningRole::DcAccount) => (ADS_UF_SERVER_TRUST_ACCOUNT, true, false),
+    let (account_type, dc, service, admin) = match role {
+        None => (ADS_UF_WORKSTATION_TRUST_ACCOUNT, false, false, false),
+        Some(ProvisioningRole::ServiceObject) => {
+            (ADS_UF_WORKSTATION_TRUST_ACCOUNT, false, true, false)
+        }
+        // The admin service object (docs/52 R2b follow-up; Q-541): a service
+        // object whose one SPN is the admin service's name.
+        Some(ProvisioningRole::AdminServiceObject) => {
+            (ADS_UF_WORKSTATION_TRUST_ACCOUNT, false, true, true)
+        }
+        Some(ProvisioningRole::DcAccount) => (ADS_UF_SERVER_TRUST_ACCOUNT, true, false, false),
         Some(_) => return Err(V::Exception),
     };
     let name = text(obj, ids.cn)?;
@@ -276,8 +339,9 @@ fn check_computer(ids: &Ids, obj: &Object, role: Option<ProvisioningRole>) -> Re
         return Err(V::Value);
     }
     match record::text(obj, ids.service_principal_name) {
-        Ok(None) => {}
-        Ok(Some(spn)) if !dc && names::spn_ok(spn, host) => {}
+        Ok(None) if !admin => {}
+        Ok(Some(spn)) if !dc && !admin && names::spn_ok(spn, host) => {}
+        Ok(Some(spn)) if admin && names::admin_service_spn_ok(spn, host) => {}
         _ => return Err(V::Value),
     }
     check_account_values(ids, obj, !dc && !service)

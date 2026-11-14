@@ -112,7 +112,10 @@ pub(crate) fn exception_of(role: ObjectRole) -> Option<ProvisioningRole> {
         ObjectRole::NamingContextRoot => Some(ProvisioningRole::NamingContextRoot),
         ObjectRole::Krbtgt => Some(ProvisioningRole::Krbtgt),
         ObjectRole::DcComputer => Some(ProvisioningRole::DcAccount),
-        ObjectRole::LdapService | ObjectRole::AdminService => Some(ProvisioningRole::ServiceObject),
+        ObjectRole::LdapService => Some(ProvisioningRole::ServiceObject),
+        // The only object that may carry the admin service's name (docs/52
+        // R2b follow-up; docs/questions/Q-541).
+        ObjectRole::AdminService => Some(ProvisioningRole::AdminServiceObject),
         ObjectRole::Tier0Ou
         | ObjectRole::WorkstationsOu
         | ObjectRole::FirstAdmin(_)
@@ -198,7 +201,7 @@ pub(crate) fn check_domain(store: &Store, plan: &Plan) -> Result<(), StoreError>
     if krbtgt.principal.as_bytes() != &planned.guid.to_packet() {
         return Err(StoreError::Krbtgt);
     }
-    let snapshot = view.snapshot();
+    let snapshot = view.authority_snapshot();
     let rid = snapshot
         .counter(RID_COUNTER)
         .map_err(|_| StoreError::Counter)?

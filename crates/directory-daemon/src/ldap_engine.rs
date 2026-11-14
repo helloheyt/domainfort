@@ -46,7 +46,7 @@ use crate::rate::ObligationLimiter;
 use crate::zones::ZoneTable;
 use core::fmt;
 use core::net::IpAddr;
-use directory_pip::{DirectoryContext, TierMap};
+use directory_pip::{DirectoryContext, PepView, TierMap};
 use dirstore::Store;
 use ipc_ldap_server::{Dispatch, LdapConnection, RequestHost, Unserved};
 use ldap::{DirectoryInputs, Engine, Outcome, RequestInputs, TransportReport};
@@ -185,8 +185,10 @@ impl RequestHost for LdapHost<'_> {
             rate: &mut *self.rate,
             now,
             transport,
+            // The PEP receives the gate-only view, never the snapshot
+            // (docs/52 R-a; A-103 on docs/questions/Q-486).
             directory: Some(DirectoryInputs {
-                view: &view,
+                view: PepView::new(&view),
                 clock: &search_clock,
             }),
         });

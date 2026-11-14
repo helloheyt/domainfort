@@ -2487,6 +2487,74 @@ fn rotate_key_and_retire_kvno_decisions_are_executed_by_id() {
     );
 }
 
+/// docs/52 R2b; docs/questions/Q-493 item 1 (the follow-up of R2): the
+/// admin service object's key set — `(GUID, AdminService)`, the purpose its
+/// name `admind/<host>` derives (Q-491 item 1) — is rotated and its old kvno
+/// retired through the admin plane: dird registers each decision on the
+/// `AdminService` key set (keyd's records name that purpose, not
+/// `Service`), and keyadm's execution in keyd succeeds — before R2b dird
+/// named `(GUID, Service)` and keyd answered `KeyNotFound`. Every AP-REQ is
+/// made before the rotation runs (they are sealed under the admin key's
+/// kvno 1); keyadm runs both decisions afterwards.
+#[test]
+fn the_admin_service_key_is_rotated_and_retired_through_the_admin_plane() {
+    let Some(world) = World::new(Options::default()) else {
+        return;
+    };
+    let mut client = world.client();
+    let mut keyadm = world.keyadm();
+    let rotate = KeyOperation::RotateKey {
+        service: g(ADMIND_SVC),
+    };
+    let retire = KeyOperation::RetireKvno {
+        key: KeyRef::Service(g(ADMIND_SVC)),
+        kvno: 1,
+    };
+    let mut ids = Vec::new();
+    for operation in [rotate, retire] {
+        let state = key_state(client.call(&request_op("admin1", operation)).unwrap());
+        let approved = key_state(
+            client
+                .call(&approve_op("admin2", state.id, operation))
+                .unwrap(),
+        );
+        assert!(approved.approved());
+        ids.push(DecisionId::new(state.id));
+    }
+    assert_eq!(keyadm.rotate_key(ids[0]), Ok(Kvno::new(2)));
+    assert_eq!(keyadm.retire_kvno(ids[1]), Ok(()));
+    // keyd's trail: both registrations and both executions name the admin
+    // service's own key set.
+    for op in [
+        ipc_audit::KeydOperation::RegisterDecision,
+        ipc_audit::KeydOperation::RotateKey,
+        ipc_audit::KeydOperation::RetireKvno,
+    ] {
+        let records = keyd_records_for(&world, op, g(ADMIND_SVC));
+        let succeeded: Vec<_> = records
+            .iter()
+            .filter(|r| r.result == ipc_audit::KeydOutcome::Success)
+            .collect();
+        assert!(!succeeded.is_empty(), "{op:?}");
+        assert!(
+            succeeded
+                .iter()
+                .all(|r| r.purpose == Some(ipc_audit::KeyPurposeCode::AdminService)),
+            "{op:?}: {succeeded:?}"
+        );
+    }
+    // dird's trail: each completing approval's registration committed, on
+    // the admin service object.
+    let approvals = await_events(&world, DirAdminOperation::Approve, 4);
+    for outcome in [&approvals[1], &approvals[3]] {
+        assert_eq!(
+            outcome.stage,
+            DirAdminStage::Outcome(OutcomeResult::Committed { allocated: None })
+        );
+        assert_eq!(outcome.target, Some(g(ADMIND_SVC).to_packet()));
+    }
+}
+
 /// docs/52 §4.3 (A-102); docs/questions/Q-453 item 1 (fail closed): when
 /// keyd does not register the decision of the quorum-completing `Approve`,
 /// dird records the registration's failure (`Outcome(Failed(

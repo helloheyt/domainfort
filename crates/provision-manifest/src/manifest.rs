@@ -9,7 +9,7 @@ use crate::value::{
     salt_items, COMPONENT_SEPARATOR, ENTRY_SEPARATOR, LIST_SEPARATOR, MANIFEST_VERSION,
 };
 use dtyp::{Guid, Sid};
-use keyd_types::{KeyHandle, KeyPurpose, PrincipalBinding, PrincipalId};
+use keyd_types::{KeyHandle, KeyPurpose, PrincipalBinding, PrincipalId, ServiceKeyHandle};
 use krb_proto::constants::{KRB_NT_PRINCIPAL, KRB_NT_SRV_HST, KRB_NT_SRV_INST};
 use krb_proto::{KerberosString, Realm};
 
@@ -62,10 +62,14 @@ pub const KRBTGT_SERVICE: &str = "krbtgt";
 /// `ldap/<dc-fqdn>`"); docs/51 §4.3 step 5.
 pub const LDAP_SERVICE_CLASS: &str = "ldap";
 
-/// The service class of the admin service object's binding.
+/// The service class of the admin service object's binding — keyd-types'
+/// one value, the class from which `KeyPurpose::of_service_name` derives the
+/// admin service's purpose (re-exported, not restated: one fact, one place —
+/// docs/52 R2b).
 /// Spec: PENDING-OWNER A-73 / docs/questions/Q-290 item 4 ("SPN
-/// `admind/<fqdn>`", a project choice); docs/51 §4.3 step 5.
-pub const ADMIN_SERVICE_CLASS: &str = "admind";
+/// `admind/<fqdn>`", a project choice); docs/51 §4.3 step 5; docs/questions/
+/// Q-491 item 1.
+pub use keyd_types::ADMIN_SERVICE_CLASS;
 
 /// A comment the encoder writes as the first line. Printable ASCII only
 /// (docs/50 §7.1).
@@ -211,6 +215,23 @@ impl SeenGuids {
     }
 }
 
+/// The krbtgt object's key set: `(GUID, Krbtgt)`.
+/// Spec: RFC 4120 §7.3; docs/47 §1.4 (R47-2); docs/51 §4.3 step 11.
+fn krbtgt_handle(principal: PrincipalId, _: &PrincipalBinding) -> KeyHandle {
+    KeyHandle::new(principal, KeyPurpose::Krbtgt)
+}
+
+/// A service object's key set: the purpose derived from its binding's name
+/// — the one derivation, `keyd_types::ServiceKeyHandle` — so the manifest
+/// names the key set the KDC seals the service's tickets under and keyd
+/// binds at the ceremony (`Service` for `ldap/<fqdn>`, `AdminService` for
+/// `admind/<fqdn>`).
+/// Spec: docs/47 §1.3, §9.1; docs/52 §5 item 3, R2b; docs/questions/Q-491
+/// item 1, Q-493 item 1.
+fn service_handle(principal: PrincipalId, binding: &PrincipalBinding) -> KeyHandle {
+    ServiceKeyHandle::of_service(principal, &binding.name).handle()
+}
+
 impl Manifest {
     /// The closed key table, in the order the encoder writes it.
     /// Spec: docs/51 §4.3 step 8; docs/50 R50-15.
@@ -260,16 +281,17 @@ impl Manifest {
             &doc,
             keys::KRBTGT,
             &mut seen,
-            KeyPurpose::Krbtgt,
+            krbtgt_handle,
             binding(&realm, KRB_NT_SRV_INST, &[KRBTGT_SERVICE, realm.as_str()]),
         )?;
         // RFC 4120 §6.2.1; docs/10 §5ב; docs/47 §9.1; docs/51 §4.3 step 11:
-        // (GUID_ldap, Service), NT-SRV-HST [ldap, fqdn].
+        // (GUID_ldap, Service), NT-SRV-HST [ldap, fqdn] — the purpose derived
+        // from the binding (`service_handle`; docs/52 R2b).
         let ldap_service = Self::object(
             &doc,
             keys::LDAP_SERVICE,
             &mut seen,
-            KeyPurpose::Service,
+            service_handle,
             binding(
                 &realm,
                 KRB_NT_SRV_HST,
@@ -280,12 +302,13 @@ impl Manifest {
         // AdminService) — the admin service's own purpose (R2, docs/52 §5
         // item 3; A-102), so keyd opens its tickets only bound to an
         // operation — [admind, fqdn], NT-SRV-HST, a service on a host
-        // (docs/questions/Q-345 item 4).
+        // (docs/questions/Q-345 item 4). The purpose is derived from that
+        // binding (`service_handle`; docs/52 R2b), not restated.
         let admin_service = Self::object(
             &doc,
             keys::ADMIN_SERVICE,
             &mut seen,
-            KeyPurpose::AdminService,
+            service_handle,
             binding(
                 &realm,
                 KRB_NT_SRV_HST,
@@ -331,7 +354,7 @@ impl Manifest {
         doc: &Document<'_>,
         key: &'static str,
         seen: &mut SeenGuids,
-        purpose: KeyPurpose,
+        handle: fn(PrincipalId, &PrincipalBinding) -> KeyHandle,
         expected: Result<PrincipalBinding, ErrorKind>,
     ) -> Result<KeySet, Error> {
         let ((guid, written), line) = doc.required(key, object_entry)?;
@@ -342,7 +365,7 @@ impl Manifest {
         }
         let principal = seen.admit(&guid).map_err(at)?;
         Ok(KeySet {
-            handle: KeyHandle::new(principal, purpose),
+            handle: handle(principal, &expected),
             binding: expected,
         })
     }

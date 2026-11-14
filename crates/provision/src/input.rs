@@ -10,8 +10,8 @@ use core::fmt;
 use std::path::Path;
 
 use directory_admin::{
-    computer_name_ok, computer_sam, dns_host_name_ok, group_sam_ok, rdn_value_ok, spn_ok,
-    user_sam_ok,
+    admin_service_spn_ok, computer_name_ok, computer_sam, dns_host_name_ok, group_sam_ok,
+    rdn_value_ok, spn_ok, user_sam_ok,
 };
 use directory_pip::NamingContext;
 use krb_proto::Realm;
@@ -459,12 +459,13 @@ impl DomainInput {
         // The two service SPNs (docs/51 §4.3 step 5; A-73) pass the
         // runtime's own SPN rule: `service "/" host`, host = the object's
         // dNSHostName (the DC's FQDN), lower case, service not "krbtgt"
-        // (directory-admin `spn_ok`; Q-355 item 3).
-        for class in [LDAP_SERVICE_CLASS, ADMIN_SERVICE_CLASS] {
-            let spn = format!("{class}/{}", self.dc_fqdn);
-            if !spn_ok(&spn, &self.dc_fqdn) {
-                return Err(InputError::new("dc-fqdn", InputErrorKind::HostName));
-            }
+        // (directory-admin `spn_ok`; Q-355 item 3) — the admin service's
+        // through `admin_service_spn_ok`, the same shape with the name that
+        // only its provisioning exception may carry (docs/questions/Q-541).
+        let ldap_spn = format!("{LDAP_SERVICE_CLASS}/{}", self.dc_fqdn);
+        let admin_spn = format!("{ADMIN_SERVICE_CLASS}/{}", self.dc_fqdn);
+        if !spn_ok(&ldap_spn, &self.dc_fqdn) || !admin_service_spn_ok(&admin_spn, &self.dc_fqdn) {
+            return Err(InputError::new("dc-fqdn", InputErrorKind::HostName));
         }
         if n.first_admins.len() < MIN_FIRST_ADMINS {
             return Err(InputError::new(

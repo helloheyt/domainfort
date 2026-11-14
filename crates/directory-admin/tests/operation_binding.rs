@@ -108,7 +108,8 @@ fn key_steps_need_the_steps_own_binding() {
     let mut table = KeyRequests::new(
         directory_admin::KeyTargets {
             krbtgt: guid(KRBTGT),
-            services: std::collections::BTreeSet::from([guid(LDAP_SVC), guid(ADMIND_SVC)]),
+            // Only the krbtgt is named below; no service object is a target.
+            services: std::collections::BTreeSet::new(),
         },
         directory_admin::KEY_REQUEST_LIFETIME,
         0,

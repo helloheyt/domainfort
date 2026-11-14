@@ -266,7 +266,7 @@ pub fn direct(
                 input_pending,
             },
             directory: Some(DirectoryInputs {
-                view: &view,
+                view: directory_pip::PepView::new(&view),
                 clock: &clock,
             }),
         },

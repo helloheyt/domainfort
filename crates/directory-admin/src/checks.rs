@@ -20,18 +20,36 @@
 //! (docs/questions/Q-487). [`Cx::resolve`] reads a key-operation target for
 //! crate::key_requests, after its `PolicyAdmin` decision (Q-486).
 //!
+//! # The raw view is this module's alone (docs/52 R-a; A-103)
+//!
+//! [`Cx`] holds the request's view twice: as a `directory_pip::PepView`
+//! ([`Cx::pep`], public to the crate) — the gate, the locators, the PIP and
+//! the account source, all the request-facing code (crate::admin,
+//! crate::key_requests) can reach — and as the authority's
+//! `DirectoryView`, a **private** field of `Cx`. Only this module reads the
+//! raw snapshot (`DirectoryView::authority_snapshot`): the internal reads
+//! docs/questions/Q-486 item 5 puts outside the gate — the write invariants'
+//! graph, the self-lockout count, the counters, the name and uniqueness
+//! checks of a create, the has-children probe of a delete, the NC root, the
+//! exact-value locator of `Lookup`, the key-operation target, the
+//! tombstones of dird's destroy decisions — each a named method here that
+//! hands back a verdict, a count, a GUID or an internal record, never an
+//! object for a reply. A new request-facing read that tried the raw view
+//! would not compile outside this module.
+//!
 //! Spec: docs/51 §7.4 steps 2-4 (one view: snapshot + tier map of the same
 //! policy version, docs/47 §8.1), §5.2, §5.6, §11; docs/11 §4, §7; A-55;
-//! docs/52 R10, R13; Q-295 item 4 (P-22).
+//! docs/52 R10, R13, R-a; Q-295 item 4 (P-22); docs/questions/Q-486
+//! (A-103).
 
 use std::collections::{BTreeSet, VecDeque};
 
 use ad_schema::flags::group_type::GROUP_TYPE_SECURITY_ENABLED;
 use directory_pip::{
-    DirectoryView, VisibilityGate, VisibilityProof, VisibilityRule, VisibleObject,
-    MAX_EXPANDED_GROUPS, MAX_NESTING_DEPTH,
+    DirectoryView, PepView, TierMap, VisibilityGate, VisibilityProof, VisibilityRule,
+    VisibleObject, MAX_EXPANDED_GROUPS, MAX_NESTING_DEPTH,
 };
-use dirstore::{ClassId, Object};
+use dirstore::{AttrId, ClassId, CounterState, Object, Tombstone, TombstonePage};
 use dtyp::{Guid, Sid};
 use ipc_audit::{AdminFailure, AdminRefusal};
 use kdc::AccountSource;
@@ -45,7 +63,7 @@ use pdp::{
 use crate::audit::Stop;
 use crate::config::AdminConfig;
 use crate::ids::Ids;
-use crate::invariants::{Fault, Graph, MAX_WALK_STEPS};
+use crate::invariants::{End, Fault, Graph, Invariants, LinkProof, MAX_WALK_STEPS};
 use crate::record;
 
 /// The transport security of the admin plane's local socket: the bytes
@@ -67,12 +85,46 @@ pub(crate) const fn local_ipc_security(channel_bound: bool) -> TransportSec {
 pub(crate) struct Cx<'c, 'v, 'a> {
     pub(crate) config: &'c AdminConfig,
     pub(crate) ids: &'c Ids,
-    pub(crate) view: &'v DirectoryView<'a>,
+    /// The view as the request-facing code receives it: the gate, the
+    /// locators, the PIP, the account source — no raw read (module
+    /// documentation; docs/52 R-a).
+    pub(crate) pep: PepView<'v, 'a>,
+    /// The authority's view of the same snapshot — private to this module,
+    /// read only by its internal-read methods (module documentation;
+    /// docs/questions/Q-486 item 5, A-103).
+    view: &'v DirectoryView<'a>,
     pub(crate) policy: &'v PolicySnapshot,
     pub(crate) now: KerberosTime,
     pub(crate) instant: Instant,
     /// The request's transport security ([`local_ipc_security`]; R2).
     pub(crate) transport_sec: TransportSec,
+}
+
+impl<'c, 'v, 'a> Cx<'c, 'v, 'a> {
+    /// The checks' inputs over `view` and the policy of the same version at
+    /// `now`: the PEP's view of it ([`Cx::pep`]) and, kept here, the raw
+    /// one. `now` outside the PDP's instant range ⇒ `InternalFailure`.
+    /// Spec: docs/51 §7.4 steps 2-4; docs/11 P9; docs/52 R-a.
+    pub(crate) fn new(
+        config: &'c AdminConfig,
+        ids: &'c Ids,
+        view: &'v DirectoryView<'a>,
+        policy: &'v PolicySnapshot,
+        now: &KerberosTime,
+        transport_sec: TransportSec,
+    ) -> Result<Cx<'c, 'v, 'a>, Stop> {
+        Ok(Cx {
+            config,
+            ids,
+            pep: PepView::new(view),
+            view,
+            policy,
+            now: *now,
+            instant: crate::time::instant(now)
+                .ok_or(Stop::Failed(AdminFailure::InternalFailure))?,
+            transport_sec,
+        })
+    }
 }
 
 /// An object a request names that the requester may see, read from the
@@ -172,7 +224,7 @@ impl<'v, 'a> Cx<'_, 'v, 'a> {
     pub(crate) fn resolve(&self, guid: Guid) -> Result<KeyTargetRecord, Stop> {
         let obj = self
             .view
-            .snapshot()
+            .authority_snapshot()
             .get_object(guid)
             .map_err(|e| store_failure(&e))?
             .ok_or(Stop::Refused(AdminRefusal::NotFound))?;
@@ -224,8 +276,7 @@ impl<'v, 'a> Cx<'_, 'v, 'a> {
     /// Spec: [MS-ADTS] 5.1.3.3.6; docs/51 §5.2 row 10 (`DirRead` on the
     /// object, docs/11 §7); docs/52 R10; A-55; docs/questions/Q-485.
     pub(crate) fn gate(&self, subject: &Subject) -> VisibilityGate<'v, 'a> {
-        VisibilityGate::new(
-            self.view,
+        self.pep.gate(
             self.policy,
             subject.clone(),
             self.context(),
@@ -240,6 +291,155 @@ impl<'v, 'a> Cx<'_, 'v, 'a> {
         self.view
             .classified_object_tier(dn)
             .map_err(|_| Stop::Failed(AdminFailure::StoreFailure))
+    }
+
+    /// The tier map of the request's policy version (policy data, not
+    /// directory content). Spec: docs/47 §6.3, §8.1.
+    pub(crate) fn tier_map(&self) -> &TierMap {
+        self.view.tier_map()
+    }
+
+    // -- Internal reads (module documentation; docs/questions/Q-486 item 5).
+
+    /// The state of the counter `name` (the change-seq or RID counter —
+    /// docs/51 §8.3). Internal read.
+    /// Spec: docs/51 §8.3; A-75; A-83.
+    pub(crate) fn counter(&self, name: &str) -> Result<Option<CounterState>, Stop> {
+        self.view
+            .authority_snapshot()
+            .counter(name)
+            .map_err(|e| store_failure(&e))
+    }
+
+    /// A create's name check: no live child of `parent` with the RDN value
+    /// `rdn` (docs/46 §8.3 item 3; dirstore `NameExists`) — taken ⇒
+    /// `Conflict`, a value no name can have ⇒ `ValueInvalid`. Internal read
+    /// of the whole directory (its refusal is the residual of
+    /// docs/questions/Q-487 item 1).
+    /// Spec: docs/46 §8.3 item 3; docs/51 §5.2 rows 1-4.
+    pub(crate) fn name_free(&self, parent: Guid, rdn: &str) -> Result<(), Stop> {
+        match self
+            .view
+            .authority_snapshot()
+            .lookup_child(Some(parent), rdn.as_bytes())
+        {
+            Ok(None) => Ok(()),
+            Ok(Some(_)) => Err(Stop::Refused(AdminRefusal::Conflict)),
+            Err(dirstore::Error::Rejected(_)) => Err(Stop::Refused(AdminRefusal::ValueInvalid)),
+            Err(e) => Err(store_failure(&e)),
+        }
+    }
+
+    /// A create's uniqueness check: no object holds `value` in the unique
+    /// attribute `attr` (docs/46 §8.5, the rule the create path cites) — taken ⇒
+    /// `Conflict`, a value the index cannot hold ⇒ `ValueInvalid`. Internal
+    /// read (docs/questions/Q-487 item 2).
+    /// Spec: docs/46 §8.5; docs/questions/Q-487 item 2.
+    pub(crate) fn unique_free(&self, attr: AttrId, value: &str) -> Result<(), Stop> {
+        match self
+            .view
+            .authority_snapshot()
+            .lookup_unique(attr, value.as_bytes())
+        {
+            Ok(None) => Ok(()),
+            Ok(Some(_)) => Err(Stop::Refused(AdminRefusal::Conflict)),
+            Err(dirstore::Error::Rejected(_)) => Err(Stop::Refused(AdminRefusal::ValueInvalid)),
+            Err(e) => Err(store_failure(&e)),
+        }
+    }
+
+    /// The NC root: the object the naming context's DN names — for the
+    /// domain SID and the write's re-verification, never a reply. Internal
+    /// read.
+    /// Spec: A-53; docs/47 §8.2; docs/51 §8.3.
+    pub(crate) fn domain_root(&self) -> Result<(Guid, Object), Stop> {
+        let labels = self.config.naming_context().labels();
+        let rdns: Vec<(&str, &str)> = labels
+            .iter()
+            .map(|l| (directory_pip::NC_RDN_ATTRIBUTE, l.as_str()))
+            .collect();
+        let guid = self
+            .view
+            .lookup_dn(&rdns)
+            .map_err(|_| Stop::Failed(AdminFailure::StoreFailure))?
+            .ok_or(Stop::Failed(AdminFailure::StoreFailure))?;
+        let root = self
+            .view
+            .authority_snapshot()
+            .get_object(guid)
+            .map_err(|e| store_failure(&e))?
+            .ok_or(Stop::Failed(AdminFailure::StoreFailure))?;
+        Ok((guid, root))
+    }
+
+    /// `true` if the object `guid` has a live child (a delete's probe,
+    /// docs/questions/Q-356 item 6). Internal read (Q-487 item 3).
+    /// Spec: docs/51 §5.2 row 9; dirstore `Snapshot::children`.
+    pub(crate) fn has_children(&self, guid: Guid) -> Result<bool, Stop> {
+        let page = self
+            .view
+            .authority_snapshot()
+            .children(Some(guid), None, 1)
+            .map_err(|e| store_failure(&e))?;
+        Ok(!page.children.is_empty())
+    }
+
+    /// The write invariants' link check of `group ∋ member` over this view
+    /// (crate::invariants, docs/52 R13). Internal read of the whole
+    /// membership graph (docs/questions/Q-487 item 4).
+    /// Spec: as `Invariants::check_link`.
+    pub(crate) fn check_link(
+        &self,
+        invariants: &Invariants,
+        group: End<'_>,
+        group_type: u32,
+        member: End<'_>,
+        member_class: ClassId,
+        members_before: usize,
+    ) -> Result<Option<LinkProof>, Stop> {
+        invariants
+            .check_link(
+                self.view.authority_snapshot(),
+                group,
+                group_type,
+                member,
+                member_class,
+                members_before,
+            )
+            .map_err(|f| fault_stop(&f))
+    }
+
+    /// `Lookup`'s locator: the object whose stored value of the unique
+    /// attribute `attr` is `value` — through the unique index, then
+    /// compared octet for octet (A-27, as the account source does). A value
+    /// that cannot name anything (empty, longer than `max`, not printable
+    /// ASCII) names nothing. Only a GUID comes back — the object itself
+    /// reaches the reply only through the gate.
+    /// Spec: docs/47 §1.3 steps 3-4 (R47-1); docs/46 §5.4 (bounds);
+    /// docs/52 R-a.
+    pub(crate) fn locate_exact(
+        &self,
+        attr: AttrId,
+        value: &str,
+        max: usize,
+    ) -> Result<Option<Guid>, Stop> {
+        if value.is_empty()
+            || value.len() > max
+            || !value.bytes().all(|b| (0x20..=0x7E).contains(&b))
+        {
+            return Ok(None);
+        }
+        let snapshot = self.view.authority_snapshot();
+        let guid = match snapshot.lookup_unique(attr, value.as_bytes()) {
+            Ok(Some(guid)) => guid,
+            Ok(None) | Err(dirstore::Error::Rejected(_)) => return Ok(None),
+            Err(e) => return Err(store_failure(&e)),
+        };
+        let Some(obj) = snapshot.get_object(guid).map_err(|e| store_failure(&e))? else {
+            return Ok(None);
+        };
+        let stored = record::text(&obj, attr).map_err(malformed)?;
+        Ok((stored == Some(value)).then_some(guid))
     }
 
     /// `true` if `r` must never be deleted or changed by the admin plane
@@ -292,7 +492,7 @@ impl<'v, 'a> Cx<'_, 'v, 'a> {
             ids: self.ids,
             schema: self.view.context().schema().schema(),
             service_objects: &self.config.protected().service_objects,
-            store: self.view.snapshot(),
+            store: self.view.authority_snapshot(),
         }
     }
 
@@ -310,7 +510,7 @@ impl<'v, 'a> Cx<'_, 'v, 'a> {
         &self,
         change: Option<&LockoutChange>,
     ) -> Result<usize, Stop> {
-        let snapshot = self.view.snapshot();
+        let snapshot = self.view.authority_snapshot();
         // Breadth first, so every object is first reached at its smallest
         // depth (a deeper first visit would cut its subtree short).
         let mut queue: VecDeque<(Guid, usize)> = VecDeque::new();
@@ -419,6 +619,31 @@ impl LockoutChange {
     fn removes_edge(&self, from: Guid, to: Guid) -> bool {
         matches!(self, LockoutChange::EdgeRemoved { group, member } if *group == from && *member == to)
     }
+}
+
+/// The tombstone of `guid` in `view` — the source of dird's destroy
+/// decision after a committed `Delete` (crate::key_requests,
+/// `DirectoryAdmin::destruction_target`). Internal read: no requester.
+/// Spec: docs/51 §6, §9; docs/52 §4.3; dirstore `Snapshot::get_tombstone`;
+/// docs/questions/Q-486 (A-103).
+pub(crate) fn tombstone(
+    view: &DirectoryView<'_>,
+    guid: Guid,
+) -> dirstore::Result<Option<Tombstone>> {
+    view.authority_snapshot().get_tombstone(guid)
+}
+
+/// One page of the tombstones in `view` after `after` (dird's
+/// re-registration of destroy decisions, A-105). Internal read: no
+/// requester.
+/// Spec: docs/51 §6, §9; docs/52 §4.3; dirstore `Snapshot::tombstones`;
+/// docs/questions/Q-470 item 4.
+pub(crate) fn tombstones(
+    view: &DirectoryView<'_>,
+    after: Option<Guid>,
+    limit: usize,
+) -> dirstore::Result<TombstonePage> {
+    view.authority_snapshot().tombstones(after, limit)
 }
 
 /// The objectSid of `domain_root`, the naming-context root.

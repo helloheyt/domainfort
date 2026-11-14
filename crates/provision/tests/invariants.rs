@@ -182,6 +182,73 @@ fn a_disabled_krbtgt_is_refused() {
     });
 }
 
+/// The admin service object's SPN as planned (`admind/<dc-fqdn>`, A-73).
+fn admin_spn(plan: &mut Plan) -> Vec<Vec<u8>> {
+    let id = attr("servicePrincipalName");
+    object(plan, ObjectRole::AdminService)
+        .attributes
+        .iter()
+        .find(|(a, _)| *a == id)
+        .map(|(_, v)| v.clone())
+        .unwrap()
+}
+
+/// docs/52 R2b follow-up; docs/questions/Q-491 item 1, Q-541: the admin
+/// service's name belongs to the admin service object alone — on the LDAP
+/// service object (a plain service-object claim) it is refused (`Value`,
+/// the SPN rule's code), before the unique index would see the duplicate.
+#[test]
+fn the_admin_service_name_on_another_object_is_refused() {
+    violates(V::Value, |plan| {
+        let spn = admin_spn(plan);
+        set(
+            object(plan, ObjectRole::LdapService),
+            "servicePrincipalName",
+            spn,
+        );
+    });
+}
+
+/// Q-541: the admin service object's claim (`AdminServiceObject`) fits only
+/// an object carrying the admin service's name — with another SPN it is
+/// `Exception`.
+#[test]
+fn the_admin_service_claim_needs_its_name() {
+    violates(V::Exception, |plan| {
+        let admin = object(plan, ObjectRole::AdminService);
+        let host = admin_spn_host(admin);
+        set(admin, "servicePrincipalName", text(&format!("host/{host}")));
+    });
+}
+
+/// Q-541: the admin service object is claimed once per session — a second
+/// planned admin service object (its own GUID and name) is `Exception`,
+/// and nothing is installed; the real one, as built, is created
+/// (`the_plan_as_built_passes_the_checker`).
+#[test]
+fn a_second_admin_service_object_is_refused() {
+    violates(V::Exception, |plan| {
+        let mut second = object(plan, ObjectRole::AdminService).clone();
+        second.guid = Guid::from_packet(&[0xA7; 16]);
+        set(&mut second, "cn", text("admind2"));
+        set(&mut second, "sAMAccountName", text("admind2$"));
+        plan.objects.push(second);
+    });
+}
+
+/// The host component of the admin service object's planned SPN.
+fn admin_spn_host(admin: &provision::PlannedObject) -> String {
+    let id = attr("servicePrincipalName");
+    let spn = admin
+        .attributes
+        .iter()
+        .find(|(a, _)| *a == id)
+        .and_then(|(_, v)| v.first())
+        .map(|v| String::from_utf8(v.clone()).unwrap())
+        .unwrap();
+    spn.split_once('/').unwrap().1.to_owned()
+}
+
 /// A-79 / Q-298 item 2: ST only for the DC account — a service object
 /// claiming it is refused.
 #[test]

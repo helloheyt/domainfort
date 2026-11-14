@@ -12,6 +12,10 @@
 //! component of a server name "MUST be lowercase"), §7.3 (krbtgt is the
 //! TGS's name); docs/47 §1.3 (R47-1, the SPN write rule).
 
+use keyd_types::KeyPurpose;
+use krb_proto::constants::{KRB_NT_PRINCIPAL, KRB_NT_SRV_HST};
+use krb_proto::{KerberosString, PrincipalName};
+
 /// The most characters of a user's or a computer's sAMAccountName ("$"
 /// included for a computer). Spec: [MS-SAMR] 3.1.1.6 item 12 ("MUST contain
 /// less than or equal to 20 characters if the object's objectClass is
@@ -148,7 +152,68 @@ pub fn dns_host_name_ok(name: &str) -> bool {
 /// host name is an Internet domain name"; host lowercase), §7.3; docs/47
 /// §1.3 (R47-1); docs/51 §5.2 row 2 (one SPN, host in lower case);
 /// docs/46 §5.4.
+///
+/// And never a name from which the admin service's key-set purpose derives
+/// ([`spn_derives_admin_service`]): `admind/<host>` is reserved for the
+/// admin service object (`admin_service_spn_ok`, its provisioning
+/// exception) as `krbtgt` is for the TGS (docs/52 R2b follow-up;
+/// docs/questions/Q-541 item 7).
 pub fn spn_ok(spn: &str, dns_host_name: &str) -> bool {
+    spn_shape_ok(spn, dns_host_name) && !spn_derives_admin_service(spn)
+}
+
+/// The admin service object's servicePrincipalName (A-73: `admind/<host>`):
+/// the shape of [`spn_ok`], and a name from which the admin service's
+/// purpose derives. Only the provisioning exception of the admin service
+/// object may carry one (crate::invariants, `ProvisioningRole::
+/// AdminServiceObject`); `provision domain` checks its input with it.
+/// Spec: A-73; docs/51 §4.3 step 5; docs/52 R2b; docs/questions/Q-541.
+pub fn admin_service_spn_ok(spn: &str, dns_host_name: &str) -> bool {
+    spn_shape_ok(spn, dns_host_name) && spn_derives_admin_service(spn)
+}
+
+/// `true` if the principal name the SPN forms (its components split on
+/// "/", NT-SRV-HST — docs/47 §1.3, §9.1) derives the admin service's key
+/// set by the one derivation, `keyd_types::KeyPurpose::of_service_name`
+/// (docs/questions/Q-491 item 1) — not a second spelling of the rule. A
+/// value that cannot form a name (a component that is not a KerberosString)
+/// derives nothing; [`spn_ok`] refuses it anyway (printable ASCII).
+/// Spec: docs/52 R2b; docs/questions/Q-491 item 1, Q-541; RFC 4120 §6.2
+/// (the name-type a hint only).
+pub(crate) fn spn_derives_admin_service(spn: &str) -> bool {
+    principal_name(KRB_NT_SRV_HST, &spn_components(spn))
+        .is_some_and(|name| KeyPurpose::of_service_name(&name) == KeyPurpose::AdminService)
+}
+
+/// `true` if the one-component client name `sam` (the sAMAccountName as the
+/// KDC's account source looks it up — docs/47 §1.3, R47-1) derives the
+/// admin service's key set by the same derivation. With the rule of
+/// Q-491 item 1 (exactly two components) it never does; asked anyway, so
+/// that every principal name an object forms goes through the one
+/// derivation (docs/questions/Q-541).
+/// Spec: docs/47 §1.3; docs/52 R2b; docs/questions/Q-541.
+pub(crate) fn client_name_derives_admin_service(sam: &str) -> bool {
+    principal_name(KRB_NT_PRINCIPAL, &[sam])
+        .is_some_and(|name| KeyPurpose::of_service_name(&name) == KeyPurpose::AdminService)
+}
+
+/// The principal name of `components`, if each is a KerberosString.
+/// Spec: RFC 4120 §5.2.2 (PrincipalName), §6.2.
+fn principal_name(name_type: i32, components: &[&str]) -> Option<PrincipalName> {
+    let name_string = components
+        .iter()
+        .map(|c| KerberosString::new(c).ok())
+        .collect::<Option<Vec<_>>>()?;
+    Some(PrincipalName {
+        name_type,
+        name_string,
+    })
+}
+
+/// [`spn_ok`] without the admin service's reservation: `service "/" host`,
+/// the rules of its documentation.
+/// Spec: as [`spn_ok`].
+fn spn_shape_ok(spn: &str, dns_host_name: &str) -> bool {
     if spn.is_empty() || spn.len() > MAX_PRINCIPAL_NAME_CHARS || !printable_ascii(spn) {
         return false;
     }
@@ -222,5 +287,29 @@ mod tests {
             spn_components("host/ws01.example.test"),
             ["host", "ws01.example.test"]
         );
+    }
+
+    /// docs/52 R2b follow-up; Q-491 item 1 (the derivation), Q-541: an SPN
+    /// from which the admin service's purpose derives is reserved — refused
+    /// by `spn_ok` for any host, accepted only by `admin_service_spn_ok`
+    /// (which keeps every other rule of the shape); other classes, a case
+    /// variant, and client names are not reserved.
+    #[test]
+    fn the_admin_service_class_is_reserved() {
+        let host = "ws01.example.test";
+        assert!(!spn_ok("admind/ws01.example.test", host));
+        assert!(spn_derives_admin_service("admind/ws01.example.test"));
+        assert!(admin_service_spn_ok("admind/ws01.example.test", host));
+        assert!(!admin_service_spn_ok("admind/ws02.example.test", host));
+        assert!(!admin_service_spn_ok(
+            "admind/WS01.example.test",
+            "WS01.example.test"
+        ));
+        assert!(!admin_service_spn_ok("ldap/ws01.example.test", host));
+        assert!(spn_ok("ldap/ws01.example.test", host));
+        assert!(spn_ok("ADMIND/ws01.example.test", host));
+        assert!(!spn_derives_admin_service("ADMIND/ws01.example.test"));
+        assert!(!client_name_derives_admin_service("admind"));
+        assert!(!client_name_derives_admin_service("ws01$"));
     }
 }

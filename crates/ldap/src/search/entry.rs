@@ -174,7 +174,7 @@ impl<'r> Search<'r> {
     /// §6.4.
     fn returned_values(
         &mut self,
-        cand: &Candidate<'_>,
+        cand: &Candidate<'r>,
         a: &Attr,
         object_name: &str,
     ) -> Result<Vec<Vec<u8>>, Stop> {
@@ -266,8 +266,7 @@ impl<'r> Search<'r> {
             Kind::MemberOf => {
                 let groups = self
                     .view
-                    .snapshot()
-                    .back_links(cand.obj().guid, a.id)
+                    .back_links(&cand.object, a.id)
                     .map_err(|_| Stop::Fail(AuditReason::DirectoryUnavailable))?;
                 self.visible_dns(groups)?
             }

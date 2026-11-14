@@ -123,7 +123,8 @@ use ipc_dird_admin::{
 use kdc::AccountSource;
 use keyd_types::{
     AccountKind as GrantKind, AppBinding, AuthnError, DecidedOperation, DecisionId,
-    DestructionPage, KeyHandle, OperationDigest, PrincipalId, ServiceContext, SetSecretTarget,
+    DestructionPage, KeyHandle, OperationDigest, PrincipalId, ServiceContext, ServiceKeyHandle,
+    SetSecretTarget,
 };
 use krb_proto::Realm;
 use pdp::Dn;
@@ -615,19 +616,6 @@ pub(crate) fn check_manifest(
     Ok(())
 }
 
-// The admin service's class is one value: the manifest's binding and keyd's
-// purpose rule name the same service (R2; A-73).
-const _: () = {
-    let manifest = provision_manifest::ADMIN_SERVICE_CLASS.as_bytes();
-    let keyd = keyd_types::ADMIN_SERVICE_CLASS.as_bytes();
-    assert!(manifest.len() == keyd.len());
-    let mut i = 0;
-    while i < manifest.len() {
-        assert!(manifest[i] == keyd[i]);
-        i += 1;
-    }
-};
-
 /// The admin service's key set: the manifest's admin-service binding
 /// resolved as the KDC resolves a service principal, and the result must be
 /// the manifest's handle — `(objectGUID, AdminService)` (module
@@ -648,16 +636,22 @@ pub(crate) fn admin_service_handle(
 }
 
 /// The key sets a key-operation request may name: the manifest's krbtgt
-/// account and its two service objects (the randomized `Service` key sets
-/// of the ceremony, docs/51 §4.3 step 11).
-/// Spec: docs/51 §4.3 steps 8, 11, §6; docs/questions/Q-420.
+/// account and its two service objects (the randomized key sets of the
+/// ceremony, docs/51 §4.3 step 11) — each service object's key set derived
+/// from its binding's name (`Service` for the LDAP service, `AdminService`
+/// for the admin service), the one derivation the KDC uses (docs/52 R2b;
+/// docs/questions/Q-493 item 1).
+/// Spec: docs/51 §4.3 steps 8, 11, §6; docs/questions/Q-420; docs/47 §1.3.
 #[must_use]
 pub fn key_targets(manifest: &Manifest) -> KeyTargets {
+    let service = |set: &provision_manifest::KeySet| {
+        ServiceKeyHandle::of_service(set.handle.principal, &set.binding.name)
+    };
     KeyTargets {
         krbtgt: guid_of(&manifest.krbtgt().handle),
         services: BTreeSet::from([
-            guid_of(&manifest.ldap_service().handle),
-            guid_of(&manifest.admin_service().handle),
+            service(manifest.ldap_service()),
+            service(manifest.admin_service()),
         ]),
     }
 }

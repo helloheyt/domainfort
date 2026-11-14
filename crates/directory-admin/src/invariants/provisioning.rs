@@ -56,15 +56,25 @@ pub enum ProvisioningRole {
     /// step 5, §11 ("ST only in `provision`"); A-79 (Q-298 item 2); Q-376
     /// item 5.
     DcAccount,
-    /// A service object (the LDAP and admin service objects): a computer
-    /// as the online path creates one, WT without pwdLastSet, which becomes
-    /// protected — never a member, never changed or deleted. Spec: docs/51
-    /// §4.3 step 5, §5.2 row 9; docs/10 §5ב; A-73; Q-376 item 6.
+    /// A service object (the LDAP service object): a computer as the online
+    /// path creates one, WT without pwdLastSet, which becomes protected —
+    /// never a member, never changed or deleted. It may not carry the admin
+    /// service's name. Spec: docs/51 §4.3 step 5, §5.2 row 9; docs/10 §5ב;
+    /// A-73; Q-376 item 6.
     ServiceObject,
+    /// The admin service object: a service object (as
+    /// [`ProvisioningRole::ServiceObject`], protected the same way) whose one
+    /// servicePrincipalName is the admin service's name `admind/<fqdn>` —
+    /// the name from which the `AdminService` key-set purpose derives. The
+    /// only object that may carry such a name; once.
+    /// Spec: A-73; docs/51 §4.3 step 5; docs/52 R2b; docs/questions/Q-491
+    /// item 1, Q-541.
+    AdminServiceObject,
 }
 
 impl ProvisioningRole {
-    /// `true` for the exceptions one domain holds only once.
+    /// `true` for the exceptions one domain holds only once (every one but
+    /// the plain service object).
     fn once(self) -> bool {
         !matches!(self, ProvisioningRole::ServiceObject)
     }
@@ -228,6 +238,10 @@ impl<'t, 's> Provisioning<'t, 's> {
         match role {
             Some(ProvisioningRole::ServiceObject) => {
                 self.invariants.service_objects.insert(guid);
+            }
+            Some(ProvisioningRole::AdminServiceObject) => {
+                self.invariants.service_objects.insert(guid);
+                self.claimed.insert(ProvisioningRole::AdminServiceObject);
             }
             Some(role) => {
                 self.claimed.insert(role);

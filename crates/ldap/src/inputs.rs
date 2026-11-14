@@ -6,13 +6,16 @@
 //! semantics), the account source of the same directory view (docs/47 §8.1:
 //! one view serves as both — `directory_pip::DirectoryView` implements
 //! `pdp::Pip` and `kdc::AccountSource`), the caller's rate limiter, the
-//! caller's `now`, and the transport facts the front observes.
+//! caller's `now`, and the transport facts the front observes. For a
+//! search, the directory comes as a `directory_pip::PepView`: the
+//! visibility gate and the locators of its questions — never the raw
+//! snapshot (docs/52 R-a; A-103 on docs/questions/Q-486).
 //!
 //! Spec: docs/49 §11 (the caller supplies `now`, `source_zone`,
 //! `connection_id` and the transport state), §10.2; docs/11 §2, §6, §8;
 //! docs/47 §8.1 (R47-11).
 
-use directory_pip::DirectoryView;
+use directory_pip::PepView;
 use kdc::AccountSource;
 use krb_proto::KerberosTime;
 use pdp::{IpScope, Pip, PolicySnapshot, RlKey};
@@ -67,18 +70,21 @@ pub trait SearchClock {
 }
 
 /// What a directory search needs beyond the PDP inputs: the request's
-/// directory view and the caller's time source.
+/// directory, as a PEP receives it, and the caller's time source.
 ///
 /// The view is one dirstore snapshot (docs/49 §6.1: "against one snapshot";
 /// [MS-ADTS] 3.1.1.5.1.4). For a directory search the engine takes every PIP
-/// answer from it as well (it implements `pdp::Pip`), so the objects it
-/// enumerates and the descriptors the PDP reads come from the same snapshot
-/// (docs/11 §6 P9); the caller passes the same view as `pip` and `accounts`
-/// (docs/47 §8.1, R47-11).
-/// Spec: docs/49 §6, §11; docs/47 §8.1.
+/// answer from it as well (`PepView::pip`), so the objects it enumerates and
+/// the descriptors the PDP reads come from the same snapshot (docs/11 §6
+/// P9); the caller passes the same view as `pip` and `accounts` (docs/47
+/// §8.1, R47-11). It is a `PepView` — the visibility gate, the locators of
+/// its questions and the PIP — never the `DirectoryView`: the engine cannot
+/// read a raw object (docs/52 R-a; A-103 on docs/questions/Q-486).
+/// Spec: docs/49 §6, §11; docs/47 §8.1; docs/52 R-a.
 pub struct DirectoryInputs<'a> {
-    /// The request's directory view.
-    pub view: &'a DirectoryView<'a>,
+    /// The request's directory as a PEP receives it
+    /// (`PepView::new(&view)`).
+    pub view: PepView<'a, 'a>,
     /// The caller's time source (timeLimit).
     pub clock: &'a dyn SearchClock,
 }
