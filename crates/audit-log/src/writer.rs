@@ -63,48 +63,35 @@ pub trait Storage {
     fn sync(&mut self) -> io::Result<()>;
 }
 
-/// A segment file on the local file system.
+/// A segment file on the local file system, held by its open descriptor.
 ///
-/// Opened in append mode (every write lands at the end; no existing octet is
-/// ever overwritten), created owner-read-write only on Unix. The durability
-/// barrier is `std::fs::File::sync_data`. Whether `sync_data` also persists
-/// the grown file length is operating-system semantics
-/// (docs/questions/Q-215); docs/questions/Q-250 item 7 records the choice.
+/// This crate opens no file: the caller hands over a file it opened **in
+/// append mode** (every write lands at the end; no existing octet is ever
+/// overwritten) — auditd through crates/protected-file's walk
+/// (`create_new_append`: exclusive, no link followed, owner-read-write only;
+/// `open_append` for a verified segment), so no segment is ever reached by
+/// a path a link could redirect (docs/52 R11; docs/questions/Q-481 item b,
+/// Q-530). The durability barrier is `std::fs::File::sync_data`. Whether
+/// `sync_data` also persists the grown file length is operating-system
+/// semantics (docs/questions/Q-215); docs/questions/Q-250 item 7 records
+/// the choice.
 ///
 /// Spec: docs/50 §6.4 ("auditd: append write access to the audit file
-/// only"), §8.1.
+/// only"), §8.1; docs/52 §3.13 (C13).
 #[derive(Debug)]
 pub struct FileStorage {
     file: std::fs::File,
 }
 
 impl FileStorage {
-    /// Create a new segment file at `path`; fails if it already exists (a
-    /// segment is never reopened for writing by accident).
-    ///
-    /// # Errors
-    /// Any I/O failure, including an existing file.
-    pub fn create_new(path: &std::path::Path) -> io::Result<FileStorage> {
-        let mut options = std::fs::OpenOptions::new();
-        options.append(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        Ok(FileStorage {
-            file: options.open(path)?,
-        })
-    }
-
-    /// Open an existing segment file for appending (after it was verified,
+    /// The storage of the segment open in `file`, which the caller opened
+    /// for appending (a new segment created exclusively, or a verified one,
     /// [`LogWriter::resume`]).
     ///
-    /// # Errors
-    /// Any I/O failure, including a missing file.
-    pub fn open_append(path: &std::path::Path) -> io::Result<FileStorage> {
-        let file = std::fs::OpenOptions::new().append(true).open(path)?;
-        Ok(FileStorage { file })
+    /// Spec: docs/50 §6.4, §8.1; docs/questions/Q-530.
+    #[must_use]
+    pub fn new(file: std::fs::File) -> FileStorage {
+        FileStorage { file }
     }
 }
 

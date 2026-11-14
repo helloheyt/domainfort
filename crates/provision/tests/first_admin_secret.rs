@@ -914,7 +914,10 @@ fn password_files_are_refused_with_nothing_sent() {
         );
         assert_eq!(clients, 0, "{refusal:?}");
     }
-    // The wrong owner: the file is the test's, the running uid another.
+    // The wrong owner: the file is the test's, the running uid another. The
+    // walk from `/` (crates/protected-file, task R11b) refuses the first
+    // directory of the test's account on the path before the file — the
+    // file's own owner check is covered by `check_facts`' unit test.
     let request = world.both_files(ALICE_PW, BOB_PW);
     let log: Log = Rc::default();
     let mut drop = recorder(&log);
@@ -926,7 +929,7 @@ fn password_files_are_refused_with_nothing_sent() {
         run(&request, &mut e).unwrap_err(),
         Refusal::PasswordFile {
             sam: "alice".to_owned(),
-            refusal: FileRefusal::WrongOwner
+            refusal: FileRefusal::Path(protected_file::PathBreak::DirectoryWrongOwner)
         }
     );
     assert!(log.borrow().is_empty(), "refused before the drop");

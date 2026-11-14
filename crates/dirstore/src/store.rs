@@ -83,6 +83,7 @@ use crate::{
 };
 use core::num::NonZeroU64;
 use dtyp::{Guid, GUID_PACKET_LEN};
+use redb::backends::FileBackend;
 use redb::{
     Database, ReadTransaction, ReadableDatabase, ReadableTable, ReadableTableMetadata,
     TableDefinition, WriteTransaction,
@@ -158,7 +159,35 @@ impl Store {
     /// as is a missing meta record in a database that holds other records.
     /// Spec: docs/32 §3 (D135); docs/10 D34 (format version).
     pub fn open(path: impl AsRef<Path>, key: IntegrityKey, schema: Schema) -> Result<Store> {
-        let db = Database::create(path)?;
+        Store::with_database(Database::create(path)?, key, schema)
+    }
+
+    /// Open (or create) the store in `file`, a regular file the caller has
+    /// already opened for reading and writing — no path is looked up again,
+    /// so the file redb works on is exactly the descriptor the caller
+    /// checked (dird: crates/protected-file `open_read_write`, docs/52 R11,
+    /// docs/questions/Q-481 item c, Q-530). Otherwise as [`Store::open`]: an
+    /// empty file becomes a new store; an existing one is authenticated by
+    /// its meta record first.
+    ///
+    /// Spec: docs/32 §3 (D135); docs/50 R50-2, §6.4; redb 4.5.0 docs.rs
+    /// `Database::builder` ("Convenience method for Builder::new"),
+    /// `Builder::create_with_backend` ("Open an existing or create a new
+    /// database with the given backend"), `backends::FileBackend::new`
+    /// ("Creates a new backend which stores data to the given file").
+    pub fn open_file(file: std::fs::File, key: IntegrityKey, schema: Schema) -> Result<Store> {
+        let backend = FileBackend::new(file)?;
+        Store::with_database(
+            Database::builder().create_with_backend(backend)?,
+            key,
+            schema,
+        )
+    }
+
+    /// Create the tables and the meta record in `db`, or authenticate the
+    /// existing meta record (both opens).
+    /// Spec: docs/32 §3 (D135); D136 (nothing of a failed open is kept).
+    fn with_database(db: Database, key: IntegrityKey, schema: Schema) -> Result<Store> {
         let txn = db.begin_write()?;
         match init_tables(&txn, &key) {
             Ok(()) => txn.commit()?,

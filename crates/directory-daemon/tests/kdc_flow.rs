@@ -208,8 +208,11 @@ fn the_full_kdc_flow_through_keyd_and_dird_equals_the_in_process_path() {
     if support::skip_as_root(uid) {
         return;
     }
-    // Two identical directories: dird's own file, and the baseline's.
-    let remote_path = dir.join("r.redb");
+    // Two identical directories: dird's own file — inside the workspace
+    // (crates/test-scratch), since dird reaches it through the
+    // protected-file walk from `/` (task R11b, Q-530) — and the baseline's.
+    let files = test_scratch::ScratchDir::new("dird-flow").unwrap();
+    let remote_path = files.join("r.redb");
     drop(support::Directory::standard(&remote_path));
     let local = support::Directory::standard(&dir.join("l.redb"));
     let handles = Handles::read(&local.store);

@@ -124,14 +124,20 @@ fn loopback_internal() -> ZoneTable {
     .unwrap()])
 }
 
-/// The real auditd (listener + writer) in `dir`, mapping `uid` to dird.
-pub fn start_auditd(dir: &TempDir, uid: u32) -> auditd_support::Server {
+/// The real auditd (listener + writer) with its socket in `dir` and its
+/// log in `logs` (a scratch directory the protected-file walk accepts:
+/// crates/audit-daemon `segments`, task R11b), mapping `uid` to dird.
+pub fn start_auditd(
+    dir: &TempDir,
+    logs: &auditd_support::TempDir,
+    uid: u32,
+) -> auditd_support::Server {
     let run_as = auditd_support::other_uid(&[uid]);
     let text = format!(
         "run_as_uid = {run_as}\nrun_as_gid = {run_as}\naudit_socket = {}\n\
          audit_log_path = {}\nuid_sources = {uid}:dird\nframe_timeout = 5s\n",
         dir.join("a.sock").display(),
-        dir.join("audit.log").display()
+        logs.base().display()
     );
     let settings = config::AuditdSettings::parse(text.as_bytes()).unwrap();
     auditd_support::Server::start(
@@ -227,6 +233,8 @@ pub struct World {
     pub client: Arc<ClientConfig>,
     pub uid: u32,
     pub dir: TempDir,
+    /// auditd's log directory (dropped last).
+    pub logs: auditd_support::TempDir,
 }
 
 /// The world, after `tweak` adjusted the front's parameters; `None` as
@@ -237,7 +245,8 @@ pub fn world(tweak: impl FnOnce(&mut FrontParams)) -> Option<World> {
     if dird_support::skip_as_root(uid) {
         return None;
     }
-    let auditd = start_auditd(&dir, uid);
+    let logs = auditd_support::TempDir::new();
+    let auditd = start_auditd(&dir, &logs, uid);
     let directory = Directory::standard(&dir.join("s.redb"));
     let mut params = dird_support::params(&dir, uid, uid, Duration::from_secs(5), 4);
     params.ldap_front_uid = uid;
@@ -274,6 +283,7 @@ pub fn world(tweak: impl FnOnce(&mut FrontParams)) -> Option<World> {
         client,
         uid,
         dir,
+        logs,
     })
 }
 

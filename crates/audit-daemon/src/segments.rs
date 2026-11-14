@@ -21,10 +21,30 @@
 //! a file at the base path itself, is refused rather than skipped. Other
 //! names in the directory are not the log's and are left alone.
 //!
+//! # Every segment through crates/protected-file (task R11b)
+//!
+//! The listing, every read, every append and every new segment go through
+//! crates/protected-file's walk from `/` with **auditd's own account** as
+//! the owner (docs/52 R11; docs/questions/Q-481 item b, Q-530): every
+//! directory on the path is entered without following a link and must be
+//! root's or auditd's and not writable by group or others; the directory is
+//! listed through its own checked descriptor
+//! (`protected_file::for_each_entry_beside`); a segment is opened relative
+//! to it without following a link — read-only for the walk at start
+//! (`protected_file::open`), for appending to the verified last segment
+//! (`open_append`), and created exclusively, mode 0600, for a new one
+//! (`create_new_append`). An existing segment must satisfy
+//! [`segment_rule`]: a regular file, auditd's, not writable by group or
+//! others. The reads and writes happen after the privilege drop, so the
+//! owner is auditd's uid (docs/50 §2.4: auditd "holds the audit file").
+//!
 //! Spec: docs/37 §2 (append-only, hash-chain); docs/50 §2.4, §6.4, §8.1;
-//! docs/questions/Q-250 items 6, 8; docs/questions/Q-265 item 2.
+//! docs/52 §3.13 (C13), §7 R11; docs/questions/Q-250 items 6, 8;
+//! docs/questions/Q-265 item 2; Q-468 (A-102); Q-481 (A-104); Q-530.
 
 use audit_log::{FileStorage, Storage};
+use protected_file::{FileFacts, OpenError, PathBreak, RuleBreak};
+use std::fs::File;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -54,6 +74,10 @@ pub fn segment_path(base: &Path, index: u64) -> PathBuf {
 pub enum ListingError {
     /// `audit_log_path` has no parent directory or no file name.
     BadBasePath,
+    /// A directory on the path to the log is a symbolic link or not a
+    /// directory, is owned by neither root nor auditd's account, or is
+    /// writable by group or others (crates/protected-file walk; task R11b).
+    Directory(PathBreak),
     /// The directory could not be read.
     Io(io::ErrorKind),
     /// A file named like a segment is not one: a file at the base path, a
@@ -69,39 +93,48 @@ pub enum ListingError {
 
 /// The segment numbers present for the log based at `base`, ascending and
 /// checked to be exactly `1 ..= n` (empty when there is no segment yet).
+/// The directory is reached through crates/protected-file's walk with
+/// `owner_uid` (auditd's account) as the files' owner and listed through
+/// its own checked descriptor; each entry's type is taken without following
+/// a link.
 ///
 /// # Errors
 /// [`ListingError`].
 ///
 /// Spec: this module's rules; docs/37 §2; docs/50 §7.5 ("auditd — opens the
-/// file, verifies the hash chain").
-pub fn list_segments(base: &Path) -> Result<Vec<u64>, ListingError> {
-    let directory = base.parent().ok_or(ListingError::BadBasePath)?;
+/// file, verifies the hash chain"); docs/52 R11; Q-530.
+pub fn list_segments(base: &Path, owner_uid: u32) -> Result<Vec<u64>, ListingError> {
     let file_name = base.file_name().ok_or(ListingError::BadBasePath)?;
-    let mut prefix = file_name.as_bytes().to_vec();
+    if base.parent().is_none() {
+        return Err(ListingError::BadBasePath);
+    }
+    let file_name = file_name.as_bytes();
+    let mut prefix = file_name.to_vec();
     prefix.push(b'.');
 
-    let entries = std::fs::read_dir(directory).map_err(|e| ListingError::Io(e.kind()))?;
     let mut indexes = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|e| ListingError::Io(e.kind()))?;
-        let name = entry.file_name();
-        let name = name.as_bytes();
-        if name == file_name.as_bytes() {
+    protected_file::for_each_entry_beside(base, owner_uid, |name, facts| {
+        if name == file_name {
             return Err(ListingError::UnexpectedFile);
         }
         let Some(suffix) = name.strip_prefix(prefix.as_slice()) else {
-            continue;
+            return Ok(());
         };
         let index = parse_index(suffix).ok_or(ListingError::UnexpectedFile)?;
-        // `DirEntry::file_type` does not follow a symbolic link: a link named
-        // like a segment is refused, not followed.
-        let file_type = entry.file_type().map_err(|e| ListingError::Io(e.kind()))?;
-        if !file_type.is_file() {
+        // The facts are the entry's own: a link named like a segment is
+        // refused, not followed.
+        if !facts.regular_file {
             return Err(ListingError::UnexpectedFile);
         }
         indexes.push(index);
-    }
+        Ok(())
+    })
+    .map_err(|error| match error {
+        OpenError::Io(kind) => ListingError::Io(kind),
+        OpenError::Path(PathBreak::NoFileName) => ListingError::BadBasePath,
+        OpenError::Path(path) => ListingError::Directory(path),
+        OpenError::Refused(listing) => listing,
+    })?;
     indexes.sort_unstable();
     let mut expected = FIRST_SEGMENT;
     for &index in &indexes {
@@ -111,6 +144,22 @@ pub fn list_segments(base: &Path) -> Result<Vec<u64>, ListingError> {
         expected = expected.saturating_add(1);
     }
     Ok(indexes)
+}
+
+/// The rule every existing segment file must satisfy when it is opened —
+/// read at start or appended to: a regular file (a link's facts never
+/// are), owned by auditd's account, not writable by group or others (no
+/// other account can change the log). Read access for a group is not
+/// refused: the log holds no secret (docs/37 §2: "only identifiers and
+/// metadata"). New segments are created 0600 (`create_new_append`).
+///
+/// # Errors
+/// The [`RuleBreak`] of the first condition broken, in that order.
+///
+/// Spec: docs/50 §2.4, §6.4; docs/37 §2; crates/protected-file
+/// `configuration_file_rule` (the same three conditions); Q-530.
+pub fn segment_rule(facts: &FileFacts, owner_uid: u32) -> Result<(), RuleBreak> {
+    protected_file::configuration_file_rule(facts, owner_uid)
 }
 
 /// The segment number in a name suffix: exactly [`SEGMENT_DIGITS`] ASCII
@@ -144,20 +193,25 @@ pub trait SegmentFactory {
     fn create(&mut self, index: u64) -> io::Result<Self::Storage>;
 }
 
-/// Segment files next to `audit_log_path`.
+/// Segment files next to `audit_log_path`, owned by auditd's account and
+/// reached only through crates/protected-file (module documentation).
 ///
-/// Spec: this module's naming rule; crates/audit-log `FileStorage`
-/// (`create_new`: never reopens an existing file; mode 0600).
+/// Spec: this module's naming rule and its R11b section; crates/audit-log
+/// `FileStorage` (the caller opens the file); crates/protected-file
+/// `create_new_append` (never reopens an existing file; mode 0600),
+/// `open_append`, `open`.
 #[derive(Debug, Clone)]
 pub struct FileSegments {
     base: PathBuf,
+    owner_uid: u32,
 }
 
 impl FileSegments {
-    /// Segments of the log based at `base` (`audit_log_path`).
+    /// Segments of the log based at `base` (`audit_log_path`), owned by
+    /// `owner_uid` (auditd's account).
     #[must_use]
-    pub fn new(base: PathBuf) -> FileSegments {
-        FileSegments { base }
+    pub fn new(base: PathBuf, owner_uid: u32) -> FileSegments {
+        FileSegments { base, owner_uid }
     }
 
     /// The base path.
@@ -171,12 +225,71 @@ impl FileSegments {
     pub fn path(&self, index: u64) -> PathBuf {
         segment_path(&self.base, index)
     }
+
+    /// The owner of the segments and of the directories on their path
+    /// (besides root): auditd's account.
+    #[must_use]
+    pub fn owner_uid(&self) -> u32 {
+        self.owner_uid
+    }
+
+    /// Open existing segment `index` read-only, through the walk and under
+    /// [`segment_rule`].
+    ///
+    /// # Errors
+    /// crates/protected-file's [`OpenError`] with the [`RuleBreak`].
+    ///
+    /// Spec: module documentation; crates/protected-file `open`.
+    pub fn open_read(&self, index: u64) -> Result<File, OpenError<RuleBreak>> {
+        protected_file::open(&self.path(index), self.owner_uid, |facts| {
+            segment_rule(facts, self.owner_uid)
+        })
+    }
+
+    /// Open existing (verified) segment `index` for appending, through the
+    /// walk and under [`segment_rule`].
+    ///
+    /// # Errors
+    /// crates/protected-file's [`OpenError`] with the [`RuleBreak`].
+    ///
+    /// Spec: module documentation; docs/50 §6.4 ("append write access to the
+    /// audit file only"); crates/protected-file `open_append`.
+    pub fn open_append(&self, index: u64) -> Result<FileStorage, OpenError<RuleBreak>> {
+        protected_file::open_append(&self.path(index), self.owner_uid, |facts| {
+            segment_rule(facts, self.owner_uid)
+        })
+        .map(FileStorage::new)
+    }
+
+    /// Create segment `index`, which must not exist, for appending: through
+    /// the walk, exclusively, mode 0600, under [`segment_rule`].
+    ///
+    /// # Errors
+    /// crates/protected-file's [`OpenError`] with the [`RuleBreak`] (an
+    /// existing name is an [`OpenError::Io`]).
+    ///
+    /// Spec: module documentation; crates/protected-file
+    /// `create_new_append`.
+    pub fn create_segment(&self, index: u64) -> Result<FileStorage, OpenError<RuleBreak>> {
+        protected_file::create_new_append(&self.path(index), self.owner_uid, |facts| {
+            segment_rule(facts, self.owner_uid)
+        })
+        .map(FileStorage::new)
+    }
 }
 
 impl SegmentFactory for FileSegments {
     type Storage = FileStorage;
 
+    /// [`FileSegments::create_segment`]; a refusal of the walk or of the
+    /// rule is reported as `PermissionDenied` (the writer treats every
+    /// failed rotation alike: nothing is acknowledged).
     fn create(&mut self, index: u64) -> io::Result<FileStorage> {
-        FileStorage::create_new(&self.path(index))
+        self.create_segment(index).map_err(|error| match error {
+            OpenError::Io(kind) => io::Error::from(kind),
+            OpenError::Path(_) | OpenError::Refused(_) => {
+                io::Error::from(io::ErrorKind::PermissionDenied)
+            }
+        })
     }
 }

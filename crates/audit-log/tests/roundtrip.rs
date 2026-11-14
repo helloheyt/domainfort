@@ -191,14 +191,35 @@ fn resume_after_verify_continues_the_chain() {
     assert_eq!(again.records(), 11);
 }
 
+/// A new segment file opened the way auditd's is (append, exclusive,
+/// owner-read-write only) — test code; auditd itself goes through
+/// crates/protected-file `create_new_append` (Q-530), whose exclusivity and
+/// mode crates/protected-file's own tests check.
+fn create_segment(path: &std::path::Path) -> FileStorage {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .append(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .unwrap();
+    FileStorage::new(file)
+}
+
+/// An existing segment file opened for appending — test code (auditd:
+/// crates/protected-file `open_append`).
+fn append_segment(path: &std::path::Path) -> FileStorage {
+    FileStorage::new(std::fs::OpenOptions::new().append(true).open(path).unwrap())
+}
+
 /// docs/50 §6.4, §8.1: the file-backed storage writes a segment that
-/// verifies, refuses to overwrite an existing segment, and reopens in
-/// append mode for a resumed writer.
+/// verifies, and a file reopened in append mode continues it for a resumed
+/// writer.
 #[test]
 fn file_storage_round_trip() {
     let dir = temp_dir("file");
     let path = dir.join("segment-0001");
-    let storage = FileStorage::create_new(&path).unwrap();
+    let storage = create_segment(&path);
     let mut writer = LogWriter::create(storage, SegmentLimit::DEFAULT).unwrap();
     for n in 1..=20u64 {
         let data = payload(n);
@@ -217,9 +238,6 @@ fn file_storage_round_trip() {
     let head = writer.head();
     drop(writer);
 
-    // A second create of the same path is refused (never overwritten).
-    assert!(FileStorage::create_new(&path).is_err());
-
     let file = std::fs::File::open(&path).unwrap();
     let verified = verify_segment(
         std::io::BufReader::new(file),
@@ -230,12 +248,8 @@ fn file_storage_round_trip() {
     .unwrap();
     assert_eq!(verified.records(), 20);
 
-    let mut resumed = LogWriter::resume(
-        FileStorage::open_append(&path).unwrap(),
-        &verified,
-        SegmentLimit::DEFAULT,
-    )
-    .unwrap();
+    let mut resumed =
+        LogWriter::resume(append_segment(&path), &verified, SegmentLimit::DEFAULT).unwrap();
     let data = payload(21);
     let persisted = resumed
         .append(

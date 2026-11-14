@@ -67,7 +67,7 @@ use ipc_audit::WindowConfig;
 use ipc_directory_server::ViewLimits;
 use keyd_types::KeydConfig;
 use ldap::{Engine, EngineConfig, RootDseConfig};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -172,7 +172,10 @@ pub enum StoreSource {
     /// Open the redb file at `path` with `key`. The file must exist (dird
     /// never creates an empty directory in place of a missing one — a
     /// provisioning step creates it), be a regular file owned by
-    /// `owner_uid` (dird's account), and give no access to group or others.
+    /// `owner_uid` (dird's account), and give no access to group or others;
+    /// every directory on its path must be root's or dird's and not
+    /// writable by group or others (crates/protected-file walk, task
+    /// R11b).
     File {
         /// `database_path`.
         path: PathBuf,
@@ -211,6 +214,10 @@ pub enum DaemonError {
     /// The redb file is missing, not a regular file, not owned by dird's
     /// account, or open to group / others.
     StoreFile,
+    /// A directory on the redb file's path is a symbolic link or not a
+    /// directory, is owned by neither root nor dird's account, or is
+    /// writable by group or others (crates/protected-file walk; task R11b).
+    StorePath,
     /// The store refused to open (a wrong integrity key is `Tamper`).
     Store,
     /// The schema could not be built.
@@ -244,6 +251,9 @@ impl fmt::Display for DaemonError {
             DaemonError::Audit(error) => write!(f, "auditd not verified: {error}"),
             DaemonError::StoreFile => f.write_str(
                 "directory file must exist, be a regular file owned by dird's account, with no group or other access",
+            ),
+            DaemonError::StorePath => f.write_str(
+                "directory file's path must pass only through directories owned by root or dird's account, not writable by group or others, and no symbolic link",
             ),
             DaemonError::Store => f.write_str("directory store could not be opened"),
             DaemonError::Schema => f.write_str("phase-1 schema could not be built"),
@@ -348,17 +358,37 @@ impl Stopped {
     }
 }
 
-/// Open the redb file (dird's own, never created here).
-/// Spec: docs/50 R50-2, §6.4 ("access to the redb file only (owned by dird,
-/// 0600)"), §7.5 step 3 (`Store::open` with the IntegrityKey — wrong key ⇒
-/// `Error::Tamper`); Q-270 item 3.
-fn open_store(path: &Path, key: IntegrityKey, owner_uid: u32) -> Result<Store, DaemonError> {
-    let metadata = std::fs::symlink_metadata(path).map_err(|_| DaemonError::StoreFile)?;
-    if !metadata.is_file() || metadata.uid() != owner_uid || metadata.mode() & 0o077 != 0 {
+/// The rule on the redb file's facts: a regular file (a link's facts never
+/// are), owned by dird's account, no permission for group or others.
+/// Spec: docs/50 §6.4 ("access to the redb file only (owned by dird,
+/// 0600)"); Q-270 item 3.
+fn store_file_rule(facts: &protected_file::FileFacts, owner_uid: u32) -> Result<(), DaemonError> {
+    if !facts.regular_file || facts.owner_uid != owner_uid || facts.mode & 0o077 != 0 {
         return Err(DaemonError::StoreFile);
     }
+    Ok(())
+}
+
+/// Open the redb file (dird's own, never created here): walk its path from
+/// `/` with dird's account as the owner, inspect and open the file for
+/// reading and writing without following a link, apply
+/// [`store_file_rule`] before and after the open (crates/protected-file
+/// `open_read_write`), and hand redb **that descriptor** — no second lookup
+/// of the path (dirstore `Store::open_file`; docs/52 R11; docs/questions
+/// Q-481 item c, Q-530). Runs after the privilege drop, as dird.
+/// Spec: docs/50 R50-2, §6.4 ("access to the redb file only (owned by dird,
+/// 0600)"), §7.5 step 3 (`Store::open` with the IntegrityKey — wrong key ⇒
+/// `Error::Tamper`); Q-270 item 3; Q-468 (A-102); Q-481 (A-104).
+fn open_store(path: &Path, key: IntegrityKey, owner_uid: u32) -> Result<Store, DaemonError> {
+    let file =
+        protected_file::open_read_write(path, owner_uid, |facts| store_file_rule(facts, owner_uid))
+            .map_err(|error| match error {
+                protected_file::OpenError::Path(_) => DaemonError::StorePath,
+                protected_file::OpenError::Io(_) => DaemonError::StoreFile,
+                protected_file::OpenError::Refused(refusal) => refusal,
+            })?;
     let schema = ad_schema::phase1().map_err(|_| DaemonError::Schema)?;
-    Store::open(path, key, schema.schema().clone()).map_err(|_| DaemonError::Store)
+    Store::open_file(file, key, schema.schema().clone()).map_err(|_| DaemonError::Store)
 }
 
 /// Remove a stale socket file at `path`, if any; refuse to remove anything

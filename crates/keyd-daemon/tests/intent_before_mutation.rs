@@ -150,16 +150,22 @@ fn grant_socket(dir: &TempDir) -> PathBuf {
 }
 
 /// The real auditd (listener + writer) in `dir` at `a.sock`, writing the log
-/// based at `log`, mapping `uid` to keyd. With `acknowledging == false` the
+/// based at `log` (in a scratch directory the protected-file walk accepts:
+/// crates/audit-daemon `segments`, task R11b), mapping `uid` to keyd. With `acknowledging == false` the
 /// writer never runs: auditd answers `Ping` but never acknowledges an
 /// `Append` (an auditd that is reachable and stuck).
-fn start_auditd(dir: &TempDir, uid: u32, log: &str, acknowledging: bool) -> auditd_support::Server {
+fn start_auditd(
+    dir: &TempDir,
+    uid: u32,
+    log: &Path,
+    acknowledging: bool,
+) -> auditd_support::Server {
     let run_as = auditd_support::other_uid(&[uid]);
     let text = format!(
         "run_as_uid = {run_as}\nrun_as_gid = {run_as}\naudit_socket = {}\n\
          audit_log_path = {}\nuid_sources = {uid}:keyd\nframe_timeout = 5s\n",
         dir.join("a.sock").display(),
-        dir.join(log).display()
+        log.display()
     );
     let settings = config::AuditdSettings::parse(text.as_bytes()).unwrap();
     auditd_support::Server::start(
@@ -231,7 +237,7 @@ fn open_segment(base: &Path, index: u64) -> BufReader<File> {
 /// (`verify_log`, then every record re-read through `SegmentReader`), with
 /// the writer stopped.
 fn verified_log(base: &Path) -> Vec<Record> {
-    let indexes = list_segments(base).unwrap();
+    let indexes = list_segments(base, auditd_support::log_uid()).unwrap();
     assert!(!indexes.is_empty(), "no segment");
     let files: Vec<_> = indexes.iter().map(|&i| open_segment(base, i)).collect();
     let head = verify_log(files, Anchor::Genesis, SegmentLimit::DEFAULT, None).unwrap();
@@ -259,7 +265,7 @@ fn verified_log(base: &Path) -> Vec<Record> {
 /// writer may still be appending (for waiting only).
 fn persisted_records(base: &Path) -> Vec<Record> {
     let mut records = Vec::new();
-    let Ok(indexes) = list_segments(base) else {
+    let Ok(indexes) = list_segments(base, auditd_support::log_uid()) else {
         return records;
     };
     let mut anchor = Anchor::Genesis;
@@ -373,11 +379,12 @@ fn change_phases(
 #[test]
 fn every_admin_change_is_intent_then_outcome_in_the_verified_log() {
     let dir = TempDir::new();
+    let logs = auditd_support::TempDir::new();
     let uid = my_uid(&dir);
     if skip_as_root(uid) {
         return;
     }
-    let auditd = start_auditd(&dir, uid, "audit.log", true);
+    let auditd = start_auditd(&dir, uid, &logs.path().join("audit.log"), true);
     let keyd = start_keyd(&dir, uid, Role::Admin, generous());
     let socket = keyd.socket.clone();
     let (answer, created) = call_until_performed(&socket, &create_key(0xA1));
@@ -446,7 +453,7 @@ fn every_admin_change_is_intent_then_outcome_in_the_verified_log() {
     keyd.stop().unwrap();
     assert!(matches!(auditd.stop(), Some(Ok(()))));
 
-    let records = keyd_records(&verified_log(&dir.join("audit.log")), uid);
+    let records = keyd_records(&verified_log(&logs.path().join("audit.log")), uid);
     let mut expected = change_phases(Op::CreateKey, created, None, Out::Success, Some(1));
     expected.extend(change_phases(
         Op::RegisterDecision,
@@ -524,11 +531,12 @@ fn every_admin_change_is_intent_then_outcome_in_the_verified_log() {
 #[test]
 fn set_secret_is_intent_then_outcome_in_the_verified_log() {
     let dir = TempDir::new();
+    let logs = auditd_support::TempDir::new();
     let uid = my_uid(&dir);
     if skip_as_root(uid) {
         return;
     }
-    let auditd = start_auditd(&dir, uid, "audit.log", true);
+    let auditd = start_auditd(&dir, uid, &logs.path().join("audit.log"), true);
     let keyd = start_keyd(&dir, uid, Role::Directory, generous());
     let mut expected = Vec::new();
     for kvno in [1, 2] {
@@ -560,7 +568,7 @@ fn set_secret_is_intent_then_outcome_in_the_verified_log() {
     }
     keyd.stop().unwrap();
     assert!(matches!(auditd.stop(), Some(Ok(()))));
-    let records = keyd_records(&verified_log(&dir.join("audit.log")), uid);
+    let records = keyd_records(&verified_log(&logs.path().join("audit.log")), uid);
     assert_eq!(phases(&records), expected);
 }
 
@@ -577,11 +585,12 @@ fn set_secret_is_intent_then_outcome_in_the_verified_log() {
 /// last intent and keyd's outcome.
 fn unacknowledged_intent_changes_nothing(role: Role, call: &Call, op: KeydOperation) {
     let dir = TempDir::new();
+    let logs = auditd_support::TempDir::new();
     let uid = my_uid(&dir);
     if skip_as_root(uid) {
         return;
     }
-    let stuck = start_auditd(&dir, uid, "stuck.log", false);
+    let stuck = start_auditd(&dir, uid, &logs.path().join("stuck.log"), false);
     // A set_secret passes keyd's authorization step only with its grant
     // (task A15a) — already in keyd here, since this auditd acknowledges no
     // grant intent either.
@@ -598,7 +607,7 @@ fn unacknowledged_intent_changes_nothing(role: Role, call: &Call, op: KeydOperat
     assert!(started.elapsed() >= INTENT_ACK_BUDGET);
 
     let _ = stuck.stop();
-    let auditd = start_auditd(&dir, uid, "audit.log", true);
+    let auditd = start_auditd(&dir, uid, &logs.path().join("audit.log"), true);
     let (answer, unacknowledged) = call_until_performed(&keyd.socket, call);
     match answer {
         Ok(Answer::CreateKey(Ok(kvno)) | Answer::SetSecret(Ok(kvno))) => {
@@ -608,7 +617,7 @@ fn unacknowledged_intent_changes_nothing(role: Role, call: &Call, op: KeydOperat
     }
     keyd.stop().unwrap();
     assert!(matches!(auditd.stop(), Some(Ok(()))));
-    let records = keyd_records(&verified_log(&dir.join("audit.log")), uid);
+    let records = keyd_records(&verified_log(&logs.path().join("audit.log")), uid);
     let expected = change_phases(op, 1 + unacknowledged, None, Out::Success, Some(1));
     assert_eq!(phases(&records), expected);
 }
@@ -630,11 +639,12 @@ fn an_unacknowledged_set_secret_is_unavailable_and_sets_nothing() {
 #[test]
 fn the_daemons_budget_parameter_bounds_the_wait() {
     let dir = TempDir::new();
+    let logs = auditd_support::TempDir::new();
     let uid = my_uid(&dir);
     if skip_as_root(uid) {
         return;
     }
-    let stuck = start_auditd(&dir, uid, "stuck.log", false);
+    let stuck = start_auditd(&dir, uid, &logs.path().join("stuck.log"), false);
     let keyd = start_keyd(&dir, uid, Role::Admin, generous());
     let started = Instant::now();
     assert_eq!(
@@ -783,6 +793,7 @@ fn serve_once(
 #[test]
 fn auditd_gone_between_intent_and_outcome_keeps_the_true_result() {
     let dir = TempDir::new();
+    let logs = auditd_support::TempDir::new();
     let uid = my_uid(&dir);
     if skip_as_root(uid) {
         return;
@@ -805,8 +816,8 @@ fn auditd_gone_between_intent_and_outcome_keeps_the_true_result() {
     vanishing.join();
 
     // An auditd again: keyd reconnects and delivers the held outcome.
-    let auditd = start_auditd(&dir, uid, "audit.log", true);
-    let base = dir.join("audit.log");
+    let auditd = start_auditd(&dir, uid, &logs.path().join("audit.log"), true);
+    let base = logs.path().join("audit.log");
     assert!(eventually(Duration::from_secs(20), || {
         keyd_records(&persisted_records(&base), uid)
             .iter()
@@ -855,11 +866,12 @@ fn window_summaries(records: &[Record], uid: u32) -> Vec<(usize, WindowSummary)>
 #[test]
 fn a_lost_outcome_is_counted_in_a_window_summary_of_the_verified_log() {
     let dir = TempDir::new();
+    let logs = auditd_support::TempDir::new();
     let uid = my_uid(&dir);
     if skip_as_root(uid) {
         return;
     }
-    let auditd = start_auditd(&dir, uid, "audit.log", true);
+    let auditd = start_auditd(&dir, uid, &logs.path().join("audit.log"), true);
     let caller = CallerId {
         uid,
         role: Role::Admin,
@@ -883,7 +895,7 @@ fn a_lost_outcome_is_counted_in_a_window_summary_of_the_verified_log() {
     keyd.stop().unwrap();
     assert!(matches!(auditd.stop(), Some(Ok(()))));
 
-    let log = verified_log(&dir.join("audit.log"));
+    let log = verified_log(&logs.path().join("audit.log"));
     let records = keyd_records(&log, uid);
     let performed = 2 * unacknowledged;
     assert_eq!(records.len(), performed + 1 + MAX_RECORDS_PER_OPERATION);

@@ -27,8 +27,6 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
 
-const OWN_UID: u32 = 4242;
-
 fn make_job(
     first: u64,
     events: Vec<ipc_audit::EventBytes>,
@@ -179,7 +177,7 @@ fn binding_permits() {
 #[test]
 fn admin_events_persist_and_verify_at_restart() {
     let dir = TempDir::new();
-    let mut sink = open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID)
+    let mut sink = open_log(&dir.base(), SegmentLimit::DEFAULT, log_uid())
         .expect("created")
         .sink;
     let dir_admin = dir_admin_pair();
@@ -192,7 +190,7 @@ fn admin_events_persist_and_verify_at_restart() {
     drop(sink);
 
     // The next start verifies every segment (A-66) and resumes.
-    let reopened = open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID).expect("verifies");
+    let reopened = open_log(&dir.base(), SegmentLimit::DEFAULT, log_uid()).expect("verifies");
     assert_eq!(reopened.start, StartKind::Resumed);
     assert_eq!(reopened.sink.head(), persisted.head);
     drop(reopened);
@@ -232,14 +230,14 @@ fn segment_names_have_twenty_digits() {
 #[test]
 fn empty_directory_creates_segment_one_then_resumes() {
     let dir = TempDir::new();
-    let opened = open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID).expect("created");
+    let opened = open_log(&dir.base(), SegmentLimit::DEFAULT, log_uid()).expect("created");
     assert_eq!(opened.start, StartKind::Created);
     assert_eq!(opened.sink.head(), ChainHead::GENESIS);
     assert_eq!(opened.sink.segment(), 1);
     drop(opened);
     assert_eq!(segment_bytes(&dir.base(), 1).len() as u64, header_len());
 
-    let reopened = open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID).expect("resumed");
+    let reopened = open_log(&dir.base(), SegmentLimit::DEFAULT, log_uid()).expect("resumed");
     assert_eq!(reopened.start, StartKind::Resumed);
     assert_eq!(reopened.sink.segment(), 1);
 }
@@ -249,7 +247,7 @@ fn empty_directory_creates_segment_one_then_resumes() {
 #[test]
 fn appended_batch_persists_with_transport_identity() {
     let dir = TempDir::new();
-    let mut sink = open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID)
+    let mut sink = open_log(&dir.base(), SegmentLimit::DEFAULT, log_uid())
         .expect("created")
         .sink;
     let batch = events(3, 40, 1);
@@ -345,7 +343,7 @@ impl SegmentFactory for GateFactory {
 fn writer_acknowledges_only_after_sync() {
     let storage = GateStorage::new();
     let log = LogWriter::create(storage.clone(), SegmentLimit::DEFAULT).expect("header");
-    let sink = LogSink::new(log, 1, GateFactory, OWN_UID);
+    let sink = LogSink::new(log, 1, GateFactory, log_uid());
     let (submitter, inbox) = writer::queue(4);
     let thread = std::thread::spawn(move || writer::run(sink, inbox));
 
@@ -378,7 +376,7 @@ fn writer_acknowledges_only_after_sync() {
 fn failed_sync_answers_unavailable_and_stops_the_writer() {
     let storage = GateStorage::new();
     let log = LogWriter::create(storage.clone(), SegmentLimit::DEFAULT).expect("header");
-    let sink = LogSink::new(log, 1, GateFactory, OWN_UID);
+    let sink = LogSink::new(log, 1, GateFactory, log_uid());
     let (submitter, inbox) = writer::queue(4);
     let thread = std::thread::spawn(move || writer::run(sink, inbox));
 
@@ -407,7 +405,7 @@ fn failed_sync_answers_unavailable_and_stops_the_writer() {
 #[test]
 fn pending_refusals_are_written_at_a_clean_stop() {
     let dir = TempDir::new();
-    let sink = open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID)
+    let sink = open_log(&dir.base(), SegmentLimit::DEFAULT, log_uid())
         .expect("created")
         .sink;
     let (submitter, inbox) = writer::queue(4);
@@ -419,7 +417,7 @@ fn pending_refusals_are_written_at_a_clean_stop() {
     // No submitter is left: the writer stops at once — a clean stop.
     assert_eq!(writer::run(sink, inbox), Ok(()));
 
-    let reopened = open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID).expect("verifies");
+    let reopened = open_log(&dir.base(), SegmentLimit::DEFAULT, log_uid()).expect("verifies");
     assert_eq!(reopened.start, StartKind::Resumed);
     let resumed_head = reopened.sink.head();
     drop(reopened);
@@ -428,7 +426,7 @@ fn pending_refusals_are_written_at_a_clean_stop() {
     assert_eq!(records.len(), 2);
     for (i, record) in records.iter().enumerate() {
         assert_eq!(record.source, Source::Auditd);
-        assert_eq!(record.source_uid, OWN_UID);
+        assert_eq!(record.source_uid, log_uid());
         assert_eq!(record.source_seq, i as u64 + 1);
     }
     assert_eq!(records[0].payload, expected_refused(2, 1, 503));
@@ -445,7 +443,7 @@ fn pending_refusals_are_written_at_a_clean_stop() {
 #[test]
 fn a_refusal_inside_the_summary_interval_is_written_at_the_stop() {
     let dir = TempDir::new();
-    let sink = open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID)
+    let sink = open_log(&dir.base(), SegmentLimit::DEFAULT, log_uid())
         .expect("created")
         .sink;
     let (submitter, inbox) = writer::queue(4);
@@ -475,7 +473,7 @@ fn a_refusal_inside_the_summary_interval_is_written_at_the_stop() {
     drop(submitter);
     assert_eq!(thread.join().unwrap(), Ok(()));
 
-    let reopened = open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID).expect("verifies");
+    let reopened = open_log(&dir.base(), SegmentLimit::DEFAULT, log_uid()).expect("verifies");
     assert_eq!(reopened.start, StartKind::Resumed);
     drop(reopened);
     let (records, _) = read_segment(&dir.base(), 1, Anchor::Genesis);
@@ -494,14 +492,14 @@ fn a_refusal_inside_the_summary_interval_is_written_at_the_stop() {
     );
 
     // A clean stop with nothing pending writes nothing.
-    let sink = open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID)
+    let sink = open_log(&dir.base(), SegmentLimit::DEFAULT, log_uid())
         .expect("verifies")
         .sink;
     let before = sink.head();
     let (submitter, inbox) = writer::queue(4);
     drop(submitter);
     assert_eq!(writer::run(sink, inbox), Ok(()));
-    let reopened = open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID).expect("verifies");
+    let reopened = open_log(&dir.base(), SegmentLimit::DEFAULT, log_uid()).expect("verifies");
     assert_eq!(reopened.sink.head(), before);
 }
 
@@ -513,7 +511,7 @@ fn a_refusal_inside_the_summary_interval_is_written_at_the_stop() {
 fn a_failed_writer_writes_no_last_summary() {
     let storage = GateStorage::new();
     let log = LogWriter::create(storage.clone(), SegmentLimit::DEFAULT).expect("header");
-    let sink = LogSink::new(log, 1, GateFactory, OWN_UID);
+    let sink = LogSink::new(log, 1, GateFactory, log_uid());
     let (submitter, inbox) = writer::queue(4);
     submitter.refusals().count_unmapped(701);
     storage.set(|s| {
@@ -541,7 +539,9 @@ fn a_failed_writer_writes_no_last_summary() {
 fn segment_full_rotates_and_the_chain_continues() {
     let dir = TempDir::new();
     let limit = SegmentLimit::new(SegmentLimit::MIN).expect("limit");
-    let sink = open_log(&dir.base(), limit, OWN_UID).expect("created").sink;
+    let sink = open_log(&dir.base(), limit, log_uid())
+        .expect("created")
+        .sink;
     let (submitter, inbox) = writer::queue(4);
     let thread = std::thread::spawn(move || writer::run(sink, inbox));
 
@@ -559,7 +559,7 @@ fn segment_full_rotates_and_the_chain_continues() {
     assert_eq!(thread.join().unwrap(), Ok(()));
     assert_eq!(last.seq, 80);
 
-    assert_eq!(list_segments(&dir.base()), Ok(vec![1, 2]));
+    assert_eq!(list_segments(&dir.base(), log_uid()), Ok(vec![1, 2]));
     let (first, first_head) = read_segment(&dir.base(), 1, Anchor::Genesis);
     assert_eq!(first.len(), 64);
     let (second, second_head) = read_segment(&dir.base(), 2, Anchor::After(first_head));
@@ -571,7 +571,7 @@ fn segment_full_rotates_and_the_chain_continues() {
         Ok(last)
     );
 
-    let reopened = open_log(&dir.base(), limit, OWN_UID).expect("resumed");
+    let reopened = open_log(&dir.base(), limit, log_uid()).expect("resumed");
     assert_eq!(reopened.start, StartKind::Resumed);
     assert_eq!(reopened.sink.segment(), 2);
     assert_eq!(reopened.sink.head(), last);
@@ -599,7 +599,7 @@ fn torn_record_starts_a_new_segment_at_last_good() {
     let last_good = built.heads[2];
     let break_offset = full - record_len(50) as u64;
 
-    let opened = open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID).expect("recovered");
+    let opened = open_log(&dir.base(), SegmentLimit::DEFAULT, log_uid()).expect("recovered");
     let expected = SegmentRecovered {
         segment: 1,
         torn: TornKind::RecordTruncated,
@@ -621,7 +621,7 @@ fn torn_record_starts_a_new_segment_at_last_good() {
     let (records, head) = read_segment(&dir.base(), 2, Anchor::After(last_good));
     assert_eq!(records.len(), 3);
     assert_eq!(records[0].source, Source::Auditd);
-    assert_eq!(records[0].source_uid, OWN_UID);
+    assert_eq!(records[0].source_uid, log_uid());
     assert_eq!(records[0].seq, last_good.seq + 1);
     assert_eq!(
         records[0].payload,
@@ -630,7 +630,7 @@ fn torn_record_starts_a_new_segment_at_last_good() {
     assert_eq!(head, after.head);
 
     // A restart verifies the whole log end to end and resumes.
-    let reopened = open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID).expect("verified");
+    let reopened = open_log(&dir.base(), SegmentLimit::DEFAULT, log_uid()).expect("verified");
     assert_eq!(reopened.start, StartKind::Resumed);
     assert_eq!(reopened.sink.head(), after.head);
 }
@@ -645,7 +645,7 @@ fn torn_header_after_rotation_is_recovered() {
     std::fs::write(segment_path(&dir.base(), 2), [b'A', b'U', b'D']).unwrap();
     let head = built.heads[2];
 
-    let opened = open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID).expect("recovered");
+    let opened = open_log(&dir.base(), SegmentLimit::DEFAULT, log_uid()).expect("recovered");
     let expected = SegmentRecovered {
         segment: 2,
         torn: TornKind::HeaderTruncated,
@@ -660,7 +660,7 @@ fn torn_header_after_rotation_is_recovered() {
     let (records, _) = read_segment(&dir.base(), 3, Anchor::After(head));
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].payload, expected_recovered(2, 0x01, head, 0, 3));
-    let again = open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID).expect("verified");
+    let again = open_log(&dir.base(), SegmentLimit::DEFAULT, log_uid()).expect("verified");
     assert_eq!(again.start, StartKind::Resumed);
 }
 
@@ -679,17 +679,17 @@ fn interrupted_recovery_is_completed() {
         .unwrap();
     let last_good = built.heads[0];
     // The recovery segment's header is on disk, its record is not.
-    let storage = audit_log::FileStorage::create_new(&segment_path(&dir.base(), 2)).unwrap();
+    let storage = new_segment(&segment_path(&dir.base(), 2));
     drop(LogWriter::start_segment(storage, last_good, SegmentLimit::DEFAULT).unwrap());
 
-    let opened = open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID).expect("completed");
+    let opened = open_log(&dir.base(), SegmentLimit::DEFAULT, log_uid()).expect("completed");
     assert!(matches!(opened.start, StartKind::Recovered(r) if r.segment == 1));
     assert_eq!(opened.sink.segment(), 2);
     drop(opened);
     let (records, _) = read_segment(&dir.base(), 2, Anchor::After(last_good));
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].source, Source::Auditd);
-    let again = open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID).expect("verified");
+    let again = open_log(&dir.base(), SegmentLimit::DEFAULT, log_uid()).expect("verified");
     assert_eq!(again.start, StartKind::Resumed);
 }
 
@@ -703,7 +703,7 @@ fn flip(base: &std::path::Path, index: u64, offset: u64) {
 }
 
 fn refused(dir: &TempDir) -> StartupError {
-    let error = open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID).expect_err("refused");
+    let error = open_log(&dir.base(), SegmentLimit::DEFAULT, log_uid()).expect_err("refused");
     assert!(error.is_chain_break(), "{error:?} is a chain break");
     error
 }
@@ -796,7 +796,7 @@ fn stray_segment_names_refuse_start() {
     build_log(&dir.base(), &[1], 20);
     std::fs::write(dir.path().join("audit.logs"), b"x").unwrap();
     std::fs::write(dir.path().join("other.log.00000000000000000001"), b"x").unwrap();
-    let opened = open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID).expect("resumed");
+    let opened = open_log(&dir.base(), SegmentLimit::DEFAULT, log_uid()).expect("resumed");
     assert_eq!(opened.start, StartKind::Resumed);
 }
 
@@ -815,7 +815,7 @@ fn torn_segment_without_recovery_record_refuses_start() {
         .unwrap();
     // A forged next segment anchored at last_good whose first record is an
     // ordinary event, not the recovery record.
-    let storage = audit_log::FileStorage::create_new(&segment_path(&dir.base(), 2)).unwrap();
+    let storage = new_segment(&segment_path(&dir.base(), 2));
     let mut forged =
         LogWriter::start_segment(storage, built.heads[0], SegmentLimit::DEFAULT).unwrap();
     let entry = audit_log::Entry {
@@ -846,7 +846,7 @@ fn octets_added_to_a_recovered_segment_refuse_start() {
         .unwrap()
         .set_len(built.lengths[0] - 3)
         .unwrap();
-    drop(open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID).expect("recovered"));
+    drop(open_log(&dir.base(), SegmentLimit::DEFAULT, log_uid()).expect("recovered"));
     let mut torn = OpenOptions::new()
         .append(true)
         .open(segment_path(&dir.base(), 1))
@@ -886,7 +886,7 @@ fn zero_filled_tail_refuses_start() {
 #[test]
 fn first_segment_not_at_genesis_refuses_start() {
     let dir = TempDir::new();
-    let storage = audit_log::FileStorage::create_new(&segment_path(&dir.base(), 1)).unwrap();
+    let storage = new_segment(&segment_path(&dir.base(), 1));
     let anchor = ChainHead {
         seq: 5,
         hash: audit_log::RecordHash::from_bytes([7; 32]),

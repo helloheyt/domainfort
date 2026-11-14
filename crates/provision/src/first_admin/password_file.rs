@@ -5,11 +5,17 @@
 //! # The file rule
 //!
 //! Checked on the file **as the running uid (root), before the privilege
-//! drop** ([`open_password_file`]) — no octet of the content is read yet:
+//! drop** ([`open_password_file`]) — no octet of the content is read yet.
+//! The file is reached through crates/protected-file's walk (task R11b;
+//! docs/52 R11; docs/questions/Q-481 item a, Q-530), like every protected
+//! file:
 //!
-//! 1. the path is inspected first without following a link
-//!    (`symlink_metadata`): a symbolic link is refused, anything but a
-//!    regular file is refused (so a FIFO or a device is never opened);
+//! 0. every directory of the path, from `/`, is entered without following a
+//!    link and must be owned by root or by the running uid and not be
+//!    writable by group or others ([`FileRefusal::Path`] otherwise);
+//! 1. the file is inspected first without following a link: a symbolic
+//!    link is refused, anything but a regular file is refused (so a FIFO or
+//!    a device is never opened) — [`check_facts`] on those facts;
 //! 2. it is opened with O_NOFOLLOW (a link put there since step 1 fails the
 //!    open) and the **opened** file is checked again (`fstat`): a regular
 //!    file, owned by the running uid, permission bits exactly 0400 or 0600
@@ -32,17 +38,16 @@
 //! Spec: docs/51 §4.4 ("a regular file (not a symlink), owned by the
 //! running uid, mode 0400/0600, ≤ 1024 bytes, one line"; "the buffers are
 //! `Zeroizing`"); A-86 follow-up (O_NOFOLLOW in every reader); docs/21 D95;
-//! rustix docs.rs `fs::openat`, `fs::OFlags::NOFOLLOW` (through
-//! crate::fs, P-2); std `fs::symlink_metadata`, `fs::Metadata`,
-//! `os::unix::fs::MetadataExt` (`uid`, `mode`, `len`), `io::Read::read`
-//! (`Ok(0)`: end of file); docs/questions/Q-411.
+//! docs/52 §3.13 (C13), §7 R11; Q-468 (A-102); Q-481 item a (A-104);
+//! crates/protected-file `open`, `FileFacts`, `OpenError`, `PathBreak`; std
+//! `io::Read::read` (`Ok(0)`: end of file); docs/questions/Q-411, Q-530.
 
 use core::fmt;
 use std::fs::File;
 use std::io::{ErrorKind, Read};
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
+use protected_file::{FileFacts, OpenError, PathBreak};
 use zeroize::Zeroizing;
 
 use super::line::{password_text, EnteredPassword, LineError, LF, MAX_PASSWORD_OCTETS};
@@ -84,10 +89,18 @@ pub enum FileRefusal {
     ControlCharacter,
     /// The line is not UTF-8.
     NotUtf8,
+    /// The path does not end in a file name, or a directory on it is a
+    /// symbolic link or not a directory, is owned by neither root nor the
+    /// running uid, or is writable by group or others (crates/protected-file
+    /// walk; task R11b).
+    Path(PathBreak),
 }
 
 impl fmt::Display for FileRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let FileRefusal::Path(path) = self {
+            return write!(f, "the password file's path {path}");
+        }
         f.write_str(match self {
             FileRefusal::Unreadable => "the password file cannot be inspected, opened or read",
             FileRefusal::Symlink => "the password file is a symbolic link",
@@ -105,48 +118,28 @@ impl fmt::Display for FileRefusal {
                 "the password file's line contains a control character"
             }
             FileRefusal::NotUtf8 => "the password file's line is not valid UTF-8 text",
+            FileRefusal::Path(_) => "the password file's path is refused",
         })
     }
 }
 
 impl std::error::Error for FileRefusal {}
 
-/// The facts of the file rule, as read from a file's metadata.
-/// Spec: module documentation, step 2.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PasswordFileFacts {
-    /// A regular file.
-    pub regular_file: bool,
-    /// The owner uid.
-    pub owner_uid: u32,
-    /// The mode bits.
-    pub mode: u32,
-    /// The size in octets.
-    pub size: u64,
-}
-
-impl PasswordFileFacts {
-    /// The facts of `metadata`.
-    #[must_use]
-    pub fn of(metadata: &std::fs::Metadata) -> PasswordFileFacts {
-        PasswordFileFacts {
-            regular_file: metadata.is_file(),
-            owner_uid: metadata.uid(),
-            mode: metadata.mode(),
-            size: metadata.len(),
-        }
-    }
-}
-
-/// The file rule on metadata: regular, owned by `running_uid`, permission
-/// bits exactly 0400 or 0600, 1 ..= [`MAX_PASSWORD_FILE_OCTETS`] octets —
-/// checked in that order.
+/// The file rule on a file's facts (crates/protected-file `FileFacts`, as
+/// the walk inspects the file without following a link, and again as the
+/// opened descriptor shows it): not a symbolic link, regular, owned by
+/// `running_uid`, permission bits exactly 0400 or 0600, 1 ..=
+/// [`MAX_PASSWORD_FILE_OCTETS`] octets — checked in that order.
 ///
 /// # Errors
 /// [`FileRefusal`].
 ///
-/// Spec: docs/51 §4.4.
-pub fn check_facts(facts: &PasswordFileFacts, running_uid: u32) -> Result<(), FileRefusal> {
+/// Spec: docs/51 §4.4 ("a regular file (not a symlink), owned by the
+/// running uid, mode 0400/0600, ≤ 1024 bytes").
+pub fn check_facts(facts: &FileFacts, running_uid: u32) -> Result<(), FileRefusal> {
+    if facts.symbolic_link {
+        return Err(FileRefusal::Symlink);
+    }
     if !facts.regular_file {
         return Err(FileRefusal::NotRegular);
     }
@@ -173,25 +166,27 @@ pub struct OpenedPasswordFile {
     file: File,
 }
 
-/// Inspect, open and check the password file at `path` as `running_uid`
-/// (module documentation, steps 1-2). Nothing of the content is read.
+/// Walk to, inspect, open and check the password file at `path` as
+/// `running_uid` (module documentation, steps 0-2) — crates/protected-file
+/// `open` with [`check_facts`] as the file rule and `running_uid` as the
+/// file's owner for the directory rule. Nothing of the content is read.
 ///
 /// # Errors
-/// [`FileRefusal`].
+/// [`FileRefusal`]: the rule's refusal; [`FileRefusal::Path`] for the
+/// path's shape or a directory on it; [`FileRefusal::Unreadable`] for any
+/// system error.
 ///
-/// Spec: docs/51 §4.4; A-86 (O_NOFOLLOW).
+/// Spec: docs/51 §4.4; A-86 (O_NOFOLLOW); docs/52 §7 R11; Q-481 item a.
 pub fn open_password_file(
     path: &Path,
     running_uid: u32,
 ) -> Result<OpenedPasswordFile, FileRefusal> {
-    let link = std::fs::symlink_metadata(path).map_err(|_| FileRefusal::Unreadable)?;
-    if link.file_type().is_symlink() {
-        return Err(FileRefusal::Symlink);
-    }
-    check_facts(&PasswordFileFacts::of(&link), running_uid)?;
-    let file = crate::fs::open_no_follow(path).map_err(|_| FileRefusal::Unreadable)?;
-    let opened = file.metadata().map_err(|_| FileRefusal::Unreadable)?;
-    check_facts(&PasswordFileFacts::of(&opened), running_uid)?;
+    let file = protected_file::open(path, running_uid, |facts| check_facts(facts, running_uid))
+        .map_err(|error| match error {
+            OpenError::Io(_) => FileRefusal::Unreadable,
+            OpenError::Path(path) => FileRefusal::Path(path),
+            OpenError::Refused(refusal) => refusal,
+        })?;
     Ok(OpenedPasswordFile { file })
 }
 
@@ -248,16 +243,18 @@ pub fn parse_password_file(content: &[u8]) -> Result<EnteredPassword, FileRefusa
 mod tests {
     use super::*;
 
-    fn facts(mode: u32, size: u64) -> PasswordFileFacts {
-        PasswordFileFacts {
+    fn facts(mode: u32, size: u64) -> FileFacts {
+        FileFacts {
             regular_file: true,
+            symbolic_link: false,
             owner_uid: 0,
             mode: 0o100_000 | mode,
             size,
         }
     }
 
-    /// docs/51 §4.4: owner, mode 0400/0600 exactly, size bounds.
+    /// docs/51 §4.4: not a symlink, regular, owner, mode 0400/0600 exactly,
+    /// size bounds.
     #[test]
     fn the_metadata_rule() {
         assert_eq!(check_facts(&facts(0o600, 20), 0), Ok(()));
@@ -284,6 +281,16 @@ mod tests {
         let mut dir = facts(0o600, 20);
         dir.regular_file = false;
         assert_eq!(check_facts(&dir, 0), Err(FileRefusal::NotRegular));
+        // A link's facts (never a regular file's): reported as a link,
+        // before anything else.
+        let link = FileFacts {
+            regular_file: false,
+            symbolic_link: true,
+            owner_uid: 1000,
+            mode: 0o120_777,
+            size: 3,
+        };
+        assert_eq!(check_facts(&link, 0), Err(FileRefusal::Symlink));
     }
 
     /// docs/51 §4.4 ("one line"); Q-411 item 3. Test data constructed by

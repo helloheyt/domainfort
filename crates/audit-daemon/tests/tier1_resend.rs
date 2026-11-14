@@ -23,7 +23,6 @@ use common::*;
 use ipc_audit::{EventBytes, EventShape};
 use tokio::sync::oneshot;
 
-const OWN_UID: u32 = 4242;
 /// The kdc's uid in these tests (made up).
 const KDC_UID: u32 = 803;
 /// Payload length of every test event.
@@ -62,7 +61,7 @@ fn next_batch(first: u64, events: Vec<EventBytes>) -> AppendJob {
 }
 
 fn open(dir: &TempDir) -> LogSink<FileSegments> {
-    open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID)
+    open_log(&dir.base(), SegmentLimit::DEFAULT, log_uid())
         .expect("the log verifies")
         .sink
 }
@@ -72,7 +71,7 @@ fn open(dir: &TempDir) -> LogSink<FileSegments> {
 fn log_records(dir: &TempDir) -> Vec<Record> {
     let mut records = Vec::new();
     let mut anchor = Anchor::Genesis;
-    for index in list_segments(&dir.base()).expect("segments") {
+    for index in list_segments(&dir.base(), log_uid()).expect("segments") {
         let (mut segment, head) = read_segment(&dir.base(), index, anchor);
         records.append(&mut segment);
         anchor = Anchor::After(head);
@@ -154,7 +153,7 @@ fn production_gives_every_source_one_numbering() {
 #[test]
 fn the_state_holds_sender_sources_only() {
     let mut tails = PersistedTails::new();
-    tails.observe(Source::Auditd, OWN_UID, 1, b"own", None);
+    tails.observe(Source::Auditd, log_uid(), 1, b"own", None);
     assert!(tails.tail(Source::Auditd).is_none());
     let batch = events(2, LEN, 1);
     assert_eq!(
@@ -192,7 +191,7 @@ fn a_resend_after_auditd_restarts_is_acknowledged_once() {
     // auditd stops after the sync, before the Ack leaves.
     drop(sink);
 
-    let reopened = open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID).expect("verifies");
+    let reopened = open_log(&dir.base(), SegmentLimit::DEFAULT, log_uid()).expect("verifies");
     assert_eq!(reopened.start, StartKind::Resumed);
     let tail = reopened.sink.tails().tail(Source::Kdc).expect("recovered");
     assert_eq!((tail.uid(), tail.last_seq()), (KDC_UID, 7));
@@ -214,7 +213,7 @@ fn a_resend_after_auditd_restarts_is_acknowledged_once() {
     expected.extend(numbered(5, &lost));
     expected.extend(numbered(8, &after));
     assert_eq!(kdc_events(&records), expected, "one copy of every event");
-    let again = open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID).expect("verifies");
+    let again = open_log(&dir.base(), SegmentLimit::DEFAULT, log_uid()).expect("verifies");
     assert_eq!(again.start, StartKind::Resumed);
 }
 
@@ -308,7 +307,7 @@ fn a_torn_batch_is_completed_by_its_resend() {
         .and_then(|file| file.set_len(cut))
         .expect("cut");
 
-    let reopened = open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID).expect("recovered");
+    let reopened = open_log(&dir.base(), SegmentLimit::DEFAULT, log_uid()).expect("recovered");
     let StartKind::Recovered(recovered) = reopened.start else {
         panic!("expected a recovery, got {:?}", reopened.start);
     };
@@ -321,7 +320,7 @@ fn a_torn_batch_is_completed_by_its_resend() {
     assert_eq!(head.seq, 10);
     drop(sink);
 
-    let again = open_log(&dir.base(), SegmentLimit::DEFAULT, OWN_UID).expect("verifies");
+    let again = open_log(&dir.base(), SegmentLimit::DEFAULT, log_uid()).expect("verifies");
     assert_eq!(again.start, StartKind::Resumed);
     drop(again);
     let (second, _) = read_segment(&dir.base(), 2, Anchor::After(recovered.last_good));

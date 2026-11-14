@@ -1,8 +1,13 @@
 #![forbid(unsafe_code)]
-//! `protected-file`: the one reader of the protected files a daemon or a tool
-//! reads (as root, before any privilege drop) to decide what it does —
-//! configuration files, the provisioning manifest, the development policy,
-//! and the key and certificate files a configuration points to.
+//! `protected-file`: the one way a daemon or a tool reaches the files it
+//! reads or writes with its own privileges — the protected files it reads
+//! (as root, before any privilege drop) to decide what it does
+//! (configuration files, the provisioning manifest, the development policy,
+//! the key and certificate files a configuration points to, provision's
+//! password files) and the data files a daemon keeps after the drop
+//! (auditd's log segments, dird's directory store; [`open_append`],
+//! [`open_read_write`], [`create_new_append`], [`for_each_entry_beside`],
+//! task R11b).
 //!
 //! # The walk
 //!
@@ -57,14 +62,28 @@
 //! is reached is shared. The directory rule is the same for every reader;
 //! only the file's owner, which it admits besides root, is the caller's.
 //!
+//! # Writing, and the entries of a directory (task R11b)
+//!
+//! The same walk serves the opens that are not read-only (`src/write.rs`):
+//! [`open_append`] and [`open_read_write`] open an existing file for
+//! appending or for reading and writing, in the file's three steps above
+//! (only the access mode differs); [`create_new_append`] creates a file that
+//! must not exist yet (`O_CREAT | O_EXCL | O_NOFOLLOW`, mode 0600 set
+//! exactly) relative to the last directory and applies the caller's rule to
+//! the created descriptor. [`for_each_entry_beside`] lists the directory a
+//! file path lies in — the walked, checked directory, read through its own
+//! descriptor — and gives each entry's facts without following a link. No
+//! entry point takes a directory descriptor or a path from outside the walk,
+//! so every open of a protected or data file passes the walk
+//! (docs/questions/Q-481 items a-c; Q-530).
+//!
 //! # Residuals
 //!
 //! * The walk opens each directory with `O_RDONLY`, so a reader that is not
 //!   root needs read permission (not only search permission) on every
 //!   directory of the path (docs/questions/Q-482).
-//! * The privileged opens Q-442 item 8 lists outside this crate (audit-daemon's
-//!   log segments, dird's redb store, provision's password files) do not go
-//!   through it yet (docs/questions/Q-481).
+//! * `/dev/urandom` is a device, not a protected file, and is opened by
+//!   path outside this crate (docs/questions/Q-481 item d; Q-530).
 //! * A non-regular file swapped in between the file's inspection and its open
 //!   makes the open itself block on a FIFO (Q-442 item 7); the `fstat` check
 //!   refuses anything else.
@@ -99,11 +118,25 @@
 //! (`st_mode`, `st_uid`), `fs::FileType::from_raw_mode` / `is_file` /
 //! `is_dir`, `fs::RawMode`, `fs::Mode::empty`, `fs::CWD` (`AT_FDCWD`),
 //! `path::Arg` (implemented for `&[u8]`), `io::Errno::kind` — API
-//! documentation only, never its source (P-2). No other implementation
+//! documentation only, never its source (P-2); for task R11b also
+//! `fs::OFlags` (`WRONLY`, `RDWR` — "not equal to `RDONLY | WRONLY`",
+//! `APPEND`, `CREATE`, `EXCL`), `fs::fchmod` ("Sets open file or directory
+//! permissions"), `fs::Mode` (`RUSR`, `WUSR`), `fs::FileType::is_symlink`,
+//! `fs::Stat::st_size`, `fs::Dir::read_from` ("Borrow `fd` and construct a
+//! `Dir` that reads entries from the given directory file descriptor"),
+//! `fs::Dir::read` ("`None` means the end of the directory"),
+//! `fs::DirEntry::file_name` and the crate's feature list (`std` enables
+//! `alloc`, which `Dir` needs) — no feature added. No other implementation
 //! consulted or recalled (AGENTS.md §1-3).
 //!
-//! Spec: docs/50 §7.1, §7.2, R50-12; docs/51 §4.3 steps 7, 8; docs/52 §3.13
-//! (R11); A-86; A-96; A-99; A-102; Q-468.
+//! Spec: docs/50 §7.1, §7.2, R50-12, §6.4; docs/51 §4.3 steps 7, 8, §4.4;
+//! docs/52 §3.13 (R11); A-86; A-96; A-99; A-102; A-104; Q-468; Q-481.
+
+mod listing;
+mod write;
+
+pub use listing::for_each_entry_beside;
+pub use write::{create_new_append, open_append, open_read_write};
 
 use core::fmt;
 use std::borrow::Cow;
@@ -136,16 +169,24 @@ const SEPARATOR: u8 = b'/';
 
 /// What a file rule looks at: the facts of the file's name in its directory
 /// (step 2, before the open) or of the opened descriptor (after it).
-/// Spec: docs/50 §7.1.
+/// Spec: docs/50 §7.1; docs/51 §4.4 (a password file: "not a symlink",
+/// "≤ 1024 bytes" — both decided on these facts, before any octet is read;
+/// task R11b).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileFacts {
     /// The facts are a regular file's (a link's facts never are: the
     /// inspection does not follow it).
     pub regular_file: bool,
+    /// The facts are a symbolic link's (only the inspection before the open
+    /// can see one: the open itself does not follow a link).
+    pub symbolic_link: bool,
     /// The owner uid.
     pub owner_uid: u32,
     /// The whole `st_mode` (file type and permission bits).
     pub mode: u32,
+    /// The size in octets (`st_size`; a negative value, which no file
+    /// has, reads as the largest size, so a size rule refuses it).
+    pub size: u64,
 }
 
 /// The `st_mode` value as a `u32`. `RawMode` is `u32` on Linux and narrower
@@ -161,12 +202,16 @@ impl FileFacts {
     /// The facts of a `stat` result.
     /// Spec: rustix docs.rs `fs::FileType::from_raw_mode` ("from the
     /// `S_IFMT` bits of the `st_mode` field of a `Stat`"), `is_file`
-    /// ("Returns true if this is a regular file").
+    /// ("Returns true if this is a regular file"), `is_symlink` ("Returns
+    /// `true` if this `FileType` is a symlink"), `fs::Stat::st_size`.
     fn of(stat: &Stat) -> FileFacts {
+        let file_type = FileType::from_raw_mode(stat.st_mode);
         FileFacts {
-            regular_file: FileType::from_raw_mode(stat.st_mode).is_file(),
+            regular_file: file_type.is_file(),
+            symbolic_link: file_type.is_symlink(),
             owner_uid: stat.st_uid,
             mode: raw_mode_bits(stat.st_mode),
+            size: u64::try_from(stat.st_size).unwrap_or(u64::MAX),
         }
     }
 }
@@ -269,7 +314,7 @@ pub enum OpenError<E> {
 }
 
 /// The [`OpenError`] for a failed system call.
-fn system<E>(errno: rustix::io::Errno) -> OpenError<E> {
+pub(crate) fn system<E>(errno: rustix::io::Errno) -> OpenError<E> {
     OpenError::Io(errno.kind())
 }
 
@@ -294,18 +339,78 @@ pub fn open<E>(
     file_owner_uid: u32,
     rule: impl Fn(&FileFacts) -> Result<(), E>,
 ) -> Result<File, OpenError<E>> {
+    open_existing(path, file_owner_uid, Access::Read, rule)
+}
+
+/// How an existing file is opened once its path is walked: the access mode.
+/// Every mode adds `O_NOFOLLOW | O_CLOEXEC`.
+/// Spec: A-86 (O_NOFOLLOW in every reader); docs/50 §6.4 ("auditd: append
+/// write access to the audit file only"; "dird: access to the redb file
+/// only"); rustix docs.rs `fs::OFlags` (`RDONLY`, `WRONLY`, `APPEND`,
+/// `RDWR`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Access {
+    /// `O_RDONLY`: the protected files a daemon or a tool reads.
+    Read,
+    /// `O_WRONLY | O_APPEND`: every write lands at the end (auditd's log).
+    Append,
+    /// `O_RDWR`: a database file (dird's store).
+    ReadWrite,
+}
+
+impl Access {
+    /// The `openat` flags of this access mode.
+    /// Spec: rustix docs.rs `fs::OFlags` (`RDWR`: "not equal to
+    /// `RDONLY | WRONLY`. It's a distinct flag").
+    fn flags(self) -> OFlags {
+        let mode = match self {
+            Access::Read => OFlags::RDONLY,
+            Access::Append => OFlags::WRONLY | OFlags::APPEND,
+            Access::ReadWrite => OFlags::RDWR,
+        };
+        mode | OFlags::NOFOLLOW | OFlags::CLOEXEC
+    }
+}
+
+/// [`open`] with any [`Access`]: walk, inspect the file without following
+/// a link and apply `rule`, open it without following a link, apply `rule`
+/// to the opened descriptor.
+/// Spec: this module's documentation, steps 0-2.
+pub(crate) fn open_existing<E>(
+    path: &Path,
+    file_owner_uid: u32,
+    access: Access,
+    rule: impl Fn(&FileFacts) -> Result<(), E>,
+) -> Result<File, OpenError<E>> {
     let absolute = absolute(path).map_err(|error| OpenError::Io(error.kind()))?;
-    let (directories, name) = split(absolute.as_os_str().as_bytes()).map_err(OpenError::Path)?;
+    let (directory, name) = walk(absolute.as_os_str().as_bytes(), file_owner_uid)?;
+    let seen = rustix::fs::statat(&directory, name, AtFlags::SYMLINK_NOFOLLOW).map_err(system)?;
+    rule(&FileFacts::of(&seen)).map_err(OpenError::Refused)?;
+    let file = open_file_no_follow(&directory, name, access).map_err(system)?;
+    let opened = rustix::fs::fstat(&file).map_err(system)?;
+    rule(&FileFacts::of(&opened)).map_err(OpenError::Refused)?;
+    Ok(file)
+}
+
+/// Steps 0 and 1 of the walk for the octets of an absolute path: split off
+/// the file name, enter `/` and every directory component under the
+/// directory rule, and return the last directory's descriptor with the
+/// file name. Nothing about the file itself is looked at.
+///
+/// # Errors
+/// [`OpenError::Path`], [`OpenError::Io`].
+///
+/// Spec: Q-468 options 1, 2(b) (A-102).
+pub(crate) fn walk<E>(
+    absolute: &[u8],
+    file_owner_uid: u32,
+) -> Result<(OwnedFd, &[u8]), OpenError<E>> {
+    let (directories, name) = split(absolute).map_err(OpenError::Path)?;
     let mut directory = root(file_owner_uid)?;
     for component in components(directories) {
         directory = enter(&directory, component, file_owner_uid)?;
     }
-    let seen = rustix::fs::statat(&directory, name, AtFlags::SYMLINK_NOFOLLOW).map_err(system)?;
-    rule(&FileFacts::of(&seen)).map_err(OpenError::Refused)?;
-    let file = open_file_no_follow(&directory, name).map_err(system)?;
-    let opened = rustix::fs::fstat(&file).map_err(system)?;
-    rule(&FileFacts::of(&opened)).map_err(OpenError::Refused)?;
-    Ok(file)
+    Ok((directory, name))
 }
 
 /// The path, absolute: a relative path is joined to the system's absolute
@@ -313,7 +418,7 @@ pub fn open<E>(
 /// and checked like the rest.
 /// Spec: Q-468 option 1 (the walk starts at `/`); std `env::current_dir`,
 /// `Path::is_absolute`, `Path::join`.
-fn absolute(path: &Path) -> io::Result<Cow<'_, Path>> {
+pub(crate) fn absolute(path: &Path) -> io::Result<Cow<'_, Path>> {
     if path.is_absolute() {
         Ok(Cow::Borrowed(path))
     } else {
@@ -394,17 +499,17 @@ fn open_directory_no_follow(
     )
 }
 
-/// Open an existing file read-only, relative to `directory`, without
+/// Open an existing file with `access`, relative to `directory`, without
 /// following a link in `name`.
-/// Spec: rustix docs.rs `fs::openat` with `OFlags::RDONLY | NOFOLLOW |
-/// CLOEXEC` (the mode is only significant when creating a file); A-86.
-fn open_file_no_follow(directory: impl AsFd, name: &[u8]) -> Result<File, rustix::io::Errno> {
-    let fd = rustix::fs::openat(
-        directory,
-        name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?;
+/// Spec: rustix docs.rs `fs::openat` with [`Access::flags`] (`O_NOFOLLOW |
+/// O_CLOEXEC` always; the mode is only significant when creating a file);
+/// A-86.
+fn open_file_no_follow(
+    directory: impl AsFd,
+    name: &[u8],
+    access: Access,
+) -> Result<File, rustix::io::Errno> {
+    let fd = rustix::fs::openat(directory, name, access.flags(), Mode::empty())?;
     Ok(File::from(fd))
 }
 
@@ -598,16 +703,19 @@ mod tests {
     }
 
     // Source: rustix docs.rs `fs::OFlags::NOFOLLOW` (O_NOFOLLOW) — the
-    // file's open on its own: a link in the last component is not followed,
-    // even when it points to a readable regular file; the file itself opens.
+    // file's open on its own, in every access mode (read, append, read and
+    // write): a link in the last component is not followed, even when it
+    // points to a readable regular file; the file itself opens.
     #[test]
     fn the_file_open_does_not_follow_a_link() {
         let dir = Scratch::new("nofollow");
         std::fs::write(dir.0.join("target"), b"x\n").unwrap();
         std::os::unix::fs::symlink(dir.0.join("target"), dir.0.join("link")).unwrap();
         let fd = dir.descriptor();
-        assert!(open_file_no_follow(&fd, b"target").is_ok());
-        assert!(open_file_no_follow(&fd, b"link").is_err());
+        for access in [Access::Read, Access::Append, Access::ReadWrite] {
+            assert!(open_file_no_follow(&fd, b"target", access).is_ok());
+            assert!(open_file_no_follow(&fd, b"link", access).is_err());
+        }
     }
 
     // Source: Q-468 option 1 (`O_NOFOLLOW | O_DIRECTORY`) — a directory

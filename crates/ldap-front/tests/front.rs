@@ -486,7 +486,8 @@ fn the_start_up_checks() {
     let no_auditd = Front::start(params.clone(), tls_support::server_config_for(&pki));
     assert!(no_auditd.err().unwrap().contains("auditd"));
 
-    let _auditd = start_auditd(&dir, uid);
+    let logs = auditd_support::TempDir::new();
+    let _auditd = start_auditd(&dir, &logs, uid);
     let no_dird = Front::start(params.clone(), tls_support::server_config_for(&pki));
     assert!(no_dird.err().unwrap().contains("dird"));
 

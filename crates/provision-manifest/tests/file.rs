@@ -37,8 +37,10 @@ impl Scratch {
 fn facts(regular_file: bool, owner_uid: u32, mode: u32) -> FileFacts {
     FileFacts {
         regular_file,
+        symbolic_link: false,
         owner_uid,
         mode,
+        size: 0,
     }
 }
 

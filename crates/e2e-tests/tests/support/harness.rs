@@ -349,9 +349,10 @@ impl Drop for Front {
 }
 
 /// Where everything lives, inside the one temporary directory (0700) —
-/// except the integrity key and the policy, which the daemons read through
-/// crates/protected-file and so live in [`Harness::files`] (crates/
-/// test-scratch: a directory the walk from `/` accepts; Q-480). The socket
+/// except the files the daemons reach through crates/protected-file — the
+/// integrity key, the policy, dird's redb file and auditd's log (task
+/// R11b) — which live in [`Harness::files`] (crates/test-scratch: a
+/// directory the walk from `/` accepts; Q-480, Q-530). The socket
 /// names are the daemons' tier-2 supports' (crates/keyd-daemon `params`,
 /// crates/directory-daemon `params`), so every sender reaches the one
 /// `a.sock`.
@@ -370,8 +371,8 @@ pub struct Paths {
 /// The whole deployment of one test (module documentation).
 pub struct Harness {
     pub dir: TempDir,
-    /// The files read through crates/protected-file (the integrity key and
-    /// the policy files).
+    /// The files reached through crates/protected-file (the integrity key,
+    /// the policy files, dird's redb file, auditd's log).
     pub files: test_scratch::ScratchDir,
     pub uid: u32,
     pub paths: Paths,
@@ -405,11 +406,11 @@ impl Harness {
         let files = test_scratch::ScratchDir::new("e2e").expect("the scratch directory");
         let paths = Paths {
             audit_socket: dir.join("a.sock"),
-            audit_log: dir.join("audit.log"),
+            audit_log: files.join("audit.log"),
             keyd_socket: dir.join("k.sock"),
             dird_kdc_socket: dir.join("d.sock"),
             dird_ldap_socket: dir.join("l.sock"),
-            database: dir.join("r.redb"),
+            database: files.join("r.redb"),
             integrity_key: files.join("integrity.key"),
             policy: files.join("policy.store"),
         };
@@ -758,7 +759,7 @@ impl Drop for Harness {
 /// return its head and records. Its writer must be stopped (a running one
 /// may be in the middle of a batch).
 pub fn verified_log(base: &Path) -> Result<(ChainHead, Vec<Record>), String> {
-    let indexes = list_segments(base).map_err(|e| format!("{e:?}"))?;
+    let indexes = list_segments(base, auditd_support::log_uid()).map_err(|e| format!("{e:?}"))?;
     if indexes.is_empty() {
         return Err(String::from("no audit segment"));
     }

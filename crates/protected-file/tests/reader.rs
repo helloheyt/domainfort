@@ -204,6 +204,18 @@ fn a_caller_rule_sees_the_facts() {
     let seen = seen.into_inner();
     assert_eq!(seen.len(), 1);
     assert!(!seen[0].regular_file);
+    // ... and say so (task R11b: provision's password-file rule reports a
+    // link as a link, docs/51 §4.4 "not a symlink").
+    assert!(seen[0].symbolic_link);
+    // A regular file's facts, before and after the open, carry its size
+    // (docs/51 §4.4: "≤ 1024 bytes", decided before any octet is read).
+    let sizes = std::cell::RefCell::new(Vec::new());
+    open(&key, uid, |facts: &FileFacts| {
+        sizes.borrow_mut().push((facts.size, facts.symbolic_link));
+        Ok::<(), ()>(())
+    })
+    .unwrap();
+    assert_eq!(sizes.into_inner(), [(32, false), (32, false)]);
 }
 
 // docs/50 §7.1: the rule on its own facts (the order: regular, owner, mode).
@@ -212,8 +224,10 @@ fn the_configuration_rule_on_facts() {
     const REGULAR: u32 = 0o100_000;
     let facts = |regular_file, owner_uid, mode| FileFacts {
         regular_file,
+        symbolic_link: false,
         owner_uid,
         mode,
+        size: 0,
     };
     assert_eq!(
         configuration_file_rule(&facts(true, 0, REGULAR | 0o644), 0),

@@ -121,12 +121,9 @@ fn a_refusal_just_before_a_stop_is_written() {
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].source, Source::Auditd);
     assert_eq!(records[0].payload, expected_refused(1, 0, uid));
-    let reopened = audit_daemon::recovery::open_log(
-        &dir.base(),
-        audit_log::SegmentLimit::DEFAULT,
-        settings.run_as().uid(),
-    )
-    .expect("the log verifies at the next start");
+    let reopened =
+        audit_daemon::recovery::open_log(&dir.base(), audit_log::SegmentLimit::DEFAULT, log_uid())
+            .expect("the log verifies at the next start");
     assert_eq!(reopened.start, audit_daemon::recovery::StartKind::Resumed);
     assert_eq!(reopened.sink.head(), head);
 }
@@ -633,12 +630,9 @@ fn a_batch_resent_after_auditd_restarts_is_acknowledged_once() {
     assert_eq!(numbers, [1, 2, 3, 4, 5, 1, 2], "one copy of 4 and 5");
     assert_eq!(records[3].payload, events(2, 64, 2)[0].as_bytes());
     assert_eq!(records[5].payload, events(2, 64, 7)[0].as_bytes());
-    let reopened = audit_daemon::recovery::open_log(
-        &dir.base(),
-        audit_log::SegmentLimit::DEFAULT,
-        settings.run_as().uid(),
-    )
-    .expect("the log verifies at the next start");
+    let reopened =
+        audit_daemon::recovery::open_log(&dir.base(), audit_log::SegmentLimit::DEFAULT, log_uid())
+            .expect("the log verifies at the next start");
     assert_eq!(reopened.sink.head(), head);
 }
 

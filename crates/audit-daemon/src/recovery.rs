@@ -49,20 +49,31 @@
 //! `source_seq` and remembered events survive a restart (decision A-98,
 //! follow-up F8; docs/questions/Q-445).
 //!
+//! # The files (task R11b)
+//!
+//! Every segment is listed, read, appended to and created through
+//! crates/protected-file's walk from `/` with auditd's account (`own_uid`)
+//! as the owner (crate::segments; docs/52 R11; docs/questions/Q-481 item b,
+//! Q-530). A directory or a segment that breaks the walk's or the segment
+//! rule is an operational refusal ([`StartupError::SegmentPath`],
+//! [`StartupError::SegmentRule`]), not a chain break: nothing about the
+//! hash chain was observed.
+//!
 //! Spec: docs/50 R50-16 ("nothing binds until its dependencies are
 //! verified"), §7.5 ("auditd — opens the file, verifies the hash chain");
-//! docs/37 §2; docs/questions/Q-250 items 6, 8, 10 (A-64); Q-265 item 1.
+//! docs/37 §2; docs/questions/Q-250 items 6, 8, 10 (A-64); Q-265 item 1;
+//! docs/52 §7 R11; Q-530.
 
 use crate::own_event::{AuditdEvent, SegmentRecovered, TornKind};
 use crate::resend::PersistedTails;
-use crate::segments::{list_segments, FileSegments, ListingError, SegmentFactory, FIRST_SEGMENT};
+use crate::segments::{list_segments, FileSegments, ListingError, FIRST_SEGMENT};
 use crate::writer::{LogSink, PersistError};
 use audit_log::{
-    Anchor, AppendError, BreakKind, FileStorage, LogWriter, SegmentLimit, SegmentReader, Source,
+    Anchor, AppendError, BreakKind, LogWriter, SegmentLimit, SegmentReader, Source,
     VerifiedSegment, VerifyError,
 };
 use core::fmt;
-use std::fs::File;
+use protected_file::{OpenError, PathBreak, RuleBreak};
 use std::io::{self, BufReader, Read};
 use std::path::Path;
 
@@ -101,6 +112,13 @@ pub enum StartupError {
     Listing(ListingError),
     /// A segment could not be opened, read or created.
     Io(io::ErrorKind),
+    /// A directory on the path to a segment is a symbolic link or not a
+    /// directory, is owned by neither root nor auditd's account, or is
+    /// writable by group or others (crates/protected-file walk; task R11b).
+    SegmentPath(PathBreak),
+    /// An existing segment is not a regular file, not auditd's, or writable
+    /// by group or others (crate::segments `segment_rule`; task R11b).
+    SegmentRule(RuleBreak),
     /// A break that is not a recoverable torn tail.
     ChainBreak {
         /// The segment it is in.
@@ -148,6 +166,9 @@ impl fmt::Display for StartupError {
             StartupError::Listing(ListingError::Io(kind)) => {
                 write!(f, "audit log directory unreadable: {kind}")
             }
+            StartupError::Listing(ListingError::Directory(path)) => {
+                write!(f, "audit log directory refused: its path {path}")
+            }
             StartupError::Listing(ListingError::UnexpectedFile) => {
                 f.write_str("unexpected file among the audit log segments")
             }
@@ -155,6 +176,18 @@ impl fmt::Display for StartupError {
                 write!(f, "audit log segment {expected} is missing")
             }
             StartupError::Io(kind) => write!(f, "audit log segment I/O failure: {kind}"),
+            StartupError::SegmentPath(path) => {
+                write!(f, "audit log segment refused: its path {path}")
+            }
+            StartupError::SegmentRule(RuleBreak::NotRegularFile) => {
+                f.write_str("audit log segment refused: not a regular file")
+            }
+            StartupError::SegmentRule(RuleBreak::WrongOwner) => {
+                f.write_str("audit log segment refused: not owned by auditd's account")
+            }
+            StartupError::SegmentRule(RuleBreak::WritableByGroupOrOthers) => {
+                f.write_str("audit log segment refused: writable by group or others")
+            }
             StartupError::ChainBreak {
                 segment,
                 kind,
@@ -184,6 +217,17 @@ enum Walk {
     AwaitingRecoveryRecord(VerifiedSegment),
     /// Ends early: a torn write.
     Torn(VerifyError, TornKind),
+}
+
+/// The start-up refusal for a segment the walk or the segment rule refused,
+/// or the system's error kind.
+/// Spec: this module's documentation (task R11b); crate::segments.
+fn segment_error(error: OpenError<RuleBreak>) -> StartupError {
+    match error {
+        OpenError::Io(kind) => StartupError::Io(kind),
+        OpenError::Path(path) => StartupError::SegmentPath(path),
+        OpenError::Refused(rule) => StartupError::SegmentRule(rule),
+    }
 }
 
 fn io_error(error: &io::Error) -> StartupError {
@@ -278,7 +322,9 @@ fn walk_segment<R: Read>(
     }
 }
 
-/// Open and walk segment `index`; returns the walk and the file's length.
+/// Open segment `index` read-only (through the walk, under the segment
+/// rule: crate::segments) and walk it; returns the walk and the file's
+/// length.
 fn walk_file(
     files: &FileSegments,
     index: u64,
@@ -287,7 +333,7 @@ fn walk_file(
     pending: Option<&SegmentRecovered>,
     tails: &mut PersistedTails,
 ) -> Result<(Walk, u64), StartupError> {
-    let file = File::open(files.path(index)).map_err(|e| io_error(&e))?;
+    let file = files.open_read(index).map_err(segment_error)?;
     let octets = file.metadata().map_err(|e| io_error(&e))?.len();
     let walk = walk_segment(BufReader::new(file), index, anchor, limit, pending, tails)?;
     Ok((walk, octets))
@@ -295,7 +341,9 @@ fn walk_file(
 
 /// Verify the log based at `base` (`audit_log_path`) and return a sink at
 /// its head, recovering a torn last segment. `limit` bounds every segment,
-/// read and written; auditd's own records carry `own_uid`. The sink's
+/// read and written; `own_uid` is auditd's account: its own records carry
+/// it, and every segment and every directory on the log's path (besides
+/// root's) must be its (crate::segments, task R11b). The sink's
 /// resend check holds the per-source state the walk recovered from every
 /// verified record (crate::resend), so a batch persisted before a stop and
 /// resent after it is recognised.
@@ -320,10 +368,10 @@ fn open_walked(
     own_uid: u32,
     tails: &mut PersistedTails,
 ) -> Result<OpenedLog, StartupError> {
-    let mut files = FileSegments::new(base.to_path_buf());
-    let indexes = list_segments(base).map_err(StartupError::Listing)?;
+    let files = FileSegments::new(base.to_path_buf(), own_uid);
+    let indexes = list_segments(base, own_uid).map_err(StartupError::Listing)?;
     let Some((&last, earlier)) = indexes.split_last() else {
-        let storage = files.create(FIRST_SEGMENT).map_err(|e| io_error(&e))?;
+        let storage = files.create_segment(FIRST_SEGMENT).map_err(segment_error)?;
         let writer = LogWriter::create(storage, limit).map_err(StartupError::Append)?;
         let mut sink = LogSink::new(writer, FIRST_SEGMENT, files, own_uid);
         sink.sign_head();
@@ -365,7 +413,7 @@ fn open_walked(
     let (walk, octets) = walk_file(&files, last, anchor, limit, pending.as_ref(), tails)?;
     match walk {
         Walk::Complete(verified) => {
-            let storage = FileStorage::open_append(&files.path(last)).map_err(|e| io_error(&e))?;
+            let storage = files.open_append(last).map_err(segment_error)?;
             let writer =
                 LogWriter::resume(storage, &verified, limit).map_err(StartupError::Append)?;
             let mut sink = LogSink::new(writer, last, files, own_uid);
@@ -379,7 +427,7 @@ fn open_walked(
             let Some(expected) = pending else {
                 return Err(StartupError::RecoveryRecordMissing { segment: last });
             };
-            let storage = FileStorage::open_append(&files.path(last)).map_err(|e| io_error(&e))?;
+            let storage = files.open_append(last).map_err(segment_error)?;
             let writer =
                 LogWriter::resume(storage, &verified, limit).map_err(StartupError::Append)?;
             let mut sink = LogSink::new(writer, last, files, own_uid);
@@ -398,7 +446,7 @@ fn open_walked(
                 segment_octets: octets,
             };
             let next = last.checked_add(1).ok_or(StartupError::RecoveryWrite)?;
-            let storage = files.create(next).map_err(|e| io_error(&e))?;
+            let storage = files.create_segment(next).map_err(segment_error)?;
             let writer = LogWriter::start_segment(storage, error.last_good, limit)
                 .map_err(StartupError::Append)?;
             let mut sink = LogSink::new(writer, next, files, own_uid);

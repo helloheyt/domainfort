@@ -1,5 +1,10 @@
-# protected-file — the one reader of the files a daemon or a tool reads as
-# root to decide what it does (task F7; the A-86 / A-96 follow-up "open
+# protected-file — the one way a daemon or a tool reaches a file by path
+# (task R11b, docs/52 R11, A-104: also the data files a daemon keeps after
+# its privilege drop — auditd's log segments, dird's redb file — and
+# provision's password files; `src/write.rs`, `src/listing.rs`, pinned by
+# tests/single_open_path.rs). Originally the one reader of the files a
+# daemon or a tool reads as root to decide what it does (task F7; the
+# A-86 / A-96 follow-up "open
 # configuration / manifest / policy files without following symlinks, in
 # every reader"; task T, docs/52 R11 / A-102: "every path component, not
 # only the last"): configuration files (docs/50 §7.1: "file root:0644"), the
@@ -38,8 +43,12 @@
 # `fs::OFlags` (`RDONLY`, `NOFOLLOW`, `DIRECTORY`, `CLOEXEC`), `fs::lstat`,
 # `fs::fstat`, `fs::Stat`, `fs::FileType::from_raw_mode` / `is_file` /
 # `is_dir`, `fs::RawMode`, `fs::Mode`, `fs::CWD`, `path::Arg`,
-# `io::Errno::kind`) — API documentation only, never its source (P-2). No
-# other implementation consulted or recalled (AGENTS.md §1-3).
+# `io::Errno::kind`; task R11b: `fs::OFlags` `WRONLY` / `RDWR` / `APPEND` /
+# `CREATE` / `EXCL`, `fs::fchmod`, `fs::Mode` `RUSR` / `WUSR`,
+# `fs::FileType::is_symlink`, `fs::Stat::st_size`, `fs::Dir::read_from` /
+# `read`, `fs::DirEntry::file_name`, the crate's feature list) — API
+# documentation only, never its source (P-2). No other implementation
+# consulted or recalled (AGENTS.md §1-3).
 
 [package]
 name = "protected-file"
@@ -50,8 +59,9 @@ publish = false
 [dependencies]
 # rustix — owner decision P-12, already in the workspace lock (daemon-
 # sandbox, provision); not a new package. Features: `fs` (openat, statat,
-# fstat, AtFlags, OFlags, Mode, FileType) and `std` (`&Path` as a path
-# argument, `Errno::kind`). Default features off.
+# fstat, fchmod, AtFlags, OFlags, Mode, FileType, Dir) and `std` (`&Path` as
+# a path argument, `Errno::kind`; it enables `alloc`, which `Dir` needs —
+# docs.rs feature list). Default features off; none added by task R11b.
 rustix = { version = "1.1.6", default-features = false, features = ["std", "fs"] }
 
 [dev-dependencies]

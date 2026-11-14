@@ -24,24 +24,21 @@ use ipc_audit::{AuditReply, AuditRequest, EventBody, EventBytes, AUDIT_CHANNEL};
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-/// A unique, empty temporary directory, removed on drop. Short names keep
-/// socket paths under the Unix socket path limit.
-pub struct TempDir(pub PathBuf);
-
-static NEXT_DIR: AtomicU32 = AtomicU32::new(0);
+/// A unique, empty scratch directory inside the workspace, removed on drop
+/// (crates/test-scratch: the log's segments are reached through
+/// crates/protected-file's walk from `/`, which accepts its directories
+/// with the test account as auditd's account — task R11b, Q-480, Q-530).
+/// Short names keep socket paths under the Unix socket path limit.
+pub struct TempDir(pub PathBuf, #[allow(dead_code)] test_scratch::ScratchDir);
 
 impl TempDir {
     pub fn new() -> TempDir {
-        let n = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("adt-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        TempDir(dir)
+        let scratch = test_scratch::ScratchDir::new("adt").expect("create scratch dir");
+        TempDir(scratch.path().to_path_buf(), scratch)
     }
 
     pub fn path(&self) -> &Path {
@@ -59,12 +56,6 @@ impl TempDir {
     }
 }
 
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 /// The uid of this test process, from the peer credentials of a socket pair
 /// (tokio `UnixStream::peer_cred`: "effective credentials of the process
 /// which called `connect` or `pair`").
@@ -77,6 +68,29 @@ pub fn own_uid() -> u32 {
         let (one, _other) = tokio::net::UnixStream::pair().expect("pair");
         one.peer_cred().expect("peer_cred").uid()
     })
+}
+
+/// auditd's account in these tests: the test account itself, which owns
+/// the scratch directories and the segments (crate
+/// `audit_daemon::segments`: every segment and directory must be auditd's
+/// or root's). Computed once.
+pub fn log_uid() -> u32 {
+    static UID: OnceLock<u32> = OnceLock::new();
+    *UID.get_or_init(own_uid)
+}
+
+/// A new segment file opened the way auditd's are (append, exclusive,
+/// owner-read-write only) — test code building a log by hand; auditd itself
+/// goes through crates/protected-file `create_new_append`.
+pub fn new_segment(path: &Path) -> FileStorage {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .append(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .expect("create segment");
+    FileStorage::new(file)
 }
 
 /// A uid distinct from `others`, never 0 or all-ones.
@@ -163,7 +177,7 @@ pub fn build_log(base: &Path, per_segment: &[usize], payload_len: usize) -> Buil
     let payload: Vec<u8> = (0..payload_len).map(|i| i as u8).collect();
     let mut seq_in_source = 0u64;
     for (i, &count) in per_segment.iter().enumerate() {
-        let storage = FileStorage::create_new(&segment_path(base, i as u64 + 1)).expect("create");
+        let storage = new_segment(&segment_path(base, i as u64 + 1));
         match writer.as_mut() {
             None => writer = Some(LogWriter::create(storage, limit).expect("create log")),
             Some(w) => {
@@ -436,7 +450,10 @@ pub struct Server {
 impl Server {
     /// Start on `settings` (log opened at its `audit_log_path`, socket at
     /// its `audit_socket`). Without `run_writer` the queue is held but never
-    /// drained.
+    /// drained. auditd's account for its files and its own records is the
+    /// test account ([`log_uid`]), not `run_as` — which crates/config keeps
+    /// distinct from every mapped source uid, the test's own included —
+    /// since the log lives in the test account's scratch directory.
     pub fn start(
         settings: &AuditdSettings,
         config: ListenerConfig,
@@ -446,7 +463,7 @@ impl Server {
         let opened = open_log(
             settings.audit_log_path().as_path(),
             SegmentLimit::DEFAULT,
-            settings.run_as().uid(),
+            log_uid(),
         )
         .expect("log opens");
         let (submitter, inbox) = writer::queue(queue_capacity);

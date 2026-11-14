@@ -88,8 +88,10 @@ config = { path = "../config" }
 daemon-sandbox = { path = "../daemon-sandbox" }
 # The protected-file reader (task F7, A-86 follow-up): every file read as
 # root before the drop is inspected without following a link, opened with
-# O_NOFOLLOW and checked on the opened descriptor. rustix inside (owner
-# decision P-12), already in the lock — no new package.
+# O_NOFOLLOW and checked on the opened descriptor. Task R11b: the redb file
+# too, after the drop (`open_read_write`, its descriptor handed to dirstore
+# `Store::open_file`). rustix inside (owner decision P-12), already in the
+# lock — no new package.
 protected-file = { path = "../protected-file" }
 # The admin channel (task A8, docs/51 §7): codec, server-side decoding,
 # reply encoding.

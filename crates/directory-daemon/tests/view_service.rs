@@ -160,7 +160,10 @@ fn the_redb_file_must_be_dirds_own_and_the_key_the_stores() {
     if support::skip_as_root(uid) {
         return;
     }
-    let path = dir.join("s.redb");
+    // The store inside the workspace (crates/test-scratch): dird reaches it
+    // through the protected-file walk from `/` (task R11b, Q-530).
+    let files = test_scratch::ScratchDir::new("dird-store").unwrap();
+    let path = files.join("s.redb");
     drop(Directory::standard(&path));
     let _auditd = FakeAuditd::start(&dir.join("a.sock"));
     let start = |path: std::path::PathBuf, key: [u8; 32], owner_uid: u32| {
@@ -174,7 +177,7 @@ fn the_redb_file_must_be_dirds_own_and_the_key_the_stores() {
             support::policy(1),
         )
     };
-    let missing = start(dir.join("none.redb"), support::TEST_KEY, uid)
+    let missing = start(files.join("none.redb"), support::TEST_KEY, uid)
         .err()
         .unwrap();
     assert!(missing.contains("directory file"), "{missing}");
