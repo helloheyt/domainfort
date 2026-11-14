@@ -14,10 +14,13 @@ use config::AdmindSettings;
 use core::fmt;
 use daemon_sandbox::{HardeningPlan, PlanError, ProcessIdentity};
 use ipc_audit::WindowConfig;
-use std::fs::File;
-use std::io::Read;
+use protected_file::Refusal;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::Path;
+
+/// The owner admind's configuration file must have: root.
+/// Spec: docs/50 §7.1 ("file root:0644 (not secret)").
+const ROOT_UID: u32 = 0;
 
 /// The locked-memory limit set before `mlockall` (docs/50 §6.4: admind
 /// `mlockall`; daemon-sandbox requires a MEMLOCK limit with
@@ -44,8 +47,9 @@ pub const SOCKET_DIRECTORY_MODE: u32 = 0o750;
 pub enum StartupError {
     /// The configuration file could not be opened or read.
     ConfigUnreadable,
-    /// The configuration file is not a regular file owned by root and
-    /// writable only by its owner (docs/50 §7.1: "file root:0644").
+    /// The configuration file is not a regular file (a symbolic link
+    /// included) owned by root and writable only by its owner (docs/50
+    /// §7.1: "file root:0644").
     ConfigPermissions,
     /// The configuration file is larger than the format allows.
     ConfigTooLarge,
@@ -98,21 +102,29 @@ impl std::error::Error for StartupError {}
 ///
 /// Spec: docs/50 R50-15, §7.1; docs/questions/Q-230.
 pub fn read_settings(path: &Path) -> Result<AdmindSettings, StartupError> {
-    let file = File::open(path).map_err(|_| StartupError::ConfigUnreadable)?;
-    let metadata = file
-        .metadata()
-        .map_err(|_| StartupError::ConfigUnreadable)?;
-    if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
-        return Err(StartupError::ConfigPermissions);
-    }
-    let bound = config::limits::MAX_FILE_OCTETS;
-    let mut contents = Vec::with_capacity(bound);
-    file.take(u64::try_from(bound).unwrap_or(u64::MAX).saturating_add(1))
-        .read_to_end(&mut contents)
-        .map_err(|_| StartupError::ConfigUnreadable)?;
-    if contents.len() > bound {
-        return Err(StartupError::ConfigTooLarge);
-    }
+    read_settings_owned_by(path, ROOT_UID)
+}
+
+/// Read and parse admind's configuration file, which must be owned by
+/// `owner` (root in the daemon — [`read_settings`]; the test account in
+/// tests, as kdc-daemon's and ldap-front's `read_settings`). The file is
+/// reached through crates/protected-file (task F7, A-86 follow-up): the path
+/// is inspected without following a symbolic link (a link is refused as
+/// [`StartupError::ConfigPermissions`], before any open), opened with
+/// O_NOFOLLOW, and the rule applied again to the opened descriptor.
+///
+/// # Errors
+/// [`StartupError`].
+///
+/// Spec: docs/50 R50-15, §7.1; docs/questions/Q-230; A-86.
+pub fn read_settings_owned_by(path: &Path, owner: u32) -> Result<AdmindSettings, StartupError> {
+    let contents =
+        protected_file::read_configuration_file(path, owner, config::limits::MAX_FILE_OCTETS)
+            .map_err(|refusal| match refusal {
+                Refusal::Unreadable(_) => StartupError::ConfigUnreadable,
+                Refusal::Rule(_) => StartupError::ConfigPermissions,
+                Refusal::TooLarge => StartupError::ConfigTooLarge,
+            })?;
     AdmindSettings::parse(&contents).map_err(|error| StartupError::Config(error.to_string()))
 }
 

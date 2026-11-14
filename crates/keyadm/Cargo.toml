@@ -64,6 +64,9 @@ keyd-types = { path = "../keyd-types" }
 # The manifest: format, file check, and the handles and bindings of the
 # ceremony's three key sets (docs/51 §4.3 step 8).
 provision-manifest = { path = "../provision-manifest" }
+# The configuration file's reader: lstat, openat O_NOFOLLOW, fstat-checked,
+# bounded (task F7, A-86 follow-up). rustix inside, already in the lock.
+protected-file = { path = "../protected-file" }
 # Only `read_state` — the real and effective uid, read through rustix as
 # docs/50 §6.1 prescribes ("process::getuid/geteuid … to verify") — for the
 # refusal to run as root. No hardening plan is applied (src/identity.rs;

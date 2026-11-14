@@ -95,8 +95,98 @@ pub const MAX_ADMIN_QUEUE_CAPACITY: usize = 16;
 /// decision event before it gives up and refuses the operation
 /// `Unavailable` (nothing committed): 2 s, the keyd channel's client
 /// deadline (docs/50 §3.6). Project choice (docs/questions/Q-388 item 3).
+/// Every production dird uses it ([`DecisionAckDeadline::PRODUCTION`];
+/// `startup::admin_params`) — there is no configuration key.
 /// Spec: docs/51 §5.7 item 2; A-85.
 pub const DECISION_ACK_DEADLINE: Duration = Duration::from_secs(2);
+
+/// The AP-REQs one admin request may carry: the requester's and at most
+/// [`ipc_dird_admin::channel::MAX_APPROVALS`] approvals' — each verified through keyd
+/// before the decision event (docs/51 §7.4 steps 1-2, §7.2).
+const MAX_VERIFICATIONS_PER_REQUEST: u32 = 1 + ipc_dird_admin::channel::MAX_APPROVALS;
+
+/// The ceiling of any dird's decision-acknowledgement wait: 4 s.
+///
+/// admind waits [`ipc_dird_admin::DEFAULT_DEADLINE`] (20 s, A-91) for each
+/// answer on `dird-admin.sock`, and that deadline covers dird's worst case
+/// for one request queued behind one other ([`MAX_ADMIN_CONNECTIONS`]
+/// connections, one request in flight on each, docs/51 §7.5): for each,
+/// [`MAX_VERIFICATIONS_PER_REQUEST`] AP-REQ verifications at keyd's client
+/// deadline ([`ipc_keyd::DEFAULT_DEADLINE`], 2 s, docs/50 §3.6) and one
+/// decision-acknowledgement wait. 2 × (3 × 2 s + 4 s) = 20 s: a longer wait
+/// could let dird decide — and commit — an operation after admind gave up
+/// on it and reported it unavailable (the ambiguity A-86 / A-90 avoid), and
+/// would hold the request queued behind it past admind's deadline as well.
+/// Production stays at [`DECISION_ACK_DEADLINE`]; a wait between the two
+/// exists only for tests on a loaded machine, whose fake auditd may be slow
+/// (the A-95 treatment of keyd's intent budget, Q-417 item 3). Project
+/// choice (docs/questions/Q-441).
+pub const MAX_DECISION_ACK_DEADLINE: Duration = Duration::from_secs(4);
+
+// The production wait is within the ceiling (docs/questions/Q-441).
+const _: () = assert!(DECISION_ACK_DEADLINE.as_nanos() <= MAX_DECISION_ACK_DEADLINE.as_nanos());
+// The ceiling keeps admind's deadline above dird's worst case for a request
+// queued behind another (docs/51 §7.5; A-91; docs/questions/Q-441).
+const _: () = assert!(
+    (MAX_ADMIN_CONNECTIONS as u128)
+        * (MAX_VERIFICATIONS_PER_REQUEST as u128 * ipc_keyd::DEFAULT_DEADLINE.as_nanos()
+            + MAX_DECISION_ACK_DEADLINE.as_nanos())
+        <= ipc_dird_admin::DEFAULT_DEADLINE.as_nanos()
+);
+
+/// The decision-acknowledgement wait of one dird: more than zero and at
+/// most [`MAX_DECISION_ACK_DEADLINE`]. The range is checked when the value
+/// is built ([`DecisionAckDeadline::new`]), so an [`AdminParams`] can only
+/// carry a wait within the ceiling. There is no configuration key for it:
+/// the parameters from dird's file always hold
+/// [`DecisionAckDeadline::PRODUCTION`].
+/// Spec: docs/51 §5.7 item 2; docs/questions/Q-388 item 3, Q-417 item 3,
+/// Q-441; A-95 (follow-up).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecisionAckDeadline(Duration);
+
+/// A decision-acknowledgement wait of zero or above
+/// [`MAX_DECISION_ACK_DEADLINE`] was refused.
+/// Spec: docs/questions/Q-441.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecisionAckDeadlineOutOfRange;
+
+impl fmt::Display for DecisionAckDeadlineOutOfRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("decision acknowledgement deadline out of range")
+    }
+}
+
+impl std::error::Error for DecisionAckDeadlineOutOfRange {}
+
+impl DecisionAckDeadline {
+    /// [`DECISION_ACK_DEADLINE`], the wait of every production dird.
+    pub const PRODUCTION: DecisionAckDeadline = DecisionAckDeadline(DECISION_ACK_DEADLINE);
+
+    /// `deadline`, if it is more than zero and at most
+    /// [`MAX_DECISION_ACK_DEADLINE`].
+    ///
+    /// # Errors
+    /// [`DecisionAckDeadlineOutOfRange`]: zero (every write would be refused
+    /// — a fault, not a setting) or above the ceiling.
+    ///
+    /// Spec: docs/questions/Q-441.
+    pub const fn new(
+        deadline: Duration,
+    ) -> Result<DecisionAckDeadline, DecisionAckDeadlineOutOfRange> {
+        if deadline.is_zero() || deadline.as_nanos() > MAX_DECISION_ACK_DEADLINE.as_nanos() {
+            Err(DecisionAckDeadlineOutOfRange)
+        } else {
+            Ok(DecisionAckDeadline(deadline))
+        }
+    }
+
+    /// The wait.
+    #[must_use]
+    pub const fn get(self) -> Duration {
+        self.0
+    }
+}
 
 /// One AP-REQ's verification: keyd's `open_and_verify_service_ticket` for
 /// the admin service's key set.
@@ -192,8 +282,9 @@ pub struct AdminParams {
     pub max_connections: usize,
     /// The admin queue ([`ADMIN_QUEUE_CAPACITY`]).
     pub queue_capacity: usize,
-    /// The decision-acknowledgement wait ([`DECISION_ACK_DEADLINE`]).
-    pub ack_deadline: Duration,
+    /// The decision-acknowledgement wait ([`DecisionAckDeadline::PRODUCTION`]
+    /// in every production dird; at most [`MAX_DECISION_ACK_DEADLINE`]).
+    pub ack_deadline: DecisionAckDeadline,
     /// The lifetime of a pending key-operation request
     /// (`directory_admin::KEY_REQUEST_LIFETIME`; docs/51 §5.6, task A10).
     pub key_request_lifetime: Duration,
@@ -209,6 +300,7 @@ impl fmt::Debug for AdminParams {
             .field("quorum", &self.quorum)
             .field("max_connections", &self.max_connections)
             .field("queue_capacity", &self.queue_capacity)
+            .field("ack_deadline", &self.ack_deadline)
             .field("key_request_lifetime", &self.key_request_lifetime)
             .finish_non_exhaustive()
     }

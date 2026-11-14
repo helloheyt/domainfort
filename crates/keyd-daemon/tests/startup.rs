@@ -12,8 +12,8 @@ use config::KeydSettings;
 use daemon_sandbox::Step;
 use keyd::Role;
 use keyd_daemon::startup::{
-    hardening_plan, prepare_socket_directory, read_settings, realm, StartupError,
-    LOCKED_MEMORY_LIMIT, OPEN_FILES_HEADROOM,
+    hardening_plan, prepare_socket_directory, read_settings, read_settings_owned_by, realm,
+    StartupError, LOCKED_MEMORY_LIMIT, OPEN_FILES_HEADROOM,
 };
 use keyd_daemon::{DaemonParams, IntentAckBudget, ENGINE_QUEUE_CAPACITY, INTENT_ACK_BUDGET};
 use std::os::unix::fs::PermissionsExt;
@@ -178,5 +178,32 @@ fn an_existing_socket_directory_must_belong_to_keyd() {
     assert_eq!(
         prepare_socket_directory(&someone_else),
         Err(StartupError::SocketDirectoryPermissions)
+    );
+}
+
+/// Task F7 (A-86 follow-up, "O_NOFOLLOW in every reader"): with the test
+/// account standing in for root, the configuration file is read through its
+/// own path, and a symbolic link to the same file is refused as
+/// `ConfigPermissions` (not a regular file) — never followed.
+#[test]
+fn a_symbolic_link_to_a_valid_configuration_is_refused() {
+    let dir = TempDir::new();
+    let path = dir.join("keyd.conf");
+    std::fs::write(&path, KEYD).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let owner = my_uid(&dir);
+    assert_eq!(
+        read_settings_owned_by(&path, owner).unwrap(),
+        settings(KEYD)
+    );
+    let link = dir.join("link.conf");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    assert_eq!(
+        read_settings_owned_by(&link, owner).err(),
+        Some(StartupError::ConfigPermissions)
+    );
+    assert_eq!(
+        read_settings(&link).err(),
+        Some(StartupError::ConfigPermissions)
     );
 }

@@ -176,6 +176,47 @@ fn the_configuration_file_rules() {
     ));
 }
 
+/// Task F7 (A-86 follow-up, "O_NOFOLLOW in every reader"): the
+/// configuration, the certificate and the key are each read through their
+/// own paths, and a symbolic link to each is refused as that file's
+/// permissions error (not a regular file) — never followed.
+#[test]
+fn a_symbolic_link_to_a_valid_file_is_refused() {
+    let dir = TempDir::new();
+    let owner = dir.uid();
+    let config = dir.join("ldap-front.conf");
+    write(
+        &config,
+        settings_text(&dir, "10.0.0.5:636").as_bytes(),
+        0o644,
+    );
+    assert!(read_settings(&config, owner).is_ok());
+    let config_link = dir.join("config-link.conf");
+    std::os::unix::fs::symlink(&config, &config_link).unwrap();
+    assert_eq!(
+        read_settings(&config_link, owner).err(),
+        Some(StartupError::ConfigPermissions)
+    );
+    let cert = dir.join("cert.der");
+    write(&cert, b"certificate octets", 0o644);
+    assert!(read_certificate(&cert, owner).is_ok());
+    let cert_link = dir.join("cert-link.der");
+    std::os::unix::fs::symlink(&cert, &cert_link).unwrap();
+    assert_eq!(
+        read_certificate(&cert_link, owner).err(),
+        Some(StartupError::CertificatePermissions)
+    );
+    let key = dir.join("key.der");
+    write(&key, &tls_support::p256_key(), 0o400);
+    assert!(read_private_key(&key, owner).is_ok());
+    let key_link = dir.join("key-link.der");
+    std::os::unix::fs::symlink(&key, &key_link).unwrap();
+    assert_eq!(
+        read_private_key(&key_link, owner).err(),
+        Some(StartupError::KeyPermissions)
+    );
+}
+
 /// docs/50 R50-12, §5.3 (task P11: the key is checked against the
 /// certificate; Q-320: the certificate's own checks): from files, with a
 /// real per-run certificate (tests/common/cert.rs) — a P-384 key is refused

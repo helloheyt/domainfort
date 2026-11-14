@@ -33,7 +33,11 @@ const CRYPTO_PROFILE: &str = "krb-crypto";
 /// (docs/51 §6, §12 A5; A-73: D182 binds the DC's processes). `provision`
 /// is the offline provisioning tool (docs/51 §4, §12 A4): it writes the
 /// directory, configuration, policy and manifest and creates no key.
-const CRYPTO_FREE: [&str; 8] = [
+/// `admin-password-policy` is the password-rule crate admind and
+/// `provision first-admin-secret` share (A-96; docs/questions/Q-410): it
+/// checks a password's text and computes nothing (Q-414 item 2 — the guard
+/// enumerates explicitly, A-73).
+const CRYPTO_FREE: [&str; 9] = [
     "keyd-types",
     "kdc",
     "ldap",
@@ -42,6 +46,7 @@ const CRYPTO_FREE: [&str; 8] = [
     "keyadm",
     "provision-manifest",
     "provision",
+    "admin-password-policy",
 ];
 
 /// The package names in `package`'s normal dependency graph (the package

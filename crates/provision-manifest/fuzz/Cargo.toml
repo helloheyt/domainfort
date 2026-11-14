@@ -27,6 +27,11 @@ libfuzzer-sys = "0.4"
 [dependencies.provision-manifest]
 path = ".."
 
+# The line layer the manifest parser uses since task F7 (A-86 follow-up):
+# the target checks that the manifest's line rules are exactly its.
+[dependencies.config]
+path = "../../config"
+
 # The manifest parser on arbitrary octets, with the invariants of accepted
 # manifests (`cargo fuzz run provision_manifest`).
 [[bin]]

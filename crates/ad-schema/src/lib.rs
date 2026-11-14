@@ -55,7 +55,6 @@ mod attributes;
 mod classes;
 mod error;
 pub mod flags;
-mod guid;
 mod schema;
 
 pub use attid::{make_attid, OidError, MAX_OID_LEN};

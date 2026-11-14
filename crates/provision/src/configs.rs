@@ -217,10 +217,12 @@ fn list(items: &[String]) -> String {
 /// - admind: `keyadm_uid`, `admin_socket_group` (docs/51 §4.6),
 ///   `min_password_length` = [`MIN_PASSWORD_LENGTH`] (A-79 / P-24; required
 ///   by admind's schema since task A9).
-/// - keyadm: keyd's socket and uid (crates/config keyadm.rs).
+/// - keyadm: keyd's socket and uid, and admind's (`admin_socket` +
+///   `admind_uid`, the optional pair of crates/config keyadm.rs that the
+///   approved-request commands and the sweep require — A-97 / Q-423 item 2).
 ///
-/// Spec: docs/51 §4.3 step 7, §4.6; docs/50 §2.4, §3.1, §3.2, §7.1;
-/// A-60; A-68; A-73.
+/// Spec: docs/51 §4.3 step 7, §4.6, §6; docs/50 §2.4, §3.1, §3.2, §7.1;
+/// A-60; A-68; A-73; A-97.
 #[must_use]
 pub fn domain_configs(input: &DomainInput, node_id: &NodeId) -> Vec<ConfigFile> {
     let a = &input.accounts;
@@ -350,9 +352,17 @@ pub fn domain_configs(input: &DomainInput, node_id: &NodeId) -> Vec<ConfigFile> 
         ("audit_socket", path(&p.audit_socket)),
         ("auditd_uid", id(a.auditd.uid)),
     ];
+    // keyadm's admin-channel pair (A-97 / Q-423 item 2): `admin.sock` — the
+    // socket admind's own file names — and admind's uid, which keyadm checks
+    // before it sends `FetchApproved` / `Complete` / `ListPendingDestruction`
+    // (docs/51 §6; docs/50 R50-3). Both are known here; the `rotate-*`,
+    // `retire-kvno` and `destroy-sweep` commands require them.
+    // Spec: docs/51 §6; docs/50 R50-3, §3.1, §3.2; A-97.
     let keyadm = vec![
         ("keyd_socket", path(&p.keyd_socket)),
         ("keyd_uid", id(a.keyd.uid)),
+        ("admin_socket", path(&p.admin_socket)),
+        ("admind_uid", id(a.admind.uid)),
     ];
     let file = |daemon, path: &FilePath, lines| ConfigFile {
         daemon,

@@ -36,5 +36,15 @@ test = false
 doc = false
 bench = false
 
+# The public line layer `config::line_format` on arbitrary octets — the one
+# docs/50 §7.1 line parser, shared with crates/provision-manifest since task
+# F7 (A-86 follow-up) — with its invariants (`cargo fuzz run line_format`).
+[[bin]]
+name = "line_format"
+path = "fuzz_targets/line_format.rs"
+test = false
+doc = false
+bench = false
+
 # Detach from the root workspace (see header).
 [workspace]

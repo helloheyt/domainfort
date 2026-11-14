@@ -12,6 +12,8 @@
 //!
 //! The curly-braced string form (2.3.4.3) is out of scope: it is defined by
 //! reference to RFC 4122, which is not an allowed source (specs/SOURCES.md).
+//! The lower-case `8-4-4-4-12` text form derived from allowed text only is
+//! in the module `guid_text` ([`Guid::parse_text`], [`Guid::to_text`]).
 
 use crate::error::{Error, Result};
 

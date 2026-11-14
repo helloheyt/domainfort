@@ -480,7 +480,7 @@ fn start_admin(
         service,
         gate: Arc::clone(gate),
         clock: params.clock.clone(),
-        ack_deadline: admin.ack_deadline,
+        ack_deadline: admin.ack_deadline.get(),
         key_requests,
     };
     let ended = Arc::clone(state);

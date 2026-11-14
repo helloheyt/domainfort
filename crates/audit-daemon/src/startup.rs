@@ -9,7 +9,8 @@
 //! 3. Read the configuration file named by the one argument: an absolute
 //!    path to a regular file owned by root and not writable by group or
 //!    others (docs/50 §7.1: "root:0644 (not secret)"; docs/questions/Q-230
-//!    item 16: file modes are the daemon's checks), at most
+//!    item 16: file modes are the daemon's checks), reached without
+//!    following a symbolic link (crates/protected-file, A-86), at most
 //!    `config::limits::MAX_FILE_OCTETS`; parse `AuditdSettings`.
 //! 4. Harden ([`hardening_plan`]: the docs/50 §6.4 baseline — drop to
 //!    `run_as_uid` / `run_as_gid` with no supplementary groups, no_new_privs,
@@ -39,10 +40,14 @@ use crate::recovery::StartKind;
 use config::AuditdSettings;
 use core::fmt;
 use daemon_sandbox::{HardeningPlan, PlanError, ProcessIdentity};
+use protected_file::{FileFacts, OpenError, ReadError, GROUP_OR_OTHER_WRITE};
 use std::ffi::OsString;
-use std::io::{self, Read};
-use std::os::unix::fs::MetadataExt;
+use std::io;
 use std::path::{Path, PathBuf};
+
+/// The owner auditd's configuration file must have: root.
+/// Spec: docs/50 §7.1 ("root:0644 (not secret)").
+const ROOT_UID: u32 = 0;
 
 /// Exit code: any start-up failure other than a chain break. Project choice.
 pub const EXIT_STARTUP: u8 = 1;
@@ -73,7 +78,7 @@ pub enum SettingsError {
     Usage,
     /// The file could not be opened or read.
     Io(io::ErrorKind),
-    /// Not a regular file.
+    /// Not a regular file (a symbolic link included).
     NotAFile,
     /// Writable by group or others.
     Writable,
@@ -134,26 +139,47 @@ pub fn config_path<I: IntoIterator<Item = OsString>>(args: I) -> Result<PathBuf,
 ///
 /// Spec: docs/50 R50-15, §7.1; docs/questions/Q-230 item 16 (A-60).
 pub fn read_settings(path: &Path) -> Result<AuditdSettings, SettingsError> {
-    let file = std::fs::File::open(path).map_err(|e| SettingsError::Io(e.kind()))?;
-    // The checks use the opened file's metadata, not the path's again.
-    let metadata = file.metadata().map_err(|e| SettingsError::Io(e.kind()))?;
-    if !metadata.is_file() {
-        return Err(SettingsError::NotAFile);
-    }
-    if metadata.mode() & 0o022 != 0 {
-        return Err(SettingsError::Writable);
-    }
-    if metadata.uid() != 0 {
-        return Err(SettingsError::NotRootOwned);
-    }
-    let bound = config::limits::MAX_FILE_OCTETS;
-    let mut octets = Vec::new();
-    file.take(u64::try_from(bound).unwrap_or(u64::MAX).saturating_add(1))
-        .read_to_end(&mut octets)
-        .map_err(|e| SettingsError::Io(e.kind()))?;
-    if octets.len() > bound {
-        return Err(SettingsError::TooLarge);
-    }
+    read_settings_owned_by(path, ROOT_UID)
+}
+
+/// Read and parse the configuration file at `path`, which must be owned by
+/// `owner` (root in the daemon — [`read_settings`]; the test account in
+/// tests, as kdc-daemon's and ldap-front's `read_settings`). The file is
+/// reached through crates/protected-file (task F7, A-86 follow-up): the path
+/// is inspected without following a symbolic link (a link is refused as
+/// [`SettingsError::NotAFile`], before any open), opened with O_NOFOLLOW,
+/// and this module's checks (in their order: a regular file, not writable
+/// by group or others, owned by `owner`) applied again to the opened
+/// descriptor.
+///
+/// # Errors
+/// [`SettingsError`].
+///
+/// Spec: docs/50 R50-15, §7.1; docs/questions/Q-230 item 16 (A-60); A-86.
+pub fn read_settings_owned_by(path: &Path, owner: u32) -> Result<AuditdSettings, SettingsError> {
+    let rule = |facts: &FileFacts| {
+        if !facts.regular_file {
+            return Err(SettingsError::NotAFile);
+        }
+        if facts.mode & GROUP_OR_OTHER_WRITE != 0 {
+            return Err(SettingsError::Writable);
+        }
+        if facts.owner_uid != owner {
+            return Err(SettingsError::NotRootOwned);
+        }
+        Ok(())
+    };
+    let file = protected_file::open(path, rule).map_err(|error| match error {
+        OpenError::Io(kind) => SettingsError::Io(kind),
+        OpenError::Refused(refusal) => refusal,
+    })?;
+    let octets =
+        protected_file::read_to_bound(file, config::limits::MAX_FILE_OCTETS).map_err(|error| {
+            match error {
+                ReadError::Io(kind) => SettingsError::Io(kind),
+                ReadError::TooLarge => SettingsError::TooLarge,
+            }
+        })?;
     AuditdSettings::parse(&octets).map_err(SettingsError::Config)
 }
 

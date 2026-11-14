@@ -16,6 +16,11 @@
 # §4.3 step 8; docs/47 §2.3 — GUIDs and SIDs are random against collision,
 # not secret).
 #
+# Task F7 (A-86 follow-ups): the line parser is crates/config's public
+# `line_format`, the GUID text is dtyp's `Guid::parse_text` / `to_text`,
+# and the file is read through crates/protected-file (O_NOFOLLOW, owner
+# injectable).
+#
 # Written only from this project's decided design, opened in-session —
 # docs/51 (§4.1, §4.3 steps 1, 2, 8, 11, 12, §4.4, §6, §11), docs/47 (§1.1,
 # §1.3, §1.4, §2.3, §3.3, §9.1), docs/50 (§7.1, §9), docs/10 (§1, §5ב, §7),
@@ -36,7 +41,8 @@ edition = "2021"
 publish = false
 
 [dependencies]
-# Our own workspace crates only (no third-party code).
+# Our own workspace crates only (no third-party code of its own; rustix
+# comes in through protected-file).
 #
 # `Guid` (the [MS-DTYP] 2.3.4.2 packet form the directory stores objectGUID
 # in, docs/47 §2.3) and `Sid::parse_sid_string` / `to_sid_string`
@@ -49,6 +55,15 @@ keyd-types = { path = "../keyd-types" }
 # `KerberosString` / `Realm` / `PrincipalName` and the RFC 4120 name-type
 # constants of each binding. krb-proto links no crypto (D182).
 krb-proto = { path = "../krb-proto" }
+# The docs/50 §7.1 line parser (`config::line_format`) and its bounds
+# (`config::limits`): one copy for the daemon configurations and the
+# manifest (A-86 follow-up, task F7; docs/questions/Q-440). config is a
+# zero-dependency leaf with no crypto, so nothing else comes with it.
+config = { path = "../config" }
+# The protected-file reader: lstat, openat O_NOFOLLOW, fstat-checked,
+# bounded (A-86 / A-96 follow-up, task F7; docs/questions/Q-442). It links
+# rustix (owner decision P-12, already in the lock) and no crypto.
+protected-file = { path = "../protected-file" }
 
 [lints]
 workspace = true

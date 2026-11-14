@@ -16,6 +16,12 @@
 //! bytes after building the rustls config"). The owner is a parameter so
 //! that the tests can use their own uid; `main` passes 0.
 //!
+//! Every file is reached through crates/protected-file (task F7, A-86
+//! follow-up): the path is inspected without following a symbolic link (a
+//! link is refused as that file's permissions error, before any open),
+//! opened with O_NOFOLLOW, and the rule applied again to the opened
+//! descriptor.
+//!
 //! # Bound before the drop, served after the dependencies
 //!
 //! docs/50 §6.2: "run as root ⇒ read the configuration and the TLS key ⇒
@@ -32,11 +38,11 @@ use crate::tls::{server_config, CredentialError, DcCredential, TlsConfigError};
 use config::LdapFrontSettings;
 use core::fmt;
 use daemon_sandbox::{HardeningPlan, PlanError, ProcessIdentity};
+use protected_file::{configuration_file_rule, FileFacts, OpenError, PERMISSION_BITS};
 use rustls::pki_types::UnixTime;
 use rustls::server::ServerConfig;
 use std::fs::File;
 use std::io::Read;
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -69,8 +75,8 @@ pub const OPEN_FILES_HEADROOM: u64 = 64;
 pub enum StartupError {
     /// The configuration file could not be opened or read.
     ConfigUnreadable,
-    /// The configuration file is not a regular file owned by root and
-    /// writable only by its owner.
+    /// The configuration file is not a regular file (a symbolic link
+    /// included) owned by root and writable only by its owner.
     ConfigPermissions,
     /// The configuration file is larger than the format allows.
     ConfigTooLarge,
@@ -78,14 +84,15 @@ pub enum StartupError {
     Config(String),
     /// The certificate file could not be opened or read.
     CertificateUnreadable,
-    /// The certificate file is not a regular file owned by root and
-    /// writable only by its owner.
+    /// The certificate file is not a regular file (a symbolic link
+    /// included) owned by root and writable only by its owner.
     CertificatePermissions,
     /// The certificate file is larger than [`MAX_CERTIFICATE_OCTETS`].
     CertificateTooLarge,
     /// The key file could not be opened or read.
     KeyUnreadable,
-    /// The key file is not a regular file owned by root with mode 0400.
+    /// The key file is not a regular file (a symbolic link included) owned
+    /// by root with mode 0400.
     KeyPermissions,
     /// The key file is larger than [`MAX_PRIVATE_KEY_OCTETS`].
     KeyTooLarge,
@@ -132,6 +139,27 @@ impl fmt::Display for StartupError {
 
 impl std::error::Error for StartupError {}
 
+/// Open the protected file at `path` through crates/protected-file (task F7,
+/// A-86 follow-up): the path is inspected without following a symbolic
+/// link, opened with O_NOFOLLOW, and `accepted` applied to the facts of the
+/// path and of the opened descriptor. A link (whose facts are never a
+/// regular file's) or a file `accepted` refuses is `refused`; a failure to
+/// inspect or open is `unreadable`.
+/// Spec: docs/50 §7.1, R50-12, §5.3; A-86.
+fn open_protected(
+    path: &Path,
+    accepted: impl Fn(&FileFacts) -> bool,
+    unreadable: StartupError,
+    refused: StartupError,
+) -> Result<File, StartupError> {
+    protected_file::open(path, |facts| if accepted(facts) { Ok(()) } else { Err(()) }).map_err(
+        |error| match error {
+            OpenError::Io(_) => unreadable,
+            OpenError::Refused(()) => refused,
+        },
+    )
+}
+
 /// Read at most `bound` octets of `file` into `buffer`, which must be
 /// `bound + 1` octets long (zero-filled); it is filled in place, never grown
 /// (so never reallocated), then truncated to the octets read. `Err(true)`
@@ -169,13 +197,12 @@ fn read_bounded(mut file: File, bound: usize, buffer: &mut Vec<u8>) -> Result<()
 ///
 /// Spec: docs/50 R50-15, §7.1; docs/questions/Q-230 (A-60).
 pub fn read_settings(path: &Path, owner: u32) -> Result<LdapFrontSettings, StartupError> {
-    let file = File::open(path).map_err(|_| StartupError::ConfigUnreadable)?;
-    let metadata = file
-        .metadata()
-        .map_err(|_| StartupError::ConfigUnreadable)?;
-    if !metadata.is_file() || metadata.uid() != owner || metadata.mode() & 0o022 != 0 {
-        return Err(StartupError::ConfigPermissions);
-    }
+    let file = open_protected(
+        path,
+        |facts| configuration_file_rule(facts, owner).is_ok(),
+        StartupError::ConfigUnreadable,
+        StartupError::ConfigPermissions,
+    )?;
     let bound = config::limits::MAX_FILE_OCTETS;
     let mut contents = vec![0u8; bound.saturating_add(1)];
     read_bounded(file, bound, &mut contents).map_err(|too_large| {
@@ -196,13 +223,12 @@ pub fn read_settings(path: &Path, owner: u32) -> Result<LdapFrontSettings, Start
 ///
 /// Spec: docs/50 R50-12, §5.3.
 pub fn read_certificate(path: &Path, owner: u32) -> Result<Vec<u8>, StartupError> {
-    let file = File::open(path).map_err(|_| StartupError::CertificateUnreadable)?;
-    let metadata = file
-        .metadata()
-        .map_err(|_| StartupError::CertificateUnreadable)?;
-    if !metadata.is_file() || metadata.uid() != owner || metadata.mode() & 0o022 != 0 {
-        return Err(StartupError::CertificatePermissions);
-    }
+    let file = open_protected(
+        path,
+        |facts| configuration_file_rule(facts, owner).is_ok(),
+        StartupError::CertificateUnreadable,
+        StartupError::CertificatePermissions,
+    )?;
     let mut contents = vec![0u8; MAX_CERTIFICATE_OCTETS.saturating_add(1)];
     read_bounded(file, MAX_CERTIFICATE_OCTETS, &mut contents).map_err(|too_large| {
         if too_large {
@@ -223,14 +249,16 @@ pub fn read_certificate(path: &Path, owner: u32) -> Result<Vec<u8>, StartupError
 ///
 /// Spec: docs/50 R50-12, §5.3, §6.4; AGENTS.md §6.
 pub fn read_private_key(path: &Path, owner: u32) -> Result<Zeroizing<Vec<u8>>, StartupError> {
-    let file = File::open(path).map_err(|_| StartupError::KeyUnreadable)?;
-    let metadata = file.metadata().map_err(|_| StartupError::KeyUnreadable)?;
-    if !metadata.is_file()
-        || metadata.uid() != owner
-        || metadata.mode() & 0o7777 != PRIVATE_KEY_MODE
-    {
-        return Err(StartupError::KeyPermissions);
-    }
+    let file = open_protected(
+        path,
+        |facts| {
+            facts.regular_file
+                && facts.owner_uid == owner
+                && facts.mode & PERMISSION_BITS == PRIVATE_KEY_MODE
+        },
+        StartupError::KeyUnreadable,
+        StartupError::KeyPermissions,
+    )?;
     let mut contents = Zeroizing::new(vec![0u8; MAX_PRIVATE_KEY_OCTETS.saturating_add(1)]);
     read_bounded(file, MAX_PRIVATE_KEY_OCTETS, &mut contents).map_err(|too_large| {
         if too_large {

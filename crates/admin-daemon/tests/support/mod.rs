@@ -60,8 +60,8 @@ use core::time::Duration;
 use directory_admin::{wall_clock, CHANGE_SEQ_COUNTER, RID_COUNTER, RID_END_EXCLUSIVE, RID_FIRST};
 use directory_daemon::policy::{DevelopmentPolicy, MandatoryFast};
 use directory_daemon::{
-    serve_with_admin, AdminParams, Clock, DaemonControl as DirdControl, KeydTicketVerifier,
-    SharedClock, StoreSource, TicketVerifier, VerifierFactory, DECISION_ACK_DEADLINE,
+    serve_with_admin, AdminParams, Clock, DaemonControl as DirdControl, DecisionAckDeadline,
+    KeydTicketVerifier, SharedClock, StoreSource, TicketVerifier, VerifierFactory,
 };
 use dirstore::{AttrId, IntegrityKey, NewObject, NodeId, Origin, Store, WriteTxn};
 use dtyp::{
@@ -1296,7 +1296,7 @@ impl World {
                     manifest: manifest(),
                     max_connections: directory_daemon::MAX_ADMIN_CONNECTIONS,
                     queue_capacity: directory_daemon::ADMIN_QUEUE_CAPACITY,
-                    ack_deadline: DECISION_ACK_DEADLINE,
+                    ack_deadline: DecisionAckDeadline::PRODUCTION,
                     key_request_lifetime: options.key_request_lifetime,
                 };
                 dird_run = Some(DirdRun::start(params, admin, Arc::clone(&provisioned)));

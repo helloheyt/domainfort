@@ -1157,7 +1157,10 @@ impl World {
             .unwrap()
             .expect("the admin channel is configured");
         admin.admind_uid = self.uid;
-        admin.ack_deadline = DECISION_ACK_WAIT;
+        // dird's bounded decision-ack deadline at its ceiling (A-95 / F7).
+        admin.ack_deadline =
+            directory_daemon::admin_service::DecisionAckDeadline::new(DECISION_ACK_WAIT)
+                .expect("within dird's ceiling");
         let keyd_socket = settings.keyd().unwrap().socket().as_path().to_path_buf();
         assert_eq!(keyd_socket, paths.keyd_socket.as_path());
         let uid = self.uid;

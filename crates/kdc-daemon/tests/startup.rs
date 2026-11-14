@@ -211,6 +211,34 @@ fn the_policy_file_through_the_shared_loader() {
     );
 }
 
+/// Task F7 (A-86 follow-up, "O_NOFOLLOW in every reader"): the kdc's
+/// configuration and policy files are read through their own paths, and a
+/// symbolic link to either is refused as a permissions error (not a regular
+/// file) — never followed.
+#[test]
+fn a_symbolic_link_to_a_valid_configuration_or_policy_is_refused() {
+    let dir = TempDir::new("link");
+    let uid = std::fs::metadata(&dir.0).unwrap().uid();
+    let config = dir.0.join("kdc.conf");
+    write(&config, kdc_config("10.0.0.5:88").as_bytes(), 0o644);
+    assert!(read_settings(&config, uid).is_ok());
+    let config_link = dir.0.join("kdc-link.conf");
+    std::os::unix::fs::symlink(&config, &config_link).unwrap();
+    assert_eq!(
+        read_settings(&config_link, uid).err(),
+        Some(StartupError::ConfigPermissions)
+    );
+    let policy = dir.0.join("policy.store");
+    write(&policy, &common_policy::policy(9).encode().unwrap(), 0o644);
+    assert!(read_policy(&policy, uid).is_ok());
+    let policy_link = dir.0.join("policy-link.store");
+    std::os::unix::fs::symlink(&policy, &policy_link).unwrap();
+    assert_eq!(
+        read_policy(&policy_link, uid).err(),
+        Some(StartupError::Policy(LoadError::Permissions))
+    );
+}
+
 /// docs/50 §4.1 ("each address served on UDP and TCP"), §6.2: one UDP
 /// socket and one TCP listener per configured address; an address already
 /// taken refuses the start. Loopback, ports first chosen by the system

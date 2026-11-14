@@ -54,8 +54,8 @@ use directory_admin::{wall_clock, CHANGE_SEQ_COUNTER, RID_COUNTER, RID_END_EXCLU
 use directory_daemon::policy::{DevelopmentPolicy, MandatoryFast};
 use directory_daemon::{
     admin_refused_peer_count, serve_with_admin, AdminParams, Clock, DaemonControl, DaemonParams,
-    KeydTicketVerifier, SharedClock, StoreSource, TicketVerifier, VerifierFactory,
-    DECISION_ACK_DEADLINE,
+    DecisionAckDeadline, DecisionAckDeadlineOutOfRange, KeydTicketVerifier, SharedClock,
+    StoreSource, TicketVerifier, VerifierFactory, DECISION_ACK_DEADLINE, MAX_DECISION_ACK_DEADLINE,
 };
 use dirstore::{AttrId, IntegrityKey, NewObject, NodeId, Origin, Store, WriteTxn};
 use dtyp::{
@@ -968,6 +968,17 @@ struct Options {
     hook: bool,
     /// The pending key-operation request lifetime (task A10).
     key_request_lifetime: Duration,
+    /// dird's decision-acknowledgement wait (A-95 follow-up, Q-441).
+    ack_deadline: DecisionAckDeadline,
+}
+
+/// The decision-acknowledgement wait of the tests that expect auditd to
+/// acknowledge: the ceiling, so a fake auditd slowed by a loaded machine
+/// still answers in time (A-95 follow-up; docs/questions/Q-417 item 3,
+/// Q-441). The production wait stays [`DecisionAckDeadline::PRODUCTION`];
+/// the expiry test uses it.
+fn generous() -> DecisionAckDeadline {
+    DecisionAckDeadline::new(MAX_DECISION_ACK_DEADLINE).unwrap()
 }
 
 impl Default for Options {
@@ -979,6 +990,7 @@ impl Default for Options {
             queue_capacity: directory_daemon::ADMIN_QUEUE_CAPACITY,
             hook: false,
             key_request_lifetime: directory_admin::KEY_REQUEST_LIFETIME,
+            ack_deadline: generous(),
         }
     }
 }
@@ -1037,7 +1049,7 @@ fn start_dird(
         manifest: manifest(),
         max_connections: options.max_connections,
         queue_capacity: options.queue_capacity,
-        ack_deadline: DECISION_ACK_DEADLINE,
+        ack_deadline: options.ack_deadline,
         key_request_lifetime: options.key_request_lifetime,
     };
     DirdRun::start(params, admin, Arc::clone(store), policy())
@@ -1572,10 +1584,14 @@ fn every_operation_end_to_end() {
 /// docs/51 §5.7 item 2; A-85: an auditd that withholds its
 /// acknowledgements ⇒ the write is refused `Unavailable` and nothing is
 /// committed; when auditd is back, the decision and a not-performed outcome
-/// reach it.
+/// reach it. The wait is the production one (the expiry is what is tested,
+/// and auditd never acknowledges while it lasts — A-95 follow-up, Q-441).
 #[test]
 fn no_acknowledgement_means_nothing_is_committed() {
-    let Some(world) = World::new(Options::default()) else {
+    let Some(world) = World::new(Options {
+        ack_deadline: DecisionAckDeadline::PRODUCTION,
+        ..Options::default()
+    }) else {
         return;
     };
     let mut client = world.client();
@@ -1865,9 +1881,13 @@ fn an_oversize_frame_is_closed_before_its_body() {
 /// the queue of one can fill; dird's bound for admind is two.)
 #[test]
 fn a_full_queue_answers_busy() {
+    // The generous wait (the default, the ceiling): the held request must
+    // still be waiting for its acknowledgement after the sleeps below and
+    // two more connections (A-95 follow-up; docs/questions/Q-417 item 3).
     let Some(world) = World::new(Options {
         max_connections: 3,
         queue_capacity: 1,
+        ack_deadline: generous(),
         ..Options::default()
     }) else {
         return;
@@ -2500,4 +2520,44 @@ fn the_pending_destruction_listing_names_deleted_accounts() {
     assert_eq!(listed.next, None);
     let events = await_events(&world, DirAdminOperation::ListPendingDestruction, 2);
     assert!(events.iter().all(|e| decision(e) == PROCEED));
+}
+
+/// A-95 follow-up (docs/questions/Q-417 item 3, Q-441): dird's
+/// decision-acknowledgement wait is a bounded parameter — production is
+/// `DECISION_ACK_DEADLINE` (2 s, Q-388 item 3), zero and anything above the
+/// 4 s ceiling cannot be built, and the ceiling keeps admind's 20 s client
+/// deadline (A-91) above dird's worst case for a request queued behind
+/// another (2 × (3 AP-REQs × keyd's 2 s + the wait)).
+#[test]
+fn the_decision_ack_deadline_is_bounded() {
+    assert_eq!(DecisionAckDeadline::PRODUCTION.get(), DECISION_ACK_DEADLINE);
+    assert_eq!(DECISION_ACK_DEADLINE, Duration::from_secs(2));
+    assert_eq!(MAX_DECISION_ACK_DEADLINE, Duration::from_secs(4));
+    assert_eq!(
+        DecisionAckDeadline::new(DECISION_ACK_DEADLINE),
+        Ok(DecisionAckDeadline::PRODUCTION)
+    );
+    for accepted in [
+        Duration::from_nanos(1),
+        Duration::from_millis(500),
+        DECISION_ACK_DEADLINE,
+        MAX_DECISION_ACK_DEADLINE,
+    ] {
+        assert_eq!(
+            DecisionAckDeadline::new(accepted).map(DecisionAckDeadline::get),
+            Ok(accepted)
+        );
+    }
+    for refused in [
+        Duration::ZERO,
+        MAX_DECISION_ACK_DEADLINE + Duration::from_nanos(1),
+        ipc_dird_admin::DEFAULT_DEADLINE,
+    ] {
+        assert_eq!(
+            DecisionAckDeadline::new(refused),
+            Err(DecisionAckDeadlineOutOfRange)
+        );
+    }
+    let worst = 2 * (3 * ipc_keyd::DEFAULT_DEADLINE + MAX_DECISION_ACK_DEADLINE);
+    assert!(worst <= ipc_dird_admin::DEFAULT_DEADLINE);
 }

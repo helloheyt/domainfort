@@ -8,7 +8,11 @@
 //! [MS-DTYP] 2.5.3.2 is in the crate `pdp`) and the inheritance of a new
 //! object's security descriptor (2.5.3.4, docs/51 §10):
 //!
-//! - [`Guid`] — packet representation ([MS-DTYP] 2.3.4.2).
+//! - [`Guid`] — packet representation ([MS-DTYP] 2.3.4.2), and the
+//!   lower-case `8-4-4-4-12` text form ([`Guid::parse_text`] /
+//!   [`Guid::to_text`]: the layout of the SDDL `guid` production of 2.5.1.1,
+//!   the fields of 2.3.4.1, the group order of the [MS-DRSR] 5.16.3.16
+//!   example — decision A-31's route, the one copy of the workspace, A-86).
 //! - [`Sid`] — packet representation and the "S-1-..." string form (decimal
 //!   or hexadecimal authority, 0 to 15 SubAuthority values) ([MS-DTYP] 2.4.1,
 //!   2.4.2.1, 2.4.2.2, 2.4.2.4; RFC 5234 §2.3, Appendix B.1).
@@ -31,8 +35,9 @@
 //!   A-84 and the readings recorded in Q-335 / Q-336 are documented at the
 //!   top of `src/create_security_descriptor.rs`.
 //!
-//! Out of scope: SDDL (2.5.1), the curly-braced GUID string (2.3.4.3, defined
-//! via RFC 4122, not an allowed source), the RPC (IDL) representations, the
+//! Out of scope: SDDL (2.5.1) beyond the `guid` production's text form, the
+//! curly-braced GUID string (2.3.4.3, defined via RFC 4122, not an allowed
+//! source), the RPC (IDL) representations, the
 //! absolute security descriptor form, the creator-descriptor branches of
 //! 2.5.3.4 (2.5.3.4.5, 2.5.3.4.6), and the access-check algorithm (crate
 //! `pdp`).
@@ -78,8 +83,13 @@
 //! (protocol revision 70.0; pinned PDF, sha256 55b59eb1…b2b1): 5.1.3.2, 6.1.3,
 //! 6.1.3.1-6.1.3.8. No other implementation was consulted or recalled.
 //!
-//! Spec: [MS-DTYP] 2.3.4, 2.4.1-2.4.6, 2.5.3.4; RFC 5234 §2.3, Appendix B.1;
-//! [MS-ADTS] 6.1.3.
+//! The GUID text form (task F7, the A-86 follow-up) was moved here from
+//! crates/ad-schema and crates/provision-manifest after re-reading, in that
+//! session, the pinned [MS-DTYP] v20241119 2.3.4.1, 2.3.4.2, 2.3.4.3 and
+//! 2.5.1.1 and [MS-DRSR] v20260309 (sha256 e8ce0c8c…b62c) 5.16.3.16.
+//!
+//! Spec: [MS-DTYP] 2.3.4, 2.4.1-2.4.6, 2.5.1.1 (`guid`), 2.5.3.4; RFC 5234
+//! §2.3, Appendix B.1; [MS-ADTS] 6.1.3; [MS-DRSR] 5.16.3.16.
 
 mod access_mask;
 mod ace;
@@ -87,6 +97,7 @@ mod acl;
 mod create_security_descriptor;
 mod error;
 mod guid;
+mod guid_text;
 mod reader;
 mod security_descriptor;
 mod sid;
@@ -106,6 +117,7 @@ pub use create_security_descriptor::{
 };
 pub use error::{Error, Result};
 pub use guid::{Guid, GUID_PACKET_LEN};
+pub use guid_text::GUID_TEXT_LEN;
 pub use security_descriptor::{
     Control, SecurityDescriptor, SD_FIXED_LEN, SECURITY_DESCRIPTOR_REVISION,
 };

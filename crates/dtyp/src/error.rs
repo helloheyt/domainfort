@@ -25,6 +25,11 @@ pub enum Error {
     // ---- GUID ([MS-DTYP] 2.3.4.2) ----
     /// A GUID packet was not exactly 16 bytes. Spec: [MS-DTYP] 2.3.4.2.
     GuidLength,
+    /// A GUID text was not exactly the lower-case `8-4-4-4-12` form (36
+    /// octets, "-" at offsets 8, 13, 18 and 23, lower-case hexadecimal
+    /// digits elsewhere). Spec: [MS-DTYP] 2.5.1.1 (the SDDL `guid`
+    /// production); [MS-DRSR] 5.16.3.16; PENDING-OWNER A-31.
+    GuidTextSyntax,
 
     // ---- SID packet ([MS-DTYP] 2.4.2.2) ----
     /// Input ended before the 8 fixed bytes and the `SubAuthorityCount`
@@ -189,6 +194,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let msg = match self {
             Error::GuidLength => "GUID packet is not 16 bytes",
+            Error::GuidTextSyntax => "GUID text is not the lower-case 8-4-4-4-12 form",
             Error::SidTruncated => "SID packet truncated",
             Error::SidRevision => "SID revision is not 1",
             Error::SidTooManySubAuthorities => "SID has more than 15 sub-authorities",

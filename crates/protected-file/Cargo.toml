@@ -1,0 +1,50 @@
+# protected-file — the one reader of the files a daemon or a tool reads as
+# root to decide what it does (task F7; the A-86 / A-96 follow-up "open
+# configuration / manifest / policy files without following symlinks, in
+# every reader"): configuration files (docs/50 §7.1: "file root:0644"), the
+# provisioning manifest (docs/51 §4.3 step 8: root:0644), the development
+# policy file (docs/50 §7.2), and the protected key and certificate files
+# the configuration only points to (docs/50 §7.1: "only paths to protected
+# files"; R50-12; Q-270 item 1).
+#
+# What it does, in one place: inspect the path without following a link
+# (`lstat`) and refuse a link, a directory, a FIFO or any non-regular file
+# before any open; open it with O_NOFOLLOW (`openat`), so a link put in its
+# place since is not followed either; apply the caller's ownership and mode
+# rule to the facts of the OPENED descriptor (`fstat`), which are the facts
+# of the file actually read; and read it only up to the caller's bound + 1.
+# The rule stays the caller's (owner, mode, error type), so every reader
+# keeps its behaviour; the configuration-file rule (regular, owner, no group
+# or other write) is provided once for the readers that share it.
+#
+# Why a crate of its own: crates/config is a zero-dependency leaf (docs/50
+# §10) and must stay pure (it opens no file); the readers live in eight
+# crates (the six daemons, keyadm, provision) plus the libraries they share
+# for the policy (policy-store) and the manifest (provision-manifest), and
+# daemon-sandbox links rustix on Linux only. docs/questions/Q-442.
+#
+# Written only from this project's decided design — docs/50 §7.1, §7.2,
+# R50-12; docs/51 §4.3 steps 7, 8, §4.4; PENDING-OWNER A-86, A-96, P-2,
+# P-12; docs/questions Q-345 item 10, Q-414 item 4 — the readers it
+# replaces (this project's own code), and the docs.rs API pages of rustix
+# 1.1.6 (`fs::openat`, `fs::OFlags` (`RDONLY`, `NOFOLLOW`, `CLOEXEC`),
+# `fs::lstat`, `fs::fstat`, `fs::Stat`, `fs::FileType::from_raw_mode` /
+# `is_file`, `fs::RawMode`, `fs::Mode`, `fs::CWD`, `io::Errno::kind`) — API
+# documentation only, never its source (P-2). No other implementation
+# consulted or recalled (AGENTS.md §1-3).
+
+[package]
+name = "protected-file"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# rustix — owner decision P-12, already in the workspace lock (daemon-
+# sandbox, provision); not a new package. Features: `fs` (openat, lstat,
+# fstat, OFlags, Mode, FileType) and `std` (`&Path` as a path argument,
+# `Errno::kind`). Default features off.
+rustix = { version = "1.1.6", default-features = false, features = ["std", "fs"] }
+
+[lints]
+workspace = true

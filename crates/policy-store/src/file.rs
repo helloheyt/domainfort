@@ -4,16 +4,19 @@
 //! others, at most [`MAX_POLICY_FILE`] octets (one more is read, so an
 //! oversized file is detected without reading it whole), decoded by
 //! [`DevelopmentPolicy::decode`]. Absent ⇒ refused (fail closed). Moved
-//! from crates/directory-daemon `startup::read_policy` (A-68), unchanged.
+//! from crates/directory-daemon `startup::read_policy` (A-68), unchanged
+//! but for the way the file is reached: since task F7 (the A-86 follow-up
+//! "O_NOFOLLOW in every reader") through crates/protected-file — the path
+//! is inspected without following a symbolic link (a link is refused as
+//! not a regular file, before any open), opened with O_NOFOLLOW, and the
+//! rule applied again to the opened descriptor.
 //!
 //! Spec: docs/50 §7.1 (root-owned files), §7.2 ("invalid … ⇒ do not
-//! start"); docs/questions/Q-219 (A-57), Q-270 item 2.
+//! start"); docs/questions/Q-219 (A-57), Q-270 item 2; A-86.
 
 use crate::policy::{DevelopmentPolicy, PolicyError, MAX_POLICY_FILE};
 use core::fmt;
-use std::fs::File;
-use std::io::Read;
-use std::os::unix::fs::MetadataExt;
+use protected_file::Refusal;
 use std::path::Path;
 
 /// Why the policy file could not be loaded. Carries no file content.
@@ -22,8 +25,8 @@ use std::path::Path;
 pub enum LoadError {
     /// The file could not be opened or read.
     Unreadable,
-    /// The file is not a regular file of the expected owner, not writable
-    /// by group or others.
+    /// The file is not a regular file (a symbolic link included) of the
+    /// expected owner, not writable by group or others.
     Permissions,
     /// The file was refused.
     Policy(PolicyError),
@@ -51,18 +54,13 @@ impl std::error::Error for LoadError {}
 ///
 /// Spec: docs/50 §7.1, §7.2; docs/questions/Q-270 item 2.
 pub fn read_file(path: &Path, owner: u32) -> Result<DevelopmentPolicy, LoadError> {
-    let file = File::open(path).map_err(|_| LoadError::Unreadable)?;
-    let metadata = file.metadata().map_err(|_| LoadError::Unreadable)?;
-    if !metadata.is_file() || metadata.uid() != owner || metadata.mode() & 0o022 != 0 {
-        return Err(LoadError::Permissions);
-    }
     let bound = MAX_POLICY_FILE as usize;
-    let mut contents = Vec::new();
-    file.take(u64::from(MAX_POLICY_FILE).saturating_add(1))
-        .read_to_end(&mut contents)
-        .map_err(|_| LoadError::Unreadable)?;
-    if contents.len() > bound {
-        return Err(LoadError::Policy(PolicyError::TooLarge));
-    }
+    let contents = protected_file::read_configuration_file(path, owner, bound).map_err(
+        |refusal| match refusal {
+            Refusal::Unreadable(_) => LoadError::Unreadable,
+            Refusal::Rule(_) => LoadError::Permissions,
+            Refusal::TooLarge => LoadError::Policy(PolicyError::TooLarge),
+        },
+    )?;
     DevelopmentPolicy::decode(&contents).map_err(LoadError::Policy)
 }

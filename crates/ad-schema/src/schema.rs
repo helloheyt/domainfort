@@ -26,7 +26,6 @@ use crate::attributes::{dirstore_syntax, AttributeEntry, Constraint, Form, SECRE
 use crate::classes::{ClassEntry, STRUCTURAL_CLASS};
 use crate::error::{Error, LookupError};
 use crate::flags::search_flags::F_CONFIDENTIAL;
-use crate::guid::parse_guid;
 use crate::{ATTRIBUTES, CLASSES};
 use dirstore::{
     AttrClass, AttrId, AttributeDefinition, ClassDefinition, ClassId, Link, Schema, Storage,
@@ -153,6 +152,14 @@ fn insert_name<T: Copy>(
         return Err(Error::DuplicateOrInvalidName(name));
     }
     Ok(())
+}
+
+/// A table GUID string (the lower-case `8-4-4-4-12` form [MS-ADSC] /
+/// [MS-ADA*] print), parsed by dtyp's one GUID text mapping — the A-31
+/// route, moved there from this crate (A-86 follow-up).
+/// Spec: [MS-DTYP] 2.3.4.1, 2.3.4.2, 2.5.1.1; [MS-DRSR] 5.16.3.16; A-31.
+fn parse_guid(s: &str) -> Option<Guid> {
+    Guid::parse_text(s).ok()
 }
 
 /// Parse a table GUID string.

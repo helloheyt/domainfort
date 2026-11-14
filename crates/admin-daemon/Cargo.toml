@@ -72,6 +72,11 @@ admin-password-policy = { path = "../admin-password-policy" }
 # The hardening plan (identity drop, no_new_privs, capabilities, core 0,
 # not dumpable, umask, mlockall).
 daemon-sandbox = { path = "../daemon-sandbox" }
+# The protected-file reader (task F7, A-86 follow-up): every file read as
+# root before the drop is inspected without following a link, opened with
+# O_NOFOLLOW and checked on the opened descriptor. rustix inside (owner
+# decision P-12), already in the lock — no new package.
+protected-file = { path = "../protected-file" }
 
 [dev-dependencies]
 # Tier 2 runs the real daemons in-process: auditd (admind's events,

@@ -1,31 +1,35 @@
 //! Every bound of the manifest. Each is checked before the octets it covers
 //! are copied anywhere, so nothing is allocated beyond the input actually
 //! present (AGENTS.md §6).
+//!
+//! The line-format bounds are crates/config's (`config::limits`), the
+//! bounds of the one line parser both use (A-86 follow-up, task F7); they
+//! are re-exported here under the names this crate has always had.
 
 /// Largest manifest: 64 KiB — the configuration-file bound, since the
 /// manifest uses the configuration line format.
-/// Spec: docs/50 §7.1 ("file ≤ 64 KiB").
-pub const MAX_FILE_OCTETS: usize = 64 * 1024;
+/// Spec: docs/50 §7.1 ("file ≤ 64 KiB"); `config::limits::MAX_FILE_OCTETS`.
+pub const MAX_FILE_OCTETS: usize = config::limits::MAX_FILE_OCTETS;
 
 /// Longest line, not counting its LF: 1024 octets.
-/// Spec: docs/50 §7.1 ("line ≤ 1024").
-pub const MAX_LINE_OCTETS: usize = 1024;
+/// Spec: docs/50 §7.1 ("line ≤ 1024"); `config::limits::MAX_LINE_OCTETS`.
+pub const MAX_LINE_OCTETS: usize = config::limits::MAX_LINE_OCTETS;
 
-/// Most lines: 1024. Project choice (AGENTS.md §6 requires a bound; the
-/// same value crates/config chose, docs/questions/Q-230).
-pub const MAX_LINES: usize = 1024;
+/// Most lines: 1024. Project choice (AGENTS.md §6 requires a bound;
+/// crates/config's, docs/questions/Q-230).
+pub const MAX_LINES: usize = config::limits::MAX_LINES;
 
-/// Longest key: 48 octets. Project choice (the same as crates/config; the
-/// longest manifest key, `manifest_version`, has 16).
-pub const MAX_KEY_OCTETS: usize = 48;
+/// Longest key: 48 octets. Project choice (crates/config's; the longest
+/// manifest key, `manifest_version`, has 16).
+pub const MAX_KEY_OCTETS: usize = config::limits::MAX_KEY_OCTETS;
 
 /// The separator between a key and its value: one space, `=`, one space.
-/// Spec: docs/50 R50-15 ("`key = value`").
-pub const SEPARATOR: &str = " = ";
+/// Spec: docs/50 R50-15 ("`key = value`"); `config::limits::SEPARATOR`.
+pub const SEPARATOR: &str = config::limits::SEPARATOR;
 
 /// Longest value: what a maximal key leaves on a maximal line (973 octets).
-/// Project choice (as crates/config, docs/questions/Q-230).
-pub const MAX_VALUE_OCTETS: usize = MAX_LINE_OCTETS - MAX_KEY_OCTETS - SEPARATOR.len();
+/// Project choice (crates/config's, docs/questions/Q-230).
+pub const MAX_VALUE_OCTETS: usize = config::limits::MAX_VALUE_OCTETS;
 
 /// Longest realm, naming-context DNS name and DC host name: 255 octets.
 ///

@@ -11,10 +11,13 @@ use core::fmt;
 use daemon_sandbox::{HardeningPlan, PlanError, ProcessIdentity};
 use keyd::{ConfigError, InMemoryKeyStore, Keyd, KeydConfig, OsEntropy};
 use krb_proto::{KerberosTime, Realm};
-use std::fs::File;
-use std::io::Read;
+use protected_file::Refusal;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::Path;
+
+/// The owner keyd's configuration file must have: root.
+/// Spec: docs/50 §7.1 ("file root:0644").
+const ROOT_UID: u32 = 0;
 
 /// Key sets the development store holds at most. Project choice — the
 /// store's capacity is not a setting (docs/questions/Q-230 item 12: library
@@ -47,8 +50,9 @@ pub const SOCKET_DIRECTORY_MODE: u32 = 0o750;
 pub enum StartupError {
     /// The configuration file could not be opened or read.
     ConfigUnreadable,
-    /// The configuration file is not a regular file owned by root and
-    /// writable only by its owner (docs/50 §7.1: "file root:0644").
+    /// The configuration file is not a regular file (a symbolic link
+    /// included) owned by root and writable only by its owner (docs/50
+    /// §7.1: "file root:0644").
     ConfigPermissions,
     /// The configuration file is larger than the format allows.
     ConfigTooLarge,
@@ -90,7 +94,7 @@ impl fmt::Display for StartupError {
 
 impl std::error::Error for StartupError {}
 
-/// Read and parse keyd's configuration file.
+/// Read and parse keyd's configuration file (owned by root).
 ///
 /// The file must be a regular file owned by root and not writable by group
 /// or others (docs/50 §7.1: "file root:0644 (not secret)"; crates/config:
@@ -103,21 +107,29 @@ impl std::error::Error for StartupError {}
 ///
 /// Spec: docs/50 R50-15, §7.1; docs/questions/Q-230; Q-260 item 6.
 pub fn read_settings(path: &Path) -> Result<KeydSettings, StartupError> {
-    let file = File::open(path).map_err(|_| StartupError::ConfigUnreadable)?;
-    let metadata = file
-        .metadata()
-        .map_err(|_| StartupError::ConfigUnreadable)?;
-    if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
-        return Err(StartupError::ConfigPermissions);
-    }
-    let bound = config::limits::MAX_FILE_OCTETS;
-    let mut contents = Vec::with_capacity(bound);
-    file.take(u64::try_from(bound).unwrap_or(u64::MAX).saturating_add(1))
-        .read_to_end(&mut contents)
-        .map_err(|_| StartupError::ConfigUnreadable)?;
-    if contents.len() > bound {
-        return Err(StartupError::ConfigTooLarge);
-    }
+    read_settings_owned_by(path, ROOT_UID)
+}
+
+/// Read and parse keyd's configuration file, which must be owned by `owner`
+/// (root in the daemon — [`read_settings`]; the test account in tests, as
+/// kdc-daemon's and ldap-front's `read_settings`). The file is reached
+/// through crates/protected-file (task F7, A-86 follow-up): the path is
+/// inspected without following a symbolic link (a link is refused as
+/// [`StartupError::ConfigPermissions`], before any open), opened with
+/// O_NOFOLLOW, and the rule applied again to the opened descriptor.
+///
+/// # Errors
+/// [`StartupError`].
+///
+/// Spec: docs/50 R50-15, §7.1; docs/questions/Q-230; Q-260 item 6; A-86.
+pub fn read_settings_owned_by(path: &Path, owner: u32) -> Result<KeydSettings, StartupError> {
+    let contents =
+        protected_file::read_configuration_file(path, owner, config::limits::MAX_FILE_OCTETS)
+            .map_err(|refusal| match refusal {
+                Refusal::Unreadable(_) => StartupError::ConfigUnreadable,
+                Refusal::Rule(_) => StartupError::ConfigPermissions,
+                Refusal::TooLarge => StartupError::ConfigTooLarge,
+            })?;
     let settings =
         KeydSettings::parse(&contents).map_err(|error| StartupError::Config(error.to_string()))?;
     // R50-18: only the insecure development store exists (config enforces

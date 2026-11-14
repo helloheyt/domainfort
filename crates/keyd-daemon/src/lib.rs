@@ -12,7 +12,7 @@
 //!    docs/questions/Q-235 item 2);
 //! 2. read the configuration path from argv and parse `KeydSettings`
 //!    ([`startup::read_settings`]: root-owned, not group/other-writable,
-//!    bounded read);
+//!    reached without following a symbolic link, bounded read);
 //! 3. privileged set-up as root: the socket's own directory
 //!    ([`startup::prepare_socket_directory`], docs/50 §3.1);
 //! 4. apply the hardening plan ([`startup::hardening_plan`]: drop to

@@ -1,7 +1,9 @@
 //! The line format: from octets to the entries of the closed key table.
 //!
 //! The manifest uses the configuration format of docs/50 §7.1 (option A,
-//! R50-15), with the same strictness as crates/config:
+//! R50-15), and since task F7 (the A-86 follow-up) the **same parser**: the
+//! public line layer of crates/config, [`config::line_format`] — one fuzzed
+//! copy instead of two (docs/questions/Q-345 item 2). Its grammar:
 //!
 //! ```text
 //! file    = *( line LF )                 ; every line ends with LF
@@ -17,48 +19,55 @@
 //!
 //! Every line form has exactly one spelling; there are no section headers,
 //! quotes, escapes, includes or interpolation. Unknown and repeated keys are
-//! refused here; a missing key is refused when it is asked for.
+//! refused by the line layer; a missing key is refused here when it is asked
+//! for. This module maps the line layer's errors onto the manifest's
+//! [`Error`] rule for rule (same line, same key, same rule).
 //!
 //! Spec: docs/50 R50-15, §7.1 ("unknown / duplicate / missing-required key ⇒
 //! refuse"; "printable ASCII only"; "file ≤ 64 KiB, line ≤ 1024"; and its
 //! D96 citation: the same strict parser discipline for every
-//! deserialization); PENDING-OWNER P-6 (ASCII only); AGENTS.md §6.
+//! deserialization); PENDING-OWNER P-6 (ASCII only), A-86; AGENTS.md §6.
 
 use crate::error::{Error, ErrorKind};
-use crate::limits::{
-    MAX_FILE_OCTETS, MAX_KEY_OCTETS, MAX_LINES, MAX_LINE_OCTETS, MAX_VALUE_OCTETS, SEPARATOR,
-};
+use config::line_format::{Entries, LineError, LineErrorKind};
 
-/// The line terminator. Spec: docs/50 §7.1.
-pub(crate) const LF: u8 = b'\n';
-
-/// The comment marker, valid only in the first column. Spec: docs/50 §7.1.
-pub(crate) const COMMENT: u8 = b'#';
-
-/// One `key = value` entry whose key is in the table.
-#[derive(Debug, Clone, Copy)]
-struct Entry<'a> {
-    line: u32,
-    key: &'static str,
-    value: &'a str,
-}
+/// Printable ASCII — the line layer's rule. Spec: docs/50 §7.1; P-6.
+pub(crate) use config::line_format::is_printable;
 
 /// The entries of one manifest, each key of the table at most once.
 /// Spec: docs/50 §7.1.
 #[derive(Debug)]
 pub(crate) struct Document<'a> {
-    entries: Vec<Entry<'a>>,
+    entries: Entries<'a>,
 }
 
-/// Printable ASCII. Spec: docs/50 §7.1; P-6.
-pub(crate) const fn is_printable(b: u8) -> bool {
-    matches!(b, 0x20..=0x7E)
+/// The manifest rule a line-format rule is. One to one: every line rule is
+/// a manifest rule of the same name (docs/50 §7.1).
+const fn kind_of(kind: LineErrorKind) -> ErrorKind {
+    match kind {
+        LineErrorKind::FileTooLarge => ErrorKind::FileTooLarge,
+        LineErrorKind::TooManyLines => ErrorKind::TooManyLines,
+        LineErrorKind::LineTooLong => ErrorKind::LineTooLong,
+        LineErrorKind::InvalidCharacter => ErrorKind::InvalidCharacter,
+        LineErrorKind::MissingFinalNewline => ErrorKind::MissingFinalNewline,
+        LineErrorKind::MalformedLine => ErrorKind::MalformedLine,
+        LineErrorKind::KeyTooLong => ErrorKind::KeyTooLong,
+        LineErrorKind::ValueTooLong => ErrorKind::ValueTooLong,
+        LineErrorKind::UnknownKey => ErrorKind::UnknownKey,
+        LineErrorKind::DuplicateKey => ErrorKind::DuplicateKey,
+    }
 }
 
-/// The key alphabet: lower-case letters, digits, underscore.
-/// Spec: docs/50 R50-15.
-const fn is_key_octet(b: u8) -> bool {
-    b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'
+/// The manifest error a line-format error is: the same line, key and rule.
+/// Spec: docs/50 §7.1; A-60 (no input text either way).
+fn error_of(error: LineError) -> Error {
+    let kind = kind_of(error.kind());
+    match (error.line(), error.key()) {
+        (Some(line), Some(key)) => Error::at(line, key, kind),
+        (Some(line), None) => Error::at_line(line, kind),
+        // The line layer reports a key only together with its line.
+        (None, _) => Error::whole(kind),
+    }
 }
 
 impl<'a> Document<'a> {
@@ -67,80 +76,9 @@ impl<'a> Document<'a> {
     ///
     /// Spec: docs/50 R50-15, §7.1.
     pub(crate) fn parse(input: &'a [u8], keys: &[&'static str]) -> Result<Self, Error> {
-        if input.len() > MAX_FILE_OCTETS {
-            return Err(Error::whole(ErrorKind::FileTooLarge));
-        }
-        let mut entries: Vec<Entry<'a>> = Vec::new();
-        let mut rest = input;
-        let mut number: u32 = 0;
-        while !rest.is_empty() {
-            number = number.saturating_add(1);
-            if usize::try_from(number).map_or(true, |n| n > MAX_LINES) {
-                return Err(Error::at_line(number, ErrorKind::TooManyLines));
-            }
-            let (line, terminated, after) = match rest.iter().position(|&b| b == LF) {
-                Some(end) => (
-                    rest.get(..end).unwrap_or_default(),
-                    true,
-                    rest.get(end.saturating_add(1)..).unwrap_or_default(),
-                ),
-                None => (rest, false, &[][..]),
-            };
-            rest = after;
-            if line.len() > MAX_LINE_OCTETS {
-                return Err(Error::at_line(number, ErrorKind::LineTooLong));
-            }
-            if !line.iter().all(|&b| is_printable(b)) {
-                return Err(Error::at_line(number, ErrorKind::InvalidCharacter));
-            }
-            if !terminated {
-                return Err(Error::at_line(number, ErrorKind::MissingFinalNewline));
-            }
-            // Printable ASCII is UTF-8; the conversion cannot fail, but is
-            // not unwrapped (AGENTS.md §6).
-            let Ok(text) = core::str::from_utf8(line) else {
-                return Err(Error::at_line(number, ErrorKind::InvalidCharacter));
-            };
-            if text.is_empty() || text.as_bytes().first() == Some(&COMMENT) {
-                continue;
-            }
-            let entry = Self::entry(number, text, keys)?;
-            if entries.iter().any(|seen| seen.key == entry.key) {
-                return Err(Error::at(number, entry.key, ErrorKind::DuplicateKey));
-            }
-            entries.push(entry);
-        }
-        Ok(Document { entries })
-    }
-
-    /// One non-empty, non-comment line as `key = value`.
-    /// Spec: docs/50 R50-15, §7.1.
-    fn entry(number: u32, text: &'a str, keys: &[&'static str]) -> Result<Entry<'a>, Error> {
-        let key_len = text.bytes().take_while(|&b| is_key_octet(b)).count();
-        let (key, after_key) = text.split_at_checked(key_len).unwrap_or((text, ""));
-        if !key.bytes().next().is_some_and(|b| b.is_ascii_lowercase()) {
-            return Err(Error::at_line(number, ErrorKind::MalformedLine));
-        }
-        let Some(value) = after_key.strip_prefix(SEPARATOR) else {
-            return Err(Error::at_line(number, ErrorKind::MalformedLine));
-        };
-        if key.len() > MAX_KEY_OCTETS {
-            return Err(Error::at_line(number, ErrorKind::KeyTooLong));
-        }
-        let Some(&known) = keys.iter().find(|k| **k == key) else {
-            return Err(Error::at_line(number, ErrorKind::UnknownKey));
-        };
-        if value.is_empty() || value.starts_with(' ') || value.ends_with(' ') {
-            return Err(Error::at(number, known, ErrorKind::MalformedLine));
-        }
-        if value.len() > MAX_VALUE_OCTETS {
-            return Err(Error::at(number, known, ErrorKind::ValueTooLong));
-        }
-        Ok(Entry {
-            line: number,
-            key: known,
-            value,
-        })
+        Entries::parse(input, keys)
+            .map(|entries| Document { entries })
+            .map_err(error_of)
     }
 
     /// The value of the required `key`, parsed by `parse`, with its line; a
@@ -151,13 +89,9 @@ impl<'a> Document<'a> {
         key: &'static str,
         parse: impl FnOnce(&'a str) -> Result<T, ErrorKind>,
     ) -> Result<(T, u32), Error> {
-        let entry = self
-            .entries
-            .iter()
-            .find(|e| e.key == key)
-            .ok_or(Error::missing(key))?;
-        parse(entry.value)
-            .map(|value| (value, entry.line))
-            .map_err(|kind| Error::at(entry.line, key, kind))
+        let entry = self.entries.find(key).ok_or(Error::missing(key))?;
+        parse(entry.value())
+            .map(|value| (value, entry.line()))
+            .map_err(|kind| Error::at(entry.line(), key, kind))
     }
 }

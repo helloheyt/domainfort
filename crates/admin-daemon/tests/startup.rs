@@ -10,8 +10,8 @@
 mod support;
 
 use admin_daemon::startup::{
-    hardening_plan, params, prepare_socket_directory, read_settings, StartupError,
-    LOCKED_MEMORY_LIMIT, OPEN_FILES_HEADROOM, SOCKET_DIRECTORY_MODE,
+    hardening_plan, params, prepare_socket_directory, read_settings, read_settings_owned_by,
+    StartupError, LOCKED_MEMORY_LIMIT, OPEN_FILES_HEADROOM, SOCKET_DIRECTORY_MODE,
 };
 use admin_daemon::{
     serve, AuditEndpoint, AuditLinkError, DaemonControl, DaemonError, DaemonParams, Limits,
@@ -159,6 +159,30 @@ fn a_configuration_not_owned_by_root_is_refused() {
         read_settings(&dir.join("absent.conf")),
         Err(StartupError::ConfigUnreadable)
     );
+}
+
+/// Task F7 (A-86 follow-up, "O_NOFOLLOW in every reader"): with the test
+/// account standing in for root, the configuration is read through its own
+/// path, and a symbolic link to the same file is refused as
+/// `ConfigPermissions` (not a regular file) — never followed.
+#[test]
+fn a_symbolic_link_to_a_valid_configuration_is_refused() {
+    let dir = TempDir::new();
+    let uid = my_uid(&dir);
+    let path = dir.join("admind.conf");
+    std::fs::write(&path, ADMIND).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(
+        read_settings_owned_by(&path, uid).unwrap(),
+        AdmindSettings::parse(ADMIND.as_bytes()).unwrap()
+    );
+    let link = dir.join("link.conf");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    assert_eq!(
+        read_settings_owned_by(&link, uid),
+        Err(StartupError::ConfigPermissions)
+    );
+    assert_eq!(read_settings(&link), Err(StartupError::ConfigPermissions));
 }
 
 /// docs/50 R50-14, §6.1, §6.4 (admind: `mlockall` — passwords in transit);

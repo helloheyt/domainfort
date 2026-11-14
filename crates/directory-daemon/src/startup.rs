@@ -8,8 +8,8 @@
 //! (A-61), Q-270.
 
 use crate::admin_service::{
-    AdminParams, KeydTicketVerifier, TicketVerifier, VerifierFactory, ADMIN_QUEUE_CAPACITY,
-    DECISION_ACK_DEADLINE, MAX_ADMIN_CONNECTIONS,
+    AdminParams, DecisionAckDeadline, KeydTicketVerifier, TicketVerifier, VerifierFactory,
+    ADMIN_QUEUE_CAPACITY, MAX_ADMIN_CONNECTIONS,
 };
 use crate::audit_link::AuditEndpoint;
 use crate::clock::SharedClock;
@@ -27,12 +27,21 @@ use dirstore::{IntegrityKey, INTEGRITY_KEY_LEN};
 use ipc_audit::WindowConfig;
 use keyd_types::KeydConfig;
 use krb_proto::Realm;
-use std::fs::File;
+use protected_file::{FileFacts, OpenError, Refusal, PERMISSION_BITS};
 use std::io::Read;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 use zeroize::Zeroizing;
+
+/// The owner of the files dird reads before its drop: root.
+/// Spec: docs/50 §7.1 ("file root:0644"), §7.4; Q-270 item 1.
+const ROOT_UID: u32 = 0;
+
+/// The permission bits of the development integrity-key file: exactly 0400.
+/// Spec: docs/50 §7.4, R50-12 ("the file 0400"); docs/questions/Q-270
+/// item 1.
+const INTEGRITY_KEY_FILE_MODE: u32 = 0o400;
 
 /// Open files beyond the kdc's connection quota and the LDAP session bound:
 /// stdio, the two listeners, the audit connection, the redb file, the
@@ -54,8 +63,9 @@ pub const SOCKET_DIRECTORY_MODE: u32 = 0o750;
 pub enum StartupError {
     /// The configuration file could not be opened or read.
     ConfigUnreadable,
-    /// The configuration file is not a regular file owned by root and
-    /// writable only by its owner (docs/50 §7.1: "file root:0644").
+    /// The configuration file is not a regular file (a symbolic link
+    /// included) owned by root and writable only by its owner (docs/50
+    /// §7.1: "file root:0644").
     ConfigPermissions,
     /// The configuration file is larger than the format allows.
     ConfigTooLarge,
@@ -133,15 +143,6 @@ impl fmt::Display for StartupError {
 
 impl std::error::Error for StartupError {}
 
-/// Read a whole file of at most `bound` octets (one more is read so an
-/// oversized file is detected without reading it whole).
-fn read_bounded(file: File, bound: usize) -> std::io::Result<Vec<u8>> {
-    let mut contents = Vec::new();
-    file.take(u64::try_from(bound).unwrap_or(u64::MAX).saturating_add(1))
-        .read_to_end(&mut contents)?;
-    Ok(contents)
-}
-
 /// Read and parse dird's configuration file: a regular file owned by root
 /// and not writable by group or others, at most
 /// `config::limits::MAX_FILE_OCTETS` octets.
@@ -151,18 +152,29 @@ fn read_bounded(file: File, bound: usize) -> std::io::Result<Vec<u8>> {
 ///
 /// Spec: docs/50 R50-15, §7.1; docs/questions/Q-230; Q-270 items 1-2.
 pub fn read_settings(path: &Path) -> Result<DirdSettings, StartupError> {
-    let file = File::open(path).map_err(|_| StartupError::ConfigUnreadable)?;
-    let metadata = file
-        .metadata()
-        .map_err(|_| StartupError::ConfigUnreadable)?;
-    if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
-        return Err(StartupError::ConfigPermissions);
-    }
-    let bound = config::limits::MAX_FILE_OCTETS;
-    let contents = read_bounded(file, bound).map_err(|_| StartupError::ConfigUnreadable)?;
-    if contents.len() > bound {
-        return Err(StartupError::ConfigTooLarge);
-    }
+    read_settings_owned_by(path, ROOT_UID)
+}
+
+/// Read and parse dird's configuration file, which must be owned by `owner`
+/// (root in the daemon — [`read_settings`]; the test account in tests, as
+/// [`read_integrity_key`] and [`read_policy`] take it). The file is reached
+/// through crates/protected-file (task F7, A-86 follow-up): the path is
+/// inspected without following a symbolic link (a link is refused as
+/// [`StartupError::ConfigPermissions`], before any open), opened with
+/// O_NOFOLLOW, and the rule applied again to the opened descriptor.
+///
+/// # Errors
+/// [`StartupError`].
+///
+/// Spec: docs/50 R50-15, §7.1; docs/questions/Q-230; Q-270 items 1-2; A-86.
+pub fn read_settings_owned_by(path: &Path, owner: u32) -> Result<DirdSettings, StartupError> {
+    let contents =
+        protected_file::read_configuration_file(path, owner, config::limits::MAX_FILE_OCTETS)
+            .map_err(|refusal| match refusal {
+                Refusal::Unreadable(_) => StartupError::ConfigUnreadable,
+                Refusal::Rule(_) => StartupError::ConfigPermissions,
+                Refusal::TooLarge => StartupError::ConfigTooLarge,
+            })?;
     let settings =
         DirdSettings::parse(&contents).map_err(|error| StartupError::Config(error.to_string()))?;
     // Only the development sources exist (config enforces it; these
@@ -177,8 +189,9 @@ pub fn read_settings(path: &Path) -> Result<DirdSettings, StartupError> {
 }
 
 /// Read the development integrity key (Q-213 interim; Q-270 item 1): a
-/// regular file (not a symbolic link) owned by `owner` (root in the
-/// daemon), mode exactly 0400, holding exactly 32 octets. Read as root
+/// regular file (not a symbolic link — neither at the path nor when opened,
+/// crates/protected-file) owned by `owner` (root in the daemon), mode
+/// exactly 0400, holding exactly 32 octets. Read as root
 /// before the privilege drop; the reading buffer is wiped when this returns
 /// (the key lives on only inside [`IntegrityKey`], itself wiped on drop).
 ///
@@ -189,15 +202,21 @@ pub fn read_settings(path: &Path) -> Result<DirdSettings, StartupError> {
 /// same pattern for the TLS key: "read as root before the drop, the file
 /// 0400"); docs/questions/Q-213 (A-57); AGENTS.md §6 (secrets).
 pub fn read_integrity_key(path: &Path, owner: u32) -> Result<IntegrityKey, StartupError> {
-    let link = std::fs::symlink_metadata(path).map_err(|_| StartupError::KeyUnreadable)?;
-    if !link.is_file() {
-        return Err(StartupError::KeyPermissions);
-    }
-    let file = File::open(path).map_err(|_| StartupError::KeyUnreadable)?;
-    let metadata = file.metadata().map_err(|_| StartupError::KeyUnreadable)?;
-    if !metadata.is_file() || metadata.uid() != owner || metadata.mode() & 0o7777 != 0o400 {
-        return Err(StartupError::KeyPermissions);
-    }
+    // Spec: docs/50 §7.4; Q-270 item 1 (root, mode exactly 0400); A-86
+    // (crates/protected-file: no symbolic link is followed, the rule is
+    // applied to the path and to the opened descriptor).
+    let key_file_rule = |facts: &FileFacts| {
+        let exact = facts.mode & PERMISSION_BITS == INTEGRITY_KEY_FILE_MODE;
+        if facts.regular_file && facts.owner_uid == owner && exact {
+            Ok(())
+        } else {
+            Err(StartupError::KeyPermissions)
+        }
+    };
+    let file = protected_file::open(path, key_file_rule).map_err(|error| match error {
+        OpenError::Io(_) => StartupError::KeyUnreadable,
+        OpenError::Refused(refusal) => refusal,
+    })?;
     let mut buffer = Zeroizing::new([0u8; INTEGRITY_KEY_LEN + 1]);
     let mut filled = 0usize;
     let mut reader = file.take(u64::try_from(INTEGRITY_KEY_LEN + 1).unwrap_or(u64::MAX));
@@ -432,7 +451,7 @@ pub fn admin_params(
         manifest,
         max_connections: MAX_ADMIN_CONNECTIONS,
         queue_capacity: ADMIN_QUEUE_CAPACITY,
-        ack_deadline: DECISION_ACK_DEADLINE,
+        ack_deadline: DecisionAckDeadline::PRODUCTION,
         key_request_lifetime: directory_admin::KEY_REQUEST_LIFETIME,
     }))
 }

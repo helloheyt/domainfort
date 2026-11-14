@@ -38,6 +38,7 @@ dependencies = [
  "krb-crypto",
  "krb-proto",
  "pdp",
+ "protected-file",
  "provision-manifest",
  "tokio",
  "zeroize",
@@ -68,6 +69,7 @@ dependencies = [
  "daemon-sandbox",
  "ipc",
  "ipc-audit",
+ "protected-file",
  "tokio",
 ]
 
@@ -267,6 +269,7 @@ dependencies = [
  "parse-ldap",
  "pdp",
  "policy-store",
+ "protected-file",
  "provision-manifest",
  "tokio",
  "zeroize",
@@ -602,6 +605,7 @@ dependencies = [
  "krb-proto",
  "pdp",
  "policy-store",
+ "protected-file",
  "tokio",
  "zeroize",
 ]
@@ -634,6 +638,7 @@ dependencies = [
  "krb-crypto",
  "krb-proto",
  "pdp",
+ "protected-file",
  "provision-manifest",
  "tokio",
  "zeroize",
@@ -668,6 +673,7 @@ dependencies = [
  "krb-crypto",
  "krb-proto",
  "pdp",
+ "protected-file",
  "tokio",
  "zeroize",
 ]
@@ -743,6 +749,7 @@ dependencies = [
  "parse-ldap",
  "parse-x509",
  "pdp",
+ "protected-file",
  "rustls",
  "tokio",
  "zeroize",
@@ -828,6 +835,14 @@ dependencies = [
  "dtyp",
  "ipc",
  "pdp",
+ "protected-file",
+]
+
+[[package]]
+name = "protected-file"
+version = "0.0.0"
+dependencies = [
+ "rustix",
 ]
 
 [[package]]
@@ -856,6 +871,7 @@ dependencies = [
  "krb-proto",
  "pdp",
  "policy-store",
+ "protected-file",
  "provision-manifest",
  "rustix",
  "tokio",
@@ -866,9 +882,11 @@ dependencies = [
 name = "provision-manifest"
 version = "0.0.0"
 dependencies = [
+ "config",
  "dtyp",
  "keyd-types",
  "krb-proto",
+ "protected-file",
 ]
 
 [[package]]

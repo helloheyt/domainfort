@@ -84,3 +84,18 @@ fn the_policy_file_is_checked_and_absent_is_refused() {
         Some(LoadError::Policy(PolicyError::TooLarge))
     );
 }
+
+/// Task F7 (A-86 follow-up, "O_NOFOLLOW in every reader"): a symbolic link
+/// to a policy file the reader accepts through its own path is refused as
+/// `Permissions` (not a regular file) — the link is never followed.
+#[test]
+fn a_symbolic_link_to_a_valid_policy_file_is_refused() {
+    let dir = TempDir::new("link");
+    let uid = std::fs::metadata(&dir.0).unwrap().uid();
+    let path = dir.0.join("policy.store");
+    write(&path, &sample_policy().encode().unwrap(), 0o644);
+    assert_eq!(read_file(&path, uid).unwrap(), sample_policy());
+    let link = dir.0.join("link.store");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    assert_eq!(read_file(&link, uid).err(), Some(LoadError::Permissions));
+}

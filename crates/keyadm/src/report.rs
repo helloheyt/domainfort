@@ -214,15 +214,11 @@ pub fn render(report: &CeremonyReport, manifest: &Manifest) -> Vec<String> {
 // The approved-request commands and the sweep (task A10).
 // ---------------------------------------------------------------------------
 
-/// The text of a GUID, in the provisioning manifest's form (crates/
-/// provision-manifest value.rs `guid_text`; [MS-DTYP] 2.5.1.1 as cited
-/// there).
+/// The text of a GUID, in the provisioning manifest's form: dtyp's one GUID
+/// text mapping (A-86 follow-up).
+/// Spec: [MS-DTYP] 2.5.1.1; [MS-DRSR] 5.16.3.16; A-31.
 fn guid_text(guid: &dtyp::Guid) -> String {
-    let d = guid.data4;
-    format!(
-        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        guid.data1, guid.data2, guid.data3, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]
-    )
+    guid.to_text()
 }
 
 /// A refusal status of admind / dird, as a fixed text.

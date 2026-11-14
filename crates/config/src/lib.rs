@@ -45,6 +45,12 @@
 //! override from the environment, no includes"). Details in [`limits`] and
 //! docs/questions/Q-230.
 //!
+//! The line layer (the grammar above, its bounds, unknown and repeated keys)
+//! is the public module [`line_format`]: the one copy of the docs/50 §7.1
+//! line parser, which crates/provision-manifest uses for the provisioning
+//! manifest too (A-86 follow-up; docs/questions/Q-345 item 2, Q-440). The
+//! schemas map its errors onto [`Error`] rule for rule.
+//!
 //! # No secrets
 //!
 //! No setting can hold a key, password, seed or token. Long-term keys live in
@@ -79,6 +85,7 @@ mod keyadm;
 mod keyd;
 mod ldap_front;
 pub mod limits;
+pub mod line_format;
 mod schema;
 mod value;
 

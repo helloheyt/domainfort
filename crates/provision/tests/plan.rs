@@ -504,6 +504,45 @@ fn every_configuration_parses_with_its_schema() {
     assert_eq!(m.naming_context_labels(), ["example", "test"]);
 }
 
+/// docs/51 §6; A-97 (Q-423 item 2, follow-up F7): keyadm's file parses back
+/// with keyadm's own schema and carries the admin-channel pair the
+/// approved-request commands and the sweep require — `admin_socket` = the
+/// `admin.sock` admind's own file names, `admind_uid` = admind's uid (the
+/// one keyd maps to Directory and dird admits on its admin channel) —
+/// besides keyd's socket and uid.
+#[test]
+fn keyadms_configuration_names_admind() {
+    let dir = TempDir::new();
+    let input = input(&dir, 61002, 61007);
+    let p = plan(&input);
+    let text_of = |d: provision::Daemon| p.configs.iter().find(|f| f.daemon == d).unwrap().text();
+    let keyadm =
+        config::KeyadmSettings::parse(text_of(provision::Daemon::Keyadm).as_bytes()).unwrap();
+    let admind_endpoint = keyadm.admind().expect("admin_socket + admind_uid");
+    assert_eq!(
+        admind_endpoint.socket().as_str(),
+        input.paths.admin_socket.as_str()
+    );
+    assert_eq!(admind_endpoint.uid(), 61006);
+    assert_eq!(
+        keyadm.keyd().socket().as_str(),
+        input.paths.keyd_socket.as_str()
+    );
+    assert_eq!(keyadm.keyd().uid(), 61001);
+    // The same socket and uid as admind's own file and dird's admin channel.
+    let admind =
+        config::AdmindSettings::parse(text_of(provision::Daemon::Admind).as_bytes()).unwrap();
+    assert_eq!(admind.admin_socket(), admind_endpoint.socket());
+    assert_eq!(admind.run_as().uid(), admind_endpoint.uid());
+    let dird = text_of(provision::Daemon::Dird);
+    assert!(dird.lines().any(|l| l == "admind_uid = 61006"));
+    let text = text_of(provision::Daemon::Keyadm);
+    assert!(text
+        .lines()
+        .any(|l| l == format!("admin_socket = {}", input.paths.admin_socket.as_str())));
+    assert!(text.lines().any(|l| l == "admind_uid = 61006"));
+}
+
 /// docs/51 §4.3 step 8; A-86: the manifest parses back, and names the
 /// planned GUIDs and SID.
 #[test]

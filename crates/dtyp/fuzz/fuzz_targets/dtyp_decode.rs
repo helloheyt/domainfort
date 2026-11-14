@@ -15,9 +15,13 @@
 //! A decoded descriptor is also used as the parent of CreateSecurityDescriptor
 //! (container and leaf child): no panic, and any computed descriptor must
 //! encode and decode back to itself.
+//! If the input is UTF-8 and parses as a GUID text (the lower-case
+//! `8-4-4-4-12` form, task F7), its text must be exactly the input (one
+//! spelling per value); any 16 octets are a GUID packet, whose text must
+//! parse back to the same GUID.
 //!
-//! Spec: [MS-DTYP] 2.4.2.1, 2.4.2.2, 2.4.4.1, 2.4.5, 2.4.6, 2.5.3.4.1;
-//! RFC 5234 §2.3.
+//! Spec: [MS-DTYP] 2.3.4.2, 2.4.2.1, 2.4.2.2, 2.4.4.1, 2.4.5, 2.4.6, 2.5.1.1,
+//! 2.5.3.4.1; [MS-DRSR] 5.16.3.16; RFC 5234 §2.3.
 
 use libfuzzer_sys::fuzz_target;
 
@@ -62,7 +66,17 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(sid) = dtyp::Sid::decode(data) {
         assert_eq!(dtyp::Sid::decode(&sid.encode()).expect("must decode"), sid);
     }
+    if let Ok(packet) = <&[u8; dtyp::GUID_PACKET_LEN]>::try_from(data) {
+        let guid = dtyp::Guid::from_packet(packet);
+        assert_eq!(
+            dtyp::Guid::parse_text(&guid.to_text()).expect("a GUID's text must parse"),
+            guid
+        );
+    }
     if let Ok(text) = core::str::from_utf8(data) {
+        if let Ok(guid) = dtyp::Guid::parse_text(text) {
+            assert_eq!(guid.to_text(), text, "one spelling per GUID");
+        }
         if let Ok(sid) = dtyp::Sid::parse_sid_string(text) {
             let canonical = sid.to_sid_string();
             assert_eq!(

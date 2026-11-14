@@ -26,7 +26,8 @@ use directory_daemon::policy::{
     tier_map, DevelopmentPolicy, MandatoryFast, PolicyError, MARKER, SUPERSEDED_FORMAT,
 };
 use directory_daemon::startup::{
-    hardening_plan, params, read_integrity_key, read_policy, read_settings, StartupError,
+    hardening_plan, params, read_integrity_key, read_policy, read_settings, read_settings_owned_by,
+    StartupError,
 };
 use dirstore::Store;
 use dtyp::{Sid, SECURITY_NT_AUTHORITY};
@@ -291,4 +292,39 @@ fn parameters_plan_and_configuration_owner() {
             Some(StartupError::ConfigPermissions)
         );
     }
+}
+
+/// Task F7 (A-86 follow-up, "O_NOFOLLOW in every reader"): with the test
+/// account standing in for root, dird's configuration and policy files are
+/// read through their own paths, and a symbolic link to either is refused
+/// as a permissions error (not a regular file) — never followed. (The
+/// integrity key's link case is in
+/// `the_integrity_key_file_is_checked_and_opens_its_store`; the manifest's
+/// in crates/provision-manifest tests/no_follow.rs.)
+#[test]
+fn a_symbolic_link_to_a_valid_configuration_or_policy_is_refused() {
+    let dir = TempDir::new();
+    let uid = support::my_uid(&dir);
+    let config = dir.join("dird.conf");
+    write(&config, DIRD.as_bytes(), 0o644);
+    assert!(read_settings_owned_by(&config, uid).is_ok());
+    let config_link = dir.join("dird-link.conf");
+    std::os::unix::fs::symlink(&config, &config_link).unwrap();
+    assert_eq!(
+        read_settings_owned_by(&config_link, uid).err(),
+        Some(StartupError::ConfigPermissions)
+    );
+    assert_eq!(
+        read_settings(&config_link).err(),
+        Some(StartupError::ConfigPermissions)
+    );
+    let policy = dir.join("policy.store");
+    write(&policy, &sample_policy().encode().unwrap(), 0o644);
+    assert_eq!(read_policy(&policy, uid).unwrap(), sample_policy());
+    let policy_link = dir.join("policy-link.store");
+    std::os::unix::fs::symlink(&policy, &policy_link).unwrap();
+    assert_eq!(
+        read_policy(&policy_link, uid).err(),
+        Some(StartupError::PolicyPermissions)
+    );
 }

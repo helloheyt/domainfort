@@ -24,7 +24,8 @@ edition = "2021"
 publish = false
 
 [dependencies]
-# Our own workspace crates only (path dependencies); no external crate.
+# Our own workspace crates only (path dependencies); no external crate of
+# its own (rustix comes in through protected-file).
 #
 # The bounded field primitives (`Reader`, `Writer`, `FrameLimit`): the file
 # keeps "the discipline of the IPC codec" (A-57, docs/50 §3.3).
@@ -34,6 +35,10 @@ ipc = { path = "../ipc" }
 pdp = { path = "../pdp" }
 # SIDs ([MS-DTYP] 2.4.2.2) and GUIDs ([MS-DTYP] 2.3.4).
 dtyp = { path = "../dtyp" }
+# The protected-file reader (task F7, A-86 follow-up): the policy file is
+# inspected without following a link, opened with O_NOFOLLOW and checked on
+# the opened descriptor. rustix inside (P-12), already in the lock.
+protected-file = { path = "../protected-file" }
 
 [lints]
 workspace = true

@@ -7,31 +7,31 @@
 //! the key sets and bindings (A-19), admind's file names the account to
 //! drop to, keyd's socket and uid, and the minimum password length (A-79).
 //! The rule is the configuration-file rule (docs/50 §7.1: "file root:0644";
-//! crates/provision-manifest `check_file`), with the A-86 follow-up applied
-//! here: the path is inspected without following a link (a link, a FIFO, a
+//! crates/provision-manifest `check_file`), with the A-86 follow-up applied:
+//! the path is inspected without following a link (a link, a FIFO, a
 //! directory are refused before any open), opened with O_NOFOLLOW, and the
 //! opened file checked again — a regular file, owned by root, not writable
 //! by group or others — and read only up to the format's size bound + 1.
+//!
+//! Since task F7 there is one reader for this (A-96 / Q-414 item 4): the
+//! manifest goes through crates/provision-manifest's owner-injectable
+//! reader (`read_manifest_owned_by`, the one keyadm and dird use with owner
+//! 0), admind's file through crates/protected-file, on which that reader is
+//! built. This module only maps their errors onto [`RootFileError`].
 //!
 //! The owner required is a parameter: 0 in production (the binary), the
 //! test account in tests — as `Ownership::root_uid` for `provision policy`.
 //!
 //! Spec: docs/51 §4.3 steps 7, 8, 12; docs/50 R50-15, §7.1; A-60 (errors
-//! never echo a value); A-86 (O_NOFOLLOW in every reader); AGENTS.md §6
-//! (bounded reads).
+//! never echo a value); A-86 (O_NOFOLLOW in every reader); A-96; AGENTS.md
+//! §6 (bounded reads).
 
 use core::fmt;
-use std::io::Read;
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use config::AdmindSettings;
-use provision_manifest::Manifest;
-
-/// Write permission for group and others (must be clear).
-/// Spec: docs/50 §7.1 ("root:0644"); crates/provision-manifest
-/// `FORBIDDEN_MODE_BITS`.
-const FORBIDDEN_MODE_BITS: u32 = 0o022;
+use protected_file::{Refusal, RuleBreak};
+use provision_manifest::{Manifest, ReadError};
 
 /// Why a root-owned input was refused. Fixed texts (a configuration or
 /// manifest error names a line or key, never a value — A-60).
@@ -69,38 +69,13 @@ impl fmt::Display for RootFileError {
 
 impl std::error::Error for RootFileError {}
 
-/// The ownership rule on one file's metadata.
-fn check(metadata: &std::fs::Metadata, root_uid: u32) -> Result<(), RootFileError> {
-    if !metadata.file_type().is_file() {
-        return Err(RootFileError::NotRegular);
+/// A break of the configuration-file rule as a [`RootFileError`].
+fn rule_error(rule: RuleBreak) -> RootFileError {
+    match rule {
+        RuleBreak::NotRegularFile => RootFileError::NotRegular,
+        RuleBreak::WrongOwner => RootFileError::NotRootOwned,
+        RuleBreak::WritableByGroupOrOthers => RootFileError::WritableByOthers,
     }
-    if metadata.uid() != root_uid {
-        return Err(RootFileError::NotRootOwned);
-    }
-    if metadata.mode() & FORBIDDEN_MODE_BITS != 0 {
-        return Err(RootFileError::WritableByOthers);
-    }
-    Ok(())
-}
-
-/// The content of the root-owned file at `path`, at most `bound` octets
-/// (module documentation).
-fn read_root_owned(path: &Path, root_uid: u32, bound: usize) -> Result<Vec<u8>, RootFileError> {
-    let link = std::fs::symlink_metadata(path).map_err(|_| RootFileError::Unreadable)?;
-    check(&link, root_uid)?;
-    let file = crate::fs::open_no_follow(path).map_err(|_| RootFileError::Unreadable)?;
-    let opened = file.metadata().map_err(|_| RootFileError::Unreadable)?;
-    check(&opened, root_uid)?;
-    let limit = u64::try_from(bound).unwrap_or(u64::MAX).saturating_add(1);
-    let mut contents = Vec::new();
-    // std `io::Read::read_to_end` retries `ErrorKind::Interrupted` itself.
-    file.take(limit)
-        .read_to_end(&mut contents)
-        .map_err(|_| RootFileError::Unreadable)?;
-    if contents.len() > bound {
-        return Err(RootFileError::TooLarge);
-    }
-    Ok(contents)
 }
 
 /// Read and parse admind's configuration file (owned by `root_uid`).
@@ -108,20 +83,35 @@ fn read_root_owned(path: &Path, root_uid: u32, bound: usize) -> Result<Vec<u8>, 
 /// # Errors
 /// [`RootFileError`].
 ///
-/// Spec: docs/50 R50-15, §7.1; crates/config `AdmindSettings::parse`.
+/// Spec: docs/50 R50-15, §7.1; crates/config `AdmindSettings::parse`;
+/// crates/protected-file `read_configuration_file` (A-86).
 pub fn read_admind_settings(path: &Path, root_uid: u32) -> Result<AdmindSettings, RootFileError> {
-    let contents = read_root_owned(path, root_uid, config::limits::MAX_FILE_OCTETS)?;
+    let contents =
+        protected_file::read_configuration_file(path, root_uid, config::limits::MAX_FILE_OCTETS)
+            .map_err(|refusal| match refusal {
+                Refusal::Unreadable(_) => RootFileError::Unreadable,
+                Refusal::Rule(rule) => rule_error(rule),
+                Refusal::TooLarge => RootFileError::TooLarge,
+            })?;
     AdmindSettings::parse(&contents).map_err(RootFileError::Config)
 }
 
-/// Read and parse the provisioning manifest (owned by `root_uid`).
+/// Read and parse the provisioning manifest (owned by `root_uid`), through
+/// crates/provision-manifest's reader — the one keyadm and dird use (A-96
+/// follow-up; Q-414 item 4).
 ///
 /// # Errors
 /// [`RootFileError`].
 ///
 /// Spec: docs/51 §4.3 steps 8, 12; crates/provision-manifest
-/// `Manifest::parse`.
+/// `read_manifest_owned_by`.
 pub fn read_manifest(path: &Path, root_uid: u32) -> Result<Manifest, RootFileError> {
-    let contents = read_root_owned(path, root_uid, provision_manifest::limits::MAX_FILE_OCTETS)?;
-    Manifest::parse(&contents).map_err(RootFileError::Manifest)
+    provision_manifest::read_manifest_owned_by(path, root_uid).map_err(|error| match error {
+        ReadError::Unreadable => RootFileError::Unreadable,
+        ReadError::NotRegularFile => RootFileError::NotRegular,
+        ReadError::NotRootOwned => RootFileError::NotRootOwned,
+        ReadError::WritableByOthers => RootFileError::WritableByOthers,
+        ReadError::TooLarge => RootFileError::TooLarge,
+        ReadError::Manifest(error) => RootFileError::Manifest(error),
+    })
 }

@@ -92,6 +92,11 @@ ipc-audit = { path = "../ipc-audit", default-features = false }
 config = { path = "../config" }
 # `HardeningPlan`, `SingleThreadProof`, `apply` (R50-14).
 daemon-sandbox = { path = "../daemon-sandbox" }
+# The protected-file reader (task F7, A-86 follow-up): every file read as
+# root before the drop is inspected without following a link, opened with
+# O_NOFOLLOW and checked on the opened descriptor. rustix inside (owner
+# decision P-12), already in the lock — no new package.
+protected-file = { path = "../protected-file" }
 # The strict RFC 5280 §4.1 certificate reader (docs/questions/Q-320): the DC
 # certificate's signatureAlgorithm / tbsCertificate.signature, SPKI
 # algorithm and validity are read with it at start-up (R50-12). Its only

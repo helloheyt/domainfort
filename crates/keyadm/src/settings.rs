@@ -1,19 +1,23 @@
 //! Reading keyadm's configuration file.
 //!
 //! The file must be a regular file owned by root and not writable by group
-//! or others (docs/50 §7.1: "file root:0644"), checked the way the daemons
-//! check theirs (crates/keyd-daemon `startup::read_settings`) and with the
-//! same rule the manifest file obeys ([`provision_manifest::check_file`]);
-//! at most `config::limits::MAX_FILE_OCTETS` + 1 octets are read.
+//! or others (docs/50 §7.1: "file root:0644"), the rule the daemons and the
+//! manifest file obey; at most `config::limits::MAX_FILE_OCTETS` + 1 octets
+//! are read. Since task F7 the file is reached through crates/protected-file
+//! (A-86 follow-up): the path is inspected without following a symbolic link
+//! (a link is refused as not a regular file), opened with O_NOFOLLOW, and
+//! the rule applied again to the opened descriptor.
 //!
-//! Spec: docs/50 R50-15, §7.1; docs/51 §6; AGENTS.md §6.
+//! Spec: docs/50 R50-15, §7.1; docs/51 §6; A-86; AGENTS.md §6.
 
 use config::KeyadmSettings;
 use core::fmt;
-use provision_manifest::{check_file, FileFacts, ReadError};
-use std::fs::File;
-use std::io::Read;
+use protected_file::Refusal;
 use std::path::Path;
+
+/// The owner keyadm's configuration file must have: root.
+/// Spec: docs/50 §7.1 ("file root:0644").
+const ROOT_UID: u32 = 0;
 
 /// Why the configuration file was not accepted. Carries no file content
 /// (the configuration's own errors never echo a value, A-60).
@@ -21,7 +25,8 @@ use std::path::Path;
 pub enum SettingsError {
     /// The file could not be opened, inspected or read.
     Unreadable,
-    /// Not a regular file owned by root and writable only by its owner.
+    /// Not a regular file (a symbolic link included) owned by root and
+    /// writable only by its owner.
     Permissions,
     /// Larger than the format allows.
     TooLarge,
@@ -44,36 +49,31 @@ impl fmt::Display for SettingsError {
 
 impl std::error::Error for SettingsError {}
 
-/// The file rule (regular, root-owned, not group/other-writable) as a
-/// [`SettingsError`].
-fn check(metadata: &std::fs::Metadata) -> Result<(), SettingsError> {
-    check_file(&FileFacts::of(metadata)).map_err(|error| match error {
-        ReadError::NotRegularFile | ReadError::NotRootOwned | ReadError::WritableByOthers => {
-            SettingsError::Permissions
-        }
-        _ => SettingsError::Unreadable,
-    })
-}
-
-/// Read and parse keyadm's configuration file.
+/// Read and parse keyadm's configuration file (owned by root).
 ///
 /// # Errors
 /// [`SettingsError`].
 ///
-/// Spec: docs/50 R50-15, §7.1; crates/keyd-daemon `read_settings`.
+/// Spec: docs/50 R50-15, §7.1.
 pub fn read_settings(path: &Path) -> Result<KeyadmSettings, SettingsError> {
-    let before = std::fs::metadata(path).map_err(|_| SettingsError::Unreadable)?;
-    check(&before)?;
-    let file = File::open(path).map_err(|_| SettingsError::Unreadable)?;
-    let opened = file.metadata().map_err(|_| SettingsError::Unreadable)?;
-    check(&opened)?;
-    let bound = config::limits::MAX_FILE_OCTETS;
-    let mut contents = Vec::new();
-    file.take(u64::try_from(bound).unwrap_or(u64::MAX).saturating_add(1))
-        .read_to_end(&mut contents)
-        .map_err(|_| SettingsError::Unreadable)?;
-    if contents.len() > bound {
-        return Err(SettingsError::TooLarge);
-    }
+    read_settings_owned_by(path, ROOT_UID)
+}
+
+/// Read and parse keyadm's configuration file, which must be owned by
+/// `owner` (root in the binary; the test account in tests, as kdc-daemon's
+/// and ldap-front's `read_settings`).
+///
+/// # Errors
+/// [`SettingsError`].
+///
+/// Spec: docs/50 R50-15, §7.1; A-86 (crates/protected-file).
+pub fn read_settings_owned_by(path: &Path, owner: u32) -> Result<KeyadmSettings, SettingsError> {
+    let contents =
+        protected_file::read_configuration_file(path, owner, config::limits::MAX_FILE_OCTETS)
+            .map_err(|refusal| match refusal {
+                Refusal::Unreadable(_) => SettingsError::Unreadable,
+                Refusal::Rule(_) => SettingsError::Permissions,
+                Refusal::TooLarge => SettingsError::TooLarge,
+            })?;
     KeyadmSettings::parse(&contents).map_err(SettingsError::Config)
 }

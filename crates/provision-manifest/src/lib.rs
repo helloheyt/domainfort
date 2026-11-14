@@ -12,8 +12,9 @@
 //!
 //! # Format
 //!
-//! The configuration line format of docs/50 §7.1 (crates/config's rules,
-//! see the `format` module notes): `key = value` lines, `#` comments in the
+//! The configuration line format of docs/50 §7.1, parsed by crates/config's
+//! public line layer `config::line_format` (one copy, A-86 follow-up — see
+//! the `format` module notes): `key = value` lines, `#` comments in the
 //! first column, printable ASCII only, LF after every line, ≤ 64 KiB,
 //! ≤ 1024 octets a line; the closed key table [`Manifest::KEYS`], every key
 //! required, none twice, nothing else. Values:
@@ -31,7 +32,8 @@
 //! | `first_admins` | 2–8 × `<guid>:NT-PRINCIPAL:<sAMAccountName>`, `", "`-separated | docs/47 §9.1; [MS-SAMR] 3.1.1.6; Q-295 |
 //!
 //! A `<guid>` is the lower-case `8-4-4-4-12` form ([MS-DTYP] 2.5.1.1 layout,
-//! field order from [MS-DRSR] 5.16.3.16 — the A-31 route), never NULL, used
+//! field order from [MS-DRSR] 5.16.3.16 — the A-31 route; dtyp's
+//! `Guid::parse_text` / `to_text`, the workspace's one copy), never NULL, used
 //! once in the manifest; it stands for the 16-octet [MS-DTYP] 2.3.4.2 packet
 //! that is the object's `PrincipalId` in keyd (docs/47 §2.3). A binding is
 //! written `<NAME-TYPE>:<c1>[/<c2>]` in the manifest's realm, and each
@@ -62,7 +64,8 @@
 //! Every bound is a named constant ([`limits`]) checked before the octets it
 //! covers are copied. Errors name a line and a key, never input text. No
 //! secret is ever a manifest value. A manifest file must be owned by root
-//! and not writable by group or others ([`read_manifest`]).
+//! and not writable by group or others, and is reached without following a
+//! symbolic link ([`read_manifest`], through crates/protected-file).
 //!
 //! # Provenance
 //!
@@ -91,7 +94,10 @@ mod value;
 
 pub use error::{Error, ErrorKind, ReadError};
 #[cfg(unix)]
-pub use file::{check_file, read_manifest, FileFacts, FORBIDDEN_MODE_BITS, REQUIRED_OWNER_UID};
+pub use file::{
+    check_file, read_manifest, read_manifest_owned_by, FileFacts, FORBIDDEN_MODE_BITS,
+    REQUIRED_OWNER_UID,
+};
 pub use manifest::{
     keys, FirstAdmin, KeySet, Manifest, ManifestFields, ADMIN_SERVICE_CLASS, KRBTGT_SERVICE,
     LDAP_SERVICE_CLASS,

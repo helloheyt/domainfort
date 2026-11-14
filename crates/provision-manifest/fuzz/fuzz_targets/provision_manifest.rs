@@ -16,9 +16,13 @@
 //!   manifest, and that text is a fixed point of encode ∘ parse (one
 //!   canonical spelling);
 //! * an accepted manifest has 2 ..= 8 first administrators and no two
-//!   objects with the same GUID (docs/51 §4.3 steps 2, 8; Q-295).
+//!   objects with the same GUID (docs/51 §4.3 steps 2, 8; Q-295);
+//! * the line layer is crates/config's (task F7, A-86 follow-up): input the
+//!   manifest accepts is accepted by `config::line_format` over the
+//!   manifest's table, and input the line layer refuses is refused by the
+//!   manifest at the same line and key.
 //!
-//! Spec: docs/51 §4.3 step 8; docs/50 R50-15, §7.1, §9.
+//! Spec: docs/51 §4.3 step 8; docs/50 R50-15, §7.1, §9; A-86.
 
 use libfuzzer_sys::fuzz_target;
 use provision_manifest::limits::{MAX_FILE_OCTETS, MAX_FIRST_ADMINS, MIN_FIRST_ADMINS};
@@ -26,6 +30,14 @@ use provision_manifest::Manifest;
 
 fuzz_target!(|data: &[u8]| {
     let result = Manifest::parse(data);
+    match config::line_format::Entries::parse(data, Manifest::KEYS) {
+        Ok(_) => {}
+        Err(line) => {
+            let err = result.as_ref().expect_err("the line layer refused it");
+            assert_eq!(err.line(), line.line());
+            assert_eq!(err.key(), line.key());
+        }
+    }
     let cut = !data.is_empty() && data.last() != Some(&b'\n');
     if data.len() > MAX_FILE_OCTETS || cut {
         assert!(result.is_err(), "bound and final LF enforced");
@@ -40,6 +52,7 @@ fuzz_target!(|data: &[u8]| {
             }
         }
         Ok(manifest) => {
+            assert!(config::line_format::Entries::parse(data, Manifest::KEYS).is_ok());
             assert!(data
                 .iter()
                 .all(|&b| b == b'\n' || (0x20..=0x7E).contains(&b)));

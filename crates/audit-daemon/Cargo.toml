@@ -34,6 +34,11 @@ ipc = { path = "../ipc" }
 config = { path = "../config" }
 # Process hardening before any thread (docs/50 R50-14; A-61).
 daemon-sandbox = { path = "../daemon-sandbox" }
+# The protected-file reader (task F7, A-86 follow-up): every file read as
+# root before the drop is inspected without following a link, opened with
+# O_NOFOLLOW and checked on the opened descriptor. rustix inside (owner
+# decision P-12), already in the lock — no new package.
+protected-file = { path = "../protected-file" }
 # The async runtime — owner decision P-12 (2026-11-13), linked never copied;
 # only its docs.rs API pages were read (P-2). Version 1.54.1, license "MIT"
 # (crates.io metadata, 2026-11-13; on the AGENTS.md §7 allowlist). Features:

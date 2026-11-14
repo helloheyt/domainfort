@@ -173,89 +173,33 @@ pub(crate) fn domain_sid(text: &str) -> Result<Sid, ErrorKind> {
 
 // ---- GUID -------------------------------------------------------------------
 //
-// [MS-DTYP] 2.3.4.3 defines the curly-braced GUID string only by reference
-// to RFC 4122, which is not an allowed source (that is why crates/dtyp has
-// no string form). The form here is derived from allowed text only — the
-// route decision A-31 accepted for crates/ad-schema (docs/questions/Q-100
-// item 1), re-derived in this session from the pinned specs:
-//
-// * layout: [MS-DTYP] 2.5.1.1, SDDL ABNF `guid = 8HEXDIG "-" 4HEXDIG "-"
-//   4HEXDIG "-" 4HEXDIG "-" 12HEXDIG` ("the GUID of the object in the form
-//   XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX");
-// * fields: [MS-DTYP] 2.3.4.1 (Data1 `unsigned long`, Data2 / Data3
-//   `unsigned short`, Data4 `byte[8]`) and 2.3.4.2 (the packet);
-// * which group is which field: [MS-DRSR] 5.16.3.16, whose printed LDAP
-//   value carries the object ACE type as the octets
-//   `53 1a 72 ab 2f 1e d0 11 98 19 00 aa 00 40 52 9b` and prints it as
-//   `ab721a53-1e2f-11d0-9819-00aa0040529b` — group 1 is the value of Data1,
-//   group 2 of Data2, group 3 of Data3, groups 4 and 5 the eight Data4 octets
-//   in array order.
-//
-// Only lower-case hex digits are accepted (one spelling per value; the
-// [MS-DRSR] example is lower case).
+// The text form is dtyp's one mapping ([`Guid::parse_text`] /
+// [`Guid::to_text`]): the lower-case `8-4-4-4-12` form of [MS-DTYP] 2.5.1.1,
+// fields from 2.3.4.1 / 2.3.4.2, group order from the [MS-DRSR] 5.16.3.16
+// example — the A-31 route this crate had re-derived (Q-345 item 5), moved
+// to dtyp so the workspace has one copy (A-86 follow-up, task F7). The
+// manifest adds only its own rule: the NULL GUID is no object's GUID.
 
-/// Length of the GUID text. Spec: [MS-DTYP] 2.5.1.1 (8+4+4+4+12 hex digits
-/// and four "-").
-const GUID_TEXT_LEN: usize = 36;
+/// Length of the GUID text. Spec: [MS-DTYP] 2.5.1.1 (dtyp `GUID_TEXT_LEN`).
+const GUID_TEXT_LEN: usize = dtyp::GUID_TEXT_LEN;
 
-/// Offsets of the four "-". Spec: [MS-DTYP] 2.5.1.1.
-const GUID_DASHES: [usize; 4] = [8, 13, 18, 23];
-
-/// Offsets of the eight two-digit Data4 octets (groups 4 and 5).
-/// Spec: [MS-DTYP] 2.5.1.1; [MS-DRSR] 5.16.3.16.
-const GUID_DATA4_AT: [usize; 8] = [19, 21, 24, 26, 28, 30, 32, 34];
-
-/// The value of the hex digits `text[start..end]` (already checked to be
-/// lower-case hex digits).
-fn hex(text: &str, start: usize, end: usize) -> Result<u32, ErrorKind> {
-    let digits = text.get(start..end).ok_or(ErrorKind::InvalidGuid)?;
-    u32::from_str_radix(digits, 16).map_err(|_| ErrorKind::InvalidGuid)
-}
-
-/// A GUID in the lower-case `8-4-4-4-12` form (module notes above); the
-/// NULL GUID is refused.
+/// A GUID in the lower-case `8-4-4-4-12` form (dtyp's mapping); the NULL
+/// GUID is refused.
 /// Spec: [MS-DTYP] 2.3.4.1, 2.3.4.2, 2.5.1.1; [MS-DRSR] 5.16.3.16; docs/51
 /// §4.1 ([MS-ADTS] 3.1.1.5.2.4 as quoted there: an objectGUID "MUST NOT be
 /// the NULL GUID"); PENDING-OWNER A-31.
 pub(crate) fn guid(text: &str) -> Result<Guid, ErrorKind> {
-    let octets = text.as_bytes();
-    if octets.len() != GUID_TEXT_LEN {
-        return Err(ErrorKind::InvalidGuid);
-    }
-    let shaped = octets.iter().enumerate().all(|(at, &c)| {
-        if GUID_DASHES.contains(&at) {
-            c == b'-'
-        } else {
-            c.is_ascii_digit() || (b'a'..=b'f').contains(&c)
-        }
-    });
-    if !shaped {
-        return Err(ErrorKind::InvalidGuid);
-    }
-    let mut data4 = [0u8; 8];
-    for (slot, &at) in data4.iter_mut().zip(GUID_DATA4_AT.iter()) {
-        *slot = u8::try_from(hex(text, at, at + 2)?).map_err(|_| ErrorKind::InvalidGuid)?;
-    }
-    let guid = Guid {
-        data1: hex(text, 0, 8)?,
-        data2: u16::try_from(hex(text, 9, 13)?).map_err(|_| ErrorKind::InvalidGuid)?,
-        data3: u16::try_from(hex(text, 14, 18)?).map_err(|_| ErrorKind::InvalidGuid)?,
-        data4,
-    };
+    let guid = Guid::parse_text(text).map_err(|_| ErrorKind::InvalidGuid)?;
     if guid.to_packet() == [0u8; dtyp::GUID_PACKET_LEN] {
         return Err(ErrorKind::NullGuid);
     }
     Ok(guid)
 }
 
-/// The text of a GUID: the inverse of [`guid`].
+/// The text of a GUID: the inverse of [`guid`] (dtyp's mapping).
 /// Spec: [MS-DTYP] 2.5.1.1; [MS-DRSR] 5.16.3.16.
 pub(crate) fn guid_text(guid: &Guid) -> String {
-    let d = guid.data4;
-    format!(
-        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        guid.data1, guid.data2, guid.data3, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]
-    )
+    guid.to_text()
 }
 
 // ---- sAMAccountName ---------------------------------------------------------

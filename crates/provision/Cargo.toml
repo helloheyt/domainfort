@@ -97,6 +97,10 @@ ipc = { path = "../ipc" }
 # The privilege drop to admind's account (identity, no_new_privs,
 # capabilities, core 0, not dumpable, mlockall) with its read-back check.
 daemon-sandbox = { path = "../daemon-sandbox" }
+# The protected-file reader (task F7, A-86 / A-96 follow-up): admind's
+# configuration for `first-admin-secret` (the manifest goes through
+# provision-manifest's reader, built on it). No new package.
+protected-file = { path = "../protected-file" }
 # admind's password rules ([MS-SAMR] 3.1.1.7.2 as A-79 / Q-401 read them),
 # shared with admin-daemon — the same functions, not a copy.
 admin-password-policy = { path = "../admin-password-policy" }

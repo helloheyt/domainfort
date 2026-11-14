@@ -26,9 +26,7 @@ use config::{KdcSettings, PolicyStoreFormat};
 use core::fmt;
 use daemon_sandbox::{HardeningPlan, PlanError, ProcessIdentity};
 use policy_store::{read_file, DevelopmentPolicy, LoadError};
-use std::fs::File;
-use std::io::Read;
-use std::os::unix::fs::MetadataExt;
+use protected_file::Refusal;
 use std::path::Path;
 
 /// Open files beyond the TCP connection bound: stdio, the listeners, the
@@ -77,28 +75,24 @@ impl std::error::Error for StartupError {}
 
 /// Read and parse the kdc's configuration file: a regular file owned by
 /// `owner` (root in the daemon) and not writable by group or others, at
-/// most `config::limits::MAX_FILE_OCTETS` octets.
+/// most `config::limits::MAX_FILE_OCTETS` octets. The file is reached
+/// through crates/protected-file (task F7, A-86 follow-up): the path is
+/// inspected without following a symbolic link (a link is refused as
+/// [`StartupError::ConfigPermissions`], before any open), opened with
+/// O_NOFOLLOW, and the rule applied again to the opened descriptor.
 ///
 /// # Errors
 /// [`StartupError`].
 ///
-/// Spec: docs/50 R50-15, §7.1; docs/questions/Q-230; A-68.
+/// Spec: docs/50 R50-15, §7.1; docs/questions/Q-230; A-68; A-86.
 pub fn read_settings(path: &Path, owner: u32) -> Result<KdcSettings, StartupError> {
-    let file = File::open(path).map_err(|_| StartupError::ConfigUnreadable)?;
-    let metadata = file
-        .metadata()
-        .map_err(|_| StartupError::ConfigUnreadable)?;
-    if !metadata.is_file() || metadata.uid() != owner || metadata.mode() & 0o022 != 0 {
-        return Err(StartupError::ConfigPermissions);
-    }
-    let bound = config::limits::MAX_FILE_OCTETS;
-    let mut contents = Vec::new();
-    file.take(u64::try_from(bound).unwrap_or(u64::MAX).saturating_add(1))
-        .read_to_end(&mut contents)
-        .map_err(|_| StartupError::ConfigUnreadable)?;
-    if contents.len() > bound {
-        return Err(StartupError::ConfigTooLarge);
-    }
+    let contents =
+        protected_file::read_configuration_file(path, owner, config::limits::MAX_FILE_OCTETS)
+            .map_err(|refusal| match refusal {
+                Refusal::Unreadable(_) => StartupError::ConfigUnreadable,
+                Refusal::Rule(_) => StartupError::ConfigPermissions,
+                Refusal::TooLarge => StartupError::ConfigTooLarge,
+            })?;
     let settings =
         KdcSettings::parse(&contents).map_err(|error| StartupError::Config(error.to_string()))?;
     // Only the unsigned development format exists (config enforces it; this
