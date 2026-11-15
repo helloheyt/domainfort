@@ -166,12 +166,13 @@ tls_handshake_timeout = 10s
 dird_deadline = 62s
 ";
 
-/// ldap-front, required keys only (LDAPS only). Spec: docs/50 §7.1, §4.2;
-/// docs/52 R14 (`internal_networks` required).
+/// ldap-front, required keys only (StartTLS only — `ldap_listen` is
+/// required, task DN10d). Spec: docs/50 §7.1, §4.2 (A-178); docs/52 R14
+/// (`internal_networks` required); docs/questions/Q-1025 item 3.
 pub const LDAP_FRONT_MINIMAL: &str = "\
 run_as_uid = 804
 run_as_gid = 804
-ldaps_listen = 10.0.0.5:636
+ldap_listen = 10.0.0.5:389
 internal_networks = 10.0.0.0/8
 tls_certificate_path = /etc/ldap-front/dc-cert.der
 tls_private_key_path = /etc/ldap-front/dc-key.der

@@ -24,10 +24,10 @@
 //!     --dird-dns-socket <path> --audit-socket <path> --admin-socket <path> \
 //!     --tls-certificate-path <path> --tls-private-key-path <path> \
 //!     --policy-next-path <path> \
-//!     --kdc-listen <addr:port> [--kdc-listen …] \
+//!     --kdc-listen <addr:88> [--kdc-listen …] \
 //!     --ldap-listen <addr:389> [--ldap-listen …] [--ldaps-listen <addr:port> …] \
-//!     --kpasswd-listen <addr:port> [--kpasswd-listen …] \
-//!     --dnsd-listen <addr:port> [--dnsd-listen …] \
+//!     --kpasswd-listen <addr:464> [--kpasswd-listen …] \
+//!     --dnsd-listen <addr:53> [--dnsd-listen …] \
 //!     --internal-network <addr/prefix> [--internal-network …] \
 //!     --dc-address <IPv4> [--dc-address …]
 //!
@@ -76,7 +76,10 @@
 //! one StartTLS listener — the zone advertises `_ldap._tcp` on 389) and the
 //! kdc, StartTLS and kpasswd listeners take only their standard port (88,
 //! 389, 464 — crates/config `StandardPort`); docs/questions/Q-1016 items 3–4
-//! (A-176), Q-1024.
+//! (A-176), Q-1024. Task DN10d moves the StartTLS requirement into
+//! ldap-front's own schema (the plan's parse-back refuses a file without
+//! `ldap_listen`) and gives dnsd's listeners port 53 only (A-178 on
+//! docs/questions/Q-1025 items 1, 3).
 //!
 //! Spec: docs/51 §4.3 (the input; step 12), §4.4 (the password source),
 //! §5.10 (`provision policy`), §3 (D95); docs/50 §7.1 (numeric ids, no

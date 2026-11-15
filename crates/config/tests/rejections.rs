@@ -964,8 +964,8 @@ fn listener_addresses() {
 fn advertised_listeners_take_only_the_standard_port() {
     assert_eq!(
         StandardPort::ALL.map(StandardPort::number),
-        [88, 389, 464],
-        "RFC 4120 §7.2.3.2; [MS-ADTS] §6.3.2.3"
+        [88, 389, 464, 53],
+        "RFC 4120 §7.2.3.2; [MS-ADTS] §6.3.2.3; RFC 1035 §4.2"
     );
     let kdc = set(KDC, "internal_networks", "10.0.0.0/8, fd00:1234::/32");
     for value in [
@@ -1461,13 +1461,23 @@ fn kdc_limits_stop_at_the_documented_value() {
     );
 }
 
-/// ldap-front needs at least one listener; no address serves both 389 and
-/// 636. Spec: docs/50 §4.2, §4.3; Q-230 item 7.
+/// ldap-front needs its StartTLS listener — `ldap_listen` is required
+/// (task DN10d: the zone advertises `_ldap._tcp` on 389, so an LDAPS-only
+/// file is refused by the daemon's own schema, `MissingKey` at
+/// `ldap_listen`, with or without LDAPS listeners); no address serves both
+/// 389 and 636. Spec: docs/50 §4.2 (A-178), §4.3; [MS-ADTS] v20261026
+/// §6.3.2.3; Q-230 item 7; docs/questions/Q-1025 item 3.
 #[test]
 fn ldap_front_listeners() {
-    let none = remove(&remove(LDAP_FRONT, "ldap_listen"), "ldaps_listen");
+    let ldaps_only = remove(LDAP_FRONT, "ldap_listen");
+    let err = error(Daemon::LdapFront, &ldaps_only);
+    assert_eq!(err.kind(), ErrorKind::MissingKey);
+    assert_eq!(err.key(), Some("ldap_listen"));
+    assert_eq!(err.line(), None);
+    let none = remove(&ldaps_only, "ldaps_listen");
     let err = error(Daemon::LdapFront, &none);
-    assert_eq!(err.kind(), ErrorKind::NoListener);
+    assert_eq!(err.kind(), ErrorKind::MissingKey);
+    assert_eq!(err.key(), Some("ldap_listen"));
     let text = set(LDAP_FRONT, "ldaps_listen", "10.0.0.5:389");
     let err = error(Daemon::LdapFront, &text);
     assert_eq!(err.kind(), ErrorKind::DuplicateEntry);

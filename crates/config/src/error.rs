@@ -147,9 +147,6 @@ pub enum ErrorKind {
     /// Spec: docs/50 §3.1 ("a socket per (server, channel)"); docs/questions/
     /// Q-230 item 16.
     DuplicatePath,
-    /// The daemon would have no network listener at all.
-    /// Spec: docs/50 §4.2; docs/questions/Q-230 item 7.
-    NoListener,
     /// A listener address outside every network of the file's zone table
     /// (`internal_networks`): phase 1 has no external LDAP listener — one
     /// front per zone, the internal one; the kdc binds to internal
@@ -178,12 +175,14 @@ pub enum ErrorKind {
     /// item 3.
     NetworkFamily,
     /// A listener whose endpoint the zone advertises (the kdc's `listen`,
-    /// ldap-front's `ldap_listen`, kpasswd-front's `listen`) on a port other
-    /// than its service's standard port ([`crate::StandardPort`]): the SRV
-    /// record names the standard port, so such a listener would be
-    /// advertised where nothing listens.
-    /// Spec: RFC 4120 §7.2.3.2; [MS-ADTS] v20261026 §6.3.2.3; docs/54 §3.1;
-    /// docs/questions/Q-1016 item 4 (A-176), Q-1024.
+    /// ldap-front's `ldap_listen`, kpasswd-front's `listen`, dnsd's
+    /// `listen`) on a port other than its service's standard port
+    /// ([`crate::StandardPort`]): the SRV record names the standard port, and
+    /// the NS record a name server reached on port 53, so such a listener
+    /// would be advertised where nothing listens.
+    /// Spec: RFC 4120 §7.2.3.2; [MS-ADTS] v20261026 §6.3.2.3; RFC 1035 §4.2;
+    /// docs/54 §3.1; docs/questions/Q-1016 item 4 (A-176), Q-1024, Q-1025
+    /// item 1 (A-178).
     NonStandardPort,
 }
 
@@ -223,7 +222,6 @@ impl ErrorKind {
             ErrorKind::DuplicateEntry => "item appears more than once",
             ErrorKind::DuplicateId => "uid appears more than once in this file",
             ErrorKind::DuplicatePath => "path is used by more than one setting",
-            ErrorKind::NoListener => "no network listener is configured",
             ErrorKind::ListenerNotInternal => {
                 "listener address is outside every configured internal network"
             }

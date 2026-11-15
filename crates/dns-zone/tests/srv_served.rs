@@ -22,7 +22,9 @@
 //! `NonStandardPort`), so a record's port and the port its daemon may listen
 //! on cannot differ; the e2e test checks that every record a provisioned zone
 //! advertises has a listener in the produced files (the StartTLS listener
-//! provision requires — Q-1016 item 3). docs/questions/Q-1024.
+//! ldap-front's own schema requires since task DN10d — Q-1016 item 3,
+//! Q-1025 item 3). docs/questions/Q-1024. The NS record's name server
+//! (dnsd, port 53) is guarded by `tests/ns_served.rs`.
 //!
 //! Scope of the scan: `crates/<serving crate>/src`, every `.rs` file except
 //! directories named `tests` and files named `tests.rs` or `*_tests.rs`
@@ -258,9 +260,13 @@ fn every_srv_port_is_the_only_port_its_serving_daemon_accepts() {
 
 /// The one definition (task DN10c): each record's port is its
 /// `standard_port` — crate config's — and the table uses exactly config's
-/// three standard ports (RFC 4120 §7.2.3.2: 88 for both Kerberos
-/// transports; [MS-ADTS] v20261026 §6.3.2.3: 389 for LDAP, 464 for the
-/// Kerberos Password Change service).
+/// standard ports but the name server's (RFC 4120 §7.2.3.2: 88 for both
+/// Kerberos transports; [MS-ADTS] v20261026 §6.3.2.3: 389 for LDAP, 464 for
+/// the Kerberos Password Change service). The name server's port (53,
+/// `StandardPort::Dns`, task DN10d) is advertised by no SRV record: the NS
+/// record names the server, and a name server is reached on port 53 (RFC
+/// 1035 §3.3.11, §4.2) — `tests/ns_served.rs`. A new standard port fails
+/// here until it says which record advertises it.
 #[test]
 fn the_srv_ports_are_config_s_standard_ports() {
     for service in SrvService::ALL {
@@ -271,6 +277,11 @@ fn the_srv_ports_are_config_s_standard_ports() {
         .map(SrvService::standard_port)
         .collect();
     used.dedup();
-    assert_eq!(used, StandardPort::ALL.to_vec());
+    let advertised_by_srv: Vec<StandardPort> = StandardPort::ALL
+        .into_iter()
+        .filter(|port| *port != StandardPort::Dns)
+        .collect();
+    assert_eq!(used, advertised_by_srv);
+    assert!(!used.contains(&StandardPort::Dns));
     assert_eq!(SrvService::ALL.map(SrvService::port), [88, 88, 389, 464]);
 }

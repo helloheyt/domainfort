@@ -13,7 +13,7 @@ use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use core::time::Duration;
 
 use config::{
-    DnsdSettings, Error, ErrorKind, DNSD_MAX_REQUESTS_PER_TCP_CONNECTION_BOUND,
+    DnsdSettings, Error, ErrorKind, StandardPort, DNSD_MAX_REQUESTS_PER_TCP_CONNECTION_BOUND,
     DNSD_MAX_TCP_CONNECTIONS_BOUND, DNSD_MAX_TCP_CONNECTIONS_PER_SOURCE_BOUND,
     DNSD_TCP_FIRST_OCTET_TIMEOUT_SECS, DNSD_TCP_FRAME_TIMEOUT_SECS, DNSD_TCP_IDLE_TIMEOUT_SECS,
     ZONE_IMAGE_MAX_AGE_SECS,
@@ -275,7 +275,43 @@ fn dnsd_listeners_must_be_internal_interface_addresses() {
         "dc1.example.test:53",
         ErrorKind::InvalidSocketAddress,
     );
-    accepts_value("listen", "192.0.2.53:5353");
+    accepts_value("listen", "192.0.2.54:53");
+}
+
+/// Task DN10d (A-178 on docs/questions/Q-1025 item 1): the zone's NS record
+/// names the DC as its name server, reached on port 53 — the NS RDATA is a
+/// name only (RFC 1035 §3.3.11) and "name server access using TCP … on
+/// server port 53 (decimal) as well as datagram access using UDP … on UDP
+/// port 53 (decimal)" (RFC 1035 §4.2). So every `listen` address is on
+/// [`StandardPort::Dns`] (53) — any other port, also on one address of
+/// several, is `NonStandardPort` at `listen`'s line, the value not echoed;
+/// the rule runs before the zone-table rule; the addresses stay the
+/// operator's. Addresses are the sample's test values (192.0.2.0/24,
+/// fd00:1234::/32).
+#[test]
+fn dnsd_listeners_take_only_port_53() {
+    assert_eq!(StandardPort::Dns.number(), 53);
+    for value in [
+        "192.0.2.53:5353",
+        "192.0.2.53:52",
+        "192.0.2.53:54",
+        "192.0.2.53:88",
+        "192.0.2.53:5300",
+        "192.0.2.53:53, [fd00:1234::35]:5353",
+        "[fd00:1234::35]:1053",
+    ] {
+        rejects_value("listen", value, ErrorKind::NonStandardPort);
+        let err = error(&set(DNSD, "listen", value));
+        assert!(!err.to_string().contains("192.0.2.53"), "no echo: {err}");
+    }
+    // Off the port and outside the zone table: the port rule speaks first.
+    rejects_value("listen", "198.51.100.53:5353", ErrorKind::NonStandardPort);
+    accepts_value("listen", "192.0.2.7:53, [fd00:1234::7]:53");
+    let s = DnsdSettings::parse(DNSD.as_bytes()).expect("valid");
+    assert!(s
+        .listen()
+        .iter()
+        .all(|address| address.port() == StandardPort::Dns.number()));
 }
 
 /// Spec: docs/50 §4.1 (CIDR); docs/questions/Q-230 item 8.

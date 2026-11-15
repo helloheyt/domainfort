@@ -216,8 +216,11 @@ pub struct Network {
     pub kdc_listen: Vec<String>,
     /// ldap-front's `ldap_listen` addresses (StartTLS, port 389): at least
     /// one — the zone advertises `_ldap._tcp` on 389, so it always has a
-    /// listener (task DN10c; docs/questions/Q-1016 item 3, decision A-176
-    /// option (a); Q-1024). crates/config refuses any other port.
+    /// listener. The rule is ldap-front's own schema's (task DN10d; A-178 on
+    /// docs/questions/Q-1025 item 3): crates/config refuses a file without
+    /// `ldap_listen` (`MissingKey`) or with another port
+    /// (`NonStandardPort`), and the plan's parse-back of the produced file
+    /// is how provisioning refuses it — before anything is written.
     pub ldap_listen: Vec<String>,
     /// ldap-front's `ldaps_listen` addresses (optional; no SRV record
     /// advertises LDAPS).
@@ -230,7 +233,9 @@ pub struct Network {
     /// docs/53 R53-3, §3.3; A-117).
     pub kpasswd_listen: Vec<String>,
     /// dnsd's `listen` addresses (each served on UDP and TCP, at least one —
-    /// docs/54 §4.3, §4.7).
+    /// docs/54 §4.3, §4.7; every one on port 53, the NS record's name server
+    /// — crates/config refuses any other, task DN10d, docs/questions/Q-1025
+    /// item 1).
     pub dnsd_listen: Vec<String>,
     /// The DC's own addresses — its host record, the zone's A records of the
     /// DC's name (`--dc-address`, task DN10b; docs/54 §3.1: "written in
@@ -335,12 +340,6 @@ pub enum InputErrorKind {
     NetworkItem,
     /// No kdc listener, no kpasswd-front listener or no dnsd listener.
     MissingListener,
-    /// No StartTLS listener (`--ldap-listen`, port 389): the zone always
-    /// advertises `_ldap._tcp` on port 389, so ldap-front must listen there —
-    /// LDAPS listeners alone would leave the advertised endpoint unserved
-    /// (task DN10c; docs/questions/Q-1016 item 3, decision A-176 option (a);
-    /// [MS-ADTS] §6.3.2.3; docs/54 §3.1; Q-1024).
-    MissingStartTlsListener,
     /// No internal network: ldap-front listens only inside the internal
     /// networks (docs/52 §7 R14; A-102 on docs/questions/Q-469 (b)).
     MissingInternalNetwork,
@@ -409,10 +408,6 @@ impl fmt::Display for InputError {
             }
             InputErrorKind::NetworkItem => "network item empty or holds a separator",
             InputErrorKind::MissingListener => "listener missing",
-            InputErrorKind::MissingStartTlsListener => {
-                "at least one StartTLS listener (port 389) is required: \
-                 the zone advertises _ldap._tcp on port 389"
-            }
             InputErrorKind::MissingInternalNetwork => {
                 "at least one internal network is required (LDAP listens only inside them)"
             }
@@ -634,11 +629,15 @@ impl DomainInput {
             computer_name_ok(&n.change_password_service_name),
         )?;
         // The two service SPNs (docs/51 §4.3 step 5; A-73) pass the
-        // runtime's own SPN rule: `service "/" host`, host = the object's
-        // dNSHostName (the DC's FQDN), lower case, service not "krbtgt"
-        // (directory-admin `spn_ok`; Q-355 item 3) — the admin service's
-        // through `admin_service_spn_ok`, the same shape with the name that
-        // only its provisioning exception may carry (docs/questions/Q-541).
+        // runtime's own SPN shape: `service "/" host`, host = the object's
+        // dNSHostName (the DC's FQDN), lower case (directory-admin `spn_ok`;
+        // Q-355 item 3) — the admin service's through
+        // `admin_service_spn_ok`, the same shape with the name that only its
+        // provisioning exception may carry (docs/questions/Q-541). `spn_ok`
+        // judges the shape only: a reserved service name (`krbtgt/…` and the
+        // like) is refused by directory-admin's one checker on the folded
+        // key, at the write (task PN5; docs/questions/Q-1030 item 1, A-179)
+        // — provision's own SPN is `ldap/<fqdn>`, never a reserved one.
         let ldap_spn = format!("{LDAP_SERVICE_CLASS}/{}", self.dc_fqdn);
         let admin_spn = format!("{ADMIN_SERVICE_CLASS}/{}", self.dc_fqdn);
         if !spn_ok(&ldap_spn, &self.dc_fqdn) || !admin_service_spn_ok(&admin_spn, &self.dc_fqdn) {
@@ -800,15 +799,17 @@ impl DomainInput {
 
     /// Network items are non-empty and hold no list separator (they are
     /// written as `", "`-separated lists, crates/config); kdc needs a
-    /// listener, ldap-front at least one StartTLS listener (LDAPS listeners
-    /// are optional beside it — task DN10c), kpasswd-front and dnsd one
-    /// each, and at least one internal network (crates/config re-checks
-    /// every address, that every listener of the four network daemons lies
-    /// in an internal network, and that the advertised listeners are on
-    /// their standard ports — `NonStandardPort`).
+    /// listener, kpasswd-front and dnsd one each, and at least one internal
+    /// network. crates/config re-checks every address, that every listener
+    /// of the four network daemons lies in an internal network, that the
+    /// advertised listeners are on their standard ports (`NonStandardPort`
+    /// — the kdc's, ldap-front's StartTLS, kpasswd-front's and dnsd's), and
+    /// that ldap-front has a StartTLS listener at all (`MissingKey` at
+    /// `ldap_listen`, task DN10d): those rules are the daemons' schemas',
+    /// applied by the plan's parse-back, with no copy here.
     /// Spec: docs/50 §4.1, §4.2, §7.1; docs/52 §7 R14; docs/53 R53-3, §3.3;
     /// docs/54 §3.1, §4.7; [MS-ADTS] §6.3.2.3; docs/questions/Q-1016 item 3
-    /// (A-176), Q-1024.
+    /// (A-176), Q-1024, Q-1025 items 1, 3 (A-178).
     fn check_network(&self) -> Result<(), InputError> {
         let n = &self.network;
         let lists: [(&'static str, &Vec<String>); 7] = [
@@ -834,17 +835,11 @@ impl DomainInput {
                 InputErrorKind::MissingListener,
             ));
         }
-        // Task DN10c (A-176 on Q-1016 item 3, option (a)): the zone
-        // synthesizes `_ldap._tcp` (port 389) whenever it is served, and
-        // provision always configures the zone — so ldap-front must listen
-        // for StartTLS on 389, whatever LDAPS listeners it also has. Under
-        // every outcome of P-64 port 389 stays listened on.
-        if n.ldap_listen.is_empty() {
-            return Err(InputError::new(
-                "ldap-listen",
-                InputErrorKind::MissingStartTlsListener,
-            ));
-        }
+        // No StartTLS check here (task DN10d, A-178 on Q-1025 item 3): the
+        // rule "ldap-front listens for StartTLS on 389" is ldap-front's own
+        // schema's — the produced file carries `ldap_listen` only when it
+        // was given, and its parse-back refuses a file without it
+        // (`PlanError::Config(LdapFront, MissingKey)`), so one rule decides.
         // kpasswd-front's and dnsd's files require `listen` (crates/config
         // kpasswd_front.rs, dnsd.rs).
         for (field, items) in [

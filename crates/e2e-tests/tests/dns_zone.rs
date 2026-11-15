@@ -886,12 +886,15 @@ fn a_provisioned_dnsd_starts_and_answers_the_zone() {
 /// (read with its own schema) lists at least one address, every one on the
 /// record's port, on a list that serves the record's transport (the kdc's
 /// `listen`: UDP and TCP per address; ldap-front's `ldap_listen`: StartTLS on
-/// TCP — the listener provision now requires; kpasswd-front's `listen`: TCP
-/// only). A Service label or transport with no produced list known fails
-/// (fail closed). No daemon runs.
+/// TCP — the listener ldap-front's own schema requires since task DN10d;
+/// kpasswd-front's `listen`: TCP only). A Service label or transport with no
+/// produced list known fails (fail closed). And the name server the NS record
+/// names — dnsd — has listeners in its produced file, every one on port 53
+/// (task DN10d, A-178 on docs/questions/Q-1025 item 1). No daemon runs.
 ///
 /// Sources: docs/54 §3.1; RFC 4120 §7.2.3.2 (both `_udp` and `_tcp`, 88);
-/// [MS-ADTS] v20261026 §6.3.2.3 (389, 88, 464); RFC 2782 (the Proto label).
+/// [MS-ADTS] v20261026 §6.3.2.3 (389, 88, 464); RFC 2782 (the Proto label);
+/// RFC 1035 §3.3.11, §4.2 (the NS record names the server; port 53).
 #[test]
 fn every_advertised_srv_record_has_a_listener_in_the_produced_files() {
     let Some(world) = World::provisioned() else {
@@ -933,6 +936,18 @@ fn every_advertised_srv_record_has_a_listener_in_the_produced_files() {
     // The provisioned deployment runs kpasswd-front: all four are advertised.
     assert_eq!(advertised, SrvService::ALL.to_vec());
     assert_eq!(front.ldap_listen(), ["127.0.0.1:389".parse().unwrap()]);
+    // The NS record's name server (task DN10d): dnsd listens, on port 53
+    // only — crates/config's one definition.
+    let dnsd = DnsdSettings::parse(&world.read(&paths.dnsd_config)).unwrap();
+    assert!(!dnsd.listen().is_empty(), "the NS record names a server");
+    assert!(
+        dnsd.listen()
+            .iter()
+            .all(|a| a.port() == config::StandardPort::Dns.number()),
+        "the name server listens on {}, the produced listeners are {:?}",
+        config::StandardPort::Dns.number(),
+        dnsd.listen()
+    );
 }
 
 /// docs/54 §4.5, §6.6 ("dird not available ⇒ SERVFAIL"); docs/questions/

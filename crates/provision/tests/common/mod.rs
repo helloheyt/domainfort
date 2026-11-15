@@ -283,8 +283,9 @@ pub fn input(dir: &TempDir, dird_uid: u32, keyadm_uid: u32) -> DomainInput {
         network: Network {
             kdc_listen: vec!["127.0.0.1:88".to_owned()],
             // Task DN10c: the StartTLS listener on 389 the zone's
-            // `_ldap._tcp` needs (docs/questions/Q-1016 item 3, A-176), and
-            // LDAPS beside it.
+            // `_ldap._tcp` needs (docs/questions/Q-1016 item 3, A-176 —
+            // ldap-front's own schema requires it since task DN10d, Q-1025
+            // item 3), and LDAPS beside it.
             ldap_listen: vec!["127.0.0.1:389".to_owned()],
             ldaps_listen: vec!["127.0.0.1:636".to_owned()],
             // The LDAP listeners (127.0.0.1) lie inside the internal

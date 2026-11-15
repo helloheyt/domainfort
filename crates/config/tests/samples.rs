@@ -232,13 +232,14 @@ fn ldap_front_sample_parses() {
     assert_eq!(l.dird_deadline(), secs(62));
 }
 
-/// LDAPS alone is a valid listener set; absent timeouts take the docs/50
-/// values (30 s, 300 s, 10 s, 65 s). Spec: docs/50 §3.6, §4.2.
+/// StartTLS alone is a valid listener set (LDAPS is optional); absent
+/// timeouts take the docs/50 values (30 s, 300 s, 10 s, 65 s).
+/// Spec: docs/50 §3.6, §4.2 (A-178); docs/questions/Q-1025 item 3.
 #[test]
 fn ldap_front_minimal_sample_takes_defaults() {
     let s = LdapFrontSettings::parse(common::LDAP_FRONT_MINIMAL.as_bytes()).expect("valid");
-    assert!(s.ldap_listen().is_empty());
-    assert_eq!(s.ldaps_listen(), [v4(10, 0, 0, 5, 636)]);
+    assert_eq!(s.ldap_listen(), [v4(10, 0, 0, 5, 389)]);
+    assert!(s.ldaps_listen().is_empty());
     let l = s.limits();
     assert_eq!(l.init_recv_timeout(), secs(30));
     assert_eq!(l.max_conn_idle_time(), secs(300));

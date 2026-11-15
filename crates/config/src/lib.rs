@@ -18,10 +18,12 @@
 //! | keyadm (tool, not a daemon) | [`KeyadmSettings`] | §2.4, R50-3; docs/51 §6 |
 //!
 //! The listeners whose endpoint the zone advertises (the kdc's `listen`,
-//! ldap-front's `ldap_listen`, kpasswd-front's `listen`) take only their
-//! service's standard port, [`StandardPort`] — the one copy of those port
-//! numbers, which the SRV synthesis reads too (task DN10c; docs/questions/
-//! Q-1016, Q-1024).
+//! ldap-front's `ldap_listen`, kpasswd-front's `listen`, and dnsd's `listen`
+//! — the name server the NS record names) take only their service's
+//! standard port, [`StandardPort`] — the one copy of those port numbers,
+//! which the SRV synthesis reads too (task DN10c; task DN10d; docs/questions/
+//! Q-1016, Q-1024, Q-1025). ldap-front's file requires its StartTLS
+//! listener (task DN10d; Q-1025 item 3).
 //!
 //! Each type has `parse(&[u8])` and a public `KEYS` table. Parsing is pure: it
 //! opens no file, reads no environment, resolves no name and checks no file

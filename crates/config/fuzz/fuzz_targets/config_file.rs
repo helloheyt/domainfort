@@ -3,7 +3,7 @@
 //!
 //! AGENTS.md §6 / docs/32 §8 (every parser gets a fuzz target before it
 //! merges to main; docs/50 §9 names this target `config_file`). On any octets
-//! all seven schemas (six daemons and the keyadm tool) must return without
+//! all eight schemas (seven daemons and the keyadm tool) must return without
 //! panicking, and:
 //!
 //! * input over the file bound, or not ending in LF, is refused by every
@@ -15,17 +15,21 @@
 //!   maps each uid once and never keyd's own uid (docs/50 R50-3, §3.2); the
 //!   same for auditd's `uid → source` map;
 //! * every account id accepted is neither 0 nor all-ones (Q-230 item 6);
-//! * every accepted kdc `listen` address is on port 88 and every accepted
-//!   ldap-front `ldap_listen` address on port 389 — the ports the zone
-//!   advertises (task DN10c; docs/questions/Q-1016 item 4, Q-1024).
+//! * every accepted kdc `listen` address is on port 88, every accepted
+//!   ldap-front `ldap_listen` address on port 389 and every accepted dnsd
+//!   `listen` address on port 53 — the ports the zone advertises (task
+//!   DN10c; docs/questions/Q-1016 item 4, Q-1024; task DN10d, Q-1025 item
+//!   1);
+//! * an accepted ldap-front file always has a StartTLS listener (task
+//!   DN10d; docs/questions/Q-1025 item 3).
 //!
 //! Spec: docs/50 R50-3, R50-15, §7.1, §9; RFC 4120 §7.2.3.2; [MS-ADTS]
-//! §6.3.2.3.
+//! §6.3.2.3; RFC 1035 §4.2.
 
 use config::limits::MAX_FILE_OCTETS;
 use config::{
-    AdmindSettings, AuditdSettings, DirdSettings, Error, KdcSettings, KeyadmSettings, KeydSettings,
-    LdapFrontSettings, StandardPort,
+    AdmindSettings, AuditdSettings, DirdSettings, DnsdSettings, Error, KdcSettings, KeyadmSettings,
+    KeydSettings, LdapFrontSettings, StandardPort,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -50,6 +54,7 @@ fuzz_target!(|data: &[u8]| {
         (AuditdSettings::parse(data).map(drop), AuditdSettings::KEYS),
         (AdmindSettings::parse(data).map(drop), AdmindSettings::KEYS),
         (KeyadmSettings::parse(data).map(drop), KeyadmSettings::KEYS),
+        (DnsdSettings::parse(data).map(drop), DnsdSettings::KEYS),
     ];
     // keyadm: the keyd uid it verifies is never 0 or all-ones (R50-3; Q-230
     // item 6).
@@ -94,7 +99,7 @@ fuzz_target!(|data: &[u8]| {
         assert!(limits.max_tcp_connections_per_source() <= limits.max_tcp_connections());
     }
     if let Ok(settings) = LdapFrontSettings::parse(data) {
-        assert!(!(settings.ldap_listen().is_empty() && settings.ldaps_listen().is_empty()));
+        assert!(!settings.ldap_listen().is_empty());
         // docs/52 R14: every accepted listener lies in the zone table.
         assert!(settings
             .ldap_listen()
@@ -105,5 +110,12 @@ fuzz_target!(|data: &[u8]| {
             .ldap_listen()
             .iter()
             .all(|address| address.port() == StandardPort::Ldap.number()));
+    }
+    if let Ok(settings) = DnsdSettings::parse(data) {
+        assert!(!settings.listen().is_empty());
+        assert!(settings
+            .listen()
+            .iter()
+            .all(|address| address.port() == StandardPort::Dns.number()));
     }
 });

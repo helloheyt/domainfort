@@ -268,12 +268,14 @@ pub(crate) fn check_internal<const N: usize>(
 
 /// Every address of an advertised listener list is on its service's
 /// standard port — the one copy of the port, [`StandardPort`], which the SRV
-/// synthesis reads too; reported at the list's line. One rule for the three
+/// synthesis reads too; reported at the list's line. One rule for the four
 /// files whose listeners the zone advertises: the kdc's `listen`,
-/// ldap-front's `ldap_listen`, kpasswd-front's `listen` (task DN10c).
+/// ldap-front's `ldap_listen`, kpasswd-front's `listen` (task DN10c) and
+/// dnsd's `listen` — the name server the NS record names (task DN10d).
 /// Addresses stay configurable; only the port is fixed.
-/// Spec: RFC 4120 §7.2.3.2; [MS-ADTS] v20261026 §6.3.2.3; docs/54 §3.1;
-/// docs/questions/Q-1016 item 4 (A-176), Q-1024.
+/// Spec: RFC 4120 §7.2.3.2; [MS-ADTS] v20261026 §6.3.2.3; RFC 1035 §4.2;
+/// docs/54 §3.1; docs/questions/Q-1016 item 4 (A-176), Q-1024, Q-1025 item
+/// 1 (A-178).
 pub(crate) fn check_standard_port(
     list: Option<&Located<Vec<SocketAddr>>>,
     key: &'static str,

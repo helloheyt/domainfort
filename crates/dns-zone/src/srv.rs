@@ -32,13 +32,16 @@
 //!   (StartTLS) and kpasswd-front's listener rule requires (crates/config
 //!   `NonStandardPort`), so a listener cannot sit on another port than the
 //!   one its record advertises;
-//! * **`_ldap._tcp` always has a listener** — provision requires at least
-//!   one StartTLS listener (crates/provision `MissingStartTlsListener`).
+//! * **`_ldap._tcp` always has a listener** — ldap-front's own schema
+//!   requires its StartTLS listener (crates/config `ldap_listen`, task
+//!   DN10d; A-178 on docs/questions/Q-1025 item 3).
 //!
 //! The guards: `tests/srv_served.rs` (each record's port is the one its
-//! serving daemon's schema accepts, and no other) and crates/e2e-tests
-//! `tests/dns_zone.rs` (every record a provisioned zone advertises has a
-//! listener in the produced files). docs/questions/Q-1024.
+//! serving daemon's schema accepts, and no other), `tests/ns_served.rs`
+//! (the name server the NS record names — dnsd — accepts port 53 only,
+//! task DN10d) and crates/e2e-tests `tests/dns_zone.rs` (every record a
+//! provisioned zone advertises has a listener in the produced files).
+//! docs/questions/Q-1024, Q-1025.
 //!
 //! Spec: docs/54 §3.1, §5.1; docs/questions/Q-618 item 1, Q-1004 (decision
 //! A-172: option 2, "one SRV record per service that exists"), Q-1016; RFC

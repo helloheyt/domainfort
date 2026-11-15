@@ -3,10 +3,16 @@
 //! bounded), the DC certificate (the same), the DC key (root-owned, mode
 //! exactly 0400, bounded) — with the test's own uid as the owner (`main`
 //! passes 0); the TLS configuration built from files; the hardening plan;
-//! the listeners bound from the configuration.
+//! the listener rule — a file without a StartTLS listener, or with one off
+//! port 389, is refused before any bind (tasks DN10c, DN10d). The binding
+//! itself is tested in-crate (src/startup.rs), on loopback ports the
+//! system picks: no product path and no test seam binds an address that is
+//! not from a file ldap-front's schema accepted (docs/questions/Q-1025
+//! item 3).
 //!
 //! Sources: docs/50 R50-12 ("the key file 0400, read as root before the
-//! privilege drop"), R50-14, R50-15, §5.3, §6.1, §6.4, §7.1; crates/config
+//! privilege drop"), R50-14, R50-15, §4.2 (A-178), §5.3, §6.1, §6.4, §7.1;
+//! [MS-ADTS] v20261026 §6.3.2.3 ("Set to 389 for LDAP service"); crates/config
 //! `LdapFrontSettings` (its sample in crates/config/tests/common). Every
 //! value is made here; the keys are generated per run (tests/common/tls.rs).
 
@@ -17,9 +23,8 @@ mod cert_support;
 mod tls_support;
 
 use ldap_front::startup::{
-    bind_listeners, hardening_plan, load_tls_config, read_certificate, read_private_key,
-    read_settings, StartupError, MAX_CERTIFICATE_OCTETS, MAX_PRIVATE_KEY_OCTETS,
-    OPEN_FILES_HEADROOM,
+    hardening_plan, load_tls_config, read_certificate, read_private_key, read_settings,
+    StartupError, MAX_CERTIFICATE_OCTETS, MAX_PRIVATE_KEY_OCTETS, OPEN_FILES_HEADROOM,
 };
 use ldap_front::tls::CredentialError;
 use ldap_front::MAX_CONNECTIONS;
@@ -54,12 +59,22 @@ fn write(path: &Path, octets: &[u8], mode: u32) {
 }
 
 /// A configuration for `dir` (the crates/config sample's shape, with the
-/// certificate and key paths in `dir` and the given listener; the zone
-/// table covers the test addresses — 10.0.0.0/8 and the loopback network,
-/// docs/52 R14).
+/// certificate and key paths in `dir`, the StartTLS listener on
+/// 10.0.0.5:389 — required, task DN10d — and the given LDAPS listener; the
+/// zone table covers the test addresses — 10.0.0.0/8 and the loopback
+/// network, docs/52 R14).
 fn settings_text(dir: &TempDir, listen: &str) -> String {
+    settings_with(
+        dir,
+        &format!("ldap_listen = 10.0.0.5:389\nldaps_listen = {listen}\n"),
+    )
+}
+
+/// A configuration for `dir` with the given listener lines (each ending in
+/// LF).
+fn settings_with(dir: &TempDir, listeners: &str) -> String {
     format!(
-        "run_as_uid = 61004\nrun_as_gid = 61004\nldaps_listen = {listen}\n\
+        "run_as_uid = 61004\nrun_as_gid = 61004\n{listeners}\
          internal_networks = 10.0.0.0/8, 127.0.0.0/8\n\
          tls_certificate_path = {}\ntls_private_key_path = {}\n\
          dird_ldap_socket = /run/dird/ldap/dird-ldap.sock\ndird_uid = 61002\n\
@@ -338,23 +353,51 @@ fn the_hardening_plan() {
     assert!(!plan.locks_all_memory());
     assert_eq!(
         plan.open_files_limit(),
-        Some(MAX_CONNECTIONS as u64 * 2 + 1 + OPEN_FILES_HEADROOM)
+        Some(MAX_CONNECTIONS as u64 * 2 + 2 + OPEN_FILES_HEADROOM)
     );
 }
 
-/// docs/50 §4.2, §6.2: the configured listener is bound (a loopback high
-/// port found free just before; never a privileged port).
+/// Task DN10d (A-178 on docs/questions/Q-1025 item 3; docs/50 §4.2 as
+/// amended; [MS-ADTS] v20261026 §6.3.2.3 — the zone advertises `_ldap._tcp`
+/// on 389): an LDAPS-only file is refused at start-up by the daemon itself
+/// (`ldap_listen` named, no value echoed), and so is a StartTLS listener
+/// off port 389 (task DN10c) — before any bind; a file with its StartTLS
+/// listener on 389 and LDAPS on any port is read, every StartTLS address
+/// on crates/config's one definition of the port.
 #[test]
-fn the_listeners_are_bound() {
+fn the_front_needs_its_starttls_listener_on_389() {
     let dir = TempDir::new();
-    let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = free.local_addr().unwrap();
-    drop(free);
-    let settings =
-        config::LdapFrontSettings::parse(settings_text(&dir, &address.to_string()).as_bytes())
-            .unwrap();
-    let listeners = bind_listeners(&settings).unwrap();
-    assert!(listeners.ldap.is_empty());
-    assert_eq!(listeners.ldaps.len(), 1);
-    assert_eq!(listeners.ldaps[0].local_addr().unwrap(), address);
+    let owner = dir.uid();
+    let path = dir.join("ldap-front.conf");
+    for (listeners, port) in [
+        ("ldaps_listen = 10.0.0.5:636\n", None),
+        (
+            "ldap_listen = 10.0.0.5:3389\nldaps_listen = 10.0.0.5:636\n",
+            Some("3389"),
+        ),
+    ] {
+        write(&path, settings_with(&dir, listeners).as_bytes(), 0o644);
+        match read_settings(&path, owner) {
+            Err(StartupError::Config(error)) => {
+                assert!(error.contains("`ldap_listen`"), "{error}");
+                if let Some(port) = port {
+                    assert!(!error.contains(port), "no echo: {error}");
+                }
+            }
+            other => panic!("{other:?}"),
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+    write(
+        &path,
+        settings_text(&dir, "10.0.0.5:6360").as_bytes(),
+        0o644,
+    );
+    let settings = read_settings(&path, owner).unwrap();
+    assert!(!settings.ldap_listen().is_empty());
+    assert!(settings
+        .ldap_listen()
+        .iter()
+        .all(|address| address.port() == config::StandardPort::Ldap.number()));
+    assert_eq!(settings.ldaps_listen().len(), 1);
 }

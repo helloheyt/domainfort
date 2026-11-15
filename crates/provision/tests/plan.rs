@@ -1208,12 +1208,14 @@ fn a_front_listener_outside_the_internal_networks_or_missing_is_refused() {
 }
 
 /// Task DN10c (docs/questions/Q-1016 item 3, decision A-176 option (a);
-/// Q-1024): the zone advertises `_ldap._tcp` on port 389 ([MS-ADTS]
-/// §6.3.2.3; docs/54 §3.1), so provisioning requires a StartTLS listener —
-/// without one it refuses before anything is built (`ldap-listen`,
-/// `MissingStartTlsListener`), LDAPS listeners notwithstanding; with one,
-/// LDAPS is optional and ldap-front's file always carries `ldap_listen`.
-/// Addresses are test data.
+/// Q-1024) and task DN10d (A-178 on Q-1025 item 3): the zone advertises
+/// `_ldap._tcp` on port 389 ([MS-ADTS] §6.3.2.3; docs/54 §3.1), so a
+/// StartTLS listener is required — by ldap-front's own schema, the one
+/// rule: without one, LDAPS listeners notwithstanding, the plan's
+/// parse-back of the produced file refuses it before anything is built
+/// (`PlanError::Config(LdapFront, MissingKey)` at `ldap_listen`, the file
+/// carrying no `ldap_listen` line); with one, LDAPS is optional and the
+/// file carries `ldap_listen`. Addresses are test data.
 #[test]
 fn a_starttls_listener_is_required() {
     let dir = TempDir::new();
@@ -1221,24 +1223,31 @@ fn a_starttls_listener_is_required() {
     let mut ldaps_only = base.clone();
     ldaps_only.network.ldap_listen.clear();
     assert!(!ldaps_only.network.ldaps_listen.is_empty());
-    match refused(&ldaps_only) {
-        PlanError::Input(error) => {
-            assert_eq!(error.kind, InputErrorKind::MissingStartTlsListener);
-            assert_eq!(error.field, "ldap-listen");
-            assert_eq!(
-                error.to_string(),
-                "ldap-listen: at least one StartTLS listener (port 389) is required: \
-                 the zone advertises _ldap._tcp on port 389"
-            );
-        }
-        other => panic!("{other:?}"),
-    }
     let mut neither = ldaps_only.clone();
     neither.network.ldaps_listen.clear();
-    assert_eq!(
-        input_kind(refused(&neither)),
-        InputErrorKind::MissingStartTlsListener
-    );
+    for i in [&ldaps_only, &neither] {
+        match refused(i) {
+            PlanError::Config(daemon, error) => {
+                assert_eq!(daemon, provision::Daemon::LdapFront);
+                assert_eq!(error.kind(), config::ErrorKind::MissingKey);
+                assert_eq!(error.key(), Some("ldap_listen"));
+                assert_eq!(
+                    PlanError::Config(daemon, error).to_string(),
+                    "generated ldap-front configuration refused: configuration key \
+                     `ldap_listen`: required key is missing"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    let files = provision::configs::domain_configs(&ldaps_only, &dirstore::NodeId([7; 16]));
+    let front = files
+        .iter()
+        .find(|f| f.daemon == provision::Daemon::LdapFront)
+        .unwrap()
+        .text();
+    assert!(!front.lines().any(|l| l.starts_with("ldap_listen")));
+    assert!(front.lines().any(|l| l.starts_with("ldaps_listen = ")));
 
     let mut starttls_only = base.clone();
     starttls_only.network.ldaps_listen.clear();
@@ -1257,12 +1266,13 @@ fn a_starttls_listener_is_required() {
 }
 
 /// Task DN10c (docs/questions/Q-1016 item 4, decision A-176 option (a);
-/// Q-1024): the listeners the zone advertises take only their standard port
-/// (RFC 4120 §7.2.3.2: 88; [MS-ADTS] §6.3.2.3: 389, 464 — crates/config
-/// `StandardPort`). One on another port fails the parse-back by the
-/// daemon's own schema (`NonStandardPort` at its listener key) — the one
-/// rule, not a copy in provision; LDAPS (no SRV record) keeps any port.
-/// Addresses are test data.
+/// Q-1024) and task DN10d (A-178 on Q-1025 item 1): the listeners the zone
+/// advertises take only their standard port (RFC 4120 §7.2.3.2: 88;
+/// [MS-ADTS] §6.3.2.3: 389, 464; RFC 1035 §4.2: 53 for the name server the
+/// NS record names — crates/config `StandardPort`). One on another port
+/// fails the parse-back by the daemon's own schema (`NonStandardPort` at
+/// its listener key) — the one rule, not a copy in provision; LDAPS (no SRV
+/// record) keeps any port. Addresses are test data.
 #[test]
 fn an_advertised_listener_on_another_port_is_refused() {
     let dir = TempDir::new();
@@ -1287,6 +1297,13 @@ fn an_advertised_listener_on_another_port_is_refused() {
             "listen",
             Box::new(|i: &mut provision::DomainInput| {
                 i.network.kpasswd_listen = vec!["127.0.0.1:88".to_owned()];
+            }),
+        ),
+        (
+            provision::Daemon::Dnsd,
+            "listen",
+            Box::new(|i: &mut provision::DomainInput| {
+                i.network.dnsd_listen = vec!["127.0.0.1:5353".to_owned()];
             }),
         ),
     ] {
