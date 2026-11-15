@@ -41,12 +41,14 @@
 //!   ([`CHANGE_PASSWORD_SERVICE_NAME`], [`is_change_password_service_name`];
 //!   RFC 3244 §2) and the KerberosTime ↔ seconds pair
 //!   ([`kerberos_time_seconds`], the scale every component compares times
-//!   on; [`kerberos_time_from_unix`], a Unix clock reading as a
-//!   KerberosTime, and its inverse [`kerberos_time_to_unix`]; RFC 4120
-//!   5.2.3) — moved here from crates/keyd-types and crates/kpasswd-front,
-//!   so every crate that links krb-proto calls the same one. The daemons'
-//!   clocks, provisioning, the kdc and the LDAP engine call them too; no
-//!   other crate defines them (Q-987 item 5, Q-995; guard
+//!   on, and its inverse [`kerberos_time_from_seconds`];
+//!   [`kerberos_time_from_unix`], a Unix clock reading as a KerberosTime,
+//!   and its inverse [`kerberos_time_to_unix`]; RFC 4120 5.2.3) — moved
+//!   here from crates/keyd-types, crates/kpasswd-front, crates/kdc and
+//!   crates/directory-pip, so every crate that links krb-proto calls the
+//!   same one. The daemons' clocks, provisioning, the kdc, directory-pip
+//!   and the LDAP engine call them too; no other crate defines them (Q-987
+//!   item 5, Q-995, Q-1005; guard
 //!   `tests/single_name_and_time_definitions.rs`).
 //!
 //! Not here (later tasks): KRB-SAFE / KRB-CRED,
@@ -137,11 +139,12 @@
 //! docs/53 (§5.4, §5.7, §5.9, §10 K1) with decision A-117
 //! (docs/questions/Q-600, Q-603, Q-604). The change-password service name
 //! rule and the KerberosTime ↔ seconds pair are this project's own code,
-//! moved from crates/keyd-types (`model.rs`, `time.rs`) and crates/
-//! kpasswd-front (`clock.rs`) and checked against RFC 3244 §2, RFC 4120
-//! 5.2.3 and 6.2 (pinned copies, SHA-256 verified) — docs/questions/Q-955
-//! item 5 (A-158), Q-987. No other implementation was consulted or
-//! recalled.
+//! moved from crates/keyd-types (`model.rs`, `time.rs`), crates/
+//! kpasswd-front (`clock.rs`), crates/kdc and crates/directory-pip
+//! (`time.rs`, the scale's inverse) and checked against RFC 3244 §2, RFC
+//! 4120 5.2.3 and 6.2 (pinned copies, SHA-256 verified) — docs/questions/
+//! Q-955 item 5 (A-158), Q-987, Q-1005. No other implementation was
+//! consulted or recalled.
 //!
 //! Spec: RFC 4120 §5, Appendix A; RFC 6113 §5.4, Appendix B; RFC 3244 §2.
 
@@ -188,4 +191,7 @@ pub use krb_error::{KrbError, MethodData};
 pub use krb_priv::{EncKrbPrivPart, KrbPriv, UserData};
 pub use preauth::{EtypeInfo2, EtypeInfo2Entry, PaEncTimestamp, PaEncTsEnc};
 pub use ticket::{EncTicketPart, Ticket, TransitedEncoding};
-pub use time::{kerberos_time_from_unix, kerberos_time_seconds, kerberos_time_to_unix};
+pub use time::{
+    kerberos_time_from_seconds, kerberos_time_from_unix, kerberos_time_seconds,
+    kerberos_time_to_unix,
+};

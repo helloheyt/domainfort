@@ -11,13 +11,17 @@
 //! the reverse difference in two (the kdc's `unix_seconds`, the LDAP
 //! engine's `unix_instant`, each spelling the epoch as a KerberosTime), and
 //! directory-daemon spelled the service name's components as literals
-//! (`KerberosString::new("kadmin")`, `("changepw")`).
+//! (`KerberosString::new("kadmin")`, `("changepw")`). Before Q-1005 the
+//! scale's inverse (a count on the scale back to a KerberosTime) was
+//! written in two more (the kdc's and directory-pip's `time.rs`, each a
+//! `from_seconds` — a name rule 1 would never have seen, hence rule 4).
 //!
 //! What this test pins, in the workspace's non-test source (`crates/*/src`):
 //!
-//! 1. `fn kerberos_time_seconds`, `fn kerberos_time_from_unix`,
-//!    `fn kerberos_time_to_unix` (RFC 4120 5.2.3) are defined only in
-//!    krb-proto `time.rs`; `const CHANGE_PASSWORD_SERVICE_NAME` and
+//! 1. `fn kerberos_time_seconds`, `fn kerberos_time_from_seconds`,
+//!    `fn kerberos_time_from_unix`, `fn kerberos_time_to_unix` (RFC 4120
+//!    5.2.3) are defined only in krb-proto `time.rs`;
+//!    `const CHANGE_PASSWORD_SERVICE_NAME` and
 //!    `fn is_change_password_service_name` (RFC 3244 §2; RFC 4120 §6.2) only
 //!    in krb-proto `kpasswd.rs`. Other crates call or re-export them
 //!    (keyd-types re-exports two under their former paths).
@@ -29,28 +33,43 @@
 //!    (`KerberosTime::new(1970, 1, 1, 0, 0, 0)`, whitespace ignored) only
 //!    where [`EPOCH_SPELLED_ELSEWHERE`] lists it, each with its reason — the
 //!    shape every hand-written Unix conversion of the workspace had.
+//! 4. A KerberosTime is built from computed fields (`KerberosTime::new(`
+//!    with an argument that is not an integer literal) outside krb-proto
+//!    only where [`FIELDS_COMPUTED_ELSEWHERE`] lists it, each with its
+//!    reason. Turning any count — seconds on the scale, Unix seconds, a
+//!    DSTIME — into a KerberosTime means computing its calendar fields and
+//!    building it, whatever the function is called: the shape both former
+//!    `from_seconds` had (the first-of-month probe
+//!    `KerberosTime::new(year, month, 1, 0, 0, 0)` and the final
+//!    construction), and the shape of every Unix copy Q-995 removed. The
+//!    listed files build a KerberosTime from fields they decode, not from a
+//!    count; a literal instant (`KerberosTime::new(1601, 1, 1, 0, 0, 0)`)
+//!    is not a conversion and is not flagged.
 //!
 //! A lexical scan, not a type: it catches the shape of the regression, and a
 //! reviewer decides any new hit. Test code is not scanned (directories
 //! named `tests`, files whose name ends in `tests.rs`, and a file's
 //! `#[cfg(test)] mod … {` block to its end); line comments are dropped.
 //! Positive controls: the scanner flags planted copies — among them the
-//! exact lines Q-995 removed — and not calls, longer identifiers, comments
-//! or test modules; and each workspace scan must find krb-proto's own
-//! definition (rules 1, 2) or the listed `till` value (rule 3), so it
-//! cannot pass vacuously.
+//! exact lines Q-995 and Q-1005 removed — and not calls, longer
+//! identifiers, literal instants, comments or test modules; and each
+//! workspace scan must find krb-proto's own definition (rules 1, 2), the
+//! listed `till` value (rule 3) or exactly the listed field decoders (rule
+//! 4), so it cannot pass vacuously or keep a stale entry.
 //!
 //! Source: RFC 3244 §2 ("the service principal kadmin/changepw@REALM");
 //! RFC 4120 5.2.3 (KerberosTime), §6.2, 5.4.1 (`till` 19700101000000Z);
-//! docs/52 §3.14 (C14); docs/questions/Q-955 item 5 (A-158), Q-987 item 5
-//! (A-165), Q-995; AGENTS.md §6.1. Test-only; modelled on crates/keyd-types
+//! RFC 4517 §3.3.13 (Generalized Time); docs/52 §3.14 (C14);
+//! docs/questions/Q-955 item 5 (A-158), Q-987 item 5 (A-165), Q-995
+//! (A-169), Q-1005; AGENTS.md §6.1. Test-only; modelled on crates/keyd-types
 //! `tests/one_service_purpose_derivation.rs` (this project's own code).
 
 use std::path::{Path, PathBuf};
 
 /// Rule 1: each single definition and the one file that holds it.
-const DEFINITIONS: [(&str, &str); 5] = [
+const DEFINITIONS: [(&str, &str); 6] = [
     ("fn kerberos_time_seconds", "krb-proto/src/time.rs"),
+    ("fn kerberos_time_from_seconds", "krb-proto/src/time.rs"),
     ("fn kerberos_time_from_unix", "krb-proto/src/time.rs"),
     ("fn kerberos_time_to_unix", "krb-proto/src/time.rs"),
     (
@@ -80,6 +99,34 @@ const EPOCH_SPELLED_ELSEWHERE: [(&str, &str); 1] = [(
     "RFC 4120 5.4.1: the `till` value 19700101000000Z (\"the maximum endtime \
      permitted\") — a protocol value, not a Unix conversion",
 )];
+
+/// Rule 4: the constructor whose arguments the scan reads.
+const CONSTRUCTOR: &str = "KerberosTime::new(";
+
+/// Rule 4: the type's home, where a KerberosTime is built from computed
+/// fields by design (the decoder and the single conversions).
+const FIELDS_HOME: &str = "krb-proto/src/";
+
+/// Rule 4: the files outside krb-proto that build a KerberosTime from
+/// computed fields, with the reason — each decodes fields, none converts a
+/// count.
+const FIELDS_COMPUTED_ELSEWHERE: [(&str, &str); 3] = [
+    (
+        "ipc-directory/src/typed.rs",
+        "the kdc ↔ dird channel's wire time: its six calendar fields, \
+         validated by KerberosTime::new on decode (RFC 4120 5.2.3; docs/50 §3.3)",
+    ),
+    (
+        "ipc-keyd/src/typed.rs",
+        "the kdc ↔ keyd channel's wire time: its six calendar fields, \
+         validated by KerberosTime::new on decode (RFC 4120 5.2.3; Q-245 item 1)",
+    ),
+    (
+        "ldap/src/search/syntax.rs",
+        "an asserted Generalized Time's fields, parsed from the assertion \
+         value and then read through directory-pip's DSTIME (RFC 4517 §3.3.13)",
+    ),
+];
 
 /// The workspace's `crates/` directory.
 fn crates_dir() -> PathBuf {
@@ -191,6 +238,53 @@ fn epoch_lines(code: &str) -> Vec<usize> {
         .collect()
 }
 
+/// Whether `argument` (trimmed) is an integer literal: digits, with `_`
+/// separators.
+fn integer_literal(argument: &str) -> bool {
+    !argument.is_empty() && argument.chars().all(|c| c.is_ascii_digit() || c == '_')
+}
+
+/// Rule 4: the lines of `code` where a `KerberosTime::new(` starts whose
+/// arguments — the text to its matching `)`, split at commas, a trailing
+/// comma ignored — are not all integer literals. `MyKerberosTime::new(` is
+/// another type and is not read.
+fn computed_constructions(code: &str) -> Vec<usize> {
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(at) = code[from..].find(CONSTRUCTOR) {
+        let start = from + at;
+        let open = start + CONSTRUCTOR.len();
+        from = open;
+        if code[..start].chars().next_back().is_some_and(ident) {
+            continue;
+        }
+        let mut depth = 1usize;
+        let mut close = code.len();
+        for (offset, c) in code[open..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = open + offset;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let literal = code[open..close]
+            .split(',')
+            .map(str::trim)
+            .filter(|argument| !argument.is_empty())
+            .all(integer_literal);
+        if !literal {
+            found.push(code[..start].matches('\n').count() + 1);
+        }
+    }
+    found
+}
+
 /// Every non-test source file of the workspace with its path relative to
 /// `crates/` and its non-test code.
 fn workspace_code() -> Vec<(String, String)> {
@@ -229,8 +323,8 @@ fn the_name_and_the_time_conversions_are_defined_once() {
         assert_eq!(
             found,
             vec![home],
-            "`{item}` must be defined only in {home} (Q-987 item 5, Q-995): call \
-             krb_proto's instead of writing a copy"
+            "`{item}` must be defined only in {home} (Q-987 item 5, Q-995, \
+             Q-1005): call krb_proto's instead of writing a copy"
         );
     }
 }
@@ -289,6 +383,49 @@ fn the_unix_epoch_is_spelled_only_where_listed() {
     );
 }
 
+/// Rule 4: a KerberosTime is built from computed fields outside krb-proto
+/// only in the listed field decoders — positive control: exactly the
+/// listed files are found (each one, so the scan is not vacuous and no
+/// entry outlives its reason).
+#[test]
+fn kerberos_time_is_built_from_computed_fields_only_where_listed() {
+    let mut unlisted = Vec::new();
+    let mut listed = Vec::new();
+    for (rel, text) in workspace_code() {
+        if rel.starts_with(FIELDS_HOME) {
+            continue;
+        }
+        for line in computed_constructions(&text) {
+            if FIELDS_COMPUTED_ELSEWHERE
+                .iter()
+                .any(|(file, _)| *file == rel)
+            {
+                listed.push(rel.clone());
+            } else {
+                unlisted.push(format!("{rel}:{line}"));
+            }
+        }
+    }
+    assert!(
+        unlisted.is_empty(),
+        "a KerberosTime built from computed fields outside krb-proto — a \
+         hand-written conversion of a count? Call krb_proto::\
+         kerberos_time_from_seconds / kerberos_time_from_unix (Q-995, \
+         Q-1005), or list the file with its reason: {unlisted:#?}"
+    );
+    listed.sort();
+    listed.dedup();
+    let expected: Vec<&str> = FIELDS_COMPUTED_ELSEWHERE
+        .iter()
+        .map(|(file, _)| *file)
+        .collect();
+    assert_eq!(
+        listed, expected,
+        "every listed field decoder must still be found (a stale entry is \
+         removed with its reason)"
+    );
+}
+
 /// Positive control of the scanners: planted copies are flagged — among
 /// them the lines Q-995 removed from directory-daemon (`kpasswd_service.rs`,
 /// `clock.rs`), the daemons' clocks and the LDAP engine — while calls,
@@ -339,4 +476,81 @@ mod tests {
         ]
     );
     assert_eq!(epoch_lines(&code), vec![4, 5]);
+}
+
+/// Positive control of rules 1 and 4 for the scale's inverse (Q-1005):
+/// planted copies are flagged — a definition of `kerberos_time_from_seconds`;
+/// the exact lines removed from the kdc's and directory-pip's `from_seconds`
+/// (the first-of-month probe, the multi-line final construction); and a
+/// path-qualified construction from a named constant (krb-proto's own
+/// former epoch line, path added) — while literal instants (the kdc's
+/// `till`, directory-pip's 1601 epoch, the kdc's configuration probe, a
+/// multi-line literal with `_` separators and a trailing comma), calls,
+/// imports, a function passed by name, another type's `new`, a comment and
+/// a test module are not.
+#[test]
+fn the_scanners_tell_a_conversion_from_a_literal_instant() {
+    let text = "\
+pub fn kerberos_time_from_seconds(seconds: i64) -> Option<KerberosTime> {
+    KerberosTime::new(year, month, 1, 0, 0, 0)
+    KerberosTime::new(
+        year,
+        month,
+        u8::try_from(day).ok()?,
+        u8::try_from(rest / SECONDS_PER_HOUR).ok()?,
+        u8::try_from(rest % SECONDS_PER_HOUR / SECONDS_PER_MINUTE).ok()?,
+        u8::try_from(rest % SECONDS_PER_MINUTE).ok()?,
+    )
+    .ok()
+    let epoch = krb_proto::KerberosTime::new(UNIX_EPOCH_YEAR, 1, 1, 0, 0, 0).ok()?;
+    KerberosTime::new(1970, 1, 1, 0, 0, 0).ok()
+    KerberosTime::new(1601, 1, 1, 0, 0, 0)
+        KerberosTime::new(2000, 1, 1, 0, 0, 0).map_err(|_| ConfigError::UdpReplyLimit)?;
+    KerberosTime::new(
+        10_000,
+        1,
+        1,
+        0,
+        0,
+        0,
+    )
+use krb_proto::{kerberos_time_from_seconds, KerberosTime};
+        Some(kerberos_time_from_seconds(renew).ok_or(TimeRefusal::OutOfRange)?)
+        .and_then(kerberos_time_from_seconds)
+    MyKerberosTime::new(year, month)
+// KerberosTime::new(year, month, 1, 0, 0, 0)
+#[cfg(test)]
+mod tests {
+    fn kerberos_time_from_seconds() {}
+    KerberosTime::new(y, mo, d, h, mi, s).unwrap()
+}
+";
+    let code = code_of(text);
+    assert!(defines(&code, "fn kerberos_time_from_seconds"));
+    assert!(
+        !defines(
+            "use krb_proto::{kerberos_time_from_seconds, KerberosTime};\n\
+             let end = kerberos_time_from_seconds(end);\n\
+             .and_then(kerberos_time_from_seconds)\n\
+             fn kerberos_time_from_seconds_checked() {}\n",
+            "fn kerberos_time_from_seconds"
+        ),
+        "an import, a call, a function passed by name and a longer \
+         identifier are not definitions"
+    );
+    assert_eq!(computed_constructions(&code), vec![2, 3, 12]);
+    let after_comments_and_tests = "\
+// pub fn kerberos_time_from_seconds(seconds: i64) -> Option<KerberosTime> {
+#[cfg(test)]
+mod tests {
+    pub fn kerberos_time_from_seconds(seconds: i64) -> Option<KerberosTime> {
+}
+";
+    assert!(
+        !defines(
+            &code_of(after_comments_and_tests),
+            "fn kerberos_time_from_seconds"
+        ),
+        "a comment and a test module define nothing"
+    );
 }
