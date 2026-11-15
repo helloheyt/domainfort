@@ -30,8 +30,9 @@
 //! raw snapshot (`DirectoryView::authority_snapshot`): the internal reads
 //! docs/questions/Q-486 item 5 puts outside the gate — the write invariants'
 //! graph, the self-lockout count, the counters, the name and uniqueness
-//! checks of a create, the has-children probe of a delete, the NC root, the
-//! exact-value locator of `Lookup`, the key-operation target, the
+//! checks of a create (the uniqueness one over the one principal namespace
+//! — task PN5), the has-children probe of a delete, the NC root, the
+//! namespace locator of `Lookup`, the key-operation target, the
 //! tombstones of dird's destroy decisions, and (task MA3) the effect-plan
 //! facts of crate::effects (`directory_pip::PrincipalFacts`, the member
 //! closure, the principals under a subtree, an account's state) — each a
@@ -53,22 +54,34 @@ use directory_pip::{
     DirectoryView, MemberChange, PepView, PrincipalFacts, TierMap, VisibilityGate, VisibilityProof,
     VisibilityRule, VisibleObject, MAX_EXPANDED_GROUPS, MAX_NESTING_DEPTH,
 };
-use dirstore::{AttrId, ClassId, CounterState, Object, Tombstone, TombstonePage};
+use dirstore::{ClassId, CounterState, Object, Tombstone, TombstonePage};
 use dtyp::{Guid, Sid};
 use ipc_audit::{AdminFailure, AdminRefusal};
 use kdc::AccountSource;
-use krb_proto::constants::KRB_NT_PRINCIPAL;
+use krb_proto::constants::{KRB_NT_PRINCIPAL, KRB_NT_SRV_HST};
 use krb_proto::{KerberosString, KerberosTime, PrincipalName};
 use pdp::{
     AccessRequest, Action, Context, Decision, Dn, Instant, IpScope, PolicySnapshot, Resource,
     Subject, Tier, Transport, TransportSec,
 };
+use principal_names::{key_of_request, KeySet, RequestKey, MAX_KEY_COMPONENTS};
 
 use crate::audit::Stop;
 use crate::config::AdminConfig;
 use crate::ids::Ids;
 use crate::invariants::{End, Fault, Graph, Invariants, LinkProof, MAX_WALK_STEPS};
 use crate::record;
+
+/// Which stored name a `Lookup` compares with its value, once the one
+/// namespace probe found an object (docs/59 §6.4: the kind filter).
+/// Spec: docs/51 §5.2 row 10 (`Lookup {sam | spn | dn}`); docs/59 §6.4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NameLookup {
+    /// The object's sAMAccountName.
+    SamAccountName,
+    /// The object's servicePrincipalName.
+    ServicePrincipalName,
+}
 
 /// The transport security of the admin plane's local socket: the bytes
 /// never leave the host's kernel (`encrypted`, `sealed`), and
@@ -312,6 +325,9 @@ pub(crate) fn fault_stop(fault: &Fault) -> Stop {
         Fault::Store(e) => store_failure(e),
         Fault::Integrity => Stop::Failed(AdminFailure::IntegrityFailure),
         Fault::Missing => Stop::Failed(AdminFailure::StoreFailure),
+        // The online PEP's checker always has its namespace (task PN5;
+        // `AdminConfig`): a misassembled checker — fail closed.
+        Fault::Namespace => Stop::Failed(AdminFailure::InternalFailure),
     }
 }
 
@@ -540,22 +556,32 @@ impl<'v, 'a> Cx<'_, 'v, 'a> {
         }
     }
 
-    /// A create's uniqueness check: no object holds `value` in the unique
-    /// attribute `attr` (docs/46 §8.5, the rule the create path cites) — taken ⇒
-    /// `Conflict`, a value the index cannot hold ⇒ `ValueInvalid`. Internal
+    /// A create's uniqueness check, in the one principal namespace (task
+    /// PN5): no live object holds any of `keys` — the keys the new object
+    /// will hold, derived by the write checker's own rules
+    /// (`Invariants::keys_of_new`) — so a name taken in **any** of its forms
+    /// (a computer `dc$` beside a user `dc`, a UPN local part beside another
+    /// object's sAMAccountName, an SPN in another case) is caught here, not
+    /// only the same value in the same attribute. Taken ⇒ `Conflict`, a key
+    /// the index cannot hold ⇒ `ValueInvalid`. One probe per key, at most
+    /// `principal_names::MAX_KEYS_PER_OBJECT`. The store refuses a key taken
+    /// in between at the commit (`ValueNotUnique` ⇒ `Conflict`). Internal
     /// read (docs/questions/Q-487 item 2).
-    /// Spec: docs/46 §8.5; docs/questions/Q-487 item 2.
-    pub(crate) fn unique_free(&self, attr: AttrId, value: &str) -> Result<(), Stop> {
-        match self
-            .view
-            .authority_snapshot()
-            .lookup_unique(attr, value.as_bytes())
-        {
-            Ok(None) => Ok(()),
-            Ok(Some(_)) => Err(Stop::Refused(AdminRefusal::Conflict)),
-            Err(dirstore::Error::Rejected(_)) => Err(Stop::Refused(AdminRefusal::ValueInvalid)),
-            Err(e) => Err(store_failure(&e)),
+    /// Spec: docs/59 §4.4 N1, §5.1 ("`names_free(&KeySet)`"), §5.3; [MS-SAMR]
+    /// 3.1.1.8.4 item 2; RFC 4120 §6.2; docs/questions/Q-487 item 2.
+    pub(crate) fn names_free(&self, keys: &KeySet) -> Result<(), Stop> {
+        let snapshot = self.view.authority_snapshot();
+        for key in keys.keys() {
+            match snapshot.lookup_unique(self.ids.principal_name_key, key.as_bytes()) {
+                Ok(None) => {}
+                Ok(Some(_)) => return Err(Stop::Refused(AdminRefusal::Conflict)),
+                Err(dirstore::Error::Rejected(_)) => {
+                    return Err(Stop::Refused(AdminRefusal::ValueInvalid))
+                }
+                Err(e) => return Err(store_failure(&e)),
+            }
         }
+        Ok(())
     }
 
     /// The NC root: the object the naming context's DN names — for the
@@ -619,17 +645,27 @@ impl<'v, 'a> Cx<'_, 'v, 'a> {
             .map_err(|f| fault_stop(&f))
     }
 
-    /// `Lookup`'s locator: the object whose stored value of the unique
-    /// attribute `attr` is `value` — through the unique index, then
-    /// compared octet for octet (A-27, as the account source does). A value
-    /// that cannot name anything (empty, longer than `max`, not printable
-    /// ASCII) names nothing. Only a GUID comes back — the object itself
-    /// reaches the reply only through the gate.
-    /// Spec: docs/47 §1.3 steps 3-4 (R47-1); docs/46 §5.4 (bounds);
-    /// docs/52 R-a.
-    pub(crate) fn locate_exact(
+    /// `Lookup`'s locator, through the one principal namespace (task PN5):
+    /// the object one of whose stored names of kind `kind` is exactly
+    /// `value`. The value is turned into the one key a request probes
+    /// (`principal_names::key_of_request` in this realm — a sAMAccountName
+    /// as a one-component name, an SPN split on "/"; the name-type a hint
+    /// only, RFC 4120 §6.2), the namespace index is probed **once**, and the
+    /// object found must hold `value` itself in the attribute of `kind`,
+    /// octet for octet (the kind filter and the exact acceptance of R47-1 —
+    /// today's semantics: `ALICE` does not find `alice`). A value that
+    /// cannot name anything (empty, longer than `max`, not printable ASCII,
+    /// a form no key has — and, as for every request, the krbtgt account,
+    /// which no request's key reaches: docs/59 §4.2, Q-1018 item 5) names
+    /// nothing. Only a GUID comes back — the object itself reaches the reply
+    /// only through the gate.
+    /// Spec: docs/59 §4.2, §5.3, §6.4 ("`Lookup {sam | spn}` ⇒ a probe in
+    /// `PRINCIPAL_NAME_KEY` + the kind filter + the comparison with the
+    /// stored value"); docs/47 §1.3 steps 3-4 (R47-1); docs/46 §5.4
+    /// (bounds); docs/52 R-a; RFC 4120 §6.2.
+    pub(crate) fn locate_name(
         &self,
-        attr: AttrId,
+        kind: NameLookup,
         value: &str,
         max: usize,
     ) -> Result<Option<Guid>, Stop> {
@@ -639,8 +675,37 @@ impl<'v, 'a> Cx<'_, 'v, 'a> {
         {
             return Ok(None);
         }
+        let (attr, name_type, components) = match kind {
+            NameLookup::SamAccountName => {
+                (self.ids.sam_account_name, KRB_NT_PRINCIPAL, vec![value])
+            }
+            NameLookup::ServicePrincipalName => (
+                self.ids.service_principal_name,
+                KRB_NT_SRV_HST,
+                crate::names::spn_components(value),
+            ),
+        };
+        if components.len() > MAX_KEY_COMPONENTS {
+            return Ok(None);
+        }
+        let Some(name_string) = components
+            .iter()
+            .map(|c| KerberosString::new(c).ok())
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        let name = PrincipalName {
+            name_type,
+            name_string,
+        };
+        let RequestKey::Key(key) =
+            key_of_request(&name, self.config.realm(), self.config.name_context())
+        else {
+            return Ok(None);
+        };
         let snapshot = self.view.authority_snapshot();
-        let guid = match snapshot.lookup_unique(attr, value.as_bytes()) {
+        let guid = match snapshot.lookup_unique(self.ids.principal_name_key, key.as_bytes()) {
             Ok(Some(guid)) => guid,
             Ok(None) | Err(dirstore::Error::Rejected(_)) => return Ok(None),
             Err(e) => return Err(store_failure(&e)),

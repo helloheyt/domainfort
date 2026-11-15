@@ -29,6 +29,9 @@ use dtyp::{
 };
 
 use super::*;
+use crate::config::{
+    PRINCIPAL_NAMESPACE_COUNTER, PRINCIPAL_NAMESPACE_END_EXCLUSIVE, PRINCIPAL_NAMESPACE_FIRST,
+};
 use crate::record::{encode_flags, encode_int64, encode_ref};
 
 /// A store file under the system's temporary directory, removed on drop.
@@ -210,10 +213,24 @@ fn group(ids: &Ids, g: Guid, parent: Guid, sam: &str, members: &[Guid]) -> NewOb
 
 const OU: u8 = 2;
 
-/// A session with the NC root and one OU.
+/// The naming context dc=example,dc=test (A-53): the realm EXAMPLE.TEST,
+/// whose one namespace alias is `example.test` (task PN5).
+fn naming_context() -> directory_pip::NamingContext {
+    directory_pip::NamingContext::new(&["example", "test"]).unwrap()
+}
+
+/// The principal namespace of [`naming_context`] (task PN5).
+fn names() -> Option<NameContext> {
+    Some(directory_pip::name_context_of(&naming_context()).unwrap())
+}
+
+/// A session in [`naming_context`]'s namespace (no zone) with the NC root
+/// and one OU.
 fn begin<'t, 's>(txn: &'t mut WriteTxn<'s>) -> Provisioning<'t, 's> {
     let ids = ids();
-    let mut session = Provisioning::begin(txn, &p1(), WALL, NODE).unwrap();
+    let mut session = Provisioning::begin(txn, &p1(), WALL, NODE)
+        .unwrap()
+        .with_naming_context(&naming_context());
     session
         .create(Some(ProvisioningRole::NamingContextRoot), root(&ids))
         .unwrap();
@@ -327,7 +344,7 @@ fn the_commit_takes_the_rid_and_the_change_seq() {
     let t = TempStore::new("allocate");
     let mut txn = t.store.begin_write().unwrap();
     begin(&mut txn);
-    let inv = Invariants::new(&p1(), BTreeSet::new(), None).unwrap();
+    let inv = Invariants::new(&p1(), BTreeSet::new(), None, names()).unwrap();
     let seq = txn.counter(CHANGE_SEQ_COUNTER).unwrap().unwrap().next_value;
     let checked = inv
         .check_create(
@@ -358,7 +375,7 @@ fn a_checked_write_is_stale_after_another_write() {
     let t = TempStore::new("stale");
     let mut txn = t.store.begin_write().unwrap();
     begin(&mut txn);
-    let inv = Invariants::new(&p1(), BTreeSet::new(), None).unwrap();
+    let inv = Invariants::new(&p1(), BTreeSet::new(), None, names()).unwrap();
     let first = inv
         .check_create(&txn, ou(&ids, guid(30), guid(1), "A"), None, &[])
         .unwrap();
@@ -389,7 +406,7 @@ fn a_link_proof_of_another_state_is_not_accepted() {
         s.create(None, group(&ids, guid(41), guid(OU), "g2", &[]))
             .unwrap();
     }
-    let inv = Invariants::new(&p1(), BTreeSet::new(), None).unwrap();
+    let inv = Invariants::new(&p1(), BTreeSet::new(), None, names()).unwrap();
     let g1 = txn.get_object(guid(40)).unwrap().unwrap();
     let g2 = txn.get_object(guid(41)).unwrap().unwrap();
     let group_type = GROUP_TYPE_SECURITY_ENABLED | GROUP_TYPE_ACCOUNT_GROUP;
@@ -462,7 +479,7 @@ fn the_closure_bound_holds_at_the_write() {
     for n in 1..=1022 {
         beneath(&mut txn, n);
     }
-    let inv = Invariants::new(&p1(), BTreeSet::new(), None).unwrap();
+    let inv = Invariants::new(&p1(), BTreeSet::new(), None, names()).unwrap();
     // 1022 groups + the new one = 1023 ≤ 1024.
     inv.check_create(
         &txn,
@@ -532,7 +549,7 @@ fn structural_objects_and_unwritten_attributes_are_refused() {
         )
         .unwrap();
     }
-    let inv = Invariants::new(&p1(), BTreeSet::new(), None).unwrap();
+    let inv = Invariants::new(&p1(), BTreeSet::new(), None, names()).unwrap();
     let uac = |v: u32| {
         vec![AttributeChange::Replace {
             id: ids.user_account_control,
@@ -683,7 +700,7 @@ fn the_admin_service_name_is_the_admin_service_objects_alone() {
         assert_eq!(StoreRead::object(&txn, guid(refused)).unwrap(), None);
     }
     assert!(StoreRead::object(&txn, guid(74)).unwrap().is_some());
-    let inv = Invariants::new(&p1(), BTreeSet::new(), None).unwrap();
+    let inv = Invariants::new(&p1(), BTreeSet::new(), None, names()).unwrap();
     let renamed = inv.check_modify(
         &txn,
         guid(76),
@@ -852,10 +869,11 @@ fn the_host_record_rule() {
     let ids = ids();
     let hosts = zone();
     let addr = |last: u8| vec![192, 0, 2, last];
+    let names = names();
     let check = |obj: &NewObject, role: Option<ProvisioningRole>, hosts: Option<&HostZone>| {
         let draft = draft(obj.guid, obj.parent, &obj.classes, &obj.attributes).unwrap();
         let class = p1().schema().most_specific_class(&draft.classes).unwrap();
-        object::check_new(&ids, &draft, class, role, hosts)
+        object::check_new(&ids, &draft, class, role, hosts, names.as_ref()).map(|_| ())
     };
     let with = |mut obj: NewObject, values: Vec<Vec<u8>>| {
         obj.attributes.push((ids.host_address, values));
@@ -950,7 +968,7 @@ fn the_commit_takes_the_zone_serial_for_zone_changes() {
     let t = TempStore::new("zone-commit");
     let mut txn = t.store.begin_write().unwrap();
     begin(&mut txn);
-    let inv = Invariants::new(&p1(), BTreeSet::new(), Some(zone())).unwrap();
+    let inv = Invariants::new(&p1(), BTreeSet::new(), Some(zone()), names()).unwrap();
     let serial = |txn: &WriteTxn<'_>| {
         txn.counter(DNS_ZONE_SERIAL_COUNTER)
             .unwrap()
@@ -1075,7 +1093,7 @@ fn the_serial_only_write_takes_the_zone_serial_alone() {
     let t = TempStore::new("zone-serial-write");
     let mut txn = t.store.begin_write().unwrap();
     begin(&mut txn);
-    let inv = Invariants::new(&p1(), BTreeSet::new(), None).unwrap();
+    let inv = Invariants::new(&p1(), BTreeSet::new(), None, names()).unwrap();
     let counter = |txn: &WriteTxn<'_>, name: &str| txn.counter(name).unwrap().unwrap();
     let seq = counter(&txn, CHANGE_SEQ_COUNTER);
     let root = StoreRead::object(&txn, guid(1)).unwrap();
@@ -1125,7 +1143,7 @@ fn the_serial_only_write_skips_zero_and_needs_the_counter() {
     txn.create_counter(CHANGE_SEQ_COUNTER, 1, u64::MAX).unwrap();
     txn.create_counter(DNS_ZONE_SERIAL_COUNTER, (1u64 << 32) - 1, u64::MAX)
         .unwrap();
-    let inv = Invariants::new(&p1(), BTreeSet::new(), None).unwrap();
+    let inv = Invariants::new(&p1(), BTreeSet::new(), None, names()).unwrap();
     // The counter's next value 2³² − 1 shows SERIAL 2³² − 1; one take would
     // show 0, so the commit takes once more.
     let checked = inv.check_zone_serial(&txn).unwrap();
@@ -1173,7 +1191,7 @@ fn the_provisioning_session_writes_the_dc_host_record_only_with_the_zone() {
             .push((ids.host_address, vec![vec![192, 0, 2, 1]]));
         c
     };
-    let naming_context = directory_pip::NamingContext::new(&["example", "test"]).unwrap();
+    let naming_context = naming_context();
     let registration = crate::config::DnsRegistration::new(zone().networks).unwrap();
     let t = TempStore::new("provision-dc-host");
     let mut txn = t.store.begin_write().unwrap();
@@ -1207,4 +1225,710 @@ fn the_provisioning_session_writes_the_dc_host_record_only_with_the_zone() {
         rule(session.create(Some(ProvisioningRole::DcAccount), dc(guid(98)))),
         InvariantViolation::Value
     );
+}
+
+// ---------------------------------------------------------------------------
+// The one principal namespace (task PN5; docs/59 §4-§5, §10.1; A-173).
+// ---------------------------------------------------------------------------
+
+/// The namespace keys stored on `g`, as text, in the store's (octet) order.
+fn stored_keys(txn: &WriteTxn<'_>, g: Guid) -> Vec<String> {
+    let ids = ids();
+    StoreRead::object(txn, g)
+        .unwrap()
+        .unwrap()
+        .attribute(ids.principal_name_key)
+        .map(|a| {
+            a.values
+                .iter()
+                .map(|v| String::from_utf8(v.value.clone()).unwrap())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `new` with the extra values `extra`.
+fn with_values(mut new: NewObject, extra: Vec<(AttrId, Vec<Vec<u8>>)>) -> NewObject {
+    new.attributes.extend(extra);
+    new
+}
+
+/// The online computer `name` on `host` (WT), with the SPN `spn` if any.
+fn online_computer(ids: &Ids, g: Guid, name: &str, host: &str, spn: Option<&str>) -> NewObject {
+    let mut c = host_computer(ids, g, name, host);
+    if let Some(spn) = spn {
+        c.attributes.push((ids.service_principal_name, text(spn)));
+    }
+    c
+}
+
+/// The checker's commit of `new` (claim `role`) in `txn`: `Ok` when written,
+/// the rule when the checker refused, and `None` for a commit the store
+/// refused because another live object holds one of its namespace keys
+/// (`ValueNotUnique` on the namespace attribute — and on nothing else).
+fn write(
+    inv: &Invariants,
+    txn: &mut WriteTxn<'_>,
+    new: NewObject,
+    role: Option<ProvisioningRole>,
+) -> Result<(), Option<InvariantViolation>> {
+    let ids = ids();
+    match inv.check_create(txn, new, role, &[]) {
+        Err(Refused::Rule(v)) => Err(Some(v)),
+        Err(other) => panic!("{other:?}"),
+        Ok(checked) => match checked.commit(txn, STAMP) {
+            Ok(_) => Ok(()),
+            Err(CommitError::Write(dirstore::Error::ValueNotUnique(id)))
+                if id == ids.principal_name_key =>
+            {
+                Err(None)
+            }
+            Err(other) => panic!("{other:?}"),
+        },
+    }
+}
+
+/// docs/59 §4.3, §4.4 N5, N7, §4.6; Q-1007 item 4; Q-1008 items 2, 6;
+/// Q-1010 item 3; Q-1020 item 7; [MS-ADTS] 3.1.1.5.3.1.1.2: every principal
+/// the provisioning session creates — the krbtgt account, the DC account, a
+/// service object, an online computer, users (one with a UPN whose local
+/// part is its sAMAccountName in another case) and a group — holds exactly
+/// the keys `keys_of_names` derives from its own names, folded, each once
+/// (stored = derived; the caller supplied none), within the count bound
+/// (user ≤ 2, computer ≤ 3 + SPNs + 1, krbtgt 1 + the alias); the krbtgt
+/// account holds the realm alias; the service object carries the DC's host
+/// name without its key; an OU holds none.
+#[test]
+fn the_checker_writes_every_principals_keys() {
+    let ids = ids();
+    let t = TempStore::new("namespace-keys");
+    let mut txn = t.store.begin_write().unwrap();
+    let upn = |s: &str| (ids.user_principal_name, text(s));
+    {
+        let mut s = begin(&mut txn);
+        s.create(
+            Some(ProvisioningRole::Krbtgt),
+            user(&ids, guid(100), guid(OU), "krbtgt", ADS_UF_NORMAL_ACCOUNT),
+        )
+        .unwrap();
+        s.create(
+            Some(ProvisioningRole::DcAccount),
+            computer(
+                &ids,
+                guid(101),
+                guid(OU),
+                "dc01",
+                ADS_UF_SERVER_TRUST_ACCOUNT,
+            ),
+        )
+        .unwrap();
+        s.create(
+            Some(ProvisioningRole::ServiceObject),
+            service(
+                &ids,
+                guid(102),
+                "ldap-svc",
+                "dc01.example.test",
+                Some("ldap/dc01.example.test"),
+            ),
+        )
+        .unwrap();
+        s.create(
+            None,
+            online_computer(
+                &ids,
+                guid(103),
+                "ws01",
+                "ws01.example.test",
+                Some("HOST/ws01.example.test"),
+            ),
+        )
+        .unwrap();
+        s.create(
+            None,
+            with_values(
+                user(&ids, guid(104), guid(OU), "Carol", ADS_UF_NORMAL_ACCOUNT),
+                vec![upn("carol@EXAMPLE.TEST")],
+            ),
+        )
+        .unwrap();
+        s.create(
+            None,
+            with_values(
+                user(&ids, guid(105), guid(OU), "dave", ADS_UF_NORMAL_ACCOUNT),
+                vec![upn("D.Smith@example.test")],
+            ),
+        )
+        .unwrap();
+        s.create(None, group(&ids, guid(106), guid(OU), "Staff-G", &[]))
+            .unwrap();
+    }
+    let expected: [(u8, &[&str]); 7] = [
+        (100, &["example.test", "krbtgt"]),
+        (101, &["dc01", "dc01$", "dc01.example.test"]),
+        (102, &["ldap-svc", "ldap-svc$", "ldap/dc01.example.test"]),
+        (
+            103,
+            &[
+                "host/ws01.example.test",
+                "ws01",
+                "ws01$",
+                "ws01.example.test",
+            ],
+        ),
+        (104, &["carol"]),
+        (105, &["d.smith", "dave"]),
+        (106, &["staff-g"]),
+    ];
+    for (n, keys) in expected {
+        assert_eq!(stored_keys(&txn, guid(n)), keys, "object {n}");
+    }
+    // Stored = derived: the one derivation the lookup re-derives with.
+    let ctx = names().unwrap();
+    let derived = |names: principal_names::PrincipalNames<'_>| -> Vec<String> {
+        principal_names::keys_of_names(&names, &ctx)
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str().to_owned())
+            .collect()
+    };
+    assert_eq!(
+        derived(principal_names::PrincipalNames {
+            class: principal_names::PrincipalClass::DomainController,
+            sam_account_name: "dc01$",
+            user_principal_name: None,
+            service_principal_names: vec![],
+            dns_host_name: Some("dc01.example.test"),
+        }),
+        stored_keys(&txn, guid(101))
+    );
+    assert_eq!(
+        derived(principal_names::PrincipalNames {
+            class: principal_names::PrincipalClass::User,
+            sam_account_name: "dave",
+            user_principal_name: Some("D.Smith@example.test"),
+            service_principal_names: vec![],
+            dns_host_name: None,
+        }),
+        stored_keys(&txn, guid(105))
+    );
+    // The count bound of Q-1008 item 2 (decided A-173).
+    assert!(stored_keys(&txn, guid(104)).len() <= 2);
+    assert!(stored_keys(&txn, guid(105)).len() <= 2);
+    assert!(stored_keys(&txn, guid(103)).len() <= 3 + 1 + 1);
+    assert_eq!(stored_keys(&txn, guid(100)).len(), 1 + 1);
+    // No key outside the namespace.
+    assert!(stored_keys(&txn, guid(OU)).is_empty());
+    assert!(stored_keys(&txn, guid(1)).is_empty());
+}
+
+/// docs/59 §4.4 N7, §5.1; Q-1008 item 6: only the checker writes the
+/// namespace keys — a caller that supplies them is refused (`NotModifiable`)
+/// even with exactly the right keys or an empty value set, on a principal or
+/// any other object; no change can write or remove them; an object outside
+/// the namespace carries no name of it. Nothing refused is written.
+#[test]
+fn a_caller_cannot_supply_or_change_the_keys() {
+    let ids = ids();
+    let t = TempStore::new("namespace-n7");
+    let mut txn = t.store.begin_write().unwrap();
+    {
+        let mut s = begin(&mut txn);
+        for keys in [vec!["eve"], vec!["mallory"], vec![]] {
+            let supplied = with_values(
+                user(&ids, guid(110), guid(OU), "eve", ADS_UF_NORMAL_ACCOUNT),
+                vec![(
+                    ids.principal_name_key,
+                    keys.iter().map(|k| k.as_bytes().to_vec()).collect(),
+                )],
+            );
+            assert_eq!(
+                rule(s.create(None, supplied)),
+                InvariantViolation::NotModifiable,
+                "{keys:?}"
+            );
+        }
+        // Nothing was written: the same GUID is created now, with the
+        // checker's own keys.
+        s.create(
+            None,
+            user(&ids, guid(110), guid(OU), "eve", ADS_UF_NORMAL_ACCOUNT),
+        )
+        .unwrap();
+        let ou_with_key = with_values(
+            ou(&ids, guid(111), guid(1), "Keys"),
+            vec![(ids.principal_name_key, text("keys"))],
+        );
+        assert_eq!(
+            rule(s.create(None, ou_with_key)),
+            InvariantViolation::NotModifiable
+        );
+        let ou_with_name = with_values(
+            ou(&ids, guid(112), guid(1), "Named"),
+            vec![(ids.sam_account_name, text("named"))],
+        );
+        assert_eq!(
+            rule(s.create(None, ou_with_name)),
+            InvariantViolation::NotModifiable
+        );
+    }
+    for refused in [111, 112] {
+        assert_eq!(StoreRead::object(&txn, guid(refused)).unwrap(), None);
+    }
+    assert_eq!(stored_keys(&txn, guid(110)), ["eve"]);
+    let inv = Invariants::new(&p1(), BTreeSet::new(), None, names()).unwrap();
+    for values in [text("mallory"), text("eve"), vec![]] {
+        let change = inv.check_modify(
+            &txn,
+            guid(110),
+            vec![AttributeChange::Replace {
+                id: ids.principal_name_key,
+                values,
+            }],
+            &[],
+        );
+        assert!(
+            matches!(
+                change,
+                Err(Refused::Rule(InvariantViolation::NotModifiable))
+            ),
+            "{change:?}"
+        );
+    }
+    assert_eq!(stored_keys(&txn, guid(110)), ["eve"]);
+}
+
+/// docs/59 §3 (M2), §4.4 N1, §10.1 (the attacks); RFC 4120 §6.2 ("Ignoring
+/// the name type, no two names can be the same"); [MS-SAMR] 3.1.1.8.4 item 2
+/// (sAMAccountName unique over the union); [MS-ADTS] 3.1.1.5.1.3 (SPN, UPN
+/// "MUST be unique"); Q-1007 items 2, 7, 8: one name, in any of its forms,
+/// is one object's only — each second holder below passes every rule of the
+/// checker and (but for the SPN, whose own index folds case too) every
+/// per-attribute index, and the store's index on the one namespace
+/// attribute refuses it at the commit (the same transaction):
+/// noPac — a computer `dc$` beside a user `dc`, and a user `ws9` (any case)
+/// beside a computer `ws9$`; a UPN `bob@<realm>` (any case) beside another
+/// object's sAMAccountName `bob`; a group beside a computer of its name; one
+/// SPN in two spellings on two service objects (neither claims the host);
+/// a user named like a computer's dNSHostName. Nothing refused is written.
+#[test]
+fn one_name_is_one_objects_in_every_form() {
+    let ids = ids();
+    let t = TempStore::new("namespace-union");
+    let mut txn = t.store.begin_write().unwrap();
+    begin(&mut txn);
+    let inv = Invariants::new(&p1(), BTreeSet::new(), None, names()).unwrap();
+    let n = ADS_UF_NORMAL_ACCOUNT;
+    let upn = |s: &str| (ids.user_principal_name, text(s));
+    // The second holders live under another OU, so that no RDN is shared:
+    // what refuses them is the namespace alone.
+    const OTHER: u8 = 3;
+    write(
+        &inv,
+        &mut txn,
+        ou(&ids, guid(OTHER), guid(1), "Other"),
+        None,
+    )
+    .unwrap();
+    let elsewhere = |mut new: NewObject| {
+        new.parent = Some(guid(OTHER));
+        new
+    };
+    // noPac, both orders.
+    write(
+        &inv,
+        &mut txn,
+        user(&ids, guid(120), guid(OU), "dc", n),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        write(
+            &inv,
+            &mut txn,
+            elsewhere(online_computer(
+                &ids,
+                guid(121),
+                "dc",
+                "dc.example.test",
+                None
+            )),
+            None
+        ),
+        Err(None)
+    );
+    write(
+        &inv,
+        &mut txn,
+        online_computer(&ids, guid(122), "ws9", "ws9.example.test", None),
+        None,
+    )
+    .unwrap();
+    for (g, sam) in [(123, "ws9"), (124, "WS9"), (125, "ws9.example.test")] {
+        assert_eq!(
+            write(
+                &inv,
+                &mut txn,
+                elsewhere(user(&ids, guid(g), guid(OU), sam, n)),
+                None
+            ),
+            Err(None),
+            "{sam}"
+        );
+    }
+    // A UPN's local part beside another object's sAMAccountName.
+    write(
+        &inv,
+        &mut txn,
+        user(&ids, guid(126), guid(OU), "bob", n),
+        None,
+    )
+    .unwrap();
+    for (g, value) in [(127, "bob@example.test"), (128, "BOB@Example.Test")] {
+        let carol = with_values(user(&ids, guid(g), guid(OU), "carol", n), vec![upn(value)]);
+        assert_eq!(write(&inv, &mut txn, carol, None), Err(None), "{value}");
+    }
+    // A group and a computer of one name.
+    write(
+        &inv,
+        &mut txn,
+        group(&ids, guid(129), guid(OU), "staff", &[]),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        write(
+            &inv,
+            &mut txn,
+            elsewhere(online_computer(
+                &ids,
+                guid(130),
+                "staff",
+                "staff.example.test",
+                None
+            )),
+            None
+        ),
+        Err(None)
+    );
+    // One SPN in two spellings (service objects claim no host key).
+    write(
+        &inv,
+        &mut txn,
+        service(
+            &ids,
+            guid(131),
+            "svc1",
+            "dc01.example.test",
+            Some("ldap/dc01.example.test"),
+        ),
+        Some(ProvisioningRole::ServiceObject),
+    )
+    .unwrap();
+    // The per-attribute index of servicePrincipalName folds case too
+    // (dirstore's comparison key): both indexes are enforced in the one
+    // commit, either may answer first.
+    let second = inv
+        .check_create(
+            &txn,
+            service(
+                &ids,
+                guid(132),
+                "svc2",
+                "dc01.example.test",
+                Some("LDAP/dc01.example.test"),
+            ),
+            Some(ProvisioningRole::ServiceObject),
+            &[],
+        )
+        .unwrap();
+    let refused = second.commit(&mut txn, STAMP);
+    assert!(
+        matches!(
+            refused,
+            Err(CommitError::Write(dirstore::Error::ValueNotUnique(id)))
+                if id == ids.principal_name_key || id == ids.service_principal_name
+        ),
+        "{refused:?}"
+    );
+    for refused in [121, 123, 124, 125, 127, 128, 130, 132] {
+        assert_eq!(
+            StoreRead::object(&txn, guid(refused)).unwrap(),
+            None,
+            "{refused}"
+        );
+    }
+    // Controls: other names are free.
+    write(
+        &inv,
+        &mut txn,
+        user(&ids, guid(133), guid(OU), "dc2", n),
+        None,
+    )
+    .unwrap();
+    write(
+        &inv,
+        &mut txn,
+        with_values(
+            user(&ids, guid(134), guid(OU), "carol", n),
+            vec![upn("carol@example.test")],
+        ),
+        None,
+    )
+    .unwrap();
+}
+
+/// Class C49 (docs/52; docs/59 §3 M3); Q-1009 items 1-2 (decided A-173);
+/// A-163; RFC 4120 §6.2 ("Names of any type with an initial component of
+/// 'krbtgt' are reserved"), §7.3; RFC 3244 §2; docs/59 §4.4 N4, N5, §10.1:
+/// a reserved name in any case is judged on the folded key. Without the
+/// claim that owns it — `ADMIND/<host>`, `KADMIN/changepw`, `KRBTGT/<host>`
+/// (accepted before task PN5: their octets differed) — the SPN is refused
+/// (`Value`); the TGS's name or the realm alias as an account name, in any
+/// case, or as a computer's base name, is refused (`ReservedName`); as a
+/// UPN's local part or a host name (`Value`). The admin service's claim must
+/// spell its own name exactly (`Value` for a case variant). `kadmin/<host>`
+/// is not reserved (Q-1009 item 7 undecided). Nothing refused is written.
+#[test]
+fn reserved_names_are_judged_on_the_folded_key() {
+    let ids = ids();
+    let t = TempStore::new("namespace-reserved");
+    let mut txn = t.store.begin_write().unwrap();
+    begin(&mut txn);
+    let inv = Invariants::new(&p1(), BTreeSet::new(), None, names()).unwrap();
+    let n = ADS_UF_NORMAL_ACCOUNT;
+    let spn_cases = [
+        ("ws10.example.test", "ADMIND/ws10.example.test"),
+        ("ws10.example.test", "Admind/ws10.example.test"),
+        ("ws10.example.test", "KRBTGT/ws10.example.test"),
+        ("ws10.example.test", "krbtgt/ws10.example.test"),
+        ("changepw", "KADMIN/changepw"),
+        ("changepw", "Kadmin/changepw"),
+    ];
+    for (host, spn) in spn_cases {
+        assert_eq!(
+            write(
+                &inv,
+                &mut txn,
+                online_computer(&ids, guid(140), "ws10", host, Some(spn)),
+                None
+            ),
+            Err(Some(InvariantViolation::Value)),
+            "{spn}"
+        );
+        assert_eq!(
+            write(
+                &inv,
+                &mut txn,
+                online_computer(&ids, guid(140), "ws10", host, Some(spn)),
+                Some(ProvisioningRole::ServiceObject)
+            ),
+            Err(Some(InvariantViolation::Value)),
+            "{spn} as a service object"
+        );
+    }
+    let account_names = [
+        user(&ids, guid(141), guid(OU), "KRBTGT", n),
+        user(&ids, guid(141), guid(OU), "KrbTgt", n),
+        user(&ids, guid(141), guid(OU), "example.test", n),
+        user(&ids, guid(141), guid(OU), "Example.Test", n),
+        group(&ids, guid(141), guid(OU), "Krbtgt", &[]),
+        online_computer(&ids, guid(141), "KRBTGT", "krbtgt.example.test", None),
+    ];
+    for new in account_names {
+        assert_eq!(
+            write(&inv, &mut txn, new, None),
+            Err(Some(InvariantViolation::ReservedName))
+        );
+    }
+    let other_names = [
+        with_values(
+            user(&ids, guid(142), guid(OU), "tgs", n),
+            vec![(ids.user_principal_name, text("krbtgt@example.test"))],
+        ),
+        online_computer(&ids, guid(142), "ws11", "example.test", None),
+        online_computer(&ids, guid(142), "ws11", "krbtgt", None),
+    ];
+    for new in other_names {
+        assert_eq!(
+            write(&inv, &mut txn, new, None),
+            Err(Some(InvariantViolation::Value))
+        );
+    }
+    // The owning claim spells its name exactly.
+    assert_eq!(
+        write(
+            &inv,
+            &mut txn,
+            service(
+                &ids,
+                guid(143),
+                "admind-svc",
+                "dc01.example.test",
+                Some("ADMIND/dc01.example.test")
+            ),
+            Some(ProvisioningRole::AdminServiceObject)
+        ),
+        Err(Some(InvariantViolation::Value))
+    );
+    for refused in [140, 141, 142, 143] {
+        assert_eq!(StoreRead::object(&txn, guid(refused)).unwrap(), None);
+    }
+    // Not reserved: `kadmin/<host>` (Q-1009 item 7 undecided).
+    write(
+        &inv,
+        &mut txn,
+        online_computer(
+            &ids,
+            guid(144),
+            "ws12",
+            "ws12.example.test",
+            Some("kadmin/ws12.example.test"),
+        ),
+        None,
+    )
+    .unwrap();
+}
+
+/// docs/59 §4.4 N2-N4 (the namespace's syntax, crate principal-names —
+/// Q-1018 item 2); Q-1007 item 3 (a UPN suffix that is not a realm alias is
+/// refused — stricter than [MS-DRSR] 4.1.4.2.22, which takes the part before
+/// the "@" whatever the domain); [MS-ADTS] 3.1.1.5.3.1.1.4 ("The SPN (2)
+/// MUST NOT contain an ":instancename" component"): an "@" in a
+/// sAMAccountName is a name rule (`Name`); a UPN of a foreign suffix, without
+/// exactly one "@", or whose local part ends with "$" or holds "/", an "@"
+/// in a dNSHostName, an SPN host part with an instance name — value rules
+/// (`Value`). A numeric port is not an instance name ([MS-ADTS] 2.2.21).
+#[test]
+fn the_namespace_syntax_is_the_checkers() {
+    let ids = ids();
+    let t = TempStore::new("namespace-syntax");
+    let mut txn = t.store.begin_write().unwrap();
+    begin(&mut txn);
+    let inv = Invariants::new(&p1(), BTreeSet::new(), None, names()).unwrap();
+    let n = ADS_UF_NORMAL_ACCOUNT;
+    assert_eq!(
+        write(
+            &inv,
+            &mut txn,
+            user(&ids, guid(150), guid(OU), "a@b", n),
+            None
+        ),
+        Err(Some(InvariantViolation::Name))
+    );
+    for value in [
+        "alice@foreign.example",
+        "alice",
+        "alice@example.test@example.test",
+        "alice$@example.test",
+        "al/ice@example.test",
+        "@example.test",
+    ] {
+        let alice = with_values(
+            user(&ids, guid(151), guid(OU), "alice", n),
+            vec![(ids.user_principal_name, text(value))],
+        );
+        assert_eq!(
+            write(&inv, &mut txn, alice, None),
+            Err(Some(InvariantViolation::Value)),
+            "{value}"
+        );
+    }
+    let at_host = online_computer(&ids, guid(152), "ws13", "ws13@example.test", None);
+    assert_eq!(
+        write(&inv, &mut txn, at_host, None),
+        Err(Some(InvariantViolation::Value))
+    );
+    let instance = online_computer(
+        &ids,
+        guid(153),
+        "ws14",
+        "ws14.example.test:inst",
+        Some("host/ws14.example.test:inst"),
+    );
+    assert_eq!(
+        write(&inv, &mut txn, instance, None),
+        Err(Some(InvariantViolation::Value))
+    );
+    for refused in [150, 151, 152, 153] {
+        assert_eq!(StoreRead::object(&txn, guid(refused)).unwrap(), None);
+    }
+    write(
+        &inv,
+        &mut txn,
+        online_computer(
+            &ids,
+            guid(154),
+            "ws15",
+            "ws15.example.test:8080",
+            Some("http/ws15.example.test:8080"),
+        ),
+        None,
+    )
+    .unwrap();
+}
+
+/// docs/59 §5.1, §5.2, §5.5; Q-1008 item 5 (decided A-173); A-83: the
+/// provisioning session creates the `principal-namespace` marker counter
+/// with the others (its one value, never taken) and refuses a store that
+/// holds it; without a naming context it creates no security principal
+/// (fail closed: the keys cannot be derived) while other objects pass;
+/// given one through `with_dns_registration` (task DN10b's naming context),
+/// it does.
+#[test]
+fn provisioning_marks_the_namespace_and_needs_its_naming_context() {
+    let ids = ids();
+    let t = TempStore::new("namespace-marker");
+    {
+        let mut txn = t.store.begin_write().unwrap();
+        {
+            let mut s = Provisioning::begin(&mut txn, &p1(), WALL, NODE).unwrap();
+            s.create(Some(ProvisioningRole::NamingContextRoot), root(&ids))
+                .unwrap();
+            s.create(None, ou(&ids, guid(OU), guid(1), "Staff"))
+                .unwrap();
+            assert!(matches!(
+                s.create(
+                    None,
+                    user(&ids, guid(160), guid(OU), "alice", ADS_UF_NORMAL_ACCOUNT)
+                ),
+                Err(ProvisioningError::Store("principal namespace"))
+            ));
+            assert!(matches!(
+                s.create(None, group(&ids, guid(161), guid(OU), "g1", &[])),
+                Err(ProvisioningError::Store("principal namespace"))
+            ));
+            let registration = crate::config::DnsRegistration::new(zone().networks).unwrap();
+            let mut s = s.with_dns_registration(&naming_context(), &registration);
+            s.create(
+                None,
+                user(&ids, guid(160), guid(OU), "alice", ADS_UF_NORMAL_ACCOUNT),
+            )
+            .unwrap();
+            s.create(None, group(&ids, guid(161), guid(OU), "g1", &[]))
+                .unwrap();
+        }
+        let state = txn.counter(PRINCIPAL_NAMESPACE_COUNTER).unwrap().unwrap();
+        assert_eq!(state.first_value, PRINCIPAL_NAMESPACE_FIRST);
+        assert_eq!(state.next_value, PRINCIPAL_NAMESPACE_FIRST);
+        assert_eq!(state.end_exclusive, PRINCIPAL_NAMESPACE_END_EXCLUSIVE);
+        assert_eq!(stored_keys(&txn, guid(160)), ["alice"]);
+        txn.commit().unwrap();
+    }
+    let t = TempStore::new("namespace-marker-only");
+    {
+        let mut txn = t.store.begin_write().unwrap();
+        txn.create_counter(
+            PRINCIPAL_NAMESPACE_COUNTER,
+            PRINCIPAL_NAMESPACE_FIRST,
+            PRINCIPAL_NAMESPACE_END_EXCLUSIVE,
+        )
+        .unwrap();
+        txn.commit().unwrap();
+    }
+    let mut txn = t.store.begin_write().unwrap();
+    assert!(matches!(
+        Provisioning::begin(&mut txn, &p1(), WALL, NODE),
+        Err(ProvisioningError::NotEmpty)
+    ));
 }

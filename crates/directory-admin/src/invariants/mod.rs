@@ -61,7 +61,30 @@
 //! itself): uniqueness of sAMAccountName / userPrincipalName /
 //! servicePrincipalName / objectSid and of an RDN under its parent, the
 //! parent's existence and class (possSuperiors), the schema's must / may
-//! and value syntaxes.
+//! and value syntaxes — and the uniqueness of every **namespace key** over
+//! all objects (below).
+//!
+//! # The one principal namespace (task PN5; docs/59 §5, A-173)
+//!
+//! **Class M2 (= C31 / W3, docs/59 §3) — uniqueness per attribute, not over
+//! the union**: a computer `dc$` beside a user `dc`, a UPN `bob@<realm>`
+//! beside another object's sAMAccountName `bob`, one SPN in two spellings
+//! each passed every per-attribute index. **The root change, write half**
+//! (the storage half is ad-schema's `PRINCIPAL_NAME_KEY`, task PN2): every
+//! create of a security principal gets its keys from the checker — module
+//! `object` derives them with `principal_names::keys_of_names` from the
+//! object's own names and its claim, asserts their count, and
+//! [`Invariants::check_create`] writes exactly those keys into the object it
+//! creates. A caller can neither supply nor change a key (docs/59 N7:
+//! `known()` / `modifiable()`), so "stored keys = derived keys" holds for
+//! every write path — online, provisioning, and any later one, which can
+//! only reach the store through this module. The store's unique index on
+//! the one attribute then refuses, in the same commit, a key another live
+//! object holds: the union is unique by construction. The provisioning
+//! session derives the keys in the realm of the naming context it is given
+//! ([`Provisioning::with_dns_registration`], task DN10b's `NamingContext`);
+//! without one it creates no principal (fail closed); it marks the store it
+//! builds (`principal-namespace` counter — Q-1008 item 5).
 //!
 //! **Not here** (decisions of the requester's request, not invariants of
 //! the store — they stay in the online PEP): visibility, the PDP decision,
@@ -124,8 +147,10 @@
 //! Spec: docs/52 §3.14, §7 (R13); AGENTS.md §6.1; A-79, A-83, A-89, A-92,
 //! A-95, A-102; docs/51 §4.3 step 5, §5.2, §8.3, §11; docs/46 §4.4, §5.4,
 //! §8.2-§8.5; docs/47 §5.3; [MS-SAMR] v20260427 2.2.1.14, 3.1.1.6,
-//! 3.1.1.8.9, 3.1.1.9.2; docs/questions/Q-298, Q-355..Q-358, Q-376, Q-416,
-//! Q-505..Q-507.
+//! 3.1.1.8.4 item 2, 3.1.1.8.9, 3.1.1.9.2; RFC 4120 §6.2 ("Ignoring the
+//! name type, no two names can be the same"); docs/59 §3 (M2), §4.4 N1, N7,
+//! §5.1-§5.2 (A-173); docs/questions/Q-298, Q-355..Q-358, Q-376, Q-416,
+//! Q-505..Q-507, Q-1008, Q-1020.
 
 mod graph;
 mod object;
@@ -140,6 +165,7 @@ use dirstore::{
     MAX_VALUES_PER_ATTRIBUTE,
 };
 use dtyp::{Guid, Sid, GUID_PACKET_LEN};
+use principal_names::{KeySet, NameContext};
 
 pub(crate) use graph::{End, Graph, MAX_WALK_STEPS};
 pub(crate) use object::HostZone;
@@ -199,6 +225,11 @@ pub(crate) enum Fault {
     Integrity,
     /// The change-seq counter or the NC root's domain SID is missing.
     Missing,
+    /// A security principal is to be created by a checker that has no
+    /// principal namespace context (a provisioning session given no naming
+    /// context): its keys cannot be derived, so it is not written (task
+    /// PN5; docs/59 §5.1 — fail closed).
+    Namespace,
 }
 
 /// A check that did not pass: a rule refused the write, or no decision was
@@ -748,23 +779,33 @@ pub(crate) struct Invariants {
     /// The zone and registrable networks of host records (task DN6);
     /// `None` ⇒ no host address can be written.
     hosts: Option<HostZone>,
+    /// The principal namespace's realm context (task PN5): the online PEP's
+    /// from `AdminConfig`, the provisioning session's from the naming
+    /// context it is given; `None` ⇒ no security principal can be created
+    /// (fail closed — `Fault::Namespace`).
+    names: Option<NameContext>,
 }
 
 impl Invariants {
     /// The checker for the phase-1 schema with these protected service
-    /// objects and, when DNS self-updates are enabled, the zone of host
-    /// records (`hosts`). Fails closed if the schema lacks a name it needs.
-    /// Spec: docs/46 §4.4, §5.4; docs/51 §5.2 row 9; docs/54 §5.3, §5.5.
+    /// objects, when DNS self-updates are enabled the zone of host records
+    /// (`hosts`), and the principal namespace's realm context (`names`).
+    /// Fails closed if the schema lacks a name it needs.
+    /// Spec: docs/46 §4.4, §5.4; docs/51 §5.2 row 9; docs/54 §5.3, §5.5;
+    /// docs/59 §5.1 (`NameContext` from `AdminConfig` and for the
+    /// provisioning session).
     pub(crate) fn new(
         schema: &Phase1Schema,
         service_objects: BTreeSet<Guid>,
         hosts: Option<HostZone>,
+        names: Option<NameContext>,
     ) -> Result<Invariants, ConfigError> {
         Ok(Invariants {
             ids: Ids::resolve(schema)?,
             schema: schema.schema().clone(),
             service_objects,
             hosts,
+            names,
         })
     }
 
@@ -909,13 +950,86 @@ impl Invariants {
         Ok(())
     }
 
+    /// The per-object rules of a new object (`object::check_new`) on the
+    /// record `obj` of most specific class `class`, for the claim `role`,
+    /// in this checker's namespace — and the keys it will hold (`Some` for a
+    /// security principal). A security principal with no namespace context
+    /// is refused first (`Fault::Namespace`).
+    /// Spec: module documentation, "The one principal namespace"; docs/59
+    /// §5.1.
+    fn per_object(
+        &self,
+        obj: &Object,
+        class: ClassId,
+        role: Option<ProvisioningRole>,
+    ) -> Result<Option<KeySet>, Refused> {
+        if object::is_principal_class(&self.ids, class) && self.names.is_none() {
+            return Err(Fault::Namespace.into());
+        }
+        Ok(object::check_new(
+            &self.ids,
+            obj,
+            class,
+            role,
+            self.hosts.as_ref(),
+            self.names.as_ref(),
+        )?)
+    }
+
+    /// N7 on the caller's raw values (docs/59 §4.4): a new object's values
+    /// name the namespace attribute not at all — not even with an empty
+    /// value set, which the record draft would drop and the checker's own
+    /// keys would then follow as a second entry (`NotModifiable`).
+    /// Spec: docs/59 §4.4 N7, §5.1; docs/questions/Q-1008 item 6.
+    fn no_supplied_keys(&self, attributes: &[(AttrId, Vec<Vec<u8>>)]) -> Result<(), Refused> {
+        if attributes
+            .iter()
+            .any(|(id, _)| *id == self.ids.principal_name_key)
+        {
+            return Err(InvariantViolation::NotModifiable.into());
+        }
+        Ok(())
+    }
+
+    /// The keys an object the online path creates — most specific class
+    /// `class`, objectClass chain `classes`, under `parent`, with the values
+    /// `attributes` — will hold in the namespace, by the very rules
+    /// [`Invariants::check_create`] applies to it (no claim): `None` for an
+    /// object outside the namespace. `prepare`'s conflict check probes these
+    /// keys (`names_free`, docs/59 §5.1); the store refuses a key taken in
+    /// between at the commit. Reads nothing from the directory.
+    /// Spec: docs/59 §5.1 ("`new_values` … becomes `names_free(&KeySet)`");
+    /// docs/questions/Q-487 item 2.
+    pub(crate) fn keys_of_new(
+        &self,
+        class: ClassId,
+        classes: &[ClassId],
+        parent: Guid,
+        attributes: &[(AttrId, Vec<Vec<u8>>)],
+    ) -> Result<Option<KeySet>, Refused> {
+        self.no_supplied_keys(attributes)?;
+        let obj = draft(
+            Guid::from_packet(&[0; 16]),
+            Some(parent),
+            classes,
+            attributes,
+        )?;
+        if self.schema.most_specific_class(&obj.classes) != Some(class) {
+            return Err(InvariantViolation::Class.into());
+        }
+        self.per_object(&obj, class, None)
+    }
+
     /// Check the create of `new` in `txn` (module documentation): the
     /// per-object rules on the record it will have, for the exception
     /// `role` it claims (`None` except in the provisioning session), its
     /// `member` links against `txn` (`proofs` from the PEP, if any), and —
     /// for a security principal — the domain SID its objectSid will
-    /// extend. A supplied objectSid is verified at the commit.
-    /// Spec: module documentation; docs/51 §5.2 rows 1-4, §4.3 step 5, §8.3.
+    /// extend and the keys it holds in the namespace, which the checker
+    /// itself writes into the object (docs/59 N7). A supplied objectSid is
+    /// verified at the commit.
+    /// Spec: module documentation; docs/51 §5.2 rows 1-4, §4.3 step 5, §8.3;
+    /// docs/59 §4.4 N1, N7, §5.1.
     pub(crate) fn check_create(
         &self,
         txn: &WriteTxn<'_>,
@@ -924,14 +1038,14 @@ impl Invariants {
         proofs: &[LinkProof],
     ) -> Result<CheckedWrite, Refused> {
         let basis = Self::basis(txn)?;
+        self.no_supplied_keys(&new.attributes)?;
         let obj = draft(new.guid, new.parent, &new.classes, &new.attributes)?;
         let class = self
             .schema
             .most_specific_class(&obj.classes)
             .ok_or(InvariantViolation::Class)?;
-        object::check_new(&self.ids, &obj, class, role, self.hosts.as_ref())?;
-        let principal_class = [self.ids.user.id, self.ids.computer.id, self.ids.group.id];
-        let principal = if principal_class.contains(&class) {
+        let keys = self.per_object(&obj, class, role)?;
+        let principal = if object::is_principal_class(&self.ids, class) {
             let source = if role == Some(ProvisioningRole::Krbtgt) {
                 RidSource::Krbtgt
             } else {
@@ -957,6 +1071,18 @@ impl Invariants {
                 creating: new.guid,
             };
             self.new_links(&before, basis, end, &[], &values, proofs)?;
+        }
+        // The namespace's keys, written by the checker itself (docs/59 N7;
+        // module documentation): exactly what `object::check_new` derived
+        // from the object's own names — the caller could supply none
+        // (`known()`). The store's unique index refuses, at the commit, a
+        // key another live object holds (N1, uniqueness over the union).
+        let mut new = new;
+        if let Some(keys) = keys {
+            new.attributes.push((
+                self.ids.principal_name_key,
+                keys.keys().map(|key| key.as_bytes().to_vec()).collect(),
+            ));
         }
         Ok(CheckedWrite {
             basis,

@@ -421,6 +421,29 @@ fn provisioned_at() -> KerberosTime {
     common::kt("20261101000000Z")
 }
 
+/// Task PN5 (docs/59 §4.1, §4.3; A-173): the keys the one write checker
+/// gives each provisioned principal in the one principal namespace, by hand
+/// in their folded form — this fixture writes beneath the checker, and the
+/// admin plane's `Lookup` and create conflicts probe these keys. The service
+/// objects carry the DC's host name without its key (Q-1010 item 3); the
+/// krbtgt account holds the realm alias (docs/59 N5). This project's test
+/// data.
+fn namespace_keys(id: u32) -> &'static [&'static str] {
+    match id {
+        KRBTGT => &["krbtgt", "example.org"],
+        LDAP_SVC => &["ldap-svc$", "ldap-svc", "ldap/dc1.example.org"],
+        ADMIND_SVC => &["admind-svc$", "admind-svc", "admind/dc1.example.org"],
+        CHANGEPW_SVC => &["changepw-svc$", "changepw-svc", "kadmin/changepw"],
+        ADMIN1 => &["admin1"],
+        ADMIN2 => &["admin2"],
+        BOB => &["bob"],
+        TIER0_GROUP => &["tier0"],
+        BOOTSTRAP => &["bootstrap"],
+        STAFF_GROUP => &["staff"],
+        _ => &[],
+    }
+}
+
 /// Provision the directory in ONE transaction, with the two counters
 /// (docs/51 §4.3 step 5, §8.3; A-83; Q-358 item 1: every write takes a
 /// change-seq).
@@ -461,6 +484,13 @@ fn provision(
             .map(|(name, values)| (attr(name), values.clone()))
             .collect();
         attributes.push((attr("nTSecurityDescriptor"), vec![sd.encode().unwrap()]));
+        let keys = namespace_keys(planned.id);
+        if !keys.is_empty() {
+            attributes.push((
+                ad_schema::PRINCIPAL_NAME_KEY,
+                keys.iter().map(|k| k.as_bytes().to_vec()).collect(),
+            ));
+        }
         let origin = origin(&mut txn);
         txn.create_object(
             NewObject {

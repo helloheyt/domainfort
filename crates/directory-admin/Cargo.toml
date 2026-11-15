@@ -50,6 +50,14 @@ kdc = { path = "../kdc" }
 keyd-types = { path = "../keyd-types" }
 # Realm, PrincipalName, KerberosString, KerberosTime and the name types.
 krb-proto = { path = "../krb-proto" }
+# Task PN5 (docs/59 §4.2, §5.1; A-173): the one name equivalence of the
+# principal namespace. The checker computes every principal's keys with
+# `keys_of_names` and writes PRINCIPAL_NAME_KEY itself (N7); A-163's reserved
+# names are judged with `reserved_name_of` on those folded keys (class C49);
+# `Lookup` probes the namespace with `key_of_request`. Our own leaf crate
+# (it links only krb-proto and keyd-types, both already above); no crypto,
+# no store, no external crate (AGENTS.md §7).
+principal-names = { path = "../principal-names" }
 # The `DirAdmin` audit event this crate plans (A-85). No feature.
 ipc-audit = { path = "../ipc-audit" }
 # The proof of an acknowledged intent `apply` and the decision paths take

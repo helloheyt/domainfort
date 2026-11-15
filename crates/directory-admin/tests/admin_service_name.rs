@@ -122,9 +122,12 @@ fn a_stored_admin_named_computer_gets_no_password_target() {
         "servicePrincipalName",
         "objectSid",
     ];
+    // A store from before the rule predates the principal namespace too
+    // (task PN5): the copy holds no namespace key — ws01's would collide.
     let attributes = ws01
         .attributes
         .iter()
+        .filter(|a| a.id != ad_schema::PRINCIPAL_NAME_KEY)
         .map(|a| {
             let named = names.iter().find(|n| d.attr(n) == a.id);
             let values = named

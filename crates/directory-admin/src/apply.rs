@@ -152,10 +152,11 @@ fn counter_failure(e: &dirstore::Error, exhausted: Stop) -> Stop {
 
 /// A refusal of the write invariants at the write, as the outcome reports
 /// it — the code `prepare` gives the same rule (module documentation, item
-/// 6: never reached by a write `prepare` passed).
+/// 6: never reached by a write `prepare` passed); `prepare` itself reports a
+/// create's per-object refusal through it (task PN5, `keys_of_new`).
 /// Spec: crate::invariants `InvariantViolation`; crate ipc-audit
 /// `AdminRefusal`; docs/51 §5.2.
-fn invariant_stop(unchecked: Unchecked) -> Stop {
+pub(crate) fn invariant_stop(unchecked: Unchecked) -> Stop {
     match unchecked {
         Unchecked::Fault(fault) => fault_stop(&fault),
         Unchecked::Rule(rule) => Stop::Refused(match rule {

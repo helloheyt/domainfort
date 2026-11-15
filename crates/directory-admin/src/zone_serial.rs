@@ -238,7 +238,8 @@ fn check_failure(refused: &Refused) -> ZoneSerialFailure {
         Refused::Fault(Fault::Store(_) | Fault::Integrity | Fault::Missing) => {
             ZoneSerialFailure::StoreFailure
         }
-        Refused::Rule(_) => ZoneSerialFailure::InternalFailure,
+        // The serial-only write creates no principal (task PN5): unreachable.
+        Refused::Fault(Fault::Namespace) | Refused::Rule(_) => ZoneSerialFailure::InternalFailure,
     }
 }
 
@@ -268,7 +269,9 @@ impl ZoneSerialWriter {
     /// Spec: module documentation.
     pub fn new(schema: &Phase1Schema) -> Result<ZoneSerialWriter, ConfigError> {
         Ok(ZoneSerialWriter {
-            invariants: Invariants::new(schema, BTreeSet::new(), None)?,
+            // No host zone and no principal namespace: the serial-only
+            // write writes no object (task PN5: no principal, so no keys).
+            invariants: Invariants::new(schema, BTreeSet::new(), None, None)?,
         })
     }
 

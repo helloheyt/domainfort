@@ -246,6 +246,7 @@ dependencies = [
  "krb-proto",
  "pdp",
  "policy-store",
+ "principal-names",
  "sha2",
  "tokio",
 ]

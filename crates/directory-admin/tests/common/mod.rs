@@ -217,6 +217,44 @@ pub fn sid_of(id: u32) -> Sid {
     account_sid(rid(id))
 }
 
+/// The keys a provisioned object holds in the one principal namespace (task
+/// PN5), written by hand in the folded form docs/59 §4.1-§4.3 gives them —
+/// what the write checker derives (`principal_names::keys_of_names`), so a
+/// store this fixture writes beneath the checker looks like one it wrote:
+/// a user / group its sAMAccountName; a computer its sAMAccountName, its
+/// base name, its SPN and its dNSHostName (the DC account too); a service
+/// object the same without the host name (Q-1010 item 3); the krbtgt
+/// account its sAMAccountName and the realm alias `example.test` (N5).
+/// Nothing for an object outside the namespace.
+/// Source: docs/59 §4.1, §4.3, §4.4 N5; docs/questions/Q-1010 item 3; this
+/// project's own test data.
+pub fn namespace_keys(id: u32) -> &'static [&'static str] {
+    match id {
+        KRBTGT => &["krbtgt", "example.test"],
+        DC01 => &["dc01$", "dc01", "dc01.example.test"],
+        LDAP_SVC => &["ldap-svc$", "ldap-svc", "ldap/dc01.example.test"],
+        ADMIND_SVC => &["admind-svc$", "admind-svc", "admind/dc01.example.test"],
+        WS01 => &[
+            "ws01$",
+            "ws01",
+            "host/ws01.example.test",
+            "ws01.example.test",
+        ],
+        ADMIN1 => &["admin1"],
+        ADMIN2 => &["admin2"],
+        HELPER => &["helper"],
+        BOB => &["bob"],
+        SECRET => &["secret"],
+        DISABLED => &["disabled"],
+        ALICE => &["alice"],
+        TIER0_GROUP => &["tier0"],
+        HELPDESK => &["helpdesk"],
+        READERS => &["readers"],
+        BOOTSTRAP => &["bootstrap"],
+        _ => &[],
+    }
+}
+
 pub fn realm() -> Realm {
     Realm::new(REALM).unwrap()
 }
@@ -896,6 +934,15 @@ impl Domain {
                 self.attr("nTSecurityDescriptor"),
                 vec![sd.encode().unwrap()],
             ));
+            // Task PN5: the namespace keys the one checker would have
+            // written (this fixture writes beneath it).
+            let keys = namespace_keys(planned.id);
+            if !keys.is_empty() {
+                attributes.push((
+                    ad_schema::PRINCIPAL_NAME_KEY,
+                    keys.iter().map(|k| k.as_bytes().to_vec()).collect(),
+                ));
+            }
             let origin = if rid_end.is_some() {
                 self.provision_origin(&mut txn)
             } else {
