@@ -244,6 +244,37 @@ fn counted_noise_takes_no_slot_and_goes_into_the_summary() {
     );
 }
 
+/// docs/questions/Q-989 item 3 (A-165: "plus a bulk `count_noise_n(u64)`"),
+/// Q-988 item 5; A-57: a count of occurrences enters the window in one step
+/// — it adds up with single counts into one summary, takes no slot, counts
+/// nothing for 0 (no summary is queued) and saturates instead of wrapping.
+/// Every value is made up here.
+#[test]
+fn counted_noise_in_bulk_adds_up_and_saturates() {
+    let mut window = SendWindow::new(WindowConfig::new(2, 1).unwrap());
+    window.count_noise_n(0);
+    assert!(window.next_batch().is_none(), "0 counts nothing");
+    window.count_noise_n(1_000);
+    window.count_noise();
+    window.count_noise_n(4);
+    assert_eq!(window.suppressed_noise(), 1_005);
+    assert_eq!(window.used(), 0, "the count takes no slot");
+    let batch = window.next_batch().unwrap();
+    assert_eq!(batch.events().len(), 1);
+    assert_eq!(
+        decode_event(batch.events()[0].as_bytes()).unwrap(),
+        EventBody::WindowSummary(WindowSummary {
+            suppressed_noise: 1_005,
+            refused_gating: 0,
+            unrecorded_outcomes: 0,
+        })
+    );
+    window.count_noise_n(u64::MAX - 1);
+    window.count_noise_n(7);
+    window.count_noise();
+    assert_eq!(window.suppressed_noise(), u64::MAX, "saturates");
+}
+
 /// Reservations count against the window before their events exist (the
 /// slot is held for the whole operation).
 #[test]

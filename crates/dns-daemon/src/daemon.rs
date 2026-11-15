@@ -31,7 +31,8 @@
 //! Every peer-driven noise occurrence passes [`Shared::noise`], the one
 //! place it is counted — into the operational log's thinned counter and
 //! into dnsd's audit window (one `WindowSummary` per audit heartbeat at
-//! most; no record per query). The reading of docs/54 §9's "dropped /
+//! most — the shared gate's summary pace, docs/questions/Q-989; no record
+//! per query). The reading of docs/54 §9's "dropped /
 //! limited / malformed / refused" (docs/questions/Q-961): dropped — a
 //! source outside `internal_networks`; limited — the UDP, TCP-message,
 //! TCP-connection and forwarding limits; malformed — a request dns-zone

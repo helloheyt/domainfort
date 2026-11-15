@@ -321,7 +321,19 @@ impl SendWindow {
     /// Spec: docs/questions/Q-218 (A-57: noise "summarised in counters and
     /// rate-limited"); docs/54 §9; docs/questions/Q-961.
     pub fn count_noise(&mut self) {
-        self.suppressed_noise = self.suppressed_noise.saturating_add(1);
+        self.count_noise_n(1);
+    }
+
+    /// Count `occurrences` noise occurrences at once — [`SendWindow::count_noise`]
+    /// in one step (one addition, not one per occurrence), for a sender that
+    /// already holds a count (docs/questions/Q-988 item 5). Into the next
+    /// [`WindowSummary`] (`suppressed_noise`); no slot; saturates instead of
+    /// wrapping; 0 counts nothing.
+    ///
+    /// Spec: docs/questions/Q-218 (A-57); docs/54 §9; docs/questions/Q-961,
+    /// Q-989 item 3 (A-165: "plus a bulk `count_noise_n(u64)`").
+    pub fn count_noise_n(&mut self, occurrences: u64) {
+        self.suppressed_noise = self.suppressed_noise.saturating_add(occurrences);
     }
 
     /// Count an outcome record that could not be committed (its

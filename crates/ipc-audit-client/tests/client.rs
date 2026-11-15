@@ -20,18 +20,20 @@
 //! §3.2 ("the source is set from the uid"), §3.6, §3.7, §7.5, §8.1; docs/52
 //! §3.11 R6 (a), §3.12 (C12); PENDING-OWNER A-57, A-67 item 2 (auditd
 //! unreachable ⇒ gating refused), A-115; docs/questions/Q-512 (A-112),
-//! Q-560, Q-630. Every value is made up here.
+//! Q-560, Q-630; the summary pace (task H1): A-57, docs/questions/Q-961
+//! item 5, Q-989 (A-165). Every value is made up here.
 // The fake auditd, the test gate and the link's runner — shared with the
 // other crates whose tests need an acknowledged intent (task R15b).
 mod linked;
 
 use ipc_audit::{EventBody, EventSource, WindowSummary};
-use ipc_audit_client::{AuditLinkError, ExpectedAuditd, IntentRecord};
+use ipc_audit_client::{AuditLinkError, ExpectedAuditd, IntentRecord, HEARTBEAT};
 use linked::{
     acknowledged, block_on, eventually, link, not_acknowledged, FakeAuditd, LinkRun, TempDir,
     TestGate,
 };
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Attack (docs/questions/Q-512 item 2): an auditd whose map gives this
 /// process's uid another source — for each source a sender can expect, the
@@ -251,4 +253,139 @@ fn a_proof_comes_only_from_an_ack_delivered_through_the_client() {
     let acked = acknowledged(Change(5));
     assert_eq!(acked.into_inner(), Change(5));
     assert_eq!(not_acknowledged(Change(6)), Change(6));
+}
+
+/// docs/questions/Q-989 (A-165; class "a counter-only report is paced by the
+/// transport's acknowledgements instead of by its own clock"), Q-961 item 5
+/// ("at most one summary per heartbeat"); A-57 (noise "summarised in counters
+/// and rate-limited"); docs/50 §8.1: noise counted continuously — one at a
+/// time and in bulk, in a tight loop for 3.5 heartbeats, so that every round
+/// trip to auditd finds new counts — into the gate of a counters-only sender
+/// (no event, no wake-up: dnsd's and kpasswd-front's arrangement),
+/// delivered by the real client to an auditd that acknowledges **at once**,
+/// reaches auditd only as `WindowSummary` events, each alone in its batch,
+/// at most one per heartbeat and about a heartbeat apart, whose counts add
+/// up to exactly what was counted. (Positive control, run for task H1: with
+/// the pace bypassed the client summarised after every acknowledgement —
+/// thousands of summaries here.)
+#[test]
+fn continuous_noise_is_summarised_at_most_once_per_heartbeat() {
+    let dir = TempDir::new();
+    let Some(uid) = dir.uid() else { return };
+    let path = dir.join("a.sock");
+    let auditd = FakeAuditd::start(&path, EventSource::Dnsd);
+    let gate = TestGate::new();
+    let started = Instant::now();
+    let run = LinkRun::start(link(&path, uid, EventSource::Dnsd), Arc::clone(&gate)).unwrap();
+    let flood = HEARTBEAT * 7 / 2;
+    let mut counted = 0u64;
+    while started.elapsed() < flood {
+        for _ in 0..64 {
+            gate.core.count_noise();
+        }
+        gate.core.count_noise_n(3);
+        counted += 64 + 3;
+        std::thread::yield_now();
+    }
+    assert!(
+        eventually(|| auditd.counted_noise() == counted),
+        "{} of {counted} counted",
+        auditd.counted_noise()
+    );
+    let elapsed = started.elapsed();
+    let events = auditd.events();
+    assert!(
+        events
+            .iter()
+            .all(|(_, event)| matches!(event, EventBody::WindowSummary(_))),
+        "{events:?}"
+    );
+    let summaries = auditd.summaries();
+    let heartbeats = elapsed.as_millis() / HEARTBEAT.as_millis() + 1;
+    assert!(
+        summaries.len() as u128 <= heartbeats,
+        "{} summaries in {heartbeats} heartbeats for {counted} counts",
+        summaries.len()
+    );
+    assert!(summaries.len() >= 2, "continuous noise is summarised again");
+    assert_eq!(auditd.appends(), summaries.len(), "each summary alone");
+    for pair in summaries.windows(2) {
+        let gap = pair[1].0.duration_since(pair[0].0);
+        assert!(gap >= HEARTBEAT / 2, "two summaries {gap:?} apart");
+    }
+    for (_, summary) in &summaries {
+        assert_eq!(
+            (summary.refused_gating, summary.unrecorded_outcomes),
+            (0, 0)
+        );
+    }
+    drop(run);
+}
+
+/// A value whose intent record is marked by `n` in a field the counted
+/// noise never fills (so the noise in auditd's summaries adds up apart).
+#[derive(Debug, PartialEq, Eq)]
+struct Marked(u64);
+
+impl IntentRecord for Marked {
+    fn intent_event(&self) -> EventBody {
+        EventBody::WindowSummary(WindowSummary {
+            suppressed_noise: 0,
+            refused_gating: 0,
+            unrecorded_outcomes: 1_000 + self.0,
+        })
+    }
+}
+
+/// docs/52 §3.11 R6 (an intent acknowledged before the change — not
+/// delayed); docs/questions/Q-989 item 3 ("gating events are untouched: they
+/// never wait"): while the summary pace holds counted noise (a summary was
+/// just sent, more noise counted since), an intent committed into the gate
+/// and signalled to the client is sent and acknowledged at once — well
+/// within a quarter heartbeat, every time — and the held noise still adds up
+/// exactly at auditd.
+#[test]
+fn an_intent_is_acknowledged_at_once_while_the_pace_holds_noise() {
+    let dir = TempDir::new();
+    let Some(uid) = dir.uid() else { return };
+    let path = dir.join("a.sock");
+    let auditd = FakeAuditd::start(&path, EventSource::Dird);
+    let gate = TestGate::new();
+    let run = LinkRun::start(link(&path, uid, EventSource::Dird), Arc::clone(&gate)).unwrap();
+    gate.core.count_noise();
+    assert!(
+        eventually(|| auditd.counted_noise() == 1),
+        "the first summary"
+    );
+    for n in 0..5 {
+        gate.core.count_noise_n(10);
+        let slot = gate.core.reserve().expect("the gate is open");
+        let pending = gate
+            .core
+            .begin_intent(slot, Marked(n))
+            .expect("the intent commits");
+        gate.wake.notify_one();
+        let sent = Instant::now();
+        let acked = gate.core.wait_acknowledged(pending, sent + HEARTBEAT / 4);
+        let took = sent.elapsed();
+        assert_eq!(
+            acked.map(|proof| proof.into_inner()).ok(),
+            Some(Marked(n)),
+            "intent {n} not acknowledged within a quarter heartbeat ({took:?})"
+        );
+        std::thread::sleep(HEARTBEAT / 5);
+    }
+    assert!(
+        eventually(|| auditd.counted_noise() == 51),
+        "{} of 51 counted",
+        auditd.counted_noise()
+    );
+    let intents: Vec<u64> = auditd
+        .summaries()
+        .iter()
+        .filter(|(_, summary)| summary.unrecorded_outcomes >= 1_000)
+        .map(|(_, summary)| summary.unrecorded_outcomes - 1_000)
+        .collect();
+    assert_eq!(intents, [0, 1, 2, 3, 4], "every intent, once, in order");
+    drop(run);
 }

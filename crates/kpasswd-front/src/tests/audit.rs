@@ -6,9 +6,11 @@
 //!   reaches the audit log as `WindowSummary` counts recorded under the
 //!   source `kpasswd-front`, the counts add up to the counted noise, and a
 //!   forwarded request or dird not serving adds nothing;
-//! * a sustained flood of noise against an auditd that takes time to
-//!   acknowledge (its persistence, docs/50 §8.1) is summarised at most once
-//!   per heartbeat — never one record per connection;
+//! * a sustained flood of noise — against an auditd that acknowledges fast,
+//!   and one that takes time to (its persistence, docs/50 §8.1) — is
+//!   summarised at most once per heartbeat, never one record per connection
+//!   and never one summary per acknowledgement (the shared gate's summary
+//!   pace, docs/questions/Q-989);
 //! * requests are not gated on auditd: lost while the front serves, the
 //!   front still serves, and the noise is still counted.
 //!
@@ -19,7 +21,7 @@
 //! refused_gating ‖ unrecorded_outcomes`; a mapped source may send
 //! `WindowSummary` only); A-57 (noise "summarised in counters and
 //! rate-limited"); docs/questions/Q-960, Q-961 items 3, 5, 6, 7 (A-160),
-//! Q-988; RFC 3244 §2 (the requests, built by hand as in crate::tests::
+//! Q-988, Q-989 (A-165); RFC 3244 §2 (the requests, built by hand as in crate::tests::
 //! world). Uids, paths and octets are hand-made test values; no fixture
 //! comes from any other implementation.
 
@@ -27,10 +29,11 @@
 
 use super::startup::real_auditd;
 use super::world::*;
-use crate::audit::{FRONT_AUDIT_SOURCE, SUMMARY_PERIOD};
+use crate::audit::FRONT_AUDIT_SOURCE;
 use audit_log::{Anchor, Record, SegmentLimit, SegmentReader, Source};
 use core::time::Duration;
 use ipc_audit::{EventBody, WindowSummary};
+use ipc_audit_client::HEARTBEAT;
 use ipc_kpasswd::HostUnserved;
 use parse_kpasswd::ReplyMessage;
 use std::io::Write;
@@ -155,21 +158,22 @@ fn noise_reaches_the_audit_log_as_summaries_under_kpasswd_front() {
     );
 }
 
-/// A-57 ("summarised in counters and rate-limited"); docs/53 §9 ("a count,
-/// not a record per datagram"); docs/50 §8.1 (auditd acknowledges after it
-/// persisted); docs/questions/Q-988: a sustained flood of noise — a request
-/// answered MALFORMED every few milliseconds for 3.5 heartbeats — against an
-/// auditd that takes 20 ms to acknowledge each batch yields only
-/// `WindowSummary` events, at most one per heartbeat (and the summaries
-/// arrive about a heartbeat apart), whose counts add up to every request
-/// sent.
-#[test]
-fn a_flood_of_noise_is_summarised_at_most_once_per_heartbeat() {
-    let audit_path = socket_path("audit-slow");
+/// A sustained flood of noise for 3.5 heartbeats — `flooders` clients at
+/// once, each sending a request answered MALFORMED, then pausing `pause` —
+/// against an auditd that acknowledges each batch after `ack_delay`: only
+/// `WindowSummary` events reach auditd, at most one per heartbeat and about
+/// a heartbeat apart, whose counts add up to every request sent.
+fn flood_is_summarised_at_most_once_per_heartbeat(
+    tag: &str,
+    ack_delay: Duration,
+    flooders: usize,
+    pause: Duration,
+) {
+    let audit_path = socket_path(tag);
     let auditd = start_auditd_with(
         &audit_path,
         FRONT_AUDIT_SOURCE,
-        AuditdBehaviour::Acknowledge(Duration::from_millis(20)),
+        AuditdBehaviour::Acknowledge(ack_delay),
     );
     let started = Instant::now();
     let socket = audit_path.clone();
@@ -177,13 +181,24 @@ fn a_flood_of_noise_is_summarised_at_most_once_per_heartbeat() {
         let _ = std::fs::remove_file(&audit_path);
         return;
     };
-    let flood = SUMMARY_PERIOD * 7 / 2;
-    let mut sent = 0u64;
-    while started.elapsed() < flood {
-        assert_eq!(result_code_of(&exchange(w.front, &SHORT_HEADER)), 1);
-        sent += 1;
-        std::thread::sleep(Duration::from_millis(3));
-    }
+    let flood = HEARTBEAT * 7 / 2;
+    let front = w.front;
+    let sent: u64 = (0..flooders)
+        .map(|_| {
+            std::thread::spawn(move || {
+                let mut sent = 0u64;
+                while started.elapsed() < flood {
+                    assert_eq!(result_code_of(&exchange(front, &SHORT_HEADER)), 1);
+                    sent += 1;
+                    std::thread::sleep(pause);
+                }
+                sent
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|flooder| flooder.join().unwrap())
+        .sum();
     assert!(
         eventually(LONG, || auditd.counted_noise() == sent),
         "{} of {sent} counted",
@@ -199,12 +214,11 @@ fn a_flood_of_noise_is_summarised_at_most_once_per_heartbeat() {
         "{events:?}"
     );
     let summaries = auditd.summaries();
-    let periods = elapsed.as_millis() / SUMMARY_PERIOD.as_millis() + 1;
+    let heartbeats = elapsed.as_millis() / HEARTBEAT.as_millis() + 1;
     assert!(
-        summaries.len() as u128 <= periods,
-        "{} summaries in {} periods for {sent} requests",
-        summaries.len(),
-        periods
+        summaries.len() as u128 <= heartbeats,
+        "{} summaries in {heartbeats} heartbeats for {sent} requests",
+        summaries.len()
     );
     assert!(
         summaries.len() >= 2,
@@ -212,7 +226,7 @@ fn a_flood_of_noise_is_summarised_at_most_once_per_heartbeat() {
     );
     for pair in summaries.windows(2) {
         let gap = pair[1].0.duration_since(pair[0].0);
-        assert!(gap >= SUMMARY_PERIOD / 2, "two summaries {gap:?} apart");
+        assert!(gap >= HEARTBEAT / 2, "two summaries {gap:?} apart");
     }
     for (_, summary) in &summaries {
         assert_eq!(
@@ -222,6 +236,39 @@ fn a_flood_of_noise_is_summarised_at_most_once_per_heartbeat() {
     }
     drop(w);
     let _ = std::fs::remove_file(&audit_path);
+}
+
+/// A-57 ("summarised in counters and rate-limited"); docs/53 §9 ("a count,
+/// not a record per datagram"); docs/50 §8.1; docs/questions/Q-989 (A-165;
+/// class "a counter-only report is paced by the transport's
+/// acknowledgements instead of by its own clock"): an auditd that
+/// acknowledges fast (1 ms) and noise denser than that round trip (two
+/// clients at once) — the case where a summary after every acknowledgement
+/// would be thousands of summaries (positive control, run for task H1 with
+/// the pace bypassed) — the front's flood is still summarised at most once
+/// per heartbeat, with no pace of the front's own (the shared gate's).
+#[test]
+fn a_flood_of_noise_is_summarised_at_most_once_per_heartbeat_with_a_fast_auditd() {
+    flood_is_summarised_at_most_once_per_heartbeat(
+        "audit-fast",
+        Duration::from_millis(1),
+        2,
+        Duration::from_millis(1),
+    );
+}
+
+/// A-57; docs/53 §9; docs/50 §8.1 (auditd acknowledges after it
+/// persisted); docs/questions/Q-988, Q-989: the same with an auditd that
+/// takes 20 ms to acknowledge each batch and one client sending a request
+/// every few milliseconds.
+#[test]
+fn a_flood_of_noise_is_summarised_at_most_once_per_heartbeat_with_a_slow_auditd() {
+    flood_is_summarised_at_most_once_per_heartbeat(
+        "audit-slow",
+        Duration::from_millis(20),
+        1,
+        Duration::from_millis(3),
+    );
 }
 
 /// docs/53 §9 (no gating event for the front); docs/questions/Q-961 item 6
@@ -244,12 +291,12 @@ fn requests_are_not_gated_on_auditd() {
         return;
     };
     // The link notices the loss at its next look (one heartbeat at most).
-    std::thread::sleep(SUMMARY_PERIOD + SUMMARY_PERIOD / 2);
+    std::thread::sleep(HEARTBEAT + HEARTBEAT / 2);
     assert!(ReplyMessage::parse_tcp(&exchange(w.front, &good_request())).is_ok());
     assert_eq!(result_code_of(&exchange(w.front, &SHORT_HEADER)), 1);
     assert_eq!(w.control.counts().noise(), 1);
     assert_eq!(w.dird.requests.lock().unwrap().len(), 1);
-    std::thread::sleep(SUMMARY_PERIOD + SUMMARY_PERIOD / 2);
+    std::thread::sleep(HEARTBEAT + HEARTBEAT / 2);
     assert!(auditd.events().is_empty());
     drop(w);
     let _ = std::fs::remove_file(&audit_path);

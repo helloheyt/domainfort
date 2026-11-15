@@ -37,46 +37,37 @@
 //!
 //! # At most one summary per heartbeat (A-57: "rate-limited")
 //!
-//! The link sends the window's summary whenever it looks at the window and
-//! something was counted — after each acknowledged batch, too — so counts
-//! that reached the window at every occurrence would leave as fast as auditd
-//! acknowledges, under a sustained flood. The front therefore keeps the
-//! occurrences in its own counter (`AuditGate::count_noise`, one atomic
-//! add, no lock) and hands them to the window once per [`SUMMARY_PERIOD`] —
-//! the audit link's own `HEARTBEAT`, one value — in `pace_summaries`; the
-//! hand-over wakes the link, which sends them as one `WindowSummary`. A
-//! summary is queued only when the window holds counts, and counts reach the
-//! window only at a hand-over: **at most one summary per period**, whatever
-//! the flood (docs/questions/Q-988 item 4; Q-989 records the class and the
-//! root option in ipc-audit-client, which would bound every counters-only
-//! sender).
+//! Each noise occurrence is counted straight into the shared gate's window
+//! ([`AuditGate::count_noise`] → ipc-audit-client `AuditGate::count_noise`),
+//! and the one audit client sends the counts as a `WindowSummary` on the
+//! gate's own pace: a window that holds only counters leaves at most once
+//! per `HEARTBEAT`, whatever the flood and however fast auditd acknowledges
+//! — the root fix of docs/questions/Q-989 (A-165) in ipc-audit-client, the
+//! bound every counters-only sender (dnsd too) gets by construction. The
+//! front keeps no pace, counter or hand-over of its own (Q-988 item 4's
+//! local form is gone).
 //!
 //! # Not gating (docs/53 §9)
 //!
 //! The front reserves no slot and sends no gating event: auditd lost while
 //! serving ⇒ requests are unaffected, the counts are kept (saturating) and
-//! sent once the link is verified again. At stop the last counts are handed
-//! over and the one flush of every daemon waits, bounded, for them
-//! (`AuditGate::close`; `AUDIT_FLUSH_GRACE`, stopping early once auditd
-//! counts as unreachable — the kdc's and keyd's rule, A-87).
+//! sent once the link is verified again. At stop the one flush of every
+//! daemon (`AuditGate::close`; `AUDIT_FLUSH_GRACE`, stopping early once
+//! auditd counts as unreachable — the kdc's and keyd's rule, A-87) waits,
+//! bounded and while auditd is reachable, for the counts still held to leave
+//! as a summary and be acknowledged (ipc-audit-client, Q-989).
 //!
 //! Spec: docs/53 §9; docs/50 R50-3, R50-16, R50-17, §3.2, §7.5, §8.1; A-57;
-//! A-87; A-160; docs/52 §3.11 R6, §3.12; docs/questions/Q-512, Q-560 items
-//! 4, 5, Q-630, Q-955 item 1 (A-158), Q-960, Q-961 items 1-7 (A-160), Q-988,
-//! Q-989;
-//! tokio 1.54.1 docs.rs: `sync::Notify::{notify_one, notified}`,
-//! `time::sleep`.
+//! A-87; A-160; A-165; docs/52 §3.11 R6, §3.12; docs/questions/Q-512, Q-560
+//! items 4, 5, Q-630, Q-955 item 1 (A-158), Q-960, Q-961 items 1-7 (A-160),
+//! Q-988, Q-989; tokio 1.54.1 docs.rs: `time::sleep`.
 
 use crate::daemon::Endpoint;
 use crate::log::{note, Note};
 use core::future::Future;
 use core::time::Duration;
-use ipc_audit::{EventSource, SendWindow, WindowConfig};
+use ipc_audit::{EventSource, WindowConfig};
 use ipc_audit_client::{AuditLink, AuditLinkError, ExpectedAuditd, FlushWait, Unflushed};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use tokio::sync::Notify;
-use tokio::time::Instant;
 
 /// The source auditd must record the front under — `kpasswd-front`, code 8.
 /// Spec: docs/50 §3.2 ("the source is set from the uid"); docs/53 §9;
@@ -88,13 +79,6 @@ pub const FRONT_AUDIT_SOURCE: EventSource = EventSource::KpasswdFront;
 /// Project choice (the shared default, as dnsd's — ipc-audit
 /// `WindowConfig::DEFAULT`).
 pub const AUDIT_WINDOW: WindowConfig = WindowConfig::DEFAULT;
-
-/// How often the noise counted at the front's layer is handed to the audit
-/// window, i.e. the shortest interval between two of the front's
-/// `WindowSummary` events: the audit link's heartbeat (one value).
-/// Spec: A-57 ("rate-limited"); docs/questions/Q-961 item 5, Q-988;
-/// ipc-audit-client `HEARTBEAT`.
-pub const SUMMARY_PERIOD: Duration = ipc_audit_client::HEARTBEAT;
 
 /// The front's link to the auditd of `endpoint`, expecting
 /// [`FRONT_AUDIT_SOURCE`].
@@ -109,17 +93,12 @@ pub fn link(endpoint: &Endpoint) -> Result<AuditLink, AuditLinkError> {
 }
 
 /// The front's gate: the shared `ipc_audit_client::AuditGate` (its window,
-/// the reachability only the audit link sets, the stop's flush) with the
-/// front's one way to record — a counted noise occurrence, handed to the
-/// window once per [`SUMMARY_PERIOD`] (module documentation).
-/// Spec: docs/53 §9; docs/52 §3.11 R6; A-57; docs/questions/Q-988.
+/// the reachability only the audit link sets, the summary pace, the stop's
+/// flush) with the front's one way to record — a counted noise occurrence.
+/// Spec: docs/53 §9; docs/52 §3.11 R6; A-57; docs/questions/Q-988, Q-989.
 #[derive(Debug)]
 pub struct AuditGate {
     core: ipc_audit_client::AuditGate,
-    /// Noise counted since the last hand-over to the window.
-    counted: AtomicU64,
-    /// Signalled by a hand-over that moved counts: wakes the audit link.
-    handed: Notify,
 }
 
 impl AuditGate {
@@ -129,73 +108,36 @@ impl AuditGate {
     pub fn new(window: WindowConfig) -> AuditGate {
         AuditGate {
             core: ipc_audit_client::AuditGate::new(window),
-            counted: AtomicU64::new(0),
-            handed: Notify::new(),
         }
     }
 
-    /// Count one noise occurrence for the next hand-over — kept while
-    /// auditd is unreachable, never a slot, saturating. Reached only through
-    /// crate::log's `Counters::noise` (the one place noise is counted).
-    /// Spec: docs/53 §9; A-57; docs/questions/Q-961 item 7, Q-988.
+    /// Count one noise occurrence into the next `WindowSummary`
+    /// (`suppressed_noise`) — kept while auditd is unreachable, never a
+    /// slot, saturating; sent on the gate's pace (module documentation).
+    /// Reached only through crate::log's `Counters::noise` (the one place
+    /// noise is counted).
+    /// Spec: docs/53 §9; A-57; docs/questions/Q-961 item 7, Q-988, Q-989;
+    /// ipc-audit-client `AuditGate::count_noise`.
     pub(crate) fn count_noise(&self) {
-        // The closure never returns `None`, so the update cannot fail.
-        let _ = self
-            .counted
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_add(1))
-            });
+        self.core.count_noise();
     }
 
-    /// Hand the noise counted since the last hand-over to the window — its
-    /// next `WindowSummary` (`suppressed_noise`) — and wake the audit link
-    /// if anything moved; the number handed over. The work is one window
-    /// step per occurrence already counted (bounded by what the period's
-    /// connections produced).
-    /// Spec: docs/questions/Q-961 items 1, 5, Q-988; ipc-audit-client
-    /// `AuditGate::count_noise`.
-    pub(crate) fn hand_over(&self) -> u64 {
-        let counted = self.counted.swap(0, Ordering::Relaxed);
-        for _ in 0..counted {
-            self.core.count_noise();
-        }
-        if counted > 0 {
-            self.handed.notify_one();
-        }
-        counted
-    }
-
-    /// Whether the window holds counts the audit link has not yet queued as
-    /// a summary (a poisoned lock holds nothing that can be delivered).
-    fn window_holds_counts(&self) -> bool {
-        self.core
-            .inspect(SendWindow::suppressed_noise)
-            .is_some_and(|counted| counted > 0)
-    }
-
-    /// The stop's flush: hand the last counts over and wait, at most
-    /// `grace` in all and only while auditd is reachable, for the audit link
-    /// to queue them; then the one flush of every daemon
-    /// (`ipc_audit_client::AuditGate::close`) with what is left of `grace`
-    /// — until the queued summaries are acknowledged or auditd counts as
-    /// unreachable (nothing the front sends gates an operation: A-87) —
-    /// and `end_link`.
+    /// The stop's flush (`ipc_audit_client::AuditGate::close`): wait at most
+    /// `grace` — while auditd is reachable — for the counts still held to
+    /// leave as a summary and for every queued summary to be acknowledged,
+    /// stopping early once the link counts auditd as unreachable (nothing
+    /// the front sends gates an operation — the kdc's and keyd's rule,
+    /// A-87); then end the link.
     /// Spec: docs/questions/Q-313 (A-82), Q-350 item 11 (A-87), Q-961 item
-    /// 6, Q-988; docs/52 §3.11 R6 (b).
+    /// 6, Q-988 item 1, Q-989; docs/52 §3.11 R6 (b).
     pub(crate) async fn close<E: Future<Output = ()>>(
         &self,
         grace: Duration,
         end_link: E,
     ) -> Unflushed {
-        let start = Instant::now();
-        self.hand_over();
-        while self.window_holds_counts() && self.core.is_reachable() && start.elapsed() < grace {
-            tokio::time::sleep(ipc_audit_client::FLUSH_POLL).await;
-        }
-        let left = grace.saturating_sub(start.elapsed());
         self.core
             .close(
-                left,
+                grace,
                 FlushWait::UntilAcknowledgedOrUnreachable,
                 tokio::time::sleep,
                 end_link,
@@ -205,17 +147,18 @@ impl AuditGate {
 }
 
 /// What the front's gate gives the one audit client (task R9b): the shared
-/// gate, the wake-up of a hand-over (module documentation), and the front's
-/// notes when the link is restored or lost.
+/// gate, no wake-up (the front records no event; its counts leave on the
+/// gate's pace — module documentation), and the front's notes when the link
+/// is restored or lost.
 /// Spec: docs/52 §3.11 R6, §3.12; docs/questions/Q-500 item 1, Q-512, Q-560
-/// item 4.
+/// item 4, Q-989.
 impl ipc_audit_client::LinkedGate for AuditGate {
     fn audit_gate(&self) -> &ipc_audit_client::AuditGate {
         &self.core
     }
 
     fn recorded(&self) -> impl Future<Output = ()> + Send + '_ {
-        self.handed.notified()
+        core::future::pending()
     }
 
     fn link_restored(&self) {
@@ -227,36 +170,27 @@ impl ipc_audit_client::LinkedGate for AuditGate {
     }
 }
 
-/// The summary pace: every [`SUMMARY_PERIOD`], hand the noise counted since
-/// to the window (module documentation). Runs until the front aborts it at
-/// stop.
-/// Spec: A-57; docs/questions/Q-961 item 5, Q-988.
-pub(crate) async fn pace_summaries(gate: Arc<AuditGate>) {
-    loop {
-        tokio::time::sleep(SUMMARY_PERIOD).await;
-        gate.hand_over();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     //! Sources: docs/53 §9 (the front's counted cases); A-57 (noise counted,
     //! not recorded per occurrence); docs/questions/Q-961 items 1, 3, 7
-    //! (A-160), Q-988 (the reading: which counted cases are noise; the
-    //! hand-over). Values are constructed for these tests.
+    //! (A-160), Q-988 (the reading: which counted cases are noise), Q-989
+    //! (A-165: the counts go straight to the shared window). Values are
+    //! constructed for these tests.
     use super::*;
     use crate::log::{Counters, Failure, Noise};
+    use ipc_audit::SendWindow;
 
     fn window_counts(gate: &AuditGate) -> u64 {
         gate.core.inspect(SendWindow::suppressed_noise).unwrap()
     }
 
-    /// Every noise case counts once on the operational log and once for the
-    /// window — through the one chokepoint — and reaches the window only at
-    /// a hand-over; the operational failures (dird not serving, a failed
-    /// accept) reach neither.
+    /// Every noise case counts once on the operational log and once in the
+    /// audit window — through the one chokepoint, at once (no local
+    /// counter, no hand-over); the operational failures (dird not serving,
+    /// a failed accept) reach neither.
     #[test]
-    fn noise_reaches_the_window_at_a_hand_over_and_failures_never() {
+    fn noise_reaches_the_window_at_once_and_failures_never() {
         let counters = Counters::default();
         let gate = AuditGate::new(AUDIT_WINDOW);
         for noise in Noise::ALL {
@@ -270,55 +204,23 @@ mod tests {
         }
         assert_eq!(counts.noise(), 6);
         assert_eq!((counts.dird_not_serving, counts.accept_failed), (1, 1));
-        assert_eq!(gate.counted.load(Ordering::Relaxed), 6);
-        assert_eq!(window_counts(&gate), 0, "nothing before the hand-over");
-        assert_eq!(gate.hand_over(), 6);
         assert_eq!(
             window_counts(&gate),
             6,
             "the six noise cases, not the two failures"
         );
-        assert_eq!(gate.hand_over(), 0, "a hand-over moves each count once");
-        assert_eq!(window_counts(&gate), 6);
     }
 
     /// The counts are kept while auditd is unreachable (a new gate counts
     /// auditd as unreachable until the audit link says otherwise) — noise is
-    /// never refused or dropped for it — and the count saturates.
+    /// never refused or dropped for it — and take no slot.
     #[test]
-    fn counts_are_kept_unreachable_and_saturate() {
+    fn counts_are_kept_while_auditd_is_unreachable() {
         let gate = AuditGate::new(AUDIT_WINDOW);
         assert!(!gate.core.is_reachable());
         gate.count_noise();
         gate.count_noise();
-        assert_eq!(gate.hand_over(), 2);
         assert_eq!(window_counts(&gate), 2);
-        gate.counted.store(u64::MAX, Ordering::Relaxed);
-        gate.count_noise();
-        assert_eq!(gate.counted.load(Ordering::Relaxed), u64::MAX);
-    }
-
-    /// A hand-over that moved counts wakes the audit link (a stored wake-up,
-    /// so a link busy at that moment still sees it); one that moved nothing
-    /// does not.
-    #[test]
-    fn a_hand_over_with_counts_wakes_the_link() {
-        use ipc_audit_client::LinkedGate;
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let gate = AuditGate::new(AUDIT_WINDOW);
-        gate.hand_over();
-        let quiet = runtime.block_on(async {
-            tokio::time::timeout(Duration::from_millis(50), gate.recorded()).await
-        });
-        assert!(quiet.is_err(), "nothing handed over, no wake-up");
-        gate.count_noise();
-        gate.hand_over();
-        let woken = runtime.block_on(async {
-            tokio::time::timeout(Duration::from_millis(50), gate.recorded()).await
-        });
-        assert!(woken.is_ok());
+        assert_eq!(gate.core.outstanding(), 0, "no slot taken");
     }
 }

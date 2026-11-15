@@ -350,11 +350,12 @@ impl Connector for LoopbackConnector {
 
 // ---- the fake auditd ------------------------------------------------------------
 
-/// What the fake auditd saw: the `Ping`s answered and the events appended.
+/// What the fake auditd saw: the `Ping`s answered and the events appended,
+/// each with the instant its batch arrived.
 #[derive(Default)]
 struct AuditSeen {
     pings: AtomicUsize,
-    events: Mutex<Vec<EventBody>>,
+    events: Mutex<Vec<(Instant, EventBody)>>,
 }
 
 /// A minimal auditd whose `Pong` names `source` and which acknowledges
@@ -405,7 +406,28 @@ impl FakeAuditd {
 
     /// Every event appended so far, in order.
     pub fn events(&self) -> Vec<EventBody> {
-        self.seen.events.lock().expect("events").clone()
+        self.seen
+            .events
+            .lock()
+            .expect("events")
+            .iter()
+            .map(|(_, event)| event.clone())
+            .collect()
+    }
+
+    /// The `WindowSummary` events appended so far, with their batch's
+    /// arrival.
+    pub fn summaries_with_arrival(&self) -> Vec<(Instant, WindowSummary)> {
+        self.seen
+            .events
+            .lock()
+            .expect("events")
+            .iter()
+            .filter_map(|(at, event)| match event {
+                EventBody::WindowSummary(summary) => Some((*at, *summary)),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The `WindowSummary` events appended so far.
@@ -461,9 +483,10 @@ fn audit_serve(mut stream: UnixStream, source: EventSource, seen: &AuditSeen) {
                 AuditReply::Pong(source)
             }
             Ok(AuditRequest::Append(append)) => {
+                let at = Instant::now();
                 let mut events = seen.events.lock().expect("events");
                 for event in append.events() {
-                    events.push(decode_event(event.as_bytes()).expect("a valid event"));
+                    events.push((at, decode_event(event.as_bytes()).expect("a valid event")));
                 }
                 AuditReply::Ack(Ack {
                     through_seq: append.last_seq(),

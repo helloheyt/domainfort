@@ -8,14 +8,17 @@
 //!   does not map it, stops the start at the audit check (fail closed).
 //! * The noise counters: every peer-driven noise occurrence reaches the
 //!   audit log as `WindowSummary` counts, recorded under the source `dnsd`;
-//!   answered queries leave no record.
+//!   answered queries leave no record; continuous noise is summarised at
+//!   most once per heartbeat even against an auditd that acknowledges at
+//!   once (the shared gate's summary pace — docs/questions/Q-989).
 //!
 //! Sources: docs/54 §4.8 ("auditd verified (the one audit client, source
 //! `dnsd` — R9b)"), §9 ("dnsd — a new source (`dnsd`, source code 7): only
 //! counters (`WindowSummary` — noise: dropped / limited / malformed /
 //! refused) … no record per query"), R54-11; docs/50 R50-16, §3.2 ("the
 //! source is set from the uid"), §7.5 (fail closed), §8.1; A-57;
-//! docs/questions/Q-619 items 2, 3, Q-950 (A-157), Q-960, Q-961. Values: the
+//! docs/questions/Q-619 items 2, 3, Q-950 (A-157), Q-960, Q-961, Q-989
+//! (A-165). Values: the
 //! RFC 2782 "Fictional example" zone (crate tests/common), hand-made uids,
 //! octets and paths. No fixture comes from any other implementation.
 
@@ -30,9 +33,11 @@ use common::{eventually, parts, query, transfer, udp_client, udp_exchange, World
 use core::time::Duration;
 use dns_daemon::{DaemonControl, DaemonError, DaemonParams, DirdEndpoint, Listeners, TcpLimits};
 use ipc_audit::{EventBody, WindowSummary};
-use ipc_audit_client::{AuditEndpoint, AuditLinkError};
+use ipc_audit_client::{AuditEndpoint, AuditLinkError, HEARTBEAT};
 use ipc_dns::{TransportError, Unserved};
 use parse_dns::RrType;
+use rate_limit::SourceLimits;
+use std::time::Instant;
 
 /// Datagrams dns-zone answers with silence: not DNS messages (shorter than
 /// the 12-octet header of RFC 1035 §4.1.1). Hand-made octets.
@@ -289,5 +294,85 @@ fn a_flood_of_noise_is_summarised_not_recorded_per_datagram() {
         "{} summaries for {noise} datagrams",
         events.len()
     );
+    assert_eq!(dnsd.stop(), Ok(()));
+}
+
+/// docs/54 §9 ("only counters", "no record per query"); A-57 ("summarised in
+/// counters and rate-limited"); docs/50 §8.1; docs/questions/Q-961 item 5
+/// ("at most one summary per heartbeat"), Q-989 (A-165; class "a
+/// counter-only report is paced by the transport's acknowledgements instead
+/// of by its own clock"): continuous noise — datagrams dns-zone silences,
+/// sent back to back for 3.5 heartbeats, every sixteen followed by a query
+/// that is answered (one client socket, nothing queued behind them: the
+/// sixteen were received; the UDP limits widened so that none is limited)
+/// — against the test auditd, which acknowledges **at once**, reaches
+/// auditd only as `WindowSummary` events, at most one per heartbeat and
+/// about a heartbeat apart, whose counts add up to exactly the datagrams
+/// sent; the answered queries add nothing. (Positive control, run for task
+/// H1: with the pace bypassed the link summarised after every
+/// acknowledgement that found new counts.)
+#[test]
+fn continuous_noise_is_summarised_at_most_once_per_heartbeat() {
+    let Some(world) = World::new(transfer(&parts(SERIAL, &[]))) else {
+        return;
+    };
+    let mut params = world.params();
+    params.udp = SourceLimits {
+        per_source: 10_000_000,
+        global: 10_000_000,
+        window: Duration::from_secs(1),
+    };
+    let started = Instant::now();
+    let dnsd = world.start(params);
+    assert!(dnsd.serving());
+    let client = udp_client();
+    let flood = HEARTBEAT * 7 / 2;
+    let mut sent = 0u64;
+    let mut id = 0u16;
+    while started.elapsed() < flood {
+        for _ in 0..16 {
+            client.send_to(&NOT_A_MESSAGE, dnsd.udp).expect("send");
+            sent += 1;
+        }
+        id = id.wrapping_add(1);
+        let answered = udp_exchange(
+            &client,
+            dnsd.udp,
+            &query(id, "server.example.com", RrType::A),
+        );
+        assert!(answered.is_some(), "the query after the noise is answered");
+    }
+    assert!(
+        eventually(Duration::from_secs(20), || world.auditd.counted_noise()
+            == sent),
+        "{} of {sent} counted",
+        world.auditd.counted_noise()
+    );
+    let elapsed = started.elapsed();
+    let events = world.auditd.events();
+    assert!(
+        events
+            .iter()
+            .all(|event| matches!(event, EventBody::WindowSummary(_))),
+        "{events:?}"
+    );
+    let summaries = world.auditd.summaries_with_arrival();
+    let heartbeats = elapsed.as_millis() / HEARTBEAT.as_millis() + 1;
+    assert!(
+        summaries.len() as u128 <= heartbeats,
+        "{} summaries in {heartbeats} heartbeats for {sent} datagrams",
+        summaries.len()
+    );
+    assert!(summaries.len() >= 2, "continuous noise is summarised again");
+    for pair in summaries.windows(2) {
+        let gap = pair[1].0.duration_since(pair[0].0);
+        assert!(gap >= HEARTBEAT / 2, "two summaries {gap:?} apart");
+    }
+    for (_, summary) in &summaries {
+        assert_eq!(
+            (summary.refused_gating, summary.unrecorded_outcomes),
+            (0, 0)
+        );
+    }
     assert_eq!(dnsd.stop(), Ok(()));
 }

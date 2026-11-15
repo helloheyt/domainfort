@@ -33,8 +33,8 @@ pub fn set_reachable(gate: &AuditGate, reachable: bool) {
     gate.set_reachable(reachable);
 }
 
-/// The next batch the client would send (`AuditGate::next_batch`). Tests
-/// only.
+/// The next batch the client would send (`AuditGate::next_batch`, the
+/// summary pace applied — docs/questions/Q-989). Tests only.
 #[must_use]
 pub fn next_batch(gate: &AuditGate) -> Option<Append> {
     gate.next_batch()

@@ -15,7 +15,8 @@
 //! * [`FakeAuditd`] — `Ping` → `Pong` naming the source it was told to
 //!   report; `Append` → `Ack` of its last number ([`Acks::Every`]) or no
 //!   reply at all ([`Acks::Never`]: sent, never acknowledged); it counts what
-//!   it received.
+//!   it received and keeps every event that decodes, with its batch's
+//!   arrival (task H1: the summaries' cadence, docs/questions/Q-989).
 //! * [`TestGate`] — a daemon's gate as the client sees it: the shared
 //!   `AuditGate` and a wake-up.
 //! * [`LinkRun`] — `connect` (the start-up verification), `attach`, then
@@ -47,8 +48,8 @@
 
 use ipc::{Direction, FrameReader, Reply};
 use ipc_audit::{
-    decode_request, encode_reply, Ack, AuditReply, AuditRequest, EventBody, EventSource,
-    WindowConfig, WindowSummary, AUDIT_CHANNEL,
+    decode_event, decode_request, encode_reply, Ack, AuditReply, AuditRequest, EventBody,
+    EventSource, WindowConfig, WindowSummary, AUDIT_CHANNEL,
 };
 use ipc_audit_client::{
     AckedIntent, AuditGate, AuditLink, AuditLinkError, ExpectedAuditd, IntentRecord, LinkedGate,
@@ -111,6 +112,9 @@ pub struct Received {
     connections: AtomicUsize,
     pings: AtomicUsize,
     appends: AtomicUsize,
+    /// Every event of every `Append` that decodes, with the instant its
+    /// batch arrived (task H1, docs/questions/Q-989: the summaries' cadence).
+    events: Mutex<Vec<(Instant, EventBody)>>,
 }
 
 /// Whether the fake auditd acknowledges the batches it receives.
@@ -195,6 +199,30 @@ impl FakeAuditd {
         self.received.connections.load(Ordering::SeqCst)
     }
 
+    /// Every event received so far, in order, with its batch's arrival.
+    pub fn events(&self) -> Vec<(Instant, EventBody)> {
+        self.received.events.lock().unwrap().clone()
+    }
+
+    /// The `WindowSummary` events received so far, with their arrival.
+    pub fn summaries(&self) -> Vec<(Instant, WindowSummary)> {
+        self.events()
+            .into_iter()
+            .filter_map(|(at, event)| match event {
+                EventBody::WindowSummary(summary) => Some((at, summary)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The noise counted in every summary received so far.
+    pub fn counted_noise(&self) -> u64 {
+        self.summaries()
+            .iter()
+            .map(|(_, summary)| summary.suppressed_noise)
+            .sum()
+    }
+
     /// Stop accepting, close every connection, remove the socket file.
     pub fn stop(&mut self) {
         let Some(thread) = self.thread.take() else {
@@ -227,6 +255,16 @@ fn serve(mut stream: UnixStream, source: EventSource, acks: Acks, received: &Rec
             }
             Ok(AuditRequest::Append(append)) => {
                 received.appends.fetch_add(1, Ordering::SeqCst);
+                let at = Instant::now();
+                if let Ok(mut events) = received.events.lock() {
+                    events.extend(
+                        append
+                            .events()
+                            .iter()
+                            .filter_map(|event| decode_event(event.as_bytes()).ok())
+                            .map(|event| (at, event)),
+                    );
+                }
                 if acks == Acks::Never {
                     continue;
                 }

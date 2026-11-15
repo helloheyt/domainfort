@@ -18,12 +18,12 @@
 //! 4. dird is verified on the kpasswd channel (peer uid, `Ping` → `Pong`
 //!    naming the internal zone) — §7.5;
 //! 5. only now are the listeners served — and the audit link attached to the
-//!    connection verified in step 3, with the summary pace, delivering the
-//!    front's noise counts as `WindowSummary` events (crate::audit; docs/53
-//!    §9; docs/questions/Q-961 item 7, Q-988). Until then nothing is read
-//!    from the listeners (a TCP handshake can complete into the kernel's
-//!    backlog; a failed start closes it) — the kdc's and ldap-front's
-//!    arrangement (Q-275 item 3).
+//!    connection verified in step 3, delivering the front's noise counts as
+//!    `WindowSummary` events on the shared gate's summary pace (crate::audit;
+//!    docs/53 §9; docs/questions/Q-961 item 7, Q-988, Q-989). Until then
+//!    nothing is read from the listeners (a TCP handshake can complete into
+//!    the kernel's backlog; a failed start closes it) — the kdc's and
+//!    ldap-front's arrangement (Q-275 item 3).
 //!
 //! # Noise (docs/53 §9; A-57)
 //!
@@ -57,9 +57,9 @@
 //!
 //! [`DaemonControl::stop`] ends every accept loop; each loop owns its
 //! connections' tasks (a tokio `JoinSet`, whose drop aborts them). Then the
-//! summary pace ends and the audit gate's one flush hands the last counts
-//! over and waits, bounded (`AUDIT_FLUSH_GRACE`, stopping early once auditd
-//! counts as unreachable), before the audit link ends (crate::audit).
+//! audit gate's one flush waits, bounded (`AUDIT_FLUSH_GRACE`, stopping
+//! early once auditd counts as unreachable), for the last counts and
+//! summaries, before the audit link ends (crate::audit).
 //! SIGTERM is not handled (as the other daemons, Q-260 item 9).
 //!
 //! Spec: docs/53 R53-3, §3.3, §5.1, §5.6, §9; docs/50 R50-16, §4.1, §6.2,
@@ -486,11 +486,11 @@ pub async fn serve(
     }
 
     // The audit link, attached to the connection verified above (the gate
-    // opens on it: task R15b, docs/questions/Q-630), and the summary pace
-    // (crate::audit) — the front's noise counts' way to the audit log.
+    // opens on it: task R15b, docs/questions/Q-630) — the front's noise
+    // counts' way to the audit log, on the gate's summary pace
+    // (crate::audit; docs/questions/Q-989).
     let gate = Arc::new(AuditGate::new(AUDIT_WINDOW));
     let audit_task = tokio::spawn(link.attach(Arc::clone(&gate), first_audit).run());
-    let pace = tokio::spawn(audit::pace_summaries(Arc::clone(&gate)));
 
     let admission = Arc::new(Admission {
         limits: front.limits,
@@ -528,10 +528,8 @@ pub async fn serve(
     }
     control.state.serving.store(false, Ordering::SeqCst);
     drop(context);
-    // The pace ends; the one flush hands the last counts over, waits for
-    // them (bounded), then the audit link ends (crate::audit).
-    pace.abort();
-    let _ = pace.await;
+    // The one flush waits (bounded) for the last counts and summaries, then
+    // the audit link ends (crate::audit).
     let unacknowledged = gate
         .close(AUDIT_FLUSH_GRACE, async {
             audit_task.abort();

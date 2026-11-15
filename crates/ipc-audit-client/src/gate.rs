@@ -63,7 +63,8 @@
 //! (`crate::client`, task R9b: peer uid and reported source verified on
 //! every connection). So the link side of the gate — marking auditd
 //! reachable ([`AuditGate::set_reachable`]), taking the batch to send
-//! ([`AuditGate::next_batch`]), feeding auditd's `Ack`
+//! ([`AuditGate::next_batch`]; the client's step `AuditGate::next_send`,
+//! which applies the summary pace), feeding auditd's `Ack`
 //! ([`AuditGate::acknowledge`]) and putting a lost batch back
 //! ([`AuditGate::connection_lost`]) — is **crate-private**: no code outside
 //! this crate (a daemon, its gate wrapper, a library) can mark auditd
@@ -78,11 +79,44 @@
 //! `test-seams` (docs/52 R15 rules; guard crates/e2e-tests
 //! `tests/no_test_seams_in_product.rs`).
 //!
+//! # The summary pace: counters leave on the gate's clock (docs/questions/Q-989)
+//!
+//! A [`WindowSummary`](ipc_audit::WindowSummary) carries the window's
+//! counters (noise counted, gating refused, outcomes not recorded — A-57,
+//! A-88). The window queues one whenever a counter is non-zero, and the
+//! audit client looks at the window again right after every acknowledged
+//! batch; so a sender that counts straight into the window (dnsd's and
+//! kpasswd-front's noise, A-160, A-165) sent, under continuous noise, one
+//! summary per auditd acknowledgement — a rate set by auditd's persistence,
+//! not by any rule of the sender's (A-57: noise "summarised in counters and
+//! rate-limited"). Class: "a counter-only report is paced by the transport's
+//! acknowledgements instead of by its own clock" (Q-989 item 2).
+//!
+//! The root change is in the one place every batch passes — the gate's
+//! crate-private next step of the audit client (`AuditGate::next_send`): a
+//! window that holds **only** counters (no event waiting) leaves as a
+//! summary at most once per `SUMMARY_PACE` — the client's [`HEARTBEAT`],
+//! one value — counted from the last summary the gate queued; until then
+//! the client is told how long to wait. Events are never held: whenever an
+//! event is waiting the batch goes at once, as before, and the counts held
+//! ride in it (the summary costs no exchange of its own, and its rate is
+//! bounded by the events', which A-57's noise share and the gating rules
+//! already bound). So every sender — dnsd, kpasswd-front, keyd, the kdc,
+//! dird, admind, any later one — gets the bound by construction; no sender
+//! keeps a pace of its own. [`AuditGate::count_noise_n`] counts a held
+//! number of occurrences in one step (Q-988 item 5). The stop's flush
+//! ([`AuditGate::close`]) also waits, while auditd is reachable, for the
+//! counts still held to leave as a summary, so the pace never holds counts
+//! past a stop it could have delivered them in.
+//!
+//! [`HEARTBEAT`]: crate::HEARTBEAT
+//!
 //! Spec: docs/52 §3.11 (R6 (a), (b)), §7 R6, §2 rows 20, 23, 38 (N5);
 //! docs/50 R50-17, §3.6 (bounded waits), §8.1; docs/51 §5.7 item 2 (A-85);
 //! docs/questions/Q-218 (A-57), Q-252 items 8, 9 (A-64), Q-260 item 2
 //! (A-67), Q-313 (A-82), Q-350 item 11 (A-87), Q-365 (A-88), Q-560 /
-//! A-115 (the follow-up), Q-570 §5 item a (A-118), Q-630.
+//! A-115 (the follow-up), Q-570 §5 item a (A-118), Q-630; Q-961 item 5,
+//! Q-988 items 4, 5, Q-989 (A-165).
 
 use core::future::Future;
 use core::time::Duration;
@@ -103,6 +137,13 @@ pub const AUDIT_FLUSH_GRACE: Duration = Duration::from_secs(5);
 /// How often [`AuditGate::close`] looks at the window while it waits — the
 /// poll interval every daemon's stop used (10 ms). Project choice.
 pub const FLUSH_POLL: Duration = Duration::from_millis(10);
+
+/// The shortest interval between two summaries of a window that holds only
+/// counters (module documentation, "The summary pace"): the audit client's
+/// heartbeat — one value, so "at most one summary per heartbeat"
+/// (docs/questions/Q-961 item 5) holds by construction.
+/// Spec: A-57 ("rate-limited"); docs/questions/Q-989 item 3 (A-165).
+const SUMMARY_PACE: Duration = crate::client::HEARTBEAT;
 
 /// Process-wide source of gate identities, so that a [`PendingIntent`] is
 /// only ever proved by the gate that committed its record.
@@ -278,6 +319,38 @@ impl WindowSteps<'_> {
 struct GateState {
     window: SendWindow,
     reachable: bool,
+    /// When the gate last queued a summary of the window's counters (the
+    /// summary pace — module documentation); `None` before the first.
+    last_summary: Option<Instant>,
+}
+
+/// Whether `window` holds counts not yet queued as a summary.
+/// Spec: docs/50 §8.1 (`WindowSummary`); A-57, A-88.
+fn holds_counts(window: &SendWindow) -> bool {
+    window.suppressed_noise() > 0 || window.refused_gating() > 0 || window.unrecorded_outcomes() > 0
+}
+
+/// Events of `window` not yet acknowledged plus its outstanding
+/// reservations ([`AuditGate::outstanding`]).
+fn outstanding_in(window: &SendWindow) -> usize {
+    window
+        .unacknowledged()
+        .saturating_add(usize::try_from(window.reserved()).unwrap_or(usize::MAX))
+}
+
+/// The audit client's next step on the gate (`AuditGate::next_send`) —
+/// crate-private, as the link side it belongs to.
+/// Spec: docs/50 §3.6, §8.1; docs/questions/Q-630, Q-989 (A-165).
+#[derive(Debug)]
+pub(crate) enum NextSend {
+    /// Send this batch now.
+    Batch(Append),
+    /// The window holds only counters and the last summary is younger than
+    /// the pace: nothing to send for this long (never zero) unless an event
+    /// is recorded meanwhile.
+    Paced(Duration),
+    /// Nothing to send.
+    Idle,
 }
 
 /// The sender's audit gate (module documentation). Shared (`Arc`) by the
@@ -311,6 +384,11 @@ struct GateState {
 /// gate.connection_lost();
 /// ```
 ///
+/// ```compile_fail,E0624
+/// let gate = ipc_audit_client::AuditGate::new(ipc_audit::WindowConfig::DEFAULT);
+/// let _ = gate.next_send();
+/// ```
+///
 /// The same code with the public API only compiles — a new gate is closed
 /// until the client attaches a verified connection (positive control):
 ///
@@ -341,6 +419,7 @@ impl AuditGate {
             state: Mutex::new(GateState {
                 window: SendWindow::new(window),
                 reachable: false,
+                last_summary: None,
             }),
             acked: Condvar::new(),
         }
@@ -440,12 +519,23 @@ impl AuditGate {
 
     /// Count one noise occurrence that has no event of its own (into the
     /// next `WindowSummary`'s `suppressed_noise`; no slot is taken) — the
-    /// counters-only sender of docs/54 §9 (dnsd).
-    /// Spec: docs/questions/Q-218 (A-57); docs/54 §9; docs/questions/Q-961;
-    /// ipc-audit `SendWindow::count_noise`.
+    /// counters-only senders of docs/54 §9 (dnsd) and docs/53 §9
+    /// (kpasswd-front). The summary leaves on the gate's pace (module
+    /// documentation), whatever the rate of the counts.
+    /// Spec: docs/questions/Q-218 (A-57); docs/54 §9; docs/questions/Q-961,
+    /// Q-989; ipc-audit `SendWindow::count_noise`.
     pub fn count_noise(&self) {
+        self.count_noise_n(1);
+    }
+
+    /// Count `occurrences` noise occurrences in one step (one lock, one
+    /// addition — never one call per occurrence), for a sender that holds a
+    /// count; saturating; 0 counts nothing.
+    /// Spec: docs/questions/Q-218 (A-57); docs/questions/Q-988 item 5, Q-989
+    /// item 3 (A-165); ipc-audit `SendWindow::count_noise_n`.
+    pub fn count_noise_n(&self, occurrences: u64) {
         if let Some(mut state) = self.lock() {
-            state.window.count_noise();
+            state.window.count_noise_n(occurrences);
         }
     }
 
@@ -550,12 +640,60 @@ impl AuditGate {
     }
 
     /// The next batch to send, if nothing is in flight and anything is
-    /// pending — the audit client's (crate-private: a batch taken by anyone
-    /// else would never reach auditd). Spec: docs/50 §3.6, §8.1;
-    /// docs/questions/Q-630.
+    /// pending — [`AuditGate::next_send`]'s batch, the summary pace applied
+    /// (crate-private: a batch taken by anyone else would never reach
+    /// auditd). The client itself takes [`AuditGate::next_send`] (it also
+    /// needs the pace's wait); this form serves the tier-1 seams
+    /// (`test_seams::next_batch`) and this crate's tests — and stays
+    /// crate-private like the rest of the link side (the E0624 example on
+    /// [`AuditGate`]). Spec: docs/50 §3.6, §8.1; docs/questions/Q-630, Q-989.
+    #[cfg_attr(not(any(test, feature = "test-seams")), allow(dead_code))]
     #[must_use]
     pub(crate) fn next_batch(&self) -> Option<Append> {
-        self.lock().and_then(|mut state| state.window.next_batch())
+        match self.next_send() {
+            NextSend::Batch(append) => Some(append),
+            NextSend::Paced(_) | NextSend::Idle => None,
+        }
+    }
+
+    /// The audit client's next step — crate-private, the one way a batch
+    /// leaves the gate; the summary pace (module documentation) lives here:
+    ///
+    /// * an event waiting (and nothing in flight) ⇒ the batch at once, with
+    ///   the counts held riding in it as its summary — events never wait;
+    /// * only counters held, and a summary queued less than `SUMMARY_PACE`
+    ///   ago ⇒ [`NextSend::Paced`] for the rest of the pace;
+    /// * only counters held otherwise ⇒ the batch of their one summary;
+    /// * nothing (or a full window, or a poisoned lock) ⇒ [`NextSend::Idle`].
+    ///
+    /// Whenever a summary is queued, the gate notes when.
+    ///
+    /// Spec: docs/50 §3.6 (one request in flight), §8.1 (`WindowSummary`);
+    /// A-57 ("summarised in counters and rate-limited"); docs/52 §3.11 R6
+    /// (events, and so intents, are not held); docs/questions/Q-961 item 5,
+    /// Q-989 item 3 (A-165), Q-630.
+    pub(crate) fn next_send(&self) -> NextSend {
+        let Some(mut state) = self.lock() else {
+            return NextSend::Idle;
+        };
+        let now = Instant::now();
+        let counted = holds_counts(&state.window);
+        let events_waiting = state.window.unacknowledged() > 0;
+        if counted && !events_waiting {
+            if let Some(last) = state.last_summary {
+                let since = now.saturating_duration_since(last);
+                if let Some(left) = SUMMARY_PACE.checked_sub(since) {
+                    if !left.is_zero() {
+                        return NextSend::Paced(left);
+                    }
+                }
+            }
+        }
+        let batch = state.window.next_batch();
+        if counted && !holds_counts(&state.window) {
+            state.last_summary = Some(now);
+        }
+        batch.map_or(NextSend::Idle, NextSend::Batch)
     }
 
     /// auditd's acknowledgement of the batch in flight — the audit client's
@@ -591,18 +729,23 @@ impl AuditGate {
     /// poisoned lock: nothing can be delivered from it).
     #[must_use]
     pub fn outstanding(&self) -> usize {
-        self.lock().map_or(0, |state| {
-            state
-                .window
-                .unacknowledged()
-                .saturating_add(usize::try_from(state.window.reserved()).unwrap_or(usize::MAX))
-        })
+        self.lock().map_or(0, |state| outstanding_in(&state.window))
     }
 
-    /// Whether the stop's wait is over under `wait`.
+    /// Whether the stop's wait is over under `wait`: every queued event
+    /// acknowledged and — while auditd is reachable, the only time they can
+    /// leave — no counts held back by the summary pace; or, under
+    /// [`FlushWait::UntilAcknowledgedOrUnreachable`], auditd unreachable. A
+    /// poisoned lock: over (nothing can be delivered from it).
+    /// Spec: docs/questions/Q-313 (A-82), Q-350 item 11 (A-87), Q-961 item
+    /// 6, Q-988 item 1, Q-989 (A-165).
     fn flushed(&self, wait: FlushWait) -> bool {
-        self.outstanding() == 0
-            || (wait == FlushWait::UntilAcknowledgedOrUnreachable && !self.is_reachable())
+        let Some(state) = self.lock() else {
+            return true;
+        };
+        let summarised = !state.reachable || !holds_counts(&state.window);
+        (outstanding_in(&state.window) == 0 && summarised)
+            || (wait == FlushWait::UntilAcknowledgedOrUnreachable && !state.reachable)
     }
 
     /// **The stop's flush** (module documentation), the one implementation
@@ -610,7 +753,9 @@ impl AuditGate {
     ///
     /// 1. wait, at most `grace` ([`AUDIT_FLUSH_GRACE`] in every daemon),
     ///    looking every [`FLUSH_POLL`] (`sleep` is the caller's runtime's
-    ///    timer), until every queued event is acknowledged — or, under
+    ///    timer), until every queued event is acknowledged and, while auditd
+    ///    is reachable, the counts the summary pace still holds have left as
+    ///    a summary (at most one pace away) — or, under
     ///    [`FlushWait::UntilAcknowledgedOrUnreachable`], the link counts as
     ///    unreachable; the audit link keeps running (and reconnecting)
     ///    meanwhile;
@@ -621,7 +766,8 @@ impl AuditGate {
     /// Spec: docs/questions/Q-313 (A-82: "waits, bounded, for auditd's
     /// acknowledgement of every queued audit event before closing, and
     /// reports what was not acknowledged"), Q-350 item 11 (A-87), Q-252 item
-    /// 9; docs/52 §3.11 R6 (b); docs/50 §3.6, §8.1.
+    /// 9, Q-961 item 6, Q-988 item 1, Q-989 (A-165); docs/52 §3.11 R6 (b);
+    /// docs/50 §3.6, §8.1.
     pub async fn close<S, F, E>(
         &self,
         grace: Duration,
@@ -853,6 +999,166 @@ mod tests {
                 unrecorded_outcomes: 0,
             })
         );
+    }
+
+    /// The events of `batch`, decoded.
+    fn decoded(batch: &Append) -> Vec<EventBody> {
+        batch
+            .events()
+            .iter()
+            .map(|event| ipc_audit::decode_event(event.as_bytes()).unwrap())
+            .collect()
+    }
+
+    /// A summary of `noise` counted noise and nothing else.
+    fn noise_summary(noise: u64) -> EventBody {
+        EventBody::WindowSummary(WindowSummary {
+            suppressed_noise: noise,
+            refused_gating: 0,
+            unrecorded_outcomes: 0,
+        })
+    }
+
+    fn ack_of(batch: &Append) -> Ack {
+        Ack {
+            through_seq: batch.last_seq(),
+            head_hash: [0; 32],
+        }
+    }
+
+    /// docs/questions/Q-989 (A-165; class "a counter-only report is paced by
+    /// the transport's acknowledgements instead of by its own clock"), Q-961
+    /// item 5 ("at most one summary per heartbeat"); A-57: a window that
+    /// holds only counters is summarised at once the first time, then —
+    /// although auditd acknowledged at once and new counts are held — not
+    /// again before the pace (the heartbeat) has passed; the counts are kept
+    /// meanwhile and the next summary carries all of them.
+    #[test]
+    fn a_window_of_counters_only_is_summarised_at_most_once_per_pace() {
+        assert_eq!(SUMMARY_PACE, crate::client::HEARTBEAT, "one value");
+        let gate = open_gate();
+        gate.count_noise();
+        let first = gate.next_batch().expect("the first summary is not held");
+        assert_eq!(decoded(&first), [noise_summary(1)]);
+        gate.acknowledge(&ack_of(&first)).unwrap();
+
+        gate.count_noise_n(3);
+        gate.count_noise();
+        let NextSend::Paced(left) = gate.next_send() else {
+            panic!("counters only, a summary just sent: held by the pace");
+        };
+        assert!(!left.is_zero() && left <= SUMMARY_PACE, "{left:?}");
+        assert!(gate.next_batch().is_none(), "nothing before the pace");
+        assert_eq!(gate.inspect(SendWindow::suppressed_noise), Some(4), "kept");
+        std::thread::sleep(left);
+        let second = gate.next_batch().expect("the pace has passed");
+        assert_eq!(decoded(&second), [noise_summary(4)], "every count, once");
+        gate.acknowledge(&ack_of(&second)).unwrap();
+        assert!(
+            matches!(gate.next_send(), NextSend::Idle),
+            "nothing counted since"
+        );
+    }
+
+    /// docs/52 §3.11 R6 (an intent's acknowledgement is not delayed);
+    /// docs/questions/Q-989 item 3 ("gating events are untouched: they never
+    /// wait"): while the pace holds counters, an event committed into the
+    /// window leaves at once, first in its batch, with the held counts riding
+    /// in it as its summary (no exchange of its own); that summary restarts
+    /// the pace.
+    #[test]
+    fn an_event_is_never_held_by_the_pace() {
+        let gate = open_gate();
+        gate.count_noise();
+        auditd_acknowledges(&gate);
+        gate.count_noise_n(2);
+        assert!(matches!(gate.next_send(), NextSend::Paced(_)));
+        let pending = gate
+            .begin_intent(gate.reserve().unwrap(), Change(70))
+            .unwrap();
+        let batch = gate.next_batch().expect("an event is never held");
+        assert_eq!(
+            decoded(&batch),
+            [Change(70).intent_event(), noise_summary(2)]
+        );
+        gate.acknowledge(&ack_of(&batch)).unwrap();
+        assert!(gate.wait_acknowledged(pending, soon()).is_ok());
+        gate.count_noise();
+        assert!(
+            matches!(gate.next_send(), NextSend::Paced(_)),
+            "the summary that rode with the event restarted the pace"
+        );
+    }
+
+    /// docs/questions/Q-988 item 5, Q-989 item 3 (A-165: a bulk count): a
+    /// held count enters the window in one step and adds up with single
+    /// counts into one summary; 0 counts nothing.
+    #[test]
+    fn counted_noise_in_bulk_reaches_one_summary() {
+        let gate = open_gate();
+        gate.count_noise_n(0);
+        assert!(
+            matches!(gate.next_send(), NextSend::Idle),
+            "0 counts nothing"
+        );
+        gate.count_noise_n(1_000);
+        gate.count_noise();
+        assert_eq!(gate.outstanding(), 0, "no slot taken");
+        let batch = gate.next_batch().unwrap();
+        assert_eq!(decoded(&batch), [noise_summary(1_001)]);
+    }
+
+    /// R6 (b), docs/questions/Q-961 item 6, Q-989: the pace never holds
+    /// counts past a stop that could deliver them — with auditd reachable,
+    /// the flush waits for the held counts' summary (here delivered by a
+    /// thread playing the audit client once the pace allows it) and its
+    /// acknowledgement; with auditd unreachable the counts cannot leave, and
+    /// even the full wait (dird, admind) does not wait for them.
+    #[test]
+    fn close_waits_for_held_counts_only_while_auditd_is_reachable() {
+        let gate = Arc::new(open_gate());
+        gate.count_noise();
+        auditd_acknowledges(&gate);
+        gate.count_noise_n(5);
+        assert!(matches!(gate.next_send(), NextSend::Paced(_)));
+        let client = {
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || loop {
+                match gate.next_send() {
+                    NextSend::Batch(batch) => {
+                        gate.acknowledge(&ack_of(&batch)).unwrap();
+                        return decoded(&batch);
+                    }
+                    NextSend::Paced(left) => std::thread::sleep(left),
+                    NextSend::Idle => panic!("the counts are held"),
+                }
+            })
+        };
+        let started = Instant::now();
+        let unflushed = run_ready(gate.close(
+            Duration::from_secs(10),
+            FlushWait::UntilAcknowledgedOrUnreachable,
+            blocking_sleep,
+            async {},
+        ));
+        assert_eq!(client.join().unwrap(), [noise_summary(5)]);
+        assert_eq!(unflushed.events(), 0);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(gate.inspect(SendWindow::suppressed_noise), Some(0));
+
+        for wait in [
+            FlushWait::UntilAcknowledged,
+            FlushWait::UntilAcknowledgedOrUnreachable,
+        ] {
+            let gate = open_gate();
+            gate.count_noise();
+            gate.set_reachable(false);
+            let grace = Duration::from_millis(200);
+            let started = Instant::now();
+            let unflushed = run_ready(gate.close(grace, wait, blocking_sleep, async {}));
+            assert_eq!(unflushed.events(), 0, "{wait:?}");
+            assert!(started.elapsed() < grace, "{wait:?}: not waited for");
+        }
     }
 
     /// R6 (b), Q-313: a clean stop — everything acknowledged — reports 0 and

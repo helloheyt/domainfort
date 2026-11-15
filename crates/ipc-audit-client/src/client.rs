@@ -65,6 +65,11 @@
 //!   auditd synced it (§8.1); the reply is read
 //!   with ipc's [`FrameReader`] under the reply bound and decoded with the
 //!   same strictness as a request (§3.3).
+//! * **The summary pace** (docs/questions/Q-989, A-165). A window that
+//!   holds only counters leaves as a `WindowSummary` at most once per
+//!   [`HEARTBEAT`] — the gate decides (`crate::gate`, "The summary pace"),
+//!   and the link waits as long as the gate says; events are never held.
+//!   So no sender's summaries follow auditd's acknowledgement rate.
 //! * **Liveness.** When nothing is pending for [`HEARTBEAT`], a `Ping`; a
 //!   connection that fails it, or any exchange, is dropped and auditd counts
 //!   as unreachable until a verified connection is back (A-57;
@@ -102,9 +107,10 @@
 //!
 //! Spec: docs/50 R50-3, R50-16, R50-17, §3.2, §3.3, §3.6, §3.7, §7.5, §8.1;
 //! docs/52 §3.12 (C12); docs/questions/Q-218 (A-57), Q-252 (A-64), Q-260
-//! (A-67), Q-512 (A-112), Q-560 (A-115), Q-570 §5 item a (A-118), Q-630.
+//! (A-67), Q-512 (A-112), Q-560 (A-115), Q-570 §5 item a (A-118), Q-630,
+//! Q-989 (A-165).
 
-use crate::gate::AuditGate;
+use crate::gate::{AuditGate, NextSend};
 use core::fmt;
 use core::future::Future;
 use core::time::Duration;
@@ -523,24 +529,36 @@ impl AuditConnection {
     }
 
     /// Deliver the window's batches until the connection fails; returns why.
-    /// The heartbeat's `Pong` must name the expected source too.
+    /// The gate says what is next (`AuditGate::next_send`): a batch is sent
+    /// at once; counters held back by the summary pace are waited for —
+    /// until the pace allows their summary, or an event is recorded — with
+    /// no `Ping` (their summary's own exchange follows); idle for
+    /// [`HEARTBEAT`] ⇒ a `Ping`, whose `Pong` must name the expected source
+    /// too.
     ///
     /// Spec: docs/50 §8.1 (persistence acknowledgements), §7.5 (`Ping` as
-    /// the health check); docs/questions/Q-218 (A-57), Q-560.
+    /// the health check); docs/questions/Q-218 (A-57), Q-560, Q-989 (A-165).
     async fn pump<G: LinkedGate + ?Sized>(&mut self, gate: &G) -> AuditLinkError {
         let core = gate.audit_gate();
         loop {
-            match core.next_batch() {
-                Some(append) => match self.exchange(&AuditRequest::Append(append)).await {
-                    Ok(AuditReply::Ack(ack)) => {
-                        if core.acknowledge(&ack).is_err() {
-                            return AuditLinkError::Protocol;
+            match core.next_send() {
+                NextSend::Batch(append) => {
+                    match self.exchange(&AuditRequest::Append(append)).await {
+                        Ok(AuditReply::Ack(ack)) => {
+                            if core.acknowledge(&ack).is_err() {
+                                return AuditLinkError::Protocol;
+                            }
                         }
+                        Ok(AuditReply::Pong(_)) => return AuditLinkError::Protocol,
+                        Err(error) => return error,
                     }
-                    Ok(AuditReply::Pong(_)) => return AuditLinkError::Protocol,
-                    Err(error) => return error,
-                },
-                None => {
+                }
+                NextSend::Paced(left) => {
+                    // Woken by an event or at the end of the pace: either
+                    // way the gate's next step decides.
+                    let _ = timeout(left.min(HEARTBEAT), gate.recorded()).await;
+                }
+                NextSend::Idle => {
                     if timeout(HEARTBEAT, gate.recorded()).await.is_err() {
                         if let Err(error) = self.check_source().await {
                             return error;

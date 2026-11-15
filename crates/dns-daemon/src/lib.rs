@@ -78,9 +78,11 @@
 //! # Residuals (documented, not hidden)
 //!
 //! - dnsd's audit is counters only (docs/54 §9): one `WindowSummary` per
-//!   audit heartbeat at most; the counts since the link's last look at the
-//!   window are not summarised at a stop (they stay on the operational log)
-//!   — docs/questions/Q-961.
+//!   audit heartbeat at most (the shared gate's summary pace — Q-989); at a
+//!   stop the flush waits, bounded and while auditd is reachable, for the
+//!   counts still held; counts it cannot deliver (auditd unreachable, the
+//!   grace spent) are lost with the process and stay on the operational log
+//!   — docs/questions/Q-961 item 6, Q-989.
 //! - No TKEY forwarding and no UDP UPDATE forwarding: dns-zone does not mark
 //!   them yet (DN9 / DR2); dird's replies are relayed on TCP without a
 //!   dns-zone `Reply::from_forwarded` (DR2) — Q-952.

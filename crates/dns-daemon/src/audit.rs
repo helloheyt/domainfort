@@ -24,10 +24,12 @@
 //! noise occurrence (crate::daemon `Shared::noise` — the one place it is
 //! counted) is counted into the shared gate's window
 //! ([`AuditGate::count_noise`]), which takes no slot; the audit link sends
-//! the count as the next `WindowSummary` (`suppressed_noise`) when it next
-//! looks at the window — at the latest after its idle heartbeat
-//! (ipc-audit-client `HEARTBEAT`) — so a flood yields at most one summary
-//! per heartbeat, never one record per datagram. dnsd reserves no slot:
+//! the count as the next `WindowSummary` (`suppressed_noise`) on the shared
+//! gate's summary pace: a window that holds only counters leaves at most
+//! once per ipc-audit-client `HEARTBEAT`, however fast auditd acknowledges
+//! (docs/questions/Q-989, A-165 — the bound every counters-only sender gets
+//! from ipc-audit-client) — so a flood yields at most one summary per
+//! heartbeat, never one record per datagram. dnsd reserves no slot:
 //! queries are not gated on auditd (docs/54 §9); the UPDATE decisions are
 //! audited — gating — by dird, their PEP (docs/54 §4.5 step 7, §9). Which
 //! counters are noise is crate::daemon's reading of docs/54 §9
@@ -35,7 +37,7 @@
 //!
 //! Spec: docs/50 R50-3, R50-16, R50-17, §3.2, §7.5, §8.1; docs/54 §4.8, §9,
 //! R54-11; docs/52 §3.12; A-57; docs/questions/Q-560 item 5, Q-619 items 2,
-//! 3, Q-950 (A-157), Q-960, Q-961.
+//! 3, Q-950 (A-157), Q-960, Q-961, Q-989 (A-165).
 
 use crate::log::{note, Note};
 use core::future::Future;
@@ -99,11 +101,13 @@ impl AuditGate {
     }
 
     /// The stop's flush (`ipc_audit_client::AuditGate::close`): wait at most
-    /// `grace` for the summaries already queued, stopping early once the
-    /// link counts auditd as unreachable (nothing dnsd sends gates an
-    /// operation — the kdc's and keyd's rule, A-87); then end the link.
-    /// Spec: docs/questions/Q-313 (A-82), Q-350 item 11 (A-87); docs/52
-    /// §3.11 R6 (b).
+    /// `grace` for the summaries already queued and — while auditd is
+    /// reachable — for the counts the summary pace still holds, stopping
+    /// early once the link counts auditd as unreachable (nothing dnsd sends
+    /// gates an operation — the kdc's and keyd's rule, A-87); then end the
+    /// link.
+    /// Spec: docs/questions/Q-313 (A-82), Q-350 item 11 (A-87), Q-961 item
+    /// 6, Q-989; docs/52 §3.11 R6 (b).
     pub(crate) async fn close<E: Future<Output = ()>>(
         &self,
         grace: Duration,
@@ -121,10 +125,11 @@ impl AuditGate {
 }
 
 /// What dnsd's gate gives the one audit client (task R9b): the shared gate,
-/// no wake-up (dnsd records no event; its counts leave with the link's
-/// heartbeat — module documentation), and dnsd's notes when the link is
+/// no wake-up (dnsd records no event; its counts leave on the gate's
+/// summary pace — module documentation), and dnsd's notes when the link is
 /// restored or lost.
-/// Spec: docs/52 §3.11 R6, §3.12; docs/questions/Q-512, Q-560 item 4.
+/// Spec: docs/52 §3.11 R6, §3.12; docs/questions/Q-512, Q-560 item 4,
+/// Q-989.
 impl ipc_audit_client::LinkedGate for AuditGate {
     fn audit_gate(&self) -> &ipc_audit_client::AuditGate {
         &self.core

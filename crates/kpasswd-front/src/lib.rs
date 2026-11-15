@@ -32,7 +32,8 @@
 //!    now are the listeners served — with the audit link attached to the
 //!    kept connection, delivering the front's noise counts as
 //!    `WindowSummary` events, at most one per heartbeat ([`audit`];
-//!    docs/questions/Q-961 item 7, Q-988).
+//!    docs/questions/Q-961 item 7, Q-988; the pace is the shared audit
+//!    gate's — Q-989).
 //!
 //! # Per connection ([`connection`] module)
 //!
@@ -71,7 +72,7 @@
 //! | [`reply`] | the KRB-ERROR encoder and the framing of keyd's sealed reply |
 //! | [`clock`] | the KRB-ERROR's server time |
 //! | `daemon` | [`serve`], the start-up checks, accept loops, connection limits |
-//! | [`audit`] | the start-up check of auditd (the front's own source, `kpasswd-front`), the audit link and the summary pace |
+//! | [`audit`] | the start-up check of auditd (the front's own source, `kpasswd-front`), and the audit link (the noise counts, on the shared gate's summary pace) |
 //! | [`startup`] | configuration, binding, hardening plan |
 //! | [`log`] | fixed stderr messages and the counted events — noise and failures (docs/53 §9) |
 //!
@@ -88,10 +89,11 @@
 //!
 //! - The front's audit is counts only: its noise as `WindowSummary` counts
 //!   (`suppressed_noise`, at most one summary per heartbeat — docs/53 §9,
-//!   A-57; docs/questions/Q-961 item 7, Q-988), no record per connection,
-//!   no breakdown by kind on the log (the kinds are on stderr). Counts the
-//!   stop's bounded flush cannot deliver (auditd unreachable, or the grace
-//!   spent) are lost with the process; they remain on the operational log.
+//!   A-57; docs/questions/Q-961 item 7, Q-988, Q-989), no record per
+//!   connection, no breakdown by kind on the log (the kinds are on stderr).
+//!   Counts the stop's bounded flush cannot deliver (auditd unreachable, or
+//!   the grace spent) are lost with the process; they remain on the
+//!   operational log.
 //!   The product front starts once auditd's `uid_sources` maps its uid to
 //!   `kpasswd-front` (task DN12); provisioning that entry is task K9's.
 //! - A compromised front can drop, delay or forge a KRB-ERROR (confusion
