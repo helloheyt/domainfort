@@ -1143,8 +1143,9 @@ impl World {
     }
 
     /// `keyadm ceremony` (library, over keyd's socket, Role::Admin):
-    /// `create_key` for krbtgt and the two service objects of the manifest
-    /// (docs/51 §4.3 step 11), then the first administrators' initial-secret
+    /// `create_key` for krbtgt and the three service objects of the manifest
+    /// (docs/51 §4.3 step 11; the change-password service's since task K9 —
+    /// docs/53 §5.2), then the first administrators' initial-secret
     /// grants (task A15a; their salts from the manifest — A-102, N4), then
     /// the seal (A-102, docs/52 R3). keyadm's file names keyd's socket.
     pub fn ceremony(&mut self) -> keyadm::ceremony::CeremonyReport {
@@ -1860,7 +1861,9 @@ fn collect_files(dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
 fn domain_input(dir: &ScratchDir, uid: u32) -> DomainInput {
     let path = |rest: &str| FilePath::parse(dir.join(rest).to_str().unwrap()).unwrap();
     let account = |n: u32| Account { uid: n, gid: n };
-    let fake = [61001, 61003, 61004, 61005, 61006, 61007, 61010];
+    let fake = [
+        61001, 61003, 61004, 61005, 61006, 61007, 61008, 61009, 61010,
+    ];
     assert!(
         !fake.contains(&uid),
         "the test uid collides with a fake account"
@@ -1876,6 +1879,9 @@ fn domain_input(dir: &ScratchDir, uid: u32) -> DomainInput {
             ldap_front: account(61004),
             auditd: account(61005),
             admind: account(61006),
+            // Task K9: the two network fronts (obviously fake accounts).
+            kpasswd_front: account(61008),
+            dnsd: account(61009),
             keyadm_uid: 61007,
             admin_socket_group: 61010,
         },
@@ -1893,10 +1899,14 @@ fn domain_input(dir: &ScratchDir, uid: u32) -> DomainInput {
             auditd_config: path("etc/auditd.conf"),
             admind_config: path("etc/admind.conf"),
             keyadm_config: path("etc/keyadm.conf"),
+            kpasswd_front_config: path("etc/kpasswd-front.conf"),
+            dnsd_config: path("etc/dnsd.conf"),
             keyd_socket: path("r/k/k.sock"),
             dird_kdc_socket: path("r/dk/d.sock"),
             dird_ldap_socket: path("r/dl/l.sock"),
             dird_admin_socket: path("r/da/a.sock"),
+            dird_kpasswd_socket: path("r/dp/p.sock"),
+            dird_dns_socket: path("r/dd/d.sock"),
             audit_socket: path("r/au/a.sock"),
             admin_socket: path("r/ad/a.sock"),
             tls_certificate: path("etc/dc-cert.der"),
@@ -1908,6 +1918,8 @@ fn domain_input(dir: &ScratchDir, uid: u32) -> DomainInput {
             ldap_listen: Vec::new(),
             ldaps_listen: vec!["127.0.0.1:636".to_owned()],
             internal_networks: vec!["127.0.0.0/8".to_owned()],
+            kpasswd_listen: vec!["127.0.0.1:464".to_owned()],
+            dnsd_listen: vec!["127.0.0.1:53".to_owned()],
         },
         names: Names {
             tier0_ou: "Tier0".to_owned(),
@@ -1917,6 +1929,7 @@ fn domain_input(dir: &ScratchDir, uid: u32) -> DomainInput {
             dc_name: "DC1".to_owned(),
             ldap_service_name: "ldapsvc".to_owned(),
             admin_service_name: "adminsvc".to_owned(),
+            change_password_service_name: "changepwsvc".to_owned(),
             first_admins: vec![ALICE.to_owned(), BOB.to_owned()],
         },
     }

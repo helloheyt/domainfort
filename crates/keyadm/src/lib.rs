@@ -31,7 +31,7 @@
 //! ([`settings`]: root-owned, not group/other-writable) → read the manifest
 //! (`provision_manifest::read_manifest`: the same rule; every first
 //! administrator must have its salt, A-102 / N4) → connect to keyd, verify
-//! its peer uid before anything is sent → `ping` → three `create_key` → one
+//! its peer uid before anything is sent → `ping` → four `create_key` (task K9: the fourth for `kadmin/changepw`) → one
 //! `grant_set_secret` per first administrator, binding the manifest's salt
 //! (task A15a: the initial-secret grants without which keyd refuses
 //! `provision first-admin-secret`'s `set_secret`, live 15 minutes — docs/51

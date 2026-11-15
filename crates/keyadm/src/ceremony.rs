@@ -1,5 +1,5 @@
-//! `keyadm ceremony`: create the krbtgt key set and the two service key sets
-//! the provisioning manifest names, grant the first administrators' initial
+//! `keyadm ceremony`: create the krbtgt key set and the three service key
+//! sets the provisioning manifest names, grant the first administrators' initial
 //! secrets, and **seal** keyd's ceremony (docs/51 §4.3 step 11; A-102,
 //! docs/52 R3).
 //!
@@ -11,14 +11,18 @@
 //!    A-63) — a process that took over the socket path receives nothing.
 //!    `ping` creates nothing, so a failure here means no key set was
 //!    touched.
-//! 2. **`create_key` ×3, in order** — `(GUID_krbtgt, Krbtgt)` with
+//! 2. **`create_key` ×4, in order** — `(GUID_krbtgt, Krbtgt)` with
 //!    NT-SRV-INST [krbtgt, REALM]; `(GUID_ldap, Service)` with NT-SRV-HST
 //!    [ldap, fqdn]; `(GUID_admin, AdminService)` with NT-SRV-HST [admind,
 //!    fqdn] — the admin service's own purpose, whose tickets keyd opens only
 //!    bound to an operation (R2, docs/52 §5 item 3; A-102) (docs/51 §4.3
-//!    step 11; docs/47 §1.4, §9.1; docs/10 §5ב, §7; A-19, A-73). The purpose
-//!    comes from the manifest's key table. keyd draws the keys and chooses
-//!    the kvno (A-35); keyadm only asks.
+//!    step 11; docs/47 §1.4, §9.1; docs/10 §5ב, §7; A-19, A-73); and (task
+//!    K9) `(GUID_changepw, ChangePasswordService)` with NT-SRV-INST
+//!    [kadmin, changepw] — the change-password service's own purpose, whose
+//!    tickets keyd opens only in `open_change_password_request` (RFC 3244 §2;
+//!    docs/53 R53-6, §5.2: its key drawn by a fourth `create_key`). The
+//!    purpose comes from the manifest's key table. keyd draws the keys and
+//!    chooses the kvno (A-35); keyadm only asks.
 //! 3. **`grant_set_secret` for each first administrator, in the manifest's
 //!    order** (task A15a; docs/questions/Q-451) — a user's one key target,
 //!    `(GUID, PrincipalLongterm)` with its NT-PRINCIPAL [sAMAccountName]
@@ -75,7 +79,8 @@
 //! | not performed: `Refused::Busy` / `Unavailable` / `Malformed` / `VersionMismatch` | no — keyd-daemon refuses a key-state change only before keyd runs it (A-88: `Busy` while auditd is away, `Unavailable` when the intent was not acknowledged in time — keyd's audit then holds the intent and a `NotPerformed` outcome) |
 //! | outcome unknown: the request was sent and the connection failed, the deadline passed, or the reply could not be read | **maybe** — keyd's audit log holds the intent and the outcome; check it before anything else |
 //!
-//! Spec: docs/51 §4.3 steps 10-12, §4.5, §6; docs/10 §2, §7, §9, §10;
+//! Spec: docs/51 §4.3 steps 10-12, §4.5, §6; docs/53 §5.2, §10 (K9);
+//! docs/10 §2, §7, §9, §10;
 //! docs/50 R50-3, §3.4, §3.6, §3.7; docs/52 §4.2 (N4), §4.4 (R3); A-19;
 //! A-35; A-63; A-73; A-77; docs/questions/Q-365, Q-367 (A-88), Q-462 item
 //! 1 (A-102).
@@ -103,11 +108,21 @@ pub enum Step {
     /// docs/52 §5 item 3 (R2: the admin service's own purpose);
     /// RFC 4120 §6.2.1.
     AdminService,
+    /// `(GUID_changepw, ChangePasswordService)`, NT-SRV-INST [kadmin,
+    /// changepw] (task K9). Spec: RFC 3244 §2; RFC 4120 §6.2; docs/53 R53-6,
+    /// §5.2, §10 (K9).
+    ChangePasswordService,
 }
 
 impl Step {
-    /// Every step, in order. Spec: docs/51 §4.3 step 11.
-    pub const ALL: [Step; 3] = [Step::Krbtgt, Step::LdapService, Step::AdminService];
+    /// Every step, in order. Spec: docs/51 §4.3 step 11; docs/53 §5.2 (the
+    /// fourth `create_key`, task K9).
+    pub const ALL: [Step; 4] = [
+        Step::Krbtgt,
+        Step::LdapService,
+        Step::AdminService,
+        Step::ChangePasswordService,
+    ];
 
     /// A fixed label for the report.
     #[must_use]
@@ -116,6 +131,7 @@ impl Step {
             Step::Krbtgt => "krbtgt",
             Step::LdapService => "ldap service",
             Step::AdminService => "admin service",
+            Step::ChangePasswordService => "change-password service",
         }
     }
 
@@ -127,6 +143,7 @@ impl Step {
             Step::Krbtgt => manifest.krbtgt(),
             Step::LdapService => manifest.ldap_service(),
             Step::AdminService => manifest.admin_service(),
+            Step::ChangePasswordService => manifest.change_password_service(),
         }
     }
 }
@@ -276,7 +293,7 @@ pub struct GrantReport {
 }
 
 /// What the ceremony did: the contact, then the steps attempted (in order;
-/// it stops after the first that did not succeed): the three key sets, the
+/// it stops after the first that did not succeed): the four key sets, the
 /// first administrators' grants, then the seal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CeremonyReport {
@@ -284,7 +301,7 @@ pub struct CeremonyReport {
     pub contact: Outcome<()>,
     /// The `create_key` steps attempted.
     pub steps: Vec<StepReport>,
-    /// The `grant_set_secret` steps attempted (task A15a), after all three
+    /// The `grant_set_secret` steps attempted (task A15a), after all four
     /// key sets were created.
     pub grants: Vec<GrantReport>,
     /// How many first administrators the manifest names (each needs its
@@ -296,7 +313,7 @@ pub struct CeremonyReport {
 }
 
 impl CeremonyReport {
-    /// `true` if all three key sets were created, every first
+    /// `true` if all four key sets were created, every first
     /// administrator's initial secret was granted, and keyd's ceremony was
     /// sealed (A-102).
     #[must_use]
@@ -304,7 +321,7 @@ impl CeremonyReport {
         self.grants_registered() && self.is_sealed()
     }
 
-    /// `true` if all three key sets were created and every first
+    /// `true` if all four key sets were created and every first
     /// administrator's initial secret was granted (the seal may still be
     /// missing).
     #[must_use]
@@ -320,7 +337,7 @@ impl CeremonyReport {
         self.seal.as_ref().is_some_and(Outcome::succeeded)
     }
 
-    /// `true` if all three key sets were created (the grants may still be
+    /// `true` if all four key sets were created (the grants may still be
     /// missing).
     #[must_use]
     pub fn key_sets_created(&self) -> bool {

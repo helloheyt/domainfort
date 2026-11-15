@@ -16,6 +16,21 @@
 //! | 2 | Allow | `DirRead` | rootDSE | any | any | the existing base (e2e `root_dse_rule`; docs/49 §5.2) |
 //! | 3 | Allow | the A3 directory actions (below) | `DirSubtree(NC root)` | `MemberOf(Tier-0 group)` | `{encrypted, sealed}` floor, internal network | docs/51 §4.3 step 6, §5.2 |
 //! | 4 | Allow | `PolicyAdmin` | every policy scope | `MemberOf(Tier-0 group)` | as 3 | docs/51 §4.3 step 6, §5.10; docs/06 §9 |
+//! | 5 | Allow | `DirControlRight(User-Change-Password)` | `DirSubtree(NC root)` | any | `{encrypted, sealed, channel_bound}` floor, internal network | task K9: docs/53 §5.6 step 4 |
+//!
+//!   **Rule 5** (task K9) is the coarse grant of kpasswd's self change:
+//!   dird asks `DirControlRight(User-Change-Password)` on the account's own
+//!   object, the Subject being that account, on transport `Kpasswd` with
+//!   `{encrypted, sealed, channel_bound}` from the internal network
+//!   (crates/directory-admin `prepare_change_password`, A-161). The rule
+//!   names no subject — layer 5 decides who: the root's PRINCIPAL_SELF ACE
+//!   grants the right only on an account's own object ([MS-ADTS]
+//!   3.1.1.3.1.5.1 "on itself"; module `descriptor`, row 11), and layer 4
+//!   (tier) applies without exception (docs/53 R53-13; Q-608 item 2, A-117).
+//!   The change-password service's AS needs no rule here: rule 1 grants
+//!   `KdcAs` on every Kerberos resource and the policy's reserved set narrows
+//!   it (pdp `change_password_as_rules`: armored only, the computer group
+//!   denied — A-151).
 //!
 //!   **Rule 1** grants exactly the Kerberos actions the phase-1 KDC asks
 //!   the PDP for — `KdcAs` on `Kerberos{Tgt}` (crates/kdc as_exchange.rs,
@@ -62,12 +77,14 @@
 //! (docs/questions/Q-590).
 //!
 //! Spec: docs/51 §4.3 step 6, §5.2, §5.10; docs/47 §6.3; docs/06 §9;
-//! docs/11 §3; A-36; A-39; A-51; A-68; A-69; A-73; A-80; crates/pdp
-//! policy.rs (the rule language), decide.rs (`desired_right`).
+//! docs/11 §3; docs/53 §5.6 step 4, §10 (K9); [MS-ADTS] 3.1.1.3.1.5.1,
+//! 6.1.1.2.7.52; A-36; A-39; A-51; A-68; A-69; A-73; A-80; A-117; A-151;
+//! A-161; crates/pdp policy.rs (the rule language), decide.rs
+//! (`desired_right`); docs/questions/Q-964 item 13.
 
 use std::collections::BTreeMap;
 
-use directory_admin::USER_FORCE_CHANGE_PASSWORD;
+use directory_admin::{USER_CHANGE_PASSWORD, USER_FORCE_CHANGE_PASSWORD};
 use dtyp::{Guid, Sid};
 use pdp::{
     Action, ActionMatch, AnonymousGrant, AuthMatch, ContextMatch, ControlRightId, Dn, Effect,
@@ -98,6 +115,9 @@ pub const RULE_TIER0_DIRECTORY: u32 = 3;
 /// Rule id of the Tier-0 policy-administration rule. Spec: docs/51 §4.3
 /// step 6, §5.10.
 pub const RULE_TIER0_POLICY: u32 = 4;
+/// Rule id of the change-password rule (task K9). Spec: docs/53 §5.6 step
+/// 4.
+pub const RULE_CHANGE_PASSWORD: u32 = 5;
 
 /// The Kerberos actions the phase-1 KDC asks the PDP for: `KdcAs` (the AS
 /// exchange, on `Kerberos{Tgt}`) and `KdcTgs` (the TGS exchange, on
@@ -128,6 +148,29 @@ const ADMIN_FLOOR: TransportSec = TransportSec {
 /// Spec: docs/11 §3; docs/51 §5.1, §5.4.
 const ADMIN_CONTEXT: ContextMatch = ContextMatch {
     min_transport: ADMIN_FLOOR,
+    src_net: Some(IpScope::Internal),
+    time_window: None,
+};
+
+/// The transport floor of the change-password rule: what dird's kpasswd PEP
+/// reports for a request whose KRB-PRIV keyd decrypted under that request's
+/// AP-REQ subkey — `{encrypted, sealed, channel_bound}` (crates/pdp
+/// `Transport::Kpasswd`; crates/directory-admin `KPASSWD_SECURITY`).
+/// Spec: docs/53 §5.4 item 1, §5.6 step 4; docs/questions/Q-601 item 7
+/// (A-117).
+const KPASSWD_FLOOR: TransportSec = TransportSec {
+    encrypted: true,
+    sealed: true,
+    channel_bound: true,
+};
+
+/// The context of the change-password rule: the floor above, the internal
+/// network (the front serves internal sources only and dird reports
+/// `src_net = Internal` for every kpasswd request — docs/53 §3.3; crates/
+/// directory-admin checks.rs).
+/// Spec: docs/53 §3.3, §5.6 step 4; docs/11 §3.
+const KPASSWD_CONTEXT: ContextMatch = ContextMatch {
+    min_transport: KPASSWD_FLOOR,
     src_net: Some(IpScope::Internal),
     time_window: None,
 };
@@ -234,6 +277,20 @@ pub(crate) fn domain_policy(input: &DomainPolicyInput) -> Result<DevelopmentPoli
             ResourceMatch::Policy { scope: None },
             SubjectMatch::MemberOf(input.tier0_group),
             ADMIN_CONTEXT,
+        ),
+        // Task K9 (module documentation, rule 5): the coarse grant of the
+        // self change; the root's PRINCIPAL_SELF ACE (layer 5) and the tier
+        // invariant (layer 4) decide.
+        allow(
+            RULE_CHANGE_PASSWORD,
+            ActionMatch::Exact(Action::DirControlRight(ControlRightId(
+                USER_CHANGE_PASSWORD,
+            ))),
+            ResourceMatch::DirSubtree {
+                base: SubtreeBase::new(input.nc_root.clone())?,
+            },
+            SubjectMatch::Any,
+            KPASSWD_CONTEXT,
         ),
     ];
     let anonymous = vec![AnonymousGrant::new(

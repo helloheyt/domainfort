@@ -101,6 +101,64 @@ fn the_service_key_sets_are_service_purpose_bound_to_class_and_host() {
     assert_eq!(admin.binding.realm.as_str(), "EXAMPLE.TEST");
 }
 
+/// Task K9 — RFC 3244 §2 ("The AP-REQ message must be for the service
+/// principal kadmin/changepw@REALM"); RFC 4120 §6.2 (SRV-INST: "the first
+/// component of a name identifies a service and the remaining components
+/// identify an instance of the service in a server-specified manner");
+/// docs/53 §5.2 (`(GUID_changepw, ChangePasswordService)`, its own purpose);
+/// docs/questions/Q-964 item 4 (the manifest names the object dird must
+/// find): the change-password service's key set is `ChangePasswordService`
+/// — the purpose the one derivation gives its name (docs/52 R2b) — bound to
+/// NT-SRV-INST [kadmin, changepw] in the manifest's realm.
+#[test]
+fn the_change_password_service_key_set_is_bound_to_kadmin_changepw() {
+    let manifest = Manifest::parse(SAMPLE.as_bytes()).unwrap();
+    let changepw = manifest.change_password_service();
+    assert_eq!(changepw.handle.purpose, KeyPurpose::ChangePasswordService);
+    assert_eq!(
+        changepw.handle.purpose,
+        KeyPurpose::of_service_name(&changepw.binding.name)
+    );
+    assert_eq!(changepw.handle.principal.as_bytes(), &guid(6).to_packet());
+    assert_eq!(changepw.binding.name.name_type, KRB_NT_SRV_INST);
+    assert_eq!(components(changepw), ["kadmin", "changepw"]);
+    assert!(keyd_types::is_change_password_service_name(
+        &changepw.binding.name
+    ));
+    assert_eq!(changepw.binding.realm.as_str(), "EXAMPLE.TEST");
+    assert_eq!(changepw.binding_text(), "NT-SRV-INST:kadmin/changepw");
+    assert_eq!(changepw.guid_text(), guid_text(6));
+    assert_eq!(keys::CHANGE_PASSWORD_SERVICE, "change_password_service");
+}
+
+/// docs/51 §5.2 row 9 (the provisioned service objects are protected) and
+/// docs/questions/Q-975: `service_objects` lists every service object of the
+/// manifest — the LDAP, admin and change-password ones, in key-table order —
+/// and nothing else (not krbtgt, not a first administrator).
+#[test]
+fn service_objects_lists_every_service_object() {
+    let manifest = Manifest::parse(SAMPLE.as_bytes()).unwrap();
+    let listed: Vec<&provision_manifest::KeySet> = manifest.service_objects().to_vec();
+    assert_eq!(
+        listed,
+        [
+            manifest.ldap_service(),
+            manifest.admin_service(),
+            manifest.change_password_service()
+        ]
+    );
+    let purposes: Vec<KeyPurpose> = listed.iter().map(|k| k.handle.purpose).collect();
+    assert_eq!(
+        purposes,
+        [
+            KeyPurpose::Service,
+            KeyPurpose::AdminService,
+            KeyPurpose::ChangePasswordService
+        ]
+    );
+    assert!(!listed.contains(&manifest.krbtgt()));
+}
+
 /// docs/51 §4.3 step 12 (`set_secret((GUID, PrincipalLongterm), binding
 /// NT-PRINCIPAL [sAMAccountName], …)`); docs/47 §9.1 (user row).
 #[test]

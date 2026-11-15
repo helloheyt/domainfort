@@ -15,7 +15,8 @@
 //!    creator).
 //! 2. For each planned object, in order, `Provisioning::create` with its
 //!    named exception, if any ([`exception_of`]: the NC root, krbtgt, the DC
-//!    account, the two service objects) — every other object (the OUs, the
+//!    account, the three service objects — LDAP, admin and, since task K9,
+//!    change-password) — every other object (the OUs, the
 //!    first administrators, the Tier-0 group with its members, the bootstrap
 //!    group) is checked exactly as the online PEP's writes are: the
 //!    [MS-SAMR] constraints and name rules (A-79), the membership rules,
@@ -116,6 +117,9 @@ pub(crate) fn exception_of(role: ObjectRole) -> Option<ProvisioningRole> {
         // The only object that may carry the admin service's name (docs/52
         // R2b follow-up; docs/questions/Q-541).
         ObjectRole::AdminService => Some(ProvisioningRole::AdminServiceObject),
+        // Task K9: the only object that may carry `kadmin/changepw` (RFC 3244
+        // §2; docs/53 §5.2; docs/questions/Q-972).
+        ObjectRole::ChangePasswordService => Some(ProvisioningRole::ChangePasswordServiceObject),
         ObjectRole::Tier0Ou
         | ObjectRole::WorkstationsOu
         | ObjectRole::FirstAdmin(_)

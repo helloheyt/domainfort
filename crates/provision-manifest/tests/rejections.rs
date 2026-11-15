@@ -43,7 +43,7 @@ fn a_duplicate_key_is_rejected() {
     let err = error(&text);
     assert_eq!(err.kind(), ErrorKind::DuplicateKey);
     assert_eq!(err.key(), Some(keys::REALM));
-    assert_eq!(err.line(), Some(12));
+    assert_eq!(err.line(), Some(13));
 }
 
 /// docs/50 R50-15 ("a closed key table"), §7.1 ("unknown key ⇒ refuse").
@@ -53,15 +53,17 @@ fn an_unknown_key_is_rejected() {
     let err = error(&text);
     assert_eq!(err.kind(), ErrorKind::UnknownKey);
     assert_eq!(err.key(), None);
-    assert_eq!(err.line(), Some(12));
+    assert_eq!(err.line(), Some(13));
 }
 
 /// docs/50 §7.1 ("missing-required ⇒ refuse"): every manifest key is
 /// required — `first_admin_salts` too (A-105, the follow-up of
-/// docs/questions/Q-473 item 2).
+/// docs/questions/Q-473 item 2), and `change_password_service` (task K9: a
+/// manifest from before it does not parse — fail closed).
 #[test]
 fn every_missing_key_is_rejected() {
     assert!(Manifest::KEYS.contains(&keys::FIRST_ADMIN_SALTS));
+    assert!(Manifest::KEYS.contains(&keys::CHANGE_PASSWORD_SERVICE));
     for key in Manifest::KEYS {
         let err = error(&remove(SAMPLE, key));
         assert_eq!(err.kind(), ErrorKind::MissingKey, "{key}");
@@ -146,7 +148,7 @@ fn oversize_inputs_are_rejected() {
     let long = format!("{SAMPLE}#{}\n", "x".repeat(MAX_LINE_OCTETS));
     let err = error(&long);
     assert_eq!(err.kind(), ErrorKind::LineTooLong);
-    assert_eq!(err.line(), Some(12));
+    assert_eq!(err.line(), Some(13));
 
     let many = SAMPLE.to_owned() + &"\n".repeat(MAX_LINES);
     assert_eq!(error(&many).kind(), ErrorKind::TooManyLines);
@@ -304,7 +306,32 @@ fn a_binding_other_than_the_fixed_one_is_rejected() {
     let g1 = common::guid_text(1);
     let g2 = common::guid_text(2);
     let g3 = common::guid_text(3);
+    let g6 = common::guid_text(6);
     for (key, value) in [
+        // Task K9 (RFC 3244 §2; RFC 4120 §6.2; docs/53 §5.2): the
+        // change-password service's binding is exactly NT-SRV-INST
+        // [kadmin, changepw] — no host instance, no other case, no third
+        // component, no other name-type label.
+        (
+            keys::CHANGE_PASSWORD_SERVICE,
+            format!("{g6}:NT-SRV-INST:kadmin/dc1.example.test"),
+        ),
+        (
+            keys::CHANGE_PASSWORD_SERVICE,
+            format!("{g6}:NT-SRV-HST:kadmin/changepw"),
+        ),
+        (
+            keys::CHANGE_PASSWORD_SERVICE,
+            format!("{g6}:NT-SRV-INST:KADMIN/changepw"),
+        ),
+        (
+            keys::CHANGE_PASSWORD_SERVICE,
+            format!("{g6}:NT-SRV-INST:kadmin/changepw/x"),
+        ),
+        (
+            keys::CHANGE_PASSWORD_SERVICE,
+            format!("{g6}:NT-SRV-HST:admind/dc1.example.test"),
+        ),
         (keys::KRBTGT, format!("{g1}:NT-SRV-INST:krbtgt/OTHER.TEST")),
         (keys::KRBTGT, format!("{g1}:NT-SRV-HST:krbtgt/EXAMPLE.TEST")),
         (keys::KRBTGT, format!("{g1}:NT-SRV-INST:krbtgt")),
@@ -364,6 +391,13 @@ fn a_guid_used_twice_is_rejected() {
     rejects(
         keys::FIRST_ADMINS,
         &format!("{g4}:NT-PRINCIPAL:alice, {g4}:NT-PRINCIPAL:bob"),
+        ErrorKind::DuplicateGuid,
+    );
+    // Task K9: the change-password service object's GUID is another
+    // object's (the admin service's).
+    rejects(
+        keys::CHANGE_PASSWORD_SERVICE,
+        &format!("{g3}:NT-SRV-INST:kadmin/changepw"),
         ErrorKind::DuplicateGuid,
     );
 }

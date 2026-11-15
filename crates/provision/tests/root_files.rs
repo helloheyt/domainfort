@@ -43,6 +43,7 @@ dc_fqdn = dc1.example.test
 krbtgt = 00000000-0000-0000-0000-000000000001:NT-SRV-INST:krbtgt/EXAMPLE.TEST
 ldap_service = 00000000-0000-0000-0000-000000000002:NT-SRV-HST:ldap/dc1.example.test
 admin_service = 00000000-0000-0000-0000-000000000003:NT-SRV-HST:admind/dc1.example.test
+change_password_service = 00000000-0000-0000-0000-000000000006:NT-SRV-INST:kadmin/changepw
 first_admins = 00000000-0000-0000-0000-000000000004:NT-PRINCIPAL:alice, 00000000-0000-0000-0000-000000000005:NT-PRINCIPAL:bob
 first_admin_salts = salt-a, salt-b
 ";

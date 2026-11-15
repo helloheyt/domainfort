@@ -22,13 +22,24 @@
 //! CSPRNG's 16 octets), or are fixed in range ([`ADMIN_TICKET_AGE_MAX_SECS`],
 //! [`ADMIN_QUORUM`]).
 //!
+//! Task K9 adds the two network fronts' files — kpasswd-front's (docs/53
+//! §3.3, §10 K8/K9) and dnsd's (docs/54 §4.3, §10 DN13, its front part) —,
+//! dird's kpasswd channel (`dird_kpasswd_socket` + `kpasswd_front_uid`,
+//! docs/53 §5.6 step 1; Q-955 item 13; Q-964 item 12) and the two fronts in
+//! auditd's `uid_sources` (`kpasswd-front`, `dnsd` — A-160, Q-960 item 6).
+//! Neither front is mapped in keyd (docs/53 R53-4: the front has no keyd
+//! channel; docs/54 §4.3: dnsd is not mapped in keyd).
+//!
 //! Spec: docs/51 §4.3 step 7, §4.6, §5.5 (R51-10), §5.6 (R51-11); docs/50
-//! R50-15, §2.4, §3.1, §3.2, §7.1, R50-18; A-60; A-68; A-73 (keyd's
-//! `uid_roles`); P-22 (the quorum); Q-270 items 1-2; docs/questions/Q-378.
+//! R50-15, §2.4, §3.1, §3.2, §7.1, R50-18; docs/53 R53-3, R53-4, §3.3,
+//! §5.6, §5.7, §9; docs/54 §4.3, §4.6, §4.7, §9; A-60; A-68; A-73 (keyd's
+//! `uid_roles`); A-117; A-119; A-160; A-161; P-22 (the quorum); Q-270 items
+//! 1-2; docs/questions/Q-378, Q-955 item 13, Q-960 item 6, Q-964 items 12-13,
+//! Q-973.
 
 use config::{
-    AdmindSettings, AuditdSettings, DirdSettings, KdcSettings, KeyadmSettings, KeydSettings,
-    LdapFrontSettings,
+    AdmindSettings, AuditdSettings, DirdSettings, DnsdSettings, KdcSettings, KeyadmSettings,
+    KeydSettings, KpasswdFrontSettings, LdapFrontSettings,
 };
 use dirstore::NodeId;
 
@@ -47,6 +58,12 @@ pub const DIRD_ADMIN_CHANNEL_KEYS: [&str; 7] = [
     // Task A16: where dird writes `policy.next` (docs/51 §5.10).
     "policy_next_path",
 ];
+
+/// dird's kpasswd-channel keys (task K7, docs/53 §5.6 step 1; Q-955 item
+/// 13; Q-964 item 12), emitted in dird's file (task K9) — beside the admin
+/// channel, which the kpasswd service shares (docs/53 §5.6 step 4).
+/// Spec: docs/53 §5.6; docs/questions/Q-964 items 12-13.
+pub const DIRD_KPASSWD_CHANNEL_KEYS: [&str; 2] = ["dird_kpasswd_socket", "kpasswd_front_uid"];
 
 /// dird's `admin_ticket_age_max`, in seconds: ten minutes. A ticket whose
 /// age (`now − authtime`) is above it is refused for an admin operation.
@@ -101,11 +118,15 @@ pub enum Daemon {
     Admind,
     /// keyadm (a tool, not a daemon).
     Keyadm,
+    /// kpasswd-front (task K9; docs/53 R53-4).
+    KpasswdFront,
+    /// dnsd (task K9 / DN13's front part; docs/54 §4.3).
+    Dnsd,
 }
 
 impl Daemon {
     /// Every configuration file, in the order they are staged and installed.
-    pub const ALL: [Daemon; 7] = [
+    pub const ALL: [Daemon; 9] = [
         Daemon::Keyd,
         Daemon::Dird,
         Daemon::Kdc,
@@ -113,6 +134,8 @@ impl Daemon {
         Daemon::Auditd,
         Daemon::Admind,
         Daemon::Keyadm,
+        Daemon::KpasswdFront,
+        Daemon::Dnsd,
     ];
 
     /// The process name (docs/50 §2.4), printable ASCII.
@@ -126,6 +149,8 @@ impl Daemon {
             Daemon::Auditd => "auditd",
             Daemon::Admind => "admind",
             Daemon::Keyadm => "keyadm",
+            Daemon::KpasswdFront => "kpasswd-front",
+            Daemon::Dnsd => "dnsd",
         }
     }
 }
@@ -181,6 +206,8 @@ impl ConfigFile {
             Daemon::Auditd => AuditdSettings::parse(self.text().as_bytes()).map(drop),
             Daemon::Admind => AdmindSettings::parse(self.text().as_bytes()).map(drop),
             Daemon::Keyadm => KeyadmSettings::parse(self.text().as_bytes()).map(drop),
+            Daemon::KpasswdFront => KpasswdFrontSettings::parse(self.text().as_bytes()).map(drop),
+            Daemon::Dnsd => DnsdSettings::parse(self.text().as_bytes()).map(drop),
         }
     }
 }
@@ -221,8 +248,20 @@ fn list(items: &[String]) -> String {
 ///   `policy_next_path` = `--policy-next-path`).
 /// - kdc, ldap-front: their sockets, peers, policy (kdc), the operator's
 ///   certificate and key paths (ldap-front, R50-12).
+/// - dird (task K9): the kpasswd channel ([`DIRD_KPASSWD_CHANNEL_KEYS`]:
+///   `dird_kpasswd_socket` + `kpasswd_front_uid`, the front's uid — docs/53
+///   §5.6 step 1).
 /// - auditd: `uid_sources` = every daemon's uid with its source name
-///   (docs/50 §3.2).
+///   (docs/50 §3.2) — the two fronts too since task K9 (`kpasswd-front`,
+///   `dnsd`; A-160, Q-960 item 6).
+/// - kpasswd-front (task K9): its account, its TCP 464 listeners inside the
+///   internal networks, the realm of its KRB-ERRORs, dird's
+///   `dird-kpasswd.sock` and uid, auditd's socket and uid (docs/53 R53-3,
+///   §3.3, §5.7); the limits keep the schema's defaults (docs/53 §5.1).
+/// - dnsd (task K9 / DN13's front part): its account, its listeners inside
+///   the internal networks, dird's `dird-dns.sock` and uid, auditd's socket
+///   and uid (docs/54 §4.3, §4.6, §4.7); the limits keep the schema's
+///   defaults (docs/54 §6.7).
 /// - admind: `admin_socket_group` (docs/51 §4.6), `min_password_length` =
 ///   [`MIN_PASSWORD_LENGTH`] (A-79 / P-24; required by admind's schema since
 ///   task A9). No `keyadm_uid`: admind forwards nothing for keyadm since
@@ -232,7 +271,9 @@ fn list(items: &[String]) -> String {
 ///   the `admin_socket` + `admind_uid` pair of A-97 is gone.
 ///
 /// Spec: docs/51 §4.3 step 7, §4.6, §6; docs/50 §2.4, §3.1, §3.2, §7.1;
-/// A-60; A-68; A-73; A-97; docs/52 §4.6 (A-102).
+/// docs/53 R53-3, §3.3, §5.6, §5.7; docs/54 §4.3, §4.6, §4.7; A-60; A-68;
+/// A-73; A-97; A-117; A-160; docs/52 §4.6 (A-102); docs/questions/Q-960
+/// item 6, Q-964 items 12-13.
 #[must_use]
 pub fn domain_configs(input: &DomainInput, node_id: &NodeId) -> Vec<ConfigFile> {
     let a = &input.accounts;
@@ -300,6 +341,11 @@ pub fn domain_configs(input: &DomainInput, node_id: &NodeId) -> Vec<ConfigFile> 
         // Task A16: the online policy change's `policy.next` (dird prepares
         // its directory; root's activation reads this same key).
         ("policy_next_path", path(&p.policy_next)),
+        // Task K9: the kpasswd channel (docs/53 §5.6 step 1: the peer on
+        // `dird-kpasswd.sock` is the front's uid only) — beside the admin
+        // channel, whose settings the kpasswd service shares (§5.6 step 4).
+        ("dird_kpasswd_socket", path(&p.dird_kpasswd_socket)),
+        ("kpasswd_front_uid", id(a.kpasswd_front.uid)),
     ]);
     let mut kdc = vec![
         ("run_as_uid", id(a.kdc.uid)),
@@ -349,9 +395,17 @@ pub fn domain_configs(input: &DomainInput, node_id: &NodeId) -> Vec<ConfigFile> 
         ("audit_log_path", path(&p.audit_log)),
         (
             "uid_sources",
+            // Task K9: the two fronts too — the source is set from the uid
+            // only (docs/50 §3.2; A-160: `dnsd` = 7, `kpasswd-front` = 8).
             format!(
-                "{}:keyd, {}:dird, {}:kdc, {}:ldap-front, {}:admind",
-                a.keyd.uid, a.dird.uid, a.kdc.uid, a.ldap_front.uid, a.admind.uid
+                "{}:keyd, {}:dird, {}:kdc, {}:ldap-front, {}:admind, {}:dnsd, {}:kpasswd-front",
+                a.keyd.uid,
+                a.dird.uid,
+                a.kdc.uid,
+                a.ldap_front.uid,
+                a.admind.uid,
+                a.dnsd.uid,
+                a.kpasswd_front.uid
             ),
         ),
     ];
@@ -374,6 +428,36 @@ pub fn domain_configs(input: &DomainInput, node_id: &NodeId) -> Vec<ConfigFile> 
         ("keyd_socket", path(&p.keyd_socket)),
         ("keyd_uid", id(a.keyd.uid)),
     ];
+    // Task K9 — kpasswd-front: TCP 464 only, every listener inside the
+    // internal networks (docs/53 R53-3, §3.3; A-117), the realm its
+    // KRB-ERRORs name (docs/53 §5.7; dird's realm, Q-955 item 4), dird's
+    // `dird-kpasswd.sock` and uid, auditd. No key, no keyd (R53-4).
+    let kpasswd_front = vec![
+        ("run_as_uid", id(a.kpasswd_front.uid)),
+        ("run_as_gid", id(a.kpasswd_front.gid)),
+        ("listen", list(&n.kpasswd_listen)),
+        ("internal_networks", list(&n.internal_networks)),
+        ("realm", input.realm.clone()),
+        ("dird_kpasswd_socket", path(&p.dird_kpasswd_socket)),
+        ("dird_uid", id(a.dird.uid)),
+        ("audit_socket", path(&p.audit_socket)),
+        ("auditd_uid", id(a.auditd.uid)),
+    ];
+    // Task K9 / DN13's front part — dnsd: every listener inside the internal
+    // networks (docs/54 §4.7; A-114), dird's `dird-dns.sock` and uid (docs/54
+    // §4.6 — dird serves it from task DN10 on; until then dnsd stops at its
+    // dird check, fail closed, docs/54 §4.8), auditd. No key, not in keyd
+    // (docs/54 §4.3).
+    let dnsd = vec![
+        ("run_as_uid", id(a.dnsd.uid)),
+        ("run_as_gid", id(a.dnsd.gid)),
+        ("listen", list(&n.dnsd_listen)),
+        ("internal_networks", list(&n.internal_networks)),
+        ("dird_dns_socket", path(&p.dird_dns_socket)),
+        ("dird_uid", id(a.dird.uid)),
+        ("audit_socket", path(&p.audit_socket)),
+        ("auditd_uid", id(a.auditd.uid)),
+    ];
     let file = |daemon, path: &FilePath, lines| ConfigFile {
         daemon,
         path: path.clone(),
@@ -387,5 +471,7 @@ pub fn domain_configs(input: &DomainInput, node_id: &NodeId) -> Vec<ConfigFile> 
         file(Daemon::Auditd, &p.auditd_config, auditd),
         file(Daemon::Admind, &p.admind_config, admind),
         file(Daemon::Keyadm, &p.keyadm_config, keyadm),
+        file(Daemon::KpasswdFront, &p.kpasswd_front_config, kpasswd_front),
+        file(Daemon::Dnsd, &p.dnsd_config, dnsd),
     ]
 }

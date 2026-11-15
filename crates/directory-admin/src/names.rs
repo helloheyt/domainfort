@@ -153,13 +153,15 @@ pub fn dns_host_name_ok(name: &str) -> bool {
 /// §1.3 (R47-1); docs/51 §5.2 row 2 (one SPN, host in lower case);
 /// docs/46 §5.4.
 ///
-/// And never a name from which the admin service's key-set purpose derives
-/// ([`spn_derives_admin_service`]): `admind/<host>` is reserved for the
+/// And never a name from which a reserved key-set purpose derives
+/// ([`reserved_purpose_of_spn`]): `admind/<host>` is reserved for the
 /// admin service object (`admin_service_spn_ok`, its provisioning
 /// exception) as `krbtgt` is for the TGS (docs/52 R2b follow-up;
-/// docs/questions/Q-541 item 7).
+/// docs/questions/Q-541 item 7), and `kadmin/changepw` for the
+/// change-password service object (`change_password_service_spn_ok`, task
+/// K9 — docs/questions/Q-972).
 pub fn spn_ok(spn: &str, dns_host_name: &str) -> bool {
-    spn_shape_ok(spn, dns_host_name) && !spn_derives_admin_service(spn)
+    spn_shape_ok(spn, dns_host_name) && reserved_purpose_of_spn(spn).is_none()
 }
 
 /// The admin service object's servicePrincipalName (A-73: `admind/<host>`):
@@ -181,20 +183,69 @@ pub fn admin_service_spn_ok(spn: &str, dns_host_name: &str) -> bool {
 /// Spec: docs/52 R2b; docs/questions/Q-491 item 1, Q-541; RFC 4120 §6.2
 /// (the name-type a hint only).
 pub(crate) fn spn_derives_admin_service(spn: &str) -> bool {
-    principal_name(KRB_NT_SRV_HST, &spn_components(spn))
-        .is_some_and(|name| KeyPurpose::of_service_name(&name) == KeyPurpose::AdminService)
+    matches!(reserved_purpose_of_spn(spn), Some(purpose) if purpose == KeyPurpose::AdminService)
 }
 
-/// `true` if the one-component client name `sam` (the sAMAccountName as the
-/// KDC's account source looks it up — docs/47 §1.3, R47-1) derives the
-/// admin service's key set by the same derivation. With the rule of
-/// Q-491 item 1 (exactly two components) it never does; asked anyway, so
-/// that every principal name an object forms goes through the one
+/// The change-password service object's servicePrincipalName (task K9):
+/// exactly the name from which the `ChangePasswordService` key-set purpose
+/// derives by the one derivation — `kadmin/changepw` (RFC 3244 §2: "the
+/// service principal kadmin/changepw@REALM"; keyd-types
+/// `is_change_password_service_name`). Its second component is a fixed
+/// instance, not a host (RFC 4120 §6.2: NT-SRV-INST, "Service and other
+/// unique instance"), so the host rule of [`spn_ok`] does not apply; the
+/// value is still printable ASCII within the SPN bound. Only the
+/// provisioning exception of the change-password service object may carry
+/// it (crate::invariants, `ProvisioningRole::ChangePasswordServiceObject`).
+/// Spec: RFC 3244 §2; RFC 4120 §6.2; docs/53 R53-6, §5.2, §10 (K9);
+/// docs/52 R2b; docs/questions/Q-964 item 13, Q-972.
+pub(crate) fn change_password_service_spn_ok(spn: &str) -> bool {
+    !spn.is_empty()
+        && spn.len() <= MAX_PRINCIPAL_NAME_CHARS
+        && printable_ascii(spn)
+        && matches!(
+            reserved_purpose_of_spn(spn),
+            Some(purpose) if purpose == KeyPurpose::ChangePasswordService
+        )
+}
+
+/// The reserved key-set purpose the principal name an SPN forms (its
+/// components split on "/", the name-type a hint only — RFC 4120 §6.2)
+/// derives by the one derivation, `keyd_types::KeyPurpose::of_service_name`
+/// — `None` for a plain service (`Service`). A reserved purpose's name
+/// belongs to one provisioned object only (crate::invariants), so every
+/// purpose but `Service` is reserved here; the match is exhaustive, so a
+/// purpose added to keyd-types later is reserved until a provisioning claim
+/// is written for it (fail closed). A value that cannot form a name derives
+/// nothing; [`spn_ok`] refuses it anyway (printable ASCII).
+/// Spec: docs/52 R2b (one derivation), §6.1 class closure; docs/questions/
+/// Q-491 item 1, Q-541, Q-972; RFC 4120 §6.2.
+pub(crate) fn reserved_purpose_of_spn(spn: &str) -> Option<KeyPurpose> {
+    let name = principal_name(KRB_NT_SRV_HST, &spn_components(spn))?;
+    match KeyPurpose::of_service_name(&name) {
+        KeyPurpose::Service => None,
+        reserved @ (KeyPurpose::AdminService
+        | KeyPurpose::ChangePasswordService
+        | KeyPurpose::PrincipalLongterm
+        | KeyPurpose::Krbtgt) => Some(reserved),
+    }
+}
+
+/// The reserved key-set purpose the one-component client name `sam` (the
+/// sAMAccountName as the KDC's account source looks it up — docs/47 §1.3,
+/// R47-1) derives by the same derivation, `None` for none. With the rules of
+/// Q-491 item 1 and RFC 3244 §2 (two components each) it never does; asked
+/// anyway, so that every principal name an object forms goes through the one
 /// derivation (docs/questions/Q-541).
-/// Spec: docs/47 §1.3; docs/52 R2b; docs/questions/Q-541.
-pub(crate) fn client_name_derives_admin_service(sam: &str) -> bool {
-    principal_name(KRB_NT_PRINCIPAL, &[sam])
-        .is_some_and(|name| KeyPurpose::of_service_name(&name) == KeyPurpose::AdminService)
+/// Spec: docs/47 §1.3; docs/52 R2b; docs/questions/Q-541, Q-972.
+pub(crate) fn reserved_purpose_of_client_name(sam: &str) -> Option<KeyPurpose> {
+    let name = principal_name(KRB_NT_PRINCIPAL, &[sam])?;
+    match KeyPurpose::of_service_name(&name) {
+        KeyPurpose::Service => None,
+        reserved @ (KeyPurpose::AdminService
+        | KeyPurpose::ChangePasswordService
+        | KeyPurpose::PrincipalLongterm
+        | KeyPurpose::Krbtgt) => Some(reserved),
+    }
 }
 
 /// The principal name of `components`, if each is a KerberosString.
@@ -309,7 +360,39 @@ mod tests {
         assert!(spn_ok("ldap/ws01.example.test", host));
         assert!(spn_ok("ADMIND/ws01.example.test", host));
         assert!(!spn_derives_admin_service("ADMIND/ws01.example.test"));
-        assert!(!client_name_derives_admin_service("admind"));
-        assert!(!client_name_derives_admin_service("ws01$"));
+        assert_eq!(reserved_purpose_of_client_name("admind"), None);
+        assert_eq!(reserved_purpose_of_client_name("ws01$"), None);
+    }
+
+    /// Task K9 (docs/53 §5.2, §10; RFC 3244 §2 "the service principal
+    /// kadmin/changepw@REALM"; docs/questions/Q-972): the change-password
+    /// service's name is reserved like the admin service's — refused by
+    /// `spn_ok` even on an object whose dNSHostName is "changepw" (the only
+    /// host for which its shape would pass), accepted only by
+    /// `change_password_service_spn_ok`, which does not apply the host rule
+    /// (its second component is a fixed instance, RFC 4120 §6.2 NT-SRV-INST);
+    /// a case variant, a third component and other classes are not the name.
+    #[test]
+    fn the_change_password_service_name_is_reserved() {
+        assert!(!spn_ok("kadmin/changepw", "changepw"));
+        assert_eq!(
+            reserved_purpose_of_spn("kadmin/changepw"),
+            Some(KeyPurpose::ChangePasswordService)
+        );
+        assert!(change_password_service_spn_ok("kadmin/changepw"));
+        assert!(!change_password_service_spn_ok("kadmin/changepw/x"));
+        assert!(!change_password_service_spn_ok("KADMIN/changepw"));
+        assert!(!change_password_service_spn_ok("kadmin/ws01.example.test"));
+        assert!(!change_password_service_spn_ok("admind/ws01.example.test"));
+        assert!(!change_password_service_spn_ok(""));
+        assert_eq!(reserved_purpose_of_spn("kadmin/ws01.example.test"), None);
+        assert!(spn_ok("kadmin/ws01.example.test", "ws01.example.test"));
+        assert!(spn_ok("KADMIN/changepw", "changepw"));
+        assert_eq!(
+            reserved_purpose_of_spn("admind/ws01.example.test"),
+            Some(KeyPurpose::AdminService)
+        );
+        assert_eq!(reserved_purpose_of_spn("ldap/ws01.example.test"), None);
+        assert_eq!(reserved_purpose_of_client_name("changepw-svc$"), None);
     }
 }

@@ -36,6 +36,10 @@ fn args(input: &provision::DomainInput) -> Vec<String> {
         "--admin-service-name",
         input.names.admin_service_name.clone(),
     );
+    push(
+        "--change-password-service-name",
+        input.names.change_password_service_name.clone(),
+    );
     push("--tier0-ou", input.names.tier0_ou.clone());
     push("--tier0-group", input.names.tier0_group.clone());
     push("--bootstrap-group", input.names.bootstrap_group.clone());
@@ -49,6 +53,8 @@ fn args(input: &provision::DomainInput) -> Vec<String> {
     push("--ldap-front-account", account(a.ldap_front));
     push("--auditd-account", account(a.auditd));
     push("--admind-account", account(a.admind));
+    push("--kpasswd-front-account", account(a.kpasswd_front));
+    push("--dnsd-account", account(a.dnsd));
     push("--keyadm-uid", a.keyadm_uid.to_string());
     push("--admin-socket-group", a.admin_socket_group.to_string());
     for (flag, path) in [
@@ -65,10 +71,14 @@ fn args(input: &provision::DomainInput) -> Vec<String> {
         ("--auditd-config", &p.auditd_config),
         ("--admind-config", &p.admind_config),
         ("--keyadm-config", &p.keyadm_config),
+        ("--kpasswd-front-config", &p.kpasswd_front_config),
+        ("--dnsd-config", &p.dnsd_config),
         ("--keyd-socket", &p.keyd_socket),
         ("--dird-kdc-socket", &p.dird_kdc_socket),
         ("--dird-ldap-socket", &p.dird_ldap_socket),
         ("--dird-admin-socket", &p.dird_admin_socket),
+        ("--dird-kpasswd-socket", &p.dird_kpasswd_socket),
+        ("--dird-dns-socket", &p.dird_dns_socket),
         ("--audit-socket", &p.audit_socket),
         ("--admin-socket", &p.admin_socket),
         ("--tls-certificate-path", &p.tls_certificate),
@@ -79,6 +89,8 @@ fn args(input: &provision::DomainInput) -> Vec<String> {
     }
     push("--kdc-listen", input.network.kdc_listen[0].clone());
     push("--ldaps-listen", input.network.ldaps_listen[0].clone());
+    push("--kpasswd-listen", input.network.kpasswd_listen[0].clone());
+    push("--dnsd-listen", input.network.dnsd_listen[0].clone());
     for network in &input.network.internal_networks {
         push("--internal-network", network.clone());
     }

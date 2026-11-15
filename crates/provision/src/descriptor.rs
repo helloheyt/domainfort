@@ -10,7 +10,7 @@
 //! - Control = SR | DP: self-relative, DACL present ([MS-DTYP] 2.4.6); no
 //!   SACL (phase 1 has no SACL writer, Q-336 item 6).
 //! - DACL, AclRevision = ACL_REVISION_DS (0x04 — object ACEs, [MS-DTYP]
-//!   2.4.5), every ACE an **allow for the Tier-0 group** with AceFlags =
+//!   2.4.5), every ACE but row 11 an **allow for the Tier-0 group** with AceFlags =
 //!   CONTAINER_INHERIT_ACE only ([MS-DTYP] 2.4.4.1: "Child objects that are
 //!   containers … inherit the ACE as an effective ACE. The inherited ACE is
 //!   inheritable" — and every directory object is a container for
@@ -28,6 +28,21 @@
 //! | 2-6 | ACCESS_ALLOWED_OBJECT_ACE (2.4.4.3) | CC 0x01 | the class's schemaIDGUID (user, computer, group, organizationalUnit, container) | `DirAddChild(class)` of rows 1-4 |
 //! | 7-9 | ACCESS_ALLOWED_OBJECT_ACE | WP 0x20 | the attribute's schemaIDGUID (userAccountControl, accountExpires, member) | `DirWrite(attr)` of rows 6-8 |
 //! | 10 | ACCESS_ALLOWED_OBJECT_ACE | CR 0x100 | User-Force-Change-Password (`00299570-246d-11d0-a768-00aa006e0529`, [MS-ADTS] 6.1.1.2.7.53) | `DirControlRight` of rows 5 (and CompletePasswordSet) |
+//! | 11 | ACCESS_ALLOWED_OBJECT_ACE, trustee **PRINCIPAL_SELF** (S-1-5-10), InheritedObjectType = the user class | CR 0x100 | User-Change-Password (`ab721a53-1e2f-11d0-9819-00aa0040529b`, [MS-ADTS] 6.1.1.2.7.52) | kpasswd's `ChangePassword`: the account's own `DirControlRight` (task K9, docs/53 §5.6 step 4) |
+//!
+//! **Row 11 (task K9).** [MS-ADTS] 3.1.1.3.1.5.1: for a password change the
+//! account whose password changes "MUST possess the 'User-Change-Password'
+//! control access right on itself". The grant is made once, here, to
+//! PRINCIPAL_SELF — the placeholder, in an inheritable ACE on an account
+//! object, for the account's own SID ([MS-DTYP] 2.4.2.4); [MS-ADTS] 5.1.3.3:
+//! the server replaces it with O!objectSid at the access check (crates/pdp
+//! does, [MS-DTYP] 2.5.3.1.1 SidInToken). Its InheritedObjectType
+//! is the user class's schemaIDGUID ([MS-DTYP] 2.4.4.3: present ⇒ only that
+//! type of child inherits it as effective), so the right is effective on
+//! user objects only — phase 1 changes users' passwords only (docs/53
+//! R53-1; D104 minimalism) — and passes through the OUs as an inherit-only
+//! copy (dtyp's [MS-DTYP] 2.5.3.4 computation, A-84). On the root itself it
+//! names the domain SID, which no token holds. docs/questions/Q-974.
 //!
 //! RIGHT_DS_DELETE_CHILD is not granted: pdp's `DirDelete` asks
 //! RIGHT_DELETE on the object only ("The alternative … DELETE_CHILD on the
@@ -43,14 +58,15 @@
 //! "ordered lexicographically") for an all-allow, all-explicit ACL.
 //!
 //! Spec: docs/51 §10 (R51-19); A-76 (Q-294 (a)); A-84 (Q-335, Q-336);
-//! [MS-DTYP] v20241119 2.4.2.4, 2.4.4.1, 2.4.4.2, 2.4.4.3, 2.4.5, 2.4.6;
-//! [MS-ADTS] v20261026 5.1.3.2, 6.1.3 items 1, 2.1, 5, 7, 6.1.3.1;
+//! [MS-DTYP] v20241119 2.4.2.4, 2.4.4.1, 2.4.4.2, 2.4.4.3, 2.4.5, 2.4.6,
+//! 2.5.3.1.1; [MS-ADTS] v20261026 3.1.1.3.1.5.1, 5.1.3.2, 5.1.3.3, 6.1.1.2.7.52,
+//! 6.1.3 items 1, 2.1, 5, 7, 6.1.3.1; docs/53 R53-1, §5.6 step 4, §10 (K9);
 //! crates/pdp decide.rs (`desired_right`).
 
-use directory_admin::USER_FORCE_CHANGE_PASSWORD;
+use directory_admin::{USER_CHANGE_PASSWORD, USER_FORCE_CHANGE_PASSWORD};
 use dtyp::{
     ace_flags, AccessMask, Ace, Acl, Control, Guid, MaskSidAce, ObjectAce, SecurityDescriptor, Sid,
-    ACL_REVISION_DS,
+    ACL_REVISION_DS, SECURITY_NT_AUTHORITY,
 };
 use pdp::access_check::rights::{
     RIGHT_DELETE, RIGHT_DS_CONTROL_ACCESS, RIGHT_DS_CREATE_CHILD, RIGHT_DS_LIST_CONTENTS,
@@ -72,6 +88,20 @@ pub const ROOT_OBJECT_RIGHTS: u32 = RIGHT_DS_READ_PROPERTY | RIGHT_DS_LIST_CONTE
 /// Spec: [MS-DTYP] 2.4.4.1 (CONTAINER_INHERIT_ACE 0x02); [MS-ADTS] 6.1.3
 /// item 5.3; A-84 (no INHERIT_ONLY_ACE).
 pub const ROOT_ACE_FLAGS: u8 = ace_flags::CONTAINER_INHERIT_ACE;
+
+/// The SubAuthority of the well-known SID PRINCIPAL_SELF, `S-1-5-10`.
+/// Spec: [MS-DTYP] 2.4.2.4 ("PRINCIPAL_SELF S-1-5-10"); [MS-ADTS] 5.1.3.3
+/// ("identified by the fixed SID value of S-1-5-10").
+pub const PRINCIPAL_SELF_RID: u32 = 10;
+
+/// PRINCIPAL_SELF, `S-1-5-10` (NT AUTHORITY, one SubAuthority).
+/// Spec: [MS-DTYP] 2.4.2.4.
+///
+/// # Errors
+/// `dtyp::Error` if the SID does not form (it always does — a fixed shape).
+pub(crate) fn principal_self() -> Result<Sid, dtyp::Error> {
+    Sid::new(SECURITY_NT_AUTHORITY, &[PRINCIPAL_SELF_RID])
+}
 
 /// One explicit, inheritable object ACE of the root.
 /// Spec: [MS-DTYP] 2.4.4.3 (ObjectType "identifies a property set,
@@ -123,6 +153,17 @@ pub(crate) fn domain_root_descriptor(
             USER_FORCE_CHANGE_PASSWORD,
             tier0_group,
         ),
+        // Row 11 (task K9; module documentation): User-Change-Password for
+        // PRINCIPAL_SELF, effective on user objects only.
+        // Spec: [MS-ADTS] 3.1.1.3.1.5.1, 6.1.1.2.7.52, 5.1.3.3; [MS-DTYP]
+        // 2.4.2.4, 2.4.4.3 (InheritedObjectType); docs/53 §5.6 step 4.
+        Ace::AccessAllowedObject(ObjectAce {
+            ace_flags: ROOT_ACE_FLAGS,
+            mask: AccessMask(RIGHT_DS_CONTROL_ACCESS),
+            object_type: Some(USER_CHANGE_PASSWORD),
+            inherited_object_type: Some(ids.user.guid),
+            sid: principal_self()?,
+        }),
     ];
     // [MS-ADTS] 6.1.3.1 rule 4: "ordered lexicographically (that is, based
     // on octet string comparison rules)" within the object-ACE group.

@@ -163,6 +163,8 @@ fn manifest() -> Manifest {
         krbtgt: guid(1),
         ldap_service: guid(2),
         admin_service: guid(3),
+        // Task K9: the change-password service object (docs/53 §5.2).
+        change_password_service: guid(6),
         first_admins: vec![(guid(4), "alice".to_owned()), (guid(5), "bob".to_owned())],
         first_admin_salts: vec!["test-salt-alice".to_owned(), "test-salt-bob".to_owned()],
     })
@@ -254,13 +256,15 @@ impl World {
     }
 }
 
-/// docs/51 §4.3 step 11 (`create_key` ×3 with the manifest's handles and
-/// bindings); docs/10 §7 (create_key returns the new kvno; A-35: keyd
+/// docs/51 §4.3 step 11 (`create_key` with the manifest's handles and
+/// bindings — four since task K9, the fourth the change-password service's,
+/// docs/53 §5.2); docs/10 §7 (create_key returns the new kvno; A-35: keyd
 /// chooses it — 1 for a new key set); docs/10 §10 (keyd audits each with
 /// principal, purpose and kvno); A-19 (keyd checks the binding rule at
-/// creation: a Krbtgt key bound to krbtgt/REALM, service keys not).
+/// creation: a Krbtgt key bound to krbtgt/REALM, a ChangePasswordService key
+/// to kadmin/changepw — RFC 3244 §2 —, service keys not).
 #[test]
-fn the_ceremony_creates_the_three_key_sets_with_their_bindings() {
+fn the_ceremony_creates_the_four_key_sets_with_their_bindings() {
     let Some(world) = world(Some(Role::Admin)) else {
         return;
     };
@@ -274,7 +278,8 @@ fn the_ceremony_creates_the_three_key_sets_with_their_bindings() {
         [
             (Step::Krbtgt, Kvno::INITIAL),
             (Step::LdapService, Kvno::INITIAL),
-            (Step::AdminService, Kvno::INITIAL)
+            (Step::AdminService, Kvno::INITIAL),
+            (Step::ChangePasswordService, Kvno::INITIAL)
         ]
     );
     assert_eq!(report::exit_code(&report), EXIT_COMPLETE);
@@ -285,15 +290,19 @@ fn the_ceremony_creates_the_three_key_sets_with_their_bindings() {
     );
     assert!(text.contains("binding NT-SRV-HST:ldap/dc1.example.test kvno 1"));
     assert!(text.contains("binding NT-SRV-HST:admind/dc1.example.test kvno 1"));
+    assert!(text.contains("binding NT-SRV-INST:kadmin/changepw kvno 1"));
 
-    let records = world.wait_for_create_key_records(3);
+    let records = world.wait_for_create_key_records(4);
     let expected = [
         (guid(1), KeyPurposeCode::Krbtgt),
         (guid(2), KeyPurposeCode::Service),
         // R2 (docs/52 §5 item 3): the admin service's own purpose.
         (guid(3), KeyPurposeCode::AdminService),
+        // Task K9 (docs/53 R53-6, §5.2): the change-password service's own
+        // purpose.
+        (guid(6), KeyPurposeCode::ChangePasswordService),
     ];
-    assert_eq!(records.len(), 3);
+    assert_eq!(records.len(), 4);
     for (record, (g, purpose)) in records.iter().zip(expected) {
         assert_eq!(record.principal, Some(g.to_packet()));
         assert_eq!(record.purpose, Some(purpose));
@@ -302,7 +311,7 @@ fn the_ceremony_creates_the_three_key_sets_with_their_bindings() {
         assert_eq!(record.caller_uid, world.uid);
     }
     // A-88: every change was preceded by its acknowledged intent.
-    assert_eq!(world.create_key_intents().len(), 3);
+    assert_eq!(world.create_key_intents().len(), 4);
     world.daemon.stop().unwrap();
 }
 
@@ -331,19 +340,23 @@ fn a_repeated_ceremony_fails_closed_at_the_first_key_set() {
     assert_eq!(again.created(), []);
     assert_eq!(
         again.not_attempted(),
-        [Step::LdapService, Step::AdminService]
+        [
+            Step::LdapService,
+            Step::AdminService,
+            Step::ChangePasswordService
+        ]
     );
     assert_eq!(report::exit_code(&again), EXIT_INCOMPLETE);
 
-    let records = world.wait_for_create_key_records(4);
-    assert_eq!(records.len(), 4, "nothing after the refused step");
-    let refused = &records[3];
+    let records = world.wait_for_create_key_records(5);
+    assert_eq!(records.len(), 5, "nothing after the refused step");
+    let refused = &records[4];
     assert_eq!(refused.principal, Some(guid(1).to_packet()));
     assert_eq!(refused.result, KeydOutcome::Denied);
     assert_eq!(refused.reason, KeydReason::CeremonySealed);
     assert_eq!(
         world.create_key_intents().len(),
-        3,
+        4,
         "no intent after the seal"
     );
     let text = report::render(&again, &m).join("\n");
@@ -413,7 +426,7 @@ fn the_ceremony_binds_the_manifests_salts_and_ends_sealed() {
 /// docs/50 R50-3 ("the client verifies the server's uid … before sending
 /// anything"; A-63): with a keyd_uid that is not the socket's peer uid,
 /// nothing is sent — no create_key is attempted, and a ceremony with the
-/// right uid afterwards creates all three key sets (so none existed).
+/// right uid afterwards creates all four key sets (so none existed).
 #[test]
 fn a_wrong_peer_uid_is_refused_before_anything_is_sent() {
     let Some(world) = world(Some(Role::Admin)) else {
@@ -708,7 +721,7 @@ fn a_create_key_keyd_never_answers_is_reported_as_outcome_unknown() {
 }
 
 /// Task A15a (docs/51 §4.3 steps 11-12, §5.8 option (b); docs/questions/
-/// Q-451): after the three key sets the ceremony grants each first
+/// Q-451): after the four key sets the ceremony grants each first
 /// administrator's initial secret — one `grant_set_secret` per
 /// administrator, in the manifest's order, by Role::Admin, each an
 /// acknowledged intent then keyd's success, naming the administrator's

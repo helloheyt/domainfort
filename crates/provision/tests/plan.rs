@@ -19,19 +19,26 @@ use ad_schema::flags::user_account_control::{
     ADS_UF_ACCOUNT_DISABLE, ADS_UF_NORMAL_ACCOUNT, ADS_UF_SERVER_TRUST_ACCOUNT,
     ADS_UF_WORKSTATION_TRUST_ACCOUNT,
 };
-use directory_admin::{new_object_descriptor, ACCOUNT_EXPIRES_NEVER, USER_FORCE_CHANGE_PASSWORD};
+use directory_admin::{
+    new_object_descriptor, ACCOUNT_EXPIRES_NEVER, USER_CHANGE_PASSWORD, USER_FORCE_CHANGE_PASSWORD,
+};
 use dtyp::{ace_flags, Ace, Sid, ACL_REVISION_DS, SECURITY_NT_AUTHORITY};
 use pdp::access_check::rights::{
     RIGHT_DELETE, RIGHT_DS_CONTROL_ACCESS, RIGHT_DS_CREATE_CHILD, RIGHT_DS_LIST_CONTENTS,
     RIGHT_DS_READ_PROPERTY, RIGHT_DS_WRITE_PROPERTY,
 };
-use pdp::{Action, ActionClass, ActionMatch, ResourceMatch, SubjectMatch, Tier};
+use pdp::{
+    Action, ActionClass, ActionMatch, ControlRightId, IpScope, ResourceMatch, SubjectMatch, Tier,
+    TransportSec,
+};
 use provision::input::InputErrorKind;
 use provision::plan::{
     CHANGE_SEQ_END_EXCLUSIVE, CHANGE_SEQ_FIRST, DOMAIN_USER_RID_KRBTGT, PROVISIONED_GROUP_TYPE,
     SECURITY_NT_NON_UNIQUE,
 };
-use provision::{ObjectRole, Plan, PlanError, RidSource, DIRD_ADMIN_CHANNEL_KEYS};
+use provision::{
+    ObjectRole, Plan, PlanError, RidSource, DIRD_ADMIN_CHANNEL_KEYS, PRINCIPAL_SELF_RID,
+};
 use provision_manifest::Manifest;
 
 fn plan(input: &provision::DomainInput) -> Plan {
@@ -106,6 +113,7 @@ fn the_object_table_is_docs_51_step_5() {
             ObjectRole::DcComputer,
             ObjectRole::LdapService,
             ObjectRole::AdminService,
+            ObjectRole::ChangePasswordService,
             ObjectRole::FirstAdmin(0),
             ObjectRole::FirstAdmin(1),
             ObjectRole::Tier0Group,
@@ -174,13 +182,37 @@ fn the_object_table_is_docs_51_step_5() {
         Some(&b"admind/dc1.example.test"[..])
     );
     assert_eq!(value(admin, "sAMAccountName"), Some(&b"adminsvc$"[..]));
+    // Task K9 — the change-password service object (RFC 3244 §2; docs/53
+    // §5.2): WT, the DC's dNSHostName, its one SPN `kadmin/changepw`, no
+    // pwdLastSet (its key comes from the ceremony), counter RID 1104.
+    let changepw = p.object(ObjectRole::ChangePasswordService).unwrap();
+    assert_eq!(changepw.class_name, "computer");
+    assert_eq!(changepw.parent, Some(tier0.guid));
+    assert_eq!(changepw.rid, RidSource::Counter(1104));
+    assert_eq!(
+        flags(changepw, "userAccountControl"),
+        ADS_UF_WORKSTATION_TRUST_ACCOUNT
+    );
+    assert_eq!(
+        value(changepw, "servicePrincipalName"),
+        Some(&b"kadmin/changepw"[..])
+    );
+    assert_eq!(
+        value(changepw, "sAMAccountName"),
+        Some(&b"changepwsvc$"[..])
+    );
+    assert_eq!(
+        value(changepw, "dNSHostName"),
+        Some(&b"dc1.example.test"[..])
+    );
+    assert_eq!(value(changepw, "pwdLastSet"), None);
     // The first administrators: N enabled (no D), pwdLastSet = the
     // provisioning time (FILETIME), accountExpires never.
     let expected_pwd = directory_admin::filetime(&now()).unwrap();
     for (i, name) in ["alice", "bob"].iter().enumerate() {
         let a = p.object(ObjectRole::FirstAdmin(i)).unwrap();
         assert_eq!(a.parent, Some(tier0.guid));
-        assert_eq!(a.rid, RidSource::Counter(1104 + i as u32));
+        assert_eq!(a.rid, RidSource::Counter(1105 + i as u32));
         assert_eq!(value(a, "sAMAccountName"), Some(name.as_bytes()));
         let uac = flags(a, "userAccountControl");
         assert_eq!(uac, ADS_UF_NORMAL_ACCOUNT);
@@ -191,7 +223,7 @@ fn the_object_table_is_docs_51_step_5() {
     // The groups: 0x80000002; Tier-0 = the first administrators; the
     // bootstrap group empty, in the workstations OU.
     let group = p.object(ObjectRole::Tier0Group).unwrap();
-    assert_eq!(group.rid, RidSource::Counter(1106));
+    assert_eq!(group.rid, RidSource::Counter(1107));
     assert_eq!(flags(group, "groupType"), PROVISIONED_GROUP_TYPE);
     assert_eq!(PROVISIONED_GROUP_TYPE, 0x8000_0002);
     let members: Vec<&[u8]> = values(group, "member");
@@ -205,7 +237,7 @@ fn the_object_table_is_docs_51_step_5() {
         .collect();
     assert_eq!(members, admins.iter().map(|g| &g[..]).collect::<Vec<_>>());
     let bootstrap = p.object(ObjectRole::BootstrapGroup).unwrap();
-    assert_eq!(bootstrap.rid, RidSource::Counter(1107));
+    assert_eq!(bootstrap.rid, RidSource::Counter(1108));
     assert_eq!(
         bootstrap.parent,
         Some(p.object(ObjectRole::WorkstationsOu).unwrap().guid)
@@ -231,7 +263,7 @@ fn the_object_table_is_docs_51_step_5() {
         assert_eq!(int64(o, "whenCreated"), dstime, "{:?}", o.role);
         assert_eq!(int64(o, "whenChanged"), dstime, "{:?}", o.role);
     }
-    assert_eq!(p.counter_rids(), 7);
+    assert_eq!(p.counter_rids(), 8);
     assert_eq!((CHANGE_SEQ_FIRST, CHANGE_SEQ_END_EXCLUSIVE), (1, u64::MAX));
 }
 
@@ -268,15 +300,18 @@ fn the_root_descriptor_grants_the_tier0_group_exactly_the_operations_rights() {
     assert!(sd.sacl.is_none());
     let dacl = sd.dacl.as_ref().unwrap();
     assert_eq!(dacl.acl_revision, ACL_REVISION_DS);
-    assert_eq!(dacl.aces.len(), 10);
-    // Every ACE: an allow, CONTAINER_INHERIT_ACE only, the Tier-0 group,
-    // no generic bit.
+    assert_eq!(dacl.aces.len(), 11);
+    // Every ACE: an allow, CONTAINER_INHERIT_ACE only, no generic bit; the
+    // Tier-0 group's for every ACE but the PRINCIPAL_SELF one of task K9
+    // (checked below), which alone names an InheritedObjectType.
     let generic = 0xF000_0000u32;
+    let principal_self = Sid::new(SECURITY_NT_AUTHORITY, &[PRINCIPAL_SELF_RID]).unwrap();
     for ace in &dacl.aces {
         assert_eq!(ace.ace_flags(), ace_flags::CONTAINER_INHERIT_ACE, "{ace:?}");
         assert_eq!(ace.mask().unwrap().0 & generic, 0, "{ace:?}");
         match ace {
             Ace::AccessAllowed(a) => assert_eq!(a.sid, tier0),
+            Ace::AccessAllowedObject(a) if a.sid == principal_self => {}
             Ace::AccessAllowedObject(a) => {
                 assert_eq!(a.sid, tier0);
                 assert!(a.object_type.is_some());
@@ -294,11 +329,12 @@ fn the_root_descriptor_grants_the_tier0_group_exactly_the_operations_rights() {
         other => panic!("first ACE {other:?}"),
     }
     assert_eq!(provision::ROOT_OBJECT_RIGHTS, 0x0001_0014);
-    // The object ACEs: exactly these (mask, ObjectType) pairs.
+    // The Tier-0 group's object ACEs: exactly these (mask, ObjectType) pairs.
     let mut grants: Vec<(u32, dtyp::Guid)> = dacl.aces[1..]
         .iter()
-        .map(|ace| match ace {
-            Ace::AccessAllowedObject(a) => (a.mask.0, a.object_type.unwrap()),
+        .filter_map(|ace| match ace {
+            Ace::AccessAllowedObject(a) if a.sid == principal_self => None,
+            Ace::AccessAllowedObject(a) => Some((a.mask.0, a.object_type.unwrap())),
             other => panic!("{other:?}"),
         })
         .collect();
@@ -321,6 +357,28 @@ fn the_root_descriptor_grants_the_tier0_group_exactly_the_operations_rights() {
     let mut sorted = encoded.clone();
     sorted.sort();
     assert_eq!(encoded, sorted);
+    // Task K9 — exactly one PRINCIPAL_SELF ACE ([MS-DTYP] 2.4.2.4: S-1-5-10;
+    // [MS-ADTS] 5.1.3.3): CONTROL_ACCESS for User-Change-Password
+    // ([MS-ADTS] 6.1.1.2.7.52, "on itself" — 3.1.1.3.1.5.1), inherited as
+    // effective by user objects only (InheritedObjectType = the user class,
+    // [MS-DTYP] 2.4.4.3).
+    let selves: Vec<&dtyp::ObjectAce> = dacl
+        .aces
+        .iter()
+        .filter_map(|ace| match ace {
+            Ace::AccessAllowedObject(a) if a.sid == principal_self => Some(a),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(selves.len(), 1);
+    assert_eq!(selves[0].mask.0, RIGHT_DS_CONTROL_ACCESS);
+    assert_eq!(selves[0].object_type, Some(USER_CHANGE_PASSWORD));
+    assert_eq!(selves[0].inherited_object_type, Some(class_guid("user")));
+    assert_eq!(
+        USER_CHANGE_PASSWORD.to_text(),
+        "ab721a53-1e2f-11d0-9819-00aa0040529b"
+    );
+    assert_eq!(principal_self.to_sid_string(), "S-1-5-10");
     // The values pdp checks, as [MS-ADTS] 5.1.3.2 gives them.
     assert_eq!(
         (
@@ -351,10 +409,137 @@ fn every_child_descriptor_is_the_runtime_computation() {
         assert_eq!(o.descriptor, expected, "{:?}", o.role);
         assert_eq!(o.descriptor.owner_sid, Some(tier0));
         // Every inherited copy is effective (INHERITED_ACE) or inheritable
-        // (INHERITED_ACE | INHERIT_ONLY_ACE | CONTAINER_INHERIT_ACE).
+        // (INHERITED_ACE | INHERIT_ONLY_ACE | CONTAINER_INHERIT_ACE): the
+        // root's 11 ACEs as inheritable copies, its 10 Tier-0 ACEs as
+        // effective copies, and — on a user object only — the PRINCIPAL_SELF
+        // ACE of task K9 as an effective copy too (its InheritedObjectType
+        // is the user class: [MS-DTYP] 2.4.4.3, 2.5.3.4).
         let dacl = o.descriptor.dacl.as_ref().unwrap();
-        assert_eq!(dacl.aces.len(), 20, "{:?}", o.role);
+        let expected = if o.class_name == "user" { 22 } else { 21 };
+        assert_eq!(dacl.aces.len(), expected, "{:?}", o.role);
     }
+}
+
+/// Task K9 — docs/53 §5.6 step 4 (layer 5 takes the grant from a
+/// PRINCIPAL_SELF ACE inherited from the domain root); [MS-ADTS]
+/// 3.1.1.3.1.5.1 (User-Change-Password "on itself"), 5.1.3.3 (S-1-5-10
+/// replaced by O!objectSid at the access check); [MS-DTYP] 2.4.4.1
+/// (INHERIT_ONLY_ACE), 2.4.4.3 (InheritedObjectType): every user object —
+/// the first administrators here — holds an effective (not inherit-only)
+/// copy of the PRINCIPAL_SELF User-Change-Password ACE; every other object
+/// holds only an inherit-only copy, so the right is effective nowhere else.
+#[test]
+fn every_user_holds_user_change_password_for_itself() {
+    let dir = TempDir::new();
+    let p = plan(&input(&dir, 61002, 61007));
+    let principal_self = Sid::new(SECURITY_NT_AUTHORITY, &[PRINCIPAL_SELF_RID]).unwrap();
+    let mut users = 0;
+    for o in &p.objects {
+        let Some(_) = o.parent else { continue };
+        let copies: Vec<&dtyp::ObjectAce> = o
+            .descriptor
+            .dacl
+            .as_ref()
+            .unwrap()
+            .aces
+            .iter()
+            .filter_map(|ace| match ace {
+                Ace::AccessAllowedObject(a)
+                    if a.sid == principal_self && a.object_type == Some(USER_CHANGE_PASSWORD) =>
+                {
+                    Some(a)
+                }
+                _ => None,
+            })
+            .collect();
+        let effective = copies
+            .iter()
+            .filter(|a| a.ace_flags & ace_flags::INHERIT_ONLY_ACE == 0)
+            .count();
+        if o.class_name == "user" {
+            users += 1;
+            assert_eq!(effective, 1, "{:?}", o.role);
+        } else {
+            assert_eq!(effective, 0, "{:?}", o.role);
+        }
+        // The inheritable copy passes the grant on to the users below.
+        assert_eq!(copies.len() - effective, 1, "{:?}", o.role);
+    }
+    // krbtgt and the two first administrators.
+    assert_eq!(users, 3);
+}
+
+/// Task K9 — layer 5 (crates/pdp `acl_grants`, [MS-DTYP] 2.5.3.2 with the
+/// [MS-DTYP] 2.5.3.1.1 PRINCIPAL_SELF substitution; [MS-ADTS] 5.1.3.3,
+/// 5.1.3.3.4) over the planned descriptors: a user is granted
+/// User-Change-Password on its **own** object ([MS-ADTS] 3.1.1.3.1.5.1, "on
+/// itself") by the PRINCIPAL_SELF ACE alone (no group in its token), never on
+/// another user's object, never User-Force-Change-Password; a computer (the
+/// change-password service object) is not granted it on itself (the ACE is
+/// effective on user objects only — docs/53 R53-1). The Tier-0 group keeps
+/// its User-Force-Change-Password (docs/51 §10).
+#[test]
+fn the_self_ace_grants_the_change_on_the_own_object_only() {
+    let dir = TempDir::new();
+    let p = plan(&input(&dir, 61002, 61007));
+    let subject = |sid: Sid, groups: &[Sid]| pdp::Subject {
+        principal: sid,
+        groups: groups.iter().copied().collect(),
+        claims: std::collections::BTreeMap::new(),
+        auth: pdp::AuthContext {
+            strength: pdp::AuthStrength::KerberosFast,
+            armored: true,
+            ticket_age: core::time::Duration::ZERO,
+            ticket_verified: true,
+        },
+        tier: Tier::Tier2,
+    };
+    let context = |o: &provision::PlannedObject| pdp::DirObjectContext {
+        object_class: class_guid(o.class_name),
+        superclasses: Vec::new(),
+        object_sid: o.sid,
+    };
+    let change = pdp::Right::ControlAccess {
+        right: USER_CHANGE_PASSWORD,
+    };
+    let force = pdp::Right::ControlAccess {
+        right: USER_FORCE_CHANGE_PASSWORD,
+    };
+    let alice = p.object(ObjectRole::FirstAdmin(0)).unwrap();
+    let bob = p.object(ObjectRole::FirstAdmin(1)).unwrap();
+    let alice_subject = subject(alice.sid.unwrap(), &[]);
+    assert!(pdp::acl_grants(
+        &alice_subject,
+        &alice.descriptor,
+        &context(alice),
+        &change
+    ));
+    assert!(!pdp::acl_grants(
+        &alice_subject,
+        &bob.descriptor,
+        &context(bob),
+        &change
+    ));
+    assert!(!pdp::acl_grants(
+        &alice_subject,
+        &alice.descriptor,
+        &context(alice),
+        &force
+    ));
+    let changepw = p.object(ObjectRole::ChangePasswordService).unwrap();
+    assert!(!pdp::acl_grants(
+        &subject(changepw.sid.unwrap(), &[]),
+        &changepw.descriptor,
+        &context(changepw),
+        &change
+    ));
+    let tier0 = p.object(ObjectRole::Tier0Group).unwrap().sid.unwrap();
+    assert!(pdp::acl_grants(
+        &subject(bob.sid.unwrap(), &[tier0]),
+        &alice.descriptor,
+        &context(alice),
+        &force
+    ));
 }
 
 /// docs/51 §4.3 step 6: format 2, version 1, the tier map, the bootstrap
@@ -381,7 +566,7 @@ fn the_policy_is_docs_51_step_6() {
     assert_eq!(p.policy.mandatory_fast.bootstrap_group, bootstrap);
     assert_eq!(p.policy.mandatory_fast.first_rule_id.0, 100);
     let ids: Vec<u32> = p.policy.rules.iter().map(|r| r.id.0).collect();
-    assert_eq!(ids, vec![1, 2, 3, 4]);
+    assert_eq!(ids, vec![1, 2, 3, 4, 5]);
     let r = &p.policy.rules;
     // Rule 1: exactly the Kerberos actions the phase-1 KDC asks the PDP for
     // (crates/kdc as_exchange.rs `Action::KdcAs`, tgs_exchange.rs
@@ -410,6 +595,49 @@ fn the_policy_is_docs_51_step_6() {
     }
     assert_eq!(r[3].when.action, ActionMatch::Exact(Action::PolicyAdmin));
     assert_eq!(r[3].when.subject, SubjectMatch::MemberOf(tier0));
+    // Rule 5 (task K9; docs/53 §5.6 step 4): exactly
+    // `DirControlRight(User-Change-Password)` under the NC root, any
+    // subject (the PRINCIPAL_SELF ACE decides), the kpasswd PEP's transport
+    // `{encrypted, sealed, channel_bound}` from the internal network.
+    assert_eq!(
+        r[4].when.action,
+        ActionMatch::Exact(Action::DirControlRight(ControlRightId(
+            USER_CHANGE_PASSWORD
+        )))
+    );
+    assert_eq!(r[4].when.subject, SubjectMatch::Any);
+    assert_eq!(r[4].effect, pdp::Effect::Allow);
+    match &r[4].when.resource {
+        ResourceMatch::DirSubtree { base } => {
+            assert_eq!(base.dn().rdns(), ["dc=example", "dc=test"]);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        r[4].when.context.min_transport,
+        TransportSec {
+            encrypted: true,
+            sealed: true,
+            channel_bound: true
+        }
+    );
+    assert_eq!(r[4].when.context.src_net, Some(IpScope::Internal));
+    // No rule but 5 names User-Change-Password, and rule 5 names nothing
+    // else (in particular not User-Force-Change-Password).
+    for rule in &r[..4] {
+        assert!(!rule
+            .when
+            .action
+            .matches(&Action::DirControlRight(ControlRightId(
+                USER_CHANGE_PASSWORD
+            ))));
+    }
+    assert!(!r[4]
+        .when
+        .action
+        .matches(&Action::DirControlRight(ControlRightId(
+            USER_FORCE_CHANGE_PASSWORD
+        ))));
     assert_eq!(p.policy.anonymous.len(), 1);
     let decoded = policy_store::DevelopmentPolicy::decode(&p.policy_file).unwrap();
     assert_eq!(decoded, p.policy);
@@ -423,7 +651,7 @@ fn every_configuration_parses_with_its_schema() {
     let dir = TempDir::new();
     let input = input(&dir, 61002, 61007);
     let p = plan(&input);
-    assert_eq!(p.configs.len(), 7);
+    assert_eq!(p.configs.len(), 9);
     for file in &p.configs {
         file.parse_back().unwrap();
         let text = file.text();
@@ -440,9 +668,23 @@ fn every_configuration_parses_with_its_schema() {
     assert_eq!(keyd.uid_roles().role_of(61007), Some(RoleName::Admin));
     assert_eq!(keyd.uid_roles().role_of(61002), Some(RoleName::Ldap));
     assert_eq!(keyd.uid_roles().len(), 4);
+    // Task K9: neither front is mapped in keyd (docs/53 R53-4: the front has
+    // no keyd channel; docs/54 §4.3: dnsd is not mapped in keyd).
+    assert_eq!(keyd.uid_roles().role_of(61008), None);
+    assert_eq!(keyd.uid_roles().role_of(61009), None);
     let auditd =
         config::AuditdSettings::parse(text_of(provision::Daemon::Auditd).as_bytes()).unwrap();
-    assert_eq!(auditd.uid_sources().len(), 5);
+    assert_eq!(auditd.uid_sources().len(), 7);
+    // Task K9 (A-160; docs/questions/Q-960 item 6): auditd maps the two
+    // fronts' uids to their sources.
+    assert_eq!(
+        auditd.uid_sources().source_of(61008),
+        Some(config::AuditSource::KpasswdFront)
+    );
+    assert_eq!(
+        auditd.uid_sources().source_of(61009),
+        Some(config::AuditSource::Dnsd)
+    );
     let admind =
         config::AdmindSettings::parse(text_of(provision::Daemon::Admind).as_bytes()).unwrap();
     assert_eq!(admind.admin_socket_group(), 61010);
@@ -671,6 +913,135 @@ fn the_kdc_file_carries_the_zone_table_and_listens_inside_it() {
     }
 }
 
+/// Task K9 — the two network fronts' files (docs/53 R53-3, R53-4, §3.3,
+/// §5.7; docs/54 §4.3, §4.6, §4.7; A-117, A-119) and dird's kpasswd channel
+/// (docs/53 §5.6 step 1; docs/questions/Q-955 item 13, Q-964 item 12): each
+/// file parses with its own schema; kpasswd-front listens on its TCP 464
+/// address inside the internal networks, names dird's realm, dird's
+/// `dird-kpasswd.sock` and uid and auditd; dnsd names `dird-dns.sock`, dird's
+/// uid and auditd; dird's file admits exactly the front's uid on the same
+/// socket; neither front file carries a key or a keyd endpoint (docs/50
+/// §7.1; R53-4; docs/54 §4.3). Addresses and ids are test data.
+#[test]
+fn the_fronts_files_parse_and_name_dird_and_auditd() {
+    let dir = TempDir::new();
+    let input = input(&dir, 61002, 61007);
+    let p = plan(&input);
+    let text_of = |d: provision::Daemon| p.configs.iter().find(|f| f.daemon == d).unwrap().text();
+
+    let front_text = text_of(provision::Daemon::KpasswdFront);
+    let front = config::KpasswdFrontSettings::parse(front_text.as_bytes()).unwrap();
+    assert_eq!(front.run_as().uid(), 61008);
+    assert_eq!(front.run_as().gid(), 61008);
+    assert_eq!(
+        front.listen(),
+        ["127.0.0.1:464".parse::<core::net::SocketAddr>().unwrap()]
+    );
+    assert_eq!(front.internal_networks().len(), 2);
+    assert_eq!(front.realm(), "EXAMPLE.TEST");
+    assert_eq!(
+        front.dird().socket().as_str(),
+        input.paths.dird_kpasswd_socket.as_str()
+    );
+    assert_eq!(front.dird().uid(), 61002);
+    assert_eq!(
+        front.audit().socket().as_str(),
+        input.paths.audit_socket.as_str()
+    );
+    assert_eq!(front.audit().uid(), 61005);
+
+    let dnsd_text = text_of(provision::Daemon::Dnsd);
+    let dnsd = config::DnsdSettings::parse(dnsd_text.as_bytes()).unwrap();
+    assert_eq!(dnsd.run_as().uid(), 61009);
+    assert_eq!(
+        dnsd.listen(),
+        ["127.0.0.1:53".parse::<core::net::SocketAddr>().unwrap()]
+    );
+    assert_eq!(dnsd.internal_networks().len(), 2);
+    assert_eq!(
+        dnsd.dird().socket().as_str(),
+        input.paths.dird_dns_socket.as_str()
+    );
+    assert_eq!(dnsd.dird().uid(), 61002);
+    assert_eq!(dnsd.audit().uid(), 61005);
+
+    for text in [&front_text, &dnsd_text] {
+        assert!(!text.lines().any(|l| l.starts_with("keyd_")), "{text}");
+        assert!(!text.contains("key_path"), "{text}");
+    }
+
+    let dird_text = text_of(provision::Daemon::Dird);
+    let dird = config::DirdSettings::parse(dird_text.as_bytes()).unwrap();
+    let channel = dird.kpasswd_channel().expect("the kpasswd channel");
+    assert_eq!(
+        channel.socket().as_str(),
+        input.paths.dird_kpasswd_socket.as_str()
+    );
+    assert_eq!(channel.peer_uid(), 61008);
+    for key in provision::configs::DIRD_KPASSWD_CHANNEL_KEYS {
+        assert!(dird_text.contains(&format!("\n{key} = ")), "{key}");
+    }
+    // dird does not serve `dird-dns.sock` before task DN10: its file names
+    // no DNS key (docs/questions/Q-973).
+    assert!(!dird_text.contains("dns_socket"));
+    assert!(!dird_text.contains("dnsd_uid"));
+}
+
+/// Task K9 — the fronts' listeners lie inside the internal networks
+/// (docs/53 §3.3; docs/54 §4.7; A-114): one outside fails the parse-back by
+/// the front's own schema (`ListenerNotInternal`); a front without a
+/// listener is refused before anything is built (`MissingListener`).
+#[test]
+fn a_front_listener_outside_the_internal_networks_or_missing_is_refused() {
+    let dir = TempDir::new();
+    let base = input(&dir, 61002, 61007);
+    for (daemon, change) in [
+        (
+            provision::Daemon::KpasswdFront,
+            Box::new(|i: &mut provision::DomainInput| {
+                i.network.kpasswd_listen = vec!["192.0.2.7:464".to_owned()];
+            }) as Box<dyn Fn(&mut provision::DomainInput)>,
+        ),
+        (
+            provision::Daemon::Dnsd,
+            Box::new(|i: &mut provision::DomainInput| {
+                i.network.dnsd_listen = vec!["192.0.2.7:53".to_owned()];
+            }),
+        ),
+    ] {
+        let mut i = base.clone();
+        change(&mut i);
+        match refused(&i) {
+            PlanError::Config(refused_daemon, error) => {
+                assert_eq!(refused_daemon, daemon);
+                assert_eq!(error.kind(), config::ErrorKind::ListenerNotInternal);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    for (field, clear) in [
+        (
+            "kpasswd-listen",
+            Box::new(|i: &mut provision::DomainInput| i.network.kpasswd_listen.clear())
+                as Box<dyn Fn(&mut provision::DomainInput)>,
+        ),
+        (
+            "dnsd-listen",
+            Box::new(|i: &mut provision::DomainInput| i.network.dnsd_listen.clear()),
+        ),
+    ] {
+        let mut i = base.clone();
+        clear(&mut i);
+        match refused(&i) {
+            PlanError::Input(error) => {
+                assert_eq!(error.kind, InputErrorKind::MissingListener);
+                assert_eq!(error.field, field);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
 fn input_kind(e: PlanError) -> InputErrorKind {
     match e {
         PlanError::Input(i) => i.kind,
@@ -710,6 +1081,19 @@ fn duplicate_and_root_uids_are_refused() {
     assert_eq!(input_kind(refused(&i)), InputErrorKind::ReservedId);
     let mut i = input(&dir, 61002, 61007);
     i.accounts.admin_socket_group = u32::MAX;
+    assert_eq!(input_kind(refused(&i)), InputErrorKind::ReservedId);
+    // Task K9: each front its own uid (docs/53 §4.3; docs/54 §4.3), never 0.
+    let mut i = input(&dir, 61002, 61007);
+    i.accounts.kpasswd_front.uid = 61004;
+    assert_eq!(input_kind(refused(&i)), InputErrorKind::DuplicateUid);
+    let mut i = input(&dir, 61002, 61007);
+    i.accounts.dnsd.uid = i.accounts.kpasswd_front.uid;
+    assert_eq!(input_kind(refused(&i)), InputErrorKind::DuplicateUid);
+    let mut i = input(&dir, 61002, 61007);
+    i.accounts.dnsd.uid = 0;
+    assert_eq!(input_kind(refused(&i)), InputErrorKind::ReservedId);
+    let mut i = input(&dir, 61002, 61007);
+    i.accounts.kpasswd_front.gid = 0;
     assert_eq!(input_kind(refused(&i)), InputErrorKind::ReservedId);
 }
 
@@ -796,6 +1180,24 @@ fn names_breaking_their_rules_are_refused() {
             Box::new(|i| i.names.tier0_group = "a,b".into()),
             InputErrorKind::Name,
         ),
+        // Task K9: the change-password service object's name — a computer
+        // name (A-79), one sAMAccountName, one RDN under the Tier-0 OU.
+        (
+            Box::new(|i| i.names.change_password_service_name = "cpw$".into()),
+            InputErrorKind::Name,
+        ),
+        (
+            Box::new(|i| i.names.change_password_service_name = "c".repeat(20)),
+            InputErrorKind::Name,
+        ),
+        (
+            Box::new(|i| i.names.change_password_service_name = "ADMINSVC".into()),
+            InputErrorKind::DuplicateAccountName,
+        ),
+        (
+            Box::new(|i| i.names.change_password_service_name = "LdapSvc".into()),
+            InputErrorKind::DuplicateAccountName,
+        ),
     ];
     for (n, (change, kind)) in cases.into_iter().enumerate() {
         let mut i = base.clone();
@@ -835,6 +1237,23 @@ fn shared_paths_and_socket_directories_are_refused() {
     }
     let mut i = input(&dir, 61002, 61007);
     i.paths.policy_next = i.paths.policy.clone();
+    assert_eq!(input_kind(refused(&i)), InputErrorKind::DuplicatePath);
+    // Task K9: the two new sockets each in a directory of its own (docs/50
+    // §3.1), the two new files distinct targets.
+    let mut i = input(&dir, 61002, 61007);
+    i.paths.dird_kpasswd_socket = path(&dir, "run/dird-admin/dird-kpasswd.sock");
+    assert_eq!(
+        input_kind(refused(&i)),
+        InputErrorKind::SharedSocketDirectory
+    );
+    let mut i = input(&dir, 61002, 61007);
+    i.paths.dird_dns_socket = path(&dir, "run/dird-kpasswd/dird-dns.sock");
+    assert_eq!(
+        input_kind(refused(&i)),
+        InputErrorKind::SharedSocketDirectory
+    );
+    let mut i = input(&dir, 61002, 61007);
+    i.paths.dnsd_config = i.paths.kpasswd_front_config.clone();
     assert_eq!(input_kind(refused(&i)), InputErrorKind::DuplicatePath);
 }
 

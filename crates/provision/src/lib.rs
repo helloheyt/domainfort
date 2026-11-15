@@ -115,6 +115,23 @@
 //! Interpretations and gaps: docs/questions/Q-375 … Q-379; for
 //! `first-admin-secret` (task A6): Q-410 … Q-414 — that module's own
 //! provenance is in its documentation.
+//!
+//! # Task K9 — what a provisioned DC needs for kpasswd and the two fronts
+//!
+//! `provision domain` also writes: the change-password service object
+//! (`kadmin/changepw`, RFC 3244 §2; docs/53 §5.2 — module [`plan`], row 8)
+//! and its manifest entry (`change_password_service`, whose key set `keyadm
+//! ceremony` creates with a fourth `create_key`); the root's PRINCIPAL_SELF
+//! ACE granting User-Change-Password ([MS-ADTS] 3.1.1.3.1.5.1, 6.1.1.2.7.52;
+//! module `descriptor`, row 11); the PDP rule for it (module [`policy`], rule
+//! 5); kpasswd-front's and dnsd's configuration files, dird's kpasswd channel
+//! and auditd's mapping of both fronts (module [`configs`]). Opened in the
+//! K9 session: docs/53 (whole), docs/54 §4.3-§4.8, §10, docs/51 §4, §6,
+//! §10, docs/57; RFC 3244 §2 (pinned, 45b9130f…dec378); RFC 4120 §6.2
+//! (pinned, 368d3cd1…f75b); [MS-ADTS] v20261026 3.1.1.3.1.5.1, 5.1.3.3,
+//! 6.1.1.2.7.52; [MS-DTYP] v20241119 2.4.2.4, 2.4.4.1, 2.4.4.3, 2.5.3.1.1
+//! (SHA-256 verified against tools/spec-pin/manifest.json). Interpretations:
+//! docs/questions/Q-972 … Q-975.
 
 pub mod cli;
 pub mod configs;
@@ -131,7 +148,7 @@ pub mod time;
 pub mod update;
 
 pub use configs::{ConfigFile, Daemon, DIRD_ADMIN_CHANNEL_KEYS};
-pub use descriptor::{ROOT_ACE_FLAGS, ROOT_OBJECT_RIGHTS};
+pub use descriptor::{PRINCIPAL_SELF_RID, ROOT_ACE_FLAGS, ROOT_OBJECT_RIGHTS};
 pub use input::{Account, Accounts, DomainInput, FilePath, InputError, Names, Network, Paths};
 pub use install::{
     install, precheck, InstallError, InstallState, Installed, Progress, Step, Target,

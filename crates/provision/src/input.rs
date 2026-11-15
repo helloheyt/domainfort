@@ -2,9 +2,15 @@
 //! checks — step 1 of docs/51 §4.3 for everything that does not touch the
 //! filesystem (the filesystem half is `install::precheck`).
 //!
+//! Task K9 adds the two network fronts (kpasswd-front, docs/53 §3.3, §10;
+//! dnsd, docs/54 §4.3, §10 row DN13 — its account, file and auditd mapping
+//! only) and the change-password service object's name (docs/53 §5.2).
+//!
 //! Spec: docs/51 §4.3 ("input (without any secret)"; step 1), §4.4, §4.6,
-//! §11; docs/50 §2.4, §3.1, R50-3, §7.1; decisions A-55, A-60, A-72, A-79,
-//! P-22 (Q-295); docs/questions/Q-345 items 6-8.
+//! §11; docs/50 §2.4, §3.1, R50-3, §7.1; docs/53 §3.3, §5.2, §10 (K9);
+//! docs/54 §4.3, §4.6, §4.7, §10 (DN13); decisions A-55, A-60, A-72, A-79,
+//! A-117, A-119, A-160, P-22 (Q-295); docs/questions/Q-345 items 6-8,
+//! Q-973.
 
 use core::fmt;
 use std::path::Path;
@@ -99,9 +105,11 @@ pub struct Account {
 }
 
 /// The accounts of the processes (docs/51 §4.3: "numeric uids/gids for the
-/// seven accounts").
+/// seven accounts" — nine since task K9 added the two network fronts).
 /// Spec: docs/50 §2.4 (one account per process), R50-3 (uid 0 never
-/// mapped); docs/51 §4.3 step 1, §4.6.
+/// mapped); docs/51 §4.3 step 1, §4.6; docs/53 §4.3 (kpasswd-front, its own
+/// uid — dird admits only it on `dird-kpasswd.sock`); docs/54 §4.3 (dnsd,
+/// "its own uid, ≠ 0").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Accounts {
     /// keyd.
@@ -116,6 +124,12 @@ pub struct Accounts {
     pub auditd: Account,
     /// admind.
     pub admind: Account,
+    /// kpasswd-front, the change-password service's network front (task
+    /// K9; docs/53 R53-4, §4.3).
+    pub kpasswd_front: Account,
+    /// dnsd, the DNS network front (task K9 / DN13's front part; docs/54
+    /// §4.3).
+    pub dnsd: Account,
     /// keyadm (a tool started directly as its account, no gid needed —
     /// docs/questions/Q-347 item 2).
     pub keyadm_uid: u32,
@@ -156,6 +170,10 @@ pub struct Paths {
     pub admind_config: FilePath,
     /// keyadm's configuration file.
     pub keyadm_config: FilePath,
+    /// kpasswd-front's configuration file (task K9).
+    pub kpasswd_front_config: FilePath,
+    /// dnsd's configuration file (task K9 / DN13's front part).
+    pub dnsd_config: FilePath,
     /// `keyd.sock`.
     pub keyd_socket: FilePath,
     /// `dird-kdc.sock`.
@@ -164,6 +182,12 @@ pub struct Paths {
     pub dird_ldap_socket: FilePath,
     /// `dird-admin.sock`.
     pub dird_admin_socket: FilePath,
+    /// `dird-kpasswd.sock` (docs/53 §4.3; named in dird's and kpasswd-front's
+    /// files).
+    pub dird_kpasswd_socket: FilePath,
+    /// `dird-dns.sock` (docs/54 §4.6; named in dnsd's file — dird serves it
+    /// from task DN10 on, docs/questions/Q-973).
+    pub dird_dns_socket: FilePath,
     /// `audit.sock`.
     pub audit_socket: FilePath,
     /// `admin.sock`.
@@ -192,8 +216,15 @@ pub struct Network {
     /// ldap-front's `ldaps_listen` addresses.
     pub ldaps_listen: Vec<String>,
     /// `internal_networks` (ldap-front, required — every LDAP listener lies
-    /// inside one of them, docs/52 R14; and kdc). dird has no zone table.
+    /// inside one of them, docs/52 R14; and kdc, kpasswd-front and dnsd,
+    /// whose listeners lie inside them too). dird has no zone table.
     pub internal_networks: Vec<String>,
+    /// kpasswd-front's `listen` addresses (TCP 464 only, at least one —
+    /// docs/53 R53-3, §3.3; A-117).
+    pub kpasswd_listen: Vec<String>,
+    /// dnsd's `listen` addresses (each served on UDP and TCP, at least one —
+    /// docs/54 §4.3, §4.7).
+    pub dnsd_listen: Vec<String>,
 }
 
 /// The names chosen at provisioning — never hard-coded (docs/47 §6.3).
@@ -217,6 +248,9 @@ pub struct Names {
     pub ldap_service_name: String,
     /// The admin service object's cn; sAMAccountName = name ‖ "$".
     pub admin_service_name: String,
+    /// The change-password service object's cn; sAMAccountName = name ‖
+    /// "$"; its one SPN is `kadmin/changepw` (task K9; docs/53 §5.2).
+    pub change_password_service_name: String,
     /// The first administrators' sAMAccountNames (2 ..= 8).
     pub first_admins: Vec<String>,
 }
@@ -283,7 +317,8 @@ pub enum InputErrorKind {
     SharedPolicyNextDirectory,
     /// A network list item is empty or holds a separator.
     NetworkItem,
-    /// No kdc listener, or neither LDAP nor LDAPS listener.
+    /// No kdc listener, neither LDAP nor LDAPS listener, no kpasswd-front
+    /// listener or no dnsd listener.
     MissingListener,
     /// No internal network: ldap-front listens only inside the internal
     /// networks (docs/52 §7 R14; A-102 on docs/questions/Q-469 (b)).
@@ -416,6 +451,11 @@ impl DomainInput {
             ("ldap-front-account", a.ldap_front),
             ("auditd-account", a.auditd),
             ("admind-account", a.admind),
+            // Task K9: the two fronts, each its own uid (docs/53 §4.3:
+            // dird admits only kpasswd-front's uid; docs/54 §4.3: dnsd's own
+            // uid, ≠ 0).
+            ("kpasswd-front-account", a.kpasswd_front),
+            ("dnsd-account", a.dnsd),
         ];
         let mut uids: Vec<(&'static str, u32)> = Vec::with_capacity(accounts.len() + 1);
         for (field, account) in accounts {
@@ -475,6 +515,10 @@ impl DomainInput {
             "admin-service-name",
             computer_name_ok(&n.admin_service_name),
         )?;
+        name(
+            "change-password-service-name",
+            computer_name_ok(&n.change_password_service_name),
+        )?;
         // The two service SPNs (docs/51 §4.3 step 5; A-73) pass the
         // runtime's own SPN rule: `service "/" host`, host = the object's
         // dNSHostName (the DC's FQDN), lower case, service not "krbtgt"
@@ -523,6 +567,7 @@ impl DomainInput {
             computer_sam(&n.dc_name),
             computer_sam(&n.ldap_service_name),
             computer_sam(&n.admin_service_name),
+            computer_sam(&n.change_password_service_name),
         ];
         let mut sams: Vec<&str> = vec![KRBTGT_NAME, &n.tier0_group, &n.bootstrap_group];
         sams.extend(computers.iter().map(String::as_str));
@@ -540,6 +585,7 @@ impl DomainInput {
             &n.dc_name,
             &n.ldap_service_name,
             &n.admin_service_name,
+            &n.change_password_service_name,
             &n.tier0_group,
         ];
         under_tier0.extend(n.first_admins.iter().map(String::as_str));
@@ -559,7 +605,7 @@ impl DomainInput {
     /// directory, owned by the server's uid"); Q-230 item 16.
     fn check_paths(&self) -> Result<(), InputError> {
         let p = &self.paths;
-        let named: [(&'static str, &FilePath); 22] = [
+        let named: [(&'static str, &FilePath); 26] = [
             ("staging-dir", &p.staging),
             ("database-path", &p.database),
             ("integrity-key-path", &p.integrity_key),
@@ -573,10 +619,14 @@ impl DomainInput {
             ("auditd-config", &p.auditd_config),
             ("admind-config", &p.admind_config),
             ("keyadm-config", &p.keyadm_config),
+            ("kpasswd-front-config", &p.kpasswd_front_config),
+            ("dnsd-config", &p.dnsd_config),
             ("keyd-socket", &p.keyd_socket),
             ("dird-kdc-socket", &p.dird_kdc_socket),
             ("dird-ldap-socket", &p.dird_ldap_socket),
             ("dird-admin-socket", &p.dird_admin_socket),
+            ("dird-kpasswd-socket", &p.dird_kpasswd_socket),
+            ("dird-dns-socket", &p.dird_dns_socket),
             ("audit-socket", &p.audit_socket),
             ("admin-socket", &p.admin_socket),
             ("tls-certificate-path", &p.tls_certificate),
@@ -599,6 +649,8 @@ impl DomainInput {
             ("dird-kdc-socket", &p.dird_kdc_socket),
             ("dird-ldap-socket", &p.dird_ldap_socket),
             ("dird-admin-socket", &p.dird_admin_socket),
+            ("dird-kpasswd-socket", &p.dird_kpasswd_socket),
+            ("dird-dns-socket", &p.dird_dns_socket),
             ("audit-socket", &p.audit_socket),
             ("admin-socket", &p.admin_socket),
         ];
@@ -634,17 +686,21 @@ impl DomainInput {
 
     /// Network items are non-empty and hold no list separator (they are
     /// written as `", "`-separated lists, crates/config); kdc needs a
-    /// listener, ldap-front at least one of LDAP / LDAPS and at least one
-    /// internal network (crates/config re-checks every address, and that
-    /// every LDAP listener lies in an internal network).
-    /// Spec: docs/50 §4.1, §4.2, §7.1; docs/52 §7 R14.
+    /// listener, ldap-front at least one of LDAP / LDAPS, kpasswd-front and
+    /// dnsd one each, and at least one internal network (crates/config
+    /// re-checks every address, and that every listener of the four network
+    /// daemons lies in an internal network).
+    /// Spec: docs/50 §4.1, §4.2, §7.1; docs/52 §7 R14; docs/53 R53-3, §3.3;
+    /// docs/54 §4.7.
     fn check_network(&self) -> Result<(), InputError> {
         let n = &self.network;
-        let lists: [(&'static str, &Vec<String>); 4] = [
+        let lists: [(&'static str, &Vec<String>); 6] = [
             ("kdc-listen", &n.kdc_listen),
             ("ldap-listen", &n.ldap_listen),
             ("ldaps-listen", &n.ldaps_listen),
             ("internal-network", &n.internal_networks),
+            ("kpasswd-listen", &n.kpasswd_listen),
+            ("dnsd-listen", &n.dnsd_listen),
         ];
         for (field, items) in lists {
             if items
@@ -665,6 +721,16 @@ impl DomainInput {
                 "ldaps-listen",
                 InputErrorKind::MissingListener,
             ));
+        }
+        // kpasswd-front's and dnsd's files require `listen` (crates/config
+        // kpasswd_front.rs, dnsd.rs).
+        for (field, items) in [
+            ("kpasswd-listen", &n.kpasswd_listen),
+            ("dnsd-listen", &n.dnsd_listen),
+        ] {
+            if items.is_empty() {
+                return Err(InputError::new(field, InputErrorKind::MissingListener));
+            }
         }
         if n.internal_networks.is_empty() {
             return Err(InputError::new(

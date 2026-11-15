@@ -9,8 +9,10 @@
 //!   uid is provisioned as keyadm's, so keyd gives it Role::Admin — A-73);
 //! - the **produced** manifest file, parsed back.
 //!
-//! The ceremony creates the three key sets of the manifest (docs/51 §4.3
-//! step 11): krbtgt, the LDAP service and the admin service.
+//! The ceremony creates the four key sets of the manifest (docs/51 §4.3
+//! step 11; docs/53 §5.2 for the fourth, task K9): krbtgt, the LDAP service,
+//! the admin service and the change-password service (`kadmin/changepw`,
+//! RFC 3244 §2).
 //!
 //! Sources: docs/51 §4.3 steps 7-8, 11; A-73 (keyd's role map); A-86 (the
 //! manifest and the ceremony); docs/10 §7 (`create_key` returns kvno 1 for
@@ -131,7 +133,8 @@ mod connector {
 
 /// docs/51 §4.3 steps 7, 8, 11: the produced keyd configuration gives the
 /// keyadm uid Role::Admin, and the produced manifest drives a complete
-/// ceremony (three key sets created).
+/// ceremony (four key sets created — task K9 added the change-password
+/// service's, docs/53 §5.2; exactly the manifest's, each kvno 1).
 #[test]
 fn keyadm_ceremony_completes_with_the_produced_manifest_and_role_map() {
     let dir = common::TempDir::new();
@@ -179,6 +182,33 @@ fn keyadm_ceremony_completes_with_the_produced_manifest_and_role_map() {
     let report = ceremony::run(&mut client, &manifest);
     assert!(report.is_complete(), "{report:?}");
     assert!(report.is_sealed());
-    assert_eq!(report.created().len(), 3);
+    assert_eq!(
+        report.created(),
+        [
+            (ceremony::Step::Krbtgt, keyd_types::Kvno::INITIAL),
+            (ceremony::Step::LdapService, keyd_types::Kvno::INITIAL),
+            (ceremony::Step::AdminService, keyd_types::Kvno::INITIAL),
+            (
+                ceremony::Step::ChangePasswordService,
+                keyd_types::Kvno::INITIAL
+            ),
+        ]
+    );
+    // The fourth key set is the produced change-password service object's:
+    // `(GUID, ChangePasswordService)` bound to kadmin/changepw.
+    let changepw = manifest.change_password_service();
+    assert_eq!(
+        changepw.handle.principal.as_bytes(),
+        &plan
+            .object(provision::ObjectRole::ChangePasswordService)
+            .unwrap()
+            .guid
+            .to_packet()
+    );
+    assert_eq!(
+        changepw.handle.purpose,
+        keyd_types::KeyPurpose::ChangePasswordService
+    );
+    assert_eq!(changepw.binding_text(), "NT-SRV-INST:kadmin/changepw");
     daemon.stop().unwrap();
 }

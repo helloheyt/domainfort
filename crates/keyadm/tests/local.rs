@@ -39,6 +39,8 @@ fn manifest() -> Manifest {
         krbtgt: guid(1),
         ldap_service: guid(2),
         admin_service: guid(3),
+        // Task K9: the change-password service object (docs/53 §5.2).
+        change_password_service: guid(6),
         first_admins: vec![(guid(4), "alice".to_owned()), (guid(5), "bob".to_owned())],
         first_admin_salts: vec!["test-salt-alice".to_owned(), "test-salt-bob".to_owned()],
     })
@@ -261,8 +263,10 @@ fn a_complete_report_prints_handles_bindings_and_kvnos() {
         "created krbtgt: principal 00000000-0000-0000-0000-000000000001 purpose Krbtgt binding NT-SRV-INST:krbtgt/EXAMPLE.TEST kvno 1",
         "created ldap service: principal 00000000-0000-0000-0000-000000000002 purpose Service binding NT-SRV-HST:ldap/dc1.example.test kvno 1",
         "created admin service: principal 00000000-0000-0000-0000-000000000003 purpose AdminService binding NT-SRV-HST:admind/dc1.example.test kvno 1",
+        // Task K9 (docs/53 §5.2; RFC 3244 §2): the fourth key set.
+        "created change-password service: principal 00000000-0000-0000-0000-000000000006 purpose ChangePasswordService binding NT-SRV-INST:kadmin/changepw kvno 1",
         "keyd's ceremony sealed",
-        "ceremony complete and sealed: 3 of 3 key sets created",
+        "ceremony complete and sealed: 4 of 4 key sets created",
         "keyd is sealed: create_key and initial-secret grants no longer exist in keyd until it restarts with an empty store",
         "granted the initial secret of first administrator alice: principal 00000000-0000-0000-0000-000000000004 purpose PrincipalLongterm binding NT-PRINCIPAL:alice; live for 900 s",
         "2 of 2 first administrators' initial secrets granted",
@@ -398,14 +402,20 @@ fn a_refused_first_step_stops_and_explains() {
     assert_eq!(report::exit_code(&report), EXIT_INCOMPLETE);
     assert_eq!(
         report.not_attempted(),
-        [Step::LdapService, Step::AdminService]
+        [
+            Step::LdapService,
+            Step::AdminService,
+            Step::ChangePasswordService
+        ]
     );
     let text = report::render(&report, &m).join("\n");
     assert!(
         text.contains("krbtgt: keyd refused (denied); not created"),
         "{text}"
     );
-    assert!(text.contains("0 of 3 key sets created; not attempted: ldap service, admin service"));
+    assert!(text.contains(
+        "0 of 4 key sets created; not attempted: ldap service, admin service, change-password service"
+    ));
     assert!(text.contains("may already exist"));
     assert!(text.contains("restart keyd"));
     assert!(text.contains("keyd is NOT sealed"));
@@ -440,7 +450,9 @@ fn an_unknown_outcome_says_the_key_set_may_exist() {
         ),
         "{text}"
     );
-    assert!(text.contains("1 of 3 key sets created; not attempted: admin service"));
+    assert!(text.contains(
+        "1 of 4 key sets created; not attempted: admin service, change-password service"
+    ));
     assert!(text.contains("check keyd's audit log before anything else"));
 }
 
@@ -491,7 +503,7 @@ fn the_three_fates_are_reported_apart() {
         assert!(text.contains(expected), "{expected}\n---\n{text}");
         assert_eq!(text.contains("MAY have been created"), unknown, "{text}");
         assert_eq!(text.contains("audit log"), unknown, "{text}");
-        assert!(text.contains("0 of 3 key sets created"));
+        assert!(text.contains("0 of 4 key sets created"));
 
         let contact = CeremonyReport {
             contact: match outcome {

@@ -517,6 +517,9 @@ fn manifest() -> Manifest {
         krbtgt: g(KRBTGT),
         ldap_service: g(LDAP_SVC),
         admin_service: g(ADMIND_SVC),
+        // Required since task K9: the object that holds `kadmin/changepw`
+        // in this directory (docs/53 §5.2; docs/questions/Q-964 item 4).
+        change_password_service: g(CHANGEPW_SVC),
         // The manifest's quorum of first administrators (the second is not
         // in this directory: these tests read the manifest's service
         // objects only).

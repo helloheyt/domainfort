@@ -4,24 +4,30 @@
 //! provision domain --realm <REALM> --naming-context dc=<l1>,…,dc=<lk> \
 //!     --dc-fqdn <host> --dc-name <name> \
 //!     --ldap-service-name <name> --admin-service-name <name> \
+//!     --change-password-service-name <name> \
 //!     --tier0-ou <ou> [--workstations-ou <ou>] \
 //!     --tier0-group <name> --bootstrap-group <name> \
 //!     --first-admin <sam> --first-admin <sam> [--first-admin <sam> …] \
 //!     --keyd-account <uid>:<gid> --dird-account <uid>:<gid> \
 //!     --kdc-account <uid>:<gid> --ldap-front-account <uid>:<gid> \
 //!     --auditd-account <uid>:<gid> --admind-account <uid>:<gid> \
+//!     --kpasswd-front-account <uid>:<gid> --dnsd-account <uid>:<gid> \
 //!     --keyadm-uid <uid> --admin-socket-group <gid> \
 //!     --staging-dir <path> --database-path <path> --integrity-key-path <path> \
 //!     --policy-path <path> --manifest-path <path> --audit-log-path <path> \
 //!     --keyd-config <path> --dird-config <path> --kdc-config <path> \
 //!     --ldap-front-config <path> --auditd-config <path> \
 //!     --admind-config <path> --keyadm-config <path> \
+//!     --kpasswd-front-config <path> --dnsd-config <path> \
 //!     --keyd-socket <path> --dird-kdc-socket <path> --dird-ldap-socket <path> \
-//!     --dird-admin-socket <path> --audit-socket <path> --admin-socket <path> \
+//!     --dird-admin-socket <path> --dird-kpasswd-socket <path> \
+//!     --dird-dns-socket <path> --audit-socket <path> --admin-socket <path> \
 //!     --tls-certificate-path <path> --tls-private-key-path <path> \
 //!     --policy-next-path <path> \
 //!     --kdc-listen <addr:port> [--kdc-listen …] \
 //!     [--ldap-listen <addr:port> …] [--ldaps-listen <addr:port> …] \
+//!     --kpasswd-listen <addr:port> [--kpasswd-listen …] \
+//!     --dnsd-listen <addr:port> [--dnsd-listen …] \
 //!     --internal-network <addr/prefix> [--internal-network …]
 //!
 //! provision policy --policy-path <path> <change> [<change> …]
@@ -59,9 +65,15 @@
 //! that one file — the file dird itself reads — so root's activation and
 //! dird cannot disagree on a path or an owner (module crate::update).
 //!
+//! Task K9 adds the change-password service object's name (docs/53 §5.2),
+//! the two network fronts' accounts, files and listeners (kpasswd-front —
+//! docs/53 §3.3; dnsd — docs/54 §4.3, §4.7) and the two dird sockets they
+//! name (`dird-kpasswd.sock`, docs/53 §4.3; `dird-dns.sock`, docs/54 §4.6).
+//!
 //! Spec: docs/51 §4.3 (the input; step 12), §4.4 (the password source),
 //! §5.10 (`provision policy`), §3 (D95); docs/50 §7.1 (numeric ids, no
-//! NSS); A-80; P-22; docs/questions/Q-411.
+//! NSS); docs/53 §3.3, §4.3, §5.2, §10 (K9); docs/54 §4.3, §4.6, §4.7;
+//! A-80; P-22; docs/questions/Q-411, Q-973.
 
 use core::fmt;
 use std::collections::BTreeMap;
@@ -144,6 +156,7 @@ const DOMAIN_FLAGS: &[(&str, Arity)] = &[
     ("--dc-name", Arity::One),
     ("--ldap-service-name", Arity::One),
     ("--admin-service-name", Arity::One),
+    ("--change-password-service-name", Arity::One),
     ("--tier0-ou", Arity::One),
     ("--workstations-ou", Arity::Optional),
     ("--tier0-group", Arity::One),
@@ -155,6 +168,8 @@ const DOMAIN_FLAGS: &[(&str, Arity)] = &[
     ("--ldap-front-account", Arity::One),
     ("--auditd-account", Arity::One),
     ("--admind-account", Arity::One),
+    ("--kpasswd-front-account", Arity::One),
+    ("--dnsd-account", Arity::One),
     ("--keyadm-uid", Arity::One),
     ("--admin-socket-group", Arity::One),
     ("--staging-dir", Arity::One),
@@ -170,10 +185,14 @@ const DOMAIN_FLAGS: &[(&str, Arity)] = &[
     ("--auditd-config", Arity::One),
     ("--admind-config", Arity::One),
     ("--keyadm-config", Arity::One),
+    ("--kpasswd-front-config", Arity::One),
+    ("--dnsd-config", Arity::One),
     ("--keyd-socket", Arity::One),
     ("--dird-kdc-socket", Arity::One),
     ("--dird-ldap-socket", Arity::One),
     ("--dird-admin-socket", Arity::One),
+    ("--dird-kpasswd-socket", Arity::One),
+    ("--dird-dns-socket", Arity::One),
     ("--audit-socket", Arity::One),
     ("--admin-socket", Arity::One),
     ("--tls-certificate-path", Arity::One),
@@ -182,6 +201,8 @@ const DOMAIN_FLAGS: &[(&str, Arity)] = &[
     ("--kdc-listen", Arity::Repeated),
     ("--ldap-listen", Arity::Repeated),
     ("--ldaps-listen", Arity::Repeated),
+    ("--kpasswd-listen", Arity::Repeated),
+    ("--dnsd-listen", Arity::Repeated),
     ("--internal-network", Arity::Repeated),
 ];
 
@@ -336,6 +357,8 @@ fn parse_domain(args: &[String]) -> Result<DomainInput, CliError> {
             ldap_front: f.account("--ldap-front-account")?,
             auditd: f.account("--auditd-account")?,
             admind: f.account("--admind-account")?,
+            kpasswd_front: f.account("--kpasswd-front-account")?,
+            dnsd: f.account("--dnsd-account")?,
             keyadm_uid: f.id("--keyadm-uid")?,
             admin_socket_group: f.id("--admin-socket-group")?,
         },
@@ -353,10 +376,14 @@ fn parse_domain(args: &[String]) -> Result<DomainInput, CliError> {
             auditd_config: f.path("--auditd-config")?,
             admind_config: f.path("--admind-config")?,
             keyadm_config: f.path("--keyadm-config")?,
+            kpasswd_front_config: f.path("--kpasswd-front-config")?,
+            dnsd_config: f.path("--dnsd-config")?,
             keyd_socket: f.path("--keyd-socket")?,
             dird_kdc_socket: f.path("--dird-kdc-socket")?,
             dird_ldap_socket: f.path("--dird-ldap-socket")?,
             dird_admin_socket: f.path("--dird-admin-socket")?,
+            dird_kpasswd_socket: f.path("--dird-kpasswd-socket")?,
+            dird_dns_socket: f.path("--dird-dns-socket")?,
             audit_socket: f.path("--audit-socket")?,
             admin_socket: f.path("--admin-socket")?,
             tls_certificate: f.path("--tls-certificate-path")?,
@@ -368,6 +395,8 @@ fn parse_domain(args: &[String]) -> Result<DomainInput, CliError> {
             ldap_listen: f.all("--ldap-listen"),
             ldaps_listen: f.all("--ldaps-listen"),
             internal_networks: f.all("--internal-network"),
+            kpasswd_listen: f.all("--kpasswd-listen"),
+            dnsd_listen: f.all("--dnsd-listen"),
         },
         names: Names {
             tier0_ou: f.one("--tier0-ou")?.to_owned(),
@@ -377,6 +406,7 @@ fn parse_domain(args: &[String]) -> Result<DomainInput, CliError> {
             dc_name: f.one("--dc-name")?.to_owned(),
             ldap_service_name: f.one("--ldap-service-name")?.to_owned(),
             admin_service_name: f.one("--admin-service-name")?.to_owned(),
+            change_password_service_name: f.one("--change-password-service-name")?.to_owned(),
             first_admins: f.all("--first-admin"),
         },
     })

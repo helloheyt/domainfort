@@ -27,7 +27,8 @@
 //! | 5 | DC computer | computer | Tier-0 OU | counter | cn = name, sAMAccountName = name‖"$"; UAC = ST; dNSHostName = fqdn; accountExpires = never; no SPN |
 //! | 6 | LDAP service | computer | Tier-0 OU | counter | as 5 with UAC = WT and SPN `ldap/<fqdn>` |
 //! | 7 | admin service | computer | Tier-0 OU | counter | as 5 with UAC = WT and SPN `admind/<fqdn>` |
-//! | 8.. | first administrators | user | Tier-0 OU | counter | cn = sAMAccountName; UAC = N; pwdLastSet = now; accountExpires = never |
+//! | 8 | change-password service (task K9) | computer | Tier-0 OU | counter | as 5 with UAC = WT and SPN `kadmin/changepw` (RFC 3244 §2) |
+//! | 9.. | first administrators | user | Tier-0 OU | counter | cn = sAMAccountName; UAC = N; pwdLastSet = now; accountExpires = never |
 //! | n-1 | Tier-0 group | group | Tier-0 OU | counter | groupType = 0x80000002; member = the first administrators |
 //! | n | bootstrap group | group | workstations OU, else NC root | counter | groupType = 0x80000002; no member |
 //!
@@ -43,8 +44,9 @@
 //! Spec: docs/51 §4.3 steps 1-8, §8.3, §10, §11; [MS-SAMR] v20260427
 //! 2.2.1.14, 3.1.1.6 items 11, 12, 14, 20, 22-24, 3.1.1.8.1 items 1.2, 2.2,
 //! 3.1.1.9.2; [MS-ADTS] v20261026 3.1.1.5.2.4, 6.1.3; [MS-DTYP] v20241119
-//! 2.4.2.4; docs/46 §4.4, §5.4, §8.1; docs/47 §1.4, §4.1, §6.3; A-72,
-//! A-75, A-76, A-79, A-83, A-84, A-89, P-22.
+//! 2.4.2.4; docs/46 §4.4, §5.4, §8.1; docs/47 §1.4, §4.1, §6.3; RFC 3244
+//! §2 and docs/53 R53-6, §5.2, §10 (K9) for row 8; A-72, A-75, A-76, A-79,
+//! A-83, A-84, A-89, A-117, P-22; docs/questions/Q-964 item 13, Q-972.
 
 use core::fmt;
 use std::collections::BTreeSet;
@@ -60,6 +62,7 @@ use directory_admin::{
 use directory_pip::{account_salt, dstime_of, AccountKind, NamingContext, NC_RDN_ATTRIBUTE};
 use dirstore::{AttrId, ClassId, NodeId, INTEGRITY_KEY_LEN};
 use dtyp::{Guid, SecurityDescriptor, Sid, GUID_PACKET_LEN, SECURITY_NT_AUTHORITY};
+use keyd_types::CHANGE_PASSWORD_SERVICE_NAME;
 use krb_proto::{KerberosTime, Realm};
 use pdp::Dn;
 use policy_store::DevelopmentPolicy;
@@ -130,6 +133,8 @@ pub enum ObjectRole {
     LdapService,
     /// The admin service object.
     AdminService,
+    /// The change-password service object (`kadmin/changepw`, task K9).
+    ChangePasswordService,
     /// The n-th first administrator (from 0).
     FirstAdmin(usize),
     /// The Tier-0 group.
@@ -390,7 +395,7 @@ impl Plan {
         let schema = ad_schema::phase1().map_err(|_| PlanError::Schema)?;
         let ids = SchemaIds::resolve(&schema).map_err(|_| PlanError::Schema)?;
         let n = &input.names;
-        let object_count = 8 + usize::from(n.workstations_ou.is_some()) + n.first_admins.len();
+        let object_count = 9 + usize::from(n.workstations_ou.is_some()) + n.first_admins.len();
         let draws = draw(rng, object_count)?;
 
         let dstime = dstime_of(&now).ok_or(PlanError::Time)?;
@@ -414,11 +419,12 @@ impl Plan {
         let rid_dc = counter_rid(0)?;
         let rid_ldap = counter_rid(1)?;
         let rid_admin_svc = counter_rid(2)?;
+        let rid_changepw_svc = counter_rid(3)?;
         let rid_admins: Vec<u32> = (0..admins)
-            .map(|i| counter_rid(3 + i))
+            .map(|i| counter_rid(4 + i))
             .collect::<Result<_, _>>()?;
-        let rid_tier0 = counter_rid(3 + admins)?;
-        let rid_bootstrap = counter_rid(4 + admins)?;
+        let rid_tier0 = counter_rid(4 + admins)?;
+        let rid_bootstrap = counter_rid(5 + admins)?;
         let tier0_sid = principal_sid(&domain_sid, rid_tier0)?;
         let bootstrap_sid = principal_sid(&domain_sid, rid_bootstrap)?;
 
@@ -426,6 +432,10 @@ impl Plan {
         let fqdn = input.dc_fqdn.as_str();
         let ldap_spn = format!("{LDAP_SERVICE_CLASS}/{fqdn}");
         let admin_spn = format!("{ADMIN_SERVICE_CLASS}/{fqdn}");
+        // RFC 3244 §2: "the service principal kadmin/changepw@REALM" — the
+        // two components of keyd-types' one definition, joined with "/" as
+        // an SPN value (docs/47 §9.1: "the single SPN split on '/'").
+        let changepw_spn = CHANGE_PASSWORD_SERVICE_NAME.join("/");
         let flags = |v: u32| vec![integer32(v)];
         let never = || vec![integer64(ACCOUNT_EXPIRES_NEVER)];
 
@@ -557,6 +567,22 @@ impl Plan {
             ADS_UF_WORKSTATION_TRUST_ACCOUNT,
             Some(&admin_spn),
             rid_admin_svc,
+        ));
+        // Task K9 — the change-password service object (docs/53 §5.2: a
+        // dedicated service object at provisioning, as the LDAP and admin
+        // service objects are, with the SPN `kadmin/changepw`; RFC 3244 §2): WT, the DC's
+        // dNSHostName (a computer requires one — Q-355 item 3), its one SPN
+        // `kadmin/changepw` — a fixed instance, not a host (RFC 4120 §6.2,
+        // NT-SRV-INST), which only its provisioning claim may carry
+        // (directory-admin `ProvisioningRole::ChangePasswordServiceObject`,
+        // docs/questions/Q-972). Its key set `(GUID, ChangePasswordService)`
+        // comes from the ceremony's `create_key` (docs/53 §5.2).
+        specs.push(computer(
+            ObjectRole::ChangePasswordService,
+            &n.change_password_service_name,
+            ADS_UF_WORKSTATION_TRUST_ACCOUNT,
+            Some(&changepw_spn),
+            rid_changepw_svc,
         ));
         // The first administrators: N enabled (no D — docs/51 §4.3 step 5:
         // "enabled, no key set until the ceremony, so it cannot
@@ -747,6 +773,7 @@ impl Plan {
             krbtgt: guid_of(ObjectRole::Krbtgt)?,
             ldap_service: guid_of(ObjectRole::LdapService)?,
             admin_service: guid_of(ObjectRole::AdminService)?,
+            change_password_service: guid_of(ObjectRole::ChangePasswordService)?,
             first_admins: admin_guids
                 .iter()
                 .copied()

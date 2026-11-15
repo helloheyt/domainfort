@@ -212,8 +212,10 @@ fn provisioning_to_a_new_users_login() {
                 (Step::Krbtgt, Kvno::INITIAL),
                 (Step::LdapService, Kvno::INITIAL),
                 (Step::AdminService, Kvno::INITIAL),
+                (Step::ChangePasswordService, Kvno::INITIAL),
             ],
-            "create_key ×3, each a new key set (docs/51 §4.3 step 11)"
+            "create_key ×4, each a new key set (docs/51 §4.3 step 11; the \
+             fourth the change-password service's — docs/53 §5.2, task K9)"
         );
         let (secrets, drops) = w.first_admin_secret();
         assert!(secrets.is_complete(), "first-admin-secret");

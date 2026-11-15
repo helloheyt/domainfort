@@ -4,7 +4,8 @@
 //!
 //! `provision domain` writes it (offline, as root, task A4); `keyadm
 //! ceremony` reads it to create the krbtgt and service key sets (step 11,
-//! task A5); `provision first-admin-secret` reads it to set the first
+//! task A5 — since task K9 also the change-password service's,
+//! `kadmin/changepw`, RFC 3244 §2); `provision first-admin-secret` reads it to set the first
 //! administrators' passwords (step 12, task A6). This crate holds the one
 //! format, the one strict parser, the one canonical encoder, the
 //! root-owned-file check, and the one derivation of every key-set handle and
@@ -29,6 +30,7 @@
 //! | `krbtgt` | `<guid>:NT-SRV-INST:krbtgt/<realm>` | RFC 4120 §7.3; docs/47 §1.4 |
 //! | `ldap_service` | `<guid>:NT-SRV-HST:ldap/<dc_fqdn>` | RFC 4120 §6.2.1; docs/10 §5ב |
 //! | `admin_service` | `<guid>:NT-SRV-HST:admind/<dc_fqdn>` | RFC 4120 §6.2.1; A-73 |
+//! | `change_password_service` | `<guid>:NT-SRV-INST:kadmin/changepw` | RFC 3244 §2; RFC 4120 §6.2 (SRV-INST: a service and a fixed instance); docs/53 §5.2; task K9 |
 //! | `first_admins` | 2–8 × `<guid>:NT-PRINCIPAL:<sAMAccountName>`, `", "`-separated | docs/47 §9.1; [MS-SAMR] 3.1.1.6; Q-295 |
 //! | `first_admin_salts` | one salt per first administrator, in `first_admins` order, `", "`-separated | the salt `provision domain` computed with `directory_pip::account_salt` (R47-4) — the one keyadm's ceremony grant binds and `first-admin-secret` presents (A-102, docs/52 N4); required since A-105 (Q-473) |
 //!
@@ -57,6 +59,7 @@
 //! krbtgt = 00000000-0000-0000-0000-000000000001:NT-SRV-INST:krbtgt/EXAMPLE.TEST
 //! ldap_service = 00000000-0000-0000-0000-000000000002:NT-SRV-HST:ldap/dc1.example.test
 //! admin_service = 00000000-0000-0000-0000-000000000003:NT-SRV-HST:admind/dc1.example.test
+//! change_password_service = 00000000-0000-0000-0000-000000000006:NT-SRV-INST:kadmin/changepw
 //! first_admins = 00000000-0000-0000-0000-000000000004:NT-PRINCIPAL:alice, 00000000-0000-0000-0000-000000000005:NT-PRINCIPAL:bob
 //! first_admin_salts = salt-a, salt-b
 //! ```

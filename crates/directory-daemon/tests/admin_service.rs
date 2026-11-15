@@ -519,6 +519,9 @@ fn manifest() -> Manifest {
         krbtgt: g(KRBTGT),
         ldap_service: g(LDAP_SVC),
         admin_service: g(ADMIND_SVC),
+        // Required since task K9 (docs/53 §5.2); not in this directory —
+        // these tests read the LDAP and admin service objects only.
+        change_password_service: g(98),
         first_admins: vec![
             (g(ADMIN1), String::from("admin1")),
             (g(ADMIN2), String::from("admin2")),

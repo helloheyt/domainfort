@@ -2,7 +2,8 @@
 //!
 //! Every value is constructed by hand for these tests and obviously fake:
 //! the realm EXAMPLE.TEST (".test"), the [MS-DTYP] 2.4.2.4 example domain
-//! SID S-1-5-21-1-2-3, GUIDs ...0001 to ...0005, administrators alice and
+//! SID S-1-5-21-1-2-3, GUIDs ...0001 to ...0006 (...0006 the
+//! change-password service object, task K9), administrators alice and
 //! bob with the placeholder salts `salt-a` and `salt-b` (not the
 //! directory's salt rule — the manifest only carries the text). No vector
 //! comes from any other implementation.
@@ -24,6 +25,7 @@ dc_fqdn = dc1.example.test
 krbtgt = 00000000-0000-0000-0000-000000000001:NT-SRV-INST:krbtgt/EXAMPLE.TEST
 ldap_service = 00000000-0000-0000-0000-000000000002:NT-SRV-HST:ldap/dc1.example.test
 admin_service = 00000000-0000-0000-0000-000000000003:NT-SRV-HST:admind/dc1.example.test
+change_password_service = 00000000-0000-0000-0000-000000000006:NT-SRV-INST:kadmin/changepw
 first_admins = 00000000-0000-0000-0000-000000000004:NT-PRINCIPAL:alice, 00000000-0000-0000-0000-000000000005:NT-PRINCIPAL:bob
 first_admin_salts = salt-a, salt-b
 ";
@@ -50,6 +52,7 @@ pub fn fields() -> ManifestFields {
         krbtgt: guid(1),
         ldap_service: guid(2),
         admin_service: guid(3),
+        change_password_service: guid(6),
         first_admins: vec![(guid(4), "alice".to_owned()), (guid(5), "bob".to_owned())],
         first_admin_salts: vec!["salt-a".to_owned(), "salt-b".to_owned()],
     }

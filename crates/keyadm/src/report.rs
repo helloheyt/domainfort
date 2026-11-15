@@ -22,7 +22,7 @@ use ipc_keyd::TransportError;
 use keyd_types::{Error as KeydError, MAX_INITIAL_SECRET_GRANT_SECS};
 use provision_manifest::Manifest;
 
-/// Exit status: all three key sets created, every first administrator's
+/// Exit status: all four key sets created, every first administrator's
 /// initial secret granted, and keyd's ceremony sealed (A-102).
 pub const EXIT_COMPLETE: u8 = 0;
 

@@ -27,6 +27,8 @@ fn domain_args() -> Vec<String> {
         "ldapsvc",
         "--admin-service-name",
         "adminsvc",
+        "--change-password-service-name",
+        "changepwsvc",
         "--tier0-ou",
         "Tier0",
         "--workstations-ou",
@@ -51,6 +53,10 @@ fn domain_args() -> Vec<String> {
         "61005:61005",
         "--admind-account",
         "61006:61006",
+        "--kpasswd-front-account",
+        "61008:61008",
+        "--dnsd-account",
+        "61009:61009",
         "--keyadm-uid",
         "61007",
         "--admin-socket-group",
@@ -59,6 +65,10 @@ fn domain_args() -> Vec<String> {
         "127.0.0.1:88",
         "--ldaps-listen",
         "127.0.0.1:636",
+        "--kpasswd-listen",
+        "127.0.0.1:464",
+        "--dnsd-listen",
+        "127.0.0.1:53",
         "--internal-network",
         "10.0.0.0/8",
         "--internal-network",
@@ -78,10 +88,14 @@ fn domain_args() -> Vec<String> {
         ("--auditd-config", "/srv/p/etc/auditd.conf"),
         ("--admind-config", "/srv/p/etc/admind.conf"),
         ("--keyadm-config", "/srv/p/etc/keyadm.conf"),
+        ("--kpasswd-front-config", "/srv/p/etc/kpasswd-front.conf"),
+        ("--dnsd-config", "/srv/p/etc/dnsd.conf"),
         ("--keyd-socket", "/srv/p/run/keyd/keyd.sock"),
         ("--dird-kdc-socket", "/srv/p/run/dk/dird-kdc.sock"),
         ("--dird-ldap-socket", "/srv/p/run/dl/dird-ldap.sock"),
         ("--dird-admin-socket", "/srv/p/run/da/dird-admin.sock"),
+        ("--dird-kpasswd-socket", "/srv/p/run/dkp/dird-kpasswd.sock"),
+        ("--dird-dns-socket", "/srv/p/run/dd/dird-dns.sock"),
         ("--audit-socket", "/srv/p/run/au/audit.sock"),
         ("--admin-socket", "/srv/p/run/ad/admin.sock"),
         ("--tls-certificate-path", "/srv/p/etc/dc-cert.der"),
@@ -117,6 +131,48 @@ fn a_full_domain_command_parses() {
     assert_eq!(input.paths.database.as_str(), "/srv/p/var/directory.redb");
     assert_eq!(input.network.kdc_listen, ["127.0.0.1:88"]);
     assert!(input.network.ldap_listen.is_empty());
+    // Task K9 (docs/53 §3.3, §5.2; docs/54 §4.3, §4.6): the change-password
+    // service object's name, the two fronts' accounts, files, sockets and
+    // listeners.
+    assert_eq!(input.names.change_password_service_name, "changepwsvc");
+    assert_eq!(input.accounts.kpasswd_front.uid, 61008);
+    assert_eq!(input.accounts.dnsd.gid, 61009);
+    assert_eq!(
+        input.paths.kpasswd_front_config.as_str(),
+        "/srv/p/etc/kpasswd-front.conf"
+    );
+    assert_eq!(input.paths.dnsd_config.as_str(), "/srv/p/etc/dnsd.conf");
+    assert_eq!(
+        input.paths.dird_kpasswd_socket.as_str(),
+        "/srv/p/run/dkp/dird-kpasswd.sock"
+    );
+    assert_eq!(
+        input.paths.dird_dns_socket.as_str(),
+        "/srv/p/run/dd/dird-dns.sock"
+    );
+    assert_eq!(input.network.kpasswd_listen, ["127.0.0.1:464"]);
+    assert_eq!(input.network.dnsd_listen, ["127.0.0.1:53"]);
+}
+
+/// Task K9: every new `domain` flag that has no default is required (an
+/// operator who omits one is refused, nothing defaulted — docs/51 §4.3).
+#[test]
+fn the_k9_flags_are_required() {
+    let base = domain_args();
+    for flag in [
+        "--change-password-service-name",
+        "--kpasswd-front-account",
+        "--dnsd-account",
+        "--kpasswd-front-config",
+        "--dnsd-config",
+        "--dird-kpasswd-socket",
+        "--dird-dns-socket",
+    ] {
+        let i = base.iter().position(|a| a == flag).unwrap();
+        let mut v = base.clone();
+        v.drain(i..i + 2);
+        assert!(usage(&v), "{flag}");
+    }
 }
 
 /// Unknown, repeated or value-less flags; a missing required flag; a value

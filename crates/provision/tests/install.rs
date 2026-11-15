@@ -23,7 +23,7 @@ use directory_pip::{DirectoryContext, NamingContext};
 use dirstore::Store;
 use kdc::AccountSource;
 use keyd_types::KeydConfig;
-use krb_proto::constants::KRB_NT_PRINCIPAL;
+use krb_proto::constants::{KRB_NT_PRINCIPAL, KRB_NT_SRV_INST};
 use krb_proto::{KerberosString, PrincipalName, Realm};
 use provision::install::InstallCause;
 use provision::{
@@ -75,7 +75,9 @@ fn provisioning_installs_files_the_daemons_accept() {
     assert_eq!(installs.last(), Some(&Target::Store));
     assert_eq!(progress.seen.first(), Some(&Step::StagingCreated));
     assert_eq!(progress.seen.last(), Some(&Step::StagingRemoved));
-    assert_eq!(installed.targets.len(), 11);
+    // Nine configuration files since task K9 (kpasswd-front, dnsd), the
+    // policy, the key, the manifest, the database.
+    assert_eq!(installed.targets.len(), 13);
     assert!(std::fs::symlink_metadata(input.paths.staging.as_path()).is_err());
 
     // Owners (Q-270 item 3; A-68; docs/51 §4.3): root for everything but
@@ -92,7 +94,7 @@ fn provisioning_installs_files_the_daemons_accept() {
         recorder.owner_of(Staged::Store),
         Some(Owner { uid, gid: uid })
     );
-    assert_eq!(recorder.records.len(), 12);
+    assert_eq!(recorder.records.len(), 14);
 
     // Modes: key 0400, database 0600, the rest 0644.
     let p = &input.paths;
@@ -104,6 +106,8 @@ fn provisioning_installs_files_the_daemons_accept() {
         &p.keyd_config,
         &p.dird_config,
         &p.kdc_config,
+        &p.kpasswd_front_config,
+        &p.dnsd_config,
     ] {
         assert_eq!(mode(path.as_path()), 0o644, "{path:?}");
     }
@@ -169,6 +173,25 @@ fn provisioning_installs_files_the_daemons_accept() {
         name_string: vec![KerberosString::new("krbtgt").unwrap()],
     };
     assert!(view.client(&realm, &krbtgt_name).unwrap().is_none());
+    // Task K9 (RFC 3244 §2; docs/53 §5.2; docs/questions/Q-964 items 4,
+    // 13): `kadmin/changepw` resolves as the KDC's AS and dird's kpasswd
+    // service resolve it — the account source's `service` — to the
+    // manifest's change-password service object, its key set
+    // `(GUID, ChangePasswordService)`, usable now.
+    let changepw_name = PrincipalName {
+        name_type: KRB_NT_SRV_INST,
+        name_string: ["kadmin", "changepw"]
+            .iter()
+            .map(|c| KerberosString::new(c).unwrap())
+            .collect(),
+    };
+    let changepw = view.service(&realm, &changepw_name).unwrap().unwrap();
+    assert_eq!(changepw.key, plan.manifest.change_password_service().handle);
+    assert_eq!(
+        changepw.key.purpose,
+        keyd_types::KeyPurpose::ChangePasswordService
+    );
+    assert!(changepw.state.usable_at(&at(10, 0, 5)));
     drop(view);
 
     // The engine dird builds at start accepts the store (its domain check).
@@ -400,15 +423,15 @@ fn a_crash_at_each_point_leaves_the_documented_state_and_a_rerun_refuses() {
         (
             Step::Installed(Target::Manifest),
             InstallState::PartlyInstalled,
-            10,
+            12,
         ),
-        (Step::TargetsSynced, InstallState::PartlyInstalled, 10),
+        (Step::TargetsSynced, InstallState::PartlyInstalled, 12),
         (
             Step::Installed(Target::Store),
             InstallState::InstalledStagingLeft,
-            11,
+            13,
         ),
-        (Step::StagingRemoved, InstallState::InstalledStagingLeft, 11),
+        (Step::StagingRemoved, InstallState::InstalledStagingLeft, 13),
     ];
     for (step, state, in_place) in cases {
         let dir = TempDir::new();
@@ -423,7 +446,7 @@ fn a_crash_at_each_point_leaves_the_documented_state_and_a_rerun_refuses() {
         assert_eq!(present.len(), in_place, "{step:?}: {present:?}");
         // The database is never in place before every other target.
         if present.contains(&Target::Store) {
-            assert_eq!(present.len(), 11, "{step:?}");
+            assert_eq!(present.len(), 13, "{step:?}");
         }
         let staging_left = std::fs::symlink_metadata(i.paths.staging.as_path()).is_ok();
         assert_eq!(staging_left, step != Step::StagingRemoved, "{step:?}");

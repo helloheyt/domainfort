@@ -227,6 +227,15 @@ pub fn accounts(dird_uid: u32, keyadm_uid: u32) -> Accounts {
             uid: 61006,
             gid: 61006,
         },
+        // Task K9: the two network fronts (obviously fake ids).
+        kpasswd_front: Account {
+            uid: 61008,
+            gid: 61008,
+        },
+        dnsd: Account {
+            uid: 61009,
+            gid: 61009,
+        },
         keyadm_uid,
         admin_socket_group: 61010,
     }
@@ -257,10 +266,14 @@ pub fn input(dir: &TempDir, dird_uid: u32, keyadm_uid: u32) -> DomainInput {
             auditd_config: path(dir, "etc/auditd.conf"),
             admind_config: path(dir, "etc/admind.conf"),
             keyadm_config: path(dir, "etc/keyadm.conf"),
+            kpasswd_front_config: path(dir, "etc/kpasswd-front.conf"),
+            dnsd_config: path(dir, "etc/dnsd.conf"),
             keyd_socket: path(dir, "run/keyd/keyd.sock"),
             dird_kdc_socket: path(dir, "run/dird-kdc/dird-kdc.sock"),
             dird_ldap_socket: path(dir, "run/dird-ldap/dird-ldap.sock"),
             dird_admin_socket: path(dir, "run/dird-admin/dird-admin.sock"),
+            dird_kpasswd_socket: path(dir, "run/dird-kpasswd/dird-kpasswd.sock"),
+            dird_dns_socket: path(dir, "run/dird-dns/dird-dns.sock"),
             audit_socket: path(dir, "run/auditd/audit.sock"),
             admin_socket: path(dir, "run/admind/admin.sock"),
             tls_certificate: path(dir, "etc/dc-cert.der"),
@@ -274,6 +287,10 @@ pub fn input(dir: &TempDir, dird_uid: u32, keyadm_uid: u32) -> DomainInput {
             // The LDAPS listener (127.0.0.1) lies inside the internal
             // networks (docs/52 R14: ldap-front listens only there).
             internal_networks: vec!["10.0.0.0/8".to_owned(), "127.0.0.0/8".to_owned()],
+            // Task K9: TCP 464 (docs/53 R53-3) and port 53 (docs/54 §4.3),
+            // inside the internal networks.
+            kpasswd_listen: vec!["127.0.0.1:464".to_owned()],
+            dnsd_listen: vec!["127.0.0.1:53".to_owned()],
         },
         names: Names {
             tier0_ou: "Tier0".to_owned(),
@@ -283,6 +300,7 @@ pub fn input(dir: &TempDir, dird_uid: u32, keyadm_uid: u32) -> DomainInput {
             dc_name: "DC1".to_owned(),
             ldap_service_name: "ldapsvc".to_owned(),
             admin_service_name: "adminsvc".to_owned(),
+            change_password_service_name: "changepwsvc".to_owned(),
             first_admins: vec!["alice".to_owned(), "bob".to_owned()],
         },
     }

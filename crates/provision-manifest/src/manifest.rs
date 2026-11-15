@@ -9,7 +9,10 @@ use crate::value::{
     salt_items, COMPONENT_SEPARATOR, ENTRY_SEPARATOR, LIST_SEPARATOR, MANIFEST_VERSION,
 };
 use dtyp::{Guid, Sid};
-use keyd_types::{KeyHandle, KeyPurpose, PrincipalBinding, PrincipalId, ServiceKeyHandle};
+use keyd_types::{
+    KeyHandle, KeyPurpose, PrincipalBinding, PrincipalId, ServiceKeyHandle,
+    CHANGE_PASSWORD_SERVICE_NAME,
+};
 use krb_proto::constants::{KRB_NT_PRINCIPAL, KRB_NT_SRV_HST, KRB_NT_SRV_INST};
 use krb_proto::{KerberosString, Realm};
 
@@ -37,6 +40,10 @@ pub mod keys {
     /// The admin service object: GUID and binding. Spec: docs/51 §4.3 steps
     /// 5, 8, 11; A-73.
     pub const ADMIN_SERVICE: &str = "admin_service";
+    /// The change-password service object: GUID and binding (task K9).
+    /// Spec: RFC 3244 §2 ("the service principal kadmin/changepw@REALM");
+    /// docs/53 R53-6, §5.2, §10 (K9); docs/questions/Q-964 items 4, 13.
+    pub const CHANGE_PASSWORD_SERVICE: &str = "change_password_service";
     /// The first administrators: GUID, sAMAccountName and binding of each.
     /// Spec: docs/51 §4.3 steps 5, 8, 12.
     pub const FIRST_ADMINS: &str = "first_admins";
@@ -164,6 +171,8 @@ pub struct ManifestFields {
     pub ldap_service: Guid,
     /// The admin service object's GUID.
     pub admin_service: Guid,
+    /// The change-password service object's GUID (task K9).
+    pub change_password_service: Guid,
     /// Each first administrator's GUID and sAMAccountName.
     pub first_admins: Vec<(Guid, String)>,
     /// Each first administrator's string-to-key salt, in `first_admins`
@@ -174,8 +183,8 @@ pub struct ManifestFields {
 
 /// The provisioning manifest (docs/51 §4.3 step 8): the realm, the domain
 /// SID, the NC's DN, the DC's host name, and the GUID and immutable binding
-/// of the krbtgt object, the LDAP and admin service objects and each first
-/// administrator. Identifiers only — no key, password or token (docs/47
+/// of the krbtgt object, the LDAP, admin and change-password service objects
+/// and each first administrator. Identifiers only — no key, password or token (docs/47
 /// §2.3: GUIDs and SIDs are not secrets).
 ///
 /// Invariants (checked by [`Manifest::parse`]; [`Manifest::new`] goes
@@ -185,7 +194,8 @@ pub struct ManifestFields {
 /// sAMAccountNames (ASCII case folded).
 ///
 /// Spec: docs/51 §4.3 steps 1, 2, 5, 8, 11, 12; docs/47 §1.4, §2.3, §9.1;
-/// RFC 4120 §6.2, §6.2.1, §7.3; A-19; A-73; docs/questions/Q-295 (P-22).
+/// RFC 4120 §6.2, §6.2.1, §7.3; RFC 3244 §2; A-19; A-73; docs/53 §5.2;
+/// docs/questions/Q-295 (P-22), Q-964 item 4.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
     realm: Realm,
@@ -195,6 +205,7 @@ pub struct Manifest {
     krbtgt: KeySet,
     ldap_service: KeySet,
     admin_service: KeySet,
+    change_password_service: KeySet,
     first_admins: Vec<FirstAdmin>,
 }
 
@@ -244,6 +255,7 @@ impl Manifest {
         keys::KRBTGT,
         keys::LDAP_SERVICE,
         keys::ADMIN_SERVICE,
+        keys::CHANGE_PASSWORD_SERVICE,
         keys::FIRST_ADMINS,
         keys::FIRST_ADMIN_SALTS,
     ];
@@ -315,6 +327,22 @@ impl Manifest {
                 &[ADMIN_SERVICE_CLASS, dc_fqdn.as_str()],
             ),
         )?;
+        // Task K9 — RFC 3244 §2 ("the service principal
+        // kadmin/changepw@REALM"); docs/53 §5.2: (GUID_changepw,
+        // ChangePasswordService), NT-SRV-INST [kadmin, changepw] — a service
+        // with a fixed instance, not a host (RFC 4120 §6.2: "If the first
+        // component of a name identifies a service and the remaining
+        // components identify an instance of the service in a
+        // server-specified manner, then the name type of SRV-INST SHOULD be
+        // used"). The purpose is derived from that binding
+        // (`service_handle`; docs/52 R2b), not restated.
+        let change_password_service = Self::object(
+            &doc,
+            keys::CHANGE_PASSWORD_SERVICE,
+            &mut seen,
+            service_handle,
+            binding(&realm, KRB_NT_SRV_INST, &CHANGE_PASSWORD_SERVICE_NAME),
+        )?;
         let admins = Self::parse_first_admins(&doc, &mut seen, &realm)?;
         // A-102 (N4), A-105 (Q-473: required): one KerberosString per first
         // administrator, in order.
@@ -343,6 +371,7 @@ impl Manifest {
             krbtgt,
             ldap_service,
             admin_service,
+            change_password_service,
             first_admins,
         })
     }
@@ -479,7 +508,7 @@ impl Manifest {
                 ErrorKind::InvalidSalt,
             ));
         }
-        let lines: [(&str, String); 10] = [
+        let lines: [(&str, String); 11] = [
             (keys::MANIFEST_VERSION, MANIFEST_VERSION.to_owned()),
             (keys::REALM, fields.realm.clone()),
             (keys::DOMAIN_SID, fields.domain_sid.to_sid_string()),
@@ -510,6 +539,14 @@ impl Manifest {
                     &fields.admin_service,
                     KRB_NT_SRV_HST,
                     &[ADMIN_SERVICE_CLASS, fields.dc_fqdn.as_str()],
+                ),
+            ),
+            (
+                keys::CHANGE_PASSWORD_SERVICE,
+                entry(
+                    &fields.change_password_service,
+                    KRB_NT_SRV_INST,
+                    &CHANGE_PASSWORD_SERVICE_NAME,
                 ),
             ),
             (keys::FIRST_ADMINS, admins.join(LIST_SEPARATOR)),
@@ -565,7 +602,7 @@ impl Manifest {
             .map(|admin| object_text(admin.key_set()))
             .collect();
         let salts: Vec<&str> = self.first_admins.iter().map(FirstAdmin::salt).collect();
-        let lines: [(&str, String); 10] = [
+        let lines: [(&str, String); 11] = [
             (keys::MANIFEST_VERSION, MANIFEST_VERSION.to_owned()),
             (keys::REALM, self.realm.as_str().to_owned()),
             (keys::DOMAIN_SID, self.domain_sid.to_sid_string()),
@@ -577,6 +614,10 @@ impl Manifest {
             (keys::KRBTGT, object_text(&self.krbtgt)),
             (keys::LDAP_SERVICE, object_text(&self.ldap_service)),
             (keys::ADMIN_SERVICE, object_text(&self.admin_service)),
+            (
+                keys::CHANGE_PASSWORD_SERVICE,
+                object_text(&self.change_password_service),
+            ),
             (keys::FIRST_ADMINS, admins.join(LIST_SEPARATOR)),
             (keys::FIRST_ADMIN_SALTS, salts.join(LIST_SEPARATOR)),
         ];
@@ -628,6 +669,33 @@ impl Manifest {
     #[must_use]
     pub fn admin_service(&self) -> &KeySet {
         &self.admin_service
+    }
+
+    /// The change-password service key set: `(GUID_changepw,
+    /// ChangePasswordService)`, NT-SRV-INST [kadmin, changepw] — the key set
+    /// `keyadm ceremony` creates (a fourth `create_key`) and the object dird
+    /// finds `kadmin/changepw` on (docs/questions/Q-964 item 4).
+    /// Spec: RFC 3244 §2; RFC 4120 §6.2; docs/53 R53-6, §5.2, §10 (K9).
+    #[must_use]
+    pub fn change_password_service(&self) -> &KeySet {
+        &self.change_password_service
+    }
+
+    /// Every service object the manifest names — the LDAP, admin and
+    /// change-password service objects, in key-table order — each with its
+    /// key set. The one list a consumer that must treat **every**
+    /// provisioned service object alike (dird's protected objects, docs/51
+    /// §5.2 row 9) iterates, so that a service object added to the manifest
+    /// is not left out by a consumer that names the objects one by one
+    /// (docs/questions/Q-975).
+    /// Spec: docs/51 §4.3 steps 5, 8, §5.2 row 9; docs/53 §5.2; docs/52 C14.
+    #[must_use]
+    pub fn service_objects(&self) -> [&KeySet; 3] {
+        [
+            &self.ldap_service,
+            &self.admin_service,
+            &self.change_password_service,
+        ]
     }
 
     /// The first administrators, in manifest order. Spec: docs/51 §4.3

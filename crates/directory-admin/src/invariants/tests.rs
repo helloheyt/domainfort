@@ -696,3 +696,89 @@ fn the_admin_service_name_is_the_admin_service_objects_alone() {
         "{renamed:?}"
     );
 }
+
+/// Task K9 (docs/53 R53-6, §5.2, §10; RFC 3244 §2 "the service principal
+/// kadmin/changepw@REALM"; docs/questions/Q-964 item 13, Q-972): the
+/// change-password service's name is the change-password service object's
+/// alone, as the admin service's is the admin service object's (Q-541). On
+/// the online path's call (no role) it is refused (`Value`) even on a
+/// computer whose dNSHostName is "changepw" (the one host its shape would
+/// fit), under the plain service-object and the admin-service claims too;
+/// the claim on an object without that name (another SPN, `kadmin/<host>`,
+/// none) is `Exception`; the claim with it passes once — the object's
+/// dNSHostName is the DC's host, the SPN's second component a fixed instance
+/// (RFC 4120 §6.2) — and a second claim is `Exception`. The admin service
+/// object still passes beside it. Nothing refused is written.
+#[test]
+fn the_change_password_service_name_is_its_objects_alone() {
+    let ids = ids();
+    let t = TempStore::new("changepw-name");
+    let mut txn = t.store.begin_write().unwrap();
+    let host = "dc01.example.test";
+    let changepw = "kadmin/changepw";
+    {
+        let mut s = begin(&mut txn);
+        assert_eq!(
+            rule(s.create(
+                None,
+                service(&ids, guid(80), "ws80", "changepw", Some(changepw))
+            )),
+            InvariantViolation::Value
+        );
+        for claim in [
+            ProvisioningRole::ServiceObject,
+            ProvisioningRole::AdminServiceObject,
+        ] {
+            assert_eq!(
+                rule(s.create(
+                    Some(claim),
+                    service(&ids, guid(80), "ws80", host, Some(changepw))
+                )),
+                InvariantViolation::Value,
+                "{claim:?}"
+            );
+        }
+        for spn in [
+            Some("ldap/dc01.example.test"),
+            Some("kadmin/dc01.example.test"),
+            None,
+        ] {
+            assert_eq!(
+                rule(s.create(
+                    Some(ProvisioningRole::ChangePasswordServiceObject),
+                    service(&ids, guid(81), "cpw81", host, spn)
+                )),
+                InvariantViolation::Exception,
+                "{spn:?}"
+            );
+        }
+        s.create(
+            Some(ProvisioningRole::ChangePasswordServiceObject),
+            service(&ids, guid(82), "changepw-svc", host, Some(changepw)),
+        )
+        .unwrap();
+        s.create(
+            Some(ProvisioningRole::AdminServiceObject),
+            service(
+                &ids,
+                guid(83),
+                "admind-svc",
+                host,
+                Some("admind/dc01.example.test"),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            rule(s.create(
+                Some(ProvisioningRole::ChangePasswordServiceObject),
+                service(&ids, guid(84), "changepw2", host, Some(changepw))
+            )),
+            InvariantViolation::Exception
+        );
+    }
+    for refused in [80, 81, 84] {
+        assert_eq!(StoreRead::object(&txn, guid(refused)).unwrap(), None);
+    }
+    assert!(StoreRead::object(&txn, guid(82)).unwrap().is_some());
+    assert!(StoreRead::object(&txn, guid(83)).unwrap().is_some());
+}

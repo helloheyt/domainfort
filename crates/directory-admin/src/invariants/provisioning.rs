@@ -7,7 +7,9 @@
 //! parent), the krbtgt account (RID 502, outside the RID counter's range),
 //! the DC's computer account (userAccountControl ST — never set by the
 //! admin plane, A-79), and the service objects, which become protected
-//! (docs/51 §5.2 row 9). Everything else it writes — the OUs, the first
+//! (docs/51 §5.2 row 9) — among them the two that alone may carry a
+//! reserved service name (`admind/<fqdn>`, Q-541; `kadmin/changepw`, task
+//! K9 — docs/53 §5.2, Q-972). Everything else it writes — the OUs, the first
 //! administrators, the two groups and the Tier-0 group's members — passes
 //! exactly the rules of the online path.
 //!
@@ -70,6 +72,16 @@ pub enum ProvisioningRole {
     /// Spec: A-73; docs/51 §4.3 step 5; docs/52 R2b; docs/questions/Q-491
     /// item 1, Q-541.
     AdminServiceObject,
+    /// The change-password service object (task K9): a service object (as
+    /// [`ProvisioningRole::ServiceObject`], protected the same way) whose one
+    /// servicePrincipalName is `kadmin/changepw` — the name RFC 3244 §2 gives
+    /// the service and from which the `ChangePasswordService` key-set purpose
+    /// derives (keyd-types `KeyPurpose::of_service_name`). Its second
+    /// component is a fixed instance, not the object's host (RFC 4120 §6.2,
+    /// NT-SRV-INST). The only object that may carry that name; once.
+    /// Spec: RFC 3244 §2; RFC 4120 §6.2; docs/53 R53-6, §5.2, §10 (K9);
+    /// docs/52 R2b; docs/questions/Q-964 item 13, Q-972.
+    ChangePasswordServiceObject,
 }
 
 impl ProvisioningRole {
@@ -239,9 +251,12 @@ impl<'t, 's> Provisioning<'t, 's> {
             Some(ProvisioningRole::ServiceObject) => {
                 self.invariants.service_objects.insert(guid);
             }
-            Some(ProvisioningRole::AdminServiceObject) => {
+            Some(
+                claim @ (ProvisioningRole::AdminServiceObject
+                | ProvisioningRole::ChangePasswordServiceObject),
+            ) => {
                 self.invariants.service_objects.insert(guid);
-                self.claimed.insert(ProvisioningRole::AdminServiceObject);
+                self.claimed.insert(claim);
             }
             Some(role) => {
                 self.claimed.insert(role);

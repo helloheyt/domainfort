@@ -13,12 +13,14 @@
 //!
 //! The name rules are the online path's own functions (crate::names, A-79).
 //! One of them is judged on every object whatever its class: no principal
-//! name it forms may derive the admin service's key-set purpose
-//! (`admind/<host>`, by the one derivation `KeyPurpose::of_service_name`),
-//! except the admin service object's own claim
-//! (`ProvisioningRole::AdminServiceObject`) — the privileged name is a
-//! state rule of the directory, not only a key that keyd refuses to make
-//! (docs/52 R2b follow-up; docs/questions/Q-541).
+//! name it forms may derive a reserved key-set purpose (by the one
+//! derivation `KeyPurpose::of_service_name`: the admin service's
+//! `admind/<host>`, the change-password service's `kadmin/changepw`),
+//! except the claim of the one object that owns that name
+//! (`ProvisioningRole::AdminServiceObject`,
+//! `ProvisioningRole::ChangePasswordServiceObject`) — the privileged name is
+//! a state rule of the directory, not only a key that keyd refuses to make
+//! (docs/52 R2b follow-up; docs/questions/Q-541; task K9, Q-972).
 //!
 //! Spec: [MS-SAMR] v20260427 (pinned, sha256 083fe00a…8a4e) 3.1.1.6 items
 //! 8-14, 20-24, 3.1.1.8.9; docs/51 §4.3 step 5, §5.2 rows 1-8, §11 (decided
@@ -31,6 +33,7 @@ use ad_schema::flags::user_account_control::{
     ADS_UF_WORKSTATION_TRUST_ACCOUNT,
 };
 use dirstore::{AttrId, ClassId, Object};
+use keyd_types::KeyPurpose;
 
 use super::{InvariantViolation as V, ProvisioningRole};
 use crate::ids::Ids;
@@ -132,17 +135,22 @@ pub(crate) fn check_new(
     if obj.attributes.iter().any(|a| !known(ids, a.id)) {
         return Err(V::NotModifiable);
     }
-    // A name from which the admin service's purpose derives is the admin
-    // service object's alone (docs/52 R2b follow-up; Q-541): carried by
-    // anything else ⇒ the value is refused (`Value` — the code `prepare`
-    // gives for the same SPN rule, `names::spn_ok`); the admin service's
-    // claim on an object that does not carry one ⇒ `Exception`.
-    let admin_named = forms_admin_service_name(ids, obj)?;
-    let admin_claim = role == Some(ProvisioningRole::AdminServiceObject);
-    if admin_named && !admin_claim {
+    // A name from which a reserved key-set purpose derives is the one
+    // object's alone that claims it (docs/52 R2b follow-up; Q-541 for the
+    // admin service's `admind/<host>`; task K9, Q-972 for the
+    // change-password service's `kadmin/changepw`): carried by anything else
+    // ⇒ the value is refused (`Value` — the code `prepare` gives for the same
+    // SPN rule, `names::spn_ok`); a claim on an object that does not carry
+    // its name ⇒ `Exception`.
+    let formed = reserved_purposes_formed(ids, obj)?;
+    let carried_by_its_claim = |purpose: &KeyPurpose| match claim_of_reserved_purpose(*purpose) {
+        Some(claim) => Some(claim) == role,
+        None => false,
+    };
+    if !formed.iter().all(carried_by_its_claim) {
         return Err(V::Value);
     }
-    if admin_claim && !admin_named {
+    if claims_a_reserved_purpose(role) && !formed.iter().any(carried_by_its_claim) {
         return Err(V::Exception);
     }
     // The NC root: a domainDNS without parent, only as the provisioning
@@ -194,15 +202,16 @@ pub(crate) fn check_new(
     }
 }
 
-/// `true` if a principal name the object forms derives the admin service's
-/// key-set purpose by the one derivation (`keyd_types::KeyPurpose::
-/// of_service_name`, through crate::names): any of its
-/// servicePrincipalName values (a service name, NT-SRV-HST — docs/47 §1.3
-/// TGS), or its sAMAccountName as a one-component client name (docs/47
-/// §1.3 AS). Judged on every object of every class, whatever the class rules
-/// below would say of the value. A value that is not UTF-8 ⇒ `Value`.
-/// Spec: docs/52 R2b; docs/questions/Q-491 item 1, Q-541; docs/47 §1.3.
-fn forms_admin_service_name(ids: &Ids, obj: &Object) -> Result<bool, V> {
+/// The reserved key-set purposes the principal names the object forms
+/// derive by the one derivation (`keyd_types::KeyPurpose::of_service_name`,
+/// through crate::names — every purpose but `Service`): from any of its
+/// servicePrincipalName values (a service name — docs/47 §1.3 TGS), or from
+/// its sAMAccountName as a one-component client name (docs/47 §1.3 AS).
+/// Judged on every object of every class, whatever the class rules below
+/// would say of the value. A value that is not UTF-8 ⇒ `Value`.
+/// Spec: docs/52 R2b; docs/questions/Q-491 item 1, Q-541, Q-972; docs/47
+/// §1.3.
+fn reserved_purposes_formed(ids: &Ids, obj: &Object) -> Result<Vec<KeyPurpose>, V> {
     let values = |id: AttrId| {
         obj.attribute(id)
             .map(|a| {
@@ -213,19 +222,55 @@ fn forms_admin_service_name(ids: &Ids, obj: &Object) -> Result<bool, V> {
             })
             .unwrap_or_default()
     };
+    let mut formed = Vec::new();
     for value in values(ids.service_principal_name) {
         let spn = core::str::from_utf8(value).map_err(|_| V::Value)?;
-        if names::spn_derives_admin_service(spn) {
-            return Ok(true);
-        }
+        formed.extend(names::reserved_purpose_of_spn(spn));
     }
     for value in values(ids.sam_account_name) {
         let sam = core::str::from_utf8(value).map_err(|_| V::Value)?;
-        if names::client_name_derives_admin_service(sam) {
-            return Ok(true);
-        }
+        formed.extend(names::reserved_purpose_of_client_name(sam));
     }
-    Ok(false)
+    Ok(formed)
+}
+
+/// The provisioning claim that alone may carry a name from which the
+/// reserved key-set purpose `purpose` derives: the admin service object for
+/// `AdminService` (`admind/<fqdn>`, A-73, Q-541) and the change-password
+/// service object for `ChangePasswordService` (`kadmin/changepw`, RFC 3244
+/// §2, task K9). Every other purpose has no claim, so a name deriving it is
+/// carried by nothing. Written as a match over the purposes (patterns, not a
+/// purpose chosen by a literal — docs/52 R2b) and exhaustive over them, so a
+/// purpose added to keyd-types later has no claim until one is written here
+/// (fail closed).
+/// Spec: docs/52 R2b; docs/53 §5.2, §10 (K9); docs/questions/Q-541, Q-972.
+fn claim_of_reserved_purpose(purpose: KeyPurpose) -> Option<ProvisioningRole> {
+    match purpose {
+        KeyPurpose::AdminService => Some(ProvisioningRole::AdminServiceObject),
+        KeyPurpose::ChangePasswordService => Some(ProvisioningRole::ChangePasswordServiceObject),
+        KeyPurpose::PrincipalLongterm | KeyPurpose::Krbtgt | KeyPurpose::Service => None,
+    }
+}
+
+/// `true` if the provisioning claim `role` exists to carry the name of a
+/// reserved key-set purpose (so an object under it that carries none is an
+/// `Exception`). Exhaustive over the claims, so a claim added later takes a
+/// position here; kept consistent with [`claim_of_reserved_purpose`] by the
+/// unit test `every_reserved_claim_has_its_purpose`.
+/// Spec: docs/52 R2b; docs/questions/Q-541, Q-972.
+fn claims_a_reserved_purpose(role: Option<ProvisioningRole>) -> bool {
+    match role {
+        Some(
+            ProvisioningRole::AdminServiceObject | ProvisioningRole::ChangePasswordServiceObject,
+        ) => true,
+        Some(
+            ProvisioningRole::NamingContextRoot
+            | ProvisioningRole::Krbtgt
+            | ProvisioningRole::DcAccount
+            | ProvisioningRole::ServiceObject,
+        )
+        | None => false,
+    }
 }
 
 /// description, when present: 1..1024 UTF-16 units, no control character.
@@ -308,21 +353,41 @@ fn check_user(ids: &Ids, obj: &Object, role: Option<ProvisioningRole>) -> Result
 /// a service object WT without pwdLastSet (its keys come from
 /// `create_key`, Q-376 item 6); the admin service object likewise, its one
 /// SPN the admin service's name (`names::admin_service_spn_ok` — the only
-/// object that may carry it, docs/questions/Q-541).
+/// object that may carry it, docs/questions/Q-541); the change-password
+/// service object likewise, its one SPN `kadmin/changepw`
+/// (`names::change_password_service_spn_ok` — task K9, Q-972).
 /// Spec: [MS-SAMR] 3.1.1.6 items 8-12, 20, 23, 24; docs/51 §4.3 step 5,
 /// §5.2 row 2, §11; docs/47 §1.3; RFC 4120 §6.2.1; A-79.
 fn check_computer(ids: &Ids, obj: &Object, role: Option<ProvisioningRole>) -> Result<(), V> {
-    let (account_type, dc, service, admin) = match role {
-        None => (ADS_UF_WORKSTATION_TRUST_ACCOUNT, false, false, false),
+    let (account_type, dc, service, spn_rule) = match role {
+        None => (
+            ADS_UF_WORKSTATION_TRUST_ACCOUNT,
+            false,
+            false,
+            SpnRule::Host,
+        ),
         Some(ProvisioningRole::ServiceObject) => {
-            (ADS_UF_WORKSTATION_TRUST_ACCOUNT, false, true, false)
+            (ADS_UF_WORKSTATION_TRUST_ACCOUNT, false, true, SpnRule::Host)
         }
         // The admin service object (docs/52 R2b follow-up; Q-541): a service
         // object whose one SPN is the admin service's name.
-        Some(ProvisioningRole::AdminServiceObject) => {
-            (ADS_UF_WORKSTATION_TRUST_ACCOUNT, false, true, true)
+        Some(ProvisioningRole::AdminServiceObject) => (
+            ADS_UF_WORKSTATION_TRUST_ACCOUNT,
+            false,
+            true,
+            SpnRule::AdminService,
+        ),
+        // The change-password service object (task K9; docs/53 §5.2): a
+        // service object whose one SPN is `kadmin/changepw` (RFC 3244 §2).
+        Some(ProvisioningRole::ChangePasswordServiceObject) => (
+            ADS_UF_WORKSTATION_TRUST_ACCOUNT,
+            false,
+            true,
+            SpnRule::ChangePasswordService,
+        ),
+        Some(ProvisioningRole::DcAccount) => {
+            (ADS_UF_SERVER_TRUST_ACCOUNT, true, false, SpnRule::None)
         }
-        Some(ProvisioningRole::DcAccount) => (ADS_UF_SERVER_TRUST_ACCOUNT, true, false, false),
         Some(_) => return Err(V::Exception),
     };
     let name = text(obj, ids.cn)?;
@@ -338,13 +403,32 @@ fn check_computer(ids: &Ids, obj: &Object, role: Option<ProvisioningRole>) -> Re
     if !names::dns_host_name_ok(host) {
         return Err(V::Value);
     }
-    match record::text(obj, ids.service_principal_name) {
-        Ok(None) if !admin => {}
-        Ok(Some(spn)) if !dc && !admin && names::spn_ok(spn, host) => {}
-        Ok(Some(spn)) if admin && names::admin_service_spn_ok(spn, host) => {}
+    match (spn_rule, record::text(obj, ids.service_principal_name)) {
+        (SpnRule::Host | SpnRule::None, Ok(None)) => {}
+        (SpnRule::Host, Ok(Some(spn))) if names::spn_ok(spn, host) => {}
+        (SpnRule::AdminService, Ok(Some(spn))) if names::admin_service_spn_ok(spn, host) => {}
+        (SpnRule::ChangePasswordService, Ok(Some(spn)))
+            if names::change_password_service_spn_ok(spn) => {}
         _ => return Err(V::Value),
     }
     check_account_values(ids, obj, !dc && !service)
+}
+
+/// The servicePrincipalName rule of a computer, by the claim it makes.
+/// Spec: docs/51 §4.3 step 5, §5.2 row 2; docs/47 §1.3; A-73; docs/53 §5.2;
+/// docs/questions/Q-541, Q-972.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpnRule {
+    /// No SPN (the DC account, docs/51 §4.3 step 5).
+    None,
+    /// At most one SPN, `service "/" dNSHostName`, not reserved
+    /// (`names::spn_ok`).
+    Host,
+    /// Exactly the admin service's name on the object's host
+    /// (`names::admin_service_spn_ok`).
+    AdminService,
+    /// Exactly `kadmin/changepw` (`names::change_password_service_spn_ok`).
+    ChangePasswordService,
 }
 
 /// A group: cn = sAMAccountName (Q-355 item 1), the group name rules
@@ -451,5 +535,43 @@ pub(crate) fn check_change(
     } else {
         // whenChanged.
         one().map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod reserved_claim_tests {
+    use super::{
+        claim_of_reserved_purpose, claims_a_reserved_purpose, KeyPurpose, ProvisioningRole,
+    };
+
+    /// The two exhaustive matches agree: a claim that exists to carry a
+    /// reserved name is exactly a claim some reserved purpose maps to, and
+    /// the online path (`None`) carries none. Source: docs/52 R2b;
+    /// docs/questions/Q-541, Q-972.
+    #[test]
+    fn every_reserved_claim_has_its_purpose() {
+        let purposes = [
+            KeyPurpose::PrincipalLongterm,
+            KeyPurpose::Krbtgt,
+            KeyPurpose::Service,
+            KeyPurpose::AdminService,
+            KeyPurpose::ChangePasswordService,
+        ];
+        let roles = [
+            None,
+            Some(ProvisioningRole::NamingContextRoot),
+            Some(ProvisioningRole::Krbtgt),
+            Some(ProvisioningRole::DcAccount),
+            Some(ProvisioningRole::ServiceObject),
+            Some(ProvisioningRole::AdminServiceObject),
+            Some(ProvisioningRole::ChangePasswordServiceObject),
+        ];
+        for role in roles {
+            let mapped = role.is_some()
+                && purposes
+                    .iter()
+                    .any(|purpose| claim_of_reserved_purpose(*purpose) == role);
+            assert_eq!(mapped, claims_a_reserved_purpose(role), "{role:?}");
+        }
     }
 }
