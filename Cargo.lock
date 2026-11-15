@@ -602,6 +602,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ipc-kpasswd"
+version = "0.0.0"
+dependencies = [
+ "ipc",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "ipc-ldap"
 version = "0.0.0"
 dependencies = [
@@ -762,6 +771,25 @@ name = "keyd-types"
 version = "0.0.0"
 dependencies = [
  "krb-proto",
+]
+
+[[package]]
+name = "kpasswd-front"
+version = "0.0.0"
+dependencies = [
+ "config",
+ "daemon-sandbox",
+ "ipc",
+ "ipc-audit",
+ "ipc-audit-client",
+ "ipc-kpasswd",
+ "keyd-types",
+ "krb-proto",
+ "parse-kpasswd",
+ "protected-file",
+ "test-scratch",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]

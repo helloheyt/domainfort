@@ -1,0 +1,105 @@
+# kpasswd-front — the network front of the Kerberos change-password service
+# (RFC 3244; docs/53 R53-3, R53-4, §3.3, §5.1, §5.7, §8, §9; decision A-117;
+# build task K8): TCP 464 only (no UDP code path — A-117, docs/questions/
+# Q-602 (a)), bound as root and dropped through daemon-sandbox (docs/50
+# §6.2, R50-14), listeners and sources only inside `internal_networks`
+# (docs/52 R14, A-114), connection quotas and the first-frame deadline of
+# docs/53 §5.1, the RFC 3244 framing through parse-kpasswd (version 0xff80
+# only — every other version, version 1 included, is answered BAD_VERSION:
+# A-117, A-142, P-31 open), each request forwarded to dird over ipc-kpasswd
+# and keyd's sealed reply relayed, and one KRB-ERROR encoder for the front's
+# own answers (never result code 0 — the type cannot hold it, A-121).
+#
+# HOLDS NO KEY, NO STORE AND NO KEYD CHANNEL (docs/53 R53-4, §4.2 option D):
+# it links no krb-crypto, keyd, keyd-types, ipc-keyd, dirstore, redb or
+# directory crate — tests/holds_no_key.rs, with a positive control. It never
+# sees the new password: that is inside the client's KRB-PRIV, under a
+# subkey only keyd recovers.
+#
+# Written only from this project's decided design (docs/53, docs/50, docs/52
+# R14, docs/questions Q-600..Q-605, Q-620, Q-621, Q-660..Q-664, Q-830, Q-831,
+# Q-945 and PENDING-OWNER A-114, A-117, A-121, A-126, A-142, A-151, A-156),
+# RFC 3244 §2 and RFC 4120 §5.9.1, §6.2, §7.2.2, §7.5.9 (pinned copies,
+# SHA-256 verified this session), the public API of the workspace crates
+# named below (ldap-front and kdc-daemon as the pattern), and the docs.rs API
+# pages of tokio 1.54.1 and zeroize 1.9.1 (API documentation only, never
+# source — PENDING-OWNER P-2). No other implementation, kpasswd server,
+# daemon or server framework was consulted or recalled (AGENTS.md §1-3).
+
+[package]
+name = "kpasswd-front"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "kpasswd_front"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kpasswd-front"
+path = "src/main.rs"
+
+[dependencies]
+# tokio — owner decision P-12, the asynchronous runtime for the network
+# side. Linked, never copied; only its docs.rs API pages were read (P-2).
+# The subset the other daemons use (never `macros` or `full`):
+#   rt      — `runtime::Builder::new_current_thread`, `spawn`, `task::JoinSet`;
+#   net     — `net::TcpListener` / `net::TcpStream` (`from_std`);
+#   time    — `time::timeout`, `time::sleep`;
+#   sync    — `sync::{Semaphore, Notify}`;
+#   io-util — `AsyncReadExt::read_exact`, `AsyncWriteExt::{write_all, shutdown}`.
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "net", "time", "sync", "io-util"] }
+# RustCrypto `zeroize` (OD-9; already in the lock): the request buffer (it
+# carries the client's KRB-PRIV) is wiped.
+zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
+# Our own workspace crates (path dependencies).
+#
+# The RFC 3244 framing: `tcp_message_length` (bound before allocation),
+# `RequestMessage::parse`, `Error::result_code`, `ReplyMessage::{ap_rep,
+# krb_error}` + `encode_tcp` (docs/questions/Q-621 "Impact: K8").
+parse-kpasswd = { path = "../parse-kpasswd" }
+# The KRB-ERROR encoder (`KrbError`, `KerberosTime`, `Microseconds`,
+# `PrincipalName`, `Realm`, `NonZeroResultCode`). The DER codec only — it
+# never encrypts or decrypts (crates/krb-proto: "this crate never encrypts
+# or decrypts"); already linked through parse-kpasswd.
+krb-proto = { path = "../krb-proto" }
+# The kpasswd-front ↔ dird channel: `KpasswdClient`, `ExpectedDird`, the
+# value types (task K7).
+ipc-kpasswd = { path = "../ipc-kpasswd" }
+# The audit channel's `EventSource` (the source auditd must record the front
+# under — none exists yet: docs/questions/Q-955 item 1).
+ipc-audit = { path = "../ipc-audit" }
+# The start-up verification of auditd through the one audit client (task
+# R9b; docs/50 R50-16, §7.5) — its tokio is the one the front links.
+ipc-audit-client = { path = "../ipc-audit-client" }
+# `KpasswdFrontSettings`, `Network`, `is_internal`.
+config = { path = "../config" }
+# `HardeningPlan`, `SingleThreadProof`, `apply` (R50-14).
+daemon-sandbox = { path = "../daemon-sandbox" }
+# The protected-file reader (task F7, A-86 follow-up): the configuration
+# file is inspected without following a link, opened with O_NOFOLLOW and
+# checked on the opened descriptor. rustix inside (P-12), already in the
+# lock — no new package.
+protected-file = { path = "../protected-file" }
+
+# No `[features]` and no test seam (docs/52 C18): the tests that run `serve`
+# with a stand-in audit source (no kpasswd-front source exists yet —
+# docs/questions/Q-955 item 1) are crate-internal `#[cfg(test)]` modules
+# (`src/tests/`), so no build of any other crate can reach that entry.
+
+[dev-dependencies]
+# TESTS ONLY: the fake auditd and dird of the tests speak the real channels
+# (the ipc framing; ipc-audit's `Pong`).
+ipc = { path = "../ipc" }
+# TESTS ONLY: pins the front's copy of the change-password service name and
+# its clock conversion to keyd's one definition (keyd-types
+# `CHANGE_PASSWORD_SERVICE_NAME`, `kerberos_time_seconds`) — a dev-dependency,
+# never in the front's normal graph (tests/holds_no_key.rs checks that).
+keyd-types = { path = "../keyd-types" }
+# The scratch directories, inside the workspace, of the tests whose files a
+# crates/protected-file reader opens (task T; docs/questions/Q-480).
+test-scratch = { path = "../test-scratch" }
+
+[lints]
+workspace = true

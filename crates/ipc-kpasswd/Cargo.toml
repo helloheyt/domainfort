@@ -1,0 +1,63 @@
+# ipc-kpasswd — the kpasswd-front ↔ dird channel (`dird-kpasswd.sock`, magic
+# 0x4B50 "KP", version 1): its message set, dird's decoding and its dispatch
+# skeleton (a host trait dird implements later), and the front's side of it —
+# an asynchronous client that cannot be built without the dird it expects
+# (dird's uid and the zone dird must assign the front) and checks both on
+# every connection before it sends anything (docs/53 §4.3, §5.6, §5.9, R53-4;
+# decision A-117; build task K7, channel part only).
+#
+# THE NEW PASSWORD NEVER CROSSES THIS CHANNEL IN CLEAR, by construction:
+# * this crate links no krb-proto and no krb-crypto, so no type that holds a
+#   decrypted KRB-PRIV payload (krb-proto's UserData / EncKrbPrivPart /
+#   ChangePasswdData / NewPasswd) can be named in its message set, and no
+#   code linked here can decrypt one (tests/no_cleartext_password.rs);
+# * no field is an `ipc::Secret` — the channel's octet types are the two
+#   Kerberos messages exactly as the client sent them;
+# * the KRB-PRIV field admits only octets whose identifier is the KRB-PRIV's
+#   [APPLICATION 21] (RFC 4120 §5.7.1, §5.10; X.690 8.1.2): the password is
+#   inside its `enc-part`, under the Authenticator's subkey that only keyd
+#   recovers (RFC 3244 §2); the cleartext form, EncKrbPrivPart
+#   [APPLICATION 28], is refused at construction and at decoding.
+#
+# A library: no daemon, no listener, no directory, no key. The dird-side
+# integration (the kpasswd thread, its queue, the keyd calls) is a later
+# task; kpasswd-front links this crate as its client.
+#
+# Provenance: written only from docs/53 (§3.3, §4.1–§4.5, §5.1, §5.5–§5.9, §8,
+# §9, §10 K7), docs/50 (§3.1–§3.7 and the channel-magic registry row
+# "dird-kpasswd.sock | ipc-kpasswd | 0x4B50"), decisions A-114, A-117, A-121,
+# A-126, A-142, docs/questions Q-600..Q-605, Q-620, Q-621, Q-660..Q-664,
+# RFC 3244 §2 and RFC 4120 §5.7.1, §5.10, §7.1 (pinned copies, SHA-256 verified
+# this session), ITU-T X.690 (02/2021, pinned) 8.1.2, 8.14, the public API of
+# this workspace's crate ipc (ipc-dns, ipc-dns-server and ldap-front's dird
+# client as the pattern), and the docs.rs API pages of tokio 1.54.1 and
+# zeroize 1.9.1 (P-2). No other implementation was consulted or recalled
+# (AGENTS.md §1-3).
+
+[package]
+name = "ipc-kpasswd"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Our own workspace crate: the framing, the envelope, the field primitives
+# and the shared `Refused` reply (docs/50 §3.3; A-59).
+ipc = { path = "../ipc" }
+# RustCrypto `zeroize` (OD-9; already in the lock): the forwarded Kerberos
+# messages (the KRB-PRIV carries the encrypted password) and the reply
+# buffers are wiped.
+zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
+# tokio — owner decision P-12 (already in the lock, the version and features
+# crate ipc-audit-client uses): the front's client — its Unix socket, the
+# kernel's peer credentials (`UnixStream::peer_cred`), deadlines and
+# reads/writes. Usage documentation only (docs.rs, P-2), never its source.
+tokio = { version = "1.54.1", default-features = false, features = ["net", "time", "io-util"] }
+
+[dev-dependencies]
+# TESTS ONLY: a runtime for the client's tests (the features the daemons
+# already use, P-12).
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "net", "time", "io-util", "sync"] }
+
+[lints]
+workspace = true

@@ -84,6 +84,7 @@ mod format;
 mod kdc;
 mod keyadm;
 mod keyd;
+mod kpasswd_front;
 mod ldap_front;
 pub mod limits;
 pub mod line_format;
@@ -110,6 +111,7 @@ pub use kdc::{
 };
 pub use keyadm::KeyadmSettings;
 pub use keyd::{KeyStoreKind, KeydSettings, RoleMap, RoleName, MAX_CONNECTIONS_PER_UID_BOUND};
+pub use kpasswd_front::{KpasswdFrontLimits, KpasswdFrontSettings, DIRD_KPASSWD_DEADLINE_SECS};
 pub use ldap_front::{
     LdapFrontLimits, LdapFrontSettings, DIRD_LDAP_DEADLINE_SECS, INIT_RECV_TIMEOUT_SECS,
     MAX_CONN_IDLE_TIME_SECS, TLS_HANDSHAKE_TIMEOUT_SECS,
