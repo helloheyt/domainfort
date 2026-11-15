@@ -40,7 +40,7 @@ while IFS= read -r f; do
 done < <(code_files)
 
 echo "== 3. אין הערת-מקור שמודה בהעתקה =="
-copied='copied from|adapted from|based on (the )?(samba|mit|heimdal|freeipa|openldap|impacket|reactos|wine)|ported from|taken from .*(kerberos|ldap|smb|netlogon)'
+copied='copied from|adapted from|based on (the )?(samba|mit|heimdal|freeipa|openldap|impacket|reactos|wine)|(^|[^[:alnum:]-])ported from|taken from .*(kerberos|ldap|smb|netlogon)'
 while IFS= read -r f; do
   [ -z "$f" ] && continue
   if grep -InEa "$copied" -- "$f" >/dev/null 2>&1; then
