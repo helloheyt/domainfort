@@ -163,8 +163,8 @@ pub const WORKSTATION_SAM: &str = "ws1$";
 
 /// The passwords of the run. Hand-made, distinctive, never written by any
 /// component (docs/51 §4.4; docs/37 §2) — the tests search every log and
-/// file for them. Each meets admind's rules (A-79: ≥ 12 characters, not
-/// containing the account name).
+/// file for them. Each meets keyd's password policy (crate
+/// admin-password-policy: docs/56 §7 P-24 on top of [MS-SAMR] 3.1.1.7.2).
 pub const ALICE_PASSWORD: &str = "Tier0-Opening-Phrase-A1";
 pub const BOB_PASSWORD: &str = "Tier0-Opening-Phrase-B2";
 pub const WORKSTATION_PASSWORD: &str = "Workstation-Fixture-Secret-W9";

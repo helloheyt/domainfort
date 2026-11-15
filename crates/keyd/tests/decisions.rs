@@ -482,7 +482,7 @@ fn the_seal_ends_the_ceremony() {
             &DIRECTORY,
             &CAROL,
             &carol_binding(),
-            z("her first passphrase"),
+            z("Sienna-Walrus-83-Kelp"),
             CAROL_SALT,
             &now()
         ),
@@ -660,7 +660,7 @@ fn a_destroy_decision_removes_both_key_sets() {
                     &DIRECTORY,
                     &handle,
                     &binding,
-                    z("machine-passphrase-01"),
+                    z("Puffin-Sorrel-81-Tulip"),
                     salt,
                     &now()
                 ),
@@ -793,7 +793,7 @@ fn a_destroy_registration_discards_the_principals_set_secret_decisions() {
             &DIRECTORY,
             &CAROL,
             &carol_binding(),
-            z("her first passphrase"),
+            z("Sienna-Walrus-83-Kelp"),
             CAROL_SALT,
             &now()
         ),
@@ -807,7 +807,7 @@ fn a_destroy_registration_discards_the_principals_set_secret_decisions() {
         f.records()[f.records().len() - 1].reason,
         AuditReason::KeyNotFound
     );
-    assert!(!f.password_works(&CAROL, "her first passphrase", CAROL_SALT));
+    assert!(!f.password_works(&CAROL, "Sienna-Walrus-83-Kelp", CAROL_SALT));
 
     // A computer: both handles' entries go, two records (PrincipalLongterm,
     // then Service).
@@ -849,7 +849,7 @@ fn a_destroy_registration_discards_the_principals_set_secret_decisions() {
             &DIRECTORY,
             &ALICE,
             &alice_binding(),
-            z("a new password"),
+            z("Gecko-Iris-38-Kiwi"),
             ALICE_SALT,
             &now()
         ),
@@ -950,7 +950,7 @@ fn the_n1_takeover_is_refused_at_every_step() {
                 &DIRECTORY,
                 &ALICE,
                 &alice_binding(),
-                z("attacker's password"),
+                z("Yarrow-Bramble-72-Pollen"),
                 ALICE_SALT,
                 &now()
             ),
@@ -960,7 +960,7 @@ fn the_n1_takeover_is_refused_at_every_step() {
         // alice's key set is untouched: her password works, the attacker's
         // does not, and her next decided password set is kvno 2.
         assert!(f.password_works(&ALICE, ALICE_PASSWORD, ALICE_SALT));
-        assert!(!f.password_works(&ALICE, "attacker's password", ALICE_SALT));
+        assert!(!f.password_works(&ALICE, "Yarrow-Bramble-72-Pollen", ALICE_SALT));
         f.grant(&ALICE, &alice_binding(), ALICE_SALT, &now())
             .unwrap();
         assert_eq!(
@@ -968,7 +968,7 @@ fn the_n1_takeover_is_refused_at_every_step() {
                 &DIRECTORY,
                 &ALICE,
                 &alice_binding(),
-                z("her next passphrase"),
+                z("Walnut-Raven-15-Cedar"),
                 ALICE_SALT,
                 &now()
             ),

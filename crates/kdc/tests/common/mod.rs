@@ -362,11 +362,11 @@ pub const CHANGEPW: KeyHandle = KeyHandle::new(
 );
 
 /// Passwords and keys chosen for these tests; marker bytes easy to spot.
-/// Task K3: keyd enforces the password policy (no account name of more than
-/// two characters as a substring, [MS-SAMR] 3.1.1.7.2 item 3.2.2), so the
-/// passwords do not contain the account names.
-pub const ALICE_PASSWORD: &str = "first-clean-room-pass";
-pub const BOB_PASSWORD: &str = "second-clean-room-pass";
+/// Task K3 / P-24: keyd enforces the password policy (crate
+/// admin-password-policy — docs/56 §7 P-24 on top of [MS-SAMR] 3.1.1.7.2),
+/// so the passwords are made-up values that meet it.
+pub const ALICE_PASSWORD: &str = "Jetty-Lark-39-Marten";
+pub const BOB_PASSWORD: &str = "Kiln-Mink-27-Nook";
 pub const ALICE_SALT: &str = "EXAMPLE.ORGalice";
 pub const BOB_SALT: &str = "EXAMPLE.ORGbob";
 pub const KRBTGT_KEY: [u8; 32] = [0xC7; 32];

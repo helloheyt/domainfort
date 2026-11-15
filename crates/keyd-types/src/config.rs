@@ -30,19 +30,22 @@ pub const MAX_CLOCK_SKEW_SECS: u32 = 3_600;
 /// "short (seconds)").
 pub const MAX_TOKEN_LIFETIME_SECS: u32 = 300;
 
-/// The least value of [`KeydConfig::min_password_chars`]: 12 characters — the
-/// project's interim floor (P-24: no allowed source fixes a value; the
-/// phase-1 schema has no minPwdLength). Also the default.
-/// Spec: [MS-SAMR] 3.1.1.7.2 item 3.2.1; PENDING-OWNER P-24, A-79;
-/// docs/53 §6.1 (`min_password_chars`, floor 12); docs/questions/Q-605
-/// item 2 (A-117).
-pub const MIN_PASSWORD_CHARS_FLOOR: u32 = 12;
+/// The least value of [`KeydConfig::min_password_chars`]: 8 characters — the
+/// owner's minimum (docs/56 §7 P-24: "8+ characters"; it replaces the
+/// interim floor of 12). Also the default; an operator may only raise it
+/// (PENDING-OWNER P-24). keyd pins this value to crate
+/// admin-password-policy's `MIN_PASSWORD_CHARS_FLOOR` (keyd `directory.rs`),
+/// which also refuses a shorter password whatever minimum it is given.
+/// Spec: [MS-SAMR] 3.1.1.7.2 item 3.2.1; docs/56 §7 (P-24); PENDING-OWNER
+/// P-24, A-79; docs/53 §6.1 (`min_password_chars`); docs/questions/Q-605
+/// item 2 (A-117), Q-910 item 2.
+pub const MIN_PASSWORD_CHARS_FLOOR: u32 = 8;
 
 /// The greatest value of [`KeydConfig::min_password_chars`]: 256 — no
 /// password can be longer ([MS-SAMR] 3.1.1.7.2 item 2: "less than or equal
 /// to 256 characters"), so a larger minimum would refuse every password.
-/// Spec: [MS-SAMR] 3.1.1.7.2 item 2; docs/questions/Q-605 item 2 ("floor
-/// 12, maximum 256").
+/// Spec: [MS-SAMR] 3.1.1.7.2 item 2; docs/questions/Q-605 item 2 ("maximum
+/// 256").
 pub const MAX_MIN_PASSWORD_CHARS: u32 = 256;
 
 /// Ticket flags an operator MAY place in the allowed mask.
@@ -355,14 +358,16 @@ mod tests {
         assert_eq!(base().validate(), Ok(()));
     }
 
-    /// P-24 / docs/53 §6.1 (Q-605 item 2): the minimum password length is
-    /// 12 by default and 12 ..= 256; anything else is refused.
+    /// docs/56 §7 P-24 / docs/53 §6.1 (Q-605 item 2): the minimum password
+    /// length is 8 by default and 8 ..= 256 (an operator may raise it);
+    /// anything else is refused.
     #[test]
     fn min_password_chars_is_bounded() {
-        assert_eq!(base().min_password_chars, 12);
+        assert_eq!(base().min_password_chars, 8);
         for (value, ok) in [
             (0, false),
-            (11, false),
+            (7, false),
+            (8, true),
             (12, true),
             (64, true),
             (256, true),

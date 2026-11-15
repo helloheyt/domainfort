@@ -1,21 +1,26 @@
-# admin-password-policy — the management plane's password rules ([MS-SAMR]
-# 3.1.1.7.2 as phase 1 applies them; docs/51 §4.4, §11, R51-5; decisions
-# A-79, A-94 on Q-401), shared by admind's `SetPassword` (task A9) and
-# `provision first-admin-secret` (task A6, docs/51 §4.3 step 12), so the two
-# can never apply different rules.
+# admin-password-policy — the password policy, in one place: the owner's
+# rules (docs/56 §7, P-24) on top of [MS-SAMR] 3.1.1.7.2 as phase 1 applies
+# it (docs/51 §4.4, §11, R51-5; decisions A-79, A-94 on Q-401). Enforced by
+# keyd's one password-install path (Q-605 / A-117, Q-664 / A-126) and
+# pre-checked with the same function by `provision first-admin-secret`;
+# admind's `SetPassword` runs its length and account-name rules as
+# non-authoritative early checks (task K11).
 #
-# The code was written for admind in task A9 (crates/admin-daemon
-# src/password.rs) and moved here unchanged in task A6; admin-daemon's
-# module `password` re-exports it.
+# The length and account-name rules were written for admind in task A9
+# (crates/admin-daemon src/password.rs) and moved here in task A6;
+# admin-daemon's module `password` re-exports them. Task P-24 (wave D1-c)
+# added the owner's rules and `check_password`.
 #
 # A leaf library: no dependency at all, no I/O, no unsafe.
 #
-# Provenance: written only from [MS-SAMR] v20260427 §3.1.1.7.2 (pinned,
-# SHA-256 083fe00a…8a4e verified against tools/spec-pin/manifest.json),
-# docs/51 (§4.4, §5.2 row 5, §7.6, §11), docs/37 §2 and the decisions in
-# docs/questions/PENDING-OWNER.md (A-79, A-94, P-24) and Q-401. No other
-# implementation or password service was consulted or recalled (AGENTS.md
-# §1-3).
+# Provenance: written only from [MS-SAMR] v20260427 §3.1.1.7.2 items 1, 2,
+# 3.2.1-3.2.4 (pinned, SHA-256 083fe00a…8a4e verified against
+# tools/spec-pin/manifest.json; text extracted with pypdf, pages 115-117),
+# docs/56 §7 (P-24), docs/51 (§4.4, §5.2 row 5, §7.6, §11), docs/47 §3.3,
+# §9.1, docs/37 §2 and the decisions in docs/questions/PENDING-OWNER.md
+# (A-79, A-94, A-117, A-121, A-126, P-24) and Q-401, Q-605, Q-664, Q-910,
+# Q-911. No other implementation, password service or password word list was
+# consulted or recalled (AGENTS.md §1-3).
 
 [package]
 name = "admin-password-policy"

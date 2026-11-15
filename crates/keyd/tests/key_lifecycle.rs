@@ -31,7 +31,7 @@ const CAROL: KeyHandle = KeyHandle::new(
     PrincipalId::from_bytes([0xCA; 16]),
     KeyPurpose::PrincipalLongterm,
 );
-const CAROL_PASSWORD: &str = "her first passphrase";
+const CAROL_PASSWORD: &str = "Sienna-Walrus-83-Kelp";
 const CAROL_SALT: &str = "EXAMPLE.ORGcarol";
 
 fn carol_name() -> PrincipalName {
@@ -101,7 +101,7 @@ fn set_secret_on_a_new_set_returns_the_initial_kvno() {
 fn set_secret_on_an_existing_set_returns_current_plus_one() {
     let mut f = Fixture::new();
     // alice was created at kvno 1 by the fixture.
-    for (password, expected) in [("a second passphrase", 2), ("a third passphrase", 3)] {
+    for (password, expected) in [("Willow-Plume-65-Ivory", 2), ("Hollow-Ibis-79-Spruce", 3)] {
         f.grant(&ALICE, &alice_binding(), ALICE_SALT, &now())
             .unwrap();
         assert_eq!(
@@ -122,7 +122,7 @@ fn set_secret_on_an_existing_set_returns_current_plus_one() {
         .verify_preauth(
             &KDC,
             &ALICE,
-            &pa_with("a third passphrase", ALICE_SALT, 3),
+            &pa_with("Hollow-Ibis-79-Spruce", ALICE_SALT, 3),
             None,
             &now()
         )
@@ -132,7 +132,7 @@ fn set_secret_on_an_existing_set_returns_current_plus_one() {
         f.keyd.verify_preauth(
             &KDC,
             &ALICE,
-            &pa_with("a second passphrase", ALICE_SALT, 2),
+            &pa_with("Willow-Plume-65-Ivory", ALICE_SALT, 2),
             None,
             &now()
         ),
@@ -159,7 +159,7 @@ fn set_secret_on_an_existing_set_returns_current_plus_one() {
             &DIRECTORY,
             &SERVICE,
             &service_binding(),
-            z("service password"),
+            z("Cinder-Otter-48-Bloom"),
             "EXAMPLE.ORGhostfiles.example.org",
             &now(),
         ),
@@ -188,7 +188,7 @@ fn destroyed_handle_is_unknown_to_every_operation() {
             &DIRECTORY,
             &ALICE,
             &alice_binding(),
-            z("a second passphrase"),
+            z("Willow-Plume-65-Ivory"),
             ALICE_SALT,
             &now(),
         ),
@@ -199,7 +199,7 @@ fn destroyed_handle_is_unknown_to_every_operation() {
         .verify_preauth(
             &KDC,
             &ALICE,
-            &pa_with("a second passphrase", ALICE_SALT, 2),
+            &pa_with("Willow-Plume-65-Ivory", ALICE_SALT, 2),
             None,
             &now(),
         )
@@ -215,7 +215,7 @@ fn destroyed_handle_is_unknown_to_every_operation() {
     assert_eq!(last.kvno, Some(Kvno::new(2)));
     assert_eq!(last.decision, Some(destroy));
 
-    for (password, kvno) in [("a second passphrase", 2), (ALICE_PASSWORD, 1)] {
+    for (password, kvno) in [("Willow-Plume-65-Ivory", 2), (ALICE_PASSWORD, 1)] {
         assert_eq!(
             f.keyd.verify_preauth(
                 &KDC,
@@ -287,7 +287,7 @@ fn destroyed_handle_is_unknown_to_every_operation() {
             &DIRECTORY,
             &ALICE,
             &krbtgt_binding(),
-            z("a new passphrase"),
+            z("Lagoon-Ember-27-Finch"),
             ALICE_SALT,
             &now(),
         ),
@@ -306,7 +306,7 @@ fn destroyed_handle_is_unknown_to_every_operation() {
             &DIRECTORY,
             &ALICE,
             &alice_binding(),
-            z("a new passphrase"),
+            z("Lagoon-Ember-27-Finch"),
             ALICE_SALT,
             &now(),
         ),
@@ -317,7 +317,7 @@ fn destroyed_handle_is_unknown_to_every_operation() {
         .verify_preauth(
             &KDC,
             &ALICE,
-            &pa_with("a new passphrase", ALICE_SALT, 1),
+            &pa_with("Lagoon-Ember-27-Finch", ALICE_SALT, 1),
             None,
             &now()
         )
@@ -443,7 +443,7 @@ fn destroy_takes_both_key_sets_of_the_principal() {
                 &DIRECTORY,
                 &handle,
                 &bound(name),
-                z("machine password"),
+                z("Maple-Gravel-94-Wren"),
                 salt,
                 &now(),
             ),
@@ -455,7 +455,7 @@ fn destroy_takes_both_key_sets_of_the_principal() {
         .verify_preauth(
             &KDC,
             &client,
-            &pa_with("machine password", salt, 1),
+            &pa_with("Maple-Gravel-94-Wren", salt, 1),
             None,
             &now(),
         )
@@ -483,7 +483,7 @@ fn destroy_takes_both_key_sets_of_the_principal() {
         f.keyd.verify_preauth(
             &KDC,
             &client,
-            &pa_with("machine password", salt, 1),
+            &pa_with("Maple-Gravel-94-Wren", salt, 1),
             None,
             &now()
         ),
@@ -497,7 +497,7 @@ fn destroy_takes_both_key_sets_of_the_principal() {
                 &DIRECTORY,
                 &handle,
                 &bound(name),
-                z("another machine password"),
+                z("Thistle-Copper-52-Wick"),
                 salt,
                 &now(),
             ),

@@ -44,9 +44,12 @@
 //!    admind's profile — not dumpable, memory locked, core 0). Nothing of a
 //!    password exists before this step.
 //! 5. **Passwords**: each file's single line, or each entered twice at the
-//!    terminal without echo; each checked by admind's own rules (module
-//!    [`line`], crate admin-password-policy). **Every** password is entered
-//!    and checked before keyd is contacted: a refusal sends nothing.
+//!    terminal without echo; each pre-checked by the rule set keyd enforces
+//!    (module [`line`], crate admin-password-policy `check_password`, with
+//!    admind's `min_password_length`, the sAMAccountName and the realm —
+//!    docs/56 §7 P-24; docs/questions/Q-605 item 3, Q-910). **Every**
+//!    password is entered and checked before keyd is contacted: a refusal
+//!    sends nothing.
 //! 6. **keyd**: a `ping` (the client checks keyd's peer uid before anything
 //!    is sent, R50-3), then for each first administrator, in the manifest's
 //!    order, `set_secret((GUID, PrincipalLongterm), NT-PRINCIPAL
@@ -265,7 +268,7 @@ impl fmt::Display for Refusal {
             }
             Refusal::PasswordRules { sam, min_chars } => write!(
                 f,
-                "the password for first administrator {sam} does not meet the password rules (at least {min_chars} characters, at most 256 UTF-16 code units and 1024 octets, not containing the account name)"
+                "the password for first administrator {sam} does not meet the password rules (at least {min_chars} characters, at most 256 UTF-16 code units and 1024 octets; an ASCII upper-case letter, lower-case letter, digit and special character; no three ascending, descending or repeated characters in a row; not containing the account name, the realm's name or a weak word)"
             ),
             Refusal::KeydClient => f.write_str("keyd's client cannot be configured"),
         }
@@ -399,11 +402,17 @@ where
                 })?
             }
         };
-        check_password(password.expose(), settings.min_password_length(), sam).map_err(|_| {
-            Refusal::PasswordRules {
-                sam: sam.to_owned(),
-                min_chars: settings.min_password_length(),
-            }
+        // keyd's own rule set (docs/questions/Q-605 item 3, Q-910): the
+        // account's name and the realm, as keyd will pass them.
+        check_password(
+            password.expose(),
+            settings.min_password_length(),
+            sam,
+            manifest.realm().as_str(),
+        )
+        .map_err(|_| Refusal::PasswordRules {
+            sam: sam.to_owned(),
+            min_chars: settings.min_password_length(),
         })?;
         passwords.push(password);
     }

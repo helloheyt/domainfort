@@ -164,9 +164,9 @@ const KDC_CALLER: CallerId = CallerId {
     uid: 1,
     role: Role::Kdc,
 };
-const USER_PASSWORD: &str = "fuzz-user-password";
+const USER_PASSWORD: &str = "Pallas-Sable-91-Teal";
 const USER_SALT: &str = "FUZZ.EXAMPLEfuzzer";
-const MACHINE_PASSWORD: &str = "fuzz-machine-secret";
+const MACHINE_PASSWORD: &str = "Rowan-Thrush-14-Vetch";
 const MACHINE_SALT: &str = "FUZZ.EXAMPLEhostfuzzhost.fuzz.example";
 /// Inputs per harness second (module docs).
 const INPUTS_PER_SECOND: u32 = 50;

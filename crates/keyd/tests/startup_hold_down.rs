@@ -438,7 +438,7 @@ fn directory_admin_and_daemon_support_operations_are_not_held() {
             &DIRECTORY,
             &BOB,
             &bob_binding(),
-            Zeroizing::new("his next passphrase".to_owned()),
+            Zeroizing::new("Ginger-Hemlock-35-Jasper".to_owned()),
             BOB_SALT,
             &at(50),
         ),

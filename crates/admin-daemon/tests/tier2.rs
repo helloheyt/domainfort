@@ -254,13 +254,17 @@ fn set_password_for_a_computer() {
     );
 }
 
-/// [MS-SAMR] 3.1.1.7.2 items 2, 3.2.1 with A-79's minimum: a password
-/// under `min_password_length` characters or over 256 UTF-16 units is
-/// refused `Invalid` BEFORE dird is asked (no `BeginPasswordSet` event);
-/// item 3.2.2: one containing the sAMAccountName (any case) is refused
-/// after `BeginPasswordSet` — never handed to keyd, completion reported
-/// `Failed` with no kvno; a two-character name is not checked. The events
-/// record `Failed{Validation, PasswordPolicy}` and nothing of which rule.
+/// keyd's rule set (crate admin-password-policy; [MS-SAMR] 3.1.1.7.2 and
+/// docs/56 §7 P-24; Q-910 item 13) as admind's pre-check: a password that
+/// breaks a rule on its text alone — under `min_password_length`
+/// characters, over 256 UTF-16 units, a missing character class, a
+/// sequence, a repeat, a weak word — is refused `Invalid` BEFORE dird is
+/// asked (no `BeginPasswordSet` event); one containing the sAMAccountName
+/// (any case) or the realm's organisation label is refused after
+/// `BeginPasswordSet` — never handed to keyd, completion reported `Failed`
+/// with no kvno; a two-character name is not checked. The events record
+/// `Failed{Validation, PasswordPolicy}` and nothing of which rule. Test
+/// data made up; the realm is EXAMPLE.ORG.
 #[test]
 fn every_password_rule_is_refused() {
     let Some(mut world) = World::new(Options {
@@ -272,13 +276,17 @@ fn every_password_rule_is_refused() {
     let mut conn = world.connect();
     let clef = '\u{1D11E}';
     for (text, why) in [
-        ("Short-Pass-123", "under the minimum (14 < 16)"),
+        ("Short-Pass-74!x", "under the minimum (15 < 16)"),
         (&"a".repeat(257) as &str, "257 UTF-16 units"),
         (
             &format!("{}{}", "a".repeat(255), clef) as &str,
             "255 + 2 UTF-16 units",
         ),
         (&clef.to_string().repeat(15) as &str, "15 code points"),
+        ("lantern-quartz-river-58", "no upper-case letter"),
+        ("Lantern-Quartz-Abc-58", "a sequence"),
+        ("Lantern-Quartz-111-Pw", "a repeat"),
+        ("Lantern-Quartz-Admin-58", "a weak word"),
     ] {
         assert_eq!(
             conn.call(&set_password(g(BOB), text)),
@@ -289,11 +297,13 @@ fn every_password_rule_is_refused() {
     // Nothing reached dird: no BeginPasswordSet event for bob.
     std::thread::sleep(Duration::from_millis(200));
     assert!(events_for(&world, DirAdminOperation::BeginPasswordSet, g(BOB)).is_empty());
-    // The sAMAccountName "bob", in any case, anywhere.
+    // The sAMAccountName "bob", in any case, anywhere; the realm's
+    // organisation label "example" (the binding's realm, EXAMPLE.ORG).
     for text in [
         "Mountain-BOB-River-77",
-        "bobcat-Lantern-Quartz",
-        "Lantern-Quartz-bOb",
+        "bobcat-Lantern-Quartz-58",
+        "Lantern-Quartz-bOb-58",
+        "Lantern-Example-Quartz-58",
     ] {
         assert_eq!(
             conn.call(&set_password(g(BOB), text)),
@@ -301,9 +311,9 @@ fn every_password_rule_is_refused() {
             "{text}"
         );
     }
-    let begin = await_events(&world, DirAdminOperation::BeginPasswordSet, g(BOB), 6);
-    assert_eq!(begin.len(), 6, "decision + outcome for each of the three");
-    let complete = await_events(&world, DirAdminOperation::CompletePasswordSet, g(BOB), 3);
+    let begin = await_events(&world, DirAdminOperation::BeginPasswordSet, g(BOB), 8);
+    assert_eq!(begin.len(), 8, "decision + outcome for each of the four");
+    let complete = await_events(&world, DirAdminOperation::CompletePasswordSet, g(BOB), 4);
     assert!(complete
         .iter()
         .all(|e| e.reported_kvnos.as_slice().is_empty()));
@@ -323,8 +333,8 @@ fn every_password_rule_is_refused() {
     );
     let events = world.finish();
     let sets = password_events(&events);
-    assert_eq!(sets.len(), 8);
-    for (_, target, kvnos, result) in &sets[..7] {
+    assert_eq!(sets.len(), 13);
+    for (_, target, kvnos, result) in &sets[..12] {
         assert_eq!(*target, g(BOB).to_packet());
         assert!(kvnos.is_empty());
         assert_eq!(
@@ -335,7 +345,7 @@ fn every_password_rule_is_refused() {
             }
         );
     }
-    assert_eq!(sets[7].3, PasswordResult::Completed);
+    assert_eq!(sets[12].3, PasswordResult::Completed);
 }
 
 /// **Attack test** — docs/10 §2; docs/50 R50-3, §3.7; docs/52 §3.12 (C12);

@@ -824,42 +824,50 @@ fn a_failed_drop_sends_nothing() {
     world.stop();
 }
 
-/// [MS-SAMR] 3.1.1.7.2 items 2, 3.2.1, 3.2.2 (admind's rules, A-79 /
-/// Q-401, crate admin-password-policy): each rule refuses the password —
-/// here always the **second** administrator's, so a refusal is shown to
-/// stop the first one being sent too — before keyd is contacted.
+/// [MS-SAMR] 3.1.1.7.2 items 2, 3.2.1, 3.2.2 and docs/56 §7 P-24 (keyd's
+/// rule set, crate admin-password-policy `check_password`; Q-605 item 3,
+/// Q-910): each rule refuses the password — here always the **second**
+/// administrator's, so a refusal is shown to stop the first one being sent
+/// too — before keyd is contacted. Test data made up; the realm is
+/// EXAMPLE.TEST.
 #[test]
 fn each_password_rule_is_refused_before_keyd_is_contacted() {
     let Some(world) = world() else {
         return;
     };
     for (bad, rule) in [
-        ("Short-pw-11", "minimum (12)"),
+        ("Tq7#Lm2", "minimum (8)"),
         (&"x".repeat(257)[..], "maximum (256 UTF-16 units)"),
-        ("my-BOB-password-77", "account name"),
-        ("xx-bOb-xx-xx-xx", "account name, mixed case"),
+        ("Tq7#BOB!w", "account name"),
+        ("Tq7#bOb!w", "account name, mixed case"),
+        ("Tq7#Example!", "realm's name"),
+        ("tq7#lm2!w", "character classes"),
+        ("Tq7#Abc!w", "sequence"),
+        ("Tq7#123!w", "sequence of digits"),
+        ("Tq7#111!w", "repeat"),
+        ("Tq7#Admin!w", "weak word"),
     ] {
         let (result, clients) = run_files(&world, &world.both_files(ALICE_PW, bad));
         assert_eq!(
             result.unwrap_err(),
             Refusal::PasswordRules {
                 sam: "bob".to_owned(),
-                min_chars: 12
+                min_chars: 8
             },
             "{rule}"
         );
         assert_eq!(clients, 0, "{rule}");
     }
     // The minimum comes from admind's configuration: 14 characters pass
-    // with 12, not with 16.
+    // with 8, not with 16.
     let fourteen = "Plum-Ridge-404";
     assert_eq!(fourteen.chars().count(), 14);
     let config_path = world.input.paths.admind_config.as_path().to_path_buf();
     let text = std::fs::read_to_string(&config_path).unwrap();
-    assert!(text.contains("min_password_length = 12\n"));
+    assert!(text.contains("min_password_length = 8\n"));
     std::fs::write(
         &config_path,
-        text.replace("min_password_length = 12\n", "min_password_length = 16\n"),
+        text.replace("min_password_length = 8\n", "min_password_length = 16\n"),
     )
     .unwrap();
     let (result, clients) = run_files(&world, &world.both_files(fourteen, BOB_PW));

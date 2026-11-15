@@ -735,15 +735,15 @@ mod tests {
         };
         let verdict = |data: &UserData, flags| judge(&config, data, &cname, flags).verdict();
         assert_eq!(
-            verdict(&change(b"a long enough phrase"), initial),
+            verdict(&change(b"Mortar-Cypress-19-Wisp"), initial),
             V::Acceptable
         );
         assert!(matches!(
-            judge(&config, &change(b"a long enough phrase"), &cname, initial),
-            Pending::Acceptable(p) if p.as_str() == "a long enough phrase"
+            judge(&config, &change(b"Mortar-Cypress-19-Wisp"), &cname, initial),
+            Pending::Acceptable(p) if p.as_str() == "Mortar-Cypress-19-Wisp"
         ));
         assert_eq!(
-            verdict(&change(b"a long enough phrase"), TicketFlags::PRE_AUTHENT),
+            verdict(&change(b"Mortar-Cypress-19-Wisp"), TicketFlags::PRE_AUTHENT),
             V::InitialFlagNeeded
         );
         // The policy before the INITIAL flag (docs/53 §5.4 order).
@@ -751,10 +751,11 @@ mod tests {
             verdict(&change(b"short"), TicketFlags::PRE_AUTHENT),
             V::PasswordRefused
         );
-        assert_eq!(
-            verdict(&change(b"xx-carol-xx-yy-zz"), initial),
-            V::PasswordRefused
-        );
+        // The ticket client's name and keyd's realm reach the policy
+        // (docs/56 §7 P-24; each otherwise-valid value breaks one rule).
+        for refused in [&b"Tq7#Carol!w"[..], b"Tq7#Example!", b"Tq7#Admin!w"] {
+            assert_eq!(verdict(&change(refused), initial), V::PasswordRefused);
+        }
         assert_eq!(verdict(&change(&[0xff; 16]), initial), V::PasswordRefused);
         assert_eq!(
             verdict(&UserData::from_slice(&[0x30, 0x00]), initial),

@@ -63,7 +63,7 @@ const CAROL: KeyHandle = KeyHandle::new(
     KeyPurpose::PrincipalLongterm,
 );
 const CAROL_SALT: &str = "EXAMPLE.ORGcarol";
-const GRANTED_PASSWORD: &str = "a granted password";
+const GRANTED_PASSWORD: &str = "Pewter-Jaguar-46-Moss";
 
 fn carol_binding() -> PrincipalBinding {
     bound(PrincipalName {

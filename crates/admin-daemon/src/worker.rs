@@ -23,10 +23,13 @@
 //! 0. **The audit slot** of its `Admind` event, reserved first; auditd
 //!    unreachable or the window full ⇒ the shared `Busy`, nothing done
 //!    (docs/51 §5.7; A-64).
-//! 1. **The password rules that need only the password** — at most 256
-//!    UTF-16 units, at least `min_password_length` characters ([MS-SAMR]
-//!    3.1.1.7.2 items 2, 3.2.1; A-79) — before dird is asked: a refusal is
-//!    `Invalid`, event `Failed{Validation, PasswordPolicy}`.
+//! 1. **The password rules that need only the password** — crate
+//!    admin-password-policy's `check_password_text`, the text-only part of
+//!    keyd's one rule set: at most 256 UTF-16 units, at least
+//!    `min_password_length` characters, the character classes, no sequence,
+//!    no repeat, no weak word ([MS-SAMR] 3.1.1.7.2 items 2, 3.2.1; docs/56 §7
+//!    P-24) — before dird is asked, so such a password never makes dird act:
+//!    a refusal is `Invalid`, event `Failed{Validation, PasswordPolicy}`.
 //! 2. **dird `BeginPasswordSet`** with the request's `auth` — dird decides
 //!    (`DirControlRight(User-Force-Change-Password)`, dual control), writes
 //!    `pwdLastSet` first (R47-7) and answers the account kind, the key
@@ -34,11 +37,16 @@
 //!    the requested account's key sets, `PrincipalLongterm` first with an
 //!    NT-PRINCIPAL binding of one component (docs/47 §9.1), else nothing is
 //!    set (fail closed).
-//! 3. **The account-name rule** ([MS-SAMR] 3.1.1.7.2 item 3.2.2), with the
-//!    sAMAccountName of that NT-PRINCIPAL binding — necessarily after step 2,
-//!    which already moved `pwdLastSet` (that only revokes the account's
-//!    tickets, which the requester was authorized to do; docs/47 §9.2 step 3
-//!    "a safe state") — docs/questions/Q-402.
+//! 3. **The whole rule set** — `check_password`, the very function keyd's
+//!    install path runs, with keyd's inputs: the sAMAccountName of that
+//!    NT-PRINCIPAL binding and the binding's realm (keyd binds every key set
+//!    to its own realm, so for any install keyd could accept it is keyd's
+//!    realm); only the minimum is admind's own `min_password_length` (keyd's
+//!    is not visible to admind — task K9/K11). Non-authoritative: keyd checks
+//!    again. Necessarily after step 2 for the name rules, which already moved
+//!    `pwdLastSet` (that only revokes the account's tickets, which the
+//!    requester was authorized to do; docs/47 §9.2 step 3 "a safe state") —
+//!    docs/questions/Q-402, Q-910 item 13.
 //! 4. **keyd `set_secret`** through `call_with_fate` (A-90), once per key
 //!    target in dird's order (a computer: `PrincipalLongterm` then `Service`,
 //!    the same password and salt — docs/47 §9.1); the first failure stops.
@@ -286,9 +294,10 @@ impl Worker {
         target: Guid,
         password: &Password,
     ) -> Ended {
-        // 1. The rules that need only the password ([MS-SAMR] 3.1.1.7.2
-        //    items 2, 3.2.1; A-79).
-        if password::check_length(password.expose(), self.min_password_length).is_err() {
+        // 1. The rules that need only the password: the text-only part of
+        //    keyd's rule set ([MS-SAMR] 3.1.1.7.2 items 2, 3.2.1, 3.2.4;
+        //    docs/56 §7 P-24; Q-910 item 13).
+        if password::check_password_text(password.expose(), self.min_password_length).is_err() {
             return Ended::refused(
                 PasswordStep::Validation,
                 PasswordFailure::PasswordPolicy,
@@ -328,7 +337,7 @@ impl Worker {
             }
         };
         // dird's reply must describe the requested account (fail closed).
-        let Some(sam) = account_name(&set, &target) else {
+        let (Some(sam), Some(first)) = (account_name(&set, &target), set.keys.first()) else {
             // Reported whatever its own fate: nothing was set either way.
             let _reported =
                 self.complete(completion, target, PasswordSetOutcome::Failed, Vec::new());
@@ -338,8 +347,16 @@ impl Worker {
                 RefusalStatus::Unavailable,
             );
         };
-        // 3. The account-name rule ([MS-SAMR] 3.1.1.7.2 item 3.2.2).
-        if password::check_account_name(password.expose(), &sam).is_err() {
+        // 3. The whole rule set, with keyd's inputs: the sAMAccountName and
+        //    the realm of the account's binding (keyd binds every key set to
+        //    its own realm); the minimum is admind's (Q-910 item 13).
+        //    Non-authoritative — keyd's install path checks again.
+        let inputs = password::PolicyInputs {
+            min_chars: self.min_password_length,
+            account_name: &[sam.as_str()],
+            organisation_name: first.binding.realm.as_str(),
+        };
+        if password::check_password(password.expose(), &inputs).is_err() {
             // Reported whatever its own fate: nothing was set either way.
             let _reported =
                 self.complete(completion, target, PasswordSetOutcome::Failed, Vec::new());

@@ -12,17 +12,23 @@
 //!    on the terminal the interrupt and suspend keys arrive as control
 //!    characters while their signals are off (module `terminal`) — so a
 //!    control character is always refused, never kept in a password.
-//! 2. **The rules** ([`check_password`]): exactly admind's — crate
-//!    admin-password-policy ([MS-SAMR] 3.1.1.7.2 items 2, 3.2.1, 3.2.2 as
-//!    A-79 / Q-401 read them) — with the minimum from admind's own
-//!    configuration (`min_password_length`, floor 12, A-79 / P-24) and the
-//!    1024-octet bound of keyd's secret field (`ipc_keyd::MAX_SECRET`).
-//!    Which rule failed is not said (docs/37 §2; Q-401 item 8).
+//! 2. **The rules** ([`check_password`]): exactly keyd's — crate
+//!    admin-password-policy's `check_password`, the one rule set keyd's
+//!    install path enforces (docs/56 §7 P-24 on top of [MS-SAMR] 3.1.1.7.2;
+//!    docs/questions/Q-605 item 3, Q-910) — with the minimum from admind's
+//!    own configuration (`min_password_length`, floor 8, P-24), the
+//!    administrator's sAMAccountName, the realm as the organisation's name,
+//!    and the 1024-octet bound of keyd's secret field
+//!    (`ipc_keyd::MAX_SECRET`). A password this pre-check passes is one
+//!    keyd's check passes too, when keyd's `min_password_chars` is no higher
+//!    than admind's minimum. Which rule failed is not said (docs/37 §2;
+//!    Q-401 item 8).
 //!
 //! Spec: docs/51 §4.4 (R51-5: "≤ 256 characters ([MS-SAMR] 3.1.1.7.2 item
 //! 2) and 1024 bytes = `ipc_keyd::MAX_SECRET`; does not contain the
 //! sAMAccountName (item 3.2.2)"), §11; [MS-SAMR] 3.1.1.7.2; docs/50 §3.4;
-//! A-79; A-94; P-24; docs/questions/Q-401, Q-411.
+//! docs/56 §7 (P-24); A-79; A-94; docs/questions/Q-401, Q-411, Q-605,
+//! Q-910.
 
 use core::fmt;
 
@@ -116,28 +122,36 @@ pub fn password_text(octets: &[u8]) -> Result<EnteredPassword, LineError> {
     Ok(EnteredPassword(Zeroizing::new(text.to_owned())))
 }
 
-/// admind's password rules for a first administrator: at most
+/// The password rules for a first administrator: at most
 /// [`MAX_PASSWORD_OCTETS`] octets, then crate admin-password-policy's
-/// `check_length` (≤ 256 UTF-16 code units, ≥ `min_chars` code points) and
-/// `check_account_name` (the sAMAccountName, more than two characters, not
-/// a case-insensitive substring) — the very functions admind's
-/// `SetPassword` applies.
+/// `check_password` — the very rule set keyd's install path enforces
+/// (docs/questions/Q-605 item 3) — with `min_chars`, the administrator's
+/// sAMAccountName as the account's name and `realm` as the organisation's
+/// name (as keyd passes them: the binding's one name component, keyd's
+/// realm).
 ///
 /// # Errors
 /// [`PasswordRefused`] — deliberately without saying which rule.
 ///
-/// Spec: [MS-SAMR] 3.1.1.7.2 items 2, 3.2.1, 3.2.2; docs/51 §4.4, §11;
-/// A-79; A-94 (Q-401); P-24.
+/// Spec: [MS-SAMR] 3.1.1.7.2 items 2, 3.2.1-3.2.4; docs/51 §4.4, §11;
+/// docs/56 §7 (P-24); A-79; A-94 (Q-401); docs/questions/Q-605, Q-910.
 pub fn check_password(
     password: &str,
     min_chars: u32,
     sam_account_name: &str,
+    realm: &str,
 ) -> Result<(), PasswordRefused> {
     if password.len() > MAX_PASSWORD_OCTETS {
         return Err(PasswordRefused);
     }
-    admin_password_policy::check_length(password, min_chars)?;
-    admin_password_policy::check_account_name(password, sam_account_name)
+    admin_password_policy::check_password(
+        password,
+        &admin_password_policy::PolicyInputs {
+            min_chars,
+            account_name: &[sam_account_name],
+            organisation_name: realm,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -181,16 +195,31 @@ mod tests {
         assert!(!shown.contains("Juniper"));
     }
 
-    /// [MS-SAMR] 3.1.1.7.2 items 2, 3.2.1, 3.2.2 with A-79's minimum,
+    /// [MS-SAMR] 3.1.1.7.2 items 2, 3.2.1, 3.2.2 and docs/56 §7 P-24,
     /// through the shared crate (each rule once; the shared crate's own
-    /// tests cover the readings).
+    /// tests cover the readings). Test data constructed by hand; realm
+    /// `EXAMPLE.ORG` and account `alice` are made-up names.
     #[test]
-    fn admind_rules_apply() {
-        assert_eq!(check_password("Juniper-Kettle-71", 12, "alice"), Ok(()));
-        assert!(check_password("short-pw-12", 12, "alice").is_err());
-        assert!(check_password("Juniper-Kettle-71", 18, "alice").is_err());
-        assert!(check_password(&"a".repeat(257), 12, "alice").is_err());
-        assert!(check_password("xx-ALICE-padding", 12, "alice").is_err());
-        assert!(check_password(&"é".repeat(513), 12, "alice").is_err());
+    fn keyds_rules_apply() {
+        let realm = "EXAMPLE.ORG";
+        assert_eq!(
+            check_password("Juniper-Kettle-71", 12, "alice", realm),
+            Ok(())
+        );
+        // The owner's floor: exactly 8 passes with a minimum of 8.
+        assert_eq!(check_password("Tq7#Lm2!", 8, "alice", realm), Ok(()));
+        assert!(check_password("Tq7#Lm2", 8, "alice", realm).is_err());
+        assert!(check_password("Juniper-Kettle-71", 18, "alice", realm).is_err());
+        assert!(check_password(&"a".repeat(257), 12, "alice", realm).is_err());
+        assert!(check_password(&"é".repeat(513), 12, "alice", realm).is_err());
+        // The account's name, the organisation's name, a weak word.
+        assert!(check_password("Tq7#ALICE!w", 8, "alice", realm).is_err());
+        assert!(check_password("Tq7#Example!", 8, "alice", realm).is_err());
+        assert!(check_password("Tq7#Admin!w", 8, "alice", realm).is_err());
+        // Classes, sequences, repeats (the owner's examples).
+        assert!(check_password("juniper-kettle-71", 8, "alice", realm).is_err());
+        assert!(check_password("Tq7#Abc!w", 8, "alice", realm).is_err());
+        assert!(check_password("Tq7#123!w", 8, "alice", realm).is_err());
+        assert!(check_password("Tq7#111!w", 8, "alice", realm).is_err());
     }
 }

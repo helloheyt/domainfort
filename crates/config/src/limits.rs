@@ -121,19 +121,22 @@ pub const KEYD_DEADLINE_SECS: Bound = Bound::up_to(2);
 
 /// admind's minimum password length (`min_password_length`), in characters:
 /// required in admind's file — no default is ever used (the `default` field
-/// below only fills the struct). Range 12 ..= 256:
-/// * the floor — decision A-79 / owner item P-24: "a required configuration
-///   key `min_password_length` in admind, with a temporary hard floor of 12
-///   characters (project choice)" — the phase-1 schema has no
-///   minPwdLength, so [MS-SAMR] 3.1.1.7.2 item 3.2.1's
-///   Effective-MinimumPasswordLength is this setting;
+/// below only fills the struct). Range 8 ..= 256:
+/// * the floor — the owner's minimum, docs/56 §7 P-24 ("8+ characters"; it
+///   replaces A-79's temporary floor of 12); an operator may only raise it
+///   (PENDING-OWNER P-24). The phase-1 schema has no minPwdLength, so
+///   [MS-SAMR] 3.1.1.7.2 item 3.2.1's Effective-MinimumPasswordLength is
+///   this setting. Pinned to crate admin-password-policy's
+///   `MIN_PASSWORD_CHARS_FLOOR` (provision `configs.rs`; this crate has no
+///   dependency);
 /// * the ceiling — [MS-SAMR] 3.1.1.7.2 item 2: a password is at most 256
 ///   characters, so a larger minimum would refuse every password.
 ///
 /// Spec: [MS-SAMR] 3.1.1.7.2 items 2, 3.2.1; docs/51 §11 (the password row);
-/// A-79; P-24; docs/questions/Q-298 item 5, Q-401.
+/// docs/56 §7 (P-24); A-79; docs/questions/Q-298 item 5, Q-401, Q-910 item
+/// 2.
 pub const MIN_PASSWORD_LENGTH: Bound = Bound {
-    min: 12,
+    min: 8,
     max: 256,
-    default: 12,
+    default: 8,
 };

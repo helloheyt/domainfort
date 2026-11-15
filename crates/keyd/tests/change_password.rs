@@ -370,7 +370,7 @@ fn a_change_round_trips_for_every_aes_enctype() {
     let mut f = fixture();
     let mut old = ALICE_PASSWORD.to_owned();
     for (i, enctype) in ENCTYPES.into_iter().enumerate() {
-        let new = format!("her new passphrase {i}");
+        let new = format!("Garland-Owl-24-Fir#{i}");
         let issued = issue(enctype);
         let cusec = 1_000 + i as u32;
         let ctx = open_request(&mut f, &issued, &Spec::new(cusec, &new)).unwrap();
@@ -418,7 +418,7 @@ fn a_change_round_trips_for_every_aes_enctype() {
 fn a_peer_address_is_matched_and_the_reply_carries_the_local_address() {
     let mut f = fixture();
     let issued = issue(EncType::Aes256CtsHmacSha196);
-    let mut spec = Spec::new(2_001, "an address-bound phrase");
+    let mut spec = Spec::new(2_001, "Rhubarb-Sequoia-68-Tapir");
     spec.s_address = peer().host_address();
     let ctx = open_request(&mut f, &issued, &spec).unwrap();
     decide_alice(&mut f);
@@ -435,7 +435,7 @@ fn a_peer_address_is_matched_and_the_reply_carries_the_local_address() {
     mapped[10] = 0xff;
     mapped[11] = 0xff;
     mapped[12..].copy_from_slice(&[192, 0, 2, 10]);
-    let mut spec = Spec::new(2_002, "another bound phrase");
+    let mut spec = Spec::new(2_002, "Urchin-Violet-84-Yucca");
     spec.s_address = peer().host_address();
     let (ap_req, krb_priv) = request(&issued, &spec);
     assert!(f
@@ -465,7 +465,7 @@ fn a_peer_address_is_matched_and_the_reply_carries_the_local_address() {
 fn the_completion_needs_the_clients_own_decision() {
     let mut f = fixture();
     let issued = issue(EncType::Aes256CtsHmacSha196);
-    let ctx = open_request(&mut f, &issued, &Spec::new(3_001, "a phrase of hers")).unwrap();
+    let ctx = open_request(&mut f, &issued, &Spec::new(3_001, "Quill-Marsh-31-Pebble")).unwrap();
 
     // No decision at all.
     assert_eq!(
@@ -547,14 +547,14 @@ fn the_completion_needs_the_clients_own_decision() {
 fn admind_cannot_redeem_a_change_password_decision() {
     let mut f = fixture();
     let issued = issue(EncType::Aes128CtsHmacSha196);
-    let ctx = open_request(&mut f, &issued, &Spec::new(4_001, "her chosen phrase")).unwrap();
+    let ctx = open_request(&mut f, &issued, &Spec::new(4_001, "Lichen-Sparrow-75-Haze")).unwrap();
     decide_alice(&mut f);
     assert_eq!(
         f.keyd.set_secret(
             &DIRECTORY,
             &ALICE,
             &alice_binding(),
-            Zeroizing::new("an admind-chosen phrase".to_owned()),
+            Zeroizing::new("Koala-Lotus-92-Mango".to_owned()),
             ALICE_SALT,
             &now(),
         ),
@@ -565,8 +565,8 @@ fn admind_cannot_redeem_a_change_password_decision() {
     f.keyd
         .complete_change_password(&LDAP, &ctx.ctx_id, &ALICE, &now())
         .unwrap();
-    assert!(f.password_works(&ALICE, "her chosen phrase", ALICE_SALT));
-    assert!(!f.password_works(&ALICE, "an admind-chosen phrase", ALICE_SALT));
+    assert!(f.password_works(&ALICE, "Lichen-Sparrow-75-Haze", ALICE_SALT));
+    assert!(!f.password_works(&ALICE, "Koala-Lotus-92-Mango", ALICE_SALT));
 }
 
 // ---------------------------------------------------------------------------
@@ -586,7 +586,7 @@ fn a_ticket_without_initial_is_result_7() {
         change_password_service_name(),
         &change_password_service_key(EncType::Aes256CtsHmacSha196),
     );
-    let ctx = open_request(&mut f, &issued, &Spec::new(5_001, "a long enough phrase")).unwrap();
+    let ctx = open_request(&mut f, &issued, &Spec::new(5_001, "Mortar-Cypress-19-Wisp")).unwrap();
     assert_eq!(ctx.verdict, ChangePasswordVerdict::InitialFlagNeeded);
     assert_eq!(last(&f).result, AuditOutcome::Success);
     assert_eq!(last(&f).reason, AuditReason::KpasswdInitialFlagNeeded);
@@ -625,21 +625,30 @@ fn a_ticket_without_initial_is_result_7() {
     );
 }
 
-/// [MS-SAMR] 3.1.1.7.2 items 2, 3.2.1, 3.2.2 (keyd's one policy, docs/53
-/// §6); RFC 3244 §2; Q-603 item 7: a new password that is too short, that
-/// contains the account name, that is over 256 UTF-16 units, or that is not
-/// UTF-8 opens with verdict `PasswordRefused` — before dird writes anything
-/// — and its reply is SOFTERROR with **no** result string; the audit record
-/// says which code, never which rule.
+/// [MS-SAMR] 3.1.1.7.2 items 2, 3.2.1, 3.2.2 and docs/56 §7 P-24 (keyd's
+/// one policy, docs/53 §6); RFC 3244 §2; Q-603 item 7; A-121: a new
+/// password that breaks any one rule — too short, the account name (both
+/// cases), the realm's name, a missing character class, a sequence (`Abc`,
+/// `123`), a repeat (`111`), a weak word (`admin`), over 256 UTF-16 units,
+/// or not UTF-8 — opens with verdict `PasswordRefused` — before dird writes
+/// anything — and its reply is SOFTERROR with **no** result string; the
+/// audit record says which code, never which rule. Test data made up.
 #[test]
 fn a_policy_violating_password_is_softerror_without_a_reason() {
     let mut f = fixture();
     let issued = issue(EncType::Aes256CtsHmacSha196);
-    let too_long = "p".repeat(257);
+    let too_long = format!("Tq7#{}", "p-".repeat(127));
     let mut cases: Vec<Vec<u8>> = vec![
         change("short"),
-        change("xx-alice-xx-yy-zz"),
-        change("xx-ALICE-xx-yy-zz"),
+        change("Tq7#Lm2"),
+        change("Tq7#alice!w"),
+        change("Tq7#ALICE!w"),
+        change("Tq7#Example!"),
+        change("tq7#lm2!xw"),
+        change("Tq7#Abc!w"),
+        change("Tq7#123!w"),
+        change("Tq7#111!w"),
+        change("Tq7#admin!w"),
         change(&too_long),
     ];
     // Not UTF-8 (RFC 3961 §3: no conversion of an unknown encoding).
@@ -778,7 +787,7 @@ fn malformed_and_unbound_requests_are_denied() {
         ),
     ];
     for (tweak, reason) in cases {
-        let mut spec = Spec::new(next(), "a long enough phrase");
+        let mut spec = Spec::new(next(), "Mortar-Cypress-19-Wisp");
         tweak(&mut spec);
         assert_eq!(
             open_request(&mut f, &issued, &spec).map(|c| c.verdict),
@@ -789,7 +798,7 @@ fn malformed_and_unbound_requests_are_denied() {
         assert_eq!(last(&f).result, AuditOutcome::Denied);
     }
     // Undecodable fields.
-    let (ap_req, krb_priv) = request(&issued, &Spec::new(next(), "a long enough phrase"));
+    let (ap_req, krb_priv) = request(&issued, &Spec::new(next(), "Mortar-Cypress-19-Wisp"));
     for (a, p) in [
         (&[0x30, 0x00][..], &krb_priv[..]),
         (&ap_req[..], &[0x30, 0x00][..]),
@@ -820,7 +829,7 @@ fn malformed_and_unbound_requests_are_denied() {
 fn a_replayed_request_is_refused() {
     let mut f = fixture();
     let issued = issue(EncType::Aes256CtsHmacSha196);
-    let spec = Spec::new(9_001, "a long enough phrase");
+    let spec = Spec::new(9_001, "Mortar-Cypress-19-Wisp");
     let (ap_req, krb_priv) = request(&issued, &spec);
     let open = |f: &mut Fixture, krb_priv: &[u8]| {
         f.keyd.open_change_password_request(
@@ -839,7 +848,7 @@ fn a_replayed_request_is_refused() {
         Err(AuthnError::Replay)
     );
     assert_eq!(last(&f).reason, AuditReason::Replay);
-    let (_, other_priv) = request(&issued, &Spec::new(9_001, "another phrase entirely"));
+    let (_, other_priv) = request(&issued, &Spec::new(9_001, "Pumice-Kestrel-53-Fig"));
     assert_eq!(
         open(&mut f, &other_priv).map(|c| c.verdict),
         Err(AuthnError::Replay)
@@ -860,7 +869,7 @@ fn the_change_password_key_is_opened_by_its_operation_only() {
     let mut f = fixture();
     add_ldap_service(&mut f);
     let issued = issue(EncType::Aes256CtsHmacSha196);
-    let (ap_req, _) = request(&issued, &Spec::new(10_001, "a long enough phrase"));
+    let (ap_req, _) = request(&issued, &Spec::new(10_001, "Mortar-Cypress-19-Wisp"));
 
     assert_eq!(
         f.keyd
@@ -898,7 +907,7 @@ fn the_change_password_key_is_opened_by_its_operation_only() {
             &DIRECTORY,
             &CHANGE_PASSWORD_SERVICE,
             &bound(change_password_service_name()),
-            Zeroizing::new("a chosen service phrase".to_owned()),
+            Zeroizing::new("Nutmeg-Olive-13-Panda".to_owned()),
             "salt",
             &now(),
         ),
@@ -925,7 +934,7 @@ fn the_change_password_key_is_opened_by_its_operation_only() {
         ldap_service_name(),
         &ldap_service_key(),
     );
-    let (ldap_ap_req, ldap_priv) = request(&ldap, &Spec::new(10_002, "a long enough phrase"));
+    let (ldap_ap_req, ldap_priv) = request(&ldap, &Spec::new(10_002, "Mortar-Cypress-19-Wisp"));
     for (principal, reason) in [
         (LDAP_SERVICE_ID, AuditReason::KeyNotFound),
         (CHANGE_PASSWORD_SERVICE_ID, AuditReason::NameBindingMismatch),
@@ -981,7 +990,7 @@ fn the_change_password_key_is_opened_by_its_operation_only() {
 fn only_ldap_runs_the_change_password_operations() {
     let mut f = fixture();
     let issued = issue(EncType::Aes256CtsHmacSha196);
-    let (ap_req, krb_priv) = request(&issued, &Spec::new(11_001, "a long enough phrase"));
+    let (ap_req, krb_priv) = request(&issued, &Spec::new(11_001, "Mortar-Cypress-19-Wisp"));
     for caller in [KDC, DIRECTORY, ADMIN] {
         assert_eq!(
             f.keyd
@@ -1051,7 +1060,7 @@ fn each_context_takes_exactly_one_reply() {
     let mut f = fixture();
     let issued = issue(EncType::Aes256CtsHmacSha196);
 
-    let ctx = open_request(&mut f, &issued, &Spec::new(12_001, "first of the phrases")).unwrap();
+    let ctx = open_request(&mut f, &issued, &Spec::new(12_001, "Basalt-Magpie-97-Rue")).unwrap();
     f.keyd
         .seal_change_password_error(&LDAP, &ctx.ctx_id, NonZeroResultCode::AuthError, &now())
         .unwrap();
@@ -1070,7 +1079,7 @@ fn each_context_takes_exactly_one_reply() {
     assert_eq!(last(&f).reason, AuditReason::TokenUnknown);
     assert!(f.password_works(&ALICE, ALICE_PASSWORD, ALICE_SALT));
 
-    let ctx = open_request(&mut f, &issued, &Spec::new(12_002, "second of the phrases")).unwrap();
+    let ctx = open_request(&mut f, &issued, &Spec::new(12_002, "Fable-Crane-41-Moth")).unwrap();
     f.keyd
         .complete_change_password(&LDAP, &ctx.ctx_id, &ALICE, &now())
         .unwrap();
@@ -1086,12 +1095,12 @@ fn each_context_takes_exactly_one_reply() {
             .complete_change_password(&LDAP, &ctx.ctx_id, &ALICE, &now()),
         Err(Error::Denied)
     );
-    assert!(f.password_works(&ALICE, "second of the phrases", ALICE_SALT));
+    assert!(f.password_works(&ALICE, "Fable-Crane-41-Moth", ALICE_SALT));
 
     // Expiry: the context lives `token_lifetime_secs` (30 s by default); the
     // decision (registered later, live 30 s) is still live when it is
     // presented.
-    let ctx = open_request(&mut f, &issued, &Spec::new(12_003, "third of the phrases")).unwrap();
+    let ctx = open_request(&mut f, &issued, &Spec::new(12_003, "Tallow-Bison-86-Sage")).unwrap();
     f.decide(
         DecidedOperation::ChangePassword {
             target: SetSecretTarget {
@@ -1109,7 +1118,7 @@ fn each_context_takes_exactly_one_reply() {
         Err(Error::Denied)
     );
     assert_eq!(last(&f).reason, AuditReason::TokenExpired);
-    assert!(f.password_works(&ALICE, "second of the phrases", ALICE_SALT));
+    assert!(f.password_works(&ALICE, "Fable-Crane-41-Moth", ALICE_SALT));
 }
 
 /// docs/53 §5.5 (`max_change_password_contexts`); AGENTS.md §6 (bounded):
@@ -1122,10 +1131,19 @@ fn the_context_table_is_bounded() {
     let mut f = Fixture::with_config(c);
     add_change_password_service(&mut f);
     let issued = issue(EncType::Aes256CtsHmacSha196);
-    let first = open_request(&mut f, &issued, &Spec::new(13_001, "a long enough phrase")).unwrap();
+    let first = open_request(
+        &mut f,
+        &issued,
+        &Spec::new(13_001, "Mortar-Cypress-19-Wisp"),
+    )
+    .unwrap();
     assert_eq!(
-        open_request(&mut f, &issued, &Spec::new(13_002, "a long enough phrase"))
-            .map(|c| c.verdict),
+        open_request(
+            &mut f,
+            &issued,
+            &Spec::new(13_002, "Mortar-Cypress-19-Wisp")
+        )
+        .map(|c| c.verdict),
         Err(AuthnError::Denied)
     );
     assert_eq!(last(&f).reason, AuditReason::TokenTableFull);
@@ -1142,15 +1160,29 @@ fn the_context_table_is_bounded() {
 // One password policy, on every path (docs/53 §6; Q-605).
 // ---------------------------------------------------------------------------
 
-/// docs/53 §6.1 (R53-10; Q-605 item 1): the policy is enforced in keyd's
-/// install path — so admind's `set_secret` on a live decision is refused a
-/// short password or one containing the account name, the decision is
-/// consumed and nothing is installed; the floor is the configured
-/// `min_password_chars` (12 by default, P-24), and a larger one applies.
+/// docs/53 §6.1 (R53-10; Q-605 item 1); docs/56 §7 P-24: the policy is
+/// enforced in keyd's install path — so admind's `set_secret` on a live
+/// decision is refused a password breaking any one of the owner's rules
+/// (too short, the account name, the realm's name, a missing class, a
+/// sequence, a repeat, a weak word), the decision is consumed and nothing
+/// is installed; the floor is the configured `min_password_chars` (8 by
+/// default, P-24) — exactly 8 passes — and a larger one applies. Test data
+/// made up.
 #[test]
 fn set_secret_obeys_the_same_policy() {
     let mut f = Fixture::new();
-    for weak in ["short-1", "my-alice-phrase-x", "elevenchars"] {
+    for weak in [
+        "Tq7#Lm2",
+        "Tq7#Alice!",
+        "Tq7#example!",
+        "TQ7#LM2!X",
+        "Tq7#cba!w",
+        "Tq7#987!w",
+        "Tq7#zZz!w",
+        "Tq7#Admin!",
+        "Tq7#Root!w",
+        "Tq7#KRBTGT!",
+    ] {
         f.grant(&ALICE, &alice_binding(), ALICE_SALT, &now())
             .unwrap();
         assert_eq!(
@@ -1176,7 +1208,7 @@ fn set_secret_obeys_the_same_policy() {
             &DIRECTORY,
             &ALICE,
             &alice_binding(),
-            Zeroizing::new("twelve chars".to_owned()),
+            Zeroizing::new("Tq7#Lm2!".to_owned()),
             ALICE_SALT,
             &now(),
         ),
@@ -1194,13 +1226,26 @@ fn set_secret_obeys_the_same_policy() {
             &DIRECTORY,
             &ALICE,
             &alice_binding(),
-            Zeroizing::new("fifteen-chars-x".to_owned()),
+            Zeroizing::new("Hollow-Ibis-79S".to_owned()),
             ALICE_SALT,
             &now(),
         ),
         Err(Error::Denied)
     );
     assert_eq!(last(&f).reason, AuditReason::PasswordPolicyRefused);
+    f.grant(&ALICE, &alice_binding(), ALICE_SALT, &now())
+        .unwrap();
+    assert_eq!(
+        f.keyd.set_secret(
+            &DIRECTORY,
+            &ALICE,
+            &alice_binding(),
+            Zeroizing::new("Hollow-Ibis-79Sx".to_owned()),
+            ALICE_SALT,
+            &now(),
+        ),
+        Ok(Kvno::new(2))
+    );
 }
 
 // ---------------------------------------------------------------------------

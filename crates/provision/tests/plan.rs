@@ -450,16 +450,17 @@ fn every_configuration_parses_with_its_schema() {
     assert!(!text_of(provision::Daemon::Admind)
         .lines()
         .any(|l| l.starts_with("keyadm_uid")));
-    // A9 made `min_password_length` required (A-79 / P-24): provisioning
-    // emits the floor, 12 (A-92, docs/questions/Q-378 item 3).
-    assert_eq!(admind.min_password_length(), 12);
+    // A9 made `min_password_length` required (A-79): provisioning emits the
+    // floor — the owner's 8 (docs/56 §7 P-24; A-92, docs/questions/Q-378
+    // item 3).
+    assert_eq!(admind.min_password_length(), 8);
     assert_eq!(
         provision::configs::MIN_PASSWORD_LENGTH,
         admind.min_password_length()
     );
     assert!(text_of(provision::Daemon::Admind)
         .lines()
-        .any(|l| l == "min_password_length = 12"));
+        .any(|l| l == "min_password_length = 8"));
     let dird = text_of(provision::Daemon::Dird);
     for key in DIRD_ADMIN_CHANNEL_KEYS {
         assert!(dird.contains(&format!("\n{key} = ")), "{key}");

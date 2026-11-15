@@ -234,7 +234,7 @@ fn admits_agrees_with_the_operations_own_refusal() {
             &DIRECTORY,
             &BOB,
             &bob_binding(),
-            Zeroizing::new(String::from("a-new-password")),
+            Zeroizing::new(String::from("Lumen-Stoat-62-Birch")),
             BOB_SALT,
             &now()
         ),

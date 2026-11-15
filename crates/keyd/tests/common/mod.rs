@@ -144,8 +144,8 @@ pub const KRBTGT: KeyHandle = KeyHandle::new(KRBTGT_ID, KeyPurpose::Krbtgt);
 pub const SERVICE: KeyHandle = KeyHandle::new(SERVICE_ID, KeyPurpose::Service);
 
 /// Passwords and keys chosen for these tests; marker bytes easy to spot.
-pub const ALICE_PASSWORD: &str = "correct horse battery staple";
-pub const BOB_PASSWORD: &str = "tr0ub4dor&3-plus";
+pub const ALICE_PASSWORD: &str = "Quartz-Mill-74-Fern";
+pub const BOB_PASSWORD: &str = "Harbor-Glint-39-Vole";
 pub const ALICE_SALT: &str = "EXAMPLE.ORGalice";
 pub const BOB_SALT: &str = "EXAMPLE.ORGbob";
 pub const KRBTGT_KEY: [u8; 32] = [0xC1; 32];

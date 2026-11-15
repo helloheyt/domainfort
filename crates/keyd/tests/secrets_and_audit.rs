@@ -277,7 +277,7 @@ fn every_operation_emits_exactly_one_audit_record() {
             &DIRECTORY,
             &ALICE,
             &alice_binding(),
-            z("a next passphrase"),
+            z("Hazel-Tundra-82-Lynx"),
             ALICE_SALT,
             &n,
         )
@@ -286,7 +286,7 @@ fn every_operation_emits_exactly_one_audit_record() {
     // No role holds verify_secret (A-102, docs/52 R4): one record, refused.
     let _ = f
         .keyd
-        .verify_secret(&DIRECTORY, &ALICE, z("a next passphrase"), &n);
+        .verify_secret(&DIRECTORY, &ALICE, z("Hazel-Tundra-82-Lynx"), &n);
     check(&f, Operation::VerifySecret, &DIRECTORY, false);
 
     let h = KeyHandle::new(
@@ -479,14 +479,14 @@ fn audit_records_contain_no_secret_bytes() {
             &DIRECTORY,
             &BOB,
             &bob_binding(),
-            z("an audit-test password"),
+            z("Indigo-Parrot-59-Gale"),
             BOB_SALT,
             &now(),
         )
         .unwrap();
     let _ = f
         .keyd
-        .verify_secret(&DIRECTORY, &BOB, z("a wrong audit guess"), &now());
+        .verify_secret(&DIRECTORY, &BOB, z("Amber-Falcon-36-Reed"), &now());
     let _ = f.keyd.verify_preauth(
         &KDC,
         &ALICE,
@@ -504,8 +504,8 @@ fn audit_records_contain_no_secret_bytes() {
     for password in [
         ALICE_PASSWORD,
         BOB_PASSWORD,
-        "an audit-test password",
-        "a wrong audit guess",
+        "Indigo-Parrot-59-Gale",
+        "Amber-Falcon-36-Reed",
     ] {
         assert!(
             !text.contains(password),

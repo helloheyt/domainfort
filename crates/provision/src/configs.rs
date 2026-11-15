@@ -65,17 +65,23 @@ pub const ADMIN_TICKET_AGE_MAX_SECS: u32 = 600;
 /// `MIN_QUORUM`.
 pub const ADMIN_QUORUM: usize = directory_admin::MIN_QUORUM;
 
-/// admind's `min_password_length`: the hard floor of 12 characters (A-79 /
-/// owner item P-24: "a required configuration key `min_password_length` in
-/// admind, with a temporary hard floor of 12 characters"). admind's schema
-/// requires the key (task A9), so every generated admind file carries it;
-/// the operator raises it by editing the file. docs/questions/Q-378 item 3
-/// (decided A-92: "provisioning must emit it (floor 12)").
-/// Spec: A-79; P-24; A-92; [MS-SAMR] 3.1.1.7.2 item 3.2.1.
-pub const MIN_PASSWORD_LENGTH: u32 = 12;
+/// admind's `min_password_length`: the floor of 8 characters — the owner's
+/// minimum (docs/56 §7 P-24: "8+ characters", replacing A-79's temporary
+/// floor of 12). admind's schema requires the key (task A9), so every
+/// generated admind file carries it; the operator raises it by editing the
+/// file. docs/questions/Q-378 item 3 (decided A-92: "provisioning must emit
+/// it").
+/// Spec: docs/56 §7 (P-24); A-79; A-92; [MS-SAMR] 3.1.1.7.2 item 3.2.1;
+/// docs/questions/Q-910 item 2.
+pub const MIN_PASSWORD_LENGTH: u32 = 8;
 
-// The value provisioning writes is the schema's own floor.
+// The value provisioning writes is the schema's own floor ...
 const _: () = assert!(MIN_PASSWORD_LENGTH == config::limits::MIN_PASSWORD_LENGTH.min);
+// ... and the password-policy crate's floor (docs/56 §7 P-24): one value,
+// pinned here because the config crate has no dependency.
+const _: () = assert!(
+    config::limits::MIN_PASSWORD_LENGTH.min == admin_password_policy::MIN_PASSWORD_CHARS_FLOOR
+);
 
 /// The process a configuration file belongs to.
 /// Spec: docs/50 §2.4 (the process table).

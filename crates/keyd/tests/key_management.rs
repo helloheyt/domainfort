@@ -176,7 +176,7 @@ fn create_key_validates_binding() {
             &DIRECTORY,
             &carol,
             &krbtgt_binding(),
-            z("first passphrase-1"),
+            z("Marble-Pigeon-93-Cactus"),
             "EXAMPLE.ORGcarol",
             &now()
         ),
@@ -203,7 +203,7 @@ fn set_secret_cannot_rebind() {
             &DIRECTORY,
             &ALICE,
             &bob_binding(),
-            z("second passphrase-2"),
+            z("Saber-Lilac-28-Quail"),
             ALICE_SALT,
             &now()
         ),
@@ -240,7 +240,7 @@ fn set_secret_cannot_rebind() {
             &DIRECTORY,
             &ALICE,
             &same,
-            z("third passphrase-3"),
+            z("Topaz-Heron-47-Dune"),
             ALICE_SALT,
             &now()
         ),
@@ -470,7 +470,7 @@ fn set_secret_rules() {
             &DIRECTORY,
             &ALICE,
             &alice_binding(),
-            z("an unused passphrase"),
+            z("Russet-Badger-63-Briar"),
             ALICE_SALT,
             &now()
         ),
@@ -491,7 +491,7 @@ fn set_secret_rules() {
             &DIRECTORY,
             &carol,
             &carol_binding,
-            z("an unused passphrase"),
+            z("Russet-Badger-63-Briar"),
             "EXAMPLE.ORGcarol",
             &now()
         ),
@@ -502,7 +502,7 @@ fn set_secret_rules() {
             &DIRECTORY,
             &KRBTGT,
             &krbtgt_binding(),
-            z("an unused passphrase"),
+            z("Russet-Badger-63-Briar"),
             "salt",
             &now()
         ),

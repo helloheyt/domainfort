@@ -1632,14 +1632,14 @@ fn admind_min_password_length_is_required() {
     assert_eq!(err.key(), Some("min_password_length"));
 }
 
-/// The hard floor is 12 (A-79 / P-24: "a temporary hard floor of 12
-/// characters"); the ceiling is 256, the most characters a password may
+/// The hard floor is 8 (docs/56 §7 P-24: "8+ characters", replacing A-79's
+/// temporary 12); the ceiling is 256, the most characters a password may
 /// have ([MS-SAMR] 3.1.1.7.2 item 2) — a larger minimum would refuse every
 /// password. Both ends are accepted; one past either end is `OutOfRange`.
-/// Spec: [MS-SAMR] 3.1.1.7.2 items 2, 3.2.1; A-79; P-24.
+/// Spec: [MS-SAMR] 3.1.1.7.2 items 2, 3.2.1; A-79; docs/56 §7 P-24.
 #[test]
 fn admind_min_password_length_range() {
-    for value in ["0", "1", "8", "11", "257", "1024", "4294967295"] {
+    for value in ["0", "1", "7", "257", "1024", "4294967295"] {
         rejects_value(
             Daemon::Admind,
             ADMIND,
@@ -1648,7 +1648,7 @@ fn admind_min_password_length_range() {
             ErrorKind::OutOfRange,
         );
     }
-    for value in ["12", "13", "64", "255", "256"] {
+    for value in ["8", "9", "11", "12", "13", "64", "255", "256"] {
         accepts_value(Daemon::Admind, ADMIND, "min_password_length", value);
     }
     let s = AdmindSettings::parse(set(ADMIND, "min_password_length", "256").as_bytes()).unwrap();

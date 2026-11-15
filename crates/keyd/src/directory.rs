@@ -31,10 +31,12 @@
 //! [`Keyd::install_password`]: the password policy, the store's acceptance,
 //! the existence rule, the name binding (A-19), keyd's choice of kvno
 //! (A-35), string-to-key and the install through `BoundKeys` /
-//! `NewBinding`. The policy ([`password_policy`]) is the rule set of crate
-//! admin-password-policy ([MS-SAMR] 3.1.1.7.2 items 2, 3.2.1, 3.2.2) with
-//! keyd's own `min_password_chars` (≥ 12, P-24). keyd's install path is the
-//! one place every password is cleartext, so a password that skipped the
+//! `NewBinding`. The policy ([`password_policy`]) is the one rule set of
+//! crate admin-password-policy, `check_password` — the owner's rules
+//! (docs/56 §7, P-24) on top of [MS-SAMR] 3.1.1.7.2 items 2, 3.2.1, 3.2.2 —
+//! with keyd's own `min_password_chars` (≥ 8, P-24), the account's name and
+//! the realm as the organisation's name. keyd's install path is the one
+//! place every password is cleartext, so a password that skipped the
 //! policy is impossible by construction — on every path, also against a
 //! compromised admind holding a live decision (class: "a rule enforced by
 //! the callers of a chokepoint instead of by the chokepoint", docs/52 C14;
@@ -48,7 +50,7 @@
 
 use crate::audit::{AuditReason, AuditSink};
 use crate::authz::{CallerId, HandleSlot, Operation};
-use crate::config::{KeydConfig, MAX_MIN_PASSWORD_CHARS};
+use crate::config::{KeydConfig, MAX_MIN_PASSWORD_CHARS, MIN_PASSWORD_CHARS_FLOOR};
 use crate::enctype::to_crypto;
 use crate::entropy::EntropySource;
 use crate::error::{Deny, Error, Internal};
@@ -69,6 +71,9 @@ const COMPARE_CHALLENGE_LENGTH: usize = 32;
 // password length ([MS-SAMR] 3.1.1.7.2 item 2): one value, pinned.
 const _: () =
     assert!(MAX_MIN_PASSWORD_CHARS as usize == admin_password_policy::MAX_PASSWORD_UTF16_UNITS);
+// Its floor is the policy crate's floor, the owner's minimum (docs/56 §7
+// P-24: 8 characters): one value, pinned.
+const _: () = assert!(MIN_PASSWORD_CHARS_FLOOR == admin_password_policy::MIN_PASSWORD_CHARS_FLOOR);
 
 /// Whether the key set an install targets must exist, must not exist, or
 /// either.
@@ -91,28 +96,48 @@ pub(crate) enum Existence {
 /// The password policy — the one rule set, applied by the one install path
 /// ([`Keyd::install_password`]) and, for kpasswd, also when the request is
 /// opened (before dird writes anything — the same function on the same
-/// value, docs/53 §6.2): at most 256 UTF-16 units and at least
-/// `min_password_chars` code points ([MS-SAMR] 3.1.1.7.2 items 2, 3.2.1;
-/// admin-password-policy `check_length`), and none of `account_name`'s
-/// components of more than two characters as a case-insensitive substring
-/// (item 3.2.2; `check_account_name` — the account's binding is its
-/// sAMAccountName, one component, docs/47 §9.1). Which rule failed is not
-/// reported: one reason, `PasswordPolicyRefused` (docs/37 §2; Q-340 item 7).
+/// value, docs/53 §6.2): crate admin-password-policy's `check_password`
+/// with
+/// - `min_password_chars` as the minimum (never below the owner's 8: the
+///   crate lifts a lower value, and keyd's configuration refuses one);
+/// - `account_name`'s components as the account's name (the account's
+///   binding is its sAMAccountName, one component — `NAME$` for a computer,
+///   docs/47 §9.1; for kpasswd, the ticket's cname);
+/// - keyd's realm, from which the crate takes the organisation's name —
+///   every label but the top-level one (docs/56 §7 P-24; Q-910 item 6; the
+///   realm is the domain's DNS name in upper case, docs/47 §3.3).
 ///
-/// Spec: [MS-SAMR] 3.1.1.7.2 items 1, 2, 3.2.1, 3.2.2; RFC 3244 §2 ("the
+/// Both names are already known here — no new data source
+/// (docs/questions/Q-910 item 6). The rules (the crate's documentation): at
+/// most 256 UTF-16 units; at least the minimum in code points; an ASCII
+/// upper-case letter, lower-case letter, digit and special character; no
+/// ascending or descending run of three; no character three times in a
+/// row; neither name, nor a delimited portion of either of more than two
+/// characters (the realm's top-level label excepted); no weak word. Which rule failed is not reported: one reason,
+/// `PasswordPolicyRefused` (docs/37 §2; Q-340 item 7); kpasswd's client
+/// sees one SOFTERROR with no result string (A-121).
+///
+/// Spec: [MS-SAMR] 3.1.1.7.2 items 1, 2, 3.2.1-3.2.4; RFC 3244 §2 ("the
 /// server will apply any local policy checks including password policy
-/// checks"); docs/53 §6; docs/questions/Q-605 items 1, 2 (A-117); P-24.
+/// checks"); docs/53 §6; docs/56 §7 (P-24); docs/questions/Q-605 items 1,
+/// 2 (A-117), Q-664 (A-126), Q-910.
 pub(crate) fn password_policy(
     config: &KeydConfig,
     password: &str,
     account_name: &PrincipalName,
 ) -> Internal<()> {
-    let refused = |_| Deny::denied(AuditReason::PasswordPolicyRefused);
-    admin_password_policy::check_length(password, config.min_password_chars).map_err(refused)?;
-    for component in &account_name.name_string {
-        admin_password_policy::check_account_name(password, component.as_str()).map_err(refused)?;
-    }
-    Ok(())
+    let components: Vec<&str> = account_name
+        .name_string
+        .iter()
+        .map(|component| component.as_str())
+        .collect();
+    let inputs = admin_password_policy::PolicyInputs {
+        min_chars: config.min_password_chars,
+        account_name: &components,
+        organisation_name: config.realm.as_str(),
+    };
+    admin_password_policy::check_password(password, &inputs)
+        .map_err(|_| Deny::denied(AuditReason::PasswordPolicyRefused))
 }
 
 impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
@@ -607,7 +632,7 @@ mod tests {
             &DIRECTORY,
             &at_max,
             &binding(),
-            Zeroizing::new("a next passphrase".to_owned()),
+            Zeroizing::new("Hazel-Tundra-82-Lynx".to_owned()),
             SALT,
             &now,
         );
@@ -624,7 +649,7 @@ mod tests {
                 &DIRECTORY,
                 &below_max,
                 &binding(),
-                Zeroizing::new("a next passphrase".to_owned()),
+                Zeroizing::new("Hazel-Tundra-82-Lynx".to_owned()),
                 SALT,
                 &now,
             ),

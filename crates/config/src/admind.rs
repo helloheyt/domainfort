@@ -24,9 +24,9 @@
 //! id — so the key that named keyadm's uid is gone (an unknown key is
 //! refused, docs/50 R50-15).
 //!
-//! **The minimum password length** (task A9; decision A-79 / P-24):
-//! `min_password_length` is the least number of characters admind accepts
-//! in a `SetPassword` — **required**, 12 ..= 256, never a default
+//! **The minimum password length** (task A9; decision A-79; docs/56 §7
+//! P-24): `min_password_length` is the least number of characters admind
+//! accepts in a `SetPassword` — **required**, 8 ..= 256, never a default
 //! ([`crate::limits::MIN_PASSWORD_LENGTH`]). [MS-SAMR] 3.1.1.7.2 item 3.2.1
 //! takes it from the domain's Effective-MinimumPasswordLength; the phase-1
 //! schema has no minPwdLength (docs/51 §11, §14), so admind's file carries
@@ -93,7 +93,7 @@ impl AdmindSettings {
 
     /// Parses and validates admind's file. Required: `run_as_uid`,
     /// `run_as_gid`, `admin_socket`, `admin_socket_group` (a gid, never 0),
-    /// `min_password_length` (12 ..= 256, no default), `dird_admin_socket` +
+    /// `min_password_length` (8 ..= 256, no default), `dird_admin_socket` +
     /// `dird_uid`, `keyd_socket` + `keyd_uid`, `audit_socket`,
     /// `auditd_uid`. Optional: `frame_timeout` (5s), `keyd_deadline` (2s).
     ///
@@ -133,8 +133,8 @@ impl AdmindSettings {
         })
     }
 
-    /// The least number of characters of a password admind sets (12 ..=
-    /// 256). Spec: [MS-SAMR] 3.1.1.7.2 item 3.2.1; A-79; P-24.
+    /// The least number of characters of a password admind sets (8 ..=
+    /// 256). Spec: [MS-SAMR] 3.1.1.7.2 item 3.2.1; A-79; docs/56 §7 P-24.
     #[must_use]
     pub const fn min_password_length(&self) -> u32 {
         self.min_password_length

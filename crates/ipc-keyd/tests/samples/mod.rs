@@ -27,7 +27,7 @@ use krb_proto::{
 };
 use zeroize::Zeroizing;
 
-pub const PASSWORD: &str = "correct-horse-battery-staple";
+pub const PASSWORD: &str = "Nook-Petrel-16-Quay";
 
 pub fn realm() -> Realm {
     Realm::new("EXAMPLE.ORG").unwrap()

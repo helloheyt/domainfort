@@ -2896,7 +2896,7 @@ fn a_delete_registers_a_destroy_decision_for_the_tombstone() {
         world.admind_keyd().set_secret(
             &target.handle,
             &target.binding,
-            zeroize::Zeroizing::new(String::from("his first passphrase")),
+            zeroize::Zeroizing::new(String::from("Oasis-Quetzal-82-Rill")),
             set.salt.as_str(),
         ),
         Ok(Ok(Kvno::new(1)))
@@ -3055,7 +3055,7 @@ fn begin_password_set_registers_the_decision_for_its_key_targets() {
     // N4: another salt is refused, and consumes the decision.
     let target = &set.keys[0];
     let mut admind = world.admind_keyd();
-    let password = || zeroize::Zeroizing::new(String::from("his next passphrase"));
+    let password = || zeroize::Zeroizing::new(String::from("Pier-Rook-49-Shoal"));
     assert_eq!(
         admind.set_secret(
             &target.handle,
@@ -3230,7 +3230,7 @@ fn lost_destroy_decisions_are_registered_again_until_keyd_ran_them() {
             world.admind_keyd().set_secret(
                 &target.handle,
                 &target.binding,
-                zeroize::Zeroizing::new(String::from("ws7's machine password")),
+                zeroize::Zeroizing::new(String::from("Quarry-Siskin-35-Thorn")),
                 set.salt.as_str(),
             ),
             Ok(Ok(Kvno::new(1)))
@@ -3340,7 +3340,7 @@ fn give_bob_a_key_set(world: &World) {
         world.admind_keyd().set_secret(
             &target.handle,
             &target.binding,
-            zeroize::Zeroizing::new(String::from("his first passphrase")),
+            zeroize::Zeroizing::new(String::from("Oasis-Quetzal-82-Rill")),
             set.salt.as_str(),
         ),
         Ok(Ok(Kvno::new(1)))
@@ -3501,7 +3501,7 @@ fn a_password_set_begun_before_the_delete_creates_no_key_set() {
         world.admind_keyd().set_secret(
             &target.handle,
             &target.binding,
-            zeroize::Zeroizing::new(String::from("his first passphrase")),
+            zeroize::Zeroizing::new(String::from("Oasis-Quetzal-82-Rill")),
             set.salt.as_str(),
         ),
         Ok(Err(keyd::Error::Denied))

@@ -232,7 +232,7 @@ fn preauth_superseded_password_denied() {
             &DIRECTORY,
             &ALICE,
             &alice_binding(),
-            Zeroizing::new("a new password".to_owned()),
+            Zeroizing::new("Gecko-Iris-38-Kiwi".to_owned()),
             ALICE_SALT,
             &now(),
         )
@@ -247,7 +247,11 @@ fn preauth_superseded_password_denied() {
         );
         assert_eq!(r, Err(AuthnError::Denied), "kvno {kvno:?}");
     }
-    let new_key = password_key(EncType::Aes256CtsHmacSha196, "a new password", ALICE_SALT);
+    let new_key = password_key(
+        EncType::Aes256CtsHmacSha196,
+        "Gecko-Iris-38-Kiwi",
+        ALICE_SALT,
+    );
     assert!(f
         .keyd
         .verify_preauth(
@@ -537,7 +541,7 @@ fn key_change_between_steps_denied() {
             &DIRECTORY,
             &ALICE,
             &alice_binding(),
-            Zeroizing::new("a changed passphrase".to_owned()),
+            Zeroizing::new("Umber-Vortex-57-Wombat".to_owned()),
             ALICE_SALT,
             &now(),
         )

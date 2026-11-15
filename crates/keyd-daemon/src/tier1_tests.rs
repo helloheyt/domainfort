@@ -297,7 +297,7 @@ fn set_secret() -> Call {
     Call::SetSecret {
         handle: client(0xB0),
         binding: binding("bob"),
-        password: Password::new(Zeroizing::new(String::from("tier-one-test-pass"))),
+        password: Password::new(Zeroizing::new(String::from("Ridge-Toucan-68-Umbel"))),
         salt: String::from("EXAMPLE.ORGbob"),
     }
 }
@@ -1291,7 +1291,7 @@ fn a_computer_decision_intent_carries_its_second_target() {
     let ws7 = Call::SetSecret {
         handle: client(0xC7),
         binding: binding("ws7$"),
-        password: Password::new(Zeroizing::new(String::from("tier-one-test-pass"))),
+        password: Password::new(Zeroizing::new(String::from("Ridge-Toucan-68-Umbel"))),
         salt: String::from("EXAMPLE.ORGws7$"),
     };
     assert!(matches!(

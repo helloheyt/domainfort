@@ -98,7 +98,7 @@ fn set_secret(octet: u8) -> Call {
     Call::SetSecret {
         handle: handle(octet),
         binding: binding("bob"),
-        password: Password::new(Zeroizing::new(String::from("tier-two-test-pass"))),
+        password: Password::new(Zeroizing::new(String::from("Shale-Urial-13-Vine"))),
         salt: String::from("EXAMPLE.ORGbob"),
     }
 }
