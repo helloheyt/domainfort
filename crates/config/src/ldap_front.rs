@@ -25,8 +25,17 @@
 //! the source of every accepted connection (crates/ldap-front) — and dird
 //! no longer maps a reported address at all (docs/questions/Q-580).
 //!
+//! **StartTLS on port 389 only** (task DN10c; A-176 on docs/questions/Q-1016
+//! item 4): the zone advertises LDAP at `_ldap._tcp` on port 389 (crates/
+//! dns-zone, from [`crate::StandardPort::Ldap`]), so every `ldap_listen`
+//! address must be on that port (`NonStandardPort`). LDAPS has no SRV record
+//! ([MS-ADTS] §6.3.2.3), so `ldaps_listen` keeps any port. That at least one
+//! StartTLS listener exists is provision's input rule (Q-1016 item 3, option
+//! (a)): this file alone cannot know whether a zone is served.
+//!
 //! Spec: docs/50 R50-10, R50-12, R50-15, §2.4, §3.6, §4.1, §4.2, §5.3, §7.1;
-//! docs/52 §7 R14.
+//! docs/52 §7 R14; [MS-ADTS] v20261026 §6.3.2.3; RFC 4511 §5.2;
+//! docs/questions/Q-1024.
 
 use core::net::SocketAddr;
 use core::time::Duration;
@@ -38,9 +47,12 @@ use crate::schema::{
     self, Account, Distinct, Endpoint, AUDITD_UID, AUDIT_SOCKET, DIRD_DEADLINE, DIRD_LDAP_SOCKET,
     DIRD_UID, INTERNAL_NETWORKS, RUN_AS_GID, RUN_AS_UID,
 };
+use crate::standard_port::StandardPort;
 use crate::value::{self, AbsolutePath, Network};
 
-/// Key: TCP listeners for LDAP with StartTLS (port 389). Spec: docs/50 §4.2.
+/// Key: TCP listeners for LDAP with StartTLS (port 389 —
+/// [`crate::StandardPort::Ldap`], the only port accepted). Spec: docs/50 §4.2;
+/// docs/questions/Q-1024.
 const LDAP_LISTEN: &str = "ldap_listen";
 /// Key: TCP listeners for LDAPS (port 636). Spec: docs/50 §4.2.
 const LDAPS_LISTEN: &str = "ldaps_listen";
@@ -174,8 +186,9 @@ impl LdapFrontSettings {
 
     /// Parses and validates ldap-front's file. Required: `run_as_uid`,
     /// `run_as_gid`, at least one of `ldap_listen` / `ldaps_listen` (no
-    /// address in both), `internal_networks` (every listener address inside
-    /// one of them), `tls_certificate_path`, `tls_private_key_path`,
+    /// address in both; every `ldap_listen` address on port 389 —
+    /// `NonStandardPort`, task DN10c), `internal_networks` (every listener
+    /// address inside one of them), `tls_certificate_path`, `tls_private_key_path`,
     /// `dird_ldap_socket` + `dird_uid`, `audit_socket`, `auditd_uid`.
     /// Optional: the timeouts (docs/50 value as default and ceiling) and
     /// `dird_deadline` (61s ..= 65s, default 65s).
@@ -184,7 +197,7 @@ impl LdapFrontSettings {
     /// Any rule of the format or of this schema (see [`crate::ErrorKind`]).
     ///
     /// Spec: docs/50 R50-10, R50-12, R50-15, §3.6, §4.1, §4.2, §5.3, §7.1;
-    /// docs/52 §7 R14.
+    /// docs/52 §7 R14; docs/questions/Q-1024.
     pub fn parse(input: &[u8]) -> Result<Self, Error> {
         let doc = Document::parse(input, Self::KEYS)?;
         let mut all = Distinct::default();
@@ -198,6 +211,10 @@ impl LdapFrontSettings {
         if ldap.is_none() && ldaps.is_none() {
             return Err(Error::file(ErrorKind::NoListener));
         }
+        // Task DN10c (A-176 on Q-1016 item 4): the zone advertises LDAP at
+        // `_ldap._tcp` on port 389 — every StartTLS listener is on it. LDAPS
+        // is advertised by no SRV record, so its port is not fixed here.
+        schema::check_standard_port(ldap.as_ref(), LDAP_LISTEN, StandardPort::Ldap)?;
         check_disjoint(ldap.as_ref(), ldaps.as_ref())?;
         let internal_networks = doc
             .required(INTERNAL_NETWORKS, |text| value::list(text, value::network))?
@@ -244,8 +261,11 @@ impl LdapFrontSettings {
         self.run_as
     }
 
-    /// The StartTLS listeners (port 389); may be empty if LDAPS is
-    /// configured. Spec: docs/50 §4.2.
+    /// The StartTLS listeners, every one on port 389
+    /// ([`crate::StandardPort::Ldap`]); may be empty in this file if LDAPS is
+    /// configured — provision always writes at least one, since the zone
+    /// advertises `_ldap._tcp` (docs/questions/Q-1016 item 3, Q-1024).
+    /// Spec: docs/50 §4.2.
     #[must_use]
     pub fn ldap_listen(&self) -> &[SocketAddr] {
         &self.ldap_listen

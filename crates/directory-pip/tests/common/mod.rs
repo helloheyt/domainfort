@@ -22,6 +22,7 @@ use dtyp::{Control, Guid, SecurityDescriptor, Sid, SECURITY_NT_AUTHORITY};
 use keyd::KeydConfig;
 use krb_proto::{KerberosString, KerberosTime, PrincipalName, Realm};
 use std::cell::Cell;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
@@ -503,6 +504,51 @@ impl Dir {
             &origin,
         )
         .expect("modify");
+        txn.commit().expect("commit");
+    }
+
+    /// Write the namespace keys of the principals `ids` as their
+    /// `PRINCIPAL_NAME_KEY` values — exactly `keys_of_names` of their stored
+    /// names, with `services` as the provisioned service objects — which is
+    /// what the one checker stores from task PN5 on (docs/59 §5.1, N7). A
+    /// test store written through dirstore directly carries no keys
+    /// otherwise; this is the helper docs/questions/Q-1026 item 5 names for
+    /// the fixtures that need them (the product writes only through the
+    /// checker, R13).
+    pub fn write_principal_keys(&self, ids: &[u32], services: &BTreeSet<Guid>) {
+        let ctx = DirectoryContext::new(self.p1.clone(), &keyd_config(), naming_context())
+            .expect("context")
+            .with_service_objects(services.clone());
+        let changes: Vec<(u32, Vec<Vec<u8>>)> = {
+            let view = ctx.view(&self.store, &self.empty_tiers).expect("view");
+            ids.iter()
+                .map(|id| {
+                    let obj = view
+                        .authority_snapshot()
+                        .get_object(guid(*id))
+                        .expect("store")
+                        .expect("object");
+                    let keys = view
+                        .principal_keys(&obj, services)
+                        .expect("keys")
+                        .expect("a principal");
+                    (*id, keys.keys().map(|k| k.as_bytes().to_vec()).collect())
+                })
+                .collect()
+        };
+        let mut txn = self.store.begin_write().expect("begin write");
+        for (id, values) in changes {
+            let origin = self.origin();
+            txn.modify_object(
+                guid(id),
+                vec![AttributeChange::Replace {
+                    id: ad_schema::PRINCIPAL_NAME_KEY,
+                    values,
+                }],
+                &origin,
+            )
+            .expect("modify");
+        }
         txn.commit().expect("commit");
     }
 

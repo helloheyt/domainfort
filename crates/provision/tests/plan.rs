@@ -1045,6 +1045,7 @@ fn the_dc_host_name_and_an_ipv4_internal_network_are_required() {
     let mut v6 = base.clone();
     v6.network.internal_networks = vec!["::1/128".to_owned()];
     v6.network.kdc_listen = vec!["[::1]:88".to_owned()];
+    v6.network.ldap_listen = vec!["[::1]:389".to_owned()];
     v6.network.ldaps_listen = vec!["[::1]:636".to_owned()];
     v6.network.kpasswd_listen = vec!["[::1]:464".to_owned()];
     v6.network.dnsd_listen = vec!["[::1]:53".to_owned()];
@@ -1204,6 +1205,105 @@ fn a_front_listener_outside_the_internal_networks_or_missing_is_refused() {
             other => panic!("{other:?}"),
         }
     }
+}
+
+/// Task DN10c (docs/questions/Q-1016 item 3, decision A-176 option (a);
+/// Q-1024): the zone advertises `_ldap._tcp` on port 389 ([MS-ADTS]
+/// §6.3.2.3; docs/54 §3.1), so provisioning requires a StartTLS listener —
+/// without one it refuses before anything is built (`ldap-listen`,
+/// `MissingStartTlsListener`), LDAPS listeners notwithstanding; with one,
+/// LDAPS is optional and ldap-front's file always carries `ldap_listen`.
+/// Addresses are test data.
+#[test]
+fn a_starttls_listener_is_required() {
+    let dir = TempDir::new();
+    let base = input(&dir, 61002, 61007);
+    let mut ldaps_only = base.clone();
+    ldaps_only.network.ldap_listen.clear();
+    assert!(!ldaps_only.network.ldaps_listen.is_empty());
+    match refused(&ldaps_only) {
+        PlanError::Input(error) => {
+            assert_eq!(error.kind, InputErrorKind::MissingStartTlsListener);
+            assert_eq!(error.field, "ldap-listen");
+            assert_eq!(
+                error.to_string(),
+                "ldap-listen: at least one StartTLS listener (port 389) is required: \
+                 the zone advertises _ldap._tcp on port 389"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    let mut neither = ldaps_only.clone();
+    neither.network.ldaps_listen.clear();
+    assert_eq!(
+        input_kind(refused(&neither)),
+        InputErrorKind::MissingStartTlsListener
+    );
+
+    let mut starttls_only = base.clone();
+    starttls_only.network.ldaps_listen.clear();
+    let p = plan(&starttls_only);
+    let text = p
+        .configs
+        .iter()
+        .find(|f| f.daemon == provision::Daemon::LdapFront)
+        .unwrap()
+        .text();
+    let front = config::LdapFrontSettings::parse(text.as_bytes()).unwrap();
+    assert_eq!(front.ldap_listen(), ["127.0.0.1:389".parse().unwrap()]);
+    assert!(front.ldaps_listen().is_empty());
+    assert!(text.lines().any(|l| l == "ldap_listen = 127.0.0.1:389"));
+    assert!(!text.lines().any(|l| l.starts_with("ldaps_listen")));
+}
+
+/// Task DN10c (docs/questions/Q-1016 item 4, decision A-176 option (a);
+/// Q-1024): the listeners the zone advertises take only their standard port
+/// (RFC 4120 §7.2.3.2: 88; [MS-ADTS] §6.3.2.3: 389, 464 — crates/config
+/// `StandardPort`). One on another port fails the parse-back by the
+/// daemon's own schema (`NonStandardPort` at its listener key) — the one
+/// rule, not a copy in provision; LDAPS (no SRV record) keeps any port.
+/// Addresses are test data.
+#[test]
+fn an_advertised_listener_on_another_port_is_refused() {
+    let dir = TempDir::new();
+    let base = input(&dir, 61002, 61007);
+    for (daemon, key, change) in [
+        (
+            provision::Daemon::Kdc,
+            "listen",
+            Box::new(|i: &mut provision::DomainInput| {
+                i.network.kdc_listen = vec!["127.0.0.1:1088".to_owned()];
+            }) as Box<dyn Fn(&mut provision::DomainInput)>,
+        ),
+        (
+            provision::Daemon::LdapFront,
+            "ldap_listen",
+            Box::new(|i: &mut provision::DomainInput| {
+                i.network.ldap_listen = vec!["127.0.0.1:3389".to_owned()];
+            }),
+        ),
+        (
+            provision::Daemon::KpasswdFront,
+            "listen",
+            Box::new(|i: &mut provision::DomainInput| {
+                i.network.kpasswd_listen = vec!["127.0.0.1:88".to_owned()];
+            }),
+        ),
+    ] {
+        let mut i = base.clone();
+        change(&mut i);
+        match refused(&i) {
+            PlanError::Config(refused_daemon, error) => {
+                assert_eq!(refused_daemon, daemon);
+                assert_eq!(error.kind(), config::ErrorKind::NonStandardPort);
+                assert_eq!(error.key(), Some(key));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    let mut ldaps_elsewhere = base.clone();
+    ldaps_elsewhere.network.ldaps_listen = vec!["127.0.0.1:6360".to_owned()];
+    assert!(Plan::build(&ldaps_elsewhere, now(), &mut CountingRandom::default()).is_ok());
 }
 
 fn input_kind(e: PlanError) -> InputErrorKind {

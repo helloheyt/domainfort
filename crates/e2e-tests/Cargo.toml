@@ -98,6 +98,11 @@ directory-admin = { path = "../directory-admin" }
 dns-daemon = { path = "../dns-daemon", features = ["test-seams"] }
 ipc-dns = { path = "../ipc-dns" }
 parse-dns = { path = "../parse-dns" }
+# Task DN10c (tests/dns_zone.rs; docs/questions/Q-1016, Q-1024): the closed
+# table of SRV records the zone can advertise (`SrvService`), checked against
+# the listeners of the produced configuration. A workspace crate, already in
+# the lock — no third-party package is added.
+dns-zone = { path = "../dns-zone" }
 # The DER encoder (`encode`, `encode_element`) under the test certificates
 # of tests/support/tls.rs (crates/parse-x509 tests/common/build.rs, reused
 # by `#[path]`, as crates/ldap-front's tests do; docs/questions/Q-320,

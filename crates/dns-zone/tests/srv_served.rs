@@ -14,10 +14,20 @@
 //!
 //! What a source scan cannot see — a listener *configured* away in another
 //! daemon's file (an ldap-front with LDAPS listeners only; a non-standard
-//! port) — is docs/questions/Q-1016.
+//! port), docs/questions/Q-1016 items 3–4 — is closed by task DN10c (A-176)
+//! and guarded here and in crates/e2e-tests `tests/dns_zone.rs`:
+//! [`every_srv_port_is_the_only_port_its_serving_daemon_accepts`] parses each
+//! serving daemon's configuration with its listener on the record's port
+//! (accepted) and on every other port of a sample (refused,
+//! `NonStandardPort`), so a record's port and the port its daemon may listen
+//! on cannot differ; the e2e test checks that every record a provisioned zone
+//! advertises has a listener in the produced files (the StartTLS listener
+//! provision requires — Q-1016 item 3). docs/questions/Q-1024.
 //!
 //! Scope of the scan: `crates/<serving crate>/src`, every `.rs` file except
-//! directories named `tests` and files named `tests.rs` (test code), with
+//! directories named `tests` and files named `tests.rs` or `*_tests.rs`
+//! (test code — the rule of crates/e2e-tests
+//! `tests/no_test_seams_in_product.rs`), with
 //! line comments (`//`, `///`, `//!`) removed — a comment saying "no UDP
 //! socket" is not a socket. A positive control checks the scan finds the
 //! KDC's UDP socket and TCP listener, so it cannot pass vacuously.
@@ -25,8 +35,13 @@
 //! Sources: docs/54 §3.1 (the record set); docs/questions/Q-1004 (A-172:
 //! "one SRV record per service that exists"); PENDING-OWNER A-117, A-158;
 //! docs/50 §2.4 (which process serves which port); RFC 2782 (the Proto
-//! label `_udp` / `_tcp`); RFC 4120 §7.2.3.2. Test-only.
+//! label `_udp` / `_tcp`); RFC 4120 §7.2.3.2; [MS-ADTS] v20261026
+//! §6.3.2.3 (the Port field: 389, 88, 464); docs/questions/Q-1016 items
+//! 3–4 (A-176), Q-1024. The configuration texts are hand-made test data
+//! (documentation addresses 192.0.2.0/24, fake uids and paths). Test-only.
 
+use config::{ErrorKind, KdcSettings, KpasswdFrontSettings, LdapFrontSettings, StandardPort};
+use core::net::SocketAddr;
 use dns_zone::{KpasswdService, SrvService};
 use std::path::{Path, PathBuf};
 
@@ -73,7 +88,7 @@ fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
             if name != "tests" {
                 sources(&path, out);
             }
-        } else if name.ends_with(".rs") && name != "tests.rs" {
+        } else if name.ends_with(".rs") && name != "tests.rs" && !name.ends_with("_tests.rs") {
             out.push(path);
         }
     }
@@ -140,4 +155,122 @@ fn the_scan_sees_the_kdc_sockets_and_ignores_comments() {
         .lines()
         .map(|l| l.split("//").next().unwrap_or(""))
         .any(|l| l.contains("UdpSocket")));
+}
+
+/// The key of the serving daemon's listener list for each Service label —
+/// the list the zone's record for it advertises (the kdc's `listen` serves
+/// UDP and TCP, ldap-front's `ldap_listen` StartTLS on TCP, kpasswd-front's
+/// `listen` TCP); `None` for a label no serving configuration is known for.
+fn listener_key(service: &[u8]) -> Option<&'static str> {
+    match service {
+        b"_kerberos" | b"_kpasswd" => Some("listen"),
+        b"_ldap" => Some("ldap_listen"),
+        _ => None,
+    }
+}
+
+/// The serving daemon's file for `service` (docs/50 §7.1; crates/config's
+/// test samples reduced to the required keys) with one listener at
+/// 192.0.2.5:`port`: the addresses its schema accepted on that list, or the
+/// refusal's (rule, key).
+fn serving_configuration(
+    service: &[u8],
+    port: u16,
+) -> Result<Vec<SocketAddr>, (ErrorKind, Option<&'static str>)> {
+    let refusal = |e: config::Error| (e.kind(), e.key());
+    let key = listener_key(service).expect("a listed Service label");
+    let listener = format!("{key} = 192.0.2.5:{port}\n");
+    let tail = "audit_socket = /run/auditd/audit.sock\nauditd_uid = 805\n";
+    match service {
+        b"_kerberos" => {
+            let text = format!(
+                "run_as_uid = 803\nrun_as_gid = 803\n{listener}\
+                 internal_networks = 192.0.2.0/24\n\
+                 keyd_socket = /run/keyd/keyd.sock\nkeyd_uid = 801\n\
+                 dird_kdc_socket = /run/dird/kdc/dird-kdc.sock\ndird_uid = 802\n\
+                 policy_store_path = /etc/domain/policy.store\n\
+                 policy_store_format = unsigned-development\n{tail}"
+            );
+            KdcSettings::parse(text.as_bytes())
+                .map(|s| s.listen().to_vec())
+                .map_err(refusal)
+        }
+        b"_ldap" => {
+            let text = format!(
+                "run_as_uid = 804\nrun_as_gid = 804\n{listener}\
+                 internal_networks = 192.0.2.0/24\n\
+                 tls_certificate_path = /etc/ldap-front/dc-cert.der\n\
+                 tls_private_key_path = /etc/ldap-front/dc-key.der\n\
+                 dird_ldap_socket = /run/dird/ldap/dird-ldap.sock\ndird_uid = 802\n{tail}"
+            );
+            LdapFrontSettings::parse(text.as_bytes())
+                .map(|s| s.ldap_listen().to_vec())
+                .map_err(refusal)
+        }
+        b"_kpasswd" => {
+            let text = format!(
+                "run_as_uid = 4464\nrun_as_gid = 4464\n{listener}\
+                 internal_networks = 192.0.2.0/24\nrealm = EXAMPLE.TEST\n\
+                 dird_kpasswd_socket = /run/dird/kpasswd/dird-kpasswd.sock\n\
+                 dird_uid = 4402\n{tail}"
+            );
+            KpasswdFrontSettings::parse(text.as_bytes())
+                .map(|s| s.listen().to_vec())
+                .map_err(refusal)
+        }
+        _ => unreachable!("listener_key lists the same labels"),
+    }
+}
+
+/// Task DN10c (A-176 on docs/questions/Q-1016 item 4; Q-1024): for every
+/// record the zone can synthesize, the serving daemon's schema accepts a
+/// listener on the record's port and refuses it on any other port of the
+/// sample — the other standard ports, the neighbours, a high port —
+/// `NonStandardPort` at the listener's key. So the advertised port and the
+/// only port a listener may have are one value. Fails closed for a Service
+/// label with no serving configuration listed.
+#[test]
+fn every_srv_port_is_the_only_port_its_serving_daemon_accepts() {
+    for service in SrvService::ALL {
+        let label = service.service_label();
+        let key = listener_key(label)
+            .unwrap_or_else(|| panic!("{service:?}: no serving configuration is listed"));
+        let port = service.port();
+        assert_eq!(
+            serving_configuration(label, port),
+            Ok(vec![SocketAddr::from(([192, 0, 2, 5], port))]),
+            "{service:?}: its own port is accepted"
+        );
+        let others = StandardPort::ALL
+            .into_iter()
+            .map(StandardPort::number)
+            .chain([port - 1, port + 1, 1088, 50_000])
+            .filter(|other| *other != port);
+        for other in others {
+            assert_eq!(
+                serving_configuration(label, other),
+                Err((ErrorKind::NonStandardPort, Some(key))),
+                "{service:?}: port {other} must be refused"
+            );
+        }
+    }
+}
+
+/// The one definition (task DN10c): each record's port is its
+/// `standard_port` — crate config's — and the table uses exactly config's
+/// three standard ports (RFC 4120 §7.2.3.2: 88 for both Kerberos
+/// transports; [MS-ADTS] v20261026 §6.3.2.3: 389 for LDAP, 464 for the
+/// Kerberos Password Change service).
+#[test]
+fn the_srv_ports_are_config_s_standard_ports() {
+    for service in SrvService::ALL {
+        assert_eq!(service.port(), service.standard_port().number());
+    }
+    let mut used: Vec<StandardPort> = SrvService::ALL
+        .into_iter()
+        .map(SrvService::standard_port)
+        .collect();
+    used.dedup();
+    assert_eq!(used, StandardPort::ALL.to_vec());
+    assert_eq!(SrvService::ALL.map(SrvService::port), [88, 88, 389, 464]);
 }

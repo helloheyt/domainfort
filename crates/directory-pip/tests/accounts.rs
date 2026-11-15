@@ -213,8 +213,13 @@ fn spn_lookup_on_computers() {
 
 /// R2 (docs/52 §5 item 3; A-73): the admin service's two-part name
 /// `admind/<host>` resolves to its object's `AdminService` key set — the
-/// KDC seals its tickets there — and every other service name (another
-/// class, more components) to the `Service` key set.
+/// KDC seals its tickets there — and another class's name to the `Service`
+/// key set. Task PN4 (docs/59 §4.4 N4, §6.1 step 3; [MS-ADTS] 2.2.21,
+/// 3.1.1.5.3.1.1.4; docs/questions/Q-1018 item 6, Q-1026): a stored
+/// three-part SPN is a name the phase-1 namespace refuses (three parts only
+/// on the DC's object, task PN16), so an object holding one is refused when
+/// it is found — fail closed (`Failed`), where the R47-1 lookup used to
+/// hand out its `Service` key set.
 #[test]
 fn the_admin_service_name_names_the_admin_service_key_set() {
     let d = Dir::new("spn-admind");
@@ -257,11 +262,11 @@ fn the_admin_service_name_names_the_admin_service_key_set() {
         .unwrap()
         .expect("the admin service");
     assert_eq!(admin.key, key_of(60, KeyPurpose::AdminService));
-    // A third component makes it another (plain) service name.
-    let other = service(&view, &["admind", "dc01.example.test", "x"])
-        .unwrap()
-        .expect("a plain service");
-    assert_eq!(other.key, key_of(61, KeyPurpose::Service));
+    // A stored third component is refused by the namespace (PN4).
+    assert_eq!(
+        service(&view, &["admind", "dc01.example.test", "x"]),
+        Err(AccountSourceError::Failed)
+    );
     let ws01 = service(&view, &["host", "ws01.example.test"])
         .unwrap()
         .unwrap();
@@ -274,8 +279,9 @@ fn the_admin_service_name_names_the_admin_service_key_set() {
 /// not significant); docs/47 §1.3 TGS step 3 (the unique index folds A–Z,
 /// Q-080; the final comparison is octet for octet); A-139 (one name rule):
 /// `kadmin/changepw` resolves to its object's `ChangePasswordService` key
-/// set under either name-type; a case variant matches no stored SPN; a
-/// third component is another (plain) service name.
+/// set under either name-type; a case variant matches no stored SPN. Task
+/// PN4 (docs/59 §4.4 N4, §6.1 step 3; Q-1026): an object holding a stored
+/// three-part SPN is refused when found — fail closed (`Failed`).
 #[test]
 fn the_change_password_service_name_names_its_key_set() {
     let d = Dir::new("spn-changepw");
@@ -316,10 +322,10 @@ fn the_change_password_service_name_names_its_key_set() {
         assert_eq!(changepw.key, key_of(62, KeyPurpose::ChangePasswordService));
     }
     assert_eq!(service(&view, &["KADMIN", "changepw"]), Ok(None));
-    let other = service(&view, &["kadmin", "changepw", "x"])
-        .unwrap()
-        .expect("a plain service");
-    assert_eq!(other.key, key_of(63, KeyPurpose::Service));
+    assert_eq!(
+        service(&view, &["kadmin", "changepw", "x"]),
+        Err(AccountSourceError::Failed)
+    );
 }
 
 /// docs/47 §1.3 TGS step 4, R47-13: an SPN can only be held by a computer

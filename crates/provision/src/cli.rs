@@ -25,7 +25,7 @@
 //!     --tls-certificate-path <path> --tls-private-key-path <path> \
 //!     --policy-next-path <path> \
 //!     --kdc-listen <addr:port> [--kdc-listen …] \
-//!     [--ldap-listen <addr:port> …] [--ldaps-listen <addr:port> …] \
+//!     --ldap-listen <addr:389> [--ldap-listen …] [--ldaps-listen <addr:port> …] \
 //!     --kpasswd-listen <addr:port> [--kpasswd-listen …] \
 //!     --dnsd-listen <addr:port> [--dnsd-listen …] \
 //!     --internal-network <addr/prefix> [--internal-network …] \
@@ -72,7 +72,11 @@
 //! name (`dird-kpasswd.sock`, docs/53 §4.3; `dird-dns.sock`, docs/54 §4.6).
 //! Task DN10b adds `--dc-address` (repeatable, at least one — checked with
 //! the input, docs/questions/Q-1014): the DC's own host record (docs/54
-//! §3.1, §10 row DN13).
+//! §3.1, §10 row DN13). Task DN10c makes `--ldap-listen` required (at least
+//! one StartTLS listener — the zone advertises `_ldap._tcp` on 389) and the
+//! kdc, StartTLS and kpasswd listeners take only their standard port (88,
+//! 389, 464 — crates/config `StandardPort`); docs/questions/Q-1016 items 3–4
+//! (A-176), Q-1024.
 //!
 //! Spec: docs/51 §4.3 (the input; step 12), §4.4 (the password source),
 //! §5.10 (`provision policy`), §3 (D95); docs/50 §7.1 (numeric ids, no

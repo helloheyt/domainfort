@@ -7,8 +7,8 @@
 # "forward to dird"), and builds every reply as a parse-dns value encoded by
 # parse-dns's canonical encoder.
 #
-# Its one dependency is this workspace's own parse-dns (path dependency); no
-# third-party crate is added (AGENTS.md §7).
+# Its dependencies are this workspace's own parse-dns and config (path
+# dependencies); no third-party crate is added (AGENTS.md §7).
 #
 # Written only from RFC 1034 §3.1, §3.6, §3.7–§3.7.2, §4.3.1–§4.3.4; RFC 1035
 # §2.3.1–§2.3.4, §3.1–§3.2.5, §3.3, §3.3.11, §3.3.13, §3.4.1, §4.1–§4.1.3,
@@ -29,6 +29,13 @@ publish = false
 # Our own strict DNS codec (path dependency, same workspace): every request is
 # decoded and every reply encoded by it (docs/54 §6.1).
 parse-dns = { path = "../parse-dns" }
+# Our own zero-dependency, std-only configuration crate (path dependency,
+# same workspace): the SRV records' ports are its `StandardPort` — the one
+# copy of 88 / 389 / 464, the same value the kdc's, ldap-front's and
+# kpasswd-front's listener rule requires (task DN10c; docs/questions/Q-1016
+# item 4, decision A-176; Q-1024). Only the constants are used: dns-zone
+# still opens, reads and parses no file.
+config = { path = "../config" }
 
 [lints]
 workspace = true

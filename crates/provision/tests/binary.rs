@@ -88,6 +88,7 @@ fn args(input: &provision::DomainInput) -> Vec<String> {
         push(flag, path.as_str().to_owned());
     }
     push("--kdc-listen", input.network.kdc_listen[0].clone());
+    push("--ldap-listen", input.network.ldap_listen[0].clone());
     push("--ldaps-listen", input.network.ldaps_listen[0].clone());
     push("--kpasswd-listen", input.network.kpasswd_listen[0].clone());
     push("--dnsd-listen", input.network.dnsd_listen[0].clone());

@@ -19,7 +19,12 @@
 //!   octet; user or computer only; never the krbtgt account (RID 502). TGS
 //!   server = two or more components joined with "/", looked up by
 //!   servicePrincipalName, octet for octet, on computers only. No UPN, "$",
-//!   enterprise or canonicalisation fallbacks.
+//!   enterprise or canonicalisation fallbacks. Both go through the one
+//!   lookup path by name, [`DirectoryView::canonical_principal`] (task PN4;
+//!   docs/59 §6): one key per request from crate `principal-names`, one
+//!   probe, the kind and the key purpose read from the object found, and
+//!   R47-1 as the acceptance of wave 2 (module `resolve`;
+//!   docs/questions/Q-1026, Q-1027).
 //! - **krbtgt (R47-2):** never a client or a service;
 //!   [`DirectoryView::krbtgt_handle`] gives `KdcConfig.krbtgt`.
 //! - **Keys (R47-3):** `KeyHandle = (objectGUID, purpose)`.
@@ -148,6 +153,7 @@ mod naming;
 mod pep;
 mod principal;
 mod record;
+mod resolve;
 mod salt;
 mod state;
 mod tier;
@@ -171,6 +177,9 @@ pub use pep::PepView;
 // An object's principal names and keys in the one namespace (task PN1;
 // docs/59 §4.3): `DirectoryView::{principal_names_of, principal_keys}`.
 pub use principal::{name_context_of, PrincipalNamesError};
+// The one lookup path by name (task PN4; docs/59 §6.1-§6.3):
+// `DirectoryView::canonical_principal`.
+pub use resolve::{LookupCtx, ResolvedPrincipal};
 pub use salt::{account_salt, AccountKind, SaltError};
 pub use tier::TierMap;
 pub use time::{dstime_of, time_of_dstime};

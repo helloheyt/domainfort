@@ -1,0 +1,594 @@
+//! The one lookup path from a requested principal name to a directory
+//! object (task PN4; docs/59 §6, wave 2; decision A-173).
+//!
+//! # What it is
+//!
+//! [`DirectoryView::canonical_principal`] is the only place in this crate
+//! that turns a name received in a request into an object: the KDC's
+//! client and service lookups ([`kdc::AccountSource`], crate::view) are thin
+//! wrappers of it, so every consumer that resolves a principal by name — the
+//! AS and the TGS, and through `AccountSource` the admin plane's, kpasswd's,
+//! the DNS update's and the LDAP session's subject checks and dird's
+//! service-object checks — passes through it (docs/59 §6.1, R59-5). The
+//! result is a [`ResolvedPrincipal`], built only here.
+//!
+//! # The steps (docs/59 §6.1)
+//!
+//! 1. **The request's key**: `principal_names::key_of_request` — at most one
+//!    key for any request; a foreign realm, a malformed name, `krbtgt/X` and
+//!    every name that would reach the krbtgt account give none (the KDC
+//!    names the TGS only through its configured handle — R47-2).
+//! 2. **The request half of the phase-1 acceptance** (R47-1; docs/59 §6.3,
+//!    wave 2): the realm is the configured realm octet for octet; a client
+//!    name has one component, a service name two or more.
+//! 3. **One probe** for that key (below, "The probe").
+//! 4. **The class** of the object found, from authoritative data
+//!    (crate::principal), filtered by the [`LookupCtx`]: a group, the krbtgt
+//!    account (RID 502) or a non-principal is no client and no service; a
+//!    service is a computer (R47-13).
+//! 5. **Re-derivation**: `principal_names::keys_of_names` of the object's
+//!    stored names, with the configured provisioned service objects (Q-1019
+//!    (a)). A name the namespace refuses, or a probed key that is not one of
+//!    the object's keys, is a fault (fail closed — docs/59 §6.1 step 3); the
+//!    kinds of the probed key are what was matched, and a kind the context
+//!    does not accept is "no such principal" (docs/59 §6.2).
+//! 6. **The stored half of the acceptance**: the stored value of the
+//!    accepted kind equals the request octet for octet (A-27) — the stored
+//!    sAMAccountName for a client, a stored servicePrincipalName for a
+//!    service. That stored value is the canonical name.
+//! 7. **The key purpose**, from the canonical (stored) name and never from
+//!    the request's spelling (docs/59 §6.1 step 6; Q-1009 item 3): the one
+//!    derivation `KeyPurpose::of_service_name` (R2b) over the canonical name,
+//!    cross-checked against the reserved-name predicate on the folded key
+//!    (`principal_names::reserved_name_of`, Q-1009 items 1-2) — the two
+//!    disagree only for a case variant of a reserved name, which is refused
+//!    (class C49: one name, one equivalence).
+//!
+//! # The probe (wave 2) — docs/questions/Q-1026
+//!
+//! Under the phase-1 acceptance every context accepts exactly one kind of
+//! name ([`LookupCtx`] → `AcceptedName`). The probe is the unique index of
+//! that kind's attribute (sAMAccountName or servicePrincipalName), asked
+//! once with the request's key. On a store whose principals carry their
+//! namespace keys (`PRINCIPAL_NAME_KEY`, written by the one checker from
+//! task PN5 on, unique over the union — task PN2), this returns exactly the
+//! object a probe of `PRINCIPAL_NAME_KEY` would return filtered to that kind:
+//! the union index makes the holder of a key unique, and an object holds a
+//! key with kind *k* exactly when its *k* attribute folds to it (the two
+//! folds are pinned equal — tests/principal_names.rs). On today's stores,
+//! where nothing writes `PRINCIPAL_NAME_KEY` yet, it is the lookup R47-1 has
+//! always made. It is ONE probe: there is no second probe in another name
+//! space when the first finds nothing (class C31). When the acceptance
+//! widens to several kinds per context (task PN14), the probe must become
+//! the `PRINCIPAL_NAME_KEY` index — only the union index answers several
+//! kinds in one probe; `AcceptedName` then gives way to a kind set, and the
+//! private `DirectoryView::probe` is the one place to change (Q-1026).
+//!
+//! # The classes (AGENTS.md §6.1)
+//!
+//! - **C31 (docs/59 §3 M1)** — an identity lookup through a fallback chain
+//!   of name spaces: one key per request, one probe, the kind decided after
+//!   the probe from the object; no "$", UPN, enterprise or one-component
+//!   sname retry exists in code.
+//! - **C49 (M3)** — name equivalence computed by more than one function:
+//!   the key comes from crate `principal-names`, the purpose and the class
+//!   from the resolved object (its stored canonical name, its class), and a
+//!   stored name whose octet-defined purpose disagrees with its folded
+//!   reservation is refused.
+//!
+//! # Residuals (documented, not hidden)
+//!
+//! - The probe uses the per-kind index until the switch of Q-1026.
+//! - Objects whose stored names the namespace refuses (writable through the
+//!   admin plane until task PN5) are no longer handed out: a
+//!   userPrincipalName with a foreign suffix, a stored three-part SPN or a
+//!   case variant of a reserved name is a fault when found; a "@" in a
+//!   sAMAccountName, or one equal to the realm alias, is a name no request
+//!   can probe — fail closed either way (Q-1026 item 3).
+//! - Whether a resolved reserved purpose belongs to the provisioning claim
+//!   that owns it (A-163) is the writer's check (task PN5); the lookup knows
+//!   only the configured provisioned service objects as a set (Q-1019), and
+//!   dird does not pass that set yet (task PN10; docs/questions/Q-1027).
+//! - dirstore exposes no change sequence of a snapshot, so a
+//!   `ResolvedPrincipal` carries none; `NameResolution.snapshot` is task
+//!   PN10's (Q-1027).
+//!
+//! Spec: docs/59 §4.7, §6.1-§6.3, §10 (the PN4 row); docs/47 §1.3 (R47-1),
+//! §1.4 (R47-2), R47-13; docs/questions/Q-1007 items 1-4, 10, Q-1009 items
+//! 1-3, Q-1018 items 2, 5, Q-1019 (a); A-27; [MS-KILE] v20261110 3.1.5.7,
+//! 3.3.5.1.1, 3.3.5.1.2, 3.3.5.6.1; RFC 4120 §6.2, §7.3.
+
+use crate::error::Fault;
+use crate::salt::AccountKind;
+use crate::view::{principal_id, DirectoryView};
+use dirstore::Object;
+use dtyp::{Guid, Sid};
+use kdc::AccountSourceError;
+use keyd_types::{KeyHandle, KeyPurpose, PrincipalId};
+use krb_proto::{KerberosString, PrincipalName, Realm};
+use principal_names::{
+    key_of_request, keys_of_names, reserved_name_of, KindSet, NameKind, PrincipalClass,
+    PrincipalKey, RequestKey, ReservedName,
+};
+
+/// The separator of an SPN's parts in its stored single-string form.
+/// Spec: [MS-ADTS] 2.2.21; [MS-KILE] 3.1.5.11.
+const SPN_SEPARATOR: char = '/';
+
+/// The context a requested name is looked up in: which kinds of name it
+/// accepts and which objects it may resolve to (docs/59 §6.2).
+///
+/// In wave 2 (the phase-1 acceptance, docs/59 §6.3) the two client contexts
+/// accept the same names, as do the two service contexts; they are kept
+/// apart because their acceptance diverges when it widens (task PN14:
+/// `TgsServer` takes a one-component name, `ServiceObject` never does).
+/// Spec: docs/59 §6.2 (the table); docs/47 §1.3 (R47-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum LookupCtx {
+    /// The client name of an AS request (cname). Spec: docs/59 §6.2;
+    /// [MS-KILE] 3.3.5.6.1; docs/47 §1.3 AS.
+    AsClient,
+    /// The client name in a ticket this realm's KDC issued — the admin
+    /// plane's, kpasswd's and the DNS update's subject, the LDAP session
+    /// check. Spec: docs/59 §6.2, §6.4.
+    TicketClient,
+    /// The server name of a TGS request (sname). Spec: docs/59 §6.2;
+    /// [MS-KILE] 3.3.5.1.1; docs/47 §1.3 TGS.
+    TgsServer,
+    /// A provisioned service object's own name (dird's admin and
+    /// change-password service checks). Spec: docs/59 §6.2.
+    ServiceObject,
+}
+
+/// The one kind of name a context accepts under the phase-1 acceptance
+/// (R47-1: "AS = sAMAccountName, TGS = SPN"; docs/59 §6.3 wave 2).
+/// Spec: docs/47 §1.3 (R47-1); docs/59 §6.3; docs/questions/Q-1007 item 10.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptedName {
+    /// sAMAccountName, one component. Spec: docs/47 §1.3 AS steps 2-4.
+    SamAccountName,
+    /// servicePrincipalName, two or more components joined with "/".
+    /// Spec: docs/47 §1.3 TGS steps 2-3.
+    ServicePrincipalName,
+}
+
+impl AcceptedName {
+    /// The namespace kind it is. Spec: docs/59 §4.1.
+    const fn kind(self) -> NameKind {
+        match self {
+            AcceptedName::SamAccountName => NameKind::SamAccountName,
+            AcceptedName::ServicePrincipalName => NameKind::ServicePrincipalName,
+        }
+    }
+
+    /// `true` if the request's name has the shape this kind takes: one
+    /// component for a sAMAccountName, two or more for an SPN.
+    /// Spec: docs/47 §1.3 AS step 2, TGS step 2 (R47-1).
+    fn takes_component_count(self, count: usize) -> bool {
+        match self {
+            AcceptedName::SamAccountName => count == 1,
+            AcceptedName::ServicePrincipalName => count >= 2,
+        }
+    }
+}
+
+impl LookupCtx {
+    /// The kind of name the context accepts in wave 2.
+    /// Spec: docs/59 §6.3 (wave 2); docs/47 §1.3 (R47-1).
+    const fn accepted(self) -> AcceptedName {
+        match self {
+            LookupCtx::AsClient | LookupCtx::TicketClient => AcceptedName::SamAccountName,
+            LookupCtx::TgsServer | LookupCtx::ServiceObject => AcceptedName::ServicePrincipalName,
+        }
+    }
+
+    /// `true` if an object of `class` may be what the context resolves to:
+    /// a client is a user or a computer account, a service a computer
+    /// account; never a group (Q-1007 item 7) and never the krbtgt account
+    /// (R47-2 — the KDC reaches it through its configured handle only).
+    /// Spec: docs/59 §6.1 step 4, §6.2; docs/47 §1.3 AS step 5, TGS step 4,
+    /// §1.4 (R47-2), R47-13.
+    const fn admits(self, class: PrincipalClass) -> bool {
+        let computer = matches!(
+            class,
+            PrincipalClass::Computer
+                | PrincipalClass::DomainController
+                | PrincipalClass::ProvisionedService
+        );
+        match self.accepted() {
+            AcceptedName::SamAccountName => computer || matches!(class, PrincipalClass::User),
+            AcceptedName::ServicePrincipalName => computer,
+        }
+    }
+}
+
+/// A requested principal name resolved to one directory object — built only
+/// by [`DirectoryView::canonical_principal`] (a capability type: holding one
+/// means the one lookup path accepted the name; docs/59 §4.7).
+///
+/// It carries what the account records are built from (crate::view) and
+/// what a `keyd_types::NameResolution` needs (task PN10): the request's
+/// realm and name, the canonical realm and name, the principal and the key
+/// purpose. Names are not secrets (docs/59 §4.6); `Debug` shows no
+/// directory value beyond them.
+/// Spec: docs/59 §4.7, §6.1, §7.1; docs/questions/Q-1011 item 1.
+pub struct ResolvedPrincipal {
+    /// The live object found (read from the view's one snapshot).
+    object: Object,
+    /// keyd's principal identifier: the objectGUID (R47-3).
+    principal: PrincipalId,
+    /// objectSid.
+    sid: Sid,
+    /// The salt rule's account kind (user / computer).
+    account_kind: AccountKind,
+    /// The class, from authoritative data and the configured provisioned
+    /// service objects (crate::principal; Q-1019).
+    class: PrincipalClass,
+    /// The kinds of the key that was matched (docs/59 §4.7 `matched`).
+    matched: KindSet,
+    /// The context it was resolved in.
+    lookup: LookupCtx,
+    /// The realm the request carried.
+    realm_as_sent: Realm,
+    /// The name the request carried.
+    name_as_sent: PrincipalName,
+    /// The configured realm.
+    canonical_realm: Realm,
+    /// The stored name it resolved to: the sAMAccountName of a client, the
+    /// servicePrincipalName of a service (the request's name-type kept).
+    canonical_name: PrincipalName,
+    /// The purpose of its key set, from the canonical name (Q-1009 item 3).
+    key_purpose: KeyPurpose,
+}
+
+impl ResolvedPrincipal {
+    /// The object's GUID.
+    #[must_use]
+    pub fn guid(&self) -> Guid {
+        self.object.guid
+    }
+
+    /// keyd's principal identifier (the objectGUID). Spec: docs/47 §2.3.
+    #[must_use]
+    pub fn principal(&self) -> PrincipalId {
+        self.principal
+    }
+
+    /// The object's objectSid.
+    #[must_use]
+    pub fn sid(&self) -> &Sid {
+        &self.sid
+    }
+
+    /// The account kind (user / computer).
+    #[must_use]
+    pub fn account_kind(&self) -> AccountKind {
+        self.account_kind
+    }
+
+    /// The object's class (crate::principal).
+    #[must_use]
+    pub fn class(&self) -> PrincipalClass {
+        self.class
+    }
+
+    /// The kinds of the matched key. Spec: docs/59 §4.7, §6.1 step 3.
+    #[must_use]
+    pub fn matched(&self) -> KindSet {
+        self.matched
+    }
+
+    /// The context it was resolved in.
+    #[must_use]
+    pub fn lookup(&self) -> LookupCtx {
+        self.lookup
+    }
+
+    /// The realm the request carried. Spec: docs/59 §4.7 (`realm_as_sent`).
+    #[must_use]
+    pub fn realm_as_sent(&self) -> &Realm {
+        &self.realm_as_sent
+    }
+
+    /// The name the request carried. Spec: docs/59 §4.7 (`name_as_sent`).
+    #[must_use]
+    pub fn name_as_sent(&self) -> &PrincipalName {
+        &self.name_as_sent
+    }
+
+    /// The configured realm. Spec: docs/59 §4.7 (`canonical_realm`).
+    #[must_use]
+    pub fn canonical_realm(&self) -> &Realm {
+        &self.canonical_realm
+    }
+
+    /// The stored name it resolved to. Spec: docs/59 §4.7
+    /// (`canonical_name`).
+    #[must_use]
+    pub fn canonical_name(&self) -> &PrincipalName {
+        &self.canonical_name
+    }
+
+    /// The purpose of its key set. Spec: docs/59 §4.7, §6.1 step 6.
+    #[must_use]
+    pub fn key_purpose(&self) -> KeyPurpose {
+        self.key_purpose
+    }
+
+    /// keyd's handle of its key set: `(objectGUID, key_purpose)`.
+    /// Spec: docs/47 §2.3 (R47-3); docs/10 §1.
+    #[must_use]
+    pub fn key_handle(&self) -> KeyHandle {
+        KeyHandle::new(self.principal, self.key_purpose)
+    }
+
+    /// The object itself, for the account records built in this crate.
+    pub(crate) fn object(&self) -> &Object {
+        &self.object
+    }
+}
+
+impl core::fmt::Debug for ResolvedPrincipal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ResolvedPrincipal")
+            .field("guid", &self.object.guid)
+            .field("class", &self.class)
+            .field("matched", &self.matched)
+            .field("lookup", &self.lookup)
+            .field("canonical_realm", &self.canonical_realm)
+            .field("canonical_name", &self.canonical_name)
+            .field("key_purpose", &self.key_purpose)
+            .finish_non_exhaustive()
+    }
+}
+
+/// `true` if the stored SPN `stored` is the request's components joined
+/// with "/", octet for octet (no allocation).
+/// Spec: docs/47 §1.3 TGS step 3 (the stored SPN value equal byte for
+/// byte); A-27.
+fn spn_equals(stored: &str, components: &[KerberosString]) -> bool {
+    let mut parts = stored.split(SPN_SEPARATOR);
+    let all_equal = components
+        .iter()
+        .all(|component| parts.next() == Some(component.as_str()));
+    all_equal && parts.next().is_none()
+}
+
+/// The canonical name of a stored value: its components (split at "/" for
+/// an SPN; a sAMAccountName has none), with the request's name-type — in
+/// wave 2 the canonical name equals the name as sent octet for octet.
+/// Spec: docs/59 §4.5, §4.7; RFC 4120 §6.2 (the name-type a hint).
+fn canonical_name_of(stored: &str, name_type: i32) -> Result<PrincipalName, Fault> {
+    let name_string = stored
+        .split(SPN_SEPARATOR)
+        .map(KerberosString::new)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| Fault::Unavailable)?;
+    Ok(PrincipalName {
+        name_type,
+        name_string,
+    })
+}
+
+/// The key purpose of a service's canonical name: the one derivation
+/// (`KeyPurpose::of_service_name`, R2b), which must agree with the
+/// reserved-name predicate on the folded key — a stored name that spells a
+/// reserved name in another case (`ADMIND/…`, `KADMIN/changepw`) is refused
+/// (`Fault`), as is a TGS name (never stored outside the krbtgt account —
+/// `keys_of_names`).
+/// Spec: docs/59 §6.1 step 6, §3 M3; docs/questions/Q-1009 items 1-3; A-73;
+/// RFC 3244 §2; RFC 4120 §6.2.
+fn service_purpose(canonical: &PrincipalName, key: &PrincipalKey) -> Result<KeyPurpose, Fault> {
+    let purpose = KeyPurpose::of_service_name(canonical);
+    let consistent = match reserved_name_of(key) {
+        None => purpose == KeyPurpose::Service,
+        Some(ReservedName::AdminService) => purpose == KeyPurpose::AdminService,
+        Some(ReservedName::ChangePasswordService) => purpose == KeyPurpose::ChangePasswordService,
+        Some(ReservedName::TicketGrantingService) => false,
+    };
+    if consistent {
+        Ok(purpose)
+    } else {
+        Err(Fault::Unavailable)
+    }
+}
+
+impl DirectoryView<'_> {
+    /// Resolve the principal `name` in `realm` for the context `ctx` — the
+    /// one lookup path by name (module documentation). `Ok(None)` is "no
+    /// such principal" (the KDC answers KDC_ERR_C/S_PRINCIPAL_UNKNOWN);
+    /// `Err` is "cannot tell" (the store failed or a record is inconsistent
+    /// — always a refusal).
+    ///
+    /// # Errors
+    /// `AccountSourceError::Failed` on a store failure or an inconsistent
+    /// record, including a stored name the namespace refuses.
+    ///
+    /// Spec: docs/59 §6.1-§6.3; docs/47 §1.3 (R47-1); A-27; Q-1026.
+    pub fn canonical_principal(
+        &self,
+        realm: &Realm,
+        name: &PrincipalName,
+        ctx: LookupCtx,
+    ) -> Result<Option<ResolvedPrincipal>, AccountSourceError> {
+        self.resolve_principal(realm, name, ctx)
+            .map_err(AccountSourceError::from)
+    }
+
+    /// [`DirectoryView::canonical_principal`] with internal faults.
+    /// Spec: docs/59 §6.1 steps 1-6 (module documentation).
+    pub(crate) fn resolve_principal(
+        &self,
+        realm: &Realm,
+        name: &PrincipalName,
+        ctx: LookupCtx,
+    ) -> Result<Option<ResolvedPrincipal>, Fault> {
+        let accepted = ctx.accepted();
+        // 1. The request's one key (docs/59 §4.2). `LocalTgs` is never
+        //    resolved by name: the KDC uses its configured krbtgt handle
+        //    (R47-2; Q-1018 item 5).
+        let key = match key_of_request(name, realm, self.ctx.name_context()) {
+            RequestKey::Key(key) => key,
+            RequestKey::LocalTgs | RequestKey::Foreign | RequestKey::NoSuchPrincipal => {
+                return Ok(None);
+            }
+        };
+        // 2. The request half of the phase-1 acceptance: the configured
+        //    realm octet for octet; one component for a client, two or more
+        //    for a service (docs/47 §1.3 AS steps 1-2, TGS steps 1-2).
+        if realm.as_bytes() != self.ctx.realm().as_bytes()
+            || !accepted.takes_component_count(name.name_string.len())
+        {
+            return Ok(None);
+        }
+        // 3. One probe (module documentation, "The probe").
+        let Some(guid) = self.probe(accepted, &key)? else {
+            return Ok(None);
+        };
+        let Some(object) = self.snapshot.get_object(guid)? else {
+            return Ok(None);
+        };
+        // 4. The class, filtered by the context.
+        let names = match self.principal_names_of(&object, self.ctx.service_objects()) {
+            Ok(Some(names)) => names,
+            Ok(None) => return Ok(None),
+            Err(_) => return Err(Fault::Unavailable),
+        };
+        if !ctx.admits(names.class) {
+            return Ok(None);
+        }
+        // 5. Re-derive the object's keys; the probed key must be one of
+        //    them (docs/59 §6.1 step 3); its kinds are what was matched.
+        let keys =
+            keys_of_names(&names, self.ctx.name_context()).map_err(|_| Fault::Unavailable)?;
+        let matched = keys.kinds_of(&key);
+        if matched.is_empty() {
+            return Err(Fault::Unavailable);
+        }
+        if !matched.contains(accepted.kind()) {
+            return Ok(None);
+        }
+        // 6. The stored half of the acceptance: the stored value equals the
+        //    request octet for octet (A-27); it is the canonical name.
+        let stored = match accepted {
+            AcceptedName::SamAccountName => {
+                let [component] = name.name_string.as_slice() else {
+                    return Ok(None);
+                };
+                (names.sam_account_name.as_bytes() == component.as_bytes())
+                    .then_some(names.sam_account_name)
+            }
+            AcceptedName::ServicePrincipalName => names
+                .service_principal_names
+                .iter()
+                .copied()
+                .find(|spn| spn_equals(spn, &name.name_string)),
+        };
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        let canonical_name = canonical_name_of(stored, name.name_type)?;
+        // The admitted classes are user / computer accounts.
+        let account = self.account(&object)?.ok_or(Fault::Unavailable)?;
+        // 7. The key purpose, from the canonical name (Q-1009 item 3).
+        let key_purpose = match accepted {
+            AcceptedName::SamAccountName => KeyPurpose::PrincipalLongterm,
+            AcceptedName::ServicePrincipalName => service_purpose(&canonical_name, &key)?,
+        };
+        Ok(Some(ResolvedPrincipal {
+            principal: principal_id(object.guid),
+            sid: account.sid,
+            account_kind: account.kind,
+            class: names.class,
+            matched,
+            lookup: ctx,
+            realm_as_sent: realm.clone(),
+            name_as_sent: name.clone(),
+            canonical_realm: self.ctx.realm().clone(),
+            canonical_name,
+            key_purpose,
+            object,
+        }))
+    }
+
+    /// The one probe of a lookup (module documentation, "The probe"; docs/
+    /// questions/Q-1026): the unique index of the accepted kind's attribute,
+    /// asked once with the request's key. A key longer than any stored
+    /// value of that attribute cannot match and is not asked (the store
+    /// refuses an over-long probe).
+    /// Spec: docs/59 §6.1 step 2; docs/47 §1.3 AS step 3, TGS step 3;
+    /// docs/46 §8.5; Q-080.
+    fn probe(&self, accepted: AcceptedName, key: &PrincipalKey) -> Result<Option<Guid>, Fault> {
+        let ids = self.ctx.ids;
+        let (attr, max_len) = match accepted {
+            AcceptedName::SamAccountName => (ids.sam_account_name, self.ctx.sam_max_len()),
+            AcceptedName::ServicePrincipalName => {
+                (ids.service_principal_name, self.ctx.spn_max_len())
+            }
+        };
+        if key.as_bytes().len() > max_len {
+            return Ok(None);
+        }
+        Ok(self.snapshot.lookup_unique(attr, key.as_bytes())?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kstrs(parts: &[&str]) -> Vec<KerberosString> {
+        parts
+            .iter()
+            .map(|p| KerberosString::new(p).unwrap())
+            .collect()
+    }
+
+    /// docs/47 §1.3 TGS step 3 (octet for octet); Q-070 item 12 (one
+    /// component list per joined form).
+    #[test]
+    fn spn_equality_is_octet_for_octet_per_component() {
+        let stored = "host/ws01.example.test";
+        assert!(spn_equals(stored, &kstrs(&["host", "ws01.example.test"])));
+        assert!(!spn_equals(stored, &kstrs(&["HOST", "ws01.example.test"])));
+        assert!(!spn_equals(stored, &kstrs(&["host"])));
+        assert!(!spn_equals(
+            stored,
+            &kstrs(&["host", "ws01.example.test", "x"])
+        ));
+        assert!(!spn_equals(stored, &kstrs(&["host/ws01.example.test"])));
+        assert!(!spn_equals(stored, &kstrs(&[])));
+    }
+
+    /// docs/47 §1.3 (R47-1: AS = one component; TGS = two or more); docs/59
+    /// §6.2 (groups and the krbtgt account in no context; services are
+    /// computers).
+    #[test]
+    fn contexts_accept_one_kind_and_admit_their_classes() {
+        use PrincipalClass::*;
+        for ctx in [LookupCtx::AsClient, LookupCtx::TicketClient] {
+            assert_eq!(ctx.accepted(), AcceptedName::SamAccountName);
+            assert!(ctx.accepted().takes_component_count(1));
+            assert!(!ctx.accepted().takes_component_count(2));
+            for class in [User, Computer, DomainController, ProvisionedService] {
+                assert!(ctx.admits(class), "{ctx:?} {class:?}");
+            }
+            for class in [TicketGrantingService, Group] {
+                assert!(!ctx.admits(class), "{ctx:?} {class:?}");
+            }
+        }
+        for ctx in [LookupCtx::TgsServer, LookupCtx::ServiceObject] {
+            assert_eq!(ctx.accepted(), AcceptedName::ServicePrincipalName);
+            assert!(!ctx.accepted().takes_component_count(1));
+            assert!(ctx.accepted().takes_component_count(2));
+            assert!(ctx.accepted().takes_component_count(3));
+            for class in [Computer, DomainController, ProvisionedService] {
+                assert!(ctx.admits(class), "{ctx:?} {class:?}");
+            }
+            for class in [User, TicketGrantingService, Group] {
+                assert!(!ctx.admits(class), "{ctx:?} {class:?}");
+            }
+        }
+    }
+}

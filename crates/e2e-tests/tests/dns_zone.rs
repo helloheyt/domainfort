@@ -1,8 +1,10 @@
-//! End to end (tasks DN10a, DN10b; docs/54 §4.6, §4.8, §10 rows DN10 / DN13 /
-//! DN14): a domain made by `provision domain`, then auditd, dird and dnsd
-//! over their real sockets — dnsd fetches the zone image from dird over
+//! End to end (tasks DN10a, DN10b, DN10c; docs/54 §4.6, §4.8, §10 rows DN10
+//! / DN13 / DN14): a domain made by `provision domain`, then auditd, dird and
+//! dnsd over their real sockets — dnsd fetches the zone image from dird over
 //! `dird-dns.sock` and answers SOA, NS, the SRV set and the DC's A record
-//! over real UDP and TCP sockets.
+//! over real UDP and TCP sockets. And (task DN10c — docs/questions/Q-1016
+//! items 3–4, Q-1024) every SRV record the provisioned zone can advertise has
+//! a listener on its port in the produced configuration files.
 //!
 //! # What runs (docs/50 §7.5; docs/54 §4.8: auditd → dird → dnsd)
 //!
@@ -67,7 +69,10 @@ mod support;
 mod provision_common;
 
 use audit_daemon::listener::ListenerConfig;
-use config::{AuditdSettings, DirdSettings, DnsdSettings};
+use config::{
+    AuditdSettings, DirdSettings, DnsdSettings, KdcSettings, KpasswdFrontSettings,
+    LdapFrontSettings,
+};
 use core::net::{Ipv4Addr, SocketAddr};
 use core::time::Duration;
 use directory_daemon::test_seams::{serve_with_dns, DnsParams};
@@ -75,6 +80,7 @@ use directory_daemon::{DaemonControl as DirdControl, StoreSource};
 use dirstore::Store;
 use dns_daemon::test_seams::DaemonParams as DnsdParams;
 use dns_daemon::{DaemonControl as DnsdControl, DaemonError as DnsdError, Listeners};
+use dns_zone::SrvService;
 use ipc::{encode_frame, Direction};
 use ipc_audit::{ZoneSerialCause, ZoneSerialOutcome, ZoneSerialStage};
 use ipc_dns::{Connection, Connector, DnsRequest, TransportError, DNS_CHANNEL};
@@ -180,7 +186,9 @@ fn domain_input(dir: &ScratchDir, uid: u32) -> DomainInput {
         },
         network: Network {
             kdc_listen: vec!["127.0.0.1:88".to_owned()],
-            ldap_listen: Vec::new(),
+            // Task DN10c: the StartTLS listener on 389 the zone's
+            // `_ldap._tcp` needs (docs/questions/Q-1016 item 3, A-176).
+            ldap_listen: vec!["127.0.0.1:389".to_owned()],
             ldaps_listen: vec!["127.0.0.1:636".to_owned()],
             internal_networks: vec!["127.0.0.0/8".to_owned(), "192.0.2.0/24".to_owned()],
             kpasswd_listen: vec!["127.0.0.1:464".to_owned()],
@@ -868,6 +876,63 @@ fn a_provisioned_dnsd_starts_and_answers_the_zone() {
             ]
         );
     });
+}
+
+/// Task DN10c (docs/questions/Q-1016 items 3–4, decision A-176; Q-1024; the
+/// class "the zone advertises an endpoint no process serves", AGENTS.md
+/// §6.1): every SRV record a provisioned zone advertises — dns-zone's closed
+/// table, with the `_kpasswd` switch dird derives from its produced file —
+/// has a listener in the produced configuration: the serving daemon's file
+/// (read with its own schema) lists at least one address, every one on the
+/// record's port, on a list that serves the record's transport (the kdc's
+/// `listen`: UDP and TCP per address; ldap-front's `ldap_listen`: StartTLS on
+/// TCP — the listener provision now requires; kpasswd-front's `listen`: TCP
+/// only). A Service label or transport with no produced list known fails
+/// (fail closed). No daemon runs.
+///
+/// Sources: docs/54 §3.1; RFC 4120 §7.2.3.2 (both `_udp` and `_tcp`, 88);
+/// [MS-ADTS] v20261026 §6.3.2.3 (389, 88, 464); RFC 2782 (the Proto label).
+#[test]
+fn every_advertised_srv_record_has_a_listener_in_the_produced_files() {
+    let Some(world) = World::provisioned() else {
+        return;
+    };
+    let paths = &world.input.paths;
+    let dird = DirdSettings::parse(&world.read(&paths.dird_config)).unwrap();
+    let kpasswd = directory_daemon::startup::dns_params(&dird)
+        .unwrap()
+        .expect("dird's file has the DNS channel")
+        .zone
+        .kpasswd;
+    let kdc = KdcSettings::parse(&world.read(&paths.kdc_config)).unwrap();
+    let front = LdapFrontSettings::parse(&world.read(&paths.ldap_front_config)).unwrap();
+    let kpasswd_front =
+        KpasswdFrontSettings::parse(&world.read(&paths.kpasswd_front_config)).unwrap();
+    let mut advertised = Vec::new();
+    for service in SrvService::ALL {
+        if !service.synthesized_with(kpasswd) {
+            continue;
+        }
+        let listeners: &[SocketAddr] = match (service.service_label(), service.proto_label()) {
+            (b"_kerberos", b"_udp" | b"_tcp") => kdc.listen(),
+            (b"_ldap", b"_tcp") => front.ldap_listen(),
+            (b"_kpasswd", b"_tcp") => kpasswd_front.listen(),
+            _ => panic!("{service:?}: no produced listener list is known"),
+        };
+        assert!(
+            !listeners.is_empty(),
+            "{service:?} is advertised, but its daemon's produced file lists no listener"
+        );
+        assert!(
+            listeners.iter().all(|a| a.port() == service.port()),
+            "{service:?} is advertised on {}, the produced listeners are {listeners:?}",
+            service.port()
+        );
+        advertised.push(service);
+    }
+    // The provisioned deployment runs kpasswd-front: all four are advertised.
+    assert_eq!(advertised, SrvService::ALL.to_vec());
+    assert_eq!(front.ldap_listen(), ["127.0.0.1:389".parse().unwrap()]);
 }
 
 /// docs/54 §4.5, §6.6 ("dird not available ⇒ SERVFAIL"); docs/questions/

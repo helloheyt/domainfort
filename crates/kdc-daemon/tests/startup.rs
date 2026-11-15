@@ -1,16 +1,17 @@
 //! Tier 1 (docs/50 §9: in-process): the kdc daemon's start-up inputs —
 //! the configuration's owner check and its explicit development policy
 //! format, the policy file through the shared loader (owner, mode, format
-//! 2), the serving parameters derived from a configuration, the listeners
-//! bound per address, and the hardening plan.
+//! 2), the serving parameters derived from a configuration, the listeners'
+//! port (88 only — task DN10c), and the hardening plan.
 //!
 //! The root-owned case cannot be made by an unprivileged test: the reading
 //! functions take the expected owner, and `main` passes uid 0. Nothing here
-//! binds a privileged port: the configuration's addresses are loopback
-//! addresses with ports chosen by the system first.
+//! binds a port: the file names port 88 only, so the binding per address is
+//! tested in-crate on a system-chosen loopback port (src/startup_tests.rs).
 //!
 //! Sources: docs/50 R50-9, R50-14, R50-15, §4.1, §6.2, §6.4, §7.1, §7.2;
-//! docs/questions/Q-230 (A-60), Q-270 item 2, A-68. Hand-made values.
+//! RFC 4120 §7.2.3.2; docs/questions/Q-230 (A-60), Q-270 item 2, A-68,
+//! Q-1024. Hand-made values.
 
 mod common_policy {
     //! The minimal shared policy of these tests (format 2, A-68).
@@ -35,9 +36,7 @@ mod common_policy {
 
 use config::KdcSettings;
 use core::time::Duration;
-use kdc_daemon::startup::{
-    bind_listeners, hardening_plan, read_policy, read_settings, StartupError,
-};
+use kdc_daemon::startup::{hardening_plan, read_policy, read_settings, StartupError};
 use kdc_daemon::{DaemonParams, AS_QUEUE_CAPACITY, TGS_QUEUE_CAPACITY};
 use pdp::IpScope;
 use policy_store::{LoadError, PolicyError, MARKER, SUPERSEDED_FORMAT};
@@ -63,7 +62,7 @@ fn write(path: &Path, octets: &[u8], mode: u32) {
 }
 
 /// A kdc configuration (docs/50 §7.1) with `listen` as given (inside the
-/// zone table, which also holds the loopback network the bind test uses —
+/// zone table, which also holds the loopback network the port test uses —
 /// docs/50 R50-9, task R15b); account 61003.
 fn kdc_config(listen: &str) -> String {
     format!(
@@ -277,27 +276,29 @@ fn a_link_or_a_writable_directory_on_the_path_is_refused() {
     );
 }
 
-/// docs/50 §4.1 ("each address served on UDP and TCP"), §6.2: one UDP
-/// socket and one TCP listener per configured address; an address already
-/// taken refuses the start. Loopback, ports first chosen by the system
-/// (never a privileged port).
+/// Task DN10c (docs/questions/Q-1016 item 4, A-176; Q-1024): the zone
+/// advertises the KDC on port 88 (RFC 4120 §7.2.3.2), so the file the kdc
+/// binds from can name no other port — refused at start-up, before any bind
+/// (`StartupError::Config` naming `listen`); every address of an accepted
+/// file is on 88. The binding itself is tested in-crate on a system-chosen
+/// loopback port (src/startup_tests.rs); nothing here binds port 88.
 #[test]
-fn listeners_are_bound_per_address() {
-    let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    let port = probe.local_addr().unwrap().port();
-    drop(probe);
-    let free = std::net::TcpListener::bind(("127.0.0.1", port));
-    let Ok(free) = free else {
-        return; // the port was taken meanwhile: nothing to check
-    };
-    drop(free);
-    let settings = KdcSettings::parse(kdc_config(&format!("127.0.0.1:{port}")).as_bytes()).unwrap();
-    let listeners = bind_listeners(&settings).unwrap();
-    assert_eq!((listeners.udp.len(), listeners.tcp.len()), (1, 1));
-    assert_eq!(listeners.udp[0].local_addr().unwrap().port(), port);
-    assert_eq!(listeners.tcp[0].local_addr().unwrap().port(), port);
-    assert!(matches!(
-        bind_listeners(&settings),
-        Err(StartupError::Bind(_))
-    ));
+fn the_kdc_binds_only_port_88() {
+    let dir = TempDir::new("port");
+    let uid = std::fs::metadata(&dir.0).unwrap().uid();
+    let path = dir.0.join("kdc.conf");
+    write(&path, kdc_config("127.0.0.1:1088").as_bytes(), 0o644);
+    match read_settings(&path, uid) {
+        Err(StartupError::Config(error)) => {
+            assert!(error.contains("`listen`"), "{error}");
+            assert!(!error.contains("1088"), "no echo: {error}");
+        }
+        other => panic!("{other:?}"),
+    }
+    let settings = KdcSettings::parse(kdc_config("127.0.0.1:88, 10.0.0.5:88").as_bytes()).unwrap();
+    assert!(settings
+        .listen()
+        .iter()
+        .all(|address| address.port() == config::StandardPort::Kerberos.number()));
+    assert_eq!(config::StandardPort::Kerberos.number(), 88);
 }

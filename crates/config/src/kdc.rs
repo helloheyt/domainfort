@@ -23,7 +23,14 @@
 //! ldap-front's file has (docs/52 R14, A-114). Sources outside the table are
 //! still served, as `External` (docs/50 §4.1 — Q-632 item 3).
 //!
-//! Spec: docs/50 R50-9, R50-15, §2.4, §3.6, §4.1, §7.1, §7.2, §7.5.
+//! **Port 88 only** (task DN10c; A-176 on docs/questions/Q-1016 item 4): the
+//! zone advertises the KDC at `_kerberos._udp` / `_kerberos._tcp` on port 88
+//! (crates/dns-zone, from [`crate::StandardPort::Kerberos`]), so every
+//! `listen` address must be on that port (`NonStandardPort`); the address is
+//! the operator's.
+//!
+//! Spec: docs/50 R50-9, R50-15, §2.4, §3.6, §4.1, §7.1, §7.2, §7.5; RFC 4120
+//! §7.2.1, §7.2.2, §7.2.3.2; docs/questions/Q-1024.
 
 use core::net::SocketAddr;
 use core::time::Duration;
@@ -37,6 +44,7 @@ use crate::schema::{
     DIRD_UID, INTERNAL_NETWORKS, KEYD_DEADLINE, KEYD_SOCKET, KEYD_UID, POLICY_STORE_PATH,
     RUN_AS_GID, RUN_AS_UID,
 };
+use crate::standard_port::StandardPort;
 use crate::value::{self, AbsolutePath, Network};
 
 /// Key: the interface addresses, each served on UDP and TCP.
@@ -202,7 +210,8 @@ impl KdcSettings {
     ];
 
     /// Parses and validates kdc's file. Required: `run_as_uid`,
-    /// `run_as_gid`, `listen`, `internal_networks` (every `listen` address
+    /// `run_as_gid`, `listen` (every address on port 88 — `NonStandardPort`;
+    /// task DN10c), `internal_networks` (every `listen` address
     /// inside one of them — `ListenerNotInternal`; task R15b),
     /// `keyd_socket` + `keyd_uid`, `dird_kdc_socket` + `dird_uid`,
     /// `policy_store_path`, `policy_store_format` (only
@@ -212,12 +221,16 @@ impl KdcSettings {
     /// # Errors
     /// Any rule of the format or of this schema (see [`crate::ErrorKind`]).
     ///
-    /// Spec: docs/50 R50-9, R50-15, §3.6, §4.1, §7.1, §7.2.
+    /// Spec: docs/50 R50-9, R50-15, §3.6, §4.1, §7.1, §7.2; RFC 4120
+    /// §7.2.3.2; docs/questions/Q-1024.
     pub fn parse(input: &[u8]) -> Result<Self, Error> {
         let doc = Document::parse(input, Self::KEYS)?;
         let mut all = Distinct::default();
         let run_as = schema::account(&doc, &mut all)?;
         let listen = doc.required(LISTEN, |text| value::list(text, value::listener_address))?;
+        // Task DN10c (A-176 on Q-1016 item 4): the zone advertises the KDC
+        // on port 88, UDP and TCP — every `listen` address is on it.
+        schema::check_standard_port(Some(&listen), LISTEN, StandardPort::Kerberos)?;
         // Required (task R15b): the kdc binds to internal interfaces only
         // (docs/50 R50-9, §4.1; Q-223 → A-57 (a)), so every `listen` address
         // lies in a network of the zone table — the rule and the match
@@ -282,7 +295,8 @@ impl KdcSettings {
     }
 
     /// The interface addresses, each served on UDP and on TCP (at least one;
-    /// none repeated). Spec: docs/50 §4.1.
+    /// none repeated; every one on port 88 — [`crate::StandardPort::Kerberos`]).
+    /// Spec: docs/50 §4.1; RFC 4120 §7.2.3.2; docs/questions/Q-1024.
     #[must_use]
     pub fn listen(&self) -> &[SocketAddr] {
         &self.listen

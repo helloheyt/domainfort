@@ -19,6 +19,11 @@
 //! closes every connection whose source is outside the table before a byte
 //! (crates/kpasswd-front).
 //!
+//! **Port 464 only** (task DN10c; A-176 on docs/questions/Q-1016 item 4):
+//! the zone advertises the service at `_kpasswd._tcp` on port 464 (crates/
+//! dns-zone, from [`crate::StandardPort::Kpasswd`]), so every `listen`
+//! address must be on that port (`NonStandardPort`).
+//!
 //! **The realm** names the service realm of the front's KRB-ERRORs (RFC 4120
 //! §5.9.1 `realm`; docs/53 §5.7: "`realm` = the realm, `sname` =
 //! `kadmin/changepw`"); the front has no keyd to ask. It must be dird's
@@ -31,7 +36,8 @@
 //! `tcp_frame_timeout` bounds the write of the reply.
 //!
 //! Spec: docs/53 R53-3, R53-4, §3.3, §5.1, §5.6, §5.7, §10 (K8); docs/50
-//! R50-15, §2.4, §3.6, §4.1, §6.2, §7.1; docs/52 §7 R14; RFC 3244 §2.
+//! R50-15, §2.4, §3.6, §4.1, §6.2, §7.1; docs/52 §7 R14; RFC 3244 §2;
+//! [MS-ADTS] v20261026 §6.3.2.3; docs/questions/Q-1024.
 
 use core::net::SocketAddr;
 use core::time::Duration;
@@ -47,10 +53,12 @@ use crate::schema::{
     self, Account, Distinct, Endpoint, AUDITD_UID, AUDIT_SOCKET, DIRD_DEADLINE,
     DIRD_KPASSWD_SOCKET, DIRD_UID, INTERNAL_NETWORKS, RUN_AS_GID, RUN_AS_UID,
 };
+use crate::standard_port::StandardPort;
 use crate::value::{self, Network};
 
-/// Key: the TCP listener addresses (port 464). Spec: docs/53 R53-3, §3.3;
-/// docs/50 §7.1 ("listen addresses").
+/// Key: the TCP listener addresses (port 464 —
+/// [`crate::StandardPort::Kpasswd`], the only port accepted). Spec: docs/53
+/// R53-3, §3.3; docs/50 §7.1 ("listen addresses"); docs/questions/Q-1024.
 const LISTEN: &str = "listen";
 /// Key: the realm the front's KRB-ERRORs name. Spec: docs/53 §5.7; RFC 4120
 /// §5.9.1.
@@ -175,8 +183,9 @@ impl KpasswdFrontSettings {
     ];
 
     /// Parses and validates kpasswd-front's file. Required: `run_as_uid`,
-    /// `run_as_gid`, `listen`, `internal_networks` (every `listen` address
-    /// inside one of them — `ListenerNotInternal`), `realm`,
+    /// `run_as_gid`, `listen` (every address on port 464 —
+    /// `NonStandardPort`, task DN10c), `internal_networks` (every `listen`
+    /// address inside one of them — `ListenerNotInternal`), `realm`,
     /// `dird_kpasswd_socket` + `dird_uid`, `audit_socket`, `auditd_uid`.
     /// Optional: the limits (the docs/50 / docs/53 value as default and
     /// ceiling; the per-source bound ≤ the global one) and `dird_deadline`
@@ -186,12 +195,15 @@ impl KpasswdFrontSettings {
     /// Any rule of the format or of this schema (see [`crate::ErrorKind`]).
     ///
     /// Spec: docs/53 R53-3, §3.3, §5.1, §5.7; docs/50 R50-15, §3.6, §4.1,
-    /// §7.1; docs/52 §7 R14.
+    /// §7.1; docs/52 §7 R14; docs/questions/Q-1024.
     pub fn parse(input: &[u8]) -> Result<Self, Error> {
         let doc = Document::parse(input, Self::KEYS)?;
         let mut all = Distinct::default();
         let run_as = schema::account(&doc, &mut all)?;
         let listen = doc.required(LISTEN, |text| value::list(text, value::listener_address))?;
+        // Task DN10c (A-176 on Q-1016 item 4): the zone advertises kpasswd
+        // at `_kpasswd._tcp` on port 464 — every `listen` address is on it.
+        schema::check_standard_port(Some(&listen), LISTEN, StandardPort::Kpasswd)?;
         let internal_networks = doc
             .required(INTERNAL_NETWORKS, |text| value::list(text, value::network))?
             .value;
@@ -237,7 +249,9 @@ impl KpasswdFrontSettings {
     }
 
     /// The TCP listener addresses (at least one; none repeated; each inside
-    /// an internal network). Spec: docs/53 R53-3, §3.3.
+    /// an internal network; every one on port 464 —
+    /// [`crate::StandardPort::Kpasswd`]). Spec: docs/53 R53-3, §3.3;
+    /// docs/questions/Q-1024.
     #[must_use]
     pub fn listen(&self) -> &[SocketAddr] {
         &self.listen

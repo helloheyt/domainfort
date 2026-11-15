@@ -6,28 +6,29 @@
 //! closed keys), §6.1, §6.2 (bind as root, then drop), §6.4 (the baseline),
 //! §7.1 (root:0644, bounded); docs/53 R53-3 (TCP 464 only — no UDP), §3.3,
 //! §5.1; docs/52 §3.18 (C18: the product parameters come from the file
-//! only); docs/questions/Q-468 (A-102: the protected-file walk). The sample
-//! file is written by hand for these tests (obviously fake uids, paths and
-//! the TEST-NET-1 / loopback addresses).
+//! only); docs/questions/Q-468 (A-102: the protected-file walk); [MS-ADTS]
+//! §6.3.2.3, docs/questions/Q-1016 item 4 (A-176), Q-1024 (port 464 only —
+//! the port the zone advertises; task DN10c). The sample file is written by
+//! hand for these tests (obviously fake uids, paths and the TEST-NET-1 /
+//! loopback addresses). Nothing here binds a port: the file names 464 only,
+//! so the binding is tested in-crate on a system-chosen loopback port
+//! (src/tests/startup.rs).
 
 #![cfg(unix)]
 
 use core::time::Duration;
-use kpasswd_front::startup::{
-    bind_listeners, hardening_plan, read_settings, StartupError, OPEN_FILES_HEADROOM,
-};
+use kpasswd_front::startup::{hardening_plan, read_settings, StartupError, OPEN_FILES_HEADROOM};
 use kpasswd_front::FrontParams;
 use std::os::unix::fs::PermissionsExt;
 use test_scratch::ScratchDir;
 
 /// A kpasswd-front file (docs/50 §7.1): the listener is a loopback address
-/// on a port the test does not bind (nothing binds it here except
-/// `bind_listeners`, which the test gives its own file).
+/// on port 464 (never bound here).
 const SAMPLE: &str = "\
 # kpasswd-front (docs/53 K8)
 run_as_uid = 61464
 run_as_gid = 61464
-listen = 127.0.0.1:1464
+listen = 127.0.0.1:464
 internal_networks = 127.0.0.0/8, 192.0.2.0/24
 realm = EXAMPLE.TEST
 dird_kpasswd_socket = /run/dird/kpasswd/dird-kpasswd.sock
@@ -101,27 +102,30 @@ fn the_file_must_be_protected_and_valid() {
     }
 }
 
-/// docs/53 R53-3 (TCP only — A-117: no UDP code path); docs/50 §6.2: the
-/// listeners are TCP listeners on the configured addresses, and nothing
-/// else is bound.
+/// Task DN10c (docs/questions/Q-1016 item 4, A-176; Q-1024): the zone
+/// advertises `_kpasswd._tcp` on port 464 ([MS-ADTS] §6.3.2.3; RFC 3244 §2),
+/// so the file the front binds from can name no other port — refused at
+/// start-up, before any bind, without echoing the value; every address of
+/// an accepted file is on 464. (The binding itself — TCP only — is tested
+/// in-crate, src/tests/startup.rs.)
 #[test]
-fn only_tcp_listeners_are_bound() {
-    let dir = ScratchDir::new("kpasswd-front-bind").unwrap();
+fn the_front_binds_only_port_464() {
+    let dir = ScratchDir::new("kpasswd-front-port").unwrap();
     let owner = dir.uid().unwrap();
-    // A port the system picks, then freed, so the file names a free port.
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let text = SAMPLE.replace("127.0.0.1:1464", &format!("127.0.0.1:{port}"));
-    let path = write_config(&dir, &text, 0o644);
+    let path = write_config(&dir, &SAMPLE.replace(":464", ":1464"), 0o644);
+    match read_settings(&path, owner) {
+        Err(StartupError::Config(text)) => {
+            assert!(text.contains("`listen`"), "{text}");
+            assert!(!text.contains("1464"), "no echo: {text}");
+        }
+        other => panic!("{other:?}"),
+    }
+    let path = write_config(&dir, SAMPLE, 0o644);
     let settings = read_settings(&path, owner).unwrap();
-    let listeners = bind_listeners(&settings).unwrap();
-    assert_eq!(listeners.tcp.len(), 1);
-    assert_eq!(listeners.tcp[0].local_addr().unwrap().port(), port);
-    // The UDP port of the same number is still free: no UDP socket exists.
-    assert!(std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok());
+    assert!(settings
+        .listen()
+        .iter()
+        .all(|address| address.port() == config::StandardPort::Kpasswd.number()));
 }
 
 /// docs/50 R50-14, §6.1, §6.4 (the baseline: identity drop, no_new_privs,

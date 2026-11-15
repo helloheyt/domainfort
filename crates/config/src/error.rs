@@ -177,6 +177,14 @@ pub enum ErrorKind {
     /// crates/directory-admin `DnsRegistration::new`; docs/questions/Q-1001
     /// item 3.
     NetworkFamily,
+    /// A listener whose endpoint the zone advertises (the kdc's `listen`,
+    /// ldap-front's `ldap_listen`, kpasswd-front's `listen`) on a port other
+    /// than its service's standard port ([`crate::StandardPort`]): the SRV
+    /// record names the standard port, so such a listener would be
+    /// advertised where nothing listens.
+    /// Spec: RFC 4120 §7.2.3.2; [MS-ADTS] v20261026 §6.3.2.3; docs/54 §3.1;
+    /// docs/questions/Q-1016 item 4 (A-176), Q-1024.
+    NonStandardPort,
 }
 
 impl ErrorKind {
@@ -223,6 +231,9 @@ impl ErrorKind {
             ErrorKind::InvalidNodeId => "value is not 32 lower-case hex digits, not all zero",
             ErrorKind::InvalidDomainName => "value is not an acceptable domain name",
             ErrorKind::NetworkFamily => "network is of an address family this setting refuses",
+            ErrorKind::NonStandardPort => {
+                "listener port is not the service's standard port (the one the zone advertises)"
+            }
         }
     }
 }

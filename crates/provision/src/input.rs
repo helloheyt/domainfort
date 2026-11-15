@@ -214,9 +214,13 @@ pub struct Paths {
 pub struct Network {
     /// kdc's `listen` addresses (at least one).
     pub kdc_listen: Vec<String>,
-    /// ldap-front's `ldap_listen` addresses.
+    /// ldap-front's `ldap_listen` addresses (StartTLS, port 389): at least
+    /// one — the zone advertises `_ldap._tcp` on 389, so it always has a
+    /// listener (task DN10c; docs/questions/Q-1016 item 3, decision A-176
+    /// option (a); Q-1024). crates/config refuses any other port.
     pub ldap_listen: Vec<String>,
-    /// ldap-front's `ldaps_listen` addresses.
+    /// ldap-front's `ldaps_listen` addresses (optional; no SRV record
+    /// advertises LDAPS).
     pub ldaps_listen: Vec<String>,
     /// `internal_networks` (ldap-front, required — every LDAP listener lies
     /// inside one of them, docs/52 R14; and kdc, kpasswd-front and dnsd,
@@ -329,9 +333,14 @@ pub enum InputErrorKind {
     SharedPolicyNextDirectory,
     /// A network list item is empty or holds a separator.
     NetworkItem,
-    /// No kdc listener, neither LDAP nor LDAPS listener, no kpasswd-front
-    /// listener or no dnsd listener.
+    /// No kdc listener, no kpasswd-front listener or no dnsd listener.
     MissingListener,
+    /// No StartTLS listener (`--ldap-listen`, port 389): the zone always
+    /// advertises `_ldap._tcp` on port 389, so ldap-front must listen there —
+    /// LDAPS listeners alone would leave the advertised endpoint unserved
+    /// (task DN10c; docs/questions/Q-1016 item 3, decision A-176 option (a);
+    /// [MS-ADTS] §6.3.2.3; docs/54 §3.1; Q-1024).
+    MissingStartTlsListener,
     /// No internal network: ldap-front listens only inside the internal
     /// networks (docs/52 §7 R14; A-102 on docs/questions/Q-469 (b)).
     MissingInternalNetwork,
@@ -400,6 +409,10 @@ impl fmt::Display for InputError {
             }
             InputErrorKind::NetworkItem => "network item empty or holds a separator",
             InputErrorKind::MissingListener => "listener missing",
+            InputErrorKind::MissingStartTlsListener => {
+                "at least one StartTLS listener (port 389) is required: \
+                 the zone advertises _ldap._tcp on port 389"
+            }
             InputErrorKind::MissingInternalNetwork => {
                 "at least one internal network is required (LDAP listens only inside them)"
             }
@@ -787,12 +800,15 @@ impl DomainInput {
 
     /// Network items are non-empty and hold no list separator (they are
     /// written as `", "`-separated lists, crates/config); kdc needs a
-    /// listener, ldap-front at least one of LDAP / LDAPS, kpasswd-front and
-    /// dnsd one each, and at least one internal network (crates/config
-    /// re-checks every address, and that every listener of the four network
-    /// daemons lies in an internal network).
+    /// listener, ldap-front at least one StartTLS listener (LDAPS listeners
+    /// are optional beside it — task DN10c), kpasswd-front and dnsd one
+    /// each, and at least one internal network (crates/config re-checks
+    /// every address, that every listener of the four network daemons lies
+    /// in an internal network, and that the advertised listeners are on
+    /// their standard ports — `NonStandardPort`).
     /// Spec: docs/50 §4.1, §4.2, §7.1; docs/52 §7 R14; docs/53 R53-3, §3.3;
-    /// docs/54 §4.7.
+    /// docs/54 §3.1, §4.7; [MS-ADTS] §6.3.2.3; docs/questions/Q-1016 item 3
+    /// (A-176), Q-1024.
     fn check_network(&self) -> Result<(), InputError> {
         let n = &self.network;
         let lists: [(&'static str, &Vec<String>); 7] = [
@@ -818,10 +834,15 @@ impl DomainInput {
                 InputErrorKind::MissingListener,
             ));
         }
-        if n.ldap_listen.is_empty() && n.ldaps_listen.is_empty() {
+        // Task DN10c (A-176 on Q-1016 item 3, option (a)): the zone
+        // synthesizes `_ldap._tcp` (port 389) whenever it is served, and
+        // provision always configures the zone — so ldap-front must listen
+        // for StartTLS on 389, whatever LDAPS listeners it also has. Under
+        // every outcome of P-64 port 389 stays listened on.
+        if n.ldap_listen.is_empty() {
             return Err(InputError::new(
-                "ldaps-listen",
-                InputErrorKind::MissingListener,
+                "ldap-listen",
+                InputErrorKind::MissingStartTlsListener,
             ));
         }
         // kpasswd-front's and dnsd's files require `listen` (crates/config

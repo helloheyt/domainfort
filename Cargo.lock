@@ -351,6 +351,7 @@ dependencies = [
 name = "dns-zone"
 version = "0.0.0"
 dependencies = [
+ "config",
  "parse-dns",
 ]
 
@@ -379,6 +380,7 @@ dependencies = [
  "directory-pip",
  "dirstore",
  "dns-daemon",
+ "dns-zone",
  "dtyp",
  "ipc",
  "ipc-admin",

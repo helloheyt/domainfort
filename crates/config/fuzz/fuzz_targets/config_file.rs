@@ -14,14 +14,18 @@
 //! * an accepted keyd file's `uid → Role` map is non-empty, never maps uid 0,
 //!   maps each uid once and never keyd's own uid (docs/50 R50-3, §3.2); the
 //!   same for auditd's `uid → source` map;
-//! * every account id accepted is neither 0 nor all-ones (Q-230 item 6).
+//! * every account id accepted is neither 0 nor all-ones (Q-230 item 6);
+//! * every accepted kdc `listen` address is on port 88 and every accepted
+//!   ldap-front `ldap_listen` address on port 389 — the ports the zone
+//!   advertises (task DN10c; docs/questions/Q-1016 item 4, Q-1024).
 //!
-//! Spec: docs/50 R50-3, R50-15, §7.1, §9.
+//! Spec: docs/50 R50-3, R50-15, §7.1, §9; RFC 4120 §7.2.3.2; [MS-ADTS]
+//! §6.3.2.3.
 
 use config::limits::MAX_FILE_OCTETS;
 use config::{
     AdmindSettings, AuditdSettings, DirdSettings, Error, KdcSettings, KeyadmSettings, KeydSettings,
-    LdapFrontSettings,
+    LdapFrontSettings, StandardPort,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -82,6 +86,10 @@ fuzz_target!(|data: &[u8]| {
     }
     if let Ok(settings) = KdcSettings::parse(data) {
         assert!(!settings.listen().is_empty());
+        assert!(settings
+            .listen()
+            .iter()
+            .all(|address| address.port() == StandardPort::Kerberos.number()));
         let limits = settings.limits();
         assert!(limits.max_tcp_connections_per_source() <= limits.max_tcp_connections());
     }
@@ -93,5 +101,9 @@ fuzz_target!(|data: &[u8]| {
             .iter()
             .chain(settings.ldaps_listen())
             .all(|address| config::is_internal(settings.internal_networks(), address.ip())));
+        assert!(settings
+            .ldap_listen()
+            .iter()
+            .all(|address| address.port() == StandardPort::Ldap.number()));
     }
 });

@@ -1995,7 +1995,10 @@ fn domain_input(dir: &ScratchDir, uid: u32) -> DomainInput {
         },
         network: Network {
             kdc_listen: vec!["127.0.0.1:88".to_owned()],
-            ldap_listen: Vec::new(),
+            // Task DN10c: the StartTLS listener the zone's `_ldap._tcp`
+            // needs (docs/questions/Q-1016 item 3, A-176); LDAPS beside it.
+            // The world binds its own loopback port-0 listeners, never these.
+            ldap_listen: vec!["127.0.0.1:389".to_owned()],
             ldaps_listen: vec!["127.0.0.1:636".to_owned()],
             // Task DN10b: the DC's address must be registrable — inside an
             // IPv4 internal network and not loopback (docs/54 §5.5) — so a

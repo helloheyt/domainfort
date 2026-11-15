@@ -62,9 +62,10 @@ parse-dns = { path = "../parse-dns" }
 config = { path = "../config" }
 # Task PN1 (docs/59 §4.2-§4.4, §8; A-173): the one name equivalence of the
 # principal namespace — the fold, the request key, the keys an object's
-# stored names produce and the realm alias set (src/principal.rs). Our own
-# crypto-free leaf crate: it links only krb-proto and keyd-types, which this
-# crate links already.
+# stored names produce and the realm alias set (src/principal.rs) — and,
+# from task PN4 (docs/59 §6), the one lookup path by name built on it
+# (src/resolve.rs). Our own crypto-free leaf crate: it links only krb-proto
+# and keyd-types, which this crate links already.
 principal-names = { path = "../principal-names" }
 
 [dev-dependencies]

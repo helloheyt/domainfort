@@ -488,13 +488,14 @@ pub fn domain_configs(input: &DomainInput, node_id: &NodeId) -> Vec<ConfigFile> 
         ("audit_socket", path(&p.audit_socket)),
         ("auditd_uid", id(a.auditd.uid)),
     ]);
+    // Task DN10c: the StartTLS listeners always — the input check requires
+    // one, since the zone advertises `_ldap._tcp` on 389 (docs/questions/
+    // Q-1016 item 3, A-176; Q-1024); LDAPS only when asked for.
     let mut ldap_front = vec![
         ("run_as_uid", id(a.ldap_front.uid)),
         ("run_as_gid", id(a.ldap_front.gid)),
+        ("ldap_listen", list(&n.ldap_listen)),
     ];
-    if !n.ldap_listen.is_empty() {
-        ldap_front.push(("ldap_listen", list(&n.ldap_listen)));
-    }
     if !n.ldaps_listen.is_empty() {
         ldap_front.push(("ldaps_listen", list(&n.ldaps_listen)));
     }

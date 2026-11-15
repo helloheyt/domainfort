@@ -10,6 +10,7 @@ use core::time::Duration;
 use crate::error::{Error, ErrorKind};
 use crate::format::{Document, Located};
 use crate::limits::Bound;
+use crate::standard_port::StandardPort;
 use crate::value::{self, is_internal, AbsolutePath, Network};
 
 /// Key: the uid the daemon drops to. Spec: docs/50 §6.1–§6.2 (R50-14), §7.1.
@@ -262,6 +263,32 @@ pub(crate) fn check_internal<const N: usize>(
     match outside {
         Some((line, key)) => Err(Error::at(line, key, ErrorKind::ListenerNotInternal)),
         None => Ok(()),
+    }
+}
+
+/// Every address of an advertised listener list is on its service's
+/// standard port — the one copy of the port, [`StandardPort`], which the SRV
+/// synthesis reads too; reported at the list's line. One rule for the three
+/// files whose listeners the zone advertises: the kdc's `listen`,
+/// ldap-front's `ldap_listen`, kpasswd-front's `listen` (task DN10c).
+/// Addresses stay configurable; only the port is fixed.
+/// Spec: RFC 4120 §7.2.3.2; [MS-ADTS] v20261026 §6.3.2.3; docs/54 §3.1;
+/// docs/questions/Q-1016 item 4 (A-176), Q-1024.
+pub(crate) fn check_standard_port(
+    list: Option<&Located<Vec<SocketAddr>>>,
+    key: &'static str,
+    service: StandardPort,
+) -> Result<(), Error> {
+    match list {
+        Some(list)
+            if list
+                .value
+                .iter()
+                .any(|address| address.port() != service.number()) =>
+        {
+            Err(Error::at(list.line, key, ErrorKind::NonStandardPort))
+        }
+        _ => Ok(()),
     }
 }
 

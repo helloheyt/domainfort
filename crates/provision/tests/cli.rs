@@ -63,6 +63,8 @@ fn domain_args() -> Vec<String> {
         "61010",
         "--kdc-listen",
         "127.0.0.1:88",
+        "--ldap-listen",
+        "127.0.0.1:389",
         "--ldaps-listen",
         "127.0.0.1:636",
         "--kpasswd-listen",
@@ -132,7 +134,10 @@ fn a_full_domain_command_parses() {
     assert_eq!(input.accounts.keyadm_uid, 61007);
     assert_eq!(input.paths.database.as_str(), "/srv/p/var/directory.redb");
     assert_eq!(input.network.kdc_listen, ["127.0.0.1:88"]);
-    assert!(input.network.ldap_listen.is_empty());
+    // Task DN10c (docs/questions/Q-1016 item 3, A-176): the StartTLS
+    // listener the zone's `_ldap._tcp` needs; LDAPS beside it.
+    assert_eq!(input.network.ldap_listen, ["127.0.0.1:389"]);
+    assert_eq!(input.network.ldaps_listen, ["127.0.0.1:636"]);
     // Task K9 (docs/53 §3.3, §5.2; docs/54 §4.3, §4.6): the change-password
     // service object's name, the two fronts' accounts, files, sockets and
     // listeners.

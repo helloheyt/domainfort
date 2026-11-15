@@ -24,14 +24,29 @@
 //! socket (a `_udp` record needs a UDP socket there, a `_tcp` record a TCP
 //! listener), so the table and the daemons cannot drift apart unnoticed.
 //! What this table cannot see — a listener *configured* away (an ldap-front
-//! with LDAPS listeners only; a port other than the standard one) — is
-//! recorded in docs/questions/Q-1016.
+//! with LDAPS listeners only; a port other than the standard one) — was
+//! recorded in docs/questions/Q-1016 and is closed by task DN10c (A-176):
+//!
+//! * **the port is one fact, in one place** — [`SrvService::port`] is
+//!   `config::StandardPort::number`, the very value the kdc's, ldap-front's
+//!   (StartTLS) and kpasswd-front's listener rule requires (crates/config
+//!   `NonStandardPort`), so a listener cannot sit on another port than the
+//!   one its record advertises;
+//! * **`_ldap._tcp` always has a listener** — provision requires at least
+//!   one StartTLS listener (crates/provision `MissingStartTlsListener`).
+//!
+//! The guards: `tests/srv_served.rs` (each record's port is the one its
+//! serving daemon's schema accepts, and no other) and crates/e2e-tests
+//! `tests/dns_zone.rs` (every record a provisioned zone advertises has a
+//! listener in the produced files). docs/questions/Q-1024.
 //!
 //! Spec: docs/54 §3.1, §5.1; docs/questions/Q-618 item 1, Q-1004 (decision
 //! A-172: option 2, "one SRV record per service that exists"), Q-1016; RFC
 //! 2782 ("The format of the SRV RR", Applicability); RFC 4120 §7.2.3.2;
 //! [MS-ADTS] v20261026 §6.3.2.3; PENDING-OWNER A-117, A-158 (kpasswd-front:
-//! TCP 464 only).
+//! TCP 464 only), A-176 (DN10c: one port definition); docs/questions/Q-1024.
+
+use config::StandardPort;
 
 /// One synthesized SRV RRset of phase 1 (one record each: a single DC, OD-2)
 /// — one variant per (service, transport) a phase-1 process serves (module
@@ -121,15 +136,24 @@ impl SrvService {
         }
     }
 
-    /// The Port. Spec: RFC 4120 §7.2.3.2 (88); [MS-ADTS] §6.3.2.3 ("Set to 389
-    /// for LDAP service … Set to 88 for Kerberos KDC service. Set to 464 for
-    /// Kerberos Password Change service").
-    pub const fn port(self) -> u16 {
+    /// The service's standard port — crate config's one definition, which
+    /// the serving daemon's listener rule requires too (module documentation;
+    /// task DN10c). Spec: RFC 4120 §7.2.3.2; [MS-ADTS] §6.3.2.3; docs/questions/
+    /// Q-1016 item 4 (A-176), Q-1024.
+    pub const fn standard_port(self) -> StandardPort {
         match self {
-            SrvService::KerberosUdp | SrvService::KerberosTcp => 88,
-            SrvService::LdapTcp => 389,
-            SrvService::KpasswdTcp => 464,
+            SrvService::KerberosUdp | SrvService::KerberosTcp => StandardPort::Kerberos,
+            SrvService::LdapTcp => StandardPort::Ldap,
+            SrvService::KpasswdTcp => StandardPort::Kpasswd,
         }
+    }
+
+    /// The Port: [`Self::standard_port`]'s number. Spec: RFC 4120 §7.2.3.2
+    /// (88); [MS-ADTS] §6.3.2.3 ("Set to 389 for LDAP service … Set to 88 for
+    /// Kerberos KDC service. Set to 464 for Kerberos Password Change
+    /// service").
+    pub const fn port(self) -> u16 {
+        self.standard_port().number()
     }
 
     /// Whether this record is synthesized when the kpasswd service is as

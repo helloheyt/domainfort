@@ -9,8 +9,10 @@
 //! ([`principal_names::PrincipalClass`]); [`DirectoryView::principal_keys`]
 //! returns the keys those names produce ([`principal_names::keys_of_names`]),
 //! in the realm the view's naming context names ([`name_context_of`]).
-//! The lookup re-derives an object's keys with it to check the key it
-//! probed (docs/59 §6.1 step 3, task PN4); nothing calls it yet but tests.
+//! The one lookup path (crate::resolve, task PN4) reads an object's names
+//! and class here and re-derives its keys to check the key it probed
+//! (docs/59 §6.1 step 3), with the provisioned service objects the
+//! [`crate::DirectoryContext`] holds (Q-1019 option (a)).
 //!
 //! # The class, from authoritative data only
 //!
@@ -181,8 +183,9 @@ impl DirectoryView<'_> {
     }
 
     /// The keys of `obj` in the one namespace — `keys_of_names` of its
-    /// principal names in the realm of this view's naming context — or
-    /// `None` if it is not a security principal.
+    /// principal names in the realm of this view's naming context (the
+    /// context's one `NameContext`, built with it — task PN4) — or `None`
+    /// if it is not a security principal.
     /// Spec: docs/59 §4.2, §4.3, §6.1 step 3; A-53.
     pub fn principal_keys(
         &self,
@@ -192,9 +195,7 @@ impl DirectoryView<'_> {
         let Some(names) = self.principal_names_of(obj, service_objects)? else {
             return Ok(None);
         };
-        let ctx =
-            name_context_of(self.ctx.naming_context()).map_err(PrincipalNamesError::Refused)?;
-        keys_of_names(&names, &ctx)
+        keys_of_names(&names, self.ctx.name_context())
             .map(Some)
             .map_err(PrincipalNamesError::Refused)
     }

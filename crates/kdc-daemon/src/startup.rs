@@ -24,6 +24,7 @@
 use crate::daemon::Listeners;
 use config::{KdcSettings, PolicyStoreFormat};
 use core::fmt;
+use core::net::SocketAddr;
 use daemon_sandbox::{HardeningPlan, PlanError, ProcessIdentity};
 use policy_store::{read_file, DevelopmentPolicy, LoadError};
 use protected_file::Refusal;
@@ -119,15 +120,27 @@ pub fn read_policy(path: &Path, owner: u32) -> Result<DevelopmentPolicy, Startup
 /// Bind one UDP socket and one TCP listener per configured address (docs/50
 /// §4.1: "each address served on UDP and TCP"; the addresses are interface
 /// addresses only — crates/config refuses the unspecified ones, Q-230 item
-/// 7). Called as root, before the drop (module documentation).
+/// 7 — and all on port 88, the port the zone advertises: crates/config
+/// refuses any other, task DN10c). Called as root, before the drop (module
+/// documentation).
 ///
 /// # Errors
 /// [`StartupError::Bind`].
 ///
-/// Spec: RFC 4120 §7.2.1, §7.2.2; docs/50 R50-9, §4.1, §6.2.
+/// Spec: RFC 4120 §7.2.1, §7.2.2, §7.2.3.2; docs/50 R50-9, §4.1, §6.2;
+/// docs/questions/Q-1024.
 pub fn bind_listeners(settings: &KdcSettings) -> Result<Listeners, StartupError> {
+    bind_addresses(settings.listen())
+}
+
+/// The binding itself, over the addresses [`bind_listeners`] takes from the
+/// settings — its only product caller, so every address is one the kdc's
+/// schema accepted (port 88). Crate-private: the in-crate test binds it on
+/// a loopback port the system picks (task DN10c — no product path takes an
+/// address that is not from the file).
+fn bind_addresses(addresses: &[SocketAddr]) -> Result<Listeners, StartupError> {
     let mut listeners = Listeners::default();
-    for address in settings.listen() {
+    for address in addresses {
         let udp = std::net::UdpSocket::bind(address)
             .map_err(|error| StartupError::Bind(error.raw_os_error()))?;
         let tcp = std::net::TcpListener::bind(address)
@@ -166,3 +179,7 @@ pub fn hardening_plan(settings: &KdcSettings) -> Result<HardeningPlan, PlanError
         .working_directory("/")
         .build()
 }
+
+#[cfg(test)]
+#[path = "startup_tests.rs"]
+mod tests;
