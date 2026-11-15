@@ -9,8 +9,9 @@
 
 use ad_schema::flags::{group_type, user_account_control};
 use ad_schema::{
-    phase1, Form, Phase1Schema, ATTRIBUTES, CLASSES, HOST_ADDRESS, HOST_ADDRESS_OCTETS,
-    INTERNAL_ATTRTYP_FIRST, SECRET_ATTRIBUTES,
+    phase1, Form, LookupError, Phase1Schema, ATTRIBUTES, CLASSES, HOST_ADDRESS,
+    HOST_ADDRESS_OCTETS, INTERNAL_ATTRTYP_FIRST, PRINCIPAL_NAME_KEY, PRINCIPAL_NAME_KEY_HOLDERS,
+    PRINCIPAL_NAME_KEY_MAX_OCTETS, SECRET_ATTRIBUTES,
 };
 use dirstore::{
     AttrClass, AttrId, Link, Multiplicity, Storage, ValueConstraint, ValueRange, ValueSyntax,
@@ -472,9 +473,15 @@ fn class_definitions_per_docs46_4_4() {
         // The internal host-address attribute (task DN6) is in computer's
         // `may` beside its AD attributes — and in no other class's.
         // Source: docs/questions/Q-614 item 1 (b), Q-992; docs/54 §5.2.
+        // The internal principal-name key (task PN2) is in the `may` of
+        // user, computer and group, after it (ascending ATTRTYP).
+        // Source: docs/59 §4.3, §4.6; docs/questions/Q-1008 item 1.
         let mut want_may = attrs(may);
         if name == "computer" {
             want_may.push(HOST_ADDRESS);
+        }
+        if ["user", "computer", "group"].contains(&name) {
+            want_may.push(PRINCIPAL_NAME_KEY);
         }
         assert_eq!(d.may, want_may, "{name}");
         assert_eq!(d.poss_superiors, classes(poss), "{name}");
@@ -488,12 +495,19 @@ fn dirstore_must_and_may_are_within_classatts() {
     // attributes (+ the allowed Secret ones), minus the one deliberate
     // omission (ou on organizationalPerson); so every dirstore must / may
     // attribute of a class is in its CLASSATTS ([MS-ADTS] 3.1.1.4.2).
-    // The internal host-address attribute (task DN6) is outside the AD
-    // model by design — no attributeID, no CLASSATTS entry (Q-992).
+    // The internal attributes — host address (task DN6) and principal-name
+    // key (task PN2) — are outside the AD model by design: no attributeID,
+    // no CLASSATTS entry (Q-992, Q-1008 item 1).
     let p1 = p1();
+    let internal = [HOST_ADDRESS, PRINCIPAL_NAME_KEY];
     for c in p1.classes() {
         let d = p1.schema().class(c.id).unwrap();
-        for a in d.must.iter().chain(&d.may).filter(|a| **a != HOST_ADDRESS) {
+        for a in d
+            .must
+            .iter()
+            .chain(&d.may)
+            .filter(|a| !internal.contains(a))
+        {
             assert!(
                 c.class_attributes.contains(a),
                 "{} allows {}",
@@ -545,5 +559,96 @@ fn the_host_address_attribute_is_internal() {
             "{}",
             c.entry.ldap_display_name
         );
+    }
+}
+
+/// The internal principal-name key (task PN2): in the dirstore schema with
+/// exactly the definition of crate `internal` — OctetString, multi-valued,
+/// 1..=2048 octets per value, Normal, stored, no link, **unique** — the
+/// second ATTRTYP of the internal range, and outside every AD table: no
+/// AttributeInfo (so no attributeID an LDAP OID description could match),
+/// no lDAPDisplayName, no schemaIDGUID / property set / AttrClass for the
+/// PDP (each lookup refuses it), in no class's CLASSATTS — so LDAP and the
+/// PDP cannot name it. Its holders are user, computer and group.
+/// Source: [MS-ADTS] v20261026 3.1.1.2.6 ("[0xFFFF0000.. 0xFFFFFFFF]
+/// Reserved for internal use (never appear on the wire)"); docs/59 §4.3,
+/// §4.6; docs/questions/Q-1008 items 1-2 (A-173: "a value ≤ 2048 octets");
+/// docs/46 §5.4 (dNSHostName rangeUpper 2048; sAMAccountName rangeLower 1
+/// — a name is never empty), §8.5 (unique).
+#[test]
+fn the_principal_name_key_attribute_is_internal() {
+    let p1 = p1();
+    // The ATTRTYP: the second of the internal range, after HOST_ADDRESS.
+    assert_eq!(PRINCIPAL_NAME_KEY, AttrId(0xFFFF_0001));
+    assert_eq!(PRINCIPAL_NAME_KEY.0, INTERNAL_ATTRTYP_FIRST + 1);
+    assert_ne!(PRINCIPAL_NAME_KEY, HOST_ADDRESS);
+    // The definition.
+    let d = p1
+        .schema()
+        .attribute(PRINCIPAL_NAME_KEY)
+        .expect("in the dirstore schema");
+    assert_eq!(d.id, PRINCIPAL_NAME_KEY);
+    assert_eq!(d.syntax, ValueSyntax::OctetString);
+    assert_eq!(d.multiplicity, Multiplicity::MultiValued);
+    assert_eq!(PRINCIPAL_NAME_KEY_MAX_OCTETS, 2048);
+    assert_eq!(d.max_value_len, 2048);
+    assert_eq!(
+        d.range,
+        Some(ValueRange {
+            lower: 1,
+            upper: 2048
+        })
+    );
+    assert_eq!(d.class, AttrClass::Normal);
+    assert_eq!(d.storage, Storage::Stored);
+    assert_eq!(d.link, None);
+    assert_eq!(d.constraint, None);
+    assert_eq!(d.rdn_att_len, None);
+    assert!(d.unique);
+    assert_eq!(*d, ad_schema::principal_name_key_definition());
+    // Outside every AD table: not among the 35 rows, no AttributeInfo, no
+    // lDAPDisplayName resolves to it, and every PDP lookup refuses it.
+    assert!(p1.attribute(PRINCIPAL_NAME_KEY).is_none());
+    assert!(p1.attributes().all(|a| a.id != PRINCIPAL_NAME_KEY));
+    for row in ATTRIBUTES.iter() {
+        assert_ne!(
+            p1.attribute_by_name(row.ldap_display_name),
+            Some(PRINCIPAL_NAME_KEY),
+            "{}",
+            row.ldap_display_name
+        );
+    }
+    assert_eq!(
+        p1.attribute_schema_id_guid(PRINCIPAL_NAME_KEY),
+        Err(LookupError::UnknownAttribute(PRINCIPAL_NAME_KEY))
+    );
+    assert_eq!(
+        p1.property_set(PRINCIPAL_NAME_KEY),
+        Err(LookupError::UnknownAttribute(PRINCIPAL_NAME_KEY))
+    );
+    assert_eq!(
+        p1.attr_class(PRINCIPAL_NAME_KEY),
+        Err(LookupError::UnknownAttribute(PRINCIPAL_NAME_KEY))
+    );
+    for c in p1.classes() {
+        assert!(
+            !c.class_attributes.contains(&PRINCIPAL_NAME_KEY),
+            "{} CLASSATTS",
+            c.entry.ldap_display_name
+        );
+    }
+    // Its holders: exactly user, computer and group list it, in `may` and
+    // never in `must` (the decided placement — docs/59 §4.6; which keys an
+    // object holds is the write checker's rule, docs/59 §5.1).
+    assert_eq!(PRINCIPAL_NAME_KEY_HOLDERS, ["user", "computer", "group"]);
+    for c in p1.classes() {
+        let def = p1.schema().class(c.id).unwrap();
+        let name = c.entry.ldap_display_name;
+        assert_eq!(
+            def.may.contains(&PRINCIPAL_NAME_KEY),
+            PRINCIPAL_NAME_KEY_HOLDERS.contains(&name),
+            "{name}"
+        );
+        assert!(!def.must.contains(&PRINCIPAL_NAME_KEY), "{name}");
     }
 }

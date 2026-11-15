@@ -26,7 +26,7 @@ use crate::attributes::{dirstore_syntax, AttributeEntry, Constraint, Form, SECRE
 use crate::classes::{ClassEntry, STRUCTURAL_CLASS};
 use crate::error::{Error, LookupError};
 use crate::flags::search_flags::F_CONFIDENTIAL;
-use crate::internal::{host_address_definition, HOST_ADDRESS, HOST_ADDRESS_HOLDERS};
+use crate::internal::internal_attributes;
 use crate::{ATTRIBUTES, CLASSES};
 use dirstore::{
     AttrClass, AttrId, AttributeDefinition, ClassDefinition, ClassId, Link, Schema, Storage,
@@ -336,31 +336,36 @@ pub fn phase1() -> Result<Phase1Schema, Error> {
             &[entry.rdn_att_id],
         )?);
     }
-    let mut definitions = Vec::with_capacity(attr_ids.len() + 1);
+    let internal = internal_attributes();
+    let mut definitions = Vec::with_capacity(attr_ids.len() + internal.len());
     for (entry, id, _) in &attr_ids {
         let class = attr_class_of(entry);
         let rdn = rdn_attributes.contains(id);
         definitions.push(attribute_definition(entry, *id, class, rdn)?);
     }
-    // The internal attribute (crate::internal): in the dirstore schema, in
-    // its holders' `may`, and in none of the AD tables or lookups — so
+    // The internal attributes (crate::internal): in the dirstore schema, in
+    // their holders' `may`, and in none of the AD tables or lookups — so
     // nothing that names attributes by OID, lDAPDisplayName or
-    // schemaIDGUID can reach it. Its ATTRTYP shares the one space and must
-    // not collide. Spec: [MS-ADTS] 3.1.1.2.6; docs/questions/Q-992.
-    if !attrtyps.insert(HOST_ADDRESS.0) {
-        return Err(Error::DuplicateAttrtyp("(internal) host address"));
-    }
-    definitions.push(host_address_definition());
-    let mut holders = BTreeSet::new();
-    for holder in HOST_ADDRESS_HOLDERS {
-        let id = resolve(&class_names, "(internal) host address", &[holder])?
-            .first()
-            .copied()
-            .ok_or(Error::UnknownName {
-                entry: "(internal) host address",
-                name: holder,
-            })?;
-        holders.insert(id);
+    // schemaIDGUID can reach one. Their ATTRTYPs share the one space and
+    // must not collide. Spec: [MS-ADTS] 3.1.1.2.6; docs/questions/Q-992,
+    // Q-1008 item 1.
+    let mut internal_may: BTreeMap<ClassId, Vec<AttrId>> = BTreeMap::new();
+    for attribute in internal {
+        let id = attribute.definition.id;
+        if !attrtyps.insert(id.0) {
+            return Err(Error::DuplicateAttrtyp(attribute.label));
+        }
+        for holder in attribute.holders {
+            let class = resolve(&class_names, attribute.label, &[*holder])?
+                .first()
+                .copied()
+                .ok_or(Error::UnknownName {
+                    entry: attribute.label,
+                    name: holder,
+                })?;
+            internal_may.entry(class).or_default().push(id);
+        }
+        definitions.push(attribute.definition);
     }
     let mut class_definitions = Vec::with_capacity(class_ids.len());
     let mut superclasses = BTreeMap::new();
@@ -385,8 +390,8 @@ pub fn phase1() -> Result<Phase1Schema, Error> {
                 name: entry.rdn_att_id,
             })?;
         let mut may = resolve(&attribute_names, name, entry.may)?;
-        if holders.contains(id) {
-            may.push(HOST_ADDRESS);
+        if let Some(internal) = internal_may.get(id) {
+            may.extend_from_slice(internal);
         }
         class_definitions.push(ClassDefinition {
             id: *id,
