@@ -1,5 +1,6 @@
 //! Principal-name rules of the phase-1 KDC: exact equivalence, the TGS name,
-//! and the service-name string handed to the PDP.
+//! the change-password service's name, and the service-name string handed to
+//! the PDP.
 //!
 //! Phase 1 does exact matching only (main-session decision 4): realm octets
 //! and every name-string component, octet for octet, with the same number of
@@ -11,8 +12,12 @@
 //! significant when checking for equivalence. Principal names that differ only
 //! in the name-type identify the same principal"; "Names of any type with an
 //! initial component of 'krbtgt' are reserved for the Kerberos
-//! ticket-granting service"), 7.3 (name of the TGS); main-session decision 4.
+//! ticket-granting service"), 7.3 (name of the TGS); RFC 3244 §2 (the
+//! change-password service principal `kadmin/changepw@REALM`); [MS-KILE]
+//! 3.3.5.1.2 (that name is never canonicalised); main-session decision 4;
+//! A-139 (one name space, one canonicalisation function).
 
+use keyd_types::is_change_password_service_name;
 use krb_proto::constants::KRB_NT_SRV_INST;
 use krb_proto::{KerberosString, PrincipalName, Realm};
 
@@ -61,13 +66,25 @@ pub(crate) enum ServerNameKind {
     /// "krbtgt": a TGS of another realm (cross-realm) or a malformed TGS
     /// name.
     ForeignTgs,
+    /// `kadmin/changepw`: the change-password service (RFC 3244 §2: "The
+    /// AP-REQ message must be for the service principal
+    /// kadmin/changepw@REALM"). Recognised by
+    /// `keyd_types::is_change_password_service_name` — the one rule keyd
+    /// binds that service's key set with and `KeyPurpose::of_service_name`
+    /// derives its purpose with — so the KDC has no second matching path for
+    /// the name (A-139). Exactly the two components, octet for octet; the
+    /// name-type is not significant (RFC 4120 6.2); never canonicalised
+    /// ([MS-KILE] 3.3.5.1.2). A ticket for it comes only from an armored AS
+    /// (docs/53 §5.2; A-117, A-142).
+    ChangePassword,
     /// Any other name: an ordinary service.
     Service,
 }
 
-/// Classify `name` against this realm's TGS name.
+/// Classify `name` against this realm's TGS name and the change-password
+/// service's name.
 /// Spec: RFC 4120 6.2 ("Names ... with an initial component of 'krbtgt' are
-/// reserved"), 7.3.
+/// reserved"), 7.3; RFC 3244 §2; docs/53 §5.2 (task K5); A-139.
 pub(crate) fn classify_server(name: &PrincipalName, realm: &Realm) -> ServerNameKind {
     let mut parts = name.name_string.iter();
     match parts.next() {
@@ -77,6 +94,7 @@ pub(crate) fn classify_server(name: &PrincipalName, realm: &Realm) -> ServerName
                 _ => ServerNameKind::ForeignTgs,
             }
         }
+        _ if is_change_password_service_name(name) => ServerNameKind::ChangePassword,
         _ => ServerNameKind::Service,
     }
 }
@@ -171,6 +189,38 @@ mod tests {
         let tgs = tgs_name(&r).unwrap();
         assert_eq!(tgs.name_type, KRB_NT_SRV_INST);
         assert_eq!(classify_server(&tgs, &r), ServerNameKind::LocalTgs);
+    }
+
+    /// RFC 3244 §2 (the service principal `kadmin/changepw@REALM`); RFC 4120
+    /// 6.2 (the name-type is not significant; components compare exactly);
+    /// [MS-KILE] 3.3.5.1.2 (no canonicalisation of that name); task K5:
+    /// exactly the two components `kadmin`, `changepw`, under any name-type,
+    /// are the change-password service — no case variant, no third
+    /// component, no single joined component.
+    #[test]
+    fn change_password_service_classification() {
+        let r = realm("EXAMPLE.ORG");
+        for name_type in [1, 2, 3] {
+            assert_eq!(
+                classify_server(&name(name_type, &["kadmin", "changepw"]), &r),
+                ServerNameKind::ChangePassword
+            );
+        }
+        for parts in [
+            &["KADMIN", "changepw"][..],
+            &["kadmin", "CHANGEPW"],
+            &["kadmin", "changepw", "EXAMPLE.ORG"],
+            &["kadmin/changepw"],
+            &["kadmin"],
+            &["changepw", "kadmin"],
+            &["kadmin", "changepw "],
+        ] {
+            assert_eq!(
+                classify_server(&name(2, parts), &r),
+                ServerNameKind::Service,
+                "{parts:?}"
+            );
+        }
     }
 
     /// Project rule: an ambiguous rendering is refused (fail closed).

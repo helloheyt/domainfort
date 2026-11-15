@@ -105,7 +105,10 @@ tokio = { version = "1.54.1", default-features = false, features = ["rt", "rt-mu
 audit-daemon = { path = "../audit-daemon" }
 audit-log = { path = "../audit-log" }
 keyd-daemon = { path = "../keyd-daemon", features = ["test-seams"] }
-keyd = { path = "../keyd" }
+# `test-seams` (docs/52 C18; docs/questions/Q-843 item 2): the tests build keyd
+# with a deterministic entropy source (`Keyd::with_entropy`, directly or through
+# the reused crates/kdc tests/common fixtures). Dev-only (resolver 2).
+keyd = { path = "../keyd", features = ["test-seams"] }
 krb-crypto = { path = "../krb-crypto" }
 directory-daemon = { path = "../directory-daemon", features = ["test-seams"] }
 directory-admin = { path = "../directory-admin" }

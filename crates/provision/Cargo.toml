@@ -119,7 +119,10 @@ kdc-daemon = { path = "../kdc-daemon", features = ["test-seams"] }
 ipc-directory-server = { path = "../ipc-directory-server" }
 kdc = { path = "../kdc" }
 keyadm = { path = "../keyadm" }
-keyd = { path = "../keyd" }
+# `test-seams` (docs/52 C18; docs/questions/Q-843 item 2): the tests build keyd
+# with a deterministic entropy source (`Keyd::with_entropy`, directly or through
+# the reused crates/kdc tests/common fixtures). Dev-only (resolver 2).
+keyd = { path = "../keyd", features = ["test-seams"] }
 keyd-daemon = { path = "../keyd-daemon", features = ["test-seams"] }
 ipc = { path = "../ipc" }
 ipc-keyd = { path = "../ipc-keyd" }

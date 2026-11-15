@@ -1,7 +1,9 @@
 //! The Authentication Service exchange: receipt of KRB_AS_REQ and generation
-//! of KRB_AS_REP (phase 1: the AS issues TGTs, docs/30 §2) — FAST-armored
-//! (RFC 6113), with one narrow unarmored exception, the bootstrap of a
-//! computer account (docs/48 §4, §7).
+//! of KRB_AS_REP (phase 1: the AS issues TGTs, docs/30 §2, and — armored
+//! only, to users only — tickets for the change-password service
+//! `kadmin/changepw`, docs/53 §5.2) — FAST-armored (RFC 6113), with one
+//! narrow unarmored exception, the bootstrap of a computer account (docs/48
+//! §4, §7).
 //!
 //! # The request shape (steps R1-R8, on the outer body of an unarmored
 //! request, on the INNER body of an armored one)
@@ -14,8 +16,9 @@
 //! R3. another realm → KDC_ERR_C_PRINCIPAL_UNKNOWN (single realm, decision
 //!     4: such a client is not in this KDC's database, 3.1.3);
 //! R4. sname: a TGS name of another realm → KDC_ERR_S_PRINCIPAL_UNKNOWN (no
-//!     inter-realm key); any non-TGS service → KDC_ERR_POLICY (the phase-1 AS
-//!     issues only TGTs, docs/30 §2);
+//!     inter-realm key); `kadmin/changepw` → accepted on the armored path
+//!     only (below); any other non-TGS service → KDC_ERR_POLICY (the phase-1
+//!     AS issues TGTs, docs/30 §2);
 //! R5. starttime beyond the skew → KDC_ERR_CANNOT_POSTDATE (3.1.3);
 //! R6. the client account: source failure → KRB_ERR_GENERIC (fail closed,
 //!     decision 3), source unreachable → KDC_ERR_SVC_UNAVAILABLE (7.5.9;
@@ -28,14 +31,21 @@
 //!
 //! # Unarmored (no PA-FX-FAST): the layer-1 gate and the bootstrap
 //!
-//! U1. R1-R8 on the request body;
+//! U1. R1-R8 on the request body. Here R4 can yield one server only, this
+//!     realm's TGS ([`LocalTgt`]): `kadmin/changepw` → the U2 refusal at
+//!     once, for every client, before the account is looked up and before
+//!     keyd — the unarmored path has no value that names that service, so an
+//!     unarmored AS for it cannot be expressed, not merely is refused (A-142:
+//!     a passive observer of such an AS could guess the old password offline
+//!     and read the new one; docs/53 §5.2: "an unarmored AS to
+//!     `kadmin/changepw` is refused for every principal");
 //! U2. the mandatory-FAST gate (docs/48 §7.2 layer 1, before keyd): unless
-//!     the client is a computer account allowed to bootstrap and asks for this
-//!     realm's TGT ([`crate::ClientAccount`] `kind` / `armor_policy`, P-10
-//!     interim), → KDC_ERR_PREAUTH_REQUIRED advertising ONLY PA-FX-FAST and
-//!     PA-FX-COOKIE — no padata is looked at and keyd is not asked, so a
-//!     passive observer never gets a PA-ENC-TIMESTAMP of such a principal to
-//!     attack offline (RFC 6113 5.4);
+//!     the client is a computer account allowed to bootstrap
+//!     ([`crate::ClientAccount`] `kind` / `armor_policy`, P-10 interim) — it
+//!     asks for this realm's TGT by U1's type — → KDC_ERR_PREAUTH_REQUIRED
+//!     advertising ONLY PA-FX-FAST and PA-FX-COOKIE — no padata is looked at
+//!     and keyd is not asked, so a passive observer never gets a
+//!     PA-ENC-TIMESTAMP of such a principal to attack offline (RFC 6113 5.4);
 //! U3. the PA-FX-COOKIE, if any, first (RFC 6113 2.4) → else
 //!     KDC_ERR_PREAUTH_EXPIRED;
 //! U4. PA-ENC-TIMESTAMP is mandatory (docs/02 §3, docs/30 §2.1): none →
@@ -75,7 +85,17 @@
 //! A7. the inner padata: PA-FX-COOKIE first (→ KDC_ERR_PREAUTH_EXPIRED); two
 //!     PA-ENCRYPTED-CHALLENGE → KDC_ERR_PREAUTH_FAILED; everything else —
 //!     PA-ENC-TIMESTAMP included — ignored (docs/48 §4.5);
-//! A8. R1-R8 on the inner body;
+//! A8. R1-R8 on the inner body; R4 yields this realm's TGS or
+//!     `kadmin/changepw` — the latter holding this exchange's armor
+//!     ([`ArmoredServer::ChangePassword`]);
+//! A8a. `kadmin/changepw` only (docs/53 §5.2): the client must be a user
+//!     account (R53-1: a computer, and so every service object, R47-13 →
+//!     KDC_ERR_POLICY); the service object (unknown →
+//!     KDC_ERR_S_PRINCIPAL_UNKNOWN; key set not ChangePasswordService →
+//!     KRB_ERR_GENERIC; disabled / locked / expired →
+//!     KDC_ERR_SERVICE_REVOKED); a session-key type both the client offers
+//!     and the service accepts (RFC 4120 3.1.3; none → KDC_ERR_ETYPE_NOSUPP)
+//!     — all before pre-authentication and keyd;
 //! A9. no PA-ENCRYPTED-CHALLENGE → KDC_ERR_PREAUTH_REQUIRED whose sealed
 //!     KrbFastResponse advertises PA-ENCRYPTED-CHALLENGE (empty) and carries
 //!     PA-ETYPE-INFO2 with the ONE entry keyd will use as the long-term key
@@ -84,10 +104,17 @@
 //!     with that PA-ETYPE-INFO2 (RFC 6113 5.4.6), or — the challenge
 //!     decrypted but out of skew — KRB_AP_ERR_SKEW (5.4.6 "KRB_APP_ERR_SKEW",
 //!     which RFC 4120 7.5.9 calls KRB_AP_ERR_SKEW; R48-6, Q-125 item 8);
-//! A11. the PDP (`KdcAs`, `armored = true`, strength `KerberosFast`) denies
-//!     → KDC_ERR_POLICY;
-//! A12-A13. times and flags as U6; keyd `issue_as_rep` under the armor (the
-//!     strengthened reply key, KrbFastFinished, the sealed `fast_rep`);
+//! A11. the PDP (`KdcAs`, `armored = true`, strength `KerberosFast`; the
+//!     resource the TGT, or `KerbResKind::ChangePassword`) denies →
+//!     KDC_ERR_POLICY;
+//! A12-A13. times and flags as U6 — for `kadmin/changepw` the ticket profile
+//!     instead (docs/53 §5.2): endtime capped at the start plus
+//!     [`CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS`], never renewable,
+//!     forwardable or proxiable, starting now; keyd sets INITIAL and
+//!     PRE-AUTHENT itself — keyd `issue_as_rep` under the armor (the
+//!     strengthened reply key, KrbFastFinished, the sealed `fast_rep`), for
+//!     `kadmin/changepw` with that service's key set as the server key and
+//!     the requested sname (no canonicalisation, [MS-KILE] 3.3.5.1.2);
 //! A14. the AS-REP: padata = [PA-FX-FAST(enc-fast-rep)] only, crealm / cname
 //!     of the inner request (5.4.3, 5.4.5).
 //!
@@ -97,13 +124,15 @@
 //! — is KDC_ERR_SVC_UNAVAILABLE (7.5.9, code 29), never PREAUTH_FAILED;
 //! nothing is sent over UDP (docs/50 §3.7, R50-8; A-56).
 //!
-//! Spec: RFC 4120 3.1.2, 3.1.3, 3.2.3, 5.2.7.2-5.2.7.5, 5.4.1, 5.4.2, 7.3,
-//! 7.5.9; RFC 6113 2.4, 5.2, 5.4, 5.4.1, 5.4.1.1, 5.4.2, 5.4.3, 5.4.4, 5.4.5,
-//! 5.4.6, 7.3; docs/30 §2; docs/10 §4, §5א; docs/48 §3.1, §4, §6, §7, §8;
-//! docs/50 §3.7 (R50-8); Q-123, Q-125, Q-126 (A-32); Q-127 interim (P-10);
-//! Q-217 (A-56); main-session decisions 3-10.
+//! Spec: RFC 4120 2.1, 3.1.2, 3.1.3, 3.2.3, 5.2.7.2-5.2.7.5, 5.4.1, 5.4.2,
+//! 6.2, 7.3, 7.5.9; RFC 6113 2.4, 5.2, 5.4, 5.4.1, 5.4.1.1, 5.4.2, 5.4.3,
+//! 5.4.4, 5.4.5, 5.4.6, 7.3; RFC 3244 §2; [MS-KILE] 3.3.5.1.2; docs/30 §2;
+//! docs/10 §4, §5א; docs/48 §3.1, §4, §6, §7, §8; docs/50 §3.7 (R50-8);
+//! docs/53 R53-1, R53-6, §5.2 (task K5); Q-123, Q-125, Q-126 (A-32); Q-127
+//! interim (P-10); Q-217 (A-56); A-117, A-139, A-142; main-session decisions
+//! 3-10.
 
-use crate::accounts::{AccountSource, ClientAccount, NamedPrincipal};
+use crate::accounts::{AccountKind, AccountSource, ClientAccount, NamedPrincipal, ServiceAccount};
 use crate::audit::{AuditReason, AuditSink};
 use crate::etype::negotiate;
 use crate::fast::{
@@ -116,20 +145,24 @@ use crate::kdc::{
     time_refusal, Kdc, Refusal, Scope,
 };
 use crate::krb_error::{advertise, etype_info2, fast_required_e_data, preauth_required_e_data};
-use crate::lifetime::{check_starttime, plan, LifetimeRequest, Limits};
+use crate::lifetime::{
+    check_starttime, plan, LifetimeRequest, Limits, CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS,
+};
 use crate::names::{classify_server, same_realm, ServerNameKind};
 use crate::options::{asks_unsupported_operation, delegation_flags, FlagRequests};
 use crate::time::seconds;
 use crate::transport::Peer;
 use core::time::Duration;
 use keyd_types::{
-    ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof, KeyCustody, KeyPurpose,
+    ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof, EncTypeId, KeyCustody,
+    KeyPurpose,
 };
 use krb_proto::constants::{
     FX_FAST_ARMOR_AP_REQUEST, KDC_ERR_BADOPTION, KDC_ERR_CLIENT_REVOKED,
     KDC_ERR_C_PRINCIPAL_UNKNOWN, KDC_ERR_ETYPE_NOSUPP, KDC_ERR_POLICY, KDC_ERR_PREAUTH_FAILED,
-    KDC_ERR_PREAUTH_REQUIRED, KDC_ERR_S_PRINCIPAL_UNKNOWN, KDC_ERR_UNKNOWN_CRITICAL_FAST_OPTIONS,
-    KRB_AP_ERR_SKEW, PA_ENCRYPTED_CHALLENGE, PA_ENC_TIMESTAMP,
+    KDC_ERR_PREAUTH_REQUIRED, KDC_ERR_SERVICE_REVOKED, KDC_ERR_S_PRINCIPAL_UNKNOWN,
+    KDC_ERR_UNKNOWN_CRITICAL_FAST_OPTIONS, KRB_AP_ERR_SKEW, PA_ENCRYPTED_CHALLENGE,
+    PA_ENC_TIMESTAMP,
 };
 use krb_proto::{
     AsRep, EncryptedData, EtypeInfo2Entry, KdcRep, KdcReq, KdcReqBody, KerberosTime, PaData,
@@ -218,16 +251,114 @@ fn challenge_refusal(error: AuthnError, etype_info: PaData) -> Refusal {
     }
 }
 
-/// What R1-R8 established about a request body.
+/// The refusal of an AS request that must be FAST-armored, before keyd and
+/// before any padata is looked at: KDC_ERR_PREAUTH_REQUIRED whose METHOD-DATA
+/// advertises ONLY PA-FX-FAST (empty) and PA-FX-COOKIE (U1, U2).
+/// Spec: docs/48 §7.2 layer 1; RFC 6113 5.2, 5.4.2 ("KDCs MUST send the
+/// advertisement of PA-FX-FAST with an empty pa-value"); RFC 4120 3.1.3
+/// (KDC_ERR_PREAUTH_REQUIRED with METHOD-DATA); A-142.
+fn fast_required() -> Refusal {
+    match fast_required_e_data() {
+        Some(e_data) => Refusal {
+            code: KDC_ERR_PREAUTH_REQUIRED,
+            reason: AuditReason::FastRequired,
+            e_data: Some(e_data),
+            fast_padata: Vec::new(),
+        },
+        None => internal(AuditReason::InternalFailure),
+    }
+}
+
+/// The one server an unarmored AS request can name (R4 on the unarmored
+/// path, U1): this realm's TGS. It carries nothing — and there is no other
+/// value, so the unarmored path cannot express a ticket for any other
+/// server, the change-password service included.
+/// Spec: docs/48 §7.3 (the bootstrap: "only TGT"); docs/53 §5.2; A-142.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LocalTgt;
+
+/// R4 on the unarmored path (U1): this realm's TGS is the only server;
+/// `kadmin/changepw` is refused with the U2 shape at once — for every
+/// client, before the account lookup (so it is no account oracle either);
+/// the other refusals are R4's.
+/// Spec: RFC 4120 3.1.3, 7.3; docs/30 §2; docs/48 §7.2 layer 1, §7.3;
+/// docs/53 §5.2; A-142; main-session decision 4.
+fn unarmored_server(kind: ServerNameKind) -> Result<LocalTgt, Refusal> {
+    match kind {
+        ServerNameKind::LocalTgs => Ok(LocalTgt),
+        ServerNameKind::ForeignTgs => Err(Refusal::new(
+            KDC_ERR_S_PRINCIPAL_UNKNOWN,
+            AuditReason::CrossRealm,
+        )),
+        ServerNameKind::Service => Err(Refusal::new(KDC_ERR_POLICY, AuditReason::AsServerNotTgs)),
+        ServerNameKind::ChangePassword => Err(fast_required()),
+    }
+}
+
+/// The servers an armored AS request can name (R4 on the armored path, A8).
+/// Spec: docs/30 §2; docs/53 §5.2; A-117.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArmoredServer {
+    /// This realm's TGS.
+    Tgt,
+    /// The change-password service (`kadmin/changepw`), holding the armor of
+    /// this exchange: the variant is built only by [`armored_server`], from
+    /// the `ArmorId` keyd's `open_fast_armor` returned — the issuance of its
+    /// ticket ([`ChangePasswordTarget`]) takes that armor, not an `Option`
+    /// of one, and keyd binds a proof to its armor (None↔None,
+    /// Some(a)↔Some(a), docs/48 §2.3).
+    /// Spec: docs/53 §5.2; A-117, A-142.
+    ChangePassword {
+        /// The armor of this exchange.
+        armor: ArmorId,
+    },
+}
+
+/// R4 on the armored path (A8): this realm's TGS, or `kadmin/changepw` with
+/// `armor`; the other refusals are R4's.
+/// Spec: RFC 4120 3.1.3, 7.3; docs/30 §2; docs/53 §5.2; main-session
+/// decision 4.
+fn armored_server(kind: ServerNameKind, armor: ArmorId) -> Result<ArmoredServer, Refusal> {
+    match kind {
+        ServerNameKind::LocalTgs => Ok(ArmoredServer::Tgt),
+        ServerNameKind::ChangePassword => Ok(ArmoredServer::ChangePassword { armor }),
+        ServerNameKind::ForeignTgs => Err(Refusal::new(
+            KDC_ERR_S_PRINCIPAL_UNKNOWN,
+            AuditReason::CrossRealm,
+        )),
+        ServerNameKind::Service => Err(Refusal::new(KDC_ERR_POLICY, AuditReason::AsServerNotTgs)),
+    }
+}
+
+/// What A8a established for an armored AS request for `kadmin/changepw`:
+/// the armor (from [`ArmoredServer::ChangePassword`]), the service object
+/// whose key set seals the ticket, and the session-key type.
+/// Spec: docs/53 §5.2; RFC 4120 3.1.3.
+struct ChangePasswordTarget {
+    /// The armor of this exchange (never absent: no `Option`).
+    armor: ArmorId,
+    /// The change-password service's account (key purpose
+    /// ChangePasswordService, usable now).
+    service: ServiceAccount,
+    /// The session-key type: the first of the client's list that keyd
+    /// configures and the service accepts.
+    session_enctype: EncTypeId,
+}
+
+/// What R1-R8 established about a request body; `S` is what R4 may yield
+/// on the path that checked it ([`LocalTgt`] unarmored, [`ArmoredServer`]
+/// armored).
 /// Spec: RFC 4120 3.1.3; docs/48 §4.1 A8.
-struct CheckedRequest {
+struct CheckedRequest<S> {
     /// The client account (key purpose and state checked).
     account: ClientAccount,
     /// The acceptable enctypes, in the client's preference order (non-empty).
     acceptable: Vec<i32>,
+    /// The requested server (R4).
+    server: S,
 }
 
-impl CheckedRequest {
+impl<S> CheckedRequest<S> {
     /// The client's ETYPE-INFO2 entries for the acceptable enctypes, in the
     /// client's order. Spec: RFC 4120 3.1.3, 5.2.7.5.
     fn hints(&self) -> Vec<EtypeInfo2Entry> {
@@ -280,14 +411,17 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
 
     /// Steps R1-R8 (module docs) on `body` — the outer body of an unarmored
     /// request, the inner body of an armored one ("The KDC-REQ-BODY in the
-    /// FAST structure is used in preference", RFC 6113 5.4.2).
-    /// Spec: RFC 4120 3.1.3, 5.4.1; docs/48 §4.1 A8; decisions 3-9.
-    fn check_as_request(
+    /// FAST structure is used in preference", RFC 6113 5.4.2). R4 is the
+    /// path's `server_of` ([`unarmored_server`] / [`armored_server`]).
+    /// Spec: RFC 4120 3.1.3, 5.4.1; docs/48 §4.1 A8; docs/53 §5.2; decisions
+    /// 3-9.
+    fn check_as_request<S>(
         &self,
         body: &KdcReqBody,
         now: &KerberosTime,
         accounts: &dyn AccountSource,
-    ) -> Result<CheckedRequest, Refusal> {
+        server_of: impl FnOnce(ServerNameKind) -> Result<S, Refusal>,
+    ) -> Result<CheckedRequest<S>, Refusal> {
         let keyd_config = self.custody.config();
         let configured: Vec<i32> = keyd_config.enctypes.iter().map(|e| e.number()).collect();
         let skew = keyd_config.clock_skew_secs;
@@ -321,18 +455,7 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
                 AuditReason::CrossRealm,
             ));
         }
-        match classify_server(sname, &self.config.realm) {
-            ServerNameKind::LocalTgs => {}
-            ServerNameKind::ForeignTgs => {
-                return Err(Refusal::new(
-                    KDC_ERR_S_PRINCIPAL_UNKNOWN,
-                    AuditReason::CrossRealm,
-                ))
-            }
-            ServerNameKind::Service => {
-                return Err(Refusal::new(KDC_ERR_POLICY, AuditReason::AsServerNotTgs))
-            }
-        }
+        let server = server_of(classify_server(sname, &self.config.realm))?;
 
         // R5. Starttime (3.1.3).
         check_starttime(body.from.as_ref(), now, skew).map_err(time_refusal)?;
@@ -370,6 +493,7 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
         Ok(CheckedRequest {
             account,
             acceptable,
+            server,
         })
     }
 
@@ -385,27 +509,19 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
     ) -> Result<Vec<u8>, Refusal> {
         let body = &req.req_body;
 
-        // U1. R1-R8.
-        let checked = self.check_as_request(body, now, accounts)?;
+        // U1. R1-R8; R4 yields this realm's TGS or nothing — the unarmored
+        // path has no value for any other server (A-142; docs/53 §5.2).
+        let checked: CheckedRequest<LocalTgt> =
+            self.check_as_request(body, now, accounts, unarmored_server)?;
 
         // U2. The mandatory-FAST gate, before keyd and before any padata is
         // looked at (docs/48 §7.2 layer 1). The bootstrap is for a computer
-        // account and for this realm's TGT only (docs/48 §7.3); R4 already
-        // refused every other target — checked again here so that the
-        // exception cannot outgrow its definition.
-        let tgt_target = body
-            .sname
-            .as_ref()
-            .is_some_and(|s| classify_server(s, &self.config.realm) == ServerNameKind::LocalTgs);
-        if !(checked.account.may_bootstrap() && tgt_target) {
-            let e_data =
-                fast_required_e_data().ok_or_else(|| internal(AuditReason::InternalFailure))?;
-            return Err(Refusal {
-                code: KDC_ERR_PREAUTH_REQUIRED,
-                reason: AuditReason::FastRequired,
-                e_data: Some(e_data),
-                fast_padata: Vec::new(),
-            });
+        // account and for this realm's TGT only (docs/48 §7.3) — the TGT by
+        // the type of `checked.server`, so the exception cannot outgrow its
+        // definition.
+        let LocalTgt = checked.server;
+        if !checked.account.may_bootstrap() {
+            return Err(fast_required());
         }
 
         // U3. The cookie first (RFC 6113 2.4).
@@ -530,9 +646,21 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
         // A7. The inner padata.
         let challenge = inner_challenge(&fast_req.padata)?;
 
-        // A8. R1-R8 on the inner body.
+        // A8. R1-R8 on the inner body; R4 yields this realm's TGS, or
+        // `kadmin/changepw` holding this exchange's armor (docs/53 §5.2).
         let body = &fast_req.req_body;
-        let checked = self.check_as_request(body, now, accounts)?;
+        let checked: CheckedRequest<ArmoredServer> =
+            self.check_as_request(body, now, accounts, |kind| armored_server(kind, armor_id))?;
+
+        // A8a. The change-password service: a user client, its service
+        // object, its session-key type — before pre-authentication and keyd
+        // (docs/53 R53-1, §5.2).
+        let change_password = match checked.server {
+            ArmoredServer::Tgt => None,
+            ArmoredServer::ChangePassword { armor } => {
+                Some(self.change_password_target(body, &checked.account, armor, now, accounts)?)
+            }
+        };
         let etype_info = checked.challenge_etype_info()?;
 
         // A9. PREAUTH_REQUIRED, armored (RFC 6113 2.2, 5.2, 5.4.4, 5.4.6).
@@ -558,8 +686,13 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
             .map_err(|error| challenge_refusal(error, etype_info))?;
 
         // A11-A13. The PDP (armored = true), times, keyd issues under the
-        // armor.
-        let parts = self.issue_tgt(body, &checked, &proof, Some(armor_id), peer, now, policy)?;
+        // armor — a TGT, or the change-password service's ticket under its
+        // profile (docs/53 §5.2).
+        let parts = match change_password {
+            None => self.issue_tgt(body, &checked, &proof, Some(armor_id), peer, now, policy)?,
+            Some(target) => self
+                .issue_change_password_ticket(body, &checked, &proof, target, peer, now, policy)?,
+        };
 
         // A14. The AS-REP: PA-FX-FAST only; the inner request's names.
         let fast_rep = parts
@@ -626,10 +759,10 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
     /// Spec: RFC 4120 3.1.3, 6.2, 7.3; docs/10 §4; docs/48 §4.1 A11-A13,
     /// §4.2; decisions 7, 9, 10.
     #[allow(clippy::too_many_arguments)]
-    fn issue_tgt(
+    fn issue_tgt<S>(
         &mut self,
         body: &KdcReqBody,
-        checked: &CheckedRequest,
+        checked: &CheckedRequest<S>,
         proof: &AuthnProof,
         armor: Option<ArmorId>,
         peer: Peer,
@@ -717,6 +850,182 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
         let krbtgt = self.config.krbtgt;
         self.custody
             .issue_as_rep(&account.key, &krbtgt, proof, armor, &template, now)
+            .map_err(issue_refusal)
+    }
+
+    /// A8a (module docs): what an armored AS for `kadmin/changepw` needs
+    /// before pre-authentication — the client is a user account (docs/53
+    /// R53-1: users only; a computer account, and so every service object,
+    /// R47-13, is refused); the service object exists, its key set is the
+    /// change-password service's (the one derivation,
+    /// `KeyPurpose::of_service_name`, R2b) and it is usable; and a
+    /// session-key type both the client offers and the service accepts.
+    /// Every refusal here is armored (sealed by the caller).
+    /// Spec: docs/53 R53-1, §5.2; RFC 4120 3.1.3 ("looks up the client and
+    /// server principals"; "information from the Kerberos database
+    /// indicating acceptable encryption methods for the application
+    /// server"); decisions 3, 6, 8.
+    fn change_password_target(
+        &self,
+        body: &KdcReqBody,
+        account: &ClientAccount,
+        armor: ArmorId,
+        now: &KerberosTime,
+        accounts: &dyn AccountSource,
+    ) -> Result<ChangePasswordTarget, Refusal> {
+        if account.kind != AccountKind::User {
+            return Err(Refusal::new(
+                KDC_ERR_POLICY,
+                AuditReason::ChangePasswordNotUser,
+            ));
+        }
+        let sname = body.sname.as_ref().ok_or(Refusal::new(
+            KDC_ERR_S_PRINCIPAL_UNKNOWN,
+            AuditReason::MissingName,
+        ))?;
+        let service = match accounts.service(&body.realm, sname) {
+            Err(error) => return Err(account_source_refusal(error)),
+            Ok(None) => {
+                return Err(Refusal::new(
+                    KDC_ERR_S_PRINCIPAL_UNKNOWN,
+                    AuditReason::ServiceUnknown,
+                ))
+            }
+            Ok(Some(service)) => service,
+        };
+        if service.key.purpose != KeyPurpose::ChangePasswordService
+            || service.key.purpose != KeyPurpose::of_service_name(sname)
+        {
+            return Err(internal(AuditReason::AccountRecordInvalid));
+        }
+        if !service.state.usable_at(now) {
+            return Err(Refusal::new(
+                KDC_ERR_SERVICE_REVOKED,
+                AuditReason::ServiceRevoked,
+            ));
+        }
+        let configured = &self.custody.config().enctypes;
+        let numbers: Vec<i32> = configured.iter().map(|e| e.number()).collect();
+        let session_enctype = negotiate(&body.etype, &numbers, &service.enctypes)
+            .first()
+            .and_then(|etype| configured.iter().copied().find(|e| e.number() == *etype))
+            .ok_or(Refusal::new(
+                KDC_ERR_ETYPE_NOSUPP,
+                AuditReason::NoCommonEncType,
+            ))?;
+        Ok(ChangePasswordTarget {
+            armor,
+            service,
+            session_enctype,
+        })
+    }
+
+    /// A11-A13 for `kadmin/changepw` (module docs): the PDP with `armored =
+    /// true` — true by construction, the target holds this exchange's armor
+    /// — on `KerbResKind::ChangePassword`; the ticket profile (docs/53 §5.2):
+    /// it starts now, ends no later than the start plus
+    /// [`CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS`] (and the accounts'
+    /// expiry), is never renewable, forwardable or proxiable whatever the
+    /// options ask — keyd adds INITIAL and PRE-AUTHENT itself (RFC 4120 2.1);
+    /// then keyd's `issue_as_rep` under the armor with the service's key set
+    /// as the server key and the requested sname, which the KDC never
+    /// canonicalises ([MS-KILE] 3.3.5.1.2).
+    /// Spec: docs/53 R53-6, §5.2; RFC 4120 2.1, 3.1.3 ("The flags field of
+    /// the new ticket will have the following options set if they have been
+    /// requested and if the policy of the local realm allows"; the server
+    /// principal's maximum life); docs/48 §4.2; A-117.
+    #[allow(clippy::too_many_arguments)]
+    fn issue_change_password_ticket<S>(
+        &mut self,
+        body: &KdcReqBody,
+        checked: &CheckedRequest<S>,
+        proof: &AuthnProof,
+        target: ChangePasswordTarget,
+        peer: Peer,
+        now: &KerberosTime,
+        policy: &PolicyInputs<'_>,
+    ) -> Result<AsRepParts, Refusal> {
+        let account = &checked.account;
+        let keyd_config = self.custody.config();
+        let skew = keyd_config.clock_skew_secs;
+        let ticket_policy = keyd_config.ticket_policy;
+
+        // The PDP (docs/53 §5.2: `KdcAs` on this service, armored).
+        enforce(
+            Question {
+                action: Action::KdcAs,
+                client: account,
+                resource: Resource::Kerberos {
+                    kind: KerbResKind::ChangePassword,
+                },
+                ticket_age: Duration::ZERO,
+                src_net: peer.src_net,
+                now,
+                armored: true,
+            },
+            policy,
+            &mut self.rate,
+        )
+        .map_err(|reason| Refusal::new(KDC_ERR_POLICY, reason))?;
+
+        // The profile: one more endtime cap, no renewal (docs/53 §5.2).
+        let mut end_caps = vec![seconds(now) + i64::from(CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS)];
+        end_caps.extend(
+            account
+                .state
+                .expires
+                .iter()
+                .chain(target.service.state.expires.iter())
+                .map(seconds),
+        );
+        let planned = plan(
+            now,
+            &LifetimeRequest {
+                from: body.from.as_ref(),
+                till: &body.till,
+                rtime: body.rtime.as_ref(),
+                flags: FlagRequests::of(body.kdc_options),
+            },
+            &Limits {
+                policy: ticket_policy,
+                skew_secs: skew,
+                end_caps,
+                renew_caps: Vec::new(),
+                renewable_permitted: false,
+            },
+        )
+        .map_err(time_refusal)?;
+
+        // keyd issues under the armor (docs/53 §5.2; docs/48 §4.1 A13).
+        let cname = body
+            .cname
+            .clone()
+            .ok_or_else(|| internal(AuditReason::InternalFailure))?;
+        let sname = body
+            .sname
+            .clone()
+            .ok_or_else(|| internal(AuditReason::InternalFailure))?;
+        let template = AsTicketTemplate {
+            client: account.key.principal,
+            crealm: body.realm.clone(),
+            cname,
+            sname,
+            starttime: None,
+            endtime: planned.endtime,
+            renew_till: None,
+            flags: TicketFlags::empty(),
+            session_enctype: target.session_enctype,
+            nonce: body.nonce,
+        };
+        self.custody
+            .issue_as_rep(
+                &account.key,
+                &target.service.key,
+                proof,
+                Some(target.armor),
+                &template,
+                now,
+            )
             .map_err(issue_refusal)
     }
 }

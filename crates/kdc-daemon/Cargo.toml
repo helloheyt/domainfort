@@ -116,7 +116,10 @@ ipc-audit-client = { path = "../ipc-audit-client", features = ["test-seams"] }
 # does. Every one is a workspace crate or already in the lock.
 keyd-daemon = { path = "../keyd-daemon", features = ["test-seams"] }
 directory-daemon = { path = "../directory-daemon", features = ["test-seams"] }
-keyd = { path = "../keyd" }
+# `test-seams` (docs/52 C18; docs/questions/Q-843 item 2): the tests build keyd
+# with a deterministic entropy source (`Keyd::with_entropy`, directly or through
+# the reused crates/kdc tests/common fixtures). Dev-only (resolver 2).
+keyd = { path = "../keyd", features = ["test-seams"] }
 krb-crypto = { path = "../krb-crypto" }
 # `test-seams` (A-113, R15): the reused dird support opens its store by path
 # (`Store::open`); without it `cargo test -p kdc-daemon` alone did not build

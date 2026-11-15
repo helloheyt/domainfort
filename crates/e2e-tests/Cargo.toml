@@ -57,7 +57,10 @@ ipc-keyd = { path = "../ipc-keyd" }
 ipc-directory = { path = "../ipc-directory" }
 ipc-ldap = { path = "../ipc-ldap" }
 policy-store = { path = "../policy-store" }
-keyd = { path = "../keyd" }
+# `test-seams` (docs/52 C18; docs/questions/Q-843 item 2): the tests build keyd
+# with a deterministic entropy source (`Keyd::with_entropy`, directly or through
+# the reused crates/kdc tests/common fixtures). Dev-only (resolver 2).
+keyd = { path = "../keyd", features = ["test-seams"] }
 keyd-types = { path = "../keyd-types" }
 kdc = { path = "../kdc" }
 krb-proto = { path = "../krb-proto" }

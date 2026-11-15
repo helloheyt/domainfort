@@ -18,6 +18,7 @@
 //! | audit | [`AuditRecord`], [`AuditOutcome`], [`AuditReason`], [`AuditKeyRef`], [`AuditSink`] |
 //! | time scale | [`kerberos_time_seconds`] |
 //! | the KDC's custody seam | [`KeyCustody`] |
+//! | the sealed key store's persisted format (task KL1, A-143) | [`sealed_store`]: [`StoreId`], [`sealed_store::KeyRecordAad`], [`sealed_store::KeyRecord`], [`sealed_store::StoreHeader`], [`sealed_store::SealingSuite`] |
 //!
 //! # Why a separate crate (D182; decision A-63)
 //!
@@ -72,6 +73,7 @@ mod error;
 mod fast_armor;
 pub mod grant;
 pub mod model;
+pub mod sealed_store;
 mod service_ticket;
 mod tgs_exchange;
 mod time;
@@ -107,6 +109,7 @@ pub use model::{
     PrincipalBinding, PrincipalId, ServiceKeyHandle, ADMIN_SERVICE_CLASS,
     CHANGE_PASSWORD_SERVICE_NAME,
 };
+pub use sealed_store::StoreId;
 pub use service_ticket::{
     AppBinding, OperationDigest, OperationTicket, ServiceContext, OPERATION_DIGEST_LEN,
 };

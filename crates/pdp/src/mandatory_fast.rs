@@ -45,7 +45,9 @@
 //! - "TGT only" is enforced by the KDC (the phase-1 AS issues TGTs only,
 //!   docs/48 §7.3). Here the bootstrap Allow names the TGT as well, but no
 //!   Deny names a non-TGT AS target (the resource matcher has no negation),
-//!   so a broader Allow could grant one.
+//!   so a broader Allow could grant one. For the one non-TGT AS target the
+//!   KDC serves — the change-password service — the explicit Deny is
+//!   [`crate::change_password_as_rules`] (task K5; docs/53 §5.2, A-142).
 //! - That `armored` is true only after keyd verified the armor is the PEP's
 //!   contract (docs/48 §4.2, R48-10; docs/11 P3).
 

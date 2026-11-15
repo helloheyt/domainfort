@@ -1,0 +1,47 @@
+# ipc-dns-server — dird's side of the dnsd ↔ dird channel (`dird-dns.sock`):
+# the zone of a connection from dnsd's peer uid, and a pure dispatcher that
+# decodes a request body, asks the host (dird) for the answer, and encodes
+# the reply — `Pong` naming the connection's zone, the zone description, the
+# validated zone image in chunks, dird's answer to a forwarded message
+# (docs/54 §4.6, as amended by decision A-140; build task DN7).
+#
+# A skeleton: no socket, no thread, no clock, no directory, no keyd. The
+# host trait is what dird implements in task DN10 (the DNS thread and its
+# bounded queue, the zone projection, the DNS PEP of task DN8).
+#
+# A separate crate, not a feature of ipc-dns: cargo unifies a package's
+# features across one build, so a `server` feature turned on for dird would
+# also be on for dnsd in a workspace build (the reason A-63 split
+# ipc-keyd-server, A-68 ipc-directory-server and P10 ipc-ldap-server). Only
+# the dird daemon depends on this crate; dnsd never does (checked by
+# crates/ipc-dns tests/no_store_dependency.rs).
+#
+# Written only from this project's decided design — docs/54 (§4.1–§4.8,
+# §6.6), docs/research/r3-c-dns.md (§4.1, §4.4), decisions A-114, A-119,
+# A-140, docs/50 (R50-3, R50-7, §3.2, §3.3, §7.5), docs/52 §7 R14 — and the
+# code of this project's crates (ipc, ipc-dns; ipc-ldap-server as the
+# pattern). No other implementation, DNS server or RPC framework was
+# consulted or recalled (AGENTS.md §1-3).
+
+[package]
+name = "ipc-dns-server"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Framing, the envelope, the shared `Refused` (docs/50 §3.3; A-59).
+ipc = { path = "../ipc" }
+# The channel: message sets, bounds, the image transfer, the codec.
+ipc-dns = { path = "../ipc-dns" }
+
+[dev-dependencies]
+# TESTS ONLY: the in-process loopback connection returns its reply bodies in
+# the zeroizing buffer ipc-dns's `Connection::receive` returns (RustCrypto
+# `zeroize`, OD-9; already in the lock and in ipc-dns's graph). The zone
+# images and messages are built through ipc-dns's re-exports of parse-dns
+# and dns-zone types.
+zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
+
+[lints]
+workspace = true

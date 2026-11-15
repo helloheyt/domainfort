@@ -1,0 +1,58 @@
+# cargo-fuzz harness for ipc-dns (AGENTS.md §6: every parser gets a fuzz
+# target before it merges to main; docs/54 §4.6, §10.3 name
+# `ipc_dns_request` / `ipc_dns_reply`).
+#
+# This is a SEPARATE workspace (note the empty [workspace] table below): it is
+# intentionally NOT a member of the root workspace, so `cargo build --all`,
+# `cargo clippy`, `cargo test`, `cargo deny` and the SBOM in the product
+# workspace never pull in the fuzzing-only dependencies. It is built only via
+# `cargo fuzz run ipc_dns_request` / `cargo fuzz run ipc_dns_reply` (nightly
+# + cargo-fuzz).
+#
+# The checks of each target live in `bodies/`, shared with the crate's
+# `tests/fuzz_bodies.rs`, so they compile and hold in every `cargo test`.
+#
+# NOTE FOR REVIEW: libfuzzer-sys is fuzz-harness-only test infrastructure, not
+# linked into any product crate, and on the license allowlist (MIT / Apache-2.0,
+# AGENTS.md §7). Pending owner sign-off (docs/questions/PENDING-OWNER.md P-1);
+# not built or run until then.
+
+[package]
+name = "ipc-dns-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ipc]
+path = "../../ipc"
+
+[dependencies.ipc-dns]
+path = ".."
+
+# dird's side: an arbitrary request body through the ipc layer and
+# `ipc_dns::decode_request`, with the canonical round-trip property and the
+# refusal table (`cargo fuzz run ipc_dns_request`).
+[[bin]]
+name = "ipc_dns_request"
+path = "fuzz_targets/ipc_dns_request.rs"
+test = false
+doc = false
+bench = false
+
+# dnsd's side: an arbitrary reply body, decoded as the client decodes it, and
+# the same octets as a zone-image payload (`cargo fuzz run ipc_dns_reply`).
+[[bin]]
+name = "ipc_dns_reply"
+path = "fuzz_targets/ipc_dns_reply.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the root workspace (see header).
+[workspace]

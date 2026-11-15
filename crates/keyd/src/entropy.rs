@@ -10,9 +10,11 @@
 //! weaker.
 //!
 //! The [`EntropySource`] trait exists so that tests can inject a
-//! deterministic source. ONLY [`OsEntropy`] may be used outside tests;
+//! deterministic source. ONLY [`OsEntropy`] is used outside tests:
 //! `Keyd::new` always uses it, and the injecting constructor
-//! `Keyd::with_entropy` is documented as test-only.
+//! `Keyd::with_entropy` exists only with the feature `test-seams`, which
+//! only `[dev-dependencies]` enable — a product build has no way to give
+//! keyd another source (docs/52 C18; docs/questions/Q-843 item 2).
 //!
 //! Residual: the quality of `/dev/urandom` early in boot (before the kernel
 //! pool is initialized) is the platform's responsibility; the keyd daemon

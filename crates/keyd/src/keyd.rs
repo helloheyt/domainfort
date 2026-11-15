@@ -147,7 +147,7 @@ impl<S: KeyStore, A: AuditSink> Keyd<S, A, OsEntropy> {
         audit: A,
         started_at: &KerberosTime,
     ) -> Result<Self, ConfigError> {
-        Self::with_entropy(config, store, audit, OsEntropy::new(), started_at)
+        Self::build(config, store, audit, OsEntropy::new(), started_at)
     }
 }
 
@@ -155,13 +155,38 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// Build keyd with an injected entropy source; `started_at` as for
     /// [`Keyd::new`].
     ///
-    /// **TESTS ONLY.** Production code must use [`Keyd::new`], which uses
-    /// the kernel CSPRNG ([`OsEntropy`]). A deterministic source makes every
-    /// session key and long-term key predictable.
+    /// **TESTS ONLY — and only in test builds.** It exists only with the
+    /// feature `test-seams`, which only `[dev-dependencies]` enable (cargo's
+    /// resolver 2 turns a dev-dependency's features on only in builds of
+    /// test targets): a product build of keyd, or of any daemon linking it,
+    /// has no constructor that accepts an entropy source other than the
+    /// kernel CSPRNG ([`OsEntropy`], through [`Keyd::new`]). A deterministic
+    /// source makes every session key and long-term key predictable.
     ///
-    /// Spec: AGENTS.md §6 (never implement an RNG; approved sources only);
-    /// RFC 4120 3.2.3; docs/50 R50-6.
+    /// Class C18 ("a product API exposes a test seam", docs/52 §3.18): the
+    /// seam is removed from the product build, not documented away — the
+    /// pattern of A-113 / R15, checked by crates/e2e-tests
+    /// `tests/no_test_seams_in_product.rs`.
+    ///
+    /// Spec: AGENTS.md §6 (never implement an RNG; approved sources only),
+    /// §6.1; docs/questions/Q-843 item 2; docs/research/r4-a CI2; docs/52
+    /// §3.18, §7 R15; RFC 4120 3.2.3; docs/50 R50-6.
+    #[cfg(feature = "test-seams")]
     pub fn with_entropy(
+        config: KeydConfig,
+        store: S,
+        audit: A,
+        entropy: E,
+        started_at: &KerberosTime,
+    ) -> Result<Self, ConfigError> {
+        Self::build(config, store, audit, entropy, started_at)
+    }
+
+    /// The one construction path behind [`Keyd::new`] (and, in test builds,
+    /// `Keyd::with_entropy`). Private: a product build reaches it only with
+    /// [`OsEntropy`].
+    /// Spec: docs/10 §11; AGENTS.md §6; RFC 4120 3.2.3; docs/50 R50-6.
+    fn build(
         config: KeydConfig,
         store: S,
         audit: A,

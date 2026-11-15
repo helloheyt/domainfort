@@ -41,6 +41,18 @@
 //!   exception (docs/48 §7.3): a computer account ([`AccountKind::Computer`]
 //!   with [`ArmorPolicy::BootstrapAllowed`]) may get its TGT unarmored with
 //!   PA-ENC-TIMESTAMP.
+//! - **The change-password service (task K5; docs/53 §5.2; A-117, A-142):**
+//!   besides TGTs, the AS issues tickets for `kadmin/changepw` (RFC 3244 §2)
+//!   — recognised by keyd's one name rule
+//!   (`keyd_types::is_change_password_service_name`, A-139), never
+//!   canonicalised ([MS-KILE] 3.3.5.1.2) — on the armored path only (the
+//!   unarmored path has no value naming that service: an unarmored AS for
+//!   it is not expressible, and is answered with the FAST-only
+//!   KDC_ERR_PREAUTH_REQUIRED for every client), to user accounts only,
+//!   under the ticket profile (≤ 300 s, never renewable / forwardable /
+//!   proxiable; INITIAL set by keyd); the PDP sees
+//!   `KerbResKind::ChangePassword`. The TGS refuses the name
+//!   (KDC_ERR_POLICY).
 //! - **Pre-authentication is mandatory:** inside FAST, the encrypted
 //!   challenge (RFC 6113 5.4.6) verified inside keyd, the reply key always
 //!   strengthened; unarmored (the bootstrap only), PA-ENC-TIMESTAMP verified
@@ -85,7 +97,9 @@
 //! TGS request, PAC (phase 2, D124), S4U / constrained delegation,
 //! user-to-user, renewal, validation, forwarded / proxy tickets,
 //! postdating, cross-realm referrals, ticket addresses, authorization data,
-//! name canonicalisation (RFC 6806), kpasswd.
+//! name canonicalisation (RFC 6806), the kpasswd service itself (RFC 3244
+//! framing and the password change are kpasswd-front, dird and keyd's;
+//! docs/53 §4) — this crate only issues the `kadmin/changepw` ticket.
 //!
 //! # Follow-ups
 //!
@@ -115,7 +129,15 @@
 //!   KDC_ERR_PREAUTH_FAILED (RFC 4120 names no other code for it).
 //! - **Error codes for phase-1 refusals** (cross-realm, AS for a non-TGS
 //!   service, TGS for a TGT, addresses) are this crate's choices among the
-//!   RFC 4120 7.5.9 codes (docs/questions/Q-070, accepted as A-27).
+//!   RFC 4120 7.5.9 codes (docs/questions/Q-070, accepted as A-27); the
+//!   TGS for `kadmin/changepw` (KDC_ERR_POLICY) and the armored AS for it
+//!   by a computer (KDC_ERR_POLICY) follow docs/53 §5.2 (task K5).
+//! - **The `kadmin/changepw` ticket before keyd task K3b:** keyd's
+//!   `issue_as_rep` accepts only the krbtgt key set as the server today, so
+//!   the AS for the change-password service ends in keyd's refusal
+//!   (KRB_ERR_GENERIC, armored) — fail closed — until keyd takes that
+//!   service's key set and enforces the profile itself
+//!   (docs/questions/Q-915).
 //! - **Retransmit cache:** a full cache stores nothing more; an identical
 //!   TGS-REQ retransmitted then is refused by keyd's replay cache (fail
 //!   closed). An identical request within the window (keyd's clock skew)
@@ -164,7 +186,13 @@
 //! docs/questions/PENDING-OWNER.md (A-17, A-19, A-22, A-23, A-24..A-27,
 //! A-32, A-33, A-39, A-42, A-43, A-56, P-10), docs/questions/Q-120..Q-127,
 //! Q-130, Q-145, Q-150, Q-217, Q-222, Q-240; docs/50 (R50-6, R50-8, §3.4,
-//! §3.5, §3.7, §7.5); and the source and documentation of this project's own
+//! §3.5, §3.7, §7.5); for task K5 (the `kadmin/changepw` ticket): RFC 3244
+//! (pinned copy, sha256 45b9130f…c378) §1-§2, RFC 4120 2.1 and 3.1.3 again,
+//! RFC 6113 Abstract and 5.4, [MS-KILE] v20261110 (pinned PDF sha256
+//! 58b84892…e3c7) 3.3.5.1.2, docs/53 (R53-1, R53-6, §5.2, §10), PENDING-OWNER
+//! A-117, A-121, A-126, A-139, A-142, docs/questions/Q-601, Q-608,
+//! docs/research/r3-e (R3E-2), r3-a (R3A-5); and the source and
+//! documentation of this project's own
 //! crates keyd, keyd-types, pdp, krb-proto and dtyp. The custody seam moved
 //! to keyd-types and `LocalKeyd` to keyd (D182; decision A-63,
 //! docs/questions/Q-245 item 3) — code moved, not rewritten. No other

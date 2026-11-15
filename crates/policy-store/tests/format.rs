@@ -17,12 +17,13 @@ mod common;
 
 use common::*;
 use pdp::{
-    mandatory_fast_rules, Action, ActionMatch, AuthMatch, ContextMatch, Dn, Effect, IpScope,
-    KerbResKind, Match, PolicyVersion, ResourceMatch, Rule, RuleError, RuleId, SubjectMatch, Tier,
-    MANDATORY_FAST_RULE_COUNT,
+    change_password_as_rules, mandatory_fast_rules, Action, ActionMatch, AuthMatch, ContextMatch,
+    Dn, Effect, IpScope, KerbResKind, Match, PolicyVersion, ResourceMatch, Rule, RuleError, RuleId,
+    SubjectMatch, Tier, CHANGE_PASSWORD_AS_RULE_COUNT, MANDATORY_FAST_RULE_COUNT,
 };
 use policy_store::{
-    codes, DevelopmentPolicy, PolicyError, FORMAT, MARKER, MAX_POLICY_FILE, SUPERSEDED_FORMAT,
+    codes, DevelopmentPolicy, PolicyError, FORMAT, MARKER, MAX_POLICY_FILE, RESERVED_RULE_COUNT,
+    SUPERSEDED_FORMAT,
 };
 
 /// docs/50 §3.3 (round trip; "a single encoding per value"), §7.2; A-36:
@@ -229,6 +230,55 @@ fn a_hand_written_rule_decodes_as_documented() {
         }]
     );
     assert_eq!(policy.encode().unwrap(), file);
+}
+
+/// The layout of the crate documentation (`6 Kerberos kind:Option<… | 2
+/// ChangePassword>`, wire.rs), octet by octet: the change-password
+/// service's resource kind (docs/53 §5.2, task K5) is code 2 with no
+/// payload; the next code is unknown and refuses the file (docs/50 §3.3:
+/// closed table).
+#[test]
+fn the_change_password_kind_decodes_as_documented() {
+    let resource = |kind: u8| {
+        Raw::default()
+            .u8(codes::resource_match::KERBEROS)
+            .u8(1) // Some
+            .u8(kind)
+            .0
+    };
+    let rule = |kind: u8| {
+        Raw::default()
+            .u32(7)
+            .u8(1) // Deny
+            .u8(codes::action_match::EXACT)
+            .u8(11) // KdcAs
+            .raw(&resource(kind))
+            .u8(codes::subject_match::ANY)
+            .u8(0)
+            .u8(0)
+            .u8(0) // min_transport
+            .u8(0) // src_net: absent
+            .u8(0) // time_window: absent
+            .u8(1)
+            .u8(0) // armored: Some(false)
+            .u32(0) // no obligation
+            .0
+    };
+    let file = |kind: u8| raw_file(&[], &[], &bootstrap().encode(), 100, &[rule(kind)], &[]);
+    assert_eq!(codes::kerberos_kind::CHANGE_PASSWORD, 2);
+    let policy = DevelopmentPolicy::decode(&file(2)).unwrap();
+    assert_eq!(
+        policy.rules[0].when.resource,
+        ResourceMatch::Kerberos {
+            kind: Some(KerbResKind::ChangePassword)
+        }
+    );
+    assert_eq!(policy.rules[0].when.auth, AuthMatch::UNARMORED);
+    assert_eq!(policy.encode().unwrap(), file(2));
+    assert!(matches!(
+        DevelopmentPolicy::decode(&file(3)),
+        Err(PolicyError::Structure(_))
+    ));
 }
 
 /// A-51 (crates/pdp policy.rs: "a loader that met a `RuleError` builds no
@@ -445,8 +495,9 @@ fn bad_rule_values_are_refused() {
 }
 
 /// Rule ids identify the rule in the audit record of a coarse deny (crates/
-/// pdp policy.rs): unique, and outside the mandatory-FAST range; the range
-/// must fit in `u32`.
+/// pdp policy.rs): unique, and outside the range of the default Kerberos
+/// rule set — the mandatory-FAST set and, after it, the change-password
+/// service's AS set (task K5; docs/53 §5.2) — which must fit in `u32`.
 #[test]
 fn rule_ids_are_unique_and_clear_of_the_fast_range() {
     let any = Raw::default().u8(codes::resource_match::ANY).0;
@@ -455,13 +506,20 @@ fn rule_ids_are_unique_and_clear_of_the_fast_range() {
         let raw: Vec<Vec<u8>> = rules.iter().map(|id| raw_rule(*id, &any)).collect();
         DevelopmentPolicy::decode(&raw_file(&[], &[], &boot, first, &raw, &[]))
     };
-    assert!(ids(&[1, 2, 99, 104], 100).is_ok());
+    assert_eq!(
+        RESERVED_RULE_COUNT,
+        MANDATORY_FAST_RULE_COUNT + CHANGE_PASSWORD_AS_RULE_COUNT
+    );
+    assert!(ids(&[1, 2, 99, 100 + RESERVED_RULE_COUNT], 100).is_ok());
     assert_eq!(ids(&[1, 1], 100), Err(PolicyError::RuleId));
-    for inside in 100..100 + MANDATORY_FAST_RULE_COUNT {
+    for inside in 100..100 + RESERVED_RULE_COUNT {
         assert_eq!(ids(&[inside], 100), Err(PolicyError::RuleId), "{inside}");
     }
-    assert_eq!(ids(&[], u32::MAX - 2), Err(PolicyError::Bootstrap));
-    assert!(ids(&[], u32::MAX - (MANDATORY_FAST_RULE_COUNT - 1)).is_ok());
+    assert_eq!(
+        ids(&[], u32::MAX - (RESERVED_RULE_COUNT - 2)),
+        Err(PolicyError::Bootstrap)
+    );
+    assert!(ids(&[], u32::MAX - (RESERVED_RULE_COUNT - 1)).is_ok());
     // The bootstrap packet must be a SID.
     assert_eq!(
         DevelopmentPolicy::decode(&raw_file(&[], &[], &[1, 0], 100, &[], &[])),
@@ -470,9 +528,11 @@ fn rule_ids_are_unique_and_clear_of_the_fast_range() {
 }
 
 /// docs/11 §6 (P9, D39); docs/50 §3.4 (the version every view carries);
-/// docs/48 §7.2 (the mandatory-FAST set is policy data): the snapshot has
-/// the file's version, the FAST set of the bootstrap group first, then the
-/// file's rules in order, and the anonymous allowlist.
+/// docs/48 §7.2 (the mandatory-FAST set is policy data); docs/53 §5.2 (task
+/// K5: the change-password service's AS set, for the same group, after
+/// it): the snapshot has the file's version, the FAST set of the bootstrap
+/// group first, then the change-password set, then the file's rules in
+/// order, and the anonymous allowlist.
 #[test]
 fn the_snapshot_carries_the_version_the_fast_set_and_the_rules() {
     let policy = sample_policy();
@@ -480,9 +540,14 @@ fn the_snapshot_carries_the_version_the_fast_set_and_the_rules() {
     assert_eq!(decoded.version, PolicyVersion(42));
     let snapshot = decoded.snapshot().unwrap();
     assert_eq!(snapshot.version(), PolicyVersion(42));
-    let fast = mandatory_fast_rules(bootstrap(), RuleId(100)).unwrap();
+    let mut fast = mandatory_fast_rules(bootstrap(), RuleId(100)).unwrap();
+    assert_eq!(fast.len(), MANDATORY_FAST_RULE_COUNT as usize);
+    fast.extend(
+        change_password_as_rules(bootstrap(), RuleId(100 + MANDATORY_FAST_RULE_COUNT)).unwrap(),
+    );
     let count = fast.len();
-    assert_eq!(count, MANDATORY_FAST_RULE_COUNT as usize);
+    assert_eq!(count, RESERVED_RULE_COUNT as usize);
+    assert_eq!(decoded.mandatory_fast.rules().unwrap(), fast);
     assert_eq!(&snapshot.rules()[..count], fast.as_slice());
     assert_eq!(&snapshot.rules()[count..], every_rule_type().as_slice());
     assert_eq!(snapshot.anonymous_allowlist(), &[root_dse_grant()]);

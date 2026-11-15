@@ -195,6 +195,9 @@ pub mod kerberos_kind {
     pub const TGT: u8 = 0;
     /// `KerbResKind::Service(spn: text)`.
     pub const SERVICE: u8 = 1;
+    /// `KerbResKind::ChangePassword` (no payload). Spec: docs/53 §5.2 (task
+    /// K5); crates/pdp model.rs.
+    pub const CHANGE_PASSWORD: u8 = 2;
 }
 
 /// The kinds of `SubjectMatch`. Spec: docs/11 §3; docs/48 §7.2 (NotMemberOf).

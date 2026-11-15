@@ -46,5 +46,21 @@ krb-proto = { path = "../krb-proto" }
 # wipes plaintext passwords, session keys and key-bearing buffers on drop.
 zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
 
+[features]
+# docs/52 C18 (docs/questions/Q-843 item 2; r4-a CI2): the test seam
+# `Keyd::with_entropy` — a constructor that accepts any entropy source —
+# exists only in a build that asks for it. Only `[dev-dependencies]` enable
+# this feature (cargo's resolver 2 turns a dev-dependency's features on only
+# in builds of test targets), so no product build of keyd, or of a daemon
+# that links it, can give keyd a source other than the kernel CSPRNG;
+# crates/e2e-tests tests/no_test_seams_in_product.rs checks every Cargo.toml
+# and every product source. Never in `default`.
+test-seams = []
+
+[dev-dependencies]
+# TESTS ONLY (docs/52 C18): this crate's own tests inject a deterministic
+# entropy source through `Keyd::with_entropy`.
+keyd = { path = ".", features = ["test-seams"] }
+
 [lints]
 workspace = true

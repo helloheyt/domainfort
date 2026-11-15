@@ -85,11 +85,20 @@ pub enum AuditReason {
     /// AS-REQ without cname, or a request without sname.
     /// Spec: RFC 4120 5.4.1.
     MissingName,
-    /// The AS-REQ names a server other than this realm's TGS.
-    /// Spec: docs/30 §2 (the AS exchange issues TGTs).
+    /// The AS-REQ names a server other than this realm's TGS and the
+    /// change-password service.
+    /// Spec: docs/30 §2 (the AS exchange issues TGTs); docs/53 §5.2.
     AsServerNotTgs,
     /// The TGS-REQ asks for a TGS name of this realm. Spec: docs/10 §5.
     TgsForTgs,
+    /// An armored AS-REQ for the change-password service (`kadmin/changepw`)
+    /// by a client that is not a user account (a computer — and so every
+    /// service object, R47-13): refused before pre-authentication.
+    /// Spec: docs/53 R53-1 ("users only"), §5.2; A-117.
+    ChangePasswordNotUser,
+    /// The TGS-REQ asks for the change-password service: its tickets come
+    /// only from the AS (INITIAL). Spec: docs/53 R53-6, §5.2; RFC 4120 2.1.
+    TgsForChangePassword,
     /// A KDC option asks for an operation phase 1 does not implement.
     /// Spec: main-session decision 9.
     UnsupportedOption,
@@ -202,10 +211,12 @@ pub enum AuditReason {
     /// An internal encoding step failed.
     InternalFailure,
     /// FAST is required and the request carries no PA-FX-FAST: an unarmored
-    /// AS request for a principal that may not bootstrap (answered with a
+    /// AS request for a principal that may not bootstrap, or for the
+    /// change-password service by anyone (answered with a
     /// KDC_ERR_PREAUTH_REQUIRED that advertises only FAST; keyd is not
     /// asked), or an unarmored TGS request (KDC_ERR_POLICY).
-    /// Spec: docs/48 §7.2 layer 1; Q-125 item 11; P-10 interim.
+    /// Spec: docs/48 §7.2 layer 1; Q-125 item 11; P-10 interim; docs/53
+    /// §5.2, A-142.
     FastRequired,
     /// The request carries more than one PA-FX-FAST (ambiguous).
     /// Spec: docs/48 §4.1 A1; Q-125 item 3.

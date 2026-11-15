@@ -1009,3 +1009,38 @@ fn account_tier_equals_pip_tier() {
     assert_eq!(view.tier_of(&alice.sid, &alice.groups), Ok(alice.tier));
     assert_eq!(alice.tier, Tier::Tier1);
 }
+
+/// Task K5 over the directory — docs/53 §5.2 ("an unarmored AS to
+/// `kadmin/changepw` is refused for every principal"; "the TGS refuses the
+/// name (KDC_ERR_POLICY)"); A-142; RFC 6113 5.2, 5.4.2: the same unarmored
+/// AS-REQ of ws01$ — a computer that may bootstrap its TGT, so for krbtgt it
+/// is offered PA-ENC-TIMESTAMP — is, for `kadmin/changepw`, answered with
+/// the FAST-only KDC_ERR_PREAUTH_REQUIRED, and so is alice's; alice's
+/// armored TGS for `kadmin/changepw` is an armored KDC_ERR_POLICY.
+#[test]
+fn the_change_password_service_over_the_directory() {
+    let d = Dir::standard("changepw-kdc");
+    let mut kdc = kdc_for(&d);
+    let tiers = TierMap::empty();
+    let changepw = name(KRB_NT_SRV_INST, &["kadmin", "changepw"]);
+    for cname in [ws01_name(), alice_name()] {
+        let request = AsReq(KdcReq {
+            padata: None,
+            req_body: KdcReqBody {
+                sname: Some(changepw.clone()),
+                ..as_body(cname, 0x0D1_4749)
+            },
+        })
+        .encode()
+        .unwrap();
+        let error = error_of(send(&d, &mut kdc, &tiers, &request, now()));
+        assert_eq!(error.error_code, KDC_ERR_PREAUTH_REQUIRED);
+        let methods = MethodData::decode(error.e_data.as_deref().unwrap()).unwrap();
+        let types: Vec<i32> = methods.0.iter().map(|p| p.padata_type).collect();
+        assert_eq!(types, vec![PA_FX_FAST, PA_FX_COOKIE]);
+    }
+    let tgt = obtain_tgt(&d, &mut kdc, &tiers);
+    let reply = send(&d, &mut kdc, &tiers, &tgs_req(&tgt, changepw, at(1)), at(1));
+    let (error, _) = armored_error(reply, &tgs_armor_key(&tgt));
+    assert_eq!(error.error_code, KDC_ERR_POLICY);
+}

@@ -43,6 +43,13 @@
 //!    workspace, test code included. Every other test obtains an
 //!    acknowledged intent from a fake auditd through the real client
 //!    (crates/ipc-audit-client `tests/linked`).
+//! 5. keyd's entropy seam (docs/questions/Q-843 item 2; r4-a CI2; task
+//!    D1-b): `Keyd::with_entropy` — the constructor that accepts any entropy
+//!    source — carries `#[cfg(feature = "test-seams")]`, keyd's own
+//!    `[features]` has `test-seams = []` outside `default` (rule 2 then holds
+//!    for keyd like for every declaring crate), and no product source but
+//!    its definition names it — so a product build of keyd, or of any daemon
+//!    linking it, has only `Keyd::new`, fixed to the kernel CSPRNG.
 //!
 //! Comments are not code: `//` comments in sources and `#` comments in
 //! manifests are skipped. Files under a `tests/` directory and files named
@@ -69,9 +76,10 @@ const DAEMONS: [&str; 5] = [
 ];
 
 /// The crates that declare the feature: the daemons above, dirstore (its
-/// path-taking `Store::open`, A-113) and ipc-audit-client (the audit gate's
-/// link side, task R15b; moved from ipc-audit with the gate by task IB1).
-const DECLARING: [&str; 7] = [
+/// path-taking `Store::open`, A-113), ipc-audit-client (the audit gate's
+/// link side, task R15b; moved from ipc-audit with the gate by task IB1)
+/// and keyd (its entropy seam `Keyd::with_entropy`, Q-843 item 2 — rule 5).
+const DECLARING: [&str; 8] = [
     "keyd-daemon",
     "kdc-daemon",
     "directory-daemon",
@@ -79,7 +87,13 @@ const DECLARING: [&str; 7] = [
     "ldap-front",
     "dirstore",
     "ipc-audit-client",
+    "keyd",
 ];
+
+/// keyd's entropy seam (rule 5): the constructor, and the one file that
+/// defines it, relative to `crates/`.
+const ENTROPY_SEAM: &str = "with_entropy";
+const ENTROPY_SEAM_DEFINITION: &str = "keyd/src/keyd.rs";
 
 /// The library crates (not daemons: no `main.rs`) that declare a
 /// `test_seams` module in `src/lib.rs`, behind the feature (rule 1).
@@ -531,6 +545,91 @@ fn the_ipc_audit_scanner_sees_planted_uses() {
         "// ipc_audit_client::test_seams in a comment\nuse ipc_audit_client::{AuditGate};\n\
          use ipc_audit::{Ack};\nuse keyd_daemon::test_seams::serve;\n"
     ));
+}
+
+/// Rule 5 (docs/questions/Q-843 item 2; r4-a CI2): keyd's
+/// `Keyd::with_entropy` exists only with the feature, keyd declares the
+/// feature outside `default`, and no product source but the definition
+/// names the constructor in code.
+#[test]
+fn keyds_entropy_seam_is_behind_the_feature() {
+    let crates = crates_dir();
+    let definition =
+        std::fs::read_to_string(crates.join(ENTROPY_SEAM_DEFINITION)).expect("keyd.rs");
+    let lines: Vec<&str> = definition.lines().map(str::trim).collect();
+    let at = lines
+        .iter()
+        .position(|l| l.starts_with(&format!("pub fn {ENTROPY_SEAM}(")))
+        .expect("Keyd::with_entropy");
+    assert_eq!(
+        lines[at - 1],
+        format!("#[cfg(feature = \"{FEATURE}\")]"),
+        "keyd: Keyd::with_entropy is not behind the feature"
+    );
+    let manifest = std::fs::read_to_string(crates.join("keyd/Cargo.toml")).expect("keyd manifest");
+    let manifest = manifest_lines(&manifest);
+    assert!(
+        manifest
+            .iter()
+            .any(|(t, c)| t == "features" && c.replace(' ', "") == format!("{FEATURE}=[]")),
+        "keyd: no `{FEATURE} = []` in [features]"
+    );
+    assert!(
+        !manifest
+            .iter()
+            .any(|(t, c)| t == "features" && c.starts_with("default") && c.contains(FEATURE)),
+        "keyd: `{FEATURE}` in the default features"
+    );
+    // No product source but the definition names the constructor in code.
+    let mut violations = Vec::new();
+    let mut scanned = 0usize;
+    for dir in crate_dirs() {
+        let mut files = Vec::new();
+        product_sources(&dir.join("src"), &mut files);
+        for file in files {
+            scanned += 1;
+            let rel = file.strip_prefix(&crates).unwrap_or(&file).to_path_buf();
+            let text = std::fs::read_to_string(&file).expect("UTF-8 source");
+            let named = names_in_code(&text, ENTROPY_SEAM);
+            if rel == Path::new(ENTROPY_SEAM_DEFINITION) {
+                // Positive control: exactly the definition line.
+                assert_eq!(named.len(), 1, "{named:?}");
+                assert!(named[0].1.starts_with(&format!("pub fn {ENTROPY_SEAM}(")));
+                continue;
+            }
+            for (line, code) in named {
+                violations.push(format!("{}:{line}: {code}", rel.display()));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "a product source names `{ENTROPY_SEAM}` (Q-843 item 2): {violations:#?}"
+    );
+    assert!(scanned > 100, "{scanned}");
+}
+
+/// The lines of `text` that name `word` in code (outside `//` comments):
+/// `(line number, code)`.
+fn names_in_code(text: &str, word: &str) -> Vec<(usize, String)> {
+    text.lines()
+        .enumerate()
+        .filter_map(|(n, line)| {
+            let code = line.split("//").next().unwrap_or("");
+            code.contains(word).then(|| (n + 1, code.trim().to_owned()))
+        })
+        .collect()
+}
+
+/// Positive control of rule 5's scanner: a call in code is seen, a mention
+/// in a comment or a doc comment is not.
+#[test]
+fn the_entropy_seam_scanner_sees_planted_calls() {
+    let text = "/// Use `Keyd::with_entropy` in tests.\n// with_entropy here too\n\
+                let k = Keyd::with_entropy(c, s, a, e, &t)?;\n";
+    let found = names_in_code(text, ENTROPY_SEAM);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].0, 3);
 }
 
 /// Positive control of the scanners: a planted mention in code is seen, a

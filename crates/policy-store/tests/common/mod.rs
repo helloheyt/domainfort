@@ -261,6 +261,21 @@ pub fn every_rule_type() -> Vec<Rule> {
             },
             Vec::new(),
         ),
+        // The change-password service's resource kind (docs/53 §5.2, task
+        // K5).
+        rule(
+            13,
+            Effect::Deny,
+            Match {
+                action: ActionMatch::Exact(Action::KdcAs),
+                resource: ResourceMatch::Kerberos {
+                    kind: Some(KerbResKind::ChangePassword),
+                },
+                auth: AuthMatch::UNARMORED,
+                ..any_match()
+            },
+            Vec::new(),
+        ),
     ]
 }
 

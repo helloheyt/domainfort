@@ -11,9 +11,9 @@ use core::ops::RangeInclusive;
 use dtyp::Sid;
 use ipc::{FrameLimit, Reader, Writer};
 use pdp::{
-    mandatory_fast_rules, AnonymousGrant, ClaimValue, Dn, KerbResKind, PolicySnapshot,
-    PolicyVersion, ResourceMatch, Rule, RuleError, RuleId, SubjectMatch, Tier,
-    MANDATORY_FAST_RULE_COUNT,
+    change_password_as_rules, mandatory_fast_rules, AnonymousGrant, ClaimValue, Dn, KerbResKind,
+    PolicySnapshot, PolicyVersion, ResourceMatch, Rule, RuleError, RuleId, SubjectMatch, Tier,
+    CHANGE_PASSWORD_AS_RULE_COUNT, MANDATORY_FAST_RULE_COUNT,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -87,6 +87,7 @@ const FILE_LIMIT: FrameLimit = match FrameLimit::new(MAX_POLICY_FILE) {
 
 const _: () = assert!(MAX_SID as usize == 8 + 4 * dtyp::SID_MAX_SUB_AUTHORITIES);
 const _: () = assert!(MANDATORY_FAST_RULE_COUNT >= 1);
+const _: () = assert!(RESERVED_RULE_COUNT >= MANDATORY_FAST_RULE_COUNT);
 
 /// Why a policy file (or a policy value to be encoded) was refused. Carries
 /// no file content (docs/50 §8.2).
@@ -116,7 +117,9 @@ pub enum PolicyError {
     /// The mandatory-FAST bootstrap group SID did not decode, or its rule
     /// ids do not fit in `u32`.
     Bootstrap,
-    /// Two rules share an id, or a rule id lies in the mandatory-FAST range.
+    /// Two rules share an id, or a rule id lies in the range of the default
+    /// Kerberos rule set ([`RESERVED_RULE_COUNT`] ids from the
+    /// mandatory-FAST entry's first id).
     RuleId,
     /// A SID, text or DN component inside a rule or grant is invalid, or a
     /// time window is reversed.
@@ -154,12 +157,24 @@ impl fmt::Display for PolicyError {
 
 impl std::error::Error for PolicyError {}
 
+/// The number of consecutive rule ids the default Kerberos rule set takes
+/// from [`MandatoryFast::first_rule_id`]: the mandatory-FAST set
+/// (`pdp::mandatory_fast_rules`, docs/48 §7.2), then the change-password
+/// service's AS set (`pdp::change_password_as_rules`, docs/53 §5.2; task
+/// K5). A file rule may not use one of them.
+/// Spec: crates/pdp mandatory_fast.rs, change_password.rs; A-39; A-117.
+pub const RESERVED_RULE_COUNT: u32 = MANDATORY_FAST_RULE_COUNT + CHANGE_PASSWORD_AS_RULE_COUNT;
+
 /// The mandatory-FAST entry of the file: the bootstrap group whose expanded
 /// members may make the one unarmored exchange (an AS for a TGT, docs/48
-/// §7.3), and the first of the [`MANDATORY_FAST_RULE_COUNT`] consecutive
-/// rule ids the set takes. Which SID a deployment names is a deployment
-/// datum (Q-130 → A-39, with P-10); the file carries it.
-/// Spec: docs/48 §7.1-§7.3; crates/pdp mandatory_fast.rs; A-39; P-10.
+/// §7.3), and the first of the [`RESERVED_RULE_COUNT`] consecutive rule ids
+/// the default Kerberos rule set takes. Which SID a deployment names is a
+/// deployment datum (Q-130 → A-39, with P-10); the file carries it. The same
+/// SID is the computer group of the change-password service's AS rules —
+/// the role docs/48 §7.2 (i) gives the bootstrap group ("the computer
+/// group"); docs/53 §5.2 ("users only (a data rule)").
+/// Spec: docs/48 §7.1-§7.3; crates/pdp mandatory_fast.rs,
+/// change_password.rs; docs/53 §5.2; A-39; A-117; A-142; P-10.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MandatoryFast {
     /// The bootstrap-allowed group SID.
@@ -169,23 +184,32 @@ pub struct MandatoryFast {
 }
 
 impl MandatoryFast {
-    /// The rule ids the set takes, or `None` if they do not fit in `u32`.
-    /// Spec: crates/pdp `mandatory_fast_rules` ("`None` if the ids would
-    /// overflow").
+    /// The rule ids the default Kerberos rule set takes, or `None` if they
+    /// do not fit in `u32`.
+    /// Spec: crates/pdp `mandatory_fast_rules`, `change_password_as_rules`
+    /// ("`None` if the ids would overflow").
     #[must_use]
     pub fn rule_ids(&self) -> Option<RangeInclusive<u32>> {
-        let last = self
-            .first_rule_id
-            .0
-            .checked_add(MANDATORY_FAST_RULE_COUNT - 1)?;
+        let last = self.first_rule_id.0.checked_add(RESERVED_RULE_COUNT - 1)?;
         Some(self.first_rule_id.0..=last)
     }
 
-    /// The rule set (`pdp::mandatory_fast_rules`), or `None` on overflow.
-    /// Spec: docs/48 §7.2.
+    /// The default Kerberos rule set — `pdp::mandatory_fast_rules` from
+    /// `first_rule_id`, then `pdp::change_password_as_rules` for the same
+    /// group from the next free id — or `None` on overflow (no partial set).
+    /// Spec: docs/48 §7.2; docs/53 §5.2 (task K5); A-142.
     #[must_use]
     pub fn rules(&self) -> Option<Vec<Rule>> {
-        mandatory_fast_rules(self.bootstrap_group, self.first_rule_id)
+        let mut rules = mandatory_fast_rules(self.bootstrap_group, self.first_rule_id)?;
+        let next = self
+            .first_rule_id
+            .0
+            .checked_add(MANDATORY_FAST_RULE_COUNT)?;
+        rules.extend(change_password_as_rules(
+            self.bootstrap_group,
+            RuleId(next),
+        )?);
+        Some(rules)
     }
 }
 
@@ -252,7 +276,7 @@ fn valid_resource(resource: &ResourceMatch) -> bool {
         ResourceMatch::File { share } => valid_text(share.0.as_bytes()),
         ResourceMatch::Dns { zone } => valid_text(zone.0.as_bytes()),
         ResourceMatch::Kerberos { kind } => match kind {
-            None | Some(KerbResKind::Tgt) => true,
+            None | Some(KerbResKind::Tgt | KerbResKind::ChangePassword) => true,
             Some(KerbResKind::Service(spn)) => valid_text(spn.0.as_bytes()),
         },
         ResourceMatch::Policy { scope } => scope
@@ -397,15 +421,18 @@ impl DevelopmentPolicy {
         w.write_seq(&self.anonymous, MAX_ANONYMOUS_GRANTS, wire::write_grant)
     }
 
-    /// The `pdp::PolicySnapshot` of this policy: the mandatory-FAST rule set
-    /// of the bootstrap group first, then the file's rules in order, the
-    /// anonymous allowlist, the file's version (crate documentation).
+    /// The `pdp::PolicySnapshot` of this policy: the default Kerberos rule
+    /// set of the bootstrap group first ([`MandatoryFast::rules`]: the
+    /// mandatory-FAST set, then the change-password service's AS set), then
+    /// the file's rules in order, the anonymous allowlist, the file's version
+    /// (crate documentation).
     ///
     /// # Errors
     /// [`PolicyError`] from [`DevelopmentPolicy::validate`] (a policy that
     /// decoded always validates).
     ///
-    /// Spec: docs/11 §3, §6 (P9, D39); docs/48 §7.2; A-39; A-51.
+    /// Spec: docs/11 §3, §6 (P9, D39); docs/48 §7.2; docs/53 §5.2 (task
+    /// K5); A-39; A-51; A-142.
     pub fn snapshot(&self) -> Result<PolicySnapshot, PolicyError> {
         self.validate()?;
         let mut rules = self.mandatory_fast.rules().ok_or(PolicyError::Bootstrap)?;

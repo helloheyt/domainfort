@@ -38,8 +38,10 @@
 //!    no sname → KDC_ERR_S_PRINCIPAL_UNKNOWN (5.4.1: sname may only be
 //!    absent with ENC-TKT-IN-SKEY, refused); this realm's TGS name →
 //!    KDC_ERR_POLICY (phase 1 issues no TGT from a TGT; keyd refuses it,
-//!    docs/10 §5); starttime beyond the skew → KDC_ERR_CANNOT_POSTDATE
-//!    (3.3.3);
+//!    docs/10 §5); the change-password service `kadmin/changepw` →
+//!    KDC_ERR_POLICY (its tickets come only from an armored AS, docs/53
+//!    §5.2; keyd's `issue_tgs_rep` refuses its key set too); starttime
+//!    beyond the skew → KDC_ERR_CANNOT_POSTDATE (3.3.3);
 //! 7. re-evaluation at use (D53, decision 8): the client account is read
 //!    again — source failure → KRB_ERR_GENERIC (unreachable →
 //!    KDC_ERR_SVC_UNAVAILABLE); gone, disabled, locked or
@@ -70,9 +72,9 @@
 //!
 //! Spec: RFC 4120 3.2.3, 3.3.2, 3.3.3, 3.3.3.1, 5.2.7.1, 5.4.1, 5.4.2, 7.5.9;
 //! RFC 6113 5.4.1.1, 5.4.2, 5.4.3, 5.4.4, 7.3; docs/30 §3; docs/10 §5, §5א;
-//! docs/48 §5, §6, §7.2; docs/25 §4 (D53); docs/50 §3.7 (R50-8);
-//! docs/questions/Q-124, Q-125 (A-32), Q-150 (A-43), Q-217 (A-56);
-//! main-session decisions 3-10, 13; A-25, A-26.
+//! docs/48 §5, §6, §7.2; docs/25 §4 (D53); docs/50 §3.7 (R50-8); docs/53
+//! §5.2 (task K5); docs/questions/Q-124, Q-125 (A-32), Q-150 (A-43), Q-217
+//! (A-56); main-session decisions 3-10, 13; A-25, A-26, A-117.
 
 use crate::accounts::AccountSource;
 use crate::as_exchange::has_unsupported_content;
@@ -281,6 +283,17 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
             ServerNameKind::Service => {}
             ServerNameKind::LocalTgs => {
                 return Err(Refusal::new(KDC_ERR_POLICY, AuditReason::TgsForTgs))
+            }
+            // docs/53 §5.2 ("the TGS refuses the name (KDC_ERR_POLICY, as
+            // R4)"): a ticket for the change-password service comes only
+            // from an armored AS, with INITIAL (RFC 4120 2.1) — never from a
+            // TGT, so a stolen TGT is never a password change. keyd's
+            // `issue_tgs_rep` refuses that key set too (second layer).
+            ServerNameKind::ChangePassword => {
+                return Err(Refusal::new(
+                    KDC_ERR_POLICY,
+                    AuditReason::TgsForChangePassword,
+                ))
             }
             ServerNameKind::ForeignTgs => {
                 return Err(Refusal::new(

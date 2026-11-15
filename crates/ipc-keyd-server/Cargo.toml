@@ -79,6 +79,11 @@ zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
 # TESTS ONLY: this crate with the loopback `dispatch`; dev-dependencies are
 # not linked into a daemon.
 ipc-keyd-server = { path = ".", features = ["loopback"] }
+# TESTS ONLY (docs/52 C18; docs/questions/Q-843 item 2): the kdc flow builds
+# keyd with a deterministic entropy source (`Keyd::with_entropy`, behind
+# keyd's `test-seams`). Beside the normal entry; a dev-dependency feature,
+# never in a product build (resolver 2).
+keyd = { path = "../keyd", features = ["test-seams"] }
 # TESTS ONLY (task R15b, docs/questions/Q-630): the proof
 # `execute_acknowledged` takes comes only through the real audit client
 # (crate ipc-audit-client, a normal dependency above) from an auditd's `Ack`

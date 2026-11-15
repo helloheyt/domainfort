@@ -354,6 +354,12 @@ pub const KRBTGT: KeyHandle =
     KeyHandle::new(PrincipalId::from_bytes([0x7B; 16]), KeyPurpose::Krbtgt);
 pub const SERVICE: KeyHandle =
     KeyHandle::new(PrincipalId::from_bytes([0x5E; 16]), KeyPurpose::Service);
+/// The change-password service's key set (`kadmin/changepw`, RFC 3244 §2;
+/// docs/53 §5.2: its own purpose, keyd-drawn — task K5).
+pub const CHANGEPW: KeyHandle = KeyHandle::new(
+    PrincipalId::from_bytes([0xCB; 16]),
+    KeyPurpose::ChangePasswordService,
+);
 
 /// Passwords and keys chosen for these tests; marker bytes easy to spot.
 /// Task K3: keyd enforces the password policy (no account name of more than
@@ -368,6 +374,9 @@ pub const SERVICE_KEY: [u8; 32] = [0xD9; 32];
 /// The computer account's random key (keyd `create_key`, docs/48 §7.3: a
 /// bootstrap account has a random key, not a human password).
 pub const MACHINE_KEY: [u8; 32] = [0xE3; 32];
+/// The change-password service's random key (keyd `create_key`, docs/53
+/// §5.2: never password-derived).
+pub const CHANGEPW_KEY: [u8; 32] = [0xA7; 32];
 /// The default subkey of the TGS authenticators (mandatory under FAST,
 /// RFC 6113 5.4.2).
 pub const TGS_SUBKEY: [u8; 32] = [0x3A; 32];
@@ -417,6 +426,12 @@ pub fn krbtgt_name() -> PrincipalName {
 
 pub fn service_name() -> PrincipalName {
     name(KRB_NT_SRV_HST, &["host", "files.example.org"])
+}
+
+/// RFC 3244 §2: "the service principal kadmin/changepw@REALM" (the
+/// name-type is a hint only, RFC 4120 6.2; NT-SRV-INST chosen here).
+pub fn change_password_name() -> PrincipalName {
+    name(KRB_NT_SRV_INST, &["kadmin", "changepw"])
 }
 
 /// KerberosTime from `YYYYMMDDHHMMSSZ`.
@@ -488,6 +503,21 @@ pub struct TestCustody {
     pub inner: LocalKeyd<InMemoryKeyStore, KeydAudit, TestEntropy>,
     pub refuse_seal: bool,
     pub unavailable: Vec<CustodyOp>,
+    /// Every `issue_as_rep` call as the KDC made it, before keyd answers
+    /// (task K5: the server key set, the armor and the template of the
+    /// change-password ticket are the KDC's half of the contract — docs/53
+    /// §5.2). TESTS ONLY.
+    pub issue_as_rep_calls: Vec<IssueAsRepCall>,
+}
+
+/// One `issue_as_rep` call: the client and server key sets, whether it was
+/// armored, and the template. TESTS ONLY.
+#[derive(Debug, Clone)]
+pub struct IssueAsRepCall {
+    pub client: KeyHandle,
+    pub server: KeyHandle,
+    pub armored: bool,
+    pub template: keyd::AsTicketTemplate,
 }
 
 impl TestCustody {
@@ -531,6 +561,12 @@ impl KeyCustody for TestCustody {
         template: &keyd::AsTicketTemplate,
         now: &KerberosTime,
     ) -> Result<keyd::AsRepParts, keyd::IssueError> {
+        self.issue_as_rep_calls.push(IssueAsRepCall {
+            client: *client,
+            server: *krbtgt,
+            armored: armor.is_some(),
+            template: template.clone(),
+        });
         if self.down(CustodyOp::IssueAsRep) {
             return Err(keyd::IssueError::Unavailable);
         }
@@ -727,6 +763,7 @@ impl Fixture {
         for (handle, binding, key) in [
             (KRBTGT, krbtgt_name(), KRBTGT_KEY),
             (SERVICE, service_name(), SERVICE_KEY),
+            (CHANGEPW, change_password_name(), CHANGEPW_KEY),
             (MACHINE, machine_name(), MACHINE_KEY),
         ] {
             for e in &enctypes {
@@ -795,11 +832,25 @@ impl Fixture {
                 },
             )
             .unwrap();
+        // The change-password service's object (docs/53 §5.2; provisioned
+        // in task K9), its key set the ChangePasswordService one.
+        accounts
+            .insert_service(
+                &realm(),
+                &change_password_name(),
+                ServiceAccount {
+                    key: CHANGEPW,
+                    state: AccountState::ACTIVE,
+                    enctypes: vec![AES256, AES128],
+                },
+            )
+            .unwrap();
 
         let custody = TestCustody {
             inner: LocalKeyd::new(keyd, KDC_CALLER).unwrap(),
             refuse_seal: false,
             unavailable: Vec::new(),
+            issue_as_rep_calls: Vec::new(),
         };
         let mut kdc = Kdc::new(
             setup.kdc,
@@ -852,6 +903,7 @@ impl Fixture {
             .records
             .clear();
         kdc.rate_limiter_mut().seen.clear();
+        kdc.custody_mut().issue_as_rep_calls.clear();
 
         Fixture {
             kdc,
@@ -935,6 +987,11 @@ impl Fixture {
 
     pub fn keyd_records(&self) -> &[AuditRecord] {
         &self.kdc.custody().keyd().audit_sink().records
+    }
+
+    /// The `issue_as_rep` calls the KDC made so far, in order.
+    pub fn issue_as_rep_calls(&self) -> &[IssueAsRepCall] {
+        &self.kdc.custody().issue_as_rep_calls
     }
 
     /// The keyd operations called so far, in order.

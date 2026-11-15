@@ -44,7 +44,10 @@ dtyp = { path = "../dtyp" }
 # TESTS ONLY: the real in-process keyd behind the KDC of the integration
 # tests (`keyd::Keyd` through `keyd::LocalKeyd`, which moved from this crate
 # to keyd by D182 / A-63).
-keyd = { path = "../keyd" }
+# `test-seams` (docs/52 C18; docs/questions/Q-843 item 2): the tests build keyd
+# with a deterministic entropy source (`Keyd::with_entropy`, directly or through
+# the reused crates/kdc tests/common fixtures). Dev-only (resolver 2).
+keyd = { path = "../keyd", features = ["test-seams"] }
 # TESTS ONLY (main-session decision 2). The integration tests play the Kerberos
 # CLIENT: derive the client key from the password and the ETYPE-INFO2 salt,
 # build PA-ENC-TIMESTAMP and TGS authenticators (RFC 4120 5.2.7.2, 5.5.1), and

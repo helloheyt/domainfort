@@ -274,6 +274,18 @@ pub enum KerbResKind {
     Tgt,
     /// A service ticket for the named SPN.
     Service(Spn),
+    /// A ticket for the change-password service (`kadmin/changepw`, RFC
+    /// 3244 §2) — an operation kind of its own, not a `Service` SPN: the
+    /// KDC decides that a request names this service with the one name
+    /// rule keyd binds that service's key set with (crates/kdc `names.rs`,
+    /// task K5), and the PDP never compares the name again — so a rule
+    /// cannot match the service through a second, string-compared path
+    /// (A-139: one name space, one canonicalisation function), and a
+    /// `Service(Spn("kadmin/changepw"))` rule never applies to it. The KDC
+    /// asks about it only in the armored AS (docs/53 §5.2).
+    /// Spec: docs/11 §1 ("operation kind"); docs/53 R53-6, §5.2; RFC 3244
+    /// §2; A-117, A-139.
+    ChangePassword,
 }
 
 /// A policy scope. Spec: docs/11 §1 (`Policy { scope }`).

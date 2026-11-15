@@ -73,7 +73,10 @@ daemon-sandbox = { path = "../daemon-sandbox" }
 # owner decision P-12) — nothing new. `#[path]`-reuses
 # crates/keyd-daemon/tests/support, as keyd-daemon's kdc_flow reuses
 # crates/kdc/tests/common.
-keyd = { path = "../keyd" }
+# `test-seams` (docs/52 C18; docs/questions/Q-843 item 2): the tests build keyd
+# with a deterministic entropy source (`Keyd::with_entropy`, directly or through
+# the reused crates/kdc tests/common fixtures). Dev-only (resolver 2).
+keyd = { path = "../keyd", features = ["test-seams"] }
 keyd-daemon = { path = "../keyd-daemon", features = ["test-seams"] }
 ipc-audit = { path = "../ipc-audit" }
 krb-proto = { path = "../krb-proto" }

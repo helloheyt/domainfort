@@ -1,0 +1,44 @@
+# cargo-fuzz harness for the sealed key store's format parsers in keyd-types
+# (task KL1; AGENTS.md §6 / docs/32 §8: every parser gets a fuzz target before
+# it merges to main). A key-store file is read back from disk, where anyone
+# who can write the disk can change it (r4-c §3.6), so the parsers must never
+# panic, hang or over-allocate on any input.
+#
+# This is a SEPARATE workspace (note the empty [workspace] table below): it is
+# intentionally NOT a member of the root workspace, so `cargo build --all`,
+# `cargo clippy`, `cargo test`, `cargo deny` and the SBOM in the product
+# workspace never pull in the fuzzing-only dependencies. It is built only via
+# `cargo fuzz run sealed_store_parse` (nightly + cargo-fuzz).
+#
+# NOTE FOR REVIEW: libfuzzer-sys is fuzz-harness-only test infrastructure, not
+# linked into any product crate, and on the license allowlist (MIT /
+# Apache-2.0, AGENTS.md §7). Pending owner sign-off (docs/questions/
+# PENDING-OWNER.md P-1); not built or run until then. The same property runs
+# deterministically in crates/keyd-types/tests/sealed_store_format.rs.
+
+[package]
+name = "keyd-types-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.keyd-types]
+path = ".."
+
+# `KeyRecord::parse`, `ParsedHeader::parse` and `parse_body` on arbitrary
+# bytes, with the round-trip property (`cargo fuzz run sealed_store_parse`).
+[[bin]]
+name = "sealed_store_parse"
+path = "fuzz_targets/sealed_store_parse.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the root workspace (see header).
+[workspace]

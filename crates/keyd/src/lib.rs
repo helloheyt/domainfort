@@ -205,8 +205,23 @@
 //! (docs/50 R50-5: otherwise a compromised kdc could "turn the time back" to
 //! use an expired TGT, or end the hold-down early). The only production
 //! entropy source is the kernel CSPRNG ([`OsEntropy`], `/dev/urandom`, fail
-//! closed); tests inject a deterministic source through the test-only
-//! [`Keyd::with_entropy`].
+//! closed): [`Keyd::new`] is the only constructor of a product build, and it
+//! is fixed to it. Tests inject a deterministic source through
+//! `Keyd::with_entropy`, which exists only with the feature `test-seams` —
+//! enabled only by `[dev-dependencies]` (docs/52 C18; docs/questions/Q-843
+//! item 2; r4-a CI2), checked by crates/e2e-tests
+//! `tests/no_test_seams_in_product.rs`.
+//!
+//! # Custody backends (task KL2)
+//!
+//! [`custody_backend`] holds the interface of the sealed key store's
+//! backends ([`CustodyBackend`]: the store wrapping key and the monotonic
+//! anchor), the properties each declares, the start-up [`probe`], and the
+//! declared [`InsecureDevelopmentCustody`]. The ceremony evidence
+//! ([`ProvisioningEvidence`]) comes only from a backend's positive "never
+//! initialized" reading (class C38, A-143). The sealed store that uses them
+//! (KL3) and the start sequence (KL4) are later tasks; their persisted format
+//! is keyd-types' `sealed_store` (KL1).
 //!
 //! # Residuals (documented, not hidden)
 //!
@@ -318,6 +333,7 @@ mod as_exchange;
 mod chain;
 mod change_password;
 mod custody;
+pub mod custody_backend;
 mod decision;
 mod directory;
 mod enctype;
@@ -345,6 +361,11 @@ mod usage;
 pub use keyd_types::{audit, authz, config, model};
 
 pub use custody::LocalKeyd;
+pub use custody_backend::{
+    probe, AnchorReading, CustodyBackend, CustodyError, CustodyProfile, CustodyProperties,
+    CustodyProperty, InsecureDevelopmentCustody, ProbeError, Probed, ProvisioningEvidence,
+    StoreWrappingKey,
+};
 pub use entropy::{EntropyError, EntropySource, OsEntropy};
 pub use keyd::Keyd;
 pub use keyd_types::kerberos_time_seconds;

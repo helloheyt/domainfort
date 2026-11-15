@@ -529,6 +529,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ipc-dns"
+version = "0.0.0"
+dependencies = [
+ "dns-zone",
+ "ipc",
+ "parse-dns",
+ "rustix",
+ "zeroize",
+]
+
+[[package]]
+name = "ipc-dns-server"
+version = "0.0.0"
+dependencies = [
+ "ipc",
+ "ipc-dns",
+ "zeroize",
+]
+
+[[package]]
 name = "ipc-keyd"
 version = "0.0.0"
 dependencies = [
@@ -681,6 +701,7 @@ name = "keyd"
 version = "0.0.0"
 dependencies = [
  "admin-password-policy",
+ "keyd",
  "keyd-types",
  "krb-crypto",
  "krb-proto",

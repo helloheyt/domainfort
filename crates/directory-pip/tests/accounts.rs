@@ -268,6 +268,60 @@ fn the_admin_service_name_names_the_admin_service_key_set() {
     assert_eq!(ws01.key.purpose, KeyPurpose::Service);
 }
 
+/// docs/53 R53-6, §5.2 (task K5: the change-password service's object,
+/// its own key set, "derived in the one place — `KeyPurpose::of_service_name`
+/// (R2b)"); RFC 3244 §2 (`kadmin/changepw`); RFC 4120 6.2 (the name-type is
+/// not significant); docs/47 §1.3 TGS step 3 (the unique index folds A–Z,
+/// Q-080; the final comparison is octet for octet); A-139 (one name rule):
+/// `kadmin/changepw` resolves to its object's `ChangePasswordService` key
+/// set under either name-type; a case variant matches no stored SPN; a
+/// third component is another (plain) service name.
+#[test]
+fn the_change_password_service_name_names_its_key_set() {
+    let d = Dir::new("spn-changepw");
+    let mut objects = d.standard_objects();
+    objects.push(d.computer(
+        62,
+        STAFF_OU,
+        "kpasswd$",
+        &[
+            (
+                "userAccountControl",
+                vec![bits(uac::ADS_UF_WORKSTATION_TRUST_ACCOUNT)],
+            ),
+            ("pwdLastSet", vec![int64(PWD_LAST_SET)]),
+            ("servicePrincipalName", vec![b"kadmin/changepw".to_vec()]),
+        ],
+    ));
+    objects.push(d.computer(
+        63,
+        STAFF_OU,
+        "kpasswdx$",
+        &[
+            (
+                "userAccountControl",
+                vec![bits(uac::ADS_UF_WORKSTATION_TRUST_ACCOUNT)],
+            ),
+            ("pwdLastSet", vec![int64(PWD_LAST_SET)]),
+            ("servicePrincipalName", vec![b"kadmin/changepw/x".to_vec()]),
+        ],
+    ));
+    d.create_all(objects);
+    let view = d.view();
+    for name_type in [KRB_NT_SRV_INST, KRB_NT_PRINCIPAL] {
+        let changepw = view
+            .service(&realm(), &name(name_type, &["kadmin", "changepw"]))
+            .unwrap()
+            .expect("the change-password service");
+        assert_eq!(changepw.key, key_of(62, KeyPurpose::ChangePasswordService));
+    }
+    assert_eq!(service(&view, &["KADMIN", "changepw"]), Ok(None));
+    let other = service(&view, &["kadmin", "changepw", "x"])
+        .unwrap()
+        .expect("a plain service");
+    assert_eq!(other.key, key_of(63, KeyPurpose::Service));
+}
+
 /// docs/47 §1.3 TGS step 4, R47-13: an SPN can only be held by a computer
 /// (the schema refuses it on a user), so a user is never a service.
 #[test]

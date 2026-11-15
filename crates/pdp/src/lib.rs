@@ -91,7 +91,10 @@
 //! which takes effect in Deny rules only ([`Rule::applies`]). The default
 //! rule set of the Q-127 interim decision (owner item P-10) is
 //! [`mandatory_fast_rules`] — policy data, with the bootstrap-allowed group
-//! SID supplied by the caller (docs/48 §7).
+//! SID supplied by the caller (docs/48 §7). Beside it,
+//! [`change_password_as_rules`] (task K5) denies the AS for the
+//! change-password service ([`KerbResKind::ChangePassword`]) when unarmored
+//! and to the computer group — policy data too (docs/53 §5.2; A-142).
 //!
 //! # Provenance
 //!
@@ -114,7 +117,10 @@
 //! - this project's docs/05, docs/06, docs/11, docs/15 §6, docs/25 §5.1,
 //!   docs/45 §5-7, docs/48 §4.2, §7 (and its closing decision), docs/49 §5.2,
 //!   §6.5, §12 (L2) and its closing decision, docs/questions/Q-127 (interim
-//!   decision, owner item P-10), Q-164 (A-48), A-31 (GUID string form).
+//!   decision, owner item P-10), Q-164 (A-48), A-31 (GUID string form);
+//! - for the change-password AS rules (task K5): docs/53 R53-1, R53-6, §5.2;
+//!   PENDING-OWNER A-117, A-139, A-142; RFC 3244 (pinned copy, sha256
+//!   45b9130f…c378) §2 (the service principal `kadmin/changepw`).
 //!
 //! No other implementation was consulted or recalled (AGENTS.md §1-3).
 //! Spec gaps, conflicts and design decisions: docs/questions/Q-050 (resolved,
@@ -126,6 +132,7 @@
 //! built here), Q-170 (open: the interpretations of that build).
 
 pub mod access_check;
+pub mod change_password;
 mod decide;
 pub mod mandatory_fast;
 pub mod model;
@@ -134,6 +141,7 @@ pub mod policy;
 mod visibility;
 
 pub use access_check::{acl_grants, dacl_preconditions, DaclRefusal, DirObjectContext, Right};
+pub use change_password::{change_password_as_rules, CHANGE_PASSWORD_AS_RULE_COUNT};
 pub use decide::{decide, is_write, required_sec, required_sec_on};
 pub use mandatory_fast::{mandatory_fast_rules, MANDATORY_FAST_RULE_COUNT};
 pub use model::{

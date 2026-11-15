@@ -58,9 +58,10 @@
 //!   component printable ASCII `att=value`, no DN twice; no entry is
 //!   Untiered;
 //! - mandatory FAST: the bootstrap group SID decodes; the
-//!   [`pdp::MANDATORY_FAST_RULE_COUNT`] rule ids from `first_rule_id` fit in
-//!   `u32` (docs/48 §7; A-39; P-10 interim);
-//! - rules: every id is unique and outside the mandatory-FAST range; every
+//!   [`RESERVED_RULE_COUNT`] rule ids of the default Kerberos rule set from
+//!   `first_rule_id` fit in `u32` (docs/48 §7; A-39; P-10 interim; docs/53
+//!   §5.2, task K5);
+//! - rules: every id is unique and outside that reserved range; every
 //!   SID decodes; every text (share, zone, SPN, policy scope, claim) is
 //!   1 ..= [`MAX_TEXT`] octets of printable ASCII; every DN component as in
 //!   the tier map; a time window is not reversed (`pdp::TimeWindow::new`);
@@ -77,7 +78,10 @@
 //! [`DevelopmentPolicy::snapshot`] builds the `pdp::PolicySnapshot` the kdc
 //! decides with: the mandatory-FAST rule set of the bootstrap group first
 //! (`pdp::mandatory_fast_rules`, policy data — the PDP layer of D126,
-//! docs/48 §7.2), then the file's rules in file order, and the anonymous
+//! docs/48 §7.2), then the change-password service's AS rules for the same
+//! group (`pdp::change_password_as_rules`: never unarmored, never a member
+//! of the computer group — docs/53 §5.2, A-142; task K5), then the file's
+//! rules in file order, and the anonymous
 //! allowlist (internal-only, A-51), all under the file's policy version.
 //! The rule order only decides which Deny id an audit record names (crates/
 //! pdp policy.rs), never an effect. dird builds its tier map from
@@ -104,16 +108,17 @@
 //! Written only from this project's decided design, opened in-session:
 //! AGENT-ONBOARDING, AGENTS, docs/50 (§3.3, §3.4, §7.2, §9, §10 P8/P9),
 //! docs/questions Q-127 / Q-130 (A-39), Q-219 (A-57), Q-270 (A-68),
-//! PENDING-OWNER (A-36, A-39, A-48, A-51, A-57, A-68, P-1, P-10); the code
-//! of this project's crates directory-daemon (`policy.rs`, moved here), pdp
-//! (`policy.rs`, `mandatory_fast.rs`, `model.rs`), ipc and dtyp. The code
+//! PENDING-OWNER (A-36, A-39, A-48, A-51, A-57, A-68, A-117, A-142, P-1,
+//! P-10), docs/53 §5.2 (task K5); the code of this project's crates
+//! directory-daemon (`policy.rs`, moved here), pdp (`policy.rs`,
+//! `mandatory_fast.rs`, `change_password.rs`, `model.rs`), ipc and dtyp. The code
 //! values of the tier table are format 1's (the directory channel's,
 //! crates/ipc-directory); every other table is this project's choice. No
 //! other implementation, policy language or serializer was consulted or
 //! recalled (AGENTS.md §1-3).
 //!
 //! Spec: docs/50 §3.3, §7.2, §9; docs/06 §9; docs/11 §3, §6; docs/48 §7;
-//! A-36; A-39; A-51; A-57; A-68.
+//! docs/53 §5.2 (task K5); A-36; A-39; A-51; A-57; A-68; A-117; A-142.
 
 pub mod codes;
 pub mod edit;
@@ -129,6 +134,6 @@ pub use file::{read_file, LoadError};
 pub use policy::{
     DevelopmentPolicy, MandatoryFast, PolicyError, FORMAT, MARKER, MAX_ACTIONS,
     MAX_ANONYMOUS_GRANTS, MAX_COMPONENT, MAX_DN_COMPONENTS, MAX_OBLIGATIONS, MAX_POLICY_FILE,
-    MAX_PRINCIPALS, MAX_RULES, MAX_SID, MAX_SUBTREES, MAX_TEXT, SUPERSEDED_FORMAT,
-    UNSIGNED_DEVELOPMENT_WARNING,
+    MAX_PRINCIPALS, MAX_RULES, MAX_SID, MAX_SUBTREES, MAX_TEXT, RESERVED_RULE_COUNT,
+    SUPERSEDED_FORMAT, UNSIGNED_DEVELOPMENT_WARNING,
 };

@@ -16,7 +16,7 @@
 //! resource_match := 0 Any | 1 DirSubtree dn | 2 RootDse
 //!                 | 3 RpcMethod iface:guid[16] ‖ opnum:Option<u16>
 //!                 | 4 File share:text | 5 Dns zone:text
-//!                 | 6 Kerberos kind:Option<0 Tgt | 1 Service spn:text>
+//!                 | 6 Kerberos kind:Option<0 Tgt | 1 Service spn:text | 2 ChangePassword>
 //!                 | 7 Policy scope:Option<text>
 //! subject_match  := 0 Any | 1 Principal sid | 2 MemberOf sid | 3 NotMemberOf sid
 //!                 | 4 Tier tier | 5 Claim id:text ‖ value
@@ -31,7 +31,8 @@
 //! ```
 //!
 //! Spec: docs/50 §3.3; docs/11 §1, §1b, §3, §8; docs/48 §7.2 (`AuthMatch`,
-//! `NotMemberOf`); docs/49 §5.2 (`RootDse`); A-48; A-51.
+//! `NotMemberOf`); docs/49 §5.2 (`RootDse`); docs/53 §5.2 (the
+//! `ChangePassword` kind, task K5); A-48; A-51.
 
 use crate::codes::{self, action_match, claim_value, constraint, kerberos_kind, obligation};
 use crate::codes::{resource_match, subject_match};
@@ -221,6 +222,7 @@ fn read_resource_match(r: &mut Reader<'_>, c: &Content) -> ipc::Result<ResourceM
             let kind = r.read_option(|r| match r.read_u8()? {
                 kerberos_kind::TGT => Ok(KerbResKind::Tgt),
                 kerberos_kind::SERVICE => read_text(r, c).map(|spn| KerbResKind::Service(Spn(spn))),
+                kerberos_kind::CHANGE_PASSWORD => Ok(KerbResKind::ChangePassword),
                 _ => Err(ipc::Error::UnknownCode),
             })?;
             Ok(ResourceMatch::Kerberos { kind })
@@ -262,6 +264,7 @@ fn write_resource_match(w: &mut Writer, matcher: &ResourceMatch) -> ipc::Result<
                     w.write_enum(kerberos_kind::SERVICE)?;
                     write_text(w, &spn.0)
                 }
+                KerbResKind::ChangePassword => w.write_enum(kerberos_kind::CHANGE_PASSWORD),
             })
         }
         ResourceMatch::Policy { scope } => {
