@@ -1365,6 +1365,9 @@ pub enum KeydRequest {
     CompleteChangePassword(CompleteChangePasswordRequest),
     /// Spec: docs/53 §5.5 (task K4).
     SealChangePasswordError(SealChangePasswordErrorRequest),
+    /// `revoke_decision(id)`: the decision id (`u64`), nothing else (task
+    /// F3). Spec: docs/52 §4.2, §4.6; docs/questions/Q-976.
+    RevokeDecision(DecisionId),
 }
 
 impl MessageSet for KeydRequest {
@@ -1399,6 +1402,7 @@ impl MessageSet for KeydRequest {
             KeydRequest::OpenChangePasswordRequest(_) => request_kind::OPEN_CHANGE_PASSWORD_REQUEST,
             KeydRequest::CompleteChangePassword(_) => request_kind::COMPLETE_CHANGE_PASSWORD,
             KeydRequest::SealChangePasswordError(_) => request_kind::SEAL_CHANGE_PASSWORD_ERROR,
+            KeydRequest::RevokeDecision(_) => request_kind::REVOKE_DECISION,
         }
     }
 
@@ -1418,7 +1422,8 @@ impl MessageSet for KeydRequest {
             KeydRequest::RotateKey(id)
             | KeydRequest::RotateKrbtgt(id)
             | KeydRequest::RetireKvno(id)
-            | KeydRequest::DestroyKeySet(id) => write_decision(writer, *id),
+            | KeydRequest::DestroyKeySet(id)
+            | KeydRequest::RevokeDecision(id) => write_decision(writer, *id),
             KeydRequest::DescribeConfig | KeydRequest::Ping | KeydRequest::SealCeremony => Ok(()),
             KeydRequest::GrantSetSecret(m) => m.write_fields(writer),
             KeydRequest::RegisterDecision(m) => m.write_fields(writer),
@@ -1495,6 +1500,7 @@ impl MessageSet for KeydRequest {
             request_kind::SEAL_CHANGE_PASSWORD_ERROR => KeydRequest::SealChangePasswordError(
                 SealChangePasswordErrorRequest::read_fields(reader)?,
             ),
+            request_kind::REVOKE_DECISION => KeydRequest::RevokeDecision(read_decision(reader)?),
             _ => return Err(Error::UnknownKind),
         })
     }
@@ -2107,6 +2113,9 @@ pub enum KeydReply {
     CompleteChangePassword(WireSealedReply),
     /// An error reply. Spec: docs/53 §5.5 (task K4).
     SealChangePasswordError(WireSealedReply),
+    /// The decision is revoked (task F3). Spec: docs/52 §4.2;
+    /// docs/questions/Q-976.
+    RevokeDecision,
     /// Spec: docs/10 §9; A-26; A-56.
     AuthnFailure(AuthnError),
     /// Spec: docs/10 §9; A-56.
@@ -2145,6 +2154,7 @@ impl MessageSet for KeydReply {
             KeydReply::OpenChangePasswordRequest(_) => reply_kind::OPEN_CHANGE_PASSWORD_REQUEST,
             KeydReply::CompleteChangePassword(_) => reply_kind::COMPLETE_CHANGE_PASSWORD,
             KeydReply::SealChangePasswordError(_) => reply_kind::SEAL_CHANGE_PASSWORD_ERROR,
+            KeydReply::RevokeDecision => reply_kind::REVOKE_DECISION,
             KeydReply::AuthnFailure(_) => reply_kind::AUTHN_FAILURE,
             KeydReply::IssueFailure(_) => reply_kind::ISSUE_FAILURE,
             KeydReply::Failure(_) => reply_kind::FAILURE,
@@ -2169,7 +2179,8 @@ impl MessageSet for KeydReply {
             | KeydReply::DestroyKeySet
             | KeydReply::GrantSetSecret
             | KeydReply::RegisterDecision
-            | KeydReply::SealCeremony => Ok(()),
+            | KeydReply::SealCeremony
+            | KeydReply::RevokeDecision => Ok(()),
             KeydReply::ListDestroyDecisions(m) => m.write_fields(writer),
             KeydReply::VerifyOperationTicket(m) => m.write_fields(writer),
             KeydReply::OpenChangePasswordRequest(m) => m.write_fields(writer),
@@ -2236,6 +2247,7 @@ impl MessageSet for KeydReply {
             reply_kind::SEAL_CHANGE_PASSWORD_ERROR => {
                 KeydReply::SealChangePasswordError(WireSealedReply::read_fields(reader)?)
             }
+            reply_kind::REVOKE_DECISION => KeydReply::RevokeDecision,
             reply_kind::AUTHN_FAILURE => {
                 KeydReply::AuthnFailure(reader.read_enum(authn_error_from_code)?)
             }

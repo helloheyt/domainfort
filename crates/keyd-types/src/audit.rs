@@ -432,6 +432,22 @@ pub enum AuditReason {
     /// reply was sealed with (outcome `Success`). Spec: RFC 3244 §2; RFC
     /// 4120 2.1; docs/53 §5.7, §9.
     KpasswdInitialFlagNeeded,
+    // ---- task F3: revoking a key-operation decision (Q-976) -------------
+    /// An execution (`rotate_key`, `rotate_krbtgt`, `retire_kvno`) or a
+    /// registration named a key-operation decision id that dird revoked
+    /// (`revoke_decision`): nothing runs and nothing is registered under it.
+    /// Decided at the authorization step — no intent (A-88). Reported as the
+    /// uniform `Denied`.
+    /// Spec: docs/52 §4.2; docs/questions/Q-937 item 6, Q-976.
+    DecisionRevoked,
+    /// `revoke_decision` named a key-operation decision whose execution
+    /// already changed key state (a rotation recorded its kvno, a
+    /// retirement its success): it cannot be undone, so it is not revoked —
+    /// answering "revoked" would claim a cancellation that did not happen.
+    /// Nothing changes. Reported as the uniform `Denied`.
+    /// Spec: docs/52 §3.10 (C10: the recorded result), §4.2; docs/questions/
+    /// Q-937 item 6, Q-976.
+    DecisionExecuted,
 }
 
 /// A key referenced by an operation, for audit (no key material).

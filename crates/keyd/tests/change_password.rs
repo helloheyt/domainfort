@@ -865,8 +865,10 @@ fn a_replayed_request_is_refused() {
 /// the change-password service key set is opened by
 /// `open_change_password_request` only — the two other service-ticket
 /// verifications name other purposes of the principal (no such key set),
-/// the KDC's issuance and every secret operation refuse its purpose, no
-/// rotation can be decided for it — and that operation opens no other key
+/// the KDC's issuance and every secret operation refuse its purpose, its
+/// rotation is only a decision's (task F3, A-126: the decision is accepted;
+/// the rotation itself — `the_change_password_key_rotates_through_a_decision_only`
+/// — runs only on it) — and that operation opens no other key
 /// set: a ticket for another service under the request's principal fails the
 /// A-19 binding, and the other services' principals have no
 /// ChangePasswordService key set.
@@ -920,10 +922,25 @@ fn the_change_password_key_is_opened_by_its_operation_only() {
         Err(Error::Denied)
     );
     assert_eq!(last(&f).reason, AuditReason::PurposeMismatch);
-    assert_eq!(
-        f.decide(
+    // Task F3 (A-126, Q-660 item 11): a rotation of it can be decided — a
+    // dird decision, the one way `rotate_key` runs; a password set of it
+    // still cannot (the set-secret family's purposes).
+    assert!(f
+        .decide(
             DecidedOperation::RotateKey {
                 handle: CHANGE_PASSWORD_SERVICE
+            },
+            &now()
+        )
+        .is_ok());
+    assert_eq!(
+        f.decide(
+            DecidedOperation::ChangePassword {
+                target: SetSecretTarget {
+                    handle: CHANGE_PASSWORD_SERVICE,
+                    binding: bound(change_password_service_name()),
+                    salt: String::from("salt"),
+                },
             },
             &now()
         ),
@@ -1908,4 +1925,102 @@ fn keyd_refuses_to_start_with_a_minimum_above_the_change_password_maximum() {
     );
     assert_eq!(start(3_600), Err(ConfigError::ChangePasswordTicketLifetime));
     assert_eq!(start(CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS), Ok(()));
+}
+
+// ---------------------------------------------------------------------------
+// Task F3: rotating the change-password service's key set through a decision
+// (owner decision A-126 on docs/questions/Q-660 item 11; Q-978). Sources:
+// docs/10 §1 ("keyd holds current + previous; sealing always under the
+// current kvno"), §5ב step 5 (a ticket is opened under the version its kvno
+// names), §6א, §7 (`rotate_key`: "the current goes down to previous";
+// `retire_kvno`); RFC 4120 3.1.3 (the ticket sealed with "the encryption
+// key extracted from the server principal's record"); docs/52 §4.2. The
+// rotated key's octets are made up for this test.
+// ---------------------------------------------------------------------------
+
+/// The change-password service key the rotation draws (scripted entropy).
+const ROTATED_CHANGE_PASSWORD_KEY: [u8; 32] = [0xE7; 32];
+
+/// A-126 / Q-978: the change-password service's key set rotates **only**
+/// through a decision dird registered for a dual-controlled key request —
+/// without one `rotate_key` is refused (`NoDecision`) and nothing changes;
+/// with one only Role::Admin runs it (Ldap, Directory and the KDC are
+/// refused at the capability table, the decision unconsumed). The rotation
+/// draws a new key under kvno 2; the AS then seals new change-password
+/// tickets under kvno 2 and the new key; a ticket issued before (kvno 1)
+/// still opens a change request — the previous version is retained (docs/10
+/// §1) — until kvno 1 is retired, also through a decision.
+#[test]
+fn the_change_password_key_rotates_through_a_decision_only() {
+    let (mut f, tgt) = as_fixture();
+    let old = issue_change_password_ticket(&mut f, &tgt, 31);
+    assert_eq!(old.ticket.enc_part.kvno, Some(1));
+
+    // No decision: refused at the authorization step, nothing rotated.
+    assert_eq!(
+        f.keyd.rotate_key(&ADMIN, next_decision_id(), &now()),
+        Err(Error::Denied)
+    );
+    assert_eq!(last(&f).reason, AuditReason::NoDecision);
+    let unchanged = issue_change_password_ticket(&mut f, &tgt, 32);
+    assert_eq!(unchanged.ticket.enc_part.kvno, Some(1));
+
+    // dird's decision for the approved request (the dual-control pair).
+    let id = f
+        .decide(
+            DecidedOperation::RotateKey {
+                handle: CHANGE_PASSWORD_SERVICE,
+            },
+            &now(),
+        )
+        .unwrap();
+    for caller in [LDAP, DIRECTORY, KDC] {
+        assert_eq!(f.keyd.rotate_key(&caller, id, &now()), Err(Error::Denied));
+        assert_eq!(last(&f).reason, AuditReason::RoleNotPermitted);
+    }
+    f.entropy.push(&ROTATED_CHANGE_PASSWORD_KEY);
+    assert_eq!(f.keyd.rotate_key(&ADMIN, id, &now()), Ok(Kvno::new(2)));
+    let rotated = last(&f);
+    assert_eq!(rotated.op, Operation::RotateKey);
+    assert_eq!(rotated.result, AuditOutcome::Success);
+    assert_eq!(rotated.principal, Some(CHANGE_PASSWORD_SERVICE_ID));
+    assert_eq!(rotated.purpose, Some(KeyPurpose::ChangePasswordService));
+    assert_eq!(rotated.kvno, Some(Kvno::new(2)));
+    assert_eq!(rotated.decision, Some(id));
+    assert_eq!(rotated.approvers, Some([APPROVER_1, APPROVER_2]));
+
+    // New tickets: kvno 2, under the new key only.
+    let new = issue_change_password_ticket(&mut f, &tgt, 33);
+    assert_eq!(new.ticket.enc_part.kvno, Some(2));
+    let new_key = key(EncType::Aes256CtsHmacSha196, &ROTATED_CHANGE_PASSWORD_KEY);
+    assert!(krb_crypto::decrypt(&new_key, usage(2), &new.ticket.enc_part.cipher).is_ok());
+    let old_key = change_password_service_key(EncType::Aes256CtsHmacSha196);
+    assert!(krb_crypto::decrypt(&old_key, usage(2), &new.ticket.enc_part.cipher).is_err());
+
+    // Both open a change request: the old one under the retained kvno 1.
+    for (issued, cusec, password) in [
+        (&new, 15_301, "Copper-Wren-58-Ash"),
+        (&old, 15_302, "Velvet-Kite-31-Elm"),
+    ] {
+        let ctx = open_request(&mut f, issued, &Spec::new(cusec, password)).unwrap();
+        assert_eq!(ctx.verdict, ChangePasswordVerdict::Acceptable);
+    }
+
+    // Retiring kvno 1 (a decision too): the old ticket no longer opens.
+    let retire = f
+        .decide(
+            DecidedOperation::RetireKvno {
+                handle: CHANGE_PASSWORD_SERVICE,
+                kvno: Kvno::new(1),
+            },
+            &now(),
+        )
+        .unwrap();
+    assert_eq!(f.keyd.retire_kvno(&ADMIN, retire, &now()), Ok(()));
+    assert_eq!(
+        open_request(&mut f, &old, &Spec::new(15_303, "Marble-Fox-47-Oak")).map(|_| ()),
+        Err(AuthnError::Denied)
+    );
+    let ctx = open_request(&mut f, &new, &Spec::new(15_304, "Marble-Fox-47-Oak")).unwrap();
+    assert_eq!(ctx.verdict, ChangePasswordVerdict::Acceptable);
 }

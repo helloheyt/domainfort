@@ -27,11 +27,25 @@
 //!    in keyd (Role::Ldap, `register_decision`), and records an `Outcome`
 //!    event of the registration (`QuorumStep::registration_event`); if any
 //!    of it fails the approval is reverted (crate::requests
-//!    `PendingRequests::revert_approval`) so the approver may approve again;
+//!    `PendingRequests::revert_approval`) so the approver may approve again
+//!    — except when the registration's outcome is unknown (keyd may hold
+//!    the decision): then dird first revokes it in keyd and drops the
+//!    request, or, keyd not reached, keeps it approved (task F3,
+//!    docs/questions/Q-977: a decision keyd may hold is never left without
+//!    an approved request in dird);
 //! 4. keyadm runs `rotate_krbtgt(id)` / `rotate_key(id)` / `retire_kvno(id)`
 //!    in keyd as Role::Admin: keyd runs the parameters **dird registered**
 //!    and builds the dual-control token itself from the registered
-//!    approvers (docs/52 §4.6, §4.8; docs/questions/Q-460).
+//!    approvers (docs/52 §4.6, §4.8; docs/questions/Q-460);
+//! 5. **(task F3)** a `Withdraw` / `Reject` of an approved key request takes
+//!    effect only once keyd revoked its decision (`revoke_decision`,
+//!    Role::Ldap — crate::requests `RevocationStep`; docs/questions/Q-937
+//!    item 6, Q-977).
+//!
+//! The change-password service's key set (`kadmin/changepw`,
+//! `ChangePasswordService`) is a target like the other service key sets
+//! when dird's caller includes it in [`KeyTargets`] (owner decision A-126
+//! on docs/questions/Q-660 item 11: rotatable through a decision; Q-978).
 //!
 //! Spec: docs/51 §5.2 row 11, §5.6, §6, §7.3, §9; docs/24 §6; docs/10 §7;
 //! docs/33 §5; A-73; A-85; A-89; P-22; docs/questions/Q-420..Q-422,
@@ -79,8 +93,9 @@ pub enum KeyOperation {
     RotateKrbtgt,
     /// `rotate_key` of a service object's randomized key set (created by
     /// `create_key` in the ceremony — docs/10 §5ב; not a computer's
-    /// password-derived one) — `Service` or `AdminService`, as the
-    /// service's name derives it ([`KeyTargets::handle_of`]).
+    /// password-derived one) — `Service`, `AdminService` or (task F3,
+    /// A-126) `ChangePasswordService`, as the service's name derives it
+    /// ([`KeyTargets::handle_of`]).
     RotateKey {
         /// The service object's objectGUID.
         service: Guid,
@@ -139,7 +154,8 @@ impl KeyOperation {
 ///
 /// A service object's key set is a [`ServiceKeyHandle`], which only the
 /// derivation from the service's name builds (`Service` for `ldap/<fqdn>`,
-/// `AdminService` for `admind/<fqdn>`): the table cannot hold — and a key
+/// `AdminService` for `admind/<fqdn>`, `ChangePasswordService` for
+/// `kadmin/changepw` — task F3, A-126): the table cannot hold — and a key
 /// operation cannot name — a purpose that contradicts the name (docs/52
 /// R2b; docs/questions/Q-493 item 1).
 /// Spec: docs/51 §4.3 steps 8, 11, §6; docs/questions/Q-386 item 1; docs/47

@@ -265,6 +265,12 @@ fn invoke(f: &mut Fixture, op: Operation, caller: &CallerId, handle: &KeyHandle)
                 &n,
             )
             .is_ok(),
+        // Task F3: a decision id only (an id keyd does not hold is revoked
+        // too — Q-976); `handle` unused.
+        Operation::RevokeDecision => f
+            .keyd
+            .revoke_decision(caller, next_decision_id(), &n)
+            .is_ok(),
     }
 }
 
@@ -286,7 +292,8 @@ fn valid_handle(op: Operation) -> KeyHandle {
         | Operation::Ping
         | Operation::SealCeremony
         | Operation::ListDestroyDecisions
-        | Operation::SealChangePasswordError => ALICE,
+        | Operation::SealChangePasswordError
+        | Operation::RevokeDecision => ALICE,
         Operation::CreateKey => {
             KeyHandle::new(PrincipalId::from_bytes([0x99; 16]), KeyPurpose::Service)
         }
@@ -377,6 +384,7 @@ fn wrong_purpose_is_denied_for_every_operation() {
                 | Operation::SealCeremony
                 | Operation::ListDestroyDecisions
                 | Operation::VerifySecret
+                | Operation::RevokeDecision
         ) {
             continue;
         }
@@ -454,7 +462,9 @@ fn issue_as_rep_krbtgt_slot_purpose() {
 /// (A-102: `RegisterDecision` Ldap only, `GrantSetSecret` Admin only,
 /// `SealCeremony` Admin, `VerifySecret` nobody); task R6 (A-105,
 /// docs/questions/Q-503): `ListDestroyDecisions` Admin and Ldap; task K3
-/// (docs/53 R53-7, A-117): the three change-password operations, Ldap.
+/// (docs/53 R53-7, A-117): the three change-password operations, Ldap; task
+/// F3 (docs/questions/Q-937 item 6, Q-976): `RevokeDecision`, Ldap — the
+/// role that registers decisions.
 #[test]
 fn capability_table_matches_design() {
     use Operation::*;
@@ -499,6 +509,7 @@ fn capability_table_matches_design() {
                 OpenChangePasswordRequest,
                 CompleteChangePassword,
                 SealChangePasswordError,
+                RevokeDecision,
             ],
         ),
     ];

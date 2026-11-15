@@ -105,10 +105,13 @@ fn keyd_outcomes_never_map_to_a_phase_code() {
 /// Task A15a (docs/questions/Q-452 item 4): the four grant reasons map to
 /// their own same-named codes, never `Unlisted`; likewise the seven decision
 /// reasons appended by A-102 (docs/52 §4.5) and the two operation-binding
-/// reasons of R2 (docs/52 §5 item 3).
+/// reasons of R2 (docs/52 §5 item 3), and the two revocation reasons of task
+/// F3 (docs/questions/Q-976).
 #[test]
 fn keyd_grant_reasons_match() {
     for reason in [
+        keyd::AuditReason::DecisionRevoked,
+        keyd::AuditReason::DecisionExecuted,
         keyd::AuditReason::NoGrant,
         keyd::AuditReason::GrantMismatch,
         keyd::AuditReason::GrantInvalid,

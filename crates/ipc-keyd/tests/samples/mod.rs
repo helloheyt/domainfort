@@ -429,6 +429,13 @@ pub fn calls() -> Vec<Call> {
             ctx: ChangePasswordCtxId::from_bytes([0xCE; 16]),
             code: NonZeroResultCode::InitialFlagNeeded,
         },
+        // Task F3 (docs/questions/Q-976): the revocation names an id only.
+        Call::RevokeDecision {
+            id: DecisionId::new(15),
+        },
+        Call::RevokeDecision {
+            id: DecisionId::new(u64::MAX),
+        },
     ]
 }
 
@@ -622,6 +629,8 @@ pub fn answers() -> Vec<Answer> {
         Answer::ListDestroyDecisions(Ok(destruction_page(1, 64, Some(64)))),
         Answer::CompleteChangePassword(Ok(sealed_reply())),
         Answer::SealChangePasswordError(Ok(sealed_reply())),
+        // Task F3 (docs/questions/Q-976).
+        Answer::RevokeDecision(Ok(())),
     ];
     // Task K4: every verdict of the closed table.
     for verdict in [
@@ -690,6 +699,7 @@ pub fn answers() -> Vec<Answer> {
         answers.push(Answer::ListDestroyDecisions(Err(error)));
         answers.push(Answer::CompleteChangePassword(Err(error)));
         answers.push(Answer::SealChangePasswordError(Err(error)));
+        answers.push(Answer::RevokeDecision(Err(error)));
     }
     answers
 }

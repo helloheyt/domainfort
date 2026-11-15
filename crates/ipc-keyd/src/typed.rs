@@ -424,6 +424,13 @@ pub enum Call {
         /// The non-zero result code.
         code: NonZeroResultCode,
     },
+    /// Revoke dird's key-operation decision (Role::Ldap; task F3). Not a
+    /// state call: it only makes keyd stricter. Spec: docs/52 §4.2;
+    /// docs/questions/Q-937 item 6, Q-976.
+    RevokeDecision {
+        /// The decision id (dird's request id).
+        id: DecisionId,
+    },
 }
 
 impl Call {
@@ -470,6 +477,7 @@ impl Call {
             Call::OpenChangePasswordRequest { .. } => Operation::OpenChangePasswordRequest,
             Call::CompleteChangePassword { .. } => Operation::CompleteChangePassword,
             Call::SealChangePasswordError { .. } => Operation::SealChangePasswordError,
+            Call::RevokeDecision { .. } => Operation::RevokeDecision,
         }
     }
 
@@ -655,6 +663,7 @@ impl Call {
                     code: *code,
                 })
             }
+            Call::RevokeDecision { id } => KeydRequest::RevokeDecision(*id),
         })
     }
 
@@ -788,6 +797,7 @@ impl Call {
                 ctx: m.ctx,
                 code: m.code,
             },
+            KeydRequest::RevokeDecision(id) => Call::RevokeDecision { id },
         })
     }
 }
@@ -829,7 +839,8 @@ impl Call {
 /// A call that is **not** a state call ([`Call::is_state_call`]): issuance
 /// and verification (the Kdc and Ldap exchanges — the change-password
 /// request's opening and error seal included, task K4), `describe_config`,
-/// `ping`, `seal_ceremony`, `list_destroy_decisions` — and `verify_secret`,
+/// `ping`, `seal_ceremony`, `list_destroy_decisions`, `revoke_decision`
+/// (task F3: it only makes keyd stricter) — and `verify_secret`,
 /// which no role holds. The only kind of call the fate-dropping
 /// `KeydClient::call` accepts.
 ///
@@ -1168,6 +1179,8 @@ pub enum Answer {
     CompleteChangePassword(Result<SealedReply, keyd_types::Error>),
     /// An error reply. Spec: docs/53 §5.5 (task K4).
     SealChangePasswordError(Result<SealedReply, keyd_types::Error>),
+    /// Spec: docs/52 §4.2; docs/questions/Q-976 (task F3).
+    RevokeDecision(Result<(), keyd_types::Error>),
 }
 
 /// A success payload, or keyd's error carried by `failure`.
@@ -1215,6 +1228,7 @@ impl Answer {
             Answer::OpenChangePasswordRequest(_) => Operation::OpenChangePasswordRequest,
             Answer::CompleteChangePassword(_) => Operation::CompleteChangePassword,
             Answer::SealChangePasswordError(_) => Operation::SealChangePasswordError,
+            Answer::RevokeDecision(_) => Operation::RevokeDecision,
         }
     }
 
@@ -1401,6 +1415,9 @@ impl Answer {
                 |reply| Ok(KeydReply::SealChangePasswordError(wire_sealed(reply)?)),
                 KeydReply::Failure,
             ),
+            Answer::RevokeDecision(r) => {
+                outcome(r, |()| Ok(KeydReply::RevokeDecision), KeydReply::Failure)
+            }
         }
     }
 
@@ -1565,6 +1582,8 @@ impl Answer {
             (Operation::SealChangePasswordError, R::Failure(e)) => {
                 Answer::SealChangePasswordError(Err(e))
             }
+            (Operation::RevokeDecision, R::RevokeDecision) => Answer::RevokeDecision(Ok(())),
+            (Operation::RevokeDecision, R::Failure(e)) => Answer::RevokeDecision(Err(e)),
             _ => return Err(ConversionError::UnexpectedReply),
         })
     }

@@ -217,6 +217,8 @@ code_table! {
     /// context); codes 1-20 keep their meaning. `OpenChangePasswordRequest`,
     /// `CompleteChangePassword`, `SealChangePasswordError` (codes 22-24) were
     /// appended by task K3 (docs/53 §5.5, §9); codes 1-21 keep their meaning.
+    /// `RevokeDecision` (code 25) was appended by task F3 (docs/questions/
+    /// Q-976); codes 1-24 keep their meaning.
     /// Spec: docs/10 §2-§7; crates/keyd authz.rs; docs/52 §4; docs/53 §9.
     pub enum KeydOperation {
         VerifyPreauth,
@@ -243,6 +245,7 @@ code_table! {
         OpenChangePasswordRequest,
         CompleteChangePassword,
         SealChangePasswordError,
+        RevokeDecision,
     }
 }
 
@@ -310,7 +313,9 @@ code_table! {
     /// moved from 79 to 80. The fourteen change-password reasons
     /// (`SubkeyMissing` … `KpasswdInitialFlagNeeded`, codes 80-93) were
     /// appended by task K3 (docs/53 §9) the same way; `Unlisted` moved from
-    /// 80 to 94.
+    /// 80 to 94. The two revocation reasons (`DecisionRevoked`,
+    /// `DecisionExecuted`, codes 94-95) were appended by task F3
+    /// (docs/questions/Q-976) the same way; `Unlisted` moved from 94 to 96.
     /// Spec: crates/keyd audit.rs; docs/10 §9, §10, I8; docs/53 §9.
     pub enum KeydReason {
         None,
@@ -406,6 +411,8 @@ code_table! {
         KpasswdSoftError,
         KpasswdAccessDenied,
         KpasswdInitialFlagNeeded,
+        DecisionRevoked,
+        DecisionExecuted,
         Unlisted,
     }
 }

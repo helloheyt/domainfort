@@ -359,6 +359,11 @@ fn run<S: KeyStore, A: AuditSink, E: EntropySource>(
         Call::SealChangePasswordError { ctx, code } => Answer::SealChangePasswordError(
             keyd.seal_change_password_error(caller, &ctx, code, now),
         ),
+        // Task F3 (docs/questions/Q-937 item 6, Q-976): dird takes back a
+        // key-operation decision; keyd's clock is the daemon's (R50-5).
+        Call::RevokeDecision { id } => {
+            Answer::RevokeDecision(keyd.revoke_decision(caller, id, now))
+        }
     }
 }
 

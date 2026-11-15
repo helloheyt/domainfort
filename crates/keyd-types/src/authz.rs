@@ -176,11 +176,26 @@ pub enum Operation {
     /// Spec: RFC 3244 §2; docs/53 R53-7, R53-11, §5.5, §5.7; docs/questions/
     /// Q-604 (A-117).
     SealChangePasswordError = 23,
+    /// Revoke a **key-operation** decision dird registered
+    /// (`RotateKrbtgt` / `RotateKey` / `RetireKvno`, named by its id): from
+    /// the answer on, no execution can consume it, and keyd keeps the id as
+    /// revoked so that no later registration under it is accepted either.
+    /// Idempotent (an id already revoked, or one keyd never held, is
+    /// answered `Ok`). A decision whose execution already changed key state
+    /// cannot be revoked — `Denied` (reason `DecisionExecuted`): the
+    /// operation ran, and saying "revoked" would claim a cancellation that
+    /// did not happen. Role::Ldap (dird) only — exactly the roles that may
+    /// register a decision (pinned below). It changes no key state and only
+    /// makes keyd stricter: one record, no intent. Appended by task F3.
+    /// Spec: docs/52 §3.1 (C1), §3.14 (C14), §4.2, §4.3 (A-102); docs/10
+    /// §2, §6א, §10; docs/questions/Q-937 item 6 (the residual of A-159),
+    /// Q-976.
+    RevokeDecision = 24,
 }
 
 impl Operation {
     /// Every operation, for exhaustive checks. Spec: docs/10 §2.
-    pub const ALL: [Operation; 24] = [
+    pub const ALL: [Operation; 25] = [
         Operation::VerifyPreauth,
         Operation::IssueAsRep,
         Operation::OpenAndVerifyTgt,
@@ -205,6 +220,7 @@ impl Operation {
         Operation::OpenChangePasswordRequest,
         Operation::CompleteChangePassword,
         Operation::SealChangePasswordError,
+        Operation::RevokeDecision,
     ];
 }
 
@@ -239,7 +255,10 @@ impl Operation {
 /// three change-password operations — `OpenChangePasswordRequest`,
 /// `CompleteChangePassword` (a key-state change, so `requires_decision`: it
 /// redeems a `SetSecret` decision dird itself registered, and the C1 pin now
-/// covers every role) and `SealChangePasswordError`.
+/// covers every role) and `SealChangePasswordError`. Task F3 (docs/questions/
+/// Q-937 item 6, Q-976): Ldap (dird) also holds `RevokeDecision` — the role
+/// that registers a decision is the only one that may revoke one (pinned:
+/// for every role, `RevokeDecision` ⇔ `RegisterDecision`).
 pub const CAPABILITY_TABLE: [(Role, &[Operation]); 4] = [
     (
         Role::Kdc,
@@ -281,6 +300,7 @@ pub const CAPABILITY_TABLE: [(Role, &[Operation]); 4] = [
             Operation::OpenChangePasswordRequest,
             Operation::CompleteChangePassword,
             Operation::SealChangePasswordError,
+            Operation::RevokeDecision,
         ],
     ),
 ];
@@ -322,7 +342,8 @@ pub const fn provisioning_only(op: Operation) -> bool {
         | Operation::ListDestroyDecisions
         | Operation::OpenChangePasswordRequest
         | Operation::CompleteChangePassword
-        | Operation::SealChangePasswordError => false,
+        | Operation::SealChangePasswordError
+        | Operation::RevokeDecision => false,
     }
 }
 
@@ -367,7 +388,8 @@ pub const fn requires_decision(op: Operation) -> bool {
         | Operation::SealCeremony
         | Operation::ListDestroyDecisions
         | Operation::OpenChangePasswordRequest
-        | Operation::SealChangePasswordError => false,
+        | Operation::SealChangePasswordError
+        | Operation::RevokeDecision => false,
     }
 }
 
@@ -423,7 +445,8 @@ pub const fn changes_key_state(op: Operation) -> bool {
         | Operation::SealCeremony
         | Operation::ListDestroyDecisions
         | Operation::OpenChangePasswordRequest
-        | Operation::SealChangePasswordError => false,
+        | Operation::SealChangePasswordError
+        | Operation::RevokeDecision => false,
     }
 }
 
@@ -431,7 +454,8 @@ pub const fn changes_key_state(op: Operation) -> bool {
 /// `grant_set_secret` (task A15a) and `register_decision` (A-102), each of
 /// which lets Role::Directory or Role::Admin run a state change keyd would
 /// otherwise refuse. Every other change keyd makes to its in-memory tables
-/// only ever makes it stricter. Audited like a key-state change: intent
+/// only ever makes it stricter — `revoke_decision` (task F3) among them: it
+/// takes a decision away, never grants one. Audited like a key-state change: intent
 /// acknowledged first, then the outcome ([`requires_acknowledged_intent`]).
 /// Moved here from crate keyd unchanged (see [`changes_key_state`]).
 ///
@@ -465,7 +489,8 @@ pub const fn loosens_authorization(op: Operation) -> bool {
         | Operation::ListDestroyDecisions
         | Operation::OpenChangePasswordRequest
         | Operation::CompleteChangePassword
-        | Operation::SealChangePasswordError => false,
+        | Operation::SealChangePasswordError
+        | Operation::RevokeDecision => false,
     }
 }
 
@@ -512,7 +537,8 @@ pub const fn requires_acknowledged_intent(op: Operation) -> bool {
 /// at a start only makes keyd stricter (a `set_secret` without its grant is
 /// refused), so nothing needs holding (docs/questions/Q-450 item 5). Nor the
 /// decision operations (`register_decision`, `seal_ceremony`,
-/// `list_destroy_decisions`, A-102): the decision table is lost at a start
+/// `list_destroy_decisions`, A-102; `revoke_decision`, task F3): the
+/// decision table is lost at a start
 /// like the grant table (stricter); the ceremony state restarts as
 /// `Provisioning` only for an empty store — docs/52 §4.4 (P-17). Held too
 /// (task K3; docs/53 §5.3, §5.8): the three change-password operations —
@@ -551,7 +577,8 @@ pub const fn startup_hold_down_applies(op: Operation) -> bool {
         | Operation::GrantSetSecret
         | Operation::RegisterDecision
         | Operation::SealCeremony
-        | Operation::ListDestroyDecisions => false,
+        | Operation::ListDestroyDecisions
+        | Operation::RevokeDecision => false,
     }
 }
 
@@ -640,7 +667,8 @@ pub const fn as_server_slot(armored: bool) -> HandleSlot {
 ///   fields), so no slot of them is permitted; nor do `register_decision`
 ///   (the purposes of a decided operation are checked through the operation
 ///   that will run it — `DecidedOperation::purposes_permitted`),
-///   `seal_ceremony` and `list_destroy_decisions` (A-102).
+///   `seal_ceremony` and `list_destroy_decisions` (A-102), nor
+///   `revoke_decision` (task F3: it names a decision id only).
 /// - `issue_tgs_rep`: Service or AdminService — a service ticket is sealed
 ///   under the key set of its service's purpose (the admin service's own,
 ///   R2). Referral TGTs (Krbtgt in docs/10 §5) are cross-realm, which phase
@@ -660,9 +688,18 @@ pub const fn as_server_slot(armored: bool) -> HandleSlot {
 ///   `set_secret` can replace the key admin tickets are verified under —
 ///   the A-50 / Q-180 item 4 rule as a purpose); nor is the change-password
 ///   service key (docs/53 §4.5, A-117).
-/// - `rotate_key`: PrincipalLongterm, Service or AdminService — never
-///   ChangePasswordService (docs/53 §4.5; Q-601 item 4: "never `set_secret`
-///   / grant / destroy / `rotate_key` targets").
+/// - `rotate_key`: PrincipalLongterm, Service, AdminService or — task F3,
+///   owner decision A-126 on docs/questions/Q-660 item 11 ("ChangePasswordService
+///   must be rotatable through a decision (like AdminService)"; a key that
+///   cannot be rotated is a weakness class of its own) —
+///   ChangePasswordService. `rotate_key` is Role::Admin's and runs **only**
+///   on a `RotateKey` decision dird registered (`requires_decision`, never
+///   provisioning-only): the slot is open to the change-password service's
+///   key set through a dual-controlled decision and in no other way (pinned
+///   below). keyd draws the new version itself (`rotate_random`), so the key
+///   set stays keyd-drawn — never password-derived (docs/53 §4.5's other
+///   rules stand: no `set_secret` / grant / destroy for it). Formerly refused
+///   (docs/53 §4.5; Q-601 item 4).
 /// - `destroy_key_set`: PrincipalLongterm or Service — never Krbtgt (A-35),
 ///   never AdminService or ChangePasswordService (a destroy decision names a
 ///   deleted account's PrincipalLongterm and Service key sets only).
@@ -718,8 +755,13 @@ pub const fn purpose_permitted(op: Operation, slot: HandleSlot, purpose: KeyPurp
         | (Operation::DestroyKeySet, HandleSlot::Primary) => {
             matches!(purpose, PrincipalLongterm | Service)
         }
+        // Task F3 (A-126; Q-660 item 11): the change-password service's key
+        // set is rotatable — through a decision only (pinned below).
         (Operation::RotateKey, HandleSlot::Primary) => {
-            matches!(purpose, PrincipalLongterm | Service | AdminService)
+            matches!(
+                purpose,
+                PrincipalLongterm | Service | AdminService | ChangePasswordService
+            )
         }
         (Operation::CreateKey, HandleSlot::Primary)
         | (Operation::RetireKvno, HandleSlot::Primary) => {
@@ -819,8 +861,10 @@ const _: () = {
             || op as u8 == Operation::VerifyOperationTicket as u8;
         let is_daemon_support =
             op as u8 == Operation::DescribeConfig as u8 || op as u8 == Operation::Ping as u8;
+        // Task F3: the revocation is a decision operation of Ldap's too.
         let is_decision = op as u8 == Operation::RegisterDecision as u8
-            || op as u8 == Operation::ListDestroyDecisions as u8;
+            || op as u8 == Operation::ListDestroyDecisions as u8
+            || op as u8 == Operation::RevokeDecision as u8;
         let is_change_password = op as u8 == Operation::OpenChangePasswordRequest as u8
             || op as u8 == Operation::CompleteChangePassword as u8
             || op as u8 == Operation::SealChangePasswordError as u8;
@@ -939,6 +983,28 @@ const _: () = {
     assert!(!startup_hold_down_applies(Operation::RegisterDecision));
     assert!(!startup_hold_down_applies(Operation::SealCeremony));
     assert!(!startup_hold_down_applies(Operation::ListDestroyDecisions));
+    // Task F3 (docs/questions/Q-937 item 6, Q-976): only the role that may
+    // register a decision may revoke one — for every role, the two cells are
+    // equal (today: Ldap, dird). The revocation changes no key state, loosens
+    // nothing (it takes a decision away), needs no decision of its own,
+    // exists after the seal, is not held after a start (a lost table is
+    // stricter already) and names no handle.
+    let roles = [Role::Kdc, Role::Directory, Role::Admin, Role::Ldap];
+    let mut rv = 0;
+    while rv < roles.len() {
+        assert!(
+            role_permits(roles[rv], Operation::RevokeDecision)
+                == role_permits(roles[rv], Operation::RegisterDecision)
+        );
+        rv += 1;
+    }
+    assert!(role_permits(Role::Ldap, Operation::RevokeDecision));
+    assert!(!changes_key_state(Operation::RevokeDecision));
+    assert!(!loosens_authorization(Operation::RevokeDecision));
+    assert!(!requires_acknowledged_intent(Operation::RevokeDecision));
+    assert!(!requires_decision(Operation::RevokeDecision));
+    assert!(!provisioning_only(Operation::RevokeDecision));
+    assert!(!startup_hold_down_applies(Operation::RevokeDecision));
     // C1 closed by construction (docs/52 §3.1, A-102): every operation
     // Directory or Admin may call either runs only on a dird decision, or
     // exists only before the seal, or is one of the three that change no
@@ -1146,17 +1212,20 @@ const _: () = {
     // retired kvno named (`retire_kvno`, any purpose) — and is opened **only**
     // by `open_change_password_request`. Task K3b (docs/53 §5.2; Q-915 items
     // 1, 3, A-151): its tickets are sealed only by `issue_as_rep`, only in
-    // the ARMORED server slot. No other operation accepts it in any slot:
-    // not `set_secret` / `verify_secret` / a grant / `destroy_key_set` /
-    // `rotate_key` (never password-derived, never replaced), not the TGS
-    // issuance or the TGT / armor steps (the TGS refuses the name), not the
-    // unarmored AS (A-142), not the two other service-ticket verifications.
+    // the ARMORED server slot. Task F3 (A-126, Q-660 item 11): its key set
+    // is rotated by `rotate_key` — on a dird decision only (pinned next).
+    // No other operation accepts it in any slot: not `set_secret` /
+    // `verify_secret` / a grant / `destroy_key_set` (never password-derived,
+    // never replaced by a caller's secret), not the TGS issuance or the TGT
+    // / armor steps (the TGS refuses the name), not the unarmored AS
+    // (A-142), not the two other service-ticket verifications.
     let mut x = 0;
     while x < Operation::ALL.len() {
         let op = Operation::ALL[x];
         let opens_it = op as u8 == Operation::OpenChangePasswordRequest as u8
             || op as u8 == Operation::CreateKey as u8
-            || op as u8 == Operation::RetireKvno as u8;
+            || op as u8 == Operation::RetireKvno as u8
+            || op as u8 == Operation::RotateKey as u8;
         let issues_it = op as u8 == Operation::IssueAsRep as u8;
         assert!(
             purpose_permitted(op, HandleSlot::Primary, KeyPurpose::ChangePasswordService)
@@ -1179,8 +1248,62 @@ const _: () = {
             HandleSlot::Secondary,
             KeyPurpose::ChangePasswordService
         ));
+        // Task F3 (A-126): every operation that changes the change-password
+        // service's key state runs on a dird decision, or exists only in the
+        // ceremony (`create_key`) — whoever may call it. So the rotation slot
+        // is open to it **only with a decision**.
+        if purpose_permitted(op, HandleSlot::Primary, KeyPurpose::ChangePasswordService)
+            && changes_key_state(op)
+        {
+            assert!(requires_decision(op) || provisioning_only(op));
+        }
         x += 1;
     }
+    // The revocation (task F3) names a decision id, no key set: no purpose
+    // in any slot.
+    let mut rp = 0;
+    while rp < purposes.len() {
+        assert!(!purpose_permitted(
+            Operation::RevokeDecision,
+            HandleSlot::Primary,
+            purposes[rp]
+        ));
+        assert!(!purpose_permitted(
+            Operation::RevokeDecision,
+            HandleSlot::Secondary,
+            purposes[rp]
+        ));
+        assert!(!purpose_permitted(
+            Operation::RevokeDecision,
+            HandleSlot::AsServer,
+            purposes[rp]
+        ));
+        assert!(!purpose_permitted(
+            Operation::RevokeDecision,
+            HandleSlot::ArmoredAsServer,
+            purposes[rp]
+        ));
+        rp += 1;
+    }
+    // The rotation of the change-password service's key set (task F3,
+    // A-126): Role::Admin's `rotate_key` only, by decision id, never before
+    // the seal only, never held, never by Ldap / Directory / the KDC.
+    assert!(purpose_permitted(
+        Operation::RotateKey,
+        HandleSlot::Primary,
+        KeyPurpose::ChangePasswordService
+    ));
+    assert!(requires_decision(Operation::RotateKey));
+    assert!(!provisioning_only(Operation::RotateKey));
+    assert!(role_permits(Role::Admin, Operation::RotateKey));
+    assert!(!role_permits(Role::Ldap, Operation::RotateKey));
+    assert!(!role_permits(Role::Directory, Operation::RotateKey));
+    assert!(!role_permits(Role::Kdc, Operation::RotateKey));
+    assert!(!purpose_permitted(
+        Operation::RotateKrbtgt,
+        HandleSlot::Primary,
+        KeyPurpose::ChangePasswordService
+    ));
     // Task K3b (docs/53 §5.2: "`server: KeyHandle` that is Krbtgt **or**
     // ChangePasswordService — no other purpose"; Q-915 items 1, 3, A-151;
     // A-142): the server slot of `issue_as_rep` is closed. Only
@@ -1306,8 +1429,9 @@ mod tests {
     /// RFC 4120 3.2.3 / docs/50 R50-6, §3.5: exactly the operations of the
     /// Kerberos exchanges (roles Kdc and Ldap, except the daemon-support
     /// operations — Q-240 item 1 — and the decision registration and its
-    /// listing — Q-450 item 5, A-102, task R6) are held after start — the
-    /// three change-password operations included (docs/53 §5.3, task K3).
+    /// listing — Q-450 item 5, A-102, task R6 — and the revocation — task
+    /// F3) are held after start — the three change-password operations
+    /// included (docs/53 §5.3, task K3).
     #[test]
     fn hold_down_covers_exactly_the_kerberos_operations() {
         for op in Operation::ALL {
@@ -1318,6 +1442,7 @@ mod tests {
                         | Operation::Ping
                         | Operation::RegisterDecision
                         | Operation::ListDestroyDecisions
+                        | Operation::RevokeDecision
                 );
             assert_eq!(startup_hold_down_applies(op), kerberos, "{op:?}");
         }

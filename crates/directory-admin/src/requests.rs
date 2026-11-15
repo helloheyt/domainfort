@@ -24,7 +24,7 @@
 //! | state | entered by | left by |
 //! |---|---|---|
 //! | `Pending` | `Propose` (the requester's AP-REQ; the operation's checks pass as a dry run and its rule needs an approver) | `Approve` reaching the quorum ⇒ `Approved`; `Reject`, `Withdraw`, expiry, or a stale basis ⇒ gone |
-//! | `Approved` | the quorum (the requester plus `admin_quorum − 1` approvers, P-22) | a directory / policy operation: its **execution** by the requester (the operation itself, sent again with a fresh AP-REQ: [`DirectoryAdmin::consume_approved`]), `Reject`, `Withdraw`, expiry ⇒ gone; a key operation: its decision is registered in keyd for keyadm at the quorum (A-102) and the record stays, for `ListRequests` / `ShowRequest`, until expiry — `Reject` / `Withdraw` of it are a `Conflict` (keyd's decision would not be revoked) |
+//! | `Approved` | the quorum (the requester plus `admin_quorum − 1` approvers, P-22) | a directory / policy operation: its **execution** by the requester (the operation itself, sent again with a fresh AP-REQ: [`DirectoryAdmin::consume_approved`]), `Reject`, `Withdraw`, expiry ⇒ gone; a key operation: its decision is registered in keyd for keyadm at the quorum (A-102) and the record stays, for `ListRequests` / `ShowRequest`, until expiry — or until a `Reject` / `Withdraw` of it, which takes effect only once keyd revoked the decision (task F3, [`RevocationStep`]; before that they were a `Conflict`) |
 //!
 //! Gone requests leave no trace here (the audit trail keeps every step); a
 //! dird restart drops every request (memory only — fail closed, docs/51
@@ -106,7 +106,7 @@ use ipc_audit::{
     OutcomeResult, MAX_APPROVERS,
 };
 use ipc_audit_client::IntentRecord;
-use keyd_types::{KeyHandle, OperationDigest};
+use keyd_types::{DecisionId, KeyHandle, OperationDigest};
 use krb_proto::KerberosTime;
 use pdp::{
     Action, Dn, Effect, Obligation, PolicyScope, PolicySnapshot, PolicyVersion, Resource, Tier,
@@ -464,9 +464,48 @@ impl PendingRequests {
 
     /// Drop the request `id` — the caller could not record the step that
     /// created it (no request outlives an unrecorded proposal; fail closed).
-    /// `true` if it was held.
+    /// `true` if it was held. An **approved key request** is never dropped
+    /// here (`false`): its decision may be in keyd, so it leaves only
+    /// through keyd's revocation ([`PendingRequests::complete_revocation`],
+    /// [`PendingRequests::revoked_after_unknown_registration`]) or expiry
+    /// (task F3, docs/questions/Q-977).
     pub fn discard(&mut self, id: u64) -> bool {
-        self.records.remove(&id).is_some()
+        match self.records.get(&id) {
+            Some(record) if handed_over(id, record).is_some() => false,
+            Some(_) => self.records.remove(&id).is_some(),
+            None => false,
+        }
+    }
+
+    /// Remove the approved key request `id` after keyd revoked its decision
+    /// `decision` (= `id`): the one other way out of `Approved` besides
+    /// expiry. `true` if it was removed.
+    fn remove_revoked(&mut self, decision: DecisionId) -> bool {
+        let id = decision.get();
+        let approved_key_request = self
+            .records
+            .get(&id)
+            .is_some_and(|record| handed_over(id, record) == Some(decision));
+        approved_key_request && self.records.remove(&id).is_some()
+    }
+
+    /// keyd revoked the decision of `step`'s approved key request (task
+    /// F3): the request is removed — the `Withdraw` / `Reject` takes effect.
+    /// Only a request still approved, for a key operation, under that id is
+    /// removed; `true` if it was.
+    /// Spec: docs/questions/Q-937 item 6, Q-977.
+    pub fn complete_revocation(&mut self, step: &RevocationStep) -> bool {
+        self.remove_revoked(step.decision)
+    }
+
+    /// keyd revoked the decision of `quorum` — the `Approve` whose
+    /// registration outcome dird did not learn (task F3): its approved
+    /// request is removed (keyd keeps the id revoked, so the decision could
+    /// never be registered again — the requester proposes anew). `true` if
+    /// it was removed.
+    /// Spec: docs/questions/Q-976 item 4, Q-977 item 3.
+    pub fn revoked_after_unknown_registration(&mut self, quorum: &QuorumStep) -> bool {
+        self.remove_revoked(quorum.decision.id)
     }
 }
 
@@ -749,6 +788,10 @@ pub struct Stepped {
     reply: StepReply,
     event: DirAdminEvent,
     decision: Option<KeyDecision>,
+    /// The decision keyd must revoke before the step takes effect (task
+    /// F3): `Some` only for the `Withdraw` / `Reject` of an approved key
+    /// request.
+    revocation: Option<DecisionId>,
     base: EventBase,
     now: KerberosTime,
 }
@@ -771,6 +814,30 @@ impl Stepped {
     #[must_use]
     pub fn decision(&self) -> Option<&KeyDecision> {
         self.decision.as_ref()
+    }
+
+    /// The decision keyd must revoke before this step takes effect: `Some`
+    /// only for the `Withdraw` / `Reject` of an approved key request (task
+    /// F3; [`RevocationStep`]).
+    #[must_use]
+    pub fn revocation(&self) -> Option<DecisionId> {
+        self.revocation
+    }
+
+    /// The `Withdraw` / `Reject` of an approved key request, as a
+    /// [`RevocationStep`], or the step back.
+    /// Spec: docs/questions/Q-937 item 6, Q-977 (task F3).
+    ///
+    /// # Errors
+    /// The step back (boxed: it is large) when it is not such a step.
+    pub fn into_revocation(self) -> Result<RevocationStep, Box<Stepped>> {
+        match self.revocation {
+            Some(decision) => Ok(RevocationStep {
+                decision,
+                step: self,
+            }),
+            None => Err(Box::new(self)),
+        }
     }
 
     /// The `Approve` that completed a key request's quorum, as a
@@ -852,6 +919,83 @@ impl IntentRecord for QuorumStep {
     }
 }
 
+/// The `Withdraw` / `Reject` of an **approved key request** (task F3;
+/// docs/questions/Q-937 item 6, Q-977): its decision is registered in keyd
+/// (A-102), so the step takes effect — the request removed
+/// ([`PendingRequests::complete_revocation`]), its `Decision` event
+/// committed, "done" answered — only once keyd revoked that decision
+/// (`revoke_decision`, Role::Ldap). Until then the request stays as it was:
+/// a caller that drops this value, or whose call to keyd fails, leaves the
+/// request approved (fail closed) and answers [`RevocationStep::refusal`].
+///
+/// **The class (AGENTS.md §6.1):** one fact held by dird and keyd that could
+/// diverge (C14, as Q-937 item 6 reads it) — the record leaving dird while
+/// keyd's decision stays executable. **The root change:** dird's record of
+/// a decision registered in keyd leaves only through keyd's revocation (or
+/// expiry, which keyd's decision shares — Q-460): the only ways to remove
+/// an approved key request are [`PendingRequests::complete_revocation`]
+/// (taking this value) and [`PendingRequests::revoked_after_unknown_registration`]
+/// (taking the `QuorumStep`), each called once keyd answered the revocation;
+/// `discard` refuses such a request. Not `Clone`.
+/// Spec: docs/52 §3.14 (C14), §4.2, §4.3 (A-102); docs/questions/Q-460,
+/// Q-937 item 6, Q-977.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RevocationStep {
+    decision: DecisionId,
+    step: Stepped,
+}
+
+/// Why keyd did not revoke a [`RevocationStep`]'s decision.
+/// Spec: docs/10 §9; docs/questions/Q-976, Q-977.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RevocationFailure {
+    /// keyd answered and refused it: the decision's execution already
+    /// changed key state (keyd's `DecisionExecuted` — the operation ran and
+    /// cannot be cancelled), or keyd refused the caller. The request stays;
+    /// the step is a `Conflict`, as before task F3.
+    Refused,
+    /// keyd was not reached, or its answer did not arrive (not sent, not
+    /// performed, outcome unknown — alike, since the revocation is
+    /// idempotent and only makes keyd stricter): the request stays and the
+    /// step is answered `Unavailable`; asking again is harmless.
+    Unavailable,
+}
+
+impl RevocationStep {
+    /// The decision to revoke in keyd: the request's id.
+    #[must_use]
+    pub fn decision(&self) -> DecisionId {
+        self.decision
+    }
+
+    /// The reply once keyd revoked it ("done").
+    #[must_use]
+    pub fn reply(&self) -> &StepReply {
+        &self.step.reply
+    }
+
+    /// The step's `Decision` event (`Proceed`) — committed only once keyd
+    /// revoked the decision.
+    #[must_use]
+    pub fn event(&self) -> &DirAdminEvent {
+        &self.step.event
+    }
+
+    /// The step's refusal when keyd did not revoke the decision: its
+    /// `Decision` event — `Refused(Conflict)` when keyd refused,
+    /// `Failed(KeydUnavailable)` when keyd was not reached — and the
+    /// client-visible status. The request stays.
+    /// Spec: docs/52 §4.3 (fail closed); docs/questions/Q-977.
+    #[must_use]
+    pub fn refusal(&self, failure: RevocationFailure) -> Refusal {
+        let stop = match failure {
+            RevocationFailure::Refused => Stop::Refused(AdminRefusal::Conflict),
+            RevocationFailure::Unavailable => Stop::Failed(AdminFailure::KeydUnavailable),
+        };
+        self.step.base.decision_refusal(&self.step.now, stop)
+    }
+}
+
 /// What the dry run of a proposed operation found.
 struct Evaluation {
     dual: Dual,
@@ -916,23 +1060,25 @@ fn push_actor(base: &mut EventBase, actor: &Sid) {
     }
 }
 
-/// `Withdraw` / `Reject` of an **approved key request** is a `Conflict`: its
-/// decision is already registered in keyd for keyadm (A-102) and lives
-/// there for the request's remaining lifetime (Q-460); removing the record
-/// here would not revoke it, so a "done" answer would claim a cancellation
-/// that did not happen — two holders of one fact diverging (class C14).
-/// No step revokes a registered key decision (no such keyd call exists);
-/// the residual is recorded in docs/questions/Q-937 item 6. An approved
-/// directory or policy request may still be withdrawn or rejected: its
-/// execution then finds no approval (`ApprovalRequired`).
-/// Spec: docs/52 §4.3 (A-102); docs/questions/Q-460, Q-937; class C14.
-fn refuse_handed_over(record: &Record) -> Result<(), Stop> {
-    if record.state == RequestState::Approved
-        && matches!(record.operation, ProposedOperation::Key(_))
-    {
-        return Err(Stop::Refused(AdminRefusal::Conflict));
-    }
-    Ok(())
+/// The decision of an **approved key request** — registered in keyd for
+/// keyadm at its quorum (A-102), live there for the request's remaining
+/// lifetime (Q-460) — named by the request's id; `None` for any other
+/// request.
+///
+/// Its `Withdraw` / `Reject` removes the record only once keyd revoked that
+/// decision (task F3, [`RevocationStep`]): removing the record alone would
+/// not revoke it, and a "done" answer would claim a cancellation that did
+/// not happen — two holders of one fact diverging (class C14, the reading of
+/// docs/questions/Q-937 item 6). Before task F3 no keyd call revoked a
+/// decision and the steps were a `Conflict` (Q-937 item 6's residual). An
+/// approved directory or policy request is removed at once: its execution
+/// then finds no approval (`ApprovalRequired`).
+/// Spec: docs/52 §4.3 (A-102); docs/questions/Q-460, Q-937 item 6, Q-977;
+/// class C14.
+fn handed_over(id: u64, record: &Record) -> Option<DecisionId> {
+    (record.state == RequestState::Approved
+        && matches!(record.operation, ProposedOperation::Key(_)))
+    .then_some(DecisionId::new(id))
 }
 
 /// A refusal that means "the request's basis changed" — the request can
@@ -1513,10 +1659,11 @@ impl<R: RandomSource> DirectoryAdmin<R> {
             &request.step.digest(&request.request_digest),
         );
         match self.step_checked(requests, request, view, policy, now, honour, &mut base) {
-            Ok((reply, decision)) => Ok(Stepped {
+            Ok((reply, decision, revocation)) => Ok(Stepped {
                 reply,
                 event: base.proceed(now),
                 decision,
+                revocation,
                 base,
                 now: *now,
             }),
@@ -1535,7 +1682,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         now: &KerberosTime,
         honour: &mut dyn FnMut(&[Obligation]) -> bool,
         base: &mut EventBase,
-    ) -> Result<(StepReply, Option<KeyDecision>), Stop> {
+    ) -> Result<(StepReply, Option<KeyDecision>, Option<DecisionId>), Stop> {
         self.same_domain(view)?;
         let cx = Cx::new(
             &self.config,
@@ -1569,6 +1716,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                 Ok((
                     StepReply::List(self.list(&cx, requests, &caller, scope)),
                     None,
+                    None,
                 ))
             }
             RequestStep::Show { id } => {
@@ -1596,7 +1744,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                     operation: record.operation.clone(),
                     facts: self.facts(&cx, &caller, record)?,
                 };
-                Ok((StepReply::Shown(Box::new(detail)), None))
+                Ok((StepReply::Shown(Box::new(detail)), None, None))
             }
             RequestStep::Withdraw { id } => {
                 let record = requests
@@ -1609,9 +1757,13 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                 {
                     return Err(Stop::Refused(AdminRefusal::NotVisible));
                 }
-                refuse_handed_over(record)?;
+                // Task F3: an approved key request stays until keyd revoked
+                // its decision (the caller's `complete_revocation`).
+                if let Some(decision) = handed_over(id, record) {
+                    return Ok((StepReply::Done, None, Some(decision)));
+                }
                 requests.records.remove(&id);
-                Ok((StepReply::Done, None))
+                Ok((StepReply::Done, None, None))
             }
             RequestStep::Reject { id, digest } => {
                 let record = requests
@@ -1631,9 +1783,12 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                 if digest != record.digest {
                     return Err(Stop::Refused(AdminRefusal::OperationMismatch));
                 }
-                refuse_handed_over(record)?;
+                // Task F3: as for `Withdraw`.
+                if let Some(decision) = handed_over(id, record) {
+                    return Ok((StepReply::Done, None, Some(decision)));
+                }
                 requests.records.remove(&id);
-                Ok((StepReply::Done, None))
+                Ok((StepReply::Done, None, None))
             }
             RequestStep::Approve { id, digest } => {
                 // P-30 (b): the signature's place — no value can be here
@@ -1642,6 +1797,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                     match signature {}
                 }
                 self.approve(&cx, requests, request, &caller, id, digest, honour, base)
+                    .map(|(reply, decision)| (reply, decision, None))
             }
         }
     }

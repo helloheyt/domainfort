@@ -225,9 +225,9 @@ pub use key_requests::{
 pub use requests::{
     ApproverSignature, ListScope, PendingRequests, PolicyFile, ProposeRequest, Proposed,
     ProposedOperation, QuorumStep, RequestDetail, RequestFact, RequestState, RequestStep,
-    RequestSummary, RequestView, StepReply, StepRequest, Stepped, MAX_FACTS, MAX_PENDING_REQUESTS,
-    MAX_REASON_REF_CHARS, MAX_REQUESTS_PER_REQUESTER, MAX_REQUEST_LIFETIME, REQUESTS_PER_REQUESTER,
-    REQUEST_LIFETIME,
+    RequestSummary, RequestView, RevocationFailure, RevocationStep, StepReply, StepRequest,
+    Stepped, MAX_FACTS, MAX_PENDING_REQUESTS, MAX_REASON_REF_CHARS, MAX_REQUESTS_PER_REQUESTER,
+    MAX_REQUEST_LIFETIME, REQUESTS_PER_REQUESTER, REQUEST_LIFETIME,
 };
 
 /// Octets of an operation digest (SHA-256). Spec: FIPS 180-4 §6.2; crate

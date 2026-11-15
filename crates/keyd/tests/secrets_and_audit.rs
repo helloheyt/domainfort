@@ -354,6 +354,15 @@ fn every_operation_emits_exactly_one_audit_record() {
     check(&f, Operation::SealCeremony, &DIRECTORY, false);
     f.keyd.seal_ceremony(&ADMIN, &n).unwrap();
     check(&f, Operation::SealCeremony, &ADMIN, true);
+    // The revocation (task F3, docs/questions/Q-976): one record either way.
+    let revocable = f
+        .decide(DecidedOperation::RotateKey { handle: h }, &n)
+        .unwrap();
+    check(&f, Operation::RegisterDecision, &LDAP, true);
+    let _ = f.keyd.revoke_decision(&ADMIN, revocable, &n);
+    check(&f, Operation::RevokeDecision, &ADMIN, false);
+    f.keyd.revoke_decision(&LDAP, revocable, &n).unwrap();
+    check(&f, Operation::RevokeDecision, &LDAP, true);
 
     // FAST (docs/48 §2.4: one record per call, success or failure). The
     // successful paths are audited in tests/fast_armor.rs.

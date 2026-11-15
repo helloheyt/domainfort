@@ -185,13 +185,20 @@ fn a_stale_plain_call_is_not_run() {
 
 /// Q-365 item 1: a call that changes no key state and loosens nothing is
 /// plain whatever keyd's state (here `ping`, and the destroy listing — a
-/// read).
+/// read — and, task F3 / docs/questions/Q-976, the revocation of a decision:
+/// it only makes keyd stricter).
 #[test]
 fn reads_are_plain() {
     let mut keyd = dev_keyd();
     for (caller, call) in [
         (ADMIN, Call::Ping),
         (LDAP, Call::ListDestroyDecisions { after: None }),
+        (
+            LDAP,
+            Call::RevokeDecision {
+                id: keyd::DecisionId::new(0x0F3),
+            },
+        ),
     ] {
         let Classified::Plain(plain) = classify(&keyd, caller, now(), call) else {
             panic!("a read is plain");

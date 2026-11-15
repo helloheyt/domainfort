@@ -97,6 +97,7 @@ fn reason(reason: &keyd::AuditReason) -> KeydReason {
         KrbPrivAddressMismatch, PasswordPolicyRefused, ChangePasswordNotAcceptable,
         ResultCodeNotPermitted, KpasswdMalformed, KpasswdHardError, KpasswdAuthError,
         KpasswdSoftError, KpasswdAccessDenied, KpasswdInitialFlagNeeded,
+        DecisionRevoked, DecisionExecuted,
     }
         _ => KeydReason::Unlisted,
     )
@@ -123,7 +124,7 @@ pub fn keyd_record(record: &keyd::AuditRecord) -> KeydRecord {
             OpenFastArmor, SealFastError, DestroyKeySet, OpenAndVerifyServiceTicket,
             DescribeConfig, Ping, GrantSetSecret, RegisterDecision, SealCeremony,
             ListDestroyDecisions, VerifyOperationTicket, OpenChangePasswordRequest,
-            CompleteChangePassword, SealChangePasswordError,
+            CompleteChangePassword, SealChangePasswordError, RevokeDecision,
         }),
         principal: record.principal.map(|id| *id.as_bytes()),
         purpose: record.purpose.as_ref().map(purpose),

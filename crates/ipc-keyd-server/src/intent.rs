@@ -170,7 +170,9 @@ impl KeyStateIntent {
             | Call::SealCeremony
             | Call::ListDestroyDecisions { .. }
             | Call::OpenChangePasswordRequest { .. }
-            | Call::SealChangePasswordError { .. } => return None,
+            | Call::SealChangePasswordError { .. }
+            // Task F3: the revocation only makes keyd stricter — no intent.
+            | Call::RevokeDecision { .. } => return None,
         };
         Some(KeyStateIntent {
             ts: now,

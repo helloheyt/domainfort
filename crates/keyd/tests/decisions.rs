@@ -1044,3 +1044,177 @@ fn decided_intent_only_for_a_pending_matching_decision() {
     );
     assert_eq!(intent.approvers, None);
 }
+
+// ---------------------------------------------------------------------------
+// Task F3: revoking a key-operation decision (docs/questions/Q-937 item 6,
+// the residual of A-159; Q-976). Sources: docs/52 §3.1 (C1), §3.10, §3.14
+// (C14), §4.2, §4.5; docs/10 §2, §6א, §10. Values made up for these tests.
+// ---------------------------------------------------------------------------
+
+/// Q-976: dird (Role::Ldap) revokes a pending key decision; from then on it
+/// is never consumed — keyadm's execution is refused (`DecisionRevoked`, at
+/// the authorization step: one record, no intent), the same decision cannot
+/// be registered again under its id, a second revocation is `Ok`, and the
+/// key set was never rotated (the next decided rotation yields kvno 2).
+#[test]
+fn a_revoked_decision_is_never_consumed() {
+    let mut f = Fixture::new();
+    let id = f.decide(rotate_service_decision(), &now()).unwrap();
+    assert_eq!(f.keyd.revoke_decision(&LDAP, id, &now()), Ok(()));
+    let revoked = last(&f);
+    assert_eq!(revoked.op, Operation::RevokeDecision);
+    assert_eq!(revoked.caller_role, LDAP.role);
+    assert_eq!(revoked.result, AuditOutcome::Success);
+    assert_eq!(revoked.decision, Some(id));
+    assert_eq!(revoked.principal, Some(SERVICE_ID));
+    assert_eq!(revoked.purpose, Some(KeyPurpose::Service));
+    assert_eq!(revoked.approvers, Some([APPROVER_1, APPROVER_2]));
+
+    assert_eq!(
+        f.keyd
+            .decided_intent(&ADMIN, Operation::RotateKey, id, &now()),
+        None,
+        "no intent for a revoked decision"
+    );
+    let before = f.records().len();
+    assert_eq!(f.keyd.rotate_key(&ADMIN, id, &now()), Err(Error::Denied));
+    assert_eq!(f.records().len(), before + 1, "one record");
+    let refused = last(&f);
+    assert_eq!(refused.op, Operation::RotateKey);
+    assert_eq!(refused.reason, AuditReason::DecisionRevoked);
+    assert_eq!(refused.decision, Some(id));
+    assert_eq!(refused.kvno, None);
+    // Not under another kind either, and not registered again.
+    assert_eq!(f.keyd.retire_kvno(&ADMIN, id, &now()), Err(Error::Denied));
+    assert_eq!(last(&f).reason, AuditReason::DecisionRevoked);
+    let operation = rotate_service_decision();
+    assert_eq!(
+        f.keyd.register_decision(
+            &LDAP,
+            id,
+            &operation,
+            &approvers_for(&operation),
+            MAX_KEY_DECISION_SECS,
+            &now()
+        ),
+        Err(Error::Denied)
+    );
+    assert_eq!(last(&f).reason, AuditReason::DecisionRevoked);
+    // Idempotent.
+    assert_eq!(f.keyd.revoke_decision(&LDAP, id, &now()), Ok(()));
+    assert_eq!(last(&f).result, AuditOutcome::Success);
+    // The key set was never rotated: a new decision rotates kvno 1 → 2.
+    let next = f.decide(rotate_service_decision(), &now()).unwrap();
+    assert_eq!(f.keyd.rotate_key(&ADMIN, next, &now()), Ok(Kvno::new(2)));
+}
+
+/// Q-976; docs/10 §2 (I2): only the role that registers decisions
+/// (Role::Ldap) revokes one — Kdc, Directory and Admin are refused at the
+/// capability table (`RoleNotPermitted`), and the decision is still
+/// executable afterwards.
+#[test]
+fn revocation_by_another_role_is_refused() {
+    let mut f = Fixture::new();
+    let id = f.decide(rotate_krbtgt_decision(), &now()).unwrap();
+    for caller in [KDC, DIRECTORY, ADMIN] {
+        assert_eq!(
+            f.keyd.revoke_decision(&caller, id, &now()),
+            Err(Error::Denied),
+            "{caller:?}"
+        );
+        let refused = last(&f);
+        assert_eq!(refused.op, Operation::RevokeDecision);
+        assert_eq!(refused.caller_role, caller.role);
+        assert_eq!(refused.reason, AuditReason::RoleNotPermitted);
+        assert_eq!(refused.decision, Some(id));
+    }
+    assert_eq!(f.keyd.rotate_krbtgt(&ADMIN, id, &now()), Ok(Kvno::new(2)));
+}
+
+/// Q-976; docs/52 §3.10 (the recorded result): a decision whose execution
+/// changed key state is not revoked (`DecisionExecuted`) — its replay still
+/// returns the recorded kvno; one whose execution keyd refused (nothing
+/// ran) is revoked, after which its id answers `DecisionRevoked`.
+#[test]
+fn an_executed_decision_is_not_revoked() {
+    let mut f = Fixture::new();
+    let id = f.decide(rotate_service_decision(), &now()).unwrap();
+    assert_eq!(f.keyd.rotate_key(&ADMIN, id, &now()), Ok(Kvno::new(2)));
+    assert_eq!(
+        f.keyd.revoke_decision(&LDAP, id, &now()),
+        Err(Error::Denied)
+    );
+    let refused = last(&f);
+    assert_eq!(refused.reason, AuditReason::DecisionExecuted);
+    assert_eq!(refused.result, AuditOutcome::Denied);
+    assert_eq!(refused.principal, Some(SERVICE_ID));
+    assert_eq!(f.keyd.rotate_key(&ADMIN, id, &now()), Ok(Kvno::new(2)));
+    assert_eq!(last(&f).reason, AuditReason::DecisionReplayed);
+
+    // kvno 7 is not retained: keyd refuses the execution, nothing ran.
+    let retire = f.decide(retire_service_decision(7), &now()).unwrap();
+    assert_eq!(
+        f.keyd.retire_kvno(&ADMIN, retire, &now()),
+        Err(Error::Denied)
+    );
+    assert_eq!(f.keyd.revoke_decision(&LDAP, retire, &now()), Ok(()));
+    assert_eq!(
+        f.keyd.retire_kvno(&ADMIN, retire, &now()),
+        Err(Error::Denied)
+    );
+    assert_eq!(last(&f).reason, AuditReason::DecisionRevoked);
+}
+
+/// Q-976 (a registration whose outcome dird did not learn may still
+/// arrive): an id keyd does not hold is revoked too — kept for
+/// `MAX_KEY_DECISION_SECS`, during which a registration under it is refused
+/// (`DecisionRevoked`); afterwards the id is free again.
+#[test]
+fn an_unknown_id_is_revoked_ahead_of_any_registration() {
+    let mut f = Fixture::new();
+    let id = next_decision_id();
+    assert_eq!(f.keyd.revoke_decision(&LDAP, id, &now()), Ok(()));
+    let record = last(&f);
+    assert_eq!(record.result, AuditOutcome::Success);
+    assert_eq!(record.decision, Some(id));
+    assert_eq!(record.principal, None, "keyd held no decision under it");
+    let operation = rotate_service_decision();
+    let approvers = approvers_for(&operation);
+    let register = |f: &mut Fixture, when: &krb_proto::KerberosTime| {
+        f.keyd
+            .register_decision(&LDAP, id, &operation, &approvers, 60, when)
+    };
+    assert_eq!(register(&mut f, &now()), Err(Error::Denied));
+    assert_eq!(last(&f).reason, AuditReason::DecisionRevoked);
+    let edge = at(i64::from(MAX_KEY_DECISION_SECS));
+    assert_eq!(register(&mut f, &edge), Err(Error::Denied));
+    let after = at(i64::from(MAX_KEY_DECISION_SECS) + 1);
+    assert_eq!(register(&mut f, &after), Ok(()));
+    assert_eq!(f.keyd.rotate_key(&ADMIN, id, &after), Ok(Kvno::new(2)));
+}
+
+/// Q-976; AGENTS.md §6 (bounded, fail closed): revoked ids count against the
+/// key-operation family's bound — with the family full of live decisions a
+/// revocation of an unknown id is `Unavailable` (`DecisionTableFull`) and
+/// changes nothing, while revoking a held one replaces it in place.
+#[test]
+fn revocations_are_bounded_with_the_family() {
+    let mut f = Fixture::new();
+    let ids: Vec<DecisionId> = (0..keyd::MAX_KEY_DECISIONS)
+        .map(|_| f.decide(rotate_service_decision(), &now()).unwrap())
+        .collect();
+    let unknown = next_decision_id();
+    assert_eq!(
+        f.keyd.revoke_decision(&LDAP, unknown, &now()),
+        Err(Error::Unavailable)
+    );
+    assert_eq!(last(&f).reason, AuditReason::DecisionTableFull);
+    assert_eq!(last(&f).result, AuditOutcome::Unavailable);
+    assert_eq!(f.keyd.revoke_decision(&LDAP, ids[0], &now()), Ok(()));
+    // Still full (the revoked id holds its place); a held one still runs.
+    assert_eq!(
+        f.decide(rotate_service_decision(), &now()),
+        Err(Error::Unavailable)
+    );
+    assert_eq!(f.keyd.rotate_key(&ADMIN, ids[1], &now()), Ok(Kvno::new(2)));
+}

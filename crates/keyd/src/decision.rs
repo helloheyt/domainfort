@@ -41,6 +41,31 @@
 //! stricter, so nothing is held after a start; dird re-registers on demand
 //! (docs/52 §4.3, §4.4).
 //!
+//! # Revoking a key-operation decision (task F3; docs/questions/Q-937 item
+//! 6, Q-976)
+//!
+//! **The class (AGENTS.md §6.1):** one fact — "this key operation is
+//! decided" — held by two components that could disagree: dird's pending
+//! request and keyd's decision. Before this, dird could drop its request
+//! (a `Withdraw` / `Reject`) while keyd's decision stayed executable for up
+//! to an hour, so dird refused those steps (`Conflict`, A-159's residual).
+//! **The root change:** the holder of the decision gets a way to take it
+//! back, and the take-back is unconditional once answered:
+//! [`Keyd::revoke_decision`] (Role::Ldap — the one role that registers
+//! decisions) moves a pending key-operation decision to a **revoked** set
+//! keyed by its id, kept [`MAX_KEY_DECISION_SECS`] — longer than any
+//! decision under that id could live. While an id is revoked, an execution
+//! naming it and a registration under it are both refused
+//! (`DecisionRevoked`): a registration still in flight when dird revoked
+//! cannot bring the decision back. An id keyd does not hold is revoked
+//! too (kept the same way), so "revoked" never depends on whether a
+//! registration whose outcome dird did not learn had arrived. A decision
+//! whose execution changed key state cannot be revoked (`DecisionExecuted`:
+//! the operation ran); one whose execution keyd refused (nothing ran) can.
+//! The revoked ids count against the key-operation family's bound: a full
+//! family refuses the revocation (`Unavailable`) — dird then keeps its
+//! request (fail closed).
+//!
 //! # Destroy decisions and the key store (R6b)
 //!
 //! **A destroy registration is dird's statement that the principal is
@@ -106,7 +131,7 @@ use keyd_types::grant::max_grant_lifetime_secs;
 use keyd_types::{
     AccountKind, CeremonyState, DecidedOperation, DecisionId, DecisionIntent, DestructionPage,
     PendingDestruction, SetSecretTarget, MAX_DECISION_APPROVERS, MAX_DESTROY_DECISION_PAGE,
-    MAX_GRANT_TARGETS,
+    MAX_GRANT_TARGETS, MAX_KEY_DECISION_SECS,
 };
 use krb_proto::KerberosTime;
 use krb_proto::{PrincipalName, Realm};
@@ -232,6 +257,11 @@ pub(crate) struct DecisionTable {
     secrets: HashMap<KeyHandle, SecretEntry>,
     keys: BTreeMap<DecisionId, OpEntry>,
     destroys: BTreeMap<DecisionId, OpEntry>,
+    /// The key-operation decision ids dird revoked (task F3; module
+    /// documentation), each with the last second (on the
+    /// [`kerberos_time_seconds`] scale) it is kept. Counted with `keys`
+    /// against the key-operation family's bound.
+    revoked: BTreeMap<DecisionId, i64>,
 }
 
 impl DecisionTable {
@@ -245,6 +275,25 @@ impl DecisionTable {
         self.secrets.retain(|_, e| now <= e.expires_at);
         self.keys.retain(|_, e| now <= e.expires_at);
         self.destroys.retain(|_, e| now <= e.expires_at);
+        self.revoked.retain(|_, until| now <= *until);
+    }
+
+    /// The entries `family` holds against its bound: for the key-operation
+    /// family its decisions and its revoked ids (task F3).
+    /// Spec: docs/questions/Q-460 (bounds), Q-976; AGENTS.md §6.
+    fn family_len(&self, family: DecisionFamily) -> usize {
+        match family {
+            DecisionFamily::KeyOperation => self.keys.len().saturating_add(self.revoked.len()),
+            DecisionFamily::Destroy => self.destroys.len(),
+            DecisionFamily::SetSecret => self.secrets.len(),
+        }
+    }
+
+    /// Whether `id` is a revoked key-operation decision id at `now`.
+    /// Spec: module documentation (task F3).
+    fn is_revoked(&self, family: DecisionFamily, id: DecisionId, now: i64) -> bool {
+        family == DecisionFamily::KeyOperation
+            && self.revoked.get(&id).is_some_and(|until| now <= *until)
     }
 
     /// The key-operation or destroy family's map.
@@ -429,8 +478,11 @@ impl DecisionTable {
     /// Register a key-operation or destroy decision. An identical live
     /// decision under the same id is accepted unchanged (a re-registration
     /// after an unknown outcome is harmless — docs/52 §4.3); a different
-    /// one is `DecisionConflict`; a full family is `DecisionTableFull`.
-    /// Spec: docs/52 §4.2, §4.3.
+    /// one is `DecisionConflict`; a full family is `DecisionTableFull`; a
+    /// key-operation id dird revoked is `DecisionRevoked` (task F3: a
+    /// registration still in flight when dird revoked cannot bring the
+    /// decision back).
+    /// Spec: docs/52 §4.2, §4.3; docs/questions/Q-976.
     fn register_op(
         &mut self,
         id: DecisionId,
@@ -441,6 +493,10 @@ impl DecisionTable {
     ) -> Internal<()> {
         self.sweep(now);
         let family = operation.family();
+        if self.is_revoked(family, id, now) {
+            return Err(Deny::denied(AuditReason::DecisionRevoked));
+        }
+        let held = self.family_len(family);
         let map = self
             .ops_mut(family)
             .ok_or(Deny::denied(AuditReason::DecisionInvalid))?;
@@ -451,7 +507,7 @@ impl DecisionTable {
                 Err(Deny::denied(AuditReason::DecisionConflict))
             };
         }
-        if map.len() >= family.capacity() {
+        if held >= family.capacity() {
             return Err(Deny::unavailable(AuditReason::DecisionTableFull));
         }
         map.insert(
@@ -474,8 +530,12 @@ impl DecisionTable {
     }
 
     /// Look the decision `id` of `family` up for an execution (or its
-    /// intent): `NoDecision` if there is no live one.
+    /// intent): `DecisionRevoked` if dird revoked it (task F3), else
+    /// `NoDecision` if there is no live one.
     fn lookup(&self, family: DecisionFamily, id: DecisionId, now: i64) -> Internal<Found> {
+        if self.is_revoked(family, id, now) {
+            return Err(Deny::denied(AuditReason::DecisionRevoked));
+        }
         let entry = self
             .find(family, id, now)
             .ok_or(Deny::denied(AuditReason::NoDecision))?;
@@ -490,6 +550,51 @@ impl DecisionTable {
                 recorded,
             },
         })
+    }
+
+    /// Revoke the key-operation decision `id` at `now`, keeping its id as
+    /// revoked until `until` (task F3; module documentation). Returns the
+    /// decision keyd held under `id` — for the record — and the outcome:
+    /// * already revoked ⇒ `Ok`, nothing changes (idempotent);
+    /// * pending, or executed with a refusal (nothing ran) ⇒ moved to the
+    ///   revoked set, `Ok`;
+    /// * executed with a kvno or a success (key state changed) ⇒
+    ///   `DecisionExecuted`, nothing changes;
+    /// * not held ⇒ the id joins the revoked set, `Ok` — or, the family
+    ///   being full, `DecisionTableFull` (`Unavailable`), nothing changes.
+    ///
+    /// Spec: docs/52 §3.10 (the recorded result), §4.2; docs/questions/
+    /// Q-937 item 6, Q-976; AGENTS.md §6 (bounded, fail closed).
+    fn revoke_key(
+        &mut self,
+        id: DecisionId,
+        now: i64,
+        until: i64,
+    ) -> (Option<OpEntry>, Internal<()>) {
+        self.sweep(now);
+        if self.revoked.contains_key(&id) {
+            return (None, Ok(()));
+        }
+        let Some(entry) = self.keys.get(&id).cloned() else {
+            if self.family_len(DecisionFamily::KeyOperation)
+                >= DecisionFamily::KeyOperation.capacity()
+            {
+                return (None, Err(Deny::unavailable(AuditReason::DecisionTableFull)));
+            }
+            self.revoked.insert(id, until);
+            return (None, Ok(()));
+        };
+        match entry.state {
+            OpState::Executed(Recorded::Kvno(_) | Recorded::Done) => (
+                Some(entry),
+                Err(Deny::denied(AuditReason::DecisionExecuted)),
+            ),
+            OpState::Pending | OpState::Executed(Recorded::Refused(_)) => {
+                self.keys.remove(&id);
+                self.revoked.insert(id, until);
+                (Some(entry), Ok(()))
+            }
+        }
     }
 
     /// Record the result of decision `id`: it is consumed (module
@@ -526,12 +631,14 @@ impl DecisionTable {
         DestructionPage { entries, next }
     }
 
-    /// Entries held, every family (live or not yet swept).
+    /// Entries held, every family (live or not yet swept), revoked ids
+    /// included.
     pub(crate) fn len(&self) -> usize {
         self.secrets
             .len()
             .saturating_add(self.keys.len())
             .saturating_add(self.destroys.len())
+            .saturating_add(self.revoked.len())
     }
 }
 
@@ -918,6 +1025,58 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             &fields,
             &result,
         );
+        result.map_err(Error::from)
+    }
+
+    /// `revoke_decision`: take back dird's key-operation decision `id`
+    /// (module documentation, "Revoking a key-operation decision") — dird
+    /// calls it when the pending request the decision came from is withdrawn
+    /// or rejected. Role::Ldap only (the role that registers decisions;
+    /// pinned in keyd-types authz). From an `Ok` on, no `rotate_krbtgt`,
+    /// `rotate_key` or `retire_kvno` can run under `id`, and no
+    /// registration under it is accepted, for [`MAX_KEY_DECISION_SECS`]
+    /// (`DecisionRevoked`).
+    ///
+    /// In order — every refusal is the uniform `Denied` unless noted, with
+    /// its reason in the one audit record:
+    /// 1. the authorization step ([`Keyd::admit`]): the role (I2);
+    /// 2. the key-operation family under `id`: already revoked ⇒ `Ok`; a
+    ///    pending decision, or one whose execution keyd refused, ⇒ revoked,
+    ///    `Ok`; one whose execution changed key state ⇒ `DecisionExecuted`;
+    ///    an id keyd does not hold ⇒ kept as revoked, `Ok` — unless the
+    ///    family is full (`Unavailable`, `DecisionTableFull`).
+    ///
+    /// It changes no key state and only makes keyd stricter: one record, no
+    /// intent (docs/10 §10). The record names the decision id and, when keyd
+    /// held the decision, its key set, kvno and approvers. No key is read.
+    ///
+    /// Spec: docs/52 §3.1 (C1), §3.10, §3.14 (C14), §4.2, §4.5; docs/10 §2,
+    /// §6א, §10; docs/questions/Q-937 item 6, Q-976 (task F3).
+    pub fn revoke_decision(
+        &mut self,
+        caller: &CallerId,
+        id: DecisionId,
+        now: &KerberosTime,
+    ) -> Result<(), Error> {
+        let (found, result) = match self.admit(caller, Operation::RevokeDecision, &[], now) {
+            Err(deny) => (None, Err(deny)),
+            Ok(()) => {
+                let now_s = kerberos_time_seconds(now);
+                // Kept longer than any decision registered under `id` before
+                // this moment could live (its lifetime is at most the
+                // family's ceiling from its own registration).
+                let until = now_s.saturating_add(i64::from(MAX_KEY_DECISION_SECS));
+                self.decisions.revoke_key(id, now_s, until)
+            }
+        };
+        let fields = match &found {
+            Some(entry) => decision_fields(Some(id), &entry.operation, &entry.approvers),
+            None => AuditFields {
+                decision: Some(id),
+                ..AuditFields::default()
+            },
+        };
+        self.emit(caller, Operation::RevokeDecision, now, &fields, &result);
         result.map_err(Error::from)
     }
 
@@ -1316,6 +1475,82 @@ mod tests {
             .register_op(DecisionId::new(5000), &op, &[], 300, 101)
             .is_ok());
         assert_eq!(t.len(), 1);
+    }
+
+    /// docs/questions/Q-937 item 6, Q-976 (task F3): a pending key decision
+    /// is revoked — no lookup or re-registration under its id afterwards,
+    /// a second revocation is `Ok`; an executed one that changed key state
+    /// is not revoked (`DecisionExecuted`), one keyd refused is; an unknown
+    /// id is kept as revoked; revoked ids count against the family's bound
+    /// and expire.
+    #[test]
+    fn key_decisions_are_revoked_once_and_for_good() {
+        let mut t = DecisionTable::new();
+        let p = PrincipalId::from_bytes([5; 16]);
+        let op = DecidedOperation::RotateKey {
+            handle: KeyHandle::new(p, KeyPurpose::Service),
+        };
+        let pair = [
+            PrincipalId::from_bytes([1; 16]),
+            PrincipalId::from_bytes([2; 16]),
+        ];
+        let family = DecisionFamily::KeyOperation;
+        let (a, b, c, d) = (
+            DecisionId::new(1),
+            DecisionId::new(2),
+            DecisionId::new(3),
+            DecisionId::new(4),
+        );
+        for id in [a, b, c] {
+            assert!(t.register_op(id, &op, &pair, 100, 0).is_ok());
+        }
+        // Pending ⇒ revoked; then nothing under its id.
+        let (found, result) = t.revoke_key(a, 1, 500);
+        assert!(result.is_ok());
+        assert_eq!(found.map(|e| e.operation), Some(op.clone()));
+        assert_eq!(
+            t.lookup(family, a, 1).map(|_| ()).map_err(|d| d.reason),
+            Err(AuditReason::DecisionRevoked)
+        );
+        assert_eq!(
+            t.register_op(a, &op, &pair, 100, 1).map_err(|d| d.reason),
+            Err(AuditReason::DecisionRevoked)
+        );
+        assert_eq!(t.revoke_key(a, 2, 600).1, Ok(()));
+        // Executed with a kvno ⇒ not revoked; executed with a refusal ⇒
+        // revoked.
+        t.record(family, b, Recorded::Kvno(Kvno::new(2)));
+        assert_eq!(
+            t.revoke_key(b, 3, 500).1.map_err(|d| d.reason),
+            Err(AuditReason::DecisionExecuted)
+        );
+        assert!(matches!(t.lookup(family, b, 3), Ok(Found::Executed { .. })));
+        t.record(family, c, Recorded::Refused(Error::Unavailable));
+        assert!(t.revoke_key(c, 3, 500).1.is_ok());
+        // An unknown id is kept as revoked.
+        let (found, result) = t.revoke_key(d, 4, 500);
+        assert!(found.is_none() && result.is_ok());
+        assert_eq!(
+            t.register_op(d, &op, &pair, 100, 4).map_err(|d| d.reason),
+            Err(AuditReason::DecisionRevoked)
+        );
+        // Revoked ids count against the bound: fill the family.
+        let held = t.family_len(family);
+        for n in 0..(keyd_types::MAX_KEY_DECISIONS - held) as u64 {
+            assert!(t
+                .register_op(DecisionId::new(100 + n), &op, &pair, 100, 4)
+                .is_ok());
+        }
+        assert_eq!(
+            t.revoke_key(DecisionId::new(999), 4, 500)
+                .1
+                .map_err(|d| d.reason),
+            Err(AuditReason::DecisionTableFull)
+        );
+        // Everything expires: the revoked ids after `until`.
+        t.sweep(501);
+        assert_eq!(t.len(), 0);
+        assert!(t.register_op(a, &op, &pair, 900, 501).is_ok());
     }
 
     /// docs/52 §4.6: the listing pages ascending, skips executed decisions,

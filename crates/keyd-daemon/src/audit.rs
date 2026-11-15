@@ -192,7 +192,9 @@ pub const fn is_gating(operation: Operation) -> bool {
         | Operation::ListDestroyDecisions
         | Operation::OpenChangePasswordRequest
         | Operation::CompleteChangePassword
-        | Operation::SealChangePasswordError => true,
+        | Operation::SealChangePasswordError
+        // Task F3: the revocation has its one record in the window.
+        | Operation::RevokeDecision => true,
         Operation::DescribeConfig | Operation::Ping => false,
     }
 }

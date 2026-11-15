@@ -92,8 +92,18 @@ pub enum Note {
     /// An `Approve` completed a key request's quorum but its decision was
     /// not registered in keyd (or its decision event was not acknowledged —
     /// class 2): the approval was withdrawn and the answer is `Unavailable`
-    /// (A-102, docs/52 §4.3). The id is the failure's class as above.
+    /// (A-102, docs/52 §4.3) — for class 3 (outcome unknown) the decision is
+    /// revoked in keyd and the request dropped instead, or, keyd not
+    /// reached, the request stays approved (task F3, docs/questions/Q-977).
+    /// The id is the failure's class as above.
     AdminDecisionNotRegistered,
+    /// keyd did not revoke a key-operation decision (task F3,
+    /// docs/questions/Q-976, Q-977): the request stays approved. The id is
+    /// the class: 1 keyd refused (the decision's execution already changed
+    /// key state) at a `Withdraw` / `Reject`, 2 keyd not reached at a
+    /// `Withdraw` / `Reject`, 3 keyd not reached after a registration whose
+    /// outcome is unknown.
+    AdminDecisionNotRevoked,
     /// A `Delete` of a user or computer committed but keyd did not register
     /// its `DestroyKeySet` decision (A-102, docs/52 §4.3): the account is
     /// deleted and its key sets are unreachable (docs/51 §9); they wait for
@@ -204,6 +214,9 @@ impl Note {
             Note::AdminDecisionNotRegistered => {
                 "approval completed a key request but keyd did not register its decision: \
                  approval withdrawn, answered unavailable; failure class"
+            }
+            Note::AdminDecisionNotRevoked => {
+                "keyd did not revoke a key request's decision: request kept approved; class"
             }
             Note::AdminDestroyNotRegistered => {
                 "account deleted but keyd did not register its destroy decision (key sets \

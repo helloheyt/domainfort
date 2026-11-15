@@ -108,12 +108,13 @@ fn kind_tables_are_as_documented() {
     // 0x12 `register_decision`, 0x13 `seal_ceremony`, 0x14
     // `list_destroy_decisions` appended by A-102 (docs/52 §4.6); 0x15
     // `verify_operation_ticket` appended by Q-523; 0x16-0x18 the three
-    // change-password operations, appended by task K4 (docs/53 §5.5).
-    assert_eq!(request_kind::ALL, (0x01..=0x18).collect::<Vec<u8>>());
+    // change-password operations, appended by task K4 (docs/53 §5.5); 0x19
+    // `revoke_decision`, appended by task F3 (docs/questions/Q-976).
+    assert_eq!(request_kind::ALL, (0x01..=0x19).collect::<Vec<u8>>());
     for (request, reply) in request_kind::ALL.iter().zip(reply_kind::ALL) {
         assert_eq!(*reply, 0x80 | request);
     }
-    assert_eq!(&reply_kind::ALL[24..], &[0xF1, 0xF2, 0xF3]);
+    assert_eq!(&reply_kind::ALL[25..], &[0xF1, 0xF2, 0xF3]);
     assert!(!request_kind::ALL.contains(&REFUSED_KIND));
     assert!(!reply_kind::ALL.contains(&REFUSED_KIND));
     let body = request_body(&Call::Ping);
@@ -164,6 +165,7 @@ fn is_refusal(answer: &Answer) -> bool {
             | Answer::OpenChangePasswordRequest(Ok(_))
             | Answer::CompleteChangePassword(Ok(_))
             | Answer::SealChangePasswordError(Ok(_))
+            | Answer::RevokeDecision(Ok(_))
     )
 }
 

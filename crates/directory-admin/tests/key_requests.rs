@@ -6,8 +6,8 @@
 //! `Approve` that completes the quorum yields the decision dird registers
 //! in keyd (docs/52 §4.3), one that does not yields none, an approval after
 //! the quorum is a conflict, and a decision that could not be registered
-//! reverts its approval; an approved key request is neither withdrawn nor
-//! rejected (its decision is in keyd). The key set of a service object carries the
+//! reverts its approval; an approved key request is withdrawn or rejected
+//! only once keyd revoked its decision (task F3). The key set of a service object carries the
 //! purpose its name derives — `AdminService` for the admin service,
 //! `Service` for the LDAP service (docs/52 R2b). The registration itself
 //! runs against the real dird and keyd in crates/directory-daemon
@@ -15,7 +15,8 @@
 //!
 //! Sources: docs/51 §5.6, §6; docs/24 §6 (principle: sign the exact
 //! operation); docs/10 §1, §7; docs/questions/Q-420, Q-460, Q-491 item 1,
-//! Q-493 item 1, Q-882; docs/52 §4.2, §4.3 (A-102), R2b. Every value is
+//! Q-493 item 1, Q-882, Q-937 item 6, Q-977, Q-978 (task F3; A-126);
+//! docs/52 §4.2, §4.3 (A-102), R2b. Every value is
 //! constructed by hand for these tests; no vector comes from any other
 //! implementation.
 
@@ -23,8 +24,8 @@ mod common;
 
 use common::{request_view, with_policy_admin, Domain};
 use directory_admin::{
-    KeyOperation, KeyRef, KeyTargets, ProposedOperation, RegistrationOutcome, RequestState,
-    RequestStep, StepReply,
+    KeyOperation, KeyRef, KeyTargets, ProposedOperation, RefusalStatus, RegistrationOutcome,
+    RequestState, RequestStep, RevocationFailure, StepReply,
 };
 use dtyp::Guid;
 use ipc_audit::{
@@ -396,15 +397,38 @@ fn a_key_operation_cannot_name_a_purpose_against_the_name() {
     );
 }
 
-/// docs/52 §4.3 (A-102: the decision is registered in keyd at the quorum),
-/// Q-460 (it lives for the request's remaining lifetime), class C14 (one
-/// fact, one holder — docs/questions/Q-937 item 6): a pending key request
-/// may be withdrawn, but once its quorum is reached neither its requester's
-/// `Withdraw` nor an approver's `Reject` is answered "done" — keyd's
-/// decision would not be revoked — so both are a `Conflict`, and the request
-/// stays approved.
+/// The state of request `id` as admin1 sees it, or `None` when it is gone
+/// (`PendingUnknown`).
+fn state_of(d: &mut Domain, id: u64) -> Option<RequestState> {
+    match d.step(RequestStep::Show { id }, "admin1") {
+        Ok(shown) => match shown.reply() {
+            StepReply::Shown(detail) => Some(detail.state),
+            other => panic!("{other:?}"),
+        },
+        Err(refusal) => {
+            assert_eq!(
+                refusal.event().stage,
+                DirAdminStage::Decision(DecisionResult::Refused(AdminRefusal::PendingUnknown))
+            );
+            None
+        }
+    }
+}
+
+/// Task F3 (docs/questions/Q-937 item 6 — the residual of A-159 — and
+/// Q-977; docs/52 §4.3, A-102: the decision is registered in keyd at the
+/// quorum; class C14, one fact, one holder): a pending key request is
+/// withdrawn at once (keyd holds nothing for it). Once its quorum is
+/// reached, its requester's `Withdraw` and an approver's `Reject` each
+/// yield a [`directory_admin::RevocationStep`] naming the decision —
+/// the request's id — and the request **stays approved** until the caller
+/// reports keyd's revocation: when keyd refused (the decision ran) the step
+/// is a `Conflict`, when keyd was not reached it is `Unavailable` — both
+/// with the request kept; once keyd revoked it, `complete_revocation`
+/// removes the request and the step's `Decision(Proceed)` event and "done"
+/// stand.
 #[test]
-fn an_approved_key_request_is_not_withdrawn_or_rejected() {
+fn an_approved_key_request_leaves_only_through_keyds_revocation() {
     let mut d = Domain::new("kr-handed-over");
     with_policy_admin(&mut d);
     let (pending, _) = proposed(&mut d, KeyOperation::RotateKrbtgt);
@@ -412,6 +436,8 @@ fn an_approved_key_request_is_not_withdrawn_or_rejected() {
         .step(RequestStep::Withdraw { id: pending }, "admin1")
         .unwrap();
     assert_eq!(withdrawn.reply(), &StepReply::Done);
+    assert_eq!(withdrawn.revocation(), None);
+    assert_eq!(state_of(&mut d, pending), None);
 
     let (id, digest) = proposed(&mut d, KeyOperation::RotateKrbtgt);
     let approved = d.approve(id, digest, "admin2").unwrap();
@@ -420,16 +446,134 @@ fn an_approved_key_request_is_not_withdrawn_or_rejected() {
         (RequestStep::Withdraw { id }, "admin1"),
         (RequestStep::Reject { id, digest }, "admin2"),
     ] {
-        let refused = d.step(step, caller).unwrap_err();
+        let stepped = d.step(step, caller).unwrap();
+        assert_eq!(stepped.revocation(), Some(DecisionId::new(id)));
+        assert!(stepped.decision().is_none());
+        let revocation = stepped.into_revocation().unwrap();
+        assert_eq!(revocation.decision(), DecisionId::new(id));
+        assert_eq!(revocation.reply(), &StepReply::Done);
+        assert_eq!(
+            revocation.event().stage,
+            DirAdminStage::Decision(DecisionResult::Proceed)
+        );
+        assert_eq!(revocation.event().pending_request, Some(id));
+        assert_eq!(
+            revocation.event().key_operation,
+            Some(KeydOperation::RotateKrbtgt)
+        );
+        // keyd refused (the decision ran) / keyd not reached: refused, kept.
+        let refused = revocation.refusal(RevocationFailure::Refused);
         assert_eq!(
             refused.event().stage,
             DirAdminStage::Decision(DecisionResult::Refused(AdminRefusal::Conflict))
         );
+        assert_eq!(refused.status(), RefusalStatus::Conflict);
         assert_eq!(refused.event().pending_request, Some(id));
+        let failed = revocation.refusal(RevocationFailure::Unavailable);
+        assert_eq!(
+            failed.event().stage,
+            DirAdminStage::Decision(DecisionResult::Failed(AdminFailure::KeydUnavailable))
+        );
+        assert_eq!(failed.status(), RefusalStatus::Unavailable);
+        assert_eq!(state_of(&mut d, id), Some(RequestState::Approved));
     }
-    let shown = d.step(RequestStep::Show { id }, "admin1").unwrap();
-    let StepReply::Shown(detail) = shown.reply() else {
-        panic!("{:?}", shown.reply());
+    // keyd revoked it: the request is gone, once.
+    let revocation = d
+        .step(RequestStep::Withdraw { id }, "admin1")
+        .unwrap()
+        .into_revocation()
+        .unwrap();
+    assert!(d.requests.complete_revocation(&revocation));
+    assert!(!d.requests.complete_revocation(&revocation));
+    assert_eq!(state_of(&mut d, id), None);
+}
+
+/// Task F3 (docs/questions/Q-977 items 1, 3; class C14): an approved key
+/// request never leaves the table except through keyd's revocation (or
+/// expiry) — `discard` (the path of an unrecorded proposal) refuses it,
+/// while it still drops a pending one; after a registration whose outcome
+/// dird did not learn, keyd's revocation removes it through the
+/// `QuorumStep`.
+#[test]
+fn an_approved_key_request_is_not_discarded() {
+    let mut d = Domain::new("kr-not-discarded");
+    with_policy_admin(&mut d);
+    let (pending, _) = proposed(&mut d, KeyOperation::RotateKrbtgt);
+    assert!(d.requests.discard(pending));
+    assert_eq!(state_of(&mut d, pending), None);
+
+    let (id, digest) = proposed(&mut d, KeyOperation::RotateKrbtgt);
+    let quorum = d
+        .approve(id, digest, "admin2")
+        .unwrap()
+        .into_quorum()
+        .unwrap();
+    assert!(!d.requests.discard(id));
+    assert_eq!(state_of(&mut d, id), Some(RequestState::Approved));
+    assert!(d.requests.revoked_after_unknown_registration(&quorum));
+    assert_eq!(state_of(&mut d, id), None);
+    assert!(!d.requests.revoked_after_unknown_registration(&quorum));
+}
+
+/// Task F3 (owner decision A-126 on docs/questions/Q-660 item 11; Q-978;
+/// docs/52 R2b — the one derivation): when dird's key targets include the
+/// change-password service's key set (`kadmin/changepw` derives
+/// `ChangePasswordService`), a `RotateKey` / `RetireKvno` request naming
+/// its object goes through the same dual-control path as the other
+/// service keys, and the quorum yields the decision on exactly that key
+/// set. The object here is the test domain's DC01 computer, named
+/// `kadmin/changepw` in the targets (test data).
+#[test]
+fn the_change_password_key_set_is_a_dual_controlled_target() {
+    let mut d = Domain::new("kr-changepw");
+    with_policy_admin(&mut d);
+    let changepw = common::guid(common::DC01);
+    let change_password_name = PrincipalName {
+        name_type: krb_proto::constants::KRB_NT_SRV_INST,
+        name_string: vec![
+            KerberosString::new("kadmin").unwrap(),
+            KerberosString::new("changepw").unwrap(),
+        ],
     };
-    assert_eq!(detail.state, RequestState::Approved);
+    let mut targets = common::domain_targets();
+    targets.services.insert(ServiceKeyHandle::of_service(
+        principal(changepw),
+        &change_password_name,
+    ));
+    d.requests = directory_admin::PendingRequests::new(
+        targets,
+        directory_admin::REQUEST_LIFETIME,
+        directory_admin::REQUESTS_PER_REQUESTER,
+    )
+    .unwrap();
+    let handle = KeyHandle::new(principal(changepw), KeyPurpose::ChangePasswordService);
+    let rotate = KeyOperation::RotateKey { service: changepw };
+    let (id, digest) = proposed(&mut d, rotate);
+    let decision = d
+        .approve(id, digest, "admin2")
+        .unwrap()
+        .decision()
+        .unwrap()
+        .clone();
+    assert_eq!(decision.id, DecisionId::new(id));
+    assert_eq!(decision.operation, DecidedOperation::RotateKey { handle });
+    assert!(decision.operation.purposes_permitted());
+    let retire = KeyOperation::RetireKvno {
+        key: KeyRef::Service(changepw),
+        kvno: 1,
+    };
+    let (id, digest) = proposed(&mut d, retire);
+    let decision = d
+        .approve(id, digest, "admin2")
+        .unwrap()
+        .decision()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        decision.operation,
+        DecidedOperation::RetireKvno {
+            handle,
+            kvno: Kvno::new(1)
+        }
+    );
 }

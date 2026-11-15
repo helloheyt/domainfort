@@ -66,6 +66,7 @@ use keyd_types::{
 };
 use krb_proto::constants::KRB_NT_SRV_INST;
 use krb_proto::{KerberosString, NonZeroResultCode, PrincipalName, Realm};
+use provision_manifest::Manifest;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -173,19 +174,24 @@ impl KpasswdNotStarted {
 }
 
 /// The change-password service's key set: `kadmin/changepw` resolved as the
-/// KDC resolves it, which must give a `ChangePasswordService` key set
-/// (module documentation).
+/// KDC resolves it, which must give a `ChangePasswordService` key set **and**
+/// be exactly the manifest's change-password service handle (A-163;
+/// docs/questions/Q-964 item 4) — the same check the admin service's handle
+/// gets (`admin_service_handle`). Anything else ⇒ the service does not start
+/// (fail closed).
 /// Spec: RFC 3244 §2; docs/53 §5.2; crate kdc `as_exchange.rs` A8a; docs/52
-/// R2b.
+/// R2b; docs/questions/Q-964 item 4, Q-975.
 pub(crate) fn change_password_service_handle(
     view: &DirectoryView<'_>,
     realm: &Realm,
+    manifest: &Manifest,
 ) -> Result<KeyHandle, KpasswdNotStarted> {
     let name = change_password_service_name().ok_or(KpasswdNotStarted::Configuration)?;
     match view.service(realm, &name) {
         Ok(Some(account))
             if account.key.purpose == KeyPurpose::ChangePasswordService
-                && account.key.purpose == KeyPurpose::of_service_name(&name) =>
+                && account.key.purpose == KeyPurpose::of_service_name(&name)
+                && account.key == manifest.change_password_service().handle =>
         {
             Ok(account.key)
         }

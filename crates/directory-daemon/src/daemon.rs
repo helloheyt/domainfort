@@ -560,11 +560,16 @@ fn start_admin(
         directory_admin::DirectoryAdmin::new(config, &schema, directory_admin::OsRandom::new())
             .map_err(|_| NotStarted::Configuration)?;
     let verifier = factory().ok_or(NotStarted::NoKeyd)?;
+    // The key sets a key operation may name: all from the manifest (krbtgt
+    // and every service object — the change-password service's included, so
+    // that its rotation goes through the same dual-controlled decision as the
+    // other service keys: A-126, task F3, A-163; docs/questions/Q-978).
+    let targets = key_targets(&admin.manifest);
     // The pending requests of every dual-controlled operation (task D2-c;
     // docs/questions/Q-882): their ids are drawn from the CSPRNG by the PEP
     // (no counter a restart could reset — Q-882 item 3).
     let requests = directory_admin::PendingRequests::new(
-        key_targets(&admin.manifest),
+        targets,
         admin.request_lifetime,
         admin.requests_per_requester,
     )
@@ -660,7 +665,7 @@ fn start_kpasswd(
         let view = ctx
             .view(store, &tiers)
             .map_err(|_| KpasswdNotStarted::DirectoryUnreadable)?;
-        change_password_service_handle(&view, &params.keyd.realm)?
+        change_password_service_handle(&view, &params.keyd.realm, &admin.manifest)?
     };
     // The admin service's configuration: one ticket-age threshold (R51-10,
     // docs/53 §5.6 step 4), the same protected objects and node-id.

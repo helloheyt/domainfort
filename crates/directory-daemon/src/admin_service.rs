@@ -63,7 +63,7 @@
 //!   decision (`RotateKrbtgt` / `RotateKey` / `RetireKvno`, the approvers,
 //!   the request's remaining lifetime), after the step's decision event was
 //!   acknowledged; any failure reverts the approval and answers
-//!   `Unavailable`;
+//!   `Unavailable` — an unknown outcome is first revoked (task F3, below);
 //! * after a `Delete` of a user or computer committed — a `DestroyKeySet`
 //!   decision for its tombstone, live `keyd_types::MAX_DESTROY_DECISION_SECS`;
 //!   a failure is noted (`AdminDestroyNotRegistered`) and the `Delete` still
@@ -74,6 +74,13 @@
 //!   [`DESTROY_RECONCILE_INTERVAL`] — so that a destroy decision
 //!   lost by a keyd restart or a failed registration is registered again
 //!   (A-105; crate::reconcile).
+//!
+//! dird **revokes** key-operation decisions (task F3; docs/questions/Q-937
+//! item 6, Q-976, Q-977; [`TicketVerifier::revoke_decision`]): the decision
+//! of an approved key request that is withdrawn or rejected — the request
+//! leaves dird only once keyd answered the revocation — and the decision of
+//! a key request whose registration outcome dird did not learn (the request
+//! is then dropped; keyd not reached ⇒ it stays approved).
 //!
 //! Each registration is a [`crate::DecisionRegistration`], which dird builds
 //! only from its evidence — an acknowledged decision event, an applied write,
@@ -365,6 +372,18 @@ pub trait TicketVerifier: Send {
         decision: DecisionRegistration,
     ) -> Result<(), RegistrationFailure>;
 
+    /// Revoke in keyd dird's key-operation decision `id` (keyd's
+    /// `revoke_decision`, Role::Ldap; task F3): `Ok` — no execution can
+    /// consume it any more; `Err(Denied)` — keyd refused (the decision's
+    /// execution already changed key state); `Err(Unavailable)` — keyd was
+    /// not reached or its answer was lost (not sent, not performed or
+    /// outcome unknown alike: the revocation is idempotent, so the caller
+    /// keeps what depends on it and may ask again). No default: every
+    /// verifier says how it revokes.
+    /// Spec: docs/52 §4.2; docs/10 §10; docs/questions/Q-937 item 6, Q-976,
+    /// Q-977.
+    fn revoke_decision(&mut self, id: DecisionId) -> Result<(), keyd_types::Error>;
+
     /// One page of keyd's pending destroy decisions strictly after `after`
     /// (keyd's `list_destroy_decisions`, Role::Ldap since task R6), for the
     /// re-registration of lost ones (crate::reconcile); `None` when keyd
@@ -447,6 +466,13 @@ where
         decision: DecisionRegistration,
     ) -> Result<(), RegistrationFailure> {
         register_with_fate(&mut self.client, &decision)
+    }
+
+    /// Not a state call (it only makes keyd stricter): `call`, every
+    /// transport failure `Unavailable` (task F3).
+    /// Spec: docs/52 §4.2; docs/questions/Q-976, Q-977.
+    fn revoke_decision(&mut self, id: DecisionId) -> Result<(), keyd_types::Error> {
+        self.client.revoke_decision(id)
     }
 
     /// A read: `call` (the fate is not needed — nothing changes either way).
@@ -771,23 +797,26 @@ pub(crate) fn admin_service_handle(
 }
 
 /// The key sets a key-operation request may name: the manifest's krbtgt
-/// account and its two service objects (the randomized key sets of the
-/// ceremony, docs/51 §4.3 step 11) — each service object's key set derived
-/// from its binding's name (`Service` for the LDAP service, `AdminService`
-/// for the admin service), the one derivation the KDC uses (docs/52 R2b;
-/// docs/questions/Q-493 item 1).
-/// Spec: docs/51 §4.3 steps 8, 11, §6; docs/questions/Q-420; docs/47 §1.3.
+/// account and **every** service object it names
+/// (`Manifest::service_objects` — the LDAP, admin and change-password
+/// services: the randomized key sets of the ceremony, docs/51 §4.3 step 11)
+/// — each service object's key set derived from its binding's name
+/// (`Service`, `AdminService`, `ChangePasswordService`), the one derivation
+/// the KDC uses (docs/52 R2b; docs/questions/Q-493 item 1). The
+/// change-password service's key set is a target since A-126 / task F3
+/// (rotation through a decision only); it is taken from the manifest, not
+/// from a directory lookup (A-163; docs/questions/Q-978 item 5).
+/// Spec: docs/51 §4.3 steps 8, 11, §6; docs/questions/Q-420, Q-975; docs/47
+/// §1.3.
 #[must_use]
 pub fn key_targets(manifest: &Manifest) -> KeyTargets {
-    let service = |set: &provision_manifest::KeySet| {
-        ServiceKeyHandle::of_service(set.handle.principal, &set.binding.name)
-    };
     KeyTargets {
         krbtgt: guid_of(&manifest.krbtgt().handle),
-        services: BTreeSet::from([
-            service(manifest.ldap_service()),
-            service(manifest.admin_service()),
-        ]),
+        services: manifest
+            .service_objects()
+            .into_iter()
+            .map(|set| ServiceKeyHandle::of_service(set.handle.principal, &set.binding.name))
+            .collect(),
     }
 }
 
@@ -797,10 +826,15 @@ pub fn key_targets(manifest: &Manifest) -> KeyTargets {
 #[must_use]
 pub fn protected_objects(manifest: &Manifest, policy: &DevelopmentPolicy) -> ProtectedObjects {
     ProtectedObjects {
-        service_objects: BTreeSet::from([
-            guid_of(&manifest.ldap_service().handle),
-            guid_of(&manifest.admin_service().handle),
-        ]),
+        // Every provisioned service object — the change-password service's
+        // included (A-163; docs/questions/Q-975): iterated, never listed one
+        // by one, so a service object added to the manifest is protected
+        // without an edit here.
+        service_objects: manifest
+            .service_objects()
+            .into_iter()
+            .map(|set| guid_of(&set.handle))
+            .collect(),
         policy_principals: BTreeSet::from([policy.mandatory_fast.bootstrap_group]),
     }
 }

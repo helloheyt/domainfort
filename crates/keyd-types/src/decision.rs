@@ -35,6 +35,13 @@
 //! (docs/52 §3.10 (a), C10: "outcome unknown" becomes "ask again"), never a
 //! second execution.
 //!
+//! A key-operation decision not yet executed can be **revoked** by the role
+//! that registers decisions (`revoke_decision`, task F3 — dird, when the
+//! pending request it came from is withdrawn or rejected): keyd then keeps
+//! its id as revoked for [`MAX_KEY_DECISION_SECS`], so neither an execution
+//! nor a later registration under that id is accepted
+//! (docs/questions/Q-937 item 6, Q-976).
+//!
 //! # The approvers
 //!
 //! dird verified every approver's AP-REQ and PDP decision; keyd records
@@ -104,8 +111,9 @@ pub enum DecidedOperation {
         /// The krbtgt handle.
         krbtgt: KeyHandle,
     },
-    /// Rotate a key set (a service object's randomized `Service` key set,
-    /// docs/51 §6).
+    /// Rotate a key set (a service object's randomized key set, docs/51 §6:
+    /// `Service`, `AdminService`, and — task F3, A-126 — the change-password
+    /// service's `ChangePasswordService`; `rotate_key`'s purpose table).
     RotateKey {
         /// The key set.
         handle: KeyHandle,
@@ -511,6 +519,26 @@ mod tests {
         assert!(!DecidedOperation::RotateKrbtgt { krbtgt: service }.purposes_permitted());
         assert!(!DecidedOperation::RotateKey { handle: krbtgt }.purposes_permitted());
         assert!(DecidedOperation::RotateKey { handle: service }.purposes_permitted());
+        // Task F3 (A-126; docs/questions/Q-660 item 11): the change-password
+        // service's key set is rotated through a decision like the admin
+        // service's; a password key set's `ChangePassword` decision still
+        // never names it.
+        let change_password_service = KeyHandle::new(p, KeyPurpose::ChangePasswordService);
+        assert!(DecidedOperation::RotateKey {
+            handle: change_password_service
+        }
+        .purposes_permitted());
+        assert_eq!(
+            DecidedOperation::RotateKey {
+                handle: change_password_service
+            }
+            .family(),
+            DecisionFamily::KeyOperation
+        );
+        assert!(!DecidedOperation::RotateKrbtgt {
+            krbtgt: change_password_service
+        }
+        .purposes_permitted());
         assert!(!DecidedOperation::RetireKvno {
             handle: krbtgt,
             kvno: Kvno::new(0)

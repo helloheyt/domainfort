@@ -416,6 +416,27 @@ fn admin_and_directory_operations_through_the_client() {
         Ok(Ok(()))
     );
     assert_eq!(admin.rotate_krbtgt(rotate_krbtgt), Ok(Ok(Kvno::new(2))));
+    // Task F3 (docs/questions/Q-976): dird (Ldap) revokes a registered key
+    // decision through `0x19`; keyadm's execution is then refused, and only
+    // Ldap may revoke. An executed decision is not revoked.
+    let revoked = keyd::DecisionId::new(17);
+    assert_eq!(
+        ldap.register_decision(
+            revoked,
+            &keyd::DecidedOperation::RotateKrbtgt { krbtgt },
+            &approvers,
+            900
+        ),
+        Ok(Ok(()))
+    );
+    assert_eq!(admin.revoke_decision(revoked), Err(keyd::Error::Denied));
+    assert_eq!(ldap.revoke_decision(revoked), Ok(()));
+    assert_eq!(ldap.revoke_decision(revoked), Ok(()));
+    assert_eq!(admin.rotate_krbtgt(revoked), Ok(Err(keyd::Error::Denied)));
+    assert_eq!(
+        ldap.revoke_decision(rotate_krbtgt),
+        Err(keyd::Error::Denied)
+    );
 
     let alice = samples::handle(0xA1, KeyPurpose::PrincipalLongterm);
     let pass = || Zeroizing::new(String::from(samples::PASSWORD));

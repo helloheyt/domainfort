@@ -191,6 +191,10 @@ pub mod request_kind {
     /// Appended by task K4.
     /// Spec: docs/53 §5.5, §5.7; docs/10 §5ג.
     pub const SEAL_CHANGE_PASSWORD_ERROR: u8 = 0x18;
+    /// `revoke_decision(id)` (Ldap): take back a key-operation decision dird
+    /// registered. Appended by task F3.
+    /// Spec: docs/52 §4.2, §4.6; docs/questions/Q-937 item 6, Q-976.
+    pub const REVOKE_DECISION: u8 = 0x19;
 
     /// The closed request table. Spec: docs/50 §3.3, §3.4.
     pub const ALL: &[u8] = &[
@@ -218,6 +222,7 @@ pub mod request_kind {
         OPEN_CHANGE_PASSWORD_REQUEST,
         COMPLETE_CHANGE_PASSWORD,
         SEAL_CHANGE_PASSWORD_ERROR,
+        REVOKE_DECISION,
     ];
 }
 
@@ -286,6 +291,9 @@ pub mod reply_kind {
     pub const COMPLETE_CHANGE_PASSWORD: u8 = ok(rq::COMPLETE_CHANGE_PASSWORD);
     /// `SealedReply` (an error reply). Spec: docs/53 §5.5.
     pub const SEAL_CHANGE_PASSWORD_ERROR: u8 = ok(rq::SEAL_CHANGE_PASSWORD_ERROR);
+    /// `()`: the decision is revoked (task F3). Spec: docs/52 §4.2;
+    /// docs/questions/Q-976.
+    pub const REVOKE_DECISION: u8 = ok(rq::REVOKE_DECISION);
     /// A refusal of an authentication step: `keyd_types::AuthnError`.
     /// Spec: docs/10 §9; A-26; A-56.
     pub const AUTHN_FAILURE: u8 = 0xF1;
@@ -323,6 +331,7 @@ pub mod reply_kind {
         OPEN_CHANGE_PASSWORD_REQUEST,
         COMPLETE_CHANGE_PASSWORD,
         SEAL_CHANGE_PASSWORD_ERROR,
+        REVOKE_DECISION,
         AUTHN_FAILURE,
         ISSUE_FAILURE,
         FAILURE,

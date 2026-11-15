@@ -148,6 +148,12 @@ const TIER0_GROUP: u32 = 20;
 const BOOTSTRAP: u32 = 21;
 const BOB: u32 = 30;
 const STAFF_GROUP: u32 = 31;
+/// The change-password service object (`kadmin/changepw`, RFC 3244 §2) —
+/// provisioned only in the worlds that ask for it (task F3).
+const CHANGEPW_SVC: u32 = 15;
+/// Its RID: outside the RID counter's range taken at provisioning, so the
+/// other worlds' RID allocations are unchanged (test data).
+const CHANGEPW_RID: u32 = 1190;
 
 /// The principals in the order provisioning takes their RIDs (krbtgt is
 /// RID 502 and takes none).
@@ -183,6 +189,9 @@ fn domain_sid() -> Sid {
 fn rid(id: u32) -> u32 {
     if id == KRBTGT {
         return 502;
+    }
+    if id == CHANGEPW_SVC {
+        return CHANGEPW_RID;
     }
     let position = RID_ORDER.iter().position(|p| *p == id).unwrap();
     1101 + u32::try_from(position).unwrap()
@@ -275,7 +284,7 @@ fn flags(v: u32) -> Vec<Vec<u8>> {
 /// The plan: the shape docs/51 §4.3 step 5 gives `provision domain`
 /// (parents first, members before groups). `with_admin_service` = false
 /// leaves the admin service object out.
-fn plan(with_admin_service: bool) -> Vec<Planned> {
+fn plan(with_admin_service: bool, with_change_password_service: bool) -> Vec<Planned> {
     let account = |id: u32, sam: &str, uac_value: u32, password: bool| {
         let mut attrs = vec![
             ("cn", text(sam)),
@@ -361,6 +370,17 @@ fn plan(with_admin_service: bool) -> Vec<Planned> {
             service(ADMIND_SVC, "admind-svc$", "admind/dc1.example.org"),
         ));
     }
+    // Task F3 (A-126): the change-password service object, as task K9 will
+    // provision it (docs/53 §5.2) — a service object holding
+    // `kadmin/changepw`.
+    if with_change_password_service {
+        plan.push(planned(
+            CHANGEPW_SVC,
+            Some(TIER0_OU),
+            "computer",
+            service(CHANGEPW_SVC, "changepw-svc$", "kadmin/changepw"),
+        ));
+    }
     plan.extend([
         planned(
             ADMIN1,
@@ -404,7 +424,11 @@ fn provisioned_at() -> KerberosTime {
 /// Provision the directory in ONE transaction, with the two counters
 /// (docs/51 §4.3 step 5, §8.3; A-83; Q-358 item 1: every write takes a
 /// change-seq).
-fn provision(path: &Path, with_admin_service: bool) -> Arc<Store> {
+fn provision(
+    path: &Path,
+    with_admin_service: bool,
+    with_change_password_service: bool,
+) -> Arc<Store> {
     let p1: Phase1Schema = phase1().unwrap();
     let store = Store::open(
         path,
@@ -424,7 +448,7 @@ fn provision(path: &Path, with_admin_service: bool) -> Arc<Store> {
         );
     }
     let mut sds: BTreeMap<u32, SecurityDescriptor> = BTreeMap::new();
-    for planned in plan(with_admin_service) {
+    for planned in plan(with_admin_service, with_change_password_service) {
         let class_id = p1.class_by_name(planned.class).unwrap();
         let class = p1.class(class_id).unwrap();
         let sd = match planned.parent {
@@ -519,9 +543,11 @@ fn manifest() -> Manifest {
         krbtgt: g(KRBTGT),
         ldap_service: g(LDAP_SVC),
         admin_service: g(ADMIND_SVC),
-        // Required since task K9 (docs/53 §5.2); not in this directory —
-        // these tests read the LDAP and admin service objects only.
-        change_password_service: g(98),
+        // Required since task K9 (docs/53 §5.2): the change-password
+        // service object `CHANGEPW_SVC`, which the worlds built with
+        // `change_password_service: true` hold — dird takes the key-operation
+        // targets and the protected objects from the manifest (A-163).
+        change_password_service: g(CHANGEPW_SVC),
         first_admins: vec![
             (g(ADMIN1), String::from("admin1")),
             (g(ADMIN2), String::from("admin2")),
@@ -766,6 +792,34 @@ fn admin_keyd(
     }
     let _ = keyd.audit_sink_mut().take();
     Ok(keyd)
+}
+
+/// [`admin_keyd`] plus the change-password service's key set (task F3,
+/// A-126: `create_key` in the ceremony, docs/53 §5.2), for the worlds that
+/// provision its object.
+fn admin_keyd_with_change_password(
+    started: &KerberosTime,
+) -> Result<Keyd<InMemoryKeyStore, RecordBuffer, common::TestEntropy>, keyd::ConfigError> {
+    let mut keyd = admin_keyd(started)?;
+    // A counter-drawn key (the test makes no change-password ticket).
+    keyd.create_key(
+        &common::ADMIN,
+        &changepw_handle(),
+        &keyd::PrincipalBinding::new(common::realm(), common::change_password_name()),
+        &common::now(),
+    )
+    .unwrap();
+    let _ = keyd.audit_sink_mut().take();
+    Ok(keyd)
+}
+
+/// The change-password service's key set: `(objectGUID, ChangePasswordService)`
+/// — the purpose `kadmin/changepw` derives (docs/52 R2b; docs/53 §5.2).
+fn changepw_handle() -> KeyHandle {
+    KeyHandle::new(
+        keyd::PrincipalId::from_bytes(g(CHANGEPW_SVC).to_packet()),
+        KeyPurpose::ChangePasswordService,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1091,6 +1145,16 @@ struct Options {
     reconcile_interval: Duration,
     /// Whether dird is given a `policy_next_path` (task A16).
     policy_next: bool,
+    /// dird's keyd client revokes no decision — keyd not reached (task F3:
+    /// the fail-closed path of a `Withdraw` / `Reject` of an approved key
+    /// request).
+    refuse_revocations: bool,
+    /// dird's keyd client registers decisions but reports their outcome
+    /// unknown (task F3).
+    unknown_registrations: bool,
+    /// Whether the change-password service object and its key set exist
+    /// (task F3, A-126).
+    change_password_service: bool,
 }
 
 /// The decision-acknowledgement wait of the tests that expect auditd to
@@ -1115,6 +1179,9 @@ impl Default for Options {
             refuse_decisions: false,
             reconcile_interval: directory_daemon::DESTROY_RECONCILE_INTERVAL,
             policy_next: true,
+            refuse_revocations: false,
+            unknown_registrations: false,
+            change_password_service: false,
         }
     }
 }
@@ -1151,11 +1218,60 @@ impl TicketVerifier for RefusingDecisions {
         Err(directory_daemon::RegistrationFailure::NotPerformed)
     }
 
+    fn revoke_decision(&mut self, id: DecisionId) -> Result<(), keyd::Error> {
+        self.0.revoke_decision(id)
+    }
+
     fn list_destroy_decisions(
         &mut self,
         after: Option<DecisionId>,
     ) -> Option<keyd_types::DestructionPage> {
         self.0.list_destroy_decisions(after)
+    }
+}
+
+/// dird's keyd client with faults (task F3), the real verifier otherwise:
+/// registrations that reach keyd but whose answer is reported lost (outcome
+/// unknown), and revocations that never reach keyd.
+struct Faults {
+    inner: Box<dyn TicketVerifier>,
+    unknown_registrations: bool,
+    refuse_revocations: bool,
+}
+
+impl TicketVerifier for Faults {
+    fn verify(
+        &mut self,
+        service: &keyd::PrincipalId,
+        operation: &keyd::OperationDigest,
+        ap_req: &[u8],
+    ) -> Result<keyd::OperationTicket, keyd::AuthnError> {
+        self.inner.verify(service, operation, ap_req)
+    }
+
+    fn register_decision(
+        &mut self,
+        decision: directory_daemon::DecisionRegistration,
+    ) -> Result<(), directory_daemon::RegistrationFailure> {
+        let registered = self.inner.register_decision(decision);
+        if self.unknown_registrations {
+            return Err(directory_daemon::RegistrationFailure::OutcomeUnknown);
+        }
+        registered
+    }
+
+    fn revoke_decision(&mut self, id: DecisionId) -> Result<(), keyd::Error> {
+        if self.refuse_revocations {
+            return Err(keyd::Error::Unavailable);
+        }
+        self.inner.revoke_decision(id)
+    }
+
+    fn list_destroy_decisions(
+        &mut self,
+        after: Option<DecisionId>,
+    ) -> Option<keyd_types::DestructionPage> {
+        self.inner.list_destroy_decisions(after)
     }
 }
 
@@ -1222,6 +1338,8 @@ fn start_dird(
     let realm = common::realm();
     let keyd_socket = keyd_socket.to_path_buf();
     let refuse_decisions = options.refuse_decisions;
+    let refuse_revocations = options.refuse_revocations;
+    let unknown_registrations = options.unknown_registrations;
     let factory: VerifierFactory = Arc::new(move || {
         let verifier: Box<dyn TicketVerifier> = Box::new(
             KeydTicketVerifier::new(
@@ -1235,6 +1353,14 @@ fn start_dird(
         if refuse_decisions {
             let refusing: Box<dyn TicketVerifier> = Box::new(RefusingDecisions(verifier));
             return Some(refusing);
+        }
+        if refuse_revocations || unknown_registrations {
+            let faulty: Box<dyn TicketVerifier> = Box::new(Faults {
+                inner: verifier,
+                unknown_registrations,
+                refuse_revocations,
+            });
+            return Some(faulty);
         }
         Some(verifier)
     });
@@ -1286,7 +1412,11 @@ impl World {
         if support::skip_as_root(uid) {
             return None;
         }
-        let store = provision(&dir.join("s.redb"), options.with_admin_service);
+        let store = provision(
+            &dir.join("s.redb"),
+            options.with_admin_service,
+            options.change_password_service,
+        );
         // Task A16: dird's own `policy.next` directory.
         let scratch = test_scratch::ScratchDir::new("dd-pn").unwrap();
         {
@@ -1304,7 +1434,18 @@ impl World {
         let keyd_directory_socket = dir.join("kd.sock");
         let keyd_auditd = support::FakeAuditd::start(&keyd_params.audit.socket);
         let clock = support::TestClock::at(common::keyd_started());
-        let keyd = support::keyd::Daemon::start(keyd_params, clock.clone(), admin_keyd).unwrap();
+        type Build = fn(
+            &KerberosTime,
+        ) -> Result<
+            Keyd<InMemoryKeyStore, RecordBuffer, common::TestEntropy>,
+            keyd::ConfigError,
+        >;
+        let build: Build = if options.change_password_service {
+            admin_keyd_with_change_password
+        } else {
+            admin_keyd
+        };
+        let keyd = support::keyd::Daemon::start(keyd_params, clock.clone(), build).unwrap();
         clock.set(common::now());
 
         // dird's auditd, with a hook recording the change-seq counter at
@@ -2935,6 +3076,319 @@ fn a_decision_keyd_does_not_register_withdraws_the_approval() {
         ))
     );
     assert_eq!(decision(&approvals[2]), PROCEED);
+}
+
+/// The state of request `id` as `viewer` is shown it, or `None` when dird
+/// answers as for an unknown id.
+fn shown_state(
+    client: &mut AdminClient<AdminConnector>,
+    viewer: &str,
+    id: u64,
+) -> Option<RequestState> {
+    match client
+        .call(&by(viewer, Operation::ShowRequest { id }))
+        .unwrap()
+    {
+        Reply::RequestShown(shown) => Some(shown.state),
+        Reply::Refused(RefusalStatus::NotFound) => None,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Task F3 (docs/questions/Q-937 item 6 — the residual of A-159 — Q-976,
+/// Q-977; docs/52 §4.3, A-102; class C14): the `Withdraw` of an approved
+/// key request by its requester, and the `Reject` of one by an approver,
+/// now succeed ("done", no longer `Conflict`): dird has keyd revoke the
+/// decision first (Role::Ldap — keyd's record names the decision), then
+/// removes the request; keyadm's execution by the id is refused
+/// (`DecisionRevoked`) and the request is unknown. A decision keyadm
+/// already executed is not revoked (keyd: `DecisionExecuted`): its
+/// withdrawal is a `Conflict` and the request stays approved.
+#[test]
+fn withdrawing_or_rejecting_an_approved_key_request_revokes_its_decision() {
+    let Some(world) = World::new(Options::default()) else {
+        return;
+    };
+    let mut client = world.client();
+    let mut keyadm = world.keyadm();
+    // Withdrawn by its requester.
+    let rotate = KeyOperation::RotateKrbtgt;
+    let first = pending(client.call(&request_op("admin1", rotate)).unwrap());
+    let approved = pending(
+        client
+            .call(&approve_op("admin2", first.id, rotate))
+            .unwrap(),
+    );
+    assert_eq!(approved.state, RequestState::Approved);
+    assert_eq!(
+        client
+            .call(&by("admin1", Operation::Withdraw { id: first.id }))
+            .unwrap(),
+        Reply::Done
+    );
+    assert_eq!(
+        keyadm.rotate_krbtgt(DecisionId::new(first.id)),
+        Ok(Err(keyd::Error::Denied))
+    );
+    assert_eq!(shown_state(&mut client, "admin1", first.id), None);
+    // Rejected by an approver.
+    let rotate_ldap = KeyOperation::RotateKey {
+        service: g(LDAP_SVC),
+    };
+    let second = pending(client.call(&request_op("admin1", rotate_ldap)).unwrap());
+    pending(
+        client
+            .call(&approve_op("admin2", second.id, rotate_ldap))
+            .unwrap(),
+    );
+    assert_eq!(
+        client
+            .call(&by(
+                "admin2",
+                Operation::Reject {
+                    id: second.id,
+                    digest: second.digest,
+                }
+            ))
+            .unwrap(),
+        Reply::Done
+    );
+    assert_eq!(
+        keyadm.rotate_key(DecisionId::new(second.id)),
+        Ok(Err(keyd::Error::Denied))
+    );
+    assert_eq!(shown_state(&mut client, "admin1", second.id), None);
+    // Executed by keyadm first: keyd does not revoke it — `Conflict`, kept.
+    let third = pending(client.call(&request_op("admin1", rotate_ldap)).unwrap());
+    pending(
+        client
+            .call(&approve_op("admin2", third.id, rotate_ldap))
+            .unwrap(),
+    );
+    assert_eq!(
+        keyadm.rotate_key(DecisionId::new(third.id)),
+        Ok(Ok(Kvno::new(2)))
+    );
+    assert_eq!(
+        client
+            .call(&by("admin1", Operation::Withdraw { id: third.id }))
+            .unwrap(),
+        Reply::Refused(RefusalStatus::Conflict)
+    );
+    assert_eq!(
+        shown_state(&mut client, "admin1", third.id),
+        Some(RequestState::Approved)
+    );
+
+    // dird's trail: each step's decision event, on its request.
+    let withdrawn = await_events(&world, DirAdminOperation::Withdraw, 2);
+    assert_eq!(decision(&withdrawn[0]), PROCEED);
+    assert_eq!(withdrawn[0].pending_request, Some(first.id));
+    assert_eq!(
+        decision(&withdrawn[1]),
+        refused(ipc_audit::AdminRefusal::Conflict)
+    );
+    assert_eq!(withdrawn[1].pending_request, Some(third.id));
+    let rejected = await_events(&world, DirAdminOperation::Reject, 1);
+    assert_eq!(decision(&rejected[0]), PROCEED);
+    assert_eq!(rejected[0].pending_request, Some(second.id));
+    // keyd's trail: dird (Ldap) revoked each decision it held — one record,
+    // no intent — and keyadm's execution was refused as revoked.
+    let revoked = keyd_records_for(&world, ipc_audit::KeydOperation::RevokeDecision, g(KRBTGT));
+    assert_eq!(revoked.len(), 1);
+    assert_eq!(revoked[0].result, ipc_audit::KeydOutcome::Success);
+    assert_eq!(revoked[0].caller_role, ipc_audit::KeydRole::Ldap);
+    assert_eq!(revoked[0].decision, Some(first.id));
+    // (A refusal at the authorization step names the decision, no key set.)
+    assert!(world._keyd_auditd.events().into_iter().any(|e| matches!(
+        e,
+        EventBody::Keyd(r) if r.op == ipc_audit::KeydOperation::RotateKrbtgt
+            && r.decision == Some(first.id)
+            && r.reason == ipc_audit::KeydReason::DecisionRevoked
+    )));
+    let revoked = keyd_records_for(
+        &world,
+        ipc_audit::KeydOperation::RevokeDecision,
+        g(LDAP_SVC),
+    );
+    assert_eq!(revoked.len(), 2);
+    assert_eq!(revoked[0].decision, Some(second.id));
+    assert_eq!(revoked[0].result, ipc_audit::KeydOutcome::Success);
+    assert_eq!(revoked[1].decision, Some(third.id));
+    assert_eq!(revoked[1].result, ipc_audit::KeydOutcome::Denied);
+    assert_eq!(revoked[1].reason, ipc_audit::KeydReason::DecisionExecuted);
+}
+
+/// Task F3 (docs/questions/Q-977; fail closed, AGENTS.md §6): when keyd
+/// does not answer the revocation, the `Withdraw` of an approved key
+/// request is answered `Unavailable` (its decision event
+/// `Failed(KeydUnavailable)`) and the request stays approved — keyd's
+/// decision was not revoked, and keyadm can still execute it.
+#[test]
+fn a_revocation_keyd_does_not_answer_keeps_the_request() {
+    let Some(world) = World::new(Options {
+        refuse_revocations: true,
+        ..Options::default()
+    }) else {
+        return;
+    };
+    let mut client = world.client();
+    let rotate = KeyOperation::RotateKey {
+        service: g(LDAP_SVC),
+    };
+    let state = pending(client.call(&request_op("admin1", rotate)).unwrap());
+    pending(
+        client
+            .call(&approve_op("admin2", state.id, rotate))
+            .unwrap(),
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            client
+                .call(&by("admin1", Operation::Withdraw { id: state.id }))
+                .unwrap(),
+            Reply::Refused(RefusalStatus::Unavailable)
+        );
+        assert_eq!(
+            shown_state(&mut client, "admin1", state.id),
+            Some(RequestState::Approved)
+        );
+    }
+    let withdrawn = await_events(&world, DirAdminOperation::Withdraw, 2);
+    for event in &withdrawn {
+        assert_eq!(
+            event.stage,
+            DirAdminStage::Decision(DecisionResult::Failed(
+                ipc_audit::AdminFailure::KeydUnavailable
+            ))
+        );
+        assert_eq!(event.pending_request, Some(state.id));
+    }
+    assert_eq!(
+        world.keyadm().rotate_key(DecisionId::new(state.id)),
+        Ok(Ok(Kvno::new(2)))
+    );
+}
+
+/// Task F3 (docs/questions/Q-977; class C14 — a decision keyd may hold is
+/// never left without an approved request in dird): when the quorum's
+/// registration outcome is unknown (here keyd did register it), dird
+/// records `Outcome(Failed(KeyOperationOutcomeUnknown))`, has keyd revoke
+/// the decision and drops the request — keyadm's execution is refused and
+/// the request is unknown; when keyd cannot be reached for the revocation
+/// either, the request stays **approved** (keyadm may run the decision it
+/// may hold) and a later `Withdraw` revokes it like any approved key
+/// request.
+#[test]
+fn an_unknown_registration_is_revoked_or_kept_approved() {
+    for refuse_revocations in [false, true] {
+        let Some(world) = World::new(Options {
+            unknown_registrations: true,
+            refuse_revocations,
+            ..Options::default()
+        }) else {
+            return;
+        };
+        let mut client = world.client();
+        let rotate = KeyOperation::RotateKey {
+            service: g(LDAP_SVC),
+        };
+        let state = pending(client.call(&request_op("admin1", rotate)).unwrap());
+        assert_eq!(
+            client
+                .call(&approve_op("admin2", state.id, rotate))
+                .unwrap(),
+            Reply::Refused(RefusalStatus::Unavailable)
+        );
+        let approvals = await_events(&world, DirAdminOperation::Approve, 2);
+        assert_eq!(
+            approvals[1].stage,
+            DirAdminStage::Outcome(OutcomeResult::Failed(
+                ipc_audit::AdminFailure::KeyOperationOutcomeUnknown
+            ))
+        );
+        let id = DecisionId::new(state.id);
+        if refuse_revocations {
+            assert_eq!(
+                shown_state(&mut client, "admin1", state.id),
+                Some(RequestState::Approved)
+            );
+            assert_eq!(
+                client
+                    .call(&by("admin1", Operation::Withdraw { id: state.id }))
+                    .unwrap(),
+                Reply::Refused(RefusalStatus::Unavailable)
+            );
+            assert_eq!(world.keyadm().rotate_key(id), Ok(Ok(Kvno::new(2))));
+        } else {
+            assert_eq!(shown_state(&mut client, "admin1", state.id), None);
+            assert_eq!(world.keyadm().rotate_key(id), Ok(Err(keyd::Error::Denied)));
+            let revoked = keyd_records_for(
+                &world,
+                ipc_audit::KeydOperation::RevokeDecision,
+                g(LDAP_SVC),
+            );
+            assert_eq!(revoked.len(), 1);
+            assert_eq!(revoked[0].result, ipc_audit::KeydOutcome::Success);
+            assert_eq!(revoked[0].decision, Some(state.id));
+        }
+    }
+}
+
+/// Task F3 (owner decision A-126 on docs/questions/Q-660 item 11; Q-978;
+/// docs/52 R2b): with the change-password service object provisioned
+/// (`kadmin/changepw`, as task K9 will), its key set is a target of dird's
+/// key operations — resolved at start as the KDC resolves the name — and is
+/// rotated through the same dual-controlled request as the other service
+/// keys: the quorum registers a `RotateKey` decision on the
+/// `ChangePasswordService` key set, keyadm runs it (kvno 2), and keyd's
+/// records name that purpose. Without a decision keyadm's rotation is
+/// refused.
+#[test]
+fn the_change_password_key_is_rotated_through_the_admin_plane() {
+    let Some(world) = World::new(Options {
+        change_password_service: true,
+        ..Options::default()
+    }) else {
+        return;
+    };
+    let mut client = world.client();
+    let mut keyadm = world.keyadm();
+    let rotate = KeyOperation::RotateKey {
+        service: g(CHANGEPW_SVC),
+    };
+    let state = pending(client.call(&request_op("admin1", rotate)).unwrap());
+    let id = DecisionId::new(state.id);
+    assert_eq!(keyadm.rotate_key(id), Ok(Err(keyd::Error::Denied)));
+    let approved = pending(
+        client
+            .call(&approve_op("admin2", state.id, rotate))
+            .unwrap(),
+    );
+    assert_eq!(approved.state, RequestState::Approved);
+    assert_eq!(keyadm.rotate_key(id), Ok(Ok(Kvno::new(2))));
+    for op in [
+        ipc_audit::KeydOperation::RegisterDecision,
+        ipc_audit::KeydOperation::RotateKey,
+    ] {
+        let records = keyd_records_for(&world, op, g(CHANGEPW_SVC));
+        let succeeded: Vec<_> = records
+            .iter()
+            .filter(|r| r.result == ipc_audit::KeydOutcome::Success)
+            .collect();
+        assert_eq!(succeeded.len(), 1, "{op:?}: {records:?}");
+        assert_eq!(
+            succeeded[0].purpose,
+            Some(ipc_audit::KeyPurposeCode::ChangePasswordService)
+        );
+        assert_eq!(succeeded[0].decision, Some(state.id));
+    }
+    let approvals = await_events(&world, DirAdminOperation::Approve, 2);
+    assert_eq!(
+        approvals[1].stage,
+        DirAdminStage::Outcome(OutcomeResult::Committed { allocated: None })
+    );
+    assert_eq!(approvals[1].target, Some(g(CHANGEPW_SVC).to_packet()));
 }
 
 /// docs/51 §5.6 (distinct, `decide` = Allow for the same Action and

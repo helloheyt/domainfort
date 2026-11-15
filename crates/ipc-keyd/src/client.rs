@@ -599,6 +599,8 @@ const _: () = {
         // change no key state (bookkeeping only).
         Operation::OpenChangePasswordRequest,
         Operation::SealChangePasswordError,
+        // Task F3: the revocation only makes keyd stricter (one record).
+        Operation::RevokeDecision,
     ];
     let state = [
         Operation::SetSecret,
@@ -1157,6 +1159,25 @@ impl<C: Connector> KeydClient<C> {
             Answer::RegisterDecision(result) => Some(result),
             _ => None,
         })
+    }
+
+    /// `revoke_decision` (Role::Ldap — dird): take back the key-operation
+    /// decision `id` it registered (task F3). Not a state call: it only makes
+    /// keyd stricter (one record, docs/10 §10), and it is idempotent — so a
+    /// caller that did not learn the answer (`Unavailable`: not sent, not
+    /// performed or outcome unknown, all alike) keeps what depends on it and
+    /// asks again. `Denied`: the decision's execution already changed key
+    /// state (or the caller's role may not revoke).
+    /// Spec: docs/52 §4.2; docs/10 §10; docs/questions/Q-937 item 6, Q-976.
+    pub fn revoke_decision(&mut self, id: DecisionId) -> Result<(), keyd_types::Error> {
+        self.issuance(
+            Call::RevokeDecision { id },
+            |answer| match answer {
+                Answer::RevokeDecision(result) => Some(result),
+                _ => None,
+            },
+            keyd_types::Error::Unavailable,
+        )
     }
 
     /// docs/10 §7א `describe_config` (Kdc, Ldap): keyd's description (the

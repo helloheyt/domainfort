@@ -136,8 +136,16 @@
 //!    failure ⇒ the approval is **reverted**
 //!    (`PendingRequests::revert_approval`: the approver may approve again;
 //!    keyd accepts an identical decision again unchanged) and the answer is
-//!    `Unavailable`. An `Approve` that does not complete a key request's
-//!    quorum releases the second slot.
+//!    `Unavailable` — except an **unknown** registration outcome (task F3,
+//!    docs/questions/Q-977): keyd may hold the decision, so dird revokes it
+//!    (`revoke_decision`) and drops the request, or, keyd not reached, keeps
+//!    the request approved. An `Approve` that does not complete a key
+//!    request's quorum releases the second slot. A `Withdraw` / `Reject` of
+//!    an **approved key request** (task F3; docs/questions/Q-937 item 6,
+//!    Q-976) takes effect only after keyd revoked its decision: revoked ⇒
+//!    the request removed, the step's decision event committed, "done";
+//!    keyd refused (the decision ran) ⇒ `Conflict`; keyd not reached ⇒
+//!    `Unavailable`; the request stays in both.
 //!
 //! An approved directory or policy request is executed by its requester —
 //! the operation itself, sent again with a fresh AP-REQ (steps 0-9 above /
@@ -209,7 +217,7 @@ use core::time::Duration;
 use directory_admin::{
     DirectoryAdmin, KeyDecision, Operation as PepOperation, OsRandom, PendingRequests, PolicyFile,
     Prepared, ProposeRequest, ProposedOperation, RegistrationOutcome, Request as PepRequest,
-    RequestStep, StepRequest, Stepped, VerificationFailure, VerifiedTicket,
+    RequestStep, RevocationFailure, StepRequest, Stepped, VerificationFailure, VerifiedTicket,
 };
 use directory_admin::{PolicyCandidate, PolicyChangeRequest};
 use directory_pip::{DirectoryContext, TierMap};
@@ -724,6 +732,11 @@ impl Running {
             Some(Ok(stepped)) if stepped.decision().is_some() => {
                 self.register_key_decision(stepped, first, second)
             }
+            // Step 4 (task F3): the Withdraw / Reject of an approved key
+            // request — keyd revokes its decision first.
+            Some(Ok(stepped)) if stepped.revocation().is_some() => {
+                self.revoke_key_decision(stepped, first, second)
+            }
             // Step 4: the event into its slot, then the reply.
             Some(Ok(stepped)) => {
                 self.release(second);
@@ -809,9 +822,84 @@ impl Running {
         self.commit_outcome(second, &quorum.registration_event(outcome));
         match registered {
             Ok(()) => wire_step_reply(quorum.reply()),
+            // Task F3 (docs/questions/Q-977): keyd may hold the decision, so
+            // the approval is not simply reverted — a decision keyd may hold
+            // is never left without an approved request here. keyd revokes
+            // it first (an id keyd does not hold is revoked too, so a
+            // registration still in flight cannot come back): revoked ⇒ the
+            // request is dropped (its id stays revoked in keyd, so it could
+            // never be registered again — the requester proposes anew);
+            // keyd not reached ⇒ the request stays approved, and a later
+            // `Withdraw` / `Reject` revokes it like any approved key request.
+            Err(failure @ RegistrationFailure::OutcomeUnknown) => {
+                note(Note::AdminDecisionNotRegistered, Some(failure.code()));
+                match self.worker.verifier.revoke_decision(quorum.decision().id) {
+                    Ok(()) => {
+                        let _ = self
+                            .worker
+                            .requests
+                            .revoked_after_unknown_registration(&quorum);
+                    }
+                    Err(_) => note(Note::AdminDecisionNotRevoked, Some(3)),
+                }
+                Reply::Refused(RefusalStatus::Unavailable)
+            }
             Err(failure) => {
                 note(Note::AdminDecisionNotRegistered, Some(failure.code()));
                 self.revert(quorum.decision())
+            }
+        }
+    }
+
+    /// Step 4 of a `Withdraw` / `Reject` of an approved key request (task
+    /// F3; module documentation, "The request queue"): keyd revokes the
+    /// request's decision (Role::Ldap, `revoke_decision`) **first**; only
+    /// then is the request removed, the step's `Decision` event committed
+    /// and "done" answered. keyd refusing — the decision's execution already
+    /// changed key state — ⇒ the step's `Conflict` refusal; keyd not reached
+    /// ⇒ `Unavailable`; the request stays approved either way (fail closed),
+    /// and a retry is harmless (the revocation is idempotent).
+    /// Spec: docs/52 §3.14 (C14), §4.2, §4.3 (A-102); docs/questions/Q-937
+    /// item 6, Q-976, Q-977.
+    fn revoke_key_decision(
+        &mut self,
+        stepped: Stepped,
+        first: Option<Reservation>,
+        second: Option<Reservation>,
+    ) -> Reply {
+        self.release(second);
+        let revocation = match stepped.into_revocation() {
+            Ok(revocation) => revocation,
+            Err(_) => {
+                // Cannot happen (the caller checked): nothing is removed.
+                self.release(first);
+                return Reply::Refused(RefusalStatus::Unavailable);
+            }
+        };
+        match self.worker.verifier.revoke_decision(revocation.decision()) {
+            Ok(()) => {
+                let _ = self.worker.requests.complete_revocation(&revocation);
+                match self.commit(first, revocation.event()) {
+                    Some(_) => wire_step_reply(revocation.reply()),
+                    None => {
+                        // Cannot happen (the slot was reserved); no answer
+                        // leaves unaudited — keyd's record of the revocation
+                        // stands.
+                        OUTCOME_UNRECORDED.hit(None);
+                        Reply::Refused(RefusalStatus::Unavailable)
+                    }
+                }
+            }
+            Err(error) => {
+                let (failure, class) = match error {
+                    keyd_types::Error::Denied => (RevocationFailure::Refused, 1),
+                    keyd_types::Error::Unavailable | keyd_types::Error::RateLimited => {
+                        (RevocationFailure::Unavailable, 2)
+                    }
+                };
+                note(Note::AdminDecisionNotRevoked, Some(class));
+                let refusal = revocation.refusal(failure);
+                self.refuse(first, None, refusal.event(), wire_status(refusal.status()))
             }
         }
     }
