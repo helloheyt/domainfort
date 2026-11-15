@@ -16,7 +16,11 @@ if cargo metadata --no-deps --format-version 1 2>/dev/null | grep -q '"packages"
 fi
 
 echo "crates present — running the full Rust gate."
+# --locked (A-155; docs/questions/Q-854 item 1; research r4-b IB5): the gate
+# builds exactly the graph recorded in Cargo.lock. If the lock would change
+# (a manifest edited without the lock, or a resolver drift), cargo refuses
+# instead of silently resolving a different graph than the one reviewed.
 cargo fmt --all --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo build --all
-cargo test --all
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo build --locked --all
+cargo test --locked --all
