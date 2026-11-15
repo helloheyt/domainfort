@@ -78,6 +78,7 @@
 mod admind;
 mod auditd;
 mod dird;
+mod dnsd;
 mod error;
 mod format;
 mod kdc;
@@ -94,6 +95,12 @@ pub use auditd::{AuditSource, AuditdSettings, SourceMap};
 pub use dird::{
     AdminServiceSettings, Channel, DirdSettings, IntegrityKeySource, PolicyStoreFormat,
     VIEW_LIFETIME_SECS,
+};
+pub use dnsd::{
+    DnsdLimits, DnsdSettings, DNSD_MAX_REQUESTS_PER_TCP_CONNECTION_BOUND,
+    DNSD_MAX_TCP_CONNECTIONS_BOUND, DNSD_MAX_TCP_CONNECTIONS_PER_SOURCE_BOUND,
+    DNSD_TCP_FIRST_OCTET_TIMEOUT_SECS, DNSD_TCP_FRAME_TIMEOUT_SECS, DNSD_TCP_IDLE_TIMEOUT_SECS,
+    ZONE_IMAGE_MAX_AGE_SECS,
 };
 pub use error::{Error, ErrorKind};
 pub use kdc::{

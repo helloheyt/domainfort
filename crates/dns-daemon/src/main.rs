@@ -1,0 +1,116 @@
+#![forbid(unsafe_code)]
+//! The dnsd binary: `dns-daemon <configuration file>`.
+//!
+//! The start-up order (docs/54 §4.7, §4.8; docs/50 R50-14, §6.2, §7.5;
+//! crates/daemon-sandbox):
+//!
+//! 1. claim the single-thread proof — the first statement of `main`;
+//! 2. read the configuration path from argv and parse it (crate::startup:
+//!    root-owned, not group/other-writable, bounded);
+//! 3. as root: bind the UDP and TCP listeners — served only once auditd,
+//!    dird and the zone image are there (crate::daemon);
+//! 4. apply the hardening plan while the process has exactly one thread —
+//!    rustix's identity calls act on the calling thread only;
+//! 5. only then build the tokio runtime (current-thread), and serve.
+//!
+//! Every start-up failure exits with a failure code (fail closed, docs/50
+//! §7.5); the service manager restarts with backoff. Messages are fixed
+//! texts on stderr (docs/50 §8.2).
+//!
+//! Spec: docs/54 §4.7, §4.8; docs/50 R50-14, R50-16, §6.2, §7.5, §8.2;
+//! docs/questions/Q-235 (A-61).
+
+use daemon_sandbox::{apply, SingleThreadProof};
+use dns_daemon::log::{note, Note};
+use dns_daemon::startup::{bind_listeners, hardening_plan, read_settings};
+use dns_daemon::{serve, DaemonControl, DaemonParams};
+use std::io::Write;
+use std::path::Path;
+use std::process::ExitCode;
+
+/// The owner the configuration file must have.
+const ROOT_UID: u32 = 0;
+
+/// Write a fixed start-up failure message and return the failure code.
+/// Spec: docs/50 §7.5, §8.2.
+fn fail(what: &str, error: &dyn std::fmt::Display) -> ExitCode {
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "dns-daemon: start-up failed: {what}: {error}"
+    );
+    ExitCode::FAILURE
+}
+
+/// A panic prints a fixed message and its location only (docs/50 §8.2;
+/// core dumps are off, R50-14).
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let mut err = std::io::stderr().lock();
+        let _ = match info.location() {
+            Some(location) => writeln!(
+                err,
+                "dns-daemon: internal error at {}:{}",
+                location.file(),
+                location.line()
+            ),
+            None => writeln!(err, "dns-daemon: internal error"),
+        };
+    }));
+}
+
+fn main() -> ExitCode {
+    // 1. The single-thread proof (R50-14): first statement of main.
+    let proof = match SingleThreadProof::claim() {
+        Ok(proof) => proof,
+        Err(error) => return fail("thread guard", &error),
+    };
+    install_panic_hook();
+
+    // 2. The configuration path from argv (exactly one argument).
+    let mut args = std::env::args_os().skip(1);
+    let (Some(path), None) = (args.next(), args.next()) else {
+        return fail("usage", &"dns-daemon <configuration file>");
+    };
+    let settings = match read_settings(Path::new(&path), ROOT_UID) {
+        Ok(settings) => settings,
+        Err(error) => return fail("configuration", &error),
+    };
+    let params = DaemonParams::from_settings(&settings);
+
+    // 3. As root, before the drop: the listeners (docs/54 §4.7).
+    let listeners = match bind_listeners(&settings) {
+        Ok(listeners) => listeners,
+        Err(error) => return fail("listeners", &error),
+    };
+    note(Note::ListenersBound, None);
+
+    // 4. Hardening, before any thread exists (R50-14).
+    let plan = match hardening_plan(&settings) {
+        Ok(plan) => plan,
+        Err(error) => return fail("hardening plan", &error),
+    };
+    if let Err(error) = apply(&plan, proof) {
+        return fail("hardening", &error);
+    }
+    note(Note::Hardened, None);
+
+    // 5. Only now: the runtime (one current-thread runtime; the zone and
+    //    forwarding threads are spawned inside `serve`).
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => return fail("runtime", &error),
+    };
+    let control = DaemonControl::new();
+    let result = runtime.block_on(serve(params, listeners, control));
+    drop(runtime);
+    match result {
+        Ok(stopped) => match stopped.join() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::FAILURE,
+        },
+        Err(error) => fail("serve", &error),
+    }
+}

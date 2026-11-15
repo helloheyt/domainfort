@@ -315,6 +315,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "dns-daemon"
+version = "0.0.0"
+dependencies = [
+ "config",
+ "daemon-sandbox",
+ "dns-daemon",
+ "dns-zone",
+ "ipc",
+ "ipc-audit",
+ "ipc-audit-client",
+ "ipc-dns",
+ "ipc-dns-server",
+ "parse-dns",
+ "protected-file",
+ "rate-limit",
+ "test-scratch",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "dns-zone"
 version = "0.0.0"
 dependencies = [

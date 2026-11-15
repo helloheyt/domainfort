@@ -67,24 +67,26 @@ use std::path::{Path, PathBuf};
 
 /// The daemon crates whose test seams live in their `test_seams` module
 /// (docs/52 §3.18).
-const DAEMONS: [&str; 5] = [
+const DAEMONS: [&str; 6] = [
     "keyd-daemon",
     "kdc-daemon",
     "directory-daemon",
     "admin-daemon",
     "ldap-front",
+    "dns-daemon",
 ];
 
 /// The crates that declare the feature: the daemons above, dirstore (its
 /// path-taking `Store::open`, A-113), ipc-audit-client (the audit gate's
 /// link side, task R15b; moved from ipc-audit with the gate by task IB1)
 /// and keyd (its entropy seam `Keyd::with_entropy`, Q-843 item 2 — rule 5).
-const DECLARING: [&str; 8] = [
+const DECLARING: [&str; 9] = [
     "keyd-daemon",
     "kdc-daemon",
     "directory-daemon",
     "admin-daemon",
     "ldap-front",
+    "dns-daemon",
     "dirstore",
     "ipc-audit-client",
     "keyd",
