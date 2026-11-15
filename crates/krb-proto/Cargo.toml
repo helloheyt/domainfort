@@ -3,8 +3,10 @@
 #
 # Scope (this crate): core AS / TGS / AP exchanges, KRB-PRIV, KRB-ERROR, the
 # RFC 6113 FAST messages, and the RFC 3244 change-password user data
-# (ChangePasswdData, result codes — docs/53 task K1). KRB-SAFE / KRB-CRED are a
-# later task. Encrypted parts stay opaque here; this crate never encrypts or
+# (ChangePasswdData, result codes — docs/53 task K1), and the project's single
+# definitions of the change-password service name rule and the KerberosTime <->
+# seconds pair (docs/questions/Q-955 item 5, A-158; Q-987). KRB-SAFE / KRB-CRED
+# are a later task. Encrypted parts stay opaque here; this crate never encrypts or
 # decrypts (that is keyd's job via krb-crypto).
 #
 # Written only from RFC 4120 (§3.5, §5, Appendix A, §7.5), RFC 6113 (§5.2,

@@ -46,6 +46,42 @@ use crate::limits::MAX_NEWPASSWD_LEN;
 use parse_asn1::Value;
 
 // ===========================================================================
+// The change-password service principal — RFC 3244 §2
+// ===========================================================================
+
+/// The two name components of the change-password service's principal,
+/// `kadmin/changepw` — the name RFC 3244 §2 gives ("The AP-REQ message must
+/// be for the service principal kadmin/changepw@REALM").
+///
+/// The project's one definition (docs/questions/Q-955 item 5, decision
+/// A-158; class C14): keyd binds the change-password key set to it, the kdc
+/// classifies a ticket request by it, and kpasswd-front names it in the
+/// `sname` of its KRB-ERRORs — keyd-types re-exports it under its former
+/// path; it is moved here unchanged from crates/keyd-types `model.rs`.
+///
+/// Spec: RFC 3244 §2; docs/53 §5.2.
+pub const CHANGE_PASSWORD_SERVICE_NAME: [&str; 2] = ["kadmin", "changepw"];
+
+/// `true` if `name` is the change-password service's: exactly the two
+/// components of [`CHANGE_PASSWORD_SERVICE_NAME`], octet for octet (the
+/// name-type is a hint only — RFC 4120 6.2: "The name-type SHOULD be treated
+/// only as a hint … It is not significant when checking for equivalence";
+/// no canonicalization of this name, [MS-KILE] 3.3.5.1.2 as recorded in
+/// docs/53 §2.2). Moved unchanged from crates/keyd-types `model.rs` (Q-955
+/// item 5), which re-exports it.
+///
+/// Spec: RFC 3244 §2; RFC 4120 6.2; docs/53 R53-6, §5.2.
+#[must_use]
+pub fn is_change_password_service_name(name: &PrincipalName) -> bool {
+    name.name_string.len() == CHANGE_PASSWORD_SERVICE_NAME.len()
+        && name
+            .name_string
+            .iter()
+            .zip(CHANGE_PASSWORD_SERVICE_NAME)
+            .all(|(component, expected)| component.as_bytes() == expected.as_bytes())
+}
+
+// ===========================================================================
 // ChangePasswdData — RFC 3244 §2
 // ===========================================================================
 

@@ -34,7 +34,17 @@
 //!   request is decoded but unreachable — [`PasswordRequest`], Q-600) and the
 //!   result data with the closed code sets [`ResultCode`] /
 //!   [`NonZeroResultCode`]. The message framing is the `parse-kpasswd`
-//!   crate's.
+//!   crate's;
+//! - the project's single definitions of two rules over these types
+//!   (docs/questions/Q-955 item 5, decision A-158 — class C14, one rule
+//!   written once): the change-password service's name
+//!   ([`CHANGE_PASSWORD_SERVICE_NAME`], [`is_change_password_service_name`];
+//!   RFC 3244 §2) and the KerberosTime ↔ seconds pair
+//!   ([`kerberos_time_seconds`], the scale every component compares times
+//!   on; [`kerberos_time_from_unix`], a Unix clock reading as a
+//!   KerberosTime; RFC 4120 5.2.3) — moved here from crates/keyd-types and
+//!   crates/kpasswd-front, so every crate that links krb-proto calls the
+//!   same one.
 //!
 //! Not here (later tasks): KRB-SAFE / KRB-CRED,
 //! the AD-* authorization containers, TYPED-DATA. Weak or excluded mechanisms
@@ -122,8 +132,13 @@
 //! §3.5, §5.6.1, §5.7.1, §5.10, §7.5.7; RFC 3244 §2 (read in full); [MS-KILE]
 //! v20261110 3.1.5.12; X.680 (02/2021) 13.2, 31.2.7; the project's design
 //! docs/53 (§5.4, §5.7, §5.9, §10 K1) with decision A-117
-//! (docs/questions/Q-600, Q-603, Q-604). No other implementation was
-//! consulted or recalled.
+//! (docs/questions/Q-600, Q-603, Q-604). The change-password service name
+//! rule and the KerberosTime ↔ seconds pair are this project's own code,
+//! moved from crates/keyd-types (`model.rs`, `time.rs`) and crates/
+//! kpasswd-front (`clock.rs`) and checked against RFC 3244 §2, RFC 4120
+//! 5.2.3 and 6.2 (pinned copies, SHA-256 verified) — docs/questions/Q-955
+//! item 5 (A-158), Q-987. No other implementation was consulted or
+//! recalled.
 //!
 //! Spec: RFC 4120 §5, Appendix A; RFC 6113 §5.4, Appendix B; RFC 3244 §2.
 
@@ -144,6 +159,7 @@ mod krb_priv;
 pub mod limits;
 mod preauth;
 mod ticket;
+mod time;
 
 pub use ap::{ApRep, ApReq, Authenticator, EncApRepPart};
 pub use basic::{
@@ -161,8 +177,12 @@ pub use kdc::{
     AsRep, AsReq, EncAsRepPart, EncKdcRepPart, EncTgsRepPart, KdcRep, KdcReq, KdcReqBody,
     KdcRequest, LastReq, LastReqEntry, TgsRep, TgsReq,
 };
-pub use kpasswd::{ChangePasswdData, NewPasswd, NonZeroResultCode, PasswordRequest, ResultCode};
+pub use kpasswd::{
+    is_change_password_service_name, ChangePasswdData, NewPasswd, NonZeroResultCode,
+    PasswordRequest, ResultCode, CHANGE_PASSWORD_SERVICE_NAME,
+};
 pub use krb_error::{KrbError, MethodData};
 pub use krb_priv::{EncKrbPrivPart, KrbPriv, UserData};
 pub use preauth::{EtypeInfo2, EtypeInfo2Entry, PaEncTimestamp, PaEncTsEnc};
 pub use ticket::{EncTicketPart, Ticket, TransitedEncoding};
+pub use time::{kerberos_time_from_unix, kerberos_time_seconds};

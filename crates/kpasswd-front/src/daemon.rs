@@ -14,13 +14,27 @@
 //!    crate::reply);
 //! 3. auditd is verified (crate::audit: its uid, and a `Pong` naming the
 //!    source `kpasswd-front` — task DN12, docs/questions/Q-955 item 1) —
-//!    R50-16;
+//!    R50-16; the verified connection is kept for the audit link (step 5);
 //! 4. dird is verified on the kpasswd channel (peer uid, `Ping` → `Pong`
 //!    naming the internal zone) — §7.5;
-//! 5. only now are the listeners served. Until then nothing is read from
-//!    them (a TCP handshake can complete into the kernel's backlog; a failed
-//!    start closes it) — the kdc's and ldap-front's arrangement (Q-275
-//!    item 3).
+//! 5. only now are the listeners served — and the audit link attached to the
+//!    connection verified in step 3, with the summary pace, delivering the
+//!    front's noise counts as `WindowSummary` events (crate::audit; docs/53
+//!    §9; docs/questions/Q-961 item 7, Q-988). Until then nothing is read
+//!    from the listeners (a TCP handshake can complete into the kernel's
+//!    backlog; a failed start closes it) — the kdc's and ldap-front's
+//!    arrangement (Q-275 item 3).
+//!
+//! # Noise (docs/53 §9; A-57)
+//!
+//! Every peer-driven noise occurrence passes [`Context::noise`] →
+//! crate::log's `Counters::noise`, the one place it is counted — on the
+//! operational log and into the audit window together; the front's own
+//! failures (dird not serving, a failed accept) pass [`Context::failure`]
+//! and stay on the operational log (the reading of docs/questions/Q-961
+//! item 3, applied to the front — Q-988). Requests are **not** gated on
+//! auditd (docs/53 §9 names no gating event for the front): auditd lost
+//! while serving ⇒ requests unaffected, counts kept.
 //!
 //! # One front, the internal zone (docs/53 §3.3; docs/52 §7 R14)
 //!
@@ -42,23 +56,27 @@
 //! # Stopping
 //!
 //! [`DaemonControl::stop`] ends every accept loop; each loop owns its
-//! connections' tasks (a tokio `JoinSet`, whose drop aborts them). SIGTERM
-//! is not handled (as the other daemons, Q-260 item 9).
+//! connections' tasks (a tokio `JoinSet`, whose drop aborts them). Then the
+//! summary pace ends and the audit gate's one flush hands the last counts
+//! over and waits, bounded (`AUDIT_FLUSH_GRACE`, stopping early once auditd
+//! counts as unreachable), before the audit link ends (crate::audit).
+//! SIGTERM is not handled (as the other daemons, Q-260 item 9).
 //!
-//! Spec: docs/53 R53-3, §3.3, §5.1, §5.6; docs/50 R50-16, §4.1, §6.2, §7.5;
-//! docs/52 §7 R14; tokio 1.54.1 docs.rs: `net::TcpListener::{from_std,
-//! accept}`, `net::TcpStream::local_addr`, `sync::{Semaphore, Notify}`,
-//! `task::JoinSet`, `spawn`; std `net::TcpListener::local_addr`.
+//! Spec: docs/53 R53-3, §3.3, §5.1, §5.6, §9; docs/50 R50-16, §4.1, §6.2,
+//! §7.5, §8.1; docs/52 §7 R14; tokio 1.54.1 docs.rs:
+//! `net::TcpListener::{from_std, accept}`, `net::TcpStream::local_addr`,
+//! `sync::{Semaphore, Notify}`, `task::JoinSet`, `spawn`; std
+//! `net::TcpListener::local_addr`.
 
-use crate::audit::verify_auditd;
+use crate::audit::{self, AuditGate, AUDIT_WINDOW};
 use crate::connection;
-use crate::log::{note, Counters, Counts, Note};
+use crate::log::{note, Counters, Counts, Failure, Noise, Note};
 use crate::reply::{InvalidRealm, ReplyEncoder};
 use config::{is_internal, KpasswdFrontSettings, Network};
 use core::fmt;
 use core::net::IpAddr;
 use core::time::Duration;
-use ipc_audit_client::AuditLinkError;
+use ipc_audit_client::{AuditLinkError, AUDIT_FLUSH_GRACE};
 use ipc_kpasswd::{
     ClientConfigError, ExpectedDird, FrontZone, KpasswdClient, Unserved, MAX_FRONT_CONNECTIONS,
 };
@@ -186,9 +204,9 @@ pub enum DaemonError {
     ListenerNotInternal,
     /// The realm is not a valid Kerberos realm.
     Realm(InvalidRealm),
-    /// auditd was not verified: unreachable, another uid, or a source other
-    /// than `kpasswd-front` (its `uid_sources` does not map the front —
-    /// task DN12); nothing was served and dird was not asked.
+    /// auditd was not verified at start: unreachable, another uid, or a
+    /// source other than `kpasswd-front` (its `uid_sources` does not map the
+    /// front — task DN12); nothing was served and dird was not asked.
     Audit(AuditLinkError),
     /// dird's configured uid is unusable.
     DirdConfig(ClientConfigError),
@@ -279,12 +297,25 @@ pub(crate) struct Context {
     pub(crate) timeouts: Timeouts,
     /// The control state, whose counters this front counts into.
     state: Arc<ControlState>,
+    /// The front's audit gate: the noise counts' way to the audit log.
+    audit: Arc<AuditGate>,
 }
 
 impl Context {
-    /// The counters.
-    pub(crate) fn counters(&self) -> &Counters {
-        &self.state.counters
+    /// Count one peer-driven noise occurrence — on the operational log and
+    /// into the audit window, through the one chokepoint (crate::log
+    /// `Counters::noise`; module documentation, "Noise").
+    /// Spec: docs/53 §9; A-57; docs/questions/Q-961 items 3, 7 (A-160),
+    /// Q-988.
+    pub(crate) fn noise(&self, noise: Noise) {
+        self.state.counters.noise(noise, &self.audit);
+    }
+
+    /// Count one of the front's own operational failures (the operational
+    /// log only).
+    /// Spec: docs/50 §8.2; docs/questions/Q-961 item 3 (A-160), Q-988.
+    pub(crate) fn failure(&self, failure: Failure) {
+        self.state.counters.failure(failure);
     }
 }
 
@@ -387,12 +418,14 @@ async fn accept_loop(
                 // A source outside the internal networks has no path: closed
                 // before any slot is taken or any byte is read.
                 if !is_internal(&internal, peer.ip()) {
-                    context.counters().source_not_internal.hit();
+                    // Noise: docs/53 §9 ("source outside internal_networks").
+                    context.noise(Noise::SourceNotInternal);
                     drop(stream);
                     continue;
                 }
                 let Some(slot) = admission.admit(peer.ip()) else {
-                    context.counters().connection_limited.hit();
+                    // Noise: "limited" (docs/questions/Q-961 item 3, Q-988).
+                    context.noise(Noise::ConnectionLimited);
                     drop(stream);
                     continue;
                 };
@@ -407,7 +440,7 @@ async fn accept_loop(
                 });
             }
             Err(_) => {
-                context.counters().accept_failed.hit();
+                context.failure(Failure::AcceptFailed);
                 sleep(ACCEPT_RETRY).await;
             }
         }
@@ -423,8 +456,8 @@ async fn accept_loop(
 /// # Errors
 /// [`DaemonError`] — a start-up check failed; nothing was served.
 ///
-/// Spec: docs/53 §3.3, §5.1, §5.6; docs/50 R50-16, §7.5; docs/52 §3.18,
-/// §7 R14.
+/// Spec: docs/53 §3.3, §5.1, §5.6, §9; docs/50 R50-16, R50-17, §7.5, §8.1;
+/// docs/52 §3.18, §7 R14; docs/questions/Q-630, Q-961 item 7, Q-988.
 pub async fn serve(
     front: FrontParams,
     listeners: Listeners,
@@ -432,15 +465,32 @@ pub async fn serve(
 ) -> Result<(), DaemonError> {
     check_listeners(&listeners, &front.internal_networks)?;
     let encoder = ReplyEncoder::new(&front.realm).map_err(DaemonError::Realm)?;
-    verify_auditd(&front.audit)
-        .await
-        .map_err(DaemonError::Audit)?;
+    // auditd first (R50-16): its uid and the source `kpasswd-front`. The
+    // verified connection is kept for the audit link (below); it is dropped
+    // with `link` on a later start-up failure.
+    let link = audit::link(&front.audit).map_err(DaemonError::Audit)?;
+    let first_audit = link.connect().await.map_err(DaemonError::Audit)?;
     note(Note::AuditVerified, None);
     let expected =
         ExpectedDird::new(front.dird.uid, FrontZone::Internal).map_err(DaemonError::DirdConfig)?;
     let client = KpasswdClient::new(front.dird.socket, expected, front.timeouts.dird_deadline);
     client.ping().await.map_err(DaemonError::Dird)?;
     note(Note::DirdVerified, None);
+
+    let mut served = Vec::with_capacity(listeners.tcp.len());
+    for listener in listeners.tcp {
+        listener
+            .set_nonblocking(true)
+            .map_err(|_| DaemonError::Listener)?;
+        served.push(TcpListener::from_std(listener).map_err(|_| DaemonError::Listener)?);
+    }
+
+    // The audit link, attached to the connection verified above (the gate
+    // opens on it: task R15b, docs/questions/Q-630), and the summary pace
+    // (crate::audit) — the front's noise counts' way to the audit log.
+    let gate = Arc::new(AuditGate::new(AUDIT_WINDOW));
+    let audit_task = tokio::spawn(link.attach(Arc::clone(&gate), first_audit).run());
+    let pace = tokio::spawn(audit::pace_summaries(Arc::clone(&gate)));
 
     let admission = Arc::new(Admission {
         limits: front.limits,
@@ -453,14 +503,8 @@ pub async fn serve(
         encoder,
         timeouts: front.timeouts,
         state: Arc::clone(&control.state),
+        audit: Arc::clone(&gate),
     });
-    let mut served = Vec::with_capacity(listeners.tcp.len());
-    for listener in listeners.tcp {
-        listener
-            .set_nonblocking(true)
-            .map_err(|_| DaemonError::Listener)?;
-        served.push(TcpListener::from_std(listener).map_err(|_| DaemonError::Listener)?);
-    }
     let loops: Vec<_> = served
         .into_iter()
         .map(|listener| {
@@ -483,6 +527,24 @@ pub async fn serve(
         let _ = accept.await;
     }
     control.state.serving.store(false, Ordering::SeqCst);
+    drop(context);
+    // The pace ends; the one flush hands the last counts over, waits for
+    // them (bounded), then the audit link ends (crate::audit).
+    pace.abort();
+    let _ = pace.await;
+    let unacknowledged = gate
+        .close(AUDIT_FLUSH_GRACE, async {
+            audit_task.abort();
+            let _ = audit_task.await;
+        })
+        .await
+        .events();
+    if unacknowledged > 0 {
+        note(
+            Note::AuditUnacknowledged,
+            Some(u64::try_from(unacknowledged).unwrap_or(u64::MAX)),
+        );
+    }
     note(Note::Stopped, None);
     Ok(())
 }

@@ -147,29 +147,16 @@ pub fn is_admin_service_name(name: &PrincipalName) -> bool {
             .is_some_and(|c| c.as_bytes() == ADMIN_SERVICE_CLASS.as_bytes())
 }
 
-/// The two name components of the change-password service's principal,
-/// `kadmin/changepw` — the name RFC 3244 §2 gives ("The AP-REQ message must
-/// be for the service principal kadmin/changepw@REALM").
-/// Spec: RFC 3244 §2; docs/53 §5.2.
-pub const CHANGE_PASSWORD_SERVICE_NAME: [&str; 2] = ["kadmin", "changepw"];
-
-/// `true` if `name` is the change-password service's: exactly the two
-/// components of [`CHANGE_PASSWORD_SERVICE_NAME`], octet for octet (the
-/// name-type is a hint only, RFC 4120 6.2; no canonicalization of this name,
-/// [MS-KILE] 3.3.5.1.2 as recorded in docs/53 §2.2). The same shape of rule
-/// as [`is_admin_service_name`]: keyd binds a
+/// The change-password service's name (`kadmin/changepw`, RFC 3244 §2) and
+/// its rule — exactly those two components, octet for octet, the name-type a
+/// hint only (RFC 4120 6.2). The same shape of rule as
+/// [`is_admin_service_name`]: keyd binds a
 /// [`KeyPurpose::ChangePasswordService`] key set to this name only, and no
-/// other key set to it.
+/// other key set to it. Defined once, in krb-proto (moved there from this
+/// module — docs/questions/Q-955 item 5, A-158; Q-987), and re-exported here
+/// under the path keyd, the kdc and provisioning name.
 /// Spec: RFC 3244 §2; RFC 4120 6.2; docs/53 R53-6, §5.2.
-#[must_use]
-pub fn is_change_password_service_name(name: &PrincipalName) -> bool {
-    name.name_string.len() == CHANGE_PASSWORD_SERVICE_NAME.len()
-        && name
-            .name_string
-            .iter()
-            .zip(CHANGE_PASSWORD_SERVICE_NAME)
-            .all(|(component, expected)| component.as_bytes() == expected.as_bytes())
-}
+pub use krb_proto::{is_change_password_service_name, CHANGE_PASSWORD_SERVICE_NAME};
 
 impl KeyPurpose {
     /// The purpose of the key set a service ticket for `name` is sealed

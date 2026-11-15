@@ -1,17 +1,17 @@
 //! The front's replies, without a network: the KRB-ERROR encoder field by
-//! field and code by code, the framing of keyd's sealed reply, and the pins
-//! of the front's copies (the service name, the clock conversion) to keyd's
-//! one definitions.
+//! field and code by code, and the framing of keyd's sealed reply. (The
+//! service name and the clock conversion are no longer the front's: they
+//! are krb-proto's one definitions, tested there — docs/questions/Q-955
+//! item 5, A-158; Q-987.)
 //!
 //! Sources: RFC 3244 §2 (reply message; result codes 1–7; "not allowed in a
-//! KRB-ERROR"; the result string "may be omitted"); RFC 4120 §5.2.3, §5.9.1,
-//! §6.2, §7.5.9; docs/53 §5.5, §5.7; docs/questions Q-604 items 1, 5, Q-621
-//! item 6; crates/keyd-types `CHANGE_PASSWORD_SERVICE_NAME` and
-//! `kerberos_time_seconds` (this project's own definitions).
+//! KRB-ERROR"; the result string "may be omitted"; "the service principal
+//! kadmin/changepw@REALM"); RFC 4120 §5.9.1, §6.2, §7.5.9; docs/53 §5.5,
+//! §5.7; docs/questions Q-604 items 1, 5, Q-621 item 6.
 
 use ipc_kpasswd::{ApRepOctets, KrbPrivOctets, SealedReply, UnsealedCode};
-use kpasswd_front::clock::{kerberos_time_from_unix, ServerTime};
-use kpasswd_front::reply::{result_code_of, sealed_reply, ReplyEncoder, CHANGE_PASSWORD_SERVICE};
+use kpasswd_front::clock::ServerTime;
+use kpasswd_front::reply::{result_code_of, sealed_reply, ReplyEncoder};
 use krb_proto::constants::{KRB_ERR_GENERIC, KRB_NT_SRV_INST};
 use krb_proto::{KerberosTime, KrbError, Microseconds, NonZeroResultCode};
 use parse_kpasswd::{ReplyBody, ReplyMessage};
@@ -55,7 +55,8 @@ fn every_krb_error_has_the_documented_fields() {
         assert_eq!(error.realm.as_str(), "EXAMPLE.TEST");
         assert_eq!(error.sname.name_type, KRB_NT_SRV_INST);
         let sname: Vec<&str> = error.sname.name_string.iter().map(|s| s.as_str()).collect();
-        assert_eq!(sname, CHANGE_PASSWORD_SERVICE);
+        assert_eq!(sname, ["kadmin", "changepw"]);
+        assert_eq!(sname, krb_proto::CHANGE_PASSWORD_SERVICE_NAME);
         assert_eq!(error.e_data, Some(code.value().to_be_bytes().to_vec()));
         assert_eq!(
             NonZeroResultCode::from_result_data(error.e_data.as_deref().unwrap()),
@@ -130,46 +131,4 @@ fn a_sealed_reply_is_framed_unchanged() {
     assert_eq!(&frame[4..10], &[0, total as u8, 0x00, 0x01, 0, 40]);
     assert_eq!(&frame[10..50], &ap_rep[..]);
     assert_eq!(&frame[50..], &krb_priv[..]);
-}
-
-/// Pin of the front's copy of the service name to keyd's one definition
-/// (crates/keyd-types; RFC 3244 §2 "kadmin/changepw"); docs/questions/Q-955
-/// item 5.
-#[test]
-fn the_service_name_is_keyds() {
-    assert_eq!(
-        CHANGE_PASSWORD_SERVICE,
-        keyd_types::CHANGE_PASSWORD_SERVICE_NAME
-    );
-}
-
-/// Pin of the front's clock conversion to keyd's one KerberosTime scale
-/// (crates/keyd-types `kerberos_time_seconds`; RFC 4120 §5.2.3): for
-/// instants across leap days, century years and the range ends, the
-/// difference on keyd's scale is the Unix difference.
-#[test]
-fn the_clock_conversion_agrees_with_keyds_scale() {
-    let epoch = keyd_types::kerberos_time_seconds(&kerberos_time_from_unix(0).unwrap());
-    let last =
-        keyd_types::kerberos_time_seconds(&KerberosTime::new(9999, 12, 31, 23, 59, 59).unwrap());
-    let last_unix = u64::try_from(last - epoch).unwrap();
-    for secs in [
-        0u64,
-        59,
-        86_399,
-        86_400,
-        951_782_400,   // 2000-02-29T00:00:00Z
-        951_868_799,   // 2000-02-29T23:59:59Z
-        4_107_542_400, // 2100-03-01T00:00:00Z (2100 is not a leap year)
-        1_794_744_000,
-        last_unix,
-    ] {
-        let time = kerberos_time_from_unix(secs).unwrap();
-        assert_eq!(
-            keyd_types::kerberos_time_seconds(&time) - epoch,
-            i64::try_from(secs).unwrap(),
-            "{secs}"
-        );
-    }
-    assert_eq!(kerberos_time_from_unix(last_unix + 1), None);
 }

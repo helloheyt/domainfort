@@ -28,10 +28,12 @@
 //! version-1 reply, docs/research/r3-e §3.2) has no code path here (A-142:
 //! replies are always authenticated).
 //!
-//! **One copy of the service name (C14 residual).** keyd-types holds the
-//! name keyd binds (`CHANGE_PASSWORD_SERVICE_NAME`); the front links no keyd
-//! crate, so it writes the RFC 3244 §2 name once more here; a test pins the
-//! two equal (docs/questions/Q-955 item 5). The KRB-ERROR's `sname` is
+//! **The service name is the project's one definition** —
+//! `krb_proto::CHANGE_PASSWORD_SERVICE_NAME`, the name keyd binds and the kdc
+//! classifies by (keyd-types re-exports it). The front links no keyd crate,
+//! so this definition lives in krb-proto, which every one of them links; the
+//! front's former copy and the test that pinned it are gone
+//! (docs/questions/Q-955 item 5, A-158; Q-987). The KRB-ERROR's `sname` is
 //! informational only (RFC 4120 §5.9: not integrity protected).
 //!
 //! Spec: RFC 3244 §2; RFC 4120 §5.9, §5.9.1, §6.2, §7.5.9; docs/53 §5.7;
@@ -41,13 +43,10 @@ use crate::clock::ServerTime;
 use core::fmt;
 use ipc_kpasswd::{SealedReply, UnsealedCode};
 use krb_proto::constants::{KRB_ERR_GENERIC, KRB_NT_SRV_INST};
-use krb_proto::{KerberosString, KrbError, NonZeroResultCode, PrincipalName, Realm};
+use krb_proto::{
+    KerberosString, KrbError, NonZeroResultCode, PrincipalName, Realm, CHANGE_PASSWORD_SERVICE_NAME,
+};
 use parse_kpasswd::ReplyMessage;
-
-/// The change-password service principal's name components (`kadmin`,
-/// `changepw`).
-/// Spec: RFC 3244 §2 ("the service principal kadmin/changepw@REALM").
-pub const CHANGE_PASSWORD_SERVICE: [&str; 2] = ["kadmin", "changepw"];
 
 /// dird's unsealed code as the RFC 3244 result code of the front's
 /// KRB-ERROR.
@@ -99,8 +98,8 @@ impl ReplyEncoder {
             return Err(InvalidRealm);
         }
         let realm = KerberosString::new(realm).map_err(|_| InvalidRealm)?;
-        let mut name_string = Vec::with_capacity(CHANGE_PASSWORD_SERVICE.len());
-        for component in CHANGE_PASSWORD_SERVICE {
+        let mut name_string = Vec::with_capacity(CHANGE_PASSWORD_SERVICE_NAME.len());
+        for component in CHANGE_PASSWORD_SERVICE_NAME {
             name_string.push(KerberosString::new(component).map_err(|_| InvalidRealm)?);
         }
         Ok(ReplyEncoder {

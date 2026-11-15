@@ -863,3 +863,62 @@ fn secret_octet_types_compare_every_octet() {
     assert!(u.is_empty());
     assert_eq!(u, UserData::new(Vec::new()));
 }
+
+// ---------------------------------------------------------------------------
+// The change-password service principal — RFC 3244 §2 (the one definition:
+// docs/questions/Q-955 item 5, A-158; Q-987)
+// ---------------------------------------------------------------------------
+
+/// A PrincipalName of `name_type` with `parts` (RFC 4120 5.2.2).
+fn principal(name_type: i32, parts: &[&str]) -> krb_proto::PrincipalName {
+    krb_proto::PrincipalName {
+        name_type,
+        name_string: parts
+            .iter()
+            .map(|part| krb_proto::KerberosString::new(part).unwrap())
+            .collect(),
+    }
+}
+
+/// RFC 3244 §2 ("the service principal kadmin/changepw@REALM"): the name is
+/// exactly the two components `kadmin`, `changepw`.
+#[test]
+fn the_change_password_service_name_is_rfc3244s() {
+    assert_eq!(
+        krb_proto::CHANGE_PASSWORD_SERVICE_NAME,
+        ["kadmin", "changepw"]
+    );
+}
+
+/// RFC 3244 §2; RFC 4120 6.2 ("The name-type SHOULD be treated only as a
+/// hint … It is not significant when checking for equivalence"): exactly
+/// `kadmin` / `changepw`, octet for octet, is the change-password service
+/// whatever the name-type; a case variant, a reordering, one or three
+/// components, one joined component, a trailing space, another instance or
+/// no component at all are not.
+#[test]
+fn the_change_password_service_rule_is_exact() {
+    use krb_proto::is_change_password_service_name;
+    for name_type in [0, 1, 2, 3, 10] {
+        assert!(
+            is_change_password_service_name(&principal(name_type, &["kadmin", "changepw"])),
+            "{name_type}"
+        );
+    }
+    for parts in [
+        &["KADMIN", "changepw"][..],
+        &["kadmin", "CHANGEPW"][..],
+        &["changepw", "kadmin"][..],
+        &["kadmin"][..],
+        &["kadmin", "changepw", "x"][..],
+        &["kadmin/changepw"][..],
+        &["kadmin", "admin"][..],
+        &["kadmin", "changepw "][..],
+        &[][..],
+    ] {
+        assert!(
+            !is_change_password_service_name(&principal(2, parts)),
+            "{parts:?}"
+        );
+    }
+}

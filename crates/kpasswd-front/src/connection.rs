@@ -44,6 +44,7 @@
 
 use crate::clock::server_time_now;
 use crate::daemon::Context;
+use crate::log::{Failure, Noise};
 use crate::reply::{result_code_of, sealed_reply};
 use core::net::SocketAddr;
 use ipc_kpasswd::{
@@ -118,10 +119,11 @@ async fn answer(
     let request = match RequestMessage::parse(message) {
         Ok(request) => request,
         Err(error) => {
+            // Noise: docs/53 §9 ("malformed framing, version").
             if error.result_code() == NonZeroResultCode::BadVersion {
-                context.counters().bad_version.hit();
+                context.noise(Noise::BadVersion);
             } else {
-                context.counters().malformed.hit();
+                context.noise(Noise::Malformed);
             }
             return krb_error(error.result_code());
         }
@@ -137,11 +139,13 @@ async fn answer(
         })
     });
     let Some(forward) = forward else {
-        context.counters().malformed.hit();
+        context.noise(Noise::Malformed);
         return krb_error(NonZeroResultCode::Malformed);
     };
     let Ok(_slot) = context.dird_slots.try_acquire() else {
-        context.counters().dird_busy.hit();
+        // Noise: refused for the front's own full capacity (docs/questions/
+        // Q-961 item 3's "refused", Q-988).
+        context.noise(Noise::DirdBusy);
         return krb_error(NonZeroResultCode::HardError);
     };
     match context.client.change_password(&forward).await {
@@ -151,7 +155,8 @@ async fn answer(
         },
         Ok(KpasswdAnswer::Unsealed(code)) => krb_error(result_code_of(code)),
         Err(_) => {
-            context.counters().dird_not_serving.hit();
+            // Not noise: dird's failure (docs/questions/Q-961 item 3, Q-988).
+            context.failure(Failure::DirdNotServing);
             krb_error(NonZeroResultCode::HardError)
         }
     }
@@ -171,11 +176,13 @@ pub(crate) async fn run(
     let reply = match read_request(&mut stream, deadline).await {
         Read::Message(message) => answer(&message, peer, local, &context).await,
         Read::Framing(error) => {
-            context.counters().malformed.hit();
+            context.noise(Noise::Malformed);
             server_time_now().and_then(|time| context.encoder.krb_error(error.result_code(), time))
         }
         Read::Incomplete => {
-            context.counters().timed_out.hit();
+            // Noise: a connection closed at the front's layer (docs/53 §9;
+            // docs/questions/Q-988).
+            context.noise(Noise::TimedOut);
             None
         }
     };
@@ -186,6 +193,6 @@ pub(crate) async fn run(
         Ok(Ok(())) => {
             let _ = timeout(context.timeouts.reply_write, stream.shutdown()).await;
         }
-        Ok(Err(_)) | Err(_) => context.counters().timed_out.hit(),
+        Ok(Err(_)) | Err(_) => context.noise(Noise::TimedOut),
     }
 }

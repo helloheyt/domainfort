@@ -27,9 +27,12 @@
 //!    every listener inside the internal networks, the realm valid, auditd
 //!    verified (its uid, and a `Pong` naming the front's own source
 //!    `kpasswd-front` — [`audit`]; task DN12, docs/questions/Q-955 item 1,
-//!    Q-960), dird verified on the
+//!    Q-960) and that connection kept, dird verified on the
 //!    kpasswd channel (`Ping` → `Pong` naming the internal zone), and only
-//!    now are the listeners served.
+//!    now are the listeners served — with the audit link attached to the
+//!    kept connection, delivering the front's noise counts as
+//!    `WindowSummary` events, at most one per heartbeat ([`audit`];
+//!    docs/questions/Q-961 item 7, Q-988).
 //!
 //! # Per connection ([`connection`] module)
 //!
@@ -42,17 +45,17 @@
 //! front's KRB-ERROR (dird's code, or HARDERROR when dird does not serve) →
 //! the reply written within its bound → close.
 //!
-//! | case | the front answers | counted |
+//! | case | the front answers | counted (noise ⇒ also `WindowSummary`, [`log`]) |
 //! |---|---|---|
-//! | source outside `internal_networks` | nothing — closed before a byte | `source_not_internal` |
-//! | global / per-source connection bound reached | nothing — closed before a byte | `connection_limited` |
-//! | header or message not whole within `tcp_first_frame_timeout`, or the client closed first | nothing — closed | `timed_out` |
-//! | TCP header announcing < 6 or > 65,535 octets | KRB-ERROR MALFORMED (1), before any allocation | `malformed` |
-//! | any other framing failure (length fields, `AP_REQ length` 0, empty KRB-PRIV) | KRB-ERROR MALFORMED (1) | `malformed` |
-//! | `protocol version number` ≠ 0xff80 (version 1 included) | KRB-ERROR BAD_VERSION (6) | `bad_version` |
-//! | the messages are not an AP-REQ and a KRB-PRIV (identifier octets) | KRB-ERROR MALFORMED (1) | `malformed` |
-//! | every dird channel slot in use | KRB-ERROR HARDERROR (2) | `dird_busy` |
-//! | dird not serving (down, wrong uid / zone, refusal, deadline, unknown outcome) | KRB-ERROR HARDERROR (2) | `dird_not_serving` |
+//! | source outside `internal_networks` | nothing — closed before a byte | `source_not_internal` — noise |
+//! | global / per-source connection bound reached | nothing — closed before a byte | `connection_limited` — noise |
+//! | header or message not whole within `tcp_first_frame_timeout`, or the client closed first | nothing — closed | `timed_out` — noise |
+//! | TCP header announcing < 6 or > 65,535 octets | KRB-ERROR MALFORMED (1), before any allocation | `malformed` — noise |
+//! | any other framing failure (length fields, `AP_REQ length` 0, empty KRB-PRIV) | KRB-ERROR MALFORMED (1) | `malformed` — noise |
+//! | `protocol version number` ≠ 0xff80 (version 1 included) | KRB-ERROR BAD_VERSION (6) | `bad_version` — noise |
+//! | the messages are not an AP-REQ and a KRB-PRIV (identifier octets) | KRB-ERROR MALFORMED (1) | `malformed` — noise |
+//! | every dird channel slot in use | KRB-ERROR HARDERROR (2) | `dird_busy` — noise |
+//! | dird not serving (down, wrong uid / zone, refusal, deadline, unknown outcome) | KRB-ERROR HARDERROR (2) | `dird_not_serving` — operational log only |
 //! | dird's `Unsealed { code }` | KRB-ERROR with that code (2 or 3) | — (dird audits) |
 //! | dird's `Sealed` | keyd's AP-REP + KRB-PRIV, unchanged | — (dird and keyd audit) |
 //!
@@ -68,9 +71,9 @@
 //! | [`reply`] | the KRB-ERROR encoder and the framing of keyd's sealed reply |
 //! | [`clock`] | the KRB-ERROR's server time |
 //! | `daemon` | [`serve`], the start-up checks, accept loops, connection limits |
-//! | [`audit`] | the start-up check of auditd (the front's own source, `kpasswd-front`) |
+//! | [`audit`] | the start-up check of auditd (the front's own source, `kpasswd-front`), the audit link and the summary pace |
 //! | [`startup`] | configuration, binding, hardening plan |
-//! | [`log`] | fixed stderr messages and the counted events (docs/53 §9) |
+//! | [`log`] | fixed stderr messages and the counted events — noise and failures (docs/53 §9) |
 //!
 //! # Security
 //!
@@ -83,18 +86,23 @@
 //!
 //! # Residuals (documented, not hidden)
 //!
-//! - The front sends no audit events: its layer is counted on the
-//!   operational log only (docs/53 §9 as Q-955 item 1 reads it; restated in
-//!   docs/questions/Q-961). The product front starts once auditd's
-//!   `uid_sources` maps its uid to `kpasswd-front` (task DN12); provisioning
-//!   that entry is task K9's.
+//! - The front's audit is counts only: its noise as `WindowSummary` counts
+//!   (`suppressed_noise`, at most one summary per heartbeat — docs/53 §9,
+//!   A-57; docs/questions/Q-961 item 7, Q-988), no record per connection,
+//!   no breakdown by kind on the log (the kinds are on stderr). Counts the
+//!   stop's bounded flush cannot deliver (auditd unreachable, or the grace
+//!   spent) are lost with the process; they remain on the operational log.
+//!   The product front starts once auditd's `uid_sources` maps its uid to
+//!   `kpasswd-front` (task DN12); provisioning that entry is task K9's.
 //! - A compromised front can drop, delay or forge a KRB-ERROR (confusion
 //!   only — RFC 4120 §5.9), lie about the client's address (skipping only
 //!   keyd's `s-address` check) and relay other hosts' requests in its own
 //!   rights (docs/53 §8; Q-603 item 8; A-114).
 //! - The realm is configured in the front's file as in dird's and keyd's
-//!   (Q-955 item 4); the service name and the clock conversion are written
-//!   once more here, pinned by tests (Q-955 item 5).
+//!   (Q-955 item 4). The service name and the clock conversion are no
+//!   longer the front's: they are krb-proto's one definitions
+//!   (`CHANGE_PASSWORD_SERVICE_NAME`, `kerberos_time_from_unix` — Q-955
+//!   item 5, A-158; Q-987).
 //! - SIGTERM is not handled; no chroot, no seccomp / landlock / namespaces
 //!   (Q-216, P-19). The code has never run on Linux (P-27).
 //!
@@ -103,10 +111,13 @@
 //! Written only from this project's decided design, opened in-session:
 //! AGENT-ONBOARDING, AGENTS, docs/53 (all; esp. R53-2, R53-3, R53-4, §3.2,
 //! §3.3, §4, §5.1, §5.5–§5.9, §8, §9, §10 K8), docs/50 (R50-3, R50-14,
-//! R50-16; §3.1–§3.7; §4.1; §6; §7.1, §7.5; §8.2), docs/52 §7 R14,
-//! docs/research/r3-e (§3), docs/questions PENDING-OWNER (A-114, A-117,
-//! A-121, A-126, A-142, A-151, A-156), Q-600..Q-605, Q-609, Q-620, Q-621,
-//! Q-660..Q-664, Q-830, Q-831, Q-945; RFC 3244 §2 (pinned, SHA-256
+//! R50-16, R50-17; §3.1–§3.7; §4.1; §6; §7.1, §7.5; §8.1, §8.2), docs/52 §7
+//! R14, docs/research/r3-e (§3), docs/questions PENDING-OWNER (A-57, A-87,
+//! A-114, A-117, A-121, A-126, A-142, A-151, A-156, A-158, A-160),
+//! Q-600..Q-605, Q-609, Q-620, Q-621, Q-660..Q-664, Q-830, Q-831, Q-945,
+//! Q-955, Q-960, Q-961, Q-987, Q-988; crates/dns-daemon's audit (the house
+//! pattern of a counters-only sender — this project's own code); RFC 3244
+//! §2 (pinned, SHA-256
 //! `45b9130f…dec378`, re-verified this session); RFC 4120 (pinned,
 //! `368d3cd1…f75b`) §5.2.3, §5.9, §5.9.1, §6.2, §7.2.2, §7.5.9; ITU-T X.680
 //! 46.2–46.3 as krb-proto cites them; the public API of this project's
@@ -117,8 +128,8 @@
 //! implementation, kpasswd server, daemon or server framework was consulted
 //! or recalled (AGENTS.md §1-3).
 //!
-//! Spec: docs/53 R53-2, R53-3, R53-4, §3.3, §5.1, §5.7, §10 (K8); RFC 3244
-//! §2; RFC 4120 §5.9.1; A-117; A-121; A-142.
+//! Spec: docs/53 R53-2, R53-3, R53-4, §3.3, §5.1, §5.7, §9, §10 (K8); RFC
+//! 3244 §2; RFC 4120 §5.9.1; A-57; A-117; A-121; A-142; A-160.
 
 pub mod audit;
 pub mod clock;

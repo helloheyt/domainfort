@@ -289,13 +289,15 @@ impl KerberosTime {
 }
 
 /// Gregorian leap-year rule (every fourth year, except century years not
-/// divisible by 400) — the calendar of X.680 46.2's "calendar date".
-fn is_leap_year(year: u16) -> bool {
+/// divisible by 400) — the calendar of X.680 46.2's "calendar date". The
+/// crate's one calendar: [`KerberosTime::new`] validates with it and the
+/// time scale (crate::time) counts with it.
+pub(crate) fn is_leap_year(year: u16) -> bool {
     (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
 /// Days in `month` of `year` (0 for an invalid month).
-fn days_in_month(year: u16, month: u8) -> u8 {
+pub(crate) fn days_in_month(year: u16, month: u8) -> u8 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,

@@ -33,7 +33,10 @@ fn loopback_listener() -> Listeners {
 
 /// The real auditd, its log in a scratch directory, mapping `mapped_uid` to
 /// the source named `source` (docs/50 §3.2, §7.1).
-fn real_auditd(mapped_uid: u32, source: &str) -> (auditd_support::TempDir, auditd_support::Server) {
+pub(super) fn real_auditd(
+    mapped_uid: u32,
+    source: &str,
+) -> (auditd_support::TempDir, auditd_support::Server) {
     let logs = auditd_support::TempDir::new();
     let settings = auditd_support::settings_for(&logs, mapped_uid, source, 5);
     let server = auditd_support::Server::start(

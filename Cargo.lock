@@ -788,7 +788,6 @@ dependencies = [
  "ipc-audit",
  "ipc-audit-client",
  "ipc-kpasswd",
- "keyd-types",
  "krb-proto",
  "parse-kpasswd",
  "protected-file",

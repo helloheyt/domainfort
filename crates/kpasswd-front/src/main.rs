@@ -11,7 +11,8 @@
 //! 4. apply the hardening plan while the process has exactly one thread —
 //!    rustix's identity calls act on the calling thread only;
 //! 5. only then build the tokio runtime, and serve (listeners internal, the
-//!    realm valid, auditd verified, dird verified, the listeners served).
+//!    realm valid, auditd verified, dird verified, the listeners served and
+//!    the audit link delivering the noise counts).
 //!
 //! Every start-up failure exits with a failure code (fail closed, §7.5); the
 //! service manager restarts with backoff. Messages are fixed texts on stderr

@@ -7,6 +7,7 @@
 //! test code (crates/e2e-tests `no_test_seams_in_product.rs`; crates/
 //! protected-file `single_open_path.rs`). Sources: see each module.
 
+mod audit;
 /// crates/audit-daemon's tier-2 harness, reused through `#[path]` (as
 /// crates/ldap-front's tests do): the **real** auditd listener and writer
 /// over a log in a scratch directory.

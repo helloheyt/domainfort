@@ -5,11 +5,37 @@
 //! `internal_networks`, malformed framing, version) — with the A-57 noise
 //! rule (a count, not a record per datagram)". So the front **counts** what
 //! happens at its own layer (connections refused at a limit or for their
-//! source, framing failures, other versions, timeouts, dird not serving) —
-//! the change itself is audited by dird and keyd (docs/53 §9: dird's
-//! `ChangePassword` event, keyd's records). The counts are kept per running
-//! daemon ([`Counters`], read through `DaemonControl::counts`), so two
-//! daemons in one process (the tests) never mix them.
+//! source, framing failures, other versions, timeouts, dird busy or not
+//! serving) — the change itself is audited by dird and keyd (docs/53 §9:
+//! dird's `ChangePassword` event, keyd's records). The counts are kept per
+//! running daemon ([`Counters`], read through `DaemonControl::counts`), so
+//! two daemons in one process (the tests) never mix them.
+//!
+//! # Noise and failures (docs/questions/Q-961 item 7, A-160; Q-988)
+//!
+//! The counted cases split by the reading Q-961 item 3 gave dnsd's counters
+//! (A-160): a **peer-driven** occurrence at the daemon's own layer is
+//! **noise** — counted on the operational log *and* into the audit window,
+//! which auditd records as `WindowSummary` counts (`suppressed_noise`;
+//! crate::audit); the daemon's own operational failures and its
+//! dependencies' (dird) failures are not noise and stay on the operational
+//! log only:
+//!
+//! | counted case | [`Noise`] / [`Failure`] | dnsd's counterpart (Q-961 item 3) |
+//! |---|---|---|
+//! | source outside `internal_networks` | `Noise::SourceNotInternal` ("dropped") | `SOURCE_NOT_INTERNAL` |
+//! | global / per-source connection bound | `Noise::ConnectionLimited` ("limited") | `TCP_LIMITED` |
+//! | request not whole in time, client closed first, reply not taken in time | `Noise::TimedOut` (a connection closed at the front's layer, docs/53 §9) | — (dnsd closes silently, uncounted) |
+//! | framing failure, not an AP-REQ + KRB-PRIV | `Noise::Malformed` ("malformed framing") | `SILENCED` |
+//! | another protocol version | `Noise::BadVersion` ("version") | — |
+//! | every dird channel slot in use | `Noise::DirdBusy` ("refused" for the front's own full capacity) | `FORWARD_QUEUE_FULL` |
+//! | dird not serving (down, refusal, deadline, unknown outcome) | `Failure::DirdNotServing` | `FORWARD_UNAVAILABLE` (not counted) |
+//! | a failed `accept` | `Failure::AcceptFailed` | `ACCEPT_FAILED` (not counted) |
+//!
+//! **One chokepoint, by construction:** a noise counter moves only through
+//! `Counters::noise`, which takes the audit gate and counts into it in the
+//! same call — the operational log and the audit window cannot drift (the
+//! fields are private to this module; there is no other way to hit them).
 //!
 //! Every message is a fixed text from [`Note`] plus, at most, a count —
 //! never request octets, names, addresses, or any peer-supplied string
@@ -19,9 +45,10 @@
 //! thinned out: written for the 1st, 2nd, 4th, 8th … event of each kind,
 //! with the running count, so a flood cannot fill the log (docs/07 §8).
 //!
-//! Spec: docs/53 §9; A-57 (noise rule); docs/50 §8.2; docs/07 §8;
-//! AGENTS.md §6.
+//! Spec: docs/53 §9; A-57 (noise rule); docs/50 §8.1, §8.2; docs/07 §8;
+//! AGENTS.md §6, §6.1; docs/questions/Q-961 items 3, 7 (A-160).
 
+use crate::audit::AuditGate;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -62,6 +89,14 @@ pub enum Note {
     DirdBusy,
     /// Accepting a TCP connection failed (the listener keeps going).
     AcceptFailed,
+    /// The audit link verified auditd again after a loss.
+    AuditRestored,
+    /// The audit link lost auditd; noise counts are kept and sent once it
+    /// is verified again (requests are not gated on auditd).
+    AuditLost,
+    /// Audit events (summaries) still unacknowledged when the front
+    /// stopped.
+    AuditUnacknowledged,
     /// Stopped.
     Stopped,
 }
@@ -88,6 +123,9 @@ impl Note {
             Note::DirdNotServing => "dird did not serve a request: answered HARDERROR",
             Note::DirdBusy => "every dird connection in use: answered HARDERROR",
             Note::AcceptFailed => "accepting a TCP connection failed",
+            Note::AuditRestored => "audit connection verified again",
+            Note::AuditLost => "audit connection lost; noise counts kept",
+            Note::AuditUnacknowledged => "audit events unacknowledged at stop",
             Note::Stopped => "stopped",
         }
     }
@@ -138,18 +176,66 @@ impl Thinned {
     }
 }
 
-/// The counters of one running front.
+/// A peer-driven noise occurrence at the front's layer (module
+/// documentation, "Noise and failures") — counted on the operational log
+/// and into the audit window.
+/// Spec: docs/53 §9; A-57; docs/questions/Q-961 item 3 (A-160), Q-988.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Noise {
+    /// A connection closed before a byte: its source is outside every
+    /// internal network (docs/53 §3.3).
+    SourceNotInternal,
+    /// A connection closed before a byte: a connection bound was reached
+    /// (docs/53 §5.1).
+    ConnectionLimited,
+    /// A connection closed without a reply: the request was not whole in
+    /// time or the client closed first — or the reply was not taken in time.
+    TimedOut,
+    /// A request answered MALFORMED.
+    Malformed,
+    /// A request answered BAD_VERSION.
+    BadVersion,
+    /// A request answered HARDERROR because every dird channel slot of the
+    /// front was in use (docs/53 §5.6 step 1).
+    DirdBusy,
+}
+
+impl Noise {
+    /// Every noise case.
+    pub const ALL: [Noise; 6] = [
+        Noise::SourceNotInternal,
+        Noise::ConnectionLimited,
+        Noise::TimedOut,
+        Noise::Malformed,
+        Noise::BadVersion,
+        Noise::DirdBusy,
+    ];
+}
+
+/// The front's own operational failure or a dependency's — not noise
+/// (module documentation): the operational log only.
+/// Spec: docs/50 §8.2; docs/questions/Q-961 item 3 (A-160), Q-988.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Failure {
+    /// dird did not serve a request (answered HARDERROR).
+    DirdNotServing,
+    /// Accepting a TCP connection failed.
+    AcceptFailed,
+}
+
+/// The counters of one running front. The fields are private: a noise
+/// counter moves only through `Counters::noise` (module documentation).
 /// Spec: docs/53 §9; A-57.
 #[derive(Debug)]
 pub struct Counters {
-    pub(crate) connection_limited: Thinned,
-    pub(crate) source_not_internal: Thinned,
-    pub(crate) malformed: Thinned,
-    pub(crate) bad_version: Thinned,
-    pub(crate) timed_out: Thinned,
-    pub(crate) dird_not_serving: Thinned,
-    pub(crate) dird_busy: Thinned,
-    pub(crate) accept_failed: Thinned,
+    connection_limited: Thinned,
+    source_not_internal: Thinned,
+    malformed: Thinned,
+    bad_version: Thinned,
+    timed_out: Thinned,
+    dird_not_serving: Thinned,
+    dird_busy: Thinned,
+    accept_failed: Thinned,
 }
 
 impl Default for Counters {
@@ -168,6 +254,38 @@ impl Default for Counters {
 }
 
 impl Counters {
+    /// The thinned counter of `noise`.
+    fn of_noise(&self, noise: Noise) -> &Thinned {
+        match noise {
+            Noise::SourceNotInternal => &self.source_not_internal,
+            Noise::ConnectionLimited => &self.connection_limited,
+            Noise::TimedOut => &self.timed_out,
+            Noise::Malformed => &self.malformed,
+            Noise::BadVersion => &self.bad_version,
+            Noise::DirdBusy => &self.dird_busy,
+        }
+    }
+
+    /// Count one noise occurrence — **the one place** a noise counter
+    /// moves: the operational log's thinned counter and the front's audit
+    /// window (sent as the next `WindowSummary`, crate::audit) in one call,
+    /// so the two cannot drift.
+    /// Spec: docs/53 §9; A-57; docs/questions/Q-961 items 2, 3, 7 (A-160),
+    /// Q-988; AGENTS.md §6.1 ("a single chokepoint").
+    pub(crate) fn noise(&self, noise: Noise, audit: &AuditGate) {
+        self.of_noise(noise).hit();
+        audit.count_noise();
+    }
+
+    /// Count one operational failure (the operational log only).
+    /// Spec: docs/50 §8.2; docs/questions/Q-961 item 3 (A-160).
+    pub(crate) fn failure(&self, failure: Failure) {
+        match failure {
+            Failure::DirdNotServing => self.dird_not_serving.hit(),
+            Failure::AcceptFailed => self.accept_failed.hit(),
+        }
+    }
+
     /// The counters now.
     #[must_use]
     pub fn snapshot(&self) -> Counts {
@@ -204,4 +322,29 @@ pub struct Counts {
     pub dird_busy: u64,
     /// Failed accepts.
     pub accept_failed: u64,
+}
+
+impl Counts {
+    /// The count of one noise case.
+    #[must_use]
+    pub fn of(&self, noise: Noise) -> u64 {
+        match noise {
+            Noise::SourceNotInternal => self.source_not_internal,
+            Noise::ConnectionLimited => self.connection_limited,
+            Noise::TimedOut => self.timed_out,
+            Noise::Malformed => self.malformed,
+            Noise::BadVersion => self.bad_version,
+            Noise::DirdBusy => self.dird_busy,
+        }
+    }
+
+    /// Every noise occurrence counted — what the front's `WindowSummary`
+    /// counts (`suppressed_noise`) add up to (module documentation).
+    /// Spec: docs/53 §9; A-57; docs/questions/Q-988.
+    #[must_use]
+    pub fn noise(&self) -> u64 {
+        Noise::ALL
+            .iter()
+            .fold(0u64, |sum, noise| sum.saturating_add(self.of(*noise)))
+    }
 }

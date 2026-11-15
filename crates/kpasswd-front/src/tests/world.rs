@@ -2,7 +2,10 @@
 //! crates/ipc-kpasswd `KpasswdConnection`, over a host that records every
 //! request and answers as the test scripts), a test auditd (the real audit
 //! channel's `Ping` → `Pong`, naming the front's own source `kpasswd-front`
-//! unless a test names another), and the front itself — the product entry,
+//! unless a test names another, and `Append` → the `Ack` of its last number,
+//! its events kept with their arrival time — docs/50 §7.5, §8.1; the pattern
+//! of crates/ipc-audit-client tests/linked and crates/dns-daemon
+//! tests/common), and the front itself — the product entry,
 //! `serve` (task DN12: the audit source is a constant, so the tests need no
 //! other entry — docs/52 C18) — on a loopback listener of a port the system
 //! picks (never port 464).
@@ -28,7 +31,9 @@ use config::Network;
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use core::time::Duration;
 use ipc::{FrameReader, Reply};
-use ipc_audit::{AuditReply, AuditRequest, EventSource, AUDIT_CHANNEL};
+use ipc_audit::{
+    Ack, AuditReply, AuditRequest, EventBody, EventSource, WindowSummary, AUDIT_CHANNEL,
+};
 use ipc_kpasswd::{
     ApRepOctets, ChangePasswordRequest, FrontZone, HostUnserved, KpasswdAnswer, KpasswdConnection,
     KpasswdHost, KrbPrivOctets, SealedReply, REQUEST_LIMIT,
@@ -100,7 +105,7 @@ pub fn sealed() -> SealedReply {
 }
 
 /// A unique socket path in the temporary directory.
-fn socket_path(tag: &str) -> PathBuf {
+pub(crate) fn socket_path(tag: &str) -> PathBuf {
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("kpf-{tag}-{}-{n}.sock", std::process::id()))
@@ -191,27 +196,118 @@ fn start_dird(path: &PathBuf) -> Dird {
     dird
 }
 
-/// Start a test auditd on `path` that names `source` in its `Pong`.
-pub(crate) fn start_auditd(path: &PathBuf, source: EventSource) {
+/// What the test auditd was sent: every appended event, with the instant
+/// its batch arrived.
+#[derive(Clone, Default)]
+pub struct AuditSeen {
+    events: Arc<Mutex<Vec<(Instant, EventBody)>>>,
+}
+
+impl AuditSeen {
+    /// Every event appended so far, in order.
+    pub fn events(&self) -> Vec<EventBody> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, event)| event.clone())
+            .collect()
+    }
+
+    /// The `WindowSummary` events appended so far, with their arrival.
+    pub fn summaries(&self) -> Vec<(Instant, WindowSummary)> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(at, event)| match event {
+                EventBody::WindowSummary(summary) => Some((*at, *summary)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The noise counted in every summary so far.
+    pub fn counted_noise(&self) -> u64 {
+        self.summaries()
+            .iter()
+            .map(|(_, summary)| summary.suppressed_noise)
+            .sum()
+    }
+}
+
+/// How a test auditd behaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuditdBehaviour {
+    /// Answer every `Ping`; acknowledge every `Append` after this delay (an
+    /// auditd's persistence before its `Ack`, docs/50 §8.1).
+    Acknowledge(Duration),
+    /// Answer the first connection's first `Ping` (the start-up check), then
+    /// close it, and close every later connection at once: auditd lost
+    /// while the front serves.
+    LostAfterStart,
+}
+
+/// Start a test auditd on `path` that names `source` in its `Pong` and
+/// acknowledges every `Append` at once (its events kept); anything else
+/// closes.
+/// Spec: docs/50 §7.5, §8.1.
+pub(crate) fn start_auditd(path: &PathBuf, source: EventSource) -> AuditSeen {
+    start_auditd_with(path, source, AuditdBehaviour::Acknowledge(Duration::ZERO))
+}
+
+/// [`start_auditd`] with a chosen [`AuditdBehaviour`].
+/// Spec: docs/50 §7.5, §8.1.
+pub(crate) fn start_auditd_with(
+    path: &PathBuf,
+    source: EventSource,
+    behaviour: AuditdBehaviour,
+) -> AuditSeen {
     let listener = UnixListener::bind(path).unwrap();
+    let seen = AuditSeen::default();
+    let shared = seen.clone();
     std::thread::spawn(move || {
+        let mut first = true;
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { return };
+            let ack_delay = match behaviour {
+                AuditdBehaviour::Acknowledge(delay) => delay,
+                AuditdBehaviour::LostAfterStart if first => Duration::ZERO,
+                AuditdBehaviour::LostAfterStart => continue,
+            };
+            let only_one_ping = behaviour == AuditdBehaviour::LostAfterStart;
+            first = false;
+            let seen = shared.clone();
             std::thread::spawn(move || {
                 let limit = AUDIT_CHANNEL.limit(ipc::Direction::Request);
                 while let Some(body) = read_frame(&mut stream, limit) {
-                    if let Ok(AuditRequest::Ping) = ipc_audit::decode_request(&body) {
-                        let pong =
-                            ipc_audit::encode_reply(&Reply::Message(AuditReply::Pong(source)))
-                                .unwrap();
-                        let _ = stream.write_all(pong.as_bytes());
-                    } else {
+                    let reply = match ipc_audit::decode_request(&body) {
+                        Ok(AuditRequest::Ping) => AuditReply::Pong(source),
+                        Ok(AuditRequest::Append(append)) => {
+                            std::thread::sleep(ack_delay);
+                            let at = Instant::now();
+                            let mut events = seen.events.lock().unwrap();
+                            for event in append.events() {
+                                let event = ipc_audit::decode_event(event.as_bytes())
+                                    .expect("a valid event");
+                                events.push((at, event));
+                            }
+                            AuditReply::Ack(Ack {
+                                through_seq: append.last_seq(),
+                                head_hash: [0; 32],
+                            })
+                        }
+                        Err(_) => return,
+                    };
+                    let frame = ipc_audit::encode_reply(&Reply::Message(reply)).unwrap();
+                    if stream.write_all(frame.as_bytes()).is_err() || only_one_ping {
                         return;
                     }
                 }
             });
         }
     });
+    seen
 }
 
 /// The internal network of the tests: 127.0.0.1/32.
@@ -219,12 +315,13 @@ pub fn loopback_only() -> Vec<Network> {
     vec![Network::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 32).unwrap()]
 }
 
-/// One running front and its test dird.
+/// One running front, its test dird and its test auditd.
 pub struct World {
     pub front: SocketAddr,
     pub control: DaemonControl,
     pub dird: Dird,
     pub dird_socket: PathBuf,
+    pub auditd: AuditSeen,
     pub uid: u32,
     thread: Option<JoinHandle<Result<(), DaemonError>>>,
     paths: Vec<PathBuf>,
@@ -270,7 +367,7 @@ pub(crate) fn world(adjust: impl FnOnce(&mut FrontParams)) -> Option<World> {
     let dird_path = socket_path("dird");
     let audit_path = socket_path("audit");
     let dird = start_dird(&dird_path);
-    start_auditd(&audit_path, FRONT_AUDIT_SOURCE);
+    let auditd = start_auditd(&audit_path, FRONT_AUDIT_SOURCE);
     let mut params = params(dird_path.clone(), audit_path.clone(), uid);
     adjust(&mut params);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -301,6 +398,7 @@ pub(crate) fn world(adjust: impl FnOnce(&mut FrontParams)) -> Option<World> {
         control,
         dird,
         dird_socket: dird_path.clone(),
+        auditd,
         uid,
         thread: Some(thread),
         paths: vec![dird_path, audit_path],
