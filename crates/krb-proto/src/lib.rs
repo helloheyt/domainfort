@@ -42,9 +42,12 @@
 //!   RFC 3244 §2) and the KerberosTime ↔ seconds pair
 //!   ([`kerberos_time_seconds`], the scale every component compares times
 //!   on; [`kerberos_time_from_unix`], a Unix clock reading as a
-//!   KerberosTime; RFC 4120 5.2.3) — moved here from crates/keyd-types and
-//!   crates/kpasswd-front, so every crate that links krb-proto calls the
-//!   same one.
+//!   KerberosTime, and its inverse [`kerberos_time_to_unix`]; RFC 4120
+//!   5.2.3) — moved here from crates/keyd-types and crates/kpasswd-front,
+//!   so every crate that links krb-proto calls the same one. The daemons'
+//!   clocks, provisioning, the kdc and the LDAP engine call them too; no
+//!   other crate defines them (Q-987 item 5, Q-995; guard
+//!   `tests/single_name_and_time_definitions.rs`).
 //!
 //! Not here (later tasks): KRB-SAFE / KRB-CRED,
 //! the AD-* authorization containers, TYPED-DATA. Weak or excluded mechanisms
@@ -185,4 +188,4 @@ pub use krb_error::{KrbError, MethodData};
 pub use krb_priv::{EncKrbPrivPart, KrbPriv, UserData};
 pub use preauth::{EtypeInfo2, EtypeInfo2Entry, PaEncTimestamp, PaEncTsEnc};
 pub use ticket::{EncTicketPart, Ticket, TransitedEncoding};
-pub use time::{kerberos_time_from_unix, kerberos_time_seconds};
+pub use time::{kerberos_time_from_unix, kerberos_time_seconds, kerberos_time_to_unix};

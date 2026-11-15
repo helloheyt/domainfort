@@ -158,7 +158,7 @@ mod tier1_tests;
 pub use audit::{is_gating, RecordBuffer};
 pub use audit_client::{AuditEndpoint, AuditLinkError};
 pub use callers::{CallerMap, CallerMapError};
-pub use clock::{kerberos_time_from_unix, Clock, SystemClock};
+pub use clock::{Clock, SystemClock};
 pub use daemon::{
     serve, DaemonControl, DaemonError, DaemonParams, Stopped, AUDIT_FLUSH_GRACE, DRAIN_GRACE,
     ENGINE_QUEUE_CAPACITY, SOCKET_FILE_MODE,

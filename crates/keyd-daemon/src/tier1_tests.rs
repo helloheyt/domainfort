@@ -15,7 +15,7 @@
 //! `test-seams`, enabled only by this crate's dev-dependency).
 
 use crate::audit::AuditGate;
-use crate::clock::{kerberos_time_from_unix, Clock};
+use crate::clock::Clock;
 use crate::engine::{
     Engine, EngineError, IntentAckBudget, IntentAckBudgetOutOfRange, SubmitError,
     INTENT_ACK_BUDGET, MAX_INTENT_ACK_BUDGET,
@@ -31,12 +31,14 @@ use ipc_audit_client::LinkedGate;
 use ipc_keyd::{Answer, Call, KeydReply, Password, KEYD_CHANNEL};
 use ipc_keyd_server::{Dispatch, KeyStateIntent};
 use keyd::{
-    kerberos_time_seconds, requires_acknowledged_intent, AccountKind, AuthnError, CallerId,
-    DecidedOperation, DecisionId, Error, InMemoryKeyStore, KeyHandle, KeyPurpose, Kvno, Operation,
-    OsEntropy, PrincipalBinding, PrincipalId, Role, SetSecretTarget, MAX_INITIAL_SECRET_GRANT_SECS,
-    MAX_SET_SECRET_GRANT_SECS,
+    requires_acknowledged_intent, AccountKind, AuthnError, CallerId, DecidedOperation, DecisionId,
+    Error, InMemoryKeyStore, KeyHandle, KeyPurpose, Kvno, Operation, OsEntropy, PrincipalBinding,
+    PrincipalId, Role, SetSecretTarget, MAX_INITIAL_SECRET_GRANT_SECS, MAX_SET_SECRET_GRANT_SECS,
 };
-use krb_proto::{KerberosString, KerberosTime, PaData, PrincipalName, Realm};
+use krb_proto::{
+    kerberos_time_from_unix, kerberos_time_to_unix, KerberosString, KerberosTime, PaData,
+    PrincipalName, Realm,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
@@ -83,10 +85,10 @@ fn client(octet: u8) -> KeyHandle {
     )
 }
 
-/// Unix seconds of a calendar time (the inverse of the clock's conversion).
+/// Unix seconds of a calendar time (the inverse of the clock's conversion,
+/// krb-proto's one pair — Q-995).
 fn unix(t: &KerberosTime) -> u64 {
-    let epoch = kerberos_time_seconds(&KerberosTime::new(1970, 1, 1, 0, 0, 0).unwrap());
-    u64::try_from(kerberos_time_seconds(t) - epoch).unwrap()
+    kerberos_time_to_unix(t).unwrap()
 }
 
 /// The start time of the engines below: 2026-11-13T10:00:00Z.

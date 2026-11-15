@@ -1,10 +1,13 @@
 //! The project's one KerberosTime ↔ seconds pair (crate `time` module):
 //! [`kerberos_time_seconds`] — the scale — and [`kerberos_time_from_unix`] —
-//! a Unix clock reading as a KerberosTime. Behaviour tests of the single
-//! definitions, moved with them (docs/questions/Q-955 item 5, A-158; Q-987)
-//! from crates/keyd-types `time.rs` (the scale's calendar differences and
-//! range) and crates/kpasswd-front (`clock.rs` fixed points; the former
-//! front-to-keyd pin is now the check that the two directions agree).
+//! a Unix clock reading as a KerberosTime — with its inverse
+//! [`kerberos_time_to_unix`]. Behaviour tests of the single definitions,
+//! moved with them (docs/questions/Q-955 item 5, A-158; Q-987) from
+//! crates/keyd-types `time.rs` (the scale's calendar differences and range)
+//! and crates/kpasswd-front (`clock.rs` fixed points; the former
+//! front-to-keyd pin is now the check that the two directions agree); the
+//! inverse's fixed points come with the kdc's copy it replaced (crates/kdc
+//! `time.rs` `unix_instant`, Q-995).
 //!
 //! Source: RFC 4120 5.2.3 ("UTC time", whole seconds, "shall specify the UTC
 //! time zone (Z)"; the example `19851106210627Z`); the proleptic Gregorian
@@ -12,7 +15,9 @@
 //! is derived by hand in its comment. No vector comes from any other
 //! implementation.
 
-use krb_proto::{kerberos_time_from_unix, kerberos_time_seconds, KerberosTime};
+use krb_proto::{
+    kerberos_time_from_unix, kerberos_time_seconds, kerberos_time_to_unix, KerberosTime,
+};
 
 fn kt(y: u16, mo: u8, d: u8, h: u8, mi: u8, s: u8) -> KerberosTime {
     KerberosTime::new(y, mo, d, h, mi, s).unwrap()
@@ -151,4 +156,42 @@ fn the_two_directions_agree() {
         kerberos_time_from_unix(4_107_542_400),
         Some(kt(2100, 3, 1, 0, 0, 0))
     );
+}
+
+/// RFC 4120 5.2.3; docs/11 §1, §10 P9 (the PDP's `Instant`, seconds since
+/// 1970-01-01T00:00:00Z — crate pdp): the inverse's hand-derived fixed points — the epoch is 0, one day later 86,400; RFC
+/// 4120's example instant 19851106210627Z is 5,788 days + 75,987 s (above);
+/// 2026-11-13T10:00:00Z is 20,770 days + 36,000 s (56 years 1970 to 2025
+/// with the 14 leap days of 1972 to 2024 = 20,454 days, plus the 304 days of
+/// 2026 before November and 12 of November — the fixed point of
+/// directory-daemon's former copy, Q-995); a KerberosTime before the epoch
+/// has no Unix reading (`None`, the caller fails closed) — and it inverts
+/// [`kerberos_time_from_unix`] on the whole range, the last second included.
+#[test]
+fn the_unix_reading_of_a_kerberos_time() {
+    assert_eq!(kerberos_time_to_unix(&kt(1970, 1, 1, 0, 0, 0)), Some(0));
+    assert_eq!(
+        kerberos_time_to_unix(&kt(1970, 1, 2, 0, 0, 0)),
+        Some(86_400)
+    );
+    assert_eq!(
+        kerberos_time_to_unix(&kt(1985, 11, 6, 21, 6, 27)),
+        Some(5_788 * 86_400 + 75_987)
+    );
+    assert_eq!(
+        kerberos_time_to_unix(&kt(2026, 11, 13, 10, 0, 0)),
+        Some(20_770 * 86_400 + 36_000)
+    );
+    assert_eq!(kerberos_time_to_unix(&kt(1969, 12, 31, 23, 59, 59)), None);
+    assert_eq!(kerberos_time_to_unix(&kt(0, 1, 1, 0, 0, 0)), None);
+    for time in [
+        kt(1970, 1, 1, 0, 0, 0),
+        kt(2000, 2, 29, 12, 34, 56),
+        kt(2024, 12, 31, 23, 59, 59),
+        kt(2100, 3, 1, 0, 0, 1),
+        kt(9999, 12, 31, 23, 59, 59),
+    ] {
+        let unix = kerberos_time_to_unix(&time).unwrap();
+        assert_eq!(kerberos_time_from_unix(unix), Some(time), "{time:?}");
+    }
 }

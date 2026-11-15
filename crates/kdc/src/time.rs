@@ -79,12 +79,11 @@ pub(crate) fn till_maximum() -> Option<KerberosTime> {
     KerberosTime::new(1970, 1, 1, 0, 0, 0).ok()
 }
 
-/// Seconds since 1970-01-01T00:00:00Z, the PDP's explicit `Instant`
-/// (docs/11 §1, P9). `None` before 1970 (the caller fails closed).
-pub(crate) fn unix_seconds(t: &KerberosTime) -> Option<u64> {
-    let epoch = seconds(&till_maximum()?);
-    u64::try_from(seconds(t) - epoch).ok()
-}
+// The PDP's explicit `Instant` (seconds since 1970-01-01T00:00:00Z, docs/11
+// §1, P9) is krb-proto's one `kerberos_time_to_unix` (crate::gate); this
+// module held a copy until docs/questions/Q-987 item 5 / A-165 folded it
+// (Q-995). `till_maximum` above is RFC 4120 5.4.1's `till` value, which only
+// happens to be the same instant.
 
 #[cfg(test)]
 mod tests {
@@ -136,12 +135,5 @@ mod tests {
         let last = seconds(&t(9999, 12, 31, 23, 59, 59));
         assert_eq!(from_seconds(last + 1), None);
         assert_eq!(from_seconds(i64::MAX), None);
-    }
-
-    #[test]
-    fn unix_instant() {
-        assert_eq!(unix_seconds(&t(1970, 1, 1, 0, 0, 0)), Some(0));
-        assert_eq!(unix_seconds(&t(1970, 1, 2, 0, 0, 0)), Some(86_400));
-        assert_eq!(unix_seconds(&t(1969, 12, 31, 23, 59, 59)), None);
     }
 }

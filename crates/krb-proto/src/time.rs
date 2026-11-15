@@ -1,7 +1,7 @@
 //! The project's one KerberosTime ↔ seconds pair: the KerberosTime-to-seconds
 //! scale every component compares times on, and the conversion of a Unix
 //! clock reading (whole seconds since 1970-01-01T00:00:00Z) into a
-//! KerberosTime.
+//! KerberosTime and back.
 //!
 //! RFC 4120 5.2.3: a KerberosTime is a UTC calendar date and time in whole
 //! seconds ("shall not include any fractional portions of the seconds … it
@@ -20,11 +20,21 @@
 //! — krb-proto is linked by keyd-types, the kdc and the front alike — and
 //! keyd-types re-exports the scale under its old path, so no caller changed.
 //!
+//! **The copies folded (docs/questions/Q-987 item 5, decision A-165;
+//! Q-995):** the clocks of kdc-daemon, keyd-daemon, directory-daemon and
+//! admin-daemon and provisioning's time each wrote the Unix conversion once
+//! more (a search over the scale, or a walk through directory-pip's DSTIME),
+//! and the kdc and the LDAP engine each wrote the reverse difference with
+//! the epoch spelled again; they call [`kerberos_time_from_unix`] /
+//! [`kerberos_time_to_unix`] now, and a source scan pins that no other crate
+//! defines either (`tests/single_name_and_time_definitions.rs`).
+//!
 //! keyd never reads a clock: every keyd operation takes `now` from its
 //! caller. The integrity of the system time source is the platform's (RFC
 //! 4120 §1.6 / §10: clock synchronization "MUST itself be secured").
 //!
-//! Spec: RFC 4120 5.2.3, §1.6, §10; docs/questions/Q-955 item 5 (A-158).
+//! Spec: RFC 4120 5.2.3, §1.6, §10; docs/questions/Q-955 item 5 (A-158),
+//! Q-987 item 5 (A-165), Q-995.
 
 use crate::basic::{days_in_month, is_leap_year, KerberosTime};
 
@@ -117,4 +127,23 @@ pub fn kerberos_time_from_unix(secs: u64) -> Option<KerberosTime> {
         u8::try_from(within_day % SECONDS_PER_MINUTE).ok()?,
     )
     .ok()
+}
+
+/// The Unix clock reading of `t`: its whole seconds after
+/// 1970-01-01T00:00:00Z — the inverse of [`kerberos_time_from_unix`] on its
+/// range — or `None` for a KerberosTime before that instant (a caller that
+/// gets `None` fails closed). The difference of two counts on the project's
+/// one scale ([`kerberos_time_seconds`]), so it can never disagree with it.
+///
+/// The PDP's explicit `Instant` (crate pdp: seconds since
+/// 1970-01-01T00:00:00Z, supplied by the PEP — docs/11 §1, §10 P9) is this
+/// value; the kdc and the LDAP engine took it from copies of this
+/// difference, each spelling the epoch once more (docs/questions/Q-987
+/// item 5; Q-995).
+///
+/// Spec: RFC 4120 5.2.3.
+#[must_use]
+pub fn kerberos_time_to_unix(t: &KerberosTime) -> Option<u64> {
+    let epoch = KerberosTime::new(UNIX_EPOCH_YEAR, 1, 1, 0, 0, 0).ok()?;
+    u64::try_from(kerberos_time_seconds(t) - kerberos_time_seconds(&epoch)).ok()
 }

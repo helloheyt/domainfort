@@ -146,7 +146,7 @@ pub mod zones;
 
 pub use audit_client::{AuditEndpoint, AuditLinkError, AUDIT_DEADLINE, HEARTBEAT};
 pub use audit_convert::kdc_event;
-pub use clock::{kerberos_time_from_unix, Clock, SystemClock};
+pub use clock::{Clock, SystemClock};
 pub use daemon::{
     serve, DaemonControl, DaemonError, DaemonParams, Listeners, Stopped, AS_QUEUE_CAPACITY,
     AUDIT_FLUSH_GRACE, DRAIN_GRACE, TGS_QUEUE_CAPACITY,

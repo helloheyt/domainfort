@@ -30,7 +30,9 @@
 //!    dropped — and only then end the audit task; the events still
 //!    unacknowledged are reported (the log note
 //!    `AuditUnacknowledged` with their count, and
-//!    [`Stopped::unacknowledged_audit_events`]); remove the socket files,
+//!    [`Stopped::unacknowledged_audit_events`]), and so are the counts never
+//!    sent as a summary (one note per kind; [`Stopped::unflushed_audit`] —
+//!    docs/questions/Q-995); remove the socket files,
 //!    return; the caller drops the runtime, after which the engine threads
 //!    end and are joined ([`Stopped::join`]).
 //!
@@ -63,7 +65,7 @@ use crate::ldap_audit::AuditGate;
 use crate::ldap_engine::LdapService;
 use crate::ldap_listener::{self, LdapServeContext};
 use crate::listener::{accept_loop, ServeContext};
-use crate::log::{note, Note};
+use crate::log::{audit_undelivered, note, Note};
 use crate::operation_ids::OperationIds;
 use crate::policy::{tier_map, DevelopmentPolicy};
 use core::fmt;
@@ -71,6 +73,7 @@ use core::time::Duration;
 use directory_pip::{DirectoryContext, NamingContext};
 use dirstore::{IntegrityKey, Store};
 use ipc_audit::WindowConfig;
+use ipc_audit_client::Unflushed;
 use ipc_directory_server::ViewLimits;
 use ipc_kpasswd::KpasswdFronts;
 use ipc_ldap_server::Fronts;
@@ -410,7 +413,7 @@ pub struct Stopped {
     /// The kpasswd thread, if the kpasswd service ran (task K7).
     kpasswd_engine: Option<EngineThread>,
     engine_failed: bool,
-    unacknowledged: usize,
+    unflushed: Unflushed,
 }
 
 impl Stopped {
@@ -422,11 +425,22 @@ impl Stopped {
 
     /// The LDAP audit events auditd had not acknowledged when the stop
     /// ended the audit task (after waiting up to [`AUDIT_FLUSH_GRACE`]):
-    /// lost with the process (Q-252 item 9). 0 after a clean stop.
+    /// lost with the process (Q-252 item 9). 0 after a clean stop. Only the
+    /// events part: the whole report is [`Stopped::unflushed_audit`].
     /// Spec: docs/50 R50-17, §8.1; docs/questions/Q-313 (A-82).
     #[must_use]
     pub fn unacknowledged_audit_events(&self) -> usize {
-        self.unacknowledged
+        self.unflushed.events()
+    }
+
+    /// Everything the stop could not deliver to auditd — the events above
+    /// and the counts never sent as a summary (`suppressed_noise`,
+    /// `refused_gating`, `unrecorded_outcomes`): the shared flush's whole
+    /// report (`ipc_audit_client::AuditGate::close`), read with
+    /// `Unflushed::undelivered` (docs/questions/Q-990 item 4, A-166; Q-995).
+    /// Spec: docs/questions/Q-313 (A-82), Q-995.
+    pub fn unflushed_audit(&self) -> Unflushed {
+        self.unflushed
     }
 
     /// Wait for the engine threads (the admin thread and the kpasswd
@@ -1080,20 +1094,16 @@ pub async fn serve_with(
     // audit task keeps reconnecting (crate::audit_link) and a link that
     // dropped just before the stop can still deliver within the bound
     // (docs/questions/Q-350 item 11). The one flush of every daemon
-    // (`ipc_audit_client::AuditGate::close`, docs/52 R6).
-    let unacknowledged = gate
+    // (`ipc_audit_client::AuditGate::close`, docs/52 R6). The report names
+    // every event auditd did not acknowledge and every count never sent as
+    // a summary (docs/questions/Q-990 item 4, A-166; Q-995).
+    let unflushed = gate
         .close(AUDIT_FLUSH_GRACE, async {
             audit_task.abort();
             let _ = audit_task.await;
         })
-        .await
-        .events();
-    if unacknowledged > 0 {
-        note(
-            Note::AuditUnacknowledged,
-            Some(u64::try_from(unacknowledged).unwrap_or(u64::MAX)),
-        );
-    }
+        .await;
+    audit_undelivered(unflushed);
     // Whether an engine ended before the stop asked for it — read before
     // the admin and kpasswd contexts are dropped below: dropping a context
     // drops its thread's queue, which ends that thread (its `on_exit` then
@@ -1119,6 +1129,6 @@ pub async fn serve_with(
         admin_engine,
         kpasswd_engine,
         engine_failed,
-        unacknowledged,
+        unflushed,
     })
 }

@@ -49,6 +49,7 @@
 //! AGENTS.md §6, §6.1; docs/questions/Q-961 items 3, 7 (A-160).
 
 use crate::audit::AuditGate;
+use ipc_audit_client::{Undelivered, Unflushed};
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -97,6 +98,17 @@ pub enum Note {
     /// Audit events (summaries) still unacknowledged when the front
     /// stopped.
     AuditUnacknowledged,
+    /// At the stop, noise counted for a `WindowSummary` that never left
+    /// the audit window (auditd unreachable, or the pace held it past the
+    /// grace): lost with the process; the identifier is the count
+    /// (docs/questions/Q-990 item 4, A-166; Q-995).
+    AuditSuppressedNoiseUndelivered,
+    /// At the stop, refused gating reservations counted for a summary that
+    /// never left the audit window; the identifier is the count (Q-995).
+    AuditRefusedGatingUndelivered,
+    /// At the stop, lost outcome records counted for a summary that never
+    /// left the audit window; the identifier is the count (A-88; Q-995).
+    AuditUnrecordedOutcomesUndelivered,
     /// Stopped.
     Stopped,
 }
@@ -126,6 +138,15 @@ impl Note {
             Note::AuditRestored => "audit connection verified again",
             Note::AuditLost => "audit connection lost; noise counts kept",
             Note::AuditUnacknowledged => "audit events unacknowledged at stop",
+            Note::AuditSuppressedNoiseUndelivered => {
+                "audit count not delivered at stop: suppressed noise"
+            }
+            Note::AuditRefusedGatingUndelivered => {
+                "audit count not delivered at stop: refused gating reservations"
+            }
+            Note::AuditUnrecordedOutcomesUndelivered => {
+                "audit count not delivered at stop: unrecorded outcomes"
+            }
             Note::Stopped => "stopped",
         }
     }
@@ -139,6 +160,25 @@ pub fn note(note: Note, id: Option<u64>) {
         Some(id) => writeln!(err, "kpasswd-front: {} [{id}]", note.text()),
         None => writeln!(err, "kpasswd-front: {}", note.text()),
     };
+}
+
+/// The stop's audit report (`ipc_audit_client::Unflushed::undelivered`): one
+/// note per kind auditd did not receive, with its count — the events it did
+/// not acknowledge and the counts never sent as a summary alike
+/// (docs/questions/Q-990 item 4, A-166; Q-995). Counts only, never event
+/// content. The `match` names every kind (no wildcard), so a kind added to
+/// the report reaches this log or fails to compile.
+/// Spec: docs/50 §8.2; docs/questions/Q-313 (A-82), Q-995.
+pub fn audit_undelivered(unflushed: Unflushed) {
+    for part in unflushed.undelivered() {
+        let kind = match part {
+            Undelivered::Events(_) => Note::AuditUnacknowledged,
+            Undelivered::SuppressedNoise(_) => Note::AuditSuppressedNoiseUndelivered,
+            Undelivered::RefusedGating(_) => Note::AuditRefusedGatingUndelivered,
+            Undelivered::UnrecordedOutcomes(_) => Note::AuditUnrecordedOutcomesUndelivered,
+        };
+        note(kind, Some(part.count()));
+    }
 }
 
 /// A count of one frequent note, logged on powers of two.

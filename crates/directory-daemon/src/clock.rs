@@ -8,10 +8,9 @@
 //!
 //! [`SystemClock`] reads the operating-system clock (`std::time::SystemTime`)
 //! and converts whole seconds since 1970-01-01T00:00:00Z to a `KerberosTime`
-//! through directory-pip's DSTIME scale (seconds since 1601-01-01T00:00:00Z,
-//! [MS-DRSR] 5.51): the DSTIME of the Unix epoch is computed with
-//! `dstime_of`, the seconds are added, and `time_of_dstime` builds the
-//! calendar time — so no epoch constant is written here, and an instant
+//! with the project's one conversion, `krb_proto::kerberos_time_from_unix`
+//! (this module composed its own through directory-pip's DSTIME scale until
+//! docs/questions/Q-987 item 5 / A-165 folded it — Q-995); an instant
 //! outside the representable range yields `None` (the request is not served,
 //! fail closed). The integrity of the host clock is the platform's (RFC 4120
 //! §1.6; docs/questions/Q-222 item 2).
@@ -20,12 +19,11 @@
 //! compared octet for octet; or one that holds, to fill the engine queue —
 //! docs/50 §9).
 //!
-//! Spec: docs/49 §11; docs/50 §4.1, §9; RFC 4120 5.2.3; [MS-DRSR] 5.51;
-//! docs/questions/Q-222 (A-56).
+//! Spec: docs/49 §11; docs/50 §4.1, §9; RFC 4120 5.2.3; docs/questions/Q-222
+//! (A-56), Q-987 item 5 (A-165), Q-995.
 
 use core::fmt;
-use directory_pip::{dstime_of, time_of_dstime};
-use krb_proto::KerberosTime;
+use krb_proto::{kerberos_time_from_unix, KerberosTime};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -42,21 +40,11 @@ pub struct SystemClock;
 
 impl Clock for SystemClock {
     /// Whole seconds of `SystemTime::now()` since the epoch.
-    /// Spec: docs/50 §4.1; RFC 4120 5.2.3; [MS-DRSR] 5.51.
+    /// Spec: docs/50 §4.1; RFC 4120 5.2.3.
     fn now(&self) -> Option<KerberosTime> {
         let since = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
         kerberos_time_from_unix(since.as_secs())
     }
-}
-
-/// The KerberosTime `secs` whole seconds after 1970-01-01T00:00:00Z, or
-/// `None` outside the representable range.
-/// Spec: RFC 4120 5.2.3; [MS-DRSR] 5.51 (DSTIME); crates/directory-pip
-/// time.rs.
-#[must_use]
-pub fn kerberos_time_from_unix(secs: u64) -> Option<KerberosTime> {
-    let epoch = dstime_of(&KerberosTime::new(1970, 1, 1, 0, 0, 0).ok()?)?;
-    time_of_dstime(epoch.checked_add(i64::try_from(secs).ok()?)?)
 }
 
 /// A clock shared by the daemon's parameters and the LDAP engine thread.
@@ -115,26 +103,12 @@ impl ldap::SearchClock for SearchTime<'_> {
 mod tests {
     use super::*;
 
-    fn t(y: u16, mo: u8, d: u8, h: u8, mi: u8, s: u8) -> KerberosTime {
-        KerberosTime::new(y, mo, d, h, mi, s).unwrap()
-    }
-
-    /// Hand-derived fixed points: the epoch is 0; 1970-01-01 → 2000-01-01
-    /// is 30 × 365 days + 7 leap days (1972 … 1996) = 10957 days; 2026-11-13
-    /// is 20,770 days after the epoch (56 years: 14 leap days 1972 … 2024,
-    /// so 56 × 365 + 14 = 20,454 days to 2026-01-01; then 316 days of 2026
-    /// to 13 November).
+    /// docs/50 §4.1 ("the system clock per request"): the host clock reads
+    /// and is represented (it is after 1970). The conversion's own tests are
+    /// krb-proto's (`tests/time_scale.rs`).
     #[test]
-    fn fixed_points() {
-        assert_eq!(kerberos_time_from_unix(0), Some(t(1970, 1, 1, 0, 0, 0)));
-        assert_eq!(
-            kerberos_time_from_unix(10_957 * 86_400 + 3_661),
-            Some(t(2000, 1, 1, 1, 1, 1))
-        );
-        assert_eq!(
-            kerberos_time_from_unix(20_770 * 86_400 + 36_000),
-            Some(t(2026, 11, 13, 10, 0, 0))
-        );
+    fn the_system_clock_reads() {
         assert!(SystemClock.now().is_some());
+        assert!(SharedClock::system().now().is_some());
     }
 }

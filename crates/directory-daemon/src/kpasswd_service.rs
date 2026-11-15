@@ -65,7 +65,9 @@ use keyd_types::{
     PrincipalId,
 };
 use krb_proto::constants::KRB_NT_SRV_INST;
-use krb_proto::{KerberosString, NonZeroResultCode, PrincipalName, Realm};
+use krb_proto::{
+    KerberosString, NonZeroResultCode, PrincipalName, Realm, CHANGE_PASSWORD_SERVICE_NAME,
+};
 use provision_manifest::Manifest;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -121,16 +123,22 @@ pub const CHANGE_PASSWORD_DECISION_LIFETIME_SECS: u32 = keyd_types::MAX_SET_SECR
 
 /// The change-password service's name, `kadmin/changepw` (RFC 3244 §2: "the
 /// service principal kadmin/changepw@REALM"), as dird resolves it in its
-/// directory. The name-type is a hint only (RFC 4120 §6.2; the directory
-/// resolves the components); NT-SRV-INST as the KDC fixtures use.
+/// directory: the components of the project's one definition,
+/// `krb_proto::CHANGE_PASSWORD_SERVICE_NAME` — the name keyd binds the key
+/// set to and the kdc classifies by (this function spelled the components
+/// as literals until docs/questions/Q-987 item 5 / A-165 folded them —
+/// Q-995). The name-type is a hint only (RFC 4120 §6.2: "not significant
+/// when checking for equivalence"; the directory resolves the components);
+/// NT-SRV-INST ("Service and other unique instance") as the KDC fixtures
+/// use.
 /// Spec: RFC 3244 §2; RFC 4120 §6.2; docs/53 §5.2.
 fn change_password_service_name() -> Option<PrincipalName> {
     Some(PrincipalName {
         name_type: KRB_NT_SRV_INST,
-        name_string: vec![
-            KerberosString::new("kadmin").ok()?,
-            KerberosString::new("changepw").ok()?,
-        ],
+        name_string: CHANGE_PASSWORD_SERVICE_NAME
+            .iter()
+            .map(|component| KerberosString::new(component).ok())
+            .collect::<Option<Vec<_>>>()?,
     })
 }
 

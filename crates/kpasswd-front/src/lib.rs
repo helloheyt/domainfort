@@ -93,7 +93,8 @@
 //!   connection, no breakdown by kind on the log (the kinds are on stderr).
 //!   Counts the stop's bounded flush cannot deliver (auditd unreachable, or
 //!   the grace spent) are lost with the process; they remain on the
-//!   operational log.
+//!   operational log, where the stop's report also names how many never
+//!   reached auditd (docs/questions/Q-995).
 //!   The product front starts once auditd's `uid_sources` maps its uid to
 //!   `kpasswd-front` (task DN12); provisioning that entry is task K9's.
 //! - A compromised front can drop, delay or forge a KRB-ERROR (confusion
