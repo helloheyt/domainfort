@@ -26,8 +26,9 @@ use ipc_admin::{
 };
 use ipc_dird_admin::channel::{MAX_AP_REQ, MAX_DN_COMPONENT, MAX_DN_COMPONENTS};
 use ipc_dird_admin::{
-    AccountExpires, Auth, Found, KeyOperation, KeyRef, KeyRequestState, LookupKey, Operation,
-    PasswordSetOutcome, PolicyChange, PolicyTier,
+    AccountExpires, Auth, Found, KeyOperation, KeyRef, ListScope, LookupKey, Operation,
+    PasswordSetOutcome, PendingRequestState, PolicyChange, PolicyTier, RequestShown, RequestState,
+    RequestSummary,
 };
 use zeroize::Zeroizing;
 
@@ -47,11 +48,8 @@ fn sid(rid: u32) -> Sid {
     Sid::new(SECURITY_NT_AUTHORITY, &[21, 1, 2, 3, rid]).unwrap()
 }
 
-fn auth(approvals: usize) -> Auth {
-    Auth {
-        requester: vec![0x6E; 300],
-        approvals: (0..approvals).map(|i| vec![0x6E, i as u8, 1, 2]).collect(),
-    }
+fn auth(len: usize) -> Auth {
+    Auth::of(vec![0x6E; 300 + len])
 }
 
 fn forward(operation: Operation) -> Request {
@@ -145,17 +143,26 @@ fn forwarded() -> Vec<Operation> {
             "dc=example".into(),
             "dc=test".into(),
         ])),
-        // Task A10: forwarded like every other operation.
-        Operation::RequestKeyOperation {
-            operation: KeyOperation::RotateKrbtgt,
+        // Task D2-c (docs/questions/Q-882): the request queue, forwarded
+        // like every other operation.
+        Operation::Propose {
+            reason_ref: Some("CHG-7".into()),
+            operation: Box::new(Operation::KeyOperation(KeyOperation::RetireKvno {
+                key: KeyRef::Krbtgt,
+                kvno: 3,
+            })),
         },
         Operation::Approve {
             id: 77,
-            operation: KeyOperation::RetireKvno {
-                key: KeyRef::Krbtgt,
-                kvno: 3,
-            },
+            digest: [0xA7; 32],
         },
+        Operation::Reject {
+            id: 78,
+            digest: [0xA8; 32],
+        },
+        Operation::Withdraw { id: 79 },
+        Operation::ListRequests(ListScope::AwaitingMe),
+        Operation::ShowRequest { id: 80 },
         // Task A16: the tier-map edit, forwarded like every other operation.
         Operation::ChangePolicy {
             changes: vec![
@@ -224,14 +231,37 @@ fn replies() -> Vec<Reply> {
         Reply::Refused(RefusalStatus::OutcomeUnknown),
         Reply::Refused(RefusalStatus::Incomplete),
         Reply::Pong,
-        // Task A10: dird's key-operation replies, passed on.
-        Reply::KeyRequest(KeyRequestState {
+        // Task D2-c: dird's request-queue replies, passed on.
+        Reply::PendingRequest(PendingRequestState {
             id: 77,
             digest: [0xA1; 32],
-            operation: KeyOperation::RotateKey { service: guid(41) },
+            state: RequestState::Pending,
             approvals: 0,
             quorum: 2,
+            expires: 99,
         }),
+        Reply::RequestList(vec![RequestSummary {
+            id: 77,
+            digest: [0xA1; 32],
+            state: RequestState::Approved,
+            operation: ipc_dird_admin::channel::request_kind::SET_ENABLED,
+            requester: sid(1104),
+            approvals: 1,
+            quorum: 2,
+            expires: 99,
+        }]),
+        Reply::RequestShown(Box::new(RequestShown {
+            id: 77,
+            digest: [0xA1; 32],
+            state: RequestState::Pending,
+            requester: sid(1104),
+            approvers: vec![],
+            quorum: 2,
+            expires: 99,
+            reason_ref: None,
+            operation: Operation::KeyOperation(KeyOperation::RotateKey { service: guid(41) }),
+            facts: vec![],
+        })),
         // Task A16: dird's `PolicyNext`, passed on.
         Reply::PolicyNext { version: 7 },
     ]
@@ -333,11 +363,15 @@ fn forwarded_operations_are_dirds_layout_byte_for_byte() {
 /// table, so a frame of one (with the former payloads) closes the
 /// connection whatever it holds; their replies (`0x89`, `0x8A`) are not in
 /// the reply table either. admind cannot be asked to forward anything for
-/// keyadm (N2).
+/// keyadm (N2). Task D2-c (docs/questions/Q-882) retired task A10's
+/// key-only `RequestKeyOperation` / `Approve {id, operation}` (`0x0E`,
+/// `0x0F`) and their reply `KeyRequest` (`0x88`) the same way.
 #[test]
 fn retired_keyadm_kinds_close() {
-    assert_eq!(request_kind::RETIRED, &[0x10, 0x11, 0x12]);
+    assert_eq!(request_kind::RETIRED, &[0x0E, 0x0F, 0x10, 0x11, 0x12]);
     for (kind, payload) in [
+        (0x0Eu8, vec![1]),
+        (0x0F, [77u64.to_be_bytes().to_vec(), vec![1]].concat()),
         (0x10u8, 77u64.to_be_bytes().to_vec()),
         (0x11, [77u64.to_be_bytes().to_vec(), vec![2]].concat()),
         (0x12, vec![0]),
@@ -352,7 +386,7 @@ fn retired_keyadm_kinds_close() {
             "{kind:#x}"
         );
     }
-    assert_eq!(reply_kind::RETIRED, &[0x89, 0x8A]);
+    assert_eq!(reply_kind::RETIRED, &[0x88, 0x89, 0x8A]);
     for kind in reply_kind::RETIRED {
         assert!(!reply_kind::ALL.contains(kind));
         let mut body = reply_body(&Reply::Pong);
@@ -438,21 +472,26 @@ fn dirds_password_set_steps_are_not_on_this_channel() {
 
 /// docs/50 §3.3 ("kind closed: unknown op ⇒ close"); A-59: unknown kinds,
 /// the unused numbers (dird's password-set steps, the join token), and the
-/// reserved `REFUSED_KIND` close the connection without a reply. (The key
-/// operations `0x0E`, `0x0F` are this channel's since task A10; keyadm's
+/// reserved `REFUSED_KIND` close the connection without a reply. (Task
+/// A10's key operations `0x0E`, `0x0F` are retired by task D2-c; keyadm's
 /// `0x10`–`0x12` are retired by A-102 and close too; `0x16` is
-/// `ChangePolicy` since task A16, so `0x17` stands for the next unused one.)
+/// `ChangePolicy` since task A16; `0x17`–`0x1C` are the request queue since
+/// task D2-c, `0x1D` its inner key-operation kind (never a request), so
+/// `0x1E` stands for the next unused one.)
 #[test]
 fn unknown_kinds_close() {
     for kind in [
         0x00,
         0x06,
         0x07,
+        0x0E,
+        0x0F,
         0x10,
         0x11,
         0x12,
         0x13,
-        0x17,
+        0x1D,
+        0x1E,
         0x81,
         0x87,
         0x7F,
@@ -525,15 +564,14 @@ fn the_password_bound() {
 }
 
 /// docs/51 §7.2: the AP-REQ fields at their bound (64 KiB each), the
-/// completion AP-REQ included, and one past it; at most two approvals.
+/// completion AP-REQ included, and one past it. There are no approvals in
+/// `auth` (retired by task D2-c, docs/questions/Q-882): a `SetPassword`
+/// whose `auth` still carries one (count 1) is malformed.
 #[test]
 fn the_ap_req_bounds() {
-    let make = |requester: usize, completion: usize, approvals: usize| {
+    let make = |requester: usize, completion: usize| {
         Request::SetPassword(SetPassword {
-            auth: Auth {
-                requester: vec![1; requester],
-                approvals: vec![vec![2; MAX_AP_REQ as usize]; approvals],
-            },
+            auth: Auth::of(vec![1; requester]),
             completion: vec![3; completion],
             target: guid(1),
             password: password(PASSWORD),
@@ -541,19 +579,25 @@ fn the_ap_req_bounds() {
     };
     let max = MAX_AP_REQ as usize;
     assert_eq!(MAX_COMPLETION_AP_REQ, MAX_AP_REQ);
-    let largest = make(max, max, 2);
+    let largest = make(max, max);
     let body = request_body(&largest);
     assert!(body.len() <= MAX_REQUEST_BODY as usize, "{}", body.len());
     assert_eq!(request_body(&decode_request(&body).unwrap()), body);
-    assert!(encode_request(&make(max + 1, 1, 0)).is_err());
-    assert!(encode_request(&make(1, max + 1, 0)).is_err());
-    assert!(encode_request(&make(1, 1, 3)).is_err());
+    assert!(encode_request(&make(max + 1, 1)).is_err());
+    assert!(encode_request(&make(1, max + 1)).is_err());
+    // The old form: one approval inside `auth` (count 1, an AP-REQ of one
+    // octet) — malformed.
+    let small = request_body(&make(1, 1));
+    let count_at = 4 + 4 + 1;
+    assert_eq!(&small[count_at..count_at + 4], &0u32.to_be_bytes());
+    let mut old = small[..count_at].to_vec();
+    old.extend(1u32.to_be_bytes());
+    old.extend([0, 0, 0, 1, 2]);
+    old.extend(&small[count_at + 4..]);
+    assert!(decode_request(&old).is_err());
     // The largest forwarded operation fits too.
     let forwarded = Request::Forward {
-        auth: Auth {
-            requester: vec![1; max],
-            approvals: vec![vec![2; max], vec![3; max]],
-        },
+        auth: Auth::of(vec![1; max]),
         operation: Operation::Lookup(LookupKey::Dn(vec![
             "c".repeat(MAX_DN_COMPONENT as usize);
             MAX_DN_COMPONENTS as usize

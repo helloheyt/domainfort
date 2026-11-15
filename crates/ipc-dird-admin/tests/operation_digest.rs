@@ -32,11 +32,8 @@ fn guid(n: u32) -> Guid {
     }
 }
 
-fn auth(seed: u8, approvals: usize) -> Auth {
-    Auth {
-        requester: vec![seed; 200],
-        approvals: (0..approvals).map(|i| vec![seed, i as u8, 7]).collect(),
-    }
+fn auth(seed: u8, len: usize) -> Auth {
+    Auth::of(vec![seed; 200 + len])
 }
 
 /// One operation of every kind, with distinct values.
@@ -91,13 +88,25 @@ fn operations() -> Vec<Operation> {
         },
         Operation::Delete { target: guid(5) },
         Operation::Lookup(LookupKey::SamAccountName("carol".into())),
-        Operation::RequestKeyOperation {
-            operation: KeyOperation::RotateKey { service: guid(30) },
+        // Task D2-c (docs/questions/Q-882): the request queue's kinds —
+        // `Approve` and `Reject` share their fields and differ in kind.
+        Operation::Propose {
+            reason_ref: Some("CHG-1".into()),
+            operation: Box::new(Operation::KeyOperation(KeyOperation::RotateKey {
+                service: guid(30),
+            })),
         },
         Operation::Approve {
             id: 41,
-            operation: KeyOperation::RotateKey { service: guid(30) },
+            digest: [0x30; 32],
         },
+        Operation::Reject {
+            id: 41,
+            digest: [0x30; 32],
+        },
+        Operation::Withdraw { id: 41 },
+        Operation::ShowRequest { id: 41 },
+        Operation::ListRequests(ipc_dird_admin::ListScope::Mine),
         // Task A16: R2's digest covers the new kind with no code of its own
         // (the payload after `auth`, like every other kind's).
         change_policy(1201, PolicyTier::Tier1),
@@ -160,10 +169,7 @@ fn body(auth: &Auth, operation: &Operation) -> Vec<u8> {
 
 /// The octets of the `auth` field alone.
 fn auth_len(auth: &Auth) -> usize {
-    let wire = WireAuth {
-        requester: auth.requester.clone(),
-        approvals: auth.approvals.clone(),
-    };
+    let wire = WireAuth::of(auth.requester.clone());
     encode_payload(&wire, REQUEST_LIMIT).unwrap().len()
 }
 
@@ -205,9 +211,8 @@ fn the_digest_covers_the_exact_payload_after_auth() {
 
 /// The digest binds the operation and nothing else: every operation of the
 /// list (two of which share their fields and differ only in kind, three of
-/// which share one target) has its own digest, and the AP-REQs do not
-/// change it (the requester's or the approvers' — an approval is bound to
-/// the same operation as the request). Source: docs/52 §5 items 1, 4.
+/// which share one target) has its own digest, and the AP-REQ does not
+/// change it. Source: docs/52 §5 items 1, 4.
 #[test]
 fn every_operation_has_its_own_digest_and_the_tickets_none() {
     let all: Vec<_> = operations()
@@ -229,30 +234,38 @@ fn every_operation_has_its_own_digest_and_the_tickets_none() {
         };
         assert_eq!(digest_of(&one), digest_of(&other));
     }
-    // A changed field changes the digest.
+    // A changed field changes the digest: an `Approve` binds the request's
+    // id and the digest the approver was shown (Q-882 item 1); a proposed
+    // key operation binds every field of it.
     let a = operation_digest(&Operation::Approve {
         id: 41,
-        operation: KeyOperation::RotateKey { service: guid(30) },
+        digest: [0x30; 32],
     })
     .unwrap();
     for changed in [
         Operation::Approve {
             id: 42,
-            operation: KeyOperation::RotateKey { service: guid(30) },
+            digest: [0x30; 32],
         },
         Operation::Approve {
             id: 41,
-            operation: KeyOperation::RotateKey { service: guid(31) },
-        },
-        Operation::Approve {
-            id: 41,
-            operation: KeyOperation::RetireKvno {
-                key: KeyRef::Service(guid(30)),
-                kvno: 1,
-            },
+            digest: [0x31; 32],
         },
     ] {
         assert_ne!(operation_digest(&changed).unwrap(), a);
+    }
+    let key =
+        |operation: KeyOperation| operation_digest(&Operation::KeyOperation(operation)).unwrap();
+    let b = key(KeyOperation::RotateKey { service: guid(30) });
+    for changed in [
+        KeyOperation::RotateKey { service: guid(31) },
+        KeyOperation::RetireKvno {
+            key: KeyRef::Service(guid(30)),
+            kvno: 1,
+        },
+        KeyOperation::RotateKrbtgt,
+    ] {
+        assert_ne!(key(changed), b);
     }
 }
 

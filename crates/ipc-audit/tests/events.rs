@@ -350,20 +350,25 @@ fn code_tables_are_closed() {
     assert_eq!(EventShape::DirAdmin.code(), 5);
     assert_eq!(EventShape::Admind.code(), 6);
     // Task A16 appended `ChangePolicy` (docs/51 §5.10; docs/questions/Q-592):
-    // the earlier eighteen keep their codes.
-    assert_eq!(table!(DirAdminOperation), 19);
+    // the earlier eighteen keep their codes. Task D2-c appended the request
+    // queue's five (docs/questions/Q-882, Q-938).
+    assert_eq!(table!(DirAdminOperation), 24);
     assert_eq!(DirAdminOperation::ListPendingDestruction.code(), 18);
     assert_eq!(DirAdminOperation::ChangePolicy.code(), 19);
+    assert_eq!(DirAdminOperation::ShowRequest.code(), 24);
     // Task A3 appended `SelfLockout` (Q-295 item 4, P-22); task F4
     // appended `ObligationRefused` (A-91, Q-388 item 1, Q-397); task A10
-    // appended `OperationMismatch` and `KeyOperationRefused` (Q-421).
-    assert_eq!(table!(AdminRefusal), 22);
+    // appended `OperationMismatch` and `KeyOperationRefused` (Q-421); task
+    // D2-c appended `ApprovalNotNeeded`, `RequestStale`, `RequesterLimit`
+    // (Q-938).
+    assert_eq!(table!(AdminRefusal), 25);
     assert_eq!(AdminRefusal::SelfLockout.code(), 19);
     assert_eq!(AdminRefusal::ObligationRefused.code(), 20);
     assert_eq!(AdminRefusal::OperationMismatch.code(), 21);
+    assert_eq!(AdminRefusal::KeyOperationRefused.code(), 22);
     assert_eq!(
         AdminRefusal::ALL.last(),
-        Some(&AdminRefusal::KeyOperationRefused)
+        Some(&AdminRefusal::RequesterLimit)
     );
     // Task F4 appended `ViewUnavailable` and `AuditUnacknowledged`; the
     // first four keep their codes (A-91, Q-397; append only).
@@ -479,23 +484,26 @@ fn field_inventory_holds_no_secret() {
     // docs/51 §5.7 item 1: "only names as AuditText, no other attribute
     // values and no password".
     let ipc_audit::DirAdminEvent {
-        time: _,            // dird's time
-        operation_id: _,    // dird's operation number
-        operation: _,       // code
-        stage: _,           // phase code + result code (+ refusal / failure code, or GUID + RID)
-        target: _,          // objectGUID
-        parent: _,          // objectGUID
-        member: _,          // objectGUID
-        requester: _,       // SID
-        approvers: _,       // SIDs (≤ 2)
-        pdp: _,             // code (+ rule id)
-        names: _,           // name-kind code + name (printable-ASCII rule), ≤ 4
-        enable: _,          // code (Enable / Disable) — request metadata, Q-340 item 5
-        account_expires: _, // code + FILETIME (never / a time) — request metadata
-        group_type: _,      // code (one of six groupType values) — request metadata
-        key_request: _,     // dird's request number
-        key_operation: _,   // code
-        reported_kvnos: _,  // key version numbers (not key material), ≤ 2
+        time: _,             // dird's time
+        operation_id: _,     // dird's operation number
+        operation: _,        // code
+        stage: _,            // phase code + result code (+ refusal / failure code, or GUID + RID)
+        target: _,           // objectGUID
+        parent: _,           // objectGUID
+        member: _,           // objectGUID
+        requester: _,        // SID
+        approvers: _,        // SIDs (≤ 2)
+        pdp: _,              // code (+ rule id)
+        names: _,            // name-kind code + name (printable-ASCII rule), ≤ 4
+        enable: _,           // code (Enable / Disable) — request metadata, Q-340 item 5
+        account_expires: _,  // code + FILETIME (never / a time) — request metadata
+        group_type: _,       // code (one of six groupType values) — request metadata
+        pending_request: _,  // dird's pending-request id
+        key_operation: _,    // code
+        reported_kvnos: _,   // key version numbers (not key material), ≤ 2
+        operation_digest: _, // SHA-256 of non-secret request fields (Q-888)
+        proposed: _,         // code (the operation a pending request is for)
+        reason_ref: _,       // printable-ASCII rule, the requester's change id (Q-882)
     } = dir_admin_create_outcome();
     // docs/51 §5.7 item 3, §7.6: the password never reaches the event.
     let ipc_audit::AdmindEvent {
@@ -514,9 +522,10 @@ fn field_inventory_holds_no_secret() {
             ipc_audit::AdmindActivity::ConnectionRefused { reason: _ } => {} // code
             ipc_audit::AdmindActivity::MalformedFrame { error: _ } => {}     // code, never octets
             ipc_audit::AdmindActivity::SetPassword {
-                target: _, // objectGUID
-                kvnos: _,  // key version numbers
-                result: _, // codes (step, purpose, failure class)
+                target: _,           // objectGUID
+                operation_digest: _, // SHA-256 of `BeginPasswordSet {target}` (Q-888)
+                kvnos: _,            // key version numbers
+                result: _,           // codes (step, purpose, failure class)
             } => {}
             ipc_audit::AdmindActivity::KeyadmForward {
                 operation: _, // code

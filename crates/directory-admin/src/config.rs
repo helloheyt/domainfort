@@ -63,8 +63,10 @@ pub const CHANGE_SEQ_END_EXCLUSIVE: u64 = u64::MAX;
 pub const MIN_QUORUM: usize = 2;
 
 /// The largest quorum a request can reach: the requester plus the most
-/// approvals a request carries (`approvals: seq<…, 2>`, docs/51 §7.2).
-/// Spec: docs/51 §7.2; crate ipc-audit `MAX_APPROVERS`.
+/// approvers an event names (crate ipc-audit `MAX_APPROVERS`, two — the
+/// bound docs/51 §7.2 set when approvals were carried in the request; they
+/// are a pending request's now, docs/questions/Q-882).
+/// Spec: docs/51 §5.6, §7.2; crate ipc-audit `MAX_APPROVERS`.
 pub const MAX_QUORUM: usize = 1 + MAX_APPROVERS;
 
 /// The objects the admin plane must never delete or change beyond what is
@@ -99,9 +101,13 @@ pub enum ConfigError {
     NodeId,
     /// An attribute or class this crate needs is missing from the schema.
     Schema,
-    /// The lifetime of a pending key-operation request is zero or above
-    /// `MAX_KEY_REQUEST_LIFETIME` (task A10).
-    KeyRequestLifetime,
+    /// The lifetime of a pending request is zero or above
+    /// `MAX_REQUEST_LIFETIME` (task D2-c; it was the key requests', task
+    /// A10).
+    RequestLifetime,
+    /// The per-requester cap of open pending requests is zero or above
+    /// `MAX_REQUESTS_PER_REQUESTER` (task D2-c).
+    RequesterCap,
 }
 
 impl core::fmt::Display for ConfigError {
@@ -112,7 +118,8 @@ impl core::fmt::Display for ConfigError {
             ConfigError::Realm => "realm is not the naming context's DNS name in upper case",
             ConfigError::NodeId => "node id is all zero",
             ConfigError::Schema => "schema lacks a definition the admin plane needs",
-            ConfigError::KeyRequestLifetime => "key-operation request lifetime is out of range",
+            ConfigError::RequestLifetime => "pending request lifetime is out of range",
+            ConfigError::RequesterCap => "per-requester pending request cap is out of range",
         })
     }
 }

@@ -640,15 +640,72 @@ fn fresh(sam: &str, operation: &Operation) -> Vec<u8> {
     )
 }
 
-/// `operation` by `requester` with `approvers`, every AP-REQ bound to it.
-fn by(requester: &str, approvers: &[&str], operation: Operation) -> Request {
+/// `operation` by `requester`, its one AP-REQ bound to it (R2). There are
+/// no approvals in a request (task D2-c; docs/questions/Q-882).
+fn by(requester: &str, operation: Operation) -> Request {
     Request::Operation {
-        auth: Auth {
-            requester: fresh(requester, &operation),
-            approvals: approvers.iter().map(|a| fresh(a, &operation)).collect(),
-        },
+        auth: Auth::of(fresh(requester, &operation)),
         operation,
     }
+}
+
+/// The fingerprint of `operation`: its own operation digest (Q-888).
+fn fingerprint(operation: &Operation) -> [u8; 32] {
+    *operation_digest(operation).unwrap().as_bytes()
+}
+
+/// `Propose {reason_ref, operation}` by `requester` (task D2-c).
+fn propose_op(requester: &str, operation: Operation, reason_ref: Option<&str>) -> Request {
+    by(
+        requester,
+        Operation::Propose {
+            reason_ref: reason_ref.map(str::to_owned),
+            operation: Box::new(operation),
+        },
+    )
+}
+
+/// `Approve {id, digest}` by `approver` (task D2-c).
+fn approve_digest(approver: &str, id: u64, digest: [u8; 32]) -> Request {
+    by(approver, Operation::Approve { id, digest })
+}
+
+/// The pending request's state of a reply.
+fn pending(reply: Reply) -> ipc_dird_admin::PendingRequestState {
+    match reply {
+        Reply::PendingRequest(state) => state,
+        other => panic!("expected PendingRequest, got {other:?}"),
+    }
+}
+
+/// The one dual-control mechanism over the socket (task D2-c;
+/// docs/questions/Q-882): `requester` proposes `operation`, each of
+/// `approvers` approves it by id and digest, then `requester` executes the
+/// very operation; the first refusal on the way is answered as it is, else
+/// the execution's reply.
+fn approved(
+    client: &mut AdminClient<AdminConnector>,
+    requester: &str,
+    approvers: &[&str],
+    operation: Operation,
+) -> Reply {
+    let state = match client
+        .call(&propose_op(requester, operation.clone(), None))
+        .unwrap()
+    {
+        Reply::PendingRequest(state) => state,
+        refused => return refused,
+    };
+    for approver in approvers {
+        match client
+            .call(&approve_digest(approver, state.id, state.digest))
+            .unwrap()
+        {
+            Reply::PendingRequest(_) => {}
+            refused => return refused,
+        }
+    }
+    client.call(&by(requester, operation)).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -1019,8 +1076,8 @@ struct Options {
     max_connections: usize,
     queue_capacity: usize,
     hook: bool,
-    /// The pending key-operation request lifetime (task A10).
-    key_request_lifetime: Duration,
+    /// The pending requests' lifetime (task D2-c).
+    request_lifetime: Duration,
     /// dird's decision-acknowledgement wait (A-95 follow-up, Q-441).
     ack_deadline: DecisionAckDeadline,
     /// dird's keyd client registers no decision (task A15a, A-102: the
@@ -1050,7 +1107,7 @@ impl Default for Options {
             max_connections: directory_daemon::MAX_ADMIN_CONNECTIONS,
             queue_capacity: directory_daemon::ADMIN_QUEUE_CAPACITY,
             hook: false,
-            key_request_lifetime: directory_admin::KEY_REQUEST_LIFETIME,
+            request_lifetime: directory_admin::REQUEST_LIFETIME,
             ack_deadline: generous(),
             refuse_decisions: false,
             reconcile_interval: directory_daemon::DESTROY_RECONCILE_INTERVAL,
@@ -1189,7 +1246,8 @@ fn start_dird(
         max_connections: options.max_connections,
         queue_capacity: options.queue_capacity,
         ack_deadline: options.ack_deadline,
-        key_request_lifetime: options.key_request_lifetime,
+        request_lifetime: options.request_lifetime,
+        requests_per_requester: directory_admin::REQUESTS_PER_REQUESTER,
         destroy_reconcile_interval: options.reconcile_interval,
         policy_next: options
             .policy_next
@@ -1459,7 +1517,6 @@ fn every_operation_end_to_end() {
         client
             .call(&by(
                 "admin1",
-                &[],
                 Operation::CreateUser {
                     parent: g(STAFF_OU),
                     sam: "carol".into(),
@@ -1494,7 +1551,6 @@ fn every_operation_end_to_end() {
         client
             .call(&by(
                 "admin1",
-                &[],
                 Operation::CreateComputer {
                     parent: g(STAFF_OU),
                     name: "ws9".into(),
@@ -1514,7 +1570,6 @@ fn every_operation_end_to_end() {
         client
             .call(&by(
                 "admin1",
-                &[],
                 Operation::CreateGroup {
                     parent: g(STAFF_OU),
                     sam: "team".into(),
@@ -1530,7 +1585,6 @@ fn every_operation_end_to_end() {
         client
             .call(&by(
                 "admin1",
-                &[],
                 Operation::CreateOu {
                     parent: g(ROOT),
                     name: "Branch".into(),
@@ -1543,7 +1597,6 @@ fn every_operation_end_to_end() {
         client
             .call(&by(
                 "admin1",
-                &[],
                 Operation::CreateContainer {
                     parent: branch,
                     name: "Things".into(),
@@ -1557,11 +1610,7 @@ fn every_operation_end_to_end() {
     // BeginPasswordSet: a user has one key target, a computer with its SPN
     // two; the salt is the account's ([MS-KILE] 3.1.1.2 via account_salt).
     match client
-        .call(&by(
-            "admin1",
-            &[],
-            Operation::BeginPasswordSet { target: carol },
-        ))
+        .call(&by("admin1", Operation::BeginPasswordSet { target: carol }))
         .unwrap()
     {
         Reply::PasswordSet(set) => {
@@ -1580,11 +1629,7 @@ fn every_operation_end_to_end() {
         other => panic!("{other:?}"),
     }
     match client
-        .call(&by(
-            "admin1",
-            &[],
-            Operation::BeginPasswordSet { target: ws9 },
-        ))
+        .call(&by("admin1", Operation::BeginPasswordSet { target: ws9 }))
         .unwrap()
     {
         Reply::PasswordSet(set) => {
@@ -1600,7 +1645,6 @@ fn every_operation_end_to_end() {
         client
             .call(&by(
                 "admin1",
-                &[],
                 Operation::CompletePasswordSet {
                     target: carol,
                     outcome: PasswordSetOutcome::Completed,
@@ -1618,7 +1662,6 @@ fn every_operation_end_to_end() {
         client
             .call(&by(
                 "admin1",
-                &[],
                 Operation::SetEnabled {
                     target: carol,
                     enabled: true,
@@ -1631,7 +1674,6 @@ fn every_operation_end_to_end() {
         client
             .call(&by(
                 "admin1",
-                &[],
                 Operation::SetAccountExpires {
                     target: carol,
                     value: AccountExpires::At(134_500_000_000_000_000),
@@ -1652,10 +1694,7 @@ fn every_operation_end_to_end() {
             member: carol,
         },
     ] {
-        assert_eq!(
-            client.call(&by("admin1", &[], operation)).unwrap(),
-            Reply::Done
-        );
+        assert_eq!(client.call(&by("admin1", operation)).unwrap(), Reply::Done);
     }
 
     // Lookup by sAMAccountName, SPN and DN; an absent name is NotFound.
@@ -1672,7 +1711,6 @@ fn every_operation_end_to_end() {
         client
             .call(&by(
                 "admin1",
-                &[],
                 Operation::Lookup(LookupKey::SamAccountName("carol".into())),
             ))
             .unwrap(),
@@ -1681,7 +1719,6 @@ fn every_operation_end_to_end() {
         client
             .call(&by(
                 "admin1",
-                &[],
                 Operation::Lookup(LookupKey::Dn(vec![
                     "cn=carol".into(),
                     "ou=Staff".into(),
@@ -1694,7 +1731,6 @@ fn every_operation_end_to_end() {
     match client
         .call(&by(
             "admin1",
-            &[],
             Operation::Lookup(LookupKey::ServicePrincipalName(
                 "host/ws9.example.org".into(),
             )),
@@ -1711,7 +1747,6 @@ fn every_operation_end_to_end() {
         client
             .call(&by(
                 "admin1",
-                &[],
                 Operation::Lookup(LookupKey::SamAccountName("nobody".into())),
             ))
             .unwrap(),
@@ -1721,7 +1756,7 @@ fn every_operation_end_to_end() {
     // Delete.
     assert_eq!(
         client
-            .call(&by("admin1", &[], Operation::Delete { target: things }))
+            .call(&by("admin1", Operation::Delete { target: things }))
             .unwrap(),
         Reply::Done
     );
@@ -1808,7 +1843,6 @@ fn no_acknowledgement_means_nothing_is_committed() {
     let reply = client
         .call(&by(
             "admin1",
-            &[],
             Operation::CreateUser {
                 parent: g(STAFF_OU),
                 sam: "withheld".into(),
@@ -1862,19 +1896,19 @@ fn an_obligation_dird_cannot_honour_is_refused_with_its_own_code() {
     for i in 0..directory_daemon::rate::OBLIGATION_LIMIT {
         assert!(
             matches!(
-                client.call(&by("admin1", &[], lookup())).unwrap(),
+                client.call(&by("admin1", lookup())).unwrap(),
                 Reply::Found(_)
             ),
             "lookup {i}"
         );
     }
     assert_eq!(
-        client.call(&by("admin1", &[], lookup())).unwrap(),
+        client.call(&by("admin1", lookup())).unwrap(),
         Reply::Refused(RefusalStatus::Denied)
     );
     // Another requester is another rate-limit key.
     assert!(matches!(
-        client.call(&by("admin2", &[], lookup())).unwrap(),
+        client.call(&by("admin2", lookup())).unwrap(),
         Reply::Found(_)
     ));
     let count = usize::try_from(directory_daemon::rate::OBLIGATION_LIMIT).unwrap() + 2;
@@ -1918,10 +1952,7 @@ fn bad_or_expired_tickets_and_keyd_down() {
         name: "Refused".into(),
     };
     let create = |requester: Vec<u8>| Request::Operation {
-        auth: Auth {
-            requester,
-            approvals: Vec::new(),
-        },
+        auth: Auth::of(requester),
         operation: refused_ou.clone(),
     };
     let seq_before = change_seq_next(&world.store);
@@ -1960,10 +1991,7 @@ fn bad_or_expired_tickets_and_keyd_down() {
     assert_eq!(
         client
             .call(&Request::Operation {
-                auth: Auth {
-                    requester: once,
-                    approvals: Vec::new(),
-                },
+                auth: Auth::of(once),
                 operation: Operation::CreateOu {
                     parent: g(ROOT),
                     name: "Replayed".into(),
@@ -1978,7 +2006,6 @@ fn bad_or_expired_tickets_and_keyd_down() {
         client
             .call(&by(
                 "admin1",
-                &[],
                 Operation::CreateOu {
                     parent: g(ROOT),
                     name: "KeydDown".into(),
@@ -2010,10 +2037,13 @@ fn bad_or_expired_tickets_and_keyd_down() {
     );
 }
 
-/// docs/51 §5.6 (R51-11); P-22; Q-357: a change to the Tier-0 group's
-/// membership needs an approver — without one ⇒ `ApprovalRequired`; a
-/// second Tier-0 administrator's AP-REQ satisfies it; the same principal
-/// twice (two distinct, valid AP-REQs of admin1) ⇒ `Denied`.
+/// docs/51 §5.6 (R51-11); P-22; Q-357; docs/questions/Q-882 (A-148: one
+/// mechanism): a change to the Tier-0 group's membership needs an approver
+/// — without an approved request ⇒ `ApprovalRequired`; the requester's own
+/// approval ⇒ `Denied` (`ApproverNotDistinct`); a second Tier-0
+/// administrator's approval of the pending request lets the requester's
+/// execution through, and the execution's decision names the approver and
+/// the request it consumed.
 #[test]
 fn dual_control() {
     let Some(world) = World::new(Options::default()) else {
@@ -2025,32 +2055,288 @@ fn dual_control() {
         member: g(BOB),
     };
     assert_eq!(
-        client.call(&by("admin1", &[], add())).unwrap(),
+        client.call(&by("admin1", add())).unwrap(),
         Reply::Refused(RefusalStatus::ApprovalRequired)
     );
+    let state = pending(client.call(&propose_op("admin1", add(), None)).unwrap());
     assert_eq!(
-        client.call(&by("admin1", &["admin1"], add())).unwrap(),
+        client
+            .call(&approve_digest("admin1", state.id, state.digest))
+            .unwrap(),
         Reply::Refused(RefusalStatus::Denied)
     );
     let seq = change_seq_next(&world.store);
-    assert_eq!(
-        client.call(&by("admin1", &["admin2"], add())).unwrap(),
-        Reply::Done
+    let approval = pending(
+        client
+            .call(&approve_digest("admin2", state.id, state.digest))
+            .unwrap(),
     );
-    assert_eq!(change_seq_next(&world.store), seq + 1);
-    let events = await_events(&world, DirAdminOperation::AddMember, 4);
+    assert_eq!(approval.state, RequestState::Approved);
     assert_eq!(
-        events[1].stage,
+        change_seq_next(&world.store),
+        seq,
+        "approving writes nothing"
+    );
+    assert_eq!(client.call(&by("admin1", add())).unwrap(), Reply::Done);
+    assert_eq!(change_seq_next(&world.store), seq + 1);
+    let approvals = await_events(&world, DirAdminOperation::Approve, 2);
+    assert_eq!(
+        approvals[0].stage,
         DirAdminStage::Decision(DecisionResult::Refused(
             ipc_audit::AdminRefusal::ApproverNotDistinct
         ))
     );
-    let approved = &events[2];
+    assert_eq!(approvals[1].stage, PROCEED);
+    let events = await_events(&world, DirAdminOperation::AddMember, 3);
     assert_eq!(
-        approved.stage,
-        DirAdminStage::Decision(DecisionResult::Proceed)
+        events[0].stage,
+        DirAdminStage::Decision(DecisionResult::Refused(
+            ipc_audit::AdminRefusal::ApprovalRequired
+        ))
     );
-    assert_eq!(approved.approvers.len(), 1);
+    let executed = &events[1];
+    assert_eq!(executed.stage, PROCEED);
+    assert_eq!(executed.approvers.as_slice(), &[sid_value(&sid_of(ADMIN2))]);
+    assert_eq!(executed.pending_request, Some(state.id));
+    assert_eq!(executed.operation_digest, fingerprint(&add()));
+}
+
+/// Task D2-c (docs/questions/Q-882 items 1-4, Q-888; r5-a MA5): the request
+/// queue over the existing socket, end to end — admin1 proposes a Tier-0
+/// membership change with a change id; admin2 lists it as awaiting it and
+/// is shown it (the operation from dird's own copy, dird's facts, the
+/// requester dird verified, the change id); admin2 approves it by id and
+/// digest; admin1's execution is applied. A second request is withdrawn
+/// (then unknown), a third rejected (then unknown). Every event of the flow
+/// carries the operation's fingerprint — the digest the client computes —
+/// so the whole flow is found in the audit trail by it.
+#[test]
+fn the_request_queue_end_to_end() {
+    let Some(world) = World::new(Options::default()) else {
+        return;
+    };
+    let mut client = world.client();
+    let add = || Operation::AddMember {
+        group: g(TIER0_GROUP),
+        member: g(BOB),
+    };
+    let digest = fingerprint(&add());
+    let state = pending(
+        client
+            .call(&propose_op("admin1", add(), Some("CHG-1182")))
+            .unwrap(),
+    );
+    assert_eq!(state.digest, digest);
+    assert_eq!(state.state, RequestState::Pending);
+    assert_eq!((state.approvals, state.quorum), (0, 2));
+    let listed = match client
+        .call(&by(
+            "admin2",
+            Operation::ListRequests(ListScope::AwaitingMe),
+        ))
+        .unwrap()
+    {
+        Reply::RequestList(entries) => entries,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, state.id);
+    assert_eq!(listed[0].requester, sid_of(ADMIN1));
+    assert_eq!(
+        listed[0].operation,
+        ipc_dird_admin::channel::request_kind::ADD_MEMBER
+    );
+    let shown = match client
+        .call(&by("admin2", Operation::ShowRequest { id: state.id }))
+        .unwrap()
+    {
+        Reply::RequestShown(shown) => shown,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(shown.operation, add());
+    assert_eq!(shown.digest, digest);
+    assert_eq!(shown.requester, sid_of(ADMIN1));
+    assert_eq!(shown.reason_ref.as_deref(), Some("CHG-1182"));
+    assert_eq!(shown.facts.len(), 2);
+    assert_eq!(shown.facts[0].guid, g(TIER0_GROUP));
+    assert_eq!(shown.facts[0].tier, ipc_dird_admin::FactTier::Tier0);
+    assert_eq!(shown.facts[1].guid, g(BOB));
+    // bob may not see it: told as for an unknown id.
+    assert_eq!(
+        client
+            .call(&by("bob", Operation::ShowRequest { id: state.id }))
+            .unwrap(),
+        Reply::Refused(RefusalStatus::NotFound)
+    );
+    pending(
+        client
+            .call(&approve_digest("admin2", state.id, state.digest))
+            .unwrap(),
+    );
+    assert_eq!(client.call(&by("admin1", add())).unwrap(), Reply::Done);
+
+    // Withdrawn, then rejected: gone.
+    let other = Operation::AddMember {
+        group: g(TIER0_GROUP),
+        member: g(STAFF_GROUP),
+    };
+    let second = pending(
+        client
+            .call(&propose_op("admin1", other.clone(), None))
+            .unwrap(),
+    );
+    assert_eq!(
+        client
+            .call(&by("admin1", Operation::Withdraw { id: second.id }))
+            .unwrap(),
+        Reply::Done
+    );
+    assert_eq!(
+        client
+            .call(&approve_digest("admin2", second.id, second.digest))
+            .unwrap(),
+        Reply::Refused(RefusalStatus::NotFound)
+    );
+    let third = pending(client.call(&propose_op("admin1", other, None)).unwrap());
+    assert_eq!(
+        client
+            .call(&by(
+                "admin2",
+                Operation::Reject {
+                    id: third.id,
+                    digest: third.digest,
+                }
+            ))
+            .unwrap(),
+        Reply::Done
+    );
+    assert_eq!(
+        client
+            .call(&approve_digest("admin2", third.id, third.digest))
+            .unwrap(),
+        Reply::Refused(RefusalStatus::NotFound)
+    );
+
+    // The audit trail, by the fingerprint the administrators saw.
+    let proposed = await_events(&world, DirAdminOperation::Propose, 3);
+    assert_eq!(proposed[0].operation_digest, digest);
+    assert_eq!(proposed[0].proposed, Some(DirAdminOperation::AddMember));
+    assert_eq!(
+        proposed[0].reason_ref.as_ref().and_then(|r| r.as_text()),
+        Some("CHG-1182")
+    );
+    assert_eq!(proposed[0].pending_request, Some(state.id));
+    let shown = await_events(&world, DirAdminOperation::ShowRequest, 2);
+    assert!(shown.iter().all(|e| e.operation_digest == digest));
+    let executed = await_events(&world, DirAdminOperation::AddMember, 2);
+    assert_eq!(executed[0].operation_digest, digest);
+    assert_eq!(executed[1].operation_digest, digest);
+    assert_eq!(executed[0].pending_request, Some(state.id));
+    assert!(is_committed(&executed[1]));
+    let withdrawn = await_events(&world, DirAdminOperation::Withdraw, 1);
+    assert_eq!(withdrawn[0].pending_request, Some(second.id));
+    let rejected = await_events(&world, DirAdminOperation::Reject, 1);
+    assert_eq!(rejected[0].pending_request, Some(third.id));
+}
+
+/// Class C43 (docs/questions/Q-882 item 2) over the socket: the target of
+/// an approved request changes before its execution (bob is disabled — a
+/// write that needs no approver) — the execution is refused `Conflict`
+/// (recorded `RequestStale`), nothing is written, the request is gone.
+#[test]
+fn a_target_changed_after_the_approval_is_refused() {
+    let Some(world) = World::new(Options::default()) else {
+        return;
+    };
+    let mut client = world.client();
+    let add = || Operation::AddMember {
+        group: g(TIER0_GROUP),
+        member: g(BOB),
+    };
+    let state = pending(client.call(&propose_op("admin1", add(), None)).unwrap());
+    pending(
+        client
+            .call(&approve_digest("admin2", state.id, state.digest))
+            .unwrap(),
+    );
+    assert_eq!(
+        client
+            .call(&by(
+                "admin1",
+                Operation::SetEnabled {
+                    target: g(BOB),
+                    enabled: false,
+                }
+            ))
+            .unwrap(),
+        Reply::Done
+    );
+    let seq = change_seq_next(&world.store);
+    assert_eq!(
+        client.call(&by("admin1", add())).unwrap(),
+        Reply::Refused(RefusalStatus::Conflict)
+    );
+    assert_eq!(change_seq_next(&world.store), seq);
+    assert_eq!(
+        client.call(&by("admin1", add())).unwrap(),
+        Reply::Refused(RefusalStatus::ApprovalRequired)
+    );
+    let events = await_events(&world, DirAdminOperation::AddMember, 2);
+    assert_eq!(
+        events[0].stage,
+        refused(ipc_audit::AdminRefusal::RequestStale)
+    );
+    assert_eq!(events[0].pending_request, Some(state.id));
+}
+
+/// Docs/questions/Q-882 item 6 (A-148: the in-request approvals are
+/// removed from the wire): a frame in the old form — an approver's AP-REQ
+/// inside `auth` (count 1) — is malformed: dird answers the shared
+/// `Refused { Malformed }` and closes, records nothing, writes nothing, and
+/// serves on.
+#[test]
+fn the_old_in_request_approvals_form_is_refused() {
+    let Some(world) = World::new(Options::default()) else {
+        return;
+    };
+    let add = Operation::AddMember {
+        group: g(TIER0_GROUP),
+        member: g(BOB),
+    };
+    let good = ipc::encode_frame(
+        ipc_dird_admin::ADMIN_CHANNEL,
+        ipc::Direction::Request,
+        &by("admin1", add.clone()).to_wire().unwrap(),
+    )
+    .unwrap();
+    let body = good.body().to_vec();
+    // magic ‖ version ‖ kind, then requester: bytes, then the count.
+    let requester_len = u32::from_be_bytes(body[4..8].try_into().unwrap()) as usize;
+    let count_at = 8 + requester_len;
+    assert_eq!(&body[count_at..count_at + 4], &0u32.to_be_bytes());
+    let approval = fresh("admin2", &add);
+    let mut old = body[..count_at].to_vec();
+    old.extend(1u32.to_be_bytes());
+    old.extend((approval.len() as u32).to_be_bytes());
+    old.extend(&approval);
+    old.extend(&body[count_at + 4..]);
+    let seq = change_seq_next(&world.store);
+    let mut stream = UnixStream::connect(&world.admin_socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream.write_all(&(old.len() as u32).to_be_bytes()).unwrap();
+    stream.write_all(&old).unwrap();
+    let reply = read_frame(&mut stream, ipc_dird_admin::REPLY_LIMIT).unwrap();
+    assert_eq!(reply[3], ipc::REFUSED_KIND);
+    assert_eq!(
+        ipc::decode_reply::<ipc_dird_admin::AdminReply>(ipc_dird_admin::ADMIN_CHANNEL, &reply)
+            .unwrap(),
+        ipc::Reply::Refused(Refused::Malformed)
+    );
+    assert_eq!(change_seq_next(&world.store), seq);
+    assert!(events_of(&world, DirAdminOperation::AddMember).is_empty());
+    world.client().ping().unwrap();
 }
 
 /// R2 — the Q-292 attack (docs/52 §3.2, class C2; §5): admind forwards
@@ -2077,10 +2363,7 @@ fn an_ap_req_attached_to_another_operation_is_denied() {
     };
     let ap_req = fresh("admin1", &meant);
     let attach = |requester: Vec<u8>, operation: &Operation| Request::Operation {
-        auth: Auth {
-            requester,
-            approvals: Vec::new(),
-        },
+        auth: Auth::of(requester),
         operation: operation.clone(),
     };
     let seq = change_seq_next(&world.store);
@@ -2132,10 +2415,10 @@ fn an_ap_req_attached_to_another_operation_is_denied() {
 }
 
 /// R2 (docs/52 §5 items 1, 4): an approver's AP-REQ authorizes exactly the
-/// request it was made for. admin2's valid AP-REQ made for another
-/// operation does not approve this Tier-0 membership change (`Denied`,
-/// recorded `ApproverUnauthenticated`), nor does one made for the same
-/// change of another member; bound to this request it does.
+/// `Approve` it was made for. admin2's valid AP-REQ made for another
+/// operation — another `Approve` of the same request, or the membership
+/// change itself — does not approve the pending request (`Denied`, recorded
+/// `ApproverUnauthenticated`); made for this `Approve` it does.
 #[test]
 fn an_approval_bound_to_another_operation_is_refused() {
     let Some(world) = World::new(Options::default()) else {
@@ -2146,33 +2429,35 @@ fn an_approval_bound_to_another_operation_is_refused() {
         group: g(TIER0_GROUP),
         member: g(member),
     };
-    let seq = change_seq_next(&world.store);
+    let state = pending(client.call(&propose_op("admin1", add(BOB), None)).unwrap());
+    let approve = Operation::Approve {
+        id: state.id,
+        digest: state.digest,
+    };
     for elsewhere in [
-        Operation::CreateOu {
-            parent: g(ROOT),
-            name: "Elsewhere".into(),
+        Operation::Approve {
+            id: state.id ^ 1,
+            digest: state.digest,
         },
-        add(STAFF_GROUP),
+        add(BOB),
     ] {
         let request = Request::Operation {
-            auth: Auth {
-                requester: fresh("admin1", &add(BOB)),
-                approvals: vec![fresh("admin2", &elsewhere)],
-            },
-            operation: add(BOB),
+            auth: Auth::of(fresh("admin2", &elsewhere)),
+            operation: approve.clone(),
         };
         assert_eq!(
             client.call(&request).unwrap(),
             Reply::Refused(RefusalStatus::Denied)
         );
     }
-    assert_eq!(change_seq_next(&world.store), seq);
     assert_eq!(
-        client.call(&by("admin1", &["admin2"], add(BOB))).unwrap(),
-        Reply::Done
+        client.call(&by("admin1", add(BOB))).unwrap(),
+        Reply::Refused(RefusalStatus::ApprovalRequired)
     );
-    let events = await_events(&world, DirAdminOperation::AddMember, 3);
-    for event in &events[..2] {
+    pending(client.call(&by("admin2", approve)).unwrap());
+    assert_eq!(client.call(&by("admin1", add(BOB))).unwrap(), Reply::Done);
+    let approvals = await_events(&world, DirAdminOperation::Approve, 3);
+    for event in &approvals[..2] {
         assert_eq!(
             event.stage,
             DirAdminStage::Decision(DecisionResult::Refused(
@@ -2180,6 +2465,7 @@ fn an_approval_bound_to_another_operation_is_refused() {
             ))
         );
     }
+    assert_eq!(approvals[2].stage, PROCEED);
 }
 
 /// docs/51 §7.1 ("the only peer = `admind_uid`; another uid ⇒ close +
@@ -2247,7 +2533,6 @@ fn a_full_queue_answers_busy() {
         let mut client = world.client();
         let request = by(
             "admin1",
-            &[],
             Operation::CreateOu {
                 parent: g(ROOT),
                 name: name.into(),
@@ -2263,7 +2548,6 @@ fn a_full_queue_answers_busy() {
     assert_eq!(
         third.call(&by(
             "admin1",
-            &[],
             Operation::CreateOu {
                 parent: g(ROOT),
                 name: "Third".into(),
@@ -2312,21 +2596,23 @@ fn without_the_admin_service_object_dird_serves_on() {
 // Task A10: dual-controlled key operations (docs/51 §5.6, §6).
 // ---------------------------------------------------------------------------
 
-use ipc_dird_admin::{KeyOperation, KeyRef, KeyRequestState};
+use ipc_dird_admin::{KeyOperation, KeyRef, ListScope, RequestState};
 
-fn key_state(reply: Reply) -> KeyRequestState {
-    match reply {
-        Reply::KeyRequest(state) => state,
-        other => panic!("expected KeyRequest, got {other:?}"),
-    }
+/// The fingerprint of a proposed key operation (Q-888).
+fn key_digest(operation: KeyOperation) -> [u8; 32] {
+    fingerprint(&Operation::KeyOperation(operation))
 }
 
+/// `Propose` of a key operation by `requester` (task D2-c: the key-only
+/// `RequestKeyOperation` is retired).
 fn request_op(requester: &str, operation: KeyOperation) -> Request {
-    by(requester, &[], Operation::RequestKeyOperation { operation })
+    propose_op(requester, Operation::KeyOperation(operation), None)
 }
 
+/// `Approve` by `approver` of the request `id`, naming the digest of
+/// `operation` (the one it was shown).
 fn approve_op(approver: &str, id: u64, operation: KeyOperation) -> Request {
-    by(approver, &[], Operation::Approve { id, operation })
+    approve_digest(approver, id, key_digest(operation))
 }
 
 fn decision(event: &DirAdminEvent) -> DirAdminStage {
@@ -2344,9 +2630,10 @@ fn sid_value(sid: &Sid) -> ipc_audit::SidValue {
 }
 
 /// docs/51 §5.6, §6 (R51-11, R51-14); P-22; A-85; docs/52 §4.2, §4.3, §4.5
-/// (A-102): `rotate_krbtgt` from request to execution — admin1 requests
-/// (PolicyAdmin on `keys`), an approval naming another operation is refused
-/// (the digest binds), admin2's approval completes the quorum and **dird
+/// (A-102); docs/questions/Q-882 (one mechanism): `rotate_krbtgt` from
+/// proposal to execution — admin1 proposes (PolicyAdmin on `keys`), an
+/// approval naming another operation's digest is refused (the digest
+/// binds), admin2's approval completes the quorum and **dird
 /// registers the decision in keyd** (Role::Ldap, its decision event
 /// acknowledged first, then an `Outcome` event of the registration); keyadm
 /// (Role::Admin on the same keyd) executes it by the request's id — kvno 2
@@ -2359,12 +2646,12 @@ fn rotate_krbtgt_request_approve_registers_the_decision() {
     };
     let mut client = world.client();
     let seq = change_seq_next(&world.store);
-    let state = key_state(
+    let state = pending(
         client
             .call(&request_op("admin1", KeyOperation::RotateKrbtgt))
             .unwrap(),
     );
-    assert_eq!(state.operation, KeyOperation::RotateKrbtgt);
+    assert_eq!(state.digest, key_digest(KeyOperation::RotateKrbtgt));
     assert_eq!((state.approvals, state.quorum), (0, 2));
     let id = state.id;
     // Not approved yet: keyd holds no decision.
@@ -2387,14 +2674,14 @@ fn rotate_krbtgt_request_approve_registers_the_decision() {
         Reply::Refused(RefusalStatus::Invalid)
     );
     // The approval: the digest and the operation are shown back.
-    let approved = key_state(
+    let approved = pending(
         client
             .call(&approve_op("admin2", id, KeyOperation::RotateKrbtgt))
             .unwrap(),
     );
     assert_eq!(approved.id, id);
     assert_eq!(approved.digest, state.digest);
-    assert!(approved.approved());
+    assert_eq!(approved.state, RequestState::Approved);
     // A further approval after the quorum ⇒ refused.
     assert_eq!(
         client
@@ -2416,9 +2703,9 @@ fn rotate_krbtgt_request_approve_registers_the_decision() {
 
     // dird's trail: the completing approval's decision, then the
     // registration's outcome.
-    let requested = await_events(&world, DirAdminOperation::RequestKeyOperation, 1);
+    let requested = await_events(&world, DirAdminOperation::Propose, 1);
     assert_eq!(decision(&requested[0]), PROCEED);
-    assert_eq!(requested[0].key_request, Some(id));
+    assert_eq!(requested[0].pending_request, Some(id));
     assert_eq!(requested[0].target, Some(g(KRBTGT).to_packet()));
     let approvals = await_events(&world, DirAdminOperation::Approve, 4);
     assert_eq!(
@@ -2436,7 +2723,7 @@ fn rotate_krbtgt_request_approve_registers_the_decision() {
         DirAdminStage::Outcome(OutcomeResult::Committed { allocated: None })
     );
     assert_eq!(approvals[1].operation_id, approvals[2].operation_id);
-    assert_eq!(approvals[2].key_request, Some(id));
+    assert_eq!(approvals[2].pending_request, Some(id));
     assert_eq!(
         decision(&approvals[3]),
         refused(ipc_audit::AdminRefusal::ApproverNotDistinct)
@@ -2490,8 +2777,8 @@ fn rotate_key_and_retire_kvno_decisions_are_executed_by_id() {
     let rotate = KeyOperation::RotateKey {
         service: g(LDAP_SVC),
     };
-    let state = key_state(client.call(&request_op("admin1", rotate)).unwrap());
-    key_state(
+    let state = pending(client.call(&request_op("admin1", rotate)).unwrap());
+    pending(
         client
             .call(&approve_op("admin2", state.id, rotate))
             .unwrap(),
@@ -2517,8 +2804,8 @@ fn rotate_key_and_retire_kvno_decisions_are_executed_by_id() {
         key: KeyRef::Service(g(LDAP_SVC)),
         kvno: 1,
     };
-    let state = key_state(client.call(&request_op("admin1", retire)).unwrap());
-    key_state(
+    let state = pending(client.call(&request_op("admin1", retire)).unwrap());
+    pending(
         client
             .call(&approve_op("admin2", state.id, retire))
             .unwrap(),
@@ -2561,13 +2848,13 @@ fn the_admin_service_key_is_rotated_and_retired_through_the_admin_plane() {
     };
     let mut ids = Vec::new();
     for operation in [rotate, retire] {
-        let state = key_state(client.call(&request_op("admin1", operation)).unwrap());
-        let approved = key_state(
+        let state = pending(client.call(&request_op("admin1", operation)).unwrap());
+        let approved = pending(
             client
                 .call(&approve_op("admin2", state.id, operation))
                 .unwrap(),
         );
-        assert!(approved.approved());
+        assert_eq!(approved.state, RequestState::Approved);
         ids.push(DecisionId::new(state.id));
     }
     assert_eq!(keyadm.rotate_key(ids[0]), Ok(Ok(Kvno::new(2))));
@@ -2619,7 +2906,7 @@ fn a_decision_keyd_does_not_register_withdraws_the_approval() {
         return;
     };
     let mut client = world.client();
-    let state = key_state(
+    let state = pending(
         client
             .call(&request_op("admin1", KeyOperation::RotateKrbtgt))
             .unwrap(),
@@ -2649,16 +2936,17 @@ fn a_decision_keyd_does_not_register_withdraws_the_approval() {
 
 /// docs/51 §5.6 (distinct, `decide` = Allow for the same Action and
 /// Resource); P-22: the requester cannot approve its own request; a usable
-/// account the PDP does not allow `PolicyAdmin` (bob, not Tier-0) is
-/// refused — as an approver and as a requester; an unverifiable approver
-/// AP-REQ is refused; nothing was approved, so nothing can be fetched.
+/// account the PDP does not allow `PolicyAdmin` (bob, not Tier-0) cannot
+/// see the request (its approval is answered as for an unknown id — the
+/// rule of A-55; task D2-c) nor propose one; an unverifiable approver
+/// AP-REQ is refused; nothing was approved, so keyd holds no decision.
 #[test]
 fn approvals_must_be_distinct_and_allowed() {
     let Some(world) = World::new(Options::default()) else {
         return;
     };
     let mut client = world.client();
-    let state = key_state(
+    let state = pending(
         client
             .call(&request_op("admin1", KeyOperation::RotateKrbtgt))
             .unwrap(),
@@ -2673,7 +2961,7 @@ fn approvals_must_be_distinct_and_allowed() {
         client
             .call(&approve_op("bob", state.id, KeyOperation::RotateKrbtgt))
             .unwrap(),
-        Reply::Refused(RefusalStatus::Denied)
+        Reply::Refused(RefusalStatus::NotFound)
     );
     assert_eq!(
         client
@@ -2682,40 +2970,22 @@ fn approvals_must_be_distinct_and_allowed() {
         Reply::Refused(RefusalStatus::Denied)
     );
     // An approver's AP-REQ that does not verify (expired ticket).
+    let approve = Operation::Approve {
+        id: state.id,
+        digest: state.digest,
+    };
     let expired = Request::Operation {
-        auth: Auth {
-            requester: ap_req(
-                "admin2",
-                999_001,
-                common::kt("20261113090000Z"),
-                &Operation::Approve {
-                    id: state.id,
-                    operation: KeyOperation::RotateKrbtgt,
-                },
-            ),
-            approvals: Vec::new(),
-        },
-        operation: Operation::Approve {
-            id: state.id,
-            operation: KeyOperation::RotateKrbtgt,
-        },
+        auth: Auth::of(ap_req(
+            "admin2",
+            999_001,
+            common::kt("20261113090000Z"),
+            &approve,
+        )),
+        operation: approve,
     };
     assert_eq!(
         client.call(&expired).unwrap(),
         Reply::Refused(RefusalStatus::Denied)
-    );
-    // One step, one AP-REQ: approvals inside a request are refused.
-    assert_eq!(
-        client
-            .call(&by(
-                "admin1",
-                &["admin2"],
-                Operation::RequestKeyOperation {
-                    operation: KeyOperation::RotateKrbtgt
-                }
-            ))
-            .unwrap(),
-        Reply::Refused(RefusalStatus::Invalid)
     );
     // Nothing was approved: keyd holds no decision (A-102).
     assert_eq!(
@@ -2727,11 +2997,11 @@ fn approvals_must_be_distinct_and_allowed() {
         approvals.iter().map(decision).collect::<Vec<_>>(),
         vec![
             refused(ipc_audit::AdminRefusal::ApproverNotDistinct),
-            refused(ipc_audit::AdminRefusal::ApproverDenied),
+            refused(ipc_audit::AdminRefusal::NotVisible),
             refused(ipc_audit::AdminRefusal::ApproverUnauthenticated),
         ]
     );
-    // The PDP reason of the denied approver is recorded.
+    // The PDP reason of the account that may not approve is recorded.
     assert!(matches!(
         approvals[1].pdp,
         Some(ipc_audit::PdpReason {
@@ -2739,32 +3009,30 @@ fn approvals_must_be_distinct_and_allowed() {
             ..
         })
     ));
-    let requested = await_events(&world, DirAdminOperation::RequestKeyOperation, 3);
+    let requested = await_events(&world, DirAdminOperation::Propose, 2);
     assert_eq!(
         decision(&requested[1]),
         refused(ipc_audit::AdminRefusal::PolicyDenied)
     );
-    assert_eq!(
-        decision(&requested[2]),
-        refused(ipc_audit::AdminRefusal::ValueInvalid)
-    );
 }
 
-/// docs/51 §5.6 ("bounded in number and in time"): a request expires after
-/// its lifetime (dird's clock moved past it) — its approval is refused as
-/// unknown; the table holds at most `MAX_PENDING_KEY_REQUESTS` requests,
-/// one more is refused (`PendingLimit`, answered `Unavailable`) until one
-/// expires.
+/// docs/51 §5.6 ("bounded in number and in time"); Q-882, Q-939, Q-940 (task
+/// D2-c): a request expires after its lifetime (dird's clock moved past it)
+/// — its approval is refused as unknown; one requester holds at most
+/// `REQUESTS_PER_REQUESTER` open requests — one more is refused
+/// (`RequesterLimit`, answered `Unavailable`) — and one per operation (the
+/// same one again: `Conflict`); once they expire, a request is accepted
+/// again.
 #[test]
 fn pending_requests_are_bounded_in_time_and_number() {
     let Some(world) = World::new(Options {
-        key_request_lifetime: Duration::from_secs(60),
+        request_lifetime: Duration::from_secs(60),
         ..Options::default()
     }) else {
         return;
     };
     let mut client = world.client();
-    let state = key_state(
+    let state = pending(
         client
             .call(&request_op("admin1", KeyOperation::RotateKrbtgt))
             .unwrap(),
@@ -2776,39 +3044,58 @@ fn pending_requests_are_bounded_in_time_and_number() {
             .unwrap(),
         Reply::Refused(RefusalStatus::NotFound)
     );
-    // Fill the table (the expired request was dropped).
-    for _ in 0..directory_admin::MAX_PENDING_KEY_REQUESTS {
-        key_state(
-            client
-                .call(&request_op("admin1", KeyOperation::RotateKrbtgt))
-                .unwrap(),
-        );
+    // The requester's cap (the expired request was dropped).
+    let operations = [
+        KeyOperation::RotateKrbtgt,
+        KeyOperation::RotateKey {
+            service: g(LDAP_SVC),
+        },
+        KeyOperation::RotateKey {
+            service: g(ADMIND_SVC),
+        },
+        KeyOperation::RetireKvno {
+            key: KeyRef::Krbtgt,
+            kvno: 1,
+        },
+        KeyOperation::RetireKvno {
+            key: KeyRef::Krbtgt,
+            kvno: 2,
+        },
+    ];
+    let cap = directory_admin::REQUESTS_PER_REQUESTER;
+    assert_eq!(cap, 4);
+    for operation in &operations[..cap] {
+        pending(client.call(&request_op("admin1", *operation)).unwrap());
     }
     assert_eq!(
-        client
-            .call(&request_op("admin1", KeyOperation::RotateKrbtgt))
-            .unwrap(),
+        client.call(&request_op("admin1", operations[cap])).unwrap(),
         Reply::Refused(RefusalStatus::Unavailable)
+    );
+    // Another requester: the same operation again is its own request; the
+    // same requester and operation twice is a conflict.
+    pending(client.call(&request_op("admin2", operations[0])).unwrap());
+    assert_eq!(
+        client.call(&request_op("admin2", operations[0])).unwrap(),
+        Reply::Refused(RefusalStatus::Conflict)
     );
     // Once they expire, a request is accepted again.
     world.clock_offset.store(122, Ordering::SeqCst);
-    key_state(
-        client
-            .call(&request_op("admin1", KeyOperation::RotateKrbtgt))
-            .unwrap(),
-    );
+    pending(client.call(&request_op("admin1", operations[cap])).unwrap());
     let approvals = await_events(&world, DirAdminOperation::Approve, 1);
     assert_eq!(
         decision(&approvals[0]),
         refused(ipc_audit::AdminRefusal::PendingUnknown)
     );
-    let n = directory_admin::MAX_PENDING_KEY_REQUESTS;
-    let requested = await_events(&world, DirAdminOperation::RequestKeyOperation, n + 3);
+    let requested = await_events(&world, DirAdminOperation::Propose, cap + 5);
     assert_eq!(
-        decision(&requested[n + 1]),
-        refused(ipc_audit::AdminRefusal::PendingLimit)
+        decision(&requested[cap + 1]),
+        refused(ipc_audit::AdminRefusal::RequesterLimit)
     );
-    assert_eq!(decision(&requested[n + 2]), PROCEED);
+    assert_eq!(
+        decision(&requested[cap + 3]),
+        refused(ipc_audit::AdminRefusal::Conflict)
+    );
+    assert_eq!(decision(&requested[cap + 4]), PROCEED);
 }
 
 /// docs/51 §5.6 ("a restart of dird ⇒ the requests vanish (fail closed)"):
@@ -2822,20 +3109,20 @@ fn a_dird_restart_drops_pending_requests() {
     };
     let id = {
         let mut client = world.client();
-        let state = key_state(
+        let state = pending(
             client
                 .call(&request_op("admin1", KeyOperation::RotateKrbtgt))
                 .unwrap(),
         );
-        key_state(
+        pending(
             client
                 .call(&approve_op("admin2", state.id, KeyOperation::RotateKrbtgt))
                 .unwrap(),
         );
         state.id
     };
-    // A restart happens at least a second later (the ids of a run start at
-    // its start's DSTIME seconds x 2^20, docs/questions/Q-388 item 4).
+    // A restart a second later (the ids are drawn from the CSPRNG — Q-882
+    // item 3 — so a new run reuses none, whatever its start time).
     world.clock_offset.store(1, Ordering::SeqCst);
     world.restart_dird();
     let mut client = world.client();
@@ -2846,7 +3133,7 @@ fn a_dird_restart_drops_pending_requests() {
         Reply::Refused(RefusalStatus::NotFound)
     );
     // The ids of the new run do not reuse the old one.
-    let state = key_state(
+    let state = pending(
         client
             .call(&request_op("admin1", KeyOperation::RotateKrbtgt))
             .unwrap(),
@@ -2884,7 +3171,6 @@ fn a_delete_registers_a_destroy_decision_for_the_tombstone() {
     let Reply::PasswordSet(set) = client
         .call(&by(
             "admin1",
-            &[],
             Operation::BeginPasswordSet { target: g(BOB) },
         ))
         .unwrap()
@@ -2903,7 +3189,7 @@ fn a_delete_registers_a_destroy_decision_for_the_tombstone() {
     );
     assert_eq!(
         client
-            .call(&by("admin1", &[], Operation::Delete { target: g(BOB) }))
+            .call(&by("admin1", Operation::Delete { target: g(BOB) }))
             .unwrap(),
         Reply::Done
     );
@@ -2911,7 +3197,6 @@ fn a_delete_registers_a_destroy_decision_for_the_tombstone() {
         client
             .call(&by(
                 "admin1",
-                &[],
                 Operation::Delete {
                     target: g(STAFF_GROUP)
                 }
@@ -3026,7 +3311,6 @@ fn begin_password_set_registers_the_decision_for_its_key_targets() {
     let Reply::PasswordSet(set) = client
         .call(&by(
             "admin1",
-            &[],
             Operation::BeginPasswordSet { target: g(BOB) },
         ))
         .unwrap()
@@ -3077,7 +3361,6 @@ fn begin_password_set_registers_the_decision_for_its_key_targets() {
     let Reply::PasswordSet(set) = client
         .call(&by(
             "admin1",
-            &[],
             Operation::BeginPasswordSet { target: g(BOB) },
         ))
         .unwrap()
@@ -3114,7 +3397,6 @@ fn a_secret_decision_keyd_does_not_register_answers_unavailable() {
         client
             .call(&by(
                 "admin1",
-                &[],
                 Operation::BeginPasswordSet { target: g(BOB) },
             ))
             .unwrap(),
@@ -3204,7 +3486,6 @@ fn lost_destroy_decisions_are_registered_again_until_keyd_ran_them() {
         client
             .call(&by(
                 "admin1",
-                &[],
                 Operation::CreateComputer {
                     parent: g(STAFF_OU),
                     name: "ws7".into(),
@@ -3215,11 +3496,7 @@ fn lost_destroy_decisions_are_registered_again_until_keyd_ran_them() {
             .unwrap(),
     );
     let Reply::PasswordSet(set) = client
-        .call(&by(
-            "admin1",
-            &[],
-            Operation::BeginPasswordSet { target: ws7 },
-        ))
+        .call(&by("admin1", Operation::BeginPasswordSet { target: ws7 }))
         .unwrap()
     else {
         panic!("a PasswordSet reply");
@@ -3246,7 +3523,7 @@ fn lost_destroy_decisions_are_registered_again_until_keyd_ran_them() {
     // The Delete registers the destroy decision under the tombstone's id.
     assert_eq!(
         client
-            .call(&by("admin1", &[], Operation::Delete { target: ws7 }))
+            .call(&by("admin1", Operation::Delete { target: ws7 }))
             .unwrap(),
         Reply::Done
     );
@@ -3328,7 +3605,6 @@ fn give_bob_a_key_set(world: &World) {
         .client()
         .call(&by(
             "admin1",
-            &[],
             Operation::BeginPasswordSet { target: g(BOB) },
         ))
         .unwrap()
@@ -3380,7 +3656,7 @@ fn a_destroy_decision_not_registered_at_the_delete_is_registered_at_start() {
     assert_eq!(
         world
             .client()
-            .call(&by("admin1", &[], Operation::Delete { target: g(BOB) }))
+            .call(&by("admin1", Operation::Delete { target: g(BOB) }))
             .unwrap(),
         Reply::Done
     );
@@ -3414,7 +3690,7 @@ fn after_the_sweep_a_dird_restart_schedules_no_destroy() {
     assert_eq!(
         world
             .client()
-            .call(&by("admin1", &[], Operation::Delete { target: g(BOB) }))
+            .call(&by("admin1", Operation::Delete { target: g(BOB) }))
             .unwrap(),
         Reply::Done
     );
@@ -3464,7 +3740,6 @@ fn a_password_set_begun_before_the_delete_creates_no_key_set() {
         .client()
         .call(&by(
             "admin1",
-            &[],
             Operation::BeginPasswordSet { target: g(BOB) },
         ))
         .unwrap()
@@ -3474,7 +3749,7 @@ fn a_password_set_begun_before_the_delete_creates_no_key_set() {
     assert_eq!(
         world
             .client()
-            .call(&by("admin1", &[], Operation::Delete { target: g(BOB) }))
+            .call(&by("admin1", Operation::Delete { target: g(BOB) }))
             .unwrap(),
         Reply::Done
     );
@@ -3552,13 +3827,14 @@ fn staff_group_tier1() -> Operation {
     }
 }
 
-/// docs/51 §5.10 (R51-21), §5.6 (P-22), §5.7: a Tier-0 administrator asks
-/// for a tier-map change with a second Tier-0 administrator's approval in
-/// the same request (every AP-REQ bound to it, R2) — dird answers the
-/// version it wrote, `policy.next` holds the loaded policy edited by the
-/// one tier-map edit (version 1 → 2; mode 0600, dird's), and auditd holds
-/// the decision (requester, approver, the change in the edit's spelling)
-/// before the outcome `Committed`.
+/// docs/51 §5.10 (R51-21), §5.6 (P-22), §5.7; docs/questions/Q-882 (one
+/// mechanism): a Tier-0 administrator proposes a tier-map change, a second
+/// Tier-0 administrator approves the pending request, and the first
+/// executes it (its AP-REQ bound to it, R2) — dird answers the version it
+/// wrote, `policy.next` holds the loaded policy edited by the one tier-map
+/// edit (version 1 → 2; mode 0600, dird's), and auditd holds the decision
+/// (requester, approver, the change in the edit's spelling, the request it
+/// consumed) before the outcome `Committed`.
 #[test]
 fn a_dual_controlled_policy_change_is_written_as_policy_next() {
     let Some(world) = World::new(Options::default()) else {
@@ -3566,9 +3842,7 @@ fn a_dual_controlled_policy_change_is_written_as_policy_next() {
     };
     let mut client = world.client();
     assert_eq!(
-        client
-            .call(&by("admin1", &["admin2"], staff_group_tier1()))
-            .unwrap(),
+        approved(&mut client, "admin1", &["admin2"], staff_group_tier1()),
         Reply::PolicyNext { version: 2 }
     );
     let next = policy_next_path(&world.scratch);
@@ -3600,6 +3874,11 @@ fn a_dual_controlled_policy_change_is_written_as_policy_next() {
         events[0].approvers.as_slice(),
         &[sid_value(&sid_of(ADMIN2))]
     );
+    assert!(events[0].pending_request.is_some());
+    assert_eq!(
+        events[0].operation_digest,
+        fingerprint(&staff_group_tier1())
+    );
     let change = format!(
         "--add-principal {} Tier1",
         sid_of(STAFF_GROUP).to_sid_string()
@@ -3618,11 +3897,12 @@ fn a_dual_controlled_policy_change_is_written_as_policy_next() {
 }
 
 /// The attacks (docs/51 §5.2 row 13, §5.6, §5.10; docs/06 §9; P-22; R2;
-/// docs/questions/Q-591): one administrator alone, or approving himself;
-/// a non-Tier-0 account (bob) even with a Tier-0 approver; an approval made
-/// for another operation — each refused, no `policy.next` written; then,
-/// with one change pending, a second is refused (`Unavailable`, recorded
-/// `PendingLimit`) and `policy.next` is left exactly as it was.
+/// docs/questions/Q-591, Q-882): one administrator alone, or approving his
+/// own request; a non-Tier-0 account (bob) proposing; an approval made for
+/// another operation — each refused, no `policy.next` written; then, with
+/// one change pending, a second is refused already at its proposal
+/// (`Unavailable`, recorded `PendingLimit`) and `policy.next` is left
+/// exactly as it was.
 #[test]
 fn a_policy_change_needs_two_tier0_administrators_and_one_at_a_time() {
     let Some(world) = World::new(Options::default()) else {
@@ -3631,20 +3911,23 @@ fn a_policy_change_needs_two_tier0_administrators_and_one_at_a_time() {
     let mut client = world.client();
     let next = policy_next_path(&world.scratch);
     assert_eq!(
-        client
-            .call(&by("admin1", &[], staff_group_tier1()))
-            .unwrap(),
+        client.call(&by("admin1", staff_group_tier1())).unwrap(),
         Reply::Refused(RefusalStatus::ApprovalRequired)
+    );
+    let state = pending(
+        client
+            .call(&propose_op("admin1", staff_group_tier1(), None))
+            .unwrap(),
     );
     assert_eq!(
         client
-            .call(&by("admin1", &["admin1"], staff_group_tier1()))
+            .call(&approve_digest("admin1", state.id, state.digest))
             .unwrap(),
         Reply::Refused(RefusalStatus::Denied)
     );
     assert_eq!(
         client
-            .call(&by("bob", &["admin2"], staff_group_tier1()))
+            .call(&propose_op("bob", staff_group_tier1(), None))
             .unwrap(),
         Reply::Refused(RefusalStatus::Denied)
     );
@@ -3656,51 +3939,71 @@ fn a_policy_change_needs_two_tier0_administrators_and_one_at_a_time() {
         )],
     };
     let mismatched = Request::Operation {
-        auth: Auth {
-            requester: fresh("admin1", &staff_group_tier1()),
-            approvals: vec![fresh("admin2", &other)],
+        auth: Auth::of(fresh("admin2", &other)),
+        operation: Operation::Approve {
+            id: state.id,
+            digest: state.digest,
         },
-        operation: staff_group_tier1(),
     };
     assert_eq!(
         client.call(&mismatched).unwrap(),
         Reply::Refused(RefusalStatus::Denied)
     );
+    assert_eq!(
+        client.call(&by("admin1", staff_group_tier1())).unwrap(),
+        Reply::Refused(RefusalStatus::ApprovalRequired)
+    );
     assert!(!next.exists(), "nothing written");
 
     // One pending change at a time.
     assert_eq!(
-        client.call(&by("admin1", &["admin2"], other)).unwrap(),
+        approved(&mut client, "admin1", &["admin2"], other),
         Reply::PolicyNext { version: 2 }
     );
-    let pending = std::fs::read(&next).unwrap();
+    let written = std::fs::read(&next).unwrap();
     assert_eq!(
         client
-            .call(&by("admin2", &["admin1"], staff_group_tier1()))
+            .call(&propose_op("admin2", staff_group_tier1(), None))
             .unwrap(),
         Reply::Refused(RefusalStatus::Unavailable)
     );
-    assert_eq!(std::fs::read(&next).unwrap(), pending, "left as it was");
+    assert_eq!(std::fs::read(&next).unwrap(), written, "left as it was");
 
-    let events = await_events(&world, DirAdminOperation::ChangePolicy, 7);
+    let events = await_events(&world, DirAdminOperation::ChangePolicy, 4);
     let stages: Vec<DirAdminStage> = events.iter().map(|e| e.stage).collect();
     assert_eq!(
         stages,
         vec![
             refused(ipc_audit::AdminRefusal::ApprovalRequired),
-            refused(ipc_audit::AdminRefusal::ApproverNotDistinct),
-            refused(ipc_audit::AdminRefusal::PolicyDenied),
-            refused(ipc_audit::AdminRefusal::ApproverUnauthenticated),
+            refused(ipc_audit::AdminRefusal::ApprovalRequired),
             DirAdminStage::Decision(DecisionResult::Proceed),
-            stages[5],
+            stages[3],
+        ]
+    );
+    assert!(is_committed(&events[3]));
+    let proposals = await_events(&world, DirAdminOperation::Propose, 4);
+    assert_eq!(
+        proposals.iter().map(decision).collect::<Vec<_>>(),
+        vec![
+            PROCEED,
+            refused(ipc_audit::AdminRefusal::PolicyDenied),
+            PROCEED,
             refused(ipc_audit::AdminRefusal::PendingLimit),
         ]
     );
-    assert!(is_committed(&events[5]));
+    let approvals = await_events(&world, DirAdminOperation::Approve, 3);
+    assert_eq!(
+        approvals.iter().map(decision).collect::<Vec<_>>(),
+        vec![
+            refused(ipc_audit::AdminRefusal::ApproverNotDistinct),
+            refused(ipc_audit::AdminRefusal::ApproverUnauthenticated),
+            PROCEED,
+        ]
+    );
 }
 
-/// Without a `policy_next_path` the online path does not exist: a change —
-/// even fully approved — is refused `Unavailable`, recorded as a failure.
+/// Without a `policy_next_path` the online path does not exist: a change
+/// cannot even be proposed — refused `Unavailable`, recorded as a failure.
 /// Spec: docs/51 §5.10; crates/config `policy_next_path` (optional).
 #[test]
 fn without_policy_next_path_a_policy_change_is_unavailable() {
@@ -3712,14 +4015,23 @@ fn without_policy_next_path_a_policy_change_is_unavailable() {
     };
     let mut client = world.client();
     assert_eq!(
-        client
-            .call(&by("admin1", &["admin2"], staff_group_tier1()))
-            .unwrap(),
+        approved(&mut client, "admin1", &["admin2"], staff_group_tier1()),
         Reply::Refused(RefusalStatus::Unavailable)
     );
-    let events = await_events(&world, DirAdminOperation::ChangePolicy, 1);
+    assert_eq!(
+        client.call(&by("admin1", staff_group_tier1())).unwrap(),
+        Reply::Refused(RefusalStatus::Unavailable)
+    );
+    let events = await_events(&world, DirAdminOperation::Propose, 1);
     assert_eq!(
         events[0].stage,
+        DirAdminStage::Decision(DecisionResult::Failed(
+            ipc_audit::AdminFailure::InternalFailure
+        ))
+    );
+    let executions = await_events(&world, DirAdminOperation::ChangePolicy, 1);
+    assert_eq!(
+        executions[0].stage,
         DirAdminStage::Decision(DecisionResult::Failed(
             ipc_audit::AdminFailure::InternalFailure
         ))

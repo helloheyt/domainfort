@@ -24,12 +24,14 @@
 //! operation digest into the Authenticator's `cksum` (RFC 4120 §5.5.1, key
 //! usage 10; crate ipc-dird-admin `operation_digest`: SHA-256 over a label,
 //! the channel header and the payload after `auth`). dird computes the
-//! digest from the request **it decoded** and passes it with the requester's
-//! and every approval's AP-REQ ([`TicketVerifier::verify`] takes a digest —
-//! dird cannot ask for an unbound admin verification). keyd verifies the
-//! `cksum` while it opens the ticket; a mismatch is the uniform `Denied`.
-//! The PEP reports `channel_bound` to the PDP only for a request whose every
-//! ticket carries that digest (docs/11 §4: a write needs it — no exemption).
+//! digest from the request **it decoded** and passes it with the request's
+//! one AP-REQ ([`TicketVerifier::verify`] takes a digest — dird cannot ask
+//! for an unbound admin verification). keyd verifies the `cksum` while it
+//! opens the ticket; a mismatch is the uniform `Denied`. The PEP reports
+//! `channel_bound` to the PDP only for a request whose ticket carries that
+//! digest (docs/11 §4: a write needs it — no exemption). A request carries
+//! exactly one AP-REQ — the requester's, or the approver's of an `Approve`:
+//! the in-request approvals are retired (docs/questions/Q-882, A-148).
 //!
 //! [`KeydTicketVerifier`] owns ipc-keyd's `KeydClient`, built only with
 //! the keyd dird expects (task R9, docs/questions/Q-466): keyd's uid, the
@@ -60,7 +62,7 @@
 //! * at the `Approve` that completes a key request's quorum — the request's
 //!   decision (`RotateKrbtgt` / `RotateKey` / `RetireKvno`, the approvers,
 //!   the request's remaining lifetime), after the step's decision event was
-//!   acknowledged; any failure withdraws the approval and answers
+//!   acknowledged; any failure reverts the approval and answers
 //!   `Unavailable`;
 //! * after a `Delete` of a user or computer committed — a `DestroyKeySet`
 //!   decision for its tombstone, live `keyd_types::MAX_DESTROY_DECISION_SECS`;
@@ -88,6 +90,17 @@
 //! `KeyPurpose::of_service_name`). Absent, multi-valued, or naming another object
 //! than the manifest's admin service ⇒ the admin service does not start;
 //! dird's other services run (docs/questions/Q-386 item 3).
+//!
+//! # The request queue (task D2-c; docs/questions/Q-882, A-148)
+//!
+//! `Propose` maps onto the PEP's [`ProposedOperation`] ([`proposal_of`]):
+//! a proposable directory write field for field, a `ChangePolicy` onto the
+//! tier-map vocabulary, a `KeyOperation` onto the PEP's key operation; its
+//! fingerprint is the proposed operation's own digest
+//! (`ipc_dird_admin::operation_digest`). `Approve` / `Reject` / `Withdraw`
+//! / `ListRequests` / `ShowRequest` map onto [`RequestStep`]s
+//! ([`step_of`]); a `ShowRequest`'s operation is rendered back from the
+//! request's own fields ([`wire_proposed`] — never requester text).
 //!
 //! # The policy change (task A16; docs/51 §5.10)
 //!
@@ -117,19 +130,21 @@ use core::fmt;
 use core::time::Duration;
 use directory_admin::{
     CompletePasswordSet, CreateComputer, CreateContainerLike, CreateGroup, CreateUser,
-    KeyAdminOperation, KeyOperation as PepKeyOperation, KeyRef as PepKeyRef, KeyReply, KeyTargets,
+    KeyOperation as PepKeyOperation, KeyRef as PepKeyRef, KeyTargets, ListScope as PepListScope,
     LookupKey as PepLookupKey, Membership, Operation as PepOperation,
-    PasswordSetOutcome as PepOutcome, ProtectedObjects, RefusalStatus as PepStatus,
-    Reply as PepReply, SetAccountExpires, SetEnabled,
+    PasswordSetOutcome as PepOutcome, ProposedOperation, ProtectedObjects,
+    RefusalStatus as PepStatus, Reply as PepReply, RequestDetail, RequestFact,
+    RequestState as PepState, RequestStep, RequestSummary as PepSummary, RequestView,
+    SetAccountExpires, SetEnabled, StepReply,
 };
 use directory_pip::{AccountKind as PipKind, DirectoryView};
 use dirstore::NodeId;
 use dtyp::Guid;
 use ipc_audit::AccountExpiresValue;
 use ipc_dird_admin::{
-    AccountExpires, AccountKind, Found, KeyOperation, KeyRef, KeyRequestState, KeyTarget,
-    LookupKey, Operation, PasswordSet, PasswordSetOutcome, PolicyChange, PolicyTier, RefusalStatus,
-    Reply,
+    AccountExpires, AccountKind, Fact, FactTier, Found, KeyOperation, KeyRef, KeyTarget, ListScope,
+    LookupKey, Operation, PasswordSet, PasswordSetOutcome, PendingRequestState, PolicyChange,
+    PolicyTier, RefusalStatus, Reply, RequestShown, RequestState, RequestSummary,
 };
 use kdc::AccountSource;
 use keyd_types::{
@@ -168,10 +183,11 @@ pub const MAX_ADMIN_QUEUE_CAPACITY: usize = 16;
 /// Spec: docs/51 §5.7 item 2; A-85.
 pub const DECISION_ACK_DEADLINE: Duration = Duration::from_secs(2);
 
-/// The AP-REQs one admin request may carry: the requester's and at most
-/// [`ipc_dird_admin::channel::MAX_APPROVALS`] approvals' — each verified through keyd
-/// before the decision event (docs/51 §7.4 steps 1-2, §7.2).
-const MAX_VERIFICATIONS_PER_REQUEST: u32 = 1 + ipc_dird_admin::channel::MAX_APPROVALS;
+/// The AP-REQs one admin request carries: one — the requester's (or the
+/// approver's of an `Approve` / `Reject`), verified through keyd before the
+/// decision event (docs/51 §7.4 steps 1-2, §7.2). The in-request approvals
+/// are retired (docs/questions/Q-882).
+const MAX_VERIFICATIONS_PER_REQUEST: u32 = 1;
 
 /// The keyd calls one admin request may make: its AP-REQ verifications plus
 /// the one decision it may register after its commit or its acknowledged
@@ -186,10 +202,11 @@ const MAX_KEYD_CALLS_PER_REQUEST: u32 = MAX_VERIFICATIONS_PER_REQUEST + 1;
 /// answer on `dird-admin.sock`, and that deadline covers dird's worst case
 /// for one request queued behind one other ([`MAX_ADMIN_CONNECTIONS`]
 /// connections, one request in flight on each, docs/51 §7.5): for each,
-/// [`MAX_KEYD_CALLS_PER_REQUEST`] keyd calls (the AP-REQ verifications and
+/// [`MAX_KEYD_CALLS_PER_REQUEST`] keyd calls (the AP-REQ verification and
 /// the decision's registration) at keyd's client deadline
 /// ([`ipc_keyd::DEFAULT_DEADLINE`], 2 s, docs/50 §3.6) and one
-/// decision-acknowledgement wait. 2 × (4 × 2 s + 4 s) = 24 s: a longer wait
+/// decision-acknowledgement wait. 2 × (2 × 2 s + 4 s) = 16 s ≤ 24 s (it was
+/// 2 × (4 × 2 s + 4 s) with in-request approvals): a longer wait
 /// could let dird decide — and commit — an operation after admind gave up
 /// on it and reported it unavailable (the ambiguity A-86 / A-90 avoid), and
 /// would hold the request queued behind it past admind's deadline as well.
@@ -479,8 +496,9 @@ pub struct KeydEndpoint {
 /// What dird's configuration and the provisioning manifest set for the admin
 /// service — **and nothing else** (docs/52 C18, task R15): the product
 /// parameters. Its keyd client, its connection and queue bounds, the
-/// decision-acknowledgement wait, the key-request lifetime and the
-/// re-registration interval are the daemon's production values, supplied by
+/// decision-acknowledgement wait, the pending requests' lifetime and
+/// per-requester cap, and the re-registration interval are the daemon's
+/// production values, supplied by
 /// `serve_with_admin` ([`AdminServeParams::production`]); they are not fields
 /// here.
 /// Spec: docs/51 §4.6, §5.5, §5.6, §7.1, §7.5; A-73; P-22; docs/52 §3.18.
@@ -538,9 +556,13 @@ pub(crate) struct AdminServeParams {
     /// The decision-acknowledgement wait ([`DecisionAckDeadline::PRODUCTION`]
     /// in every production dird; at most [`MAX_DECISION_ACK_DEADLINE`]).
     pub ack_deadline: DecisionAckDeadline,
-    /// The lifetime of a pending key-operation request
-    /// (`directory_admin::KEY_REQUEST_LIFETIME`; docs/51 §5.6, task A10).
-    pub key_request_lifetime: Duration,
+    /// The lifetime of a pending request (`directory_admin::REQUEST_LIFETIME`;
+    /// docs/51 §5.6; docs/questions/Q-939).
+    pub request_lifetime: Duration,
+    /// The open pending requests one requester may hold
+    /// (`directory_admin::REQUESTS_PER_REQUESTER`, interim while P-78 is
+    /// open; docs/questions/Q-940).
+    pub requests_per_requester: usize,
     /// How often the admin thread re-registers lost destroy decisions
     /// ([`DESTROY_RECONCILE_INTERVAL`] in every production dird; kept
     /// within [`MIN_DESTROY_RECONCILE_INTERVAL`] ..=
@@ -579,8 +601,9 @@ impl AdminServeParams {
     /// (task R9; A-73), with the keyd channel's 2 s deadline — and the
     /// daemon's constants: [`MAX_ADMIN_CONNECTIONS`],
     /// [`ADMIN_QUEUE_CAPACITY`], [`DecisionAckDeadline::PRODUCTION`],
-    /// `directory_admin::KEY_REQUEST_LIFETIME` and
-    /// [`DESTROY_RECONCILE_INTERVAL`] (docs/52 C18, task R15).
+    /// `directory_admin::REQUEST_LIFETIME`,
+    /// `directory_admin::REQUESTS_PER_REQUESTER` and
+    /// [`DESTROY_RECONCILE_INTERVAL`] (docs/52 C18, task R15; task D2-c).
     /// Spec: docs/51 §4.6, §5.5, §5.6, §7.1, §7.5; A-73; docs/questions/Q-385,
     /// Q-466 (A-102), Q-501.
     pub(crate) fn production(admin: AdminParams, realm: &Realm) -> AdminServeParams {
@@ -613,7 +636,8 @@ impl AdminServeParams {
             max_connections: MAX_ADMIN_CONNECTIONS,
             queue_capacity: ADMIN_QUEUE_CAPACITY,
             ack_deadline: DecisionAckDeadline::PRODUCTION,
-            key_request_lifetime: directory_admin::KEY_REQUEST_LIFETIME,
+            request_lifetime: directory_admin::REQUEST_LIFETIME,
+            requests_per_requester: directory_admin::REQUESTS_PER_REQUESTER,
             destroy_reconcile_interval: DESTROY_RECONCILE_INTERVAL,
             // Task A16: configured, passed through.
             policy_next: admin.policy_next,
@@ -632,7 +656,8 @@ impl fmt::Debug for AdminServeParams {
             .field("max_connections", &self.max_connections)
             .field("queue_capacity", &self.queue_capacity)
             .field("ack_deadline", &self.ack_deadline)
-            .field("key_request_lifetime", &self.key_request_lifetime)
+            .field("request_lifetime", &self.request_lifetime)
+            .field("requests_per_requester", &self.requests_per_requester)
             .field(
                 "destroy_reconcile_interval",
                 &self.destroy_reconcile_interval,
@@ -801,50 +826,235 @@ fn wire_key_operation(operation: &PepKeyOperation) -> KeyOperation {
     }
 }
 
-/// The PEP's key-plane request of a typed operation, if it is one
-/// (`RequestKeyOperation`, `Approve`).
-/// Spec: docs/51 §5.6, §6, §7.3.
+/// The PEP's operation of the operation a `Propose` carries (task D2-c):
+/// a directory write field for field, a `ChangePolicy` in the tier-map
+/// vocabulary, a key operation; `None` for anything else (the codec admits
+/// only `request_kind::PROPOSABLE`; the PEP refuses a read or an audit-only
+/// report itself).
+/// Spec: docs/questions/Q-882 item 1; crate directory-admin
+/// `ProposedOperation`.
 #[must_use]
-pub fn key_request_of(operation: &Operation) -> Option<KeyAdminOperation> {
+pub fn proposal_of(operation: &Operation) -> Option<ProposedOperation> {
     match operation {
-        Operation::RequestKeyOperation { operation } => {
-            Some(KeyAdminOperation::RequestKeyOperation {
-                operation: pep_key_operation(operation),
-            })
+        Operation::ChangePolicy { changes } => {
+            Some(ProposedOperation::Policy(tier_changes(changes)))
         }
-        Operation::Approve { id, operation } => Some(KeyAdminOperation::Approve {
-            id: *id,
-            operation: pep_key_operation(operation),
-        }),
-        _ => None,
+        Operation::KeyOperation(operation) => {
+            Some(ProposedOperation::Key(pep_key_operation(operation)))
+        }
+        other => pep_operation(other).map(ProposedOperation::Directory),
     }
 }
 
-/// The typed reply of a key-plane step. A count that cannot be one octet
-/// (never: at most two approvals, a quorum of at most three) is answered
-/// `Unavailable`.
-/// Spec: docs/51 §6, §7.3.
+/// The PEP's step of a request-queue operation, if it is one (task D2-c).
+/// Spec: docs/questions/Q-882 item 1; r5-a §11 MA5.
 #[must_use]
-pub fn wire_key_reply(reply: &KeyReply) -> Reply {
+pub fn step_of(operation: &Operation) -> Option<RequestStep> {
+    Some(match operation {
+        Operation::Approve { id, digest } => RequestStep::Approve {
+            id: *id,
+            digest: OperationDigest::new(*digest),
+        },
+        Operation::Reject { id, digest } => RequestStep::Reject {
+            id: *id,
+            digest: OperationDigest::new(*digest),
+        },
+        Operation::Withdraw { id } => RequestStep::Withdraw { id: *id },
+        Operation::ListRequests(scope) => RequestStep::List(match scope {
+            ListScope::Mine => PepListScope::Mine,
+            ListScope::AwaitingMe => PepListScope::AwaitingMe,
+        }),
+        Operation::ShowRequest { id } => RequestStep::Show { id: *id },
+        _ => return None,
+    })
+}
+
+/// The typed operation of the PEP's (field for field — the inverse of
+/// [`pep_operation`]).
+/// Spec: docs/51 §7.3; crate directory-admin `Operation`.
+fn wire_operation(operation: &PepOperation) -> Operation {
+    match operation {
+        PepOperation::CreateUser(c) => Operation::CreateUser {
+            parent: c.parent,
+            sam: c.sam.clone(),
+            upn: c.upn.clone(),
+            description: c.description.clone(),
+        },
+        PepOperation::CreateComputer(c) => Operation::CreateComputer {
+            parent: c.parent,
+            name: c.name.clone(),
+            dns_host_name: c.dns_host_name.clone(),
+            spn: c.spn.clone(),
+        },
+        PepOperation::CreateGroup(c) => Operation::CreateGroup {
+            parent: c.parent,
+            sam: c.sam.clone(),
+            group_type: c.group_type,
+        },
+        PepOperation::CreateOu(c) => Operation::CreateOu {
+            parent: c.parent,
+            name: c.name.clone(),
+        },
+        PepOperation::CreateContainer(c) => Operation::CreateContainer {
+            parent: c.parent,
+            name: c.name.clone(),
+        },
+        PepOperation::BeginPasswordSet { target } => {
+            Operation::BeginPasswordSet { target: *target }
+        }
+        PepOperation::CompletePasswordSet(c) => Operation::CompletePasswordSet {
+            target: c.target,
+            outcome: match c.outcome {
+                PepOutcome::Completed => PasswordSetOutcome::Completed,
+                PepOutcome::Failed => PasswordSetOutcome::Failed,
+            },
+            kvnos: c.kvnos.clone(),
+        },
+        PepOperation::SetEnabled(s) => Operation::SetEnabled {
+            target: s.target,
+            enabled: s.enabled,
+        },
+        PepOperation::SetAccountExpires(s) => Operation::SetAccountExpires {
+            target: s.target,
+            value: match s.value.filetime() {
+                None => AccountExpires::Never,
+                Some(at) => AccountExpires::At(at),
+            },
+        },
+        PepOperation::AddMember(m) => Operation::AddMember {
+            group: m.group,
+            member: m.member,
+        },
+        PepOperation::RemoveMember(m) => Operation::RemoveMember {
+            group: m.group,
+            member: m.member,
+        },
+        PepOperation::Delete { target } => Operation::Delete { target: *target },
+        PepOperation::Lookup(key) => Operation::Lookup(match key {
+            PepLookupKey::SamAccountName(sam) => LookupKey::SamAccountName(sam.clone()),
+            PepLookupKey::ServicePrincipalName(spn) => LookupKey::ServicePrincipalName(spn.clone()),
+            PepLookupKey::Dn(dn) => LookupKey::Dn(dn.rdns().to_vec()),
+        }),
+    }
+}
+
+/// The typed operation of a pending request's own fields — what a
+/// `ShowRequest` renders (never requester text: class C44); `None` if a
+/// policy change holds a tier the channel cannot carry (cannot happen: it
+/// came from the channel).
+/// Spec: docs/questions/Q-882 item 1; docs/research/r5-b-cli.md §7.4
+/// rule 1.
+#[must_use]
+pub fn wire_proposed(operation: &ProposedOperation) -> Option<Operation> {
+    Some(match operation {
+        ProposedOperation::Directory(op) => wire_operation(op),
+        ProposedOperation::Policy(changes) => Operation::ChangePolicy {
+            changes: policy_changes(changes)?,
+        },
+        ProposedOperation::Key(op) => Operation::KeyOperation(wire_key_operation(op)),
+    })
+}
+
+/// The channel's state of the PEP's.
+fn wire_state(state: PepState) -> RequestState {
+    match state {
+        PepState::Pending => RequestState::Pending,
+        PepState::Approved => RequestState::Approved,
+    }
+}
+
+/// The typed reply of a request's state (the answer to `Propose` and
+/// `Approve`). A count that cannot be one octet (never: a quorum of at most
+/// three) is answered `Unavailable`.
+/// Spec: docs/questions/Q-882 item 1.
+#[must_use]
+pub fn wire_request_view(view: &RequestView) -> Reply {
+    match (u8::try_from(view.approvals), u8::try_from(view.quorum)) {
+        (Ok(approvals), Ok(quorum)) => Reply::PendingRequest(PendingRequestState {
+            id: view.id,
+            digest: *view.digest.as_bytes(),
+            state: wire_state(view.state),
+            approvals,
+            quorum,
+            expires: view.expires,
+        }),
+        _ => Reply::Refused(RefusalStatus::Unavailable),
+    }
+}
+
+/// One `ListRequests` entry; `None` if a count does not fit or the
+/// operation has no wire form (neither happens).
+fn wire_summary(summary: &PepSummary) -> Option<RequestSummary> {
+    let kind = wire_proposed(&summary.operation)?.to_wire().ok()?.kind();
+    Some(RequestSummary {
+        id: summary.id,
+        digest: *summary.digest.as_bytes(),
+        state: wire_state(summary.state),
+        operation: kind,
+        requester: summary.requester,
+        approvals: u8::try_from(summary.approvals).ok()?,
+        quorum: u8::try_from(summary.quorum).ok()?,
+        expires: summary.expires,
+    })
+}
+
+/// One fact on the channel.
+fn wire_fact(fact: &RequestFact) -> Fact {
+    Fact {
+        guid: fact.guid,
+        dn: fact.dn.rdns().to_vec(),
+        class: fact.class.to_owned(),
+        sid: fact.sid,
+        tier: match fact.tier {
+            Some(Tier::Tier0) => FactTier::Tier0,
+            Some(Tier::Tier1) => FactTier::Tier1,
+            Some(Tier::Tier2) => FactTier::Tier2,
+            Some(Tier::Untiered) | None => FactTier::Unclassified,
+        },
+    }
+}
+
+/// A `ShowRequest` answer; `None` if a count does not fit or the operation
+/// has no wire form (neither happens).
+fn wire_detail(detail: &RequestDetail) -> Option<RequestShown> {
+    Some(RequestShown {
+        id: detail.id,
+        digest: *detail.digest.as_bytes(),
+        state: wire_state(detail.state),
+        requester: detail.requester,
+        approvers: detail.approvers.clone(),
+        quorum: u8::try_from(detail.quorum).ok()?,
+        expires: detail.expires,
+        reason_ref: detail.reason_ref.clone(),
+        operation: wire_proposed(&detail.operation)?,
+        facts: detail.facts.iter().map(wire_fact).collect(),
+    })
+}
+
+/// The typed reply of a request-queue step. Anything that cannot be
+/// rendered (never) is answered `Unavailable`.
+/// Spec: docs/questions/Q-882 item 1; r5-a §11 MA5.
+#[must_use]
+pub fn wire_step_reply(reply: &StepReply) -> Reply {
+    let unavailable = Reply::Refused(RefusalStatus::Unavailable);
     match reply {
-        KeyReply::Request(view) => {
-            match (u8::try_from(view.approvals), u8::try_from(view.quorum)) {
-                (Ok(approvals), Ok(quorum)) => Reply::KeyRequest(KeyRequestState {
-                    id: view.id,
-                    digest: view.digest,
-                    operation: wire_key_operation(&view.operation),
-                    approvals,
-                    quorum,
-                }),
-                _ => Reply::Refused(RefusalStatus::Unavailable),
-            }
+        StepReply::Request(view) => wire_request_view(view),
+        StepReply::Done => Reply::Done,
+        StepReply::List(entries) => entries
+            .iter()
+            .map(wire_summary)
+            .collect::<Option<Vec<_>>>()
+            .map_or(unavailable, Reply::RequestList),
+        StepReply::Shown(detail) => {
+            wire_detail(detail).map_or(unavailable, |shown| Reply::RequestShown(Box::new(shown)))
         }
     }
 }
 
 /// The PEP's operation of a typed request (field for field; no rule is
 /// applied here — the PEP checks every value and audits a refusal); `None`
-/// for a key-plane request ([`key_request_of`]).
+/// for a request-queue step ([`proposal_of`], [`step_of`]) and a policy
+/// change ([`policy_change_of`]).
 /// Spec: docs/51 §7.3; crate directory-admin `Operation`.
 #[must_use]
 pub fn pep_operation(operation: &Operation) -> Option<PepOperation> {
@@ -932,9 +1142,14 @@ pub fn pep_operation(operation: &Operation) -> Option<PepOperation> {
             LookupKey::ServicePrincipalName(spn) => PepLookupKey::ServicePrincipalName(spn.clone()),
             LookupKey::Dn(dn) => PepLookupKey::Dn(Dn::new(dn.clone())),
         }),
-        Operation::RequestKeyOperation { .. }
+        Operation::ChangePolicy { .. }
+        | Operation::KeyOperation(_)
+        | Operation::Propose { .. }
         | Operation::Approve { .. }
-        | Operation::ChangePolicy { .. } => return None,
+        | Operation::Reject { .. }
+        | Operation::Withdraw { .. }
+        | Operation::ListRequests(_)
+        | Operation::ShowRequest { .. } => return None,
     })
 }
 
@@ -949,24 +1164,52 @@ pub fn policy_change_of(operation: &Operation) -> Option<Vec<TierChange>> {
     let Operation::ChangePolicy { changes } = operation else {
         return None;
     };
+    Some(tier_changes(changes))
+}
+
+/// The tier-map vocabulary of a `ChangePolicy`'s changes (field for field).
+/// Spec: docs/51 §5.10; crate policy-store `TierChange`.
+fn tier_changes(changes: &[PolicyChange]) -> Vec<TierChange> {
     let tier = |tier: &PolicyTier| match tier {
         PolicyTier::Tier0 => Tier::Tier0,
         PolicyTier::Tier1 => Tier::Tier1,
         PolicyTier::Tier2 => Tier::Tier2,
     };
-    Some(
-        changes
-            .iter()
-            .map(|change| match change {
-                PolicyChange::AddPrincipal(sid, t) => TierChange::AddPrincipal(*sid, tier(t)),
-                PolicyChange::RemovePrincipal(sid) => TierChange::RemovePrincipal(*sid),
-                PolicyChange::AddSubtree(dn, t) => {
-                    TierChange::AddSubtree(Dn::new(dn.clone()), tier(t))
+    changes
+        .iter()
+        .map(|change| match change {
+            PolicyChange::AddPrincipal(sid, t) => TierChange::AddPrincipal(*sid, tier(t)),
+            PolicyChange::RemovePrincipal(sid) => TierChange::RemovePrincipal(*sid),
+            PolicyChange::AddSubtree(dn, t) => TierChange::AddSubtree(Dn::new(dn.clone()), tier(t)),
+            PolicyChange::RemoveSubtree(dn) => TierChange::RemoveSubtree(Dn::new(dn.clone())),
+        })
+        .collect()
+}
+
+/// The channel's changes of a tier-map vocabulary list (the inverse of
+/// [`tier_changes`]); `None` for a tier the channel cannot carry
+/// (`Untiered` is never a map row, A-36).
+/// Spec: docs/51 §5.10; A-36.
+fn policy_changes(changes: &[TierChange]) -> Option<Vec<PolicyChange>> {
+    let tier = |tier: &Tier| match tier {
+        Tier::Tier0 => Some(PolicyTier::Tier0),
+        Tier::Tier1 => Some(PolicyTier::Tier1),
+        Tier::Tier2 => Some(PolicyTier::Tier2),
+        _ => None,
+    };
+    changes
+        .iter()
+        .map(|change| {
+            Some(match change {
+                TierChange::AddPrincipal(sid, t) => PolicyChange::AddPrincipal(*sid, tier(t)?),
+                TierChange::RemovePrincipal(sid) => PolicyChange::RemovePrincipal(*sid),
+                TierChange::AddSubtree(dn, t) => {
+                    PolicyChange::AddSubtree(dn.rdns().to_vec(), tier(t)?)
                 }
-                PolicyChange::RemoveSubtree(dn) => TierChange::RemoveSubtree(Dn::new(dn.clone())),
+                TierChange::RemoveSubtree(dn) => PolicyChange::RemoveSubtree(dn.rdns().to_vec()),
             })
-            .collect(),
-    )
+        })
+        .collect()
 }
 
 /// The wire status of the PEP's status (the same six values by name).
@@ -1067,7 +1310,19 @@ const _: () = assert!(
 );
 const _: () =
     assert!(ipc_dird_admin::channel::MAX_DN_COMPONENTS as usize == directory_pip::MAX_DN_DEPTH);
-const _: () = assert!(ipc_dird_admin::channel::MAX_APPROVALS as usize == ipc_audit::MAX_APPROVERS);
+// Task D2-c: the request queue's bounds on the channel are the PEP's.
+const _: () = assert!(
+    ipc_dird_admin::channel::MAX_SHOWN_APPROVERS as usize == directory_admin::MAX_QUORUM - 1
+);
+const _: () = assert!(
+    ipc_dird_admin::channel::MAX_LISTED_REQUESTS as usize == directory_admin::MAX_PENDING_REQUESTS
+);
+const _: () = assert!(ipc_dird_admin::channel::MAX_FACTS as usize == directory_admin::MAX_FACTS);
+const _: () = assert!(
+    ipc_dird_admin::channel::MAX_REASON_REF as usize == directory_admin::MAX_REASON_REF_CHARS
+);
+const _: () = assert!(directory_admin::MAX_PENDING_REQUESTS <= u8::MAX as usize);
+const _: () = assert!(ipc_dird_admin::channel::RETIRED_APPROVALS == 0);
 const _: () = assert!(ipc_dird_admin::channel::MAX_KVNOS as usize == ipc_audit::MAX_REPORTED_KVNOS);
 const _: () = assert!(ipc_dird_admin::channel::DIGEST_LEN == directory_admin::DIGEST_LEN);
 const _: () = assert!(directory_admin::MAX_QUORUM <= u8::MAX as usize);

@@ -149,7 +149,7 @@ mod window;
 pub use admin::{
     AccountExpiresValue, AdmindActivity, AdmindEvent, Allocation, DecisionResult, DirAdminEvent,
     DirAdminStage, OutcomeResult, PasswordResult, PasswordStep, TargetName, MAX_APPROVERS,
-    MAX_REPORTED_KVNOS, MAX_TARGET_NAMES,
+    MAX_REPORTED_KVNOS, MAX_TARGET_NAMES, OPERATION_DIGEST_LEN,
 };
 pub use channel::{
     decode_reply, decode_request, encode_reply, encode_request, Ack, Append, AppendCursor,

@@ -33,8 +33,10 @@ use std::path::PathBuf;
 use ad_schema::flags::user_account_control as uac;
 use ad_schema::{phase1, Phase1Schema};
 use directory_admin::{
-    wall_clock, AdminConfig, Applied, DirectoryAdmin, Operation, Prepared, ProtectedObjects,
-    RandomError, RandomSource, Refusal, Request, VerifiedTicket, CHANGE_SEQ_COUNTER, RID_COUNTER,
+    wall_clock, AdminConfig, Applied, DirectoryAdmin, KeyTargets, Operation, PendingRequests,
+    PolicyFile, Prepared, ProposeRequest, Proposed, ProposedOperation, ProtectedObjects,
+    RandomError, RandomSource, Refusal, Request, RequestStep, StepReply, StepRequest, Stepped,
+    VerifiedTicket, CHANGE_SEQ_COUNTER, REQUESTS_PER_REQUESTER, REQUEST_LIFETIME, RID_COUNTER,
     RID_END_EXCLUSIVE, RID_FIRST,
 };
 use directory_pip::{DirectoryContext, DirectoryView, NamingContext, TierMap};
@@ -252,6 +254,40 @@ pub fn ticket(sam: &str) -> VerifiedTicket {
 /// request's digest (R2, docs/52 §5 item 4).
 pub const TEST_DIGEST: keyd_types::OperationDigest = keyd_types::OperationDigest::new([0x0D; 32]);
 
+/// A made-up operation digest for `operation` (these PEP tests run without
+/// the channel codec): SHA-256 (the approved `sha2`, a normal dependency of
+/// the crate) of its `Debug` form — distinct operations get distinct
+/// digests, as the codec's digest would give them (docs/52 §5 item 1;
+/// docs/questions/Q-888). Only its use is checked.
+pub fn fingerprint(operation: &impl core::fmt::Debug) -> keyd_types::OperationDigest {
+    use sha2::{Digest, Sha256};
+    keyd_types::OperationDigest::new(<[u8; 32]>::from(Sha256::digest(
+        format!("{operation:?}").as_bytes(),
+    )))
+}
+
+/// The domain's key sets: its krbtgt (RID 502) and its two service objects,
+/// each named by the SPN this module gives it (`ldap/dc01.example.test`,
+/// `admind/dc01.example.test`) through the one derivation (docs/52 R2b).
+pub fn domain_targets() -> KeyTargets {
+    let service = |id: u32, class: &str| {
+        keyd_types::ServiceKeyHandle::of_service(
+            keyd_types::PrincipalId::from_bytes(guid(id).to_packet()),
+            &PrincipalName {
+                name_type: krb_proto::constants::KRB_NT_SRV_HST,
+                name_string: vec![
+                    KerberosString::new(class).unwrap(),
+                    KerberosString::new("dc01.example.test").unwrap(),
+                ],
+            },
+        )
+    };
+    KeyTargets {
+        krbtgt: guid(KRBTGT),
+        services: BTreeSet::from([service(LDAP_SVC, "ldap"), service(ADMIND_SVC, "admind")]),
+    }
+}
+
 /// A ticket of `sam` whose AP-REQ keyd verified bound to `bound` (R2).
 pub fn ticket_bound_to(sam: &str, bound: Option<keyd_types::OperationDigest>) -> VerifiedTicket {
     VerifiedTicket {
@@ -351,8 +387,11 @@ impl RandomSource for CountingRandom {
         self.next += 1;
         let mut bytes = [0xA3u8; 16];
         bytes[8..].copy_from_slice(&self.next.to_be_bytes());
+        // A short draw (a pending request's 8-octet id, task D2-c) takes
+        // the counter end, so ids are distinct and non-zero too.
+        let offset = 16 - out.len().min(16);
         for (i, o) in out.iter_mut().enumerate() {
-            *o = bytes[i % 16];
+            *o = bytes[(offset + i) % 16];
         }
         Ok(())
     }
@@ -442,6 +481,11 @@ pub struct Domain {
     pub tiers: TierMap,
     pub policy: PolicySnapshot,
     pub admin: DirectoryAdmin<CountingRandom>,
+    /// The pending requests of the one dual-control mechanism (task D2-c).
+    pub requests: PendingRequests,
+    /// The loaded policy file a proposed tier-map change is built on (a
+    /// test that proposes one sets it).
+    pub policy_file: Option<policy_store::DevelopmentPolicy>,
     next_op: Cell<u64>,
     _dir: TempDir,
 }
@@ -569,6 +613,13 @@ impl Domain {
             tiers,
             policy,
             admin,
+            requests: PendingRequests::new(
+                domain_targets(),
+                REQUEST_LIFETIME,
+                REQUESTS_PER_REQUESTER,
+            )
+            .expect("requests"),
+            policy_file: None,
             next_op: Cell::new(0),
             _dir: dir,
         };
@@ -805,33 +856,146 @@ impl Domain {
             .next_value
     }
 
-    /// A request by `requester` with `approvers`.
-    pub fn request(&self, op: Operation, requester: &str, approvers: &[&str]) -> Request {
+    fn next_id(&self) -> u64 {
         let id = self.next_op.get() + 1;
         self.next_op.set(id);
+        id
+    }
+
+    /// A direct request by `requester` — its digest the operation's
+    /// [`fingerprint`], the requester's ticket bound to it (R2).
+    pub fn request(&self, op: Operation, requester: &str) -> Request {
+        let digest = fingerprint(&op);
         Request {
-            operation_id: id,
+            operation_id: self.next_id(),
             operation: op,
-            operation_digest: TEST_DIGEST,
-            requester: ticket(requester),
-            approvals: approvers.iter().map(|a| ticket(a)).collect(),
+            operation_digest: digest,
+            requester: ticket_bound_to(requester, Some(digest)),
         }
     }
 
-    /// Run `op` end to end at [`now`]: begin the `WriteTxn`, take the view,
-    /// prepare, then apply and commit (or abort on a refusal).
+    /// `Propose` of `operation` by `requester` at [`now`] (task D2-c): the
+    /// request's fingerprint is the operation's [`fingerprint`], the
+    /// requester's ticket is bound to [`TEST_DIGEST`] (the `Propose`'s own
+    /// digest here).
+    pub fn propose(
+        &mut self,
+        operation: ProposedOperation,
+        requester: &str,
+        reason_ref: Option<&str>,
+    ) -> Result<Proposed, Refusal> {
+        let digest = match &operation {
+            ProposedOperation::Directory(op) => fingerprint(op),
+            ProposedOperation::Policy(changes) => fingerprint(changes),
+            ProposedOperation::Key(op) => fingerprint(op),
+        };
+        let request = ProposeRequest {
+            operation_id: self.next_id(),
+            operation,
+            operation_digest: digest,
+            request_digest: TEST_DIGEST,
+            reason_ref: reason_ref.map(str::to_owned),
+            requester: ticket(requester),
+        };
+        self.propose_request(&request)
+    }
+
+    /// `Propose` of a prepared request, with the loaded policy file if the
+    /// test gave one ([`Domain::policy_file`]).
+    pub fn propose_request(&mut self, request: &ProposeRequest) -> Result<Proposed, Refusal> {
+        let view = self.ctx.view(&self.store, &self.tiers).expect("view");
+        let mut honour = |_: &[pdp::Obligation]| true;
+        let file = self.policy_file.as_ref().map(|installed| PolicyFile {
+            installed,
+            pending: directory_admin::PendingPolicy::Absent,
+        });
+        self.admin.propose(
+            &mut self.requests,
+            request,
+            &view,
+            &self.policy,
+            file,
+            &now(),
+            &mut honour,
+        )
+    }
+
+    /// One step by `caller` at `at`, its ticket bound to [`TEST_DIGEST`].
+    pub fn step_at(
+        &mut self,
+        step: RequestStep,
+        caller: VerifiedTicket,
+        at: &KerberosTime,
+    ) -> Result<Stepped, Refusal> {
+        let request = StepRequest {
+            operation_id: self.next_id(),
+            step,
+            request_digest: TEST_DIGEST,
+            caller,
+            signature: None,
+        };
+        let view = self.ctx.view(&self.store, &self.tiers).expect("view");
+        let mut honour = |_: &[pdp::Obligation]| true;
+        self.admin.step(
+            &mut self.requests,
+            &request,
+            &view,
+            &self.policy,
+            at,
+            &mut honour,
+        )
+    }
+
+    /// One step by `caller` at [`now`].
+    pub fn step(&mut self, step: RequestStep, caller: &str) -> Result<Stepped, Refusal> {
+        self.step_at(step, ticket(caller), &now())
+    }
+
+    /// `Approve {id, digest}` by `approver` at [`now`].
+    pub fn approve(
+        &mut self,
+        id: u64,
+        digest: keyd_types::OperationDigest,
+        approver: &str,
+    ) -> Result<Stepped, Refusal> {
+        self.step(RequestStep::Approve { id, digest }, approver)
+    }
+
+    /// Run `op` end to end at [`now`]: with `approvers`, first the one
+    /// dual-control mechanism (task D2-c; docs/questions/Q-882) — `Propose`
+    /// by the requester, `Approve` by each approver in order (a refusal of
+    /// either is returned as it is) — then the execution: begin the
+    /// `WriteTxn`, take the view, prepare, then apply and commit (or abort
+    /// on a refusal).
     pub fn run(&mut self, op: Operation, requester: &str, approvers: &[&str]) -> Ran {
-        let request = self.request(op, requester, approvers);
+        if !approvers.is_empty() {
+            let proposed =
+                match self.propose(ProposedOperation::Directory(op.clone()), requester, None) {
+                    Ok(proposed) => proposed,
+                    Err(refusal) => return Ran::Refused(refusal),
+                };
+            let (id, digest) = (proposed.reply().id, proposed.reply().digest);
+            for approver in approvers {
+                if let Err(refusal) = self.approve(id, digest, approver) {
+                    return Ran::Refused(refusal);
+                }
+            }
+        }
+        let request = self.request(op, requester);
         self.run_request(&request)
     }
 
     pub fn run_request(&mut self, request: &Request) -> Ran {
         let mut txn = self.store.begin_write().expect("begin write");
         let view = self.ctx.view(&self.store, &self.tiers).expect("view");
-        let prepared = match self.admin.prepare(request, &view, &self.policy, &now()) {
-            Ok(p) => p,
-            Err(r) => return Ran::Refused(r),
-        };
+        let prepared =
+            match self
+                .admin
+                .prepare(request, &mut self.requests, &view, &self.policy, &now())
+            {
+                Ok(p) => p,
+                Err(r) => return Ran::Refused(r),
+            };
         drop(view);
         if !prepared.writes() {
             return Ran::Read(Box::new(prepared));
@@ -851,6 +1015,35 @@ impl Domain {
             }
         }
     }
+}
+
+/// The request view of a step's reply (`Approve`).
+pub fn request_view(stepped: &Stepped) -> directory_admin::RequestView {
+    match stepped.reply() {
+        StepReply::Request(view) => view.clone(),
+        other => panic!("not a request view: {other:?}"),
+    }
+}
+
+/// The test domain's policy plus `PolicyAdmin` on every policy scope for the
+/// Tier-0 group — provision's rule 4 (docs/questions/Q-420 item 1: the key
+/// operations ask `PolicyAdmin` on `Policy { scope: "keys" }`; the tier-map
+/// change on `"tier-map"`).
+pub fn with_policy_admin(d: &mut Domain) {
+    let mut rules = d.policy.rules().to_vec();
+    rules.push(pdp::Rule {
+        id: pdp::RuleId(9),
+        effect: pdp::Effect::Allow,
+        when: pdp::Match {
+            action: pdp::ActionMatch::Exact(pdp::Action::PolicyAdmin),
+            resource: pdp::ResourceMatch::Policy { scope: None },
+            subject: pdp::SubjectMatch::MemberOf(sid_of(TIER0_GROUP)),
+            context: pdp::ContextMatch::ANY,
+            auth: pdp::AuthMatch::ANY,
+        },
+        obligations: vec![],
+    });
+    d.policy = pdp::PolicySnapshot::new(d.policy.version(), rules, vec![]);
 }
 
 /// Play auditd for one prepared write (docs/51 §5.7 item 2, A-85; docs/52

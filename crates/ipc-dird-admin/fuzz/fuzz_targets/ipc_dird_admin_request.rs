@@ -11,17 +11,20 @@
 //! rejection maps to the refusal table (a shared `Refused`, or a close
 //! without a reply).
 //!
-//! Task A10 added the key-operation kinds (`RequestKeyOperation`,
-//! `Approve`). keyadm's `FetchApproved` / `Complete` /
-//! `ListPendingDestruction` (`0x10`–`0x12`) were retired by A-102: nothing
-//! decodes with one of those kinds.
+//! Task D2-c (docs/questions/Q-882) retired task A10's key-only
+//! `RequestKeyOperation` / `Approve` (`0x0E`, `0x0F`) and the in-request
+//! approvals (a non-empty `auth.approvals` never decodes), and added the
+//! request queue (`Propose` with a nested proposed operation, `Approve`,
+//! `Reject`, `Withdraw`, `ListRequests`, `ShowRequest`). keyadm's
+//! `FetchApproved` / `Complete` / `ListPendingDestruction` (`0x10`–`0x12`)
+//! were retired by A-102: nothing decodes with one of the retired kinds.
 //!
 //! R2 (docs/52 §5, A-102): every request that decodes has an operation
 //! digest (the application data its AP-REQs are bound to), the same from
 //! the typed and the wire form. Written, not run (PENDING-OWNER P-1).
 //!
 //! Spec: docs/51 §6, §7.1-§7.3, §7.5; docs/50 §3.3, §9; A-59;
-//! docs/questions/Q-422, Q-460 (A-102); docs/52 §5 item 1.
+//! docs/questions/Q-422, Q-460 (A-102), Q-882; docs/52 §5 item 1.
 
 use ipc::{decode_body, encode_frame, Direction};
 use ipc_dird_admin::{

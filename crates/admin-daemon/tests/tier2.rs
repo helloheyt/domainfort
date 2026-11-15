@@ -41,7 +41,7 @@ fn password(text: &str) -> ipc_admin::Password {
 /// Complete's — docs/questions/Q-400).
 fn set_password(target: Guid, text: &str) -> Request {
     Request::SetPassword(SetPassword {
-        auth: begin_auth("admin1", &[], target),
+        auth: begin_auth("admin1", target),
         completion: completion("admin1", target),
         target,
         password: password(text),
@@ -91,16 +91,30 @@ fn await_events(
 /// One `SetPassword` event: peer uid, target, kvnos, result.
 type PasswordEvent = (Option<u32>, [u8; 16], Vec<u32>, PasswordResult);
 
-/// admind's `SetPassword` events.
+/// admind's `SetPassword` events. Each carries the fingerprint of its
+/// operation — the digest of `BeginPasswordSet {target}` the requester's
+/// AP-REQ is bound to (task D2-c; docs/questions/Q-888) — checked here for
+/// every one.
 fn password_events(events: &[AdmindEvent]) -> Vec<PasswordEvent> {
     events
         .iter()
         .filter_map(|e| match &e.activity {
             AdmindActivity::SetPassword {
                 target,
+                operation_digest,
                 kvnos,
                 result,
-            } => Some((e.peer_uid, *target, kvnos.as_slice().to_vec(), *result)),
+            } => {
+                let begin = Operation::BeginPasswordSet {
+                    target: dtyp::Guid::from_packet(target),
+                };
+                assert_eq!(
+                    operation_digest,
+                    ipc_dird_admin::operation_digest(&begin).unwrap().as_bytes(),
+                    "the event's fingerprint"
+                );
+                Some((e.peer_uid, *target, kvnos.as_slice().to_vec(), *result))
+            }
             _ => None,
         })
         .collect()
@@ -446,7 +460,6 @@ fn dird_down_is_unavailable() {
     );
     let create = forward(
         "admin1",
-        &[],
         Operation::CreateUser {
             parent: g(STAFF_OU),
             sam: "carol".into(),
@@ -517,7 +530,6 @@ fn a_forwarded_create_user_round_trips() {
     let mut conn = world.connect();
     let create = forward(
         "admin1",
-        &[],
         Operation::CreateUser {
             parent: g(STAFF_OU),
             sam: "carol".into(),
@@ -540,7 +552,6 @@ fn a_forwarded_create_user_round_trips() {
     assert!(sid.is_some());
     let lookup = forward(
         "admin1",
-        &[],
         Operation::Lookup(ipc_dird_admin::LookupKey::SamAccountName("carol".into())),
     );
     match conn.call(&lookup) {
@@ -553,10 +564,7 @@ fn a_forwarded_create_user_round_trips() {
     }
     // A bad ticket: dird's uniform Denied passes through by name.
     let forged = Request::Forward {
-        auth: Auth {
-            requester: vec![0x6E, 0x00],
-            approvals: vec![],
-        },
+        auth: Auth::of(vec![0x6E, 0x00]),
         operation: Operation::Delete { target: guid },
     };
     assert_eq!(conn.call(&forged), refused(RefusalStatus::Denied));
@@ -588,7 +596,7 @@ fn an_auth_bound_to_another_operation_is_refused_through_admind() {
         description: None,
     };
     let rebound = Request::Forward {
-        auth: auth("admin1", &[], &meant),
+        auth: auth("admin1", &meant),
         operation: other,
     };
     assert_eq!(conn.call(&rebound), refused(RefusalStatus::Denied));
@@ -602,7 +610,7 @@ fn an_auth_bound_to_another_operation_is_refused_through_admind() {
         None
     );
     let wrong_target = Request::SetPassword(SetPassword {
-        auth: begin_auth("admin1", &[], g(WS9)),
+        auth: begin_auth("admin1", g(WS9)),
         completion: completion("admin1", g(BOB)),
         target: g(BOB),
         password: password(GOOD),
@@ -610,7 +618,7 @@ fn an_auth_bound_to_another_operation_is_refused_through_admind() {
     assert_eq!(conn.call(&wrong_target), refused(RefusalStatus::Denied));
     assert!(!keyd_verifies(&world, g(BOB), GOOD), "no password was set");
     assert!(matches!(
-        conn.call(&forward("admin1", &[], meant)),
+        conn.call(&forward("admin1", meant)),
         Got::Reply(Reply::Created { .. })
     ));
     assert_eq!(conn.call(&set_password(g(BOB), GOOD)), changed(&[1], true));
@@ -619,9 +627,10 @@ fn an_auth_bound_to_another_operation_is_refused_through_admind() {
 
 /// docs/51 §7.2, §7.6; A-70, A-73: the AP-REQs reach dird byte for byte as
 /// the client sent them — a forwarded operation's `auth`; for `SetPassword`
-/// the `auth` of `BeginPasswordSet` (approvals included) and the completion
-/// AP-REQ of `CompletePasswordSet` (with no approvals); dird's reply comes
-/// back unchanged; the password never reaches dird.
+/// the `auth` of `BeginPasswordSet` and the completion AP-REQ of
+/// `CompletePasswordSet` (there are no approvals in any `auth` — task D2-c,
+/// docs/questions/Q-882); dird's reply comes back unchanged; the password
+/// never reaches dird.
 #[test]
 fn ap_reqs_reach_dird_unchanged() {
     let created = ipc_dird_admin::Reply::Created {
@@ -638,10 +647,7 @@ fn ap_reqs_reach_dird_unchanged() {
         return;
     };
     let mut conn = world.connect();
-    let sent = Auth {
-        requester: (0..=255u8).cycle().take(3000).collect(),
-        approvals: vec![vec![0xA1; 17], vec![0xA2; 4096]],
-    };
+    let sent = Auth::of((0..=255u8).cycle().take(3000).collect());
     let operation = Operation::CreateGroup {
         parent: g(STAFF_OU),
         sam: "team".into(),
@@ -658,10 +664,7 @@ fn ap_reqs_reach_dird_unchanged() {
             sid: Some(support::sid_of(BOB))
         })
     );
-    let begin_auth = Auth {
-        requester: vec![0xB0; 999],
-        approvals: vec![vec![0xB1; 5]],
-    };
+    let begin_auth = Auth::of(vec![0xB0; 999]);
     let completion = vec![0xC0; 1234];
     let request = Request::SetPassword(SetPassword {
         auth: begin_auth.clone(),
@@ -691,10 +694,7 @@ fn ap_reqs_reach_dird_unchanged() {
                 operation: Operation::BeginPasswordSet { target: g(BOB) }
             },
             ipc_dird_admin::Request::Operation {
-                auth: Auth {
-                    requester: completion,
-                    approvals: vec![]
-                },
+                auth: Auth::of(completion),
                 operation: Operation::CompletePasswordSet {
                     target: g(BOB),
                     outcome: ipc_dird_admin::PasswordSetOutcome::Completed,
@@ -970,7 +970,7 @@ fn a_refused_completion_still_reports_the_password_set() {
     };
     let mut conn = world.connect();
     let request = Request::SetPassword(SetPassword {
-        auth: begin_auth("admin1", &[], g(BOB)),
+        auth: begin_auth("admin1", g(BOB)),
         completion: vec![0x6E, 0x00],
         target: g(BOB),
         password: password(GOOD),
@@ -1008,9 +1008,10 @@ fn dird_events(world: &World, operation: DirAdminOperation) -> Vec<DirAdminEvent
         .collect()
 }
 
-/// One frame of a retired keyadm kind (`0x10` `FetchApproved`, `0x11`
-/// `Complete`, `0x12` `ListPendingDestruction`) with its former payload (an
-/// id; an id and a "performed, kvno 3" outcome; no cursor) — what an
+/// One frame of a retired kind (`0x10` `FetchApproved`, `0x11`
+/// `Complete`, `0x12` `ListPendingDestruction` with their former payload —
+/// an id; an id and a "performed, kvno 3" outcome; no cursor — and task
+/// A10's `0x0E` / `0x0F`, retired by task D2-c, with one octet) — what an
 /// attacker holding admind's channel would forge (test data).
 fn retired_frame(kind: u8) -> Vec<u8> {
     let payload: Vec<u8> = match kind {
@@ -1054,18 +1055,22 @@ fn the_retired_keyadm_requests_never_reach_dird() {
     let mut conn = world.connect();
     let request = forward(
         "admin1",
-        &[],
-        Operation::RequestKeyOperation {
-            operation: KeyOperation::RotateKrbtgt,
+        Operation::Propose {
+            reason_ref: None,
+            operation: Box::new(Operation::KeyOperation(KeyOperation::RotateKrbtgt)),
         },
     );
+    let digest =
+        *ipc_dird_admin::operation_digest(&Operation::KeyOperation(KeyOperation::RotateKrbtgt))
+            .unwrap()
+            .as_bytes();
     assert!(matches!(
         conn.call(&request),
-        Got::Reply(Reply::KeyRequest(state)) if state.operation == KeyOperation::RotateKrbtgt
+        Got::Reply(Reply::PendingRequest(state)) if state.digest == digest
     ));
     assert!(eventually(Duration::from_secs(10), || !dird_events(
         &world,
-        DirAdminOperation::RequestKeyOperation
+        DirAdminOperation::Propose
     )
     .is_empty()));
     for operation in [
@@ -1091,7 +1096,10 @@ fn the_retired_keyadm_requests_never_reach_dird() {
                 }
         })
         .count();
-    assert_eq!(unknown, 3);
+    // keyadm's three and task A10's key-only two (retired by task D2-c,
+    // docs/questions/Q-882).
+    assert_eq!(unknown, ipc_admin::channel::request_kind::RETIRED.len());
+    assert_eq!(unknown, 5);
 }
 
 /// Task F6 (A-94; docs/questions/Q-406 item 3): a frame dropped by the
@@ -1287,7 +1295,7 @@ fn dirds_grant_expires() {
     )
     .unwrap();
     let begin = || ipc_dird_admin::Request::Operation {
-        auth: begin_auth("admin1", &[], g(BOB)),
+        auth: begin_auth("admin1", g(BOB)),
         operation: Operation::BeginPasswordSet { target: g(BOB) },
     };
     assert!(matches!(

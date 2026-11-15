@@ -5,7 +5,9 @@
 //! decode.
 //!
 //! Sources: docs/51 §7.1-§7.3, §7.5; docs/50 §3.3, §9; A-59; A-85 (one
-//! spelling of "never"). Every value is constructed by hand for these
+//! spelling of "never"); docs/questions/Q-882 (A-148: one dual-control
+//! mechanism — the request queue's kinds; the in-request approvals and the
+//! key-only kinds retired). Every value is constructed by hand for these
 //! tests (the SID layout is the [MS-DTYP] 2.4.2.4 example's); no vector
 //! comes from any other implementation.
 
@@ -16,14 +18,16 @@ use ipc::{
 };
 use ipc_dird_admin::channel::{
     request_kind, MAX_AP_REQ, MAX_DESCRIPTION, MAX_DNS_HOST_NAME, MAX_DN_COMPONENT,
-    MAX_DN_COMPONENTS, MAX_NAME, MAX_POLICY_CHANGES, MAX_POLICY_DN_COMPONENTS, MAX_PRINCIPAL_NAME,
+    MAX_DN_COMPONENTS, MAX_FACTS, MAX_LISTED_REQUESTS, MAX_NAME, MAX_POLICY_CHANGES,
+    MAX_POLICY_DN_COMPONENTS, MAX_PRINCIPAL_NAME, MAX_REASON_REF, MAX_SID,
 };
 use ipc_dird_admin::{
     decode_request, encode_reply, AccountExpires, AccountKind, AdminReply, AdminRequest, Auth,
-    Found, KeyOperation, KeyRef, KeyRequestState, KeyTarget, LookupKey, Operation, PasswordSet,
-    PasswordSetOutcome, PolicyChange, PolicyTier, RefusalStatus, Rejection, Reply, Request,
-    ACCOUNT_EXPIRES_NEVER, ADMIN_CHANNEL, ADMIN_MAGIC, ADMIN_VERSION, MAX_REPLY_BODY,
-    MAX_REQUEST_BODY, REPLY_LIMIT, REQUEST_LIMIT,
+    Fact, FactTier, Found, KeyOperation, KeyRef, KeyTarget, ListScope, LookupKey, Operation,
+    PasswordSet, PasswordSetOutcome, PendingRequestState, PolicyChange, PolicyTier, RefusalStatus,
+    Rejection, Reply, Request, RequestShown, RequestState, RequestSummary, ACCOUNT_EXPIRES_NEVER,
+    ADMIN_CHANNEL, ADMIN_MAGIC, ADMIN_VERSION, MAX_REPLY_BODY, MAX_REQUEST_BODY, REPLY_LIMIT,
+    REQUEST_LIMIT,
 };
 use keyd_types::{KeyHandle, KeyPurpose, PrincipalBinding, PrincipalId};
 use krb_proto::constants::{KRB_NT_PRINCIPAL, KRB_NT_SRV_HST};
@@ -42,16 +46,13 @@ fn sid(rid: u32) -> Sid {
     Sid::new(SECURITY_NT_AUTHORITY, &[21, 1, 2, 3, rid]).unwrap()
 }
 
-fn auth(approvals: usize) -> Auth {
-    Auth {
-        requester: vec![0x6E; 300],
-        approvals: (0..approvals).map(|i| vec![0x6E, i as u8, 1, 2]).collect(),
-    }
+fn auth() -> Auth {
+    Auth::of(vec![0x6E; 300])
 }
 
 fn op(operation: Operation) -> Request {
     Request::Operation {
-        auth: auth(1),
+        auth: auth(),
         operation,
     }
 }
@@ -148,37 +149,62 @@ fn requests() -> Vec<Request> {
             "dc=test".into(),
         ]))),
         Request::Operation {
-            auth: auth(0),
+            auth: auth(),
             operation: Operation::Delete { target: guid(10) },
         },
         Request::Operation {
-            auth: auth(2),
+            auth: auth(),
             operation: Operation::Delete { target: guid(11) },
         },
-        // Task A10 (docs/51 §5.6, §6): the key-operation requests.
-        op(Operation::RequestKeyOperation {
-            operation: KeyOperation::RotateKrbtgt,
+        // Task D2-c (docs/questions/Q-882): the request queue — a proposal of
+        // every proposable kind's shape (a directory write, a policy change,
+        // each key operation), with and without a reason; the steps.
+        op(Operation::Propose {
+            reason_ref: Some("CHG-1182".into()),
+            operation: Box::new(Operation::SetEnabled {
+                target: guid(30),
+                enabled: false,
+            }),
         }),
-        op(Operation::RequestKeyOperation {
-            operation: KeyOperation::RotateKey { service: guid(30) },
+        op(Operation::Propose {
+            reason_ref: None,
+            operation: Box::new(Operation::ChangePolicy {
+                changes: vec![PolicyChange::AddPrincipal(sid(1203), PolicyTier::Tier0)],
+            }),
         }),
-        op(Operation::RequestKeyOperation {
-            operation: KeyOperation::RetireKvno {
-                key: KeyRef::Krbtgt,
-                kvno: 7,
-            },
+        op(Operation::Propose {
+            reason_ref: None,
+            operation: Box::new(Operation::KeyOperation(KeyOperation::RotateKrbtgt)),
+        }),
+        op(Operation::Propose {
+            reason_ref: None,
+            operation: Box::new(Operation::KeyOperation(KeyOperation::RotateKey {
+                service: guid(30),
+            })),
+        }),
+        op(Operation::Propose {
+            reason_ref: Some("x".into()),
+            operation: Box::new(Operation::KeyOperation(KeyOperation::RetireKvno {
+                key: KeyRef::Service(guid(31)),
+                kvno: u32::MAX,
+            })),
         }),
         op(Operation::Approve {
             id: u64::MAX,
-            operation: KeyOperation::RetireKvno {
-                key: KeyRef::Service(guid(31)),
-                kvno: u32::MAX,
-            },
+            digest: [0xD1; 32],
         }),
+        op(Operation::Reject {
+            id: 1,
+            digest: [0xD2; 32],
+        }),
+        op(Operation::Withdraw { id: 0x0102_0304 }),
+        op(Operation::ListRequests(ListScope::Mine)),
+        op(Operation::ListRequests(ListScope::AwaitingMe)),
+        op(Operation::ShowRequest { id: 7 }),
         Request::Ping,
         // Task A16: every change of the tier-map edit, and the bound.
         Request::Operation {
-            auth: auth(2),
+            auth: auth(),
             operation: Operation::ChangePolicy {
                 changes: vec![
                     PolicyChange::AddPrincipal(sid(1200), PolicyTier::Tier1),
@@ -262,14 +288,76 @@ fn replies() -> Vec<Reply> {
         Reply::Refused(RefusalStatus::Conflict),
         Reply::Refused(RefusalStatus::Unavailable),
         Reply::Pong,
-        // Task A10.
-        Reply::KeyRequest(KeyRequestState {
+        // Task D2-c (docs/questions/Q-882): the request queue's replies.
+        Reply::PendingRequest(PendingRequestState {
             id: 17,
             digest: [0xD1; 32],
-            operation: KeyOperation::RotateKrbtgt,
+            state: RequestState::Pending,
+            approvals: 0,
+            quorum: 2,
+            expires: 1_794_000_000,
+        }),
+        Reply::PendingRequest(PendingRequestState {
+            id: u64::MAX,
+            digest: [0xD2; 32],
+            state: RequestState::Approved,
             approvals: 1,
             quorum: 2,
+            expires: u64::MAX,
         }),
+        Reply::RequestList(vec![]),
+        Reply::RequestList(vec![RequestSummary {
+            id: 9,
+            digest: [0xD3; 32],
+            state: RequestState::Pending,
+            operation: request_kind::KEY_OPERATION,
+            requester: sid(1104),
+            approvals: 0,
+            quorum: 2,
+            expires: 5,
+        }]),
+        Reply::RequestShown(Box::new(RequestShown {
+            id: 9,
+            digest: [0xD4; 32],
+            state: RequestState::Pending,
+            requester: sid(1104),
+            approvers: vec![],
+            quorum: 2,
+            expires: 5,
+            reason_ref: Some("CHG-1182".into()),
+            operation: Operation::AddMember {
+                group: guid(40),
+                member: guid(41),
+            },
+            facts: vec![
+                Fact {
+                    guid: guid(40),
+                    dn: vec!["cn=T0-Admins".into(), "dc=example".into(), "dc=test".into()],
+                    class: "group".into(),
+                    sid: Some(sid(1105)),
+                    tier: FactTier::Tier0,
+                },
+                Fact {
+                    guid: guid(41),
+                    dn: vec!["cn=alice2".into(), "dc=example".into(), "dc=test".into()],
+                    class: "user".into(),
+                    sid: Some(sid(1107)),
+                    tier: FactTier::Unclassified,
+                },
+            ],
+        })),
+        Reply::RequestShown(Box::new(RequestShown {
+            id: 10,
+            digest: [0xD5; 32],
+            state: RequestState::Approved,
+            requester: sid(1104),
+            approvers: vec![sid(1106)],
+            quorum: 2,
+            expires: 6,
+            reason_ref: None,
+            operation: Operation::KeyOperation(KeyOperation::RotateKrbtgt),
+            facts: vec![],
+        })),
         // Task A16.
         Reply::PolicyNext { version: 2 },
         Reply::PolicyNext { version: u64::MAX },
@@ -330,23 +418,22 @@ fn every_reply_round_trips_canonically() {
     assert_eq!(kinds, all, "every reply kind sampled");
 }
 
-/// Task A10 (docs/51 §5.6, §6; docs/questions/Q-422): the key-operation
-/// layouts, octet for octet, assembled here by hand from the decided
-/// layout — `RequestKeyOperation := auth ‖ KeyOperation`; `Approve := auth ‖
-/// id:u64 ‖ KeyOperation`; `KeyOperation := u8 1 | u8 2 ‖ [16] | u8 3 ‖
-/// KeyRef ‖ u32`; `KeyRef := u8 1 | u8 2 ‖ [16]`. keyadm's requests are
-/// retired (A-102): see [`retired_keyadm_kinds_are_unknown`].
+/// Task D2-c (docs/questions/Q-882 items 1, 6): the request queue's layouts,
+/// octet for octet, assembled here by hand from the decided layout —
+/// `auth := requester:bytes ‖ approvals:seq<_, 0>` (the retired count, 0);
+/// `Propose := auth ‖ reason_ref:Option<bytes<64>> ‖ kind:u8 ‖ fields`;
+/// `Approve := auth ‖ id:u64 ‖ digest:[32]`; `Withdraw := auth ‖ id:u64`;
+/// `ListRequests := auth ‖ scope:u8`; `KeyOperation := u8 1 | u8 2 ‖ [16] |
+/// u8 3 ‖ KeyRef ‖ u32` under the inner kind `0x1D`; and the replies
+/// `PendingRequest := id ‖ digest ‖ state ‖ approvals ‖ quorum ‖
+/// expires:u64`.
 #[test]
-fn key_operation_layouts() {
+fn request_queue_layouts() {
     let auth_octets = |a: &Auth| {
         let mut out = Vec::new();
         out.extend((a.requester.len() as u32).to_be_bytes());
         out.extend(&a.requester);
-        out.extend((a.approvals.len() as u32).to_be_bytes());
-        for approval in &a.approvals {
-            out.extend((approval.len() as u32).to_be_bytes());
-            out.extend(approval);
-        }
+        out.extend(0u32.to_be_bytes()); // the retired approvals: always none
         out
     };
     let envelope = |kind: u8| {
@@ -355,48 +442,183 @@ fn key_operation_layouts() {
         out.push(kind);
         out
     };
-    // RequestKeyOperation(RotateKrbtgt).
-    let request = op(Operation::RequestKeyOperation {
-        operation: KeyOperation::RotateKrbtgt,
+    // Propose(reason "CHG-1", RotateKrbtgt).
+    let request = op(Operation::Propose {
+        reason_ref: Some("CHG-1".into()),
+        operation: Box::new(Operation::KeyOperation(KeyOperation::RotateKrbtgt)),
     });
-    let mut expected = envelope(0x0E);
-    expected.extend(auth_octets(&auth(1)));
-    expected.push(1);
+    let mut expected = envelope(0x17);
+    expected.extend(auth_octets(&auth()));
+    expected.extend([1, 0, 0, 0, 5]);
+    expected.extend(b"CHG-1");
+    expected.extend([0x1D, 1]); // KeyOperation ‖ RotateKrbtgt
     assert_eq!(request_body(&request), expected);
-    // Approve(id 0x0102030405060708, RetireKvno(Service(g), 9)).
-    let request = op(Operation::Approve {
-        id: 0x0102_0304_0506_0708,
-        operation: KeyOperation::RetireKvno {
+    // Propose(no reason, RetireKvno(Service(g), 9)).
+    let request = op(Operation::Propose {
+        reason_ref: None,
+        operation: Box::new(Operation::KeyOperation(KeyOperation::RetireKvno {
             key: KeyRef::Service(guid(40)),
             kvno: 9,
-        },
+        })),
     });
-    let mut expected = envelope(0x0F);
-    expected.extend(auth_octets(&auth(1)));
-    expected.extend([1, 2, 3, 4, 5, 6, 7, 8]);
-    expected.extend([3, 2]);
+    let mut expected = envelope(0x17);
+    expected.extend(auth_octets(&auth()));
+    expected.extend([0, 0x1D, 3, 2]);
     expected.extend(guid(40).to_packet());
     expected.extend(9u32.to_be_bytes());
     assert_eq!(request_body(&request), expected);
-    let mut body = envelope(0x0E);
-    body.extend(auth_octets(&auth(0)));
-    body.push(4); // KeyOperation 4    let mut body = envelope(0x0E);
-    body.extend(auth_octets(&auth(0)));
-    body.push(4); // KeyOperation 4
+    // Propose(Delete(g)): the inner kind is Delete's own (0x0C).
+    let request = op(Operation::Propose {
+        reason_ref: None,
+        operation: Box::new(Operation::Delete { target: guid(41) }),
+    });
+    let mut expected = envelope(0x17);
+    expected.extend(auth_octets(&auth()));
+    expected.extend([0, 0x0C]);
+    expected.extend(guid(41).to_packet());
+    assert_eq!(request_body(&request), expected);
+    // Approve(id 0x0102030405060708, digest).
+    let request = op(Operation::Approve {
+        id: 0x0102_0304_0506_0708,
+        digest: [0xA5; 32],
+    });
+    let mut expected = envelope(0x18);
+    expected.extend(auth_octets(&auth()));
+    expected.extend([1, 2, 3, 4, 5, 6, 7, 8]);
+    expected.extend([0xA5; 32]);
+    assert_eq!(request_body(&request), expected);
+    // Reject has Approve's layout under 0x19; Withdraw / ShowRequest an id.
+    let request = op(Operation::Reject {
+        id: 2,
+        digest: [0x5A; 32],
+    });
+    let mut expected = envelope(0x19);
+    expected.extend(auth_octets(&auth()));
+    expected.extend(2u64.to_be_bytes());
+    expected.extend([0x5A; 32]);
+    assert_eq!(request_body(&request), expected);
+    for (operation, kind) in [
+        (Operation::Withdraw { id: 3 }, 0x1A),
+        (Operation::ShowRequest { id: 3 }, 0x1C),
+    ] {
+        let mut expected = envelope(kind);
+        expected.extend(auth_octets(&auth()));
+        expected.extend(3u64.to_be_bytes());
+        assert_eq!(request_body(&op(operation)), expected);
+    }
+    for (scope, code) in [(ListScope::Mine, 1u8), (ListScope::AwaitingMe, 2)] {
+        let mut expected = envelope(0x1B);
+        expected.extend(auth_octets(&auth()));
+        expected.push(code);
+        assert_eq!(request_body(&op(Operation::ListRequests(scope))), expected);
+    }
+    // PendingRequest.
+    let reply = reply_body(&Reply::PendingRequest(PendingRequestState {
+        id: 0x11,
+        digest: [0xEE; 32],
+        state: RequestState::Approved,
+        approvals: 1,
+        quorum: 2,
+        expires: 0x0203,
+    }));
+    let mut expected = envelope(0x8C);
+    expected.extend(0x11u64.to_be_bytes());
+    expected.extend([0xEE; 32]);
+    expected.extend([2, 1, 2]);
+    expected.extend(0x0203u64.to_be_bytes());
+    assert_eq!(reply, expected);
+    // Strictness: an unknown key-operation tag, key-reference tag, scope
+    // and request state are malformed.
+    let mut body = envelope(0x17);
+    body.extend(auth_octets(&auth()));
+    body.extend([0, 0x1D, 4]); // KeyOperation 4
     assert_eq!(
         decode_request(&body),
         Err(Rejection::Refuse(Refused::Malformed))
     );
-    let mut body = envelope(0x0E);
-    body.extend(auth_octets(&auth(0)));
-    body.extend([3, 3]); // KeyRef 3
+    let mut body = envelope(0x17);
+    body.extend(auth_octets(&auth()));
+    body.extend([0, 0x1D, 3, 3]); // KeyRef 3
     body.extend(1u32.to_be_bytes());
     assert_eq!(
         decode_request(&body),
         Err(Rejection::Refuse(Refused::Malformed))
     );
+    for bad in [0u8, 3, 0xFF] {
+        let mut body = envelope(0x1B);
+        body.extend(auth_octets(&auth()));
+        body.push(bad);
+        assert_eq!(
+            decode_request(&body),
+            Err(Rejection::Refuse(Refused::Malformed)),
+            "scope {bad}"
+        );
+    }
+    let mut bad_state = reply.clone();
+    bad_state[4 + 8 + 32] = 3;
+    assert!(decode_reply::<AdminReply>(ADMIN_CHANNEL, &bad_state).is_err());
 }
 
+/// Task D2-c (docs/questions/Q-882 item 1): only `request_kind::PROPOSABLE`
+/// may be proposed — a `Lookup`, a `CompletePasswordSet`, a queue step or a
+/// `Propose` inside a `Propose` is refused on encoding and malformed on
+/// decoding; the inner key-operation kind alone is no request (it does not
+/// encode, and a frame of it closes).
+#[test]
+fn only_proposable_operations_are_proposed() {
+    let nested = |inner: Operation| {
+        op(Operation::Propose {
+            reason_ref: None,
+            operation: Box::new(inner),
+        })
+    };
+    for inner in [
+        Operation::Lookup(LookupKey::SamAccountName("a".into())),
+        Operation::CompletePasswordSet {
+            target: guid(1),
+            outcome: PasswordSetOutcome::Completed,
+            kvnos: vec![1],
+        },
+        Operation::Approve {
+            id: 1,
+            digest: [0; 32],
+        },
+        Operation::Withdraw { id: 1 },
+        Operation::ListRequests(ListScope::Mine),
+        Operation::ShowRequest { id: 1 },
+        Operation::Propose {
+            reason_ref: None,
+            operation: Box::new(Operation::Delete { target: guid(1) }),
+        },
+    ] {
+        let wire = nested(inner.clone()).to_wire().unwrap();
+        assert!(
+            encode_frame(ADMIN_CHANNEL, Direction::Request, &wire).is_err(),
+            "{inner:?}"
+        );
+    }
+    // Hand-built: a Propose whose inner kind is Lookup's (0x0D), Propose's
+    // (0x17) or Approve's (0x18) — malformed.
+    let delete = request_body(&nested(Operation::Delete { target: guid(2) }));
+    let kind_at = delete.len() - 16 - 1;
+    assert_eq!(delete[kind_at], 0x0C);
+    for bad in [0x0D, 0x07, 0x17, 0x18, 0x1B, 0x14, 0x0E, 0x0F] {
+        let mut body = delete.clone();
+        body[kind_at] = bad;
+        assert_eq!(
+            decode_request(&body),
+            Err(Rejection::Refuse(Refused::Malformed)),
+            "{bad:#x}"
+        );
+    }
+    // The inner key-operation kind on its own: no encoding, a close.
+    let alone = op(Operation::KeyOperation(KeyOperation::RotateKrbtgt));
+    let wire = alone.to_wire().unwrap();
+    assert!(encode_frame(ADMIN_CHANNEL, Direction::Request, &wire).is_err());
+    let mut body = request_body(&Request::Ping);
+    body[3] = request_kind::KEY_OPERATION;
+    assert_eq!(decode_request(&body), Err(Rejection::Close));
+}
 /// A-102 (docs/52 §4.6, §4.8; docs/questions/Q-460): keyadm's
 /// `FetchApproved` / `Complete` / `ListPendingDestruction` (`0x10`–`0x12`)
 /// are retired — they are not in the closed request table, so a frame of
@@ -412,7 +634,7 @@ fn retired_keyadm_kinds_are_unknown() {
         out.push(kind);
         out
     };
-    assert_eq!(request_kind::RETIRED, &[0x10, 0x11, 0x12]);
+    assert_eq!(request_kind::RETIRED, &[0x0E, 0x0F, 0x10, 0x11, 0x12]);
     for kind in request_kind::RETIRED {
         assert!(!request_kind::ALL.contains(kind), "{kind:#x}");
     }
@@ -429,7 +651,7 @@ fn retired_keyadm_kinds_are_unknown() {
         assert_eq!(decode_request(&body), Err(Rejection::Close), "{kind:#x}");
     }
     let replies = ipc_dird_admin::channel::reply_kind::RETIRED;
-    assert_eq!(replies, &[0x89, 0x8A]);
+    assert_eq!(replies, &[0x88, 0x89, 0x8A]);
     for kind in replies {
         assert!(!ipc_dird_admin::channel::reply_kind::ALL.contains(kind));
         let mut body = envelope(*kind);
@@ -438,30 +660,63 @@ fn retired_keyadm_kinds_are_unknown() {
     }
 }
 
-/// docs/51 §7.2: the auth field carries at most two approvals.
+/// Task D2-c (docs/questions/Q-882 item 6, A-148): the in-request approvals
+/// are retired — `Auth` has no field for them, and on the wire the sequence
+/// keeps only its count, always 0: a request that still carries an approval
+/// (the old form, count 1 or 2 and an AP-REQ) is malformed, whatever its
+/// kind, before anything after `auth` is read. The retired key-only kinds
+/// (`0x0E` `RequestKeyOperation`, `0x0F` `Approve {id, operation}`) close the
+/// connection like any unknown kind.
 #[test]
-fn three_approvals_are_refused() {
-    let request = Request::Operation {
-        auth: auth(3),
-        operation: Operation::Delete { target: guid(1) },
-    };
-    let wire = request.to_wire().unwrap();
-    assert!(encode_frame(ADMIN_CHANNEL, Direction::Request, &wire).is_err());
-    // Hand-built: the count octet raised to 3 (one approval of 4 octets
-    // appended).
-    let mut body = request_body(&Request::Operation {
-        auth: auth(2),
+fn in_request_approvals_are_retired() {
+    let body = request_body(&Request::Operation {
+        auth: auth(),
         operation: Operation::Delete { target: guid(1) },
     });
     let count_at = 4 + 4 + 300;
-    assert_eq!(&body[count_at..count_at + 4], &2u32.to_be_bytes());
-    body[count_at..count_at + 4].copy_from_slice(&3u32.to_be_bytes());
-    let insert_at = body.len() - 16;
-    body.splice(insert_at..insert_at, [0, 0, 0, 1, 0x6E]);
+    assert_eq!(&body[count_at..count_at + 4], &0u32.to_be_bytes());
+    for approvals in [1u32, 2, 3] {
+        // The old form: the count, then that many AP-REQs of 4 octets.
+        let mut old = body[..count_at].to_vec();
+        old.extend(approvals.to_be_bytes());
+        for _ in 0..approvals {
+            old.extend([0, 0, 0, 4, 0x6E, 0x6E, 0x6E, 0x6E]);
+        }
+        old.extend(&body[count_at + 4..]);
+        assert_eq!(
+            decode_request(&old),
+            Err(Rejection::Refuse(Refused::Malformed)),
+            "{approvals} approvals"
+        );
+    }
+    // The same for a ChangePolicy, which carried its approvers this way.
+    let policy = request_body(&op(Operation::ChangePolicy {
+        changes: vec![PolicyChange::AddPrincipal(sid(5), PolicyTier::Tier0)],
+    }));
+    let mut old = policy[..count_at].to_vec();
+    old.extend(1u32.to_be_bytes());
+    old.extend([0, 0, 0, 1, 0xBB]);
+    old.extend(&policy[count_at + 4..]);
     assert_eq!(
-        decode_request(&body),
+        decode_request(&old),
         Err(Rejection::Refuse(Refused::Malformed))
     );
+    // The retired key-only kinds: their former layouts close.
+    let envelope = |kind: u8| {
+        let mut out = ADMIN_MAGIC.to_be_bytes().to_vec();
+        out.push(ADMIN_VERSION);
+        out.push(kind);
+        out
+    };
+    for (kind, payload) in [
+        (0x0Eu8, vec![1]),
+        (0x0F, [5u64.to_be_bytes().to_vec(), vec![1]].concat()),
+    ] {
+        let mut frame = envelope(kind);
+        frame.extend(&body[4..count_at + 4]);
+        frame.extend(payload);
+        assert_eq!(decode_request(&frame), Err(Rejection::Close), "{kind:#x}");
+    }
 }
 
 /// The `bytes<max>` bound of `field` in `make(len)`: `max` octets pass,
@@ -481,18 +736,15 @@ fn check_bound(max: u32, make: impl Fn(usize) -> Request) {
 fn every_field_bound() {
     let ascii = |n: usize| "a".repeat(n);
     check_bound(MAX_AP_REQ, |n| Request::Operation {
-        auth: Auth {
-            requester: vec![1; n],
-            approvals: vec![],
-        },
+        auth: Auth::of(vec![1; n]),
         operation: Operation::Delete { target: guid(1) },
     });
-    check_bound(MAX_AP_REQ, |n| Request::Operation {
-        auth: Auth {
-            requester: vec![1],
-            approvals: vec![vec![2; n], vec![3; n]],
-        },
-        operation: Operation::Delete { target: guid(1) },
+    // Task D2-c: the `reason_ref` of a `Propose`.
+    check_bound(MAX_REASON_REF, |n| {
+        op(Operation::Propose {
+            reason_ref: Some(ascii(n)),
+            operation: Box::new(Operation::Delete { target: guid(1) }),
+        })
     });
     check_bound(MAX_NAME, |n| {
         op(Operation::CreateUser {
@@ -562,16 +814,13 @@ fn every_field_bound() {
     });
 }
 
-/// docs/51 §7.5: the largest request (three AP-REQs at their bound and the
+/// docs/51 §7.5: the largest request (the AP-REQ at its bound and the
 /// largest payload) fits 256 KiB; a declared body over 256 KiB is refused at
 /// the length prefix, before any body octet (docs/50 §3.3).
 #[test]
 fn the_body_bounds() {
     let largest = Request::Operation {
-        auth: Auth {
-            requester: vec![1; MAX_AP_REQ as usize],
-            approvals: vec![vec![2; MAX_AP_REQ as usize], vec![3; MAX_AP_REQ as usize]],
-        },
+        auth: Auth::of(vec![1; MAX_AP_REQ as usize]),
         operation: Operation::Lookup(LookupKey::Dn(vec![
             "c".repeat(MAX_DN_COMPONENT as usize);
             MAX_DN_COMPONENTS as usize
@@ -595,11 +844,13 @@ fn the_body_bounds() {
 
 /// docs/50 §3.3 ("kind closed: unknown op ⇒ close"); A-59: an unknown kind,
 /// the unused number between the key-operation requests and `Ping` (`0x13`,
-/// the deferred join token — task A12), and the reserved `REFUSED_KIND`
-/// close the connection without a reply.
+/// the deferred join token — task A12), the inner kind of a proposed key
+/// operation (`0x1D`, never a request of its own — task D2-c), the first
+/// number after the request queue, and the reserved `REFUSED_KIND` close
+/// the connection without a reply.
 #[test]
 fn unknown_kinds_close() {
-    for kind in [0x00, 0x13, 0x15, 0x81, 0x7F, REFUSED_KIND] {
+    for kind in [0x00, 0x13, 0x15, 0x1D, 0x1E, 0x81, 0x7F, REFUSED_KIND] {
         let mut body = request_body(&Request::Ping);
         body[3] = kind;
         assert_eq!(decode_request(&body), Err(Rejection::Close), "{kind:#x}");
@@ -785,10 +1036,7 @@ fn directions_do_not_mix() {
 #[test]
 fn change_policy_layout() {
     let request = Request::Operation {
-        auth: Auth {
-            requester: vec![0xAA],
-            approvals: vec![vec![0xBB]],
-        },
+        auth: Auth::of(vec![0xAA]),
         operation: Operation::ChangePolicy {
             changes: vec![
                 PolicyChange::AddPrincipal(sid(7), PolicyTier::Tier1),
@@ -797,7 +1045,7 @@ fn change_policy_layout() {
         },
     };
     let mut expected = vec![0x44, 0x41, 0x01, 0x16];
-    expected.extend([0, 0, 0, 1, 0xAA, 0, 0, 0, 1, 0, 0, 0, 1, 0xBB]);
+    expected.extend([0, 0, 0, 1, 0xAA, 0, 0, 0, 0]); // requester; no approvals (retired)
     expected.extend([0, 0, 0, 2]);
     let packet = sid(7).encode();
     expected.push(0x01);
@@ -887,5 +1135,96 @@ fn change_policy_bounds_and_codes() {
     assert_eq!(
         decode_request(&body),
         Err(Rejection::Refuse(Refused::Malformed))
+    );
+}
+
+/// Task D2-c (docs/questions/Q-882 item 1; Q-936): the request queue's reply
+/// bounds — at most `MAX_LISTED_REQUESTS` entries and `MAX_FACTS` facts — fit
+/// the 64 KiB reply body at their largest (a `RequestShown` of the largest
+/// proposable operation with two facts of 64-component DNs), and one past
+/// each sequence bound is refused.
+#[test]
+fn request_queue_reply_bounds() {
+    let largest_sid = Sid::new(SECURITY_NT_AUTHORITY, &[u32::MAX; 15]).unwrap();
+    assert_eq!(largest_sid.encode().len(), MAX_SID as usize);
+    let fact = |n: u32| Fact {
+        guid: guid(n),
+        dn: vec!["c".repeat(MAX_DN_COMPONENT as usize); MAX_DN_COMPONENTS as usize],
+        class: "organizationalUnit".into(),
+        sid: Some(largest_sid),
+        tier: FactTier::Tier0,
+    };
+    let largest_create = Operation::CreateUser {
+        parent: guid(1),
+        sam: "a".repeat(MAX_NAME as usize),
+        upn: Some("u".repeat(MAX_PRINCIPAL_NAME as usize)),
+        description: Some("d".repeat(MAX_DESCRIPTION as usize)),
+    };
+    let shown = |facts: Vec<Fact>| {
+        Reply::RequestShown(Box::new(RequestShown {
+            id: u64::MAX,
+            digest: [0xFF; 32],
+            state: RequestState::Approved,
+            requester: largest_sid,
+            approvers: vec![largest_sid; 2],
+            quorum: 3,
+            expires: u64::MAX,
+            reason_ref: Some("r".repeat(MAX_REASON_REF as usize)),
+            operation: largest_create.clone(),
+            facts,
+        }))
+    };
+    let body = reply_body(&shown(vec![fact(1); MAX_FACTS as usize]));
+    assert!(body.len() <= MAX_REPLY_BODY as usize, "{}", body.len());
+    assert!(encode_reply(&shown(vec![fact(1); MAX_FACTS as usize + 1])).is_err());
+    let summary = RequestSummary {
+        id: 1,
+        digest: [1; 32],
+        state: RequestState::Pending,
+        operation: request_kind::DELETE,
+        requester: largest_sid,
+        approvals: 0,
+        quorum: 2,
+        expires: 1,
+    };
+    let list = |n: usize| Reply::RequestList(vec![summary.clone(); n]);
+    let body = reply_body(&list(MAX_LISTED_REQUESTS as usize));
+    assert!(body.len() <= MAX_REPLY_BODY as usize);
+    assert!(encode_reply(&list(MAX_LISTED_REQUESTS as usize + 1)).is_err());
+    // A summary naming a kind that is not proposable has no wire form.
+    let lookup = RequestSummary {
+        operation: request_kind::LOOKUP,
+        ..summary
+    };
+    assert!(encode_reply(&Reply::RequestList(vec![lookup])).is_err());
+}
+
+/// Task D2-c (docs/questions/Q-888): the digest an `Approve` names and a
+/// `Propose`'s fingerprint are the operation digest of the proposed
+/// operation sent on its own — the same function, the same octets: a
+/// proposed `Delete` has the fingerprint of the `Delete` itself, and the
+/// `Propose`'s own digest (what the requester's AP-REQ is bound to) differs
+/// from it and covers the `reason_ref`.
+#[test]
+fn the_fingerprint_is_the_operations_own_digest() {
+    let delete = Operation::Delete { target: guid(7) };
+    let fingerprint = ipc_dird_admin::operation_digest(&delete).unwrap();
+    let propose = |reason: Option<&str>| Operation::Propose {
+        reason_ref: reason.map(str::to_owned),
+        operation: Box::new(delete.clone()),
+    };
+    let a = ipc_dird_admin::operation_digest(&propose(None)).unwrap();
+    let b = ipc_dird_admin::operation_digest(&propose(Some("CHG-1"))).unwrap();
+    assert_ne!(a, fingerprint);
+    assert_ne!(a, b);
+    // A key operation's fingerprint: the inner kind's digest.
+    let rotate = Operation::KeyOperation(KeyOperation::RotateKrbtgt);
+    let retire = Operation::KeyOperation(KeyOperation::RetireKvno {
+        key: KeyRef::Krbtgt,
+        kvno: 2,
+    });
+    assert_ne!(
+        ipc_dird_admin::operation_digest(&rotate).unwrap(),
+        ipc_dird_admin::operation_digest(&retire).unwrap()
     );
 }

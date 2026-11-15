@@ -68,8 +68,10 @@ use crate::record;
 
 /// The transport security of the admin plane's local socket: the bytes
 /// never leave the host's kernel (`encrypted`, `sealed`), and
-/// `channel_bound` exactly when keyd verified every AP-REQ the request
-/// relies on bound to its operation (R2 — `subject::all_bound`).
+/// `channel_bound` exactly when keyd verified the request's AP-REQ bound
+/// to its operation (R2 — `VerifiedTicket::bound_to`; a request carries one
+/// AP-REQ since the in-request approvals were retired, docs/questions/
+/// Q-882).
 /// Spec: docs/51 §5.4 (R51-9); docs/52 §5 item 4; docs/questions/Q-463
 /// (A-102, superseding Q-292 / A-74 option (a)).
 pub(crate) const fn local_ipc_security(channel_bound: bool) -> TransportSec {

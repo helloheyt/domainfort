@@ -18,8 +18,9 @@
 
 use crate::channel::{codes, RefusalStatus, DIGEST_LEN};
 use crate::wire::{
-    AdminReply, AdminRequest, WireAuth, WireKeyOperation, WireKeyRef, WireKeyRequest,
-    WireKeyTarget, WireLookupKey, WireOperation, WirePolicyChange,
+    AdminReply, AdminRequest, WireAuth, WireFact, WireKeyOperation, WireKeyRef, WireKeyTarget,
+    WireLookupKey, WireOperation, WirePendingRequest, WirePolicyChange, WireRequestShown,
+    WireRequestSummary,
 };
 use core::fmt;
 use dtyp::{Guid, Sid};
@@ -52,6 +53,8 @@ pub enum ConversionError {
     NonCanonical,
     /// The reply is valid but answers another request.
     UnexpectedReply,
+    /// A count that does not fit its one-octet field (approvals, quorum).
+    Count,
 }
 
 impl fmt::Display for ConversionError {
@@ -63,13 +66,15 @@ impl fmt::Display for ConversionError {
             ConversionError::PrincipalName => "invalid PrincipalName",
             ConversionError::NonCanonical => "value with a second spelling",
             ConversionError::UnexpectedReply => "reply does not answer the request",
+            ConversionError::Count => "count does not fit its field",
         })
     }
 }
 
 impl std::error::Error for ConversionError {}
 
-/// The authentication field (opaque AP-REQs). Spec: docs/51 §7.2.
+/// The authentication field (the requester's opaque AP-REQ; the in-request
+/// approvals are retired — docs/questions/Q-882 item 6). Spec: docs/51 §7.2.
 pub type Auth = WireAuth;
 
 /// UTF-8 text from wire octets.
@@ -386,24 +391,68 @@ pub enum Operation {
     },
     /// `Lookup {sam | spn | dn}`.
     Lookup(LookupKey),
-    /// `RequestKeyOperation {operation}`.
-    RequestKeyOperation {
-        /// The key operation asked for.
-        operation: KeyOperation,
-    },
-    /// `Approve {id, operation}`.
-    Approve {
-        /// The pending request's id.
-        id: u64,
-        /// The exact operation the approver approves.
-        operation: KeyOperation,
-    },
     /// `ChangePolicy {changes}` (task A16): a tier-map edit under mandatory
     /// dual control, written by dird as `policy.next`.
     ChangePolicy {
         /// The changes, in order.
         changes: Vec<PolicyChange>,
     },
+    /// A proposed key operation — only as the operation of a `Propose` (or
+    /// of a `RequestShown`); never a request of its own (the codec refuses
+    /// to send it alone).
+    /// Spec: docs/51 §6; docs/questions/Q-882.
+    KeyOperation(KeyOperation),
+    /// `Propose {reason_ref?, operation}`: open a pending request for one
+    /// dual-controlled operation (`request_kind::PROPOSABLE`).
+    /// Spec: docs/questions/Q-882 items 1, 4.
+    Propose {
+        /// The requester's change identifier (unverified; the PEP admits
+        /// printable ASCII of 1 to 64 characters).
+        reason_ref: Option<String>,
+        /// The operation the request is for.
+        operation: Box<Operation>,
+    },
+    /// `Approve {id, digest}`.
+    /// Spec: docs/questions/Q-882 item 1.
+    Approve {
+        /// The pending request's id.
+        id: u64,
+        /// The operation digest the approver was shown.
+        digest: [u8; DIGEST_LEN],
+    },
+    /// `Reject {id, digest}`.
+    /// Spec: docs/research/r5-a-admin-model.md §11 MA5.
+    Reject {
+        /// The pending request's id.
+        id: u64,
+        /// The operation digest the rejecting approver was shown.
+        digest: [u8; DIGEST_LEN],
+    },
+    /// `Withdraw {id}`.
+    /// Spec: docs/questions/Q-882 item 1.
+    Withdraw {
+        /// The pending request's id.
+        id: u64,
+    },
+    /// `ListRequests {scope}`.
+    /// Spec: docs/questions/Q-882 item 1; r5-a §11 MA5.
+    ListRequests(ListScope),
+    /// `ShowRequest {id}`.
+    /// Spec: docs/questions/Q-882 item 1; r5-a §11 MA5.
+    ShowRequest {
+        /// The pending request's id.
+        id: u64,
+    },
+}
+
+/// The scope of a `ListRequests`.
+/// Spec: docs/questions/Q-882 item 1 (`List {mine | awaiting_me}`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ListScope {
+    /// The caller's own pending requests.
+    Mine,
+    /// The pending requests the caller may approve and has not approved.
+    AwaitingMe,
 }
 
 impl Operation {
@@ -500,19 +549,39 @@ impl Operation {
                     LookupKey::Dn(dn.iter().map(|c| text(c)).collect::<Result<_, _>>()?)
                 }
             }),
-            WireOperation::RequestKeyOperation { operation } => Operation::RequestKeyOperation {
-                operation: KeyOperation::from_wire(operation),
-            },
-            WireOperation::Approve { id, operation } => Operation::Approve {
-                id: *id,
-                operation: KeyOperation::from_wire(operation),
-            },
             WireOperation::ChangePolicy { changes } => Operation::ChangePolicy {
                 changes: changes
                     .iter()
                     .map(PolicyChange::from_wire)
                     .collect::<Result<_, _>>()?,
             },
+            WireOperation::KeyOperation { operation } => {
+                Operation::KeyOperation(KeyOperation::from_wire(operation))
+            }
+            WireOperation::Propose {
+                reason_ref,
+                operation,
+            } => Operation::Propose {
+                reason_ref: opt_text(reason_ref.as_ref())?,
+                operation: Box::new(Operation::from_wire(operation)?),
+            },
+            WireOperation::Approve { id, digest } => Operation::Approve {
+                id: *id,
+                digest: *digest,
+            },
+            WireOperation::Reject { id, digest } => Operation::Reject {
+                id: *id,
+                digest: *digest,
+            },
+            WireOperation::Withdraw { id } => Operation::Withdraw { id: *id },
+            WireOperation::ListRequests { scope } => {
+                Operation::ListRequests(if *scope == codes::LIST_MINE {
+                    ListScope::Mine
+                } else {
+                    ListScope::AwaitingMe
+                })
+            }
+            WireOperation::ShowRequest { id } => Operation::ShowRequest { id: *id },
         })
     }
 
@@ -610,16 +679,35 @@ impl Operation {
                 }
                 LookupKey::Dn(dn) => WireLookupKey::Dn(dn.iter().map(bytes).collect()),
             }),
-            Operation::RequestKeyOperation { operation } => WireOperation::RequestKeyOperation {
-                operation: operation.to_wire(),
-            },
-            Operation::Approve { id, operation } => WireOperation::Approve {
-                id: *id,
-                operation: operation.to_wire(),
-            },
             Operation::ChangePolicy { changes } => WireOperation::ChangePolicy {
                 changes: changes.iter().map(PolicyChange::to_wire).collect(),
             },
+            Operation::KeyOperation(operation) => WireOperation::KeyOperation {
+                operation: operation.to_wire(),
+            },
+            Operation::Propose {
+                reason_ref,
+                operation,
+            } => WireOperation::Propose {
+                reason_ref: opt(reason_ref),
+                operation: Box::new(operation.to_wire()?),
+            },
+            Operation::Approve { id, digest } => WireOperation::Approve {
+                id: *id,
+                digest: *digest,
+            },
+            Operation::Reject { id, digest } => WireOperation::Reject {
+                id: *id,
+                digest: *digest,
+            },
+            Operation::Withdraw { id } => WireOperation::Withdraw { id: *id },
+            Operation::ListRequests(scope) => WireOperation::ListRequests {
+                scope: match scope {
+                    ListScope::Mine => codes::LIST_MINE,
+                    ListScope::AwaitingMe => codes::LIST_AWAITING_ME,
+                },
+            },
+            Operation::ShowRequest { id } => WireOperation::ShowRequest { id: *id },
         })
     }
 }
@@ -713,29 +801,272 @@ pub struct Found {
     pub sid: Option<Sid>,
 }
 
-/// The pending key-operation request as dird holds it — the answer to
-/// `RequestKeyOperation` and to `Approve`, so the requester and every
-/// approver see the exact operation and its digest.
-/// Spec: docs/51 §5.6, §7.3 (`id / state`); docs/24 §6 (principle).
+/// The state of a pending request. Task D2-c.
+/// Spec: docs/questions/Q-882 items 1-2; crate::channel `codes::REQUEST_*`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RequestState {
+    /// Awaiting approvals.
+    Pending,
+    /// The quorum is reached: a directory or policy operation may be
+    /// executed by its requester (the operation itself, sent again — dird
+    /// re-evaluates everything then); a key operation's decision is
+    /// registered in keyd for keyadm (A-102).
+    Approved,
+}
+
+impl RequestState {
+    /// Code → state (the wire layer admits only the two codes).
+    fn from_code(code: u8) -> RequestState {
+        if code == codes::REQUEST_APPROVED {
+            RequestState::Approved
+        } else {
+            RequestState::Pending
+        }
+    }
+
+    /// State → code.
+    fn code(self) -> u8 {
+        match self {
+            RequestState::Pending => codes::REQUEST_PENDING,
+            RequestState::Approved => codes::REQUEST_APPROVED,
+        }
+    }
+}
+
+/// A pending request's state, as dird answers `Propose` and `Approve`.
+/// Spec: docs/questions/Q-882 item 1 (`{id, digest, quorum, expires}`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KeyRequestState {
-    /// The request's id.
+pub struct PendingRequestState {
+    /// The id (64 bits from dird's CSPRNG).
     pub id: u64,
-    /// The operation digest (docs/questions/Q-420).
+    /// The operation digest of the request's operation — the fingerprint the
+    /// requester saw, the approver compares and the audit trail carries
+    /// (docs/questions/Q-888).
     pub digest: [u8; DIGEST_LEN],
-    /// The operation.
-    pub operation: KeyOperation,
-    /// Approvals recorded so far.
+    /// The state.
+    pub state: RequestState,
+    /// Approvals recorded so far (the requester not counted).
     pub approvals: u8,
     /// The quorum, the requester included (`admin_quorum`, P-22).
     pub quorum: u8,
+    /// The expiry: seconds since 1970-01-01T00:00:00Z.
+    pub expires: u64,
 }
 
-impl KeyRequestState {
-    /// Whether the approvals reach the quorum.
-    #[must_use]
-    pub fn approved(&self) -> bool {
-        u16::from(self.approvals) + 1 >= u16::from(self.quorum)
+impl PendingRequestState {
+    fn from_wire(wire: &WirePendingRequest) -> PendingRequestState {
+        PendingRequestState {
+            id: wire.id,
+            digest: wire.digest,
+            state: RequestState::from_code(wire.state),
+            approvals: wire.approvals,
+            quorum: wire.quorum,
+            expires: wire.expires,
+        }
+    }
+
+    fn to_wire(&self) -> WirePendingRequest {
+        WirePendingRequest {
+            id: self.id,
+            digest: self.digest,
+            state: self.state.code(),
+            approvals: self.approvals,
+            quorum: self.quorum,
+            expires: self.expires,
+        }
+    }
+}
+
+/// One entry of a `ListRequests` answer.
+/// Spec: docs/research/r5-a-admin-model.md §11 MA5.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestSummary {
+    /// The id.
+    pub id: u64,
+    /// The operation digest.
+    pub digest: [u8; DIGEST_LEN],
+    /// The state.
+    pub state: RequestState,
+    /// The kind of the operation (`request_kind::PROPOSABLE`).
+    pub operation: u8,
+    /// The requester's objectSid, as dird verified it.
+    pub requester: Sid,
+    /// Approvals recorded so far.
+    pub approvals: u8,
+    /// The quorum.
+    pub quorum: u8,
+    /// The expiry (seconds since 1970).
+    pub expires: u64,
+}
+
+impl RequestSummary {
+    fn from_wire(wire: &WireRequestSummary) -> Result<RequestSummary, ConversionError> {
+        Ok(RequestSummary {
+            id: wire.id,
+            digest: wire.digest,
+            state: RequestState::from_code(wire.state),
+            operation: wire.operation,
+            requester: sid(&wire.requester)?,
+            approvals: wire.approvals,
+            quorum: wire.quorum,
+            expires: wire.expires,
+        })
+    }
+
+    fn to_wire(&self) -> WireRequestSummary {
+        WireRequestSummary {
+            id: self.id,
+            digest: self.digest,
+            state: self.state.code(),
+            operation: self.operation,
+            requester: self.requester.encode(),
+            approvals: self.approvals,
+            quorum: self.quorum,
+            expires: self.expires,
+        }
+    }
+}
+
+/// The explicit tier of a fact: what the tier map or a structural rule
+/// makes it — or `Unclassified` (Tier0 for writes by A-36, yet needing no
+/// approver: P-22).
+/// Spec: docs/47 §6.3; A-36; P-22; docs/questions/Q-887 item 2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FactTier {
+    /// Explicitly Tier 0.
+    Tier0,
+    /// Tier 1.
+    Tier1,
+    /// Tier 2.
+    Tier2,
+    /// No explicit classification.
+    Unclassified,
+}
+
+impl FactTier {
+    fn from_code(code: u8) -> FactTier {
+        match code {
+            codes::TIER_0 => FactTier::Tier0,
+            codes::TIER_1 => FactTier::Tier1,
+            codes::TIER_2 => FactTier::Tier2,
+            _ => FactTier::Unclassified,
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            FactTier::Tier0 => codes::TIER_0,
+            FactTier::Tier1 => codes::TIER_1,
+            FactTier::Tier2 => codes::TIER_2,
+            FactTier::Unclassified => codes::FACT_UNCLASSIFIED,
+        }
+    }
+}
+
+/// One fact dird resolved for an object a pending operation names.
+/// Spec: docs/questions/Q-882 item 1, Q-887 items 2-3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fact {
+    /// The objectGUID.
+    pub guid: Guid,
+    /// The DN, leaf first.
+    pub dn: Vec<String>,
+    /// The most specific class's lDAPDisplayName.
+    pub class: String,
+    /// The objectSid, if any.
+    pub sid: Option<Sid>,
+    /// The explicit tier.
+    pub tier: FactTier,
+}
+
+impl Fact {
+    fn from_wire(wire: &WireFact) -> Result<Fact, ConversionError> {
+        Ok(Fact {
+            guid: guid(&wire.guid),
+            dn: wire.dn.iter().map(|c| text(c)).collect::<Result<_, _>>()?,
+            class: text(&wire.class)?,
+            sid: wire.sid.as_deref().map(sid).transpose()?,
+            tier: FactTier::from_code(wire.tier),
+        })
+    }
+
+    fn to_wire(&self) -> WireFact {
+        WireFact {
+            guid: self.guid.to_packet(),
+            dn: self.dn.iter().map(|c| c.as_bytes().to_vec()).collect(),
+            class: self.class.as_bytes().to_vec(),
+            sid: self.sid.as_ref().map(Sid::encode),
+            tier: self.tier.code(),
+        }
+    }
+}
+
+/// A pending request as dird holds it — the answer to `ShowRequest`: the
+/// operation from dird's own copy (never requester text), the requester and
+/// approvers dird verified, and the facts dird resolved.
+/// Spec: docs/questions/Q-882 item 1, Q-887 item 3; docs/research/
+/// r5-b-cli.md §7.4.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestShown {
+    /// The id.
+    pub id: u64,
+    /// The operation digest.
+    pub digest: [u8; DIGEST_LEN],
+    /// The state.
+    pub state: RequestState,
+    /// The requester's objectSid.
+    pub requester: Sid,
+    /// The approvers' objectSids, in approval order.
+    pub approvers: Vec<Sid>,
+    /// The quorum.
+    pub quorum: u8,
+    /// The expiry (seconds since 1970).
+    pub expires: u64,
+    /// The requester's change identifier (unverified).
+    pub reason_ref: Option<String>,
+    /// The operation.
+    pub operation: Operation,
+    /// The facts.
+    pub facts: Vec<Fact>,
+}
+
+impl RequestShown {
+    fn from_wire(wire: &WireRequestShown) -> Result<RequestShown, ConversionError> {
+        Ok(RequestShown {
+            id: wire.id,
+            digest: wire.digest,
+            state: RequestState::from_code(wire.state),
+            requester: sid(&wire.requester)?,
+            approvers: wire
+                .approvers
+                .iter()
+                .map(|a| sid(a))
+                .collect::<Result<_, _>>()?,
+            quorum: wire.quorum,
+            expires: wire.expires,
+            reason_ref: opt_text(wire.reason_ref.as_ref())?,
+            operation: Operation::from_wire(&wire.operation)?,
+            facts: wire
+                .facts
+                .iter()
+                .map(Fact::from_wire)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+
+    fn to_wire(&self) -> Result<WireRequestShown, ConversionError> {
+        Ok(WireRequestShown {
+            id: self.id,
+            digest: self.digest,
+            state: self.state.code(),
+            requester: self.requester.encode(),
+            approvers: self.approvers.iter().map(Sid::encode).collect(),
+            quorum: self.quorum,
+            expires: self.expires,
+            reason_ref: self.reason_ref.as_ref().map(|r| r.as_bytes().to_vec()),
+            operation: self.operation.to_wire()?,
+            facts: self.facts.iter().map(Fact::to_wire).collect(),
+        })
     }
 }
 
@@ -759,16 +1090,21 @@ pub enum Reply {
     Refused(RefusalStatus),
     /// `Ping` answered.
     Pong,
-    /// `RequestKeyOperation` / `Approve`. The request's id is also the id
-    /// of the decision dird registers in keyd when an `Approve` completes
-    /// the quorum (A-102, docs/52 §4.3) — what the operator gives keyadm.
-    KeyRequest(KeyRequestState),
     /// `ChangePolicy` written as `policy.next` (task A16): the version root's
     /// activation installs (`provision policy --activate-next`).
     PolicyNext {
         /// The `policy_version` of `policy.next`.
         version: u64,
     },
+    /// `Propose` / `Approve`: the pending request's state. For a key
+    /// operation the request's id is also the id of the decision dird
+    /// registers in keyd when an `Approve` completes the quorum (A-102,
+    /// docs/52 §4.3) — what the operator gives keyadm.
+    PendingRequest(PendingRequestState),
+    /// `ListRequests`: the requests in the scope.
+    RequestList(Vec<RequestSummary>),
+    /// `ShowRequest`: the request as dird holds it.
+    RequestShown(Box<RequestShown>),
 }
 
 impl Reply {
@@ -806,14 +1142,19 @@ impl Reply {
             }),
             AdminReply::Refused(status) => Reply::Refused(*status),
             AdminReply::Pong => Reply::Pong,
-            AdminReply::KeyRequest(request) => Reply::KeyRequest(KeyRequestState {
-                id: request.id,
-                digest: request.digest,
-                operation: KeyOperation::from_wire(&request.operation),
-                approvals: request.approvals,
-                quorum: request.quorum,
-            }),
             AdminReply::PolicyNext { version } => Reply::PolicyNext { version: *version },
+            AdminReply::PendingRequest(request) => {
+                Reply::PendingRequest(PendingRequestState::from_wire(request))
+            }
+            AdminReply::RequestList { entries } => Reply::RequestList(
+                entries
+                    .iter()
+                    .map(RequestSummary::from_wire)
+                    .collect::<Result<_, _>>()?,
+            ),
+            AdminReply::RequestShown(shown) => {
+                Reply::RequestShown(Box::new(RequestShown::from_wire(shown)?))
+            }
         })
     }
 
@@ -849,14 +1190,12 @@ impl Reply {
             },
             Reply::Refused(status) => AdminReply::Refused(*status),
             Reply::Pong => AdminReply::Pong,
-            Reply::KeyRequest(request) => AdminReply::KeyRequest(WireKeyRequest {
-                id: request.id,
-                digest: request.digest,
-                operation: request.operation.to_wire(),
-                approvals: request.approvals,
-                quorum: request.quorum,
-            }),
             Reply::PolicyNext { version } => AdminReply::PolicyNext { version: *version },
+            Reply::PendingRequest(request) => AdminReply::PendingRequest(request.to_wire()),
+            Reply::RequestList(entries) => AdminReply::RequestList {
+                entries: entries.iter().map(RequestSummary::to_wire).collect(),
+            },
+            Reply::RequestShown(shown) => AdminReply::RequestShown(Box::new(shown.to_wire()?)),
         })
     }
 }

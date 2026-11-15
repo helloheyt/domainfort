@@ -32,8 +32,19 @@
 //! requests (docs/51 §7.6): the client binds its `auth` AP-REQs to
 //! `BeginPasswordSet {target}` and its `completion` AP-REQ to
 //! `CompletePasswordSet {target, …}`; the password is in neither (dird
-//! never sees it). An `Approve` binds `(kind, id, operation)` — the exact
-//! approval (docs/questions/Q-420 item 3).
+//! never sees it). An `Approve` binds `(kind, id, digest)` — the exact
+//! approval of the pending request `id` whose operation digest the approver
+//! was shown (docs/questions/Q-420 item 3, Q-882 item 1); a `Propose` binds
+//! its `reason_ref` and its whole operation (kind and fields).
+//!
+//! # The fingerprint of an operation (docs/questions/Q-882, Q-888)
+//!
+//! The digest of an operation *as sent on its own* — for a proposed key
+//! operation, of `KEY_OPERATION ‖ KeyOperation` — is the operation's
+//! fingerprint: the value a pending request holds and shows, the value an
+//! `Approve` names, the value the requester's AP-REQ is bound to when the
+//! approved operation is executed, and the value every audit event of it
+//! carries. One function computes it on both sides of the channel.
 //!
 //! The client puts `get_mic(session key, usage 10, digest)` of the session
 //! key's required checksum type into the Authenticator; dird computes the

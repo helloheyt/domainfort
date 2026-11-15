@@ -91,10 +91,7 @@ fn client(script: &Rc<RefCell<Script>>) -> AdminClient<ScriptConnector> {
 
 fn lookup() -> Request {
     Request::Operation {
-        auth: Auth {
-            requester: vec![1, 2, 3],
-            approvals: vec![],
-        },
+        auth: Auth::of(vec![1, 2, 3]),
         operation: Operation::Lookup(LookupKey::SamAccountName("carol".into())),
     }
 }

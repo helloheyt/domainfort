@@ -5,16 +5,23 @@
 //! # Where the numbers come from
 //!
 //! * **Request direction: 256 KiB.** Every operation carries the
-//!   authentication field `auth := requester ‖ approvals` — up to three raw
-//!   AP-REQs of at most 64 KiB each (`ipc_keyd::MAX_REQUEST_FIELD`, because
-//!   dird hands them to keyd exactly as they arrived) — and a payload of at
-//!   most 16 KiB (names ≤ 3 KiB per docs/46 §5.4, as docs/51 §7.5 states).
-//!   docs/51 §7.5: "request ≤ 256 KiB (three AP-REQs of 64 KiB + payload
-//!   ≤ 16 KiB …); const assert against `ipc_keyd::MAX_REQUEST_FIELD`".
-//! * **Reply direction: 16 KiB.** The largest reply is a `BeginPasswordSet`
-//!   answer (two key targets with their bindings and the salt) or a `Lookup`
-//!   answer (a DN of at most 64 components) — both under 10 KiB, checked at
-//!   compile time below. docs/51 §7.5: "reply ≤ 16 KiB".
+//!   authentication field `auth := requester ‖ approvals` — the requester's
+//!   raw AP-REQ of at most 64 KiB (`ipc_keyd::MAX_REQUEST_FIELD`, because
+//!   dird hands it to keyd exactly as it arrived) and the **retired**
+//!   approvals sequence, always empty (docs/questions/Q-882, A-148: every
+//!   approval is a step on a pending request held in dird — `Approve` —
+//!   never an AP-REQ inside another request) — and a payload of at most
+//!   16 KiB (names ≤ 3 KiB per docs/46 §5.4, as docs/51 §7.5 states).
+//!   docs/51 §7.5: "request ≤ 256 KiB (… payload ≤ 16 KiB …); const assert
+//!   against `ipc_keyd::MAX_REQUEST_FIELD`". The 256 KiB bound is kept
+//!   (it now holds one AP-REQ, not three).
+//! * **Reply direction: 64 KiB.** The largest reply is a `ShowRequest`
+//!   answer (`RequestShown`): the pending request's operation as dird holds
+//!   it (≤ 16 KiB of fields) and the facts dird resolved for the objects it
+//!   names (two DNs of at most 64 components each, ≈ 8.4 KiB each) — about
+//!   34 KiB, checked at compile time below. docs/51 §7.5 set "reply ≤
+//!   16 KiB" before the request queue existed; raised to 64 KiB by task
+//!   D2-c (docs/questions/Q-936; project choice).
 //! * **Field bounds** are octet bounds that only bound allocation; the write
 //!   PEP (crates/directory-admin) applies the semantic rules (characters,
 //!   forms, lengths in characters) and records a refusal in the audit trail.
@@ -44,8 +51,11 @@ pub const ADMIN_VERSION: u8 = 1;
 /// Request body bound: 256 KiB. Spec: docs/51 §7.5.
 pub const MAX_REQUEST_BODY: u32 = 256 * 1024;
 
-/// Reply body bound: 16 KiB. Spec: docs/51 §7.5.
-pub const MAX_REPLY_BODY: u32 = 16 * 1024;
+/// Reply body bound: 64 KiB (module notes: a `RequestShown` reaches about
+/// 34 KiB). Project choice.
+/// Spec: docs/51 §7.5 (16 KiB before the request queue); docs/questions/
+/// Q-936 (raised for `ShowRequest`, Q-882).
+pub const MAX_REPLY_BODY: u32 = 64 * 1024;
 
 /// The request direction's [`FrameLimit`]; a bound outside ipc's range stops
 /// the build here (const evaluation), never at run time.
@@ -68,17 +78,51 @@ pub const ADMIN_CHANNEL: Channel =
 
 // ---- field bounds ----------------------------------------------------------
 
-/// Bound of one raw AP-REQ (the requester's or an approver's): 64 KiB, the
-/// keyd channel's per-field request bound, because dird forwards it to keyd
+/// Bound of one raw AP-REQ (the requester's): 64 KiB, the keyd channel's
+/// per-field request bound, because dird forwards it to keyd
 /// `open_and_verify_service_ticket` exactly as received.
 /// Spec: docs/51 §7.2 (`requester: bytes<64 KiB>`; "64 KiB =
 /// `ipc_keyd::MAX_REQUEST_FIELD`, because dird passes them to keyd as they
 /// are").
 pub const MAX_AP_REQ: u32 = 64 * 1024;
 
-/// Most approvals one request carries. Spec: docs/51 §7.2 (`approvals:
-/// seq<bytes<64 KiB>, 2>`).
-pub const MAX_APPROVALS: u32 = 2;
+/// The bound of `auth`'s **retired** approvals sequence: zero. The sequence
+/// keeps its place on the wire (its count, always 0 — so every other field
+/// of every kind keeps its layout), and a sequence with any element is
+/// refused by the codec (`ipc::Error::CountOverBound`): the in-request
+/// approvals form of dual control has no code path (AGENTS.md §6 "insecure
+/// options have no code path"; docs/52 C14 — one mechanism). Every approval
+/// is an `Approve` of a pending request dird holds.
+/// Spec: docs/questions/Q-882 item 6 (A-148: "remove `auth.approvals` from
+/// the wire"); docs/research/r5-b-cli.md §7.1-§7.2; docs/questions/Q-935.
+pub const RETIRED_APPROVALS: u32 = 0;
+
+/// Bound of a pending request's `reason_ref` (octets): 64 — "printable
+/// ASCII ≤ 64, a change identifier" (the PEP checks the characters).
+/// Spec: docs/questions/Q-882 item 4; docs/research/r5-b-cli.md §7.2.
+pub const MAX_REASON_REF: u32 = 64;
+
+/// Most pending requests one `ListRequests` answer carries: dird's whole
+/// table (crate directory-admin `MAX_PENDING_REQUESTS`, pinned in
+/// crates/directory-daemon, which links both).
+/// Spec: docs/research/r5-a-admin-model.md §11 MA5 (`ListRequests`);
+/// docs/questions/Q-937.
+pub const MAX_LISTED_REQUESTS: u32 = 32;
+
+/// Most approvers a `ShowRequest` answer names: the quorum's largest number
+/// of approvers besides the requester (crate directory-admin `MAX_QUORUM`
+/// − 1, pinned in crates/directory-daemon).
+/// Spec: docs/51 §5.6 (P-22 — the requester plus one other); docs/questions/
+/// Q-882 item 1 (`Show {id}` ⇒ "… the approvals").
+pub const MAX_SHOWN_APPROVERS: u32 = 2;
+
+/// Most facts a `ShowRequest` answer carries: one per object the pending
+/// operation names — at most two (a membership change names the group and
+/// the member; a create of a security principal reads its parent and the
+/// naming-context root).
+/// Spec: docs/questions/Q-882 item 1 ("facts dird resolved for every GUID
+/// in the operation"), Q-887 item 3 (the same structure).
+pub const MAX_FACTS: u32 = 2;
 
 /// Bound of the payload after `auth`: 16 KiB. Spec: docs/51 §7.5 ("payload
 /// ≤ 16 KiB: names ≤ 3 KiB according to docs/46 §5.4").
@@ -153,10 +197,9 @@ pub const MAX_SALT: u32 = 1024;
 /// `organizationalUnit`).
 pub const MAX_CLASS_NAME: u32 = 64;
 
-/// Octets of a key-operation request's digest: a SHA-256 output.
-/// Spec: docs/51 §5.6 ("the operation digest"); FIPS 180-4 (SHA-256, as
-/// computed by the approved RustCrypto `sha2` in dird); docs/questions/
-/// Q-420.
+/// Octets of an operation digest: a SHA-256 output (crate::digest).
+/// Spec: docs/52 §5 item 1; FIPS 180-4 (SHA-256, as computed by the
+/// approved RustCrypto `sha2`); docs/questions/Q-882 item 1.
 pub const DIGEST_LEN: usize = 32;
 
 /// Most tier-map changes one `ChangePolicy` request carries: four — every
@@ -176,9 +219,9 @@ pub const MAX_POLICY_CHANGES: u32 = 4;
 /// Spec: docs/51 §7.5 ("payload ≤ 16 KiB").
 pub const MAX_POLICY_DN_COMPONENTS: u32 = 16;
 
-/// Body octets of the `auth` field at its largest.
-pub const MAX_AUTH: usize =
-    4 + MAX_AP_REQ as usize + 4 + MAX_APPROVALS as usize * (4 + MAX_AP_REQ as usize);
+/// Body octets of the `auth` field at its largest: the requester's AP-REQ
+/// and the (always empty) retired approvals count.
+pub const MAX_AUTH: usize = 4 + MAX_AP_REQ as usize + 4;
 
 /// The envelope: magic, version, kind.
 const ENVELOPE: usize = 4;
@@ -207,10 +250,39 @@ const FOUND: usize = ENVELOPE
 
 /// The largest `KeyOperation`: tag, key-reference tag, objectGUID, kvno.
 const KEY_OPERATION_SIZE: usize = 1 + 1 + 16 + 4;
-/// Payload octets of the largest `Approve` after `auth`.
-const APPROVE_SIZE: usize = 8 + KEY_OPERATION_SIZE;
-/// Body octets of the largest key-request replies.
-const KEY_REQUEST_SIZE: usize = ENVELOPE + 8 + DIGEST_LEN + KEY_OPERATION_SIZE + 1 + 1;
+/// Payload octets of an `Approve` / `Reject` after `auth`: id and digest.
+const APPROVE_SIZE: usize = 8 + DIGEST_LEN;
+/// Body octets of a `PendingRequest` reply.
+const PENDING_REQUEST_SIZE: usize = ENVELOPE + 8 + DIGEST_LEN + 1 + 1 + 1 + 8;
+/// One `RequestSummary` of a `RequestList`.
+const REQUEST_SUMMARY_SIZE: usize = 8 + DIGEST_LEN + 1 + 1 + (4 + MAX_SID as usize) + 1 + 1 + 8;
+/// Body octets of the largest `RequestList`.
+const REQUEST_LIST_SIZE: usize = ENVELOPE + 4 + MAX_LISTED_REQUESTS as usize * REQUEST_SUMMARY_SIZE;
+/// One `Fact` of a `RequestShown`: GUID, DN, class, SID, tier.
+const FACT_SIZE: usize = 16
+    + (4 + MAX_DN_COMPONENTS as usize * (4 + MAX_DN_COMPONENT as usize))
+    + (4 + MAX_CLASS_NAME as usize)
+    + (1 + 4 + MAX_SID as usize)
+    + 1;
+/// Body octets of the largest `RequestShown`: the header, the requester and
+/// approvers, the reason, the operation (its kind and at most the payload
+/// bound of fields) and the facts.
+const REQUEST_SHOWN_SIZE: usize = ENVELOPE
+    + 8
+    + DIGEST_LEN
+    + 1
+    + (4 + MAX_SID as usize)
+    + (4 + MAX_SHOWN_APPROVERS as usize * (4 + MAX_SID as usize))
+    + 1
+    + 8
+    + (1 + 4 + MAX_REASON_REF as usize)
+    + (1 + MAX_PAYLOAD)
+    + (4 + MAX_FACTS as usize * FACT_SIZE);
+/// Payload octets of the largest `Propose` after `auth`: the reason and the
+/// largest proposable operation (a `ChangePolicy`, bounded below; a
+/// `CreateUser`).
+const PROPOSE_SIZE: usize = (1 + 4 + MAX_REASON_REF as usize) + 1 + CHANGE_POLICY_SIZE;
+const PROPOSE_CREATE_SIZE: usize = (1 + 4 + MAX_REASON_REF as usize) + 1 + CREATE_USER;
 
 /// The largest tier-map change: its tag, then a SID and a tier, or a DN of
 /// [`MAX_POLICY_DN_COMPONENTS`] components and a tier (task A16).
@@ -225,7 +297,12 @@ const POLICY_NEXT_SIZE: usize = ENVELOPE + 8;
 // The bounds agree with the values they are derived from and fit the body
 // bounds; checked at compile time, never at run time.
 const _: () = assert!(APPROVE_SIZE <= MAX_PAYLOAD);
-const _: () = assert!(KEY_REQUEST_SIZE <= MAX_REPLY_BODY as usize);
+const _: () = assert!(KEY_OPERATION_SIZE <= MAX_PAYLOAD);
+const _: () = assert!(PROPOSE_SIZE <= MAX_PAYLOAD);
+const _: () = assert!(PROPOSE_CREATE_SIZE <= MAX_PAYLOAD);
+const _: () = assert!(PENDING_REQUEST_SIZE <= MAX_REPLY_BODY as usize);
+const _: () = assert!(REQUEST_LIST_SIZE <= MAX_REPLY_BODY as usize);
+const _: () = assert!(REQUEST_SHOWN_SIZE <= MAX_REPLY_BODY as usize);
 const _: () = assert!(MAX_AP_REQ == ipc_keyd::channel::MAX_REQUEST_FIELD);
 const _: () = assert!(MAX_SALT <= ipc_keyd::channel::MAX_SALT);
 const _: () = assert!(MAX_REALM <= ipc_keyd::channel::MAX_REQUEST_FIELD);
@@ -250,13 +327,17 @@ const _: () = assert!(MAX_POLICY_DN_COMPONENTS <= MAX_DN_COMPONENTS);
 /// `RequestKeyOperation`, `Approve`, and keyadm's `FetchApproved`,
 /// `Complete`, `ListPendingDestruction`. **`0x10`, `0x11`, `0x12` are
 /// retired by A-102 and never reused** (docs/52 §4.6, §4.8;
-/// docs/questions/Q-460: keyadm talks to keyd only and executes the
-/// decisions dird registered in keyd — no channel carries an "approved"
-/// operation or a tombstone list to keyadm any more). `0x13` (the table's
-/// `IssueJoinToken`, task A12 — deferred, A-78) stays unused. Values are a
-/// project choice.
+/// docs/questions/Q-460). **`0x0E` (`RequestKeyOperation`) and `0x0F` (the
+/// key-only `Approve {id, operation}`) are retired by task D2-c and never
+/// reused** (docs/questions/Q-882, A-148: one dual-control mechanism — a
+/// key operation is proposed with `Propose` like every other dual-controlled
+/// operation, and approved with the one `Approve {id, digest}`). `0x13` (the
+/// table's `IssueJoinToken`, task A12 — deferred, A-78) stays unused; `0x15`
+/// is admin.sock's `SetPassword`. The request queue (task D2-c,
+/// docs/questions/Q-882, docs/research/r5-a-admin-model.md §11 MA5) is
+/// appended from `0x17`. Values are a project choice.
 /// Spec: docs/51 §7.3; docs/50 §3.3 ("`kind` closed"), §7.5 (`Ping`);
-/// docs/questions/Q-389 item 1 (A-91), Q-422, Q-460 (A-102).
+/// docs/questions/Q-389 item 1 (A-91), Q-422, Q-460 (A-102), Q-882, Q-935.
 pub mod request_kind {
     /// `CreateUser`. Spec: docs/51 §7.3; §5.2 row 1.
     pub const CREATE_USER: u8 = 0x01;
@@ -284,32 +365,89 @@ pub mod request_kind {
     pub const DELETE: u8 = 0x0C;
     /// `Lookup`. Spec: docs/51 §7.3; §5.2 row 10.
     pub const LOOKUP: u8 = 0x0D;
-    /// `RequestKeyOperation {operation}`: a requester opens a pending
-    /// key-operation request. Spec: docs/51 §5.2 row 11, §5.6, §6, §7.3.
-    pub const REQUEST_KEY_OPERATION: u8 = 0x0E;
-    /// `Approve {id, operation}`: an approver approves the exact operation
-    /// of a pending request. Spec: docs/51 §5.6, §6, §7.3.
-    pub const APPROVE: u8 = 0x0F;
+    // 0x0E (`RequestKeyOperation`) and 0x0F (`Approve {id, operation}`):
+    // retired by task D2-c, never reused (docs/questions/Q-882, Q-935).
     // 0x10 (`FetchApproved`), 0x11 (`Complete`), 0x12
     // (`ListPendingDestruction`): retired by A-102, never reused (docs/52
     // §4.6; docs/questions/Q-460).
     /// `Ping`: the health check, no `auth`. Spec: docs/51 §7.3; docs/50 §7.5.
     pub const PING: u8 = 0x14;
     /// `ChangePolicy {changes}` (appended by task A16): a tier-map edit
-    /// under mandatory dual control — the requester's AP-REQ and the
-    /// approvers' in `auth`, every one bound to this request's digest —
+    /// under mandatory dual control — executed by its requester once a
+    /// pending request for exactly these changes is approved (Q-882) —
     /// which dird writes as `policy.next` (version + 1) for root to
     /// activate. `0x15` is admin.sock's `SetPassword` (the two channels
     /// share the forwarded kinds' numbers), so this kind is `0x16`.
     /// Spec: docs/51 §5.2 row 13, §5.6, §5.10 (R51-21); A-80;
-    /// docs/questions/Q-592.
+    /// docs/questions/Q-592, Q-882.
     pub const CHANGE_POLICY: u8 = 0x16;
+    /// `Propose {reason_ref?, operation}`: the requester opens a pending
+    /// request for one dual-controlled operation — dird holds its exact
+    /// fields and its operation digest (task D2-c).
+    /// Spec: docs/questions/Q-882 item 1 (`Propose`); docs/research/
+    /// r5-b-cli.md §7.2.
+    pub const PROPOSE: u8 = 0x17;
+    /// `Approve {id, digest}`: an approver approves the pending request
+    /// `id`, naming the operation digest it was shown.
+    /// Spec: docs/questions/Q-882 item 1 (`Approve {id, digest}`); docs/51
+    /// §5.6.
+    pub const APPROVE: u8 = 0x18;
+    /// `Reject {id, digest}`: an eligible approver ends a pending request.
+    /// Spec: docs/research/r5-a-admin-model.md §5, §11 MA5 (`Reject`).
+    pub const REJECT: u8 = 0x19;
+    /// `Withdraw {id}`: the requester ends its own pending request.
+    /// Spec: docs/questions/Q-882 item 1 (`Withdraw {id}`); r5-a §11 MA5.
+    pub const WITHDRAW: u8 = 0x1A;
+    /// `ListRequests {scope}`: the caller's own pending requests, or those
+    /// awaiting its approval.
+    /// Spec: docs/questions/Q-882 item 1 (`List {mine | awaiting_me}`);
+    /// r5-a §5, §11 MA5 (`ListRequests`).
+    pub const LIST_REQUESTS: u8 = 0x1B;
+    /// `ShowRequest {id}`: the pending request as dird holds it — its
+    /// operation from dird's own fields, never from requester text — and
+    /// the facts dird resolved.
+    /// Spec: docs/questions/Q-882 item 1 (`Show {id}`); r5-a §5, §11 MA5;
+    /// docs/research/r5-b-cli.md §7.4.
+    pub const SHOW_REQUEST: u8 = 0x1C;
+    /// The kind of a **proposed key operation** — `RotateKrbtgt`,
+    /// `RotateKey`, `RetireKvno` (docs/51 §6) — inside a `Propose` only:
+    /// it names the operation in the digest (crate::digest) and in a
+    /// `RequestShown`. Never a request of its own: not in [`ALL`], so a
+    /// frame of this kind is refused like an unknown kind (a key operation
+    /// is executed by keyadm in keyd, from the decision dird registers —
+    /// A-102).
+    /// Spec: docs/51 §6; docs/questions/Q-882 item 2; docs/52 §4.3.
+    pub const KEY_OPERATION: u8 = 0x1D;
 
-    /// The kinds retired by A-102 — keyadm's `FetchApproved`, `Complete`,
-    /// `ListPendingDestruction` — kept only so that tests can show the
-    /// closed table refuses them; never in [`ALL`], never reused.
-    /// Spec: docs/52 §4.6; docs/questions/Q-460 (A-102).
-    pub const RETIRED: &[u8] = &[0x10, 0x11, 0x12];
+    /// The kinds retired by A-102 (keyadm's `FetchApproved`, `Complete`,
+    /// `ListPendingDestruction`) and by task D2-c (`RequestKeyOperation`,
+    /// the key-only `Approve`) — kept only so that tests can show the closed
+    /// table refuses them; never in [`ALL`], never reused.
+    /// Spec: docs/52 §4.6; docs/questions/Q-460 (A-102), Q-882, Q-935.
+    pub const RETIRED: &[u8] = &[0x0E, 0x0F, 0x10, 0x11, 0x12];
+
+    /// The operations a `Propose` may carry: the dual-controlled ones
+    /// (docs/51 §5.6, P-22 — the writes whose rule can require an approver,
+    /// the policy change and the key operations). `Lookup` and
+    /// `CompletePasswordSet` never need an approver and are not proposable;
+    /// neither is any request-queue kind.
+    /// Spec: docs/51 §5.2, §5.6, §6; docs/questions/Q-882 item 1 ("every
+    /// dual-controlled operation, by P-22's list").
+    pub const PROPOSABLE: &[u8] = &[
+        CREATE_USER,
+        CREATE_COMPUTER,
+        CREATE_GROUP,
+        CREATE_OU,
+        CREATE_CONTAINER,
+        BEGIN_PASSWORD_SET,
+        SET_ENABLED,
+        SET_ACCOUNT_EXPIRES,
+        ADD_MEMBER,
+        REMOVE_MEMBER,
+        DELETE,
+        CHANGE_POLICY,
+        KEY_OPERATION,
+    ];
 
     /// The closed request table. Spec: docs/51 §7.3; docs/50 §3.3.
     pub const ALL: &[u8] = &[
@@ -326,10 +464,14 @@ pub mod request_kind {
         REMOVE_MEMBER,
         DELETE,
         LOOKUP,
-        REQUEST_KEY_OPERATION,
-        APPROVE,
         PING,
         CHANGE_POLICY,
+        PROPOSE,
+        APPROVE,
+        REJECT,
+        WITHDRAW,
+        LIST_REQUESTS,
+        SHOW_REQUEST,
     ];
 }
 
@@ -342,7 +484,7 @@ pub mod reply_kind {
     /// `PasswordSet { kind, keys, salt }`. Spec: docs/51 §7.3
     /// (`BeginPasswordSet`).
     pub const PASSWORD_SET: u8 = 0x82;
-    /// `Done`: the `()` of docs/51 §7.3.
+    /// `Done`: the `()` of docs/51 §7.3 (and of `Reject` / `Withdraw`).
     pub const DONE: u8 = 0x83;
     /// `Found { guid, dn, class, sid? }`. Spec: docs/51 §7.3 (`Lookup`).
     pub const FOUND: u8 = 0x84;
@@ -351,12 +493,9 @@ pub mod reply_kind {
     pub const REFUSED: u8 = 0x85;
     /// `Pong`: the reply to `Ping`. Spec: docs/50 §7.5.
     pub const PONG: u8 = 0x86;
-    /// `KeyRequest { id, digest, operation, approvals, quorum }`: the
-    /// pending request as dird holds it, shown back to the requester and to
-    /// every approver. (`0x87` is admin.sock's `PasswordChanged`, never
-    /// dird's — the two channels share their common reply numbers.)
-    /// Spec: docs/51 §5.6, §7.3 (`id / state`); docs/questions/Q-422.
-    pub const KEY_REQUEST: u8 = 0x88;
+    // 0x87 is admin.sock's `PasswordChanged`, never dird's (the two channels
+    // share their common reply numbers). 0x88 (`KeyRequest`): retired by
+    // task D2-c with its requests, never reused (docs/questions/Q-882).
     // 0x89 (`Approved`) and 0x8A (`PendingDestruction`): keyadm's replies,
     // retired by A-102, never reused (docs/52 §4.6; docs/questions/Q-460).
     /// `PolicyNext { version }` (appended by task A16): the answer to a
@@ -364,10 +503,21 @@ pub mod reply_kind {
     /// activation will install.
     /// Spec: docs/51 §5.10; docs/questions/Q-592.
     pub const POLICY_NEXT: u8 = 0x8B;
+    /// `PendingRequest { id, digest, state, approvals, quorum, expires }`:
+    /// the answer to `Propose` and `Approve` (task D2-c).
+    /// Spec: docs/questions/Q-882 item 1 (`{id, digest, quorum, expires}`).
+    pub const PENDING_REQUEST: u8 = 0x8C;
+    /// `RequestList { entries }`: the answer to `ListRequests`.
+    /// Spec: r5-a §11 MA5; docs/questions/Q-882 item 1.
+    pub const REQUEST_LIST: u8 = 0x8D;
+    /// `RequestShown { … }`: the answer to `ShowRequest`.
+    /// Spec: docs/questions/Q-882 item 1, Q-887 item 3; r5-b §7.4.
+    pub const REQUEST_SHOWN: u8 = 0x8E;
 
-    /// The reply kinds retired by A-102; never in [`ALL`], never reused.
-    /// Spec: docs/52 §4.6; docs/questions/Q-460 (A-102).
-    pub const RETIRED: &[u8] = &[0x89, 0x8A];
+    /// The reply kinds retired by A-102 and by task D2-c; never in [`ALL`],
+    /// never reused.
+    /// Spec: docs/52 §4.6; docs/questions/Q-460 (A-102), Q-882, Q-935.
+    pub const RETIRED: &[u8] = &[0x88, 0x89, 0x8A];
 
     /// The closed reply table (without the reserved `REFUSED_KIND`).
     /// Spec: docs/51 §7.3; docs/50 §3.3; A-59.
@@ -378,8 +528,10 @@ pub mod reply_kind {
         FOUND,
         REFUSED,
         PONG,
-        KEY_REQUEST,
         POLICY_NEXT,
+        PENDING_REQUEST,
+        REQUEST_LIST,
+        REQUEST_SHOWN,
     ];
 }
 
@@ -399,11 +551,48 @@ const fn all_distinct(kinds: &[u8]) -> bool {
     true
 }
 
+/// Whether no value of `a` is in `b`. Compile-time helper.
+const fn disjoint(a: &[u8], b: &[u8]) -> bool {
+    let mut i = 0;
+    while i < a.len() {
+        let mut j = 0;
+        while j < b.len() {
+            if a[i] == b[j] {
+                return false;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    true
+}
+
 // No kind equals the reserved `REFUSED_KIND` (A-59), and each table is a set.
 const _: () = assert!(ipc::kinds_exclude_refused(request_kind::ALL));
 const _: () = assert!(ipc::kinds_exclude_refused(reply_kind::ALL));
 const _: () = assert!(all_distinct(request_kind::ALL));
 const _: () = assert!(all_distinct(reply_kind::ALL));
+const _: () = assert!(all_distinct(request_kind::PROPOSABLE));
+const _: () = assert!(disjoint(request_kind::ALL, request_kind::RETIRED));
+const _: () = assert!(disjoint(reply_kind::ALL, reply_kind::RETIRED));
+// The inner kind of a proposed key operation is never a request of its own.
+const _: () = assert!(disjoint(request_kind::ALL, &[request_kind::KEY_OPERATION]));
+// No request-queue kind, read or audit-only step is proposable (no
+// `Propose` inside a `Propose`).
+const _: () = assert!(disjoint(
+    request_kind::PROPOSABLE,
+    &[
+        request_kind::PROPOSE,
+        request_kind::APPROVE,
+        request_kind::REJECT,
+        request_kind::WITHDRAW,
+        request_kind::LIST_REQUESTS,
+        request_kind::SHOW_REQUEST,
+        request_kind::LOOKUP,
+        request_kind::COMPLETE_PASSWORD_SET,
+        request_kind::PING,
+    ]
+));
 
 // ---- closed value tables ---------------------------------------------------
 
@@ -482,6 +671,28 @@ pub mod codes {
     pub const TIER_1: u8 = 0x01;
     /// A tier-map row's tier: `Tier2`.
     pub const TIER_2: u8 = 0x02;
+    /// A fact's tier (`RequestShown`): no explicit classification — Tier0
+    /// for writes by A-36's default, but no tier-map entry or structural
+    /// rule names it (P-22: such a write needs no approver). The three tier
+    /// codes above are the explicit tiers. Task D2-c.
+    /// Spec: docs/47 §6.3; A-36; P-22; docs/questions/Q-887 item 2 ("tier").
+    pub const FACT_UNCLASSIFIED: u8 = 0x03;
+
+    /// A pending request's state: awaiting approvals. Task D2-c.
+    /// Spec: docs/questions/Q-882 item 1; docs/questions/Q-937.
+    pub const REQUEST_PENDING: u8 = 0x01;
+    /// A pending request's state: the quorum is reached — a directory or
+    /// policy operation may now be executed by its requester; a key
+    /// operation's decision is registered in keyd for keyadm (A-102).
+    /// Spec: docs/questions/Q-882 item 2; docs/questions/Q-937.
+    pub const REQUEST_APPROVED: u8 = 0x02;
+
+    /// `ListRequests.scope`: the caller's own pending requests.
+    /// Spec: docs/questions/Q-882 item 1 (`List {mine | awaiting_me}`).
+    pub const LIST_MINE: u8 = 0x01;
+    /// `ListRequests.scope`: the pending requests the caller may approve and
+    /// has not approved.
+    pub const LIST_AWAITING_ME: u8 = 0x02;
 }
 
 /// What the client is told about a refused or failed operation (the reason

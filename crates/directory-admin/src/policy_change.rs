@@ -17,13 +17,15 @@
 //!    operation, tier-0, always controlled", docs/06 §9; the object tier of
 //!    a policy scope is Tier0, so a subject below Tier0 is denied by the
 //!    PDP's tier layer whatever the rules say);
-//! 4. **mandatory dual control** (docs/51 §5.2 row 13: "always"; P-22):
-//!    the PEP's one `dual_control`, with `required` always true — every
-//!    approval a verified, fresh, distinct, Tier0-allowed AP-REQ bound to
-//!    this very request's digest, and the requester plus the approvals at
-//!    least the configured quorum (2 under P-22). There is no second
+//! 4. **mandatory dual control** (docs/51 §5.2 row 13: "always"; P-22) by
+//!    the **one mechanism** (task D2-c; docs/questions/Q-882): the change
+//!    runs only by consuming the approved pending request crate::requests
+//!    holds for exactly these changes (their digest and their fields) and
+//!    this requester — its approvers re-evaluated for `PolicyAdmin` on the
+//!    tier-map scope and its basis (the policy version) confirmed against
+//!    this view; without one ⇒ `ApprovalRequired`. There is no second
 //!    implementation of the approval rule (docs/52 C14 — one rule, one
-//!    implementation);
+//!    implementation), and no approval inside the request;
 //! 5. **one pending change at a time**: a `policy.next` dird already wrote
 //!    and root has not activated refuses a new change (`PendingLimit`) —
 //!    checked after the PDP and dual control, so an account that may not
@@ -60,7 +62,7 @@
 use directory_pip::DirectoryView;
 use ipc_audit::{
     AdminFailure, AdminRefusal, DirAdminEvent, DirAdminStage, EventBody, OutcomeResult,
-    MAX_APPROVERS, MAX_TARGET_NAMES,
+    MAX_TARGET_NAMES,
 };
 use ipc_audit_client::{AckedIntent, IntentRecord};
 use keyd_types::OperationDigest;
@@ -72,7 +74,8 @@ use crate::admin::{subject_of, DirectoryAdmin, OpCx, VerificationFailure};
 use crate::audit::{sid_value, EventBase, Refusal, Stop};
 use crate::checks::{local_ipc_security, Cx};
 use crate::random::RandomSource;
-use crate::subject::{all_bound, SubjectError, VerifiedTicket};
+use crate::requests::{Basis, PendingRequests, ProposedOperation};
+use crate::subject::{SubjectError, VerifiedTicket};
 
 /// The policy scope of a tier-map change: `PolicyAdmin` on `Policy {scope:
 /// "tier-map"}`. The rule `provision domain` writes for the Tier-0 group
@@ -101,10 +104,11 @@ pub enum PendingPolicy {
     Present,
 }
 
-/// One `ChangePolicy` request, after the caller verified every AP-REQ
-/// through keyd — each bound to `operation_digest`, the digest of the
-/// request dird decoded (R2).
-/// Spec: docs/51 §7.2, §7.3; docs/52 §5 items 1, 4.
+/// One `ChangePolicy` request, after the caller verified its AP-REQ through
+/// keyd — bound to `operation_digest`, the digest of the request dird
+/// decoded (R2). No approvals: the change consumes an approved pending
+/// request (docs/questions/Q-882).
+/// Spec: docs/51 §7.2, §7.3; docs/52 §5 items 1, 4; docs/questions/Q-882.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyChangeRequest {
     /// dird's number for the operation (its `Decision` and `Outcome` events
@@ -112,12 +116,11 @@ pub struct PolicyChangeRequest {
     pub operation_id: u64,
     /// The changes, in order (the tier-map edit's vocabulary).
     pub changes: Vec<TierChange>,
-    /// The operation digest every ticket below must carry (R2).
+    /// The operation digest the ticket below must carry (R2) — the
+    /// fingerprint an approved pending request is matched by (Q-888).
     pub operation_digest: OperationDigest,
     /// The requester's verified ticket.
     pub requester: VerifiedTicket,
-    /// The approvers' verified tickets (at most two, docs/51 §7.2).
-    pub approvals: Vec<VerifiedTicket>,
 }
 
 /// A decided tier-map change: the `Decision` event to have acknowledged and
@@ -252,6 +255,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         &self,
         operation_id: u64,
         changes: &[TierChange],
+        operation_digest: &OperationDigest,
         failure: VerificationFailure,
         now: &KerberosTime,
     ) -> Refusal {
@@ -260,7 +264,8 @@ impl<R: RandomSource> DirectoryAdmin<R> {
             VerificationFailure::Approver => Stop::Refused(AdminRefusal::ApproverUnauthenticated),
             VerificationFailure::KeydUnavailable => Stop::Failed(AdminFailure::KeydUnavailable),
         };
-        EventBase::of_policy_change(operation_id, changes).decision_refusal(now, stop)
+        EventBase::of_policy_change(operation_id, changes, operation_digest)
+            .decision_refusal(now, stop)
     }
 
     /// The refusal of a `ChangePolicy` that failed before any check ran (the
@@ -272,17 +277,19 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         &self,
         operation_id: u64,
         changes: &[TierChange],
+        operation_digest: &OperationDigest,
         failure: AdminFailure,
         now: &KerberosTime,
     ) -> Refusal {
-        EventBase::of_policy_change(operation_id, changes)
+        EventBase::of_policy_change(operation_id, changes, operation_digest)
             .decision_refusal(now, Stop::Failed(failure))
     }
 
     /// Decide a `ChangePolicy` against ONE view, the PDP snapshot of the
     /// loaded policy, the loaded policy itself (`installed`, of the same
     /// version) and what dird observed of `policy.next` (module
-    /// documentation, steps 1-6).
+    /// documentation, steps 1-6) — consuming the approved pending request
+    /// `requests` holds for it (step 4).
     ///
     /// `Err` carries the `Decision` event of the refusal (send it) and the
     /// client-visible status.
@@ -292,14 +299,21 @@ impl<R: RandomSource> DirectoryAdmin<R> {
     pub fn prepare_policy_change(
         &self,
         request: &PolicyChangeRequest,
+        requests: &mut PendingRequests,
         view: &DirectoryView<'_>,
         policy: &PolicySnapshot,
         installed: &DevelopmentPolicy,
         pending: PendingPolicy,
         now: &KerberosTime,
     ) -> Result<PreparedPolicyChange, Refusal> {
-        let mut base = EventBase::of_policy_change(request.operation_id, &request.changes);
-        match self.policy_checked(request, view, policy, installed, pending, now, &mut base) {
+        let mut base = EventBase::of_policy_change(
+            request.operation_id,
+            &request.changes,
+            &request.operation_digest,
+        );
+        match self.policy_checked(
+            request, requests, view, policy, installed, pending, now, &mut base,
+        ) {
             Ok(decided) => Ok(PreparedPolicyChange {
                 decision: base.proceed(now),
                 base,
@@ -316,6 +330,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
     fn policy_checked(
         &self,
         request: &PolicyChangeRequest,
+        requests: &mut PendingRequests,
         view: &DirectoryView<'_>,
         policy: &PolicySnapshot,
         installed: &DevelopmentPolicy,
@@ -331,12 +346,9 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         {
             return Err(Stop::Failed(AdminFailure::InternalFailure));
         }
-        // R2 (docs/52 §5 item 4): bound only if keyd verified every ticket
+        // R2 (docs/52 §5 item 4): bound only if keyd verified the ticket
         // bound to this very request.
-        let bound = all_bound(
-            &request.operation_digest,
-            core::iter::once(&request.requester).chain(&request.approvals),
-        );
+        let bound = request.requester.bound_to(&request.operation_digest);
         let cx = Cx::new(
             &self.config,
             &self.ids,
@@ -354,9 +366,6 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         if requester.ticket_age() > self.config.ticket_age_max() {
             return Err(Stop::Refused(AdminRefusal::TicketAge));
         }
-        if request.approvals.len() > MAX_APPROVERS {
-            return Err(Stop::Refused(AdminRefusal::ValueInvalid));
-        }
         // Step 2 — the request's own values (they reveal nothing).
         if request.changes.is_empty() || request.changes.len() > MAX_POLICY_CHANGES {
             return Err(Stop::Refused(AdminRefusal::ValueInvalid));
@@ -364,7 +373,6 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         let ctx = OpCx {
             cx: &cx,
             requester: &requester,
-            approvals: &request.approvals,
         };
         // Step 3 — `PolicyAdmin` on the tier-map scope (docs/06 §9).
         let action = Action::PolicyAdmin;
@@ -372,8 +380,19 @@ impl<R: RandomSource> DirectoryAdmin<R> {
             scope: PolicyScope(String::from(POLICY_CHANGE_SCOPE)),
         };
         let obligations = self.authorize(&ctx, base, &action, &resource)?;
-        // Step 4 — dual control, always (docs/51 §5.2 row 13; P-22).
-        self.dual_control(&ctx, base, true, &action, &resource)?;
+        // Step 4 — dual control, always (docs/51 §5.2 row 13; P-22), by the
+        // one mechanism: the approved request for exactly these changes.
+        self.consume_approved(
+            &cx,
+            requests,
+            &requester,
+            &ProposedOperation::Policy(request.changes.clone()),
+            &request.operation_digest,
+            &action,
+            &resource,
+            &Basis::of_policy(&cx),
+            base,
+        )?;
         // Step 5 — one pending change at a time (after the PDP: no oracle).
         if pending == PendingPolicy::Present {
             return Err(Stop::Refused(AdminRefusal::PendingLimit));

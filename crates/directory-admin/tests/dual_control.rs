@@ -8,7 +8,10 @@
 //! needs no approver), item 2 — the requester plus one other, distinct
 //! approver, each with `decide` = Allow for the same Action and Resource,
 //! item 4 — refuse a disable, delete or removal from the Tier-0 group that
-//! leaves fewer enabled Tier-0 administrators than the quorum. Fixtures:
+//! leaves fewer enabled Tier-0 administrators than the quorum; and the one
+//! mechanism that carries every approval (task D2-c; docs/questions/Q-882,
+//! A-148: `Propose` ⇒ `Approve` ⇒ the execution consumes the approved
+//! request — tests/common `Domain::run` with approvers). Fixtures:
 //! tests/common (two administrators, quorum 2).
 
 mod common;
@@ -107,7 +110,17 @@ fn tier0_principals_and_groups_need_an_approver() {
     ];
     for op in ops {
         let r = d.run(op.clone(), "admin1", &[]).refused();
-        assert_eq!(refusal_code(&r), AdminRefusal::ApprovalRequired, "{op:?}");
+        // Deleting admin2 would leave one Tier-0 administrator: the
+        // self-lockout guard, which no approval could satisfy, refuses it
+        // first (task D2-c: an operation's own checks run before its dual
+        // control is resolved, so such an operation is never queued for an
+        // approver either).
+        let expected = if matches!(op, Operation::Delete { .. }) {
+            AdminRefusal::SelfLockout
+        } else {
+            AdminRefusal::ApprovalRequired
+        };
+        assert_eq!(refusal_code(&r), expected, "{op:?}");
     }
     // Satisfied: the Tier0 group gains alice with admin2's approval.
     d.run(
@@ -122,7 +135,8 @@ fn tier0_principals_and_groups_need_an_approver() {
 }
 
 /// P-22 item 2: the approver must differ from the requester and from every
-/// other approver.
+/// other approver (a quorum of three, so that admin2's second approval is
+/// still asked for).
 #[test]
 fn approvers_must_be_distinct() {
     let mut d = Domain::new("dc-distinct");
@@ -131,6 +145,7 @@ fn approvers_must_be_distinct() {
         .refused();
     assert_eq!(refusal_code(&r), AdminRefusal::ApproverNotDistinct);
     assert_eq!(r.status(), RefusalStatus::Denied);
+    let mut d = Domain::with_quorum("dc-distinct3", 3);
     let r = d
         .run(
             create_user(TIER0_OU, "admin3"),
@@ -142,8 +157,11 @@ fn approvers_must_be_distinct() {
 }
 
 /// P-22 item 2: each approval needs `decide` = Allow for the same Action
-/// and Resource — bob may read but not create ⇒ `ApproverDenied`; helper is
-/// Tier1, so creating in a Tier0 subtree is denied to him (layer 4).
+/// and Resource — bob may read but not create; helper is Tier1, so creating
+/// in a Tier0 subtree is denied to him (layer 4). An account the PDP does
+/// not allow the request's Action cannot even see the pending request: its
+/// `Approve` is answered as for an unknown id (`NotFound`; the event keeps
+/// `NotVisible` — the rule of A-55; task D2-c).
 #[test]
 fn an_approver_the_pdp_denies_is_refused() {
     let mut d = Domain::new("dc-denied");
@@ -151,8 +169,12 @@ fn an_approver_the_pdp_denies_is_refused() {
         let r = d
             .run(create_user(TIER0_OU, "admin3"), "admin1", &[approver])
             .refused();
-        assert_eq!(refusal_code(&r), AdminRefusal::ApproverDenied, "{approver}");
-        assert_eq!(r.status(), RefusalStatus::Denied);
+        assert_eq!(refusal_code(&r), AdminRefusal::NotVisible, "{approver}");
+        assert_eq!(r.status(), RefusalStatus::NotFound);
+        // The refused proposal stays pending; withdraw it for the next.
+        let id = r.event().pending_request.unwrap();
+        d.step(directory_admin::RequestStep::Withdraw { id }, "admin1")
+            .unwrap();
     }
 }
 
@@ -162,34 +184,49 @@ fn an_approver_the_pdp_denies_is_refused() {
 #[test]
 fn an_unusable_approver_is_refused() {
     let mut d = Domain::new("dc-unusable");
+    let proposed = d
+        .propose(
+            directory_admin::ProposedOperation::Directory(create_user(TIER0_OU, "admin3")),
+            "admin1",
+            None,
+        )
+        .unwrap();
+    let (id, digest) = (proposed.reply().id, proposed.reply().digest);
     for approver in ["disabled", "nobody"] {
-        let r = d
-            .run(create_user(TIER0_OU, "admin3"), "admin1", &[approver])
-            .refused();
+        let r = d.approve(id, digest, approver).unwrap_err();
         assert_eq!(
             refusal_code(&r),
             AdminRefusal::ApproverUnauthenticated,
             "{approver}"
         );
     }
-    let mut request = d.request(create_user(TIER0_OU, "admin3"), "admin1", &["admin2"]);
-    request.approvals[0].authtime = kt(2026, 11, 13, 9, 49, 59);
-    let r = d.run_request(&request).refused();
+    let mut old = ticket("admin2");
+    old.authtime = kt(2026, 11, 13, 9, 49, 59);
+    let r = d
+        .step_at(
+            directory_admin::RequestStep::Approve { id, digest },
+            old,
+            &now(),
+        )
+        .unwrap_err();
     assert_eq!(refusal_code(&r), AdminRefusal::ApproverUnauthenticated);
 }
 
-/// docs/51 §7.2: at most two approvals per request.
+/// Task D2-c (r5-a MA5: "no multi-approve"; docs/51 §5.6): an approval
+/// after the quorum is a `Conflict` — no approval is ever recorded beyond
+/// what the request needs (admin2's second approval of the approved
+/// request), and none is carried in a request.
 #[test]
-fn more_than_two_approvals_are_refused() {
+fn approvals_after_the_quorum_are_refused() {
     let mut d = Domain::new("dc-many");
     let r = d
         .run(
             create_user(TIER0_OU, "admin3"),
             "admin1",
-            &["admin2", "alice", "bob"],
+            &["admin2", "admin2"],
         )
         .refused();
-    assert_eq!(refusal_code(&r), AdminRefusal::ValueInvalid);
+    assert_eq!(refusal_code(&r), AdminRefusal::Conflict);
 }
 
 /// A quorum of three needs two distinct approvers (P-22 allows the
@@ -233,7 +270,10 @@ fn unverified_ap_reqs_are_refused_uniformly() {
             RefusalStatus::Unavailable,
         ),
     ] {
-        let r = d.admin.refuse_unverified(7, &op, failure, &now());
+        let r = d
+            .admin
+            .refuse_unverified(7, &op, &fingerprint(&op), failure, &now());
+        assert_eq!(r.event().operation_digest, *fingerprint(&op).as_bytes());
         assert_eq!(r.event().stage, stage);
         assert_eq!(r.status(), status);
         assert_eq!(r.event().operation_id, 7);

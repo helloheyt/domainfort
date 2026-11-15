@@ -19,7 +19,7 @@ use crate::wire::{AdminReply, AdminRequest, WireSetPassword};
 use core::fmt;
 use dtyp::{Guid, Sid};
 use ipc::Secret;
-use ipc_dird_admin::{Auth, Found, KeyRequestState, Operation};
+use ipc_dird_admin::{Auth, Found, Operation, PendingRequestState, RequestShown, RequestSummary};
 use zeroize::Zeroizing;
 
 /// A value on the wire did not pass its strict decoder, or a typed value has
@@ -263,10 +263,14 @@ pub enum Reply {
     Refused(RefusalStatus),
     /// `Ping` answered.
     Pong,
-    /// dird's pending key-operation request (`RequestKeyOperation`,
-    /// `Approve`); its id is the id of the decision dird registers in keyd
-    /// when an `Approve` completes the quorum (A-102, docs/52 §4.3).
-    KeyRequest(KeyRequestState),
+    /// dird's pending request's state (`Propose`, `Approve`; task D2-c);
+    /// for a key operation its id is the id of the decision dird registers
+    /// in keyd when an `Approve` completes the quorum (A-102, docs/52 §4.3).
+    PendingRequest(PendingRequestState),
+    /// dird's `ListRequests` answer.
+    RequestList(Vec<RequestSummary>),
+    /// dird's `ShowRequest` answer.
+    RequestShown(Box<RequestShown>),
     /// dird's answer to a `ChangePolicy` it wrote as `policy.next` (task
     /// A16): the version root's activation installs.
     PolicyNext {
@@ -330,19 +334,17 @@ impl Reply {
                 kvnos: kvnos.clone(),
                 completion_recorded: *completion_recorded,
             }),
-            AdminReply::KeyRequest(request) => {
-                match ipc_dird_admin::Reply::from_wire(&ipc_dird_admin::AdminReply::KeyRequest(
-                    request.clone(),
-                ))
-                .map_err(ConversionError::Reply)?
-                {
-                    ipc_dird_admin::Reply::KeyRequest(state) => Reply::KeyRequest(state),
-                    _ => {
-                        return Err(ConversionError::Reply(
-                            ipc_dird_admin::ConversionError::UnexpectedReply,
-                        ))
-                    }
-                }
+            // The request queue's replies: dird's typed layer reads them.
+            AdminReply::PendingRequest(request) => {
+                queue_reply(ipc_dird_admin::AdminReply::PendingRequest(request.clone()))?
+            }
+            AdminReply::RequestList { entries } => {
+                queue_reply(ipc_dird_admin::AdminReply::RequestList {
+                    entries: entries.clone(),
+                })?
+            }
+            AdminReply::RequestShown(shown) => {
+                queue_reply(ipc_dird_admin::AdminReply::RequestShown(shown.clone()))?
             }
             AdminReply::PolicyNext { version } => Reply::PolicyNext { version: *version },
         })
@@ -374,20 +376,38 @@ impl Reply {
             },
             Reply::Refused(status) => AdminReply::Refused(*status),
             Reply::Pong => AdminReply::Pong,
-            Reply::KeyRequest(state) => {
-                // dird's typed layer writes it, byte for byte.
-                match ipc_dird_admin::Reply::KeyRequest(state.clone())
+            // dird's typed layer writes them, byte for byte.
+            Reply::PendingRequest(state) => {
+                match ipc_dird_admin::Reply::PendingRequest(state.clone())
                     .to_wire()
                     .map_err(ConversionError::Reply)?
                 {
-                    ipc_dird_admin::AdminReply::KeyRequest(request) => {
-                        AdminReply::KeyRequest(request)
+                    ipc_dird_admin::AdminReply::PendingRequest(request) => {
+                        AdminReply::PendingRequest(request)
                     }
-                    _ => {
-                        return Err(ConversionError::Reply(
-                            ipc_dird_admin::ConversionError::UnexpectedReply,
-                        ))
+                    _ => return Err(unexpected()),
+                }
+            }
+            Reply::RequestList(entries) => {
+                match ipc_dird_admin::Reply::RequestList(entries.clone())
+                    .to_wire()
+                    .map_err(ConversionError::Reply)?
+                {
+                    ipc_dird_admin::AdminReply::RequestList { entries } => {
+                        AdminReply::RequestList { entries }
                     }
+                    _ => return Err(unexpected()),
+                }
+            }
+            Reply::RequestShown(shown) => {
+                match ipc_dird_admin::Reply::RequestShown(shown.clone())
+                    .to_wire()
+                    .map_err(ConversionError::Reply)?
+                {
+                    ipc_dird_admin::AdminReply::RequestShown(shown) => {
+                        AdminReply::RequestShown(shown)
+                    }
+                    _ => return Err(unexpected()),
                 }
             }
             Reply::PolicyNext { version } => AdminReply::PolicyNext { version: *version },
@@ -409,7 +429,9 @@ impl Reply {
                 Some(Reply::Refused(RefusalStatus::from_dird(status)))
             }
             ipc_dird_admin::Reply::Pong => Some(Reply::Pong),
-            ipc_dird_admin::Reply::KeyRequest(state) => Some(Reply::KeyRequest(state)),
+            ipc_dird_admin::Reply::PendingRequest(state) => Some(Reply::PendingRequest(state)),
+            ipc_dird_admin::Reply::RequestList(entries) => Some(Reply::RequestList(entries)),
+            ipc_dird_admin::Reply::RequestShown(shown) => Some(Reply::RequestShown(shown)),
             ipc_dird_admin::Reply::PolicyNext { version } => Some(Reply::PolicyNext { version }),
             ipc_dird_admin::Reply::PasswordSet(_) => None,
         }
@@ -417,9 +439,10 @@ impl Reply {
 }
 
 /// Whether `reply` is an answer `request` can receive: `Created` for a
-/// create, `Found` for `Lookup`, `KeyRequest` for `RequestKeyOperation` /
-/// `Approve`, `PolicyNext` for `ChangePolicy` (task A16), `Done` for the
-/// other forwarded operations,
+/// create, `Found` for `Lookup`, `PendingRequest` for `Propose` / `Approve`,
+/// `RequestList` for `ListRequests`, `RequestShown` for `ShowRequest` (task
+/// D2-c), `PolicyNext` for `ChangePolicy` (task A16), `Done` for the
+/// other forwarded operations (`Reject`, `Withdraw` included),
 /// `PasswordChanged` for `SetPassword`, a refusal for any operation, `Pong`
 /// for `Ping` (the closed reply column, docs/51 §7.3,
 /// §7.6).
@@ -436,10 +459,12 @@ pub fn answers(request: &Request, reply: &Reply) -> bool {
             Reply::Refused(_) => true,
             Reply::Pong | Reply::PasswordChanged(_) => false,
             Reply::PolicyNext { .. } => matches!(operation, Operation::ChangePolicy { .. }),
-            Reply::KeyRequest(_) => matches!(
+            Reply::PendingRequest(_) => matches!(
                 operation,
-                Operation::RequestKeyOperation { .. } | Operation::Approve { .. }
+                Operation::Propose { .. } | Operation::Approve { .. }
             ),
+            Reply::RequestList(_) => matches!(operation, Operation::ListRequests(_)),
+            Reply::RequestShown(_) => matches!(operation, Operation::ShowRequest { .. }),
             Reply::Created { .. } => matches!(
                 operation,
                 Operation::CreateUser { .. }
@@ -456,7 +481,25 @@ pub fn answers(request: &Request, reply: &Reply) -> bool {
                     | Operation::AddMember { .. }
                     | Operation::RemoveMember { .. }
                     | Operation::Delete { .. }
+                    | Operation::Reject { .. }
+                    | Operation::Withdraw { .. }
             ),
         },
+    }
+}
+
+/// The "reply does not answer" conversion error.
+fn unexpected() -> ConversionError {
+    ConversionError::Reply(ipc_dird_admin::ConversionError::UnexpectedReply)
+}
+
+/// A request-queue reply read by dird's typed layer (the same octets).
+/// Spec: crate ipc-dird-admin `Reply` (task D2-c rows).
+fn queue_reply(dird: ipc_dird_admin::AdminReply) -> Result<Reply, ConversionError> {
+    match ipc_dird_admin::Reply::from_wire(&dird).map_err(ConversionError::Reply)? {
+        ipc_dird_admin::Reply::PendingRequest(state) => Ok(Reply::PendingRequest(state)),
+        ipc_dird_admin::Reply::RequestList(entries) => Ok(Reply::RequestList(entries)),
+        ipc_dird_admin::Reply::RequestShown(shown) => Ok(Reply::RequestShown(shown)),
+        _ => Err(unexpected()),
     }
 }

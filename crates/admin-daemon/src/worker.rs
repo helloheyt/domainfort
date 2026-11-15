@@ -16,7 +16,7 @@
 //! | not sent: connect, peer credentials, peer uid, unencodable | `Unavailable` |
 //! | dird's shared refusal: `Busy` | the shared `Busy` |
 //! | dird's shared refusal: `Unavailable`, `Malformed`, `VersionMismatch` | `Unavailable` (dird refused before acting) |
-//! | after sending: deadline, close, I/O, framing, a reply that does not decode or answer | a write: `OutcomeUnknown` (dird may have committed — its audit trail says; never a resend, A-87); `Lookup`: `Unavailable` |
+//! | after sending: deadline, close, I/O, framing, a reply that does not decode or answer | a write or a request-queue change: `OutcomeUnknown` (dird may have committed — its audit trail says; never a resend, A-87); a read (`Lookup`, `ListRequests`, `ShowRequest`): `Unavailable` |
 //!
 //! # `SetPassword` (docs/51 §5.2 row 5, §7.6, §9; docs/47 §9.2)
 //!
@@ -54,8 +54,11 @@
 //!    succeeded — with the request's `completion` AP-REQ (keyd's replay cache
 //!    makes the `BeginPasswordSet` one single-use; docs/questions/Q-400).
 //! 6. **The `Admind` event** committed into its slot (`Completed`, or the
-//!    first failing step with its class; the kvnos keyd chose), then the
-//!    reply.
+//!    first failing step with its class; the kvnos keyd chose; the
+//!    operation digest of `BeginPasswordSet {target}` — the fingerprint the
+//!    requester's AP-REQ is bound to and dird's events carry, computed here
+//!    from the octets admind forwards: task D2-c, docs/questions/Q-888),
+//!    then the reply.
 //!
 //! | how it ended | the administrator gets |
 //! |---|---|
@@ -134,10 +137,9 @@ impl Work {
     /// Spec: docs/questions/Q-370 item 9 (the same case in keyd-daemon).
     pub(crate) fn lost_answer(&self) -> Reply {
         match self {
-            Work::Forward {
-                operation: Operation::Lookup(_),
-                ..
-            } => Reply::Refused(RefusalStatus::Unavailable),
+            Work::Forward { operation, .. } if reads_only(operation) => {
+                Reply::Refused(RefusalStatus::Unavailable)
+            }
             _ => Reply::Refused(RefusalStatus::OutcomeUnknown),
         }
     }
@@ -236,8 +238,7 @@ impl Worker {
     /// A forwarded operation (module documentation).
     /// Spec: docs/51 §5.1, §7.6; A-70; A-87.
     fn forward(&mut self, auth: Auth, operation: Operation) -> Answer {
-        let lookup = matches!(operation, Operation::Lookup(_));
-        let unknown = if lookup {
+        let unknown = if reads_only(&operation) {
             RefusalStatus::Unavailable
         } else {
             RefusalStatus::OutcomeUnknown
@@ -274,6 +275,7 @@ impl Worker {
             peer_uid: Some(peer_uid),
             activity: AdmindActivity::SetPassword {
                 target: target.to_packet(),
+                operation_digest: begin_digest(target),
                 kvnos: BoundedSeq::new(ended.kvnos).unwrap_or_default(),
                 result: ended.result,
             },
@@ -462,10 +464,7 @@ impl Worker {
         kvnos: Vec<u32>,
     ) -> Result<(), PasswordFailure> {
         let request = DirdRequest::Operation {
-            auth: Auth {
-                requester: completion,
-                approvals: Vec::new(),
-            },
+            auth: Auth::of(completion),
             operation: Operation::CompletePasswordSet {
                 target,
                 outcome,
@@ -479,6 +478,31 @@ impl Worker {
             Err(unserved) => Err(dird_unserved_cause(unserved)),
         }
     }
+}
+
+/// Whether a forwarded operation only reads (an unknown fate cannot have
+/// changed anything): `Lookup`, and the request queue's `ListRequests` /
+/// `ShowRequest` (task D2-c).
+/// Spec: docs/51 §7.6; A-87, A-88 (never "not done" of what may be done).
+fn reads_only(operation: &Operation) -> bool {
+    matches!(
+        operation,
+        Operation::Lookup(_) | Operation::ListRequests(_) | Operation::ShowRequest { .. }
+    )
+}
+
+/// The fingerprint of a `SetPassword` for its event: the operation digest of
+/// `BeginPasswordSet {target}` — the dird operation the requester's `auth`
+/// AP-REQ is bound to, computed by the one function both ends use (crate
+/// ipc-dird-admin `operation_digest`). It is the client's binding, never a
+/// value the client supplies (C3). A typed `BeginPasswordSet` always has a
+/// digest; should it not, the event carries zeros (no correlation, no
+/// claim).
+/// Spec: docs/questions/Q-888 item 1 ("admind's events … computed from the
+/// octets it forwards"); docs/52 §5 item 1.
+fn begin_digest(target: Guid) -> [u8; ipc_audit::OPERATION_DIGEST_LEN] {
+    ipc_dird_admin::operation_digest(&Operation::BeginPasswordSet { target })
+        .map_or([0; ipc_audit::OPERATION_DIGEST_LEN], |d| *d.as_bytes())
 }
 
 /// How a `SetPassword` ended: the reply, the key versions keyd chose, the

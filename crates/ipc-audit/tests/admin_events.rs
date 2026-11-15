@@ -68,9 +68,12 @@ fn delete_refused() -> DirAdminEvent {
         enable: None,
         account_expires: None,
         group_type: None,
-        key_request: None,
+        pending_request: None,
         key_operation: None,
         reported_kvnos: BoundedSeq::empty(),
+        operation_digest: [0x9C; 32],
+        proposed: None,
+        reason_ref: None,
     }
 }
 
@@ -90,6 +93,10 @@ struct DirAdminAt {
     /// each one octet when absent.
     enable: usize,
     kvnos_count: usize,
+    /// The operation digest (32 octets, task D2-c).
+    digest: usize,
+    /// The marker of `proposed`; `reason_ref`'s follows.
+    proposed: usize,
 }
 
 /// The octets of [`delete_refused`], assembled field by field from the
@@ -132,10 +139,15 @@ fn delete_refused_octets() -> (Vec<u8>, DirAdminAt) {
     x.push(0); // enable absent
     x.push(0); // account_expires absent
     x.push(0); // group_type absent
-    x.push(0); // key_request absent
+    x.push(0); // pending_request absent
     x.push(0); // key_operation absent
     let kvnos_count = x.len();
     x.extend(0u32.to_be_bytes()); // no kvno
+    let digest = x.len();
+    x.extend([0x9C; 32]); // operation_digest (task D2-c, Q-888)
+    let proposed = x.len();
+    x.push(0); // proposed absent
+    x.push(0); // reason_ref absent
     let at = DirAdminAt {
         operation,
         phase,
@@ -149,6 +161,8 @@ fn delete_refused_octets() -> (Vec<u8>, DirAdminAt) {
         name_text,
         enable,
         kvnos_count,
+        digest,
+        proposed,
     };
     (x, at)
 }
@@ -400,8 +414,9 @@ fn dir_admin_phase_and_result_tables() {
     // Codes past the refusal table (19 entries since task A3 appended
     // `SelfLockout`, 20 since task F4 appended `ObligationRefused`, A-91,
     // 22 since task A10 appended `OperationMismatch` and
-    // `KeyOperationRefused`, Q-421).
-    for code in [0u8, 23, 0xFF] {
+    // `KeyOperationRefused`, Q-421, 25 since task D2-c appended
+    // `ApprovalNotNeeded`, `RequestStale`, `RequesterLimit`, Q-938).
+    for code in [0u8, 26, 0xFF] {
         assert_eq!(
             decode_event(&patched(at.detail, code)),
             codec(ipc::Error::UnknownCode)
@@ -458,13 +473,14 @@ fn dir_admin_phase_and_result_tables() {
 }
 
 /// docs/50 §3.3: unknown operation and name-kind codes are refused (task
-/// A16 appended `ChangePolicy` = 19 and `PolicyChange` = 7, so the first
-/// unknown codes are 20 and 8).
+/// A16 appended `ChangePolicy` = 19 and `PolicyChange` = 7; task D2-c
+/// appended `Propose` .. `ShowRequest` = 20..24 — docs/questions/Q-938 — so
+/// the first unknown codes are 25 and 8).
 #[test]
 fn dir_admin_unknown_codes() {
     let (good, at) = delete_refused_octets();
     for (position, codes) in [
-        (at.operation, [0u8, 20, 0xFF]),
+        (at.operation, [0u8, 25, 0xFF]),
         (at.name_kind, [0u8, 8, 0xFF]),
     ] {
         for code in codes {
@@ -600,6 +616,7 @@ fn set_password_failed_octets() -> (AdmindEvent, Vec<u8>, AdmindAt) {
     let activity = x.len();
     x.push(3); // SetPassword
     x.extend([0x5E; 16]); // target
+    x.extend([0x9C; 32]); // operation_digest (task D2-c, Q-888)
     let kvnos_count = x.len();
     x.extend(1u32.to_be_bytes());
     x.extend(5u32.to_be_bytes());
@@ -668,6 +685,7 @@ fn admind_wire_layout() {
                 head(Some(1500)),
                 vec![3],
                 vec![0x5E; 16],
+                vec![0x9C; 32], // operation_digest (task D2-c)
                 2u32.to_be_bytes().to_vec(),
                 4u32.to_be_bytes().to_vec(),
                 2u32.to_be_bytes().to_vec(),
@@ -776,10 +794,11 @@ fn largest_admin_events_fit() {
     // Computed from the layout: DirAdmin 2 + 7 + 8 + 1 + 24 (stage with
     // allocation) + 3 × 17 (GUIDs) + 71 (SID) + 4 + 2 × 70 (approvers) + 7
     // (PDP) + 4 + 4 × 262 (names) + 2 (enable) + 10 (account_expires At) +
-    // 2 (group_type) + 9 + 2 + 12 = 1404; Admind 2 + 7 + 5 + 1 + 16 + 12 +
-    // 4 = 47.
-    assert_eq!(dir_admin, 1404);
-    assert_eq!(admind, 47);
+    // 2 (group_type) + 9 + 2 + 12 = 1404, + 32 (operation_digest) + 2
+    // (proposed) + 262 (reason_ref) since task D2-c = 1700; Admind 2 + 7 +
+    // 5 + 1 + 16 + 32 (operation_digest, task D2-c) + 12 + 4 = 79.
+    assert_eq!(dir_admin, 1700);
+    assert_eq!(admind, 79);
     assert!(dir_admin <= MAX_EVENT_OCTETS as usize);
 }
 
@@ -926,11 +945,72 @@ fn a10_codes_are_appended() {
     assert_eq!(AdminRefusal::ObligationRefused.code(), 20);
     assert_eq!(AdminRefusal::OperationMismatch.code(), 21);
     assert_eq!(AdminRefusal::KeyOperationRefused.code(), 22);
-    assert_eq!(AdminRefusal::ALL.len(), 22);
+    assert!(AdminRefusal::ALL.len() >= 22);
     assert_eq!(AdminFailure::AuditUnacknowledged.code(), 6);
     assert_eq!(AdminFailure::KeyOperationNotPerformed.code(), 7);
     assert_eq!(AdminFailure::KeyOperationOutcomeUnknown.code(), 8);
     assert_eq!(AdminFailure::ALL.len(), 8);
+}
+
+/// Task D2-c (docs/questions/Q-882, Q-888, Q-938): the request-queue codes
+/// are appended — operations `Propose` .. `ShowRequest` (20..24), refusals
+/// `ApprovalNotNeeded`, `RequestStale`, `RequesterLimit` (23..25) — and no
+/// earlier code moved; the retired `RequestKeyOperation` keeps code 14.
+#[test]
+fn d2c_codes_are_appended() {
+    assert_eq!(DirAdminOperation::RequestKeyOperation.code(), 14);
+    assert_eq!(DirAdminOperation::Approve.code(), 15);
+    assert_eq!(DirAdminOperation::ChangePolicy.code(), 19);
+    assert_eq!(DirAdminOperation::Propose.code(), 20);
+    assert_eq!(DirAdminOperation::Reject.code(), 21);
+    assert_eq!(DirAdminOperation::Withdraw.code(), 22);
+    assert_eq!(DirAdminOperation::ListRequests.code(), 23);
+    assert_eq!(DirAdminOperation::ShowRequest.code(), 24);
+    assert_eq!(DirAdminOperation::ALL.len(), 24);
+    assert_eq!(AdminRefusal::ApprovalNotNeeded.code(), 23);
+    assert_eq!(AdminRefusal::RequestStale.code(), 24);
+    assert_eq!(AdminRefusal::RequesterLimit.code(), 25);
+    assert_eq!(AdminRefusal::ALL.len(), 25);
+}
+
+/// Task D2-c (docs/questions/Q-888): the operation digest, `proposed` and
+/// `reason_ref` are appended to the `DirAdmin` layout after the reported
+/// kvnos — 32 octets, then `00` | `01 ‖ operation code`, then `00` | `01 ‖
+/// AuditText` — octet for octet; an unknown `proposed` code and a short
+/// digest are refused.
+#[test]
+fn dir_admin_digest_and_request_fields_layout() {
+    let (base, at) = delete_refused_octets();
+    assert_eq!(&base[at.digest..at.digest + 32], &[0x9C; 32]);
+    assert_eq!(&base[at.proposed..], &[0, 0]);
+    let event = DirAdminEvent {
+        operation: DirAdminOperation::Approve,
+        pending_request: Some(0x1122_3344_5566_7788),
+        operation_digest: [0x3B; 32],
+        proposed: Some(DirAdminOperation::SetEnabled),
+        reason_ref: Some(ipc_audit::AuditText::from_client("CHG-1182")),
+        ..delete_refused()
+    };
+    let mut expected = base[..at.operation].to_vec();
+    expected.push(15); // Approve
+    expected.extend(&base[at.operation + 1..at.enable + 3]);
+    expected.push(1); // pending_request present
+    expected.extend(0x1122_3344_5566_7788u64.to_be_bytes());
+    expected.extend(&base[at.enable + 4..at.digest]);
+    expected.extend([0x3B; 32]);
+    expected.extend([1, 8]); // proposed: SetEnabled
+    expected.extend([1, 1]); // reason_ref present, text kept
+    expected.extend(8u32.to_be_bytes());
+    expected.extend(b"CHG-1182");
+    let event = EventBody::DirAdmin(Box::new(event));
+    assert_eq!(encode_event(&event).unwrap().as_bytes(), &expected[..]);
+    assert_eq!(decode_event(&expected).unwrap(), event);
+    // An unknown `proposed` code; a digest cut short.
+    let mut bad = base.clone();
+    bad[at.proposed] = 1;
+    bad.insert(at.proposed + 1, 25);
+    assert_eq!(decode_event(&bad), codec(ipc::Error::UnknownCode));
+    assert!(decode_event(&base[..at.digest + 31]).is_err());
 }
 
 // ---- peek_shape ---------------------------------------------------------------
@@ -974,6 +1054,7 @@ fn every_password_step_and_cause_round_trips() {
             let event = EventBody::Admind(Box::new(AdmindEvent {
                 activity: AdmindActivity::SetPassword {
                     target: [7; 16],
+                    operation_digest: [0x9C; 32],
                     kvnos: BoundedSeq::empty(),
                     result: PasswordResult::Failed {
                         step,

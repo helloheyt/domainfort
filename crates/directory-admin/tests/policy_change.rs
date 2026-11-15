@@ -1,7 +1,8 @@
 //! `PolicyAdmin` online (task A16): the write PEP's decision on a tier-map
 //! change — the requester's `PolicyAdmin` on the `tier-map` scope, mandatory
-//! dual control with the PEP's one approval rule, one pending change at a
-//! time, the candidate built by the one tier-map edit (version + 1) and
+//! dual control by the one mechanism (task D2-c, docs/questions/Q-882: an
+//! approved pending request for exactly these changes, consumed by the
+//! execution), one pending change at a time, the candidate built by the one tier-map edit (version + 1) and
 //! re-read by the policy format's own decoder, released only by the
 //! acknowledgement of the decision event.
 //!
@@ -20,8 +21,8 @@ use std::collections::BTreeMap;
 
 use common::*;
 use directory_admin::{
-    PendingPolicy, PolicyCandidate, PolicyChangeRequest, PreparedPolicyChange, RefusalStatus,
-    VerificationFailure, MAX_POLICY_CHANGES,
+    PendingPolicy, PolicyCandidate, PolicyChangeRequest, PreparedPolicyChange, ProposedOperation,
+    RefusalStatus, RequestStep, VerificationFailure, MAX_POLICY_CHANGES,
 };
 use ipc_audit::{
     AdminFailure, AdminNameKind, AdminRefusal, DecisionResult, DirAdminOperation, DirAdminStage,
@@ -108,28 +109,65 @@ fn sid_value(id: u32) -> SidValue {
     SidValue::new(dtyp::SECURITY_NT_AUTHORITY, vec![21, 1, 2, 3, rid(id)]).unwrap()
 }
 
-/// A `ChangePolicy` by `requester` with `approvers`, every ticket bound to
-/// the request's digest (R2).
-fn request(changes: Vec<TierChange>, requester: &str, approvers: &[&str]) -> PolicyChangeRequest {
+/// A `ChangePolicy` executed by `requester`, the ticket bound to the
+/// request's digest (R2) — the changes' fingerprint.
+fn request(changes: Vec<TierChange>, requester: &str) -> PolicyChangeRequest {
+    let digest = fingerprint(&changes);
     PolicyChangeRequest {
         operation_id: 7,
         changes,
-        operation_digest: TEST_DIGEST,
-        requester: ticket(requester),
-        approvals: approvers.iter().map(|a| ticket(a)).collect(),
+        operation_digest: digest,
+        requester: ticket_bound_to(requester, Some(digest)),
     }
 }
 
-/// Decide `request` against the domain with `installed` and `pending`.
+/// The domain under `installed`: its PDP snapshot, and the file a proposal
+/// builds its candidate on.
+fn load(d: &mut Domain, installed: &DevelopmentPolicy) {
+    d.policy = installed.snapshot().unwrap();
+    d.policy_file = Some(installed.clone());
+}
+
+/// The one dual-control mechanism (task D2-c): `requester` proposes the
+/// change, each of `approvers` approves it; then the execution by
+/// `requester` against the domain with `installed` and `pending`.
 fn decide(
-    d: &Domain,
+    d: &mut Domain,
+    installed: &DevelopmentPolicy,
+    changes: Vec<TierChange>,
+    requester: &str,
+    approvers: &[&str],
+    pending: PendingPolicy,
+) -> Result<PreparedPolicyChange, directory_admin::Refusal> {
+    load(d, installed);
+    if !approvers.is_empty() {
+        let proposed = d.propose(ProposedOperation::Policy(changes.clone()), requester, None)?;
+        let (id, digest) = (proposed.reply().id, proposed.reply().digest);
+        for approver in approvers {
+            d.approve(id, digest, approver)?;
+        }
+    }
+    execute(d, installed, &request(changes, requester), pending)
+}
+
+/// The execution of `request` against the domain with `installed`.
+fn execute(
+    d: &mut Domain,
     installed: &DevelopmentPolicy,
     request: &PolicyChangeRequest,
     pending: PendingPolicy,
 ) -> Result<PreparedPolicyChange, directory_admin::Refusal> {
     let snapshot = installed.snapshot().unwrap();
-    d.admin
-        .prepare_policy_change(request, &d.view(), &snapshot, installed, pending, &now())
+    let view = d.ctx.view(&d.store, &d.tiers).unwrap();
+    d.admin.prepare_policy_change(
+        request,
+        &mut d.requests,
+        &view,
+        &snapshot,
+        installed,
+        pending,
+        &now(),
+    )
 }
 
 /// Play auditd for one decision (as tests/common `acknowledged` does for a
@@ -155,12 +193,14 @@ fn refusal_code(r: &directory_admin::Refusal) -> DecisionResult {
 /// prepared value only through the acknowledgement, with its outcome events.
 #[test]
 fn an_approved_change_yields_the_next_version() {
-    let d = Domain::new("pc-approved");
+    let mut d = Domain::new("pc-approved");
     let installed = installed();
     let prepared = decide(
-        &d,
+        &mut d,
         &installed,
-        &request(vec![add_staff_tier2()], "admin1", &["admin2"]),
+        vec![add_staff_tier2()],
+        "admin1",
+        &["admin2"],
         PendingPolicy::Absent,
     )
     .unwrap();
@@ -174,6 +214,13 @@ fn an_approved_change_yields_the_next_version() {
     assert_eq!(decision.operation_id, 7);
     assert_eq!(decision.requester, Some(sid_value(ADMIN1)));
     assert_eq!(decision.approvers.as_slice(), &[sid_value(ADMIN2)]);
+    // The approved request it consumed, and the fingerprint (Q-888).
+    assert!(decision.pending_request.is_some());
+    assert_eq!(
+        decision.operation_digest,
+        *fingerprint(&vec![add_staff_tier2()]).as_bytes()
+    );
+    assert!(d.requests.is_empty(), "consumed");
     let names = decision.names.as_slice();
     assert_eq!(names.len(), 1);
     assert_eq!(names[0].kind, AdminNameKind::PolicyChange);
@@ -208,12 +255,14 @@ fn an_approved_change_yields_the_next_version() {
 /// change the policy — not alone, and not by approving his own request.
 #[test]
 fn a_single_administrator_cannot_complete_it() {
-    let d = Domain::new("pc-single");
+    let mut d = Domain::new("pc-single");
     let installed = installed();
     let alone = decide(
-        &d,
+        &mut d,
         &installed,
-        &request(vec![add_staff_tier2()], "admin1", &[]),
+        vec![add_staff_tier2()],
+        "admin1",
+        &[],
         PendingPolicy::Absent,
     )
     .unwrap_err();
@@ -223,9 +272,11 @@ fn a_single_administrator_cannot_complete_it() {
     );
     assert_eq!(alone.status(), RefusalStatus::ApprovalRequired);
     let self_approved = decide(
-        &d,
+        &mut d,
         &installed,
-        &request(vec![add_staff_tier2()], "admin1", &["admin1"]),
+        vec![add_staff_tier2()],
+        "admin1",
+        &["admin1"],
         PendingPolicy::Absent,
     )
     .unwrap_err();
@@ -238,16 +289,20 @@ fn a_single_administrator_cannot_complete_it() {
 
 /// docs/06 §9, docs/11 §4 (layer 4): a policy scope is Tier0, so the Tier-1
 /// helper is denied by the PDP even with a rule granting his group
-/// `PolicyAdmin` and a Tier-0 approver; and a Tier-1 approval does not count
-/// for a Tier-0 requester (the approver's own decision).
+/// `PolicyAdmin` (his proposal is refused); and a Tier-1 account cannot
+/// approve a Tier-0 requester's change (the approver's own decision — it
+/// may not even see the request: `NotVisible`, told `NotFound`, the rule of
+/// A-55; task D2-c).
 #[test]
 fn a_non_tier0_administrator_is_denied_by_the_pdp() {
-    let d = Domain::new("pc-tier1");
+    let mut d = Domain::new("pc-tier1");
     let installed = installed();
     let denied = decide(
-        &d,
+        &mut d,
         &installed,
-        &request(vec![add_staff_tier2()], "helper", &["admin2"]),
+        vec![add_staff_tier2()],
+        "helper",
+        &["admin2"],
         PendingPolicy::Absent,
     )
     .unwrap_err();
@@ -261,16 +316,19 @@ fn a_non_tier0_administrator_is_denied_by_the_pdp() {
         Some(PdpReasonCode::TierViolation)
     );
     let approver = decide(
-        &d,
+        &mut d,
         &installed,
-        &request(vec![add_staff_tier2()], "admin1", &["helper"]),
+        vec![add_staff_tier2()],
+        "admin1",
+        &["helper"],
         PendingPolicy::Absent,
     )
     .unwrap_err();
     assert_eq!(
         refusal_code(&approver),
-        DecisionResult::Refused(AdminRefusal::ApproverDenied)
+        DecisionResult::Refused(AdminRefusal::NotVisible)
     );
+    assert_eq!(approver.status(), RefusalStatus::NotFound);
 }
 
 /// docs/51 §5.10 ("one pending change at a time", docs/questions/Q-591):
@@ -279,12 +337,14 @@ fn a_non_tier0_administrator_is_denied_by_the_pdp() {
 /// policy is told it may not, not that a change is pending (A-55).
 #[test]
 fn a_second_pending_change_is_refused_after_the_pdp() {
-    let d = Domain::new("pc-pending");
+    let mut d = Domain::new("pc-pending");
     let installed = installed();
     let pending = decide(
-        &d,
+        &mut d,
         &installed,
-        &request(vec![add_staff_tier2()], "admin1", &["admin2"]),
+        vec![add_staff_tier2()],
+        "admin1",
+        &["admin2"],
         PendingPolicy::Present,
     )
     .unwrap_err();
@@ -293,10 +353,10 @@ fn a_second_pending_change_is_refused_after_the_pdp() {
         DecisionResult::Refused(AdminRefusal::PendingLimit)
     );
     assert_eq!(pending.status(), RefusalStatus::Unavailable);
-    let no_oracle = decide(
-        &d,
+    let no_oracle = execute(
+        &mut d,
         &installed,
-        &request(vec![add_staff_tier2()], "helper", &["admin2"]),
+        &request(vec![add_staff_tier2()], "helper"),
         PendingPolicy::Present,
     )
     .unwrap_err();
@@ -305,9 +365,11 @@ fn a_second_pending_change_is_refused_after_the_pdp() {
         DecisionResult::Refused(AdminRefusal::PolicyDenied)
     );
     let unapproved = decide(
-        &d,
+        &mut d,
         &installed,
-        &request(vec![add_staff_tier2()], "admin1", &[]),
+        vec![add_staff_tier2()],
+        "admin1",
+        &[],
         PendingPolicy::Present,
     )
     .unwrap_err();
@@ -320,10 +382,12 @@ fn a_second_pending_change_is_refused_after_the_pdp() {
 /// docs/51 §5.10; docs/questions/Q-379, Q-590: the edit's own refusals
 /// (removing the last Tier0 principal, adding a row already present), no
 /// change, and more changes than the audit event can name are
-/// `ValueInvalid`.
+/// `ValueInvalid` — already at the proposal (its dry run builds the
+/// candidate: no approver is asked to judge an edit that cannot be made —
+/// task D2-c, class C47).
 #[test]
 fn an_edit_the_edit_refuses_is_invalid() {
-    let d = Domain::new("pc-invalid");
+    let mut d = Domain::new("pc-invalid");
     let installed = installed();
     let staff = |n: u32| TierChange::AddSubtree(ou_dn(&format!("S{n}")), Tier::Tier2);
     for changes in [
@@ -334,12 +398,15 @@ fn an_edit_the_edit_refuses_is_invalid() {
         (0..=MAX_POLICY_CHANGES as u32).map(staff).collect(),
     ] {
         let refused = decide(
-            &d,
+            &mut d,
             &installed,
-            &request(changes.clone(), "admin1", &["admin2"]),
+            changes.clone(),
+            "admin1",
+            &["admin2"],
             PendingPolicy::Absent,
         )
         .unwrap_err();
+        assert_eq!(refused.event().operation, DirAdminOperation::Propose);
         assert_eq!(
             refusal_code(&refused),
             DecisionResult::Refused(AdminRefusal::ValueInvalid),
@@ -349,38 +416,60 @@ fn an_edit_the_edit_refuses_is_invalid() {
     }
     // At the bound it is decided.
     decide(
-        &d,
+        &mut d,
         &installed,
-        &request(
-            (0..MAX_POLICY_CHANGES as u32).map(staff).collect(),
-            "admin1",
-            &["admin2"],
-        ),
+        (0..MAX_POLICY_CHANGES as u32).map(staff).collect(),
+        "admin1",
+        &["admin2"],
         PendingPolicy::Absent,
     )
     .unwrap();
 }
 
-/// R2 (docs/52 §5 item 4): an approval not bound to this request's digest
-/// leaves the channel unbound — `PolicyAdmin` is a write, so the PDP denies
-/// it (`WeakTransport`).
+/// R2 (docs/52 §5 item 4): an `Approve` whose AP-REQ keyd verified for
+/// another digest leaves the channel unbound — `PolicyAdmin` is a write, so
+/// the PDP denies the approver (`WeakTransport`) and the request stays
+/// invisible to it; no approval is recorded, and the change still needs one.
 #[test]
 fn an_approval_bound_to_another_operation_is_not_channel_bound() {
-    let d = Domain::new("pc-unbound");
+    let mut d = Domain::new("pc-unbound");
     let installed = installed();
-    let mut unbound = request(vec![add_staff_tier2()], "admin1", &[]);
-    unbound.approvals = vec![ticket_bound_to(
-        "admin2",
-        Some(keyd_types::OperationDigest::new([0xEE; 32])),
-    )];
-    let refused = decide(&d, &installed, &unbound, PendingPolicy::Absent).unwrap_err();
+    load(&mut d, &installed);
+    let proposed = d
+        .propose(
+            ProposedOperation::Policy(vec![add_staff_tier2()]),
+            "admin1",
+            None,
+        )
+        .unwrap();
+    let refused = d
+        .step_at(
+            RequestStep::Approve {
+                id: proposed.reply().id,
+                digest: proposed.reply().digest,
+            },
+            ticket_bound_to("admin2", Some(keyd_types::OperationDigest::new([0xEE; 32]))),
+            &now(),
+        )
+        .unwrap_err();
     assert_eq!(
         refusal_code(&refused),
-        DecisionResult::Refused(AdminRefusal::PolicyDenied)
+        DecisionResult::Refused(AdminRefusal::NotVisible)
     );
     assert_eq!(
         refused.event().pdp.map(|p| p.code),
         Some(PdpReasonCode::WeakTransport)
+    );
+    let unapproved = execute(
+        &mut d,
+        &installed,
+        &request(vec![add_staff_tier2()], "admin1"),
+        PendingPolicy::Absent,
+    )
+    .unwrap_err();
+    assert_eq!(
+        refusal_code(&unapproved),
+        DecisionResult::Refused(AdminRefusal::ApprovalRequired)
     );
 }
 
@@ -389,22 +478,25 @@ fn an_approval_bound_to_another_operation_is_not_channel_bound() {
 /// uniform refusal; keyd down is a failure.
 #[test]
 fn misassembled_inputs_and_unverified_tickets_fail_closed() {
-    let d = Domain::new("pc-misassembled");
+    let mut d = Domain::new("pc-misassembled");
     let installed = installed();
     let mut newer = installed.clone();
     newer.version = PolicyVersion(2);
     let snapshot = installed.snapshot().unwrap();
+    let view = d.ctx.view(&d.store, &d.tiers).unwrap();
     let refused = d
         .admin
         .prepare_policy_change(
-            &request(vec![add_staff_tier2()], "admin1", &["admin2"]),
-            &d.view(),
+            &request(vec![add_staff_tier2()], "admin1"),
+            &mut d.requests,
+            &view,
             &snapshot,
             &newer,
             PendingPolicy::Absent,
             &now(),
         )
         .unwrap_err();
+    drop(view);
     assert_eq!(
         refusal_code(&refused),
         DecisionResult::Failed(AdminFailure::InternalFailure)
@@ -424,9 +516,13 @@ fn misassembled_inputs_and_unverified_tickets_fail_closed() {
             DecisionResult::Failed(AdminFailure::KeydUnavailable),
         ),
     ] {
-        let r = d
-            .admin
-            .refuse_unverified_policy_change(9, &changes, failure, &now());
+        let r = d.admin.refuse_unverified_policy_change(
+            9,
+            &changes,
+            &fingerprint(&changes.to_vec()),
+            failure,
+            &now(),
+        );
         assert_eq!(refusal_code(&r), expected);
         assert_eq!(r.event().operation, DirAdminOperation::ChangePolicy);
         assert_eq!(r.event().names.len(), 1);

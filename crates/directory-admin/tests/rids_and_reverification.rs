@@ -77,11 +77,14 @@ fn an_aborted_transaction_consumes_nothing() {
     let mut d = Domain::new("rid-abort");
     let rid_before = d.counter_next(directory_admin::RID_COUNTER);
     let seq_before = d.counter_next(directory_admin::CHANGE_SEQ_COUNTER);
-    let request = d.request(create_user("u1"), "admin1", &[]);
+    let request = d.request(create_user("u1"), "admin1");
     {
         let mut txn = d.store.begin_write().unwrap();
         let view = d.ctx.view(&d.store, &d.tiers).unwrap();
-        let prepared = d.admin.prepare(&request, &view, &d.policy, &now()).unwrap();
+        let prepared = d
+            .admin
+            .prepare(&request, &mut d.requests, &view, &d.policy, &now())
+            .unwrap();
         drop(view);
         let applied = d
             .admin
@@ -127,10 +130,12 @@ fn an_exhausted_rid_range_refuses_principals_only() {
 #[test]
 fn apply_refuses_a_write_prepared_against_a_stale_view() {
     let mut d = Domain::new("stale");
-    let stale = d.request(create_user("u1"), "admin1", &[]);
+    let stale = d.request(create_user("u1"), "admin1");
     let prepared = {
         let view = d.ctx.view(&d.store, &d.tiers).unwrap();
-        d.admin.prepare(&stale, &view, &d.policy, &now()).unwrap()
+        d.admin
+            .prepare(&stale, &mut d.requests, &view, &d.policy, &now())
+            .unwrap()
     };
     // Another write commits in between.
     d.run(
@@ -170,12 +175,13 @@ fn apply_compares_the_records_it_depends_on() {
             enabled: false,
         }),
         "admin1",
-        &[],
     );
     let mut txn = d.store.begin_write().unwrap();
     let prepared = {
         let view = d.ctx.view(&d.store, &d.tiers).unwrap();
-        d.admin.prepare(&request, &view, &d.policy, &now()).unwrap()
+        d.admin
+            .prepare(&request, &mut d.requests, &view, &d.policy, &now())
+            .unwrap()
     };
     // Change bob inside the same transaction without taking a change-seq.
     txn.modify_object(
@@ -209,12 +215,14 @@ fn apply_compares_the_records_it_depends_on() {
 /// the proof, cannot run: nothing is written.
 #[test]
 fn without_auditds_acknowledgement_there_is_no_proof_and_no_write() {
-    let d = Domain::new("no-ack");
+    let mut d = Domain::new("no-ack");
     let seq_before = d.counter_next(directory_admin::CHANGE_SEQ_COUNTER);
-    let request = d.request(create_user("u1"), "admin1", &[]);
+    let request = d.request(create_user("u1"), "admin1");
     let prepared = {
         let view = d.ctx.view(&d.store, &d.tiers).unwrap();
-        d.admin.prepare(&request, &view, &d.policy, &now()).unwrap()
+        d.admin
+            .prepare(&request, &mut d.requests, &view, &d.policy, &now())
+            .unwrap()
     };
     let back = linked::not_acknowledged(prepared);
     assert!(back.writes());
@@ -234,11 +242,12 @@ fn a_read_only_operation_has_nothing_to_apply() {
     let request = d.request(
         Operation::Lookup(directory_admin::LookupKey::SamAccountName("alice".into())),
         "admin1",
-        &[],
     );
     let prepared = {
         let view = d.ctx.view(&d.store, &d.tiers).unwrap();
-        d.admin.prepare(&request, &view, &d.policy, &now()).unwrap()
+        d.admin
+            .prepare(&request, &mut d.requests, &view, &d.policy, &now())
+            .unwrap()
     };
     assert!(!prepared.writes());
     let mut txn = d.store.begin_write().unwrap();

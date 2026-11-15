@@ -7,8 +7,10 @@
 //!   untouched (docs/51 §7.6: "the same operations").
 //! * **`SetPassword`**:
 //!   `auth ‖ completion: bytes<64 KiB> ‖ target: [16] ‖ password: secret bytes<1024>`
-//!   — `auth` is dird's field (the requester's AP-REQ and ≤ 2 approvals, for
-//!   `BeginPasswordSet`); `completion` is one more AP-REQ of the requester,
+//!   — `auth` is dird's field (the requester's AP-REQ for `BeginPasswordSet`;
+//!   the in-request approvals are retired — docs/questions/Q-882: a Tier0
+//!   account's password set needs an approved pending request in dird);
+//!   `completion` is one more AP-REQ of the requester,
 //!   for `CompletePasswordSet` (keyd's replay cache makes each AP-REQ
 //!   single-use — docs/questions/Q-400); the password is an `ipc::Secret`
 //!   (zeroizing buffer, no `Debug` content, no `Clone`).
@@ -16,8 +18,9 @@
 //!   `ListPendingDestruction`, the only ones without `auth`) are retired by
 //!   A-102 (docs/52 §4.6; docs/questions/Q-460): their kinds are not in the
 //!   closed table, so admind refuses them like any unknown kind.
-//! * The replies `Created`, `Done`, `Found`, `Pong`, `KeyRequest`,
-//!   `PolicyNext` (task A16) are dird's (read and written by
+//! * The replies `Created`, `Done`, `Found`, `Pong`, `PolicyNext` (task
+//!   A16), `PendingRequest`, `RequestList`, `RequestShown` (task D2-c) are
+//!   dird's (read and written by
 //!   `ipc_dird_admin::AdminReply`); `Refused` carries this channel's status
 //!   table; `PasswordChanged` is `kvnos: seq<u32, 2> ‖ completion_recorded:
 //!   bool`.
@@ -31,7 +34,9 @@ use crate::channel::{
 use core::fmt;
 use ipc::{Error, MessageSet, Payload, Reader, Result, Secret, Writer};
 use ipc_dird_admin::wire::{AdminReply as DirdReply, AdminRequest as DirdRequest};
-use ipc_dird_admin::{WireAuth, WireKeyRequest, WireOperation};
+use ipc_dird_admin::{
+    WireAuth, WireOperation, WirePendingRequest, WireRequestShown, WireRequestSummary,
+};
 
 /// A 16-octet objectGUID packet.
 pub type GuidPacket = [u8; 16];
@@ -39,8 +44,8 @@ pub type GuidPacket = [u8; 16];
 /// The fields of a `SetPassword` request.
 /// Spec: docs/51 §7.6; docs/questions/Q-400.
 pub struct WireSetPassword {
-    /// The requester's and approvers' raw AP-REQs, forwarded untouched to
-    /// dird's `BeginPasswordSet`.
+    /// The requester's raw AP-REQ, forwarded untouched to dird's
+    /// `BeginPasswordSet`.
     pub auth: WireAuth,
     /// The requester's second raw AP-REQ, forwarded untouched to dird's
     /// `CompletePasswordSet` (with no approvals).
@@ -205,8 +210,15 @@ pub enum AdminReply {
         /// Whether dird accepted the `CompletePasswordSet` report.
         completion_recorded: bool,
     },
-    /// dird's `KeyRequest` (dird's layout).
-    KeyRequest(WireKeyRequest),
+    /// dird's `PendingRequest` (dird's layout; task D2-c).
+    PendingRequest(WirePendingRequest),
+    /// dird's `RequestList` (dird's layout).
+    RequestList {
+        /// The entries.
+        entries: Vec<WireRequestSummary>,
+    },
+    /// dird's `RequestShown` (dird's layout).
+    RequestShown(Box<WireRequestShown>),
     /// dird's `PolicyNext` (dird's layout: `version:u64`; task A16).
     PolicyNext {
         /// The `policy_version` of `policy.next`.
@@ -225,7 +237,9 @@ impl MessageSet for AdminReply {
             AdminReply::Refused(_) => reply_kind::REFUSED,
             AdminReply::Pong => reply_kind::PONG,
             AdminReply::PasswordChanged { .. } => reply_kind::PASSWORD_CHANGED,
-            AdminReply::KeyRequest(_) => reply_kind::KEY_REQUEST,
+            AdminReply::PendingRequest(_) => reply_kind::PENDING_REQUEST,
+            AdminReply::RequestList { .. } => reply_kind::REQUEST_LIST,
+            AdminReply::RequestShown(_) => reply_kind::REQUEST_SHOWN,
             AdminReply::PolicyNext { .. } => reply_kind::POLICY_NEXT,
         }
     }
@@ -259,8 +273,15 @@ impl MessageSet for AdminReply {
                 writer.write_bool(*completion_recorded)
             }
             AdminReply::Done | AdminReply::Pong => Ok(()),
-            AdminReply::KeyRequest(request) => {
-                DirdReply::KeyRequest(request.clone()).write_payload(writer)
+            AdminReply::PendingRequest(request) => {
+                DirdReply::PendingRequest(request.clone()).write_payload(writer)
+            }
+            AdminReply::RequestList { entries } => DirdReply::RequestList {
+                entries: entries.clone(),
+            }
+            .write_payload(writer),
+            AdminReply::RequestShown(shown) => {
+                DirdReply::RequestShown(shown.clone()).write_payload(writer)
             }
             AdminReply::PolicyNext { version } => {
                 DirdReply::PolicyNext { version: *version }.write_payload(writer)
@@ -297,8 +318,16 @@ impl MessageSet for AdminReply {
                 kvnos: reader.read_seq(MAX_KVNOS, Reader::read_u32)?,
                 completion_recorded: reader.read_bool()?,
             },
-            reply_kind::KEY_REQUEST => match DirdReply::read_payload(kind, reader)? {
-                DirdReply::KeyRequest(request) => AdminReply::KeyRequest(request),
+            reply_kind::PENDING_REQUEST => match DirdReply::read_payload(kind, reader)? {
+                DirdReply::PendingRequest(request) => AdminReply::PendingRequest(request),
+                _ => return Err(Error::UnknownKind),
+            },
+            reply_kind::REQUEST_LIST => match DirdReply::read_payload(kind, reader)? {
+                DirdReply::RequestList { entries } => AdminReply::RequestList { entries },
+                _ => return Err(Error::UnknownKind),
+            },
+            reply_kind::REQUEST_SHOWN => match DirdReply::read_payload(kind, reader)? {
+                DirdReply::RequestShown(shown) => AdminReply::RequestShown(shown),
                 _ => return Err(Error::UnknownKind),
             },
             reply_kind::POLICY_NEXT => match DirdReply::read_payload(kind, reader)? {

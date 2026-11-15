@@ -12,8 +12,8 @@ mod common;
 
 use common::*;
 use directory_admin::{
-    CreateUser, KeyAdminOperation, KeyOperation, KeyRequests, LookupKey, Membership, Operation,
-    RefusalStatus,
+    CreateUser, KeyOperation, LookupKey, Membership, Operation, ProposedOperation, RefusalStatus,
+    RequestStep,
 };
 use ipc_audit::{AdminRefusal, DecisionResult, DirAdminStage, PdpReasonCode};
 use keyd_types::OperationDigest;
@@ -45,7 +45,7 @@ fn refusal_code(r: &directory_admin::Refusal) -> AdminRefusal {
 fn a_write_by_a_ticket_bound_elsewhere_is_weak_transport() {
     let mut d = Domain::new("bind-write");
     for bound in [Some(OTHER), None] {
-        let mut request = d.request(create_user(STAFF_OU, "carol"), "admin1", &[]);
+        let mut request = d.request(create_user(STAFF_OU, "carol"), "admin1");
         request.requester = ticket_bound_to("admin1", bound);
         let r = d.run_request(&request).refused();
         assert_eq!(refusal_code(&r), AdminRefusal::PolicyDenied, "{bound:?}");
@@ -62,10 +62,13 @@ fn a_write_by_a_ticket_bound_elsewhere_is_weak_transport() {
     ));
 }
 
-/// An approval bound to another operation does not bind this one: the
-/// Tier-0 membership change that needs admin2's approval is refused at layer
-/// 2 when admin2's ticket was verified for another digest, and applied when
-/// both tickets carry the request's digest.
+/// An approval bound to another operation does not bind this one (task
+/// D2-c: an approval is an `Approve` of a pending request): admin2's
+/// `Approve` whose AP-REQ keyd verified for another digest leaves the
+/// channel unbound, so the PDP denies admin2 the request's Action at layer 2
+/// (`WeakTransport`) — the request stays invisible to it (`NotVisible`) and
+/// unapproved, and the Tier-0 membership change is refused
+/// `ApprovalRequired`; approved with a bound ticket, it is applied.
 #[test]
 fn an_approval_bound_to_another_operation_is_refused() {
     let mut d = Domain::new("bind-approval");
@@ -75,12 +78,24 @@ fn an_approval_bound_to_another_operation_is_refused() {
             member: guid(ALICE),
         })
     };
-    let mut request = d.request(op(), "admin1", &["admin2"]);
-    request.approvals = vec![ticket_bound_to("admin2", Some(OTHER))];
-    let r = d.run_request(&request).refused();
-    assert_eq!(refusal_code(&r), AdminRefusal::PolicyDenied);
+    let proposed = d
+        .propose(ProposedOperation::Directory(op()), "admin1", None)
+        .unwrap();
+    let (id, digest) = (proposed.reply().id, proposed.reply().digest);
+    let r = d
+        .step_at(
+            RequestStep::Approve { id, digest },
+            ticket_bound_to("admin2", Some(OTHER)),
+            &now(),
+        )
+        .unwrap_err();
+    assert_eq!(refusal_code(&r), AdminRefusal::NotVisible);
     assert_eq!(r.event().pdp.unwrap().code, PdpReasonCode::WeakTransport);
-    d.run(op(), "admin1", &["admin2"]).applied();
+    let request = d.request(op(), "admin1");
+    let r = d.run_request(&request).refused();
+    assert_eq!(refusal_code(&r), AdminRefusal::ApprovalRequired);
+    d.approve(id, digest, "admin2").unwrap();
+    d.run(op(), "admin1", &[]).applied();
 }
 
 /// A read needs no channel binding (docs/11 §4: "authenticated read →
@@ -91,57 +106,32 @@ fn a_read_needs_no_binding() {
     let mut request = d.request(
         Operation::Lookup(LookupKey::SamAccountName("alice".into())),
         "admin1",
-        &[],
     );
     request.requester = ticket_bound_to("admin1", None);
     let prepared = d.run_request(&request).read();
     assert!(prepared.reply().is_some());
 }
 
-/// The key plane (docs/51 §5.6): `PolicyAdmin` is a write, so a
-/// `RequestKeyOperation` whose ticket keyd verified for another digest is
-/// refused at layer 2, and an `Approve` likewise — an approver's AP-REQ
-/// authorizes exactly the `Approve` it was made for.
+/// The key plane (docs/51 §5.6), through the one mechanism (task D2-c):
+/// `PolicyAdmin` is a write, so a `Propose` of a key operation whose ticket
+/// keyd verified for another digest — or reported unbound — is refused at
+/// layer 2, and nothing is held.
 #[test]
 fn key_steps_need_the_steps_own_binding() {
-    let d = Domain::new("bind-key");
-    let mut table = KeyRequests::new(
-        directory_admin::KeyTargets {
-            krbtgt: guid(KRBTGT),
-            // Only the krbtgt is named below; no service object is a target.
-            services: std::collections::BTreeSet::new(),
-        },
-        directory_admin::KEY_REQUEST_LIFETIME,
-        0,
-    )
-    .unwrap();
-    let request = KeyAdminOperation::RequestKeyOperation {
-        operation: KeyOperation::RotateKrbtgt,
-    };
-    let step = |table: &mut KeyRequests,
-                request: &KeyAdminOperation,
-                sam: &str,
-                bound: Option<OperationDigest>| {
-        let view = d.view();
-        let ticket = ticket_bound_to(sam, bound);
-        let mut honour = |_: &[pdp::Obligation]| true;
-        d.admin.key_step(
-            table,
-            1,
-            request,
-            &TEST_DIGEST,
-            Some(&ticket),
-            0,
-            &view,
-            &d.policy,
-            &now(),
-            &mut honour,
-        )
-    };
+    let mut d = Domain::new("bind-key");
+    with_policy_admin(&mut d);
     for bound in [Some(OTHER), None] {
-        let r = step(&mut table, &request, "admin1", bound).unwrap_err();
+        let request = directory_admin::ProposeRequest {
+            operation_id: 1,
+            operation: ProposedOperation::Key(KeyOperation::RotateKrbtgt),
+            operation_digest: fingerprint(&KeyOperation::RotateKrbtgt),
+            request_digest: TEST_DIGEST,
+            reason_ref: None,
+            requester: ticket_bound_to("admin1", bound),
+        };
+        let r = d.propose_request(&request).unwrap_err();
         assert_eq!(refusal_code(&r), AdminRefusal::PolicyDenied, "{bound:?}");
         assert_eq!(r.event().pdp.unwrap().code, PdpReasonCode::WeakTransport);
     }
-    assert!(table.is_empty());
+    assert!(d.requests.is_empty());
 }

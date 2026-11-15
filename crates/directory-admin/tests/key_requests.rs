@@ -1,28 +1,30 @@
-//! The pending key-operation requests (task A10; A-102): the operation
-//! digest binds every field of the request, the table's lifetime is
-//! bounded, the operations' codes and purposes; and the steps against the
-//! provisioned test domain (tests/common): the `Approve` that completes the
-//! quorum yields the decision dird registers in keyd (docs/52 §4.3), one
-//! that does not yields none, and an approval after the quorum is a
-//! conflict. The key set of a service object carries the purpose its name
-//! derives — `AdminService` for the admin service, `Service` for the LDAP
-//! service (docs/52 R2b). The registration itself runs against the real
-//! dird and keyd in crates/directory-daemon tests/admin_service.rs.
+//! Key operations through the one dual-control mechanism (task D2-c;
+//! docs/questions/Q-882, A-148 — task A10's key-only table and steps are
+//! retired): the operations' codes and the key sets they act on; and the
+//! steps against the provisioned test domain (tests/common): a key
+//! operation is proposed like every other dual-controlled operation, the
+//! `Approve` that completes the quorum yields the decision dird registers
+//! in keyd (docs/52 §4.3), one that does not yields none, an approval after
+//! the quorum is a conflict, and a decision that could not be registered
+//! reverts its approval; an approved key request is neither withdrawn nor
+//! rejected (its decision is in keyd). The key set of a service object carries the
+//! purpose its name derives — `AdminService` for the admin service,
+//! `Service` for the LDAP service (docs/52 R2b). The registration itself
+//! runs against the real dird and keyd in crates/directory-daemon
+//! tests/admin_service.rs.
 //!
-//! Sources: docs/51 §5.6 ("the operation digest", "bounded in time"), §6;
-//! docs/24 §6 (principle: sign the exact operation); docs/10 §1, §7;
-//! docs/questions/Q-420, Q-460, Q-491 item 1, Q-493 item 1; docs/52 §4.2,
-//! §4.3 (A-102), R2b. Every value is
+//! Sources: docs/51 §5.6, §6; docs/24 §6 (principle: sign the exact
+//! operation); docs/10 §1, §7; docs/questions/Q-420, Q-460, Q-491 item 1,
+//! Q-493 item 1, Q-882; docs/52 §4.2, §4.3 (A-102), R2b. Every value is
 //! constructed by hand for these tests; no vector comes from any other
-//! implementation (SHA-256 itself is the approved `sha2`'s — only its use is
-//! checked here).
+//! implementation.
 
 mod common;
 
-use core::time::Duration;
+use common::{request_view, with_policy_admin, Domain};
 use directory_admin::{
-    operation_digest, ConfigError, KeyAdminOperation, KeyOperation, KeyRef, KeyReply, KeyRequests,
-    KeyStep, KeyTargets, RegistrationOutcome, KEY_REQUEST_LIFETIME, MAX_KEY_REQUEST_LIFETIME,
+    KeyOperation, KeyRef, KeyTargets, ProposedOperation, RegistrationOutcome, RequestState,
+    RequestStep, StepReply,
 };
 use dtyp::Guid;
 use ipc_audit::{
@@ -60,62 +62,15 @@ fn service_key(g: Guid, class: &str, host: &str) -> ServiceKeyHandle {
     ServiceKeyHandle::of_service(PrincipalId::from_bytes(g.to_packet()), &spn(class, host))
 }
 
-/// The krbtgt key set of the account `g`.
-fn krbtgt_key(g: Guid) -> KeyHandle {
-    KeyHandle::new(PrincipalId::from_bytes(g.to_packet()), KeyPurpose::Krbtgt)
+fn principal(g: Guid) -> PrincipalId {
+    PrincipalId::from_bytes(g.to_packet())
 }
 
-/// docs/51 §5.6; docs/24 §6: the digest is a function of the request — the
-/// same inputs give the same digest; changing the id, the operation, its
-/// kvno, the key set, the requester or the expiry changes it.
-#[test]
-fn the_digest_binds_every_field() {
-    let k = krbtgt_key;
-    let base = operation_digest(7, &KeyOperation::RotateKrbtgt, k(guid(1)), guid(2), 1000);
-    assert_eq!(
-        base,
-        operation_digest(7, &KeyOperation::RotateKrbtgt, k(guid(1)), guid(2), 1000)
-    );
-    let retire = |kvno| KeyOperation::RetireKvno {
-        key: KeyRef::Krbtgt,
-        kvno,
-    };
-    let rotate = KeyOperation::RotateKey { service: guid(1) };
-    let variants = [
-        operation_digest(8, &KeyOperation::RotateKrbtgt, k(guid(1)), guid(2), 1000),
-        operation_digest(7, &retire(0), k(guid(1)), guid(2), 1000),
-        operation_digest(7, &retire(1), k(guid(1)), guid(2), 1000),
-        operation_digest(7, &retire(2), k(guid(1)), guid(2), 1000),
-        operation_digest(
-            7,
-            &rotate,
-            service_key(guid(1), "ldap", "dc01.example.test").handle(),
-            guid(2),
-            1000,
-        ),
-        // The same object and operation under the other service purpose
-        // (docs/52 R2b): the digest binds the purpose too.
-        operation_digest(
-            7,
-            &rotate,
-            service_key(guid(1), "admind", "dc01.example.test").handle(),
-            guid(2),
-            1000,
-        ),
-        operation_digest(7, &KeyOperation::RotateKrbtgt, k(guid(3)), guid(2), 1000),
-        operation_digest(7, &KeyOperation::RotateKrbtgt, k(guid(1)), guid(4), 1000),
-        operation_digest(7, &KeyOperation::RotateKrbtgt, k(guid(1)), guid(2), 1001),
-    ];
-    let mut all: BTreeSet<[u8; 32]> = variants.iter().copied().collect();
-    assert_eq!(all.len(), variants.len());
-    assert!(all.insert(base), "every variant differs from the base");
-}
-
-/// docs/10 §1, §7: the keyd operation of each request, and the key set it
-/// acts on — the krbtgt's `Krbtgt` key set, or the service object's key set
-/// with the purpose its name derives (docs/52 R2b; Q-493 item 1): `Service`
-/// for `ldap/<host>`, `AdminService` for `admind/<host>`; a service object
-/// that is no target names no key set.
+/// docs/10 §1, §7: the keyd operation of each key operation, and the key
+/// set it acts on — the krbtgt's `Krbtgt` key set, or the service object's
+/// key set with the purpose its name derives (docs/52 R2b; Q-493 item 1):
+/// `Service` for `ldap/<host>`, `AdminService` for `admind/<host>`; a
+/// service object that is no target names no key set.
 #[test]
 fn operations_name_their_keyd_operation_and_purpose() {
     let (ldap, admin, other) = (guid(5), guid(6), guid(9));
@@ -162,15 +117,6 @@ fn operations_name_their_keyd_operation_and_purpose() {
         ),
         (
             KeyOperation::RetireKvno {
-                key: KeyRef::Service(ldap),
-                kvno: 1,
-            },
-            KeydOperation::RetireKvno,
-            Some((ldap, KeyPurpose::Service)),
-            false,
-        ),
-        (
-            KeyOperation::RetireKvno {
                 key: KeyRef::Service(admin),
                 kvno: 1,
             },
@@ -186,174 +132,32 @@ fn operations_name_their_keyd_operation_and_purpose() {
         );
         assert_eq!(operation.answers_kvno(), kvno);
     }
-    // Both steps carry a ticket (keyadm's ticketless steps are retired —
-    // A-102); `Approve` reserves two events (its decision and the outcome of
-    // its decision's registration in keyd — docs/52 §4.3).
-    let steps = [
-        (
-            KeyAdminOperation::RequestKeyOperation {
-                operation: KeyOperation::RotateKrbtgt,
-            },
-            DirAdminOperation::RequestKeyOperation,
-            true,
-            1,
-        ),
-        (
-            KeyAdminOperation::Approve {
-                id: 1,
-                operation: KeyOperation::RotateKrbtgt,
-            },
-            DirAdminOperation::Approve,
-            true,
-            2,
-        ),
-    ];
-    for (step, code, ticket, events) in steps {
-        assert_eq!(step.code(), code);
-        assert_eq!(step.takes_ticket(), ticket);
-        assert_eq!(step.audit_events(), events);
-    }
 }
 
-/// docs/51 §5.6 ("bounded in time"): the lifetime is 1 s ..= one hour; a
-/// new table is empty.
-#[test]
-fn the_lifetime_is_bounded() {
-    let targets = || KeyTargets {
-        krbtgt: guid(1),
-        services: BTreeSet::from([
-            service_key(guid(2), "ldap", "dc01.example.test"),
-            service_key(guid(3), "admind", "dc01.example.test"),
-        ]),
-    };
-    for lifetime in [
-        Duration::ZERO,
-        MAX_KEY_REQUEST_LIFETIME + Duration::from_secs(1),
-    ] {
-        assert_eq!(
-            KeyRequests::new(targets(), lifetime, 0).unwrap_err(),
-            ConfigError::KeyRequestLifetime
-        );
-    }
-    for lifetime in [
-        Duration::from_secs(1),
-        KEY_REQUEST_LIFETIME,
-        MAX_KEY_REQUEST_LIFETIME,
-    ] {
-        let table = KeyRequests::new(targets(), lifetime, 0).unwrap();
-        assert!(table.is_empty());
-        assert_eq!(table.len(), 0);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The steps against the provisioned test domain (A-102).
-// ---------------------------------------------------------------------------
-
-/// The test domain's policy plus `PolicyAdmin` on every policy scope for the
-/// Tier-0 group — provision's rule 4 (docs/questions/Q-420 item 1: the
-/// key operations ask `PolicyAdmin` on `Policy { scope: "keys" }`).
-fn with_policy_admin(d: &mut common::Domain) {
-    let mut rules = d.policy.rules().to_vec();
-    rules.push(pdp::Rule {
-        id: pdp::RuleId(9),
-        effect: pdp::Effect::Allow,
-        when: pdp::Match {
-            action: pdp::ActionMatch::Exact(pdp::Action::PolicyAdmin),
-            resource: pdp::ResourceMatch::Policy { scope: None },
-            subject: pdp::SubjectMatch::MemberOf(common::sid_of(common::TIER0_GROUP)),
-            context: pdp::ContextMatch::ANY,
-            auth: pdp::AuthMatch::ANY,
-        },
-        obligations: vec![],
-    });
-    d.policy = pdp::PolicySnapshot::new(d.policy.version(), rules, vec![]);
-}
-
-/// The domain's key sets: its krbtgt (RID 502) and its two service objects,
-/// each named by the SPN tests/common gives it (`ldap/dc01.example.test`,
-/// `admind/dc01.example.test`) through the one derivation (docs/52 R2b).
-fn domain_targets() -> KeyTargets {
-    KeyTargets {
-        krbtgt: common::guid(common::KRBTGT),
-        services: BTreeSet::from([
-            service_key(common::guid(common::LDAP_SVC), "ldap", "dc01.example.test"),
-            service_key(
-                common::guid(common::ADMIND_SVC),
-                "admind",
-                "dc01.example.test",
-            ),
-        ]),
-    }
-}
-
-/// One step by `sam` at `common::now()`.
-fn step(
-    d: &common::Domain,
-    table: &mut KeyRequests,
-    id: u64,
-    request: &KeyAdminOperation,
-    sam: &str,
-) -> Result<KeyStep, directory_admin::Refusal> {
-    let view = d.view();
-    let ticket = common::ticket(sam);
-    let mut honour = |_: &[pdp::Obligation]| true;
-    d.admin.key_step(
-        table,
-        id,
-        request,
-        &common::TEST_DIGEST,
-        Some(&ticket),
-        0,
-        &view,
-        &d.policy,
-        &common::now(),
-        &mut honour,
-    )
-}
-
-fn principal(g: Guid) -> PrincipalId {
-    PrincipalId::from_bytes(g.to_packet())
+/// admin1 proposes `operation`; returns the request's id and digest.
+fn proposed(d: &mut Domain, operation: KeyOperation) -> (u64, keyd_types::OperationDigest) {
+    let proposed = d
+        .propose(ProposedOperation::Key(operation), "admin1", None)
+        .unwrap();
+    assert!(proposed.reply().state == RequestState::Pending);
+    (proposed.reply().id, proposed.reply().digest)
 }
 
 /// docs/52 §4.3 (the key-operation rows), docs/51 §5.6 (R51-11: the
 /// requester plus one other approver; `DualControlToken { approver_1: the
 /// requester, approver_2: the approver }`), Q-460 (the decision lives no
-/// longer than its request): with quorum 2, the requester's
-/// `RequestKeyOperation` yields no decision; admin2's `Approve` completes the
-/// quorum and yields the decision — id = the request's id, the krbtgt's
-/// `RotateKrbtgt`, approvers [admin1, admin2], the request's remaining
-/// lifetime; a further approval is a `Conflict` and yields nothing.
+/// longer than its request): with quorum 2, admin1's `Propose` yields no
+/// decision; admin2's `Approve` completes the quorum and yields the decision
+/// — id = the request's id, the krbtgt's `RotateKrbtgt`, approvers
+/// [admin1, admin2], the request's remaining lifetime; a further approval is
+/// a `Conflict` and yields nothing.
 #[test]
 fn the_quorum_completing_approve_yields_the_decision() {
-    let mut d = common::Domain::new("kr-decision");
+    let mut d = Domain::new("kr-decision");
     with_policy_admin(&mut d);
-    let mut table = KeyRequests::new(domain_targets(), KEY_REQUEST_LIFETIME, 1000).unwrap();
-    let opened = step(
-        &d,
-        &mut table,
-        1,
-        &KeyAdminOperation::RequestKeyOperation {
-            operation: KeyOperation::RotateKrbtgt,
-        },
-        "admin1",
-    )
-    .unwrap();
-    assert!(opened.decision().is_none());
-    let KeyReply::Request(view) = opened.reply();
-    let id = view.id;
-    let approved = step(
-        &d,
-        &mut table,
-        2,
-        &KeyAdminOperation::Approve {
-            id,
-            operation: KeyOperation::RotateKrbtgt,
-        },
-        "admin2",
-    )
-    .unwrap();
-    let decision = approved.decision().unwrap();
+    let (id, digest) = proposed(&mut d, KeyOperation::RotateKrbtgt);
+    let approved = d.approve(id, digest, "admin2").unwrap();
+    let decision = approved.decision().unwrap().clone();
     assert_eq!(decision.id, DecisionId::new(id));
     assert_eq!(
         decision.operation,
@@ -370,28 +174,35 @@ fn the_quorum_completing_approve_yields_the_decision() {
     );
     assert_eq!(
         u64::from(decision.lifetime_secs),
-        KEY_REQUEST_LIFETIME.as_secs()
+        directory_admin::REQUEST_LIFETIME.as_secs()
     );
-    // Its decision event, then (built on demand) its registration's outcome.
-    assert_eq!(approved.events().len(), 1);
-    assert!(matches!(
-        approved.events()[0].stage,
-        DirAdminStage::Decision(DecisionResult::Proceed)
-    ));
+    assert_eq!(request_view(&approved).state, RequestState::Approved);
+    // Its decision event names the step, the request, the key operation and
+    // its fingerprint (Q-888); its registration's outcome is built on demand.
+    let event = approved.event();
+    assert_eq!(event.operation, DirAdminOperation::Approve);
     assert_eq!(
-        approved
+        event.stage,
+        DirAdminStage::Decision(DecisionResult::Proceed)
+    );
+    assert_eq!(event.pending_request, Some(id));
+    assert_eq!(event.key_operation, Some(KeydOperation::RotateKrbtgt));
+    assert_eq!(event.operation_digest, *digest.as_bytes());
+    let quorum = approved.into_quorum().unwrap();
+    assert_eq!(
+        quorum
             .registration_event(RegistrationOutcome::Registered)
             .stage,
         DirAdminStage::Outcome(OutcomeResult::Committed { allocated: None })
     );
     assert_eq!(
-        approved
+        quorum
             .registration_event(RegistrationOutcome::Refused)
             .stage,
         DirAdminStage::Outcome(OutcomeResult::Refused(AdminRefusal::KeyOperationRefused))
     );
     assert_eq!(
-        approved
+        quorum
             .registration_event(RegistrationOutcome::OutcomeUnknown)
             .stage,
         DirAdminStage::Outcome(OutcomeResult::Failed(
@@ -399,46 +210,34 @@ fn the_quorum_completing_approve_yields_the_decision() {
         ))
     );
     // After the quorum: a conflict, no decision.
-    let again = step(
-        &d,
-        &mut table,
-        3,
-        &KeyAdminOperation::Approve {
-            id,
-            operation: KeyOperation::RotateKrbtgt,
-        },
-        "admin2",
+    let again = d.approve(id, digest, "admin2").unwrap_err();
+    assert_eq!(
+        again.event().stage,
+        DirAdminStage::Decision(DecisionResult::Refused(AdminRefusal::Conflict))
     );
-    assert!(again.is_err());
 }
 
 /// docs/52 §4.3; Q-453 item 1 (fail closed): when the decision could not be
-/// registered, dird withdraws the approval that completed the quorum — the
-/// approver may approve again, and the same decision is yielded again (keyd
-/// accepts an identical decision unchanged). A retire decision names the
-/// key set and the kvno (Q-420 item 4).
+/// registered, dird reverts the approval that completed the quorum — the
+/// request is pending again, the approver may approve again, and the same
+/// decision is yielded again (keyd accepts an identical decision
+/// unchanged). A retire decision names the key set and the kvno (Q-420
+/// item 4).
 #[test]
-fn a_withdrawn_approval_can_be_given_again() {
-    let mut d = common::Domain::with_quorum("kr-withdraw", 2);
+fn a_reverted_approval_can_be_given_again() {
+    let mut d = Domain::new("kr-revert");
     with_policy_admin(&mut d);
-    let mut table = KeyRequests::new(domain_targets(), KEY_REQUEST_LIFETIME, 2000).unwrap();
     let operation = KeyOperation::RetireKvno {
         key: KeyRef::Service(common::guid(common::LDAP_SVC)),
         kvno: 4,
     };
-    let opened = step(
-        &d,
-        &mut table,
-        1,
-        &KeyAdminOperation::RequestKeyOperation { operation },
-        "admin1",
-    )
-    .unwrap();
-    let KeyReply::Request(view) = opened.reply();
-    let id = view.id;
-    let approve = KeyAdminOperation::Approve { id, operation };
-    let first = step(&d, &mut table, 2, &approve, "admin2").unwrap();
-    let decision = first.decision().unwrap().clone();
+    let (id, digest) = proposed(&mut d, operation);
+    let decision = d
+        .approve(id, digest, "admin2")
+        .unwrap()
+        .decision()
+        .unwrap()
+        .clone();
     assert_eq!(
         decision.operation,
         DecidedOperation::RetireKvno {
@@ -449,9 +248,12 @@ fn a_withdrawn_approval_can_be_given_again() {
             kvno: Kvno::new(4),
         }
     );
-    assert!(table.withdraw(&decision));
-    assert!(!table.withdraw(&decision), "only the completing approval");
-    let second = step(&d, &mut table, 3, &approve, "admin2").unwrap();
+    assert!(d.requests.revert_approval(&decision));
+    assert!(
+        !d.requests.revert_approval(&decision),
+        "only the completing approval"
+    );
+    let second = d.approve(id, digest, "admin2").unwrap();
     assert_eq!(second.decision(), Some(&decision));
 }
 
@@ -461,64 +263,33 @@ fn a_withdrawn_approval_can_be_given_again() {
 /// approval is the only one possible here).
 #[test]
 fn a_non_completing_approve_yields_no_decision() {
-    let mut d = common::Domain::with_quorum("kr-quorum3", 3);
+    let mut d = Domain::with_quorum("kr-quorum3", 3);
     with_policy_admin(&mut d);
-    let mut table = KeyRequests::new(domain_targets(), KEY_REQUEST_LIFETIME, 3000).unwrap();
-    let operation = KeyOperation::RotateKey {
-        service: common::guid(common::ADMIND_SVC),
-    };
-    let opened = step(
-        &d,
-        &mut table,
-        1,
-        &KeyAdminOperation::RequestKeyOperation { operation },
-        "admin1",
-    )
-    .unwrap();
-    let KeyReply::Request(view) = opened.reply();
-    let approved = step(
-        &d,
-        &mut table,
-        2,
-        &KeyAdminOperation::Approve {
-            id: view.id,
-            operation,
+    let (id, digest) = proposed(
+        &mut d,
+        KeyOperation::RotateKey {
+            service: common::guid(common::ADMIND_SVC),
         },
-        "admin2",
-    )
-    .unwrap();
+    );
+    let approved = d.approve(id, digest, "admin2").unwrap();
     assert!(approved.decision().is_none());
-    let KeyReply::Request(view) = approved.reply();
+    let view = request_view(&approved);
     assert_eq!((view.approvals, view.quorum), (1, 3));
+    assert_eq!(view.state, RequestState::Pending);
 }
 
-/// The decision of a quorum-completing `Approve` of `operation`, requested
+/// The decision of a quorum-completing `Approve` of `operation`, proposed
 /// by admin1 and approved by admin2 against the test domain.
-fn decided(table_seed: u64, operation: KeyOperation) -> DecidedOperation {
-    let mut d = common::Domain::new("kr-r2b");
+fn decided(name: &str, operation: KeyOperation) -> DecidedOperation {
+    let mut d = Domain::new(name);
     with_policy_admin(&mut d);
-    let mut table = KeyRequests::new(domain_targets(), KEY_REQUEST_LIFETIME, table_seed).unwrap();
-    let opened = step(
-        &d,
-        &mut table,
-        1,
-        &KeyAdminOperation::RequestKeyOperation { operation },
-        "admin1",
-    )
-    .unwrap();
-    let KeyReply::Request(view) = opened.reply();
-    let approved = step(
-        &d,
-        &mut table,
-        2,
-        &KeyAdminOperation::Approve {
-            id: view.id,
-            operation,
-        },
-        "admin2",
-    )
-    .unwrap();
-    approved.decision().unwrap().operation.clone()
+    let (id, digest) = proposed(&mut d, operation);
+    d.approve(id, digest, "admin2")
+        .unwrap()
+        .decision()
+        .unwrap()
+        .operation
+        .clone()
 }
 
 /// docs/52 R2b; docs/questions/Q-493 item 1 (the fix): `rotate_key` and
@@ -539,7 +310,7 @@ fn the_admin_service_key_operations_name_its_admin_service_key_set() {
     );
     assert_eq!(
         decided(
-            4000,
+            "kr-r2b-1",
             KeyOperation::RotateKey {
                 service: common::guid(common::ADMIND_SVC)
             }
@@ -548,7 +319,7 @@ fn the_admin_service_key_operations_name_its_admin_service_key_set() {
     );
     assert_eq!(
         decided(
-            5000,
+            "kr-r2b-2",
             KeyOperation::RetireKvno {
                 key: KeyRef::Service(common::guid(common::ADMIND_SVC)),
                 kvno: 1,
@@ -561,7 +332,7 @@ fn the_admin_service_key_operations_name_its_admin_service_key_set() {
     );
     assert_eq!(
         decided(
-            6000,
+            "kr-r2b-3",
             KeyOperation::RotateKey {
                 service: common::guid(common::LDAP_SVC)
             }
@@ -573,16 +344,13 @@ fn the_admin_service_key_operations_name_its_admin_service_key_set() {
 /// Attack (docs/52 R2b, class "one fact derived in two places"): a key
 /// operation cannot name a purpose that contradicts the service's name.
 /// The operation carries no purpose at all; the only purpose it gets is the
-/// target's, which only the derivation from the name builds — so whatever
-/// table a caller assembles, the admin service's object is `AdminService`
-/// and nothing else is (the type has no other constructor: a hand-built
-/// `(admind GUID, Service)` target does not compile). An approval naming a
-/// service object outside the targets matches no request
-/// (`OperationMismatch`), and a request for it is `ValueInvalid`.
+/// target's, which only the derivation from the name builds. A proposal for
+/// a service object outside the targets is `ValueInvalid`, and an approval
+/// naming another digest than the request's is `OperationMismatch`; a kvno
+/// of 0 is `ValueInvalid`.
 #[test]
 fn a_key_operation_cannot_name_a_purpose_against_the_name() {
     let admin = common::guid(common::ADMIND_SVC);
-    // Whatever name a caller hands the derivation, the purpose follows it.
     for (class, purpose) in [
         ("admind", KeyPurpose::AdminService),
         ("ldap", KeyPurpose::Service),
@@ -598,46 +366,70 @@ fn a_key_operation_cannot_name_a_purpose_against_the_name() {
             Some(purpose)
         );
     }
-    // A service object that is not a target.
-    let mut d = common::Domain::new("kr-r2b-attack");
+    let mut d = Domain::new("kr-r2b-attack");
     with_policy_admin(&mut d);
-    let mut table = KeyRequests::new(domain_targets(), KEY_REQUEST_LIFETIME, 7000).unwrap();
-    let outsider = KeyOperation::RotateKey {
+    for outsider in [
+        KeyOperation::RotateKey {
+            service: common::guid(common::BOB),
+        },
+        KeyOperation::RetireKvno {
+            key: KeyRef::Krbtgt,
+            kvno: 0,
+        },
+    ] {
+        let refused = d
+            .propose(ProposedOperation::Key(outsider), "admin1", None)
+            .unwrap_err();
+        assert_eq!(
+            refused.event().stage,
+            DirAdminStage::Decision(DecisionResult::Refused(AdminRefusal::ValueInvalid))
+        );
+    }
+    let (id, _) = proposed(&mut d, KeyOperation::RotateKey { service: admin });
+    let other = common::fingerprint(&KeyOperation::RotateKey {
         service: common::guid(common::BOB),
-    };
-    assert!(step(
-        &d,
-        &mut table,
-        1,
-        &KeyAdminOperation::RequestKeyOperation {
-            operation: outsider
-        },
-        "admin1",
-    )
-    .is_err());
-    let rotate = KeyOperation::RotateKey { service: admin };
-    let opened = step(
-        &d,
-        &mut table,
-        2,
-        &KeyAdminOperation::RequestKeyOperation { operation: rotate },
-        "admin1",
-    )
-    .unwrap();
-    let KeyReply::Request(view) = opened.reply();
-    let refused = step(
-        &d,
-        &mut table,
-        3,
-        &KeyAdminOperation::Approve {
-            id: view.id,
-            operation: outsider,
-        },
-        "admin2",
-    )
-    .unwrap_err();
+    });
+    let refused = d.approve(id, other, "admin2").unwrap_err();
     assert_eq!(
         refused.event().stage,
         DirAdminStage::Decision(DecisionResult::Refused(AdminRefusal::OperationMismatch))
     );
+}
+
+/// docs/52 §4.3 (A-102: the decision is registered in keyd at the quorum),
+/// Q-460 (it lives for the request's remaining lifetime), class C14 (one
+/// fact, one holder — docs/questions/Q-937 item 6): a pending key request
+/// may be withdrawn, but once its quorum is reached neither its requester's
+/// `Withdraw` nor an approver's `Reject` is answered "done" — keyd's
+/// decision would not be revoked — so both are a `Conflict`, and the request
+/// stays approved.
+#[test]
+fn an_approved_key_request_is_not_withdrawn_or_rejected() {
+    let mut d = Domain::new("kr-handed-over");
+    with_policy_admin(&mut d);
+    let (pending, _) = proposed(&mut d, KeyOperation::RotateKrbtgt);
+    let withdrawn = d
+        .step(RequestStep::Withdraw { id: pending }, "admin1")
+        .unwrap();
+    assert_eq!(withdrawn.reply(), &StepReply::Done);
+
+    let (id, digest) = proposed(&mut d, KeyOperation::RotateKrbtgt);
+    let approved = d.approve(id, digest, "admin2").unwrap();
+    assert!(approved.decision().is_some());
+    for (step, caller) in [
+        (RequestStep::Withdraw { id }, "admin1"),
+        (RequestStep::Reject { id, digest }, "admin2"),
+    ] {
+        let refused = d.step(step, caller).unwrap_err();
+        assert_eq!(
+            refused.event().stage,
+            DirAdminStage::Decision(DecisionResult::Refused(AdminRefusal::Conflict))
+        );
+        assert_eq!(refused.event().pending_request, Some(id));
+    }
+    let shown = d.step(RequestStep::Show { id }, "admin1").unwrap();
+    let StepReply::Shown(detail) = shown.reply() else {
+        panic!("{:?}", shown.reply());
+    };
+    assert_eq!(detail.state, RequestState::Approved);
 }

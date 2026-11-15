@@ -19,18 +19,24 @@
 //! 5. The semantic checks of §11 and §5.2 (protected objects, classes,
 //!    membership rules, the cycle refusal, the member limit, values already
 //!    taken, the new object's descriptor) and the counters' presence.
-//! 6. Dual control (§5.6, P-22): every supplied approval is checked
-//!    (Subject, ticket age, distinct from the requester and from the other
-//!    approvers, `decide` = Allow for the same Action and Resource); when
-//!    the operation needs it, too few approvals ⇒ `ApprovalRequired`.
-//! 7. The self-lockout guard (Q-295 item 4).
+//! 6. The self-lockout guard (Q-295 item 4).
+//! 7. Dual control (§5.6, P-22) — **one mechanism** (task D2-c;
+//!    docs/questions/Q-882, A-148): each handler only *classifies* the
+//!    operation ([`Dual`]: whether its rule needs an approver, and the
+//!    Action and Resource every approver must be allowed). When it does,
+//!    the operation runs only by consuming an **approved pending request**
+//!    dird holds for exactly this operation (its digest and its fields) and
+//!    this requester (crate::requests): every approver and every object the
+//!    operation depends on are re-evaluated against this view first (class
+//!    C43), and the request is consumed. Without one ⇒ `ApprovalRequired`.
+//!    There are no approvals inside a request (the field is retired).
 //!
 //! Spec: docs/51 §5.2-§5.7, §7.4, §8, §9, §10, §11; A-72..A-79, A-83..A-85,
-//! P-22.
+//! P-22; docs/questions/Q-882.
 
 use dirstore::{AttrId, CounterState, Object};
 use dtyp::{Guid, Sid};
-use ipc_audit::{AdminFailure, AdminRefusal, DirAdminEvent, EventBody, MAX_APPROVERS};
+use ipc_audit::{AdminFailure, AdminRefusal, DirAdminEvent, EventBody};
 use ipc_audit_client::IntentRecord;
 use keyd_types::{
     KeyHandle, KeyPurpose, OperationDigest, PrincipalBinding, PrincipalId, ServiceKeyHandle,
@@ -69,7 +75,8 @@ use crate::operation::{
 use crate::random::RandomSource;
 use crate::record;
 use crate::reply::{KeyTarget, LookupResult, PasswordSetReply, Reply};
-use crate::subject::{all_bound, AdminSubject, SubjectError, VerifiedTicket};
+use crate::requests::{Basis, PendingRequests, ProposedOperation};
+use crate::subject::{AdminSubject, SubjectError, VerifiedTicket};
 use crate::time;
 
 /// The control access right User-Force-Change-Password: rightsGuid
@@ -91,9 +98,12 @@ pub const USER_FORCE_CHANGE_PASSWORD: Guid = Guid {
 /// plane writes "never" as this value only).
 pub const ACCOUNT_EXPIRES_NEVER: i64 = i64::MAX;
 
-/// One admin request, after the caller verified every AP-REQ through keyd.
-/// Spec: docs/51 §7.2 (`auth := requester ‖ approvals`), §7.3; docs/52 §5
-/// item 4 (the operation digest).
+/// One admin request, after the caller verified its AP-REQ through keyd.
+/// There are no approvals in it: dual control is a pending request dird
+/// holds (crate::requests; docs/questions/Q-882 — the in-request approvals
+/// of docs/51 §7.2 are retired).
+/// Spec: docs/51 §7.2 (`auth`), §7.3; docs/52 §5 item 4 (the operation
+/// digest); docs/questions/Q-882.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
     /// dird's number for the operation: its `Decision` and `Outcome`
@@ -102,15 +112,15 @@ pub struct Request {
     /// The operation.
     pub operation: Operation,
     /// The operation digest dird computed from the request it decoded
-    /// (crate ipc-dird-admin `operation_digest`) and had keyd verify every
-    /// AP-REQ against. The PEP reports `channel_bound` to the PDP only when
-    /// every ticket below carries exactly this digest (R2).
+    /// (crate ipc-dird-admin `operation_digest`) and had keyd verify the
+    /// AP-REQ against — the operation's fingerprint (docs/questions/Q-888):
+    /// every event of the operation carries it, and an approved pending
+    /// request is matched by it. The PEP reports `channel_bound` to the PDP
+    /// only when the ticket below carries exactly this digest (R2).
     /// Spec: docs/52 §5 items 1, 4; RFC 4120 §5.5.1.
     pub operation_digest: OperationDigest,
     /// The requester's verified ticket.
     pub requester: VerifiedTicket,
-    /// The approvers' verified tickets (at most two, docs/51 §7.2).
-    pub approvals: Vec<VerifiedTicket>,
 }
 
 /// Which AP-REQ keyd did not verify — for the refusal the caller records
@@ -119,10 +129,53 @@ pub struct Request {
 pub enum VerificationFailure {
     /// The requester's AP-REQ did not verify (`Unauthenticated`).
     Requester,
-    /// An approver's AP-REQ did not verify (`ApproverUnauthenticated`).
+    /// An approver's AP-REQ (of an `Approve` / `Reject`) did not verify
+    /// (`ApproverUnauthenticated`).
     Approver,
     /// keyd did not answer (`Failed(KeydUnavailable)`, A-56).
     KeydUnavailable,
+}
+
+/// How an operation's rule classifies it for dual control (docs/51 §5.6,
+/// P-22 item 1): whether it needs an approver, and the Action and Resource
+/// every approver must be allowed — the requester's own (P-22 item 2: "the
+/// same Action and Resource"). Each handler computes it; crate::requests
+/// alone acts on it (one mechanism — docs/52 C14; docs/questions/Q-882).
+/// Spec: docs/51 §5.6 (R51-11); P-22; docs/questions/Q-882.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Dual {
+    /// No approver is needed.
+    NotRequired,
+    /// An approver is needed; each must be allowed `action` on `resource`.
+    Required {
+        /// The operation's Action.
+        action: Action,
+        /// The operation's Resource.
+        resource: Resource,
+    },
+}
+
+impl Dual {
+    /// The classification of an operation whose rule `required` holds.
+    pub(crate) fn of(required: bool, action: &Action, resource: &Resource) -> Dual {
+        if required {
+            Dual::Required {
+                action: action.clone(),
+                resource: resource.clone(),
+            }
+        } else {
+            Dual::NotRequired
+        }
+    }
+}
+
+/// What one operation's checks produced: the plan, the obligations of the
+/// requester's Allow, and the dual-control classification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Handled {
+    pub(crate) plan: Plan,
+    pub(crate) obligations: Vec<Obligation>,
+    pub(crate) dual: Dual,
 }
 
 /// What `apply` will write, with the state `prepare` decided on.
@@ -287,19 +340,21 @@ impl<R: RandomSource> DirectoryAdmin<R> {
     }
 
     /// The refusal of a request whose AP-REQ keyd did not verify: the
-    /// `Decision` event to record (no requester SID — none was verified)
-    /// and the uniform `Denied` (or `Unavailable` when keyd is down).
+    /// `Decision` event to record (no requester SID — none was verified;
+    /// the operation's digest, `operation_digest`, as dird computed it) and
+    /// the uniform `Denied` (or `Unavailable` when keyd is down).
     /// Spec: docs/51 §7.4 step 1 ("failure ⇒ `Denied` uniform (A-26), keyd
-    /// down ⇒ `Unavailable` (A-56)").
+    /// down ⇒ `Unavailable` (A-56)"); docs/questions/Q-888.
     #[must_use]
     pub fn refuse_unverified(
         &self,
         operation_id: u64,
         operation: &Operation,
+        operation_digest: &OperationDigest,
         failure: VerificationFailure,
         now: &KerberosTime,
     ) -> Refusal {
-        let base = EventBase::of_request(operation_id, operation);
+        let base = EventBase::of_request(operation_id, operation, operation_digest);
         let stop = match failure {
             VerificationFailure::Requester => Stop::Refused(AdminRefusal::Unauthenticated),
             VerificationFailure::Approver => Stop::Refused(AdminRefusal::ApproverUnauthenticated),
@@ -315,17 +370,28 @@ impl<R: RandomSource> DirectoryAdmin<R> {
     /// transaction's starting state (`apply` refuses otherwise — see
     /// `DirectoryAdmin::apply`).
     ///
+    /// An operation whose rule needs an approver consumes the approved
+    /// pending request `requests` holds for it (module documentation, step
+    /// 7) — at the decision: an approval allows one execution attempt,
+    /// whatever happens after `prepare` (fail closed).
+    ///
     /// `Err` carries the `Decision` event of the refusal (send it) and the
-    /// client-visible status. Spec: docs/51 §7.4 steps 2-4; A-85.
+    /// client-visible status. Spec: docs/51 §7.4 steps 2-4; A-85;
+    /// docs/questions/Q-882 item 2.
     pub fn prepare(
         &self,
         request: &Request,
+        requests: &mut PendingRequests,
         view: &DirectoryView<'_>,
         policy: &PolicySnapshot,
         now: &KerberosTime,
     ) -> Result<Prepared, Refusal> {
-        let mut base = EventBase::of_request(request.operation_id, &request.operation);
-        match self.checked(request, view, policy, now, &mut base) {
+        let mut base = EventBase::of_request(
+            request.operation_id,
+            &request.operation,
+            &request.operation_digest,
+        );
+        match self.checked(request, requests, view, policy, now, &mut base) {
             Ok((plan, obligations, requester)) => Ok(Prepared {
                 decision: base.proceed(now),
                 base,
@@ -341,6 +407,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
     fn checked(
         &self,
         request: &Request,
+        requests: &mut PendingRequests,
         view: &DirectoryView<'_>,
         policy: &PolicySnapshot,
         now: &KerberosTime,
@@ -354,11 +421,8 @@ impl<R: RandomSource> DirectoryAdmin<R> {
             return Err(Stop::Failed(AdminFailure::InternalFailure));
         }
         // R2 (docs/52 §5 item 4): the channel is bound only if keyd verified
-        // every ticket the request relies on bound to this very operation.
-        let bound = all_bound(
-            &request.operation_digest,
-            core::iter::once(&request.requester).chain(&request.approvals),
-        );
+        // the request's ticket bound to this very operation.
+        let bound = request.requester.bound_to(&request.operation_digest);
         let cx = Cx::new(
             &self.config,
             &self.ids,
@@ -376,36 +440,63 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         if requester.ticket_age() > self.config.ticket_age_max() {
             return Err(Stop::Refused(AdminRefusal::TicketAge));
         }
-        if request.approvals.len() > MAX_APPROVERS {
-            return Err(Stop::Refused(AdminRefusal::ValueInvalid));
-        }
         let ctx = OpCx {
             cx: &cx,
             requester: &requester,
-            approvals: &request.approvals,
         };
-        let (plan, obligations) = match &request.operation {
-            Operation::CreateUser(c) => self.create(&ctx, base, NewObject::User(c))?,
-            Operation::CreateComputer(c) => self.create(&ctx, base, NewObject::Computer(c))?,
-            Operation::CreateGroup(c) => self.create(&ctx, base, NewObject::Group(c))?,
-            Operation::CreateOu(c) => self.create(&ctx, base, NewObject::Ou(c))?,
-            Operation::CreateContainer(c) => self.create(&ctx, base, NewObject::Container(c))?,
-            Operation::BeginPasswordSet { target } => {
-                self.begin_password_set(&ctx, base, *target)?
-            }
-            Operation::CompletePasswordSet(c) => self.complete_password_set(&ctx, base, c)?,
-            Operation::SetEnabled(s) => self.set_enabled(&ctx, base, s)?,
-            Operation::SetAccountExpires(s) => self.set_account_expires(&ctx, base, s)?,
-            Operation::AddMember(m) => self.membership(&ctx, base, m, true)?,
-            Operation::RemoveMember(m) => self.membership(&ctx, base, m, false)?,
-            Operation::Delete { target } => self.delete(&ctx, base, *target)?,
-            Operation::Lookup(key) => self.lookup(&ctx, base, key)?,
-        };
-        let obligations = obligations
+        let handled = self.evaluate(&ctx, base, &request.operation)?;
+        // Step 7 — dual control, by the one mechanism (crate::requests).
+        if let Dual::Required { action, resource } = &handled.dual {
+            let basis = Basis::of_plan(&cx, &handled.plan)?;
+            self.consume_approved(
+                &cx,
+                requests,
+                &requester,
+                &ProposedOperation::Directory(request.operation.clone()),
+                &request.operation_digest,
+                action,
+                resource,
+                &basis,
+                base,
+            )?;
+        }
+        let obligations = handled
+            .obligations
             .into_iter()
             .filter(|o| !matches!(o, Obligation::Audit))
             .collect();
-        Ok((plan, obligations, *requester.sid()))
+        Ok((handled.plan, obligations, *requester.sid()))
+    }
+
+    /// The checks of one directory operation for `ctx.requester` against
+    /// `ctx`'s view (module documentation, steps 2-6, and step 7's
+    /// classification), committing nothing — the same code for a direct
+    /// execution, a proposal and the re-evaluation of a pending request
+    /// (crate::requests; docs/52 C14).
+    /// Spec: docs/51 §5.2, §5.6, §7.4 steps 2-4, §11.
+    pub(crate) fn evaluate(
+        &self,
+        ctx: &OpCx<'_, '_, '_, '_>,
+        base: &mut EventBase,
+        operation: &Operation,
+    ) -> Result<Handled, Stop> {
+        Ok(match operation {
+            Operation::CreateUser(c) => self.create(ctx, base, NewObject::User(c))?,
+            Operation::CreateComputer(c) => self.create(ctx, base, NewObject::Computer(c))?,
+            Operation::CreateGroup(c) => self.create(ctx, base, NewObject::Group(c))?,
+            Operation::CreateOu(c) => self.create(ctx, base, NewObject::Ou(c))?,
+            Operation::CreateContainer(c) => self.create(ctx, base, NewObject::Container(c))?,
+            Operation::BeginPasswordSet { target } => {
+                self.begin_password_set(ctx, base, *target)?
+            }
+            Operation::CompletePasswordSet(c) => self.complete_password_set(ctx, base, c)?,
+            Operation::SetEnabled(s) => self.set_enabled(ctx, base, s)?,
+            Operation::SetAccountExpires(s) => self.set_account_expires(ctx, base, s)?,
+            Operation::AddMember(m) => self.membership(ctx, base, m, true)?,
+            Operation::RemoveMember(m) => self.membership(ctx, base, m, false)?,
+            Operation::Delete { target } => self.delete(ctx, base, *target)?,
+            Operation::Lookup(key) => self.lookup(ctx, base, key)?,
+        })
     }
 }
 
@@ -427,7 +518,6 @@ pub(crate) fn subject_of(
 pub(crate) struct OpCx<'o, 'c, 'v, 'a> {
     pub(crate) cx: &'o Cx<'c, 'v, 'a>,
     pub(crate) requester: &'o AdminSubject,
-    pub(crate) approvals: &'o [VerifiedTicket],
 }
 
 /// The object a create makes.
@@ -512,50 +602,6 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                 Err(Stop::Failed(AdminFailure::StoreFailure))
             }
         }
-    }
-
-    /// Dual control (docs/51 §5.6, R51-11; P-22 items 1-2): every supplied
-    /// approval must come from a usable account with a fresh enough ticket,
-    /// be distinct from the requester and from every other approver, and get
-    /// `decide` = Allow for the same Action and Resource; when `required`,
-    /// the requester plus the approvals must reach the quorum. Approvals
-    /// supplied when dual control does not apply are checked all the same
-    /// (docs/questions/Q-357 items 3-4).
-    pub(crate) fn dual_control(
-        &self,
-        ctx: &OpCx<'_, '_, '_, '_>,
-        base: &mut EventBase,
-        required: bool,
-        action: &Action,
-        resource: &Resource,
-    ) -> Result<(), Stop> {
-        let mut principals: Vec<Sid> = vec![*ctx.requester.sid()];
-        for ticket in ctx.approvals {
-            let approver = subject_of(ctx.cx, ticket).map_err(|e| match e {
-                SubjectError::NotUsable => Stop::Refused(AdminRefusal::ApproverUnauthenticated),
-                SubjectError::Unavailable => Stop::Failed(AdminFailure::StoreFailure),
-            })?;
-            if let Some(sid) = sid_value(approver.sid()) {
-                base.approvers.push(sid);
-            }
-            if approver.ticket_age() > self.config.ticket_age_max() {
-                return Err(Stop::Refused(AdminRefusal::ApproverUnauthenticated));
-            }
-            if principals.contains(approver.sid()) {
-                return Err(Stop::Refused(AdminRefusal::ApproverNotDistinct));
-            }
-            principals.push(*approver.sid());
-            let decision = ctx
-                .cx
-                .decide(approver.subject(), action.clone(), resource.clone());
-            if decision.effect != Effect::Allow {
-                return Err(Stop::Refused(AdminRefusal::ApproverDenied));
-            }
-        }
-        if required && principals.len() < self.config.quorum() {
-            return Err(Stop::Refused(AdminRefusal::ApprovalRequired));
-        }
-        Ok(())
     }
 
     /// The self-lockout guard: refuse a change that would leave fewer
@@ -757,7 +803,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         ctx: &OpCx<'_, '_, '_, '_>,
         base: &mut EventBase,
         new: NewObject<'_>,
-    ) -> Result<(Plan, Vec<Obligation>), Stop> {
+    ) -> Result<Handled, Stop> {
         let cx = ctx.cx;
         let values = self.new_values(new)?;
         let parent_guid = match new {
@@ -812,9 +858,8 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         // P-22 item 1: "create inside an explicitly Tier0 subtree of the
         // tier map".
         let required = cx.tier_map().subtree_tier(&parent.dn) == Some(Tier::Tier0);
-        self.dual_control(ctx, base, required, &action, &resource)?;
-        Ok((
-            Plan::Write(WritePlan {
+        Ok(Handled {
+            plan: Plan::Write(WritePlan {
                 change_seq,
                 seen,
                 kind: WriteKind::Create(CreatePlan {
@@ -825,7 +870,8 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                 }),
             }),
             obligations,
-        ))
+            dual: Dual::of(required, &action, &resource),
+        })
     }
 
     /// The account a password operation names, and the key sets admind
@@ -913,7 +959,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         ctx: &OpCx<'_, '_, '_, '_>,
         base: &mut EventBase,
         target: Guid,
-    ) -> Result<(Plan, Vec<Obligation>), Stop> {
+    ) -> Result<Handled, Stop> {
         let cx = ctx.cx;
         let (t, _) = self.named(ctx, base, target)?;
         let (action, resource) = password_request(&t);
@@ -921,15 +967,15 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         let reply = self.password_targets(cx, &t)?;
         let change_seq = self.change_seq(cx)?;
         let required = cx.explicit_tier(&t.dn)? == Some(Tier::Tier0);
-        self.dual_control(ctx, base, required, &action, &resource)?;
-        Ok((
-            Plan::Write(WritePlan {
+        Ok(Handled {
+            plan: Plan::Write(WritePlan {
                 change_seq,
                 seen: vec![(t.guid, t.obj)],
                 kind: WriteKind::PasswordSet { target, reply },
             }),
             obligations,
-        ))
+            dual: Dual::of(required, &action, &resource),
+        })
     }
 
     /// `CompletePasswordSet`: audit only. The same decision as
@@ -943,7 +989,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         ctx: &OpCx<'_, '_, '_, '_>,
         base: &mut EventBase,
         c: &CompletePasswordSet,
-    ) -> Result<(Plan, Vec<Obligation>), Stop> {
+    ) -> Result<Handled, Stop> {
         let cx = ctx.cx;
         let (t, _) = self.named(ctx, base, c.target)?;
         let (action, resource) = password_request(&t);
@@ -956,8 +1002,13 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         if !fits {
             return Err(Stop::Refused(AdminRefusal::ValueInvalid));
         }
-        self.dual_control(ctx, base, false, &action, &resource)?;
-        Ok((Plan::Read(Reply::Done), obligations))
+        // Audit only, never dual-controlled (docs/51 §7.3).
+        let _ = (action, resource);
+        Ok(Handled {
+            plan: Plan::Read(Reply::Done),
+            obligations,
+            dual: Dual::NotRequired,
+        })
     }
 
     /// An account a `SetEnabled` / `SetAccountExpires` names: a user or
@@ -984,7 +1035,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         ctx: &OpCx<'_, '_, '_, '_>,
         base: &mut EventBase,
         s: &SetEnabled,
-    ) -> Result<(Plan, Vec<Obligation>), Stop> {
+    ) -> Result<Handled, Stop> {
         let cx = ctx.cx;
         let (t, _) = self.named(ctx, base, s.target)?;
         let action = Action::DirWrite;
@@ -1001,12 +1052,11 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         };
         let change_seq = self.change_seq(cx)?;
         let required = cx.explicit_tier(&t.dn)? == Some(Tier::Tier0);
-        self.dual_control(ctx, base, required, &action, &resource)?;
         if !s.enabled {
             self.lockout_guard(cx, LockoutChange::Unusable(t.guid))?;
         }
-        Ok((
-            Plan::Write(WritePlan {
+        Ok(Handled {
+            plan: Plan::Write(WritePlan {
                 change_seq,
                 seen: vec![(t.guid, t.obj)],
                 kind: WriteKind::SetUac {
@@ -1015,7 +1065,8 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                 },
             }),
             obligations,
-        ))
+            dual: Dual::of(required, &action, &resource),
+        })
     }
 
     /// `SetAccountExpires`: `DirWrite(accountExpires)`; "never" is written
@@ -1029,7 +1080,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         ctx: &OpCx<'_, '_, '_, '_>,
         base: &mut EventBase,
         s: &SetAccountExpires,
-    ) -> Result<(Plan, Vec<Obligation>), Stop> {
+    ) -> Result<Handled, Stop> {
         let cx = ctx.cx;
         let value = match s.value.filetime() {
             None => ACCOUNT_EXPIRES_NEVER,
@@ -1045,14 +1096,13 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         self.account_target(cx, &t)?;
         let change_seq = self.change_seq(cx)?;
         let required = cx.explicit_tier(&t.dn)? == Some(Tier::Tier0);
-        self.dual_control(ctx, base, required, &action, &resource)?;
         let now_filetime =
             time::filetime(&cx.now).ok_or(Stop::Failed(AdminFailure::InternalFailure))?;
         if value <= now_filetime {
             self.lockout_guard(cx, LockoutChange::Unusable(t.guid))?;
         }
-        Ok((
-            Plan::Write(WritePlan {
+        Ok(Handled {
+            plan: Plan::Write(WritePlan {
                 change_seq,
                 seen: vec![(t.guid, t.obj)],
                 kind: WriteKind::SetAccountExpires {
@@ -1061,7 +1111,8 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                 },
             }),
             obligations,
-        ))
+            dual: Dual::of(required, &action, &resource),
+        })
     }
 
     /// `AddMember` / `RemoveMember`: `DirWrite(member)` on the group; the
@@ -1081,7 +1132,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         base: &mut EventBase,
         m: &Membership,
         add: bool,
-    ) -> Result<(Plan, Vec<Obligation>), Stop> {
+    ) -> Result<Handled, Stop> {
         let cx = ctx.cx;
         let (group, _) = self.named(ctx, base, m.group)?;
         let (member, _) = self.named(ctx, base, m.member)?;
@@ -1131,7 +1182,6 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         }
         let change_seq = self.change_seq(cx)?;
         let required = cx.explicit_tier(&group.dn)? == Some(Tier::Tier0);
-        self.dual_control(ctx, base, required, &action, &resource)?;
         if !add {
             self.lockout_guard(
                 cx,
@@ -1141,8 +1191,8 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                 },
             )?;
         }
-        Ok((
-            Plan::Write(WritePlan {
+        Ok(Handled {
+            plan: Plan::Write(WritePlan {
                 change_seq,
                 seen: vec![(group.guid, group.obj), (member.guid, member.obj)],
                 kind: WriteKind::SetMembers {
@@ -1152,7 +1202,8 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                 },
             }),
             obligations,
-        ))
+            dual: Dual::of(required, &action, &resource),
+        })
     }
 
     /// `Delete`: `DirDelete`; never krbtgt, a DC account, a service object,
@@ -1169,7 +1220,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         ctx: &OpCx<'_, '_, '_, '_>,
         base: &mut EventBase,
         target: Guid,
-    ) -> Result<(Plan, Vec<Obligation>), Stop> {
+    ) -> Result<Handled, Stop> {
         let cx = ctx.cx;
         let (t, _) = self.named(ctx, base, target)?;
         let action = Action::DirDelete;
@@ -1186,16 +1237,16 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         }
         let change_seq = self.change_seq(cx)?;
         let required = cx.explicit_tier(&t.dn)? == Some(Tier::Tier0);
-        self.dual_control(ctx, base, required, &action, &resource)?;
         self.lockout_guard(cx, LockoutChange::Deleted(t.guid))?;
-        Ok((
-            Plan::Write(WritePlan {
+        Ok(Handled {
+            plan: Plan::Write(WritePlan {
                 change_seq,
                 seen: vec![(t.guid, t.obj)],
                 kind: WriteKind::Delete { target },
             }),
             obligations,
-        ))
+            dual: Dual::of(required, &action, &resource),
+        })
     }
 
     /// `Lookup`: the object the key names, if the requester may see it
@@ -1211,7 +1262,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         ctx: &OpCx<'_, '_, '_, '_>,
         base: &mut EventBase,
         key: &LookupKey,
-    ) -> Result<(Plan, Vec<Obligation>), Stop> {
+    ) -> Result<Handled, Stop> {
         let cx = ctx.cx;
         let guid = self
             .find(cx, key)?
@@ -1225,20 +1276,16 @@ impl<R: RandomSource> DirectoryAdmin<R> {
             .ok_or(Stop::Failed(AdminFailure::IntegrityFailure))?
             .name;
         let sid = record::sid(&found.obj, self.ids.object_sid).map_err(malformed)?;
-        let resource = Resource::DirObject {
-            dn: found.dn.clone(),
-            attr: None,
-        };
-        self.dual_control(ctx, base, false, &Action::DirRead, &resource)?;
-        Ok((
-            Plan::Read(Reply::Found(LookupResult {
+        Ok(Handled {
+            plan: Plan::Read(Reply::Found(LookupResult {
                 guid,
                 dn: found.dn,
                 class,
                 sid,
             })),
-            decision.obligations,
-        ))
+            obligations: decision.obligations,
+            dual: Dual::NotRequired,
+        })
     }
 
     /// The object a `Lookup` key names, if any: a sAMAccountName or SPN

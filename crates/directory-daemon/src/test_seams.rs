@@ -17,7 +17,7 @@
 //! | [`AdminParams::keyd`] | the admin service's keyd client — any [`crate::TicketVerifier`] | `KeydTicketVerifier` over `ipc_keyd::UnixConnector` (Role::Ldap, task R9) |
 //! | [`AdminParams::max_connections`], [`AdminParams::queue_capacity`] | the admin channel's bounds | `MAX_ADMIN_CONNECTIONS`, `ADMIN_QUEUE_CAPACITY` |
 //! | [`AdminParams::ack_deadline`] | the decision-acknowledgement wait, bounded by its type at `MAX_DECISION_ACK_DEADLINE` (A-95) | `DecisionAckDeadline::PRODUCTION` |
-//! | [`AdminParams::key_request_lifetime`] | a pending key request's lifetime | `directory_admin::KEY_REQUEST_LIFETIME` |
+//! | [`AdminParams::request_lifetime`], [`AdminParams::requests_per_requester`] | a pending request's lifetime; the open requests one requester may hold (task D2-c) | `directory_admin::REQUEST_LIFETIME`, `directory_admin::REQUESTS_PER_REQUESTER` |
 //! | [`AdminParams::destroy_reconcile_interval`] | the re-registration interval, kept within `MIN_/MAX_DESTROY_RECONCILE_INTERVAL` (A-105) | `DESTROY_RECONCILE_INTERVAL` |
 //! | [`opened`] | an already-opened store, skipping the file checks | the redb file (`StoreSource::File`) |
 //!
@@ -69,8 +69,10 @@ pub struct AdminParams {
     pub queue_capacity: usize,
     /// The decision-acknowledgement wait (bounded by its type).
     pub ack_deadline: DecisionAckDeadline,
-    /// The lifetime of a pending key-operation request.
-    pub key_request_lifetime: Duration,
+    /// The lifetime of a pending request (task D2-c).
+    pub request_lifetime: Duration,
+    /// The open pending requests one requester may hold (task D2-c).
+    pub requests_per_requester: usize,
     /// How often the admin thread re-registers lost destroy decisions
     /// (kept within the crate's bounds by the admin thread).
     pub destroy_reconcile_interval: Duration,
@@ -92,7 +94,8 @@ impl From<AdminParams> for AdminServeParams {
             max_connections: admin.max_connections,
             queue_capacity: admin.queue_capacity,
             ack_deadline: admin.ack_deadline,
-            key_request_lifetime: admin.key_request_lifetime,
+            request_lifetime: admin.request_lifetime,
+            requests_per_requester: admin.requests_per_requester,
             destroy_reconcile_interval: admin.destroy_reconcile_interval,
             policy_next: admin.policy_next,
         }
@@ -117,7 +120,8 @@ impl AdminParams {
             max_connections: full.max_connections,
             queue_capacity: full.queue_capacity,
             ack_deadline: full.ack_deadline,
-            key_request_lifetime: full.key_request_lifetime,
+            request_lifetime: full.request_lifetime,
+            requests_per_requester: full.requests_per_requester,
             destroy_reconcile_interval: full.destroy_reconcile_interval,
             policy_next: full.policy_next,
         }

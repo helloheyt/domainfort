@@ -6,7 +6,7 @@
 //!
 //! | field | encoding |
 //! |---|---|
-//! | `auth` | `requester: bytes<64 KiB>` ‖ `approvals: seq<bytes<64 KiB>, 2>` (raw AP-REQs) |
+//! | `auth` | `requester: bytes<64 KiB>` (a raw AP-REQ) ‖ `approvals: seq<_, 0>` (retired by Q-882: always empty) |
 //! | object | 16-octet objectGUID packet ([MS-DTYP] 2.3.4.2) |
 //! | name, UPN, SPN, dNSHostName, description | `bytes<max>` (UTF-8 in the typed layer) |
 //! | DN | `seq<bytes<128>, 64>` of `att=value` components, leaf first |
@@ -17,7 +17,10 @@
 //! | `KeyOperation` | `u8 1 RotateKrbtgt` / `u8 2 RotateKey ‖ service:[16]` / `u8 3 RetireKvno ‖ KeyRef ‖ kvno:u32` |
 //! | `KeyRef` | `u8 1 Krbtgt` / `u8 2 Service ‖ principal:[16]` |
 //! | `PolicyChange` | `u8 1 AddPrincipal ‖ sid ‖ tier:u8` / `u8 2 RemovePrincipal ‖ sid` / `u8 3 AddSubtree ‖ dn:seq<bytes<128>,16> ‖ tier` / `u8 4 RemoveSubtree ‖ dn` (task A16) |
-//! | digest | 32 octets (a SHA-256 output, computed in dird) |
+//! | digest | 32 octets (a SHA-256 output: an operation digest, crate::digest) |
+//! | proposed operation | `kind:u8` from `request_kind::PROPOSABLE` ‖ that kind's fields (a key operation: `KEY_OPERATION` ‖ `KeyOperation`) |
+//! | request state, list scope, fact tier | `u8` from a closed table (`codes::REQUEST_*`, `codes::LIST_*`, `codes::TIER_*` / `FACT_UNCLASSIFIED`) |
+//! | time of a request's expiry | `u64` seconds since 1970-01-01T00:00:00Z (the PDP's `Instant`, docs/11 P9) |
 //!
 //! Every request but `Ping` carries `auth`. keyadm's former requests
 //! (`FetchApproved`, `Complete`, `ListPendingDestruction` — the only ones
@@ -30,10 +33,11 @@
 //! DER"; "`KeyHandle` = 16 octets `PrincipalId` + `u8` purpose").
 
 use crate::channel::{
-    codes, reply_kind, request_kind, RefusalStatus, DIGEST_LEN, MAX_APPROVALS, MAX_AP_REQ,
-    MAX_BINDING_NAME, MAX_CLASS_NAME, MAX_DESCRIPTION, MAX_DNS_HOST_NAME, MAX_DN_COMPONENT,
-    MAX_DN_COMPONENTS, MAX_KEY_TARGETS, MAX_KVNOS, MAX_NAME, MAX_POLICY_CHANGES,
-    MAX_POLICY_DN_COMPONENTS, MAX_PRINCIPAL_NAME, MAX_REALM, MAX_SALT, MAX_SID,
+    codes, reply_kind, request_kind, RefusalStatus, DIGEST_LEN, MAX_AP_REQ, MAX_BINDING_NAME,
+    MAX_CLASS_NAME, MAX_DESCRIPTION, MAX_DNS_HOST_NAME, MAX_DN_COMPONENT, MAX_DN_COMPONENTS,
+    MAX_FACTS, MAX_KEY_TARGETS, MAX_KVNOS, MAX_LISTED_REQUESTS, MAX_NAME, MAX_POLICY_CHANGES,
+    MAX_POLICY_DN_COMPONENTS, MAX_PRINCIPAL_NAME, MAX_REALM, MAX_REASON_REF, MAX_SALT,
+    MAX_SHOWN_APPROVERS, MAX_SID, RETIRED_APPROVALS,
 };
 use ipc::{DerBlob, Error, MessageSet, Payload, Reader, Result, Writer};
 use keyd_types::KeyPurpose;
@@ -73,18 +77,33 @@ fn write_dn(writer: &mut Writer, dn: &[Vec<u8>]) -> Result<()> {
 // Requests.
 // ===========================================================================
 
-/// The authentication field of every operation: the requester's raw AP-REQ
-/// and the approvers' (at most two). There is **no** field in which admind
-/// could claim a name, a SID, a tier or "approved" — dird learns who asks
-/// only from keyd's verification of these tickets.
+/// The authentication field of every operation: the requester's raw AP-REQ.
+/// There is **no** field in which admind could claim a name, a SID, a tier
+/// or "approved" — dird learns who asks only from keyd's verification of
+/// this ticket.
+///
+/// **No approvals.** The in-request approvals of docs/51 §7.2 (`approvals:
+/// seq<bytes<64 KiB>, 2>`) are retired (docs/questions/Q-882 item 6, A-148):
+/// the type has no field for them, and the wire keeps only the sequence's
+/// count — always written 0, and read with the bound
+/// [`RETIRED_APPROVALS`] (0), so a request that still carries one is refused
+/// by the codec (`ipc::Error::CountOverBound`) before anything is decoded
+/// further. Every approval is an `Approve {id, digest}` of a pending request
+/// dird holds.
 /// Spec: docs/51 §7.2; A-70 (precedent: the front cannot claim an identity);
-/// A-73.
+/// A-73; docs/questions/Q-882, Q-935.
 #[derive(Clone, PartialEq, Eq)]
 pub struct WireAuth {
     /// The requester's `KRB_AP_REQ` DER, as admind received it.
     pub requester: Vec<u8>,
-    /// The approvers' `KRB_AP_REQ` DERs.
-    pub approvals: Vec<Vec<u8>>,
+}
+
+impl WireAuth {
+    /// The `auth` of a request: `requester`'s AP-REQ.
+    #[must_use]
+    pub fn of(requester: Vec<u8>) -> WireAuth {
+        WireAuth { requester }
+    }
 }
 
 impl core::fmt::Debug for WireAuth {
@@ -92,28 +111,28 @@ impl core::fmt::Debug for WireAuth {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("WireAuth")
             .field("requester_len", &self.requester.len())
-            .field("approvals", &self.approvals.len())
             .finish()
     }
 }
 
 impl Payload for WireAuth {
-    /// Spec: docs/51 §7.2.
+    /// The requester, then the retired approvals' count (0).
+    /// Spec: docs/51 §7.2; docs/questions/Q-882 item 6.
     fn write_fields(&self, writer: &mut Writer) -> Result<()> {
         writer.write_bytes(&self.requester, MAX_AP_REQ)?;
-        writer.write_seq(&self.approvals, MAX_APPROVALS, |w, a| {
-            w.write_bytes(a, MAX_AP_REQ)
-        })
+        writer.write_seq::<Vec<u8>>(&[], RETIRED_APPROVALS, |w, a| w.write_bytes(a, MAX_AP_REQ))
     }
 
-    /// Spec: docs/51 §7.2.
+    /// Spec: docs/51 §7.2; docs/questions/Q-882 item 6 (a non-empty
+    /// sequence is over its bound of 0 and refused here).
     fn read_fields(reader: &mut Reader<'_>) -> Result<WireAuth> {
         let requester = read_owned(reader, MAX_AP_REQ)?;
-        let approvals = reader.read_seq(MAX_APPROVALS, |r| read_owned(r, MAX_AP_REQ))?;
-        Ok(WireAuth {
-            requester,
-            approvals,
-        })
+        let retired = reader.read_seq(RETIRED_APPROVALS, |r| read_owned(r, MAX_AP_REQ))?;
+        if !retired.is_empty() {
+            // Cannot happen: the bound is 0.
+            return Err(Error::CountOverBound);
+        }
+        Ok(WireAuth { requester })
     }
 }
 
@@ -435,25 +454,68 @@ pub enum WireOperation {
     },
     /// `Lookup {sam | spn | dn}`.
     Lookup(WireLookupKey),
-    /// `RequestKeyOperation {operation}`.
-    RequestKeyOperation {
-        /// The key operation asked for.
-        operation: WireKeyOperation,
-    },
-    /// `Approve {id, operation}`: the approver names the exact operation it
-    /// approves (docs/24 §6 principle, as docs/51 §5.6 cites it).
-    Approve {
-        /// The pending request's id.
-        id: u64,
-        /// The operation the approver approves.
-        operation: WireKeyOperation,
-    },
     /// `ChangePolicy {changes}` (task A16): the tier-map edit, 1 to
     /// [`MAX_POLICY_CHANGES`] changes (the count's lower bound is the
     /// edit's own rule, applied in dird).
     ChangePolicy {
         /// The changes, in order.
         changes: Vec<WirePolicyChange>,
+    },
+    /// A proposed key operation (kind `KEY_OPERATION`): valid only as the
+    /// operation of a [`WireOperation::Propose`] (and in a
+    /// `RequestShown`); never a request of its own.
+    /// Spec: docs/51 §6; docs/questions/Q-882.
+    KeyOperation {
+        /// The key operation.
+        operation: WireKeyOperation,
+    },
+    /// `Propose {reason_ref?, operation}` (task D2-c): open a pending
+    /// request for `operation`, one of `request_kind::PROPOSABLE`.
+    /// Spec: docs/questions/Q-882 items 1, 4.
+    Propose {
+        /// The requester's change identifier, at most [`MAX_REASON_REF`]
+        /// octets (printable ASCII — the PEP checks it); shown to approvers
+        /// as unverified.
+        reason_ref: Option<Vec<u8>>,
+        /// The operation the request is for (never a `Propose`).
+        operation: Box<WireOperation>,
+    },
+    /// `Approve {id, digest}`: approve the pending request `id`, whose
+    /// operation digest the approver was shown.
+    /// Spec: docs/questions/Q-882 item 1.
+    Approve {
+        /// The pending request's id.
+        id: u64,
+        /// The operation digest the approver was shown.
+        digest: [u8; DIGEST_LEN],
+    },
+    /// `Reject {id, digest}`: end the pending request `id` (an eligible
+    /// approver).
+    /// Spec: docs/research/r5-a-admin-model.md §11 MA5.
+    Reject {
+        /// The pending request's id.
+        id: u64,
+        /// The operation digest the rejecting approver was shown.
+        digest: [u8; DIGEST_LEN],
+    },
+    /// `Withdraw {id}`: end the pending request `id` (its requester).
+    /// Spec: docs/questions/Q-882 item 1.
+    Withdraw {
+        /// The pending request's id.
+        id: u64,
+    },
+    /// `ListRequests {scope}`: [`codes::LIST_MINE`] or
+    /// [`codes::LIST_AWAITING_ME`].
+    /// Spec: docs/questions/Q-882 item 1; r5-a §11 MA5.
+    ListRequests {
+        /// The scope code.
+        scope: u8,
+    },
+    /// `ShowRequest {id}`.
+    /// Spec: docs/questions/Q-882 item 1; r5-a §11 MA5.
+    ShowRequest {
+        /// The pending request's id.
+        id: u64,
     },
 }
 
@@ -475,9 +537,14 @@ impl WireOperation {
             WireOperation::RemoveMember { .. } => request_kind::REMOVE_MEMBER,
             WireOperation::Delete { .. } => request_kind::DELETE,
             WireOperation::Lookup(_) => request_kind::LOOKUP,
-            WireOperation::RequestKeyOperation { .. } => request_kind::REQUEST_KEY_OPERATION,
-            WireOperation::Approve { .. } => request_kind::APPROVE,
             WireOperation::ChangePolicy { .. } => request_kind::CHANGE_POLICY,
+            WireOperation::KeyOperation { .. } => request_kind::KEY_OPERATION,
+            WireOperation::Propose { .. } => request_kind::PROPOSE,
+            WireOperation::Approve { .. } => request_kind::APPROVE,
+            WireOperation::Reject { .. } => request_kind::REJECT,
+            WireOperation::Withdraw { .. } => request_kind::WITHDRAW,
+            WireOperation::ListRequests { .. } => request_kind::LIST_REQUESTS,
+            WireOperation::ShowRequest { .. } => request_kind::SHOW_REQUEST,
         }
     }
 
@@ -566,15 +633,46 @@ impl WireOperation {
                     write_dn(writer, dn)
                 }
             },
-            WireOperation::RequestKeyOperation { operation } => operation.write(writer),
-            WireOperation::Approve { id, operation } => {
-                writer.write_u64(*id)?;
-                operation.write(writer)
-            }
             WireOperation::ChangePolicy { changes } => {
                 writer.write_seq(changes, MAX_POLICY_CHANGES, |w, c| c.write(w))
             }
+            WireOperation::KeyOperation { operation } => operation.write(writer),
+            WireOperation::Propose {
+                reason_ref,
+                operation,
+            } => {
+                write_opt_bytes(writer, reason_ref.as_ref(), MAX_REASON_REF)?;
+                operation.write_proposed(writer)
+            }
+            WireOperation::Approve { id, digest } | WireOperation::Reject { id, digest } => {
+                writer.write_u64(*id)?;
+                writer.write_array(digest)
+            }
+            WireOperation::Withdraw { id } | WireOperation::ShowRequest { id } => {
+                writer.write_u64(*id)
+            }
+            WireOperation::ListRequests { scope } => writer.write_enum(*scope),
         }
+    }
+
+    /// A proposed operation: `kind:u8 ‖ fields`, the kind one of
+    /// `request_kind::PROPOSABLE` (anything else is refused: no `Propose`
+    /// inside a `Propose`, no read, no queue step).
+    /// Spec: docs/questions/Q-882 item 1.
+    pub(crate) fn write_proposed(&self, writer: &mut Writer) -> Result<()> {
+        let kind = self.kind();
+        if !request_kind::PROPOSABLE.contains(&kind) {
+            return Err(Error::UnknownKind);
+        }
+        writer.write_enum(kind)?;
+        self.write_fields(writer)
+    }
+
+    /// A proposed operation (see [`WireOperation::write_proposed`]).
+    /// Spec: docs/questions/Q-882 item 1.
+    fn read_proposed(reader: &mut Reader<'_>) -> Result<WireOperation> {
+        let kind = reader.read_enum(|c| request_kind::PROPOSABLE.contains(&c).then_some(c))?;
+        WireOperation::read_fields(kind, reader)
     }
 
     /// The fields of a frame of kind `kind`. Spec: docs/51 §7.3.
@@ -655,15 +753,36 @@ impl WireOperation {
                     _ => WireLookupKey::Dn(read_dn(reader)?),
                 })
             }
-            request_kind::REQUEST_KEY_OPERATION => WireOperation::RequestKeyOperation {
+            request_kind::CHANGE_POLICY => WireOperation::ChangePolicy {
+                changes: reader.read_seq(MAX_POLICY_CHANGES, WirePolicyChange::read)?,
+            },
+            // Reached only through `read_proposed` (the kind is not in
+            // `request_kind::ALL`, which `read_payload` checks first).
+            request_kind::KEY_OPERATION => WireOperation::KeyOperation {
                 operation: WireKeyOperation::read(reader)?,
+            },
+            request_kind::PROPOSE => WireOperation::Propose {
+                reason_ref: read_opt_owned(reader, MAX_REASON_REF)?,
+                operation: Box::new(WireOperation::read_proposed(reader)?),
             },
             request_kind::APPROVE => WireOperation::Approve {
                 id: reader.read_u64()?,
-                operation: WireKeyOperation::read(reader)?,
+                digest: reader.read_array()?,
             },
-            request_kind::CHANGE_POLICY => WireOperation::ChangePolicy {
-                changes: reader.read_seq(MAX_POLICY_CHANGES, WirePolicyChange::read)?,
+            request_kind::REJECT => WireOperation::Reject {
+                id: reader.read_u64()?,
+                digest: reader.read_array()?,
+            },
+            request_kind::WITHDRAW => WireOperation::Withdraw {
+                id: reader.read_u64()?,
+            },
+            request_kind::LIST_REQUESTS => WireOperation::ListRequests {
+                scope: reader.read_enum(|c| {
+                    matches!(c, codes::LIST_MINE | codes::LIST_AWAITING_ME).then_some(c)
+                })?,
+            },
+            request_kind::SHOW_REQUEST => WireOperation::ShowRequest {
+                id: reader.read_u64()?,
             },
             _ => return Err(Error::UnknownKind),
         })
@@ -787,22 +906,239 @@ impl Payload for WireKeyTarget {
     }
 }
 
-/// The pending request as dird holds it (`RequestKeyOperation` and
-/// `Approve` reply with it): shown back so the requester and every approver
-/// see the exact operation and its digest.
-/// Spec: docs/51 §5.6, §7.3; docs/24 §6 (principle).
+/// A request state code (closed table).
+/// Spec: crate::channel `codes::REQUEST_*`.
+fn read_state(reader: &mut Reader<'_>) -> Result<u8> {
+    reader.read_enum(|c| matches!(c, codes::REQUEST_PENDING | codes::REQUEST_APPROVED).then_some(c))
+}
+
+/// The state of a pending request, shown back to the requester and to every
+/// approver: the answer to `Propose` and `Approve` (task D2-c).
+///
+/// `id:u64 ‖ digest:[32] ‖ state:u8 ‖ approvals:u8 ‖ quorum:u8 ‖
+/// expires:u64`.
+/// Spec: docs/questions/Q-882 item 1 (`{id, digest, quorum, expires}`);
+/// docs/51 §5.6.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WireKeyRequest {
+pub struct WirePendingRequest {
+    /// The id (64 bits from dird's CSPRNG, Q-882 item 3).
+    pub id: u64,
+    /// The operation digest of the request's operation (crate::digest).
+    pub digest: [u8; DIGEST_LEN],
+    /// [`codes::REQUEST_PENDING`] or [`codes::REQUEST_APPROVED`].
+    pub state: u8,
+    /// Approvals recorded so far (the requester not counted).
+    pub approvals: u8,
+    /// The quorum, the requester included (`admin_quorum`, P-22).
+    pub quorum: u8,
+    /// The expiry: seconds since 1970-01-01T00:00:00Z.
+    pub expires: u64,
+}
+
+impl WirePendingRequest {
+    /// Spec: docs/questions/Q-882 item 1.
+    fn write(&self, writer: &mut Writer) -> Result<()> {
+        writer.write_u64(self.id)?;
+        writer.write_array(&self.digest)?;
+        writer.write_enum(self.state)?;
+        writer.write_u8(self.approvals)?;
+        writer.write_u8(self.quorum)?;
+        writer.write_u64(self.expires)
+    }
+
+    /// Spec: docs/questions/Q-882 item 1.
+    fn read(reader: &mut Reader<'_>) -> Result<WirePendingRequest> {
+        Ok(WirePendingRequest {
+            id: reader.read_u64()?,
+            digest: reader.read_array()?,
+            state: read_state(reader)?,
+            approvals: reader.read_u8()?,
+            quorum: reader.read_u8()?,
+            expires: reader.read_u64()?,
+        })
+    }
+}
+
+/// One entry of a `RequestList` (task D2-c).
+///
+/// `id ‖ digest ‖ state:u8 ‖ operation:u8 (a PROPOSABLE kind) ‖
+/// requester:bytes<68> (objectSid) ‖ approvals:u8 ‖ quorum:u8 ‖
+/// expires:u64`.
+/// Spec: docs/research/r5-a-admin-model.md §11 MA5; docs/questions/Q-882
+/// item 1 (`List`); docs/research/r5-b-cli.md §7.4 ("the requester … verified
+/// by the directory").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireRequestSummary {
     /// The id.
     pub id: u64,
     /// The operation digest.
     pub digest: [u8; DIGEST_LEN],
-    /// The operation.
-    pub operation: WireKeyOperation,
+    /// The state code.
+    pub state: u8,
+    /// The kind of the operation the request is for.
+    pub operation: u8,
+    /// The requester's objectSid packet ([MS-DTYP] 2.4.2.2), as dird
+    /// verified it.
+    pub requester: Vec<u8>,
     /// Approvals recorded so far.
     pub approvals: u8,
-    /// The quorum (requester included).
+    /// The quorum.
     pub quorum: u8,
+    /// The expiry (seconds since 1970).
+    pub expires: u64,
+}
+
+impl WireRequestSummary {
+    /// Spec: r5-a §11 MA5.
+    fn write(&self, writer: &mut Writer) -> Result<()> {
+        writer.write_u64(self.id)?;
+        writer.write_array(&self.digest)?;
+        writer.write_enum(self.state)?;
+        if !request_kind::PROPOSABLE.contains(&self.operation) {
+            return Err(Error::UnknownCode);
+        }
+        writer.write_enum(self.operation)?;
+        writer.write_bytes(&self.requester, MAX_SID)?;
+        writer.write_u8(self.approvals)?;
+        writer.write_u8(self.quorum)?;
+        writer.write_u64(self.expires)
+    }
+
+    /// Spec: r5-a §11 MA5.
+    fn read(reader: &mut Reader<'_>) -> Result<WireRequestSummary> {
+        Ok(WireRequestSummary {
+            id: reader.read_u64()?,
+            digest: reader.read_array()?,
+            state: read_state(reader)?,
+            operation: reader.read_enum(|c| request_kind::PROPOSABLE.contains(&c).then_some(c))?,
+            requester: read_owned(reader, MAX_SID)?,
+            approvals: reader.read_u8()?,
+            quorum: reader.read_u8()?,
+            expires: reader.read_u64()?,
+        })
+    }
+}
+
+/// One fact dird resolved for an object a pending operation names (task
+/// D2-c): what the approver is shown beside the operation — "directory
+/// says", never the requester's words.
+///
+/// `guid:[16] ‖ dn:seq<bytes<128>,64> ‖ class:bytes<64> ‖
+/// sid:Option<bytes<68>> ‖ tier:u8` (`codes::TIER_0..2`, or
+/// `codes::FACT_UNCLASSIFIED`).
+/// Spec: docs/questions/Q-882 item 1 ("facts dird resolved: DN / class /
+/// SID / tier for every GUID"), Q-887 items 2-3; docs/research/r5-b-cli.md
+/// §7.4 rule 2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireFact {
+    /// The objectGUID packet.
+    pub guid: GuidPacket,
+    /// The DN, leaf first.
+    pub dn: Vec<Vec<u8>>,
+    /// The most specific class's lDAPDisplayName.
+    pub class: Vec<u8>,
+    /// The objectSid packet, if any.
+    pub sid: Option<Vec<u8>>,
+    /// The explicit tier code.
+    pub tier: u8,
+}
+
+impl WireFact {
+    /// Spec: docs/questions/Q-887 item 2.
+    fn write(&self, writer: &mut Writer) -> Result<()> {
+        writer.write_array(&self.guid)?;
+        write_dn(writer, &self.dn)?;
+        writer.write_bytes(&self.class, MAX_CLASS_NAME)?;
+        write_opt_bytes(writer, self.sid.as_ref(), MAX_SID)?;
+        writer.write_enum(self.tier)
+    }
+
+    /// Spec: docs/questions/Q-887 item 2.
+    fn read(reader: &mut Reader<'_>) -> Result<WireFact> {
+        Ok(WireFact {
+            guid: reader.read_array()?,
+            dn: read_dn(reader)?,
+            class: read_owned(reader, MAX_CLASS_NAME)?,
+            sid: read_opt_owned(reader, MAX_SID)?,
+            tier: reader.read_enum(|c| {
+                matches!(
+                    c,
+                    codes::TIER_0 | codes::TIER_1 | codes::TIER_2 | codes::FACT_UNCLASSIFIED
+                )
+                .then_some(c)
+            })?,
+        })
+    }
+}
+
+/// A pending request as dird holds it: the answer to `ShowRequest` (task
+/// D2-c). The operation is dird's own copy of the fields it will execute —
+/// never text the requester wrote (docs/research/r5-b-cli.md §7.4 rule 1;
+/// class C44) — and the facts are what dird resolved for the objects it
+/// names, through the caller's visibility gate.
+///
+/// `id ‖ digest ‖ state:u8 ‖ requester:bytes<68> ‖ approvers:seq<bytes<68>,
+/// 2> ‖ quorum:u8 ‖ expires:u64 ‖ reason_ref:Option<bytes<64>> ‖ operation
+/// (a PROPOSABLE kind ‖ its fields) ‖ facts:seq<Fact, 2>`.
+/// Spec: docs/questions/Q-882 item 1 (`Show {id}`), Q-887 item 3;
+/// docs/research/r5-a-admin-model.md §11 MA5; docs/research/r5-b-cli.md
+/// §7.4.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireRequestShown {
+    /// The id.
+    pub id: u64,
+    /// The operation digest.
+    pub digest: [u8; DIGEST_LEN],
+    /// The state code.
+    pub state: u8,
+    /// The requester's objectSid packet, as dird verified it.
+    pub requester: Vec<u8>,
+    /// The approvers' objectSid packets, in approval order.
+    pub approvers: Vec<Vec<u8>>,
+    /// The quorum.
+    pub quorum: u8,
+    /// The expiry (seconds since 1970).
+    pub expires: u64,
+    /// The requester's change identifier (unverified).
+    pub reason_ref: Option<Vec<u8>>,
+    /// The operation (a PROPOSABLE kind).
+    pub operation: WireOperation,
+    /// The facts, at most [`MAX_FACTS`].
+    pub facts: Vec<WireFact>,
+}
+
+impl WireRequestShown {
+    /// Spec: docs/questions/Q-882 item 1.
+    fn write(&self, writer: &mut Writer) -> Result<()> {
+        writer.write_u64(self.id)?;
+        writer.write_array(&self.digest)?;
+        writer.write_enum(self.state)?;
+        writer.write_bytes(&self.requester, MAX_SID)?;
+        writer.write_seq(&self.approvers, MAX_SHOWN_APPROVERS, |w, a| {
+            w.write_bytes(a, MAX_SID)
+        })?;
+        writer.write_u8(self.quorum)?;
+        writer.write_u64(self.expires)?;
+        write_opt_bytes(writer, self.reason_ref.as_ref(), MAX_REASON_REF)?;
+        self.operation.write_proposed(writer)?;
+        writer.write_seq(&self.facts, MAX_FACTS, |w, f| f.write(w))
+    }
+
+    /// Spec: docs/questions/Q-882 item 1.
+    fn read(reader: &mut Reader<'_>) -> Result<WireRequestShown> {
+        Ok(WireRequestShown {
+            id: reader.read_u64()?,
+            digest: reader.read_array()?,
+            state: read_state(reader)?,
+            requester: read_owned(reader, MAX_SID)?,
+            approvers: reader.read_seq(MAX_SHOWN_APPROVERS, |r| read_owned(r, MAX_SID))?,
+            quorum: reader.read_u8()?,
+            expires: reader.read_u64()?,
+            reason_ref: read_opt_owned(reader, MAX_REASON_REF)?,
+            operation: WireOperation::read_proposed(reader)?,
+            facts: reader.read_seq(MAX_FACTS, WireFact::read)?,
+        })
+    }
 }
 
 /// One reply of the admin channel (the shared `Refused` travels separately,
@@ -843,13 +1179,20 @@ pub enum AdminReply {
     Refused(RefusalStatus),
     /// `Ping` answered.
     Pong,
-    /// `RequestKeyOperation` / `Approve`: the pending request.
-    KeyRequest(WireKeyRequest),
     /// `ChangePolicy` written as `policy.next` (task A16): its version.
     PolicyNext {
         /// The `policy_version` of the file dird wrote (the loaded one + 1).
         version: u64,
     },
+    /// `Propose` / `Approve`: the pending request's state (task D2-c).
+    PendingRequest(WirePendingRequest),
+    /// `ListRequests`: the requests in the scope.
+    RequestList {
+        /// One entry per request, at most [`MAX_LISTED_REQUESTS`].
+        entries: Vec<WireRequestSummary>,
+    },
+    /// `ShowRequest`: the request as dird holds it.
+    RequestShown(Box<WireRequestShown>),
 }
 
 impl MessageSet for AdminReply {
@@ -863,8 +1206,10 @@ impl MessageSet for AdminReply {
             AdminReply::Found { .. } => reply_kind::FOUND,
             AdminReply::Refused(_) => reply_kind::REFUSED,
             AdminReply::Pong => reply_kind::PONG,
-            AdminReply::KeyRequest(_) => reply_kind::KEY_REQUEST,
             AdminReply::PolicyNext { .. } => reply_kind::POLICY_NEXT,
+            AdminReply::PendingRequest(_) => reply_kind::PENDING_REQUEST,
+            AdminReply::RequestList { .. } => reply_kind::REQUEST_LIST,
+            AdminReply::RequestShown(_) => reply_kind::REQUEST_SHOWN,
         }
     }
 
@@ -893,14 +1238,12 @@ impl MessageSet for AdminReply {
             }
             AdminReply::Refused(status) => writer.write_enum(status.code()),
             AdminReply::Done | AdminReply::Pong => Ok(()),
-            AdminReply::KeyRequest(request) => {
-                writer.write_u64(request.id)?;
-                writer.write_array(&request.digest)?;
-                request.operation.write(writer)?;
-                writer.write_u8(request.approvals)?;
-                writer.write_u8(request.quorum)
-            }
             AdminReply::PolicyNext { version } => writer.write_u64(*version),
+            AdminReply::PendingRequest(request) => request.write(writer),
+            AdminReply::RequestList { entries } => {
+                writer.write_seq(entries, MAX_LISTED_REQUESTS, |w, e| e.write(w))
+            }
+            AdminReply::RequestShown(shown) => shown.write(writer),
         }
     }
 
@@ -928,16 +1271,18 @@ impl MessageSet for AdminReply {
             },
             reply_kind::REFUSED => AdminReply::Refused(reader.read_enum(RefusalStatus::from_code)?),
             reply_kind::PONG => AdminReply::Pong,
-            reply_kind::KEY_REQUEST => AdminReply::KeyRequest(WireKeyRequest {
-                id: reader.read_u64()?,
-                digest: reader.read_array()?,
-                operation: WireKeyOperation::read(reader)?,
-                approvals: reader.read_u8()?,
-                quorum: reader.read_u8()?,
-            }),
             reply_kind::POLICY_NEXT => AdminReply::PolicyNext {
                 version: reader.read_u64()?,
             },
+            reply_kind::PENDING_REQUEST => {
+                AdminReply::PendingRequest(WirePendingRequest::read(reader)?)
+            }
+            reply_kind::REQUEST_LIST => AdminReply::RequestList {
+                entries: reader.read_seq(MAX_LISTED_REQUESTS, WireRequestSummary::read)?,
+            },
+            reply_kind::REQUEST_SHOWN => {
+                AdminReply::RequestShown(Box::new(WireRequestShown::read(reader)?))
+            }
             _ => return Err(Error::UnknownKind),
         })
     }

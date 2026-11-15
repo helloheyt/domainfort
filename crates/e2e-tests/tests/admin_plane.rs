@@ -287,19 +287,13 @@ fn provisioning_to_a_new_users_login() {
         let once = w.ap_req(&alice, &group("e2e-staff"));
         let staff = w
             .admin(&ipc_admin::Request::Forward {
-                auth: Auth {
-                    requester: once.clone(),
-                    approvals: Vec::new(),
-                },
+                auth: Auth::of(once.clone()),
                 operation: group("e2e-staff"),
             })
             .created();
         assert_eq!(
             w.admin(&ipc_admin::Request::Forward {
-                auth: Auth {
-                    requester: once.clone(),
-                    approvals: Vec::new(),
-                },
+                auth: Auth::of(once.clone()),
                 operation: group("e2e-staff"),
             })
             .refusal(),
@@ -308,10 +302,7 @@ fn provisioning_to_a_new_users_login() {
         );
         assert_eq!(
             w.admin(&ipc_admin::Request::Forward {
-                auth: Auth {
-                    requester: once,
-                    approvals: Vec::new(),
-                },
+                auth: Auth::of(once),
                 operation: group("e2e-other"),
             })
             .refusal(),
@@ -324,10 +315,7 @@ fn provisioning_to_a_new_users_login() {
         let made_for = w.ap_req(&alice, &group("e2e-meant"));
         assert_eq!(
             w.admin(&ipc_admin::Request::Forward {
-                auth: Auth {
-                    requester: made_for,
-                    approvals: Vec::new(),
-                },
+                auth: Auth::of(made_for),
                 operation: group("e2e-hijacked"),
             })
             .refusal(),
@@ -514,36 +502,42 @@ fn provisioning_to_a_new_users_login() {
             "{swept:?}"
         );
         let destroy_decision = swept.destroyed[0].decision;
-        // A-102 (docs/52 §4.2): a dual-controlled key operation — alice
-        // requests, bob approves (the approval that completes the quorum
-        // makes dird register the decision in keyd), keyadm runs it by the
-        // request's id; keyd builds the dual-control token itself.
+        // A-102 (docs/52 §4.2): a dual-controlled key operation, through
+        // the one mechanism (task D2-c, docs/questions/Q-882) — alice
+        // proposes it, bob approves the pending request by id and digest
+        // (the approval that completes the quorum makes dird register the
+        // decision in keyd), keyadm runs it by the request's id; keyd builds
+        // the dual-control token itself.
         let rotation = ipc_dird_admin::KeyOperation::RotateKrbtgt;
-        let request_id = match w
+        let proposed = match w
             .forward(
                 &alice,
                 &[],
-                Operation::RequestKeyOperation {
-                    operation: rotation,
+                Operation::Propose {
+                    reason_ref: None,
+                    operation: Box::new(Operation::KeyOperation(rotation)),
                 },
             )
             .reply()
         {
-            Reply::KeyRequest(state) => state.id,
-            other => panic!("RequestKeyOperation: {other:?}"),
+            Reply::PendingRequest(state) => state,
+            other => panic!("Propose: {other:?}"),
         };
+        let request_id = proposed.id;
         match w
             .forward(
                 &bob,
                 &[],
                 Operation::Approve {
                     id: request_id,
-                    operation: rotation,
+                    digest: proposed.digest,
                 },
             )
             .reply()
         {
-            Reply::KeyRequest(state) => assert!(state.approved()),
+            Reply::PendingRequest(state) => {
+                assert_eq!(state.state, ipc_dird_admin::RequestState::Approved)
+            }
             other => panic!("Approve: {other:?}"),
         }
         let rotated = keyadm::execute::run(
@@ -801,7 +795,14 @@ fn provisioning_to_a_new_users_login() {
         use Said::*;
         let mut expected = vec![
             (Op::CreateUser, Refused(AdminRefusal::ApprovalRequired)),
-            (Op::CreateUser, Refused(AdminRefusal::ApproverNotDistinct)),
+            // Task D2-c (Q-882): alice's own approval of her proposal is
+            // refused (the world helper then withdraws it); bob approves the
+            // next proposal, and alice's execution consumes it.
+            (Op::Propose, Proceed),
+            (Op::Approve, Refused(AdminRefusal::ApproverNotDistinct)),
+            (Op::Withdraw, Proceed),
+            (Op::Propose, Proceed),
+            (Op::Approve, Proceed),
             (Op::CreateUser, Proceed),
             (Op::CreateUser, Committed),
             (Op::CreateUser, Proceed),
@@ -841,9 +842,9 @@ fn provisioning_to_a_new_users_login() {
             (Op::SetEnabled, Committed),
             (Op::Delete, Proceed),
             (Op::Delete, Committed),
-            // A-102: the krbtgt rotation — the request, then the approval
+            // A-102: the krbtgt rotation — the proposal, then the approval
             // that completed the quorum and its registration in keyd.
-            (Op::RequestKeyOperation, Proceed),
+            (Op::Propose, Proceed),
             (Op::Approve, Proceed),
             (Op::Approve, Committed),
         ]);
@@ -878,11 +879,32 @@ fn provisioning_to_a_new_users_login() {
                 _ => None,
             })
             .collect();
+        // Task D2-c (Q-888): admind's event carries the fingerprint of the
+        // operation — the digest of `BeginPasswordSet {dave}` the client's
+        // AP-REQ was bound to, the same dird's events of that step carry.
+        let begin_digest =
+            *ipc_dird_admin::operation_digest(&Operation::BeginPasswordSet { target: dave })
+                .unwrap()
+                .as_bytes();
         assert!(
             admind.iter().any(|(_, a)| matches!(a,
-            AdmindActivity::SetPassword { target, kvnos, result: PasswordResult::Completed }
-                if *target == packet(dave) && kvnos.as_slice() == [1])),
+            AdmindActivity::SetPassword {
+                target,
+                operation_digest,
+                kvnos,
+                result: PasswordResult::Completed,
+            } if *target == packet(dave)
+                && kvnos.as_slice() == [1]
+                && *operation_digest == begin_digest)),
             "admind recorded dave's completed SetPassword with kvno 1"
+        );
+        assert!(
+            admin
+                .iter()
+                .any(|(_, e)| e.operation == Op::BeginPasswordSet
+                    && e.target == Some(packet(dave))
+                    && e.operation_digest == begin_digest),
+            "dird's BeginPasswordSet events carry the same fingerprint"
         );
         assert!(
             admind.iter().any(|(_, a)| matches!(a,
@@ -1070,7 +1092,7 @@ fn auditd_down_refuses_admin_writes_and_leaves_the_store_unchanged() {
         // exactly those answers.
         let created_after = w.settled(|w| {
             let operation = create_user(workstations, "after");
-            let auth = w.auth(&alice, &[], &operation);
+            let auth = w.auth(&alice, &operation);
             w.admin(&ipc_admin::Request::Forward { auth, operation })
         });
         assert!(
@@ -1183,7 +1205,7 @@ fn admind_down_the_client_sees_closure() {
         w.stop_admind();
         let workstations = w.guid(ObjectRole::WorkstationsOu);
         let operation = create_user(workstations, "erin");
-        let auth = w.auth(&alice, &[], &operation);
+        let auth = w.auth(&alice, &operation);
         let got = open.call(&ipc_admin::Request::Forward { auth, operation });
         assert_eq!(got, Got::Closed, "the open connection is closed");
         assert!(
@@ -1215,9 +1237,10 @@ fn admind_down_the_client_sees_closure() {
 /// Task A16 (docs/51 §5.10, R51-21; A-80 on Q-299 option (b); P-22; A-69):
 /// over the real `admin.sock` → admind → `dird-admin.sock` → dird (keyd
 /// verifying every AP-REQ, auditd recording): one first administrator alone
-/// cannot change the tier map; with the second's approval in the same
-/// request dird writes `policy.next` (version 1 → 2) in its own directory;
-/// a second change is refused while it is pending; root's activation
+/// cannot change the tier map; with the second's approval of the pending
+/// request (task D2-c, Q-882) dird writes `policy.next` (version 1 → 2) in
+/// its own directory; a second change is refused while it is pending —
+/// already at its proposal; root's activation
 /// (`provision policy --activate-next`, reading dird's own configuration
 /// file) installs it — the daemons' loaders read version 2 — and removes
 /// `policy.next`; the verified audit log holds the decision with the
@@ -1291,7 +1314,7 @@ fn a_dual_controlled_policy_change_is_written_for_root_and_activated() {
             .map(|(_, e)| e)
             .filter(|e| e.operation == DirAdminOperation::ChangePolicy)
             .collect();
-        assert_eq!(changes.len(), 4, "{changes:?}");
+        assert_eq!(changes.len(), 3, "{changes:?}");
         assert_eq!(
             changes[0].stage,
             DirAdminStage::Decision(DecisionResult::Refused(AdminRefusal::ApprovalRequired))
@@ -1321,9 +1344,16 @@ fn a_dual_controlled_policy_change_is_written_for_root_and_activated() {
             DirAdminStage::Outcome(OutcomeResult::Committed { .. })
         ));
         assert_eq!(changes[2].operation_id, changes[1].operation_id);
+        let proposals: Vec<&DirAdminEvent> = dir_admin_events(&events)
+            .into_iter()
+            .map(|(_, e)| e)
+            .filter(|e| e.operation == DirAdminOperation::Propose)
+            .collect();
+        assert_eq!(proposals.len(), 2, "{proposals:?}");
         assert_eq!(
-            changes[3].stage,
+            proposals[1].stage,
             DirAdminStage::Decision(DecisionResult::Refused(AdminRefusal::PendingLimit))
         );
+        assert_eq!(proposals[1].proposed, Some(DirAdminOperation::ChangePolicy));
     });
 }

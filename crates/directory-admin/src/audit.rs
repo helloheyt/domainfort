@@ -29,6 +29,7 @@ use ipc_audit::{
     EnableDirection, GroupTypeCode, KeydOperation, OutcomeResult, PdpReason, PdpReasonCode,
     SidValue, TargetName, MAX_APPROVERS, MAX_REPORTED_KVNOS, MAX_TARGET_NAMES,
 };
+use keyd_types::OperationDigest;
 use krb_proto::KerberosTime;
 
 use crate::operation::{LookupKey, Operation};
@@ -83,13 +84,19 @@ impl Stop {
                 AdminRefusal::AccountNameInvalid
                 | AdminRefusal::ValueInvalid
                 | AdminRefusal::MembershipInvalid
-                | AdminRefusal::OperationMismatch => RefusalStatus::Invalid,
-                AdminRefusal::Conflict => RefusalStatus::Conflict,
-                // The bounded pending table is full: retrying later (after a
-                // request expires or completes) may succeed (task A10).
-                AdminRefusal::RidExhausted | AdminRefusal::PendingLimit => {
-                    RefusalStatus::Unavailable
-                }
+                | AdminRefusal::OperationMismatch
+                // A proposal for an operation that needs no approver: send
+                // the operation itself (task D2-c, docs/questions/Q-938).
+                | AdminRefusal::ApprovalNotNeeded => RefusalStatus::Invalid,
+                // The state a pending request was judged on changed (task
+                // D2-c, class C43): the request is dropped; propose again.
+                AdminRefusal::Conflict | AdminRefusal::RequestStale => RefusalStatus::Conflict,
+                // The bounded pending table is full, or the requester holds
+                // its cap of open requests: retrying later (after a request
+                // expires or completes) may succeed (task A10; task D2-c).
+                AdminRefusal::RidExhausted
+                | AdminRefusal::PendingLimit
+                | AdminRefusal::RequesterLimit => RefusalStatus::Unavailable,
                 AdminRefusal::Unauthenticated
                 | AdminRefusal::TicketAge
                 | AdminRefusal::PolicyDenied
@@ -186,9 +193,17 @@ pub(crate) struct EventBase {
     enable: Option<EnableDirection>,
     account_expires: Option<AccountExpiresValue>,
     group_type: Option<GroupTypeCode>,
-    pub(crate) key_request: Option<u64>,
+    pub(crate) pending_request: Option<u64>,
     pub(crate) key_operation: Option<KeydOperation>,
     pub(crate) reported_kvnos: Vec<u32>,
+    /// The operation's fingerprint (docs/questions/Q-888): the digest dird
+    /// computed from the request it decoded — or, on a step of a pending
+    /// request, the request's operation digest.
+    pub(crate) operation_digest: OperationDigest,
+    /// The operation a pending directory / policy request is for.
+    pub(crate) proposed: Option<DirAdminOperation>,
+    /// A pending request's `reason_ref` (unverified).
+    pub(crate) reason_ref: Option<AuditText>,
 }
 
 /// One name of the request, kept by the `AuditText` rule.
@@ -202,10 +217,15 @@ fn name(kind: AdminNameKind, text: &str) -> TargetName {
 impl EventBase {
     /// The fields the request itself determines: the operation, the objects
     /// it names (`target` / `parent` / `member` by GUID), its name fields,
-    /// and the three request values A-85 records.
-    /// Spec: crate ipc-audit `DirAdminEvent` field list; Q-340 items 4-5.
-    pub(crate) fn of_request(operation_id: u64, op: &Operation) -> EventBase {
-        let mut base = EventBase::bare(operation_id, op.code());
+    /// the three request values A-85 records, and its digest (Q-888).
+    /// Spec: crate ipc-audit `DirAdminEvent` field list; Q-340 items 4-5;
+    /// docs/questions/Q-888.
+    pub(crate) fn of_request(
+        operation_id: u64,
+        op: &Operation,
+        digest: &OperationDigest,
+    ) -> EventBase {
+        let mut base = EventBase::bare(operation_id, op.code(), digest);
         match op {
             Operation::CreateUser(c) => {
                 base.parent = Some(c.parent);
@@ -287,8 +307,9 @@ impl EventBase {
     pub(crate) fn of_policy_change(
         operation_id: u64,
         changes: &[policy_store::TierChange],
+        digest: &OperationDigest,
     ) -> EventBase {
-        let mut base = EventBase::bare(operation_id, DirAdminOperation::ChangePolicy);
+        let mut base = EventBase::bare(operation_id, DirAdminOperation::ChangePolicy, digest);
         base.names = changes
             .iter()
             .map(|change| name(AdminNameKind::PolicyChange, &change.to_string()))
@@ -296,10 +317,15 @@ impl EventBase {
         base
     }
 
-    /// An event base with only the operation number and code (every other
-    /// field empty): a key-operation step fills its own fields (task A10).
+    /// An event base with only the operation number, code and digest (every
+    /// other field empty): a step of a pending request fills its own fields
+    /// (crate::requests).
     /// Spec: crate ipc-audit `DirAdminEvent` field list.
-    pub(crate) fn bare(operation_id: u64, operation: DirAdminOperation) -> EventBase {
+    pub(crate) fn bare(
+        operation_id: u64,
+        operation: DirAdminOperation,
+        digest: &OperationDigest,
+    ) -> EventBase {
         EventBase {
             operation_id,
             operation,
@@ -313,10 +339,46 @@ impl EventBase {
             enable: None,
             account_expires: None,
             group_type: None,
-            key_request: None,
+            pending_request: None,
             key_operation: None,
             reported_kvnos: Vec::new(),
+            operation_digest: *digest,
+            proposed: None,
+            reason_ref: None,
         }
+    }
+
+    /// The request-derived fields of a pending request's operation, for an
+    /// event of the step `step` on it: the objects and names a directory
+    /// operation names, a policy change's changes, a key operation's code,
+    /// the operation's code as `proposed`, its digest and its `reason_ref`
+    /// (task D2-c).
+    /// Spec: crate ipc-audit `DirAdminEvent` field list (`pending_request`,
+    /// `proposed`, `reason_ref`, `operation_digest`); docs/questions/Q-882,
+    /// Q-888.
+    pub(crate) fn of_proposed(
+        operation_id: u64,
+        step: DirAdminOperation,
+        operation: &crate::requests::ProposedOperation,
+        digest: &OperationDigest,
+        reason_ref: Option<&str>,
+    ) -> EventBase {
+        use crate::requests::ProposedOperation;
+        let mut base = match operation {
+            ProposedOperation::Directory(op) => EventBase::of_request(operation_id, op, digest),
+            ProposedOperation::Policy(changes) => {
+                EventBase::of_policy_change(operation_id, changes, digest)
+            }
+            ProposedOperation::Key(op) => {
+                let mut base = EventBase::bare(operation_id, step, digest);
+                base.key_operation = Some(op.keyd_operation());
+                base
+            }
+        };
+        base.proposed = operation.code();
+        base.operation = step;
+        base.reason_ref = reason_ref.map(AuditText::from_client);
+        base
     }
 
     /// Build the event of `stage`, recorded at `now`. A bounded field that
@@ -330,6 +392,7 @@ impl EventBase {
         names.truncate(MAX_TARGET_NAMES);
         let mut kvnos = self.reported_kvnos.clone();
         kvnos.truncate(MAX_REPORTED_KVNOS);
+        let digest: [u8; 32] = *self.operation_digest.as_bytes();
         DirAdminEvent {
             time,
             operation_id: self.operation_id,
@@ -345,9 +408,12 @@ impl EventBase {
             enable: self.enable,
             account_expires: self.account_expires,
             group_type: self.group_type,
-            key_request: self.key_request,
+            pending_request: self.pending_request,
             key_operation: self.key_operation,
             reported_kvnos: BoundedSeq::new(kvnos).unwrap_or_default(),
+            operation_digest: digest,
+            proposed: self.proposed,
+            reason_ref: self.reason_ref.clone(),
         }
     }
 

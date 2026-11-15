@@ -12,11 +12,12 @@
 //!    [`directory_pip::DirectoryView`] (taken after it began its
 //!    `WriteTxn`, for a write) and the policy snapshot of the same version.
 //!    `prepare` builds the requester's Subject from the directory
-//!    ([`AdminSubject::from_verified_ticket`]), runs `decide`, the
-//!    dual-control classification and the approvers' checks, the semantic
-//!    checks of docs/51 §11 and the self-lockout guard, and returns a
-//!    [`Prepared`] carrying the `Decision` event — or a [`Refusal`] whose
-//!    event records why;
+//!    ([`AdminSubject::from_verified_ticket`]), runs `decide`, the semantic
+//!    checks of docs/51 §11, the self-lockout guard and the dual-control
+//!    classification — consuming, when the operation needs an approver, the
+//!    approved pending request held for it ([`PendingRequests`]) — and
+//!    returns a [`Prepared`] carrying the `Decision` event — or a
+//!    [`Refusal`] whose event records why;
 //! 2. sends the decision event and waits for auditd's acknowledgement
 //!    (auditd unavailable ⇒ the operation is refused before the commit,
 //!    docs/51 §5.7 item 2);
@@ -31,18 +32,24 @@
 //! `Lookup` and `CompletePasswordSet` commit nothing: their decision event
 //! is the only one, and their reply is [`Prepared::reply`].
 //!
-//! # Dual-controlled key operations (task A10)
+//! # One dual-control mechanism (task D2-c; docs/questions/Q-882, A-148)
 //!
-//! [`DirectoryAdmin::key_step`] serves `RequestKeyOperation` and `Approve`
-//! over the pending requests dird holds in memory ([`KeyRequests`]):
-//! `PolicyAdmin` on the policy scope `keys` for the requester and every
-//! approver, the approval bound to the request's operation digest; the
-//! `Approve` that completes the quorum yields the [`KeyDecision`] dird
-//! registers in keyd (A-102, docs/52 §4.3) — as a [`QuorumStep`], whose
-//! `Decision` event auditd must acknowledge first (an
-//! `ipc_audit_client::AckedIntent<QuorumStep>`, docs/52 R6). keyadm's
-//! `FetchApproved`, `Complete` and `ListPendingDestruction` are retired
-//! (docs/52 §4.6); [`DirectoryAdmin::destruction_target`] and
+//! Every dual-controlled operation — a directory write whose rule needs an
+//! approver (P-22), a `ChangePolicy`, a key operation — goes through a
+//! pending request dird holds in memory ([`PendingRequests`], module
+//! `requests`): [`DirectoryAdmin::propose`] (the operation's checks as a dry
+//! run; its exact fields and its operation digest held), then
+//! [`DirectoryAdmin::step`] — `Approve {id, digest}` (everything the
+//! request was judged on evaluated again — class C43), `Reject`,
+//! `Withdraw`, `ListRequests`, `ShowRequest` (r5-a MA5). At the quorum a
+//! directory or policy operation is executed by its requester (`prepare` /
+//! `prepare_policy_change` consume the approved request); a key
+//! operation's `Approve` yields the [`KeyDecision`] dird registers in keyd
+//! (A-102, docs/52 §4.3) — as a [`QuorumStep`], whose `Decision` event
+//! auditd must acknowledge first (an `ipc_audit_client::AckedIntent<QuorumStep>`,
+//! docs/52 R6). The in-request approvals of docs/51 §7.2 and the key-only
+//! `RequestKeyOperation` / `Approve` (task A10) have no code path.
+//! [`DirectoryAdmin::destruction_target`] and
 //! [`DirectoryAdmin::destruction_targets`] name the key sets a committed
 //! `Delete` leaves to destroy, as [`TombstonedPrincipal`]s — the only input
 //! of a destroy decision (module `key_requests`; docs/51 §5.6, §6; A-105).
@@ -52,7 +59,8 @@
 //! [`DirectoryAdmin::prepare_policy_change`] decides a `ChangePolicy`
 //! request — a tier-map edit in the vocabulary of `provision policy` — with
 //! the PEP's own `authorize` (`PolicyAdmin` on the scope
-//! [`POLICY_CHANGE_SCOPE`]) and its one `dual_control`, always required;
+//! [`POLICY_CHANGE_SCOPE`]) and the one dual-control mechanism, always
+//! required (an approved pending request for exactly these changes);
 //! refuses while a `policy.next` waits for root ([`PendingPolicy`]); and
 //! builds the candidate with crate policy-store's one tier-map edit (the
 //! next version), decoded again by the format's own decoder before anything
@@ -146,6 +154,15 @@
 //! Q-356 (membership and protected objects), Q-357 (dual control and the
 //! self-lockout guard), Q-358 (two-phase contract and re-verification),
 //! Q-416 (the closure-size refusal).
+//!
+//! The one dual-control mechanism (task D2-c) was written only from, opened
+//! in this session: docs/research/r5-b-cli.md (§6, §7, §12-§15),
+//! docs/research/r5-a-admin-model.md (§5, §8.2, §11 MA5), docs/questions
+//! Q-882, Q-888, Q-887, Q-878, Q-874, docs/51 (§5.5-§5.7, §7), docs/52
+//! (§2 classes C14, C43, C44, C46, C47; §3.11), PENDING-OWNER (A-102,
+//! A-108, A-110, A-111, A-120, A-146..A-148, P-22, P-30, P-78) and this
+//! repository's own code; interpretations in docs/questions/Q-935..Q-941.
+//! No other implementation was consulted or recalled (AGENTS.md §1-3).
 
 mod admin;
 mod apply;
@@ -162,6 +179,7 @@ mod policy_change;
 mod random;
 mod record;
 mod reply;
+mod requests;
 mod subject;
 mod time;
 
@@ -180,13 +198,24 @@ pub use descriptor::{new_object_descriptor, DescriptorError};
 // `provision domain` writes the new domain, and the only place the named
 // provisioning exceptions exist.
 pub use invariants::{InvariantViolation, Provisioning, ProvisioningError, ProvisioningRole};
-// Dual-controlled key operations (task A10, docs/51 §5.6, §6).
+// Key operations (task A10, docs/51 §5.6, §6): their key sets, the decision
+// registered in keyd, the tombstones to destroy.
 pub use key_requests::{
-    operation_digest, DestructionTargets, KeyAdminOperation, KeyDecision, KeyOperation, KeyRef,
-    KeyReply, KeyRequestView, KeyRequests, KeyStep, KeyTargets, QuorumStep, RegistrationOutcome,
-    TombstonedPrincipal, DIGEST_LEN, KEY_POLICY_SCOPE, KEY_REQUEST_LIFETIME,
-    MAX_KEY_REQUEST_LIFETIME, MAX_PENDING_KEY_REQUESTS,
+    DestructionTargets, KeyDecision, KeyOperation, KeyRef, KeyTargets, RegistrationOutcome,
+    TombstonedPrincipal, KEY_POLICY_SCOPE,
 };
+// The one dual-control mechanism (task D2-c; docs/questions/Q-882).
+pub use requests::{
+    ApproverSignature, ListScope, PendingRequests, PolicyFile, ProposeRequest, Proposed,
+    ProposedOperation, QuorumStep, RequestDetail, RequestFact, RequestState, RequestStep,
+    RequestSummary, RequestView, StepReply, StepRequest, Stepped, MAX_FACTS, MAX_PENDING_REQUESTS,
+    MAX_REASON_REF_CHARS, MAX_REQUESTS_PER_REQUESTER, MAX_REQUEST_LIFETIME, REQUESTS_PER_REQUESTER,
+    REQUEST_LIFETIME,
+};
+
+/// Octets of an operation digest (SHA-256). Spec: FIPS 180-4 §6.2; crate
+/// ipc-dird-admin `DIGEST_LEN` (pinned in crates/directory-daemon).
+pub const DIGEST_LEN: usize = 32;
 // The name and value rules, public for `provision domain` (task A4), which
 // must apply exactly these rules to the names it is given (A-79).
 pub use names::{

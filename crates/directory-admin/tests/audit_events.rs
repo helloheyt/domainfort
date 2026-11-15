@@ -54,6 +54,7 @@ fn create_user_events_are_exact() {
         upn: Some("carol@example.test".into()),
         description: Some("not for the log".into()),
     });
+    let digest = *fingerprint(&op).as_bytes();
     let (decision, applied) = d.run(op, "admin1", &[]).applied();
     let expected = DirAdminEvent {
         time: at_now(),
@@ -74,9 +75,13 @@ fn create_user_events_are_exact() {
         enable: None,
         account_expires: None,
         group_type: None,
-        key_request: None,
+        pending_request: None,
         key_operation: None,
         reported_kvnos: BoundedSeq::empty(),
+        // Q-888: the fingerprint the requester's AP-REQ is bound to.
+        operation_digest: digest,
+        proposed: None,
+        reason_ref: None,
     };
     assert_eq!(decision, expected);
     assert_eq!(
@@ -110,16 +115,12 @@ fn create_user_events_are_exact() {
 #[test]
 fn a_refusal_event_is_exact() {
     let mut d = Domain::new("events-refused");
-    let r = d
-        .run(
-            Operation::SetEnabled(SetEnabled {
-                target: guid(ALICE),
-                enabled: false,
-            }),
-            "bob",
-            &[],
-        )
-        .refused();
+    let op = Operation::SetEnabled(SetEnabled {
+        target: guid(ALICE),
+        enabled: false,
+    });
+    let digest = *fingerprint(&op).as_bytes();
+    let r = d.run(op, "bob", &[]).refused();
     assert_eq!(
         r.event(),
         &DirAdminEvent {
@@ -140,32 +141,35 @@ fn a_refusal_event_is_exact() {
             enable: Some(EnableDirection::Disable),
             account_expires: None,
             group_type: None,
-            key_request: None,
+            pending_request: None,
             key_operation: None,
             reported_kvnos: BoundedSeq::empty(),
+            operation_digest: digest,
+            proposed: None,
+            reason_ref: None,
         }
     );
 }
 
 /// A-85 / docs/51 §5.6: a dual-controlled membership change names the group
-/// as target, the member, the requester and the verified approver; a
-/// `CreateGroup` records its groupType code (Q-340 item 5).
+/// as target, the member, the requester and the approver of the pending
+/// request it consumed — and that request's id, and the operation's
+/// fingerprint (task D2-c; Q-882, Q-888); a `CreateGroup` records its
+/// groupType code (Q-340 item 5).
 #[test]
 fn dual_control_and_group_type_events_are_exact() {
     let mut d = Domain::new("events-dual");
-    let (decision, applied) = d
-        .run(
-            Operation::AddMember(Membership {
-                group: guid(TIER0_GROUP),
-                member: guid(ALICE),
-            }),
-            "admin1",
-            &["admin2"],
-        )
-        .applied();
+    let op = Operation::AddMember(Membership {
+        group: guid(TIER0_GROUP),
+        member: guid(ALICE),
+    });
+    let digest = *fingerprint(&op).as_bytes();
+    let (decision, applied) = d.run(op, "admin1", &["admin2"]).applied();
+    assert!(decision.pending_request.is_some());
     let expected = DirAdminEvent {
         time: at_now(),
-        operation_id: 1,
+        // Propose (1) and Approve (2) came first.
+        operation_id: 3,
         operation: DirAdminOperation::AddMember,
         stage: DirAdminStage::Decision(DecisionResult::Proceed),
         target: Some(guid(TIER0_GROUP).to_packet()),
@@ -178,9 +182,12 @@ fn dual_control_and_group_type_events_are_exact() {
         enable: None,
         account_expires: None,
         group_type: None,
-        key_request: None,
+        pending_request: decision.pending_request,
         key_operation: None,
         reported_kvnos: BoundedSeq::empty(),
+        operation_digest: digest,
+        proposed: None,
+        reason_ref: None,
     };
     assert_eq!(decision, expected);
     assert_eq!(
@@ -205,7 +212,7 @@ fn dual_control_and_group_type_events_are_exact() {
         decision.group_type,
         Some(GroupTypeCode::SecurityUniversalGroup)
     );
-    assert_eq!(decision.operation_id, 2);
+    assert_eq!(decision.operation_id, 4);
     // Default groupType: GROUP_TYPE_SECURITY_ACCOUNT ([MS-SAMR] 3.1.1.8.1
     // item 2.2).
     let (decision, _) = d

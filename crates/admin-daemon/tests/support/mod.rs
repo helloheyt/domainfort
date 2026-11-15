@@ -635,37 +635,26 @@ pub fn fresh_unbound(sam: &str) -> Vec<u8> {
     ap_req(sam, CUSEC.fetch_add(1, Ordering::SeqCst), None)
 }
 
-/// The auth field of `operation` by `requester` with `approvers`, every
-/// AP-REQ bound to it (R2).
-pub fn auth(
-    requester: &str,
-    approvers: &[&str],
-    operation: &ipc_dird_admin::Operation,
-) -> ipc_dird_admin::Auth {
-    ipc_dird_admin::Auth {
-        requester: fresh(requester, operation),
-        approvals: approvers.iter().map(|a| fresh(a, operation)).collect(),
-    }
+/// The auth field of `operation` by `requester`, its AP-REQ bound to it
+/// (R2). There are no approvals in a request (task D2-c; docs/questions/
+/// Q-882: an approval is an `Approve` of a pending request).
+pub fn auth(requester: &str, operation: &ipc_dird_admin::Operation) -> ipc_dird_admin::Auth {
+    ipc_dird_admin::Auth::of(fresh(requester, operation))
 }
 
-/// A `Forward` of `operation` by `requester` with `approvers`.
-pub fn forward(
-    requester: &str,
-    approvers: &[&str],
-    operation: ipc_dird_admin::Operation,
-) -> ipc_admin::Request {
+/// A `Forward` of `operation` by `requester`.
+pub fn forward(requester: &str, operation: ipc_dird_admin::Operation) -> ipc_admin::Request {
     ipc_admin::Request::Forward {
-        auth: auth(requester, approvers, &operation),
+        auth: auth(requester, &operation),
         operation,
     }
 }
 
 /// The `auth` of a `SetPassword` of `target`: bound to the
 /// `BeginPasswordSet {target}` admind sends dird (docs/51 §7.6; R2).
-pub fn begin_auth(requester: &str, approvers: &[&str], target: dtyp::Guid) -> ipc_dird_admin::Auth {
+pub fn begin_auth(requester: &str, target: dtyp::Guid) -> ipc_dird_admin::Auth {
     auth(
         requester,
-        approvers,
         &ipc_dird_admin::Operation::BeginPasswordSet { target },
     )
 }
@@ -1322,7 +1311,7 @@ impl Default for Options {
             keyd_deadline: Duration::from_secs(2),
             frame_timeout: Duration::from_secs(2),
             keyadm_keyd: false,
-            key_request_lifetime: directory_admin::KEY_REQUEST_LIFETIME,
+            key_request_lifetime: directory_admin::REQUEST_LIFETIME,
         }
     }
 }
@@ -1509,7 +1498,8 @@ impl World {
                     max_connections: directory_daemon::MAX_ADMIN_CONNECTIONS,
                     queue_capacity: directory_daemon::ADMIN_QUEUE_CAPACITY,
                     ack_deadline: DecisionAckDeadline::PRODUCTION,
-                    key_request_lifetime: options.key_request_lifetime,
+                    request_lifetime: options.key_request_lifetime,
+                    requests_per_requester: directory_admin::REQUESTS_PER_REQUESTER,
                     destroy_reconcile_interval: directory_daemon::DESTROY_RECONCILE_INTERVAL,
                     // Task A16: these worlds exercise no policy change.
                     policy_next: None,

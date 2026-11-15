@@ -26,8 +26,11 @@
 //!
 //! Every frame: `length:u32 ‖ magic:u16 ‖ version:u8 ‖ kind:u8 ‖ payload`
 //! (docs/50 §3.3). Every operation's payload starts with
-//! `auth := requester: bytes<64 KiB> ‖ approvals: seq<bytes<64 KiB>, 2>` —
-//! raw AP-REQs; there is no field in which admind could claim a name, SID,
+//! `auth := requester: bytes<64 KiB> ‖ approvals: seq<_, 0>` — the
+//! requester's raw AP-REQ, and the count of the **retired** in-request
+//! approvals, always 0 (a non-empty sequence is refused: docs/questions/
+//! Q-882 item 6, A-148 — every approval is an `Approve` of a pending request
+//! dird holds); there is no field in which admind could claim a name, SID,
 //! tier or "approved" (docs/51 §7.2; A-70).
 //!
 //! **Every AP-REQ is bound to its operation (R2; docs/52 §5; A-102):** the
@@ -53,30 +56,59 @@
 //! | → | `0x0B` | `RemoveMember` | `group ‖ member` | `Done` |
 //! | → | `0x0C` | `Delete` | `target` | `Done` |
 //! | → | `0x0D` | `Lookup` | `u8 1 ‖ sam:bytes<256> \| u8 2 ‖ spn:bytes<1024> \| u8 3 ‖ dn:seq<bytes<128>,64>` | `Found` |
-//! | → | `0x0E` | `RequestKeyOperation` | `operation:KeyOperation` | `KeyRequest` |
-//! | → | `0x0F` | `Approve` | `id:u64 ‖ operation:KeyOperation` | `KeyRequest` |
+//! | → | `0x0E`, `0x0F` | (retired by task D2-c: `RequestKeyOperation`, the key-only `Approve {id, operation}` — Q-882) | — | — |
 //! | → | `0x10`–`0x12` | (retired by A-102: keyadm's `FetchApproved`, `Complete`, `ListPendingDestruction`) | — | — |
 //! | → | `0x14` | `Ping` | (no `auth`, empty) | `Pong` |
 //! | → | `0x16` | `ChangePolicy` (task A16) | `changes:seq<PolicyChange, 4>` | `PolicyNext` |
+//! | → | `0x17` | `Propose` (D2-c) | `reason_ref:Option<bytes<64>> ‖ operation:ProposedOperation` | `PendingRequest` |
+//! | → | `0x18` | `Approve` (D2-c) | `id:u64 ‖ digest:[32]` | `PendingRequest` |
+//! | → | `0x19` | `Reject` (D2-c) | `id:u64 ‖ digest:[32]` | `Done` |
+//! | → | `0x1A` | `Withdraw` (D2-c) | `id:u64` | `Done` |
+//! | → | `0x1B` | `ListRequests` (D2-c) | `scope:u8{1 Mine, 2 AwaitingMe}` | `RequestList` |
+//! | → | `0x1C` | `ShowRequest` (D2-c) | `id:u64` | `RequestShown` |
 //! | ← | `0x81` | `Created` | `guid:[16] ‖ sid:Option<bytes<68>>` | — |
 //! | ← | `0x82` | `PasswordSet` | `kind:u8{1 User, 2 Computer} ‖ keys:seq<(principal:[16] ‖ purpose:u8{1 Longterm, 2 Service} ‖ realm:bytes<255> ‖ name:bytes<4096> DER), 2> ‖ salt:bytes<1024>` | — |
 //! | ← | `0x83` | `Done` | — | — |
 //! | ← | `0x84` | `Found` | `guid:[16] ‖ dn:seq<bytes<128>,64> ‖ class:bytes<64> ‖ sid:Option<bytes<68>>` | — |
 //! | ← | `0x85` | `Refused` | `status:u8{1 Denied, 2 ApprovalRequired, 3 NotFound, 4 Invalid, 5 Conflict, 6 Unavailable}` | — |
 //! | ← | `0x86` | `Pong` | — | — |
-//! | ← | `0x88` | `KeyRequest` | `id:u64 ‖ digest:[32] ‖ operation:KeyOperation ‖ approvals:u8 ‖ quorum:u8` | — |
+//! | ← | `0x88` | (retired by task D2-c: `KeyRequest`) | — | — |
 //! | ← | `0x89`, `0x8A` | (retired by A-102: `Approved`, `PendingDestruction`) | — | — |
 //! | ← | `0x8B` | `PolicyNext` (task A16) | `version:u64` | — |
+//! | ← | `0x8C` | `PendingRequest` (D2-c) | `id:u64 ‖ digest:[32] ‖ state:u8{1 Pending, 2 Approved} ‖ approvals:u8 ‖ quorum:u8 ‖ expires:u64` | — |
+//! | ← | `0x8D` | `RequestList` (D2-c) | `entries:seq<(id ‖ digest ‖ state ‖ operation:u8 ‖ requester:bytes<68> ‖ approvals:u8 ‖ quorum:u8 ‖ expires:u64), 32>` | — |
+//! | ← | `0x8E` | `RequestShown` (D2-c) | `id ‖ digest ‖ state ‖ requester:bytes<68> ‖ approvers:seq<bytes<68>,2> ‖ quorum:u8 ‖ expires:u64 ‖ reason_ref:Option<bytes<64>> ‖ operation:ProposedOperation ‖ facts:seq<Fact,2>` | — |
 //! | ← | `0xFF` | shared `Refused` (A-59) | `code` | — |
 //!
+//! `ProposedOperation := kind:u8 ‖ fields`, the kind one of
+//! `request_kind::PROPOSABLE` — the dual-controlled writes, `ChangePolicy`,
+//! and `0x1D KeyOperation` (a key operation; never a request of its own).
+//! `Fact := guid:[16] ‖ dn:seq<bytes<128>,64> ‖ class:bytes<64> ‖
+//! sid:Option<bytes<68>> ‖ tier:u8{0 Tier0, 1 Tier1, 2 Tier2,
+//! 3 Unclassified}`. `expires` is in seconds since 1970-01-01T00:00:00Z.
 //! `KeyOperation := u8 1 RotateKrbtgt | u8 2 RotateKey ‖ service:[16] |
 //! u8 3 RetireKvno ‖ KeyRef ‖ kvno:u32`; `KeyRef := u8 1 Krbtgt | u8 2
 //! Service ‖ principal:[16]` (task A10, docs/questions/Q-422). keyadm's
 //! three requests (`0x10`–`0x12`, the only ones without `auth`) and their
 //! replies (`0x89`, `0x8A`) were **retired by A-102** and are never reused
 //! (docs/52 §4.6, §4.8; docs/questions/Q-460): when an `Approve` completes
-//! the quorum, dird registers the decision in keyd itself (Role::Ldap), and
-//! keyadm executes it in keyd by the request's id. `PolicyChange := u8 1
+//! the quorum of a key-operation request, dird registers the decision in
+//! keyd itself (Role::Ldap), and keyadm executes it in keyd by the request's
+//! id.
+//!
+//! **One dual-control mechanism (task D2-c; docs/questions/Q-882, A-148).**
+//! Every dual-controlled operation goes through a pending request dird
+//! holds: `Propose` (the requester's AP-REQ bound to the `Propose`) ⇒ dird
+//! holds the exact operation and its operation digest; `Approve {id,
+//! digest}` (each approver's AP-REQ bound to the `Approve`); at the quorum a
+//! directory or policy operation becomes executable by its requester — the
+//! same operation sent again, with a fresh AP-REQ, which dird matches to the
+//! approved request by its digest, re-evaluating the requester, every
+//! approver and the objects it names against the current state (class C43)
+//! — and a key operation's decision is registered in keyd. `Reject`,
+//! `Withdraw`, `ListRequests`, `ShowRequest` complete the queue (r5-a MA5).
+//! The in-request approvals and the key-only `RequestKeyOperation` /
+//! `Approve` have no code path. `PolicyChange := u8 1
 //! AddPrincipal ‖ sid:bytes<68> ‖ tier:u8 | u8 2 RemovePrincipal ‖ sid | u8 3
 //! AddSubtree ‖ dn:seq<bytes<128>,16> ‖ tier | u8 4 RemoveSubtree ‖ dn`,
 //! `tier := 0 Tier0 | 1 Tier1 | 2 Tier2` — the tier-map edit's vocabulary
@@ -84,7 +116,7 @@
 //! requester and the approvers, every AP-REQ bound to the request's digest
 //! like any other operation's). Kind `0x13` (the join token of docs/51 §7.3, task A12) is unused. Reply
 //! `0x87` is admin.sock's `PasswordChanged`, never dird's. Request body
-//! ≤ 256 KiB, reply body ≤ 16 KiB ([`channel`]).
+//! ≤ 256 KiB, reply body ≤ 64 KiB ([`channel`]).
 //!
 //! # Security
 //!
@@ -133,13 +165,15 @@ pub use client::{
 pub use digest::{operation_digest, wire_operation_digest, DigestError, OPERATION_DIGEST_LABEL};
 pub use server::{decode_request, encode_refusal, encode_reply, EncodeError, Rejection};
 pub use typed::{
-    AccountExpires, AccountKind, Auth, ConversionError, Found, KeyOperation, KeyRef,
-    KeyRequestState, KeyTarget, LookupKey, Operation, PasswordSet, PasswordSetOutcome,
-    PolicyChange, PolicyTier, Reply, Request, ACCOUNT_EXPIRES_NEVER,
+    AccountExpires, AccountKind, Auth, ConversionError, Fact, FactTier, Found, KeyOperation,
+    KeyRef, KeyTarget, ListScope, LookupKey, Operation, PasswordSet, PasswordSetOutcome,
+    PendingRequestState, PolicyChange, PolicyTier, Reply, Request, RequestShown, RequestState,
+    RequestSummary, ACCOUNT_EXPIRES_NEVER,
 };
 #[cfg(unix)]
 pub use unix::{UnixConnection, UnixConnector};
 pub use wire::{
-    AdminReply, AdminRequest, WireAuth, WireKeyOperation, WireKeyRef, WireKeyRequest,
-    WireKeyTarget, WireLookupKey, WireOperation, WirePolicyChange,
+    AdminReply, AdminRequest, WireAuth, WireFact, WireKeyOperation, WireKeyRef, WireKeyTarget,
+    WireLookupKey, WireOperation, WirePendingRequest, WirePolicyChange, WireRequestShown,
+    WireRequestSummary,
 };

@@ -645,8 +645,18 @@ code_table! {
     /// under mandatory dual control, which dird writes as `policy.next` for
     /// root to activate; its events name each change in the edit's own
     /// spelling (`AdminNameKind::PolicyChange`).
+    /// **One dual-control mechanism (task D2-c; docs/questions/Q-882,
+    /// A-148):** `Propose`, `Reject`, `Withdraw`, `ListRequests` and
+    /// `ShowRequest` are appended — the steps on the pending requests dird
+    /// holds for every dual-controlled operation (r5-a MA5); `Approve` keeps
+    /// its code and now approves any pending request (`Approve {id,
+    /// digest}`); `RequestKeyOperation` is **retired** (a key operation is
+    /// proposed with `Propose`): no producer sends it any more, its code
+    /// keeps its meaning and is never reused. The operation a pending
+    /// request is for is in [`crate::DirAdminEvent::proposed`] (or, for a
+    /// key operation, `key_operation`).
     /// Spec: docs/51 §5.2, §5.7, §5.10, §6, §7.3; docs/questions/Q-340
-    /// item 2, Q-592.
+    /// item 2, Q-592, Q-882, Q-938.
     pub enum DirAdminOperation {
         CreateUser,
         CreateComputer,
@@ -667,6 +677,11 @@ code_table! {
         Complete,
         ListPendingDestruction,
         ChangePolicy,
+        Propose,
+        Reject,
+        Withdraw,
+        ListRequests,
+        ShowRequest,
     }
 }
 
@@ -762,6 +777,22 @@ code_table! {
     ///   keyadm reports that keyd answered the approved key operation with
     ///   a refusal (`Denied` / `RateLimited` / `Unavailable` — keyd stores
     ///   nothing then, docs/10 §9). Appended by task A10 (Q-421).
+    /// * `ApprovalNotNeeded` — a `Propose` for an operation whose rule needs
+    ///   no approver (P-22: e.g. a write that is Tier0 only because it is
+    ///   unclassified): it is executed directly, never queued for a human
+    ///   (class C47 — fewer approvals, not faster ones; r5-a §8.2 item 1).
+    ///   Appended by task D2-c (docs/questions/Q-882, Q-938).
+    /// * `RequestStale` — a pending request whose basis changed since it was
+    ///   proposed: an object it names (any attribute), the policy version,
+    ///   or the requester's or an approver's standing (account unusable,
+    ///   name re-bound, ticket revoked, PDP no longer Allow) — at an
+    ///   `Approve` or at the execution; the request is dropped (class C43:
+    ///   an approval is never applied to a state other than the one it was
+    ///   judged on). Appended by task D2-c (Q-882 item 2, Q-938).
+    /// * `RequesterLimit` — the requester already holds the most open
+    ///   pending requests one requester may hold (interim cap while owner
+    ///   item P-78 / Q-878 is open; class C47 — no flooding of the
+    ///   approvers). Appended by task D2-c (Q-938, Q-940).
     ///
     /// Spec: docs/51 §5.2, §5.5, §5.6, §6, §7.4, §8.3, §11;
     /// docs/questions/Q-340 item 3; Q-295 item 4 (P-22); docs/11 §2, §8;
@@ -789,6 +820,9 @@ code_table! {
         ObligationRefused,
         OperationMismatch,
         KeyOperationRefused,
+        ApprovalNotNeeded,
+        RequestStale,
+        RequesterLimit,
     }
 }
 

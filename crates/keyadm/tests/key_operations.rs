@@ -64,29 +64,38 @@ fn admind_keyd_client(world: &World) -> KeydClient<connectors::KeydConnector> {
     )
 }
 
-/// admin1 requests `operation` through admind; admin2 approves it — the
+/// admin1 proposes `operation` through admind (task D2-c, docs/questions/
+/// Q-882: the one dual-control mechanism); admin2 approves it — the
 /// approval that completes the quorum, at which dird registers the decision
 /// in keyd under the request's id (A-102). Returns that id.
 fn request_and_approve(world: &World, operation: KeyOperation) -> u64 {
     let mut conn = world.connect();
-    let request = Operation::RequestKeyOperation { operation };
-    let id = match conn.call(&Request::Forward {
-        auth: auth("admin1", &[], &request),
+    let request = Operation::Propose {
+        reason_ref: None,
+        operation: Box::new(Operation::KeyOperation(operation)),
+    };
+    let state = match conn.call(&Request::Forward {
+        auth: auth("admin1", &request),
         operation: request,
     }) {
-        Got::Reply(Reply::KeyRequest(state)) => state.id,
+        Got::Reply(Reply::PendingRequest(state)) => state,
         other => panic!("{other:?}"),
     };
     // R2: admin2's AP-REQ is bound to exactly this Approve.
-    let approve = Operation::Approve { id, operation };
+    let approve = Operation::Approve {
+        id: state.id,
+        digest: state.digest,
+    };
     match conn.call(&Request::Forward {
-        auth: auth("admin2", &[], &approve),
+        auth: auth("admin2", &approve),
         operation: approve,
     }) {
-        Got::Reply(Reply::KeyRequest(state)) => assert!(state.approved()),
+        Got::Reply(Reply::PendingRequest(state)) => {
+            assert_eq!(state.state, ipc_dird_admin::RequestState::Approved)
+        }
         other => panic!("{other:?}"),
     }
-    id
+    state.id
 }
 
 /// admin1 deletes ws9 through admind; dird registers the destroy decision.
@@ -94,7 +103,7 @@ fn delete_ws9(world: &World) {
     let mut conn = world.connect();
     assert_eq!(
         conn.call(&Request::Forward {
-            auth: auth("admin1", &[], &Operation::Delete { target: g(WS9) }),
+            auth: auth("admin1", &Operation::Delete { target: g(WS9) }),
             operation: Operation::Delete { target: g(WS9) },
         }),
         Got::Reply(Reply::Done)

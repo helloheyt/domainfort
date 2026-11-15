@@ -9,11 +9,14 @@
 //! Arbitrary bytes → decoder; never a panic, bounded allocation; whatever
 //! decodes re-encodes to exactly the input.
 //!
-//! Task A10 added the replies `KeyRequest` and (retired by A-102) `Approved`, `PendingDestruction`
-//! (closed tables for their operation, key reference and account kind).
+//! Task A10 added the replies `KeyRequest` (retired by task D2-c) and
+//! (retired by A-102) `Approved`, `PendingDestruction`. Task D2-c added the
+//! request queue's replies `PendingRequest`, `RequestList` and
+//! `RequestShown` (closed tables for the state, the proposed operation's
+//! kind and the facts' tier; a nested proposed operation).
 //!
 //! Spec: docs/51 §6, §7.3, §7.5; docs/50 §3.3, §9; A-59; docs/questions/
-//! Q-422.
+//! Q-422, Q-882.
 
 use ipc::{decode_reply, encode_reply, Reply as IpcReply};
 use ipc_dird_admin::{AdminReply, Reply, ADMIN_CHANNEL};

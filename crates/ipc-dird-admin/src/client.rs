@@ -174,10 +174,11 @@ fn remaining(start: Instant, deadline: Duration) -> Result<Duration, TransportEr
 
 /// Whether `reply` is an answer `request` can receive (the closed reply
 /// column of docs/51 §7.3: `GUID, SID` for a create, the key targets for
-/// `BeginPasswordSet`, `()` for the others, `Found` for `Lookup`, the
-/// pending request for `RequestKeyOperation` / `Approve`, the version written
-/// for `ChangePolicy` (task A16); a refusal for any operation; `Pong` for
-/// `Ping`).
+/// `BeginPasswordSet`, `()` for the others (`Reject` and `Withdraw`
+/// included), `Found` for `Lookup`, the pending request's state for
+/// `Propose` / `Approve`, the list for `ListRequests`, the request for
+/// `ShowRequest` (task D2-c, Q-882), the version written for `ChangePolicy`
+/// (task A16); a refusal for any operation; `Pong` for `Ping`).
 /// Spec: docs/51 §7.3; docs/50 §3.3 (replies decoded with the same
 /// strictness).
 #[must_use]
@@ -188,10 +189,12 @@ pub fn answers(request: &Request, reply: &Reply) -> bool {
             Reply::Refused(_) => true,
             Reply::Pong => false,
             Reply::PolicyNext { .. } => matches!(operation, Operation::ChangePolicy { .. }),
-            Reply::KeyRequest(_) => matches!(
+            Reply::PendingRequest(_) => matches!(
                 operation,
-                Operation::RequestKeyOperation { .. } | Operation::Approve { .. }
+                Operation::Propose { .. } | Operation::Approve { .. }
             ),
+            Reply::RequestList(_) => matches!(operation, Operation::ListRequests(_)),
+            Reply::RequestShown(_) => matches!(operation, Operation::ShowRequest { .. }),
             Reply::Created { .. } => matches!(
                 operation,
                 Operation::CreateUser { .. }
@@ -210,6 +213,8 @@ pub fn answers(request: &Request, reply: &Reply) -> bool {
                     | Operation::AddMember { .. }
                     | Operation::RemoveMember { .. }
                     | Operation::Delete { .. }
+                    | Operation::Reject { .. }
+                    | Operation::Withdraw { .. }
             ),
         },
     }

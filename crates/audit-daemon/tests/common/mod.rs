@@ -295,9 +295,12 @@ pub fn dir_admin_event(operation_id: u64, stage: ipc_audit::DirAdminStage) -> Ev
         enable: None,
         account_expires: None,
         group_type: None,
-        key_request: None,
+        pending_request: None,
         key_operation: None,
         reported_kvnos: ipc_audit::BoundedSeq::empty(),
+        operation_digest: [0x9C; 32],
+        proposed: None,
+        reason_ref: None,
     }))
 }
 
@@ -337,6 +340,7 @@ pub fn admind_events() -> Vec<EventBody> {
             peer_uid: Some(1500),
             activity: ipc_audit::AdmindActivity::SetPassword {
                 target: [0x5E; 16],
+                operation_digest: [0x9C; 32],
                 kvnos: ipc_audit::BoundedSeq::new(vec![2]).expect("one kvno"),
                 result: ipc_audit::PasswordResult::Completed,
             },

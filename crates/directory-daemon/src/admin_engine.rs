@@ -11,20 +11,24 @@
 //!    answered `Unavailable` and nothing is done (no keyd call, no write):
 //!    "auditd unavailable ⇒ the operation is refused before any commit"
 //!    (A-85). Every `DirAdmin` event is gating (Q-340 item 8).
-//! 1. **Verify the AP-REQs through keyd** (Role::Ldap,
+//! 1. **Verify the AP-REQ through keyd** (Role::Ldap,
 //!    `open_and_verify_service_ticket` on the admin service's key set,
 //!    bound to the request's operation digest — R2, docs/52 §5: computed
 //!    here from the decoded operation, `ipc_dird_admin::operation_digest`)
-//!    — the requester's, then each approval's. keyd unreachable ⇒
-//!    `Unavailable` (A-56); any other failure ⇒ the uniform `Denied`
-//!    (A-26) — `DirectoryAdmin::refuse_unverified` plans the refusal event.
+//!    — the request's one AP-REQ (the in-request approvals are retired,
+//!    docs/questions/Q-882). keyd unreachable ⇒ `Unavailable` (A-56); any
+//!    other failure ⇒ the uniform `Denied` (A-26) —
+//!    `DirectoryAdmin::refuse_unverified` plans the refusal event.
 //! 2. **Begin the `WriteTxn`** (for a write) — dird's admin thread is the
 //!    only runtime writer, and beginning first makes the view the
 //!    transaction's starting state (Q-358 item 1).
 //! 3. **Take the view** (one snapshot + the tier map of the loaded policy).
 //! 4. **`prepare`** — every check of the PEP; a refusal carries its
-//!    `Decision` event. The `RateLimit` / `Constrain` obligations of the
-//!    requester's Allow are honoured here (docs/11 §2; Q-358 item 7).
+//!    `Decision` event. An operation whose rule needs an approver consumes
+//!    the approved pending request this thread holds for it (task D2-c,
+//!    Q-882) — re-evaluated against this view first. The `RateLimit` /
+//!    `Constrain` obligations of the requester's Allow are honoured here
+//!    (docs/11 §2; Q-358 item 7).
 //! 5. **The decision event, acknowledged**: committed into its slot, and
 //!    the thread waits (bounded) until auditd acknowledged it — persisted it.
 //!    No acknowledgement in time ⇒ the transaction is aborted, the outcome
@@ -79,9 +83,9 @@
 //! 9. **Reply.**
 //!
 //! Every registration in keyd is a `crate::DecisionRegistration`, built only
-//! from its evidence — the `AckedIntent<QuorumStep>` of an `Approve`, the
-//! `Applied` of a `BeginPasswordSet`, a `TombstonedPrincipal` (docs/52 R6;
-//! crate::registration).
+//! from its evidence — the `AckedIntent<QuorumStep>` of an `Approve` of a
+//! key request, the `Applied` of a `BeginPasswordSet`, a
+//! `TombstonedPrincipal` (docs/52 R6; crate::registration).
 //!
 //! # Re-registering lost destroy decisions (A-105)
 //!
@@ -99,48 +103,63 @@
 //! Every refusal sends its event (into the reserved slot) before the reply.
 //! AP-REQ octets are never logged; the thread logs fixed notes only.
 //!
-//! # The key-plane steps (task A10; docs/51 §5.6, §6)
+//! # The request queue (task D2-c; docs/questions/Q-882, A-148)
 //!
-//! `RequestKeyOperation` and `Approve` (each with exactly one AP-REQ — the
-//! requester's, the approver's) act on the pending requests this thread
-//! holds **in memory** (`directory_admin::KeyRequests`; a dird restart
-//! drops them). keyadm's former `FetchApproved`, `Complete`,
-//! `ListPendingDestruction` are retired (A-102, docs/52 §4.6, §4.8):
+//! One dual-control mechanism: every dual-controlled operation goes through
+//! a pending request this thread holds **in memory**
+//! (`directory_admin::PendingRequests`; a dird restart drops them). The
+//! in-request approvals and task A10's key-only steps are retired; keyadm's
+//! former `FetchApproved`, `Complete`, `ListPendingDestruction` stay retired
+//! (A-102, docs/52 §4.6, §4.8). Each step carries exactly one AP-REQ — the
+//! requester's (`Propose`, `Withdraw`, `ListRequests`, `ShowRequest`) or
+//! the approver's (`Approve`, `Reject`):
 //! 0. `now`; the audit slots — two for `Approve` (its decision and the
-//!    outcome of its decision's registration), one for
-//!    `RequestKeyOperation` — all or none, auditd reachable;
-//! 1. the AP-REQ through keyd;
+//!    outcome of a key decision's registration), one for the others — all
+//!    or none, auditd reachable;
+//! 1. the AP-REQ through keyd, bound to the step's own digest; a `Propose`'s
+//!    fingerprint is its proposed operation's own digest
+//!    (`ipc_dird_admin::operation_digest`, docs/questions/Q-888);
 //! 2. one view (no `WriteTxn`: nothing of the directory is written);
-//! 3. `DirectoryAdmin::key_step` — the Subject, `PolicyAdmin` on the `keys`
-//!    scope, the obligations honoured before the table changes, the step;
+//! 3. `DirectoryAdmin::propose` / `DirectoryAdmin::step` — the Subject, the
+//!    operation's checks as a dry run (or, at an `Approve`, everything the
+//!    request was judged on evaluated again — class C43), the obligations
+//!    honoured before the table changes, the step;
 //! 4. its decision event committed into the first slot before the reply
-//!    (it commits nothing to the directory: no acknowledgement wait —
-//!    Q-340 item 1, the LDAP rule) — **except** for the `Approve` that
-//!    completed the quorum (A-102, docs/52 §4.3): its decision event is
-//!    **acknowledged** by auditd first (no loosening of keyd without the
-//!    decision durably recorded — A-85, Q-453 item 1), then the decision is
-//!    registered in keyd (`register_decision`, Role::Ldap,
+//!    (nothing is committed to the directory: no acknowledgement wait —
+//!    Q-340 item 1, the LDAP rule); a `Propose` whose event cannot be
+//!    committed discards its new request — **except** for the `Approve`
+//!    that completed a **key** request's quorum (A-102, docs/52 §4.3): its
+//!    decision event is **acknowledged** by auditd first, then the decision
+//!    is registered in keyd (`register_decision`, Role::Ldap,
 //!    `call_with_fate`), then the registration's `Outcome` event goes into
 //!    the second slot. No acknowledgement in time, or any registration
-//!    failure ⇒ the approval is **withdrawn** (`KeyRequests::withdraw`: the
-//!    approver may approve again; keyd accepts an identical decision again
-//!    unchanged) and the answer is `Unavailable`. An `Approve` that does not
-//!    complete the quorum releases the second slot.
+//!    failure ⇒ the approval is **reverted**
+//!    (`PendingRequests::revert_approval`: the approver may approve again;
+//!    keyd accepts an identical decision again unchanged) and the answer is
+//!    `Unavailable`. An `Approve` that does not complete a key request's
+//!    quorum releases the second slot.
+//!
+//! An approved directory or policy request is executed by its requester —
+//! the operation itself, sent again with a fresh AP-REQ (steps 0-9 above /
+//! "The policy change" below): `prepare` / `prepare_policy_change` consume
+//! it, after confirming its basis and its approvers against the view.
 //!
 //! # The policy change (task A16; docs/51 §5.10, R51-21; A-80)
 //!
-//! `ChangePolicy` — a tier-map edit carrying the requester's AP-REQ and the
-//! approvers' in its `auth`, every one bound to the request's digest:
+//! `ChangePolicy` — a tier-map edit, executed by its requester once a
+//! pending request for exactly these changes is approved (Q-882), its
+//! AP-REQ bound to the request's digest:
 //! 0. `now`; two audit slots (decision and outcome), all or none, auditd
 //!    reachable; `policy_next_path` not configured ⇒ its `Decision(Failed)`
 //!    and `Unavailable`;
-//! 1. the AP-REQs through keyd (requester, then each approval);
+//! 1. the requester's AP-REQ through keyd;
 //! 2. whether `policy.next` is pending (dird's own file, through
 //!    crates/protected-file) — unreadable ⇒ `Unavailable`;
 //! 3. one view (no `WriteTxn`: the directory is not written), then
 //!    `DirectoryAdmin::prepare_policy_change` — `PolicyAdmin` on the
-//!    `tier-map` scope, mandatory dual control with the PEP's one approval
-//!    rule, one pending change at a time, the candidate built by crate
+//!    `tier-map` scope, mandatory dual control by the one mechanism (the
+//!    approved pending request consumed), one pending change at a time, the
+//!    candidate built by crate
 //!    policy-store's one tier-map edit (version + 1) and re-read by the
 //!    format's own decoder; the requester's obligations honoured;
 //! 4. the decision event committed and **acknowledged** — no
@@ -172,9 +191,9 @@
 //! Q-388; A-88 (Q-366, Q-395); A-91 (Q-397); docs/11 §2, §8.
 
 use crate::admin_service::{
-    key_request_of, pep_operation, policy_change_of, wire_key_reply, wire_reply, wire_status,
-    RegistrationFailure, TicketVerifier, MAX_DESTROY_RECONCILE_INTERVAL,
-    MIN_DESTROY_RECONCILE_INTERVAL,
+    pep_operation, policy_change_of, proposal_of, step_of, wire_reply, wire_request_view,
+    wire_status, wire_step_reply, RegistrationFailure, TicketVerifier,
+    MAX_DESTROY_RECONCILE_INTERVAL, MIN_DESTROY_RECONCILE_INTERVAL,
 };
 use crate::clock::SharedClock;
 use crate::engine::{EngineError, EngineThread, OnExit, SubmitError};
@@ -187,9 +206,9 @@ use crate::reconcile::Reconciler;
 use crate::registration::DecisionRegistration;
 use core::time::Duration;
 use directory_admin::{
-    DirectoryAdmin, KeyAdminOperation, KeyDecision, KeyRequests, KeyStep,
-    Operation as PepOperation, OsRandom, Prepared, RegistrationOutcome, Request as PepRequest,
-    VerificationFailure, VerifiedTicket,
+    DirectoryAdmin, KeyDecision, Operation as PepOperation, OsRandom, PendingRequests, PolicyFile,
+    Prepared, ProposeRequest, ProposedOperation, RegistrationOutcome, Request as PepRequest,
+    RequestStep, StepRequest, Stepped, VerificationFailure, VerifiedTicket,
 };
 use directory_admin::{PolicyCandidate, PolicyChangeRequest};
 use directory_pip::{DirectoryContext, TierMap};
@@ -284,8 +303,9 @@ pub(crate) struct AdminWorker {
     pub(crate) clock: SharedClock,
     /// How long a decision event may wait for its acknowledgement.
     pub(crate) ack_deadline: Duration,
-    /// The pending key-operation requests (memory only; docs/51 §5.6).
-    pub(crate) key_requests: KeyRequests,
+    /// The pending requests of every dual-controlled operation (memory
+    /// only; docs/51 §5.6; docs/questions/Q-882).
+    pub(crate) requests: PendingRequests,
     /// How often lost destroy decisions are re-registered (A-105;
     /// crate::reconcile), kept within [`MIN_DESTROY_RECONCILE_INTERVAL`] ..=
     /// [`MAX_DESTROY_RECONCILE_INTERVAL`].
@@ -388,8 +408,9 @@ impl Running {
         }
     }
 
-    /// The one AP-REQ of a key-plane step (the requester's or the
-    /// approver's), through keyd, bound to `digest` (R2).
+    /// Step 1: the request's one AP-REQ (the requester's, or the approver's
+    /// of an `Approve` / `Reject`), through keyd, bound to `digest` — the
+    /// request's own (R2).
     /// Spec: docs/51 §7.4 step 1; docs/52 §5 item 4; A-26; A-56; A-73.
     fn verify_one(
         &mut self,
@@ -405,39 +426,6 @@ impl Running {
                 AuthnError::Unavailable => VerificationFailure::KeydUnavailable,
                 _ => VerificationFailure::Requester,
             })
-    }
-
-    /// Step 1: the requester's AP-REQ, then each approval's, through keyd —
-    /// every one bound to `digest`, the request's own (R2: an approval
-    /// authorizes exactly this request).
-    /// Spec: docs/51 §7.4 step 1; docs/52 §5 item 4; A-26; A-56; A-73.
-    fn verify(
-        &mut self,
-        auth: &Auth,
-        digest: &OperationDigest,
-    ) -> Result<(VerifiedTicket, Vec<VerifiedTicket>), VerificationFailure> {
-        let service = self.worker.service.principal;
-        let requester = self
-            .worker
-            .verifier
-            .verify(&service, digest, &auth.requester)
-            .map_err(|e| match e {
-                AuthnError::Unavailable => VerificationFailure::KeydUnavailable,
-                _ => VerificationFailure::Requester,
-            })?;
-        let mut approvals = Vec::with_capacity(auth.approvals.len());
-        for approval in &auth.approvals {
-            let ticket = self
-                .worker
-                .verifier
-                .verify(&service, digest, approval)
-                .map_err(|e| match e {
-                    AuthnError::Unavailable => VerificationFailure::KeydUnavailable,
-                    _ => VerificationFailure::Approver,
-                })?;
-            approvals.push(VerifiedTicket::from_operation_ticket(&ticket));
-        }
-        Ok((VerifiedTicket::from_operation_ticket(&requester), approvals))
     }
 
     /// The obligations of the requester's Allow: `RateLimit` through the
@@ -468,56 +456,197 @@ impl Running {
         &self,
         operation_id: u64,
         operation: &PepOperation,
+        digest: &OperationDigest,
         now: &KerberosTime,
     ) -> DirAdminEvent {
         let base = self.worker.admin.refuse_unverified(
             operation_id,
             operation,
+            digest,
             VerificationFailure::KeydUnavailable,
             now,
         );
         restage(base.event(), VIEW_UNAVAILABLE)
     }
 
-    /// One job: a key-plane step, or an operation on the directory.
-    /// Spec: docs/51 §5.6, §6, §7.3, §7.4.
+    /// One job: a request-queue step, a policy change, or an operation on
+    /// the directory.
+    /// Spec: docs/51 §5.6, §6, §7.3, §7.4; docs/questions/Q-882.
     fn handle(&mut self, work: &AdminWork) -> Reply {
         match work {
             AdminWork::Operation { auth, operation } => {
                 // R2 (docs/52 §5 item 4): the digest of the operation dird
-                // decoded — what every AP-REQ must be bound to. A decoded
+                // decoded — what the AP-REQ must be bound to. A decoded
                 // operation always has one; fail closed if not.
                 let Ok(digest) = operation_digest(operation) else {
                     return Reply::Refused(RefusalStatus::Unavailable);
                 };
+                if let Operation::Propose {
+                    reason_ref,
+                    operation: proposed,
+                } = operation
+                {
+                    return self.handle_propose(auth, proposed, reason_ref.as_deref(), &digest);
+                }
+                if let Some(step) = step_of(operation) {
+                    return self.handle_step(auth, step, &digest);
+                }
                 if let Some(changes) = policy_change_of(operation) {
                     return self.handle_policy(auth, &changes, &digest);
                 }
-                match key_request_of(operation) {
-                    Some(request) => self.handle_key(auth, request, &digest),
-                    None => match pep_operation(operation) {
-                        Some(operation) => self.handle_directory(auth, operation, &digest),
-                        // Cannot happen: every other operation maps.
-                        None => Reply::Refused(RefusalStatus::Unavailable),
-                    },
+                match pep_operation(operation) {
+                    Some(operation) => self.handle_directory(auth, operation, &digest),
+                    // Cannot happen: a key operation never decodes on its
+                    // own (the codec), every other operation maps.
+                    None => Reply::Refused(RefusalStatus::Unavailable),
                 }
             }
         }
     }
 
-    /// One key-plane step (module documentation, "The key-plane steps").
-    /// Spec: docs/51 §5.6, §6, §7.4; A-85; A-89; docs/11 §2.
-    fn handle_key(
+    /// One `Propose` (module documentation, "The request queue").
+    /// Spec: docs/questions/Q-882 items 1, 3, 4; docs/51 §5.6, §7.4; A-85;
+    /// docs/11 §2.
+    fn handle_propose(
         &mut self,
         auth: &Auth,
-        request: KeyAdminOperation,
-        digest: &OperationDigest,
+        proposed: &Operation,
+        reason_ref: Option<&str>,
+        request_digest: &OperationDigest,
     ) -> Reply {
         let Some(now) = self.worker.clock.now() else {
             return Reply::Refused(RefusalStatus::Unavailable);
         };
+        // The fingerprint: the proposed operation's own digest (Q-888); and
+        // the PEP's form of it. Neither can fail for a decoded `Propose`.
+        let (Ok(fingerprint), Some(operation)) =
+            (operation_digest(proposed), proposal_of(proposed))
+        else {
+            return Reply::Refused(RefusalStatus::Unavailable);
+        };
+        // Step 0: the audit slot, before anything is done.
+        let Some(slots) = self.worker.gate.admit_slots(1) else {
+            AUDIT_UNAVAILABLE.hit(None);
+            return Reply::Refused(RefusalStatus::Unavailable);
+        };
+        let first = slots.into_iter().next();
+        let operation_id = self.next_id();
+
+        // Step 1: the requester's AP-REQ, bound to this `Propose` (R2).
+        let requester = match self.verify_one(&auth.requester, request_digest) {
+            Ok(ticket) => ticket,
+            Err(failure) => {
+                let refusal = self.worker.admin.refuse_unverified_proposal(
+                    operation_id,
+                    &operation,
+                    &fingerprint,
+                    reason_ref,
+                    failure,
+                    &now,
+                );
+                return self.refuse(first, None, refusal.event(), wire_status(refusal.status()));
+            }
+        };
+        // A policy change's dry run builds its candidate from the loaded
+        // policy and needs to know whether a `policy.next` waits.
+        let pending = match (&operation, &self.worker.policy_next) {
+            (ProposedOperation::Policy(_), None) => Err(AdminFailure::InternalFailure),
+            (ProposedOperation::Policy(_), Some(file)) => match file.pending() {
+                Ok(pending) => Ok(Some(pending)),
+                Err(error) => {
+                    note(Note::AdminPolicyNextNotWritten, Some(error.code()));
+                    Err(AdminFailure::StoreFailure)
+                }
+            },
+            _ => Ok(None),
+        };
+        let pending = match pending {
+            Ok(pending) => pending,
+            Err(failure) => {
+                let refusal = self.worker.admin.refuse_failed_proposal(
+                    operation_id,
+                    &operation,
+                    &fingerprint,
+                    reason_ref,
+                    failure,
+                    &now,
+                );
+                return self.refuse(first, None, refusal.event(), RefusalStatus::Unavailable);
+            }
+        };
+        let request = ProposeRequest {
+            operation_id,
+            operation,
+            operation_digest: fingerprint,
+            request_digest: *request_digest,
+            reason_ref: reason_ref.map(str::to_owned),
+            requester,
+        };
+
+        // Steps 2-3: one view (nothing is written), then the proposal.
+        let store = Arc::clone(&self.worker.store);
+        let proposed = {
+            let Running { worker, rate, .. } = self;
+            match worker.ctx.view(&store, &worker.tiers) {
+                Ok(view) => {
+                    let mut honour = |obligations: &[Obligation]| {
+                        honour_obligations(rate, obligations, false, &now)
+                    };
+                    let policy_file = pending.map(|pending| PolicyFile {
+                        installed: &worker.installed,
+                        pending,
+                    });
+                    Some(worker.admin.propose(
+                        &mut worker.requests,
+                        &request,
+                        &view,
+                        &worker.policy,
+                        policy_file,
+                        &now,
+                        &mut honour,
+                    ))
+                }
+                Err(_) => None,
+            }
+        };
+        match proposed {
+            None => {
+                let refusal = self.worker.admin.refuse_failed_proposal(
+                    operation_id,
+                    &request.operation,
+                    &request.operation_digest,
+                    reason_ref,
+                    AdminFailure::ViewUnavailable,
+                    &now,
+                );
+                self.refuse(first, None, refusal.event(), RefusalStatus::Unavailable)
+            }
+            Some(Err(refusal)) => {
+                self.refuse(first, None, refusal.event(), wire_status(refusal.status()))
+            }
+            // Step 4: the event, then the reply; no request outlives an
+            // unrecorded proposal.
+            Some(Ok(proposed)) => match self.commit(first, proposed.event()) {
+                Some(_) => wire_request_view(proposed.reply()),
+                None => {
+                    self.worker.requests.discard(proposed.id());
+                    OUTCOME_UNRECORDED.hit(None);
+                    Reply::Refused(RefusalStatus::Unavailable)
+                }
+            },
+        }
+    }
+
+    /// One step on the pending requests (module documentation, "The request
+    /// queue").
+    /// Spec: docs/questions/Q-882 items 1-2; r5-a §11 MA5; docs/51 §5.6,
+    /// §7.4; A-85; A-89; docs/11 §2.
+    fn handle_step(&mut self, auth: &Auth, step: RequestStep, digest: &OperationDigest) -> Reply {
+        let Some(now) = self.worker.clock.now() else {
+            return Reply::Refused(RefusalStatus::Unavailable);
+        };
         // Step 0: the audit slots, before anything is done.
-        let Some(slots) = self.worker.gate.admit_slots(request.audit_events()) else {
+        let Some(slots) = self.worker.gate.admit_slots(step.audit_events()) else {
             AUDIT_UNAVAILABLE.hit(None);
             return Reply::Refused(RefusalStatus::Unavailable);
         };
@@ -527,13 +656,16 @@ impl Running {
         let operation_id = self.next_id();
 
         // Step 1: the step's one AP-REQ, bound to this step (R2).
-        let ticket = match self.verify_one(&auth.requester, digest) {
+        let caller = match self.verify_one(&auth.requester, digest) {
             Ok(ticket) => ticket,
             Err(failure) => {
-                let refusal =
-                    self.worker
-                        .admin
-                        .refuse_unverified_key(operation_id, &request, failure, &now);
+                let refusal = self.worker.admin.refuse_unverified_step(
+                    operation_id,
+                    &step,
+                    digest,
+                    failure,
+                    &now,
+                );
                 return self.refuse(
                     first,
                     second,
@@ -542,24 +674,28 @@ impl Running {
                 );
             }
         };
-        let approvals_supplied = auth.approvals.len();
+        let request = StepRequest {
+            operation_id,
+            step,
+            request_digest: *digest,
+            caller,
+            // P-30 (b): no signature scheme yet (Q-864, P-20) — the
+            // slot's type has no value (Q-941).
+            signature: None,
+        };
 
         // Steps 2-3: one view (nothing is written), then the step.
         let store = Arc::clone(&self.worker.store);
-        let step = {
+        let stepped = {
             let Running { worker, rate, .. } = self;
             match worker.ctx.view(&store, &worker.tiers) {
                 Ok(view) => {
                     let mut honour = |obligations: &[Obligation]| {
                         honour_obligations(rate, obligations, false, &now)
                     };
-                    Some(worker.admin.key_step(
-                        &mut worker.key_requests,
-                        operation_id,
+                    Some(worker.admin.step(
+                        &mut worker.requests,
                         &request,
-                        digest,
-                        Some(&ticket),
-                        approvals_supplied,
                         &view,
                         &worker.policy,
                         &now,
@@ -569,11 +705,12 @@ impl Running {
                 Err(_) => None,
             }
         };
-        match step {
+        match stepped {
             None => {
-                let refusal = self.worker.admin.refuse_failed_key(
+                let refusal = self.worker.admin.refuse_failed_step(
                     operation_id,
-                    &request,
+                    &step,
+                    digest,
                     AdminFailure::ViewUnavailable,
                     &now,
                 );
@@ -585,55 +722,48 @@ impl Running {
                 refusal.event(),
                 wire_status(refusal.status()),
             ),
-            // Step 4 (A-102): the Approve that completed the quorum.
-            Some(Ok(step)) if step.decision().is_some() => {
-                self.register_key_decision(step, first, second)
+            // Step 4 (A-102): the Approve that completed a key request's
+            // quorum.
+            Some(Ok(stepped)) if stepped.decision().is_some() => {
+                self.register_key_decision(stepped, first, second)
             }
-            // Step 4: the events into their slots, then the reply.
-            Some(Ok(step)) => {
-                let mut slots = [first, second].into_iter();
-                let mut recorded = true;
-                for event in step.events() {
-                    if self.commit(slots.next().flatten(), event).is_none() {
-                        recorded = false;
+            // Step 4: the event into its slot, then the reply.
+            Some(Ok(stepped)) => {
+                self.release(second);
+                match self.commit(first, stepped.event()) {
+                    Some(_) => wire_step_reply(stepped.reply()),
+                    None => {
+                        // Cannot happen (the slot was reserved); no answer
+                        // leaves unaudited.
+                        OUTCOME_UNRECORDED.hit(None);
+                        Reply::Refused(RefusalStatus::Unavailable)
                     }
-                }
-                for unused in slots {
-                    self.release(unused);
-                }
-                if recorded {
-                    wire_key_reply(step.reply())
-                } else {
-                    // Cannot happen (the slots were reserved); no answer
-                    // leaves unaudited.
-                    OUTCOME_UNRECORDED.hit(None);
-                    Reply::Refused(RefusalStatus::Unavailable)
                 }
             }
         }
     }
 
-    /// Step 4 of an `Approve` that completed its request's quorum (module
-    /// documentation, "The key-plane steps"): its decision event committed
-    /// and acknowledged ⇒ the decision registered in keyd ⇒ the
-    /// registration's `Outcome` event ⇒ the reply. Any failure withdraws the
-    /// approval and answers `Unavailable`.
+    /// Step 4 of an `Approve` that completed a key request's quorum (module
+    /// documentation, "The request queue"): its decision event committed and
+    /// acknowledged ⇒ the decision registered in keyd ⇒ the registration's
+    /// `Outcome` event ⇒ the reply. Any failure reverts the approval and
+    /// answers `Unavailable`.
     /// Spec: docs/52 §4.2, §4.3, §4.5 (A-102); docs/51 §5.6, §5.7 item 2;
     /// A-85; docs/questions/Q-453 item 1, Q-460.
     fn register_key_decision(
         &mut self,
-        step: KeyStep,
+        stepped: Stepped,
         first: Option<Reservation>,
         second: Option<Reservation>,
     ) -> Reply {
-        let quorum = match step.into_quorum() {
+        let quorum = match stepped.into_quorum() {
             Ok(quorum) => quorum,
-            Err(step) => {
+            Err(stepped) => {
                 // Cannot happen (the caller checked): nothing to register.
                 self.release(first);
                 self.release(second);
-                if let Some(decision) = step.decision() {
-                    return self.withdraw(decision);
+                if let Some(decision) = stepped.decision() {
+                    return self.revert(decision);
                 }
                 return Reply::Refused(RefusalStatus::Unavailable);
             }
@@ -644,7 +774,7 @@ impl Running {
         let Some(slot) = first else {
             // Cannot happen (two slots were reserved).
             self.release(second);
-            return self.withdraw(quorum.decision());
+            return self.revert(quorum.decision());
         };
         let pending = match self.worker.gate.begin_intent(slot, quorum) {
             Ok(pending) => pending,
@@ -653,7 +783,7 @@ impl Running {
                 // unaudited, and keyd was not asked.
                 OUTCOME_UNRECORDED.hit(None);
                 self.release(second);
-                return self.withdraw(quorum.decision());
+                return self.revert(quorum.decision());
             }
         };
         let deadline = Instant::now() + self.worker.ack_deadline;
@@ -668,7 +798,7 @@ impl Running {
                     Note::AdminDecisionNotRegistered,
                     Some(RegistrationFailure::NotPerformed.code()),
                 );
-                return self.withdraw(quorum.decision());
+                return self.revert(quorum.decision());
             }
         };
         let (registration, quorum) = DecisionRegistration::of_quorum(acked);
@@ -681,19 +811,19 @@ impl Running {
         };
         self.commit_outcome(second, &quorum.registration_event(outcome));
         match registered {
-            Ok(()) => wire_key_reply(quorum.reply()),
+            Ok(()) => wire_step_reply(quorum.reply()),
             Err(failure) => {
                 note(Note::AdminDecisionNotRegistered, Some(failure.code()));
-                self.withdraw(quorum.decision())
+                self.revert(quorum.decision())
             }
         }
     }
 
-    /// Withdraw the approval that completed `decision`'s quorum and answer
-    /// `Unavailable` (module documentation, "The key-plane steps", step 4).
+    /// Revert the approval that completed `decision`'s quorum and answer
+    /// `Unavailable` (module documentation, "The request queue", step 4).
     /// Spec: docs/52 §4.3; docs/questions/Q-453 item 1 (fail closed).
-    fn withdraw(&mut self, decision: &KeyDecision) -> Reply {
-        let _ = self.worker.key_requests.withdraw(decision);
+    fn revert(&mut self, decision: &KeyDecision) -> Reply {
+        let _ = self.worker.requests.revert_approval(decision);
         Reply::Refused(RefusalStatus::Unavailable)
     }
 
@@ -763,20 +893,21 @@ impl Running {
             let refusal = self.worker.admin.refuse_failed_policy_change(
                 operation_id,
                 changes,
+                digest,
                 AdminFailure::InternalFailure,
                 &now,
             );
             return self.refuse(first, second, refusal.event(), RefusalStatus::Unavailable);
         };
 
-        // Step 1: the requester's and every approval's AP-REQ, each bound to
-        // this request (R2).
-        let (requester, approvals) = match self.verify(auth, digest) {
+        // Step 1: the requester's AP-REQ, bound to this request (R2).
+        let requester = match self.verify_one(&auth.requester, digest) {
             Ok(verified) => verified,
             Err(failure) => {
                 let refusal = self.worker.admin.refuse_unverified_policy_change(
                     operation_id,
                     changes,
+                    digest,
                     failure,
                     &now,
                 );
@@ -793,7 +924,6 @@ impl Running {
             changes: changes.to_vec(),
             operation_digest: *digest,
             requester,
-            approvals,
         };
 
         // Steps 2-3: whether a change is pending, one view, the decision.
@@ -804,6 +934,7 @@ impl Running {
                 let refusal = self.worker.admin.refuse_failed_policy_change(
                     operation_id,
                     changes,
+                    digest,
                     AdminFailure::StoreFailure,
                     &now,
                 );
@@ -814,6 +945,7 @@ impl Running {
         let prepared = match self.worker.ctx.view(&store, &self.worker.tiers) {
             Ok(view) => self.worker.admin.prepare_policy_change(
                 &request,
+                &mut self.worker.requests,
                 &view,
                 &self.worker.policy,
                 &self.worker.installed,
@@ -824,6 +956,7 @@ impl Running {
                 let refusal = self.worker.admin.refuse_failed_policy_change(
                     operation_id,
                     changes,
+                    digest,
                     AdminFailure::ViewUnavailable,
                     &now,
                 );
@@ -913,14 +1046,17 @@ impl Running {
         let second = slots.next();
         let operation_id = self.next_id();
 
-        // Step 1: the tickets, each bound to this request (R2).
-        let (requester, approvals) = match self.verify(auth, digest) {
+        // Step 1: the requester's ticket, bound to this request (R2).
+        let requester = match self.verify_one(&auth.requester, digest) {
             Ok(verified) => verified,
             Err(failure) => {
-                let refusal =
-                    self.worker
-                        .admin
-                        .refuse_unverified(operation_id, &operation, failure, &now);
+                let refusal = self.worker.admin.refuse_unverified(
+                    operation_id,
+                    &operation,
+                    digest,
+                    failure,
+                    &now,
+                );
                 return self.refuse(
                     first,
                     second,
@@ -934,7 +1070,6 @@ impl Running {
             operation,
             operation_digest: *digest,
             requester,
-            approvals,
         };
 
         // Steps 2-3: the transaction first, then the view.
@@ -944,21 +1079,30 @@ impl Running {
             match store.begin_write() {
                 Ok(begun) => txn = Some(begun),
                 Err(_) => {
-                    let event =
-                        self.view_unavailable_decision(operation_id, &request.operation, &now);
+                    let event = self.view_unavailable_decision(
+                        operation_id,
+                        &request.operation,
+                        digest,
+                        &now,
+                    );
                     return self.refuse(first, second, &event, RefusalStatus::Unavailable);
                 }
             }
         }
         let prepared = match self.worker.ctx.view(&store, &self.worker.tiers) {
-            // Step 4: every check of the PEP against this one view.
-            Ok(view) => self
-                .worker
-                .admin
-                .prepare(&request, &view, &self.worker.policy, &now),
+            // Step 4: every check of the PEP against this one view (an
+            // approved pending request consumed when one is needed).
+            Ok(view) => self.worker.admin.prepare(
+                &request,
+                &mut self.worker.requests,
+                &view,
+                &self.worker.policy,
+                &now,
+            ),
             Err(_) => {
                 abort(txn);
-                let event = self.view_unavailable_decision(operation_id, &request.operation, &now);
+                let event =
+                    self.view_unavailable_decision(operation_id, &request.operation, digest, &now);
                 return self.refuse(first, second, &event, RefusalStatus::Unavailable);
             }
         };

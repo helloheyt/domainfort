@@ -63,6 +63,11 @@ use crate::error::EventError;
 use crate::values::{
     read_opt, write_opt, AuditText, BoundedSeq, CalendarTime, PdpReason, SidValue,
 };
+
+/// Octets of an operation digest: a SHA-256 output (crate ipc-dird-admin
+/// `operation_digest`). Spec: docs/52 §5 item 1; FIPS 180-4 §6.2;
+/// docs/questions/Q-888 item 1 (`operation_digest: [u8; 32]`).
+pub const OPERATION_DIGEST_LEN: usize = 32;
 use ipc::{Reader, Writer};
 
 /// Most approvers a `DirAdmin` event names. Spec: docs/51 §7.2
@@ -347,14 +352,34 @@ impl AccountExpiresValue {
 ///   value of `SetAccountExpires`; `group_type` — the groupType of
 ///   `CreateGroup` (absent when the request named none of the six). `None`
 ///   for every other operation (Q-340 item 5).
-/// * `key_request` — the pending key-operation request's id (§5.6, §6);
-///   `key_operation` — the key operation it asks for (`RotateKey`,
-///   `RotateKrbtgt`, `RetireKvno`, …, docs/51 §6).
+/// * `pending_request` — the pending request's id (§5.6; docs/questions/
+///   Q-882): on every step of the request queue, and on the execution that
+///   consumed an approved request (task D2-c; it was `key_request`, the key
+///   requests' id only); `key_operation` — the key operation a key request
+///   asks for (`RotateKey`, `RotateKrbtgt`, `RetireKvno`, …, docs/51 §6).
 /// * `reported_kvnos` — key versions reported to dird: by admind in
 ///   `CompletePasswordSet`, by keyadm in `Complete` (dird does not verify
 ///   them; keyd's own records do).
+/// * `operation_digest` (task D2-c; docs/questions/Q-888) — the operation's
+///   fingerprint: the operation digest dird computed from the request it
+///   decoded (crate ipc-dird-admin `operation_digest`) — the value the
+///   administrator saw before sending and the requester's AP-REQ is bound
+///   to. On every step of a pending request it is the request's operation
+///   digest (for an `Approve` / `Reject` that names an unknown request,
+///   the digest it names); for `ListRequests`, the digest of that request.
+///   **Never** a correlation value a client supplies (C3): dird derives it
+///   from the octets it executes, so "find operation 9c41…" works from end
+///   to end, refusals and unknown outcomes included. Not a secret: a digest
+///   of fields the event already records.
+/// * `proposed` (task D2-c) — the operation a pending request is for, on
+///   the steps of a directory or policy request (a key request's is in
+///   `key_operation`); `None` otherwise.
+/// * `reason_ref` (task D2-c; docs/questions/Q-882 item 4) — the
+///   requester's change identifier of a pending request, as the requester
+///   wrote it (unverified), kept by the [`AuditText`] rule.
 ///
-/// Spec: docs/51 §5.3, §5.6, §5.7 item 1, §6, §7.3, §7.4.
+/// Spec: docs/51 §5.3, §5.6, §5.7 item 1, §6, §7.3, §7.4; docs/questions/
+/// Q-882, Q-888.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirAdminEvent {
     /// dird's clock when it recorded the event.
@@ -386,12 +411,18 @@ pub struct DirAdminEvent {
     pub account_expires: Option<AccountExpiresValue>,
     /// `CreateGroup`: the groupType (one of the six phase-1 values).
     pub group_type: Option<GroupTypeCode>,
-    /// The pending key-operation request's id.
-    pub key_request: Option<u64>,
-    /// The key operation a pending request asks for.
+    /// The pending request's id.
+    pub pending_request: Option<u64>,
+    /// The key operation a pending key request asks for.
     pub key_operation: Option<KeydOperation>,
     /// Key versions reported to dird (0 to [`MAX_REPORTED_KVNOS`]).
     pub reported_kvnos: BoundedSeq<u32, MAX_REPORTED_KVNOS>,
+    /// The operation's fingerprint (its operation digest).
+    pub operation_digest: [u8; OPERATION_DIGEST_LEN],
+    /// The operation a pending directory or policy request is for.
+    pub proposed: Option<DirAdminOperation>,
+    /// The requester's change identifier of a pending request.
+    pub reason_ref: Option<AuditText>,
 }
 
 impl DirAdminEvent {
@@ -420,14 +451,19 @@ impl DirAdminEvent {
         write_opt(writer, self.group_type.as_ref(), |g, w| {
             Ok(w.write_enum(g.code())?)
         })?;
-        write_opt(writer, self.key_request.as_ref(), |id, w| {
+        write_opt(writer, self.pending_request.as_ref(), |id, w| {
             Ok(w.write_u64(*id)?)
         })?;
         write_opt(writer, self.key_operation.as_ref(), |op, w| {
             Ok(w.write_enum(op.code())?)
         })?;
         self.reported_kvnos
-            .write(writer, |kvno, w| Ok(w.write_u32(*kvno)?))
+            .write(writer, |kvno, w| Ok(w.write_u32(*kvno)?))?;
+        writer.write_array(&self.operation_digest)?;
+        write_opt(writer, self.proposed.as_ref(), |op, w| {
+            Ok(w.write_enum(op.code())?)
+        })?;
+        write_opt(writer, self.reason_ref.as_ref(), AuditText::write)
     }
 
     pub(crate) fn read(reader: &mut Reader<'_>) -> Result<DirAdminEvent, EventError> {
@@ -445,9 +481,12 @@ impl DirAdminEvent {
         let enable = read_opt(reader, |r| Ok(r.read_enum(EnableDirection::from_code)?))?;
         let account_expires = read_opt(reader, AccountExpiresValue::read)?;
         let group_type = read_opt(reader, |r| Ok(r.read_enum(GroupTypeCode::from_code)?))?;
-        let key_request = read_opt(reader, |r| Ok(r.read_u64()?))?;
+        let pending_request = read_opt(reader, |r| Ok(r.read_u64()?))?;
         let key_operation = read_opt(reader, |r| Ok(r.read_enum(KeydOperation::from_code)?))?;
         let reported_kvnos = BoundedSeq::read(reader, |r| Ok(r.read_u32()?))?;
+        let operation_digest = reader.read_array::<OPERATION_DIGEST_LEN>()?;
+        let proposed = read_opt(reader, |r| Ok(r.read_enum(DirAdminOperation::from_code)?))?;
+        let reason_ref = read_opt(reader, AuditText::read)?;
         Ok(DirAdminEvent {
             time,
             operation_id,
@@ -463,9 +502,12 @@ impl DirAdminEvent {
             enable,
             account_expires,
             group_type,
-            key_request,
+            pending_request,
             key_operation,
             reported_kvnos,
+            operation_digest,
+            proposed,
+            reason_ref,
         })
     }
 }
@@ -577,6 +619,13 @@ pub enum AdmindActivity {
     SetPassword {
         /// The account's objectGUID (= the principal id of its key sets).
         target: [u8; 16],
+        /// The fingerprint of the operation: the operation digest of
+        /// `BeginPasswordSet {target}` — what the requester's AP-REQ is
+        /// bound to, computed by admind from the octets it forwards (crate
+        /// ipc-dird-admin `operation_digest`), the same value dird's
+        /// `DirAdmin` events of that step carry (task D2-c;
+        /// docs/questions/Q-888 item 1). Never a client-supplied value.
+        operation_digest: [u8; OPERATION_DIGEST_LEN],
         /// The key versions keyd chose, in call order (`PrincipalLongterm`,
         /// then `Service` for a computer — docs/51 §5.2 row 5): one per
         /// `set_secret` that succeeded.
@@ -622,10 +671,12 @@ impl AdmindActivity {
             AdmindActivity::MalformedFrame { error } => writer.write_enum(error.code())?,
             AdmindActivity::SetPassword {
                 target,
+                operation_digest,
                 kvnos,
                 result,
             } => {
                 writer.write_array(target)?;
+                writer.write_array(operation_digest)?;
                 kvnos.write(writer, |kvno, w| Ok(w.write_u32(*kvno)?))?;
                 result.write(writer)?;
             }
@@ -651,10 +702,12 @@ impl AdmindActivity {
             },
             AdmindActivityCode::SetPassword => {
                 let target = reader.read_array::<16>()?;
+                let operation_digest = reader.read_array::<OPERATION_DIGEST_LEN>()?;
                 let kvnos = BoundedSeq::read(reader, |r| Ok(r.read_u32()?))?;
                 let result = PasswordResult::read(reader)?;
                 AdmindActivity::SetPassword {
                     target,
+                    operation_digest,
                     kvnos,
                     result,
                 }

@@ -243,7 +243,7 @@ fn unknown_or_unusable_requesters_are_refused_uniformly() {
 #[test]
 fn a_ticket_older_than_the_threshold_is_refused() {
     let mut d = Domain::new("ticket-age");
-    let mut request = d.request(create_user(STAFF_OU, "carol"), "admin1", &[]);
+    let mut request = d.request(create_user(STAFF_OU, "carol"), "admin1");
     // 601 s before now (10:00:00 − 10 min 1 s = 09:49:59).
     request.requester.authtime = kt(2026, 11, 13, 9, 49, 59);
     let r = d.run_request(&request).refused();

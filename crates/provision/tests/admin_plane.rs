@@ -6,7 +6,9 @@
 //!   verified the AP-REQ — docs/51 §5.3, §7.4): the first administrator
 //!   alice (a Tier-0 group member), approved by the second first
 //!   administrator bob (P-22: an explicit Tier-0 subtree needs dual
-//!   control), performs every operation of docs/51 §5.2 on objects under
+//!   control — through the one mechanism of task D2-c, docs/questions/
+//!   Q-882: alice proposes, bob approves the pending request, alice
+//!   executes), performs every operation of docs/51 §5.2 on objects under
 //!   the Tier-0 OU — a user at depth 2 (NC root → OU → user);
 //! - `pdp::decide` directly, with the produced policy (loaded by
 //!   policy-store) and the produced directory as PIP: every A3 action is
@@ -33,9 +35,10 @@ use std::collections::BTreeSet;
 
 use directory_admin::{
     AdminConfig, AdminSubject, CompletePasswordSet, CreateComputer, CreateContainerLike,
-    CreateGroup, CreateUser, DirectoryAdmin, LookupKey, Membership, Operation, PasswordSetOutcome,
-    ProtectedObjects, RandomError, RandomSource, Reply, Request, SetAccountExpires, SetEnabled,
-    VerifiedTicket, USER_FORCE_CHANGE_PASSWORD,
+    CreateGroup, CreateUser, DirectoryAdmin, KeyTargets, LookupKey, Membership, Operation,
+    PasswordSetOutcome, PendingRequests, ProposeRequest, ProposedOperation, ProtectedObjects,
+    RandomError, RandomSource, Reply, Request, RequestStep, SetAccountExpires, SetEnabled,
+    StepRequest, VerifiedTicket, USER_FORCE_CHANGE_PASSWORD,
 };
 use directory_daemon::startup::{read_integrity_key, read_policy};
 use directory_pip::{DirectoryContext, NamingContext, TierMap};
@@ -80,6 +83,18 @@ fn request_time() -> KerberosTime {
 /// a made-up value standing for the one keyd would have verified.
 const BOUND: keyd_types::OperationDigest = keyd_types::OperationDigest::new([0xB7; 32]);
 
+/// A made-up operation digest per operation (these tests run without the
+/// channel codec): a fold of the operation's `Debug` form into 32 octets —
+/// distinct operations get distinct values, which is all the PEP uses it
+/// for (an approved request is matched by it, docs/questions/Q-882).
+fn digest_of(operation: &Operation) -> keyd_types::OperationDigest {
+    let mut out = [0u8; 32];
+    for (i, b) in format!("{operation:?}").bytes().enumerate() {
+        out[i % 32] = out[i % 32].wrapping_mul(31).wrapping_add(b);
+    }
+    keyd_types::OperationDigest::new(out)
+}
+
 fn ticket(name: &str, authtime: KerberosTime) -> VerifiedTicket {
     VerifiedTicket {
         crealm: Realm::new("EXAMPLE.TEST").unwrap(),
@@ -101,6 +116,8 @@ struct Domain {
     tiers: TierMap,
     policy: PolicySnapshot,
     admin: DirectoryAdmin<AdminRandom>,
+    /// The pending requests of the one dual-control mechanism (task D2-c).
+    requests: PendingRequests,
     next_id: u64,
     authtime: KerberosTime,
     now: KerberosTime,
@@ -180,6 +197,16 @@ impl Domain {
         )
         .unwrap();
         let admin = DirectoryAdmin::new(config, &schema, AdminRandom::default()).unwrap();
+        // No key operation runs here: the krbtgt alone, no service target.
+        let requests = PendingRequests::new(
+            KeyTargets {
+                krbtgt: plan.object(ObjectRole::Krbtgt).unwrap().guid,
+                services: BTreeSet::new(),
+            },
+            directory_admin::REQUEST_LIFETIME,
+            directory_admin::REQUESTS_PER_REQUESTER,
+        )
+        .unwrap();
         Some(Domain {
             _dir: dir,
             plan,
@@ -188,6 +215,7 @@ impl Domain {
             tiers,
             policy,
             admin,
+            requests,
             next_id: 1,
             authtime: at(10, 0, 10),
             now: request_time(),
@@ -202,28 +230,110 @@ impl Domain {
         self.plan.object(role).unwrap().sid.unwrap()
     }
 
+    /// The refusal code of a refusal (a `Decision` refusal).
+    fn code(refusal: &directory_admin::Refusal) -> AdminRefusal {
+        match refusal.event().stage {
+            DirAdminStage::Decision(DecisionResult::Refused(code)) => code,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The approvals of `operation` by `approvers` through the one
+    /// dual-control mechanism (task D2-c; docs/questions/Q-882): `requester`
+    /// proposes it, each approver approves the pending request. An
+    /// operation whose rule needs no approver is not queued (`Ok`).
+    fn approvals(
+        &mut self,
+        operation: &Operation,
+        requester: &str,
+        approvers: &[&str],
+    ) -> Result<(), AdminRefusal> {
+        if approvers.is_empty() || !operation.writes() {
+            return Ok(());
+        }
+        let propose = ProposeRequest {
+            operation_id: self.next_id,
+            operation: ProposedOperation::Directory(operation.clone()),
+            operation_digest: digest_of(operation),
+            request_digest: BOUND,
+            reason_ref: None,
+            requester: ticket(requester, self.authtime),
+        };
+        self.next_id += 1;
+        let mut honour = |_: &[pdp::Obligation]| true;
+        let view = self.ctx.view(&self.store, &self.tiers).unwrap();
+        let proposed = match self.admin.propose(
+            &mut self.requests,
+            &propose,
+            &view,
+            &self.policy,
+            None,
+            &self.now,
+            &mut honour,
+        ) {
+            Ok(proposed) => proposed,
+            Err(r) if Self::code(&r) == AdminRefusal::ApprovalNotNeeded => return Ok(()),
+            Err(r) => return Err(Self::code(&r)),
+        };
+        for approver in approvers {
+            let step = StepRequest {
+                operation_id: self.next_id,
+                step: RequestStep::Approve {
+                    id: proposed.reply().id,
+                    digest: proposed.reply().digest,
+                },
+                request_digest: BOUND,
+                caller: ticket(approver, self.authtime),
+                signature: None,
+            };
+            self.next_id += 1;
+            if let Err(r) = self.admin.step(
+                &mut self.requests,
+                &step,
+                &view,
+                &self.policy,
+                &self.now,
+                &mut honour,
+            ) {
+                return Err(Self::code(&r));
+            }
+        }
+        Ok(())
+    }
+
     /// One request through prepare ⇒ apply ⇒ commit, as dird's admin
-    /// service runs it (the WriteTxn begun before the view, Q-358 item 1).
+    /// service runs it (the WriteTxn begun before the view, Q-358 item 1) —
+    /// after its approvals, when it needs them.
     fn run(&mut self, operation: Operation, requester: &str, approvers: &[&str]) -> Ran {
+        if let Err(code) = self.approvals(&operation, requester, approvers) {
+            return Ran::Refused(code);
+        }
+        let digest = digest_of(&operation);
         let request = Request {
             operation_id: self.next_id,
             operation,
-            operation_digest: BOUND,
-            requester: ticket(requester, self.authtime),
-            approvals: approvers.iter().map(|a| ticket(a, self.authtime)).collect(),
+            operation_digest: digest,
+            requester: VerifiedTicket {
+                bound_operation: Some(digest),
+                ..ticket(requester, self.authtime)
+            },
         };
         self.next_id += 1;
         let mut txn = self.store.begin_write().unwrap();
         let view = self.ctx.view(&self.store, &self.tiers).unwrap();
-        let prepared = match self.admin.prepare(&request, &view, &self.policy, &self.now) {
-            Ok(p) => p,
-            Err(refusal) => {
-                return Ran::Refused(match refusal.event().stage {
-                    DirAdminStage::Decision(DecisionResult::Refused(code)) => code,
-                    other => panic!("{other:?}"),
-                })
-            }
-        };
+        let prepared =
+            match self
+                .admin
+                .prepare(&request, &mut self.requests, &view, &self.policy, &self.now)
+            {
+                Ok(p) => p,
+                Err(refusal) => {
+                    return Ran::Refused(match refusal.event().stage {
+                        DirAdminStage::Decision(DecisionResult::Refused(code)) => code,
+                        other => panic!("{other:?}"),
+                    })
+                }
+            };
         drop(view);
         if !prepared.writes() {
             return Ran::Read(prepared.reply().unwrap().clone());

@@ -27,17 +27,20 @@
 //!
 //! Every frame: `length:u32 ‖ magic:u16 ‖ version:u8 ‖ kind:u8 ‖ payload`
 //! (docs/50 §3.3). Every operation starts with dird's
-//! `auth := requester: bytes<64 KiB> ‖ approvals: seq<bytes<64 KiB>, 2>` —
-//! raw AP-REQs that admind forwards untouched; there is no field in which a
-//! client (or admind) could claim a name, SID, tier or "approved" (docs/51
-//! §7.2; A-70).
+//! `auth := requester: bytes<64 KiB> ‖ approvals: seq<_, 0>` — the
+//! requester's raw AP-REQ, which admind forwards untouched, and the count of
+//! the **retired** in-request approvals, always 0 (docs/questions/Q-882,
+//! A-148: every approval is an `Approve` of a pending request dird holds);
+//! there is no field in which a client (or admind) could claim a name, SID,
+//! tier or "approved" (docs/51 §7.2; A-70).
 //!
 //! | dir | kind | message | payload |
 //! |---|---|---|---|
 //! | → | `0x01`–`0x05` | `CreateUser`, `CreateComputer`, `CreateGroup`, `CreateOu`, `CreateContainer` | dird's (`auth` ‖ fields) |
 //! | → | `0x08`–`0x0D` | `SetEnabled`, `SetAccountExpires`, `AddMember`, `RemoveMember`, `Delete`, `Lookup` | dird's (`auth` ‖ fields) |
 //! | → | `0x14` | `Ping` | — (no `auth`) |
-//! | → | `0x0E`, `0x0F` | `RequestKeyOperation`, `Approve` | dird's (`auth` ‖ fields) |
+//! | → | `0x0E`, `0x0F` | (retired by task D2-c: `RequestKeyOperation`, the key-only `Approve` — Q-882) | — |
+//! | → | `0x17`–`0x1C` | `Propose`, `Approve`, `Reject`, `Withdraw`, `ListRequests`, `ShowRequest` (task D2-c) | dird's (`auth` ‖ fields) |
 //! | → | `0x10`–`0x12` | (retired by A-102: keyadm's `FetchApproved`, `Complete`, `ListPendingDestruction`) | — |
 //! | → | `0x15` | `SetPassword` | `auth ‖ completion:bytes<64 KiB> ‖ target:[16] ‖ password:secret bytes<1024>` |
 //! | → | `0x16` | `ChangePolicy` (task A16) | dird's (`auth` ‖ fields) |
@@ -47,14 +50,15 @@
 //! | ← | `0x85` | `Refused` | `status:u8{1 Denied, 2 ApprovalRequired, 3 NotFound, 4 Invalid, 5 Conflict, 6 Unavailable, 7 OutcomeUnknown, 8 Incomplete}` |
 //! | ← | `0x86` | `Pong` | — |
 //! | ← | `0x87` | `PasswordChanged` | `kvnos:seq<u32,2> ‖ completion_recorded:bool` |
-//! | ← | `0x88` | `KeyRequest` | dird's |
+//! | ← | `0x88` | (retired by task D2-c: `KeyRequest`) | — |
+//! | ← | `0x8C`–`0x8E` | `PendingRequest`, `RequestList`, `RequestShown` (task D2-c) | dird's |
 //! | ← | `0x89`, `0x8A` | (retired by A-102: `Approved`, `PendingDestruction`) | — |
 //! | ← | `0x8B` | `PolicyNext` (task A16) | dird's: `version:u64` |
 //! | ← | `0xFF` | shared `Refused` (A-59) | `code` |
 //!
 //! Unused kinds: `0x06` / `0x07` (dird's password-set steps — only admind
 //! sends them, to dird), `0x13` (the join token, task A12). Request body
-//! ≤ 288 KiB, reply body ≤ 16 KiB ([`channel`]). The synchronous client
+//! ≤ 288 KiB, reply body ≤ 64 KiB ([`channel`]). The synchronous client
 //! ([`client`], task A10) is `adminctl`'s when task A11 builds it (keyadm
 //! used it until A-102, which took admind out of keyadm's path).
 //!

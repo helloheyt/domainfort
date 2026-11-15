@@ -778,6 +778,14 @@ fn workstation_fixture(plan: &Plan, input: &DomainInput, uid: u32) -> Workstatio
     )
     .unwrap();
     let mut admin = DirectoryAdmin::new(config, &schema, FixtureRandom::default()).unwrap();
+    // The one dual-control mechanism's table (task D2-c): no fixture step
+    // needs an approver (an unclassified OU), so it stays empty.
+    let mut requests = directory_admin::PendingRequests::new(
+        directory_daemon::admin_service::key_targets(&plan.manifest),
+        directory_admin::REQUEST_LIFETIME,
+        directory_admin::REQUESTS_PER_REQUESTER,
+    )
+    .unwrap();
     let now = fixture_at();
     // The fixture runs the PEP without dird or keyd: the verified ticket's
     // facts are injected, its operation binding (R2) a made-up digest that
@@ -797,12 +805,11 @@ fn workstation_fixture(plan: &Plan, input: &DomainInput, uid: u32) -> Workstatio
             operation,
             operation_digest: fixture_digest,
             requester: requester.clone(),
-            approvals: Vec::new(),
         };
         let mut txn = store.begin_write().unwrap();
         let view = ctx.view(&store, &tiers).unwrap();
         let prepared = admin
-            .prepare(&request, &view, &snapshot, &now)
+            .prepare(&request, &mut requests, &view, &snapshot, &now)
             .unwrap_or_else(|r| panic!("fixture refused: {:?}", r.event()));
         drop(view);
         let applied = admin
@@ -1613,21 +1620,15 @@ impl World {
         who.ticket.ap_req_bound(self.now, cusec, digest.as_bytes())
     }
 
-    /// The `auth` field of `operation`: `requester`'s AP-REQ and one per
-    /// approver (docs/51 §7.2), every one bound to `operation` (R2).
+    /// The `auth` field of `operation`: `requester`'s AP-REQ bound to it
+    /// (R2). There are no approvals in a request (task D2-c;
+    /// docs/questions/Q-882).
     pub fn auth(
         &mut self,
         requester: &Persona,
-        approvers: &[&Persona],
         operation: &ipc_dird_admin::Operation,
     ) -> ipc_dird_admin::Auth {
-        ipc_dird_admin::Auth {
-            requester: self.ap_req(requester, operation),
-            approvals: approvers
-                .iter()
-                .map(|a| self.ap_req(a, operation))
-                .collect(),
-        }
+        ipc_dird_admin::Auth::of(self.ap_req(requester, operation))
     }
 
     /// One request on a new `admin.sock` connection.
@@ -1636,19 +1637,51 @@ impl World {
         conn.call(request)
     }
 
-    /// A forwarded operation by `requester` with `approvers`.
+    /// A forwarded operation by `requester` with `approvers` — with
+    /// approvers, through the one dual-control mechanism (task D2-c;
+    /// docs/questions/Q-882): `requester` proposes it, each approver
+    /// approves the pending request by id and digest (an approval refused ⇒
+    /// the request is withdrawn and the refusal answered), then `requester`
+    /// executes the very operation.
     pub fn forward(
         &mut self,
         requester: &Persona,
         approvers: &[&Persona],
         operation: ipc_dird_admin::Operation,
     ) -> Got {
-        let auth = self.auth(requester, approvers, &operation);
+        if !approvers.is_empty() {
+            let propose = ipc_dird_admin::Operation::Propose {
+                reason_ref: None,
+                operation: Box::new(operation.clone()),
+            };
+            let state = match self.forward(requester, &[], propose) {
+                Got::Reply(ipc_admin::Reply::PendingRequest(state)) => state,
+                other => return other,
+            };
+            for approver in approvers {
+                let approve = ipc_dird_admin::Operation::Approve {
+                    id: state.id,
+                    digest: state.digest,
+                };
+                match self.forward(approver, &[], approve) {
+                    Got::Reply(ipc_admin::Reply::PendingRequest(_)) => {}
+                    refused => {
+                        let withdraw = ipc_dird_admin::Operation::Withdraw { id: state.id };
+                        let _ = self.forward(requester, &[], withdraw);
+                        return refused;
+                    }
+                }
+            }
+        }
+        let auth = self.auth(requester, &operation);
         self.admin(&ipc_admin::Request::Forward { auth, operation })
     }
 
     /// `SetPassword` by `requester` (two AP-REQs — A-94, docs/questions/
-    /// Q-400 — plus one per approver).
+    /// Q-400). With approvers: first the one dual-control mechanism for its
+    /// `BeginPasswordSet {target}` (task D2-c; docs/questions/Q-882 —
+    /// proposed by `requester`, approved by each approver), whose approved
+    /// request dird's `BeginPasswordSet` consumes.
     pub fn set_password(
         &mut self,
         requester: &Persona,
@@ -1656,15 +1689,32 @@ impl World {
         target: Guid,
         password: &str,
     ) -> Got {
+        let begin = ipc_dird_admin::Operation::BeginPasswordSet { target };
+        if !approvers.is_empty() {
+            let propose = ipc_dird_admin::Operation::Propose {
+                reason_ref: None,
+                operation: Box::new(begin.clone()),
+            };
+            let state = match self.forward(requester, &[], propose) {
+                Got::Reply(ipc_admin::Reply::PendingRequest(state)) => state,
+                other => return other,
+            };
+            for approver in approvers {
+                let approve = ipc_dird_admin::Operation::Approve {
+                    id: state.id,
+                    digest: state.digest,
+                };
+                match self.forward(approver, &[], approve) {
+                    Got::Reply(ipc_admin::Reply::PendingRequest(_)) => {}
+                    refused => return refused,
+                }
+            }
+        }
         // R2 (docs/51 §7.6; docs/52 §5 items 1, 5): `auth` is bound to the
         // `BeginPasswordSet {target}` admind sends dird, `completion` to its
         // `CompletePasswordSet {target, …}` (whose digest covers the target
         // only — the outcome and kvnos are admind's report).
-        let auth = self.auth(
-            requester,
-            approvers,
-            &ipc_dird_admin::Operation::BeginPasswordSet { target },
-        );
+        let auth = self.auth(requester, &begin);
         let completion = self.ap_req(
             requester,
             &ipc_dird_admin::Operation::CompletePasswordSet {

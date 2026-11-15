@@ -548,18 +548,13 @@ fn start_admin(
         directory_admin::DirectoryAdmin::new(config, &schema, directory_admin::OsRandom::new())
             .map_err(|_| NotStarted::Configuration)?;
     let verifier = factory().ok_or(NotStarted::NoKeyd)?;
-    // The pending key-operation requests (task A10): their ids start after
-    // the start's DSTIME seconds × 2^20, as the operation numbers do
-    // (docs/questions/Q-388 item 4).
-    let first_key_id = params
-        .clock
-        .now()
-        .and_then(|now| directory_admin::wall_clock(&now))
-        .map_or(0, |seconds| seconds.0.wrapping_shl(20));
-    let key_requests = directory_admin::KeyRequests::new(
+    // The pending requests of every dual-controlled operation (task D2-c;
+    // docs/questions/Q-882): their ids are drawn from the CSPRNG by the PEP
+    // (no counter a restart could reset — Q-882 item 3).
+    let requests = directory_admin::PendingRequests::new(
         key_targets(&admin.manifest),
-        admin.key_request_lifetime,
-        first_key_id,
+        admin.request_lifetime,
+        admin.requests_per_requester,
     )
     .map_err(|_| NotStarted::Configuration)?;
     let worker = AdminWorker {
@@ -573,7 +568,7 @@ fn start_admin(
         gate: Arc::clone(gate),
         clock: params.clock.clone(),
         ack_deadline: admin.ack_deadline.get(),
-        key_requests,
+        requests,
         reconcile_interval: admin.destroy_reconcile_interval,
         // Task A16: the base of a tier-map change, and where it is written.
         installed: policy.clone(),

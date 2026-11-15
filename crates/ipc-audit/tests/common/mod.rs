@@ -327,9 +327,12 @@ pub fn dir_admin_create_decision() -> DirAdminEvent {
         enable: None,
         account_expires: None,
         group_type: None,
-        key_request: None,
+        pending_request: None,
         key_operation: None,
         reported_kvnos: BoundedSeq::empty(),
+        operation_digest: [0x9C; 32],
+        proposed: None,
+        reason_ref: None,
     }
 }
 
@@ -428,7 +431,7 @@ pub fn dir_admin_key_complete() -> DirAdminEvent {
         parent: None,
         approvers: BoundedSeq::new(vec![domain_sid(1107)]).unwrap(),
         names: BoundedSeq::empty(),
-        key_request: Some(9),
+        pending_request: Some(9),
         key_operation: Some(KeydOperation::RotateKrbtgt),
         reported_kvnos: BoundedSeq::new(vec![3]).unwrap(),
         ..dir_admin_create_decision()
@@ -470,9 +473,12 @@ pub fn largest_dir_admin() -> DirAdminEvent {
         enable: Some(EnableDirection::Disable),
         account_expires: Some(AccountExpiresValue::at(u64::MAX)),
         group_type: Some(GroupTypeCode::SecurityUniversalGroup),
-        key_request: Some(u64::MAX),
+        pending_request: Some(u64::MAX),
         key_operation: Some(KeydOperation::Ping),
         reported_kvnos: BoundedSeq::new(vec![u32::MAX; MAX_REPORTED_KVNOS]).unwrap(),
+        operation_digest: [0xFF; 32],
+        proposed: Some(DirAdminOperation::ShowRequest),
+        reason_ref: Some(longest_text('r')),
     }
 }
 
@@ -505,6 +511,7 @@ pub fn admind_set_password() -> AdmindEvent {
     AdmindEvent {
         activity: AdmindActivity::SetPassword {
             target: [0x5E; 16],
+            operation_digest: [0x9C; 32],
             kvnos: BoundedSeq::new(vec![4, 2]).unwrap(),
             result: PasswordResult::Completed,
         },
@@ -518,6 +525,7 @@ pub fn admind_set_password_failed() -> AdmindEvent {
     AdmindEvent {
         activity: AdmindActivity::SetPassword {
             target: [0x5E; 16],
+            operation_digest: [0x9C; 32],
             kvnos: BoundedSeq::new(vec![5]).unwrap(),
             result: PasswordResult::Failed {
                 step: PasswordStep::SetSecret(KeyPurposeCode::Service),
@@ -555,6 +563,7 @@ pub fn largest_admind() -> AdmindEvent {
         peer_uid: Some(u32::MAX),
         activity: AdmindActivity::SetPassword {
             target: [0xFF; 16],
+            operation_digest: [0x9C; 32],
             kvnos: BoundedSeq::new(vec![u32::MAX; MAX_REPORTED_KVNOS]).unwrap(),
             result: PasswordResult::Failed {
                 step: PasswordStep::SetSecret(KeyPurposeCode::PrincipalLongterm),
@@ -649,6 +658,7 @@ pub fn admin_samples() -> Vec<EventBody> {
         AdmindEvent {
             activity: AdmindActivity::SetPassword {
                 target: [1; 16],
+                operation_digest: [0x9C; 32],
                 kvnos: BoundedSeq::empty(),
                 result: PasswordResult::Failed {
                     step: PasswordStep::Validation,
@@ -668,6 +678,7 @@ pub fn admin_samples() -> Vec<EventBody> {
         AdmindEvent {
             activity: AdmindActivity::SetPassword {
                 target: [2; 16],
+                operation_digest: [0x9C; 32],
                 kvnos: BoundedSeq::empty(),
                 result: PasswordResult::Failed {
                     step: PasswordStep::SetSecret(KeyPurposeCode::PrincipalLongterm),

@@ -10,10 +10,12 @@
 //!   same `auth` (for dird's `BeginPasswordSet`), one more AP-REQ of the
 //!   requester (for dird's `CompletePasswordSet`: keyd's replay cache makes
 //!   every AP-REQ single-use, RFC 4120 §3.2.3 — docs/questions/Q-400), the
-//!   target and the password: 4 AP-REQs + ~1 KiB. 288 KiB holds both, checked
-//!   at compile time below.
-//! * **Reply direction: 16 KiB**, as dird's admin channel: the largest reply
-//!   is a `Lookup`'s `Found` (a DN of at most 64 components).
+//!   target and the password: 2 AP-REQs + ~1 KiB (the in-request approvals
+//!   are retired — docs/questions/Q-882). 288 KiB holds both, checked at
+//!   compile time below.
+//! * **Reply direction: 64 KiB**, as dird's admin channel: the largest reply
+//!   is a `ShowRequest`'s `RequestShown` (the pending operation and two
+//!   facts' DNs — task D2-c, docs/questions/Q-936).
 //! * **Password: 1024 octets** — keyd's `set_secret` bound
 //!   (`ipc_keyd::channel::MAX_SECRET`), to which admind hands it; the
 //!   character rules ([MS-SAMR] 3.1.1.7.2) are admind's own check.
@@ -43,9 +45,10 @@ pub const ADMIN_VERSION: u8 = 1;
 /// Spec: docs/51 §7.5, §7.6; docs/50 §3.3.
 pub const MAX_REQUEST_BODY: u32 = 288 * 1024;
 
-/// Reply body bound: 16 KiB. Spec: docs/51 §7.5 (the admin channel's
-/// reply bound, which this channel's replies share).
-pub const MAX_REPLY_BODY: u32 = 16 * 1024;
+/// Reply body bound: 64 KiB — dird's admin channel's, which this channel's
+/// replies share (raised from 16 KiB for `ShowRequest`, task D2-c).
+/// Spec: docs/51 §7.5; docs/questions/Q-936.
+pub const MAX_REPLY_BODY: u32 = 64 * 1024;
 
 /// The request direction's [`FrameLimit`]; a bound outside ipc's range stops
 /// the build here (const evaluation), never at run time.
@@ -107,15 +110,18 @@ const _: () = assert!(PASSWORD_CHANGED <= MAX_REPLY_BODY as usize);
 /// numbers of dird's admin channel (their layouts are that channel's);
 /// `0x06` / `0x07` — dird's `BeginPasswordSet` / `CompletePasswordSet` —
 /// are never assigned here (only admind calls them, inside `SetPassword`);
-/// the key-operation requests `RequestKeyOperation` / `Approve` (`0x0E`,
-/// `0x0F`) are forwarded like every other operation; keyadm's former
-/// requests `FetchApproved` / `Complete` / `ListPendingDestruction`
-/// (`0x10`–`0x12`, task A10) are **retired by A-102 and never reused**
-/// (docs/52 §4.6, §4.8; docs/questions/Q-460 — keyadm talks to keyd only,
-/// so admind is no longer in its path: N2); `0x13` (the join token, task
-/// A12) stays unused; `SetPassword` is `0x15`. Values are a project choice.
+/// task A10's key-only `RequestKeyOperation` / `Approve` (`0x0E`, `0x0F`)
+/// are **retired by task D2-c** (docs/questions/Q-882: one dual-control
+/// mechanism) and the request queue's `Propose`, `Approve`, `Reject`,
+/// `Withdraw`, `ListRequests`, `ShowRequest` (`0x17`–`0x1C`) are forwarded
+/// like every other operation; keyadm's former requests `FetchApproved` /
+/// `Complete` / `ListPendingDestruction` (`0x10`–`0x12`, task A10) are
+/// **retired by A-102 and never reused** (docs/52 §4.6, §4.8;
+/// docs/questions/Q-460 — keyadm talks to keyd only, so admind is no longer
+/// in its path: N2); `0x13` (the join token, task A12) stays unused;
+/// `SetPassword` is `0x15`. Values are a project choice.
 /// Spec: docs/51 §6, §7.3, §7.6; docs/50 §3.3 ("`kind` closed"), §7.5
-/// (`Ping`); docs/questions/Q-422, Q-460 (A-102).
+/// (`Ping`); docs/questions/Q-422, Q-460 (A-102), Q-882.
 pub mod request_kind {
     use ipc_dird_admin::channel::request_kind as dird;
 
@@ -141,10 +147,18 @@ pub mod request_kind {
     pub const DELETE: u8 = dird::DELETE;
     /// `Lookup`. Spec: docs/51 §7.3; §5.2 row 10.
     pub const LOOKUP: u8 = dird::LOOKUP;
-    /// `RequestKeyOperation`. Spec: docs/51 §5.6, §6, §7.3.
-    pub const REQUEST_KEY_OPERATION: u8 = dird::REQUEST_KEY_OPERATION;
-    /// `Approve`. Spec: docs/51 §5.6, §6, §7.3.
+    /// `Propose`. Spec: docs/questions/Q-882 item 1.
+    pub const PROPOSE: u8 = dird::PROPOSE;
+    /// `Approve {id, digest}`. Spec: docs/questions/Q-882 item 1.
     pub const APPROVE: u8 = dird::APPROVE;
+    /// `Reject {id, digest}`. Spec: r5-a §11 MA5.
+    pub const REJECT: u8 = dird::REJECT;
+    /// `Withdraw {id}`. Spec: docs/questions/Q-882 item 1.
+    pub const WITHDRAW: u8 = dird::WITHDRAW;
+    /// `ListRequests {scope}`. Spec: docs/questions/Q-882 item 1.
+    pub const LIST_REQUESTS: u8 = dird::LIST_REQUESTS;
+    /// `ShowRequest {id}`. Spec: docs/questions/Q-882 item 1.
+    pub const SHOW_REQUEST: u8 = dird::SHOW_REQUEST;
     /// `Ping`: admind's health check, no `auth`. Spec: docs/50 §7.5.
     pub const PING: u8 = dird::PING;
     /// `SetPassword {auth, completion, target, password}`.
@@ -169,14 +183,19 @@ pub mod request_kind {
         REMOVE_MEMBER,
         DELETE,
         LOOKUP,
-        REQUEST_KEY_OPERATION,
-        APPROVE,
         CHANGE_POLICY,
+        PROPOSE,
+        APPROVE,
+        REJECT,
+        WITHDRAW,
+        LIST_REQUESTS,
+        SHOW_REQUEST,
     ];
 
     /// The kinds retired by A-102 (keyadm's `FetchApproved`, `Complete`,
-    /// `ListPendingDestruction`): never in [`ALL`], never reused.
-    /// Spec: docs/52 §4.6; docs/questions/Q-460 (A-102).
+    /// `ListPendingDestruction`) and by task D2-c (`RequestKeyOperation`,
+    /// the key-only `Approve`): never in [`ALL`], never reused.
+    /// Spec: docs/52 §4.6; docs/questions/Q-460 (A-102), Q-882.
     pub const RETIRED: &[u8] = dird::RETIRED;
 
     /// The closed request table. Spec: docs/51 §7.6; docs/50 §3.3.
@@ -192,11 +211,15 @@ pub mod request_kind {
         REMOVE_MEMBER,
         DELETE,
         LOOKUP,
-        REQUEST_KEY_OPERATION,
-        APPROVE,
         PING,
         SET_PASSWORD,
         CHANGE_POLICY,
+        PROPOSE,
+        APPROVE,
+        REJECT,
+        WITHDRAW,
+        LIST_REQUESTS,
+        SHOW_REQUEST,
     ];
 }
 
@@ -223,15 +246,19 @@ pub mod reply_kind {
     /// `PasswordChanged { kvnos, completion_recorded }`: every `set_secret`
     /// of a `SetPassword` succeeded. Spec: docs/51 §7.6.
     pub const PASSWORD_CHANGED: u8 = 0x87;
-    /// `KeyRequest`: dird's answer to `RequestKeyOperation` / `Approve`.
-    /// Spec: docs/51 §5.6, §7.3.
-    pub const KEY_REQUEST: u8 = dird::KEY_REQUEST;
+    /// `PendingRequest`: dird's answer to `Propose` / `Approve`.
+    /// Spec: docs/questions/Q-882 item 1.
+    pub const PENDING_REQUEST: u8 = dird::PENDING_REQUEST;
+    /// `RequestList`: dird's answer to `ListRequests`.
+    pub const REQUEST_LIST: u8 = dird::REQUEST_LIST;
+    /// `RequestShown`: dird's answer to `ShowRequest`.
+    pub const REQUEST_SHOWN: u8 = dird::REQUEST_SHOWN;
     /// `PolicyNext { version }`: dird's answer to `ChangePolicy` (task A16).
     /// Spec: docs/51 §5.10.
     pub const POLICY_NEXT: u8 = dird::POLICY_NEXT;
-    /// The reply kinds retired by A-102 (`Approved`, `PendingDestruction`):
-    /// never in [`ALL`], never reused.
-    /// Spec: docs/52 §4.6; docs/questions/Q-460 (A-102).
+    /// The reply kinds retired by A-102 (`Approved`, `PendingDestruction`)
+    /// and by task D2-c (`KeyRequest`): never in [`ALL`], never reused.
+    /// Spec: docs/52 §4.6; docs/questions/Q-460 (A-102), Q-882.
     pub const RETIRED: &[u8] = dird::RETIRED;
 
     /// The closed reply table (without the reserved `REFUSED_KIND`).
@@ -243,8 +270,10 @@ pub mod reply_kind {
         REFUSED,
         PONG,
         PASSWORD_CHANGED,
-        KEY_REQUEST,
         POLICY_NEXT,
+        PENDING_REQUEST,
+        REQUEST_LIST,
+        REQUEST_SHOWN,
     ];
 }
 

@@ -72,19 +72,6 @@ impl VerifiedTicket {
     }
 }
 
-/// `true` if every ticket a request relies on — the requester's and each
-/// approval's — was verified by keyd bound to `digest`, the digest of the
-/// request being decided. Only then does the PEP report `channel_bound` to
-/// the PDP (docs/11 §4: a write needs it).
-/// Spec: docs/52 §5 item 4 ("`transport_sec.channel_bound = true` only after
-/// verification"); docs/11 §1, §4.
-pub(crate) fn all_bound<'t>(
-    digest: &OperationDigest,
-    tickets: impl IntoIterator<Item = &'t VerifiedTicket>,
-) -> bool {
-    tickets.into_iter().all(|t| t.bound_to(digest))
-}
-
 /// Why no Subject was built. Both are refusals; neither says why to the
 /// client (A-26: a uniform `Denied`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
