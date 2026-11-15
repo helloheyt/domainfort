@@ -79,7 +79,9 @@ mod tgs_exchange;
 mod time;
 mod tokens;
 
-pub use as_exchange::{AsRepParts, AsTicketTemplate, AuthnProof};
+pub use as_exchange::{
+    AsRepParts, AsServer, AsTicketTemplate, AuthnProof, CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS,
+};
 pub use audit::{AuditKeyRef, AuditOutcome, AuditReason, AuditRecord, AuditSink};
 pub use authz::{CallerId, Operation, Role};
 pub use change_password::{

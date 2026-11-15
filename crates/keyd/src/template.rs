@@ -18,7 +18,10 @@ use crate::config::TicketPolicy;
 use crate::error::{Deny, Internal};
 use crate::model::{KeyHandle, KeyPurpose, PrincipalBinding};
 use crate::time::{kerberos_time_seconds, within_skew};
-use keyd_types::{is_admin_service_name, is_change_password_service_name};
+use keyd_types::{
+    is_admin_service_name, is_change_password_service_name,
+    CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS,
+};
 use krb_proto::constants::KRB_NT_SRV_INST;
 use krb_proto::limits::MAX_NAME_COMPONENTS;
 use krb_proto::{KerberosFlags, KerberosString, KerberosTime, PrincipalName, Realm, TicketFlags};
@@ -259,6 +262,54 @@ pub(crate) fn check_times(
     }
 }
 
+/// The ticket profile of the change-password service (`kadmin/changepw`),
+/// enforced by keyd whatever the KDC asks — the flags of the ticket, or
+/// `BadTemplate`:
+///
+/// - no flag requested at all (`TemplateFlags`): never FORWARDABLE,
+///   PROXIABLE, RENEWABLE, MAY-POSTDATE or POSTDATED — the realm's policy
+///   may allow them for TGTs, the service's profile does not (RFC 4120
+///   3.1.3: flags only "if the policy of the local realm allows");
+/// - no starttime (`TemplateTimes`): the ticket starts at authtime (RFC 4120
+///   5.3) — never postdated;
+/// - no renew-till (`TemplateTimes`);
+/// - the realm's time rules ([`check_times`]: endtime in the future, the
+///   lifetime within the realm's minimum and maximum);
+/// - endtime − authtime ≤ [`CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS`]
+///   (`TemplateTimes`): "the maximum allowable lifetime associated with the
+///   server principal" (RFC 4120 3.1.3).
+///
+/// The flags are then INITIAL and PRE-AUTHENT — the facts keyd verified
+/// ([`as_ticket_flags`] of the empty request): the ticket is issued by the AS
+/// after pre-authentication (RFC 4120 2.1: a password-changing service "can
+/// insist that this flag be set"; RFC 3244 §2).
+///
+/// Spec: docs/53 R53-6, §5.2 ("lifetime ≤ 300 s, no renewable, forwardable,
+/// proxiable, postdated"; "keyd sets INITIAL and PRE-AUTHENT itself");
+/// docs/questions/Q-915 item 4 (A-151); RFC 4120 2.1, 3.1.3, 5.3; RFC 3244
+/// §2.
+pub(crate) fn change_password_ticket(
+    policy: &TicketPolicy,
+    skew_secs: u32,
+    now: i64,
+    authtime: &KerberosTime,
+    t: &TemplateTimes<'_>,
+    requested: TicketFlags,
+) -> Internal<TicketFlags> {
+    if requested != TicketFlags::empty() || t.renewable {
+        return Err(Deny::bad_template(AuditReason::TemplateFlags));
+    }
+    if t.starttime.is_some() || t.renew_till.is_some() {
+        return Err(Deny::bad_template(AuditReason::TemplateTimes));
+    }
+    check_times(policy, skew_secs, now, authtime, t)?;
+    let lifetime = kerberos_time_seconds(t.endtime) - kerberos_time_seconds(authtime);
+    if lifetime > i64::from(CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS) {
+        return Err(Deny::bad_template(AuditReason::TemplateTimes));
+    }
+    as_ticket_flags(policy, TicketFlags::empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,6 +421,92 @@ mod tests {
             ..t
         };
         assert!(check_times(&policy(), 300, now, &auth, &t).is_err());
+    }
+
+    /// docs/53 §5.2 / Q-915 item 4 (the change-password ticket profile);
+    /// RFC 4120 2.1 (INITIAL, PRE-AUTHENT), 3.1.3 (the server principal's
+    /// maximum lifetime; flags only if policy allows), 5.3 (starttime absent
+    /// ⇒ authtime): with a realm policy that allows forwardable, proxiable
+    /// and renewable tickets and a one-minute minimum, the profile still
+    /// gives exactly INITIAL | PRE-AUTHENT for a request of no flag ending
+    /// within 300 s of authtime, and refuses any flag, a starttime, a
+    /// renew-till and an endtime beyond authtime + 300 s.
+    #[test]
+    fn the_change_password_profile() {
+        let mut generous = policy();
+        generous.allowed_flags = generous
+            .allowed_flags
+            .union(TicketFlags::FORWARDABLE)
+            .union(TicketFlags::PROXIABLE);
+        generous.min_lifetime_secs = 60;
+        let auth = kt("20261113100000Z");
+        let now = kerberos_time_seconds(&auth);
+        let end_300 = kt("20261113100500Z");
+        let end_301 = kt("20261113100501Z");
+        let end_120 = kt("20261113100200Z");
+        let times = |endtime| TemplateTimes {
+            starttime: None,
+            endtime,
+            renew_till: None,
+            renewable: false,
+        };
+        for end in [&end_300, &end_120] {
+            let flags = change_password_ticket(
+                &generous,
+                300,
+                now,
+                &auth,
+                &times(end),
+                TicketFlags::empty(),
+            )
+            .unwrap();
+            assert_eq!(flags, TicketFlags::INITIAL.union(TicketFlags::PRE_AUTHENT));
+        }
+        let refused = |t: &TemplateTimes<'_>, flags: TicketFlags| {
+            change_password_ticket(&generous, 300, now, &auth, t, flags).is_err()
+        };
+        assert!(refused(&times(&end_301), TicketFlags::empty()));
+        for flag in [
+            TicketFlags::FORWARDABLE,
+            TicketFlags::PROXIABLE,
+            TicketFlags::RENEWABLE,
+            TicketFlags::INITIAL,
+        ] {
+            assert!(refused(&times(&end_300), flag), "{flag:?}");
+        }
+        let start = kt("20261113100000Z");
+        assert!(refused(
+            &TemplateTimes {
+                starttime: Some(&start),
+                ..times(&end_300)
+            },
+            TicketFlags::empty()
+        ));
+        let renew = kt("20261113100500Z");
+        assert!(refused(
+            &TemplateTimes {
+                renew_till: Some(&renew),
+                ..times(&end_300)
+            },
+            TicketFlags::empty()
+        ));
+        assert!(refused(
+            &TemplateTimes {
+                renewable: true,
+                ..times(&end_300)
+            },
+            TicketFlags::empty()
+        ));
+        // The realm minimum still applies: 2 minutes under a 5-minute minimum.
+        assert!(change_password_ticket(
+            &policy(),
+            300,
+            now,
+            &auth,
+            &times(&end_120),
+            TicketFlags::empty()
+        )
+        .is_err());
     }
 
     #[test]

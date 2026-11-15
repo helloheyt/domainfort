@@ -400,12 +400,16 @@ fn wrong_purpose_is_denied_for_every_operation() {
     }
 }
 
-/// I3 for the second handle of issue_as_rep: the ticket can only be sealed
-/// under a Krbtgt-purpose key. Source: docs/10 §4 (`krbtgt: KeyHandle //
-/// Krbtgt`), §12 I3.
+/// I3 for the server handle of issue_as_rep: an unarmored ticket can only be
+/// sealed under a Krbtgt-purpose key — not a service's, a client's, the
+/// admin service's, nor the change-password service's, whose tickets are
+/// issued only armored (task K3b). Source: docs/10 §4, §12 I3; docs/53 §5.2;
+/// docs/questions/Q-915 items 1, 3 (A-151); A-142.
 #[test]
 fn issue_as_rep_krbtgt_slot_purpose() {
     let mut f = Fixture::new();
+    add_admin_service(&mut f);
+    add_change_password_service(&mut f);
     let proof = f
         .keyd
         .verify_preauth(
@@ -416,7 +420,7 @@ fn issue_as_rep_krbtgt_slot_purpose() {
             &now(),
         )
         .unwrap();
-    for wrong in [SERVICE, BOB] {
+    for wrong in [SERVICE, BOB, ADMIN_SERVICE, CHANGE_PASSWORD_SERVICE] {
         assert!(f
             .keyd
             .issue_as_rep(&KDC, &ALICE, &wrong, &proof, None, &as_template(), &now())

@@ -75,11 +75,17 @@ pub trait KeyCustody {
     ) -> Result<AuthnProof, AuthnError>;
 
     /// docs/10 §4 `issue_as_rep`; armored when `armor` is `Some` (then
-    /// `fast_rep` is `Some`, docs/48 §2.3).
+    /// `fast_rep` is `Some`, docs/48 §2.3). `server` is the key set the
+    /// ticket is sealed under: this realm's krbtgt (a TGT), or — armored
+    /// only — the change-password service's (`kadmin/changepw`, under its
+    /// ticket profile); keyd refuses any other (`crate::AsServer`, the
+    /// closed server slot of task K3b).
+    /// Spec: docs/10 §4; docs/53 §5.2; docs/questions/Q-915 items 1, 3
+    /// (A-151).
     fn issue_as_rep(
         &mut self,
         client: &KeyHandle,
-        krbtgt: &KeyHandle,
+        server: &KeyHandle,
         proof: &AuthnProof,
         armor: Option<ArmorId>,
         template: &AsTicketTemplate,

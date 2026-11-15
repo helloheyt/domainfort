@@ -114,7 +114,10 @@
 //! challenge FAST factor (one attempt per armor); [`Keyd::issue_as_rep`]
 //! with that armor seals the reply under the strengthened reply key and
 //! returns the sealed KrbFastResponse (`fast_rep`: the KDC's encrypted
-//! challenge, the strengthen key, KrbFastFinished). In the TGS,
+//! challenge, the strengthen key, KrbFastFinished) — and only with an armor
+//! may its server be the change-password service (`kadmin/changepw`), whose
+//! ticket keyd issues under that service's profile ([`AsServer`]; task K3b,
+//! docs/53 §5.2). In the TGS,
 //! [`Keyd::open_and_verify_tgt`] with a [`TgsFastRequest`] derives the
 //! implicit armor key from the PA-TGS-REQ subkey and the TGT session key,
 //! verifies the req-checksum over the AP-REQ and decrypts the KrbFastReq;
@@ -390,6 +393,7 @@ pub use keyd_types::{
     ServiceContext, ServiceCtxId, TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext,
     ThrottlePolicy, TicketPolicy, MAX_FX_COOKIE_LENGTH, TOKEN_ID_LENGTH,
 };
+pub use keyd_types::{AsServer, CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS};
 pub use keyd_types::{
     CeremonyState, DecidedOperation, DecisionId, DecisionIntent, DestructionPage,
     PendingDestruction, MAX_DECISION_APPROVERS, MAX_DESTROY_DECISIONS, MAX_DESTROY_DECISION_PAGE,

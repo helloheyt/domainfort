@@ -16,6 +16,7 @@
 //! types are carried as crypto-free identifiers ([`EncTypeId`]); keyd
 //! converts them to its crypto profile's type internally.
 
+use crate::as_exchange::CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS;
 use crate::enctype::{s2k_iteration_count, EncTypeId};
 use crate::error::ConfigError;
 use krb_proto::{Realm, TicketFlags};
@@ -93,6 +94,22 @@ pub struct TicketPolicy {
     /// Maximum renewable lifetime (renew-till - starttime). RFC 4120 §8.2:
     /// 1 week.
     pub max_renewable_lifetime_secs: u32,
+}
+
+impl TicketPolicy {
+    /// `true` if a change-password service ticket can be issued under this
+    /// policy: the realm's minimum lifetime is not above that ticket's
+    /// maximum ([`CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS`]). Below the
+    /// minimum a ticket is KDC_ERR_NEVER_VALID (RFC 4120 3.1.3), so a larger
+    /// minimum would refuse every AS for `kadmin/changepw`;
+    /// [`KeydConfig::validate`] refuses such a policy at start. The RFC 4120
+    /// §8.2 default minimum (5 minutes) equals the maximum.
+    /// Spec: RFC 4120 3.1.3, §8.2; docs/53 §5.2; docs/questions/Q-915 item 5
+    /// (A-151).
+    #[must_use]
+    pub const fn permits_change_password_ticket(&self) -> bool {
+        self.min_lifetime_secs <= CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS
+    }
 }
 
 impl Default for TicketPolicy {
@@ -231,10 +248,13 @@ impl KeydConfig {
         }
     }
 
-    /// Check every field; any inconsistency is refused (fail closed).
+    /// Check every field; any inconsistency is refused (fail closed) —
+    /// including a realm minimum ticket lifetime above the change-password
+    /// ticket's maximum ([`TicketPolicy::permits_change_password_ticket`],
+    /// task K3b).
     ///
     /// Spec: docs/10 §1 (only the listed enctypes), D33, D36; RFC 4120 §8.2,
-    /// 5.3; RFC 3962 §4.
+    /// 3.1.3, 5.3; RFC 3962 §4; docs/questions/Q-915 item 5 (A-151).
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.enctypes.is_empty() {
             return Err(ConfigError::EncTypes);
@@ -270,6 +290,12 @@ impl KeydConfig {
             || p.max_lifetime_secs > p.max_renewable_lifetime_secs
         {
             return Err(ConfigError::TicketLifetimes);
+        }
+        // Task K3b: a realm minimum above the change-password ticket's
+        // maximum would make every AS for `kadmin/changepw`
+        // KDC_ERR_NEVER_VALID (RFC 4120 3.1.3) — refused here, at start.
+        if !p.permits_change_password_ticket() {
+            return Err(ConfigError::ChangePasswordTicketLifetime);
         }
         if !CONFIGURABLE_TICKET_FLAGS.contains(p.allowed_flags) {
             return Err(ConfigError::TicketFlags);
@@ -356,6 +382,43 @@ mod tests {
     #[test]
     fn default_config_is_valid() {
         assert_eq!(base().validate(), Ok(()));
+    }
+
+    /// Task K3b (docs/questions/Q-915 item 5; RFC 4120 3.1.3: below the
+    /// site minimum a ticket is KDC_ERR_NEVER_VALID; §8.2: the default
+    /// minimum is 5 minutes): a realm minimum lifetime above the
+    /// change-password ticket's 300-second maximum is refused at start; 300
+    /// itself (the RFC default) and anything below are accepted.
+    #[test]
+    fn a_realm_minimum_above_the_change_password_maximum_is_refused() {
+        assert_eq!(CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS, 300);
+        assert_eq!(
+            TicketPolicy::default().min_lifetime_secs,
+            CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS
+        );
+        assert!(TicketPolicy::default().permits_change_password_ticket());
+        for (minimum, ok) in [
+            (1, true),
+            (60, true),
+            (300, true),
+            (301, false),
+            (3_600, false),
+        ] {
+            let mut c = base();
+            c.ticket_policy.min_lifetime_secs = minimum;
+            assert_eq!(c.ticket_policy.permits_change_password_ticket(), ok);
+            let expected = if ok {
+                Ok(())
+            } else {
+                Err(ConfigError::ChangePasswordTicketLifetime)
+            };
+            assert_eq!(c.validate(), expected, "{minimum}");
+        }
+        // The general lifetime rule is checked first (min > max).
+        let mut c = base();
+        c.ticket_policy.max_lifetime_secs = 200;
+        c.ticket_policy.min_lifetime_secs = 301;
+        assert_eq!(c.validate(), Err(ConfigError::TicketLifetimes));
     }
 
     /// docs/56 §7 P-24 / docs/53 §6.1 (Q-605 item 2): the minimum password

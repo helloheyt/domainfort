@@ -16,25 +16,25 @@
 //! [MS-KILE] 3.3.5.1.2 (no canonicalisation of `kadmin/changepw`); docs/53
 //! R53-1, R53-6, §5.2, §10 (the attack list); docs/48 §7.2; A-117, A-139,
 //! A-142 (no FAST exception for the AS to `kadmin/changepw`, ever);
-//! docs/research/r3-e R3E-2. All values hand-made; no vector or fixture
-//! from any other implementation.
+//! docs/research/r3-e R3E-2; task K3b (docs/questions/Q-915: keyd issues the
+//! ticket only armored and enforces the profile itself). All values
+//! hand-made; no vector or fixture from any other implementation.
 //!
-//! keyd's `issue_as_rep` takes the krbtgt key set only until keyd task K3b
-//! (docs/questions/Q-915): the armored AS for `kadmin/changepw` therefore
-//! reaches keyd with the KDC's half of the contract — recorded by the test
-//! custody (`issue_as_rep_calls`) and checked here — and keyd refuses it
-//! (fail closed). When K3b lands, `armored_user_as_hands_keyd_the_profile`
-//! becomes the full round trip (the ticket opened under the service key:
-//! INITIAL, PRE-AUTHENT, the endtime).
+//! The KDC's half of the contract — the server key set, the armor and the
+//! template it hands keyd — is recorded by the test custody
+//! (`issue_as_rep_calls`); keyd's half (task K3b) is checked on the ticket
+//! itself, opened by the client (the strengthened reply key) and by the
+//! service (its key, usage 2).
 
 mod common;
 
 use common::*;
-use kdc::{AccountKind, AuditReason};
+use kdc::{AccountKind, AuditOutcome, AuditReason};
+use keyd::KeyPurpose;
 use krb_proto::constants::{
     KDC_ERR_NEVER_VALID, KDC_ERR_POLICY, KDC_ERR_PREAUTH_REQUIRED, KDC_ERR_SERVICE_REVOKED,
-    KDC_ERR_S_PRINCIPAL_UNKNOWN, KRB_ERR_GENERIC, KRB_NT_PRINCIPAL, KRB_NT_SRV_INST, PA_FX_COOKIE,
-    PA_FX_FAST,
+    KDC_ERR_S_PRINCIPAL_UNKNOWN, KRB_AP_ERR_BAD_INTEGRITY, KRB_AP_ERR_NOT_US, KRB_ERR_GENERIC,
+    KRB_NT_PRINCIPAL, KRB_NT_SRV_INST, PA_FX_COOKIE, PA_FX_FAST,
 };
 use krb_proto::{MethodData, TicketFlags};
 use pdp::{
@@ -66,6 +66,27 @@ fn alice_for_change_password() -> AsReqSpec {
         sname: Some(change_password_name()),
         ..AsReqSpec::alice()
     }
+}
+
+/// The flags of every change-password ticket: INITIAL and PRE-AUTHENT, set
+/// by keyd, and nothing else (RFC 4120 2.1; docs/53 §5.2).
+fn profile_flags() -> TicketFlags {
+    TicketFlags::INITIAL.union(TicketFlags::PRE_AUTHENT)
+}
+
+/// The change-password service's key (aes256, the first configured
+/// enctype — the ticket is sealed under the service key's preferred type,
+/// RFC 4120 3.1.3).
+fn change_password_key() -> krb_crypto::ProtocolKey {
+    aes256(&CHANGEPW_KEY)
+}
+
+/// alice's change-password ticket through the KDC, opened by her (the
+/// armored AS-REP, RFC 6113 5.4.3).
+fn obtain_change_password_ticket(f: &mut Fixture, spec: AsReqSpec) -> Tgt {
+    let key = alice_key(AES256);
+    let fast = f.send_fast(&spec.with_challenge(&key));
+    open_fast_as_rep(&sent(fast.reply), &fast.armor_key, &key)
 }
 
 /// The METHOD-DATA padata types of an unarmored KRB-ERROR's e-data, each
@@ -147,18 +168,27 @@ fn unarmored_as_for_change_password_is_fast_required_for_every_client() {
 
 // ------------------------------------------------------ armored AS ----
 
-/// docs/53 §5.2 (the ticket only from an armored AS; keyd `issue_as_rep`
-/// with the ChangePasswordService key set; INITIAL and PRE-AUTHENT set by
-/// keyd; lifetime ≤ 300 s; no renewable / forwardable / proxiable); RFC
-/// 4120 3.1.3 (the server principal's maximum lifetime; the session-key
-/// type from the client's list and the service's); [MS-KILE] 3.3.5.1.2 and
-/// U7 (the requested sname, never canonicalised); A-117: alice's armored AS
-/// for `kadmin/changepw`, asking 8 hours, passes the PDP of a deployment and
+/// The full round trip (task K3b). docs/53 §5.2 (the ticket only from an
+/// armored AS; keyd `issue_as_rep` with the ChangePasswordService key set;
+/// INITIAL and PRE-AUTHENT set by keyd; lifetime ≤ 300 s; no renewable /
+/// forwardable / proxiable); RFC 4120 2.1 (INITIAL), 3.1.3 (the server
+/// principal's maximum lifetime; the session-key type from the client's
+/// list and the service's; the ticket sealed under "the encryption key
+/// extracted from the server principal's record"), 3.1.5 (the client checks
+/// sname / srealm and the nonce), 5.3 (usage 2); RFC 6113 5.4.3 (the
+/// strengthened reply key, KrbFastFinished); RFC 3244 §2 (the service
+/// principal `kadmin/changepw@REALM`); docs/53 §5.2 and U7 (the requested
+/// sname, never canonicalised); A-117; Q-915: alice's armored AS for
+/// `kadmin/changepw`, asking 8 hours, passes the PDP of a deployment and
 /// reaches keyd's `issue_as_rep` exactly once — armored, server = the
 /// change-password key set, template sname = the requested name, starting
 /// now, ending at now + 300 s, no flag requested, no renew-till, aes256 —
-/// after keyd verified her encrypted challenge. Until keyd task K3b
-/// (Q-915) keyd refuses that server key set: an armored KRB_ERR_GENERIC.
+/// after keyd verified her encrypted challenge; keyd issues: the AS-REP
+/// opens under her strengthened reply key, names `kadmin/changepw` in this
+/// realm, ends at now + 300 s with exactly INITIAL | PRE-AUTHENT; the
+/// ticket opens under the change-password service key (not under krbtgt)
+/// with the same facts and session key; both audits record the issuance —
+/// keyd's with the ChangePasswordService key set as the server.
 #[test]
 fn armored_user_as_hands_keyd_the_profile() {
     let mut f = deployment_setup().build();
@@ -190,11 +220,52 @@ fn armored_user_as_hands_keyd_the_profile() {
         ]
     );
 
-    // Pre-K3b keyd: the change-password key set is not a server it issues
-    // under — refused, armored (fail closed).
-    let error = open_fast_error(fast.reply, &fast.armor_key);
-    assert_eq!(error.outer.error_code, KRB_ERR_GENERIC);
-    assert_eq!(f.events()[0].reason, AuditReason::IssueDenied);
+    // keyd's half (task K3b): the reply, as alice opens it.
+    let issued = open_fast_as_rep(&sent(fast.reply), &fast.armor_key, &alice_key(AES256));
+    let rep = &issued.rep.0;
+    assert_eq!(rep.crealm, realm());
+    assert_eq!(rep.cname, alice_name());
+    assert_eq!(rep.ticket.realm, realm());
+    assert_eq!(rep.ticket.sname, change_password_name());
+    let part = &issued.part.0;
+    assert_eq!(part.nonce, spec.nonce);
+    assert_eq!(part.srealm, realm());
+    assert_eq!(part.sname, change_password_name());
+    assert_eq!(part.flags, profile_flags());
+    assert_eq!(part.authtime, now());
+    assert_eq!(part.starttime, None);
+    assert_eq!(part.endtime, at(300));
+    assert_eq!(part.renew_till, None);
+    assert_eq!(part.key.keytype, AES256);
+
+    // The ticket, as the service opens it: under its own key, never krbtgt.
+    assert_eq!(rep.ticket.enc_part.etype, AES256);
+    let ticket = open_ticket(&rep.ticket, &change_password_key());
+    assert_eq!(ticket.flags, profile_flags());
+    assert_eq!(ticket.crealm, realm());
+    assert_eq!(ticket.cname, alice_name());
+    assert_eq!(ticket.authtime, now());
+    assert_eq!(ticket.starttime, None);
+    assert_eq!(ticket.endtime, at(300));
+    assert_eq!(ticket.renew_till, None);
+    assert_eq!(ticket.caddr, None);
+    assert_eq!(ticket.key.keyvalue, part.key.keyvalue);
+    assert!(krb_crypto::decrypt(&krbtgt_key(), usage(2), &rep.ticket.enc_part.cipher).is_err());
+
+    // One audit event each.
+    assert_eq!(f.events().len(), 1);
+    assert_eq!(f.events()[0].outcome, AuditOutcome::Issued);
+    assert!(f.events()[0].armor.reply_armored);
+    let issue = f
+        .keyd_records()
+        .iter()
+        .find(|r| r.op == keyd::Operation::IssueAsRep)
+        .expect("keyd's issue record");
+    assert_eq!(issue.result, keyd::AuditOutcome::Success);
+    assert_eq!(issue.principal, Some(ALICE.principal));
+    let server = issue.secondary.expect("the server key set");
+    assert_eq!(server.principal, CHANGEPW.principal);
+    assert_eq!(server.purpose, KeyPurpose::ChangePasswordService);
 }
 
 /// RFC 4120 6.2 (the name-type is a hint) and [MS-KILE] 3.3.5.1.2 (no
@@ -246,10 +317,12 @@ fn only_the_exact_name_is_the_change_password_service() {
 /// minimum): with a realm policy that allows forwardable, proxiable and
 /// renewable tickets and the client asking for all of them and for the
 /// maximum life, the template still ends at now + 300 s with no flag and no
-/// renew-till; asking 10 or exactly 5 minutes → now + 300 s; asking 2
-/// minutes is below the realm's 5-minute minimum → KDC_ERR_NEVER_VALID,
-/// keyd not asked to issue. With a 1-minute realm minimum, 2 minutes asked
-/// → now + 120 s, and an account expiring at now + 200 s caps it there.
+/// renew-till — and the ticket keyd issues for it (task K3b) is INITIAL |
+/// PRE-AUTHENT only, ending at now + 300 s; asking 10 or exactly 5 minutes
+/// → now + 300 s; asking 2 minutes is below the realm's 5-minute minimum →
+/// KDC_ERR_NEVER_VALID, keyd not asked to issue. With a 1-minute realm
+/// minimum, 2 minutes asked → now + 120 s, and an account expiring at
+/// now + 200 s caps it there.
 #[test]
 fn lifetime_and_flags_follow_the_profile() {
     let generous = |min: u32| {
@@ -276,11 +349,20 @@ fn lifetime_and_flags_follow_the_profile() {
         rtime: Some(kt("20261120100000Z")),
         ..alice_for_change_password()
     };
-    let (_, template) = issued(&mut f, all);
+    let (fast, template) = issued(&mut f, all);
     let template = template.expect("keyd asked");
     assert_eq!(template.endtime, at(300));
     assert_eq!(template.flags, TicketFlags::empty());
     assert_eq!(template.renew_till, None);
+    // ... and the ticket keyd issued (task K3b): capped at now + 300 s, the
+    // asked-for flags dropped, only INITIAL | PRE-AUTHENT.
+    let key = alice_key(AES256);
+    let opened = open_fast_as_rep(&sent(fast.reply), &fast.armor_key, &key);
+    let ticket = open_ticket(&opened.rep.0.ticket, &change_password_key());
+    assert_eq!(ticket.flags, profile_flags());
+    assert_eq!(ticket.endtime, at(300));
+    assert_eq!(ticket.renew_till, None);
+    assert_eq!(opened.part.0.flags, profile_flags());
     for till in [at(600), at(300)] {
         let (_, template) = issued(
             &mut f,
@@ -511,19 +593,37 @@ fn tgs_for_change_password_is_refused() {
 }
 
 /// The change-password ticket is not a TGT (RFC 4120 3.3.2: the TGS uses a
-/// ticket "for the TGS"): a TGS-REQ presenting a ticket whose sname is
-/// `kadmin/changepw` is KRB_AP_ERR_NOT_US before keyd — the name never
-/// counts as this realm's TGS.
+/// ticket "for the TGS"; 5.3: a ticket is sealed in "the server's secret
+/// key"; task K3b, Q-915: the real ticket keyd issued). alice's own
+/// change-password ticket, from her armored AS, presented in a TGS-REQ with
+/// its session key: as issued (sname `kadmin/changepw`) it is
+/// KRB_AP_ERR_NOT_US before keyd — the name never counts as this realm's
+/// TGS; with the sname rewritten to `krbtgt/REALM` it reaches keyd, whose
+/// krbtgt key does not open it (it is sealed under the change-password
+/// service key) — KRB_AP_ERR_BAD_INTEGRITY (A-26), no TGS ticket issued.
 #[test]
 fn a_change_password_ticket_is_no_tgt() {
-    let mut f = Fixture::new();
-    let mut tgt = obtain_tgt(&mut f);
-    tgt.rep.0.ticket.sname = change_password_name();
+    let mut f = deployment_setup().build();
+    let issued = obtain_change_password_ticket(&mut f, alice_for_change_password());
+    let mut ticket = issued.rep.0.ticket.clone();
+    assert_eq!(ticket.sname, change_password_name());
+
     let before = f.keyd_records().len();
-    let (request, _) = TgsReqSpec::service().encode(&tgt);
-    assert_eq!(
-        code_of(f.send(&request)),
-        krb_proto::constants::KRB_AP_ERR_NOT_US
-    );
-    assert_eq!(f.keyd_records().len(), before);
+    let (request, _) = TgsReqSpec::service().encode_with_ticket(&ticket, &issued.session);
+    assert_eq!(code_of(f.send(&request)), KRB_AP_ERR_NOT_US);
+    assert_eq!(f.keyd_records().len(), before, "keyd is not asked");
+
+    ticket.sname = krbtgt_name();
+    let mut spec = TgsReqSpec::service();
+    spec.cusec += 1;
+    let (request, _) = spec.encode_with_ticket(&ticket, &issued.session);
+    assert_eq!(code_of(f.send(&request)), KRB_AP_ERR_BAD_INTEGRITY);
+    let opened = f
+        .keyd_records()
+        .iter()
+        .rev()
+        .find(|r| r.op == keyd::Operation::OpenAndVerifyTgt)
+        .expect("keyd tried the krbtgt key");
+    assert_eq!(opened.result, keyd::AuditOutcome::Denied);
+    assert!(!f.keyd_ops().contains(&keyd::Operation::IssueTgsRep));
 }

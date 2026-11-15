@@ -132,12 +132,13 @@
 //!   RFC 4120 7.5.9 codes (docs/questions/Q-070, accepted as A-27); the
 //!   TGS for `kadmin/changepw` (KDC_ERR_POLICY) and the armored AS for it
 //!   by a computer (KDC_ERR_POLICY) follow docs/53 §5.2 (task K5).
-//! - **The `kadmin/changepw` ticket before keyd task K3b:** keyd's
-//!   `issue_as_rep` accepts only the krbtgt key set as the server today, so
-//!   the AS for the change-password service ends in keyd's refusal
-//!   (KRB_ERR_GENERIC, armored) — fail closed — until keyd takes that
-//!   service's key set and enforces the profile itself
-//!   (docs/questions/Q-915).
+//! - **The `kadmin/changepw` ticket, two layers:** the KDC plans the
+//!   ticket profile (endtime ≤ start + keyd-types'
+//!   `CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS`, no renew / forward / proxy)
+//!   and can express the request only on the armored path; keyd (task K3b,
+//!   docs/questions/Q-915) issues it only armored and refuses any template
+//!   outside the profile (KRB_ERR_GENERIC, armored, if the KDC ever sent
+//!   one) — so the profile holds even against a KDC that asks otherwise.
 //! - **Retransmit cache:** a full cache stores nothing more; an identical
 //!   TGS-REQ retransmitted then is refused by keyd's replay cache (fail
 //!   closed). An identical request within the window (keyd's clock skew)

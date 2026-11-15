@@ -10,38 +10,52 @@
 //!
 //! `issue_as_rep` builds the EncTicketPart and EncASRepPart itself from a
 //! validated template, draws the session key from the entropy source, seals
-//! the ticket under the CURRENT krbtgt key and the reply under the client key
-//! that pre-authenticated — or, under FAST, under the reply key strengthened
-//! with a fresh strengthen key — and returns only sealed blobs: the session
-//! key, the strengthen key and the reply key never leave keyd (docs/10 §4
-//! steps 1-7; docs/48 §2.2, §4.3).
+//! the ticket under the CURRENT key of the server key set and the reply under
+//! the client key that pre-authenticated — or, under FAST, under the reply
+//! key strengthened with a fresh strengthen key — and returns only sealed
+//! blobs: the session key, the strengthen key and the reply key never leave
+//! keyd (docs/10 §4 steps 1-7; docs/48 §2.2, §4.3).
+//!
+//! The server is one of a closed set ([`AsServer`], task K3b): this realm's
+//! TGS (a TGT, armored or not) or the change-password service
+//! `kadmin/changepw` — only under FAST armor, and only under that service's
+//! ticket profile, which keyd enforces whatever the KDC asks (INITIAL and
+//! PRE-AUTHENT set by keyd, endtime ≤ authtime + 300 s, no other flag, no
+//! starttime, no renew-till). An unarmored change-password issuance has no
+//! value inside keyd (`AsIssuance`); the capability table refuses the
+//! service's key set in the unarmored server slot before that (docs/53 §5.2;
+//! A-142 — the KDC's type is the first layer, this the second).
 //!
 //! Phase 1 issues no PAC (MS-PAC / NDR is phase 2, where D124 applies):
 //! tickets carry no authorization-data. Tickets are addressless (no caddr;
 //! RFC 4120 5.3 recommends allowing addressless tickets). The transited
 //! field is empty (local authentication, RFC 4120 3.3.3.2).
 //!
-//! Spec: RFC 4120 3.1.2, 3.1.3, 5.2.7.2, 5.3, 5.4.2, 7.3, 7.5.1; RFC 6113
-//! 5.1, 5.4, 5.4.3, 5.4.6, 6.2, 8; docs/10 §4, §8; docs/30 §2; docs/48 §2.3,
-//! §4.
+//! Spec: RFC 4120 2.1, 3.1.2, 3.1.3, 5.2.7.2, 5.3, 5.4.2, 7.3, 7.5.1; RFC
+//! 6113 5.1, 5.4, 5.4.3, 5.4.6, 6.2, 8; RFC 3244 §2; docs/10 §4, §8; docs/30
+//! §2; docs/48 §2.3, §4; docs/53 R53-6, §5.2; docs/questions/Q-915 (A-151).
 
 use crate::audit::{AuditKeyRef, AuditReason, AuditSink};
-use crate::authz::{CallerId, HandleSlot, Operation};
+use crate::authz::{as_server_slot, CallerId, HandleSlot, Operation};
 use crate::chain::{self, ChainClass, ChainVerified};
 use crate::enctype::to_crypto;
 use crate::entropy::EntropySource;
 use crate::error::{AuthnError, Deny, Internal, IssueError};
 use crate::keyd::{draw, new_random_key, seal, AuditFields, Keyd};
-use crate::model::{KeyHandle, KeyPurpose, Kvno, PrincipalId};
+use crate::model::{KeyHandle, Kvno, PrincipalId};
 use crate::store::{KeyStore, KeyVersion, UnboundUse};
-use crate::template::{as_ticket_flags, check_times, tgs_name, TemplateTimes};
+use crate::template::{
+    as_ticket_flags, change_password_ticket, check_times, tgs_name, TemplateTimes,
+};
 use crate::throttle::SecretThrottle;
 use crate::time::{kerberos_time_seconds, within_skew};
 use crate::tokens::{ArmorId, ExchangeId, TokenRefusal, TOKEN_ID_LENGTH};
 use crate::usage::{
     AS_REP_ENC_PART, AS_REQ_PA_ENC_TIMESTAMP, KEY_USAGE_ENC_CHALLENGE_CLIENT, TICKET_ENC_PART,
 };
-use keyd_types::{AsRepParts, AsTicketTemplate, AuthnProof};
+use keyd_types::{
+    is_change_password_service_name, AsRepParts, AsServer, AsTicketTemplate, AuthnProof,
+};
 use krb_crypto::{EncType, ProtocolKey};
 use krb_proto::constants::{DOMAIN_X500_COMPRESS, PA_ENCRYPTED_CHALLENGE, PA_ENC_TIMESTAMP};
 use krb_proto::{
@@ -82,6 +96,54 @@ impl ProofEntry {
     /// Spec: docs/10 §8, §12 I4; docs/questions/Q-115 (A-35).
     pub(crate) fn principal(&self) -> PrincipalId {
         self.principal
+    }
+}
+
+/// What one `issue_as_rep` issues: the closed server slot ([`AsServer`])
+/// joined with the issuance's armor. Built only by [`AsIssuance::of`], after
+/// the capability table admitted the server key set in the slot of its
+/// armoring — and the change-password variant holds its armor, not an
+/// `Option` of one: inside keyd an unarmored change-password issuance is
+/// not a value (task K3b; the second layer of A-142 — the KDC's
+/// `ArmoredServer` is the first).
+/// Spec: docs/53 §5.2; docs/questions/Q-915 items 1, 3 (A-151); A-142;
+/// docs/52 C24.
+enum AsIssuance {
+    /// A TGT of this realm, armored or not (docs/48 §7.3: the unarmored
+    /// computer bootstrap).
+    LocalTgt {
+        /// The armor of an armored issuance.
+        armor: Option<[u8; TOKEN_ID_LENGTH]>,
+    },
+    /// A ticket for the change-password service, under its profile.
+    ChangePasswordService {
+        /// The armor of this issuance (never absent).
+        armor: [u8; TOKEN_ID_LENGTH],
+    },
+}
+
+impl AsIssuance {
+    /// The issuance for `server` with `armor`: the one classification
+    /// ([`AsServer::of`]) — anything else is `Denied` (`PurposeMismatch`,
+    /// as the capability table already decided in `admit`).
+    /// Spec: docs/53 §5.2; docs/questions/Q-915 items 1, 3.
+    fn of(server: &KeyHandle, armor: Option<ArmorId>) -> Internal<AsIssuance> {
+        let armor = armor.map(|armor_id| *armor_id.as_bytes());
+        match (AsServer::of(server.purpose, armor.is_some()), armor) {
+            (Some(AsServer::LocalTgt), armor) => Ok(AsIssuance::LocalTgt { armor }),
+            (Some(AsServer::ChangePasswordService), Some(armor)) => {
+                Ok(AsIssuance::ChangePasswordService { armor })
+            }
+            _ => Err(Deny::denied(AuditReason::PurposeMismatch)),
+        }
+    }
+
+    /// The armor of this issuance, if armored.
+    fn armor(&self) -> Option<&[u8; TOKEN_ID_LENGTH]> {
+        match self {
+            AsIssuance::LocalTgt { armor } => armor.as_ref(),
+            AsIssuance::ChangePasswordService { armor } => Some(armor),
+        }
     }
 }
 
@@ -405,25 +467,41 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         })
     }
 
-    /// `issue_as_rep`: consume `proof` and issue a TGT — armored when
-    /// `armor` is `Some`.
+    /// `issue_as_rep`: consume `proof` and issue an AS ticket for `server` —
+    /// armored when `armor` is `Some`. `server` is one of a closed set
+    /// ([`AsServer`]): this realm's krbtgt key set (a TGT, armored or not), or
+    /// — armored only — the change-password service's key set (a ticket for
+    /// `kadmin/changepw`, under that service's profile).
     ///
-    /// 1. authorize and admit (Kdc; client handle PrincipalLongterm, krbtgt handle
-    ///    Krbtgt);
+    /// 1. authorize and admit (Kdc; client handle PrincipalLongterm; server
+    ///    handle in the server slot of its armoring — `as_server_slot`:
+    ///    unarmored Krbtgt only, armored Krbtgt or ChangePasswordService —
+    ///    `Denied` / `PurposeMismatch` otherwise, the proof untouched); the
+    ///    issuance is then one of `AsIssuance` — a change-password one
+    ///    always holds its armor;
     /// 2. consume the proof: live, issued to this caller, bound to this
     ///    client (`Denied` otherwise — the proof is destroyed either way);
-    ///    and the proof's armor is `armor` — None↔None, Some(a)↔Some(a)
-    ///    (`Denied`, docs/48 §2.3);
-    /// 3. validate the template (`BadTemplate`): realm, TGS sname, enctype
-    ///    configured, flags in the allowed mask, times within policy;
+    ///    and the proof's armor is the issuance's — None↔None,
+    ///    Some(a)↔Some(a) (`Denied`, docs/48 §2.3) — so a change-password
+    ///    ticket is issued only on an encrypted challenge verified under the
+    ///    same armor;
+    /// 3. validate the template (`BadTemplate`): realm; sname — this realm's
+    ///    TGS name for a TGT, `kadmin/changepw` (any name-type) for the
+    ///    change-password service; enctype configured; for a TGT, flags in
+    ///    the allowed mask and times within policy (`check_times`); for the
+    ///    change-password service, its profile
+    ///    (`template::change_password_ticket`: no flag, no starttime, no
+    ///    renew-till, the realm's time rules, endtime ≤ authtime + 300 s);
     ///    armored: the armor is live, this caller's and bound to this proof,
     ///    and the template's crealm / cname / nonce are the stored inner
     ///    request's (`Denied`, docs/48 §3.4); then the name bindings
     ///    (`Denied`): crealm/cname must identify the client key set's bound
-    ///    name, and the krbtgt key set must be bound to krbtgt/realm =
-    ///    template sname (Q-040, A-19; RFC 4120 6.2, 7.3);
+    ///    name, and the server key set must be bound to the template's sname
+    ///    (Q-040, A-19; RFC 4120 6.2, 7.3);
     /// 4. draw a fresh session key;
-    /// 5. EncTicketPart sealed under the CURRENT krbtgt key, usage 2;
+    /// 5. EncTicketPart sealed under the CURRENT key of the server key set,
+    ///    usage 2 (the flags: the TGT's requested ones, or for the
+    ///    change-password service exactly INITIAL | PRE-AUTHENT);
     /// 6. EncASRepPart, usage 3, with the client kvno, sealed under the
     ///    client key that pre-authenticated (still the current version) —
     ///    or, armored, under the reply key strengthened with a fresh
@@ -440,14 +518,17 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// is destroyed.
     ///
     /// Spec: docs/10 §4 (issue_as_rep, steps 1-7), §8; docs/48 §2.3, §3.4,
-    /// §4.3, §4.4; RFC 4120 3.1.3, 5.3, 5.4.2 (key usage 3; client kvno
-    /// included), 7.5.1 (usages 2, 3); RFC 6113 5.4.2, 5.4.3, 5.4.6.
+    /// §4.3, §4.4; RFC 4120 2.1, 3.1.3 (the ticket sealed with "the
+    /// encryption key extracted from the server principal's record"), 5.3,
+    /// 5.4.2 (key usage 3; client kvno included), 7.5.1 (usages 2, 3); RFC
+    /// 6113 5.4, 5.4.2, 5.4.3, 5.4.6; RFC 3244 §2; docs/53 R53-6, §5.2;
+    /// docs/questions/Q-915 items 1, 3, 4 (A-151); A-142.
     #[allow(clippy::too_many_arguments)]
     pub fn issue_as_rep(
         &mut self,
         caller: &CallerId,
         client: &KeyHandle,
-        krbtgt: &KeyHandle,
+        server: &KeyHandle,
         proof: &AuthnProof,
         armor: Option<ArmorId>,
         template: &AsTicketTemplate,
@@ -457,7 +538,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         let result = self.issue_as_rep_inner(
             caller,
             client,
-            krbtgt,
+            server,
             proof,
             armor,
             template,
@@ -473,19 +554,25 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         &mut self,
         caller: &CallerId,
         client: &KeyHandle,
-        krbtgt: &KeyHandle,
+        server: &KeyHandle,
         proof: &AuthnProof,
         armor: Option<ArmorId>,
         template: &AsTicketTemplate,
         now: &KerberosTime,
         fields: &mut AuditFields,
     ) -> Internal<AsRepParts> {
+        // The closed server slot: the slot of this issuance's armoring
+        // (Q-915 items 1, 3; pinned in keyd-types authz.rs).
         self.admit(
             caller,
             Operation::IssueAsRep,
-            &[(HandleSlot::Primary, client), (HandleSlot::Krbtgt, krbtgt)],
+            &[
+                (HandleSlot::Primary, client),
+                (as_server_slot(armor.is_some()), server),
+            ],
             now,
         )?;
+        let issuance = AsIssuance::of(server, armor)?;
         let now_s = kerberos_time_seconds(now);
 
         // Step 1: the proof (I4).
@@ -502,33 +589,55 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         }
         // The proof and the armor are one conversation: None↔None,
         // Some(a)↔Some(a). Spec: docs/48 §2.3, §9.2 item 8.
-        let armor = armor.map(|armor_id| *armor_id.as_bytes());
+        let armor = issuance.armor().copied();
         if entry.armor != armor {
             return Err(Deny::denied(AuditReason::ArmorProofMismatch));
         }
 
-        // Step 2: the template.
+        // Step 2: the template — the server's name, then its rules.
         let realm = &self.config.realm;
-        if template.crealm != *realm || template.sname != tgs_name(realm) {
+        let sname_fits = match issuance {
+            AsIssuance::LocalTgt { .. } => template.sname == tgs_name(realm),
+            AsIssuance::ChangePasswordService { .. } => {
+                is_change_password_service_name(&template.sname)
+            }
+        };
+        if template.crealm != *realm || !sname_fits {
             return Err(Deny::bad_template(AuditReason::TemplateNames));
         }
         if !self.config.enctypes.contains(&template.session_enctype) {
             return Err(Deny::bad_template(AuditReason::TemplateEncType));
         }
         let policy = &self.config.ticket_policy;
-        let flags = as_ticket_flags(policy, template.flags)?;
-        check_times(
-            policy,
-            self.config.clock_skew_secs,
-            now_s,
-            &entry.authtime,
-            &TemplateTimes {
-                starttime: template.starttime.as_ref(),
-                endtime: &template.endtime,
-                renew_till: template.renew_till.as_ref(),
-                renewable: template.flags.contains(TicketFlags::RENEWABLE),
-            },
-        )?;
+        let times = TemplateTimes {
+            starttime: template.starttime.as_ref(),
+            endtime: &template.endtime,
+            renew_till: template.renew_till.as_ref(),
+            renewable: template.flags.contains(TicketFlags::RENEWABLE),
+        };
+        let flags = match issuance {
+            AsIssuance::LocalTgt { .. } => {
+                let flags = as_ticket_flags(policy, template.flags)?;
+                check_times(
+                    policy,
+                    self.config.clock_skew_secs,
+                    now_s,
+                    &entry.authtime,
+                    &times,
+                )?;
+                flags
+            }
+            // The service's profile, whatever the KDC asked (docs/53 §5.2;
+            // Q-915 item 4).
+            AsIssuance::ChangePasswordService { .. } => change_password_ticket(
+                policy,
+                self.config.clock_skew_secs,
+                now_s,
+                &entry.authtime,
+                &times,
+                template.flags,
+            )?,
+        };
         // Armored: the armor is live, this caller's and bound to this proof,
         // and the template answers the inner request (crealm, cname, nonce).
         // Not consumed yet — a refusal leaves it for the armored error.
@@ -563,20 +672,22 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         let client_key = client_version
             .key_for(entry.reply_enctype)
             .ok_or(Deny::denied(AuditReason::KeyNotFound))?;
-        let tgs_set = self
+        let server_set = self
             .store
-            .get(krbtgt)
+            .get(server)
             .ok_or(Deny::denied(AuditReason::KeyNotFound))?;
         fields.secondary = Some(AuditKeyRef {
-            principal: krbtgt.principal,
-            purpose: KeyPurpose::Krbtgt,
-            kvno: Some(tgs_set.current_kvno()),
+            principal: server.principal,
+            purpose: server.purpose,
+            kvno: Some(server_set.current_kvno()),
         });
-        // The krbtgt key must be bound to the ticket's sname — which step 2
-        // found equal to this realm's TGS name (RFC 4120 7.3), so the key is
-        // bound to krbtgt/realm.
-        let tgs_version = tgs_set.bound_to(realm, &template.sname)?.current();
-        let tgs_key = tgs_version
+        // The server key must be bound to the ticket's sname — which step 2
+        // found to be this realm's TGS name (RFC 4120 7.3) or
+        // `kadmin/changepw` (RFC 3244 §2); keyd's creation rule binds a
+        // Krbtgt key set only to a TGS name and a ChangePasswordService key
+        // set only to `kadmin/changepw` (template::check_new_binding).
+        let server_version = server_set.bound_to(realm, &template.sname)?.current();
+        let server_key = server_version
             .preferred()
             .ok_or(Deny::denied(AuditReason::KeyNotFound))?;
 
@@ -588,7 +699,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         };
         drop(session);
 
-        // Step 5: EncTicketPart under krbtgt (usage 2).
+        // Step 5: EncTicketPart under the server key (usage 2).
         let enc_ticket_part = EncTicketPart {
             flags,
             key: session_key.clone(),
@@ -611,14 +722,19 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             .encode()
             .map_err(|_| Deny::unavailable(AuditReason::InternalFailure))?;
         drop(enc_ticket_part);
-        let ticket_cipher = seal(&mut self.entropy, tgs_key, TICKET_ENC_PART, &ticket_plain)?;
+        let ticket_cipher = seal(
+            &mut self.entropy,
+            server_key,
+            TICKET_ENC_PART,
+            &ticket_plain,
+        )?;
         drop(ticket_plain);
         let ticket = Ticket {
             realm: realm.clone(),
             sname: template.sname.clone(),
             enc_part: EncryptedData {
-                etype: tgs_key.enc_type().number(),
-                kvno: Some(tgs_version.kvno().get()),
+                etype: server_key.enc_type().number(),
+                kvno: Some(server_version.kvno().get()),
                 cipher: ticket_cipher,
             },
         };

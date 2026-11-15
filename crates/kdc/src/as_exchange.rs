@@ -145,9 +145,7 @@ use crate::kdc::{
     time_refusal, Kdc, Refusal, Scope,
 };
 use crate::krb_error::{advertise, etype_info2, fast_required_e_data, preauth_required_e_data};
-use crate::lifetime::{
-    check_starttime, plan, LifetimeRequest, Limits, CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS,
-};
+use crate::lifetime::{check_starttime, plan, LifetimeRequest, Limits};
 use crate::names::{classify_server, same_realm, ServerNameKind};
 use crate::options::{asks_unsupported_operation, delegation_flags, FlagRequests};
 use crate::time::seconds;
@@ -155,7 +153,7 @@ use crate::transport::Peer;
 use core::time::Duration;
 use keyd_types::{
     ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof, EncTypeId, KeyCustody,
-    KeyPurpose,
+    KeyPurpose, CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS,
 };
 use krb_proto::constants::{
     FX_FAST_ARMOR_AP_REQUEST, KDC_ERR_BADOPTION, KDC_ERR_CLIENT_REVOKED,
@@ -968,7 +966,9 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
         )
         .map_err(|reason| Refusal::new(KDC_ERR_POLICY, reason))?;
 
-        // The profile: one more endtime cap, no renewal (docs/53 §5.2).
+        // The profile: one more endtime cap, no renewal (docs/53 §5.2). The
+        // cap is keyd-types' one definition, the value keyd enforces in
+        // `issue_as_rep` (docs/questions/Q-915 item 2).
         let mut end_caps = vec![seconds(now) + i64::from(CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS)];
         end_caps.extend(
             account

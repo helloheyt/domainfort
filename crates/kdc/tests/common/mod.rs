@@ -555,7 +555,7 @@ impl KeyCustody for TestCustody {
     fn issue_as_rep(
         &mut self,
         client: &KeyHandle,
-        krbtgt: &KeyHandle,
+        server: &KeyHandle,
         proof: &keyd::AuthnProof,
         armor: Option<keyd::ArmorId>,
         template: &keyd::AsTicketTemplate,
@@ -563,7 +563,7 @@ impl KeyCustody for TestCustody {
     ) -> Result<keyd::AsRepParts, keyd::IssueError> {
         self.issue_as_rep_calls.push(IssueAsRepCall {
             client: *client,
-            server: *krbtgt,
+            server: *server,
             armored: armor.is_some(),
             template: template.clone(),
         });
@@ -571,7 +571,7 @@ impl KeyCustody for TestCustody {
             return Err(keyd::IssueError::Unavailable);
         }
         self.inner
-            .issue_as_rep(client, krbtgt, proof, armor, template, now)
+            .issue_as_rep(client, server, proof, armor, template, now)
     }
     fn open_fast_armor(
         &mut self,

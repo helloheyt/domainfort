@@ -34,23 +34,6 @@ use crate::time::{from_seconds, seconds, till_maximum};
 use keyd_types::TicketPolicy;
 use krb_proto::KerberosTime;
 
-/// The longest life, in seconds, of a ticket for the change-password service
-/// (`kadmin/changepw`): 300 — the project's choice for that service's ticket
-/// profile (any value at least the round trip works; shorter is a smaller
-/// window for a stolen INITIAL ticket). It is a server-principal limit in the
-/// sense of RFC 4120 3.1.3 ("The ticket's starttime plus the maximum
-/// allowable lifetime associated with the server principal"), applied as one
-/// more endtime cap; the realm's minimum lifetime still applies
-/// (KDC_ERR_NEVER_VALID below it).
-///
-/// keyd owns the profile and enforces it in `issue_as_rep` (docs/53 §5.2);
-/// until keyd-types exposes the value, the KDC plans with this copy —
-/// docs/questions/Q-915 item 2 asks for the one definition.
-///
-/// Spec: docs/53 R53-6, §5.2 ("lifetime ≤ 300 s"); docs/questions/Q-601
-/// item 3; A-117 ("INITIAL, ≤300 s"); RFC 4120 3.1.3.
-pub(crate) const CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS: u32 = 300;
-
 /// What the client asked for. Spec: RFC 4120 5.4.1 (from, till, rtime).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LifetimeRequest<'a> {

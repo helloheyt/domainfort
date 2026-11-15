@@ -88,14 +88,14 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> KeyCustody for LocalKeyd<S, A,
     fn issue_as_rep(
         &mut self,
         client: &KeyHandle,
-        krbtgt: &KeyHandle,
+        server: &KeyHandle,
         proof: &AuthnProof,
         armor: Option<ArmorId>,
         template: &AsTicketTemplate,
         now: &KerberosTime,
     ) -> Result<AsRepParts, IssueError> {
         self.keyd
-            .issue_as_rep(&self.caller, client, krbtgt, proof, armor, template, now)
+            .issue_as_rep(&self.caller, client, server, proof, armor, template, now)
     }
 
     fn open_fast_armor(

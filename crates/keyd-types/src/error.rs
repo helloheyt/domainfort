@@ -157,6 +157,11 @@ pub enum ConfigError {
     /// floor (P-24) or above the maximum password length ([MS-SAMR]
     /// 3.1.1.7.2 item 2). Task K3; docs/53 §6.1; Q-605 item 2.
     PasswordPolicy,
+    /// The realm's minimum ticket lifetime is above the change-password
+    /// ticket's maximum (`CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS`, 300 s):
+    /// every AS for `kadmin/changepw` would be KDC_ERR_NEVER_VALID (RFC 4120
+    /// 3.1.3). Task K3b; docs/53 §5.2; docs/questions/Q-915 item 5.
+    ChangePasswordTicketLifetime,
 }
 
 macro_rules! impl_display {
@@ -199,4 +204,6 @@ impl_display!(ConfigError,
     ConfigError::Throttle => "invalid throttle policy",
     ConfigError::CustodyRole => "key custody caller is not the Kdc role",
     ConfigError::PasswordPolicy => "invalid minimum password length",
+    ConfigError::ChangePasswordTicketLifetime =>
+        "minimum ticket lifetime exceeds the change-password ticket maximum",
 );

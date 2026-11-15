@@ -2,10 +2,12 @@
 //! `open_change_password_request`, `complete_change_password`,
 //! `seal_change_password_error` — Role::Ldap (dird) only.
 //!
-//! The tests play three parts: the KDC (the AS issuance of a
-//! `kadmin/changepw` ticket is task K5, so the tests seal the ticket
-//! themselves under the change-password service key they scripted into
-//! `create_key`), the Kerberos client (the AP-REQ with a subkey and a
+//! The tests play three parts: the KDC (most tests seal the
+//! `kadmin/changepw` ticket themselves under the change-password service key
+//! they scripted into `create_key`, so that a test can make a ticket keyd
+//! would never issue; the last section — task K3b — has keyd's armored AS
+//! issue it, under the service's profile), the Kerberos client (the AP-REQ
+//! with a subkey and a
 //! sequence number, the KRB-PRIV under the subkey with key usage 13, and the
 //! opening of keyd's AP-REP — usage 12 under the session key — and reply
 //! KRB-PRIV), and dird (the `ChangePassword` decision, then the completion or
@@ -16,26 +18,30 @@
 //! from the RFC 5737 documentation range); no vector comes from any other
 //! implementation.
 //!
-//! Sources: RFC 3244 §2 (pinned, read in full); RFC 4120 §2.1, §3.2.3,
-//! §3.2.4, §3.2.5, §3.5.1, §3.5.2, §5.5.1, §5.5.2, §5.7.1, §7.1, §7.5.1
+//! Sources: RFC 3244 §2 (pinned, read in full); RFC 4120 §2.1, §3.1.3,
+//! §3.1.5, §3.2.3, §3.2.4, §3.2.5, §3.5.1, §3.5.2, §5.3, §5.5.1, §5.5.2,
+//! §5.7.1, §7.1, §7.5.1, §8.2 (pinned); RFC 6113 §5.4, §5.4.3, §5.4.6
 //! (pinned); RFC 3962 §7; RFC 8009 §7; [MS-SAMR] 3.1.1.7.2 (as applied by
-//! crate admin-password-policy); docs/53 §2.4, §4.3-§4.5, §5.3-§5.8, §6, §8,
-//! §10; docs/questions/Q-601, Q-603, Q-604, Q-605, Q-620, Q-662.
+//! crate admin-password-policy); docs/53 §2.4, §4.3-§4.5, §5.2-§5.8, §6, §8,
+//! §10; docs/questions/Q-601, Q-603, Q-604, Q-605, Q-620, Q-662, Q-915.
 
 mod common;
 
 use common::*;
 use keyd::{
-    AuditOutcome, AuditReason, AuthnError, ChangePasswordContext, ChangePasswordCtxId,
-    ChangePasswordVerdict, DecidedOperation, EncTypeId, Error, HostAddr, KeyHandle, KeyPurpose,
-    Kvno, Operation, SealedReply, SetSecretTarget, ADDRESS_TYPE_DIRECTIONAL,
+    AsRepParts, AsServer, AsTicketTemplate, AuditOutcome, AuditReason, AuthnError, AuthnProof,
+    ChangePasswordContext, ChangePasswordCtxId, ChangePasswordVerdict, ConfigError,
+    DecidedOperation, EncTypeId, Error, FastArmor, HostAddr, InMemoryKeyStore, IssueError,
+    KeyHandle, KeyPurpose, Keyd, KeydConfig, Kvno, Operation, SealedReply, SetSecretTarget,
+    ADDRESS_TYPE_DIRECTIONAL, CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS,
 };
 use krb_crypto::{EncType, ProtocolKey};
-use krb_proto::constants::DOMAIN_X500_COMPRESS;
+use krb_proto::constants::{DOMAIN_X500_COMPRESS, PA_ENCRYPTED_CHALLENGE};
 use krb_proto::{
-    ApOptions, ApReq, Authenticator, ChangePasswdData, Checksum, EncApRepPart, EncKrbPrivPart,
-    EncTicketPart, EncryptedData, EncryptionKey, HostAddress, KerberosTime, KeyValue, KrbPriv,
-    Microseconds, NewPasswd, NonZeroResultCode, PrincipalName, ResultCode, Ticket, TicketFlags,
+    ApOptions, ApReq, Authenticator, ChangePasswdData, Checksum, EncApRepPart, EncAsRepPart,
+    EncKrbPrivPart, EncTicketPart, EncryptedData, EncryptionKey, FastOptions, HostAddress,
+    KerberosTime, KeyValue, KrbFastReq, KrbFastResponse, KrbPriv, Microseconds, NewPasswd,
+    NonZeroResultCode, PaData, PaEncTsEnc, PrincipalName, ResultCode, Ticket, TicketFlags,
     TransitedEncoding, UserData,
 };
 use zeroize::Zeroizing;
@@ -1313,4 +1319,593 @@ fn an_unknown_context_is_refused() {
     );
     assert_eq!(last(&f).reason, AuditReason::TokenUnknown);
     assert!(f.password_works(&ALICE, ALICE_PASSWORD, ALICE_SALT));
+}
+
+// ---------------------------------------------------------------------------
+// Task K3b: keyd's AS issues the ticket — armored only, under the profile.
+//
+// The test is the KDC (opening the armor, verifying the encrypted challenge,
+// asking keyd to issue) and the client (the armor AP-REQ, the encrypted
+// challenge, opening the armored reply). The derivations follow RFC 6113
+// 5.4.1.1 (the armor key), 5.4.6 (the challenge key, usage 54) and 5.4.3
+// (the strengthened reply key); no RFC gives a vector for them (the
+// cryptography is krb-crypto's, verified against RFC 3962 / RFC 8009).
+// Sources: docs/53 §5.2; docs/questions/Q-915 (A-151); A-142; RFC 4120 2.1,
+// 3.1.3, 3.1.5, 5.3, §8.2; RFC 3244 §2.
+// ---------------------------------------------------------------------------
+
+/// The subkey of the computer's armor AP-REQ (RFC 6113 5.4.1.1: "MUST be
+/// present"), made up for these tests.
+const ARMOR_SUBKEY: [u8; 32] = [0x2D; 32];
+/// The nonce of alice's inner AS request (RFC 4120 5.4.1), made up.
+const AS_NONCE: u32 = 0x4B33_0001;
+
+/// keyd (aes256 only, `config` otherwise) with the change-password service
+/// key set, the computer account and its TGT — the armor ticket (D126,
+/// docs/48 §3.1) — audit cleared.
+fn as_fixture_with(config: KeydConfig) -> (Fixture, Tgt) {
+    let mut f = Fixture::with_config(config);
+    add_change_password_service(&mut f);
+    add_computer(&mut f);
+    let tgt = obtain_computer_tgt(&mut f, now(), kt("20261113180000Z"));
+    f.keyd.audit_sink_mut().records.clear();
+    (f, tgt)
+}
+
+fn as_fixture() -> (Fixture, Tgt) {
+    as_fixture_with(config())
+}
+
+/// One armored conversation: keyd opened the armor of alice's inner AS
+/// request for `kadmin/changepw`; `armor_key` is the client's own
+/// derivation of the armor key.
+struct Conversation {
+    armor: FastArmor,
+    armor_key: ProtocolKey,
+}
+
+/// Open a conversation (the armor authenticator made unique by `cusec`):
+/// the inner request names alice and `kadmin/changepw`; the req-checksum
+/// covers the outer body's octets (RFC 6113 5.4.2).
+fn open_conversation(f: &mut Fixture, tgt: &Tgt, cusec: u32) -> Conversation {
+    let ap = ap_req(
+        &tgt.parts.ticket,
+        armor_authenticator(
+            &tgt.session,
+            &ArmorAuthSpec::new(now(), cusec, ARMOR_SUBKEY),
+        ),
+    );
+    let armor_key = client_armor_key(&ARMOR_SUBKEY, &tgt.session);
+    let (mut inner_body, _) = as_req_body(AS_NONCE);
+    inner_body.sname = Some(change_password_service_name());
+    let inner = KrbFastReq {
+        fast_options: FastOptions::empty(),
+        padata: Vec::new(),
+        req_body: inner_body,
+    };
+    let (_, outer) = as_req_body(AS_NONCE);
+    let req = armored_req(&ap, &armor_key, &outer, &inner);
+    let armor = f
+        .keyd
+        .open_fast_armor(&KDC, &KRBTGT, &req, &outer, &now())
+        .unwrap();
+    Conversation { armor, armor_key }
+}
+
+/// alice's encrypted challenge in this conversation: PA-ENC-TS-ENC under
+/// KRB-FX-CF2(armor_key, long-term key, "clientchallengearmor",
+/// "challengelongterm"), key usage 54 (RFC 6113 5.4.6).
+fn encrypted_challenge(c: &Conversation) -> PaData {
+    let key = krb_crypto::krb_fx_cf2(
+        &c.armor_key,
+        &alice_key(),
+        b"clientchallengearmor",
+        b"challengelongterm",
+    )
+    .unwrap();
+    let plain = PaEncTsEnc {
+        patimestamp: now(),
+        pausec: None,
+    }
+    .encode()
+    .unwrap();
+    let cipher = krb_crypto::encrypt(&key, usage(54), &[0x29; 16], &plain).unwrap();
+    PaData {
+        padata_type: PA_ENCRYPTED_CHALLENGE,
+        padata_value: EncryptedData {
+            etype: key.enc_type().number(),
+            kvno: None,
+            cipher,
+        }
+        .encode()
+        .unwrap(),
+    }
+}
+
+/// keyd verifies alice's encrypted challenge under the conversation's armor.
+fn armored_proof(f: &mut Fixture, c: &Conversation) -> AuthnProof {
+    f.keyd
+        .verify_preauth(
+            &KDC,
+            &ALICE,
+            &encrypted_challenge(c),
+            Some(c.armor.armor_id),
+            &now(),
+        )
+        .unwrap()
+}
+
+/// The template the KDC sends for alice's change-password ticket ending at
+/// `endtime` (docs/53 §5.2: no flag, no starttime, no renew-till).
+fn change_password_template(endtime: KerberosTime) -> AsTicketTemplate {
+    AsTicketTemplate {
+        client: ALICE_ID,
+        crealm: realm(),
+        cname: alice_name(),
+        sname: change_password_service_name(),
+        starttime: None,
+        endtime,
+        renew_till: None,
+        flags: TicketFlags::empty(),
+        session_enctype: EncTypeId::Aes256CtsHmacSha196,
+        nonce: AS_NONCE,
+    }
+}
+
+/// keyd issues for `server` with `template`, under the conversation's armor.
+fn issue_armored(
+    f: &mut Fixture,
+    c: &Conversation,
+    proof: &AuthnProof,
+    server: &KeyHandle,
+    template: &AsTicketTemplate,
+) -> Result<AsRepParts, IssueError> {
+    f.keyd.issue_as_rep(
+        &KDC,
+        &ALICE,
+        server,
+        proof,
+        Some(c.armor.armor_id),
+        template,
+        &now(),
+    )
+}
+
+/// A fresh conversation, alice's proof in it, and keyd's answer for
+/// `server` and `template`.
+fn try_issue(
+    f: &mut Fixture,
+    tgt: &Tgt,
+    cusec: u32,
+    server: &KeyHandle,
+    template: &AsTicketTemplate,
+) -> Result<AsRepParts, IssueError> {
+    let c = open_conversation(f, tgt, cusec);
+    let proof = armored_proof(f, &c);
+    issue_armored(f, &c, &proof, server, template)
+}
+
+/// The client opens the armored reply: the KrbFastResponse under the armor
+/// key (usage 52), the strengthen key, the reply key KRB-FX-CF2(strengthen
+/// key, alice's key, "strengthenkey", "replykey"), the EncASRepPart (usage
+/// 3). RFC 6113 5.4.3; RFC 4120 5.4.2.
+fn open_armored_reply(c: &Conversation, parts: &AsRepParts) -> EncAsRepPart {
+    let fast_rep = parts.fast_rep.as_ref().expect("an armored reply");
+    let response = KrbFastResponse::decode(&open(&c.armor_key, 52, fast_rep)).unwrap();
+    assert_eq!(response.nonce, AS_NONCE);
+    let strengthen = key_from(response.strengthen_key.as_ref().expect("strengthen-key"));
+    let reply_key =
+        krb_crypto::krb_fx_cf2(&strengthen, &alice_key(), b"strengthenkey", b"replykey").unwrap();
+    EncAsRepPart::decode(&open(&reply_key, 3, &parts.enc_part)).unwrap()
+}
+
+/// alice's change-password ticket as keyd issues it, opened by her.
+fn issue_change_password_ticket(f: &mut Fixture, tgt: &Tgt, cusec: u32) -> Issued {
+    let c = open_conversation(f, tgt, cusec);
+    let proof = armored_proof(f, &c);
+    let parts = issue_armored(
+        f,
+        &c,
+        &proof,
+        &CHANGE_PASSWORD_SERVICE,
+        &change_password_template(at(300)),
+    )
+    .unwrap();
+    let rep = open_armored_reply(&c, &parts);
+    Issued {
+        enctype: EncType::Aes256CtsHmacSha196,
+        ticket: parts.ticket,
+        session: key_from(&rep.0.key),
+    }
+}
+
+/// The full keyd round trip (docs/53 §5.2; Q-915 items 1, 3, 4; RFC 4120
+/// 2.1 — INITIAL "issued using the AS protocol"; 3.1.3 — the ticket sealed
+/// with "the encryption key extracted from the server principal's record",
+/// the server principal's maximum lifetime; 3.1.5 — the client checks sname
+/// / srealm and the nonce; 5.3 — usage 2; RFC 6113 5.4.3, 5.4.6; RFC 3244
+/// §2): keyd issues alice's armored AS for `kadmin/changepw` under the
+/// change-password service's key set — the ticket opens under that key
+/// (never krbtgt) with exactly INITIAL | PRE-AUTHENT, authtime now, no
+/// starttime, endtime now + 300 s, no renew-till; her armored reply carries
+/// the same facts and session key; keyd's record names the
+/// ChangePasswordService key set as the server. Then the ticket is what
+/// `open_change_password_request` accepts: a change request through it opens
+/// with verdict `Acceptable` and INITIAL (RFC 3244 §2 — "checks whether the
+/// initial flag is required").
+#[test]
+fn the_as_issues_the_change_password_ticket_under_its_profile() {
+    let (mut f, tgt) = as_fixture();
+    let c = open_conversation(&mut f, &tgt, 1);
+    let proof = armored_proof(&mut f, &c);
+    let parts = issue_armored(
+        &mut f,
+        &c,
+        &proof,
+        &CHANGE_PASSWORD_SERVICE,
+        &change_password_template(at(CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS.into())),
+    )
+    .unwrap();
+    let record = last(&f);
+    assert_eq!(record.op, Operation::IssueAsRep);
+    assert_eq!(record.result, AuditOutcome::Success);
+    let server = record.secondary.expect("the server key set");
+    assert_eq!(server.principal, CHANGE_PASSWORD_SERVICE_ID);
+    assert_eq!(server.purpose, KeyPurpose::ChangePasswordService);
+
+    let profile = TicketFlags::INITIAL.union(TicketFlags::PRE_AUTHENT);
+    assert_eq!(parts.ticket.realm, realm());
+    assert_eq!(parts.ticket.sname, change_password_service_name());
+    assert_eq!(parts.ticket.enc_part.etype, 18);
+    assert_eq!(parts.ticket.enc_part.kvno, Some(1));
+    let service_key = change_password_service_key(EncType::Aes256CtsHmacSha196);
+    let ticket = EncTicketPart::decode(&open(&service_key, 2, &parts.ticket.enc_part)).unwrap();
+    assert_eq!(ticket.flags, profile);
+    assert_eq!(ticket.crealm, realm());
+    assert_eq!(ticket.cname, alice_name());
+    assert_eq!(ticket.authtime, now());
+    assert_eq!(ticket.starttime, None);
+    assert_eq!(ticket.endtime, at(300));
+    assert_eq!(ticket.renew_till, None);
+    assert_eq!(ticket.caddr, None);
+    assert_eq!(ticket.authorization_data, None);
+    assert!(krb_crypto::decrypt(&krbtgt_key(), usage(2), &parts.ticket.enc_part.cipher).is_err());
+
+    let rep = open_armored_reply(&c, &parts);
+    assert_eq!(rep.0.flags, profile);
+    assert_eq!(rep.0.srealm, realm());
+    assert_eq!(rep.0.sname, change_password_service_name());
+    assert_eq!(rep.0.nonce, AS_NONCE);
+    assert_eq!(rep.0.endtime, at(300));
+    assert_eq!(rep.0.renew_till, None);
+    assert_eq!(rep.0.key.keyvalue, ticket.key.keyvalue);
+
+    // The ticket opens a change request (task K3's operation).
+    let issued = Issued {
+        enctype: EncType::Aes256CtsHmacSha196,
+        ticket: parts.ticket.clone(),
+        session: key_from(&rep.0.key),
+    };
+    let ctx = open_request(&mut f, &issued, &Spec::new(15_001, "Garland-Owl-24-Fir")).unwrap();
+    assert_eq!(ctx.verdict, ChangePasswordVerdict::Acceptable);
+    assert_eq!(ctx.cname, alice_name());
+    assert_eq!(ctx.endtime, at(300));
+    assert!(ctx.flags.contains(TicketFlags::INITIAL));
+}
+
+/// A-142 at keyd's layer (docs/53 §5.2 "second layer"; Q-915 items 1, 3;
+/// docs/52 C24 — a lax option the client chooses): an unarmored issuance for
+/// the change-password service is not representable — keyd's unarmored
+/// server slot takes the krbtgt key set only, so the change-password key set
+/// there is `Denied` (`PurposeMismatch`) before the proof is touched; the
+/// same holds for an armored proof presented without its armor. The same
+/// proofs still issue what their slot allows (an unarmored TGT; the armored
+/// change-password ticket with the armor). The classification has no value
+/// for an unarmored change-password server.
+#[test]
+fn an_unarmored_change_password_issuance_is_refused() {
+    let (mut f, tgt) = as_fixture();
+    assert_eq!(AsServer::of(KeyPurpose::ChangePasswordService, false), None);
+    assert_eq!(
+        AsServer::of(KeyPurpose::ChangePasswordService, true),
+        Some(AsServer::ChangePasswordService)
+    );
+
+    // An unarmored (PA-ENC-TIMESTAMP) proof.
+    let proof = f
+        .keyd
+        .verify_preauth(
+            &KDC,
+            &ALICE,
+            &pa_enc_timestamp(&alice_key(), Some(1), now()),
+            None,
+            &now(),
+        )
+        .unwrap();
+    assert_eq!(
+        f.keyd
+            .issue_as_rep(
+                &KDC,
+                &ALICE,
+                &CHANGE_PASSWORD_SERVICE,
+                &proof,
+                None,
+                &change_password_template(at(300)),
+                &now(),
+            )
+            .map(|_| ()),
+        Err(IssueError::Denied)
+    );
+    assert_eq!(last(&f).result, AuditOutcome::Denied);
+    assert_eq!(last(&f).reason, AuditReason::PurposeMismatch);
+    let tgt_parts = f
+        .keyd
+        .issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, None, &as_template(), &now())
+        .unwrap();
+    assert_eq!(tgt_parts.ticket.sname, krbtgt_name());
+
+    // An armored proof, the armor withheld.
+    let c = open_conversation(&mut f, &tgt, 2);
+    let proof = armored_proof(&mut f, &c);
+    assert_eq!(
+        f.keyd
+            .issue_as_rep(
+                &KDC,
+                &ALICE,
+                &CHANGE_PASSWORD_SERVICE,
+                &proof,
+                None,
+                &change_password_template(at(300)),
+                &now(),
+            )
+            .map(|_| ()),
+        Err(IssueError::Denied)
+    );
+    assert_eq!(last(&f).reason, AuditReason::PurposeMismatch);
+    assert!(issue_armored(
+        &mut f,
+        &c,
+        &proof,
+        &CHANGE_PASSWORD_SERVICE,
+        &change_password_template(at(300)),
+    )
+    .is_ok());
+}
+
+/// keyd enforces the profile whatever the KDC asks (docs/53 §5.2: "lifetime
+/// ≤ 300 s, no renewable, forwardable, proxiable, postdated"; Q-915 item 4;
+/// RFC 4120 3.1.3 — the server principal's maximum lifetime, flags only "if
+/// the policy of the local realm allows", 5.3 — starttime absent ⇒
+/// authtime): under a realm policy that allows forwardable, proxiable and
+/// renewable tickets and a one-minute minimum, a change-password template
+/// ending beyond authtime + 300 s, asking any flag, carrying a starttime or
+/// a renew-till is refused (`BadTemplate`) — never issued longer or with
+/// the flag; a template naming another service with the change-password key
+/// set, or `kadmin/changepw` with the krbtgt key set, is refused
+/// (`TemplateNames`). Templates within the profile — 120 s and 300 s — are
+/// issued, ending where asked.
+#[test]
+fn keyd_enforces_the_profile_whatever_the_kdc_asks() {
+    let mut generous = config();
+    generous.ticket_policy.allowed_flags = generous
+        .ticket_policy
+        .allowed_flags
+        .union(TicketFlags::FORWARDABLE)
+        .union(TicketFlags::PROXIABLE);
+    generous.ticket_policy.min_lifetime_secs = 60;
+    let (mut f, tgt) = as_fixture_with(generous);
+
+    let base = change_password_template(at(300));
+    let with = |change: &dyn Fn(&mut AsTicketTemplate)| {
+        let mut template = base.clone();
+        change(&mut template);
+        template
+    };
+    let cases: Vec<(&str, KeyHandle, AsTicketTemplate, AuditReason)> = vec![
+        (
+            "301 s",
+            CHANGE_PASSWORD_SERVICE,
+            change_password_template(at(301)),
+            AuditReason::TemplateTimes,
+        ),
+        (
+            "one hour",
+            CHANGE_PASSWORD_SERVICE,
+            change_password_template(at(3_600)),
+            AuditReason::TemplateTimes,
+        ),
+        (
+            "forwardable",
+            CHANGE_PASSWORD_SERVICE,
+            with(&|t| t.flags = TicketFlags::FORWARDABLE),
+            AuditReason::TemplateFlags,
+        ),
+        (
+            "proxiable",
+            CHANGE_PASSWORD_SERVICE,
+            with(&|t| t.flags = TicketFlags::PROXIABLE),
+            AuditReason::TemplateFlags,
+        ),
+        (
+            "renewable",
+            CHANGE_PASSWORD_SERVICE,
+            with(&|t| {
+                t.flags = TicketFlags::RENEWABLE;
+                t.renew_till = Some(at(600));
+            }),
+            AuditReason::TemplateFlags,
+        ),
+        (
+            "initial asked",
+            CHANGE_PASSWORD_SERVICE,
+            with(&|t| t.flags = TicketFlags::INITIAL),
+            AuditReason::TemplateFlags,
+        ),
+        (
+            "renew-till",
+            CHANGE_PASSWORD_SERVICE,
+            with(&|t| t.renew_till = Some(at(300))),
+            AuditReason::TemplateTimes,
+        ),
+        (
+            "starttime",
+            CHANGE_PASSWORD_SERVICE,
+            with(&|t| t.starttime = Some(now())),
+            AuditReason::TemplateTimes,
+        ),
+        (
+            "TGS name",
+            CHANGE_PASSWORD_SERVICE,
+            with(&|t| t.sname = krbtgt_name()),
+            AuditReason::TemplateNames,
+        ),
+        (
+            "another service",
+            CHANGE_PASSWORD_SERVICE,
+            with(&|t| t.sname = service_name()),
+            AuditReason::TemplateNames,
+        ),
+        (
+            "kadmin/changepw under krbtgt",
+            KRBTGT,
+            base.clone(),
+            AuditReason::TemplateNames,
+        ),
+    ];
+    for (i, (what, server, template, reason)) in cases.into_iter().enumerate() {
+        let cusec = 100 + i as u32;
+        assert_eq!(
+            try_issue(&mut f, &tgt, cusec, &server, &template).map(|_| ()),
+            Err(IssueError::BadTemplate),
+            "{what}"
+        );
+        assert_eq!(last(&f).result, AuditOutcome::BadTemplate, "{what}");
+        assert_eq!(last(&f).reason, reason, "{what}");
+    }
+
+    let service_key = change_password_service_key(EncType::Aes256CtsHmacSha196);
+    for (cusec, end) in [(200, at(120)), (201, at(300))] {
+        let parts = try_issue(
+            &mut f,
+            &tgt,
+            cusec,
+            &CHANGE_PASSWORD_SERVICE,
+            &change_password_template(end),
+        )
+        .unwrap();
+        let ticket = EncTicketPart::decode(&open(&service_key, 2, &parts.ticket.enc_part)).unwrap();
+        assert_eq!(ticket.endtime, end);
+        assert_eq!(
+            ticket.flags,
+            TicketFlags::INITIAL.union(TicketFlags::PRE_AUTHENT)
+        );
+    }
+}
+
+/// The change-password ticket is not a TGT (RFC 4120 3.3.2: the TGS takes a
+/// ticket "for the TGS"; 5.3: a ticket is sealed in "the server's secret
+/// key"; docs/53 §5.2): presented to `open_and_verify_tgt` as issued it is
+/// `NotLocalTgt`; with its sname rewritten to `krbtgt/REALM` it does not
+/// open under the krbtgt key (`IntegrityFailure`); the change-password key
+/// set is never the key of a TGT step (`PurposeMismatch`); and as the armor
+/// of a FAST conversation it is `NotLocalTgt` too.
+#[test]
+fn the_change_password_ticket_is_no_tgt() {
+    let (mut f, tgt) = as_fixture();
+    let issued = issue_change_password_ticket(&mut f, &tgt, 1);
+    let (_, body) = tgs_req_body(0x5151_0001, service_name());
+    let tgs_ap_req = |ticket: &Ticket, cusec: u32| {
+        ap_req(
+            ticket,
+            authenticator(
+                &issued.session,
+                &AuthenticatorSpec::new(now(), cusec, &body),
+            ),
+        )
+    };
+
+    let opened = f.keyd.open_and_verify_tgt(
+        &KDC,
+        &KRBTGT,
+        &tgs_ap_req(&issued.ticket, 11),
+        &body,
+        None,
+        &now(),
+    );
+    assert_eq!(opened.map(|_| ()), Err(AuthnError::Denied));
+    assert_eq!(last(&f).reason, AuditReason::NotLocalTgt);
+
+    let mut renamed = issued.ticket.clone();
+    renamed.sname = krbtgt_name();
+    let opened = f.keyd.open_and_verify_tgt(
+        &KDC,
+        &KRBTGT,
+        &tgs_ap_req(&renamed, 12),
+        &body,
+        None,
+        &now(),
+    );
+    assert_eq!(opened.map(|_| ()), Err(AuthnError::Denied));
+    assert_eq!(last(&f).reason, AuditReason::IntegrityFailure);
+
+    let opened = f.keyd.open_and_verify_tgt(
+        &KDC,
+        &CHANGE_PASSWORD_SERVICE,
+        &tgs_ap_req(&issued.ticket, 13),
+        &body,
+        None,
+        &now(),
+    );
+    assert_eq!(opened.map(|_| ()), Err(AuthnError::Denied));
+    assert_eq!(last(&f).reason, AuditReason::PurposeMismatch);
+
+    // As a FAST armor (RFC 6113 5.4.1.1: the armor ticket is a TGT).
+    let armor_ap = ap_req(
+        &issued.ticket,
+        armor_authenticator(
+            &issued.session,
+            &ArmorAuthSpec {
+                crealm: realm(),
+                cname: alice_name(),
+                ..ArmorAuthSpec::new(now(), 14, ARMOR_SUBKEY)
+            },
+        ),
+    );
+    let armor_key = client_armor_key(&ARMOR_SUBKEY, &issued.session);
+    let (_, outer) = as_req_body(AS_NONCE);
+    let req = armored_req(&armor_ap, &armor_key, &outer, &fast_req(AS_NONCE));
+    assert_eq!(
+        f.keyd
+            .open_fast_armor(&KDC, &KRBTGT, &req, &outer, &now())
+            .map(|_| ()),
+        Err(AuthnError::Denied)
+    );
+    assert_eq!(last(&f).reason, AuditReason::NotLocalTgt);
+}
+
+/// Q-915 item 5 (RFC 4120 3.1.3: below the site minimum a ticket is
+/// KDC_ERR_NEVER_VALID; §8.2: the default minimum, 5 minutes, equals the
+/// change-password maximum): keyd refuses to start with a realm minimum
+/// ticket lifetime above 300 s — every change-password AS would fail — and
+/// starts with exactly 300 s.
+#[test]
+fn keyd_refuses_to_start_with_a_minimum_above_the_change_password_maximum() {
+    let start = |minimum: u32| {
+        let mut c = config();
+        c.ticket_policy.min_lifetime_secs = minimum;
+        Keyd::with_entropy(
+            c,
+            InMemoryKeyStore::new_insecure_development_allowing_krbtgt(8),
+            CollectingAudit::default(),
+            TestEntropy::default(),
+            &keyd_started(),
+        )
+        .map(|_| ())
+    };
+    assert_eq!(
+        start(CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS + 1),
+        Err(ConfigError::ChangePasswordTicketLifetime)
+    );
+    assert_eq!(start(3_600), Err(ConfigError::ChangePasswordTicketLifetime));
+    assert_eq!(start(CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS), Ok(()));
 }

@@ -14,6 +14,7 @@
 //! Spec: docs/10 §2 (caller model, capability table), §12 I2, I3; docs/09 א.6;
 //! docs/25 §3.2 (keyd is a PEP).
 
+use crate::as_exchange::AsServer;
 use crate::model::KeyPurpose;
 use crate::service_ticket::{AppBinding, OperationDigest, OPERATION_DIGEST_LEN};
 
@@ -578,20 +579,48 @@ pub const fn role_permits(role: Role, op: Operation) -> bool {
 
 /// Which handle argument of an operation a purpose check is about.
 ///
-/// Spec: docs/10 §4 (issue_as_rep takes a client and a krbtgt handle).
+/// `issue_as_rep` takes a client and a server handle; its server slot has
+/// two variants, chosen by whether the issuance is FAST-armored
+/// ([`as_server_slot`]) — so the capability table itself, and its
+/// compile-time pins, say that the change-password service is a server only
+/// of an armored issuance (task K3b).
+///
+/// Spec: docs/10 §4 (issue_as_rep takes a client and a server handle);
+/// docs/53 §5.2; docs/questions/Q-915 items 1, 3 (A-151).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum HandleSlot {
     /// The operation's main handle (the client, service, krbtgt or managed
     /// key, depending on the operation).
     Primary = 0,
-    /// The krbtgt handle of `issue_as_rep`.
-    Krbtgt = 1,
+    /// The server handle of an **unarmored** `issue_as_rep`: the key set
+    /// the ticket is sealed under — this realm's krbtgt only
+    /// ([`AsServer::of`] with `armored = false`).
+    /// Spec: docs/10 §4; docs/48 §7.3 (the unarmored bootstrap: "only
+    /// TGT"); A-142.
+    AsServer = 1,
     /// The second key target of `grant_set_secret`: a computer's `Service`
     /// key set (docs/47 §9.1: a computer's password sets its
     /// `PrincipalLongterm` and its `Service` key set).
     /// Spec: docs/51 §5.2 row 5, §7.3; docs/questions/Q-450 item 2.
     Secondary = 2,
+    /// The server handle of a **FAST-armored** `issue_as_rep`: krbtgt or the
+    /// change-password service's key set ([`AsServer::of`] with `armored =
+    /// true`).
+    /// Spec: docs/53 §5.2; docs/questions/Q-915 items 1, 3 (A-151); A-117.
+    ArmoredAsServer = 3,
+}
+
+/// The server slot of an `issue_as_rep` that is `armored` or not — the one
+/// choice keyd makes when it admits the call (pinned below).
+/// Spec: docs/53 §5.2; docs/questions/Q-915 items 1, 3; A-142.
+#[must_use]
+pub const fn as_server_slot(armored: bool) -> HandleSlot {
+    if armored {
+        HandleSlot::ArmoredAsServer
+    } else {
+        HandleSlot::AsServer
+    }
 }
 
 /// The purposes an operation accepts in a handle slot. Anything else is
@@ -599,9 +628,12 @@ pub enum HandleSlot {
 ///
 /// - `verify_preauth`, `issue_as_rep` (client): PrincipalLongterm (docs/10
 ///   §4 "חייב purpose = PrincipalLongterm").
-/// - `issue_as_rep` (krbtgt), `open_and_verify_tgt`, `open_fast_armor`:
-///   Krbtgt (docs/10 §4, §5; docs/48 §2.3 "open_fast_armor.krbtgt =
-///   Krbtgt").
+/// - `issue_as_rep` (server): exactly the servers of [`AsServer::of`] — in
+///   the unarmored slot Krbtgt only, in the armored slot Krbtgt or
+///   ChangePasswordService (docs/53 §5.2: "Krbtgt **or**
+///   ChangePasswordService, no other purpose"; A-142: never unarmored).
+/// - `open_and_verify_tgt`, `open_fast_armor`: Krbtgt (docs/10 §4, §5;
+///   docs/48 §2.3 "open_fast_armor.krbtgt = Krbtgt").
 /// - `seal_fast_error` takes no handle: the armor token is its authority
 ///   (docs/48 §2.3), so no slot of it is permitted.
 /// - `describe_config`, `ping` take no handle (docs/50 §3.4: no request
@@ -641,7 +673,9 @@ pub enum HandleSlot {
 ///   docs/53 §5.2).
 /// - `open_change_password_request`: ChangePasswordService only — the
 ///   purpose of `AppBinding::ChangePassword`; no other operation opens a
-///   ticket under that key set (docs/53 §4.5, pinned below).
+///   ticket under that key set (docs/53 §4.5, pinned below); the one other
+///   operation that uses it is the armored `issue_as_rep`, which seals the
+///   service's tickets (task K3b, pinned below).
 /// - `complete_change_password`: PrincipalLongterm only — the target is a
 ///   user's password key set (docs/53 R53-1: users only; the decision's
 ///   one target).
@@ -655,10 +689,16 @@ pub enum HandleSlot {
 /// Spec: docs/10 §2 ("(b) the KeyPurpose of the handle matches the
 /// operation"), §4, §5, §6, §7, §12 I3; docs/48 §2.3, §9.1 I3;
 /// docs/questions/Q-115 (A-35), Q-165 item 3 (A-46), Q-450 item 2, Q-463
-/// item 4 (A-102; docs/52 §5 item 3), Q-523.
+/// item 4 (A-102; docs/52 §5 item 3), Q-523, Q-915 items 1, 3 (A-151).
 pub const fn purpose_permitted(op: Operation, slot: HandleSlot, purpose: KeyPurpose) -> bool {
     use KeyPurpose::{AdminService, ChangePasswordService, Krbtgt, PrincipalLongterm, Service};
     match (op, slot) {
+        // The closed server slot (task K3b): defined by the one
+        // classification, so the table cannot name a third server.
+        (Operation::IssueAsRep, HandleSlot::AsServer) => AsServer::of(purpose, false).is_some(),
+        (Operation::IssueAsRep, HandleSlot::ArmoredAsServer) => {
+            AsServer::of(purpose, true).is_some()
+        }
         (Operation::IssueTgsRep, HandleSlot::Primary) => matches!(purpose, Service | AdminService),
         (Operation::OpenAndVerifyServiceTicket, HandleSlot::Primary) => matches!(purpose, Service),
         (Operation::VerifyOperationTicket, HandleSlot::Primary) => matches!(purpose, AdminService),
@@ -670,8 +710,7 @@ pub const fn purpose_permitted(op: Operation, slot: HandleSlot, purpose: KeyPurp
         | (Operation::CompleteChangePassword, HandleSlot::Primary) => {
             matches!(purpose, PrincipalLongterm)
         }
-        (Operation::IssueAsRep, HandleSlot::Krbtgt)
-        | (Operation::OpenAndVerifyTgt, HandleSlot::Primary)
+        (Operation::OpenAndVerifyTgt, HandleSlot::Primary)
         | (Operation::OpenFastArmor, HandleSlot::Primary)
         | (Operation::RotateKrbtgt, HandleSlot::Primary) => matches!(purpose, Krbtgt),
         (Operation::SetSecret, HandleSlot::Primary)
@@ -761,7 +800,7 @@ const _: () = {
     ));
     assert!(!purpose_permitted(
         Operation::DestroyKeySet,
-        HandleSlot::Krbtgt,
+        HandleSlot::AsServer,
         KeyPurpose::Krbtgt
     ));
     // Service-ticket verification (docs/questions/Q-165 item 3, A-46):
@@ -823,7 +862,7 @@ const _: () = {
         ));
         assert!(!purpose_permitted(
             Operation::DescribeConfig,
-            HandleSlot::Krbtgt,
+            HandleSlot::ArmoredAsServer,
             purposes[p]
         ));
         assert!(!purpose_permitted(
@@ -833,7 +872,7 @@ const _: () = {
         ));
         assert!(!purpose_permitted(
             Operation::Ping,
-            HandleSlot::Krbtgt,
+            HandleSlot::ArmoredAsServer,
             purposes[p]
         ));
         p += 1;
@@ -977,7 +1016,7 @@ const _: () = {
     ));
     assert!(!purpose_permitted(
         Operation::GrantSetSecret,
-        HandleSlot::Krbtgt,
+        HandleSlot::AsServer,
         KeyPurpose::Krbtgt
     ));
     // Only grant_set_secret has a Secondary slot.
@@ -1010,7 +1049,7 @@ const _: () = {
     ));
     assert!(!purpose_permitted(
         Operation::OpenAndVerifyServiceTicket,
-        HandleSlot::Krbtgt,
+        HandleSlot::ArmoredAsServer,
         KeyPurpose::Service
     ));
     // R2 (docs/52 §3.2, §5 item 3; docs/questions/Q-463, A-102): the admin
@@ -1105,26 +1144,36 @@ const _: () = {
     // Task K3 (docs/53 §4.5, R53-6; Q-601 item 4, A-117): the change-password
     // service's key set is drawn by keyd (`create_key`) and may have a
     // retired kvno named (`retire_kvno`, any purpose) — and is opened **only**
-    // by `open_change_password_request`. No other operation accepts it in any
-    // slot: not `set_secret` / `verify_secret` / a grant / `destroy_key_set`
-    // / `rotate_key` (never password-derived, never replaced), not the KDC's
-    // issuance or TGT steps (the TGS refuses the name — the AS profile is
-    // task K5), not the two other service-ticket verifications.
+    // by `open_change_password_request`. Task K3b (docs/53 §5.2; Q-915 items
+    // 1, 3, A-151): its tickets are sealed only by `issue_as_rep`, only in
+    // the ARMORED server slot. No other operation accepts it in any slot:
+    // not `set_secret` / `verify_secret` / a grant / `destroy_key_set` /
+    // `rotate_key` (never password-derived, never replaced), not the TGS
+    // issuance or the TGT / armor steps (the TGS refuses the name), not the
+    // unarmored AS (A-142), not the two other service-ticket verifications.
     let mut x = 0;
     while x < Operation::ALL.len() {
         let op = Operation::ALL[x];
         let opens_it = op as u8 == Operation::OpenChangePasswordRequest as u8
             || op as u8 == Operation::CreateKey as u8
             || op as u8 == Operation::RetireKvno as u8;
+        let issues_it = op as u8 == Operation::IssueAsRep as u8;
         assert!(
             purpose_permitted(op, HandleSlot::Primary, KeyPurpose::ChangePasswordService)
                 == opens_it
         );
         assert!(!purpose_permitted(
             op,
-            HandleSlot::Krbtgt,
+            HandleSlot::AsServer,
             KeyPurpose::ChangePasswordService
         ));
+        assert!(
+            purpose_permitted(
+                op,
+                HandleSlot::ArmoredAsServer,
+                KeyPurpose::ChangePasswordService
+            ) == issues_it
+        );
         assert!(!purpose_permitted(
             op,
             HandleSlot::Secondary,
@@ -1132,6 +1181,63 @@ const _: () = {
         ));
         x += 1;
     }
+    // Task K3b (docs/53 §5.2: "`server: KeyHandle` that is Krbtgt **or**
+    // ChangePasswordService — no other purpose"; Q-915 items 1, 3, A-151;
+    // A-142): the server slot of `issue_as_rep` is closed. Only
+    // `issue_as_rep` has server slots; its unarmored slot takes exactly
+    // Krbtgt, its armored slot exactly Krbtgt and ChangePasswordService —
+    // both exactly the classification `AsServer::of` — and keyd picks the
+    // slot from the armor with `as_server_slot`.
+    assert!(as_server_slot(false) as u8 == HandleSlot::AsServer as u8);
+    assert!(as_server_slot(true) as u8 == HandleSlot::ArmoredAsServer as u8);
+    let mut v = 0;
+    while v < Operation::ALL.len() {
+        let op = Operation::ALL[v];
+        let mut q = 0;
+        while q < purposes.len() {
+            let purpose = purposes[q];
+            if op as u8 == Operation::IssueAsRep as u8 {
+                let tgt = purpose as u8 == KeyPurpose::Krbtgt as u8;
+                let change_password = purpose as u8 == KeyPurpose::ChangePasswordService as u8;
+                assert!(purpose_permitted(op, HandleSlot::AsServer, purpose) == tgt);
+                assert!(
+                    purpose_permitted(op, HandleSlot::ArmoredAsServer, purpose)
+                        == (tgt || change_password)
+                );
+                assert!(
+                    purpose_permitted(op, HandleSlot::AsServer, purpose)
+                        == AsServer::of(purpose, false).is_some()
+                );
+                assert!(
+                    purpose_permitted(op, HandleSlot::ArmoredAsServer, purpose)
+                        == AsServer::of(purpose, true).is_some()
+                );
+            } else {
+                assert!(!purpose_permitted(op, HandleSlot::AsServer, purpose));
+                assert!(!purpose_permitted(op, HandleSlot::ArmoredAsServer, purpose));
+            }
+            q += 1;
+        }
+        v += 1;
+    }
+    // The classification itself: each server names the purpose it came from,
+    // and only the change-password service requires the armor — so it is
+    // never a server of an unarmored issuance.
+    let mut w = 0;
+    while w < purposes.len() {
+        let purpose = purposes[w];
+        if let Some(server) = AsServer::of(purpose, true) {
+            assert!(server.key_purpose() as u8 == purpose as u8);
+        }
+        if let Some(server) = AsServer::of(purpose, false) {
+            assert!(server.key_purpose() as u8 == purpose as u8);
+            assert!(!server.requires_armor());
+        }
+        w += 1;
+    }
+    assert!(AsServer::ChangePasswordService.requires_armor());
+    assert!(!AsServer::LocalTgt.requires_armor());
+    assert!(AsServer::of(KeyPurpose::ChangePasswordService, false).is_none());
     // ... and `open_change_password_request` opens nothing else.
     let mut y = 0;
     while y < purposes.len() {
