@@ -1,13 +1,13 @@
 //! Error type for the IPC codec.
 //!
-//! Hand-rolled, no dependency (AGENTS.md §7). Every variant names one rule the
+//! Hand-rolled, no dependency (docs/CLEAN-ROOM.md). Every variant names one rule the
 //! decoder enforces (or the encoder's matching representability rule). Fail
 //! closed: a malformed frame is always a distinct `Err`, never a panic and
-//! never a silent repair (AGENTS.md §6; docs/50 §3.3).
+//! never a silent repair (docs/CLEAN-ROOM.md; docs/50 §3.3).
 //!
 //! Security: no variant carries octets of the frame — only which rule failed
 //! — so nothing secret (a `SetSecret` password, a key-bearing value) can reach
-//! an error, a log line or a panic message (AGENTS.md §6; docs/50 §8.2: "IPC
+//! an error, a log line or a panic message (docs/CLEAN-ROOM.md; docs/50 §8.2: "IPC
 //! errors carry a code, not content").
 
 use crate::refused::Refused;
@@ -87,7 +87,7 @@ pub enum Error {
 
     /// Optional and sequence fields nested deeper than
     /// [`crate::MAX_NESTING`].
-    /// Spec: AGENTS.md §6 (recursion-depth limits); docs/questions/Q-225 item 5.
+    /// Spec: docs/CLEAN-ROOM.md (recursion-depth limits); docs/questions/Q-225 item 5.
     NestingTooDeep,
 
     // ---- encoding -----------------------------------------------------------

@@ -1,7 +1,7 @@
 #![no_main]
 //! Fuzz target for dirstore's record decoders.
 //!
-//! AGENTS.md §6 / docs/32 §8 (D138) require a fuzz target for every parser
+//! docs/CLEAN-ROOM.md / docs/32 §8 (D138) require a fuzz target for every parser
 //! before it merges to `main`. Record bodies — and the reverse-link keys a
 //! prefix scan reads back — come from disk and are treated as untrusted
 //! (docs/32 §3: tag first, then bounded parse), so arbitrary bytes are fed to

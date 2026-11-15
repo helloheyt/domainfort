@@ -41,7 +41,7 @@
 //! error, a failed SERIAL check, dird not serving a forward, a stale image)
 //! are not peer noise and stay on the operational log only.
 //!
-//! # Fail closed (docs/54 §4.4, §4.8; AGENTS.md §6)
+//! # Fail closed (docs/54 §4.4, §4.8; docs/CLEAN-ROOM.md)
 //!
 //! | condition | effect |
 //! |---|---|

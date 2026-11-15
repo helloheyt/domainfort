@@ -112,7 +112,7 @@
 //!
 //! Spec: docs/50 §3.1-§3.7 (R50-3, R50-5, R50-7, R50-8), §7.5 step 4, §10
 //! (`ipc-keyd`: "a synchronous client implementing `kdc::KeyCustody`" — the
-//! trait is `keyd_types::KeyCustody` since D182 / A-63); docs/10 §2, §7א,
+//! trait is `keyd_types::KeyCustody` since D182 / A-63); docs/10 §2, §7a,
 //! §9, §10; docs/52 §3.10 (c), §3.12 (C12), §7 R9; docs/questions/Q-217,
 //! Q-222 (A-56), Q-240 item 8 (A-62), Q-311, Q-312 (A-82), Q-351 (A-87),
 //! Q-365, Q-367 (A-88), Q-403 (A-94), Q-466 (A-102).
@@ -365,7 +365,7 @@ pub enum ClientConfigError {
 /// the caller role: the realm only (a process that knows its realm from its
 /// own configuration — dird), or the whole description (the kdc: the one it
 /// started from, docs/50 §7.5 step 4, docs/questions/Q-350 item 1).
-/// Spec: docs/50 §3.4 (`DescribeConfig`), §3.7, §7.5 step 4; docs/10 §7א;
+/// Spec: docs/50 §3.4 (`DescribeConfig`), §3.7, §7.5 step 4; docs/10 §7a;
 /// docs/52 §3.12; docs/questions/Q-311 (A-82), Q-466 item 1 (A-102).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExpectedDescription {
@@ -393,7 +393,7 @@ impl ExpectedDescription {
 /// [`KeydClient::new`] besides the transport and the deadline: there is no
 /// client without it (task R9; docs/52 §3.12 C12).
 ///
-/// Spec: docs/50 R50-3, §3.2, §3.7; docs/10 §2, §7א; docs/52 §3.12, §7 R9;
+/// Spec: docs/50 R50-3, §3.2, §3.7; docs/10 §2, §7a; docs/52 §3.12, §7 R9;
 /// docs/questions/Q-311, Q-351, Q-403 option (c), Q-466 items 1-2 (A-102).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpectedPeer {
@@ -436,7 +436,7 @@ impl ExpectedPeer {
     /// [`ClientConfigError::DescriptionNotCallable`]: the expected role may
     /// not call `DescribeConfig` (docs/10 §2).
     ///
-    /// Spec: docs/10 §2, §7א; docs/questions/Q-311 (A-82), Q-466 item 1.
+    /// Spec: docs/10 §2, §7a; docs/questions/Q-311 (A-82), Q-466 item 1.
     pub fn with_description(
         self,
         description: ExpectedDescription,
@@ -523,7 +523,7 @@ fn probe_on<K: Connection>(
 /// call it — [`ExpectedPeer::with_description`]), else `Ping` (every role).
 /// keyd's own refusal of the probe, another role or another description is
 /// [`Unserved::PeerMismatch`]; a failure of the exchange is that failure.
-/// Spec: docs/50 R50-3, R50-8, §3.4, §3.7, §7.5 step 4; docs/10 §2, §7א;
+/// Spec: docs/50 R50-3, R50-8, §3.4, §3.7, §7.5 step 4; docs/10 §2, §7a;
 /// docs/questions/Q-311 (A-82), Q-351 (A-87), Q-403 option (c), Q-466
 /// items 1-2 (A-102).
 fn verify_role_on<K: Connection>(
@@ -877,7 +877,7 @@ impl<C: Connector> KeydClient<C> {
         )
     }
 
-    /// docs/10 §5א `open_fast_armor`. Spec: docs/50 §3.4.
+    /// docs/10 §5a `open_fast_armor`. Spec: docs/50 §3.4.
     pub fn open_fast_armor(
         &mut self,
         krbtgt: &KeyHandle,
@@ -948,7 +948,7 @@ impl<C: Connector> KeydClient<C> {
         )
     }
 
-    /// docs/10 §5א `seal_fast_error`. Spec: docs/50 §3.4.
+    /// docs/10 §5a `seal_fast_error`. Spec: docs/50 §3.4.
     pub fn seal_fast_error(
         &mut self,
         conversation: &FastConversation,
@@ -970,7 +970,7 @@ impl<C: Connector> KeydClient<C> {
         )
     }
 
-    /// docs/10 §5ב `open_and_verify_service_ticket` (Role::Ldap): an
+    /// docs/10 §5b `open_and_verify_service_ticket` (Role::Ldap): an
     /// **unbound** service AP-REQ under the `Service` key set of `service`
     /// (the binding's purpose, R2); keyd keeps the session key under the
     /// answer's one-time context id.
@@ -994,7 +994,7 @@ impl<C: Connector> KeydClient<C> {
         )
     }
 
-    /// docs/10 §5ב `verify_operation_ticket` (Role::Ldap): a service AP-REQ
+    /// docs/10 §5b `verify_operation_ticket` (Role::Ldap): a service AP-REQ
     /// **bound to `operation`** under the `AdminService` key set of
     /// `service` (the binding's purpose, R2). The answer has no context id:
     /// keyd keeps nothing for it (Q-523).
@@ -1180,7 +1180,7 @@ impl<C: Connector> KeydClient<C> {
         )
     }
 
-    /// docs/10 §7א `describe_config` (Kdc, Ldap): keyd's description (the
+    /// docs/10 §7a `describe_config` (Kdc, Ldap): keyd's description (the
     /// caller role of the reply is left out — [`KeydClient::describe_config_with_role`]).
     /// Spec: docs/50 §3.4, §7.5.
     pub fn describe_config(&mut self) -> Result<ConfigDescription, keyd_types::Error> {
@@ -1188,7 +1188,7 @@ impl<C: Connector> KeydClient<C> {
             .map(|described| described.description)
     }
 
-    /// docs/10 §7א `describe_config` (Kdc, Ldap): keyd's description and the
+    /// docs/10 §7a `describe_config` (Kdc, Ldap): keyd's description and the
     /// caller role keyd resolved for this process from its peer uid.
     /// Spec: docs/50 §3.4, §7.5; docs/questions/Q-351 (A-87).
     pub fn describe_config_with_role(&mut self) -> Result<DescribedConfig, keyd_types::Error> {
@@ -1202,7 +1202,7 @@ impl<C: Connector> KeydClient<C> {
         )
     }
 
-    /// docs/10 §7א `ping` (every role): keyd's health, and the caller role
+    /// docs/10 §7a `ping` (every role): keyd's health, and the caller role
     /// keyd resolved for this process (on a verified connection, the
     /// expected one).
     /// Spec: docs/50 §3.4, §7.5; docs/questions/Q-466 item 2 (A-102).
@@ -1329,7 +1329,7 @@ impl<C: Connector> KeydClient<C> {
 ///
 /// Spec: docs/50 §3.4, §7.5 step 4 ("`DescribeConfig` from keyd …
 /// `KdcConfig::validate(&keyd_config)` — only then bind 88"), §10; docs/10
-/// §2, §7א; docs/questions/Q-311 (A-82), Q-351 (A-87), Q-466 (A-102).
+/// §2, §7a; docs/questions/Q-311 (A-82), Q-351 (A-87), Q-466 (A-102).
 pub struct IpcKeyd<C: Connector> {
     client: KeydClient<C>,
     description: ConfigDescription,

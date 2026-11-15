@@ -13,7 +13,7 @@
 //! tables to each other, number for number.
 //!
 //! Only the four AES encryption types exist: no DES, 3DES or RC4 type is
-//! expressible (AGENTS.md §6; docs/10 §1, §12 I5).
+//! expressible (docs/CLEAN-ROOM.md; docs/10 §1, §12 I5).
 //!
 //! Spec: RFC 3961 §8 ("Encryption and checksum-type numbers are signed
 //! 32-bit values"; 17 and 18 assigned to [KRB5-AES]); RFC 3962 §4, §7 (17,

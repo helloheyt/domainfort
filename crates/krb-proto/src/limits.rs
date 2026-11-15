@@ -1,4 +1,4 @@
-//! Documented resource bounds (AGENTS.md §6: "no unbounded allocation from
+//! Documented resource bounds (docs/CLEAN-ROOM.md: "no unbounded allocation from
 //! attacker-supplied lengths"; docs/45 §5).
 //!
 //! These are **not** RFC 4120 rules — RFC 4120 §5 places no size limit on these

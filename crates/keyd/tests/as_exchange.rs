@@ -175,7 +175,7 @@ fn preauth_clock_skew() {
 }
 
 /// I5: an RC4 (etype 23) or unconfigured AES (etype 17) PA-ENC-TIMESTAMP is
-/// refused before any decryption. Source: docs/10 §12 I5; AGENTS.md §6 (no
+/// refused before any decryption. Source: docs/10 §12 I5; docs/CLEAN-ROOM.md (no
 /// RC4 code path); krb-crypto has no type for 23 at all.
 #[test]
 fn preauth_rejects_weak_and_unconfigured_etypes() {
@@ -559,7 +559,7 @@ fn key_change_between_steps_denied() {
 
 /// Bounded proof table: when full of live proofs, new ones are refused
 /// (fail closed) and room returns as proofs expire. Source: docs/10 D36;
-/// AGENTS.md §6 (bounded).
+/// docs/CLEAN-ROOM.md (bounded).
 #[test]
 fn proof_table_is_bounded() {
     let mut c = config();

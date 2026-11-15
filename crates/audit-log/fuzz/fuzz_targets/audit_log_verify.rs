@@ -2,7 +2,7 @@
 //! Fuzz target for the audit-log segment verifier: `audit_log::SegmentReader`
 //! and `audit_log::verify_segment` on arbitrary octets.
 //!
-//! AGENTS.md §6 / docs/50 §9 (R50-19): arbitrary bytes → parser; never a
+//! docs/CLEAN-ROOM.md / docs/50 §9 (R50-19): arbitrary bytes → parser; never a
 //! panic, bounded allocation (every declared record length is checked against
 //! `MAX_RECORD_LEN` before the body is read). The first input octet picks the
 //! anchor (genesis, trusted, or after the head named by the next 40 octets)

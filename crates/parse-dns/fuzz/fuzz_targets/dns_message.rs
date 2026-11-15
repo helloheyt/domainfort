@@ -1,7 +1,7 @@
 #![no_main]
 //! Fuzz target for `parse_dns::decode` (docs/54 §10.3 `dns_message`).
 //!
-//! AGENTS.md §6 requires a fuzz target for every parser before it merges to
+//! docs/CLEAN-ROOM.md requires a fuzz target for every parser before it merges to
 //! `main`. Arbitrary octets are decoded under every profile: none may panic,
 //! hang or over-allocate — each fails closed with a `parse_dns::Error`.
 //!

@@ -16,7 +16,7 @@
 //! number of octets (X.690 10.1), which RFC 4511 §5.1 also permits.
 //!
 //! Every length is checked against the octets actually present before any
-//! slice is taken (AGENTS.md §6: no unbounded allocation from attacker-supplied
+//! slice is taken (docs/CLEAN-ROOM.md: no unbounded allocation from attacker-supplied
 //! lengths), and no function indexes or panics on input.
 
 use crate::error::{Error, Limit, Result};
@@ -230,7 +230,7 @@ impl<'a> Reader<'a> {
         };
         self.take(octets)?;
         // Bound the declared length by what is present before slicing.
-        // Spec: X.690 8.1.3.3; AGENTS.md §6.
+        // Spec: X.690 8.1.3.3; docs/CLEAN-ROOM.md
         let remaining = self.buf.len().saturating_sub(self.pos);
         if length > remaining {
             return Err(Error::LengthExceedsInput);

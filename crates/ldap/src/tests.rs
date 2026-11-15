@@ -446,7 +446,7 @@ fn a_removed_or_replaced_account_is_disconnected() {
     assert_disconnected(&outcome, &session, AuditReason::IdentityRevoked);
 }
 
-/// AGENTS.md §6 (fail closed): an account source that cannot answer ends the
+/// docs/CLEAN-ROOM.md (fail closed): an account source that cannot answer ends the
 /// session like a revocation.
 #[test]
 fn an_unavailable_account_source_is_disconnected() {

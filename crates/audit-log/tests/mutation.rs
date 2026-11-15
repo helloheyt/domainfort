@@ -2,7 +2,7 @@
 //! log is detected against its final head, and the verifier never panics on
 //! any of them, nor on arbitrary input.
 //!
-//! Source: docs/37 §2 (tamper-evident log); AGENTS.md §6 (strict, bounded
+//! Source: docs/37 §2 (tamper-evident log); docs/CLEAN-ROOM.md (strict, bounded
 //! parsers that fail closed; fuzz targets — this sweep is the deterministic
 //! complement of fuzz/audit_log_verify).
 

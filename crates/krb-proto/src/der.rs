@@ -42,7 +42,7 @@ pub(crate) fn encode_top(value: &Value) -> Result<Vec<u8>> {
 /// The intermediate `parse-asn1` value tree holds a copy of the key octets, so
 /// it is scrubbed on every path — success or error — before returning.
 /// Spec: RFC 4120 5.2.9 (EncryptionKey.keyvalue "contains the key itself");
-/// AGENTS.md §6 (secrets).
+/// docs/CLEAN-ROOM.md (secrets).
 pub(crate) fn decode_secret<T>(
     bytes: &[u8],
     convert: impl FnOnce(&Value) -> Result<T>,
@@ -55,7 +55,7 @@ pub(crate) fn decode_secret<T>(
 
 /// Encode a structure that carries key material. The intermediate value tree is
 /// scrubbed and the output is returned in a [`Zeroizing`] buffer.
-/// Spec: RFC 4120 5.2.9; AGENTS.md §6 (secrets).
+/// Spec: RFC 4120 5.2.9; docs/CLEAN-ROOM.md (secrets).
 pub(crate) fn encode_secret(mut value: Value) -> Result<Zeroizing<Vec<u8>>> {
     let result = parse_asn1::encode(&value).map(Zeroizing::new);
     scrub(&mut value);
@@ -70,7 +70,7 @@ pub(crate) fn encode_secret(mut value: Value) -> Result<Zeroizing<Vec<u8>>> {
 /// Overwrite every buffer in a value tree with zeros (RustCrypto `zeroize`).
 ///
 /// Iterative with an explicit work list, so the walk never recurses on an
-/// input-shaped depth (AGENTS.md §6). Used for trees that held key material.
+/// input-shaped depth (docs/CLEAN-ROOM.md). Used for trees that held key material.
 pub(crate) fn scrub(value: &mut Value) {
     let mut work: Vec<&mut Value> = vec![value];
     while let Some(node) = work.pop() {
@@ -94,7 +94,7 @@ pub(crate) fn scrub(value: &mut Value) {
 /// SEQUENCE components under construction for a key-bearing type. If building
 /// fails part-way (`?` returns early), the components already built — which
 /// may include a copy of key octets — are scrubbed on drop.
-/// Spec: RFC 4120 5.2.9; AGENTS.md §6 (secrets).
+/// Spec: RFC 4120 5.2.9; docs/CLEAN-ROOM.md (secrets).
 pub(crate) struct SecretFields(Vec<Value>);
 
 impl SecretFields {
@@ -240,7 +240,7 @@ impl<'a> Fields<'a> {
 // ---------------------------------------------------------------------------
 
 /// Decode a SEQUENCE OF, enforcing this crate's element bound before any
-/// element is converted. Spec: X.690 8.10; resource bound per AGENTS.md §6.
+/// element is converted. Spec: X.690 8.10; resource bound per docs/CLEAN-ROOM.md
 pub(crate) fn decode_sequence_of<T>(
     value: &Value,
     limit: usize,
@@ -354,7 +354,7 @@ pub(crate) fn octets(bytes: &[u8]) -> Value {
 mod tests {
     use super::*;
 
-    /// `scrub` reaches every buffer of a nested tree (AGENTS.md §6). The
+    /// `scrub` reaches every buffer of a nested tree (docs/CLEAN-ROOM.md). The
     /// `zeroize` crate's `Vec` impl wipes the whole capacity and truncates, so
     /// every buffer is left empty.
     #[test]

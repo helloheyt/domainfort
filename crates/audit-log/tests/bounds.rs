@@ -5,7 +5,7 @@
 //! Source: docs/50 §3.3 ("audit ≤ 8 KiB per event"); docs/07 §8 ("the log
 //! does not bring the service down when it fills"; "a separate disk
 //! quota"); docs/questions/Q-218 (A-57: log overflow does not turn into
-//! shutdown); AGENTS.md §6 (bounded parsers, no allocation from an
+//! shutdown); docs/CLEAN-ROOM.md (bounded parsers, no allocation from an
 //! attacker-supplied length); docs/questions/Q-250 items 3, 4, 6.
 
 mod common;
@@ -136,7 +136,7 @@ fn segment_limit_range() {
     assert!(SegmentLimit::DEFAULT.max_octets() >= SegmentLimit::MIN);
 }
 
-/// AGENTS.md §6: a declared record length over the bound is refused at the
+/// docs/CLEAN-ROOM.md: a declared record length over the bound is refused at the
 /// prefix — before the (absent) body is awaited — not reported as a
 /// truncation.
 #[test]

@@ -47,7 +47,7 @@ use zeroize::Zeroizing;
 /// source `E` (always [`OsEntropy`] outside tests). Operations take
 /// `&mut self`; the daemon crate (D34) serializes access.
 ///
-/// Spec: docs/09 א (keyd), docs/10.
+/// Spec: docs/09 A (keyd), docs/10.
 pub struct Keyd<S: KeyStore, A: AuditSink, E: EntropySource = OsEntropy> {
     pub(crate) config: KeydConfig,
     /// `config.enctypes` as the crypto profile's own type, in the same
@@ -113,7 +113,7 @@ pub(crate) const STARTUP_HOLD_DOWN_SKEW_INTERVALS: i64 = 2;
 /// arithmetic — a product or sum that does not fit holds for good
 /// (`i64::MAX`, fail closed). Unreachable with validated inputs (seconds are
 /// below 2^39, time.rs; the skew is at most `MAX_CLOCK_SKEW_SECS`).
-/// Spec: RFC 4120 3.2.3; A-62; AGENTS.md §6 (fail closed).
+/// Spec: RFC 4120 3.2.3; A-62; docs/CLEAN-ROOM.md (fail closed).
 pub(crate) fn startup_hold_down_until(started_at: i64, clock_skew_secs: u32) -> i64 {
     i64::from(clock_skew_secs)
         .checked_mul(STARTUP_HOLD_DOWN_SKEW_INTERVALS)
@@ -139,7 +139,7 @@ impl<S: KeyStore, A: AuditSink> Keyd<S, A, OsEntropy> {
     /// could otherwise end the hold-down early, or replay an expired ticket
     /// or an out-of-window authenticator (docs/50 §3.5, R50-5; A-56).
     ///
-    /// Spec: docs/10 §11; AGENTS.md §6; RFC 4120 3.2.3; docs/50 R50-5,
+    /// Spec: docs/10 §11; docs/CLEAN-ROOM.md; RFC 4120 3.2.3; docs/50 R50-5,
     /// R50-6, §3.5; docs/questions/Q-222 (A-56), Q-240 item 3 (A-62).
     pub fn new(
         config: KeydConfig,
@@ -168,7 +168,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// pattern of A-113 / R15, checked by crates/e2e-tests
     /// `tests/no_test_seams_in_product.rs`.
     ///
-    /// Spec: AGENTS.md §6 (never implement an RNG; approved sources only),
+    /// Spec: docs/CLEAN-ROOM.md (never implement an RNG; approved sources only),
     /// §6.1; docs/questions/Q-843 item 2; docs/research/r4-a CI2; docs/52
     /// §3.18, §7 R15; RFC 4120 3.2.3; docs/50 R50-6.
     #[cfg(feature = "test-seams")]
@@ -185,7 +185,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// The one construction path behind [`Keyd::new`] (and, in test builds,
     /// `Keyd::with_entropy`). Private: a product build reaches it only with
     /// [`OsEntropy`].
-    /// Spec: docs/10 §11; AGENTS.md §6; RFC 4120 3.2.3; docs/50 R50-6.
+    /// Spec: docs/10 §11; docs/CLEAN-ROOM.md; RFC 4120 3.2.3; docs/50 R50-6.
     fn build(
         config: KeydConfig,
         store: S,
@@ -287,7 +287,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// requests until the clock skew interval has passed, providing assurance
     /// that any lost or replayed authenticators will fall outside the
     /// allowable clock skew"); docs/50 R50-6, §3.5; docs/questions/Q-222
-    /// (A-56), Q-240 items 1, 3 (A-62); AGENTS.md §6 (fail closed); docs/51
+    /// (A-56), Q-240 items 1, 3 (A-62); docs/CLEAN-ROOM.md (fail closed); docs/51
     /// §5.8; docs/questions/Q-291 (A-74), Q-450 items 1, 7.
     pub(crate) fn admit(
         &self,
@@ -378,7 +378,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
 }
 
 impl<S: KeyStore, A: AuditSink, E: EntropySource> fmt::Debug for Keyd<S, A, E> {
-    /// Non-secret state only (AGENTS.md §6).
+    /// Non-secret state only (docs/CLEAN-ROOM.md).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Keyd")
             .field("realm", &self.config.realm)
@@ -447,7 +447,7 @@ fn authorize(
 }
 
 /// Fill `out` from the entropy source; failure is `Unavailable` (fail
-/// closed, no fallback). Spec: AGENTS.md §6; RFC 4120 3.1.3.
+/// closed, no fallback). Spec: docs/CLEAN-ROOM.md; RFC 4120 3.1.3.
 pub(crate) fn draw<E: EntropySource>(entropy: &mut E, out: &mut [u8]) -> Internal<()> {
     entropy
         .fill(out)
@@ -535,7 +535,7 @@ mod tests {
     use super::*;
 
     /// A-62: the hold-down ends two skew intervals after the start; a sum
-    /// that cannot be represented holds for good (fail closed, AGENTS.md §6).
+    /// that cannot be represented holds for good (fail closed, docs/CLEAN-ROOM.md).
     #[test]
     fn hold_down_is_two_skew_intervals_and_overflow_holds() {
         assert_eq!(startup_hold_down_until(1_000, 300), 1_600);

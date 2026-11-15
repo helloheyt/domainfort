@@ -20,7 +20,7 @@
 # §9.1, docs/37 §2 and the decisions in docs/questions/PENDING-OWNER.md
 # (A-79, A-94, A-117, A-121, A-126, P-24) and Q-401, Q-605, Q-664, Q-910,
 # Q-911. No other implementation, password service or password word list was
-# consulted or recalled (AGENTS.md §1-3).
+# consulted or recalled (docs/CLEAN-ROOM.md).
 
 [package]
 name = "admin-password-policy"

@@ -8,7 +8,7 @@
 //! OCTET STRING 8.7.2 (primitive per §5.1), SEQUENCE 8.9, SET OF 8.12, and
 //! implicit tags 8.14.4 (form of the base type). The one external vector is the
 //! example payload of [MS-ADTS] v20261026 6.3.3, used verbatim. No vector
-//! comes from any other implementation or test suite (AGENTS.md §4.5).
+//! comes from any other implementation or test suite (docs/CLEAN-ROOM.md).
 
 mod common;
 

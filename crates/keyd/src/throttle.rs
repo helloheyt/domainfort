@@ -16,7 +16,7 @@
 //! `AuthnError::Denied` (A-26).
 //!
 //! Spec: docs/10 §6 (`verify_secret` "constant-time, throttled"); docs/07 D19
-//! (online guessing); AGENTS.md §6 (bounded, fail closed); A-34.
+//! (online guessing); docs/CLEAN-ROOM.md (bounded, fail closed); A-34.
 
 use crate::config::ThrottlePolicy;
 use crate::model::PrincipalId;

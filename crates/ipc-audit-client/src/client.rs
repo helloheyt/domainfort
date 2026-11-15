@@ -5,7 +5,7 @@
 //! a non-optional tokio (task IB1, docs/questions/Q-851, A-144); auditd does
 //! not link it.
 //!
-//! # The class it closes (AGENTS.md §6.1)
+//! # The class it closes (docs/CLEAN-ROOM.md)
 //!
 //! * **C12 — "the peer's identity is verified by choice, or only in part".**
 //!   Each daemon verified auditd's uid and a `Ping` → `Pong`, but the `Pong`
@@ -103,7 +103,7 @@
 //! docs.rs API pages of tokio 1.54.1 (P-2): `net::UnixStream::{connect,
 //! peer_cred}`, `net::unix::UCred::uid`, `time::{timeout, sleep}`,
 //! `io::{AsyncReadExt::read, AsyncWriteExt::write_all}`. No other
-//! implementation was consulted or recalled (AGENTS.md §1-3).
+//! implementation was consulted or recalled (docs/CLEAN-ROOM.md).
 //!
 //! Spec: docs/50 R50-3, R50-16, R50-17, §3.2, §3.3, §3.6, §3.7, §7.5, §8.1;
 //! docs/52 §3.12 (C12); docs/questions/Q-218 (A-57), Q-252 (A-64), Q-260

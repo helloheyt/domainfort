@@ -22,7 +22,7 @@
 # Moved unchanged from ipc-keyd's `server` module (written from docs/50,
 # docs/10 §2, A-56, A-59 and this project's own crates). No other
 # implementation, serializer or RPC framework was consulted or recalled
-# (AGENTS.md §1-3).
+# (docs/CLEAN-ROOM.md).
 
 [package]
 name = "ipc-keyd-server"

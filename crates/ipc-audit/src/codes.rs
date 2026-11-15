@@ -28,7 +28,7 @@
 //! meaning.
 //!
 //! Every variant carries no data: a code cannot hold a secret (docs/37 §2:
-//! "only identifiers and metadata"; AGENTS.md §6).
+//! "only identifiers and metadata"; docs/CLEAN-ROOM.md).
 //!
 //! The admin-plane tables (`DirAdmin`, `Admind` shapes — docs/51 §5.7, task
 //! A7) have no source crate yet; they mirror the operation and step names of

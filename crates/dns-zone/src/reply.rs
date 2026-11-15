@@ -1,7 +1,7 @@
 //! Replies: the one place reply octets come into existence, and so the one
 //! place the transport size rule is enforced.
 //!
-//! **Class closed here (AGENTS.md §6.1): a UDP reply larger than the
+//! **Class closed here (docs/CLEAN-ROOM.md): a UDP reply larger than the
 //! amplification bound.** Rather than checking at each call site, a [`Reply`]
 //! can only be built by this module, and every constructor applies the bound
 //! of docs/54 §6.5 to the encoded octets: over UDP a reply is at most 512

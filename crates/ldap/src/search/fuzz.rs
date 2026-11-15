@@ -1,4 +1,4 @@
-//! Hooks for the detached fuzz workspace `crates/ldap/fuzz` (AGENTS.md §6:
+//! Hooks for the detached fuzz workspace `crates/ldap/fuzz` (docs/CLEAN-ROOM.md:
 //! every parser of network input gets a fuzz target before it merges to
 //! main). Compiled only with the `fuzz-hooks` feature, which no product
 //! build enables; not part of the engine's API.
@@ -33,7 +33,7 @@
 //!
 //! Descriptions are matched ASCII case-insensitively (RFC 4512 §2.5).
 //!
-//! Spec: AGENTS.md §6; docs/49 §2.5; RFC 4511 §4.5.1.7; RFC 4517 §3.3.3,
+//! Spec: docs/CLEAN-ROOM.md; docs/49 §2.5; RFC 4511 §4.5.1.7; RFC 4517 §3.3.3,
 //! §3.3.13, §3.3.16; RFC 4512 §1.4, §2.5; Q-080.
 
 use parse_ldap::Filter;

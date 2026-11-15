@@ -66,7 +66,7 @@ use tokio::sync::Notify;
 
 /// Most events [`EventBuffer`] holds for one request. The KDC emits exactly
 /// one; more is a fault the engine refuses on (fail closed). Project bound
-/// (AGENTS.md §6).
+/// (docs/CLEAN-ROOM.md).
 pub const MAX_EVENTS_PER_REQUEST: usize = 4;
 
 /// The KDC's audit sink in the daemon: the events of the request in

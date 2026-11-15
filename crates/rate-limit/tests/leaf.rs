@@ -7,7 +7,7 @@
 //! crate: the leaf takes none); a positive control shows the scan sees a
 //! dependency table when there is one.
 //!
-//! Sources: docs/54 §4.7, §6.7, §10 (DN3); AGENT-ONBOARDING §12 ("zero or
+//! Sources: docs/54 §4.7, §6.7, §10 (DN3); docs/CLEAN-ROOM.md ("zero or
 //! minimal runtime dependencies for leaf crates").
 
 /// The `(table, line)` pairs of every entry inside a dependency table of

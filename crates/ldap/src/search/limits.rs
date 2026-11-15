@@ -1,7 +1,7 @@
 //! The bounds of one directory search, each a named constant with its
 //! justification.
 //!
-//! docs/32 §8 and AGENTS.md §6 require bounds and fix no numbers; docs/49
+//! docs/32 §8 and docs/CLEAN-ROOM.md require bounds and fix no numbers; docs/49
 //! §6.1 (R49-3, R49-9) chose the visit budget, the page bound and the
 //! response bound, anchored to the LDAP policies of [MS-ADTS] 3.1.1.3.4.6 and
 //! never above their defaults. The engine reads no clock (docs/49 §11): the

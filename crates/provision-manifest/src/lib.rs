@@ -28,7 +28,7 @@
 //! | `naming_context` | `dc=<label>,…` | 1–16 labels of `A-Z a-z 0-9 -` (A-53) |
 //! | `dc_fqdn` | lower-case host name | RFC 4120 §6.2.1 ("MUST be lowercase") |
 //! | `krbtgt` | `<guid>:NT-SRV-INST:krbtgt/<realm>` | RFC 4120 §7.3; docs/47 §1.4 |
-//! | `ldap_service` | `<guid>:NT-SRV-HST:ldap/<dc_fqdn>` | RFC 4120 §6.2.1; docs/10 §5ב |
+//! | `ldap_service` | `<guid>:NT-SRV-HST:ldap/<dc_fqdn>` | RFC 4120 §6.2.1; docs/10 §5b |
 //! | `admin_service` | `<guid>:NT-SRV-HST:admind/<dc_fqdn>` | RFC 4120 §6.2.1; A-73 |
 //! | `change_password_service` | `<guid>:NT-SRV-INST:kadmin/changepw` | RFC 3244 §2; RFC 4120 §6.2 (SRV-INST: a service and a fixed instance); docs/53 §5.2; task K9 |
 //! | `first_admins` | 2–8 × `<guid>:NT-PRINCIPAL:<sAMAccountName>`, `", "`-separated | docs/47 §9.1; [MS-SAMR] 3.1.1.6; Q-295 |
@@ -77,7 +77,7 @@
 //!
 //! Written only from this project's decided design and the pinned specs,
 //! opened in-session: docs/51 (§4.1, §4.3, §4.4, §6, §11), docs/47 (§1.1,
-//! §1.3, §1.4, §2.3, §3.3, §9.1), docs/50 (§7.1, §9), docs/10 (§1, §5ב,
+//! §1.3, §1.4, §2.3, §3.3, §9.1), docs/50 (§7.1, §9), docs/10 (§1, §5b,
 //! §7), PENDING-OWNER (A-19, A-31, A-53, A-55, A-60, A-72, A-73, A-77, P-1,
 //! P-6, P-22), docs/questions Q-100 item 1, Q-200 item 1, Q-295; RFC 4120
 //! §5.2.1, §6.1, §6.2, §6.2.1, §7.3; [MS-DTYP] v20241119 2.3.4.1, 2.3.4.2,
@@ -86,7 +86,7 @@
 //! tools/spec-pin/manifest.json); and the public API of this project's
 //! crates config, dtyp, keyd-types, krb-proto and directory-pip. No other
 //! implementation and no existing provisioning or key-administration tool
-//! was consulted or recalled (AGENTS.md §1-3).
+//! was consulted or recalled (docs/CLEAN-ROOM.md).
 //!
 //! Spec: docs/51 §4.3 step 8; docs/50 R50-15, §7.1; A-19; A-72.
 

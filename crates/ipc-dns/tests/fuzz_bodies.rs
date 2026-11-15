@@ -5,7 +5,7 @@
 //! hold before the fuzz workspace itself is built (PENDING-OWNER P-1).
 //!
 //! Sources: docs/54 §4.6, §10.3 (`ipc_dns_request`, `ipc_dns_reply`);
-//! docs/50 §3.3, §9; AGENTS.md §6; A-152 / docs/questions/Q-922 (the
+//! docs/50 §3.3, §9; docs/CLEAN-ROOM.md; A-152 / docs/questions/Q-922 (the
 //! retired kinds `0x02` / `0x82` are among the garbage inputs). Inputs are
 //! encoded by this crate from hand-made values and the RFC 2782 "Fictional
 //! example" zone.

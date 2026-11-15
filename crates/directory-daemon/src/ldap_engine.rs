@@ -61,7 +61,7 @@ use tokio::sync::oneshot;
 use zeroize::Zeroizing;
 
 /// Largest LDAP engine queue accepted by [`LdapService::spawn`]. Project
-/// bound (AGENTS.md §6).
+/// bound (docs/CLEAN-ROOM.md).
 pub const MAX_LDAP_QUEUE_CAPACITY: usize = 1024;
 
 /// What a connection gets back from the engine thread: its connection state

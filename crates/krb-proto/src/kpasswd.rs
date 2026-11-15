@@ -97,7 +97,7 @@ secret_octets! {
     /// verdict (SOFTERROR) — docs/53 §5.4 items 5–6, docs/questions/Q-603
     /// item 7.
     ///
-    /// Spec: RFC 3244 §2; AGENTS.md §6.
+    /// Spec: RFC 3244 §2; docs/CLEAN-ROOM.md
     NewPasswd
 }
 

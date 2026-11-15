@@ -65,7 +65,7 @@ pub const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
 /// ignored"; that blocked behaviour is hard-wired here for every requester
 /// (no Domain / Enterprise Admins exemption — the PDP has no such notion;
 /// administrators get WRITE_DAC through explicit ACEs), closing the
-/// owner → WRITE_DAC escalation path (AGENTS.md §6: fail closed). WRITE_OWNER
+/// owner → WRITE_DAC escalation path (docs/CLEAN-ROOM.md: fail closed). WRITE_OWNER
 /// is never implicit ([MS-DTYP] 2.5.3.2 / [MS-ADTS] 5.1.3.3.1: only with
 /// SeTakeOwnershipPrivilege, which this model has no notion of).
 pub const OWNER_IMPLICIT_RIGHTS: u32 = RIGHT_READ_CONTROL;

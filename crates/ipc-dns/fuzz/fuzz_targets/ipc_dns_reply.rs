@@ -1,5 +1,5 @@
 #![no_main]
-//! Fuzz target `ipc_dns_reply` (docs/54 §4.6, §10.3; AGENTS.md §6): dnsd's
+//! Fuzz target `ipc_dns_reply` (docs/54 §4.6, §10.3; docs/CLEAN-ROOM.md): dnsd's
 //! decoding of an arbitrary reply body of the dnsd ↔ dird channel, and of the
 //! same octets as a reassembled zone-image payload. The checks are in
 //! `../bodies/ipc_dns_reply.rs`, shared with the crate's

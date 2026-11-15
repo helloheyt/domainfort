@@ -14,7 +14,7 @@
 # docs/06 §9; docs/11 §3, §6; docs/47 §6.3; docs/48 §7; docs/questions
 # Q-130, Q-164, Q-170, Q-219, Q-270 and PENDING-OWNER A-36, A-39, A-48,
 # A-51, A-57, A-68) and the public API of the workspace crates named below
-# — AGENTS.md §1-3. No other implementation, policy language or serializer
+# — docs/CLEAN-ROOM.md No other implementation, policy language or serializer
 # was consulted or recalled.
 
 [package]

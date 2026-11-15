@@ -2,7 +2,7 @@
 //!
 //! Every bound a decoder enforces is either one of these constants or a value
 //! the caller passes in (a [`FrameLimit`] per channel and direction, a `max`
-//! per byte string or sequence field). Spec: docs/50 §3.3, R50-4; AGENTS.md §6
+//! per byte string or sequence field). Spec: docs/50 §3.3, R50-4; docs/CLEAN-ROOM.md
 //! (parsers are strict and bounded).
 
 /// Octets of the frame length prefix: `length:u32`, big-endian.
@@ -52,7 +52,7 @@ pub const MAX_BODY_CEILING: u32 = 8 * 1024 * 1024;
 /// stack depth. The [`crate::Reader`] and the [`crate::Writer`] apply the same
 /// limit, so nothing encodable is undecodable.
 ///
-/// Spec: AGENTS.md §6 (recursion-depth limits); docs/50 §3.3; project choice,
+/// Spec: docs/CLEAN-ROOM.md (recursion-depth limits); docs/50 §3.3; project choice,
 /// docs/questions/Q-225 item 5.
 pub const MAX_NESTING: usize = 8;
 

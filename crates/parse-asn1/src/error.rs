@@ -1,14 +1,14 @@
 //! Error type for the strict DER codec.
 //!
-//! Hand-rolled, zero-dependency (AGENTS.md §7). Every variant corresponds to a
+//! Hand-rolled, zero-dependency (docs/CLEAN-ROOM.md). Every variant corresponds to a
 //! specific rule the decoder enforces or a canonicality rule the encoder
 //! refuses to break. Fail closed: any malformed or non-canonical input is a
-//! distinct `Err`, never a panic and never a silent repair (AGENTS.md §6;
+//! distinct `Err`, never a panic and never a silent repair (docs/CLEAN-ROOM.md;
 //! docs/32 §8).
 //!
 //! Security: no variant carries attacker-supplied contents — only structural
 //! facts (which rule failed). Nothing that could be secret material is ever
-//! placed in an error (AGENTS.md §6 "secrets never in errors").
+//! placed in an error (docs/CLEAN-ROOM.md "secrets never in errors").
 
 use core::fmt;
 
@@ -60,11 +60,11 @@ pub enum Error {
     TrailingData,
 
     /// Nesting of constructed values exceeded [`crate::MAX_DEPTH`].
-    /// Resource bound, not an encoding rule (AGENTS.md §6; docs/32 §8).
+    /// Resource bound, not an encoding rule (docs/CLEAN-ROOM.md; docs/32 §8).
     DepthExceeded,
 
     /// A tag outside the implemented Kerberos subset was encountered.
-    /// Fail closed (AGENTS.md §6). Spec: subset per docs/45 §3 / RFC 4120 §5.
+    /// Fail closed (docs/CLEAN-ROOM.md). Spec: subset per docs/45 §3 / RFC 4120 §5.
     UnsupportedTag,
 
     /// Primitive/constructed bit did not match the type: a primitive type was

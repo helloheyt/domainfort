@@ -215,7 +215,7 @@ fn socket_server(test: &str, connections: usize) -> (PathBuf, PathBuf, thread::J
 }
 
 /// docs/50 R50-3 (peer credentials only from rustix `socket_peercred`,
-/// "linux_kernel" only per its docs.rs page); AGENTS.md §6 (fail closed):
+/// "linux_kernel" only per its docs.rs page); docs/CLEAN-ROOM.md (fail closed):
 /// where the peer cannot be verified, the client sends nothing and reports
 /// `Unavailable`.
 #[cfg(not(target_os = "linux"))]

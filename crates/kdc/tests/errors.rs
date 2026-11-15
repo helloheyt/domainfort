@@ -1,7 +1,7 @@
 //! KRB-ERROR content and audit hygiene.
 //!
 //! Sources: RFC 4120 5.9.1 (KRB-ERROR fields), 7.5.9; docs/10 §9 and docs/11
-//! §8 (terse errors, reason to audit only); AGENTS.md §6 (secrets never in
+//! §8 (terse errors, reason to audit only); docs/CLEAN-ROOM.md (secrets never in
 //! errors or logs); main-session decisions 3-6, 11, 14, 15. All values
 //! hand-made.
 
@@ -92,7 +92,7 @@ fn refusals() -> Vec<Vec<u8>> {
 /// KDC_ERR_PREAUTH_REQUIRED (RFC 4120 5.9.1 METHOD-DATA) or for an armored
 /// error, where it is METHOD-DATA with exactly one PA-FX-FAST (RFC 6113
 /// 5.4.4); no key octets, passwords or derived keys anywhere in the bytes
-/// (AGENTS.md §6) — the computer account's key and its TGT session key
+/// (docs/CLEAN-ROOM.md) — the computer account's key and its TGT session key
 /// included.
 #[test]
 fn no_krb_error_carries_e_text_or_key_material() {

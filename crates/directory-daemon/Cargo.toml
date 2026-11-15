@@ -16,7 +16,7 @@
 # crates named below, and the docs.rs API pages of tokio 1.54.1 (API
 # documentation only, never source — PENDING-OWNER P-2). No other
 # implementation, directory server, daemon or RPC system was consulted or
-# recalled (AGENTS.md §1-3).
+# recalled (docs/CLEAN-ROOM.md).
 
 [package]
 name = "directory-daemon"
@@ -35,7 +35,7 @@ path = "src/main.rs"
 [dependencies]
 # tokio — owner decision P-12, the asynchronous runtime for the socket side.
 # Linked, never copied; only its docs.rs API pages were read (P-2). Version
-# 1.54.1; license MIT (docs/50 §0.3) — on the AGENTS.md §7 allowlist.
+# 1.54.1; license MIT (docs/50 §0.3) — on the docs/CLEAN-ROOM.md allowlist.
 # Features: the subset keyd-daemon uses, from docs/50 §10 P0's list (never
 # `macros` or `full`):
 #   rt      — `runtime::Builder::new_current_thread`, `spawn`;

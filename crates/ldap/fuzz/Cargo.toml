@@ -1,5 +1,5 @@
 # cargo-fuzz harness for the LDAP engine's own parsers of network input
-# (AGENTS.md §6 / docs/32 §8: every parser gets a fuzz target before it merges
+# (docs/CLEAN-ROOM.md / docs/32 §8: every parser gets a fuzz target before it merges
 # to main; docs/49 §2.5): the filter assertion-value parsers of search (RFC
 # 4517 Integer, Generalized Time, Boolean; the Q-080 string fold; the RFC
 # 4512 OID check; the substring rule) and filter evaluation over a fixed
@@ -15,7 +15,7 @@
 #
 # NOTE FOR REVIEW: libfuzzer-sys is fuzz-harness-only test infrastructure, not
 # linked into any product crate, and on the license allowlist (MIT / Apache-2.0,
-# AGENTS.md §7). Pending owner sign-off (docs/questions/PENDING-OWNER.md P-1);
+# docs/CLEAN-ROOM.md). Pending owner sign-off (docs/questions/PENDING-OWNER.md P-1);
 # not built or run until then.
 
 [package]

@@ -90,7 +90,7 @@ pub const MAX_AP_REQ: u32 = 64 * 1024;
 /// keeps its place on the wire (its count, always 0 — so every other field
 /// of every kind keeps its layout), and a sequence with any element is
 /// refused by the codec (`ipc::Error::CountOverBound`): the in-request
-/// approvals form of dual control has no code path (AGENTS.md §6 "insecure
+/// approvals form of dual control has no code path (docs/CLEAN-ROOM.md "insecure
 /// options have no code path"; docs/52 C14 — one mechanism). Every approval
 /// is an `Approve` of a pending request dird holds.
 /// Spec: docs/questions/Q-882 item 6 (A-148: "remove `auth.approvals` from
@@ -230,7 +230,7 @@ pub const MAX_PLAN: usize = 24 * 1024;
 
 /// Most principals one effect plan names (and most SIDs one of its sets
 /// holds). Project choice (task MA2; docs/questions/Q-981).
-/// Spec: docs/research/r5-a-admin-model.md §3.3; AGENTS.md §6 (bounded).
+/// Spec: docs/research/r5-a-admin-model.md §3.3; docs/CLEAN-ROOM.md (bounded).
 pub const MAX_PLAN_PRINCIPALS: u32 = 256;
 
 /// Most effects one plan holds (each groups the principals that share one
@@ -735,7 +735,7 @@ pub mod codes {
     pub const KEY_OP_ROTATE_KRBTGT: u8 = 0x01;
     /// `KeyOperation`: `rotate_key` of a service object's randomized
     /// `Service` key set; its objectGUID follows. Spec: docs/51 §6; docs/10
-    /// §7, §5ב.
+    /// §7, §5b.
     pub const KEY_OP_ROTATE_KEY: u8 = 0x02;
     /// `KeyOperation`: `retire_kvno`; a key reference and the kvno follow.
     /// Spec: docs/51 §6; docs/10 §7; docs/33 §5.

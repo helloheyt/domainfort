@@ -33,7 +33,7 @@
 //! labels ≤ 63 and names ≤ 255 octets after decompression (RFC 1035 §3.1);
 //! length octets `01`/`10` refused (§4.1.4); section counts bounded per
 //! profile and checked against the octets present before any allocation
-//! (docs/54 §6.2; AGENTS.md §6); RDLENGTH must equal the decoded RDATA for the
+//! (docs/54 §6.2; docs/CLEAN-ROOM.md); RDLENGTH must equal the decoded RDATA for the
 //! modelled types; nothing may follow the last record; the TSIG RR exactly
 //! once and last (RFC 8945 §5.2), CLASS ANY, TTL 0, MAC ≤ 64 octets,
 //! Algorithm Name uncompressed. No recursion anywhere: names are read with a
@@ -50,7 +50,7 @@
 //! # Provenance
 //!
 //! Written only from the allowed specifications, opened in-session from the
-//! pinned copies in `tools/spec-pin/cache/` (AGENTS.md §1-3): RFC 1034 §3.1,
+//! pinned copies in `tools/spec-pin/cache/` (docs/CLEAN-ROOM.md): RFC 1034 §3.1,
 //! §3.6; RFC 1035 §2.3.1–§2.3.4, §3.1, §3.2.1–§3.2.5, §3.3, §3.3.11, §3.3.13,
 //! §3.4.1, §4.1–§4.1.4, §4.2–§4.2.2; RFC 2136 §1–§1.3, §2–§2.6, §3.4.1, §3.8;
 //! RFC 2782; RFC 3645 §5.1, §8; RFC 8945 §3, §4.1–§4.3.3.1, §5.1–§5.3.2, §6;

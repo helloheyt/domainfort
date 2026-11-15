@@ -396,7 +396,7 @@ fn check(input: &[u8]) {
 /// is refused, every error names only a key of dnsd's table and no input
 /// text. (Arbitrary inputs are the fuzz target's job — docs/50 §9,
 /// `config_file`; docs/54 §10.3 `config_dnsd`.)
-/// Spec: AGENTS.md §6 (strict, bounded parsers); docs/50 R50-15, §7.1.
+/// Spec: docs/CLEAN-ROOM.md (strict, bounded parsers); docs/50 R50-15, §7.1.
 #[test]
 fn dnsd_sweep_never_panics() {
     const SUBSTITUTES: &[u8] = &[

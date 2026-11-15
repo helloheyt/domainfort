@@ -74,7 +74,7 @@
 //! Q-275, PENDING-OWNER) and the public API of this project's crates ipc,
 //! ipc-ldap, ldap, parse-ldap and pdp (ipc-directory-server as the pattern).
 //! No other implementation, LDAP server or RPC framework was consulted or
-//! recalled (AGENTS.md §1-3).
+//! recalled (docs/CLEAN-ROOM.md).
 
 use core::fmt;
 use ipc::{decode_body, encode_frame, encode_refused, Direction, EncodedFrame, Refused};

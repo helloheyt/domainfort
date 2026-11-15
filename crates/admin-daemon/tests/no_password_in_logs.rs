@@ -1,5 +1,5 @@
 //! The password is never in any log line, event or file (docs/51 §7.6: "the
-//! password never reaches dird"; docs/50 §3.3, §8.2; AGENTS.md §6: "secrets
+//! password never reaches dird"; docs/50 §3.3, §8.2; docs/CLEAN-ROOM.md: "secrets
 //! never in logs, panics, debug output, or error messages").
 //!
 //! The whole world of tests/support (auditd, two keyds, dird, admind) runs
@@ -113,7 +113,7 @@ fn scenario() {
     println!("{DONE} files={scanned}");
 }
 
-/// docs/50 §8.2; AGENTS.md §6: no password in anything any daemon printed,
+/// docs/50 §8.2; docs/CLEAN-ROOM.md: no password in anything any daemon printed,
 /// in admind's events, or in any file the world wrote.
 #[test]
 fn the_password_is_never_logged() {

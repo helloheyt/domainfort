@@ -136,7 +136,7 @@ fn non_ascii_and_control_octets_are_rejected() {
     assert_eq!(error(&text).kind(), ErrorKind::InvalidCharacter);
 }
 
-/// docs/50 §7.1 ("file ≤ 64 KiB", "line ≤ 1024"); AGENTS.md §6 (bounded):
+/// docs/50 §7.1 ("file ≤ 64 KiB", "line ≤ 1024"); docs/CLEAN-ROOM.md (bounded):
 /// an oversized input, an over-long line and too many lines are refused.
 #[test]
 fn oversize_inputs_are_rejected() {

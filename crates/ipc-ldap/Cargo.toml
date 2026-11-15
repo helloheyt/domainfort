@@ -23,7 +23,7 @@
 # rustix 1.1.6 (`net::sockopt::socket_peercred`, `net::UCred`, `fs::Uid`)
 # and zeroize 1.9.1 (`Zeroizing`) — API documentation only, never their
 # source (P-2). No other implementation, LDAP server, serializer or RPC
-# framework was consulted or recalled (AGENTS.md §1-3).
+# framework was consulted or recalled (docs/CLEAN-ROOM.md).
 
 [package]
 name = "ipc-ldap"
@@ -50,7 +50,7 @@ zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
 # Unix socket (docs/50 R50-3: "the client verifies that the server's uid is
 # the configured uid of keyd / dird"). Linked, never copied; only its docs.rs
 # API pages were read (P-2). License as recorded in docs/50 §0.3 (MIT /
-# Apache-2.0 alternatives, AGENTS.md §7). Features per the docs.rs pages:
+# Apache-2.0 alternatives, docs/CLEAN-ROOM.md). Features per the docs.rs pages:
 # `net` (`socket_peercred`, "Available on linux_kernel and crate feature net
 # only"), `std` (the `AsFd` the function takes). Linux only: elsewhere the
 # peer check fails closed.

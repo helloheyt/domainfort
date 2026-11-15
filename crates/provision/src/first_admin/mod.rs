@@ -83,7 +83,7 @@
 //!
 //! # Provenance
 //!
-//! Written only from, opened in this session: AGENT-ONBOARDING, AGENTS,
+//! Written only from, opened in this session: docs/CLEAN-ROOM.md, docs/CLEAN-ROOM.md,
 //! specs/SOURCES; docs/51 (whole), docs/47 §3, §9, docs/10 §2, §6, §7, §9,
 //! §10, docs/50 §0.3, §6, docs/21 D95; docs/questions PENDING-OWNER (A-15,
 //! A-35, A-61, A-73, A-77, A-79, A-86, A-88, A-90, A-92, A-94, P-2, P-12,
@@ -96,7 +96,7 @@
 //! (`termios` and its items, `io::read`, `buffer::Buffer`; P-2) and the std
 //! API documentation. No other implementation, password prompt, terminal
 //! utility or provisioning tool — its prompts, messages, flags or code —
-//! was consulted or recalled (AGENTS.md §1-3).
+//! was consulted or recalled (docs/CLEAN-ROOM.md).
 //!
 //! Spec: docs/51 §4.3 steps 5, 11, 12, §4.4, §4.5, §5.8, §12 (A6); docs/47
 //! §3.3, §9.1, §9.2; docs/10 §2, §6, §9, §10; docs/50 R50-3, R50-14, §6.4;

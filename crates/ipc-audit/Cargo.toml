@@ -29,7 +29,7 @@
 #
 # Written only from this project's decided design (docs/50, docs/37,
 # docs/07 §8, docs/questions/Q-218 / A-57, docs/questions/Q-225 / A-59,
-# Q-265 / A-66, Q-851 / A-144) and the public API of crate ipc — AGENTS.md
+# Q-265 / A-66, Q-851 / A-144) and the public API of crate ipc — docs/CLEAN-ROOM.md
 # §1-3. No other implementation, serializer, RPC framework or audit format
 # was consulted or recalled.
 

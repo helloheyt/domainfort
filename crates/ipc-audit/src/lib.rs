@@ -131,7 +131,7 @@
 //! gate are crate `ipc_audit_client`'s since task IB1). The split of task
 //! IB1 was written only from docs/questions/Q-851, PENDING-OWNER A-144 and
 //! docs/research/r4-b §3.3, §5.6. No other implementation, serializer, RPC
-//! framework or audit format was consulted or recalled (AGENTS.md §1-3).
+//! framework or audit format was consulted or recalled (docs/CLEAN-ROOM.md).
 //!
 //! Spec: docs/50 R50-17, §3.3, §8.1, §10; docs/37 §2; Q-218 (A-57); A-59;
 //! docs/51 §5.7 (A-72); A-88 (Q-366, Q-395); A-91 (Q-388, Q-397); docs/52

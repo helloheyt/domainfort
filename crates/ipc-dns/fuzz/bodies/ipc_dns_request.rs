@@ -4,7 +4,7 @@
 //! `ipc_dns::decode_request`, the entry point dird's dispatcher
 //! (ipc-dns-server) takes.
 //!
-//! Properties (AGENTS.md §6; docs/50 §3.3, §9; docs/54 §4.6, §10.3):
+//! Properties (docs/CLEAN-ROOM.md; docs/50 §3.3, §9; docs/54 §4.6, §10.3):
 //! arbitrary bytes → decoder, never a panic, bounded allocation; whatever
 //! decodes re-encodes to exactly the input ("a single encoding per value");
 //! a decoded `Forward` keeps its transport's bound (12 ..= 512 octets over

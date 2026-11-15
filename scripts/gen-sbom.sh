@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # phase-0 SBOM (software bill of materials) — supply-chain provenance
-# (docs/14 D61, docs/22 R13).
+# (D61, R13).
 #
 # No-op while the workspace has no crates (nothing to enumerate). Once crates and
 # dependencies exist, emits a CycloneDX SBOM. Requires: cargo install cargo-cyclonedx

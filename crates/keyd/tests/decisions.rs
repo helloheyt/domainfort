@@ -1048,7 +1048,7 @@ fn decided_intent_only_for_a_pending_matching_decision() {
 // ---------------------------------------------------------------------------
 // Task F3: revoking a key-operation decision (docs/questions/Q-937 item 6,
 // the residual of A-159; Q-976). Sources: docs/52 §3.1 (C1), §3.10, §3.14
-// (C14), §4.2, §4.5; docs/10 §2, §6א, §10. Values made up for these tests.
+// (C14), §4.2, §4.5; docs/10 §2, §6a, §10. Values made up for these tests.
 // ---------------------------------------------------------------------------
 
 /// Q-976: dird (Role::Ldap) revokes a pending key decision; from then on it
@@ -1193,7 +1193,7 @@ fn an_unknown_id_is_revoked_ahead_of_any_registration() {
     assert_eq!(f.keyd.rotate_key(&ADMIN, id, &after), Ok(Kvno::new(2)));
 }
 
-/// Q-976; AGENTS.md §6 (bounded, fail closed): revoked ids count against the
+/// Q-976; docs/CLEAN-ROOM.md (bounded, fail closed): revoked ids count against the
 /// key-operation family's bound — with the family full of live decisions a
 /// revocation of an unknown id is `Unavailable` (`DecisionTableFull`) and
 /// changes nothing, while revoking a held one replaces it in place.

@@ -1,6 +1,6 @@
 //! Every bound of the manifest. Each is checked before the octets it covers
 //! are copied anywhere, so nothing is allocated beyond the input actually
-//! present (AGENTS.md §6).
+//! present (docs/CLEAN-ROOM.md).
 //!
 //! The line-format bounds are crates/config's (`config::limits`), the
 //! bounds of the one line parser both use (A-86 follow-up, task F7); they
@@ -15,7 +15,7 @@ pub const MAX_FILE_OCTETS: usize = config::limits::MAX_FILE_OCTETS;
 /// Spec: docs/50 §7.1 ("line ≤ 1024"); `config::limits::MAX_LINE_OCTETS`.
 pub const MAX_LINE_OCTETS: usize = config::limits::MAX_LINE_OCTETS;
 
-/// Most lines: 1024. Project choice (AGENTS.md §6 requires a bound;
+/// Most lines: 1024. Project choice (docs/CLEAN-ROOM.md requires a bound;
 /// crates/config's, docs/questions/Q-230).
 pub const MAX_LINES: usize = config::limits::MAX_LINES;
 
@@ -58,7 +58,7 @@ pub const MIN_FIRST_ADMINS: usize = 2;
 
 /// Most first administrators: 8.
 ///
-/// Project choice (AGENTS.md §6 bounds): with entries of at most
+/// Project choice (docs/CLEAN-ROOM.md bounds): with entries of at most
 /// 36 + 1 + 12 + 1 + 20 = 70 octets, eight entries and their separators
 /// (8 · 70 + 7 · 2 = 574 octets) stay within [`MAX_VALUE_OCTETS`]; further
 /// administrators are created through the admin plane (docs/51 §5.2).

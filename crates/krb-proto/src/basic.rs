@@ -625,7 +625,7 @@ secret_octets! {
     /// [`crate::NewPasswd`].)
     ///
     /// Spec: RFC 4120 5.2.9 ("This field contains the key itself");
-    /// AGENTS.md §6.
+    /// docs/CLEAN-ROOM.md
     KeyValue
 }
 

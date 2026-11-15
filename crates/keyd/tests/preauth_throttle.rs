@@ -109,7 +109,7 @@ fn throttle_is_per_principal() {
 /// untracked principal is refused (even with the right password) rather
 /// than escaping the throttle; once the windows expire there is room again.
 /// Source: decision A-34 ("bounded table, fail closed when full");
-/// AGENTS.md §6.
+/// docs/CLEAN-ROOM.md
 #[test]
 fn full_throttle_table_fails_closed() {
     let mut f = Fixture::with_config(throttled_config(1));

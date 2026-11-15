@@ -10,7 +10,7 @@
 //! reported at its line.
 //!
 //! Spec: docs/50 R50-15, §7.1; docs/21 area 4 (D96: "config deserialization —
-//! the same strict parser discipline"); AGENTS.md §6.
+//! the same strict parser discipline"); docs/CLEAN-ROOM.md
 
 use crate::error::{Error, ErrorKind};
 use crate::line_format::{Entries, LineError, LineErrorKind};

@@ -1,14 +1,14 @@
 //! Error type for the typed Kerberos message layer.
 //!
-//! Hand-rolled, no extra dependency (AGENTS.md §7; house style of
+//! Hand-rolled, no extra dependency (docs/CLEAN-ROOM.md; house style of
 //! `parse-asn1`). Every variant names one specific rule that the input broke —
 //! a DER rule (delegated to `parse-asn1`), an RFC 4120 §5 constraint, or one of
 //! this crate's documented resource bounds. Fail closed: malformed input is a
-//! distinct `Err`, never a panic and never a silent repair (AGENTS.md §6).
+//! distinct `Err`, never a panic and never a silent repair (docs/CLEAN-ROOM.md).
 //!
 //! Security: no variant carries any input content — only the structural fact
 //! of which rule failed — so key material, cipher text, or names can never leak
-//! through an error, its `Debug`, or its `Display` (AGENTS.md §6 "secrets never
+//! through an error, its `Debug`, or its `Display` (docs/CLEAN-ROOM.md "secrets never
 //! in errors").
 
 use core::fmt;
@@ -26,7 +26,7 @@ pub enum Error {
     Der(parse_asn1::Error),
 
     /// The input is longer than [`crate::limits::MAX_MESSAGE_LEN`].
-    /// Resource bound (AGENTS.md §6), not an RFC 4120 rule.
+    /// Resource bound (docs/CLEAN-ROOM.md), not an RFC 4120 rule.
     MessageTooLarge,
 
     /// An `[APPLICATION n]` value was required but a value of another class was
@@ -169,7 +169,7 @@ pub enum Error {
     EmptySequenceOf,
 
     /// A SEQUENCE OF had more elements than this crate's documented bound for
-    /// that field (see [`crate::limits`]). Resource bound (AGENTS.md §6).
+    /// that field (see [`crate::limits`]). Resource bound (docs/CLEAN-ROOM.md).
     TooManyElements,
 
     /// A ChangePasswdData `newpasswd` was longer than

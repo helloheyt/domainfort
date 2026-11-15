@@ -20,7 +20,7 @@
 //!   and whose FastOptions come from the input — the cookie, the inner
 //!   padata scan, the FastOptions check and keyd's challenge decoding.
 //!
-//! Invariants checked on every reply (AGENTS.md §6; main-session decisions
+//! Invariants checked on every reply (docs/CLEAN-ROOM.md; main-session decisions
 //! 1, 11, 12): nothing panics; a reply is bounded and decodes as AS-REP,
 //! TGS-REP or KRB-ERROR; a KRB-ERROR never carries e-text, and its e-data,
 //! when present, is METHOD-DATA.
@@ -37,7 +37,7 @@
 //! is bounded, so state growth is bounded.
 //!
 //! Spec: RFC 4120 7.2.1, 7.2.2, 5.1.4, 5.9.1; RFC 6113 5.4.1.1, 5.4.2,
-//! 5.4.3, 5.4.6; docs/48 §9.2 item 16; AGENTS.md §6.
+//! 5.4.3, 5.4.6; docs/48 §9.2 item 16; docs/CLEAN-ROOM.md
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, OnceLock};

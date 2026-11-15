@@ -5,7 +5,7 @@
 //! `VerifySecret` body (password) is read into `Zeroizing`, the frame buffer
 //! zeroized after decoding, in both sides"), §8.2 (no raw request octets in
 //! logs; secret-bearing types without a `Debug` that prints content), R50-4;
-//! docs/10 I7; AGENTS.md §6.
+//! docs/10 I7; docs/CLEAN-ROOM.md
 //!
 //! Observing the memory of a dropped value would need `unsafe` (reading freed
 //! memory), which this workspace forbids. The drop path is therefore verified

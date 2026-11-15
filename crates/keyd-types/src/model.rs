@@ -2,7 +2,7 @@
 //! handles.
 //!
 //! A [`KeyHandle`] names a stored key set — never the key material itself.
-//! Spec: docs/10 §1 (object model); docs/09 א.5 ("references to keys are
+//! Spec: docs/10 §1 (object model); docs/09 A.5 ("references to keys are
 //! handles, not keys").
 
 use core::fmt;
@@ -84,7 +84,7 @@ impl Kvno {
 /// docs/10 §1 (GKDI root, backup key, DC identity) are out of scope and have
 /// no variant.
 ///
-/// Spec: docs/10 §1 (KeyPurpose), §2, §12 I3; docs/09 א.3 (2); docs/52 §3.2,
+/// Spec: docs/10 §1 (KeyPurpose), §2, §12 I3; docs/09 A.3 (2); docs/52 §3.2,
 /// §5 item 3 (R2, the admin service's own purpose; A-102); docs/53 §4.5,
 /// §5.2 (the change-password service's own purpose; A-117).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -213,7 +213,7 @@ impl KeyHandle {
 /// [`KeyPurpose::ChangePasswordService`], every other service
 /// [`KeyPurpose::Service`].
 ///
-/// Class closed (docs/52 R2b, AGENTS.md §6.1): one fact — the purpose of a
+/// Class closed (docs/52 R2b, docs/CLEAN-ROOM.md): one fact — the purpose of a
 /// service object's key set — chosen in several places (the KDC's account
 /// source from the name, but the admin plane's key operations, the
 /// password-set targets and the provisioning manifest each by a literal), so

@@ -88,12 +88,12 @@
 //! password lives in `ipc::Secret` (wire) and a zeroizing `String` (typed),
 //! is never printed by any `Debug` (not even its length), has no `Clone` and
 //! no `PartialEq`; no error carries frame, AP-REQ or password octets
-//! (docs/50 §3.3, §8.2; AGENTS.md §6).
+//! (docs/50 §3.3, §8.2; docs/CLEAN-ROOM.md).
 //!
 //! # Provenance
 //!
 //! Written only from this project's decided design, opened in-session:
-//! AGENT-ONBOARDING, AGENTS, docs/51 (whole), docs/50 (§2.4, §3, §6.4, §7,
+//! docs/CLEAN-ROOM.md, docs/CLEAN-ROOM.md, docs/51 (whole), docs/50 (§2.4, §3, §6.4, §7,
 //! §8, §9, the channel-magic registry), docs/47 §9, docs/10 §2, §6, §10,
 //! docs/questions Q-220, Q-290, Q-291, Q-340, Q-341, Q-350, Q-365, Q-367,
 //! Q-370, Q-378, Q-385..Q-389 and PENDING-OWNER (A-26, A-55, A-56, A-59,
@@ -101,7 +101,7 @@
 //! public API of this project's crates ipc, ipc-dird-admin, dtyp, ipc-keyd;
 //! and the docs.rs API page of zeroize 1.9.1 as already cited in crate ipc
 //! (P-2). No other implementation, management protocol, serializer or RPC
-//! framework was consulted or recalled (AGENTS.md §1-3).
+//! framework was consulted or recalled (docs/CLEAN-ROOM.md).
 //!
 //! Spec: docs/51 §7.1, §7.2, §7.6, R51-7; docs/50 R50-4, §3.3, §7.5, the
 //! channel-magic registry; A-59; A-64; A-72; A-73.

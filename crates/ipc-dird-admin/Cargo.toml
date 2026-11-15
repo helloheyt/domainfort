@@ -15,7 +15,7 @@
 # channel-magic registry, the decisions in docs/questions/PENDING-OWNER.md
 # (A-59, A-63, A-64, A-70, A-72, A-73, A-85, A-87, A-89), and the public API
 # of this workspace's crates. No other implementation was consulted or
-# recalled (AGENTS.md §1-3).
+# recalled (docs/CLEAN-ROOM.md).
 
 [package]
 name = "ipc-dird-admin"
@@ -52,7 +52,7 @@ zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
 # RustCrypto, OD-9; already in the workspace lock and already in dird's graph
 # (dirstore, directory-admin link it). License: MIT OR Apache-2.0. Called only
 # through its documented one-shot `Digest::digest` (docs.rs sha2 0.11.1, as
-# crates/audit-log cites it); no hash is implemented here (AGENTS.md §6). A
+# crates/audit-log cites it); no hash is implemented here (docs/CLEAN-ROOM.md). A
 # hash, not Kerberos crypto: the MIC over the digest is the client's and
 # keyd's (krb-crypto), never this crate's (D182).
 sha2 = { version = "0.11", default-features = false }
@@ -61,7 +61,7 @@ sha2 = { version = "0.11", default-features = false }
 # Unix socket (docs/50 R50-3: "the client verifies that the server's uid is
 # the configured uid"; docs/51 §7.1). Linked, never copied; only its docs.rs
 # API pages were read (P-2). License as recorded in docs/50 §0.3 (MIT /
-# Apache-2.0 alternatives, AGENTS.md §7). Features per the docs.rs pages:
+# Apache-2.0 alternatives, docs/CLEAN-ROOM.md). Features per the docs.rs pages:
 # `net` (`socket_peercred`, "Available on linux_kernel and crate feature net
 # only"), `std` (the `AsFd` the function takes). Linux only: elsewhere the
 # peer check fails closed.

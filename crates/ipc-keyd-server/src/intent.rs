@@ -358,7 +358,7 @@ pub enum Classified {
     KeyStateChange(KeyStateCall),
     /// keyd says it needs an intent but no intent can be derived from it
     /// (cannot happen: the classifications are pinned by tests) — not
-    /// served (fail closed; AGENTS.md §6).
+    /// served (fail closed; docs/CLEAN-ROOM.md).
     Inconsistent,
 }
 

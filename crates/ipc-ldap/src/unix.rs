@@ -109,7 +109,7 @@ fn peer_uid_of(stream: &UnixStream) -> Result<u32, TransportError> {
 }
 
 /// No verified source of peer credentials on this platform: fail closed.
-/// Spec: docs/50 R50-3; AGENTS.md §6 (fail closed).
+/// Spec: docs/50 R50-3; docs/CLEAN-ROOM.md (fail closed).
 #[cfg(not(target_os = "linux"))]
 fn peer_uid_of(_stream: &UnixStream) -> Result<u32, TransportError> {
     Err(TransportError::PeerCredentials)

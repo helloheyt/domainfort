@@ -1,7 +1,7 @@
 #![no_main]
 //! Fuzz target for the security data-type decoders.
 //!
-//! AGENTS.md §6 / docs/32 §8 require a fuzz target for every parser before it
+//! docs/CLEAN-ROOM.md / docs/32 §8 require a fuzz target for every parser before it
 //! merges to `main`. Arbitrary bytes are fed to every decoder in `dtyp`: none
 //! may panic, hang, or over-allocate on any input (each fails closed with a
 //! `Result` error instead). When a decoder accepts the input, the value must

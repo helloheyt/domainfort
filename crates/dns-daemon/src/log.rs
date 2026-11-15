@@ -7,7 +7,7 @@
 //! Not the audit trail. Every message is a fixed text from [`Note`] plus, at
 //! most, a numeric identifier (a count, a SERIAL, an OS error number) —
 //! never request octets, names, addresses, TSIGs or any peer-supplied
-//! string (AGENTS.md §6; docs/50 §8.2: "operational log to stderr in fixed
+//! string (docs/CLEAN-ROOM.md; docs/50 §8.2: "operational log to stderr in fixed
 //! codes + identifiers"; docs/54 §9: "never in a log: message octets, GSS
 //! tokens, MICs … raw key_name"). No record per query (docs/54 §9, R54-11:
 //! "no record per query"). No logging crate (docs/50 §8.2). A failed write
@@ -20,7 +20,7 @@
 //! log") — they are docs/54 §9's counters ("dropped / limited / malformed /
 //! refused").
 //!
-//! Spec: docs/50 §8.2; docs/07 §8; docs/54 §9; AGENTS.md §6.
+//! Spec: docs/50 §8.2; docs/07 §8; docs/54 §9; docs/CLEAN-ROOM.md
 
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};

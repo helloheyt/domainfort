@@ -2,7 +2,7 @@
 //! rule, and "never panic on any input".
 //!
 //! Sources: RFC 4120 5.1.4, 7.2.1, 7.2.2, 7.5.9, 3.1.2; main-session
-//! decisions 1, 11, 12; AGENTS.md §6 (bounded parsers, fail closed). All
+//! decisions 1, 11, 12; docs/CLEAN-ROOM.md (bounded parsers, fail closed). All
 //! inputs hand-made or derived from the test's own valid requests.
 
 mod common;
@@ -247,7 +247,7 @@ fn several_records_on_one_stream() {
     assert!(rest.is_empty());
 }
 
-/// AGENTS.md §6 (never panic; bounded; fail closed): thousands of mutated
+/// docs/CLEAN-ROOM.md (never panic; bounded; fail closed): thousands of mutated
 /// versions of valid AS-REQ and TGS-REQ messages — single-octet changes,
 /// truncations, insertions — over both transports. Every reply is either
 /// nothing (UDP) or a message that decodes as AS-REP, TGS-REP or KRB-ERROR,

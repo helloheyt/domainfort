@@ -7,7 +7,7 @@
 //!
 //! Every malformed stored value is an error: the record was authenticated
 //! by dirstore, so a value that does not decode is an inconsistent record
-//! and the operation fails closed (AGENTS.md §6).
+//! and the operation fails closed (docs/CLEAN-ROOM.md).
 
 use dirstore::{AttrId, Object};
 use dtyp::{Guid, Sid, GUID_PACKET_LEN};

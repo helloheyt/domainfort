@@ -47,7 +47,7 @@
 //!
 //! Sources: docs/51 §5.2, §5.3, §5.6, §5.7, §5.10, §7.1-§7.5; docs/52 §3.2, §5;
 //! docs/50 §3.3, §3.6,
-//! §9; docs/10 §5ב; RFC 4120 §3.2.3, §5.3, §5.5.1, §6.2.1, §7.5.1; [MS-SAMR]
+//! §9; docs/10 §5b; RFC 4120 §3.2.3, §5.3, §5.5.1, §6.2.1, §7.5.1; [MS-SAMR]
 //! 2.2.1.14 (RID 502); [MS-DTYP] 2.4.2.4 (SID layout); docs/11 §2, §8;
 //! A-26, A-56, A-73, A-85, A-89, A-91, P-22. Every value is constructed by
 //! hand for these tests (the
@@ -3404,7 +3404,7 @@ fn withdrawing_or_rejecting_an_approved_key_request_revokes_its_decision() {
     assert_eq!(revoked[1].reason, ipc_audit::KeydReason::DecisionExecuted);
 }
 
-/// Task F3 (docs/questions/Q-977; fail closed, AGENTS.md §6): when keyd
+/// Task F3 (docs/questions/Q-977; fail closed, docs/CLEAN-ROOM.md): when keyd
 /// does not answer the revocation, the `Withdraw` of an approved key
 /// request is answered `Unavailable` (its decision event
 /// `Failed(KeydUnavailable)`) and the request stays approved — keyd's

@@ -339,7 +339,7 @@ fn every_framing_failure_maps_to_malformed_or_bad_version() {
 
 #[test]
 fn errors_carry_no_message_octets() {
-    // AGENTS.md §6: errors are unit variants; nothing of the input can appear
+    // docs/CLEAN-ROOM.md: errors are unit variants; nothing of the input can appear
     // in Debug or Display.
     let m = message(0x1234, &[0xAB; 4], &[0xCD; 4]);
     let err = RequestMessage::parse(&m).unwrap_err();

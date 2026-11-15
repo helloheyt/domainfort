@@ -2,7 +2,7 @@
 //! capability table) and I3 (every handle's purpose matches the operation),
 //! exhaustively over all operations, roles and purposes. Source: docs/10 §2
 //! (capability table; "mismatch -> Denied, recorded"), §12 I2, I3; docs/09
-//! א.6 (D31); docs/52 §4, §7 R1, R3, R4 (A-102: the decision operations,
+//! A.6 (D31); docs/52 §4, §7 R1, R3, R4 (A-102: the decision operations,
 //! `verify_secret` in no role).
 
 mod common;

@@ -6,7 +6,7 @@
 //! alice is a user, so her guesses are armored encrypted challenges (FAST is
 //! mandatory, docs/48 §7, P-10 interim), one armor per attempt (docs/48 §2.3:
 //! one pre-authentication attempt per armor); the throttle counts challenge
-//! failures exactly as PA-ENC-TIMESTAMP failures (docs/10 §5א, A-34). The
+//! failures exactly as PA-ENC-TIMESTAMP failures (docs/10 §5a, A-34). The
 //! test acts as the client (RFC 4120 §3.1; RFC 6113 5.4.6); the passwords and
 //! the policy are made up for these tests.
 

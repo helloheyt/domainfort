@@ -28,7 +28,7 @@
 //!   integrity, [MS-ADTS] 3.1.1.1.6).
 //! - **Unique attributes** (docs/46 §8.5): for every attribute the schema
 //!   marks `unique`, an index from the value's comparison key to the owning
-//!   GUID refuses duplicates. No code path disables it (AGENTS.md §6).
+//!   GUID refuses duplicates. No code path disables it (docs/CLEAN-ROOM.md).
 //! - **Per-value attr-stamps** `(version, wall-clock, origin-node,
 //!   origin-seq)` (docs/29 §2, D119). Every time and node id is supplied by the
 //!   caller ([`Origin`]); the engine reads no clock. The engine computes
@@ -131,7 +131,7 @@
 //! `tools/spec-pin/cache/`). GUID / SID / security-descriptor handling is delegated
 //! to our own `dtyp` crate (its public API and docs, read in-session); the redb,
 //! hmac and sha2 public API docs on docs.rs (PENDING-OWNER P-2). No other
-//! implementation was consulted or recalled (AGENTS.md §1-3).
+//! implementation was consulted or recalled (docs/CLEAN-ROOM.md).
 //!
 //! Spec: docs/32 §1-§8 (D134-D136, D138); docs/29 §2 (D119), §5 (D121);
 //! docs/46 §8; docs/12 D44; docs/11 §6; docs/10 D34; docs/49 §6.1 (R49-9);
@@ -213,7 +213,7 @@ pub const MAX_TOMBSTONES_PER_PAGE: usize = 1000;
 /// objects and tombstones alike, each authenticated): the work of one call
 /// is bounded however few of them are tombstones; the caller continues from
 /// [`TombstonePage::next`]. Spec: docs/32 §8 (bounded work; no number
-/// fixed there); AGENTS.md §6; project choice.
+/// fixed there); docs/CLEAN-ROOM.md; project choice.
 pub const MAX_TOMBSTONE_SCAN: usize = 4096;
 
 /// Longest counter name, in bytes (at least one byte is required). A name is

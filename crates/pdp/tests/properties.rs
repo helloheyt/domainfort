@@ -841,7 +841,7 @@ fn layer2_follows_required_sec_for_every_action() {
 // ------------------------------------- mandatory FAST: never widens ----
 //
 // Source: docs/48 §7.2 (`Match.auth`, option (i); `NotMemberOf`, option
-// (ii)); Q-127 interim decision (P-10, (ג) = (ii)); docs/11 §3 (rules;
+// (ii)); Q-127 interim decision (P-10, (c) = (ii)); docs/11 §3 (rules;
 // explicit Deny wins), §10 (P1, P2, P4, P7). Hand-made domains; no vector
 // from another implementation.
 

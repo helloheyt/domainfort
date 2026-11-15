@@ -148,7 +148,7 @@ fn file_size_bound() {
     assert_eq!((err.line(), err.key()), (None, None));
 }
 
-/// 1024 lines are accepted; line 1025 is refused. Spec: AGENTS.md §6
+/// 1024 lines are accepted; line 1025 is refused. Spec: docs/CLEAN-ROOM.md
 /// (bounded parsers); docs/questions/Q-230 (MAX_LINES).
 #[test]
 fn line_count_bound() {
@@ -185,7 +185,7 @@ fn line_length_bound() {
     assert_eq!(err.kind(), ErrorKind::LineTooLong);
 }
 
-/// Spec: AGENTS.md §6 (bounds); docs/questions/Q-230 (MAX_KEY_OCTETS).
+/// Spec: docs/CLEAN-ROOM.md (bounds); docs/questions/Q-230 (MAX_KEY_OCTETS).
 #[test]
 fn key_length_bound() {
     let long_key = "k".repeat(MAX_KEY_OCTETS + 1);
@@ -677,7 +677,7 @@ fn role_map_rejects_uid_zero() {
     );
 }
 
-/// "Role אחד ל-uid"; "a uid that appears twice ⇒ keyd does not start".
+/// "one Role per uid"; "a uid that appears twice ⇒ keyd does not start".
 /// Spec: docs/50 R50-3, §3.2.
 #[test]
 fn role_map_rejects_the_same_uid_twice() {
@@ -952,7 +952,7 @@ fn listener_addresses() {
     );
 }
 
-/// Spec: AGENTS.md §6 (bounds); docs/questions/Q-230 (MAX_LIST_ITEMS = 32).
+/// Spec: docs/CLEAN-ROOM.md (bounds); docs/questions/Q-230 (MAX_LIST_ITEMS = 32).
 #[test]
 fn list_item_bound() {
     let max = config::limits::MAX_LIST_ITEMS;
@@ -1558,7 +1558,7 @@ fn a_file_parses_only_as_its_own_daemon() {
 }
 
 /// The message is fixed text: line, schema key name, rule — nothing else.
-/// Spec: docs/50 §8.2 ("errors carry a code, not content"); AGENTS.md §6.
+/// Spec: docs/50 §8.2 ("errors carry a code, not content"); docs/CLEAN-ROOM.md
 #[test]
 fn error_display_is_fixed_text() {
     let err = KdcSettings::parse(set(KDC, "listen", "0.0.0.0:88").as_bytes())

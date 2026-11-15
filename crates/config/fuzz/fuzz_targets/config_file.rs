@@ -1,7 +1,7 @@
 #![no_main]
 //! Fuzz target for `config`, the strict daemon configuration parser.
 //!
-//! AGENTS.md §6 / docs/32 §8 (every parser gets a fuzz target before it
+//! docs/CLEAN-ROOM.md / docs/32 §8 (every parser gets a fuzz target before it
 //! merges to main; docs/50 §9 names this target `config_file`). On any octets
 //! all seven schemas (six daemons and the keyadm tool) must return without
 //! panicking, and:
@@ -9,7 +9,7 @@
 //! * input over the file bound, or not ending in LF, is refused by every
 //!   schema (docs/50 §7.1; Q-230 item 2);
 //! * an error names, at most, a key of that daemon's own closed table — never
-//!   input text (AGENTS.md §6; docs/50 §8.2);
+//!   input text (docs/CLEAN-ROOM.md; docs/50 §8.2);
 //! * an accepted file contains only printable ASCII and LF (docs/50 §7.1);
 //! * an accepted keyd file's `uid → Role` map is non-empty, never maps uid 0,
 //!   maps each uid once and never keyd's own uid (docs/50 R50-3, §3.2); the

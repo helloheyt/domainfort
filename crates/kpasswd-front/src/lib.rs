@@ -80,7 +80,7 @@
 //!
 //! `#![forbid(unsafe_code)]`; no `unwrap`, `expect` or `panic!` outside
 //! tests. Nothing logged carries request octets, names, addresses or any
-//! peer-supplied string (AGENTS.md §6; docs/53 §9; docs/50 §8.2); the
+//! peer-supplied string (docs/CLEAN-ROOM.md; docs/53 §9; docs/50 §8.2); the
 //! request buffer is wiped. Weak options have no code path: no UDP
 //! (A-117), no version 1 (P-31 open; A-142), no result string, no
 //! unauthenticated success.
@@ -111,7 +111,7 @@
 //! # Provenance
 //!
 //! Written only from this project's decided design, opened in-session:
-//! AGENT-ONBOARDING, AGENTS, docs/53 (all; esp. R53-2, R53-3, R53-4, §3.2,
+//! docs/CLEAN-ROOM.md, docs/CLEAN-ROOM.md, docs/53 (all; esp. R53-2, R53-3, R53-4, §3.2,
 //! §3.3, §4, §5.1, §5.5–§5.9, §8, §9, §10 K8), docs/50 (R50-3, R50-14,
 //! R50-16, R50-17; §3.1–§3.7; §4.1; §6; §7.1, §7.5; §8.1, §8.2), docs/52 §7
 //! R14, docs/research/r3-e (§3), docs/questions PENDING-OWNER (A-57, A-87,
@@ -128,7 +128,7 @@
 //! kdc-daemon as the pattern); and the docs.rs API pages of tokio 1.54.1
 //! and zeroize 1.9.1 — API documentation only, never source (P-2). No other
 //! implementation, kpasswd server, daemon or server framework was consulted
-//! or recalled (AGENTS.md §1-3).
+//! or recalled (docs/CLEAN-ROOM.md).
 //!
 //! Spec: docs/53 R53-2, R53-3, R53-4, §3.3, §5.1, §5.7, §9, §10 (K8); RFC
 //! 3244 §2; RFC 4120 §5.9.1; A-57; A-117; A-121; A-142; A-160.

@@ -1,4 +1,4 @@
-# cargo-fuzz harness for ipc-admin (AGENTS.md §6: every parser gets a fuzz
+# cargo-fuzz harness for ipc-admin (docs/CLEAN-ROOM.md: every parser gets a fuzz
 # target before it merges to main; docs/51 §7.6: "crate `ipc-admin` + fuzz
 # targets").
 #
@@ -11,7 +11,7 @@
 #
 # NOTE FOR REVIEW: libfuzzer-sys is fuzz-harness-only test infrastructure, not
 # linked into any product crate, and on the license allowlist (MIT / Apache-2.0,
-# AGENTS.md §7). Pending owner sign-off (docs/questions/PENDING-OWNER.md P-1);
+# docs/CLEAN-ROOM.md). Pending owner sign-off (docs/questions/PENDING-OWNER.md P-1);
 # not built or run until then.
 
 [package]

@@ -11,7 +11,7 @@
 //! decodes re-encodes to exactly the input, with the same digest.
 //!
 //! Spec: docs/research/r5-a-admin-model.md §3.3; docs/50 §3.3, §9;
-//! AGENTS.md §6 (every parser gets a fuzz target); docs/questions/Q-981.
+//! docs/CLEAN-ROOM.md (every parser gets a fuzz target); docs/questions/Q-981.
 
 use ipc_dird_admin::{plan_digest, EffectPlan};
 use libfuzzer_sys::fuzz_target;

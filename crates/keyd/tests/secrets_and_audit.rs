@@ -1,8 +1,8 @@
 //! Invariants I1 (no long-term key bytes out), I6 (uniform errors,
 //! constant-time comparison facilities), I7 (plaintext taken in zeroizing
 //! containers) and I8 (every operation audited, no secret in audit), plus
-//! redacted Debug output. Source: docs/10 §9, §10, §12; docs/09 א.1, א.5;
-//! docs/52 §4 (A-102: the decision operations); AGENTS.md §6. All values
+//! redacted Debug output. Source: docs/10 §9, §10, §12; docs/09 A.1, A.5;
+//! docs/52 §4 (A-102: the decision operations); docs/CLEAN-ROOM.md All values
 //! are constructed for these tests.
 
 mod common;
@@ -25,7 +25,7 @@ fn z(s: &str) -> Zeroizing<String> {
 /// returns key material: only kvnos, unit, one-time tokens with non-secret
 /// facts, and sealed EncryptedData. Changing any return type breaks this
 /// test and forces a review. There is no read-key operation in any role.
-/// Source: docs/10 §12 I1 ("checking the output types"), §7; docs/09 א.5
+/// Source: docs/10 §12 I1 ("checking the output types"), §7; docs/09 A.5
 /// (export_key / get_key / read_secret / generic crypto absent).
 #[test]
 // The pinned fn-pointer types are long by nature; aliases would hide them.
@@ -157,7 +157,7 @@ fn operation_signatures_return_no_key_material() {
 }
 
 /// I1 at the value level: nothing keyd returns contains a long-term key or
-/// the session key in the clear. Source: docs/10 §12 I1; docs/09 א.4.
+/// the session key in the clear. Source: docs/10 §12 I1; docs/09 A.4.
 #[test]
 fn returned_values_contain_no_key_octets() {
     let mut f = Fixture::new();
@@ -468,7 +468,7 @@ fn renderings(secret: &[u8]) -> Vec<String> {
 
 /// I8: audit records carry no secret — no password text, no key octets (in
 /// any rendering), no session key — across a full set of operations.
-/// Source: docs/10 §10 ("without any secret"), §12 I8; AGENTS.md §6.
+/// Source: docs/10 §10 ("without any secret"), §12 I8; docs/CLEAN-ROOM.md
 #[test]
 fn audit_records_contain_no_secret_bytes() {
     let mut f = Fixture::new();
@@ -536,7 +536,7 @@ fn audit_records_contain_no_secret_bytes() {
 }
 
 /// Debug output of keyd's public values is redacted: no key octets, no
-/// session keys. Source: docs/09 א.7 ("no Debug on key types"); AGENTS.md §6.
+/// session keys. Source: docs/09 A.7 ("no Debug on key types"); docs/CLEAN-ROOM.md
 #[test]
 fn debug_output_is_redacted() {
     let mut f = Fixture::new();

@@ -61,7 +61,7 @@
 //! P-17 / A-77: a documented residual).
 //!
 //! Spec: docs/52 §3.1, §3.3, §3.4, §3.10, §4, §7 R1, R3; docs/51 §4.3, §5.6,
-//! §5.8, §6, §9; docs/10 §2, §6, §6א, §7; docs/questions/Q-460, Q-461,
+//! §5.8, §6, §9; docs/10 §2, §6, §6a, §7; docs/questions/Q-460, Q-461,
 //! Q-462 item 1 (A-102), Q-421 item 2 (the request lifetime), Q-450, Q-451.
 
 use crate::authz::{purpose_permitted, HandleSlot, Operation};
@@ -196,7 +196,7 @@ impl DecisionFamily {
     /// a set-secret decision). A full family refuses a new decision (fail
     /// closed), never evicting a live one.
     /// Spec: docs/questions/Q-450 item 4; [`MAX_KEY_DECISIONS`],
-    /// [`MAX_DESTROY_DECISIONS`]; AGENTS.md §6 (bounded).
+    /// [`MAX_DESTROY_DECISIONS`]; docs/CLEAN-ROOM.md (bounded).
     #[must_use]
     pub const fn capacity(self) -> usize {
         match self {

@@ -30,7 +30,7 @@
 //!
 //! The listing is bounded: each page's cursor must move strictly forward,
 //! and at most [`MAX_PAGES`] pages are read — a peer that loops is refused
-//! (fail closed, AGENTS.md §6).
+//! (fail closed, docs/CLEAN-ROOM.md).
 //!
 //! Spec: docs/51 §6, §9; docs/52 §3.1, §4.2, §4.3, §4.6; docs/10 §7, §9;
 //! A-18; A-35; A-88; A-90; A-102.
@@ -45,7 +45,7 @@ use keyd_types::{
 
 /// Most pages one sweep reads: enough for every destroy decision keyd can
 /// hold ([`MAX_DESTROY_DECISIONS`] in pages of [`MAX_DESTROY_DECISION_PAGE`])
-/// plus one. Project bound (AGENTS.md §6).
+/// plus one. Project bound (docs/CLEAN-ROOM.md).
 pub const MAX_PAGES: usize = MAX_DESTROY_DECISIONS.div_ceil(MAX_DESTROY_DECISION_PAGE) + 1;
 
 /// Why the sweep stopped before the end.

@@ -11,7 +11,7 @@
 //!
 //! Every message is a fixed text from [`Note`] plus, at most, a count — never
 //! request octets, names, addresses, TLS secrets or any peer-supplied string
-//! (AGENTS.md §6; docs/50 §8.2: "operational log to stderr in fixed codes +
+//! (docs/CLEAN-ROOM.md; docs/50 §8.2: "operational log to stderr in fixed codes +
 //! identifiers"; "never logged: raw request bytes … keys"). No logging crate
 //! (docs/50 §8.2; rustls `logging` is off). A failed write to stderr is
 //! ignored, never a panic.
@@ -20,7 +20,7 @@
 //! 1st, 2nd, 4th, 8th … event of each kind, with the running count, so a
 //! flood cannot fill the log (docs/07 §8: "rate limit for the log").
 //!
-//! Spec: docs/50 §8.2; docs/07 §8; AGENTS.md §6.
+//! Spec: docs/50 §8.2; docs/07 §8; docs/CLEAN-ROOM.md
 
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};

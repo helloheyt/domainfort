@@ -1144,7 +1144,7 @@ fn each_context_takes_exactly_one_reply() {
     assert!(f.password_works(&ALICE, "Fable-Crane-41-Moth", ALICE_SALT));
 }
 
-/// docs/53 §5.5 (`max_change_password_contexts`); AGENTS.md §6 (bounded):
+/// docs/53 §5.5 (`max_change_password_contexts`); docs/CLEAN-ROOM.md (bounded):
 /// a full context table refuses a new request (`Unavailable`), never
 /// evicting a live one.
 #[test]
@@ -1272,7 +1272,7 @@ fn set_secret_obeys_the_same_policy() {
 }
 
 // ---------------------------------------------------------------------------
-// The new password never leaves keyd (docs/53 §8, §9; AGENTS.md §6).
+// The new password never leaves keyd (docs/53 §8, §9; docs/CLEAN-ROOM.md).
 // ---------------------------------------------------------------------------
 
 /// docs/53 §9 ("never: the password, the KRB-PRIV / AP-REQ octets, the
@@ -1931,8 +1931,8 @@ fn keyd_refuses_to_start_with_a_minimum_above_the_change_password_maximum() {
 // Task F3: rotating the change-password service's key set through a decision
 // (owner decision A-126 on docs/questions/Q-660 item 11; Q-978). Sources:
 // docs/10 §1 ("keyd holds current + previous; sealing always under the
-// current kvno"), §5ב step 5 (a ticket is opened under the version its kvno
-// names), §6א, §7 (`rotate_key`: "the current goes down to previous";
+// current kvno"), §5b step 5 (a ticket is opened under the version its kvno
+// names), §6a, §7 (`rotate_key`: "the current goes down to previous";
 // `retire_kvno`); RFC 4120 3.1.3 (the ticket sealed with "the encryption
 // key extracted from the server principal's record"); docs/52 §4.2. The
 // rotated key's octets are made up for this test.

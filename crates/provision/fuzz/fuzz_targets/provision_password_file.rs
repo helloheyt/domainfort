@@ -2,7 +2,7 @@
 //! Fuzz target for the content rule of a first administrator's password
 //! file (`provision::first_admin::password_file::parse_password_file`).
 //!
-//! AGENTS.md §6 (every parser gets a fuzz target before it merges to
+//! docs/CLEAN-ROOM.md (every parser gets a fuzz target before it merges to
 //! main); docs/51 §12 task A6; docs/50 §9 (fuzz targets in detached
 //! workspaces until P-1). On any octets the parser must return without
 //! panicking, and:

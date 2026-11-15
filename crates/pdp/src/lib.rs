@@ -122,7 +122,7 @@
 //!   PENDING-OWNER A-117, A-139, A-142; RFC 3244 (pinned copy, sha256
 //!   45b9130f…c378) §2 (the service principal `kadmin/changepw`).
 //!
-//! No other implementation was consulted or recalled (AGENTS.md §1-3).
+//! No other implementation was consulted or recalled (docs/CLEAN-ROOM.md).
 //! Spec gaps, conflicts and design decisions: docs/questions/Q-050 (resolved,
 //! A-21), Q-051 (deferred: owner item P-8 + lab recording), Q-052 (resolved,
 //! A-22), Q-081 (resolved, A-28: the object type tree's class and duplicate

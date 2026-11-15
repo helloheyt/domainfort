@@ -2,7 +2,7 @@
 //! Fuzz target for ad-schema's string inputs: `make_attid` (an OID string,
 //! [MS-DRSR] 5.16.4 over X.690 8.19) and the lDAPDisplayName lookups.
 //!
-//! AGENTS.md §6 requires a fuzz target for every parser before it merges to
+//! docs/CLEAN-ROOM.md requires a fuzz target for every parser before it merges to
 //! `main`. Any input must fail closed (`OidError` / `None`) without a
 //! panic, hang or over-allocation. When `make_attid` accepts an OID, its
 //! result is a prefix-table ATTRTYP: the upper word is one of the

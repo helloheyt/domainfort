@@ -5,18 +5,18 @@
 # First user: ldap-front's check of the operator-supplied DC certificate
 # (docs/50 R50-12, §5.3). Later users: the PKI of docs/35 (chains, PKINIT,
 # EST), which will parse certificates that arrive from the network — hence a
-# crate of its own, like every network-facing parser (AGENT-ONBOARDING §12;
+# crate of its own, like every network-facing parser (docs/CLEAN-ROOM.md;
 # docs/03 §principles), with its own fuzz target.
 #
 # Leaf crate: its only dependency is this workspace's own strict DER codec,
 # so there is nothing third-party to link and nothing for cargo-deny to
-# license-check here (AGENTS.md §7). It interprets no algorithm: the
+# license-check here (docs/CLEAN-ROOM.md). It interprets no algorithm: the
 # AlgorithmIdentifier is returned as octets for the caller to compare with
 # constants it trusts.
 #
 # Written only from RFC 5280 (§4.1, §4.1.1.1-§4.1.1.3, §4.1.2.1-§4.1.2.9,
 # §4.2, Appendix A.1 / A.2) and ITU-T X.690 / X.680 (02/2021), opened
-# in-session from the pinned cache — AGENTS.md §1-3. No other implementation
+# in-session from the pinned cache — docs/CLEAN-ROOM.md No other implementation
 # consulted or recalled.
 
 [package]

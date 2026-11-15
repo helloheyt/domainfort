@@ -603,7 +603,7 @@ fn renderings(secret: &[u8]) -> Vec<String> {
 /// exactly one audit record, and no record carries key bytes (in any
 /// rendering) or password text. Source: docs/questions/Q-115 (A-35:
 /// "zeroize + audit"); docs/10 §10 ("without any secret"), §12 I8;
-/// AGENTS.md §6.
+/// docs/CLEAN-ROOM.md
 #[test]
 fn destroy_key_set_audit_has_no_key_material() {
     let mut f = Fixture::new();

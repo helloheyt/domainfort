@@ -27,7 +27,7 @@
 # tools/spec-pin/cache/, SHA-256 verified against the manifest), and the
 # docs.rs API pages of rustix 1.1.6 and redb 4.5.0 (API documentation only,
 # never source — P-2). No other implementation and no existing provisioning
-# tool was consulted or recalled (AGENTS.md §1-3).
+# tool was consulted or recalled (docs/CLEAN-ROOM.md).
 
 [package]
 name = "provision"

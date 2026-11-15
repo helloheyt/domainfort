@@ -25,11 +25,11 @@ use krb_proto::{KerberosTime, Realm};
 /// PA-ENC-TIMESTAMP; a TGS-REQ adds one TGT, which in phase 1 carries no
 /// authorization data (no PAC, D124 is phase 2). 64 KiB leaves more than a
 /// hundredfold headroom for phase-2 PACs while bounding the memory one
-/// request can make the KDC hold (AGENTS.md §6). It is a quarter of
+/// request can make the KDC hold (docs/CLEAN-ROOM.md). It is a quarter of
 /// krb-proto's own decoder bound (`limits::MAX_MESSAGE_LEN`, 256 KiB), so the
 /// KDC's check is always the first one a request meets.
 ///
-/// Spec: AGENTS.md §6 (bounded parsers); RFC 4120 7.2.2 (KRB_ERR_FIELD_TOOLONG
+/// Spec: docs/CLEAN-ROOM.md (bounded parsers); RFC 4120 7.2.2 (KRB_ERR_FIELD_TOOLONG
 /// is the code for a length this implementation cannot take).
 pub const MAX_REQUEST_LEN: usize = 64 * 1024;
 
@@ -51,11 +51,11 @@ pub const DEFAULT_RETRANSMIT_CAPACITY: usize = 4096;
 pub const DEFAULT_RETRANSMIT_MAX_OCTETS: usize = 8 * 1024 * 1024;
 
 /// Upper bound for the retransmit-cache entry count (memory bound,
-/// AGENTS.md §6).
+/// docs/CLEAN-ROOM.md).
 pub const MAX_RETRANSMIT_CAPACITY: usize = 1 << 20;
 
 /// Upper bound for the retransmit-cache octet budget (memory bound,
-/// AGENTS.md §6).
+/// docs/CLEAN-ROOM.md).
 pub const MAX_RETRANSMIT_OCTETS: usize = 256 * 1024 * 1024;
 
 /// KDC configuration.
@@ -103,7 +103,7 @@ impl KdcConfig {
     ///   krb-proto's message bound;
     /// - the retransmit bounds are non-zero and within the memory bounds.
     ///
-    /// Spec: RFC 4120 7.2.1, 7.3; docs/10 §1; AGENTS.md §6; docs/50 §7.5.
+    /// Spec: RFC 4120 7.2.1, 7.3; docs/10 §1; docs/CLEAN-ROOM.md; docs/50 §7.5.
     pub fn validate(&self, keyd: &ConfigDescription) -> Result<(), ConfigError> {
         if self.realm.as_bytes() != keyd.realm.as_bytes() {
             return Err(ConfigError::RealmMismatch);

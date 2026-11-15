@@ -12,7 +12,7 @@
 //! client-claimed name), the bind mechanism, the target, the result code
 //! sent, the Notice of Disconnection sent, the connection action and an
 //! internal reason. There is no field for attribute values, filter assertion
-//! values, passwords, SASL credentials or tickets (AGENTS.md §6; docs/07 §8;
+//! values, passwords, SASL credentials or tickets (docs/CLEAN-ROOM.md; docs/07 §8;
 //! docs/49 §10.1). A simple-bind password never reaches the engine at all
 //! (A-52: the canonical profile carries only an empty-or-placeholder
 //! password).
@@ -257,7 +257,7 @@ pub enum AuditReason {
     /// (R49-15), §3.2; RFC 4120 3.3.3.1 (hot-list); RFC 4511 §6.
     IdentityRevoked,
     /// The account source could not answer the re-check (fail closed).
-    /// Spec: docs/49 §4.4; AGENTS.md §6.
+    /// Spec: docs/49 §4.4; docs/CLEAN-ROOM.md
     AccountSourceFailure,
 
     // ---- controls ----------------------------------------------------------
@@ -273,7 +273,7 @@ pub enum AuditReason {
     UnsupportedVersion,
     /// The unauthenticated mechanism of simple bind. Spec: RFC 4513 §5.1.2.
     UnauthenticatedBind,
-    /// Simple bind with a password: no code path (AGENTS.md §6; P-14).
+    /// Simple bind with a password: no code path (docs/CLEAN-ROOM.md; P-14).
     /// Refused before any name lookup and before keyd.
     SimplePasswordBind,
     /// SASL with an empty mechanism. Spec: RFC 4511 §4.2.1.
@@ -352,7 +352,7 @@ pub enum AuditReason {
     /// adminLimitExceeded. Spec: docs/49 §6.5 ("bounded").
     ValueBudgetExceeded,
     /// The tree is deeper than the DN bound: adminLimitExceeded.
-    /// Spec: AGENTS.md §6 (bounded work); directory-pip `MAX_DN_DEPTH`.
+    /// Spec: docs/CLEAN-ROOM.md (bounded work); directory-pip `MAX_DN_DEPTH`.
     DepthExceeded,
     /// The client's timeLimit passed (by the caller's clock): the entries
     /// already sent stand. Spec: RFC 4511 §4.5.1.5, A.2 (timeLimitExceeded).

@@ -51,8 +51,8 @@ use zeroize::{Zeroize, Zeroizing};
 /// The most octets the buffer may hold: the largest message of any framing
 /// state plus one read. Reads are made only while the first message is
 /// incomplete, so this is never reached by a well-behaved peer; reaching it
-/// closes the connection (a defensive bound, AGENTS.md §6).
-/// Spec: docs/49 §2.4; AGENTS.md §6 (bounded parsers).
+/// closes the connection (a defensive bound, docs/CLEAN-ROOM.md).
+/// Spec: docs/49 §2.4; docs/CLEAN-ROOM.md (bounded parsers).
 pub const MAX_BUFFERED_OCTETS: usize = parse_ldap::MAX_AUTH_MESSAGE_OCTETS + READ_CHUNK;
 
 /// Octets read from the client socket per read call at most. Project
@@ -61,7 +61,7 @@ pub const READ_CHUNK: usize = 16 * 1024;
 
 /// The client's cleartext LDAP octets not yet cut into messages (module
 /// documentation: wiped on every move).
-/// Spec: docs/50 §4.3 step 3 ("destroy the cleartext buffer"); AGENTS.md
+/// Spec: docs/50 §4.3 step 3 ("destroy the cleartext buffer"); docs/CLEAN-ROOM.md
 /// §6.
 pub struct WireBuffer {
     octets: Zeroizing<Vec<u8>>,
@@ -82,7 +82,7 @@ impl Default for WireBuffer {
 }
 
 /// Appending would exceed [`MAX_BUFFERED_OCTETS`].
-/// Spec: AGENTS.md §6.
+/// Spec: docs/CLEAN-ROOM.md
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BufferFull;
 
@@ -119,7 +119,7 @@ impl WireBuffer {
     /// # Errors
     /// [`BufferFull`] beyond [`MAX_BUFFERED_OCTETS`]; nothing is appended.
     ///
-    /// Spec: AGENTS.md §6 (no unbounded allocation).
+    /// Spec: docs/CLEAN-ROOM.md (no unbounded allocation).
     pub fn extend(&mut self, input: &[u8]) -> Result<(), BufferFull> {
         let wanted = self
             .octets

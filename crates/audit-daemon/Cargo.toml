@@ -9,7 +9,7 @@
 # Q-252 (A-64), Q-251 (P-20) — the public API of the workspace crates named
 # below, and the docs.rs API pages of tokio 1.54.1 (P-2; never its source).
 # No existing log daemon, journal or audit implementation was consulted or
-# recalled (AGENTS.md §1-3).
+# recalled (docs/CLEAN-ROOM.md).
 
 [package]
 name = "audit-daemon"
@@ -47,7 +47,7 @@ daemon-sandbox = { path = "../daemon-sandbox" }
 protected-file = { path = "../protected-file" }
 # The async runtime — owner decision P-12 (2026-11-13), linked never copied;
 # only its docs.rs API pages were read (P-2). Version 1.54.1, license "MIT"
-# (crates.io metadata, 2026-11-13; on the AGENTS.md §7 allowlist). Features:
+# (crates.io metadata, 2026-11-13; on the docs/CLEAN-ROOM.md allowlist). Features:
 # exactly the docs/50 §10 P0 set, no `macros` / `full`:
 #   rt              — `runtime::Builder`, `Runtime::spawn` / `enter`;
 #   rt-multi-thread — `Builder::new_multi_thread` (the writer holds the main

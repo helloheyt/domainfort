@@ -57,7 +57,7 @@
 //! Q-500, Q-502, Q-510, Q-512, Q-560, Q-570, Q-630) and the docs.rs API
 //! pages of tokio 1.54.1. The split itself: docs/questions/Q-851, A-144,
 //! docs/research/r4-b §5.6. No other implementation, serializer, RPC
-//! framework or audit format was consulted or recalled (AGENTS.md §1-3).
+//! framework or audit format was consulted or recalled (docs/CLEAN-ROOM.md).
 //!
 //! Spec: docs/50 R50-17, §3.6, §3.7, §8.1; docs/52 §3.11 R6 (A-102), §3.12
 //! (task R9b, A-112; Q-512, Q-560); docs/questions/Q-630; Decision: A-144;

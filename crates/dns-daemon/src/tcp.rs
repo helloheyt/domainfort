@@ -23,7 +23,7 @@
 //!    message octets, never reading past the message (the next one waits in
 //!    the socket); the buffer grows only with the octets that arrived
 //!    (crate::limits::TCP_READ_CHUNK), never to the declared length first
-//!    (AGENTS.md §6). The length field bounds a message at 65535 octets by
+//!    (docs/CLEAN-ROOM.md). The length field bounds a message at 65535 octets by
 //!    construction; a message shorter than a header is dns-zone's to refuse
 //!    (row 2: close).
 //! 4. **One message at a time** — read one, answer it, then read the next:

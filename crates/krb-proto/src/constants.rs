@@ -2,7 +2,7 @@
 //! tables opened in-session.
 //!
 //! Names are the RFC's own labels with hyphens written as underscores
-//! (AGENTS.md §4.4). Only the constants the in-scope messages (AS / TGS / AP /
+//! (docs/CLEAN-ROOM.md). Only the constants the in-scope messages (AS / TGS / AP /
 //! KRB-PRIV / KRB-ERROR, FAST armoring of AS / TGS, and the RFC 3244 change
 //! password user data) use are defined; values for out-of-scope or excluded
 //! mechanisms (e.g. PA-PW-SALT, PA-ETYPE-INFO, KRB-SAFE / KRB-CRED, the

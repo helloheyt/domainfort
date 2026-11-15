@@ -4,7 +4,7 @@
 //! §3.3 (the record and header fields), §8.3 (unknown ids refused), §9.1
 //! (C39) and the layout written in crates/keyd-types/src/sealed_store.rs
 //! from it; RFC 3962 §6, §7 and RFC 8009 §2, §5, §7 (key lengths); RFC 4120
-//! §5.2.2, §5.2.9; AGENTS.md §6 (strict, bounded parsers). No specification
+//! §5.2.2, §5.2.9; docs/CLEAN-ROOM.md (strict, bounded parsers). No specification
 //! defines this format, so there is no external vector: the expected octets
 //! below are hand-derived from the layout. No other implementation was
 //! consulted or recalled.
@@ -245,7 +245,7 @@ fn password_source_layout_is_pinned() {
 
 /// RFC 3962 §6 / RFC 8009 §2: the body is the key octets in version and
 /// enctype order, with no length field; it round-trips through views, and a
-/// view's Debug shows no octet (AGENTS.md §6).
+/// view's Debug shows no octet (docs/CLEAN-ROOM.md).
 #[test]
 fn body_round_trips_as_views() {
     let aad = two_version_aad();
@@ -609,7 +609,7 @@ fn header_rules() {
 }
 
 /// A registry that declares lengths over the codec's bounds is refused
-/// (AGENTS.md §6: the codec's bounds do not depend on the registry).
+/// (docs/CLEAN-ROOM.md: the codec's bounds do not depend on the registry).
 #[test]
 fn a_suite_over_the_bounds_is_refused() {
     let mut octets = record_octets(&drawn_aad());

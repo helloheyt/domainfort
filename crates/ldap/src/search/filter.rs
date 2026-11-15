@@ -209,7 +209,7 @@ fn malformed() -> Stop {
 /// assertion parsing, comparison) and the directory. A search candidate is
 /// the directory-backed view ([`CandidateEntry`]); the fuzz hooks use a fixed
 /// in-memory entry (crate::search::fuzz), so that the same code is fuzzed.
-/// Spec: RFC 4511 §4.5.1.7; AGENTS.md §6 (parsers of network input get a
+/// Spec: RFC 4511 §4.5.1.7; docs/CLEAN-ROOM.md (parsers of network input get a
 /// fuzz target).
 pub(super) trait EntryView {
     /// A recognised attribute of this entry.

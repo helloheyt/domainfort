@@ -11,7 +11,7 @@
 //! any other implementation.
 //!
 //! Sources: RFC 4120 §2.2, §3.2.3, §3.3.3.2, §5.3, §5.5.1, §7.5.1, §7.5.5;
-//! [MS-KILE] 3.4.5; docs/10 §2, §5ב, §9, §12; docs/49 §3.3;
+//! [MS-KILE] 3.4.5; docs/10 §2, §5b, §9, §12; docs/49 §3.3;
 //! docs/questions/Q-165 (A-46), Q-180; A-19 (Q-040); A-26 (Q-071).
 
 mod common;
@@ -1001,7 +1001,7 @@ fn password_derived_service_key_never_verifies() {
 // ---------------------------------------------------------------------------
 
 /// The service-context table is bounded and fails closed when full of live
-/// entries; expired entries make room. Source: docs/10 §8, D36; AGENTS.md §6
+/// entries; expired entries make room. Source: docs/10 §8, D36; docs/CLEAN-ROOM.md
 /// (bounded, fail closed).
 #[test]
 fn service_context_table_is_bounded() {
@@ -1065,7 +1065,7 @@ fn destroying_the_service_key_set_discards_its_contexts() {
 
 /// Nothing keyd returns or audits holds the LDAP service key, the service
 /// session key or a subkey — in any rendering; Debug is redacted. Source:
-/// docs/10 §12 I1, I8; AGENTS.md §6 (secrets never in logs or debug
+/// docs/10 §12 I1, I8; docs/CLEAN-ROOM.md (secrets never in logs or debug
 /// output).
 #[test]
 fn no_key_octets_in_outputs_or_audit() {

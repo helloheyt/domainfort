@@ -1,4 +1,4 @@
-# cargo-fuzz harness for dtyp (AGENTS.md §6 / docs/32 §8: every parser gets a
+# cargo-fuzz harness for dtyp (docs/CLEAN-ROOM.md / docs/32 §8: every parser gets a
 # fuzz target before it merges to main).
 #
 # This is a SEPARATE workspace (note the empty [workspace] table below): it is
@@ -9,7 +9,7 @@
 #
 # NOTE FOR REVIEW: libfuzzer-sys is fuzz-harness-only test infrastructure, not
 # linked into any product crate, and on the license allowlist (MIT /
-# Apache-2.0, AGENTS.md §7). It is PENDING OWNER APPROVAL (docs/questions/
+# Apache-2.0, docs/CLEAN-ROOM.md). It is PENDING OWNER APPROVAL (docs/questions/
 # PENDING-OWNER.md, P-1): this harness has not been built or run.
 
 [package]

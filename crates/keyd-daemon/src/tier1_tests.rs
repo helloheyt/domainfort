@@ -417,7 +417,7 @@ fn acknowledge_all(gate: &AuditGate) {
 }
 
 /// docs/50 R50-3, §3.4 (`Ping`: every mapped role; `DescribeConfig`: Kdc,
-/// Ldap); docs/10 §7א; docs/questions/Q-351 (A-87): a mapped Kdc caller is
+/// Ldap); docs/10 §7a; docs/questions/Q-351 (A-87): a mapped Kdc caller is
 /// served both, with keyd's own configuration (the realm of the daemon's
 /// keyd) and the caller role the daemon resolved for it (Kdc).
 #[test]
@@ -494,7 +494,7 @@ fn the_hold_down_runs_on_keyds_clock_from_construction() {
     ));
 }
 
-/// docs/50 R50-5 (keyd reads its own clock) and AGENTS.md §6 (fail closed):
+/// docs/50 R50-5 (keyd reads its own clock) and docs/CLEAN-ROOM.md (fail closed):
 /// an unreadable clock is `Refused::Unavailable`, then close; keyd is not
 /// called (no record).
 #[test]
@@ -1101,7 +1101,7 @@ fn queued_requests_are_answered_before_the_engine_ends() {
     on_exit.recv().unwrap();
 }
 
-/// AGENTS.md §6 (bounded queues; tokio's `mpsc::channel` panics on 0):
+/// docs/CLEAN-ROOM.md (bounded queues; tokio's `mpsc::channel` panics on 0):
 /// a capacity of 0 or above the ceiling is refused.
 #[test]
 fn queue_capacity_is_bounded() {

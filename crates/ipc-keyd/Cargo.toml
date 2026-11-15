@@ -20,7 +20,7 @@
 # rustix 1.1.6 (`net` module, `net::sockopt::socket_peercred`, `net::UCred`,
 # `fs::Uid`, `fd::AsFd`) and zeroize 1.9.1 (`Zeroizing`) — API documentation
 # only, never their source (P-2). No other implementation, serializer or RPC
-# framework was consulted or recalled (AGENTS.md §1-3).
+# framework was consulted or recalled (docs/CLEAN-ROOM.md).
 
 [package]
 name = "ipc-keyd"
@@ -52,7 +52,7 @@ zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
 # socket (docs/50 R50-3: "rustix `socket_peercred` in the synchronous
 # client"). Linked, never copied; only its docs.rs API pages were read (P-2).
 # License as recorded in docs/50 §0.3 ("Apache-2.0 WITH LLVM-exception OR
-# Apache-2.0 OR MIT", satisfied by the plain alternatives, AGENTS.md §7).
+# Apache-2.0 OR MIT", satisfied by the plain alternatives, docs/CLEAN-ROOM.md).
 # Features, per the docs.rs pages read: `net` — `net::sockopt::socket_peercred`
 # ("Available on linux_kernel and crate feature net only") and `net::UCred`;
 # `std` — the `fd::AsFd` the function takes is std's, implemented by

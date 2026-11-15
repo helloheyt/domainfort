@@ -39,7 +39,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// Most RDN components of a DN this crate resolves or produces (project
 /// choice; bounds the walk up and down the tree — dirstore fixes no tree
-/// depth). Spec: AGENTS.md §6 (bounded work on input); docs/47 §8.2.
+/// depth). Spec: docs/CLEAN-ROOM.md (bounded work on input); docs/47 §8.2.
 pub const MAX_DN_DEPTH: usize = 64;
 
 /// The separator of an RDN component, `att=value`, in the directory's own
@@ -201,7 +201,7 @@ fn principal_id(guid: Guid) -> PrincipalId {
 /// Spec: docs/48 §3.1 (armor ticket of a computer account only, D126), §7.2
 /// ("derived by the AccountSource from authoritative data: objectClass
 /// computer → BootstrapAllowed; everything else → Required"), §7.3;
-/// docs/questions/Q-127 interim decision ((ב) = `kind` from objectClass;
+/// docs/questions/Q-127 interim decision ((b) = `kind` from objectClass;
 /// P-10).
 fn armor_facts(kind: AccountKind) -> (KdcAccountKind, ArmorPolicy) {
     match kind {

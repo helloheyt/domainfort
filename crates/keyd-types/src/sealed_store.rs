@@ -53,7 +53,7 @@
 //! trait: no AEAD is approved for keyd yet (docs/research/r4-a §4 G1,
 //! docs/questions/Q-840), so this module assigns no code.
 //!
-//! # Strictness (AGENTS.md §6)
+//! # Strictness (docs/CLEAN-ROOM.md)
 //!
 //! Every parser here checks the whole input against a fixed bound before it
 //! reads a field, checks each length against its own bound **and** against
@@ -79,7 +79,7 @@
 //! Spec: docs/research/r4-c-key-lifecycle.md §3.3, §3.6, §3.7, §8.1, §8.3,
 //! §9.1; PENDING-OWNER A-143; docs/10 §1; RFC 4120 §5.2.2, §5.2.9, §6.2;
 //! RFC 3961 §8; RFC 3962 §4, §6, §7; RFC 8009 §2, §5, §7; docs/38 §1, §2
-//! (D159); AGENTS.md §6.
+//! (D159); docs/CLEAN-ROOM.md
 
 use crate::decision::CeremonyState;
 use crate::enctype::EncTypeId;
@@ -116,7 +116,7 @@ pub const STORE_ID_LEN: usize = 16;
 /// Bound on the realm and on each name component of a binding, in octets.
 /// Not an RFC 4120 rule (§5.2.1 bounds no KerberosString); a project choice
 /// equal to the bound on a salt — docs/questions/Q-905 item 2.
-/// Spec: RFC 4120 §5.2.1, §5.2.2; AGENTS.md §6.
+/// Spec: RFC 4120 §5.2.1, §5.2.2; docs/CLEAN-ROOM.md
 pub const MAX_NAME_OCTETS: usize = 1024;
 
 /// Bound on a string-to-key salt, in octets: the bound the keyd channel puts
@@ -144,18 +144,18 @@ pub const MAX_KEY_OCTETS: usize = 32;
 /// Bound on what a suite may add to a plaintext when sealing, in octets
 /// (nonce, tag). A codec bound, not a cryptographic parameter: a registry
 /// that declares more is refused ([`FormatError::BadSuiteParameters`]).
-/// Spec: AGENTS.md §6 (bounded); docs/questions/Q-906.
+/// Spec: docs/CLEAN-ROOM.md (bounded); docs/questions/Q-906.
 pub const MAX_SEAL_OVERHEAD: usize = 64;
 
 /// Bound on a suite's record digest, in octets. A codec bound, like
 /// [`MAX_SEAL_OVERHEAD`].
-/// Spec: AGENTS.md §6; docs/questions/Q-906.
+/// Spec: docs/CLEAN-ROOM.md; docs/questions/Q-906.
 pub const MAX_DIGEST_OCTETS: usize = 64;
 
 /// Bound on the number of key records of one store: the capacity of keyd's
 /// development store (`keyd_daemon::startup::KEY_STORE_CAPACITY`), a
 /// project choice (docs/questions/Q-230 item 12).
-/// Spec: AGENTS.md §6; r4-c §3.3.
+/// Spec: docs/CLEAN-ROOM.md; r4-c §3.3.
 pub const MAX_KEY_RECORDS: usize = 4096;
 
 /// Fixed octets at the start of a record's associated data: magic, format
@@ -173,7 +173,7 @@ const MAX_VERSION_OCTETS: usize =
     4 + 1 + 2 + MAX_SALT_OCTETS + 1 + S2K_PARAMS_LEN + 1 + MAX_RECORD_ENCTYPES * 4;
 
 /// Bound on a record's associated data, in octets.
-/// Spec: AGENTS.md §6 (the whole input is bounded before any field is read).
+/// Spec: docs/CLEAN-ROOM.md (the whole input is bounded before any field is read).
 pub const MAX_RECORD_AAD_OCTETS: usize =
     RECORD_FIXED_OCTETS + MAX_BINDING_OCTETS + 1 + MAX_VERSIONS * MAX_VERSION_OCTETS;
 
@@ -182,7 +182,7 @@ pub const MAX_RECORD_AAD_OCTETS: usize =
 pub const MAX_BODY_OCTETS: usize = MAX_VERSIONS * MAX_RECORD_ENCTYPES * MAX_KEY_OCTETS;
 
 /// Bound on a whole key record, in octets.
-/// Spec: AGENTS.md §6.
+/// Spec: docs/CLEAN-ROOM.md
 pub const MAX_KEY_RECORD_OCTETS: usize =
     MAX_RECORD_AAD_OCTETS + MAX_BODY_OCTETS + MAX_SEAL_OVERHEAD;
 
@@ -191,7 +191,7 @@ pub const MAX_KEY_RECORD_OCTETS: usize =
 const HEADER_FIXED_OCTETS: usize = 4 + 2 + 2 + STORE_ID_LEN + 8 + 1 + 4;
 
 /// Bound on the whole store header, in octets.
-/// Spec: AGENTS.md §6.
+/// Spec: docs/CLEAN-ROOM.md
 pub const MAX_STORE_HEADER_OCTETS: usize =
     HEADER_FIXED_OCTETS + MAX_DIGEST_OCTETS + MAX_SEAL_OVERHEAD;
 
@@ -210,8 +210,8 @@ const CEREMONY_PROVISIONING: u8 = 1;
 const CEREMONY_SEALED: u8 = 2;
 
 /// Why an encoding was refused. Carries no data — no field, octet or length
-/// of the input reaches it (AGENTS.md §6: nothing secret in an error).
-/// Spec: AGENTS.md §6; r4-c §3.7 step 5 ("every failure ⇒ keyd does not
+/// of the input reaches it (docs/CLEAN-ROOM.md: nothing secret in an error).
+/// Spec: docs/CLEAN-ROOM.md; r4-c §3.7 step 5 ("every failure ⇒ keyd does not
 /// start").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormatError {
@@ -297,7 +297,7 @@ pub trait SealingSuite: Copy + Eq + fmt::Debug {
 }
 
 /// The suite of `code`, with its lengths inside the codec's bounds.
-/// Spec: docs/38 §2 (floor); AGENTS.md §6.
+/// Spec: docs/38 §2 (floor); docs/CLEAN-ROOM.md
 fn suite_of<S: SealingSuite>(code: u16) -> Result<S, FormatError> {
     let suite = S::from_code(code).ok_or(FormatError::UnknownSuite)?;
     check_suite(suite)?;
@@ -305,7 +305,7 @@ fn suite_of<S: SealingSuite>(code: u16) -> Result<S, FormatError> {
 }
 
 /// The suite's lengths are inside the codec's bounds; the code maps back to
-/// the suite. Spec: AGENTS.md §6.
+/// the suite. Spec: docs/CLEAN-ROOM.md
 fn check_suite<S: SealingSuite>(suite: S) -> Result<(), FormatError> {
     let digest = suite.digest_len();
     let consistent = S::from_code(suite.code()) == Some(suite);
@@ -424,7 +424,7 @@ impl<S: SealingSuite> KeyRecordAad<S> {
     /// list, a previous kvno not below the current one, a name with no
     /// component.
     ///
-    /// Spec: r4-c §3.3; AGENTS.md §6.
+    /// Spec: r4-c §3.3; docs/CLEAN-ROOM.md
     pub fn encode(&self) -> Result<Vec<u8>, FormatError> {
         check_suite(self.suite)?;
         check_versions(&self.current, self.previous.as_ref())?;
@@ -491,7 +491,7 @@ impl<'a, S: SealingSuite> KeyRecord<'a, S> {
     /// [`FormatError`] — every input this codec did not produce is refused
     /// (module documentation, "Strictness").
     ///
-    /// Spec: r4-c §3.3, §3.7 step 5, §8.3; AGENTS.md §6.
+    /// Spec: r4-c §3.3, §3.7 step 5, §8.3; docs/CLEAN-ROOM.md
     pub fn parse(input: &'a [u8]) -> Result<Self, FormatError> {
         if input.len() > MAX_KEY_RECORD_OCTETS {
             return Err(FormatError::TooLarge);
@@ -567,7 +567,7 @@ pub const fn record_key_octets(enctype: EncTypeId) -> usize {
 
 /// One key of a plaintext body: its encryption type and a view of its
 /// octets in the caller's buffer. `Debug` shows the type and the length
-/// only — never an octet (AGENTS.md §6).
+/// only — never an octet (docs/CLEAN-ROOM.md).
 /// Spec: RFC 3962 §6; RFC 8009 §2.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct KeyOctets<'a> {
@@ -604,7 +604,7 @@ impl<'a> VersionKeys<'a> {
 /// A parsed plaintext body: views of the current version's keys and, when
 /// kept, the previous version's — into the caller's buffer, which the caller
 /// keeps in zeroizing memory (this crate never copies key material).
-/// Spec: r4-c §3.3; docs/10 §11 (zeroize); AGENTS.md §6.
+/// Spec: r4-c §3.3; docs/10 §11 (zeroize); docs/CLEAN-ROOM.md
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordBody<'a> {
     /// The current version's keys.
@@ -709,7 +709,7 @@ impl<S: SealingSuite> StoreHeader<S> {
     /// count over [`MAX_KEY_RECORDS`], a root digest not of the suite's
     /// digest length.
     ///
-    /// Spec: r4-c §3.3; AGENTS.md §6.
+    /// Spec: r4-c §3.3; docs/CLEAN-ROOM.md
     pub fn encode_fields(&self) -> Result<Vec<u8>, FormatError> {
         check_suite(self.suite)?;
         if self.generation == 0 {
@@ -763,7 +763,7 @@ impl<'a, S: SealingSuite> ParsedHeader<'a, S> {
     /// [`FormatError`] (module documentation, "Strictness").
     ///
     /// Spec: r4-c §3.3, §3.7 step 4 ("`format_version` ≥ the floor;
-    /// `store_id`; G against the anchor; the root digest"); AGENTS.md §6.
+    /// `store_id`; G against the anchor; the root digest"); docs/CLEAN-ROOM.md
     pub fn parse(input: &'a [u8]) -> Result<Self, FormatError> {
         if input.len() > MAX_STORE_HEADER_OCTETS {
             return Err(FormatError::TooLarge);
@@ -1023,7 +1023,7 @@ fn write_version(out: &mut Writer, version: &RecordVersion) -> Result<(), Format
 }
 
 /// Parse a record's associated data (the reader stops right after it).
-/// Spec: r4-c §3.3; AGENTS.md §6.
+/// Spec: r4-c §3.3; docs/CLEAN-ROOM.md
 fn read_record_aad<S: SealingSuite>(
     reader: &mut Reader<'_>,
 ) -> Result<KeyRecordAad<S>, FormatError> {
@@ -1170,7 +1170,7 @@ fn write_version_keys(
 
 /// A bounds-checked reader over an input slice: every read checks the
 /// remaining length first and never panics.
-/// Spec: AGENTS.md §6 (strict, bounded parsers).
+/// Spec: docs/CLEAN-ROOM.md (strict, bounded parsers).
 struct Reader<'a> {
     input: &'a [u8],
     at: usize,
@@ -1246,7 +1246,7 @@ impl<'a> Reader<'a> {
 
 /// A big-endian writer of non-secret fields (secret key octets go only
 /// through [`encode_body_into`], into the caller's buffer).
-/// Spec: AGENTS.md §6.
+/// Spec: docs/CLEAN-ROOM.md
 struct Writer {
     out: Vec<u8>,
 }
@@ -1341,7 +1341,7 @@ mod tests {
     }
 
     /// The reader never reads past its input and refuses a length over its
-    /// bound before taking octets (AGENTS.md §6).
+    /// bound before taking octets (docs/CLEAN-ROOM.md).
     #[test]
     fn reader_is_bounded() {
         let mut r = Reader::new(&[0x00, 0x05, 1, 2]);

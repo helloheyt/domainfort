@@ -1,5 +1,5 @@
 #![no_main]
-//! Fuzz target `ipc_dns_request` (docs/54 §4.6, §10.3; AGENTS.md §6): dird's
+//! Fuzz target `ipc_dns_request` (docs/54 §4.6, §10.3; docs/CLEAN-ROOM.md): dird's
 //! decoding of an arbitrary request body of the dnsd ↔ dird channel. The
 //! checks are in `../bodies/ipc_dns_request.rs`, shared with the crate's
 //! `tests/fuzz_bodies.rs`. Written, not run (PENDING-OWNER P-1).

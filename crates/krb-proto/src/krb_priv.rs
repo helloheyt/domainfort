@@ -84,7 +84,7 @@ secret_octets! {
     ///
     /// Spec: RFC 4120 5.6.1 (user-data "contains the application-specific
     /// data that is being passed from the sender to the recipient"), 5.7.1;
-    /// RFC 3244 §2; AGENTS.md §6.
+    /// RFC 3244 §2; docs/CLEAN-ROOM.md
     UserData
 }
 

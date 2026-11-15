@@ -2,7 +2,7 @@
 //! Fuzz target for `parse_x509::parse_certificate`, the RFC 5280 §4.1
 //! certificate reader.
 //!
-//! AGENTS.md §6 / docs/32 §8 (every parser gets a fuzz target before it
+//! docs/CLEAN-ROOM.md / docs/32 §8 (every parser gets a fuzz target before it
 //! merges to main). On any input the reader must not panic, hang or
 //! over-allocate, and:
 //!

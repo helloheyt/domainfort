@@ -21,7 +21,7 @@
 # crates, and the docs.rs API pages of tokio 1.54.1 and rustix 1.1.6 as
 # already cited in the daemons this crate follows (P-2). No other
 # implementation, management daemon or password service was consulted or
-# recalled (AGENTS.md §1-3).
+# recalled (docs/CLEAN-ROOM.md).
 
 [package]
 name = "admin-daemon"

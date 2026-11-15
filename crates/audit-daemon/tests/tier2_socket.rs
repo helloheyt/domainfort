@@ -354,7 +354,7 @@ fn version_and_magic_errors_follow_the_shared_rules() {
     assert_eq!(server.stop(), Some(Ok(())));
 }
 
-/// Source: AGENTS.md §6 (bounded resources); docs/50 §3.6; Q-265 item 5
+/// Source: docs/CLEAN-ROOM.md (bounded resources); docs/50 §3.6; Q-265 item 5
 /// (connection quota per source), item 8 (counted in the summary).
 #[test]
 fn connections_over_the_quota_are_closed() {

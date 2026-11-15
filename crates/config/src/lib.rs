@@ -67,7 +67,7 @@
 //! and the decisions it cites (docs/questions Q-213, Q-214, Q-219–Q-223 →
 //! A-56/A-57; PENDING-OWNER A-36, A-53, A-55), plus the public API of this
 //! project's crates `keyd` (`Role`), `directory-pip` (`NamingContext`) and
-//! `ldap` (`MAX_QUERY_SECONDS`), all opened in-session (AGENTS.md §1-3). Socket
+//! `ldap` (`MAX_QUERY_SECONDS`), all opened in-session (docs/CLEAN-ROOM.md). Socket
 //! addresses and IP addresses are parsed and printed by the Rust standard
 //! library (`core::net`), used through its API. No other implementation —
 //! of this protocol stack or of any configuration format — was consulted or

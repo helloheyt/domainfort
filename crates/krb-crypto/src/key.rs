@@ -1,7 +1,7 @@
 //! Key types: the protocol key (base key) and the specific keys derived from
 //! it.
 //!
-//! Security (AGENTS.md §6):
+//! Security (docs/CLEAN-ROOM.md):
 //! - Key octets live in a fixed-size buffer (no reallocation can leave stray
 //!   copies) and are zeroized when the value is dropped.
 //! - `Debug` prints only the encryption type / key kind and the length — never

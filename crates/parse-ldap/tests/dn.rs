@@ -5,7 +5,7 @@
 //! 3.1.1.3.1.2.1, 3.1.1.3.1.2.3 and 3.1.1.3.4.1.5, or are built here from the
 //! RFC 4514 §3 grammar and the project rules (Q-080, Q-090, docs/49 §2.4,
 //! docs/46 §8.3). No vector comes from any other implementation or test suite
-//! (AGENTS.md §4.5).
+//! (docs/CLEAN-ROOM.md).
 
 use parse_ldap::dn::{parse_ldap_dn, AttributeType, Dn, DnError, LdapDn, Rdn, OBJECT_GUID_OCTETS};
 use parse_ldap::{MAX_DN_RDNS, MAX_LDAPDN_OCTETS, MAX_RDN_VALUE_OCTETS};
@@ -681,7 +681,7 @@ fn from_directory_rdns_rejections() {
 
 // ---- errors carry no input --------------------------------------------------
 
-// Source: AGENTS.md §6 (nothing attacker-supplied in errors); the Display
+// Source: docs/CLEAN-ROOM.md (nothing attacker-supplied in errors); the Display
 // strings are fixed.
 #[test]
 fn error_display_is_fixed_text() {

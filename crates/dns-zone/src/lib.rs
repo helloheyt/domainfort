@@ -42,7 +42,7 @@
 //!
 //! Written only from the allowed specifications, opened in-session from the
 //! pinned copies in `tools/spec-pin/cache/` with SHA-256 verified against
-//! `tools/spec-pin/manifest.json` (AGENTS.md §1-3): RFC 1034 §3.1, §3.6,
+//! `tools/spec-pin/manifest.json` (docs/CLEAN-ROOM.md): RFC 1034 §3.1, §3.6,
 //! §3.7–§3.7.2, §4.3.1–§4.3.4; RFC 1035 §2.3.1–§2.3.4, §3.1–§3.2.5, §3.3,
 //! §3.3.11, §3.3.13, §3.4.1, §4.1–§4.1.3, §4.2–§4.2.2, §6.2; RFC 2136 §1.1,
 //! §2–§2.3, §3, §3.1, §3.3, §3.8, §7.8, §7.11; RFC 2782 (whole); RFC 4120

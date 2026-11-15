@@ -92,7 +92,7 @@ pub enum KeyOperation {
     /// `rotate_krbtgt(DualControlToken)`.
     RotateKrbtgt,
     /// `rotate_key` of a service object's randomized key set (created by
-    /// `create_key` in the ceremony — docs/10 §5ב; not a computer's
+    /// `create_key` in the ceremony — docs/10 §5b; not a computer's
     /// password-derived one) — `Service`, `AdminService` or (task F3,
     /// A-126) `ChangePasswordService`, as the service's name derives it
     /// ([`KeyTargets::handle_of`]).
@@ -332,7 +332,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
     /// target's [`ServiceKeyHandle`], its purpose derived from its name
     /// ([`KeyTargets::handle_of`]; docs/52 R2b) — and the target's record.
     /// Spec: docs/51 §4.3 steps 5, 8, 11, §6; [MS-SAMR] 2.2.1.14 (RID 502);
-    /// docs/10 §5ב, §7; docs/questions/Q-420, Q-493 item 1.
+    /// docs/10 §5b, §7; docs/questions/Q-420, Q-493 item 1.
     pub(crate) fn key_target(
         &self,
         cx: &Cx<'_, '_, '_>,

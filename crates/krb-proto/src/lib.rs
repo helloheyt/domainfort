@@ -114,7 +114,7 @@
 //!
 //! # Naming
 //!
-//! Types and fields use RFC 4120's names (AGENTS.md §4.4), transliterated to
+//! Types and fields use RFC 4120's names (docs/CLEAN-ROOM.md), transliterated to
 //! Rust: hyphens are dropped from type names, which are written in CamelCase
 //! (`KDC-REQ-BODY` → `KdcReqBody`, `EncASRepPart` → `EncAsRepPart`,
 //! `PA-DATA` → `PaData`), and become underscores in field names
@@ -125,7 +125,7 @@
 //! # Provenance
 //!
 //! Written only from the allowed specifications, opened in-session
-//! (AGENTS.md §1-3): RFC 4120 (§1.5, §5, §6.2, §7.5, Appendix A), ITU-T X.680
+//! (docs/CLEAN-ROOM.md): RFC 4120 (§1.5, §5, §6.2, §7.5, Appendix A), ITU-T X.680
 //! (02/2021) clauses 22 and 46 and Table 8, ITU-T X.690 (02/2021) clauses
 //! 8.6, 8.9, 8.10, 8.13, 8.14 and 11.7, and RFC 6113 (§5.2, §5.4, §6, §7,
 //! Appendix B) for FAST. KRB_PRIV and the change-password user data: RFC 4120

@@ -18,7 +18,7 @@
 //! | `version` ≠ 3 | protocolError (2) | RFC 4511 §4.2 ("MUST respond ... protocolError"); no LDAPv2 (R49-17) |
 //! | simple, empty name, empty password | success (0) — identity stays anonymous | RFC 4513 §5.1.1, §2 ("MUST support the anonymous authentication mechanism") |
 //! | simple, name, empty password | unwillingToPerform (53) | RFC 4513 §5.1.2 ("Servers SHOULD by default fail Unauthenticated Bind requests with a resultCode of unwillingToPerform") |
-//! | simple, non-empty password (any name) | authMethodNotSupported (7) | AGENTS.md §6; P-14 (Q-166): no code path, even over TLS; refused before any name lookup and never reaching keyd; RFC 4513 §5.1.3 (empty name + password: "undefined") |
+//! | simple, non-empty password (any name) | authMethodNotSupported (7) | docs/CLEAN-ROOM.md; P-14 (Q-166): no code path, even over TLS; refused before any name lookup and never reaching keyd; RFC 4513 §5.1.3 (empty name + password: "undefined") |
 //! | SASL, empty mechanism | authMethodNotSupported (7) | RFC 4511 §4.2.1 ("MUST return ... authMethodNotSupported") |
 //! | SASL GSSAPI, no TLS | confidentialityRequired (13) | docs/49 §3.1, §4.1 (R49-6); RFC 4513 §6.1 |
 //! | SASL GSSAPI, TLS | authMethodNotSupported (7) until task L7 | docs/49 §12: L7 is blocked on owner item P-13 (RFC 2743) |
@@ -100,7 +100,7 @@ fn decide(request: &BindRequest, tls: bool) -> (ResultCode, AuditReason) {
                 ),
                 // Name/password (or the undefined empty-name form): no code
                 // path. The name is not looked up and keyd is not called.
-                // Spec: AGENTS.md §6; P-14; RFC 4513 §5.1.3.
+                // Spec: docs/CLEAN-ROOM.md; P-14; RFC 4513 §5.1.3.
                 (_, false) => (
                     ResultCode::AuthMethodNotSupported,
                     AuditReason::SimplePasswordBind,

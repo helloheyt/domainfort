@@ -126,7 +126,7 @@
 //! map's principals and subtrees are recognised by the PEP itself).
 //! docs/questions/Q-386.
 //!
-//! Spec: docs/51 §5.2 row 9, §5.3, §7, §12 (A8); docs/10 §2, §5ב, §7א;
+//! Spec: docs/51 §5.2 row 9, §5.3, §7, §12 (A8); docs/10 §2, §5b, §7a;
 //! docs/50 §3.4, §3.6, §3.7; docs/52 §3.2, §5 (R2); RFC 4120 §5.5.1, §7.5.1;
 //! A-56; A-73; A-87; A-89; A-102.
 
@@ -178,7 +178,7 @@ pub const MAX_ADMIN_CONNECTIONS: usize = 2;
 /// serialized"). Project choice.
 pub const ADMIN_QUEUE_CAPACITY: usize = 1;
 
-/// Largest admin queue accepted. Project bound (AGENTS.md §6).
+/// Largest admin queue accepted. Project bound (docs/CLEAN-ROOM.md).
 pub const MAX_ADMIN_QUEUE_CAPACITY: usize = 16;
 
 /// How long the admin thread waits for auditd's acknowledgement of a
@@ -340,7 +340,7 @@ impl RegistrationFailure {
 /// `verify_operation_ticket` for the admin service's key set, bound to an
 /// operation digest, which leaves no service context in keyd (Q-523) — and
 /// the registration of dird's decisions (task A15a; A-102).
-/// Spec: docs/10 §5ב; docs/51 §5.8 option (b), §7.4 step 1; A-73; docs/52
+/// Spec: docs/10 §5b; docs/51 §5.8 option (b), §7.4 step 1; A-73; docs/52
 /// §4.2, §4.3, §5 items 3-4.
 pub trait TicketVerifier: Send {
     /// Verify `ap_req` (the raw `KRB_AP_REQ` DER admind forwarded) under the
@@ -413,7 +413,7 @@ impl<C: ipc_keyd::Connector> KeydTicketVerifier<C> {
     /// # Errors
     /// `ipc_keyd::ClientConfigError` (a keyd uid of 0).
     ///
-    /// Spec: docs/10 §2 (Role `Ldap`), §7א; docs/50 R50-3, §3.7, §7.5 step
+    /// Spec: docs/10 §2 (Role `Ldap`), §7a; docs/50 R50-3, §3.7, §7.5 step
     /// 4; A-73; docs/questions/Q-311, Q-351, Q-466 item 1 (A-102).
     pub fn new(
         connector: C,
@@ -442,7 +442,7 @@ where
     C: ipc_keyd::Connector + Send,
     C::Connection: Send,
 {
-    /// Spec: docs/10 §5ב, §7א; docs/50 §3.7, §7.5 step 4; docs/52 §5 item 3;
+    /// Spec: docs/10 §5b, §7a; docs/50 §3.7, §7.5 step 4; docs/52 §5 item 3;
     /// A-56; A-87 (docs/questions/Q-311); docs/questions/Q-466 (the role and
     /// realm expected of every new connection), Q-523 (no service context).
     fn verify(

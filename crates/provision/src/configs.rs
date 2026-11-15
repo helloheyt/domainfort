@@ -72,7 +72,7 @@ pub const DIRD_KPASSWD_CHANNEL_KEYS: [&str; 2] = ["dird_kpasswd_socket", "kpassw
 /// that no standing authorization exists server-side; ten minutes leaves
 /// an administrator time to obtain a fresh service ticket and an approver
 /// time to act (P-22 dual control), while keyd's replay cache already makes
-/// each AP-REQ single-use (docs/10 §5ב as cited in docs/51 §5.5).
+/// each AP-REQ single-use (docs/10 §5b as cited in docs/51 §5.5).
 /// docs/questions/Q-378 item 1.
 pub const ADMIN_TICKET_AGE_MAX_SECS: u32 = 600;
 

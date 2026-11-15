@@ -609,7 +609,7 @@ fn armor_id_is_one_time_caller_bound_and_short_lived() {
 /// audit record holds the armor key, the subkey, the armor ticket's session
 /// key or the long-term keys; the armor id's Debug shows a short prefix
 /// only. Source: docs/48 §2.2, §9.1 I1, I8, §9.2 item 1; docs/10 §12 I1, I8;
-/// AGENTS.md §6.
+/// docs/CLEAN-ROOM.md
 #[test]
 fn no_armor_key_in_any_output_or_audit_record() {
     let (mut f, tgt) = setup();

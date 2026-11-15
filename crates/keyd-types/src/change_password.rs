@@ -31,7 +31,7 @@
 //! and BAD_VERSION (6) describe a message keyd could not open, never one it
 //! opened, and SOFTERROR (4) / INITIAL_FLAG_NEEDED (7) are keyd's findings,
 //! so none of them is sealable for an acceptable request. Class closed
-//! (AGENTS.md §6.1): "an authenticated reply that states an outcome other
+//! (docs/CLEAN-ROOM.md): "an authenticated reply that states an outcome other
 //! than what was established" — a sealed code is bound to keyd's verdict by
 //! construction, not by the caller's discipline.
 //!
@@ -48,7 +48,7 @@
 //! against tools/spec-pin/manifest.json), [MS-KILE] 3.1.5.12 (as recorded in
 //! docs/53 §2.2), docs/53 §4.5, §5.4-§5.7 and docs/questions/Q-601, Q-603,
 //! Q-604, Q-620 (decisions A-117, A-121), opened in this session. No other
-//! implementation was consulted or recalled (AGENTS.md §1-3).
+//! implementation was consulted or recalled (docs/CLEAN-ROOM.md).
 //!
 //! Spec: RFC 3244 §2; RFC 4120 2.1, 3.2.4, 3.5.2, 5.7.1, 7.1; docs/53 §4.5,
 //! §5.4-§5.7; docs/questions/Q-601 item 2, Q-603, Q-604 (A-117).

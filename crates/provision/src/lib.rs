@@ -96,7 +96,7 @@
 //!
 //! # Provenance
 //!
-//! Written only from, opened in this session: AGENT-ONBOARDING, AGENTS,
+//! Written only from, opened in this session: docs/CLEAN-ROOM.md, docs/CLEAN-ROOM.md,
 //! docs/51 (whole), docs/46 (§4, §5.4, §8), docs/47 (§1.3, §1.4, §3.3, §4,
 //! §6.3), docs/50 (§2.4, §3.1-§3.2, §6.4, §7), docs/32, HANDOFF,
 //! PENDING-OWNER (A-15, A-19, A-57, A-60, A-68, A-69, A-72..A-89, P-2,
@@ -110,7 +110,7 @@
 //! public APIs of this workspace's crates; and the docs.rs API pages of
 //! rustix 1.1.6 and redb 4.5.0 (API documentation only, never source —
 //! P-2). No other implementation and no existing provisioning tool was
-//! consulted or recalled (AGENTS.md §1-3).
+//! consulted or recalled (docs/CLEAN-ROOM.md).
 //!
 //! Interpretations and gaps: docs/questions/Q-375 … Q-379; for
 //! `first-admin-secret` (task A6): Q-410 … Q-414 — that module's own

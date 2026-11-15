@@ -1,6 +1,6 @@
 //! Test vectors for the strict DER codec.
 //!
-//! Every vector names its source. Sources are allowed per AGENTS.md §3/§4.5:
+//! Every vector names its source. Sources are allowed per docs/CLEAN-ROOM.md/§4.5:
 //! examples from ITU-T X.690 (02/2021) and ITU-T X.680 (02/2021), the example
 //! in RFC 4120 §5.2.3, and byte sequences hand-derived from a named clause.
 //! No vector comes from any other implementation's test suite.
@@ -300,7 +300,7 @@ fn rejects_invalid_generalized_time() {
 
 #[test]
 fn rejects_over_depth_nesting() {
-    // AGENTS.md §6 / docs/32 §8: nesting is bounded (MAX_DEPTH). Build a chain of
+    // docs/CLEAN-ROOM.md / docs/32 §8: nesting is bounded (MAX_DEPTH). Build a chain of
     // explicit context tags deeper than the limit, then decode it.
     let mut value = Value::integer(1);
     for _ in 0..(parse_asn1::MAX_DEPTH + 5) {

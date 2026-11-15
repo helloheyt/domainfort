@@ -67,7 +67,7 @@
 //! `#![forbid(unsafe_code)]`; no `unwrap`, `expect` or `panic!` outside
 //! tests. Request bodies (which may carry a password) live only in zeroizing
 //! buffers. Nothing logged carries request octets, keys, tokens or a
-//! peer-supplied string (AGENTS.md §6; docs/50 §8.2).
+//! peer-supplied string (docs/CLEAN-ROOM.md; docs/50 §8.2).
 //!
 //! # Residuals (documented, not hidden)
 //!
@@ -99,9 +99,9 @@
 //! # Provenance
 //!
 //! Written only from this project's decided design, opened in-session:
-//! AGENT-ONBOARDING, AGENTS, docs/50 (§1 R50-3..R50-8, R50-14, R50-16..R50-19;
+//! docs/CLEAN-ROOM.md, docs/CLEAN-ROOM.md, docs/50 (§1 R50-3..R50-8, R50-14, R50-16..R50-19;
 //! §2.4; §3.1-§3.7; §6; §7.1, §7.3, §7.5; §8; §9; §10 P7; the channel-magic
-//! registry), docs/10 (§2, §3, §7א, §9-§12), docs/questions Q-212 (P-17),
+//! registry), docs/10 (§2, §3, §7a, §9-§12), docs/questions Q-212 (P-17),
 //! Q-218 (A-57), Q-222 (A-56), Q-230 (A-60), Q-235 (A-61), Q-240 (A-62),
 //! Q-245 (A-63), Q-250 / Q-252 (A-64), Q-255 (A-65), PENDING-OWNER; the
 //! public API of this project's crates ipc, ipc-keyd, ipc-keyd-server,
@@ -114,7 +114,7 @@
 //! `time::{timeout, sleep}`, `task::{spawn, JoinHandle}`,
 //! `io::{AsyncReadExt, AsyncWriteExt}`) — API documentation only, never
 //! source (P-2). No other implementation, daemon, server framework or RPC
-//! system was consulted or recalled (AGENTS.md §1-3).
+//! system was consulted or recalled (docs/CLEAN-ROOM.md).
 //!
 //! The shared gate, the proof of an acknowledged intent and the one stop
 //! flush (task R6, decision A-102) were written only from docs/52 (§2,
@@ -122,10 +122,10 @@
 //! PENDING-OWNER (A-85, A-87, A-88, A-93, A-102, A-105), docs/questions
 //! Q-313, Q-350, Q-365, Q-470, Q-471 and this repository's own code
 //! (docs/questions/Q-500..Q-503). No other implementation was consulted
-//! or recalled (AGENTS.md §1-3).
+//! or recalled (docs/CLEAN-ROOM.md).
 //!
 //! The key-state change path (decision A-86, task F2) was written only from
-//! docs/10 (§2, §5ב, §6, §7, §10, §12), docs/50 (§3.5, §3.6, §3.7, §8),
+//! docs/10 (§2, §5b, §6, §7, §10, §12), docs/50 (§3.5, §3.6, §3.7, §8),
 //! docs/51 §5.7 (A-85, the precedent), PENDING-OWNER (A-57, A-62..A-67,
 //! A-85), docs/questions Q-218, Q-252, Q-260, Q-265, Q-340, the task's
 //! statement of A-86 / Q-346, and the public API of this project's crates

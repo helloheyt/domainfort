@@ -45,7 +45,7 @@ const _: () = assert!(MAX_PASSWORD_OCTETS as u64 == ipc_keyd::channel::MAX_SECRE
 pub(crate) const LF: u8 = b'\n';
 
 /// Why a line is not a password. Fixed texts; never an octet of the line.
-/// Spec: module documentation; AGENTS.md §6.
+/// Spec: module documentation; docs/CLEAN-ROOM.md
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineError {
     /// Nothing before the terminator.
@@ -75,7 +75,7 @@ impl std::error::Error for LineError {}
 
 /// A password as this tool holds it: zeroized on drop, never printed (its
 /// `Debug` shows nothing), never cloned.
-/// Spec: docs/51 §4.4 ("the buffers are `Zeroizing`"); AGENTS.md §6.
+/// Spec: docs/51 §4.4 ("the buffers are `Zeroizing`"); docs/CLEAN-ROOM.md
 pub struct EnteredPassword(Zeroizing<String>);
 
 impl EnteredPassword {

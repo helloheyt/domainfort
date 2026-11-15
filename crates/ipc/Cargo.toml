@@ -13,7 +13,7 @@
 # for the buffers that may hold secrets (R50-4; docs/10 I7). License: MIT OR
 # Apache-2.0. Written only from this project's decided design (docs/50 §3,
 # §10; docs/10 §2-§3, D34) and the docs.rs API pages of `zeroize` (P-2) —
-# AGENTS.md §1-3. No other implementation consulted or recalled.
+# docs/CLEAN-ROOM.md No other implementation consulted or recalled.
 
 [package]
 name = "ipc"

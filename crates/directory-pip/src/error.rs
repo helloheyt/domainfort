@@ -1,4 +1,4 @@
-//! Errors. None carries a name, a key or any directory value (AGENTS.md §6:
+//! Errors. None carries a name, a key or any directory value (docs/CLEAN-ROOM.md:
 //! no secret, and nothing an attacker could use as an oracle, in errors).
 //!
 //! Every lookup failure inside a view is a [`Fault`]; the trait boundaries
@@ -7,7 +7,7 @@
 //! in-process view is never `AccountSourceError::Unavailable` (that is the
 //! directory process being unreachable, docs/50 §3.7).
 //!
-//! Spec: AGENTS.md §6 ("fail closed"; "secrets never appear in ... error
+//! Spec: docs/CLEAN-ROOM.md ("fail closed"; "secrets never appear in ... error
 //! messages"); docs/47 §5.3 item 3, §8; D40.
 
 use pdp::PipError;
@@ -67,7 +67,7 @@ pub(crate) enum Fault {
 
 impl From<dirstore::Error> for Fault {
     /// Any store error (tamper, inconsistency, I/O, refused input) is
-    /// "cannot tell". Spec: AGENTS.md §6 (fail closed).
+    /// "cannot tell". Spec: docs/CLEAN-ROOM.md (fail closed).
     fn from(_: dirstore::Error) -> Fault {
         Fault::Unavailable
     }

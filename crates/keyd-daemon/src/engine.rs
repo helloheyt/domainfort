@@ -120,7 +120,7 @@ use tokio::sync::{mpsc, oneshot};
 use zeroize::Zeroizing;
 
 /// Largest engine queue accepted by [`Engine::spawn`]. Project bound
-/// (tokio's `mpsc::channel` panics on 0 or "too large"; AGENTS.md §6).
+/// (tokio's `mpsc::channel` panics on 0 or "too large"; docs/CLEAN-ROOM.md).
 pub const MAX_QUEUE_CAPACITY: usize = 1024;
 
 /// The production intent-acknowledgement budget: how long after a key-state
@@ -427,7 +427,7 @@ where
             Classified::Plain(plain) => plain,
             Classified::KeyStateChange(change) => return self.change_key_state(change, queued),
             // keyd and the classification disagree on what needs an intent:
-            // not served (fail closed; AGENTS.md §6).
+            // not served (fail closed; docs/CLEAN-ROOM.md).
             Classified::Inconsistent => return refuse(Refused::Unavailable),
         };
         // A-57: a gating operation reserves its record's slot before keyd

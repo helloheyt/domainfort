@@ -14,7 +14,7 @@
 //! constants it trusts (ldap-front uses rustls-pki-types' documented
 //! `alg_id` constants) — and the validity as [`Time`] values.
 //!
-//! # Strictness (fail closed, AGENTS.md §6)
+//! # Strictness (fail closed, docs/CLEAN-ROOM.md)
 //!
 //! * DER only: every identifier and length is read by parse-asn1's
 //!   `split_element` (definite, minimal); INTEGER, OBJECT IDENTIFIER,
@@ -49,7 +49,7 @@
 //! 8.6, 8.14, 10.1, 10.2, 11.1, 11.2, 11.5-11.8; ITU-T X.680 02/2021
 //! (b69dc475…ee14) Table 1, Table 8, 46, 47 — and the public API of this
 //! workspace's parse-asn1. No other implementation consulted or recalled
-//! (AGENTS.md §1-3).
+//! (docs/CLEAN-ROOM.md).
 //!
 //! Spec: RFC 5280 4.1, 4.1.1, 4.1.2, 4.2; X.690 8, 10, 11; X.680 Table 1.
 

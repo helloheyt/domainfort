@@ -3,7 +3,7 @@
 //! Source: docs/46 §8.5 (an integrity-tagged index from the comparison key to
 //! the GUID for every `unique` attribute; create / modify that would
 //! duplicate a value is refused; maintained in the same transaction; removed
-//! on delete; no code path disables it — AGENTS.md §6); Q-080 (phase-1
+//! on delete; no code path disables it — docs/CLEAN-ROOM.md); Q-080 (phase-1
 //! comparison key for String(Unicode): printable ASCII, A–Z folded; raw bytes
 //! for other syntaxes); [MS-ADTS] v20261026 §3.1.1.5.1.3 (UPN / SPN "MUST be
 //! unique"). Test data is hand-made (tests/common).

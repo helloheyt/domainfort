@@ -2,7 +2,7 @@
 //!
 //! Source of the seed: the self-relative security descriptor of [MS-DTYP]
 //! v20241119 2.5.1.4. Every single-byte substitution and every truncation of
-//! it is fed to each decoder. Properties checked (fail closed, AGENTS.md §6):
+//! it is fed to each decoder. Properties checked (fail closed, docs/CLEAN-ROOM.md):
 //! no decoder panics; whatever decodes re-encodes; re-encoding is a fixed
 //! point (`decode(encode(v)) == v`, `encode(decode(encode(v))) == encode(v)`).
 //! The last test also runs CreateSecurityDescriptor ([MS-DTYP] 2.5.3.4.1) on

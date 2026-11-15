@@ -1,6 +1,6 @@
 //! Error type of the configuration parser.
 //!
-//! Hand-rolled, zero-dependency (AGENTS.md §7). Every [`ErrorKind`] names one
+//! Hand-rolled, zero-dependency (docs/CLEAN-ROOM.md). Every [`ErrorKind`] names one
 //! rule the parser enforces. Fail closed: any rejection means the daemon does
 //! not start (docs/50 §7.1: "unknown / duplicate / missing-required key ⇒ do
 //! not start"; §7.5: "every daemon exits with an error code on any start-up
@@ -11,13 +11,13 @@
 //! never text from the input) and the rule that failed. It never carries the
 //! offending value or any other octet of the file: a value written in the wrong
 //! place could be sensitive by mistake, and secrets never reach error messages
-//! (AGENTS.md §6; docs/50 §8.2: "IPC errors carry a code, not content").
+//! (docs/CLEAN-ROOM.md; docs/50 §8.2: "IPC errors carry a code, not content").
 
 use core::fmt;
 
 /// Which rule a configuration file broke.
 ///
-/// Spec: docs/50 R50-15, §7.1 (the format and its rules); AGENTS.md §6
+/// Spec: docs/50 R50-15, §7.1 (the format and its rules); docs/CLEAN-ROOM.md
 /// (strict, bounded parsers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -27,7 +27,7 @@ pub enum ErrorKind {
     /// Spec: docs/50 §7.1 ("file ≤ 64 KiB").
     FileTooLarge,
     /// The file has more than [`crate::limits::MAX_LINES`] lines.
-    /// Spec: AGENTS.md §6 (bounded parsers); project choice (limits).
+    /// Spec: docs/CLEAN-ROOM.md (bounded parsers); project choice (limits).
     TooManyLines,
     /// A line (without its LF) is longer than
     /// [`crate::limits::MAX_LINE_OCTETS`]. Spec: docs/50 §7.1 ("line ≤ 1024").
@@ -38,7 +38,7 @@ pub enum ErrorKind {
     InvalidCharacter,
     /// The file does not end with LF: its last line is cut (for example a torn
     /// write), so its value cannot be trusted to be complete.
-    /// Spec: docs/50 §7.1 (fail closed); AGENTS.md §6.
+    /// Spec: docs/50 §7.1 (fail closed); docs/CLEAN-ROOM.md
     MissingFinalNewline,
     /// A line that is neither empty, nor a comment starting with `#` in its
     /// first column, nor exactly `key = value` (a key at the start of the line,
@@ -47,10 +47,10 @@ pub enum ErrorKind {
     /// Spec: docs/50 R50-15 ("`key = value` lines"), §7.1.
     MalformedLine,
     /// A key is longer than [`crate::limits::MAX_KEY_OCTETS`].
-    /// Spec: AGENTS.md §6 (bounds); project choice (limits).
+    /// Spec: docs/CLEAN-ROOM.md (bounds); project choice (limits).
     KeyTooLong,
     /// A value is longer than [`crate::limits::MAX_VALUE_OCTETS`].
-    /// Spec: AGENTS.md §6 (bounds); project choice (limits).
+    /// Spec: docs/CLEAN-ROOM.md (bounds); project choice (limits).
     ValueTooLong,
 
     // ---- the closed key table ----------------------------------------------
@@ -124,7 +124,7 @@ pub enum ErrorKind {
     /// empty item. Spec: docs/50 §7.1; docs/questions/Q-230 item 14.
     InvalidList,
     /// A list with more than [`crate::limits::MAX_LIST_ITEMS`] items.
-    /// Spec: AGENTS.md §6 (bounds); project choice (limits).
+    /// Spec: docs/CLEAN-ROOM.md (bounds); project choice (limits).
     TooManyItems,
     /// A map entry that is not `<uid>:<name>`.
     /// Spec: docs/50 §3.2 (static `uid → Role` map); docs/questions/Q-230
@@ -214,7 +214,7 @@ impl ErrorKind {
 
 /// A configuration rejection: where, which setting, and which rule.
 ///
-/// Spec: docs/50 R50-15, §7.1; AGENTS.md §6 (no secrets in errors).
+/// Spec: docs/50 R50-15, §7.1; docs/CLEAN-ROOM.md (no secrets in errors).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Error {
     line: Option<u32>,

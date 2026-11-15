@@ -5,7 +5,7 @@
 //! immediately after it. The framer reads only the identifier and length
 //! octets of the outer LDAPMessage, compares the announced size with the bound
 //! for the session's authentication state **before any allocation or wait for
-//! contents** (docs/49 §2.4; AGENTS.md §6), and only then reports whether the
+//! contents** (docs/49 §2.4; docs/CLEAN-ROOM.md), and only then reports whether the
 //! whole message is present.
 //!
 //! Lengths follow the wire profile (A-45): definite only, at most

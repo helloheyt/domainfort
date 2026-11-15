@@ -23,7 +23,7 @@
 //! test account in tests — as `Ownership::root_uid` for `provision policy`.
 //!
 //! Spec: docs/51 §4.3 steps 7, 8, 12; docs/50 R50-15, §7.1; A-60 (errors
-//! never echo a value); A-86 (O_NOFOLLOW in every reader); A-96; AGENTS.md
+//! never echo a value); A-86 (O_NOFOLLOW in every reader); A-96; docs/CLEAN-ROOM.md
 //! §6 (bounded reads).
 
 use core::fmt;

@@ -28,7 +28,7 @@
 //!
 //! The check reads only an event's format and shape octets
 //! (`ipc_audit::peek_shape`): the payloads stay opaque and auditd gains no
-//! event parser (AGENTS.md §6; crate::lib "payloads stored opaque"). A
+//! event parser (docs/CLEAN-ROOM.md; crate::lib "payloads stored opaque"). A
 //! payload that does not name a known shape in the current event format is
 //! **not** bound and is stored as before (decided on docs/questions/Q-341:
 //! option (a) — "opaque payloads keep their current behaviour").

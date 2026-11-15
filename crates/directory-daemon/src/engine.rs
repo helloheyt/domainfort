@@ -46,7 +46,7 @@ use tokio::sync::oneshot;
 use zeroize::Zeroizing;
 
 /// Largest engine queue accepted by [`DirectoryEngine::spawn`]. Project
-/// bound (AGENTS.md §6).
+/// bound (docs/CLEAN-ROOM.md).
 pub const MAX_QUEUE_CAPACITY: usize = 1024;
 
 /// How often an idle engine sweeps expired views. Project choice.

@@ -19,7 +19,7 @@
 //! `adts.rs` for [MS-ADTS] 5.1.3.3.x — and **a right is granted only if every
 //! applicable procedure grants it**. Where they agree this is simply their
 //! common result; where they differ it is the stricter one (fail closed —
-//! AGENTS.md §6; D40). The divergences are recorded in Q-050 (resolved,
+//! docs/CLEAN-ROOM.md; D40). The divergences are recorded in Q-050 (resolved,
 //! A-21) and Q-051 (interim conjunction kept; deferred to owner item P-8 and
 //! the lab recording, docs/44). The conjunction is a subset of each
 //! procedure's result, so it can never grant more than either text.

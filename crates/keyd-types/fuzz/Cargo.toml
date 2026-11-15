@@ -1,5 +1,5 @@
 # cargo-fuzz harness for the sealed key store's format parsers in keyd-types
-# (task KL1; AGENTS.md §6 / docs/32 §8: every parser gets a fuzz target before
+# (task KL1; docs/CLEAN-ROOM.md / docs/32 §8: every parser gets a fuzz target before
 # it merges to main). A key-store file is read back from disk, where anyone
 # who can write the disk can change it (r4-c §3.6), so the parsers must never
 # panic, hang or over-allocate on any input.
@@ -12,7 +12,7 @@
 #
 # NOTE FOR REVIEW: libfuzzer-sys is fuzz-harness-only test infrastructure, not
 # linked into any product crate, and on the license allowlist (MIT /
-# Apache-2.0, AGENTS.md §7). Pending owner sign-off (docs/questions/
+# Apache-2.0, docs/CLEAN-ROOM.md). Pending owner sign-off (docs/questions/
 # PENDING-OWNER.md P-1); not built or run until then. The same property runs
 # deterministically in crates/keyd-types/tests/sealed_store_format.rs.
 

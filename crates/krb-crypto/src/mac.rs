@@ -1,5 +1,5 @@
 //! HMAC over the hash functions the AES encryption types use, through the
-//! approved `hmac`, `sha1` and `sha2` crates (AGENTS.md §6: no primitive is
+//! approved `hmac`, `sha1` and `sha2` crates (docs/CLEAN-ROOM.md: no primitive is
 //! implemented here).
 //!
 //! Spec: RFC 3962 §6 (H = SHA-1); RFC 8009 §5 (HMAC-SHA-256 for

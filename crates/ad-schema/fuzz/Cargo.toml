@@ -1,5 +1,5 @@
 # cargo-fuzz harness for ad-schema's OID → ATTRTYP mapping and name lookups
-# (AGENTS.md §6: every parser gets a fuzz target before it merges to main).
+# (docs/CLEAN-ROOM.md: every parser gets a fuzz target before it merges to main).
 # `make_attid` parses a dotted-decimal OID string that a future LDAP layer
 # may take from a client (a numericoid), so it must never panic, hang or
 # over-allocate on any input.
@@ -12,7 +12,7 @@
 #
 # NOTE FOR REVIEW: libfuzzer-sys is fuzz-harness-only test infrastructure, not
 # linked into any product crate, and on the license allowlist (MIT /
-# Apache-2.0, AGENTS.md §7). It is PENDING OWNER APPROVAL (docs/questions/
+# Apache-2.0, docs/CLEAN-ROOM.md). It is PENDING OWNER APPROVAL (docs/questions/
 # PENDING-OWNER.md, P-1): this harness has not been built or run.
 
 [package]

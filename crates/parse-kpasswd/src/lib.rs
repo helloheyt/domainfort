@@ -53,7 +53,7 @@
 //!
 //! # Provenance
 //!
-//! Written only from the allowed specifications, opened in-session (AGENTS.md
+//! Written only from the allowed specifications, opened in-session (docs/CLEAN-ROOM.md
 //! §1-3): RFC 3244 §2 (read in full, pinned SHA-256 `45b9130f…dec378`) and RFC
 //! 4120 §5.5.1, §5.5.2, §5.7.1, §5.9.1 (pinned) for the message names; and the
 //! project's design docs/53 (§3.2, §3.3, §5.1, §5.7, §5.9, §10 K2) with decision

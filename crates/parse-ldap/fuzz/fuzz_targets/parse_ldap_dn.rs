@@ -1,7 +1,7 @@
 #![no_main]
 //! Fuzz target for `parse_ldap::dn`, the RFC 4514 / `<GUID=hex>` DN parser.
 //!
-//! AGENTS.md §6 / docs/32 §8 (every parser gets a fuzz target before it
+//! docs/CLEAN-ROOM.md / docs/32 §8 (every parser gets a fuzz target before it
 //! merges to main; docs/49 §2.5: "`dn` when the DN module is written"). On any
 //! UTF-8 input the parser must not panic, and:
 //!

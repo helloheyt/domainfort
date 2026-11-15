@@ -3,7 +3,7 @@
 //! parses from a record payload): `ipc_audit::decode_event`, and the
 //! two-octet `ipc_audit::peek_shape` auditd uses for the source binding.
 //!
-//! AGENTS.md §6 / docs/50 §9 (R50-19, target `ipc_audit_event`): arbitrary
+//! docs/CLEAN-ROOM.md / docs/50 §9 (R50-19, target `ipc_audit_event`): arbitrary
 //! bytes → decoder; never a panic, bounded allocation (every count and
 //! length is checked against its bound first). Whatever decodes must
 //! re-encode to exactly the input (docs/50 §3.3: one encoding per value),

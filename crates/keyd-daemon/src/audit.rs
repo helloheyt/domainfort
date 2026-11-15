@@ -26,7 +26,7 @@
 //!   change, which keyd cannot take back and whose intent is already
 //!   acknowledged (next section, A-86).
 //! * **Not gating** — `describe_config` and `ping`, which touch no key, token,
-//!   throttle or replay cache (docs/10 §7א): they run whatever the audit
+//!   throttle or replay cache (docs/10 §7a): they run whatever the audit
 //!   state, and their records are offered as noise (queued within the noise
 //!   share of the window, otherwise counted into a `WindowSummary`). This
 //!   keeps the health check and the kdc's start-up `DescribeConfig` (docs/50
@@ -117,7 +117,7 @@ use tokio::sync::Notify;
 
 /// Most records [`RecordBuffer`] holds for one operation. keyd emits exactly
 /// one (docs/10 I8); more is a fault the engine refuses on (fail closed).
-/// Project bound (AGENTS.md §6: no unbounded growth).
+/// Project bound (docs/CLEAN-ROOM.md: no unbounded growth).
 pub const MAX_RECORDS_PER_OPERATION: usize = 4;
 
 /// keyd's audit sink in the daemon: the records of the operation in progress.
@@ -165,7 +165,7 @@ impl AuditSink for RecordBuffer {
 /// An exhaustive match: a new keyd operation does not compile until it is
 /// classified here.
 ///
-/// Spec: docs/questions/Q-218 (A-57), Q-252 item 8 (A-64); docs/10 §7א
+/// Spec: docs/questions/Q-218 (A-57), Q-252 item 8 (A-64); docs/10 §7a
 /// (`describe_config` / `ping`: no key, no secret); docs/questions/Q-260
 /// item 1.
 #[must_use]

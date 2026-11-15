@@ -1,34 +1,35 @@
-# Workspace — פרצוף נייטיבי (שלב 1) בבנייה. ההתקדמות: docs/45 §10.
+# Workspace — the native face (phase 1), under construction. Progress: docs/STATUS.md.
 #
-# גייט ליצירת crates: OD-1 (אישור משפטי) — **נסגר 2026-11-12** ✓.
-# ה-crates שב-members לא תלויים בהקלטת-המעבדה. קוד שמול Windows (PAC, NDR,
-# פרצוף-Windows) עדיין חסום עד אימות ה-⚠ שלו בהקלטה (docs/44, OD-6).
+# Gate for creating crates: OD-1 (legal approval) — **closed 2026-11-12** ✓.
+# The crates in members do not depend on the lab recording. Windows-facing code (PAC, NDR,
+# the Windows face) is still blocked until its ⚠ items are verified in the recording (OD-6).
 #
-# ה-crates המתוכננים (לפי docs/03-components.md ו-docs/09–11), בסדר קריטיות:
-#   C0:  keyd        — משמורת הסודות (docs/10-keyd-interface.md)
-#        kdc         — הנפקת אימות (docs/30-kdc-core-flows.md)
-#        pdp         — ליבת ההחלטה (docs/11-pdp-interface.md)
-#   C1:  dirstore    — אחסון + מודל אבטחה (docs/32 — מעל redb, OD-4)
-#        rpc         — DCE/RPC + שירותי RPC
-#        repl        — שכפול נייטיבי (docs/29, שלב 4)
-#   C2:  parse-*     — parsers מבודדים (asn1, ndr, dns, smb, gss)
+# The planned crates (see docs/ARCHITECTURE.md and docs/STATUS.md), in order of criticality:
+#   C0:  keyd        — custody of the secrets
+#        kdc         — issuing authentication
+#        pdp         — the decision core
+#   C1:  dirstore    — storage + security model (on top of redb, OD-4)
+#        rpc         — DCE/RPC + RPC services
+#        repl        — native replication (phase 4)
+#   C2:  parse-*     — isolated parsers (asn1, ndr, dns, smb, gss)
 #
-# כל parser שמול הרשת = crate נפרד, לתהליך נפרד עם sandbox (docs/03 §עקרונות).
+# Every network-facing parser = a separate crate, for a separate process with a sandbox
+# (docs/ARCHITECTURE.md, "Design rules").
 #
-# תלויות מאושרות (הכרעות 2026-11-12, מקושרות לא-מועתקות — D2; יירשמו ב-Cargo של
-# כל crate כשייווצר): redb (אחסון, OD-4); RustCrypto כברירת-מחדל + aws-lc-rs
-# כ-backend מאומת-FIPS, ו-rustls ל-TLS (קריפטו/PQC, OD-9/D180).
-# הכרעת-בעלים 2026-11-13 (P-12): tokio (runtime אסינכרוני) ו-rustix (זיהוי-עמית בלי unsafe
-# בקוד שלנו). כל התלויות יורדות אצל מי שבונה (`scripts/install-deps.sh` / cargo) — שום קוד
-# של צד-שלישי לא נמצא במאגר.
+# Approved dependencies (decisions of 2026-11-12, linked, not copied — D2; recorded in each
+# crate's Cargo.toml when it is created): redb (storage, OD-4); RustCrypto as the default + aws-lc-rs
+# as the FIPS-validated backend, and rustls for TLS (crypto/PQC, OD-9/D180).
+# Owner decision 2026-11-13 (P-12): tokio (asynchronous runtime) and rustix (peer identification
+# without unsafe in our code). All dependencies are downloaded by whoever builds
+# (`scripts/install-deps.sh` / cargo; see docs/BUILDING.md) — no third-party code is in the repository.
 
 [workspace]
 resolver = "2"
 members = ["crates/parse-asn1", "crates/krb-crypto", "crates/krb-proto", "crates/dtyp", "crates/dirstore", "crates/pdp", "crates/keyd", "crates/kdc", "crates/ad-schema", "crates/directory-pip", "crates/parse-ldap", "crates/ldap", "crates/config", "crates/ipc", "crates/daemon-sandbox", "crates/ipc-keyd", "crates/audit-log", "crates/ipc-audit", "crates/ipc-audit-client", "crates/keyd-types", "crates/ipc-keyd-server", "crates/audit-daemon", "crates/keyd-daemon", "crates/ipc-directory", "crates/ipc-directory-server", "crates/directory-daemon", "crates/policy-store", "crates/kdc-daemon", "crates/ipc-ldap", "crates/ipc-ldap-server", "crates/ldap-front", "crates/parse-x509", "crates/e2e-tests", "crates/provision-manifest", "crates/keyadm", "crates/directory-admin", "crates/ipc-dird-admin", "crates/provision", "crates/ipc-admin", "crates/admin-daemon", "crates/admin-password-policy", "crates/protected-file", "crates/test-scratch", "crates/parse-kpasswd", "crates/parse-dns", "crates/dns-zone", "crates/ipc-dns", "crates/ipc-dns-server", "crates/rate-limit", "crates/dns-daemon", "crates/ipc-kpasswd", "crates/kpasswd-front"]
 
-# מדיניות build לכלל ה-workspace (תחול כשייווספו crates):
+# Build policy for the whole workspace (applies as crates are added):
 [workspace.lints.rust]
-unsafe_code = "forbid"   # חריג דורש הצדקה כתובה + סוקר שני (AGENTS.md §6)
+unsafe_code = "forbid"   # an exception needs a written justification + a second reviewer (docs/ARCHITECTURE.md, "Design rules")
 
 [workspace.lints.clippy]
 all = "warn"

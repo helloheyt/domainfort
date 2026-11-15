@@ -1,9 +1,9 @@
-# cargo-deny — בקרת תלויות (AGENTS.md §7, החלטה D2).
-# הרצה:  cargo deny check
-# נכשל על רישיון לא ברשימה או על חבילת לוגיקת-פרוטוקול לא מאושרת.
+# cargo-deny — dependency control (docs/SECURITY-MODEL.md, "Dependencies"; decision D2).
+# Run:  cargo deny check
+# Fails on a licence not on the list or on an unapproved protocol-logic package.
 
 [licenses]
-# רשימת הרישיונות המותרים בלבד (AGENTS.md §7). כל דבר אחר (GPL/LGPL/AGPL/MPL/SSPL/לא-ידוע) נדחה.
+# The allowed licences only (docs/SECURITY-MODEL.md, "Dependencies"). Anything else (GPL/LGPL/AGPL/MPL/SSPL/unknown) is refused.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -14,14 +14,14 @@ allow = [
     "Unicode-3.0",
 ]
 confidence-threshold = 0.95
-# חריג נקודתי לרישיון דורש אישור בעלים — יתווסף כאן במפורש עם נימוק, אם בכלל.
+# A one-off licence exception needs owner approval — it would be added here explicitly, with a rationale, if ever.
 exceptions = []
 
 [bans]
 multiple-versions = "warn"
-wildcards = "deny"            # בלי תלות עם גרסת "*"
-# חבילות לוגיקת-פרוטוקול אסורות ללא אישור מפורש (D2): הלוגיקה הזו היא העבודה שלנו.
-# קישור לחבילה כזו = קוד של מישהו אחר שרץ ב-DC. רשימת דוגמאות; מורחבת בסקירה.
+wildcards = "deny"            # no dependency with version "*"
+# Protocol-logic packages are forbidden without explicit approval (D2): that logic is our own work.
+# Linking such a package = someone else's code running in the DC. A list of examples; extended in review.
 deny = [
     { name = "krb5" },
     { name = "kerberos" },
@@ -39,13 +39,13 @@ deny = [
 ]
 
 [advisories]
-# פגיעויות ידועות בתלויות — נכשל על פגיעות, לא רק מתריע.
+# Known vulnerabilities in dependencies — fails on a vulnerability, does not only warn.
 version = 2
 yanked = "deny"
 ignore = []
 
 [sources]
-# מקורות חבילות מותרים בלבד (crates.io הרשמי).
+# Allowed package sources only (the official crates.io).
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]

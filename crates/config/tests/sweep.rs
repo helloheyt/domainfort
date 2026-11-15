@@ -9,7 +9,7 @@
 //! daemon's file. (Arbitrary inputs are the fuzz target's job — docs/50 §9,
 //! `config_file`.)
 //!
-//! Spec: AGENTS.md §6 (strict, bounded parsers; no panic on input); docs/50
+//! Spec: docs/CLEAN-ROOM.md (strict, bounded parsers; no panic on input); docs/50
 //! R50-3, R50-15, §7.1, §9.
 
 mod common;
@@ -99,7 +99,7 @@ fn truncation_sweep() {
 
 /// Every octet of every full sample replaced by each substitute, and every
 /// octet deleted: no panic; errors are well-formed; accepted maps hold their
-/// invariants. Spec: AGENTS.md §6; docs/50 R50-3, R50-15.
+/// invariants. Spec: docs/CLEAN-ROOM.md; docs/50 R50-3, R50-15.
 #[test]
 fn octet_mutation_sweep() {
     for &(daemon, full, _) in ALL {

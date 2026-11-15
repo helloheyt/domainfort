@@ -90,7 +90,7 @@ pub enum AuditReason {
     KvnoMismatch,
     /// The dual-control token does not name two distinct approvers.
     DualControlRejected,
-    /// The entropy source failed (fail closed; AGENTS.md §6).
+    /// The entropy source failed (fail closed; docs/CLEAN-ROOM.md).
     EntropyFailure,
     /// An encryption type outside the configured set (I5).
     UnsupportedEncType,
@@ -293,7 +293,7 @@ pub enum AuditReason {
     GrantInvalid,
     /// `grant_set_secret`: the grant table is full of live grants; the grant
     /// is refused (fail closed) rather than evicting a live one.
-    /// Spec: docs/questions/Q-450 item 4; AGENTS.md §6 (bounded).
+    /// Spec: docs/questions/Q-450 item 4; docs/CLEAN-ROOM.md (bounded).
     GrantTableFull,
     /// A Role::Admin key operation (`rotate_key`, `rotate_krbtgt`,
     /// `retire_kvno`, `destroy_key_set`) named no live decision of its
@@ -316,7 +316,7 @@ pub enum AuditReason {
     /// `register_decision`: the decision's family is full of live
     /// decisions; refused (fail closed), never evicting one. Reported as
     /// `Unavailable`.
-    /// Spec: docs/52 §4.2 ("bounded"); AGENTS.md §6.
+    /// Spec: docs/52 §4.2 ("bounded"); docs/CLEAN-ROOM.md
     DecisionTableFull,
     /// `register_decision`: the id already names a different live decision
     /// of the family (an identical one is accepted without change).
@@ -358,7 +358,7 @@ pub enum AuditReason {
     /// exist for it afterwards. One extra record per discarded entry, after
     /// the registration's own record: the handle, and the discarded entry's
     /// decision id (none for the ceremony's grant). Outcome `Success`.
-    /// Spec: docs/questions/Q-501 (R6b), Q-520; docs/10 §6א, §7.
+    /// Spec: docs/questions/Q-501 (R6b), Q-520; docs/10 §6a, §7.
     SecretDecisionDiscarded,
     // ---- task K3: the change-password operations (docs/53 §5, §9) --------
     /// `open_change_password_request`: the Authenticator carries no subkey —

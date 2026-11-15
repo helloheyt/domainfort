@@ -69,7 +69,7 @@
 //! # Provenance
 //!
 //! Written only from this project's decided design, opened in-session:
-//! AGENT-ONBOARDING, AGENTS, docs/50 (§1 R50-3, R50-4, R50-7, R50-8,
+//! docs/CLEAN-ROOM.md, docs/CLEAN-ROOM.md, docs/50 (§1 R50-3, R50-4, R50-7, R50-8,
 //! R50-10, R50-11, R50-13; §3.1-§3.7; §4.2; §4.3; §7.5; §8.2; §9; §10; the
 //! channel-magic registry; decision A-58), docs/49 (R49-6, R49-15, R49-16;
 //! §2.4; §4.3; §4.4; §11), docs/questions Q-163 (A-47), Q-190 (A-54), Q-200
@@ -78,7 +78,7 @@
 //! the code of this project's crates ipc and parse-ldap (and ipc-directory
 //! as the pattern); and the docs.rs API pages of rustix 1.1.6 and zeroize
 //! 1.9.1 (P-2). No other implementation, LDAP server, serializer or RPC
-//! framework was consulted or recalled (AGENTS.md §1-3).
+//! framework was consulted or recalled (docs/CLEAN-ROOM.md).
 //!
 //! Spec: docs/50 R50-3, R50-4, R50-7, R50-10, §3, §4.2, §4.3, §10 (P10);
 //! docs/49 R49-16; A-47; A-54; A-59.

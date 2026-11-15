@@ -12,7 +12,7 @@
 //! the semantic rules of docs/51 §11, which dird's write PEP applies.
 //!
 //! Spec: docs/51 §7.2, §7.3, §7.6; docs/50 §3.3 ("a single encoding per
-//! value"; secret-bearing buffers zeroized); docs/10 I7; AGENTS.md §6.
+//! value"; secret-bearing buffers zeroized); docs/10 I7; docs/CLEAN-ROOM.md
 
 use crate::channel::RefusalStatus;
 use crate::wire::{AdminReply, AdminRequest, WireSetPassword};
@@ -59,7 +59,7 @@ impl std::error::Error for ConversionError {}
 /// nothing of it (not even the length); no `Clone` (no silent second copy),
 /// no `PartialEq` (no variable-time comparison of secret material).
 /// Spec: docs/51 §7.6 ("buffers carrying a secret are `Zeroizing`"); docs/10
-/// I6, I7; docs/50 §8.2; AGENTS.md §6.
+/// I6, I7; docs/50 §8.2; docs/CLEAN-ROOM.md
 pub struct Password(Zeroizing<String>);
 
 impl Password {
@@ -71,7 +71,7 @@ impl Password {
     }
 
     /// The text. Named so every use is visible in review.
-    /// Spec: AGENTS.md §6.
+    /// Spec: docs/CLEAN-ROOM.md
     #[must_use]
     pub fn expose(&self) -> &str {
         &self.0

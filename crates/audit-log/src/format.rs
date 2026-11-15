@@ -116,7 +116,7 @@ impl RecordHash {
 
     /// SHA-256 of `octets`, through the approved `sha2` crate.
     ///
-    /// Spec: docs/50 §8.1 ("SHA-256 from the approved RustCrypto"); AGENTS.md
+    /// Spec: docs/50 §8.1 ("SHA-256 from the approved RustCrypto"); docs/CLEAN-ROOM.md
     /// §6 (no primitive implemented here); docs.rs sha2 0.11.1 (`Digest`).
     #[must_use]
     pub fn of(octets: &[u8]) -> RecordHash {

@@ -62,7 +62,7 @@
 //! store; no store destroys a krbtgt key set (it is only ever rotated).
 //!
 //! Spec: docs/10 §1 (StoredKeySet; current + previous kvno), §7, §11, §12 I1;
-//! docs/09 א.7 (D32 rotation); docs/33 §6.1 (D178); docs/questions/Q-115
+//! docs/09 A.7 (D32 rotation); docs/33 §6.1 (D178); docs/questions/Q-115
 //! (A-35); docs/questions/Q-040 (A-19); RFC 4120 6.2 (name equivalence);
 //! docs/52 §3.5, §7 R7.
 
@@ -514,7 +514,7 @@ impl KeyStore for InMemoryKeyStore {
         self.sets.get_mut(handle)
     }
 
-    /// Spec: docs/33 §6.1 (D178); bounded per AGENTS.md §6.
+    /// Spec: docs/33 §6.1 (D178); bounded per docs/CLEAN-ROOM.md
     fn insert(&mut self, handle: KeyHandle, set: StoredKeySet) -> Result<(), StoreError> {
         if !self.accepts(handle.purpose) {
             return Err(StoreError::Refused);
@@ -547,7 +547,7 @@ impl KeyStore for InMemoryKeyStore {
 }
 
 impl fmt::Debug for InMemoryKeyStore {
-    /// Counts and mode only — never keys (AGENTS.md §6).
+    /// Counts and mode only — never keys (docs/CLEAN-ROOM.md).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("InMemoryKeyStore")
             .field("key_sets", &self.sets.len())
@@ -750,7 +750,7 @@ mod tests {
         );
     }
 
-    /// Debug output carries no key octets (AGENTS.md §6).
+    /// Debug output carries no key octets (docs/CLEAN-ROOM.md).
     #[test]
     fn debug_has_no_key_material() {
         let s = StoredKeySet {

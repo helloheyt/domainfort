@@ -821,7 +821,7 @@ fn the_manifest_carries_the_directorys_salts() {
         .any(|l| l.starts_with("first_admin_salts = ")));
 }
 
-/// AGENTS.md §6: the plan's debug output never shows the integrity key.
+/// docs/CLEAN-ROOM.md: the plan's debug output never shows the integrity key.
 #[test]
 fn the_integrity_key_is_redacted_in_debug_output() {
     let dir = TempDir::new();

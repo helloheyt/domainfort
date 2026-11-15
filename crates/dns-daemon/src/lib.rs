@@ -96,7 +96,7 @@
 //! # Provenance
 //!
 //! Written only from this project's decided design, opened in-session:
-//! AGENT-ONBOARDING, AGENTS; docs/54 (all — esp. §3.3, §4.1–§4.8, §6.4–§6.7,
+//! docs/CLEAN-ROOM.md, docs/CLEAN-ROOM.md; docs/54 (all — esp. §3.3, §4.1–§4.8, §6.4–§6.7,
 //! §8, §9, §10 DN11); docs/research/r3-c-dns.md (§4.1, §5, §6 W17, W21, §9);
 //! docs/57; docs/50 (R50-3, R50-14, R50-16, §3.6, §4.1, §6, §7.5, §8.2, §9);
 //! docs/07 §1, §8; docs/questions PENDING-OWNER (A-114, A-119, A-122,
@@ -112,7 +112,7 @@
 //! `sync::{mpsc, oneshot, Notify}`, `time::{timeout, sleep}`,
 //! `io::{AsyncReadExt, AsyncWriteExt}`) — API documentation only, never
 //! source (P-2). No other implementation, DNS server, daemon or server
-//! framework was consulted or recalled (AGENTS.md §1-3).
+//! framework was consulted or recalled (docs/CLEAN-ROOM.md).
 //!
 //! Spec: docs/54 §4, R54-2, R54-4, R54-10, R54-11, §6.4–§6.7, §10 (DN11);
 //! A-119; A-140; A-152; A-154; docs/50 R50-14, R50-16.

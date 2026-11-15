@@ -12,7 +12,7 @@
 //!   reassembly and the per-reply bounds. Whatever decodes as a single reply
 //!   re-encodes to exactly its body.
 //!
-//! AGENTS.md §6 / docs/50 §9 (R50-19: `ipc_ldap_frames`; the client decodes
+//! docs/CLEAN-ROOM.md / docs/50 §9 (R50-19: `ipc_ldap_frames`; the client decodes
 //! replies); docs/50 §3.3 ("replies are decoded with the same strictness"):
 //! never a panic, bounded allocation.
 //!

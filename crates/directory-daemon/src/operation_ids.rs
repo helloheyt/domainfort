@@ -1,7 +1,7 @@
 //! dird's operation numbers: one counter for every thread that decides an
 //! audited operation — the admin thread and the kpasswd thread (task K7).
 //!
-//! # The class (AGENTS.md §6.1)
+//! # The class (docs/CLEAN-ROOM.md)
 //!
 //! An operation number is the `operation_id` of the operation's `DirAdmin`
 //! events (Q-340 item 1: a decision and its outcome carry the same number)

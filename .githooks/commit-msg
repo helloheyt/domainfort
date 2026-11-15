@@ -1,32 +1,32 @@
 #!/usr/bin/env bash
-# commit-msg hook — אוכף את trailers ה-clean-room (AGENTS.md §4).
+# commit-msg hook — enforces the clean-room trailers (docs/CLEAN-ROOM.md, "Commit trailers").
 #
-# כלל:
-#   • כל commit חייב trailer  Clean-Room:
-#   • commit שנוגע בקוד מוצר (crates/** או src/**) חייב גם  Spec-Ref:
-# נכשל → ה-commit נדחה. זה הופך את "אין קוד בלי provenance" לאכיף, לא להמלצה.
+# Rule:
+#   • every commit must carry the trailer  Clean-Room:
+#   • a commit that touches product code (crates/** or src/**) must also carry  Spec-Ref:
+# On failure the commit is rejected. This makes "no code without provenance" enforced, not a recommendation.
 set -euo pipefail
 
 msg_file="$1"
 msg="$(cat "$msg_file")"
 
-fail() { echo "✖ commit-msg: $1" >&2; echo "  ראו AGENTS.md §4." >&2; exit 1; }
+fail() { echo "✖ commit-msg: $1" >&2; echo "  See docs/CLEAN-ROOM.md (\"Commit trailers\")." >&2; exit 1; }
 
-# 1. Clean-Room חובה תמיד.
+# 1. Clean-Room is always required.
 if ! grep -qE '^Clean-Room:[[:space:]]*\S' <<<"$msg"; then
-  fail "חסר trailer 'Clean-Room:' (הצהרה שנכתב רק ממקורות Spec-Ref / ללא קוד מוצר)."
+  fail "missing trailer 'Clean-Room:' (a statement that the change was written only from the Spec-Ref sources, or contains no product code)."
 fi
 
-# 2. האם ה-commit נוגע בקוד מוצר?
+# 2. Does the commit touch product code?
 touches_product=0
 if git diff --cached --name-only 2>/dev/null | grep -qE '^(crates|src)/'; then
   touches_product=1
 fi
 
-# 3. Spec-Ref חובה לקוד מוצר.
+# 3. Spec-Ref is required for product code.
 if [ "$touches_product" -eq 1 ]; then
   if ! grep -qE '^Spec-Ref:[[:space:]]*\S' <<<"$msg"; then
-    fail "commit נוגע בקוד מוצר (crates/|src/) אך חסר trailer 'Spec-Ref:' (למשל 'Spec-Ref: MS-KILE r49.0 3.3.5.7; RFC 4120 5.4.2')."
+    fail "commit touches product code (crates/|src/) but the trailer 'Spec-Ref:' is missing (for example 'Spec-Ref: MS-KILE r49.0 3.3.5.7; RFC 4120 5.4.2')."
   fi
 fi
 

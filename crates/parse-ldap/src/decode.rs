@@ -21,7 +21,7 @@
 //! not to SEQUENCE OF / SET OF, whose elements all have one type.
 //!
 //! Nothing here indexes into input, unwraps, or panics; every length is bounded
-//! by the octets present and every count by a named limit (AGENTS.md §6).
+//! by the octets present and every count by a named limit (docs/CLEAN-ROOM.md).
 
 use crate::ber::{
     application, context, integer_value, is_constructed, tag_of, validate_element, Profile, Reader,

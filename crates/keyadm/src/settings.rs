@@ -8,7 +8,7 @@
 //! (a link is refused as not a regular file), opened with O_NOFOLLOW, and
 //! the rule applied again to the opened descriptor.
 //!
-//! Spec: docs/50 R50-15, §7.1; docs/51 §6; A-86; AGENTS.md §6.
+//! Spec: docs/50 R50-15, §7.1; docs/51 §6; A-86; docs/CLEAN-ROOM.md
 
 use config::KeyadmSettings;
 use core::fmt;

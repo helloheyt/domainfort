@@ -24,7 +24,7 @@
 //!   auditd acknowledges, so no local account can keep either window full.
 //!   The same numbers and the same fixed-window scheme as dird's and the
 //!   kdc's `RateLimit` obligation limiter (Q-275 item 5, Q-388 item 2).
-//! * [`MAX_TRACKED_UIDS`] = 256: a bounded table (AGENTS.md §6); when it is
+//! * [`MAX_TRACKED_UIDS`] = 256: a bounded table (docs/CLEAN-ROOM.md); when it is
 //!   full of uids active in the current window, a new uid is refused `Busy`
 //!   (fail closed). Every request frame counts, `Ping` included.
 //!
@@ -47,7 +47,7 @@ pub const REQUESTS_PER_WINDOW: u32 = 60;
 /// The rate window. Project choice (Q-405).
 pub const RATE_WINDOW: Duration = Duration::from_secs(60);
 
-/// Most peer uids the rate table tracks at once. Project bound (AGENTS.md
+/// Most peer uids the rate table tracks at once. Project bound (docs/CLEAN-ROOM.md
 /// §6; Q-405).
 pub const MAX_TRACKED_UIDS: usize = 256;
 
@@ -191,7 +191,7 @@ mod tests {
         assert!(limiter.admit(1000, t0 + Duration::from_secs(61)));
     }
 
-    /// AGENTS.md §6 (bounded table): a full table of active uids refuses a
+    /// docs/CLEAN-ROOM.md (bounded table): a full table of active uids refuses a
     /// new uid; expired entries are dropped to make room.
     #[test]
     fn the_table_is_bounded() {

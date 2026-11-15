@@ -1,7 +1,7 @@
 //! Key-material handling: EncryptionKey.keyvalue is redacted in Debug, kept in
 //! zeroizing storage, returned in zeroizing encodings, and never reaches an
 //! error. Source: RFC 4120 5.2.9 (keyvalue "contains the key itself");
-//! AGENTS.md §6 (secrets never in logs, debug output, or errors). Vectors
+//! docs/CLEAN-ROOM.md (secrets never in logs, debug output, or errors). Vectors
 //! hand-derived from RFC 4120 Appendix A; none from another implementation.
 
 mod common;
@@ -27,7 +27,7 @@ fn assert_no_key_text(text: &str) {
 
 #[test]
 fn encryption_key_debug_is_redacted() {
-    // RFC 4120 5.2.9; AGENTS.md §6: the key octets never appear in Debug.
+    // RFC 4120 5.2.9; docs/CLEAN-ROOM.md: the key octets never appear in Debug.
     let key = EncryptionKey {
         keytype: 18,
         keyvalue: KeyValue::new(marker_key()),
@@ -74,7 +74,7 @@ fn key_bearing_message_debug_is_redacted() {
 
 #[test]
 fn key_bearing_encodings_are_zeroizing() {
-    // AGENTS.md §6: the DER of a key-bearing structure is itself key material
+    // docs/CLEAN-ROOM.md: the DER of a key-bearing structure is itself key material
     // and is returned in a Zeroizing buffer (compile-time type check).
     let key = EncryptionKey {
         keytype: 18,

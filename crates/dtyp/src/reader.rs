@@ -2,7 +2,7 @@
 //!
 //! Every read is checked against the remaining input before any slice is
 //! taken, so no length or count from the input is ever used to index or
-//! allocate without a bound (AGENTS.md §6; docs/32 §8). Each caller names the
+//! allocate without a bound (docs/CLEAN-ROOM.md; docs/32 §8). Each caller names the
 //! structure-specific error to return when the input is too short.
 //!
 //! Byte order: a self-relative security descriptor "is sent in little-endian

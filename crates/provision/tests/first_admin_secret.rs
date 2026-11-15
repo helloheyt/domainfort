@@ -1322,7 +1322,7 @@ fn a_keyd_giving_another_role_receives_no_password() {
     world.stop();
 }
 
-/// docs/51 §4.4 ("no secret in the output"); AGENTS.md §6: across a
+/// docs/51 §4.4 ("no secret in the output"); docs/CLEAN-ROOM.md: across a
 /// success, a re-run, each kind of refusal and each keyd failure, no
 /// password appears in what the command prints (standard output and
 /// error, captured), in a report's or refusal's `Debug`, or in keyd's audit

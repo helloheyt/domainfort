@@ -1,14 +1,14 @@
 //! Why a certificate was refused.
 //!
-//! Hand-rolled, no dependency beyond parse-asn1's own error (AGENTS.md §7).
+//! Hand-rolled, no dependency beyond parse-asn1's own error (docs/CLEAN-ROOM.md).
 //! No variant carries input octets — only which field and which rule —
 //! so an error can be logged without echoing anything from the file
-//! (AGENTS.md §6; docs/50 §8.2).
+//! (docs/CLEAN-ROOM.md; docs/50 §8.2).
 
 use core::fmt;
 
 /// The certificate field being read when a rule failed. Names follow
-/// RFC 5280 §4.1 (AGENTS.md §4.4).
+/// RFC 5280 §4.1 (docs/CLEAN-ROOM.md).
 /// Spec: RFC 5280 4.1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -57,7 +57,7 @@ pub enum Field {
 #[non_exhaustive]
 pub enum Error {
     /// The input is longer than [`crate::MAX_CERTIFICATE_OCTETS`]
-    /// (resource bound, AGENTS.md §6).
+    /// (resource bound, docs/CLEAN-ROOM.md).
     TooLarge,
     /// A DER rule was broken while reading the field (non-minimal or
     /// indefinite length, truncation, a non-minimal INTEGER, …).

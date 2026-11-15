@@ -23,6 +23,6 @@
 //! Written only from this project's documents (docs/52 §3.18, §7 R15; the
 //! questions cited; the dev-only feature precedent of docs/questions/Q-500
 //! item 6, A-107) and this repository's own code. No other implementation
-//! was consulted or recalled (AGENTS.md §1-3).
+//! was consulted or recalled (docs/CLEAN-ROOM.md).
 
 pub use crate::daemon::{serve_with as serve, ExtraListener, ServeParams as DaemonParams};

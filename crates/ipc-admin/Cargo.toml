@@ -20,7 +20,7 @@
 # the channel-magic registry, the decisions in
 # docs/questions/PENDING-OWNER.md (A-59, A-63, A-64, A-72, A-73, A-79, A-85,
 # A-88, A-90, A-91) and the public API of this workspace's crates. No other
-# implementation was consulted or recalled (AGENTS.md §1-3).
+# implementation was consulted or recalled (docs/CLEAN-ROOM.md).
 
 [package]
 name = "ipc-admin"

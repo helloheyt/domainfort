@@ -1051,7 +1051,7 @@ fn conversation_kinds_do_not_mix() {
 /// holds the armor key, the subkey, the TGT session key, the strengthen
 /// key, the strengthened reply key, the service session key or the
 /// long-term keys. Source: docs/48 §2.2, §9.1 I1, I8, §9.2 item 1; docs/10
-/// §12 I1, I8; AGENTS.md §6.
+/// §12 I1, I8; docs/CLEAN-ROOM.md
 #[test]
 fn no_fast_key_in_any_output_or_audit_record() {
     let (mut f, tgt) = setup();

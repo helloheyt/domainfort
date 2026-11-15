@@ -107,7 +107,7 @@ impl Ids {
 
 /// The single stored value of `id`, or `None` if absent. More than one value
 /// is an inconsistent record (every attribute read here is single-valued).
-/// Spec: docs/46 §5.4 (Single); AGENTS.md §6 (fail closed).
+/// Spec: docs/46 §5.4 (Single); docs/CLEAN-ROOM.md (fail closed).
 pub(crate) fn single(obj: &Object, id: AttrId) -> Result<Option<&[u8]>, Fault> {
     match obj.attribute(id) {
         None => Ok(None),

@@ -78,7 +78,7 @@
 //!   AclRevision; the CASE of 2.5.3.4.4 has no arm for audit ACEs, so they
 //!   get no effective copy.
 //!
-//! # Fail closed (AGENTS.md §6) and bounds
+//! # Fail closed (docs/CLEAN-ROOM.md) and bounds
 //!
 //! - DELIBERATE: an inheritable ACE of a type this crate keeps as
 //!   [`Ace::Unsupported`] cannot be substituted or mapped (2.5.3.4.7 needs its
@@ -272,7 +272,7 @@ pub fn create_security_descriptor(
     if creator_descriptor.is_some() {
         return Err(Error::CreatorDescriptorNotSupported);
     }
-    // Bound the inputs before building anything from them (AGENTS.md §6): the
+    // Bound the inputs before building anything from them (docs/CLEAN-ROOM.md): the
     // parent must be an encodable descriptor (every ACL <= 65535 bytes,
     // [MS-DTYP] 2.4.5; flags consistent, 2.4.6), and so must the default DACL.
     if let Some(parent) = parent_descriptor {
@@ -442,7 +442,7 @@ fn compute_inherited_acl_from_parent(
     is_container_object: bool,
     object_types: Option<&[Guid]>,
 ) -> Result<Acl> {
-    // DELIBERATE (fail closed, AGENTS.md §6): an inheritable ACE this crate
+    // DELIBERATE (fail closed, docs/CLEAN-ROOM.md): an inheritable ACE this crate
     // does not interpret cannot be substituted or mapped (2.5.3.4.7 needs its
     // Sid and Mask), and dropping it could drop a deny. Refuse it.
     if acl

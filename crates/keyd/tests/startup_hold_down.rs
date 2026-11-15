@@ -297,7 +297,7 @@ fn the_window_is_twice_the_configured_clock_skew() {
 }
 
 /// A `now` before the start (a clock stepped back) is held: the elapsed time
-/// cannot be established (fail closed, AGENTS.md §6).
+/// cannot be established (fail closed, docs/CLEAN-ROOM.md).
 #[test]
 fn a_clock_before_the_start_is_held() {
     let mut f = started_now();

@@ -45,7 +45,7 @@
 //! 3.1.1.2.3, 3.1.1.2.3.3, 3.1.1.2.4.3, 3.1.1.2.4.6, 3.1.1.2.4.8, 3.1.1.2.6,
 //! 3.1.1.4.2; [MS-DTYP] v20241119 2.3.4.1, 2.3.4.2, 2.5.1.1; ITU-T X.690
 //! (02/2021) 8.19. No other implementation was consulted or recalled
-//! (AGENTS.md §1-3).
+//! (docs/CLEAN-ROOM.md).
 //!
 //! Spec: docs/46 §3-§8; [MS-DRSR] 5.16.4; [MS-ADSC]; [MS-ADA1-3];
 //! [MS-ADTS] 3.1.1.1.4, 3.1.1.4.2.

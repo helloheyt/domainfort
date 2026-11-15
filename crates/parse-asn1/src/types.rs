@@ -1,6 +1,6 @@
 //! Tag model, value model, and subset constants.
 //!
-//! Terminology follows the specifications (AGENTS.md §4.4): tag "class" and
+//! Terminology follows the specifications (docs/CLEAN-ROOM.md): tag "class" and
 //! "number", "primitive"/"constructed", and the ASN.1 type names from
 //! ITU-T X.680 (02/2021) and RFC 4120 §5. No naming is mirrored from any
 //! existing implementation.
@@ -11,7 +11,7 @@ use core::cmp::Ordering;
 /// Maximum nesting depth of constructed values the decoder will descend.
 ///
 /// This is a resource bound to stop stack exhaustion from attacker-supplied
-/// nesting, not an encoding rule (AGENTS.md §6; docs/32 §8 "recursion-depth
+/// nesting, not an encoding rule (docs/CLEAN-ROOM.md; docs/32 §8 "recursion-depth
 /// limit"). Chosen well above the depth any RFC 4120 §5 structure reaches.
 pub const MAX_DEPTH: usize = 64;
 

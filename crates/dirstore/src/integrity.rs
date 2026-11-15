@@ -1,7 +1,7 @@
 //! At-rest integrity: an HMAC-SHA-256 tag on every stored record.
 //!
 //! Construction (this crate's own, built on the approved primitive — no
-//! primitive is implemented here, AGENTS.md §6):
+//! primitive is implemented here, docs/CLEAN-ROOM.md):
 //!
 //! ```text
 //! tag   = HMAC-SHA-256(K, MAC_CONTEXT || kind || u32be(len(key)) || key || body)
@@ -57,7 +57,7 @@ const MAC_CONTEXT: &[u8] = b"dirstore.record.v1";
 ///
 /// Held in a [`Zeroizing`] buffer (wiped on drop); `Debug` prints no key
 /// bytes; there is no accessor and no `Clone`. Spec: docs/32 §3 (key managed
-/// by keyd/HSM), D135; AGENTS.md §6 (secrets never in logs).
+/// by keyd/HSM), D135; docs/CLEAN-ROOM.md (secrets never in logs).
 pub struct IntegrityKey {
     key: Zeroizing<[u8; INTEGRITY_KEY_LEN]>,
 }

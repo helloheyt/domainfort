@@ -71,7 +71,7 @@
 //! (docs/50 §3.7, R50-8; A-56).
 //!
 //! Spec: RFC 4120 3.2.3, 3.3.2, 3.3.3, 3.3.3.1, 5.2.7.1, 5.4.1, 5.4.2, 7.5.9;
-//! RFC 6113 5.4.1.1, 5.4.2, 5.4.3, 5.4.4, 7.3; docs/30 §3; docs/10 §5, §5א;
+//! RFC 6113 5.4.1.1, 5.4.2, 5.4.3, 5.4.4, 7.3; docs/30 §3; docs/10 §5, §5a;
 //! docs/48 §5, §6, §7.2; docs/25 §4 (D53); docs/50 §3.7 (R50-8); docs/53
 //! §5.2 (task K5); docs/questions/Q-124, Q-125 (A-32), Q-150 (A-43), Q-217
 //! (A-56); main-session decisions 3-10, 13; A-25, A-26, A-117.
@@ -425,7 +425,7 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
             flags.insert(TicketFlags::RENEWABLE);
         }
 
-        // 12. keyd issues on the armored context (docs/10 §5, §5א; docs/48
+        // 12. keyd issues on the armored context (docs/10 §5, §5a; docs/48
         // §5.2). The service ticket starts now; sname and nonce are the inner
         // request's (keyd checks them against the inner body it kept).
         let session_enctype = self

@@ -1053,7 +1053,7 @@ fn krb_fast_armored_rep_rejections() {
 }
 
 // ===========================================================================
-// Rejections: resource bounds — crate::limits (AGENTS.md §6)
+// Rejections: resource bounds — crate::limits (docs/CLEAN-ROOM.md)
 // ===========================================================================
 
 #[test]
@@ -1190,7 +1190,7 @@ fn rejects_ber_length_forms() {
 }
 
 // ===========================================================================
-// Key material — RFC 6113 5.4.3 strengthen-key; RFC 4120 5.2.9; AGENTS.md §6
+// Key material — RFC 6113 5.4.3 strengthen-key; RFC 4120 5.2.9; docs/CLEAN-ROOM.md
 // ===========================================================================
 
 /// A KrbFastResponse whose only secret is a strengthen-key of 32 × 0x5A
@@ -1218,7 +1218,7 @@ fn assert_no_key_text(text: &str) {
 
 #[test]
 fn krb_fast_response_debug_redacts_strengthen_key() {
-    // RFC 6113 5.4.3 (strengthen-key is key material); AGENTS.md §6.
+    // RFC 6113 5.4.3 (strengthen-key is key material); docs/CLEAN-ROOM.md
     let response = marker_response();
     let text = format!("{response:?}");
     assert!(text.contains("redacted"), "{text}");
@@ -1234,7 +1234,7 @@ fn krb_fast_response_debug_redacts_strengthen_key() {
 
 #[test]
 fn krb_fast_response_encoding_is_zeroizing() {
-    // AGENTS.md §6: the DER of a key-bearing structure is key material and is
+    // docs/CLEAN-ROOM.md: the DER of a key-bearing structure is key material and is
     // returned in a Zeroizing buffer (compile-time type check).
     let response = marker_response();
     let encoded: Zeroizing<Vec<u8>> = response.encode().unwrap();

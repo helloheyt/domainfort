@@ -105,7 +105,7 @@
 //!
 //! Written only from, opened in this session: docs/51 (whole; decided
 //! A-72), docs/47 (§1.3, §3, §4, §5, §6, §9), docs/46 (§2.3, §4, §5, §8),
-//! docs/11 (§2, §4), docs/32 (§6, §7), AGENT-ONBOARDING, AGENTS, the
+//! docs/11 (§2, §4), docs/32 (§6, §7), docs/CLEAN-ROOM.md, docs/CLEAN-ROOM.md, the
 //! decisions A-18, A-19, A-35, A-55, A-72..A-79, A-83..A-85, P-22 and the
 //! questions Q-290, Q-292..Q-295, Q-298, Q-330, Q-335, Q-336; the pinned
 //! specifications from `tools/spec-pin/cache/` (SHA-256 verified against
@@ -120,7 +120,7 @@
 //! public APIs of this workspace's crates dirstore, ad-schema, dtyp, pdp,
 //! directory-pip, kdc, keyd-types, krb-proto, ipc-audit and keyd (its
 //! entropy source, as the pattern A-15 names) were read. No other
-//! implementation was consulted or recalled (AGENTS.md §1-3).
+//! implementation was consulted or recalled (docs/CLEAN-ROOM.md).
 //!
 //! The closure-size refusal of `AddMember` (the A-89 residual, task F5)
 //! was written only from docs/47 §5.3, PENDING-OWNER A-89, docs/questions
@@ -149,7 +149,7 @@
 //! PENDING-OWNER (A-85, A-87, A-88, A-93, A-102, A-105), docs/questions
 //! Q-313, Q-350, Q-365, Q-470, Q-471 and this repository's own code
 //! (docs/questions/Q-500..Q-503). No other implementation was consulted
-//! or recalled (AGENTS.md §1-3).
+//! or recalled (docs/CLEAN-ROOM.md).
 //!
 //! Interpretations and gaps: docs/questions/Q-355 (names and values),
 //! Q-356 (membership and protected objects), Q-357 (dual control and the
@@ -163,7 +163,7 @@
 //! (§2 classes C14, C43, C44, C46, C47; §3.11), PENDING-OWNER (A-102,
 //! A-108, A-110, A-111, A-120, A-146..A-148, P-22, P-30, P-78) and this
 //! repository's own code; interpretations in docs/questions/Q-935..Q-941.
-//! No other implementation was consulted or recalled (AGENTS.md §1-3).
+//! No other implementation was consulted or recalled (docs/CLEAN-ROOM.md).
 //!
 //! # Plan → Commit (tasks MA2 + MA3; docs/research/r5-a-admin-model.md
 //! §3.3, §11; PENDING-OWNER A-147)
@@ -188,7 +188,7 @@
 //! r5-a-admin-model.md (whole), docs/questions/Q-874, Q-117, Q-935..Q-941,
 //! PENDING-OWNER (A-36, A-102, A-108, A-147, A-159), docs/52 (C14, C43, C46,
 //! C47), docs/51 §5-§7, docs/57 and this repository's own code. No other
-//! implementation was consulted or recalled (AGENTS.md §1-3).
+//! implementation was consulted or recalled (docs/CLEAN-ROOM.md).
 //!
 //! `ChangePassword` (task K6, module `change_password`) was written only
 //! from, opened in this session: docs/53 (whole), PENDING-OWNER (A-117,
@@ -197,7 +197,7 @@
 //! pinned RFC 3244 §2, RFC 4120 §3.2.3 and [MS-ADTS] v20261026
 //! 3.1.1.3.1.5.1, 6.1.1.2.7.52, and this repository's own code;
 //! interpretations in docs/questions/Q-963. No other implementation was
-//! consulted or recalled (AGENTS.md §1-3).
+//! consulted or recalled (docs/CLEAN-ROOM.md).
 
 mod admin;
 mod apply;

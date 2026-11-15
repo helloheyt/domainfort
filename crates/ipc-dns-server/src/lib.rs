@@ -55,7 +55,7 @@
 //! PENDING-OWNER A-114, A-119, A-140, Q-613, Q-619, Q-810, Q-815) and the
 //! public API of this project's crates ipc and ipc-dns (ipc-ldap-server as
 //! the pattern). No other implementation, DNS server or RPC framework was
-//! consulted or recalled (AGENTS.md §1-3).
+//! consulted or recalled (docs/CLEAN-ROOM.md).
 
 use core::fmt;
 use ipc::{EncodedFrame, Refused};

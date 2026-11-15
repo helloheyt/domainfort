@@ -1,7 +1,7 @@
 #![no_main]
 //! Fuzz target for `krb_crypto::verify_mic`.
 //!
-//! AGENTS.md §6 requires a fuzz target for code that consumes untrusted input
+//! docs/CLEAN-ROOM.md requires a fuzz target for code that consumes untrusted input
 //! before it merges to `main`. The input is split as:
 //!
 //! ```text

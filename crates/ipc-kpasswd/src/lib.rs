@@ -72,7 +72,7 @@
 //! # Provenance
 //!
 //! Written only from this project's decided design and the allowed
-//! specifications, opened in-session: AGENT-ONBOARDING, AGENTS; docs/53 (all;
+//! specifications, opened in-session: docs/CLEAN-ROOM.md, docs/CLEAN-ROOM.md; docs/53 (all;
 //! esp. §3.3, §4.1–§4.5, §5.1, §5.5–§5.9, §8, §9, §10 K7); docs/50 (§3.1–§3.7,
 //! §7.5, the channel-magic registry); docs/questions PENDING-OWNER (A-114,
 //! A-117, A-121, A-126, A-142, A-151, A-156), Q-600..Q-605, Q-609, Q-620,
@@ -84,7 +84,7 @@
 //! ldap-front's dird client as the pattern); and the docs.rs API pages of
 //! tokio 1.54.1 and zeroize 1.9.1 (P-2) and the std 1.95.0 API documentation
 //! (`IpAddr::to_canonical`). No other implementation, kpasswd server,
-//! serializer or RPC framework was consulted or recalled (AGENTS.md §1-3).
+//! serializer or RPC framework was consulted or recalled (docs/CLEAN-ROOM.md).
 //!
 //! Spec: docs/53 §4.3, §5.5–§5.9, R53-4, R53-8; A-117; docs/50 R50-3, R50-4,
 //! R50-7, §3; A-59.

@@ -2,7 +2,7 @@
 //! Fuzz target for the IPC field decoder: `ipc::Reader` through
 //! `ipc::decode_body`.
 //!
-//! AGENTS.md §6 / docs/50 §9 (R50-19): arbitrary bytes → decoder; never a
+//! docs/CLEAN-ROOM.md / docs/50 §9 (R50-19): arbitrary bytes → decoder; never a
 //! panic, bounded allocation. Three parts:
 //!
 //! 1. The input is a frame body of a fuzz-local message set whose two kinds

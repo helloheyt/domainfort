@@ -67,7 +67,7 @@
 //!
 //! `#![forbid(unsafe_code)]`; no `unwrap`, `expect` or `panic!` outside
 //! tests (const evaluation only). Nothing logged carries request octets,
-//! names, addresses, TLS secrets or a peer-supplied string (AGENTS.md §6;
+//! names, addresses, TLS secrets or a peer-supplied string (docs/CLEAN-ROOM.md;
 //! docs/50 §8.2). The key octets, the cleartext LDAP buffer and the
 //! canonical messages are wiped; the rustls provider is passed explicitly
 //! (never a process default); no TLS 1.2, 0-RTT, resumption, key log,
@@ -93,7 +93,7 @@
 //! # Provenance
 //!
 //! Written only from this project's decided design, opened in-session:
-//! AGENT-ONBOARDING, AGENTS, docs/50 (R50-3, R50-7, R50-10..R50-16; §2.4;
+//! docs/CLEAN-ROOM.md, docs/CLEAN-ROOM.md, docs/50 (R50-3, R50-7, R50-10..R50-16; §2.4;
 //! §3.1-§3.7; §4.1-§4.3; §5.1-§5.4; §6; §7.1, §7.5; §8; §9; §10 P11),
 //! docs/49 (R49-6, R49-14, R49-15, R49-16; §4; §10; §11), docs/questions
 //! Q-162 / Q-163 (A-47), Q-185 (A-52), Q-221 (A-57), Q-230 (A-60), Q-275
@@ -111,7 +111,7 @@
 //! rustls-pki-types 1.16.0 (incl. `alg_id`), aws-lc-rs 1.19.0 and
 //! zeroize 1.9.1 — API documentation only, never source (P-2). No other
 //! implementation, TLS-terminating proxy, LDAP server or daemon was
-//! consulted or recalled (AGENTS.md §1-3).
+//! consulted or recalled (docs/CLEAN-ROOM.md).
 //!
 //! Spec: docs/50 §10 (P11), R50-10, R50-11, R50-12, R50-14, R50-16; docs/49
 //! R49-15, R49-16; RFC 4511 §4.14; RFC 4513 §3; RFC 8446 §9.1; A-58.

@@ -1,7 +1,7 @@
 #![no_main]
 //! Fuzz target for the RFC 3244 request framing.
 //!
-//! AGENTS.md §6 / docs/32 §8 / docs/53 §5.9 require a fuzz target for every
+//! docs/CLEAN-ROOM.md / docs/32 §8 / docs/53 §5.9 require a fuzz target for every
 //! parser before it merges to `main`. Arbitrary bytes are fed to
 //! `RequestMessage::parse` (one message), `RequestMessage::parse_tcp` (one
 //! whole TCP frame) and `tcp_message_length` (the 4-octet header): none may

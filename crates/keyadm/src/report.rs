@@ -13,7 +13,7 @@
 //! (docs/questions/Q-367, A-88).
 //!
 //! Spec: docs/51 §6; docs/10 §7, §9, §10; docs/50 §8.2 (fixed messages, no
-//! request octets); AGENTS.md §6; docs/questions/Q-367 (A-88); docs/52
+//! request octets); docs/CLEAN-ROOM.md; docs/questions/Q-367 (A-88); docs/52
 //! §3.10, §4.2, §4.4 (A-102).
 
 use crate::ceremony::{CeremonyReport, NotSent, Outcome, Step, Unknown};

@@ -63,9 +63,9 @@
 //! (`keep_service_context`) is reached only from the unbound operation.
 //!
 //! The split into two operations (Q-523) was written only from RFC 4120 (the
-//! pinned copy) §3.2.3, §3.2.4, §5.5.1, §7.5.1, docs/10 §5ב / §8, docs/52 §3.4
+//! pinned copy) §3.2.3, §3.2.4, §5.5.1, §7.5.1, docs/10 §5b / §8, docs/52 §3.4
 //! / §5, docs/questions/Q-387, Q-493, Q-523 and this crate's own code; no other
-//! implementation was consulted or recalled (AGENTS.md §1-3).
+//! implementation was consulted or recalled (docs/CLEAN-ROOM.md).
 //!
 //! # The third profile: a change-password request (task K3)
 //!
@@ -83,7 +83,7 @@
 //!
 //! Spec: RFC 4120 §4, 2.2, 3.2.3, 3.3.3, 3.3.3.2, 5.3, 5.5.1, 6.2, 7.5.1;
 //! RFC 3961 §3, §4; RFC 3962 §7; RFC 8009 §6; [MS-KILE] 3.4.5 (retry with
-//! the previous server key); docs/10 §5ב, §8, §9, §12; docs/49 §3.3, §12;
+//! the previous server key); docs/10 §5b, §8, §9, §12; docs/49 §3.3, §12;
 //! docs/52 §3.2, §3.4, §5; docs/questions/Q-165 (A-46), Q-180, Q-463
 //! (A-102), Q-523; A-19 (docs/questions/Q-040); A-26 (docs/questions/Q-071).
 
@@ -314,7 +314,7 @@ impl Accompanying<'_> {
 /// one keeps the keys under a context id, the operation-bound one drops them
 /// (Q-523), the change-password one keeps them in its request context
 /// (task K3).
-/// Spec: RFC 4120 3.2.3, 5.3, 5.5.1; docs/10 §5ב; docs/questions/Q-523.
+/// Spec: RFC 4120 3.2.3, 5.3, 5.5.1; docs/10 §5b; docs/questions/Q-523.
 pub(crate) struct VerifiedApReq {
     /// Client realm from the ticket. Spec: RFC 4120 5.3.
     pub(crate) crealm: krb_proto::Realm,
@@ -424,7 +424,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// LDAP PEP's and the PDP's, on the returned facts (docs/49 §3.2).
     ///
     /// Spec: RFC 4120 2.2, 3.2.3, 3.3.3.2, 5.3, 5.5.1, 6.2, 7.5.1; [MS-KILE]
-    /// 3.4.5; docs/10 §5ב, §9 (A-26); docs/49 §3.3; docs/52 §5;
+    /// 3.4.5; docs/10 §5b, §9 (A-26); docs/49 §3.3; docs/52 §5;
     /// docs/questions/Q-165 (A-46), Q-180, Q-463 (A-102), Q-523; A-19
     /// (docs/questions/Q-040).
     pub fn open_and_verify_service_ticket(
@@ -478,7 +478,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     ///
     /// Spec: RFC 4120 2.2, 3.2.3, 3.2.4, 3.3.3.2, 5.3, 5.5.1, 6.2, 7.5.1;
     /// RFC 3961 §3, §4; RFC 3962 §7; RFC 8009 §6; [MS-KILE] 3.4.5; docs/10
-    /// §5ב, §9 (A-26); docs/52 §3.4, §5; docs/questions/Q-387 item 4, Q-463
+    /// §5b, §9 (A-26); docs/52 §3.4, §5; docs/questions/Q-387 item 4, Q-463
     /// (A-102), Q-493 item 3, Q-523.
     pub fn verify_operation_ticket(
         &mut self,

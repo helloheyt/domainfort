@@ -61,7 +61,7 @@ pub enum ProvisioningRole {
     /// A service object (the LDAP service object): a computer as the online
     /// path creates one, WT without pwdLastSet, which becomes protected —
     /// never a member, never changed or deleted. It may not carry the admin
-    /// service's name. Spec: docs/51 §4.3 step 5, §5.2 row 9; docs/10 §5ב;
+    /// service's name. Spec: docs/51 §4.3 step 5, §5.2 row 9; docs/10 §5b;
     /// A-73; Q-376 item 6.
     ServiceObject,
     /// The admin service object: a service object (as

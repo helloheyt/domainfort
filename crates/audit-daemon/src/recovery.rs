@@ -102,7 +102,7 @@ pub struct OpenedLog {
 
 /// Why the daemon refuses to start.
 ///
-/// No variant carries record octets (AGENTS.md §6; docs/50 §8.2).
+/// No variant carries record octets (docs/CLEAN-ROOM.md; docs/50 §8.2).
 ///
 /// Spec: docs/50 §7.5 ("every daemon exits with an error code on any
 /// start-up failure"); docs/37 §2.

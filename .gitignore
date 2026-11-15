@@ -1,24 +1,24 @@
 # Rust
 /target
 **/*.rs.bk
-# Cargo.lock של ה-workspace — **ב-track** (D183): מאז שנכנסו תלויות חיצוניות
-# (RustCrypto, krb-crypto) הוא נועץ גרסאות מדויקות — build משוחזר (D61) ושרשרת-
-# אספקה (R13). רק Cargo.lock של workspaces מנותקים (fuzz) נשאר מחוץ ל-track.
-# (הערה חייבת להיות בשורה נפרדת; הערת-inline שוברת את התבנית ב-gitignore.)
+# The workspace Cargo.lock IS tracked (D183): since external dependencies came in
+# (RustCrypto, krb-crypto) it pins exact versions — for a reproducible build (D61) and the supply
+# chain (R13). Only the Cargo.lock of detached workspaces (fuzz) stays untracked.
+# (The comment must be on its own line; an inline comment breaks the pattern in .gitignore.)
 crates/*/fuzz/Cargo.lock
 
 
-# ספריות-עבודה של בדיקות שקוראות דרך protected-file (crates/test-scratch; Q-480)
+# Working directories of tests that read through protected-file (crates/test-scratch; Q-480)
 /.test-scratch/
-# ספריות-העבודה של בדיקות tier-3 כ-root (של root, 0755; crates/test-scratch `ScratchDir::new_tier3`; Q-680)
+# Working directories of the tier-3 tests run as root (owned by root, 0755; crates/test-scratch `ScratchDir::new_tier3`; Q-680)
 /.test-scratch-tier3/
 
-# ספריית מפרטים — הקבצים שהורדו נשמרים מקומית; המניפסט (עם ה-sha256) כן ב-track.
+# Specification library — downloaded files are kept locally; the manifest (with the sha256) IS tracked.
 /tools/spec-pin/cache/
 
-# SBOM output (נוצר ב-CI/מקומית; לא ב-track)
+# SBOM output (generated in CI or locally; not tracked)
 *.cdx.json
 bom.json
 
-# מערכת
+# System
 .DS_Store

@@ -5,7 +5,7 @@
 //! the offending position and checks that neither `Display` nor `Debug` of the
 //! error contains it.
 //!
-//! Spec: AGENTS.md §6 ("secrets never appear in logs, panics, debug output, or
+//! Spec: docs/CLEAN-ROOM.md ("secrets never appear in logs, panics, debug output, or
 //! error messages"); docs/50 §8.2 ("errors carry a code, not content"), R50-15
 //! ("no secrets").
 
@@ -35,7 +35,7 @@ fn check(daemon: Daemon, text: &str) {
 }
 
 /// Unknown key: neither its name nor its value is echoed.
-/// Spec: docs/50 R50-15, §7.1; AGENTS.md §6.
+/// Spec: docs/50 R50-15, §7.1; docs/CLEAN-ROOM.md
 #[test]
 fn unknown_key_is_not_echoed() {
     check(Daemon::Keyd, &append(KEYD, &format!("password = {MARKER}")));
@@ -46,7 +46,7 @@ fn unknown_key_is_not_echoed() {
 }
 
 /// Malformed lines: a bare secret on a line, or a mis-spaced entry.
-/// Spec: docs/50 R50-15; AGENTS.md §6.
+/// Spec: docs/50 R50-15; docs/CLEAN-ROOM.md
 #[test]
 fn malformed_line_is_not_echoed() {
     check(Daemon::Keyd, &append(KEYD, MARKER));
@@ -66,7 +66,7 @@ fn malformed_line_is_not_echoed() {
 }
 
 /// Values of the wrong type, for every value type.
-/// Spec: docs/50 §7.1 ("every value typed"); AGENTS.md §6.
+/// Spec: docs/50 §7.1 ("every value typed"); docs/CLEAN-ROOM.md
 #[test]
 fn bad_values_are_not_echoed() {
     let m = MARKER;
@@ -102,7 +102,7 @@ fn bad_values_are_not_echoed() {
 }
 
 /// A duplicate key whose second value is the secret.
-/// Spec: docs/50 §7.1; AGENTS.md §6.
+/// Spec: docs/50 §7.1; docs/CLEAN-ROOM.md
 #[test]
 fn duplicate_key_is_not_echoed() {
     check(
@@ -112,7 +112,7 @@ fn duplicate_key_is_not_echoed() {
 }
 
 /// A duplicate path, a duplicate list item, a duplicate uid.
-/// Spec: docs/50 §3.1, §3.2; AGENTS.md §6.
+/// Spec: docs/50 §3.1, §3.2; docs/CLEAN-ROOM.md
 #[test]
 fn duplicates_are_not_echoed() {
     let path = format!("/run/{MARKER}");
@@ -123,7 +123,7 @@ fn duplicates_are_not_echoed() {
 }
 
 /// A non-printable octet next to the secret; an overlong value made of it; a
-/// cut last line holding it. Spec: docs/50 §7.1; AGENTS.md §6.
+/// cut last line holding it. Spec: docs/50 §7.1; docs/CLEAN-ROOM.md
 #[test]
 fn bound_and_character_errors_are_not_echoed() {
     check(Daemon::Keyd, &set(KEYD, "realm", &format!("{MARKER}\u{1}")));

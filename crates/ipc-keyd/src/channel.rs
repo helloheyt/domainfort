@@ -79,8 +79,8 @@ pub const MAX_SALT: u32 = 1024;
 
 /// Bound of the PA-DATA sequence of `seal_fast_error`: krb-proto's own bound
 /// on a padata sequence (`krb_proto::limits::MAX_PADATA`), so the codec never
-/// refuses what keyd itself must judge (keyd's allowlist, docs/10 §5א).
-/// Spec: docs/50 §3.4 (`padata: seq<DER>`); docs/10 §5א.
+/// refuses what keyd itself must judge (keyd's allowlist, docs/10 §5a).
+/// Spec: docs/50 §3.4 (`padata: seq<DER>`); docs/10 §5a.
 pub const MAX_SEAL_PADATA: u32 = 32;
 
 /// Bound of the enctype list of `describe_config`: the four encryption types
@@ -131,16 +131,16 @@ pub mod request_kind {
     pub const VERIFY_PREAUTH: u8 = 0x01;
     /// `issue_as_rep` (Kdc). Spec: docs/10 §4.
     pub const ISSUE_AS_REP: u8 = 0x02;
-    /// `open_fast_armor` (Kdc). Spec: docs/10 §5א.
+    /// `open_fast_armor` (Kdc). Spec: docs/10 §5a.
     pub const OPEN_FAST_ARMOR: u8 = 0x03;
     /// `open_and_verify_tgt` (Kdc). Spec: docs/10 §5.
     pub const OPEN_AND_VERIFY_TGT: u8 = 0x04;
     /// `issue_tgs_rep` (Kdc). Spec: docs/10 §5.
     pub const ISSUE_TGS_REP: u8 = 0x05;
-    /// `seal_fast_error` (Kdc). Spec: docs/10 §5א.
+    /// `seal_fast_error` (Kdc). Spec: docs/10 §5a.
     pub const SEAL_FAST_ERROR: u8 = 0x06;
     /// `open_and_verify_service_ticket` (Ldap) — the unbound verification
-    /// only since Q-523. Spec: docs/10 §5ב.
+    /// only since Q-523. Spec: docs/10 §5b.
     pub const OPEN_AND_VERIFY_SERVICE_TICKET: u8 = 0x07;
     /// `set_secret` (Directory). Spec: docs/10 §6.
     pub const SET_SECRET: u8 = 0x08;
@@ -157,9 +157,9 @@ pub mod request_kind {
     pub const RETIRE_KVNO: u8 = 0x0D;
     /// `destroy_key_set(decision)` (Admin). Spec: docs/10 §7; docs/52 §4.6.
     pub const DESTROY_KEY_SET: u8 = 0x0E;
-    /// `describe_config` (Kdc, Ldap). Spec: docs/10 §7א.
+    /// `describe_config` (Kdc, Ldap). Spec: docs/10 §7a.
     pub const DESCRIBE_CONFIG: u8 = 0x0F;
-    /// `ping` (every role). Spec: docs/10 §7א.
+    /// `ping` (every role). Spec: docs/10 §7a.
     pub const PING: u8 = 0x10;
     /// `grant_set_secret` (Admin, provisioning only since A-102). Appended
     /// by task A15a.
@@ -176,20 +176,20 @@ pub mod request_kind {
     pub const LIST_DESTROY_DECISIONS: u8 = 0x14;
     /// `verify_operation_ticket` (Ldap): the operation-bound service-ticket
     /// verification, which keeps no service context. Appended by Q-523.
-    /// Spec: docs/10 §5ב; docs/52 §3.4, §5; docs/questions/Q-523.
+    /// Spec: docs/10 §5b; docs/52 §3.4, §5; docs/questions/Q-523.
     pub const VERIFY_OPERATION_TICKET: u8 = 0x15;
     /// `open_change_password_request` (Ldap): an RFC 3244 request's AP-REQ
     /// and KRB-PRIV, opened and judged inside keyd. Appended by task K4.
-    /// Spec: docs/53 §5.5; docs/10 §5ג; RFC 3244 §2.
+    /// Spec: docs/53 §5.5; docs/10 §5c; RFC 3244 §2.
     pub const OPEN_CHANGE_PASSWORD_REQUEST: u8 = 0x16;
     /// `complete_change_password` (Ldap): install the context's password on
     /// dird's decision and seal the success reply — a state call. Appended
     /// by task K4.
-    /// Spec: docs/53 §5.5; docs/10 §5ג; docs/52 §3.10 (c) (R9).
+    /// Spec: docs/53 §5.5; docs/10 §5c; docs/52 §3.10 (c) (R9).
     pub const COMPLETE_CHANGE_PASSWORD: u8 = 0x17;
     /// `seal_change_password_error` (Ldap): seal a non-zero result code.
     /// Appended by task K4.
-    /// Spec: docs/53 §5.5, §5.7; docs/10 §5ג.
+    /// Spec: docs/53 §5.5, §5.7; docs/10 §5c.
     pub const SEAL_CHANGE_PASSWORD_ERROR: u8 = 0x18;
     /// `revoke_decision(id)` (Ldap): take back a key-operation decision dird
     /// registered. Appended by task F3.
@@ -244,15 +244,15 @@ pub mod reply_kind {
     pub const VERIFY_PREAUTH: u8 = ok(rq::VERIFY_PREAUTH);
     /// `AsRepParts`. Spec: docs/10 §4.
     pub const ISSUE_AS_REP: u8 = ok(rq::ISSUE_AS_REP);
-    /// `FastArmor`. Spec: docs/10 §5א.
+    /// `FastArmor`. Spec: docs/10 §5a.
     pub const OPEN_FAST_ARMOR: u8 = ok(rq::OPEN_FAST_ARMOR);
     /// `TgtContext`. Spec: docs/10 §5.
     pub const OPEN_AND_VERIFY_TGT: u8 = ok(rq::OPEN_AND_VERIFY_TGT);
     /// `TgsRepParts`. Spec: docs/10 §5.
     pub const ISSUE_TGS_REP: u8 = ok(rq::ISSUE_TGS_REP);
-    /// The sealed `EncryptedData`. Spec: docs/10 §5א.
+    /// The sealed `EncryptedData`. Spec: docs/10 §5a.
     pub const SEAL_FAST_ERROR: u8 = ok(rq::SEAL_FAST_ERROR);
-    /// `ServiceContext` (with its one-time context id). Spec: docs/10 §5ב.
+    /// `ServiceContext` (with its one-time context id). Spec: docs/10 §5b.
     pub const OPEN_AND_VERIFY_SERVICE_TICKET: u8 = ok(rq::OPEN_AND_VERIFY_SERVICE_TICKET);
     /// The installed `Kvno`. Spec: docs/10 §6.
     pub const SET_SECRET: u8 = ok(rq::SET_SECRET);
@@ -268,9 +268,9 @@ pub mod reply_kind {
     pub const RETIRE_KVNO: u8 = ok(rq::RETIRE_KVNO);
     /// `()`. Spec: docs/10 §7.
     pub const DESTROY_KEY_SET: u8 = ok(rq::DESTROY_KEY_SET);
-    /// `ConfigDescription`. Spec: docs/10 §7א.
+    /// `ConfigDescription`. Spec: docs/10 §7a.
     pub const DESCRIBE_CONFIG: u8 = ok(rq::DESCRIBE_CONFIG);
-    /// `()`. Spec: docs/10 §7א.
+    /// `()`. Spec: docs/10 §7a.
     pub const PING: u8 = ok(rq::PING);
     /// `()`: the grant is registered. Spec: docs/51 §5.8 option (b);
     /// docs/questions/Q-450 item 9.
@@ -281,11 +281,11 @@ pub mod reply_kind {
     pub const SEAL_CEREMONY: u8 = ok(rq::SEAL_CEREMONY);
     /// One page of pending destroy decisions. Spec: docs/52 §4.6.
     pub const LIST_DESTROY_DECISIONS: u8 = ok(rq::LIST_DESTROY_DECISIONS);
-    /// `OperationTicket` (no context id). Spec: docs/10 §5ב;
+    /// `OperationTicket` (no context id). Spec: docs/10 §5b;
     /// docs/questions/Q-523.
     pub const VERIFY_OPERATION_TICKET: u8 = ok(rq::VERIFY_OPERATION_TICKET);
     /// `ChangePasswordContext` (a request-context id and a verdict).
-    /// Spec: docs/53 §5.5; docs/10 §5ג.
+    /// Spec: docs/53 §5.5; docs/10 §5c.
     pub const OPEN_CHANGE_PASSWORD_REQUEST: u8 = ok(rq::OPEN_CHANGE_PASSWORD_REQUEST);
     /// `SealedReply` (the success reply). Spec: docs/53 §5.5.
     pub const COMPLETE_CHANGE_PASSWORD: u8 = ok(rq::COMPLETE_CHANGE_PASSWORD);

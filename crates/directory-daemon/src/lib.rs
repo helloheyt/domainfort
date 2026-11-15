@@ -102,7 +102,7 @@
 //! `#![forbid(unsafe_code)]`; no `unwrap`, `expect` or `panic!` outside
 //! tests and const evaluation. The integrity key is read into zeroizing
 //! buffers only, never logged, never on any channel. Nothing logged carries
-//! request octets, directory values or a peer-supplied string (AGENTS.md §6;
+//! request octets, directory values or a peer-supplied string (docs/CLEAN-ROOM.md;
 //! docs/50 §8.2).
 //!
 //! # Residuals (documented, not hidden)
@@ -130,7 +130,7 @@
 //! # Provenance
 //!
 //! Written only from this project's decided design, opened in-session:
-//! AGENT-ONBOARDING, AGENTS, docs/50 (R50-2, R50-3, R50-7, R50-14,
+//! docs/CLEAN-ROOM.md, docs/CLEAN-ROOM.md, docs/50 (R50-2, R50-3, R50-7, R50-14,
 //! R50-16..R50-19; §2.4; §3.1-§3.7; §6; §7.1, §7.2, §7.4, §7.5; §8; §9; §10
 //! P8; the channel-magic registry), docs/47 §8, docs/questions Q-213,
 //! Q-214, Q-218..Q-220 (A-57), Q-230 (A-60), Q-235 (A-61), Q-245 (A-63),
@@ -144,7 +144,7 @@
 //! sleep}`, `task::spawn`, `io::{AsyncReadExt, AsyncWriteExt}`) — API
 //! documentation only, never source (P-2). No other implementation,
 //! directory server, daemon or RPC system was consulted or recalled
-//! (AGENTS.md §1-3).
+//! (docs/CLEAN-ROOM.md).
 //!
 //! The shared gate, the proof of an acknowledged intent and the one stop
 //! flush (task R6, decision A-102) were written only from docs/52 (§2,
@@ -152,7 +152,7 @@
 //! PENDING-OWNER (A-85, A-87, A-88, A-93, A-102, A-105), docs/questions
 //! Q-313, Q-350, Q-365, Q-470, Q-471 and this repository's own code
 //! (docs/questions/Q-500..Q-503). No other implementation was consulted
-//! or recalled (AGENTS.md §1-3).
+//! or recalled (docs/CLEAN-ROOM.md).
 //!
 //! The LDAP engine's audit event is converted to its wire shape here
 //! ([`ldap_event`], module `audit_convert`) since task IB1 moved it out of
@@ -168,7 +168,7 @@
 //! (crates ipc-kpasswd, ipc-keyd, keyd-types, directory-admin; this crate's
 //! LDAP and admin services as the pattern); interpretations in
 //! docs/questions/Q-964. No other implementation was consulted or recalled
-//! (AGENTS.md §1-3).
+//! (docs/CLEAN-ROOM.md).
 //!
 //! Spec: docs/50 §10 (P8), R50-2, R50-3, R50-7, R50-14, R50-16, R50-17;
 //! docs/47 §8; A-57; A-58; Decision: A-144; Q-851 (task IB1); docs/53 §5.6

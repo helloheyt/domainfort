@@ -83,7 +83,7 @@ fn the_krbtgt_key_set_is_krbtgt_purpose_bound_to_krbtgt_realm() {
 
 /// docs/51 §4.3 step 11 (`(GUID_ldap, Service)`, NT-SRV-HST [ldap, fqdn]
 /// and `(GUID_admin, AdminService)`, [admind, fqdn] — R2, docs/52 §5 item 3,
-/// the admin service's own purpose); docs/10 §5ב; A-73 (`admind/<fqdn>`);
+/// the admin service's own purpose); docs/10 §5b; A-73 (`admind/<fqdn>`);
 /// RFC 4120 §6.2.1 ("a two-component name of type NT-SRV-HST").
 #[test]
 fn the_service_key_sets_are_service_purpose_bound_to_class_and_host() {

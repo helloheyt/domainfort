@@ -16,7 +16,7 @@
 //!    [ldap, fqdn]; `(GUID_admin, AdminService)` with NT-SRV-HST [admind,
 //!    fqdn] — the admin service's own purpose, whose tickets keyd opens only
 //!    bound to an operation (R2, docs/52 §5 item 3; A-102) (docs/51 §4.3
-//!    step 11; docs/47 §1.4, §9.1; docs/10 §5ב, §7; A-19, A-73); and (task
+//!    step 11; docs/47 §1.4, §9.1; docs/10 §5b, §7; A-19, A-73); and (task
 //!    K9) `(GUID_changepw, ChangePasswordService)` with NT-SRV-INST
 //!    [kadmin, changepw] — the change-password service's own purpose, whose
 //!    tickets keyd opens only in `open_change_password_request` (RFC 3244 §2;
@@ -101,7 +101,7 @@ pub enum Step {
     /// `(GUID_krbtgt, Krbtgt)`, NT-SRV-INST [krbtgt, REALM]. Spec: docs/47
     /// §1.4; RFC 4120 §7.3.
     Krbtgt,
-    /// `(GUID_ldap, Service)`, NT-SRV-HST [ldap, fqdn]. Spec: docs/10 §5ב;
+    /// `(GUID_ldap, Service)`, NT-SRV-HST [ldap, fqdn]. Spec: docs/10 §5b;
     /// RFC 4120 §6.2.1.
     LdapService,
     /// `(GUID_admin, AdminService)`, NT-SRV-HST [admind, fqdn]. Spec: A-73;

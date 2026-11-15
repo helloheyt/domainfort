@@ -27,7 +27,7 @@
 //! hardening keyadm would not take anything from it.
 //!
 //! Spec: docs/50 R50-3, §3.2, §6.1, §6.2, §6.4; docs/51 §4.3 step 11, §6;
-//! docs/10 §2, I1; AGENTS.md §6 (fail closed).
+//! docs/10 §2, I1; docs/CLEAN-ROOM.md (fail closed).
 
 use core::fmt;
 

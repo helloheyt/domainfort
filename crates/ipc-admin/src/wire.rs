@@ -63,7 +63,7 @@ pub struct WireSetPassword {
 impl fmt::Debug for WireSetPassword {
     /// Lengths and the target only: neither AP-REQ octets nor anything of
     /// the password (not even its length) is printed (docs/50 §8.2;
-    /// AGENTS.md §6).
+    /// docs/CLEAN-ROOM.md).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WireSetPassword")
             .field("auth", &self.auth)

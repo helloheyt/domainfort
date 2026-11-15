@@ -918,7 +918,7 @@ fn challenge_carries_no_kvno() {
 /// reply key, the session key, the subkey, the armor ticket's session key or
 /// any long-term key. Source: docs/48 §2.2 ("no FAST key — armor, challenge,
 /// strengthen, reply — leaves keyd"), §9.1 I1, I8, §9.2 item 1; docs/10 §12
-/// I1, I8; AGENTS.md §6.
+/// I1, I8; docs/CLEAN-ROOM.md
 #[test]
 fn no_fast_key_in_any_output_or_audit_record() {
     let (mut f, tgt) = setup();

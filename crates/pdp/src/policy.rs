@@ -15,7 +15,7 @@
 //! AuthMatch { armored: Option<bool> }` on the Allow side, and option (ii) a
 //! negated subject predicate (`SubjectMatch::NotMemberOf`) so that an
 //! explicit Deny can be written ("explicit Deny wins", docs/11 §3, P4);
-//! Q-127 interim decision (owner item P-10): (ג) = (ii). Neither extension
+//! Q-127 interim decision (owner item P-10): (c) = (ii). Neither extension
 //! widens an existing rule's grants:
 //! - a rule whose `auth` is [`AuthMatch::ANY`] matches exactly what it
 //!   matched before `auth` existed (the conjunction gains a `true` term);
@@ -124,9 +124,9 @@ impl Rule {
     /// when its `Match` holds AND its subject predicate is not negated: an
     /// Allow with [`SubjectMatch::NotMemberOf`] matches nothing.
     ///
-    /// DELIBERATE (fail closed, AGENTS.md §6; Q-130): the negated predicate
+    /// DELIBERATE (fail closed, docs/CLEAN-ROOM.md; Q-130): the negated predicate
     /// exists to write an explicit Deny (docs/48 §7.2 option (ii); Q-127
-    /// (ג) = (ii)). In a grant it would hold for every subject whose
+    /// (c) = (ii)). In a grant it would hold for every subject whose
     /// membership is absent from the request — a grant on missing data. A
     /// negation can therefore only remove grants (through a Deny, P4), never
     /// add one. Spec: docs/11 §3 ("explicit Deny wins; without a matching
@@ -319,7 +319,7 @@ pub enum SubjectMatch {
     /// group SID: `Subject.groups` is the expanded, nested membership from
     /// authoritative data (docs/11 §1). Spec: docs/48 §7.2 option (ii)
     /// ("explicit Deny with a negative predicate
-    /// (`SubjectMatch::NotMemberOf`)"); Q-127 interim decision (P-10), (ג) =
+    /// (`SubjectMatch::NotMemberOf`)"); Q-127 interim decision (P-10), (c) =
     /// (ii); docs/11 §3 (subject predicate; explicit Deny wins), P4.
     NotMemberOf(PrincipalId),
     /// The subject's (PIP-verified) tier is exactly this one.

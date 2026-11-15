@@ -5,7 +5,7 @@
 //! itself is built (PENDING-OWNER P-1).
 //!
 //! Sources: docs/53 §5.9 (`ipc_kpasswd_request`, `ipc_kpasswd_reply`);
-//! docs/50 §3.3, §9; AGENTS.md §6. Inputs are encoded by this crate from the
+//! docs/50 §3.3, §9; docs/CLEAN-ROOM.md Inputs are encoded by this crate from the
 //! hand-made values of tests/common.
 
 mod common;
@@ -74,7 +74,7 @@ fn garbage() -> Vec<Vec<u8>> {
     ]
 }
 
-/// docs/53 §5.9; AGENTS.md §6: the request body holds over every variant.
+/// docs/53 §5.9; docs/CLEAN-ROOM.md: the request body holds over every variant.
 #[test]
 fn the_request_target_holds() {
     for input in requests().iter().flat_map(|r| variants(r)).chain(garbage()) {
@@ -82,7 +82,7 @@ fn the_request_target_holds() {
     }
 }
 
-/// docs/53 §5.9; AGENTS.md §6: the reply body holds over every variant.
+/// docs/53 §5.9; docs/CLEAN-ROOM.md: the reply body holds over every variant.
 #[test]
 fn the_reply_target_holds() {
     for input in replies().iter().flat_map(|r| variants(r)).chain(garbage()) {

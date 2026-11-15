@@ -1,5 +1,5 @@
 //! Errors of the event encoding. No variant carries event octets
-//! (AGENTS.md §6; docs/50 §8.2).
+//! (docs/CLEAN-ROOM.md; docs/50 §8.2).
 
 use core::fmt;
 

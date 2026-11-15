@@ -45,7 +45,7 @@
 //! later use to save a key for.
 //!
 //! Spec: RFC 4120 §4, 3.2.3, 3.2.4, 5.3, 5.5.1, 7.5.1; RFC 3961 §3, §4; RFC
-//! 3962 §7; RFC 8009 §6, §7; docs/10 §5ב; docs/49 §3.3; docs/52 §3.2, §3.4,
+//! 3962 §7; RFC 8009 §6, §7; docs/10 §5b; docs/49 §3.3; docs/52 §3.2, §3.4,
 //! §5; docs/questions/Q-165 (A-46), Q-463 (A-102), Q-523, Q-575.
 
 use crate::authz::Operation;
@@ -110,7 +110,7 @@ pub enum AppBinding {
     /// rather than ignored; the GSS checksum of RFC 4121 is task L6b, a
     /// separate variant when it comes). Opens only a
     /// [`KeyPurpose::Service`] key set (the LDAP service key).
-    /// Spec: docs/10 §5ב step 9; docs/questions/Q-180 item 3 (A-50).
+    /// Spec: docs/10 §5b step 9; docs/questions/Q-180 item 3 (A-50).
     Unbound,
     /// The admin channel: the Authenticator must carry a `cksum` of the
     /// session key's required checksum type, key usage 10, whose MIC

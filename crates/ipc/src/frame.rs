@@ -120,7 +120,7 @@ enum State {
 ///   leaves a copy behind, and it is zeroizing.
 /// * A framing error is sticky: every later call reports it again, and
 ///   [`FrameReader::reset`] does not clear it — the connection is closed
-///   (docs/50 §3.3; AGENTS.md §6: fail closed).
+///   (docs/50 §3.3; docs/CLEAN-ROOM.md: fail closed).
 /// * `Debug` shows lengths only.
 ///
 /// Spec: docs/50 §3.3 (bound before allocation; frame buffer zeroized after
@@ -236,7 +236,7 @@ impl FrameReader {
     /// failed stream stays failed.
     ///
     /// Spec: docs/50 §3.3 ("the frame buffer is zeroized after decoding");
-    /// AGENTS.md §6 (fail closed).
+    /// docs/CLEAN-ROOM.md (fail closed).
     pub fn reset(&mut self) {
         // The previous body drops here and is zeroized.
         self.body = Zeroizing::new(Vec::new());

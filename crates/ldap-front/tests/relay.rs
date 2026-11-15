@@ -258,7 +258,7 @@ fn a_bind_password_never_reaches_dird() {
     .is_ok());
 }
 
-/// AGENTS.md §6 (no unbounded allocation): the buffer refuses to grow past
+/// docs/CLEAN-ROOM.md (no unbounded allocation): the buffer refuses to grow past
 /// its bound, and appends nothing when it refuses.
 #[test]
 fn the_buffer_is_bounded() {

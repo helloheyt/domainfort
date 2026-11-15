@@ -1,7 +1,7 @@
 #![no_main]
 //! Fuzz target for the RFC 6113 FAST decoders.
 //!
-//! AGENTS.md §6 / docs/32 §8 require a fuzz target for every parser before it
+//! docs/CLEAN-ROOM.md / docs/32 §8 require a fuzz target for every parser before it
 //! merges to `main`. Arbitrary bytes are fed to the `decode` of every FAST
 //! type that is decoded on its own: the PA-FX-FAST padata values
 //! (PA-FX-FAST-REQUEST, PA-FX-FAST-REPLY), the decrypted inner messages

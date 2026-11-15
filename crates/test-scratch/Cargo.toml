@@ -33,7 +33,7 @@
 # Written only from this project's decided design (docs/52 §3.13, §3.18;
 # docs/50 §9; Q-468; Q-480; Q-482; Q-680) and the Rust standard library's
 # API. No other implementation
-# consulted or recalled (AGENTS.md §1-3).
+# consulted or recalled (docs/CLEAN-ROOM.md).
 
 [package]
 name = "test-scratch"

@@ -12,7 +12,7 @@
 //!
 //! Spec: docs/10 §2 (`CallerId`, role `Kdc`: verify_preauth, issue_as_rep,
 //! open_and_verify_tgt, issue_tgs_rep, open_fast_armor, seal_fast_error),
-//! §4, §5, §5א; docs/48 §2.3; docs/50 §3.4; D182; A-63.
+//! §4, §5, §5a; docs/48 §2.3; docs/50 §3.4; D182; A-63.
 
 use crate::audit::AuditSink;
 use crate::authz::{CallerId, Role};

@@ -7,7 +7,7 @@
 //! refusals of the rule model, A-51; rule ids unique and clear of the
 //! mandatory-FAST range).
 //!
-//! AGENTS.md §6 / docs/50 §9 (R50-19: `policy_store`): arbitrary bytes →
+//! docs/CLEAN-ROOM.md / docs/50 §9 (R50-19: `policy_store`): arbitrary bytes →
 //! decoder; never a panic, bounded allocation. Whatever decodes must
 //! re-encode to exactly the input (docs/50 §3.3: "a single encoding per
 //! value"; A-57: "the same discipline as the IPC codec") and give a

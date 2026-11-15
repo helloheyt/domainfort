@@ -1,9 +1,9 @@
 //! Error type of the DNS codec.
 //!
-//! Hand-rolled, zero-dependency (AGENTS.md §7). Every variant names one rule
+//! Hand-rolled, zero-dependency (docs/CLEAN-ROOM.md). Every variant names one rule
 //! the decoder (or, for [`Error::InvalidValue`], the encoder) enforces. Fail
 //! closed: malformed input is always a distinct `Err`, never a panic and never
-//! a silent repair (AGENTS.md §6; docs/54 §6.1).
+//! a silent repair (docs/CLEAN-ROOM.md; docs/54 §6.1).
 //!
 //! What the server answers for each error is the caller's policy (docs/54
 //! §6.6, task DN2): e.g. [`Error::MessageTooLarge`] on UDP is silence,
@@ -76,7 +76,7 @@ pub enum Error {
     /// The section counts cannot fit in the octets that follow the header,
     /// even with every name at its shortest. Checked before anything is
     /// allocated. Spec: RFC 1035 §4.1.1 (the counts number the entries
-    /// present); AGENTS.md §6 (no allocation from attacker-supplied counts).
+    /// present); docs/CLEAN-ROOM.md (no allocation from attacker-supplied counts).
     CountExceedsMessage,
 
     // ---- names --------------------------------------------------------------

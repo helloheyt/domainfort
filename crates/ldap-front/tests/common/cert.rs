@@ -38,7 +38,7 @@
 //!   well-defined expiration date"), unless a test sets its own window.
 //!
 //! Every value is made here, per run; nothing comes from another
-//! implementation's tests (AGENTS.md §2).
+//! implementation's tests (docs/CLEAN-ROOM.md).
 //!
 //! Sources: RFC 5280 §4.1, §4.1.1.2, §4.1.1.3, §4.1.2.1-§4.1.2.9,
 //! §4.2.1.1-§4.2.1.3, §4.2.1.6, §4.2.1.9, §4.2.1.12, A.1, A.2; RFC 8446

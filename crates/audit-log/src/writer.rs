@@ -187,7 +187,7 @@ pub struct Persisted {
 /// Why an append (or a rotation) was refused.
 ///
 /// Every refusal except the I/O ones happens before any octet is written.
-/// No variant carries payload octets (AGENTS.md §6; docs/50 §8.2).
+/// No variant carries payload octets (docs/CLEAN-ROOM.md; docs/50 §8.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppendError {
     /// An earlier write, flush or sync failed; the segment's tail is unknown

@@ -6,7 +6,7 @@
 //! `ZoneImage::new` — what dnsd's `DnsClient` does with dird's octets
 //! (docs/50 §3.3: "replies are decoded with the same strictness").
 //!
-//! Properties (AGENTS.md §6; docs/50 §3.3, §9; docs/54 §4.4, §4.6, §10.3):
+//! Properties (docs/CLEAN-ROOM.md; docs/50 §3.3, §9; docs/54 §4.4, §4.6, §10.3):
 //! never a panic, bounded allocation (an image ≤ 8 MiB); whatever decodes
 //! re-encodes to exactly the input, the frame and the image payload alike.
 //!

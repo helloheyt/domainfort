@@ -2,7 +2,7 @@
 //! Fuzz target for the LDAP engine's filter assertion-value parsers
 //! (crates/ldap/src/search/syntax.rs, through `ldap::fuzz_hooks`).
 //!
-//! AGENTS.md §6 / docs/32 §8 (every parser of network input gets a fuzz
+//! docs/CLEAN-ROOM.md / docs/32 §8 (every parser of network input gets a fuzz
 //! target before it merges to main). On any input nothing panics, and:
 //!
 //! * Integer (RFC 4517 §3.3.16): the grammar admits one spelling per number,

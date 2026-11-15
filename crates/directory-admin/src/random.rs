@@ -1,6 +1,6 @@
 //! Randomness for objectGUIDs.
 //!
-//! This crate implements no random number generator (AGENTS.md §6 "never
+//! This crate implements no random number generator (docs/CLEAN-ROOM.md "never
 //! implement ... RNG") and links no randomness crate. The production source
 //! is [`OsRandom`]: the operating-system kernel CSPRNG read through
 //! `/dev/urandom` with `read_exact`, the same source keyd uses (A-15, as
@@ -14,7 +14,7 @@
 //! Spec: [MS-ADTS] 3.1.1.5.2.4 ("For originating updates, a new objectGUID
 //! value is generated and set on the object. This value MUST NOT be the
 //! NULL GUID"); docs/51 R51-3, R51-17 (every identifier from the CSPRNG;
-//! dird, not admind, draws it); A-15; A-77; AGENTS.md §6.
+//! dird, not admind, draws it); A-15; A-77; docs/CLEAN-ROOM.md
 
 /// The random source failed. Carries no data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -29,7 +29,7 @@ pub trait RandomSource {
 }
 
 /// The kernel CSPRNG via `/dev/urandom` — the only source permitted outside
-/// tests. Fails closed on any error. Spec: A-15; AGENTS.md §6.
+/// tests. Fails closed on any error. Spec: A-15; docs/CLEAN-ROOM.md
 #[derive(Debug, Default, Clone, Copy)]
 pub struct OsRandom {
     _private: (),
@@ -79,7 +79,7 @@ mod tests {
     use super::*;
 
     /// The OS source fills the whole buffer, and two draws differ (smoke
-    /// test on the build host; AGENTS.md §6).
+    /// test on the build host; docs/CLEAN-ROOM.md).
     #[test]
     #[cfg(unix)]
     fn os_random_fills_the_buffer() {

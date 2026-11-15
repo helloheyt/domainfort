@@ -63,15 +63,15 @@
 //! # Provenance
 //!
 //! Written only from this project's decided design, opened in-session:
-//! AGENT-ONBOARDING, AGENTS, docs/51 (whole), docs/10 (§1, §2, §5ב, §7,
-//! §7א, §9-§11), docs/47 (§1.1-§1.4, §2.3, §9.1), docs/50 (§2.4, §3.1-§3.7,
+//! docs/CLEAN-ROOM.md, docs/CLEAN-ROOM.md, docs/51 (whole), docs/10 (§1, §2, §5b, §7,
+//! §7a, §9-§11), docs/47 (§1.1-§1.4, §2.3, §9.1), docs/50 (§2.4, §3.1-§3.7,
 //! §6.1-§6.4, §7.1, §9, magic registry), docs/questions Q-290, Q-295, Q-296
 //! and PENDING-OWNER (A-19, A-35, A-57, A-63, A-72, A-73, A-77, P-17, P-22);
 //! RFC 4120 §6.2, §6.2.1, §7.3 (pinned, SHA-256 verified); and the public
 //! API of this project's crates config, ipc, ipc-keyd, keyd-types,
 //! provision-manifest and daemon-sandbox. No other implementation and no
 //! existing key-administration or provisioning tool — its commands, names,
-//! file formats or messages — was consulted or recalled (AGENTS.md §1-3).
+//! file formats or messages — was consulted or recalled (docs/CLEAN-ROOM.md).
 //!
 //! The decision commands, the sweep over keyd's destroy decisions and the
 //! seal (A-102) are written from docs/52 §3.1, §3.3, §3.10, §4 and

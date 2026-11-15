@@ -9,9 +9,9 @@
 //! Both tables are `const` and fixed at compile time: they cannot be changed
 //! at run time, and the compile-time assertions at the bottom of this file
 //! pin the security-relevant cells. This process-authorization table is
-//! independent of the PDP (docs/09 א.6, D31).
+//! independent of the PDP (docs/09 A.6, D31).
 //!
-//! Spec: docs/10 §2 (caller model, capability table), §12 I2, I3; docs/09 א.6;
+//! Spec: docs/10 §2 (caller model, capability table), §12 I2, I3; docs/09 A.6;
 //! docs/25 §3.2 (keyd is a PEP).
 
 use crate::as_exchange::AsServer;
@@ -69,7 +69,7 @@ pub struct CallerId {
 /// Netlogon, SNTP, GKDI, BackupKey, S4U and replication operations are not
 /// implemented and have no variant.
 ///
-/// Spec: docs/10 §2 (capability table), §4, §5, §6, §7; docs/09 א.5.
+/// Spec: docs/10 §2 (capability table), §4, §5, §6, §7; docs/09 A.5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Operation {
@@ -99,7 +99,7 @@ pub enum Operation {
     SealFastError = 11,
     /// Spec: docs/10 §7; docs/questions/Q-115 (A-35).
     DestroyKeySet = 12,
-    /// Spec: docs/10 §5ב; docs/49 §3.3; RFC 4120 3.2.3;
+    /// Spec: docs/10 §5b; docs/49 §3.3; RFC 4120 3.2.3;
     /// docs/questions/Q-165 (A-46).
     OpenAndVerifyServiceTicket = 13,
     /// The non-secret part of keyd's configuration, which the kdc needs at
@@ -147,7 +147,7 @@ pub enum Operation {
     /// context**: the answer (`OperationTicket`) has no context id and keyd
     /// keeps no session key for it. Role::Ldap (dird). Appended by Q-523;
     /// `OpenAndVerifyServiceTicket` is now the unbound verification only.
-    /// Spec: RFC 4120 3.2.3, 5.5.1, 7.5.1 item 10; docs/10 §5ב; docs/52
+    /// Spec: RFC 4120 3.2.3, 5.5.1, 7.5.1 item 10; docs/10 §5b; docs/52
     /// §3.4 (C4), §5; docs/questions/Q-387 item 4, Q-493 item 3, Q-523.
     VerifyOperationTicket = 20,
     /// Open an RFC 3244 change-password request: the AP-REQ for
@@ -188,7 +188,7 @@ pub enum Operation {
     /// register a decision (pinned below). It changes no key state and only
     /// makes keyd stricter: one record, no intent. Appended by task F3.
     /// Spec: docs/52 §3.1 (C1), §3.14 (C14), §4.2, §4.3 (A-102); docs/10
-    /// §2, §6א, §10; docs/questions/Q-937 item 6 (the residual of A-159),
+    /// §2, §6a, §10; docs/questions/Q-937 item 6 (the residual of A-159),
     /// Q-976.
     RevokeDecision = 24,
 }
@@ -228,7 +228,7 @@ impl Operation {
 /// not listed is denied.
 ///
 /// Spec: docs/10 §2 (table rows Kdc, Directory, Admin — restricted to the
-/// phase-1 operations), §7; docs/09 א.6 (D31); docs/48 §2.3 ("`Kdc` also
+/// phase-1 operations), §7; docs/09 A.6 (D31); docs/48 §2.3 ("`Kdc` also
 /// gets `open_fast_armor`, `seal_fast_error`. No other role");
 /// docs/questions/Q-115 (A-35: `destroy_key_set` is an Admin operation);
 /// docs/questions/Q-165 item 3 (A-46: `Ldap` holds only the service-ticket
@@ -654,7 +654,7 @@ pub const fn as_server_slot(armored: bool) -> HandleSlot {
 /// denied (key separation, invariant I3).
 ///
 /// - `verify_preauth`, `issue_as_rep` (client): PrincipalLongterm (docs/10
-///   §4 "חייב purpose = PrincipalLongterm").
+///   §4 "must be purpose = PrincipalLongterm").
 /// - `issue_as_rep` (server): exactly the servers of [`AsServer::of`] — in
 ///   the unarmored slot Krbtgt only, in the armored slot Krbtgt or
 ///   ChangePasswordService (docs/53 §5.2: "Krbtgt **or**

@@ -101,7 +101,7 @@ fn trailing_octets_rejected() {
 
 #[test]
 fn counts_exceeding_the_message_rejected() {
-    // Source: RFC 1035 §4.1.1 (counts number the entries present); AGENTS.md
+    // Source: RFC 1035 §4.1.1 (counts number the entries present); docs/CLEAN-ROOM.md
     // §6 (no allocation from attacker-supplied counts). Checked before any
     // section is read.
     let wire = cat(&[

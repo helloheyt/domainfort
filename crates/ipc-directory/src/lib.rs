@@ -52,7 +52,7 @@
 //! # Provenance
 //!
 //! Written only from this project's decided design, opened in-session:
-//! AGENT-ONBOARDING, AGENTS, docs/50 (§1 R50-2..R50-8; §2.2; §3.1-§3.7;
+//! docs/CLEAN-ROOM.md, docs/CLEAN-ROOM.md, docs/50 (§1 R50-2..R50-8; §2.2; §3.1-§3.7;
 //! §7.5; §8.2; §9; §10; the channel-magic registry; closing decision A-58),
 //! docs/47 §8, docs/questions Q-213 / Q-214 / Q-218..Q-220 (A-57), Q-217 /
 //! Q-222 (A-56), Q-225 (A-59), Q-245 (A-63), Q-255 (A-65), Q-270,
@@ -60,7 +60,7 @@
 //! keyd-types, krb-proto, dtyp, directory-pip (its API) and ipc-keyd (the
 //! pattern); and the docs.rs API pages of rustix 1.1.6 and zeroize 1.9.1
 //! (P-2). No other implementation, directory server, serializer or RPC
-//! framework was consulted or recalled (AGENTS.md §1-3).
+//! framework was consulted or recalled (docs/CLEAN-ROOM.md).
 //!
 //! Spec: docs/50 R50-2, R50-3, R50-4, R50-7, R50-8, §3, §7.5, §10 (P8);
 //! docs/47 §8; A-56; A-57; A-59; A-63.

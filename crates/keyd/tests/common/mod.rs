@@ -31,7 +31,7 @@ use zeroize::Zeroizing;
 
 // ---------------------------------------------------------------------------
 // Deterministic entropy (TESTS ONLY — keyd::OsEntropy is the only production
-// source, AGENTS.md §6).
+// source, docs/CLEAN-ROOM.md).
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]

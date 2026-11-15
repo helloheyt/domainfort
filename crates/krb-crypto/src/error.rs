@@ -1,13 +1,13 @@
 //! Error type for the Kerberos AES encryption and checksum profile.
 //!
-//! Hand-rolled (AGENTS.md §7: prefer a hand-rolled enum over a crate for a
+//! Hand-rolled (docs/CLEAN-ROOM.md: prefer a hand-rolled enum over a crate for a
 //! leaf). Every variant names one specific rule that failed. Fail closed:
 //! malformed input, a bad length, or an integrity failure is a distinct `Err`,
-//! never a panic and never a silent repair (AGENTS.md §6).
+//! never a panic and never a silent repair (docs/CLEAN-ROOM.md).
 //!
 //! Security: no variant carries any data at all — in particular no key
 //! octets, no plaintext, no MAC value and no attacker-supplied bytes. Only the
-//! fact of which rule failed is reported (AGENTS.md §6 "secrets never in
+//! fact of which rule failed is reported (docs/CLEAN-ROOM.md "secrets never in
 //! errors").
 
 use core::fmt;
@@ -21,7 +21,7 @@ pub type Result<T> = core::result::Result<T, Error>;
 pub enum Error {
     /// The encryption type number is not one of the four AES types this crate
     /// implements (17, 18, 19, 20). Every other number — including DES, 3DES
-    /// and RC4 — has no code path (AGENTS.md §6).
+    /// and RC4 — has no code path (docs/CLEAN-ROOM.md).
     /// Spec: RFC 3962 §7; RFC 8009 §7; RFC 3961 §8 (numbers are signed 32-bit).
     UnsupportedEncType,
 
@@ -85,7 +85,7 @@ pub enum Error {
     /// An input to a building-block function (n-fold, CBC-CTS) had a length
     /// outside the range that function accepts.
     /// Spec: RFC 3961 §5.1 (n-fold); RFC 3962 §5 (CTS on at least one block);
-    /// resource bounds per AGENTS.md §6.
+    /// resource bounds per docs/CLEAN-ROOM.md
     InvalidInputLength,
 }
 

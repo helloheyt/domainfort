@@ -66,7 +66,7 @@
 //! it only when the configuration names that profile, and
 //! [`Probed::notice`] returns [`INSECURE_DEVELOPMENT_NOTICE`] for the
 //! daemon's log (R50-18: "clearly marked"). It needs no primitive beyond
-//! the kernel CSPRNG keyd already reads ([`OsEntropy`]; AGENTS.md §6 —
+//! the kernel CSPRNG keyd already reads ([`OsEntropy`]; docs/CLEAN-ROOM.md —
 //! nothing implemented here). Protects against: nothing (r4-c §3.2, the
 //! "Dev" column).
 //!
@@ -82,7 +82,7 @@
 //! profiles), §3.6 (the anchor), §3.7 steps 1-3 (probe, anchor, SWK), §9.1
 //! (C38), R4C-3, R4C-5, R4C-14 (named anchors); PENDING-OWNER A-143;
 //! docs/50 R50-18; docs/52 §4.4; docs/research/r4-a-crypto-inventory.md
-//! R4A-5 (AES-256 where there is a choice); AGENTS.md §6, §6.1.
+//! R4A-5 (AES-256 where there is a choice); docs/CLEAN-ROOM.md, §6.1.
 
 use crate::entropy::{EntropySource, OsEntropy};
 use core::fmt;
@@ -239,7 +239,7 @@ pub enum AnchorReading {
     },
 }
 
-/// A backend operation failed. Carries no data (AGENTS.md §6). Every case
+/// A backend operation failed. Carries no data (docs/CLEAN-ROOM.md). Every case
 /// is fail closed: keyd does not start, or the operation is not performed.
 /// Spec: r4-c §3.7 ("missing ⇒ keyd does not start"), §3.8 (backend
 /// unavailable).
@@ -268,7 +268,7 @@ pub enum ProbeError {
 }
 
 /// The store wrapping key, held in zeroizing memory. Opaque: no accessor
-/// outside keyd, no octet in `Debug` (AGENTS.md §6). The sealed store (KL3)
+/// outside keyd, no octet in `Debug` (docs/CLEAN-ROOM.md). The sealed store (KL3)
 /// reads it inside keyd.
 /// Spec: r4-c §3.3 (the SWK), §3.7 step 3; docs/10 §11 (zeroize).
 pub struct StoreWrappingKey {
@@ -279,7 +279,7 @@ impl StoreWrappingKey {
     /// A fresh key from `entropy` (the kernel CSPRNG in the development
     /// backend); entropy failure is `Unavailable` (fail closed, no
     /// fallback).
-    /// Spec: AGENTS.md §6 (never implement an RNG); RFC 4120 §3.1.3 ("See
+    /// Spec: docs/CLEAN-ROOM.md (never implement an RNG); RFC 4120 §3.1.3 ("See
     /// \[RFC4086\]" — keys must be unguessable).
     fn draw<E: EntropySource>(entropy: &mut E) -> Result<Self, CustodyError> {
         let mut octets = Zeroizing::new([0u8; STORE_KEY_OCTETS]);
@@ -314,7 +314,7 @@ impl fmt::Debug for StoreWrappingKey {
 /// only this module calls a backend's operations (they take an [`Access`]
 /// token no other code can build). A backend declares hardware properties;
 /// a backend outside keyd could declare them falsely.
-/// Spec: AGENTS.md §6.1 ("a single chokepoint"); r4-c §3.2.
+/// Spec: docs/CLEAN-ROOM.md ("a single chokepoint"); r4-c §3.2.
 mod sealed {
     /// Implemented only by this crate's backends.
     pub trait Sealed {}
@@ -325,7 +325,7 @@ mod sealed {
     pub struct Access(());
 
     impl Access {
-        /// Spec: AGENTS.md §6.1.
+        /// Spec: docs/CLEAN-ROOM.md
         pub(super) const fn new() -> Self {
             Access(())
         }
@@ -553,7 +553,7 @@ impl<B: CustodyBackend> Probed<B> {
 }
 
 impl<B> fmt::Debug for Probed<B> {
-    /// Properties and anchor only — never a key (AGENTS.md §6).
+    /// Properties and anchor only — never a key (docs/CLEAN-ROOM.md).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Probed")
             .field("properties", &self.properties)
@@ -714,7 +714,7 @@ impl CustodyBackend for InsecureDevelopmentCustody {
 }
 
 impl fmt::Debug for InsecureDevelopmentCustody {
-    /// The declaration and the anchor — never the SWK (AGENTS.md §6).
+    /// The declaration and the anchor — never the SWK (docs/CLEAN-ROOM.md).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut s = f.debug_struct("InsecureDevelopmentCustody");
         s.field("insecure_development", &true);

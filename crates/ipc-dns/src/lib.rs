@@ -81,7 +81,7 @@
 //! # Provenance
 //!
 //! Written only from this project's decided design and the allowed
-//! specifications, opened in-session: AGENT-ONBOARDING, AGENTS; docs/54 (all,
+//! specifications, opened in-session: docs/CLEAN-ROOM.md, docs/CLEAN-ROOM.md; docs/54 (all,
 //! esp. §4.1–§4.8, §6.1, §6.2, §6.6, §7.5, §8, §9, §10 — DN7, §11 — Q-613,
 //! Q-619); docs/research/r3-c-dns.md (all; §4.1, §4.4, §5, §6 W1, W21, §9 —
 //! DR4); docs/57; docs/50 (§3.1–§3.7, §7.5, the channel-magic registry);
@@ -95,7 +95,7 @@
 //! pattern); and the docs.rs API pages of rustix 1.1.6 and zeroize 1.9.1
 //! (P-2) and the std 1.95.0 API documentation (`IpAddr::to_canonical`). No
 //! other implementation, DNS server, serializer or RPC framework was
-//! consulted or recalled (AGENTS.md §1-3).
+//! consulted or recalled (docs/CLEAN-ROOM.md).
 //!
 //! Spec: docs/54 §4.4, §4.6, R54-4, R54-5; A-119; A-140; A-152 (Q-922);
 //! docs/50 R50-3, R50-4, R50-7, §3; A-59.

@@ -231,7 +231,7 @@ pub enum Visibility<'v> {
     Refused(Decision),
 }
 
-/// The view could not answer. Never carries a name or a value (AGENTS.md
+/// The view could not answer. Never carries a name or a value (docs/CLEAN-ROOM.md
 /// §6; crate error.rs).
 #[derive(Debug)]
 pub enum GateFault {

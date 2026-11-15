@@ -258,7 +258,7 @@ fn a_client_certificate_is_ignored() {
 
 /// RFC 4511 §4.2 (a simple bind with a password); crates/ldap's table
 /// ("simple bind with a password | authMethodNotSupported (7), before any
-/// lookup, never keyd" — P-14; AGENTS.md §6: cleartext simple bind has no
+/// lookup, never keyd" — P-14; docs/CLEAN-ROOM.md: cleartext simple bind has no
 /// code path): over TLS the bind is refused with 7, octet for octet the
 /// engine's answer to the canonical message the front relays (the password
 /// replaced by the decoder's placeholder, A-52).

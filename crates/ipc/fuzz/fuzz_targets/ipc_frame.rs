@@ -2,7 +2,7 @@
 //! Fuzz target for the IPC stream framer: `ipc::decode_frame` and
 //! `ipc::FrameReader`.
 //!
-//! AGENTS.md §6 / docs/50 §9 (R50-19): arbitrary bytes → framer; never a
+//! docs/CLEAN-ROOM.md / docs/50 §9 (R50-19): arbitrary bytes → framer; never a
 //! panic, bounded allocation. The first input octet picks the body bound and
 //! the chunk size the stream arrives in; the rest is the stream. Every frame
 //! the stateless decoder cuts must lie inside the buffer and within the bound

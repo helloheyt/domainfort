@@ -155,13 +155,13 @@ impl Acl {
         if acl_size < ACL_HEADER_LEN {
             return Err(Error::AclSizeTooSmall);
         }
-        // Bound AclSize by the input before slicing (AGENTS.md §6).
+        // Bound AclSize by the input before slicing (docs/CLEAN-ROOM.md).
         if acl_size > input.len() {
             return Err(Error::AclTruncated);
         }
         let region = &input[ACL_HEADER_LEN..acl_size];
         // Every ACE is at least its 4-byte header (2.4.4.1), so AceCount is
-        // bounded by the region before any allocation from it (AGENTS.md §6).
+        // bounded by the region before any allocation from it (docs/CLEAN-ROOM.md).
         if ace_count > region.len() / ACE_HEADER_LEN {
             return Err(Error::AceCountExceedsAclSize);
         }

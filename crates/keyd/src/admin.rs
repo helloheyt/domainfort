@@ -13,7 +13,7 @@
 //! itself from the decision's approvers ([`DualControlToken`] is private to
 //! this crate — a fabricated token is unrepresentable).
 //!
-//! Spec: docs/10 §7; docs/09 א.7 (D32 current + previous); docs/33 §5
+//! Spec: docs/10 §7; docs/09 A.7 (D32 current + previous); docs/33 §5
 //! (double krbtgt rotation after compromise, D20), §6.1 (D178);
 //! docs/questions/Q-115 (A-35, `destroy_key_set`); docs/52 §4.2, §4.4;
 //! docs/questions/Q-460, Q-462 item 1 (A-102).
@@ -37,7 +37,7 @@ use krb_proto::KerberosTime;
 /// PDP decision (docs/51 §5.6). keyd still checks that the two are
 /// distinct (registration already did).
 ///
-/// Spec: docs/10 §7 ("rotate_krbtgt באישור כפול"); docs/43 D175; docs/52
+/// Spec: docs/10 §7 ("rotate_krbtgt with dual approval"); docs/43 D175; docs/52
 /// §4.2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DualControlToken {

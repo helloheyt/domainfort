@@ -4,7 +4,7 @@
 //!
 //! The front reads the four header octets, calls [`tcp_message_length`] —
 //! which bounds the announced length **before** any buffer for the message is
-//! allocated (AGENTS.md §6; docs/53 §5.1) — reads exactly that many octets,
+//! allocated (docs/CLEAN-ROOM.md; docs/53 §5.1) — reads exactly that many octets,
 //! and parses them with `RequestMessage::parse`. `RequestMessage::parse_tcp`
 //! / `ReplyMessage::parse_tcp` do the same on a buffer that already holds one
 //! whole frame.

@@ -177,7 +177,7 @@ fn open_protected(
 /// `bound + 1` octets long (zero-filled); it is filled in place, never grown
 /// (so never reallocated), then truncated to the octets read. `Err(true)`
 /// if the file is longer than `bound`, `Err(false)` on a read failure.
-/// Spec: AGENTS.md §6 (bounded reads; secrets never copied around).
+/// Spec: docs/CLEAN-ROOM.md (bounded reads; secrets never copied around).
 fn read_bounded(mut file: File, bound: usize, buffer: &mut Vec<u8>) -> Result<(), bool> {
     let mut filled = 0usize;
     loop {
@@ -262,7 +262,7 @@ pub fn read_certificate(path: &Path, owner: u32) -> Result<Vec<u8>, StartupError
 /// # Errors
 /// [`StartupError`].
 ///
-/// Spec: docs/50 R50-12, §5.3, §6.4; AGENTS.md §6.
+/// Spec: docs/50 R50-12, §5.3, §6.4; docs/CLEAN-ROOM.md
 pub fn read_private_key(path: &Path, owner: u32) -> Result<Zeroizing<Vec<u8>>, StartupError> {
     let file = open_protected(
         path,

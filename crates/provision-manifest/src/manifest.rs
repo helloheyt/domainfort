@@ -35,7 +35,7 @@ pub mod keys {
     /// The krbtgt object: GUID and binding. Spec: docs/51 §4.3 steps 8, 11.
     pub const KRBTGT: &str = "krbtgt";
     /// The LDAP service object: GUID and binding. Spec: docs/51 §4.3 steps
-    /// 5, 8, 11; docs/10 §5ב.
+    /// 5, 8, 11; docs/10 §5b.
     pub const LDAP_SERVICE: &str = "ldap_service";
     /// The admin service object: GUID and binding. Spec: docs/51 §4.3 steps
     /// 5, 8, 11; A-73.
@@ -65,7 +65,7 @@ pub mod keys {
 pub const KRBTGT_SERVICE: &str = "krbtgt";
 
 /// The service class of the LDAP service object's binding.
-/// Spec: docs/10 §5ב ("a dedicated service object with the single SPN
+/// Spec: docs/10 §5b ("a dedicated service object with the single SPN
 /// `ldap/<dc-fqdn>`"); docs/51 §4.3 step 5.
 pub const LDAP_SERVICE_CLASS: &str = "ldap";
 
@@ -296,7 +296,7 @@ impl Manifest {
             krbtgt_handle,
             binding(&realm, KRB_NT_SRV_INST, &[KRBTGT_SERVICE, realm.as_str()]),
         )?;
-        // RFC 4120 §6.2.1; docs/10 §5ב; docs/47 §9.1; docs/51 §4.3 step 11:
+        // RFC 4120 §6.2.1; docs/10 §5b; docs/47 §9.1; docs/51 §4.3 step 11:
         // (GUID_ldap, Service), NT-SRV-HST [ldap, fqdn] — the purpose derived
         // from the binding (`service_handle`; docs/52 R2b).
         let ldap_service = Self::object(
@@ -657,7 +657,7 @@ impl Manifest {
     }
 
     /// The LDAP service key set: `(GUID_ldap, Service)`, NT-SRV-HST
-    /// [ldap, fqdn]. Spec: docs/10 §5ב; docs/51 §4.3 step 11; RFC 4120
+    /// [ldap, fqdn]. Spec: docs/10 §5b; docs/51 §4.3 step 11; RFC 4120
     /// §6.2.1.
     #[must_use]
     pub fn ldap_service(&self) -> &KeySet {

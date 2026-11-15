@@ -1,4 +1,4 @@
-//! Error types. Hand-rolled (AGENTS.md §7). Every failure names the table
+//! Error types. Hand-rolled (docs/CLEAN-ROOM.md). Every failure names the table
 //! entry (a static lDAPDisplayName) and the rule; nothing else is carried.
 //! Building the schema fails closed on any of them (docs/46 §3.3, R46-3).
 

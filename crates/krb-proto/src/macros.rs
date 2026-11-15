@@ -44,7 +44,7 @@ macro_rules! der_codec {
 /// the intermediate value tree is scrubbed and the encoding is returned in a
 /// `Zeroizing` buffer.
 ///
-/// Spec: RFC 4120 5.1.1, 5.2.9; AGENTS.md §6 (secrets).
+/// Spec: RFC 4120 5.1.1, 5.2.9; docs/CLEAN-ROOM.md (secrets).
 macro_rules! der_codec_secret {
     ($ty:ident, $asn1:literal) => {
         der_codec_secret!($ty, $asn1, "RFC 4120 Appendix A");
@@ -88,10 +88,10 @@ macro_rules! der_codec_secret {
 /// - no `Display`, no `Hash`, no conversion that copies the octets out
 ///   except [`as_bytes`](crate::KeyValue::as_bytes).
 ///
-/// Class closed by construction (AGENTS.md §6.1): "a secret-bearing type that
+/// Class closed by construction (docs/CLEAN-ROOM.md): "a secret-bearing type that
 /// is missing its wipe or its redaction" — the properties live in one place.
 ///
-/// Spec: AGENTS.md §6 (secrets never in logs, panics or debug output).
+/// Spec: docs/CLEAN-ROOM.md (secrets never in logs, panics or debug output).
 macro_rules! secret_octets {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
@@ -130,7 +130,7 @@ macro_rules! secret_octets {
 
         impl core::fmt::Debug for $name {
             fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-                // Secrets never appear in debug output (AGENTS.md §6).
+                // Secrets never appear in debug output (docs/CLEAN-ROOM.md).
                 f.write_str(concat!(stringify!($name), "(<redacted>)"))
             }
         }

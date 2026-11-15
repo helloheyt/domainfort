@@ -1,9 +1,9 @@
 //! Framing errors.
 //!
-//! Hand-rolled, no extra dependency (AGENTS.md §7). Every variant names the
+//! Hand-rolled, no extra dependency (docs/CLEAN-ROOM.md). Every variant names the
 //! one RFC 3244 §2 / docs/53 §5.1 rule the input broke; no variant carries any
 //! input octet, so nothing of a message can leak through an error, its
-//! `Debug` or its `Display` (AGENTS.md §6). Each maps to the RFC 3244 result
+//! `Debug` or its `Display` (docs/CLEAN-ROOM.md). Each maps to the RFC 3244 result
 //! code the front answers with ([`Error::result_code`], docs/53 §5.7).
 
 use core::fmt;

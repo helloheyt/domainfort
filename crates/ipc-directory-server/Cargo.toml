@@ -17,7 +17,7 @@
 # code of this project's crates (ipc, ipc-directory, directory-pip, dirstore,
 # kdc, pdp, dtyp, keyd-types, krb-proto; ipc-keyd-server as the pattern). No
 # other implementation, directory server or RPC framework was consulted or
-# recalled (AGENTS.md §1-3).
+# recalled (docs/CLEAN-ROOM.md).
 
 [package]
 name = "ipc-directory-server"

@@ -19,7 +19,7 @@
 //! Fixed width, big-endian (the convention of the IPC codec and of the log,
 //! docs/50 §3.3; crates/audit-log `format`). Only identifiers and metadata:
 //! segment numbers, sequence numbers, a chain hash, octet counts, counters
-//! and a uid — nothing secret (docs/37 §2; AGENTS.md §6).
+//! and a uid — nothing secret (docs/37 §2; docs/CLEAN-ROOM.md).
 //!
 //! The leading octet `0xAD` differs from `ipc_audit::EVENT_FORMAT` (the
 //! senders' event format), so a reader that decodes a payload without first
@@ -30,7 +30,7 @@
 //! There is **no decoder** in the daemon: at start the recovery check
 //! re-encodes the record it expects and compares octets
 //! ([`crate::recovery`]), so no new parser of on-disk data is added
-//! (AGENTS.md §6).
+//! (docs/CLEAN-ROOM.md).
 //!
 //! Spec: docs/50 §3.2 ("an unmapped uid ⇒ the connection is closed + an audit
 //! record"), R50-17; docs/questions/Q-250 items 5, 8 (`Auditd` source; the

@@ -3,7 +3,7 @@
 //!
 //! **No operation of keyd returns long-term key material.** keyd performs
 //! operations *with* secrets and returns results — never the secret itself
-//! (docs/09 א.1; docs/10 invariant I1).
+//! (docs/09 A.1; docs/10 invariant I1).
 //!
 //! # Scope (phase 1, native face)
 //!
@@ -299,7 +299,7 @@
 //!
 //! # Provenance
 //!
-//! Written only from the allowed sources, opened in-session (AGENTS.md
+//! Written only from the allowed sources, opened in-session (docs/CLEAN-ROOM.md
 //! §1-3): RFC 4120 (§1.6, §2, §3.1-3.3, §4, §5.2.7-5.2.9, §5.3, §5.4.1,
 //! §5.4.2, §5.5.1, §5.5.2, §5.9.1, §6.1, §6.2, §7.3, §7.5.1, §7.5.3-7.5.5,
 //! §7.5.9, §8.2, §10),
@@ -324,12 +324,12 @@
 //! RFC 8009 §1, §6, §7 (pinned copies, SHA-256 verified), docs/52 §3.2, §5
 //! and docs/questions/Q-463, Q-490..Q-493; for the binding and chain proof
 //! types (R7) and the destroy-registration rule (R6b), docs/52 §3.5, §3.6,
-//! §7, docs/10 §6א, §7, §9, §12 I6, docs/25 §3.2, RFC 4120 §3.2.3, §6.2
+//! §7, docs/10 §6a, §7, §9, §12 I6, docs/25 §3.2, RFC 4120 §3.2.3, §6.2
 //! (pinned copy, SHA-256 verified), docs/questions/Q-040, Q-071, Q-470,
 //! Q-471, Q-501, Q-503 and decisions A-19, A-26, A-105, A-107. No other
 //! implementation was consulted or recalled.
 //!
-//! Spec: docs/10; docs/09 א; RFC 4120 §3, §5.
+//! Spec: docs/10; docs/09 A; RFC 4120 §3, §5.
 
 mod admin;
 mod as_exchange;

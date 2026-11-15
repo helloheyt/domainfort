@@ -1,7 +1,7 @@
 //! Randomness for session keys, long-term keys, confounders and one-time
 //! token ids.
 //!
-//! keyd implements no random number generator (AGENTS.md §6 "never implement
+//! keyd implements no random number generator (docs/CLEAN-ROOM.md "never implement
 //! ... RNG") and links no randomness crate. The only production source is
 //! [`OsEntropy`]: the operating-system kernel CSPRNG read through
 //! `/dev/urandom` with `read_exact`. Any failure — the device cannot be
@@ -22,7 +22,7 @@
 //!
 //! Spec: RFC 4120 3.1.3 (the session key must be unguessable; "See
 //! [RFC4086]"); RFC 3961 §3 (random-to-key takes a random bitstring, "a
-//! confounder should be included"); AGENTS.md §6.
+//! confounder should be included"); docs/CLEAN-ROOM.md
 
 /// Entropy failure. Carries no data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,14 +40,14 @@ pub trait EntropySource {
 /// The kernel CSPRNG via `/dev/urandom` — the only source permitted outside
 /// tests. Fails closed on any error.
 ///
-/// Spec: AGENTS.md §6; RFC 4120 3.1.3.
+/// Spec: docs/CLEAN-ROOM.md; RFC 4120 3.1.3.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct OsEntropy {
     _private: (),
 }
 
 impl OsEntropy {
-    /// The OS source. Spec: AGENTS.md §6.
+    /// The OS source. Spec: docs/CLEAN-ROOM.md
     pub const fn new() -> Self {
         OsEntropy { _private: () }
     }

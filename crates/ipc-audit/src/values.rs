@@ -468,7 +468,7 @@ impl CodecError {
 /// event built from it always encodes (docs/50 §3.3: "`seq<T,max>`"), and
 /// decoding checks the count against `MAX` before reading any item.
 ///
-/// Spec: docs/50 §3.3; AGENTS.md §6 (no unbounded allocation from a decoded
+/// Spec: docs/50 §3.3; docs/CLEAN-ROOM.md (no unbounded allocation from a decoded
 /// count).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BoundedSeq<T, const MAX: usize>(Vec<T>);

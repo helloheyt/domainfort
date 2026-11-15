@@ -3,14 +3,14 @@
 //! (shared by every daemon schema and by crates/provision-manifest since
 //! task F7, the A-86 follow-up).
 //!
-//! AGENTS.md §6 / docs/32 §8 (every parser gets a fuzz target before it
+//! docs/CLEAN-ROOM.md / docs/32 §8 (every parser gets a fuzz target before it
 //! merges to main). On any octets, against a fixed closed table,
 //! `Entries::parse` must return without panicking, and:
 //!
 //! * input over the file bound, or not ending in LF, is refused (docs/50
 //!   §7.1);
 //! * an error names, at most, a key of the table — never input text — and a
-//!   key only together with a line (AGENTS.md §6; A-60);
+//!   key only together with a line (docs/CLEAN-ROOM.md; A-60);
 //! * accepted input is printable ASCII and LF only; every entry's key is in
 //!   the table and appears once; every value is non-empty, printable, without
 //!   a leading or trailing space and within the value bound; the entries'

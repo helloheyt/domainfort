@@ -51,7 +51,7 @@
 //!
 //! # Provenance
 //!
-//! Written only from sources opened in this session (AGENTS.md §1-3): RFC 4511
+//! Written only from sources opened in this session (docs/CLEAN-ROOM.md): RFC 4511
 //! §4.1.3; RFC 4514 (§1, §2.1–§2.4, §3, §4, §5, App. A, App. B); RFC 4512
 //! §1.4, §2.5; RFC 4517
 //! §3.3.9; [MS-ADTS] v20261026 3.1.1.1.4, 3.1.1.3.1.2.1–3.1.1.3.1.2.5,
@@ -152,7 +152,7 @@ pub struct Rdn {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttributeType(String);
 
-/// Why a DN was refused. No variant carries input bytes (AGENTS.md §6).
+/// Why a DN was refused. No variant carries input bytes (docs/CLEAN-ROOM.md).
 ///
 /// See the module documentation for the resultCode each group maps to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

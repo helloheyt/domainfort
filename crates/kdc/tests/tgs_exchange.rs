@@ -266,7 +266,7 @@ fn identical_retransmission_gets_the_same_reply() {
 /// Decision 9 / RFC 4120 5.4.1: operation options at TGS are
 /// KDC_ERR_BADOPTION (the inner request), as are additional tickets (RFC 4120
 /// 5.4.1). enc-authorization-data is refused by keyd itself, which under FAST
-/// checks both bodies before its chain completes (docs/10 §5א; Q-150 item 2,
+/// checks both bodies before its chain completes (docs/10 §5a; Q-150 item 2,
 /// A-43) — the uniform KRB_AP_ERR_BAD_INTEGRITY (A-26); keyd carries no
 /// authorization data (docs/10 §5).
 #[test]

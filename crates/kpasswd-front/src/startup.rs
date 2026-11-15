@@ -80,7 +80,7 @@ impl std::error::Error for StartupError {}
 /// `bound + 1` octets long (zero-filled); it is filled in place, never grown,
 /// then truncated to the octets read. `Err(true)` if the file is longer than
 /// `bound`, `Err(false)` on a read failure.
-/// Spec: AGENTS.md §6 (bounded reads).
+/// Spec: docs/CLEAN-ROOM.md (bounded reads).
 fn read_bounded(mut file: File, bound: usize, buffer: &mut Vec<u8>) -> Result<(), bool> {
     let mut filled = 0usize;
     loop {

@@ -59,7 +59,7 @@
 //! R50-3, R50-5, R50-7; §10), docs/10 §2, decisions A-56, A-59 — and the
 //! code of this project's crates ipc, ipc-keyd and keyd. No other
 //! implementation, serializer or RPC framework was consulted or recalled
-//! (AGENTS.md §1-3).
+//! (docs/CLEAN-ROOM.md).
 //!
 //! Spec: docs/50 §3.2, §3.3, §3.4, §3.5, R50-3, R50-5, R50-7; docs/10 §2;
 //! A-56; A-59; D182; A-63; docs/52 §3.11 R6 (A-102); Decision: A-144;
@@ -173,7 +173,7 @@ pub fn execute_acknowledged<S: KeyStore, A: AuditSink, E: EntropySource>(
 /// docs/questions/Q-466 item 2, A-102).
 ///
 /// Spec: docs/10 §2 (`CallerId` "derived from the connected peer … not
-/// claimed by the caller"), §4-§7א; docs/50 R50-3, R50-5; A-56;
+/// claimed by the caller"), §4-§7a; docs/50 R50-3, R50-5; A-56;
 /// docs/questions/Q-351 (A-87).
 fn run<S: KeyStore, A: AuditSink, E: EntropySource>(
     keyd: &mut Keyd<S, A, E>,

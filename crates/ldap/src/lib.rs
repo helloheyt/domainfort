@@ -85,7 +85,7 @@
 //! through the same `EntryView` seam a candidate uses) have fuzz targets in
 //! the detached workspace `crates/ldap/fuzz` (`ldap_assertion_values`,
 //! `ldap_filter_fixed_entry`), reached through the `fuzz-hooks` feature,
-//! which no product build enables (AGENTS.md §6; built only after owner item
+//! which no product build enables (docs/CLEAN-ROOM.md; built only after owner item
 //! P-1).
 //!
 //! # Residuals (documented, not hidden)
@@ -132,15 +132,15 @@
 //! 3.1.1.3.1.1.3 (introduction), 3.1.1.3.1.2.1-3.1.1.3.1.2.5,
 //! 3.1.1.3.1.3.1-3.1.1.3.1.3.6, 3.1.1.3.4.6, 3.1.1.4.1-3.1.1.4.5
 //! (introduction), 5.1.3.3.6; [MS-DRSR] v20260309 (e8ce0c8c…b62c)
-//! 5.16.3.1-5.16.3.10, 5.51. This project's documents: AGENT-ONBOARDING,
-//! AGENTS, docs/46 §1, §2.3, §5, §6, §7, docs/47 §8.2, docs/49 (decided,
+//! 5.16.3.1-5.16.3.10, 5.51. This project's documents: docs/CLEAN-ROOM.md,
+//! docs/CLEAN-ROOM.md, docs/46 §1, §2.3, §5, §6, §7, docs/47 §8.2, docs/49 (decided,
 //! A-45..A-48), docs/11 §2, docs/questions Q-163, Q-166, Q-167, Q-168,
 //! Q-169, Q-170 (A-51), Q-175 (A-49), Q-185 (A-52), Q-190 (A-54), Q-195
 //! (A-53), PENDING-OWNER (A-28..A-54, P-7, P-9, P-12, P-13, P-14). The
 //! source and documentation of this project's own crates parse-ldap, pdp,
 //! kdc, directory-pip, dirstore, ad-schema, keyd, krb-proto and dtyp were
 //! read for their APIs. No other implementation was consulted or recalled
-//! (AGENTS.md §1-3).
+//! (docs/CLEAN-ROOM.md).
 //!
 //! Spec: docs/49 §3-§12; RFC 4511; RFC 4513.
 
@@ -172,7 +172,7 @@ pub use search::limits::{
 };
 pub use session::{Listener, Session};
 
-/// Hooks for the detached fuzz workspace `crates/ldap/fuzz` only (AGENTS.md
+/// Hooks for the detached fuzz workspace `crates/ldap/fuzz` only (docs/CLEAN-ROOM.md
 /// §6); compiled with the `fuzz-hooks` feature, which no product build
 /// enables. Not part of the engine's API.
 #[cfg(feature = "fuzz-hooks")]

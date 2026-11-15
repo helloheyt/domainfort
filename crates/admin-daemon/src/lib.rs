@@ -104,7 +104,7 @@
 //! # Provenance
 //!
 //! Written only from this project's decided design, opened in-session:
-//! AGENT-ONBOARDING, AGENTS, docs/51 (whole), docs/50 (§2.4, §3, §6.4, §7,
+//! docs/CLEAN-ROOM.md, docs/CLEAN-ROOM.md, docs/51 (whole), docs/50 (§2.4, §3, §6.4, §7,
 //! §8, §9, the channel-magic registry), docs/47 §9, docs/10 §2, §6, §10,
 //! docs/questions Q-220, Q-290, Q-291, Q-340, Q-341, Q-350, Q-365, Q-367,
 //! Q-370, Q-378, Q-385..Q-389 and PENDING-OWNER (A-57, A-63, A-64, A-70,
@@ -115,7 +115,7 @@
 //! keyd-types, krb-proto, dtyp, config, daemon-sandbox; directory-daemon and
 //! keyd-daemon as the pattern); and the docs.rs API pages of tokio 1.54.1 as
 //! cited in those daemons (P-2). No other implementation, management daemon
-//! or password service was consulted or recalled (AGENTS.md §1-3).
+//! or password service was consulted or recalled (docs/CLEAN-ROOM.md).
 //!
 //! The shared gate, the proof of an acknowledged intent and the one stop
 //! flush (task R6, decision A-102) were written only from docs/52 (§2,
@@ -123,7 +123,7 @@
 //! PENDING-OWNER (A-85, A-87, A-88, A-93, A-102, A-105), docs/questions
 //! Q-313, Q-350, Q-365, Q-470, Q-471 and this repository's own code
 //! (docs/questions/Q-500..Q-503). No other implementation was consulted
-//! or recalled (AGENTS.md §1-3).
+//! or recalled (docs/CLEAN-ROOM.md).
 //!
 //! Spec: docs/51 §5.1, §5.2 row 5, §5.7, §5.8, §7.6, §9, §12 (A9); docs/50
 //! §2.4, R50-3, R50-7, R50-14, R50-16, R50-17, §3, §6.4, §7.5, §8; A-57;

@@ -44,7 +44,7 @@
 //! # Revoking a key-operation decision (task F3; docs/questions/Q-937 item
 //! 6, Q-976)
 //!
-//! **The class (AGENTS.md §6.1):** one fact — "this key operation is
+//! **The class (docs/CLEAN-ROOM.md):** one fact — "this key operation is
 //! decided" — held by two components that could disagree: dird's pending
 //! request and keyd's decision. Before this, dird could drop its request
 //! (a `Withdraw` / `Reject`) while keyd's decision stayed executable for up
@@ -115,7 +115,7 @@
 //! record, no intent.
 //!
 //! Spec: docs/52 §3.1, §3.3, §3.4, §3.10, §4, §7 R1, R3; docs/51 §4.3,
-//! §5.6, §5.8, §6, §9; docs/10 §2, §6, §6א, §7, §10, §11; docs/questions/
+//! §5.6, §5.8, §6, §9; docs/10 §2, §6, §6a, §7, §10, §11; docs/questions/
 //! Q-460, Q-461, Q-462 item 1 (A-102), Q-450, Q-451, Q-452, Q-365 (A-88).
 
 use crate::audit::{AuditKeyRef, AuditOutcome, AuditReason, AuditRecord, AuditSink};
@@ -158,7 +158,7 @@ struct SecretEntry {
     /// `DecidedOperation::ChangePassword` decision). An entry is invisible to
     /// the other operation — admind cannot redeem a decision dird made for a
     /// user's own change, nor the reverse. Task K3 (class: a one-time
-    /// authorization meant for one executor redeemable by another; AGENTS.md
+    /// authorization meant for one executor redeemable by another; docs/CLEAN-ROOM.md
     /// §6.1 — docs/questions/Q-662).
     executor: Operation,
     /// The account's name for the password policy's account-name rule: the
@@ -250,7 +250,7 @@ pub(crate) enum Found {
 }
 
 /// The decision table (module documentation).
-/// Spec: docs/52 §4.2; docs/questions/Q-450 items 1, 4; AGENTS.md §6
+/// Spec: docs/52 §4.2; docs/questions/Q-450 items 1, 4; docs/CLEAN-ROOM.md
 /// (bounded, fail closed).
 #[derive(Debug, Default)]
 pub(crate) struct DecisionTable {
@@ -280,7 +280,7 @@ impl DecisionTable {
 
     /// The entries `family` holds against its bound: for the key-operation
     /// family its decisions and its revoked ids (task F3).
-    /// Spec: docs/questions/Q-460 (bounds), Q-976; AGENTS.md §6.
+    /// Spec: docs/questions/Q-460 (bounds), Q-976; docs/CLEAN-ROOM.md
     fn family_len(&self, family: DecisionFamily) -> usize {
         match family {
             DecisionFamily::KeyOperation => self.keys.len().saturating_add(self.revoked.len()),
@@ -564,7 +564,7 @@ impl DecisionTable {
     ///   being full, `DecisionTableFull` (`Unavailable`), nothing changes.
     ///
     /// Spec: docs/52 §3.10 (the recorded result), §4.2; docs/questions/
-    /// Q-937 item 6, Q-976; AGENTS.md §6 (bounded, fail closed).
+    /// Q-937 item 6, Q-976; docs/CLEAN-ROOM.md (bounded, fail closed).
     fn revoke_key(
         &mut self,
         id: DecisionId,
@@ -752,7 +752,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// whether a key set exists, and drops set-secret entries — names,
     /// salts, no key); nothing secret is taken or returned.
     ///
-    /// Spec: docs/52 §4.2, §4.3, §4.5, §7 R1; docs/10 §2, §6א, §9, §10;
+    /// Spec: docs/52 §4.2, §4.3, §4.5, §7 R1; docs/10 §2, §6a, §9, §10;
     /// docs/50 R50-5; docs/questions/Q-460 (A-102), Q-450, Q-452, Q-471 item
     /// 5, Q-501 (R6b).
     pub fn register_decision(
@@ -899,7 +899,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// 4. the table (`GrantTableFull` ⇒ `Unavailable`).
     ///
     /// Spec: docs/51 §4.3 steps 11-12, §5.8 option (b); docs/52 §4.4;
-    /// docs/10 §2, §6א; docs/questions/Q-450, Q-451, Q-462 item 1 (A-102).
+    /// docs/10 §2, §6a; docs/questions/Q-450, Q-451, Q-462 item 1 (A-102).
     pub fn grant_set_secret(
         &mut self,
         caller: &CallerId,
@@ -1051,7 +1051,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// held the decision, its key set, kvno and approvers. No key is read.
     ///
     /// Spec: docs/52 §3.1 (C1), §3.10, §3.14 (C14), §4.2, §4.5; docs/10 §2,
-    /// §6א, §10; docs/questions/Q-937 item 6, Q-976 (task F3).
+    /// §6a, §10; docs/questions/Q-937 item 6, Q-976 (task F3).
     pub fn revoke_decision(
         &mut self,
         caller: &CallerId,

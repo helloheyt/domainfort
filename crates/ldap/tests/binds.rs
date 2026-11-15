@@ -2,7 +2,7 @@
 //!
 //! Sources (each test names its own): RFC 4511 §4.2, §4.2.1, §4.2.2;
 //! RFC 4513 §4, §5.1.1, §5.1.2, §5.1.3, §6.1; RFC 4752 §3; docs/49 §3.1;
-//! P-14 (Q-166); AGENTS.md §6. Hand-made requests.
+//! P-14 (Q-166); docs/CLEAN-ROOM.md Hand-made requests.
 
 mod common;
 
@@ -55,7 +55,7 @@ fn report_for(tls_up: bool) -> ldap::TransportReport {
     }
 }
 
-/// P-14 / AGENTS.md §6 (no code path for simple bind with a password, even
+/// P-14 / docs/CLEAN-ROOM.md (no code path for simple bind with a password, even
 /// over TLS); docs/49 §3.1 ("authMethodNotSupported (7) ... before any
 /// lookup of the name and without keyd"). The account source is never asked
 /// (no name lookup), and nothing else in the engine can reach keyd.

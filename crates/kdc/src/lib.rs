@@ -16,7 +16,7 @@
 //! The KDC holds no secret (docs/30 §1): every key operation is a call to
 //! keyd through [`KeyCustody`] — `verify_preauth`, `issue_as_rep`,
 //! `open_and_verify_tgt`, `issue_tgs_rep`, `open_fast_armor`,
-//! `seal_fast_error` (docs/10 §4-§5א). Every AS and TGS step is a PDP
+//! `seal_fast_error` (docs/10 §4-§5a). Every AS and TGS step is a PDP
 //! decision (`Action::KdcAs` / `KdcTgs`, docs/11; module [`gate`]).
 //! Principals come from a KDC-owned [`AccountSource`] trait (main-session
 //! decision 3), passed with each request alongside the [`PolicyInputs`] so
@@ -175,14 +175,14 @@
 //!
 //! # Provenance
 //!
-//! Written only from the allowed sources, opened in-session (AGENTS.md
+//! Written only from the allowed sources, opened in-session (docs/CLEAN-ROOM.md
 //! §1-3): RFC 4120 (pinned copy, sha256 368d3cd1…f75b) §2, 2.1-2.9, 3.1,
 //! 3.1.2-3.1.6, 3.2.3, 3.3, 3.3.1-3.3.3.2, 5.1.1-5.1.5, 5.2.1-5.2.3, 5.2.7,
 //! 5.2.7.1-5.2.7.5, 5.2.8, 5.3, 5.4.1, 5.4.2, 5.9, 5.9.1, 5.10, 6.1, 6.2,
 //! 7.2, 7.2.1, 7.2.2, 7.3, 7.5.1, 7.5.2, 7.5.7, 7.5.8, 7.5.9, 8.2; RFC 6113
 //! (pinned copy, sha256 69c49f1a…d278c) §2.2, 2.4, 5.2, 5.4, 5.4.1, 5.4.1.1,
 //! 5.4.2, 5.4.3, 5.4.4, 5.4.5, 5.4.6, 6.1, 6.2, 7.1, 7.2, 7.3; this project's
-//! docs/02 §3, docs/10 (§5א included), docs/11, docs/25 §3-§5, docs/30
+//! docs/02 §3, docs/10 (§5a included), docs/11, docs/25 §3-§5, docs/30
 //! §1-§3, §7, docs/45 §10, docs/48 (decided A-33),
 //! docs/questions/PENDING-OWNER.md (A-17, A-19, A-22, A-23, A-24..A-27,
 //! A-32, A-33, A-39, A-42, A-43, A-56, P-10), docs/questions/Q-120..Q-127,

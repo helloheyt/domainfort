@@ -144,7 +144,7 @@ fn format_and_path_rules_apply() {
     }
 }
 
-/// AGENTS.md §6 / A-60 ("an error never shows the value that was
+/// docs/CLEAN-ROOM.md / A-60 ("an error never shows the value that was
 /// written"): a rejected value does not appear in the error text.
 #[test]
 fn errors_do_not_echo_values() {

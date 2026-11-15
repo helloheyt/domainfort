@@ -1,6 +1,6 @@
 //! Test vectors for the Kerberos AES encryption and checksum profile.
 //!
-//! Every vector names its source. Sources are allowed per AGENTS.md §3/§4.5:
+//! Every vector names its source. Sources are allowed per docs/CLEAN-ROOM.md/§4.5:
 //! RFC 3961 Appendix A.1 (n-fold), RFC 3962 Appendix B (PBKDF2 string-to-key
 //! with DK), RFC 8009 Appendix A (string-to-key, key derivation, sample
 //! encryptions, sample checksums, PRF) and RFC 6113 Appendix A (KRB-FX-CF2).
@@ -768,7 +768,7 @@ fn reject_truncated_ciphertext() {
 #[test]
 fn reject_unknown_enctype_numbers() {
     // RFC 3961 §8 lists DES (1-3), 3DES (5, 7, 16), RC4 (23, 24) and others;
-    // none has a code path here (AGENTS.md §6). Zero and negative numbers are
+    // none has a code path here (docs/CLEAN-ROOM.md). Zero and negative numbers are
     // invalid or local-use (RFC 3961 §8).
     for n in [i32::MIN, -1, 0, 1, 2, 3, 5, 7, 16, 21, 23, 24, 65, i32::MAX] {
         assert_eq!(
@@ -1092,7 +1092,7 @@ fn krb_fx_cf2_rejects_identical_peppers() {
 
 #[test]
 fn key_debug_is_redacted() {
-    // AGENTS.md §6: secrets never in debug output.
+    // docs/CLEAN-ROOM.md: secrets never in debug output.
     let key = rfc8009_base_key_128();
     let text = format!("{key:?}");
     assert!(text.contains("redacted"));

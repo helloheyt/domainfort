@@ -1,7 +1,7 @@
 //! The message model: header, question, resource records, TSIG.
 //!
 //! The model is shaped so that what the specifications forbid in phase 1 has
-//! no representation (AGENTS.md §6.1):
+//! no representation (docs/CLEAN-ROOM.md):
 //!
 //! * section counts are not stored — they are the lengths of the sections, so
 //!   a count that disagrees with the records cannot exist;

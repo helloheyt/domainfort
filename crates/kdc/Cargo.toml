@@ -12,7 +12,7 @@
 # §5.2, §5.4-§5.4.6, §6.1, §6.2, §7.1-§7.3; FAST, docs/48 tasks T5/T6) and
 # this project's design documents (docs/02 §3, docs/10, docs/11, docs/25
 # §3-5, docs/30, docs/45 §10, docs/48, docs/questions/PENDING-OWNER.md A-19,
-# A-22..A-27, A-32, A-33, A-39, A-42, A-43, A-63, P-10) — AGENTS.md §1-3. No
+# A-22..A-27, A-32, A-33, A-39, A-42, A-43, A-63, P-10) — docs/CLEAN-ROOM.md No
 # other implementation consulted or recalled.
 
 [package]
@@ -23,7 +23,7 @@ publish = false
 
 [dependencies]
 # Our own workspace crates only (path dependencies). No external crate
-# (AGENTS.md §7). In particular NOT krb-crypto: only keyd links the crypto
+# (docs/CLEAN-ROOM.md). In particular NOT krb-crypto: only keyd links the crypto
 # profile in the product (D182) — the KDC never encrypts or decrypts.
 #
 # Typed RFC 4120 messages with strict DER (AS-REQ, TGS-REQ, AS-REP, TGS-REP,

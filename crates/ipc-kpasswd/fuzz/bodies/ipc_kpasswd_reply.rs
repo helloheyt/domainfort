@@ -5,7 +5,7 @@
 //! does with dird's octets (docs/50 §3.3: "replies are decoded with the same
 //! strictness").
 //!
-//! Properties (AGENTS.md §6; docs/50 §3.3, §9; docs/53 §5.9): never a
+//! Properties (docs/CLEAN-ROOM.md; docs/50 §3.3, §9; docs/53 §5.9): never a
 //! panic, bounded allocation; whatever decodes re-encodes to exactly the
 //! input; a decoded `Sealed` keeps its domains (an AP-REP starting
 //! `[APPLICATION 15]`, a KRB-PRIV starting `[APPLICATION 21]`, the two

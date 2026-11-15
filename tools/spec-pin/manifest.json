@@ -1,5 +1,5 @@
 {
-  "_comment": "ספריית המפרטים המוצמדת (specs/SOURCES.md §D, docs/17 SV-*). revision+sha256 ממולאים ע\"י scripts/pin-specs.sh. ללא הצמדה — אין לכתוב קוד מהמסמך (AGENTS.md).",
+  "_comment": "The pinned specification library (docs/STANDARDS.md; docs/CLEAN-ROOM.md, Pinned specifications). revision+sha256 are filled in by scripts/pin-specs.sh. Without a pin, no code may be written from the document (docs/CLEAN-ROOM.md).",
   "ms_openspec_pdf_host": "https://winprotocoldoc.z19.web.core.windows.net",
   "generated_at": "2026-11-14T23:50:18Z",
   "documents": [

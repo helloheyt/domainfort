@@ -64,7 +64,7 @@ impl<V> TokenTable<V> {
 
     /// Insert a fresh token. Refuses (returns `false`) when the table is full
     /// of live entries or the id collides — never evicts a live entry.
-    /// Spec: docs/10 D36; AGENTS.md §6 (bounded, fail closed).
+    /// Spec: docs/10 D36; docs/CLEAN-ROOM.md (bounded, fail closed).
     pub(crate) fn insert(
         &mut self,
         id: [u8; TOKEN_ID_LENGTH],

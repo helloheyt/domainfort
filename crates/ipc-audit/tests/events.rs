@@ -429,7 +429,7 @@ fn code_tables_are_closed() {
     assert_eq!(KeydReason::ALL.last().map(|r| r.name()), Some("Unlisted"));
 }
 
-/// docs/37 §2, docs/10 I8, AGENTS.md §6: the complete field inventory of
+/// docs/37 §2, docs/10 I8, docs/CLEAN-ROOM.md: the complete field inventory of
 /// every shape. Each binding below is destructured exhaustively, so adding
 /// a field to a shape stops this test from compiling until the field is
 /// classified here. Every field is an identifier, a code, a count, a time,

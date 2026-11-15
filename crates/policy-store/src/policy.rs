@@ -33,7 +33,7 @@ pub const FORMAT: u8 = 2;
 /// Spec: A-68; docs/questions/Q-275 item 1.
 pub const SUPERSEDED_FORMAT: u8 = 1;
 
-/// Largest policy file: 1 MiB. Project choice (AGENTS.md §6: bounded);
+/// Largest policy file: 1 MiB. Project choice (docs/CLEAN-ROOM.md: bounded);
 /// unchanged from format 1.
 pub const MAX_POLICY_FILE: u32 = 1024 * 1024;
 

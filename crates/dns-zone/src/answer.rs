@@ -65,7 +65,7 @@ impl<'a> ZoneState<'a> {
     /// `now` (both read by dnsd from its own clock — this crate reads none).
     /// A `now` earlier than `confirmed_at` is treated as stale: fail closed.
     ///
-    /// Spec: docs/54 §4.4; docs/questions/Q-616 item 6; AGENTS.md §6 (fail
+    /// Spec: docs/54 §4.4; docs/questions/Q-616 item 6; docs/CLEAN-ROOM.md (fail
     /// closed).
     pub fn from_confirmation(
         image: &'a ZoneImage,

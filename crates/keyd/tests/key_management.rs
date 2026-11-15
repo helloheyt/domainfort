@@ -4,7 +4,7 @@
 //! set_secret, `verify_secret` in no role (A-102, docs/52 R4), and entropy
 //! failure (fail closed). Sources: docs/10 §6, §7, §12; docs/33 §5, §6.1;
 //! RFC 4120 3.2.3 (ticket decrypted with the kvno it names); docs/52 §4.2,
-//! §7 R1, R4; AGENTS.md §6. All values are constructed for these tests.
+//! §7 R1, R4; docs/CLEAN-ROOM.md All values are constructed for these tests.
 
 mod common;
 
@@ -520,7 +520,7 @@ fn set_secret_rules() {
 }
 
 /// Entropy failure fails closed in every operation that needs randomness;
-/// keyd never falls back. Source: AGENTS.md §6; RFC 4120 3.1.3.
+/// keyd never falls back. Source: docs/CLEAN-ROOM.md; RFC 4120 3.1.3.
 #[test]
 fn entropy_failure_fails_closed() {
     let mut f = Fixture::new();

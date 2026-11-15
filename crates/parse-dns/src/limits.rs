@@ -3,7 +3,7 @@
 //! The message, label and name bounds are fixed by RFC 1035; the per-opcode
 //! section counts and the TSIG MAC bound are project choices fixed by docs/54
 //! §6.2 (A-119). Every count is also checked against the octets actually
-//! present before anything is allocated (AGENTS.md §6): a count can never make
+//! present before anything is allocated (docs/CLEAN-ROOM.md): a count can never make
 //! the decoder reserve more than the bounded message can hold.
 
 /// Octets in the header section: six 16-bit fields (ID, the flag word,

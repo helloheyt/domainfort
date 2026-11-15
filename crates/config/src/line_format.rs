@@ -33,10 +33,10 @@
 //! from the input and allocates one small record per entry (at most
 //! [`crate::limits::MAX_LINES`]). An error carries a line number, a key of
 //! the caller's table (a `&'static str`, never text from the input) and the
-//! rule — never an octet of the input (AGENTS.md §6; A-60).
+//! rule — never an octet of the input (docs/CLEAN-ROOM.md; A-60).
 //!
 //! Spec: docs/50 R50-15, §7.1; docs/21 area 4 (D96: "config deserialization —
-//! the same strict parser discipline"); AGENTS.md §6; PENDING-OWNER A-86.
+//! the same strict parser discipline"); docs/CLEAN-ROOM.md; PENDING-OWNER A-86.
 
 use crate::limits::{
     MAX_FILE_OCTETS, MAX_KEY_OCTETS, MAX_LINES, MAX_LINE_OCTETS, MAX_VALUE_OCTETS, SEPARATOR,
@@ -67,14 +67,14 @@ const fn is_key_octet(b: u8) -> bool {
 ///
 /// Exhaustive on purpose: a caller maps every rule onto its own error type,
 /// and a new rule must not slip through a wildcard arm.
-/// Spec: docs/50 R50-15, §7.1; AGENTS.md §6.
+/// Spec: docs/50 R50-15, §7.1; docs/CLEAN-ROOM.md
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineErrorKind {
     /// The file is larger than [`crate::limits::MAX_FILE_OCTETS`].
     /// Spec: docs/50 §7.1 ("file ≤ 64 KiB").
     FileTooLarge,
     /// The file has more than [`crate::limits::MAX_LINES`] lines.
-    /// Spec: AGENTS.md §6 (bounded parsers); docs/questions/Q-230.
+    /// Spec: docs/CLEAN-ROOM.md (bounded parsers); docs/questions/Q-230.
     TooManyLines,
     /// A line (without its LF) is longer than
     /// [`crate::limits::MAX_LINE_OCTETS`]. Spec: docs/50 §7.1 ("line ≤ 1024").
@@ -83,16 +83,16 @@ pub enum LineErrorKind {
     /// Spec: docs/50 §7.1 ("printable ASCII only").
     InvalidCharacter,
     /// The file does not end with LF (a cut last line).
-    /// Spec: docs/50 §7.1 (fail closed); AGENTS.md §6.
+    /// Spec: docs/50 §7.1 (fail closed); docs/CLEAN-ROOM.md
     MissingFinalNewline,
     /// A line that is neither empty, nor a `#` comment in its first column,
     /// nor exactly `key = value`. Spec: docs/50 R50-15, §7.1.
     MalformedLine,
     /// A key longer than [`crate::limits::MAX_KEY_OCTETS`].
-    /// Spec: AGENTS.md §6; docs/questions/Q-230.
+    /// Spec: docs/CLEAN-ROOM.md; docs/questions/Q-230.
     KeyTooLong,
     /// A value longer than [`crate::limits::MAX_VALUE_OCTETS`].
-    /// Spec: AGENTS.md §6; docs/questions/Q-230.
+    /// Spec: docs/CLEAN-ROOM.md; docs/questions/Q-230.
     ValueTooLong,
     /// A key that is not in the caller's closed key table.
     /// Spec: docs/50 R50-15 ("a closed key table"), §7.1.
@@ -104,7 +104,7 @@ pub enum LineErrorKind {
 
 /// A line-format rejection: where (a line, or the whole file), which key of
 /// the caller's table (when known), and which rule. Never input text.
-/// Spec: docs/50 R50-15, §7.1; AGENTS.md §6; A-60.
+/// Spec: docs/50 R50-15, §7.1; docs/CLEAN-ROOM.md; A-60.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LineError {
     line: Option<u32>,
@@ -276,7 +276,7 @@ impl<'a> Entries<'a> {
                 ));
             }
             // Printable ASCII is UTF-8; the check cannot fail, but is not
-            // unwrapped (AGENTS.md §6).
+            // unwrapped (docs/CLEAN-ROOM.md).
             let Ok(text) = core::str::from_utf8(line) else {
                 return Err(LineError::at_line(number, LineErrorKind::InvalidCharacter));
             };

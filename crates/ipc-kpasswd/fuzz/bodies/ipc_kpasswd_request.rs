@@ -4,7 +4,7 @@
 //! through `ipc_kpasswd::decode_request` (the entry point dird's dispatcher
 //! takes), and through the dispatcher itself with a host that answers.
 //!
-//! Properties (AGENTS.md §6; docs/50 §3.3, §9; docs/53 §5.9): arbitrary
+//! Properties (docs/CLEAN-ROOM.md; docs/50 §3.3, §9; docs/53 §5.9): arbitrary
 //! bytes → decoder, never a panic, bounded allocation; whatever decodes
 //! re-encodes to exactly the input ("a single encoding per value"); a decoded
 //! `ChangePassword` keeps its domains — an AP-REQ starting `[APPLICATION 14]`,

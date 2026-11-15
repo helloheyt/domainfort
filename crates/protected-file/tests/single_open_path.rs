@@ -19,7 +19,7 @@
 //! would see a planted call.
 //!
 //! Source: docs/52 §3.13, §7 (R11); docs/questions/Q-468 option 3, Q-481,
-//! Q-530; AGENTS.md §6.1 ("a single chokepoint through which the action
+//! Q-530; docs/CLEAN-ROOM.md ("a single chokepoint through which the action
 //! must pass"); crates/directory-admin/tests/single_write_path.rs (the same
 //! guard for R13, this project's own). Test-only.
 

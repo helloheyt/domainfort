@@ -5,9 +5,9 @@
 //! every exchange, with one exception), §7.2 (enforced in two layers; layer
 //! 2 is a PDP rule on `armored`, option (ii): an explicit Deny with a
 //! negated subject predicate plus `AuthMatch`), §7.3 (the bootstrap
-//! exception (א): an unarmored AS only for a computer account, TGT only);
+//! exception (a): an unarmored AS only for a computer account, TGT only);
 //! the closing decision of docs/48 (Q-127 → owner item P-10; build per the
-//! proposal meanwhile); Q-127 interim decision ((1)–(5), (ג) = (ii));
+//! proposal meanwhile); Q-127 interim decision ((1)–(5), (c) = (ii));
 //! docs/11 §3 (rules; explicit Deny wins; no matching Allow → Deny), §4
 //! (layer 3), §10 (P2, P4); D126 (docs/30 §5).
 //!
@@ -39,7 +39,7 @@
 //!   is asked only after pre-authentication.
 //! - The PDP sees SIDs, not the account's `kind`: the bootstrap set is a
 //!   group SID chosen in policy data, and the KDC's layer 1 derives
-//!   `armor_policy` from objectClass computer (Q-127 interim (ב)). Both
+//!   `armor_policy` from objectClass computer (Q-127 interim (b)). Both
 //!   layers must pass, so a mismatch can only refuse more. Which SID a
 //!   deployment names: Q-130.
 //! - "TGT only" is enforced by the KDC (the phase-1 AS issues TGTs only,
@@ -123,7 +123,7 @@ pub fn mandatory_fast_rules(bootstrap_allowed: PrincipalId, first_id: RuleId) ->
             obligations: Vec::new(),
         },
         // docs/48 §7.2 (i) ("except one Allow KdcAs for MemberOf(computer
-        // group)"), §7.3 (א) (unarmored AS, TGT only); Q-127 (4).
+        // group)"), §7.3 (a) (unarmored AS, TGT only); Q-127 (4).
         Rule {
             id: id(3)?,
             effect: Effect::Allow,

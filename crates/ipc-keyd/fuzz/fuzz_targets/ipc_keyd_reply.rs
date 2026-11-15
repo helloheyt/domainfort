@@ -10,7 +10,7 @@
 //! `Answer::from_wire` (the reply must belong to the operation; every
 //! Kerberos value through krb-proto's strict decoder).
 //!
-//! AGENTS.md §6 / docs/50 §9 (R50-19: "`ipc_keyd_reply` (the client decodes
+//! docs/CLEAN-ROOM.md / docs/50 §9 (R50-19: "`ipc_keyd_reply` (the client decodes
 //! replies)"); docs/50 §3.3 ("replies are decoded with the same
 //! strictness"): never a panic; whatever decodes re-encodes to exactly the
 //! input. A decoded `DescribeConfig` reply carries the caller role as its

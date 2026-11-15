@@ -41,7 +41,7 @@ pub(crate) const DOMAIN_USER_RID_KRBTGT: u32 = 0x0000_01F6;
 /// closure-size check alike. Every reference followed (a tier-map root, a
 /// `member` value, a memberOf back link) counts once, also when it leads to
 /// an object already seen, so the bound caps the work as well as the
-/// objects read. Project choice (AGENTS.md §6); a walk that exceeds it
+/// objects read. Project choice (docs/CLEAN-ROOM.md); a walk that exceeds it
 /// refuses the operation (docs/questions/Q-357 item 8; Q-356 items 4-5;
 /// Q-416).
 pub(crate) const MAX_WALK_STEPS: usize = 16_384;

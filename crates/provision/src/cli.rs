@@ -89,7 +89,7 @@ use crate::input::{
 use crate::policy::TierChange;
 
 /// The most arguments accepted. Project choice (bounded parsing,
-/// AGENTS.md §6): the largest `domain` command has under 100.
+/// docs/CLEAN-ROOM.md): the largest `domain` command has under 100.
 pub const MAX_ARGUMENTS: usize = 512;
 
 /// The longest argument accepted, in octets (the configuration format's
@@ -208,7 +208,7 @@ const DOMAIN_FLAGS: &[(&str, Arity)] = &[
 
 /// The arguments as checked text: valid UTF-8, printable ASCII only
 /// (0x20..=0x7E), bounded in count and length.
-/// Spec: docs/50 §7.1 (printable ASCII); AGENTS.md §6 (bounded).
+/// Spec: docs/50 §7.1 (printable ASCII); docs/CLEAN-ROOM.md (bounded).
 fn texts<I: IntoIterator<Item = OsString>>(args: I) -> Result<Vec<String>, CliError> {
     let mut out = Vec::new();
     for arg in args {

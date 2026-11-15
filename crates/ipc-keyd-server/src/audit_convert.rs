@@ -26,7 +26,7 @@
 //! code, task P6), written there only from docs/50 §8.1, §8.2, docs/37 §2,
 //! docs/questions/Q-252 items 3, 4 and the public API of crates/keyd (audit,
 //! authz, model) and crates/krb-proto (basic). No other implementation was
-//! consulted or recalled (AGENTS.md §1-3).
+//! consulted or recalled (docs/CLEAN-ROOM.md).
 //!
 //! Spec: docs/50 §8.1, §8.2; docs/37 §2; docs/10 §10; docs/questions/Q-252
 //! items 3, 4. Decision: A-144; Q-851.

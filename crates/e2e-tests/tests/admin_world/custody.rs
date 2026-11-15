@@ -150,7 +150,7 @@ impl KeyStore for CustodyStore {
     }
 
     /// The trait's contract: an existing handle ⇒ `Exists`, a full store ⇒
-    /// `Full` (bounded, AGENTS.md §6).
+    /// `Full` (bounded, docs/CLEAN-ROOM.md).
     fn insert(&mut self, handle: KeyHandle, set: StoredKeySet) -> Result<(), StoreError> {
         if !self.accepts(handle.purpose) {
             return Err(StoreError::Refused);

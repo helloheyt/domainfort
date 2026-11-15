@@ -87,7 +87,7 @@ impl AccountState {
 /// The KDC uses it for one decision: only a computer account's TGT may armor
 /// an AS request (D126; docs/48 §3.1).
 ///
-/// Spec: docs/48 §3.1, §7.2; Q-127 interim decision (ב) — `kind` derived by
+/// Spec: docs/48 §3.1, §7.2; Q-127 interim decision (b) — `kind` derived by
 /// the AccountSource from objectClass (P-10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountKind {
@@ -104,7 +104,7 @@ pub enum AccountKind {
 /// exchange, with one exception), §7.2 (`armor_policy: Required |
 /// BootstrapAllowed`, derived by the AccountSource from authoritative data:
 /// objectClass computer → BootstrapAllowed, everything else → Required),
-/// §7.3 (the bootstrap exception (א)); Q-127 interim decision (P-10).
+/// §7.3 (the bootstrap exception (a)); Q-127 interim decision (P-10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArmorPolicy {
     /// Every AS exchange must be FAST-armored. The default for every
@@ -139,7 +139,7 @@ pub struct ClientAccount {
     /// One entry per enctype of the client's keys: etype, salt and s2kparams
     /// (RFC 4120 5.2.7.5). Must describe the key set keyd holds for `key`.
     pub etype_info: Vec<EtypeInfo2Entry>,
-    /// User or computer (docs/48 §3.1; Q-127 interim (ב)).
+    /// User or computer (docs/48 §3.1; Q-127 interim (b)).
     pub kind: AccountKind,
     /// Whether an unarmored AS is allowed (docs/48 §7.2 layer 1).
     pub armor_policy: ArmorPolicy,
@@ -151,7 +151,7 @@ impl ClientAccount {
     /// BootstrapAllowed on any other kind of account counts as Required —
     /// the exception is for computer accounts only (fail closed).
     /// Spec: docs/48 §7.2, §7.3 ("AS unarmored, only for armor_policy =
-    /// BootstrapAllowed (computer account)"); Q-127 interim (P-10); AGENTS.md
+    /// BootstrapAllowed (computer account)"); Q-127 interim (P-10); docs/CLEAN-ROOM.md
     /// §6 (fail closed).
     pub(crate) fn may_bootstrap(&self) -> bool {
         self.kind == AccountKind::Computer && self.armor_policy == ArmorPolicy::BootstrapAllowed

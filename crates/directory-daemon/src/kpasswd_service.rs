@@ -42,13 +42,13 @@
 //! §3.6; docs/52 R2b; RFC 3244 §2; RFC 4120 §7.1; A-117, A-126, A-158.
 //!
 //! Written only from this project's decided design and the allowed
-//! specifications, opened in this session: AGENT-ONBOARDING, AGENTS; docs/53
+//! specifications, opened in this session: docs/CLEAN-ROOM.md, docs/CLEAN-ROOM.md; docs/53
 //! (whole); PENDING-OWNER (A-117, A-121, A-126, A-142, A-151, A-153, A-156,
 //! A-158, A-159); docs/questions Q-600..Q-609, Q-660..Q-664, Q-945, Q-955;
 //! docs/research/r3-e (§1-§3); the pinned RFC 3244 §2 and RFC 4120 §3.2.3;
 //! and this repository's own code (crates ipc-kpasswd, ipc-keyd, keyd-types,
 //! directory-admin, directory-pip, kdc and this crate's admin service as the
-//! pattern). No other implementation was consulted or recalled (AGENTS.md
+//! pattern). No other implementation was consulted or recalled (docs/CLEAN-ROOM.md
 //! §1-3).
 
 use crate::registration::DecisionRegistration;
@@ -85,7 +85,7 @@ pub const MAX_KPASSWD_CONNECTIONS: usize = ipc_kpasswd::MAX_FRONT_CONNECTIONS;
 /// pool"). Project choice (docs/questions/Q-964 item 4).
 pub const KPASSWD_QUEUE_CAPACITY: usize = 1;
 
-/// Largest kpasswd queue accepted. Project bound (AGENTS.md §6).
+/// Largest kpasswd queue accepted. Project bound (docs/CLEAN-ROOM.md).
 pub const MAX_KPASSWD_QUEUE_CAPACITY: usize = 16;
 
 /// The keyd calls one change request may make: `open_change_password_request`,
@@ -275,7 +275,7 @@ pub enum CompletionOutcome {
 /// The production client: ipc-keyd's `KeydClient` expecting Role::Ldap and
 /// dird's realm on every connection (task R9; the admin service's
 /// `KeydTicketVerifier` as the pattern).
-/// Spec: docs/10 §2 (Role `Ldap`), §7א; docs/50 R50-3, §3.7; A-73;
+/// Spec: docs/10 §2 (Role `Ldap`), §7a; docs/50 R50-3, §3.7; A-73;
 /// docs/questions/Q-466 item 1 (A-102).
 pub struct KeydKpasswdClient<C: ipc_keyd::Connector> {
     client: ipc_keyd::KeydClient<C>,
@@ -290,7 +290,7 @@ impl<C: ipc_keyd::Connector> KeydKpasswdClient<C> {
     /// # Errors
     /// `ipc_keyd::ClientConfigError` (a keyd uid of 0).
     ///
-    /// Spec: docs/10 §2, §7א; docs/50 R50-3, §3.7; A-73; docs/questions/Q-466.
+    /// Spec: docs/10 §2, §7a; docs/50 R50-3, §3.7; A-73; docs/questions/Q-466.
     pub fn new(
         connector: C,
         keyd_uid: u32,

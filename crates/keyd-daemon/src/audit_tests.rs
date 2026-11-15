@@ -5,7 +5,7 @@
 //! driven only by its client in a product, task R15b, docs/questions/Q-630).
 //! Moved out of `audit.rs` unchanged otherwise.
 //!
-//! Sources: docs/10 §7א, I8; docs/questions/Q-218 (A-57), A-64, Q-346
+//! Sources: docs/10 §7a, I8; docs/questions/Q-218 (A-57), A-64, Q-346
 //! (A-86), A-88; docs/52 §3.11 R6 (a); docs/50 §8.1. Every value is
 //! constructed for these tests.
 
@@ -22,7 +22,7 @@ fn open(gate: &AuditGate) {
     test_seams::set_reachable(gate.audit_gate(), true);
 }
 
-/// docs/10 §7א (`describe_config`, `ping`: no key, no secret) and A-57 /
+/// docs/10 §7a (`describe_config`, `ping`: no key, no secret) and A-57 /
 /// A-64 (every operation that touches a key, token or secret gates).
 #[test]
 fn only_describe_config_and_ping_do_not_gate() {
@@ -64,7 +64,7 @@ fn a_gating_operation_needs_its_record() {
     assert_eq!(gate.outstanding(), 0, "the slot was given back");
 }
 
-/// The buffer is bounded (AGENTS.md §6) and reports the overflow.
+/// The buffer is bounded (docs/CLEAN-ROOM.md) and reports the overflow.
 #[test]
 fn record_buffer_is_bounded() {
     let mut buffer = RecordBuffer::new();

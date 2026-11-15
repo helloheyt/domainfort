@@ -60,7 +60,7 @@
 //!
 //! No `unsafe`; no panic, `unwrap` or indexing on the read path; every
 //! length is checked against a named bound before allocation; no error
-//! carries record octets (AGENTS.md §6). Event payloads are non-secret by
+//! carries record octets (docs/CLEAN-ROOM.md). Event payloads are non-secret by
 //! construction (docs/37 §2: "only identifiers and metadata").
 //!
 //! # Provenance
@@ -73,7 +73,7 @@
 //! `sha2` 0.11.1, `digest` 0.11.3 (`Digest`, `Output`) and `hybrid-array`
 //! 0.4.11 (`Array`). The layout and every name are this project's own; no
 //! existing audit-log, journal or hash-chain format or implementation was
-//! consulted or recalled (AGENTS.md §1-3).
+//! consulted or recalled (docs/CLEAN-ROOM.md).
 //!
 //! Spec: docs/50 R50-17, §8.1, §10; docs/37 §2; docs/07 §8; Q-218 (A-57).
 

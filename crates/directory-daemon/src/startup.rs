@@ -204,7 +204,7 @@ pub fn read_settings_owned_by(path: &Path, owner: u32) -> Result<DirdSettings, S
 ///
 /// Spec: docs/50 §7.1 ("only paths to protected files"), §7.4, R50-12 (the
 /// same pattern for the TLS key: "read as root before the drop, the file
-/// 0400"); docs/questions/Q-213 (A-57); AGENTS.md §6 (secrets).
+/// 0400"); docs/questions/Q-213 (A-57); docs/CLEAN-ROOM.md (secrets).
 pub fn read_integrity_key(path: &Path, owner: u32) -> Result<IntegrityKey, StartupError> {
     // Spec: docs/50 §7.4; Q-270 item 1 (root, mode exactly 0400); A-86
     // (crates/protected-file: no symbolic link is followed, the rule is

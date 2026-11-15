@@ -15,7 +15,7 @@ use crate::time::Time;
 use core::cmp::Ordering;
 use parse_asn1::{decode, encode_element, split_element, Element, Tag, TagClass, Value};
 
-/// Most octets a certificate may have. Resource bound (AGENTS.md §6), the
+/// Most octets a certificate may have. Resource bound (docs/CLEAN-ROOM.md), the
 /// same value as ldap-front's certificate-file bound (one DER certificate is
 /// a few hundred octets to a few KiB). Project choice.
 pub const MAX_CERTIFICATE_OCTETS: usize = 64 * 1024;

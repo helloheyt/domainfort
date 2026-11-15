@@ -48,7 +48,7 @@
 //! its path must be root's.
 //!
 //! [`read_to_bound`] then reads at most `bound + 1` octets, so an oversized
-//! file is refused without being read whole (AGENTS.md §6: no unbounded
+//! file is refused without being read whole (docs/CLEAN-ROOM.md: no unbounded
 //! allocation). [`read_configuration_file`] is the walk plus the read under
 //! the rule docs/50 §7.1 sets for a configuration file
 //! ([`configuration_file_rule`]: a regular file, owned by the expected
@@ -185,7 +185,7 @@
 //! `fs::Stat` (`st_dev`, `st_gid`), `fs::FileType::is_socket`, `fs::Mode`
 //! (`RWXU`, `RGRP`, `XGRP`, `ROTH`), `io::Errno::kind` — all under the `fs`
 //! (and `std`) features already enabled: none added. No other
-//! implementation consulted or recalled (AGENTS.md §1-3).
+//! implementation consulted or recalled (docs/CLEAN-ROOM.md).
 //!
 //! Spec: docs/50 §3.1, §7.1, §7.2, R50-12, §6.4; docs/51 §4.3 steps 3-9,
 //! §4.4; docs/52 §3.13 (R11); A-86; A-92; A-96; A-99; A-102; A-104; A-109;
@@ -378,7 +378,7 @@ fn directory_rule(facts: &DirectoryFacts, file_owner_uid: u32) -> Result<(), Pat
 }
 
 /// Why [`open`] refused.
-/// Spec: docs/50 §7.5 (fail closed); AGENTS.md §6.
+/// Spec: docs/50 §7.5 (fail closed); docs/CLEAN-ROOM.md
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenError<E> {
     /// A directory or the file could not be inspected or opened, or the
@@ -634,7 +634,7 @@ fn open_file_no_follow(
 }
 
 /// Why [`read_to_bound`] refused.
-/// Spec: AGENTS.md §6 (bounded reads).
+/// Spec: docs/CLEAN-ROOM.md (bounded reads).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadError {
     /// The read failed (the system's error kind).
@@ -650,7 +650,7 @@ pub enum ReadError {
 /// # Errors
 /// [`ReadError`].
 ///
-/// Spec: AGENTS.md §6; docs/50 §7.1 ("file ≤ 64 KiB" for a configuration);
+/// Spec: docs/CLEAN-ROOM.md; docs/50 §7.1 ("file ≤ 64 KiB" for a configuration);
 /// std `io::Read::take`, `read_to_end` (which retries `Interrupted`).
 pub fn read_to_bound(file: File, bound: usize) -> Result<Vec<u8>, ReadError> {
     let limit = u64::try_from(bound).unwrap_or(u64::MAX).saturating_add(1);

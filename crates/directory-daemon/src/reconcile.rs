@@ -92,7 +92,7 @@ pub const MAX_REGISTRATIONS_PER_RUN: usize = 32;
 
 /// Settled tombstones remembered at most; past it the memory starts again
 /// empty (the cost: one more registration each, which keyd refuses — R6b).
-/// Project bound (AGENTS.md §6).
+/// Project bound (docs/CLEAN-ROOM.md).
 pub const MAX_SETTLED: usize = 4096;
 
 /// Pages of keyd's pending destroy decisions one listing reads at most:

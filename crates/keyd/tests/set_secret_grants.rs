@@ -6,7 +6,7 @@
 //! and consumes one, with exactly its binding **and salt** (N4).
 //!
 //! Sources: docs/51 §4.3 steps 11-12, §5.2 row 5, §5.8 option (b), §7.3;
-//! docs/47 §9.1; docs/10 §2, §6, §6א, §9, §10; docs/questions/Q-291 (A-74),
+//! docs/47 §9.1; docs/10 §2, §6, §6a, §9, §10; docs/questions/Q-291 (A-74),
 //! Q-450, Q-451; docs/52 §2 row 37 (N4), §4.2 (A-102). All values are
 //! constructed by hand for these tests.
 

@@ -1,6 +1,6 @@
 //! Resource bounds of the codec, each a named constant with its justification.
 //!
-//! AGENTS.md §6 (and docs/32 §8, per docs/49 §2.4) require bounds but do not
+//! docs/CLEAN-ROOM.md (and docs/32 §8, per docs/49 §2.4) require bounds but do not
 //! fix the numbers, so
 //! each value below is a project choice (docs/49 §2.4, R49-3), anchored where
 //! possible to the LDAP policy names of [MS-ADTS] 3.1.1.3.4.6 but stricter than

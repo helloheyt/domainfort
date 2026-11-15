@@ -61,7 +61,7 @@ pub const OBLIGATION_LIMIT: u32 = 60;
 /// The obligation window, in seconds of the request's `now`. Project choice.
 pub const OBLIGATION_WINDOW_SECS: i64 = 60;
 
-/// Most keys tracked at once. Project bound (AGENTS.md §6).
+/// Most keys tracked at once. Project bound (docs/CLEAN-ROOM.md).
 pub const OBLIGATION_KEYS: usize = 4096;
 
 /// The PDP's `RateLimit` obligation (docs/11 §8): per `RlKey`, at most

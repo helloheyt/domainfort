@@ -12,7 +12,7 @@
 //! | 20    | aes256-cts-hmac-sha384-192   | 20        | RFC 8009   |
 //!
 //! Every other encryption or checksum type number — DES, 3DES, RC4 and the
-//! rest — is an error; none of them has a code path (AGENTS.md §6; docs/38
+//! rest — is an error; none of them has a code path (docs/CLEAN-ROOM.md; docs/38
 //! §2). The RFC 3961 operations provided are: string-to-key, random-to-key,
 //! key derivation for a caller-supplied key usage (Kc / Ke / Ki), encrypt and
 //! decrypt with integrity, get_mic / verify_mic, and the pseudo-random
@@ -30,7 +30,7 @@
 //!   component (`keyd`) supplies it from an approved source and tests are
 //!   deterministic. Only `keyd` links this crate (compute-don't-give; docs/09,
 //!   docs/10).
-//! - No cryptographic primitive is implemented here (AGENTS.md §6). AES, SHA-1,
+//! - No cryptographic primitive is implemented here (docs/CLEAN-ROOM.md). AES, SHA-1,
 //!   SHA-2, HMAC and PBKDF2 come from approved RustCrypto crates. This crate
 //!   composes only the Kerberos-specified constructions: n-fold, DR/DK, the
 //!   KDF-HMAC-SHA2 framing, CBC with ciphertext stealing, and the
@@ -48,7 +48,7 @@
 //! # Provenance
 //!
 //! Written only from the allowed specifications, opened in-session
-//! (AGENTS.md §1-3): RFC 3961 (framework, n-fold, simplified profile, DK/DR),
+//! (docs/CLEAN-ROOM.md): RFC 3961 (framework, n-fold, simplified profile, DK/DR),
 //! RFC 3962 (AES with HMAC-SHA1, PBKDF2 string-to-key, ciphertext stealing),
 //! RFC 8009 (AES with HMAC-SHA2, KDF-HMAC-SHA2), RFC 2040 §8 (the
 //! ciphertext-stealing steps RFC 3962 §5 references, with the errata of

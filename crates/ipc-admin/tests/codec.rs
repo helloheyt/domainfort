@@ -712,7 +712,7 @@ fn second_spellings_are_malformed() {
     assert_eq!(disposition(&body), refused(Refused::Malformed, None));
 }
 
-/// docs/50 §8.2; AGENTS.md §6 ("secrets never in logs, panics, debug
+/// docs/50 §8.2; docs/CLEAN-ROOM.md ("secrets never in logs, panics, debug
 /// output"): no `Debug` of the typed request, the `SetPassword`, the
 /// password, the wire request or its fields prints the password — not as
 /// text, not as octets.

@@ -1,13 +1,13 @@
 //! The strict, bounded decoder.
 //!
-//! Order of work (fail closed at the first violation, AGENTS.md §6):
+//! Order of work (fail closed at the first violation, docs/CLEAN-ROOM.md):
 //!
 //! 1. message size against the transport bound, before any octet is read
 //!    (RFC 1035 §2.3.4, §4.2.1, §4.2.2);
 //! 2. header (RFC 1035 §4.1.1), QR and OPCODE against the profile;
 //! 3. section counts against the profile bounds (docs/54 §6.2), then against
 //!    the octets present with every entry at its smallest — before any
-//!    allocation (AGENTS.md §6);
+//!    allocation (docs/CLEAN-ROOM.md);
 //! 4. sections front to back; names through [`crate::name`] (compression with
 //!    one hop per name, by construction); RDATA of the modelled types decoded
 //!    with RDLENGTH matched exactly (docs/54 §6.2); other RDATA skipped;

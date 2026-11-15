@@ -1,4 +1,4 @@
-# cargo-fuzz harness for krb-proto (AGENTS.md §6 / docs/32 §8: every parser gets
+# cargo-fuzz harness for krb-proto (docs/CLEAN-ROOM.md / docs/32 §8: every parser gets
 # a fuzz target before it merges to main).
 #
 # This is a SEPARATE workspace (note the empty [workspace] table below): it is
@@ -10,7 +10,7 @@
 #
 # NOTE FOR REVIEW: libfuzzer-sys is fuzz-harness-only test infrastructure, not
 # linked into any product crate, and on the license allowlist (MIT / Apache-2.0,
-# AGENTS.md §7). Pending owner sign-off (docs/questions/PENDING-OWNER.md P-1);
+# docs/CLEAN-ROOM.md). Pending owner sign-off (docs/questions/PENDING-OWNER.md P-1);
 # not built or run until then.
 
 [package]

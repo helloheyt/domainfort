@@ -169,7 +169,7 @@ fn write_flags(writer: &mut Writer, flags: TicketFlags) -> Result<()> {
 
 /// `FastConversation` = which (`u8`: 1 As, 2 Tgs) ‖ its token.
 /// Spec: docs/50 §3.4 (`conversation: As(ArmorId) | Tgs(CtxId)`); docs/10
-/// §5א.
+/// §5a.
 fn write_conversation(writer: &mut Writer, conversation: &FastConversation) -> Result<()> {
     match conversation {
         FastConversation::As(armor) => {
@@ -188,7 +188,7 @@ const CONVERSATION_AS: u8 = 0x01;
 /// Wire code of `FastConversation::Tgs`. Project choice.
 const CONVERSATION_TGS: u8 = 0x02;
 
-/// Spec: docs/50 §3.4; docs/10 §5א.
+/// Spec: docs/50 §3.4; docs/10 §5a.
 fn read_conversation(reader: &mut Reader<'_>) -> Result<FastConversation> {
     #[derive(Clone, Copy)]
     enum Which {
@@ -490,7 +490,7 @@ impl Payload for IssueAsRepRequest {
 }
 
 /// `open_fast_armor`. Spec: docs/50 §3.4 (`krbtgt`, `armored_req: DER`,
-/// `outer_req_body: bytes`); docs/10 §5א.
+/// `outer_req_body: bytes`); docs/10 §5a.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenFastArmorRequest {
     /// Krbtgt handle.
@@ -525,7 +525,7 @@ impl Payload for OpenFastArmorRequest {
 
 /// The FAST part of `open_and_verify_tgt`.
 /// Spec: docs/50 §3.4 (`fast: Option<{ ap_req_octets: bytes, armored_req:
-/// DER }>`); docs/10 §5א (`TgsFastRequest`).
+/// DER }>`); docs/10 §5a (`TgsFastRequest`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireTgsFast {
     /// The raw PA-TGS-REQ padata-value octets (keyd decodes and compares
@@ -679,7 +679,7 @@ impl Payload for IssueTgsRepRequest {
 }
 
 /// `seal_fast_error`. Spec: docs/50 §3.4 (`conversation`, `error: DER`,
-/// `padata: seq<DER>`); docs/10 §5א.
+/// `padata: seq<DER>`); docs/10 §5a.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealFastErrorRequest {
     /// The armored conversation answered.
@@ -737,7 +737,7 @@ fn read_fixed(reader: &mut Reader<'_>, value: u8) -> Result<()> {
 /// binding, R2: no purpose travels, so no request can pair the admin service
 /// key with an unbound verification — that one is kind 0x15). On the wire
 /// the binding octet stays, with its one value (Q-523, append-only).
-/// Spec: docs/50 §3.4 (`service`, `ap_req_octets: bytes`); docs/10 §5ב;
+/// Spec: docs/50 §3.4 (`service`, `ap_req_octets: bytes`); docs/10 §5b;
 /// docs/52 §5 item 3 (A-102); docs/questions/Q-523.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenAndVerifyServiceTicketRequest {
@@ -770,7 +770,7 @@ impl Payload for OpenAndVerifyServiceTicketRequest {
 /// `verify_operation_ticket`: the admin service principal, the operation
 /// digest the AP-REQ must be bound to (keyd derives the AdminService
 /// purpose from it, R2), and the AP-REQ. Appended by Q-523.
-/// Spec: docs/10 §5ב; docs/52 §5 items 1-3; docs/50 §3.3 (append-only),
+/// Spec: docs/10 §5b; docs/52 §5 items 1-3; docs/50 §3.3 (append-only),
 /// §3.4; docs/questions/Q-523.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifyOperationTicketRequest {
@@ -1321,15 +1321,15 @@ pub enum KeydRequest {
     VerifyPreauth(VerifyPreauthRequest),
     /// Spec: docs/10 §4.
     IssueAsRep(IssueAsRepRequest),
-    /// Spec: docs/10 §5א.
+    /// Spec: docs/10 §5a.
     OpenFastArmor(OpenFastArmorRequest),
     /// Spec: docs/10 §5.
     OpenAndVerifyTgt(OpenAndVerifyTgtRequest),
     /// Spec: docs/10 §5.
     IssueTgsRep(IssueTgsRepRequest),
-    /// Spec: docs/10 §5א.
+    /// Spec: docs/10 §5a.
     SealFastError(SealFastErrorRequest),
-    /// Spec: docs/10 §5ב.
+    /// Spec: docs/10 §5b.
     OpenAndVerifyServiceTicket(OpenAndVerifyServiceTicketRequest),
     /// Spec: docs/10 §6.
     SetSecret(SetSecretRequest),
@@ -1345,9 +1345,9 @@ pub enum KeydRequest {
     RetireKvno(DecisionId),
     /// `destroy_key_set(decision)`. Spec: docs/10 §7; A-35; docs/52 §4.6.
     DestroyKeySet(DecisionId),
-    /// No field. Spec: docs/10 §7א.
+    /// No field. Spec: docs/10 §7a.
     DescribeConfig,
-    /// No field. Spec: docs/10 §7א.
+    /// No field. Spec: docs/10 §7a.
     Ping,
     /// Spec: docs/51 §5.8 option (b); docs/questions/Q-450.
     GrantSetSecret(GrantSetSecretRequest),
@@ -1357,7 +1357,7 @@ pub enum KeydRequest {
     SealCeremony,
     /// `after: Option<u64>`. Spec: docs/52 §4.6.
     ListDestroyDecisions(Option<DecisionId>),
-    /// Spec: docs/10 §5ב; docs/questions/Q-523.
+    /// Spec: docs/10 §5b; docs/questions/Q-523.
     VerifyOperationTicket(VerifyOperationTicketRequest),
     /// Spec: docs/53 §5.5 (task K4).
     OpenChangePasswordRequest(OpenChangePasswordRequestFields),
@@ -1549,7 +1549,7 @@ impl Payload for WireRepParts {
 }
 
 /// `FastArmor`. Spec: docs/50 §3.4 (`FastArmor { armor_id, armor_crealm,
-/// armor_cname, armor_authtime, fast_req: DER }`); docs/10 §5א.
+/// armor_cname, armor_authtime, fast_req: DER }`); docs/10 §5a.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireFastArmor {
     /// The one-time armor token.
@@ -1659,7 +1659,7 @@ impl Payload for WireTgtContext {
 
 /// `ServiceContext` of an unbound verification. Spec: docs/50 §3.4
 /// (`ServiceContext { ctx_id, crealm, cname, authtime, endtime, flags,
-/// subkey_present }`); docs/10 §5ב. Its last octet is the one-value
+/// subkey_present }`); docs/10 §5b. Its last octet is the one-value
 /// [`NO_BOUND_OPERATION`] (Q-523, append-only).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireServiceContext {
@@ -1717,7 +1717,7 @@ impl Payload for WireServiceContext {
 /// `OperationTicket`: the facts of an operation-bound verification and the
 /// digest keyd verified the `cksum` MIC over — **no context id** (keyd keeps
 /// none, Q-523). Appended by Q-523.
-/// Spec: docs/10 §5ב; docs/52 §5 items 3-4; docs/50 §3.3 (append-only),
+/// Spec: docs/10 §5b; docs/52 §5 items 3-4; docs/50 §3.3 (append-only),
 /// §3.4; docs/questions/Q-523.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireOperationTicket {
@@ -1913,7 +1913,7 @@ const fn caller_role_from_code(code: u8) -> Option<Role> {
 /// is sent (docs/questions/Q-351, A-87).
 ///
 /// Spec: docs/50 §3.4 (`DescribeConfig`: "realm, enctypes, clock_skew_secs,
-/// token_lifetime_secs, ticket_policy"), §3.7; docs/10 §2, §7א
+/// token_lifetime_secs, ticket_policy"), §3.7; docs/10 §2, §7a
 /// (`s2k_params` added, Q-240 item 2); docs/questions/Q-351 (A-87: the reply
 /// "carries the caller's Role as keyd resolved it from the peer uid (not
 /// secret)").
@@ -1937,7 +1937,7 @@ pub struct WireConfigDescription {
 }
 
 impl Payload for WireConfigDescription {
-    /// Spec: docs/50 §3.4; docs/10 §7א; docs/questions/Q-351 (A-87).
+    /// Spec: docs/50 §3.4; docs/10 §7a; docs/questions/Q-351 (A-87).
     fn write_fields(&self, writer: &mut Writer) -> Result<()> {
         writer.write_bytes(&self.realm, MAX_REPLY_FIELD)?;
         writer.write_seq(&self.enctypes, MAX_ENCTYPES, |w, e| write_enctype(w, *e))?;
@@ -1952,7 +1952,7 @@ impl Payload for WireConfigDescription {
     }
 
     /// Spec: docs/50 §3.3 (closed tables; nothing after the last field),
-    /// §3.4; docs/10 §7א; docs/questions/Q-351 (A-87).
+    /// §3.4; docs/10 §7a; docs/questions/Q-351 (A-87).
     fn read_fields(reader: &mut Reader<'_>) -> Result<WireConfigDescription> {
         let realm = read_owned(reader, MAX_REPLY_FIELD)?;
         let enctypes = reader.read_seq(MAX_ENCTYPES, read_enctype)?;
@@ -2061,15 +2061,15 @@ pub enum KeydReply {
     VerifyPreauth(WireAuthnProof),
     /// Spec: docs/10 §4.
     IssueAsRep(WireRepParts),
-    /// Spec: docs/10 §5א.
+    /// Spec: docs/10 §5a.
     OpenFastArmor(WireFastArmor),
     /// Spec: docs/10 §5.
     OpenAndVerifyTgt(WireTgtContext),
     /// Spec: docs/10 §5.
     IssueTgsRep(WireRepParts),
-    /// DER `EncryptedData`. Spec: docs/10 §5א.
+    /// DER `EncryptedData`. Spec: docs/10 §5a.
     SealFastError(DerBlob),
-    /// Spec: docs/10 §5ב.
+    /// Spec: docs/10 §5b.
     OpenAndVerifyServiceTicket(WireServiceContext),
     /// Spec: docs/10 §6.
     SetSecret(Kvno),
@@ -2086,14 +2086,14 @@ pub enum KeydReply {
     /// Spec: docs/10 §7.
     DestroyKeySet,
     /// keyd's description and the caller's role.
-    /// Spec: docs/10 §7א; docs/questions/Q-351 (A-87).
+    /// Spec: docs/10 §7a; docs/questions/Q-351 (A-87).
     DescribeConfig(WireConfigDescription),
     /// keyd is serving, and the role keyd resolved for the caller from the
     /// connection's peer uid — the only field, appended to what was an
     /// empty payload (task R9). Every role may ping (docs/10 §2), so every
     /// client can check its own role on each new connection before it
     /// sends anything else, whatever operations its role may call.
-    /// Spec: docs/10 §2, §7א; docs/50 §3.4 (`Ping`), §3.7;
+    /// Spec: docs/10 §2, §7a; docs/50 §3.4 (`Ping`), §3.7;
     /// docs/questions/Q-403 option (c), Q-466 item 2 (A-102).
     Ping(Role),
     /// The grant is registered. Spec: docs/51 §5.8 option (b);
@@ -2105,7 +2105,7 @@ pub enum KeydReply {
     SealCeremony,
     /// Spec: docs/52 §4.6.
     ListDestroyDecisions(WireDestructionPage),
-    /// Spec: docs/10 §5ב; docs/questions/Q-523.
+    /// Spec: docs/10 §5b; docs/questions/Q-523.
     VerifyOperationTicket(WireOperationTicket),
     /// Spec: docs/53 §5.5 (task K4).
     OpenChangePasswordRequest(WireChangePasswordContext),

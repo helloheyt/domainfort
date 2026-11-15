@@ -28,7 +28,7 @@
 //! or inside a longer identifier.
 //!
 //! Source: docs/52 §3.6 (C6), R-a; docs/questions/Q-486 (R-a, A-103);
-//! AGENTS.md §6.1 ("removing the capability from the component that should
+//! docs/CLEAN-ROOM.md ("removing the capability from the component that should
 //! not have it"). Test-only; modelled on crates/directory-admin
 //! tests/single_write_path.rs.
 

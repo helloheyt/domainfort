@@ -38,7 +38,7 @@
 //!
 //! Spec: docs/10 §2 (Role `Kdc`: verify_preauth, issue_as_rep,
 //! open_and_verify_tgt, issue_tgs_rep, open_fast_armor, seal_fast_error),
-//! §4, §5, §5א, §8, §9; docs/48 §2.3; docs/09 א.1; docs/30 §1; docs/50 R50-8,
+//! §4, §5, §5a, §8, §9; docs/48 §2.3; docs/09 A.1; docs/30 §1; docs/50 R50-8,
 //! §3.4, §3.6, §3.7, §7.5; RFC 4120 3.2.3, 7.5.9; docs/questions/Q-217,
 //! Q-222 (A-56); D182; A-63.
 
@@ -54,7 +54,7 @@ use krb_proto::{ApReq, EncryptedData, KerberosTime, KrbError, KrbFastArmoredReq,
 /// The keyd operations the KDC calls (role `Kdc`). Each may answer
 /// `Unavailable` (module docs): keyd did not serve the call.
 ///
-/// Spec: docs/10 §2, §4, §5, §5א, §9; docs/48 §2.3; docs/50 §3.7 (R50-8);
+/// Spec: docs/10 §2, §4, §5, §5a, §9; docs/48 §2.3; docs/50 §3.7 (R50-8);
 /// docs/questions/Q-217 (A-56).
 pub trait KeyCustody {
     /// keyd's non-secret configuration: realm, AES encryption types, clock
@@ -92,7 +92,7 @@ pub trait KeyCustody {
         now: &KerberosTime,
     ) -> Result<AsRepParts, IssueError>;
 
-    /// docs/10 §5א `open_fast_armor`: the FX_FAST_ARMOR_AP_REQUEST armor of
+    /// docs/10 §5a `open_fast_armor`: the FX_FAST_ARMOR_AP_REQUEST armor of
     /// an AS request and its KrbFastReq; the req-checksum is verified over
     /// the raw outer KDC-REQ-BODY octets (RFC 6113 5.4.2).
     fn open_fast_armor(
@@ -105,7 +105,7 @@ pub trait KeyCustody {
 
     /// docs/10 §5 `open_and_verify_tgt` (A-17: the authenticator checksum is
     /// verified over the raw KDC-REQ-BODY octets); with `fast`, the implicit
-    /// FAST armor of the TGS request (docs/10 §5א, docs/48 §5).
+    /// FAST armor of the TGS request (docs/10 §5a, docs/48 §5).
     fn open_and_verify_tgt(
         &mut self,
         krbtgt: &KeyHandle,
@@ -124,7 +124,7 @@ pub trait KeyCustody {
         now: &KerberosTime,
     ) -> Result<TgsRepParts, IssueError>;
 
-    /// docs/10 §5א `seal_fast_error`: the enc-fast-rep of an armored
+    /// docs/10 §5a `seal_fast_error`: the enc-fast-rep of an armored
     /// KRB-ERROR (RFC 6113 5.4.4), consuming the conversation's token.
     fn seal_fast_error(
         &mut self,

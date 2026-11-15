@@ -1,0 +1,12 @@
+# Hosts scripts/pin-specs.sh may download pinned specifications from.
+# One host per line. These are the official publishers of the standards the
+# project is written from (see docs/STANDARDS.md and docs/CLEAN-ROOM.md).
+
+learn.microsoft.com
+winprotocoldocs-bhdugrdyduf5h2e4.b02.azurefd.net
+winprotocoldoc.z19.web.core.windows.net
+www.rfc-editor.org
+datatracker.ietf.org
+pubs.opengroup.org
+www.itu.int
+csrc.nist.gov

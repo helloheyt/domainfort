@@ -3,7 +3,7 @@
 //! Only the Distinguished Encoding Rules are accepted: definite lengths encoded
 //! in the minimum octets, canonical SET OF ordering, primitive encodings where
 //! DER requires them, and no trailing data. Anything else is a distinct `Err`
-//! (fail closed — AGENTS.md §6; docs/32 §8). The decoder is bounded: every
+//! (fail closed — docs/CLEAN-ROOM.md; docs/32 §8). The decoder is bounded: every
 //! length is checked against the remaining input before use (so nothing is
 //! allocated from an attacker-controlled length without a bound), and nesting is
 //! capped at [`crate::MAX_DEPTH`].
@@ -224,7 +224,7 @@ impl<'a> Cursor<'a> {
         let tag = self.read_tag()?;
         let length = self.read_length()?;
         // Bound the declared length against what is actually present before
-        // slicing. Spec: X.690 8.1.3.3; AGENTS.md §6 (no unbounded reads).
+        // slicing. Spec: X.690 8.1.3.3; docs/CLEAN-ROOM.md (no unbounded reads).
         if length > self.remaining().len() {
             return Err(Error::LengthExceedsInput);
         }

@@ -1,6 +1,6 @@
 //! Errors of the manifest parser, builder and file reader.
 //!
-//! Hand-rolled, zero-dependency (AGENTS.md §7). **No echo**: an [`Error`]
+//! Hand-rolled, zero-dependency (docs/CLEAN-ROOM.md). **No echo**: an [`Error`]
 //! carries only a line number, the name of a manifest key (a
 //! `&'static str` from the closed key table, never text from the input) and
 //! the rule that failed — never a value or any other octet of the file, as
@@ -12,7 +12,7 @@ use core::fmt;
 /// Which rule a manifest broke.
 ///
 /// Spec: docs/50 R50-15, §7.1 (the line format); docs/51 §4.3 step 8 (the
-/// manifest); AGENTS.md §6 (strict, bounded parsers).
+/// manifest); docs/CLEAN-ROOM.md (strict, bounded parsers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ErrorKind {
@@ -130,7 +130,7 @@ impl ErrorKind {
 
 /// A manifest rejection: where, which key, and which rule.
 ///
-/// Spec: docs/50 §7.1; AGENTS.md §6 (no secrets — and here no input at all —
+/// Spec: docs/50 §7.1; docs/CLEAN-ROOM.md (no secrets — and here no input at all —
 /// in errors).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Error {
@@ -226,7 +226,7 @@ impl std::error::Error for Error {}
 ///
 /// Spec: docs/51 §4.3 step 8 (the manifest is root:0644); docs/50 §7.1 (the
 /// same rule as a configuration file: owned by root, not writable by group
-/// or others); AGENTS.md §6 (fail closed).
+/// or others); docs/CLEAN-ROOM.md (fail closed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadError {
     /// The file could not be opened, inspected or read.

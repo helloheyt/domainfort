@@ -335,7 +335,7 @@ fn unavailable_stops_the_sweep_for_a_retry() {
     assert_eq!(report::sweep_exit_code(&report), EXIT_NOTHING_ATTEMPTED);
 }
 
-/// AGENTS.md §6 (a looping peer is refused; fail closed); docs/52 §4.6: a
+/// docs/CLEAN-ROOM.md (a looping peer is refused; fail closed); docs/52 §4.6: a
 /// listing whose cursor does not move forward stops the sweep; a listing
 /// keyd refuses (e.g. this account is not Role::Admin) stops it with
 /// nothing sent; exit 1.

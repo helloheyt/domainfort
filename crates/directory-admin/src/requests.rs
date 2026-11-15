@@ -5,7 +5,7 @@
 //! MA5) — and the consumption of an approved request by the operation's
 //! execution.
 //!
-//! # The class this closes (AGENTS.md §6.1)
+//! # The class this closes (docs/CLEAN-ROOM.md)
 //!
 //! Before this module there were **two** mechanisms for one control
 //! (docs/research/r5-b-cli.md §7.1): directory writes and `ChangePolicy`
@@ -146,7 +146,7 @@ use crate::subject::{AdminSubject, SubjectError, VerifiedTicket};
 /// Most pending requests dird holds at once (approved ones included, until
 /// they are executed or expire). Project choice: dual-controlled operations
 /// are rare and human-paced; [`MAX_REQUESTS_PER_REQUESTER`] × a few
-/// administrators. Spec: docs/51 §5.6 ("bounded in number"); AGENTS.md §6;
+/// administrators. Spec: docs/51 §5.6 ("bounded in number"); docs/CLEAN-ROOM.md;
 /// docs/questions/Q-940.
 pub const MAX_PENDING_REQUESTS: usize = 32;
 
@@ -163,7 +163,7 @@ pub const REQUEST_LIFETIME: Duration = Duration::from_secs(60 * 60);
 /// The longest lifetime accepted: one hour — keyd's ceiling for a key
 /// decision's lifetime (`keyd_types::MAX_KEY_DECISION_SECS`), and the
 /// ceiling of `admin_ticket_age_max` (docs/questions/Q-385 item 4).
-/// Spec: docs/51 §5.6; AGENTS.md §6; docs/questions/Q-939.
+/// Spec: docs/51 §5.6; docs/CLEAN-ROOM.md; docs/questions/Q-939.
 pub const MAX_REQUEST_LIFETIME: Duration = Duration::from_secs(60 * 60);
 
 /// The default cap of open pending requests per requester: 4 — **interim**,
@@ -175,7 +175,7 @@ pub const MAX_REQUEST_LIFETIME: Duration = Duration::from_secs(60 * 60);
 pub const REQUESTS_PER_REQUESTER: usize = 4;
 
 /// The largest per-requester cap accepted. Spec: docs/questions/Q-940;
-/// AGENTS.md §6.
+/// docs/CLEAN-ROOM.md
 pub const MAX_REQUESTS_PER_REQUESTER: usize = 8;
 
 /// The longest `reason_ref`: 64 printable ASCII characters ("a change
@@ -1012,7 +1012,7 @@ impl IntentRecord for QuorumStep {
 /// a caller that drops this value, or whose call to keyd fails, leaves the
 /// request approved (fail closed) and answers [`RevocationStep::refusal`].
 ///
-/// **The class (AGENTS.md §6.1):** one fact held by dird and keyd that could
+/// **The class (docs/CLEAN-ROOM.md):** one fact held by dird and keyd that could
 /// diverge (C14, as Q-937 item 6 reads it) — the record leaving dird while
 /// keyd's decision stays executable. **The root change:** dird's record of
 /// a decision registered in keyd leaves only through keyd's revocation (or

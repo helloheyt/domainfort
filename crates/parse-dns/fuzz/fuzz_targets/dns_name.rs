@@ -1,7 +1,7 @@
 #![no_main]
 //! Fuzz target for domain names (docs/54 §10.3 `dns_name`).
 //!
-//! AGENTS.md §6 requires a fuzz target for every parser before it merges to
+//! docs/CLEAN-ROOM.md requires a fuzz target for every parser before it merges to
 //! `main`. The input is cut at each 0xFF octet into up to 33 pieces, and an
 //! UPDATE request is built around them: the first piece is the ZNAME, each
 //! further piece the owner name of an empty-RDATA record (RFC 2136 §2.4.4

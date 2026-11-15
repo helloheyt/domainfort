@@ -76,9 +76,9 @@
 //! docs.rs API pages of rustix 1.1.6 and zeroize 1.9.1 (P-2). The wire layout
 //! and every name come from docs/50 §3.3-§3.4 and keyd's API. No other
 //! implementation, serializer or RPC framework was consulted or recalled
-//! (AGENTS.md §1-3). Task F3 added the caller role of the `describe_config`
+//! (docs/CLEAN-ROOM.md). Task F3 added the caller role of the `describe_config`
 //! reply and the client's request fate from docs/questions Q-351, Q-365,
-//! Q-367 and PENDING-OWNER A-87, A-88, with docs/10 §2, §7א, §9, §10 and
+//! Q-367 and PENDING-OWNER A-87, A-88, with docs/10 §2, §7a, §9, §10 and
 //! docs/50 §3.4-§3.7. Task A15a added `grant_set_secret` (request `0x11`,
 //! reply `0x91`; the additive client method `KeydClient::grant_set_secret`)
 //! from docs/51 §5.8, docs/questions Q-291 and PENDING-OWNER A-74, A-88.

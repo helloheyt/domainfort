@@ -20,5 +20,5 @@ pub const MESSAGE_HEADER_LEN: usize = 6;
 /// longer than 65,535 octets. A TCP header announcing more is refused before
 /// any allocation (docs/53 §5.1: "value 0 or > 65,535 ⇒ close before
 /// allocation"; §5.9 "≤ 65,535").
-/// Spec: RFC 3244 §2; docs/53 §5.1, §5.9; AGENTS.md §6.
+/// Spec: RFC 3244 §2; docs/53 §5.1, §5.9; docs/CLEAN-ROOM.md
 pub const MAX_MESSAGE_LEN: usize = u16::MAX as usize;

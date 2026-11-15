@@ -69,7 +69,7 @@ pub fn segment_path(base: &Path, index: u64) -> PathBuf {
 
 /// Why the segment listing was refused.
 ///
-/// Spec: docs/37 §2 (a deleted segment is a break); AGENTS.md §6 (fail
+/// Spec: docs/37 §2 (a deleted segment is a break); docs/CLEAN-ROOM.md (fail
 /// closed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListingError {

@@ -119,7 +119,7 @@ pub const UDP_RECEIVE_BUFFER: usize = dns_zone::limits::MAX_UDP_MESSAGE_OCTETS +
 
 /// Octets read from a TCP stream per read call at most: a message buffer
 /// grows with the octets that arrived, never to its declared length first
-/// (AGENTS.md §6: no allocation from an attacker-supplied length). Project
+/// (docs/CLEAN-ROOM.md: no allocation from an attacker-supplied length). Project
 /// choice.
 pub const TCP_READ_CHUNK: usize = 4096;
 

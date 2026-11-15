@@ -1,9 +1,9 @@
 //! Error type for the LDAP-BER codec.
 //!
-//! Hand-rolled, zero-dependency (AGENTS.md §7). Every variant names one rule the
+//! Hand-rolled, zero-dependency (docs/CLEAN-ROOM.md). Every variant names one rule the
 //! decoder enforces (or one representability rule the encoder enforces). Fail
 //! closed: malformed input is always a distinct `Err`, never a panic and never a
-//! silent repair (AGENTS.md §6; docs/49 §2.3).
+//! silent repair (docs/CLEAN-ROOM.md; docs/49 §2.3).
 //!
 //! Disposition (docs/49 §2.3, §9): [`Error::MessageTooLarge`] means "drop the
 //! connection without a response" ([MS-ADTS] 3.1.1.3.4.6). Every other decode
@@ -11,7 +11,7 @@
 //! `protocolError` and immediate termination (RFC 4511 §4.1.1).
 //!
 //! Security: no variant carries attacker-supplied bytes — only which rule
-//! failed. Nothing secret can reach an error (AGENTS.md §6).
+//! failed. Nothing secret can reach an error (docs/CLEAN-ROOM.md).
 
 use core::fmt;
 
@@ -93,7 +93,7 @@ pub enum Error {
     EndOfContents,
 
     /// Constructed nesting or a counted element exceeded a bound.
-    /// Spec: docs/49 §2.4 (R49-3); AGENTS.md §6.
+    /// Spec: docs/49 §2.4 (R49-3); docs/CLEAN-ROOM.md
     LimitExceeded(Limit),
 
     /// The message is larger than the bound for the session's authentication

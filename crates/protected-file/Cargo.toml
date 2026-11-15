@@ -52,7 +52,7 @@
 # `fs::FileType::is_symlink`, `fs::Stat::st_size`, `fs::Dir::read_from` /
 # `read`, `fs::DirEntry::file_name`, the crate's feature list) — API
 # documentation only, never its source (P-2). No other implementation
-# consulted or recalled (AGENTS.md §1-3).
+# consulted or recalled (docs/CLEAN-ROOM.md).
 
 [package]
 name = "protected-file"

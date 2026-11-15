@@ -177,7 +177,7 @@ pub struct BindRequest {
 pub enum AuthenticationChoice {
     /// `simple [0] OCTET STRING`, decoded to its shape only: the password
     /// octets are never retained (docs/49 §2.3). Name/password simple bind has
-    /// no code path (AGENTS.md §6; R49-4) — the codec parses it only so the
+    /// no code path (docs/CLEAN-ROOM.md; R49-4) — the codec parses it only so the
     /// engine can refuse it.
     Simple { password_empty: bool },
     /// `sasl [3] SaslCredentials`.
@@ -201,7 +201,7 @@ pub struct SaslCredentials {
 
 impl fmt::Debug for SaslCredentials {
     /// Shows only the size of `credentials`: SASL tokens never reach debug
-    /// output (AGENTS.md §6; docs/49 §10).
+    /// output (docs/CLEAN-ROOM.md; docs/49 §10).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SaslCredentials")
             .field("mechanism", &self.mechanism)
@@ -232,7 +232,7 @@ pub struct BindResponse {
 }
 
 impl fmt::Debug for BindResponse {
-    /// Shows only the size of `serverSaslCreds` (AGENTS.md §6; docs/49 §10).
+    /// Shows only the size of `serverSaslCreds` (docs/CLEAN-ROOM.md; docs/49 §10).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BindResponse")
             .field("result", &self.result)

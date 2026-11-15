@@ -2,7 +2,7 @@
 //! Fuzz target for the audit channel's request decoder (what auditd parses
 //! from every sender): `ipc_audit::decode_request`.
 //!
-//! AGENTS.md §6 / docs/50 §9 (R50-19): arbitrary bytes → decoder; never a
+//! docs/CLEAN-ROOM.md / docs/50 §9 (R50-19): arbitrary bytes → decoder; never a
 //! panic, bounded allocation. Whatever decodes must re-encode to exactly the
 //! input (docs/50 §3.3: "every decoder checks `encode(decode(b)) == b`"), an
 //! `Append` must respect its bounds (1..=16 events of 1..=8192 octets,

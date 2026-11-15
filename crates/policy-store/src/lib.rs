@@ -106,7 +106,7 @@
 //! # Provenance
 //!
 //! Written only from this project's decided design, opened in-session:
-//! AGENT-ONBOARDING, AGENTS, docs/50 (§3.3, §3.4, §7.2, §9, §10 P8/P9),
+//! docs/CLEAN-ROOM.md, docs/CLEAN-ROOM.md, docs/50 (§3.3, §3.4, §7.2, §9, §10 P8/P9),
 //! docs/questions Q-127 / Q-130 (A-39), Q-219 (A-57), Q-270 (A-68),
 //! PENDING-OWNER (A-36, A-39, A-48, A-51, A-57, A-68, A-117, A-142, P-1,
 //! P-10), docs/53 §5.2 (task K5); the code of this project's crates
@@ -115,7 +115,7 @@
 //! values of the tier table are format 1's (the directory channel's,
 //! crates/ipc-directory); every other table is this project's choice. No
 //! other implementation, policy language or serializer was consulted or
-//! recalled (AGENTS.md §1-3).
+//! recalled (docs/CLEAN-ROOM.md).
 //!
 //! Spec: docs/50 §3.3, §7.2, §9; docs/06 §9; docs/11 §3, §6; docs/48 §7;
 //! docs/53 §5.2 (task K5); A-36; A-39; A-51; A-57; A-68; A-117; A-142.

@@ -1,6 +1,6 @@
 # cargo-fuzz harness for provision's password-file reader (task A6, docs/51
 # §12: "`provision first-admin-secret` … + fuzz for the password-file
-# reader"; AGENTS.md §6: every parser gets a fuzz target before it merges to
+# reader"; docs/CLEAN-ROOM.md: every parser gets a fuzz target before it merges to
 # main; docs/50 §9).
 #
 # This is a SEPARATE workspace (note the empty [workspace] table below): it is
@@ -11,7 +11,7 @@
 #
 # NOTE FOR REVIEW: libfuzzer-sys is fuzz-harness-only test infrastructure, not
 # linked into any product crate, and on the license allowlist (MIT /
-# Apache-2.0, AGENTS.md §7). It is PENDING OWNER APPROVAL (docs/questions/
+# Apache-2.0, docs/CLEAN-ROOM.md). It is PENDING OWNER APPROVAL (docs/questions/
 # PENDING-OWNER.md, P-1): this harness has been written, not built or run.
 
 [package]

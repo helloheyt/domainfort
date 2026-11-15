@@ -542,7 +542,7 @@ fn sample_messages() -> Vec<Vec<u8>> {
 
 #[test]
 fn single_octet_mutations_never_panic() {
-    // Robustness property (AGENTS.md §6: never panic; fail closed): replacing
+    // Robustness property (docs/CLEAN-ROOM.md: never panic; fail closed): replacing
     // any one octet of a valid request either fails with a typed error or
     // yields a value whose canonical encoding decodes, under the canonical
     // profile, to the same value (R49-16).
@@ -582,7 +582,7 @@ fn single_octet_mutations_never_panic() {
 
 #[test]
 fn sasl_credentials_are_redacted_in_debug() {
-    // AGENTS.md §6 / docs/49 §10: SASL tokens never reach debug output.
+    // docs/CLEAN-ROOM.md / docs/49 §10: SASL tokens never reach debug output.
     let creds = SaslCredentials {
         mechanism: "GSSAPI".to_owned(),
         credentials: Some(b"TOKEN-OCTETS".to_vec()),

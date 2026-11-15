@@ -39,14 +39,14 @@
 //!
 //! Every message is a fixed text from [`Note`] plus, at most, a count —
 //! never request octets, names, addresses, or any peer-supplied string
-//! (AGENTS.md §6; docs/53 §9: "never: the password, the KRB-PRIV / AP-REQ
+//! (docs/CLEAN-ROOM.md; docs/53 §9: "never: the password, the KRB-PRIV / AP-REQ
 //! octets"; docs/50 §8.2). No logging crate. A failed write to stderr is
 //! ignored, never a panic. Notes a network peer can trigger at will are
 //! thinned out: written for the 1st, 2nd, 4th, 8th … event of each kind,
 //! with the running count, so a flood cannot fill the log (docs/07 §8).
 //!
 //! Spec: docs/53 §9; A-57 (noise rule); docs/50 §8.1, §8.2; docs/07 §8;
-//! AGENTS.md §6, §6.1; docs/questions/Q-961 items 3, 7 (A-160).
+//! docs/CLEAN-ROOM.md, §6.1; docs/questions/Q-961 items 3, 7 (A-160).
 
 use crate::audit::AuditGate;
 use std::io::Write;
@@ -271,7 +271,7 @@ impl Counters {
     /// window (sent as the next `WindowSummary`, crate::audit) in one call,
     /// so the two cannot drift.
     /// Spec: docs/53 §9; A-57; docs/questions/Q-961 items 2, 3, 7 (A-160),
-    /// Q-988; AGENTS.md §6.1 ("a single chokepoint").
+    /// Q-988; docs/CLEAN-ROOM.md ("a single chokepoint").
     pub(crate) fn noise(&self, noise: Noise, audit: &AuditGate) {
         self.of_noise(noise).hit();
         audit.count_noise();

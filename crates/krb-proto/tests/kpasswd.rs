@@ -264,7 +264,7 @@ fn krb_priv_rejects_non_der_framing() {
 
 #[test]
 fn krb_priv_rejects_oversized_input() {
-    // Resource bound (krb_proto::limits::MAX_MESSAGE_LEN; AGENTS.md §6).
+    // Resource bound (krb_proto::limits::MAX_MESSAGE_LEN; docs/CLEAN-ROOM.md).
     let huge = vec![0u8; limits::MAX_MESSAGE_LEN + 1];
     assert_eq!(KrbPriv::decode(&huge), Err(Error::MessageTooLarge));
 }
@@ -797,7 +797,7 @@ fn result_data_is_exactly_the_code() {
 }
 
 // ===========================================================================
-// Secrets — AGENTS.md §6
+// Secrets — docs/CLEAN-ROOM.md
 // ===========================================================================
 
 fn assert_no_password_text(text: &str) {
@@ -811,7 +811,7 @@ fn assert_no_password_text(text: &str) {
 
 #[test]
 fn passwords_are_redacted_in_debug() {
-    // AGENTS.md §6: the new password never appears in Debug output — not in
+    // docs/CLEAN-ROOM.md: the new password never appears in Debug output — not in
     // NewPasswd, ChangePasswdData, PasswordRequest, UserData (which holds the
     // ChangePasswdData DER) or EncKrbPrivPart.
     let newpasswd = NewPasswd::from_slice(PASSWORD);
@@ -828,7 +828,7 @@ fn passwords_are_redacted_in_debug() {
 
 #[test]
 fn password_bearing_encodings_are_zeroizing() {
-    // AGENTS.md §6: the DER of ChangePasswdData / EncKrbPrivPart carries the
+    // docs/CLEAN-ROOM.md: the DER of ChangePasswdData / EncKrbPrivPart carries the
     // password and is returned in a Zeroizing buffer (compile-time type check).
     let cpd = ChangePasswdData::change(NewPasswd::from_slice(PASSWORD));
     let encoded: Zeroizing<Vec<u8>> = cpd.encode().unwrap();

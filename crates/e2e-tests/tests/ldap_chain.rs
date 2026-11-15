@@ -13,7 +13,7 @@
 //!   StartTLS request in the same write ⇒ operationsError, closed (§4.3
 //!   steps 1-2; RFC 4511 §4.14.1);
 //! * a password bind over TLS ⇒ refused authMethodNotSupported (A-71;
-//!   AGENTS.md §6: cleartext simple bind has no code path).
+//!   docs/CLEAN-ROOM.md: cleartext simple bind has no code path).
 //!
 //! The TLS client is rustls itself, verifying the DC's real test
 //! certificate with its standard verifier against only the per-run test CA
@@ -241,7 +241,7 @@ fn cleartext_injected_around_start_tls_closes_the_connection() {
     });
 }
 
-/// RFC 4511 §4.2 (a simple bind with a password); A-71; AGENTS.md §6
+/// RFC 4511 §4.2 (a simple bind with a password); A-71; docs/CLEAN-ROOM.md
 /// (cleartext simple bind has no code path; crates/ldap: "simple bind with
 /// a password | authMethodNotSupported (7), before any lookup, never
 /// keyd"): over LDAPS and over StartTLS the bind is refused with 7, octet

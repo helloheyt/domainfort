@@ -36,12 +36,12 @@
 //! components are validated and skipped (RFC 4511 §4); [`Profile::Canonical`]
 //! accepts only what [`encode_message`] produces. Every rejection is a typed
 //! [`Error`]; nothing panics, and nothing is allocated from an
-//! attacker-supplied length beyond the octets present (AGENTS.md §6). All
+//! attacker-supplied length beyond the octets present (docs/CLEAN-ROOM.md). All
 //! bounds are named constants in [`limits`].
 //!
 //! # Provenance
 //!
-//! Written only from the allowed specifications, opened in-session (AGENTS.md
+//! Written only from the allowed specifications, opened in-session (docs/CLEAN-ROOM.md
 //! §1-3): RFC 4511 (§4, §4.1–§4.5.2, §4.6–§4.14, §5, §6, App. B); RFC 4512
 //! §1.4, §2.5; ITU-T X.690 (02/2021) clauses 7.3, 8.1–8.4, 8.7–8.14, 10.1–10.3,
 //! 11.1; ITU-T X.680 (02/2021) Table 1; [MS-ADTS] v20261026 3.1.1.3.4.6 and

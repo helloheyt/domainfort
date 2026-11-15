@@ -5,7 +5,7 @@
 //! spelling of "never") — the path `ipc_dird_admin::decode_request` takes in
 //! dird.
 //!
-//! AGENTS.md §6 / docs/50 §9 / docs/51 §7.5: arbitrary bytes → decoder;
+//! docs/CLEAN-ROOM.md / docs/50 §9 / docs/51 §7.5: arbitrary bytes → decoder;
 //! never a panic, bounded allocation. Whatever decodes must re-encode to
 //! exactly the input (docs/50 §3.3: "a single encoding per value"), and a
 //! rejection maps to the refusal table (a shared `Refused`, or a close

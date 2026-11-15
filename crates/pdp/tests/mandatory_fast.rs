@@ -6,7 +6,7 @@
 //! Allow side; option (ii) an explicit Deny with `SubjectMatch::NotMemberOf`),
 //! §7.3 (bootstrap exception: an unarmored AS only for a computer account,
 //! TGT only; "TGS is always armored"); Q-127 interim decision (owner item
-//! P-10: (1)–(5), (ג) = (ii)); docs/11 §3 (rules; explicit Deny wins; no
+//! P-10: (1)–(5), (c) = (ii)); docs/11 §3 (rules; explicit Deny wins; no
 //! matching Allow → Deny), §10 (P2, P4). Hand-made cases; every SID is a
 //! hand-made label in the layout of [MS-DTYP] 2.4.2 (see `common`); no
 //! vector from another implementation.
@@ -113,7 +113,7 @@ fn unarmored_as_is_denied_for_a_regular_subject() {
     }
 }
 
-/// docs/48 §7.3 (א); Q-127 (4): an unarmored AS for a TGT by a member of the
+/// docs/48 §7.3 (a); Q-127 (4): an unarmored AS for a TGT by a member of the
 /// bootstrap set is allowed — membership through the expanded groups, or
 /// the principal being the designated SID itself (`MemberOf` semantics).
 #[test]

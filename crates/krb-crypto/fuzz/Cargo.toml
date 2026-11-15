@@ -1,4 +1,4 @@
-# cargo-fuzz harness for krb-crypto (AGENTS.md §6: every parser of untrusted
+# cargo-fuzz harness for krb-crypto (docs/CLEAN-ROOM.md: every parser of untrusted
 # input gets a fuzz target before it merges to main). decrypt and verify_mic
 # consume attacker-supplied bytes and must never panic, hang, or
 # over-allocate — they fail closed with a `Result` error instead.
@@ -11,7 +11,7 @@
 #
 # NOTE FOR REVIEW: libfuzzer-sys is fuzz-harness-only test infrastructure, not
 # linked into any product crate, and on the license allowlist (MIT /
-# Apache-2.0, AGENTS.md §7). Pending owner sign-off (docs/questions/
+# Apache-2.0, docs/CLEAN-ROOM.md). Pending owner sign-off (docs/questions/
 # PENDING-OWNER.md P-1) — not built or run until approved.
 
 [package]

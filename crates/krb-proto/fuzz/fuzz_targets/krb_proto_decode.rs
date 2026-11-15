@@ -1,7 +1,7 @@
 #![no_main]
 //! Fuzz target for the typed Kerberos message decoders.
 //!
-//! AGENTS.md §6 / docs/32 §8 require a fuzz target for every parser before it
+//! docs/CLEAN-ROOM.md / docs/32 §8 require a fuzz target for every parser before it
 //! merges to `main`. Arbitrary bytes are fed to the `decode` of every top-level
 //! message and every structure that is decoded on its own (decrypted parts,
 //! padata values, e-data): none may panic, hang, or over-allocate — each fails

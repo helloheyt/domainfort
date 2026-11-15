@@ -1,7 +1,7 @@
 //! The zone image: the typed, immutable, bounded snapshot dnsd answers from.
 //!
 //! Built only through [`ZoneImage::new`], which validates every part, so an
-//! invalid image cannot exist (AGENTS.md §6.1 — unrepresentable states):
+//! invalid image cannot exist (docs/CLEAN-ROOM.md — unrepresentable states):
 //!
 //! * every host name is exactly one RFC 1035 §2.3.1 LDH label below the apex,
 //!   so `*`, `_` and multi-label host names — wildcards, shadowing of an SRV

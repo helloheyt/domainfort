@@ -55,7 +55,7 @@
 //! octets present can fill. Buffers that may hold a secret — the frame
 //! reader's body, the writer's output, [`EncodedFrame`], [`Secret`] — are
 //! zeroizing and are never reallocated in place. No error carries frame
-//! octets, and no `Debug` output prints payload octets (AGENTS.md §6;
+//! octets, and no `Debug` output prints payload octets (docs/CLEAN-ROOM.md;
 //! docs/50 §8.2).
 //!
 //! # Provenance
@@ -67,7 +67,7 @@
 //! Q-225: the reserved `REFUSED_KIND`), and the docs.rs API pages of
 //! `zeroize` 1.9.1 (`Zeroizing`, `Zeroize`, `ZeroizeOnDrop`). The wire layout
 //! and every name come from docs/50 §3.3. No other implementation, serializer
-//! or RPC framework was consulted or recalled (AGENTS.md §1-3).
+//! or RPC framework was consulted or recalled (docs/CLEAN-ROOM.md).
 //!
 //! Spec: docs/50 §3.3, §10; R50-4; D34; A-59.
 

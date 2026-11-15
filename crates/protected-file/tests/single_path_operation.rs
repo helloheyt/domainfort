@@ -29,7 +29,7 @@
 //! crate's own `*at` calls and would see a planted call.
 //!
 //! Source: docs/52 §3.13, §7 (R11); docs/questions Q-532 items 1, 2, 5
-//! (A-109), Q-550; AGENTS.md §6.1 ("a single chokepoint through which the
+//! (A-109), Q-550; docs/CLEAN-ROOM.md ("a single chokepoint through which the
 //! action must pass"); tests/single_open_path.rs (the same guard for
 //! opens, this project's own). Test-only.
 

@@ -63,7 +63,7 @@ const CHUNK: usize = 256;
 
 /// The most octets read on, and discarded, after an overlong line before
 /// the entry gives up looking for its end. Project choice (bounded,
-/// AGENTS.md §6).
+/// docs/CLEAN-ROOM.md).
 const DISCARD_LIMIT: usize = 1024 * 1024;
 
 /// Getting and setting a terminal's mode (the seam of the restore logic).

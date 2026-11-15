@@ -1,10 +1,10 @@
 //! Error type for the security data-type codec.
 //!
-//! Hand-rolled, zero-dependency (AGENTS.md §7). Every variant corresponds to one
+//! Hand-rolled, zero-dependency (docs/CLEAN-ROOM.md). Every variant corresponds to one
 //! structural rule that the decoder enforces (or that the canonical encoder
 //! refuses to break). Fail closed: any malformed or inconsistent
 //! input is a distinct `Err`, never a panic and never a silent repair
-//! (AGENTS.md §6; docs/32 §8).
+//! (docs/CLEAN-ROOM.md; docs/32 §8).
 //!
 //! Security: no variant carries attacker-supplied contents — only the fact of
 //! which rule failed.
@@ -168,7 +168,7 @@ pub enum Error {
 
     // ---- framing ----
     /// Bytes remained after a complete stand-alone SID, ACE or ACL.
-    /// Strict framing (AGENTS.md §6).
+    /// Strict framing (docs/CLEAN-ROOM.md).
     TrailingData,
 
     // ---- CreateSecurityDescriptor ([MS-DTYP] 2.5.3.4) ----

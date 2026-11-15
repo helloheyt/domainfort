@@ -2,7 +2,7 @@
 //!
 //! keyd never seals what the caller asks blindly: it builds the ticket
 //! itself and accepts from the caller only template values that pass these
-//! structural checks (anti-oracle, docs/09 א.3 (3); docs/10 §4 step 2).
+//! structural checks (anti-oracle, docs/09 A.3 (3); docs/10 §4 step 2).
 //! Failures are `BadTemplate` — the rules are public policy, nothing secret.
 //! The principal-name binding checks are authorization failures and are
 //! `Denied`: the creation rule here ([`check_new_binding`], whose proof is

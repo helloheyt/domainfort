@@ -1,11 +1,11 @@
 //! Error types.
 //!
-//! Hand-rolled (AGENTS.md §7; docs/45 §4 style). Fail closed: every broken
+//! Hand-rolled (docs/CLEAN-ROOM.md; docs/45 §4 style). Fail closed: every broken
 //! rule is a distinct variant, never a panic and never a silent repair
-//! (AGENTS.md §6; docs/32 §8).
+//! (docs/CLEAN-ROOM.md; docs/32 §8).
 //!
 //! Security: no variant carries attribute values, record bytes or key
-//! material — only identifiers and which rule failed (AGENTS.md §6
+//! material — only identifiers and which rule failed (docs/CLEAN-ROOM.md
 //! "secrets never appear in error messages").
 
 use crate::types::{AttrId, ClassId};

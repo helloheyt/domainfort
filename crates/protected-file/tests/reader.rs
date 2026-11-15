@@ -13,7 +13,7 @@
 //! the same `WrongOwner`.
 //!
 //! Sources: docs/50 §7.1 ("file root:0644"); docs/51 §4.3 step 8; A-86,
-//! A-96 (O_NOFOLLOW in every reader); AGENTS.md §6 (bounded reads). Test-only;
+//! A-96 (O_NOFOLLOW in every reader); docs/CLEAN-ROOM.md (bounded reads). Test-only;
 //! no vector from any other implementation.
 
 use std::io::ErrorKind;
@@ -137,7 +137,7 @@ fn owner_and_mode_are_checked() {
     }
 }
 
-// AGENTS.md §6: exactly the bound is read; one octet more is refused.
+// docs/CLEAN-ROOM.md: exactly the bound is read; one octet more is refused.
 #[test]
 fn the_bound_is_enforced() {
     let dir = Scratch::new("bound");

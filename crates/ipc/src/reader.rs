@@ -187,7 +187,7 @@ impl<'a> Reader<'a> {
     /// octets present can produce.
     ///
     /// Spec: docs/50 §3.3 ("`seq<T,max>` = `u32` count ≤ max + items");
-    /// AGENTS.md §6 (no unbounded allocation from attacker-supplied lengths).
+    /// docs/CLEAN-ROOM.md (no unbounded allocation from attacker-supplied lengths).
     pub fn read_seq<T>(
         &mut self,
         max: u32,
@@ -217,7 +217,7 @@ impl<'a> Reader<'a> {
     /// Run `read` one nesting level deeper, refusing to pass
     /// [`MAX_NESTING`].
     ///
-    /// Spec: AGENTS.md §6 (recursion-depth limits); docs/questions/Q-225 item 5.
+    /// Spec: docs/CLEAN-ROOM.md (recursion-depth limits); docs/questions/Q-225 item 5.
     fn nested<T>(&mut self, read: impl FnOnce(&mut Reader<'a>) -> Result<T>) -> Result<T> {
         if self.depth >= MAX_NESTING {
             return Err(Error::NestingTooDeep);

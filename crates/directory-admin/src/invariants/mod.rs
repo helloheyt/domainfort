@@ -2,7 +2,7 @@
 //! online write PEP's `apply` and `provision domain`'s store builder alike
 //! (docs/52 §3.14, class C14; task R13, decision A-102).
 //!
-//! # The class and the root-level change (AGENTS.md §6.1)
+//! # The class and the root-level change (docs/CLEAN-ROOM.md)
 //!
 //! **Class C14 — a write invariant enforced on only one of the write
 //! paths.** The [MS-SAMR] constraints (A-79), the name rules, the groupType
@@ -80,7 +80,7 @@
 //! without the others exactly: a chain or a closure through two new links
 //! into one group would pass through that group twice, i.e. close a cycle.
 //!
-//! Spec: docs/52 §3.14, §7 (R13); AGENTS.md §6.1; A-79, A-83, A-89, A-92,
+//! Spec: docs/52 §3.14, §7 (R13); docs/CLEAN-ROOM.md; A-79, A-83, A-89, A-92,
 //! A-95, A-102; docs/51 §4.3 step 5, §5.2, §8.3, §11; docs/46 §4.4, §5.4,
 //! §8.2-§8.5; docs/47 §5.3; [MS-SAMR] v20260427 2.2.1.14, 3.1.1.6,
 //! 3.1.1.8.9, 3.1.1.9.2; docs/questions/Q-298, Q-355..Q-358, Q-376, Q-416,

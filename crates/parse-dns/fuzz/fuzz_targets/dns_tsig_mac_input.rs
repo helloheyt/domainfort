@@ -2,7 +2,7 @@
 //! Fuzz target for the TSIG MAC input components (docs/54 §10.3
 //! `dns_tsig_mac_input`).
 //!
-//! AGENTS.md §6 requires a fuzz target for every parser before it merges to
+//! docs/CLEAN-ROOM.md requires a fuzz target for every parser before it merges to
 //! `main`. For every input that decodes with a TSIG RR under a request
 //! profile:
 //!

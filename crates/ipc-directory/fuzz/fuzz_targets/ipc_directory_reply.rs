@@ -6,7 +6,7 @@
 //! request (`into_client`, `into_service`, `into_groups`, `into_tier`,
 //! `into_domain`, `into_view_begun`), every value through its strict decoder.
 //!
-//! AGENTS.md §6 / docs/50 §9 (R50-19: "the client decodes replies");
+//! docs/CLEAN-ROOM.md / docs/50 §9 (R50-19: "the client decodes replies");
 //! docs/50 §3.3 ("replies are decoded with the same strictness"): never a
 //! panic; whatever decodes re-encodes to exactly the input.
 //!

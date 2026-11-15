@@ -1,7 +1,7 @@
 #![no_main]
 //! Fuzz target for the RFC 3244 reply framing.
 //!
-//! AGENTS.md §6 / docs/32 §8 / docs/53 §5.9 require a fuzz target for every
+//! docs/CLEAN-ROOM.md / docs/32 §8 / docs/53 §5.9 require a fuzz target for every
 //! parser before it merges to `main`; replies are decoded as strictly as
 //! requests (docs/07 §5, docs/50 §3.3). Arbitrary bytes are fed to
 //! `ReplyMessage::parse` and `ReplyMessage::parse_tcp`: none may panic, hang

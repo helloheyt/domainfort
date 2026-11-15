@@ -147,16 +147,16 @@
 //! # Provenance
 //!
 //! Written only from this project's decided design, opened in-session:
-//! AGENT-ONBOARDING, AGENTS, docs/51 (§5, §7, §9, §12), docs/50 (§2.4,
-//! §3.1-§3.7, §7.5, §8, §9, the channel-magic registry), docs/10 (§2, §5ב,
-//! §7א), docs/questions Q-230, Q-270, Q-290, Q-292, Q-340, Q-341, Q-350,
+//! docs/CLEAN-ROOM.md, docs/CLEAN-ROOM.md, docs/51 (§5, §7, §9, §12), docs/50 (§2.4,
+//! §3.1-§3.7, §7.5, §8, §9, the channel-magic registry), docs/10 (§2, §5b,
+//! §7a), docs/questions Q-230, Q-270, Q-290, Q-292, Q-340, Q-341, Q-350,
 //! Q-351, Q-355..Q-358 and PENDING-OWNER (A-26, A-55, A-56, A-59, A-63,
 //! A-64, A-70, A-72, A-73, A-85, A-87, A-89); the public API of this
 //! project's crates ipc, dtyp, keyd-types, krb-proto, ipc-keyd (and
 //! ipc-directory / ipc-ldap as the pattern); and the docs.rs API pages of
 //! rustix 1.1.6 and zeroize 1.9.1 (P-2). No other implementation,
 //! management plane, serializer or RPC framework was consulted or recalled
-//! (AGENTS.md §1-3). The operation digest (R2) is written from RFC 4120 §4,
+//! (docs/CLEAN-ROOM.md). The operation digest (R2) is written from RFC 4120 §4,
 //! §5.5.1, §7.5.1 (pinned copy, SHA-256 verified), docs/52 §3.2, §5 and
 //! docs/questions/Q-463 (A-102), calling the approved `sha2` through the
 //! one-shot `Digest::digest` this project's crates already use.

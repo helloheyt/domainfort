@@ -19,7 +19,7 @@
 //! INTEGER / OBJECT IDENTIFIER / tag-number encodings, and no trailing data.
 //! Every deviation is a distinct [`Error`] — the decoder never panics, never
 //! loops unbounded, and never allocates from an attacker-controlled length
-//! without first bounding it against the input (AGENTS.md §6; docs/32 §8).
+//! without first bounding it against the input (docs/CLEAN-ROOM.md; docs/32 §8).
 //! Nesting is capped at [`MAX_DEPTH`]. The encoder refuses to emit a
 //! non-canonical value, so `encode(decode(x)) == x` for canonical input and
 //! `decode(encode(v)) == v`.
@@ -37,7 +37,7 @@
 //!
 //! # Provenance
 //!
-//! Written only from the allowed specifications, opened in-session (AGENTS.md
+//! Written only from the allowed specifications, opened in-session (docs/CLEAN-ROOM.md
 //! §1-3): ITU-T X.690 (02/2021) — BER/CER/DER encoding rules; ITU-T X.680
 //! (02/2021) — ASN.1 types and the universal class tag assignments; and
 //! RFC 4120 §5 — the Kerberos ASN.1 module (the subset to implement). No other

@@ -579,7 +579,7 @@ fn name_value_rules() {
 #[test]
 fn debug_output_never_shows_mac_key_name_or_octets() {
     // Source: docs/54 §9 ("never in a log: message octets, GSS tokens, MICs …
-    // raw key_name"); AGENTS.md §6. `Debug` of the decoded types shows only
+    // raw key_name"); docs/CLEAN-ROOM.md `Debug` of the decoded types shows only
     // lengths for these fields.
     let alg = name("gss-tsig");
     let mac = [0xE7u8; 28];

@@ -13,7 +13,7 @@
 //!    R50-3).
 //! 2. **Quota.** At most [`MAX_CONNECTIONS_PER_SOURCE`] connections per
 //!    mapped source, so no sender can make auditd hold unbounded frame
-//!    buffers (AGENTS.md §6). Over the quota: closed, no reply, counted.
+//!    buffers (docs/CLEAN-ROOM.md). Over the quota: closed, no reply, counted.
 //! 3. **Frames.** `ipc::FrameReader` with the channel's request bound: the
 //!    declared length is checked before any body octet is allocated or
 //!    awaited, and no more octets are read than the current frame needs, so

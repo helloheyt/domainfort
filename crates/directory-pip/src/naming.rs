@@ -52,7 +52,7 @@ pub const NC_RDN_ATTRIBUTE: &str = "dc";
 
 /// Most labels in the naming context's DN (project choice): every object's
 /// DN, NC suffix included, is bounded by [`crate::MAX_DN_DEPTH`], so the
-/// suffix may use only part of that depth. Spec: AGENTS.md §6 (bounds);
+/// suffix may use only part of that depth. Spec: docs/CLEAN-ROOM.md (bounds);
 /// docs/49 §2.4.
 pub const MAX_NC_LABELS: usize = 16;
 

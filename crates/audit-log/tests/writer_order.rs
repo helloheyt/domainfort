@@ -4,7 +4,7 @@
 //!
 //! Source: docs/50 R50-17 ("processes deliver events in a bounded window and
 //! wait for persistence acknowledgements"), §8.1 ("auditd acknowledges the
-//! last sequence number persisted"); AGENTS.md §6 (fail closed);
+//! last sequence number persisted"); docs/CLEAN-ROOM.md (fail closed);
 //! docs/questions/Q-250 item 7.
 
 mod common;

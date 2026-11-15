@@ -29,7 +29,7 @@
 //!   and the uid that record came from;
 //! * the **remembered events**: the `source_seq`, the SHA-256 of the payload
 //!   (through crates/audit-log [`RecordHash::of`], the approved `sha2`
-//!   crate — AGENTS.md §6) and, where known, the chain head of the record
+//!   crate — docs/CLEAN-ROOM.md) and, where known, the chain head of the record
 //!   holding it, for the source's last [`REMEMBERED_EVENTS`] events. A byte
 //!   comparison needs the persisted octets or a collision-resistant digest
 //!   of them; the digest keeps the state small.

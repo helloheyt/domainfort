@@ -75,7 +75,7 @@
 //! record. Written only from r5-a (§3.3, §11 MA3), docs/questions/Q-874,
 //! PENDING-OWNER A-36, A-147, docs/47 §4-§6 and this crate's own code
 //! (interpretations in docs/questions/Q-980..Q-984). No other
-//! implementation was consulted or recalled (AGENTS.md §1-3).
+//! implementation was consulted or recalled (docs/CLEAN-ROOM.md).
 //!
 //! # Residuals and follow-ups (documented, not hidden)
 //!
@@ -112,7 +112,7 @@
 //! A-55, A-89, A-102, docs/questions/Q-200 and Q-358, and [MS-ADTS]
 //! v20261026 3.1.1.4.3 and 5.1.3.3.6 (pinned PDF, SHA-256 55b59eb1…b2b1
 //! verified), with this repository's ldap and directory-admin code. No other
-//! implementation was consulted or recalled (AGENTS.md §1-3).
+//! implementation was consulted or recalled (docs/CLEAN-ROOM.md).
 //!
 //! Spec: docs/47 §1-§12; docs/11 §6; docs/06 §8-§10.
 

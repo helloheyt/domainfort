@@ -100,7 +100,7 @@ pub use directory_admin::{CHANGE_SEQ_END_EXCLUSIVE, CHANGE_SEQ_FIRST};
 
 /// The integrity key: wiped on drop, never printed.
 /// Spec: docs/51 §4.3 step 4, §4.4 ("the integrity key only in the 0400
-/// file"); AGENTS.md §6 (secrets never in logs or debug output).
+/// file"); docs/CLEAN-ROOM.md (secrets never in logs or debug output).
 pub(crate) struct IntegrityKeyMaterial(Zeroizing<[u8; INTEGRITY_KEY_LEN]>);
 
 impl IntegrityKeyMaterial {
@@ -552,7 +552,7 @@ impl Plan {
             rid_dc,
         ));
         // The service objects: one SPN each, host in lower case (docs/10
-        // §5ב / A-46; RFC 4120 §6.2.1 as cited in docs/47 §1.3); WT
+        // §5b / A-46; RFC 4120 §6.2.1 as cited in docs/47 §1.3); WT
         // (docs/51 §4.3 step 5); the admin class per A-73.
         specs.push(computer(
             ObjectRole::LdapService,

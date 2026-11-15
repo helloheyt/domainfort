@@ -1,5 +1,5 @@
 //! Guard of docs/52 R2b (class: one fact derived in two places — a
-//! divergence that fails open or closed by luck; AGENTS.md §6.1): the
+//! divergence that fails open or closed by luck; docs/CLEAN-ROOM.md): the
 //! purpose of a service object's key set is derived from the service's name
 //! in exactly one place, `KeyPurpose::of_service_name` (crate keyd-types
 //! `model.rs`), which `ServiceKeyHandle::of_service` — the only constructor
@@ -33,7 +33,7 @@
 //! cannot pass vacuously.
 //!
 //! Source: docs/52 §3.2, §5 item 3, R2b; docs/questions/Q-491 item 1, Q-493
-//! item 1; AGENTS.md §6.1 ("a single chokepoint", "a type that can only be
+//! item 1; docs/CLEAN-ROOM.md ("a single chokepoint", "a type that can only be
 //! built after the check"). Test-only; modelled on crates/directory-admin
 //! tests/single_write_path.rs.
 

@@ -21,7 +21,7 @@ use crate::enctype::{s2k_iteration_count, EncTypeId};
 use crate::error::ConfigError;
 use krb_proto::{Realm, TicketFlags};
 
-/// Upper bound for every table capacity (memory bound, AGENTS.md §6).
+/// Upper bound for every table capacity (memory bound, docs/CLEAN-ROOM.md).
 pub const MAX_TABLE_CAPACITY: usize = 1 << 20;
 
 /// Upper bound for the clock-skew window, in seconds.
@@ -520,7 +520,7 @@ mod tests {
     }
 
     /// The armor table and the preauth throttle are bounded and validated
-    /// like the other tables (docs/48 §9.1 I4; A-34; AGENTS.md §6).
+    /// like the other tables (docs/48 §9.1 I4; A-34; docs/CLEAN-ROOM.md).
     #[test]
     fn armor_table_and_preauth_throttle_are_validated() {
         let mut c = base();
@@ -541,7 +541,7 @@ mod tests {
     }
 
     /// The service-context table is bounded and validated like the other
-    /// token tables (docs/49 §3.3, A-46; AGENTS.md §6).
+    /// token tables (docs/49 §3.3, A-46; docs/CLEAN-ROOM.md).
     #[test]
     fn service_context_table_is_validated() {
         let mut c = base();

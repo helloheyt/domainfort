@@ -46,7 +46,7 @@ use krb_proto::{
 use zeroize::Zeroizing;
 
 /// Why a value could not cross between the typed and the wire form. Carries
-/// no octet of the value (AGENTS.md §6; docs/50 §8.2: "IPC errors carry a
+/// no octet of the value (docs/CLEAN-ROOM.md; docs/50 §8.2: "IPC errors carry a
 /// code, not content").
 ///
 /// Spec: docs/50 §3.3, §8.2.
@@ -182,7 +182,7 @@ fn binding(wire: &WireBinding) -> Converted<PrincipalBinding> {
 
 /// A password or candidate passed to keyd: zeroizing text whose `Debug`
 /// prints nothing. No `Clone` (no silent second copy).
-/// Spec: docs/10 §6, I7; docs/50 §8.2; AGENTS.md §6.
+/// Spec: docs/10 §6, I7; docs/50 §8.2; docs/CLEAN-ROOM.md
 pub struct Password(Zeroizing<String>);
 
 impl Password {
@@ -218,7 +218,7 @@ impl fmt::Debug for Password {
 // ===========================================================================
 
 /// The FAST part of an `open_and_verify_tgt` call, owned.
-/// Spec: docs/10 §5א (`TgsFastRequest`).
+/// Spec: docs/10 §5a (`TgsFastRequest`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TgsFast {
     /// The raw PA-TGS-REQ padata-value octets.
@@ -230,7 +230,7 @@ pub struct TgsFast {
 /// One keyd call with its typed arguments — everything but the caller and
 /// `now`, which the server takes from the transport and from its own clock.
 ///
-/// Spec: docs/50 §3.4, R50-3, R50-5; docs/10 §4-§7א; A-56.
+/// Spec: docs/50 §3.4, R50-3, R50-5; docs/10 §4-§7a; A-56.
 #[derive(Debug)]
 pub enum Call {
     /// Spec: docs/10 §4.
@@ -255,7 +255,7 @@ pub enum Call {
         /// The ticket template.
         template: AsTicketTemplate,
     },
-    /// Spec: docs/10 §5א.
+    /// Spec: docs/10 §5a.
     OpenFastArmor {
         /// Krbtgt handle.
         krbtgt: KeyHandle,
@@ -284,7 +284,7 @@ pub enum Call {
         /// The ticket template.
         template: TgsTicketTemplate,
     },
-    /// Spec: docs/10 §5א.
+    /// Spec: docs/10 §5a.
     SealFastError {
         /// The armored conversation.
         conversation: FastConversation,
@@ -293,7 +293,7 @@ pub enum Call {
         /// The KrbFastResponse padata.
         padata: Vec<PaData>,
     },
-    /// The unbound verification (the LDAP front). Spec: docs/10 §5ב;
+    /// The unbound verification (the LDAP front). Spec: docs/10 §5b;
     /// docs/52 §5 item 3 (R2: keyd derives the key set's purpose from the
     /// binding); docs/questions/Q-523.
     OpenAndVerifyServiceTicket {
@@ -303,7 +303,7 @@ pub enum Call {
         ap_req_octets: Vec<u8>,
     },
     /// The operation-bound verification (dird's admin channel): keeps no
-    /// service context. Spec: docs/10 §5ב; docs/52 §5 items 3-4;
+    /// service context. Spec: docs/10 §5b; docs/52 §5 items 3-4;
     /// docs/questions/Q-523.
     VerifyOperationTicket {
         /// The admin service key set's principal.
@@ -361,9 +361,9 @@ pub enum Call {
         /// The decision id.
         decision: DecisionId,
     },
-    /// Spec: docs/10 §7א.
+    /// Spec: docs/10 §7a.
     DescribeConfig,
-    /// Spec: docs/10 §7א.
+    /// Spec: docs/10 §7a.
     Ping,
     /// Spec: docs/51 §5.8 option (b); docs/questions/Q-450.
     GrantSetSecret {
@@ -1110,7 +1110,7 @@ fn proof(wire: &WireAuthnProof) -> Converted<AuthnProof> {
 /// `describe_config` (docs/10 §2) and which the description alone does not
 /// distinguish. The `Ping` answer carries the same role for every role.
 ///
-/// Spec: docs/10 §2, §7א; docs/50 §3.4 (`DescribeConfig`), §3.7;
+/// Spec: docs/10 §2, §7a; docs/50 §3.4 (`DescribeConfig`), §3.7;
 /// docs/questions/Q-351 (A-87).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DescribedConfig {
@@ -1128,17 +1128,17 @@ pub enum Answer {
     VerifyPreauth(Result<AuthnProof, AuthnError>),
     /// Spec: docs/10 §4.
     IssueAsRep(Result<AsRepParts, IssueError>),
-    /// Spec: docs/10 §5א.
+    /// Spec: docs/10 §5a.
     OpenFastArmor(Result<FastArmor, AuthnError>),
     /// Spec: docs/10 §5.
     OpenAndVerifyTgt(Result<TgtContext, AuthnError>),
     /// Spec: docs/10 §5.
     IssueTgsRep(Result<TgsRepParts, IssueError>),
-    /// Spec: docs/10 §5א.
+    /// Spec: docs/10 §5a.
     SealFastError(Result<EncryptedData, keyd_types::Error>),
-    /// Spec: docs/10 §5ב.
+    /// Spec: docs/10 §5b.
     OpenAndVerifyServiceTicket(Result<ServiceContext, AuthnError>),
-    /// Spec: docs/10 §5ב; docs/questions/Q-523.
+    /// Spec: docs/10 §5b; docs/questions/Q-523.
     VerifyOperationTicket(Result<OperationTicket, AuthnError>),
     /// Spec: docs/10 §6.
     SetSecret(Result<Kvno, keyd_types::Error>),
@@ -1155,14 +1155,14 @@ pub enum Answer {
     /// Spec: docs/10 §7.
     DestroyKeySet(Result<(), keyd_types::Error>),
     /// keyd's description and the caller's role ([`DescribedConfig`]).
-    /// Spec: docs/10 §7א; docs/questions/Q-351 (A-87).
+    /// Spec: docs/10 §7a; docs/questions/Q-351 (A-87).
     DescribeConfig(Result<DescribedConfig, keyd_types::Error>),
     /// keyd's health answer: on success the role keyd resolved for the
     /// caller from the connection's peer uid (reported, never claimed —
     /// the server side fills it from the `CallerId` keyd authorized the
     /// call with). Every role may ping, so this is how a client of any
     /// role verifies its own role (task R9).
-    /// Spec: docs/10 §2, §7א; docs/questions/Q-403 option (c), Q-466 item
+    /// Spec: docs/10 §2, §7a; docs/questions/Q-403 option (c), Q-466 item
     /// 2 (A-102).
     Ping(Result<Role, keyd_types::Error>),
     /// Spec: docs/51 §5.8 option (b); docs/questions/Q-450.

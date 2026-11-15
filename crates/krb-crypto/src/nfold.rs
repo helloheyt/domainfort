@@ -21,7 +21,7 @@ use crate::error::{Error, Result};
 
 /// Upper bound, in octets, on both the input and the output of [`n_fold`].
 ///
-/// Resource bound only (AGENTS.md §6: no unbounded work from an input
+/// Resource bound only (docs/CLEAN-ROOM.md: no unbounded work from an input
 /// length); it is not a value from the specification. It comfortably covers
 /// every RFC 3961 Appendix A.1 vector and every in-crate use.
 pub const N_FOLD_MAX_OCTETS: usize = 64;

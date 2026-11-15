@@ -1,7 +1,7 @@
 #![no_main]
 //! Fuzz target for `parse_ldap::frame_length`, the TCP stream framer.
 //!
-//! AGENTS.md §6 / docs/32 §8 (docs/49 §2.5: "arbitrary bytes → framer →
+//! docs/CLEAN-ROOM.md / docs/32 §8 (docs/49 §2.5: "arbitrary bytes → framer →
 //! decode; never a panic, bounded allocation"). The buffer is treated as a
 //! byte stream: every complete frame the framer reports must lie inside the
 //! buffer and within the session bound, and is then decoded as a request

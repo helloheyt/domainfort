@@ -1,7 +1,7 @@
 //! AES in CBC mode with ciphertext stealing (CTS): the basic encryption and
 //! decryption functions E and D of the AES Kerberos encryption types.
 //!
-//! The AES block cipher itself comes from the approved `aes` crate (AGENTS.md
+//! The AES block cipher itself comes from the approved `aes` crate (docs/CLEAN-ROOM.md
 //! §6: we never implement a primitive). This module only composes the
 //! Kerberos-specified mode on top of the single-block AES operations, exactly
 //! as RFC 3962 §5 describes it:

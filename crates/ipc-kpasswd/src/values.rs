@@ -1,6 +1,6 @@
 //! The channel's value types. Each one can hold only a value the channel
 //! admits, so a value that would be refused on the wire cannot be built in
-//! the first place (AGENTS.md §6.1 — unrepresentable states), and the
+//! the first place (docs/CLEAN-ROOM.md — unrepresentable states), and the
 //! decoder and the constructors apply the same rules.
 //!
 //! # No password, by type
@@ -380,7 +380,7 @@ impl SealedReply {
 /// codes (MALFORMED, BAD_VERSION) never cross this channel. SUCCESS is not
 /// representable (RFC 3244 §2: not allowed in a KRB-ERROR).
 ///
-/// **Class closed (AGENTS.md §6.1):** "an unauthenticated reply carrying a
+/// **Class closed (docs/CLEAN-ROOM.md):** "an unauthenticated reply carrying a
 /// code that should have been sealed" — a compromised dird answering, say,
 /// ACCESSDENIED in a KRB-ERROR where keyd's sealed verdict was due; root
 /// option taken: the type has no such value.

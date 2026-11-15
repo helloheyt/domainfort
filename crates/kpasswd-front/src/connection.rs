@@ -8,7 +8,7 @@
 //!    precedes the message and specifies the length of the message" (RFC
 //!    3244 §2) — is read and bounded with parse-kpasswd's
 //!    `tcp_message_length` **before** any buffer for the message exists
-//!    (docs/53 §5.1: "0 or > 65,535 ⇒ … before allocation"; AGENTS.md §6).
+//!    (docs/53 §5.1: "0 or > 65,535 ⇒ … before allocation"; docs/CLEAN-ROOM.md).
 //!    Out of range ⇒ the KRB-ERROR of `Error::result_code` (MALFORMED) and
 //!    close.
 //! 2. **The message**: exactly the announced octets, into a zeroizing buffer

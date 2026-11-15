@@ -1,5 +1,5 @@
 #![no_main]
-//! Fuzz target `ipc_kpasswd_reply` (docs/53 §5.9; AGENTS.md §6): the
+//! Fuzz target `ipc_kpasswd_reply` (docs/53 §5.9; docs/CLEAN-ROOM.md): the
 //! front's decoding of an arbitrary reply body of the kpasswd-front ↔ dird
 //! channel. The checks are in `../bodies/ipc_kpasswd_reply.rs`, shared with
 //! the crate's `tests/fuzz_bodies.rs`. Written, not run (PENDING-OWNER P-1).

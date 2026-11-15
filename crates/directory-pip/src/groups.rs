@@ -15,7 +15,7 @@
 //!   [MS-DRSR] 4.1.8.1.5);
 //! - **a cycle is an error**: the management plane refuses a `member` write
 //!   that closes a cycle, so one found here comes from an inconsistent or
-//!   replayed store (P-7) — fail closed (AGENTS.md §6).
+//!   replayed store (P-7) — fail closed (docs/CLEAN-ROOM.md).
 //!
 //! The walk is a depth-first search with "on the current path" / "done"
 //! marks: reaching an on-path group is a cycle; reaching a done group reuses

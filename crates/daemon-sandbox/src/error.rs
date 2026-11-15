@@ -1,6 +1,6 @@
 //! Typed errors. Every message is a fixed string plus, for an operating-system
 //! failure, the numeric error code — never a path, a value read from a file,
-//! or anything a caller supplied (AGENTS.md §6 "secrets never in errors";
+//! or anything a caller supplied (docs/CLEAN-ROOM.md "secrets never in errors";
 //! docs/50 §8.2 "IPC errors carry a code, not content").
 
 use std::fmt;

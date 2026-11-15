@@ -55,7 +55,7 @@
 //! Every count, size and offset is checked against the input before it is
 //! used; nothing is allocated from an attacker-controlled count without such a
 //! bound; there is no recursion. Every violated rule is a distinct [`Error`]
-//! (fail closed — AGENTS.md §6; docs/32 §8). Where the text needed a reading,
+//! (fail closed — docs/CLEAN-ROOM.md; docs/32 §8). Where the text needed a reading,
 //! the reading is recorded in `docs/questions/` (Q-020 to Q-025, resolved).
 //!
 //! The encoder is canonical and refuses values the decoder would reject, so
@@ -73,7 +73,7 @@
 //! and 2.5.1.4 (worked example); and RFC 5234 (STD 68, January 2008) §2.3 and
 //! Appendix B.1, which [MS-DTYP] 2.4.2.1 cites for its grammar, read from
 //! www.rfc-editor.org. No other implementation was consulted or recalled
-//! (AGENTS.md §1-3).
+//! (docs/CLEAN-ROOM.md).
 //!
 //! CreateSecurityDescriptor (task A2 of docs/51 §12) was added from the same
 //! pinned [MS-DTYP] PDF, opened in that session: 2.4.1 (CREATOR_SID_AUTHORITY),

@@ -2,14 +2,14 @@
 //! Fuzz target for `provision-manifest`, the strict provisioning-manifest
 //! parser.
 //!
-//! AGENTS.md §6 (every parser gets a fuzz target before it merges to
+//! docs/CLEAN-ROOM.md (every parser gets a fuzz target before it merges to
 //! main); docs/50 §9 (fuzz targets in detached workspaces until P-1). On
 //! any octets `Manifest::parse` must return without panicking, and:
 //!
 //! * input over the size bound, or not ending in LF, is refused (docs/50
 //!   §7.1);
 //! * an error names, at most, a key of the closed table — never input text
-//!   (AGENTS.md §6; A-60);
+//!   (docs/CLEAN-ROOM.md; A-60);
 //! * an accepted manifest came from printable ASCII and LF only (docs/50
 //!   §7.1; P-6);
 //! * an accepted manifest encodes to text that parses back to the same

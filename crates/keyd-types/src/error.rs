@@ -32,9 +32,9 @@
 //!
 //! Spec: docs/10 §9 (`AuthnError { Denied }`, `IssueError { Denied,
 //! BadTemplate }`, `Error { Denied, Unavailable, RateLimited }`) as amended by
-//! A-26 and A-56; docs/09 א.3 (5) uniform errors; RFC 4120 3.2.3, 3.3.2 (the
+//! A-26 and A-56; docs/09 A.3 (5) uniform errors; RFC 4120 3.2.3, 3.3.2 (the
 //! codes these classes correspond to); docs/50 R50-6, R50-8, §3.5, §3.7;
-//! AGENTS.md §6 (no secrets in errors).
+//! docs/CLEAN-ROOM.md (no secrets in errors).
 
 use core::fmt;
 

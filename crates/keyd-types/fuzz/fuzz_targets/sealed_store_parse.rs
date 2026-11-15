@@ -1,7 +1,7 @@
 #![no_main]
 //! Fuzz target for the sealed key store's persisted format (task KL1).
 //!
-//! AGENTS.md §6 / docs/32 §8 require a fuzz target for every parser before
+//! docs/CLEAN-ROOM.md / docs/32 §8 require a fuzz target for every parser before
 //! it merges to `main`; a key-store file is untrusted when read back (r4-c
 //! §3.6: whoever can write the disk can change it). Arbitrary bytes are fed
 //! to `KeyRecord::parse` and `ParsedHeader::parse`, and — for an accepted
@@ -15,7 +15,7 @@
 //! The suite registry here is fuzz data (two codes with distinct lengths):
 //! no suite is registered in the product yet (docs/questions/Q-906).
 //!
-//! Spec: docs/research/r4-c-key-lifecycle.md §3.3, §3.6, §8.3; AGENTS.md §6.
+//! Spec: docs/research/r4-c-key-lifecycle.md §3.3, §3.6, §8.3; docs/CLEAN-ROOM.md
 
 use keyd_types::sealed_store::{
     encode_header, encode_record, parse_body, KeyRecord, ParsedHeader, SealingSuite,

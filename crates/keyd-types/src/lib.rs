@@ -51,7 +51,7 @@
 //! count rule, written from RFC 3961 §8, RFC 3962 §4, §7 and RFC 8009 §4, §7
 //! (pinned copies in tools/spec-pin/cache, SHA-256 verified against the
 //! manifest), opened in-session. No other implementation was consulted or
-//! recalled (AGENTS.md §1-3).
+//! recalled (docs/CLEAN-ROOM.md).
 //!
 //! The decision table's vocabulary ([`decision`], A-102) is written from
 //! this project's docs/52 §3.1, §3.4, §4 and docs/questions/Q-460..Q-462,

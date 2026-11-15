@@ -57,7 +57,7 @@
 //! controls check that each scan finds what it must and would see a planted
 //! violation.
 //!
-//! Source: docs/52 §3.18, §7 R15; AGENTS.md §6.1 ("a single chokepoint";
+//! Source: docs/52 §3.18, §7 R15; docs/CLEAN-ROOM.md ("a single chokepoint";
 //! "removing the capability from the component that should not have it");
 //! the precedent crates/directory-admin `tests/single_write_path.rs` (R13)
 //! and crates/ipc-keyd-server's `loopback` feature (docs/questions/Q-500).

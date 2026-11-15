@@ -1,5 +1,5 @@
 name: ci
-# CI של שלב 0 — שכבת האכיפה השלישית (docs/01-cleanroom.md). נכשל = לא נכנס ל-main.
+# Phase-0 CI — the third enforcement layer (docs/CLEAN-ROOM.md, "Enforcement"). A failure does not merge into main.
 on:
   pull_request:
   push:
@@ -17,20 +17,13 @@ jobs:
       - name: No vendored / foreign-licensed / copied code
         run: bash scripts/check-no-vendor.sh
 
-  sources-sync:
-    name: egress-allowlist ↔ SOURCES
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: bash scripts/check-sources-sync.sh
-
   specs-pinned:
     name: spec manifest integrity
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y jq
-      # מאמת שה-sha256 המוצמד עדיין תואם את המקור (docs/17 SV-*).
+      # Verifies that each pinned sha256 still matches its source (docs/CLEAN-ROOM.md, "Pinned specifications").
       - run: bash scripts/pin-specs.sh --verify
 
   deps:
@@ -47,8 +40,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with: { components: "rustfmt, clippy" }
-      # גייט אחד שמזהה workspace ריק (שלב 0) → no-op, ונכנס לתוקף אוטומטית עם
-      # ה-crate הראשון. (קודם לכן השלבים הישירים נכשלו על "no members".)
+      # One gate that recognises an empty workspace (phase 0) → no-op, and takes effect automatically with
+      # the first crate. (Before this, the direct steps failed on "no members".)
       - run: bash scripts/check-rust.sh
 
   sbom:
@@ -57,5 +50,5 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # no-op כל עוד אין crates; מפיק CycloneDX כשיהיו (D61, R13).
+      # no-op while there are no crates; produces CycloneDX once there are (D61, R13).
       - run: bash scripts/gen-sbom.sh

@@ -50,7 +50,7 @@
 //! PENDING-OWNER) and the public API of this project's crates ipc,
 //! ipc-directory, directory-pip, dirstore, kdc and pdp (ipc-keyd-server as
 //! the pattern). No other implementation, directory server or RPC framework
-//! was consulted or recalled (AGENTS.md §1-3).
+//! was consulted or recalled (docs/CLEAN-ROOM.md).
 
 use core::fmt;
 use core::time::Duration;

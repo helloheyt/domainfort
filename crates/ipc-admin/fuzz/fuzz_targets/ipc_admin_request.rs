@@ -6,7 +6,7 @@
 //! password as UTF-8 moved into a zeroizing buffer) — the path
 //! `ipc_admin::decode_request` takes in admind.
 //!
-//! AGENTS.md §6 / docs/50 §9: arbitrary bytes → decoder; never a panic,
+//! docs/CLEAN-ROOM.md / docs/50 §9: arbitrary bytes → decoder; never a panic,
 //! bounded allocation. Whatever decodes must re-encode to exactly the input
 //! (docs/50 §3.3: "a single encoding per value"), and a rejection maps to
 //! the refusal table (a shared `Refused`, or a close without a reply).

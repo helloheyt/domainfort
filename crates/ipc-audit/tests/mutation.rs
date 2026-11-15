@@ -4,7 +4,7 @@
 //! never a second encoding.
 //!
 //! Source: docs/50 §3.3 (strict decoding; "every decoder checks
-//! `encode(decode(b)) == b`"), §9 (codec tests); AGENTS.md §6 (bounded
+//! `encode(decode(b)) == b`"), §9 (codec tests); docs/CLEAN-ROOM.md (bounded
 //! parsers; fuzz targets — this sweep is the deterministic complement of
 //! fuzz/).
 

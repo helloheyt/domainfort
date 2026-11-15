@@ -52,14 +52,14 @@
 //! v20261026 3.1.1.3.1.5.1, 6.1.1.2.7.52; RFC 4120 §3.2.3 ("does not imply
 //! authorization"); docs/questions/Q-601, Q-608, Q-662 (A-117, A-126).
 //!
-//! Written only from, opened in this session: AGENT-ONBOARDING, AGENTS,
+//! Written only from, opened in this session: docs/CLEAN-ROOM.md, docs/CLEAN-ROOM.md,
 //! docs/53 (whole), PENDING-OWNER (A-117, A-121, A-126, A-142, A-151, A-153,
 //! A-156, A-158, A-159), docs/questions Q-600..Q-609, Q-660..Q-664, Q-945,
 //! Q-955, docs/research/r3-e (§1-§3), the pinned RFC 3244 §2 (SHA-256
 //! `45b9130f…dec378`) and RFC 4120 §3.2.3 (`368d3cd1…f75b`), the pinned
 //! [MS-ADTS] v20261026 (`55b59eb1…b2b1`) 3.1.1.3.1.5.1 and 6.1.1.2.7.52, and
 //! this repository's own code. No other implementation was consulted or
-//! recalled (AGENTS.md §1-3).
+//! recalled (docs/CLEAN-ROOM.md).
 
 use dtyp::Guid;
 use ipc_audit::{AdminFailure, AdminRefusal, DecisionResult, DirAdminOperation, DirAdminStage};

@@ -922,7 +922,7 @@ pub fn decode_event(octets: &[u8]) -> Result<EventBody, EventError> {
 ///
 /// auditd uses it to refuse a shape from a source that may not send it
 /// (crate audit-daemon; docs/questions/Q-341) while keeping the payloads
-/// opaque, so no event parser is added to auditd (AGENTS.md §6).
+/// opaque, so no event parser is added to auditd (docs/CLEAN-ROOM.md).
 ///
 /// Spec: docs/50 §3.2 (the source comes from the transport), §3.3, §8.1;
 /// docs/51 §5.7; docs/questions/Q-341.

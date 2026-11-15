@@ -2,7 +2,7 @@
 //! (docs/49 §10.1, R49-14).
 //!
 //! Sources (each test names its own): docs/49 §10.1, §11 (the engine returns
-//! the audit event with the responses); AGENTS.md §6 (secrets never in logs,
+//! the audit event with the responses); docs/CLEAN-ROOM.md (secrets never in logs,
 //! panics, debug output or errors); RFC 4511 §4.2 (SaslCredentials).
 //! Hand-made requests.
 
@@ -48,7 +48,7 @@ fn exactly_one_event_per_message() {
     assert_eq!(after.action, ConnectionAction::Close);
 }
 
-/// AGENTS.md §6; docs/49 §10.1 ("no SASL tokens"): SASL credentials appear
+/// docs/CLEAN-ROOM.md; docs/49 §10.1 ("no SASL tokens"): SASL credentials appear
 /// nowhere in the outcome — not in a response, not in the audit event, not
 /// in any Debug output — on every path a SASL bind can take.
 #[test]

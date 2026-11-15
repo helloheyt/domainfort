@@ -65,7 +65,7 @@
 //!
 //! `#![forbid(unsafe_code)]`; no `unwrap`, `expect` or `panic!` outside
 //! tests. Nothing logged carries request octets, names, tickets or a
-//! peer-supplied string (AGENTS.md §6; docs/50 §8.2); the request buffers
+//! peer-supplied string (docs/CLEAN-ROOM.md; docs/50 §8.2); the request buffers
 //! never appear in `Debug` output.
 //!
 //! # Residuals (documented, not hidden)
@@ -90,7 +90,7 @@
 //! # Provenance
 //!
 //! Written only from this project's decided design, opened in-session:
-//! AGENT-ONBOARDING, AGENTS, docs/50 (R50-2, R50-3, R50-7..R50-9, R50-14,
+//! docs/CLEAN-ROOM.md, docs/CLEAN-ROOM.md, docs/50 (R50-2, R50-3, R50-7..R50-9, R50-14,
 //! R50-16, R50-17, R50-19; §2.4; §3.1-§3.7; §4.1; §6; §7.1, §7.2, §7.5; §8;
 //! §9; §10 P9; the channel registry), docs/07 §1, docs/questions Q-127 /
 //! Q-130 (A-39), Q-217 / Q-222 (A-56), Q-218 / Q-219 / Q-223 (A-57), Q-230
@@ -106,7 +106,7 @@
 //! `time::{timeout, sleep}`, `io::{AsyncReadExt, AsyncWriteExt}`) — API
 //! documentation only, never source (P-2). No other implementation, KDC,
 //! daemon, server framework or RPC system was consulted or recalled
-//! (AGENTS.md §1-3).
+//! (docs/CLEAN-ROOM.md).
 //!
 //! The shared gate, the proof of an acknowledged intent and the one stop
 //! flush (task R6, decision A-102) were written only from docs/52 (§2,
@@ -114,7 +114,7 @@
 //! PENDING-OWNER (A-85, A-87, A-88, A-93, A-102, A-105), docs/questions
 //! Q-313, Q-350, Q-365, Q-470, Q-471 and this repository's own code
 //! (docs/questions/Q-500..Q-503). No other implementation was consulted
-//! or recalled (AGENTS.md §1-3).
+//! or recalled (docs/CLEAN-ROOM.md).
 //!
 //! The KDC's audit event is converted to its wire shape here
 //! ([`kdc_event`], module `audit_convert`) since task IB1 moved it out of an

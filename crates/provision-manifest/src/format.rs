@@ -26,7 +26,7 @@
 //! Spec: docs/50 R50-15, §7.1 ("unknown / duplicate / missing-required key ⇒
 //! refuse"; "printable ASCII only"; "file ≤ 64 KiB, line ≤ 1024"; and its
 //! D96 citation: the same strict parser discipline for every
-//! deserialization); PENDING-OWNER P-6 (ASCII only), A-86; AGENTS.md §6.
+//! deserialization); PENDING-OWNER P-6 (ASCII only), A-86; docs/CLEAN-ROOM.md
 
 use crate::error::{Error, ErrorKind};
 use config::line_format::{Entries, LineError, LineErrorKind};

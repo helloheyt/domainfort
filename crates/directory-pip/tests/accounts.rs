@@ -59,7 +59,7 @@ fn exact_sam_account_name_hit() {
 
 /// docs/48 §3.1, §7.2 ("derived by the AccountSource from authoritative
 /// data: objectClass computer → BootstrapAllowed; everything else →
-/// Required"); Q-127 interim decision ((ב) = `kind` from objectClass; P-10):
+/// Required"); Q-127 interim decision ((b) = `kind` from objectClass; P-10):
 /// users are `User` / `Required`; computers — a workstation (WT) and a DC
 /// (ST) alike — are `Computer` / `BootstrapAllowed`.
 #[test]

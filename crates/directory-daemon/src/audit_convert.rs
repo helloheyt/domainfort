@@ -33,7 +33,7 @@
 //! the public API of crates/ldap (audit, engine), crates/pdp (model),
 //! crates/parse-ldap (error, message), crates/dtyp (sid, guid) and
 //! crates/krb-proto (basic). No other implementation was consulted or
-//! recalled (AGENTS.md §1-3).
+//! recalled (docs/CLEAN-ROOM.md).
 //!
 //! Spec: docs/50 §8.1, §8.2; docs/37 §2; docs/49 §10.1; docs/52 §7 R14;
 //! docs/questions/Q-252 items 3, 4. Decision: A-144; Q-851.

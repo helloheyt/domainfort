@@ -2,7 +2,7 @@
 //!
 //! Only the four AES encryption types and their four associated checksum
 //! types exist here. Any other number maps to an error: DES, 3DES, RC4 and the
-//! rest have no code path at all (AGENTS.md §6; docs/38 §2 "hard floor").
+//! rest have no code path at all (docs/CLEAN-ROOM.md; docs/38 §2 "hard floor").
 //!
 //! Spec: RFC 3962 §6, §7; RFC 8009 §5, §6, §7; RFC 3961 §2, §8.
 

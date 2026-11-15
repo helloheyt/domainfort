@@ -47,10 +47,10 @@
 //! Written only from RFC 3244 §2 (pinned, SHA-256 `45b9130f…dec378`, read in
 //! full), RFC 4120 §2.1, §3.2.3, §3.2.4, §3.2.5, §3.5.1, §3.5.2, §5.5.1,
 //! §5.5.2, §5.7.1, §7.1, §7.5.1, §7.5.3 (pinned, `368d3cd1…`), RFC 3961 §3,
-//! docs/53 §4-§9, docs/10 §5ב, §6א, §8 and docs/questions/Q-601, Q-603,
+//! docs/53 §4-§9, docs/10 §5b, §6a, §8 and docs/questions/Q-601, Q-603,
 //! Q-604, Q-605, Q-620 (A-117, A-121), opened in this session, and this
 //! crate's own code. No other implementation was consulted or recalled
-//! (AGENTS.md §1-3).
+//! (docs/CLEAN-ROOM.md).
 //!
 //! Spec: RFC 3244 §2; RFC 4120 2.1, 3.2.3, 3.2.4, 3.5.1, 3.5.2, 5.5.2, 5.7.1,
 //! 7.1, 7.5.1; docs/53 R53-5, R53-7, R53-8, R53-9, §5.3-§5.8; docs/10 §8.
@@ -325,7 +325,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// `s-address`; `now` keyd-daemon's own clock (R50-5).
     ///
     /// 1. Steps 1-11 of the **shared** service-ticket verification
-    ///    (`verify_service_ap_req`, docs/10 §5ב) with
+    ///    (`verify_service_ap_req`, docs/10 §5b) with
     ///    `AppBinding::ChangePassword`: Role::Ldap; the ChangePasswordService
     ///    key set of `service` (the binding's purpose); no USE-SESSION-KEY;
     ///    the A-19 binding to `kadmin/changepw`; keyd-drawn key versions
@@ -347,7 +347,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// the verdict's result code (outcome `Success`).
     ///
     /// Spec: RFC 3244 §2; RFC 4120 2.1, 3.2.3, 3.5.2, 5.5.1, 5.7.1, 7.1,
-    /// 7.5.1; docs/53 R53-7, R53-9, §5.3, §5.4, §5.5; docs/10 §5ב, §8, §9
+    /// 7.5.1; docs/53 R53-7, R53-9, §5.3, §5.4, §5.5; docs/10 §5b, §8, §9
     /// (A-26); docs/questions/Q-601 item 2, Q-603, Q-620 item 5 (A-117).
     #[allow(clippy::too_many_arguments)]
     pub fn open_change_password_request(
@@ -494,7 +494,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// Spec: RFC 3244 §2 ("The server then generates the appropriate
     /// keytypes from the password and stores them"); RFC 4120 3.2.4, 5.5.2,
     /// 5.7.1, 6.2; docs/53 R53-5, R53-7, R53-8, §4.4, §5.5, §6; docs/10 §6,
-    /// §6א, §10; docs/questions/Q-601 items 2, 5, Q-605 (A-117).
+    /// §6a, §10; docs/questions/Q-601 items 2, 5, Q-605 (A-117).
     pub fn complete_change_password(
         &mut self,
         caller: &CallerId,

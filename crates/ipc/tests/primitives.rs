@@ -6,7 +6,7 @@
 //! `bytes<max>` = `u32` length ≤ max + bytes; `seq<T,max>` = `u32` count ≤ max +
 //! items; enum = `u8` from a closed table" — "a single encoding per value";
 //! no-trailing-byte row; Kerberos values as `bytes<max>` holding DER), R50-4,
-//! and AGENTS.md §6 (recursion-depth limits) for the nesting bound.
+//! and docs/CLEAN-ROOM.md (recursion-depth limits) for the nesting bound.
 
 use ipc::{
     decode_payload, encode_payload, DerBlob, Error, FrameLimit, Reader, Secret, Writer, MAX_NESTING,

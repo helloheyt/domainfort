@@ -4,14 +4,14 @@
 #   18 aes256-cts-hmac-sha1-96      / cksumtype 16  (RFC 3962)
 #   19 aes128-cts-hmac-sha256-128   / cksumtype 19  (RFC 8009)
 #   20 aes256-cts-hmac-sha384-192   / cksumtype 20  (RFC 8009)
-# DES, 3DES, RC4 and every other enctype have NO code path (AGENTS.md §6).
+# DES, 3DES, RC4 and every other enctype have NO code path (docs/CLEAN-ROOM.md).
 #
 # Pure library: no I/O, no global state, no randomness (the confounder is a
 # caller-supplied parameter). Only `keyd` links this crate (compute-don't-give;
 # docs/09, docs/10).
 #
 # Written only from RFC 3961, RFC 3962, RFC 8009 and RFC 2040 §8 (the CTS
-# description RFC 3962 §5 references), opened in-session — AGENTS.md §1-3.
+# description RFC 3962 §5 references), opened in-session — docs/CLEAN-ROOM.md
 #
 # Dependencies: RustCrypto crates only (owner decision OD-9 / D180), linked,
 # never copied. Cryptographic primitives (AES, SHA-1, SHA-2, HMAC, PBKDF2) come
@@ -35,7 +35,7 @@ sha1 = { version = "0.11", default-features = false, features = ["zeroize"] }
 sha2 = { version = "0.11", default-features = false, features = ["zeroize"] }
 # PBKDF2 for string-to-key (RFC 3962 §4; RFC 8009 §4). Only the HMAC PRF API.
 pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
-# Zeroize key material on drop (AGENTS.md §6: secrets never linger).
+# Zeroize key material on drop (docs/CLEAN-ROOM.md: secrets never linger).
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
 
 [lints]

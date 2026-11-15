@@ -4,7 +4,7 @@
 //! closed kind table, fields, no trailing octet — then every Kerberos value
 //! through krb-proto's strict decoder, passwords and salt as UTF-8).
 //!
-//! AGENTS.md §6 / docs/50 §9 (R50-19): arbitrary bytes → decoder; never a
+//! docs/CLEAN-ROOM.md / docs/50 §9 (R50-19): arbitrary bytes → decoder; never a
 //! panic, bounded allocation. Whatever decodes must re-encode to exactly the
 //! input (docs/50 §3.3: "a single encoding per value"; "every decoder checks
 //! `encode(decode(b)) == b`"), and a rejection maps to the refusal table (a

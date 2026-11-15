@@ -20,7 +20,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 ///   that touches them is easy to audit.
 ///
 /// Spec: docs/50 §3.3 ("the `SetSecret`/`VerifySecret` body (password) is read
-/// into `Zeroizing` … in both sides"); R50-4; docs/10 I6, I7; AGENTS.md §6.
+/// into `Zeroizing` … in both sides"); R50-4; docs/10 I6, I7; docs/CLEAN-ROOM.md
 pub struct Secret {
     octets: Zeroizing<Vec<u8>>,
 }
@@ -46,7 +46,7 @@ impl Secret {
     }
 
     /// The secret octets. Named so every use is visible in review.
-    /// Spec: AGENTS.md §6 (secrets never in logs, panics or errors).
+    /// Spec: docs/CLEAN-ROOM.md (secrets never in logs, panics or errors).
     #[must_use]
     pub fn expose(&self) -> &[u8] {
         &self.octets

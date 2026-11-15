@@ -14,7 +14,7 @@
 //! calls, so it cannot pass vacuously, and that it would see a planted
 //! call.
 //!
-//! Source: docs/52 §3.14, §7 (R13); AGENTS.md §6.1 ("a single chokepoint
+//! Source: docs/52 §3.14, §7 (R13); docs/CLEAN-ROOM.md ("a single chokepoint
 //! through which the action must pass"); crate::invariants (directory-admin
 //! `src/invariants/mod.rs`). Test-only.
 

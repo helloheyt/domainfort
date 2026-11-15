@@ -1,6 +1,6 @@
 //! SID tests: packet representation and string form.
 //!
-//! Every vector names its source. Sources (AGENTS.md §3/§4.5): the string
+//! Every vector names its source. Sources (docs/CLEAN-ROOM.md/§4.5): the string
 //! forms listed in [MS-DTYP] v20241119 2.4.2.4 (well-known SIDs) and 2.4.1
 //! (identifier authorities), SID bytes that appear in the worked example of
 //! [MS-DTYP] 2.5.1.4, byte sequences hand-derived from [MS-DTYP] 2.4.2.1 /

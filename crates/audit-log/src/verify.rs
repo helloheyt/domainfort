@@ -3,7 +3,7 @@
 //!
 //! Reading is streaming and bounded: the header, then one record at a time,
 //! with the declared record length checked against [`MAX_RECORD_LEN`]
-//! **before** the body is allocated or read (AGENTS.md §6: no allocation from
+//! **before** the body is allocated or read (docs/CLEAN-ROOM.md: no allocation from
 //! an attacker-supplied length beyond the bound). A segment is never read as
 //! a whole.
 //!
@@ -102,7 +102,7 @@ pub enum BreakKind {
 
 /// The first break in a segment.
 ///
-/// No variant carries record octets (AGENTS.md §6; docs/50 §8.2).
+/// No variant carries record octets (docs/CLEAN-ROOM.md; docs/50 §8.2).
 ///
 /// Spec: docs/37 §2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

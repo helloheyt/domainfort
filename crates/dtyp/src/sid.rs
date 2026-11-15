@@ -13,7 +13,7 @@
 //! (2.4.6), as the 2.5.1.4 example shows.
 //!
 //! A SID is held in a fixed array of [`SID_MAX_SUB_AUTHORITIES`] entries, so
-//! decoding never allocates from the attacker-supplied count (AGENTS.md §6).
+//! decoding never allocates from the attacker-supplied count (docs/CLEAN-ROOM.md).
 
 use crate::error::{Error, Result};
 use crate::reader::Reader;

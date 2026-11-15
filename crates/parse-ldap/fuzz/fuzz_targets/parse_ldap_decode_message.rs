@@ -1,7 +1,7 @@
 #![no_main]
 //! Fuzz target for `parse_ldap::decode_message`.
 //!
-//! AGENTS.md §6 / docs/32 §8 require a fuzz target for every parser before it
+//! docs/CLEAN-ROOM.md / docs/32 §8 require a fuzz target for every parser before it
 //! merges to `main` (docs/49 §2.5). Arbitrary bytes are decoded as a request
 //! and as a response, under the wire and the canonical profiles, with both
 //! session bounds: none may panic, hang, or over-allocate — each fails closed

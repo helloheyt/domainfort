@@ -314,7 +314,7 @@ fn the_service_ticket_binding_is_a_closed_table() {
 /// bound to no operation, and the R2 present form (`01` ‖ 32 octets) is
 /// refused (`UnknownCode`). The operation-bound answer (0x95) carries the
 /// digest and no context id. Source: docs/50 §3.3 (closed tables, one
-/// encoding per value); docs/10 §5ב; docs/questions/Q-523.
+/// encoding per value); docs/10 §5b; docs/questions/Q-523.
 #[test]
 fn the_service_context_reply_names_no_operation() {
     let answer = samples::answers()
@@ -347,7 +347,7 @@ fn the_service_context_reply_names_no_operation() {
     assert_eq!(&body[4..8], &[0, 0, 0, 11], "EXAMPLE.ORG first");
 }
 
-/// docs/50 §3.3 (strict decoding; AGENTS.md §6: never panic on input): a
+/// docs/50 §3.3 (strict decoding; docs/CLEAN-ROOM.md: never panic on input): a
 /// one-octet mutation sweep over every sample request never panics, and
 /// every mutated body that is accepted re-encodes to exactly itself — no
 /// value has two encodings, through the wire and the krb-proto layers.
@@ -628,7 +628,7 @@ fn an_unknown_caller_role_is_refused() {
 
 /// docs/50 §3.3 (envelope `magic ‖ version ‖ kind ‖ payload`; "enum = `u8`
 /// from a closed table"; round trip), §3.4 (`Ping` — every role); docs/10
-/// §2, §7א; Q-466 item 2 (A-102: "caller role in Ping"): the `Ping` reply is
+/// §2, §7a; Q-466 item 2 (A-102: "caller role in Ping"): the `Ping` reply is
 /// the envelope (kind `0x90`) and one octet, the caller role, from the
 /// table of the `DescribeConfig` reply; each body decodes to that role and
 /// re-encodes to itself.

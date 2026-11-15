@@ -302,7 +302,7 @@ fn the_file_is_exactly_one_der_v3_certificate() {
     assert_eq!(refusal(oversized, key, now()), malformed(X509::TooLarge));
 }
 
-/// docs/50 §8.2; AGENTS.md §6: the refusal texts are fixed and name the
+/// docs/50 §8.2; docs/CLEAN-ROOM.md: the refusal texts are fixed and name the
 /// rule (and, for a malformed file, the field) — never an octet of the
 /// file or of the key.
 #[test]

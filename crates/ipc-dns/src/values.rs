@@ -1,6 +1,6 @@
 //! The channel's value types. Each one can hold only a value the channel
 //! admits, so a value that would be refused on the wire cannot be built in
-//! the first place (AGENTS.md §6.1 — unrepresentable states), and the
+//! the first place (docs/CLEAN-ROOM.md — unrepresentable states), and the
 //! decoder and the constructors apply the same rules.
 //!
 //! Spec: docs/54 §4.6; docs/research/r3-c-dns.md §4.1, §4.4 (A-140);

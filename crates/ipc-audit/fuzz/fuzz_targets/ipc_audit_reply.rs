@@ -3,7 +3,7 @@
 //! parses from auditd): `ipc_audit::decode_reply`, the shared `Refused`
 //! included.
 //!
-//! AGENTS.md §6 / docs/50 §9 (R50-19); docs/50 §3.3 ("replies are decoded
+//! docs/CLEAN-ROOM.md / docs/50 §9 (R50-19); docs/50 §3.3 ("replies are decoded
 //! with the same strictness"): never a panic; whatever decodes re-encodes to
 //! exactly the input; and a decoded `Ack` fed to a sender window that has a
 //! batch in flight is either applied (only when it names that batch's last

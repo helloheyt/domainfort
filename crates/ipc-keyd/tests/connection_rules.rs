@@ -35,7 +35,7 @@
 //!
 //! Sources: docs/50 R50-3, R50-7, R50-8, §3.3, §3.4 (`DescribeConfig` — Kdc,
 //! Ldap; `Ping` — every role), §3.6 (idle connections held; one deadline per
-//! call), §3.7, §7.5 step 4, §9; docs/10 §2, §7א, §10; docs/52 §3.10,
+//! call), §3.7, §7.5 step 4, §9; docs/10 §2, §7a, §10; docs/52 §3.10,
 //! §3.12, §7 R9; docs/questions/Q-311, Q-312 (A-82), Q-351 (A-87), Q-365,
 //! Q-367 (A-88), Q-403 option (c), Q-466 (A-102). Every value is
 //! constructed by hand (tests/samples).

@@ -230,7 +230,7 @@ pub struct AttributeDefinition {
     pub constraint: Option<ValueConstraint>,
     /// No two live objects may hold values with the same comparison key
     /// (docs/46 §8.5). Honoured always; nothing can switch it off at run time
-    /// (AGENTS.md §6).
+    /// (docs/CLEAN-ROOM.md).
     pub unique: bool,
     /// For an attribute that can name objects (a class's RDN attribute): the
     /// length in characters of `att` in the RDN form `att=val`, i.e. of the

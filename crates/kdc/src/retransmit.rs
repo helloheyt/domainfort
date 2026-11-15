@@ -22,7 +22,7 @@
 //! stored (a later identical request is then processed again and, for a TGS,
 //! refused by keyd's replay cache — fail closed, documented residual).
 //!
-//! Spec: RFC 4120 3.1.2, 3.3.2, 7.2.1; docs/10 D33; AGENTS.md §6 (bounded).
+//! Spec: RFC 4120 3.1.2, 3.3.2, 7.2.1; docs/10 D33; docs/CLEAN-ROOM.md (bounded).
 
 use crate::accounts::NamedPrincipal;
 use crate::audit::{ArmorAudit, Exchange};
@@ -80,7 +80,7 @@ impl RetransmitCache {
 
     /// Store `stored` as the reply to `request` until `expires_at`. Expired
     /// entries are evicted first; if the bounds still do not allow it, the
-    /// reply is not stored. Spec: RFC 4120 3.1.2; AGENTS.md §6.
+    /// reply is not stored. Spec: RFC 4120 3.1.2; docs/CLEAN-ROOM.md
     pub(crate) fn insert(
         &mut self,
         request: &[u8],
@@ -165,7 +165,7 @@ mod tests {
     }
 
     /// Bounded in entries and octets; expired entries make room
-    /// (AGENTS.md §6).
+    /// (docs/CLEAN-ROOM.md).
     #[test]
     fn bounds() {
         let mut cache = RetransmitCache::new(2, 1024);

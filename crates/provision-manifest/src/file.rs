@@ -20,7 +20,7 @@
 //! (the test account in tests, as provision's `root_uid`); [`read_manifest`]
 //! is that reader with owner 0.
 //!
-//! Spec: docs/51 §4.3 step 8; docs/50 §7.1; A-86; A-96; AGENTS.md §6
+//! Spec: docs/51 §4.3 step 8; docs/50 §7.1; A-86; A-96; docs/CLEAN-ROOM.md
 //! (bounded reads, fail closed).
 
 use crate::error::ReadError;
@@ -71,7 +71,7 @@ pub fn check_file(facts: &FileFacts) -> Result<(), ReadError> {
 /// link is [`ReadError::NotRegularFile`]), too large, or the content refused
 /// by [`Manifest::parse`].
 ///
-/// Spec: docs/51 §4.3 steps 8, 11, 12; docs/50 §7.1; AGENTS.md §6.
+/// Spec: docs/51 §4.3 steps 8, 11, 12; docs/50 §7.1; docs/CLEAN-ROOM.md
 pub fn read_manifest(path: &Path) -> Result<Manifest, ReadError> {
     read_manifest_owned_by(path, REQUIRED_OWNER_UID)
 }

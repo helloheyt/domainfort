@@ -25,6 +25,6 @@
 //! Written only from this project's documents (docs/52 §3.18, §7 R15; the
 //! questions cited) and this repository's own code (the kdc-daemon and
 //! ldap-front seams as the pattern). No other implementation was consulted
-//! or recalled (AGENTS.md §1-3).
+//! or recalled (docs/CLEAN-ROOM.md).
 
 pub use crate::daemon::{serve_with as serve, ServeParams as DaemonParams};

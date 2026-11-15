@@ -3,7 +3,7 @@
 //! Not the audit trail (that is auditd, R50-17). Every message is a fixed
 //! text from [`Note`] plus, at most, a numeric identifier (a count, a policy
 //! version, an OS error number) — never request octets, names, tickets,
-//! addresses or any peer-supplied string (AGENTS.md §6; docs/50 §8.2:
+//! addresses or any peer-supplied string (docs/CLEAN-ROOM.md; docs/50 §8.2:
 //! "operational log to stderr in fixed codes + identifiers"; "never logged:
 //! raw request bytes"). No logging crate (docs/50 §8.2). A failed write to
 //! stderr is ignored, never a panic.
@@ -13,7 +13,7 @@
 //! event of each kind, with the running count, so a flood cannot fill the
 //! log (docs/07 §8: "rate limit for the log").
 //!
-//! Spec: docs/50 §8.2; docs/07 §8; AGENTS.md §6.
+//! Spec: docs/50 §8.2; docs/07 §8; docs/CLEAN-ROOM.md
 
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};

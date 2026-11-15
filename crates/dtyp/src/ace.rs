@@ -297,7 +297,7 @@ impl Ace {
         if size % 4 != 0 {
             return Err(Error::AceSizeNotMultipleOf4);
         }
-        // Bound AceSize by the input before slicing (AGENTS.md §6).
+        // Bound AceSize by the input before slicing (docs/CLEAN-ROOM.md).
         if size > input.len() {
             return Err(Error::AceTruncated);
         }

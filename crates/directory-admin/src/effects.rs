@@ -3,7 +3,7 @@
 //! `ipc_dird_admin::EffectPlan`, built from the same evaluation that decides
 //! the operation and read through the same functions that enforce it.
 //!
-//! # The class this closes (AGENTS.md §6.1): C46
+//! # The class this closes (docs/CLEAN-ROOM.md): C46
 //!
 //! "The approved effect is smaller than the executed one": a decision and an
 //! approval covered the request — "AddMember(H, G)" — while its effect

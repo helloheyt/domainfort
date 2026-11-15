@@ -13,7 +13,7 @@
 //! | client authentication | none (`with_no_client_auth`: no CertificateRequest is ever sent, so a client never sends a certificate) | docs/50 §5.1; RFC 8446 §4.3.2, §4.4.2; docs/49 §4.4 ([MS-ADTS] 5.1.1.2: no client certificate in phase 1) |
 //! | 0-RTT | `max_early_data_size = 0` | RFC 8446 §2.3 ("There are no guarantees of non-replay between connections") |
 //! | resumption | `send_tls13_tickets = 0`, `max_tls13_tickets = 0`, a ticketer that never produces tickets, `NoServerSessionStorage` | docs/50 §5.1; D104; RFC 8446 §4.6.1 |
-//! | key log | `NoKeyLog` (never `KeyLogFile`, which reads SSLKEYLOGFILE) | AGENTS.md §6; docs/21 D95 |
+//! | key log | `NoKeyLog` (never `KeyLogFile`, which reads SSLKEYLOGFILE) | docs/CLEAN-ROOM.md; docs/21 D95 |
 //! | secret extraction | `enable_secret_extraction = false` | docs/50 §5.1 |
 //! | 0.5-RTT data | `send_half_rtt_data = false` | docs/50 §5.1 |
 //! | ALPN | empty | docs/50 §5.1 |
@@ -135,7 +135,7 @@ pub const DC_SIGNATURE_SCHEME: SignatureScheme = SignatureScheme::ECDSA_NISTP256
 
 /// The key-log labels rustls documents (`KeyLog::log`); the configured key
 /// log must decline every one.
-/// Spec: AGENTS.md §6; docs.rs rustls 0.23.46 `KeyLog::log`.
+/// Spec: docs/CLEAN-ROOM.md; docs.rs rustls 0.23.46 `KeyLog::log`.
 const KEY_LOG_LABELS: [&str; 7] = [
     "CLIENT_RANDOM",
     "CLIENT_EARLY_TRAFFIC_SECRET",

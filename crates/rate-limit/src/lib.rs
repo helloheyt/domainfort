@@ -37,7 +37,7 @@
 //! # Security
 //!
 //! Bounded: only admitted datagrams create entries, so the table never holds
-//! more than `global` sources (AGENTS.md §6). Fail closed: a poisoned lock
+//! more than `global` sources (docs/CLEAN-ROOM.md). Fail closed: a poisoned lock
 //! refuses. The source address of a UDP datagram can be forged (tokio
 //! `UdpSocket::recv_from`: "should not be trusted"), so the per-source limit
 //! is a weak defence alone (docs/50 §4.1); the global budget and the
@@ -47,7 +47,7 @@
 //!
 //! Moved from this project's crates/kdc-daemon `src/rate.rs` (written from
 //! docs/50 §4.1 and Q-223); placed per docs/54 §6.7 and §10 (DN3). No other
-//! implementation consulted or recalled (AGENTS.md §1-3).
+//! implementation consulted or recalled (docs/CLEAN-ROOM.md).
 //!
 //! Spec: docs/50 R50-9, §4.1; docs/02 §2 (CLDAP: "rate limiting per source,
 //! listening on internal interfaces only"); docs/54 §6.7, §10 (DN3);
@@ -84,7 +84,7 @@ struct SourceWindow {
 /// A datagram is admitted when its source has had fewer than `per_source`
 /// datagrams admitted in the current window and all sources fewer than
 /// `global`. Only admitted datagrams create entries, so the table never
-/// holds more than `global` sources (bounded, AGENTS.md §6). The source
+/// holds more than `global` sources (bounded, docs/CLEAN-ROOM.md). The source
 /// address of a UDP datagram can be forged (tokio `UdpSocket::recv_from`:
 /// "should not be trusted"), so the per-source limit is a weak defence
 /// alone (docs/50 §4.1); the global budget and the internal-only binding

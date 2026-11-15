@@ -1,7 +1,7 @@
 //! Bounds of the format, and the range type of the per-daemon limits.
 //!
 //! The file and line bounds are the numbers docs/50 §7.1 states. The other
-//! format bounds are project choices (AGENTS.md §6 requires bounds but does not
+//! format bounds are project choices (docs/CLEAN-ROOM.md requires bounds but does not
 //! fix them), listed in docs/questions/Q-230. Every bound is checked before the
 //! octets it covers are copied anywhere, so nothing is allocated beyond the
 //! input actually present.
@@ -15,7 +15,7 @@ pub const MAX_LINE_OCTETS: usize = 1024;
 
 /// Most lines in one file: 1024.
 ///
-/// Project choice (AGENTS.md §6 bounds; Q-230): the largest key table has
+/// Project choice (docs/CLEAN-ROOM.md bounds; Q-230): the largest key table has
 /// fewer than thirty keys, so a file of this many lines is already almost all
 /// comments.
 pub const MAX_LINES: usize = 1024;
