@@ -7,7 +7,7 @@
 //! by the front (R49-14)"), §8.1 names the sources (kdc, keyd, the LDAP
 //! engine's `Outcome.audit`) and ipc-audit has no front event shape. So the
 //! front verifies that auditd is there and answering — through the one audit
-//! client of crate ipc-audit (`ipc_audit::client::AuditLink::verify`, task
+//! client of crate ipc-audit (`ipc_audit_client::AuditLink::verify`, task
 //! R9b): the peer uid is the configured `auditd_uid` and auditd's `Pong`
 //! names the source auditd records the front under, which must be
 //! [`AUDIT_SOURCE`] — and then closes the connection; its own layer is only
@@ -17,17 +17,17 @@
 //! docs/52 §3.12; docs/questions/Q-512 (A-112), Q-560.
 
 use crate::dird::Endpoint;
-use ipc_audit::client::{AuditLink, ExpectedAuditd};
 use ipc_audit::EventSource;
+use ipc_audit_client::{AuditLink, ExpectedAuditd};
 
 /// Why the check failed: the one audit client's error (carries no octet of
 /// any frame). Spec: docs/50 §7.5, §8.2.
-pub use ipc_audit::client::AuditLinkError as AuditCheckError;
+pub use ipc_audit_client::AuditLinkError as AuditCheckError;
 
 /// How long one step of the check may take: the one audit client's
 /// deadline. Project choice (as the other daemons' audit deadline; docs/50
 /// gives none — Q-260 item 4).
-pub use ipc_audit::client::AUDIT_DEADLINE as AUDIT_CHECK_DEADLINE;
+pub use ipc_audit_client::AUDIT_DEADLINE as AUDIT_CHECK_DEADLINE;
 
 /// The source auditd must record the front under (docs/50 §2.4, §3.2: the
 /// front's uid is mapped to `ldap-front`, crates/config `AuditSource`).

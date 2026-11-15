@@ -114,10 +114,10 @@ pub const SOCKET_FILE_MODE: u32 = 0o660;
 pub const DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 /// How long a stop waits for auditd to acknowledge the LDAP audit window:
-/// the one bound of every daemon, `ipc_audit::AUDIT_FLUSH_GRACE` (5 s).
+/// the one bound of every daemon, `ipc_audit_client::AUDIT_FLUSH_GRACE` (5 s).
 /// docs/questions/Q-313 (A-82: "the same bound keyd and the kdc use");
 /// docs/52 §3.11 R6 (b).
-pub const AUDIT_FLUSH_GRACE: Duration = ipc_audit::AUDIT_FLUSH_GRACE;
+pub const AUDIT_FLUSH_GRACE: Duration = ipc_audit_client::AUDIT_FLUSH_GRACE;
 
 /// Poll interval while draining. Project choice.
 const DRAIN_POLL: Duration = Duration::from_millis(10);
@@ -859,7 +859,7 @@ pub async fn serve_with(
     // audit task keeps reconnecting (crate::audit_link) and a link that
     // dropped just before the stop can still deliver within the bound
     // (docs/questions/Q-350 item 11). The one flush of every daemon
-    // (`ipc_audit::AuditGate::close`, docs/52 R6).
+    // (`ipc_audit_client::AuditGate::close`, docs/52 R6).
     let unacknowledged = gate
         .close(AUDIT_FLUSH_GRACE, async {
             audit_task.abort();

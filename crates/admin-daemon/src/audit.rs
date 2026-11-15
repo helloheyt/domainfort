@@ -29,7 +29,8 @@
 use crate::log::{note, Note};
 use core::future::Future;
 use core::time::Duration;
-use ipc_audit::{AdmindEvent, EventBody, FlushWait, Reservation, Unflushed, WindowConfig};
+use ipc_audit::{AdmindEvent, EventBody, Reservation, WindowConfig};
+use ipc_audit_client::{FlushWait, Unflushed};
 use tokio::sync::Notify;
 
 /// An event could not be put into its reserved slot (cannot happen for an
@@ -40,14 +41,14 @@ pub struct RecordLost;
 
 /// Shared by the admin listener (noise), the worker (reserve, commit) and
 /// the audit client task (batches, acknowledgements, reachability): the
-/// shared `ipc_audit::AuditGate` (its window, the reachability, the stop's
+/// shared `ipc_audit_client::AuditGate` (its window, the reachability, the stop's
 /// flush — docs/52 §3.11 R6) plus admind's event shape and the tokio
 /// wake-up of the audit client.
 /// Spec: docs/50 R50-17, §8.1; docs/questions/Q-218 (A-57); docs/52 §3.11
 /// R6.
 #[derive(Debug)]
 pub struct AuditGate {
-    core: ipc_audit::AuditGate,
+    core: ipc_audit_client::AuditGate,
     wake: Notify,
 }
 
@@ -57,7 +58,7 @@ impl AuditGate {
     #[must_use]
     pub fn new(window: WindowConfig) -> AuditGate {
         AuditGate {
-            core: ipc_audit::AuditGate::new(window),
+            core: ipc_audit_client::AuditGate::new(window),
             wake: Notify::new(),
         }
     }
@@ -96,7 +97,7 @@ impl AuditGate {
     // No `set_reachable` here (task R15b, docs/questions/Q-630): the shared
     // gate's reachability is the audit client's alone (crate-private to
     // ipc-audit); admind's start attaches the verified connection to this
-    // gate (`ipc_audit::client::AuditLink::attach`).
+    // gate (`ipc_audit_client::AuditLink::attach`).
 
     /// Whether auditd is reachable (the audit client's view).
     #[must_use]
@@ -110,7 +111,7 @@ impl AuditGate {
         self.core.outstanding()
     }
 
-    /// The stop's flush (`ipc_audit::AuditGate::close`): admind waits the
+    /// The stop's flush (`ipc_audit_client::AuditGate::close`): admind waits the
     /// whole `grace` for the acknowledgements even while its link counts as
     /// unreachable (`FlushWait::UntilAcknowledged` — the wait it was built
     /// with, as dird's, A-87), then ends the link (`end_link`), then reports
@@ -133,12 +134,12 @@ impl AuditGate {
     }
 }
 
-/// What admind's gate gives the one audit client (`ipc_audit::client`, task
+/// What admind's gate gives the one audit client (`ipc_audit_client`, task
 /// R9b): the shared gate, the wake-up of a recorded event, and admind's
 /// notes when the link is restored or lost.
 /// Spec: docs/52 §3.11 R6, §3.12; docs/questions/Q-512, Q-560 item 4.
-impl ipc_audit::client::LinkedGate for AuditGate {
-    fn audit_gate(&self) -> &ipc_audit::AuditGate {
+impl ipc_audit_client::LinkedGate for AuditGate {
+    fn audit_gate(&self) -> &ipc_audit_client::AuditGate {
         &self.core
     }
 

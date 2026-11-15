@@ -8,8 +8,9 @@
 //! [`EventBuffer`], only holds the event of the request in progress; right
 //! after the request the engine moves it into the sender window
 //! (`ipc_audit::SendWindow`), from which the audit client delivers it to
-//! auditd over `audit.sock` (R50-17, §8.1), converted by ipc-audit's `kdc`
-//! feature (`KdcEvent::from`).
+//! auditd over `audit.sock` (R50-17, §8.1), converted by
+//! [`crate::kdc_event`] (crate::audit_convert — task IB1, docs/questions/
+//! Q-851).
 //!
 //! # Is the kdc an issuance-gating sender? Yes.
 //!
@@ -58,9 +59,8 @@
 use crate::log::{note, Note};
 use core::future::Future;
 use core::time::Duration;
-use ipc_audit::{
-    EventBody, FlushWait, KdcEvent, Reservation, Unflushed, WindowConfig, WindowSteps,
-};
+use ipc_audit::{EventBody, Reservation, WindowConfig};
+use ipc_audit_client::{FlushWait, Unflushed, WindowSteps};
 use kdc::{AuditEvent, AuditOutcome, AuditSink};
 use tokio::sync::Notify;
 
@@ -120,9 +120,9 @@ pub fn is_issued(event: &AuditEvent) -> bool {
     matches!(event.outcome, AuditOutcome::Issued)
 }
 
-/// The wire event of one KDC event. Spec: crates/ipc-audit convert.rs.
+/// The wire event of one KDC event. Spec: crate::audit_convert.
 fn event_of(event: &AuditEvent) -> EventBody {
-    EventBody::Kdc(Box::new(KdcEvent::from(event)))
+    EventBody::Kdc(Box::new(crate::audit_convert::kdc_event(event)))
 }
 
 /// The record of a request could not be put into the window: its reply
@@ -143,14 +143,14 @@ pub enum Recorded {
 
 /// Shared by the engine thread (admit, record) and the audit client task
 /// (batches, acknowledgements, reachability): the shared
-/// `ipc_audit::AuditGate` (its window, the reachability, the stop's flush —
+/// `ipc_audit_client::AuditGate` (its window, the reachability, the stop's flush —
 /// docs/52 §3.11 R6) plus the kdc's event shape and the tokio wake-up of the
 /// audit client.
 /// Spec: docs/50 R50-17, §8.1; docs/questions/Q-218 (A-57); docs/52 §3.11
 /// R6.
 #[derive(Debug)]
 pub struct AuditGate {
-    core: ipc_audit::AuditGate,
+    core: ipc_audit_client::AuditGate,
     wake: Notify,
 }
 
@@ -160,7 +160,7 @@ impl AuditGate {
     #[must_use]
     pub fn new(window: WindowConfig) -> AuditGate {
         AuditGate {
-            core: ipc_audit::AuditGate::new(window),
+            core: ipc_audit_client::AuditGate::new(window),
             wake: Notify::new(),
         }
     }
@@ -256,7 +256,7 @@ impl AuditGate {
     // No `set_reachable` here (task R15b, docs/questions/Q-630): the shared
     // gate's reachability is the audit client's alone (crate-private to
     // ipc-audit); the kdc's start attaches the verified connection to this
-    // gate (`ipc_audit::client::AuditLink::attach`).
+    // gate (`ipc_audit_client::AuditLink::attach`).
 
     /// Whether auditd is reachable (the audit client's view).
     #[must_use]
@@ -270,7 +270,7 @@ impl AuditGate {
         self.core.outstanding()
     }
 
-    /// The stop's flush (`ipc_audit::AuditGate::close`): the kdc stops
+    /// The stop's flush (`ipc_audit_client::AuditGate::close`): the kdc stops
     /// waiting as soon as its link counts auditd as unreachable
     /// (`FlushWait::UntilAcknowledgedOrUnreachable` — the rule A-87 kept for
     /// the kdc), then ends the link (`end_link`), then reports what is left.
@@ -292,12 +292,12 @@ impl AuditGate {
     }
 }
 
-/// What the kdc's gate gives the one audit client (`ipc_audit::client`,
+/// What the kdc's gate gives the one audit client (`ipc_audit_client`,
 /// task R9b): the shared gate, the wake-up of a recorded event, and the
 /// kdc's notes when the link is restored or lost.
 /// Spec: docs/52 §3.11 R6, §3.12; docs/questions/Q-512, Q-560 item 4.
-impl ipc_audit::client::LinkedGate for AuditGate {
-    fn audit_gate(&self) -> &ipc_audit::AuditGate {
+impl ipc_audit_client::LinkedGate for AuditGate {
+    fn audit_gate(&self) -> &ipc_audit_client::AuditGate {
         &self.core
     }
 
@@ -314,7 +314,7 @@ impl ipc_audit::client::LinkedGate for AuditGate {
     }
 }
 
-// The unit tests open the gate through ipc-audit's dev-only test seams, so
+// The unit tests open the gate through ipc-audit-client's dev-only test seams, so
 // they live in a test file (task R15b, docs/questions/Q-630).
 #[cfg(test)]
 #[path = "audit_tests.rs"]

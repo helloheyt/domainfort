@@ -1,7 +1,7 @@
 //! Unit tests of keyd's gate wrapper (`audit.rs`), in-process: the tests
 //! play the audit client at the window level — the gate opened, a batch
-//! taken, auditd's `Ack` fed — through ipc-audit's dev-only test seams
-//! (the link side of the shared gate is crate-private to ipc-audit and
+//! taken, auditd's `Ack` fed — through ipc-audit-client's dev-only test seams
+//! (the link side of the shared gate is crate-private to ipc-audit-client and
 //! driven only by its client in a product, task R15b, docs/questions/Q-630).
 //! Moved out of `audit.rs` unchanged otherwise.
 //!
@@ -10,8 +10,9 @@
 //! constructed for these tests.
 
 use super::*;
-use ipc_audit::client::LinkedGate;
-use ipc_audit::{test_seams, Ack, KeydOutcome};
+use ipc_audit::{Ack, KeydOutcome};
+use ipc_audit_client::test_seams;
+use ipc_audit_client::LinkedGate;
 use ipc_keyd::Call;
 use ipc_keyd_server::{classify, Classified};
 use keyd::{CallerId, KeyHandle, PrincipalId};

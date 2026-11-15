@@ -37,9 +37,9 @@
 //!    An edit the edit refuses is `ValueInvalid`.
 //!
 //! The result is a [`PreparedPolicyChange`]: the `Decision` event (its
-//! `ipc_audit::IntentRecord`) and the candidate, which leaves the type only
+//! `ipc_audit_client::IntentRecord`) and the candidate, which leaves the type only
 //! through [`PolicyCandidate::from_acknowledged`] — from an
-//! `ipc_audit::AckedIntent<PreparedPolicyChange>`, which only the caller's
+//! `ipc_audit_client::AckedIntent<PreparedPolicyChange>`, which only the caller's
 //! audit gate produces after auditd acknowledged the decision event (docs/52
 //! R6: "decision acknowledged ⇒ commit" as a type). dird writes the file
 //! from the [`PolicyCandidate`] and records the `Outcome` event it plans.
@@ -59,9 +59,10 @@
 
 use directory_pip::DirectoryView;
 use ipc_audit::{
-    AckedIntent, AdminFailure, AdminRefusal, DirAdminEvent, DirAdminStage, EventBody, IntentRecord,
-    OutcomeResult, MAX_APPROVERS, MAX_TARGET_NAMES,
+    AdminFailure, AdminRefusal, DirAdminEvent, DirAdminStage, EventBody, OutcomeResult,
+    MAX_APPROVERS, MAX_TARGET_NAMES,
 };
+use ipc_audit_client::{AckedIntent, IntentRecord};
 use keyd_types::OperationDigest;
 use krb_proto::KerberosTime;
 use pdp::{Action, Obligation, PolicyScope, PolicySnapshot, PolicyVersion, Resource};

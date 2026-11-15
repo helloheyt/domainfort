@@ -1,7 +1,7 @@
 //! Unit tests of the kdc's gate wrapper (`audit.rs`), in-process: they open
 //! the gate as the audit client does with a verified connection, through
-//! ipc-audit's dev-only test seams (the link side of the shared gate is
-//! crate-private to ipc-audit and driven only by its client in a product,
+//! ipc-audit-client's dev-only test seams (the link side of the shared gate is
+//! crate-private to ipc-audit-client and driven only by its client in a product,
 //! task R15b, docs/questions/Q-630). Moved out of `audit.rs` unchanged
 //! otherwise.
 //!
@@ -9,8 +9,8 @@
 //! constructed for these tests.
 
 use super::*;
-use ipc_audit::client::LinkedGate;
-use ipc_audit::test_seams;
+use ipc_audit_client::test_seams;
+use ipc_audit_client::LinkedGate;
 use kdc::{ArmorAudit, AuditReason, Exchange, Transport};
 use krb_proto::KerberosTime;
 

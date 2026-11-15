@@ -66,9 +66,9 @@ pub const TGS_QUEUE_CAPACITY: usize = 64;
 pub const DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 /// How long a stop waits for auditd to acknowledge the window: the one
-/// bound of every daemon, `ipc_audit::AUDIT_FLUSH_GRACE` (5 s; a project
+/// bound of every daemon, `ipc_audit_client::AUDIT_FLUSH_GRACE` (5 s; a project
 /// choice). Spec: docs/52 §3.11 R6 (b); docs/questions/Q-313 (A-82).
-pub const AUDIT_FLUSH_GRACE: Duration = ipc_audit::AUDIT_FLUSH_GRACE;
+pub const AUDIT_FLUSH_GRACE: Duration = ipc_audit_client::AUDIT_FLUSH_GRACE;
 
 /// Poll interval while draining. Project choice.
 const DRAIN_POLL: Duration = Duration::from_millis(10);
@@ -324,7 +324,7 @@ impl Stopped {
     /// The audit events auditd had not acknowledged when the stop ended the
     /// audit task (after waiting up to [`AUDIT_FLUSH_GRACE`], or less once
     /// auditd counted as unreachable): lost with the process (Q-252 item 9).
-    /// The shared flush's report (`ipc_audit::AuditGate::close`, docs/52
+    /// The shared flush's report (`ipc_audit_client::AuditGate::close`, docs/52
     /// R6), as dird and admind expose it; the kdc writes no log note for it,
     /// as before.
     /// Spec: docs/50 R50-17, §8.1; docs/questions/Q-313 (A-82).
@@ -582,7 +582,7 @@ where
     control.state.serving.store(false, Ordering::SeqCst);
     wait_until(DRAIN_GRACE, || shared.in_flight.load(Ordering::SeqCst) == 0).await;
     queues.close();
-    // The one flush of every daemon (`ipc_audit::AuditGate::close`, docs/52
+    // The one flush of every daemon (`ipc_audit_client::AuditGate::close`, docs/52
     // R6): the kdc's rule ends the wait early when auditd counts as
     // unreachable (A-87 kept it).
     let unacknowledged = gate

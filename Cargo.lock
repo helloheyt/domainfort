@@ -29,6 +29,7 @@ dependencies = [
  "ipc",
  "ipc-admin",
  "ipc-audit",
+ "ipc-audit-client",
  "ipc-dird-admin",
  "ipc-directory",
  "ipc-keyd",
@@ -237,6 +238,7 @@ dependencies = [
  "dtyp",
  "ipc",
  "ipc-audit",
+ "ipc-audit-client",
  "kdc",
  "keyd-types",
  "krb-proto",
@@ -260,6 +262,7 @@ dependencies = [
  "dtyp",
  "ipc",
  "ipc-audit",
+ "ipc-audit-client",
  "ipc-dird-admin",
  "ipc-directory",
  "ipc-directory-server",
@@ -346,6 +349,7 @@ dependencies = [
  "ipc",
  "ipc-admin",
  "ipc-audit",
+ "ipc-audit-client",
  "ipc-dird-admin",
  "ipc-directory",
  "ipc-keyd",
@@ -467,15 +471,15 @@ name = "ipc-audit"
 version = "0.0.0"
 dependencies = [
  "ad-schema",
- "dtyp",
+ "ipc",
+]
+
+[[package]]
+name = "ipc-audit-client"
+version = "0.0.0"
+dependencies = [
  "ipc",
  "ipc-audit",
- "kdc",
- "keyd",
- "krb-proto",
- "ldap",
- "parse-ldap",
- "pdp",
  "tokio",
 ]
 
@@ -543,6 +547,7 @@ dependencies = [
  "dtyp",
  "ipc",
  "ipc-audit",
+ "ipc-audit-client",
  "ipc-keyd",
  "ipc-keyd-server",
  "kdc",
@@ -618,6 +623,7 @@ dependencies = [
  "dtyp",
  "ipc",
  "ipc-audit",
+ "ipc-audit-client",
  "ipc-directory",
  "ipc-keyd",
  "kdc",
@@ -692,6 +698,7 @@ dependencies = [
  "dtyp",
  "ipc",
  "ipc-audit",
+ "ipc-audit-client",
  "ipc-keyd",
  "ipc-keyd-server",
  "kdc",
@@ -765,6 +772,7 @@ dependencies = [
  "dtyp",
  "ipc",
  "ipc-audit",
+ "ipc-audit-client",
  "ipc-directory",
  "ipc-keyd",
  "ipc-ldap",
@@ -904,6 +912,7 @@ dependencies = [
  "dtyp",
  "ipc",
  "ipc-audit",
+ "ipc-audit-client",
  "ipc-directory-server",
  "ipc-keyd",
  "kdc",

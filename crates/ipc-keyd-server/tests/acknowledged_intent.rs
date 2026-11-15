@@ -1,7 +1,7 @@
 //! A key-state change runs only with the proof that auditd acknowledged its
 //! intent (docs/52 §3.11 R6, decision A-102): `classify` decides from keyd's
 //! own authorization step, an admitted change runs only through
-//! `execute_acknowledged` with an `ipc_audit::AckedIntent`, and `execute`
+//! `execute_acknowledged` with an `ipc_audit_client::AckedIntent`, and `execute`
 //! refuses (`NotRun`, keyd not called) a plain call keyd would now admit.
 //!
 //! Sources: docs/52 §3.11 R6 (a); docs/questions/Q-365 (A-88: the six
@@ -10,7 +10,7 @@
 //! (A-102: `set_secret` only on a live decision dird registered); docs/50
 //! §8.1 (an `Ack` after auditd's sync). The proof comes only through the
 //! real audit client from a (fake) auditd's `Ack` — the gate's link side is
-//! crate-private to ipc-audit (task R15b, docs/questions/Q-630). Every value
+//! crate-private to ipc-audit-client (task R15b, docs/questions/Q-630). Every value
 //! is constructed by hand for these tests; no vector comes from any other
 //! implementation.
 
@@ -18,10 +18,11 @@
 mod samples;
 
 // A fake auditd and the real audit client linked to a gate (task R15b).
-#[path = "../../ipc-audit/tests/linked/mod.rs"]
+#[path = "../../ipc-audit-client/tests/linked/mod.rs"]
 mod linked;
 
-use ipc_audit::{AckedIntent, EventBody, IntentRecord, KeydOutcome, KeydRecord};
+use ipc_audit::{EventBody, KeydOutcome, KeydRecord};
+use ipc_audit_client::{AckedIntent, IntentRecord};
 use ipc_keyd::{Answer, Call};
 use ipc_keyd_server::{classify, execute, execute_acknowledged, Classified, KeyStateCall, NotRun};
 use keyd::{

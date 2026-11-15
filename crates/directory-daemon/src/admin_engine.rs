@@ -31,7 +31,7 @@
 //!    slot records the operation as not performed
 //!    (`Outcome(Failed(AuditUnacknowledged))`), and the answer is
 //!    `Unavailable`. The prepared write goes into the gate with its
-//!    decision event and comes back as an `ipc_audit::AckedIntent<Prepared>`
+//!    decision event and comes back as an `ipc_audit_client::AckedIntent<Prepared>`
 //!    only after the acknowledgement (docs/52 R6) — the only form `apply`
 //!    takes.
 //! 6. **`apply`** inside the transaction (it re-verifies what could have

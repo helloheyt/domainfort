@@ -22,7 +22,7 @@
 
 /// A fake auditd and the real audit client linked to a gate: the only way a
 /// test obtains the proof `apply` takes (task R15b, docs/questions/Q-630).
-#[path = "../../../ipc-audit/tests/linked/mod.rs"]
+#[path = "../../../ipc-audit-client/tests/linked/mod.rs"]
 pub mod linked;
 
 use core::time::Duration;
@@ -44,7 +44,8 @@ use dtyp::{
     GenericMapping, Guid, MaskSidAce, SecurityDescriptor, Sid, Token, ACL_REVISION_DS,
     SECURITY_NT_AUTHORITY,
 };
-use ipc_audit::{AckedIntent, DirAdminEvent};
+use ipc_audit::DirAdminEvent;
+use ipc_audit_client::AckedIntent;
 use keyd_types::KeydConfig;
 use krb_proto::constants::KRB_NT_PRINCIPAL;
 use krb_proto::{KerberosString, KerberosTime, PrincipalName, Realm};
@@ -853,7 +854,7 @@ impl Domain {
 }
 
 /// Play auditd for one prepared write (docs/51 §5.7 item 2, A-85; docs/52
-/// §3.11 R6): commit its decision event into an `ipc_audit::AuditGate`
+/// §3.11 R6): commit its decision event into an `ipc_audit_client::AuditGate`
 /// attached to the real audit client, which delivers it to a fake auditd
 /// that acknowledges it as auditd does once it synced it (docs/50 §8.1),
 /// and take the proof `apply` requires. The only way the tests obtain one is

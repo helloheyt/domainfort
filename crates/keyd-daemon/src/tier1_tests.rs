@@ -9,7 +9,7 @@
 //! Tier 1 plays the audit client itself at the window level — the gate
 //! opened or closed, a batch taken and inspected without being delivered,
 //! a connection lost, auditd's `Ack` fed at a chosen moment. The shared
-//! gate's link side is crate-private to ipc-audit (a product reaches it only
+//! gate's link side is crate-private to ipc-audit-client (a product reaches it only
 //! through the one audit client, task R15b, docs/questions/Q-630), so these
 //! tests reach it through ipc-audit's dev-only `test_seams` (feature
 //! `test-seams`, enabled only by this crate's dev-dependency).
@@ -22,11 +22,12 @@ use crate::engine::{
 };
 use crate::startup::development_keyd;
 use ipc::{decode_reply, encode_frame, Direction, Refused, Reply};
-use ipc_audit::client::LinkedGate;
 use ipc_audit::{
-    decode_event, test_seams, Ack, EventBody, KeyPurposeCode, KeydOperation, KeydOutcome,
-    KeydReason, KeydRecord, KeydRole, WindowConfig,
+    decode_event, Ack, EventBody, KeyPurposeCode, KeydOperation, KeydOutcome, KeydReason,
+    KeydRecord, KeydRole, WindowConfig,
 };
+use ipc_audit_client::test_seams;
+use ipc_audit_client::LinkedGate;
 use ipc_keyd::{Answer, Call, KeydReply, Password, KEYD_CHANNEL};
 use ipc_keyd_server::{Dispatch, KeyStateIntent};
 use keyd::{

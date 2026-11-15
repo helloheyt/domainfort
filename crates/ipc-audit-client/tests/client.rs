@@ -1,4 +1,4 @@
-//! The one audit client (`ipc_audit::client`, task R9b) over real Unix
+//! The one audit client (crate `ipc_audit_client`, task R9b) over real Unix
 //! sockets: the peer uid and the source auditd reports are verified on every
 //! new connection before any batch, and an auditd that would record this
 //! process under another source receives nothing — the gate keeps auditd
@@ -21,14 +21,12 @@
 //! §3.11 R6 (a), §3.12 (C12); PENDING-OWNER A-57, A-67 item 2 (auditd
 //! unreachable ⇒ gating refused), A-115; docs/questions/Q-512 (A-112),
 //! Q-560, Q-630. Every value is made up here.
-#![cfg(feature = "client")]
-
 // The fake auditd, the test gate and the link's runner — shared with the
 // other crates whose tests need an acknowledged intent (task R15b).
 mod linked;
 
-use ipc_audit::client::{AuditLinkError, ExpectedAuditd};
-use ipc_audit::{EventBody, EventSource, IntentRecord, WindowSummary};
+use ipc_audit::{EventBody, EventSource, WindowSummary};
+use ipc_audit_client::{AuditLinkError, ExpectedAuditd, IntentRecord};
 use linked::{
     acknowledged, block_on, eventually, link, not_acknowledged, FakeAuditd, LinkRun, TempDir,
     TestGate,
@@ -239,7 +237,7 @@ impl IntentRecord for Change {
     }
 }
 
-/// Task R15b / docs/52 §3.11 R6 (a): code outside ipc-audit obtains an
+/// Task R15b / docs/52 §3.11 R6 (a): code outside ipc-audit-client obtains an
 /// `AckedIntent` only through the client — the intent record delivered to
 /// an auditd that acknowledges it ⇒ the proof, for the same value; the
 /// record delivered to an auditd that never acknowledges ⇒ the value back,

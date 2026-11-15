@@ -24,9 +24,10 @@ use directory_admin::{
     VerificationFailure, MAX_POLICY_CHANGES,
 };
 use ipc_audit::{
-    AckedIntent, AdminFailure, AdminNameKind, AdminRefusal, DecisionResult, DirAdminOperation,
-    DirAdminStage, OutcomeResult, PdpReasonCode, SidValue,
+    AdminFailure, AdminNameKind, AdminRefusal, DecisionResult, DirAdminOperation, DirAdminStage,
+    OutcomeResult, PdpReasonCode, SidValue,
 };
+use ipc_audit_client::AckedIntent;
 use pdp::{
     ActionMatch, AuthMatch, ContextMatch, Effect, Match, PolicyVersion, ResourceMatch, Rule,
     RuleId, SubjectMatch, SubtreeBase, Tier,

@@ -1,10 +1,11 @@
-//! A fake auditd and the **real** audit client (`ipc_audit::client`) linked
-//! to a gate — the way a test obtains an acknowledged intent (task R15b,
-//! docs/questions/Q-630).
+//! A fake auditd and the **real** audit client (crate `ipc_audit_client`)
+//! linked to a gate — the way a test obtains an acknowledged intent (task
+//! R15b, docs/questions/Q-630).
 //!
 //! The audit gate's link side (auditd reachable, the batch to send,
-//! auditd's `Ack`) is crate-private to ipc-audit: only the one client, after
-//! verifying auditd's uid and the source auditd reports, drives it. So a
+//! auditd's `Ack`) is crate-private to ipc-audit-client: only the one
+//! client, after verifying auditd's uid and the source auditd reports,
+//! drives it. So a
 //! test that needs an [`AckedIntent`] (dird's `apply`, keyd's
 //! `execute_acknowledged`) plays **auditd**, never the client: a minimal
 //! auditd on a Unix socket in a unique temporary directory, the real
@@ -28,25 +29,30 @@
 //! needs an acknowledged intent cannot run as root; it is not skipped
 //! silently).
 //!
-//! Shared through `#[path]` by crates/ipc-audit `tests/client.rs`,
+//! Shared through `#[path]` by crates/ipc-audit-client `tests/client.rs`,
 //! crates/directory-admin `tests/common`, crates/provision
 //! `tests/admin_plane.rs`, crates/ipc-keyd-server
 //! `tests/acknowledged_intent.rs` and crates/e2e-tests `tests/admin_world`
-//! (each needs `ipc`, `ipc-audit` with feature `client`, and tokio with
+//! (each needs `ipc`, `ipc-audit`, `ipc-audit-client`, and tokio with
 //! `rt` and `sync` as dev-dependencies).
 //!
 //! Source: docs/50 R50-3 ("the client verifies the server's uid too"),
 //! §3.2, §3.6, §3.7, §7.5, §8.1 (an `Ack` only after auditd's sync);
 //! docs/52 §3.11 R6, §3.12; docs/questions/Q-512, Q-560, Q-630. Moved from
 //! crates/ipc-audit `tests/client.rs` (this project's test code, task R9b),
-//! with the silent mode and the chain added. Every value is made up here.
+//! with the silent mode and the chain added; moved with the client to
+//! crates/ipc-audit-client by task IB1 (docs/questions/Q-851). Every value
+//! is made up here.
 #![allow(dead_code)] // each test binary uses a different subset
 
 use ipc::{Direction, FrameReader, Reply};
-use ipc_audit::client::{AuditLink, AuditLinkError, ExpectedAuditd, LinkedGate};
 use ipc_audit::{
-    decode_request, encode_reply, Ack, AckedIntent, AuditGate, AuditReply, AuditRequest, EventBody,
-    EventSource, IntentRecord, PendingIntent, WindowConfig, WindowSummary, AUDIT_CHANNEL,
+    decode_request, encode_reply, Ack, AuditReply, AuditRequest, EventBody, EventSource,
+    WindowConfig, WindowSummary, AUDIT_CHANNEL,
+};
+use ipc_audit_client::{
+    AckedIntent, AuditGate, AuditLink, AuditLinkError, ExpectedAuditd, IntentRecord, LinkedGate,
+    PendingIntent,
 };
 use std::future::Future;
 use std::io::{ErrorKind, Read, Write};
@@ -466,7 +472,7 @@ impl Linked {
 /// `value` with the proof that auditd acknowledged its intent record: the
 /// record committed into a gate, delivered by the real client to an auditd
 /// that acknowledges it (docs/50 §8.1), the proof taken from the gate —
-/// the only way any code outside ipc-audit obtains one.
+/// the only way any code outside ipc-audit-client obtains one.
 ///
 /// # Panics
 /// As [`Linked::start`]; no acknowledgement within 10 s.

@@ -1,0 +1,70 @@
+# ipc-audit-client — a sender's side of the audit channel (`audit.sock`):
+# the one audit client (task R9b, docs/questions/Q-512, Q-560) and the
+# audit gate with the proof of an acknowledged intent it drives (task R6,
+# A-102; task R15b, docs/questions/Q-630).
+#
+# Split out of crate ipc-audit by task IB1 (docs/questions/Q-851, decision
+# A-144; class C40 "what an artifact links depends on what is built with
+# it"): ipc-audit had the client behind an optional tokio (feature
+# `client`), and in a shared build one daemon's feature reached every other
+# daemon. Here tokio is an ordinary, NON-optional dependency — no manifest
+# of this workspace declares an `optional` dependency, so no feature of ours
+# can change which packages an artifact links (docs/research/r4-b §5.6).
+#
+# The gate moved with the client because its link side (auditd reachable,
+# the batch to send, auditd's `Ack`, a lost batch) is crate-private to the
+# crate of the one client that drives it (docs/questions/Q-630): only the
+# client, after verifying auditd's uid and reported source, can open a gate
+# or acknowledge, i.e. mint an `AckedIntent`. Keeping gate and client in one
+# crate keeps that a privacy error (E0624) for every other crate, as it was
+# — see docs/questions/Q-900.
+#
+# Who links it: the senders (keyd-daemon, kdc-daemon, directory-daemon,
+# admin-daemon), ldap-front's start-up check, and the crates whose mutation
+# entry points take the proof (ipc-keyd-server, directory-admin). auditd
+# does NOT: it links only crate ipc-audit (wire shapes and codec).
+#
+# Written only from this project's decided design (docs/50, docs/52 §3.11,
+# §3.12, docs/questions/Q-512, Q-560, Q-630, Q-851 / A-144) and the
+# docs.rs API pages of tokio 1.54.1 (P-2) — AGENTS.md §1-3. The code was
+# moved unchanged from crate ipc-audit (this project's own code). No other
+# implementation, serializer, RPC framework or audit format was consulted
+# or recalled.
+
+[package]
+name = "ipc-audit-client"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[features]
+# TESTS ONLY (task R15b, docs/questions/Q-630; the docs/52 R15 rules,
+# docs/questions/Q-570 item 2, A-118): the module `test_seams`, which
+# reaches the audit gate's crate-private link side (reachability, the batch
+# to send, auditd's `Ack`, a lost batch) for the in-process tier-1 tests of
+# a daemon's gate (docs/50 §9). Enabled ONLY from [dev-dependencies] (cargo
+# resolver 2: never in a product build), never in `default`; guarded by
+# crates/e2e-tests tests/no_test_seams_in_product.rs. cfg-only: it turns on
+# no dependency (Q-851: features never change the graph).
+test-seams = []
+
+[dependencies]
+# Framing (`FrameReader`, `Direction`, `Reply`) for the client's replies.
+ipc = { path = "../ipc" }
+# The audit channel's wire shapes, codec and the sender window the gate
+# holds (`SendWindow`, `EventBody`, `Ack`, `Append`, `EventSource`, ...).
+ipc-audit = { path = "../ipc-audit" }
+# tokio — owner decision P-12 (2026-11-13), already in the lock and used by
+# every daemon that links this crate: the client's Unix socket, deadlines
+# and reads/writes. The same version and features crate ipc-audit's
+# feature `client` turned on before task IB1 — no new package, no new
+# feature. Usage documentation only (docs.rs, P-2), never its source.
+tokio = { version = "1.54.1", default-features = false, features = ["net", "time", "io-util"] }
+
+[dev-dependencies]
+# TESTS ONLY: a tokio runtime for the client's tests (tests/client.rs) —
+# the package and features the daemons already use (P-12).
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "net", "time", "io-util", "sync"] }
+
+[lints]
+workspace = true

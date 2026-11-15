@@ -26,8 +26,11 @@ path = "src/main.rs"
 audit-log = { path = "../audit-log" }
 # The `audit.sock` message set and the per-connection sequence check. Core
 # only: no kdc / keyd / ldap conversions in this process (docs/questions/Q-252
-# item 1; D104 minimality).
-ipc-audit = { path = "../ipc-audit", default-features = false }
+# item 1; D104 minimality). Since task IB1 (docs/questions/Q-851, A-144)
+# ipc-audit has no feature and no optional dependency at all, so no other
+# daemon built with this one can put a conversion or a source crate into it
+# (the old `default-features = false` could not prevent that).
+ipc-audit = { path = "../ipc-audit" }
 # Framing, the shared `Refused` reply (A-59).
 ipc = { path = "../ipc" }
 # `AuditdSettings` and the `uid → source` map (docs/50 R50-15, §3.2; A-60).

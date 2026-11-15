@@ -14,9 +14,12 @@
 //! written is still recorded (as `Unlisted`) rather than dropped — an audit
 //! event is never lost to a missing table entry. New variants are appended
 //! at the end of a table, before `Unlisted` moves; existing codes never
-//! change meaning (the log keeps them forever). The conversions (features
-//! `kdc`, `keyd`, `ldap`) map `Source::X => Table::X` by name, so a renamed
-//! or misspelled variant does not compile.
+//! change meaning (the log keeps them forever). The conversions — on the
+//! side that already links each source crate since task IB1
+//! (docs/questions/Q-851, A-144): crates/kdc-daemon `audit_convert`,
+//! crates/ipc-keyd-server `audit_convert`, crates/directory-daemon
+//! `audit_convert` — map `Source::X => Table::X` by name, so a renamed or
+//! misspelled variant does not compile.
 //!
 //! One table extends its source: [`KeydOutcome`] appends, after keyd's five
 //! outcomes, the two phase codes keyd-daemon writes around a key-state

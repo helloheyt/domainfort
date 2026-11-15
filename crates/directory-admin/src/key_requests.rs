@@ -82,8 +82,9 @@ use directory_pip::DirectoryView;
 use dtyp::{Guid, Sid};
 use ipc_audit::{
     AdminFailure, AdminRefusal, DirAdminEvent, DirAdminOperation, DirAdminStage, EventBody,
-    IntentRecord, KeydOperation, OutcomeResult,
+    KeydOperation, OutcomeResult,
 };
+use ipc_audit_client::IntentRecord;
 use keyd_types::{
     DecidedOperation, DecisionId, KeyHandle, KeyPurpose, Kvno, OperationDigest, PrincipalId,
     ServiceKeyHandle, MAX_KEY_DECISION_SECS,
@@ -601,7 +602,7 @@ impl KeyStep {
 /// acknowledge before dird registers the decision in keyd (A-85: no
 /// loosening of keyd without the PDP's decision durably recorded) — and the
 /// [`KeyDecision`]. dird's registration takes it only as an
-/// `ipc_audit::AckedIntent<QuorumStep>` (docs/52 §3.11 R6 (a)). Not `Clone`.
+/// `ipc_audit_client::AckedIntent<QuorumStep>` (docs/52 §3.11 R6 (a)). Not `Clone`.
 /// Spec: docs/52 §4.3, §3.11 R6 (a); docs/51 §5.6, §5.7 item 2; A-85.
 #[derive(Debug, PartialEq, Eq)]
 pub struct QuorumStep {

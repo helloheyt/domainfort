@@ -61,10 +61,17 @@ ipc-keyd = { path = "../ipc-keyd" }
 # The directory channel's client (`DirectoryClient`, `RemoteView`,
 # `UnavailableDirectory`, `UnixConnector`).
 ipc-directory = { path = "../ipc-directory" }
-# The audit channel and the sender window (A-57), with the kdc event
-# conversion only (A-66: each daemon enables only its own), and the one
-# audit client (`client`, task R9b — docs/questions/Q-560).
-ipc-audit = { path = "../ipc-audit", default-features = false, features = ["kdc", "client"] }
+# The audit channel and the sender window (A-57). Since task IB1
+# (docs/questions/Q-851, A-144) the kdc event conversion lives HERE
+# (src/audit_convert.rs), on the side that already links kdc, pdp and
+# krb-proto — not behind an optional feature of ipc-audit, which a shared
+# build unified into every daemon (and so put keyd, krb-crypto and dirstore
+# into this one). No feature.
+ipc-audit = { path = "../ipc-audit" }
+# The one audit client (task R9b — docs/questions/Q-560) and the shared gate
+# it drives; crate ipc-audit-client since task IB1. Its tokio is the one
+# this daemon already links.
+ipc-audit-client = { path = "../ipc-audit-client" }
 # The shared policy file (A-68).
 policy-store = { path = "../policy-store" }
 # `PolicySnapshot`, `IpScope`, `RlKey`.
@@ -97,10 +104,11 @@ test-seams = []
 kdc-daemon = { path = ".", features = ["test-seams"] }
 # TESTS ONLY (task R15b, docs/questions/Q-630): the in-process unit tests of
 # the gate wrapper (src/audit_tests.rs) open the gate as the audit client
-# does, through ipc-audit's test seams — the shared gate's link side is
-# crate-private to ipc-audit. Beside the normal entry; a dev-dependency
-# feature, never in a product build (resolver 2).
-ipc-audit = { path = "../ipc-audit", features = ["test-seams"] }
+# does, through ipc-audit-client's test seams — the shared gate's link side
+# is crate-private to ipc-audit-client. Beside the normal entry; a
+# dev-dependency feature, never in a product build (resolver 2). cfg-only:
+# it turns on no dependency.
+ipc-audit-client = { path = "../ipc-audit-client", features = ["test-seams"] }
 # TESTS ONLY. The flows run the real keyd daemon and the real dird
 # (crates/keyd-daemon and crates/directory-daemon tests/support, reused by
 # `#[path]`) and reuse the kdc integration fixtures (crates/kdc/tests/common,

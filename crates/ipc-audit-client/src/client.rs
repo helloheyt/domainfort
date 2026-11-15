@@ -1,8 +1,9 @@
 //! The one audit client: a sender's link to auditd over `audit.sock` — the
 //! single implementation for every daemon that sends events (keyd, the kdc,
 //! dird, admind) and for ldap-front's start-up check (task R9b, docs/52
-//! §3.12 C12, docs/questions/Q-512, Q-560). Behind the feature `client`
-//! (tokio); auditd does not enable it.
+//! §3.12 C12, docs/questions/Q-512, Q-560). In crate ipc-audit-client, with
+//! a non-optional tokio (task IB1, docs/questions/Q-851, A-144); auditd does
+//! not link it.
 //!
 //! # The class it closes (AGENTS.md §6.1)
 //!
@@ -50,7 +51,8 @@
 //! Whether auditd is reachable, and what auditd acknowledged, are the facts
 //! an [`crate::AckedIntent`] rests on; their one owner is this client. The
 //! gate's link side (reachability, the batch to send, the `Ack`, a lost
-//! batch) is crate-private to ipc-audit, and only this module drives it: a
+//! batch) is crate-private to ipc-audit-client, and only this module drives
+//! it: a
 //! daemon hands its gate and its verified start-up connection to
 //! [`AuditLink::attach`] — which marks auditd reachable **because** that
 //! connection was verified — and spawns [`AttachedLink::run`]. Nothing
@@ -102,14 +104,14 @@
 //! docs/52 §3.12 (C12); docs/questions/Q-218 (A-57), Q-252 (A-64), Q-260
 //! (A-67), Q-512 (A-112), Q-560 (A-115), Q-570 §5 item a (A-118), Q-630.
 
-use crate::channel::{
-    decode_reply, encode_request, AuditReply, AuditRequest, EventSource, AUDIT_CHANNEL,
-};
 use crate::gate::AuditGate;
 use core::fmt;
 use core::future::Future;
 use core::time::Duration;
 use ipc::{Direction, FrameReader, Reply};
+use ipc_audit::{
+    decode_reply, encode_request, AuditReply, AuditRequest, EventSource, AUDIT_CHANNEL,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -365,7 +367,7 @@ impl AuditLink {
     /// and source); [`AttachedLink::run`] then delivers over it and keeps
     /// the reachability true to the link from there on. This is how a
     /// daemon's start opens its gate — the gate's link side is crate-private
-    /// to ipc-audit, so nothing else can (docs/questions/Q-630). A
+    /// to ipc-audit-client, so nothing else can (docs/questions/Q-630). A
     /// connection verified against another expectation does not open the
     /// gate and is never used.
     ///

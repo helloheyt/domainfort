@@ -1,5 +1,5 @@
 //! admind's link to auditd: the one audit client of crate ipc-audit
-//! (`ipc_audit::client`, task R9b) with admind's expectation — auditd's uid
+//! (`ipc_audit_client`, task R9b) with admind's expectation — auditd's uid
 //! and the source auditd must record admind's events under,
 //! [`AUDIT_SOURCE`]. Verified first, before admind listens (docs/50 R50-16:
 //! "auditd → keyd → dird → … → admind; a daemon binds nothing until its
@@ -12,15 +12,15 @@
 //! gate counts auditd as unreachable — `SetPassword` is refused `Busy` until
 //! a connection verified both ways is back (A-57; docs/questions/Q-512,
 //! Q-560). What stays admind's own: its gate wrapper (crate::audit, which
-//! implements `ipc_audit::client::LinkedGate`), its notes and this
+//! implements `ipc_audit_client::LinkedGate`), its notes and this
 //! expectation.
 //!
 //! Spec: docs/50 R50-3, R50-16, R50-17, §3.2, §8.1; docs/51 §5.7 item 3;
 //! docs/52 §3.12; docs/questions/Q-512 (A-112), Q-560.
 
-pub use ipc_audit::client::{AuditEndpoint, AuditLinkError, AUDIT_DEADLINE, HEARTBEAT};
-use ipc_audit::client::{AuditLink, ExpectedAuditd};
 use ipc_audit::EventSource;
+pub use ipc_audit_client::{AuditEndpoint, AuditLinkError, AUDIT_DEADLINE, HEARTBEAT};
+use ipc_audit_client::{AuditLink, ExpectedAuditd};
 
 /// The source auditd must record admind's events under: admind sends the
 /// `Admind` shape, which auditd accepts only from `Admind` (A-85;

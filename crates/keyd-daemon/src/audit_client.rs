@@ -1,5 +1,5 @@
 //! keyd's audit client: the one audit client of crate ipc-audit
-//! (`ipc_audit::client`, task R9b) with keyd's expectation — auditd's uid
+//! (`ipc_audit_client`, task R9b) with keyd's expectation — auditd's uid
 //! and the source auditd must record keyd's events under, [`AUDIT_SOURCE`].
 //!
 //! On every new connection, before any batch, the shared client checks the
@@ -8,15 +8,15 @@
 //! counts auditd as unreachable — gating operations are refused (`Busy`)
 //! until a connection verified both ways is back (A-57; docs/questions/
 //! Q-512, Q-560). What stays keyd's own: its gate wrapper (crate::audit,
-//! which implements `ipc_audit::client::LinkedGate`), its notes
+//! which implements `ipc_audit_client::LinkedGate`), its notes
 //! (`AuditRestored`, `AuditLost`) and this expectation.
 //!
 //! Spec: docs/50 R50-3, R50-16, R50-17, §3.2, §8.1; docs/52 §3.12;
 //! docs/questions/Q-512 (A-112), Q-560.
 
-pub use ipc_audit::client::{AuditEndpoint, AuditLinkError, AUDIT_DEADLINE, HEARTBEAT};
-use ipc_audit::client::{AuditLink, ExpectedAuditd};
 use ipc_audit::EventSource;
+pub use ipc_audit_client::{AuditEndpoint, AuditLinkError, AUDIT_DEADLINE, HEARTBEAT};
+use ipc_audit_client::{AuditLink, ExpectedAuditd};
 
 /// The source auditd must record keyd's events under: keyd sends the `Keyd`
 /// shape, which auditd accepts only from `Keyd` (A-85; crates/audit-daemon

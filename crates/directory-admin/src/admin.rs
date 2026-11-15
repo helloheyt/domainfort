@@ -30,9 +30,8 @@
 
 use dirstore::{AttrId, CounterState, Object};
 use dtyp::{Guid, Sid};
-use ipc_audit::{
-    AdminFailure, AdminRefusal, DirAdminEvent, EventBody, IntentRecord, MAX_APPROVERS,
-};
+use ipc_audit::{AdminFailure, AdminRefusal, DirAdminEvent, EventBody, MAX_APPROVERS};
+use ipc_audit_client::IntentRecord;
 use keyd_types::{
     KeyHandle, KeyPurpose, OperationDigest, PrincipalBinding, PrincipalId, ServiceKeyHandle,
 };
@@ -194,8 +193,8 @@ pub(crate) enum Plan {
 ///
 /// **Not `Clone`** (docs/52 N5, R6): its decision event is its
 /// [`IntentRecord`]; `apply` takes it only as an
-/// `ipc_audit::AckedIntent<Prepared>` — which only the caller's
-/// `ipc_audit::AuditGate` produces, after auditd acknowledged **this**
+/// `ipc_audit_client::AckedIntent<Prepared>` — which only the caller's
+/// `ipc_audit_client::AuditGate` produces, after auditd acknowledged **this**
 /// prepared operation's decision event — so a write cannot be applied before
 /// the acknowledgement, and one acknowledgement applies one write.
 ///

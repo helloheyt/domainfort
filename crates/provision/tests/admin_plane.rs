@@ -24,7 +24,7 @@ mod common;
 
 // A fake auditd and the real audit client linked to a gate: the only way a
 // test obtains the proof `apply` takes (task R15b, docs/questions/Q-630).
-#[path = "../../ipc-audit/tests/linked/mod.rs"]
+#[path = "../../ipc-audit-client/tests/linked/mod.rs"]
 mod linked;
 
 use common::*;
@@ -795,12 +795,12 @@ fn the_policy_grants_only_the_phase1_kerberos_actions() {
 }
 
 /// Play auditd for one prepared write (docs/51 §5.7 item 2, A-85; docs/52
-/// §3.11 R6): commit its decision event into an `ipc_audit::AuditGate` the
+/// §3.11 R6): commit its decision event into an `ipc_audit_client::AuditGate` the
 /// real audit client is attached to, let a fake auditd acknowledge it as
 /// auditd does once it synced it (docs/50 §8.1), and take the proof `apply`
 /// requires — the only way to obtain one (task R15b).
 fn acknowledged(
     prepared: directory_admin::Prepared,
-) -> ipc_audit::AckedIntent<directory_admin::Prepared> {
+) -> ipc_audit_client::AckedIntent<directory_admin::Prepared> {
     linked::acknowledged(prepared)
 }

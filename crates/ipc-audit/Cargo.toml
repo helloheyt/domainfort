@@ -1,31 +1,37 @@
 # ipc-audit — the audit channel (`audit.sock`) message set over `ipc`, the
 # canonical event encoding for the kdc / keyd / ldap audit shapes and the
-# admin-plane `DirAdmin` / `Admind` shapes (docs/51 §5.7, task A7 — core,
-# no feature, no new dependency), and the
+# admin-plane `DirAdmin` / `Admind` shapes (docs/51 §5.7, task A7), and the
 # sender-side bounded window that implements the decided overflow policy
 # (docs/50 R50-17, §8.1, §10 task P6 — the library half; docs/questions/Q-218,
 # A-57).
 #
-# Core: one dependency, this project's `ipc` (framing, codec primitives,
-# shared `Refused`). auditd (P6b) uses only the core:
-#     ipc-audit = { path = "../ipc-audit" }
+# One dependency, this project's `ipc` (framing, codec primitives, shared
+# `Refused`), and NO feature: docs/50 §10 lists only `ipc` for this crate
+# (docs/questions/Q-252 item 1). auditd (P6b) links only this crate.
 #
-# Features `kdc`, `keyd`, `ldap` add the conversions from each source crate's
-# audit type to its wire shape. They pull in that source crate and the crates
-# its audit type is made of — all workspace crates, no third-party
-# dependency. NONE is on by default (decision A-66, docs/questions/Q-265
-# follow-up): each daemon enables only the conversion it sends (keyd-daemon:
-# `keyd`), so that building the whole workspace no longer unifies the kdc /
-# ldap conversions into auditd or any other daemon — the same
-# feature-unification problem A-63 solved with a separate crate. Keeping them
-# optional keeps auditd free of the protocol stacks (D104 minimality; docs/50
-# §10 lists only `ipc` for this crate — docs/questions/Q-252 item 1).
+# Task IB1 (docs/questions/Q-851, decision A-144; class C40, docs/research/
+# r4-b §3.3, §5.6). Until then this crate declared the source crates (kdc,
+# keyd, ldap, pdp, krb-proto, dtyp, parse-ldap) and tokio as OPTIONAL
+# dependencies behind the features `kdc`, `keyd`, `ldap` and `client`. The
+# old comment here (A-66) promised that, with none of them on by default,
+# "building the whole workspace no longer unifies the kdc / ldap conversions
+# into auditd or any other daemon". That was wrong: cargo unifies the
+# features of one package across everything built together, so in any
+# shared build (`cargo build --all`, `-p a -p b`) every daemon that linked
+# ipc-audit got all three conversions and their source crates — keyd,
+# krb-crypto (AES, SHA-1, PBKDF2), dirstore and redb — whatever it asked
+# for. A default-off feature does not isolate; only the crate graph does.
+# Now no manifest in the workspace declares an `optional` dependency, and
+# features are cfg-only (`= []`). The conversions moved to the side that
+# already links each source crate (crates/kdc-daemon, crates/ipc-keyd-server,
+# crates/directory-daemon — each an `audit_convert` module), and the client,
+# with the gate it drives, to crate ipc-audit-client (non-optional tokio).
 #
 # Written only from this project's decided design (docs/50, docs/37,
 # docs/07 §8, docs/questions/Q-218 / A-57, docs/questions/Q-225 / A-59,
-# Q-265 / A-66) and the public API of the workspace crates named below —
-# AGENTS.md §1-3. No other implementation, serializer, RPC framework or audit
-# format was consulted or recalled.
+# Q-265 / A-66, Q-851 / A-144) and the public API of crate ipc — AGENTS.md
+# §1-3. No other implementation, serializer, RPC framework or audit format
+# was consulted or recalled.
 
 [package]
 name = "ipc-audit"
@@ -33,61 +39,11 @@ version = "0.0.0"
 edition = "2021"
 publish = false
 
-[features]
-# Empty (A-66): a consumer names the conversion it needs.
-default = []
-# kdc::AuditEvent -> KdcEvent.
-kdc = ["dep:kdc", "dep:pdp", "dep:krb-proto"]
-# keyd::AuditRecord -> KeydRecord.
-keyd = ["dep:keyd", "dep:krb-proto"]
-# ldap::AuditEvent -> LdapEvent.
-ldap = ["dep:ldap", "dep:pdp", "dep:krb-proto", "dep:dtyp", "dep:parse-ldap"]
-# The one audit client (task R9b, docs/questions/Q-512, Q-560): a sender's
-# link to auditd over `audit.sock` (src/client.rs). Enabled by the senders
-# (keyd-daemon, kdc-daemon, directory-daemon, admin-daemon) and by
-# ldap-front's start-up check; NOT by auditd, whose ipc-audit stays the
-# one-dependency core.
-client = ["dep:tokio"]
-# TESTS ONLY (task R15b, docs/questions/Q-630; the docs/52 R15 rules,
-# docs/questions/Q-570 item 2, A-118): the module `test_seams`, which
-# reaches the audit gate's crate-private link side (reachability, the batch
-# to send, auditd's `Ack`, a lost batch) for the in-process tier-1 tests of
-# a daemon's gate (docs/50 §9). Enabled ONLY from [dev-dependencies] (cargo
-# resolver 2: never in a product build), never in `default`; guarded by
-# crates/e2e-tests tests/no_test_seams_in_product.rs.
-test-seams = []
-
 [dependencies]
 # Framing, field primitives, the `MessageSet` pattern and `REFUSED_KIND`.
 ipc = { path = "../ipc" }
-# Source audit types, for the optional conversions only (path dependencies,
-# same workspace).
-kdc = { path = "../kdc", optional = true }
-keyd = { path = "../keyd", optional = true }
-ldap = { path = "../ldap", optional = true }
-pdp = { path = "../pdp", optional = true }
-krb-proto = { path = "../krb-proto", optional = true }
-dtyp = { path = "../dtyp", optional = true }
-parse-ldap = { path = "../parse-ldap", optional = true }
-# tokio — owner decision P-12 (2026-11-13), already in the lock and used by
-# every daemon with these features: the client's Unix socket, deadlines and
-# reads/writes (feature `client` only; no new package). Usage documentation
-# only (docs.rs, P-2), never its source.
-tokio = { version = "1.54.1", default-features = false, features = ["net", "time", "io-util"], optional = true }
 
 [dev-dependencies]
-# TESTS ONLY: this crate itself with every conversion turned on, so that the
-# conversion tests (tests/conversions.rs, gated by
-# `#![cfg(all(feature = "kdc", feature = "keyd", feature = "ldap"))]`) are
-# built and run by a plain `cargo test --all` (scripts/check-rust.sh) although
-# no feature is on by default (A-66). Dev-dependencies take part only in the
-# builds of test targets, so this turns no conversion on for a daemon binary
-# (checked: `cargo tree -p audit-daemon -e normal`). `client` likewise, for
-# the client's tests (tests/client.rs).
-ipc-audit = { path = ".", features = ["kdc", "keyd", "ldap", "client"] }
-# TESTS ONLY: a tokio runtime for the client's tests (tests/client.rs) —
-# the package and features the daemons already use (P-12).
-tokio = { version = "1.54.1", default-features = false, features = ["rt", "net", "time", "io-util", "sync"] }
 # TESTS ONLY: this project's schema crate, so that a test checks the six
 # `GroupTypeCode` values against `ad_schema::flags::group_type::ALLOWED_VALUES`
 # — the repository's one statement of the phase-1 groupType values

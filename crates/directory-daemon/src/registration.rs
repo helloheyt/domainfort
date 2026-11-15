@@ -15,7 +15,7 @@
 //! takes a [`DecisionRegistration`], and a `DecisionRegistration` has no
 //! public constructor: it is made inside this crate, only from
 //!
-//! * an `ipc_audit::AckedIntent<directory_admin::QuorumStep>` — the `Approve`
+//! * an `ipc_audit_client::AckedIntent<directory_admin::QuorumStep>` — the `Approve`
 //!   that completed a key request's quorum, whose `Decision` event auditd
 //!   acknowledged ([`DecisionRegistration::of_quorum`]);
 //! * a `directory_admin::Applied` of a `BeginPasswordSet` — made only by
@@ -48,7 +48,7 @@
 use crate::admin_service::{secret_decision_of, SET_SECRET_GRANT_LIFETIME_SECS};
 use directory_admin::{Applied, QuorumStep, TombstonedPrincipal};
 use dtyp::Guid;
-use ipc_audit::AckedIntent;
+use ipc_audit_client::AckedIntent;
 use keyd_types::{DecidedOperation, DecisionId, PrincipalId, MAX_DESTROY_DECISION_SECS};
 
 /// The id of the destroy decision of the tombstone `guid`: the XOR of its objectGUID's

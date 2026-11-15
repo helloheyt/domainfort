@@ -14,8 +14,9 @@
 #
 # Task R6 (docs/52 §3.11, A-102): `classify` decides which calls need their
 # intent acknowledged by auditd first; such a call runs only through
-# `execute_acknowledged`, which takes an `ipc_audit::AckedIntent` by value
-# (ipc-audit's gate is the only source of one). The unaudited `dispatch` is
+# `execute_acknowledged`, which takes an `ipc_audit_client::AckedIntent` by
+# value (ipc-audit-client's gate is the only source of one). The unaudited
+# `dispatch` is
 # behind the `loopback` feature, which no daemon enables (tests only).
 #
 # Moved unchanged from ipc-keyd's `server` module (written from docs/50,
@@ -43,10 +44,17 @@ ipc-keyd = { path = "../ipc-keyd" }
 keyd = { path = "../keyd" }
 # `KerberosTime` (the daemon's clock, R50-5).
 krb-proto = { path = "../krb-proto" }
-# The proof of an acknowledged intent (`AckedIntent`, `IntentRecord`) and
-# keyd's record layout for the intent record (feature `keyd`: the conversion
-# from keyd's `AuditRecord`, already linked by keyd-daemon). Task R6.
-ipc-audit = { path = "../ipc-audit", default-features = false, features = ["keyd"] }
+# keyd's record layout on the audit channel (`KeydRecord` and its codes).
+# Since task IB1 (docs/questions/Q-851, A-144) the conversion from keyd's
+# `AuditRecord` lives HERE (src/audit_convert.rs), on the side that already
+# links keyd — not behind an optional feature of ipc-audit, which a shared
+# build unified into every daemon. No feature.
+ipc-audit = { path = "../ipc-audit" }
+# The proof of an acknowledged intent (`AckedIntent`, `IntentRecord`) — task
+# R6; crate ipc-audit-client since task IB1 (the gate lives with the one
+# client that drives its link side, docs/questions/Q-630, Q-900). Its tokio
+# is already linked by keyd-daemon, the only crate that links this one.
+ipc-audit-client = { path = "../ipc-audit-client" }
 
 [features]
 # The unaudited in-process loopback `dispatch` (keyd run directly, no audit
@@ -68,16 +76,16 @@ pdp = { path = "../pdp" }
 dtyp = { path = "../dtyp" }
 krb-crypto = { path = "../krb-crypto" }
 zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
-# TESTS ONLY: this crate with the loopback `dispatch` (the pattern ipc-audit
-# uses for its conversions); dev-dependencies are not linked into a daemon.
+# TESTS ONLY: this crate with the loopback `dispatch`; dev-dependencies are
+# not linked into a daemon.
 ipc-keyd-server = { path = ".", features = ["loopback"] }
 # TESTS ONLY (task R15b, docs/questions/Q-630): the proof
 # `execute_acknowledged` takes comes only through the real audit client
-# (ipc-audit feature `client`) from an auditd's `Ack` — the tests run a fake
-# auditd on a Unix socket (crates/ipc-audit tests/linked, reused by
-# `#[path]`) and a tokio runtime for the client. tokio is P-12's, already in
-# the lock — no new package; dev-dependencies are not linked into a daemon.
-ipc-audit = { path = "../ipc-audit", default-features = false, features = ["keyd", "client"] }
+# (crate ipc-audit-client, a normal dependency above) from an auditd's `Ack`
+# — the tests run a fake auditd on a Unix socket (crates/ipc-audit-client
+# tests/linked, reused by `#[path]`) and a tokio runtime for the client.
+# tokio is P-12's, already in the lock — no new package; dev-dependencies
+# are not linked into a daemon.
 tokio = { version = "1.54.1", default-features = false, features = ["rt", "sync"] }
 
 [lints]

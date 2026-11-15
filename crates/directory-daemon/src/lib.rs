@@ -145,12 +145,18 @@
 //! (docs/questions/Q-500..Q-503). No other implementation was consulted
 //! or recalled (AGENTS.md §1-3).
 //!
+//! The LDAP engine's audit event is converted to its wire shape here
+//! ([`ldap_event`], module `audit_convert`) since task IB1 moved it out of
+//! an optional feature of crate ipc-audit (class C40; docs/questions/Q-851,
+//! decision A-144).
+//!
 //! Spec: docs/50 §10 (P8), R50-2, R50-3, R50-7, R50-14, R50-16, R50-17;
-//! docs/47 §8; A-57; A-58.
+//! docs/47 §8; A-57; A-58; Decision: A-144; Q-851 (task IB1).
 
 mod admin_engine;
 mod admin_listener;
 pub mod admin_service;
+mod audit_convert;
 pub mod audit_link;
 pub mod clock;
 mod daemon;
@@ -175,6 +181,7 @@ pub use admin_service::{
     MAX_DECISION_ACK_DEADLINE, MAX_DESTROY_RECONCILE_INTERVAL, MIN_DESTROY_RECONCILE_INTERVAL,
     SET_SECRET_GRANT_LIFETIME_SECS,
 };
+pub use audit_convert::ldap_event;
 pub use audit_link::{AuditEndpoint, AuditLinkError};
 pub use clock::{Clock, SharedClock, SystemClock};
 pub use daemon::{

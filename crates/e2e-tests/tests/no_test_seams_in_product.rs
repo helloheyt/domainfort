@@ -12,8 +12,10 @@
 //! left: its shape↔source binding table and connection quota are not
 //! parameters at all (R15, after task R9b gave every test sender its own
 //! listener). dirstore's path-taking `Store::open` (A-113) is gated by the
-//! same feature. ipc-audit's `test_seams` (task R15b, docs/questions/Q-630)
-//! reaches the audit gate's crate-private link side — auditd reachable, the
+//! same feature. ipc-audit-client's `test_seams` (task R15b, docs/questions/
+//! Q-630; in crate ipc-audit-client, with the gate and the one client, since
+//! task IB1 — docs/questions/Q-851) reaches the audit gate's crate-private
+//! link side — auditd reachable, the
 //! batch to send, auditd's `Ack`, a lost batch — which in a product only the
 //! one audit client drives; it exists only for the in-process tier-1 tests
 //! of keyd's and the kdc's gate wrappers. This test checks the things that
@@ -33,13 +35,14 @@
 //!    and start-up path included) names `test_seams` in code, except the
 //!    declaration itself — so a test build, in which the module does exist,
 //!    gives no product path a seam either;
-//! 4. ipc-audit's seams (the evidence an `AckedIntent` rests on) are the
-//!    narrowest: ipc-audit declares its module like the daemons (rule 1),
-//!    only keyd-daemon's and kdc-daemon's `[dev-dependencies]` enable
-//!    ipc-audit's feature, and only their tier-1 test files name
-//!    `ipc_audit::test_seams` — in **any** source of the workspace, test
-//!    code included. Every other test obtains an acknowledged intent from a
-//!    fake auditd through the real client (crates/ipc-audit `tests/linked`).
+//! 4. ipc-audit-client's seams (the evidence an `AckedIntent` rests on) are
+//!    the narrowest: ipc-audit-client declares its module like the daemons
+//!    (rule 1), only keyd-daemon's and kdc-daemon's `[dev-dependencies]`
+//!    enable ipc-audit-client's feature, and only their tier-1 test files
+//!    name `ipc_audit_client::test_seams` — in **any** source of the
+//!    workspace, test code included. Every other test obtains an
+//!    acknowledged intent from a fake auditd through the real client
+//!    (crates/ipc-audit-client `tests/linked`).
 //!
 //! Comments are not code: `//` comments in sources and `#` comments in
 //! manifests are skipped. Files under a `tests/` directory and files named
@@ -66,8 +69,8 @@ const DAEMONS: [&str; 5] = [
 ];
 
 /// The crates that declare the feature: the daemons above, dirstore (its
-/// path-taking `Store::open`, A-113) and ipc-audit (the audit gate's link
-/// side, task R15b).
+/// path-taking `Store::open`, A-113) and ipc-audit-client (the audit gate's
+/// link side, task R15b; moved from ipc-audit with the gate by task IB1).
 const DECLARING: [&str; 7] = [
     "keyd-daemon",
     "kdc-daemon",
@@ -75,19 +78,19 @@ const DECLARING: [&str; 7] = [
     "admin-daemon",
     "ldap-front",
     "dirstore",
-    "ipc-audit",
+    "ipc-audit-client",
 ];
 
 /// The library crates (not daemons: no `main.rs`) that declare a
 /// `test_seams` module in `src/lib.rs`, behind the feature (rule 1).
-const LIBRARY_MODULES: [&str; 1] = ["ipc-audit"];
+const LIBRARY_MODULES: [&str; 1] = ["ipc-audit-client"];
 
-/// The only crates whose `[dev-dependencies]` enable ipc-audit's feature
-/// (rule 4): their in-process tier-1 tests play the audit client.
+/// The only crates whose `[dev-dependencies]` enable ipc-audit-client's
+/// feature (rule 4): their in-process tier-1 tests play the audit client.
 const IPC_AUDIT_SEAM_USERS: [&str; 2] = ["keyd-daemon", "kdc-daemon"];
 
-/// The only files, relative to `crates/`, that name `ipc_audit::test_seams`
-/// (rule 4).
+/// The only files, relative to `crates/`, that name
+/// `ipc_audit_client::test_seams` (rule 4).
 const IPC_AUDIT_SEAM_FILES: [&str; 3] = [
     "keyd-daemon/src/audit_tests.rs",
     "keyd-daemon/src/tier1_tests.rs",
@@ -187,7 +190,7 @@ fn manifest_violations(text: &str, own_feature_allowed: bool) -> Vec<String> {
         .collect()
 }
 
-/// Rule 1: each daemon (and ipc-audit, task R15b) declares the module
+/// Rule 1: each daemon (and ipc-audit-client, task R15b) declares the module
 /// behind the feature, hidden, and its manifest has the feature outside
 /// `default`.
 #[test]
@@ -381,9 +384,10 @@ fn all_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Whether `text` names ipc-audit's seams in code (outside `//` comments):
-/// a path `ipc_audit::test_seams`, or a `use ipc_audit::{…}` group — over
-/// any number of lines — that lists `test_seams`.
+/// Whether `text` names ipc-audit-client's seams in code (outside `//`
+/// comments): a path `ipc_audit_client::test_seams`, or a
+/// `use ipc_audit_client::{…}` group — over any number of lines — that lists
+/// `test_seams`.
 fn names_ipc_audit_seams(text: &str) -> bool {
     let compact: String = text
         .lines()
@@ -391,10 +395,10 @@ fn names_ipc_audit_seams(text: &str) -> bool {
         .flat_map(str::chars)
         .filter(|c| !c.is_whitespace())
         .collect();
-    if compact.contains("ipc_audit::test_seams") {
+    if compact.contains("ipc_audit_client::test_seams") {
         return true;
     }
-    const GROUP: &str = "ipc_audit::{";
+    const GROUP: &str = "ipc_audit_client::{";
     let mut rest = compact.as_str();
     while let Some(at) = rest.find(GROUP) {
         let after = &rest[at + GROUP.len()..];
@@ -425,7 +429,7 @@ fn names_ipc_audit_seams(text: &str) -> bool {
     false
 }
 
-/// Rule 4 (task R15b, docs/questions/Q-630): ipc-audit's seams — the
+/// Rule 4 (task R15b, docs/questions/Q-630): ipc-audit-client's seams — the
 /// evidence an `AckedIntent` rests on — are enabled only by keyd-daemon's
 /// and kdc-daemon's dev-dependencies and named only by their tier-1 test
 /// files, in any source of the workspace (test code included).
@@ -442,7 +446,7 @@ fn only_the_tier_1_gate_tests_reach_ipc_audits_seams() {
             .to_owned();
         let text = std::fs::read_to_string(dir.join("Cargo.toml")).expect("manifest");
         for (table, code) in manifest_lines(&text) {
-            if code.starts_with("ipc-audit") && code.contains(FEATURE) {
+            if code.starts_with("ipc-audit-client") && code.contains(FEATURE) {
                 if table.ends_with("dev-dependencies")
                     && IPC_AUDIT_SEAM_USERS.contains(&name.as_str())
                 {
@@ -455,7 +459,8 @@ fn only_the_tier_1_gate_tests_reach_ipc_audits_seams() {
     }
     assert!(
         violations.is_empty(),
-        "ipc-audit's `{FEATURE}` enabled outside keyd-daemon's / kdc-daemon's dev-dependencies: \
+        "ipc-audit-client's `{FEATURE}` enabled outside keyd-daemon's / kdc-daemon's \
+         dev-dependencies: \
          {violations:#?}"
     );
     enabling.sort();
@@ -490,7 +495,8 @@ fn only_the_tier_1_gate_tests_reach_ipc_audits_seams() {
         .collect();
     assert!(
         unexpected.is_empty(),
-        "a source outside the tier-1 gate tests names ipc_audit::test_seams: {unexpected:#?}"
+        "a source outside the tier-1 gate tests names ipc_audit_client::test_seams: \
+         {unexpected:#?}"
     );
     // Positive control: each allowed file is seen, and the scan covered
     // test code too (far more files than the product scan).
@@ -506,22 +512,24 @@ fn only_the_tier_1_gate_tests_reach_ipc_audits_seams() {
 
 /// Positive control of rule 4's scanner: a path, a one-line and a
 /// multi-line `use` group naming the module are seen; a comment, another
-/// crate's module and an ipc-audit group without it are not.
+/// crate's module and an ipc-audit-client group without it are not.
 #[test]
 fn the_ipc_audit_scanner_sees_planted_uses() {
     assert!(names_ipc_audit_seams(
-        "fn f(g: &G) { ipc_audit::test_seams::set_reachable(g, true); }"
-    ));
-    assert!(names_ipc_audit_seams("use ipc_audit::{test_seams, Ack};"));
-    assert!(names_ipc_audit_seams(
-        "use ipc_audit::{\n    decode_event, Ack,\n    test_seams,\n};\n"
+        "fn f(g: &G) { ipc_audit_client::test_seams::set_reachable(g, true); }"
     ));
     assert!(names_ipc_audit_seams(
-        "use ipc_audit::{client::{AuditLink}, test_seams::acknowledge};"
+        "use ipc_audit_client::{test_seams, AuditGate};"
+    ));
+    assert!(names_ipc_audit_seams(
+        "use ipc_audit_client::{\n    AckedIntent, AuditGate,\n    test_seams,\n};\n"
+    ));
+    assert!(names_ipc_audit_seams(
+        "use ipc_audit_client::{gate::{X}, test_seams::acknowledge};"
     ));
     assert!(!names_ipc_audit_seams(
-        "// ipc_audit::test_seams in a comment\nuse ipc_audit::{Ack, AuditGate};\n\
-         use keyd_daemon::test_seams::serve;\n"
+        "// ipc_audit_client::test_seams in a comment\nuse ipc_audit_client::{AuditGate};\n\
+         use ipc_audit::{Ack};\nuse keyd_daemon::test_seams::serve;\n"
     ));
 }
 

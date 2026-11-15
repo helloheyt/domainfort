@@ -84,13 +84,12 @@
 //! (A-67), Q-313 (A-82), Q-350 item 11 (A-87), Q-365 (A-88), Q-560 /
 //! A-115 (the follow-up), Q-570 §5 item a (A-118), Q-630.
 
-use crate::channel::{Ack, Append};
-use crate::event::EventBody;
-use crate::window::{
-    NoiseAdmission, Reservation, SendWindow, WindowConfig, WindowError, WindowFull,
-};
 use core::future::Future;
 use core::time::Duration;
+use ipc_audit::{
+    Ack, Append, EventBody, NoiseAdmission, Reservation, SendWindow, WindowConfig, WindowError,
+    WindowFull,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::Instant;
@@ -286,29 +285,29 @@ struct GateState {
 ///
 /// # Only the audit client opens the gate or acknowledges (task R15b)
 ///
-/// Outside ipc-audit the link side does not exist: code in a daemon, its
+/// Outside ipc-audit-client the link side does not exist: code in a daemon, its
 /// gate wrapper or a library cannot mark auditd reachable, take or put back
 /// a batch, or feed an `Ack` — so it cannot mint an [`AckedIntent`]
 /// (docs/questions/Q-630). Each of these is a privacy error (E0624):
 ///
 /// ```compile_fail,E0624
-/// let gate = ipc_audit::AuditGate::new(ipc_audit::WindowConfig::DEFAULT);
+/// let gate = ipc_audit_client::AuditGate::new(ipc_audit::WindowConfig::DEFAULT);
 /// gate.set_reachable(true);
 /// ```
 ///
 /// ```compile_fail,E0624
-/// let gate = ipc_audit::AuditGate::new(ipc_audit::WindowConfig::DEFAULT);
+/// let gate = ipc_audit_client::AuditGate::new(ipc_audit::WindowConfig::DEFAULT);
 /// let ack = ipc_audit::Ack { through_seq: 1, head_hash: [0; 32] };
 /// let _ = gate.acknowledge(&ack);
 /// ```
 ///
 /// ```compile_fail,E0624
-/// let gate = ipc_audit::AuditGate::new(ipc_audit::WindowConfig::DEFAULT);
+/// let gate = ipc_audit_client::AuditGate::new(ipc_audit::WindowConfig::DEFAULT);
 /// let _ = gate.next_batch();
 /// ```
 ///
 /// ```compile_fail,E0624
-/// let gate = ipc_audit::AuditGate::new(ipc_audit::WindowConfig::DEFAULT);
+/// let gate = ipc_audit_client::AuditGate::new(ipc_audit::WindowConfig::DEFAULT);
 /// gate.connection_lost();
 /// ```
 ///
@@ -316,7 +315,7 @@ struct GateState {
 /// until the client attaches a verified connection (positive control):
 ///
 /// ```
-/// let gate = ipc_audit::AuditGate::new(ipc_audit::WindowConfig::DEFAULT);
+/// let gate = ipc_audit_client::AuditGate::new(ipc_audit::WindowConfig::DEFAULT);
 /// let _ack = ipc_audit::Ack { through_seq: 1, head_hash: [0; 32] };
 /// assert!(!gate.is_reachable());
 /// assert!(gate.reserve().is_none());
@@ -357,7 +356,6 @@ impl AuditGate {
     /// the evidence"): reachable exactly while it holds a verified
     /// connection. Spec: docs/50 §8.1; A-57, A-67 item 2; docs/questions/
     /// Q-560 (A-115), Q-630.
-    #[cfg_attr(not(feature = "client"), allow(dead_code))]
     pub(crate) fn set_reachable(&self, reachable: bool) {
         if let Some(mut state) = self.lock() {
             state.reachable = reachable;
@@ -544,7 +542,6 @@ impl AuditGate {
     /// pending — the audit client's (crate-private: a batch taken by anyone
     /// else would never reach auditd). Spec: docs/50 §3.6, §8.1;
     /// docs/questions/Q-630.
-    #[cfg_attr(not(feature = "client"), allow(dead_code))]
     #[must_use]
     pub(crate) fn next_batch(&self) -> Option<Append> {
         self.lock().and_then(|mut state| state.window.next_batch())
@@ -561,7 +558,6 @@ impl AuditGate {
     ///
     /// Spec: docs/50 §8.1; docs/52 §3.11 R6 (a); docs/questions/Q-560
     /// (A-115), Q-630.
-    #[cfg_attr(not(feature = "client"), allow(dead_code))]
     pub(crate) fn acknowledge(&self, ack: &Ack) -> Result<usize, WindowError> {
         let result = match self.lock() {
             Some(mut state) => state.window.acknowledge(ack),
@@ -574,7 +570,6 @@ impl AuditGate {
     /// The audit connection dropped: the batch in flight goes back to the
     /// front — the audit client's (crate-private). Spec: docs/50 §3.7, §8.1;
     /// docs/questions/Q-630.
-    #[cfg_attr(not(feature = "client"), allow(dead_code))]
     pub(crate) fn connection_lost(&self) {
         if let Some(mut state) = self.lock() {
             state.window.connection_lost();
@@ -646,9 +641,9 @@ mod tests {
     //! after the sync, cumulative), docs/questions/Q-350 item 11 (A-87: the
     //! two wait rules). Every value is constructed for these tests.
     use super::*;
-    use crate::event::WindowSummary;
     use core::pin::pin;
     use core::task::{Context, Poll, Waker};
+    use ipc_audit::WindowSummary;
     use std::sync::Arc;
 
     /// A value whose intent record is a summary carrying `n` (any event
@@ -716,7 +711,7 @@ mod tests {
         assert_eq!(pending.get(), &Change(7));
         let batch = gate.next_batch().unwrap();
         assert_eq!(
-            crate::decode_event(batch.events()[0].as_bytes()).unwrap(),
+            ipc_audit::decode_event(batch.events()[0].as_bytes()).unwrap(),
             Change(7).intent_event()
         );
         gate.acknowledge(&Ack {

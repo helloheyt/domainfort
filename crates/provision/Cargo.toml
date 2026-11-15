@@ -123,11 +123,13 @@ keyd = { path = "../keyd" }
 keyd-daemon = { path = "../keyd-daemon", features = ["test-seams"] }
 ipc = { path = "../ipc" }
 ipc-keyd = { path = "../ipc-keyd" }
-# `client` and tokio's `sync` (task R15b, docs/questions/Q-630): the proof
+ipc-audit = { path = "../ipc-audit" }
+# The client and tokio's `sync` (task R15b, docs/questions/Q-630): the proof
 # directory-admin's `apply` takes comes only through the real audit client
-# from a fake auditd's `Ack` (crates/ipc-audit tests/linked, reused by
-# `#[path]` in tests/admin_plane.rs).
-ipc-audit = { path = "../ipc-audit", default-features = false, features = ["keyd", "client"] }
+# from a fake auditd's `Ack` (crates/ipc-audit-client tests/linked, reused
+# by `#[path]` in tests/admin_plane.rs). Crate ipc-audit-client since task
+# IB1 (docs/questions/Q-851).
+ipc-audit-client = { path = "../ipc-audit-client" }
 tokio = { version = "1.54.1", default-features = false, features = ["rt", "net", "sync"] }
 # The scratch directories, inside the workspace, of the tests whose files a
 # crates/protected-file reader opens — the walk from `/` accepts them (task

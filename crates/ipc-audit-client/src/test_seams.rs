@@ -13,8 +13,9 @@
 //! audit client (`crate::client`, after verifying auditd's uid and reported
 //! source) drives it, so no code can mint an [`crate::AckedIntent`] without
 //! auditd. Tests that need an acknowledged intent play auditd through a fake
-//! auditd and the **real** client (crates/ipc-audit `tests/linked`). Only the
-//! in-process tier-1 tests of a daemon's own gate (docs/50 §9: "in-process …
+//! auditd and the **real** client (crates/ipc-audit-client `tests/linked`).
+//! Only the in-process tier-1 tests of a daemon's own gate (docs/50 §9:
+//! "in-process …
 //! without sockets") play the *client* itself at the window level — a batch
 //! taken and inspected without being delivered, a connection lost, an
 //! acknowledgement at a chosen moment — which a socket and the asynchronous
@@ -23,9 +24,8 @@
 //! Spec: docs/52 §3.11 R6 (a), §3.18 (C18), §7 R15; docs/50 §8.1, §9;
 //! docs/questions/Q-560 (A-115), Q-570 §5 item a (A-118), Q-630.
 
-use crate::channel::{Ack, Append};
 use crate::gate::AuditGate;
-use crate::window::WindowError;
+use ipc_audit::{Ack, Append, WindowError};
 
 /// The audit client's view of auditd (`AuditGate::set_reachable`). Tests
 /// only.

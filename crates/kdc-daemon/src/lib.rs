@@ -116,11 +116,18 @@
 //! (docs/questions/Q-500..Q-503). No other implementation was consulted
 //! or recalled (AGENTS.md §1-3).
 //!
+//! The KDC's audit event is converted to its wire shape here
+//! ([`kdc_event`], module `audit_convert`) since task IB1 moved it out of an
+//! optional feature of crate ipc-audit (class C40; docs/questions/Q-851,
+//! decision A-144).
+//!
 //! Spec: docs/50 §10 (P9), R50-2, R50-3, R50-8, R50-9, R50-14, R50-16,
-//! R50-17; RFC 4120 §7.2; A-56; A-57; A-58; A-68.
+//! R50-17; RFC 4120 §7.2; A-56; A-57; A-58; A-68; Decision: A-144; Q-851
+//! (task IB1).
 
 pub mod audit;
 mod audit_client;
+mod audit_convert;
 pub mod clock;
 pub mod custody;
 mod daemon;
@@ -134,6 +141,7 @@ mod udp;
 pub mod zones;
 
 pub use audit_client::{AuditEndpoint, AuditLinkError, AUDIT_DEADLINE, HEARTBEAT};
+pub use audit_convert::kdc_event;
 pub use clock::{kerberos_time_from_unix, Clock, SystemClock};
 pub use daemon::{
     serve, DaemonControl, DaemonError, DaemonParams, Listeners, Stopped, AS_QUEUE_CAPACITY,

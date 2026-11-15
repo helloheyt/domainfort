@@ -7,8 +7,8 @@
 //! `Outcome` (R49-14; Q-190 item 13: "the event is returned in `Outcome`").
 //! The PEP writes it (docs/50 §4.2: "the LDAP event is written by dird, the
 //! PEP, not by the front"): dird moves it into the sender window
-//! (`ipc_audit::SendWindow`) as an `LdapEvent` (ipc-audit's `ldap` feature),
-//! from which the audit client (crate::audit_link) delivers it to auditd
+//! (`ipc_audit::SendWindow`) as an `LdapEvent` (crate::audit_convert, task
+//! IB1), from which the audit client (crate::audit_link) delivers it to auditd
 //! over `audit.sock` (R50-17, §8.1). The record also keeps the client
 //! address the front reported in `Open` — as `reported_peer`, an unverified
 //! observation: the event's zone is the front's, from its peer uid, and
@@ -46,12 +46,12 @@
 //! # The shared gate (docs/52 R6, A-102)
 //!
 //! The window, the reachability, the acknowledgement wait and the stop's
-//! flush are `ipc_audit::AuditGate`'s — one implementation for every
+//! flush are `ipc_audit_client::AuditGate`'s — one implementation for every
 //! sending daemon. This wrapper adds what is dird's: the LDAP and admin
 //! event shapes, and the tokio wake-up of the audit link. The admin thread's
 //! "decision acknowledged ⇒ apply / register" goes through
 //! [`AuditGate::begin_intent`] and [`AuditGate::wait_acknowledged`], whose
-//! `ipc_audit::AckedIntent` is the only way into `DirectoryAdmin::apply`
+//! `ipc_audit_client::AckedIntent` is the only way into `DirectoryAdmin::apply`
 //! and into a decision's registration (crate::admin_engine,
 //! crate::registration).
 //!
@@ -59,13 +59,12 @@
 //! (A-57), Q-252 items 8, 9 (A-64), Q-260 item 2 (A-67), Q-275 item 6
 //! (A-69); docs/52 §3.11 R6.
 
+use crate::audit_convert::ldap_event;
 use crate::log::{note, Note};
 use core::future::Future;
 use core::time::Duration;
-use ipc_audit::{
-    AckedIntent, DirAdminEvent, EventBody, FlushWait, IntentRecord, LdapEvent, PendingIntent,
-    ReportedAddress, Reservation, Unflushed, WindowConfig,
-};
+use ipc_audit::{DirAdminEvent, EventBody, ReportedAddress, Reservation, WindowConfig};
+use ipc_audit_client::{AckedIntent, FlushWait, IntentRecord, PendingIntent, Unflushed};
 use ipc_ldap::ReportedPeer;
 use ldap::{AuditEvent, AuditOperation};
 use std::time::Instant;
@@ -85,9 +84,9 @@ pub fn is_noise(event: &AuditEvent) -> bool {
 
 /// The wire event of one LDAP event, with the address the front reported
 /// for the connection (unverified — docs/52 R14).
-/// Spec: crates/ipc-audit convert.rs; docs/52 §7 R14.
+/// Spec: crate::audit_convert; docs/52 §7 R14.
 fn event_of(event: &AuditEvent, reported_peer: ReportedPeer) -> EventBody {
-    EventBody::Ldap(Box::new(LdapEvent::from_engine(
+    EventBody::Ldap(Box::new(ldap_event(
         event,
         ReportedAddress::new(reported_peer.unverified_address()),
     )))
@@ -104,12 +103,12 @@ pub struct RecordLost;
 /// the audit client task (batches, acknowledgements, reachability): one
 /// window, one link to auditd for every event dird sends (A-85: "reuse
 /// dird's existing audit link and window"). The core is
-/// `ipc_audit::AuditGate` (module documentation).
+/// `ipc_audit_client::AuditGate` (module documentation).
 /// Spec: docs/50 R50-17, §8.1; docs/questions/Q-218 (A-57); docs/51 §5.7;
 /// docs/52 §3.11 R6.
 #[derive(Debug)]
 pub struct AuditGate {
-    core: ipc_audit::AuditGate,
+    core: ipc_audit_client::AuditGate,
     wake: Notify,
 }
 
@@ -119,7 +118,7 @@ impl AuditGate {
     #[must_use]
     pub fn new(window: WindowConfig) -> AuditGate {
         AuditGate {
-            core: ipc_audit::AuditGate::new(window),
+            core: ipc_audit_client::AuditGate::new(window),
             wake: Notify::new(),
         }
     }
@@ -170,7 +169,7 @@ impl AuditGate {
     // No `set_reachable` here (task R15b, docs/questions/Q-630): the shared
     // gate's reachability is the audit client's alone (crate-private to
     // ipc-audit); dird's start attaches the verified connection to this
-    // gate (`ipc_audit::client::AuditLink::attach`).
+    // gate (`ipc_audit_client::AuditLink::attach`).
 
     /// Whether auditd is reachable (the audit client's view).
     #[must_use]
@@ -265,7 +264,7 @@ impl AuditGate {
         self.core.outstanding()
     }
 
-    /// The stop's flush (`ipc_audit::AuditGate::close`): dird waits the
+    /// The stop's flush (`ipc_audit_client::AuditGate::close`): dird waits the
     /// whole `grace` for the acknowledgements even while its link counts as
     /// unreachable (`FlushWait::UntilAcknowledged`, A-87), then ends the
     /// link (`end_link`), then reports what is left.
@@ -287,12 +286,12 @@ impl AuditGate {
     }
 }
 
-/// What dird's gate gives the one audit client (`ipc_audit::client`, task
+/// What dird's gate gives the one audit client (`ipc_audit_client`, task
 /// R9b): the shared gate, the wake-up of a recorded event, and dird's notes
 /// when the link is restored or lost.
 /// Spec: docs/52 §3.11 R6, §3.12; docs/questions/Q-512, Q-560 item 4.
-impl ipc_audit::client::LinkedGate for AuditGate {
-    fn audit_gate(&self) -> &ipc_audit::AuditGate {
+impl ipc_audit_client::LinkedGate for AuditGate {
+    fn audit_gate(&self) -> &ipc_audit_client::AuditGate {
         &self.core
     }
 

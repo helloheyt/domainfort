@@ -86,10 +86,14 @@ ipc-ldap = { path = "../ipc-ldap" }
 # Framing of the dird channel's replies (`FrameReader`; the audit check is
 # crate ipc-audit's client since task R9b).
 ipc = { path = "../ipc" }
+# The audit channel's `EventSource` (the source auditd records the front
+# under); no event conversion.
+ipc-audit = { path = "../ipc-audit" }
 # The start-up verification of auditd (docs/50 R50-16, §7.5) through the
-# one audit client (`client`, task R9b — docs/questions/Q-560: uid and the
-# source auditd records the front under); no event conversion (A-66).
-ipc-audit = { path = "../ipc-audit", default-features = false, features = ["client"] }
+# one audit client (task R9b — docs/questions/Q-560: uid and the source
+# auditd records the front under). Crate ipc-audit-client since task IB1
+# (docs/questions/Q-851, A-144); its tokio is the one the front links.
+ipc-audit-client = { path = "../ipc-audit-client" }
 # `LdapFrontSettings`.
 config = { path = "../config" }
 # `HardeningPlan`, `SingleThreadProof`, `apply` (R50-14).
@@ -145,7 +149,6 @@ keyd-daemon = { path = "../keyd-daemon", features = ["test-seams"] }
 ipc-keyd = { path = "../ipc-keyd" }
 ipc-directory = { path = "../ipc-directory" }
 krb-proto = { path = "../krb-proto" }
-ipc-audit = { path = "../ipc-audit", features = ["ldap"] }
 # The DER encoder (`encode`, `encode_element`) that builds the tests' real
 # RFC 5280 certificates (crates/parse-x509 tests/common/build.rs, reused by
 # `#[path]`; docs/questions/Q-320). A workspace crate, already in the lock

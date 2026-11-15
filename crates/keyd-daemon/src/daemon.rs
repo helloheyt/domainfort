@@ -78,9 +78,9 @@ pub const SOCKET_FILE_MODE: u32 = 0o660;
 pub const DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 /// How long a stop waits for auditd to acknowledge the window: the one
-/// bound of every daemon, `ipc_audit::AUDIT_FLUSH_GRACE` (5 s; a project
+/// bound of every daemon, `ipc_audit_client::AUDIT_FLUSH_GRACE` (5 s; a project
 /// choice). Spec: docs/52 §3.11 R6 (b); docs/questions/Q-313 (A-82).
-pub const AUDIT_FLUSH_GRACE: Duration = ipc_audit::AUDIT_FLUSH_GRACE;
+pub const AUDIT_FLUSH_GRACE: Duration = ipc_audit_client::AUDIT_FLUSH_GRACE;
 
 /// Poll interval while draining. Project choice.
 const DRAIN_POLL: Duration = Duration::from_millis(10);
@@ -482,7 +482,7 @@ where
     for (path, _) in &contexts {
         let _ = std::fs::remove_file(path);
     }
-    // The one flush of every daemon (`ipc_audit::AuditGate::close`, docs/52
+    // The one flush of every daemon (`ipc_audit_client::AuditGate::close`, docs/52
     // R6): keyd's rule ends the wait early when auditd counts as unreachable
     // (A-87 kept it). What auditd did not acknowledge is lost with this
     // process (Q-252 item 9) — among it, perhaps, the outcome of a key-state

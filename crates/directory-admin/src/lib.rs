@@ -40,7 +40,7 @@
 //! `Approve` that completes the quorum yields the [`KeyDecision`] dird
 //! registers in keyd (A-102, docs/52 §4.3) — as a [`QuorumStep`], whose
 //! `Decision` event auditd must acknowledge first (an
-//! `ipc_audit::AckedIntent<QuorumStep>`, docs/52 R6). keyadm's
+//! `ipc_audit_client::AckedIntent<QuorumStep>`, docs/52 R6). keyadm's
 //! `FetchApproved`, `Complete` and `ListPendingDestruction` are retired
 //! (docs/52 §4.6); [`DirectoryAdmin::destruction_target`] and
 //! [`DirectoryAdmin::destruction_targets`] name the key sets a committed
@@ -57,15 +57,15 @@
 //! builds the candidate with crate policy-store's one tier-map edit (the
 //! next version), decoded again by the format's own decoder before anything
 //! is written. The candidate leaves [`PreparedPolicyChange`] only as a
-//! [`PolicyCandidate`], made from the `ipc_audit::AckedIntent` of its
+//! [`PolicyCandidate`], made from the `ipc_audit_client::AckedIntent` of its
 //! decision event (module `policy_change`; docs/questions/Q-590..Q-593).
 //!
 //! # The proof of an acknowledged decision (docs/52 §3.11 R6, A-102)
 //!
-//! [`Prepared`] is not `Clone` and is its own `ipc_audit::IntentRecord`
+//! [`Prepared`] is not `Clone` and is its own `ipc_audit_client::IntentRecord`
 //! (its `Decision` event); [`DirectoryAdmin::apply`] takes it only as an
-//! `ipc_audit::AckedIntent<Prepared>`, which only the caller's
-//! `ipc_audit::AuditGate` produces after auditd acknowledged that event. The
+//! `ipc_audit_client::AckedIntent<Prepared>`, which only the caller's
+//! `ipc_audit_client::AuditGate` produces after auditd acknowledged that event. The
 //! "decision acknowledged ⇒ commit" rule of A-85 is a type, not a comment.
 //!
 //! # The operations (docs/51 §5.2, §7.3)

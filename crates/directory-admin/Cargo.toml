@@ -50,8 +50,15 @@ kdc = { path = "../kdc" }
 keyd-types = { path = "../keyd-types" }
 # Realm, PrincipalName, KerberosString, KerberosTime and the name types.
 krb-proto = { path = "../krb-proto" }
-# The `DirAdmin` audit event this crate plans (A-85). No conversion feature.
+# The `DirAdmin` audit event this crate plans (A-85). No feature.
 ipc-audit = { path = "../ipc-audit" }
+# The proof of an acknowledged intent `apply` and the decision paths take
+# (`AckedIntent`, `IntentRecord` — docs/52 §3.11 R6). Crate ipc-audit-client
+# since task IB1 (docs/questions/Q-851, A-144): the gate that alone mints
+# the proof lives with the one client that drives its link side
+# (docs/questions/Q-630). This links tokio's `net`/`time`/`io-util` (class
+# N, P-12) into the crates that link this one — see docs/questions/Q-900.
+ipc-audit-client = { path = "../ipc-audit-client" }
 # The development policy value and the one tier-map edit both
 # policy-change paths share (task A16, docs/51 §5.10: the online
 # `PolicyAdmin` path builds `policy.next` with the edit `provision policy`
@@ -70,14 +77,13 @@ sha2 = { version = "0.11", default-features = false }
 # path (`Store::open`, feature `test-seams`).
 dirstore = { path = "../dirstore", features = ["test-seams"] }
 # TESTS ONLY (task R15b, docs/questions/Q-630): the proof `apply` takes comes
-# only through the real audit client (ipc-audit feature `client`) from an
-# auditd's `Ack` — the tests run a fake auditd on a Unix socket
-# (crates/ipc-audit tests/linked, reused by `#[path]`): its framing (`ipc`)
-# and a tokio runtime for the client. Workspace crates and tokio (P-12),
-# already in the lock — no new package; dev-dependencies are not linked into
-# any product.
+# only through the real audit client (crate ipc-audit-client, a normal
+# dependency above) from an auditd's `Ack` — the tests run a fake auditd on
+# a Unix socket (crates/ipc-audit-client tests/linked, reused by `#[path]`):
+# its framing (`ipc`) and a tokio runtime for the client. Workspace crates
+# and tokio (P-12), already in the lock — no new package; dev-dependencies
+# are not linked into any product.
 ipc = { path = "../ipc" }
-ipc-audit = { path = "../ipc-audit", features = ["client"] }
 tokio = { version = "1.54.1", default-features = false, features = ["rt", "sync"] }
 
 [lints]

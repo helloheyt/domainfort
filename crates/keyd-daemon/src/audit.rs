@@ -88,9 +88,9 @@
 //!
 //! Step 3 is no longer the engine's discipline: keyd runs an admitted
 //! key-state change only through `ipc_keyd_server::execute_acknowledged`,
-//! which takes an `ipc_audit::AckedIntent<ipc_keyd_server::KeyStateCall>`
+//! which takes an `ipc_audit_client::AckedIntent<ipc_keyd_server::KeyStateCall>`
 //! by value — and [`AuditGate::wait_acknowledged`] is where it comes from:
-//! the shared `ipc_audit::AuditGate`, after auditd acknowledged that very
+//! the shared `ipc_audit_client::AuditGate`, after auditd acknowledged that very
 //! call's intent record. Which calls need it is `ipc_keyd_server::classify`'s
 //! decision (from keyd's own authorization step), not this crate's. The
 //! window, the reachability, the acknowledgement wait and the stop's flush
@@ -107,10 +107,8 @@
 use crate::log::{note, Note};
 use core::future::Future;
 use core::time::Duration;
-use ipc_audit::{
-    AckedIntent, EventBody, FlushWait, KeydRecord, PendingIntent, Reservation, Unflushed,
-    WindowConfig, WindowSteps,
-};
+use ipc_audit::{EventBody, Reservation, WindowConfig};
+use ipc_audit_client::{AckedIntent, FlushWait, PendingIntent, Unflushed, WindowSteps};
 use ipc_keyd_server::KeyStateCall;
 use keyd::{AuditRecord, AuditSink, Operation};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -277,7 +275,7 @@ pub(crate) enum Waited {
 
 /// Shared by the engine thread (admit, record, the intent path) and the
 /// audit client task (batches, acknowledgements, reachability): the shared
-/// `ipc_audit::AuditGate` (module documentation), keyd's operation
+/// `ipc_audit_client::AuditGate` (module documentation), keyd's operation
 /// classification, the tokio wake-up of the audit client, and the daemon's
 /// own total of lost outcomes.
 ///
@@ -285,7 +283,7 @@ pub(crate) enum Waited {
 /// R6.
 #[derive(Debug)]
 pub(crate) struct AuditGate {
-    core: ipc_audit::AuditGate,
+    core: ipc_audit_client::AuditGate,
     /// Wakes the audit client when an event was committed.
     wake: Notify,
     /// Outcome records of key-state changes that could not be committed
@@ -295,9 +293,10 @@ pub(crate) struct AuditGate {
     unrecorded: AtomicU64,
 }
 
-/// The wire event of one keyd record. Spec: crates/ipc-audit convert.rs.
+/// The wire event of one keyd record. Spec: crates/ipc-keyd-server
+/// `keyd_record` (moved from crates/ipc-audit by task IB1, Q-851).
 fn event_of(record: &AuditRecord) -> EventBody {
-    EventBody::Keyd(Box::new(KeydRecord::from(record)))
+    EventBody::Keyd(Box::new(ipc_keyd_server::keyd_record(record)))
 }
 
 impl AuditGate {
@@ -305,7 +304,7 @@ impl AuditGate {
     /// audit client says otherwise (fail closed).
     pub(crate) fn new(window: WindowConfig) -> AuditGate {
         AuditGate {
-            core: ipc_audit::AuditGate::new(window),
+            core: ipc_audit_client::AuditGate::new(window),
             wake: Notify::new(),
             unrecorded: AtomicU64::new(0),
         }
@@ -553,10 +552,10 @@ impl AuditGate {
 
     // No `set_reachable` / `acknowledge` / `next_batch` / `connection_lost`
     // here (task R15b, docs/questions/Q-630): the shared gate's link side is
-    // crate-private to ipc-audit and driven only by its audit client, which
-    // keyd's start attaches to this gate (`ipc_audit::client::AuditLink::
+    // crate-private to ipc-audit-client and driven only by its audit client, which
+    // keyd's start attaches to this gate (`ipc_audit_client::AuditLink::
     // attach`) once auditd is verified. The in-process unit and tier-1 tests
-    // play the client through ipc-audit's dev-only test seams.
+    // play the client through ipc-audit-client's dev-only test seams.
 
     /// Whether auditd is reachable (the audit client's view; tests — the
     /// stop's rule reads it inside the shared gate).
@@ -572,7 +571,7 @@ impl AuditGate {
         self.core.outstanding()
     }
 
-    /// The stop's flush (`ipc_audit::AuditGate::close`): keyd stops waiting
+    /// The stop's flush (`ipc_audit_client::AuditGate::close`): keyd stops waiting
     /// as soon as its link counts auditd as unreachable
     /// (`FlushWait::UntilAcknowledgedOrUnreachable` — the rule A-87 kept for
     /// keyd), then ends the link (`end_link`), then reports what is left.
@@ -600,12 +599,12 @@ impl AuditGate {
     }
 }
 
-/// What keyd's gate gives the one audit client (`ipc_audit::client`, task
+/// What keyd's gate gives the one audit client (`ipc_audit_client`, task
 /// R9b): the shared gate, the wake-up of a committed event, and keyd's
 /// notes when the link is restored or lost.
 /// Spec: docs/52 §3.11 R6, §3.12; docs/questions/Q-512, Q-560 item 4.
-impl ipc_audit::client::LinkedGate for AuditGate {
-    fn audit_gate(&self) -> &ipc_audit::AuditGate {
+impl ipc_audit_client::LinkedGate for AuditGate {
+    fn audit_gate(&self) -> &ipc_audit_client::AuditGate {
         &self.core
     }
 

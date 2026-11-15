@@ -22,11 +22,11 @@
 //!   again at the moment it runs and refuses to run an admitted change
 //!   ([`crate::NotRun`]);
 //! * [`Classified::KeyStateChange`] — it does: a [`KeyStateCall`], the call
-//!   with its intent record (an `ipc_audit::IntentRecord`), runnable **only**
-//!   through [`crate::execute_acknowledged`], which takes an
-//!   `ipc_audit::AckedIntent<KeyStateCall>` by value — made only by the
-//!   daemon's `ipc_audit::AuditGate` after auditd acknowledged **that**
-//!   call's intent record.
+//!   with its intent record (an `ipc_audit_client::IntentRecord`), runnable
+//!   **only** through [`crate::execute_acknowledged`], which takes an
+//!   `ipc_audit_client::AckedIntent<KeyStateCall>` by value — made only by
+//!   the daemon's `ipc_audit_client::AuditGate` after auditd acknowledged
+//!   **that** call's intent record.
 //!
 //! So keyd runs no admitted key-state change, and no loosening, without its
 //! intent acknowledged — by construction of this crate's API, not of the
@@ -40,7 +40,9 @@
 //! Spec: docs/52 §3.11 R6 (a), §4.5, §7 R6; docs/10 §2, §6, §7, §10, §12
 //! I8; docs/questions/Q-346 (A-86), Q-365 (A-88), Q-452 item 1.
 
-use ipc_audit::{EventBody, IntentRecord, KeydOutcome, KeydReason, KeydRecord};
+use crate::audit_convert::keyd_record;
+use ipc_audit::{EventBody, KeydOutcome, KeydReason};
+use ipc_audit_client::IntentRecord;
 use ipc_keyd::Call;
 use keyd::authz::HandleSlot;
 use keyd::{
@@ -269,7 +271,7 @@ impl KeyStateIntent {
             result: AuditOutcome::Success,
             reason: AuditReason::None,
         };
-        let mut wire = KeydRecord::from(&record);
+        let mut wire = keyd_record(&record);
         wire.result = phase;
         wire.reason = KeydReason::None;
         EventBody::Keyd(Box::new(wire))
@@ -279,7 +281,7 @@ impl KeyStateIntent {
 /// A call that needs an acknowledged intent and that keyd's authorization
 /// step admits, with its intent record. Made only by [`classify`]; run only
 /// through [`crate::execute_acknowledged`], which takes it as an
-/// `ipc_audit::AckedIntent<KeyStateCall>`. Not `Clone`.
+/// `ipc_audit_client::AckedIntent<KeyStateCall>`. Not `Clone`.
 /// Spec: docs/52 §3.11 R6 (a); docs/questions/Q-365 (A-88).
 #[derive(Debug)]
 pub struct KeyStateCall {

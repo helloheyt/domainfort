@@ -1,7 +1,7 @@
 //! `apply`: the write of a prepared operation, inside the caller's
 //! `WriteTxn`, after auditd acknowledged the decision event — `apply` takes
 //! the prepared operation only with that proof
-//! (`ipc_audit::AckedIntent<Prepared>`, docs/52 §3.11 R6 (a)): a write
+//! (`ipc_audit_client::AckedIntent<Prepared>`, docs/52 §3.11 R6 (a)): a write
 //! whose decision is not durably recorded does not compile.
 //!
 //! # What `apply` re-verifies
@@ -65,7 +65,8 @@
 
 use dirstore::{AttributeChange, NewObject, WriteTxn};
 use dtyp::{Guid, Sid, GUID_PACKET_LEN};
-use ipc_audit::{AckedIntent, AdminFailure, AdminRefusal, Allocation, DirAdminEvent};
+use ipc_audit::{AdminFailure, AdminRefusal, Allocation, DirAdminEvent};
+use ipc_audit_client::AckedIntent;
 use krb_proto::KerberosTime;
 
 use crate::admin::{CreatePlan, DirectoryAdmin, Plan, Prepared, WriteKind, WritePlan};
@@ -196,7 +197,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
     /// pwdLastSet, the outcome event).
     ///
     /// `prepared` comes with its proof: auditd acknowledged its decision
-    /// event (`ipc_audit::AuditGate::wait_acknowledged` is the only source
+    /// event (`ipc_audit_client::AuditGate::wait_acknowledged` is the only source
     /// of an `AckedIntent`; module documentation). Commit `txn` on `Ok` and
     /// send [`Applied::outcome_event`] (or [`Applied::commit_failure_event`]
     /// if the commit fails); on `Err` abort `txn` and send the refusal's

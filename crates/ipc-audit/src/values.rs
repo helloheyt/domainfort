@@ -303,9 +303,12 @@ impl SidValue {
     }
 
     /// A SID keeping at most [`MAX_SID_SUB_AUTHORITIES`] sub-authorities
-    /// (more cannot occur from a `dtyp::Sid`).
-    #[cfg(feature = "ldap")]
-    pub(crate) fn clamped(authority: [u8; 6], sub_authorities: &[u32]) -> SidValue {
+    /// (more cannot occur from a `dtyp::Sid`). Public since task IB1: the
+    /// LDAP conversion moved to the side that links crates/ldap
+    /// (crates/directory-daemon `audit_convert`; docs/questions/Q-851,
+    /// A-144), which builds the wire SID from a `dtyp::Sid` with it.
+    #[must_use]
+    pub fn clamped(authority: [u8; 6], sub_authorities: &[u32]) -> SidValue {
         let kept = sub_authorities.len().min(MAX_SID_SUB_AUTHORITIES);
         SidValue {
             authority,

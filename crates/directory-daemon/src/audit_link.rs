@@ -1,5 +1,5 @@
 //! dird's link to auditd: the one audit client of crate ipc-audit
-//! (`ipc_audit::client`, task R9b) with dird's expectation — auditd's uid
+//! (`ipc_audit_client`, task R9b) with dird's expectation — auditd's uid
 //! and the source auditd must record dird's events under, [`AUDIT_SOURCE`].
 //! Verified first, before dird opens the directory or listens (docs/50
 //! R50-16: "auditd → keyd → dird → …; a daemon binds nothing until its
@@ -15,15 +15,15 @@
 //! (the kdc audits every request itself); the refused peers of dird's
 //! channels are counted on stderr, as keyd does (docs/questions/Q-260
 //! item 5; Q-270 item 6). What stays dird's own: its gate wrapper
-//! (crate::ldap_audit, which implements `ipc_audit::client::LinkedGate`),
+//! (crate::ldap_audit, which implements `ipc_audit_client::LinkedGate`),
 //! its notes and this expectation.
 //!
 //! Spec: docs/50 R50-3, R50-16, R50-17, §3.2, §8.1; docs/51 §5.7; docs/52
 //! §3.12; docs/questions/Q-512 (A-112), Q-560.
 
-pub use ipc_audit::client::{AuditEndpoint, AuditLinkError, AUDIT_DEADLINE, HEARTBEAT};
-use ipc_audit::client::{AuditLink, ExpectedAuditd};
 use ipc_audit::EventSource;
+pub use ipc_audit_client::{AuditEndpoint, AuditLinkError, AUDIT_DEADLINE, HEARTBEAT};
+use ipc_audit_client::{AuditLink, ExpectedAuditd};
 
 /// The source auditd must record dird's events under: dird sends the
 /// `Ldap` and `DirAdmin` shapes, which auditd accepts only from `Dird`

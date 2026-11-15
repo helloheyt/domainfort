@@ -54,10 +54,14 @@ ipc-dird-admin = { path = "../ipc-dird-admin" }
 # keyd's channel: admind's client of keyd (Role::Directory; keyd's uid
 # checked first; `call_with_fate`, A-90). Links no keyd and no crypto.
 ipc-keyd = { path = "../ipc-keyd" }
-# The audit channel and the `Admind` event shape; no conversion feature
-# (A-66: admind's events have no source crate); the one audit client
-# (`client`, task R9b — docs/questions/Q-560).
-ipc-audit = { path = "../ipc-audit", default-features = false, features = ["client"] }
+# The audit channel and the `Admind` event shape (admind's events have no
+# source crate, so no conversion).
+ipc-audit = { path = "../ipc-audit" }
+# The one audit client (task R9b — docs/questions/Q-560) and the shared gate
+# it drives; crate ipc-audit-client since task IB1 (docs/questions/Q-851,
+# A-144: no optional dependency in the workspace). Its tokio is the one this
+# daemon already links.
+ipc-audit-client = { path = "../ipc-audit-client" }
 # keyd's crypto-free types (`KeyPurpose`, `Error`, the time scale).
 keyd-types = { path = "../keyd-types" }
 # `KerberosTime` (the clock), `KRB_NT_PRINCIPAL`.

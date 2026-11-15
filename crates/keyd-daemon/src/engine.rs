@@ -53,7 +53,7 @@
 //! [`ipc_keyd_server::classify`]'s; an admitted change is a
 //! `ipc_keyd_server::KeyStateCall` that only
 //! [`ipc_keyd_server::execute_acknowledged`] runs, and only with the
-//! `ipc_audit::AckedIntent` the shared gate gives after auditd's
+//! `ipc_audit_client::AckedIntent` the shared gate gives after auditd's
 //! acknowledgement; [`ipc_keyd_server::execute`] refuses (`NotRun`) to run
 //! a plain call that keyd would now admit as such a change.
 //!

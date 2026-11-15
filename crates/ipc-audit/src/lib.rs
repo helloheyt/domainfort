@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 //! `ipc-audit`: the audit channel over `ipc`, the canonical encoding of the
 //! audit events, and the sender's bounded window (docs/50 R50-17, §8.1, §10
-//! task P6 — the library half; the auditd binary is P6b).
+//! task P6 — the library half; the auditd binary is P6b). One dependency,
+//! crate `ipc`; no feature (task IB1, below).
 //!
 //! # Channel (`audit.sock`)
 //!
@@ -24,17 +25,28 @@
 //! that auditd records it under its own source (task R9b, docs/questions/
 //! Q-512, Q-560).
 //!
-//! # The audit client (feature `client`)
+//! # The audit client and the gate: crate `ipc_audit_client`
 //!
-//! [`client`]: the one implementation of a sender's link to auditd (task
-//! R9b) — an [`client::AuditLink`] is built only with an
-//! [`client::ExpectedAuditd`] (auditd's uid and the source it must record
-//! this process under), verifies both on every new connection before any
-//! batch, and delivers a daemon's [`AuditGate`] window. Used by keyd-daemon,
-//! kdc-daemon, directory-daemon, admin-daemon and ldap-front's start-up
-//! check; behind the feature `client` (it needs tokio — owner decision
-//! P-12), which auditd does not enable, so the core keeps its one
-//! dependency.
+//! The one implementation of a sender's link to auditd (task R9b) and the
+//! audit gate with the proof of an acknowledged intent it drives (task R6,
+//! A-102) are crate `ipc_audit_client`'s, with its own non-optional tokio
+//! (owner decision P-12). auditd links only this crate.
+//!
+//! # No feature changes the graph (task IB1)
+//!
+//! Until task IB1 this crate carried the client (feature `client`, an
+//! optional tokio) and the conversions from the source crates' audit types
+//! (features `kdc`, `keyd`, `ldap`, each pulling its source crate in as an
+//! optional dependency). Decision A-66 kept them off by default, but cargo
+//! unifies features within one build: in a shared build one daemon's
+//! feature reached every daemon, linking keyd, krb-crypto and dirstore
+//! into processes that must not contain them (class C40, docs/questions/
+//! Q-851, decision A-144). Now no manifest of the workspace declares an
+//! `optional` dependency: the client is crate `ipc_audit_client`, and each
+//! conversion lives on the side that already links its source crate
+//! (crates/kdc-daemon, crates/ipc-keyd-server, crates/directory-daemon —
+//! each an `audit_convert` module) as plain functions (the orphan rule
+//! allows no `From` impl between two foreign types there).
 //!
 //! # Events
 //!
@@ -56,11 +68,8 @@
 //! item 5). Client strings are kept only as
 //! printable ASCII ≤ 256 octets, else a marker ([`AuditText`]). Codes come
 //! from closed tables mirroring the source enumerations by name
-//! (crate::codes). The conversions from the source types are behind the
-//! features `kdc`, `keyd`, `ldap` — none on by default (decision A-66):
-//! each daemon enables only the conversion it sends (keyd-daemon: `keyd`;
-//! auditd and dird: none), so a whole-workspace build does not unify the
-//! others into them. The admin-plane shapes need no feature: they have no
+//! (crate::codes). The conversions from the source types are on the side
+//! that links each source (task IB1, above). The admin-plane shapes have no
 //! source crate and are built from this crate's types.
 //!
 //! [`peek_shape`] reads only an event's format and shape octets: auditd uses
@@ -82,22 +91,6 @@
 //! on stderr. Every `DirAdmin` event is gating; an `Admind` event is
 //! noise exactly when it records a refused connection or a malformed frame
 //! ([`AdmindEvent::is_noise`]), so neither can make admind unavailable.
-//!
-//! # The gate and the proof of an acknowledged intent (docs/52 R6, A-102)
-//!
-//! [`AuditGate`]: the window and the audit client's view of auditd behind
-//! one lock — the one gate every sending daemon (keyd, the kdc, dird,
-//! admind) builds its own wrapper on. [`AckedIntent<T>`] is obtainable only
-//! from [`AuditGate::wait_acknowledged`], after auditd acknowledged the
-//! intent record ([`IntentRecord`]) of that very value: a mutation entry
-//! point that takes it by value cannot run before the acknowledgement
-//! (dird's `apply`, keyd's key-state changes, dird's decision
-//! registrations). [`AuditGate::close`] is the one bounded flush at stop
-//! ([`AUDIT_FLUSH_GRACE`], [`FlushWait`], [`Unflushed`]). The gate's link
-//! side — auditd reachable, the batch to send, auditd's `Ack`, a lost batch
-//! — is crate-private: only the one audit client (`client`, which verified
-//! the connection) drives it, so no code outside this crate can open a gate
-//! or acknowledge, i.e. mint a proof (task R15b, docs/questions/Q-630).
 //!
 //! # Security
 //!
@@ -134,26 +127,22 @@
 //! §3.6, §3.7, §7.5, §8.1), docs/52 (§3.11, §3.12, §7), PENDING-OWNER
 //! (A-57, A-67, A-85, A-87, A-101, A-107, A-112), docs/questions Q-500,
 //! Q-502, Q-510, Q-512, this repository's four daemon audit clients they
-//! replace, and the docs.rs API pages of tokio 1.54.1. No other
-//! implementation, serializer, RPC framework or audit format was consulted
-//! or recalled (AGENTS.md §1-3).
+//! replace, and the docs.rs API pages of tokio 1.54.1 (the client and the
+//! gate are crate `ipc_audit_client`'s since task IB1). The split of task
+//! IB1 was written only from docs/questions/Q-851, PENDING-OWNER A-144 and
+//! docs/research/r4-b §3.3, §5.6. No other implementation, serializer, RPC
+//! framework or audit format was consulted or recalled (AGENTS.md §1-3).
 //!
 //! Spec: docs/50 R50-17, §3.3, §8.1, §10; docs/37 §2; Q-218 (A-57); A-59;
 //! docs/51 §5.7 (A-72); A-88 (Q-366, Q-395); A-91 (Q-388, Q-397); docs/52
-//! §3.11 R6 (A-102), §3.12 (task R9b, A-112; Q-512, Q-560).
+//! §3.11 R6 (A-102), §3.12 (task R9b, A-112; Q-512, Q-560); Decision:
+//! A-144; Q-851 (task IB1).
 
 mod admin;
 mod channel;
-#[cfg(feature = "client")]
-pub mod client;
 mod codes;
-mod convert;
 mod error;
 mod event;
-mod gate;
-#[cfg(feature = "test-seams")]
-#[doc(hidden)]
-pub mod test_seams;
 mod values;
 mod window;
 
@@ -183,10 +172,6 @@ pub use event::{
     EventBody, EventBytes, KdcEvent, KdcOutcome, KeyRef, KeydRecord, LdapBind, LdapEvent,
     LdapOperation, LdapSearch, LdapTarget, TransportSecurity, WindowSummary, EVENT_FORMAT,
     MAX_EVENT_OCTETS, MAX_FILTER_ATTRS,
-};
-pub use gate::{
-    AckedIntent, AuditGate, FlushWait, IntentRecord, PendingIntent, Unflushed, WindowSteps,
-    AUDIT_FLUSH_GRACE, FLUSH_POLL,
 };
 pub use values::{
     AuditText, BoundedSeq, CalendarTime, CodecError, PdpReason, Principal, ReportedAddress,

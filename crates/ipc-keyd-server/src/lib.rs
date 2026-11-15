@@ -34,8 +34,9 @@
 //! auditd first (module `intent`). A plain call runs with [`execute`]; a
 //! key-state change (or a loosening) that keyd admits is a [`KeyStateCall`]
 //! and runs **only** with [`execute_acknowledged`], which takes an
-//! `ipc_audit::AckedIntent<KeyStateCall>` by value — obtainable only from
-//! the daemon's `ipc_audit::AuditGate` after auditd acknowledged that
+//! `ipc_audit_client::AckedIntent<KeyStateCall>` by value — obtainable only
+//! from the daemon's `ipc_audit_client::AuditGate` after auditd acknowledged
+//! that
 //! call's intent record. [`execute`] checks again when it runs and refuses
 //! ([`NotRun`]) to run a call that now needs the proof.
 //!
@@ -44,6 +45,13 @@
 //! the in-process loopback of the tests (this crate's, and keyd-daemon's
 //! comparison of its engine with it) — not a path a production build has
 //! (docs/52 C18).
+//!
+//! # keyd's record on the audit channel (task IB1)
+//!
+//! [`keyd_record`] converts keyd's `AuditRecord` to the audit channel's
+//! `ipc_audit::KeydRecord` (module `audit_convert`) — here, on the side that
+//! already links keyd, since task IB1 moved it out of an optional feature
+//! of crate ipc-audit (class C40; docs/questions/Q-851, decision A-144).
 //!
 //! # Provenance
 //!
@@ -54,15 +62,18 @@
 //! (AGENTS.md §1-3).
 //!
 //! Spec: docs/50 §3.2, §3.3, §3.4, §3.5, R50-3, R50-5, R50-7; docs/10 §2;
-//! A-56; A-59; D182; A-63; docs/52 §3.11 R6 (A-102).
+//! A-56; A-59; D182; A-63; docs/52 §3.11 R6 (A-102); Decision: A-144;
+//! Q-851 (task IB1).
 
+mod audit_convert;
 mod intent;
 
+pub use audit_convert::keyd_record;
 pub use intent::{classify, Classified, KeyStateCall, KeyStateIntent, PlainCall};
 
 use core::fmt;
 use ipc::EncodedFrame;
-use ipc_audit::AckedIntent;
+use ipc_audit_client::AckedIntent;
 use ipc_keyd::{Answer, Call, DescribedConfig};
 use keyd::{AuditSink, CallerId, EntropySource, KeyStore, Keyd, TgsFastRequest};
 use krb_proto::KerberosTime;

@@ -78,9 +78,9 @@ pub const SOCKET_FILE_MODE: u32 = 0o666;
 pub const DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 /// How long a stop waits for auditd to acknowledge admind's window: the one
-/// bound of every daemon, `ipc_audit::AUDIT_FLUSH_GRACE` (5 s;
+/// bound of every daemon, `ipc_audit_client::AUDIT_FLUSH_GRACE` (5 s;
 /// docs/questions/Q-313, A-82; docs/52 §3.11 R6 (b)).
-pub const AUDIT_FLUSH_GRACE: Duration = ipc_audit::AUDIT_FLUSH_GRACE;
+pub const AUDIT_FLUSH_GRACE: Duration = ipc_audit_client::AUDIT_FLUSH_GRACE;
 
 /// Poll interval while draining. Project choice.
 const DRAIN_POLL: Duration = Duration::from_millis(10);
@@ -397,7 +397,7 @@ pub async fn serve_with(
     control.state.serving.store(false, Ordering::SeqCst);
     context.start_draining();
     wait_until(DRAIN_GRACE, || context.in_flight() == 0).await;
-    // The one flush of every daemon (`ipc_audit::AuditGate::close`, docs/52
+    // The one flush of every daemon (`ipc_audit_client::AuditGate::close`, docs/52
     // R6): admind's full wait, as built (A-87's rule for dird).
     let unacknowledged = gate
         .close(AUDIT_FLUSH_GRACE, async {

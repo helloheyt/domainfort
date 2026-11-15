@@ -75,7 +75,7 @@ daemon-sandbox = { path = "../daemon-sandbox" }
 # crates/kdc/tests/common.
 keyd = { path = "../keyd" }
 keyd-daemon = { path = "../keyd-daemon", features = ["test-seams"] }
-ipc-audit = { path = "../ipc-audit", default-features = false, features = ["keyd"] }
+ipc-audit = { path = "../ipc-audit" }
 krb-proto = { path = "../krb-proto" }
 # Off Linux the ipc-keyd connector cannot read peer credentials (fail
 # closed), so the tests read keyd's uid with tokio `UnixStream::peer_cred`,
