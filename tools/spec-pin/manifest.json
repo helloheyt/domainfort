@@ -1,7 +1,7 @@
 {
   "_comment": "ספריית המפרטים המוצמדת (specs/SOURCES.md §D, docs/17 SV-*). revision+sha256 ממולאים ע\"י scripts/pin-specs.sh. ללא הצמדה — אין לכתוב קוד מהמסמך (AGENTS.md).",
   "ms_openspec_pdf_host": "https://winprotocoldoc.z19.web.core.windows.net",
-  "generated_at": "2026-11-14T23:29:52Z",
+  "generated_at": "2026-11-14T23:50:18Z",
   "documents": [
     {
       "id": "MS-ADTS",
@@ -295,6 +295,46 @@
       "url": "https://www.rfc-editor.org/rfc/rfc3645.txt",
       "revision": "RFC3645",
       "sha256": "18443eba664ecbeff6ac63bf11f260b9e8cb801f60a963b3e89586485fa44efe",
+      "phase": "1",
+      "blocks": []
+    },
+    {
+      "id": "RFC1034",
+      "title": "Domain names - concepts and facilities",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc1034.txt",
+      "revision": "RFC1034",
+      "sha256": "d6b10a71441df879cc2817d23f2dad120c8a5f87e74eba1e4ed4b743a76a891a",
+      "phase": "1",
+      "blocks": []
+    },
+    {
+      "id": "RFC1035",
+      "title": "Domain names - implementation and specification",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc1035.txt",
+      "revision": "RFC1035",
+      "sha256": "d14ae809fc9b41bbcae26bb38c937c9515808b944f3252b00de9fe0e95f4fdfb",
+      "phase": "1",
+      "blocks": []
+    },
+    {
+      "id": "RFC2136",
+      "title": "Dynamic Updates in the Domain Name System (DNS UPDATE)",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc2136.txt",
+      "revision": "RFC2136",
+      "sha256": "c6ee9f06e8dd817e260734adadef806a4296ed637d8afabc508f96ae84625bd5",
+      "phase": "1",
+      "blocks": []
+    },
+    {
+      "id": "RFC8945",
+      "title": "Secret Key Transaction Authentication for DNS (TSIG)",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc8945.txt",
+      "revision": "RFC8945",
+      "sha256": "f225ac6b0c5c0c1e4c9dc97adb0156faccfebbeaef4e84aebc5fdf727079ae62",
       "phase": "1",
       "blocks": []
     },

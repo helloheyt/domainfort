@@ -1,0 +1,59 @@
+# cargo-fuzz harness for parse-dns (AGENTS.md §6: every parser gets a fuzz
+# target before it merges to main; docs/54 §10.3).
+#
+# This is a SEPARATE workspace (note the empty [workspace] table below): it is
+# intentionally NOT a member of the root workspace, so `cargo build --all`,
+# `cargo clippy`, `cargo test`, `cargo deny` and the SBOM in the product
+# workspace never pull in the fuzzing-only dependencies. It is built only via
+# `cargo fuzz run dns_message` / `cargo fuzz run dns_name` /
+# `cargo fuzz run dns_tsig_mac_input` (nightly + cargo-fuzz).
+#
+# NOTE FOR REVIEW: libfuzzer-sys is fuzz-harness-only test infrastructure, not
+# linked into any product crate, and on the license allowlist (MIT / Apache-2.0,
+# AGENTS.md §7). Pending owner sign-off (docs/questions/PENDING-OWNER.md P-1);
+# not built or run until then.
+
+[package]
+name = "parse-dns-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.parse-dns]
+path = ".."
+
+# `decode` under every profile, with the canonical re-encoding property
+# (`cargo fuzz run dns_message`; docs/54 §10.3).
+[[bin]]
+name = "dns_message"
+path = "fuzz_targets/dns_message.rs"
+test = false
+doc = false
+bench = false
+
+# Names: compressed names inside a message built around the input, plus the
+# standalone constructors (`cargo fuzz run dns_name`; docs/54 §10.3).
+[[bin]]
+name = "dns_name"
+path = "fuzz_targets/dns_name.rs"
+test = false
+doc = false
+bench = false
+
+# The TSIG MAC input components derived from the received octets
+# (`cargo fuzz run dns_tsig_mac_input`; docs/54 §10.3).
+[[bin]]
+name = "dns_tsig_mac_input"
+path = "fuzz_targets/dns_tsig_mac_input.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the root workspace (see header).
+[workspace]

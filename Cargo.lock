@@ -809,6 +809,10 @@ name = "parse-asn1"
 version = "0.0.0"
 
 [[package]]
+name = "parse-dns"
+version = "0.0.0"
+
+[[package]]
 name = "parse-kpasswd"
 version = "0.0.0"
 dependencies = [
