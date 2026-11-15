@@ -197,13 +197,14 @@ fn admit(shared: &Shared, context: &Arc<TcpContext>, peer: IpAddr) -> Option<Slo
     if shared.draining.load(Ordering::SeqCst) {
         return None;
     }
+    // Noise: docs/54 §9 ("dropped", "limited").
     if !shared.serves(peer) {
-        SOURCE_NOT_INTERNAL.hit();
+        shared.noise(&SOURCE_NOT_INTERNAL);
         return None;
     }
     let slot = context.acquire(source_key(peer));
     if slot.is_none() {
-        TCP_LIMITED.hit();
+        shared.noise(&TCP_LIMITED);
     }
     slot
 }
@@ -324,9 +325,10 @@ async fn connection(
         if shared.draining.load(Ordering::SeqCst) {
             return;
         }
-        // The per-source and global message limit (R54-10).
+        // The per-source and global message limit (R54-10). Noise: docs/54
+        // §9 ("limited").
         if !shared.tcp_limiter.admit(key, Instant::now()) {
-            TCP_QUERY_LIMITED.hit();
+            shared.noise(&TCP_QUERY_LIMITED);
             return;
         }
         let next = answer(&mut stream, &message, peer, &shared, limits.frame_timeout).await;
@@ -351,8 +353,9 @@ async fn answer(
         Verdict::Reply(reply) if reply.transport() == Transport::Tcp => reply.into_bytes(),
         // Never: dns-zone builds for the transport it is given. Fail closed.
         Verdict::Reply(_) | Verdict::Close => return Next::Close,
+        // Noise: docs/54 §9 ("malformed").
         Verdict::Silence(_) => {
-            SILENCED.hit();
+            shared.noise(&SILENCED);
             return Next::Continue;
         }
         Verdict::Forward(forward) => match relay(&forward, peer, shared).await {
@@ -393,7 +396,8 @@ async fn relay(forward: &Forward<'_>, peer: IpAddr, shared: &Arc<Shared>) -> Rel
         .forward_limiter
         .admit(source_key(peer), Instant::now())
     {
-        FORWARD_LIMITED.hit();
+        // Noise: docs/54 §9 ("limited").
+        shared.noise(&FORWARD_LIMITED);
         return fallback();
     }
     let Some(request) = DnsMessage::new(forward.message())
@@ -407,7 +411,9 @@ async fn relay(forward: &Forward<'_>, peer: IpAddr, shared: &Arc<Shared>) -> Rel
         .try_send(ForwardJob { request, answer })
         .is_err()
     {
-        FORWARD_QUEUE_FULL.hit();
+        // Noise: docs/54 §9 ("refused" — refused for a full queue;
+        // docs/questions/Q-961).
+        shared.noise(&FORWARD_QUEUE_FULL);
         return fallback();
     }
     match timeout(shared.forward_answer_timeout, outcome).await {

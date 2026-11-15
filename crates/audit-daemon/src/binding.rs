@@ -11,7 +11,11 @@
 //! | `WindowSummary` | any mapped source | every sender's window writes one (Q-252 item 8, A-57) |
 //!
 //! ldap-front sends no events (crates/ldap-front audit.rs), so no shape is
-//! bound to it.
+//! bound to it; nor to dnsd, which sends only `WindowSummary` counters
+//! (docs/54 §9), nor to kpasswd-front, which sends no events (docs/53 §9;
+//! docs/questions/Q-955 item 1) — task DN12, docs/questions/Q-960. Each of
+//! the three may send `WindowSummary` like every mapped source, and every
+//! other shape from them is refused.
 //!
 //! The source of every record is the connection's peer uid, never a field
 //! (docs/50 §3.2, §8.1). A shape from any other source is a forgery attempt

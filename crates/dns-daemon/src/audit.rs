@@ -1,86 +1,144 @@
-//! dnsd's audit check: auditd verified first (docs/50 R50-16; docs/54 §4.8:
+//! dnsd's audit: auditd verified first, then dnsd's noise counters
+//! delivered as `WindowSummary` events (docs/54 §9).
+//!
+//! # The start-up check (docs/50 R50-16; docs/54 §4.8)
+//!
 //! "configuration ⇒ bind ⇒ hardening ⇒ auditd verified (the one audit
-//! client, source `dnsd` — R9b) ⇒ dird verified ⇒ …").
-//!
-//! The check is the one audit client's (crates/ipc-audit-client
-//! `AuditLink::verify`, task R9b): connect, check auditd's uid, `Ping` → a
-//! `Pong` naming the source auditd records **this** process under — another
+//! client, source `dnsd` — R9b) ⇒ dird verified ⇒ …". The check is the one
+//! audit client's (crates/ipc-audit-client `AuditLink::connect`, task R9b):
+//! connect, check auditd's uid, `Ping` → a `Pong` naming the source auditd
+//! records **this** process under, which must be [`AUDIT_SOURCE`] — another
 //! source ⇒ nothing sent, no start (docs/52 §3.12 C12; docs/questions/
-//! Q-560). There is no way to skip it.
+//! Q-560). There is no way to skip it, and no other source to expect: the
+//! source is this constant, not a parameter (task DN12, docs/questions/
+//! Q-950, Q-960). It is auditd that decides the source, from dnsd's peer uid
+//! and its own `uid_sources` map (docs/50 §3.2) — an auditd that does not
+//! map dnsd's uid to `dnsd` closes the connection or names another source,
+//! and dnsd does not start (fail closed, docs/50 §7.5).
 //!
-//! # The source `dnsd` does not exist yet (docs/questions/Q-950)
+//! # What dnsd records (docs/54 §9, R54-11)
 //!
-//! docs/54 §9 and docs/questions/Q-619 item 2 give dnsd its own audit source
-//! (`dnsd`, code 7 ⚠), added to ipc-audit's closed `EventSource` table, the
-//! audit log's source codes, auditd's `uid_sources` and its shape ↔ source
-//! binding — task DN12, not built. dnsd must not borrow another process's
-//! source: auditd would record dnsd's connection as that process (the C12
-//! class R9b closed). So the source dnsd expects is [`AUDIT_SOURCE`] =
-//! `None` until DN12, and with `None` the check refuses
-//! ([`AuditCheckError::SourceNotRegistered`]) — **the product daemon does
-//! not start** (fail closed, docs/50 §7.5). When DN12 adds the variant, this
-//! constant becomes `Some(EventSource::Dnsd)` and nothing else changes.
+//! "dnsd — a new source (`dnsd`, source code 7): only counters
+//! (`WindowSummary` — noise: dropped / limited / malformed / refused) … no
+//! record per query." dnsd has no event shape of its own: every peer-driven
+//! noise occurrence (crate::daemon `Shared::noise` — the one place it is
+//! counted) is counted into the shared gate's window
+//! ([`AuditGate::count_noise`]), which takes no slot; the audit link sends
+//! the count as the next `WindowSummary` (`suppressed_noise`) when it next
+//! looks at the window — at the latest after its idle heartbeat
+//! (ipc-audit-client `HEARTBEAT`) — so a flood yields at most one summary
+//! per heartbeat, never one record per datagram. dnsd reserves no slot:
+//! queries are not gated on auditd (docs/54 §9); the UPDATE decisions are
+//! audited — gating — by dird, their PEP (docs/54 §4.5 step 7, §9). Which
+//! counters are noise is crate::daemon's reading of docs/54 §9
+//! (docs/questions/Q-961).
 //!
-//! Nor does dnsd send events yet: docs/54 §9 gives it noise counters only
-//! (`WindowSummary`), and no event shape of its own exists (DN12). Like
-//! ldap-front (which "sends no events; verifies auditd at start"), dnsd
-//! verifies auditd at start and reports its counters on its operational log
-//! (crate::log) meanwhile. Queries are not gated on auditd (docs/54 §9: "no
-//! record per query"); the UPDATE decisions are audited — gating — by dird,
-//! their PEP (docs/54 §4.5 step 7, §9).
-//!
-//! Spec: docs/50 R50-3, R50-16, §3.2, §7.5; docs/54 §4.8, §9; docs/52 §3.12;
-//! docs/questions/Q-560 item 5, Q-619 items 2, 3, Q-950.
+//! Spec: docs/50 R50-3, R50-16, R50-17, §3.2, §7.5, §8.1; docs/54 §4.8, §9,
+//! R54-11; docs/52 §3.12; A-57; docs/questions/Q-560 item 5, Q-619 items 2,
+//! 3, Q-950 (A-157), Q-960, Q-961.
 
-use ipc_audit::EventSource;
-use ipc_audit_client::{AuditEndpoint, AuditLink, AuditLinkError, ExpectedAuditd};
+use crate::log::{note, Note};
+use core::future::Future;
+use core::time::Duration;
+use ipc_audit::{EventSource, WindowConfig};
+use ipc_audit_client::{
+    AuditEndpoint, AuditLink, AuditLinkError, ExpectedAuditd, FlushWait, Unflushed,
+};
 
-/// The source auditd must record dnsd under — `dnsd` (docs/54 §9; Q-619
-/// item 2), not yet in ipc-audit's closed table (task DN12): `None` until
-/// then, so the start-up check refuses (module documentation; Q-950).
-pub const AUDIT_SOURCE: Option<EventSource> = None;
+/// The source auditd must record dnsd under — `dnsd`, code 7.
+/// Spec: docs/54 §9; docs/questions/Q-619 item 2, Q-950 (A-157), Q-960.
+pub const AUDIT_SOURCE: EventSource = EventSource::Dnsd;
 
-/// Why the audit check failed. Carries no octet of any frame.
-/// Spec: docs/50 §7.5, §8.2.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuditCheckError {
-    /// dnsd has no audit source of its own yet (task DN12, docs/questions/
-    /// Q-950): nothing was connected.
-    SourceNotRegistered,
-    /// The one audit client's check failed (uid 0 configured, connect, peer
-    /// uid, the source auditd named, a deadline, …).
-    Link(AuditLinkError),
+/// dnsd's audit window: ipc-audit's default. dnsd commits no event of its
+/// own and reserves no slot, so the window only ever holds its summaries.
+/// Project choice (the shared default, ipc-audit `WindowConfig::DEFAULT`).
+pub const AUDIT_WINDOW: WindowConfig = WindowConfig::DEFAULT;
+
+/// dnsd's link to the auditd of `endpoint`, expecting [`AUDIT_SOURCE`].
+///
+/// # Errors
+/// [`AuditLinkError::RootServerUid`] for a configured auditd uid of 0.
+///
+/// Spec: docs/50 R50-3, R50-16, §3.2; docs/questions/Q-560 item 5.
+pub fn link(endpoint: &AuditEndpoint) -> Result<AuditLink, AuditLinkError> {
+    let expected = ExpectedAuditd::new(endpoint.uid, AUDIT_SOURCE)?;
+    Ok(AuditLink::new(endpoint.socket.clone(), expected))
 }
 
-impl core::fmt::Display for AuditCheckError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            AuditCheckError::SourceNotRegistered => f.write_str(
-                "dnsd has no audit source of its own yet (task DN12); auditd not contacted",
-            ),
-            AuditCheckError::Link(error) => write!(f, "{error}"),
+/// dnsd's gate: the shared `ipc_audit_client::AuditGate` (its window, the
+/// reachability the audit link alone sets, the stop's flush) with dnsd's
+/// one way to record — a counted noise occurrence.
+/// Spec: docs/54 §9; docs/52 §3.11 R6; A-57.
+#[derive(Debug)]
+pub struct AuditGate {
+    core: ipc_audit_client::AuditGate,
+}
+
+impl AuditGate {
+    /// A gate over an empty window; auditd counts as unreachable until the
+    /// audit link says otherwise.
+    #[must_use]
+    pub fn new(window: WindowConfig) -> AuditGate {
+        AuditGate {
+            core: ipc_audit_client::AuditGate::new(window),
         }
+    }
+
+    /// Count one peer-driven noise occurrence into the next
+    /// `WindowSummary` — kept while auditd is unreachable, never a slot.
+    /// Spec: docs/54 §9; A-57; docs/questions/Q-961.
+    pub fn count_noise(&self) {
+        self.core.count_noise();
+    }
+
+    /// Noise counted and not yet queued as a summary (for tests and the
+    /// daemon's own reports); `None` if the gate's lock is poisoned.
+    #[must_use]
+    pub fn counted_noise(&self) -> Option<u64> {
+        self.core.inspect(ipc_audit::SendWindow::suppressed_noise)
+    }
+
+    /// The stop's flush (`ipc_audit_client::AuditGate::close`): wait at most
+    /// `grace` for the summaries already queued, stopping early once the
+    /// link counts auditd as unreachable (nothing dnsd sends gates an
+    /// operation — the kdc's and keyd's rule, A-87); then end the link.
+    /// Spec: docs/questions/Q-313 (A-82), Q-350 item 11 (A-87); docs/52
+    /// §3.11 R6 (b).
+    pub(crate) async fn close<E: Future<Output = ()>>(
+        &self,
+        grace: Duration,
+        end_link: E,
+    ) -> Unflushed {
+        self.core
+            .close(
+                grace,
+                FlushWait::UntilAcknowledgedOrUnreachable,
+                tokio::time::sleep,
+                end_link,
+            )
+            .await
     }
 }
 
-impl std::error::Error for AuditCheckError {}
+/// What dnsd's gate gives the one audit client (task R9b): the shared gate,
+/// no wake-up (dnsd records no event; its counts leave with the link's
+/// heartbeat — module documentation), and dnsd's notes when the link is
+/// restored or lost.
+/// Spec: docs/52 §3.11 R6, §3.12; docs/questions/Q-512, Q-560 item 4.
+impl ipc_audit_client::LinkedGate for AuditGate {
+    fn audit_gate(&self) -> &ipc_audit_client::AuditGate {
+        &self.core
+    }
 
-/// Verify the auditd of `endpoint`, expecting it to record this process
-/// under `source` (module documentation).
-///
-/// # Errors
-/// [`AuditCheckError`].
-///
-/// Spec: docs/50 R50-3, R50-16, §3.2, §7.5; docs/questions/Q-560 item 5,
-/// Q-950.
-pub async fn verify_auditd(
-    endpoint: &AuditEndpoint,
-    source: Option<EventSource>,
-) -> Result<(), AuditCheckError> {
-    let source = source.ok_or(AuditCheckError::SourceNotRegistered)?;
-    let expected = ExpectedAuditd::new(endpoint.uid, source).map_err(AuditCheckError::Link)?;
-    AuditLink::new(endpoint.socket.clone(), expected)
-        .verify()
-        .await
-        .map_err(AuditCheckError::Link)
+    fn recorded(&self) -> impl Future<Output = ()> + Send + '_ {
+        core::future::pending()
+    }
+
+    fn link_restored(&self) {
+        note(Note::AuditRestored, None);
+    }
+
+    fn link_lost(&self) {
+        note(Note::AuditLost, None);
+    }
 }

@@ -25,8 +25,9 @@
 //!    process has one thread (R50-14);
 //! 5. only then build the tokio runtime (current-thread) and run [`serve`]:
 //!    every listener inside the internal networks, the realm valid, auditd
-//!    verified (**fails closed today — no audit source exists for the
-//!    front**, [`audit`]; docs/questions/Q-955 item 1), dird verified on the
+//!    verified (its uid, and a `Pong` naming the front's own source
+//!    `kpasswd-front` — [`audit`]; task DN12, docs/questions/Q-955 item 1,
+//!    Q-960), dird verified on the
 //!    kpasswd channel (`Ping` → `Pong` naming the internal zone), and only
 //!    now are the listeners served.
 //!
@@ -67,7 +68,7 @@
 //! | [`reply`] | the KRB-ERROR encoder and the framing of keyd's sealed reply |
 //! | [`clock`] | the KRB-ERROR's server time |
 //! | `daemon` | [`serve`], the start-up checks, accept loops, connection limits |
-//! | [`audit`] | the start-up check of auditd (fails closed until the front has an audit source) |
+//! | [`audit`] | the start-up check of auditd (the front's own source, `kpasswd-front`) |
 //! | [`startup`] | configuration, binding, hardening plan |
 //! | [`log`] | fixed stderr messages and the counted events (docs/53 §9) |
 //!
@@ -82,8 +83,11 @@
 //!
 //! # Residuals (documented, not hidden)
 //!
-//! - **No audit source** (docs/questions/Q-955 item 1): the product front
-//!   does not start until ipc-audit / config gain a kpasswd-front source.
+//! - The front sends no audit events: its layer is counted on the
+//!   operational log only (docs/53 §9 as Q-955 item 1 reads it; restated in
+//!   docs/questions/Q-961). The product front starts once auditd's
+//!   `uid_sources` maps its uid to `kpasswd-front` (task DN12); provisioning
+//!   that entry is task K9's.
 //! - A compromised front can drop, delay or forge a KRB-ERROR (confusion
 //!   only — RFC 4120 §5.9), lie about the client's address (skipping only
 //!   keyd's `s-address` check) and relay other hosts' requests in its own
@@ -129,10 +133,9 @@ pub use daemon::{
 };
 pub use log::Counts;
 
-// The tests that run `serve` end to end with a stand-in audit source (no
-// kpasswd-front source exists yet — docs/questions/Q-955 item 1). They are
-// crate-internal `#[cfg(test)]` modules, not a test seam: no build of any
-// other crate can reach the entry that takes the source (docs/52 C18).
-// Sources: see each module.
+// The tests that run `serve` end to end against a test dird and a test (or
+// the real) auditd. They are crate-internal `#[cfg(test)]` modules; since
+// task DN12 they run the product entry itself — there is no test seam
+// (docs/52 C18). Sources: see each module.
 #[cfg(test)]
 mod tests;

@@ -12,8 +12,9 @@
 //!    zone's (docs/53 §3.3; docs/52 R14), whatever bound the listeners;
 //! 2. the realm is a valid Kerberos realm (the KRB-ERROR encoder,
 //!    crate::reply);
-//! 3. auditd is verified (crate::audit) — R50-16; today this fails closed,
-//!    no audit source existing for the front (docs/questions/Q-955 item 1);
+//! 3. auditd is verified (crate::audit: its uid, and a `Pong` naming the
+//!    source `kpasswd-front` — task DN12, docs/questions/Q-955 item 1) —
+//!    R50-16;
 //! 4. dird is verified on the kpasswd channel (peer uid, `Ping` → `Pong`
 //!    naming the internal zone) — §7.5;
 //! 5. only now are the listeners served. Until then nothing is read from
@@ -49,7 +50,7 @@
 //! accept}`, `net::TcpStream::local_addr`, `sync::{Semaphore, Notify}`,
 //! `task::JoinSet`, `spawn`; std `net::TcpListener::local_addr`.
 
-use crate::audit::{verify_auditd, AuditCheckError, FRONT_AUDIT_SOURCE};
+use crate::audit::verify_auditd;
 use crate::connection;
 use crate::log::{note, Counters, Counts, Note};
 use crate::reply::{InvalidRealm, ReplyEncoder};
@@ -57,7 +58,7 @@ use config::{is_internal, KpasswdFrontSettings, Network};
 use core::fmt;
 use core::net::IpAddr;
 use core::time::Duration;
-use ipc_audit::EventSource;
+use ipc_audit_client::AuditLinkError;
 use ipc_kpasswd::{
     ClientConfigError, ExpectedDird, FrontZone, KpasswdClient, Unserved, MAX_FRONT_CONNECTIONS,
 };
@@ -165,33 +166,6 @@ impl FrontParams {
     }
 }
 
-/// Everything [`serve_with`] needs besides the listeners: the product
-/// [`FrontParams`] plus the audit source the front must be recorded under.
-/// Built for a product front only by `From<FrontParams>`, with
-/// [`FRONT_AUDIT_SOURCE`] (none yet — the start fails closed, crate::audit).
-/// Crate-private: only this crate's `#[cfg(test)]` modules build one with a
-/// stand-in source for their test auditd — no other crate, in any build,
-/// can (docs/52 C18: no test seam in a product API).
-/// Spec: docs/52 §3.18; docs/50 R50-16; docs/questions/Q-955 item 1.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ServeParams {
-    /// The product parameters.
-    pub(crate) front: FrontParams,
-    /// The source auditd must record the front under.
-    pub(crate) audit_source: Option<EventSource>,
-}
-
-impl From<FrontParams> for ServeParams {
-    /// The product parameters with the product audit source.
-    /// Spec: crate::audit.
-    fn from(front: FrontParams) -> ServeParams {
-        ServeParams {
-            front,
-            audit_source: FRONT_AUDIT_SOURCE,
-        }
-    }
-}
-
 /// The bound TCP listeners (crate::startup binds them as root).
 /// Spec: docs/53 R53-3; docs/50 §6.2.
 #[derive(Debug, Default)]
@@ -212,8 +186,10 @@ pub enum DaemonError {
     ListenerNotInternal,
     /// The realm is not a valid Kerberos realm.
     Realm(InvalidRealm),
-    /// auditd was not verified.
-    Audit(AuditCheckError),
+    /// auditd was not verified: unreachable, another uid, or a source other
+    /// than `kpasswd-front` (its `uid_sources` does not map the front —
+    /// task DN12); nothing was served and dird was not asked.
+    Audit(AuditLinkError),
     /// dird's configured uid is unusable.
     DirdConfig(ClientConfigError),
     /// dird did not answer the check.
@@ -439,39 +415,24 @@ async fn accept_loop(
 }
 
 /// Run the product kpasswd-front until [`DaemonControl::stop`] (module
-/// documentation): the product parameters and the product audit source
-/// (docs/52 C18).
+/// documentation): the product parameters and the product audit source,
+/// `audit::FRONT_AUDIT_SOURCE` — the one entry, for the product and for this
+/// crate's tests alike: since task DN12 there is no value left to vary, so
+/// there is no crate-private second entry either (docs/52 C18).
 ///
 /// # Errors
 /// [`DaemonError`] — a start-up check failed; nothing was served.
 ///
-/// Spec: docs/53 §3.3, §5.1; docs/50 R50-16, §7.5; docs/52 §3.18.
+/// Spec: docs/53 §3.3, §5.1, §5.6; docs/50 R50-16, §7.5; docs/52 §3.18,
+/// §7 R14.
 pub async fn serve(
-    params: FrontParams,
+    front: FrontParams,
     listeners: Listeners,
     control: DaemonControl,
 ) -> Result<(), DaemonError> {
-    serve_with(ServeParams::from(params), listeners, control).await
-}
-
-/// [`serve`] with every value given. Crate-private (see [`ServeParams`]).
-///
-/// # Errors
-/// [`DaemonError`] — a start-up check failed; nothing was served.
-///
-/// Spec: docs/53 §3.3, §5.1, §5.6; docs/50 R50-16, §7.5; docs/52 §7 R14.
-pub(crate) async fn serve_with(
-    params: ServeParams,
-    listeners: Listeners,
-    control: DaemonControl,
-) -> Result<(), DaemonError> {
-    let ServeParams {
-        front,
-        audit_source,
-    } = params;
     check_listeners(&listeners, &front.internal_networks)?;
     let encoder = ReplyEncoder::new(&front.realm).map_err(DaemonError::Realm)?;
-    verify_auditd(&front.audit, audit_source)
+    verify_auditd(&front.audit)
         .await
         .map_err(DaemonError::Audit)?;
     note(Note::AuditVerified, None);

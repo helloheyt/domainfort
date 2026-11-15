@@ -68,13 +68,15 @@ ipc-dns = { path = "../ipc-dns" }
 # A-154 item 6 (a)): used as is, keyed by the IPv4 address / IPv6 /64. A
 # leaf: no dependency at all.
 rate-limit = { path = "../rate-limit" }
-# The audit channel's `EventSource` (the source auditd must record dnsd
-# under; no event conversion — dnsd sends no event yet, docs/questions/
-# Q-950). Since task IB1 its only dependency is crate ipc (A-149).
+# The audit channel's `EventSource::Dnsd` (the source auditd must record
+# dnsd under — task DN12) and `WindowConfig`; no event conversion — dnsd's
+# only events are the window's `WindowSummary` counters (docs/54 §9). Since
+# task IB1 its only dependency is crate ipc (A-149).
 ipc-audit = { path = "../ipc-audit" }
 # The one audit client (task R9b; crate ipc-audit-client since task IB1):
-# auditd's uid and reported source verified at start (docs/50 R50-16). Its
-# tokio is the one this daemon links.
+# auditd's uid and reported source verified at start (docs/50 R50-16), and
+# the gate + link that deliver the noise counters. Its tokio is the one this
+# daemon links.
 ipc-audit-client = { path = "../ipc-audit-client" }
 # `DnsdSettings`, `Network`, `is_internal` (the one address match, A-114).
 config = { path = "../config" }
@@ -116,6 +118,13 @@ zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
 # tests whose configuration file crates/protected-file reads (task T;
 # docs/questions/Q-480). No dependency.
 test-scratch = { path = "../test-scratch" }
+# TESTS ONLY (task DN12): tests/audit.rs runs the product start against the
+# real auditd listener and writer (crates/audit-daemon tests/common, reused
+# by `#[path]` as crates/ldap-front's tests do) and reads its log. Workspace
+# crates, already in the lock; never normal dependencies (the guard
+# tests/no_store_or_keyd.rs checks the normal graph).
+audit-daemon = { path = "../audit-daemon" }
+audit-log = { path = "../audit-log" }
 
 [lints]
 workspace = true

@@ -182,7 +182,9 @@ fn ping_gets_pong() {
 /// set from the uid"), §8.1; task R9b (docs/questions/Q-512, Q-560): the
 /// `Pong` names the source the connection's events are recorded under — for
 /// every source a uid can be mapped to — and an `Append` on the same
-/// connection is recorded under exactly that source.
+/// connection is recorded under exactly that source. Task DN12: `dnsd`
+/// (docs/54 §9) and `kpasswd-front` (docs/53 §9) included
+/// (docs/questions/Q-960).
 #[test]
 fn pong_names_the_source_the_connection_is_recorded_under() {
     let Some(uid) = mappable_uid() else { return };
@@ -192,6 +194,12 @@ fn pong_names_the_source_the_connection_is_recorded_under() {
         ("kdc", EventSource::Kdc, Source::Kdc),
         ("ldap-front", EventSource::LdapFront, Source::LdapFront),
         ("admind", EventSource::Admind, Source::Admind),
+        ("dnsd", EventSource::Dnsd, Source::Dnsd),
+        (
+            "kpasswd-front",
+            EventSource::KpasswdFront,
+            Source::KpasswdFront,
+        ),
     ] {
         let dir = TempDir::new();
         let settings = settings_for(&dir, uid, name, 5);
@@ -602,7 +610,11 @@ fn misbound_shape_is_refused_and_recorded() {
 /// every shape is sent on its own connection: the sender's own shapes and
 /// `WindowSummary` get an `Ack`; every other shape is refused (`Malformed`,
 /// then close), nothing of it persisted, and the refusals are counted into
-/// `EventsMisbound` records.
+/// `EventsMisbound` records. Task DN12 (docs/54 §9: dnsd sends only
+/// `WindowSummary` counters; docs/53 §9, Q-955 item 1: kpasswd-front sends
+/// no events; docs/questions/Q-960): a dnsd- and a kpasswd-front-mapped
+/// connection get an `Ack` for `WindowSummary` alone — every other shape is
+/// refused from them.
 #[test]
 fn older_shapes_are_bound_to_their_sender() {
     let Some(uid) = mappable_uid() else { return };
@@ -614,7 +626,13 @@ fn older_shapes_are_bound_to_their_sender() {
         ("Admind", admind_events().remove(1)),
         ("WindowSummary", window_summary()),
     ];
-    for (source, own_shapes) in [("kdc", &["Kdc"][..]), ("dird", &["Ldap", "DirAdmin"][..])] {
+    let none: &[&str] = &[];
+    for (source, own_shapes) in [
+        ("kdc", &["Kdc"][..]),
+        ("dird", &["Ldap", "DirAdmin"][..]),
+        ("dnsd", none),
+        ("kpasswd-front", none),
+    ] {
         let dir = TempDir::new();
         let settings = settings_for(&dir, uid, source, 5);
         let server = Server::start(&settings, config(&settings), 8, true);

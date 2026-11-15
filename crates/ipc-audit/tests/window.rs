@@ -178,6 +178,72 @@ fn lost_outcomes_are_counted_into_the_next_summary() {
     );
 }
 
+/// docs/54 §9 (dnsd: "only counters (`WindowSummary` — noise: dropped /
+/// limited / malformed / refused)", "no record per query"); A-57 (noise is
+/// summarised in counters): noise counted without an event of its own takes
+/// no slot — not even within the noise share, and never one a gating event
+/// needs — and goes into the next summary's `suppressed_noise`, beside the
+/// other counts; nothing is sent while nothing was counted. Task DN12,
+/// docs/questions/Q-961.
+#[test]
+fn counted_noise_takes_no_slot_and_goes_into_the_summary() {
+    let mut window = SendWindow::new(WindowConfig::new(2, 1).unwrap());
+    assert!(
+        window.next_batch().is_none(),
+        "nothing counted, nothing sent"
+    );
+    for _ in 0..5 {
+        window.count_noise();
+    }
+    assert_eq!(window.suppressed_noise(), 5);
+    assert_eq!(window.used(), 0, "the count takes no slot");
+    assert_eq!(window.unacknowledged(), 0);
+    // Every slot is still there for gating events.
+    let a = window.reserve().unwrap();
+    let b = window.reserve().unwrap();
+    assert!(window.is_full());
+    window.release(a);
+    window.release(b);
+
+    let batch = window.next_batch().unwrap();
+    assert_eq!(batch.events().len(), 1);
+    assert_eq!(
+        decode_event(batch.events()[0].as_bytes()).unwrap(),
+        EventBody::WindowSummary(WindowSummary {
+            suppressed_noise: 5,
+            refused_gating: 0,
+            unrecorded_outcomes: 0,
+        })
+    );
+    assert_eq!(window.suppressed_noise(), 0, "counted again from 0");
+    window
+        .acknowledge(&Ack {
+            through_seq: batch.last_seq(),
+            head_hash: [0; 32],
+        })
+        .unwrap();
+    assert!(window.next_batch().is_none(), "nothing counted since");
+
+    // Counted while the window is full: kept, and summarised once a slot is
+    // free.
+    let slots = [window.reserve().unwrap(), window.reserve().unwrap()];
+    window.count_noise();
+    assert!(window.next_batch().is_none(), "no slot for the summary yet");
+    assert_eq!(window.suppressed_noise(), 1);
+    for slot in slots {
+        window.release(slot);
+    }
+    let batch = window.next_batch().unwrap();
+    assert_eq!(
+        decode_event(batch.events()[0].as_bytes()).unwrap(),
+        EventBody::WindowSummary(WindowSummary {
+            suppressed_noise: 1,
+            refused_gating: 0,
+            unrecorded_outcomes: 0,
+        })
+    );
+}
+
 /// Reservations count against the window before their events exist (the
 /// slot is held for the whole operation).
 #[test]

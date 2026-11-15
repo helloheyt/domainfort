@@ -12,22 +12,41 @@
 //!    start ([`DaemonError::ListenerNotInternal`]), nothing contacted
 //!    (docs/54 §4.7: "`serve` refuses a listener whose local address lies
 //!    outside it");
-//! 2. auditd is verified (crate::audit) — else no start;
+//! 2. auditd is verified (crate::audit: its uid, and a `Pong` naming the
+//!    source `dnsd`) — else no start; the verified connection is kept for
+//!    dnsd's counters;
 //! 3. the zone thread verifies dird on its connection and fetches the whole
 //!    image (`FetchZoneImage { have: None }`) — else no start;
 //! 4. the forwarding thread verifies dird on its own connection — else no
 //!    start;
-//! 5. **only now** are the listeners served. Until then nothing was read
-//!    from them or answered (a datagram waits in the receive buffer, a TCP
+//! 5. **only now** are the listeners served — and the audit link attached to
+//!    the connection verified in step 2, delivering dnsd's noise counters
+//!    (crate::audit; docs/54 §9). Until then nothing was read from the
+//!    listeners or answered (a datagram waits in the receive buffer, a TCP
 //!    handshake can complete into the backlog; a failed start closes them
 //!    all — the kdc's and ldap-front's arrangement, Q-275 item 3).
+//!
+//! # Noise counters (docs/54 §9)
+//!
+//! Every peer-driven noise occurrence passes [`Shared::noise`], the one
+//! place it is counted — into the operational log's thinned counter and
+//! into dnsd's audit window (one `WindowSummary` per audit heartbeat at
+//! most; no record per query). The reading of docs/54 §9's "dropped /
+//! limited / malformed / refused" (docs/questions/Q-961): dropped — a
+//! source outside `internal_networks`; limited — the UDP, TCP-message,
+//! TCP-connection and forwarding limits; malformed — a request dns-zone
+//! answers with silence; refused — a signed UPDATE refused for a full
+//! forwarding queue. dnsd's own operational failures (a receive or accept
+//! error, a failed SERIAL check, dird not serving a forward, a stale image)
+//! are not peer noise and stay on the operational log only.
 //!
 //! # Fail closed (docs/54 §4.4, §4.8; AGENTS.md §6)
 //!
 //! | condition | effect |
 //! |---|---|
 //! | dird never reached, or no valid image, at start | no start: nothing is ever answered |
-//! | auditd not verified at start (or no audit source — Q-950) | no start |
+//! | auditd not verified at start (another uid, or a source other than `dnsd` — its `uid_sources` does not map dnsd) | no start |
+//! | auditd lost while serving | queries unaffected (not gated, docs/54 §9); counts kept and sent once the link is verified again |
 //! | a listener outside `internal_networks` | no start |
 //! | image not confirmed within `zone_image_max_age` | every query SERVFAIL (dns-zone row 12) until a SERIAL check succeeds |
 //! | source outside `internal_networks` | UDP: dropped; TCP: closed before a byte is read |
@@ -41,22 +60,25 @@
 //! the forwarding queue and the zone thread's request channel then have no
 //! sender left, so both threads end after their current dird call (bounded
 //! by the channel deadline); the caller joins them ([`Stopped::join`]) after
-//! dropping the runtime. SIGTERM is not handled, as in the other daemons
-//! (Q-260 item 9).
+//! dropping the runtime. The audit gate's one flush (`AUDIT_FLUSH_GRACE`,
+//! stopping early once auditd counts as unreachable) then ends the audit
+//! link; noise counted since the link's last look at the window is not
+//! summarised (it stays on the operational log — docs/questions/Q-961).
+//! SIGTERM is not handled, as in the other daemons (Q-260 item 9).
 //!
 //! Spec: docs/54 §4.4, §4.6–§4.8, §6.6, §6.7; docs/50 R50-14, R50-16, §6.2,
 //! §7.5; A-114; A-152; docs/questions/Q-921 item 6; tokio 1.54.1 docs.rs:
 //! `net::{UdpSocket, TcpListener}::from_std`, `task::JoinSet`, `spawn`,
 //! `sync::{mpsc, oneshot, Notify}`.
 
-use crate::audit::{verify_auditd, AuditCheckError, AUDIT_SOURCE};
+use crate::audit::{self, AuditGate, AUDIT_WINDOW};
 use crate::clock::{Clock, MonotonicClock};
 use crate::forward::{self, ForwardJob, ForwardThread};
 use crate::limits::{
     FORWARD_ANSWER_TIMEOUT, FORWARD_LIMITS, FORWARD_QUEUE_CAPACITY, REFRESH_INTERVAL, REFRESH_WAIT,
     TCP_MESSAGE_LIMITS, UDP_LIMITS,
 };
-use crate::log::{note, Note, ZONE_UNAVAILABLE};
+use crate::log::{note, Note, Thinned, ZONE_UNAVAILABLE};
 use crate::source::is_served;
 use crate::tcp::{accept_tcp, TcpContext, TcpLimits};
 use crate::udp::serve_udp;
@@ -65,8 +87,7 @@ use config::{DnsdSettings, Network};
 use core::fmt;
 use core::time::Duration;
 use dns_zone::{answer, Transport, Verdict, ZoneState};
-use ipc_audit::EventSource;
-use ipc_audit_client::AuditEndpoint;
+use ipc_audit_client::{AuditEndpoint, AuditLinkError, AUDIT_FLUSH_GRACE};
 use ipc_dns::{
     ClientConfigError, Connector, DnsClient, ExpectedDird, FrontZone, UnixConnector, Unserved,
 };
@@ -93,8 +114,9 @@ pub struct DirdEndpoint {
 /// What dnsd's configuration file sets for the daemon — **and nothing
 /// else** (docs/52 C18, task R15): the product parameters. The values no
 /// configuration key sets (the rate limits, the forwarding queue, the
-/// refresh interval, the dird deadline, the audit source) are the daemon's
-/// constants, supplied by [`serve`]; they are not fields here.
+/// refresh interval, the dird deadline) are the daemon's constants,
+/// supplied by [`serve`]; they are not fields here. The audit source is not
+/// a parameter anywhere: it is `audit::AUDIT_SOURCE` (task DN12).
 /// Spec: docs/54 §4.3, §4.4, §4.6, §4.7, §6.7; docs/52 §3.18.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonParams {
@@ -153,11 +175,9 @@ pub struct ServeParams {
     pub dird_uid: u32,
     /// The deadline of one call on the dird channel (docs/50 §3.6).
     pub dird_deadline: Duration,
-    /// auditd's socket and uid.
+    /// auditd's socket and uid (the source it must name is
+    /// `audit::AUDIT_SOURCE`, never a parameter — task DN12).
     pub audit: AuditEndpoint,
-    /// The source auditd must record dnsd under ([`AUDIT_SOURCE`] — `None`
-    /// until task DN12, docs/questions/Q-950).
-    pub audit_source: Option<EventSource>,
     /// The zone table (A-114).
     pub internal_networks: Vec<Network>,
     /// The TCP connection bounds and timeouts.
@@ -189,7 +209,6 @@ impl From<DaemonParams> for ServeParams {
             dird_uid: params.dird.uid,
             dird_deadline: crate::limits::DIRD_DEADLINE,
             audit: params.audit,
-            audit_source: AUDIT_SOURCE,
             internal_networks: params.internal_networks,
             tcp: params.tcp,
             zone_image_max_age: params.zone_image_max_age,
@@ -223,9 +242,10 @@ pub enum DaemonError {
     /// cannot be read): nothing was served; auditd and dird were not
     /// contacted. Spec: docs/54 §4.7; A-114.
     ListenerNotInternal,
-    /// auditd was not verified (docs/50 R50-16), or dnsd has no audit source
-    /// yet (docs/questions/Q-950).
-    Audit(AuditCheckError),
+    /// auditd was not verified (docs/50 R50-16): unreachable, another uid,
+    /// or a source other than `dnsd` (its `uid_sources` does not map dnsd —
+    /// task DN12); nothing was sent and dird was not contacted.
+    Audit(AuditLinkError),
     /// dird's uid is configured as 0 (never a server uid, docs/50 §3.2).
     DirdConfig(ClientConfigError),
     /// dird was not verified or did not serve a valid zone image at start
@@ -268,6 +288,8 @@ pub(crate) struct Shared {
     pub(crate) forward_answer_timeout: Duration,
     /// Set at shutdown: nothing new is answered.
     pub(crate) draining: AtomicBool,
+    /// dnsd's audit gate: the noise counters' way to the audit log.
+    audit: Arc<AuditGate>,
 }
 
 impl fmt::Debug for Shared {
@@ -282,6 +304,16 @@ impl Shared {
     /// Whether dnsd serves `source` (A-114; crate::source).
     pub(crate) fn serves(&self, source: IpAddr) -> bool {
         is_served(&self.internal, source)
+    }
+
+    /// Count one peer-driven noise occurrence — the one place it is
+    /// counted: the operational log's thinned `counter` and dnsd's audit
+    /// window, sent as the next `WindowSummary` (module documentation,
+    /// "Noise counters").
+    /// Spec: docs/54 §9, R54-11; A-57; docs/questions/Q-961.
+    pub(crate) fn noise(&self, counter: &Thinned) {
+        counter.hit();
+        self.audit.count_noise();
     }
 
     /// dns-zone's verdict on `request` received over `transport`, from the
@@ -347,7 +379,13 @@ pub(crate) mod tests {
             forwards,
             forward_answer_timeout: Duration::from_secs(1),
             draining: AtomicBool::new(false),
+            audit: Arc::new(AuditGate::new(AUDIT_WINDOW)),
         })
+    }
+
+    /// The noise `shared` counted into its audit window (not yet sent).
+    pub(crate) fn counted_noise(shared: &Shared) -> u64 {
+        shared.audit.counted_noise().expect("gate")
     }
 
     /// A QUERY for `server.example.com` A (RFC 1035 §4.1.1, §4.1.2),
@@ -532,10 +570,11 @@ where
     // 1. Every listener internal (docs/54 §4.7) — nothing contacted before.
     check_listeners(&listeners, &params.internal_networks)?;
 
-    // 2. auditd first (docs/50 R50-16; docs/54 §4.8).
-    verify_auditd(&params.audit, params.audit_source)
-        .await
-        .map_err(DaemonError::Audit)?;
+    // 2. auditd first (docs/50 R50-16; docs/54 §4.8): its uid and the
+    //    source `dnsd` (task R9b, DN12). The verified connection is kept for
+    //    the audit link (step 5); dropped with `link` on a later failure.
+    let link = audit::link(&params.audit).map_err(DaemonError::Audit)?;
+    let first_audit = link.connect().await.map_err(DaemonError::Audit)?;
     note(Note::AuditVerified, None);
 
     // 3. dird and the first image, on the zone thread (docs/54 §4.8).
@@ -597,7 +636,11 @@ where
         return Err(error);
     }
 
-    // 5. The listeners, served only now.
+    // 5. The listeners, served only now — and the audit link, attached to
+    //    the connection verified in step 2 (the gate opens on it: task
+    //    R15b, docs/questions/Q-630), delivering the noise counters.
+    let gate = Arc::new(AuditGate::new(AUDIT_WINDOW));
+    let audit_task = tokio::spawn(link.attach(Arc::clone(&gate), first_audit).run());
     let now = Instant::now();
     let shared = Arc::new(Shared {
         zone: view,
@@ -610,6 +653,7 @@ where
         forwards,
         forward_answer_timeout: params.forward_answer_timeout,
         draining: AtomicBool::new(false),
+        audit: Arc::clone(&gate),
     });
     let tcp_context = Arc::new(TcpContext::new(params.tcp));
     let mut tasks = Vec::new();
@@ -643,6 +687,8 @@ where
         for task in tasks {
             let _ = task.await;
         }
+        audit_task.abort();
+        let _ = audit_task.await;
         drop(shared);
         let _ = forward_thread.join();
         let _ = zone_thread.join();
@@ -665,6 +711,21 @@ where
     // The last holder of the forwarding queue's sender: the forwarding
     // thread ends, and with it the last sender of the zone thread's channel.
     drop(shared);
+    // The one flush of every daemon (`ipc_audit_client::AuditGate::close`,
+    // docs/52 R6 (b)), then the audit link ends.
+    let unacknowledged = gate
+        .close(AUDIT_FLUSH_GRACE, async {
+            audit_task.abort();
+            let _ = audit_task.await;
+        })
+        .await
+        .events();
+    if unacknowledged > 0 {
+        note(
+            Note::AuditUnacknowledged,
+            Some(u64::try_from(unacknowledged).unwrap_or(u64::MAX)),
+        );
+    }
     note(Note::Stopped, None);
     Ok(Stopped {
         zone: zone_thread,

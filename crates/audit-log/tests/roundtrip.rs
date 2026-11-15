@@ -54,6 +54,37 @@ fn records_read_back_exactly() {
     reader.finish().unwrap();
 }
 
+/// Task DN12 (docs/54 §9: "dnsd — source code 7, after auditd's 6";
+/// docs/questions/Q-960: kpasswd-front takes the next free code, 8): the
+/// closed source table is append-only — every code of before is unchanged
+/// (logs written before read the same), the two new sources take 7 and 8,
+/// every code maps back, and 0 and every code above 8 are outside the table.
+/// (`records_read_back_exactly` writes and reads records of every source.)
+#[test]
+fn source_codes_are_append_only() {
+    let codes = [
+        (Source::Keyd, 1u8),
+        (Source::Dird, 2),
+        (Source::Kdc, 3),
+        (Source::LdapFront, 4),
+        (Source::Admind, 5),
+        (Source::Auditd, 6),
+        (Source::Dnsd, 7),
+        (Source::KpasswdFront, 8),
+    ];
+    assert_eq!(
+        Source::ALL.to_vec(),
+        codes.iter().map(|&(s, _)| s).collect::<Vec<_>>()
+    );
+    for (source, code) in codes {
+        assert_eq!(source.code(), code, "{source:?}");
+        assert_eq!(Source::from_code(code), Some(source));
+    }
+    for code in [0u8, 9, 10, u8::MAX] {
+        assert_eq!(Source::from_code(code), None, "{code}");
+    }
+}
+
 /// docs/37 §2: the first record links to the genesis value (32 zero
 /// octets, sequence 0) — docs/questions/Q-250 item 2.
 #[test]

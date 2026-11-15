@@ -68,9 +68,10 @@ pub const EXIT_WRITER: u8 = 3;
 
 /// The open-files limit: the standard streams, the segment being written
 /// and one being read at start, the listener, and up to
-/// `MAX_CONNECTIONS_PER_SOURCE` connections for each of the five sources,
-/// with room for connections accepted only to be refused. Project choice
-/// (docs/50 §6.1: "nofile according to the connection quotas").
+/// `MAX_CONNECTIONS_PER_SOURCE` connections for each of the seven sources
+/// (6 + 7 × 4 = 34 since task DN12 added dnsd and kpasswd-front), with room
+/// for connections accepted only to be refused. Project choice (docs/50
+/// §6.1: "nofile according to the connection quotas").
 pub const OPEN_FILES_LIMIT: u64 = 64;
 
 /// tokio worker threads: the writer holds the main thread, the runtime only

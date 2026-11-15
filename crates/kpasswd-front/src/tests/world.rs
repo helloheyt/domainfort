@@ -1,11 +1,11 @@
 //! The front's test world: a test dird (this repository's dispatcher,
 //! crates/ipc-kpasswd `KpasswdConnection`, over a host that records every
 //! request and answers as the test scripts), a test auditd (the real audit
-//! channel's `Ping` → `Pong`), and the front itself — the real start path,
-//! `serve_with`, given a stand-in audit source (no kpasswd-front source
-//! exists yet, docs/questions/Q-955 item 1; crate-internal, so no other
-//! crate can do this — docs/52 C18) — on a loopback listener of a port the
-//! system picks (never port 464).
+//! channel's `Ping` → `Pong`, naming the front's own source `kpasswd-front`
+//! unless a test names another), and the front itself — the product entry,
+//! `serve` (task DN12: the audit source is a constant, so the tests need no
+//! other entry — docs/52 C18) — on a loopback listener of a port the system
+//! picks (never port 464).
 //!
 //! The test dird and auditd run in this process, so their uid is the test's
 //! own; as root the tests skip (uid 0 is never mapped — docs/50 R50-3).
@@ -20,9 +20,9 @@
 #![allow(dead_code)]
 #![cfg(unix)]
 
-use crate::daemon::{serve_with as serve, ServeParams};
+use crate::audit::FRONT_AUDIT_SOURCE;
 use crate::{
-    ConnectionLimits, DaemonControl, DaemonError, Endpoint, FrontParams, Listeners, Timeouts,
+    serve, ConnectionLimits, DaemonControl, DaemonError, Endpoint, FrontParams, Listeners, Timeouts,
 };
 use config::Network;
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -192,7 +192,7 @@ fn start_dird(path: &PathBuf) -> Dird {
 }
 
 /// Start a test auditd on `path` that names `source` in its `Pong`.
-fn start_auditd(path: &PathBuf, source: EventSource) {
+pub(crate) fn start_auditd(path: &PathBuf, source: EventSource) {
     let listener = UnixListener::bind(path).unwrap();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -245,36 +245,32 @@ impl Drop for World {
 /// The parameters of a world (before `adjust`): the test dird and auditd,
 /// the realm, a 1 s first frame, 16 connections, 8 per source, the loopback
 /// network only.
-pub(crate) fn params(dird: PathBuf, audit: PathBuf, uid: u32) -> ServeParams {
-    ServeParams {
-        front: FrontParams {
-            dird: Endpoint { socket: dird, uid },
-            audit: Endpoint { socket: audit, uid },
-            realm: REALM.to_owned(),
-            timeouts: Timeouts {
-                first_frame: FIRST_FRAME,
-                reply_write: Duration::from_secs(2),
-                dird_deadline: Duration::from_secs(5),
-            },
-            limits: ConnectionLimits {
-                max_connections: 16,
-                max_per_source: 8,
-            },
-            internal_networks: loopback_only(),
+pub(crate) fn params(dird: PathBuf, audit: PathBuf, uid: u32) -> FrontParams {
+    FrontParams {
+        dird: Endpoint { socket: dird, uid },
+        audit: Endpoint { socket: audit, uid },
+        realm: REALM.to_owned(),
+        timeouts: Timeouts {
+            first_frame: FIRST_FRAME,
+            reply_write: Duration::from_secs(2),
+            dird_deadline: Duration::from_secs(5),
         },
-        // A stand-in: the test auditd names it (docs/questions/Q-955 item 1).
-        audit_source: Some(EventSource::LdapFront),
+        limits: ConnectionLimits {
+            max_connections: 16,
+            max_per_source: 8,
+        },
+        internal_networks: loopback_only(),
     }
 }
 
 /// Start a world, or `None` as root. `adjust` changes the parameters before
 /// the front starts.
-pub(crate) fn world(adjust: impl FnOnce(&mut ServeParams)) -> Option<World> {
+pub(crate) fn world(adjust: impl FnOnce(&mut FrontParams)) -> Option<World> {
     let uid = own_uid()?;
     let dird_path = socket_path("dird");
     let audit_path = socket_path("audit");
     let dird = start_dird(&dird_path);
-    start_auditd(&audit_path, EventSource::LdapFront);
+    start_auditd(&audit_path, FRONT_AUDIT_SOURCE);
     let mut params = params(dird_path.clone(), audit_path.clone(), uid);
     adjust(&mut params);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -314,16 +310,16 @@ pub(crate) fn world(adjust: impl FnOnce(&mut ServeParams)) -> Option<World> {
 /// Run `serve` once with `params` and `listeners` and return its start-up
 /// error (the test dird and auditd are started on the parameters' paths).
 pub(crate) fn start_error(
-    params: ServeParams,
+    params: FrontParams,
     listeners: Listeners,
     dird: bool,
     auditd: Option<EventSource>,
 ) -> Option<DaemonError> {
     if dird {
-        start_dird(&params.front.dird.socket);
+        start_dird(&params.dird.socket);
     }
     if let Some(source) = auditd {
-        start_auditd(&params.front.audit.socket, source);
+        start_auditd(&params.audit.socket, source);
     }
     let control = DaemonControl::new();
     let result = tokio::runtime::Builder::new_current_thread()

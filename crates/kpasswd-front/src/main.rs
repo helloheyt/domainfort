@@ -15,8 +15,9 @@
 //!
 //! Every start-up failure exits with a failure code (fail closed, §7.5); the
 //! service manager restarts with backoff. Messages are fixed texts on stderr
-//! (docs/50 §8.2). Today step 5 fails at the audit check: the front has no
-//! audit source yet (docs/questions/Q-955 item 1).
+//! (docs/50 §8.2). Step 5's audit check needs auditd's `uid_sources` to map
+//! the front's uid to `kpasswd-front` (task DN12; docs/questions/Q-955
+//! item 1, Q-960); otherwise it fails closed.
 //!
 //! Spec: docs/53 R53-3, §3.3; docs/50 R50-14, R50-16, §6.2, §7.5, §8.2;
 //! docs/questions/Q-235 (A-61).

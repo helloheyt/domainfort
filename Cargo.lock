@@ -318,6 +318,8 @@ dependencies = [
 name = "dns-daemon"
 version = "0.0.0"
 dependencies = [
+ "audit-daemon",
+ "audit-log",
  "config",
  "daemon-sandbox",
  "dns-daemon",
@@ -777,6 +779,8 @@ dependencies = [
 name = "kpasswd-front"
 version = "0.0.0"
 dependencies = [
+ "audit-daemon",
+ "audit-log",
  "config",
  "daemon-sandbox",
  "ipc",

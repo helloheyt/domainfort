@@ -204,13 +204,18 @@ impl Payload for Ack {
 /// Closed table: the processes that can be mapped to a uid (docs/50 §2.4;
 /// crates/config `AuditSource`). The codes are the audit log's own source
 /// codes (crates/audit-log `Source::code`: keyd 1, dird 2, kdc 3,
-/// ldap-front 4, admind 5) — one numbering for "the source" on the wire and
-/// on disk; crates/audit-daemon's tests pin them equal. auditd's own source
-/// (code 6 in the log) names no peer, so it has no value here: 6, like 0 and
-/// every other code, is outside the table (docs/questions/Q-560 item 2).
+/// ldap-front 4, admind 5, dnsd 7, kpasswd-front 8) — one numbering for
+/// "the source" on the wire and on disk; crates/audit-daemon's tests pin
+/// them equal. auditd's own source (code 6 in the log) names no peer, so it
+/// has no value here: 6, like 0 and every other code, is outside the table
+/// (docs/questions/Q-560 item 2). The table is append-only: dnsd and
+/// kpasswd-front were appended after auditd's 6 (task DN12), nothing was
+/// renumbered, and the channel version is unchanged (the A-115 precedent).
 ///
 /// Spec: docs/50 §2.4, §3.2, §3.3 ("enum = `u8` from a closed table"), §8.1;
-/// docs/52 §3.12; docs/questions/Q-512 (A-112), Q-560.
+/// docs/52 §3.12; docs/54 §4.3, §9 (dnsd, code 7); docs/53 §9
+/// (kpasswd-front); docs/questions/Q-512 (A-112), Q-560, Q-619 item 2,
+/// Q-950 (A-157), Q-955 item 1 (A-158), Q-960.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EventSource {
     /// keyd. Spec: docs/50 §2.4.
@@ -225,20 +230,31 @@ pub enum EventSource {
     LdapFront,
     /// admind. Spec: docs/51 §5.7 item 3.
     Admind,
+    /// dnsd, the DNS front (sends only `WindowSummary` counters; verifies
+    /// auditd at start). Spec: docs/54 §4.3, §4.8, §9; docs/questions/Q-619
+    /// item 2, Q-950 (A-157).
+    Dnsd,
+    /// kpasswd-front (sends no events; verifies auditd at start). Spec:
+    /// docs/53 §9; docs/questions/Q-955 item 1 (A-158).
+    KpasswdFront,
 }
 
 impl EventSource {
     /// Every source, in code order.
-    pub const ALL: [EventSource; 5] = [
+    pub const ALL: [EventSource; 7] = [
         EventSource::Keyd,
         EventSource::Dird,
         EventSource::Kdc,
         EventSource::LdapFront,
         EventSource::Admind,
+        EventSource::Dnsd,
+        EventSource::KpasswdFront,
     ];
 
     /// The wire code (the audit log's source code). Project choice; 0 is
-    /// never a code.
+    /// never a code and 6 is auditd's own (it names no peer). Spec: docs/54
+    /// §9 ("dnsd — source code 7, after auditd's 6"); docs/questions/Q-960
+    /// (kpasswd-front: the next free code, 8).
     #[must_use]
     pub const fn code(self) -> u8 {
         match self {
@@ -247,6 +263,8 @@ impl EventSource {
             EventSource::Kdc => 3,
             EventSource::LdapFront => 4,
             EventSource::Admind => 5,
+            EventSource::Dnsd => 7,
+            EventSource::KpasswdFront => 8,
         }
     }
 
@@ -259,6 +277,8 @@ impl EventSource {
             3 => Some(EventSource::Kdc),
             4 => Some(EventSource::LdapFront),
             5 => Some(EventSource::Admind),
+            7 => Some(EventSource::Dnsd),
+            8 => Some(EventSource::KpasswdFront),
             _ => None,
         }
     }

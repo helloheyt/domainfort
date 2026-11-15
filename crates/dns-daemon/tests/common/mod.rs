@@ -11,10 +11,11 @@
 //!   (ipc-dns's Unix connector reads the peer uid with rustix, Linux only;
 //!   the loopback reports a fixed uid, so the tests run everywhere.)
 //! * **auditd** — a minimal auditd on a Unix socket answering `Ping` with a
-//!   `Pong` naming a source (the pattern of crates/ipc-audit-client
-//!   tests/linked). dnsd has no source of its own yet (task DN12,
-//!   docs/questions/Q-950): the tests use [`STAND_IN_SOURCE`], so what is
-//!   tested is the mechanism — uid, named source, no start without it.
+//!   `Pong` naming a source — dnsd's own, `dnsd` (task DN12), unless a test
+//!   names another — and every `Append` with the `Ack` of its last number,
+//!   keeping the decoded events (the pattern of crates/ipc-audit-client
+//!   tests/linked). The real auditd's mapping of the uid to `dnsd` is
+//!   tested in tests/product_audit.rs.
 //! * **dnsd** — the real `dns_daemon::test_seams::serve` on its own thread
 //!   with its own current-thread runtime, a UDP socket and a TCP listener
 //!   bound on 127.0.0.1 at ports the system picks (never a privileged port,
@@ -34,13 +35,14 @@
 use config::Network;
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use core::time::Duration;
+use dns_daemon::audit::AUDIT_SOURCE;
 use dns_daemon::clock::Clock;
 use dns_daemon::test_seams::{serve, DaemonParams};
 use dns_daemon::{DaemonControl, DaemonError, Listeners, TcpLimits};
 use ipc::{Direction, FrameReader, Reply};
 use ipc_audit::{
-    decode_request as audit_decode_request, encode_reply as audit_encode_reply, AuditReply,
-    AuditRequest, EventSource, AUDIT_CHANNEL,
+    decode_event, decode_request as audit_decode_request, encode_reply as audit_encode_reply, Ack,
+    AuditReply, AuditRequest, EventBody, EventSource, WindowSummary, AUDIT_CHANNEL,
 };
 use ipc_audit_client::AuditEndpoint;
 use ipc_dns::{
@@ -67,12 +69,6 @@ use zeroize::Zeroizing;
 
 /// dird's uid as the loopback reports it (hand-made).
 pub const DIRD_UID: u32 = 61_002;
-
-/// The source the fake auditd names and dnsd expects in these tests — a
-/// stand-in: dnsd's own source does not exist until task DN12
-/// (docs/questions/Q-950). ldap-front's, as the one other process that
-/// sends no events and only verifies auditd at start.
-pub const STAND_IN_SOURCE: EventSource = EventSource::LdapFront;
 
 /// RFC 2782 "Fictional example": SERIAL.
 pub const SERIAL: u32 = 1_995_032_001;
@@ -354,12 +350,19 @@ impl Connector for LoopbackConnector {
 
 // ---- the fake auditd ------------------------------------------------------------
 
-/// A minimal auditd whose `Pong` names `source` (the pattern of
-/// crates/ipc-audit-client tests/linked).
+/// What the fake auditd saw: the `Ping`s answered and the events appended.
+#[derive(Default)]
+struct AuditSeen {
+    pings: AtomicUsize,
+    events: Mutex<Vec<EventBody>>,
+}
+
+/// A minimal auditd whose `Pong` names `source` and which acknowledges
+/// every `Append` (the pattern of crates/ipc-audit-client tests/linked).
 pub struct FakeAuditd {
     path: PathBuf,
     stop: Arc<AtomicBool>,
-    pings: Arc<AtomicUsize>,
+    seen: Arc<AuditSeen>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -369,16 +372,16 @@ impl FakeAuditd {
         let listener = UnixListener::bind(path).expect("audit socket");
         listener.set_nonblocking(true).expect("nonblocking");
         let stop = Arc::new(AtomicBool::new(false));
-        let pings = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(AuditSeen::default());
         let thread = {
-            let (stop, pings) = (Arc::clone(&stop), Arc::clone(&pings));
+            let (stop, seen) = (Arc::clone(&stop), Arc::clone(&seen));
             std::thread::spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
                     match listener.accept() {
                         Ok((stream, _)) => {
                             stream.set_nonblocking(false).expect("blocking");
-                            let pings = Arc::clone(&pings);
-                            std::thread::spawn(move || audit_serve(stream, source, &pings));
+                            let seen = Arc::clone(&seen);
+                            std::thread::spawn(move || audit_serve(stream, source, &seen));
                         }
                         Err(e) if e.kind() == ErrorKind::WouldBlock => {
                             std::thread::sleep(Duration::from_millis(2));
@@ -391,13 +394,34 @@ impl FakeAuditd {
         FakeAuditd {
             path: path.to_path_buf(),
             stop,
-            pings,
+            seen,
             thread: Some(thread),
         }
     }
 
     pub fn pings(&self) -> usize {
-        self.pings.load(Ordering::SeqCst)
+        self.seen.pings.load(Ordering::SeqCst)
+    }
+
+    /// Every event appended so far, in order.
+    pub fn events(&self) -> Vec<EventBody> {
+        self.seen.events.lock().expect("events").clone()
+    }
+
+    /// The `WindowSummary` events appended so far.
+    pub fn summaries(&self) -> Vec<WindowSummary> {
+        self.events()
+            .into_iter()
+            .filter_map(|event| match event {
+                EventBody::WindowSummary(summary) => Some(summary),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The noise counted in every summary so far.
+    pub fn counted_noise(&self) -> u64 {
+        self.summaries().iter().map(|s| s.suppressed_noise).sum()
     }
 }
 
@@ -411,8 +435,9 @@ impl Drop for FakeAuditd {
     }
 }
 
-/// `Ping` → `Pong(source)`; anything else closes. Spec: docs/50 §7.5.
-fn audit_serve(mut stream: UnixStream, source: EventSource, pings: &AtomicUsize) {
+/// `Ping` → `Pong(source)`; `Append` → its events kept, `Ack` of its last
+/// number; anything else closes. Spec: docs/50 §7.5, §8.1.
+fn audit_serve(mut stream: UnixStream, source: EventSource, seen: &AuditSeen) {
     loop {
         let mut reader = FrameReader::new(AUDIT_CHANNEL.limit(Direction::Request));
         let mut chunk = [0u8; 1024];
@@ -430,16 +455,26 @@ fn audit_serve(mut stream: UnixStream, source: EventSource, pings: &AtomicUsize)
                 }
             }
         };
-        match audit_decode_request(&body) {
+        let reply = match audit_decode_request(&body) {
             Ok(AuditRequest::Ping) => {
-                pings.fetch_add(1, Ordering::SeqCst);
-                let frame =
-                    audit_encode_reply(&Reply::Message(AuditReply::Pong(source))).expect("pong");
-                if stream.write_all(frame.as_bytes()).is_err() {
-                    return;
-                }
+                seen.pings.fetch_add(1, Ordering::SeqCst);
+                AuditReply::Pong(source)
             }
-            _ => return,
+            Ok(AuditRequest::Append(append)) => {
+                let mut events = seen.events.lock().expect("events");
+                for event in append.events() {
+                    events.push(decode_event(event.as_bytes()).expect("a valid event"));
+                }
+                AuditReply::Ack(Ack {
+                    through_seq: append.last_seq(),
+                    head_hash: [0; 32],
+                })
+            }
+            Err(_) => return,
+        };
+        let frame = audit_encode_reply(&Reply::Message(reply)).expect("reply");
+        if stream.write_all(frame.as_bytes()).is_err() {
+            return;
         }
     }
 }
@@ -475,8 +510,9 @@ pub const WIDE: SourceLimits = SourceLimits {
     window: Duration::from_secs(1),
 };
 
-/// dnsd's parameters for a test: the stand-in audit source, loopback as the
-/// internal network, short timings, wide limits.
+/// dnsd's parameters for a test: the fake auditd at `audit`, loopback as the
+/// internal network, short timings, wide limits. (The audit source is not a
+/// parameter: dnsd always expects `dnsd` — task DN12.)
 pub fn params(audit: &Path, auditd_uid: u32) -> DaemonParams {
     DaemonParams {
         dird_uid: DIRD_UID,
@@ -485,7 +521,6 @@ pub fn params(audit: &Path, auditd_uid: u32) -> DaemonParams {
             socket: audit.to_path_buf(),
             uid: auditd_uid,
         },
-        audit_source: Some(STAND_IN_SOURCE),
         internal_networks: vec![loopback_network()],
         tcp: TcpLimits {
             max_connections: 32,
@@ -637,7 +672,7 @@ impl World {
         if skip_as_root(uid) {
             return None;
         }
-        let auditd = FakeAuditd::start(&dir.path().join("audit.sock"), STAND_IN_SOURCE);
+        let auditd = FakeAuditd::start(&dir.path().join("audit.sock"), AUDIT_SOURCE);
         let dird = TestDird::new(image);
         let connector = LoopbackConnector::new(&dird);
         Some(World {

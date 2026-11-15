@@ -7,9 +7,12 @@
 //! from the configuration — [`crate::DaemonParams::from_settings`] — and run
 //! by [`crate::serve`], which supplies every value below itself.
 //!
+//! The audit source is **not** a seam (task DN12, docs/questions/Q-960):
+//! every build expects `audit::AUDIT_SOURCE` (`dnsd`); tests vary what the
+//! auditd at the socket names instead.
+//!
 //! | seam | what it varies | production value (`crate::serve`) |
 //! |---|---|---|
-//! | [`DaemonParams::audit_source`] | the source auditd must name | `audit::AUDIT_SOURCE` (`None` until task DN12 — docs/questions/Q-950) |
 //! | [`DaemonParams::udp`], [`DaemonParams::tcp_messages`], [`DaemonParams::forwards`] | the rate limits (docs/54 §6.7) | `limits::UDP_LIMITS`, `TCP_MESSAGE_LIMITS`, `FORWARD_LIMITS` |
 //! | [`DaemonParams::forward_queue_capacity`] | the forwarding queue | `limits::FORWARD_QUEUE_CAPACITY` |
 //! | [`DaemonParams::refresh_interval`], [`DaemonParams::refresh_wait`], [`DaemonParams::forward_answer_timeout`], [`DaemonParams::dird_deadline`] | the dird timings | `limits::REFRESH_INTERVAL`, `REFRESH_WAIT`, `FORWARD_ANSWER_TIMEOUT`, `DIRD_DEADLINE` |

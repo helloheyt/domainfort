@@ -21,7 +21,10 @@
 //!   so a flood can never take the slots gating events need. Beyond that
 //!   share, noise is counted, not queued ([`SendWindow::offer_noise`]), and
 //!   the count goes into the next [`WindowSummary`]: summarised in counters,
-//!   and limited to the share of the window that acknowledgements free.
+//!   and limited to the share of the window that acknowledgements free. A
+//!   sender whose noise has no event shape at all (dnsd: docs/54 §9, "only
+//!   counters") counts every occurrence ([`SendWindow::count_noise`]) into
+//!   the same summary.
 //! * **Lost outcomes** — for an operation recorded in two events (an intent
 //!   or decision acknowledged first, then its outcome: keyd-daemon's
 //!   key-state changes, dird's admin writes), an outcome record that could
@@ -304,6 +307,21 @@ impl SendWindow {
             self.suppressed_noise = self.suppressed_noise.saturating_add(1);
         })?;
         Ok(NoiseAdmission::Queued { seq })
+    }
+
+    /// Count one noise occurrence that has no event of its own — a sender
+    /// whose noise is reported **only** as counters (dnsd: docs/54 §9,
+    /// "only counters (`WindowSummary` — noise: dropped / limited /
+    /// malformed / refused)"; "no record per query"). The count goes into
+    /// the next [`WindowSummary`] (`suppressed_noise`), exactly as noise
+    /// beyond the noise share does in [`SendWindow::offer_noise`]; it takes
+    /// no slot, so it can never crowd out a gating event. Saturates instead
+    /// of wrapping.
+    ///
+    /// Spec: docs/questions/Q-218 (A-57: noise "summarised in counters and
+    /// rate-limited"); docs/54 §9; docs/questions/Q-961.
+    pub fn count_noise(&mut self) {
+        self.suppressed_noise = self.suppressed_noise.saturating_add(1);
     }
 
     /// Count an outcome record that could not be committed (its

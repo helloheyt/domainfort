@@ -67,8 +67,8 @@ krb-proto = { path = "../krb-proto" }
 # The kpasswd-front ↔ dird channel: `KpasswdClient`, `ExpectedDird`, the
 # value types (task K7).
 ipc-kpasswd = { path = "../ipc-kpasswd" }
-# The audit channel's `EventSource` (the source auditd must record the front
-# under — none exists yet: docs/questions/Q-955 item 1).
+# The audit channel's `EventSource::KpasswdFront` (the source auditd must
+# record the front under — task DN12; docs/questions/Q-955 item 1).
 ipc-audit = { path = "../ipc-audit" }
 # The start-up verification of auditd through the one audit client (task
 # R9b; docs/50 R50-16, §7.5) — its tokio is the one the front links.
@@ -84,9 +84,9 @@ daemon-sandbox = { path = "../daemon-sandbox" }
 protected-file = { path = "../protected-file" }
 
 # No `[features]` and no test seam (docs/52 C18): the tests that run `serve`
-# with a stand-in audit source (no kpasswd-front source exists yet —
-# docs/questions/Q-955 item 1) are crate-internal `#[cfg(test)]` modules
-# (`src/tests/`), so no build of any other crate can reach that entry.
+# end to end are crate-internal `#[cfg(test)]` modules (`src/tests/`) and,
+# since task DN12, call the product entry itself (the audit source is a
+# constant, no parameter).
 
 [dev-dependencies]
 # TESTS ONLY: the fake auditd and dird of the tests speak the real channels
@@ -100,6 +100,13 @@ keyd-types = { path = "../keyd-types" }
 # The scratch directories, inside the workspace, of the tests whose files a
 # crates/protected-file reader opens (task T; docs/questions/Q-480).
 test-scratch = { path = "../test-scratch" }
+# TESTS ONLY (task DN12): the product start runs against the real auditd
+# listener and writer (crates/audit-daemon tests/common, reused by `#[path]`
+# in src/tests/mod.rs, as crates/ldap-front's tests do). Workspace crates,
+# already in the lock; never normal dependencies (tests/holds_no_key.rs
+# checks the normal graph).
+audit-daemon = { path = "../audit-daemon" }
+audit-log = { path = "../audit-log" }
 
 [lints]
 workspace = true

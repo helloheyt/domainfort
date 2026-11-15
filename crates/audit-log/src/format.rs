@@ -164,9 +164,14 @@ impl ChainHead {
 /// uid — never from the event body. Closed table; codes are a project
 /// choice.
 ///
+/// Append-only: dnsd (7) and kpasswd-front (8) were appended after
+/// `Auditd` (6) by task DN12; no code was renumbered, so every log written
+/// before reads the same.
+///
 /// Spec: docs/50 §3.2 ("each marked as the event source — the source is set
 /// from the uid, not from the event body"), §2.4 (the processes), R50-17;
-/// docs/questions/Q-250 item 5 (`Auditd`, for auditd's own records).
+/// docs/questions/Q-250 item 5 (`Auditd`, for auditd's own records); docs/54
+/// §9 (dnsd, code 7); docs/53 §9 (kpasswd-front); docs/questions/Q-960.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Source {
     /// keyd. Spec: docs/50 §2.4.
@@ -182,20 +187,30 @@ pub enum Source {
     /// auditd itself (for example: a connection from an unmapped uid was
     /// refused — docs/50 §3.2 "closed + an audit record").
     Auditd,
+    /// dnsd, the DNS front. Spec: docs/54 §4.3, §9; docs/questions/Q-619
+    /// item 2, Q-950 (A-157).
+    Dnsd,
+    /// kpasswd-front. Spec: docs/53 §9; docs/questions/Q-955 item 1
+    /// (A-158).
+    KpasswdFront,
 }
 
 impl Source {
     /// Every source, in code order.
-    pub const ALL: [Source; 6] = [
+    pub const ALL: [Source; 8] = [
         Source::Keyd,
         Source::Dird,
         Source::Kdc,
         Source::LdapFront,
         Source::Admind,
         Source::Auditd,
+        Source::Dnsd,
+        Source::KpasswdFront,
     ];
 
-    /// The on-disk code. Project choice; 0 is never a code.
+    /// The on-disk code. Project choice; 0 is never a code. Spec: docs/54
+    /// §9 ("dnsd — source code 7, after auditd's 6"); docs/questions/Q-960
+    /// (kpasswd-front: the next free code, 8).
     #[must_use]
     pub const fn code(self) -> u8 {
         match self {
@@ -205,6 +220,8 @@ impl Source {
             Source::LdapFront => 4,
             Source::Admind => 5,
             Source::Auditd => 6,
+            Source::Dnsd => 7,
+            Source::KpasswdFront => 8,
         }
     }
 
@@ -218,6 +235,8 @@ impl Source {
             4 => Some(Source::LdapFront),
             5 => Some(Source::Admind),
             6 => Some(Source::Auditd),
+            7 => Some(Source::Dnsd),
+            8 => Some(Source::KpasswdFront),
             _ => None,
         }
     }

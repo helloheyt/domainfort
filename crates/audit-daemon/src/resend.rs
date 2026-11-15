@@ -127,8 +127,9 @@ pub const REMEMBERED_EVENTS: usize = 256;
 // One batch of a sender must fit, whatever the numbering.
 const _: () = assert!(REMEMBERED_EVENTS >= ipc_audit::MAX_BATCH_EVENTS as usize);
 
-/// Sender sources: every `Source` except auditd's own.
-const SENDER_SOURCES: usize = 5;
+/// Sender sources: every `Source` except auditd's own (dnsd and
+/// kpasswd-front appended by task DN12 — docs/questions/Q-960).
+const SENDER_SOURCES: usize = 7;
 
 /// Whose numbering a source carries.
 ///
@@ -255,6 +256,8 @@ const fn slot(source: Source) -> Option<usize> {
         Source::Kdc => Some(2),
         Source::LdapFront => Some(3),
         Source::Admind => Some(4),
+        Source::Dnsd => Some(5),
+        Source::KpasswdFront => Some(6),
         Source::Auditd => None,
     }
 }

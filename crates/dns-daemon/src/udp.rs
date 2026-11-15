@@ -82,14 +82,15 @@ pub(crate) fn handle(
     if shared.draining.load(Ordering::SeqCst) {
         return None;
     }
-    // 2. Internal sources only (A-114).
+    // 2. Internal sources only (A-114). Noise: docs/54 §9 ("dropped").
     if !shared.serves(source) {
-        SOURCE_NOT_INTERNAL.hit();
+        shared.noise(&SOURCE_NOT_INTERNAL);
         return None;
     }
-    // 3. Per-source and global limit (A-154 item 6 (a)).
+    // 3. Per-source and global limit (A-154 item 6 (a)). Noise: docs/54 §9
+    //    ("limited").
     if !shared.udp_limiter.admit(source_key(source), now) {
-        UDP_LIMITED.hit();
+        shared.noise(&UDP_LIMITED);
         return None;
     }
     // 4. dns-zone's verdict.
@@ -97,9 +98,9 @@ pub(crate) fn handle(
         Verdict::Reply(reply) if reply.transport() == Transport::Udp => Some(reply),
         // A reply built for another transport never leaves on UDP (cannot
         // happen: dns-zone builds for the transport it is given). Fail
-        // closed.
+        // closed. Noise: docs/54 §9 ("malformed").
         Verdict::Reply(_) | Verdict::Silence(_) | Verdict::Close => {
-            SILENCED.hit();
+            shared.noise(&SILENCED);
             None
         }
         Verdict::Forward(_) => {
@@ -112,7 +113,7 @@ pub(crate) fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::tests::{example_query, shared_for_test};
+    use crate::daemon::tests::{counted_noise, example_query, shared_for_test};
     use core::net::Ipv4Addr;
 
     /// docs/54 §4.7 (A-114): the same well-formed query is answered for a
@@ -137,5 +138,21 @@ mod tests {
         shared.draining.store(true, Ordering::SeqCst);
         let other = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 8));
         assert!(handle(&shared, other, &query, now).is_none(), "draining");
+        // docs/54 §9 (task DN12): the two dropped sources and the limited
+        // datagram are noise in dnsd's audit window; answered queries are
+        // not ("no record per query"), nor is a datagram ignored while
+        // draining.
+        assert_eq!(counted_noise(&shared), 3);
+    }
+
+    /// docs/54 §9 ("malformed"; task DN12): a datagram dns-zone answers with
+    /// silence (here: not a DNS message — hand-made octets) is noise in the
+    /// audit window. RFC 1035 §4.1.1 (a 12-octet header at least).
+    #[test]
+    fn a_silenced_datagram_is_counted_noise() {
+        let shared = shared_for_test(10);
+        let inside = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9));
+        assert!(handle(&shared, inside, &[0x01, 0x02, 0x03], Instant::now()).is_none());
+        assert_eq!(counted_noise(&shared), 1);
     }
 }

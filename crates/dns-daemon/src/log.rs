@@ -1,6 +1,8 @@
-//! The operational log: fixed messages on stderr — and, until dnsd has an
-//! audit shape of its own (docs/questions/Q-950), the only place its noise
-//! counters are reported.
+//! The operational log: fixed messages on stderr, and the counters behind
+//! them. The peer-driven noise counters are also counted into dnsd's audit
+//! window and reach the audit log as `WindowSummary` events (crate::audit;
+//! docs/54 §9; task DN12) — counted at one place, crate::daemon
+//! `Shared::noise`.
 //!
 //! Not the audit trail. Every message is a fixed text from [`Note`] plus, at
 //! most, a numeric identifier (a count, a SERIAL, an OS error number) —
@@ -34,6 +36,13 @@ pub enum Note {
     Hardened,
     /// auditd answered the start-up check (R50-16).
     AuditVerified,
+    /// The audit link was verified again after a loss (uid and source).
+    AuditRestored,
+    /// The audit link was lost; noise counts are kept until it is back.
+    AuditLost,
+    /// At the stop, summaries auditd did not acknowledge in time; the
+    /// identifier is their number.
+    AuditUnacknowledged,
     /// dird was verified and the first zone image fetched; the identifier is
     /// its SERIAL (docs/54 §4.8).
     ZoneImageFetched,
@@ -94,6 +103,9 @@ impl Note {
             }
             Note::Hardened => "process hardening applied and verified",
             Note::AuditVerified => "audit connection verified",
+            Note::AuditRestored => "audit connection restored and verified",
+            Note::AuditLost => "audit connection lost; noise counts kept until it is back",
+            Note::AuditUnacknowledged => "audit summaries not acknowledged at stop",
             Note::ZoneImageFetched => "dird verified, zone image fetched; SERIAL",
             Note::Listening => "listening",
             Note::ZoneImageReplaced => "zone image replaced; SERIAL",

@@ -115,7 +115,7 @@ fn dird_not_serving_is_harderror() {
 /// never silence on TCP.
 #[test]
 fn dird_down_is_harderror() {
-    let Some(w) = world(|p| p.front.timeouts.dird_deadline = Duration::from_secs(2)) else {
+    let Some(w) = world(|p| p.timeouts.dird_deadline = Duration::from_secs(2)) else {
         return;
     };
     // Remove the dird socket: new connections to it fail.
@@ -270,8 +270,8 @@ fn an_incomplete_request_times_out_without_a_reply() {
 #[test]
 fn the_per_source_quota_closes_extra_connections() {
     let Some(w) = world(|p| {
-        p.front.limits.max_per_source = 1;
-        p.front.timeouts.first_frame = Duration::from_secs(5);
+        p.limits.max_per_source = 1;
+        p.timeouts.first_frame = Duration::from_secs(5);
     }) else {
         return;
     };

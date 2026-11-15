@@ -438,6 +438,17 @@ impl AuditGate {
         }
     }
 
+    /// Count one noise occurrence that has no event of its own (into the
+    /// next `WindowSummary`'s `suppressed_noise`; no slot is taken) — the
+    /// counters-only sender of docs/54 §9 (dnsd).
+    /// Spec: docs/questions/Q-218 (A-57); docs/54 §9; docs/questions/Q-961;
+    /// ipc-audit `SendWindow::count_noise`.
+    pub fn count_noise(&self) {
+        if let Some(mut state) = self.lock() {
+            state.window.count_noise();
+        }
+    }
+
     /// Count an outcome record that could not be committed after its intent
     /// or decision was recorded (into the next `WindowSummary`).
     /// Spec: decision A-88; docs/questions/Q-366 option (a), Q-395.
@@ -817,6 +828,31 @@ mod tests {
         assert_eq!(gate.inspect(SendWindow::refused_gating), Some(1));
         gate.release(one);
         assert_eq!(gate.reserve_all(2).map(|slots| slots.len()), Some(2));
+    }
+
+    /// docs/54 §9 (dnsd: counters only); A-57: noise counted without an
+    /// event is kept whether or not auditd is reachable, takes no slot (none
+    /// is outstanding) and leaves in the next batch as one `WindowSummary`.
+    /// Task DN12, docs/questions/Q-961.
+    #[test]
+    fn counted_noise_reaches_the_next_summary() {
+        let gate = AuditGate::new(WindowConfig::DEFAULT);
+        gate.count_noise();
+        gate.count_noise();
+        assert_eq!(gate.outstanding(), 0, "no slot taken");
+        assert_eq!(gate.inspect(SendWindow::suppressed_noise), Some(2));
+        gate.set_reachable(true);
+        gate.count_noise();
+        let append = gate.next_batch().unwrap();
+        assert_eq!(append.events().len(), 1);
+        assert_eq!(
+            ipc_audit::decode_event(append.events()[0].as_bytes()).unwrap(),
+            EventBody::WindowSummary(WindowSummary {
+                suppressed_noise: 3,
+                refused_gating: 0,
+                unrecorded_outcomes: 0,
+            })
+        );
     }
 
     /// R6 (b), Q-313: a clean stop — everything acknowledged — reports 0 and

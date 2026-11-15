@@ -47,16 +47,26 @@ pub enum AuditSource {
     /// admind (its `Admind` events, which auditd accepts only from this
     /// source — docs/51 §5.7 item 3, docs/questions/Q-341).
     Admind,
+    /// dnsd, the DNS front (only `WindowSummary` counters — docs/54 §9; no
+    /// shape is bound to it). Spec: docs/54 §4.3, §9; docs/questions/Q-619
+    /// item 2, Q-950 (A-157), Q-960.
+    Dnsd,
+    /// kpasswd-front (no events — docs/53 §9; no shape is bound to it).
+    /// Spec: docs/53 §9; docs/questions/Q-955 item 1 (A-158), Q-960.
+    KpasswdFront,
 }
 
 /// The accepted spellings of [`AuditSource`]: the process names of docs/50
-/// §2.4. Spec: docs/50 §2.4, §3.2.
+/// §2.4, docs/54 §4.3 (`dnsd`) and docs/53 (`kpasswd-front`). Spec: docs/50
+/// §2.4, §3.2; docs/54 §4.3; docs/53 §9.
 const SOURCE_NAMES: &[(&str, AuditSource)] = &[
     ("keyd", AuditSource::Keyd),
     ("dird", AuditSource::Dird),
     ("kdc", AuditSource::Kdc),
     ("ldap-front", AuditSource::LdapFront),
     ("admind", AuditSource::Admind),
+    ("dnsd", AuditSource::Dnsd),
+    ("kpasswd-front", AuditSource::KpasswdFront),
 ];
 
 /// auditd's static `uid → source` map.

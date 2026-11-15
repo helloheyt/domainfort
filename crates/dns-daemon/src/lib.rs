@@ -19,9 +19,10 @@
 //!  main (root) ─ config ─ bind UDP+TCP per `listen` ─ hardening ─┐
 //!                                                                 ▼
 //!  current-thread tokio runtime: serve()
-//!   ├─ start: listeners internal? ─ auditd verified ─ zone thread: dird
-//!   │         verified + FetchZoneImage{None} ─ forward thread: dird
-//!   │         verified ─ only then:
+//!   ├─ start: listeners internal? ─ auditd verified (source `dnsd`) ─ zone
+//!   │         thread: dird verified + FetchZoneImage{None} ─ forward
+//!   │         thread: dird verified ─ only then:
+//!   ├─ audit link task: noise counts ⇒ WindowSummary (≤ 1 per heartbeat)
 //!   ├─ UDP task per socket ── source internal? ─ UDP limiter ─ dns-zone
 //!   │                         verdict ─ Reply (≤ 512, ≤ k × request)
 //!   └─ TCP accept task per listener (JoinSet of connections)
@@ -41,9 +42,10 @@
 //!   nothing is ever answered before the first image (docs/54 §4.8).
 //! * The image not confirmed within `zone_image_max_age` ⇒ SERVFAIL to every
 //!   query (dns-zone row 12; docs/54 §4.4).
-//! * auditd not verified at start ⇒ no start (docs/50 R50-16). **dnsd has
-//!   no audit source of its own yet (task DN12): the product daemon refuses
-//!   to start until it exists** — docs/questions/Q-950.
+//! * auditd not verified at start ⇒ no start (docs/50 R50-16): its uid, and
+//!   a `Pong` naming dnsd's own source `dnsd` (code 7 — task DN12,
+//!   docs/questions/Q-950, Q-960), which auditd gives only to the uid its
+//!   `uid_sources` maps to `dnsd`.
 //! * A listener or a source outside `internal_networks` ⇒ no start /
 //!   dropped (A-114).
 //! * A full forwarding queue, a limit, a failed dird call ⇒ SERVFAIL; dird's
@@ -59,7 +61,7 @@
 //! | `udp` / `tcp` | the listeners (RFC 1035 §4.2.1 / §4.2.2) |
 //! | [`source`] | internal-only, and the per-source key (IPv4 / IPv6 /64) |
 //! | [`limits`] | the daemon's constants (docs/questions/Q-951) |
-//! | [`audit`] | the start-up check of auditd |
+//! | [`audit`] | the start-up check of auditd, and the noise counters as `WindowSummary` (docs/54 §9) |
 //! | [`clock`] | the staleness clock |
 //! | [`startup`] | configuration, binding, hardening plan |
 //! | [`log`] | fixed stderr messages and the noise counters |
@@ -75,7 +77,10 @@
 //!
 //! # Residuals (documented, not hidden)
 //!
-//! - No audit source / no audit events of dnsd's own (task DN12; Q-950).
+//! - dnsd's audit is counters only (docs/54 §9): one `WindowSummary` per
+//!   audit heartbeat at most; the counts since the link's last look at the
+//!   window are not summarised at a stop (they stay on the operational log)
+//!   — docs/questions/Q-961.
 //! - No TKEY forwarding and no UDP UPDATE forwarding: dns-zone does not mark
 //!   them yet (DN9 / DR2); dird's replies are relayed on TCP without a
 //!   dns-zone `Reply::from_forwarded` (DR2) — Q-952.

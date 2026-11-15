@@ -177,10 +177,14 @@ pub fn bind(path: &Path) -> Result<UnixListener, BindError> {
     Ok(listener)
 }
 
+/// Quota slots: one per configurable source ([`log_source`]).
+const QUOTA_SLOTS: usize = 7;
+
 /// The log source of a configured source, and its quota slot.
 ///
 /// Spec: docs/50 §2.4, §3.2; crates/config `AuditSource`; crates/audit-log
-/// `Source`.
+/// `Source`; docs/54 §9 and docs/53 §9 (dnsd, kpasswd-front — task DN12,
+/// docs/questions/Q-960).
 const fn log_source(source: AuditSource) -> (Source, usize) {
     match source {
         AuditSource::Keyd => (Source::Keyd, 0),
@@ -188,6 +192,8 @@ const fn log_source(source: AuditSource) -> (Source, usize) {
         AuditSource::Kdc => (Source::Kdc, 2),
         AuditSource::LdapFront => (Source::LdapFront, 3),
         AuditSource::Admind => (Source::Admind, 4),
+        AuditSource::Dnsd => (Source::Dnsd, 5),
+        AuditSource::KpasswdFront => (Source::KpasswdFront, 6),
     }
 }
 
@@ -206,6 +212,8 @@ pub const fn reported_source(source: Source) -> Option<EventSource> {
         Source::Kdc => Some(EventSource::Kdc),
         Source::LdapFront => Some(EventSource::LdapFront),
         Source::Admind => Some(EventSource::Admind),
+        Source::Dnsd => Some(EventSource::Dnsd),
+        Source::KpasswdFront => Some(EventSource::KpasswdFront),
         Source::Auditd => None,
     }
 }
@@ -213,7 +221,7 @@ pub const fn reported_source(source: Source) -> Option<EventSource> {
 /// Open connections per source slot.
 #[derive(Debug, Default)]
 struct Quota {
-    open: [AtomicUsize; 5],
+    open: [AtomicUsize; QUOTA_SLOTS],
 }
 
 /// One held connection slot; released on drop.

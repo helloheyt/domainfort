@@ -93,8 +93,10 @@ fn pong_body(code: u8) -> Vec<u8> {
 /// from a closed table", canonical round trip): the `Pong` carries the
 /// source auditd records the connection under, for every source of the
 /// closed table — its code is the one octet after the envelope, and the
-/// codes are the audit log's (keyd 1, dird 2, kdc 3, ldap-front 4, admind 5;
-/// crates/audit-log `Source::code`).
+/// codes are the audit log's (keyd 1, dird 2, kdc 3, ldap-front 4, admind 5,
+/// dnsd 7, kpasswd-front 8; crates/audit-log `Source::code`). Task DN12:
+/// docs/54 §9 (dnsd, code 7 after auditd's 6), docs/questions/Q-960
+/// (kpasswd-front 8); appended, nothing renumbered.
 #[test]
 fn pong_carries_every_source() {
     let codes = [
@@ -103,6 +105,8 @@ fn pong_carries_every_source() {
         (EventSource::Kdc, 3),
         (EventSource::LdapFront, 4),
         (EventSource::Admind, 5),
+        (EventSource::Dnsd, 7),
+        (EventSource::KpasswdFront, 8),
     ];
     assert_eq!(
         EventSource::ALL.to_vec(),
@@ -123,10 +127,11 @@ fn pong_carries_every_source() {
 
 /// Task R9b (docs/questions/Q-560 item 2; docs/50 §3.3 "enum = `u8` from a
 /// closed table"): every code outside the table — 0, auditd's own source
-/// (6 in the log, which names no peer) and everything above — is refused.
+/// (6 in the log, which names no peer) and everything above 8 — is refused.
 #[test]
 fn pong_with_an_unknown_source_is_refused() {
-    for code in (0u8..=u8::MAX).filter(|code| !(1..=5).contains(code)) {
+    let in_table = |code: &u8| (1..=5).contains(code) || (7..=8).contains(code);
+    for code in (0u8..=u8::MAX).filter(|code| !in_table(code)) {
         assert_eq!(EventSource::from_code(code), None, "{code}");
         assert_eq!(
             decode_reply(&pong_body(code)),

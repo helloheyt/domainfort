@@ -7,17 +7,20 @@
 //! `DescribeZone`); docs/54 §4.6 (dnsd verifies dird's uid and the zone in
 //! the `Pong` — C12), §4.7 (`serve` refuses a listener outside
 //! `internal_networks`); docs/50 R50-16 (auditd first), §7.5 (fail closed);
-//! docs/52 §3.12 (the audit source checked); docs/questions/Q-950 (dnsd's
-//! own audit source does not exist yet: the product refuses to start).
+//! docs/52 §3.12 (the audit source checked); docs/54 §9 and docs/questions/
+//! Q-950, Q-960 (dnsd's own audit source, `dnsd` — task DN12; the product
+//! start against the real auditd is tests/audit.rs).
 //! Values: the RFC 2782 "Fictional example" zone; hand-made uids and IDs.
 
 mod common;
 
-use common::{parts, query, reply, transfer, udp_client, udp_exchange, Dnsd, World, SERIAL};
+use common::{
+    parts, query, reply, transfer, udp_client, udp_exchange, Dnsd, FakeAuditd, World, SERIAL,
+};
 use config::Network;
 use core::net::{IpAddr, Ipv4Addr};
 use core::time::Duration;
-use dns_daemon::audit::{AuditCheckError, AUDIT_SOURCE};
+use dns_daemon::audit::AUDIT_SOURCE;
 use dns_daemon::test_seams::DaemonParams as ServeParams;
 use dns_daemon::{DaemonError, DaemonParams, DirdEndpoint, TcpLimits};
 use ipc::Refused;
@@ -119,8 +122,11 @@ fn a_peer_that_is_not_dird_gets_nothing() {
 }
 
 /// docs/50 R50-16 (auditd first), docs/52 §3.12 (the source auditd names is
-/// checked): no auditd ⇒ no start, dird never contacted; an auditd that
-/// would record dnsd under another source ⇒ no start.
+/// checked): no auditd ⇒ no start, dird never contacted; an auditd under
+/// another uid ⇒ no start; an auditd that would record dnsd under another
+/// source than `dnsd` — every other source of the closed table — ⇒ no start,
+/// dird never contacted (task DN12: dnsd borrows no other process's source,
+/// docs/questions/Q-950).
 #[test]
 fn auditd_is_verified_first() {
     let Some(world) = World::new(transfer(&parts(SERIAL, &[]))) else {
@@ -131,43 +137,40 @@ fn auditd_is_verified_first() {
     let mut dnsd = world.start(params);
     assert_eq!(
         dnsd.join(),
-        Err(DaemonError::Audit(AuditCheckError::Link(
-            AuditLinkError::Connect
-        )))
+        Err(DaemonError::Audit(AuditLinkError::Connect))
     );
     assert!(world.dird.state().fetches.is_empty(), "dird not contacted");
 
     let mut params = world.params();
-    params.audit_source = Some(EventSource::Kdc);
+    params.audit.uid = world.uid + 1;
     let mut dnsd = world.start(params);
     assert_eq!(
         dnsd.join(),
-        Err(DaemonError::Audit(AuditCheckError::Link(
-            AuditLinkError::SourceMismatch
-        )))
+        Err(DaemonError::Audit(AuditLinkError::PeerMismatch))
     );
     assert!(world.dird.state().fetches.is_empty(), "dird not contacted");
+
+    for other in EventSource::ALL.into_iter().filter(|s| *s != AUDIT_SOURCE) {
+        let socket = world.dir.path().join("other.sock");
+        let _cross_wired = FakeAuditd::start(&socket, other);
+        let mut params = world.params();
+        params.audit.socket = socket;
+        let mut dnsd = world.start(params);
+        assert_eq!(
+            dnsd.join(),
+            Err(DaemonError::Audit(AuditLinkError::SourceMismatch)),
+            "{other:?}"
+        );
+        assert!(world.dird.state().fetches.is_empty(), "dird not contacted");
+    }
 }
 
-/// docs/questions/Q-950: dnsd's own audit source (`dnsd`, docs/54 §9) is not
-/// in ipc-audit's closed table yet (task DN12), and dnsd borrows no other
-/// process's source — with the product's expectation the check refuses
-/// before auditd is even contacted, and dnsd does not start.
+/// docs/54 §9 ("dnsd — a new source (`dnsd`, source code 7)"); docs/
+/// questions/Q-619 item 2, Q-960: the source dnsd expects is its own, code 7.
 #[test]
-fn without_its_own_audit_source_dnsd_does_not_start() {
-    assert_eq!(AUDIT_SOURCE, None);
-    let Some(world) = World::new(transfer(&parts(SERIAL, &[]))) else {
-        return;
-    };
-    let mut params = world.params();
-    params.audit_source = AUDIT_SOURCE;
-    let mut dnsd = world.start(params);
-    assert_eq!(
-        dnsd.join(),
-        Err(DaemonError::Audit(AuditCheckError::SourceNotRegistered))
-    );
-    assert_eq!(world.auditd.pings(), 0, "auditd not contacted");
-    assert!(world.dird.state().fetches.is_empty(), "dird not contacted");
+fn dnsd_expects_its_own_audit_source() {
+    assert_eq!(AUDIT_SOURCE, EventSource::Dnsd);
+    assert_eq!(AUDIT_SOURCE.code(), 7);
 }
 
 /// docs/54 §4.7 (A-114): `serve` refuses a listener whose local address
@@ -187,10 +190,10 @@ fn a_listener_outside_the_internal_networks_means_no_start() {
 }
 
 /// docs/52 C18 (task R15): a product dnsd runs with the configuration's
-/// values and the daemon's constants only — the product audit source
-/// (`None`, Q-950), the rate limits and queue of docs/questions/Q-951, the
-/// refresh interval of docs/54 §4.4 (5 s), and the channel's one deadline
-/// (crates/ipc-dns `DEFAULT_DEADLINE`, Q-920 item 9).
+/// values and the daemon's constants only — the rate limits and queue of
+/// docs/questions/Q-951, the refresh interval of docs/54 §4.4 (5 s), and the
+/// channel's one deadline (crates/ipc-dns `DEFAULT_DEADLINE`, Q-920 item 9);
+/// the audit source is no parameter at all (task DN12).
 #[test]
 fn a_product_dnsd_runs_with_the_constants() {
     let product = DaemonParams {
@@ -215,7 +218,7 @@ fn a_product_dnsd_runs_with_the_constants() {
     };
     let serve = ServeParams::from(product);
     assert_eq!(serve.dird_uid, 802);
-    assert_eq!(serve.audit_source, None);
+    assert_eq!(serve.audit.uid, 805);
     assert_eq!(serve.dird_deadline, ipc_dns::DEFAULT_DEADLINE);
     assert_eq!(serve.udp, dns_daemon::limits::UDP_LIMITS);
     assert_eq!(serve.tcp_messages, dns_daemon::limits::TCP_MESSAGE_LIMITS);
