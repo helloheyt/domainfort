@@ -60,6 +60,12 @@ parse-dns = { path = "../parse-dns" }
 # A-114: "one implementation for address matching") for the registrable
 # networks of a host record (docs/54 §5.5; Q-614 item 8). Zero dependencies.
 config = { path = "../config" }
+# Task PN1 (docs/59 §4.2-§4.4, §8; A-173): the one name equivalence of the
+# principal namespace — the fold, the request key, the keys an object's
+# stored names produce and the realm alias set (src/principal.rs). Our own
+# crypto-free leaf crate: it links only krb-proto and keyd-types, which this
+# crate links already.
+principal-names = { path = "../principal-names" }
 
 [dev-dependencies]
 # TESTS ONLY (docs/52 C18, task R15; A-113): the tests open their stores by

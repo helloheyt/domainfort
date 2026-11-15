@@ -73,6 +73,7 @@ mod error;
 mod fast_armor;
 pub mod grant;
 pub mod model;
+mod name_resolution;
 pub mod sealed_store;
 mod service_ticket;
 mod tgs_exchange;
@@ -110,6 +111,11 @@ pub use model::{
     is_admin_service_name, is_change_password_service_name, KeyHandle, KeyPurpose, Kvno,
     PrincipalBinding, PrincipalId, ServiceKeyHandle, ADMIN_SERVICE_CLASS,
     CHANGE_PASSWORD_SERVICE_NAME,
+};
+pub use name_resolution::{
+    AttestedNameResolution, NameResolution, NameResolutionError, NameResolutionFields,
+    MAX_NAME_RESOLUTION_MAC_INPUT, NAME_RESOLUTION_LABEL, NAME_RESOLUTION_TAG_LEN,
+    NAME_RESOLUTION_WINDOW_SECS,
 };
 pub use sealed_store::StoreId;
 pub use service_ticket::{

@@ -146,6 +146,7 @@ mod host;
 mod names;
 mod naming;
 mod pep;
+mod principal;
 mod record;
 mod salt;
 mod state;
@@ -167,6 +168,9 @@ pub use host::{
 };
 pub use naming::{NamingContext, MAX_NC_LABELS, NC_RDN_ATTRIBUTE};
 pub use pep::PepView;
+// An object's principal names and keys in the one namespace (task PN1;
+// docs/59 §4.3): `DirectoryView::{principal_names_of, principal_keys}`.
+pub use principal::{name_context_of, PrincipalNamesError};
 pub use salt::{account_salt, AccountKind, SaltError};
 pub use tier::TierMap;
 pub use time::{dstime_of, time_of_dstime};

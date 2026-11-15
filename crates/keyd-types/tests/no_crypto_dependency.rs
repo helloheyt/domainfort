@@ -93,7 +93,14 @@ fn crypto_free_crates_do_not_link_the_crypto_profile() {
             graph.iter().any(|name| name == package),
             "cargo tree did not list {package} itself: {graph:?}"
         );
-        for forbidden in [CRYPTO_PROFILE, "keyd", "ipc-keyd-server"] {
+        // `name-attestation` (A-173, A-175): the attestation key's MAC code —
+        // only dird (the signer) and keyd (the verifier) link it.
+        for forbidden in [
+            CRYPTO_PROFILE,
+            "keyd",
+            "ipc-keyd-server",
+            "name-attestation",
+        ] {
             assert!(
                 !graph.iter().any(|name| name == forbidden),
                 "{package} depends on {forbidden} (D182: only keyd links krb-crypto): {graph:?}"

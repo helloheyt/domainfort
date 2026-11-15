@@ -309,6 +309,7 @@ dependencies = [
  "krb-proto",
  "parse-dns",
  "pdp",
+ "principal-names",
 ]
 
 [[package]]
@@ -904,6 +905,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "name-attestation"
+version = "0.0.0"
+dependencies = [
+ "hmac",
+ "keyd-types",
+ "krb-proto",
+ "sha2",
+ "zeroize",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -973,6 +985,14 @@ dependencies = [
  "pdp",
  "protected-file",
  "test-scratch",
+]
+
+[[package]]
+name = "principal-names"
+version = "0.0.0"
+dependencies = [
+ "keyd-types",
+ "krb-proto",
 ]
 
 [[package]]
