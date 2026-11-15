@@ -44,6 +44,7 @@ const KDC: &str = "\
 run_as_uid = 61003
 run_as_gid = 61003
 listen = 10.0.0.5:88
+internal_networks = 10.0.0.0/8
 keyd_socket = /run/keyd/keyd.sock
 keyd_uid = 61001
 dird_kdc_socket = /run/dird/kdc/dird-kdc.sock

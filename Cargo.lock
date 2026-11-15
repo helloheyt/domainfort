@@ -235,6 +235,7 @@ dependencies = [
  "directory-pip",
  "dirstore",
  "dtyp",
+ "ipc",
  "ipc-audit",
  "kdc",
  "keyd-types",
@@ -242,6 +243,7 @@ dependencies = [
  "pdp",
  "policy-store",
  "sha2",
+ "tokio",
 ]
 
 [[package]]
@@ -549,6 +551,7 @@ dependencies = [
  "krb-crypto",
  "krb-proto",
  "pdp",
+ "tokio",
  "zeroize",
 ]
 

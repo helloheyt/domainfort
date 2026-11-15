@@ -937,9 +937,10 @@ fn listener_addresses() {
     ] {
         rejects_value(Daemon::Kdc, KDC, key, value, ErrorKind::InvalidList);
     }
+    // Every listener inside the zone table (docs/50 R50-9; task R15b).
     accepts_value(
         Daemon::Kdc,
-        KDC,
+        &set(KDC, "internal_networks", "10.0.0.0/8, 127.0.0.0/8, ::1/128"),
         key,
         "[::1]:8888, 127.0.0.1:88, 10.0.0.5:89",
     );
@@ -1017,7 +1018,12 @@ fn networks() {
         key,
         "10.0.0.5/32, fd00:1234::5/128, 128.0.0.0/1",
     );
-    accepts_value(Daemon::Kdc, KDC, key, "10.0.0.0/8, 10.1.0.0/16");
+    accepts_value(
+        Daemon::Kdc,
+        KDC,
+        key,
+        "10.0.0.0/8, 10.1.0.0/16, fd00:1234::/32",
+    );
 }
 
 // ---- whole-file consistency ----------------------------------------------------
@@ -1453,6 +1459,46 @@ fn ldap_front_listeners_must_be_internal() {
         &append(DIRD, "internal_networks = 10.0.0.0/8"),
     );
     assert_eq!(err.kind(), ErrorKind::UnknownKey);
+}
+
+/// docs/50 R50-9 ("binding to internal interfaces only"), §4.1 (UDP: the
+/// same; CIDR → Internal; the match within one address family — Q-275 item
+/// 9); docs/questions/Q-223 (A-57 (a)); task R15b (docs/questions/Q-632,
+/// A-114's follow-up): the kdc's file has ldap-front's rule — the zone table
+/// is required and every `listen` address lies in one of its networks
+/// (`ListenerNotInternal` at `listen`), by the one match.
+#[test]
+fn kdc_listeners_must_be_internal() {
+    // The sample's listeners: 10.0.0.5 and fd00:1234::5, inside
+    // 10.0.0.0/8, fd00:1234::/32.
+    let text = set(KDC, "listen", "10.0.0.5:88, 192.168.11.5:88");
+    let err = error(Daemon::Kdc, &text);
+    assert_eq!(err.kind(), ErrorKind::ListenerNotInternal);
+    assert_eq!(err.key(), Some("listen"));
+    // An IPv6 address outside fd00:1234::/32.
+    let text = set(KDC, "listen", "[fd00:1235::5]:88");
+    assert_eq!(
+        error(Daemon::Kdc, &text).kind(),
+        ErrorKind::ListenerNotInternal
+    );
+    // 10.0.0.5 written as an IPv4-mapped IPv6 address: not rewritten.
+    let text = set(KDC, "listen", "[::ffff:10.0.0.5]:88");
+    assert_eq!(
+        error(Daemon::Kdc, &text).kind(),
+        ErrorKind::ListenerNotInternal
+    );
+    // A narrower table that leaves one configured listener outside.
+    let err = error(Daemon::Kdc, &set(KDC, "internal_networks", "10.0.0.0/8"));
+    assert_eq!(err.kind(), ErrorKind::ListenerNotInternal);
+    assert_eq!(err.key(), Some("listen"));
+    // The table is required.
+    let err = error(Daemon::Kdc, &remove(KDC, "internal_networks"));
+    assert_eq!(err.kind(), ErrorKind::MissingKey);
+    assert_eq!(err.key(), Some("internal_networks"));
+    // Inside: host routes of exactly the listener addresses.
+    let text = set(KDC, "internal_networks", "10.0.0.5/32, fd00:1234::5/128");
+    let s = KdcSettings::parse(text.as_bytes()).expect("every listener inside");
+    assert_eq!(s.internal_networks().len(), 2);
 }
 
 /// The dird-ldap deadline stays above the engine's 60-second query bound and

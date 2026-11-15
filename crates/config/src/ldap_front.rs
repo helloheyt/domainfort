@@ -38,7 +38,7 @@ use crate::schema::{
     self, Account, Distinct, Endpoint, AUDITD_UID, AUDIT_SOCKET, DIRD_DEADLINE, DIRD_LDAP_SOCKET,
     DIRD_UID, INTERNAL_NETWORKS, RUN_AS_GID, RUN_AS_UID,
 };
-use crate::value::{self, is_internal, AbsolutePath, Network};
+use crate::value::{self, AbsolutePath, Network};
 
 /// Key: TCP listeners for LDAP with StartTLS (port 389). Spec: docs/50 §4.2.
 const LDAP_LISTEN: &str = "ldap_listen";
@@ -152,34 +152,6 @@ fn check_disjoint(
     Ok(())
 }
 
-/// Every listener address lies in a network of the zone table; reported at
-/// the first list (by line) that holds one outside it.
-/// Spec: docs/52 §7 R14; A-102 on docs/questions/Q-469 (b); docs/50 §4.1
-/// (CIDR → Internal), §4.2; docs/questions/Q-580.
-fn check_internal(
-    lists: [(Option<&Located<Vec<SocketAddr>>>, &'static str); 2],
-    internal: &[Network],
-) -> Result<(), Error> {
-    let mut outside: Option<(u32, &'static str)> = None;
-    for (list, key) in lists {
-        let Some(list) = list else {
-            continue;
-        };
-        if list
-            .value
-            .iter()
-            .any(|address| !is_internal(internal, address.ip()))
-            && outside.is_none_or(|(line, _)| list.line < line)
-        {
-            outside = Some((list.line, key));
-        }
-    }
-    match outside {
-        Some((line, key)) => Err(Error::at(line, key, ErrorKind::ListenerNotInternal)),
-        None => Ok(()),
-    }
-}
-
 impl LdapFrontSettings {
     /// The closed key table of ldap-front's file. Spec: docs/50 R50-15.
     pub const KEYS: &'static [&'static str] = &[
@@ -230,7 +202,7 @@ impl LdapFrontSettings {
         let internal_networks = doc
             .required(INTERNAL_NETWORKS, |text| value::list(text, value::network))?
             .value;
-        check_internal(
+        schema::check_internal(
             [(ldap.as_ref(), LDAP_LISTEN), (ldaps.as_ref(), LDAPS_LISTEN)],
             &internal_networks,
         )?;

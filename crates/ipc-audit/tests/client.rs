@@ -2,342 +2,38 @@
 //! sockets: the peer uid and the source auditd reports are verified on every
 //! new connection before any batch, and an auditd that would record this
 //! process under another source receives nothing — the gate keeps auditd
-//! unreachable meanwhile, so gating operations are refused.
+//! unreachable meanwhile, so gating operations are refused. Task R15b: the
+//! client is the only source of the gate's evidence — attaching a verified
+//! connection opens the gate, ending the link closes it, and a proof of an
+//! acknowledged intent comes only from an auditd's `Ack` delivered through
+//! the client.
 //!
 //! The auditd here is a minimal server written from the audit channel's own
 //! message set (this crate): `Ping` → `Pong` naming the source it was told
-//! to report, `Append` → `Ack` of its last number; it counts what it
-//! received. Real peer credentials on both sides (the test's own uid); as
-//! root the tests are skipped (uid 0 is never an expected auditd uid —
-//! docs/50 R50-3).
+//! to report, `Append` → `Ack` of its last number (or no reply, in its
+//! silent mode); it counts what it received (tests/linked, shared with the
+//! other crates' tests). Real peer credentials on both sides (the test's own
+//! uid); as root the tests are skipped (uid 0 is never an expected auditd
+//! uid — docs/50 R50-3).
 //!
 //! Source: docs/50 R50-3 ("the client verifies the server's uid too"),
 //! §3.2 ("the source is set from the uid"), §3.6, §3.7, §7.5, §8.1; docs/52
-//! §3.12 (C12); PENDING-OWNER A-57, A-67 item 2 (auditd unreachable ⇒
-//! gating refused); docs/questions/Q-512 (A-112), Q-560. Every value is made
-//! up here.
+//! §3.11 R6 (a), §3.12 (C12); PENDING-OWNER A-57, A-67 item 2 (auditd
+//! unreachable ⇒ gating refused), A-115; docs/questions/Q-512 (A-112),
+//! Q-560, Q-630. Every value is made up here.
 #![cfg(feature = "client")]
 
-use ipc::{Direction, FrameReader, Reply};
-use ipc_audit::client::{AuditLink, AuditLinkError, ExpectedAuditd, LinkedGate};
-use ipc_audit::{
-    decode_request, encode_reply, Ack, AuditGate, AuditReply, AuditRequest, EventBody, EventSource,
-    WindowConfig, WindowSummary, AUDIT_CHANNEL,
+// The fake auditd, the test gate and the link's runner — shared with the
+// other crates whose tests need an acknowledged intent (task R15b).
+mod linked;
+
+use ipc_audit::client::{AuditLinkError, ExpectedAuditd};
+use ipc_audit::{EventBody, EventSource, IntentRecord, WindowSummary};
+use linked::{
+    acknowledged, block_on, eventually, link, not_acknowledged, FakeAuditd, LinkRun, TempDir,
+    TestGate,
 };
-use std::future::Future;
-use std::io::{ErrorKind, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
-
-static NEXT_DIR: AtomicU32 = AtomicU32::new(0);
-
-/// A unique temporary directory (mode 0700), removed on drop.
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new() -> TempDir {
-        let n = NEXT_DIR.fetch_add(1, Ordering::SeqCst);
-        let path = std::env::temp_dir().join(format!("iac{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&path)
-            .unwrap();
-        TempDir(path)
-    }
-
-    fn join(&self, name: &str) -> PathBuf {
-        self.0.join(name)
-    }
-
-    /// The test process's uid: the owner of the directory it just created;
-    /// `None` as root.
-    fn uid(&self) -> Option<u32> {
-        let uid = std::fs::metadata(&self.0).unwrap().uid();
-        if uid == 0 {
-            eprintln!("skipped: running as root (docs/50 R50-3: uid 0 is never expected)");
-            None
-        } else {
-            Some(uid)
-        }
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// What the fake auditd received.
-#[derive(Default)]
-struct Received {
-    connections: AtomicUsize,
-    pings: AtomicUsize,
-    appends: AtomicUsize,
-}
-
-/// A minimal auditd whose `Pong` names `source` (module documentation).
-struct FakeAuditd {
-    path: PathBuf,
-    stop: Arc<AtomicBool>,
-    received: Arc<Received>,
-    streams: Arc<Mutex<Vec<UnixStream>>>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl FakeAuditd {
-    fn start(path: &Path, source: EventSource) -> FakeAuditd {
-        let _ = std::fs::remove_file(path);
-        let listener = UnixListener::bind(path).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let stop = Arc::new(AtomicBool::new(false));
-        let received = Arc::new(Received::default());
-        let streams = Arc::new(Mutex::new(Vec::new()));
-        let thread = {
-            let (stop, received, streams) = (
-                Arc::clone(&stop),
-                Arc::clone(&received),
-                Arc::clone(&streams),
-            );
-            std::thread::spawn(move || {
-                while !stop.load(Ordering::SeqCst) {
-                    match listener.accept() {
-                        Ok((stream, _)) => {
-                            stream.set_nonblocking(false).unwrap();
-                            received.connections.fetch_add(1, Ordering::SeqCst);
-                            streams.lock().unwrap().push(stream.try_clone().unwrap());
-                            let received = Arc::clone(&received);
-                            std::thread::spawn(move || serve(stream, source, &received));
-                        }
-                        Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                            std::thread::sleep(Duration::from_millis(5));
-                        }
-                        Err(_) => return,
-                    }
-                }
-            })
-        };
-        FakeAuditd {
-            path: path.to_path_buf(),
-            stop,
-            received,
-            streams,
-            thread: Some(thread),
-        }
-    }
-
-    fn pings(&self) -> usize {
-        self.received.pings.load(Ordering::SeqCst)
-    }
-
-    fn appends(&self) -> usize {
-        self.received.appends.load(Ordering::SeqCst)
-    }
-
-    fn connections(&self) -> usize {
-        self.received.connections.load(Ordering::SeqCst)
-    }
-
-    /// Stop accepting, close every connection, remove the socket file.
-    fn stop(&mut self) {
-        let Some(thread) = self.thread.take() else {
-            return;
-        };
-        self.stop.store(true, Ordering::SeqCst);
-        thread.join().unwrap();
-        for stream in self.streams.lock().unwrap().drain(..) {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
-        }
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-impl Drop for FakeAuditd {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-/// One connection: `Ping` → `Pong(source)`, `Append` → `Ack` of its last
-/// number (docs/50 §7.5, §8.1). Anything else closes it.
-fn serve(mut stream: UnixStream, source: EventSource, received: &Received) {
-    while let Some(body) = read_frame(&mut stream) {
-        let reply = match decode_request(&body) {
-            Ok(AuditRequest::Ping) => {
-                received.pings.fetch_add(1, Ordering::SeqCst);
-                AuditReply::Pong(source)
-            }
-            Ok(AuditRequest::Append(append)) => {
-                received.appends.fetch_add(1, Ordering::SeqCst);
-                AuditReply::Ack(Ack {
-                    through_seq: append.last_seq(),
-                    head_hash: [0; 32],
-                })
-            }
-            Err(_) => return,
-        };
-        let frame = encode_reply(&Reply::Message(reply)).unwrap();
-        if stream.write_all(frame.as_bytes()).is_err() {
-            return;
-        }
-    }
-}
-
-/// One request frame from a blocking stream; `None` once the peer closed.
-fn read_frame(stream: &mut UnixStream) -> Option<Vec<u8>> {
-    let mut reader = FrameReader::new(AUDIT_CHANNEL.limit(Direction::Request));
-    let mut chunk = [0u8; 1024];
-    loop {
-        if let Some(body) = reader.body() {
-            return Some(body.to_vec());
-        }
-        let wanted = reader.wanted().min(chunk.len());
-        if wanted == 0 {
-            return None;
-        }
-        match stream.read(&mut chunk[..wanted]) {
-            Ok(0) => return None,
-            Ok(n) => {
-                reader.push(&chunk[..n]).ok()?;
-            }
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(_) => return None,
-        }
-    }
-}
-
-/// A daemon's gate as the link sees it: the shared gate and a wake-up.
-struct TestGate {
-    core: AuditGate,
-    wake: tokio::sync::Notify,
-}
-
-impl TestGate {
-    fn new() -> Arc<TestGate> {
-        Arc::new(TestGate {
-            core: AuditGate::new(WindowConfig::DEFAULT),
-            wake: tokio::sync::Notify::new(),
-        })
-    }
-
-    /// Commit one gating event without asking for reachability (a test
-    /// step: what a daemon commits is refused while auditd is unreachable,
-    /// and the test wants something pending to see it is not sent).
-    fn commit_pending(&self) {
-        let event = EventBody::WindowSummary(WindowSummary {
-            suppressed_noise: 1,
-            refused_gating: 2,
-            unrecorded_outcomes: 3,
-        });
-        self.core
-            .with_steps(|window| {
-                let slot = window.reserve().unwrap();
-                window.commit(slot, &event).unwrap();
-            })
-            .unwrap();
-        self.wake.notify_one();
-    }
-}
-
-impl LinkedGate for TestGate {
-    fn audit_gate(&self) -> &AuditGate {
-        &self.core
-    }
-
-    fn recorded(&self) -> impl Future<Output = ()> + Send + '_ {
-        self.wake.notified()
-    }
-
-    fn link_restored(&self) {}
-
-    fn link_lost(&self) {}
-}
-
-/// `future` on a fresh current-thread runtime.
-fn block_on<F: Future>(future: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(future)
-}
-
-/// The link's task on its own thread and runtime: `connect` (the start-up
-/// verification), then `run` until dropped.
-struct LinkRun {
-    stop: Arc<tokio::sync::Notify>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl LinkRun {
-    fn start(link: AuditLink, gate: Arc<TestGate>) -> Result<LinkRun, AuditLinkError> {
-        let (report, started) = mpsc::channel();
-        let stop = Arc::new(tokio::sync::Notify::new());
-        let thread = {
-            let stop = Arc::clone(&stop);
-            std::thread::spawn(move || {
-                block_on(async move {
-                    match link.connect().await {
-                        Ok(first) => {
-                            let _ = report.send(Ok(()));
-                            let task = tokio::spawn(link.run(gate, first));
-                            stop.notified().await;
-                            task.abort();
-                            let _ = task.await;
-                        }
-                        Err(error) => {
-                            let _ = report.send(Err(error));
-                        }
-                    }
-                });
-            })
-        };
-        match started.recv().unwrap() {
-            Ok(()) => Ok(LinkRun {
-                stop,
-                thread: Some(thread),
-            }),
-            Err(error) => {
-                thread.join().unwrap();
-                Err(error)
-            }
-        }
-    }
-}
-
-impl Drop for LinkRun {
-    fn drop(&mut self) {
-        self.stop.notify_one();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-/// Poll `condition` until it holds or 10 s passed.
-fn eventually(mut condition: impl FnMut() -> bool) -> bool {
-    let end = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < end {
-        if condition() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    condition()
-}
-
-fn link(path: &Path, uid: u32, source: EventSource) -> AuditLink {
-    AuditLink::new(
-        path.to_path_buf(),
-        ExpectedAuditd::new(uid, source).unwrap(),
-    )
-}
+use std::sync::Arc;
 
 /// Attack (docs/questions/Q-512 item 2): an auditd whose map gives this
 /// process's uid another source — for each source a sender can expect, the
@@ -408,7 +104,10 @@ fn the_expected_auditd_is_served() {
     );
     let gate = TestGate::new();
     let run = LinkRun::start(link(&path, uid, EventSource::Kdc), Arc::clone(&gate)).unwrap();
-    assert!(eventually(|| gate.core.is_reachable()));
+    assert!(
+        gate.core.is_reachable(),
+        "attached: the gate is open at once"
+    );
     gate.commit_pending();
     gate.commit_pending();
     assert!(eventually(|| gate.core.outstanding() == 0), "acknowledged");
@@ -457,4 +156,101 @@ fn reconnecting_to_a_cross_wired_auditd_sends_nothing() {
     assert!(back.appends() >= 1);
     assert!(gate.core.is_reachable());
     drop(run);
+}
+
+/// Task R15b (docs/questions/Q-630): the gate's reachability is the
+/// client's alone — a new gate is closed (no slot); attaching the verified
+/// start-up connection opens it at once (before the delivery task runs: a
+/// daemon serves right after its start); dropping the attached link — the
+/// daemon's stop aborting the task, or a start that failed before spawning
+/// it — closes it again (A-57: no link, no reachability).
+#[test]
+fn attaching_a_verified_connection_opens_the_gate_and_its_end_closes_it() {
+    let dir = TempDir::new();
+    let Some(uid) = dir.uid() else { return };
+    let path = dir.join("a.sock");
+    let _auditd = FakeAuditd::start(&path, EventSource::Keyd);
+    let gate = TestGate::new();
+    assert!(!gate.core.is_reachable());
+    assert!(gate.core.reserve().is_none(), "closed until attached");
+    block_on(async {
+        let link = link(&path, uid, EventSource::Keyd);
+        let first = link.connect().await.unwrap();
+        let attached = link.attach(Arc::clone(&gate), first);
+        assert!(gate.core.is_reachable(), "open on the verified connection");
+        let slot = gate.core.reserve().expect("a gating slot");
+        gate.core.release(slot);
+        drop(attached);
+        assert!(!gate.core.is_reachable(), "the link ended: closed");
+        assert!(gate.core.reserve().is_none());
+    });
+    // A delivery task aborted at stop closes the gate too.
+    let run = LinkRun::start(link(&path, uid, EventSource::Keyd), Arc::clone(&gate)).unwrap();
+    assert!(gate.core.is_reachable());
+    drop(run);
+    assert!(
+        !gate.core.is_reachable(),
+        "the aborted link closed the gate"
+    );
+}
+
+/// Task R15b: a connection verified against another expectation (another
+/// source) does not open a gate when attached to a link that expects
+/// something else — the link verifies its own auditd again (here a
+/// cross-wired one: never), and nothing is sent.
+#[test]
+fn a_connection_verified_for_another_expectation_opens_nothing() {
+    let dir = TempDir::new();
+    let Some(uid) = dir.uid() else { return };
+    let path = dir.join("a.sock");
+    let auditd = FakeAuditd::start(&path, EventSource::Kdc);
+    let gate = TestGate::new();
+    gate.commit_pending();
+    block_on(async {
+        let as_kdc = link(&path, uid, EventSource::Kdc).connect().await.unwrap();
+        let attached = link(&path, uid, EventSource::Dird).attach(Arc::clone(&gate), as_kdc);
+        assert!(!gate.core.is_reachable(), "not this link's verified auditd");
+        let task = tokio::spawn(attached.run());
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!gate.core.is_reachable());
+        task.abort();
+        let _ = task.await;
+    });
+    assert_eq!(
+        auditd.appends(),
+        0,
+        "no batch to an auditd it did not verify"
+    );
+    assert_eq!(gate.core.outstanding(), 1, "the event waits");
+}
+
+/// A value whose intent record is a summary carrying `n` (any event built
+/// from this crate's types serves).
+#[derive(Debug, PartialEq, Eq)]
+struct Change(u64);
+
+impl IntentRecord for Change {
+    fn intent_event(&self) -> EventBody {
+        EventBody::WindowSummary(WindowSummary {
+            suppressed_noise: self.0,
+            refused_gating: 0,
+            unrecorded_outcomes: 0,
+        })
+    }
+}
+
+/// Task R15b / docs/52 §3.11 R6 (a): code outside ipc-audit obtains an
+/// `AckedIntent` only through the client — the intent record delivered to
+/// an auditd that acknowledges it ⇒ the proof, for the same value; the
+/// record delivered to an auditd that never acknowledges ⇒ the value back,
+/// no proof. (That nothing outside the crate can mark auditd reachable or
+/// acknowledge is shown by the `compile_fail` examples on `AuditGate`.)
+#[test]
+fn a_proof_comes_only_from_an_ack_delivered_through_the_client() {
+    if TempDir::new().uid().is_none() {
+        return;
+    }
+    let acked = acknowledged(Change(5));
+    assert_eq!(acked.into_inner(), Change(5));
+    assert_eq!(not_acknowledged(Change(6)), Change(6));
 }

@@ -14,9 +14,10 @@
 //!    new connection checks the server's uid before anything is sent
 //!    (A-63), and a dependency that is down answers that request
 //!    `Unavailable` (docs/50 §3.7) — docs/questions/Q-407.
-//! 3. **the listener** — `admin_socket`: remove a stale socket file (only if
-//!    it is a socket; anything else ⇒ error), bind, set the socket file's
-//!    mode ([`SOCKET_FILE_MODE`]), accept (crate::listener).
+//! 3. **the listener** — `admin_socket`: bind, set the socket file's mode
+//!    ([`SOCKET_FILE_MODE`]), accept (crate::listener); the one stale-socket
+//!    removal is the root-side preparation's, before the drop — an occupied
+//!    path fails the bind (task R15b).
 //! 4. **until stopped** — [`DaemonControl::stop`]: stop accepting, answer
 //!    new requests `Unavailable`, wait (bounded by [`DRAIN_GRACE`]) for the
 //!    requests in flight, then (bounded by [`AUDIT_FLUSH_GRACE`]) until
@@ -47,7 +48,7 @@ use crate::worker::Worker;
 use core::fmt;
 use core::time::Duration;
 use ipc_audit::WindowConfig;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -191,9 +192,10 @@ pub enum DaemonError {
     Audit(AuditLinkError),
     /// The worker thread could not be started.
     Worker,
-    /// A non-socket file is in the way of `admin_socket`.
-    SocketPathOccupied,
-    /// The socket could not be bound or its mode set.
+    /// The socket could not be bound or its mode set — among others, its
+    /// path is occupied: the stale socket of an earlier run is removed by
+    /// the root-side preparation alone (`startup::prepare_socket_directory`,
+    /// task R15b), never here.
     Bind,
 }
 
@@ -202,9 +204,6 @@ impl fmt::Display for DaemonError {
         match self {
             DaemonError::Audit(error) => write!(f, "auditd not verified: {error}"),
             DaemonError::Worker => f.write_str("worker thread could not be started"),
-            DaemonError::SocketPathOccupied => {
-                f.write_str("admin socket path is occupied by a file that is not a socket")
-            }
             DaemonError::Bind => f.write_str("admin socket could not be bound"),
         }
     }
@@ -289,24 +288,15 @@ impl Stopped {
     }
 }
 
-/// Remove a stale socket file at `path`, if any; refuse to remove anything
-/// that is not a socket.
-/// Spec: docs/50 §3.1 ("the daemon manages this explicitly").
-fn remove_stale_socket(path: &Path) -> Result<(), DaemonError> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_socket() => {
-            std::fs::remove_file(path).map_err(|_| DaemonError::Bind)
-        }
-        Ok(_) => Err(DaemonError::SocketPathOccupied),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err(DaemonError::Bind),
-    }
-}
-
-/// Bind `admin_socket` and set its mode.
-/// Spec: docs/50 §3.1; tokio `net::UnixListener::bind`.
+/// Bind `admin_socket` and set its mode. Nothing is removed first: the one
+/// stale-socket removal is the root-side preparation's
+/// (`protected_file::prepare_socket_directory`, relative to the walked and
+/// checked directory, before the drop — task R11c); a path occupied after it
+/// (only root or admind's account could have done that) fails the bind
+/// (task R15b, docs/questions/Q-631).
+/// Spec: docs/50 §3.1 ("the daemon manages this explicitly"); tokio
+/// `net::UnixListener::bind`.
 fn bind(path: &Path) -> Result<UnixListener, DaemonError> {
-    remove_stale_socket(path)?;
     let listener = UnixListener::bind(path).map_err(|_| DaemonError::Bind)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(SOCKET_FILE_MODE))
         .map_err(|_| DaemonError::Bind)?;
@@ -357,7 +347,9 @@ pub async fn serve_with(
     let audit = link.connect().await.map_err(DaemonError::Audit)?;
     note(Note::AuditVerified, None);
     let gate = Arc::new(AuditGate::new(params.audit_window));
-    gate.set_reachable(true);
+    // The gate opens on the verified connection — by the audit client, the
+    // one owner of "auditd is reachable" (task R15b, docs/questions/Q-630).
+    let attached = link.attach(Arc::clone(&gate), audit);
 
     // 2. The worker.
     let worker = Worker {
@@ -374,7 +366,7 @@ pub async fn serve_with(
             ended.stop.notify_one();
         })
         .map_err(|_| DaemonError::Worker)?;
-    let audit_task = tokio::spawn(link.run(Arc::clone(&gate), audit));
+    let audit_task = tokio::spawn(attached.run());
 
     // 3. The listener.
     let listener = match bind(&params.admin_socket) {

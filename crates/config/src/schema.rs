@@ -4,12 +4,13 @@
 //! carry the same meaning in every file that has them, so one socket or one
 //! account is spelled the same way in the server's file and in each client's.
 
+use core::net::SocketAddr;
 use core::time::Duration;
 
 use crate::error::{Error, ErrorKind};
 use crate::format::{Document, Located};
 use crate::limits::Bound;
-use crate::value::{self, AbsolutePath};
+use crate::value::{self, is_internal, AbsolutePath, Network};
 
 /// Key: the uid the daemon drops to. Spec: docs/50 §6.1–§6.2 (R50-14), §7.1.
 pub(crate) const RUN_AS_UID: &str = "run_as_uid";
@@ -220,6 +221,38 @@ pub(crate) fn duration(
         .optional(key, |text| value::duration_secs(text, bound))?
         .map_or(bound.default, |located| located.value);
     Ok(value::seconds(secs))
+}
+
+/// Every listener address lies in a network of the zone table; reported at
+/// the first list (by line) that holds one outside it. One rule for every
+/// daemon that owns a network listener and the zone table: ldap-front (R14)
+/// and the kdc (R50-9, task R15b), with one match (`value::is_internal`).
+/// Spec: docs/52 §7 R14; A-102 on docs/questions/Q-469 (b); docs/50 R50-9
+/// ("binding to internal interfaces only"), §4.1 (CIDR → Internal; UDP:
+/// "binding to internal interfaces only"), §4.2; docs/questions/Q-223
+/// (A-57 (a)), Q-580 (A-114), Q-632.
+pub(crate) fn check_internal<const N: usize>(
+    lists: [(Option<&Located<Vec<SocketAddr>>>, &'static str); N],
+    internal: &[Network],
+) -> Result<(), Error> {
+    let mut outside: Option<(u32, &'static str)> = None;
+    for (list, key) in lists {
+        let Some(list) = list else {
+            continue;
+        };
+        if list
+            .value
+            .iter()
+            .any(|address| !is_internal(internal, address.ip()))
+            && outside.is_none_or(|(line, _)| list.line < line)
+        {
+            outside = Some((list.line, key));
+        }
+    }
+    match outside {
+        Some((line, key)) => Err(Error::at(line, key, ErrorKind::ListenerNotInternal)),
+        None => Ok(()),
+    }
 }
 
 /// An optional integer limit, or its default, with its line (0 when absent).

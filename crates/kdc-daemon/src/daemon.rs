@@ -210,6 +210,10 @@ pub enum DaemonError {
     Engine,
     /// A listener could not be handed to the runtime.
     Listener,
+    /// A listener's local address lies outside every internal network
+    /// (docs/50 R50-9: "binding to internal interfaces only"; task R15b):
+    /// nothing was served; auditd, keyd and dird were not contacted.
+    ListenerNotInternal,
 }
 
 impl fmt::Display for DaemonError {
@@ -219,6 +223,9 @@ impl fmt::Display for DaemonError {
             DaemonError::Start(error) => write!(f, "{error}"),
             DaemonError::Engine => f.write_str("engine thread could not be started"),
             DaemonError::Listener => f.write_str("listener could not be served"),
+            DaemonError::ListenerNotInternal => {
+                f.write_str("a listener is outside every configured internal network")
+            }
         }
     }
 }
@@ -335,6 +342,31 @@ impl Stopped {
     }
 }
 
+/// Every UDP socket's and TCP listener's local address lies in an internal
+/// network of the zone table (an unreadable address counts as outside) —
+/// the configuration's rule (crates/config: every `listen` address inside
+/// `internal_networks`) checked again at the one place every listener
+/// passes, also one `main` did not bind from the file (tests bind their
+/// own), as ldap-front's `serve` does (docs/52 R14).
+///
+/// # Errors
+/// [`DaemonError::ListenerNotInternal`]: nothing is served; auditd, keyd and
+/// dird are not contacted.
+///
+/// Spec: docs/50 R50-9 ("binding to internal interfaces only"), §4.1;
+/// docs/questions/Q-223 (A-57 (a)), Q-580 (A-114), Q-632.
+fn check_listeners(listeners: &Listeners, zones: &ZoneTable) -> Result<(), DaemonError> {
+    let udp = listeners.udp.iter().map(std::net::UdpSocket::local_addr);
+    let tcp = listeners.tcp.iter().map(std::net::TcpListener::local_addr);
+    for local in udp.chain(tcp) {
+        match local {
+            Ok(address) if zones.is_internal(address.ip()) => {}
+            _ => return Err(DaemonError::ListenerNotInternal),
+        }
+    }
+    Ok(())
+}
+
 /// Wait until `done()` or `grace` passed.
 async fn wait_until(grace: Duration, done: impl Fn() -> bool) {
     let start = Instant::now();
@@ -433,6 +465,18 @@ where
     )
     .map_err(|_| DaemonError::Engine)?;
 
+    // 1b. Every listener on an internal interface (R50-9; task R15b) — the
+    //     chokepoint for any listener, however bound — before auditd, keyd
+    //     or dird is contacted. On failure `go` is dropped: the engine
+    //     thread ends without contacting keyd or dird (and the connectors
+    //     it owns are dropped there, not in this task).
+    if let Err(error) = check_listeners(&listeners, &params.zones) {
+        drop(go);
+        let _ = started.await;
+        let _ = engine_thread.join();
+        return Err(error);
+    }
+
     // 2. auditd first (R50-16): its uid and the source it records the kdc
     //    under (task R9b). On failure `go` is dropped: the engine thread
     //    ends without contacting keyd or dird.
@@ -450,7 +494,9 @@ where
         }
     };
     note(Note::AuditVerified, None);
-    gate.set_reachable(true);
+    // The gate opens on the verified connection — by the audit client, the
+    // one owner of "auditd is reachable" (task R15b, docs/questions/Q-630).
+    let attached = link.attach(Arc::clone(&gate), first);
 
     // 3. keyd, dird, the policy version, the KDC — on the engine thread.
     let _ = go.send(());
@@ -468,7 +514,7 @@ where
     note(Note::DependenciesVerified, Some(policy_version.0));
 
     // 4. The audit client (the one of ipc-audit, task R9b).
-    let audit_task = tokio::spawn(link.run(Arc::clone(&gate), first));
+    let audit_task = tokio::spawn(attached.run());
 
     // 5. The listeners, served only now.
     let shared = Arc::new(Shared {

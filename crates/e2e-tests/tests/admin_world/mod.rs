@@ -79,6 +79,11 @@ pub mod custody;
 #[path = "../../../provision/tests/common/mod.rs"]
 pub mod provision_common;
 
+// A fake auditd and the real audit client linked to a gate: the only way a
+// test obtains the proof `apply` takes (task R15b, docs/questions/Q-630).
+#[path = "../../../ipc-audit/tests/linked/mod.rs"]
+mod linked;
+
 use crate::common::{self, Armor, AsReqSpec, FastError, ServiceTicket, TgsReqSpec, Tgt};
 use crate::support::kdcd::{self, connector, Kdcd};
 use crate::support::keyd_support::{self, TestClock};
@@ -1868,22 +1873,12 @@ fn domain_input(dir: &ScratchDir, uid: u32) -> DomainInput {
 }
 
 /// Play auditd for one prepared write (docs/51 §5.7 item 2, A-85; docs/52
-/// §3.11 R6): commit its decision event into an `ipc_audit::AuditGate`,
-/// acknowledge it as auditd does once it synced it (docs/50 §8.1), and take
-/// the proof `apply` requires — the only way to obtain one.
+/// §3.11 R6): commit its decision event into an `ipc_audit::AuditGate` the
+/// real audit client is attached to, let a fake auditd acknowledge it as
+/// auditd does once it synced it (docs/50 §8.1), and take the proof `apply`
+/// requires — the only way to obtain one (task R15b).
 fn acknowledged(
     prepared: directory_admin::Prepared,
 ) -> ipc_audit::AckedIntent<directory_admin::Prepared> {
-    let gate = ipc_audit::AuditGate::new(ipc_audit::WindowConfig::DEFAULT);
-    gate.set_reachable(true);
-    let slot = gate.reserve().expect("a slot");
-    let pending = gate.begin_intent(slot, prepared).expect("committed");
-    let batch = gate.next_batch().expect("the decision event is sent");
-    gate.acknowledge(&ipc_audit::Ack {
-        through_seq: batch.last_seq(),
-        head_hash: [0; 32],
-    })
-    .expect("auditd acknowledges");
-    gate.wait_acknowledged(pending, std::time::Instant::now())
-        .expect("acknowledged")
+    linked::acknowledged(prepared)
 }

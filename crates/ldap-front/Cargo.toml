@@ -132,7 +132,10 @@ audit-log = { path = "../audit-log" }
 ldap = { path = "../ldap" }
 ipc-ldap-server = { path = "../ipc-ldap-server" }
 directory-pip = { path = "../directory-pip" }
-dirstore = { path = "../dirstore" }
+# `test-seams` (A-113, R15): the tests open their store by path
+# (`Store::open`); without it `cargo test -p ldap-front` alone did not build
+# (task R15b, docs/questions/Q-634).
+dirstore = { path = "../dirstore", features = ["test-seams"] }
 ad-schema = { path = "../ad-schema" }
 pdp = { path = "../pdp" }
 dtyp = { path = "../dtyp" }

@@ -93,10 +93,10 @@ impl AuditGate {
         self.wake.notify_one();
     }
 
-    /// Record the audit client's view of auditd.
-    pub fn set_reachable(&self, reachable: bool) {
-        self.core.set_reachable(reachable);
-    }
+    // No `set_reachable` here (task R15b, docs/questions/Q-630): the shared
+    // gate's reachability is the audit client's alone (crate-private to
+    // ipc-audit); admind's start attaches the verified connection to this
+    // gate (`ipc_audit::client::AuditLink::attach`).
 
     /// Whether auditd is reachable (the audit client's view).
     #[must_use]

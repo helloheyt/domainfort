@@ -62,14 +62,16 @@ fn write(path: &Path, octets: &[u8], mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
-/// A kdc configuration (docs/50 §7.1) with `listen` as given; account 61003.
+/// A kdc configuration (docs/50 §7.1) with `listen` as given (inside the
+/// zone table, which also holds the loopback network the bind test uses —
+/// docs/50 R50-9, task R15b); account 61003.
 fn kdc_config(listen: &str) -> String {
     format!(
         "\
 run_as_uid = 61003
 run_as_gid = 61003
 listen = {listen}
-internal_networks = 10.0.0.0/8, fd00::/16
+internal_networks = 10.0.0.0/8, fd00::/16, 127.0.0.0/8
 keyd_socket = /run/keyd/keyd.sock
 keyd_uid = 61001
 dird_kdc_socket = /run/dird/kdc/dird-kdc.sock
@@ -111,7 +113,7 @@ fn parameters_from_the_configuration() {
     assert_eq!(p.as_queue_capacity, AS_QUEUE_CAPACITY);
     assert_eq!(p.tgs_queue_capacity, TGS_QUEUE_CAPACITY);
     assert_eq!(p.udp_max_reply_len, kdc::DEFAULT_UDP_MAX_REPLY_LEN);
-    assert_eq!(p.zones.len(), 2);
+    assert_eq!(p.zones.len(), 3);
     assert_eq!(
         p.zones.scope("10.9.8.7".parse().unwrap()),
         IpScope::Internal

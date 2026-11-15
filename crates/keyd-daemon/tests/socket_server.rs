@@ -15,12 +15,15 @@ use ipc_keyd::{Answer, Call};
 use keyd::{AuthnError, Error, KeyHandle, KeyPurpose, PrincipalId, Role};
 use keyd_daemon::startup::development_keyd;
 use keyd_daemon::test_seams::DaemonParams;
-use keyd_daemon::{CallerMap, SystemClock};
+use keyd_daemon::{CallerMap, DaemonError, SystemClock};
 use krb_proto::{PaData, Realm};
+use protected_file::{ExistingGroup, SocketDirectoryOwner};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::time::{Duration, Instant};
 use support::{
     eventually, my_uid, params, skip_as_root, Daemon, FakeAuditd, RawClient, Received, TempDir,
 };
+use test_scratch::ScratchDir;
 
 fn realm() -> Realm {
     Realm::new("EXAMPLE.ORG").unwrap()
@@ -368,53 +371,93 @@ fn a_cross_wired_auditd_after_a_restart_gets_nothing_and_gating_is_refused() {
     world.daemon.stop().unwrap();
 }
 
-/// docs/50 §3.1 (the daemon manages the socket file explicitly): a stale
-/// socket file is replaced, but a file that is not a socket is never
-/// removed — the daemon does not start.
+/// docs/50 §3.1 (the daemon manages the socket file explicitly); task R15b
+/// (docs/questions/Q-631; A-113, Q-552 item 1): the daemon's own start —
+/// after the privilege drop — removes **nothing** at its socket path. A
+/// file that is not a socket, and a socket left behind alike, make the
+/// start fail with `Bind` and stay exactly as they were; the one stale-socket
+/// removal is the root-side preparation's (next test).
 #[test]
-fn a_non_socket_file_at_the_socket_path_is_refused() {
+fn an_occupied_socket_path_is_refused_and_left_alone() {
     let dir = TempDir::new();
     let uid = my_uid(&dir);
     if skip_as_root(uid) {
         return;
     }
-    let params = params(&dir, CallerMap::new(&[(uid, Role::Kdc)]).unwrap(), uid);
-    std::fs::write(&params.keyd_socket, b"not a socket").unwrap();
-    let _auditd = FakeAuditd::start(&params.audit.socket);
-    let socket = params.keyd_socket.clone();
-    assert!(start(params).is_err());
+    let callers = || CallerMap::new(&[(uid, Role::Kdc)]).unwrap();
+    let params_now = params(&dir, callers(), uid);
+    let socket = params_now.keyd_socket.clone();
+    std::fs::write(&socket, b"not a socket").unwrap();
+    let _auditd = FakeAuditd::start(&params_now.audit.socket);
+    assert_eq!(start(params_now).err(), Some(DaemonError::Bind.to_string()));
     assert_eq!(std::fs::read(&socket).unwrap(), b"not a socket");
+
+    std::fs::remove_file(&socket).unwrap();
+    drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+    assert_eq!(
+        start(params(&dir, callers(), uid)).err(),
+        Some(DaemonError::Bind.to_string())
+    );
+    assert!(
+        std::fs::symlink_metadata(&socket)
+            .unwrap()
+            .file_type()
+            .is_socket(),
+        "the start removed nothing"
+    );
 }
 
-/// Task P7 ("drain the queue and close"): a stop removes the socket file,
-/// joins the engine thread, and a stale socket left behind is replaced at
-/// the next start (docs/50 §3.1).
+/// Task P7 ("drain the queue and close"): a stop removes the socket file and
+/// joins the engine thread. Task R15b (docs/questions/Q-631): a socket left
+/// behind by an aborted run is removed at the next start by the root-side
+/// preparation alone — `protected_file::prepare_socket_directory`, which
+/// keyd's `main` runs before the drop (R11c) — the one mechanism; the
+/// daemon's own start refuses it until then. The socket directory lives in
+/// a scratch directory inside the workspace (crates/test-scratch, Q-480):
+/// the preparation walks its parent from `/`.
 #[test]
-fn stop_removes_the_socket_and_a_restart_replaces_a_stale_one() {
-    let Some(world) = world(Some(Role::Kdc), |_| {}) else {
+fn stop_removes_the_socket_and_only_the_preparation_removes_a_stale_one() {
+    let dir = TempDir::new();
+    let uid = my_uid(&dir);
+    if skip_as_root(uid) {
         return;
+    }
+    let scratch = ScratchDir::new("kss").unwrap();
+    let owner = SocketDirectoryOwner {
+        uid,
+        gid: std::fs::metadata(scratch.path()).unwrap().gid(),
+        existing_group: ExistingGroup::ChosenByOperator,
     };
-    let socket = world.daemon.socket.clone();
+    let socket = scratch.join("run").join("k.sock");
+    let prepare = || protected_file::prepare_socket_directory(&socket, owner);
+    let with_socket = || {
+        let mut daemon = params(&dir, CallerMap::new(&[(uid, Role::Kdc)]).unwrap(), uid);
+        daemon.keyd_socket = socket.clone();
+        daemon
+    };
+    let _auditd = FakeAuditd::start(&dir.join("a.sock"));
+    assert_eq!(prepare(), Ok(()));
+    let daemon = start(with_socket()).unwrap();
     let mut client = RawClient::connect(&socket);
     assert!(matches!(
         client.call(&Call::Ping),
         Some(Ok(Answer::Ping(Ok(_))))
     ));
-    world.daemon.stop().unwrap();
+    daemon.stop().unwrap();
     assert!(!socket.exists());
     assert_eq!(client.receive(), Received::Closed);
 
-    // A stale socket file (bound, then abandoned) is replaced.
-    let stale = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-    drop(stale);
-    assert!(socket.exists());
-    let uid = my_uid(&world.dir);
-    let params = params(
-        &world.dir,
-        CallerMap::new(&[(uid, Role::Kdc)]).unwrap(),
-        uid,
+    // An aborted run's socket (bound, then abandoned): the start alone
+    // refuses it; the preparation removes it; then the daemon starts.
+    drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+    assert_eq!(
+        start(with_socket()).err(),
+        Some(DaemonError::Bind.to_string())
     );
-    let daemon = start(params).unwrap();
+    assert!(socket.exists(), "the start removed nothing");
+    assert_eq!(prepare(), Ok(()));
+    assert!(!socket.exists(), "the preparation removed it");
+    let daemon = start(with_socket()).unwrap();
     let mut client = RawClient::connect(&daemon.socket);
     assert!(matches!(
         client.call(&Call::Ping),

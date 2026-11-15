@@ -389,22 +389,48 @@ fn connections_over_the_quota_are_closed() {
 }
 
 /// Source: docs/50 §3.1 ("deleting a stale socket file before bind … the
-/// daemon manages this explicitly"); Q-265 item 9.
+/// daemon manages this explicitly"); Q-265 item 9; task R15b
+/// (docs/questions/Q-631; A-113, Q-552 item 1): the post-drop `bind`
+/// removes nothing — a stale socket left by an earlier run, and a file that
+/// is not a socket alike, fail the bind and stay as they were; the one
+/// stale-socket removal is the root-side preparation's
+/// (`protected_file::prepare_socket_directory`, auditd's step 3b), after
+/// which the bind succeeds with the socket file's mode. The scratch
+/// directory (crates/test-scratch) is walkable from `/`, with the test
+/// account as auditd's.
 #[test]
-fn bind_replaces_a_stale_socket_but_never_another_file() {
-    use std::os::unix::fs::PermissionsExt;
+fn only_the_preparation_removes_a_stale_socket_and_bind_removes_nothing() {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
     let dir = TempDir::new();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .build()
         .unwrap();
     let _context = runtime.enter();
+    let owner = protected_file::SocketDirectoryOwner {
+        uid: log_uid(),
+        gid: std::fs::metadata(dir.path()).unwrap().gid(),
+        existing_group: protected_file::ExistingGroup::ChosenByOperator,
+    };
 
-    // A stale socket file left by an earlier run.
+    // A stale socket file left by an earlier run: bind refuses it, leaves it.
     let stale = std::os::unix::net::UnixListener::bind(dir.socket()).unwrap();
     drop(stale);
-    assert!(dir.socket().exists());
-    let bound = listener::bind(&dir.socket()).expect("stale socket replaced");
+    assert!(matches!(
+        listener::bind(&dir.socket()).err(),
+        Some(BindError::Io(_))
+    ));
+    assert!(std::fs::symlink_metadata(dir.socket())
+        .unwrap()
+        .file_type()
+        .is_socket());
+    // The preparation removes it; then the bind succeeds.
+    assert_eq!(
+        protected_file::prepare_socket_directory(&dir.socket(), owner),
+        Ok(())
+    );
+    assert!(!dir.socket().exists());
+    let bound = listener::bind(&dir.socket()).expect("bound after the preparation");
     let mode = std::fs::metadata(dir.socket())
         .unwrap()
         .permissions()
@@ -412,10 +438,17 @@ fn bind_replaces_a_stale_socket_but_never_another_file() {
     assert_eq!(mode & 0o777, listener::SOCKET_FILE_MODE);
     drop(bound);
 
-    // A regular file is left alone.
+    // A regular file is left alone by both.
     let other = dir.path().join("not-a-socket");
     std::fs::write(&other, b"keep").unwrap();
-    assert_eq!(listener::bind(&other).err(), Some(BindError::NotASocket));
+    assert_eq!(
+        protected_file::prepare_socket_directory(&other, owner),
+        Ok(())
+    );
+    assert!(matches!(
+        listener::bind(&other).err(),
+        Some(BindError::Io(_))
+    ));
     assert_eq!(std::fs::read(&other).unwrap(), b"keep");
 }
 

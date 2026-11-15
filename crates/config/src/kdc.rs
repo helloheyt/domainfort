@@ -15,6 +15,14 @@
 //! `policy_store_format = unsigned-development`, the only accepted value
 //! (A-68; docs/questions/Q-270 item 2, Q-275 item 2).
 //!
+//! **Internal listeners only** (task R15b, docs/questions/Q-632): docs/50
+//! R50-9 binds the kdc's listeners "to internal interfaces only" (and §4.1
+//! for UDP, Q-223 → A-57 (a)), so the zone table (`internal_networks`) is
+//! required and every `listen` address must lie in one of its networks
+//! (`ListenerNotInternal`) — the rule and the one match (`value::is_internal`)
+//! ldap-front's file has (docs/52 R14, A-114). Sources outside the table are
+//! still served, as `External` (docs/50 §4.1 — Q-632 item 3).
+//!
 //! Spec: docs/50 R50-9, R50-15, §2.4, §3.6, §4.1, §7.1, §7.2, §7.5.
 
 use core::net::SocketAddr;
@@ -194,11 +202,12 @@ impl KdcSettings {
     ];
 
     /// Parses and validates kdc's file. Required: `run_as_uid`,
-    /// `run_as_gid`, `listen`, `keyd_socket` + `keyd_uid`, `dird_kdc_socket` +
-    /// `dird_uid`, `policy_store_path`, `policy_store_format` (only
+    /// `run_as_gid`, `listen`, `internal_networks` (every `listen` address
+    /// inside one of them — `ListenerNotInternal`; task R15b),
+    /// `keyd_socket` + `keyd_uid`, `dird_kdc_socket` + `dird_uid`,
+    /// `policy_store_path`, `policy_store_format` (only
     /// `unsigned-development`, A-68), `audit_socket`, `auditd_uid`.
-    /// Optional: `internal_networks` (absent ⇒ every source is `External`) and
-    /// the limits (docs/50 value as default and ceiling).
+    /// Optional: the limits (docs/50 value as default and ceiling).
     ///
     /// # Errors
     /// Any rule of the format or of this schema (see [`crate::ErrorKind`]).
@@ -208,12 +217,16 @@ impl KdcSettings {
         let doc = Document::parse(input, Self::KEYS)?;
         let mut all = Distinct::default();
         let run_as = schema::account(&doc, &mut all)?;
-        let listen = doc
-            .required(LISTEN, |text| value::list(text, value::listener_address))?
-            .value;
+        let listen = doc.required(LISTEN, |text| value::list(text, value::listener_address))?;
+        // Required (task R15b): the kdc binds to internal interfaces only
+        // (docs/50 R50-9, §4.1; Q-223 → A-57 (a)), so every `listen` address
+        // lies in a network of the zone table — the rule and the match
+        // ldap-front's file has (docs/52 R14, Q-580, A-114; Q-632).
         let internal_networks = doc
-            .optional(INTERNAL_NETWORKS, |text| value::list(text, value::network))?
-            .map_or_else(Vec::new, |located| located.value);
+            .required(INTERNAL_NETWORKS, |text| value::list(text, value::network))?
+            .value;
+        schema::check_internal([(Some(&listen), LISTEN)], &internal_networks)?;
+        let listen = listen.value;
         let keyd = schema::endpoint(&doc, &mut all, KEYD_SOCKET, KEYD_UID)?;
         let dird = schema::endpoint(&doc, &mut all, DIRD_KDC_SOCKET, DIRD_UID)?;
         let policy_store_path = schema::path(&doc, &mut all, POLICY_STORE_PATH)?;
@@ -276,7 +289,8 @@ impl KdcSettings {
     }
 
     /// The zone table for `Peer.src_net`: sources inside these networks are
-    /// `Internal`, all others `External`. Spec: docs/50 §4.1.
+    /// `Internal`, all others `External`; at least one network, and every
+    /// `listen` address inside one. Spec: docs/50 R50-9, §4.1.
     #[must_use]
     pub fn internal_networks(&self) -> &[Network] {
         &self.internal_networks

@@ -30,9 +30,10 @@
 //! 6. Print the start notice and the signing mode (UNSIGNED, P-20).
 //! 7. Build the tokio runtime with an explicit worker count (docs/50 §6.2:
 //!    overrides `TOKIO_WORKER_THREADS`).
-//! 8. Bind `audit_socket` (a stale socket left since step 3b removed; mode
-//!    0660, set by path inside the directory step 3b checked) — only now,
-//!    after the log verified (docs/50 R50-16, §7.5).
+//! 8. Bind `audit_socket` (nothing removed here: step 3b's removal is the one
+//!    stale-socket removal, and an occupied path fails the bind — task
+//!    R15b; mode 0660, set by path inside the directory step 3b checked) —
+//!    only now, after the log verified (docs/50 R50-16, §7.5).
 //! 9. Spawn the listener; the main thread becomes the writer
 //!    (crate::writer). If the writer fails, the daemon exits
 //!    [`EXIT_WRITER`] and the service manager restarts it (docs/50 §7.5).

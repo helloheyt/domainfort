@@ -24,9 +24,9 @@
 //!   committing **that same value's** intent record
 //!   ([`IntentRecord::intent_event`]) into this gate's window, and only once
 //!   an acknowledgement from auditd covering that record's sequence number
-//!   reached this gate ([`AuditGate::acknowledge`] — called by the daemon's
-//!   audit client with auditd's verified `Ack`, docs/50 §8.1: an `Ack`
-//!   comes only after the sync). It is neither `Clone` nor constructible
+//!   reached this gate ([`AuditGate::acknowledge`] — called only by the one
+//!   audit client, `crate::client`, with auditd's `Ack` on the verified
+//!   connection, docs/50 §8.1: an `Ack` comes only after the sync). It is neither `Clone` nor constructible
 //!   elsewhere, so a mutation entry point that takes `AckedIntent<T>` **by
 //!   value** cannot be reached without the acknowledgement, and one proof
 //!   serves one mutation. No acknowledgement in time ⇒ the value comes back
@@ -55,10 +55,34 @@
 //! not acknowledge: the only way an acknowledgement reaches the window is
 //! [`AuditGate::acknowledge`].
 //!
+//! # Only the audit client supplies the evidence (task R15b)
+//!
+//! The proof is only as strong as its evidence: "auditd is reachable" and
+//! "auditd acknowledged through sequence number N". Both are facts of the
+//! verified connection to auditd, whose one owner is the audit client
+//! (`crate::client`, task R9b: peer uid and reported source verified on
+//! every connection). So the link side of the gate — marking auditd
+//! reachable ([`AuditGate::set_reachable`]), taking the batch to send
+//! ([`AuditGate::next_batch`]), feeding auditd's `Ack`
+//! ([`AuditGate::acknowledge`]) and putting a lost batch back
+//! ([`AuditGate::connection_lost`]) — is **crate-private**: no code outside
+//! this crate (a daemon, its gate wrapper, a library) can mark auditd
+//! reachable or acknowledge anything, so no code outside the client can
+//! mint an [`AckedIntent`]. A daemon's gate counts auditd as reachable from
+//! the moment the client attaches a verified connection to it
+//! (`client::AuditLink::attach`) until that link ends. Class: "a proof
+//! type whose evidence can be supplied by someone other than its owner"
+//! (docs/questions/Q-630). In-process tests of a daemon's gate (tier 1,
+//! docs/50 §9: "in-process … without sockets") reach the link side only
+//! through `test_seams`, which exists only with the dev-only feature
+//! `test-seams` (docs/52 R15 rules; guard crates/e2e-tests
+//! `tests/no_test_seams_in_product.rs`).
+//!
 //! Spec: docs/52 §3.11 (R6 (a), (b)), §7 R6, §2 rows 20, 23, 38 (N5);
 //! docs/50 R50-17, §3.6 (bounded waits), §8.1; docs/51 §5.7 item 2 (A-85);
 //! docs/questions/Q-218 (A-57), Q-252 items 8, 9 (A-64), Q-260 item 2
-//! (A-67), Q-313 (A-82), Q-350 item 11 (A-87), Q-365 (A-88).
+//! (A-67), Q-313 (A-82), Q-350 item 11 (A-87), Q-365 (A-88), Q-560 /
+//! A-115 (the follow-up), Q-570 §5 item a (A-118), Q-630.
 
 use crate::channel::{Ack, Append};
 use crate::event::EventBody;
@@ -260,8 +284,46 @@ struct GateState {
 /// The sender's audit gate (module documentation). Shared (`Arc`) by the
 /// threads that run operations and the audit client task.
 ///
+/// # Only the audit client opens the gate or acknowledges (task R15b)
+///
+/// Outside ipc-audit the link side does not exist: code in a daemon, its
+/// gate wrapper or a library cannot mark auditd reachable, take or put back
+/// a batch, or feed an `Ack` — so it cannot mint an [`AckedIntent`]
+/// (docs/questions/Q-630). Each of these is a privacy error (E0624):
+///
+/// ```compile_fail,E0624
+/// let gate = ipc_audit::AuditGate::new(ipc_audit::WindowConfig::DEFAULT);
+/// gate.set_reachable(true);
+/// ```
+///
+/// ```compile_fail,E0624
+/// let gate = ipc_audit::AuditGate::new(ipc_audit::WindowConfig::DEFAULT);
+/// let ack = ipc_audit::Ack { through_seq: 1, head_hash: [0; 32] };
+/// let _ = gate.acknowledge(&ack);
+/// ```
+///
+/// ```compile_fail,E0624
+/// let gate = ipc_audit::AuditGate::new(ipc_audit::WindowConfig::DEFAULT);
+/// let _ = gate.next_batch();
+/// ```
+///
+/// ```compile_fail,E0624
+/// let gate = ipc_audit::AuditGate::new(ipc_audit::WindowConfig::DEFAULT);
+/// gate.connection_lost();
+/// ```
+///
+/// The same code with the public API only compiles — a new gate is closed
+/// until the client attaches a verified connection (positive control):
+///
+/// ```
+/// let gate = ipc_audit::AuditGate::new(ipc_audit::WindowConfig::DEFAULT);
+/// let _ack = ipc_audit::Ack { through_seq: 1, head_hash: [0; 32] };
+/// assert!(!gate.is_reachable());
+/// assert!(gate.reserve().is_none());
+/// ```
+///
 /// Spec: docs/50 R50-17, §8.1; docs/questions/Q-218 (A-57); docs/52 §3.11
-/// R6.
+/// R6; docs/questions/Q-630.
 #[derive(Debug)]
 pub struct AuditGate {
     id: u64,
@@ -290,8 +352,13 @@ impl AuditGate {
         self.state.lock().ok()
     }
 
-    /// Record the audit client's view of auditd.
-    pub fn set_reachable(&self, reachable: bool) {
+    /// Record the audit client's view of auditd — the client's only
+    /// (crate-private, module documentation "Only the audit client supplies
+    /// the evidence"): reachable exactly while it holds a verified
+    /// connection. Spec: docs/50 §8.1; A-57, A-67 item 2; docs/questions/
+    /// Q-560 (A-115), Q-630.
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
+    pub(crate) fn set_reachable(&self, reachable: bool) {
         if let Some(mut state) = self.lock() {
             state.reachable = reachable;
         }
@@ -430,7 +497,8 @@ impl AuditGate {
     /// gate (acknowledgements are cumulative and in order: one batch in
     /// flight, oldest first) — or `deadline` passed. Blocks the calling
     /// thread (an engine or admin thread, never a runtime's) on a condition
-    /// variable [`AuditGate::acknowledge`] signals; never past `deadline`.
+    /// variable the audit client's acknowledgement signals; never past
+    /// `deadline`.
     ///
     /// # Errors
     /// The value back, **without a proof**: not acknowledged by `deadline`, a
@@ -473,23 +541,28 @@ impl AuditGate {
     }
 
     /// The next batch to send, if nothing is in flight and anything is
-    /// pending. Spec: docs/50 §3.6, §8.1.
+    /// pending — the audit client's (crate-private: a batch taken by anyone
+    /// else would never reach auditd). Spec: docs/50 §3.6, §8.1;
+    /// docs/questions/Q-630.
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
     #[must_use]
-    pub fn next_batch(&self) -> Option<Append> {
+    pub(crate) fn next_batch(&self) -> Option<Append> {
         self.lock().and_then(|mut state| state.window.next_batch())
     }
 
-    /// auditd's acknowledgement of the batch in flight — for the daemon's
-    /// audit client only, with the `Ack` auditd sent on the verified
-    /// connection. Wakes every thread waiting for an intent
-    /// ([`AuditGate::wait_acknowledged`]).
+    /// auditd's acknowledgement of the batch in flight — the audit client's
+    /// only (crate-private), with the `Ack` auditd sent on the verified
+    /// connection: the evidence [`AuditGate::wait_acknowledged`] turns into
+    /// an [`AckedIntent`]. Wakes every thread waiting for an intent.
     ///
     /// # Errors
     /// The window's [`WindowError`] (an acknowledgement that does not match;
     /// the connection is then closed); `UnexpectedAck` for a poisoned lock.
     ///
-    /// Spec: docs/50 §8.1.
-    pub fn acknowledge(&self, ack: &Ack) -> Result<usize, WindowError> {
+    /// Spec: docs/50 §8.1; docs/52 §3.11 R6 (a); docs/questions/Q-560
+    /// (A-115), Q-630.
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
+    pub(crate) fn acknowledge(&self, ack: &Ack) -> Result<usize, WindowError> {
         let result = match self.lock() {
             Some(mut state) => state.window.acknowledge(ack),
             None => Err(WindowError::UnexpectedAck),
@@ -499,8 +572,10 @@ impl AuditGate {
     }
 
     /// The audit connection dropped: the batch in flight goes back to the
-    /// front. Spec: docs/50 §3.7, §8.1.
-    pub fn connection_lost(&self) {
+    /// front — the audit client's (crate-private). Spec: docs/50 §3.7, §8.1;
+    /// docs/questions/Q-630.
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
+    pub(crate) fn connection_lost(&self) {
         if let Some(mut state) = self.lock() {
             state.window.connection_lost();
         }

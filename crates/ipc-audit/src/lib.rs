@@ -93,7 +93,11 @@
 //! point that takes it by value cannot run before the acknowledgement
 //! (dird's `apply`, keyd's key-state changes, dird's decision
 //! registrations). [`AuditGate::close`] is the one bounded flush at stop
-//! ([`AUDIT_FLUSH_GRACE`], [`FlushWait`], [`Unflushed`]).
+//! ([`AUDIT_FLUSH_GRACE`], [`FlushWait`], [`Unflushed`]). The gate's link
+//! side — auditd reachable, the batch to send, auditd's `Ack`, a lost batch
+//! — is crate-private: only the one audit client (`client`, which verified
+//! the connection) drives it, so no code outside this crate can open a gate
+//! or acknowledge, i.e. mint a proof (task R15b, docs/questions/Q-630).
 //!
 //! # Security
 //!
@@ -147,6 +151,9 @@ mod convert;
 mod error;
 mod event;
 mod gate;
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod test_seams;
 mod values;
 mod window;
 

@@ -71,6 +71,14 @@ zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
 # TESTS ONLY: this crate with the loopback `dispatch` (the pattern ipc-audit
 # uses for its conversions); dev-dependencies are not linked into a daemon.
 ipc-keyd-server = { path = ".", features = ["loopback"] }
+# TESTS ONLY (task R15b, docs/questions/Q-630): the proof
+# `execute_acknowledged` takes comes only through the real audit client
+# (ipc-audit feature `client`) from an auditd's `Ack` — the tests run a fake
+# auditd on a Unix socket (crates/ipc-audit tests/linked, reused by
+# `#[path]`) and a tokio runtime for the client. tokio is P-12's, already in
+# the lock — no new package; dev-dependencies are not linked into a daemon.
+ipc-audit = { path = "../ipc-audit", default-features = false, features = ["keyd", "client"] }
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "sync"] }
 
 [lints]
 workspace = true

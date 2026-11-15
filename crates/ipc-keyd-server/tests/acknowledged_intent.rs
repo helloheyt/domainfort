@@ -8,15 +8,20 @@
 //! key-state operations and the loosenings take the intent path; an
 //! authorization refusal keeps one record and no intent); docs/52 §4.2
 //! (A-102: `set_secret` only on a live decision dird registered); docs/50
-//! §8.1 (an `Ack` after auditd's sync). Every value is constructed by hand
-//! for these tests; no vector comes from any other implementation.
+//! §8.1 (an `Ack` after auditd's sync). The proof comes only through the
+//! real audit client from a (fake) auditd's `Ack` — the gate's link side is
+//! crate-private to ipc-audit (task R15b, docs/questions/Q-630). Every value
+//! is constructed by hand for these tests; no vector comes from any other
+//! implementation.
 
 #[path = "../../ipc-keyd/tests/samples/mod.rs"]
 mod samples;
 
-use ipc_audit::{
-    Ack, AckedIntent, AuditGate, EventBody, IntentRecord, KeydOutcome, KeydRecord, WindowConfig,
-};
+// A fake auditd and the real audit client linked to a gate (task R15b).
+#[path = "../../ipc-audit/tests/linked/mod.rs"]
+mod linked;
+
+use ipc_audit::{AckedIntent, EventBody, IntentRecord, KeydOutcome, KeydRecord};
 use ipc_keyd::{Answer, Call};
 use ipc_keyd_server::{classify, execute, execute_acknowledged, Classified, KeyStateCall, NotRun};
 use keyd::{
@@ -24,7 +29,6 @@ use keyd::{
     KeyPurpose, Keyd, KeydConfig, Kvno, OsEntropy, Role,
 };
 use krb_proto::KerberosTime;
-use std::time::{Duration, Instant};
 
 #[derive(Default)]
 struct Records(Vec<AuditRecord>);
@@ -70,19 +74,11 @@ fn dev_keyd() -> DevKeyd {
     .unwrap()
 }
 
-/// Play auditd: commit `change`'s intent into a gate, acknowledge it as
-/// auditd does after its sync, and take the proof.
+/// Play auditd: commit `change`'s intent into a gate the real audit client
+/// is attached to, let a fake auditd acknowledge it as auditd does after
+/// its sync, and take the proof.
 fn acknowledged(change: KeyStateCall) -> AckedIntent<KeyStateCall> {
-    let gate = AuditGate::new(WindowConfig::DEFAULT);
-    gate.set_reachable(true);
-    let pending = gate.begin_intent(gate.reserve().unwrap(), change).unwrap();
-    let batch = gate.next_batch().unwrap();
-    gate.acknowledge(&Ack {
-        through_seq: batch.last_seq(),
-        head_hash: [0; 32],
-    })
-    .unwrap();
-    gate.wait_acknowledged(pending, Instant::now()).unwrap()
+    linked::acknowledged(change)
 }
 
 fn set_alice() -> Call {
@@ -137,12 +133,7 @@ fn an_admitted_change_runs_only_with_its_proof() {
     );
 
     // Sent, never acknowledged: no proof, the change back, keyd untouched.
-    let gate = AuditGate::new(WindowConfig::DEFAULT);
-    gate.set_reachable(true);
-    let pending = gate.begin_intent(gate.reserve().unwrap(), change).unwrap();
-    let _sent = gate.next_batch().unwrap();
-    let deadline = Instant::now() + Duration::from_millis(20);
-    let change = gate.wait_acknowledged(pending, deadline).unwrap_err();
+    let change = linked::not_acknowledged(change);
     assert!(keyd.audit_sink().0.is_empty(), "keyd was not called");
 
     // Acknowledged: keyd runs it, once.

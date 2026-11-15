@@ -72,7 +72,7 @@ use ipc_audit::{
     AUDIT_CHANNEL,
 };
 use std::io;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -134,19 +134,19 @@ impl ListenerConfig {
 /// Why the socket could not be bound.
 ///
 /// Spec: docs/50 §3.1 ("deleting a stale socket file before bind … the
-/// daemon manages this explicitly").
+/// daemon manages this explicitly" — done by the root-side preparation,
+/// `startup::prepare_socket_directory`, task R11c; task R15b).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindError {
-    /// Something other than a socket exists at the path; it is left alone.
-    NotASocket,
-    /// Removing the stale socket, binding, or setting the mode failed.
+    /// Binding or setting the mode failed — among others, the path is
+    /// occupied (a stale socket the preparation did not remove, or another
+    /// kind of file: left alone either way).
     Io(io::ErrorKind),
 }
 
 impl fmt::Display for BindError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            BindError::NotASocket => f.write_str("a non-socket file exists at the socket path"),
             BindError::Io(kind) => write!(f, "socket bind failed: {kind}"),
         }
     }
@@ -154,9 +154,13 @@ impl fmt::Display for BindError {
 
 impl std::error::Error for BindError {}
 
-/// Bind `audit.sock` at `path`: remove a stale socket file left by an
-/// earlier run (never any other kind of file), bind, and set the file's mode
-/// to [`SOCKET_FILE_MODE`].
+/// Bind `audit.sock` at `path` and set the file's mode to
+/// [`SOCKET_FILE_MODE`]. Nothing is removed first: the one stale-socket
+/// removal is the root-side preparation's
+/// (`protected_file::prepare_socket_directory`, relative to the walked and
+/// checked directory, before the drop — task R11c); a path occupied after it
+/// (only root or auditd's account could have done that) fails the bind
+/// (task R15b, docs/questions/Q-631).
 ///
 /// Must be called within a tokio runtime context (tokio `UnixListener::bind`
 /// requires "a runtime with IO enabled"; the daemon uses `Runtime::enter`).
@@ -167,14 +171,6 @@ impl std::error::Error for BindError {}
 /// Spec: docs/50 §3.1; R50-16 (bound only after the log verified);
 /// tokio `net::UnixListener::bind`.
 pub fn bind(path: &Path) -> Result<UnixListener, BindError> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_socket() => {
-            std::fs::remove_file(path).map_err(|e| BindError::Io(e.kind()))?;
-        }
-        Ok(_) => return Err(BindError::NotASocket),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(BindError::Io(error.kind())),
-    }
     let listener = UnixListener::bind(path).map_err(|e| BindError::Io(e.kind()))?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(SOCKET_FILE_MODE))
         .map_err(|e| BindError::Io(e.kind()))?;

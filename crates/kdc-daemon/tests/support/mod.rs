@@ -39,7 +39,10 @@ use core::time::Duration;
 use directory_daemon::policy::{DevelopmentPolicy, MandatoryFast};
 use directory_pip::{DirectoryContext, TierMap};
 use dirstore::Store;
-use kdc_daemon::zones::{Network, ZoneTable};
+// The zone table's entries are crates/config's networks — the one address
+// match (task R15b, docs/questions/Q-632).
+use config::Network;
+use kdc_daemon::zones::ZoneTable;
 // The full parameters and the generic `serve` are the daemon's test seams
 // (docs/52 C18, task R15; feature `test-seams`, enabled by the
 // dev-dependency).

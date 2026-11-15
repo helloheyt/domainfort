@@ -69,6 +69,16 @@ sha2 = { version = "0.11", default-features = false }
 # TESTS ONLY (docs/52 C18, task R15; A-113): the tests open their stores by
 # path (`Store::open`, feature `test-seams`).
 dirstore = { path = "../dirstore", features = ["test-seams"] }
+# TESTS ONLY (task R15b, docs/questions/Q-630): the proof `apply` takes comes
+# only through the real audit client (ipc-audit feature `client`) from an
+# auditd's `Ack` — the tests run a fake auditd on a Unix socket
+# (crates/ipc-audit tests/linked, reused by `#[path]`): its framing (`ipc`)
+# and a tokio runtime for the client. Workspace crates and tokio (P-12),
+# already in the lock — no new package; dev-dependencies are not linked into
+# any product.
+ipc = { path = "../ipc" }
+ipc-audit = { path = "../ipc-audit", features = ["client"] }
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "sync"] }
 
 [lints]
 workspace = true

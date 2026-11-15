@@ -5,68 +5,24 @@
 //! `External`) — the daemon sees it, the client does not claim it"; §4.2:
 //! "the mapping belongs to the PEP". The configuration carries the entries
 //! (`internal_networks`, crates/config: canonical network address, host
-//! bits zero, prefix ≥ 1); the match is here.
+//! bits zero, prefix ≥ 1) **and the one match** (`config::Network::contains`
+//! / `config::is_internal`: same address family only, an IPv4-mapped IPv6
+//! address not rewritten — docs/questions/Q-275 item 9): the kdc's own copy
+//! of the containment code is gone (task R15b, docs/questions/Q-632; A-114's
+//! follow-up), so the kdc, its configuration's listener rule and
+//! ldap-front classify an address by the same code. The mapping to an
+//! `IpScope` stays here, in the PEP.
 //!
-//! A source matches an entry of its own address family only: an IPv4 source
-//! is compared with the IPv4 entries, an IPv6 source (an IPv4-mapped one
-//! included) with the IPv6 entries. No address is rewritten, so nothing is
-//! classified Internal by a translation the operator did not write (fail
-//! closed, docs/questions/Q-275 item 9). An empty table makes every source
-//! External — the restrictive scope (docs/questions/Q-230 item 8).
+//! The table also checks the kdc's listeners (docs/50 R50-9, "binding to
+//! internal interfaces only"): [`ZoneTable::is_internal`].
 //!
-//! Spec: docs/50 §4.1, §4.2; docs/11 §1 (`Context.src_net`);
-//! docs/questions/Q-230 item 8 (A-60).
+//! Spec: docs/50 R50-9, §4.1, §4.2; docs/11 §1 (`Context.src_net`);
+//! docs/questions/Q-230 item 8 (A-60), Q-275 item 9 (A-69), Q-580 (A-114),
+//! Q-632.
 
+use config::Network;
 use core::net::IpAddr;
 use pdp::IpScope;
-
-/// One internal network: an address with all bits past the prefix zero,
-/// and the prefix length (1 ..= 32 or 1 ..= 128).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Network {
-    address: IpAddr,
-    prefix_len: u8,
-}
-
-impl Network {
-    /// A network, or `None` if the prefix is 0 or longer than the address,
-    /// or a host bit is set (the configuration's rules, Q-230 item 8).
-    #[must_use]
-    pub fn new(address: IpAddr, prefix_len: u8) -> Option<Network> {
-        let width = match address {
-            IpAddr::V4(_) => 32,
-            IpAddr::V6(_) => 128,
-        };
-        if prefix_len == 0 || prefix_len > width {
-            return None;
-        }
-        let network = Network {
-            address,
-            prefix_len,
-        };
-        network.contains(address).then_some(network)
-    }
-
-    /// Whether `source` lies in this network (same family only).
-    #[must_use]
-    pub fn contains(&self, source: IpAddr) -> bool {
-        match (self.address, source) {
-            (IpAddr::V4(net), IpAddr::V4(ip)) => {
-                let mask = u32::MAX
-                    .checked_shl(32 - u32::from(self.prefix_len))
-                    .unwrap_or(0);
-                u32::from(ip) & mask == u32::from(net)
-            }
-            (IpAddr::V6(net), IpAddr::V6(ip)) => {
-                let mask = u128::MAX
-                    .checked_shl(128 - u32::from(self.prefix_len))
-                    .unwrap_or(0);
-                u128::from(ip) & mask == u128::from(net)
-            }
-            _ => false,
-        }
-    }
-}
 
 /// The internal networks; everything else is External.
 /// Spec: docs/50 §4.1.
@@ -76,7 +32,8 @@ pub struct ZoneTable {
 }
 
 impl ZoneTable {
-    /// A table of `internal` networks.
+    /// A table of `internal` networks (crates/config's type: only the
+    /// parser's rules make one — `config::Network::new`).
     #[must_use]
     pub fn new(internal: Vec<Network>) -> ZoneTable {
         ZoneTable { internal }
@@ -85,19 +42,23 @@ impl ZoneTable {
     /// The table of the configuration's `internal_networks` (already
     /// validated by crates/config).
     #[must_use]
-    pub fn from_settings(networks: &[config::Network]) -> ZoneTable {
+    pub fn from_settings(networks: &[Network]) -> ZoneTable {
         ZoneTable {
-            internal: networks
-                .iter()
-                .filter_map(|n| Network::new(n.address(), n.prefix_len()))
-                .collect(),
+            internal: networks.to_vec(),
         }
+    }
+
+    /// Whether `address` lies in an internal network — the configuration's
+    /// one match (`config::is_internal`). Spec: docs/50 §4.1; Q-275 item 9.
+    #[must_use]
+    pub fn is_internal(&self, address: IpAddr) -> bool {
+        config::is_internal(&self.internal, address)
     }
 
     /// The zone of `source`. Spec: docs/50 §4.1; docs/11 §1.
     #[must_use]
     pub fn scope(&self, source: IpAddr) -> IpScope {
-        if self.internal.iter().any(|n| n.contains(source)) {
+        if self.is_internal(source) {
             IpScope::Internal
         } else {
             IpScope::External
@@ -126,9 +87,10 @@ mod tests {
         IpAddr::V4(Ipv4Addr::new(a, b, c, d))
     }
 
-    /// docs/50 §4.1 (CIDR → Internal, else External); Q-230 item 8 (host
-    /// bits zero, prefix ≥ 1, empty table ⇒ External); Q-275 item 9 (no
-    /// family translation).
+    /// docs/50 §4.1 (CIDR → Internal, else External); Q-230 item 8 (empty
+    /// table ⇒ External); Q-275 item 9 (no family translation) — through
+    /// crates/config's one match (its own rules — host bits, prefix bounds —
+    /// are tested there: crates/config tests `network_containment`).
     #[test]
     fn cidr_entries_classify_sources() {
         let ten = Network::new(v4(10, 0, 0, 0), 8).unwrap();
@@ -151,12 +113,13 @@ mod tests {
             ZoneTable::default().scope(v4(10, 0, 0, 1)),
             IpScope::External
         );
-        // Host bits, prefix 0 and over-long prefixes are refused.
-        assert!(Network::new(v4(10, 0, 0, 1), 8).is_none());
-        assert!(Network::new(v4(10, 0, 0, 0), 0).is_none());
-        assert!(Network::new(v4(10, 0, 0, 0), 33).is_none());
-        let host = Network::new(v4(192, 168, 1, 7), 32).unwrap();
-        assert!(host.contains(v4(192, 168, 1, 7)));
-        assert!(!host.contains(v4(192, 168, 1, 8)));
+        // The same answers as the configuration's match, for every address
+        // above (one implementation).
+        for address in [v4(10, 200, 3, 4), v4(11, 0, 0, 1), mapped] {
+            assert_eq!(
+                table.is_internal(address),
+                config::is_internal(&[ten, ula], address)
+            );
+        }
     }
 }

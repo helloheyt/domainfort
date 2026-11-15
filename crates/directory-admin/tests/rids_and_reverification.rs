@@ -204,8 +204,9 @@ fn apply_compares_the_records_it_depends_on() {
 
 /// docs/52 §3.11 R6 (a), N5; A-85: a prepared write whose decision event
 /// auditd has not acknowledged gets no proof — the gate hands the prepared
-/// operation back at the deadline (sent, never acknowledged) — so `apply`,
-/// which takes only the proof, cannot run: nothing is written.
+/// operation back at the deadline (sent by the real audit client to an
+/// auditd that never acknowledges, task R15b) — so `apply`, which takes only
+/// the proof, cannot run: nothing is written.
 #[test]
 fn without_auditds_acknowledgement_there_is_no_proof_and_no_write() {
     let d = Domain::new("no-ack");
@@ -215,14 +216,7 @@ fn without_auditds_acknowledgement_there_is_no_proof_and_no_write() {
         let view = d.ctx.view(&d.store, &d.tiers).unwrap();
         d.admin.prepare(&request, &view, &d.policy, &now()).unwrap()
     };
-    let gate = ipc_audit::AuditGate::new(ipc_audit::WindowConfig::DEFAULT);
-    gate.set_reachable(true);
-    let pending = gate
-        .begin_intent(gate.reserve().unwrap(), prepared)
-        .unwrap();
-    let _sent = gate.next_batch().unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
-    let back = gate.wait_acknowledged(pending, deadline).unwrap_err();
+    let back = linked::not_acknowledged(prepared);
     assert!(back.writes());
     assert_eq!(back.decision_event().operation_id, request.operation_id);
     assert_eq!(

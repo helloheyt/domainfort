@@ -5,6 +5,14 @@
 //!
 //! Every test names its source. Every value is constructed by hand for these
 //! tests; no vector comes from any other implementation.
+//!
+//! Tier 1 plays the audit client itself at the window level — the gate
+//! opened or closed, a batch taken and inspected without being delivered,
+//! a connection lost, auditd's `Ack` fed at a chosen moment. The shared
+//! gate's link side is crate-private to ipc-audit (a product reaches it only
+//! through the one audit client, task R15b, docs/questions/Q-630), so these
+//! tests reach it through ipc-audit's dev-only `test_seams` (feature
+//! `test-seams`, enabled only by this crate's dev-dependency).
 
 use crate::audit::AuditGate;
 use crate::clock::{kerberos_time_from_unix, Clock};
@@ -14,9 +22,10 @@ use crate::engine::{
 };
 use crate::startup::development_keyd;
 use ipc::{decode_reply, encode_frame, Direction, Refused, Reply};
+use ipc_audit::client::LinkedGate;
 use ipc_audit::{
-    decode_event, Ack, EventBody, KeyPurposeCode, KeydOperation, KeydOutcome, KeydReason,
-    KeydRecord, KeydRole, WindowConfig,
+    decode_event, test_seams, Ack, EventBody, KeyPurposeCode, KeydOperation, KeydOutcome,
+    KeydReason, KeydRecord, KeydRole, WindowConfig,
 };
 use ipc_keyd::{Answer, Call, KeydReply, Password, KEYD_CHANNEL};
 use ipc_keyd_server::{Dispatch, KeyStateIntent};
@@ -137,7 +146,7 @@ fn engine_with(
     budget: IntentAckBudget,
 ) -> (TestEngine, Arc<AuditGate>) {
     let gate = Arc::new(AuditGate::new(window));
-    gate.set_reachable(reachable);
+    test_seams::set_reachable(gate.audit_gate(), reachable);
     let engine = Engine::start(
         clock.clone(),
         Arc::clone(&gate),
@@ -217,7 +226,7 @@ impl AutoAck {
             let (gate, stop, acked) = (Arc::clone(gate), Arc::clone(&stop), Arc::clone(&acked));
             std::thread::spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
-                    let Some(append) = gate.next_batch() else {
+                    let Some(append) = test_seams::next_batch(gate.audit_gate()) else {
                         std::thread::sleep(Duration::from_millis(1));
                         continue;
                     };
@@ -230,7 +239,7 @@ impl AutoAck {
                         through_seq: append.last_seq(),
                         head_hash: [0; 32],
                     };
-                    gate.acknowledge(&ack).unwrap();
+                    test_seams::acknowledge(gate.audit_gate(), &ack).unwrap();
                 }
             })
         };
@@ -378,7 +387,7 @@ fn verify_secret(octet: u8) -> Call {
 
 /// The keyd records in the window, in order (acknowledging nothing).
 fn window_records(gate: &AuditGate) -> Vec<ipc_audit::KeydRecord> {
-    let batch = gate.next_batch();
+    let batch = test_seams::next_batch(gate.audit_gate());
     let records = batch
         .map(|append| {
             append
@@ -391,18 +400,18 @@ fn window_records(gate: &AuditGate) -> Vec<ipc_audit::KeydRecord> {
                 .collect()
         })
         .unwrap_or_default();
-    gate.connection_lost();
+    test_seams::connection_lost(gate.audit_gate());
     records
 }
 
 /// Acknowledge every event in the window, as auditd would.
 fn acknowledge_all(gate: &AuditGate) {
-    while let Some(append) = gate.next_batch() {
+    while let Some(append) = test_seams::next_batch(gate.audit_gate()) {
         let ack = Ack {
             through_seq: append.last_seq(),
             head_hash: [0; 32],
         };
-        gate.acknowledge(&ack).unwrap();
+        test_seams::acknowledge(gate.audit_gate(), &ack).unwrap();
     }
 }
 
@@ -546,7 +555,7 @@ fn audit_unreachable_refuses_gating_operations_but_serves_ping_and_describe() {
     assert_eq!(ops, [KeydOperation::Ping, KeydOperation::DescribeConfig]);
     // auditd back: the same create_key and set_secret are served, each at
     // the initial kvno — the refused attempts created nothing.
-    gate.set_reachable(true);
+    test_seams::set_reachable(gate.audit_gate(), true);
     let _auditd = AutoAck::start(&gate);
     assert!(matches!(
         serve(&mut engine, ADMIN, &create_key(0xA1, "alice")).0,
@@ -794,7 +803,7 @@ fn an_authorization_refusal_is_one_record_without_intent() {
 fn an_unrecorded_outcome_answers_the_true_result_and_is_counted() {
     let clock = TestClock::at(t0());
     let gate = Arc::new(AuditGate::new(WindowConfig::DEFAULT));
-    gate.set_reachable(true);
+    test_seams::set_reachable(gate.audit_gate(), true);
     let mut engine = Engine::start(
         clock.clone(),
         Arc::clone(&gate),
@@ -1029,7 +1038,7 @@ fn a_full_queue_answers_busy_at_once() {
         waiting: Mutex::new(waiting),
     };
     let gate = Arc::new(AuditGate::new(WindowConfig::DEFAULT));
-    gate.set_reachable(true);
+    test_seams::set_reachable(gate.audit_gate(), true);
     let engine = Engine::start(
         clock,
         gate,

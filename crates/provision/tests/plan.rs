@@ -623,11 +623,47 @@ fn the_zone_table_is_ldap_fronts() {
     assert_eq!(error.kind, InputErrorKind::MissingInternalNetwork);
     assert_eq!(error.field, "internal-network");
 
+    // The kdc's listener moved inside 10.0.0.0/8 (task R15b: the kdc's file
+    // has the same rule), so only the LDAP listener is outside.
     let mut outside = input.clone();
     outside.network.internal_networks = vec!["10.0.0.0/8".to_owned()];
+    outside.network.kdc_listen = vec!["10.0.0.5:88".to_owned()];
     match refused(&outside) {
         PlanError::Config(daemon, error) => {
             assert_eq!(daemon, provision::Daemon::LdapFront);
+            assert_eq!(error.kind(), config::ErrorKind::ListenerNotInternal);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// docs/50 R50-9 ("binding to internal interfaces only"), §4.1; task R15b
+/// (docs/questions/Q-632): the zone table goes to the kdc's file too —
+/// always, since provisioning requires one network — and a kdc listener
+/// outside the internal networks fails the parse-back by the kdc's own
+/// schema. Addresses are test data.
+#[test]
+fn the_kdc_file_carries_the_zone_table_and_listens_inside_it() {
+    let dir = TempDir::new();
+    let input = input(&dir, 61002, 61007);
+    let p = plan(&input);
+    let kdc_text = p
+        .configs
+        .iter()
+        .find(|f| f.daemon == provision::Daemon::Kdc)
+        .unwrap()
+        .text();
+    let kdc = config::KdcSettings::parse(kdc_text.as_bytes()).unwrap();
+    assert_eq!(kdc.internal_networks().len(), 2);
+    assert!(kdc_text
+        .lines()
+        .any(|l| l == "internal_networks = 10.0.0.0/8, 127.0.0.0/8"));
+
+    let mut outside = input.clone();
+    outside.network.kdc_listen = vec!["192.0.2.7:88".to_owned()];
+    match refused(&outside) {
+        PlanError::Config(daemon, error) => {
+            assert_eq!(daemon, provision::Daemon::Kdc);
             assert_eq!(error.kind(), config::ErrorKind::ListenerNotInternal);
         }
         other => panic!("{other:?}"),

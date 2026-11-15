@@ -63,11 +63,11 @@ const PATH_OPERATIONS: [&str; 22] = [
 
 /// The reason shared by the four socket-serving daemons' post-drop socket
 /// code (docs/questions Q-550 item 2).
-const SOCKET_AFTER_THE_DROP: &str =
-    "after the privilege drop, as the daemon's own account: a stale \
-     socket left since the root-side preparation removed (symlink_metadata, remove_file), the \
-     socket bound (UnixListener::bind — no descriptor-relative bind exists) and its mode set \
-     (set_permissions — chmodat cannot refuse a link on Linux), the socket removed at stop — all \
+const SOCKET_AFTER_THE_DROP: &str = "after the privilege drop, as the daemon's own account: the \
+     socket bound (UnixListener::bind — no descriptor-relative bind exists; nothing is removed \
+     before it: the stale-socket removal is protected_file::prepare_socket_directory's alone, \
+     task R15b / Q-631) and its mode set (set_permissions — chmodat cannot refuse a link on \
+     Linux), the socket this run bound removed at stop or on a failed start (remove_file) — all \
      inside the socket directory protected_file::prepare_socket_directory walked and checked at \
      this start, so only root or the daemon's own account can change any component of the path \
      (Q-550 item 2)";

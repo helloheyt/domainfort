@@ -299,10 +299,11 @@ pub fn domain_configs(input: &DomainInput, node_id: &NodeId) -> Vec<ConfigFile> 
         ("run_as_uid", id(a.kdc.uid)),
         ("run_as_gid", id(a.kdc.gid)),
         ("listen", list(&n.kdc_listen)),
+        // Required: the kdc binds to internal interfaces only — every
+        // listener lies in an internal network (docs/50 R50-9; task R15b,
+        // docs/questions/Q-632). The input check guarantees one entry.
+        ("internal_networks", list(&n.internal_networks)),
     ];
-    if !n.internal_networks.is_empty() {
-        kdc.push(("internal_networks", list(&n.internal_networks)));
-    }
     kdc.extend([
         ("keyd_socket", path(&p.keyd_socket)),
         ("keyd_uid", id(a.keyd.uid)),

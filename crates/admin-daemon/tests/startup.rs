@@ -178,9 +178,13 @@ fn an_auditd_recording_admind_under_another_source_is_refused() {
     }
 }
 
-/// docs/50 §3.1 ("the daemon manages this explicitly"): a file that is not
-/// a socket in the way of `admin_socket` is never removed — admind does not
-/// start.
+/// docs/50 §3.1 ("the daemon manages this explicitly"); task R15b
+/// (docs/questions/Q-631; A-113, Q-552 item 1): admind's own start — after
+/// the privilege drop — removes nothing at `admin_socket`: a file that is
+/// not a socket, and a socket left behind alike, make it fail with `Bind`
+/// and stay as they were. The one stale-socket removal is the root-side
+/// preparation's (`startup::prepare_socket_directory`, crates/protected-file
+/// tests/socket_directory.rs).
 #[test]
 fn a_file_in_the_way_of_the_socket_is_not_removed() {
     let dir = TempDir::new();
@@ -192,8 +196,21 @@ fn a_file_in_the_way_of_the_socket_is_not_removed() {
         FakeAuditd::start_recording_as(&dir.join("a.sock"), ipc_audit::EventSource::Admind);
     std::fs::write(dir.join("am.sock"), b"not a socket").unwrap();
     let params = test_params(&dir, &dir.join("a.sock"), uid);
-    assert_eq!(run(params), Err(DaemonError::SocketPathOccupied));
+    assert_eq!(run(params), Err(DaemonError::Bind));
     assert_eq!(std::fs::read(dir.join("am.sock")).unwrap(), b"not a socket");
+
+    std::fs::remove_file(dir.join("am.sock")).unwrap();
+    drop(std::os::unix::net::UnixListener::bind(dir.join("am.sock")).unwrap());
+    let params = test_params(&dir, &dir.join("a.sock"), uid);
+    assert_eq!(run(params), Err(DaemonError::Bind));
+    assert!(
+        std::os::unix::fs::FileTypeExt::is_socket(
+            &std::fs::symlink_metadata(dir.join("am.sock"))
+                .unwrap()
+                .file_type()
+        ),
+        "the start removed nothing"
+    );
 }
 
 /// docs/50 §7.1 ("file root:0644"): a configuration file owned by another

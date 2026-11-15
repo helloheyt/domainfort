@@ -501,6 +501,14 @@ impl Server {
             .expect("runtime");
         let socket = first.audit_socket().as_path().to_path_buf();
         for settings in listeners {
+            // auditd's post-drop bind removes nothing (task R15b,
+            // docs/questions/Q-631): the stale socket of an earlier run is
+            // removed by the root-side preparation alone (auditd's step 3b,
+            // `protected_file::prepare_socket_directory`). A restart of this
+            // in-process server stands in for that step by removing its own
+            // earlier socket — the harness's sockets may lie outside a
+            // directory the preparation's walk accepts (e2e, ldap-front).
+            let _ = std::fs::remove_file(settings.audit_socket().as_path());
             let bound = {
                 let _context = runtime.enter();
                 listener::bind(settings.audit_socket().as_path()).expect("bind")

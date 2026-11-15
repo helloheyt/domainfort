@@ -18,9 +18,10 @@
 //!    the LDAP events, crate::audit_link) — then the LDAP engine thread and
 //!    its own bounded queue (crate::ldap_engine).
 //! 4. **the listeners** — for `dird_kdc_socket` and `dird_ldap_socket`:
-//!    remove a stale socket file (only if it is a socket; anything else ⇒
-//!    error), bind, set the socket file's mode, accept (docs/50 §3.1). The
-//!    admin socket is not bound (task P13).
+//!    bind, set the socket file's mode, accept (docs/50 §3.1; the one
+//!    stale-socket removal is the root-side preparation's, before the drop —
+//!    an occupied path fails the bind, task R15b). The admin socket is not
+//!    bound (task P13).
 //! 5. **until stopped** — [`DaemonControl::stop`]: stop accepting, answer
 //!    new requests `Unavailable`, wait (bounded) for queued requests, then
 //!    wait (bounded by [`AUDIT_FLUSH_GRACE`], the bound keyd and the kdc
@@ -68,7 +69,7 @@ use ipc_directory_server::ViewLimits;
 use ipc_ldap_server::Fronts;
 use keyd_types::KeydConfig;
 use ldap::{Engine, EngineConfig, RootDseConfig};
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -310,18 +311,18 @@ pub enum DaemonError {
     /// The engine could not start (the directory has no usable domain root
     /// or krbtgt account, or a limit is out of range).
     Engine(EngineError),
-    /// A non-socket file is in the way of `dird_kdc_socket`.
-    SocketPathOccupied,
-    /// The socket could not be bound or its mode set.
+    /// The socket could not be bound or its mode set — among others, its
+    /// path is occupied: the stale socket of an earlier run is removed by
+    /// the root-side preparation alone (`startup::prepare_socket_directory`,
+    /// task R15b), never here.
     Bind,
     /// The policy's PDP snapshot was refused (a rule-set error).
     PolicySnapshot,
     /// The LDAP engine refused its configuration (naming context, DNS host
     /// name).
     LdapEngine,
-    /// A non-socket file is in the way of `dird_ldap_socket`.
-    LdapSocketPathOccupied,
-    /// The LDAP socket could not be bound or its mode set.
+    /// The LDAP socket could not be bound or its mode set (an occupied path
+    /// included, as for [`DaemonError::Bind`]).
     LdapBind,
 }
 
@@ -340,16 +341,10 @@ impl fmt::Display for DaemonError {
             DaemonError::Context => f.write_str("directory context refused the configuration"),
             DaemonError::Policy => f.write_str("policy tier map refused"),
             DaemonError::Engine(error) => write!(f, "{error}"),
-            DaemonError::SocketPathOccupied => {
-                f.write_str("dird-kdc socket path is occupied by a file that is not a socket")
-            }
             DaemonError::Bind => f.write_str("dird-kdc socket could not be bound"),
             DaemonError::PolicySnapshot => f.write_str("policy rule set refused"),
             DaemonError::LdapEngine => {
                 f.write_str("LDAP engine refused the naming context or the DNS host name")
-            }
-            DaemonError::LdapSocketPathOccupied => {
-                f.write_str("dird-ldap socket path is occupied by a file that is not a socket")
             }
             DaemonError::LdapBind => f.write_str("dird-ldap socket could not be bound"),
         }
@@ -470,37 +465,25 @@ fn open_store(path: &Path, key: IntegrityKey, owner_uid: u32) -> Result<Store, D
     Store::open_file(file, key, schema.schema().clone()).map_err(|_| DaemonError::Store)
 }
 
-/// Remove a stale socket file at `path`, if any; refuse to remove anything
-/// that is not a socket.
-/// Spec: docs/50 §3.1 ("the daemon manages this explicitly").
-fn remove_stale_socket(path: &Path) -> Result<(), DaemonError> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_socket() => {
-            std::fs::remove_file(path).map_err(|_| DaemonError::Bind)
-        }
-        Ok(_) => Err(DaemonError::SocketPathOccupied),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err(DaemonError::Bind),
-    }
-}
-
-/// Bind a socket path and set its mode.
-/// Spec: docs/50 §3.1; tokio `net::UnixListener::bind`.
+/// Bind a socket path and set its mode. Nothing is removed first: the one
+/// stale-socket removal is the root-side preparation's
+/// (`protected_file::prepare_socket_directory`, relative to the walked and
+/// checked directory, before the drop — task R11c); a path occupied after it
+/// (only root or dird's account could have done that) fails the bind (task
+/// R15b, docs/questions/Q-631).
+/// Spec: docs/50 §3.1 ("the daemon manages this explicitly"); tokio
+/// `net::UnixListener::bind`.
 fn bind(path: &Path) -> Result<UnixListener, DaemonError> {
-    remove_stale_socket(path)?;
     let listener = UnixListener::bind(path).map_err(|_| DaemonError::Bind)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(SOCKET_FILE_MODE))
         .map_err(|_| DaemonError::Bind)?;
     Ok(listener)
 }
 
-/// Bind `dird_ldap_socket` (the LDAP variants of [`bind`]'s errors).
+/// Bind `dird_ldap_socket` (the LDAP variant of [`bind`]'s error).
 /// Spec: docs/50 §3.1, §4.2.
 fn bind_ldap(path: &Path) -> Result<UnixListener, DaemonError> {
-    bind(path).map_err(|error| match error {
-        DaemonError::SocketPathOccupied => DaemonError::LdapSocketPathOccupied,
-        _ => DaemonError::LdapBind,
-    })
+    bind(path).map_err(|_| DaemonError::LdapBind)
 }
 
 /// Wait until `done()` or `grace` passed.
@@ -740,10 +723,12 @@ pub async fn serve_with(
         },
     })
     .map_err(|_| DaemonError::LdapEngine)?;
-    // auditd was verified a moment ago (step 1); the audit task takes over
-    // the reachability from here.
+    // auditd was verified a moment ago (step 1): the gate opens on that
+    // connection — by the audit client, the one owner of "auditd is
+    // reachable" (task R15b, docs/questions/Q-630) — and the audit task
+    // keeps the reachability from here.
     let gate = Arc::new(AuditGate::new(params.audit_window));
-    gate.set_reachable(true);
+    let attached = link.attach(Arc::clone(&gate), audit);
     let service = LdapService {
         store: Arc::clone(&store),
         ctx: ldap_ctx,
@@ -776,7 +761,7 @@ pub async fn serve_with(
             return Err(DaemonError::Engine(error));
         }
     };
-    let audit_task = tokio::spawn(link.run(Arc::clone(&gate), audit));
+    let audit_task = tokio::spawn(attached.run());
 
     // 4. The listeners.
     let listeners = match bind(&params.kdc_socket) {

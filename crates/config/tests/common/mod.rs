@@ -96,7 +96,7 @@ pub const KDC: &str = "\
 run_as_uid = 803
 run_as_gid = 803
 listen = 10.0.0.5:88, [fd00:1234::5]:88
-internal_networks = 10.0.0.0/8
+internal_networks = 10.0.0.0/8, fd00:1234::/32
 keyd_socket = /run/keyd/keyd.sock
 keyd_uid = 801
 dird_kdc_socket = /run/dird/kdc/dird-kdc.sock
@@ -115,11 +115,13 @@ keyd_deadline = 2s
 dird_deadline = 1s
 ";
 
-/// kdc, required keys only. Spec: docs/50 §7.1.
+/// kdc, required keys only — the zone table among them, every listener
+/// inside it (docs/50 R50-9; task R15b). Spec: docs/50 §7.1.
 pub const KDC_MINIMAL: &str = "\
 run_as_uid = 803
 run_as_gid = 803
 listen = 127.0.0.1:88
+internal_networks = 127.0.0.0/8
 keyd_socket = /run/keyd/keyd.sock
 keyd_uid = 801
 dird_kdc_socket = /run/dird/kdc/dird-kdc.sock

@@ -152,9 +152,10 @@ pub enum ErrorKind {
     NoListener,
     /// A listener address outside every network of the file's zone table
     /// (`internal_networks`): phase 1 has no external LDAP listener — one
-    /// front per zone, the internal one.
+    /// front per zone, the internal one; the kdc binds to internal
+    /// interfaces only (R50-9; task R15b).
     /// Spec: docs/52 §7 R14; A-102 on docs/questions/Q-469 (b); docs/50
-    /// §4.1 (CIDR → Internal); docs/questions/Q-580.
+    /// R50-9, §4.1 (CIDR → Internal); docs/questions/Q-580, Q-632.
     ListenerNotInternal,
     /// Two limits contradict each other (a per-source bound above the global
     /// bound). Spec: docs/50 §4.1.

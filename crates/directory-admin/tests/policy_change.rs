@@ -24,8 +24,8 @@ use directory_admin::{
     VerificationFailure, MAX_POLICY_CHANGES,
 };
 use ipc_audit::{
-    Ack, AckedIntent, AdminFailure, AdminNameKind, AdminRefusal, AuditGate, DecisionResult,
-    DirAdminOperation, DirAdminStage, OutcomeResult, PdpReasonCode, SidValue, WindowConfig,
+    AckedIntent, AdminFailure, AdminNameKind, AdminRefusal, DecisionResult, DirAdminOperation,
+    DirAdminStage, OutcomeResult, PdpReasonCode, SidValue,
 };
 use pdp::{
     ActionMatch, AuthMatch, ContextMatch, Effect, Match, PolicyVersion, ResourceMatch, Rule,
@@ -132,20 +132,11 @@ fn decide(
 }
 
 /// Play auditd for one decision (as tests/common `acknowledged` does for a
-/// directory write): the proof, obtained only through the gate.
+/// directory write): the proof, obtained only through the gate the real
+/// audit client is attached to, from a fake auditd's `Ack` (task R15b,
+/// docs/questions/Q-630 — nothing else can acknowledge).
 fn acknowledged(prepared: PreparedPolicyChange) -> AckedIntent<PreparedPolicyChange> {
-    let gate = AuditGate::new(WindowConfig::DEFAULT);
-    gate.set_reachable(true);
-    let slot = gate.reserve().expect("a slot");
-    let pending = gate.begin_intent(slot, prepared).expect("committed");
-    let batch = gate.next_batch().expect("the decision event is sent");
-    gate.acknowledge(&Ack {
-        through_seq: batch.last_seq(),
-        head_hash: [0; 32],
-    })
-    .expect("auditd acknowledges");
-    gate.wait_acknowledged(pending, std::time::Instant::now())
-        .expect("acknowledged")
+    linked::acknowledged(prepared)
 }
 
 fn refusal_code(r: &directory_admin::Refusal) -> DecisionResult {

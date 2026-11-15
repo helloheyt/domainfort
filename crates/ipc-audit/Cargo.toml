@@ -48,6 +48,14 @@ ldap = ["dep:ldap", "dep:pdp", "dep:krb-proto", "dep:dtyp", "dep:parse-ldap"]
 # ldap-front's start-up check; NOT by auditd, whose ipc-audit stays the
 # one-dependency core.
 client = ["dep:tokio"]
+# TESTS ONLY (task R15b, docs/questions/Q-630; the docs/52 R15 rules,
+# docs/questions/Q-570 item 2, A-118): the module `test_seams`, which
+# reaches the audit gate's crate-private link side (reachability, the batch
+# to send, auditd's `Ack`, a lost batch) for the in-process tier-1 tests of
+# a daemon's gate (docs/50 §9). Enabled ONLY from [dev-dependencies] (cargo
+# resolver 2: never in a product build), never in `default`; guarded by
+# crates/e2e-tests tests/no_test_seams_in_product.rs.
+test-seams = []
 
 [dependencies]
 # Framing, field primitives, the `MessageSet` pattern and `REFUSED_KIND`.

@@ -145,7 +145,7 @@ fn kdc_sample_parses() {
     let s = KdcSettings::parse(common::KDC.as_bytes()).expect("valid kdc file");
     assert_eq!((s.run_as().uid(), s.run_as().gid()), (803, 803));
     assert_eq!(s.listen(), [v4(10, 0, 0, 5, 88), fd00_1234(5, 88)]);
-    assert_eq!(s.internal_networks().len(), 1);
+    assert_eq!(s.internal_networks().len(), 2);
     assert_eq!(s.keyd().socket().as_str(), "/run/keyd/keyd.sock");
     assert_eq!(s.keyd().uid(), 801);
     assert_eq!(s.dird().socket().as_str(), "/run/dird/kdc/dird-kdc.sock");
@@ -173,7 +173,7 @@ fn kdc_sample_parses() {
 fn kdc_minimal_sample_takes_defaults() {
     let s = KdcSettings::parse(common::KDC_MINIMAL.as_bytes()).expect("valid kdc file");
     assert_eq!(s.listen(), [v4(127, 0, 0, 1, 88)]);
-    assert!(s.internal_networks().is_empty());
+    assert_eq!(s.internal_networks().len(), 1);
     let l = s.limits();
     assert_eq!(l.max_tcp_connections(), 1024);
     assert_eq!(l.max_tcp_connections_per_source(), 16);

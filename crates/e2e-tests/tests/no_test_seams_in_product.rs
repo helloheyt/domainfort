@@ -12,8 +12,12 @@
 //! left: its shape↔source binding table and connection quota are not
 //! parameters at all (R15, after task R9b gave every test sender its own
 //! listener). dirstore's path-taking `Store::open` (A-113) is gated by the
-//! same feature. This test checks the things that keep that true by
-//! construction in a product build:
+//! same feature. ipc-audit's `test_seams` (task R15b, docs/questions/Q-630)
+//! reaches the audit gate's crate-private link side — auditd reachable, the
+//! batch to send, auditd's `Ack`, a lost batch — which in a product only the
+//! one audit client drives; it exists only for the in-process tier-1 tests
+//! of keyd's and the kdc's gate wrappers. This test checks the things that
+//! keep that true by construction in a product build:
 //!
 //! 1. every daemon with seams declares `test_seams` behind the feature, and
 //!    its own `[features]` table has `test-seams = []`, outside `default`;
@@ -28,7 +32,14 @@
 //! 3. no non-test source of the workspace (`crates/*/src`, every `main.rs`
 //!    and start-up path included) names `test_seams` in code, except the
 //!    declaration itself — so a test build, in which the module does exist,
-//!    gives no product path a seam either.
+//!    gives no product path a seam either;
+//! 4. ipc-audit's seams (the evidence an `AckedIntent` rests on) are the
+//!    narrowest: ipc-audit declares its module like the daemons (rule 1),
+//!    only keyd-daemon's and kdc-daemon's `[dev-dependencies]` enable
+//!    ipc-audit's feature, and only their tier-1 test files name
+//!    `ipc_audit::test_seams` — in **any** source of the workspace, test
+//!    code included. Every other test obtains an acknowledged intent from a
+//!    fake auditd through the real client (crates/ipc-audit `tests/linked`).
 //!
 //! Comments are not code: `//` comments in sources and `#` comments in
 //! manifests are skipped. Files under a `tests/` directory and files named
@@ -54,15 +65,33 @@ const DAEMONS: [&str; 5] = [
     "ldap-front",
 ];
 
-/// The crates that declare the feature: the daemons above and dirstore (its
-/// path-taking `Store::open`, A-113).
-const DECLARING: [&str; 6] = [
+/// The crates that declare the feature: the daemons above, dirstore (its
+/// path-taking `Store::open`, A-113) and ipc-audit (the audit gate's link
+/// side, task R15b).
+const DECLARING: [&str; 7] = [
     "keyd-daemon",
     "kdc-daemon",
     "directory-daemon",
     "admin-daemon",
     "ldap-front",
     "dirstore",
+    "ipc-audit",
+];
+
+/// The library crates (not daemons: no `main.rs`) that declare a
+/// `test_seams` module in `src/lib.rs`, behind the feature (rule 1).
+const LIBRARY_MODULES: [&str; 1] = ["ipc-audit"];
+
+/// The only crates whose `[dev-dependencies]` enable ipc-audit's feature
+/// (rule 4): their in-process tier-1 tests play the audit client.
+const IPC_AUDIT_SEAM_USERS: [&str; 2] = ["keyd-daemon", "kdc-daemon"];
+
+/// The only files, relative to `crates/`, that name `ipc_audit::test_seams`
+/// (rule 4).
+const IPC_AUDIT_SEAM_FILES: [&str; 3] = [
+    "keyd-daemon/src/audit_tests.rs",
+    "keyd-daemon/src/tier1_tests.rs",
+    "kdc-daemon/src/audit_tests.rs",
 ];
 
 /// The feature name.
@@ -158,12 +187,13 @@ fn manifest_violations(text: &str, own_feature_allowed: bool) -> Vec<String> {
         .collect()
 }
 
-/// Rule 1: each daemon declares the module behind the feature, hidden, and
-/// its manifest has the feature outside `default`.
+/// Rule 1: each daemon (and ipc-audit, task R15b) declares the module
+/// behind the feature, hidden, and its manifest has the feature outside
+/// `default`.
 #[test]
 fn every_daemon_declares_its_test_seams_behind_the_feature() {
     let crates = crates_dir();
-    for daemon in DAEMONS {
+    for daemon in DAEMONS.into_iter().chain(LIBRARY_MODULES) {
         let lib = std::fs::read_to_string(crates.join(daemon).join("src/lib.rs")).expect("lib.rs");
         let code: Vec<&str> = lib
             .lines()
@@ -296,10 +326,9 @@ fn no_product_source_names_the_test_seams() {
             scanned += 1;
             let rel = file.strip_prefix(&crates).unwrap_or(&file).to_path_buf();
             let is_module = rel.file_name().and_then(|n| n.to_str()) == Some("test_seams.rs");
-            let daemon_lib = DAEMONS
-                .iter()
-                .any(|d| rel == Path::new(d).join("src/lib.rs"));
-            if is_module && DAEMONS.iter().any(|d| rel.starts_with(d)) {
+            let declaring = || DAEMONS.iter().chain(LIBRARY_MODULES.iter());
+            let daemon_lib = declaring().any(|d| rel == Path::new(d).join("src/lib.rs"));
+            if is_module && declaring().any(|d| rel.starts_with(d)) {
                 continue;
             }
             let text = std::fs::read_to_string(&file).expect("UTF-8 source");
@@ -318,7 +347,11 @@ fn no_product_source_names_the_test_seams() {
     );
     // Positive controls: every declaration was seen, and the scan covered
     // the workspace (every daemon's main.rs among the files).
-    assert_eq!(declarations.len(), DAEMONS.len(), "{declarations:?}");
+    assert_eq!(
+        declarations.len(),
+        DAEMONS.len() + LIBRARY_MODULES.len(),
+        "{declarations:?}"
+    );
     assert!(scanned > 100, "{scanned}");
     for daemon in DAEMONS {
         assert!(
@@ -326,6 +359,170 @@ fn no_product_source_names_the_test_seams() {
             "{daemon}"
         );
     }
+}
+
+/// Every `.rs` file below `dir`, recursively, test code included (rule 4);
+/// build output (`target`) skipped.
+fn all_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<PathBuf> = read.map(|e| e.expect("entry").path()).collect();
+    entries.sort();
+    for path in entries {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if path.is_dir() {
+            if name != "target" {
+                all_sources(&path, out);
+            }
+        } else if name.ends_with(".rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// Whether `text` names ipc-audit's seams in code (outside `//` comments):
+/// a path `ipc_audit::test_seams`, or a `use ipc_audit::{…}` group — over
+/// any number of lines — that lists `test_seams`.
+fn names_ipc_audit_seams(text: &str) -> bool {
+    let compact: String = text
+        .lines()
+        .map(|line| line.split("//").next().unwrap_or(""))
+        .flat_map(str::chars)
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    if compact.contains("ipc_audit::test_seams") {
+        return true;
+    }
+    const GROUP: &str = "ipc_audit::{";
+    let mut rest = compact.as_str();
+    while let Some(at) = rest.find(GROUP) {
+        let after = &rest[at + GROUP.len()..];
+        let mut depth = 1usize;
+        let mut end = after.len();
+        for (i, c) in after.char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let group = &after[..end];
+        if group
+            .split([',', '{', '}'])
+            .any(|item| item == MODULE || item.starts_with("test_seams::"))
+        {
+            return true;
+        }
+        rest = &after[end..];
+    }
+    false
+}
+
+/// Rule 4 (task R15b, docs/questions/Q-630): ipc-audit's seams — the
+/// evidence an `AckedIntent` rests on — are enabled only by keyd-daemon's
+/// and kdc-daemon's dev-dependencies and named only by their tier-1 test
+/// files, in any source of the workspace (test code included).
+#[test]
+fn only_the_tier_1_gate_tests_reach_ipc_audits_seams() {
+    let crates = crates_dir();
+    let mut enabling = Vec::new();
+    let mut violations = Vec::new();
+    for dir in crate_dirs() {
+        let name = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_owned();
+        let text = std::fs::read_to_string(dir.join("Cargo.toml")).expect("manifest");
+        for (table, code) in manifest_lines(&text) {
+            if code.starts_with("ipc-audit") && code.contains(FEATURE) {
+                if table.ends_with("dev-dependencies")
+                    && IPC_AUDIT_SEAM_USERS.contains(&name.as_str())
+                {
+                    enabling.push(name.clone());
+                } else {
+                    violations.push(format!("{name}: [{table}] {code}"));
+                }
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "ipc-audit's `{FEATURE}` enabled outside keyd-daemon's / kdc-daemon's dev-dependencies: \
+         {violations:#?}"
+    );
+    enabling.sort();
+    let mut users = IPC_AUDIT_SEAM_USERS.to_vec();
+    users.sort_unstable();
+    assert_eq!(enabling, users, "positive control");
+
+    let this_file = Path::new(file!())
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let mut naming = Vec::new();
+    let mut scanned = 0usize;
+    for dir in crate_dirs() {
+        let mut files = Vec::new();
+        all_sources(&dir, &mut files);
+        for file in files {
+            let rel = file.strip_prefix(&crates).unwrap_or(&file).to_path_buf();
+            if rel == Path::new("e2e-tests/tests").join(this_file) {
+                continue;
+            }
+            scanned += 1;
+            let text = std::fs::read_to_string(&file).expect("UTF-8 source");
+            if names_ipc_audit_seams(&text) {
+                naming.push(rel.display().to_string());
+            }
+        }
+    }
+    let unexpected: Vec<&String> = naming
+        .iter()
+        .filter(|f| !IPC_AUDIT_SEAM_FILES.contains(&f.as_str()))
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "a source outside the tier-1 gate tests names ipc_audit::test_seams: {unexpected:#?}"
+    );
+    // Positive control: each allowed file is seen, and the scan covered
+    // test code too (far more files than the product scan).
+    naming.sort();
+    let mut expected: Vec<String> = IPC_AUDIT_SEAM_FILES
+        .iter()
+        .map(|f| (*f).to_owned())
+        .collect();
+    expected.sort();
+    assert_eq!(naming, expected);
+    assert!(scanned > 300, "{scanned}");
+}
+
+/// Positive control of rule 4's scanner: a path, a one-line and a
+/// multi-line `use` group naming the module are seen; a comment, another
+/// crate's module and an ipc-audit group without it are not.
+#[test]
+fn the_ipc_audit_scanner_sees_planted_uses() {
+    assert!(names_ipc_audit_seams(
+        "fn f(g: &G) { ipc_audit::test_seams::set_reachable(g, true); }"
+    ));
+    assert!(names_ipc_audit_seams("use ipc_audit::{test_seams, Ack};"));
+    assert!(names_ipc_audit_seams(
+        "use ipc_audit::{\n    decode_event, Ack,\n    test_seams,\n};\n"
+    ));
+    assert!(names_ipc_audit_seams(
+        "use ipc_audit::{client::{AuditLink}, test_seams::acknowledge};"
+    ));
+    assert!(!names_ipc_audit_seams(
+        "// ipc_audit::test_seams in a comment\nuse ipc_audit::{Ack, AuditGate};\n\
+         use keyd_daemon::test_seams::serve;\n"
+    ));
 }
 
 /// Positive control of the scanners: a planted mention in code is seen, a

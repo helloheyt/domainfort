@@ -49,7 +49,10 @@ pdp = { path = "../pdp" }
 # the lock.
 ad-schema = { path = "../ad-schema" }
 directory-pip = { path = "../directory-pip" }
-dirstore = { path = "../dirstore" }
+# `test-seams` (A-113, R15): the reused fixtures open their store by path
+# (`Store::open`); without it `cargo test -p ipc-ldap-server` alone did not
+# build (task R15b, docs/questions/Q-634).
+dirstore = { path = "../dirstore", features = ["test-seams"] }
 keyd = { path = "../keyd" }
 krb-proto = { path = "../krb-proto" }
 dtyp = { path = "../dtyp" }

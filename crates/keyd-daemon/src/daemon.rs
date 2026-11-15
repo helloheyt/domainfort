@@ -13,10 +13,11 @@
 //!    (R50-7) — after hardening, since `serve` runs in the runtime `main`
 //!    builds only after `daemon_sandbox::apply` (R50-14).
 //! 3. **audit client** task, on the verified connection (R50-17).
-//! 4. **listener** — remove a stale socket file at `keyd_socket` (only if it
-//!    is a socket; anything else ⇒ error), bind, set the socket file's mode,
-//!    accept (docs/50 §3.1: "removing an old socket file before bind … the
-//!    daemon manages this explicitly").
+//! 4. **listener** — bind `keyd_socket`, set the socket file's mode, accept
+//!    (docs/50 §3.1: "removing an old socket file before bind … the daemon
+//!    manages this explicitly" — the root-side preparation did, before the
+//!    drop, the one stale-socket removal; an occupied path fails the bind —
+//!    task R15b).
 //! 5. **until stopped** — [`DaemonControl::stop`]: stop accepting, answer new
 //!    requests `Unavailable`, wait (bounded) for queued requests to be
 //!    answered, remove the socket file, wait (bounded) for auditd to
@@ -52,7 +53,7 @@ use core::time::Duration;
 use ipc_audit::WindowConfig;
 use keyd::{ConfigError, EntropySource, KeyStore, Keyd};
 use krb_proto::{KerberosTime, Realm};
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -222,9 +223,10 @@ pub enum DaemonError {
     Audit(AuditLinkError),
     /// The engine could not start.
     Engine(EngineError),
-    /// A non-socket file is in the way of `keyd_socket`.
-    SocketPathOccupied,
-    /// The socket could not be bound or its mode set.
+    /// The socket could not be bound or its mode set — among others, its
+    /// path is occupied: the stale socket of an earlier run is removed by
+    /// the root-side preparation alone (`startup::prepare_socket_directory`,
+    /// task R15b), never here.
     Bind,
 }
 
@@ -233,9 +235,6 @@ impl fmt::Display for DaemonError {
         match self {
             DaemonError::Audit(error) => write!(f, "auditd not verified: {error}"),
             DaemonError::Engine(error) => write!(f, "{error}"),
-            DaemonError::SocketPathOccupied => {
-                f.write_str("keyd socket path is occupied by a file that is not a socket")
-            }
             DaemonError::Bind => f.write_str("keyd socket could not be bound"),
         }
     }
@@ -310,24 +309,15 @@ impl Stopped {
     }
 }
 
-/// Remove a stale socket file at `path`, if any; refuse to remove anything
-/// that is not a socket.
-/// Spec: docs/50 §3.1 ("the daemon manages this explicitly").
-fn remove_stale_socket(path: &Path) -> Result<(), DaemonError> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_socket() => {
-            std::fs::remove_file(path).map_err(|_| DaemonError::Bind)
-        }
-        Ok(_) => Err(DaemonError::SocketPathOccupied),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err(DaemonError::Bind),
-    }
-}
-
-/// Bind `keyd_socket` and set its mode.
-/// Spec: docs/50 §3.1; tokio `net::UnixListener::bind`.
+/// Bind `keyd_socket` and set its mode. Nothing is removed first: the one
+/// stale-socket removal is the root-side preparation's
+/// (`protected_file::prepare_socket_directory`, relative to the walked and
+/// checked directory, before the drop — task R11c); a path occupied after it
+/// (only root or keyd's account could have done that) fails the bind (task
+/// R15b, docs/questions/Q-631).
+/// Spec: docs/50 §3.1 ("the daemon manages this explicitly"); tokio
+/// `net::UnixListener::bind`.
 fn bind(path: &Path) -> Result<UnixListener, DaemonError> {
-    remove_stale_socket(path)?;
     let listener = UnixListener::bind(path).map_err(|_| DaemonError::Bind)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(SOCKET_FILE_MODE))
         .map_err(|_| DaemonError::Bind)?;
@@ -399,7 +389,9 @@ where
     let first = link.connect().await.map_err(DaemonError::Audit)?;
     note(Note::AuditVerified, None);
     let gate = Arc::new(AuditGate::new(params.window));
-    gate.set_reachable(true);
+    // The gate opens on the verified connection — by the audit client, the
+    // one owner of "auditd is reachable" (task R15b, docs/questions/Q-630).
+    let attached = link.attach(Arc::clone(&gate), first);
 
     // 2. The engine: hold-down start from keyd's clock, then its thread.
     let engine = Engine::start(
@@ -421,7 +413,7 @@ where
         .map_err(DaemonError::Engine)?;
 
     // 3. The audit client (the one of ipc-audit, task R9b).
-    let audit_task = tokio::spawn(link.run(Arc::clone(&gate), first));
+    let audit_task = tokio::spawn(attached.run());
 
     // 4. The listener — `keyd_socket`, then any extra listener on the same
     // engine (tests only, docs/questions/Q-453). All are bound before any

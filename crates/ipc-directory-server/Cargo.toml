@@ -52,6 +52,10 @@ keyd = { path = "../keyd" }
 krb-proto = { path = "../krb-proto" }
 dtyp = { path = "../dtyp" }
 zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
+# `test-seams` (A-113, R15): the reused fixtures open their store by path
+# (`Store::open`); without it `cargo test -p ipc-directory-server` alone did
+# not build (task R15b, docs/questions/Q-634). Beside the normal entry.
+dirstore = { path = "../dirstore", features = ["test-seams"] }
 
 [lints]
 workspace = true

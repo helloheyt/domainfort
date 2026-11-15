@@ -269,6 +269,58 @@ fn no_auditd_refuses_to_start() {
     stack.stop();
 }
 
+/// Attack — docs/50 R50-9 ("binding to internal interfaces only"), §4.1
+/// (UDP: the same); docs/questions/Q-223 (A-57 (a)); task R15b
+/// (docs/questions/Q-632; A-114's follow-up): a kdc whose UDP and TCP
+/// listeners (127.0.0.1) lie outside every internal network of its zone
+/// table does not start — refused first, before auditd is contacted (with
+/// no auditd running the refusal is still the listener's) — and with a
+/// table that holds the listener address the same start serves. The
+/// table's match is crates/config's (`config::is_internal`).
+#[test]
+fn a_listener_outside_the_internal_networks_is_not_served() {
+    let Some(mut stack) = Stack::start(7, 7, |_| {}).unwrap() else {
+        return;
+    };
+    stack.kdcd.take().unwrap().stop().unwrap();
+    let outside = |zones: Vec<config::Network>| {
+        let mut params = kdc_params(&stack.dir.join("ka.sock"), stack.uid);
+        params.zones = kdc_daemon::zones::ZoneTable::new(zones);
+        Kdcd::start(
+            params,
+            shared_policy(7, vec![common::allow_kerberos()]),
+            &stack.keyd_socket,
+            &stack.dird_socket,
+            HeldClock::at(common::now()),
+        )
+    };
+    let ten = config::Network::new("10.0.0.0".parse().unwrap(), 8).unwrap();
+    let v6_loopback = config::Network::new("::1".parse().unwrap(), 128).unwrap();
+    for zones in [vec![ten], vec![v6_loopback], Vec::new()] {
+        let result = outside(zones.clone());
+        assert!(
+            matches!(&result, Err(m) if m.contains("outside every configured internal network")),
+            "{zones:?}: {:?}",
+            result.as_ref().err()
+        );
+    }
+    // Refused before auditd: with auditd gone the refusal is the same.
+    stack.kdc_auditd.stop();
+    let result = outside(vec![ten]);
+    assert!(
+        matches!(&result, Err(m) if m.contains("outside every configured internal network")),
+        "{:?}",
+        result.as_ref().err()
+    );
+    // Positive control: auditd back, the loopback network ⇒ served.
+    stack.kdc_auditd =
+        FakeAuditd::start_recording_as(&stack.dir.join("ka.sock"), ipc_audit::EventSource::Kdc);
+    let loopback = config::Network::new("127.0.0.0".parse().unwrap(), 8).unwrap();
+    let served = outside(vec![loopback]).unwrap();
+    served.stop().unwrap();
+    stack.stop();
+}
+
 /// Attack — task R9b (docs/questions/Q-512, Q-560; docs/50 §3.2: the source
 /// is set from the uid): an auditd whose map gives the kdc's uid another
 /// source is refused at its first `Pong`, before any event is sent; the kdc

@@ -47,7 +47,10 @@ ldap-front = { path = "../ldap-front", features = ["test-seams"] }
 audit-log = { path = "../audit-log" }
 config = { path = "../config" }
 ipc = { path = "../ipc" }
-ipc-audit = { path = "../ipc-audit" }
+# `client` (task R15b, docs/questions/Q-630): the admin world obtains the
+# proof directory-admin's `apply` takes only through the real audit client
+# from a fake auditd's `Ack` (crates/ipc-audit tests/linked, by `#[path]`).
+ipc-audit = { path = "../ipc-audit", features = ["client"] }
 ipc-keyd = { path = "../ipc-keyd" }
 ipc-directory = { path = "../ipc-directory" }
 ipc-ldap = { path = "../ipc-ldap" }

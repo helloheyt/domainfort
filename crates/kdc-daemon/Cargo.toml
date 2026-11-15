@@ -95,6 +95,12 @@ test-seams = []
 # TESTS ONLY (docs/52 C18, task R15): this crate's own tests use its test
 # seams (`test_seams`).
 kdc-daemon = { path = ".", features = ["test-seams"] }
+# TESTS ONLY (task R15b, docs/questions/Q-630): the in-process unit tests of
+# the gate wrapper (src/audit_tests.rs) open the gate as the audit client
+# does, through ipc-audit's test seams — the shared gate's link side is
+# crate-private to ipc-audit. Beside the normal entry; a dev-dependency
+# feature, never in a product build (resolver 2).
+ipc-audit = { path = "../ipc-audit", features = ["test-seams"] }
 # TESTS ONLY. The flows run the real keyd daemon and the real dird
 # (crates/keyd-daemon and crates/directory-daemon tests/support, reused by
 # `#[path]`) and reuse the kdc integration fixtures (crates/kdc/tests/common,
@@ -104,7 +110,10 @@ keyd-daemon = { path = "../keyd-daemon", features = ["test-seams"] }
 directory-daemon = { path = "../directory-daemon", features = ["test-seams"] }
 keyd = { path = "../keyd" }
 krb-crypto = { path = "../krb-crypto" }
-dirstore = { path = "../dirstore" }
+# `test-seams` (A-113, R15): the reused dird support opens its store by path
+# (`Store::open`); without it `cargo test -p kdc-daemon` alone did not build
+# (fixed in task R15b — feature unification hid it in workspace builds).
+dirstore = { path = "../dirstore", features = ["test-seams"] }
 directory-pip = { path = "../directory-pip" }
 ad-schema = { path = "../ad-schema" }
 dtyp = { path = "../dtyp" }

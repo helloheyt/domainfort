@@ -41,15 +41,26 @@
 //! task R9's `ExpectedPeer` (docs/questions/Q-510).
 //!
 //! While no verified connection exists the daemon's gate counts auditd as
-//! unreachable ([`AuditGate::set_reachable`]), so gating operations are
-//! refused (A-57; A-67 item 2: "auditd unreachable → every issuance is
-//! refused") — a cross-wired auditd is, to the daemon, an unreachable one.
+//! unreachable, so gating operations are refused (A-57; A-67 item 2:
+//! "auditd unreachable → every issuance is refused") — a cross-wired auditd
+//! is, to the daemon, an unreachable one.
+//!
+//! # The client is the only source of the gate's evidence (task R15b)
+//!
+//! Whether auditd is reachable, and what auditd acknowledged, are the facts
+//! an [`crate::AckedIntent`] rests on; their one owner is this client. The
+//! gate's link side (reachability, the batch to send, the `Ack`, a lost
+//! batch) is crate-private to ipc-audit, and only this module drives it: a
+//! daemon hands its gate and its verified start-up connection to
+//! [`AuditLink::attach`] — which marks auditd reachable **because** that
+//! connection was verified — and spawns [`AttachedLink::run`]. Nothing
+//! else can open a gate or acknowledge (docs/questions/Q-630).
 //!
 //! # Delivery (as the four copies did)
 //!
 //! * **Strict request → reply.** One request in flight (docs/50 §3.6): an
-//!   `Append` of the window's next batch ([`AuditGate::next_batch`]),
-//!   answered by `Ack` only after auditd synced it (§8.1); the reply is read
+//!   `Append` of the window's next batch, answered by `Ack` only after
+//!   auditd synced it (§8.1); the reply is read
 //!   with ipc's [`FrameReader`] under the reply bound and decoded with the
 //!   same strictness as a request (§3.3).
 //! * **Liveness.** When nothing is pending for [`HEARTBEAT`], a `Ping`; a
@@ -57,9 +68,9 @@
 //!   as unreachable until a verified connection is back (A-57;
 //!   docs/questions/Q-260 item 2).
 //! * **Reconnection** with a bounded, doubling backoff (docs/50 §3.7). The
-//!   batch in flight goes back to the front of the window
-//!   ([`AuditGate::connection_lost`]) and is resent with the same sequence
-//!   numbers (Q-252 item 7; auditd's resend check, A-101, recognises it).
+//!   batch in flight goes back to the front of the window and is resent
+//!   with the same sequence numbers (Q-252 item 7; auditd's resend check,
+//!   A-101, recognises it).
 //!
 //! What stays each daemon's own ([`LinkedGate`]): its gate wrapper (the
 //! shared [`AuditGate`] plus its event shapes — task R6), the tokio wake-up
@@ -89,7 +100,7 @@
 //!
 //! Spec: docs/50 R50-3, R50-16, R50-17, §3.2, §3.3, §3.6, §3.7, §7.5, §8.1;
 //! docs/52 §3.12 (C12); docs/questions/Q-218 (A-57), Q-252 (A-64), Q-260
-//! (A-67), Q-512 (A-112), Q-560.
+//! (A-67), Q-512 (A-112), Q-560 (A-115), Q-570 §5 item a (A-118), Q-630.
 
 use crate::channel::{
     decode_reply, encode_request, AuditReply, AuditRequest, EventSource, AUDIT_CHANNEL,
@@ -348,21 +359,80 @@ impl AuditLink {
         self.connect().await.map(drop)
     }
 
-    /// The audit client task: deliver the gate's events over `first` (the
-    /// connection verified at start), then reconnect — and verify again —
-    /// with backoff whenever it fails. Runs until the daemon aborts it at
-    /// shutdown (the daemon's gate `close`, docs/questions/Q-502).
+    /// Attach `first` — the connection [`AuditLink::connect`] verified at
+    /// start — to the daemon's `gate`: from this call on the gate counts
+    /// auditd as reachable, **because** that connection was verified (uid
+    /// and source); [`AttachedLink::run`] then delivers over it and keeps
+    /// the reachability true to the link from there on. This is how a
+    /// daemon's start opens its gate — the gate's link side is crate-private
+    /// to ipc-audit, so nothing else can (docs/questions/Q-630). A
+    /// connection verified against another expectation does not open the
+    /// gate and is never used.
+    ///
+    /// Spec: docs/50 R50-16 (auditd verified first), R50-17, §8.1; A-57,
+    /// A-67 item 2; docs/questions/Q-560 (A-115), Q-570 §5 item a, Q-630.
+    #[must_use = "the attached link must be run (spawned) to deliver the gate's events"]
+    pub fn attach<G: LinkedGate>(self, gate: Arc<G>, first: AuditConnection) -> AttachedLink<G> {
+        let first = (first.expected == self.expected).then_some(first);
+        if first.is_some() {
+            gate.audit_gate().set_reachable(true);
+        }
+        AttachedLink {
+            link: self,
+            gate,
+            first,
+        }
+    }
+}
+
+/// A daemon's gate with the audit link attached ([`AuditLink::attach`]):
+/// the gate counts auditd as reachable exactly while this link holds a
+/// verified connection, and as unreachable once it is dropped (the daemon
+/// aborted the task at stop, or never ran it).
+///
+/// Spec: docs/50 R50-17, §3.7, §8.1; A-57, A-67 item 2; docs/questions/
+/// Q-630.
+#[must_use = "the attached link must be run (spawned) to deliver the gate's events"]
+pub struct AttachedLink<G: LinkedGate> {
+    link: AuditLink,
+    gate: Arc<G>,
+    /// The verified start-up connection, until `run` takes it.
+    first: Option<AuditConnection>,
+}
+
+impl<G: LinkedGate> fmt::Debug for AttachedLink<G> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AttachedLink")
+            .field("link", &self.link)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<G: LinkedGate> Drop for AttachedLink<G> {
+    /// No link, no reachability: the gate's view of auditd ends with the
+    /// link (fail closed, A-57).
+    fn drop(&mut self) {
+        self.gate.audit_gate().set_reachable(false);
+    }
+}
+
+impl<G: LinkedGate> AttachedLink<G> {
+    /// The audit client task: deliver the gate's events over the connection
+    /// verified at start, then reconnect — and verify again — with backoff
+    /// whenever it fails. Runs until the daemon aborts it at shutdown (the
+    /// daemon's gate `close`, docs/questions/Q-502); the gate then counts
+    /// auditd as unreachable.
     ///
     /// Spec: docs/50 R50-17, §3.7, §8.1; docs/questions/Q-218 (A-57),
     /// Q-512.
-    pub async fn run<G: LinkedGate>(self, gate: Arc<G>, first: AuditConnection) {
-        // A connection verified against another expectation is never used.
-        let mut connection = (first.expected == self.expected).then_some(first);
+    pub async fn run(mut self) {
+        let mut connection = self.first.take();
+        let gate = Arc::clone(&self.gate);
         let mut backoff = BACKOFF_MIN;
         loop {
             let mut current = match connection.take() {
                 Some(current) => current,
-                None => match self.connect().await {
+                None => match self.link.connect().await {
                     Ok(current) => {
                         gate.link_restored();
                         backoff = BACKOFF_MIN;
