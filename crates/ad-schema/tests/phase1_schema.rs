@@ -8,7 +8,10 @@
 //! 2.2.16; Q-090 (rdn_att_len); Q-091 item 10 (printable ASCII).
 
 use ad_schema::flags::{group_type, user_account_control};
-use ad_schema::{phase1, Form, Phase1Schema, ATTRIBUTES, CLASSES, SECRET_ATTRIBUTES};
+use ad_schema::{
+    phase1, Form, Phase1Schema, ATTRIBUTES, CLASSES, HOST_ADDRESS, HOST_ADDRESS_OCTETS,
+    INTERNAL_ATTRTYP_FIRST, SECRET_ATTRIBUTES,
+};
 use dirstore::{
     AttrClass, AttrId, Link, Multiplicity, Storage, ValueConstraint, ValueRange, ValueSyntax,
 };
@@ -466,7 +469,14 @@ fn class_definitions_per_docs46_4_4() {
         assert_eq!(d.instantiable, instantiable, "{name}");
         assert_eq!(d.rdn_attr, id(&p1, rdn), "{name}");
         assert_eq!(d.must, attrs(must), "{name}");
-        assert_eq!(d.may, attrs(may), "{name}");
+        // The internal host-address attribute (task DN6) is in computer's
+        // `may` beside its AD attributes — and in no other class's.
+        // Source: docs/questions/Q-614 item 1 (b), Q-992; docs/54 §5.2.
+        let mut want_may = attrs(may);
+        if name == "computer" {
+            want_may.push(HOST_ADDRESS);
+        }
+        assert_eq!(d.may, want_may, "{name}");
         assert_eq!(d.poss_superiors, classes(poss), "{name}");
         assert_eq!(d.nc_root, nc_root, "{name}");
     }
@@ -478,10 +488,12 @@ fn dirstore_must_and_may_are_within_classatts() {
     // attributes (+ the allowed Secret ones), minus the one deliberate
     // omission (ou on organizationalPerson); so every dirstore must / may
     // attribute of a class is in its CLASSATTS ([MS-ADTS] 3.1.1.4.2).
+    // The internal host-address attribute (task DN6) is outside the AD
+    // model by design — no attributeID, no CLASSATTS entry (Q-992).
     let p1 = p1();
     for c in p1.classes() {
         let d = p1.schema().class(c.id).unwrap();
-        for a in d.must.iter().chain(&d.may) {
+        for a in d.must.iter().chain(&d.may).filter(|a| **a != HOST_ADDRESS) {
             assert!(
                 c.class_attributes.contains(a),
                 "{} allows {}",
@@ -489,5 +501,49 @@ fn dirstore_must_and_may_are_within_classatts() {
                 p1.attribute(*a).unwrap().entry.ldap_display_name
             );
         }
+    }
+}
+
+/// The internal host-address attribute (task DN6): in the dirstore schema
+/// with exactly the definition of crate `internal` — OctetString, multi-
+/// valued, 4 octets per value, Normal, stored, not unique — an ATTRTYP from
+/// the internal range, and in none of the AD lookups (no lDAPDisplayName, no
+/// AttributeInfo), so nothing that names attributes on the wire reaches it.
+/// Source: [MS-ADTS] v20261026 3.1.1.2.6 ("[0xFFFF0000..0xFFFFFFFF]
+/// Reserved for internal use (never appear on the wire)"); RFC 1035 §3.4.1
+/// (a 32-bit address); docs/54 §5.2; docs/questions/Q-614 item 1, Q-992.
+#[test]
+fn the_host_address_attribute_is_internal() {
+    let p1 = p1();
+    const { assert!(HOST_ADDRESS.0 >= INTERNAL_ATTRTYP_FIRST) };
+    assert_eq!(INTERNAL_ATTRTYP_FIRST, 0xFFFF_0000);
+    let d = p1
+        .schema()
+        .attribute(HOST_ADDRESS)
+        .expect("in the dirstore schema");
+    assert_eq!(d.syntax, ValueSyntax::OctetString);
+    assert_eq!(d.multiplicity, Multiplicity::MultiValued);
+    assert_eq!(HOST_ADDRESS_OCTETS, 4);
+    assert_eq!(d.max_value_len, 4);
+    assert_eq!(d.range, Some(ValueRange { lower: 4, upper: 4 }));
+    assert_eq!(d.class, AttrClass::Normal);
+    assert_eq!(d.storage, Storage::Stored);
+    assert_eq!(d.link, None);
+    assert_eq!(d.constraint, None);
+    assert!(!d.unique);
+    // Not an AD attribute: no AttributeInfo, not among the 35, no name.
+    assert!(p1.attribute(HOST_ADDRESS).is_none());
+    assert!(p1.attributes().all(|a| a.id != HOST_ADDRESS));
+    assert!(p1.attributes().all(|a| a.id.0 < 0x8000_0000));
+    assert_eq!(p1.attribute_by_name("ipHostNumber"), None);
+    // Only computer may hold it.
+    for c in p1.classes() {
+        let holds = p1.schema().class(c.id).unwrap().may.contains(&HOST_ADDRESS);
+        assert_eq!(
+            holds,
+            c.entry.ldap_display_name == "computer",
+            "{}",
+            c.entry.ldap_display_name
+        );
     }
 }

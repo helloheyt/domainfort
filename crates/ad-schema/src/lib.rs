@@ -15,6 +15,12 @@
 //!   only), organizationalUnit, container, person, organizationalPerson,
 //!   user, computer, group — with their classSchema values from [MS-ADSC]
 //!   and the dirstore definitions of docs/46 §4.4 (R46-9).
+//! - **One internal attribute** ([`HOST_ADDRESS`], module `internal`; task
+//!   DN6): a computer's DNS host addresses (docs/54 §5.2), stored by dirstore
+//!   and allowed on computer, with an ATTRTYP from the range [MS-ADTS]
+//!   3.1.1.2.6 reserves "for internal use (never appear on the wire)" — in
+//!   none of the AD tables or lookups, so no LDAP request, PDP resource or
+//!   wire format can name it (docs/questions/Q-614 item 1 (b), Q-992).
 //! - **Identifiers computed, not tabled**: `AttrId` / `ClassId` =
 //!   [`make_attid`]`(attributeID | governsID)` — `MakeAttid` over
 //!   `NewPrefixTable()` exactly as [MS-DRSR] 5.16.4 defines them; an OID
@@ -55,6 +61,7 @@ mod attributes;
 mod classes;
 mod error;
 pub mod flags;
+mod internal;
 mod schema;
 
 pub use attid::{make_attid, OidError, MAX_OID_LEN};
@@ -63,6 +70,11 @@ pub use attributes::{
 };
 pub use classes::{ClassEntry, CLASSES, STRUCTURAL_CLASS};
 pub use error::{Error, LookupError};
+// The internal host-address attribute (task DN6; docs/questions/Q-992).
+pub use internal::{
+    host_address_definition, HOST_ADDRESS, HOST_ADDRESS_HOLDERS, HOST_ADDRESS_OCTETS,
+    INTERNAL_ATTRTYP_FIRST,
+};
 pub use schema::{
     phase1, AttributeInfo, ChainClass, ClassChain, ClassInfo, Phase1Schema, PropertySet,
 };

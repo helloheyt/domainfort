@@ -77,6 +77,29 @@
 //! (interpretations in docs/questions/Q-980..Q-984). No other
 //! implementation was consulted or recalled (AGENTS.md §1-3).
 //!
+//! # DNS: the host record, its tier, and the zone projection (task DN6)
+//!
+//! A member host's DNS addresses are an attribute of its own computer object
+//! (module `host`; docs/54 §5.2, decision A-119 on docs/questions/Q-614):
+//! [`host_label`] derives its one LDH label from its sAMAccountName and
+//! dNSHostName ([MS-ADTS] 3.1.1.5.3.1.1.2), so the name comes from the
+//! identity, never from a message. `Pip::object_tier` of
+//! `Resource::Dns { zone, record: Some(k) }` is the tier of the one computer
+//! owning `k` (docs/54 §5.6; Q-614 item 6) — so a computer that is not Tier0
+//! may update its own record. [`DirectoryView::zone_projection`] (module
+//! `zone`) builds dnsd's `dns_zone::ZoneImage` from one snapshot: SOA / NS /
+//! SRV synthesized, the DC's and the usable member hosts' A records, SERIAL
+//! from the `dns-zone-serial` counter, and the instant the image holds until
+//! ([`ZoneProjection::valid_until`]). Written only from docs/54 (§3.1, §4.4,
+//! §5.1-§5.6), docs/questions/Q-613, Q-614, Q-616, Q-618, PENDING-OWNER
+//! A-111, A-119, the pinned [MS-ADTS] v20261026 3.1.1.2.6, 3.1.1.5.3.1.1.2,
+//! [MS-ADSC] v20240423 2.21, 2.67, [MS-ADA1] v20180912 2.315, RFC 1035
+//! §2.3.1, §2.3.3, §2.3.4, §3.4.1 and RFC 2136 §3.6, §7.11, §7.12 (opened
+//! in-session from tools/spec-pin/cache/, SHA-256 verified), and this
+//! repository's crates dns-zone, parse-dns and config; interpretations in
+//! docs/questions/Q-991..Q-994. No other implementation was consulted or
+//! recalled (AGENTS.md §1-3).
+//!
 //! # Residuals and follow-ups (documented, not hidden)
 //!
 //! - The tier map is trusted as given: verifying the signed policy store
@@ -119,6 +142,7 @@
 mod error;
 mod facts;
 mod groups;
+mod host;
 mod names;
 mod naming;
 mod pep;
@@ -129,10 +153,18 @@ mod tier;
 mod time;
 mod view;
 mod visible;
+mod zone;
 
 pub use error::ViewError;
 pub use facts::{PrincipalFacts, PrincipalKind};
 pub use groups::{MemberChange, MAX_EXPANDED_GROUPS, MAX_NESTING_DEPTH};
+// A computer's DNS host record: the rules its writer, the PIP and the zone
+// projection share (task DN6; docs/54 §5.2-§5.5).
+pub use host::{
+    host_address_of, host_address_value, host_label, registrable, zone_serial,
+    DNS_ZONE_SERIAL_COUNTER, DNS_ZONE_SERIAL_END_EXCLUSIVE, DNS_ZONE_SERIAL_FIRST, HOST_ADDRESS,
+    MAX_HOST_ADDRESSES,
+};
 pub use naming::{NamingContext, MAX_NC_LABELS, NC_RDN_ATTRIBUTE};
 pub use pep::PepView;
 pub use salt::{account_salt, AccountKind, SaltError};
@@ -143,3 +175,10 @@ pub use visible::{
     hides, GateFault, Unseen, UnseenCause, Visibility, VisibilityGate, VisibilityProof,
     VisibilityRule, VisibleObject,
 };
+// The zone projection (task DN6; docs/54 §4.4): the one function from the
+// directory to dnsd's zone image, for dird's DNS channel (task DN10a).
+pub use zone::{ZoneParameters, ZoneProjection, ZoneProjectionError, MAX_ZONE_WALK_OBJECTS};
+// The zone crate's types the projection's API speaks in, so its consumer
+// (dird, task DN10a) names them through this crate.
+pub use dns_zone::{KpasswdService, SoaParameters, ZoneImage, ZoneImageError};
+pub use parse_dns::Name as DnsName;

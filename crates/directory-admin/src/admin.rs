@@ -78,7 +78,7 @@ use crate::config::{AdminConfig, ConfigError, CHANGE_SEQ_COUNTER, RID_COUNTER};
 use crate::descriptor::new_object_sd;
 use crate::effects::BuiltPlan;
 use crate::ids::{ClassIds, Ids};
-use crate::invariants::{End, Invariants, LinkProof};
+use crate::invariants::{End, HostZone, Invariants, LinkProof};
 use crate::names;
 use crate::operation::{
     CompletePasswordSet, CreateComputer, CreateContainerLike, CreateGroup, CreateUser, LookupKey,
@@ -385,7 +385,14 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         schema: &Phase1Schema,
         rng: R,
     ) -> Result<DirectoryAdmin<R>, ConfigError> {
-        let invariants = Invariants::new(schema, config.protected().service_objects.clone())?;
+        // Host records (task DN6): only when DNS self-updates are enabled,
+        // in the naming context's zone (A-53; docs/54 §5.3, §5.5).
+        let hosts = config.dns_registration().map(|dns| HostZone {
+            zone: config.naming_context().dns_name(),
+            networks: dns.networks().to_vec(),
+        });
+        let invariants =
+            Invariants::new(schema, config.protected().service_objects.clone(), hosts)?;
         Ok(DirectoryAdmin {
             config,
             ids: Ids::resolve(schema)?,

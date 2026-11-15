@@ -171,6 +171,33 @@ impl<'c, 'v, 'a> Cx<'c, 'v, 'a> {
         )
     }
 
+    /// The checks' inputs of a DNS self-update (task DN6): the same view and
+    /// policy, the transport `Dns`, and **no** transport security — what a
+    /// GSS-TSIG signed UPDATE has: the message is signed, the transport is
+    /// neither encrypted nor sealed nor bound (RFC 8945 §4.3 signs, it does
+    /// not encrypt). `DnsUpdate` has no transport floor (A-22), so this
+    /// truthful value refuses nothing; no policy can mistake it for a
+    /// protected channel.
+    /// Spec: pdp `required_sec` (A-22: "DnsUpdate: NO transport floor");
+    /// docs/40 §2 (D166); docs/54 §4.5 step 5; docs/questions/Q-991 item 8.
+    pub(crate) fn dns(
+        config: &'c AdminConfig,
+        ids: &'c Ids,
+        view: &'v DirectoryView<'a>,
+        policy: &'v PolicySnapshot,
+        now: &KerberosTime,
+    ) -> Result<Cx<'c, 'v, 'a>, Stop> {
+        Cx::on(
+            config,
+            ids,
+            view,
+            policy,
+            now,
+            Transport::Dns,
+            TransportSec::NONE,
+        )
+    }
+
     /// The inputs on `transport` with `transport_sec`.
     /// Spec: docs/11 §1 (`Context.transport`, `transport_sec`).
     fn on(

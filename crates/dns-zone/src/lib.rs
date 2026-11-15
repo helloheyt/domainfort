@@ -61,7 +61,8 @@ mod srv;
 
 pub use answer::{answer, Forward, Silence, Verdict, ZoneState};
 pub use image::{
-    is_ldh_label, HostRecordParts, SoaParameters, ZoneImage, ZoneImageError, ZoneImageParts,
+    is_host_address, is_ldh_label, HostRecordParts, SoaParameters, ZoneImage, ZoneImageError,
+    ZoneImageParts,
 };
 pub use parse_dns::Transport;
 pub use reply::{udp_reply_limit, Reply};

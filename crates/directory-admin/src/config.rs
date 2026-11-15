@@ -8,12 +8,22 @@
 
 use core::time::Duration;
 use std::collections::BTreeSet;
+use std::net::IpAddr;
 
+use config::Network;
 use directory_pip::NamingContext;
 use dirstore::NodeId;
 use dtyp::{Guid, Sid};
 use ipc_audit::MAX_APPROVERS;
 use krb_proto::Realm;
+
+/// The zone serial counter (task DN6): its name and range, defined once in
+/// crate directory-pip (the zone projection reads it) and created, like the
+/// RID and change-seq counters, by the provisioning session only (A-83).
+/// Spec: docs/54 §5.4; RFC 2136 §3.6, §7.11; A-75; A-83.
+pub use directory_pip::{
+    DNS_ZONE_SERIAL_COUNTER, DNS_ZONE_SERIAL_END_EXCLUSIVE, DNS_ZONE_SERIAL_FIRST,
+};
 
 /// The name of the RID counter. Created by `provision domain` only (A-83:
 /// "counters created only by `provision domain`"), never by this crate.
@@ -108,6 +118,10 @@ pub enum ConfigError {
     /// The per-requester cap of open pending requests is zero or above
     /// `MAX_REQUESTS_PER_REQUESTER` (task D2-c).
     RequesterCap,
+    /// The DNS registration networks are empty, or one is not IPv4 (task
+    /// DN6: a host record holds IPv4 addresses only — AAAA waits for RFC
+    /// 3596, docs/54 §3.1).
+    DnsNetworks,
 }
 
 impl core::fmt::Display for ConfigError {
@@ -120,7 +134,41 @@ impl core::fmt::Display for ConfigError {
             ConfigError::Schema => "schema lacks a definition the admin plane needs",
             ConfigError::RequestLifetime => "pending request lifetime is out of range",
             ConfigError::RequesterCap => "per-requester pending request cap is out of range",
+            ConfigError::DnsNetworks => "DNS registration networks are empty or not IPv4",
         })
+    }
+}
+
+/// What a host may register in its own DNS host record (task DN6): the
+/// networks its addresses must lie in (`dns_registrable_networks`, docs/54
+/// §5.5; Q-614 item 8 — dird's configuration, defaulting to its
+/// `internal_networks`). Without it, the PEP refuses every self-update and
+/// the write checker refuses every host address (fail closed).
+/// Spec: docs/54 §5.5; docs/questions/Q-614 item 8; A-114.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsRegistration {
+    networks: Vec<Network>,
+}
+
+impl DnsRegistration {
+    /// The registration rule over `networks`: at least one, all IPv4.
+    ///
+    /// # Errors
+    /// [`ConfigError::DnsNetworks`].
+    ///
+    /// Spec: docs/54 §3.1 (A only; AAAA waits for RFC 3596), §5.5.
+    pub fn new(networks: Vec<Network>) -> Result<DnsRegistration, ConfigError> {
+        let ipv4 = |n: &Network| matches!(n.address(), IpAddr::V4(_));
+        if networks.is_empty() || !networks.iter().all(ipv4) {
+            return Err(ConfigError::DnsNetworks);
+        }
+        Ok(DnsRegistration { networks })
+    }
+
+    /// The registrable networks.
+    #[must_use]
+    pub fn networks(&self) -> &[Network] {
+        &self.networks
     }
 }
 
@@ -139,6 +187,8 @@ pub struct AdminConfig {
     naming_context: NamingContext,
     node_id: NodeId,
     protected: ProtectedObjects,
+    /// The DNS self-update rule (task DN6); `None` ⇒ none is accepted.
+    dns: Option<DnsRegistration>,
 }
 
 impl AdminConfig {
@@ -183,7 +233,24 @@ impl AdminConfig {
             naming_context,
             node_id,
             protected,
+            dns: None,
         })
+    }
+
+    /// This configuration with DNS self-updates enabled under `dns` (task
+    /// DN6; docs/54 §5.5). Without it, `DnsSelfUpdate` is refused and no
+    /// host address can be written (fail closed).
+    /// Spec: docs/54 §5.5; docs/questions/Q-614 item 8.
+    #[must_use]
+    pub fn with_dns_registration(mut self, dns: DnsRegistration) -> AdminConfig {
+        self.dns = Some(dns);
+        self
+    }
+
+    /// The DNS self-update rule, if enabled.
+    #[must_use]
+    pub fn dns_registration(&self) -> Option<&DnsRegistration> {
+        self.dns.as_ref()
     }
 
     /// The ticket-age threshold (R51-10).

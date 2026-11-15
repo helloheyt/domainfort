@@ -71,6 +71,11 @@ policy-store = { path = "../policy-store" }
 # krb-proto, ipc-keyd, zeroize, sha2 and, on Linux, rustix — all already in
 # dird's graph); no store, no crypto profile.
 ipc-dird-admin = { path = "../ipc-dird-admin" }
+# Task DN6: the registrable networks of a host record (docs/54 §5.5;
+# Q-614 item 8) are `config::Network` values matched by its one matcher
+# (A-114: "one implementation for address matching"). Our own leaf crate,
+# zero dependencies, already in dird's graph.
+config = { path = "../config" }
 # SHA-256 of a pending key-operation request's operation digest (task A10,
 # docs/51 §5.6; docs/questions/Q-420). RustCrypto, OD-9; already in the
 # workspace lock and already in dird's graph (dirstore links it). License:

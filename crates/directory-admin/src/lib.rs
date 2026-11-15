@@ -199,6 +199,25 @@
 //! interpretations in docs/questions/Q-963. No other implementation was
 //! consulted or recalled (AGENTS.md §1-3).
 
+//! # `DnsSelfUpdate` (task DN6; docs/54 §4.5, §5; decision A-119)
+//!
+//! A member host's change of its own DNS host record (module `dns_update`):
+//! [`DirectoryAdmin::dns_update_host`] decides the signer's own host from
+//! the identity keyd verified (Subject, own computer, host name, PDP
+//! `DnsUpdate` with the owner's tier), [`DirectoryAdmin::prepare_dns_self_update`]
+//! judges the new address set, and [`DirectoryAdmin::apply_dns_self_update`]
+//! writes it — after auditd acknowledged the decision — as a `CheckedWrite`
+//! of the one checker. The record is an attribute of the owner (ad-schema
+//! `HOST_ADDRESS`); its holder rule (a computer named `<computerName>.<zone>`,
+//! one LDH label; at most eight registrable addresses) is a state rule of the
+//! checker; and the commit takes the `dns-zone-serial` counter in the same
+//! transaction for **every** write that changes the zone's content — a host
+//! record's, and an admin write to an object holding one (RFC 2136 §3.6).
+//! The provisioning session creates that counter with the other two (A-83).
+//! Written only from the sources listed in module `dns_update`;
+//! interpretations in docs/questions/Q-991..Q-994. No other implementation
+//! was consulted or recalled (AGENTS.md §1-3).
+
 mod admin;
 mod apply;
 mod audit;
@@ -206,6 +225,7 @@ mod change_password;
 mod checks;
 mod config;
 mod descriptor;
+mod dns_update;
 mod effects;
 mod ids;
 mod invariants;
@@ -233,10 +253,18 @@ pub use change_password::{
     USER_CHANGE_PASSWORD,
 };
 pub use config::{
-    AdminConfig, ConfigError, ProtectedObjects, CHANGE_SEQ_COUNTER, CHANGE_SEQ_END_EXCLUSIVE,
-    CHANGE_SEQ_FIRST, MAX_QUORUM, MIN_QUORUM, RID_COUNTER, RID_END_EXCLUSIVE, RID_FIRST,
+    AdminConfig, ConfigError, DnsRegistration, ProtectedObjects, CHANGE_SEQ_COUNTER,
+    CHANGE_SEQ_END_EXCLUSIVE, CHANGE_SEQ_FIRST, DNS_ZONE_SERIAL_COUNTER,
+    DNS_ZONE_SERIAL_END_EXCLUSIVE, DNS_ZONE_SERIAL_FIRST, MAX_QUORUM, MIN_QUORUM, RID_COUNTER,
+    RID_END_EXCLUSIVE, RID_FIRST,
 };
 pub use descriptor::{new_object_descriptor, DescriptorError};
+// A host's change of its own DNS host record (task DN6; docs/54 §4.5): the
+// one write path of the dynamic records, for dird's DNS PEP (task DN8).
+pub use dns_update::{
+    AppliedDnsUpdate, DnsHost, DnsHostUpdate, DnsUpdateFailure, DnsUpdateRefusal, DnsUpdateTicket,
+    PreparedDnsUpdate, RecordedDnsUpdate,
+};
 // The write invariants' provisioning session (docs/52 R13): the only way
 // `provision domain` writes the new domain, and the only place the named
 // provisioning exceptions exist.

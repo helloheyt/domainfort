@@ -22,6 +22,14 @@
 //! a state rule of the directory, not only a key that keyd refuses to make
 //! (docs/52 R2b follow-up; docs/questions/Q-541; task K9, Q-972).
 //!
+//! A host record (task DN6) is a state rule too ([`check_host_record`]):
+//! the internal host-address attribute (ad-schema `HOST_ADDRESS`) only on
+//! an online computer or the DC account whose names give one LDH host label
+//! `<computerName>.<zone>`, with at most eight registrable addresses — never
+//! on a service object, krbtgt, a user, and never without a configured zone.
+//! No generic change writes it (it is not [`modifiable`]): only the checked
+//! host-record write of crate::invariants.
+//!
 //! Spec: [MS-SAMR] v20260427 (pinned, sha256 083fe00a…8a4e) 3.1.1.6 items
 //! 8-14, 20-24, 3.1.1.8.9; docs/51 §4.3 step 5, §5.2 rows 1-8, §11 (decided
 //! A-79 / docs/questions/Q-298); docs/46 §4.4, §5.4, §8.2; docs/47 §4.2
@@ -69,6 +77,7 @@ fn known(ids: &Ids, id: AttrId) -> bool {
         ids.service_principal_name,
         ids.dns_host_name,
         ids.description,
+        ids.host_address,
     ]
     .contains(&id)
 }
@@ -131,9 +140,16 @@ pub(crate) fn check_new(
     obj: &Object,
     class: ClassId,
     role: Option<ProvisioningRole>,
+    hosts: Option<&HostZone>,
 ) -> Result<(), V> {
     if obj.attributes.iter().any(|a| !known(ids, a.id)) {
         return Err(V::NotModifiable);
+    }
+    // A host record (task DN6): only the holder the rule admits (module
+    // `host_record`, below), whatever else the class rules say.
+    if let Some(values) = obj.attribute(ids.host_address) {
+        let values: Vec<&[u8]> = values.values.iter().map(|v| v.value.as_slice()).collect();
+        check_host_record(ids, obj, class, role, &values, hosts)?;
     }
     // A name from which a reserved key-set purpose derives is the one
     // object's alone that claims it (docs/52 R2b follow-up; Q-541 for the
@@ -459,6 +475,102 @@ fn check_group(ids: &Ids, obj: &Object, role: Option<ProvisioningRole>) -> Resul
         return Err(V::Value);
     }
     check_description(ids, obj)
+}
+
+/// The zone a host record lives in and the networks its addresses must lie
+/// in (task DN6): the naming context's DNS name (A-53) and the configured
+/// registrable networks. The online PEP's checker has it when DNS
+/// self-updates are enabled; the provisioning session has none yet (task
+/// DN13 adds the DC's record) — without it no host address can be written
+/// (fail closed).
+/// Spec: docs/54 §5.3, §5.5; docs/questions/Q-614 items 3, 8.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostZone {
+    /// The zone (the NC's DNS name).
+    pub(crate) zone: String,
+    /// The registrable networks (IPv4, at least one).
+    pub(crate) networks: Vec<config::Network>,
+}
+
+/// The rule of a host record (task DN6; docs/54 §5.2-§5.5; Q-614 items 2,
+/// 3, 8) — the state rule every write that leaves host addresses on an
+/// object keeps, whichever path writes it:
+///
+/// - the holder is a computer, either an online one (no claim) or the DC
+///   account (its record comes from provisioning, docs/54 §3.1) — never a
+///   service object, krbtgt or the NC root (`Exception`);
+/// - the zone is known ([`HostZone`]) — otherwise nothing is written
+///   (`Value`);
+/// - its names pass the host-name rule: the computerName is one RFC 1035
+///   §2.3.1 LDH label and dNSHostName is exactly `<computerName>.<zone>`
+///   without case (directory-pip `host_label`; [MS-ADTS] 3.1.1.5.3.1.1.2) —
+///   otherwise `Name`;
+/// - at most `MAX_HOST_ADDRESSES` values (the image's bound), each four
+///   octets (RFC 1035 §3.4.1) holding an address that is registrable:
+///   never loopback, unspecified or multicast, inside a registrable network
+///   (directory-pip `registrable`) — otherwise `Value`. Distinct by the
+///   store's set semantics (one spelling per address).
+///
+/// An empty value set is no record: nothing to judge.
+/// Spec: docs/54 §5.2, §5.3, §5.5; docs/questions/Q-614 items 2, 3, 8;
+/// [MS-ADTS] v20261026 3.1.1.5.3.1.1.2; RFC 1035 §2.3.1, §3.4.1.
+pub(crate) fn check_host_record(
+    ids: &Ids,
+    obj: &Object,
+    class: ClassId,
+    role: Option<ProvisioningRole>,
+    values: &[&[u8]],
+    hosts: Option<&HostZone>,
+) -> Result<(), V> {
+    if values.is_empty() {
+        return Ok(());
+    }
+    let hosts = check_host_holder(ids, obj, class, role, hosts)?;
+    check_host_values(values, hosts)
+}
+
+/// The holder part of [`check_host_record`]: a computer, online or the DC
+/// account; the zone known; its names passing the host-name rule. Returns
+/// the zone.
+/// Spec: as [`check_host_record`].
+pub(crate) fn check_host_holder<'h>(
+    ids: &Ids,
+    obj: &Object,
+    class: ClassId,
+    role: Option<ProvisioningRole>,
+    hosts: Option<&'h HostZone>,
+) -> Result<&'h HostZone, V> {
+    if class != ids.computer.id {
+        return Err(V::NotModifiable);
+    }
+    match role {
+        None | Some(ProvisioningRole::DcAccount) => {}
+        Some(_) => return Err(V::Exception),
+    }
+    let hosts = hosts.ok_or(V::Value)?;
+    let sam = text(obj, ids.sam_account_name)?;
+    let dns_host_name = text(obj, ids.dns_host_name)?;
+    if directory_pip::host_label(sam, dns_host_name, &hosts.zone).is_none() {
+        return Err(V::Name);
+    }
+    Ok(hosts)
+}
+
+/// The value part of [`check_host_record`]: at most `MAX_HOST_ADDRESSES`
+/// values, each four octets holding a registrable address.
+/// Spec: as [`check_host_record`].
+pub(crate) fn check_host_values(values: &[&[u8]], hosts: &HostZone) -> Result<(), V> {
+    if values.len() > directory_pip::MAX_HOST_ADDRESSES {
+        return Err(V::Value);
+    }
+    let allowed = |value: &&[u8]| {
+        directory_pip::host_address_of(value)
+            .is_some_and(|address| directory_pip::registrable(address, &hosts.networks))
+    };
+    if !values.iter().all(allowed) {
+        return Err(V::Value);
+    }
+    Ok(())
 }
 
 /// The rule of one change (attribute `id` replaced by `values`) of the

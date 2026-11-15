@@ -48,6 +48,18 @@ keyd-types = { path = "../keyd-types" }
 krb-proto = { path = "../krb-proto" }
 # GUID, SID and SECURITY_DESCRIPTOR.
 dtyp = { path = "../dtyp" }
+# Task DN6 (docs/54 §4.4; decision A-119): the zone projection builds dnsd's
+# `ZoneImage` with the zone crate's own validating constructor, and the host
+# rules (LDH label, allowed address, ≤ 8 addresses) are the zone crate's —
+# one statement of each (docs/52 C14). Our own leaf crates, no I/O: dns-zone
+# links only parse-dns, which links nothing.
+dns-zone = { path = "../dns-zone" }
+# The DNS names of the image (apex, RNAME) — the type `ZoneImage` takes.
+parse-dns = { path = "../parse-dns" }
+# The one implementation of address-in-network matching (`Network::contains`,
+# A-114: "one implementation for address matching") for the registrable
+# networks of a host record (docs/54 §5.5; Q-614 item 8). Zero dependencies.
+config = { path = "../config" }
 
 [dev-dependencies]
 # TESTS ONLY (docs/52 C18, task R15; A-113): the tests open their stores by

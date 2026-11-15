@@ -19,12 +19,11 @@ use pdp::Instant;
 const FILETIME_TICKS_PER_SECOND: i64 = 10_000_000;
 
 /// Seconds since 1970-01-01T00:00:00Z: the PDP's explicit `Instant`
-/// (docs/11 §1, P9). `None` before 1970 (the caller fails closed).
+/// (docs/11 §1, P9). `None` before 1970 (the caller fails closed). The
+/// conversion is krb-proto's one definition (A-169; Q-995 item 5a).
+/// Spec: RFC 4120 §5.2.3.
 pub(crate) fn instant(now: &KerberosTime) -> Option<Instant> {
-    let epoch = KerberosTime::new(1970, 1, 1, 0, 0, 0).ok()?;
-    let seconds =
-        keyd_types::kerberos_time_seconds(now) - keyd_types::kerberos_time_seconds(&epoch);
-    u64::try_from(seconds).ok().map(Instant)
+    krb_proto::kerberos_time_to_unix(now).map(Instant)
 }
 
 /// The DSTIME of `now` (whenCreated / whenChanged). Spec: [MS-DRSR] 5.51 as

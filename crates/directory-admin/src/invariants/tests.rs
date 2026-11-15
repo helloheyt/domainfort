@@ -322,7 +322,7 @@ fn the_commit_takes_the_rid_and_the_change_seq() {
     let t = TempStore::new("allocate");
     let mut txn = t.store.begin_write().unwrap();
     begin(&mut txn);
-    let inv = Invariants::new(&p1(), BTreeSet::new()).unwrap();
+    let inv = Invariants::new(&p1(), BTreeSet::new(), None).unwrap();
     let seq = txn.counter(CHANGE_SEQ_COUNTER).unwrap().unwrap().next_value;
     let checked = inv
         .check_create(
@@ -353,7 +353,7 @@ fn a_checked_write_is_stale_after_another_write() {
     let t = TempStore::new("stale");
     let mut txn = t.store.begin_write().unwrap();
     begin(&mut txn);
-    let inv = Invariants::new(&p1(), BTreeSet::new()).unwrap();
+    let inv = Invariants::new(&p1(), BTreeSet::new(), None).unwrap();
     let first = inv
         .check_create(&txn, ou(&ids, guid(30), guid(1), "A"), None, &[])
         .unwrap();
@@ -384,7 +384,7 @@ fn a_link_proof_of_another_state_is_not_accepted() {
         s.create(None, group(&ids, guid(41), guid(OU), "g2", &[]))
             .unwrap();
     }
-    let inv = Invariants::new(&p1(), BTreeSet::new()).unwrap();
+    let inv = Invariants::new(&p1(), BTreeSet::new(), None).unwrap();
     let g1 = txn.get_object(guid(40)).unwrap().unwrap();
     let g2 = txn.get_object(guid(41)).unwrap().unwrap();
     let group_type = GROUP_TYPE_SECURITY_ENABLED | GROUP_TYPE_ACCOUNT_GROUP;
@@ -457,7 +457,7 @@ fn the_closure_bound_holds_at_the_write() {
     for n in 1..=1022 {
         beneath(&mut txn, n);
     }
-    let inv = Invariants::new(&p1(), BTreeSet::new()).unwrap();
+    let inv = Invariants::new(&p1(), BTreeSet::new(), None).unwrap();
     // 1022 groups + the new one = 1023 ≤ 1024.
     inv.check_create(
         &txn,
@@ -527,7 +527,7 @@ fn structural_objects_and_unwritten_attributes_are_refused() {
         )
         .unwrap();
     }
-    let inv = Invariants::new(&p1(), BTreeSet::new()).unwrap();
+    let inv = Invariants::new(&p1(), BTreeSet::new(), None).unwrap();
     let uac = |v: u32| {
         vec![AttributeChange::Replace {
             id: ids.user_account_control,
@@ -678,7 +678,7 @@ fn the_admin_service_name_is_the_admin_service_objects_alone() {
         assert_eq!(StoreRead::object(&txn, guid(refused)).unwrap(), None);
     }
     assert!(StoreRead::object(&txn, guid(74)).unwrap().is_some());
-    let inv = Invariants::new(&p1(), BTreeSet::new()).unwrap();
+    let inv = Invariants::new(&p1(), BTreeSet::new(), None).unwrap();
     let renamed = inv.check_modify(
         &txn,
         guid(76),
@@ -781,4 +781,281 @@ fn the_change_password_service_name_is_its_objects_alone() {
     }
     assert!(StoreRead::object(&txn, guid(82)).unwrap().is_some());
     assert!(StoreRead::object(&txn, guid(83)).unwrap().is_some());
+}
+
+/// Task DN6; docs/54 §5.4, R54-12; A-83: the provisioning session creates
+/// the zone serial counter with the other two (first value 1), and refuses
+/// a store that already holds it.
+#[test]
+fn provisioning_creates_the_zone_serial_counter() {
+    let t = TempStore::new("zone-serial");
+    {
+        let mut txn = t.store.begin_write().unwrap();
+        begin(&mut txn);
+        let state = txn.counter(DNS_ZONE_SERIAL_COUNTER).unwrap().unwrap();
+        assert_eq!(state.first_value, 1);
+        assert_eq!(state.next_value, 1);
+        assert_eq!(state.end_exclusive, u64::MAX);
+        txn.commit().unwrap();
+    }
+    let t = TempStore::new("zone-serial-only");
+    {
+        let mut txn = t.store.begin_write().unwrap();
+        txn.create_counter(DNS_ZONE_SERIAL_COUNTER, 1, u64::MAX)
+            .unwrap();
+        txn.commit().unwrap();
+    }
+    let mut txn = t.store.begin_write().unwrap();
+    assert!(matches!(
+        Provisioning::begin(&mut txn, &p1(), WALL, NODE),
+        Err(ProvisioningError::NotEmpty)
+    ));
+}
+
+/// The zone of the host-record tests: example.test, 192.0.2.0/24 (this
+/// project's test data).
+fn zone() -> HostZone {
+    HostZone {
+        zone: "example.test".into(),
+        networks: vec![config::Network::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 0)),
+            24,
+        )
+        .unwrap()],
+    }
+}
+
+/// A computer named `name` with dNSHostName `host` (online shape, WT).
+fn host_computer(ids: &Ids, g: Guid, name: &str, host: &str) -> NewObject {
+    let mut c = computer(ids, g, guid(OU), name, ADS_UF_WORKSTATION_TRUST_ACCOUNT);
+    for (id, values) in c.attributes.iter_mut() {
+        if *id == ids.dns_host_name {
+            *values = text(host);
+        }
+    }
+    c
+}
+
+/// Task DN6 (docs/54 §5.2, §5.3, §5.5; Q-614 items 2, 3, 8; [MS-ADTS]
+/// 3.1.1.5.3.1.1.2; RFC 1035 §2.3.1, §3.4.1): the host-record state rule
+/// on the record a create would produce — a computer whose names give one
+/// LDH host label `<computerName>.<zone>`, at most eight registrable 4-octet
+/// addresses, never on a user or a service object, and never without a
+/// zone (the provisioning session has none yet: fail closed).
+#[test]
+fn the_host_record_rule() {
+    let ids = ids();
+    let hosts = zone();
+    let addr = |last: u8| vec![192, 0, 2, last];
+    let check = |obj: &NewObject, role: Option<ProvisioningRole>, hosts: Option<&HostZone>| {
+        let draft = draft(obj.guid, obj.parent, &obj.classes, &obj.attributes).unwrap();
+        let class = p1().schema().most_specific_class(&draft.classes).unwrap();
+        object::check_new(&ids, &draft, class, role, hosts)
+    };
+    let with = |mut obj: NewObject, values: Vec<Vec<u8>>| {
+        obj.attributes.push((ids.host_address, values));
+        obj
+    };
+    let ws = |values| {
+        with(
+            host_computer(&ids, guid(90), "ws01", "ws01.example.test"),
+            values,
+        )
+    };
+    // Accepted: one and eight addresses; the DC's claim too.
+    assert_eq!(check(&ws(vec![addr(10)]), None, Some(&hosts)), Ok(()));
+    assert_eq!(
+        check(&ws((1..=8).map(addr).collect()), None, Some(&hosts)),
+        Ok(())
+    );
+    let dc = with(
+        computer(
+            &ids,
+            guid(91),
+            guid(OU),
+            "dc01",
+            ADS_UF_SERVER_TRUST_ACCOUNT,
+        ),
+        vec![addr(1)],
+    );
+    assert_eq!(
+        check(&dc, Some(ProvisioningRole::DcAccount), Some(&hosts)),
+        Ok(())
+    );
+    // No zone: nothing is written.
+    assert_eq!(
+        check(&ws(vec![addr(10)]), None, None),
+        Err(InvariantViolation::Value)
+    );
+    // Values: nine, a loopback / multicast / foreign address, 3 octets.
+    for values in [
+        (1..=9).map(addr).collect::<Vec<_>>(),
+        vec![vec![127, 0, 0, 1]],
+        vec![vec![224, 0, 0, 1]],
+        vec![vec![198, 51, 100, 1]],
+        vec![vec![0, 0, 0, 0]],
+    ] {
+        assert_eq!(
+            check(&ws(values.clone()), None, Some(&hosts)),
+            Err(InvariantViolation::Value),
+            "{values:?}"
+        );
+    }
+    // Names: not `<computerName>.<zone>`, not an LDH label.
+    for (name, host) in [
+        ("ws01", "web.example.test"),
+        ("ws01", "ws01.other.test"),
+        ("w_1", "w_1.example.test"),
+        ("1ws", "1ws.example.test"),
+    ] {
+        let obj = with(host_computer(&ids, guid(92), name, host), vec![addr(10)]);
+        assert_eq!(
+            check(&obj, None, Some(&hosts)),
+            Err(InvariantViolation::Name),
+            "{name} {host}"
+        );
+    }
+    // A service object's claim never holds one; a user never does.
+    let svc = with(
+        host_computer(&ids, guid(93), "ldap-svc", "dc01.example.test"),
+        vec![addr(10)],
+    );
+    assert_eq!(
+        check(&svc, Some(ProvisioningRole::ServiceObject), Some(&hosts)),
+        Err(InvariantViolation::Exception)
+    );
+    let alice = with(
+        user(&ids, guid(94), guid(OU), "alice", ADS_UF_NORMAL_ACCOUNT),
+        vec![addr(10)],
+    );
+    assert_eq!(
+        check(&alice, None, Some(&hosts)),
+        Err(InvariantViolation::NotModifiable)
+    );
+}
+
+/// Task DN6 (RFC 2136 §3.6; docs/54 §5.4): the one commit takes the zone
+/// serial for every write that changes the zone's content — a host record's
+/// write, a change or a delete of an object holding one — and not for one
+/// that does not; a host record's write keeps the per-object rule
+/// (`Protected` for a structural target, the values judged).
+#[test]
+fn the_commit_takes_the_zone_serial_for_zone_changes() {
+    let ids = ids();
+    let t = TempStore::new("zone-commit");
+    let mut txn = t.store.begin_write().unwrap();
+    begin(&mut txn);
+    let inv = Invariants::new(&p1(), BTreeSet::new(), Some(zone())).unwrap();
+    let serial = |txn: &WriteTxn<'_>| {
+        txn.counter(DNS_ZONE_SERIAL_COUNTER)
+            .unwrap()
+            .unwrap()
+            .next_value
+    };
+    // A computer without a record: created, no serial.
+    let checked = inv
+        .check_create(
+            &txn,
+            host_computer(&ids, guid(95), "ws01", "ws01.example.test"),
+            None,
+            &[],
+        )
+        .unwrap();
+    let committed = checked.commit(&mut txn, WALL, NODE).unwrap();
+    assert_eq!(committed.zone_serial, None);
+    assert_eq!(serial(&txn), 1);
+    // Its record: the serial moves; SERIAL = the counter's next value.
+    let when = encode_int64(2);
+    let checked = inv
+        .check_host_record(
+            &txn,
+            guid(95),
+            vec![vec![192, 0, 2, 10]],
+            vec![],
+            when.clone(),
+        )
+        .unwrap();
+    assert_eq!(
+        checked.commit(&mut txn, WALL, NODE).unwrap().zone_serial,
+        Some(2)
+    );
+    assert_eq!(serial(&txn), 2);
+    // A plain change of the holder (whenChanged): the serial moves.
+    let checked = inv
+        .check_modify(
+            &txn,
+            guid(95),
+            vec![AttributeChange::Replace {
+                id: ids.when_changed,
+                values: vec![encode_int64(3)],
+            }],
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        checked.commit(&mut txn, WALL, NODE).unwrap().zone_serial,
+        Some(3)
+    );
+    // A change of an object without one: it does not.
+    let checked = inv
+        .check_modify(
+            &txn,
+            guid(OU),
+            vec![AttributeChange::Replace {
+                id: ids.when_changed,
+                values: vec![encode_int64(3)],
+            }],
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        checked.commit(&mut txn, WALL, NODE).unwrap().zone_serial,
+        None
+    );
+    assert_eq!(serial(&txn), 3);
+    // Values and targets are judged at the check.
+    assert!(matches!(
+        inv.check_host_record(
+            &txn,
+            guid(95),
+            vec![vec![10, 0, 0, 1]],
+            vec![],
+            when.clone()
+        ),
+        Err(Refused::Rule(InvariantViolation::Value))
+    ));
+    assert!(matches!(
+        inv.check_host_record(
+            &txn,
+            guid(95),
+            vec![vec![192, 0, 2, 10]],
+            vec![vec![192, 0, 2, 11]],
+            when.clone()
+        ),
+        Err(Refused::Rule(InvariantViolation::Value))
+    ));
+    assert!(matches!(
+        inv.check_host_record(&txn, guid(1), vec![], vec![], when.clone()),
+        Err(Refused::Rule(InvariantViolation::Protected))
+    ));
+    // The generic modify never writes a host record.
+    assert!(matches!(
+        inv.check_modify(
+            &txn,
+            guid(95),
+            vec![AttributeChange::Replace {
+                id: ids.host_address,
+                values: vec![vec![192, 0, 2, 12]],
+            }],
+            &[]
+        ),
+        Err(Refused::Rule(InvariantViolation::NotModifiable))
+    ));
+    // Deleting the holder: the serial moves, the record goes with it.
+    let checked = inv.check_delete(&txn, guid(95)).unwrap();
+    assert_eq!(
+        checked.commit(&mut txn, WALL, NODE).unwrap().zone_serial,
+        Some(4)
+    );
+    assert_eq!(StoreRead::object(&txn, guid(95)).unwrap(), None);
 }

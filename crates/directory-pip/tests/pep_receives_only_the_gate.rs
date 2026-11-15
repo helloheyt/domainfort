@@ -19,6 +19,10 @@
 //!    `DirectoryView`, `Snapshot`, `.snapshot(`, `authority_snapshot`,
 //!    `get_object(` or `.view(` (taking a view from a context): it can reach
 //!    the directory only through the `PepView` its inputs carry.
+//! 3. (Task DN6; docs/54 §4.4) the zone image dird serves to dnsd is built
+//!    only by directory-pip's zone projection — the authority's own read of
+//!    its snapshot, listed here with that reason: no other code on the
+//!    directory's side builds a `dns_zone::ZoneImage`.
 //!
 //! Test code is not scanned (directories named `tests`, files whose name
 //! ends in `tests.rs`, and a file's `#[cfg(test)] mod … {` block to its
@@ -209,6 +213,48 @@ fn the_ldap_pep_names_no_raw_directory_access() {
     );
     // Positive control: the scan read the engine's sources.
     assert!(uses_pep_view, "crate ldap's PepView not seen");
+}
+
+/// The crates on the directory's side of the DNS channel: the authority
+/// (directory-pip), its write PEP (directory-admin) and dird
+/// (directory-daemon) — every crate that holds a `DirectoryView`. dnsd's
+/// side (dns-daemon, ipc-dns) rebuilds images from the channel's octets and
+/// is not scanned here.
+const DIRECTORY_SIDE: [&str; 3] = ["directory-pip", "directory-admin", "directory-daemon"];
+
+/// docs/54 §4.4 (task DN6; the A-111 scan list, decision A-119): the zone
+/// image dird serves is built by ONE function over the authority's
+/// snapshot — directory-pip's zone projection — so the image carries only
+/// what that function puts in it (host label, addresses, TTL; SOA / NS /
+/// SRV synthesized) and no second projection over a raw read can put more
+/// of an object on the wire (class C6). In the directory-side crates'
+/// non-test source, `ZoneImage::new(` and `ZoneImageParts {` appear only
+/// in `directory-pip/src/zone.rs`. Positive control: the projection's own
+/// call is seen.
+#[test]
+fn the_zone_image_is_built_only_by_the_projection() {
+    let crates = crates_dir();
+    let mut violations = Vec::new();
+    let mut seen = false;
+    for name in DIRECTORY_SIDE {
+        for (file, code) in crate_code(name) {
+            let rel = file.strip_prefix(&crates).unwrap_or(&file).to_path_buf();
+            for token in ["ZoneImage::new(", "ZoneImageParts {"] {
+                for line in lines_with(&code, token) {
+                    if rel == Path::new("directory-pip/src/zone.rs") {
+                        seen = true;
+                    } else {
+                        violations.push(format!("{}:{line}: {token}", rel.display()));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "a zone image built outside the one projection (docs/54 §4.4): {violations:#?}"
+    );
+    assert!(seen, "the projection's ZoneImage::new not seen");
 }
 
 /// Positive control of the scanner: each forbidden token is seen in

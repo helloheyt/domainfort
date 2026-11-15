@@ -233,6 +233,7 @@ name = "directory-admin"
 version = "0.0.0"
 dependencies = [
  "ad-schema",
+ "config",
  "directory-pip",
  "dirstore",
  "dtyp",
@@ -294,13 +295,16 @@ name = "directory-pip"
 version = "0.0.0"
 dependencies = [
  "ad-schema",
+ "config",
  "dirstore",
+ "dns-zone",
  "dtyp",
  "kdc",
  "keyd",
  "keyd-types",
  "krb-crypto",
  "krb-proto",
+ "parse-dns",
  "pdp",
 ]
 

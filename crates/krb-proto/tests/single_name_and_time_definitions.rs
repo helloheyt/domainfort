@@ -75,19 +75,11 @@ const EPOCH_AS_KERBEROS_TIME: &str = "KerberosTime::new(1970,1,1,0,0,0)";
 
 /// Rule 3: the files outside krb-proto that may spell the epoch, with the
 /// reason.
-const EPOCH_SPELLED_ELSEWHERE: [(&str, &str); 2] = [
-    (
-        "kdc/src/time.rs",
-        "RFC 4120 5.4.1: the `till` value 19700101000000Z (\"the maximum endtime \
-         permitted\") — a protocol value, not a Unix conversion",
-    ),
-    (
-        "directory-admin/src/time.rs",
-        "residual of Q-995: `instant` still writes the KerberosTime -> Unix \
-         difference (the crate belonged to a parallel task this wave); to fold \
-         into krb_proto::kerberos_time_to_unix",
-    ),
-];
+const EPOCH_SPELLED_ELSEWHERE: [(&str, &str); 1] = [(
+    "kdc/src/time.rs",
+    "RFC 4120 5.4.1: the `till` value 19700101000000Z (\"the maximum endtime \
+     permitted\") — a protocol value, not a Unix conversion",
+)];
 
 /// The workspace's `crates/` directory.
 fn crates_dir() -> PathBuf {

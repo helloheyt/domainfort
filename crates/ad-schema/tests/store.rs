@@ -563,3 +563,74 @@ fn rdn_and_naming_rules_apply() {
         Violation::ValueNotAsciiPrintable(cn)
     );
 }
+
+#[test]
+fn the_host_address_attribute_in_the_store() {
+    // Source: task DN6 (crate `internal`; docs/questions/Q-614 item 1 (b),
+    // Q-992): the internal host-address attribute is held on a computer, as
+    // a set of 4-octet values (RFC 1035 §3.4.1: "A 32 bit Internet
+    // address"); any other length, and any other class, is refused by the
+    // store itself; a Replace keeps the attr-stamp of a value already
+    // present and stamps a new one (dirstore `AttributeChange::Replace`).
+    // The addresses are this project's test data.
+    use ad_schema::HOST_ADDRESS;
+    let f = Fixture::new("host-address");
+    f.tree();
+    let host = |octets: &[&[u8]]| octets.iter().map(|o| o.to_vec()).collect::<Vec<_>>();
+    // On a user: not allowed.
+    let mut user = f.user(10, guid(2), "alice", &[]);
+    user.attributes
+        .push((HOST_ADDRESS, host(&[&[192, 0, 2, 10]])));
+    assert_eq!(
+        f.refused(user),
+        Violation::AttributeNotAllowed(HOST_ADDRESS)
+    );
+    // On a computer: 3 octets (below the range) or 5 (above the value
+    // bound) refused.
+    for (bad, violation) in [
+        (&[192u8, 0, 2][..], Violation::ValueOutOfRange(HOST_ADDRESS)),
+        (
+            &[192, 0, 2, 10, 1][..],
+            Violation::ValueTooLarge(HOST_ADDRESS),
+        ),
+    ] {
+        let mut computer = f.computer(11, guid(2), "ws11$", &[]);
+        computer.attributes.push((HOST_ADDRESS, host(&[bad])));
+        assert_eq!(f.refused(computer), violation);
+    }
+    // Two addresses accepted.
+    let mut computer = f.computer(11, guid(2), "ws11$", &[]);
+    computer
+        .attributes
+        .push((HOST_ADDRESS, host(&[&[192, 0, 2, 10], &[192, 0, 2, 11]])));
+    f.create(computer).unwrap();
+    let stamp_of = |value: &[u8]| {
+        let snapshot = f.store.snapshot().unwrap();
+        let obj = snapshot.get_object(guid(11)).unwrap().unwrap();
+        obj.attribute(HOST_ADDRESS)
+            .unwrap()
+            .values
+            .iter()
+            .find(|v| v.value == value)
+            .map(|v| v.stamp)
+    };
+    let first = stamp_of(&[192, 0, 2, 10]).unwrap();
+    // Replace: keep .10, drop .11, add .12 — .10 keeps its stamp.
+    let mut txn = f.store.begin_write().unwrap();
+    let origin = f.origin();
+    txn.modify_object(
+        guid(11),
+        vec![AttributeChange::Replace {
+            id: HOST_ADDRESS,
+            values: host(&[&[192, 0, 2, 10], &[192, 0, 2, 12]]),
+        }],
+        &origin,
+    )
+    .unwrap();
+    txn.commit().unwrap();
+    assert_eq!(stamp_of(&[192, 0, 2, 10]), Some(first));
+    assert_eq!(stamp_of(&[192, 0, 2, 11]), None);
+    let added = stamp_of(&[192, 0, 2, 12]).unwrap();
+    assert_eq!(added.origin_seq, origin.origin_seq);
+    assert_ne!(added.origin_seq, first.origin_seq);
+}

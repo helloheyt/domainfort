@@ -188,6 +188,10 @@ fn commit_stop(e: CommitError) -> Stop {
         CommitError::RidRange | CommitError::Sid => Stop::Failed(AdminFailure::InternalFailure),
         CommitError::ChangeSeq(e) => counter_failure(&e, Stop::Failed(AdminFailure::StoreFailure)),
         CommitError::Write(e) => write_failure(&e),
+        // Task DN6: a write that changes the zone takes its serial; the
+        // counter missing or exhausted refuses the write (A-83).
+        CommitError::ZoneSerial(e) => counter_failure(&e, Stop::Failed(AdminFailure::StoreFailure)),
+        CommitError::Read(e) => store_failure(&e),
     }
 }
 
@@ -348,7 +352,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
     /// new principal's RID) itself, in `txn`.
     /// Spec: docs/51 §8.3 ("change-seq — the same mechanism"); docs/29 §2
     /// as cited there; A-75; A-89; docs/52 R13; dirstore `Origin`.
-    fn commit(
+    pub(crate) fn commit(
         &self,
         checked: CheckedWrite,
         txn: &mut WriteTxn<'_>,
@@ -453,7 +457,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                 &[],
             )
             .map_err(invariant_stop)?;
-        let Committed { rid, sid } = self.commit(checked, txn, now)?;
+        let Committed { rid, sid, .. } = self.commit(checked, txn, now)?;
         Ok((
             Some(Allocation {
                 guid: guid.to_packet(),

@@ -34,7 +34,8 @@ use dtyp::Guid;
 
 use super::{CommitError, InvariantViolation, Invariants, Refused, StoreRead};
 use crate::config::{
-    CHANGE_SEQ_COUNTER, CHANGE_SEQ_END_EXCLUSIVE, CHANGE_SEQ_FIRST, RID_COUNTER, RID_END_EXCLUSIVE,
+    CHANGE_SEQ_COUNTER, CHANGE_SEQ_END_EXCLUSIVE, CHANGE_SEQ_FIRST, DNS_ZONE_SERIAL_COUNTER,
+    DNS_ZONE_SERIAL_END_EXCLUSIVE, DNS_ZONE_SERIAL_FIRST, RID_COUNTER, RID_END_EXCLUSIVE,
     RID_FIRST,
 };
 
@@ -143,6 +144,10 @@ fn commit_failed(e: CommitError) -> ProvisioningError {
         CommitError::Sid => ProvisioningError::SidMismatch,
         CommitError::ChangeSeq(_) => ProvisioningError::Store("take_counter_value(change-seq)"),
         CommitError::Write(_) => ProvisioningError::Store("create_object"),
+        CommitError::ZoneSerial(_) => {
+            ProvisioningError::Store("take_counter_value(dns-zone-serial)")
+        }
+        CommitError::Read(_) => ProvisioningError::Store("read"),
     }
 }
 
@@ -177,18 +182,17 @@ impl<'t, 's> Provisioning<'t, 's> {
         wall_clock: Timestamp,
         origin_node: NodeId,
     ) -> Result<Provisioning<'t, 's>, ProvisioningError> {
-        let invariants =
-            Invariants::new(schema, BTreeSet::new()).map_err(|_| ProvisioningError::Schema)?;
+        // No zone yet: the session writes no host record until task DN13
+        // gives it the DC's (fail closed — docs/54 §3.1).
+        let invariants = Invariants::new(schema, BTreeSet::new(), None)
+            .map_err(|_| ProvisioningError::Schema)?;
         let read = |_| ProvisioningError::Store("read");
         let roots = StoreRead::children(&*txn, None, 1).map_err(read)?;
-        if StoreRead::counter(&*txn, RID_COUNTER)
-            .map_err(read)?
-            .is_some()
-            || StoreRead::counter(&*txn, CHANGE_SEQ_COUNTER)
-                .map_err(read)?
-                .is_some()
-            || !roots.children.is_empty()
-        {
+        let mut any_counter = false;
+        for name in [RID_COUNTER, CHANGE_SEQ_COUNTER, DNS_ZONE_SERIAL_COUNTER] {
+            any_counter |= StoreRead::counter(&*txn, name).map_err(read)?.is_some();
+        }
+        if any_counter || !roots.children.is_empty() {
             return Err(ProvisioningError::NotEmpty);
         }
         txn.create_counter(RID_COUNTER, RID_FIRST, RID_END_EXCLUSIVE)
@@ -199,6 +203,15 @@ impl<'t, 's> Provisioning<'t, 's> {
             CHANGE_SEQ_END_EXCLUSIVE,
         )
         .map_err(|_| ProvisioningError::Store("create_counter(change-seq)"))?;
+        // The zone serial (task DN6; docs/54 §5.4, R54-12): created here,
+        // with the other two, so every provisioned store has it — A-83:
+        // counters only at provisioning.
+        txn.create_counter(
+            DNS_ZONE_SERIAL_COUNTER,
+            DNS_ZONE_SERIAL_FIRST,
+            DNS_ZONE_SERIAL_END_EXCLUSIVE,
+        )
+        .map_err(|_| ProvisioningError::Store("create_counter(dns-zone-serial)"))?;
         Ok(Provisioning {
             txn,
             invariants,

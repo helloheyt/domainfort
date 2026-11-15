@@ -347,7 +347,7 @@ impl DirectoryView<'_> {
     /// no such object exists — then nothing is in the NC (fail closed on a
     /// misconfiguration). Found once per view.
     /// Spec: [MS-ADTS] 3.1.1.1.4, 3.1.1.1.5, 3.1.1.3.1.2.2; A-53.
-    fn nc_root(&self) -> Result<Guid, Fault> {
+    pub(crate) fn nc_root(&self) -> Result<Guid, Fault> {
         *self.nc_root.get_or_init(|| {
             let label = self
                 .ctx
@@ -750,7 +750,7 @@ impl DirectoryView<'_> {
     /// classification ([`DirectoryView::classified_tier`]); no
     /// classification ⇒ Tier0 (an unclassified resource is Tier0 for writes,
     /// A-36).
-    fn dir_object_tier(&self, dn: &Dn) -> Result<Tier, Fault> {
+    pub(crate) fn dir_object_tier(&self, dn: &Dn) -> Result<Tier, Fault> {
         Ok(self.classified_tier(dn)?.unwrap_or(Tier::Tier0))
     }
 
@@ -889,19 +889,31 @@ impl Pip for DirectoryView<'_> {
 
     /// `object_tier` is asked only for writes (pdp `decide`, layer 4), so
     /// every resource kind the map cannot classify is Tier0: a policy scope
-    /// (docs/06 §9), and RPC / file / DNS / Kerberos resources until the map
-    /// has rows for them (A-36: an unclassified resource is Tier0 for
-    /// writes). The rootDSE is never written (pdp admits only `DirRead` on
-    /// it; [MS-ADTS] 3.1.1.3.2: its attributes "are read-only"), so it is
-    /// never asked; if it were, Tier0 (A-36).
-    /// Spec: docs/47 §6.3, §8.2; docs/06 §9; docs/49 §5.2 (R49-10); A-36.
+    /// (docs/06 §9), and RPC / file / Kerberos resources until the map has
+    /// rows for them (A-36: an unclassified resource is Tier0 for writes).
+    /// The rootDSE is never written (pdp admits only `DirRead` on it;
+    /// [MS-ADTS] 3.1.1.3.2: its attributes "are read-only"), so it is never
+    /// asked; if it were, Tier0 (A-36).
+    ///
+    /// A DNS record (task DN6; docs/54 §5.6; Q-614 item 6): the record is an
+    /// attribute of the one computer object that owns its name, so its tier
+    /// is that object's ([`DirectoryView::dns_record_tier`]) — derived here
+    /// from the directory, never from the request (P3); no record key, a
+    /// zone other than this view's, or a name nobody owns ⇒ Tier0 (fail
+    /// closed).
+    /// Spec: docs/47 §6.3, §8.2; docs/06 §9; docs/49 §5.2 (R49-10); A-36;
+    /// docs/54 §5.6; docs/questions/Q-614 item 6.
     fn object_tier(&self, r: &Resource) -> Result<Tier, PipError> {
         match r {
             Resource::DirObject { dn, .. } => Ok(self.dir_object_tier(dn)?),
+            Resource::Dns {
+                zone,
+                record: Some(key),
+            } => self.dns_record_tier(&zone.0, &key.0),
             Resource::Policy { .. }
             | Resource::RpcMethod { .. }
             | Resource::File { .. }
-            | Resource::Dns { .. }
+            | Resource::Dns { record: None, .. }
             | Resource::Kerberos { .. }
             | Resource::RootDse => Ok(Tier::Tier0),
         }

@@ -384,6 +384,13 @@ pub struct Extra {
     pub self_rule: bool,
     /// The tier map classifies ou=Staff with this tier.
     pub staff_tier: Option<Tier>,
+    /// Task DN6: the PEP accepts DNS self-updates under this rule
+    /// (`AdminConfig::with_dns_registration`).
+    pub dns: Option<directory_admin::DnsRegistration>,
+    /// Task DN6: the policy also allows `DnsUpdate` on the zone
+    /// `example.test` to any subject (the coarse layer; the tier layer and
+    /// the PEP's structural checks decide).
+    pub dns_rule: bool,
 }
 
 /// A child's SD, computed as provisioning computes it (CreateSecurityDescriptor
@@ -649,6 +656,22 @@ impl Domain {
                 SubjectMatch::Any,
             ));
         }
+        if extra.dns_rule {
+            rules.push(Rule {
+                id: RuleId(5),
+                effect: Effect::Allow,
+                when: Match {
+                    action: ActionMatch::Exact(pdp::Action::DnsUpdate),
+                    resource: ResourceMatch::Dns {
+                        zone: pdp::ZoneId("example.test".into()),
+                    },
+                    subject: SubjectMatch::Any,
+                    context: ContextMatch::ANY,
+                    auth: AuthMatch::ANY,
+                },
+                obligations: vec![],
+            });
+        }
         let policy = PolicySnapshot::new(PolicyVersion(1), rules, vec![]);
         let config = AdminConfig::new(
             TICKET_AGE_MAX,
@@ -662,6 +685,10 @@ impl Domain {
             },
         )
         .expect("config");
+        let config = match extra.dns.clone() {
+            Some(dns) => config.with_dns_registration(dns),
+            None => config,
+        };
         let admin = DirectoryAdmin::new(config, &p1, CountingRandom::default()).expect("admin");
         let domain = Domain {
             p1,

@@ -68,6 +68,36 @@
 //! dual control, the self-lockout guard, the policy-named objects (they
 //! depend on the policy version, docs/47 §8.1).
 //!
+//! # The zone serial (task DN6)
+//!
+//! **Class — the zone's content changes while its SOA SERIAL does not**
+//! (RFC 2136 §3.6: "It is imperative that the zone's contents and the SOA's
+//! SERIAL be tightly synchronized. If the zone appears to change, the SOA
+//! must appear to change as well"). dnsd fetches a new image only when the
+//! SERIAL moves (docs/54 §4.4), so a content change without one is never
+//! served — or a stale record is served on. The content (crate directory-pip
+//! `zone`) depends on more than a host's own record: an admin write that
+//! disables, expires or deletes a computer holding one changes it too.
+//!
+//! **The change.** The one commit ([`CheckedWrite::commit`]) takes the
+//! `dns-zone-serial` counter in the same transaction for **every** write
+//! that changes the zone's content: a host record's write ([`Op`]
+//! `HostRecord`, `DnsSelfUpdate`), and any create, change or delete of an
+//! object that holds — or will hold — host addresses. No write path can skip
+//! it: there is no other commit. A host record is itself a state rule of the
+//! checker (module `object`, `check_host_record`): a computer named
+//! `<computerName>.<zone>` with one LDH label, at most eight registrable
+//! addresses — so a write the zone image would refuse cannot be stored.
+//! What the commit cannot see is the clock (an address ageing out, an
+//! account reaching accountExpires): the projection names that instant
+//! (`ZoneProjection::valid_until`) — docs/questions/Q-993.
+//!
+//! A host record's write that registers again an address already stored
+//! makes two originating writes in the transaction (the value written out,
+//! then back), because a dirstore Replace keeps a present value's attr-stamp
+//! — the stamp is the address's registration time (docs/questions/Q-991
+//! item 5).
+//!
 //! # Links checked once
 //!
 //! The online PEP's `prepare` runs the link walks against its snapshot and
@@ -101,9 +131,13 @@ use dirstore::{
 use dtyp::{Guid, Sid, GUID_PACKET_LEN};
 
 pub(crate) use graph::{End, Graph, MAX_WALK_STEPS};
+pub(crate) use object::HostZone;
 pub use provisioning::{Provisioning, ProvisioningError, ProvisioningRole};
 
-use crate::config::{ConfigError, CHANGE_SEQ_COUNTER, RID_COUNTER, RID_END_EXCLUSIVE, RID_FIRST};
+use crate::config::{
+    ConfigError, CHANGE_SEQ_COUNTER, DNS_ZONE_SERIAL_COUNTER, RID_COUNTER, RID_END_EXCLUSIVE,
+    RID_FIRST,
+};
 use crate::ids::Ids;
 use crate::record;
 
@@ -288,6 +322,17 @@ enum Op {
     Delete {
         target: Guid,
     },
+    /// A host record's write (task DN6, `DnsSelfUpdate`): `addresses` is the
+    /// record's complete new value set; `renewed` the values of it the write
+    /// registers again (their registration time — the attr-stamp — becomes
+    /// this write's even when already present); `when_changed` the change
+    /// that sets whenChanged.
+    HostRecord {
+        target: Guid,
+        addresses: Vec<Vec<u8>>,
+        renewed: Vec<Vec<u8>>,
+        when_changed: AttributeChange,
+    },
 }
 
 /// A write every rule passed, against the transaction state whose
@@ -297,13 +342,18 @@ enum Op {
 pub(crate) struct CheckedWrite {
     basis: CounterState,
     op: Op,
+    /// The host-address attribute's id, for the zone-serial rule of the
+    /// commit (task DN6).
+    host_address: AttrId,
 }
 
-/// What a commit allocated: the RID and objectSid of a new principal.
+/// What a commit allocated: the RID and objectSid of a new principal, and —
+/// for a write that changed the zone's content — the zone's new SOA SERIAL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Committed {
     pub(crate) rid: Option<u32>,
     pub(crate) sid: Option<Sid>,
+    pub(crate) zone_serial: Option<u32>,
 }
 
 /// Why a checked write did not commit. Every variant leaves the
@@ -326,6 +376,12 @@ pub(crate) enum CommitError {
     ChangeSeq(dirstore::Error),
     /// dirstore refused the write itself.
     Write(dirstore::Error),
+    /// The write changes the zone's content and the zone serial counter
+    /// refused a take, or is missing (task DN6; A-83: never created here).
+    ZoneSerial(dirstore::Error),
+    /// The target could not be read to tell whether the write changes the
+    /// zone's content.
+    Read(dirstore::Error),
 }
 
 impl CheckedWrite {
@@ -351,16 +407,73 @@ impl CheckedWrite {
         if current != Some(self.basis) {
             return Err(CommitError::Stale);
         }
-        match self.op {
+        // The zone serial (task DN6; RFC 2136 §3.6: "If the zone appears to
+        // change, the SOA must appear to change as well"): a write that
+        // leaves, or finds, host addresses on its object changes what the
+        // zone projection returns, so it takes the zone serial counter in
+        // this same transaction — here, in the one commit every write path
+        // goes through (module documentation, "The zone serial").
+        let host_address = self.host_address;
+        let zone = self.op.changes_zone(txn, host_address)?;
+        let mut committed = self.op.commit(txn, wall_clock, origin_node, host_address)?;
+        if zone {
+            committed.zone_serial = Some(take_zone_serial(txn)?);
+        }
+        Ok(committed)
+    }
+}
+
+impl Op {
+    /// `true` if this write changes the zone's content: the object it
+    /// creates holds host addresses, or the object it changes or deletes
+    /// holds some (before the write) or will (a host record's write always
+    /// counts). Read in the transaction, before the write.
+    /// Spec: RFC 2136 §3.6; docs/54 §5.4; crate directory-pip `zone`
+    /// (what the projection reads).
+    fn changes_zone(&self, txn: &WriteTxn<'_>, host_address: AttrId) -> Result<bool, CommitError> {
+        let holds = |target: Guid| -> Result<bool, CommitError> {
+            Ok(txn
+                .get_object(target)
+                .map_err(CommitError::Read)?
+                .is_some_and(|obj| obj.attribute(host_address).is_some()))
+        };
+        match self {
+            Op::Create { new, .. } => Ok(new
+                .attributes
+                .iter()
+                .any(|(id, values)| *id == host_address && !values.is_empty())),
+            Op::Modify { target, changes } => {
+                let writes = changes.iter().any(|change| {
+                    let AttributeChange::Replace { id, values } = change;
+                    *id == host_address && !values.is_empty()
+                });
+                Ok(writes || holds(*target)?)
+            }
+            Op::Delete { target } => holds(*target),
+            Op::HostRecord { .. } => Ok(true),
+        }
+    }
+
+    /// The write itself (see [`CheckedWrite::commit`]).
+    fn commit(
+        self,
+        txn: &mut WriteTxn<'_>,
+        wall_clock: Timestamp,
+        origin_node: NodeId,
+        host_address: AttrId,
+    ) -> Result<Committed, CommitError> {
+        let none = Committed {
+            rid: None,
+            sid: None,
+            zone_serial: None,
+        };
+        match self {
             Op::Create {
                 mut new,
                 principal,
                 object_sid,
             } => {
-                let mut committed = Committed {
-                    rid: None,
-                    sid: None,
-                };
+                let mut committed = none;
                 if let Some((source, domain)) = principal {
                     let rid = match source {
                         RidSource::Krbtgt => graph::DOMAIN_USER_RID_KRBTGT,
@@ -387,6 +500,7 @@ impl CheckedWrite {
                     committed = Committed {
                         rid: Some(rid),
                         sid: Some(sid),
+                        zone_serial: None,
                     };
                 }
                 let origin = take_origin(txn, wall_clock, origin_node)?;
@@ -398,22 +512,91 @@ impl CheckedWrite {
                 let origin = take_origin(txn, wall_clock, origin_node)?;
                 txn.modify_object(target, changes, &origin)
                     .map_err(CommitError::Write)?;
-                Ok(Committed {
-                    rid: None,
-                    sid: None,
-                })
+                Ok(none)
             }
             Op::Delete { target } => {
                 let origin = take_origin(txn, wall_clock, origin_node)?;
                 txn.delete_object(target, &origin)
                     .map_err(CommitError::Write)?;
-                Ok(Committed {
-                    rid: None,
-                    sid: None,
-                })
+                Ok(none)
+            }
+            Op::HostRecord {
+                target,
+                addresses,
+                renewed,
+                when_changed,
+            } => {
+                // A value the write registers again that is already stored
+                // keeps its attr-stamp under a Replace (dirstore
+                // `AttributeChange::Replace`); so it is first written out,
+                // then back with the rest — two originating writes of the
+                // same transaction, each with its own change-seq; nothing in
+                // between is ever committed (module documentation, "The zone
+                // serial"; docs/questions/Q-991 item 5).
+                let stored: Vec<Vec<u8>> = txn
+                    .get_object(target)
+                    .map_err(CommitError::Read)?
+                    .and_then(|obj| obj.attribute(host_address).cloned())
+                    .map(|a| a.values.into_iter().map(|v| v.value).collect())
+                    .unwrap_or_default();
+                let again: Vec<&Vec<u8>> = renewed.iter().filter(|v| stored.contains(v)).collect();
+                if !again.is_empty() {
+                    let without: Vec<Vec<u8>> = addresses
+                        .iter()
+                        .filter(|v| !again.contains(v))
+                        .cloned()
+                        .collect();
+                    let origin = take_origin(txn, wall_clock, origin_node)?;
+                    txn.modify_object(
+                        target,
+                        vec![AttributeChange::Replace {
+                            id: host_address,
+                            values: without,
+                        }],
+                        &origin,
+                    )
+                    .map_err(CommitError::Write)?;
+                }
+                let origin = take_origin(txn, wall_clock, origin_node)?;
+                txn.modify_object(
+                    target,
+                    vec![
+                        AttributeChange::Replace {
+                            id: host_address,
+                            values: addresses,
+                        },
+                        when_changed,
+                    ],
+                    &origin,
+                )
+                .map_err(CommitError::Write)?;
+                Ok(none)
             }
         }
     }
+}
+
+/// Take the zone serial counter in `txn` and return the zone's new SOA
+/// SERIAL ([`directory_pip::zone_serial`] of the counter's state): one take
+/// per content change, and one more when that would show SERIAL 0 (RFC 2136
+/// §7.11: "if the result of the increment is zero … increment it again").
+/// The counter missing or exhausted ⇒ refused (A-83: never created or reset
+/// here).
+/// Spec: docs/54 §5.4; RFC 2136 §3.6, §7.11; A-75; A-83.
+fn take_zone_serial(txn: &mut WriteTxn<'_>) -> Result<u32, CommitError> {
+    for _ in 0..2 {
+        txn.take_counter_value(DNS_ZONE_SERIAL_COUNTER)
+            .map_err(CommitError::ZoneSerial)?;
+        let state = txn
+            .counter(DNS_ZONE_SERIAL_COUNTER)
+            .map_err(CommitError::ZoneSerial)?
+            .ok_or(CommitError::ZoneSerial(dirstore::Error::NoSuchCounter))?;
+        if let Some(serial) = directory_pip::zone_serial(&state) {
+            return Ok(serial);
+        }
+    }
+    // Two takes cannot both land on a multiple of 2³².
+    Err(CommitError::ZoneSerial(dirstore::Error::CounterExhausted))
 }
 
 /// The `Origin` of one write: the next change-seq, taken in `txn`.
@@ -515,21 +698,32 @@ pub(crate) struct Invariants {
     ids: Ids,
     schema: Schema,
     service_objects: BTreeSet<Guid>,
+    /// The zone and registrable networks of host records (task DN6);
+    /// `None` ⇒ no host address can be written.
+    hosts: Option<HostZone>,
 }
 
 impl Invariants {
     /// The checker for the phase-1 schema with these protected service
-    /// objects. Fails closed if the schema lacks a name it needs.
-    /// Spec: docs/46 §4.4, §5.4; docs/51 §5.2 row 9.
+    /// objects and, when DNS self-updates are enabled, the zone of host
+    /// records (`hosts`). Fails closed if the schema lacks a name it needs.
+    /// Spec: docs/46 §4.4, §5.4; docs/51 §5.2 row 9; docs/54 §5.3, §5.5.
     pub(crate) fn new(
         schema: &Phase1Schema,
         service_objects: BTreeSet<Guid>,
+        hosts: Option<HostZone>,
     ) -> Result<Invariants, ConfigError> {
         Ok(Invariants {
             ids: Ids::resolve(schema)?,
             schema: schema.schema().clone(),
             service_objects,
+            hosts,
         })
+    }
+
+    /// The zone of host records, if DNS self-updates are enabled.
+    pub(crate) fn hosts(&self) -> Option<&HostZone> {
+        self.hosts.as_ref()
     }
 
     /// The rules of module `graph` over `store`.
@@ -688,7 +882,7 @@ impl Invariants {
             .schema
             .most_specific_class(&obj.classes)
             .ok_or(InvariantViolation::Class)?;
-        object::check_new(&self.ids, &obj, class, role)?;
+        object::check_new(&self.ids, &obj, class, role, self.hosts.as_ref())?;
         let principal_class = [self.ids.user.id, self.ids.computer.id, self.ids.group.id];
         let principal = if principal_class.contains(&class) {
             let source = if role == Some(ProvisioningRole::Krbtgt) {
@@ -724,6 +918,7 @@ impl Invariants {
                 principal,
                 object_sid: self.ids.object_sid,
             },
+            host_address: self.ids.host_address,
         })
     }
 
@@ -769,6 +964,7 @@ impl Invariants {
         Ok(CheckedWrite {
             basis,
             op: Op::Modify { target, changes },
+            host_address: self.ids.host_address,
         })
     }
 
@@ -793,6 +989,71 @@ impl Invariants {
         Ok(CheckedWrite {
             basis,
             op: Op::Delete { target },
+            host_address: self.ids.host_address,
+        })
+    }
+
+    /// Check a host record's write (task DN6, `DnsSelfUpdate`) of `target`
+    /// in `txn`: the target exists and is not structural (the DC, a service
+    /// object, krbtgt, the NC root — their records, if any, come from
+    /// provisioning only); its new value set `addresses` keeps the
+    /// host-record rule (`object::check_host_record`: a computer whose names
+    /// pass the host-name rule, at most eight registrable addresses); every
+    /// value of `renewed` is one of `addresses`; `when_changed` is the new
+    /// whenChanged (DSTIME, one value). The commit takes the write's
+    /// change-seq(s) and the zone serial itself.
+    /// Spec: docs/54 §4.5 step 6, §5.2-§5.5; docs/questions/Q-614 items 2,
+    /// 3, 8; RFC 2136 §3.6; docs/46 §5.4 (whenChanged).
+    pub(crate) fn check_host_record(
+        &self,
+        txn: &WriteTxn<'_>,
+        target: Guid,
+        addresses: Vec<Vec<u8>>,
+        renewed: Vec<Vec<u8>>,
+        when_changed: Vec<u8>,
+    ) -> Result<CheckedWrite, Refused> {
+        let basis = Self::basis(txn)?;
+        let graph = self.graph(txn);
+        let current = txn
+            .get_object(target)
+            .map_err(Fault::Store)?
+            .ok_or(InvariantViolation::NoSuchObject)?;
+        let class = graph.class_of(&current)?;
+        if graph.is_structural(target, &current, class)? {
+            return Err(InvariantViolation::Protected.into());
+        }
+        let mut distinct = BTreeSet::new();
+        if !addresses.iter().all(|v| distinct.insert(v.as_slice())) {
+            return Err(InvariantViolation::Value.into());
+        }
+        if !renewed.iter().all(|v| addresses.contains(v)) {
+            return Err(InvariantViolation::Value.into());
+        }
+        // Even an empty set (the record removed) is written only for a
+        // holder the rule admits — a computer whose names pass it.
+        let hosts =
+            object::check_host_holder(&self.ids, &current, class, None, self.hosts.as_ref())?;
+        let values: Vec<&[u8]> = addresses.iter().map(Vec::as_slice).collect();
+        object::check_host_values(&values, hosts)?;
+        object::check_change(
+            &self.ids,
+            &current,
+            class,
+            self.ids.when_changed,
+            core::slice::from_ref(&when_changed),
+        )?;
+        Ok(CheckedWrite {
+            basis,
+            op: Op::HostRecord {
+                target,
+                addresses,
+                renewed,
+                when_changed: AttributeChange::Replace {
+                    id: self.ids.when_changed,
+                    values: vec![when_changed],
+                },
+            },
+            host_address: self.ids.host_address,
         })
     }
 }
