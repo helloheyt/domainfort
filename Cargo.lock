@@ -310,6 +310,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dns-zone"
+version = "0.0.0"
+dependencies = [
+ "parse-dns",
+]
+
+[[package]]
 name = "dtyp"
 version = "0.0.0"
 
