@@ -339,6 +339,16 @@
       "blocks": []
     },
     {
+      "id": "RFC5905",
+      "title": "Network Time Protocol Version 4: Protocol and Algorithms Specification",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc5905.txt",
+      "revision": "RFC5905",
+      "sha256": "8b7abd903c60202e2953ee012fefa6916666c3b0c71825c748cdd262024fb268",
+      "phase": "1",
+      "blocks": []
+    },
+    {
       "id": "RFC8915",
       "title": "Network Time Security for NTP",
       "kind": "rfc",
