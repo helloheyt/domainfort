@@ -17,9 +17,18 @@ confidence-threshold = 0.95
 # A one-off licence exception needs owner approval — it would be added here explicitly, with a rationale, if ever.
 exceptions = []
 
+[licenses.private]
+# The allow-list governs what we LINK. Our own workspace crates (all `publish = false`) are covered by
+# the repository's LICENSE (AGPL-3.0) and are not checked against it.
+ignore = true
+
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"            # no dependency with version "*"
+# Our own workspace crates refer to each other by path, without a version. Every workspace crate is
+# `publish = false` ("private" to cargo-deny), so those path dependencies are allowed; a public
+# crate's path dependency would still be refused.
+allow-wildcard-paths = true
 # Protocol-logic packages are forbidden without explicit approval (D2): that logic is our own work.
 # Linking such a package = someone else's code running in the DC. A list of examples; extended in review.
 deny = [

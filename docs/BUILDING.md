@@ -4,7 +4,7 @@
 
 | Tool | Why |
 |---|---|
-| Rust via [rustup](https://rustup.rs) | The repository's `rust-toolchain.toml` selects the stable channel with `rustfmt` and `clippy`; `cargo` installs it on first use. An exact version will be pinned before the first release. All crates use the 2021 edition. |
+| Rust via [rustup](https://rustup.rs) | The repository's `rust-toolchain.toml` pins an exact Rust version (currently 1.95.0) with `rustfmt` and `clippy`; `rustup` installs it on first use. CI installs the same version. All crates use the 2021 edition. |
 | A C compiler (`cc`, or the one named in `CC`) | The TLS cryptography provider used by the LDAP front (aws-lc-rs) compiles C code. It is the only C code in the build. CMake is not needed for the regular build. |
 | `python3` | Used by the dependency licence check. |
 | `jq`, `curl` | Only for verifying the pinned specification documents. |

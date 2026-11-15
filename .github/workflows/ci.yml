@@ -38,7 +38,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # The exact version pinned in rust-toolchain.toml (keep the two equal).
+      - uses: dtolnay/rust-toolchain@1.95.0
         with: { components: "rustfmt, clippy" }
       # One gate that recognises an empty workspace (phase 0) → no-op, and takes effect automatically with
       # the first crate. (Before this, the direct steps failed on "no members".)
@@ -49,6 +50,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.95.0
       # no-op while there are no crates; produces CycloneDX once there are (D61, R13).
       - run: bash scripts/gen-sbom.sh

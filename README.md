@@ -95,8 +95,8 @@ What is planned next, and what is waiting on external decisions, is in
 
 ## Build and check
 
-Requirements: a Rust toolchain from [rustup](https://rustup.rs) (the repository pins the stable
-channel in `rust-toolchain.toml`), a C compiler (the TLS library used by the LDAP front builds C
+Requirements: a Rust toolchain from [rustup](https://rustup.rs) (the repository pins an exact
+version in `rust-toolchain.toml`), a C compiler (the TLS library used by the LDAP front builds C
 code), and `python3` for the dependency licence check. See [docs/BUILDING.md](docs/BUILDING.md).
 
 ```bash
