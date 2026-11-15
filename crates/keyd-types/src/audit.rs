@@ -328,10 +328,12 @@ pub enum AuditReason {
     /// once, docs/52 §3.10 (a)). The record's outcome is the recorded one.
     /// Spec: docs/52 §3.10, §4.2.
     DecisionReplayed,
-    /// `create_key` or Role::Admin's `grant_set_secret` after
-    /// `seal_ceremony`: those operations exist only in the provisioning
-    /// ceremony. Reported as the uniform `Denied`.
-    /// Spec: docs/52 §4.4, §7 R3; docs/questions/Q-462 item 1 (A-102).
+    /// `create_key`, Role::Admin's `grant_set_secret` or
+    /// `install_attestation_key` (task PN8) after `seal_ceremony` — or on a
+    /// keyd that started operational: those operations exist only in the
+    /// provisioning ceremony. Reported as the uniform `Denied`.
+    /// Spec: docs/52 §4.4, §7 R3; docs/questions/Q-462 item 1 (A-102);
+    /// docs/questions/Q-1011 item 2 (A-173).
     CeremonySealed,
     /// `verify_operation_ticket` (the operation-digest binding, the admin
     /// service key; Q-523): the Authenticator carries no `cksum`, so
@@ -448,6 +450,42 @@ pub enum AuditReason {
     /// Spec: docs/52 §3.10 (C10: the recorded result), §4.2; docs/questions/
     /// Q-937 item 6, Q-976.
     DecisionExecuted,
+    // ---- task PN8: the attestation key and the name resolution (docs/59 §7)
+    /// `install_attestation_key`: keyd already holds an attestation key. A
+    /// key is installed once per start, in the ceremony, and never replaced
+    /// (a second key would let whoever presents it decide which resolutions
+    /// keyd believes). Nothing changes. Reported as the uniform `Denied`.
+    /// Spec: docs/59 §7.4; docs/questions/Q-1011 item 2 (A-173: "delivered to
+    /// keyd in ceremony mode only, never exported").
+    AttestationKeyInstalled,
+    /// A name resolution reached keyd while it holds no attestation key (it
+    /// was never installed in this start's ceremony): no resolution can be
+    /// verified, so every one is refused (fail closed). Reported as the
+    /// uniform `Denied`.
+    /// Spec: docs/59 §7.2 step 1, §7.4; docs/questions/Q-1011 item 2;
+    /// AGENTS.md §6 (fail closed).
+    AttestationKeyMissing,
+    /// The name resolution's tag does not verify under the attestation key
+    /// (or a field is outside its bound): it is not dird's statement — the
+    /// fields are never used. Reported as the uniform `Denied`.
+    /// Spec: docs/59 §7.2 step 1, §7.5; docs/questions/Q-1011 item 4
+    /// (A-173: "NameResolutionInvalid").
+    NameResolutionInvalid,
+    /// The (verified) name resolution was issued more than
+    /// `NAME_RESOLUTION_WINDOW_SECS` (30 s) before or after keyd's own `now`.
+    /// Reported as the uniform `Denied`.
+    /// Spec: docs/59 §7.2 step 3, §7.5; docs/questions/Q-1011 items 3, 4
+    /// (A-173: W = 30 s on keyd's own clock; "NameResolutionStale").
+    NameResolutionStale,
+    /// The verified name resolution does not name the key set it was
+    /// presented for: another principal or another purpose than the key
+    /// set's handle, a canonical name that is not the key set's bound name
+    /// in the namespace's equivalence (principal-names), or a krbtgt key set
+    /// (bound only by its exact stored binding, never by a resolution).
+    /// Reported as the uniform `Denied`.
+    /// Spec: docs/59 §7.2 step 4, §7.5; docs/questions/Q-1011 item 4
+    /// (A-173: "NameResolutionMismatch"); RFC 4120 §6.2, §7.3.
+    NameResolutionMismatch,
 }
 
 /// A key referenced by an operation, for audit (no key material).

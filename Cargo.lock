@@ -751,6 +751,8 @@ dependencies = [
  "keyd-types",
  "krb-crypto",
  "krb-proto",
+ "name-attestation",
+ "principal-names",
  "zeroize",
 ]
 

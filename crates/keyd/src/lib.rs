@@ -14,7 +14,7 @@
 //! |-------------|------------|
 //! | `Kdc`       | [`Keyd::verify_preauth`], [`Keyd::issue_as_rep`], [`Keyd::open_and_verify_tgt`], [`Keyd::issue_tgs_rep`], [`Keyd::open_fast_armor`], [`Keyd::seal_fast_error`], [`Keyd::describe_config`], [`Keyd::ping`] |
 //! | `Directory` | [`Keyd::set_secret`] (on a dird decision), [`Keyd::ping`] |
-//! | `Admin`     | before the seal: [`Keyd::create_key`], [`Keyd::grant_set_secret`] (initial secrets of users); always: [`Keyd::rotate_key`], [`Keyd::rotate_krbtgt`], [`Keyd::retire_kvno`], [`Keyd::destroy_key_set`] (each by dird decision id), [`Keyd::seal_ceremony`], [`Keyd::list_destroy_decisions`], [`Keyd::ping`] |
+//! | `Admin`     | before the seal: [`Keyd::create_key`], [`Keyd::grant_set_secret`] (initial secrets of users), [`Keyd::install_attestation_key`] (task PN8 — not yet a capability-table row: PN9); always: [`Keyd::rotate_key`], [`Keyd::rotate_krbtgt`], [`Keyd::retire_kvno`], [`Keyd::destroy_key_set`] (each by dird decision id), [`Keyd::seal_ceremony`], [`Keyd::list_destroy_decisions`], [`Keyd::ping`] |
 //! | `Ldap`      | [`Keyd::open_and_verify_service_ticket`], [`Keyd::verify_operation_ticket`], [`Keyd::register_decision`], [`Keyd::revoke_decision`] (task F3), [`Keyd::describe_config`], [`Keyd::ping`] |
 //!
 //! [`Keyd::verify_secret`] is in no role's row (A-102, docs/52 R4).
@@ -200,6 +200,18 @@
 //! is read from the key store, and a re-registration after the destruction
 //! schedules nothing.
 //!
+//! **Name resolutions** (task PN8, additive; docs/59 §7; decision A-173 —
+//! docs/questions/Q-1011): keyd holds one attestation key — installed by
+//! Role::Admin in the ceremony only ([`Keyd::install_attestation_key`]),
+//! never replaced, never exported, never used to tag — and verifies dird's
+//! `AttestedNameResolution` with it: tag (constant time, before any field)
+//! ⇒ realm ⇒ freshness (30 s on keyd's clock) ⇒ a `VerifiedNameResolution`,
+//! which exists only after those checks and is the only input of
+//! `StoredKeySet::bound_by` (principal and purpose = the set's own handle;
+//! canonical name = the bound name by the `principal-names` key). AS / TGS
+//! issuance still binds by `bound_to`; it moves to the resolution in task
+//! PN11 (crate name_resolution).
+//!
 //! # Time and randomness
 //!
 //! keyd reads no clock: every operation takes `now` from the caller, and the
@@ -238,7 +250,9 @@
 //!   they are sealed or decoded. Rust moves of `ProtocolKey` values may leave
 //!   stack copies. `mlock`, no core dumps and guard pages belong to the
 //!   daemon (docs/10 §11).
-//! - Name binding compares names exactly as given: canonicalization (case,
+//! - Name binding compares names exactly as given (`bound_to`; the
+//!   resolution path of task PN8 compares by the namespace key and is not
+//!   used for issuance until PN11): canonicalization (case,
 //!   aliases, enterprise names) is the KDC's job before it calls keyd, and a
 //!   binding is only as correct as the Admin / Directory caller that created
 //!   the key set. There is no rename in phase 1 (follow-up: a rename
@@ -326,7 +340,10 @@
 //! types (R7) and the destroy-registration rule (R6b), docs/52 §3.5, §3.6,
 //! §7, docs/10 §6א, §7, §9, §12 I6, docs/25 §3.2, RFC 4120 §3.2.3, §6.2
 //! (pinned copy, SHA-256 verified), docs/questions/Q-040, Q-071, Q-470,
-//! Q-471, Q-501, Q-503 and decisions A-19, A-26, A-105, A-107. No other
+//! Q-471, Q-501, Q-503 and decisions A-19, A-26, A-105, A-107; for the
+//! attestation key and the verified name resolution (task PN8), docs/59
+//! §3, §7, §10, docs/questions/Q-1011, Q-1018, Q-1023 (decisions A-173,
+//! A-175) and RFC 4120 §6.2, §7.3 (pinned copy, SHA-256 verified). No other
 //! implementation was consulted or recalled.
 //!
 //! Spec: docs/10; docs/09 א; RFC 4120 §3, §5.
@@ -345,6 +362,7 @@ mod error;
 mod fast_armor;
 #[allow(clippy::module_inception)]
 mod keyd;
+mod name_resolution;
 mod replay;
 mod runtime;
 mod service_ticket;
@@ -371,6 +389,9 @@ pub use custody_backend::{
 };
 pub use entropy::{EntropyError, EntropySource, OsEntropy};
 pub use keyd::Keyd;
+// The attestation key's type, for the ceremony that installs it (task PN8 /
+// PN9) — not name-attestation's signer `tag`, which keyd neither uses nor
+// re-exports (docs/questions/Q-1011 item 2).
 pub use keyd_types::kerberos_time_seconds;
 pub use keyd_types::{
     is_admin_service_name, AppBinding, OperationDigest, ADMIN_SERVICE_CLASS, OPERATION_DIGEST_LEN,
@@ -400,6 +421,8 @@ pub use keyd_types::{
     MAX_DESTROY_DECISION_SECS, MAX_KEY_DECISIONS, MAX_KEY_DECISION_SECS,
     MIN_KEY_DECISION_APPROVERS,
 };
+pub use name_attestation::AttestationKey;
+pub use name_attestation::ATTESTATION_KEY_LEN;
 pub use state_change::{changes_key_state, loosens_authorization, requires_acknowledged_intent};
 pub use store::{InMemoryKeyStore, KeyStore, StoreError, StoredKeySet};
 pub use throttle::{FailureWindowThrottle, SecretThrottle};

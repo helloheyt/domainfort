@@ -52,8 +52,10 @@
 //! The name-type is authenticated too: it is a hint for equivalence (RFC
 //! 4120 §6.2) but part of the name dird saw, and everything the value
 //! carries is covered — nothing in it can change unseen. `issued_at` is its
-//! six calendar fields (RFC 4120 §5.2.3 `YYYYMMDDHHMMSSZ`); the purpose has
-//! an explicit code ([`KeyPurpose`] gains no variant without one).
+//! six calendar fields (RFC 4120 §5.2.3 `YYYYMMDDHHMMSSZ`); the purpose is
+//! its explicit code [`KeyPurpose::code`] — the one table of it, which the
+//! sealed store persists too ([`KeyPurpose`] gains no variant without one;
+//! docs/questions/Q-1023 item 4).
 //!
 //! # Bounds (AGENTS.md §6)
 //!
@@ -283,7 +285,7 @@ impl NameResolution {
         put_realm(&mut out, &f.canonical_realm)?;
         put_name(&mut out, &f.canonical_name)?;
         out.extend_from_slice(f.principal.as_bytes());
-        out.push(mac_purpose_code(f.key_purpose));
+        out.push(f.key_purpose.code());
         out.extend_from_slice(&f.snapshot.to_be_bytes());
         put_time(&mut out, &f.issued_at);
         Ok(out)
@@ -397,21 +399,6 @@ fn put_name(out: &mut Vec<u8>, name: &PrincipalName) -> Result<(), NameResolutio
 fn put_time(out: &mut Vec<u8>, t: &KerberosTime) {
     out.extend_from_slice(&t.year().to_be_bytes());
     out.extend_from_slice(&[t.month(), t.day(), t.hour(), t.minute(), t.second()]);
-}
-
-/// The MAC input's code of a purpose — explicit, so that the encoding does
-/// not depend on the enum's in-memory representation; a new purpose fails
-/// to compile here until it is given a code. The same numbers as the sealed
-/// store's persisted codes (`sealed_store`; Q-1023 item 4).
-/// Spec: docs/10 §1 (KeyPurpose); docs/59 §7.1 (`key_purpose`).
-const fn mac_purpose_code(purpose: KeyPurpose) -> u8 {
-    match purpose {
-        KeyPurpose::PrincipalLongterm => 0,
-        KeyPurpose::Krbtgt => 1,
-        KeyPurpose::Service => 2,
-        KeyPurpose::AdminService => 3,
-        KeyPurpose::ChangePasswordService => 4,
-    }
 }
 
 // The bounds fit the prefixes that carry them.
@@ -674,19 +661,27 @@ mod tests {
         assert_eq!(NAME_RESOLUTION_WINDOW_SECS, 30);
     }
 
-    /// Every purpose has its own code, equal to the sealed store's persisted
-    /// code (docs/10 §1; Q-1023 item 4).
+    /// Every purpose puts its own code — `KeyPurpose::code`, the one table
+    /// the sealed store persists too (Q-1023 item 4) — at the purpose's
+    /// position of the MAC input, after the label, the two realms and names
+    /// of `fields()` and the principal id; the numbers are pinned literally.
     #[test]
     fn every_purpose_has_its_own_code() {
         let all = [
-            (KeyPurpose::PrincipalLongterm, 0),
+            (KeyPurpose::PrincipalLongterm, 0u8),
             (KeyPurpose::Krbtgt, 1),
             (KeyPurpose::Service, 2),
             (KeyPurpose::AdminService, 3),
             (KeyPurpose::ChangePasswordService, 4),
         ];
+        // label (1 + 28), realm (2 + 8), name (4 + 1 + 2 + 5), twice, then
+        // the principal id (16).
+        let at = 1 + 28 + 2 * ((2 + 8) + (4 + 1 + 2 + 5)) + 16;
         for (purpose, code) in all {
-            assert_eq!(mac_purpose_code(purpose), code, "{purpose:?}");
+            let mut f = fields();
+            f.key_purpose = purpose;
+            assert_eq!(input_of(f)[at], code, "{purpose:?}");
+            assert_eq!(purpose.code(), code, "{purpose:?}");
         }
     }
 

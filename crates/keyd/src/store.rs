@@ -39,7 +39,13 @@
 //!   one, the binding unchanged);
 //! * a set is created only from a `NewBinding` — built only by
 //!   `template::check_new_binding`, the creation rule of A-19 — so a key set
-//!   bound to a name the rule refuses is unrepresentable.
+//!   bound to a name the rule refuses is unrepresentable;
+//! * (task PN8, additive — issuance adopts it in PN11) `StoredKeySet::bound_by`
+//!   returns a `BoundKeys` only for a `VerifiedNameResolution` — a dird
+//!   statement whose tag, realm and freshness keyd checked, which exists
+//!   only after those checks (crate name_resolution) — that names this set's
+//!   own handle and, in the namespace's equivalence (`principal-names`), its
+//!   bound name (docs/59 §7.2; class C3 closed for names, C5 kept closed).
 //!
 //! The raw accessors (the current and previous versions, the binding, and the
 //! key lookups of a version) are private to this module. A new operation that
@@ -69,6 +75,7 @@
 use crate::audit::AuditReason;
 use crate::error::{Deny, Internal};
 use crate::model::{KeyHandle, KeyPurpose, Kvno, PrincipalBinding};
+use crate::name_resolution::VerifiedNameResolution;
 use crate::template::NewBinding;
 use core::fmt;
 use krb_crypto::{EncType, ProtocolKey};
@@ -263,10 +270,18 @@ pub(crate) enum UnboundUse {
 ///
 /// Opaque: no public constructor, no public key accessor (I1).
 ///
+/// The set also keeps the handle its creation rule was checked for (task
+/// PN8): `StoredKeySet::bound_by` compares a verified name resolution with
+/// the set's **own** handle, fixed at creation — never with a handle a
+/// caller passes alongside (which could name another key set than the one
+/// whose keys are then used).
+///
 /// Spec: docs/10 §1 ("keyd holds current + previous"; "decrypt may try a set
 /// of kvnos; signing/sealing always with the current kvno"); docs/09 D32;
-/// docs/questions/Q-040 (A-19, name binding); docs/52 §3.5 (R7).
+/// docs/questions/Q-040 (A-19, name binding); docs/52 §3.5 (R7); docs/59
+/// §7.2 step 4.
 pub struct StoredKeySet {
+    handle: KeyHandle,
     binding: PrincipalBinding,
     current: KvnoKeys,
     previous: Option<KvnoKeys>,
@@ -276,11 +291,12 @@ impl StoredKeySet {
     /// A new key set from its creation proof — the binding passed the
     /// creation rule (`template::check_new_binding`) for one handle — and its
     /// first version. Returns that handle, under which the caller stores the
-    /// set.
-    /// Spec: docs/questions/Q-040 (A-19); docs/10 §6, §7.
+    /// set; the set keeps it too (for `StoredKeySet::bound_by`).
+    /// Spec: docs/questions/Q-040 (A-19); docs/10 §6, §7; docs/59 §7.2.
     pub(crate) fn create(binding: NewBinding, current: KvnoKeys) -> (KeyHandle, StoredKeySet) {
         let (handle, binding) = binding.into_parts();
         let set = StoredKeySet {
+            handle,
             binding,
             current,
             previous: None,
@@ -311,6 +327,51 @@ impl StoredKeySet {
         } else {
             Err(Deny::denied(AuditReason::NameBindingMismatch))
         }
+    }
+
+    /// The proof that this set is the one a **verified** name resolution
+    /// names — dird's statement, checked by keyd (`name_attestation::verify`
+    /// ⇒ realm ⇒ freshness, `Keyd::verify_name_resolution`) — through which
+    /// its keys are used; otherwise `Denied` (reason
+    /// `NameResolutionMismatch`). Additive beside [`StoredKeySet::bound_to`]:
+    /// issuance moves to it in task PN11 (docs/59 §10); nothing calls it
+    /// outside tests yet.
+    ///
+    /// All of:
+    /// 1. the set is not a krbtgt key set — the krbtgt is reached only by
+    ///    its exact stored binding (`bound_to(realm, krbtgt/REALM)`), never
+    ///    by a resolution (docs/59 §7.2: "the KDC always writes the
+    ///    canonical `krbtgt/<REALM>`"; RFC 4120 §7.3);
+    /// 2. the resolution's principal **and** key purpose are the set's own
+    ///    handle (docs/59 §7.2 step 4: `principal == handle.principal` and
+    ///    `key_purpose == handle.purpose`) — the handle the set was created
+    ///    for, not one the caller supplies;
+    /// 3. the resolution's canonical name is the set's bound name in the
+    ///    namespace's one equivalence — the same `principal-names` key, the
+    ///    name-type ignored (RFC 4120 §6.2) and the case folded — never an
+    ///    octet comparison: keyd holds no second definition of "the same
+    ///    name" (class C49, docs/59 §3 M3; Q-1011 item 6).
+    ///
+    /// The type does the rest: a `VerifiedNameResolution` exists only after
+    /// the tag, realm and freshness checks (crate name_resolution), so an
+    /// unchecked or stale resolution cannot reach this function.
+    ///
+    /// Spec: docs/59 §7.2 steps 1–4, §3 (M4 = C3, keeping C5 closed — R7);
+    /// docs/questions/Q-1011 items 4–6 (A-173); RFC 4120 §6.2, §7.3;
+    /// AGENTS.md §6.1 (a proof type built only after the check).
+    #[cfg_attr(not(test), allow(dead_code))] // issuance adopts it in PN11
+    pub(crate) fn bound_by(&self, verified: &VerifiedNameResolution) -> Internal<BoundKeys<'_>> {
+        let mismatch = Err(Deny::denied(AuditReason::NameResolutionMismatch));
+        if self.handle.purpose == KeyPurpose::Krbtgt {
+            return mismatch;
+        }
+        if verified.handle() != self.handle {
+            return mismatch;
+        }
+        if !verified.names_binding(&self.binding) {
+            return mismatch;
+        }
+        Ok(BoundKeys { set: self })
     }
 
     /// The current version, for a declared use in which the principal's
@@ -380,6 +441,7 @@ impl StoredKeySet {
 impl fmt::Debug for StoredKeySet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StoredKeySet")
+            .field("handle", &self.handle)
             .field("binding", &self.binding)
             .field("current", &self.current)
             .field("previous", &self.previous)
@@ -586,6 +648,7 @@ mod tests {
     /// `template::check_new_binding`'s, tested there and through keyd).
     fn set(kvno: u32) -> StoredKeySet {
         StoredKeySet {
+            handle: KeyHandle::new(PrincipalId::from_bytes([1; 16]), KeyPurpose::Service),
             binding: binding(),
             current: KvnoKeys::random(Kvno::new(kvno), vec![key(0x11)]),
             previous: None,
@@ -754,6 +817,7 @@ mod tests {
     #[test]
     fn debug_has_no_key_material() {
         let s = StoredKeySet {
+            handle: KeyHandle::new(PrincipalId::from_bytes([1; 16]), KeyPurpose::Service),
             binding: binding(),
             current: KvnoKeys::random(Kvno::new(3), vec![key(0x5A)]),
             previous: None,
