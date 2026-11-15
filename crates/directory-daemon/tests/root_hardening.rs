@@ -23,19 +23,52 @@
 //!   no longer be opened (the drop took effect), and the tokio runtime and a
 //!   thread start — the order of `main`.
 //!
+//! # How to run the root scenario (docs/questions/Q-680)
+//!
+//! As root, on Linux, in an isolated machine (never a host), from a
+//! checkout **copied as root** — every file and directory root's (`cp -r`
+//! as root, not `cp -a` / `rsync -a` of an account's tree, which keep its
+//! owner) — to a path of only `A-Z a-z 0-9 . _ - /` whose every directory
+//! from `/` is root's, mode 0755, e.g. `/srv/lds` (not under `/root`, mode
+//! 0700 — the other tier-3 tests' daemons must walk the path after their
+//! drop; one layout serves them all); built and run there as root:
+//! `cargo test -p directory-daemon --test root_hardening -- --ignored`.
+//! `HOME` does not matter.
+//!
+//! # Fixtures, as production has them
+//!
+//! The **parent** (root, never hardened) makes the scenario's tier-3
+//! scratch directory (crates/test-scratch `ScratchDir::new_tier3`: root's,
+//! mode 0755, every directory above it root's 0755 — or a refusal naming
+//! the directory at fault) and removes it once the child exits: the child,
+//! after its drop, can no longer remove root's files. In it the child
+//! writes `integrity.key`: root's (written by the root child), mode exactly
+//! 0400, 32 octets — the rule of `read_integrity_key` (docs/50 §7.4; Q-270
+//! item 1), read with root as the expected owner, so every directory on the
+//! path must be root's (Q-468 option 2(b), Q-480 item 5).
+//!
 //! Sources: docs/50 R50-14, R50-19, §6.1, §6.2, §6.4, §7.4, §9;
-//! docs/questions/Q-235 (A-61), Q-270 item 1. Test identities (uid/gid
-//! 61002) are project choices.
+//! docs/questions/Q-235 (A-61), Q-270 item 1, Q-480, Q-680. Test identities
+//! (uid/gid 61002) are project choices.
 
 use config::DirdSettings;
 use daemon_sandbox::{apply, SandboxError, SingleThreadProof};
 use directory_daemon::startup::{hardening_plan, read_integrity_key};
 use std::env;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
 /// Names the scenario a child process runs.
 const SCENARIO_ENV: &str = "DIRD_TIER3_SCENARIO";
+
+/// Names the tier-3 scratch directory the parent made for the child's
+/// scenario (module documentation).
+const SCRATCH_ENV: &str = "DIRD_TIER3_SCRATCH";
+
+/// The integrity key file's mode. Spec: docs/50 §7.4; Q-270 item 1 ("root,
+/// mode exactly 0400").
+const KEY_FILE_MODE: u32 = 0o400;
 
 /// Why the root scenario is skipped by default (docs/50 R50-19 tier 3).
 const ROOT_ONLY: &str = "requires root on Linux in an isolated environment: it drops the \
@@ -66,6 +99,9 @@ type Outcome = Result<(), String>;
 struct Scenario {
     name: &'static str,
     ignore: Option<&'static str>,
+    /// The tag of the tier-3 scratch directory the parent makes for the
+    /// scenario, if it needs one (module documentation).
+    scratch: Option<&'static str>,
     run: fn() -> Outcome,
 }
 
@@ -73,11 +109,13 @@ const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "unprivileged_apply_fails_closed",
         ignore: None,
+        scratch: None,
         run: unprivileged_apply_fails_closed,
     },
     Scenario {
         name: "root_dird_plan_applies_then_key_is_unreadable",
         ignore: Some(ROOT_ONLY),
+        scratch: Some("dird3"),
         run: root_dird_plan_applies_then_key_is_unreadable,
     },
 ];
@@ -148,7 +186,26 @@ fn run_parent() -> ExitCode {
             );
             continue;
         }
-        let status = Command::new(&exe).env(SCENARIO_ENV, scenario.name).status();
+        let scratch = match scenario
+            .scratch
+            .map(test_scratch::ScratchDir::new_tier3)
+            .transpose()
+        {
+            Ok(scratch) => scratch,
+            Err(error) => {
+                println!("test {} ... FAILED: {error}", scenario.name);
+                failed += 1;
+                continue;
+            }
+        };
+        let mut command = Command::new(&exe);
+        command.env(SCENARIO_ENV, scenario.name);
+        if let Some(scratch) = &scratch {
+            command.env(SCRATCH_ENV, scratch.path());
+        }
+        let status = command.status();
+        // Removed by root, now that the child has exited.
+        drop(scratch);
         if matches!(status, Ok(s) if s.success()) {
             println!("test {} ... ok", scenario.name);
         } else {
@@ -163,13 +220,12 @@ fn run_parent() -> ExitCode {
     }
 }
 
-/// The current uid: the owner of a directory this process creates.
+/// The current uid: the owner of a directory this process creates (in the
+/// workspace's scratch root, crates/test-scratch — not the temporary
+/// directory).
 fn current_uid() -> Result<u32, String> {
-    let dir = env::temp_dir().join(format!("dird-t3-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let uid = std::fs::metadata(&dir).map_err(|e| e.to_string())?.uid();
-    let _ = std::fs::remove_dir(&dir);
-    Ok(uid)
+    let dir = test_scratch::ScratchDir::new("dird-t3-uid").map_err(|e| e.to_string())?;
+    dir.uid().map_err(|e| e.to_string())
 }
 
 /// docs/50 §7.5, R50-14: without root (or off Linux) dird's plan cannot be
@@ -195,13 +251,16 @@ fn unprivileged_apply_fails_closed() -> Outcome {
 /// process; the runtime builds and a thread starts.
 fn root_dird_plan_applies_then_key_is_unreadable() -> Outcome {
     let proof = SingleThreadProof::claim().map_err(|e| e.to_string())?;
-    // Inside the workspace (crates/test-scratch, Q-480): the protected-file
-    // walk from `/` must accept every directory for root's expectation — so
-    // the checkout must be root's (P-27).
-    let key_dir = test_scratch::ScratchDir::new("dird-t3-key").map_err(|e| e.to_string())?;
+    // The parent's tier-3 scratch directory (module documentation): root's,
+    // 0755, every directory above it root's — the protected-file walk from
+    // `/` accepts each one for root's expectation (Q-468 option 2(b)).
+    let key_dir = env::var_os(SCRATCH_ENV)
+        .map(PathBuf::from)
+        .ok_or("no tier-3 scratch directory: the parent makes it")?;
     let key_path = key_dir.join("integrity.key");
+    // Written by this root process: root's; then mode exactly 0400.
     std::fs::write(&key_path, [0x5D; 32]).map_err(|e| e.to_string())?;
-    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o400))
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(KEY_FILE_MODE))
         .map_err(|e| e.to_string())?;
     let _key = read_integrity_key(&key_path, 0).map_err(|e| e.to_string())?;
     let settings = DirdSettings::parse(DIRD.as_bytes()).map_err(|e| e.to_string())?;

@@ -6,19 +6,62 @@
 //! account; and a root connection — uid 0, never mapped (R50-3) — is closed
 //! without a reply.
 //!
-//! Run as root on Linux with `cargo test -p audit-daemon --test tier3_root
-//! -- --ignored`. Anywhere else the test reports why it skipped.
+//! # How to run (docs/questions/Q-680)
+//!
+//! As root, on Linux, in an isolated machine (never a host), from a
+//! checkout **copied as root** — every file and directory root's (`cp -r`
+//! as root, not `cp -a` / `rsync -a` of an account's tree, which keep its
+//! owner) — to a path of only `A-Z a-z 0-9 . _ - /` whose every directory
+//! from `/` is root's, mode 0755, e.g. `/srv/lds`; built and run there as
+//! root: `cargo test -p audit-daemon --test tier3_root -- --ignored`. **Not
+//! under `/root`** (mode 0700): after its drop the daemon walks to its log
+//! and socket directories as `RUN_AS`, and the walk opens every directory
+//! `O_RDONLY` (docs/questions/Q-482 item 6). `HOME` does not matter: the
+//! fixtures live under `<checkout>/.test-scratch-tier3/`
+//! (crates/test-scratch `ScratchDir::new_tier3`), which refuses, naming the
+//! directory at fault, on any other layout. Off Linux or not as root the
+//! test reports why it skipped.
+//!
+//! # Fixtures, as production has them
+//!
+//! | path (under the tier-3 scratch directory) | owner | mode | rule |
+//! |---|---|---|---|
+//! | every directory above it, and itself | root | 0755 | the walk from `/` for root (configuration) and for `RUN_AS` (log, socket) — Q-468 option 2(b), Q-482 item 6 |
+//! | `auditd.conf` | root | 0644 | docs/50 §7.1 ("root:0644"); crate::startup step 3 |
+//! | `log/` | `RUN_AS`:`RUN_AS` | 0750 | auditd's data directory: root's or auditd's, not writable by group or others (crate::segments) |
+//! | `log/audit.log.<n>` | `RUN_AS` (made by the daemon) | 0600 | `data_file_rule` (A-109) |
+//! | `run/` | `RUN_AS`:`RUN_AS` | 0750 | the socket directory, present: auditd's, no group write, nothing for others (docs/50 §3.1; `prepare_socket_directory`, A-113) |
+//! | `run/audit.sock` | `RUN_AS` (bound by the daemon) | 0660 | docs/50 §3.1 |
 
 mod common;
 
 use common::*;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// The account the daemon drops to in this test (numeric, need not exist —
 /// docs/50 §7.1 "numeric ids, no NSS lookup").
 const RUN_AS: u32 = 4321;
+
+/// The configuration file's mode. Spec: docs/50 §7.1 ("root:0644 (not
+/// secret)").
+const CONFIGURATION_MODE: u32 = 0o644;
+
+/// The mode of auditd's log and socket directories here: rwx for auditd,
+/// r-x for its group, nothing for others — what the socket directory may
+/// have at most (docs/50 §3.1: "mode 0750") and the log directory's walk
+/// accepts (no write for group or others).
+const DAEMON_DIRECTORY_MODE: u32 = 0o750;
+
+/// Create `path` as a directory of `RUN_AS` (uid and gid) with
+/// [`DAEMON_DIRECTORY_MODE`], set exactly whatever the umask.
+fn daemon_directory(path: &Path) {
+    std::fs::create_dir(path).unwrap();
+    std::os::unix::fs::chown(path, Some(RUN_AS), Some(RUN_AS)).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(DAEMON_DIRECTORY_MODE)).unwrap();
+}
 
 #[test]
 #[ignore = "root only (docs/50 §9 tier 3): run as root on Linux with --ignored"]
@@ -31,18 +74,17 @@ fn daemon_drops_privileges_before_creating_files_and_binding() {
         eprintln!("skipped: the privilege drop needs root");
         return;
     }
-    let dir = TempDir::new();
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-    let log_dir = dir.path().join("log");
-    let run_dir = dir.path().join("run");
-    for sub in [&log_dir, &run_dir] {
-        std::fs::create_dir(sub).unwrap();
-        std::os::unix::fs::chown(sub, Some(RUN_AS), Some(RUN_AS)).unwrap();
-        std::fs::set_permissions(sub, std::fs::Permissions::from_mode(0o750)).unwrap();
-    }
+    // Root's, 0755, every directory above root's 0755 — or a refusal that
+    // says how to run tier 3 (module documentation).
+    let dir = test_scratch::ScratchDir::new_tier3("adt3").unwrap_or_else(|e| panic!("{e}"));
+    let log_dir = dir.join("log");
+    let run_dir = dir.join("run");
+    daemon_directory(&log_dir);
+    daemon_directory(&run_dir);
     let socket = run_dir.join("audit.sock");
     let base = log_dir.join("audit.log");
-    let config_path = dir.path().join("auditd.conf");
+    let config_path = dir.join("auditd.conf");
+    // Written by this root process: root's.
     std::fs::write(
         &config_path,
         format!(
@@ -54,7 +96,12 @@ fn daemon_drops_privileges_before_creating_files_and_binding() {
         ),
     )
     .unwrap();
-    std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::set_permissions(
+        &config_path,
+        std::fs::Permissions::from_mode(CONFIGURATION_MODE),
+    )
+    .unwrap();
+    assert_eq!(std::fs::metadata(&config_path).unwrap().uid(), 0);
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_audit-daemon"))
         .arg(&config_path)

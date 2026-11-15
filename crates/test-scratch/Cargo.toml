@@ -20,11 +20,19 @@
 # other octet (this development host's checkout is under `…/linux server/…`)
 # the root is `$HOME/.test-scratch` instead — the same properties.
 #
+# Tier 3 (root; docs/50 §9): `ScratchDir::new_tier3` makes
+# `<workspace>/.test-scratch-tier3/<unique>` — root's, mode 0755, never under
+# `$HOME` — after checking that every directory above it is root's, not
+# writable by group or others and readable by others (the daemons' accounts
+# walk it after their drop, Q-482 item 6) and that the process is root; it
+# refuses otherwise with how tier 3 must be run (docs/questions/Q-680).
+#
 # Used only from `[dev-dependencies]`. No dependency, no unsafe, no panic: the
 # constructor returns `io::Result` and the tests decide.
 #
 # Written only from this project's decided design (docs/52 §3.13, §3.18;
-# Q-468; Q-480) and the Rust standard library's API. No other implementation
+# docs/50 §9; Q-468; Q-480; Q-482; Q-680) and the Rust standard library's
+# API. No other implementation
 # consulted or recalled (AGENTS.md §1-3).
 
 [package]

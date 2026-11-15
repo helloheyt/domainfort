@@ -10,6 +10,8 @@ crates/*/fuzz/Cargo.lock
 
 # ספריות-עבודה של בדיקות שקוראות דרך protected-file (crates/test-scratch; Q-480)
 /.test-scratch/
+# ספריות-העבודה של בדיקות tier-3 כ-root (של root, 0755; crates/test-scratch `ScratchDir::new_tier3`; Q-680)
+/.test-scratch-tier3/
 
 # ספריית מפרטים — הקבצים שהורדו נשמרים מקומית; המניפסט (עם ה-sha256) כן ב-track.
 /tools/spec-pin/cache/

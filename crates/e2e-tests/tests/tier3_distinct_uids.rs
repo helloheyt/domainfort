@@ -33,9 +33,41 @@
 //! The uids and gid (61100-61105) are project choices for an isolated test
 //! machine.
 //!
+//! # How to run (docs/questions/Q-680)
+//!
+//! As root, on Linux, in an isolated machine (never a host), from a
+//! checkout **copied as root** — every file and directory root's (`cp -r`
+//! as root, not `cp -a` / `rsync -a` of an account's tree, which keep its
+//! owner) — to a path of only `A-Z a-z 0-9 . _ - /` whose every directory
+//! from `/` is root's, mode 0755, e.g. `/srv/lds`; built and run there as
+//! root: `cargo test -p e2e-tests --test tier3_distinct_uids -- --ignored`.
+//! **Not under `/root`** (mode 0700): auditd and dird walk to their log and
+//! store as their own accounts, and the walk opens every directory
+//! `O_RDONLY` (docs/questions/Q-482 item 6). `HOME` does not matter: the
+//! fixtures live under `<checkout>/.test-scratch-tier3/` (crates/
+//! test-scratch `ScratchDir::new_tier3`), which refuses, naming the
+//! directory at fault, on any other layout — never under the temporary
+//! directory (`/tmp` is 1777: the directory rule refuses it, sticky bit or
+//! not).
+//!
+//! # Fixtures, as production has them
+//!
+//! | path (under the tier-3 scratch directory) | owner | mode | read by |
+//! |---|---|---|---|
+//! | every directory above it, and itself | root | 0755 | every walk (root's and the daemons' accounts') — Q-468 option 2(b), Q-482 item 6 |
+//! | `integrity.key` | root | 0400 | dird's `read_integrity_key`, as root (docs/50 §7.4; Q-270 item 1) |
+//! | `policy.store` | root | 0644 | dird's and the kdc's `read_policy`, as root (A-68; docs/50 §7.1) |
+//! | `l.redb` | root | 0600 | the test only (the reference copy, opened by path) |
+//! | `audit/` | auditd:shared | 0750 | auditd's log and socket directory (docs/50 §3.1: "owned by the server's uid, mode 0750, group = the channel's clients") |
+//! | `audit/audit.log.<n>` | auditd (made by it) | 0600 | auditd, then root's verification with auditd as the owner (`data_file_rule`, A-109) |
+//! | `keyd/` | keyd:shared | 0750 | keyd's socket directory |
+//! | `dird/` | dird:shared | 0750 | dird's store and socket directory |
+//! | `dird/r.redb` | dird:shared | 0600 | dird's `open_store`, as dird (`data_file_rule`; docs/50 §6.4 "owned by dird, 0600") |
+//! | the sockets | each daemon (bound by it) | 0660 | the daemons, through the shared group |
+//!
 //! Sources: docs/50 R50-3, R50-17, R50-19, §3.1, §3.2, §6.1, §6.2, §8.1,
-//! §9; docs/questions Q-245 item 11; RFC 4120 §7.2.1, §7.2.2; RFC 4511
-//! §4.5.1. Every value is made here.
+//! §9; docs/questions Q-245 item 11, Q-480, Q-680; RFC 4120 §7.2.1,
+//! §7.2.2; RFC 4511 §4.5.1. Every value is made here.
 
 #[path = "../../kdc/tests/common/mod.rs"]
 mod common;
@@ -48,7 +80,7 @@ use directory_daemon::{SharedClock, StoreSource};
 use ipc_audit::{decode_event, EventBody, KeydRole};
 use keyd::Role;
 use keyd_daemon::CallerMap;
-use std::os::unix::fs::{chown, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{chown, PermissionsExt};
 use std::path::{Path, PathBuf};
 use support::kdcd::{message, tcp_send, udp_send, Handles, HeldClock, Kdcd};
 use support::ldap_client::{root_dse, tcp, tls_over, LdapReader};
@@ -62,6 +94,13 @@ const KDC_UID: u32 = 61104;
 const FRONT_UID: u32 = 61105;
 /// The one group of every daemon thread (module documentation).
 const SHARED_GID: u32 = 61100;
+
+/// A daemon's directory: rwx for the daemon, r-x for the shared group (the
+/// other daemons reach its sockets through it), nothing for others — the
+/// socket directory's mode (docs/50 §3.1: "mode 0750, group = the channel's
+/// clients"), and no write for group or others, as the walk to a data file
+/// requires (Q-468 option 2(b)).
+const DAEMON_DIRECTORY_MODE: u32 = 0o750;
 
 /// docs/50 R50-19 tier 3; Q-310: distinct uids per daemon — each record of
 /// auditd's verified log carries its sender's uid and the source auditd's
@@ -115,30 +154,25 @@ fn as_account<T: Send + 'static>(
     .map_err(|_| format!("the start of uid {uid} panicked"))?
 }
 
-/// A directory owned by `uid` (mode 0755) inside `base`.
+/// A directory of `uid` and the shared group, mode
+/// [`DAEMON_DIRECTORY_MODE`] (set exactly, whatever the umask), inside
+/// `base`.
 fn owned_dir(base: &Path, name: &str, uid: u32) -> Result<PathBuf, String> {
     let dir = base.join(name);
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| e.to_string())?;
+    std::fs::create_dir(&dir).map_err(|e| e.to_string())?;
     chown(&dir, Some(uid), Some(SHARED_GID)).map_err(|e| e.to_string())?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(DAEMON_DIRECTORY_MODE))
+        .map_err(|e| e.to_string())?;
     Ok(dir)
 }
 
 fn run() -> Result<(), String> {
-    // As root only: the base directory (0755, root-owned) proves it.
-    let base = std::env::temp_dir().join(format!("e2e-t3-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
-    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| e.to_string())?;
-    if std::fs::metadata(&base).map_err(|e| e.to_string())?.uid() != 0 {
-        let _ = std::fs::remove_dir_all(&base);
-        return Err(String::from("tier 3 must run as root (docs/50 R50-19)"));
-    }
-    let result = deploy_and_check(&base);
-    let _ = std::fs::remove_dir_all(&base);
-    result
+    // As root only, from a root-owned checkout: the tier-3 scratch directory
+    // (root's, 0755, every directory above it root's 0755) is made only for
+    // root, and otherwise refused with how to run tier 3 (module
+    // documentation). Removed, with everything in it, when this returns.
+    let base = test_scratch::ScratchDir::new_tier3("e2e3").map_err(|e| e.to_string())?;
+    deploy_and_check(base.path())
 }
 
 fn deploy_and_check(base: &Path) -> Result<(), String> {

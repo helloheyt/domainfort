@@ -23,19 +23,52 @@
 //!   took effect — R50-12: the key is read before it), the bound socket is
 //!   still open, and the tokio runtime starts and takes it (`from_std`).
 //!
+//! # How to run the root scenario (docs/questions/Q-680)
+//!
+//! As root, on Linux, in an isolated machine (never a host), from a
+//! checkout **copied as root** — every file and directory root's (`cp -r`
+//! as root, not `cp -a` / `rsync -a` of an account's tree, which keep its
+//! owner) — to a path of only `A-Z a-z 0-9 . _ - /` whose every directory
+//! from `/` is root's, mode 0755, e.g. `/srv/lds` (not under `/root`, mode
+//! 0700 — the other tier-3 tests' daemons must walk the path after their
+//! drop; one layout serves them all); built and run there as root:
+//! `cargo test -p ldap-front --test root_hardening -- --ignored`. `HOME`
+//! does not matter.
+//!
+//! # Fixtures, as production has them
+//!
+//! The **parent** (root, never hardened) makes the scenario's tier-3
+//! scratch directory (crates/test-scratch `ScratchDir::new_tier3`: root's,
+//! mode 0755, every directory above it root's 0755 — or a refusal naming
+//! the directory at fault) and removes it once the child exits: the child,
+//! after its drop, can no longer remove root's files. In it the child
+//! writes `dc-key.der`: root's (written by the root child), mode exactly
+//! 0400 — the rule of `read_private_key` (docs/50 R50-12: "the file 0400"),
+//! read with root as the expected owner, so every directory on the path
+//! must be root's (Q-468 option 2(b), Q-480 item 5).
+//!
 //! Sources: docs/50 R50-12, R50-14, R50-19, §6.1, §6.2, §6.4, §9;
-//! docs/questions/Q-235 (A-61). Test identities (uid/gid 61004) are project
-//! choices; the key octets are arbitrary test data (the reader does not
-//! parse them).
+//! docs/questions/Q-235 (A-61), Q-480, Q-680. Test identities (uid/gid
+//! 61004) are project choices; the key octets are arbitrary test data (the
+//! reader does not parse them).
 
 use config::LdapFrontSettings;
 use daemon_sandbox::{apply, SandboxError, SingleThreadProof};
 use ldap_front::startup::{hardening_plan, read_private_key};
 use std::env;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
 const SCENARIO_ENV: &str = "LDAP_FRONT_TIER3_SCENARIO";
+
+/// Names the tier-3 scratch directory the parent made for the child's
+/// scenario (module documentation).
+const SCRATCH_ENV: &str = "LDAP_FRONT_TIER3_SCRATCH";
+
+/// The private key file's mode. Spec: docs/50 R50-12 ("the key is read as
+/// root before the privilege drop, the file 0400").
+const KEY_FILE_MODE: u32 = 0o400;
 
 const ROOT_ONLY: &str = "requires root on Linux in an isolated environment: it drops the \
 process identity (docs/50 R50-19 tier 3); run with -- --ignored";
@@ -61,6 +94,9 @@ type Outcome = Result<(), String>;
 struct Scenario {
     name: &'static str,
     ignore: Option<&'static str>,
+    /// The tag of the tier-3 scratch directory the parent makes for the
+    /// scenario, if it needs one (module documentation).
+    scratch: Option<&'static str>,
     run: fn() -> Outcome,
 }
 
@@ -68,11 +104,13 @@ const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "unprivileged_apply_fails_closed",
         ignore: None,
+        scratch: None,
         run: unprivileged_apply_fails_closed,
     },
     Scenario {
         name: "root_front_plan_applies_after_key_and_bind",
         ignore: Some(ROOT_ONLY),
+        scratch: Some("lfront3"),
         run: root_front_plan_applies_after_key_and_bind,
     },
 ];
@@ -140,7 +178,26 @@ fn run_parent() -> ExitCode {
             );
             continue;
         }
-        let status = Command::new(&exe).env(SCENARIO_ENV, scenario.name).status();
+        let scratch = match scenario
+            .scratch
+            .map(test_scratch::ScratchDir::new_tier3)
+            .transpose()
+        {
+            Ok(scratch) => scratch,
+            Err(error) => {
+                println!("test {} ... FAILED: {error}", scenario.name);
+                failed += 1;
+                continue;
+            }
+        };
+        let mut command = Command::new(&exe);
+        command.env(SCENARIO_ENV, scenario.name);
+        if let Some(scratch) = &scratch {
+            command.env(SCRATCH_ENV, scratch.path());
+        }
+        let status = command.status();
+        // Removed by root, now that the child has exited.
+        drop(scratch);
         if matches!(status, Ok(s) if s.success()) {
             println!("test {} ... ok", scenario.name);
         } else {
@@ -155,12 +212,12 @@ fn run_parent() -> ExitCode {
     }
 }
 
+/// The current uid: the owner of a directory this process creates (in the
+/// workspace's scratch root, crates/test-scratch — not the temporary
+/// directory).
 fn current_uid() -> Result<u32, String> {
-    let dir = env::temp_dir().join(format!("lfront-t3-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let uid = std::fs::metadata(&dir).map_err(|e| e.to_string())?.uid();
-    let _ = std::fs::remove_dir(&dir);
-    Ok(uid)
+    let dir = test_scratch::ScratchDir::new("lfront-t3-uid").map_err(|e| e.to_string())?;
+    dir.uid().map_err(|e| e.to_string())
 }
 
 /// docs/50 §7.5, R50-14: without root (or off Linux) the front's plan
@@ -187,15 +244,16 @@ fn unprivileged_apply_fails_closed() -> Outcome {
 /// the socket still usable, and the runtime takes it.
 fn root_front_plan_applies_after_key_and_bind() -> Outcome {
     let proof = SingleThreadProof::claim().map_err(|e| e.to_string())?;
-    // Inside the workspace (crates/test-scratch, Q-480): the protected-file
-    // walk from `/` must accept every directory for root's expectation — so
-    // the checkout must be root's (P-27).
-    let root_dir = test_scratch::ScratchDir::new("lfront-t3-root").map_err(|e| e.to_string())?;
-    std::fs::set_permissions(root_dir.path(), std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| e.to_string())?;
+    // The parent's tier-3 scratch directory (module documentation): root's,
+    // 0755, every directory above it root's — the protected-file walk from
+    // `/` accepts each one for root's expectation (Q-468 option 2(b)).
+    let root_dir = env::var_os(SCRATCH_ENV)
+        .map(PathBuf::from)
+        .ok_or("no tier-3 scratch directory: the parent makes it")?;
     let key_path = root_dir.join("dc-key.der");
+    // Written by this root process: root's; then mode exactly 0400.
     std::fs::write(&key_path, [0x5Au8; 64]).map_err(|e| e.to_string())?;
-    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o400))
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(KEY_FILE_MODE))
         .map_err(|e| e.to_string())?;
     let key = read_private_key(&key_path, 0).map_err(|e| e.to_string())?;
     if key.len() != 64 {
