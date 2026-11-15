@@ -39,15 +39,18 @@ use directory_pip::{DnsName, KpasswdService, SoaParameters, ZoneParameters};
 use dirstore::{AttrId, NewObject};
 use dtyp::{Control, SecurityDescriptor, Sid, SECURITY_NT_AUTHORITY};
 use ipc::{encode_frame, Direction, Refused};
+use ipc_audit::{ZoneSerialCause, ZoneSerialOutcome, ZoneSerialStage};
 use ipc_dns::{
     Connection, Connector, DnsClient, DnsMessage, DnsReply, DnsRequest, ExpectedDird,
     ForwardRequest, FrontZone, ImageFetch, PeerAddress, Serial, Transport, TransportError,
     Unserved, DNS_CHANNEL,
 };
+use krb_proto::KerberosTime;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::thread::JoinHandle;
 use std::time::Instant;
 use support::{Directory, FakeAuditd, TempDir};
@@ -57,6 +60,51 @@ const DC: u32 = 50;
 
 /// The DC's address (192.0.2.0/24, hand-made).
 const DC_ADDRESS: [u8; 4] = [192, 0, 2, 10];
+
+/// The member host of the ageing test (small id; GUID = guid(id)).
+const WS04: u32 = 60;
+
+/// Its address (192.0.2.0/24, hand-made).
+const WS04_ADDRESS: [u8; 4] = [192, 0, 2, 40];
+
+/// dird's clock of these tests, set by the test (a `directory_daemon::Clock`
+/// — the daemon's clock seam, `DaemonParams::clock`).
+#[derive(Clone)]
+struct SetClock(Arc<Mutex<KerberosTime>>);
+
+impl SetClock {
+    fn at(time: KerberosTime) -> SetClock {
+        SetClock(Arc::new(Mutex::new(time)))
+    }
+    fn set(&self, time: KerberosTime) {
+        *self.0.lock().unwrap() = time;
+    }
+}
+
+impl directory_daemon::Clock for SetClock {
+    fn now(&self) -> Option<KerberosTime> {
+        Some(*self.0.lock().unwrap())
+    }
+}
+
+/// The `ZoneSerial` events auditd received (task DN10b): `(cause, from,
+/// stage)` in order.
+fn zone_serial_events(auditd: &FakeAuditd) -> Vec<(ZoneSerialCause, u32, ZoneSerialStage)> {
+    auditd
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            ipc_audit::EventBody::ZoneSerial(z) => Some((z.cause, z.from.get(), z.stage)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn advanced(serial: u32) -> ZoneSerialStage {
+    ZoneSerialStage::Outcome(ZoneSerialOutcome::Advanced {
+        serial: core::num::NonZeroU32::new(serial).unwrap(),
+    })
+}
 
 /// A canonical self-relative security descriptor (as tests/support's).
 fn sd_value() -> Vec<u8> {
@@ -113,8 +161,64 @@ fn dc_directory(path: &Path, address: bool) -> Directory {
         directory_pip::DNS_ZONE_SERIAL_END_EXCLUSIVE,
     )
     .unwrap();
+    // The change-seq counter (A-83: created at provisioning with the zone
+    // serial): the serial-only write is checked against its state (task
+    // DN10b; directory-admin `invariants`).
+    txn.create_counter(
+        directory_admin::CHANGE_SEQ_COUNTER,
+        directory_admin::CHANGE_SEQ_FIRST,
+        directory_admin::CHANGE_SEQ_END_EXCLUSIVE,
+    )
+    .unwrap();
     txn.commit().unwrap();
     d
+}
+
+/// A member host of the zone (task DN10b's ageing test): `ws04$` (WT),
+/// dNSHostName `ws04.example.org` — one LDH label under the zone (docs/54
+/// §5.3) — whose host record 192.0.2.40 is registered at `registered` (the
+/// value's attr-stamp is its registration time — docs/questions/Q-991 item
+/// 5), written raw (test only).
+fn add_member_host(d: &Directory, registered: &KerberosTime) {
+    let attr = |name: &str| -> AttrId { d.p1.attribute_by_name(name).unwrap() };
+    let class = d.p1.class_by_name("computer").unwrap();
+    let ws = NewObject {
+        guid: support::guid(WS04),
+        parent: Some(support::guid(support::USERS)),
+        classes: d.p1.class(class).unwrap().object_class.clone(),
+        attributes: vec![
+            (attr("cn"), vec![b"ws04".to_vec()]),
+            (attr("sAMAccountName"), vec![b"ws04$".to_vec()]),
+            (attr("objectSid"), vec![support::sid_of(WS04).encode()]),
+            (
+                attr("whenCreated"),
+                vec![support::WHEN_CREATED.to_be_bytes().to_vec()],
+            ),
+            (
+                attr("userAccountControl"),
+                vec![uac::ADS_UF_WORKSTATION_TRUST_ACCOUNT.to_be_bytes().to_vec()],
+            ),
+            (attr("dNSHostName"), vec![b"ws04.example.org".to_vec()]),
+            (attr("nTSecurityDescriptor"), vec![sd_value()]),
+        ],
+    };
+    d.create_all(vec![ws]);
+    let mut txn = d.store.begin_write().unwrap();
+    let origin = dirstore::Origin {
+        wall_clock: directory_admin::wall_clock(registered).unwrap(),
+        origin_node: dirstore::NodeId([0xDD; 16]),
+        origin_seq: 900,
+    };
+    txn.modify_object(
+        support::guid(WS04),
+        vec![dirstore::AttributeChange::Replace {
+            id: directory_pip::HOST_ADDRESS,
+            values: vec![WS04_ADDRESS.to_vec()],
+        }],
+        &origin,
+    )
+    .unwrap();
+    txn.commit().unwrap();
 }
 
 /// The zone values: RNAME hostmaster.example.org (RFC 1035 §8), the timers
@@ -149,7 +253,30 @@ struct DnsDird {
 
 impl DnsDird {
     fn start(dir: &TempDir, uid: u32, dnsd_uid: u32, directory: &Directory) -> DnsDird {
-        let params = support::params(dir, uid, uid, Duration::from_secs(5), 4);
+        DnsDird::start_with(
+            dir,
+            uid,
+            dnsd_uid,
+            directory,
+            None,
+            directory_daemon::MIN_SERIAL_ADVANCE_INTERVAL,
+        )
+    }
+
+    /// dird with its clock (`None`: the system clock) and the bound between
+    /// two serial advances for the clock (task DN10b) given.
+    fn start_with(
+        dir: &TempDir,
+        uid: u32,
+        dnsd_uid: u32,
+        directory: &Directory,
+        clock: Option<SetClock>,
+        min_serial_advance_interval: Duration,
+    ) -> DnsDird {
+        let mut params = support::params(dir, uid, uid, Duration::from_secs(5), 4);
+        if let Some(clock) = clock {
+            params.clock = directory_daemon::SharedClock::new(clock);
+        }
         let ldap_socket = params.ldap_socket.clone();
         let dns_socket = dir.join("n.sock");
         let dns = DnsParams {
@@ -158,6 +285,7 @@ impl DnsDird {
             zone: zone(KpasswdService::Absent),
             max_connections: directory_daemon::MAX_DNS_CONNECTIONS,
             queue_capacity: directory_daemon::DNS_QUEUE_CAPACITY,
+            min_serial_advance_interval,
         };
         let source: StoreSource = test_seams::opened(Arc::clone(&directory.store));
         let control = DaemonControl::new();
@@ -293,10 +421,14 @@ fn client(socket: &Path, dird_uid: u32) -> DnsClient<DnsConnector> {
 
 /// docs/54 §4.4, §4.6, §5.4: dnsd's `Ping` is answered with the internal
 /// zone; its first fetch gets the projection's image — apex example.org,
-/// SERIAL 1 (the counter's next value before any take — Q-991 item 6), the
-/// DC `dc1.example.org` as the one host, the three SRV records of a zone
-/// without kpasswd (RFC 4120 §7.2.3.2, [MS-ADTS] 6.3.2.3); a fetch naming
-/// that SERIAL is `Unchanged`. dird's other channels still listen.
+/// SERIAL 2: the counter's next value was 1 (Q-991 item 6) and the DNS
+/// service's start advanced it once through the one checker (task DN10b;
+/// docs/questions/Q-1002 item 4 (b)) — its `ZoneSerial` decision (cause
+/// `ServiceStart`, from 1) then its outcome (advanced to 2) reached auditd;
+/// the DC `dc1.example.org` as the one host, the three SRV records of a
+/// zone without kpasswd (RFC 4120 §7.2.3.2, [MS-ADTS] 6.3.2.3); a fetch
+/// naming that SERIAL is `Unchanged` (and advances nothing). dird's other
+/// channels still listen.
 #[test]
 fn dird_serves_the_zone_image_to_dnsd() {
     let dir = TempDir::new();
@@ -305,8 +437,15 @@ fn dird_serves_the_zone_image_to_dnsd() {
         return;
     }
     let directory = dc_directory(&dir.join("s.redb"), true);
-    let _auditd = FakeAuditd::start_recording_as(&dir.join("a.sock"), ipc_audit::EventSource::Dird);
+    let auditd = FakeAuditd::start_recording_as(&dir.join("a.sock"), ipc_audit::EventSource::Dird);
     let dird = DnsDird::start(&dir, uid, uid, &directory);
+    assert_eq!(
+        zone_serial_events(&auditd),
+        vec![
+            (ZoneSerialCause::ServiceStart, 1, ZoneSerialStage::Decision),
+            (ZoneSerialCause::ServiceStart, 1, advanced(2)),
+        ]
+    );
     assert!(dird.ldap_socket.exists(), "the LDAP channel listens");
     let mut dnsd = client(&dird.dns_socket, uid);
     dnsd.ping().expect("Pong with the internal zone");
@@ -318,7 +457,7 @@ fn dird_serves_the_zone_image_to_dnsd() {
         image.apex(),
         &DnsName::from_labels([&b"example"[..], b"org"]).unwrap()
     );
-    assert_eq!(image.serial(), 1);
+    assert_eq!(image.serial(), 2);
     assert_eq!(
         image.dc_name(),
         &DnsName::from_labels([&b"dc1"[..], b"example", b"org"]).unwrap()
@@ -326,11 +465,163 @@ fn dird_serves_the_zone_image_to_dnsd() {
     assert_eq!(image.host_count(), 1);
     assert_eq!(image.srv_services().count(), 3);
     assert_eq!(image.minimum(), 60);
-    let serial = Serial::new(1).unwrap();
+    let serial = Serial::new(2).unwrap();
     assert_eq!(
         dnsd.fetch_zone_image(Some(serial)).expect("confirmed"),
         ImageFetch::Unchanged(serial)
     );
+    assert_eq!(zone_serial_events(&auditd).len(), 2, "no further advance");
+    drop(dnsd);
+    dird.stop().expect("clean stop");
+}
+
+/// The current time of the ageing test: 2026-11-13T09:00:00Z.
+fn t0() -> KerberosTime {
+    KerberosTime::new(2026, 11, 13, 9, 0, 0).unwrap()
+}
+
+/// Task DN10b (docs/questions/Q-1002 item 4 (a), Q-993 item 3; RFC 2136
+/// §3.6: "If the zone appears to change, the SOA must appear to change as
+/// well"; docs/54 §5.2: an address leaves the image at
+/// `dns_record_max_age`): ws04's address, registered at t0 − 1 h, is in the
+/// image served at t0 under SERIAL 2. dird's clock (the clock seam) moves
+/// past t0 − 1 h + 7 days: the projection's content under SERIAL 2 changed
+/// with no write, so dird advances the serial through the one checker
+/// (cause `ContentAged`, from 2 — decision acknowledged, then the outcome:
+/// advanced to 3) and serves SERIAL 3 without ws04, instead of confirming
+/// `Unchanged`. A fetch naming 3 is `Unchanged` and advances nothing more.
+///
+/// Then dird's clock goes back to t0 (a clock jump): the content at t0
+/// holds ws04 again — it differs from SERIAL 3's — so another advance is
+/// needed, but the previous one was less than the bound ago (here 1 s, the
+/// test seam; the product bound is 10 s): the fetch is refused (fail closed:
+/// neither a stale `Unchanged` nor a second content under SERIAL 3), counted.
+/// After the bound the advance happens (from 3, to 4) and SERIAL 4 holds
+/// ws04 again. Addresses and times are hand-made test data.
+#[test]
+fn the_serial_advances_when_the_content_ages_and_the_bound_holds() {
+    let dir = TempDir::new();
+    let uid = support::my_uid(&dir);
+    if support::skip_as_root(uid) {
+        return;
+    }
+    let directory = dc_directory(&dir.join("s.redb"), true);
+    // 2026-11-13T08:00:00Z: one hour before t0.
+    add_member_host(
+        &directory,
+        &KerberosTime::new(2026, 11, 13, 8, 0, 0).unwrap(),
+    );
+    let auditd = FakeAuditd::start_recording_as(&dir.join("a.sock"), ipc_audit::EventSource::Dird);
+    let clock = SetClock::at(t0());
+    let dird = DnsDird::start_with(
+        &dir,
+        uid,
+        uid,
+        &directory,
+        Some(clock.clone()),
+        Duration::from_secs(1),
+    );
+    let mut dnsd = client(&dird.dns_socket, uid);
+    let image = match dnsd.fetch_zone_image(None).expect("the image") {
+        ImageFetch::Image(image) => image,
+        ImageFetch::Unchanged(_) => panic!("no image held yet"),
+    };
+    assert_eq!((image.serial(), image.host_count()), (2, 2));
+
+    // 7 days after the registration, plus one second: ws04's address aged
+    // out (2026-11-20T08:00:01Z).
+    clock.set(KerberosTime::new(2026, 11, 20, 8, 0, 1).unwrap());
+    let image = match dnsd
+        .fetch_zone_image(Some(Serial::new(2).unwrap()))
+        .expect("the new image")
+    {
+        ImageFetch::Image(image) => image,
+        ImageFetch::Unchanged(_) => panic!("a changed content was confirmed under SERIAL 2"),
+    };
+    assert_eq!((image.serial(), image.host_count()), (3, 1));
+    assert_eq!(
+        zone_serial_events(&auditd),
+        vec![
+            (ZoneSerialCause::ServiceStart, 1, ZoneSerialStage::Decision),
+            (ZoneSerialCause::ServiceStart, 1, advanced(2)),
+            (ZoneSerialCause::ContentAged, 2, ZoneSerialStage::Decision),
+            (ZoneSerialCause::ContentAged, 2, advanced(3)),
+        ]
+    );
+    let three = Serial::new(3).unwrap();
+    assert_eq!(
+        dnsd.fetch_zone_image(Some(three)).expect("confirmed"),
+        ImageFetch::Unchanged(three)
+    );
+    assert_eq!(zone_serial_events(&auditd).len(), 4);
+
+    // The clock jumps back to t0: within the bound, the fetch is refused.
+    clock.set(t0());
+    let deferred = directory_daemon::dns_serial_advance_deferred_count();
+    match dnsd.fetch_zone_image(Some(three)) {
+        Err(Unserved::Refused(Refused::Unavailable) | Unserved::Transport(_)) => {}
+        other => panic!("expected the fetch refused, got {other:?}"),
+    }
+    assert!(directory_daemon::dns_serial_advance_deferred_count() > deferred);
+    assert_eq!(zone_serial_events(&auditd).len(), 4, "nothing decided");
+    // After the bound: advanced, and ws04 is back.
+    std::thread::sleep(Duration::from_millis(1100));
+    let mut dnsd = client(&dird.dns_socket, uid);
+    let image = match dnsd.fetch_zone_image(Some(three)).expect("the new image") {
+        ImageFetch::Image(image) => image,
+        ImageFetch::Unchanged(_) => panic!("a changed content was confirmed under SERIAL 3"),
+    };
+    assert_eq!((image.serial(), image.host_count()), (4, 2));
+    assert_eq!(
+        zone_serial_events(&auditd)[4..],
+        [
+            (ZoneSerialCause::ContentAged, 3, ZoneSerialStage::Decision),
+            (ZoneSerialCause::ContentAged, 3, advanced(4)),
+        ]
+    );
+    drop(dnsd);
+    dird.stop().expect("clean stop");
+}
+
+/// Task DN10b (docs/54 §4.4; docs/questions/Q-1015 item 1): dird's clock
+/// going back without crossing a change of the content (here: t0 + 1 h,
+/// then t0 — ws04's address, registered at t0 − 1 h, is young at both) is
+/// no change — `Unchanged` is confirmed and nothing is advanced; only the
+/// start's advance is in the log.
+#[test]
+fn a_clock_going_back_without_a_change_advances_nothing() {
+    let dir = TempDir::new();
+    let uid = support::my_uid(&dir);
+    if support::skip_as_root(uid) {
+        return;
+    }
+    let directory = dc_directory(&dir.join("s.redb"), true);
+    add_member_host(
+        &directory,
+        &KerberosTime::new(2026, 11, 13, 8, 0, 0).unwrap(),
+    );
+    let auditd = FakeAuditd::start_recording_as(&dir.join("a.sock"), ipc_audit::EventSource::Dird);
+    let clock = SetClock::at(KerberosTime::new(2026, 11, 13, 10, 0, 0).unwrap());
+    let dird = DnsDird::start_with(
+        &dir,
+        uid,
+        uid,
+        &directory,
+        Some(clock.clone()),
+        Duration::from_secs(1),
+    );
+    let mut dnsd = client(&dird.dns_socket, uid);
+    let two = Serial::new(2).unwrap();
+    assert!(matches!(
+        dnsd.fetch_zone_image(None).expect("the image"),
+        ImageFetch::Image(_)
+    ));
+    clock.set(t0());
+    assert_eq!(
+        dnsd.fetch_zone_image(Some(two)).expect("confirmed"),
+        ImageFetch::Unchanged(two)
+    );
+    assert_eq!(zone_serial_events(&auditd).len(), 2, "the start's only");
     drop(dnsd);
     dird.stop().expect("clean stop");
 }
@@ -441,7 +732,10 @@ fn a_forwarded_message_is_refused_unread() {
 
 /// docs/54 §3.1 (the DC's A record comes from its computer object), §4.8:
 /// without the DC's host address the zone cannot be projected — dird starts,
-/// its other channels listen, `dird-dns.sock` is not bound.
+/// its other channels listen, `dird-dns.sock` is not bound; and nothing is
+/// written for a zone that cannot be served (task DN10b: the start's serial
+/// advance comes after the first projection — no `ZoneSerial` event, the
+/// counter unmoved).
 #[test]
 fn no_dns_service_without_the_dc_host_record() {
     let dir = TempDir::new();
@@ -450,11 +744,20 @@ fn no_dns_service_without_the_dc_host_record() {
         return;
     }
     let directory = dc_directory(&dir.join("s.redb"), false);
-    let _auditd = FakeAuditd::start_recording_as(&dir.join("a.sock"), ipc_audit::EventSource::Dird);
+    let auditd = FakeAuditd::start_recording_as(&dir.join("a.sock"), ipc_audit::EventSource::Dird);
     let dird = DnsDird::start(&dir, uid, uid, &directory);
     assert!(dird.ldap_socket.exists(), "dird's other services run");
     assert!(!dird.dns_socket.exists(), "no DNS service");
     dird.stop().expect("clean stop");
+    assert!(zone_serial_events(&auditd).is_empty());
+    let txn = directory.store.begin_write().unwrap();
+    assert_eq!(
+        txn.counter(directory_pip::DNS_ZONE_SERIAL_COUNTER)
+            .unwrap()
+            .unwrap()
+            .next_value,
+        1
+    );
 }
 
 /// A dird file with the DNS channel (hand-made; docs/questions/Q-619 item

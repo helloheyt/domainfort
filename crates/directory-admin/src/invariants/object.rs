@@ -480,10 +480,10 @@ fn check_group(ids: &Ids, obj: &Object, role: Option<ProvisioningRole>) -> Resul
 /// The zone a host record lives in and the networks its addresses must lie
 /// in (task DN6): the naming context's DNS name (A-53) and the configured
 /// registrable networks. The online PEP's checker has it when DNS
-/// self-updates are enabled; the provisioning session has none yet (task
-/// DN13 adds the DC's record) — without it no host address can be written
-/// (fail closed).
-/// Spec: docs/54 §5.3, §5.5; docs/questions/Q-614 items 3, 8.
+/// self-updates are enabled; the provisioning session when it is given one
+/// (`Provisioning::with_dns_registration`, task DN10b — the DC's own record)
+/// — without it no host address can be written (fail closed).
+/// Spec: docs/54 §5.3, §5.5; docs/questions/Q-614 items 3, 8, Q-1003 item 2.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HostZone {
     /// The zone (the NC's DNS name).

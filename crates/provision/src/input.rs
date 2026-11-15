@@ -5,14 +5,17 @@
 //! Task K9 adds the two network fronts (kpasswd-front, docs/53 §3.3, §10;
 //! dnsd, docs/54 §4.3, §10 row DN13 — its account, file and auditd mapping
 //! only) and the change-password service object's name (docs/53 §5.2).
+//! Task DN10b adds the DC's own addresses (`--dc-address`, docs/54 §3.1, §10
+//! row DN13), written as the DC's host record through the one checker.
 //!
 //! Spec: docs/51 §4.3 ("input (without any secret)"; step 1), §4.4, §4.6,
 //! §11; docs/50 §2.4, §3.1, R50-3, §7.1; docs/53 §3.3, §5.2, §10 (K9);
-//! docs/54 §4.3, §4.6, §4.7, §10 (DN13); decisions A-55, A-60, A-72, A-79,
-//! A-117, A-119, A-160, P-22 (Q-295); docs/questions/Q-345 items 6-8,
-//! Q-973.
+//! docs/54 §3.1, §4.3, §4.6, §4.7, §10 (DN13); decisions A-55, A-60, A-72,
+//! A-79, A-117, A-119, A-160, A-172, P-22 (Q-295); docs/questions/Q-345
+//! items 6-8, Q-973, Q-1003, Q-1014.
 
 use core::fmt;
+use core::net::Ipv4Addr;
 use std::path::Path;
 
 use directory_admin::{
@@ -225,6 +228,15 @@ pub struct Network {
     /// dnsd's `listen` addresses (each served on UDP and TCP, at least one —
     /// docs/54 §4.3, §4.7).
     pub dnsd_listen: Vec<String>,
+    /// The DC's own addresses — its host record, the zone's A records of the
+    /// DC's name (`--dc-address`, task DN10b; docs/54 §3.1: "written in
+    /// `provision domain` only", §10 row DN13): IPv4 in the standard dotted
+    /// form, 1 ..= 8 distinct, each registrable — inside an IPv4 internal
+    /// network (dird's `dns_registrable_networks`), never loopback,
+    /// unspecified or multicast (directory-pip `registrable`, the write
+    /// checker's own rule). docs/questions/Q-619 item 7, Q-1003 item 3,
+    /// Q-1014.
+    pub dc_addresses: Vec<String>,
 }
 
 /// The names chosen at provisioning — never hard-coded (docs/47 §6.3).
@@ -332,6 +344,20 @@ pub enum InputErrorKind {
     /// [MS-ADTS] 3.1.1.5.3.1.1.2): the zone projection would refuse the DC
     /// (docs/questions/Q-994 item 6 (b)).
     DcHostName,
+    /// No DC address: the zone cannot be served without the DC's A record
+    /// (docs/54 §3.1; the projection refuses a DC without one — task DN10b,
+    /// docs/questions/Q-1014).
+    MissingDcAddress,
+    /// A DC address is not an IPv4 address in the standard dotted form, is
+    /// listed twice, or there are more than eight (the host-record bound,
+    /// directory-pip `MAX_HOST_ADDRESSES`; phase 1 serves A records only —
+    /// docs/54 §3.1; task DN10b).
+    DcAddress,
+    /// A DC address is not registrable: loopback, unspecified, multicast, or
+    /// outside every IPv4 internal network (dird's registrable networks —
+    /// directory-pip `registrable`, the write checker's rule; docs/54 §5.5;
+    /// task DN10b).
+    DcAddressNotRegistrable,
 }
 
 /// An input error: the field (the command-line flag's name) and the rule.
@@ -383,6 +409,16 @@ impl fmt::Display for InputError {
             InputErrorKind::DcHostName => {
                 "the DC host name must be <dc-name>.<zone>, <dc-name> one letter-digit-hyphen label"
             }
+            InputErrorKind::MissingDcAddress => {
+                "at least one DC address is required (the zone's A record of the DC)"
+            }
+            InputErrorKind::DcAddress => {
+                "a DC address must be a distinct IPv4 address in dotted form, at most eight"
+            }
+            InputErrorKind::DcAddressNotRegistrable => {
+                "a DC address must lie in an IPv4 internal network and not be loopback, \
+                 unspecified or multicast"
+            }
         };
         write!(f, "{}: {rule}", self.field)
     }
@@ -395,6 +431,9 @@ impl std::error::Error for InputError {}
 pub(crate) struct Checked {
     pub(crate) realm: Realm,
     pub(crate) naming_context: NamingContext,
+    /// The DC's addresses, parsed (their registrability is judged against
+    /// dird's parsed file by the plan — one network rule, crate config's).
+    pub(crate) dc_addresses: Vec<Ipv4Addr>,
 }
 
 /// A uid or gid that is neither 0 nor all-ones.
@@ -456,10 +495,48 @@ impl DomainInput {
         }
         self.check_paths()?;
         self.check_network()?;
+        let dc_addresses = self.dc_addresses()?;
         Ok(Checked {
             realm,
             naming_context,
+            dc_addresses,
         })
+    }
+
+    /// The DC's addresses (`--dc-address`, task DN10b): at least one, at
+    /// most `MAX_HOST_ADDRESSES`, each an IPv4 address written exactly as
+    /// the standard library prints it (one spelling per address, as crates/
+    /// config reads addresses — docs/50 §7.1), none twice. Whether each is
+    /// registrable needs the parsed internal networks: the plan judges it
+    /// against dird's own parsed file (`Plan::build`), so the rule and the
+    /// networks are the write checker's and dird's, not a copy here.
+    ///
+    /// # Errors
+    /// `dc-address`: [`InputErrorKind::MissingDcAddress`],
+    /// [`InputErrorKind::DcAddress`].
+    ///
+    /// Spec: docs/54 §3.1 (A only), §4.4 (≤ 8 addresses), §10 row DN13;
+    /// RFC 1035 §3.4.1; docs/questions/Q-619 item 7, Q-1003 item 3, Q-1014.
+    fn dc_addresses(&self) -> Result<Vec<Ipv4Addr>, InputError> {
+        let field = "dc-address";
+        let items = &self.network.dc_addresses;
+        if items.is_empty() {
+            return Err(InputError::new(field, InputErrorKind::MissingDcAddress));
+        }
+        if items.len() > directory_pip::MAX_HOST_ADDRESSES {
+            return Err(InputError::new(field, InputErrorKind::DcAddress));
+        }
+        let mut addresses: Vec<Ipv4Addr> = Vec::with_capacity(items.len());
+        for item in items {
+            let address: Ipv4Addr = item
+                .parse()
+                .map_err(|_| InputError::new(field, InputErrorKind::DcAddress))?;
+            if address.to_string() != *item || addresses.contains(&address) {
+                return Err(InputError::new(field, InputErrorKind::DcAddress));
+            }
+            addresses.push(address);
+        }
+        Ok(addresses)
     }
 
     /// uids: never 0 or all-ones, one per process (keyadm included); gids:
@@ -718,13 +795,14 @@ impl DomainInput {
     /// docs/54 §4.7.
     fn check_network(&self) -> Result<(), InputError> {
         let n = &self.network;
-        let lists: [(&'static str, &Vec<String>); 6] = [
+        let lists: [(&'static str, &Vec<String>); 7] = [
             ("kdc-listen", &n.kdc_listen),
             ("ldap-listen", &n.ldap_listen),
             ("ldaps-listen", &n.ldaps_listen),
             ("internal-network", &n.internal_networks),
             ("kpasswd-listen", &n.kpasswd_listen),
             ("dnsd-listen", &n.dnsd_listen),
+            ("dc-address", &n.dc_addresses),
         ];
         for (field, items) in lists {
             if items

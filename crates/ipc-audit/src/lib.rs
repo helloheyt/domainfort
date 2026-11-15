@@ -59,7 +59,9 @@
 //! plus [`WindowSummary`], and the admin-plane shapes
 //! [`DirAdminEvent`] (sent by dird: the decision before each admin commit
 //! and the outcome after it) and [`AdmindEvent`] (sent by admind) — docs/51
-//! §5.7, task A7. Each carries exactly the
+//! §5.7, task A7 — and [`ZoneSerialEvent`] (sent by dird: its serial-only
+//! zone write, decision before the commit and outcome after it — task
+//! DN10b, docs/questions/Q-1002, Q-1013). Each carries exactly the
 //! non-secret fields its source exposes; no field can hold a key, password,
 //! ticket, PAC, plaintext, ciphertext, free attribute value or request
 //! octets (docs/37 §2; docs/10 I8; docs/49 §10.1) — the only request values
@@ -74,8 +76,9 @@
 //!
 //! [`peek_shape`] reads only an event's format and shape octets: auditd uses
 //! it to accept each shape only from its one sender (`Kdc` ⇐ kdc, `Keyd` ⇐
-//! keyd, `Ldap` / `DirAdmin` ⇐ dird, `Admind` ⇐ admind; `WindowSummary` from
-//! any), without decoding payloads (docs/questions/Q-341, option (a)).
+//! keyd, `Ldap` / `DirAdmin` / `ZoneSerial` ⇐ dird, `Admind` ⇐ admind;
+//! `WindowSummary` from any), without decoding payloads (docs/questions/
+//! Q-341, option (a)).
 //!
 //! # Overflow policy (docs/questions/Q-218, A-57)
 //!
@@ -145,6 +148,7 @@ mod error;
 mod event;
 mod values;
 mod window;
+mod zone;
 
 pub use admin::{
     AccountExpiresValue, AdmindActivity, AdmindEvent, Allocation, DecisionResult, DirAdminEvent,
@@ -164,7 +168,8 @@ pub use codes::{
     IpZone, KdcExchange, KdcOutcomeCode, KdcReason, KdcTransport, KeyPurposeCode, KeyadmOperation,
     KeydOperation, KeydOutcome, KeydReason, KeydRole, LdapAction, LdapOperationCode, LdapReason,
     LdapTargetCode, LdapTransport, OutcomeResultCode, PasswordFailure, PasswordResultCode,
-    PasswordStepCode, PdpReasonCode, SearchScope, UnsupportedOpCode,
+    PasswordStepCode, PdpReasonCode, SearchScope, UnsupportedOpCode, ZoneSerialCause,
+    ZoneSerialFailure, ZoneSerialOutcomeCode, ZoneSerialPhase,
 };
 pub use error::EventError;
 pub use event::{
@@ -178,3 +183,5 @@ pub use values::{
     SidValue, MAX_NAME_COMPONENTS, MAX_SID_SUB_AUTHORITIES, MAX_TEXT_OCTETS,
 };
 pub use window::{NoiseAdmission, Reservation, SendWindow, WindowConfig, WindowError, WindowFull};
+// dird's serial-only zone write (task DN10b; docs/questions/Q-1013).
+pub use zone::{ZoneSerialEvent, ZoneSerialOutcome, ZoneSerialStage};

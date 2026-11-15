@@ -92,6 +92,17 @@
 //! account reaching accountExpires): the projection names that instant
 //! (`ZoneProjection::valid_until`) — docs/questions/Q-993.
 //!
+//! **The serial-only write (task DN10b; Q-1002, decision A-172).** For the
+//! changes no commit sees — the clock, and a dird restart with other zone
+//! values — dird advances the serial alone: [`Op`] `ZoneSerial`, checked by
+//! [`Invariants::check_zone_serial`], whose commit writes no object and takes
+//! no change-seq (there is no originating write to stamp — docs/29 §2 as
+//! cited in docs/51 §8.3: the change-seq is an object write's `Origin`) and
+//! takes the zone serial exactly as a content write does, in the one commit:
+//! `take_zone_serial` stays the counter's only taker, so there is still
+//! exactly one writer of SERIAL and one door to it (crate::zone_serial is
+//! the public entry, after auditd acknowledged the decision).
+//!
 //! A host record's write that registers again an address already stored
 //! makes two originating writes in the transaction (the value written out,
 //! then back), because a dirstore Replace keeps a present value's attr-stamp
@@ -333,6 +344,24 @@ enum Op {
         renewed: Vec<Vec<u8>>,
         when_changed: AttributeChange,
     },
+    /// The serial-only write (task DN10b; docs/questions/Q-1002 item 2):
+    /// no object is written; the commit takes the zone serial alone
+    /// (module documentation, "The zone serial").
+    ZoneSerial,
+}
+
+/// What an originating object write is stamped with (its `Origin`, beside
+/// the change-seq the commit takes): the write's wall clock (directory-admin
+/// `wall_clock`) and this DC's node-id. The serial-only write has none — it
+/// writes no object — and an object write without one is refused
+/// ([`CommitError::Unstamped`]), never stamped with a stand-in.
+/// Spec: docs/51 §8.3; docs/29 §2 as cited there; dirstore `Origin`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WriteStamp {
+    /// The wall clock of the write (DSTIME seconds).
+    pub(crate) wall_clock: Timestamp,
+    /// This DC's node-id.
+    pub(crate) origin_node: NodeId,
 }
 
 /// A write every rule passed, against the transaction state whose
@@ -382,6 +411,9 @@ pub(crate) enum CommitError {
     /// The target could not be read to tell whether the write changes the
     /// zone's content.
     Read(dirstore::Error),
+    /// An object write was committed without its [`WriteStamp`] (a
+    /// misassembled caller — fail closed).
+    Unstamped,
 }
 
 impl CheckedWrite {
@@ -389,17 +421,18 @@ impl CheckedWrite {
     /// refused if the change-seq counter is no longer the checked state;
     /// for a security principal, the RID from the counter (or the krbtgt
     /// exception's 502) and the objectSid it forms; the change-seq of the
-    /// write's `Origin` (with `wall_clock` and `origin_node`); then the one
-    /// dirstore call.
+    /// write's `Origin` (with `stamp`'s wall clock and node-id — required
+    /// for every object write, absent for the serial-only write, which
+    /// writes no object); then the one dirstore call; then, for a write
+    /// that changes the zone, the zone serial.
     /// Spec: module documentation; docs/51 §8.3 (RID and change-seq from
     /// the counters, in the creation's own `WriteTxn`); A-75; A-83; A-89
     /// (Q-358 item 1); [MS-SAMR] 3.1.1.9.2, 3.1.1.9.2.1 item 1.2; docs/29 §2
-    /// as cited in docs/51 §8.3.
+    /// as cited in docs/51 §8.3; docs/questions/Q-1002 item 2 (A-172).
     pub(crate) fn commit(
         self,
         txn: &mut WriteTxn<'_>,
-        wall_clock: Timestamp,
-        origin_node: NodeId,
+        stamp: Option<WriteStamp>,
     ) -> Result<Committed, CommitError> {
         let current = txn
             .counter(CHANGE_SEQ_COUNTER)
@@ -412,10 +445,11 @@ impl CheckedWrite {
         // leaves, or finds, host addresses on its object changes what the
         // zone projection returns, so it takes the zone serial counter in
         // this same transaction — here, in the one commit every write path
-        // goes through (module documentation, "The zone serial").
+        // goes through (module documentation, "The zone serial"). The
+        // serial-only write (task DN10b) is such a write by definition.
         let host_address = self.host_address;
         let zone = self.op.changes_zone(txn, host_address)?;
-        let mut committed = self.op.commit(txn, wall_clock, origin_node, host_address)?;
+        let mut committed = self.op.commit(txn, stamp, host_address)?;
         if zone {
             committed.zone_serial = Some(take_zone_serial(txn)?);
         }
@@ -427,9 +461,11 @@ impl Op {
     /// `true` if this write changes the zone's content: the object it
     /// creates holds host addresses, or the object it changes or deletes
     /// holds some (before the write) or will (a host record's write always
-    /// counts). Read in the transaction, before the write.
+    /// counts) — or it is the serial-only write, whose whole purpose is the
+    /// zone's SERIAL (task DN10b). Read in the transaction, before the
+    /// write.
     /// Spec: RFC 2136 §3.6; docs/54 §5.4; crate directory-pip `zone`
-    /// (what the projection reads).
+    /// (what the projection reads); docs/questions/Q-1002 item 2.
     fn changes_zone(&self, txn: &WriteTxn<'_>, host_address: AttrId) -> Result<bool, CommitError> {
         let holds = |target: Guid| -> Result<bool, CommitError> {
             Ok(txn
@@ -450,7 +486,7 @@ impl Op {
                 Ok(writes || holds(*target)?)
             }
             Op::Delete { target } => holds(*target),
-            Op::HostRecord { .. } => Ok(true),
+            Op::HostRecord { .. } | Op::ZoneSerial => Ok(true),
         }
     }
 
@@ -458,14 +494,23 @@ impl Op {
     fn commit(
         self,
         txn: &mut WriteTxn<'_>,
-        wall_clock: Timestamp,
-        origin_node: NodeId,
+        stamp: Option<WriteStamp>,
         host_address: AttrId,
     ) -> Result<Committed, CommitError> {
         let none = Committed {
             rid: None,
             sid: None,
             zone_serial: None,
+        };
+        // The serial-only write writes no object, so it has no `Origin` to
+        // stamp (module documentation); every other write needs its stamp.
+        let WriteStamp {
+            wall_clock,
+            origin_node,
+        } = match (&self, stamp) {
+            (Op::ZoneSerial, _) => return Ok(none),
+            (_, Some(stamp)) => stamp,
+            (_, None) => return Err(CommitError::Unstamped),
         };
         match self {
             Op::Create {
@@ -572,6 +617,8 @@ impl Op {
                 .map_err(CommitError::Write)?;
                 Ok(none)
             }
+            // Returned above: no object, no change-seq.
+            Op::ZoneSerial => Ok(none),
         }
     }
 }
@@ -1053,6 +1100,22 @@ impl Invariants {
                     values: vec![when_changed],
                 },
             },
+            host_address: self.ids.host_address,
+        })
+    }
+
+    /// Check the serial-only write (task DN10b) in `txn`: nothing of the
+    /// directory is changed, so no object rule applies; the write is checked
+    /// against the transaction's change-seq state like every other (its
+    /// commit is refused if another write committed in between) and its
+    /// commit takes the zone serial — the counter missing or exhausted
+    /// refuses it there (A-83: never created at run time).
+    /// Spec: module documentation, "The zone serial"; docs/questions/Q-1002
+    /// item 2 (A-172); RFC 2136 §3.6, §7.11.
+    pub(crate) fn check_zone_serial(&self, txn: &WriteTxn<'_>) -> Result<CheckedWrite, Refused> {
+        Ok(CheckedWrite {
+            basis: Self::basis(txn)?,
+            op: Op::ZoneSerial,
             host_address: self.ids.host_address,
         })
     }

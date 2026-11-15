@@ -160,8 +160,9 @@ fn strict_decoding() {
     b[0] = EVENT_FORMAT + 1;
     assert_eq!(decode_event(&b), Err(EventError::UnsupportedFormat));
     // Shapes 5 (DirAdmin) and 6 (Admind) were appended for the admin plane
-    // (docs/51 §5.7); 7 is the first code outside the closed table.
-    for shape in [0u8, 7, 0xFF] {
+    // (docs/51 §5.7), 7 (ZoneSerial) by task DN10b; 8 is the first code
+    // outside the closed table.
+    for shape in [0u8, 8, 0xFF] {
         let mut b = good.clone();
         b[1] = shape;
         assert_eq!(
@@ -344,16 +345,18 @@ fn code_tables_are_closed() {
     table!(LdapOperationCode);
     table!(BindMechanismCode);
     table!(LdapTargetCode);
-    // The first four shapes keep their codes; the admin plane appended two.
-    assert_eq!(table!(EventShape), 6);
+    // The first four shapes keep their codes; the admin plane appended two;
+    // task DN10b appended `ZoneSerial` (docs/questions/Q-1013).
+    assert_eq!(table!(EventShape), 7);
     assert_eq!(
         EventShape::ALL.iter().map(|s| s.code()).collect::<Vec<_>>(),
-        [1, 2, 3, 4, 5, 6]
+        [1, 2, 3, 4, 5, 6, 7]
     );
     assert_eq!(EventShape::Kdc.code(), 1);
     assert_eq!(EventShape::WindowSummary.code(), 4);
     assert_eq!(EventShape::DirAdmin.code(), 5);
     assert_eq!(EventShape::Admind.code(), 6);
+    assert_eq!(EventShape::ZoneSerial.code(), 7);
     // Task A16 appended `ChangePolicy` (docs/51 §5.10; docs/questions/Q-592):
     // the earlier eighteen keep their codes. Task D2-c appended the request
     // queue's five (docs/questions/Q-882, Q-938). Task K6 appended

@@ -1073,6 +1073,84 @@ fn the_dc_host_name_and_an_ipv4_internal_network_are_required() {
     assert_eq!(dird.dns_service().unwrap().registrable_networks().len(), 2);
 }
 
+/// Task DN10b (docs/54 §3.1 — the DC's A record "written in `provision
+/// domain` only", §4.4 — at most 8 addresses, §5.5 — registrable; §10 row
+/// DN13 `--dc-address`; docs/questions/Q-1003 item 3, Q-1014): the planned
+/// DC object carries its addresses as the internal host-address attribute
+/// (4 octets each, RFC 1035 §3.4.1); and the plan refuses, naming the flag,
+/// no address, one not in the standard dotted IPv4 form, one twice, more
+/// than eight, and one that is not registrable — loopback (even inside the
+/// internal network 127.0.0.0/8), unspecified, multicast, or outside every
+/// IPv4 internal network. The session's networks are dird's parsed
+/// `dns_registrable_networks`. Addresses are hand-made test data.
+#[test]
+fn the_dc_addresses_are_planned_and_checked() {
+    let dir = TempDir::new();
+    let base = input(&dir, 61002, 61007);
+    let p = plan(&base);
+    let dc = p.object(ObjectRole::DcComputer).unwrap();
+    assert_eq!(
+        dc.attributes
+            .iter()
+            .find(|(id, _)| *id == directory_pip::HOST_ADDRESS)
+            .map(|(_, values)| values.clone()),
+        Some(vec![vec![10, 0, 0, 10]])
+    );
+    assert_eq!(
+        p.dns_registration
+            .networks()
+            .iter()
+            .map(|n| (n.address().to_string(), n.prefix_len()))
+            .collect::<Vec<_>>(),
+        [("10.0.0.0".to_owned(), 8), ("127.0.0.0".to_owned(), 8)]
+    );
+    // No other planned object holds a host address.
+    assert!(p
+        .objects
+        .iter()
+        .filter(|o| o.role != ObjectRole::DcComputer)
+        .all(|o| o
+            .attributes
+            .iter()
+            .all(|(id, _)| *id != directory_pip::HOST_ADDRESS)));
+
+    let refused = |addresses: &[&str], kind: InputErrorKind| {
+        let mut i = base.clone();
+        i.network.dc_addresses = addresses.iter().map(|a| (*a).to_owned()).collect();
+        assert_eq!(
+            Plan::build(&i, now(), &mut CountingRandom::default()).unwrap_err(),
+            PlanError::Input(provision::input::InputError {
+                field: "dc-address",
+                kind
+            }),
+            "{addresses:?}"
+        );
+    };
+    refused(&[], InputErrorKind::MissingDcAddress);
+    for malformed in ["10.0.0.010", "10.0.0", "10.0.0.256", "fd00::1", "dc1"] {
+        refused(&[malformed], InputErrorKind::DcAddress);
+    }
+    refused(&["10.0.0.10", "10.0.0.10"], InputErrorKind::DcAddress);
+    let nine: Vec<String> = (1..=9).map(|k| format!("10.0.0.{k}")).collect();
+    let nine: Vec<&str> = nine.iter().map(String::as_str).collect();
+    refused(&nine, InputErrorKind::DcAddress);
+    for unregistrable in ["127.0.0.1", "0.0.0.0", "224.0.0.1", "192.0.2.10"] {
+        refused(&[unregistrable], InputErrorKind::DcAddressNotRegistrable);
+    }
+    // Eight distinct registrable addresses are the bound, not over it.
+    let mut eight = base.clone();
+    eight.network.dc_addresses = (1..=8).map(|k| format!("10.0.0.{k}")).collect();
+    let p = plan(&eight);
+    let values = p
+        .object(ObjectRole::DcComputer)
+        .unwrap()
+        .attributes
+        .iter()
+        .find(|(id, _)| *id == directory_pip::HOST_ADDRESS)
+        .map(|(_, values)| values.len());
+    assert_eq!(values, Some(8));
+}
+
 /// Task K9 — the fronts' listeners lie inside the internal networks
 /// (docs/53 §3.3; docs/54 §4.7; A-114): one outside fails the parse-back by
 /// the front's own schema (`ListenerNotInternal`); a front without a

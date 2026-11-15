@@ -1997,9 +1997,13 @@ fn domain_input(dir: &ScratchDir, uid: u32) -> DomainInput {
             kdc_listen: vec!["127.0.0.1:88".to_owned()],
             ldap_listen: Vec::new(),
             ldaps_listen: vec!["127.0.0.1:636".to_owned()],
-            internal_networks: vec!["127.0.0.0/8".to_owned()],
+            // Task DN10b: the DC's address must be registrable — inside an
+            // IPv4 internal network and not loopback (docs/54 §5.5) — so a
+            // test network beside loopback holds it.
+            internal_networks: vec!["127.0.0.0/8".to_owned(), "192.0.2.0/24".to_owned()],
             kpasswd_listen: vec!["127.0.0.1:464".to_owned()],
             dnsd_listen: vec!["127.0.0.1:53".to_owned()],
+            dc_addresses: vec!["192.0.2.10".to_owned()],
         },
         names: Names {
             tier0_ou: "Tier0".to_owned(),

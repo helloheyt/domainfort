@@ -23,6 +23,7 @@
 //! | [`KpasswdParams::keyd`] | the kpasswd service's keyd client — any [`crate::KpasswdKeyd`] (task K7) | `KeydKpasswdClient` over `ipc_keyd::UnixConnector` (Role::Ldap) |
 //! | [`KpasswdParams::max_connections`], [`KpasswdParams::queue_capacity`] | the kpasswd channel's bounds | `MAX_KPASSWD_CONNECTIONS`, `KPASSWD_QUEUE_CAPACITY` |
 //! | [`DnsParams::max_connections`], [`DnsParams::queue_capacity`] | the DNS channel's bounds (task DN10a) | `MAX_DNS_CONNECTIONS`, `DNS_QUEUE_CAPACITY` |
+//! | [`DnsParams::min_serial_advance_interval`] | the least time between two serial advances for the clock (task DN10b) | `MIN_SERIAL_ADVANCE_INTERVAL` |
 //!
 //! Spec: docs/52 §3.18, §7 R15; docs/questions/Q-415, Q-432 (A-95), Q-501
 //! (A-105), Q-570.
@@ -179,6 +180,9 @@ pub struct DnsParams {
     pub max_connections: usize,
     /// The DNS queue.
     pub queue_capacity: usize,
+    /// The least time between two serial advances for the clock (task
+    /// DN10b).
+    pub min_serial_advance_interval: Duration,
 }
 
 impl From<DnsParams> for DnsServeParams {
@@ -189,6 +193,7 @@ impl From<DnsParams> for DnsServeParams {
             zone: dns.zone,
             max_connections: dns.max_connections,
             queue_capacity: dns.queue_capacity,
+            min_serial_advance_interval: dns.min_serial_advance_interval,
         }
     }
 }
@@ -205,6 +210,7 @@ impl DnsParams {
             zone: full.zone,
             max_connections: full.max_connections,
             queue_capacity: full.queue_capacity,
+            min_serial_advance_interval: full.min_serial_advance_interval,
         }
     }
 }

@@ -217,11 +217,13 @@ fn the_image_holds_exactly_the_servable_hosts() {
     );
     // 2026-11-13T09:00:00Z + 7 days = 2026-11-20T09:00:00Z.
     assert_eq!(projection.valid_until(), Some(kt(2026, 11, 20, 9, 0, 0)));
-    // The kpasswd switch adds its two SRV records (docs/54 §3.1).
+    // The kpasswd switch adds its SRV record (docs/54 §3.1) — `_kpasswd._tcp`
+    // only: one record per service that exists (docs/questions/Q-1004,
+    // A-172; kpasswd-front serves TCP only).
     let mut with_kpasswd = params();
     with_kpasswd.kpasswd = KpasswdService::Present;
     let projection = view.zone_projection(&with_kpasswd, &now()).unwrap();
-    assert_eq!(projection.image().srv_services().count(), 5);
+    assert_eq!(projection.image().srv_services().count(), 4);
 }
 
 /// docs/54 §4.4, §5.2: an address leaves the image at its maximum age, and

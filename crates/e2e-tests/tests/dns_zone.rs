@@ -1,6 +1,6 @@
-//! End to end (task DN10a; docs/54 §4.6, §4.8, §10 rows DN10 / DN14): a
-//! domain made by `provision domain`, then auditd, dird and dnsd over their
-//! real sockets — dnsd fetches the zone image from dird over
+//! End to end (tasks DN10a, DN10b; docs/54 §4.6, §4.8, §10 rows DN10 / DN13 /
+//! DN14): a domain made by `provision domain`, then auditd, dird and dnsd
+//! over their real sockets — dnsd fetches the zone image from dird over
 //! `dird-dns.sock` and answers SOA, NS, the SRV set and the DC's A record
 //! over real UDP and TCP sockets.
 //!
@@ -11,17 +11,15 @@
 //!    scratch directory: the database, the integrity key, the policy and the
 //!    configuration files — dird's with its DNS channel and zone values,
 //!    dnsd's naming the same `dird-dns.sock` (docs/questions/Q-1003 item 1).
-//! 2. **The DC's host record — a test-only stand-in for DN13's step.** docs/54
-//!    §3.1 says the DC's A record is "written in `provision domain` only",
-//!    through the one write checker; the provisioning session cannot be given
-//!    the zone in this task (a directory-admin change — docs/questions/Q-1003
-//!    item 2). So, between provisioning and the daemons, the test writes the
-//!    DC's address into the produced store directly (dirstore, feature
-//!    `test-seams`: test code only — never a product path), taking the
-//!    change-seq and the zone serial in the same transaction as the checker's
-//!    commit would (A-170). The address, 192.0.2.10, lies in an internal
-//!    network of the input (192.0.2.0/24), hence in dird's registrable
-//!    networks.
+//! 2. **The DC's host record — written by `provision domain` itself** (task
+//!    DN10b; docs/54 §3.1: "written in `provision domain` only"): the input's
+//!    `--dc-address` 192.0.2.10 (inside the internal network 192.0.2.0/24,
+//!    hence in dird's registrable networks) goes with the DC account's create
+//!    through the provisioning session, given the zone, and the one checker's
+//!    host-record rule; that commit takes the zone serial (docs/questions/
+//!    Q-1003 item 2, Q-1014). The test only reads the produced store to see
+//!    it there (no write: the DN10a stand-in that wrote the record directly
+//!    is gone).
 //! 3. **auditd** — the real listener and writer on the produced log, one
 //!    listener per sender (dird's, dnsd's) naming the test uid as that sender
 //!    (tests/support `labelled_auditd_settings`; task R9b).
@@ -29,7 +27,9 @@
 //!    file through its own product constructors (`startup::params`,
 //!    `startup::dns_params`), the produced database, key and policy through
 //!    its own readers; injected: the test uid as each peer's (kdc, ldap-front,
-//!    auditd, **dnsd**).
+//!    auditd, **dnsd**). Its DNS service's start advances the zone serial
+//!    once through the one checker, the decision acknowledged by the real
+//!    auditd (task DN10b; docs/questions/Q-1002 item 4 (b)).
 //! 5. **dnsd** — its parameters from the produced file
 //!    (`DaemonParams::from_settings`), the test uid as dird's and auditd's;
 //!    its UDP socket and TCP listener on 127.0.0.1 at system-chosen ports
@@ -46,12 +46,15 @@
 //! (61009, a fake account) instead, so the test's own connections — dnsd's
 //! among them — are not dnsd's.
 //!
-//! Sources: docs/54 §3.1 (the record set), §4.4, §4.6, §4.8, §6.4 (answers),
-//! §6.6 ("dird not available ⇒ SERVFAIL"); RFC 1035 §3.3.13, §4.1.1, §4.2.1,
-//! §4.2.2, §5.3 (the SOA timers provisioned), §8 (HOSTMASTER); RFC 2782
-//! (SRV, Target addresses in Additional); RFC 4120 §7.2.3.2 (`_kerberos`,
-//! udp and tcp); [MS-ADTS] 6.3.2.3 (`_ldap`, `_kpasswd`; ports 389, 88, 464);
-//! RFC 2136 §2.2 (UPDATE); RFC 3645 §5.1 / RFC 8945 §4.2 (a gss-tsig TSIG).
+//! Sources: docs/54 §3.1 (the record set), §4.4, §4.6, §4.8, §5.4, §6.4
+//! (answers), §6.6 ("dird not available ⇒ SERVFAIL"); RFC 1035 §3.3.13,
+//! §4.1.1, §4.2.1, §4.2.2, §5.3 (the SOA timers provisioned), §8
+//! (HOSTMASTER); RFC 2782 (SRV, Target addresses in Additional); RFC 4120
+//! §7.2.3.2 (`_kerberos`, udp and tcp); [MS-ADTS] 6.3.2.3 (`_ldap`,
+//! `_kpasswd`; ports 389, 88, 464); docs/questions/Q-1004 (A-172: one SRV
+//! record per service that exists — `_kpasswd._tcp` only); RFC 2136 §2.2
+//! (UPDATE), §3.6 (the SERIAL moves with the zone); RFC 3645 §5.1 / RFC 8945
+//! §4.2 (a gss-tsig TSIG).
 //! Every value is hand-made test data (obviously fake names, accounts and
 //! addresses from 192.0.2.0/24); no octet comes from any other
 //! implementation or capture.
@@ -69,10 +72,11 @@ use core::net::{Ipv4Addr, SocketAddr};
 use core::time::Duration;
 use directory_daemon::test_seams::{serve_with_dns, DnsParams};
 use directory_daemon::{DaemonControl as DirdControl, StoreSource};
-use dirstore::{AttributeChange, Origin, Store};
+use dirstore::Store;
 use dns_daemon::test_seams::DaemonParams as DnsdParams;
 use dns_daemon::{DaemonControl as DnsdControl, DaemonError as DnsdError, Listeners};
 use ipc::{encode_frame, Direction};
+use ipc_audit::{ZoneSerialCause, ZoneSerialOutcome, ZoneSerialStage};
 use ipc_dns::{Connection, Connector, DnsRequest, TransportError, DNS_CHANNEL};
 use krb_proto::KerberosTime;
 use parse_dns::{
@@ -181,6 +185,8 @@ fn domain_input(dir: &ScratchDir, uid: u32) -> DomainInput {
             internal_networks: vec!["127.0.0.0/8".to_owned(), "192.0.2.0/24".to_owned()],
             kpasswd_listen: vec!["127.0.0.1:464".to_owned()],
             dnsd_listen: vec!["127.0.0.1:53".to_owned()],
+            // Task DN10b: the DC's host record (docs/54 §3.1).
+            dc_addresses: vec![DC_ADDRESS.to_string()],
         },
         names: Names {
             tier0_ou: "Tier0".to_owned(),
@@ -341,8 +347,9 @@ struct World {
 }
 
 impl World {
-    /// `provision domain`, then the test-only DC host record (module
-    /// documentation, step 2); nothing runs yet. `None` as root.
+    /// `provision domain` — which writes the DC's host record itself (module
+    /// documentation, step 2; the produced store is only read here); nothing
+    /// runs yet. `None` as root.
     fn provisioned() -> Option<World> {
         let dir = ScratchDir::new("e2e-dns").expect("the scratch directory");
         let uid = dir.uid().expect("the scratch directory's owner");
@@ -364,7 +371,10 @@ impl World {
             &mut HaltAt::never(),
         )
         .expect("provision domain");
-        // The DC's host record (test-only stand-in — module documentation).
+        // The DC's host record, as `provision domain` wrote it (module
+        // documentation, step 2): read only — the DC object holds the
+        // `--dc-address` value, and the zone serial counter was taken once
+        // (that one write changed the zone — A-170). SERIAL is now 2.
         let dc = plan.object(ObjectRole::DcComputer).expect("the DC").guid;
         let key =
             directory_daemon::startup::read_integrity_key(input.paths.integrity_key.as_path(), uid)
@@ -372,27 +382,23 @@ impl World {
         let schema = ad_schema::phase1().unwrap();
         let store =
             Store::open(input.paths.database.as_path(), key, schema.schema().clone()).unwrap();
-        let mut txn = store.begin_write().unwrap();
-        let origin = Origin {
-            wall_clock: directory_admin::wall_clock(&provisioned_at()).unwrap(),
-            origin_node: plan.node_id,
-            origin_seq: txn
-                .take_counter_value(directory_admin::CHANGE_SEQ_COUNTER)
-                .unwrap(),
-        };
-        txn.modify_object(
-            dc,
-            vec![AttributeChange::Replace {
-                id: directory_pip::HOST_ADDRESS,
-                values: vec![directory_pip::host_address_value(DC_ADDRESS)],
-            }],
-            &origin,
-        )
-        .unwrap();
-        // A-170: a write that changes the zone takes the zone serial.
-        txn.take_counter_value(directory_pip::DNS_ZONE_SERIAL_COUNTER)
-            .unwrap();
-        txn.commit().unwrap();
+        {
+            let snapshot = store.snapshot().unwrap();
+            let dc_object = snapshot.get_object(dc).unwrap().expect("the DC object");
+            let addresses: Vec<Vec<u8>> = dc_object
+                .attribute(directory_pip::HOST_ADDRESS)
+                .map(|a| a.values.iter().map(|v| v.value.clone()).collect())
+                .unwrap_or_default();
+            assert_eq!(
+                addresses,
+                vec![directory_pip::host_address_value(DC_ADDRESS)]
+            );
+            let zone = snapshot
+                .counter(directory_pip::DNS_ZONE_SERIAL_COUNTER)
+                .unwrap()
+                .expect("the zone serial counter");
+            assert_eq!(directory_pip::zone_serial(&zone), Some(2));
+        }
         drop(store);
         // Each socket in its own directory (docs/50 §3.1), 0700 here: the
         // daemons' privileged set-up would create them as root.
@@ -739,16 +745,23 @@ fn assert_dc_address(records: &[parse_dns::ResourceRecord]) {
 /// fetched over `dird-dns.sock` — and answers, over UDP and over TCP:
 ///
 /// * SOA of the apex: MNAME the DC, RNAME `hostmaster.example.org`
-///   (provisioned — RFC 1035 §8), SERIAL 2 (the zone counter after the DC
-///   record's write — A-170), the timers of RFC 1035 §5.3's example, TTL
-///   3600 s;
+///   (provisioned — RFC 1035 §8), SERIAL 3 (2 after provisioning's write of
+///   the DC record — A-170 — and one advance at dird's DNS service start,
+///   task DN10b), the timers of RFC 1035 §5.3's example, TTL 3600 s;
 /// * NS of the apex: the DC, its address in Additional (RFC 1034 §3.7.1);
 /// * the SRV set — `_kerberos._udp`, `_kerberos._tcp` (RFC 4120 §7.2.3.2:
-///   both), `_ldap._tcp` (389), and `_kpasswd._tcp` / `_kpasswd._udp` (464:
-///   the kpasswd channel is provisioned, so kpasswd exists — docs/54 §3.1,
-///   A-119) — priority 0, weight 0, Target the DC, its address in
-///   Additional (RFC 2782);
+///   both), `_ldap._tcp` (389), and `_kpasswd._tcp` (464: the kpasswd
+///   channel is provisioned, so kpasswd exists — docs/54 §3.1, A-119) —
+///   priority 0, weight 0, Target the DC, its address in Additional (RFC
+///   2782); and **no** `_kpasswd._udp` (NXDOMAIN): kpasswd-front serves TCP
+///   only, one SRV record per service that exists (docs/questions/Q-1004,
+///   A-172);
 /// * A of the DC: 192.0.2.10.
+///
+/// And auditd's log holds dird's two `ZoneSerial` events of the start's
+/// advance — the decision (cause `ServiceStart`, from 2), acknowledged
+/// before the write, then the outcome (advanced to 3) — recorded under
+/// dird's source (docs/51 §5.7 item 2; A-85; docs/questions/Q-1013).
 #[test]
 fn a_provisioned_dnsd_starts_and_answers_the_zone() {
     within(support::TEST_BOUND, || {
@@ -775,7 +788,7 @@ fn a_provisioned_dnsd_starts_and_answers_the_zone() {
             };
             assert_eq!(fields.mname, name(DC_FQDN));
             assert_eq!(fields.rname, name("hostmaster.example.org"));
-            assert_eq!(fields.serial, 2);
+            assert_eq!(fields.serial, 3);
             assert_eq!(
                 [fields.refresh, fields.retry, fields.expire, fields.minimum],
                 [7200, 600, 3_600_000, 60]
@@ -792,7 +805,6 @@ fn a_provisioned_dnsd_starts_and_answers_the_zone() {
                 ("_kerberos._tcp.example.org", 88),
                 ("_ldap._tcp.example.org", 389),
                 ("_kpasswd._tcp.example.org", 464),
-                ("_kpasswd._udp.example.org", 464),
             ] {
                 let srv = exchange(&query(id, owner, RrType::SRV));
                 assert_authoritative(&srv, id);
@@ -809,6 +821,11 @@ fn a_provisioned_dnsd_starts_and_answers_the_zone() {
                 assert_eq!(fields.target, name(DC_FQDN));
                 assert_dc_address(&srv.additional);
             }
+            // One SRV record per service that exists (docs/questions/Q-1004,
+            // A-172): no UDP kpasswd — the name does not exist.
+            let udp_kpasswd = exchange(&query(id, "_kpasswd._udp.example.org", RrType::SRV));
+            assert_eq!(udp_kpasswd.header.rcode, Rcode::NXDOMAIN);
+            assert!(udp_kpasswd.answer.is_empty());
 
             let a = exchange(&query(id, DC_FQDN, RrType::A));
             assert_authoritative(&a, id);
@@ -818,6 +835,38 @@ fn a_provisioned_dnsd_starts_and_answers_the_zone() {
         dnsd.stop().expect("dnsd stops cleanly");
         dird.stop().expect("dird stops cleanly");
         world.stop_auditd();
+
+        // dird's serial advance at its DNS service start, in auditd's
+        // verified log, under dird's source (the transport identity).
+        let (_, records) =
+            support::verified_log(world.input.paths.audit_log.as_path()).expect("the log verifies");
+        support::assert_recorded_under_their_senders(&records, world.uid);
+        let zone_serial: Vec<(ZoneSerialCause, u32, ZoneSerialStage)> = records
+            .iter()
+            .filter(|record| record.source != audit_log::Source::Auditd)
+            .filter_map(|record| {
+                match ipc_audit::decode_event(&record.payload).expect("every payload decodes") {
+                    ipc_audit::EventBody::ZoneSerial(event) => {
+                        assert_eq!(record.source, audit_log::Source::Dird);
+                        Some((event.cause, event.from.get(), event.stage))
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        assert_eq!(
+            zone_serial,
+            vec![
+                (ZoneSerialCause::ServiceStart, 2, ZoneSerialStage::Decision),
+                (
+                    ZoneSerialCause::ServiceStart,
+                    2,
+                    ZoneSerialStage::Outcome(ZoneSerialOutcome::Advanced {
+                        serial: core::num::NonZeroU32::new(3).unwrap()
+                    })
+                ),
+            ]
+        );
     });
 }
 

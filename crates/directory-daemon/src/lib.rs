@@ -222,8 +222,9 @@ pub use daemon::{
 };
 pub use dns_listener::dns_refused_peer_count;
 pub use dns_service::{
-    dns_forward_refused_count, DnsNotStarted, DnsParams, DNS_QUEUE_CAPACITY, MAX_DNS_CONNECTIONS,
-    MAX_DNS_QUEUE_CAPACITY,
+    dns_forward_refused_count, dns_serial_advance_deferred_count, DnsNotStarted, DnsParams,
+    SerialAdvanceStop, DNS_QUEUE_CAPACITY, MAX_DNS_CONNECTIONS, MAX_DNS_QUEUE_CAPACITY,
+    MIN_SERIAL_ADVANCE_INTERVAL,
 };
 pub use engine::{DirectoryEngine, EngineError, EngineHandle, EnginePanicked, EngineThread};
 pub use kpasswd_listener::kpasswd_refused_peer_count;

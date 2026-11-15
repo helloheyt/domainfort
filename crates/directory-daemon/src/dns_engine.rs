@@ -13,12 +13,23 @@
 //!   request is decoded and answered) and hands it back with the dispatch.
 //! * Queue full ⇒ `Refused::Busy` at once (`try_send`); dnsd answers
 //!   SERVFAIL (docs/54 §4.6, §6.6).
-//! * The thread only reads the store (one snapshot per fetch); the DNS
-//!   service writes nothing in this task (docs/questions/Q-1002).
+//! * The thread reads the store (one snapshot per fetch) and writes it only
+//!   through the serial-only checked write (task DN10b; crate::dns_service,
+//!   docs/questions/Q-1002): at its start, before the queue is served, and
+//!   when the clock changed the content under the current SERIAL.
+//! * **The start runs on this thread** ([`DnsWorker::start`]: the zone
+//!   projects, the start's serial advance — whose decision auditd must
+//!   acknowledge — the first projection): the wait for the acknowledgement
+//!   blocks this thread, never the runtime the audit client runs on. Its
+//!   result goes back through a `oneshot` the daemon awaits; a failed start
+//!   ends the thread **before** the exit hook is armed, so dird's other
+//!   services run on (the hook stops dird only when a serving DNS thread
+//!   ends).
 //!
-//! Spec: docs/54 §4.6; docs/50 R50-7, R50-14.
+//! Spec: docs/54 §4.6, §4.8; docs/50 R50-7, R50-14; docs/questions/Q-1002
+//! item 4 (b).
 
-use crate::dns_service::{DnsWorker, MAX_DNS_QUEUE_CAPACITY};
+use crate::dns_service::{DnsNotStarted, DnsWorker, MAX_DNS_QUEUE_CAPACITY};
 use crate::engine::{EngineError, EngineThread, OnExit, SubmitError};
 use ipc_dns_server::{Dispatch, DnsConnection};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
@@ -71,16 +82,21 @@ impl DnsEngineHandle {
 
 impl DnsWorker {
     /// Move the worker onto its own OS thread behind a queue of `capacity`
-    /// jobs (0 < capacity ≤ [`MAX_DNS_QUEUE_CAPACITY`]). `on_exit` runs when
-    /// the thread ends, so the daemon stops instead of serving without it.
+    /// jobs (0 < capacity ≤ [`MAX_DNS_QUEUE_CAPACITY`]). The thread first
+    /// runs [`DnsWorker::start`] and sends its result on `started` (the
+    /// zone's SERIAL, or why the service does not start — the thread then
+    /// ends at once, without running `on_exit`). Once started, `on_exit`
+    /// runs when the thread ends, so the daemon stops instead of serving
+    /// without it.
     ///
     /// # Errors
     /// [`EngineError::QueueCapacity`], [`EngineError::Spawn`].
     ///
-    /// Spec: docs/54 §4.6; docs/50 R50-7, R50-14.
+    /// Spec: docs/54 §4.6, §4.8; docs/50 R50-7, R50-14; module documentation.
     pub(crate) fn spawn<X>(
         self,
         capacity: usize,
+        started: oneshot::Sender<Result<u32, DnsNotStarted>>,
         on_exit: X,
     ) -> Result<(DnsEngineHandle, EngineThread), EngineError>
     where
@@ -94,6 +110,12 @@ impl DnsWorker {
         let thread = std::thread::Builder::new()
             .name(String::from("dird-dns"))
             .spawn(move || {
+                let start = worker.start();
+                let serving = start.is_ok();
+                // The daemon may have stopped waiting; then nothing serves.
+                if started.send(start).is_err() || !serving {
+                    return;
+                }
                 let _exit = OnExit(Some(on_exit));
                 while let Ok(job) = jobs.recv() {
                     let DnsJob {

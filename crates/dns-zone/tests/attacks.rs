@@ -122,7 +122,7 @@ fn k4_measured_against_phase1_answers_q672() {
         ("_kerberos._udp.example.com", 33),
         ("_kerberos._tcp.example.com", 33),
         ("_ldap._tcp.example.com", 33),
-        ("_kpasswd._udp.example.com", 33),
+        ("_kpasswd._tcp.example.com", 33),
     ] {
         assert!(!measure(&zone, qname, qtype).1, "{qname}");
     }

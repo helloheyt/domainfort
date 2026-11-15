@@ -78,6 +78,7 @@ use crate::config::CHANGE_SEQ_COUNTER;
 use crate::descriptor::new_object_sd;
 use crate::invariants::{
     CheckedWrite, CommitError, Committed, InvariantViolation, LinkProof, Refused as Unchecked,
+    WriteStamp,
 };
 use crate::random::RandomSource;
 use crate::record;
@@ -192,6 +193,8 @@ fn commit_stop(e: CommitError) -> Stop {
         // counter missing or exhausted refuses the write (A-83).
         CommitError::ZoneSerial(e) => counter_failure(&e, Stop::Failed(AdminFailure::StoreFailure)),
         CommitError::Read(e) => store_failure(&e),
+        // Cannot happen: this crate's commits always carry their stamp.
+        CommitError::Unstamped => Stop::Failed(AdminFailure::InternalFailure),
     }
 }
 
@@ -360,9 +363,11 @@ impl<R: RandomSource> DirectoryAdmin<R> {
     ) -> Result<Committed, Stop> {
         let wall_clock =
             time::wall_clock(now).ok_or(Stop::Failed(AdminFailure::InternalFailure))?;
-        checked
-            .commit(txn, wall_clock, self.config.node_id())
-            .map_err(commit_stop)
+        let stamp = WriteStamp {
+            wall_clock,
+            origin_node: self.config.node_id(),
+        };
+        checked.commit(txn, Some(stamp)).map_err(commit_stop)
     }
 
     /// One modify of `target`, through the write invariants (`proof`: the

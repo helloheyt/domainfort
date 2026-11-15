@@ -73,6 +73,8 @@ fn domain_args() -> Vec<String> {
         "10.0.0.0/8",
         "--internal-network",
         "127.0.0.0/8",
+        "--dc-address",
+        "10.0.0.10",
     ];
     let paths = [
         ("--staging-dir", "/srv/p/etc/staging"),
@@ -152,6 +154,31 @@ fn a_full_domain_command_parses() {
     );
     assert_eq!(input.network.kpasswd_listen, ["127.0.0.1:464"]);
     assert_eq!(input.network.dnsd_listen, ["127.0.0.1:53"]);
+    // Task DN10b: the DC's address (docs/54 §3.1, §10 row DN13).
+    assert_eq!(input.network.dc_addresses, ["10.0.0.10"]);
+}
+
+/// Task DN10b (docs/54 §10 row DN13; docs/questions/Q-1014): `--dc-address`
+/// is repeatable; given twice, both values are kept in order — and left out,
+/// the command line still parses (the rule "at least one" is the input's,
+/// with the flag's name, like the listeners').
+#[test]
+fn the_dc_address_flag_repeats() {
+    let mut args = domain_args();
+    args.push("--dc-address".to_owned());
+    args.push("10.0.0.11".to_owned());
+    let Ok(Command::Domain(input)) = parse(os(&args)) else {
+        panic!("parses");
+    };
+    assert_eq!(input.network.dc_addresses, ["10.0.0.10", "10.0.0.11"]);
+    let base = domain_args();
+    let i = base.iter().position(|a| a == "--dc-address").unwrap();
+    let mut without = base.clone();
+    without.drain(i..i + 2);
+    let Ok(Command::Domain(input)) = parse(os(&without)) else {
+        panic!("parses");
+    };
+    assert!(input.network.dc_addresses.is_empty());
 }
 
 /// Task K9: every new `domain` flag that has no default is required (an

@@ -20,6 +20,9 @@ pub enum EventError {
     InvalidText,
     /// A calendar-time field is out of range.
     InvalidTime,
+    /// A zone SERIAL field is 0, which no zone shows (RFC 2136 §7.11; task
+    /// DN10b, crate::zone).
+    InvalidSerial,
 }
 
 impl From<ipc::Error> for EventError {
@@ -35,6 +38,7 @@ impl fmt::Display for EventError {
             EventError::UnsupportedFormat => f.write_str("audit event format not supported"),
             EventError::InvalidText => f.write_str("audit event text is not printable ASCII"),
             EventError::InvalidTime => f.write_str("audit event time field out of range"),
+            EventError::InvalidSerial => f.write_str("audit event zone serial is zero"),
         }
     }
 }

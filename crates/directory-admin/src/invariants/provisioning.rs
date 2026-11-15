@@ -13,6 +13,12 @@
 //! administrators, the two groups and the Tier-0 group's members — passes
 //! exactly the rules of the online path.
 //!
+//! Given the zone ([`Provisioning::with_dns_registration`], task DN10b), the
+//! DC account's create also carries the DC's own host record — through the
+//! same host-record rule an online host's record passes, and with the zone
+//! serial taken in the same commit (docs/54 §3.1; docs/questions/Q-1003
+//! item 2).
+//!
 //! A session can be opened only on an **empty** store (no counter, no
 //! object) and creates both named counters itself (A-83: counters are
 //! created only by provisioning; A-75, docs/51 §8.3). A provisioned store
@@ -32,11 +38,15 @@ use ad_schema::Phase1Schema;
 use dirstore::{NewObject, NodeId, Timestamp, WriteTxn};
 use dtyp::Guid;
 
-use super::{CommitError, InvariantViolation, Invariants, Refused, StoreRead};
+use directory_pip::NamingContext;
+
+use super::{
+    CommitError, HostZone, InvariantViolation, Invariants, Refused, StoreRead, WriteStamp,
+};
 use crate::config::{
-    CHANGE_SEQ_COUNTER, CHANGE_SEQ_END_EXCLUSIVE, CHANGE_SEQ_FIRST, DNS_ZONE_SERIAL_COUNTER,
-    DNS_ZONE_SERIAL_END_EXCLUSIVE, DNS_ZONE_SERIAL_FIRST, RID_COUNTER, RID_END_EXCLUSIVE,
-    RID_FIRST,
+    DnsRegistration, CHANGE_SEQ_COUNTER, CHANGE_SEQ_END_EXCLUSIVE, CHANGE_SEQ_FIRST,
+    DNS_ZONE_SERIAL_COUNTER, DNS_ZONE_SERIAL_END_EXCLUSIVE, DNS_ZONE_SERIAL_FIRST, RID_COUNTER,
+    RID_END_EXCLUSIVE, RID_FIRST,
 };
 
 /// A named provisioning exception: what an object claims to be beyond the
@@ -148,6 +158,8 @@ fn commit_failed(e: CommitError) -> ProvisioningError {
             ProvisioningError::Store("take_counter_value(dns-zone-serial)")
         }
         CommitError::Read(_) => ProvisioningError::Store("read"),
+        // Cannot happen: the session stamps every write.
+        CommitError::Unstamped => ProvisioningError::Store("stamp"),
     }
 }
 
@@ -182,8 +194,9 @@ impl<'t, 's> Provisioning<'t, 's> {
         wall_clock: Timestamp,
         origin_node: NodeId,
     ) -> Result<Provisioning<'t, 's>, ProvisioningError> {
-        // No zone yet: the session writes no host record until task DN13
-        // gives it the DC's (fail closed — docs/54 §3.1).
+        // No zone yet: the session writes no host record unless it is given
+        // one ([`Provisioning::with_dns_registration`], task DN10b) — fail
+        // closed (docs/54 §3.1).
         let invariants = Invariants::new(schema, BTreeSet::new(), None)
             .map_err(|_| ProvisioningError::Schema)?;
         let read = |_| ProvisioningError::Store("read");
@@ -219,6 +232,32 @@ impl<'t, 's> Provisioning<'t, 's> {
             origin_node,
             claimed: BTreeSet::new(),
         })
+    }
+
+    /// This session with the zone of host records: the naming context's DNS
+    /// name and `dns`'s registrable networks — exactly as the online PEP
+    /// derives its own (`DirectoryAdmin::new`, A-53) — so the DC's own host
+    /// record (docs/54 §3.1: "written in `provision domain` only") passes the
+    /// one checker's host-record rule under its `DcAccount` claim: the DC's
+    /// names give one LDH label `<computerName>.<zone>`, at most eight
+    /// addresses, each registrable (never loopback, unspecified or
+    /// multicast; inside a registrable network). Without it the session
+    /// writes no host address (fail closed). The commit that writes the
+    /// record takes the zone serial in the same transaction, as every write
+    /// that changes the zone (RFC 2136 §3.6).
+    /// Spec: docs/54 §3.1, §5.3, §5.5; docs/questions/Q-994 item 6 (a),
+    /// Q-1003 item 2 (A-172: task DN10b); A-53.
+    #[must_use]
+    pub fn with_dns_registration(
+        mut self,
+        naming_context: &NamingContext,
+        dns: &DnsRegistration,
+    ) -> Provisioning<'t, 's> {
+        self.invariants.hosts = Some(HostZone {
+            zone: naming_context.dns_name(),
+            networks: dns.networks().to_vec(),
+        });
+        self
     }
 
     /// Create `new`, claiming the exception `role` (`None`: an ordinary
@@ -257,8 +296,12 @@ impl<'t, 's> Provisioning<'t, 's> {
             .invariants
             .check_create(self.txn, new, role, &[])
             .map_err(refused)?;
+        let stamp = WriteStamp {
+            wall_clock: self.wall_clock,
+            origin_node: self.origin_node,
+        };
         checked
-            .commit(self.txn, self.wall_clock, self.origin_node)
+            .commit(self.txn, Some(stamp))
             .map_err(commit_failed)?;
         match role {
             Some(ProvisioningRole::ServiceObject) => {

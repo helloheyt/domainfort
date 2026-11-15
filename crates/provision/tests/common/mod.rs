@@ -291,6 +291,9 @@ pub fn input(dir: &TempDir, dird_uid: u32, keyadm_uid: u32) -> DomainInput {
             // inside the internal networks.
             kpasswd_listen: vec!["127.0.0.1:464".to_owned()],
             dnsd_listen: vec!["127.0.0.1:53".to_owned()],
+            // Task DN10b: the DC's host record (docs/54 §3.1), inside the
+            // IPv4 internal network 10.0.0.0/8 (not loopback).
+            dc_addresses: vec!["10.0.0.10".to_owned()],
         },
         names: Names {
             tier0_ou: "Tier0".to_owned(),

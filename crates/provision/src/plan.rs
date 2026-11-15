@@ -24,7 +24,7 @@
 //! | 2 | Tier-0 OU | organizationalUnit | NC root | — | `ou` |
 //! | 3 | workstations OU (optional) | organizationalUnit | NC root | — | `ou` |
 //! | 4 | krbtgt | user | Tier-0 OU | 502 (fixed) | cn = sAMAccountName = "krbtgt"; UAC = N; accountExpires = never; no pwdLastSet |
-//! | 5 | DC computer | computer | Tier-0 OU | counter | cn = name, sAMAccountName = name‖"$"; UAC = ST; dNSHostName = fqdn; accountExpires = never; no SPN |
+//! | 5 | DC computer | computer | Tier-0 OU | counter | cn = name, sAMAccountName = name‖"$"; UAC = ST; dNSHostName = fqdn; accountExpires = never; no SPN; its host record = the `--dc-address` values (task DN10b — the zone's A record of the DC, docs/54 §3.1) |
 //! | 6 | LDAP service | computer | Tier-0 OU | counter | as 5 with UAC = WT and SPN `ldap/<fqdn>` |
 //! | 7 | admin service | computer | Tier-0 OU | counter | as 5 with UAC = WT and SPN `admind/<fqdn>` |
 //! | 8 | change-password service (task K9) | computer | Tier-0 OU | counter | as 5 with UAC = WT and SPN `kadmin/changepw` (RFC 3244 §2) |
@@ -55,11 +55,15 @@ use ad_schema::flags::group_type::{GROUP_TYPE_ACCOUNT_GROUP, GROUP_TYPE_SECURITY
 use ad_schema::flags::user_account_control::{
     ADS_UF_NORMAL_ACCOUNT, ADS_UF_SERVER_TRUST_ACCOUNT, ADS_UF_WORKSTATION_TRUST_ACCOUNT,
 };
+use config::DirdSettings;
 use directory_admin::{
-    computer_sam, filetime, new_object_descriptor, RandomSource, ACCOUNT_EXPIRES_NEVER,
-    RID_END_EXCLUSIVE, RID_FIRST,
+    computer_sam, filetime, new_object_descriptor, DnsRegistration, RandomSource,
+    ACCOUNT_EXPIRES_NEVER, RID_END_EXCLUSIVE, RID_FIRST,
 };
-use directory_pip::{account_salt, dstime_of, AccountKind, NamingContext, NC_RDN_ATTRIBUTE};
+use directory_pip::{
+    account_salt, dstime_of, host_address_value, registrable, AccountKind, NamingContext,
+    HOST_ADDRESS, NC_RDN_ATTRIBUTE,
+};
 use dirstore::{AttrId, ClassId, NodeId, INTEGRITY_KEY_LEN};
 use dtyp::{Guid, SecurityDescriptor, Sid, GUID_PACKET_LEN, SECURITY_NT_AUTHORITY};
 use keyd_types::CHANGE_PASSWORD_SERVICE_NAME;
@@ -72,7 +76,7 @@ use zeroize::Zeroizing;
 use crate::configs::{domain_configs, ConfigFile, Daemon};
 use crate::descriptor::domain_root_descriptor;
 use crate::ids::{integer32, integer64, object_ref, text, ClassIds, SchemaIds};
-use crate::input::{Account, DomainInput, InputError, Paths, KRBTGT_NAME};
+use crate::input::{Account, DomainInput, InputError, InputErrorKind, Paths, KRBTGT_NAME};
 use crate::policy::{domain_policy, CreatableClasses, DomainPolicyInput};
 
 /// SECURITY_NT_NON_UNIQUE: the first SubAuthority of a domain SID.
@@ -211,6 +215,10 @@ pub enum PlanError {
     Salt,
     /// A planned RID or SID could not be formed.
     Sid,
+    /// dird's generated file names no DNS registration networks the write
+    /// checker accepts (task DN10b: the provisioning session's zone comes
+    /// from that file).
+    DnsRegistration,
 }
 
 impl fmt::Display for PlanError {
@@ -232,6 +240,9 @@ impl fmt::Display for PlanError {
             PlanError::ManifestRoundTrip => f.write_str("manifest did not parse back"),
             PlanError::Salt => f.write_str("a first administrator's salt cannot be formed"),
             PlanError::Sid => f.write_str("a SID could not be formed"),
+            PlanError::DnsRegistration => {
+                f.write_str("dird's generated file names no usable DNS registration networks")
+            }
         }
     }
 }
@@ -291,6 +302,35 @@ pub struct Plan {
     pub paths: Paths,
     /// The owner of the database file (dird's account).
     pub store_owner: Owner,
+    /// The provisioning session's host-record networks: dird's
+    /// `dns_registrable_networks` as its own schema parsed them back (task
+    /// DN10b; docs/questions/Q-1014).
+    pub dns_registration: DnsRegistration,
+}
+
+/// The registrable networks of dird's generated file, as dird's own schema
+/// parses them (crate config `DirdSettings::dns_service`), as the write
+/// checker's rule (`DnsRegistration::new`: at least one, all IPv4).
+///
+/// # Errors
+/// [`PlanError::DnsRegistration`]; a file its schema refuses
+/// ([`PlanError::Config`] — already checked by `parse_back`).
+///
+/// Spec: docs/54 §5.5; docs/questions/Q-1001 item 3, Q-1003 items 1-2,
+/// Q-1014.
+fn dird_dns_registration(configs: &[ConfigFile]) -> Result<DnsRegistration, PlanError> {
+    let dird = configs
+        .iter()
+        .find(|file| file.daemon == Daemon::Dird)
+        .ok_or(PlanError::DnsRegistration)?;
+    let settings = DirdSettings::parse(dird.text().as_bytes())
+        .map_err(|e| PlanError::Config(Daemon::Dird, e))?;
+    let networks = settings
+        .dns_service()
+        .ok_or(PlanError::DnsRegistration)?
+        .registrable_networks()
+        .to_vec();
+    DnsRegistration::new(networks).map_err(|_| PlanError::DnsRegistration)
 }
 
 /// The draws of step 2.
@@ -544,13 +584,28 @@ impl Plan {
                 values,
             }
         };
-        specs.push(computer(
+        // Task DN10b: the DC's own host record — its addresses as the
+        // internal host-address attribute (four octets each, RFC 1035
+        // §3.4.1; ad-schema `HOST_ADDRESS`), written with the DC account's
+        // create through the one checker's host-record rule (docs/54 §3.1:
+        // "written in `provision domain` only"; docs/questions/Q-1003 item 2).
+        let mut dc = computer(
             ObjectRole::DcComputer,
             &n.dc_name,
             ADS_UF_SERVER_TRUST_ACCOUNT,
             None,
             rid_dc,
+        );
+        dc.values.push((
+            HOST_ADDRESS,
+            checked
+                .dc_addresses
+                .iter()
+                .copied()
+                .map(host_address_value)
+                .collect(),
         ));
+        specs.push(dc);
         // The service objects: one SPN each, host in lower case (docs/10
         // §5ב / A-46; RFC 4120 §6.2.1 as cited in docs/47 §1.3); WT
         // (docs/51 §4.3 step 5); the admin class per A-73.
@@ -741,6 +796,25 @@ impl Plan {
                 .map_err(|e| PlanError::Config(file.daemon, e))?;
         }
 
+        // Task DN10b: the provisioning session's zone — the registrable
+        // networks of dird's own parsed file (one rule set, dird's: the
+        // session and dird judge a host record against the same networks),
+        // and every DC address registrable in them by the write checker's own
+        // rule (directory-pip `registrable`), refused here with the flag's
+        // name before anything is written; the checker judges them again at
+        // the write (docs/54 §3.1, §5.5; docs/questions/Q-1003 item 2, Q-1014).
+        let dns_registration = dird_dns_registration(&configs)?;
+        if !checked
+            .dc_addresses
+            .iter()
+            .all(|address| registrable(*address, dns_registration.networks()))
+        {
+            return Err(PlanError::Input(InputError::new(
+                "dc-address",
+                InputErrorKind::DcAddressNotRegistrable,
+            )));
+        }
+
         // Step 8: the manifest, through the builder (which parses its own
         // canonical text, A-86).
         let guid_of = |role: ObjectRole| {
@@ -800,6 +874,7 @@ impl Plan {
             manifest,
             paths: input.paths.clone(),
             store_owner: Owner::from(input.accounts.dird),
+            dns_registration,
         })
     }
 

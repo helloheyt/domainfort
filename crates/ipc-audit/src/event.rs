@@ -4,6 +4,7 @@
 //! ```text
 //! Event := event_format:u8 (= 1) ‖ shape:u8 ‖ the shape's fields
 //! shape := 1 Kdc | 2 Keyd | 3 Ldap | 4 WindowSummary | 5 DirAdmin | 6 Admind
+//!        | 7 ZoneSerial
 //! ```
 //!
 //! Each shape carries exactly the non-secret fields its source crate's
@@ -12,7 +13,8 @@
 //! the `ipc` field primitives (one encoding per value, docs/50 §3.3). The
 //! admin-plane shapes `DirAdmin` (dird) and `Admind` (admind) have no source
 //! audit type yet; their fields are this crate's (crate::admin, docs/51
-//! §5.7, task A7).
+//! §5.7, task A7) — as are those of `ZoneSerial` (dird's serial-only zone
+//! write, crate::zone; task DN10b, docs/questions/Q-1013).
 //! **No field can hold a key, a password, a ticket, a PAC, a plaintext, a
 //! ciphertext, a free attribute value or any request octet string** (the
 //! `DirAdmin` request values are closed codes, Q-340 item 5): the types
@@ -47,6 +49,7 @@ use crate::values::{
     read_opt, read_seq, write_opt, write_seq, AuditText, CalendarTime, CodecError, PdpReason,
     Principal, ReportedAddress, SidValue,
 };
+use crate::zone::ZoneSerialEvent;
 use core::fmt;
 use ipc::{FrameLimit, Reader, Writer};
 
@@ -791,6 +794,9 @@ pub enum EventBody {
     DirAdmin(Box<DirAdminEvent>),
     /// An admind event (docs/51 §5.7 item 3).
     Admind(Box<AdmindEvent>),
+    /// dird's serial-only zone write: a decision or outcome (task DN10b;
+    /// docs/questions/Q-1002, Q-1013).
+    ZoneSerial(Box<ZoneSerialEvent>),
 }
 
 impl EventBody {
@@ -804,6 +810,7 @@ impl EventBody {
             EventBody::WindowSummary(_) => EventShape::WindowSummary,
             EventBody::DirAdmin(_) => EventShape::DirAdmin,
             EventBody::Admind(_) => EventShape::Admind,
+            EventBody::ZoneSerial(_) => EventShape::ZoneSerial,
         }
     }
 }
@@ -881,6 +888,7 @@ pub fn encode_event(event: &EventBody) -> Result<EventBytes, EventError> {
         EventBody::WindowSummary(summary) => summary.write(&mut writer)?,
         EventBody::DirAdmin(admin) => admin.write(&mut writer)?,
         EventBody::Admind(admind) => admind.write(&mut writer)?,
+        EventBody::ZoneSerial(zone) => zone.write(&mut writer)?,
     }
     // The payload holds no secret (docs/37 §2); the zeroizing buffer of the
     // ipc writer is simply copied out.
@@ -910,6 +918,9 @@ pub fn decode_event(octets: &[u8]) -> Result<EventBody, EventError> {
         EventShape::WindowSummary => EventBody::WindowSummary(WindowSummary::read(&mut reader)?),
         EventShape::DirAdmin => EventBody::DirAdmin(Box::new(DirAdminEvent::read(&mut reader)?)),
         EventShape::Admind => EventBody::Admind(Box::new(AdmindEvent::read(&mut reader)?)),
+        EventShape::ZoneSerial => {
+            EventBody::ZoneSerial(Box::new(ZoneSerialEvent::read(&mut reader)?))
+        }
     };
     reader.finish()?;
     Ok(event)

@@ -97,6 +97,9 @@ fn binding_table() {
     assert_eq!(bound_source(EventShape::DirAdmin), Some(Source::Dird));
     assert_eq!(bound_source(EventShape::Admind), Some(Source::Admind));
     assert_eq!(bound_source(EventShape::WindowSummary), None);
+    // Task DN10b (docs/questions/Q-1013; A-85): dird's serial-only zone
+    // write — accepted from dird only.
+    assert_eq!(bound_source(EventShape::ZoneSerial), Some(Source::Dird));
     // No shape is bound to ldap-front (it sends no events) or to auditd
     // (its own records never come over the socket).
     for shape in EventShape::ALL {
@@ -105,7 +108,7 @@ fn binding_table() {
     }
     // Every shape of the closed table is classified (a new shape fails
     // the exhaustive match in `bound_source` until it is).
-    assert_eq!(EventShape::ALL.len(), 6);
+    assert_eq!(EventShape::ALL.len(), 7);
 }
 
 /// Source: docs/50 §3.2, §4.2, §8.1; docs/51 §5.7; docs/questions/Q-341.
@@ -131,12 +134,14 @@ fn binding_permits() {
             assert!(permits(source, &event));
         }
         // The older shapes (only the shape octet is read): Kdc ⇐ kdc,
-        // Keyd ⇐ keyd, Ldap ⇐ dird, WindowSummary ⇐ any.
+        // Keyd ⇐ keyd, Ldap ⇐ dird, WindowSummary ⇐ any; and task DN10b's
+        // ZoneSerial (7) ⇐ dird (docs/questions/Q-1013; A-85).
         for (shape, sender) in [
             (1u8, Some(Source::Kdc)),
             (2, Some(Source::Keyd)),
             (3, Some(Source::Dird)),
             (4, None),
+            (7, Some(Source::Dird)),
         ] {
             let event = ipc_audit::EventBytes::new(vec![ipc_audit::EVENT_FORMAT, shape]).unwrap();
             let expected = match sender {
@@ -153,7 +158,7 @@ fn binding_permits() {
         let event = ipc_audit::EventBytes::new(vec![ipc_audit::EVENT_FORMAT + 1, 1]).unwrap();
         assert!(permits(source, &event));
         // A shape code past the table, or another format octet: not bound.
-        let event = ipc_audit::EventBytes::new(vec![ipc_audit::EVENT_FORMAT, 7, 0]).unwrap();
+        let event = ipc_audit::EventBytes::new(vec![ipc_audit::EVENT_FORMAT, 8, 0]).unwrap();
         assert!(permits(source, &event));
         let event = ipc_audit::EventBytes::new(vec![0xAD, 5]).unwrap();
         assert!(permits(source, &event));

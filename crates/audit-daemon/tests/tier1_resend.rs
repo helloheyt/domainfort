@@ -141,9 +141,14 @@ fn production_gives_every_source_one_numbering() {
     }
     assert_eq!(numbering(one_label, Source::Kdc), Numbering::Shared);
     assert_eq!(numbering(one_label, Source::Dird), Numbering::Single);
-    // dird's two shapes under another label are still one sender's.
+    // dird's shapes under another label are still one sender's (task DN10b
+    // added `ZoneSerial`, dird's too — docs/questions/Q-1013).
     fn dird_as_kdc(shape: EventShape) -> Option<Source> {
-        matches!(shape, EventShape::Ldap | EventShape::DirAdmin).then_some(Source::Kdc)
+        matches!(
+            shape,
+            EventShape::Ldap | EventShape::DirAdmin | EventShape::ZoneSerial
+        )
+        .then_some(Source::Kdc)
     }
     assert_eq!(numbering(dird_as_kdc, Source::Kdc), Numbering::Single);
 }

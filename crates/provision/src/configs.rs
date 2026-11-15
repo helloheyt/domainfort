@@ -34,10 +34,11 @@
 //! file names) + `dnsd_uid` (dnsd's account), docs/54 §4.6 — and the zone
 //! values of its image ([`DIRD_DNS_CHANNEL_KEYS`]; docs/questions/Q-619
 //! item 5, Q-1001, Q-1003 item 1), so a provisioned dird serves the socket
-//! a provisioned dnsd connects to (Q-973 item 6). The DC's own host record
-//! is **not** written yet (it needs the provisioning session's zone — a
-//! directory-admin change, docs/questions/Q-1003 item 2): until it is, the
-//! zone cannot be projected and dird's DNS service reports it at start.
+//! a provisioned dnsd connects to (Q-973 item 6). Since task DN10b the
+//! DC's own host record is written too (`--dc-address`, through the
+//! provisioning session given the zone — module crate::store), and the
+//! session's networks are the `dns_registrable_networks` of this very file
+//! as dird's schema parses it back (crate::plan; docs/questions/Q-1014).
 //!
 //! Spec: docs/51 §4.3 step 7, §4.6, §5.5 (R51-10), §5.6 (R51-11); docs/50
 //! R50-15, §2.4, §3.1, §3.2, §7.1, R50-18; docs/53 R53-3, R53-4, §3.3,

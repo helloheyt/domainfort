@@ -7,6 +7,7 @@
 //! | `Keyd` | keyd | `keyd::AuditRecord` (docs/50 §8.1; docs/10 §10) |
 //! | `Ldap` | dird | the LDAP events are written by dird, the PEP, not by the front (docs/50 §4.2; R49-14) |
 //! | `DirAdmin` | dird | dird is the source of the admin write events (docs/51 §5.7 item 1) |
+//! | `ZoneSerial` | dird | dird alone advances the zone serial without a content write, through the one checker (task DN10b; docs/questions/Q-1002, Q-1013; A-85) |
 //! | `Admind` | admind | admind sends its own events (docs/51 §5.7 item 3) |
 //! | `WindowSummary` | any mapped source | every sender's window writes one (Q-252 item 8, A-57) |
 //!
@@ -55,7 +56,7 @@ pub const fn bound_source(shape: EventShape) -> Option<Source> {
     match shape {
         EventShape::Kdc => Some(Source::Kdc),
         EventShape::Keyd => Some(Source::Keyd),
-        EventShape::Ldap | EventShape::DirAdmin => Some(Source::Dird),
+        EventShape::Ldap | EventShape::DirAdmin | EventShape::ZoneSerial => Some(Source::Dird),
         EventShape::Admind => Some(Source::Admind),
         EventShape::WindowSummary => None,
     }

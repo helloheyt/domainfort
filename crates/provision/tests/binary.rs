@@ -94,6 +94,9 @@ fn args(input: &provision::DomainInput) -> Vec<String> {
     for network in &input.network.internal_networks {
         push("--internal-network", network.clone());
     }
+    for address in &input.network.dc_addresses {
+        push("--dc-address", address.clone());
+    }
     v
 }
 

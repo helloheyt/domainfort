@@ -217,6 +217,21 @@
 //! Written only from the sources listed in module `dns_update`;
 //! interpretations in docs/questions/Q-991..Q-994. No other implementation
 //! was consulted or recalled (AGENTS.md §1-3).
+//!
+//! # The serial-only zone write (task DN10b; docs/questions/Q-1002, A-172)
+//!
+//! [`ZoneSerialWriter`] advances the zone's SOA SERIAL without a content
+//! write, for the changes no commit sees (the clock; a dird restart with
+//! other zone values): `prepare` in dird's `WriteTxn` (the `ZoneSerial`
+//! decision event), auditd's acknowledgement, then `apply` — the one
+//! checker's `Op::ZoneSerial` and the one commit, which takes the counter
+//! exactly as for a content write; still one writer of SERIAL. The
+//! provisioning session, given the zone
+//! ([`Provisioning::with_dns_registration`]), writes the DC's own host
+//! record through the same host-record rule. Written only from the sources
+//! listed in module `zone_serial`; interpretations in docs/questions/Q-1013,
+//! Q-1014. No other implementation was consulted or recalled (AGENTS.md
+//! §1-3).
 
 mod admin;
 mod apply;
@@ -239,6 +254,7 @@ mod reply;
 mod requests;
 mod subject;
 mod time;
+mod zone_serial;
 
 pub use admin::{
     DirectoryAdmin, Prepared, Request, VerificationFailure, ACCOUNT_EXPIRES_NEVER,
@@ -308,3 +324,9 @@ pub use random::{OsRandom, RandomError, RandomSource};
 pub use reply::{KeyTarget, LookupResult, PasswordChangeTarget, PasswordSetReply, Reply};
 pub use subject::{AdminSubject, SubjectError, VerifiedTicket};
 pub use time::{filetime, wall_clock};
+// The serial-only zone write (task DN10b; docs/questions/Q-1002, A-172):
+// the zone's SERIAL advanced through the one commit, after auditd
+// acknowledged the decision — for dird's DNS service.
+pub use zone_serial::{
+    AppliedSerialAdvance, PreparedSerialAdvance, SerialAdvanceFailed, ZoneSerialWriter,
+};

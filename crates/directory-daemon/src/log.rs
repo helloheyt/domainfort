@@ -185,11 +185,19 @@ pub enum Note {
     /// it fetches); the fetch was refused `Unavailable` (fail closed — dnsd
     /// keeps its image until its staleness bound).
     DnsZoneUnavailable,
-    /// The clock changed the zone's content under its SERIAL (an address
-    /// aged out, an account expired) and the serial cannot be advanced yet
-    /// (docs/questions/Q-993 item 3, Q-1002): the fetch was refused
-    /// `Unavailable`.
-    DnsSerialAdvanceNeeded,
+    /// The zone's SERIAL was advanced without a content write (task DN10b;
+    /// docs/questions/Q-1002): the id is the new SERIAL.
+    DnsSerialAdvanced,
+    /// The clock changed the zone's content under its SERIAL and the
+    /// advance is deferred: the previous one was less than the bound ago
+    /// (task DN10b, `dns_service::MIN_SERIAL_ADVANCE_INTERVAL`; thinned) —
+    /// the fetch was refused `Unavailable` (fail closed).
+    DnsSerialAdvanceDeferred,
+    /// A serial advance did not happen (auditd unavailable, not
+    /// acknowledged, the store, the counter — logged with the code of
+    /// `dns_service::SerialAdvanceStop::code`, thinned): the fetch was
+    /// refused `Unavailable` (fail closed).
+    DnsSerialAdvanceFailed,
     /// At the stop, noise counted for a `WindowSummary` that never left
     /// the audit window (auditd unreachable, or the pace held it past the
     /// grace): lost with the process; the identifier is the count
@@ -310,9 +318,13 @@ impl Note {
                 "forwarded DNS message refused unread: the DNS update service is not built"
             }
             Note::DnsZoneUnavailable => "zone image not projected: fetch refused; reason code",
-            Note::DnsSerialAdvanceNeeded => {
-                "zone content changed with the clock under its serial and the serial cannot be \
-                 advanced: fetch refused"
+            Note::DnsSerialAdvanced => "zone serial advanced without a content write; serial",
+            Note::DnsSerialAdvanceDeferred => {
+                "zone content changed with the clock under its serial and the previous serial \
+                 advance is too recent: fetch refused"
+            }
+            Note::DnsSerialAdvanceFailed => {
+                "zone serial advance did not happen: fetch refused; reason code"
             }
             Note::AuditSuppressedNoiseUndelivered => {
                 "audit count not delivered at stop: suppressed noise"

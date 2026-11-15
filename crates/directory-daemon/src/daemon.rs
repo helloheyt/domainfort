@@ -59,7 +59,7 @@ use crate::admin_service::{
 use crate::audit_link::{self, AuditEndpoint, AuditLinkError};
 use crate::clock::SharedClock;
 use crate::dns_listener::{self, DnsServeContext};
-use crate::dns_service::{DnsNotStarted, DnsParams, DnsServeParams, DnsWorker};
+use crate::dns_service::{DnsNotStarted, DnsParams, DnsServeParams, DnsWorker, SerialAdvance};
 use crate::engine::{DirectoryEngine, EngineError, EnginePanicked, EngineThread};
 use crate::kpasswd_engine::KpasswdWorker;
 use crate::kpasswd_listener::{self, KpasswdServeContext};
@@ -760,50 +760,77 @@ struct DnsRunning {
 }
 
 /// Start the DNS service (task DN10a; docs/54 §4.6): its own directory
-/// context and tier map of the loaded policy, one zone projection at
-/// dird's clock — a directory whose zone cannot be projected (no DC host
-/// address, no zone serial counter, …) would serve nothing, so the service
-/// does not start and says why — then the DNS thread, `dird-dns.sock`
-/// bound, accept. Independent of the admin and kpasswd services: the zone
-/// image needs neither keyd nor the write PEP (docs/questions/Q-1000 item
-/// 1). Any failure ⇒ [`DnsNotStarted`]: dird's other services run (the
-/// admin service's precedent, docs/51 §4.6); a provisioned dnsd then stops
-/// at its dird check (docs/54 §4.8 — fail closed).
-/// Spec: docs/54 §4.3, §4.4, §4.6, §4.8; docs/50 R50-3, R50-7.
-fn start_dns(
+/// context and tier map of the loaded policy, the serial-only write's door
+/// (task DN10b), then the DNS thread, whose first step is the start
+/// ([`DnsWorker::start`]): the zone must project — a directory whose zone
+/// cannot be projected (no DC host address, no zone serial counter, …)
+/// would serve nothing, so the service does not start and says why — then
+/// the start's serial advance through the one checker, its decision
+/// acknowledged by auditd (docs/questions/Q-1002 item 4 (b): zone values
+/// changed in dird's file are never served under an earlier SERIAL), then
+/// the first projection. Only then `dird-dns.sock` is bound and accepted
+/// on. Independent of the admin and kpasswd services: the zone image and
+/// the serial advance need neither keyd nor the write PEP
+/// (docs/questions/Q-1000 item 1). Any failure ⇒ [`DnsNotStarted`]: dird's
+/// other services run (the admin service's precedent, docs/51 §4.6); a
+/// provisioned dnsd then stops at its dird check (docs/54 §4.8 — fail
+/// closed).
+/// Spec: docs/54 §4.3, §4.4, §4.6, §4.8, §5.4; docs/50 R50-3, R50-7;
+/// docs/questions/Q-1002 (A-172).
+async fn start_dns(
     dns: DnsServeParams,
     params: &ServeParams,
     store: &Arc<Store>,
     policy: &DevelopmentPolicy,
+    gate: &Arc<AuditGate>,
     state: &Arc<ControlState>,
+    ids: &Arc<OperationIds>,
 ) -> Result<(DnsRunning, u32), DnsNotStarted> {
     let schema = ad_schema::phase1().map_err(|_| DnsNotStarted::Configuration)?;
+    let writer = directory_admin::ZoneSerialWriter::new(&schema)
+        .map_err(|_| DnsNotStarted::Configuration)?;
     let ctx = DirectoryContext::new(schema, &params.keyd, params.naming_context.clone())
         .map_err(|_| DnsNotStarted::Configuration)?;
     let tiers = tier_map(policy).map_err(|_| DnsNotStarted::Configuration)?;
+    let advance = SerialAdvance::new(
+        writer,
+        Arc::clone(gate),
+        Arc::clone(ids),
+        dns.min_serial_advance_interval,
+    );
     let worker = DnsWorker::new(
         Arc::clone(store),
         ctx,
         tiers,
         dns.zone.clone(),
         params.clock.clone(),
+        advance,
     );
-    // The zone must project before anything is served (docs/54 §4.8: dnsd
-    // serves only after its first image; an image dird cannot build is a
-    // service that cannot start). Here — before this first projection — the
-    // serial-only checked write of docs/questions/Q-1002 item 4 (b) will
-    // advance the zone serial once per start, so that zone values changed
-    // in dird's file are never served under an earlier SERIAL (Q-619 item
-    // 10); until it exists that is a documented residual (Q-1002 item 5).
-    let serial = worker.project()?.0.image().serial();
     let ended = Arc::clone(state);
+    let (started, start) = tokio::sync::oneshot::channel();
     let (handle, thread) = worker
-        .spawn(dns.queue_capacity, move || {
+        .spawn(dns.queue_capacity, started, move || {
             ended.engine_ended.store(true, Ordering::SeqCst);
             ended.stopping.store(true, Ordering::SeqCst);
             ended.stop.notify_one();
         })
         .map_err(|_| DnsNotStarted::Spawn)?;
+    // The start runs on the DNS thread (its acknowledgement wait must not
+    // block this runtime, which runs the audit client); the thread ends at
+    // once when it fails.
+    let serial = match start.await {
+        Ok(Ok(serial)) => serial,
+        Ok(Err(reason)) => {
+            drop(handle);
+            let _ = thread.join();
+            return Err(reason);
+        }
+        Err(_) => {
+            drop(handle);
+            let _ = thread.join();
+            return Err(DnsNotStarted::Spawn);
+        }
+    };
     let listener = match bind(&dns.socket) {
         Ok(listener) => listener,
         Err(_) => {
@@ -1137,16 +1164,18 @@ pub async fn serve_with(
     // service: a failure is logged and dird serves on without it.
     let dns_running = match dns {
         None => None,
-        Some(dns) => match start_dns(dns, &params, &store, &policy, &control.state) {
-            Ok((running, serial)) => {
-                note(Note::DnsListening, Some(u64::from(serial)));
-                Some(running)
+        Some(dns) => {
+            match start_dns(dns, &params, &store, &policy, &gate, &control.state, &ids).await {
+                Ok((running, serial)) => {
+                    note(Note::DnsListening, Some(u64::from(serial)));
+                    Some(running)
+                }
+                Err(reason) => {
+                    note(Note::DnsNotStarted, Some(reason.code()));
+                    None
+                }
             }
-            Err(reason) => {
-                note(Note::DnsNotStarted, Some(reason.code()));
-                None
-            }
-        },
+        }
     };
     drop(store);
     control.state.serving.store(true, Ordering::SeqCst);

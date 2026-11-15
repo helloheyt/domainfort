@@ -83,6 +83,11 @@ fn sid(rid: u32) -> Sid {
 
 const WALL: Timestamp = Timestamp(13_400_000_000);
 const NODE: NodeId = NodeId([0x5C; 16]);
+/// The stamp of every object write committed here.
+const STAMP: Option<WriteStamp> = Some(WriteStamp {
+    wall_clock: WALL,
+    origin_node: NODE,
+});
 
 fn text(s: &str) -> Vec<Vec<u8>> {
     vec![s.as_bytes().to_vec()]
@@ -332,7 +337,7 @@ fn the_commit_takes_the_rid_and_the_change_seq() {
             &[],
         )
         .unwrap();
-    let committed = checked.commit(&mut txn, WALL, NODE).unwrap();
+    let committed = checked.commit(&mut txn, STAMP).unwrap();
     assert_eq!(committed.rid, Some(1101));
     assert_eq!(committed.sid, Some(sid(1101)));
     let alice = txn.get_object(guid(20)).unwrap().unwrap();
@@ -360,9 +365,9 @@ fn a_checked_write_is_stale_after_another_write() {
     let second = inv
         .check_create(&txn, ou(&ids, guid(31), guid(1), "B"), None, &[])
         .unwrap();
-    second.commit(&mut txn, WALL, NODE).unwrap();
+    second.commit(&mut txn, STAMP).unwrap();
     assert!(matches!(
-        first.commit(&mut txn, WALL, NODE),
+        first.commit(&mut txn, STAMP),
         Err(CommitError::Stale)
     ));
     assert!(txn.get_object(guid(30)).unwrap().is_none());
@@ -413,7 +418,7 @@ fn a_link_proof_of_another_state_is_not_accepted() {
     };
     inv.check_modify(&txn, guid(41), member(guid(40)), &[])
         .unwrap()
-        .commit(&mut txn, WALL, NODE)
+        .commit(&mut txn, STAMP)
         .unwrap();
     assert!(matches!(
         inv.check_modify(&txn, guid(40), member(guid(41)), &[proof]),
@@ -961,7 +966,7 @@ fn the_commit_takes_the_zone_serial_for_zone_changes() {
             &[],
         )
         .unwrap();
-    let committed = checked.commit(&mut txn, WALL, NODE).unwrap();
+    let committed = checked.commit(&mut txn, STAMP).unwrap();
     assert_eq!(committed.zone_serial, None);
     assert_eq!(serial(&txn), 1);
     // Its record: the serial moves; SERIAL = the counter's next value.
@@ -976,7 +981,7 @@ fn the_commit_takes_the_zone_serial_for_zone_changes() {
         )
         .unwrap();
     assert_eq!(
-        checked.commit(&mut txn, WALL, NODE).unwrap().zone_serial,
+        checked.commit(&mut txn, STAMP).unwrap().zone_serial,
         Some(2)
     );
     assert_eq!(serial(&txn), 2);
@@ -993,7 +998,7 @@ fn the_commit_takes_the_zone_serial_for_zone_changes() {
         )
         .unwrap();
     assert_eq!(
-        checked.commit(&mut txn, WALL, NODE).unwrap().zone_serial,
+        checked.commit(&mut txn, STAMP).unwrap().zone_serial,
         Some(3)
     );
     // A change of an object without one: it does not.
@@ -1008,10 +1013,7 @@ fn the_commit_takes_the_zone_serial_for_zone_changes() {
             &[],
         )
         .unwrap();
-    assert_eq!(
-        checked.commit(&mut txn, WALL, NODE).unwrap().zone_serial,
-        None
-    );
+    assert_eq!(checked.commit(&mut txn, STAMP).unwrap().zone_serial, None);
     assert_eq!(serial(&txn), 3);
     // Values and targets are judged at the check.
     assert!(matches!(
@@ -1054,8 +1056,155 @@ fn the_commit_takes_the_zone_serial_for_zone_changes() {
     // Deleting the holder: the serial moves, the record goes with it.
     let checked = inv.check_delete(&txn, guid(95)).unwrap();
     assert_eq!(
-        checked.commit(&mut txn, WALL, NODE).unwrap().zone_serial,
+        checked.commit(&mut txn, STAMP).unwrap().zone_serial,
         Some(4)
     );
     assert_eq!(StoreRead::object(&txn, guid(95)).unwrap(), None);
+}
+
+/// Task DN10b (docs/questions/Q-1002 item 2, A-172; RFC 2136 §3.6): the
+/// serial-only write commits through the one commit — it takes the zone
+/// serial exactly once, writes no object, takes no change-seq (it has no
+/// `Origin`: docs/51 §8.3); its check is bound to the change-seq state like
+/// every other (another write committed in between ⇒ `Stale`); and an
+/// object write without its stamp is refused (`Unstamped`), never stamped
+/// with a stand-in.
+#[test]
+fn the_serial_only_write_takes_the_zone_serial_alone() {
+    let ids = ids();
+    let t = TempStore::new("zone-serial-write");
+    let mut txn = t.store.begin_write().unwrap();
+    begin(&mut txn);
+    let inv = Invariants::new(&p1(), BTreeSet::new(), None).unwrap();
+    let counter = |txn: &WriteTxn<'_>, name: &str| txn.counter(name).unwrap().unwrap();
+    let seq = counter(&txn, CHANGE_SEQ_COUNTER);
+    let root = StoreRead::object(&txn, guid(1)).unwrap();
+    let checked = inv.check_zone_serial(&txn).unwrap();
+    assert_eq!(
+        checked.commit(&mut txn, None).unwrap(),
+        Committed {
+            rid: None,
+            sid: None,
+            zone_serial: Some(2)
+        }
+    );
+    assert_eq!(counter(&txn, CHANGE_SEQ_COUNTER), seq, "no change-seq");
+    assert_eq!(StoreRead::object(&txn, guid(1)).unwrap(), root);
+    assert_eq!(counter(&txn, DNS_ZONE_SERIAL_COUNTER).next_value, 2);
+    // Checked, then another write commits: the serial-only write is stale.
+    let stale = inv.check_zone_serial(&txn).unwrap();
+    let ou2 = inv
+        .check_create(&txn, ou(&ids, guid(96), guid(1), "Other"), None, &[])
+        .unwrap();
+    ou2.commit(&mut txn, STAMP).unwrap();
+    assert!(matches!(
+        stale.commit(&mut txn, None),
+        Err(CommitError::Stale)
+    ));
+    assert_eq!(counter(&txn, DNS_ZONE_SERIAL_COUNTER).next_value, 2);
+    // An object write without its stamp: refused, nothing written.
+    let unstamped = inv
+        .check_create(&txn, ou(&ids, guid(97), guid(1), "Third"), None, &[])
+        .unwrap();
+    assert!(matches!(
+        unstamped.commit(&mut txn, None),
+        Err(CommitError::Unstamped)
+    ));
+    assert_eq!(StoreRead::object(&txn, guid(97)).unwrap(), None);
+}
+
+/// Task DN10b; RFC 2136 §7.11 ("if the result of the increment is zero …
+/// increment it again"); A-83: the serial-only write never shows SERIAL 0
+/// (from a counter whose next value is 2³² − 1 it takes twice: SERIAL 1),
+/// and without the zone serial counter it is refused at the commit (the
+/// counter is never created at run time).
+#[test]
+fn the_serial_only_write_skips_zero_and_needs_the_counter() {
+    let t = TempStore::new("zone-serial-zero");
+    let mut txn = t.store.begin_write().unwrap();
+    txn.create_counter(CHANGE_SEQ_COUNTER, 1, u64::MAX).unwrap();
+    txn.create_counter(DNS_ZONE_SERIAL_COUNTER, (1u64 << 32) - 1, u64::MAX)
+        .unwrap();
+    let inv = Invariants::new(&p1(), BTreeSet::new(), None).unwrap();
+    // The counter's next value 2³² − 1 shows SERIAL 2³² − 1; one take would
+    // show 0, so the commit takes once more.
+    let checked = inv.check_zone_serial(&txn).unwrap();
+    assert_eq!(checked.commit(&mut txn, None).unwrap().zone_serial, Some(1));
+    assert_eq!(
+        txn.counter(DNS_ZONE_SERIAL_COUNTER)
+            .unwrap()
+            .unwrap()
+            .next_value,
+        (1u64 << 32) + 1
+    );
+    drop(txn);
+    let t = TempStore::new("zone-serial-missing");
+    let mut txn = t.store.begin_write().unwrap();
+    txn.create_counter(CHANGE_SEQ_COUNTER, 1, u64::MAX).unwrap();
+    let checked = inv.check_zone_serial(&txn).unwrap();
+    assert!(matches!(
+        checked.commit(&mut txn, None),
+        Err(CommitError::ZoneSerial(_))
+    ));
+    // Without the change-seq counter there is no basis: refused at the
+    // check (a store not provisioned).
+    drop(txn);
+    let t = TempStore::new("zone-serial-no-seq");
+    let txn = t.store.begin_write().unwrap();
+    assert!(matches!(
+        inv.check_zone_serial(&txn),
+        Err(Refused::Fault(Fault::Missing))
+    ));
+}
+
+/// Task DN10b (docs/54 §3.1; docs/questions/Q-1003 item 2, A-172): given the
+/// zone (`with_dns_registration` — the naming context's DNS name and the
+/// registrable networks), the provisioning session writes the DC account
+/// with its host record under the `DcAccount` claim, and that commit takes
+/// the zone serial; without the zone the same create is refused (`Value` —
+/// no host address can be written: fail closed).
+#[test]
+fn the_provisioning_session_writes_the_dc_host_record_only_with_the_zone() {
+    let ids = ids();
+    // dc01$, dNSHostName dc01.example.test (the helper's), ST, one address.
+    let dc = |g: Guid| {
+        let mut c = computer(&ids, g, guid(OU), "dc01", ADS_UF_SERVER_TRUST_ACCOUNT);
+        c.attributes
+            .push((ids.host_address, vec![vec![192, 0, 2, 1]]));
+        c
+    };
+    let naming_context = directory_pip::NamingContext::new(&["example", "test"]).unwrap();
+    let registration = crate::config::DnsRegistration::new(zone().networks).unwrap();
+    let t = TempStore::new("provision-dc-host");
+    let mut txn = t.store.begin_write().unwrap();
+    {
+        let mut session = begin(&mut txn).with_dns_registration(&naming_context, &registration);
+        session
+            .create(Some(ProvisioningRole::DcAccount), dc(guid(98)))
+            .unwrap();
+    }
+    assert_eq!(
+        txn.counter(DNS_ZONE_SERIAL_COUNTER)
+            .unwrap()
+            .unwrap()
+            .next_value,
+        2
+    );
+    let stored = StoreRead::object(&txn, guid(98)).unwrap().unwrap();
+    assert_eq!(
+        stored.attribute(ids.host_address).map(|a| a
+            .values
+            .iter()
+            .map(|v| v.value.clone())
+            .collect::<Vec<_>>()),
+        Some(vec![vec![192, 0, 2, 1]])
+    );
+    drop(txn);
+    let t = TempStore::new("provision-dc-host-no-zone");
+    let mut txn = t.store.begin_write().unwrap();
+    let mut session = begin(&mut txn);
+    assert_eq!(
+        rule(session.create(Some(ProvisioningRole::DcAccount), dc(guid(98)))),
+        InvariantViolation::Value
+    );
 }

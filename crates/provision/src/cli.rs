@@ -28,7 +28,8 @@
 //!     [--ldap-listen <addr:port> …] [--ldaps-listen <addr:port> …] \
 //!     --kpasswd-listen <addr:port> [--kpasswd-listen …] \
 //!     --dnsd-listen <addr:port> [--dnsd-listen …] \
-//!     --internal-network <addr/prefix> [--internal-network …]
+//!     --internal-network <addr/prefix> [--internal-network …] \
+//!     --dc-address <IPv4> [--dc-address …]
 //!
 //! provision policy --policy-path <path> <change> [<change> …]
 //!   <change> := --add-principal <SID> <Tier0|Tier1|Tier2>
@@ -69,6 +70,9 @@
 //! the two network fronts' accounts, files and listeners (kpasswd-front —
 //! docs/53 §3.3; dnsd — docs/54 §4.3, §4.7) and the two dird sockets they
 //! name (`dird-kpasswd.sock`, docs/53 §4.3; `dird-dns.sock`, docs/54 §4.6).
+//! Task DN10b adds `--dc-address` (repeatable, at least one — checked with
+//! the input, docs/questions/Q-1014): the DC's own host record (docs/54
+//! §3.1, §10 row DN13).
 //!
 //! Spec: docs/51 §4.3 (the input; step 12), §4.4 (the password source),
 //! §5.10 (`provision policy`), §3 (D95); docs/50 §7.1 (numeric ids, no
@@ -204,6 +208,7 @@ const DOMAIN_FLAGS: &[(&str, Arity)] = &[
     ("--kpasswd-listen", Arity::Repeated),
     ("--dnsd-listen", Arity::Repeated),
     ("--internal-network", Arity::Repeated),
+    ("--dc-address", Arity::Repeated),
 ];
 
 /// The arguments as checked text: valid UTF-8, printable ASCII only
@@ -397,6 +402,7 @@ fn parse_domain(args: &[String]) -> Result<DomainInput, CliError> {
             internal_networks: f.all("--internal-network"),
             kpasswd_listen: f.all("--kpasswd-listen"),
             dnsd_listen: f.all("--dnsd-listen"),
+            dc_addresses: f.all("--dc-address"),
         },
         names: Names {
             tier0_ou: f.one("--tier0-ou")?.to_owned(),

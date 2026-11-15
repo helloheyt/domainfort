@@ -158,35 +158,45 @@ fn ldap_srv_record_ms_adts_6_3_2_3() {
 #[test]
 fn kpasswd_srv_only_when_kpasswd_exists_q618() {
     // docs/54 §3.1, Q-618 item 1: `_kpasswd` records only when the service
-    // exists; [MS-ADTS] §6.3.2.3: port 464, both "_kpasswd._tcp.X" and
-    // "_kpasswd._udp.X".
+    // exists; [MS-ADTS] §6.3.2.3: port 464, "_kpasswd._tcp.X". One record
+    // per service that exists (docs/questions/Q-1004, A-172): kpasswd-front
+    // serves TCP only (A-117, A-158), so "_kpasswd._udp.X" is never
+    // synthesized — that name does not exist in either zone.
     let without = rfc2782_zone();
     let with = rfc2782_zone_with_kpasswd();
-    for owner in ["_kpasswd._tcp.example.com", "_kpasswd._udp.example.com"] {
-        let reply = udp(&without, &query(0x1005, owner, 33, IN, false));
+    let owner = "_kpasswd._tcp.example.com";
+    let reply = udp(&without, &query(0x1005, owner, 33, IN, false));
+    assert_eq!(reply.header.rcode, Rcode::NXDOMAIN);
+    let reply = udp(&with, &query(0x1005, owner, 33, IN, false));
+    assert_eq!(reply.header.rcode, Rcode::NOERROR);
+    match &reply.answer[0].rdata {
+        RData::Srv(srv) => assert_eq!(srv.port, 464),
+        other => panic!("not SRV: {other:?}"),
+    }
+    for zone in [&without, &with] {
+        let reply = udp(
+            zone,
+            &query(0x1006, "_kpasswd._udp.example.com", 33, IN, false),
+        );
         assert_eq!(reply.header.rcode, Rcode::NXDOMAIN);
-        let reply = udp(&with, &query(0x1005, owner, 33, IN, false));
-        assert_eq!(reply.header.rcode, Rcode::NOERROR);
-        match &reply.answer[0].rdata {
-            RData::Srv(srv) => assert_eq!(srv.port, 464),
-            other => panic!("not SRV: {other:?}"),
-        }
+        assert!(reply.answer.is_empty());
     }
     assert_eq!(without.srv_services().count(), 3);
-    assert_eq!(with.srv_services().count(), 5);
+    assert_eq!(with.srv_services().count(), 4);
 }
 
 #[test]
 fn srv_set_names_and_ports_ms_adts_6_3_2_3_rfc4120_7_2_3_2() {
     // The closed phase-1 set (Q-618 item 1) with the names and ports of
-    // [MS-ADTS] §6.3.2.3 and RFC 4120 §7.2.3.2.
-    let expected: [(SrvService, &[u8], &[u8], u16); 5] = [
+    // [MS-ADTS] §6.3.2.3 and RFC 4120 §7.2.3.2 — one per service that
+    // exists (docs/questions/Q-1004, A-172: no `_kpasswd._udp`).
+    let expected: [(SrvService, &[u8], &[u8], u16); 4] = [
         (SrvService::KerberosUdp, b"_kerberos", b"_udp", 88),
         (SrvService::KerberosTcp, b"_kerberos", b"_tcp", 88),
         (SrvService::LdapTcp, b"_ldap", b"_tcp", 389),
         (SrvService::KpasswdTcp, b"_kpasswd", b"_tcp", 464),
-        (SrvService::KpasswdUdp, b"_kpasswd", b"_udp", 464),
     ];
+    assert_eq!(SrvService::ALL.len(), expected.len());
     for (service, svc, proto, port) in expected {
         assert_eq!(service.service_label(), svc);
         assert_eq!(service.proto_label(), proto);
