@@ -22,7 +22,7 @@ on are not switched off in a configuration file — they are simply not implemen
 - **Long term:** a full Windows Server replacement for identity and domain services, managed
   through a command-line interface and a graphical interface, with full Linux integration.
 
-## Three principles
+## Two principles
 
 ### 1. Secure protocols only — weak options have no code path
 
@@ -43,16 +43,7 @@ following do not exist in the code base at all; a client that asks for them is r
 
 The full per-protocol picture is in [docs/PROTOCOLS.md](docs/PROTOCOLS.md).
 
-### 2. Clean room — written only from public specifications
-
-Every line of code is written from published specifications only: the Microsoft Open
-Specifications, IETF RFCs, The Open Group DCE 1.1 RPC specification (C706), ITU-T X.680/X.690 and
-NIST publications. No existing implementation of these protocols — open source or proprietary —
-is consulted or recalled. The specification documents are pinned by SHA-256, and every commit
-carries `Spec-Ref:` and `Clean-Room:` trailers that a commit hook and CI enforce. See
-[docs/CLEAN-ROOM.md](docs/CLEAN-ROOM.md).
-
-### 3. Root cause first
+### 2. Root cause first
 
 When a weakness is found, the fix starts by naming its **class** and asking whether the
 infrastructure can be changed so that the whole class becomes impossible by construction — a
@@ -102,7 +93,7 @@ code), and `python3` for the dependency licence check. See [docs/BUILDING.md](do
 ```bash
 bash scripts/install-deps.sh      # fetch dependencies exactly as pinned in Cargo.lock, check licences
 scripts/check-rust.sh             # fmt, clippy -D warnings, build, test (with --locked)
-bash scripts/check-no-vendor.sh   # clean-room contamination scan
+bash scripts/check-no-vendor.sh   # no vendored third-party code or foreign licence headers
 ```
 
 The daemons run on Linux only. The code builds and the tests run on macOS and on Debian 12.
@@ -126,7 +117,6 @@ The daemons run on Linux only. The code builds and the tests run on macOS and on
 | [docs/SECURITY-MODEL.md](docs/SECURITY-MODEL.md) | threat model, the root-cause-first method with examples, parsers, secrets, dependencies, residual risks |
 | [docs/PROTOCOLS.md](docs/PROTOCOLS.md) | per protocol: implemented, planned, deliberately absent |
 | [docs/STATUS.md](docs/STATUS.md) | crates by area, what works end to end, what is next, what is blocked |
-| [docs/CLEAN-ROOM.md](docs/CLEAN-ROOM.md) | the development method and what contributors must not send |
 | [docs/BUILDING.md](docs/BUILDING.md) | toolchain, checks, test tiers, fuzzing, platforms |
 | [docs/STANDARDS.md](docs/STANDARDS.md) | the standards implemented or read, grouped by area |
 

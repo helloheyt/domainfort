@@ -54,13 +54,13 @@ Other checks:
 
 | Command | What it does |
 |---|---|
-| `bash scripts/check-no-vendor.sh` | Clean-room contamination scan: vendored code, foreign licence headers in code files, comments admitting copying, committed specification files. See [CLEAN-ROOM.md](CLEAN-ROOM.md#contamination-scan). |
-| `bash scripts/check-provenance.sh <base>` | Checks the `Clean-Room:` and `Spec-Ref:` trailers of every commit since `<base>`. |
+| `bash scripts/check-no-vendor.sh` | Checks that no third-party code, foreign licence header or specification file is committed. |
+| `bash scripts/check-provenance.sh <base>` | Checks the required commit-message trailers of every commit since `<base>`. |
 | `bash scripts/install-hooks.sh` | Enables the commit-message hook that enforces the trailers locally. |
 | `bash scripts/pin-specs.sh --verify` | Re-downloads the pinned specification documents and checks their SHA-256. |
 | `bash scripts/gen-sbom.sh` | Produces a CycloneDX software bill of materials (needs `cargo-cyclonedx`; skipped if it is not installed). |
 
-CI runs the provenance and contamination checks, the specification hash check, `cargo deny`, the
+CI runs the commit-trailer and vendored-code checks, the specification hash check, `cargo deny`, the
 Rust gate and the SBOM job on every pull request.
 
 ### Building product binaries

@@ -1,7 +1,6 @@
 # Standards
 
-These are the standards Domainfort implements, implements a subset of, or reads for reference. Code is
-written only from documents of these kinds (see [CLEAN-ROOM.md](CLEAN-ROOM.md)).
+These are the standards Domainfort implements, implements a subset of, or reads for reference.
 
 **Pinned copies.** Documents marked **pinned** are recorded in
 [`tools/spec-pin/manifest.json`](../tools/spec-pin/manifest.json) with their official URL, their

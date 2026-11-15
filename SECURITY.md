@@ -25,7 +25,5 @@ residual recorded.
 
 - Weak protocol options (NTLM, RC4/DES, SMB1, cleartext LDAP simple bind and others listed in the
   README) are deliberately not implemented; requests to add them are declined.
-- Please do not send code, patches or proof-of-concept code taken from other implementations — this
-  is a clean-room project and we cannot accept it (see [docs/CLEAN-ROOM.md](docs/CLEAN-ROOM.md)).
 
 There is no bug bounty.
