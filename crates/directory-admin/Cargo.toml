@@ -64,6 +64,13 @@ ipc-audit-client = { path = "../ipc-audit-client" }
 # `PolicyAdmin` path builds `policy.next` with the edit `provision policy`
 # uses offline). Our own crate; no crypto, no store.
 policy-store = { path = "../policy-store" }
+# The effect plan's canonical form and digest (tasks MA2 + MA3; docs/research/
+# r5-a-admin-model.md §3.3): the PEP builds the `EffectPlan` whose digest the
+# `Commit` names, with the channel's one definition of it — no second
+# encoding to drift (docs/52 C14). Our own crate (ipc, dtyp, keyd-types,
+# krb-proto, ipc-keyd, zeroize, sha2 and, on Linux, rustix — all already in
+# dird's graph); no store, no crypto profile.
+ipc-dird-admin = { path = "../ipc-dird-admin" }
 # SHA-256 of a pending key-operation request's operation digest (task A10,
 # docs/51 §5.6; docs/questions/Q-420). RustCrypto, OD-9; already in the
 # workspace lock and already in dird's graph (dirstore links it). License:

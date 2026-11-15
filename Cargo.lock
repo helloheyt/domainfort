@@ -239,6 +239,7 @@ dependencies = [
  "ipc",
  "ipc-audit",
  "ipc-audit-client",
+ "ipc-dird-admin",
  "kdc",
  "keyd-types",
  "krb-proto",

@@ -63,6 +63,20 @@
 //! [`DirectoryView::authority_snapshot`], for the authority's own reads
 //! (module `pep`).
 //!
+//! # Effect-plan facts (task MA3; docs/research/r5-a-admin-model.md §3.3)
+//!
+//! [`DirectoryView::principal_facts`] answers what the PIP will say about a
+//! principal once an admin write is committed — its expansion, subject tier
+//! and object tier — with the view's own functions, under a [`MemberChange`]
+//! (the member set the write gives one group) or a candidate tier map
+//! (module `facts`); [`DirectoryView::member_closure`] and
+//! [`DirectoryView::principals_under`] find which principals to ask about;
+//! [`DirectoryView::account_state_of`] is the KDC's account state of a
+//! record. Written only from r5-a (§3.3, §11 MA3), docs/questions/Q-874,
+//! PENDING-OWNER A-36, A-147, docs/47 §4-§6 and this crate's own code
+//! (interpretations in docs/questions/Q-980..Q-984). No other
+//! implementation was consulted or recalled (AGENTS.md §1-3).
+//!
 //! # Residuals and follow-ups (documented, not hidden)
 //!
 //! - The tier map is trusted as given: verifying the signed policy store
@@ -103,6 +117,7 @@
 //! Spec: docs/47 §1-§12; docs/11 §6; docs/06 §8-§10.
 
 mod error;
+mod facts;
 mod groups;
 mod names;
 mod naming;
@@ -116,7 +131,8 @@ mod view;
 mod visible;
 
 pub use error::ViewError;
-pub use groups::{MAX_EXPANDED_GROUPS, MAX_NESTING_DEPTH};
+pub use facts::{PrincipalFacts, PrincipalKind};
+pub use groups::{MemberChange, MAX_EXPANDED_GROUPS, MAX_NESTING_DEPTH};
 pub use naming::{NamingContext, MAX_NC_LABELS, NC_RDN_ATTRIBUTE};
 pub use pep::PepView;
 pub use salt::{account_salt, AccountKind, SaltError};

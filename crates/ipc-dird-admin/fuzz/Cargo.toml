@@ -51,5 +51,13 @@ test = false
 doc = false
 bench = false
 
+# The effect plan's strict decoder (task MA2; docs/questions/Q-981).
+[[bin]]
+name = "ipc_dird_admin_plan"
+path = "fuzz_targets/ipc_dird_admin_plan.rs"
+test = false
+doc = false
+bench = false
+
 # Detach from the root workspace (see header).
 [workspace]

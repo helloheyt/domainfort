@@ -50,11 +50,76 @@ fn auth() -> Auth {
     Auth::of(vec![0x6E; 300])
 }
 
+/// `operation` as a request — a planned operation as the `Commit` of a plan
+/// ([`planned`]: task MA2, a planned operation has no frame of its own).
 fn op(operation: Operation) -> Request {
     Request::Operation {
         auth: auth(),
-        operation,
+        operation: planned(operation),
     }
+}
+
+/// The plan digest the samples commit to.
+const PLAN: [u8; 32] = [0x5C; 32];
+
+/// A planned operation (`request_kind::PLANNED`) wrapped in the `Commit` of
+/// [`PLAN`]; anything else as it is (docs/questions/Q-980).
+fn planned(operation: Operation) -> Operation {
+    // An operation without a wire form stays as it is (its request then has
+    // none either).
+    let Ok(wire) = operation.to_wire() else {
+        return operation;
+    };
+    if ipc_dird_admin::channel::request_kind::PLANNED.contains(&wire.kind()) {
+        Operation::Commit {
+            plan: PLAN,
+            operation: Box::new(operation),
+        }
+    } else {
+        operation
+    }
+}
+
+/// A small effect plan of every kind of effect but the account ones: alice
+/// gains the T0-Admins group and enters Tier 0, which the tier map names.
+fn sample_plan() -> ipc_dird_admin::EffectPlan {
+    use ipc_dird_admin::{
+        Effect, EffectPlan, PlanPrincipal, PlanPrincipalKind, PlanTier, PolicyReferenceKind,
+    };
+    use std::collections::BTreeSet;
+    EffectPlan::new(
+        [
+            PlanPrincipal {
+                sid: sid(1107),
+                guid: guid(41),
+                kind: PlanPrincipalKind::User,
+                name: "alice2".into(),
+            },
+            PlanPrincipal {
+                sid: sid(1105),
+                guid: guid(40),
+                kind: PlanPrincipalKind::Group,
+                name: "T0-Admins".into(),
+            },
+        ],
+        [
+            Effect::MembershipDelta {
+                gained: BTreeSet::from([sid(1105)]),
+                lost: BTreeSet::new(),
+                principals: BTreeSet::from([sid(1107)]),
+            },
+            Effect::TierDelta {
+                subject: (PlanTier::None, PlanTier::Tier0),
+                object: (PlanTier::None, PlanTier::Tier0),
+                principals: BTreeSet::from([sid(1107)]),
+            },
+            Effect::PolicyReference {
+                reference: PolicyReferenceKind::TierMap(PlanTier::Tier0),
+                principals: BTreeSet::from([sid(1105)]),
+            },
+        ],
+    )
+    .unwrap()
 }
 
 fn kstr(s: &str) -> KerberosString {
@@ -150,45 +215,53 @@ fn requests() -> Vec<Request> {
         ]))),
         Request::Operation {
             auth: auth(),
-            operation: Operation::Delete { target: guid(10) },
+            operation: planned(Operation::Delete { target: guid(10) }),
         },
         Request::Operation {
             auth: auth(),
-            operation: Operation::Delete { target: guid(11) },
+            operation: planned(Operation::Delete { target: guid(11) }),
         },
         // Task D2-c (docs/questions/Q-882): the request queue — a proposal of
         // every proposable kind's shape (a directory write, a policy change,
         // each key operation), with and without a reason; the steps.
         op(Operation::Propose {
             reason_ref: Some("CHG-1182".into()),
-            operation: Box::new(Operation::SetEnabled {
+            operation: Box::new(planned(Operation::SetEnabled {
                 target: guid(30),
                 enabled: false,
-            }),
-        }),
-        op(Operation::Propose {
-            reason_ref: None,
-            operation: Box::new(Operation::ChangePolicy {
-                changes: vec![PolicyChange::AddPrincipal(sid(1203), PolicyTier::Tier0)],
-            }),
-        }),
-        op(Operation::Propose {
-            reason_ref: None,
-            operation: Box::new(Operation::KeyOperation(KeyOperation::RotateKrbtgt)),
-        }),
-        op(Operation::Propose {
-            reason_ref: None,
-            operation: Box::new(Operation::KeyOperation(KeyOperation::RotateKey {
-                service: guid(30),
             })),
+        }),
+        op(Operation::Propose {
+            reason_ref: None,
+            operation: Box::new(planned(Operation::ChangePolicy {
+                changes: vec![PolicyChange::AddPrincipal(sid(1203), PolicyTier::Tier0)],
+            })),
+        }),
+        op(Operation::Propose {
+            reason_ref: None,
+            operation: Box::new(planned(Operation::KeyOperation(KeyOperation::RotateKrbtgt))),
+        }),
+        op(Operation::Propose {
+            reason_ref: None,
+            operation: Box::new(planned(Operation::KeyOperation(KeyOperation::RotateKey {
+                service: guid(30),
+            }))),
         }),
         op(Operation::Propose {
             reason_ref: Some("x".into()),
-            operation: Box::new(Operation::KeyOperation(KeyOperation::RetireKvno {
+            operation: Box::new(planned(Operation::KeyOperation(KeyOperation::RetireKvno {
                 key: KeyRef::Service(guid(31)),
                 kvno: u32::MAX,
-            })),
+            }))),
         }),
+        // Task MA2: the plan of each planned shape.
+        op(Operation::PlanOperation(Box::new(Operation::AddMember {
+            group: guid(40),
+            member: guid(41),
+        }))),
+        op(Operation::PlanOperation(Box::new(Operation::KeyOperation(
+            KeyOperation::RotateKrbtgt,
+        )))),
         op(Operation::Approve {
             id: u64::MAX,
             digest: [0xD1; 32],
@@ -205,7 +278,7 @@ fn requests() -> Vec<Request> {
         // Task A16: every change of the tier-map edit, and the bound.
         Request::Operation {
             auth: auth(),
-            operation: Operation::ChangePolicy {
+            operation: planned(Operation::ChangePolicy {
                 changes: vec![
                     PolicyChange::AddPrincipal(sid(1200), PolicyTier::Tier1),
                     PolicyChange::RemovePrincipal(sid(1201)),
@@ -215,7 +288,7 @@ fn requests() -> Vec<Request> {
                     ),
                     PolicyChange::RemoveSubtree(vec!["ou=Old".into(), "dc=test".into()]),
                 ],
-            },
+            }),
         },
         op(Operation::ChangePolicy {
             changes: vec![PolicyChange::AddPrincipal(sid(1202), PolicyTier::Tier0)],
@@ -325,9 +398,13 @@ fn replies() -> Vec<Reply> {
             quorum: 2,
             expires: 5,
             reason_ref: Some("CHG-1182".into()),
-            operation: Operation::AddMember {
-                group: guid(40),
-                member: guid(41),
+            // Task MA2: the `Commit` of the plan dird holds, shown beside it.
+            operation: Operation::Commit {
+                plan: sample_plan().digest().unwrap(),
+                operation: Box::new(Operation::AddMember {
+                    group: guid(40),
+                    member: guid(41),
+                }),
             },
             facts: vec![
                 Fact {
@@ -345,6 +422,7 @@ fn replies() -> Vec<Reply> {
                     tier: FactTier::Unclassified,
                 },
             ],
+            plan: Some(sample_plan()),
         })),
         Reply::RequestShown(Box::new(RequestShown {
             id: 10,
@@ -355,12 +433,42 @@ fn replies() -> Vec<Reply> {
             quorum: 2,
             expires: 6,
             reason_ref: None,
-            operation: Operation::KeyOperation(KeyOperation::RotateKrbtgt),
+            operation: Operation::Commit {
+                plan: ipc_dird_admin::EffectPlan::empty().digest().unwrap(),
+                operation: Box::new(Operation::KeyOperation(KeyOperation::RotateKrbtgt)),
+            },
             facts: vec![],
+            plan: Some(ipc_dird_admin::EffectPlan::empty()),
+        })),
+        // A create's request: no plan.
+        Reply::RequestShown(Box::new(RequestShown {
+            id: 11,
+            digest: [0xD6; 32],
+            state: RequestState::Pending,
+            requester: sid(1104),
+            approvers: vec![],
+            quorum: 2,
+            expires: 7,
+            reason_ref: None,
+            operation: Operation::CreateOu {
+                parent: guid(4),
+                name: "Lab".into(),
+            },
+            facts: vec![],
+            plan: None,
         })),
         // Task A16.
         Reply::PolicyNext { version: 2 },
         Reply::PolicyNext { version: u64::MAX },
+        // Task MA2.
+        Reply::Plan {
+            plan: sample_plan(),
+            digest: sample_plan().digest().unwrap(),
+        },
+        Reply::Plan {
+            plan: ipc_dird_admin::EffectPlan::empty(),
+            digest: ipc_dird_admin::EffectPlan::empty().digest().unwrap(),
+        },
     ]
 }
 
@@ -442,39 +550,63 @@ fn request_queue_layouts() {
         out.push(kind);
         out
     };
-    // Propose(reason "CHG-1", RotateKrbtgt).
+    // Task MA2: a planned operation is proposed as the `Commit` of its plan:
+    // `0x1F ‖ plan:[32] ‖ inner kind ‖ fields`.
+    // Propose(reason "CHG-1", Commit(PLAN, RotateKrbtgt)).
     let request = op(Operation::Propose {
         reason_ref: Some("CHG-1".into()),
-        operation: Box::new(Operation::KeyOperation(KeyOperation::RotateKrbtgt)),
+        operation: Box::new(planned(Operation::KeyOperation(KeyOperation::RotateKrbtgt))),
     });
     let mut expected = envelope(0x17);
     expected.extend(auth_octets(&auth()));
     expected.extend([1, 0, 0, 0, 5]);
     expected.extend(b"CHG-1");
+    expected.push(0x1F);
+    expected.extend(PLAN);
     expected.extend([0x1D, 1]); // KeyOperation ‖ RotateKrbtgt
     assert_eq!(request_body(&request), expected);
-    // Propose(no reason, RetireKvno(Service(g), 9)).
+    // Propose(no reason, Commit(PLAN, RetireKvno(Service(g), 9))).
     let request = op(Operation::Propose {
         reason_ref: None,
-        operation: Box::new(Operation::KeyOperation(KeyOperation::RetireKvno {
+        operation: Box::new(planned(Operation::KeyOperation(KeyOperation::RetireKvno {
             key: KeyRef::Service(guid(40)),
             kvno: 9,
-        })),
+        }))),
     });
     let mut expected = envelope(0x17);
     expected.extend(auth_octets(&auth()));
-    expected.extend([0, 0x1D, 3, 2]);
+    expected.extend([0, 0x1F]);
+    expected.extend(PLAN);
+    expected.extend([0x1D, 3, 2]);
     expected.extend(guid(40).to_packet());
     expected.extend(9u32.to_be_bytes());
     assert_eq!(request_body(&request), expected);
-    // Propose(Delete(g)): the inner kind is Delete's own (0x0C).
+    // Propose(Commit(PLAN, Delete(g))): the inner kind is Delete's own (0x0C).
     let request = op(Operation::Propose {
         reason_ref: None,
-        operation: Box::new(Operation::Delete { target: guid(41) }),
+        operation: Box::new(planned(Operation::Delete { target: guid(41) })),
     });
     let mut expected = envelope(0x17);
     expected.extend(auth_octets(&auth()));
-    expected.extend([0, 0x0C]);
+    expected.extend([0, 0x1F]);
+    expected.extend(PLAN);
+    expected.push(0x0C);
+    expected.extend(guid(41).to_packet());
+    assert_eq!(request_body(&request), expected);
+    // Commit(PLAN, Delete(g)) and PlanOperation(Delete(g)) at top level.
+    let request = op(Operation::Delete { target: guid(41) });
+    let mut expected = envelope(0x1F);
+    expected.extend(auth_octets(&auth()));
+    expected.extend(PLAN);
+    expected.push(0x0C);
+    expected.extend(guid(41).to_packet());
+    assert_eq!(request_body(&request), expected);
+    let request = op(Operation::PlanOperation(Box::new(Operation::Delete {
+        target: guid(41),
+    })));
+    let mut expected = envelope(0x1E);
+    expected.extend(auth_octets(&auth()));
+    expected.push(0x0C);
     expected.extend(guid(41).to_packet());
     assert_eq!(request_body(&request), expected);
     // Approve(id 0x0102030405060708, digest).
@@ -588,8 +720,12 @@ fn only_proposable_operations_are_proposed() {
         Operation::ShowRequest { id: 1 },
         Operation::Propose {
             reason_ref: None,
-            operation: Box::new(Operation::Delete { target: guid(1) }),
+            operation: Box::new(planned(Operation::Delete { target: guid(1) })),
         },
+        // Task MA2: a bare planned operation, and a plan request, are not
+        // proposable (only the `Commit` of a plan is).
+        Operation::Delete { target: guid(1) },
+        Operation::PlanOperation(Box::new(Operation::Delete { target: guid(1) })),
     ] {
         let wire = nested(inner.clone()).to_wire().unwrap();
         assert!(
@@ -599,9 +735,10 @@ fn only_proposable_operations_are_proposed() {
     }
     // Hand-built: a Propose whose inner kind is Lookup's (0x0D), Propose's
     // (0x17) or Approve's (0x18) — malformed.
-    let delete = request_body(&nested(Operation::Delete { target: guid(2) }));
+    let delete = request_body(&nested(planned(Operation::Delete { target: guid(2) })));
     let kind_at = delete.len() - 16 - 1;
     assert_eq!(delete[kind_at], 0x0C);
+    assert_eq!(delete[kind_at - 33], 0x1F);
     for bad in [0x0D, 0x07, 0x17, 0x18, 0x1B, 0x14, 0x0E, 0x0F] {
         let mut body = delete.clone();
         body[kind_at] = bad;
@@ -671,7 +808,7 @@ fn retired_keyadm_kinds_are_unknown() {
 fn in_request_approvals_are_retired() {
     let body = request_body(&Request::Operation {
         auth: auth(),
-        operation: Operation::Delete { target: guid(1) },
+        operation: planned(Operation::Delete { target: guid(1) }),
     });
     let count_at = 4 + 4 + 300;
     assert_eq!(&body[count_at..count_at + 4], &0u32.to_be_bytes());
@@ -737,13 +874,13 @@ fn every_field_bound() {
     let ascii = |n: usize| "a".repeat(n);
     check_bound(MAX_AP_REQ, |n| Request::Operation {
         auth: Auth::of(vec![1; n]),
-        operation: Operation::Delete { target: guid(1) },
+        operation: planned(Operation::Delete { target: guid(1) }),
     });
     // Task D2-c: the `reason_ref` of a `Propose`.
     check_bound(MAX_REASON_REF, |n| {
         op(Operation::Propose {
             reason_ref: Some(ascii(n)),
-            operation: Box::new(Operation::Delete { target: guid(1) }),
+            operation: Box::new(planned(Operation::Delete { target: guid(1) })),
         })
     });
     check_bound(MAX_NAME, |n| {
@@ -850,7 +987,25 @@ fn the_body_bounds() {
 /// the connection without a reply.
 #[test]
 fn unknown_kinds_close() {
-    for kind in [0x00, 0x13, 0x15, 0x1D, 0x1E, 0x81, 0x7F, REFUSED_KIND] {
+    // Task MA2: the planned kinds (0x06, 0x08-0x0C, 0x16) left the table;
+    // 0x1E / 0x1F are `PlanOperation` / `Commit`, so 0x20 is unused.
+    for kind in [
+        0x00,
+        0x06,
+        0x08,
+        0x09,
+        0x0A,
+        0x0B,
+        0x0C,
+        0x13,
+        0x15,
+        0x16,
+        0x1D,
+        0x20,
+        0x81,
+        0x7F,
+        REFUSED_KIND,
+    ] {
         let mut body = request_body(&Request::Ping);
         body[3] = kind;
         assert_eq!(decode_request(&body), Err(Rejection::Close), "{kind:#x}");
@@ -1035,17 +1190,20 @@ fn directions_do_not_mix() {
 /// `PolicyNext` reply (`version:u64`), assembled by hand.
 #[test]
 fn change_policy_layout() {
+    // Task MA2: the policy change travels as the `Commit` of its plan.
     let request = Request::Operation {
         auth: Auth::of(vec![0xAA]),
-        operation: Operation::ChangePolicy {
+        operation: planned(Operation::ChangePolicy {
             changes: vec![
                 PolicyChange::AddPrincipal(sid(7), PolicyTier::Tier1),
                 PolicyChange::RemoveSubtree(vec!["ou=X".into()]),
             ],
-        },
+        }),
     };
-    let mut expected = vec![0x44, 0x41, 0x01, 0x16];
+    let mut expected = vec![0x44, 0x41, 0x01, 0x1F];
     expected.extend([0, 0, 0, 1, 0xAA, 0, 0, 0, 0]); // requester; no approvals (retired)
+    expected.extend(PLAN);
+    expected.push(0x16); // ChangePolicy
     expected.extend([0, 0, 0, 2]);
     let packet = sid(7).encode();
     expected.push(0x01);
@@ -1172,6 +1330,9 @@ fn request_queue_reply_bounds() {
             reason_ref: Some("r".repeat(MAX_REASON_REF as usize)),
             operation: largest_create.clone(),
             facts,
+            // A create has no plan; the largest plan beside the largest
+            // operation is checked at compile time (crate::channel).
+            plan: None,
         }))
     };
     let body = reply_body(&shown(vec![fact(1); MAX_FACTS as usize]));
@@ -1207,7 +1368,8 @@ fn request_queue_reply_bounds() {
 /// from it and covers the `reason_ref`.
 #[test]
 fn the_fingerprint_is_the_operations_own_digest() {
-    let delete = Operation::Delete { target: guid(7) };
+    // Task MA2: the operation proposed is the `Commit` of its plan.
+    let delete = planned(Operation::Delete { target: guid(7) });
     let fingerprint = ipc_dird_admin::operation_digest(&delete).unwrap();
     let propose = |reason: Option<&str>| Operation::Propose {
         reason_ref: reason.map(str::to_owned),

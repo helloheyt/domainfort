@@ -357,8 +357,10 @@ fn code_tables_are_closed() {
     // Task A16 appended `ChangePolicy` (docs/51 §5.10; docs/questions/Q-592):
     // the earlier eighteen keep their codes. Task D2-c appended the request
     // queue's five (docs/questions/Q-882, Q-938). Task K6 appended
-    // `ChangePassword` (docs/53 §9).
-    assert_eq!(table!(DirAdminOperation), 25);
+    // `ChangePassword` (docs/53 §9). Task MA2 appended `PlanOperation`
+    // (docs/questions/Q-980).
+    assert_eq!(table!(DirAdminOperation), 26);
+    assert_eq!(DirAdminOperation::PlanOperation.code(), 26);
     assert_eq!(DirAdminOperation::ListPendingDestruction.code(), 18);
     assert_eq!(DirAdminOperation::ChangePolicy.code(), 19);
     assert_eq!(DirAdminOperation::ShowRequest.code(), 24);
@@ -367,16 +369,13 @@ fn code_tables_are_closed() {
     // appended `ObligationRefused` (A-91, Q-388 item 1, Q-397); task A10
     // appended `OperationMismatch` and `KeyOperationRefused` (Q-421); task
     // D2-c appended `ApprovalNotNeeded`, `RequestStale`, `RequesterLimit`
-    // (Q-938).
-    assert_eq!(table!(AdminRefusal), 25);
+    // (Q-938); task MA2 appended `PlanRequired` .. `PlanTooLarge` (Q-980).
+    assert_eq!(table!(AdminRefusal), 29);
     assert_eq!(AdminRefusal::SelfLockout.code(), 19);
     assert_eq!(AdminRefusal::ObligationRefused.code(), 20);
     assert_eq!(AdminRefusal::OperationMismatch.code(), 21);
     assert_eq!(AdminRefusal::KeyOperationRefused.code(), 22);
-    assert_eq!(
-        AdminRefusal::ALL.last(),
-        Some(&AdminRefusal::RequesterLimit)
-    );
+    assert_eq!(AdminRefusal::ALL.last(), Some(&AdminRefusal::PlanTooLarge));
     // Task F4 appended `ViewUnavailable` and `AuditUnacknowledged`; the
     // first four keep their codes (A-91, Q-397; append only).
     // Task A10 appended `KeyOperationNotPerformed` and
@@ -511,6 +510,7 @@ fn field_inventory_holds_no_secret() {
         operation_digest: _, // SHA-256 of non-secret request fields (Q-888)
         proposed: _,         // code (the operation a pending request is for)
         reason_ref: _,       // printable-ASCII rule, the requester's change id (Q-882)
+        plan_digest: _,      // SHA-256 of the effect plan, never its effects (MA2, Q-874 item 7)
     } = dir_admin_create_outcome();
     // docs/51 §5.7 item 3, §7.6: the password never reaches the event.
     let ipc_audit::AdmindEvent {

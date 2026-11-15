@@ -36,8 +36,32 @@ fn auth(seed: u8, len: usize) -> Auth {
     Auth::of(vec![seed; 200 + len])
 }
 
-/// One operation of every kind, with distinct values.
+/// A planned operation (task MA2) as the `Commit` of a plan; anything else
+/// as it is.
+fn planned(operation: Operation) -> Operation {
+    let kind = operation.to_wire().unwrap().kind();
+    if ipc_dird_admin::channel::request_kind::PLANNED.contains(&kind) {
+        Operation::Commit {
+            plan: [0x5C; 32],
+            operation: Box::new(operation),
+        }
+    } else {
+        operation
+    }
+}
+
+/// One operation of every kind, with distinct values (a planned one as the
+/// `Commit` of a plan — task MA2 — and a `PlanOperation`).
 fn operations() -> Vec<Operation> {
+    let mut all: Vec<Operation> = bare_operations().into_iter().map(planned).collect();
+    all.push(Operation::PlanOperation(Box::new(Operation::Delete {
+        target: guid(5),
+    })));
+    all
+}
+
+/// The operations of [`operations`] before they are committed.
+fn bare_operations() -> Vec<Operation> {
     vec![
         Operation::CreateUser {
             parent: guid(1),
@@ -92,9 +116,9 @@ fn operations() -> Vec<Operation> {
         // `Approve` and `Reject` share their fields and differ in kind.
         Operation::Propose {
             reason_ref: Some("CHG-1".into()),
-            operation: Box::new(Operation::KeyOperation(KeyOperation::RotateKey {
+            operation: Box::new(planned(Operation::KeyOperation(KeyOperation::RotateKey {
                 service: guid(30),
-            })),
+            }))),
         },
         Operation::Approve {
             id: 41,

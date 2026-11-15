@@ -68,8 +68,18 @@ fn set_password(text: &str, approvals: usize) -> Request {
         auth: auth(approvals),
         completion: vec![0x6E; 77],
         target: guid(5),
+        plan: [0x5C; 32],
         password: password(text),
     })
+}
+
+/// The `Commit` of a planned operation (task MA2: a planned operation has no
+/// frame of its own; docs/questions/Q-980).
+fn commit(operation: Operation) -> Operation {
+    Operation::Commit {
+        plan: [0x5C; 32],
+        operation: Box::new(operation),
+    }
 }
 
 /// One sample of every forwarded operation (and the optional fields both
@@ -112,27 +122,34 @@ fn forwarded() -> Vec<Operation> {
             parent: guid(4),
             name: "Things".into(),
         },
-        Operation::SetEnabled {
+        // Task MA2: the planned operations travel as the `Commit` of a plan,
+        // and are planned with `PlanOperation`.
+        commit(Operation::SetEnabled {
             target: guid(6),
             enabled: false,
-        },
-        Operation::SetAccountExpires {
+        }),
+        commit(Operation::SetAccountExpires {
             target: guid(6),
             value: AccountExpires::Never,
-        },
-        Operation::SetAccountExpires {
+        }),
+        commit(Operation::SetAccountExpires {
             target: guid(6),
             value: AccountExpires::At(134_400_000_000_000_000),
-        },
-        Operation::AddMember {
+        }),
+        commit(Operation::AddMember {
             group: guid(7),
             member: guid(8),
-        },
-        Operation::RemoveMember {
+        }),
+        commit(Operation::RemoveMember {
             group: guid(7),
             member: guid(8),
-        },
-        Operation::Delete { target: guid(9) },
+        }),
+        commit(Operation::Delete { target: guid(9) }),
+        Operation::PlanOperation(Box::new(Operation::AddMember {
+            group: guid(7),
+            member: guid(8),
+        })),
+        Operation::PlanOperation(Box::new(Operation::BeginPasswordSet { target: guid(5) })),
         Operation::Lookup(LookupKey::SamAccountName("carol".into())),
         Operation::Lookup(LookupKey::ServicePrincipalName(
             "host/ws02.example.test".into(),
@@ -147,10 +164,10 @@ fn forwarded() -> Vec<Operation> {
         // like every other operation.
         Operation::Propose {
             reason_ref: Some("CHG-7".into()),
-            operation: Box::new(Operation::KeyOperation(KeyOperation::RetireKvno {
+            operation: Box::new(commit(Operation::KeyOperation(KeyOperation::RetireKvno {
                 key: KeyRef::Krbtgt,
                 kvno: 3,
-            })),
+            }))),
         },
         Operation::Approve {
             id: 77,
@@ -164,12 +181,12 @@ fn forwarded() -> Vec<Operation> {
         Operation::ListRequests(ListScope::AwaitingMe),
         Operation::ShowRequest { id: 80 },
         // Task A16: the tier-map edit, forwarded like every other operation.
-        Operation::ChangePolicy {
+        commit(Operation::ChangePolicy {
             changes: vec![
                 PolicyChange::AddPrincipal(sid(1300), PolicyTier::Tier1),
                 PolicyChange::RemoveSubtree(vec!["ou=Old".into(), "dc=test".into()]),
             ],
-        },
+        }),
     ]
 }
 
@@ -178,11 +195,11 @@ fn requests() -> Vec<Request> {
     let mut all: Vec<Request> = forwarded().into_iter().map(forward).collect();
     all.push(Request::Forward {
         auth: auth(0),
-        operation: Operation::Delete { target: guid(10) },
+        operation: commit(Operation::Delete { target: guid(10) }),
     });
     all.push(Request::Forward {
         auth: auth(2),
-        operation: Operation::Delete { target: guid(11) },
+        operation: commit(Operation::Delete { target: guid(11) }),
     });
     all.push(set_password(PASSWORD, 0));
     all.push(set_password("ünïcødé-passwörd-☃-𝄞", 2));
@@ -259,11 +276,24 @@ fn replies() -> Vec<Reply> {
             quorum: 2,
             expires: 99,
             reason_ref: None,
-            operation: Operation::KeyOperation(KeyOperation::RotateKey { service: guid(41) }),
+            // Task MA2: a planned request is held as the `Commit` of its
+            // plan, shown beside it.
+            operation: Operation::Commit {
+                plan: ipc_dird_admin::EffectPlan::empty().digest().unwrap(),
+                operation: Box::new(Operation::KeyOperation(KeyOperation::RotateKey {
+                    service: guid(41),
+                })),
+            },
             facts: vec![],
+            plan: Some(ipc_dird_admin::EffectPlan::empty()),
         })),
         // Task A16: dird's `PolicyNext`, passed on.
         Reply::PolicyNext { version: 7 },
+        // Task MA2: dird's `Plan`, passed on.
+        Reply::Plan {
+            plan: ipc_dird_admin::EffectPlan::empty(),
+            digest: ipc_dird_admin::EffectPlan::empty().digest().unwrap(),
+        },
     ]
 }
 
@@ -368,8 +398,10 @@ fn forwarded_operations_are_dirds_layout_byte_for_byte() {
 /// `0x0F`) and their reply `KeyRequest` (`0x88`) the same way.
 #[test]
 fn retired_keyadm_kinds_close() {
-    assert_eq!(request_kind::RETIRED, &[0x0E, 0x0F, 0x10, 0x11, 0x12]);
+    // Task MA2 retired the plan-less `SetPassword` (0x15) the same way.
+    assert_eq!(request_kind::RETIRED, &[0x0E, 0x0F, 0x10, 0x11, 0x12, 0x15]);
     for (kind, payload) in [
+        (0x15u8, vec![0]),
         (0x0Eu8, vec![1]),
         (0x0F, [77u64.to_be_bytes().to_vec(), vec![1]].concat()),
         (0x10u8, 77u64.to_be_bytes().to_vec()),
@@ -428,7 +460,9 @@ fn every_reply_round_trips_canonically() {
 
 /// docs/51 §7.6: dird's `BeginPasswordSet` / `CompletePasswordSet` never
 /// travel on admin.sock — no typed form, no wire form, and their kind
-/// numbers close the connection.
+/// numbers close the connection; since task MA2 not as a `Commit` either
+/// (only `SetPassword` sets a password here: docs/questions/Q-980), while
+/// planning one (`PlanOperation`) reads only and travels.
 #[test]
 fn dirds_password_set_steps_are_not_on_this_channel() {
     for operation in [
@@ -440,11 +474,16 @@ fn dirds_password_set_steps_are_not_on_this_channel() {
         },
     ] {
         assert!(!ipc_admin::forwarded(&operation));
-        let request = forward(operation.clone());
-        assert_eq!(
-            request.to_wire().err(),
-            Some(ConversionError::NotOnThisChannel)
-        );
+        assert!(!ipc_admin::forwarded(&commit(operation.clone())));
+        for request in [
+            forward(operation.clone()),
+            forward(commit(operation.clone())),
+        ] {
+            assert_eq!(
+                request.to_wire().err(),
+                Some(ConversionError::NotOnThisChannel)
+            );
+        }
         let wire = AdminRequest::Forward {
             auth: auth(1),
             operation: operation.to_wire().unwrap(),
@@ -453,21 +492,25 @@ fn dirds_password_set_steps_are_not_on_this_channel() {
             encode_frame(ADMIN_CHANNEL, Direction::Request, &wire).err(),
             Some(ipc::Error::UnknownKind)
         );
-        // dird's own frame of the operation, under this channel's magic.
-        let dird = ipc_dird_admin::Request::Operation {
-            auth: auth(1),
-            operation,
-        };
-        let frame = encode_frame(
-            ipc_dird_admin::ADMIN_CHANNEL,
-            Direction::Request,
-            &dird.to_wire().unwrap(),
-        )
-        .unwrap();
-        let mut body = frame.body().to_vec();
-        body[0..2].copy_from_slice(&ADMIN_MAGIC.to_be_bytes());
-        assert_eq!(disposition(&body), closed(ipc::Error::UnknownKind));
     }
+    // dird's own frame of `Commit {plan, BeginPasswordSet}`, under this
+    // channel's magic: the kind travels here, the operation does not.
+    let dird = ipc_dird_admin::Request::Operation {
+        auth: auth(1),
+        operation: commit(Operation::BeginPasswordSet { target: guid(1) }),
+    };
+    let frame = encode_frame(
+        ipc_dird_admin::ADMIN_CHANNEL,
+        Direction::Request,
+        &dird.to_wire().unwrap(),
+    )
+    .unwrap();
+    let mut body = frame.body().to_vec();
+    body[0..2].copy_from_slice(&ADMIN_MAGIC.to_be_bytes());
+    assert!(disposition(&body).is_err());
+    assert!(ipc_admin::forwarded(&Operation::PlanOperation(Box::new(
+        Operation::BeginPasswordSet { target: guid(1) }
+    ))));
 }
 
 /// docs/50 §3.3 ("kind closed: unknown op ⇒ close"); A-59: unknown kinds,
@@ -476,14 +519,25 @@ fn dirds_password_set_steps_are_not_on_this_channel() {
 /// A10's key operations `0x0E`, `0x0F` are retired by task D2-c; keyadm's
 /// `0x10`–`0x12` are retired by A-102 and close too; `0x16` is
 /// `ChangePolicy` since task A16; `0x17`–`0x1C` are the request queue since
-/// task D2-c, `0x1D` its inner key-operation kind (never a request), so
-/// `0x1E` stands for the next unused one.)
+/// task D2-c, `0x1D` its inner key-operation kind (never a request); task
+/// MA2 took the planned operations — `0x08`–`0x0C`, `0x16` — out of the
+/// table (they travel inside `PlanOperation` `0x1E` / `Commit` `0x1F`),
+/// retired the plan-less `SetPassword` `0x15` and appended the planned one
+/// as `0x20`, so `0x21` stands for the next unused one.)
 #[test]
 fn unknown_kinds_close() {
     for kind in [
         0x00,
         0x06,
         0x07,
+        0x08,
+        0x09,
+        0x0A,
+        0x0B,
+        0x0C,
+        0x15,
+        0x16,
+        0x21,
         0x0E,
         0x0F,
         0x10,
@@ -491,7 +545,6 @@ fn unknown_kinds_close() {
         0x12,
         0x13,
         0x1D,
-        0x1E,
         0x81,
         0x87,
         0x7F,
@@ -574,6 +627,7 @@ fn the_ap_req_bounds() {
             auth: Auth::of(vec![1; requester]),
             completion: vec![3; completion],
             target: guid(1),
+            plan: [0x5C; 32],
             password: password(PASSWORD),
         })
     };
@@ -632,6 +686,7 @@ fn a_password_that_is_not_utf8_is_malformed() {
         auth: auth(0),
         completion: vec![1],
         target: guid(1).to_packet(),
+        plan: [0x5C; 32],
         password: Secret::from_slice(&[0x70, 0xFF, 0x70]),
     });
     let frame = encode_frame(ADMIN_CHANNEL, Direction::Request, &wire).unwrap();
@@ -642,10 +697,10 @@ fn a_password_that_is_not_utf8_is_malformed() {
 /// spelling on this channel too (dird's typed decoder); text must be UTF-8.
 #[test]
 fn second_spellings_are_malformed() {
-    let mut body = request_body(&forward(Operation::SetAccountExpires {
+    let mut body = request_body(&forward(commit(Operation::SetAccountExpires {
         target: guid(1),
         value: AccountExpires::At(1),
-    }));
+    })));
     let n = body.len();
     body[n - 8..].copy_from_slice(&ipc_dird_admin::ACCOUNT_EXPIRES_NEVER.to_be_bytes());
     assert_eq!(disposition(&body), refused(Refused::Malformed, None));
@@ -770,7 +825,7 @@ fn which_reply_answers_which_request() {
     let lookup = forward(Operation::Lookup(LookupKey::SamAccountName("x".into())));
     assert!(answers(&lookup, &found));
     assert!(!answers(&lookup, &Reply::Done));
-    let delete = forward(Operation::Delete { target: guid(1) });
+    let delete = forward(commit(Operation::Delete { target: guid(1) }));
     assert!(answers(&delete, &Reply::Done));
     assert!(answers(&delete, &refusal));
     assert!(!answers(&delete, &Reply::Pong));

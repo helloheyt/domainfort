@@ -64,15 +64,27 @@ fn admind_keyd_client(world: &World) -> KeydClient<connectors::KeydConnector> {
     )
 }
 
+/// `operation` as the `Commit` of the plan dird gives admin1 for it now — a
+/// `PlanOperation` through admind (task MA2; docs/research/
+/// r5-a-admin-model.md §3.3; docs/questions/Q-980): a planned operation
+/// travels only so.
+fn committed(world: &World, operation: Operation) -> Operation {
+    Operation::Commit {
+        plan: world.plan_digest("admin1", operation.clone()),
+        operation: Box::new(operation),
+    }
+}
+
 /// admin1 proposes `operation` through admind (task D2-c, docs/questions/
-/// Q-882: the one dual-control mechanism); admin2 approves it — the
-/// approval that completes the quorum, at which dird registers the decision
-/// in keyd under the request's id (A-102). Returns that id.
+/// Q-882: the one dual-control mechanism) — as the `Commit` of its plan
+/// (task MA2); admin2 approves it — the approval that completes the quorum,
+/// at which dird registers the decision in keyd under the request's id
+/// (A-102). Returns that id.
 fn request_and_approve(world: &World, operation: KeyOperation) -> u64 {
     let mut conn = world.connect();
     let request = Operation::Propose {
         reason_ref: None,
-        operation: Box::new(Operation::KeyOperation(operation)),
+        operation: Box::new(committed(world, Operation::KeyOperation(operation))),
     };
     let state = match conn.call(&Request::Forward {
         auth: auth("admin1", &request),
@@ -98,13 +110,15 @@ fn request_and_approve(world: &World, operation: KeyOperation) -> u64 {
     state.id
 }
 
-/// admin1 deletes ws9 through admind; dird registers the destroy decision.
+/// admin1 deletes ws9 through admind — the `Commit` of its plan (task MA2);
+/// dird registers the destroy decision.
 fn delete_ws9(world: &World) {
+    let delete = committed(world, Operation::Delete { target: g(WS9) });
     let mut conn = world.connect();
     assert_eq!(
         conn.call(&Request::Forward {
-            auth: auth("admin1", &Operation::Delete { target: g(WS9) }),
-            operation: Operation::Delete { target: g(WS9) },
+            auth: auth("admin1", &delete),
+            operation: delete,
         }),
         Got::Reply(Reply::Done)
     );

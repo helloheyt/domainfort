@@ -11,7 +11,9 @@
 mod common;
 
 use common::*;
-use directory_admin::{CreateGroup, CreateUser, Membership, Operation, SetEnabled};
+use directory_admin::{
+    CreateGroup, CreateUser, Membership, Operation, ProposedOperation, SetEnabled,
+};
 use ipc_audit::{
     AdminFailure, AdminNameKind, AdminRefusal, Allocation, AuditText, BoundedSeq, CalendarTime,
     DecisionResult, DirAdminEvent, DirAdminOperation, DirAdminStage, EnableDirection,
@@ -82,6 +84,7 @@ fn create_user_events_are_exact() {
         operation_digest: digest,
         proposed: None,
         reason_ref: None,
+        plan_digest: None,
     };
     assert_eq!(decision, expected);
     assert_eq!(
@@ -147,6 +150,7 @@ fn a_refusal_event_is_exact() {
             operation_digest: digest,
             proposed: None,
             reason_ref: None,
+            plan_digest: None,
         }
     );
 }
@@ -164,6 +168,8 @@ fn dual_control_and_group_type_events_are_exact() {
         member: guid(ALICE),
     });
     let digest = *fingerprint(&op).as_bytes();
+    // Task MA2: the plan the execution recomputed (alice enters Tier 0).
+    let plan = d.committed_plan(&ProposedOperation::Directory(op.clone()), "admin1");
     let (decision, applied) = d.run(op, "admin1", &["admin2"]).applied();
     assert!(decision.pending_request.is_some());
     let expected = DirAdminEvent {
@@ -188,6 +194,7 @@ fn dual_control_and_group_type_events_are_exact() {
         operation_digest: digest,
         proposed: None,
         reason_ref: None,
+        plan_digest: Some(plan),
     };
     assert_eq!(decision, expected);
     assert_eq!(

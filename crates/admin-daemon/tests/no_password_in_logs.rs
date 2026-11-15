@@ -20,6 +20,14 @@ mod support;
 use ipc_admin::{Request, SetPassword};
 use std::process::Command;
 use support::{begin_auth, completion, g, Got, Options, World, BOB, WS9};
+
+/// Task MA2: dird's `BeginPasswordSet` is the `Commit` of its plan.
+fn plan(world: &World, target: dtyp::Guid) -> [u8; 32] {
+    world.plan_digest(
+        "admin1",
+        ipc_dird_admin::Operation::BeginPasswordSet { target },
+    )
+}
 use zeroize::Zeroizing;
 
 /// The marker that makes this test run the scenario (the child).
@@ -37,11 +45,13 @@ const PASSWORDS: [&str; 5] = [
     "Malformed-Frame-Secret-Pw",
 ];
 
-fn set_password(target: dtyp::Guid, text: &str) -> Request {
+fn set_password(world: &World, target: dtyp::Guid, text: &str) -> Request {
+    let plan = plan(world, target);
     Request::SetPassword(SetPassword {
-        auth: begin_auth("admin1", target),
+        auth: begin_auth("admin1", target, plan),
         completion: completion("admin1", target),
         target,
+        plan,
         password: ipc_admin::Password::new(Zeroizing::new(text.to_owned())),
     })
 }
@@ -58,24 +68,24 @@ fn scenario() {
     };
     let mut conn = world.connect();
     assert!(matches!(
-        conn.call(&set_password(g(BOB), PASSWORDS[0])),
+        conn.call(&set_password(&world, g(BOB), PASSWORDS[0])),
         Got::Reply(ipc_admin::Reply::PasswordChanged(_))
     ));
     assert_eq!(
-        conn.call(&set_password(g(BOB), PASSWORDS[1])),
+        conn.call(&set_password(&world, g(BOB), PASSWORDS[1])),
         Got::Reply(ipc_admin::Reply::Refused(ipc_admin::RefusalStatus::Invalid))
     );
     assert_eq!(
-        conn.call(&set_password(g(BOB), PASSWORDS[2])),
+        conn.call(&set_password(&world, g(BOB), PASSWORDS[2])),
         Got::Reply(ipc_admin::Reply::Refused(ipc_admin::RefusalStatus::Invalid))
     );
     assert!(matches!(
-        conn.call(&set_password(g(WS9), PASSWORDS[3])),
+        conn.call(&set_password(&world, g(WS9), PASSWORDS[3])),
         Got::Reply(ipc_admin::Reply::PasswordChanged(_))
     ));
     // A SetPassword frame with a trailing octet: malformed, refused, closed
     // — a noise event naming the rule, never an octet of the frame.
-    let frame = ipc_admin::encode_request(&set_password(g(BOB), PASSWORDS[4])).unwrap();
+    let frame = ipc_admin::encode_request(&set_password(&world, g(BOB), PASSWORDS[4])).unwrap();
     let mut octets = frame.as_bytes().to_vec();
     octets.push(0);
     let length = u32::try_from(octets.len() - 4).unwrap();

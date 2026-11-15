@@ -510,14 +510,17 @@ fn provisioning_to_a_new_users_login() {
         // (the approval that completes the quorum makes dird register the
         // decision in keyd), keyadm runs it by the request's id; keyd builds
         // the dual-control token itself.
+        // Task MA2: the key operation is proposed as the `Commit` of its plan
+        // (a rotation keeps every key version: the empty plan).
         let rotation = ipc_dird_admin::KeyOperation::RotateKrbtgt;
+        let committed = w.committed(&alice, Operation::KeyOperation(rotation));
         let proposed = match w
             .forward(
                 &alice,
                 &[],
                 Operation::Propose {
                     reason_ref: None,
-                    operation: Box::new(Operation::KeyOperation(rotation)),
+                    operation: Box::new(committed),
                 },
             )
             .reply()
@@ -791,8 +794,35 @@ fn provisioning_to_a_new_users_login() {
                 assert!(opened, "every outcome follows its Proceed decision");
             }
         }
-        let trail: Vec<(DirAdminOperation, Said)> =
-            admin.iter().map(|(_, e)| (e.operation, said(e))).collect();
+        // Task MA2: every planned operation was planned first — the plan
+        // digest its decision recomputed is one a `PlanOperation` answered
+        // (docs/research/r5-a-admin-model.md §3.3; Q-874 item 7). The trail
+        // below is the operations themselves, without the plans.
+        let planned: std::collections::BTreeSet<[u8; 32]> = admin
+            .iter()
+            .filter(|(_, e)| {
+                e.operation == DirAdminOperation::PlanOperation && said(e) == Said::Proceed
+            })
+            .filter_map(|(_, e)| e.plan_digest)
+            .collect();
+        for (_, e) in admin.iter().filter(|(_, e)| {
+            matches!(
+                e.operation,
+                DirAdminOperation::BeginPasswordSet
+                    | DirAdminOperation::SetEnabled
+                    | DirAdminOperation::AddMember
+                    | DirAdminOperation::RemoveMember
+                    | DirAdminOperation::Delete
+            ) && said(e) == Said::Proceed
+        }) {
+            let digest = e.plan_digest.expect("a planned operation's plan digest");
+            assert!(planned.contains(&digest), "{:?} was planned", e.operation);
+        }
+        let trail: Vec<(DirAdminOperation, Said)> = admin
+            .iter()
+            .filter(|(_, e)| e.operation != DirAdminOperation::PlanOperation)
+            .map(|(_, e)| (e.operation, said(e)))
+            .collect();
         use DirAdminOperation as Op;
         use Said::*;
         let mut expected = vec![
@@ -882,12 +912,24 @@ fn provisioning_to_a_new_users_login() {
             })
             .collect();
         // Task D2-c (Q-888): admind's event carries the fingerprint of the
-        // operation — the digest of `BeginPasswordSet {dave}` the client's
-        // AP-REQ was bound to, the same dird's events of that step carry.
-        let begin_digest =
-            *ipc_dird_admin::operation_digest(&Operation::BeginPasswordSet { target: dave })
-                .unwrap()
-                .as_bytes();
+        // operation — the digest of `Commit {plan, BeginPasswordSet {dave}}`
+        // (task MA2) the client's AP-REQ was bound to, the same dird's events
+        // of that step carry; the plan is the one dird's decision recomputed.
+        let dave_plan = admin
+            .iter()
+            .find(|(_, e)| {
+                e.operation == Op::BeginPasswordSet
+                    && e.target == Some(packet(dave))
+                    && said(e) == Proceed
+            })
+            .and_then(|(_, e)| e.plan_digest)
+            .expect("dird's BeginPasswordSet of dave carries its plan digest");
+        let begin_digest = *ipc_dird_admin::operation_digest(&Operation::Commit {
+            plan: dave_plan,
+            operation: Box::new(Operation::BeginPasswordSet { target: dave }),
+        })
+        .unwrap()
+        .as_bytes();
         assert!(
             admind.iter().any(|(_, a)| matches!(a,
             AdmindActivity::SetPassword {

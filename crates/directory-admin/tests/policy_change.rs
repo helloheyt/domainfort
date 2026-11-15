@@ -117,8 +117,19 @@ fn request(changes: Vec<TierChange>, requester: &str) -> PolicyChangeRequest {
         operation_id: 7,
         changes,
         operation_digest: digest,
+        // Task MA2: the plan is checked after `PolicyAdmin` and dual control
+        // classification; this file's own tests of the plan set it with
+        // `planned_request`.
+        plan: Some([0xEE; 32]),
         requester: ticket_bound_to(requester, Some(digest)),
     }
+}
+
+/// [`request`] committing to the plan `d` computes for `changes` (task MA2).
+fn planned_request(d: &Domain, changes: Vec<TierChange>, requester: &str) -> PolicyChangeRequest {
+    let mut request = request(changes.clone(), requester);
+    request.plan = Some(d.committed_plan(&ProposedOperation::Policy(changes), requester));
+    request
 }
 
 /// The domain under `installed`: its PDP snapshot, and the file a proposal
@@ -147,7 +158,8 @@ fn decide(
             d.approve(id, digest, approver)?;
         }
     }
-    execute(d, installed, &request(changes, requester), pending)
+    let request = planned_request(d, changes, requester);
+    execute(d, installed, &request, pending)
 }
 
 /// The execution of `request` against the domain with `installed`.
@@ -527,4 +539,72 @@ fn misassembled_inputs_and_unverified_tickets_fail_closed() {
         assert_eq!(r.event().operation, DirAdminOperation::ChangePolicy);
         assert_eq!(r.event().names.len(), 1);
     }
+}
+
+/// The plan of a policy change (task MA3; r5-a §8.2: "`ChangePolicy` ⇒
+/// everyone whose tier changes"), read through the PIP's tier functions
+/// under the candidate map the one tier-map edit builds: classifying
+/// `readers` Tier 2 moves the group and its members bob, disabled and alice
+/// from Untiered to Tier 2 (subject) and from unclassified to Tier 2
+/// (object); helper, also in the Tier-1 helpdesk, keeps Tier 1 — not in the
+/// plan. Classifying ou=Staff Tier 2 changes object tiers only (a subtree is
+/// no subject tier). The execution recomputes the same plan, and its
+/// decision records the plan's digest.
+#[test]
+fn a_policy_change_plans_who_changes_tier() {
+    use ipc_dird_admin::{Effect, PlanTier};
+    let mut d = Domain::new("pc-plan");
+    let installed = installed();
+    load(&mut d, &installed);
+    let readers = vec![TierChange::AddPrincipal(sid_of(READERS), Tier::Tier2)];
+    let planned = d
+        .plan_operation(ProposedOperation::Policy(readers.clone()), "admin1")
+        .unwrap();
+    let moved: std::collections::BTreeSet<dtyp::Sid> = [READERS, BOB, DISABLED, ALICE]
+        .iter()
+        .map(|id| sid_of(*id))
+        .collect();
+    assert_eq!(
+        planned.plan().effects(),
+        &[Effect::TierDelta {
+            subject: (PlanTier::None, PlanTier::Tier2),
+            object: (PlanTier::None, PlanTier::Tier2),
+            principals: moved,
+        }]
+    );
+    assert!(planned.plan().principal(&sid_of(HELPER)).is_none());
+
+    let staff = d
+        .plan_operation(ProposedOperation::Policy(vec![add_staff_tier2()]), "admin1")
+        .unwrap();
+    for effect in staff.plan().effects() {
+        match effect {
+            Effect::TierDelta {
+                subject, object, ..
+            } => {
+                assert_eq!(subject.0, subject.1, "a subtree is no subject tier");
+                assert_eq!(object.1, PlanTier::Tier2);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(staff
+        .plan()
+        .effects()
+        .iter()
+        .any(|e| e.principals().contains(&sid_of(ALICE))));
+
+    let prepared = decide(
+        &mut d,
+        &installed,
+        readers,
+        "admin1",
+        &["admin2"],
+        PendingPolicy::Absent,
+    )
+    .unwrap();
+    assert_eq!(
+        prepared.decision_event().plan_digest,
+        Some(planned.digest())
+    );
 }

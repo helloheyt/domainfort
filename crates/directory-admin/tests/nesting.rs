@@ -184,9 +184,12 @@ fn layers_above(d: &Domain, g: dtyp::Guid, width: u32, layers: u32, first: u32) 
 /// lockout count). 15 layers of 35 groups above a group are within the
 /// depth (alice → group → 15 layers = 16 levels) but take 35 + 14 · 35² =
 /// 17,185 references to climb: adding a member is refused (fail closed).
-/// 15 layers of 30 groups (30 + 14 · 30² = 12,630 references) are allowed —
-/// a chain of exactly 16 levels again — and directory-pip resolves the new
-/// member.
+/// 15 layers of 30 groups (30 + 14 · 30² = 12,630 references) pass the
+/// walk — a chain of exactly 16 levels again: the link check allows it, and
+/// the write stops only at its effect plan, which would name bob's 451 new
+/// groups — beyond the plan's bounds, so not performed (`PlanTooLarge`, task
+/// MA2; docs/questions/Q-981: an effect that cannot be shown is not
+/// performed). Written beneath the PEP, directory-pip resolves the member.
 #[test]
 fn a_depth_walk_over_its_bound_is_refused() {
     let mut d = Domain::new("nest-bound");
@@ -197,6 +200,28 @@ fn a_depth_walk_over_its_bound_is_refused() {
     assert_eq!(r.status(), RefusalStatus::Invalid);
     let narrower = new_group(&mut d, "narrower");
     layers_above(&d, narrower, 30, 15, 400_000);
-    d.run(add(narrower, guid(BOB)), "admin1", &[]).applied();
+    let r = d.run(add(narrower, guid(BOB)), "admin1", &[]).refused();
+    assert_eq!(refusal_code(&r), AdminRefusal::PlanTooLarge);
+    force_member(&d, narrower, guid(BOB));
     assert!(resolves(&d, "bob"));
+}
+
+/// `member` into the empty `group`, beneath the PEP (task MA2: a link the
+/// write path allows but cannot plan within the plan's bounds).
+fn force_member(d: &Domain, group: dtyp::Guid, member: dtyp::Guid) {
+    let mut txn = d.store.begin_write().unwrap();
+    txn.modify_object(
+        group,
+        vec![dirstore::AttributeChange::Replace {
+            id: d.attr("member"),
+            values: vec![member.to_packet().to_vec()],
+        }],
+        &dirstore::Origin {
+            wall_clock: directory_admin::wall_clock(&now()).unwrap(),
+            origin_node: NODE_ID,
+            origin_seq: 0,
+        },
+    )
+    .unwrap();
+    txn.commit().unwrap();
 }

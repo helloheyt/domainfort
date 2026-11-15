@@ -32,6 +32,9 @@ pub(crate) struct Ids {
     pub(crate) pwd_last_set: AttrId,
     pub(crate) when_created: AttrId,
     pub(crate) member_of: AttrId,
+    /// The forward link memberOf is the back link of (task MA3: the
+    /// downward walk of an effect plan, crate::groups `member_closure`).
+    pub(crate) member: AttrId,
     pub(crate) group_type: AttrId,
     pub(crate) nt_security_descriptor: AttrId,
     /// The RDN attribute of every component of the naming context's DN
@@ -58,6 +61,7 @@ impl Ids {
             pwd_last_set: attr("pwdLastSet")?,
             when_created: attr("whenCreated")?,
             member_of: attr("memberOf")?,
+            member: attr("member")?,
             group_type: attr("groupType")?,
             nt_security_descriptor: attr("nTSecurityDescriptor")?,
             dc: attr(crate::naming::NC_RDN_ATTRIBUTE)?,
@@ -84,6 +88,11 @@ impl Ids {
         // memberOf is answered from the reverse-link index.
         let member_of = schema.attribute(ids.member_of).ok_or(ViewError::Schema)?;
         if !matches!(member_of.link, Some(Link::Back { .. })) {
+            return Err(ViewError::Schema);
+        }
+        // member is the forward link (its values are objectGUID packets).
+        let member = schema.attribute(ids.member).ok_or(ViewError::Schema)?;
+        if !matches!(member.link, Some(Link::Forward { .. })) {
             return Err(ViewError::Schema);
         }
         // The NC root is a domainDNS object named by dc ([MS-ADTS]
@@ -150,4 +159,23 @@ pub(crate) fn text(obj: &Object, id: AttrId) -> Result<Option<&str>, Fault> {
     single(obj, id)?
         .map(|v| core::str::from_utf8(v).map_err(|_| Fault::Unavailable))
         .transpose()
+}
+
+/// The objectGUIDs of a link attribute's values (ObjectRef: the 16-octet
+/// objectGUID packet, docs/46 §8.1). A value of another length is an
+/// inconsistent record.
+/// Spec: docs/46 §8.1; [MS-DTYP] 2.3.4.2.
+pub(crate) fn refs(obj: &Object, id: AttrId) -> Result<Vec<dtyp::Guid>, Fault> {
+    match obj.attribute(id) {
+        None => Ok(Vec::new()),
+        Some(attr) => attr
+            .values
+            .iter()
+            .map(|v| {
+                <&[u8; 16]>::try_from(v.value.as_slice())
+                    .map(dtyp::Guid::from_packet)
+                    .map_err(|_| Fault::Unavailable)
+            })
+            .collect(),
+    }
 }

@@ -37,13 +37,15 @@
 //! | dir | kind | message | payload |
 //! |---|---|---|---|
 //! | → | `0x01`–`0x05` | `CreateUser`, `CreateComputer`, `CreateGroup`, `CreateOu`, `CreateContainer` | dird's (`auth` ‖ fields) |
-//! | → | `0x08`–`0x0D` | `SetEnabled`, `SetAccountExpires`, `AddMember`, `RemoveMember`, `Delete`, `Lookup` | dird's (`auth` ‖ fields) |
+//! | → | `0x0D` | `Lookup` | dird's (`auth` ‖ fields) |
+//! | → | `0x08`–`0x0C`, `0x16` | (task MA2: `SetEnabled`, `SetAccountExpires`, `AddMember`, `RemoveMember`, `Delete`, `ChangePolicy` are planned operations — forwarded only inside `PlanOperation` / `Commit` / `Propose`, never as frames of their own) | — |
+//! | → | `0x1E`, `0x1F` | `PlanOperation`, `Commit` (task MA2) | dird's (`auth` ‖ fields) — a `Commit` never of dird's password-set steps |
 //! | → | `0x14` | `Ping` | — (no `auth`) |
 //! | → | `0x0E`, `0x0F` | (retired by task D2-c: `RequestKeyOperation`, the key-only `Approve` — Q-882) | — |
 //! | → | `0x17`–`0x1C` | `Propose`, `Approve`, `Reject`, `Withdraw`, `ListRequests`, `ShowRequest` (task D2-c) | dird's (`auth` ‖ fields) |
 //! | → | `0x10`–`0x12` | (retired by A-102: keyadm's `FetchApproved`, `Complete`, `ListPendingDestruction`) | — |
-//! | → | `0x15` | `SetPassword` | `auth ‖ completion:bytes<64 KiB> ‖ target:[16] ‖ password:secret bytes<1024>` |
-//! | → | `0x16` | `ChangePolicy` (task A16) | dird's (`auth` ‖ fields) |
+//! | → | `0x15` | (retired by task MA2: the plan-less `SetPassword`) | — |
+//! | → | `0x20` | `SetPassword` (task MA2) | `auth ‖ completion:bytes<64 KiB> ‖ target:[16] ‖ plan:[32] ‖ password:secret bytes<1024>` |
 //! | ← | `0x81` | `Created` | dird's: `guid:[16] ‖ sid:Option<bytes<68>>` |
 //! | ← | `0x83` | `Done` | — |
 //! | ← | `0x84` | `Found` | dird's: `guid ‖ dn:seq<bytes<128>,64> ‖ class:bytes<64> ‖ sid?` |
@@ -54,6 +56,7 @@
 //! | ← | `0x8C`–`0x8E` | `PendingRequest`, `RequestList`, `RequestShown` (task D2-c) | dird's |
 //! | ← | `0x89`, `0x8A` | (retired by A-102: `Approved`, `PendingDestruction`) | — |
 //! | ← | `0x8B` | `PolicyNext` (task A16) | dird's: `version:u64` |
+//! | ← | `0x8F` | `Plan` (task MA2) | dird's: `plan:bytes<24 KiB> ‖ digest:[32]` |
 //! | ← | `0xFF` | shared `Refused` (A-59) | `code` |
 //!
 //! Unused kinds: `0x06` / `0x07` (dird's password-set steps — only admind
@@ -61,6 +64,16 @@
 //! ≤ 288 KiB, reply body ≤ 64 KiB ([`channel`]). The synchronous client
 //! ([`client`], task A10) is `adminctl`'s when task A11 builds it (keyadm
 //! used it until A-102, which took admind out of keyadm's path).
+//!
+//! **Plan → Commit (task MA2; docs/research/r5-a-admin-model.md §3.3;
+//! docs/questions/Q-980).** A password set requires an effect plan: the
+//! client plans `BeginPasswordSet {target}` (`PlanOperation`, forwarded),
+//! then sends `SetPassword` with the plan's digest; admind sends dird
+//! `Commit {plan, BeginPasswordSet {target}}` — the operation the `auth`
+//! AP-REQ is bound to — and dird recomputes the plan and refuses any
+//! difference. `Commit` of a password-set step is never forwarded (only
+//! `SetPassword` sets a password here, so `pwdLastSet` is never written
+//! without the `set_secret` that follows).
 //!
 //! `completion` is a second AP-REQ of the requester for dird's
 //! `CompletePasswordSet`: dird verifies every request's AP-REQs through

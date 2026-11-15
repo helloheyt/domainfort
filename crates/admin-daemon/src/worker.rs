@@ -265,9 +265,10 @@ impl Worker {
             auth,
             completion,
             target,
+            plan,
             password,
         } = request;
-        let ended = self.password_steps(auth, completion, target, &password);
+        let ended = self.password_steps(auth, completion, target, plan, &password);
         // The password's buffer is wiped here, before anything else happens.
         drop(password);
         let event = AdmindEvent {
@@ -275,7 +276,7 @@ impl Worker {
             peer_uid: Some(peer_uid),
             activity: AdmindActivity::SetPassword {
                 target: target.to_packet(),
-                operation_digest: begin_digest(target),
+                operation_digest: begin_digest(target, plan),
                 kvnos: BoundedSeq::new(ended.kvnos).unwrap_or_default(),
                 result: ended.result,
             },
@@ -294,6 +295,7 @@ impl Worker {
         auth: Auth,
         completion: Vec<u8>,
         target: Guid,
+        plan: [u8; 32],
         password: &Password,
     ) -> Ended {
         // 1. The rules that need only the password: the text-only part of
@@ -306,10 +308,12 @@ impl Worker {
                 RefusalStatus::Invalid,
             );
         }
-        // 2. dird's BeginPasswordSet (auth forwarded untouched).
+        // 2. dird's BeginPasswordSet (auth forwarded untouched) — as the
+        //    `Commit` of the plan the requester planned (task MA2; dird
+        //    recomputes the plan and refuses any difference).
         let begin = DirdRequest::Operation {
             auth,
-            operation: Operation::BeginPasswordSet { target },
+            operation: begin_commit(target, plan),
         };
         let set = match self.dird.call(&begin) {
             Ok(ipc_dird_admin::Reply::PasswordSet(set)) => set,
@@ -487,12 +491,26 @@ impl Worker {
 fn reads_only(operation: &Operation) -> bool {
     matches!(
         operation,
-        Operation::Lookup(_) | Operation::ListRequests(_) | Operation::ShowRequest { .. }
+        Operation::Lookup(_)
+            | Operation::ListRequests(_)
+            | Operation::ShowRequest { .. }
+            | Operation::PlanOperation(_)
     )
 }
 
+/// dird's `Commit {plan, BeginPasswordSet {target}}`: the one form in which
+/// a password set reaches dird (task MA2; docs/questions/Q-980, Q-982).
+/// Spec: docs/research/r5-a-admin-model.md §3.3; docs/51 §7.6.
+fn begin_commit(target: Guid, plan: [u8; 32]) -> Operation {
+    Operation::Commit {
+        plan,
+        operation: Box::new(Operation::BeginPasswordSet { target }),
+    }
+}
+
 /// The fingerprint of a `SetPassword` for its event: the operation digest of
-/// `BeginPasswordSet {target}` — the dird operation the requester's `auth`
+/// `Commit {plan, BeginPasswordSet {target}}` (task MA2; before it, of
+/// `BeginPasswordSet {target}`) — the dird operation the requester's `auth`
 /// AP-REQ is bound to, computed by the one function both ends use (crate
 /// ipc-dird-admin `operation_digest`). It is the client's binding, never a
 /// value the client supplies (C3). A typed `BeginPasswordSet` always has a
@@ -500,8 +518,8 @@ fn reads_only(operation: &Operation) -> bool {
 /// claim).
 /// Spec: docs/questions/Q-888 item 1 ("admind's events … computed from the
 /// octets it forwards"); docs/52 §5 item 1.
-fn begin_digest(target: Guid) -> [u8; ipc_audit::OPERATION_DIGEST_LEN] {
-    ipc_dird_admin::operation_digest(&Operation::BeginPasswordSet { target })
+fn begin_digest(target: Guid, plan: [u8; 32]) -> [u8; ipc_audit::OPERATION_DIGEST_LEN] {
+    ipc_dird_admin::operation_digest(&begin_commit(target, plan))
         .map_or([0; ipc_audit::OPERATION_DIGEST_LEN], |d| *d.as_bytes())
 }
 

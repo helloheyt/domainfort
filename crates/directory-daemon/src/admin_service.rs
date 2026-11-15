@@ -894,6 +894,20 @@ pub fn proposal_of(operation: &Operation) -> Option<ProposedOperation> {
     }
 }
 
+/// The PEP's form of a proposed operation and the plan digest it commits
+/// to: a `Commit {plan, operation}` is its planned operation with `plan`
+/// (task MA2); a create is itself with none.
+/// Spec: docs/questions/Q-980; crate directory-admin `ProposeRequest::plan`.
+#[must_use]
+pub fn committed_proposal(operation: &Operation) -> Option<(ProposedOperation, Option<[u8; 32]>)> {
+    match operation {
+        Operation::Commit { plan, operation } => {
+            proposal_of(operation).map(|proposed| (proposed, Some(*plan)))
+        }
+        other => proposal_of(other).map(|proposed| (proposed, None)),
+    }
+}
+
 /// The PEP's step of a request-queue operation, if it is one (task D2-c).
 /// Spec: docs/questions/Q-882 item 1; r5-a §11 MA5.
 #[must_use]
@@ -1074,8 +1088,17 @@ fn wire_detail(detail: &RequestDetail) -> Option<RequestShown> {
         quorum: u8::try_from(detail.quorum).ok()?,
         expires: detail.expires,
         reason_ref: detail.reason_ref.clone(),
-        operation: wire_proposed(&detail.operation)?,
+        // A planned request is held as the `Commit` of its plan (task MA2):
+        // the plan's digest from dird's own plan, the plan beside it.
+        operation: match &detail.plan {
+            Some(plan) => Operation::Commit {
+                plan: plan.digest().ok()?,
+                operation: Box::new(wire_proposed(&detail.operation)?),
+            },
+            None => wire_proposed(&detail.operation)?,
+        },
         facts: detail.facts.iter().map(wire_fact).collect(),
+        plan: detail.plan.clone(),
     })
 }
 
@@ -1197,7 +1220,9 @@ pub fn pep_operation(operation: &Operation) -> Option<PepOperation> {
         | Operation::Reject { .. }
         | Operation::Withdraw { .. }
         | Operation::ListRequests(_)
-        | Operation::ShowRequest { .. } => return None,
+        | Operation::ShowRequest { .. }
+        | Operation::PlanOperation(_)
+        | Operation::Commit { .. } => return None,
     })
 }
 

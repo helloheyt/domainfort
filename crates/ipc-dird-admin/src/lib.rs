@@ -19,6 +19,7 @@
 //! | typed | [`typed`] | UTF-8 text, GUIDs, SIDs (dtyp), realms / salts / binding names (krb-proto); one spelling per value |
 //! | server | [`server`] | [`decode_request`] (or how to refuse), [`encode_reply`] |
 //! | digest | [`digest`] | [`operation_digest`]: the application data an admin AP-REQ is bound to (R2, docs/52 §5) |
+//! | plan | [`plan`] | [`EffectPlan`]: the effect plan's canonical encoding and [`plan_digest`] (task MA2) |
 //! | client | [`client`] | [`AdminClient`]: dird-uid check before sending, deadline, idle check, no resend, strict replies |
 //! | socket | `unix` | [`UnixConnector`]: blocking Unix stream, peer uid via rustix (Linux; elsewhere fail closed) |
 //!
@@ -40,6 +41,11 @@
 //! the payload after `auth` (for `CompletePasswordSet`, its `target` only).
 //! dird has keyd verify it; an AP-REQ attached to another operation is
 //! refused.
+//!
+//! Since task MA2 the rows `0x06`, `0x08`–`0x0C` and `0x16` (and `0x1D`)
+//! are **planned operations**: valid only as the operation inside
+//! `PlanOperation` (`0x1E`) and `Commit` (`0x1F`), never as frames of their
+//! own (docs/questions/Q-980, Q-982).
 //!
 //! | dir | kind | message | payload after `auth` | reply |
 //! |---|---|---|---|---|
@@ -66,6 +72,8 @@
 //! | → | `0x1A` | `Withdraw` (D2-c) | `id:u64` | `Done` |
 //! | → | `0x1B` | `ListRequests` (D2-c) | `scope:u8{1 Mine, 2 AwaitingMe}` | `RequestList` |
 //! | → | `0x1C` | `ShowRequest` (D2-c) | `id:u64` | `RequestShown` |
+//! | → | `0x1E` | `PlanOperation` (MA2) | `operation:PlannedOperation` | `Plan` |
+//! | → | `0x1F` | `Commit` (MA2) | `plan:[32] ‖ operation:PlannedOperation` (never a key operation at top level) | the planned operation's reply |
 //! | ← | `0x81` | `Created` | `guid:[16] ‖ sid:Option<bytes<68>>` | — |
 //! | ← | `0x82` | `PasswordSet` | `kind:u8{1 User, 2 Computer} ‖ keys:seq<(principal:[16] ‖ purpose:u8{1 Longterm, 2 Service} ‖ realm:bytes<255> ‖ name:bytes<4096> DER), 2> ‖ salt:bytes<1024>` | — |
 //! | ← | `0x83` | `Done` | — | — |
@@ -77,12 +85,23 @@
 //! | ← | `0x8B` | `PolicyNext` (task A16) | `version:u64` | — |
 //! | ← | `0x8C` | `PendingRequest` (D2-c) | `id:u64 ‖ digest:[32] ‖ state:u8{1 Pending, 2 Approved} ‖ approvals:u8 ‖ quorum:u8 ‖ expires:u64` | — |
 //! | ← | `0x8D` | `RequestList` (D2-c) | `entries:seq<(id ‖ digest ‖ state ‖ operation:u8 ‖ requester:bytes<68> ‖ approvals:u8 ‖ quorum:u8 ‖ expires:u64), 32>` | — |
-//! | ← | `0x8E` | `RequestShown` (D2-c) | `id ‖ digest ‖ state ‖ requester:bytes<68> ‖ approvers:seq<bytes<68>,2> ‖ quorum:u8 ‖ expires:u64 ‖ reason_ref:Option<bytes<64>> ‖ operation:ProposedOperation ‖ facts:seq<Fact,2>` | — |
+//! | ← | `0x8E` | `RequestShown` (D2-c) | `id ‖ digest ‖ state ‖ requester:bytes<68> ‖ approvers:seq<bytes<68>,2> ‖ quorum:u8 ‖ expires:u64 ‖ reason_ref:Option<bytes<64>> ‖ operation:ProposedOperation ‖ facts:seq<Fact,2> ‖ plan:Option<bytes<24 KiB>>` (`plan` appended by MA2) | — |
+//! | ← | `0x8F` | `Plan` (MA2) | `plan:bytes<24 KiB> ‖ digest:[32]` | — |
 //! | ← | `0xFF` | shared `Refused` (A-59) | `code` | — |
 //!
 //! `ProposedOperation := kind:u8 ‖ fields`, the kind one of
-//! `request_kind::PROPOSABLE` — the dual-controlled writes, `ChangePolicy`,
-//! and `0x1D KeyOperation` (a key operation; never a request of its own).
+//! `request_kind::PROPOSABLE` — the creates, and `0x1F Commit` of a planned
+//! operation. `PlannedOperation := kind:u8 ‖ fields`, the kind one of
+//! `request_kind::PLANNED` — `BeginPasswordSet`, `SetEnabled`,
+//! `SetAccountExpires`, `AddMember`, `RemoveMember`, `Delete`,
+//! `ChangePolicy`, and `0x1D KeyOperation`. **Since task MA2 none of these
+//! is a request of its own** (docs/research/r5-a-admin-model.md §3.3;
+//! docs/questions/Q-980, Q-982): each is planned (`PlanOperation` → `Plan`)
+//! and executed or proposed only as a `Commit {plan, operation}`, whose
+//! operation digest covers the plan digest — the effect closure the
+//! requester's AP-REQ and the approvers' `Approve` bind; dird recomputes the
+//! plan at the execution and refuses any difference (`PlanChanged`, wire
+//! `Conflict`).
 //! `Fact := guid:[16] ‖ dn:seq<bytes<128>,64> ‖ class:bytes<64> ‖
 //! sid:Option<bytes<68>> ‖ tier:u8{0 Tier0, 1 Tier1, 2 Tier2,
 //! 3 Unclassified}`. `expires` is in seconds since 1970-01-01T00:00:00Z.
@@ -148,6 +167,7 @@
 pub mod channel;
 pub mod client;
 pub mod digest;
+pub mod plan;
 pub mod server;
 pub mod typed;
 #[cfg(unix)]
@@ -163,6 +183,10 @@ pub use client::{
     DEFAULT_DEADLINE,
 };
 pub use digest::{operation_digest, wire_operation_digest, DigestError, OPERATION_DIGEST_LABEL};
+pub use plan::{
+    plan_digest, Effect, EffectPlan, PlanError, PlanPrincipal, PlanPrincipalKind, PlanTier,
+    PolicyReferenceKind, RevocationKind, PLAN_DIGEST_LABEL, PLAN_LAYOUT,
+};
 pub use server::{decode_request, encode_refusal, encode_reply, EncodeError, Rejection};
 pub use typed::{
     AccountExpires, AccountKind, Auth, ConversionError, Fact, FactTier, Found, KeyOperation,

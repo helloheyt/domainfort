@@ -17,6 +17,7 @@
 //! same strictness); A-85 (one spelling of "never").
 
 use crate::channel::{codes, RefusalStatus, DIGEST_LEN};
+use crate::plan::{plan_digest, EffectPlan};
 use crate::wire::{
     AdminReply, AdminRequest, WireAuth, WireFact, WireKeyOperation, WireKeyRef, WireKeyTarget,
     WireLookupKey, WireOperation, WirePendingRequest, WirePolicyChange, WireRequestShown,
@@ -55,6 +56,10 @@ pub enum ConversionError {
     UnexpectedReply,
     /// A count that does not fit its one-octet field (approvals, quorum).
     Count,
+    /// An effect plan does not decode, its digest is not the one it comes
+    /// with, or a shown request's plan is not the one its `Commit` names
+    /// (task MA2).
+    Plan,
 }
 
 impl fmt::Display for ConversionError {
@@ -67,6 +72,7 @@ impl fmt::Display for ConversionError {
             ConversionError::NonCanonical => "value with a second spelling",
             ConversionError::UnexpectedReply => "reply does not answer the request",
             ConversionError::Count => "count does not fit its field",
+            ConversionError::Plan => "effect plan does not match its digest",
         })
     }
 }
@@ -443,6 +449,19 @@ pub enum Operation {
         /// The pending request's id.
         id: u64,
     },
+    /// `PlanOperation {operation}` (task MA2): ask for the effect plan of a
+    /// planned operation (`request_kind::PLANNED`).
+    /// Spec: docs/research/r5-a-admin-model.md §3.3; docs/questions/Q-980.
+    PlanOperation(Box<Operation>),
+    /// `Commit {plan, operation}` (task MA2): a planned operation with the
+    /// digest of the plan it commits to.
+    /// Spec: docs/research/r5-a-admin-model.md §3.3; docs/questions/Q-980.
+    Commit {
+        /// The plan digest (crate::plan `plan_digest`).
+        plan: [u8; DIGEST_LEN],
+        /// The planned operation.
+        operation: Box<Operation>,
+    },
 }
 
 /// The scope of a `ListRequests`.
@@ -582,6 +601,13 @@ impl Operation {
                 })
             }
             WireOperation::ShowRequest { id } => Operation::ShowRequest { id: *id },
+            WireOperation::PlanOperation { operation } => {
+                Operation::PlanOperation(Box::new(Operation::from_wire(operation)?))
+            }
+            WireOperation::Commit { plan, operation } => Operation::Commit {
+                plan: *plan,
+                operation: Box::new(Operation::from_wire(operation)?),
+            },
         })
     }
 
@@ -708,6 +734,13 @@ impl Operation {
                 },
             },
             Operation::ShowRequest { id } => WireOperation::ShowRequest { id: *id },
+            Operation::PlanOperation(operation) => WireOperation::PlanOperation {
+                operation: Box::new(operation.to_wire()?),
+            },
+            Operation::Commit { plan, operation } => WireOperation::Commit {
+                plan: *plan,
+                operation: Box::new(operation.to_wire()?),
+            },
         })
     }
 }
@@ -1028,10 +1061,38 @@ pub struct RequestShown {
     pub operation: Operation,
     /// The facts.
     pub facts: Vec<Fact>,
+    /// The effect plan dird holds, for a `Commit` (task MA2): decoded from
+    /// dird's canonical bytes, and checked against the `Commit`'s plan
+    /// digest when converted (a client renders exactly what is bound).
+    pub plan: Option<EffectPlan>,
+}
+
+/// The plan of a shown request must be the one its operation names: `Some`
+/// exactly for a `Commit`, whose `plan` is that plan's digest.
+/// Spec: docs/questions/Q-874 item 1, Q-980 (the plan rendered from the
+/// server's bytes is the plan whose digest is signed).
+fn plan_matches(operation: &Operation, plan: Option<&[u8]>) -> Result<(), ConversionError> {
+    match (operation, plan) {
+        (Operation::Commit { plan: digest, .. }, Some(octets))
+            if plan_digest(octets) == *digest =>
+        {
+            Ok(())
+        }
+        (Operation::Commit { .. }, _) | (_, Some(_)) => Err(ConversionError::Plan),
+        (_, None) => Ok(()),
+    }
 }
 
 impl RequestShown {
     fn from_wire(wire: &WireRequestShown) -> Result<RequestShown, ConversionError> {
+        let operation = Operation::from_wire(&wire.operation)?;
+        plan_matches(&operation, wire.plan.as_deref())?;
+        let plan = wire
+            .plan
+            .as_deref()
+            .map(EffectPlan::decode)
+            .transpose()
+            .map_err(|_| ConversionError::Plan)?;
         Ok(RequestShown {
             id: wire.id,
             digest: wire.digest,
@@ -1045,12 +1106,13 @@ impl RequestShown {
             quorum: wire.quorum,
             expires: wire.expires,
             reason_ref: opt_text(wire.reason_ref.as_ref())?,
-            operation: Operation::from_wire(&wire.operation)?,
+            operation,
             facts: wire
                 .facts
                 .iter()
                 .map(Fact::from_wire)
                 .collect::<Result<_, _>>()?,
+            plan,
         })
     }
 
@@ -1066,6 +1128,16 @@ impl RequestShown {
             reason_ref: self.reason_ref.as_ref().map(|r| r.as_bytes().to_vec()),
             operation: self.operation.to_wire()?,
             facts: self.facts.iter().map(Fact::to_wire).collect(),
+            plan: {
+                let octets = self
+                    .plan
+                    .as_ref()
+                    .map(EffectPlan::encode)
+                    .transpose()
+                    .map_err(|_| ConversionError::Plan)?;
+                plan_matches(&self.operation, octets.as_deref())?;
+                octets
+            },
         })
     }
 }
@@ -1105,6 +1177,14 @@ pub enum Reply {
     RequestList(Vec<RequestSummary>),
     /// `ShowRequest`: the request as dird holds it.
     RequestShown(Box<RequestShown>),
+    /// `PlanOperation`: the effect plan (task MA2) — decoded from its
+    /// canonical bytes, whose digest is `digest` (checked when converted).
+    Plan {
+        /// The plan.
+        plan: EffectPlan,
+        /// Its digest: the value a `Commit` names.
+        digest: [u8; DIGEST_LEN],
+    },
 }
 
 impl Reply {
@@ -1155,6 +1235,15 @@ impl Reply {
             AdminReply::RequestShown(shown) => {
                 Reply::RequestShown(Box::new(RequestShown::from_wire(shown)?))
             }
+            AdminReply::Plan { plan, digest } => {
+                if plan_digest(plan) != *digest {
+                    return Err(ConversionError::Plan);
+                }
+                Reply::Plan {
+                    plan: EffectPlan::decode(plan).map_err(|_| ConversionError::Plan)?,
+                    digest: *digest,
+                }
+            }
         })
     }
 
@@ -1196,6 +1285,16 @@ impl Reply {
                 entries: entries.iter().map(RequestSummary::to_wire).collect(),
             },
             Reply::RequestShown(shown) => AdminReply::RequestShown(Box::new(shown.to_wire()?)),
+            Reply::Plan { plan, digest } => {
+                let octets = plan.encode().map_err(|_| ConversionError::Plan)?;
+                if plan_digest(&octets) != *digest {
+                    return Err(ConversionError::Plan);
+                }
+                AdminReply::Plan {
+                    plan: octets,
+                    digest: *digest,
+                }
+            }
         })
     }
 }

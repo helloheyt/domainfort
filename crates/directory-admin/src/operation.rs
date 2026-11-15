@@ -196,6 +196,30 @@ impl Operation {
         }
     }
 
+    /// `true` for the operations that **require an effect plan** (task MA2;
+    /// docs/questions/Q-982): their effect reaches beyond their direct
+    /// target — a membership change (transitive), an account's enable,
+    /// expiry, delete or password set (its tickets; a delete's memberships
+    /// and key sets). Decided by the kind alone, never by the target's state
+    /// (the requirement itself cannot change between plan and commit). Such
+    /// an operation is decided only with the digest of the plan it commits
+    /// to (`Request::plan`); the creates, `Lookup` and `CompletePasswordSet`
+    /// take none.
+    /// Spec: docs/research/r5-a-admin-model.md §3.3, §8.2; docs/questions/
+    /// Q-982; crate ipc-dird-admin `request_kind::PLANNED`.
+    #[must_use]
+    pub fn requires_plan(&self) -> bool {
+        matches!(
+            self,
+            Operation::BeginPasswordSet { .. }
+                | Operation::SetEnabled(_)
+                | Operation::SetAccountExpires(_)
+                | Operation::AddMember(_)
+                | Operation::RemoveMember(_)
+                | Operation::Delete { .. }
+        )
+    }
+
     /// `true` for the operations that commit a directory write (they get a
     /// `Decision` event acknowledged before the commit and an `Outcome`
     /// event after it); `Lookup` and `CompletePasswordSet` commit nothing

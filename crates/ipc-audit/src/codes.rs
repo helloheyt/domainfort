@@ -667,8 +667,15 @@ code_table! {
     /// the requester's own account as `target` and its objectSid as
     /// `requester` (docs/53 §9); dird decides it on `dird-kpasswd.sock`, not
     /// on `dird-admin.sock`.
+    /// `PlanOperation` (appended by task MA2; docs/research/
+    /// r5-a-admin-model.md §3.3, §11 MA2; docs/questions/Q-874, Q-980): the
+    /// requester asks dird for the effect plan of an operation — the same
+    /// checks as its execution, committing nothing; the plan's digest is in
+    /// [`crate::DirAdminEvent::plan_digest`], the operation planned in
+    /// `proposed`. The execution itself (`Commit`) keeps the code of the
+    /// operation it executes.
     /// Spec: docs/51 §5.2, §5.7, §5.10, §6, §7.3; docs/questions/Q-340
-    /// item 2, Q-592, Q-882, Q-938; docs/53 §4.4, §9 (K6).
+    /// item 2, Q-592, Q-882, Q-938; docs/53 §4.4, §9 (K6); Q-980.
     pub enum DirAdminOperation {
         CreateUser,
         CreateComputer,
@@ -695,6 +702,7 @@ code_table! {
         ListRequests,
         ShowRequest,
         ChangePassword,
+        PlanOperation,
     }
 }
 
@@ -806,6 +814,23 @@ code_table! {
     ///   pending requests one requester may hold (interim cap while owner
     ///   item P-78 / Q-878 is open; class C47 — no flooding of the
     ///   approvers). Appended by task D2-c (Q-938, Q-940).
+    /// * `PlanRequired` — an operation that requires an effect plan
+    ///   (docs/questions/Q-982) arrived without one: it has no wire form
+    ///   without one (crate ipc-dird-admin), so this is the PEP's own
+    ///   defence in depth. Appended by task MA2 (r5-a §3.3; Q-980).
+    /// * `PlanChanged` — the effect plan dird recomputed at the execution,
+    ///   at an `Approve` or at a `Propose` differs from the plan the request
+    ///   commits to (its digest is inside the operation digest the AP-REQ
+    ///   is bound to): the effect closure is no longer the one that was
+    ///   approved (class C46) — nothing is written; plan again. Appended by
+    ///   task MA2 (Q-874 item 2, Q-980).
+    /// * `PlanNotVisible` — an effect of the plan names a principal the
+    ///   requester (or the approver) may not see: whoever cannot see the
+    ///   results of an operation does not perform or approve it (Q-874
+    ///   item 4, Q-983). Appended by task MA2.
+    /// * `PlanTooLarge` — the effect closure exceeds the plan's bounds (it
+    ///   could not be shown, so it is not performed — fail closed, Q-981).
+    ///   Appended by task MA2.
     ///
     /// Spec: docs/51 §5.2, §5.5, §5.6, §6, §7.4, §8.3, §11;
     /// docs/questions/Q-340 item 3; Q-295 item 4 (P-22); docs/11 §2, §8;
@@ -836,6 +861,10 @@ code_table! {
         ApprovalNotNeeded,
         RequestStale,
         RequesterLimit,
+        PlanRequired,
+        PlanChanged,
+        PlanNotVisible,
+        PlanTooLarge,
     }
 }
 

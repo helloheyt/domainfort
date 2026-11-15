@@ -377,9 +377,18 @@ impl AccountExpiresValue {
 /// * `reason_ref` (task D2-c; docs/questions/Q-882 item 4) — the
 ///   requester's change identifier of a pending request, as the requester
 ///   wrote it (unverified), kept by the [`AuditText`] rule.
+/// * `plan_digest` (appended by task MA2; docs/research/r5-a-admin-model.md
+///   §3.3; docs/questions/Q-874 item 7, Q-980) — the digest of the effect
+///   plan dird computed for the operation (crate ipc-dird-admin
+///   `plan_digest`): on a `PlanOperation`, the plan it answered; on the
+///   execution (and every step) of an operation that requires a plan, the
+///   plan dird recomputed — so the trail can be replayed against the
+///   snapshot. Only the digest, never the effects (they name principals the
+///   event does not otherwise carry). `None` for an operation without a
+///   plan, or when the plan was not reached.
 ///
 /// Spec: docs/51 §5.3, §5.6, §5.7 item 1, §6, §7.3, §7.4; docs/questions/
-/// Q-882, Q-888.
+/// Q-882, Q-888, Q-874 item 7.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirAdminEvent {
     /// dird's clock when it recorded the event.
@@ -423,6 +432,8 @@ pub struct DirAdminEvent {
     pub proposed: Option<DirAdminOperation>,
     /// The requester's change identifier of a pending request.
     pub reason_ref: Option<AuditText>,
+    /// The digest of the operation's effect plan (task MA2).
+    pub plan_digest: Option<[u8; OPERATION_DIGEST_LEN]>,
 }
 
 impl DirAdminEvent {
@@ -463,7 +474,10 @@ impl DirAdminEvent {
         write_opt(writer, self.proposed.as_ref(), |op, w| {
             Ok(w.write_enum(op.code())?)
         })?;
-        write_opt(writer, self.reason_ref.as_ref(), AuditText::write)
+        write_opt(writer, self.reason_ref.as_ref(), AuditText::write)?;
+        write_opt(writer, self.plan_digest.as_ref(), |d, w| {
+            Ok(w.write_array(d)?)
+        })
     }
 
     pub(crate) fn read(reader: &mut Reader<'_>) -> Result<DirAdminEvent, EventError> {
@@ -487,6 +501,7 @@ impl DirAdminEvent {
         let operation_digest = reader.read_array::<OPERATION_DIGEST_LEN>()?;
         let proposed = read_opt(reader, |r| Ok(r.read_enum(DirAdminOperation::from_code)?))?;
         let reason_ref = read_opt(reader, AuditText::read)?;
+        let plan_digest = read_opt(reader, |r| Ok(r.read_array::<OPERATION_DIGEST_LEN>()?))?;
         Ok(DirAdminEvent {
             time,
             operation_id,
@@ -508,6 +523,7 @@ impl DirAdminEvent {
             operation_digest,
             proposed,
             reason_ref,
+            plan_digest,
         })
     }
 }

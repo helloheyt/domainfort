@@ -165,6 +165,31 @@
 //! repository's own code; interpretations in docs/questions/Q-935..Q-941.
 //! No other implementation was consulted or recalled (AGENTS.md §1-3).
 //!
+//! # Plan → Commit (tasks MA2 + MA3; docs/research/r5-a-admin-model.md
+//! §3.3, §11; PENDING-OWNER A-147)
+//!
+//! An operation that requires an effect plan (`Operation::requires_plan`,
+//! `ProposedOperation::requires_plan` — membership changes, an account's
+//! enable / expiry / delete / password set, the policy change, the key
+//! operations; docs/questions/Q-982) is first planned —
+//! [`DirectoryAdmin::plan`]: its every check as a dry run, then its effect
+//! plan built by module `effects` from that evaluation over directory-pip's
+//! enforcing functions — and then executed or proposed only with the digest
+//! of that plan (`Request::plan`, `ProposeRequest::plan`,
+//! `PolicyChangeRequest::plan`), which is inside the operation digest the
+//! AP-REQs bind. The plan is recomputed at every `Propose`, `Approve` and
+//! execution; any difference refuses (`PlanChanged`); a principal the
+//! requester or approver may not see refuses (`PlanNotVisible`); a closure
+//! too large to show refuses (`PlanTooLarge`). Class C46 ("the approved
+//! effect is smaller than the executed one") has no path left
+//! (docs/questions/Q-980..Q-984).
+//!
+//! Written only from, opened in this session: docs/research/
+//! r5-a-admin-model.md (whole), docs/questions/Q-874, Q-117, Q-935..Q-941,
+//! PENDING-OWNER (A-36, A-102, A-108, A-147, A-159), docs/52 (C14, C43, C46,
+//! C47), docs/51 §5-§7, docs/57 and this repository's own code. No other
+//! implementation was consulted or recalled (AGENTS.md §1-3).
+//!
 //! `ChangePassword` (task K6, module `change_password`) was written only
 //! from, opened in this session: docs/53 (whole), PENDING-OWNER (A-117,
 //! A-121, A-126, A-142, A-151, A-153, A-156, A-158, A-159), docs/questions
@@ -181,6 +206,7 @@ mod change_password;
 mod checks;
 mod config;
 mod descriptor;
+mod effects;
 mod ids;
 mod invariants;
 mod key_requests;
@@ -223,11 +249,11 @@ pub use key_requests::{
 };
 // The one dual-control mechanism (task D2-c; docs/questions/Q-882).
 pub use requests::{
-    ApproverSignature, ListScope, PendingRequests, PolicyFile, ProposeRequest, Proposed,
-    ProposedOperation, QuorumStep, RequestDetail, RequestFact, RequestState, RequestStep,
-    RequestSummary, RequestView, RevocationFailure, RevocationStep, StepReply, StepRequest,
-    Stepped, MAX_FACTS, MAX_PENDING_REQUESTS, MAX_REASON_REF_CHARS, MAX_REQUESTS_PER_REQUESTER,
-    MAX_REQUEST_LIFETIME, REQUESTS_PER_REQUESTER, REQUEST_LIFETIME,
+    ApproverSignature, ListScope, PendingRequests, PlanRequest, Planned, PolicyFile,
+    ProposeRequest, Proposed, ProposedOperation, QuorumStep, RequestDetail, RequestFact,
+    RequestState, RequestStep, RequestSummary, RequestView, RevocationFailure, RevocationStep,
+    StepReply, StepRequest, Stepped, MAX_FACTS, MAX_PENDING_REQUESTS, MAX_REASON_REF_CHARS,
+    MAX_REQUESTS_PER_REQUESTER, MAX_REQUEST_LIFETIME, REQUESTS_PER_REQUESTER, REQUEST_LIFETIME,
 };
 
 /// Octets of an operation digest (SHA-256). Spec: FIPS 180-4 §6.2; crate

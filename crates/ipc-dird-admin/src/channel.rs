@@ -219,6 +219,25 @@ pub const MAX_POLICY_CHANGES: u32 = 4;
 /// Spec: docs/51 §7.5 ("payload ≤ 16 KiB").
 pub const MAX_POLICY_DN_COMPONENTS: u32 = 16;
 
+/// Bound of an effect plan's canonical encoding (octets): 24 KiB — so that
+/// a `RequestShown` carrying the plan of the request beside its operation
+/// and its facts stays within the 64 KiB reply bound (checked below). An
+/// effect closure that does not fit is not performed (`PlanTooLarge`, fail
+/// closed). Project choice (task MA2; docs/questions/Q-981).
+/// Spec: docs/research/r5-a-admin-model.md §3.3; docs/51 §7.5 (reply bound,
+/// as raised by Q-936).
+pub const MAX_PLAN: usize = 24 * 1024;
+
+/// Most principals one effect plan names (and most SIDs one of its sets
+/// holds). Project choice (task MA2; docs/questions/Q-981).
+/// Spec: docs/research/r5-a-admin-model.md §3.3; AGENTS.md §6 (bounded).
+pub const MAX_PLAN_PRINCIPALS: u32 = 256;
+
+/// Most effects one plan holds (each groups the principals that share one
+/// change). Project choice (task MA2; docs/questions/Q-981).
+/// Spec: docs/research/r5-a-admin-model.md §3.3.
+pub const MAX_PLAN_EFFECTS: u32 = 64;
+
 /// Body octets of the `auth` field at its largest: the requester's AP-REQ
 /// and the (always empty) retired approvals count.
 pub const MAX_AUTH: usize = 4 + MAX_AP_REQ as usize + 4;
@@ -277,7 +296,15 @@ const REQUEST_SHOWN_SIZE: usize = ENVELOPE
     + 8
     + (1 + 4 + MAX_REASON_REF as usize)
     + (1 + MAX_PAYLOAD)
-    + (4 + MAX_FACTS as usize * FACT_SIZE);
+    + (4 + MAX_FACTS as usize * FACT_SIZE)
+    + (1 + 4 + MAX_PLAN);
+/// Body octets of a `Plan` reply: the plan and its digest (task MA2).
+const PLAN_SIZE: usize = ENVELOPE + (4 + MAX_PLAN) + DIGEST_LEN;
+/// Payload octets of the largest `Propose` of a `Commit` after `auth`: the
+/// reason, the `Commit` kind, the plan digest, the inner kind and the
+/// largest planned operation (a `ChangePolicy`).
+const PROPOSE_COMMIT_SIZE: usize =
+    (1 + 4 + MAX_REASON_REF as usize) + 1 + DIGEST_LEN + 1 + CHANGE_POLICY_SIZE;
 /// Payload octets of the largest `Propose` after `auth`: the reason and the
 /// largest proposable operation (a `ChangePolicy`, bounded below; a
 /// `CreateUser`).
@@ -303,6 +330,8 @@ const _: () = assert!(PROPOSE_CREATE_SIZE <= MAX_PAYLOAD);
 const _: () = assert!(PENDING_REQUEST_SIZE <= MAX_REPLY_BODY as usize);
 const _: () = assert!(REQUEST_LIST_SIZE <= MAX_REPLY_BODY as usize);
 const _: () = assert!(REQUEST_SHOWN_SIZE <= MAX_REPLY_BODY as usize);
+const _: () = assert!(PLAN_SIZE <= MAX_REPLY_BODY as usize);
+const _: () = assert!(PROPOSE_COMMIT_SIZE <= MAX_PAYLOAD);
 const _: () = assert!(MAX_AP_REQ == ipc_keyd::channel::MAX_REQUEST_FIELD);
 const _: () = assert!(MAX_SALT <= ipc_keyd::channel::MAX_SALT);
 const _: () = assert!(MAX_REALM <= ipc_keyd::channel::MAX_REQUEST_FIELD);
@@ -418,6 +447,47 @@ pub mod request_kind {
     /// A-102).
     /// Spec: docs/51 §6; docs/questions/Q-882 item 2; docs/52 §4.3.
     pub const KEY_OPERATION: u8 = 0x1D;
+    /// `PlanOperation {operation}` (appended by task MA2): the requester
+    /// asks dird for the **effect plan** of one of [`PLANNED`] — the same
+    /// checks as its execution, committing nothing; answered `Plan {plan,
+    /// digest}` (crate::plan).
+    /// Spec: docs/research/r5-a-admin-model.md §3.3 (`PlanOperation {op,
+    /// fields} → EffectPlan`), §11 MA2; docs/questions/Q-874 item 1, Q-980.
+    pub const PLAN_OPERATION: u8 = 0x1E;
+    /// `Commit {plan, operation}` (appended by task MA2): one of [`PLANNED`]
+    /// with the digest of the plan it commits to — the only form in which a
+    /// planned operation executes, and the form in which it is proposed. Its
+    /// operation digest covers the plan digest, so the requester's AP-REQ
+    /// and every approver's `Approve` bind the effect closure; dird
+    /// recomputes the plan at the execution and refuses any difference
+    /// (`PlanChanged`). A `Commit` of a key operation is valid only inside a
+    /// `Propose` (keyadm executes key operations, A-102).
+    /// Spec: docs/research/r5-a-admin-model.md §3.3 (`Commit {plan_id}` with
+    /// `OperationDigest = H(op ‖ fields ‖ plan.digest)`); docs/questions/
+    /// Q-874 items 1-2, Q-980.
+    pub const COMMIT: u8 = 0x1F;
+
+    /// The operations that **require an effect plan** (task MA2;
+    /// docs/questions/Q-982): every operation whose effect reaches beyond
+    /// its direct target — membership changes (transitive), an account's
+    /// enable / expiry / delete and password set (its tickets; a delete's
+    /// memberships and key sets), the policy change (everyone whose tier
+    /// changes) and the key operations. None of these kinds is a request of
+    /// its own any more (they are not in [`ALL`]): each travels only inside
+    /// `PlanOperation` and `Commit` — so a planned operation has no frame
+    /// that executes it without a plan.
+    /// Spec: docs/research/r5-a-admin-model.md §3.3, §8.2 ("hidden
+    /// effects"); docs/questions/Q-982.
+    pub const PLANNED: &[u8] = &[
+        BEGIN_PASSWORD_SET,
+        SET_ENABLED,
+        SET_ACCOUNT_EXPIRES,
+        ADD_MEMBER,
+        REMOVE_MEMBER,
+        DELETE,
+        CHANGE_POLICY,
+        KEY_OPERATION,
+    ];
 
     /// The kinds retired by A-102 (keyadm's `FetchApproved`, `Complete`,
     /// `ListPendingDestruction`) and by task D2-c (`RequestKeyOperation`,
@@ -433,7 +503,24 @@ pub mod request_kind {
     /// neither is any request-queue kind.
     /// Spec: docs/51 §5.2, §5.6, §6; docs/questions/Q-882 item 1 ("every
     /// dual-controlled operation, by P-22's list").
+    ///
+    /// Since task MA2 a planned operation is proposed only as a `Commit` of
+    /// it (the plan it commits to is what the approvers approve): the
+    /// [`PLANNED`] kinds are proposable only inside [`COMMIT`].
     pub const PROPOSABLE: &[u8] = &[
+        CREATE_USER,
+        CREATE_COMPUTER,
+        CREATE_GROUP,
+        CREATE_OU,
+        CREATE_CONTAINER,
+        COMMIT,
+    ];
+
+    /// The kinds of the operation a pending request is for, as a
+    /// `RequestList` entry names it: a proposable create, or the planned
+    /// operation inside a `Commit` (task MA2).
+    /// Spec: docs/research/r5-a-admin-model.md §11 MA5; docs/questions/Q-980.
+    pub const REQUEST_OPERATIONS: &[u8] = &[
         CREATE_USER,
         CREATE_COMPUTER,
         CREATE_GROUP,
@@ -449,29 +536,26 @@ pub mod request_kind {
         KEY_OPERATION,
     ];
 
-    /// The closed request table. Spec: docs/51 §7.3; docs/50 §3.3.
+    /// The closed request table. Spec: docs/51 §7.3; docs/50 §3.3. The
+    /// [`PLANNED`] kinds left it with task MA2 (they travel only inside
+    /// `PlanOperation` / `Commit`); their numbers keep their meaning there.
     pub const ALL: &[u8] = &[
         CREATE_USER,
         CREATE_COMPUTER,
         CREATE_GROUP,
         CREATE_OU,
         CREATE_CONTAINER,
-        BEGIN_PASSWORD_SET,
         COMPLETE_PASSWORD_SET,
-        SET_ENABLED,
-        SET_ACCOUNT_EXPIRES,
-        ADD_MEMBER,
-        REMOVE_MEMBER,
-        DELETE,
         LOOKUP,
         PING,
-        CHANGE_POLICY,
         PROPOSE,
         APPROVE,
         REJECT,
         WITHDRAW,
         LIST_REQUESTS,
         SHOW_REQUEST,
+        PLAN_OPERATION,
+        COMMIT,
     ];
 }
 
@@ -513,6 +597,11 @@ pub mod reply_kind {
     /// `RequestShown { … }`: the answer to `ShowRequest`.
     /// Spec: docs/questions/Q-882 item 1, Q-887 item 3; r5-b §7.4.
     pub const REQUEST_SHOWN: u8 = 0x8E;
+    /// `Plan { plan, digest }`: the answer to `PlanOperation` — the effect
+    /// plan's canonical encoding and its digest (task MA2).
+    /// Spec: docs/research/r5-a-admin-model.md §3.3; docs/questions/Q-874
+    /// item 1, Q-980.
+    pub const PLAN: u8 = 0x8F;
 
     /// The reply kinds retired by A-102 and by task D2-c; never in [`ALL`],
     /// never reused.
@@ -532,6 +621,7 @@ pub mod reply_kind {
         PENDING_REQUEST,
         REQUEST_LIST,
         REQUEST_SHOWN,
+        PLAN,
     ];
 }
 
@@ -577,6 +667,12 @@ const _: () = assert!(disjoint(request_kind::ALL, request_kind::RETIRED));
 const _: () = assert!(disjoint(reply_kind::ALL, reply_kind::RETIRED));
 // The inner kind of a proposed key operation is never a request of its own.
 const _: () = assert!(disjoint(request_kind::ALL, &[request_kind::KEY_OPERATION]));
+// No planned operation is a request of its own (task MA2): it travels only
+// inside `PlanOperation` / `Commit`.
+const _: () = assert!(disjoint(request_kind::ALL, request_kind::PLANNED));
+const _: () = assert!(disjoint(request_kind::PROPOSABLE, request_kind::PLANNED));
+const _: () = assert!(all_distinct(request_kind::PLANNED));
+const _: () = assert!(all_distinct(request_kind::REQUEST_OPERATIONS));
 // No request-queue kind, read or audit-only step is proposable (no
 // `Propose` inside a `Propose`).
 const _: () = assert!(disjoint(
@@ -591,6 +687,7 @@ const _: () = assert!(disjoint(
         request_kind::LOOKUP,
         request_kind::COMPLETE_PASSWORD_SET,
         request_kind::PING,
+        request_kind::PLAN_OPERATION,
     ]
 ));
 
@@ -693,6 +790,40 @@ pub mod codes {
     /// `ListRequests.scope`: the pending requests the caller may approve and
     /// has not approved.
     pub const LIST_AWAITING_ME: u8 = 0x02;
+
+    /// An effect plan's principal: a user (task MA2, crate::plan).
+    /// Spec: docs/research/r5-a-admin-model.md §3.3; docs/46 §4.
+    pub const PLAN_KIND_USER: u8 = 0x01;
+    /// An effect plan's principal: a computer.
+    pub const PLAN_KIND_COMPUTER: u8 = 0x02;
+    /// An effect plan's principal: a group.
+    pub const PLAN_KIND_GROUP: u8 = 0x03;
+
+    /// Effect tag: `MembershipDelta` (task MA2, crate::plan).
+    /// Spec: docs/research/r5-a-admin-model.md §3.3 (`Effect`).
+    pub const EFFECT_MEMBERSHIP_DELTA: u8 = 0x01;
+    /// Effect tag: `TierDelta`.
+    pub const EFFECT_TIER_DELTA: u8 = 0x02;
+    /// Effect tag: `PolicyReference`.
+    pub const EFFECT_POLICY_REFERENCE: u8 = 0x03;
+    /// Effect tag: `TicketsRevoked`.
+    pub const EFFECT_TICKETS_REVOKED: u8 = 0x04;
+    /// Effect tag: `ProtectedDataLoss`.
+    pub const EFFECT_PROTECTED_DATA_LOSS: u8 = 0x05;
+    /// Effect tag: `KeyDestruction`.
+    pub const EFFECT_KEY_DESTRUCTION: u8 = 0x06;
+
+    /// `PolicyReference`: a tier-map row names the group (its tier
+    /// follows). Spec: docs/47 §6.3; A-36.
+    pub const REFERENCE_TIER_MAP: u8 = 0x01;
+    /// `PolicyReference`: a policy principal (the bootstrap group).
+    /// Spec: A-39 / A-44.
+    pub const REFERENCE_POLICY_PRINCIPAL: u8 = 0x02;
+
+    /// `TicketsRevoked`: a password set (`revoked_before`, A-162).
+    pub const REVOKED_BY_PASSWORD_SET: u8 = 0x01;
+    /// `TicketsRevoked`: the account becomes unusable (D53).
+    pub const REVOKED_ACCOUNT_UNUSABLE: u8 = 0x02;
 }
 
 /// What the client is told about a refused or failed operation (the reason

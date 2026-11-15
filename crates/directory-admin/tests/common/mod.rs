@@ -34,10 +34,10 @@ use ad_schema::flags::user_account_control as uac;
 use ad_schema::{phase1, Phase1Schema};
 use directory_admin::{
     wall_clock, AdminConfig, Applied, DirectoryAdmin, KeyTargets, Operation, PendingRequests,
-    PolicyFile, Prepared, ProposeRequest, Proposed, ProposedOperation, ProtectedObjects,
-    RandomError, RandomSource, Refusal, Request, RequestStep, StepReply, StepRequest, Stepped,
-    VerifiedTicket, CHANGE_SEQ_COUNTER, REQUESTS_PER_REQUESTER, REQUEST_LIFETIME, RID_COUNTER,
-    RID_END_EXCLUSIVE, RID_FIRST,
+    PlanRequest, PolicyFile, Prepared, ProposeRequest, Proposed, ProposedOperation,
+    ProtectedObjects, RandomError, RandomSource, Refusal, Request, RequestStep, StepReply,
+    StepRequest, Stepped, VerifiedTicket, CHANGE_SEQ_COUNTER, REQUESTS_PER_REQUESTER,
+    REQUEST_LIFETIME, RID_COUNTER, RID_END_EXCLUSIVE, RID_FIRST,
 };
 use directory_pip::{DirectoryContext, DirectoryView, NamingContext, TierMap};
 use dirstore::{AttrId, IntegrityKey, NewObject, NodeId, Object, Origin, Store, WriteTxn};
@@ -929,15 +929,77 @@ impl Domain {
     }
 
     /// A direct request by `requester` — its digest the operation's
-    /// [`fingerprint`], the requester's ticket bound to it (R2).
+    /// [`fingerprint`], the requester's ticket bound to it (R2); for an
+    /// operation that requires a plan (task MA2), the `Commit` of the plan
+    /// `requester` gets from [`Domain::plan_operation`] now ([`Domain::committed_plan`]).
     pub fn request(&self, op: Operation, requester: &str) -> Request {
+        let plan = op
+            .requires_plan()
+            .then(|| self.committed_plan(&ProposedOperation::Directory(op.clone()), requester));
+        self.request_with_plan(op, requester, plan)
+    }
+
+    /// A direct request committing to `plan` (task MA2).
+    pub fn request_with_plan(
+        &self,
+        op: Operation,
+        requester: &str,
+        plan: Option<[u8; 32]>,
+    ) -> Request {
         let digest = fingerprint(&op);
         Request {
             operation_id: self.next_id(),
             operation: op,
             operation_digest: digest,
+            plan,
             requester: ticket_bound_to(requester, Some(digest)),
         }
+    }
+
+    /// The loaded policy file of a test that gave one (a policy change's
+    /// plan and proposal are built on it).
+    pub fn file(&self) -> Option<PolicyFile<'_>> {
+        self.policy_file.as_ref().map(|installed| PolicyFile {
+            installed,
+            pending: directory_admin::PendingPolicy::Absent,
+        })
+    }
+
+    /// `PlanOperation` of `operation` by `requester` at [`now`] (task MA2),
+    /// the requester's ticket bound to [`TEST_DIGEST`].
+    pub fn plan_operation(
+        &self,
+        operation: ProposedOperation,
+        requester: &str,
+    ) -> Result<directory_admin::Planned, Refusal> {
+        // Plans are numbered 0: they do not shift the operation numbers the
+        // tests expect of the steps around them.
+        let request = PlanRequest {
+            operation_id: 0,
+            operation,
+            request_digest: TEST_DIGEST,
+            requester: ticket(requester),
+        };
+        let view = self.ctx.view(&self.store, &self.tiers).expect("view");
+        let mut honour = |_: &[pdp::Obligation]| true;
+        self.admin.plan(
+            &self.requests,
+            &request,
+            &view,
+            &self.policy,
+            self.file(),
+            &now(),
+            &mut honour,
+        )
+    }
+
+    /// The plan digest a client commits to for `operation`: the digest of
+    /// [`Domain::plan_operation`]'s plan — or, when planning is refused, a made-up
+    /// digest, so the execution meets the same refusal from its own checks
+    /// (they run before the plan is compared).
+    pub fn committed_plan(&self, operation: &ProposedOperation, requester: &str) -> [u8; 32] {
+        self.plan_operation(operation.clone(), requester)
+            .map_or([0xEE; 32], |planned| planned.digest())
     }
 
     /// `Propose` of `operation` by `requester` at [`now`] (task D2-c): the
@@ -955,12 +1017,16 @@ impl Domain {
             ProposedOperation::Policy(changes) => fingerprint(changes),
             ProposedOperation::Key(op) => fingerprint(op),
         };
+        let plan = operation
+            .requires_plan()
+            .then(|| self.committed_plan(&operation, requester));
         let request = ProposeRequest {
             operation_id: self.next_id(),
             operation,
             operation_digest: digest,
             request_digest: TEST_DIGEST,
             reason_ref: reason_ref.map(str::to_owned),
+            plan,
             requester: ticket(requester),
         };
         self.propose_request(&request)
@@ -1002,11 +1068,16 @@ impl Domain {
         };
         let view = self.ctx.view(&self.store, &self.tiers).expect("view");
         let mut honour = |_: &[pdp::Obligation]| true;
+        let file = self.policy_file.as_ref().map(|installed| PolicyFile {
+            installed,
+            pending: directory_admin::PendingPolicy::Absent,
+        });
         self.admin.step(
             &mut self.requests,
             &request,
             &view,
             &self.policy,
+            file,
             at,
             &mut honour,
         )

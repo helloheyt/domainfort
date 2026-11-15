@@ -74,6 +74,7 @@ fn delete_refused() -> DirAdminEvent {
         operation_digest: [0x9C; 32],
         proposed: None,
         reason_ref: None,
+        plan_digest: None,
     }
 }
 
@@ -148,6 +149,7 @@ fn delete_refused_octets() -> (Vec<u8>, DirAdminAt) {
     let proposed = x.len();
     x.push(0); // proposed absent
     x.push(0); // reason_ref absent
+    x.push(0); // plan_digest absent (task MA2)
     let at = DirAdminAt {
         operation,
         phase,
@@ -415,8 +417,9 @@ fn dir_admin_phase_and_result_tables() {
     // `SelfLockout`, 20 since task F4 appended `ObligationRefused`, A-91,
     // 22 since task A10 appended `OperationMismatch` and
     // `KeyOperationRefused`, Q-421, 25 since task D2-c appended
-    // `ApprovalNotNeeded`, `RequestStale`, `RequesterLimit`, Q-938).
-    for code in [0u8, 26, 0xFF] {
+    // `ApprovalNotNeeded`, `RequestStale`, `RequesterLimit`, Q-938, 29
+    // since task MA2 appended `PlanRequired` .. `PlanTooLarge`, Q-980).
+    for code in [0u8, 30, 0xFF] {
         assert_eq!(
             decode_event(&patched(at.detail, code)),
             codec(ipc::Error::UnknownCode)
@@ -475,13 +478,13 @@ fn dir_admin_phase_and_result_tables() {
 /// docs/50 §3.3: unknown operation and name-kind codes are refused (task
 /// A16 appended `ChangePolicy` = 19 and `PolicyChange` = 7; task D2-c
 /// appended `Propose` .. `ShowRequest` = 20..24 — docs/questions/Q-938 —;
-/// task K6 appended `ChangePassword` = 25 (docs/53 §9) — so the first
-/// unknown codes are 26 and 8).
+/// task K6 appended `ChangePassword` = 25 (docs/53 §9); task MA2 appended
+/// `PlanOperation` = 26 (Q-980) — so the first unknown codes are 27 and 8).
 #[test]
 fn dir_admin_unknown_codes() {
     let (good, at) = delete_refused_octets();
     for (position, codes) in [
-        (at.operation, [0u8, 26, 0xFF]),
+        (at.operation, [0u8, 27, 0xFF]),
         (at.name_kind, [0u8, 8, 0xFF]),
     ] {
         for code in codes {
@@ -796,9 +799,10 @@ fn largest_admin_events_fit() {
     // allocation) + 3 × 17 (GUIDs) + 71 (SID) + 4 + 2 × 70 (approvers) + 7
     // (PDP) + 4 + 4 × 262 (names) + 2 (enable) + 10 (account_expires At) +
     // 2 (group_type) + 9 + 2 + 12 = 1404, + 32 (operation_digest) + 2
-    // (proposed) + 262 (reason_ref) since task D2-c = 1700; Admind 2 + 7 +
-    // 5 + 1 + 16 + 32 (operation_digest, task D2-c) + 12 + 4 = 79.
-    assert_eq!(dir_admin, 1700);
+    // (proposed) + 262 (reason_ref) since task D2-c = 1700, + 33
+    // (plan_digest) since task MA2 = 1733; Admind 2 + 7 + 5 + 1 + 16 + 32
+    // (operation_digest, task D2-c) + 12 + 4 = 79.
+    assert_eq!(dir_admin, 1733);
     assert_eq!(admind, 79);
     assert!(dir_admin <= MAX_EVENT_OCTETS as usize);
 }
@@ -969,11 +973,43 @@ fn d2c_codes_are_appended() {
     assert_eq!(DirAdminOperation::ShowRequest.code(), 24);
     // Task K6 appended `ChangePassword` (docs/53 §9): no earlier code moved.
     assert_eq!(DirAdminOperation::ChangePassword.code(), 25);
-    assert_eq!(DirAdminOperation::ALL.len(), 25);
     assert_eq!(AdminRefusal::ApprovalNotNeeded.code(), 23);
     assert_eq!(AdminRefusal::RequestStale.code(), 24);
     assert_eq!(AdminRefusal::RequesterLimit.code(), 25);
-    assert_eq!(AdminRefusal::ALL.len(), 25);
+}
+
+/// Task MA2 (docs/questions/Q-980): `PlanOperation` and the four plan
+/// refusals are appended — no earlier code moved.
+#[test]
+fn ma2_codes_are_appended() {
+    assert_eq!(DirAdminOperation::ChangePassword.code(), 25);
+    assert_eq!(DirAdminOperation::PlanOperation.code(), 26);
+    assert_eq!(DirAdminOperation::ALL.len(), 26);
+    assert_eq!(AdminRefusal::RequesterLimit.code(), 25);
+    assert_eq!(AdminRefusal::PlanRequired.code(), 26);
+    assert_eq!(AdminRefusal::PlanChanged.code(), 27);
+    assert_eq!(AdminRefusal::PlanNotVisible.code(), 28);
+    assert_eq!(AdminRefusal::PlanTooLarge.code(), 29);
+    assert_eq!(AdminRefusal::ALL.len(), 29);
+}
+
+/// Task MA2 (docs/questions/Q-874 item 7, Q-980): the plan digest is
+/// appended to the `DirAdmin` layout after `reason_ref` — `00` | `01 ‖ 32
+/// octets` — octet for octet; a short digest is refused.
+#[test]
+fn dir_admin_plan_digest_layout() {
+    let (base, at) = delete_refused_octets();
+    let event = DirAdminEvent {
+        plan_digest: Some([0x5A; 32]),
+        ..delete_refused()
+    };
+    let mut expected = base[..at.proposed + 2].to_vec();
+    expected.push(1);
+    expected.extend([0x5A; 32]);
+    let event = EventBody::DirAdmin(Box::new(event));
+    assert_eq!(encode_event(&event).unwrap().as_bytes(), &expected[..]);
+    assert_eq!(decode_event(&expected).unwrap(), event);
+    assert!(decode_event(&expected[..expected.len() - 1]).is_err());
 }
 
 /// Task D2-c (docs/questions/Q-888): the operation digest, `proposed` and
@@ -985,7 +1021,7 @@ fn d2c_codes_are_appended() {
 fn dir_admin_digest_and_request_fields_layout() {
     let (base, at) = delete_refused_octets();
     assert_eq!(&base[at.digest..at.digest + 32], &[0x9C; 32]);
-    assert_eq!(&base[at.proposed..], &[0, 0]);
+    assert_eq!(&base[at.proposed..], &[0, 0, 0]);
     let event = DirAdminEvent {
         operation: DirAdminOperation::Approve,
         pending_request: Some(0x1122_3344_5566_7788),
@@ -1005,14 +1041,15 @@ fn dir_admin_digest_and_request_fields_layout() {
     expected.extend([1, 1]); // reason_ref present, text kept
     expected.extend(8u32.to_be_bytes());
     expected.extend(b"CHG-1182");
+    expected.push(0); // plan_digest absent (task MA2)
     let event = EventBody::DirAdmin(Box::new(event));
     assert_eq!(encode_event(&event).unwrap().as_bytes(), &expected[..]);
     assert_eq!(decode_event(&expected).unwrap(), event);
-    // An unknown `proposed` code (task K6 appended `ChangePassword` = 25,
-    // so 26 is the first unknown one); a digest cut short.
+    // An unknown `proposed` code (task MA2 appended `PlanOperation` = 26,
+    // so 27 is the first unknown one); a digest cut short.
     let mut bad = base.clone();
     bad[at.proposed] = 1;
-    bad.insert(at.proposed + 1, 26);
+    bad.insert(at.proposed + 1, 27);
     assert_eq!(decode_event(&bad), codec(ipc::Error::UnknownCode));
     assert!(decode_event(&base[..at.digest + 31]).is_err());
 }

@@ -31,6 +31,17 @@
 //!    C43), and the request is consumed. Without one ⇒ `ApprovalRequired`.
 //!    There are no approvals inside a request (the field is retired).
 //!
+//! Between steps 6 and 7 — **the effect plan** (task MA2/MA3;
+//! docs/research/r5-a-admin-model.md §3.3; docs/questions/Q-874, Q-980):
+//! an operation that requires a plan (`Operation::requires_plan`) is decided
+//! only with the digest of the plan it commits to (`Request::plan`; absent ⇒
+//! `PlanRequired`). The plan is computed from this very evaluation by
+//! crate::effects over directory-pip's enforcing functions; every principal
+//! it names must be visible to the requester (`PlanNotVisible`); a digest
+//! other than the committed one ⇒ `PlanChanged` — after the approved request
+//! (if any) is consumed, so an approval still allows one execution attempt
+//! (Q-941 item 4). Nothing is written in either case.
+//!
 //! Spec: docs/51 §5.2-§5.7, §7.4, §8, §9, §10, §11; A-72..A-79, A-83..A-85,
 //! P-22; docs/questions/Q-882.
 
@@ -65,6 +76,7 @@ use crate::checks::{
 };
 use crate::config::{AdminConfig, ConfigError, CHANGE_SEQ_COUNTER, RID_COUNTER};
 use crate::descriptor::new_object_sd;
+use crate::effects::BuiltPlan;
 use crate::ids::{ClassIds, Ids};
 use crate::invariants::{End, Invariants, LinkProof};
 use crate::names;
@@ -119,6 +131,13 @@ pub struct Request {
     /// only when the ticket below carries exactly this digest (R2).
     /// Spec: docs/52 §5 items 1, 4; RFC 4120 §5.5.1.
     pub operation_digest: OperationDigest,
+    /// The digest of the effect plan the request commits to — the `plan` of
+    /// its `Commit {plan, operation}` (crate ipc-dird-admin), inside the
+    /// operation digest above. Required exactly for an operation that
+    /// requires a plan (`Operation::requires_plan`); `None` otherwise.
+    /// Spec: docs/research/r5-a-admin-model.md §3.3; docs/questions/Q-874
+    /// items 1-2, Q-980.
+    pub plan: Option<[u8; 32]>,
     /// The requester's verified ticket.
     pub requester: VerifiedTicket,
 }
@@ -483,6 +502,16 @@ impl<R: RandomSource> DirectoryAdmin<R> {
             requester: &requester,
         };
         let handled = self.evaluate(&ctx, base, &request.operation)?;
+        // The effect plan (task MA2; module documentation): recomputed from
+        // this evaluation, compared with the plan the request commits to.
+        let changed = self.committed_plan(
+            &cx,
+            &requester,
+            &request.operation,
+            &handled.plan,
+            request.plan,
+            base,
+        )?;
         // Step 7 — dual control, by the one mechanism (crate::requests).
         if let Dual::Required { action, resource } = &handled.dual {
             let basis = Basis::of_plan(&cx, &handled.plan)?;
@@ -498,7 +527,43 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                 base,
             )?;
         }
+        if changed {
+            return Err(Stop::Refused(AdminRefusal::PlanChanged));
+        }
         Ok((handled.plan, handled.obligations, *requester.sid()))
+    }
+
+    /// The effect plan of a directory operation against the plan the request
+    /// commits to (module documentation): `Ok(true)` when the recomputed plan
+    /// differs (the caller refuses `PlanChanged` once dual control consumed
+    /// its approval); a planned operation without a plan ⇒ `PlanRequired`; a
+    /// plan for an operation that takes none ⇒ `ValueInvalid` (one spelling
+    /// per operation); a principal the requester may not see ⇒
+    /// `PlanNotVisible`. The recomputed digest goes to the event.
+    /// Spec: docs/research/r5-a-admin-model.md §3.3; docs/questions/Q-874
+    /// items 2, 4, 7, Q-980, Q-983.
+    pub(crate) fn committed_plan(
+        &self,
+        cx: &Cx<'_, '_, '_>,
+        requester: &AdminSubject,
+        operation: &Operation,
+        plan: &Plan,
+        committed: Option<[u8; 32]>,
+        base: &mut EventBase,
+    ) -> Result<bool, Stop> {
+        if !operation.requires_plan() {
+            if committed.is_some() {
+                return Err(Stop::Refused(AdminRefusal::ValueInvalid));
+            }
+            return Ok(false);
+        }
+        let Some(committed) = committed else {
+            return Err(Stop::Refused(AdminRefusal::PlanRequired));
+        };
+        let built: BuiltPlan = self.directory_effects(cx, operation, plan)?;
+        base.plan_digest = Some(built.digest);
+        self.plan_visible(cx, requester.subject(), &built.plan)?;
+        Ok(built.digest != committed)
     }
 
     /// The checks of one directory operation for `ctx.requester` against

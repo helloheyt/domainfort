@@ -699,6 +699,76 @@ fn approve_digest(approver: &str, id: u64, digest: [u8; 32]) -> Request {
     by(approver, Operation::Approve { id, digest })
 }
 
+/// The plan digest the samples commit to where dird gives no plan (the plan
+/// refused: the execution then meets the same refusal from its own checks).
+const NO_PLAN: [u8; 32] = [0x5C; 32];
+
+/// Whether `operation` requires an effect plan (crate ipc-dird-admin
+/// `request_kind::PLANNED`; task MA2).
+fn is_planned(operation: &Operation) -> bool {
+    operation
+        .to_wire()
+        .is_ok_and(|w| ipc_dird_admin::channel::request_kind::PLANNED.contains(&w.kind()))
+}
+
+/// Task MA2 (docs/research/r5-a-admin-model.md §3.3): a planned operation
+/// is planned first (`PlanOperation`, by the requester) and travels as the
+/// `Commit` of that plan — what these helpers send for every planned
+/// operation a test names.
+trait Plans {
+    /// The digest of the plan dird gives `requester` for `operation` now.
+    fn plan_of(&mut self, requester: &str, operation: &Operation) -> [u8; 32];
+    /// `operation`, as the `Commit` of its plan when it requires one.
+    fn committed(&mut self, requester: &str, operation: Operation) -> Operation;
+    /// `operation` by `requester` (the `Commit` of its plan when planned).
+    fn run(&mut self, requester: &str, operation: Operation) -> Result<Reply, Unserved>;
+    /// `Propose` of `operation` (the `Commit` of its plan when planned).
+    fn propose(
+        &mut self,
+        requester: &str,
+        operation: Operation,
+        reason_ref: Option<&str>,
+    ) -> Result<Reply, Unserved>;
+}
+
+impl Plans for AdminClient<AdminConnector> {
+    fn plan_of(&mut self, requester: &str, operation: &Operation) -> [u8; 32] {
+        match self.call(&by(
+            requester,
+            Operation::PlanOperation(Box::new(operation.clone())),
+        )) {
+            Ok(Reply::Plan { digest, .. }) => digest,
+            _ => NO_PLAN,
+        }
+    }
+
+    fn committed(&mut self, requester: &str, operation: Operation) -> Operation {
+        if is_planned(&operation) {
+            Operation::Commit {
+                plan: self.plan_of(requester, &operation),
+                operation: Box::new(operation),
+            }
+        } else {
+            operation
+        }
+    }
+
+    fn run(&mut self, requester: &str, operation: Operation) -> Result<Reply, Unserved> {
+        let operation = self.committed(requester, operation);
+        self.call(&by(requester, operation))
+    }
+
+    fn propose(
+        &mut self,
+        requester: &str,
+        operation: Operation,
+        reason_ref: Option<&str>,
+    ) -> Result<Reply, Unserved> {
+        let operation = self.committed(requester, operation);
+        self.call(&propose_op(requester, operation, reason_ref))
+    }
+}
+
 /// The pending request's state of a reply.
 fn pending(reply: Reply) -> ipc_dird_admin::PendingRequestState {
     match reply {
@@ -718,6 +788,8 @@ fn approved(
     approvers: &[&str],
     operation: Operation,
 ) -> Reply {
+    // Task MA2: the `Commit` of the plan is what is proposed and executed.
+    let operation = client.committed(requester, operation);
     let state = match client
         .call(&propose_op(requester, operation.clone(), None))
         .unwrap()
@@ -1659,7 +1731,7 @@ fn every_operation_end_to_end() {
     let seq_before = change_seq_next(&world.store);
     let (carol, carol_sid) = created(
         client
-            .call(&by(
+            .run(
                 "admin1",
                 Operation::CreateUser {
                     parent: g(STAFF_OU),
@@ -1667,7 +1739,7 @@ fn every_operation_end_to_end() {
                     upn: Some("carol@example.org".into()),
                     description: Some("Staff account".into()),
                 },
-            ))
+            )
             .unwrap(),
     );
     assert_eq!(
@@ -1693,7 +1765,7 @@ fn every_operation_end_to_end() {
     // CreateComputer (with its SPN).
     let (ws9, ws9_sid) = created(
         client
-            .call(&by(
+            .run(
                 "admin1",
                 Operation::CreateComputer {
                     parent: g(STAFF_OU),
@@ -1701,7 +1773,7 @@ fn every_operation_end_to_end() {
                     dns_host_name: "ws9.example.org".into(),
                     spn: Some("host/ws9.example.org".into()),
                 },
-            ))
+            )
             .unwrap(),
     );
     assert_eq!(
@@ -1712,14 +1784,14 @@ fn every_operation_end_to_end() {
     // CreateGroup (the default groupType).
     let (team, team_sid) = created(
         client
-            .call(&by(
+            .run(
                 "admin1",
                 Operation::CreateGroup {
                     parent: g(STAFF_OU),
                     sam: "team".into(),
                     group_type: None,
                 },
-            ))
+            )
             .unwrap(),
     );
     assert!(team_sid.is_some());
@@ -1727,25 +1799,25 @@ fn every_operation_end_to_end() {
     // CreateOu and CreateContainer: no SID.
     let (branch, branch_sid) = created(
         client
-            .call(&by(
+            .run(
                 "admin1",
                 Operation::CreateOu {
                     parent: g(ROOT),
                     name: "Branch".into(),
                 },
-            ))
+            )
             .unwrap(),
     );
     assert_eq!(branch_sid, None);
     let (things, things_sid) = created(
         client
-            .call(&by(
+            .run(
                 "admin1",
                 Operation::CreateContainer {
                     parent: branch,
                     name: "Things".into(),
                 },
-            ))
+            )
             .unwrap(),
     );
     assert_eq!(things_sid, None);
@@ -1754,7 +1826,7 @@ fn every_operation_end_to_end() {
     // BeginPasswordSet: a user has one key target, a computer with its SPN
     // two; the salt is the account's ([MS-KILE] 3.1.1.2 via account_salt).
     match client
-        .call(&by("admin1", Operation::BeginPasswordSet { target: carol }))
+        .run("admin1", Operation::BeginPasswordSet { target: carol })
         .unwrap()
     {
         Reply::PasswordSet(set) => {
@@ -1773,7 +1845,7 @@ fn every_operation_end_to_end() {
         other => panic!("{other:?}"),
     }
     match client
-        .call(&by("admin1", Operation::BeginPasswordSet { target: ws9 }))
+        .run("admin1", Operation::BeginPasswordSet { target: ws9 })
         .unwrap()
     {
         Reply::PasswordSet(set) => {
@@ -1787,14 +1859,14 @@ fn every_operation_end_to_end() {
     // CompletePasswordSet: audit only.
     assert_eq!(
         client
-            .call(&by(
+            .run(
                 "admin1",
                 Operation::CompletePasswordSet {
                     target: carol,
                     outcome: PasswordSetOutcome::Completed,
                     kvnos: vec![1],
                 },
-            ))
+            )
             .unwrap(),
         Reply::Done
     );
@@ -1804,25 +1876,25 @@ fn every_operation_end_to_end() {
     // SetEnabled, SetAccountExpires.
     assert_eq!(
         client
-            .call(&by(
+            .run(
                 "admin1",
                 Operation::SetEnabled {
                     target: carol,
                     enabled: true,
                 },
-            ))
+            )
             .unwrap(),
         Reply::Done
     );
     assert_eq!(
         client
-            .call(&by(
+            .run(
                 "admin1",
                 Operation::SetAccountExpires {
                     target: carol,
                     value: AccountExpires::At(134_500_000_000_000_000),
                 },
-            ))
+            )
             .unwrap(),
         Reply::Done
     );
@@ -1838,7 +1910,7 @@ fn every_operation_end_to_end() {
             member: carol,
         },
     ] {
-        assert_eq!(client.call(&by("admin1", operation)).unwrap(), Reply::Done);
+        assert_eq!(client.run("admin1", operation).unwrap(), Reply::Done);
     }
 
     // Lookup by sAMAccountName, SPN and DN; an absent name is NotFound.
@@ -1853,15 +1925,15 @@ fn every_operation_end_to_end() {
     };
     expect_carol(
         client
-            .call(&by(
+            .run(
                 "admin1",
                 Operation::Lookup(LookupKey::SamAccountName("carol".into())),
-            ))
+            )
             .unwrap(),
     );
     expect_carol(
         client
-            .call(&by(
+            .run(
                 "admin1",
                 Operation::Lookup(LookupKey::Dn(vec![
                     "cn=carol".into(),
@@ -1869,16 +1941,16 @@ fn every_operation_end_to_end() {
                     "dc=example".into(),
                     "dc=org".into(),
                 ])),
-            ))
+            )
             .unwrap(),
     );
     match client
-        .call(&by(
+        .run(
             "admin1",
             Operation::Lookup(LookupKey::ServicePrincipalName(
                 "host/ws9.example.org".into(),
             )),
-        ))
+        )
         .unwrap()
     {
         Reply::Found(found) => {
@@ -1889,10 +1961,10 @@ fn every_operation_end_to_end() {
     }
     assert_eq!(
         client
-            .call(&by(
+            .run(
                 "admin1",
                 Operation::Lookup(LookupKey::SamAccountName("nobody".into())),
-            ))
+            )
             .unwrap(),
         Reply::Refused(RefusalStatus::NotFound)
     );
@@ -1900,7 +1972,7 @@ fn every_operation_end_to_end() {
     // Delete.
     assert_eq!(
         client
-            .call(&by("admin1", Operation::Delete { target: things }))
+            .run("admin1", Operation::Delete { target: things })
             .unwrap(),
         Reply::Done
     );
@@ -1985,7 +2057,7 @@ fn no_acknowledgement_means_nothing_is_committed() {
     world.auditd.withhold(true);
     let started = Instant::now();
     let reply = client
-        .call(&by(
+        .run(
             "admin1",
             Operation::CreateUser {
                 parent: g(STAFF_OU),
@@ -1993,7 +2065,7 @@ fn no_acknowledgement_means_nothing_is_committed() {
                 upn: None,
                 description: None,
             },
-        ))
+        )
         .unwrap();
     assert_eq!(reply, Reply::Refused(RefusalStatus::Unavailable));
     assert!(started.elapsed() >= DECISION_ACK_DEADLINE);
@@ -2039,20 +2111,17 @@ fn an_obligation_dird_cannot_honour_is_refused_with_its_own_code() {
     let lookup = || Operation::Lookup(LookupKey::SamAccountName("bob".into()));
     for i in 0..directory_daemon::rate::OBLIGATION_LIMIT {
         assert!(
-            matches!(
-                client.call(&by("admin1", lookup())).unwrap(),
-                Reply::Found(_)
-            ),
+            matches!(client.run("admin1", lookup()).unwrap(), Reply::Found(_)),
             "lookup {i}"
         );
     }
     assert_eq!(
-        client.call(&by("admin1", lookup())).unwrap(),
+        client.run("admin1", lookup()).unwrap(),
         Reply::Refused(RefusalStatus::Denied)
     );
     // Another requester is another rate-limit key.
     assert!(matches!(
-        client.call(&by("admin2", lookup())).unwrap(),
+        client.run("admin2", lookup()).unwrap(),
         Reply::Found(_)
     ));
     let count = usize::try_from(directory_daemon::rate::OBLIGATION_LIMIT).unwrap() + 2;
@@ -2148,13 +2217,13 @@ fn bad_or_expired_tickets_and_keyd_down() {
     world.keyd.take().unwrap().stop().unwrap();
     assert_eq!(
         client
-            .call(&by(
+            .run(
                 "admin1",
                 Operation::CreateOu {
                     parent: g(ROOT),
                     name: "KeydDown".into(),
                 }
-            ))
+            )
             .unwrap(),
         Reply::Refused(RefusalStatus::Unavailable)
     );
@@ -2199,10 +2268,10 @@ fn dual_control() {
         member: g(BOB),
     };
     assert_eq!(
-        client.call(&by("admin1", add())).unwrap(),
+        client.run("admin1", add()).unwrap(),
         Reply::Refused(RefusalStatus::ApprovalRequired)
     );
-    let state = pending(client.call(&propose_op("admin1", add(), None)).unwrap());
+    let state = pending(client.propose("admin1", add(), None).unwrap());
     assert_eq!(
         client
             .call(&approve_digest("admin1", state.id, state.digest))
@@ -2221,7 +2290,7 @@ fn dual_control() {
         seq,
         "approving writes nothing"
     );
-    assert_eq!(client.call(&by("admin1", add())).unwrap(), Reply::Done);
+    assert_eq!(client.run("admin1", add()).unwrap(), Reply::Done);
     assert_eq!(change_seq_next(&world.store), seq + 1);
     let approvals = await_events(&world, DirAdminOperation::Approve, 2);
     assert_eq!(
@@ -2242,7 +2311,16 @@ fn dual_control() {
     assert_eq!(executed.stage, PROCEED);
     assert_eq!(executed.approvers.as_slice(), &[sid_value(&sid_of(ADMIN2))]);
     assert_eq!(executed.pending_request, Some(state.id));
-    assert_eq!(executed.operation_digest, fingerprint(&add()));
+    // Task MA2: the fingerprint is the `Commit` of the plan dird recomputed,
+    // which the event carries (docs/questions/Q-874 item 7).
+    let plan = executed.plan_digest.expect("the plan digest is audited");
+    assert_eq!(
+        executed.operation_digest,
+        fingerprint(&Operation::Commit {
+            plan,
+            operation: Box::new(add()),
+        })
+    );
 }
 
 /// Task D2-c (docs/questions/Q-882 items 1-4, Q-888; r5-a MA5): the request
@@ -2264,20 +2342,15 @@ fn the_request_queue_end_to_end() {
         group: g(TIER0_GROUP),
         member: g(BOB),
     };
-    let digest = fingerprint(&add());
-    let state = pending(
-        client
-            .call(&propose_op("admin1", add(), Some("CHG-1182")))
-            .unwrap(),
-    );
+    // Task MA2: the request is for the `Commit` of the plan admin1 gets.
+    let committed = client.committed("admin1", add());
+    let digest = fingerprint(&committed);
+    let state = pending(client.propose("admin1", add(), Some("CHG-1182")).unwrap());
     assert_eq!(state.digest, digest);
     assert_eq!(state.state, RequestState::Pending);
     assert_eq!((state.approvals, state.quorum), (0, 2));
     let listed = match client
-        .call(&by(
-            "admin2",
-            Operation::ListRequests(ListScope::AwaitingMe),
-        ))
+        .run("admin2", Operation::ListRequests(ListScope::AwaitingMe))
         .unwrap()
     {
         Reply::RequestList(entries) => entries,
@@ -2291,14 +2364,22 @@ fn the_request_queue_end_to_end() {
         ipc_dird_admin::channel::request_kind::ADD_MEMBER
     );
     let shown = match client
-        .call(&by("admin2", Operation::ShowRequest { id: state.id }))
+        .run("admin2", Operation::ShowRequest { id: state.id })
         .unwrap()
     {
         Reply::RequestShown(shown) => shown,
         other => panic!("{other:?}"),
     };
-    assert_eq!(shown.operation, add());
+    // The operation as dird holds it — the `Commit` of its plan — and the
+    // plan itself, from dird's own bytes: bob enters Tier 0 (task MA2).
+    assert_eq!(shown.operation, committed);
     assert_eq!(shown.digest, digest);
+    let plan = shown.plan.as_ref().expect("the plan is shown");
+    assert!(plan.effects().iter().any(|e| matches!(
+        e,
+        ipc_dird_admin::Effect::TierDelta { subject, principals, .. }
+            if subject.1 == ipc_dird_admin::PlanTier::Tier0 && principals.contains(&sid_of(BOB))
+    )));
     assert_eq!(shown.requester, sid_of(ADMIN1));
     assert_eq!(shown.reason_ref.as_deref(), Some("CHG-1182"));
     assert_eq!(shown.facts.len(), 2);
@@ -2308,7 +2389,7 @@ fn the_request_queue_end_to_end() {
     // bob may not see it: told as for an unknown id.
     assert_eq!(
         client
-            .call(&by("bob", Operation::ShowRequest { id: state.id }))
+            .run("bob", Operation::ShowRequest { id: state.id })
             .unwrap(),
         Reply::Refused(RefusalStatus::NotFound)
     );
@@ -2317,21 +2398,17 @@ fn the_request_queue_end_to_end() {
             .call(&approve_digest("admin2", state.id, state.digest))
             .unwrap(),
     );
-    assert_eq!(client.call(&by("admin1", add())).unwrap(), Reply::Done);
+    assert_eq!(client.run("admin1", add()).unwrap(), Reply::Done);
 
     // Withdrawn, then rejected: gone.
     let other = Operation::AddMember {
         group: g(TIER0_GROUP),
         member: g(STAFF_GROUP),
     };
-    let second = pending(
-        client
-            .call(&propose_op("admin1", other.clone(), None))
-            .unwrap(),
-    );
+    let second = pending(client.propose("admin1", other.clone(), None).unwrap());
     assert_eq!(
         client
-            .call(&by("admin1", Operation::Withdraw { id: second.id }))
+            .run("admin1", Operation::Withdraw { id: second.id })
             .unwrap(),
         Reply::Done
     );
@@ -2341,16 +2418,16 @@ fn the_request_queue_end_to_end() {
             .unwrap(),
         Reply::Refused(RefusalStatus::NotFound)
     );
-    let third = pending(client.call(&propose_op("admin1", other, None)).unwrap());
+    let third = pending(client.propose("admin1", other, None).unwrap());
     assert_eq!(
         client
-            .call(&by(
+            .run(
                 "admin2",
                 Operation::Reject {
                     id: third.id,
                     digest: third.digest,
                 }
-            ))
+            )
             .unwrap(),
         Reply::Done
     );
@@ -2383,6 +2460,64 @@ fn the_request_queue_end_to_end() {
     assert_eq!(rejected[0].pending_request, Some(third.id));
 }
 
+/// Plan → Commit over the socket (task MA2; docs/research/
+/// r5-a-admin-model.md §3.3; docs/questions/Q-874 items 1-2, 7): admin1
+/// plans disabling bob (`Plan {plan, digest}` — his tickets end); the commit
+/// of that plan runs, and its events carry the plan digest the
+/// `PlanOperation` event recorded; committing the same plan again — bob is
+/// already disabled, so the recomputed plan revokes nothing — is refused
+/// `Conflict` (recorded `PlanChanged`) and writes nothing.
+#[test]
+fn a_commit_of_a_stale_plan_is_refused_over_the_socket() {
+    let Some(world) = World::new(Options::default()) else {
+        return;
+    };
+    let mut client = world.client();
+    let disable = || Operation::SetEnabled {
+        target: g(BOB),
+        enabled: false,
+    };
+    let planned = client
+        .call(&by("admin1", Operation::PlanOperation(Box::new(disable()))))
+        .unwrap();
+    let (plan, digest) = match planned {
+        Reply::Plan { plan, digest } => (plan, digest),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        plan.effects(),
+        &[ipc_dird_admin::Effect::TicketsRevoked {
+            kind: ipc_dird_admin::RevocationKind::AccountUnusable,
+            principals: std::collections::BTreeSet::from([sid_of(BOB)]),
+        }]
+    );
+    assert_eq!(plan.principal(&sid_of(BOB)).unwrap().name, "bob");
+    let commit = || Operation::Commit {
+        plan: digest,
+        operation: Box::new(disable()),
+    };
+    assert_eq!(client.call(&by("admin1", commit())).unwrap(), Reply::Done);
+    let seq = change_seq_next(&world.store);
+    assert_eq!(
+        client.call(&by("admin1", commit())).unwrap(),
+        Reply::Refused(RefusalStatus::Conflict)
+    );
+    assert_eq!(change_seq_next(&world.store), seq, "nothing written");
+    let plans = await_events(&world, DirAdminOperation::PlanOperation, 1);
+    assert_eq!(plans[0].plan_digest, Some(digest));
+    assert_eq!(plans[0].stage, PROCEED);
+    let executed = await_events(&world, DirAdminOperation::SetEnabled, 3);
+    assert_eq!(executed[0].stage, PROCEED);
+    assert_eq!(executed[0].plan_digest, Some(digest));
+    assert!(is_committed(&executed[1]));
+    assert_eq!(executed[1].plan_digest, Some(digest));
+    assert_eq!(
+        executed[2].stage,
+        refused(ipc_audit::AdminRefusal::PlanChanged)
+    );
+    assert_ne!(executed[2].plan_digest, Some(digest));
+}
+
 /// Class C43 (docs/questions/Q-882 item 2) over the socket: the target of
 /// an approved request changes before its execution (bob is disabled — a
 /// write that needs no approver) — the execution is refused `Conflict`
@@ -2397,7 +2532,7 @@ fn a_target_changed_after_the_approval_is_refused() {
         group: g(TIER0_GROUP),
         member: g(BOB),
     };
-    let state = pending(client.call(&propose_op("admin1", add(), None)).unwrap());
+    let state = pending(client.propose("admin1", add(), None).unwrap());
     pending(
         client
             .call(&approve_digest("admin2", state.id, state.digest))
@@ -2405,24 +2540,24 @@ fn a_target_changed_after_the_approval_is_refused() {
     );
     assert_eq!(
         client
-            .call(&by(
+            .run(
                 "admin1",
                 Operation::SetEnabled {
                     target: g(BOB),
                     enabled: false,
                 }
-            ))
+            )
             .unwrap(),
         Reply::Done
     );
     let seq = change_seq_next(&world.store);
     assert_eq!(
-        client.call(&by("admin1", add())).unwrap(),
+        client.run("admin1", add()).unwrap(),
         Reply::Refused(RefusalStatus::Conflict)
     );
     assert_eq!(change_seq_next(&world.store), seq);
     assert_eq!(
-        client.call(&by("admin1", add())).unwrap(),
+        client.run("admin1", add()).unwrap(),
         Reply::Refused(RefusalStatus::ApprovalRequired)
     );
     let events = await_events(&world, DirAdminOperation::AddMember, 2);
@@ -2446,6 +2581,12 @@ fn the_old_in_request_approvals_form_is_refused() {
     let add = Operation::AddMember {
         group: g(TIER0_GROUP),
         member: g(BOB),
+    };
+    // Task MA2: the planned operation travels as a `Commit` (its plan does
+    // not matter here: the frame is refused before anything is decided).
+    let add = Operation::Commit {
+        plan: NO_PLAN,
+        operation: Box::new(add),
     };
     let good = ipc::encode_frame(
         ipc_dird_admin::ADMIN_CHANNEL,
@@ -2520,7 +2661,10 @@ fn an_ap_req_attached_to_another_operation_is_denied() {
         client
             .call(&attach(
                 ap_req.clone(),
-                &Operation::Delete { target: g(BOB) }
+                &Operation::Commit {
+                    plan: NO_PLAN,
+                    operation: Box::new(Operation::Delete { target: g(BOB) }),
+                }
             ))
             .unwrap(),
         Reply::Refused(RefusalStatus::Denied)
@@ -2573,7 +2717,7 @@ fn an_approval_bound_to_another_operation_is_refused() {
         group: g(TIER0_GROUP),
         member: g(member),
     };
-    let state = pending(client.call(&propose_op("admin1", add(BOB), None)).unwrap());
+    let state = pending(client.propose("admin1", add(BOB), None).unwrap());
     let approve = Operation::Approve {
         id: state.id,
         digest: state.digest,
@@ -2595,11 +2739,11 @@ fn an_approval_bound_to_another_operation_is_refused() {
         );
     }
     assert_eq!(
-        client.call(&by("admin1", add(BOB))).unwrap(),
+        client.run("admin1", add(BOB)).unwrap(),
         Reply::Refused(RefusalStatus::ApprovalRequired)
     );
-    pending(client.call(&by("admin2", approve)).unwrap());
-    assert_eq!(client.call(&by("admin1", add(BOB))).unwrap(), Reply::Done);
+    pending(client.run("admin2", approve).unwrap());
+    assert_eq!(client.run("admin1", add(BOB)).unwrap(), Reply::Done);
     let approvals = await_events(&world, DirAdminOperation::Approve, 3);
     for event in &approvals[..2] {
         assert_eq!(
@@ -2690,13 +2834,13 @@ fn a_full_queue_answers_busy() {
     std::thread::sleep(Duration::from_millis(300));
     let mut third = world.client();
     assert_eq!(
-        third.call(&by(
+        third.run(
             "admin1",
             Operation::CreateOu {
                 parent: g(ROOT),
                 name: "Third".into(),
             },
-        )),
+        ),
         Err(Unserved::Refused(Refused::Busy))
     );
     assert_eq!(
@@ -2742,15 +2886,59 @@ fn without_the_admin_service_object_dird_serves_on() {
 
 use ipc_dird_admin::{KeyOperation, KeyRef, ListScope, RequestState};
 
-/// The fingerprint of a proposed key operation (Q-888).
+/// The effect plan dird computes for a key operation on this fixture (task
+/// MA2; docs/research/r5-a-admin-model.md §3.3 `KeyDestruction`): a
+/// rotation keeps every key version — the empty plan; a `RetireKvno`
+/// destroys that version of its key set's account (the fixture's krbtgt or
+/// service object, by SID and sAMAccountName).
+fn key_plan(operation: KeyOperation) -> ipc_dird_admin::EffectPlan {
+    use ipc_dird_admin::{Effect, EffectPlan, PlanPrincipal, PlanPrincipalKind};
+    let KeyOperation::RetireKvno { key, kvno } = operation else {
+        return EffectPlan::empty();
+    };
+    let (id, kind, name) = match key {
+        KeyRef::Krbtgt => (KRBTGT, PlanPrincipalKind::User, "krbtgt"),
+        KeyRef::Service(guid) if guid == g(LDAP_SVC) => {
+            (LDAP_SVC, PlanPrincipalKind::Computer, "ldap-svc$")
+        }
+        KeyRef::Service(guid) if guid == g(ADMIND_SVC) => {
+            (ADMIND_SVC, PlanPrincipalKind::Computer, "admind-svc$")
+        }
+        KeyRef::Service(_) => return EffectPlan::empty(),
+    };
+    EffectPlan::new(
+        [PlanPrincipal {
+            sid: sid_of(id),
+            guid: g(id),
+            kind,
+            name: name.into(),
+        }],
+        [Effect::KeyDestruction {
+            kvno: Some(kvno),
+            principals: std::collections::BTreeSet::from([sid_of(id)]),
+        }],
+    )
+    .unwrap()
+}
+
+/// A key operation as proposed: the `Commit` of its plan (task MA2).
+fn key_committed(operation: KeyOperation) -> Operation {
+    Operation::Commit {
+        plan: key_plan(operation).digest().unwrap(),
+        operation: Box::new(Operation::KeyOperation(operation)),
+    }
+}
+
+/// The fingerprint of a proposed key operation (Q-888): the digest of the
+/// `Commit` of its plan (task MA2).
 fn key_digest(operation: KeyOperation) -> [u8; 32] {
-    fingerprint(&Operation::KeyOperation(operation))
+    fingerprint(&key_committed(operation))
 }
 
 /// `Propose` of a key operation by `requester` (task D2-c: the key-only
-/// `RequestKeyOperation` is retired).
+/// `RequestKeyOperation` is retired; task MA2: as the `Commit` of its plan).
 fn request_op(requester: &str, operation: KeyOperation) -> Request {
-    propose_op(requester, Operation::KeyOperation(operation), None)
+    propose_op(requester, key_committed(operation), None)
 }
 
 /// `Approve` by `approver` of the request `id`, naming the digest of
@@ -3085,10 +3273,7 @@ fn shown_state(
     viewer: &str,
     id: u64,
 ) -> Option<RequestState> {
-    match client
-        .call(&by(viewer, Operation::ShowRequest { id }))
-        .unwrap()
-    {
+    match client.run(viewer, Operation::ShowRequest { id }).unwrap() {
         Reply::RequestShown(shown) => Some(shown.state),
         Reply::Refused(RefusalStatus::NotFound) => None,
         other => panic!("{other:?}"),
@@ -3122,7 +3307,7 @@ fn withdrawing_or_rejecting_an_approved_key_request_revokes_its_decision() {
     assert_eq!(approved.state, RequestState::Approved);
     assert_eq!(
         client
-            .call(&by("admin1", Operation::Withdraw { id: first.id }))
+            .run("admin1", Operation::Withdraw { id: first.id })
             .unwrap(),
         Reply::Done
     );
@@ -3143,13 +3328,13 @@ fn withdrawing_or_rejecting_an_approved_key_request_revokes_its_decision() {
     );
     assert_eq!(
         client
-            .call(&by(
+            .run(
                 "admin2",
                 Operation::Reject {
                     id: second.id,
                     digest: second.digest,
                 }
-            ))
+            )
             .unwrap(),
         Reply::Done
     );
@@ -3171,7 +3356,7 @@ fn withdrawing_or_rejecting_an_approved_key_request_revokes_its_decision() {
     );
     assert_eq!(
         client
-            .call(&by("admin1", Operation::Withdraw { id: third.id }))
+            .run("admin1", Operation::Withdraw { id: third.id })
             .unwrap(),
         Reply::Refused(RefusalStatus::Conflict)
     );
@@ -3245,7 +3430,7 @@ fn a_revocation_keyd_does_not_answer_keeps_the_request() {
     for _ in 0..2 {
         assert_eq!(
             client
-                .call(&by("admin1", Operation::Withdraw { id: state.id }))
+                .run("admin1", Operation::Withdraw { id: state.id })
                 .unwrap(),
             Reply::Refused(RefusalStatus::Unavailable)
         );
@@ -3315,7 +3500,7 @@ fn an_unknown_registration_is_revoked_or_kept_approved() {
             );
             assert_eq!(
                 client
-                    .call(&by("admin1", Operation::Withdraw { id: state.id }))
+                    .run("admin1", Operation::Withdraw { id: state.id })
                     .unwrap(),
                 Reply::Refused(RefusalStatus::Unavailable)
             );
@@ -3626,10 +3811,7 @@ fn a_delete_registers_a_destroy_decision_for_the_tombstone() {
     // bob gets a key set first: dird's SetSecret decision, admind's
     // set_secret with exactly its binding and salt.
     let Reply::PasswordSet(set) = client
-        .call(&by(
-            "admin1",
-            Operation::BeginPasswordSet { target: g(BOB) },
-        ))
+        .run("admin1", Operation::BeginPasswordSet { target: g(BOB) })
         .unwrap()
     else {
         panic!("a PasswordSet reply");
@@ -3646,18 +3828,18 @@ fn a_delete_registers_a_destroy_decision_for_the_tombstone() {
     );
     assert_eq!(
         client
-            .call(&by("admin1", Operation::Delete { target: g(BOB) }))
+            .run("admin1", Operation::Delete { target: g(BOB) })
             .unwrap(),
         Reply::Done
     );
     assert_eq!(
         client
-            .call(&by(
+            .run(
                 "admin1",
                 Operation::Delete {
                     target: g(STAFF_GROUP)
                 }
-            ))
+            )
             .unwrap(),
         Reply::Done
     );
@@ -3766,10 +3948,7 @@ fn begin_password_set_registers_the_decision_for_its_key_targets() {
     };
     let mut client = world.client();
     let Reply::PasswordSet(set) = client
-        .call(&by(
-            "admin1",
-            Operation::BeginPasswordSet { target: g(BOB) },
-        ))
+        .run("admin1", Operation::BeginPasswordSet { target: g(BOB) })
         .unwrap()
     else {
         panic!("a PasswordSet reply");
@@ -3816,10 +3995,7 @@ fn begin_password_set_registers_the_decision_for_its_key_targets() {
         Ok(Err(keyd::Error::Denied))
     );
     let Reply::PasswordSet(set) = client
-        .call(&by(
-            "admin1",
-            Operation::BeginPasswordSet { target: g(BOB) },
-        ))
+        .run("admin1", Operation::BeginPasswordSet { target: g(BOB) })
         .unwrap()
     else {
         panic!("a PasswordSet reply");
@@ -3852,10 +4028,7 @@ fn a_secret_decision_keyd_does_not_register_answers_unavailable() {
     let seq_before = change_seq_next(&world.store);
     assert_eq!(
         client
-            .call(&by(
-                "admin1",
-                Operation::BeginPasswordSet { target: g(BOB) },
-            ))
+            .run("admin1", Operation::BeginPasswordSet { target: g(BOB) },)
             .unwrap(),
         Reply::Refused(RefusalStatus::Unavailable)
     );
@@ -3941,7 +4114,7 @@ fn lost_destroy_decisions_are_registered_again_until_keyd_ran_them() {
     // SetSecret decision.
     let (ws7, _) = created(
         client
-            .call(&by(
+            .run(
                 "admin1",
                 Operation::CreateComputer {
                     parent: g(STAFF_OU),
@@ -3949,11 +4122,11 @@ fn lost_destroy_decisions_are_registered_again_until_keyd_ran_them() {
                     dns_host_name: "ws7.example.org".into(),
                     spn: Some("host/ws7.example.org".into()),
                 },
-            ))
+            )
             .unwrap(),
     );
     let Reply::PasswordSet(set) = client
-        .call(&by("admin1", Operation::BeginPasswordSet { target: ws7 }))
+        .run("admin1", Operation::BeginPasswordSet { target: ws7 })
         .unwrap()
     else {
         panic!("a PasswordSet reply");
@@ -3980,7 +4153,7 @@ fn lost_destroy_decisions_are_registered_again_until_keyd_ran_them() {
     // The Delete registers the destroy decision under the tombstone's id.
     assert_eq!(
         client
-            .call(&by("admin1", Operation::Delete { target: ws7 }))
+            .run("admin1", Operation::Delete { target: ws7 })
             .unwrap(),
         Reply::Done
     );
@@ -4060,10 +4233,7 @@ fn lost_destroy_decisions_are_registered_again_until_keyd_ran_them() {
 fn give_bob_a_key_set(world: &World) {
     let Reply::PasswordSet(set) = world
         .client()
-        .call(&by(
-            "admin1",
-            Operation::BeginPasswordSet { target: g(BOB) },
-        ))
+        .run("admin1", Operation::BeginPasswordSet { target: g(BOB) })
         .unwrap()
     else {
         panic!("a PasswordSet reply");
@@ -4113,7 +4283,7 @@ fn a_destroy_decision_not_registered_at_the_delete_is_registered_at_start() {
     assert_eq!(
         world
             .client()
-            .call(&by("admin1", Operation::Delete { target: g(BOB) }))
+            .run("admin1", Operation::Delete { target: g(BOB) })
             .unwrap(),
         Reply::Done
     );
@@ -4147,7 +4317,7 @@ fn after_the_sweep_a_dird_restart_schedules_no_destroy() {
     assert_eq!(
         world
             .client()
-            .call(&by("admin1", Operation::Delete { target: g(BOB) }))
+            .run("admin1", Operation::Delete { target: g(BOB) })
             .unwrap(),
         Reply::Done
     );
@@ -4195,10 +4365,7 @@ fn a_password_set_begun_before_the_delete_creates_no_key_set() {
     };
     let Reply::PasswordSet(set) = world
         .client()
-        .call(&by(
-            "admin1",
-            Operation::BeginPasswordSet { target: g(BOB) },
-        ))
+        .run("admin1", Operation::BeginPasswordSet { target: g(BOB) })
         .unwrap()
     else {
         panic!("a PasswordSet reply");
@@ -4206,7 +4373,7 @@ fn a_password_set_begun_before_the_delete_creates_no_key_set() {
     assert_eq!(
         world
             .client()
-            .call(&by("admin1", Operation::Delete { target: g(BOB) }))
+            .run("admin1", Operation::Delete { target: g(BOB) })
             .unwrap(),
         Reply::Done
     );
@@ -4334,7 +4501,10 @@ fn a_dual_controlled_policy_change_is_written_as_policy_next() {
     assert!(events[0].pending_request.is_some());
     assert_eq!(
         events[0].operation_digest,
-        fingerprint(&staff_group_tier1())
+        fingerprint(&Operation::Commit {
+            plan: events[0].plan_digest.expect("the plan digest is audited"),
+            operation: Box::new(staff_group_tier1()),
+        })
     );
     let change = format!(
         "--add-principal {} Tier1",
@@ -4368,14 +4538,10 @@ fn a_policy_change_needs_two_tier0_administrators_and_one_at_a_time() {
     let mut client = world.client();
     let next = policy_next_path(&world.scratch);
     assert_eq!(
-        client.call(&by("admin1", staff_group_tier1())).unwrap(),
+        client.run("admin1", staff_group_tier1()).unwrap(),
         Reply::Refused(RefusalStatus::ApprovalRequired)
     );
-    let state = pending(
-        client
-            .call(&propose_op("admin1", staff_group_tier1(), None))
-            .unwrap(),
-    );
+    let state = pending(client.propose("admin1", staff_group_tier1(), None).unwrap());
     assert_eq!(
         client
             .call(&approve_digest("admin1", state.id, state.digest))
@@ -4383,9 +4549,7 @@ fn a_policy_change_needs_two_tier0_administrators_and_one_at_a_time() {
         Reply::Refused(RefusalStatus::Denied)
     );
     assert_eq!(
-        client
-            .call(&propose_op("bob", staff_group_tier1(), None))
-            .unwrap(),
+        client.propose("bob", staff_group_tier1(), None).unwrap(),
         Reply::Refused(RefusalStatus::Denied)
     );
     // admin2's approval made for another change (R2): keyd refuses it.
@@ -4407,7 +4571,7 @@ fn a_policy_change_needs_two_tier0_administrators_and_one_at_a_time() {
         Reply::Refused(RefusalStatus::Denied)
     );
     assert_eq!(
-        client.call(&by("admin1", staff_group_tier1())).unwrap(),
+        client.run("admin1", staff_group_tier1()).unwrap(),
         Reply::Refused(RefusalStatus::ApprovalRequired)
     );
     assert!(!next.exists(), "nothing written");
@@ -4419,9 +4583,7 @@ fn a_policy_change_needs_two_tier0_administrators_and_one_at_a_time() {
     );
     let written = std::fs::read(&next).unwrap();
     assert_eq!(
-        client
-            .call(&propose_op("admin2", staff_group_tier1(), None))
-            .unwrap(),
+        client.propose("admin2", staff_group_tier1(), None).unwrap(),
         Reply::Refused(RefusalStatus::Unavailable)
     );
     assert_eq!(std::fs::read(&next).unwrap(), written, "left as it was");
@@ -4476,7 +4638,7 @@ fn without_policy_next_path_a_policy_change_is_unavailable() {
         Reply::Refused(RefusalStatus::Unavailable)
     );
     assert_eq!(
-        client.call(&by("admin1", staff_group_tier1())).unwrap(),
+        client.run("admin1", staff_group_tier1()).unwrap(),
         Reply::Refused(RefusalStatus::Unavailable)
     );
     let events = await_events(&world, DirAdminOperation::Propose, 1);

@@ -152,6 +152,20 @@
 //! "The policy change" below): `prepare` / `prepare_policy_change` consume
 //! it, after confirming its basis and its approvers against the view.
 //!
+//! # Plan → Commit (tasks MA2 + MA3; docs/research/r5-a-admin-model.md §3.3)
+//!
+//! A `PlanOperation` of a planned operation (crate ipc-dird-admin
+//! `request_kind::PLANNED`): `now`; one audit slot; the requester's AP-REQ
+//! bound to the `PlanOperation`; one view (nothing is written — no
+//! `WriteTxn`); `DirectoryAdmin::plan` — the operation's every check as a
+//! dry run, then its effect plan, every principal visible to the requester;
+//! the decision event committed before the reply `Plan {plan, digest}`.
+//! Nothing is held: a `Commit {plan, operation}` is decided exactly as the
+//! operation was before (steps 0-9 above, "The policy change" below, or
+//! inside a `Propose`), with the committed plan digest — the PEP recomputes
+//! the plan and refuses any difference (`PlanChanged`, wire `Conflict`). A
+//! planned operation has no other frame (docs/questions/Q-980, Q-982).
+//!
 //! # The policy change (task A16; docs/51 §5.10, R51-21; A-80)
 //!
 //! `ChangePolicy` — a tier-map edit, executed by its requester once a
@@ -199,8 +213,8 @@
 //! Q-388; A-88 (Q-366, Q-395); A-91 (Q-397); docs/11 §2, §8.
 
 use crate::admin_service::{
-    pep_operation, policy_change_of, proposal_of, step_of, wire_reply, wire_request_view,
-    wire_status, wire_step_reply, RegistrationFailure, TicketVerifier,
+    committed_proposal, pep_operation, policy_change_of, proposal_of, step_of, wire_reply,
+    wire_request_view, wire_status, wire_step_reply, RegistrationFailure, TicketVerifier,
     MAX_DESTROY_RECONCILE_INTERVAL, MIN_DESTROY_RECONCILE_INTERVAL,
 };
 use crate::clock::SharedClock;
@@ -215,9 +229,10 @@ use crate::reconcile::Reconciler;
 use crate::registration::DecisionRegistration;
 use core::time::Duration;
 use directory_admin::{
-    DirectoryAdmin, KeyDecision, Operation as PepOperation, OsRandom, PendingRequests, PolicyFile,
-    Prepared, ProposeRequest, ProposedOperation, RegistrationOutcome, Request as PepRequest,
-    RequestStep, RevocationFailure, StepRequest, Stepped, VerificationFailure, VerifiedTicket,
+    DirectoryAdmin, KeyDecision, Operation as PepOperation, OsRandom, PendingPolicy,
+    PendingRequests, PlanRequest, PolicyFile, Prepared, ProposeRequest, ProposedOperation,
+    RegistrationOutcome, Request as PepRequest, RequestStep, RevocationFailure, StepRequest,
+    Stepped, VerificationFailure, VerifiedTicket,
 };
 use directory_admin::{PolicyCandidate, PolicyChangeRequest};
 use directory_pip::{DirectoryContext, TierMap};
@@ -493,16 +508,26 @@ impl Running {
                 {
                     return self.handle_propose(auth, proposed, reason_ref.as_deref(), &digest);
                 }
+                if let Operation::PlanOperation(planned) = operation {
+                    return self.handle_plan(auth, planned, &digest);
+                }
                 if let Some(step) = step_of(operation) {
                     return self.handle_step(auth, step, &digest);
                 }
+                // A `Commit`: the planned operation, and the digest of the
+                // plan it commits to (task MA2).
+                let (operation, plan) = match operation {
+                    Operation::Commit { plan, operation } => (&**operation, Some(*plan)),
+                    other => (other, None),
+                };
                 if let Some(changes) = policy_change_of(operation) {
-                    return self.handle_policy(auth, &changes, &digest);
+                    return self.handle_policy(auth, &changes, plan, &digest);
                 }
                 match pep_operation(operation) {
-                    Some(operation) => self.handle_directory(auth, operation, &digest),
+                    Some(operation) => self.handle_directory(auth, operation, plan, &digest),
                     // Cannot happen: a key operation never decodes on its
-                    // own (the codec), every other operation maps.
+                    // own, nor as a top-level `Commit` (the codec); every
+                    // other operation maps.
                     None => Reply::Refused(RefusalStatus::Unavailable),
                 }
             }
@@ -524,8 +549,8 @@ impl Running {
         };
         // The fingerprint: the proposed operation's own digest (Q-888); and
         // the PEP's form of it. Neither can fail for a decoded `Propose`.
-        let (Ok(fingerprint), Some(operation)) =
-            (operation_digest(proposed), proposal_of(proposed))
+        let (Ok(fingerprint), Some((operation, plan))) =
+            (operation_digest(proposed), committed_proposal(proposed))
         else {
             return Reply::Refused(RefusalStatus::Unavailable);
         };
@@ -585,6 +610,7 @@ impl Running {
             operation_digest: fingerprint,
             request_digest: *request_digest,
             reason_ref: reason_ref.map(str::to_owned),
+            plan,
             requester,
         };
 
@@ -635,6 +661,109 @@ impl Running {
                 Some(_) => wire_request_view(proposed.reply()),
                 None => {
                     self.worker.requests.discard(proposed.id());
+                    OUTCOME_UNRECORDED.hit(None);
+                    Reply::Refused(RefusalStatus::Unavailable)
+                }
+            },
+        }
+    }
+
+    /// One `PlanOperation` (module documentation, "Plan → Commit").
+    /// Spec: docs/research/r5-a-admin-model.md §3.3; docs/questions/Q-874
+    /// items 1, 4-6, Q-980; docs/51 §7.4; A-85; docs/11 §2.
+    fn handle_plan(
+        &mut self,
+        auth: &Auth,
+        planned: &Operation,
+        request_digest: &OperationDigest,
+    ) -> Reply {
+        let Some(now) = self.worker.clock.now() else {
+            return Reply::Refused(RefusalStatus::Unavailable);
+        };
+        // The PEP's form of the planned operation (cannot fail for a
+        // decoded `PlanOperation`: its operation is one of PLANNED).
+        let Some(operation) = proposal_of(planned) else {
+            return Reply::Refused(RefusalStatus::Unavailable);
+        };
+        // Step 0: the audit slot, before anything is done.
+        let Some(slots) = self.worker.gate.admit_slots(1) else {
+            AUDIT_UNAVAILABLE.hit(None);
+            return Reply::Refused(RefusalStatus::Unavailable);
+        };
+        let first = slots.into_iter().next();
+        let operation_id = self.next_id();
+
+        // Step 1: the requester's AP-REQ, bound to this `PlanOperation`.
+        let requester = match self.verify_one(&auth.requester, request_digest) {
+            Ok(ticket) => ticket,
+            Err(failure) => {
+                let refusal = self.worker.admin.refuse_unverified_proposal(
+                    operation_id,
+                    &operation,
+                    request_digest,
+                    None,
+                    failure,
+                    &now,
+                );
+                return self.refuse(first, None, refusal.event(), wire_status(refusal.status()));
+            }
+        };
+        let request = PlanRequest {
+            operation_id,
+            operation,
+            request_digest: *request_digest,
+            requester,
+        };
+
+        // Steps 2-3: one view (nothing is written), then the plan. A policy
+        // change's plan is built from the loaded policy's one edit.
+        let store = Arc::clone(&self.worker.store);
+        let planned = {
+            let Running { worker, rate, .. } = self;
+            match worker.ctx.view(&store, &worker.tiers) {
+                Ok(view) => {
+                    let mut honour = |obligations: &[Obligation]| {
+                        honour_obligations(rate, obligations, false, &now)
+                    };
+                    let policy_file = worker.policy_next.as_ref().map(|_| PolicyFile {
+                        installed: &worker.installed,
+                        pending: PendingPolicy::Absent,
+                    });
+                    Some(worker.admin.plan(
+                        &worker.requests,
+                        &request,
+                        &view,
+                        &worker.policy,
+                        policy_file,
+                        &now,
+                        &mut honour,
+                    ))
+                }
+                Err(_) => None,
+            }
+        };
+        match planned {
+            None => {
+                let refusal = self.worker.admin.refuse_failed_proposal(
+                    operation_id,
+                    &request.operation,
+                    request_digest,
+                    None,
+                    AdminFailure::ViewUnavailable,
+                    &now,
+                );
+                self.refuse(first, None, refusal.event(), RefusalStatus::Unavailable)
+            }
+            Some(Err(refusal)) => {
+                self.refuse(first, None, refusal.event(), wire_status(refusal.status()))
+            }
+            // Step 4: the event, then the reply.
+            Some(Ok(planned)) => match self.commit(first, planned.event()) {
+                Some(_) => Reply::Plan {
+                    plan: planned.plan().clone(),
+                    digest: planned.digest(),
+                },
+                None => {
                     OUTCOME_UNRECORDED.hit(None);
                     Reply::Refused(RefusalStatus::Unavailable)
                 }
@@ -698,11 +827,20 @@ impl Running {
                     let mut honour = |obligations: &[Obligation]| {
                         honour_obligations(rate, obligations, false, &now)
                     };
+                    // A policy request's plan is recomputed at every
+                    // `Approve` from the loaded policy (task MA2); a step
+                    // never consults `pending` (only a `Propose`'s full dry
+                    // run does).
+                    let policy_file = worker.policy_next.as_ref().map(|_| PolicyFile {
+                        installed: &worker.installed,
+                        pending: PendingPolicy::Absent,
+                    });
                     Some(worker.admin.step(
                         &mut worker.requests,
                         &request,
                         &view,
                         &worker.policy,
+                        policy_file,
                         &now,
                         &mut honour,
                     ))
@@ -957,6 +1095,7 @@ impl Running {
         &mut self,
         auth: &Auth,
         changes: &[TierChange],
+        plan: Option<[u8; 32]>,
         digest: &OperationDigest,
     ) -> Reply {
         let Some(now) = self.worker.clock.now() else {
@@ -1008,6 +1147,7 @@ impl Running {
             operation_id,
             changes: changes.to_vec(),
             operation_digest: *digest,
+            plan,
             requester,
         };
 
@@ -1115,6 +1255,7 @@ impl Running {
         &mut self,
         auth: &Auth,
         operation: PepOperation,
+        plan: Option<[u8; 32]>,
         digest: &OperationDigest,
     ) -> Reply {
         let Some(now) = self.worker.clock.now() else {
@@ -1154,6 +1295,7 @@ impl Running {
             operation_id,
             operation,
             operation_digest: *digest,
+            plan,
             requester,
         };
 

@@ -179,7 +179,13 @@ fn a_member_added_under_a_large_tree_is_refused_at_1025() {
     }
     write_groups(&d, &groups);
 
-    d.run(add(t, guid(ALICE)), "admin1", &[]).applied();
+    // The link check allows exactly 1024; the write stops only at its
+    // effect plan, which would name 1023 new groups — beyond the plan's
+    // bounds (`PlanTooLarge`, task MA2; docs/questions/Q-981) — so the link
+    // is written beneath the PEP.
+    let r = d.run(add(t, guid(ALICE)), "admin1", &[]).refused();
+    assert_eq!(refusal_code(&r), AdminRefusal::PlanTooLarge);
+    force_member(&d, t, guid(ALICE));
     assert!(resolves(&d, "alice"));
     assert_eq!(closure_size(&d, "alice"), 1024);
 
@@ -190,7 +196,9 @@ fn a_member_added_under_a_large_tree_is_refused_at_1025() {
     assert!(resolves(&d, "bob"));
 
     let empty = new_group(&mut d, "empty");
-    d.run(add(t2, empty), "admin1", &[]).applied();
+    let r = d.run(add(t2, empty), "admin1", &[]).refused();
+    assert_eq!(refusal_code(&r), AdminRefusal::PlanTooLarge);
+    force_member(&d, t2, empty);
     let r = d.run(add(empty, guid(WS01)), "admin1", &[]).refused();
     assert_eq!(refusal_code(&r), AdminRefusal::MembershipInvalid);
     let full = new_group(&mut d, "full");

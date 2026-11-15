@@ -32,9 +32,13 @@
 //! graph, the self-lockout count, the counters, the name and uniqueness
 //! checks of a create, the has-children probe of a delete, the NC root, the
 //! exact-value locator of `Lookup`, the key-operation target, the
-//! tombstones of dird's destroy decisions — each a named method here that
-//! hands back a verdict, a count, a GUID or an internal record, never an
-//! object for a reply. A new request-facing read that tried the raw view
+//! tombstones of dird's destroy decisions, and (task MA3) the effect-plan
+//! facts of crate::effects (`directory_pip::PrincipalFacts`, the member
+//! closure, the principals under a subtree, an account's state) — each a
+//! named method here that hands back a verdict, a count, a GUID or an
+//! internal record, never an object for a reply. An effect plan reaches a
+//! reply only after every principal it names passed the requester's
+//! visibility gate (crate::effects, `PlanNotVisible`). A new request-facing read that tried the raw view
 //! would not compile outside this module.
 //!
 //! Spec: docs/51 §7.4 steps 2-4 (one view: snapshot + tier map of the same
@@ -46,8 +50,8 @@ use std::collections::{BTreeSet, VecDeque};
 
 use ad_schema::flags::group_type::GROUP_TYPE_SECURITY_ENABLED;
 use directory_pip::{
-    DirectoryView, PepView, TierMap, VisibilityGate, VisibilityProof, VisibilityRule,
-    VisibleObject, MAX_EXPANDED_GROUPS, MAX_NESTING_DEPTH,
+    DirectoryView, MemberChange, PepView, PrincipalFacts, TierMap, VisibilityGate, VisibilityProof,
+    VisibilityRule, VisibleObject, MAX_EXPANDED_GROUPS, MAX_NESTING_DEPTH,
 };
 use dirstore::{AttrId, ClassId, CounterState, Object, Tombstone, TombstonePage};
 use dtyp::{Guid, Sid};
@@ -416,6 +420,69 @@ impl<'v, 'a> Cx<'_, 'v, 'a> {
     }
 
     // -- Internal reads (module documentation; docs/questions/Q-486 item 5).
+
+    /// The effect-plan facts of the principal `guid` (task MA3): what the
+    /// PIP answers now, or under `change` / `tiers` — the view's own
+    /// functions (directory-pip `principal_facts`). Internal read: the caller
+    /// shows a principal only after the visibility gate.
+    /// Spec: docs/research/r5-a-admin-model.md §3.3; docs/47 §5.3, §6.3.
+    pub(crate) fn principal_facts(
+        &self,
+        guid: Guid,
+        change: Option<&MemberChange>,
+        tiers: Option<&TierMap>,
+    ) -> Result<Option<PrincipalFacts>, Stop> {
+        self.view
+            .principal_facts(guid, change, tiers)
+            .map_err(|_| Stop::Failed(AdminFailure::StoreFailure))
+    }
+
+    /// The principals whose expansion passes through `roots` (task MA3;
+    /// directory-pip `member_closure`); `None` beyond `limit`. Internal read.
+    /// Spec: docs/47 §5.3; docs/questions/Q-984.
+    pub(crate) fn member_closure(
+        &self,
+        roots: &[Guid],
+        limit: usize,
+    ) -> Result<Option<BTreeSet<Guid>>, Stop> {
+        self.view
+            .member_closure(roots, limit)
+            .map_err(|_| Stop::Failed(AdminFailure::StoreFailure))
+    }
+
+    /// The principals at or below the subtree `base` (task MA3;
+    /// directory-pip `principals_under`); `None` beyond `limit`. Internal
+    /// read.
+    /// Spec: docs/47 §6.3; docs/questions/Q-984.
+    pub(crate) fn principals_under(
+        &self,
+        base: &Dn,
+        limit: usize,
+    ) -> Result<Option<BTreeSet<Guid>>, Stop> {
+        self.view
+            .principals_under(base, limit)
+            .map_err(|_| Stop::Failed(AdminFailure::StoreFailure))
+    }
+
+    /// The KDC's account state of the record `obj` — stored, or the one a
+    /// write is about to store (task MA3; directory-pip `account_state_of`).
+    /// Spec: docs/47 §4; A-162.
+    pub(crate) fn account_state_of(&self, obj: &Object) -> Result<Option<kdc::AccountState>, Stop> {
+        self.view
+            .account_state_of(obj)
+            .map_err(|_| Stop::Failed(AdminFailure::IntegrityFailure))
+    }
+
+    /// The objectGUID of the live object whose objectSid is `sid`, if any
+    /// (task MA3: a group an expansion names, a tier-map row's SID).
+    /// Internal read.
+    /// Spec: docs/47 §8.2 (`lookup_unique(objectSid, p)`).
+    pub(crate) fn guid_of_sid(&self, sid: &Sid) -> Result<Option<Guid>, Stop> {
+        self.view
+            .authority_snapshot()
+            .lookup_unique(self.ids.object_sid, &sid.encode())
+            .map_err(|e| store_failure(&e))
+    }
 
     /// The state of the counter `name` (the change-seq or RID counter —
     /// docs/51 §8.3). Internal read.

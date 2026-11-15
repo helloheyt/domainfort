@@ -301,6 +301,7 @@ pub fn dir_admin_event(operation_id: u64, stage: ipc_audit::DirAdminStage) -> Ev
         operation_digest: [0x9C; 32],
         proposed: None,
         reason_ref: None,
+        plan_digest: None,
     }))
 }
 

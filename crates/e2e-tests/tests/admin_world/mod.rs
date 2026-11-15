@@ -800,10 +800,34 @@ fn workstation_fixture(plan: &Plan, input: &DomainInput, uid: u32) -> Workstatio
     let mut next_id = 0u64;
     let mut run = |operation: PepOperation| -> PepReply {
         next_id += 1;
+        // Task MA2: a planned operation commits to the plan the PEP gives
+        // for it now (docs/research/r5-a-admin-model.md §3.3).
+        let plan = operation.requires_plan().then(|| {
+            let view = ctx.view(&store, &tiers).unwrap();
+            let request = directory_admin::PlanRequest {
+                operation_id: next_id,
+                operation: directory_admin::ProposedOperation::Directory(operation.clone()),
+                request_digest: fixture_digest,
+                requester: requester.clone(),
+            };
+            admin
+                .plan(
+                    &requests,
+                    &request,
+                    &view,
+                    &snapshot,
+                    None,
+                    &now,
+                    &mut |_| true,
+                )
+                .unwrap_or_else(|r| panic!("fixture not planned: {:?}", r.event()))
+                .digest()
+        });
         let request = PepRequest {
             operation_id: next_id,
             operation,
             operation_digest: fixture_digest,
+            plan,
             requester: requester.clone(),
         };
         let mut txn = store.begin_write().unwrap();
@@ -1638,18 +1662,62 @@ impl World {
         conn.call(request)
     }
 
+    /// The digest of the plan dird gives `requester` for the planned
+    /// `operation` — a `PlanOperation` through admind (task MA2; docs/
+    /// research/r5-a-admin-model.md §3.3) — or, when the plan is refused, a
+    /// made-up digest: the execution then meets the same refusal from its
+    /// own checks (they run before the plan is compared).
+    pub fn plan_digest(
+        &mut self,
+        requester: &Persona,
+        operation: &ipc_dird_admin::Operation,
+    ) -> [u8; 32] {
+        let plan = ipc_dird_admin::Operation::PlanOperation(Box::new(operation.clone()));
+        let auth = self.auth(requester, &plan);
+        match self.admin(&ipc_admin::Request::Forward {
+            auth,
+            operation: plan,
+        }) {
+            Got::Reply(ipc_admin::Reply::Plan { digest, .. }) => digest,
+            _ => [0x5C; 32],
+        }
+    }
+
+    /// `operation` as the `Commit` of the plan dird gives `requester` when
+    /// it requires one (crate ipc-dird-admin `request_kind::PLANNED`; task
+    /// MA2), else as it is.
+    pub fn committed(
+        &mut self,
+        requester: &Persona,
+        operation: ipc_dird_admin::Operation,
+    ) -> ipc_dird_admin::Operation {
+        let kind = operation.to_wire().map(|w| w.kind()).unwrap_or(0);
+        if ipc_dird_admin::channel::request_kind::PLANNED.contains(&kind) {
+            let plan = self.plan_digest(requester, &operation);
+            ipc_dird_admin::Operation::Commit {
+                plan,
+                operation: Box::new(operation),
+            }
+        } else {
+            operation
+        }
+    }
+
     /// A forwarded operation by `requester` with `approvers` — with
     /// approvers, through the one dual-control mechanism (task D2-c;
     /// docs/questions/Q-882): `requester` proposes it, each approver
     /// approves the pending request by id and digest (an approval refused ⇒
     /// the request is withdrawn and the refusal answered), then `requester`
-    /// executes the very operation.
+    /// executes the very operation. A planned operation (task MA2) is first
+    /// planned by `requester`; its `Commit` is what is proposed, approved
+    /// and executed.
     pub fn forward(
         &mut self,
         requester: &Persona,
         approvers: &[&Persona],
         operation: ipc_dird_admin::Operation,
     ) -> Got {
+        let operation = self.committed(requester, operation);
         if !approvers.is_empty() {
             let propose = ipc_dird_admin::Operation::Propose {
                 reason_ref: None,
@@ -1690,7 +1758,15 @@ impl World {
         target: Guid,
         password: &str,
     ) -> Got {
-        let begin = ipc_dird_admin::Operation::BeginPasswordSet { target };
+        // Task MA2: the password set is the `Commit` of its plan.
+        let plan = self.plan_digest(
+            requester,
+            &ipc_dird_admin::Operation::BeginPasswordSet { target },
+        );
+        let begin = ipc_dird_admin::Operation::Commit {
+            plan,
+            operation: Box::new(ipc_dird_admin::Operation::BeginPasswordSet { target }),
+        };
         if !approvers.is_empty() {
             let propose = ipc_dird_admin::Operation::Propose {
                 reason_ref: None,
@@ -1728,6 +1804,7 @@ impl World {
             auth,
             completion,
             target,
+            plan,
             password: ipc_admin::Password::new(Zeroizing::new(password.to_owned())),
         }))
     }

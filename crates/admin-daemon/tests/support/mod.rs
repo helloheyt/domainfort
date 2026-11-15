@@ -653,14 +653,25 @@ pub fn forward(requester: &str, operation: ipc_dird_admin::Operation) -> ipc_adm
     }
 }
 
-/// The `auth` of a `SetPassword` of `target`: bound to the
-/// `BeginPasswordSet {target}` admind sends dird (docs/51 §7.6; R2).
-pub fn begin_auth(requester: &str, target: dtyp::Guid) -> ipc_dird_admin::Auth {
-    auth(
-        requester,
-        &ipc_dird_admin::Operation::BeginPasswordSet { target },
-    )
+/// The `auth` of a `SetPassword` of `target`: bound to the `Commit {plan,
+/// BeginPasswordSet {target}}` admind sends dird (docs/51 §7.6; R2; task
+/// MA2 — docs/questions/Q-980).
+pub fn begin_auth(requester: &str, target: dtyp::Guid, plan: [u8; 32]) -> ipc_dird_admin::Auth {
+    auth(requester, &begin_commit(target, plan))
 }
+
+/// dird's `Commit {plan, BeginPasswordSet {target}}` (task MA2).
+pub fn begin_commit(target: dtyp::Guid, plan: [u8; 32]) -> ipc_dird_admin::Operation {
+    ipc_dird_admin::Operation::Commit {
+        plan,
+        operation: Box::new(ipc_dird_admin::Operation::BeginPasswordSet { target }),
+    }
+}
+
+/// The plan digest the tests commit to where dird plans nothing (the
+/// recording fake), or where planning was refused (the execution then meets
+/// the same refusal from its own checks).
+pub const FAKE_PLAN: [u8; 32] = [0x5C; 32];
 
 /// The `completion` AP-REQ of a `SetPassword` of `target`: bound to the
 /// `CompletePasswordSet {target, …}` admind sends dird — its digest covers
@@ -1067,22 +1078,28 @@ fn serve_dird(
         let Ok(request) = ipc_dird_admin::decode_request(&body) else {
             return;
         };
-        let answer = match &request {
-            ipc_dird_admin::Request::Ping => ipc_dird_admin::Reply::Pong,
+        // A planned operation reaches dird as the `Commit` of its plan (task
+        // MA2): the fake answers the operation it commits.
+        let executed = match &request {
             ipc_dird_admin::Request::Operation {
-                operation: Operation::BeginPasswordSet { target },
+                operation: Operation::Commit { operation, .. },
                 ..
-            } if key_targets => {
+            } => Some(&**operation),
+            ipc_dird_admin::Request::Operation { operation, .. } => Some(operation),
+            ipc_dird_admin::Request::Ping => None,
+        };
+        let answer = match (&request, executed) {
+            (ipc_dird_admin::Request::Ping, _) => ipc_dird_admin::Reply::Pong,
+            (_, Some(Operation::BeginPasswordSet { target })) if key_targets => {
                 let answer = bob_key_targets(*target);
                 if let Some(grants) = &grants {
                     register_grant(grants, &answer);
                 }
                 answer
             }
-            ipc_dird_admin::Request::Operation {
-                operation: Operation::CompletePasswordSet { .. },
-                ..
-            } if key_targets => ipc_dird_admin::Reply::Done,
+            (_, Some(Operation::CompletePasswordSet { .. })) if key_targets => {
+                ipc_dird_admin::Reply::Done
+            }
             _ => reply.clone(),
         };
         received.lock().unwrap().push(request);
@@ -1586,6 +1603,22 @@ impl World {
     /// A new connection to admind.
     pub fn connect(&self) -> AdminConn {
         AdminConn::connect(&self.admin_socket)
+    }
+
+    /// The digest of the plan dird gives `requester` for `operation` (task
+    /// MA2): a `PlanOperation` forwarded through admind on a connection of
+    /// its own; [`FAKE_PLAN`] with the recording fake (it plans nothing) or
+    /// when the plan is refused.
+    pub fn plan_digest(&self, requester: &str, operation: ipc_dird_admin::Operation) -> [u8; 32] {
+        if self.recording.is_some() {
+            return FAKE_PLAN;
+        }
+        let mut conn = self.connect();
+        let plan = ipc_dird_admin::Operation::PlanOperation(Box::new(operation));
+        match conn.call(&forward(requester, plan)) {
+            Got::Reply(ipc_admin::Reply::Plan { digest, .. }) => digest,
+            _ => FAKE_PLAN,
+        }
     }
 
     /// dird's `DirAdmin` events so far.

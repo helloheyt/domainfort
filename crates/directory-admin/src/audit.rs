@@ -87,10 +87,18 @@ impl Stop {
                 | AdminRefusal::OperationMismatch
                 // A proposal for an operation that needs no approver: send
                 // the operation itself (task D2-c, docs/questions/Q-938).
-                | AdminRefusal::ApprovalNotNeeded => RefusalStatus::Invalid,
+                | AdminRefusal::ApprovalNotNeeded
+                // A planned operation without its plan, or an effect closure
+                // too large to show (task MA2, docs/questions/Q-980, Q-981).
+                | AdminRefusal::PlanRequired
+                | AdminRefusal::PlanTooLarge => RefusalStatus::Invalid,
                 // The state a pending request was judged on changed (task
                 // D2-c, class C43): the request is dropped; propose again.
-                AdminRefusal::Conflict | AdminRefusal::RequestStale => RefusalStatus::Conflict,
+                // The effect closure is no longer the planned one (task MA2,
+                // class C46): plan again.
+                AdminRefusal::Conflict | AdminRefusal::RequestStale | AdminRefusal::PlanChanged => {
+                    RefusalStatus::Conflict
+                }
                 // The bounded pending table is full, or the requester holds
                 // its cap of open requests: retrying later (after a request
                 // expires or completes) may succeed (task A10; task D2-c).
@@ -105,6 +113,9 @@ impl Stop {
                 | AdminRefusal::ApproverDenied
                 | AdminRefusal::TargetProtected
                 | AdminRefusal::SelfLockout
+                // An effect names a principal the requester (or approver)
+                // may not see (task MA2, docs/questions/Q-983).
+                | AdminRefusal::PlanNotVisible
                 // Recorded in a `Complete`'s outcome event only; never a
                 // refusal of a request (task A10).
                 | AdminRefusal::KeyOperationRefused
@@ -204,6 +215,9 @@ pub(crate) struct EventBase {
     pub(crate) proposed: Option<DirAdminOperation>,
     /// A pending request's `reason_ref` (unverified).
     pub(crate) reason_ref: Option<AuditText>,
+    /// The digest of the effect plan dird computed for the operation (task
+    /// MA2; docs/questions/Q-874 item 7).
+    pub(crate) plan_digest: Option<[u8; 32]>,
 }
 
 /// One name of the request, kept by the `AuditText` rule.
@@ -345,6 +359,7 @@ impl EventBase {
             operation_digest: *digest,
             proposed: None,
             reason_ref: None,
+            plan_digest: None,
         }
     }
 
@@ -414,6 +429,7 @@ impl EventBase {
             operation_digest: digest,
             proposed: self.proposed,
             reason_ref: self.reason_ref.clone(),
+            plan_digest: self.plan_digest,
         }
     }
 

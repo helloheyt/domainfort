@@ -52,6 +52,10 @@ pub struct WireSetPassword {
     pub completion: Vec<u8>,
     /// The account's objectGUID packet.
     pub target: GuidPacket,
+    /// The digest of the effect plan dird's `Commit {plan,
+    /// BeginPasswordSet {target}}` commits to (task MA2; docs/questions/
+    /// Q-980): the requester's `auth` AP-REQ is bound to that `Commit`.
+    pub plan: [u8; 32],
     /// The password (UTF-8 in the typed layer), in a zeroizing buffer.
     pub password: Secret,
 }
@@ -65,6 +69,7 @@ impl fmt::Debug for WireSetPassword {
             .field("auth", &self.auth)
             .field("completion_len", &self.completion.len())
             .field("target", &self.target)
+            .field("plan", &self.plan)
             .field("password", &self.password)
             .finish()
     }
@@ -76,6 +81,7 @@ impl Payload for WireSetPassword {
         self.auth.write_fields(writer)?;
         writer.write_bytes(&self.completion, MAX_COMPLETION_AP_REQ)?;
         writer.write_array(&self.target)?;
+        writer.write_array(&self.plan)?;
         writer.write_secret(&self.password, MAX_PASSWORD)
     }
 
@@ -85,11 +91,13 @@ impl Payload for WireSetPassword {
         let auth = WireAuth::read_fields(reader)?;
         let completion = reader.read_bytes(MAX_COMPLETION_AP_REQ)?.to_vec();
         let target = reader.read_array()?;
+        let plan = reader.read_array()?;
         let password = reader.read_secret(MAX_PASSWORD)?;
         Ok(WireSetPassword {
             auth,
             completion,
             target,
+            plan,
             password,
         })
     }
@@ -224,6 +232,13 @@ pub enum AdminReply {
         /// The `policy_version` of `policy.next`.
         version: u64,
     },
+    /// dird's `Plan` (dird's layout; task MA2).
+    Plan {
+        /// The effect plan's canonical encoding.
+        plan: Vec<u8>,
+        /// Its digest.
+        digest: [u8; 32],
+    },
 }
 
 impl MessageSet for AdminReply {
@@ -241,6 +256,7 @@ impl MessageSet for AdminReply {
             AdminReply::RequestList { .. } => reply_kind::REQUEST_LIST,
             AdminReply::RequestShown(_) => reply_kind::REQUEST_SHOWN,
             AdminReply::PolicyNext { .. } => reply_kind::POLICY_NEXT,
+            AdminReply::Plan { .. } => reply_kind::PLAN,
         }
     }
 
@@ -286,6 +302,11 @@ impl MessageSet for AdminReply {
             AdminReply::PolicyNext { version } => {
                 DirdReply::PolicyNext { version: *version }.write_payload(writer)
             }
+            AdminReply::Plan { plan, digest } => DirdReply::Plan {
+                plan: plan.clone(),
+                digest: *digest,
+            }
+            .write_payload(writer),
         }
     }
 
@@ -332,6 +353,10 @@ impl MessageSet for AdminReply {
             },
             reply_kind::POLICY_NEXT => match DirdReply::read_payload(kind, reader)? {
                 DirdReply::PolicyNext { version } => AdminReply::PolicyNext { version },
+                _ => return Err(Error::UnknownKind),
+            },
+            reply_kind::PLAN => match DirdReply::read_payload(kind, reader)? {
+                DirdReply::Plan { plan, digest } => AdminReply::Plan { plan, digest },
                 _ => return Err(Error::UnknownKind),
             },
             _ => return Err(Error::UnknownKind),

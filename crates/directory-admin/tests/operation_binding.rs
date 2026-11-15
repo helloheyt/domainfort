@@ -127,6 +127,8 @@ fn key_steps_need_the_steps_own_binding() {
             operation_digest: fingerprint(&KeyOperation::RotateKrbtgt),
             request_digest: TEST_DIGEST,
             reason_ref: None,
+            // Task MA2: refused at the PDP, before the plan is compared.
+            plan: Some([0xEE; 32]),
             requester: ticket_bound_to("admin1", bound),
         };
         let r = d.propose_request(&request).unwrap_err();

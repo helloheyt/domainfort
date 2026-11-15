@@ -171,18 +171,18 @@ impl DirectoryContext {
 pub struct DirectoryView<'a> {
     pub(crate) ctx: &'a DirectoryContext,
     pub(crate) snapshot: Snapshot<'a>,
-    tiers: &'a TierMap,
+    pub(crate) tiers: &'a TierMap,
     /// The GUID of the NC root object, found once per view (A-53).
     nc_root: OnceCell<Result<Guid, Fault>>,
 }
 
 /// A user or computer object, read and checked (docs/47 §1.3, §4.1).
-struct Account<'o> {
-    kind: AccountKind,
-    sid: Sid,
-    sam_account_name: &'o str,
+pub(crate) struct Account<'o> {
+    pub(crate) kind: AccountKind,
+    pub(crate) sid: Sid,
+    pub(crate) sam_account_name: &'o str,
     /// userAccountControl, checked by [`state::checked_uac`].
-    uac: Option<u32>,
+    pub(crate) uac: Option<u32>,
 }
 
 /// keyd's principal identifier of an object: its objectGUID, in the 16-octet
@@ -244,7 +244,7 @@ impl DirectoryView<'_> {
     /// docs/46 §4.4) and the checked userAccountControl. `Ok(None)` if the
     /// object is not an account; `Err` if it is inconsistent.
     /// Spec: docs/47 §1.3 steps 5-7, §4.1.
-    fn account<'o>(&self, obj: &'o Object) -> Result<Option<Account<'o>>, Fault> {
+    pub(crate) fn account<'o>(&self, obj: &'o Object) -> Result<Option<Account<'o>>, Fault> {
         let Some(kind) = self.account_kind(obj)? else {
             return Ok(None);
         };
@@ -267,7 +267,11 @@ impl DirectoryView<'_> {
 
     /// The account state of a checked account. Spec: docs/47 §4 (R47-5,
     /// R47-6, R47-7).
-    fn state_of(&self, obj: &Object, account: &Account<'_>) -> Result<AccountState, Fault> {
+    pub(crate) fn state_of(
+        &self,
+        obj: &Object,
+        account: &Account<'_>,
+    ) -> Result<AccountState, Fault> {
         let ids = self.ctx.ids;
         state::account_state(
             account.kind,
@@ -284,9 +288,21 @@ impl DirectoryView<'_> {
     /// value ⇒ `Untiered`. A `p` that is not a directory object has no ST.
     /// Spec: docs/47 §6.3 (R47-9), §8.2; [MS-ADTS] 2.2.16 (ST); docs/11 §1.
     fn subject_tier(&self, p: &Sid, g: &BTreeSet<Sid>) -> Result<Tier, Fault> {
-        let mut tier = self
-            .tiers
-            .principal_tier(core::iter::once(p).chain(g.iter()));
+        self.subject_tier_in(self.tiers, p, g)
+    }
+
+    /// [`DirectoryView::subject_tier`] under the tier map `tiers` — the
+    /// view's own, or (task MA3) a policy change's candidate map: the same
+    /// rule, so an effect plan's "after" is what the PIP will answer once
+    /// the candidate is the loaded policy.
+    /// Spec: docs/47 §6.3 (R47-9); docs/research/r5-a-admin-model.md §3.3.
+    pub(crate) fn subject_tier_in(
+        &self,
+        tiers: &TierMap,
+        p: &Sid,
+        g: &BTreeSet<Sid>,
+    ) -> Result<Tier, Fault> {
+        let mut tier = tiers.principal_tier(core::iter::once(p).chain(g.iter()));
         if let Some(guid) = self
             .snapshot
             .lookup_unique(self.ctx.ids.object_sid, &p.encode())?
@@ -373,7 +389,7 @@ impl DirectoryView<'_> {
     ///
     /// Spec: docs/47 §8.2 (DN resolution); docs/46 §8.3; [MS-ADTS] 3.1.1.1.4;
     /// A-53; pdp `Dn`.
-    fn resolve(&self, dn: &Dn) -> Result<Object, Fault> {
+    pub(crate) fn resolve(&self, dn: &Dn) -> Result<Object, Fault> {
         let rdns = dn.rdns();
         let suffix = self.ctx.naming_context.dn().rdns();
         if rdns.len() > MAX_DN_DEPTH || !rdns.ends_with(suffix) {
@@ -745,28 +761,50 @@ impl DirectoryView<'_> {
     /// krbtgt account and a DC account (ST). `None` when nothing classifies
     /// it — the case A-36 makes Tier0 for writes.
     fn classified_tier(&self, dn: &Dn) -> Result<Option<Tier>, Fault> {
-        let ids = self.ctx.ids;
         let obj = self.resolve(dn)?;
-        let class = self.most_specific_class(&obj)?;
-        let mut tier = self.tiers.subtree_tier(dn);
+        self.classified_tier_of(self.tiers, dn, &obj, None)
+    }
+
+    /// [`DirectoryView::classified_tier`] of the object `obj` at `dn`, under
+    /// the tier map `tiers`, with the groups `groups` when given (task MA3:
+    /// an effect plan passes the expansion it computed under its
+    /// hypothesis, and a policy change's candidate map) — else the object's
+    /// expansion in this snapshot. One rule for both (docs/52 C14).
+    /// Spec: docs/47 §6.3 (R47-9); A-36; docs/research/r5-a-admin-model.md
+    /// §3.3.
+    pub(crate) fn classified_tier_of(
+        &self,
+        tiers: &TierMap,
+        dn: &Dn,
+        obj: &Object,
+        groups: Option<&BTreeSet<Sid>>,
+    ) -> Result<Option<Tier>, Fault> {
+        let ids = self.ctx.ids;
+        let class = self.most_specific_class(obj)?;
+        let mut tier = tiers.subtree_tier(dn);
         if obj.parent.is_none() || class == ids.domain_dns {
             tier = most_privileged(tier, Some(Tier::Tier0));
         }
-        let sid = if let Some(account) = self.account(&obj)? {
+        let sid = if let Some(account) = self.account(obj)? {
             if is_krbtgt_sid(&account.sid) || state::is_dc_account(account.uac) {
                 tier = most_privileged(tier, Some(Tier::Tier0));
             }
             Some(account.sid)
         } else if class == ids.group {
-            Some(record::sid(&obj, ids.object_sid)?.ok_or(Fault::Unavailable)?)
+            Some(record::sid(obj, ids.object_sid)?.ok_or(Fault::Unavailable)?)
         } else {
             None
         };
         if let Some(sid) = sid {
-            let groups = groups::expand(self, &obj)?;
-            let mapped = self
-                .tiers
-                .principal_tier(core::iter::once(&sid).chain(groups.iter()));
+            let expanded;
+            let groups = match groups {
+                Some(groups) => groups,
+                None => {
+                    expanded = groups::expand(self, obj)?;
+                    &expanded
+                }
+            };
+            let mapped = tiers.principal_tier(core::iter::once(&sid).chain(groups.iter()));
             tier = most_privileged(tier, mapped);
         }
         Ok(tier)

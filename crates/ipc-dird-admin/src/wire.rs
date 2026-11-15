@@ -18,7 +18,9 @@
 //! | `KeyRef` | `u8 1 Krbtgt` / `u8 2 Service ‖ principal:[16]` |
 //! | `PolicyChange` | `u8 1 AddPrincipal ‖ sid ‖ tier:u8` / `u8 2 RemovePrincipal ‖ sid` / `u8 3 AddSubtree ‖ dn:seq<bytes<128>,16> ‖ tier` / `u8 4 RemoveSubtree ‖ dn` (task A16) |
 //! | digest | 32 octets (a SHA-256 output: an operation digest, crate::digest) |
-//! | proposed operation | `kind:u8` from `request_kind::PROPOSABLE` ‖ that kind's fields (a key operation: `KEY_OPERATION` ‖ `KeyOperation`) |
+//! | proposed operation | `kind:u8` from `request_kind::PROPOSABLE` ‖ that kind's fields (a planned operation: `COMMIT` ‖ its fields) |
+//! | planned operation | `kind:u8` from `request_kind::PLANNED` ‖ that kind's fields (a key operation: `KEY_OPERATION` ‖ `KeyOperation`) — inside `PlanOperation` / `Commit` only (task MA2) |
+//! | effect plan | `bytes<24 KiB>` holding the plan's canonical encoding (crate::plan) |
 //! | request state, list scope, fact tier | `u8` from a closed table (`codes::REQUEST_*`, `codes::LIST_*`, `codes::TIER_*` / `FACT_UNCLASSIFIED`) |
 //! | time of a request's expiry | `u64` seconds since 1970-01-01T00:00:00Z (the PDP's `Instant`, docs/11 P9) |
 //!
@@ -35,15 +37,18 @@
 use crate::channel::{
     codes, reply_kind, request_kind, RefusalStatus, DIGEST_LEN, MAX_AP_REQ, MAX_BINDING_NAME,
     MAX_CLASS_NAME, MAX_DESCRIPTION, MAX_DNS_HOST_NAME, MAX_DN_COMPONENT, MAX_DN_COMPONENTS,
-    MAX_FACTS, MAX_KEY_TARGETS, MAX_KVNOS, MAX_LISTED_REQUESTS, MAX_NAME, MAX_POLICY_CHANGES,
-    MAX_POLICY_DN_COMPONENTS, MAX_PRINCIPAL_NAME, MAX_REALM, MAX_REASON_REF, MAX_SALT,
-    MAX_SHOWN_APPROVERS, MAX_SID, RETIRED_APPROVALS,
+    MAX_FACTS, MAX_KEY_TARGETS, MAX_KVNOS, MAX_LISTED_REQUESTS, MAX_NAME, MAX_PLAN,
+    MAX_POLICY_CHANGES, MAX_POLICY_DN_COMPONENTS, MAX_PRINCIPAL_NAME, MAX_REALM, MAX_REASON_REF,
+    MAX_SALT, MAX_SHOWN_APPROVERS, MAX_SID, RETIRED_APPROVALS,
 };
 use ipc::{DerBlob, Error, MessageSet, Payload, Reader, Result, Writer};
 use keyd_types::KeyPurpose;
 
 /// A 16-octet objectGUID packet.
 pub type GuidPacket = [u8; 16];
+
+/// The plan bound as a field bound (24 KiB fits a `u32`).
+const MAX_PLAN_U32: u32 = MAX_PLAN as u32;
 
 /// An owned byte string of at most `max` octets.
 fn read_owned(reader: &mut Reader<'_>, max: u32) -> Result<Vec<u8>> {
@@ -517,6 +522,22 @@ pub enum WireOperation {
         /// The pending request's id.
         id: u64,
     },
+    /// `PlanOperation {operation}` (task MA2): the effect plan of one of
+    /// `request_kind::PLANNED`.
+    /// Spec: docs/research/r5-a-admin-model.md §3.3; docs/questions/Q-980.
+    PlanOperation {
+        /// The planned operation.
+        operation: Box<WireOperation>,
+    },
+    /// `Commit {plan, operation}` (task MA2): one of `request_kind::PLANNED`
+    /// with the digest of the plan it commits to (crate::plan).
+    /// Spec: docs/research/r5-a-admin-model.md §3.3; docs/questions/Q-980.
+    Commit {
+        /// The plan digest.
+        plan: [u8; DIGEST_LEN],
+        /// The planned operation.
+        operation: Box<WireOperation>,
+    },
 }
 
 impl WireOperation {
@@ -545,7 +566,20 @@ impl WireOperation {
             WireOperation::Withdraw { .. } => request_kind::WITHDRAW,
             WireOperation::ListRequests { .. } => request_kind::LIST_REQUESTS,
             WireOperation::ShowRequest { .. } => request_kind::SHOW_REQUEST,
+            WireOperation::PlanOperation { .. } => request_kind::PLAN_OPERATION,
+            WireOperation::Commit { .. } => request_kind::COMMIT,
         }
+    }
+
+    /// Whether this is a `Commit` of a key operation — valid only inside a
+    /// `Propose` (a key operation is executed by keyadm in keyd, A-102).
+    /// Spec: docs/51 §6; docs/questions/Q-980.
+    fn commits_key_operation(&self) -> bool {
+        matches!(
+            self,
+            WireOperation::Commit { operation, .. }
+                if matches!(**operation, WireOperation::KeyOperation { .. })
+        )
     }
 
     /// The fields after `auth`, in the docs/51 §7.3 order.
@@ -652,7 +686,31 @@ impl WireOperation {
                 writer.write_u64(*id)
             }
             WireOperation::ListRequests { scope } => writer.write_enum(*scope),
+            WireOperation::PlanOperation { operation } => operation.write_planned(writer),
+            WireOperation::Commit { plan, operation } => {
+                writer.write_array(plan)?;
+                operation.write_planned(writer)
+            }
         }
+    }
+
+    /// A planned operation: `kind:u8 ‖ fields`, the kind one of
+    /// `request_kind::PLANNED` (anything else is refused).
+    /// Spec: docs/questions/Q-980, Q-982.
+    pub(crate) fn write_planned(&self, writer: &mut Writer) -> Result<()> {
+        let kind = self.kind();
+        if !request_kind::PLANNED.contains(&kind) {
+            return Err(Error::UnknownKind);
+        }
+        writer.write_enum(kind)?;
+        self.write_fields(writer)
+    }
+
+    /// A planned operation (see [`WireOperation::write_planned`]).
+    /// Spec: docs/questions/Q-980.
+    fn read_planned(reader: &mut Reader<'_>) -> Result<WireOperation> {
+        let kind = reader.read_enum(|c| request_kind::PLANNED.contains(&c).then_some(c))?;
+        WireOperation::read_fields(kind, reader)
     }
 
     /// A proposed operation: `kind:u8 ‖ fields`, the kind one of
@@ -784,6 +842,13 @@ impl WireOperation {
             request_kind::SHOW_REQUEST => WireOperation::ShowRequest {
                 id: reader.read_u64()?,
             },
+            request_kind::PLAN_OPERATION => WireOperation::PlanOperation {
+                operation: Box::new(WireOperation::read_planned(reader)?),
+            },
+            request_kind::COMMIT => WireOperation::Commit {
+                plan: reader.read_array()?,
+                operation: Box::new(WireOperation::read_planned(reader)?),
+            },
             _ => return Err(Error::UnknownKind),
         })
     }
@@ -814,10 +879,14 @@ impl MessageSet for AdminRequest {
         }
     }
 
-    /// Spec: docs/51 §7.2 (`auth` on every operation), §7.3.
+    /// Spec: docs/51 §7.2 (`auth` on every operation), §7.3; a `Commit` of
+    /// a key operation is never a request of its own (docs/questions/Q-980).
     fn write_payload(&self, writer: &mut Writer) -> Result<()> {
         match self {
             AdminRequest::Operation { auth, operation } => {
+                if operation.commits_key_operation() {
+                    return Err(Error::UnknownKind);
+                }
                 auth.write_fields(writer)?;
                 operation.write_fields(writer)
             }
@@ -836,6 +905,11 @@ impl MessageSet for AdminRequest {
         }
         let auth = WireAuth::read_fields(reader)?;
         let operation = WireOperation::read_fields(kind, reader)?;
+        // A key operation executes only from keyd's decision (A-102): its
+        // `Commit` is valid inside a `Propose` only (task MA2).
+        if operation.commits_key_operation() {
+            return Err(Error::UnknownKind);
+        }
         Ok(AdminRequest::Operation { auth, operation })
     }
 }
@@ -994,7 +1068,7 @@ impl WireRequestSummary {
         writer.write_u64(self.id)?;
         writer.write_array(&self.digest)?;
         writer.write_enum(self.state)?;
-        if !request_kind::PROPOSABLE.contains(&self.operation) {
+        if !request_kind::REQUEST_OPERATIONS.contains(&self.operation) {
             return Err(Error::UnknownCode);
         }
         writer.write_enum(self.operation)?;
@@ -1010,7 +1084,8 @@ impl WireRequestSummary {
             id: reader.read_u64()?,
             digest: reader.read_array()?,
             state: read_state(reader)?,
-            operation: reader.read_enum(|c| request_kind::PROPOSABLE.contains(&c).then_some(c))?,
+            operation: reader
+                .read_enum(|c| request_kind::REQUEST_OPERATIONS.contains(&c).then_some(c))?,
             requester: read_owned(reader, MAX_SID)?,
             approvals: reader.read_u8()?,
             quorum: reader.read_u8()?,
@@ -1079,7 +1154,11 @@ impl WireFact {
 ///
 /// `id ‖ digest ‖ state:u8 ‖ requester:bytes<68> ‖ approvers:seq<bytes<68>,
 /// 2> ‖ quorum:u8 ‖ expires:u64 ‖ reason_ref:Option<bytes<64>> ‖ operation
-/// (a PROPOSABLE kind ‖ its fields) ‖ facts:seq<Fact, 2>`.
+/// (a PROPOSABLE kind ‖ its fields) ‖ facts:seq<Fact, 2> ‖
+/// plan:Option<bytes<24 KiB>>` — `plan` appended by task MA2: the canonical
+/// encoding of the effect plan dird holds for a `Commit` (its digest is the
+/// `Commit`'s `plan`), rendered from dird's own bytes, never from requester
+/// text (docs/questions/Q-874, Q-980).
 /// Spec: docs/questions/Q-882 item 1 (`Show {id}`), Q-887 item 3;
 /// docs/research/r5-a-admin-model.md §11 MA5; docs/research/r5-b-cli.md
 /// §7.4.
@@ -1105,6 +1184,8 @@ pub struct WireRequestShown {
     pub operation: WireOperation,
     /// The facts, at most [`MAX_FACTS`].
     pub facts: Vec<WireFact>,
+    /// The effect plan's canonical encoding, for a `Commit` (task MA2).
+    pub plan: Option<Vec<u8>>,
 }
 
 impl WireRequestShown {
@@ -1121,7 +1202,8 @@ impl WireRequestShown {
         writer.write_u64(self.expires)?;
         write_opt_bytes(writer, self.reason_ref.as_ref(), MAX_REASON_REF)?;
         self.operation.write_proposed(writer)?;
-        writer.write_seq(&self.facts, MAX_FACTS, |w, f| f.write(w))
+        writer.write_seq(&self.facts, MAX_FACTS, |w, f| f.write(w))?;
+        write_opt_bytes(writer, self.plan.as_ref(), MAX_PLAN_U32)
     }
 
     /// Spec: docs/questions/Q-882 item 1.
@@ -1137,6 +1219,7 @@ impl WireRequestShown {
             reason_ref: read_opt_owned(reader, MAX_REASON_REF)?,
             operation: WireOperation::read_proposed(reader)?,
             facts: reader.read_seq(MAX_FACTS, WireFact::read)?,
+            plan: read_opt_owned(reader, MAX_PLAN_U32)?,
         })
     }
 }
@@ -1193,6 +1276,14 @@ pub enum AdminReply {
     },
     /// `ShowRequest`: the request as dird holds it.
     RequestShown(Box<WireRequestShown>),
+    /// `PlanOperation`: the effect plan's canonical encoding and its digest
+    /// (task MA2).
+    Plan {
+        /// The canonical encoding (crate::plan), at most 24 KiB.
+        plan: Vec<u8>,
+        /// Its digest (crate::plan `plan_digest`).
+        digest: [u8; DIGEST_LEN],
+    },
 }
 
 impl MessageSet for AdminReply {
@@ -1210,6 +1301,7 @@ impl MessageSet for AdminReply {
             AdminReply::PendingRequest(_) => reply_kind::PENDING_REQUEST,
             AdminReply::RequestList { .. } => reply_kind::REQUEST_LIST,
             AdminReply::RequestShown(_) => reply_kind::REQUEST_SHOWN,
+            AdminReply::Plan { .. } => reply_kind::PLAN,
         }
     }
 
@@ -1244,6 +1336,10 @@ impl MessageSet for AdminReply {
                 writer.write_seq(entries, MAX_LISTED_REQUESTS, |w, e| e.write(w))
             }
             AdminReply::RequestShown(shown) => shown.write(writer),
+            AdminReply::Plan { plan, digest } => {
+                writer.write_bytes(plan, MAX_PLAN_U32)?;
+                writer.write_array(digest)
+            }
         }
     }
 
@@ -1283,6 +1379,10 @@ impl MessageSet for AdminReply {
             reply_kind::REQUEST_SHOWN => {
                 AdminReply::RequestShown(Box::new(WireRequestShown::read(reader)?))
             }
+            reply_kind::PLAN => AdminReply::Plan {
+                plan: read_owned(reader, MAX_PLAN_U32)?,
+                digest: reader.read_array()?,
+            },
             _ => return Err(Error::UnknownKind),
         })
     }

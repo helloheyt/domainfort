@@ -25,8 +25,8 @@ use ipc_audit::{
 use ipc_dird_admin::{Auth, Operation};
 use keyd::{KeyHandle, KeyPurpose, PrincipalId};
 use support::{
-    auth, begin_auth, completion, eventually, forward, fresh_unbound, g, DirdMode, Got, KeydMode,
-    Options, World, BOB, JO, STAFF_OU, WS9,
+    auth, begin_auth, begin_commit, completion, eventually, forward, fresh_unbound, g, DirdMode,
+    Got, KeydMode, Options, World, BOB, FAKE_PLAN, JO, STAFF_OU, WS9,
 };
 use zeroize::Zeroizing;
 
@@ -37,13 +37,28 @@ fn password(text: &str) -> ipc_admin::Password {
     ipc_admin::Password::new(Zeroizing::new(text.to_owned()))
 }
 
+/// The plans the tests committed to, by target (task MA2): the fingerprint
+/// admind records is the digest of `Commit {plan, BeginPasswordSet}`.
+static PLANS: std::sync::Mutex<Vec<(Guid, [u8; 32])>> = std::sync::Mutex::new(Vec::new());
+
+/// The plan dird gives admin1 for `BeginPasswordSet {target}` now (task MA2;
+/// docs/questions/Q-980), recorded for [`password_events`].
+fn plan(world: &World, target: Guid) -> [u8; 32] {
+    let plan = world.plan_digest("admin1", Operation::BeginPasswordSet { target });
+    PLANS.lock().unwrap().push((target, plan));
+    plan
+}
+
 /// `SetPassword` of `target` by admin1 (two fresh AP-REQs: Begin's and
-/// Complete's — docs/questions/Q-400).
-fn set_password(target: Guid, text: &str) -> Request {
+/// Complete's — docs/questions/Q-400), committing to the plan dird gives
+/// now (task MA2).
+fn set_password(world: &World, target: Guid, text: &str) -> Request {
+    let plan = plan(world, target);
     Request::SetPassword(SetPassword {
-        auth: begin_auth("admin1", target),
+        auth: begin_auth("admin1", target, plan),
         completion: completion("admin1", target),
         target,
+        plan,
         password: password(text),
     })
 }
@@ -105,12 +120,16 @@ fn password_events(events: &[AdmindEvent]) -> Vec<PasswordEvent> {
                 kvnos,
                 result,
             } => {
-                let begin = Operation::BeginPasswordSet {
-                    target: dtyp::Guid::from_packet(target),
-                };
-                assert_eq!(
-                    operation_digest,
-                    ipc_dird_admin::operation_digest(&begin).unwrap().as_bytes(),
+                // The digest of the `Commit {plan, BeginPasswordSet}` of a
+                // plan the test committed to for this target (task MA2).
+                let target_guid = dtyp::Guid::from_packet(target);
+                let plans = PLANS.lock().unwrap().clone();
+                assert!(
+                    plans.iter().any(|(t, plan)| *t == target_guid
+                        && operation_digest
+                            == ipc_dird_admin::operation_digest(&begin_commit(target_guid, *plan))
+                                .unwrap()
+                                .as_bytes()),
                     "the event's fingerprint"
                 );
                 Some((e.peer_uid, *target, kvnos.as_slice().to_vec(), *result))
@@ -169,7 +188,10 @@ fn set_password_for_a_user() {
     };
     let mut conn = world.connect();
     assert_eq!(conn.call(&Request::Ping), Got::Reply(Reply::Pong));
-    assert_eq!(conn.call(&set_password(g(BOB), GOOD)), changed(&[1], true));
+    assert_eq!(
+        conn.call(&set_password(&world, g(BOB), GOOD)),
+        changed(&[1], true)
+    );
     assert!(keyd_verifies(&world, g(BOB), GOOD));
     assert!(!keyd_verifies(&world, g(BOB), "Granite-Orchard-Lantern-43"));
 
@@ -199,7 +221,10 @@ fn set_password_for_a_user() {
     assert_eq!(records[1].principal, Some(g(BOB).to_packet()));
 
     // Again: the next kvno.
-    assert_eq!(conn.call(&set_password(g(BOB), GOOD)), changed(&[2], true));
+    assert_eq!(
+        conn.call(&set_password(&world, g(BOB), GOOD)),
+        changed(&[2], true)
+    );
     let complete = await_events(&world, DirAdminOperation::CompletePasswordSet, g(BOB), 2);
     assert_eq!(complete[1].reported_kvnos.as_slice(), &[2]);
 
@@ -234,7 +259,7 @@ fn set_password_for_a_computer() {
     };
     let mut conn = world.connect();
     assert_eq!(
-        conn.call(&set_password(g(WS9), GOOD)),
+        conn.call(&set_password(&world, g(WS9), GOOD)),
         changed(&[1, 1], true)
     );
     assert!(keyd_verifies(&world, g(WS9), GOOD));
@@ -303,7 +328,7 @@ fn every_password_rule_is_refused() {
         ("Lantern-Quartz-Admin-58", "a weak word"),
     ] {
         assert_eq!(
-            conn.call(&set_password(g(BOB), text)),
+            conn.call(&set_password(&world, g(BOB), text)),
             refused(RefusalStatus::Invalid),
             "{why}"
         );
@@ -320,7 +345,7 @@ fn every_password_rule_is_refused() {
         "Lantern-Example-Quartz-58",
     ] {
         assert_eq!(
-            conn.call(&set_password(g(BOB), text)),
+            conn.call(&set_password(&world, g(BOB), text)),
             refused(RefusalStatus::Invalid),
             "{text}"
         );
@@ -342,7 +367,7 @@ fn every_password_rule_is_refused() {
     // jo: a two-character name is not checked ([MS-SAMR] 3.1.1.7.2 item
     // 3.2.2 "more than two characters").
     assert_eq!(
-        conn.call(&set_password(g(JO), "jo-jo-JO-Lantern-91")),
+        conn.call(&set_password(&world, g(JO), "jo-jo-JO-Lantern-91")),
         changed(&[1], true)
     );
     let events = world.finish();
@@ -381,7 +406,7 @@ fn a_keyd_giving_admind_another_role_receives_no_set_secret() {
     };
     let mut conn = world.connect();
     assert_eq!(
-        conn.call(&set_password(g(BOB), GOOD)),
+        conn.call(&set_password(&world, g(BOB), GOOD)),
         refused(RefusalStatus::Unavailable)
     );
     let complete = await_events(&world, DirAdminOperation::CompletePasswordSet, g(BOB), 1);
@@ -420,7 +445,7 @@ fn keyd_never_answering_is_outcome_unknown() {
     };
     let mut conn = world.connect();
     assert_eq!(
-        conn.call(&set_password(g(WS9), GOOD)),
+        conn.call(&set_password(&world, g(WS9), GOOD)),
         refused(RefusalStatus::OutcomeUnknown)
     );
     assert!(world.silent_keyd.as_ref().unwrap().accepted() >= 1);
@@ -452,10 +477,13 @@ fn dird_down_is_unavailable() {
     };
     let mut conn = world.connect();
     // A first call holds admind's connection to dird.
-    assert_eq!(conn.call(&set_password(g(BOB), GOOD)), changed(&[1], true));
+    assert_eq!(
+        conn.call(&set_password(&world, g(BOB), GOOD)),
+        changed(&[1], true)
+    );
     world.dird.take().unwrap().stop().unwrap();
     assert_eq!(
-        conn.call(&set_password(g(BOB), GOOD)),
+        conn.call(&set_password(&world, g(BOB), GOOD)),
         refused(RefusalStatus::Unavailable)
     );
     let create = forward(
@@ -505,10 +533,10 @@ fn auditd_down_refuses_set_password() {
     // Until admind notices (its heartbeat), a password that breaks a rule
     // is refused `Invalid` without leaving admind; afterwards `Busy`.
     assert!(eventually(Duration::from_secs(10), || {
-        conn.call(&set_password(g(BOB), "short")) == Got::Refused(Refused::Busy)
+        conn.call(&set_password(&world, g(BOB), "short")) == Got::Refused(Refused::Busy)
     }));
     assert_eq!(
-        conn.call(&set_password(g(BOB), GOOD)),
+        conn.call(&set_password(&world, g(BOB), GOOD)),
         Got::Refused(Refused::Busy)
     );
     std::thread::sleep(Duration::from_millis(200));
@@ -565,7 +593,10 @@ fn a_forwarded_create_user_round_trips() {
     // A bad ticket: dird's uniform Denied passes through by name.
     let forged = Request::Forward {
         auth: Auth::of(vec![0x6E, 0x00]),
-        operation: Operation::Delete { target: guid },
+        operation: Operation::Commit {
+            plan: FAKE_PLAN,
+            operation: Box::new(Operation::Delete { target: guid }),
+        },
     };
     assert_eq!(conn.call(&forged), refused(RefusalStatus::Denied));
 }
@@ -609,10 +640,12 @@ fn an_auth_bound_to_another_operation_is_refused_through_admind() {
             .unwrap(),
         None
     );
+    let bob_plan = plan(&world, g(BOB));
     let wrong_target = Request::SetPassword(SetPassword {
-        auth: begin_auth("admin1", g(WS9)),
+        auth: begin_auth("admin1", g(WS9), bob_plan),
         completion: completion("admin1", g(BOB)),
         target: g(BOB),
+        plan: bob_plan,
         password: password(GOOD),
     });
     assert_eq!(conn.call(&wrong_target), refused(RefusalStatus::Denied));
@@ -621,7 +654,10 @@ fn an_auth_bound_to_another_operation_is_refused_through_admind() {
         conn.call(&forward("admin1", meant)),
         Got::Reply(Reply::Created { .. })
     ));
-    assert_eq!(conn.call(&set_password(g(BOB), GOOD)), changed(&[1], true));
+    assert_eq!(
+        conn.call(&set_password(&world, g(BOB), GOOD)),
+        changed(&[1], true)
+    );
     assert!(keyd_verifies(&world, g(BOB), GOOD));
 }
 
@@ -670,6 +706,7 @@ fn ap_reqs_reach_dird_unchanged() {
         auth: begin_auth.clone(),
         completion: completion.clone(),
         target: g(BOB),
+        plan: FAKE_PLAN,
         password: password(GOOD),
     });
     assert_eq!(conn.call(&request), changed(&[1], true));
@@ -691,7 +728,7 @@ fn ap_reqs_reach_dird_unchanged() {
             },
             ipc_dird_admin::Request::Operation {
                 auth: begin_auth,
-                operation: Operation::BeginPasswordSet { target: g(BOB) }
+                operation: begin_commit(g(BOB), FAKE_PLAN)
             },
             ipc_dird_admin::Request::Operation {
                 auth: Auth::of(completion),
@@ -723,7 +760,7 @@ fn a_begin_answer_that_is_not_a_key_target_list_sets_nothing() {
     };
     let mut conn = world.connect();
     assert_eq!(
-        conn.call(&set_password(g(BOB), GOOD)),
+        conn.call(&set_password(&world, g(BOB), GOOD)),
         refused(RefusalStatus::Unavailable)
     );
     assert!(!keyd_verifies(&world, g(BOB), GOOD));
@@ -749,7 +786,7 @@ fn the_per_uid_rate_limit_answers_busy() {
     }
     assert_eq!(conn.call(&Request::Ping), Got::Refused(Refused::Busy));
     assert_eq!(
-        conn.call(&set_password(g(BOB), GOOD)),
+        conn.call(&set_password(&world, g(BOB), GOOD)),
         Got::Refused(Refused::Busy)
     );
     // The same uid on a new connection shares the budget.
@@ -939,7 +976,7 @@ fn a_computer_set_in_part_is_incomplete() {
     ));
     let mut conn = world.connect();
     assert_eq!(
-        conn.call(&set_password(g(WS9), GOOD)),
+        conn.call(&set_password(&world, g(WS9), GOOD)),
         refused(RefusalStatus::Incomplete)
     );
     let complete = await_events(&world, DirAdminOperation::CompletePasswordSet, g(WS9), 1);
@@ -969,10 +1006,12 @@ fn a_refused_completion_still_reports_the_password_set() {
         return;
     };
     let mut conn = world.connect();
+    let bob_plan = plan(&world, g(BOB));
     let request = Request::SetPassword(SetPassword {
-        auth: begin_auth("admin1", g(BOB)),
+        auth: begin_auth("admin1", g(BOB), bob_plan),
         completion: vec![0x6E, 0x00],
         target: g(BOB),
+        plan: bob_plan,
         password: password(GOOD),
     });
     assert_eq!(conn.call(&request), changed(&[1], false));
@@ -1053,17 +1092,23 @@ fn the_retired_keyadm_requests_never_reach_dird() {
     }
     // The administrators' channel itself is unchanged.
     let mut conn = world.connect();
+    // Task MA2: a key operation is proposed as the `Commit` of its plan (a
+    // rotation's plan is empty: no effect beyond its key set).
+    let rotate = Operation::KeyOperation(KeyOperation::RotateKrbtgt);
+    let committed = Operation::Commit {
+        plan: world.plan_digest("admin1", rotate),
+        operation: Box::new(Operation::KeyOperation(KeyOperation::RotateKrbtgt)),
+    };
     let request = forward(
         "admin1",
         Operation::Propose {
             reason_ref: None,
-            operation: Box::new(Operation::KeyOperation(KeyOperation::RotateKrbtgt)),
+            operation: Box::new(committed.clone()),
         },
     );
-    let digest =
-        *ipc_dird_admin::operation_digest(&Operation::KeyOperation(KeyOperation::RotateKrbtgt))
-            .unwrap()
-            .as_bytes();
+    let digest = *ipc_dird_admin::operation_digest(&committed)
+        .unwrap()
+        .as_bytes();
     assert!(matches!(
         conn.call(&request),
         Got::Reply(Reply::PendingRequest(state)) if state.digest == digest
@@ -1096,10 +1141,11 @@ fn the_retired_keyadm_requests_never_reach_dird() {
                 }
         })
         .count();
-    // keyadm's three and task A10's key-only two (retired by task D2-c,
-    // docs/questions/Q-882).
+    // keyadm's three, task A10's key-only two (retired by task D2-c,
+    // docs/questions/Q-882) and the plan-less `SetPassword` (retired by
+    // task MA2, docs/questions/Q-980).
     assert_eq!(unknown, ipc_admin::channel::request_kind::RETIRED.len());
-    assert_eq!(unknown, 5);
+    assert_eq!(unknown, 6);
 }
 
 /// Task F6 (A-94; docs/questions/Q-406 item 3): a frame dropped by the
@@ -1122,11 +1168,15 @@ fn rate_limited_and_refused_values_have_their_own_codes() {
     // A SetAccountExpires `At(0x7FFFFFFFFFFFFFFF)`: wire-valid, refused by
     // the typed layer (one spelling of "never", A-85). Hand-built from the
     // forwarded layout (docs/51 §7.3): auth, target, 2 ‖ u64.
-    let mut body = vec![0x41, 0x4D, 1, 0x09];
+    // Task MA2: the planned operation travels as a `Commit` (kind 0x1F):
+    // auth, the plan digest, the inner kind (0x09), target, 2 ‖ u64.
+    let mut body = vec![0x41, 0x4D, 1, 0x1F];
     let requester = fresh_unbound("admin1");
     body.extend((requester.len() as u32).to_be_bytes());
     body.extend(&requester);
     body.extend(0u32.to_be_bytes());
+    body.extend(FAKE_PLAN);
+    body.push(0x09);
     body.extend(g(BOB).to_packet());
     body.push(2);
     body.extend(0x7FFF_FFFF_FFFF_FFFFu64.to_be_bytes());
@@ -1205,7 +1255,10 @@ fn set_password_runs_on_the_grant_dird_registers() {
         return;
     };
     let mut conn = world.connect();
-    assert_eq!(conn.call(&set_password(g(BOB), GOOD)), changed(&[1], true));
+    assert_eq!(
+        conn.call(&set_password(&world, g(BOB), GOOD)),
+        changed(&[1], true)
+    );
     assert!(keyd_verifies(&world, g(BOB), GOOD));
     assert!(eventually(Duration::from_secs(10), || {
         bob_records(&world, KeydOperation::SetSecret)
@@ -1271,7 +1324,10 @@ fn a_set_secret_without_dirds_grant_is_denied() {
     // After a SetPassword the grant is spent: a direct set_secret is
     // refused again.
     let mut conn = world.connect();
-    assert_eq!(conn.call(&set_password(g(BOB), GOOD)), changed(&[1], true));
+    assert_eq!(
+        conn.call(&set_password(&world, g(BOB), GOOD)),
+        changed(&[1], true)
+    );
     assert_eq!(
         direct_set_secret(&world, "Rogue-Phrase-Without-Grant-2"),
         Some(Err(keyd::Error::Denied))
@@ -1294,9 +1350,15 @@ fn dirds_grant_expires() {
         ipc_dird_admin::DEFAULT_DEADLINE,
     )
     .unwrap();
-    let begin = || ipc_dird_admin::Request::Operation {
-        auth: begin_auth("admin1", g(BOB)),
-        operation: Operation::BeginPasswordSet { target: g(BOB) },
+    // Each `BeginPasswordSet` commits to the plan dird gives at that moment
+    // (task MA2): once a password was set in this very second, a second set
+    // revokes no further ticket, and its plan says so.
+    let begin = || {
+        let bob_plan = plan(&world, g(BOB));
+        ipc_dird_admin::Request::Operation {
+            auth: begin_auth("admin1", g(BOB), bob_plan),
+            operation: begin_commit(g(BOB), bob_plan),
+        }
     };
     assert!(matches!(
         dird.call(&begin()),

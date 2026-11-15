@@ -36,9 +36,9 @@ use std::collections::BTreeSet;
 use directory_admin::{
     AdminConfig, AdminSubject, CompletePasswordSet, CreateComputer, CreateContainerLike,
     CreateGroup, CreateUser, DirectoryAdmin, KeyTargets, LookupKey, Membership, Operation,
-    PasswordSetOutcome, PendingRequests, ProposeRequest, ProposedOperation, ProtectedObjects,
-    RandomError, RandomSource, Reply, Request, RequestStep, SetAccountExpires, SetEnabled,
-    StepRequest, VerifiedTicket, USER_FORCE_CHANGE_PASSWORD,
+    PasswordSetOutcome, PendingRequests, PlanRequest, ProposeRequest, ProposedOperation,
+    ProtectedObjects, RandomError, RandomSource, Reply, Request, RequestStep, SetAccountExpires,
+    SetEnabled, StepRequest, VerifiedTicket, USER_FORCE_CHANGE_PASSWORD,
 };
 use directory_daemon::startup::{read_integrity_key, read_policy};
 use directory_pip::{DirectoryContext, NamingContext, TierMap};
@@ -238,6 +238,40 @@ impl Domain {
         }
     }
 
+    /// The plan digest `requester` commits to for `operation` (task MA2,
+    /// A-167): the digest of the plan dird answers to `PlanOperation` now —
+    /// or, when planning is refused, a made-up digest, so the execution meets
+    /// the same refusal from its own checks (they run before the plan is
+    /// compared). `None` for an operation that takes no plan.
+    /// Spec: docs/research/r5-a-admin-model.md §3.3; docs/questions/Q-874,
+    /// Q-980.
+    fn plan_of(&self, operation: &Operation, requester: &str) -> Option<[u8; 32]> {
+        if !operation.requires_plan() {
+            return None;
+        }
+        let request = PlanRequest {
+            operation_id: 0,
+            operation: ProposedOperation::Directory(operation.clone()),
+            request_digest: BOUND,
+            requester: ticket(requester, self.authtime),
+        };
+        let view = self.ctx.view(&self.store, &self.tiers).unwrap();
+        let mut honour = |_: &[pdp::Obligation]| true;
+        Some(
+            self.admin
+                .plan(
+                    &self.requests,
+                    &request,
+                    &view,
+                    &self.policy,
+                    None,
+                    &self.now,
+                    &mut honour,
+                )
+                .map_or([0xEE; 32], |planned| planned.digest()),
+        )
+    }
+
     /// The approvals of `operation` by `approvers` through the one
     /// dual-control mechanism (task D2-c; docs/questions/Q-882): `requester`
     /// proposes it, each approver approves the pending request. An
@@ -257,6 +291,7 @@ impl Domain {
             operation_digest: digest_of(operation),
             request_digest: BOUND,
             reason_ref: None,
+            plan: self.plan_of(operation, requester),
             requester: ticket(requester, self.authtime),
         };
         self.next_id += 1;
@@ -292,6 +327,7 @@ impl Domain {
                 &step,
                 &view,
                 &self.policy,
+                None,
                 &self.now,
                 &mut honour,
             ) {
@@ -309,10 +345,12 @@ impl Domain {
             return Ran::Refused(code);
         }
         let digest = digest_of(&operation);
+        let plan = self.plan_of(&operation, requester);
         let request = Request {
             operation_id: self.next_id,
             operation,
             operation_digest: digest,
+            plan,
             requester: VerifiedTicket {
                 bound_operation: Some(digest),
                 ..ticket(requester, self.authtime)

@@ -119,6 +119,10 @@ pub struct PolicyChangeRequest {
     /// The operation digest the ticket below must carry (R2) — the
     /// fingerprint an approved pending request is matched by (Q-888).
     pub operation_digest: OperationDigest,
+    /// The digest of the effect plan the change commits to — its
+    /// `Commit`'s `plan` (task MA2): required; recomputed and compared.
+    /// Spec: docs/research/r5-a-admin-model.md §3.3; docs/questions/Q-980.
+    pub plan: Option<[u8; 32]>,
     /// The requester's verified ticket.
     pub requester: VerifiedTicket,
 }
@@ -380,6 +384,19 @@ impl<R: RandomSource> DirectoryAdmin<R> {
             scope: PolicyScope(String::from(POLICY_CHANGE_SCOPE)),
         };
         let obligations = self.authorize(&ctx, base, &action, &resource)?;
+        // The effect plan (task MA2): everyone whose tier the candidate map
+        // changes, recomputed by crate::effects and compared with the plan
+        // the change commits to (after the approval is consumed: one
+        // approval, one execution attempt — Q-941 item 4).
+        let Some(committed) = request.plan else {
+            return Err(Stop::Refused(AdminRefusal::PlanRequired));
+        };
+        if request.changes.is_empty() {
+            return Err(Stop::Refused(AdminRefusal::ValueInvalid));
+        }
+        let built = self.policy_effects(&cx, installed, &request.changes)?;
+        base.plan_digest = Some(built.digest);
+        self.plan_visible(&cx, requester.subject(), &built.plan)?;
         // Step 4 — dual control, always (docs/51 §5.2 row 13; P-22), by the
         // one mechanism: the approved request for exactly these changes.
         self.consume_approved(
@@ -393,6 +410,9 @@ impl<R: RandomSource> DirectoryAdmin<R> {
             &Basis::of_policy(&cx),
             base,
         )?;
+        if built.digest != committed {
+            return Err(Stop::Refused(AdminRefusal::PlanChanged));
+        }
         // Step 5 — one pending change at a time (after the PDP: no oracle).
         if pending == PendingPolicy::Present {
             return Err(Stop::Refused(AdminRefusal::PendingLimit));

@@ -333,6 +333,7 @@ pub fn dir_admin_create_decision() -> DirAdminEvent {
         operation_digest: [0x9C; 32],
         proposed: None,
         reason_ref: None,
+        plan_digest: None,
     }
 }
 
@@ -479,6 +480,7 @@ pub fn largest_dir_admin() -> DirAdminEvent {
         operation_digest: [0xFF; 32],
         proposed: Some(DirAdminOperation::ShowRequest),
         reason_ref: Some(longest_text('r')),
+        plan_digest: Some([0xEF; 32]),
     }
 }
 

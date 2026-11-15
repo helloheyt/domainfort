@@ -126,6 +126,10 @@ pub struct SetPassword {
     pub completion: Vec<u8>,
     /// The account.
     pub target: Guid,
+    /// The digest of the effect plan dird's `Commit {plan, BeginPasswordSet
+    /// {target}}` commits to (task MA2) — from a `PlanOperation` of
+    /// `BeginPasswordSet {target}`.
+    pub plan: [u8; 32],
     /// The password.
     pub password: Password,
 }
@@ -137,18 +141,26 @@ impl fmt::Debug for SetPassword {
             .field("auth", &self.auth)
             .field("completion_len", &self.completion.len())
             .field("target", &self.target)
+            .field("plan", &self.plan)
             .field("password", &self.password)
             .finish()
     }
 }
 
 /// Whether `operation` travels on this channel (every operation of dird's
-/// channel but its two password-set steps).
-/// Spec: docs/51 §7.6.
+/// channel but its two password-set steps — also not as a `Commit`: only
+/// `SetPassword` sets a password here, so `pwdLastSet` is never written
+/// without the `set_secret` that follows it, docs/51 §7.6; planning one,
+/// `PlanOperation`, reads only and travels).
+/// Spec: docs/51 §7.6; docs/questions/Q-980.
 #[must_use]
 pub fn forwarded(operation: &Operation) -> bool {
+    let executed = match operation {
+        Operation::Commit { operation, .. } => operation,
+        other => other,
+    };
     !matches!(
-        operation,
+        executed,
         Operation::BeginPasswordSet { .. } | Operation::CompletePasswordSet { .. }
     )
 }
@@ -191,11 +203,13 @@ impl Request {
                 auth,
                 completion,
                 target,
+                plan,
                 password,
             }) => Ok(Request::SetPassword(SetPassword {
                 auth,
                 completion,
                 target: Guid::from_packet(&target),
+                plan,
                 password: Password::from_secret(password)?,
             })),
         }
@@ -224,6 +238,7 @@ impl Request {
                 auth: set.auth.clone(),
                 completion: set.completion.clone(),
                 target: set.target.to_packet(),
+                plan: set.plan,
                 password: set.password.to_secret(),
             })),
         }
@@ -276,6 +291,14 @@ pub enum Reply {
     PolicyNext {
         /// The `policy_version` of `policy.next`.
         version: u64,
+    },
+    /// dird's effect plan (`PlanOperation`, task MA2), checked against its
+    /// digest by dird's typed layer.
+    Plan {
+        /// The plan.
+        plan: ipc_dird_admin::EffectPlan,
+        /// Its digest.
+        digest: [u8; 32],
     },
 }
 
@@ -347,6 +370,10 @@ impl Reply {
                 queue_reply(ipc_dird_admin::AdminReply::RequestShown(shown.clone()))?
             }
             AdminReply::PolicyNext { version } => Reply::PolicyNext { version: *version },
+            AdminReply::Plan { plan, digest } => queue_reply(ipc_dird_admin::AdminReply::Plan {
+                plan: plan.clone(),
+                digest: *digest,
+            })?,
         })
     }
 
@@ -411,6 +438,18 @@ impl Reply {
                 }
             }
             Reply::PolicyNext { version } => AdminReply::PolicyNext { version: *version },
+            Reply::Plan { plan, digest } => match (ipc_dird_admin::Reply::Plan {
+                plan: plan.clone(),
+                digest: *digest,
+            })
+            .to_wire()
+            .map_err(ConversionError::Reply)?
+            {
+                ipc_dird_admin::AdminReply::Plan { plan, digest } => {
+                    AdminReply::Plan { plan, digest }
+                }
+                _ => return Err(unexpected()),
+            },
         })
     }
 
@@ -433,6 +472,7 @@ impl Reply {
             ipc_dird_admin::Reply::RequestList(entries) => Some(Reply::RequestList(entries)),
             ipc_dird_admin::Reply::RequestShown(shown) => Some(Reply::RequestShown(shown)),
             ipc_dird_admin::Reply::PolicyNext { version } => Some(Reply::PolicyNext { version }),
+            ipc_dird_admin::Reply::Plan { plan, digest } => Some(Reply::Plan { plan, digest }),
             ipc_dird_admin::Reply::PasswordSet(_) => None,
         }
     }
@@ -455,9 +495,24 @@ pub fn answers(request: &Request, reply: &Reply) -> bool {
         Request::SetPassword(_) => {
             matches!(reply, Reply::PasswordChanged(_) | Reply::Refused(_))
         }
-        Request::Forward { operation, .. } => match reply {
+        Request::Forward { operation, .. } => forward_answers(operation, reply),
+    }
+}
+
+/// [`answers`] for a forwarded operation (a `Commit` is answered as the
+/// operation it commits; task MA2).
+fn forward_answers(operation: &Operation, reply: &Reply) -> bool {
+    if let Operation::Commit {
+        operation: inner, ..
+    } = operation
+    {
+        return !matches!(reply, Reply::Plan { .. }) && forward_answers(inner, reply);
+    }
+    {
+        match reply {
             Reply::Refused(_) => true,
             Reply::Pong | Reply::PasswordChanged(_) => false,
+            Reply::Plan { .. } => matches!(operation, Operation::PlanOperation(_)),
             Reply::PolicyNext { .. } => matches!(operation, Operation::ChangePolicy { .. }),
             Reply::PendingRequest(_) => matches!(
                 operation,
@@ -484,7 +539,7 @@ pub fn answers(request: &Request, reply: &Reply) -> bool {
                     | Operation::Reject { .. }
                     | Operation::Withdraw { .. }
             ),
-        },
+        }
     }
 }
 
@@ -500,6 +555,7 @@ fn queue_reply(dird: ipc_dird_admin::AdminReply) -> Result<Reply, ConversionErro
         ipc_dird_admin::Reply::PendingRequest(state) => Ok(Reply::PendingRequest(state)),
         ipc_dird_admin::Reply::RequestList(entries) => Ok(Reply::RequestList(entries)),
         ipc_dird_admin::Reply::RequestShown(shown) => Ok(Reply::RequestShown(shown)),
+        ipc_dird_admin::Reply::Plan { plan, digest } => Ok(Reply::Plan { plan, digest }),
         _ => Err(unexpected()),
     }
 }

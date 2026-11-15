@@ -85,8 +85,12 @@ pub const MAX_KVNOS: u32 = dird::MAX_KVNOS;
 
 /// Body octets of the largest `SetPassword`: envelope, `auth`, the
 /// completion AP-REQ, the target, the password.
-const SET_PASSWORD: usize =
-    4 + dird::MAX_AUTH + (4 + MAX_COMPLETION_AP_REQ as usize) + 16 + (4 + MAX_PASSWORD as usize);
+const SET_PASSWORD: usize = 4
+    + dird::MAX_AUTH
+    + (4 + MAX_COMPLETION_AP_REQ as usize)
+    + 16
+    + dird::DIGEST_LEN
+    + (4 + MAX_PASSWORD as usize);
 
 /// Body octets of the largest forwarded operation: dird's own bound.
 const FORWARDED: usize = 4 + dird::MAX_AUTH + dird::MAX_PAYLOAD;
@@ -119,9 +123,16 @@ const _: () = assert!(PASSWORD_CHANGED <= MAX_REPLY_BODY as usize);
 /// **retired by A-102 and never reused** (docs/52 §4.6, §4.8;
 /// docs/questions/Q-460 — keyadm talks to keyd only, so admind is no longer
 /// in its path: N2); `0x13` (the join token, task A12) stays unused;
-/// `SetPassword` is `0x15`. Values are a project choice.
+/// `SetPassword` was `0x15`; **task MA2** retired it (a password set
+/// requires an effect plan — docs/questions/Q-980, Q-982) and appended the
+/// planned `SetPassword` as `0x20`, which carries the digest of the plan its
+/// dird `Commit {plan, BeginPasswordSet}` commits to. The planned dird
+/// operations (`SetEnabled`, `SetAccountExpires`, `AddMember`,
+/// `RemoveMember`, `Delete`, `ChangePolicy`) left the table with dird's: they
+/// are forwarded only inside `PlanOperation` / `Commit` (`0x1E`, `0x1F`) and
+/// `Propose`. Values are a project choice.
 /// Spec: docs/51 §6, §7.3, §7.6; docs/50 §3.3 ("`kind` closed"), §7.5
-/// (`Ping`); docs/questions/Q-422, Q-460 (A-102), Q-882.
+/// (`Ping`); docs/questions/Q-422, Q-460 (A-102), Q-882, Q-980.
 pub mod request_kind {
     use ipc_dird_admin::channel::request_kind as dird;
 
@@ -161,9 +172,17 @@ pub mod request_kind {
     pub const SHOW_REQUEST: u8 = dird::SHOW_REQUEST;
     /// `Ping`: admind's health check, no `auth`. Spec: docs/50 §7.5.
     pub const PING: u8 = dird::PING;
-    /// `SetPassword {auth, completion, target, password}`.
-    /// Spec: docs/51 §7.6; docs/questions/Q-400.
-    pub const SET_PASSWORD: u8 = 0x15;
+    /// `SetPassword {auth, completion, target, plan, password}` (task MA2:
+    /// the planned form; the plan-less `0x15` is retired, never reused).
+    /// Spec: docs/51 §7.6; docs/questions/Q-400, Q-980.
+    pub const SET_PASSWORD: u8 = 0x20;
+    /// `PlanOperation {operation}`, forwarded (task MA2).
+    /// Spec: docs/research/r5-a-admin-model.md §3.3; docs/questions/Q-980.
+    pub const PLAN_OPERATION: u8 = dird::PLAN_OPERATION;
+    /// `Commit {plan, operation}`, forwarded (task MA2) — never of dird's
+    /// password-set steps (only `SetPassword` sets a password here).
+    /// Spec: docs/research/r5-a-admin-model.md §3.3; docs/questions/Q-980.
+    pub const COMMIT: u8 = dird::COMMIT;
     /// `ChangePolicy {changes}`, forwarded like every other operation (task
     /// A16; dird's `0x16`, which steps over this channel's `0x15`).
     /// Spec: docs/51 §5.2 row 13, §5.10; docs/questions/Q-592.
@@ -177,26 +196,23 @@ pub mod request_kind {
         CREATE_GROUP,
         CREATE_OU,
         CREATE_CONTAINER,
-        SET_ENABLED,
-        SET_ACCOUNT_EXPIRES,
-        ADD_MEMBER,
-        REMOVE_MEMBER,
-        DELETE,
         LOOKUP,
-        CHANGE_POLICY,
         PROPOSE,
         APPROVE,
         REJECT,
         WITHDRAW,
         LIST_REQUESTS,
         SHOW_REQUEST,
+        PLAN_OPERATION,
+        COMMIT,
     ];
 
     /// The kinds retired by A-102 (keyadm's `FetchApproved`, `Complete`,
     /// `ListPendingDestruction`) and by task D2-c (`RequestKeyOperation`,
     /// the key-only `Approve`): never in [`ALL`], never reused.
     /// Spec: docs/52 §4.6; docs/questions/Q-460 (A-102), Q-882.
-    pub const RETIRED: &[u8] = dird::RETIRED;
+    /// And by task MA2: the plan-less `SetPassword` (`0x15`).
+    pub const RETIRED: &[u8] = &[0x0E, 0x0F, 0x10, 0x11, 0x12, 0x15];
 
     /// The closed request table. Spec: docs/51 §7.6; docs/50 §3.3.
     pub const ALL: &[u8] = &[
@@ -205,21 +221,17 @@ pub mod request_kind {
         CREATE_GROUP,
         CREATE_OU,
         CREATE_CONTAINER,
-        SET_ENABLED,
-        SET_ACCOUNT_EXPIRES,
-        ADD_MEMBER,
-        REMOVE_MEMBER,
-        DELETE,
         LOOKUP,
         PING,
         SET_PASSWORD,
-        CHANGE_POLICY,
         PROPOSE,
         APPROVE,
         REJECT,
         WITHDRAW,
         LIST_REQUESTS,
         SHOW_REQUEST,
+        PLAN_OPERATION,
+        COMMIT,
     ];
 }
 
@@ -256,6 +268,9 @@ pub mod reply_kind {
     /// `PolicyNext { version }`: dird's answer to `ChangePolicy` (task A16).
     /// Spec: docs/51 §5.10.
     pub const POLICY_NEXT: u8 = dird::POLICY_NEXT;
+    /// `Plan { plan, digest }`: dird's answer to `PlanOperation` (task MA2).
+    /// Spec: docs/research/r5-a-admin-model.md §3.3.
+    pub const PLAN: u8 = dird::PLAN;
     /// The reply kinds retired by A-102 (`Approved`, `PendingDestruction`)
     /// and by task D2-c (`KeyRequest`): never in [`ALL`], never reused.
     /// Spec: docs/52 §4.6; docs/questions/Q-460 (A-102), Q-882.
@@ -274,6 +289,7 @@ pub mod reply_kind {
         PENDING_REQUEST,
         REQUEST_LIST,
         REQUEST_SHOWN,
+        PLAN,
     ];
 }
 

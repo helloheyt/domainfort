@@ -54,6 +54,20 @@
 //! requester is the fresh AP-REQ's (every check of `prepare`, ticket age
 //! included).
 //!
+//! # The effect plan (task MA2/MA3; docs/research/r5-a-admin-model.md §3.3)
+//!
+//! A request for an operation that requires a plan (a `Commit {plan,
+//! operation}` on the wire — docs/questions/Q-980, Q-982) holds the plan the
+//! `Propose`'s dry run computed (crate::effects), whose digest must be the
+//! one the `Commit` names (else `PlanRequired` / `PlanChanged`) — so the
+//! request's fingerprint, the digest every `Approve` names, covers the
+//! effect closure. At every `Approve` the plan is recomputed with everything
+//! else (any difference drops the request, `PlanChanged`); the approver must
+//! see every principal it names (`PlanNotVisible`, the request stays);
+//! `ShowRequest` returns the plan from dird's own record, to a viewer that
+//! may see all of it. At the execution the operation's own checks recompute
+//! the plan (crate::admin, crate::policy_change).
+//!
 //! # The bounds (classes C47, C9)
 //!
 //! At most [`MAX_PENDING_REQUESTS`] requests; at most `per_requester` open
@@ -106,6 +120,7 @@ use ipc_audit::{
     OutcomeResult, MAX_APPROVERS,
 };
 use ipc_audit_client::IntentRecord;
+use ipc_dird_admin::EffectPlan;
 use keyd_types::{DecisionId, KeyHandle, OperationDigest};
 use krb_proto::KerberosTime;
 use pdp::{
@@ -118,6 +133,7 @@ use crate::admin::{subject_of, DirectoryAdmin, Dual, OpCx, Plan, VerificationFai
 use crate::audit::{pdp_reason, sid_value, EventBase, Refusal, Stop};
 use crate::checks::{local_ipc_security, malformed, Cx, Resolved};
 use crate::config::ConfigError;
+use crate::effects::BuiltPlan;
 use crate::key_requests::{
     key_request, KeyDecision, KeyOperation, KeyTargets, RegistrationOutcome,
 };
@@ -202,6 +218,18 @@ impl ProposedOperation {
             ProposedOperation::Directory(op) => Some(op.code()),
             ProposedOperation::Policy(_) => Some(DirAdminOperation::ChangePolicy),
             ProposedOperation::Key(_) => None,
+        }
+    }
+
+    /// Whether it requires an effect plan (task MA2; docs/questions/Q-982):
+    /// a planned directory operation, the policy change and the key
+    /// operations.
+    /// Spec: crate ipc-dird-admin `request_kind::PLANNED`.
+    #[must_use]
+    pub fn requires_plan(&self) -> bool {
+        match self {
+            ProposedOperation::Directory(op) => op.requires_plan(),
+            ProposedOperation::Policy(_) | ProposedOperation::Key(_) => true,
         }
     }
 
@@ -377,6 +405,9 @@ struct Record {
     action: Action,
     resource: Resource,
     key_handle: Option<KeyHandle>,
+    /// The effect plan the request commits to (task MA2): `Some` exactly for
+    /// an operation that requires one.
+    plan: Option<BuiltPlan>,
 }
 
 /// The pending requests (module documentation). In dird's memory only.
@@ -591,6 +622,9 @@ pub struct RequestDetail {
     pub operation: ProposedOperation,
     /// The facts (through the viewer's visibility gate).
     pub facts: Vec<RequestFact>,
+    /// The effect plan dird holds for the request (task MA2): its digest is
+    /// the `plan` of the request's `Commit`.
+    pub plan: Option<EffectPlan>,
 }
 
 /// The reply of a step.
@@ -625,8 +659,58 @@ pub struct ProposeRequest {
     pub request_digest: OperationDigest,
     /// The requester's change identifier.
     pub reason_ref: Option<String>,
+    /// The digest of the effect plan the proposed `Commit` names (task MA2):
+    /// required exactly for an operation that requires a plan.
+    pub plan: Option<[u8; 32]>,
     /// The requester's verified ticket.
     pub requester: VerifiedTicket,
+}
+
+/// The inputs of a `PlanOperation` (task MA2), after the caller verified the
+/// requester's AP-REQ through keyd.
+/// Spec: docs/research/r5-a-admin-model.md §3.3; docs/questions/Q-874 item 1,
+/// Q-980.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanRequest {
+    /// dird's number for the step.
+    pub operation_id: u64,
+    /// The operation to plan (one that requires a plan).
+    pub operation: ProposedOperation,
+    /// The digest of the `PlanOperation` request itself — what the
+    /// requester's AP-REQ is bound to (R2).
+    pub request_digest: OperationDigest,
+    /// The requester's verified ticket.
+    pub requester: VerifiedTicket,
+}
+
+/// A `PlanOperation` that succeeded: the plan, its digest and the
+/// `Decision` event to commit before the reply.
+/// Spec: docs/questions/Q-874 item 1; docs/questions/Q-980.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Planned {
+    plan: EffectPlan,
+    digest: [u8; 32],
+    event: DirAdminEvent,
+}
+
+impl Planned {
+    /// The plan.
+    #[must_use]
+    pub fn plan(&self) -> &EffectPlan {
+        &self.plan
+    }
+
+    /// Its digest: the value a `Commit` names.
+    #[must_use]
+    pub fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+
+    /// The `Decision` event.
+    #[must_use]
+    pub fn event(&self) -> &DirAdminEvent {
+        &self.event
+    }
 }
 
 /// One step on the pending requests (other than `Propose`).
@@ -1002,6 +1086,8 @@ struct Evaluation {
     obligations: Vec<Obligation>,
     basis: Basis,
     key_handle: Option<KeyHandle>,
+    /// The effect plan (task MA2), for an operation that requires one.
+    plan: Option<BuiltPlan>,
 }
 
 /// The obligations of an Allow other than the audit record this crate
@@ -1046,6 +1132,7 @@ fn describe(base: &mut EventBase, id: u64, record: &Record) {
         .filter_map(|p| sid_value(&p.sid))
         .collect();
     described.pdp = base.pdp;
+    described.plan_digest = record.plan.as_ref().map(|p| p.digest);
     *base = described;
 }
 
@@ -1265,6 +1352,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
             action,
             resource,
             key_handle: evaluation.key_handle,
+            plan: evaluation.plan,
         };
         let reply = self.view_of(id, &record);
         requests.records.insert(id, record);
@@ -1323,6 +1411,16 @@ impl<R: RandomSource> DirectoryAdmin<R> {
             &requests.targets,
             policy_file,
             true,
+            base,
+        )?;
+        // The effect plan (task MA2): the one the proposed `Commit` names,
+        // every principal visible to the requester.
+        self.check_committed(
+            &cx,
+            &requester,
+            &request.operation,
+            evaluation.plan.as_ref(),
+            request.plan,
             base,
         )?;
         let Dual::Required { action, resource } = evaluation.dual.clone() else {
@@ -1391,11 +1489,17 @@ impl<R: RandomSource> DirectoryAdmin<R> {
             ProposedOperation::Directory(op) => {
                 let handled = self.evaluate(&ctx, base, op)?;
                 let basis = Basis::of_plan(cx, &handled.plan)?;
+                let plan = if op.requires_plan() {
+                    Some(self.directory_effects(cx, op, &handled.plan)?)
+                } else {
+                    None
+                };
                 Ok(Evaluation {
                     dual: handled.dual,
                     obligations: handled.obligations,
                     basis,
                     key_handle: None,
+                    plan,
                 })
             }
             ProposedOperation::Policy(changes) => {
@@ -1407,10 +1511,16 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                     scope: PolicyScope(String::from(POLICY_CHANGE_SCOPE)),
                 };
                 let obligations = self.authorize(&ctx, base, &action, &resource)?;
+                // The plan needs the loaded policy (the candidate is its one
+                // edit) — at the `Propose` and at every `Approve`.
+                let Some(file) = policy_file else {
+                    return Err(Stop::Failed(AdminFailure::InternalFailure));
+                };
+                if cx.policy.version() != file.installed.version {
+                    return Err(Stop::Failed(AdminFailure::InternalFailure));
+                }
+                let plan = self.policy_effects(cx, file.installed, changes)?;
                 if full {
-                    let Some(file) = policy_file else {
-                        return Err(Stop::Failed(AdminFailure::InternalFailure));
-                    };
                     if cx.policy.version() != file.installed.version {
                         return Err(Stop::Failed(AdminFailure::InternalFailure));
                     }
@@ -1431,6 +1541,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                     obligations,
                     basis: Basis::of_policy(cx),
                     key_handle: None,
+                    plan: Some(plan),
                 })
             }
             ProposedOperation::Key(op) => {
@@ -1442,6 +1553,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                 }
                 let (handle, target) = self.key_target(cx, targets, op)?;
                 base.target = Some(target.guid);
+                let plan = self.key_effects(cx, op, &target)?;
                 Ok(Evaluation {
                     dual: Dual::Required { action, resource },
                     obligations: decision.obligations,
@@ -1450,6 +1562,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                         objects: vec![(target.guid, object_state(&target.obj))],
                     },
                     key_handle: Some(handle),
+                    plan: Some(plan),
                 })
             }
         }
@@ -1494,6 +1607,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         cx: &Cx<'_, '_, '_>,
         record: &Record,
         targets: &KeyTargets,
+        policy_file: Option<PolicyFile<'_>>,
     ) -> Result<(), Stop> {
         let requester = subject_of(cx, &record.requester.ticket).map_err(|e| match e {
             SubjectError::NotUsable => Stop::Refused(AdminRefusal::RequestStale),
@@ -1510,11 +1624,16 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                 &requester,
                 &record.operation,
                 targets,
-                None,
+                policy_file,
                 false,
                 &mut scratch,
             )
             .map_err(stale)?;
+        // The effect closure (task MA2): recomputed, never remembered — a
+        // different plan means the approvals so far judged another effect.
+        if evaluation.plan.as_ref().map(|p| p.digest) != record.plan.as_ref().map(|p| p.digest) {
+            return Err(Stop::Refused(AdminRefusal::PlanChanged));
+        }
         let same = matches!(
             &evaluation.dual,
             Dual::Required { action, resource }
@@ -1644,12 +1763,14 @@ impl<R: RandomSource> DirectoryAdmin<R> {
     ///
     /// Spec: docs/questions/Q-882 items 1-2; r5-a §11 MA5; docs/51 §5.6,
     /// §7.4; docs/52 §4.3 (A-102).
+    #[allow(clippy::too_many_arguments)]
     pub fn step(
         &self,
         requests: &mut PendingRequests,
         request: &StepRequest,
         view: &DirectoryView<'_>,
         policy: &PolicySnapshot,
+        policy_file: Option<PolicyFile<'_>>,
         now: &KerberosTime,
         honour: &mut dyn FnMut(&[Obligation]) -> bool,
     ) -> Result<Stepped, Refusal> {
@@ -1658,7 +1779,16 @@ impl<R: RandomSource> DirectoryAdmin<R> {
             request.step.code(),
             &request.step.digest(&request.request_digest),
         );
-        match self.step_checked(requests, request, view, policy, now, honour, &mut base) {
+        match self.step_checked(
+            requests,
+            request,
+            view,
+            policy,
+            policy_file,
+            now,
+            honour,
+            &mut base,
+        ) {
             Ok((reply, decision, revocation)) => Ok(Stepped {
                 reply,
                 event: base.proceed(now),
@@ -1679,6 +1809,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         request: &StepRequest,
         view: &DirectoryView<'_>,
         policy: &PolicySnapshot,
+        policy_file: Option<PolicyFile<'_>>,
         now: &KerberosTime,
         honour: &mut dyn FnMut(&[Obligation]) -> bool,
         base: &mut EventBase,
@@ -1732,6 +1863,12 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                         return Err(Stop::Refused(AdminRefusal::NotVisible));
                     }
                 }
+                // The plan is shown whole or not at all (its bytes are what
+                // is signed): a viewer that may not see every principal it
+                // names is answered as for a request it may not see.
+                if self.record_plan_visible(&cx, &caller, record).is_err() {
+                    return Err(Stop::Refused(AdminRefusal::NotVisible));
+                }
                 let detail = RequestDetail {
                     id,
                     digest: record.digest,
@@ -1743,6 +1880,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                     reason_ref: record.reason_ref.clone(),
                     operation: record.operation.clone(),
                     facts: self.facts(&cx, &caller, record)?,
+                    plan: record.plan.as_ref().map(|p| p.plan.clone()),
                 };
                 Ok((StepReply::Shown(Box::new(detail)), None, None))
             }
@@ -1796,8 +1934,18 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                 if let Some(signature) = request.signature {
                     match signature {}
                 }
-                self.approve(&cx, requests, request, &caller, id, digest, honour, base)
-                    .map(|(reply, decision)| (reply, decision, None))
+                self.approve(
+                    &cx,
+                    requests,
+                    request,
+                    &caller,
+                    id,
+                    digest,
+                    policy_file,
+                    honour,
+                    base,
+                )
+                .map(|(reply, decision)| (reply, decision, None))
             }
         }
     }
@@ -1820,6 +1968,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         approver: &AdminSubject,
         id: u64,
         digest: OperationDigest,
+        policy_file: Option<PolicyFile<'_>>,
         honour: &mut dyn FnMut(&[Obligation]) -> bool,
         base: &mut EventBase,
     ) -> Result<(StepReply, Option<KeyDecision>), Stop> {
@@ -1846,9 +1995,12 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         if record.approvals.iter().any(|p| p.is(approver)) {
             return Err(Stop::Refused(AdminRefusal::ApproverNotDistinct));
         }
+        // The approver judges the effect closure: it must see every
+        // principal the plan names (task MA2; docs/questions/Q-983).
+        self.record_plan_visible(cx, approver, &record)?;
         // Class C43: what the request was judged on must hold now; else it
         // can never run as approved — dropped.
-        if let Err(stop) = self.reevaluate(cx, &record, &requests.targets) {
+        if let Err(stop) = self.reevaluate(cx, &record, &requests.targets, policy_file) {
             if matches!(stop, Stop::Refused(_)) {
                 requests.records.remove(&id);
             }
@@ -1880,6 +2032,144 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         }
         let entry = entry.clone();
         Ok((StepReply::Request(self.view_of(id, &entry)), key_decision))
+    }
+
+    /// The plan `record` holds must be visible whole to `viewer` (task MA2;
+    /// crate::effects): `PlanNotVisible` otherwise. A key operation's plan
+    /// names its key target, read after `PolicyAdmin` on `keys` outside the
+    /// gate (docs/questions/Q-486): not gated again.
+    /// Spec: docs/questions/Q-874 item 4, Q-983.
+    fn record_plan_visible(
+        &self,
+        cx: &Cx<'_, '_, '_>,
+        viewer: &AdminSubject,
+        record: &Record,
+    ) -> Result<(), Stop> {
+        match (&record.operation, &record.plan) {
+            (ProposedOperation::Key(_), _) | (_, None) => Ok(()),
+            (_, Some(built)) => self.plan_visible(cx, viewer.subject(), &built.plan),
+        }
+    }
+
+    /// The plan an evaluation computed against the plan a proposal or a
+    /// `PlanOperation` names (task MA2): a planned operation without one ⇒
+    /// `PlanRequired`; a plan for an operation that takes none ⇒
+    /// `ValueInvalid`; a principal the requester may not see ⇒
+    /// `PlanNotVisible` (except a key operation's target, Q-486); another
+    /// digest ⇒ `PlanChanged`. The digest goes to the event.
+    /// Spec: docs/questions/Q-874 items 2, 4, 7, Q-980, Q-983.
+    fn check_committed(
+        &self,
+        cx: &Cx<'_, '_, '_>,
+        requester: &AdminSubject,
+        operation: &ProposedOperation,
+        built: Option<&BuiltPlan>,
+        committed: Option<[u8; 32]>,
+        base: &mut EventBase,
+    ) -> Result<(), Stop> {
+        match (built, committed) {
+            (None, None) => Ok(()),
+            (None, Some(_)) => Err(Stop::Refused(AdminRefusal::ValueInvalid)),
+            (Some(built), committed) => {
+                base.plan_digest = Some(built.digest);
+                if !matches!(operation, ProposedOperation::Key(_)) {
+                    self.plan_visible(cx, requester.subject(), &built.plan)?;
+                }
+                match committed {
+                    None => Err(Stop::Refused(AdminRefusal::PlanRequired)),
+                    Some(digest) if digest != built.digest => {
+                        Err(Stop::Refused(AdminRefusal::PlanChanged))
+                    }
+                    Some(_) => Ok(()),
+                }
+            }
+        }
+    }
+
+    /// `PlanOperation` (task MA2; docs/research/r5-a-admin-model.md §3.3):
+    /// the requester's Subject and ticket age, the operation's every check
+    /// as a dry run against ONE view (exactly what its execution or its
+    /// `Propose` runs), then its effect plan (crate::effects) — every
+    /// principal visible to the requester (a key operation's target
+    /// excepted, Q-486). Nothing is held: the plan is recomputed, never
+    /// remembered, at the `Commit` / `Propose` (docs/questions/Q-980).
+    /// The requester's obligations are honoured (`honour`), as for a
+    /// `Propose`.
+    ///
+    /// `Err` carries the `Decision` event of the refusal and the
+    /// client-visible status.
+    ///
+    /// Spec: docs/research/r5-a-admin-model.md §3.3 (the order against the
+    /// PDP: the plan only after Allow — no oracle); docs/questions/Q-874
+    /// items 1, 4, 5, 6, Q-980; docs/51 §7.4; docs/11 §2.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan(
+        &self,
+        requests: &PendingRequests,
+        request: &PlanRequest,
+        view: &DirectoryView<'_>,
+        policy: &PolicySnapshot,
+        policy_file: Option<PolicyFile<'_>>,
+        now: &KerberosTime,
+        honour: &mut dyn FnMut(&[Obligation]) -> bool,
+    ) -> Result<Planned, Refusal> {
+        let mut base = EventBase::of_proposed(
+            request.operation_id,
+            DirAdminOperation::PlanOperation,
+            &request.operation,
+            &request.request_digest,
+            None,
+        );
+        let checked = (|| {
+            self.same_domain(view)?;
+            let cx = Cx::new(
+                &self.config,
+                &self.ids,
+                view,
+                policy,
+                now,
+                local_ipc_security(request.requester.bound_to(&request.request_digest)),
+            )?;
+            let requester = subject_of(&cx, &request.requester).map_err(|e| match e {
+                SubjectError::NotUsable => Stop::Refused(AdminRefusal::Unauthenticated),
+                SubjectError::Unavailable => Stop::Failed(AdminFailure::StoreFailure),
+            })?;
+            base.requester = sid_value(requester.sid());
+            if requester.ticket_age() > self.config.ticket_age_max() {
+                return Err(Stop::Refused(AdminRefusal::TicketAge));
+            }
+            if !request.operation.requires_plan() {
+                return Err(Stop::Refused(AdminRefusal::ValueInvalid));
+            }
+            let evaluation = self.evaluate_proposed(
+                &cx,
+                &requester,
+                &request.operation,
+                &requests.targets,
+                policy_file,
+                false,
+                &mut base,
+            )?;
+            let Some(built) = evaluation.plan else {
+                return Err(Stop::Failed(AdminFailure::InternalFailure));
+            };
+            base.plan_digest = Some(built.digest);
+            if !matches!(request.operation, ProposedOperation::Key(_)) {
+                self.plan_visible(&cx, requester.subject(), &built.plan)?;
+            }
+            if !honour(&caller_obligations(&evaluation.obligations)) {
+                return Err(Stop::Refused(AdminRefusal::ObligationRefused));
+            }
+            Ok(built)
+        })();
+        match checked {
+            Ok(built) => Ok(Planned {
+                plan: built.plan,
+                digest: built.digest,
+                event: base.proceed(now),
+            }),
+            Err(stop) => Err(base.decision_refusal(now, stop)),
+        }
     }
 
     /// `ListRequests`: the caller's own requests, or the pending ones it may

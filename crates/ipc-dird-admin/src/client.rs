@@ -178,15 +178,32 @@ fn remaining(start: Instant, deadline: Duration) -> Result<Duration, TransportEr
 /// included), `Found` for `Lookup`, the pending request's state for
 /// `Propose` / `Approve`, the list for `ListRequests`, the request for
 /// `ShowRequest` (task D2-c, Q-882), the version written for `ChangePolicy`
-/// (task A16); a refusal for any operation; `Pong` for `Ping`).
+/// (task A16), the plan for `PlanOperation` and the planned operation's own
+/// answer for a `Commit` of it (task MA2); a refusal for any operation;
+/// `Pong` for `Ping`).
 /// Spec: docs/51 §7.3; docs/50 §3.3 (replies decoded with the same
-/// strictness).
+/// strictness); docs/questions/Q-980.
 #[must_use]
 pub fn answers(request: &Request, reply: &Reply) -> bool {
     match request {
         Request::Ping => matches!(reply, Reply::Pong),
-        Request::Operation { operation, .. } => match reply {
+        Request::Operation { operation, .. } => answers_operation(operation, reply),
+    }
+}
+
+/// [`answers`] for one operation (a `Commit` is answered as the operation it
+/// commits).
+fn answers_operation(operation: &Operation, reply: &Reply) -> bool {
+    if let Operation::Commit {
+        operation: inner, ..
+    } = operation
+    {
+        return !matches!(reply, Reply::Plan { .. }) && answers_operation(inner, reply);
+    }
+    {
+        match reply {
             Reply::Refused(_) => true,
+            Reply::Plan { .. } => matches!(operation, Operation::PlanOperation(_)),
             Reply::Pong => false,
             Reply::PolicyNext { .. } => matches!(operation, Operation::ChangePolicy { .. }),
             Reply::PendingRequest(_) => matches!(
@@ -216,7 +233,7 @@ pub fn answers(request: &Request, reply: &Reply) -> bool {
                     | Operation::Reject { .. }
                     | Operation::Withdraw { .. }
             ),
-        },
+        }
     }
 }
 
