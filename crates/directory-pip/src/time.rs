@@ -122,30 +122,16 @@ pub fn dstime_of(time: &KerberosTime) -> Option<i64> {
     kerberos_time_seconds(time).checked_sub(epoch_1601()?)
 }
 
-/// A FILETIME rounded DOWN to the whole second (an expiry: earlier is the
-/// stricter side). `None` if negative or not representable.
-/// Spec: [MS-DTYP] 2.3.3; docs/47 §4.2.
+/// A FILETIME rounded DOWN to the whole second it falls in: an expiry
+/// (earlier is the stricter side, docs/47 §4.2) and the second of a
+/// password set, whose every ticket at or before it is revoked (docs/47
+/// §4.5; Q-965 (a)). `None` if negative or not representable.
+/// Spec: [MS-DTYP] 2.3.3; docs/47 §4.2, §4.5.
 pub(crate) fn filetime_floor(ticks: i64) -> Option<KerberosTime> {
     if ticks < 0 {
         return None;
     }
     since_1601(ticks / FILETIME_TICKS_PER_SECOND)
-}
-
-/// A FILETIME rounded UP to the whole second (a revocation cut-off: later
-/// is the stricter side, docs/47 §4.5 "ceil_s(pwdLastSet)"). `None` if
-/// negative or not representable. Spec: [MS-DTYP] 2.3.3; docs/47 §4.5.
-pub(crate) fn filetime_ceil(ticks: i64) -> Option<KerberosTime> {
-    if ticks < 0 {
-        return None;
-    }
-    let whole = ticks / FILETIME_TICKS_PER_SECOND;
-    let seconds = if ticks % FILETIME_TICKS_PER_SECOND == 0 {
-        whole
-    } else {
-        whole.checked_add(1)?
-    };
-    since_1601(seconds)
 }
 
 #[cfg(test)]
@@ -179,15 +165,20 @@ mod tests {
         );
     }
 
-    /// Floor for expiry, ceiling for revocation (docs/47 §4.2, §4.5).
+    /// Floor to the second the FILETIME falls in, for expiry and for the
+    /// second of a password set alike (docs/47 §4.2, §4.5; Q-965 (a)):
+    /// every 100-ns interval of 1970-01-01T00:00:00Z maps to that second.
     #[test]
     fn rounding() {
         let base = 116_444_736_000_000_000i64; // 1970-01-01T00:00:00Z
+        assert_eq!(filetime_floor(base), Some(t(1970, 1, 1, 0, 0, 0)));
         assert_eq!(filetime_floor(base + 1), Some(t(1970, 1, 1, 0, 0, 0)));
-        assert_eq!(filetime_ceil(base + 1), Some(t(1970, 1, 1, 0, 0, 1)));
-        assert_eq!(filetime_ceil(base), Some(t(1970, 1, 1, 0, 0, 0)));
         assert_eq!(
-            filetime_ceil(base + 9_999_999),
+            filetime_floor(base + 9_999_999),
+            Some(t(1970, 1, 1, 0, 0, 0))
+        );
+        assert_eq!(
+            filetime_floor(base + 10_000_000),
             Some(t(1970, 1, 1, 0, 0, 1))
         );
     }
@@ -196,11 +187,9 @@ mod tests {
     #[test]
     fn out_of_range() {
         assert_eq!(filetime_floor(-1), None);
-        assert_eq!(filetime_ceil(-1), None);
         assert_eq!(since_1601(-1), None);
         // i64::MAX intervals is about year 30828 — beyond 9999.
         assert_eq!(filetime_floor(i64::MAX), None);
-        assert_eq!(filetime_ceil(i64::MAX), None);
         let last = kerberos_time_seconds(&t(9999, 12, 31, 23, 59, 59));
         assert_eq!(from_seconds(last), Some(t(9999, 12, 31, 23, 59, 59)));
         assert_eq!(from_seconds(last + 1), None);

@@ -612,14 +612,20 @@ fn missing_or_inconsistent_user_account_control() {
     }
 }
 
-/// docs/47 §4.5 (R47-7): revoked_before = max(whenCreated + 1 s,
-/// ceil_s(pwdLastSet)), pwdLastSet absent / 0 not counted.
+/// docs/47 §4.5 (R47-7) as fixed by Q-965 (a) / A-161: revoked_before =
+/// max(whenCreated + 1 s, floor_s(pwdLastSet) + 1 s), pwdLastSet absent / 0
+/// not counted — a ticket first authenticated at or before the second of
+/// the last password set is revoked.
 /// - whenCreated = 2026-11-01T00:00:00Z, pwdLastSet = 2026-11-05T12:00:00.5Z
-///   → ceil = 12:00:01, the later → 2026-11-05T12:00:01Z;
+///   → floor = 12:00:00, + 1 s, the later → 2026-11-05T12:00:01Z;
+/// - pwdLastSet at the whole second 2026-11-13T10:00:30Z (the form dird
+///   writes) → 10:00:31: a ticket of 10:00:30 itself is revoked (the
+///   same-second window of Q-965 closed), one of 10:00:31 is not;
 /// - pwdLastSet 0 (DP account) → whenCreated + 1 s = 2026-11-01T00:00:01Z;
 /// - pwdLastSet earlier than whenCreated → whenCreated + 1 s.
 ///
-/// RFC 4120 3.3.3.1: a TGT whose authtime is in the range is rejected.
+/// RFC 4120 3.3.3.1: a TGT whose authtime is in the range is rejected;
+/// RFC 4120 5.2.3: authtime has no fractional seconds.
 #[test]
 fn revoked_before_derivation() {
     let d = Dir::standard("revoked-before");
@@ -646,12 +652,26 @@ fn revoked_before_derivation() {
                 ("pwdLastSet", vec![int64(EXPIRES_2026)]),
             ],
         ),
+        // pwdLastSet 2026-11-13T10:00:30Z, a whole second.
+        d.user(
+            63,
+            STAFF_OU,
+            "whole",
+            &[
+                ("userAccountControl", normal()),
+                ("pwdLastSet", vec![int64(NOW_PLUS_30_FILETIME)]),
+            ],
+        ),
     ]);
     let view = d.view();
     let alice = client(&view, &["alice"]).unwrap().unwrap().state;
     assert_eq!(alice.revoked_before, Some(kt(2026, 11, 5, 12, 0, 1)));
     assert!(alice.revokes(&kt(2026, 11, 5, 12, 0, 0)));
     assert!(!alice.revokes(&kt(2026, 11, 5, 12, 0, 1)));
+    let whole = client(&view, &["whole"]).unwrap().unwrap().state;
+    assert_eq!(whole.revoked_before, Some(kt(2026, 11, 13, 10, 0, 31)));
+    assert!(whole.revokes(&kt(2026, 11, 13, 10, 0, 30)));
+    assert!(!whole.revokes(&kt(2026, 11, 13, 10, 0, 31)));
     let zero = client(&view, &["zero"]).unwrap().unwrap().state;
     assert_eq!(zero.revoked_before, Some(kt(2026, 11, 1, 0, 0, 1)));
     let older = client(&view, &["older"]).unwrap().unwrap().state;

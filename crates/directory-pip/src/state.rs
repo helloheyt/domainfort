@@ -12,7 +12,7 @@
 
 use crate::error::Fault;
 use crate::salt::AccountKind;
-use crate::time::{filetime_ceil, filetime_floor, from_seconds, since_1601};
+use crate::time::{filetime_floor, from_seconds, since_1601};
 use ad_schema::flags::user_account_control::{
     ADS_UF_ACCOUNT_DISABLE, ADS_UF_DONT_EXPIRE_PASSWD, ADS_UF_INTERDOMAIN_TRUST_ACCOUNT,
     ADS_UF_NORMAL_ACCOUNT, ADS_UF_PASSWORD_EXPIRED, ADS_UF_SERVER_TRUST_ACCOUNT,
@@ -145,41 +145,59 @@ pub(crate) fn expires(account_expires: Option<i64>) -> Result<Option<KerberosTim
     }
 }
 
-/// `revoked_before` (docs/47 §4.5, R47-7):
-/// `max(whenCreated + 1 s, ceil_s(pwdLastSet))`, pwdLastSet absent or 0 not
-/// counted.
+/// `revoked_before` (docs/47 §4.5, R47-7; Q-965 option (a), A-161):
+/// `max(whenCreated + 1 s, floor_s(pwdLastSet) + 1 s)`, pwdLastSet absent or
+/// 0 not counted. This is the one definition of the cut; the one comparison
+/// is kdc `AccountState::revokes` (`authtime < revoked_before`), which every
+/// revocation path uses (the KDC's AS and TGS, the LDAP bind, the write
+/// PEP's `AdminSubject` — admin reset and kpasswd alike).
 ///
-/// - whenCreated (DSTIME, [MS-DRSR] 5.51) revokes every TGT issued before
-///   the current account existed — every TGT of a former holder of the name
-///   (RFC 4120 §6.2 "stale entries"; A-18: a delete frees the name). `+1 s`
-///   because authtime and DSTIME are whole seconds.
-/// - pwdLastSet (FILETIME, [MS-DTYP] 2.3.3) revokes TGTs older than the last
-///   password set, rounded UP to the second for the same reason.
+/// authtime is a whole second (KerberosTime has no fractional seconds,
+/// RFC 4120 5.2.3), so `authtime < S + 1 s` ⇔ `authtime ≤ S`: an event in
+/// second `S` revokes every ticket first authenticated **at or before** `S`.
+///
+/// - whenCreated (DSTIME, whole seconds, [MS-DRSR] 5.51) revokes every TGT
+///   issued at or before the second the current account came to exist —
+///   every TGT of a former holder of the name (RFC 4120 §6.2 "stale
+///   entries"; A-18: a delete frees the name).
+/// - pwdLastSet (FILETIME, 100-ns intervals, [MS-DTYP] 2.3.3) revokes every
+///   ticket first authenticated at or before the second of the last
+///   password set — including one authenticated in that very second, so a
+///   ticket that made a change cannot make another (docs/53 R53-9; Q-965:
+///   the earlier `ceil_s(pwdLastSet)` left a ticket of the same second
+///   alive when pwdLastSet is a whole second, as dird writes it). The cost
+///   — a ticket obtained in the same second **after** a set is revoked too
+///   (the client authenticates again) — is the fail-closed side.
 /// - whenCreated is set by the system on create (docs/46 §5.4, systemOnly);
 ///   an account without it is an inconsistent record: `Err` (fail closed —
 ///   without it a reused name could inherit an older account's TGTs;
 ///   Q-136 item 3).
 ///
 /// Spec: RFC 4120 3.3.3.1 (the hot-list: "a range of issue timestamps"),
-/// §6.2; [MS-DRSR] 5.51; [MS-DTYP] 2.3.3; docs/47 §4.5 (R47-7); A-27.
+/// 5.2.3, §6.2; [MS-DRSR] 5.51; [MS-DTYP] 2.3.3; docs/47 §4.5 (R47-7);
+/// A-27; Q-965 (a) / A-161.
 pub(crate) fn revoked_before(
     when_created: Option<i64>,
     pwd_last_set: Option<i64>,
 ) -> Result<KerberosTime, Fault> {
     let created = when_created.ok_or(Fault::Unavailable)?;
-    let after_creation = created
-        .checked_add(1)
-        .and_then(since_1601)
-        .ok_or(Fault::Unavailable)?;
-    let mut cut = kerberos_time_seconds(&after_creation);
+    // The latest second the hot-list covers: whenCreated's, or the second
+    // of the last password set if that is later.
+    let created_second = since_1601(created).ok_or(Fault::Unavailable)?;
+    let mut last_revoked = kerberos_time_seconds(&created_second);
     match pwd_last_set {
         None | Some(0) => {}
         Some(ticks) => {
-            let set = filetime_ceil(ticks).ok_or(Fault::Unavailable)?;
-            cut = cut.max(kerberos_time_seconds(&set));
+            let set_second = filetime_floor(ticks).ok_or(Fault::Unavailable)?;
+            last_revoked = last_revoked.max(kerberos_time_seconds(&set_second));
         }
     }
-    from_seconds(cut).ok_or(Fault::Unavailable)
+    // The cut is the second after it: `authtime < cut` ⇔ `authtime ≤
+    // last_revoked` (RFC 4120 5.2.3: whole seconds).
+    last_revoked
+        .checked_add(1)
+        .and_then(from_seconds)
+        .ok_or(Fault::Unavailable)
 }
 
 /// The whole account state. `locked` is always `false`: phase 1 keeps no
@@ -208,6 +226,7 @@ pub(crate) fn account_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::time::FILETIME_TICKS_PER_SECOND;
 
     const N: u32 = ADS_UF_NORMAL_ACCOUNT;
     const WT: u32 = ADS_UF_WORKSTATION_TRUST_ACCOUNT;
@@ -263,5 +282,80 @@ mod tests {
         // Computers are exempt.
         assert!(enabled(Computer, Some(WT), None));
         assert!(enabled(Computer, Some(ST), Some(0)));
+    }
+
+    fn kt(y: u16, mo: u8, d: u8, h: u8, mi: u8, s: u8) -> KerberosTime {
+        KerberosTime::new(y, mo, d, h, mi, s).unwrap()
+    }
+
+    /// The account state with the rule's two inputs, through the one
+    /// comparison (kdc `AccountState::revokes`).
+    fn state(when_created: i64, pwd_last_set: Option<i64>) -> AccountState {
+        account_state(
+            AccountKind::User,
+            Some(N),
+            None,
+            pwd_last_set,
+            Some(when_created),
+        )
+        .unwrap()
+    }
+
+    /// Q-965 (a), A-161; docs/53 R53-9; docs/47 §4.5 (R47-7); RFC 4120
+    /// 3.3.3.1, 5.2.3 (authtime in whole seconds): a password set at the
+    /// whole second `S` — the form dird writes, `filetime(now)` — revokes a
+    /// ticket first authenticated in `S` itself and every earlier one; a
+    /// ticket of `S + 1 s` survives. A set within `S` (a fractional
+    /// FILETIME) gives the same cut.
+    ///
+    /// Values (hand-derived on the calendar, as in crate::time's tests):
+    /// `S` = 2026-11-13T10:00:00Z = 20 770 days after 1970-01-01 (20 758 to
+    /// 2026-11-01, + 12) = 1 794 528 000 s, + 10 h = 1 794 564 000 s, +
+    /// 11 644 473 600 s (1601 → 1970) = DSTIME 13 439 037 600; FILETIME =
+    /// DSTIME × 10^7 ([MS-DTYP] 2.3.3). whenCreated = 2026-11-01T00:00:00Z
+    /// = DSTIME 13 437 964 800 ([MS-DRSR] 5.51).
+    #[test]
+    fn a_password_set_revokes_its_own_second() {
+        const CREATED: i64 = 13_437_964_800;
+        const SET_DSTIME: i64 = 13_439_037_600;
+        let set = SET_DSTIME * FILETIME_TICKS_PER_SECOND;
+        let s = kt(2026, 11, 13, 10, 0, 0);
+        let s_plus_1 = kt(2026, 11, 13, 10, 0, 1);
+        for ticks in [set, set + 1, set + FILETIME_TICKS_PER_SECOND - 1] {
+            let account = state(CREATED, Some(ticks));
+            assert_eq!(account.revoked_before, Some(s_plus_1), "{ticks}");
+            // The same second as the set: revoked (the Q-965 window closed).
+            assert!(account.revokes(&s), "{ticks}");
+            assert!(account.revokes(&kt(2026, 11, 13, 9, 59, 59)), "{ticks}");
+            // One second later: not revoked.
+            assert!(!account.revokes(&s_plus_1), "{ticks}");
+        }
+        // The next whole second of FILETIME moves the cut by one second.
+        let next = state(CREATED, Some(set + FILETIME_TICKS_PER_SECOND));
+        assert!(next.revokes(&s_plus_1));
+        assert!(!next.revokes(&kt(2026, 11, 13, 10, 0, 2)));
+    }
+
+    /// docs/47 §4.5 (R47-7), the whenCreated half unchanged: a ticket of
+    /// the creation second (a former holder of the name) is revoked, one of
+    /// the next second is not; pwdLastSet absent, 0, or earlier than
+    /// whenCreated leaves whenCreated's cut. whenCreated absent ⇒ `Err`
+    /// (Q-136 item 3).
+    #[test]
+    fn the_creation_second_is_revoked() {
+        const CREATED: i64 = 13_437_964_800; // 2026-11-01T00:00:00Z
+        let created = kt(2026, 11, 1, 0, 0, 0);
+        let after = kt(2026, 11, 1, 0, 0, 1);
+        let earlier_set = (CREATED - 60) * FILETIME_TICKS_PER_SECOND;
+        for pwd_last_set in [None, Some(0), Some(earlier_set)] {
+            let account = state(CREATED, pwd_last_set);
+            assert_eq!(account.revoked_before, Some(after), "{pwd_last_set:?}");
+            assert!(account.revokes(&created), "{pwd_last_set:?}");
+            assert!(!account.revokes(&after), "{pwd_last_set:?}");
+        }
+        assert_eq!(
+            revoked_before(None, Some(earlier_set)),
+            Err(Fault::Unavailable)
+        );
     }
 }

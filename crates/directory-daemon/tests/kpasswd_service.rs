@@ -30,7 +30,8 @@
 //! `ChangePassword` decision and outcome events, `pwdLastSet` = dird's now)
 //! ⇒ the new password verifies in keyd and the old one does not; the same
 //! ticket again (a fresh Authenticator) ⇒ sealed AUTHERROR (the change
-//! revoked it — docs/53 R53-9) and the same request octets again ⇒ keyd's
+//! revoked it — docs/53 R53-9), also when dird's clock is in the AS's own
+//! second (Q-965 (a), A-161), and the same request octets again ⇒ keyd's
 //! replay cache ⇒ unsealed AUTHERROR; a computer ⇒ sealed ACCESSDENIED; a
 //! Tier0 account ⇒ sealed ACCESSDENIED (Q-608 item 1, strict default); a
 //! policy-violating new password ⇒ sealed SOFTERROR with no result string,
@@ -769,8 +770,9 @@ fn serve_audit(
 // ---------------------------------------------------------------------------
 
 /// dird's clock: the kdc fixtures' `now` plus the test's offset in seconds
-/// (1 by default — so the change's `pwdLastSet` lies after the ticket's
-/// authtime, docs/47 §4.5).
+/// (`Options::dird_offset`: 1 by default, so the change's `pwdLastSet`
+/// lies a second after the ticket's authtime; 0 puts it in the AS's own
+/// second — docs/47 §4.5, Q-965).
 struct FixedNow(Arc<AtomicI64>);
 
 impl Clock for FixedNow {
@@ -803,6 +805,9 @@ struct Options {
     /// A hook recording alice's `pwdLastSet` and the change-seq counter at
     /// every `Decision(Proceed)` of a `ChangePassword`.
     hook: bool,
+    /// dird's clock, in seconds after the kdc fixtures' `now` (the AS's
+    /// authtime).
+    dird_offset: i64,
 }
 
 impl Default for Options {
@@ -813,6 +818,7 @@ impl Default for Options {
             // answers in time (A-95 follow-up, Q-441).
             ack_deadline: DecisionAckDeadline::new(MAX_DECISION_ACK_DEADLINE).unwrap(),
             hook: false,
+            dird_offset: 1,
         }
     }
 }
@@ -911,7 +917,7 @@ impl World {
 
         // dird.
         let mut params = support::params(&dir, uid, uid, Duration::from_secs(5), 4);
-        params.clock = SharedClock::new(FixedNow(Arc::new(AtomicI64::new(1))));
+        params.clock = SharedClock::new(FixedNow(Arc::new(AtomicI64::new(options.dird_offset))));
         let realm = common::realm();
         let verifier: VerifierFactory = {
             let (socket, realm) = (keyd_socket.clone(), realm.clone());
@@ -1355,6 +1361,57 @@ fn an_armored_change_password_ticket_changes_the_password() {
         world.send(&ap_req, &krb_priv).unwrap(),
         KpasswdAnswer::Unsealed(UnsealedCode::AuthError)
     );
+}
+
+/// Q-965 (a) / A-161; docs/53 R53-9 exact ("one INITIAL ticket ⇒ at most
+/// one change"); docs/47 §4.5 (R47-7); RFC 4120 §3.3.3.1, §5.2.3 (authtime
+/// in whole seconds): dird's clock in the AS's own second (offset 0) — the
+/// change's `pwdLastSet` is the authtime's whole second — and the same
+/// ticket with a fresh Authenticator (keyd's verdict again `Acceptable`) ⇒
+/// sealed AUTHERROR, its decision event `Unauthenticated`: the change
+/// revoked the ticket of its own second. Under the former
+/// `ceil_s(pwdLastSet)` cut this second change passed (Q-965).
+#[test]
+fn a_change_in_the_tickets_own_second_revokes_it() {
+    let Some(world) = World::new(Options {
+        dird_offset: 0,
+        ..Options::default()
+    }) else {
+        return;
+    };
+    let held = alice_ticket();
+    let (ap_req, krb_priv, cusec) = request(&held, NEW_PASSWORD);
+    let answer = world.send(&ap_req, &krb_priv).unwrap();
+    assert_eq!(
+        result_of(&held, &sealed(answer), cusec),
+        ResultCode::Success
+    );
+    // pwdLastSet = dird's now = the AS's second ([MS-DTYP] 2.3.3 via
+    // directory-admin `filetime`).
+    let filetime = directory_admin::filetime(&common::now()).unwrap();
+    assert_eq!(
+        alice_pwd_last_set(&world.store),
+        filetime.to_be_bytes().to_vec()
+    );
+    assert!(world.alice_password_is(NEW_PASSWORD));
+
+    // The same ticket, a fresh Authenticator, in the same second: revoked.
+    let other = "Quill-Marsh-31-Pebble";
+    let (ap_req2, krb_priv2, cusec2) = request(&held, other);
+    let answer = world.send(&ap_req2, &krb_priv2).unwrap();
+    assert_eq!(
+        result_of(&held, &sealed(answer), cusec2),
+        ResultCode::Failure(krb_proto::NonZeroResultCode::AuthError)
+    );
+    let events = await_change_events(&world, 3);
+    assert_eq!(
+        events[2].stage,
+        DirAdminStage::Decision(DecisionResult::Refused(
+            ipc_audit::AdminRefusal::Unauthenticated
+        ))
+    );
+    assert!(world.alice_password_is(NEW_PASSWORD));
+    assert!(!world.alice_password_is(other));
 }
 
 /// docs/53 R53-1, §5.6 step 4, §5.7: a computer's request (its ticket sealed

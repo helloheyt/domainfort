@@ -27,7 +27,9 @@
 //!   function for the password path and PA-ETYPE-INFO2.
 //! - **State (R47-5, R47-6, R47-7):** enabled / expired / usable from
 //!   userAccountControl, accountExpires, pwdLastSet; `locked = false`;
-//!   `revoked_before = max(whenCreated + 1 s, ceil_s(pwdLastSet))`.
+//!   `revoked_before = max(whenCreated + 1 s, floor_s(pwdLastSet) + 1 s)` —
+//!   a ticket first authenticated at or before the second of the account's
+//!   creation or of its last password set is revoked (Q-965 (a), A-161).
 //! - **Groups (R47-8):** a bounded transitive closure over memberOf, security
 //!   groups only; a cycle or a bound exceeded is an error.
 //! - **Tier (R47-9):** a [`TierMap`] passed in as data, plus DC accounts,

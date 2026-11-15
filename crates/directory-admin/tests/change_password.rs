@@ -95,11 +95,21 @@ fn change(d: &Domain, sam: &str) -> ChangePasswordRequest {
 /// transaction began, as dird does; on success the write is acknowledged,
 /// applied and committed.
 fn run(d: &mut Domain, request: &ChangePasswordRequest) -> Result<(DirAdminEvent, Reply), Refusal> {
+    run_at(d, request, &now())
+}
+
+/// [`run`] with dird's clock at `at` (the decision and the write's
+/// `pwdLastSet` alike).
+fn run_at(
+    d: &mut Domain,
+    request: &ChangePasswordRequest,
+    at: &KerberosTime,
+) -> Result<(DirAdminEvent, Reply), Refusal> {
     let mut txn = d.store.begin_write().unwrap();
     let view = d.ctx.view(&d.store, &d.tiers).unwrap();
     let prepared = d
         .admin
-        .prepare_change_password(request, &view, &d.policy, &now());
+        .prepare_change_password(request, &view, &d.policy, at);
     drop(view);
     let prepared = match prepared {
         Ok(prepared) => prepared,
@@ -109,10 +119,7 @@ fn run(d: &mut Domain, request: &ChangePasswordRequest) -> Result<(DirAdminEvent
         }
     };
     let decision = prepared.decision_event().clone();
-    let applied = d
-        .admin
-        .apply(acknowledged(prepared), &mut txn, &now())
-        .unwrap();
+    let applied = d.admin.apply(acknowledged(prepared), &mut txn, at).unwrap();
     txn.commit().unwrap();
     assert_eq!(
         applied.outcome_event().stage,
@@ -241,6 +248,34 @@ fn the_ticket_of_a_change_is_revoked_by_it() {
     assert_eq!(change_password_result(&r), NonZeroResultCode::AuthError);
 }
 
+/// Q-965 (a) / A-161; docs/53 R53-9 exact; docs/47 §4.5 (R47-7); RFC 4120
+/// 3.3.3.1, 5.2.3 (authtime in whole seconds): a ticket first
+/// authenticated in the **same second** as dird's clock makes a change —
+/// `pwdLastSet` = that whole second ([MS-DTYP] 2.3.3 via `filetime`) — and
+/// is revoked by it: a second change with it (a fresh Authenticator, keyd's
+/// verdict again `Acceptable`) is refused (`Unauthenticated` ⇒ AUTHERROR).
+/// A ticket first authenticated one second later is not revoked by that
+/// change: its change, with dird's clock in that later second, passes.
+#[test]
+fn a_ticket_of_the_changes_own_second_is_revoked_by_it() {
+    let mut d = self_change_domain("cp-same-second", Some(Tier::Tier2));
+    let first = change_at(&d, "alice", now());
+    run(&mut d, &first).unwrap();
+    let obj = d.object(guid(ALICE)).unwrap();
+    assert_eq!(
+        obj.attribute(d.attr("pwdLastSet")).unwrap().values[0].value,
+        int64(NOW_FILETIME)
+    );
+    let again = change_at(&d, "alice", now());
+    let r = run(&mut d, &again).unwrap_err();
+    assert_eq!(refusal_code(&r), AdminRefusal::Unauthenticated);
+    assert_eq!(change_password_result(&r), NonZeroResultCode::AuthError);
+    // One second later: a new ticket, a new second.
+    let later = kt(2026, 11, 13, 10, 0, 1);
+    let next = change_at(&d, "alice", later);
+    assert!(run_at(&mut d, &next, &later).is_ok());
+}
+
 /// [MS-ADTS] 3.1.1.3.1.5.1 ("on itself"): the right comes from the object's
 /// own ACL — without the PRINCIPAL_SELF ACE the change is the PDP's Deny
 /// (layer 5, `Acl`); without the coarse rule it is `NoGrant` (layer 3).
@@ -336,6 +371,12 @@ fn unusable_accounts_and_stale_tickets_are_autherror() {
         // Before the provisioning's pwdLastSet (2026-11-01T00:00:00Z).
         (
             change_at(&d, "alice", kt(2026, 10, 31, 23, 59, 59)),
+            AdminRefusal::Unauthenticated,
+        ),
+        // In its very second (also the creation second, docs/47 §4.5):
+        // revoked too — at or before the second of the set (Q-965 (a)).
+        (
+            change_at(&d, "alice", kt(2026, 11, 1, 0, 0, 0)),
             AdminRefusal::Unauthenticated,
         ),
         // 601 s before `now` (2026-11-13T10:00:00Z): over the 600 s

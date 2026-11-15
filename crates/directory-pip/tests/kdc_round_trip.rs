@@ -927,6 +927,30 @@ fn password_reset_revokes_older_tgts() {
     assert_eq!(error.error_code, KDC_ERR_TGT_REVOKED);
 }
 
+/// Q-965 (a) / A-161 end to end (docs/47 §4.5, R47-7; RFC 4120 3.3.3.1,
+/// 5.2.3): a password set at the whole second of the TGT's authtime (`now`,
+/// the form dird writes) revokes the TGT — the next armored TGS is
+/// KDC_ERR_TGT_REVOKED. Under the former `ceil_s(pwdLastSet)` cut this TGT
+/// survived. pwdLastSet = FILETIME of `now` = that of `now + 30 s` less
+/// 30 × 10^7 ([MS-DTYP] 2.3.3; tests/common).
+#[test]
+fn a_password_set_in_the_tgts_second_revokes_it() {
+    const NOW_FILETIME: i64 = NOW_PLUS_30_FILETIME - 30 * 10_000_000;
+    let d = Dir::standard("tgt-revoked-same-second");
+    let mut kdc = kdc_for(&d);
+    let tiers = TierMap::empty();
+    let tgt = obtain_tgt(&d, &mut kdc, &tiers);
+    d.set(ALICE, "pwdLastSet", vec![int64(NOW_FILETIME)]);
+    let error = error_of(send(
+        &d,
+        &mut kdc,
+        &tiers,
+        &tgs_req(&tgt, service_name(), at(1)),
+        at(1),
+    ));
+    assert_eq!(error.error_code, KDC_ERR_TGT_REVOKED);
+}
+
 /// docs/47 §4.1 end to end: disabling the account (userAccountControl D)
 /// after the TGT was issued refuses the next TGS (re-evaluation at use,
 /// D53 → KDC_ERR_CLIENT_REVOKED).
