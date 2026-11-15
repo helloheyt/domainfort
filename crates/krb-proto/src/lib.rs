@@ -21,14 +21,22 @@
 //!   [`EncTgsRepPart`], [`EncKdcRepPart`], [`LastReq`];
 //! - AP exchange (5.5): [`ApReq`], [`Authenticator`], [`ApRep`],
 //!   [`EncApRepPart`];
+//! - KRB_PRIV (5.7.1): [`KrbPriv`], [`EncKrbPrivPart`] (its `user-data` is a
+//!   secret [`UserData`]);
 //! - [`KrbError`] and [`MethodData`] (5.9.1);
 //! - FAST (RFC 6113 5.4): [`PaFxFastRequest`], [`KrbFastArmoredReq`],
 //!   [`KrbFastArmor`], [`KrbFastReq`], [`FastOptions`], [`PaFxFastReply`],
 //!   [`KrbFastArmoredRep`], [`KrbFastResponse`], [`KrbFastFinished`],
 //!   [`EncryptedChallenge`]. The FAST types carry RFC 6113 extension markers
-//!   but undefined components are still rejected (docs/questions/Q-032).
+//!   but undefined components are still rejected (docs/questions/Q-032);
+//! - change-password user data (RFC 3244 §2; docs/53 task K1):
+//!   [`ChangePasswdData`] (its `newpasswd` is a secret [`NewPasswd`]; a set
+//!   request is decoded but unreachable — [`PasswordRequest`], Q-600) and the
+//!   result data with the closed code sets [`ResultCode`] /
+//!   [`NonZeroResultCode`]. The message framing is the `parse-kpasswd`
+//!   crate's.
 //!
-//! Not here (later tasks): KRB-SAFE / KRB-PRIV / KRB-CRED,
+//! Not here (later tasks): KRB-SAFE / KRB-CRED,
 //! the AD-* authorization containers, TYPED-DATA. Weak or excluded mechanisms
 //! have no code path: PA-PW-SALT / ETYPE-INFO are not implemented, and no
 //! encryption-type numbers are defined here (etype policy is the crypto
@@ -81,12 +89,14 @@
 //!
 //! # Secrets
 //!
-//! [`EncryptionKey`]`.keyvalue` is a [`KeyValue`]: held in a RustCrypto
-//! `zeroize::Zeroizing` buffer (wiped on drop), redacted in `Debug`, never put
-//! in an error (no [`Error`] variant carries input content). Types that carry
-//! a key ([`EncryptionKey`], [`EncTicketPart`], [`EncAsRepPart`],
-//! [`EncTgsRepPart`], [`Authenticator`], [`EncApRepPart`],
-//! [`KrbFastResponse`]) scrub the
+//! [`EncryptionKey`]`.keyvalue` is a [`KeyValue`], EncKrbPrivPart `user-data`
+//! a [`UserData`], ChangePasswdData `newpasswd` a [`NewPasswd`] — three names
+//! for one definition: held in a RustCrypto `zeroize::Zeroizing` buffer (wiped
+//! on drop), redacted in `Debug`, never put in an error (no [`Error`] variant
+//! carries input content). Types that carry secret octets ([`EncryptionKey`],
+//! [`EncTicketPart`], [`EncAsRepPart`], [`EncTgsRepPart`], [`Authenticator`],
+//! [`EncApRepPart`], [`KrbFastResponse`], [`EncKrbPrivPart`],
+//! [`ChangePasswdData`]) scrub the
 //! intermediate `parse-asn1` value tree on decode and encode, and return their
 //! encoding in a `Zeroizing<Vec<u8>>`. Residual: transient buffers allocated
 //! inside `parse-asn1` while encoding (and the caller's own input buffer) are
@@ -108,9 +118,14 @@
 //! (AGENTS.md §1-3): RFC 4120 (§1.5, §5, §6.2, §7.5, Appendix A), ITU-T X.680
 //! (02/2021) clauses 22 and 46 and Table 8, ITU-T X.690 (02/2021) clauses
 //! 8.6, 8.9, 8.10, 8.13, 8.14 and 11.7, and RFC 6113 (§5.2, §5.4, §6, §7,
-//! Appendix B) for FAST. No other implementation was consulted or recalled.
+//! Appendix B) for FAST. KRB_PRIV and the change-password user data: RFC 4120
+//! §3.5, §5.6.1, §5.7.1, §5.10, §7.5.7; RFC 3244 §2 (read in full); [MS-KILE]
+//! v20261110 3.1.5.12; X.680 (02/2021) 13.2, 31.2.7; the project's design
+//! docs/53 (§5.4, §5.7, §5.9, §10 K1) with decision A-117
+//! (docs/questions/Q-600, Q-603, Q-604). No other implementation was
+//! consulted or recalled.
 //!
-//! Spec: RFC 4120 §5, Appendix A; RFC 6113 §5.4, Appendix B.
+//! Spec: RFC 4120 §5, Appendix A; RFC 6113 §5.4, Appendix B; RFC 3244 §2.
 
 #[macro_use]
 mod macros;
@@ -123,7 +138,9 @@ mod error;
 mod fast;
 mod flags;
 mod kdc;
+mod kpasswd;
 mod krb_error;
+mod krb_priv;
 pub mod limits;
 mod preauth;
 mod ticket;
@@ -144,6 +161,8 @@ pub use kdc::{
     AsRep, AsReq, EncAsRepPart, EncKdcRepPart, EncTgsRepPart, KdcRep, KdcReq, KdcReqBody,
     KdcRequest, LastReq, LastReqEntry, TgsRep, TgsReq,
 };
+pub use kpasswd::{ChangePasswdData, NewPasswd, NonZeroResultCode, PasswordRequest, ResultCode};
 pub use krb_error::{KrbError, MethodData};
+pub use krb_priv::{EncKrbPrivPart, KrbPriv, UserData};
 pub use preauth::{EtypeInfo2, EtypeInfo2Entry, PaEncTimestamp, PaEncTsEnc};
 pub use ticket::{EncTicketPart, Ticket, TransitedEncoding};

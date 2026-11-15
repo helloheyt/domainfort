@@ -809,6 +809,13 @@ name = "parse-asn1"
 version = "0.0.0"
 
 [[package]]
+name = "parse-kpasswd"
+version = "0.0.0"
+dependencies = [
+ "krb-proto",
+]
+
+[[package]]
 name = "parse-ldap"
 version = "0.0.0"
 

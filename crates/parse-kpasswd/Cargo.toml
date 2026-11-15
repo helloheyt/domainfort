@@ -1,0 +1,33 @@
+# parse-kpasswd — the RFC 3244 change-password message framing (docs/53 §5.1,
+# §5.9, task K2; decision A-117).
+#
+# A network-facing parser crate of its own, for the future `kpasswd-front`
+# process (docs/53 R53-4; docs/03 §principles: every network-facing parser in a
+# separate, unprivileged process). It frames and bounds the request and reply
+# messages of RFC 3244 §2 (message length, protocol version number, AP_REQ /
+# AP_REP length, the two Kerberos messages) and the 4-octet TCP header, and hands
+# out borrowed slices. It does NOT decode DER: the AP-REQ and the KRB-PRIV are
+# opaque octets here, opened only by keyd through krb-proto (docs/53 §5.1).
+#
+# Its one dependency is this workspace's own krb-proto, for the closed RFC 3244
+# result-code type (`NonZeroResultCode`) that every framing error maps to
+# (docs/53 §5.7); no third-party crate is added (AGENTS.md §7).
+#
+# Written only from RFC 3244 §2 (read in full) and RFC 4120 (§5.7.1, §5.9.1 for
+# the message names), opened in-session from the pinned cache, and from the
+# project's design docs/53 / docs/questions/Q-602..Q-604 — AGENTS.md §1-3. No
+# other implementation consulted or recalled.
+
+[package]
+name = "parse-kpasswd"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Our own Kerberos codec (path dependency, same workspace): only for the closed
+# result-code type `NonZeroResultCode` (RFC 3244 §2; docs/53 §4.5, §5.7).
+krb-proto = { path = "../krb-proto" }
+
+[lints]
+workspace = true

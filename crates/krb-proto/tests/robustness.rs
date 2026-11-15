@@ -52,10 +52,16 @@ fn all_decoders(data: &[u8]) {
     check!(krb_proto::KrbFastArmoredRep, data);
     check!(krb_proto::KrbFastResponse, data);
     check!(krb_proto::KrbFastFinished, data);
+    // RFC 4120 5.7.1 KRB_PRIV and the RFC 3244 §2 ChangePasswdData.
+    check!(krb_proto::KrbPriv, data);
+    check!(krb_proto::EncKrbPrivPart, data);
+    check!(krb_proto::ChangePasswdData, data);
+    check!(krb_proto::HostAddress, data);
 }
 
 /// Seeds: a TGT, a service ticket, an AP-REQ around the TGT, an AS-REQ body,
-/// and an EncTicketPart (RFC 4120 5.3, 5.4.1, 5.5.1).
+/// an EncTicketPart (RFC 4120 5.3, 5.4.1, 5.5.1), a ChangePasswdData (RFC 3244
+/// §2), an EncKrbPrivPart and a KRB-PRIV (RFC 4120 5.7.1).
 fn seeds() -> Vec<Vec<u8>> {
     let (tgt_der, _) = tgt();
     let (st_der, _) = service_ticket();
@@ -103,7 +109,49 @@ fn seeds() -> Vec<Vec<u8>> {
             &ctx(7, &gtime(b"20261113190000Z")),
         ]),
     );
-    vec![tgt_der, st_der, ap_req, as_req, body, enc_ticket_part]
+    // RFC 4120 5.7.1 KRB-PRIV / EncKrbPrivPart and RFC 3244 §2
+    // ChangePasswdData (set form, so every optional component is present).
+    let change_passwd_data = seq(&[
+        &ctx(0, &octets(b"seed-password")),
+        &ctx(1, &pname_der(&[0x01], &["bob"])),
+        &ctx(2, &gstring(b"EXAMPLE.ORG")),
+    ]);
+    let enc_krb_priv_part = app(
+        28,
+        &seq(&[
+            &ctx(0, &octets(&change_passwd_data)),
+            &ctx(1, &gtime(b"20261115120000Z")),
+            &ctx(2, &int(&[0x01, 0x86, 0xA0])),
+            &ctx(3, &int(&[0x3A, 0x5C, 0x0F, 0x21])),
+            &ctx(
+                4,
+                &seq(&[&ctx(0, &int(&[0x03])), &ctx(1, &octets(&[0; 4]))]),
+            ),
+            &ctx(
+                5,
+                &seq(&[&ctx(0, &int(&[0x02])), &ctx(1, &octets(&[10, 0, 0, 1]))]),
+            ),
+        ]),
+    );
+    let krb_priv = app(
+        21,
+        &seq(&[
+            &ctx(0, &int(&[0x05])),
+            &ctx(1, &int(&[0x15])),
+            &ctx(3, &enc_data_der(&[0x12], Some(&[0x01]), &[9, 8, 7])),
+        ]),
+    );
+    vec![
+        tgt_der,
+        st_der,
+        ap_req,
+        as_req,
+        body,
+        enc_ticket_part,
+        change_passwd_data,
+        enc_krb_priv_part,
+        krb_priv,
+    ]
 }
 
 #[test]

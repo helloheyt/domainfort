@@ -171,6 +171,33 @@ pub enum Error {
     /// A SEQUENCE OF had more elements than this crate's documented bound for
     /// that field (see [`crate::limits`]). Resource bound (AGENTS.md §6).
     TooManyElements,
+
+    /// A ChangePasswdData `newpasswd` was longer than
+    /// [`crate::limits::MAX_NEWPASSWD_LEN`] octets. A distinct variant so
+    /// keyd can answer it with the PasswordRefused verdict (SOFTERROR), as
+    /// docs/53 §5.7 asks for a password that is "too long".
+    /// Spec: docs/53 §5.4 item 4, §5.9 (project bound; RFC 3244 §2 states
+    /// none).
+    NewPasswdTooLong,
+
+    /// Change-password result data was not exactly the two octets of a result
+    /// code: shorter is truncated; longer would carry a result string, which
+    /// this project never sends and does not accept.
+    /// Spec: RFC 3244 §2 ("result code (16 bits)"; the result string "may be
+    /// omitted"); docs/questions/Q-604 item 5 (always omitted).
+    ResultDataLength,
+
+    /// A change-password result code outside the values RFC 3244 §2 defines
+    /// (0-7). 0xFFFF ("some other reason") is outside the closed set: this
+    /// project never sends it.
+    /// Spec: RFC 3244 §2 ("The result code must have one of the following
+    /// values"); docs/questions/Q-604 item 4.
+    UnknownResultCode,
+
+    /// Result code 0 (KRB5_KPASSWD_SUCCESS) where only a failure code is
+    /// allowed.
+    /// Spec: RFC 3244 §2 (SUCCESS "is not allowed in a KRB-ERROR message").
+    SuccessNotAllowed,
 }
 
 impl fmt::Display for Error {
@@ -205,6 +232,10 @@ impl fmt::Display for Error {
             Error::KerberosFlagsLength => "KerberosFlags is not exactly 32 bits",
             Error::EmptySequenceOf => "SEQUENCE OF must not be empty here",
             Error::TooManyElements => "SEQUENCE OF exceeds its element bound",
+            Error::NewPasswdTooLong => "newpasswd exceeds its length bound",
+            Error::ResultDataLength => "result data is not exactly a 16-bit result code",
+            Error::UnknownResultCode => "result code value not defined",
+            Error::SuccessNotAllowed => "result code 0 where a failure code is required",
         };
         f.write_str(msg)
     }

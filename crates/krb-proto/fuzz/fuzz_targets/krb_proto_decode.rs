@@ -38,6 +38,7 @@ fuzz_target!(|data: &[u8]| {
     check!(krb_proto::TgsRep, data);
     check!(krb_proto::ApReq, data);
     check!(krb_proto::ApRep, data);
+    check!(krb_proto::KrbPriv, data);
     check!(krb_proto::KrbError, data);
     check!(krb_proto::Ticket, data);
     // Decrypted parts (keyd decodes these after decryption).
@@ -46,6 +47,10 @@ fuzz_target!(|data: &[u8]| {
     check!(krb_proto::EncTgsRepPart, data);
     check!(krb_proto::Authenticator, data);
     check!(krb_proto::EncApRepPart, data);
+    check!(krb_proto::EncKrbPrivPart, data);
+    // RFC 3244 §2 ChangePasswdData (keyd decodes it from the decrypted
+    // EncKrbPrivPart user-data; docs/53 §5.9).
+    check!(krb_proto::ChangePasswdData, data);
     // Typed-hole contents decoded on their own.
     check!(krb_proto::PaEncTsEnc, data);
     check!(krb_proto::EtypeInfo2, data);

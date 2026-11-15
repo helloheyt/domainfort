@@ -11,7 +11,6 @@ use crate::error::{Error, Result};
 use crate::limits::{MAX_AUTHORIZATION_ELEMENTS, MAX_HOST_ADDRESSES, MAX_NAME_COMPONENTS};
 use core::fmt;
 use parse_asn1::Value;
-use zeroize::Zeroizing;
 
 // ===========================================================================
 // KerberosString / Realm — RFC 4120 5.2.1, 5.2.2
@@ -612,71 +611,21 @@ der_codec!(EncryptedData, "EncryptedData");
 // EncryptionKey — RFC 4120 5.2.9
 // ===========================================================================
 
-/// The `keyvalue` octets of an EncryptionKey — key material.
-///
-/// Held in a RustCrypto [`Zeroizing`] buffer, wiped on drop. `Debug` never
-/// prints the octets. Equality compares every octet without an early exit on
-/// the first difference; it is meant for bookkeeping and tests, not as a
-/// verified constant-time primitive — authentication decisions must never be
-/// made by comparing keys.
-///
-/// Spec: RFC 4120 5.2.9 ("This field contains the key itself"); AGENTS.md §6.
-#[derive(Clone)]
-pub struct KeyValue(Zeroizing<Vec<u8>>);
-
-impl KeyValue {
-    /// Take ownership of key octets (no copy is made).
-    pub fn new(bytes: Vec<u8>) -> Self {
-        KeyValue(Zeroizing::new(bytes))
-    }
-
-    /// Copy key octets into a new zeroizing buffer of exactly the right
-    /// capacity (so no reallocation leaves a stale copy behind).
-    pub fn from_slice(bytes: &[u8]) -> Self {
-        let mut buffer = Vec::with_capacity(bytes.len());
-        buffer.extend_from_slice(bytes);
-        KeyValue(Zeroizing::new(buffer))
-    }
-
-    /// The key octets.
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-
-    /// Number of key octets.
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    /// `true` if there are no key octets.
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
+secret_octets! {
+    /// The `keyvalue` octets of an EncryptionKey — key material.
+    ///
+    /// Held in a RustCrypto `Zeroizing` buffer, wiped on drop. `Debug` never
+    /// prints the octets. Equality compares every octet without an early exit
+    /// on the first difference; it is meant for bookkeeping and tests, not as
+    /// a verified constant-time primitive — authentication decisions must
+    /// never be made by comparing keys. (Defined by the crate's one
+    /// secret-octets definition, shared with [`crate::UserData`] and
+    /// [`crate::NewPasswd`].)
+    ///
+    /// Spec: RFC 4120 5.2.9 ("This field contains the key itself");
+    /// AGENTS.md §6.
+    KeyValue
 }
-
-impl fmt::Debug for KeyValue {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Secrets never appear in debug output (AGENTS.md §6).
-        f.write_str("KeyValue(<redacted>)")
-    }
-}
-
-impl PartialEq for KeyValue {
-    fn eq(&self, other: &Self) -> bool {
-        if self.0.len() != other.0.len() {
-            return false;
-        }
-        // Accumulate differences over every octet; no early exit.
-        let difference = self
-            .0
-            .iter()
-            .zip(other.0.iter())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b));
-        difference == 0
-    }
-}
-
-impl Eq for KeyValue {}
 
 /// ```text
 /// EncryptionKey   ::= SEQUENCE {

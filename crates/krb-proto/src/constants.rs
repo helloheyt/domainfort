@@ -1,16 +1,17 @@
-//! Protocol constants, transcribed from the RFC 4120 and RFC 6113 tables opened
-//! in-session.
+//! Protocol constants, transcribed from the RFC 4120, RFC 6113 and RFC 3244
+//! tables opened in-session.
 //!
 //! Names are the RFC's own labels with hyphens written as underscores
 //! (AGENTS.md §4.4). Only the constants the in-scope messages (AS / TGS / AP /
-//! KRB-ERROR, and FAST armoring of AS / TGS) use are defined; values for
-//! out-of-scope or excluded mechanisms (e.g. PA-PW-SALT, PA-ETYPE-INFO,
-//! KRB-SAFE/PRIV/CRED, the RFC 6113 5.3 authentication sets) are deliberately
-//! absent. Key usage numbers (RFC 4120 7.5.1, RFC 6113 6.2) belong to the
-//! crypto layer and are not defined here.
+//! KRB-PRIV / KRB-ERROR, FAST armoring of AS / TGS, and the RFC 3244 change
+//! password user data) use are defined; values for out-of-scope or excluded
+//! mechanisms (e.g. PA-PW-SALT, PA-ETYPE-INFO, KRB-SAFE / KRB-CRED, the
+//! RFC 6113 5.3 authentication sets) are deliberately absent. Key usage
+//! numbers (RFC 4120 7.5.1, RFC 6113 6.2) belong to the crypto layer and are
+//! not defined here.
 //!
 //! Spec: RFC 4120 5.10, 7.5.2, 7.5.5, 7.5.6, 7.5.7, 7.5.8, 7.5.9; RFC 6113
-//! 6.1, 6.4, 7.1, 7.2.
+//! 6.1, 6.4, 7.1, 7.2; RFC 3244 §2.
 
 // --- Protocol version number. Spec: RFC 4120 7.5.6; 5.2.4. -------------------
 
@@ -32,6 +33,8 @@ pub const KRB_TGS_REP: i64 = 13;
 pub const KRB_AP_REQ: i64 = 14;
 /// Response to KRB_AP_REQ_MUTUAL. Spec: RFC 4120 7.5.7.
 pub const KRB_AP_REP: i64 = 15;
+/// Private (encrypted) application message. Spec: RFC 4120 7.5.7.
+pub const KRB_PRIV: i64 = 21;
 /// Error response. Spec: RFC 4120 7.5.7.
 pub const KRB_ERROR: i64 = 30;
 
@@ -61,6 +64,10 @@ pub(crate) const APP_ENC_AS_REP_PART: u32 = 25;
 pub(crate) const APP_ENC_TGS_REP_PART: u32 = 26;
 /// `EncAPRepPart ::= [APPLICATION 27]`. Spec: RFC 4120 5.10, 5.5.2.
 pub(crate) const APP_ENC_AP_REP_PART: u32 = 27;
+/// `KRB-PRIV ::= [APPLICATION 21]`. Spec: RFC 4120 5.10, 5.7.1.
+pub(crate) const APP_KRB_PRIV: u32 = 21;
+/// `EncKrbPrivPart ::= [APPLICATION 28]`. Spec: RFC 4120 5.10, 5.7.1.
+pub(crate) const APP_ENC_KRB_PRIV_PART: u32 = 28;
 /// `KRB-ERROR ::= [APPLICATION 30]`. Spec: RFC 4120 5.10, 5.9.1.
 pub(crate) const APP_KRB_ERROR: u32 = 30;
 
@@ -279,3 +286,25 @@ pub const KDC_ERR_PREAUTH_BAD_AUTHENTICATION_SET: i32 = 92;
 /// The KDC does not support a critical FastOptions bit.
 /// Spec: RFC 6113 5.4.2, 6.1.
 pub const KDC_ERR_UNKNOWN_CRITICAL_FAST_OPTIONS: i32 = 93;
+
+// --- Change-password result codes. Spec: RFC 3244 §2 (the table of defined
+// codes; 0xFFFF "if the request fails for some other reason" is not defined
+// here — this project never sends it, docs/questions/Q-604 item 4). ----------
+
+/// Request succeeds; not allowed in a KRB-ERROR message. Spec: RFC 3244 §2.
+pub const KRB5_KPASSWD_SUCCESS: u16 = 0;
+/// Request fails due to being malformed. Spec: RFC 3244 §2.
+pub const KRB5_KPASSWD_MALFORMED: u16 = 1;
+/// Request fails due to a "hard" error in processing it. Spec: RFC 3244 §2.
+pub const KRB5_KPASSWD_HARDERROR: u16 = 2;
+/// Request fails due to an error in authentication processing.
+/// Spec: RFC 3244 §2.
+pub const KRB5_KPASSWD_AUTHERROR: u16 = 3;
+/// Request fails due to a "soft" error in processing it. Spec: RFC 3244 §2.
+pub const KRB5_KPASSWD_SOFTERROR: u16 = 4;
+/// Requestor not authorized. Spec: RFC 3244 §2.
+pub const KRB5_KPASSWD_ACCESSDENIED: u16 = 5;
+/// Protocol version unsupported. Spec: RFC 3244 §2.
+pub const KRB5_KPASSWD_BAD_VERSION: u16 = 6;
+/// Initial flag required. Spec: RFC 3244 §2.
+pub const KRB5_KPASSWD_INITIAL_FLAG_NEEDED: u16 = 7;

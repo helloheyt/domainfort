@@ -57,3 +57,14 @@ pub const MAX_ADDITIONAL_TICKETS: usize = 8;
 /// Maximum number of entries in an ETYPE-INFO2 value.
 /// Spec context: RFC 4120 5.2.7.5.
 pub const MAX_ETYPE_INFO2_ENTRIES: usize = 32;
+
+/// Maximum length, in octets, of ChangePasswdData `newpasswd` (decode and
+/// encode; over it ⇒ [`crate::Error::NewPasswdTooLong`]).
+///
+/// Not an RFC 3244 rule — RFC 3244 §2 bounds no field. It is the project's one
+/// bound on a password on every path: docs/53 §5.4 item 4 and §5.9
+/// ("newpasswd ≤ 1024 octets (`ipc_keyd::MAX_SECRET`)"), equal to docs/50 §3.4
+/// `password: secret bytes<1024>` (`ipc_keyd::channel::MAX_SECRET`). keyd maps
+/// the error to the PasswordRefused verdict (SOFTERROR, docs/53 §5.7 "too
+/// long"), not to MALFORMED (docs/questions/Q-620).
+pub const MAX_NEWPASSWD_LEN: usize = 1024;
