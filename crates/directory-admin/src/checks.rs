@@ -82,6 +82,22 @@ pub(crate) const fn local_ipc_security(channel_bound: bool) -> TransportSec {
     }
 }
 
+/// The transport security of a kpasswd request (task K6): `{encrypted,
+/// sealed, channel_bound}` all true — **only** because keyd verified that
+/// the request's KRB-PRIV is encrypted under the subkey of that very
+/// request's AP-REQ (RFC 3244 §2; RFC 4120 §5.7.1, key usage 13): the new
+/// password is confidential, integrity-protected and bound to the
+/// authentication. A `ChangePasswordTicket` exists only for a request keyd
+/// opened that way (crate::change_password), so this value is never
+/// reported for anything else.
+/// Spec: docs/53 §5.4 item 1, §5.6 step 4; docs/questions/Q-601 item 7
+/// (A-117).
+pub(crate) const KPASSWD_SECURITY: TransportSec = TransportSec {
+    encrypted: true,
+    sealed: true,
+    channel_bound: true,
+};
+
 /// The inputs every check reads: the configuration, the schema ids, ONE
 /// view, the policy of the same version, and the caller's `now`.
 pub(crate) struct Cx<'c, 'v, 'a> {
@@ -98,8 +114,12 @@ pub(crate) struct Cx<'c, 'v, 'a> {
     pub(crate) policy: &'v PolicySnapshot,
     pub(crate) now: KerberosTime,
     pub(crate) instant: Instant,
-    /// The request's transport security ([`local_ipc_security`]; R2).
+    /// The request's transport security ([`local_ipc_security`]; R2 — or
+    /// [`KPASSWD_SECURITY`]).
     pub(crate) transport_sec: TransportSec,
+    /// The transport the request arrived on: `LocalIpc` (the admin plane's
+    /// `dird-admin.sock`) or `Kpasswd` (task K6).
+    transport: Transport,
 }
 
 impl<'c, 'v, 'a> Cx<'c, 'v, 'a> {
@@ -115,6 +135,49 @@ impl<'c, 'v, 'a> Cx<'c, 'v, 'a> {
         now: &KerberosTime,
         transport_sec: TransportSec,
     ) -> Result<Cx<'c, 'v, 'a>, Stop> {
+        Cx::on(
+            config,
+            ids,
+            view,
+            policy,
+            now,
+            Transport::LocalIpc,
+            transport_sec,
+        )
+    }
+
+    /// The checks' inputs of a kpasswd request (task K6): the same view and
+    /// policy, the transport `Kpasswd` with [`KPASSWD_SECURITY`].
+    /// Spec: docs/53 §5.6 step 4; docs/questions/Q-601 item 7 (A-117).
+    pub(crate) fn kpasswd(
+        config: &'c AdminConfig,
+        ids: &'c Ids,
+        view: &'v DirectoryView<'a>,
+        policy: &'v PolicySnapshot,
+        now: &KerberosTime,
+    ) -> Result<Cx<'c, 'v, 'a>, Stop> {
+        Cx::on(
+            config,
+            ids,
+            view,
+            policy,
+            now,
+            Transport::Kpasswd,
+            KPASSWD_SECURITY,
+        )
+    }
+
+    /// The inputs on `transport` with `transport_sec`.
+    /// Spec: docs/11 §1 (`Context.transport`, `transport_sec`).
+    fn on(
+        config: &'c AdminConfig,
+        ids: &'c Ids,
+        view: &'v DirectoryView<'a>,
+        policy: &'v PolicySnapshot,
+        now: &KerberosTime,
+        transport: Transport,
+        transport_sec: TransportSec,
+    ) -> Result<Cx<'c, 'v, 'a>, Stop> {
         Ok(Cx {
             config,
             ids,
@@ -125,6 +188,7 @@ impl<'c, 'v, 'a> Cx<'c, 'v, 'a> {
             instant: crate::time::instant(now)
                 .ok_or(Stop::Failed(AdminFailure::InternalFailure))?,
             transport_sec,
+            transport,
         })
     }
 }
@@ -169,6 +233,18 @@ impl<'v> Resolved<'v> {
 /// (docs/questions/Q-486).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KeyTargetRecord {
+    pub(crate) guid: Guid,
+    pub(crate) obj: Object,
+    pub(crate) dn: Dn,
+    pub(crate) class: ClassId,
+}
+
+/// The requester's own account of a kpasswd change, read for
+/// crate::change_password after its Subject was built from the same view
+/// ([`Cx::own_account`]). Not a [`Resolved`]: it is not an object the
+/// request names (task K6; docs/questions/Q-963 item 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OwnAccount {
     pub(crate) guid: Guid,
     pub(crate) obj: Object,
     pub(crate) dn: Dn,
@@ -244,16 +320,54 @@ impl<'v, 'a> Cx<'_, 'v, 'a> {
         })
     }
 
-    /// The `Context` of every PDP request on the admin plane's local socket.
+    /// The requester's own account object of a kpasswd change (task K6):
+    /// the record and the canonical DN of `guid` — the objectGUID of the
+    /// account the request ticket's client resolved to through this view's
+    /// account source (`AdminSubject::guid`). Internal read: the object is
+    /// not named by the request, it **is** the authenticated requester, so
+    /// the visibility gate (which answers "is the requester allowed to know
+    /// this object exists", A-55) does not apply — nothing of it reaches a
+    /// reply (docs/questions/Q-963 item 2). Gone, or outside the naming
+    /// context ⇒ `Failed(IntegrityFailure)`: the account source found it in
+    /// this very snapshot.
+    /// Spec: docs/53 §5.6 step 4 (the PDP on "the account object itself");
+    /// [MS-ADTS] 3.1.1.3.1.5.1 ("on itself"); docs/47 §1.3 (the handle's
+    /// principal is the objectGUID); docs/52 R-a.
+    pub(crate) fn own_account(&self, guid: Guid) -> Result<OwnAccount, Stop> {
+        let integrity = Stop::Failed(AdminFailure::IntegrityFailure);
+        let obj = self
+            .view
+            .authority_snapshot()
+            .get_object(guid)
+            .map_err(|e| store_failure(&e))?
+            .ok_or(integrity)?;
+        let dn = self
+            .view
+            .dn_of(guid)
+            .map_err(|_| Stop::Failed(AdminFailure::StoreFailure))?
+            .ok_or(integrity)?;
+        let class = self.class_of(&obj)?;
+        Ok(OwnAccount {
+            guid,
+            obj,
+            dn,
+            class,
+        })
+    }
+
+    /// The `Context` of every PDP request of this request: on the admin
+    /// plane's local socket, or — task K6 — through the kpasswd front, whose
+    /// only zone is the internal one (docs/53 §3.3: `FrontZone::Internal`,
+    /// derived by dird from the front's uid).
     /// Spec: docs/51 §5.4 (`Transport::LocalIpc`, `{encrypted, sealed}`);
     /// docs/52 §5 item 4 (`channel_bound` once keyd verified the binding);
-    /// docs/11 §1, P9 (the PEP supplies the time); docs/questions/Q-358
-    /// item 11.
+    /// docs/53 §3.3, §5.6 step 4; docs/11 §1, P9 (the PEP supplies the
+    /// time); docs/questions/Q-358 item 11.
     fn context(&self) -> Context {
         Context {
             src_net: IpScope::Internal,
             time: self.instant,
-            transport: Transport::LocalIpc,
+            transport: self.transport,
             transport_sec: self.transport_sec,
         }
     }
@@ -452,8 +566,21 @@ impl<'v, 'a> Cx<'_, 'v, 'a> {
     /// Spec: docs/51 §5.2 rows 5, 6, 9, §4.3 step 5; [MS-SAMR] 3.1.1.6 items
     /// 14, 22; A-18, A-19, A-35; docs/47 §6.3 (ST ⇒ the DC).
     pub(crate) fn is_structural(&self, r: &Resolved) -> Result<bool, Stop> {
+        self.is_structural_object(r.guid, &r.obj, r.class)
+    }
+
+    /// [`Cx::is_structural`] of an object given by its parts — a
+    /// [`Resolved`]'s, or the requester's own account of a kpasswd change
+    /// ([`OwnAccount`], task K6): the same rule, one implementation.
+    /// Spec: as [`Cx::is_structural`].
+    pub(crate) fn is_structural_object(
+        &self,
+        guid: Guid,
+        obj: &Object,
+        class: ClassId,
+    ) -> Result<bool, Stop> {
         self.graph()
-            .is_structural(r.guid, &r.obj, r.class)
+            .is_structural(guid, obj, class)
             .map_err(|f| fault_stop(&f))
     }
 

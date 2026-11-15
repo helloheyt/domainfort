@@ -351,11 +351,13 @@ fn code_tables_are_closed() {
     assert_eq!(EventShape::Admind.code(), 6);
     // Task A16 appended `ChangePolicy` (docs/51 §5.10; docs/questions/Q-592):
     // the earlier eighteen keep their codes. Task D2-c appended the request
-    // queue's five (docs/questions/Q-882, Q-938).
-    assert_eq!(table!(DirAdminOperation), 24);
+    // queue's five (docs/questions/Q-882, Q-938). Task K6 appended
+    // `ChangePassword` (docs/53 §9).
+    assert_eq!(table!(DirAdminOperation), 25);
     assert_eq!(DirAdminOperation::ListPendingDestruction.code(), 18);
     assert_eq!(DirAdminOperation::ChangePolicy.code(), 19);
     assert_eq!(DirAdminOperation::ShowRequest.code(), 24);
+    assert_eq!(DirAdminOperation::ChangePassword.code(), 25);
     // Task A3 appended `SelfLockout` (Q-295 item 4, P-22); task F4
     // appended `ObligationRefused` (A-91, Q-388 item 1, Q-397); task A10
     // appended `OperationMismatch` and `KeyOperationRefused` (Q-421); task

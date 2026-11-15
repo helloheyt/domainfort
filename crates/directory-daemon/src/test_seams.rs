@@ -20,6 +20,8 @@
 //! | [`AdminParams::request_lifetime`], [`AdminParams::requests_per_requester`] | a pending request's lifetime; the open requests one requester may hold (task D2-c) | `directory_admin::REQUEST_LIFETIME`, `directory_admin::REQUESTS_PER_REQUESTER` |
 //! | [`AdminParams::destroy_reconcile_interval`] | the re-registration interval, kept within `MIN_/MAX_DESTROY_RECONCILE_INTERVAL` (A-105) | `DESTROY_RECONCILE_INTERVAL` |
 //! | [`opened`] | an already-opened store, skipping the file checks | the redb file (`StoreSource::File`) |
+//! | [`KpasswdParams::keyd`] | the kpasswd service's keyd client — any [`crate::KpasswdKeyd`] (task K7) | `KeydKpasswdClient` over `ipc_keyd::UnixConnector` (Role::Ldap) |
+//! | [`KpasswdParams::max_connections`], [`KpasswdParams::queue_capacity`] | the kpasswd channel's bounds | `MAX_KPASSWD_CONNECTIONS`, `KPASSWD_QUEUE_CAPACITY` |
 //!
 //! Spec: docs/52 §3.18, §7 R15; docs/questions/Q-415, Q-432 (A-95), Q-501
 //! (A-105), Q-570.
@@ -31,6 +33,7 @@
 
 use crate::admin_service::{AdminServeParams, DecisionAckDeadline};
 use crate::daemon::{DaemonControl, DaemonError, OpenedStore, Stopped, StoreSource};
+use crate::kpasswd_service::KpasswdServeParams;
 use crate::policy::DevelopmentPolicy;
 use crate::policy_next::PolicyNextFile;
 use core::time::Duration;
@@ -41,6 +44,7 @@ use std::sync::Arc;
 
 pub use crate::admin_service::VerifierFactory;
 pub use crate::daemon::ServeParams as DaemonParams;
+pub use crate::kpasswd_service::KpasswdKeydFactory;
 
 /// Everything the admin service runs with — the product
 /// [`crate::AdminParams`] plus its seams (module documentation). The same
@@ -128,6 +132,36 @@ impl AdminParams {
     }
 }
 
+/// Everything the kpasswd service runs with — the product
+/// [`crate::KpasswdParams`] plus its seams (module documentation; task K7).
+/// Spec: docs/53 §5.6; docs/52 C18.
+#[derive(Clone)]
+pub struct KpasswdParams {
+    /// `dird_kpasswd_socket`.
+    pub socket: PathBuf,
+    /// `kpasswd_front_uid`: the only peer admitted.
+    pub front_uid: u32,
+    /// The kpasswd thread's keyd client (any [`crate::KpasswdKeyd`]);
+    /// `None` ⇒ the kpasswd service does not start.
+    pub keyd: Option<KpasswdKeydFactory>,
+    /// Connections the front may hold.
+    pub max_connections: usize,
+    /// The kpasswd queue.
+    pub queue_capacity: usize,
+}
+
+impl From<KpasswdParams> for KpasswdServeParams {
+    fn from(kpasswd: KpasswdParams) -> KpasswdServeParams {
+        KpasswdServeParams {
+            socket: kpasswd.socket,
+            front_uid: kpasswd.front_uid,
+            keyd: kpasswd.keyd,
+            max_connections: kpasswd.max_connections,
+            queue_capacity: kpasswd.queue_capacity,
+        }
+    }
+}
+
 /// A store already opened in this process ([`StoreSource::Opened`]).
 #[must_use]
 pub fn opened(store: Arc<Store>) -> StoreSource {
@@ -144,7 +178,7 @@ pub async fn serve(
     policy: DevelopmentPolicy,
     control: DaemonControl,
 ) -> Result<Stopped, DaemonError> {
-    crate::daemon::serve_with(params, None, source, policy, control).await
+    crate::daemon::serve_with(params, None, None, source, policy, control).await
 }
 
 /// `crate::serve_with_admin` with every value given.
@@ -158,5 +192,28 @@ pub async fn serve_with_admin(
     policy: DevelopmentPolicy,
     control: DaemonControl,
 ) -> Result<Stopped, DaemonError> {
-    crate::daemon::serve_with(params, admin.map(Into::into), source, policy, control).await
+    crate::daemon::serve_with(params, admin.map(Into::into), None, source, policy, control).await
+}
+
+/// `crate::serve_with_services` with every value given (task K7).
+///
+/// # Errors
+/// [`DaemonError`].
+pub async fn serve_with_kpasswd(
+    params: DaemonParams,
+    admin: Option<AdminParams>,
+    kpasswd: Option<KpasswdParams>,
+    source: StoreSource,
+    policy: DevelopmentPolicy,
+    control: DaemonControl,
+) -> Result<Stopped, DaemonError> {
+    crate::daemon::serve_with(
+        params,
+        admin.map(Into::into),
+        kpasswd.map(Into::into),
+        source,
+        policy,
+        control,
+    )
+    .await
 }

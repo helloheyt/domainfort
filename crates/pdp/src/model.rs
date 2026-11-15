@@ -525,6 +525,22 @@ pub enum Transport {
     /// docs/questions/Q-463 (A-102; superseding Q-292 / A-74 option (a));
     /// A-57 / Q-214 (the local channel); RFC 4120 §5.5.1.
     LocalIpc,
+    /// The change-password service (RFC 3244 §2, TCP 464 through
+    /// kpasswd-front and `dird-kpasswd.sock`). Its PEP (dird, task K6)
+    /// reports `{encrypted, sealed, channel_bound}` all true **only**
+    /// because keyd verified that the request's KRB-PRIV is encrypted under
+    /// the subkey of that very request's AP-REQ: the new password is
+    /// confidential, integrity-protected and bound to the authentication
+    /// (docs/53 §5.4 item 1, §5.6 step 4).
+    ///
+    /// Its floor is the floor of every transport ([`crate::required_sec_on`]);
+    /// `decide` reads no other property of the variant, which records the
+    /// transport truthfully (docs/questions/Q-601 item 7: a new variant,
+    /// accepted with A-117).
+    ///
+    /// Spec: docs/53 §5.6 step 4, §5.4 item 1; docs/questions/Q-601 item 7
+    /// (A-117); RFC 3244 §2; RFC 4120 §5.7.1, §7.5.1 (key usage 13).
+    Kpasswd,
 }
 
 /// Security properties of the transport. Spec: docs/11 §1 (`{ encrypted,

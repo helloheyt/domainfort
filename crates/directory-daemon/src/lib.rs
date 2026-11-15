@@ -6,7 +6,12 @@
 //! its **admin service** for admind (task A8, docs/51 §7): `dird-admin.sock`,
 //! the write PEP (crates/directory-admin) on a dedicated admin thread, every
 //! AP-REQ verified through keyd under Role::Ldap (A-73), every decision
-//! acknowledged by auditd before the commit (A-85).
+//! acknowledged by auditd before the commit (A-85) — and, beside the admin
+//! service, its **kpasswd service** for kpasswd-front (task K7, docs/53
+//! §5.6): `dird-kpasswd.sock`, a user's change of its own password —
+//! keyd opens the RFC 3244 request (only keyd decrypts the new password),
+//! the same write PEP decides it (`ChangePassword`, task K6) on its own
+//! thread and queue, keyd completes and seals the reply.
 //!
 //! dird is the only process that opens the redb file and holds the dirstore
 //! `IntegrityKey` (R50-2; Q-213 → A-57). The kdc asks it over
@@ -87,6 +92,10 @@
 //! | `admin_engine` | the admin thread: its bounded queue and the per-request steps of docs/51 §7.4 |
 //! | `admin_listener` | `dird-admin.sock`: admind's uid only, ≤ 2 connections, framing, deadlines |
 //! | [`policy_next`] | `policy.next`: an approved tier-map change written for root to activate (task A16, docs/51 §5.10) |
+//! | [`kpasswd_service`] | the kpasswd service's parameters, keyd client (Role::Ldap), the change-password service's key set, the channel conversions (task K7) |
+//! | `kpasswd_engine` | the kpasswd thread: its bounded queue and docs/53 §5.6's steps |
+//! | `kpasswd_listener` | `dird-kpasswd.sock`: kpasswd-front's uid only, ≤ 8 connections, framing, deadlines |
+//! | `operation_ids` | dird's one counter of operation numbers (admin and kpasswd threads) |
 //!
 //! # Security
 //!
@@ -150,8 +159,20 @@
 //! an optional feature of crate ipc-audit (class C40; docs/questions/Q-851,
 //! decision A-144).
 //!
+//! The kpasswd service (task K7, dird side: modules `kpasswd_service`,
+//! `kpasswd_engine`, `kpasswd_listener`, `operation_ids`) was written only
+//! from, opened in this session: docs/53 (whole), PENDING-OWNER (A-117,
+//! A-121, A-126, A-142, A-151, A-153, A-156, A-158, A-159), docs/questions
+//! Q-600..Q-609, Q-660..Q-664, Q-945, Q-955, docs/research/r3-e (§1-§3), the
+//! pinned RFC 3244 §2 and RFC 4120 §3.2.3, and this repository's own code
+//! (crates ipc-kpasswd, ipc-keyd, keyd-types, directory-admin; this crate's
+//! LDAP and admin services as the pattern); interpretations in
+//! docs/questions/Q-964. No other implementation was consulted or recalled
+//! (AGENTS.md §1-3).
+//!
 //! Spec: docs/50 §10 (P8), R50-2, R50-3, R50-7, R50-14, R50-16, R50-17;
-//! docs/47 §8; A-57; A-58; Decision: A-144; Q-851 (task IB1).
+//! docs/47 §8; A-57; A-58; Decision: A-144; Q-851 (task IB1); docs/53 §5.6
+//! (K7).
 
 mod admin_engine;
 mod admin_listener;
@@ -161,11 +182,15 @@ pub mod audit_link;
 pub mod clock;
 mod daemon;
 mod engine;
+mod kpasswd_engine;
+mod kpasswd_listener;
+pub mod kpasswd_service;
 pub mod ldap_audit;
 mod ldap_engine;
 mod ldap_listener;
 mod listener;
 pub mod log;
+mod operation_ids;
 pub mod policy;
 pub mod policy_next;
 pub mod rate;
@@ -185,11 +210,17 @@ pub use audit_convert::ldap_event;
 pub use audit_link::{AuditEndpoint, AuditLinkError};
 pub use clock::{Clock, SharedClock, SystemClock};
 pub use daemon::{
-    serve, serve_with_admin, DaemonControl, DaemonError, DaemonParams, OpenedStore, Stopped,
-    StoreSource, AUDIT_FLUSH_GRACE, DRAIN_GRACE, ENGINE_QUEUE_CAPACITY, LDAP_QUEUE_CAPACITY,
-    MAX_KDC_CONNECTIONS, MAX_LDAP_SESSIONS, MAX_OPEN_VIEWS, SOCKET_FILE_MODE,
+    serve, serve_with_admin, serve_with_services, DaemonControl, DaemonError, DaemonParams,
+    OpenedStore, Stopped, StoreSource, AUDIT_FLUSH_GRACE, DRAIN_GRACE, ENGINE_QUEUE_CAPACITY,
+    LDAP_QUEUE_CAPACITY, MAX_KDC_CONNECTIONS, MAX_LDAP_SESSIONS, MAX_OPEN_VIEWS, SOCKET_FILE_MODE,
 };
 pub use engine::{DirectoryEngine, EngineError, EngineHandle, EnginePanicked, EngineThread};
+pub use kpasswd_listener::kpasswd_refused_peer_count;
+pub use kpasswd_service::{
+    CompletionOutcome, KeydKpasswdClient, KpasswdKeyd, KpasswdKeydFactory, KpasswdNotStarted,
+    KpasswdParams, CHANGE_PASSWORD_DECISION_LIFETIME_SECS, KPASSWD_QUEUE_CAPACITY,
+    MAX_KPASSWD_CALL_SECS, MAX_KPASSWD_CONNECTIONS, MAX_KPASSWD_QUEUE_CAPACITY,
+};
 pub use ldap_engine::{LdapEngineHandle, LdapService, MAX_LDAP_QUEUE_CAPACITY};
 pub use ldap_listener::ldap_refused_peer_count;
 pub use listener::refused_peer_count;

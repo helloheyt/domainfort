@@ -22,6 +22,12 @@ fn line_of(text: &str, key: &str) -> Option<u32> {
         .and_then(|index| u32::try_from(index + 1).ok())
 }
 
+/// `text` without dird's kpasswd channel (task K7), which is refused
+/// without the admin channel (tests/dird_kpasswd.rs).
+fn without_kpasswd(text: &str) -> String {
+    remove(&remove(text, "dird_kpasswd_socket"), "kpasswd_front_uid")
+}
+
 /// The error of parsing `text` as `daemon`.
 fn error(daemon: Daemon, text: &str) -> Error {
     daemon
@@ -1136,11 +1142,12 @@ fn dird_admin_pair_is_both_or_neither() {
     let err = error(Daemon::Dird, &text);
     assert_eq!(err.kind(), ErrorKind::IncompletePair);
     assert_eq!(err.key(), Some("admind_uid"));
-    // Task A16: the optional admin-service key goes with the channel too.
-    let mut both_removed = remove(
+    // Task A16: the optional admin-service key goes with the channel too;
+    // task K7: so does the kpasswd channel, which needs the admin channel.
+    let mut both_removed = without_kpasswd(&remove(
         &remove(&remove(DIRD, "dird_admin_socket"), "admind_uid"),
         "policy_next_path",
-    );
+    ));
     for key in ["admin_ticket_age_max", "admin_quorum", "provision_manifest"] {
         both_removed = remove(&both_removed, key);
     }
@@ -1197,11 +1204,13 @@ fn dird_admin_service_settings_follow_the_admin_channel() {
         assert_eq!(err.key(), Some(key), "{key}");
     }
     // Task A16: the optional `policy_next_path` (refused without the
-    // channel, test below) is removed with the channel here.
-    let without_channel = remove(
+    // channel, test below) is removed with the channel here; task K7: the
+    // kpasswd channel too (refused without the admin channel —
+    // tests/dird_kpasswd.rs).
+    let without_channel = without_kpasswd(&remove(
         &remove(&remove(DIRD, "dird_admin_socket"), "admind_uid"),
         "policy_next_path",
-    );
+    ));
     for key in ["admin_ticket_age_max", "admin_quorum", "provision_manifest"] {
         let mut text = without_channel.clone();
         for other in ["admin_ticket_age_max", "admin_quorum", "provision_manifest"] {
@@ -1239,7 +1248,7 @@ fn dird_policy_next_path_follows_the_admin_channel() {
     let without = remove(DIRD, "policy_next_path");
     let s = DirdSettings::parse(without.as_bytes()).expect("optional");
     assert!(s.admin_service().unwrap().policy_next().is_none());
-    let mut no_channel = remove(&remove(DIRD, "dird_admin_socket"), "admind_uid");
+    let mut no_channel = without_kpasswd(&remove(&remove(DIRD, "dird_admin_socket"), "admind_uid"));
     for other in ["admin_ticket_age_max", "admin_quorum", "provision_manifest"] {
         no_channel = remove(&no_channel, other);
     }

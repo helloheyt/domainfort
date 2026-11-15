@@ -28,6 +28,11 @@ pub(crate) const DIRD_KDC_SOCKET: &str = "dird_kdc_socket";
 pub(crate) const DIRD_LDAP_SOCKET: &str = "dird_ldap_socket";
 /// Key: path of `dird-admin.sock`. Spec: docs/50 §3.1, §2.3.
 pub(crate) const DIRD_ADMIN_SOCKET: &str = "dird_admin_socket";
+/// Key: path of `dird-kpasswd.sock` — one spelling for dird's file (the
+/// server) and kpasswd-front's (the client; task K7). Spec: docs/53 §4.3;
+/// docs/50 the channel-magic registry (`dird-kpasswd.sock | ipc-kpasswd |
+/// 0x4B50`); docs/questions/Q-955 item 13.
+pub(crate) const DIRD_KPASSWD_SOCKET: &str = "dird_kpasswd_socket";
 /// Key: path of `audit.sock`. Spec: docs/50 §3.1, §8.1 (R50-17).
 pub(crate) const AUDIT_SOCKET: &str = "audit_socket";
 /// Key: the uid auditd runs as (verified by its clients). Spec: docs/50 R50-3.

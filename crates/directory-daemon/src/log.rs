@@ -120,6 +120,36 @@ pub enum Note {
     /// class: 1 the file system refused a step, 2 the directory could not be
     /// made durable.
     AdminPolicyNextNotWritten,
+    /// dird listens on `dird-kpasswd.sock` (task K7, docs/53 §5.6).
+    KpasswdListening,
+    /// The kpasswd service did not start (logged with the reason's code,
+    /// `kpasswd_service::KpasswdNotStarted::code`); dird's other services
+    /// run.
+    KpasswdNotStarted,
+    /// A `dird-kpasswd.sock` connection's peer uid is not kpasswd-front's;
+    /// closed without a reply (docs/53 §5.6 step 1; docs/50 R50-3).
+    KpasswdPeerRefused,
+    /// The front's connection bound is reached; the connection is refused
+    /// `Busy` and closed (docs/53 §5.6 step 1).
+    KpasswdConnectionLimit,
+    /// The kpasswd queue is full; the request is refused `Busy` and the
+    /// connection closed — the front answers HARDERROR (docs/53 §5.6 step
+    /// 1, §5.7).
+    KpasswdBusy,
+    /// A change request was answered HARDERROR before keyd was asked:
+    /// auditd could not take its events (A-85, docs/53 §5.6).
+    KpasswdAuditUnavailable,
+    /// A change's outcome event could not be committed after its write (its
+    /// decision event documents it).
+    KpasswdOutcomeUnrecorded,
+    /// A committed `ChangePassword` was answered HARDERROR: keyd did not
+    /// register its decision (docs/53 §5.6 step 5). The id is the failure's
+    /// class: 1 keyd refused it, 2 not performed, 3 outcome unknown.
+    KpasswdDecisionNotRegistered,
+    /// keyd's completion of a decided change was not answered: whether the
+    /// new password was installed is in keyd's audit records (docs/53 §5.6
+    /// step 6 — the safe state of docs/47 §9.2); answered HARDERROR.
+    KpasswdCompletionUnknown,
     /// Stopped.
     Stopped,
 }
@@ -191,6 +221,31 @@ impl Note {
             }
             Note::AdminPolicyNextNotWritten => {
                 "approved tier-map change not written as policy.next: answered unavailable; class"
+            }
+            Note::KpasswdListening => "listening on the kpasswd channel",
+            Note::KpasswdNotStarted => {
+                "kpasswd service not started (the other services run); reason code"
+            }
+            Note::KpasswdPeerRefused => {
+                "kpasswd channel connection closed: peer uid is not kpasswd-front's"
+            }
+            Note::KpasswdConnectionLimit => {
+                "kpasswd channel connection refused: connection bound reached"
+            }
+            Note::KpasswdBusy => "kpasswd request refused: kpasswd queue full",
+            Note::KpasswdAuditUnavailable => {
+                "kpasswd request answered hard error: auditd cannot take its events"
+            }
+            Note::KpasswdOutcomeUnrecorded => {
+                "password change outcome event not recorded (its decision event was)"
+            }
+            Note::KpasswdDecisionNotRegistered => {
+                "password change committed but keyd did not register its decision: answered hard \
+                 error (no password installed); failure class"
+            }
+            Note::KpasswdCompletionUnknown => {
+                "password change completion not answered by keyd (keyd's records tell whether it \
+                 was installed): answered hard error"
             }
             Note::Stopped => "stopped",
         }

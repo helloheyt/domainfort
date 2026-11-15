@@ -655,8 +655,13 @@ code_table! {
     /// keeps its meaning and is never reused. The operation a pending
     /// request is for is in [`crate::DirAdminEvent::proposed`] (or, for a
     /// key operation, `key_operation`).
+    /// `ChangePassword` (appended by task K6): a user's change of its own
+    /// password through kpasswd (RFC 3244 §2) — the `DirAdmin` shape with
+    /// the requester's own account as `target` and its objectSid as
+    /// `requester` (docs/53 §9); dird decides it on `dird-kpasswd.sock`, not
+    /// on `dird-admin.sock`.
     /// Spec: docs/51 §5.2, §5.7, §5.10, §6, §7.3; docs/questions/Q-340
-    /// item 2, Q-592, Q-882, Q-938.
+    /// item 2, Q-592, Q-882, Q-938; docs/53 §4.4, §9 (K6).
     pub enum DirAdminOperation {
         CreateUser,
         CreateComputer,
@@ -682,6 +687,7 @@ code_table! {
         Withdraw,
         ListRequests,
         ShowRequest,
+        ChangePassword,
     }
 }
 

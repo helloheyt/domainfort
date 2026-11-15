@@ -1,10 +1,12 @@
 //! dird's configuration file.
 //!
 //! dird is the sole owner of the redb file and runs the LDAP engine (docs/50
-//! R50-1, R50-2). It serves three channels — `dird-kdc.sock`,
-//! `dird-ldap.sock`, `dird-admin.sock` — each admitting exactly one peer uid
-//! (§3.2), loads the signed policy store (which carries the TierMap, A-36)
-//! (§7.2). dird has **no zone table**: the zone of an LDAP client is the zone
+//! R50-1, R50-2). It serves up to four channels — `dird-kdc.sock`,
+//! `dird-ldap.sock`, `dird-admin.sock` and (task K7) `dird-kpasswd.sock` —
+//! each admitting exactly one peer uid (§3.2; docs/53 §5.6 step 1), loads the
+//! signed policy store (which carries the TierMap, A-36) (§7.2). The kpasswd
+//! channel's zone, like the LDAP channel's, is its front's, derived from the
+//! peer uid (docs/53 §3.3). dird has **no zone table**: the zone of an LDAP client is the zone
 //! of the front it came through, derived from the peer uid of the
 //! `dird-ldap.sock` connection — phase 1 has one front, the internal one
 //! (docs/52 §7 R14; A-102 on docs/questions/Q-469 (b)) — never from an address
@@ -34,8 +36,8 @@ use crate::format::Document;
 use crate::limits::{Bound, ADMIN_QUORUM, ADMIN_TICKET_AGE_MAX_SECS, FRAME_TIMEOUT_SECS};
 use crate::schema::{
     self, Account, Distinct, Endpoint, AUDITD_UID, AUDIT_SOCKET, DIRD_ADMIN_SOCKET,
-    DIRD_KDC_SOCKET, DIRD_LDAP_SOCKET, FRAME_TIMEOUT, KEYD_SOCKET, KEYD_UID, POLICY_STORE_PATH,
-    RUN_AS_GID, RUN_AS_UID,
+    DIRD_KDC_SOCKET, DIRD_KPASSWD_SOCKET, DIRD_LDAP_SOCKET, FRAME_TIMEOUT, KEYD_SOCKET, KEYD_UID,
+    POLICY_STORE_PATH, RUN_AS_GID, RUN_AS_UID,
 };
 use crate::value::{self, AbsolutePath, NamingContextLabels, NODE_ID_OCTETS};
 
@@ -56,6 +58,10 @@ const KDC_UID: &str = "kdc_uid";
 const LDAP_FRONT_UID: &str = "ldap_front_uid";
 /// Key: the only uid admitted on `dird-admin.sock`. Spec: docs/50 §3.2.
 const ADMIND_UID: &str = "admind_uid";
+/// Key: the only uid admitted on `dird-kpasswd.sock` — kpasswd-front's.
+/// Spec: docs/53 §5.6 step 1 ("the peer on dird-kpasswd.sock = the front's
+/// uid only (R50-3)"); docs/questions/Q-955 item 13.
+const KPASSWD_FRONT_UID: &str = "kpasswd_front_uid";
 /// Key: how long a `BeginView` snapshot stays pinned. Spec: docs/50 §3.4.
 const VIEW_LIFETIME: &str = "view_lifetime";
 /// Key: where the dirstore integrity key comes from. Spec: docs/50 §7.4;
@@ -215,6 +221,7 @@ pub struct DirdSettings {
     kdc_channel: Channel,
     ldap_channel: Channel,
     admin_channel: Option<Channel>,
+    kpasswd_channel: Option<Channel>,
     keyd: Option<Endpoint>,
     node_id: Option<[u8; NODE_ID_OCTETS]>,
     admin_service: Option<AdminServiceSettings>,
@@ -254,6 +261,8 @@ impl DirdSettings {
         LDAP_FRONT_UID,
         DIRD_ADMIN_SOCKET,
         ADMIND_UID,
+        DIRD_KPASSWD_SOCKET,
+        KPASSWD_FRONT_UID,
         KEYD_SOCKET,
         KEYD_UID,
         NODE_ID,
@@ -279,7 +288,11 @@ impl DirdSettings {
     /// `admin_quorum` (2 ..= 3), `provision_manifest` and `node_id` are
     /// required, and without them the first three are refused
     /// (`IncompletePair`); with the admin channel, optionally
-    /// `policy_next_path` (task A16 — refused without the channel);
+    /// `policy_next_path` (task A16 — refused without the channel) and
+    /// `dird_kpasswd_socket` with `kpasswd_front_uid` (task K7 — both or
+    /// neither, `IncompletePair`; refused without the admin channel, whose
+    /// settings the kpasswd service shares — docs/53 §5.6 step 4; the socket
+    /// path and the uid distinct from every other of the file);
     /// `keyd_socket` with `keyd_uid` (both or neither —
     /// without them dird's admin service does not start, the rest of dird
     /// runs); `node_id` (32 lower-case hex digits, not all zero);
@@ -356,6 +369,49 @@ impl DirdSettings {
                 all.path(KEYD_SOCKET, &socket.value, socket.line)?;
                 all.id(KEYD_UID, uid.value, uid.line)?;
                 Some(Endpoint::from_parts(socket.value, uid.value))
+            }
+        };
+        // The kpasswd channel (task K7; docs/53 §5.6 step 1): both or
+        // neither, and only beside the admin channel — the kpasswd service
+        // shares the admin service's ticket-age threshold, manifest, node-id
+        // and keyd (docs/53 §5.6 step 4; R51-10: one threshold). A kpasswd
+        // setting without the admin channel is refused, never ignored.
+        let kpasswd_socket = doc.optional(DIRD_KPASSWD_SOCKET, value::absolute_path)?;
+        let kpasswd_uid = doc.optional(KPASSWD_FRONT_UID, value::account_id)?;
+        let kpasswd_channel = match (kpasswd_socket, kpasswd_uid) {
+            (None, None) => None,
+            (Some(socket), None) => {
+                return Err(Error::at(
+                    socket.line,
+                    DIRD_KPASSWD_SOCKET,
+                    ErrorKind::IncompletePair,
+                ))
+            }
+            (None, Some(uid)) => {
+                return Err(Error::at(
+                    uid.line,
+                    KPASSWD_FRONT_UID,
+                    ErrorKind::IncompletePair,
+                ))
+            }
+            (Some(socket), Some(uid)) => {
+                if admin_channel.is_none() {
+                    return Err(Error::at(
+                        socket.line.min(uid.line),
+                        if socket.line <= uid.line {
+                            DIRD_KPASSWD_SOCKET
+                        } else {
+                            KPASSWD_FRONT_UID
+                        },
+                        ErrorKind::IncompletePair,
+                    ));
+                }
+                all.path(DIRD_KPASSWD_SOCKET, &socket.value, socket.line)?;
+                all.id(KPASSWD_FRONT_UID, uid.value, uid.line)?;
+                Some(Channel {
+                    socket: socket.value,
+                    peer_uid: uid.value,
+                })
             }
         };
         let node_id = doc.optional(NODE_ID, value::node_id)?;
@@ -435,6 +491,7 @@ impl DirdSettings {
             kdc_channel,
             ldap_channel,
             admin_channel,
+            kpasswd_channel,
             keyd,
             node_id: node_id.map(|located| located.value),
             admin_service,
@@ -522,6 +579,14 @@ impl DirdSettings {
     #[must_use]
     pub fn admin_channel(&self) -> Option<&Channel> {
         self.admin_channel.as_ref()
+    }
+
+    /// `dird-kpasswd.sock` and kpasswd-front's uid, when configured (only
+    /// beside the admin channel). Spec: docs/53 §5.6 step 1; docs/50 §3.2;
+    /// docs/questions/Q-955 item 13.
+    #[must_use]
+    pub fn kpasswd_channel(&self) -> Option<&Channel> {
+        self.kpasswd_channel.as_ref()
     }
 
     /// keyd's socket and uid, when configured: dird's admin service verifies

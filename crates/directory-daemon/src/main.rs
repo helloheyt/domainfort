@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 //! The dird binary: `directory-daemon <configuration file>` — the
 //! directory-view service (task P8), the LDAP service (task P10) and, when
-//! configured, the admin service (task A8, docs/51 §7).
+//! configured, the admin service (task A8, docs/51 §7) and the kpasswd
+//! service beside it (task K7, docs/53 §5.6).
 //!
 //! The start-up order (docs/50 R50-14, §6.2, §7.5; crates/daemon-sandbox):
 //!
@@ -24,10 +25,11 @@
 use daemon_sandbox::{apply, SingleThreadProof};
 use directory_daemon::log::{note, Note};
 use directory_daemon::startup::{
-    admin_params, hardening_plan, params, prepare_policy_next_directory, prepare_socket_directory,
-    read_integrity_key, read_policy, read_provision_manifest, read_settings,
+    admin_params, hardening_plan, kpasswd_params, params, prepare_policy_next_directory,
+    prepare_socket_directory, read_integrity_key, read_policy, read_provision_manifest,
+    read_settings,
 };
-use directory_daemon::{serve_with_admin, DaemonControl, StoreSource};
+use directory_daemon::{serve_with_services, DaemonControl, StoreSource};
 use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
@@ -143,7 +145,12 @@ fn main() -> ExitCode {
         owner_uid: settings.run_as().uid(),
     };
     let control = DaemonControl::new();
-    let result = runtime.block_on(serve_with_admin(params, admin, source, policy, control));
+    // Task K7: the kpasswd service beside the admin service, when its
+    // channel is configured.
+    let kpasswd = kpasswd_params(&settings);
+    let result = runtime.block_on(serve_with_services(
+        params, admin, kpasswd, source, policy, control,
+    ));
     drop(runtime);
     match result {
         Ok(stopped) => {

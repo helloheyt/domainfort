@@ -446,33 +446,47 @@ where
         &mut self,
         decision: DecisionRegistration,
     ) -> Result<(), RegistrationFailure> {
-        let call = ipc_keyd::Call::RegisterDecision {
-            id: decision.id(),
-            operation: decision.operation().clone(),
-            approvers: decision.approvers().to_vec(),
-            lifetime_secs: decision.lifetime_secs(),
-        };
-        match self.client.call_with_fate(&call) {
-            Ok(ipc_keyd::Answer::RegisterDecision(Ok(()))) => Ok(()),
-            Ok(ipc_keyd::Answer::RegisterDecision(Err(error))) => {
-                Err(RegistrationFailure::Refused(error))
-            }
-            // The client checks that a reply answers its call; anything
-            // else cannot arrive — and would say nothing of the decision.
-            Ok(_) => Err(RegistrationFailure::OutcomeUnknown),
-            Err(failure) => Err(match failure.fate {
-                ipc_keyd::RequestFate::NotSent | ipc_keyd::RequestFate::NotPerformed => {
-                    RegistrationFailure::NotPerformed
-                }
-                ipc_keyd::RequestFate::OutcomeUnknown => RegistrationFailure::OutcomeUnknown,
-            }),
-        }
+        register_with_fate(&mut self.client, &decision)
     }
 
     /// A read: `call` (the fate is not needed — nothing changes either way).
     /// Spec: docs/52 §4.6; docs/questions/Q-470 (A-105), Q-501, Q-503.
     fn list_destroy_decisions(&mut self, after: Option<DecisionId>) -> Option<DestructionPage> {
         self.client.list_destroy_decisions(after).ok()
+    }
+}
+
+/// Register `decision` in keyd through `client` — keyd's
+/// `register_decision` (Role::Ldap) by `call_with_fate` (A-90): a decision
+/// loosens keyd, so whether a failed call may still have registered it is
+/// told apart. The one registration of every decision dird makes — the
+/// admin service's and the kpasswd service's (task K7).
+/// Spec: docs/52 §4.2, §4.3; docs/51 §5.8 option (b); docs/questions/Q-367
+/// (A-88), Q-450, Q-453 item 1, Q-460, Q-662.
+pub(crate) fn register_with_fate<C: ipc_keyd::Connector>(
+    client: &mut ipc_keyd::KeydClient<C>,
+    decision: &DecisionRegistration,
+) -> Result<(), RegistrationFailure> {
+    let call = ipc_keyd::Call::RegisterDecision {
+        id: decision.id(),
+        operation: decision.operation().clone(),
+        approvers: decision.approvers().to_vec(),
+        lifetime_secs: decision.lifetime_secs(),
+    };
+    match client.call_with_fate(&call) {
+        Ok(ipc_keyd::Answer::RegisterDecision(Ok(()))) => Ok(()),
+        Ok(ipc_keyd::Answer::RegisterDecision(Err(error))) => {
+            Err(RegistrationFailure::Refused(error))
+        }
+        // The client checks that a reply answers its call; anything else
+        // cannot arrive — and would say nothing of the decision.
+        Ok(_) => Err(RegistrationFailure::OutcomeUnknown),
+        Err(failure) => Err(match failure.fate {
+            ipc_keyd::RequestFate::NotSent | ipc_keyd::RequestFate::NotPerformed => {
+                RegistrationFailure::NotPerformed
+            }
+            ipc_keyd::RequestFate::OutcomeUnknown => RegistrationFailure::OutcomeUnknown,
+        }),
     }
 }
 
@@ -1255,6 +1269,28 @@ pub fn secret_decision_of(reply: &PepReply) -> Option<DecidedOperation> {
     Some(DecidedOperation::SetSecret { kind, targets })
 }
 
+/// The `ChangePassword` decision a committed `ChangePassword` registers in
+/// keyd (task K7): exactly the user's key set — handle, binding **and
+/// salt** — its reply names; executed only by keyd's
+/// `complete_change_password` for a request of that very client
+/// (docs/questions/Q-662). `None` for any other reply — so a
+/// `BeginPasswordSet` never yields this decision and a `ChangePassword`
+/// never yields a `SetSecret` ([`secret_decision_of`]).
+/// Spec: docs/53 §4.4, §5.6 step 5; docs/52 §4.2; A-126.
+#[must_use]
+pub fn change_password_decision_of(reply: &PepReply) -> Option<DecidedOperation> {
+    let PepReply::PasswordChange(change) = reply else {
+        return None;
+    };
+    Some(DecidedOperation::ChangePassword {
+        target: SetSecretTarget {
+            handle: change.key.handle,
+            binding: change.key.binding.clone(),
+            salt: change.salt.as_str().to_owned(),
+        },
+    })
+}
+
 /// The typed reply of the PEP's reply.
 /// Spec: docs/51 §7.3 (the reply column).
 #[must_use]
@@ -1280,6 +1316,10 @@ pub fn wire_reply(reply: &PepReply) -> Reply {
             salt: set.salt.clone(),
         }),
         PepReply::Done => Reply::Done,
+        // A user's own change (task K6) is decided on `dird-kpasswd.sock`
+        // and never answers an admin request; it has no form on this
+        // channel (fail closed).
+        PepReply::PasswordChange(_) => Reply::Refused(RefusalStatus::Unavailable),
         PepReply::Found(found) => Reply::Found(Found {
             guid: found.guid,
             dn: found.dn.rdns().to_vec(),

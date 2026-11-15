@@ -474,13 +474,14 @@ fn dir_admin_phase_and_result_tables() {
 
 /// docs/50 §3.3: unknown operation and name-kind codes are refused (task
 /// A16 appended `ChangePolicy` = 19 and `PolicyChange` = 7; task D2-c
-/// appended `Propose` .. `ShowRequest` = 20..24 — docs/questions/Q-938 — so
-/// the first unknown codes are 25 and 8).
+/// appended `Propose` .. `ShowRequest` = 20..24 — docs/questions/Q-938 —;
+/// task K6 appended `ChangePassword` = 25 (docs/53 §9) — so the first
+/// unknown codes are 26 and 8).
 #[test]
 fn dir_admin_unknown_codes() {
     let (good, at) = delete_refused_octets();
     for (position, codes) in [
-        (at.operation, [0u8, 25, 0xFF]),
+        (at.operation, [0u8, 26, 0xFF]),
         (at.name_kind, [0u8, 8, 0xFF]),
     ] {
         for code in codes {
@@ -966,7 +967,9 @@ fn d2c_codes_are_appended() {
     assert_eq!(DirAdminOperation::Withdraw.code(), 22);
     assert_eq!(DirAdminOperation::ListRequests.code(), 23);
     assert_eq!(DirAdminOperation::ShowRequest.code(), 24);
-    assert_eq!(DirAdminOperation::ALL.len(), 24);
+    // Task K6 appended `ChangePassword` (docs/53 §9): no earlier code moved.
+    assert_eq!(DirAdminOperation::ChangePassword.code(), 25);
+    assert_eq!(DirAdminOperation::ALL.len(), 25);
     assert_eq!(AdminRefusal::ApprovalNotNeeded.code(), 23);
     assert_eq!(AdminRefusal::RequestStale.code(), 24);
     assert_eq!(AdminRefusal::RequesterLimit.code(), 25);
@@ -1005,10 +1008,11 @@ fn dir_admin_digest_and_request_fields_layout() {
     let event = EventBody::DirAdmin(Box::new(event));
     assert_eq!(encode_event(&event).unwrap().as_bytes(), &expected[..]);
     assert_eq!(decode_event(&expected).unwrap(), event);
-    // An unknown `proposed` code; a digest cut short.
+    // An unknown `proposed` code (task K6 appended `ChangePassword` = 25,
+    // so 26 is the first unknown one); a digest cut short.
     let mut bad = base.clone();
     bad[at.proposed] = 1;
-    bad.insert(at.proposed + 1, 25);
+    bad.insert(at.proposed + 1, 26);
     assert_eq!(decode_event(&bad), codec(ipc::Error::UnknownCode));
     assert!(decode_event(&base[..at.digest + 31]).is_err());
 }

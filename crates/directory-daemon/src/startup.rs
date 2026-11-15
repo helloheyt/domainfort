@@ -10,6 +10,7 @@
 use crate::admin_service::{AdminParams, KeydEndpoint};
 use crate::audit_link::AuditEndpoint;
 use crate::daemon::{DaemonParams, MAX_KDC_CONNECTIONS, MAX_LDAP_SESSIONS};
+use crate::kpasswd_service::KpasswdParams;
 use crate::policy::{read_file, DevelopmentPolicy, LoadError, PolicyError};
 use crate::policy_next::PolicyNextFile;
 use config::{DirdSettings, IntegrityKeySource, PolicyStoreFormat};
@@ -270,9 +271,10 @@ pub fn read_policy(path: &Path, owner: u32) -> Result<DevelopmentPolicy, Startup
 }
 
 /// The privileged set-up (as root, before the drop): the directories of
-/// `dird_kdc_socket`, `dird_ldap_socket` and, when the admin channel is
-/// configured, `dird_admin_socket` (docs/50 §3.1: "each socket in its own
-/// directory"), each through the one implementation every socket-serving
+/// `dird_kdc_socket`, `dird_ldap_socket` and, when configured,
+/// `dird_admin_socket` and `dird_kpasswd_socket` (task K7) (docs/50 §3.1:
+/// "each socket in its own directory"), each through the one implementation
+/// every socket-serving
 /// daemon shares (`protected_file::prepare_socket_directory`, task R11c):
 /// its parent walked from `/` (no link, every directory root's or dird's,
 /// none writable by group or others); missing ⇒ created relative to the
@@ -296,10 +298,12 @@ pub fn prepare_socket_directory(settings: &DirdSettings) -> Result<(), StartupEr
         existing_group: ExistingGroup::ChosenByOperator,
     };
     let admin_socket = settings.admin_channel().map(config::Channel::socket);
+    let kpasswd_socket = settings.kpasswd_channel().map(config::Channel::socket);
     for socket in [
         Some(settings.kdc_channel().socket()),
         Some(settings.ldap_channel().socket()),
         admin_socket,
+        kpasswd_socket,
     ]
     .into_iter()
     .flatten()
@@ -431,6 +435,20 @@ pub fn admin_params(
             .policy_next()
             .map(|path| PolicyNextFile::new(path.as_path().to_path_buf(), settings.run_as().uid())),
     }))
+}
+
+/// The kpasswd service's parameters (task K7; docs/53 §5.6), when the
+/// kpasswd channel is configured — the one product constructor (docs/52
+/// C18): `dird_kpasswd_socket` and `kpasswd_front_uid`. Everything else it
+/// runs with is the admin service's and the daemon's constants
+/// (`serve_with_services`).
+/// Spec: docs/53 §5.6 step 1; docs/questions/Q-955 item 13.
+#[must_use]
+pub fn kpasswd_params(settings: &DirdSettings) -> Option<KpasswdParams> {
+    settings.kpasswd_channel().map(|channel| KpasswdParams {
+        socket: channel.socket().as_path().to_path_buf(),
+        front_uid: channel.peer_uid(),
+    })
 }
 
 /// The directory of `policy.next` (task A16, docs/51 §5.10), when the admin

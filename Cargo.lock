@@ -267,6 +267,7 @@ dependencies = [
  "ipc-directory",
  "ipc-directory-server",
  "ipc-keyd",
+ "ipc-kpasswd",
  "ipc-ldap",
  "ipc-ldap-server",
  "kdc",

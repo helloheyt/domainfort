@@ -54,11 +54,17 @@ use crate::admin_service::{
 use crate::audit_link::{self, AuditEndpoint, AuditLinkError};
 use crate::clock::SharedClock;
 use crate::engine::{DirectoryEngine, EngineError, EnginePanicked, EngineThread};
+use crate::kpasswd_engine::KpasswdWorker;
+use crate::kpasswd_listener::{self, KpasswdServeContext};
+use crate::kpasswd_service::{
+    change_password_service_handle, KpasswdNotStarted, KpasswdParams, KpasswdServeParams,
+};
 use crate::ldap_audit::AuditGate;
 use crate::ldap_engine::LdapService;
 use crate::ldap_listener::{self, LdapServeContext};
 use crate::listener::{accept_loop, ServeContext};
 use crate::log::{note, Note};
+use crate::operation_ids::OperationIds;
 use crate::policy::{tier_map, DevelopmentPolicy};
 use core::fmt;
 use core::time::Duration;
@@ -66,6 +72,7 @@ use directory_pip::{DirectoryContext, NamingContext};
 use dirstore::{IntegrityKey, Store};
 use ipc_audit::WindowConfig;
 use ipc_directory_server::ViewLimits;
+use ipc_kpasswd::KpasswdFronts;
 use ipc_ldap_server::Fronts;
 use keyd_types::KeydConfig;
 use ldap::{Engine, EngineConfig, RootDseConfig};
@@ -400,6 +407,8 @@ pub struct Stopped {
     engine: EngineThread,
     ldap_engine: EngineThread,
     admin_engine: Option<EngineThread>,
+    /// The kpasswd thread, if the kpasswd service ran (task K7).
+    kpasswd_engine: Option<EngineThread>,
     engine_failed: bool,
     unacknowledged: usize,
 }
@@ -420,8 +429,9 @@ impl Stopped {
         self.unacknowledged
     }
 
-    /// Wait for the engine threads (the admin thread too, if the admin
-    /// service ran); call after the runtime was dropped.
+    /// Wait for the engine threads (the admin thread and the kpasswd
+    /// thread too, if their services ran); call after the runtime was
+    /// dropped.
     ///
     /// # Errors
     /// [`EnginePanicked`] if any unwound.
@@ -429,7 +439,8 @@ impl Stopped {
         let directory = self.engine.join();
         let ldap = self.ldap_engine.join();
         let admin = self.admin_engine.map_or(Ok(()), EngineThread::join);
-        directory.and(ldap).and(admin)
+        let kpasswd = self.kpasswd_engine.map_or(Ok(()), EngineThread::join);
+        directory.and(ldap).and(admin).and(kpasswd)
     }
 }
 
@@ -516,6 +527,7 @@ fn start_admin(
     policy: &DevelopmentPolicy,
     gate: &Arc<AuditGate>,
     state: &Arc<ControlState>,
+    ids: &Arc<OperationIds>,
 ) -> Result<AdminRunning, NotStarted> {
     let factory = admin.keyd.clone().ok_or(NotStarted::NoKeyd)?;
     check_manifest(
@@ -573,6 +585,8 @@ fn start_admin(
         // Task A16: the base of a tier-map change, and where it is written.
         installed: policy.clone(),
         policy_next: admin.policy_next.clone(),
+        // Task K7: dird's one counter of operation numbers.
+        ids: Arc::clone(ids),
     };
     let ended = Arc::clone(state);
     let (handle, thread) = worker
@@ -605,6 +619,111 @@ fn start_admin(
     })
 }
 
+/// A running kpasswd service (task K7).
+struct KpasswdRunning {
+    context: Arc<KpasswdServeContext>,
+    accept: JoinHandle<()>,
+    thread: EngineThread,
+    socket: PathBuf,
+}
+
+/// Start the kpasswd service (task K7, dird side; docs/53 §5.6): with the
+/// admin service's settings (`admin` — the ticket-age threshold, the
+/// protected objects of the manifest, the node-id, the
+/// decision-acknowledgement wait), build its own write PEP over the loaded
+/// policy, find the change-password service's key set (`kadmin/changepw`,
+/// as the KDC resolves it — crate::kpasswd_service), build its keyd client,
+/// start the kpasswd thread, bind `dird-kpasswd.sock`, accept. Any failure
+/// ⇒ [`KpasswdNotStarted`]: dird's other services run.
+/// Spec: docs/53 §5.6 steps 1, 4; docs/51 §4.6 (the admin service's
+/// precedent); docs/50 R50-3, R50-7.
+#[allow(clippy::too_many_arguments)]
+fn start_kpasswd(
+    kpasswd: KpasswdServeParams,
+    admin: &AdminServeParams,
+    params: &ServeParams,
+    store: &Arc<Store>,
+    policy: &DevelopmentPolicy,
+    gate: &Arc<AuditGate>,
+    state: &Arc<ControlState>,
+    ids: &Arc<OperationIds>,
+) -> Result<KpasswdRunning, KpasswdNotStarted> {
+    let factory = kpasswd.keyd.clone().ok_or(KpasswdNotStarted::NoKeyd)?;
+    let schema = ad_schema::phase1().map_err(|_| KpasswdNotStarted::Configuration)?;
+    let ctx = DirectoryContext::new(schema.clone(), &params.keyd, params.naming_context.clone())
+        .map_err(|_| KpasswdNotStarted::Configuration)?;
+    let tiers = tier_map(policy).map_err(|_| KpasswdNotStarted::Configuration)?;
+    let snapshot = policy
+        .snapshot()
+        .map_err(|_| KpasswdNotStarted::Configuration)?;
+    let service = {
+        let view = ctx
+            .view(store, &tiers)
+            .map_err(|_| KpasswdNotStarted::DirectoryUnreadable)?;
+        change_password_service_handle(&view, &params.keyd.realm)?
+    };
+    // The admin service's configuration: one ticket-age threshold (R51-10,
+    // docs/53 §5.6 step 4), the same protected objects and node-id.
+    let config = directory_admin::AdminConfig::new(
+        admin.ticket_age_max,
+        admin.quorum,
+        params.keyd.realm.clone(),
+        params.naming_context.clone(),
+        admin.node_id,
+        protected_objects(&admin.manifest, policy),
+    )
+    .map_err(|_| KpasswdNotStarted::Configuration)?;
+    let pep =
+        directory_admin::DirectoryAdmin::new(config, &schema, directory_admin::OsRandom::new())
+            .map_err(|_| KpasswdNotStarted::Configuration)?;
+    let keyd = factory().ok_or(KpasswdNotStarted::NoKeyd)?;
+    let worker = KpasswdWorker {
+        store: Arc::clone(store),
+        ctx,
+        tiers,
+        policy: snapshot,
+        admin: pep,
+        keyd,
+        service,
+        gate: Arc::clone(gate),
+        clock: params.clock.clone(),
+        ack_deadline: admin.ack_deadline.get(),
+        ids: Arc::clone(ids),
+    };
+    let ended = Arc::clone(state);
+    let (handle, thread) = worker
+        .spawn(kpasswd.queue_capacity, move || {
+            ended.engine_ended.store(true, Ordering::SeqCst);
+            ended.stopping.store(true, Ordering::SeqCst);
+            ended.stop.notify_one();
+        })
+        .map_err(|_| KpasswdNotStarted::Spawn)?;
+    let listener = match bind(&kpasswd.socket) {
+        Ok(listener) => listener,
+        Err(_) => {
+            drop(handle);
+            let _ = thread.join();
+            return Err(KpasswdNotStarted::Bind);
+        }
+    };
+    let context = Arc::new(KpasswdServeContext::new(
+        KpasswdFronts::new(kpasswd.front_uid),
+        params.frame_timeout,
+        kpasswd.max_connections,
+        handle,
+    ));
+    let accept = tokio::spawn(kpasswd_listener::accept_loop(
+        listener,
+        Arc::clone(&context),
+    ));
+    Ok(KpasswdRunning {
+        context,
+        accept,
+        thread,
+        socket: kpasswd.socket,
+    })
+}
+
 /// Run dird's directory-view service and its LDAP service until
 /// [`DaemonControl::stop`] (module documentation); no admin service. The
 /// product parameters run with the daemon's production constants (docs/52
@@ -621,7 +740,15 @@ pub async fn serve(
     policy: DevelopmentPolicy,
     control: DaemonControl,
 ) -> Result<Stopped, DaemonError> {
-    serve_with(ServeParams::from(params), None, source, policy, control).await
+    serve_with(
+        ServeParams::from(params),
+        None,
+        None,
+        source,
+        policy,
+        control,
+    )
+    .await
 }
 
 /// [`serve`], plus — when `admin` is given — the admin service on
@@ -652,8 +779,48 @@ pub async fn serve_with_admin(
     policy: DevelopmentPolicy,
     control: DaemonControl,
 ) -> Result<Stopped, DaemonError> {
-    let admin = admin.map(|admin| AdminServeParams::production(admin, &params.keyd.realm));
-    serve_with(ServeParams::from(params), admin, source, policy, control).await
+    serve_with_services(params, admin, None, source, policy, control).await
+}
+
+/// [`serve_with_admin`], plus — when `kpasswd` is given — the kpasswd
+/// service on `dird-kpasswd.sock` (task K7; docs/53 §5.6). The kpasswd
+/// service runs only with the admin service, whose settings it shares (the
+/// ticket-age threshold, the manifest, the node-id, keyd); when it cannot
+/// start, dird logs why and runs its other services.
+///
+/// # Errors
+/// [`DaemonError`] for a start-up failure of the directory-view or LDAP
+/// service (nothing is listening then).
+///
+/// The kpasswd service runs with its production keyd client
+/// (`KeydKpasswdClient` over `ipc_keyd::UnixConnector`, Role::Ldap, the
+/// admin service's keyd and dird's realm) and its production bounds
+/// (docs/52 C18).
+///
+/// Spec: docs/53 §5.6; docs/51 §4.6, §7; docs/50 R50-3, R50-7; docs/52
+/// §3.18.
+pub async fn serve_with_services(
+    params: DaemonParams,
+    admin: Option<AdminParams>,
+    kpasswd: Option<KpasswdParams>,
+    source: StoreSource,
+    policy: DevelopmentPolicy,
+    control: DaemonControl,
+) -> Result<Stopped, DaemonError> {
+    let realm = params.keyd.realm.clone();
+    let keyd = admin.as_ref().and_then(|admin| admin.keyd.clone());
+    let kpasswd =
+        kpasswd.map(|kpasswd| KpasswdServeParams::production(kpasswd, keyd.as_ref(), &realm));
+    let admin = admin.map(|admin| AdminServeParams::production(admin, &realm));
+    serve_with(
+        ServeParams::from(params),
+        admin,
+        kpasswd,
+        source,
+        policy,
+        control,
+    )
+    .await
 }
 
 /// [`serve_with_admin`] with every value given: the parameters with their
@@ -670,6 +837,7 @@ pub async fn serve_with_admin(
 pub async fn serve_with(
     params: ServeParams,
     admin: Option<AdminServeParams>,
+    kpasswd: Option<KpasswdServeParams>,
     source: StoreSource,
     policy: DevelopmentPolicy,
     control: DaemonControl,
@@ -798,20 +966,59 @@ pub async fn serve_with(
         ldap_listener,
         Arc::clone(&ldap_context),
     ));
+    // dird's one counter of operation numbers (task K7,
+    // crate::operation_ids): the admin thread and the kpasswd thread draw
+    // from it, so their events and keyd decisions never share a number.
+    let ids = Arc::new(OperationIds::starting_at(&params.clock));
     // The admin service (task A8), optional: a failure is logged and dird
     // serves on without it (docs/51 §4.6).
+    let admin_settings = admin.clone();
     let admin_running = match admin {
         None => None,
-        Some(admin) => match start_admin(admin, &params, &store, &policy, &gate, &control.state) {
+        Some(admin) => {
+            match start_admin(admin, &params, &store, &policy, &gate, &control.state, &ids) {
+                Ok(running) => {
+                    note(Note::AdminListening, None);
+                    Some(running)
+                }
+                Err(reason) => {
+                    note(Note::AdminNotStarted, Some(reason.code()));
+                    None
+                }
+            }
+        }
+    };
+    // The kpasswd service (task K7), optional, and only beside a running
+    // admin service (crate::kpasswd_service): a failure is logged and dird
+    // serves on without it.
+    let kpasswd_running = match (kpasswd, admin_settings.as_ref(), admin_running.is_some()) {
+        (None, _, _) => None,
+        (Some(kpasswd), Some(admin), true) => match start_kpasswd(
+            kpasswd,
+            admin,
+            &params,
+            &store,
+            &policy,
+            &gate,
+            &control.state,
+            &ids,
+        ) {
             Ok(running) => {
-                note(Note::AdminListening, None);
+                note(Note::KpasswdListening, None);
                 Some(running)
             }
             Err(reason) => {
-                note(Note::AdminNotStarted, Some(reason.code()));
+                note(Note::KpasswdNotStarted, Some(reason.code()));
                 None
             }
         },
+        (Some(_), _, _) => {
+            note(
+                Note::KpasswdNotStarted,
+                Some(KpasswdNotStarted::NoAdminService.code()),
+            );
+            None
+        }
     };
     drop(store);
     control.state.serving.store(true, Ordering::SeqCst);
@@ -833,11 +1040,22 @@ pub async fn serve_with(
         }
         None => None,
     };
+    let kpasswd_parts = match kpasswd_running {
+        Some(running) => {
+            running.accept.abort();
+            let _ = running.accept.await;
+            Some((running.context, running.thread, running.socket))
+        }
+        None => None,
+    };
     control.state.serving.store(false, Ordering::SeqCst);
     context.start_draining();
     ldap_context.start_draining();
     if let Some((admin_context, _, _)) = admin_parts.as_ref() {
         admin_context.start_draining();
+    }
+    if let Some((kpasswd_context, _, _)) = kpasswd_parts.as_ref() {
+        kpasswd_context.start_draining();
     }
     wait_until(DRAIN_GRACE, || {
         context.in_flight() == 0
@@ -845,6 +1063,9 @@ pub async fn serve_with(
             && admin_parts
                 .as_ref()
                 .is_none_or(|(admin_context, _, _)| admin_context.in_flight() == 0)
+            && kpasswd_parts
+                .as_ref()
+                .is_none_or(|(kpasswd_context, _, _)| kpasswd_context.in_flight() == 0)
     })
     .await;
     // Q-313 (A-82: "waits, bounded, for auditd's acknowledgement of every
@@ -868,13 +1089,21 @@ pub async fn serve_with(
             Some(u64::try_from(unacknowledged).unwrap_or(u64::MAX)),
         );
     }
+    // Whether an engine ended before the stop asked for it — read before
+    // the admin and kpasswd contexts are dropped below: dropping a context
+    // drops its thread's queue, which ends that thread (its `on_exit` then
+    // marks it ended), and a thread ended by the stop is no failure.
+    let engine_failed = control.state.engine_ended.load(Ordering::SeqCst);
     let _ = std::fs::remove_file(&params.kdc_socket);
     let _ = std::fs::remove_file(&params.ldap_socket);
     let admin_engine = admin_parts.map(|(_, thread, socket)| {
         let _ = std::fs::remove_file(&socket);
         thread
     });
-    let engine_failed = control.state.engine_ended.load(Ordering::SeqCst);
+    let kpasswd_engine = kpasswd_parts.map(|(_, thread, socket)| {
+        let _ = std::fs::remove_file(&socket);
+        thread
+    });
     if engine_failed {
         note(Note::EngineStopped, None);
     }
@@ -883,6 +1112,7 @@ pub async fn serve_with(
         engine: engine_thread,
         ldap_engine: ldap_thread,
         admin_engine,
+        kpasswd_engine,
         engine_failed,
         unacknowledged,
     })

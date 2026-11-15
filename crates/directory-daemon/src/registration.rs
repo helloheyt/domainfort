@@ -21,6 +21,9 @@
 //! * a `directory_admin::Applied` of a `BeginPasswordSet` — made only by
 //!   `DirectoryAdmin::apply`, which takes the write's `AckedIntent`
 //!   ([`DecisionRegistration::of_password_set`]);
+//! * a `directory_admin::Applied` of a `ChangePassword` — the kpasswd
+//!   service's (task K7, docs/53 §5.6 step 5), made by the same `apply`
+//!   ([`DecisionRegistration::of_password_change`]);
 //! * a `directory_admin::TombstonedPrincipal` — a tombstone of the `user`
 //!   class in dird's store, which exists only because a `Delete` committed
 //!   after its decision event was acknowledged; durable, so it also serves
@@ -45,7 +48,10 @@
 //! item 2, §5.8 option (b), §6, §9; A-85; A-102; A-105; docs/questions/
 //! Q-453 item 1, Q-460, Q-470, Q-500, Q-501.
 
-use crate::admin_service::{secret_decision_of, SET_SECRET_GRANT_LIFETIME_SECS};
+use crate::admin_service::{
+    change_password_decision_of, secret_decision_of, SET_SECRET_GRANT_LIFETIME_SECS,
+};
+use crate::kpasswd_service::CHANGE_PASSWORD_DECISION_LIFETIME_SECS;
 use directory_admin::{Applied, QuorumStep, TombstonedPrincipal};
 use dtyp::Guid;
 use ipc_audit_client::AckedIntent;
@@ -114,6 +120,25 @@ impl DecisionRegistration {
             operation,
             approvers: Vec::new(),
             lifetime_secs: SET_SECRET_GRANT_LIFETIME_SECS,
+        })
+    }
+
+    /// The `ChangePassword` decision of a committed `ChangePassword` (task
+    /// K7; decision `id`, its operation id): exactly the user's key set and
+    /// salt its reply names, live [`CHANGE_PASSWORD_DECISION_LIFETIME_SECS`];
+    /// `None` for any other write (a `BeginPasswordSet` included —
+    /// docs/questions/Q-662: the decision names its executor).
+    /// Spec: docs/53 §5.6 step 5 (after the outcome event, A-100's order);
+    /// docs/52 §4.2, §4.3, §3.11 R6 (a).
+    pub(crate) fn of_password_change(
+        id: DecisionId,
+        applied: &Applied,
+    ) -> Option<DecisionRegistration> {
+        change_password_decision_of(applied.reply()).map(|operation| DecisionRegistration {
+            id,
+            operation,
+            approvers: Vec::new(),
+            lifetime_secs: CHANGE_PASSWORD_DECISION_LIFETIME_SECS,
         })
     }
 

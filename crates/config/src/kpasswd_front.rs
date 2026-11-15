@@ -44,8 +44,8 @@ use crate::kdc::{
 };
 use crate::limits::Bound;
 use crate::schema::{
-    self, Account, Distinct, Endpoint, AUDITD_UID, AUDIT_SOCKET, DIRD_DEADLINE, DIRD_UID,
-    INTERNAL_NETWORKS, RUN_AS_GID, RUN_AS_UID,
+    self, Account, Distinct, Endpoint, AUDITD_UID, AUDIT_SOCKET, DIRD_DEADLINE,
+    DIRD_KPASSWD_SOCKET, DIRD_UID, INTERNAL_NETWORKS, RUN_AS_GID, RUN_AS_UID,
 };
 use crate::value::{self, Network};
 
@@ -55,9 +55,6 @@ const LISTEN: &str = "listen";
 /// Key: the realm the front's KRB-ERRORs name. Spec: docs/53 §5.7; RFC 4120
 /// §5.9.1.
 const REALM: &str = "realm";
-/// Key: path of `dird-kpasswd.sock`. Spec: docs/53 §4.3; docs/50 the
-/// channel-magic registry.
-const DIRD_KPASSWD_SOCKET: &str = "dird_kpasswd_socket";
 /// Key: global TCP connection bound. Spec: docs/53 §5.1; docs/50 §4.1.
 const MAX_TCP_CONNECTIONS: &str = "max_tcp_connections";
 /// Key: TCP connections per source address. Spec: docs/53 §5.1; docs/50

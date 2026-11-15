@@ -110,6 +110,13 @@ directory-admin = { path = "../directory-admin" }
 # `open_and_verify_service_ticket`, `describe_config`, the Unix connector.
 # The client side of the keyd channel links no crypto (A-63).
 ipc-keyd = { path = "../ipc-keyd" }
+# The kpasswd-front ↔ dird channel (task K7, docs/53 §4.3, §5.6;
+# `dird-kpasswd.sock`, magic 0x4B50): the message set, the zone of a front
+# from its uid (`KpasswdFronts`) and the dispatcher dird hosts on its kpasswd
+# thread. A workspace crate with no feature, already in the lock (it links
+# ipc, zeroize and tokio — all already in this daemon's graph); it links no
+# krb-proto / krb-crypto, so nothing on the channel can hold a password.
+ipc-kpasswd = { path = "../ipc-kpasswd" }
 # The provisioning manifest (root-owned, non-secret): the admin service
 # object and the service objects dird protects (docs/51 §4.3 step 8).
 provision-manifest = { path = "../provision-manifest" }

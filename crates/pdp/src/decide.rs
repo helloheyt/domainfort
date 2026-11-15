@@ -346,7 +346,11 @@ pub fn required_sec_on(action: &Action, transport: Transport) -> TransportSec {
         | Transport::SmbEnc
         | Transport::NcacnIpTcpPrivacy
         | Transport::Dns
-        | Transport::Kerberos => floor,
+        | Transport::Kerberos
+        // docs/53 §5.6 step 4 (task K6): the kpasswd PEP's channel
+        // properties come from keyd's verification of the KRB-PRIV under
+        // the AP-REQ's subkey; the floor is the same.
+        | Transport::Kpasswd => floor,
     }
 }
 

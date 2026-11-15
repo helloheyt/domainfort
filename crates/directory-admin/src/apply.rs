@@ -69,7 +69,9 @@ use ipc_audit::{AdminFailure, AdminRefusal, Allocation, DirAdminEvent};
 use ipc_audit_client::AckedIntent;
 use krb_proto::KerberosTime;
 
-use crate::admin::{CreatePlan, DirectoryAdmin, Plan, Prepared, WriteKind, WritePlan};
+use crate::admin::{
+    CreatePlan, DirectoryAdmin, PasswordWrite, Plan, Prepared, WriteKind, WritePlan,
+};
 use crate::audit::{Refusal, Stop};
 use crate::checks::{domain_sid, fault_stop, store_failure};
 use crate::config::CHANGE_SEQ_COUNTER;
@@ -280,7 +282,18 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                     when_changed,
                 ];
                 self.modify(txn, now, target, changes, None)?;
-                Ok((None, Reply::PasswordSet(reply)))
+                // One write, two replies (task K6): the key sets of a
+                // `BeginPasswordSet`, or the one key set of a user's own
+                // `ChangePassword` — each its own reply type, so dird
+                // registers the decision whose executor fits it
+                // (docs/questions/Q-662).
+                Ok((
+                    None,
+                    match reply {
+                        PasswordWrite::Set(reply) => Reply::PasswordSet(reply),
+                        PasswordWrite::Change(target) => Reply::PasswordChange(target),
+                    },
+                ))
             }
             WriteKind::SetUac { target, uac } => {
                 let changes = vec![

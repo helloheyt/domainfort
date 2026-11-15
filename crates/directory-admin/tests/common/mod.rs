@@ -351,6 +351,41 @@ pub fn root_sd() -> SecurityDescriptor {
     )
 }
 
+/// PRINCIPAL_SELF, S-1-5-10 ([MS-DTYP] 2.4.2.4, as crates/pdp
+/// `access_check/token.rs` substitutes it — [MS-ADTS] 5.1.3.3: the SID of
+/// the object the access is checked on).
+pub fn principal_self() -> Sid {
+    Sid::new(SECURITY_NT_AUTHORITY, &[10]).unwrap()
+}
+
+/// An inheritable object ACE granting PRINCIPAL_SELF the control access
+/// right User-Change-Password ([MS-ADTS] 6.1.1.2.7.52; 3.1.1.3.1.5.1: the
+/// account "MUST possess the 'User-Change-Password' control access right
+/// on itself"; [MS-DTYP] 2.4.4.3 ACCESS_ALLOWED_OBJECT_ACE) — the ACE task
+/// K9 puts into the provisioned root SD (docs/53 §5.6 step 4); test data
+/// here.
+pub fn self_change_ace() -> Ace {
+    Ace::AccessAllowedObject(dtyp::ObjectAce {
+        ace_flags: ace_flags::CONTAINER_INHERIT_ACE,
+        mask: AccessMask(RIGHT_DS_CONTROL_ACCESS),
+        object_type: Some(directory_admin::USER_CHANGE_PASSWORD),
+        inherited_object_type: None,
+        sid: principal_self(),
+    })
+}
+
+/// What a test domain is built with beyond the standard one (task K6).
+#[derive(Debug, Clone, Default)]
+pub struct Extra {
+    /// The root SD also carries [`self_change_ace`].
+    pub self_ace: bool,
+    /// The policy also allows `DirControlRight(User-Change-Password)` under
+    /// the NC root to any subject (the coarse layer; the ACL decides).
+    pub self_rule: bool,
+    /// The tier map classifies ou=Staff with this tier.
+    pub staff_tier: Option<Tier>,
+}
+
 /// A child's SD, computed as provisioning computes it (CreateSecurityDescriptor
 /// from the parent's, the Tier-0 group as the token's owner — docs/51 §10;
 /// A-76; [MS-ADTS] 6.1.3 item 5 inputs).
@@ -487,6 +522,8 @@ pub struct Domain {
     /// test that proposes one sets it).
     pub policy_file: Option<policy_store::DevelopmentPolicy>,
     next_op: Cell<u64>,
+    /// The root SD carries [`self_change_ace`] (task K6).
+    self_ace: bool,
     _dir: TempDir,
 }
 
@@ -537,6 +574,16 @@ impl Domain {
     }
 
     fn with_options(test_name: &str, quorum: usize, rid_end: Option<u64>) -> Domain {
+        Domain::build(test_name, quorum, rid_end, Extra::default())
+    }
+
+    /// The standard domain with the additions of `extra` (task K6: a user's
+    /// own password change).
+    pub fn with_extra(test_name: &str, extra: Extra) -> Domain {
+        Domain::build(test_name, QUORUM, Some(RID_END_EXCLUSIVE), extra)
+    }
+
+    fn build(test_name: &str, quorum: usize, rid_end: Option<u64>, extra: Extra) -> Domain {
         let p1 = phase1().expect("phase-1 schema");
         let dir = TempDir::new(test_name);
         let store = Store::open(
@@ -547,15 +594,19 @@ impl Domain {
         .expect("open store");
         let ctx = DirectoryContext::new(p1.clone(), &KeydConfig::new(realm()), naming_context())
             .expect("context");
+        let mut subtrees = vec![
+            (ou_dn("Tier0"), Tier::Tier0),
+            (ou_dn("Managed"), Tier::Tier1),
+        ];
+        if let Some(tier) = extra.staff_tier {
+            subtrees.push((ou_dn("Staff"), tier));
+        }
         let tiers = TierMap::new(
             BTreeMap::from([
                 (sid_of(TIER0_GROUP), Tier::Tier0),
                 (sid_of(HELPDESK), Tier::Tier1),
             ]),
-            vec![
-                (ou_dn("Tier0"), Tier::Tier0),
-                (ou_dn("Managed"), Tier::Tier1),
-            ],
+            subtrees,
         )
         .expect("tier map");
         let allow = |id: u32, action: ActionMatch, subject: SubjectMatch| Rule {
@@ -572,27 +623,33 @@ impl Domain {
             },
             obligations: vec![],
         };
-        let policy = PolicySnapshot::new(
-            PolicyVersion(1),
-            vec![
-                allow(
-                    1,
-                    ActionMatch::Class(pdp::ActionClass::Directory),
-                    SubjectMatch::MemberOf(sid_of(TIER0_GROUP)),
-                ),
-                allow(
-                    2,
-                    ActionMatch::Class(pdp::ActionClass::Directory),
-                    SubjectMatch::MemberOf(sid_of(HELPDESK)),
-                ),
-                allow(
-                    3,
-                    ActionMatch::AnyOf(vec![pdp::Action::DirRead, pdp::Action::DirList]),
-                    SubjectMatch::MemberOf(sid_of(READERS)),
-                ),
-            ],
-            vec![],
-        );
+        let mut rules = vec![
+            allow(
+                1,
+                ActionMatch::Class(pdp::ActionClass::Directory),
+                SubjectMatch::MemberOf(sid_of(TIER0_GROUP)),
+            ),
+            allow(
+                2,
+                ActionMatch::Class(pdp::ActionClass::Directory),
+                SubjectMatch::MemberOf(sid_of(HELPDESK)),
+            ),
+            allow(
+                3,
+                ActionMatch::AnyOf(vec![pdp::Action::DirRead, pdp::Action::DirList]),
+                SubjectMatch::MemberOf(sid_of(READERS)),
+            ),
+        ];
+        if extra.self_rule {
+            rules.push(allow(
+                4,
+                ActionMatch::Exact(pdp::Action::DirControlRight(pdp::ControlRightId(
+                    directory_admin::USER_CHANGE_PASSWORD,
+                ))),
+                SubjectMatch::Any,
+            ));
+        }
+        let policy = PolicySnapshot::new(PolicyVersion(1), rules, vec![]);
         let config = AdminConfig::new(
             TICKET_AGE_MAX,
             quorum,
@@ -621,6 +678,7 @@ impl Domain {
             .expect("requests"),
             policy_file: None,
             next_op: Cell::new(0),
+            self_ace: extra.self_ace,
             _dir: dir,
         };
         domain.provision(rid_end);
@@ -699,7 +757,15 @@ impl Domain {
                     ("dc", text("example")),
                     ("objectSid", vec![domain_sid().encode()]),
                 ],
-                sd: Some(root_sd()),
+                sd: Some(if self.self_ace {
+                    let mut sd = root_sd();
+                    if let Some(dacl) = sd.dacl.as_mut() {
+                        dacl.aces.push(self_change_ace());
+                    }
+                    sd
+                } else {
+                    root_sd()
+                }),
             },
             planned(TIER0_OU, Some(ROOT), "organizationalUnit", ou("Tier0")),
             planned(STAFF_OU, Some(ROOT), "organizationalUnit", ou("Staff")),
@@ -856,7 +922,7 @@ impl Domain {
             .next_value
     }
 
-    fn next_id(&self) -> u64 {
+    pub fn next_id(&self) -> u64 {
         let id = self.next_op.get() + 1;
         self.next_op.set(id);
         id

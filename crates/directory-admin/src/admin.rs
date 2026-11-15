@@ -74,7 +74,7 @@ use crate::operation::{
 };
 use crate::random::RandomSource;
 use crate::record;
-use crate::reply::{KeyTarget, LookupResult, PasswordSetReply, Reply};
+use crate::reply::{KeyTarget, LookupResult, PasswordChangeTarget, PasswordSetReply, Reply};
 use crate::requests::{Basis, PendingRequests, ProposedOperation};
 use crate::subject::{AdminSubject, SubjectError, VerifiedTicket};
 use crate::time;
@@ -202,13 +202,29 @@ pub(crate) struct CreatePlan {
     pub(crate) attributes: Vec<(AttrId, Vec<Vec<u8>>)>,
 }
 
+/// What a password write hands back once committed: the key sets of an
+/// administrator's `BeginPasswordSet` (admind's `set_secret`, on a
+/// `SetSecret` decision), or the one key set of a user's own `ChangePassword`
+/// (keyd's `complete_change_password`, on a `ChangePassword` decision —
+/// docs/questions/Q-662: the decision names its executor). The write itself
+/// is the same for both (`pwdLastSet = now`, crate::apply): one write path,
+/// two replies.
+/// Spec: docs/51 §5.2 row 5; docs/53 §4.4 (R53-5), §5.6 step 5; A-126.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PasswordWrite {
+    /// `BeginPasswordSet`.
+    Set(PasswordSetReply),
+    /// `ChangePassword` (task K6).
+    Change(PasswordChangeTarget),
+}
+
 /// The write of one operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WriteKind {
     Create(CreatePlan),
     PasswordSet {
         target: Guid,
-        reply: PasswordSetReply,
+        reply: PasswordWrite,
     },
     SetUac {
         target: Guid,
@@ -292,6 +308,32 @@ impl Prepared {
         match &self.plan {
             Plan::Read(reply) => Some(reply),
             Plan::Write(_) => None,
+        }
+    }
+}
+
+impl Prepared {
+    /// A prepared operation from its parts: the `Decision` event
+    /// (`Proceed`, at `now`) of `base`, the obligations of the requester's
+    /// Allow other than the audit record, the requester's objectSid and the
+    /// plan — for `prepare` and `prepare_change_password` alike (task K6).
+    /// Spec: docs/51 §5.7 item 2, §7.4 step 5; A-85.
+    pub(crate) fn planned(
+        base: EventBase,
+        now: &KerberosTime,
+        obligations: Vec<Obligation>,
+        requester: Sid,
+        plan: Plan,
+    ) -> Prepared {
+        Prepared {
+            decision: base.proceed(now),
+            base,
+            obligations: obligations
+                .into_iter()
+                .filter(|o| !matches!(o, Obligation::Audit))
+                .collect(),
+            requester,
+            plan,
         }
     }
 }
@@ -392,13 +434,9 @@ impl<R: RandomSource> DirectoryAdmin<R> {
             &request.operation_digest,
         );
         match self.checked(request, requests, view, policy, now, &mut base) {
-            Ok((plan, obligations, requester)) => Ok(Prepared {
-                decision: base.proceed(now),
-                base,
-                obligations,
-                requester,
-                plan,
-            }),
+            Ok((plan, obligations, requester)) => {
+                Ok(Prepared::planned(base, now, obligations, requester, plan))
+            }
             Err(stop) => Err(base.decision_refusal(now, stop)),
         }
     }
@@ -460,12 +498,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                 base,
             )?;
         }
-        let obligations = handled
-            .obligations
-            .into_iter()
-            .filter(|o| !matches!(o, Obligation::Audit))
-            .collect();
-        Ok((handled.plan, obligations, *requester.sid()))
+        Ok((handled.plan, handled.obligations, *requester.sid()))
     }
 
     /// The checks of one directory operation for `ctx.requester` against
@@ -505,13 +538,21 @@ pub(crate) fn subject_of(
     cx: &Cx<'_, '_, '_>,
     ticket: &VerifiedTicket,
 ) -> Result<AdminSubject, SubjectError> {
-    AdminSubject::from_verified_ticket(
-        cx.pep.accounts(),
-        &ticket.crealm,
-        &ticket.cname,
-        &ticket.authtime,
-        &cx.now,
-    )
+    subject_of_facts(cx, &ticket.crealm, &ticket.cname, &ticket.authtime)
+}
+
+/// The Subject of the client a ticket keyd verified names — the admin
+/// plane's `VerifiedTicket`, or a kpasswd request's `ChangePasswordTicket`
+/// (task K6): one construction for both (docs/53 §4.4: "the same
+/// function").
+/// Spec: docs/51 §5.3; docs/53 §5.6 step 4.
+pub(crate) fn subject_of_facts(
+    cx: &Cx<'_, '_, '_>,
+    crealm: &krb_proto::Realm,
+    cname: &PrincipalName,
+    authtime: &KerberosTime,
+) -> Result<AdminSubject, SubjectError> {
+    AdminSubject::from_verified_ticket(cx.pep.accounts(), crealm, cname, authtime, &cx.now)
 }
 
 /// The per-request part every operation handler reads.
@@ -622,7 +663,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
     /// The change-seq counter must exist and not be exhausted (A-83: never
     /// created here; missing ⇒ refusal).
     /// Spec: docs/51 §8.3; A-75; A-83.
-    fn change_seq(&self, cx: &Cx<'_, '_, '_>) -> Result<CounterState, Stop> {
+    pub(crate) fn change_seq(&self, cx: &Cx<'_, '_, '_>) -> Result<CounterState, Stop> {
         let state = cx
             .counter(CHANGE_SEQ_COUNTER)?
             .ok_or(Stop::Failed(AdminFailure::StoreFailure))?;
@@ -883,28 +924,35 @@ impl<R: RandomSource> DirectoryAdmin<R> {
     /// "Service with host name as instance"); docs/47 §1.4 (krbtgt is
     /// never password-derived: its password set is replaced with a random
     /// value, [MS-SAMR] 3.1.1.8.5 item 3 as cited there).
-    fn password_targets(
+    ///
+    /// The account is given by its parts — a [`Resolved`]'s (the admin
+    /// plane), or the requester's own account of a kpasswd change (task K6,
+    /// crate::change_password) — so both reach the key sets through this one
+    /// derivation (docs/52 C14).
+    pub(crate) fn password_targets(
         &self,
         cx: &Cx<'_, '_, '_>,
-        t: &Resolved,
+        guid: Guid,
+        obj: &Object,
+        class: dirstore::ClassId,
     ) -> Result<PasswordSetReply, Stop> {
-        if !cx.is_account(t.class) {
+        if !cx.is_account(class) {
             return Err(Stop::Refused(AdminRefusal::ValueInvalid));
         }
-        if cx.is_structural(t)? {
+        if cx.is_structural_object(guid, obj, class)? {
             return Err(Stop::Refused(AdminRefusal::TargetProtected));
         }
         let ids = &self.ids;
         let internal = || Stop::Failed(AdminFailure::InternalFailure);
-        let sam = record::text(&t.obj, ids.sam_account_name)
+        let sam = record::text(obj, ids.sam_account_name)
             .map_err(malformed)?
             .ok_or(Stop::Failed(AdminFailure::IntegrityFailure))?;
-        let kind = if t.class == ids.computer.id {
+        let kind = if class == ids.computer.id {
             AccountKind::Computer
         } else {
             AccountKind::User
         };
-        let principal = PrincipalId::from_bytes(t.guid.to_packet());
+        let principal = PrincipalId::from_bytes(guid.to_packet());
         let realm = self.config.realm().clone();
         let mut keys = vec![KeyTarget {
             handle: KeyHandle::new(principal, KeyPurpose::PrincipalLongterm),
@@ -917,9 +965,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
             ),
         }];
         if kind == AccountKind::Computer {
-            if let Some(spn) =
-                record::text(&t.obj, ids.service_principal_name).map_err(malformed)?
-            {
+            if let Some(spn) = record::text(obj, ids.service_principal_name).map_err(malformed)? {
                 let name_string = names::spn_components(spn)
                     .into_iter()
                     .map(|c| KerberosString::new(c).map_err(|_| internal()))
@@ -964,14 +1010,17 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         let (t, _) = self.named(ctx, base, target)?;
         let (action, resource) = password_request(&t);
         let obligations = self.authorize(ctx, base, &action, &resource)?;
-        let reply = self.password_targets(cx, &t)?;
+        let reply = self.password_targets(cx, t.guid, &t.obj, t.class)?;
         let change_seq = self.change_seq(cx)?;
         let required = cx.explicit_tier(&t.dn)? == Some(Tier::Tier0);
         Ok(Handled {
             plan: Plan::Write(WritePlan {
                 change_seq,
                 seen: vec![(t.guid, t.obj)],
-                kind: WriteKind::PasswordSet { target, reply },
+                kind: WriteKind::PasswordSet {
+                    target,
+                    reply: PasswordWrite::Set(reply),
+                },
             }),
             obligations,
             dual: Dual::of(required, &action, &resource),
@@ -994,7 +1043,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         let (t, _) = self.named(ctx, base, c.target)?;
         let (action, resource) = password_request(&t);
         let obligations = self.authorize(ctx, base, &action, &resource)?;
-        let reply = self.password_targets(cx, &t)?;
+        let reply = self.password_targets(cx, t.guid, &t.obj, t.class)?;
         let fits = match c.outcome {
             PasswordSetOutcome::Completed => c.kvnos.len() == reply.keys.len(),
             PasswordSetOutcome::Failed => c.kvnos.len() < reply.keys.len(),

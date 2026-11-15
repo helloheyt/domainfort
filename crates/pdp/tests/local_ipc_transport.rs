@@ -35,8 +35,9 @@ const BOUND: TransportSec = TransportSec {
     channel_bound: true,
 };
 
-/// Every transport other than `LocalIpc`.
-const NETWORK_TRANSPORTS: [Transport; 8] = [
+/// Every transport other than `LocalIpc` (task K6 added `Kpasswd`,
+/// docs/53 §5.6 step 4: the same floor as every other).
+const NETWORK_TRANSPORTS: [Transport; 9] = [
     Transport::Ldap,
     Transport::Ldaps,
     Transport::LdapSasl,
@@ -45,6 +46,7 @@ const NETWORK_TRANSPORTS: [Transport; 8] = [
     Transport::NcacnIpTcpPrivacy,
     Transport::Dns,
     Transport::Kerberos,
+    Transport::Kpasswd,
 ];
 
 /// One request of every action kind, on a resource it belongs to.

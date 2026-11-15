@@ -199,6 +199,7 @@ use crate::clock::SharedClock;
 use crate::engine::{EngineError, EngineThread, OnExit, SubmitError};
 use crate::ldap_audit::AuditGate;
 use crate::log::{note, Note, Thinned};
+use crate::operation_ids::OperationIds;
 use crate::policy::DevelopmentPolicy;
 use crate::policy_next::{PolicyNextError, PolicyNextFile};
 use crate::rate::ObligationLimiter;
@@ -234,12 +235,6 @@ static AUDIT_UNAVAILABLE: Thinned = Thinned::new(Note::AdminAuditUnavailable);
 /// Outcome events that could not be committed after a commit (thinned log;
 /// cannot happen for events built from ipc-audit's types).
 static OUTCOME_UNRECORDED: Thinned = Thinned::new(Note::AdminOutcomeUnrecorded);
-
-/// Operation numbers per second of the start time (2^20): the first number
-/// of a run is the start's DSTIME seconds × 2^20 + 1, so the numbers of two
-/// runs do not overlap unless one run performs a million operations per
-/// second it lasted. Project choice (docs/questions/Q-388 item 4).
-const OPERATION_ID_SHIFT: u32 = 20;
 
 /// What a job asks of the admin thread.
 /// Spec: docs/51 §6, §7.3.
@@ -316,12 +311,14 @@ pub(crate) struct AdminWorker {
     /// Where an approved tier-map change is written (task A16); `None` ⇒
     /// `ChangePolicy` is answered `Unavailable`.
     pub(crate) policy_next: Option<PolicyNextFile>,
+    /// dird's operation numbers, shared with the kpasswd thread (task K7;
+    /// crate::operation_ids).
+    pub(crate) ids: Arc<OperationIds>,
 }
 
 /// The running state of the admin thread.
 struct Running {
     worker: AdminWorker,
-    next_operation: u64,
     rate: ObligationLimiter,
     /// The re-registration of lost destroy decisions (A-105).
     reconciler: Reconciler,
@@ -338,31 +335,31 @@ const VIEW_UNAVAILABLE: DirAdminStage =
 /// honour (the PDP reason stays `Allowed`).
 /// Spec: docs/11 §2 ("the PEP must honour obligations"), §8;
 /// docs/questions/Q-358 item 7, Q-388 item 2, Q-397 (A-91: its own code).
-const OBLIGATION_REFUSED: DirAdminStage =
+pub(crate) const OBLIGATION_REFUSED: DirAdminStage =
     DirAdminStage::Decision(DecisionResult::Refused(AdminRefusal::ObligationRefused));
 
 /// The outcome stage of a write whose decision event auditd did not
 /// acknowledge in time: not performed (the transaction was aborted).
 /// Spec: docs/51 §5.7 item 2 ("decision acknowledged ⇒ commit"); A-85;
 /// docs/questions/Q-388 items 1, 3, Q-397 (A-91: its own code).
-const NOT_PERFORMED: DirAdminStage =
+pub(crate) const NOT_PERFORMED: DirAdminStage =
     DirAdminStage::Outcome(OutcomeResult::Failed(AdminFailure::AuditUnacknowledged));
 
 /// An event with another stage (the request-derived fields kept): used for
 /// the three cases the PEP has no planner for — [`VIEW_UNAVAILABLE`],
 /// [`OBLIGATION_REFUSED`], [`NOT_PERFORMED`] (module documentation;
 /// docs/questions/Q-388 items 1-2, Q-397).
-fn restage(event: &DirAdminEvent, stage: DirAdminStage) -> DirAdminEvent {
+pub(crate) fn restage(event: &DirAdminEvent, stage: DirAdminStage) -> DirAdminEvent {
     let mut event = event.clone();
     event.stage = stage;
     event
 }
 
 impl Running {
-    /// The next operation number (Q-340 item 1).
+    /// The next operation number (Q-340 item 1) — of dird's one counter
+    /// (crate::operation_ids).
     fn next_id(&mut self) -> u64 {
-        self.next_operation = self.next_operation.wrapping_add(1);
-        self.next_operation
+        self.worker.ids.next()
     }
 
     /// Commit `event` into `slot`; the sequence number, or `None`.
@@ -1218,7 +1215,7 @@ impl Running {
 /// `Lookup`. `false` ⇒ refused.
 /// Spec: docs/11 §2 ("the PEP must honour obligations"), §8;
 /// docs/questions/Q-358 item 7, Q-388 item 2.
-fn honour_obligations(
+pub(crate) fn honour_obligations(
     rate: &mut ObligationLimiter,
     obligations: &[Obligation],
     lookup: bool,
@@ -1246,7 +1243,7 @@ fn honour_obligations(
 /// leaves nothing committed either — the transaction is dropped).
 /// Spec: dirstore `WriteTxn::abort`; A-83 ("abort the transaction when the
 /// object create is refused").
-fn abort(txn: Option<WriteTxn<'_>>) {
+pub(crate) fn abort(txn: Option<WriteTxn<'_>>) {
     if let Some(txn) = txn {
         let _ = txn.abort();
     }
@@ -1274,18 +1271,12 @@ impl AdminWorker {
             return Err(EngineError::QueueCapacity);
         }
         let (queue, jobs) = sync_channel::<AdminJob>(capacity);
-        let first_id = self
-            .clock
-            .now()
-            .and_then(|now| directory_admin::wall_clock(&now))
-            .map_or(0, |seconds| seconds.0.wrapping_shl(OPERATION_ID_SHIFT));
         let interval = self.reconcile_interval.clamp(
             MIN_DESTROY_RECONCILE_INTERVAL,
             MAX_DESTROY_RECONCILE_INTERVAL,
         );
         let mut running = Running {
             worker: self,
-            next_operation: first_id,
             rate: ObligationLimiter::new(),
             reconciler: Reconciler::new(),
         };

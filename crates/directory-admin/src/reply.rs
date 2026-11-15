@@ -38,6 +38,23 @@ pub struct PasswordSetReply {
     pub salt: KerberosString,
 }
 
+/// What a committed `ChangePassword` hands dird for keyd (task K6): the
+/// user's one key set (`(objectGUID, PrincipalLongterm)` bound to
+/// NT-PRINCIPAL [sAMAccountName]) and its salt — exactly what dird's
+/// `ChangePassword` decision names (`DecidedOperation::ChangePassword
+/// { target }`, docs/questions/Q-662) and keyd's `complete_change_password`
+/// installs into. Derived by the same `password_targets` as a
+/// [`PasswordSetReply`]; never handed to admind (dird keeps it).
+/// Spec: docs/53 §4.4 (R53-5), §5.6 steps 5-6; docs/47 §9.1, §3.3 (R47-4);
+/// A-126.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PasswordChangeTarget {
+    /// The user's password key set and its binding.
+    pub key: KeyTarget,
+    /// The key salt ([MS-KILE] 3.1.1.2 via `directory_pip::account_salt`).
+    pub salt: KerberosString,
+}
+
 /// The `Lookup` reply: only identifiers (docs/51 §5.2 row 10).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LookupResult {
@@ -64,6 +81,9 @@ pub enum Reply {
     },
     /// `BeginPasswordSet`.
     PasswordSet(PasswordSetReply),
+    /// `ChangePassword` (task K6; on `dird-kpasswd.sock`, never on the admin
+    /// channel).
+    PasswordChange(PasswordChangeTarget),
     /// `CompletePasswordSet`, `SetEnabled`, `SetAccountExpires`,
     /// `AddMember`, `RemoveMember`, `Delete`.
     Done,

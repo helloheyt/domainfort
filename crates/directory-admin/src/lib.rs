@@ -88,6 +88,7 @@
 //! | `AddMember` / `RemoveMember` | `DirWrite(member)` on the group | group explicitly Tier0 |
 //! | `Delete` | `DirDelete` on the object | object explicitly Tier0 |
 //! | `Lookup` | `DirRead` on the object | never |
+//! | `ChangePassword` (kpasswd, task K6) | `DirControlRight(User-Change-Password)` on the requester's own account | account explicitly Tier0 ⇒ refused (no approver on kpasswd) |
 //!
 //! Before any of these, every object the request names must be visible to
 //! the requester through `directory_pip::VisibilityGate`, rule
@@ -163,10 +164,20 @@
 //! A-108, A-110, A-111, A-120, A-146..A-148, P-22, P-30, P-78) and this
 //! repository's own code; interpretations in docs/questions/Q-935..Q-941.
 //! No other implementation was consulted or recalled (AGENTS.md §1-3).
+//!
+//! `ChangePassword` (task K6, module `change_password`) was written only
+//! from, opened in this session: docs/53 (whole), PENDING-OWNER (A-117,
+//! A-121, A-126, A-142, A-151, A-153, A-156, A-158, A-159), docs/questions
+//! Q-600..Q-609, Q-660..Q-664, Q-945, Q-955, docs/research/r3-e (§1-§3), the
+//! pinned RFC 3244 §2, RFC 4120 §3.2.3 and [MS-ADTS] v20261026
+//! 3.1.1.3.1.5.1, 6.1.1.2.7.52, and this repository's own code;
+//! interpretations in docs/questions/Q-963. No other implementation was
+//! consulted or recalled (AGENTS.md §1-3).
 
 mod admin;
 mod apply;
 mod audit;
+mod change_password;
 mod checks;
 mod config;
 mod descriptor;
@@ -189,6 +200,12 @@ pub use admin::{
 };
 pub use apply::Applied;
 pub use audit::{Refusal, RefusalStatus};
+// A user's change of its own password through kpasswd (task K6; docs/53
+// §4.4, §5.6 step 4): the one write path, User-Change-Password on itself.
+pub use change_password::{
+    change_password_result, ChangePasswordRequest, ChangePasswordTicket, NO_OPERATION_DIGEST,
+    USER_CHANGE_PASSWORD,
+};
 pub use config::{
     AdminConfig, ConfigError, ProtectedObjects, CHANGE_SEQ_COUNTER, CHANGE_SEQ_END_EXCLUSIVE,
     CHANGE_SEQ_FIRST, MAX_QUORUM, MIN_QUORUM, RID_COUNTER, RID_END_EXCLUSIVE, RID_FIRST,
@@ -234,6 +251,6 @@ pub use policy_change::{
     POLICY_CHANGE_SCOPE,
 };
 pub use random::{OsRandom, RandomError, RandomSource};
-pub use reply::{KeyTarget, LookupResult, PasswordSetReply, Reply};
+pub use reply::{KeyTarget, LookupResult, PasswordChangeTarget, PasswordSetReply, Reply};
 pub use subject::{AdminSubject, SubjectError, VerifiedTicket};
 pub use time::{filetime, wall_clock};
