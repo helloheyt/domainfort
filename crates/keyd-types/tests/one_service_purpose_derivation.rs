@@ -222,15 +222,17 @@ fn no_component_chooses_a_service_purpose_by_a_literal() {
          `ServiceKeyHandle::of_service` / `KeyPurpose::of_service_name` \
          (docs/52 R2b): {violations:#?}"
     );
-    // Positive control: the scan sees the matches it must see — the admin
-    // plane's digest codes of the three service purposes.
+    // Positive control: the scan sees the matches it must see — each of the
+    // three service purposes is matched (not chosen) somewhere in the scanned
+    // sources. The control is not pinned to one file: the admin plane's
+    // key-operation digest codes that it used to name
+    // (directory-admin/src/key_requests.rs) were folded into the one
+    // operation digest by A-159 (Q-935), and admind's request classification
+    // now holds the three matches.
     for literal in PURPOSES {
         assert!(
-            matched
-                .iter()
-                .any(|m| m.starts_with("directory-admin/src/key_requests.rs")
-                    && m.ends_with(literal)),
-            "{literal} not seen in directory-admin: {matched:#?}"
+            matched.iter().any(|m| m.ends_with(literal)),
+            "{literal} not seen as a match anywhere: {matched:#?}"
         );
     }
 }
