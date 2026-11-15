@@ -202,6 +202,43 @@ pub(crate) fn dns_host_name(text: &str) -> Result<String, ErrorKind> {
     }
 }
 
+/// Most octets of one label. Spec: RFC 1035 §2.3.4 ("labels 63 octets or
+/// less"), §3.1.
+pub const MAX_LABEL_OCTETS: usize = 63;
+
+/// Most octets of a domain name in its text form without the final dot: a
+/// wire name is its labels, each with a one-octet length, and the root's
+/// zero octet (RFC 1035 §3.1) — so 255 wire octets are 253 text octets.
+/// Spec: RFC 1035 §2.3.4 ("names 255 octets or less"), §3.1.
+pub const MAX_DOMAIN_NAME_OCTETS: usize = 253;
+
+/// A domain name (dird's `dns_soa_rname` — the SOA's RNAME, the mailbox of
+/// the person responsible for the zone, its local part as the first label —
+/// RFC 1035 §8): labels of 1 ..= [`MAX_LABEL_OCTETS`] octets of
+/// `A-Z a-z 0-9 -`, separated by single dots, at most
+/// [`MAX_DOMAIN_NAME_OCTETS`] octets in all; no final dot, no escape (a
+/// local part with a dot or another special character is not expressible —
+/// a strict subset of RFC 1035 §8's encoding). dird builds the wire name
+/// (crates/parse-dns `Name::from_labels`), which re-validates.
+/// Spec: RFC 1035 §2.3.1, §2.3.4, §3.1, §3.3.13 (RNAME "a <domain-name>"),
+/// §8; docs/questions/Q-1001 item 4.
+pub(crate) fn domain_name(text: &str) -> Result<String, ErrorKind> {
+    let valid = !text.is_empty()
+        && text.len() <= MAX_DOMAIN_NAME_OCTETS
+        && text.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= MAX_LABEL_OCTETS
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+    if valid {
+        Ok(text.to_owned())
+    } else {
+        Err(ErrorKind::InvalidDomainName)
+    }
+}
+
 /// The naming context — the DN of the domain root (A-53) — as its labels.
 ///
 /// Written `dc=<label>,…,dc=<label>`, leaf first, `dc` in lower case, no space

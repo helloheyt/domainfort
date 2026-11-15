@@ -981,10 +981,96 @@ fn the_fronts_files_parse_and_name_dird_and_auditd() {
     for key in provision::configs::DIRD_KPASSWD_CHANNEL_KEYS {
         assert!(dird_text.contains(&format!("\n{key} = ")), "{key}");
     }
-    // dird does not serve `dird-dns.sock` before task DN10: its file names
-    // no DNS key (docs/questions/Q-973).
-    assert!(!dird_text.contains("dns_socket"));
-    assert!(!dird_text.contains("dnsd_uid"));
+    // Task DN10a (docs/54 §4.6; docs/questions/Q-973 item 6, Q-1003 item
+    // 1): dird serves `dird-dns.sock` — the very path dnsd's file names — to
+    // dnsd's uid only, with the zone values of its image.
+    let dns = dird.dns_service().expect("the DNS channel");
+    assert_eq!(dns.channel().socket(), dnsd.dird().socket());
+    assert_eq!(dns.channel().peer_uid(), dnsd.run_as().uid());
+    for key in provision::configs::DIRD_DNS_CHANNEL_KEYS {
+        assert!(dird_text.contains(&format!("\n{key} = ")), "{key}");
+    }
+    // The registrable networks: the IPv4 internal networks (A records only
+    // — docs/54 §3.1): of 10.0.0.0/8 and 127.0.0.0/8, both.
+    assert_eq!(
+        dns.registrable_networks(),
+        dnsd.internal_networks(),
+        "every internal network of the input is IPv4"
+    );
+    // RNAME = hostmaster.<zone> (RFC 1035 §8); the timers of RFC 1035 §5.3's
+    // example; the TTLs; dns_record_max_age keeps the schema's default.
+    assert_eq!(dns.soa().rname(), "hostmaster.example.test");
+    assert_eq!(
+        [
+            dns.soa().refresh(),
+            dns.soa().retry(),
+            dns.soa().expire(),
+            dns.soa().minimum()
+        ],
+        [7200, 600, 3_600_000, 60]
+    );
+    assert_eq!(dns.infrastructure_ttl(), 3600);
+    assert_eq!(dns.host_ttl(), 600);
+    assert_eq!(dns.record_max_age().as_secs(), 7 * 24 * 60 * 60);
+    assert!(!dird_text.contains("dns_record_max_age"));
+}
+
+/// Task DN10a (docs/54 §3.1, §5.3, §5.5; docs/questions/Q-994 item 6 (b),
+/// Q-1003 item 1): the DC's host name must be `<dc-name>.<zone>` (the zone's
+/// host-name rule, compared without case), and at least one internal network
+/// must be IPv4 (dird's registrable networks); otherwise nothing is built.
+/// An IPv6 internal network beside an IPv4 one stays internal but is not
+/// registrable.
+#[test]
+fn the_dc_host_name_and_an_ipv4_internal_network_are_required() {
+    let dir = TempDir::new();
+    let base = input(&dir, 61002, 61007);
+    for fqdn in ["dc2.example.test", "dc1.other.test", "dc1.sub.example.test"] {
+        let mut i = base.clone();
+        i.dc_fqdn = fqdn.to_owned();
+        let err = Plan::build(&i, now(), &mut CountingRandom::default()).unwrap_err();
+        assert_eq!(
+            err,
+            PlanError::Input(provision::input::InputError {
+                field: "dc-fqdn",
+                kind: InputErrorKind::DcHostName
+            }),
+            "{fqdn}"
+        );
+    }
+    // Case does not matter (RFC 1035 §2.3.3): DC1 / dc1.example.test is the
+    // base input itself.
+    assert!(Plan::build(&base, now(), &mut CountingRandom::default()).is_ok());
+
+    let mut v6 = base.clone();
+    v6.network.internal_networks = vec!["::1/128".to_owned()];
+    v6.network.kdc_listen = vec!["[::1]:88".to_owned()];
+    v6.network.ldaps_listen = vec!["[::1]:636".to_owned()];
+    v6.network.kpasswd_listen = vec!["[::1]:464".to_owned()];
+    v6.network.dnsd_listen = vec!["[::1]:53".to_owned()];
+    let err = Plan::build(&v6, now(), &mut CountingRandom::default()).unwrap_err();
+    assert_eq!(
+        err,
+        PlanError::Input(provision::input::InputError {
+            field: "internal-network",
+            kind: InputErrorKind::MissingIpv4InternalNetwork
+        })
+    );
+
+    let mut mixed = base.clone();
+    mixed
+        .network
+        .internal_networks
+        .push("fd00:1234::/32".to_owned());
+    let p = Plan::build(&mixed, now(), &mut CountingRandom::default()).unwrap();
+    let dird_text = p
+        .configs
+        .iter()
+        .find(|f| f.daemon == provision::Daemon::Dird)
+        .unwrap()
+        .text();
+    let dird = config::DirdSettings::parse(dird_text.as_bytes()).unwrap();
+    assert_eq!(dird.dns_service().unwrap().registrable_networks().len(), 2);
 }
 
 /// Task K9 — the fronts' listeners lie inside the internal networks

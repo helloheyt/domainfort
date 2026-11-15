@@ -89,6 +89,15 @@ admin-daemon = { path = "../admin-daemon", features = ["test-seams"] }
 ipc-admin = { path = "../ipc-admin" }
 ipc-dird-admin = { path = "../ipc-dird-admin" }
 directory-admin = { path = "../directory-admin" }
+# Task DN10a (tests/dns_zone.rs, docs/54 §4.6, §4.8): dnsd started in-process
+# through its test seams (`test_seams::serve`, feature `test-seams` — docs/52
+# C18; only a dev-dependency enables it), dnsd's side of `dird-dns.sock`
+# (ipc-dns: the client's connection type), and the DNS codec the clients
+# encode their queries and decode the replies with (parse-dns). All
+# workspace crates, already in the lock — no third-party package is added.
+dns-daemon = { path = "../dns-daemon", features = ["test-seams"] }
+ipc-dns = { path = "../ipc-dns" }
+parse-dns = { path = "../parse-dns" }
 # The DER encoder (`encode`, `encode_element`) under the test certificates
 # of tests/support/tls.rs (crates/parse-x509 tests/common/build.rs, reused
 # by `#[path]`, as crates/ldap-front's tests do; docs/questions/Q-320,

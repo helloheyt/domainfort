@@ -1,8 +1,9 @@
 #![forbid(unsafe_code)]
 //! The dird binary: `directory-daemon <configuration file>` — the
 //! directory-view service (task P8), the LDAP service (task P10) and, when
-//! configured, the admin service (task A8, docs/51 §7) and the kpasswd
-//! service beside it (task K7, docs/53 §5.6).
+//! configured, the admin service (task A8, docs/51 §7), the kpasswd
+//! service beside it (task K7, docs/53 §5.6) and the DNS service (task
+//! DN10a, docs/54 §4.6).
 //!
 //! The start-up order (docs/50 R50-14, §6.2, §7.5; crates/daemon-sandbox):
 //!
@@ -25,9 +26,9 @@
 use daemon_sandbox::{apply, SingleThreadProof};
 use directory_daemon::log::{note, Note};
 use directory_daemon::startup::{
-    admin_params, hardening_plan, kpasswd_params, params, prepare_policy_next_directory,
-    prepare_socket_directory, read_integrity_key, read_policy, read_provision_manifest,
-    read_settings,
+    admin_params, dns_params, hardening_plan, kpasswd_params, params,
+    prepare_policy_next_directory, prepare_socket_directory, read_integrity_key, read_policy,
+    read_provision_manifest, read_settings,
 };
 use directory_daemon::{serve_with_services, DaemonControl, StoreSource};
 use std::io::Write;
@@ -85,6 +86,11 @@ fn main() -> ExitCode {
     let params = match params(&settings) {
         Ok(params) => params,
         Err(error) => return fail("configuration", &error),
+    };
+    // Task DN10a: the DNS service, when its channel is configured.
+    let dns = match dns_params(&settings) {
+        Ok(dns) => dns,
+        Err(error) => return fail("DNS service", &error),
     };
 
     // 3. As root, before the drop: the development key and policy, the
@@ -149,7 +155,7 @@ fn main() -> ExitCode {
     // channel is configured.
     let kpasswd = kpasswd_params(&settings);
     let result = runtime.block_on(serve_with_services(
-        params, admin, kpasswd, source, policy, control,
+        params, admin, kpasswd, dns, source, policy, control,
     ));
     drop(runtime);
     match result {

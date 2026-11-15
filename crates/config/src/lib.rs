@@ -94,8 +94,8 @@ mod value;
 pub use admind::AdmindSettings;
 pub use auditd::{AuditSource, AuditdSettings, SourceMap};
 pub use dird::{
-    AdminServiceSettings, Channel, DirdSettings, IntegrityKeySource, PolicyStoreFormat,
-    VIEW_LIFETIME_SECS,
+    AdminServiceSettings, Channel, DirdSettings, DnsServiceSettings, IntegrityKeySource,
+    PolicyStoreFormat, SoaSettings, VIEW_LIFETIME_SECS,
 };
 pub use dnsd::{
     DnsdLimits, DnsdSettings, DNSD_MAX_REQUESTS_PER_TCP_CONNECTION_BOUND,
@@ -118,6 +118,6 @@ pub use ldap_front::{
 };
 pub use schema::{Account, Endpoint};
 pub use value::{
-    is_internal, AbsolutePath, NamingContextLabels, Network, MAX_NAMING_CONTEXT_LABELS,
-    NODE_ID_OCTETS,
+    is_internal, AbsolutePath, NamingContextLabels, Network, MAX_DOMAIN_NAME_OCTETS,
+    MAX_LABEL_OCTETS, MAX_NAMING_CONTEXT_LABELS, NODE_ID_OCTETS,
 };

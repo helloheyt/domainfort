@@ -10,13 +10,14 @@
 use crate::admin_service::{AdminParams, KeydEndpoint};
 use crate::audit_link::AuditEndpoint;
 use crate::daemon::{DaemonParams, MAX_KDC_CONNECTIONS, MAX_LDAP_SESSIONS};
+use crate::dns_service::DnsParams;
 use crate::kpasswd_service::KpasswdParams;
 use crate::policy::{read_file, DevelopmentPolicy, LoadError, PolicyError};
 use crate::policy_next::PolicyNextFile;
 use config::{DirdSettings, IntegrityKeySource, PolicyStoreFormat};
 use core::fmt;
 use daemon_sandbox::{HardeningPlan, PlanError, ProcessIdentity};
-use directory_pip::NamingContext;
+use directory_pip::{DnsName, KpasswdService, NamingContext, SoaParameters, ZoneParameters};
 use dirstore::{IntegrityKey, INTEGRITY_KEY_LEN};
 use keyd_types::KeydConfig;
 use krb_proto::Realm;
@@ -37,12 +38,27 @@ const ROOT_UID: u32 = 0;
 /// item 1.
 const INTEGRITY_KEY_FILE_MODE: u32 = 0o400;
 
-/// Open files beyond the kdc's connection quota and the LDAP session bound:
-/// stdio, the two listeners, the audit connection, the redb file, the
-/// runtime's own descriptors, and room for connections accepted only to be
-/// closed (refused peers). Project choice (docs/50 §6.1: "nofile according
-/// to the connection quotas").
+/// Open files beyond the served channels' connection bounds
+/// ([`MAX_SERVED_CONNECTIONS`]): stdio, the listeners, the audit connection,
+/// the redb file, the keyd clients' connections, the runtime's own
+/// descriptors, and room for connections accepted only to be closed
+/// (refused peers). Project choice (docs/50 §6.1: "nofile according to the
+/// connection quotas").
 pub const OPEN_FILES_HEADROOM: u64 = 32;
+
+/// Every connection dird may hold open as a server at once: the bound of
+/// each channel it serves — the kdc's quota, the LDAP sessions, admind's,
+/// kpasswd-front's and (task DN10a) dnsd's connections — summed in this one
+/// place, whether or not a service is configured, so no channel's bound can
+/// be left out of the open-files limit (docs/questions/Q-1000 item 9; before
+/// task DN10a the admin and kpasswd channels were not counted).
+/// Spec: docs/50 §6.1 ("nofile according to the connection quotas"), §3.6;
+/// docs/54 §4.6.
+pub const MAX_SERVED_CONNECTIONS: usize = MAX_KDC_CONNECTIONS
+    + MAX_LDAP_SESSIONS
+    + crate::admin_service::MAX_ADMIN_CONNECTIONS
+    + crate::kpasswd_service::MAX_KPASSWD_CONNECTIONS
+    + crate::dns_service::MAX_DNS_CONNECTIONS;
 
 /// Mode of the socket directory: owner all, group enter, other nothing —
 /// the one value crates/protected-file creates every socket directory with.
@@ -104,6 +120,9 @@ pub enum StartupError {
     /// a foreign or open directory on its path, an existing directory not
     /// dird's or open to others, or the creation failed) — task A16.
     PolicyNextDirectory,
+    /// `dns_soa_rname` does not form a DNS name (crates/parse-dns refused
+    /// its labels) — task DN10a.
+    DnsRname,
 }
 
 impl fmt::Display for StartupError {
@@ -141,6 +160,7 @@ impl fmt::Display for StartupError {
             StartupError::PolicyNextDirectory => f.write_str(
                 "policy.next directory must be dird's, with no group write and no access for others, on a path of root's or dird's directories",
             ),
+            StartupError::DnsRname => f.write_str("dns_soa_rname is not a DNS name"),
         }
     }
 }
@@ -272,7 +292,8 @@ pub fn read_policy(path: &Path, owner: u32) -> Result<DevelopmentPolicy, Startup
 
 /// The privileged set-up (as root, before the drop): the directories of
 /// `dird_kdc_socket`, `dird_ldap_socket` and, when configured,
-/// `dird_admin_socket` and `dird_kpasswd_socket` (task K7) (docs/50 §3.1:
+/// `dird_admin_socket`, `dird_kpasswd_socket` (task K7) and
+/// `dird_dns_socket` (task DN10a) (docs/50 §3.1:
 /// "each socket in its own directory"), each through the one implementation
 /// every socket-serving
 /// daemon shares (`protected_file::prepare_socket_directory`, task R11c):
@@ -299,11 +320,14 @@ pub fn prepare_socket_directory(settings: &DirdSettings) -> Result<(), StartupEr
     };
     let admin_socket = settings.admin_channel().map(config::Channel::socket);
     let kpasswd_socket = settings.kpasswd_channel().map(config::Channel::socket);
+    // Task DN10a: `dird-dns.sock`, when the DNS channel is configured.
+    let dns_socket = settings.dns_service().map(|dns| dns.channel().socket());
     for socket in [
         Some(settings.kdc_channel().socket()),
         Some(settings.ldap_channel().socket()),
         admin_socket,
         kpasswd_socket,
+        dns_socket,
     ]
     .into_iter()
     .flatten()
@@ -324,8 +348,9 @@ pub fn prepare_socket_directory(settings: &DirdSettings) -> Result<(), StartupEr
 /// dird's hardening plan: the docs/50 §6.4 baseline (drop to `run_as_uid` /
 /// `run_as_gid` with the supplementary groups cleared, no_new_privs, every
 /// capability dropped, core limit 0, not dumpable, umask 077), an open-files
-/// limit sized from the kdc's connection quota, and the working directory
-/// `/` (the open-files limit also covers the LDAP sessions). No `mlockall`
+/// limit sized from every served channel's connection bound
+/// ([`MAX_SERVED_CONNECTIONS`]) and the headroom, and the working directory
+/// `/`. No `mlockall`
 /// (docs/50 §6.4 names it for keyd and admind, not dird);
 /// no chroot (the redb file and `audit.sock` live in other directories).
 ///
@@ -337,7 +362,7 @@ pub fn prepare_socket_directory(settings: &DirdSettings) -> Result<(), StartupEr
 pub fn hardening_plan(settings: &DirdSettings) -> Result<HardeningPlan, PlanError> {
     let account = settings.run_as();
     let identity = ProcessIdentity::new(account.uid(), account.gid())?;
-    let open_files = u64::try_from(MAX_KDC_CONNECTIONS.saturating_add(MAX_LDAP_SESSIONS))
+    let open_files = u64::try_from(MAX_SERVED_CONNECTIONS)
         .unwrap_or(u64::MAX)
         .saturating_add(OPEN_FILES_HEADROOM);
     HardeningPlan::daemon_baseline(identity)
@@ -449,6 +474,54 @@ pub fn kpasswd_params(settings: &DirdSettings) -> Option<KpasswdParams> {
         socket: channel.socket().as_path().to_path_buf(),
         front_uid: channel.peer_uid(),
     })
+}
+
+/// The DNS service's parameters (task DN10a; docs/54 §4.6), when the DNS
+/// channel is configured — the one product constructor (docs/52 C18):
+/// `dird_dns_socket`, `dnsd_uid` and the zone values of the image
+/// (`ZoneParameters`, crate directory-pip): the SOA's RNAME as a DNS name
+/// (its labels in order — RFC 1035 §3.3.13, §8), REFRESH / RETRY / EXPIRE /
+/// MINIMUM, the infrastructure and host TTLs, `dns_record_max_age` and
+/// `dns_registrable_networks` as configured — and the `_kpasswd` switch from
+/// whether the kpasswd channel is configured (docs/54 §3.1: "synthesized
+/// only when kpasswd exists"; one fact, not a second key — docs/questions/
+/// Q-1001 item 5).
+///
+/// # Errors
+/// [`StartupError::DnsRname`].
+///
+/// Spec: docs/54 §3.1, §4.4, §4.6, §5.2, §5.5; RFC 1035 §3.3.13;
+/// docs/questions/Q-619 item 5, Q-991 item 4 (A-170), Q-1001.
+pub fn dns_params(settings: &DirdSettings) -> Result<Option<DnsParams>, StartupError> {
+    let Some(dns) = settings.dns_service() else {
+        return Ok(None);
+    };
+    let soa = dns.soa();
+    let rname = DnsName::from_labels(soa.rname().split('.').map(str::as_bytes))
+        .map_err(|_| StartupError::DnsRname)?;
+    let kpasswd = if settings.kpasswd_channel().is_some() {
+        KpasswdService::Present
+    } else {
+        KpasswdService::Absent
+    };
+    Ok(Some(DnsParams {
+        socket: dns.channel().socket().as_path().to_path_buf(),
+        dnsd_uid: dns.channel().peer_uid(),
+        zone: ZoneParameters {
+            soa: SoaParameters {
+                rname,
+                refresh: soa.refresh(),
+                retry: soa.retry(),
+                expire: soa.expire(),
+                minimum: soa.minimum(),
+            },
+            infrastructure_ttl: dns.infrastructure_ttl(),
+            host_ttl: dns.host_ttl(),
+            kpasswd,
+            max_record_age: dns.record_max_age().as_secs(),
+            registrable_networks: dns.registrable_networks().to_vec(),
+        },
+    }))
 }
 
 /// The directory of `policy.next` (task A16, docs/51 §5.10), when the admin

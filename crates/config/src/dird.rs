@@ -1,8 +1,10 @@
 //! dird's configuration file.
 //!
 //! dird is the sole owner of the redb file and runs the LDAP engine (docs/50
-//! R50-1, R50-2). It serves up to four channels — `dird-kdc.sock`,
-//! `dird-ldap.sock`, `dird-admin.sock` and (task K7) `dird-kpasswd.sock` —
+//! R50-1, R50-2). It serves up to five channels — `dird-kdc.sock`,
+//! `dird-ldap.sock`, `dird-admin.sock`, (task K7) `dird-kpasswd.sock` and
+//! (task DN10a) `dird-dns.sock`, with the zone values of its image (docs/54
+//! §3.1, §4.4; docs/questions/Q-1001) —
 //! each admitting exactly one peer uid (§3.2; docs/53 §5.6 step 1), loads the
 //! signed policy store (which carries the TierMap, A-36) (§7.2). The kpasswd
 //! channel's zone, like the LDAP channel's, is its front's, derived from the
@@ -32,14 +34,18 @@
 use core::time::Duration;
 
 use crate::error::{Error, ErrorKind};
-use crate::format::Document;
-use crate::limits::{Bound, ADMIN_QUORUM, ADMIN_TICKET_AGE_MAX_SECS, FRAME_TIMEOUT_SECS};
+use crate::format::{Document, Located};
+use crate::limits::{
+    Bound, ADMIN_QUORUM, ADMIN_TICKET_AGE_MAX_SECS, DNS_RECORD_MAX_AGE_SECS, DNS_TIME_SECS,
+    FRAME_TIMEOUT_SECS,
+};
 use crate::schema::{
     self, Account, Distinct, Endpoint, AUDITD_UID, AUDIT_SOCKET, DIRD_ADMIN_SOCKET,
-    DIRD_KDC_SOCKET, DIRD_KPASSWD_SOCKET, DIRD_LDAP_SOCKET, FRAME_TIMEOUT, KEYD_SOCKET, KEYD_UID,
-    POLICY_STORE_PATH, RUN_AS_GID, RUN_AS_UID,
+    DIRD_DNS_SOCKET, DIRD_KDC_SOCKET, DIRD_KPASSWD_SOCKET, DIRD_LDAP_SOCKET, FRAME_TIMEOUT,
+    KEYD_SOCKET, KEYD_UID, POLICY_STORE_PATH, RUN_AS_GID, RUN_AS_UID,
 };
-use crate::value::{self, AbsolutePath, NamingContextLabels, NODE_ID_OCTETS};
+use crate::value::{self, AbsolutePath, NamingContextLabels, Network, NODE_ID_OCTETS};
+use core::net::IpAddr;
 
 /// Key: the realm. Spec: docs/50 §7.1; A-55 (must match the naming context).
 const REALM: &str = "realm";
@@ -92,6 +98,49 @@ const PROVISION_MANIFEST: &str = "provision_manifest";
 /// drop); root's activation reads the same key. Spec: docs/51 §5.10
 /// (R51-21); A-80; docs/questions/Q-591.
 const POLICY_NEXT_PATH: &str = "policy_next_path";
+/// Key: the only uid admitted on `dird-dns.sock` — dnsd's (task DN10a).
+/// Spec: docs/54 §4.3 ("dird gets another socket (`dird-dns.sock`, peer =
+/// `dnsd_uid` only)"), §4.6; docs/questions/Q-619 item 5.
+const DNSD_UID: &str = "dnsd_uid";
+/// Key: the networks a host's registered address must lie in
+/// (`dns_registrable_networks`), IPv4 only. Spec: docs/54 §4.4, §5.5;
+/// docs/questions/Q-614 item 8, Q-619 item 4, Q-994 item 6 (e).
+const DNS_REGISTRABLE_NETWORKS: &str = "dns_registrable_networks";
+/// Key: `dns_record_max_age`. Spec: docs/54 §5.2; docs/questions/Q-614
+/// item 7, Q-619 item 5.
+const DNS_RECORD_MAX_AGE: &str = "dns_record_max_age";
+/// Key: the SOA's RNAME. Spec: docs/54 §3.1 (SOA row); RFC 1035 §3.3.13;
+/// docs/questions/Q-619 item 5.
+const DNS_SOA_RNAME: &str = "dns_soa_rname";
+/// Key: the SOA's REFRESH. Spec: docs/54 §3.1; RFC 1035 §3.3.13.
+const DNS_SOA_REFRESH: &str = "dns_soa_refresh";
+/// Key: the SOA's RETRY. Spec: docs/54 §3.1; RFC 1035 §3.3.13.
+const DNS_SOA_RETRY: &str = "dns_soa_retry";
+/// Key: the SOA's EXPIRE. Spec: docs/54 §3.1; RFC 1035 §3.3.13.
+const DNS_SOA_EXPIRE: &str = "dns_soa_expire";
+/// Key: the SOA's MINIMUM. Spec: docs/54 §3.1, §6.4; RFC 1035 §3.3.13.
+const DNS_SOA_MINIMUM: &str = "dns_soa_minimum";
+/// Key: the TTL of the synthesized SOA, NS and SRV records. Spec: docs/54
+/// §5.1; docs/questions/Q-994 item 6 (e).
+const DNS_INFRASTRUCTURE_TTL: &str = "dns_infrastructure_ttl";
+/// Key: the one zone-wide TTL of every host's A records. Spec: docs/54
+/// §3.1; RFC 2136 §7.12; docs/questions/Q-991 item 4 (A-170).
+const DNS_HOST_TTL: &str = "dns_host_ttl";
+
+/// The zone keys of dird's DNS service, besides the channel's pair: each
+/// required with the channel, each refused without it.
+/// Spec: docs/questions/Q-619 item 5, Q-1001 item 1.
+const DNS_ZONE_KEYS: [&str; 9] = [
+    DNS_REGISTRABLE_NETWORKS,
+    DNS_RECORD_MAX_AGE,
+    DNS_SOA_RNAME,
+    DNS_SOA_REFRESH,
+    DNS_SOA_RETRY,
+    DNS_SOA_EXPIRE,
+    DNS_SOA_MINIMUM,
+    DNS_INFRASTRUCTURE_TTL,
+    DNS_HOST_TTL,
+];
 
 /// Where dird's dirstore integrity key comes from.
 ///
@@ -204,6 +253,200 @@ impl AdminServiceSettings {
     }
 }
 
+/// The SOA fields dird's configuration sets (MNAME and SERIAL are not
+/// configured: MNAME is the DC's name, SERIAL the zone counter — docs/54
+/// §3.1). Times in seconds.
+/// Spec: RFC 1035 §3.3.13; docs/54 §3.1 (SOA row); docs/questions/Q-619
+/// item 5.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoaSettings {
+    rname: String,
+    refresh: u32,
+    retry: u32,
+    expire: u32,
+    minimum: u32,
+}
+
+impl SoaSettings {
+    /// RNAME, a domain name in text form (labels separated by dots, no final
+    /// dot). Spec: RFC 1035 §3.3.13, §8.
+    #[must_use]
+    pub fn rname(&self) -> &str {
+        &self.rname
+    }
+
+    /// REFRESH. Spec: RFC 1035 §3.3.13.
+    #[must_use]
+    pub const fn refresh(&self) -> u32 {
+        self.refresh
+    }
+
+    /// RETRY. Spec: RFC 1035 §3.3.13.
+    #[must_use]
+    pub const fn retry(&self) -> u32 {
+        self.retry
+    }
+
+    /// EXPIRE. Spec: RFC 1035 §3.3.13.
+    #[must_use]
+    pub const fn expire(&self) -> u32 {
+        self.expire
+    }
+
+    /// MINIMUM — the floor of every TTL sent from the zone. Spec: RFC 1035
+    /// §3.3.13.
+    #[must_use]
+    pub const fn minimum(&self) -> u32 {
+        self.minimum
+    }
+}
+
+/// dird's DNS service (task DN10a): present exactly when the channel
+/// (`dird_dns_socket` + `dnsd_uid`) is configured, with the zone values
+/// its image takes that the directory does not hold (docs/54 §3.1, §4.4,
+/// §5.2, §5.5). Whether the `_kpasswd` SRV records are synthesized is not a
+/// key: it is whether dird's kpasswd channel is configured
+/// ([`DirdSettings::kpasswd_channel`]) — one fact, one place
+/// (docs/questions/Q-1001 item 5).
+/// Spec: docs/54 §3.1, §4.3, §4.4, §4.6, §5.2, §5.5; docs/questions/Q-619
+/// item 5, Q-994 item 6 (e), Q-1001.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsServiceSettings {
+    channel: Channel,
+    registrable_networks: Vec<Network>,
+    record_max_age: Duration,
+    soa: SoaSettings,
+    infrastructure_ttl: u32,
+    host_ttl: u32,
+}
+
+impl DnsServiceSettings {
+    /// `dird-dns.sock` and dnsd's uid — the only peer admitted.
+    /// Spec: docs/54 §4.3, §4.6; docs/50 R50-3.
+    #[must_use]
+    pub fn channel(&self) -> &Channel {
+        &self.channel
+    }
+
+    /// `dns_registrable_networks`: IPv4 networks, at least one.
+    /// Spec: docs/54 §5.5; docs/questions/Q-614 item 8.
+    #[must_use]
+    pub fn registrable_networks(&self) -> &[Network] {
+        &self.registrable_networks
+    }
+
+    /// `dns_record_max_age`. Spec: docs/54 §5.2.
+    #[must_use]
+    pub const fn record_max_age(&self) -> Duration {
+        self.record_max_age
+    }
+
+    /// The configured SOA fields. Spec: docs/54 §3.1.
+    #[must_use]
+    pub fn soa(&self) -> &SoaSettings {
+        &self.soa
+    }
+
+    /// The TTL of the synthesized SOA, NS and SRV records, in seconds.
+    /// Spec: docs/54 §5.1.
+    #[must_use]
+    pub const fn infrastructure_ttl(&self) -> u32 {
+        self.infrastructure_ttl
+    }
+
+    /// The TTL of every host's A records, in seconds. Spec: docs/questions/
+    /// Q-991 item 4 (A-170).
+    #[must_use]
+    pub const fn host_ttl(&self) -> u32 {
+        self.host_ttl
+    }
+}
+
+/// A required zone time value `<seconds>s` within [`DNS_TIME_SECS`].
+/// Spec: docs/50 §7.1 ("a duration with a unit"); RFC 1035 §2.3.4,
+/// §3.3.13.
+fn zone_time(doc: &Document<'_>, key: &'static str) -> Result<u32, Error> {
+    Ok(doc
+        .required(key, |text| value::duration_secs(text, DNS_TIME_SECS))?
+        .value)
+}
+
+/// The IPv4 networks of `dns_registrable_networks`: a list of networks
+/// (crates/config's one network rule), every one IPv4.
+/// Spec: docs/54 §3.1, §5.5; docs/questions/Q-1001 item 3.
+fn ipv4_networks(text: &str) -> Result<Vec<Network>, ErrorKind> {
+    let networks = value::list(text, value::network)?;
+    if networks
+        .iter()
+        .all(|network| matches!(network.address(), IpAddr::V4(_)))
+    {
+        Ok(networks)
+    } else {
+        Err(ErrorKind::NetworkFamily)
+    }
+}
+
+/// dird's DNS service from the channel pair and the zone keys (module
+/// documentation): both or neither of the pair (`IncompletePair`); with
+/// it, every zone key but `dns_record_max_age` required (no hidden
+/// default — docs/54 §3.1 gives no value; Q-1001 item 2); without it,
+/// every zone key refused at its line (`IncompletePair`), never ignored.
+/// Spec: docs/54 §3.1, §4.6, §5.2, §5.5; docs/50 §3.2, §7.1;
+/// docs/questions/Q-619 item 5, Q-1001 item 1.
+fn dns_service(
+    doc: &Document<'_>,
+    all: &mut Distinct,
+) -> Result<Option<DnsServiceSettings>, Error> {
+    let socket = doc.optional(DIRD_DNS_SOCKET, value::absolute_path)?;
+    let uid = doc.optional(DNSD_UID, value::account_id)?;
+    let channel = match (socket, uid) {
+        (None, None) => None,
+        (Some(socket), None) => {
+            return Err(Error::at(
+                socket.line,
+                DIRD_DNS_SOCKET,
+                ErrorKind::IncompletePair,
+            ))
+        }
+        (None, Some(uid)) => return Err(Error::at(uid.line, DNSD_UID, ErrorKind::IncompletePair)),
+        (Some(socket), Some(uid)) => {
+            all.path(DIRD_DNS_SOCKET, &socket.value, socket.line)?;
+            all.id(DNSD_UID, uid.value, uid.line)?;
+            Some(Channel {
+                socket: socket.value,
+                peer_uid: uid.value,
+            })
+        }
+    };
+    let Some(channel) = channel else {
+        // A zone setting of a service that is not configured is a mistake:
+        // refused at its line, never silently ignored (fail closed).
+        for key in DNS_ZONE_KEYS {
+            if let Some(Located { line, .. }) = doc.optional(key, |_| Ok(()))? {
+                return Err(Error::at(line, key, ErrorKind::IncompletePair));
+            }
+        }
+        return Ok(None);
+    };
+    let registrable_networks = doc.required(DNS_REGISTRABLE_NETWORKS, ipv4_networks)?.value;
+    let record_max_age = schema::duration(doc, DNS_RECORD_MAX_AGE, DNS_RECORD_MAX_AGE_SECS)?;
+    let soa = SoaSettings {
+        rname: doc.required(DNS_SOA_RNAME, value::domain_name)?.value,
+        refresh: zone_time(doc, DNS_SOA_REFRESH)?,
+        retry: zone_time(doc, DNS_SOA_RETRY)?,
+        expire: zone_time(doc, DNS_SOA_EXPIRE)?,
+        minimum: zone_time(doc, DNS_SOA_MINIMUM)?,
+    };
+    Ok(Some(DnsServiceSettings {
+        channel,
+        registrable_networks,
+        record_max_age,
+        soa,
+        infrastructure_ttl: zone_time(doc, DNS_INFRASTRUCTURE_TTL)?,
+        host_ttl: zone_time(doc, DNS_HOST_TTL)?,
+    }))
+}
+
 /// dird's settings, as parsed and validated from its file.
 ///
 /// Spec: docs/50 R50-15, §2.4, §7.1.
@@ -222,6 +465,7 @@ pub struct DirdSettings {
     ldap_channel: Channel,
     admin_channel: Option<Channel>,
     kpasswd_channel: Option<Channel>,
+    dns_service: Option<DnsServiceSettings>,
     keyd: Option<Endpoint>,
     node_id: Option<[u8; NODE_ID_OCTETS]>,
     admin_service: Option<AdminServiceSettings>,
@@ -263,6 +507,17 @@ impl DirdSettings {
         ADMIND_UID,
         DIRD_KPASSWD_SOCKET,
         KPASSWD_FRONT_UID,
+        DIRD_DNS_SOCKET,
+        DNSD_UID,
+        DNS_REGISTRABLE_NETWORKS,
+        DNS_RECORD_MAX_AGE,
+        DNS_SOA_RNAME,
+        DNS_SOA_REFRESH,
+        DNS_SOA_RETRY,
+        DNS_SOA_EXPIRE,
+        DNS_SOA_MINIMUM,
+        DNS_INFRASTRUCTURE_TTL,
+        DNS_HOST_TTL,
         KEYD_SOCKET,
         KEYD_UID,
         NODE_ID,
@@ -293,6 +548,14 @@ impl DirdSettings {
     /// neither, `IncompletePair`; refused without the admin channel, whose
     /// settings the kpasswd service shares — docs/53 §5.6 step 4; the socket
     /// path and the uid distinct from every other of the file);
+    /// `dird_dns_socket` with `dnsd_uid` (task DN10a — both or neither,
+    /// `IncompletePair`; independent of the admin channel), and with them
+    /// `dns_registrable_networks` (IPv4 networks only — `NetworkFamily`),
+    /// `dns_soa_rname` (a domain name), `dns_soa_refresh`, `dns_soa_retry`,
+    /// `dns_soa_expire`, `dns_soa_minimum`, `dns_infrastructure_ttl`,
+    /// `dns_host_ttl` (each `<n>s`, 0 ..= 2147483647 — required, no default)
+    /// and optionally `dns_record_max_age` (1s ..= 604800s, default 604800s)
+    /// — each zone key refused without the channel (`IncompletePair`);
     /// `keyd_socket` with `keyd_uid` (both or neither —
     /// without them dird's admin service does not start, the rest of dird
     /// runs); `node_id` (32 lower-case hex digits, not all zero);
@@ -414,6 +677,10 @@ impl DirdSettings {
                 })
             }
         };
+        // The DNS channel (task DN10a; docs/54 §4.6): independent of the
+        // admin channel — the zone image needs neither keyd nor the write
+        // PEP (docs/questions/Q-1001 item 1).
+        let dns_service = dns_service(&doc, &mut all)?;
         let node_id = doc.optional(NODE_ID, value::node_id)?;
         let ticket_age = doc.optional(ADMIN_TICKET_AGE_MAX, |text| {
             value::duration_secs(text, ADMIN_TICKET_AGE_MAX_SECS)
@@ -492,6 +759,7 @@ impl DirdSettings {
             ldap_channel,
             admin_channel,
             kpasswd_channel,
+            dns_service,
             keyd,
             node_id: node_id.map(|located| located.value),
             admin_service,
@@ -587,6 +855,14 @@ impl DirdSettings {
     #[must_use]
     pub fn kpasswd_channel(&self) -> Option<&Channel> {
         self.kpasswd_channel.as_ref()
+    }
+
+    /// dird's DNS service — `dird-dns.sock`, dnsd's uid and the zone values
+    /// — when configured (task DN10a). Spec: docs/54 §4.3, §4.6;
+    /// docs/questions/Q-619 item 5, Q-1001.
+    #[must_use]
+    pub fn dns_service(&self) -> Option<&DnsServiceSettings> {
+        self.dns_service.as_ref()
     }
 
     /// keyd's socket and uid, when configured: dird's admin service verifies

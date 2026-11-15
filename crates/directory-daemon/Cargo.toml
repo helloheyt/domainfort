@@ -117,6 +117,19 @@ ipc-keyd = { path = "../ipc-keyd" }
 # ipc, zeroize and tokio — all already in this daemon's graph); it links no
 # krb-proto / krb-crypto, so nothing on the channel can hold a password.
 ipc-kpasswd = { path = "../ipc-kpasswd" }
+# The dnsd ↔ dird channel (task DN10a, docs/54 §4.6; `dird-dns.sock`, magic
+# 0x444E): the message set and the image transfer (ipc-dns), and the
+# dispatcher with the zone of a front from its uid (`DnsFronts`) that dird
+# hosts on its DNS thread (ipc-dns-server). Workspace crates with no feature,
+# already in the lock (they link ipc, parse-dns, dns-zone, zeroize and — on
+# Linux — rustix, all already in this daemon's graph); neither links keyd,
+# krb-crypto or a store.
+ipc-dns = { path = "../ipc-dns" }
+ipc-dns-server = { path = "../ipc-dns-server" }
+# The zone image's TTL bound (`limits::MAX_TTL`), pinned against dird's
+# configuration bound (src/dns_service.rs). Already in this daemon's graph
+# through directory-pip; a direct edge only.
+dns-zone = { path = "../dns-zone" }
 # The provisioning manifest (root-owned, non-secret): the admin service
 # object and the service objects dird protects (docs/51 §4.3 step 8).
 provision-manifest = { path = "../provision-manifest" }

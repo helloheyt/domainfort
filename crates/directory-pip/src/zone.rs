@@ -113,6 +113,10 @@ pub struct ZoneParameters {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ZoneProjection {
     image: ZoneImage,
+    /// The parts `image` was validated from — what the channel encodes
+    /// (crates/ipc-dns `ImageTransfer::new`, which validates them again);
+    /// task DN10a, docs/questions/Q-1000 item 2.
+    parts: ZoneImageParts,
     valid_until: Option<KerberosTime>,
 }
 
@@ -127,6 +131,15 @@ impl ZoneProjection {
     #[must_use]
     pub fn into_image(self) -> ZoneImage {
         self.image
+    }
+
+    /// The parts the image was validated from (`ZoneImage::new` accepted
+    /// exactly these), for dird's DNS channel: the transfer encoding takes
+    /// parts, not an image (crates/ipc-dns `ImageTransfer::new`; task DN10a).
+    /// Spec: docs/54 §4.4, §4.6; docs/questions/Q-1000 item 2.
+    #[must_use]
+    pub fn parts(&self) -> &ZoneImageParts {
+        &self.parts
     }
 
     /// The earliest instant at which the clock alone — an address reaching
@@ -266,7 +279,7 @@ impl DirectoryView<'_> {
             }
         }
         let dc = dc.ok_or(ZoneProjectionError::DcAccount)?;
-        let image = ZoneImage::new(ZoneImageParts {
+        let parts = ZoneImageParts {
             apex,
             serial,
             soa: params.soa.clone(),
@@ -274,13 +287,17 @@ impl DirectoryView<'_> {
             dc,
             hosts,
             kpasswd: params.kpasswd,
-        })
-        .map_err(ZoneProjectionError::Image)?;
+        };
+        let image = ZoneImage::new(parts.clone()).map_err(ZoneProjectionError::Image)?;
         let valid_until = match horizon.0 {
             None => None,
             Some(t) => Some(time_of_dstime(t).ok_or(ZoneProjectionError::Time)?),
         };
-        Ok(ZoneProjection { image, valid_until })
+        Ok(ZoneProjection {
+            image,
+            parts,
+            valid_until,
+        })
     }
 
     /// Every computer of the naming context that holds host addresses, and

@@ -38,8 +38,8 @@ use crate::error::{Error, ErrorKind};
 use crate::format::{Document, Located};
 use crate::limits::Bound;
 use crate::schema::{
-    self, Account, Distinct, Endpoint, AUDITD_UID, AUDIT_SOCKET, DIRD_UID, INTERNAL_NETWORKS,
-    RUN_AS_GID, RUN_AS_UID,
+    self, Account, Distinct, Endpoint, AUDITD_UID, AUDIT_SOCKET, DIRD_DNS_SOCKET, DIRD_UID,
+    INTERNAL_NETWORKS, RUN_AS_GID, RUN_AS_UID,
 };
 use crate::value::{self, Network};
 
@@ -47,9 +47,6 @@ use crate::value::{self, Network};
 /// Spec: RFC 1035 §4.2 ("TCP … on server port 53 … as well as datagram access
 /// using UDP"); docs/54 §4.3, §4.7.
 const LISTEN: &str = "listen";
-/// Key: path of `dird-dns.sock`. Spec: docs/54 §4.6; docs/questions/Q-619
-/// item 4.
-const DIRD_DNS_SOCKET: &str = "dird_dns_socket";
 /// Key: the bounded staleness of the zone image. Spec: docs/54 §4.4
 /// (`zone_image_max_age`); docs/questions/Q-616 item 6.
 const ZONE_IMAGE_MAX_AGE: &str = "zone_image_max_age";

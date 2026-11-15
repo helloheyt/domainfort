@@ -96,6 +96,9 @@
 //! | `kpasswd_engine` | the kpasswd thread: its bounded queue and docs/53 §5.6's steps |
 //! | `kpasswd_listener` | `dird-kpasswd.sock`: kpasswd-front's uid only, ≤ 8 connections, framing, deadlines |
 //! | `operation_ids` | dird's one counter of operation numbers (admin and kpasswd threads) |
+//! | [`dns_service`] | the DNS service's parameters and the host of the dnsd ↔ dird channel: the zone image from the one projection, `Forward` refused unread (task DN10a) |
+//! | `dns_engine` | the DNS thread: its bounded queue and the channel's dispatcher |
+//! | `dns_listener` | `dird-dns.sock`: dnsd's uid only, ≤ 4 connections, framing, deadlines |
 //!
 //! # Security
 //!
@@ -181,6 +184,9 @@ mod audit_convert;
 pub mod audit_link;
 pub mod clock;
 mod daemon;
+mod dns_engine;
+mod dns_listener;
+pub mod dns_service;
 mod engine;
 mod kpasswd_engine;
 mod kpasswd_listener;
@@ -213,6 +219,11 @@ pub use daemon::{
     serve, serve_with_admin, serve_with_services, DaemonControl, DaemonError, DaemonParams,
     OpenedStore, Stopped, StoreSource, AUDIT_FLUSH_GRACE, DRAIN_GRACE, ENGINE_QUEUE_CAPACITY,
     LDAP_QUEUE_CAPACITY, MAX_KDC_CONNECTIONS, MAX_LDAP_SESSIONS, MAX_OPEN_VIEWS, SOCKET_FILE_MODE,
+};
+pub use dns_listener::dns_refused_peer_count;
+pub use dns_service::{
+    dns_forward_refused_count, DnsNotStarted, DnsParams, DNS_QUEUE_CAPACITY, MAX_DNS_CONNECTIONS,
+    MAX_DNS_QUEUE_CAPACITY,
 };
 pub use engine::{DirectoryEngine, EngineError, EngineHandle, EnginePanicked, EngineThread};
 pub use kpasswd_listener::kpasswd_refused_peer_count;

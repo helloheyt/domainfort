@@ -161,6 +161,35 @@ pub enum Note {
     /// new password was installed is in keyd's audit records (docs/53 §5.6
     /// step 6 — the safe state of docs/47 §9.2); answered HARDERROR.
     KpasswdCompletionUnknown,
+    /// dird listens on `dird-dns.sock` (task DN10a, docs/54 §4.6); the id is
+    /// the zone's SERIAL at start.
+    DnsListening,
+    /// The DNS service did not start (logged with the reason's code,
+    /// `dns_service::DnsNotStarted::code`); dird's other services run.
+    DnsNotStarted,
+    /// A `dird-dns.sock` connection's peer uid is not dnsd's; closed
+    /// without a reply (docs/54 §4.6; docs/50 R50-3).
+    DnsPeerRefused,
+    /// dnsd's connection bound is reached; the connection is refused `Busy`
+    /// and closed (docs/54 §4.6).
+    DnsConnectionLimit,
+    /// The DNS queue is full; the request is refused `Busy` and the
+    /// connection closed — dnsd answers SERVFAIL (docs/54 §4.6).
+    DnsBusy,
+    /// A forwarded UPDATE / TKEY was refused `Unavailable` without being
+    /// read: the DNS PEP is not built (tasks DN8, DN9; docs/questions/
+    /// Q-1000 item 4).
+    DnsForwardRefused,
+    /// A zone image could not be projected (logged with the code of
+    /// `dns_service::DnsNotStarted::code`, thinned — dnsd chooses how often
+    /// it fetches); the fetch was refused `Unavailable` (fail closed — dnsd
+    /// keeps its image until its staleness bound).
+    DnsZoneUnavailable,
+    /// The clock changed the zone's content under its SERIAL (an address
+    /// aged out, an account expired) and the serial cannot be advanced yet
+    /// (docs/questions/Q-993 item 3, Q-1002): the fetch was refused
+    /// `Unavailable`.
+    DnsSerialAdvanceNeeded,
     /// At the stop, noise counted for a `WindowSummary` that never left
     /// the audit window (auditd unreachable, or the pace held it past the
     /// grace): lost with the process; the identifier is the count
@@ -271,6 +300,19 @@ impl Note {
             Note::KpasswdCompletionUnknown => {
                 "password change completion not answered by keyd (keyd's records tell whether it \
                  was installed): answered hard error"
+            }
+            Note::DnsListening => "listening on the DNS channel; zone serial",
+            Note::DnsNotStarted => "DNS service not started (the other services run); reason code",
+            Note::DnsPeerRefused => "DNS channel connection closed: peer uid is not dnsd's",
+            Note::DnsConnectionLimit => "DNS channel connection refused: connection bound reached",
+            Note::DnsBusy => "DNS request refused: DNS queue full",
+            Note::DnsForwardRefused => {
+                "forwarded DNS message refused unread: the DNS update service is not built"
+            }
+            Note::DnsZoneUnavailable => "zone image not projected: fetch refused; reason code",
+            Note::DnsSerialAdvanceNeeded => {
+                "zone content changed with the clock under its serial and the serial cannot be \
+                 advanced: fetch refused"
             }
             Note::AuditSuppressedNoiseUndelivered => {
                 "audit count not delivered at stop: suppressed noise"

@@ -331,15 +331,22 @@ fn parameters_plan_and_configuration_owner() {
     assert!(plan.makes_not_dumpable());
     assert!(!plan.locks_all_memory());
     assert_eq!(plan.file_mode_mask(), Some(0o077));
-    // Sized from the kdc's quota and the LDAP session bound (docs/50 §6.1:
-    // "nofile according to the connection quotas").
+    // Sized from every served channel's connection bound — the kdc's quota,
+    // the LDAP sessions, admind's, kpasswd-front's and dnsd's connections
+    // (docs/50 §6.1: "nofile according to the connection quotas";
+    // docs/questions/Q-1000 item 9).
+    assert_eq!(
+        directory_daemon::startup::MAX_SERVED_CONNECTIONS,
+        directory_daemon::MAX_KDC_CONNECTIONS
+            + directory_daemon::MAX_LDAP_SESSIONS
+            + directory_daemon::MAX_ADMIN_CONNECTIONS
+            + directory_daemon::MAX_KPASSWD_CONNECTIONS
+            + directory_daemon::MAX_DNS_CONNECTIONS
+    );
     assert_eq!(
         plan.open_files_limit(),
         Some(
-            u64::try_from(
-                directory_daemon::MAX_KDC_CONNECTIONS + directory_daemon::MAX_LDAP_SESSIONS
-            )
-            .unwrap()
+            u64::try_from(directory_daemon::startup::MAX_SERVED_CONNECTIONS).unwrap()
                 + directory_daemon::startup::OPEN_FILES_HEADROOM
         )
     );

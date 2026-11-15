@@ -1032,6 +1032,9 @@ impl World {
             "kdc" => "ak.sock",
             "ldap-front" => "af.sock",
             "admind" => "am.sock",
+            // Task DN10a: dnsd's listener (support::AUDIT_LABELS); this
+            // world runs no dnsd, so nothing connects to it.
+            "dnsd" => "an.sock",
             other => panic!("not a sender: {other}"),
         };
         produced.with_file_name(name)

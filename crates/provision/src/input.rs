@@ -19,7 +19,7 @@ use directory_admin::{
     admin_service_spn_ok, computer_name_ok, computer_sam, dns_host_name_ok, group_sam_ok,
     rdn_value_ok, spn_ok, user_sam_ok,
 };
-use directory_pip::NamingContext;
+use directory_pip::{host_label, NamingContext};
 use krb_proto::Realm;
 use provision_manifest::limits::{MAX_FIRST_ADMINS, MIN_FIRST_ADMINS};
 use provision_manifest::{ADMIN_SERVICE_CLASS, LDAP_SERVICE_CLASS};
@@ -323,6 +323,15 @@ pub enum InputErrorKind {
     /// No internal network: ldap-front listens only inside the internal
     /// networks (docs/52 §7 R14; A-102 on docs/questions/Q-469 (b)).
     MissingInternalNetwork,
+    /// No IPv4 internal network: dird's `dns_registrable_networks` are the
+    /// IPv4 internal networks (phase 1 serves A records only — docs/54
+    /// §3.1, §5.5; docs/questions/Q-1003 item 1).
+    MissingIpv4InternalNetwork,
+    /// The DC's host name is not `<dc-name>.<zone>` with `<dc-name>` one LDH
+    /// label (the host-name rule of the zone — directory-pip `host_label`;
+    /// [MS-ADTS] 3.1.1.5.3.1.1.2): the zone projection would refuse the DC
+    /// (docs/questions/Q-994 item 6 (b)).
+    DcHostName,
 }
 
 /// An input error: the field (the command-line flag's name) and the rule.
@@ -367,6 +376,12 @@ impl fmt::Display for InputError {
             InputErrorKind::MissingListener => "listener missing",
             InputErrorKind::MissingInternalNetwork => {
                 "at least one internal network is required (LDAP listens only inside them)"
+            }
+            InputErrorKind::MissingIpv4InternalNetwork => {
+                "at least one IPv4 internal network is required (the DNS zone's registrable networks)"
+            }
+            InputErrorKind::DcHostName => {
+                "the DC host name must be <dc-name>.<zone>, <dc-name> one letter-digit-hyphen label"
             }
         };
         write!(f, "{}: {rule}", self.field)
@@ -430,6 +445,15 @@ impl DomainInput {
         }
         self.check_accounts()?;
         self.check_names()?;
+        // Task DN10a (Q-994 item 6 (b)): the DC's host name passes the
+        // zone's host-name rule — the one function the write checker, the
+        // PIP and the zone projection use (directory-pip `host_label`) —
+        // or the projection refuses the DC (`DcName`) and no zone is served.
+        // Spec: [MS-ADTS] 3.1.1.5.3.1.1.2; RFC 1035 §2.3.1; docs/54 §5.3.
+        let dc_sam = computer_sam(&self.names.dc_name);
+        if host_label(&dc_sam, &self.dc_fqdn, &naming_context.dns_name()).is_none() {
+            return Err(InputError::new("dc-fqdn", InputErrorKind::DcHostName));
+        }
         self.check_paths()?;
         self.check_network()?;
         Ok(Checked {
@@ -736,6 +760,15 @@ impl DomainInput {
             return Err(InputError::new(
                 "internal-network",
                 InputErrorKind::MissingInternalNetwork,
+            ));
+        }
+        // Task DN10a: dird's `dns_registrable_networks` are the IPv4
+        // internal networks (A records only — docs/54 §3.1, §5.5); dird's
+        // schema requires at least one.
+        if crate::configs::ipv4_networks(&n.internal_networks).is_empty() {
+            return Err(InputError::new(
+                "internal-network",
+                InputErrorKind::MissingIpv4InternalNetwork,
             ));
         }
         Ok(())

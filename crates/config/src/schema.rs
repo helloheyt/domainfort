@@ -33,6 +33,11 @@ pub(crate) const DIRD_ADMIN_SOCKET: &str = "dird_admin_socket";
 /// docs/50 the channel-magic registry (`dird-kpasswd.sock | ipc-kpasswd |
 /// 0x4B50`); docs/questions/Q-955 item 13.
 pub(crate) const DIRD_KPASSWD_SOCKET: &str = "dird_kpasswd_socket";
+/// Key: path of `dird-dns.sock` — one spelling for dird's file (the server,
+/// task DN10a) and dnsd's (the client, task DN11). Spec: docs/54 §4.6;
+/// docs/50 the channel-magic registry (`dird-dns.sock | ipc-dns | 0x444E`);
+/// docs/questions/Q-619 items 4-5.
+pub(crate) const DIRD_DNS_SOCKET: &str = "dird_dns_socket";
 /// Key: path of `audit.sock`. Spec: docs/50 §3.1, §8.1 (R50-17).
 pub(crate) const AUDIT_SOCKET: &str = "audit_socket";
 /// Key: the uid auditd runs as (verified by its clients). Spec: docs/50 R50-3.

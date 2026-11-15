@@ -164,6 +164,19 @@ pub enum ErrorKind {
     /// Spec: docs/51 §4.6 ("`node_id` (hex, not secret)"); docs/29 §2 as cited
     /// in docs/51 §4.3; docs/questions/Q-385 item 3.
     InvalidNodeId,
+    /// Not a domain name in the accepted form: labels of 1 ..= 63 octets of
+    /// `A-Z a-z 0-9 -`, separated by single dots, at most 253 octets of
+    /// text (255 in wire form).
+    /// Spec: RFC 1035 §2.3.1 (the preferred syntax's character set), §2.3.4
+    /// ("labels 63 octets or less"; "names 255 octets or less"), §3.1;
+    /// docs/questions/Q-1001 item 4.
+    InvalidDomainName,
+    /// A network of an address family the setting does not admit (dird's
+    /// `dns_registrable_networks`: IPv4 only — A records only in phase 1).
+    /// Spec: docs/54 §3.1 (A only; AAAA waits for RFC 3596), §5.5;
+    /// crates/directory-admin `DnsRegistration::new`; docs/questions/Q-1001
+    /// item 3.
+    NetworkFamily,
 }
 
 impl ErrorKind {
@@ -208,6 +221,8 @@ impl ErrorKind {
             }
             ErrorKind::InconsistentLimits => "per-source limit exceeds the global limit",
             ErrorKind::InvalidNodeId => "value is not 32 lower-case hex digits, not all zero",
+            ErrorKind::InvalidDomainName => "value is not an acceptable domain name",
+            ErrorKind::NetworkFamily => "network is of an address family this setting refuses",
         }
     }
 }

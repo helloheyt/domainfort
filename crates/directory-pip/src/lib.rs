@@ -180,5 +180,5 @@ pub use visible::{
 pub use zone::{ZoneParameters, ZoneProjection, ZoneProjectionError, MAX_ZONE_WALK_OBJECTS};
 // The zone crate's types the projection's API speaks in, so its consumer
 // (dird, task DN10a) names them through this crate.
-pub use dns_zone::{KpasswdService, SoaParameters, ZoneImage, ZoneImageError};
+pub use dns_zone::{KpasswdService, SoaParameters, ZoneImage, ZoneImageError, ZoneImageParts};
 pub use parse_dns::Name as DnsName;

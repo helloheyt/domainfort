@@ -30,6 +30,15 @@
 //! Neither front is mapped in keyd (docs/53 R53-4: the front has no keyd
 //! channel; docs/54 §4.3: dnsd is not mapped in keyd).
 //!
+//! Task DN10a adds dird's DNS channel — `dird_dns_socket` (the path dnsd's
+//! file names) + `dnsd_uid` (dnsd's account), docs/54 §4.6 — and the zone
+//! values of its image ([`DIRD_DNS_CHANNEL_KEYS`]; docs/questions/Q-619
+//! item 5, Q-1001, Q-1003 item 1), so a provisioned dird serves the socket
+//! a provisioned dnsd connects to (Q-973 item 6). The DC's own host record
+//! is **not** written yet (it needs the provisioning session's zone — a
+//! directory-admin change, docs/questions/Q-1003 item 2): until it is, the
+//! zone cannot be projected and dird's DNS service reports it at start.
+//!
 //! Spec: docs/51 §4.3 step 7, §4.6, §5.5 (R51-10), §5.6 (R51-11); docs/50
 //! R50-15, §2.4, §3.1, §3.2, §7.1, R50-18; docs/53 R53-3, R53-4, §3.3,
 //! §5.6, §5.7, §9; docs/54 §4.3, §4.6, §4.7, §9; A-60; A-68; A-73 (keyd's
@@ -64,6 +73,87 @@ pub const DIRD_ADMIN_CHANNEL_KEYS: [&str; 7] = [
 /// channel, which the kpasswd service shares (docs/53 §5.6 step 4).
 /// Spec: docs/53 §5.6; docs/questions/Q-964 items 12-13.
 pub const DIRD_KPASSWD_CHANNEL_KEYS: [&str; 2] = ["dird_kpasswd_socket", "kpasswd_front_uid"];
+
+/// dird's DNS-channel keys (task DN10a, docs/54 §4.6; docs/questions/Q-619
+/// item 5, Q-1001), emitted in dird's file whenever dnsd's is (always,
+/// since task K9): the channel's pair — the same `dird-dns.sock` path dnsd's
+/// file names and dnsd's uid — and the zone values the image takes that the
+/// directory does not hold. `dns_record_max_age` keeps the schema's default
+/// (docs/54 §5.2: 7 days, also the ceiling — Q-230 item 4), as the fronts'
+/// limits keep theirs.
+/// Spec: docs/54 §3.1, §4.3, §4.6, §5.5; docs/questions/Q-619 item 5,
+/// Q-1001, Q-1003 item 1.
+pub const DIRD_DNS_CHANNEL_KEYS: [&str; 10] = [
+    "dird_dns_socket",
+    "dnsd_uid",
+    "dns_registrable_networks",
+    "dns_soa_rname",
+    "dns_soa_refresh",
+    "dns_soa_retry",
+    "dns_soa_expire",
+    "dns_soa_minimum",
+    "dns_infrastructure_ttl",
+    "dns_host_ttl",
+];
+
+/// The local part of the SOA's RNAME, the mailbox of the person
+/// responsible for the zone: `hostmaster`, prefaced to the zone's name as
+/// one label — RNAME = `hostmaster.<zone>`. RFC 1035 §8 maps "the mailbox
+/// HOSTMASTER@SRI-NIC.ARPA … into the domain name HOSTMASTER.SRI-NIC.ARPA";
+/// the label is that example's. Project choice ⚠ (docs/54 §3.1: RNAME is
+/// dird configuration with no value; the operator edits dird's file) —
+/// docs/questions/Q-1003 item 1.
+/// Spec: RFC 1035 §3.3.13, §8; docs/54 §3.1.
+pub const DNS_SOA_RNAME_LOCAL_PART: &str = "hostmaster";
+
+/// The SOA's REFRESH, RETRY, EXPIRE and MINIMUM, in seconds: the values of
+/// RFC 1035 §5.3's master file example (`7200 ; REFRESH`, `600 ; RETRY`,
+/// `3600000; EXPIRE`, `60) ; MINIMUM`). REFRESH, RETRY and EXPIRE matter to
+/// secondary servers only, and there are none (OD-2); MINIMUM is the floor
+/// of every TTL dnsd sends (RFC 1035 §3.3.13). Project choice ⚠ —
+/// docs/questions/Q-1003 item 1.
+/// Spec: RFC 1035 §3.3.13, §5.3; docs/54 §3.1.
+pub const DNS_SOA_TIMERS: [u32; 4] = [7200, 600, 3_600_000, 60];
+
+/// The TTL of the synthesized SOA, NS and SRV records: one hour — they
+/// change only with dird's configuration or the DC (docs/54 §5.1). Project
+/// choice ⚠ — docs/questions/Q-1003 item 1.
+/// Spec: docs/54 §5.1; RFC 1035 §3.2.1.
+pub const DNS_INFRASTRUCTURE_TTL_SECS: u32 = 3600;
+
+/// The one zone-wide TTL of the hosts' A records: ten minutes — how long a
+/// client may cache a host's address after the host changed or left it
+/// (docs/54 §5.2; RFC 1035 §3.2.1). Project choice ⚠ — docs/questions/
+/// Q-1003 item 1.
+/// Spec: docs/questions/Q-991 item 4 (A-170: one TTL from dird's
+/// configuration); RFC 2136 §7.12.
+pub const DNS_HOST_TTL_SECS: u32 = 600;
+
+// Every value is inside dird's schema bound for zone time values.
+const _: () = assert!(DNS_INFRASTRUCTURE_TTL_SECS <= config::limits::DNS_TIME_SECS.max);
+const _: () = assert!(DNS_HOST_TTL_SECS <= config::limits::DNS_TIME_SECS.max);
+const _: () = assert!(DNS_SOA_TIMERS[0] <= config::limits::DNS_TIME_SECS.max);
+const _: () = assert!(DNS_SOA_TIMERS[1] <= config::limits::DNS_TIME_SECS.max);
+const _: () = assert!(DNS_SOA_TIMERS[2] <= config::limits::DNS_TIME_SECS.max);
+const _: () = assert!(DNS_SOA_TIMERS[3] <= config::limits::DNS_TIME_SECS.max);
+
+/// The IPv4 networks among `items` (crates/config's spelling
+/// `<address>/<prefix>`): dird's `dns_registrable_networks` — Q-619 item 4's
+/// default, the internal networks, restricted to IPv4 because phase 1
+/// serves A records only (docs/54 §3.1). Every item is parsed back by dird's
+/// schema before anything is written.
+/// Spec: docs/54 §3.1, §5.5; docs/questions/Q-619 item 4, Q-1003 item 1.
+#[must_use]
+pub fn ipv4_networks(items: &[String]) -> Vec<String> {
+    items
+        .iter()
+        .filter(|item| {
+            item.split_once('/')
+                .is_some_and(|(address, _)| address.parse::<core::net::Ipv4Addr>().is_ok())
+        })
+        .cloned()
+        .collect()
+}
 
 /// dird's `admin_ticket_age_max`, in seconds: ten minutes. A ticket whose
 /// age (`now − authtime`) is above it is refused for an admin operation.
@@ -251,6 +341,12 @@ fn list(items: &[String]) -> String {
 /// - dird (task K9): the kpasswd channel ([`DIRD_KPASSWD_CHANNEL_KEYS`]:
 ///   `dird_kpasswd_socket` + `kpasswd_front_uid`, the front's uid — docs/53
 ///   §5.6 step 1).
+/// - dird (task DN10a): the DNS channel ([`DIRD_DNS_CHANNEL_KEYS`]:
+///   `dird_dns_socket` — the path in dnsd's file — + `dnsd_uid`, dnsd's
+///   uid; `dns_registrable_networks` = the IPv4 internal networks; the SOA's
+///   RNAME `hostmaster.<zone>` and [`DNS_SOA_TIMERS`]; the TTLs
+///   [`DNS_INFRASTRUCTURE_TTL_SECS`], [`DNS_HOST_TTL_SECS`] — docs/54 §3.1,
+///   §4.6, §5.5; Q-1003 item 1).
 /// - auditd: `uid_sources` = every daemon's uid with its source name
 ///   (docs/50 §3.2) — the two fronts too since task K9 (`kpasswd-front`,
 ///   `dnsd`; A-160, Q-960 item 6).
@@ -346,6 +442,31 @@ pub fn domain_configs(input: &DomainInput, node_id: &NodeId) -> Vec<ConfigFile> 
         // channel, whose settings the kpasswd service shares (§5.6 step 4).
         ("dird_kpasswd_socket", path(&p.dird_kpasswd_socket)),
         ("kpasswd_front_uid", id(a.kpasswd_front.uid)),
+        // Task DN10a: the DNS channel (docs/54 §4.6: the peer on
+        // `dird-dns.sock` is dnsd's uid only) — the path dnsd's file names
+        // — and the zone values ([`DIRD_DNS_CHANNEL_KEYS`]).
+        ("dird_dns_socket", path(&p.dird_dns_socket)),
+        ("dnsd_uid", id(a.dnsd.uid)),
+        (
+            "dns_registrable_networks",
+            list(&ipv4_networks(&n.internal_networks)),
+        ),
+        (
+            "dns_soa_rname",
+            format!(
+                "{DNS_SOA_RNAME_LOCAL_PART}.{}",
+                input.naming_context.join(".")
+            ),
+        ),
+        ("dns_soa_refresh", format!("{}s", DNS_SOA_TIMERS[0])),
+        ("dns_soa_retry", format!("{}s", DNS_SOA_TIMERS[1])),
+        ("dns_soa_expire", format!("{}s", DNS_SOA_TIMERS[2])),
+        ("dns_soa_minimum", format!("{}s", DNS_SOA_TIMERS[3])),
+        (
+            "dns_infrastructure_ttl",
+            format!("{DNS_INFRASTRUCTURE_TTL_SECS}s"),
+        ),
+        ("dns_host_ttl", format!("{DNS_HOST_TTL_SECS}s")),
     ]);
     let mut kdc = vec![
         ("run_as_uid", id(a.kdc.uid)),
@@ -445,9 +566,8 @@ pub fn domain_configs(input: &DomainInput, node_id: &NodeId) -> Vec<ConfigFile> 
     ];
     // Task K9 / DN13's front part — dnsd: every listener inside the internal
     // networks (docs/54 §4.7; A-114), dird's `dird-dns.sock` and uid (docs/54
-    // §4.6 — dird serves it from task DN10 on; until then dnsd stops at its
-    // dird check, fail closed, docs/54 §4.8), auditd. No key, not in keyd
-    // (docs/54 §4.3).
+    // §4.6 — dird serves it since task DN10a, its file naming the same path
+    // and dnsd's uid), auditd. No key, not in keyd (docs/54 §4.3).
     let dnsd = vec![
         ("run_as_uid", id(a.dnsd.uid)),
         ("run_as_gid", id(a.dnsd.gid)),
