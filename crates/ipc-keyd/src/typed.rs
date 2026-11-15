@@ -20,25 +20,28 @@
 //! Q-245 item 1.
 
 use crate::wire::{
-    CreateKeyRequest, GrantSetSecretRequest, IssueAsRepRequest, IssueTgsRepRequest, KeydReply,
-    KeydRequest, OpenAndVerifyServiceTicketRequest, OpenAndVerifyTgtRequest, OpenFastArmorRequest,
-    RegisterDecisionRequest, SealFastErrorRequest, SetSecretRequest, VerifyOperationTicketRequest,
-    VerifyPreauthRequest, VerifySecretRequest, WireAsTemplate, WireAuthnProof, WireBinding,
-    WireConfigDescription, WireDecidedOperation, WireDestructionPage, WireFastArmor,
-    WireOperationTicket, WireRepParts, WireServiceContext, WireSetSecretTarget, WireTgsFast,
-    WireTgsTemplate, WireTgtContext, WireTime,
+    CompleteChangePasswordRequest, CreateKeyRequest, GrantSetSecretRequest, IssueAsRepRequest,
+    IssueTgsRepRequest, KeydReply, KeydRequest, OpenAndVerifyServiceTicketRequest,
+    OpenAndVerifyTgtRequest, OpenChangePasswordRequestFields, OpenFastArmorRequest,
+    RegisterDecisionRequest, SealChangePasswordErrorRequest, SealFastErrorRequest,
+    SetSecretRequest, VerifyOperationTicketRequest, VerifyPreauthRequest, VerifySecretRequest,
+    WireAsTemplate, WireAuthnProof, WireBinding, WireChangePasswordContext, WireConfigDescription,
+    WireDecidedOperation, WireDestructionPage, WireFastArmor, WireOperationTicket, WireRepParts,
+    WireSealedReply, WireServiceContext, WireSetSecretTarget, WireTgsFast, WireTgsTemplate,
+    WireTgtContext, WireTime,
 };
 use core::fmt;
 use ipc::{DerBlob, Secret};
 use keyd_types::{
-    AccountKind, ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof, ConfigDescription,
-    CtxId, DecidedOperation, DecisionId, DestructionPage, FastArmor, FastConversation, IssueError,
-    KeyHandle, Kvno, Operation, OperationDigest, OperationTicket, PrincipalBinding, PrincipalId,
-    Role, ServiceContext, SetSecretTarget, TgsRepParts, TgsTicketTemplate, TgtContext,
+    AccountKind, ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof,
+    ChangePasswordContext, ChangePasswordCtxId, ConfigDescription, CtxId, DecidedOperation,
+    DecisionId, DestructionPage, FastArmor, FastConversation, HostAddr, IssueError, KeyHandle,
+    Kvno, Operation, OperationDigest, OperationTicket, PrincipalBinding, PrincipalId, Role,
+    SealedReply, ServiceContext, SetSecretTarget, TgsRepParts, TgsTicketTemplate, TgtContext,
 };
 use krb_proto::{
-    ApReq, EncryptedData, KerberosTime, KrbError, KrbFastArmoredReq, KrbFastReq, PaData,
-    PrincipalName, Realm, Ticket,
+    ApRep, ApReq, EncryptedData, KerberosTime, KrbError, KrbFastArmoredReq, KrbFastReq, KrbPriv,
+    NonZeroResultCode, PaData, PrincipalName, Realm, Ticket,
 };
 use zeroize::Zeroizing;
 
@@ -390,6 +393,37 @@ pub enum Call {
         /// Resume strictly after this decision id.
         after: Option<DecisionId>,
     },
+    /// Open an RFC 3244 request (Role::Ldap; task K4). No password field:
+    /// the password is inside the KRB-PRIV, which only keyd decrypts.
+    /// Spec: docs/53 §5.5; RFC 3244 §2.
+    OpenChangePasswordRequest {
+        /// The change-password service key set's principal.
+        service: PrincipalId,
+        /// The raw KRB_AP_REQ octets.
+        ap_req_octets: Vec<u8>,
+        /// The raw KRB-PRIV octets.
+        krb_priv_octets: Vec<u8>,
+        /// The peer's address, as the front's kernel reported it.
+        peer: HostAddr,
+        /// The connection's local address.
+        local: HostAddr,
+    },
+    /// Complete a request on dird's decision (Role::Ldap; task K4) — a
+    /// state call. Spec: docs/53 §5.5.
+    CompleteChangePassword {
+        /// The request context.
+        ctx: ChangePasswordCtxId,
+        /// The user's password key set.
+        target: KeyHandle,
+    },
+    /// Seal a request's error reply (Role::Ldap; task K4). Spec: docs/53
+    /// §5.5, §5.7.
+    SealChangePasswordError {
+        /// The request context.
+        ctx: ChangePasswordCtxId,
+        /// The non-zero result code.
+        code: NonZeroResultCode,
+    },
 }
 
 impl Call {
@@ -433,6 +467,9 @@ impl Call {
             Call::RegisterDecision { .. } => Operation::RegisterDecision,
             Call::SealCeremony => Operation::SealCeremony,
             Call::ListDestroyDecisions { .. } => Operation::ListDestroyDecisions,
+            Call::OpenChangePasswordRequest { .. } => Operation::OpenChangePasswordRequest,
+            Call::CompleteChangePassword { .. } => Operation::CompleteChangePassword,
+            Call::SealChangePasswordError { .. } => Operation::SealChangePasswordError,
         }
     }
 
@@ -593,6 +630,31 @@ impl Call {
             }),
             Call::SealCeremony => KeydRequest::SealCeremony,
             Call::ListDestroyDecisions { after } => KeydRequest::ListDestroyDecisions(*after),
+            Call::OpenChangePasswordRequest {
+                service,
+                ap_req_octets,
+                krb_priv_octets,
+                peer,
+                local,
+            } => KeydRequest::OpenChangePasswordRequest(OpenChangePasswordRequestFields {
+                service: *service,
+                ap_req_octets: ap_req_octets.clone(),
+                krb_priv_octets: krb_priv_octets.clone(),
+                peer: *peer,
+                local: *local,
+            }),
+            Call::CompleteChangePassword { ctx, target } => {
+                KeydRequest::CompleteChangePassword(CompleteChangePasswordRequest {
+                    ctx: *ctx,
+                    target: *target,
+                })
+            }
+            Call::SealChangePasswordError { ctx, code } => {
+                KeydRequest::SealChangePasswordError(SealChangePasswordErrorRequest {
+                    ctx: *ctx,
+                    code: *code,
+                })
+            }
         })
     }
 
@@ -711,6 +773,21 @@ impl Call {
             },
             KeydRequest::SealCeremony => Call::SealCeremony,
             KeydRequest::ListDestroyDecisions(after) => Call::ListDestroyDecisions { after },
+            KeydRequest::OpenChangePasswordRequest(m) => Call::OpenChangePasswordRequest {
+                service: m.service,
+                ap_req_octets: m.ap_req_octets,
+                krb_priv_octets: m.krb_priv_octets,
+                peer: m.peer,
+                local: m.local,
+            },
+            KeydRequest::CompleteChangePassword(m) => Call::CompleteChangePassword {
+                ctx: m.ctx,
+                target: m.target,
+            },
+            KeydRequest::SealChangePasswordError(m) => Call::SealChangePasswordError {
+                ctx: m.ctx,
+                code: m.code,
+            },
         })
     }
 }
@@ -750,7 +827,8 @@ impl Call {
 }
 
 /// A call that is **not** a state call ([`Call::is_state_call`]): issuance
-/// and verification (the Kdc and Ldap exchanges), `describe_config`,
+/// and verification (the Kdc and Ldap exchanges — the change-password
+/// request's opening and error seal included, task K4), `describe_config`,
 /// `ping`, `seal_ceremony`, `list_destroy_decisions` — and `verify_secret`,
 /// which no role holds. The only kind of call the fate-dropping
 /// `KeydClient::call` accepts.
@@ -843,7 +921,8 @@ impl IssuanceCall {
 
 /// A **state call** ([`Call::is_state_call`]): `set_secret`, `create_key`,
 /// `rotate_key`, `rotate_krbtgt`, `retire_kvno`, `destroy_key_set`,
-/// `grant_set_secret`, `register_decision`. Its request's fate matters —
+/// `grant_set_secret`, `register_decision`, `complete_change_password`
+/// (task K4: it installs a password). Its request's fate matters —
 /// "not performed" (keyd refused it before running it, A-88) and "outcome
 /// unknown" (it may have run) must not be folded into one `Unavailable` —
 /// so the keyd client sends it only through `KeydClient::call_with_fate`
@@ -946,6 +1025,13 @@ fn wire_decided(operation: &DecidedOperation) -> Converted<WireDecidedOperation>
         DecidedOperation::DestroyKeySet { principal } => {
             WireDecidedOperation::DestroyKeySet(*principal)
         }
+        DecidedOperation::ChangePassword { target } => {
+            WireDecidedOperation::ChangePassword(WireSetSecretTarget {
+                handle: target.handle,
+                binding: wire_binding(&target.binding)?,
+                salt: target.salt.as_bytes().to_vec(),
+            })
+        }
     })
 }
 
@@ -966,6 +1052,13 @@ fn decided(wire: &WireDecidedOperation) -> Converted<DecidedOperation> {
         },
         WireDecidedOperation::DestroyKeySet(principal) => DecidedOperation::DestroyKeySet {
             principal: *principal,
+        },
+        WireDecidedOperation::ChangePassword(target) => DecidedOperation::ChangePassword {
+            target: SetSecretTarget {
+                handle: target.handle,
+                binding: binding(&target.binding)?,
+                salt: text(&target.salt)?,
+            },
         },
     })
 }
@@ -1069,6 +1162,12 @@ pub enum Answer {
     SealCeremony(Result<(), keyd_types::Error>),
     /// Spec: docs/52 §4.6.
     ListDestroyDecisions(Result<DestructionPage, keyd_types::Error>),
+    /// Spec: docs/53 §5.5 (task K4).
+    OpenChangePasswordRequest(Result<ChangePasswordContext, AuthnError>),
+    /// The success reply. Spec: docs/53 §5.5 (task K4).
+    CompleteChangePassword(Result<SealedReply, keyd_types::Error>),
+    /// An error reply. Spec: docs/53 §5.5 (task K4).
+    SealChangePasswordError(Result<SealedReply, keyd_types::Error>),
 }
 
 /// A success payload, or keyd's error carried by `failure`.
@@ -1113,6 +1212,9 @@ impl Answer {
             Answer::RegisterDecision(_) => Operation::RegisterDecision,
             Answer::SealCeremony(_) => Operation::SealCeremony,
             Answer::ListDestroyDecisions(_) => Operation::ListDestroyDecisions,
+            Answer::OpenChangePasswordRequest(_) => Operation::OpenChangePasswordRequest,
+            Answer::CompleteChangePassword(_) => Operation::CompleteChangePassword,
+            Answer::SealChangePasswordError(_) => Operation::SealChangePasswordError,
         }
     }
 
@@ -1272,6 +1374,33 @@ impl Answer {
                 },
                 KeydReply::Failure,
             ),
+            Answer::OpenChangePasswordRequest(r) => outcome(
+                r,
+                |c| {
+                    Ok(KeydReply::OpenChangePasswordRequest(
+                        WireChangePasswordContext {
+                            ctx_id: c.ctx_id,
+                            crealm: c.crealm.as_bytes().to_vec(),
+                            cname: der(c.cname.encode())?,
+                            authtime: wire_time(&c.authtime),
+                            endtime: wire_time(&c.endtime),
+                            flags: c.flags,
+                            verdict: c.verdict,
+                        },
+                    ))
+                },
+                KeydReply::AuthnFailure,
+            ),
+            Answer::CompleteChangePassword(r) => outcome(
+                r,
+                |reply| Ok(KeydReply::CompleteChangePassword(wire_sealed(reply)?)),
+                KeydReply::Failure,
+            ),
+            Answer::SealChangePasswordError(r) => outcome(
+                r,
+                |reply| Ok(KeydReply::SealChangePasswordError(wire_sealed(reply)?)),
+                KeydReply::Failure,
+            ),
         }
     }
 
@@ -1410,9 +1539,54 @@ impl Answer {
             (Operation::ListDestroyDecisions, R::Failure(e)) => {
                 Answer::ListDestroyDecisions(Err(e))
             }
+            (Operation::OpenChangePasswordRequest, R::OpenChangePasswordRequest(c)) => {
+                Answer::OpenChangePasswordRequest(Ok(ChangePasswordContext {
+                    ctx_id: c.ctx_id,
+                    crealm: realm(&c.crealm)?,
+                    cname: decoded(&c.cname, PrincipalName::decode)?,
+                    authtime: time(&c.authtime)?,
+                    endtime: time(&c.endtime)?,
+                    flags: c.flags,
+                    verdict: c.verdict,
+                }))
+            }
+            (Operation::OpenChangePasswordRequest, R::AuthnFailure(e)) => {
+                Answer::OpenChangePasswordRequest(Err(e))
+            }
+            (Operation::CompleteChangePassword, R::CompleteChangePassword(s)) => {
+                Answer::CompleteChangePassword(Ok(sealed(&s)?))
+            }
+            (Operation::CompleteChangePassword, R::Failure(e)) => {
+                Answer::CompleteChangePassword(Err(e))
+            }
+            (Operation::SealChangePasswordError, R::SealChangePasswordError(s)) => {
+                Answer::SealChangePasswordError(Ok(sealed(&s)?))
+            }
+            (Operation::SealChangePasswordError, R::Failure(e)) => {
+                Answer::SealChangePasswordError(Err(e))
+            }
             _ => return Err(ConversionError::UnexpectedReply),
         })
     }
+}
+
+/// A `SealedReply` on the wire: the AP-REP and the KRB-PRIV as canonical
+/// DER. Spec: docs/53 §5.5; docs/50 §3.3.
+fn wire_sealed(reply: &SealedReply) -> Converted<WireSealedReply> {
+    Ok(WireSealedReply {
+        ap_rep: der(reply.ap_rep.encode())?,
+        krb_priv: der(reply.krb_priv.encode())?,
+    })
+}
+
+/// A `SealedReply` from the wire: both through krb-proto's strict decoder.
+/// Spec: docs/53 §5.5; docs/50 §3.3 (replies decoded as strictly as
+/// requests).
+fn sealed(wire: &WireSealedReply) -> Converted<SealedReply> {
+    Ok(SealedReply {
+        ap_rep: decoded(&wire.ap_rep, ApRep::decode)?,
+        krb_priv: decoded(&wire.krb_priv, KrbPriv::decode)?,
+    })
 }
 
 /// `AsRepParts` / `TgsRepParts` on the wire. Spec: docs/50 §3.4.

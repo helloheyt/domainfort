@@ -438,6 +438,9 @@ pub fn operation_digest(
         // The admin service's key set (R2, R2b): a code of its own so that
         // no two purposes share one.
         KeyPurpose::AdminService => 3,
+        // The change-password service's key set (task K3, docs/53 §5.2): a
+        // code of its own too (keyd refuses to rotate it — docs/53 §4.5).
+        KeyPurpose::ChangePasswordService => 4,
     };
     let mut octets = Vec::with_capacity(DIGEST_LABEL.len() + 8 + 1 + 16 + 1 + 4 + 16 + 8);
     octets.extend_from_slice(DIGEST_LABEL);

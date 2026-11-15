@@ -316,6 +316,7 @@
 mod admin;
 mod as_exchange;
 mod chain;
+mod change_password;
 mod custody;
 mod decision;
 mod directory;
@@ -349,6 +350,12 @@ pub use keyd::Keyd;
 pub use keyd_types::kerberos_time_seconds;
 pub use keyd_types::{
     is_admin_service_name, AppBinding, OperationDigest, ADMIN_SERVICE_CLASS, OPERATION_DIGEST_LEN,
+};
+pub use keyd_types::{
+    is_change_password_service_name, ChangePasswordContext, ChangePasswordCtxId,
+    ChangePasswordVerdict, HostAddr, SealedReply, ADDRESS_TYPE_DIRECTIONAL, ADDRESS_TYPE_IPV4,
+    ADDRESS_TYPE_IPV6, CHANGE_PASSWORD_SERVICE_NAME, DIRECTIONAL_AP_REQ_RECIPIENT,
+    DIRECTIONAL_AP_REQ_SENDER, MAX_MIN_PASSWORD_CHARS, MIN_PASSWORD_CHARS_FLOOR,
 };
 pub use keyd_types::{
     AccountKind, SetSecretTarget, MAX_GRANT_TARGETS, MAX_INITIAL_SECRET_GRANT_SECS,

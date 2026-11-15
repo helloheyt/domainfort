@@ -373,8 +373,11 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             // AdminService) key set goes with it (its session key zeroized):
             // the key set it was verified under no longer exists (docs/49
             // §3.3, A-46). (A destroy decision never names an AdminService
-            // key set — crate authz `purpose_permitted`.)
-            KeyPurpose::Service | KeyPurpose::AdminService => {
+            // or ChangePasswordService key set — crate authz
+            // `purpose_permitted`; a change-password request context names
+            // the user key set it may install, not the service key set, and
+            // the install itself requires the user key set to exist.)
+            KeyPurpose::Service | KeyPurpose::AdminService | KeyPurpose::ChangePasswordService => {
                 let service = *handle;
                 self.service_contexts
                     .discard_where(|entry| entry.service() == service);

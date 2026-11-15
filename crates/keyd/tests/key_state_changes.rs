@@ -16,17 +16,21 @@ use keyd::{
 use zeroize::Zeroizing;
 
 const ROLES: [Role; 4] = [Role::Kdc, Role::Directory, Role::Admin, Role::Ldap];
-const PURPOSES: [KeyPurpose; 3] = [
+const PURPOSES: [KeyPurpose; 5] = [
     KeyPurpose::PrincipalLongterm,
     KeyPurpose::Krbtgt,
     KeyPurpose::Service,
+    KeyPurpose::AdminService,
+    KeyPurpose::ChangePasswordService,
 ];
 
 /// docs/10 §6, §7; A-86: exactly the six operations that install, rotate,
-/// retire or destroy long-term key versions change key state. The
-/// throttles, the replay cache and the token tables are bookkeeping (the
-/// Kerberos exchanges, `verify_secret`), and `describe_config` / `ping`
-/// change nothing.
+/// retire or destroy long-term key versions change key state — and the
+/// change-password completion, which installs a password through the same
+/// install path as `set_secret` (task K3, docs/53 §9). The throttles, the
+/// replay cache and the token tables are bookkeeping (the Kerberos
+/// exchanges, `verify_secret`, the change-password open and error seal),
+/// and `describe_config` / `ping` change nothing.
 #[test]
 fn exactly_the_key_lifecycle_operations_change_key_state() {
     let changing: Vec<Operation> = Operation::ALL
@@ -42,6 +46,7 @@ fn exactly_the_key_lifecycle_operations_change_key_state() {
             Operation::RotateKrbtgt,
             Operation::RetireKvno,
             Operation::DestroyKeySet,
+            Operation::CompleteChangePassword,
         ]
     );
 }
@@ -80,8 +85,10 @@ fn the_grant_and_the_decision_loosen_authorization_and_need_an_intent() {
 
 /// docs/10 §2, §12 I2, I3: `admits` is the role check and the purpose check
 /// of the capability tables, for every role × purpose of every key-state
-/// operation (none of which is held, docs/10 §11) — and for `set_secret`
-/// also a live grant (task A15a), of which none is registered here. The
+/// operation (none of which is held, docs/10 §11, except the
+/// change-password completion — task K3 — which is held and, like
+/// `set_secret`, needs a live decision) — and for `set_secret` also a live
+/// grant (task A15a), of which none is registered here. The
 /// four operations that run a decision by id are never admitted by
 /// `admits` (A-102: their daemon asks `decided_intent`).
 #[test]

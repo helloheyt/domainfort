@@ -145,7 +145,7 @@ pub const SERVICE: KeyHandle = KeyHandle::new(SERVICE_ID, KeyPurpose::Service);
 
 /// Passwords and keys chosen for these tests; marker bytes easy to spot.
 pub const ALICE_PASSWORD: &str = "correct horse battery staple";
-pub const BOB_PASSWORD: &str = "tr0ub4dor&3";
+pub const BOB_PASSWORD: &str = "tr0ub4dor&3-plus";
 pub const ALICE_SALT: &str = "EXAMPLE.ORGalice";
 pub const BOB_SALT: &str = "EXAMPLE.ORGbob";
 pub const KRBTGT_KEY: [u8; 32] = [0xC1; 32];
@@ -402,7 +402,9 @@ pub fn approvers_for(operation: &DecidedOperation) -> Vec<PrincipalId> {
         DecidedOperation::RotateKrbtgt { .. }
         | DecidedOperation::RotateKey { .. }
         | DecidedOperation::RetireKvno { .. } => vec![APPROVER_1, APPROVER_2],
-        DecidedOperation::SetSecret { .. } | DecidedOperation::DestroyKeySet { .. } => Vec::new(),
+        DecidedOperation::SetSecret { .. }
+        | DecidedOperation::DestroyKeySet { .. }
+        | DecidedOperation::ChangePassword { .. } => Vec::new(),
     }
 }
 
@@ -410,7 +412,9 @@ pub fn approvers_for(operation: &DecidedOperation) -> Vec<PrincipalId> {
 /// decision.rs).
 pub fn ceiling_for(operation: &DecidedOperation) -> u32 {
     match operation {
-        DecidedOperation::SetSecret { .. } => MAX_SET_SECRET_GRANT_SECS,
+        DecidedOperation::SetSecret { .. } | DecidedOperation::ChangePassword { .. } => {
+            MAX_SET_SECRET_GRANT_SECS
+        }
         DecidedOperation::RotateKrbtgt { .. }
         | DecidedOperation::RotateKey { .. }
         | DecidedOperation::RetireKvno { .. } => MAX_KEY_DECISION_SECS,
@@ -766,6 +770,61 @@ pub fn add_admin_service(f: &mut Fixture) {
     f.entropy.push(&ADMIN_SERVICE_KEY);
     f.keyd
         .create_key(&ADMIN, &ADMIN_SERVICE, &bound(admin_service_name()), &now())
+        .unwrap();
+    f.keyd.audit_sink_mut().records.clear();
+}
+
+// ---------------------------------------------------------------------------
+// The DC's change-password service (task K3; RFC 3244 §2; docs/53 §5.2): its
+// own key purpose, `ChangePasswordService`, bound to ("kadmin", "changepw"),
+// drawn by `create_key`. The key bytes are made up for these tests.
+// ---------------------------------------------------------------------------
+
+pub const CHANGE_PASSWORD_SERVICE_ID: PrincipalId = PrincipalId::from_bytes([0xCF; 16]);
+pub const CHANGE_PASSWORD_SERVICE: KeyHandle = KeyHandle::new(
+    CHANGE_PASSWORD_SERVICE_ID,
+    KeyPurpose::ChangePasswordService,
+);
+pub const CHANGE_PASSWORD_SERVICE_KEY: [u8; 32] = [0xC4; 32];
+
+/// RFC 3244 §2: "kadmin/changepw@REALM" (NT-SRV-INST, RFC 4120 6.2.1).
+pub fn change_password_service_name() -> PrincipalName {
+    PrincipalName {
+        name_type: KRB_NT_SRV_INST,
+        name_string: vec![kstr("kadmin"), kstr("changepw")],
+    }
+}
+
+/// The change-password service key of `enctype` (its first K octets).
+pub fn change_password_service_key(enctype: EncType) -> ProtocolKey {
+    krb_crypto::random_to_key(
+        enctype,
+        &CHANGE_PASSWORD_SERVICE_KEY[..enctype.key_length()],
+    )
+    .unwrap()
+}
+
+/// Create the change-password service key set through `create_key`
+/// (Admin, the ceremony — docs/53 §5.2), one key per configured enctype.
+pub fn add_change_password_service(f: &mut Fixture) {
+    let enctypes: Vec<EncType> = f
+        .keyd
+        .config()
+        .enctypes
+        .iter()
+        .map(|e| EncType::from_number(e.number()).unwrap())
+        .collect();
+    for enctype in &enctypes {
+        f.entropy
+            .push(&CHANGE_PASSWORD_SERVICE_KEY[..enctype.key_length()]);
+    }
+    f.keyd
+        .create_key(
+            &ADMIN,
+            &CHANGE_PASSWORD_SERVICE,
+            &bound(change_password_service_name()),
+            &now(),
+        )
         .unwrap();
     f.keyd.audit_sink_mut().records.clear();
 }

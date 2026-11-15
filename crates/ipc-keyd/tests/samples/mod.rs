@@ -14,15 +14,16 @@ use ipc_keyd::{
     Password, PendingDestruction, SetSecretTarget, TgsFast,
 };
 use keyd_types::{
-    ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof, ConfigDescription, CtxId,
-    EncTypeId, ExchangeId, FastArmor, FastConversation, IssueError, KeyHandle, KeyPurpose, Kvno,
-    PrincipalBinding, PrincipalId, Role, ServiceContext, ServiceCtxId, TgsRepParts,
+    ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof, ChangePasswordContext,
+    ChangePasswordCtxId, ChangePasswordVerdict, ConfigDescription, CtxId, EncTypeId, ExchangeId,
+    FastArmor, FastConversation, HostAddr, IssueError, KeyHandle, KeyPurpose, Kvno,
+    PrincipalBinding, PrincipalId, Role, SealedReply, ServiceContext, ServiceCtxId, TgsRepParts,
     TgsTicketTemplate, TgtContext, TicketPolicy,
 };
 use krb_proto::{
-    ApOptions, ApReq, Checksum, EncryptedData, FastOptions, KdcOptions, KdcReqBody, KerberosString,
-    KerberosTime, KrbError, KrbFastArmor, KrbFastArmoredReq, KrbFastReq, Microseconds, PaData,
-    PrincipalName, Realm, Ticket, TicketFlags,
+    ApOptions, ApRep, ApReq, Checksum, EncryptedData, FastOptions, KdcOptions, KdcReqBody,
+    KerberosString, KerberosTime, KrbError, KrbFastArmor, KrbFastArmoredReq, KrbFastReq, KrbPriv,
+    Microseconds, NonZeroResultCode, PaData, PrincipalName, Realm, Ticket, TicketFlags,
 };
 use zeroize::Zeroizing;
 
@@ -387,7 +388,79 @@ pub fn calls() -> Vec<Call> {
         Call::ListDestroyDecisions {
             after: Some(DecisionId::new(42)),
         },
+        // Task K4 (docs/53 §5.5): a user's own change decision (code 6) and
+        // the three change-password operations — an IPv4 and an IPv6
+        // connection, every non-zero result code the codec carries.
+        Call::RegisterDecision {
+            id: DecisionId::new(14),
+            operation: DecidedOperation::ChangePassword {
+                target: alice_target(),
+            },
+            approvers: Vec::new(),
+            lifetime_secs: 30,
+        },
+        Call::OpenChangePasswordRequest {
+            service: PrincipalId::from_bytes([0xCF; 16]),
+            ap_req_octets: ap_req().encode().unwrap(),
+            krb_priv_octets: krb_priv().encode().unwrap(),
+            peer: HostAddr::ipv4([192, 0, 2, 10]),
+            local: HostAddr::ipv4([192, 0, 2, 1]),
+        },
+        Call::OpenChangePasswordRequest {
+            service: PrincipalId::from_bytes([0xCF; 16]),
+            ap_req_octets: ap_req().encode().unwrap(),
+            krb_priv_octets: krb_priv().encode().unwrap(),
+            peer: HostAddr::ipv6([
+                0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0a,
+            ]),
+            local: HostAddr::ipv6([
+                0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+            ]),
+        },
+        Call::CompleteChangePassword {
+            ctx: ChangePasswordCtxId::from_bytes([0xCC; 16]),
+            target: handle(0xA1, KeyPurpose::PrincipalLongterm),
+        },
+        Call::SealChangePasswordError {
+            ctx: ChangePasswordCtxId::from_bytes([0xCD; 16]),
+            code: NonZeroResultCode::Malformed,
+        },
+        Call::SealChangePasswordError {
+            ctx: ChangePasswordCtxId::from_bytes([0xCE; 16]),
+            code: NonZeroResultCode::InitialFlagNeeded,
+        },
     ]
+}
+
+/// A KRB-PRIV (RFC 4120 5.7.1): opaque ciphertext under key usage 13.
+pub fn krb_priv() -> KrbPriv {
+    KrbPriv {
+        enc_part: enc(18, None, 0x13),
+    }
+}
+
+/// A sealed change-password reply (docs/53 §5.5): an AP-REP (RFC 4120
+/// 5.5.2) and a KRB-PRIV, both opaque ciphertext here.
+pub fn sealed_reply() -> SealedReply {
+    SealedReply {
+        ap_rep: ApRep {
+            enc_part: enc(18, None, 0x12),
+        },
+        krb_priv: krb_priv(),
+    }
+}
+
+/// An opened change-password request with `verdict` (docs/53 §5.5).
+pub fn change_password_context(verdict: ChangePasswordVerdict) -> ChangePasswordContext {
+    ChangePasswordContext {
+        ctx_id: ChangePasswordCtxId::from_bytes([0xCB; 16]),
+        crealm: realm(),
+        cname: name(1, &["alice"]),
+        authtime: time(5),
+        endtime: time(10),
+        flags: flags(0x0060_0000),
+        verdict,
+    }
 }
 
 /// An approver's principal id (made up for these tests).
@@ -547,7 +620,21 @@ pub fn answers() -> Vec<Answer> {
         Answer::ListDestroyDecisions(Ok(destruction_page(1, 0, None))),
         Answer::ListDestroyDecisions(Ok(destruction_page(5, 3, Some(7)))),
         Answer::ListDestroyDecisions(Ok(destruction_page(1, 64, Some(64)))),
+        Answer::CompleteChangePassword(Ok(sealed_reply())),
+        Answer::SealChangePasswordError(Ok(sealed_reply())),
     ];
+    // Task K4: every verdict of the closed table.
+    for verdict in [
+        ChangePasswordVerdict::Acceptable,
+        ChangePasswordVerdict::Malformed,
+        ChangePasswordVerdict::InitialFlagNeeded,
+        ChangePasswordVerdict::SetNotSupported,
+        ChangePasswordVerdict::PasswordRefused,
+    ] {
+        answers.push(Answer::OpenChangePasswordRequest(Ok(
+            change_password_context(verdict),
+        )));
+    }
     // The caller role of the DescribeConfig reply: every value of the closed
     // table (Q-351, A-87) — the codec carries any role; keyd answers only
     // Kdc and Ldap callers (docs/10 §2).
@@ -572,6 +659,7 @@ pub fn answers() -> Vec<Answer> {
         answers.push(Answer::OpenAndVerifyTgt(Err(error)));
         answers.push(Answer::OpenAndVerifyServiceTicket(Err(error)));
         answers.push(Answer::VerifyOperationTicket(Err(error)));
+        answers.push(Answer::OpenChangePasswordRequest(Err(error)));
     }
     for error in [
         IssueError::Denied,
@@ -600,6 +688,8 @@ pub fn answers() -> Vec<Answer> {
         answers.push(Answer::RegisterDecision(Err(error)));
         answers.push(Answer::SealCeremony(Err(error)));
         answers.push(Answer::ListDestroyDecisions(Err(error)));
+        answers.push(Answer::CompleteChangePassword(Err(error)));
+        answers.push(Answer::SealChangePasswordError(Err(error)));
     }
     answers
 }

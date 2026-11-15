@@ -40,7 +40,8 @@ use core::fmt;
 
 /// Error of an authentication step (`verify_preauth`,
 /// `open_and_verify_tgt`, `open_fast_armor`,
-/// `open_and_verify_service_ticket`, `verify_operation_ticket`).
+/// `open_and_verify_service_ticket`, `verify_operation_ticket`,
+/// `open_change_password_request`).
 ///
 /// `Denied` is returned for every failure decided before the step's
 /// cryptographic chain completed. The other variants are returned only after
@@ -111,7 +112,8 @@ pub enum IssueError {
 /// `rotate_key`, `rotate_krbtgt`, `retire_kvno`, `destroy_key_set`,
 /// `set_secret`, `verify_secret`, `seal_fast_error`, `describe_config`,
 /// `ping`, `grant_set_secret`, `register_decision`, `seal_ceremony`,
-/// `list_destroy_decisions`).
+/// `list_destroy_decisions`, `complete_change_password`,
+/// `seal_change_password_error`).
 /// Spec: docs/10 §9; docs/50 §3.4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -151,6 +153,10 @@ pub enum ConfigError {
     /// not the `Kdc` role (docs/10 §2). Moved with `LocalKeyd` from the kdc
     /// crate's configuration error (D182; decision A-63).
     CustodyRole,
+    /// The password policy's minimum (`min_password_chars`) is below the
+    /// floor (P-24) or above the maximum password length ([MS-SAMR]
+    /// 3.1.1.7.2 item 2). Task K3; docs/53 §6.1; Q-605 item 2.
+    PasswordPolicy,
 }
 
 macro_rules! impl_display {
@@ -192,4 +198,5 @@ impl_display!(ConfigError,
     ConfigError::S2kParams => "invalid string-to-key parameters",
     ConfigError::Throttle => "invalid throttle policy",
     ConfigError::CustodyRole => "key custody caller is not the Kdc role",
+    ConfigError::PasswordPolicy => "invalid minimum password length",
 );

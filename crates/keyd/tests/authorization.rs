@@ -74,6 +74,8 @@ fn binding_for(handle: &KeyHandle) -> keyd::PrincipalBinding {
         KeyPurpose::Service => service_binding(),
         // R2: the admin service's name (A-73).
         KeyPurpose::AdminService => bound(admin_service_name()),
+        // Task K3: `kadmin/changepw` (RFC 3244 §2).
+        KeyPurpose::ChangePasswordService => bound(change_password_service_name()),
     }
 }
 
@@ -86,7 +88,7 @@ const UNREGISTERED: DecisionId = DecisionId::new(0xDEAD_BEEF);
 fn decided_for(handle: &KeyHandle) -> DecidedOperation {
     match handle.purpose {
         KeyPurpose::Krbtgt => DecidedOperation::RotateKrbtgt { krbtgt: *handle },
-        KeyPurpose::Service | KeyPurpose::AdminService => {
+        KeyPurpose::Service | KeyPurpose::AdminService | KeyPurpose::ChangePasswordService => {
             DecidedOperation::RotateKey { handle: *handle }
         }
         KeyPurpose::PrincipalLongterm => DecidedOperation::DestroyKeySet {
@@ -230,6 +232,39 @@ fn invoke(f: &mut Fixture, op: Operation, caller: &CallerId, handle: &KeyHandle)
         // No handle (A-102): `handle` is unused.
         Operation::SealCeremony => f.keyd.seal_ceremony(caller, &n).is_ok(),
         Operation::ListDestroyDecisions => f.keyd.list_destroy_decisions(caller, None, &n).is_ok(),
+        // Task K3: the principal only (the purpose is the binding's, as for
+        // the other service-ticket verifications).
+        Operation::OpenChangePasswordRequest => f
+            .keyd
+            .open_change_password_request(
+                caller,
+                &handle.principal,
+                &dummy_ap_req().encode().unwrap(),
+                &[0x30, 0x00],
+                &keyd::HostAddr::ipv4([192, 0, 2, 10]),
+                &keyd::HostAddr::ipv4([192, 0, 2, 1]),
+                &n,
+            )
+            .is_ok(),
+        Operation::CompleteChangePassword => f
+            .keyd
+            .complete_change_password(
+                caller,
+                &keyd::ChangePasswordCtxId::from_bytes([6; 16]),
+                handle,
+                &n,
+            )
+            .is_ok(),
+        // No handle (the request context is its authority): `handle` unused.
+        Operation::SealChangePasswordError => f
+            .keyd
+            .seal_change_password_error(
+                caller,
+                &keyd::ChangePasswordCtxId::from_bytes([6; 16]),
+                krb_proto::NonZeroResultCode::HardError,
+                &n,
+            )
+            .is_ok(),
     }
 }
 
@@ -244,11 +279,14 @@ fn valid_handle(op: Operation) -> KeyHandle {
         Operation::VerifyOperationTicket => ADMIN_SERVICE,
         Operation::SetSecret | Operation::VerifySecret | Operation::GrantSetSecret => ALICE,
         Operation::RegisterDecision => SERVICE,
-        // No handle (docs/50 §3.4; A-102); unused.
+        Operation::OpenChangePasswordRequest => CHANGE_PASSWORD_SERVICE,
+        Operation::CompleteChangePassword => ALICE,
+        // No handle (docs/50 §3.4; A-102; task K3); unused.
         Operation::DescribeConfig
         | Operation::Ping
         | Operation::SealCeremony
-        | Operation::ListDestroyDecisions => ALICE,
+        | Operation::ListDestroyDecisions
+        | Operation::SealChangePasswordError => ALICE,
         Operation::CreateKey => {
             KeyHandle::new(PrincipalId::from_bytes([0x99; 16]), KeyPurpose::Service)
         }
@@ -306,6 +344,7 @@ fn wrong_purpose_is_denied_for_every_operation() {
         (KeyPurpose::Krbtgt, KRBTGT),
         (KeyPurpose::Service, SERVICE),
         (KeyPurpose::AdminService, ADMIN_SERVICE),
+        (KeyPurpose::ChangePasswordService, CHANGE_PASSWORD_SERVICE),
     ];
     for op in Operation::ALL {
         // seal_fast_error takes no handle: the armor token is its authority
@@ -318,10 +357,15 @@ fn wrong_purpose_is_denied_for_every_operation() {
         // never a purpose — no purpose can mismatch (crate service_ticket.rs
         // `krbtgt_and_principal_keys_are_never_opened`); Q-523: nor can
         // `verify_operation_ticket`.
+        // Task K3: `open_change_password_request` names a principal (its
+        // purpose is `AppBinding::ChangePassword`'s) and
+        // `seal_change_password_error` no handle.
         if matches!(
             op,
             Operation::OpenAndVerifyServiceTicket
                 | Operation::VerifyOperationTicket
+                | Operation::OpenChangePasswordRequest
+                | Operation::SealChangePasswordError
                 | Operation::SealFastError
                 | Operation::DescribeConfig
                 | Operation::Ping
@@ -405,7 +449,8 @@ fn issue_as_rep_krbtgt_slot_purpose() {
 /// A15a); docs/52 §4, §7 R1, R3, R4 and docs/questions/Q-460, Q-462, Q-465
 /// (A-102: `RegisterDecision` Ldap only, `GrantSetSecret` Admin only,
 /// `SealCeremony` Admin, `VerifySecret` nobody); task R6 (A-105,
-/// docs/questions/Q-503): `ListDestroyDecisions` Admin and Ldap.
+/// docs/questions/Q-503): `ListDestroyDecisions` Admin and Ldap; task K3
+/// (docs/53 R53-7, A-117): the three change-password operations, Ldap.
 #[test]
 fn capability_table_matches_design() {
     use Operation::*;
@@ -447,6 +492,9 @@ fn capability_table_matches_design() {
                 ListDestroyDecisions,
                 DescribeConfig,
                 Ping,
+                OpenChangePasswordRequest,
+                CompleteChangePassword,
+                SealChangePasswordError,
             ],
         ),
     ];

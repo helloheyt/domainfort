@@ -157,8 +157,38 @@ fn every_held_operation_refused_at(f: &mut Fixture, tgt: &Tgt, when: KerberosTim
     assert_eq!(r.unwrap_err(), AuthnError::Unavailable);
     assert_held(f, Operation::VerifyOperationTicket);
 
+    // Task K3 (docs/53 §5.3): the change-password request enters the same
+    // replay cache, and its context steps consume a context.
+    let r = f.keyd.open_change_password_request(
+        &LDAP,
+        &SERVICE.principal,
+        &[0x30, 0x00],
+        &[0x30, 0x00],
+        &keyd::HostAddr::ipv4([192, 0, 2, 10]),
+        &keyd::HostAddr::ipv4([192, 0, 2, 1]),
+        &when,
+    );
+    assert_eq!(r.unwrap_err(), AuthnError::Unavailable);
+    assert_held(f, Operation::OpenChangePasswordRequest);
+    let r = f.keyd.complete_change_password(
+        &LDAP,
+        &keyd::ChangePasswordCtxId::from_bytes([7; 16]),
+        &ALICE,
+        &when,
+    );
+    assert_eq!(r.unwrap_err(), Error::Unavailable);
+    assert_held(f, Operation::CompleteChangePassword);
+    let r = f.keyd.seal_change_password_error(
+        &LDAP,
+        &keyd::ChangePasswordCtxId::from_bytes([7; 16]),
+        krb_proto::NonZeroResultCode::HardError,
+        &when,
+    );
+    assert_eq!(r.unwrap_err(), Error::Unavailable);
+    assert_held(f, Operation::SealChangePasswordError);
+
     // Exactly one record per call (I8), and every held operation was called.
-    assert_eq!(f.records().len() - before, 8);
+    assert_eq!(f.records().len() - before, 11);
     for op in Operation::ALL {
         if startup_hold_down_applies(op) {
             assert!(
@@ -408,7 +438,7 @@ fn directory_admin_and_daemon_support_operations_are_not_held() {
             &DIRECTORY,
             &BOB,
             &bob_binding(),
-            Zeroizing::new("bob's next password".to_owned()),
+            Zeroizing::new("his next passphrase".to_owned()),
             BOB_SALT,
             &at(50),
         ),

@@ -360,6 +360,78 @@ pub enum AuditReason {
     /// decision id (none for the ceremony's grant). Outcome `Success`.
     /// Spec: docs/questions/Q-501 (R6b), Q-520; docs/10 §6א, §7.
     SecretDecisionDiscarded,
+    // ---- task K3: the change-password operations (docs/53 §5, §9) --------
+    /// `open_change_password_request`: the Authenticator carries no subkey —
+    /// RFC 3244 §2: "The authenticator in the AP-REQ must include a
+    /// subsession key". Uniform `Denied`, before the replay cache.
+    /// Spec: RFC 3244 §2; docs/53 §5.3 (step 10); RFC 4120 5.5.1.
+    SubkeyMissing,
+    /// `open_change_password_request`: the Authenticator carries no
+    /// sequence number — RFC 3244 §2: "the seq-number in the authenticator
+    /// will be present" (the RFC 4120 5.5.1 leniency for an omitted zero is
+    /// not taken, Q-603 item 3). Uniform `Denied`, before the replay cache.
+    /// Spec: RFC 3244 §2; RFC 4120 5.5.1; docs/53 §5.3.
+    SequenceNumberMissing,
+    /// `open_change_password_request`: the KRB-PRIV's `seq-number` is absent
+    /// or differs from the Authenticator's (RFC 4120 3.5.2: "If an incorrect
+    /// sequence number is included, or if a sequence number is expected but
+    /// not present, the KRB_AP_ERR_BADORDER error is generated"; RFC 3244
+    /// §2: present and equal). Uniform `Denied`.
+    /// Spec: RFC 4120 3.5.2; RFC 3244 §2; docs/53 §5.4 item 2; Q-603 item 2.
+    KrbPrivSequenceMismatch,
+    /// `open_change_password_request`: the KRB-PRIV's `timestamp` is present
+    /// but not within the clock skew of keyd's clock (RFC 4120 3.5.2:
+    /// "present but not current"). Uniform `Denied`.
+    /// Spec: RFC 4120 3.5.2; docs/53 §5.4 item 2.
+    KrbPrivTimestampSkew,
+    /// `open_change_password_request`: the KRB-PRIV's `s-address` is neither
+    /// the directional address 0 nor the peer address the front's kernel
+    /// reported (an IPv4-mapped address as type 2 only) — RFC 4120 3.5.2
+    /// KRB_AP_ERR_BADADDR. Uniform `Denied`.
+    /// Spec: RFC 4120 3.5.2, 7.1; docs/53 §5.4 item 3; Q-603 item 8.
+    KrbPrivAddressMismatch,
+    /// A password broke the password policy at keyd's install path — the
+    /// one place every password, on every path, is cleartext (the length
+    /// in code points / UTF-16 units, or the account name as a substring).
+    /// Which rule is never recorded. Uniform `Denied`.
+    /// Spec: [MS-SAMR] 3.1.1.7.2 items 2, 3.2.1, 3.2.2; docs/53 §6; Q-605
+    /// item 1 (A-117).
+    PasswordPolicyRefused,
+    /// `complete_change_password` on a context whose verdict is not
+    /// `Acceptable`: only an error reply may be sealed for it. Uniform
+    /// `Denied`; the context stays for that error reply.
+    /// Spec: docs/53 §5.5 ("verdict ≠ Acceptable ⇒ Denied").
+    ChangePasswordNotAcceptable,
+    /// `seal_change_password_error` with a result code the context's verdict
+    /// does not permit (`ChangePasswordVerdict::permits_error`): a reply
+    /// would state an outcome keyd did not establish. Uniform `Denied`; the
+    /// context stays.
+    /// Spec: docs/53 §5.5, §5.7; RFC 3244 §2.
+    ResultCodeNotPermitted,
+    /// The result code KRB5_KPASSWD_MALFORMED (1): the verdict of an opened
+    /// request (outcome `Success`), or the code an error reply was sealed
+    /// with. Spec: RFC 3244 §2; docs/53 §9 (one record "with the code").
+    KpasswdMalformed,
+    /// The result code KRB5_KPASSWD_HARDERROR (2) an error reply was sealed
+    /// with (outcome `Success`). Spec: RFC 3244 §2; docs/53 §5.7, §9.
+    KpasswdHardError,
+    /// The result code KRB5_KPASSWD_AUTHERROR (3) an error reply was sealed
+    /// with (outcome `Success`). Spec: RFC 3244 §2; docs/53 §5.7, §9.
+    KpasswdAuthError,
+    /// The result code KRB5_KPASSWD_SOFTERROR (4): the verdict of an opened
+    /// request whose new password was refused, or the code an error reply
+    /// was sealed with (outcome `Success`). Spec: RFC 3244 §2; docs/53 §5.7,
+    /// §9.
+    KpasswdSoftError,
+    /// The result code KRB5_KPASSWD_ACCESSDENIED (5): the verdict of an
+    /// opened set request, or the code an error reply was sealed with
+    /// (outcome `Success`). Spec: RFC 3244 §2; docs/53 §5.7, §9.
+    KpasswdAccessDenied,
+    /// The result code KRB5_KPASSWD_INITIAL_FLAG_NEEDED (7): the verdict of
+    /// an opened request whose ticket is not INITIAL, or the code an error
+    /// reply was sealed with (outcome `Success`). Spec: RFC 3244 §2; RFC
+    /// 4120 2.1; docs/53 §5.7, §9.
+    KpasswdInitialFlagNeeded,
 }
 
 /// A key referenced by an operation, for audit (no key material).

@@ -269,8 +269,9 @@ fn code_tables_are_closed() {
     // (docs/questions/Q-452 item 4); A-102 the seven decision reasons
     // (docs/52 §4.5); R2 the two operation-binding reasons (docs/52 §5);
     // R6b the discard of a deleted principal's set-secret entries
-    // (docs/questions/Q-520), `Unlisted` last (80).
-    assert_eq!(table!(KeydReason), 80);
+    // (docs/questions/Q-520); task K3 the fourteen change-password reasons
+    // (docs/53 §9, codes 80-93), `Unlisted` last (94).
+    assert_eq!(table!(KeydReason), 94);
     assert_eq!(KeydReason::NoGrant.code(), 66);
     assert_eq!(KeydReason::GrantTableFull.code(), 69);
     assert_eq!(KeydReason::NoDecision.code(), 70);
@@ -278,16 +279,23 @@ fn code_tables_are_closed() {
     assert_eq!(KeydReason::OperationDigestMissing.code(), 77);
     assert_eq!(KeydReason::OperationDigestMismatch.code(), 78);
     assert_eq!(KeydReason::SecretDecisionDiscarded.code(), 79);
-    assert_eq!(KeydReason::Unlisted.code(), 80);
+    assert_eq!(KeydReason::SubkeyMissing.code(), 80);
+    assert_eq!(KeydReason::PasswordPolicyRefused.code(), 85);
+    assert_eq!(KeydReason::KpasswdInitialFlagNeeded.code(), 93);
+    assert_eq!(KeydReason::Unlisted.code(), 94);
     assert_eq!(table!(LdapReason), 53);
     assert_eq!(table!(CodecErrorCode), 35);
     assert_eq!(table!(CodecLimit), 12);
     assert_eq!(table!(PdpReasonCode), 12);
     // `GrantSetSecret` (17) appended by task A15a; `RegisterDecision`,
     // `SealCeremony`, `ListDestroyDecisions` (18-20) by A-102 (docs/52 §4);
-    // `VerifyOperationTicket` (21) by Q-523; 1-16 keep their codes.
-    assert_eq!(table!(KeydOperation), 21);
+    // `VerifyOperationTicket` (21) by Q-523; the three change-password
+    // operations (22-24) by task K3 (docs/53 §9); 1-16 keep their codes.
+    assert_eq!(table!(KeydOperation), 24);
     assert_eq!(KeydOperation::VerifyOperationTicket.code(), 21);
+    assert_eq!(KeydOperation::OpenChangePasswordRequest.code(), 22);
+    assert_eq!(KeydOperation::CompleteChangePassword.code(), 23);
+    assert_eq!(KeydOperation::SealChangePasswordError.code(), 24);
     assert_eq!(KeydOperation::OpenAndVerifyServiceTicket.code(), 14);
     assert_eq!(KeydOperation::GrantSetSecret.code(), 17);
     assert_eq!(KeydOperation::RegisterDecision.code(), 18);
@@ -298,10 +306,12 @@ fn code_tables_are_closed() {
     table!(KdcOutcomeCode);
     table!(IpZone);
     table!(KeydRole);
-    // R2 appended `AdminService` (4); 1-3 keep their codes.
-    assert_eq!(table!(KeyPurposeCode), 4);
+    // R2 appended `AdminService` (4); task K3 `ChangePasswordService` (5);
+    // 1-3 keep their codes.
+    assert_eq!(table!(KeyPurposeCode), 5);
     assert_eq!(KeyPurposeCode::Service.code(), 3);
     assert_eq!(KeyPurposeCode::AdminService.code(), 4);
+    assert_eq!(KeyPurposeCode::ChangePasswordService.code(), 5);
     // keyd's five outcomes keep their codes; A-86 appended two phases.
     assert_eq!(table!(KeydOutcome), 7);
     assert_eq!(

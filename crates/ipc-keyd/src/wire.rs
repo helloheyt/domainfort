@@ -6,7 +6,7 @@
 //!
 //! | value | encoding |
 //! |---|---|
-//! | `KeyHandle` | 16-octet `PrincipalId` ‖ purpose `u8` (closed table: 1 PrincipalLongterm, 2 Krbtgt, 3 Service, 4 AdminService) |
+//! | `KeyHandle` | 16-octet `PrincipalId` ‖ purpose `u8` (closed table: 1 PrincipalLongterm, 2 Krbtgt, 3 Service, 4 AdminService, 5 ChangePasswordService — task K4) |
 //! | binding of `open_and_verify_service_ticket` (0x07) | `u8 1` (Unbound) — the only value since Q-523; `u8 2` (OperationDigest) is refused: an operation-bound verification is its own kind, 0x15. No purpose travels: keyd derives it from the binding (R2) |
 //! | operation digest of `verify_operation_ticket` (0x15) / `OperationTicket` (0x95) | 32 octets |
 //! | end of the `ServiceContext` reply (0x87) | `u8 0` — the absent marker of the former `bound_operation: Option<[32]>`, the only value since Q-523 (an unbound verification is bound to no operation) |
@@ -22,7 +22,12 @@
 //! | `AccountKind` of a grant | `u8` (closed table: 1 User, 2 Computer) |
 //! | grant / decision lifetime | `u32` seconds, relative — keyd adds its own clock's `now` |
 //! | `DecisionId` | `u64` |
-//! | `DecidedOperation` | `u8` (closed table: 1 SetSecret, 2 RotateKrbtgt, 3 RotateKey, 4 RetireKvno, 5 DestroyKeySet) ‖ its fields ([`WireDecidedOperation`]) |
+//! | `DecidedOperation` | `u8` (closed table: 1 SetSecret, 2 RotateKrbtgt, 3 RotateKey, 4 RetireKvno, 5 DestroyKeySet, 6 ChangePassword — task K4) ‖ its fields ([`WireDecidedOperation`]) |
+//! | `HostAddr` of `open_change_password_request` (0x16) | family `u8` (closed table: 1 IPv4 ‖ 4 octets, 2 IPv6 ‖ 16 octets; an IPv4-mapped IPv6 address is refused — it has one encoding, family 1, RFC 4120 7.1) |
+//! | `ChangePasswordCtxId` (0x96, 0x17, 0x18) | `TOKEN_ID_LENGTH` octets |
+//! | `ChangePasswordVerdict` (0x96) | `u8` (closed table: 1 Acceptable, 2 Malformed, 3 InitialFlagNeeded, 4 SetNotSupported, 5 PasswordRefused) |
+//! | `NonZeroResultCode` (0x18) | `u16`, the RFC 3244 §2 value (1-7; 0 and every undefined value refused) |
+//! | `SealedReply` (0x97, 0x98) | DER `AP-REP` ‖ DER `KRB-PRIV` |
 //!
 //! **A-102 (docs/52 §4.6):** `rotate_key`, `rotate_krbtgt`, `retire_kvno`
 //! and `destroy_key_set` carry **only a decision id** — no handle, kvno or
@@ -48,6 +53,16 @@
 //! that does not give it its own role. No request field is ever read as a
 //! role.
 //!
+//! **Task K4 (append-only, docs/50 §3.3):** the three change-password
+//! operations of task K3 are the appended kinds 0x16 / 0x96
+//! (`open_change_password_request`), 0x17 / 0x97 (`complete_change_password`
+//! — a state call, docs/52 §3.10 (c)) and 0x18 / 0x98
+//! (`seal_change_password_error`); purpose code 5 and decided-operation code
+//! 6 are appended to their tables. No password field exists in any of them:
+//! the new password travels only inside the encrypted KRB-PRIV, which only
+//! keyd opens (docs/53 R53-4). `KEYD_VERSION` stays 1 (the precedent of R9
+//! and Q-523; docs/questions/Q-661).
+//!
 //! **Q-523 (append-only, docs/50 §3.3):** the operation-bound service-ticket
 //! verification was moved out of kind 0x07 into the appended kinds 0x15 /
 //! 0x95, whose answer has no context id. Kind 0x07 / 0x87 keep their layout
@@ -65,11 +80,12 @@ use crate::channel::{
 };
 use ipc::{DerBlob, Error, MessageSet, Payload, Reader, Result, Secret, Writer};
 use keyd_types::{
-    AccountKind, ArmorId, AuthnError, CtxId, DecisionId, EncTypeId, ExchangeId, FastConversation,
-    IssueError, KeyHandle, KeyPurpose, Kvno, OperationDigest, PendingDestruction, PrincipalId,
-    Role, ServiceCtxId, TicketPolicy, OPERATION_DIGEST_LEN, TOKEN_ID_LENGTH,
+    AccountKind, ArmorId, AuthnError, ChangePasswordCtxId, ChangePasswordVerdict, CtxId,
+    DecisionId, EncTypeId, ExchangeId, FastConversation, HostAddr, IssueError, KeyHandle,
+    KeyPurpose, Kvno, OperationDigest, PendingDestruction, PrincipalId, Role, ServiceCtxId,
+    TicketPolicy, ADDRESS_TYPE_IPV4, OPERATION_DIGEST_LEN, TOKEN_ID_LENGTH,
 };
-use krb_proto::{KerberosFlags, TicketFlags};
+use krb_proto::{KerberosFlags, NonZeroResultCode, TicketFlags};
 
 // ===========================================================================
 // Field helpers for keyd's own (non-Kerberos) types.
@@ -84,6 +100,8 @@ const fn purpose_code(purpose: KeyPurpose) -> u8 {
         KeyPurpose::Krbtgt => 0x02,
         KeyPurpose::Service => 0x03,
         KeyPurpose::AdminService => 0x04,
+        // Task K4 (docs/53 §5.2): appended.
+        KeyPurpose::ChangePasswordService => 0x05,
     }
 }
 
@@ -95,6 +113,7 @@ const fn purpose_from_code(code: u8) -> Option<KeyPurpose> {
         0x02 => Some(KeyPurpose::Krbtgt),
         0x03 => Some(KeyPurpose::Service),
         0x04 => Some(KeyPurpose::AdminService),
+        0x05 => Some(KeyPurpose::ChangePasswordService),
         _ => None,
     }
 }
@@ -784,6 +803,153 @@ impl Payload for VerifyOperationTicketRequest {
     }
 }
 
+/// Wire code of an IPv4 [`HostAddr`]. Project choice (closed table).
+/// Spec: docs/50 §3.3 ("enum = `u8` from a closed table"); RFC 4120 7.1.
+const HOST_ADDR_IPV4: u8 = 0x01;
+/// Wire code of an IPv6 [`HostAddr`]. Project choice (closed table).
+/// Spec: docs/50 §3.3; RFC 4120 7.1.
+const HOST_ADDR_IPV6: u8 = 0x02;
+
+/// `HostAddr` = family (`u8`) ‖ the address octets (4 or 16).
+/// Spec: docs/53 §5.5 (`peer`, `local`); RFC 4120 7.1.
+fn write_host_addr(writer: &mut Writer, address: &HostAddr) -> Result<()> {
+    match address.octets() {
+        [a, b, c, d] if address.addr_type() == ADDRESS_TYPE_IPV4 => {
+            writer.write_enum(HOST_ADDR_IPV4)?;
+            writer.write_array(&[*a, *b, *c, *d])
+        }
+        octets => {
+            let v6: [u8; 16] = octets.try_into().map_err(|_| Error::UnknownCode)?;
+            writer.write_enum(HOST_ADDR_IPV6)?;
+            writer.write_array(&v6)
+        }
+    }
+}
+
+/// Spec: docs/53 §5.5; RFC 4120 7.1 ("IPv4-mapped IPv6 addresses MUST be
+/// represented as addresses of type 2") — so a mapped address in the IPv6
+/// form is refused: every address has exactly one encoding (docs/50 §3.3,
+/// round trip).
+fn read_host_addr(reader: &mut Reader<'_>) -> Result<HostAddr> {
+    let family = reader.read_enum(|c| (c == HOST_ADDR_IPV4 || c == HOST_ADDR_IPV6).then_some(c))?;
+    if family == HOST_ADDR_IPV4 {
+        return Ok(HostAddr::ipv4(reader.read_array()?));
+    }
+    let address = HostAddr::ipv6(reader.read_array()?);
+    if address.addr_type() == ADDRESS_TYPE_IPV4 {
+        return Err(Error::UnknownCode);
+    }
+    Ok(address)
+}
+
+/// `open_change_password_request` (task K4): the change-password service's
+/// principal (keyd derives the purpose from `AppBinding::ChangePassword`),
+/// the RFC 3244 request's AP-REQ and KRB-PRIV as received (keyd decodes
+/// both itself — the front never decodes DER, docs/53 §5.1), and the
+/// connection's peer and local addresses as the front's kernel reported
+/// them. No password field: the password is inside the KRB-PRIV's
+/// ciphertext.
+/// Spec: docs/53 §5.5 (`ap_req_octets`, `krb_priv_octets`, `peer`, `local`);
+/// docs/50 §3.3 (append-only), §3.4; RFC 3244 §2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenChangePasswordRequestFields {
+    /// The change-password service key set's principal.
+    pub service: PrincipalId,
+    /// The raw KRB_AP_REQ octets.
+    pub ap_req_octets: Vec<u8>,
+    /// The raw KRB-PRIV octets.
+    pub krb_priv_octets: Vec<u8>,
+    /// The peer's address (for the `s-address` check only).
+    pub peer: HostAddr,
+    /// The connection's local address (for the reply's `s-address` only).
+    pub local: HostAddr,
+}
+
+impl Payload for OpenChangePasswordRequestFields {
+    /// Spec: docs/53 §5.5; docs/50 §3.4.
+    fn write_fields(&self, writer: &mut Writer) -> Result<()> {
+        writer.write_array(self.service.as_bytes())?;
+        writer.write_bytes(&self.ap_req_octets, MAX_REQUEST_FIELD)?;
+        writer.write_bytes(&self.krb_priv_octets, MAX_REQUEST_FIELD)?;
+        write_host_addr(writer, &self.peer)?;
+        write_host_addr(writer, &self.local)
+    }
+
+    /// Spec: docs/53 §5.5; docs/50 §3.4.
+    fn read_fields(reader: &mut Reader<'_>) -> Result<OpenChangePasswordRequestFields> {
+        let service = PrincipalId::from_bytes(reader.read_array()?);
+        let ap_req_octets = read_owned(reader, MAX_REQUEST_FIELD)?;
+        let krb_priv_octets = read_owned(reader, MAX_REQUEST_FIELD)?;
+        let peer = read_host_addr(reader)?;
+        let local = read_host_addr(reader)?;
+        Ok(OpenChangePasswordRequestFields {
+            service,
+            ap_req_octets,
+            krb_priv_octets,
+            peer,
+            local,
+        })
+    }
+}
+
+/// `complete_change_password` (task K4) = the request-context id ‖ the
+/// target `KeyHandle`. No password, no binding, no salt: keyd takes the
+/// password from the context and the binding and salt from dird's decision
+/// (docs/53 §5.5).
+/// Spec: docs/53 §5.5 (`complete_change_password(ctx, target)`); docs/50
+/// §3.4.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompleteChangePasswordRequest {
+    /// The request context.
+    pub ctx: ChangePasswordCtxId,
+    /// The user's password key set.
+    pub target: KeyHandle,
+}
+
+impl Payload for CompleteChangePasswordRequest {
+    /// Spec: docs/53 §5.5.
+    fn write_fields(&self, writer: &mut Writer) -> Result<()> {
+        writer.write_array(self.ctx.as_bytes())?;
+        write_handle(writer, &self.target)
+    }
+
+    /// Spec: docs/53 §5.5.
+    fn read_fields(reader: &mut Reader<'_>) -> Result<CompleteChangePasswordRequest> {
+        let ctx = ChangePasswordCtxId::from_bytes(read_token(reader)?);
+        let target = read_handle(reader)?;
+        Ok(CompleteChangePasswordRequest { ctx, target })
+    }
+}
+
+/// `seal_change_password_error` (task K4) = the request-context id ‖ the
+/// result code (`u16`, RFC 3244 §2). A zero or an undefined code is refused
+/// by the codec: SUCCESS is never sealed here (RFC 3244 §2: "not allowed in
+/// a KRB-ERROR message"; docs/53 §4.5).
+/// Spec: docs/53 §5.5 (`code: NonZeroResultCode`); RFC 3244 §2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealChangePasswordErrorRequest {
+    /// The request context.
+    pub ctx: ChangePasswordCtxId,
+    /// The non-zero result code.
+    pub code: NonZeroResultCode,
+}
+
+impl Payload for SealChangePasswordErrorRequest {
+    /// Spec: docs/53 §5.5; RFC 3244 §2 (16-bit codes).
+    fn write_fields(&self, writer: &mut Writer) -> Result<()> {
+        writer.write_array(self.ctx.as_bytes())?;
+        writer.write_u16(self.code.value())
+    }
+
+    /// Spec: docs/53 §5.5; RFC 3244 §2.
+    fn read_fields(reader: &mut Reader<'_>) -> Result<SealChangePasswordErrorRequest> {
+        let ctx = ChangePasswordCtxId::from_bytes(read_token(reader)?);
+        let code =
+            NonZeroResultCode::from_value(reader.read_u16()?).map_err(|_| Error::UnknownCode)?;
+        Ok(SealChangePasswordErrorRequest { ctx, code })
+    }
+}
+
 /// `set_secret`. The password travels only in a zeroizing [`Secret`] whose
 /// `Debug` prints nothing (not even its length).
 /// Spec: docs/50 §3.3 ("the `SetSecret`/`VerifySecret` body (password) is
@@ -1003,6 +1169,8 @@ pub enum WireDecidedOperation {
     RetireKvno(KeyHandle, Kvno),
     /// Code 5: the principal id (16 octets).
     DestroyKeySet(PrincipalId),
+    /// Code 6 (task K4): the one target of a user's own password change.
+    ChangePassword(WireSetSecretTarget),
 }
 
 impl Payload for WireDecidedOperation {
@@ -1031,12 +1199,16 @@ impl Payload for WireDecidedOperation {
                 writer.write_enum(0x05)?;
                 writer.write_array(principal.as_bytes())
             }
+            WireDecidedOperation::ChangePassword(target) => {
+                writer.write_enum(0x06)?;
+                target.write_fields(writer)
+            }
         }
     }
 
     /// Spec: docs/52 §4.6; docs/50 §3.3 (closed tables, bounded counts).
     fn read_fields(reader: &mut Reader<'_>) -> Result<WireDecidedOperation> {
-        let code = reader.read_enum(|c| (1..=5).contains(&c).then_some(c))?;
+        let code = reader.read_enum(|c| (1..=6).contains(&c).then_some(c))?;
         Ok(match code {
             0x01 => {
                 let kind = reader.read_enum(account_kind_from_code)?;
@@ -1050,7 +1222,10 @@ impl Payload for WireDecidedOperation {
                 let handle = read_handle(reader)?;
                 WireDecidedOperation::RetireKvno(handle, Kvno::new(reader.read_u32()?))
             }
-            _ => WireDecidedOperation::DestroyKeySet(PrincipalId::from_bytes(reader.read_array()?)),
+            0x05 => {
+                WireDecidedOperation::DestroyKeySet(PrincipalId::from_bytes(reader.read_array()?))
+            }
+            _ => WireDecidedOperation::ChangePassword(WireSetSecretTarget::read_fields(reader)?),
         })
     }
 }
@@ -1184,6 +1359,12 @@ pub enum KeydRequest {
     ListDestroyDecisions(Option<DecisionId>),
     /// Spec: docs/10 §5ב; docs/questions/Q-523.
     VerifyOperationTicket(VerifyOperationTicketRequest),
+    /// Spec: docs/53 §5.5 (task K4).
+    OpenChangePasswordRequest(OpenChangePasswordRequestFields),
+    /// Spec: docs/53 §5.5 (task K4).
+    CompleteChangePassword(CompleteChangePasswordRequest),
+    /// Spec: docs/53 §5.5 (task K4).
+    SealChangePasswordError(SealChangePasswordErrorRequest),
 }
 
 impl MessageSet for KeydRequest {
@@ -1215,6 +1396,9 @@ impl MessageSet for KeydRequest {
             KeydRequest::SealCeremony => request_kind::SEAL_CEREMONY,
             KeydRequest::ListDestroyDecisions(_) => request_kind::LIST_DESTROY_DECISIONS,
             KeydRequest::VerifyOperationTicket(_) => request_kind::VERIFY_OPERATION_TICKET,
+            KeydRequest::OpenChangePasswordRequest(_) => request_kind::OPEN_CHANGE_PASSWORD_REQUEST,
+            KeydRequest::CompleteChangePassword(_) => request_kind::COMPLETE_CHANGE_PASSWORD,
+            KeydRequest::SealChangePasswordError(_) => request_kind::SEAL_CHANGE_PASSWORD_ERROR,
         }
     }
 
@@ -1242,6 +1426,9 @@ impl MessageSet for KeydRequest {
                 writer.write_option(after.as_ref(), |w, id| write_decision(w, *id))
             }
             KeydRequest::VerifyOperationTicket(m) => m.write_fields(writer),
+            KeydRequest::OpenChangePasswordRequest(m) => m.write_fields(writer),
+            KeydRequest::CompleteChangePassword(m) => m.write_fields(writer),
+            KeydRequest::SealChangePasswordError(m) => m.write_fields(writer),
         }
     }
 
@@ -1298,6 +1485,15 @@ impl MessageSet for KeydRequest {
             }
             request_kind::VERIFY_OPERATION_TICKET => KeydRequest::VerifyOperationTicket(
                 VerifyOperationTicketRequest::read_fields(reader)?,
+            ),
+            request_kind::OPEN_CHANGE_PASSWORD_REQUEST => KeydRequest::OpenChangePasswordRequest(
+                OpenChangePasswordRequestFields::read_fields(reader)?,
+            ),
+            request_kind::COMPLETE_CHANGE_PASSWORD => KeydRequest::CompleteChangePassword(
+                CompleteChangePasswordRequest::read_fields(reader)?,
+            ),
+            request_kind::SEAL_CHANGE_PASSWORD_ERROR => KeydRequest::SealChangePasswordError(
+                SealChangePasswordErrorRequest::read_fields(reader)?,
             ),
             _ => return Err(Error::UnknownKind),
         })
@@ -1563,6 +1759,113 @@ impl Payload for WireOperationTicket {
     }
 }
 
+/// Wire code of a [`ChangePasswordVerdict`]. Project choice (closed table).
+/// Spec: docs/50 §3.3; docs/53 §5.5.
+const fn verdict_code(verdict: ChangePasswordVerdict) -> u8 {
+    match verdict {
+        ChangePasswordVerdict::Acceptable => 0x01,
+        ChangePasswordVerdict::Malformed => 0x02,
+        ChangePasswordVerdict::InitialFlagNeeded => 0x03,
+        ChangePasswordVerdict::SetNotSupported => 0x04,
+        ChangePasswordVerdict::PasswordRefused => 0x05,
+    }
+}
+
+/// The verdict of a wire code, or `None` outside the closed table.
+/// Spec: docs/50 §3.3; docs/53 §5.5.
+const fn verdict_from_code(code: u8) -> Option<ChangePasswordVerdict> {
+    match code {
+        0x01 => Some(ChangePasswordVerdict::Acceptable),
+        0x02 => Some(ChangePasswordVerdict::Malformed),
+        0x03 => Some(ChangePasswordVerdict::InitialFlagNeeded),
+        0x04 => Some(ChangePasswordVerdict::SetNotSupported),
+        0x05 => Some(ChangePasswordVerdict::PasswordRefused),
+        _ => None,
+    }
+}
+
+/// `ChangePasswordContext` (task K4): the request-context id, the ticket's
+/// non-secret facts and keyd's verdict — no key, no password.
+/// Spec: docs/53 §5.5 (`struct ChangePasswordContext { ctx_id, crealm,
+/// cname, authtime, endtime, flags, verdict }`); docs/50 §3.4.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireChangePasswordContext {
+    /// The one-time request-context token.
+    pub ctx_id: ChangePasswordCtxId,
+    /// Client realm, KerberosString octets.
+    pub crealm: Vec<u8>,
+    /// DER `PrincipalName` of the client.
+    pub cname: DerBlob,
+    /// Ticket authtime.
+    pub authtime: WireTime,
+    /// Ticket endtime.
+    pub endtime: WireTime,
+    /// Ticket flags.
+    pub flags: TicketFlags,
+    /// keyd's verdict.
+    pub verdict: ChangePasswordVerdict,
+}
+
+impl Payload for WireChangePasswordContext {
+    /// Spec: docs/53 §5.5.
+    fn write_fields(&self, writer: &mut Writer) -> Result<()> {
+        writer.write_array(self.ctx_id.as_bytes())?;
+        writer.write_bytes(&self.crealm, MAX_REPLY_FIELD)?;
+        writer.write_der(&self.cname, MAX_REPLY_FIELD)?;
+        self.authtime.write_fields(writer)?;
+        self.endtime.write_fields(writer)?;
+        write_flags(writer, self.flags)?;
+        writer.write_enum(verdict_code(self.verdict))
+    }
+
+    /// Spec: docs/53 §5.5.
+    fn read_fields(reader: &mut Reader<'_>) -> Result<WireChangePasswordContext> {
+        let ctx_id = ChangePasswordCtxId::from_bytes(read_token(reader)?);
+        let crealm = read_owned(reader, MAX_REPLY_FIELD)?;
+        let cname = reader.read_der(MAX_REPLY_FIELD)?;
+        let authtime = WireTime::read_fields(reader)?;
+        let endtime = WireTime::read_fields(reader)?;
+        let flags = read_flags(reader)?;
+        let verdict = reader.read_enum(verdict_from_code)?;
+        Ok(WireChangePasswordContext {
+            ctx_id,
+            crealm,
+            cname,
+            authtime,
+            endtime,
+            flags,
+            verdict,
+        })
+    }
+}
+
+/// `SealedReply` (task K4): DER `AP-REP` ‖ DER `KRB-PRIV`, framed by the
+/// front (RFC 3244 §2).
+/// Spec: docs/53 §5.5 (`struct SealedReply { ap_rep: Bytes, krb_priv:
+/// Bytes } // DER`); docs/50 §3.4.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireSealedReply {
+    /// DER `AP-REP`.
+    pub ap_rep: DerBlob,
+    /// DER `KRB-PRIV`.
+    pub krb_priv: DerBlob,
+}
+
+impl Payload for WireSealedReply {
+    /// Spec: docs/53 §5.5.
+    fn write_fields(&self, writer: &mut Writer) -> Result<()> {
+        writer.write_der(&self.ap_rep, MAX_REPLY_FIELD)?;
+        writer.write_der(&self.krb_priv, MAX_REPLY_FIELD)
+    }
+
+    /// Spec: docs/53 §5.5.
+    fn read_fields(reader: &mut Reader<'_>) -> Result<WireSealedReply> {
+        let ap_rep = reader.read_der(MAX_REPLY_FIELD)?;
+        let krb_priv = reader.read_der(MAX_REPLY_FIELD)?;
+        Ok(WireSealedReply { ap_rep, krb_priv })
+    }
+}
+
 /// Wire code of the caller's role in the `DescribeConfig` and `Ping`
 /// replies (one table for both). Project choice: a closed table in the
 /// order of `keyd_types::Role`; 0x00 and 0x05-0xFF name no role and are
@@ -1798,6 +2101,12 @@ pub enum KeydReply {
     ListDestroyDecisions(WireDestructionPage),
     /// Spec: docs/10 §5ב; docs/questions/Q-523.
     VerifyOperationTicket(WireOperationTicket),
+    /// Spec: docs/53 §5.5 (task K4).
+    OpenChangePasswordRequest(WireChangePasswordContext),
+    /// The success reply. Spec: docs/53 §5.5 (task K4).
+    CompleteChangePassword(WireSealedReply),
+    /// An error reply. Spec: docs/53 §5.5 (task K4).
+    SealChangePasswordError(WireSealedReply),
     /// Spec: docs/10 §9; A-26; A-56.
     AuthnFailure(AuthnError),
     /// Spec: docs/10 §9; A-56.
@@ -1833,6 +2142,9 @@ impl MessageSet for KeydReply {
             KeydReply::SealCeremony => reply_kind::SEAL_CEREMONY,
             KeydReply::ListDestroyDecisions(_) => reply_kind::LIST_DESTROY_DECISIONS,
             KeydReply::VerifyOperationTicket(_) => reply_kind::VERIFY_OPERATION_TICKET,
+            KeydReply::OpenChangePasswordRequest(_) => reply_kind::OPEN_CHANGE_PASSWORD_REQUEST,
+            KeydReply::CompleteChangePassword(_) => reply_kind::COMPLETE_CHANGE_PASSWORD,
+            KeydReply::SealChangePasswordError(_) => reply_kind::SEAL_CHANGE_PASSWORD_ERROR,
             KeydReply::AuthnFailure(_) => reply_kind::AUTHN_FAILURE,
             KeydReply::IssueFailure(_) => reply_kind::ISSUE_FAILURE,
             KeydReply::Failure(_) => reply_kind::FAILURE,
@@ -1860,6 +2172,10 @@ impl MessageSet for KeydReply {
             | KeydReply::SealCeremony => Ok(()),
             KeydReply::ListDestroyDecisions(m) => m.write_fields(writer),
             KeydReply::VerifyOperationTicket(m) => m.write_fields(writer),
+            KeydReply::OpenChangePasswordRequest(m) => m.write_fields(writer),
+            KeydReply::CompleteChangePassword(m) | KeydReply::SealChangePasswordError(m) => {
+                m.write_fields(writer)
+            }
             KeydReply::DescribeConfig(m) => m.write_fields(writer),
             // Q-466 item 2 (A-102): the caller role, from the table of the
             // `DescribeConfig` reply.
@@ -1910,6 +2226,15 @@ impl MessageSet for KeydReply {
             }
             reply_kind::VERIFY_OPERATION_TICKET => {
                 KeydReply::VerifyOperationTicket(WireOperationTicket::read_fields(reader)?)
+            }
+            reply_kind::OPEN_CHANGE_PASSWORD_REQUEST => KeydReply::OpenChangePasswordRequest(
+                WireChangePasswordContext::read_fields(reader)?,
+            ),
+            reply_kind::COMPLETE_CHANGE_PASSWORD => {
+                KeydReply::CompleteChangePassword(WireSealedReply::read_fields(reader)?)
+            }
+            reply_kind::SEAL_CHANGE_PASSWORD_ERROR => {
+                KeydReply::SealChangePasswordError(WireSealedReply::read_fields(reader)?)
             }
             reply_kind::AUTHN_FAILURE => {
                 KeydReply::AuthnFailure(reader.read_enum(authn_error_from_code)?)

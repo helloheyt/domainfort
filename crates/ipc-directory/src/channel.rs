@@ -373,6 +373,9 @@ pub mod codes {
             // R2 (docs/52 §5 item 3): the admin service's key set — the KDC
             // seals its tickets there.
             KeyPurpose::AdminService => 0x04,
+            // Task K3 (docs/53 §5.2): the change-password service's key set,
+            // appended (docs/50 §3.3).
+            KeyPurpose::ChangePasswordService => 0x05,
         }
     }
 
@@ -384,6 +387,7 @@ pub mod codes {
             0x02 => Some(KeyPurpose::Krbtgt),
             0x03 => Some(KeyPurpose::Service),
             0x04 => Some(KeyPurpose::AdminService),
+            0x05 => Some(KeyPurpose::ChangePasswordService),
             _ => None,
         }
     }

@@ -108,7 +108,10 @@ pub const MAX_DECISION_APPROVERS: u32 = 3;
 pub const MAX_DESTROY_PAGE: u32 = 64;
 
 // The bounds agree with the values they are derived from; checked at compile
-// time, never at run time.
+// time, never at run time. Task K3 (docs/questions/Q-620 item 4): the bound
+// of a password on this channel is the bound of RFC 3244's `newpasswd`, so a
+// kpasswd password and a `set_secret` password share one limit.
+const _: () = assert!(krb_proto::limits::MAX_NEWPASSWD_LEN == MAX_SECRET as usize);
 const _: () = assert!(MAX_REQUEST_FIELD as usize == kdc::MAX_REQUEST_LEN);
 const _: () = assert!(MAX_REPLY_FIELD as usize == krb_proto::limits::MAX_MESSAGE_LEN);
 const _: () = assert!(MAX_SEAL_PADATA as usize == krb_proto::limits::MAX_PADATA);
@@ -175,6 +178,19 @@ pub mod request_kind {
     /// verification, which keeps no service context. Appended by Q-523.
     /// Spec: docs/10 §5ב; docs/52 §3.4, §5; docs/questions/Q-523.
     pub const VERIFY_OPERATION_TICKET: u8 = 0x15;
+    /// `open_change_password_request` (Ldap): an RFC 3244 request's AP-REQ
+    /// and KRB-PRIV, opened and judged inside keyd. Appended by task K4.
+    /// Spec: docs/53 §5.5; docs/10 §5ג; RFC 3244 §2.
+    pub const OPEN_CHANGE_PASSWORD_REQUEST: u8 = 0x16;
+    /// `complete_change_password` (Ldap): install the context's password on
+    /// dird's decision and seal the success reply — a state call. Appended
+    /// by task K4.
+    /// Spec: docs/53 §5.5; docs/10 §5ג; docs/52 §3.10 (c) (R9).
+    pub const COMPLETE_CHANGE_PASSWORD: u8 = 0x17;
+    /// `seal_change_password_error` (Ldap): seal a non-zero result code.
+    /// Appended by task K4.
+    /// Spec: docs/53 §5.5, §5.7; docs/10 §5ג.
+    pub const SEAL_CHANGE_PASSWORD_ERROR: u8 = 0x18;
 
     /// The closed request table. Spec: docs/50 §3.3, §3.4.
     pub const ALL: &[u8] = &[
@@ -199,6 +215,9 @@ pub mod request_kind {
         SEAL_CEREMONY,
         LIST_DESTROY_DECISIONS,
         VERIFY_OPERATION_TICKET,
+        OPEN_CHANGE_PASSWORD_REQUEST,
+        COMPLETE_CHANGE_PASSWORD,
+        SEAL_CHANGE_PASSWORD_ERROR,
     ];
 }
 
@@ -260,6 +279,13 @@ pub mod reply_kind {
     /// `OperationTicket` (no context id). Spec: docs/10 §5ב;
     /// docs/questions/Q-523.
     pub const VERIFY_OPERATION_TICKET: u8 = ok(rq::VERIFY_OPERATION_TICKET);
+    /// `ChangePasswordContext` (a request-context id and a verdict).
+    /// Spec: docs/53 §5.5; docs/10 §5ג.
+    pub const OPEN_CHANGE_PASSWORD_REQUEST: u8 = ok(rq::OPEN_CHANGE_PASSWORD_REQUEST);
+    /// `SealedReply` (the success reply). Spec: docs/53 §5.5.
+    pub const COMPLETE_CHANGE_PASSWORD: u8 = ok(rq::COMPLETE_CHANGE_PASSWORD);
+    /// `SealedReply` (an error reply). Spec: docs/53 §5.5.
+    pub const SEAL_CHANGE_PASSWORD_ERROR: u8 = ok(rq::SEAL_CHANGE_PASSWORD_ERROR);
     /// A refusal of an authentication step: `keyd_types::AuthnError`.
     /// Spec: docs/10 §9; A-26; A-56.
     pub const AUTHN_FAILURE: u8 = 0xF1;
@@ -294,6 +320,9 @@ pub mod reply_kind {
         SEAL_CEREMONY,
         LIST_DESTROY_DECISIONS,
         VERIFY_OPERATION_TICKET,
+        OPEN_CHANGE_PASSWORD_REQUEST,
+        COMPLETE_CHANGE_PASSWORD,
+        SEAL_CHANGE_PASSWORD_ERROR,
         AUTHN_FAILURE,
         ISSUE_FAILURE,
         FAILURE,

@@ -18,7 +18,7 @@ use crate::config::TicketPolicy;
 use crate::error::{Deny, Internal};
 use crate::model::{KeyHandle, KeyPurpose, PrincipalBinding};
 use crate::time::{kerberos_time_seconds, within_skew};
-use keyd_types::is_admin_service_name;
+use keyd_types::{is_admin_service_name, is_change_password_service_name};
 use krb_proto::constants::KRB_NT_SRV_INST;
 use krb_proto::limits::MAX_NAME_COMPONENTS;
 use krb_proto::{KerberosFlags, KerberosString, KerberosTime, PrincipalName, Realm, TicketFlags};
@@ -80,7 +80,10 @@ impl NewBinding {
 /// - an AdminService key is bound to the admin service's two-part name
 ///   (`admind`, host — `keyd_types::is_admin_service_name`), and no other
 ///   key may be bound to such a name (R2: the same shape of reservation, for
-///   this project's own service).
+///   this project's own service);
+/// - a ChangePasswordService key is bound to exactly `kadmin/changepw`
+///   (`keyd_types::is_change_password_service_name`, RFC 3244 §2), and no
+///   other key may be bound to that name (task K3; docs/53 §5.2).
 ///
 /// Failure is `Denied` (reason `InvalidNameBinding`).
 ///
@@ -110,10 +113,18 @@ pub(crate) fn check_new_binding(
     // of every issuance and verification, A-19), and the KDC's purpose rule
     // (`KeyPurpose::of_service_name`) is enforced here too.
     let admin = is_admin_service_name(&binding.name);
+    // Task K3 (docs/53 §5.2, R53-6): the same reservation for the
+    // change-password service's name — so a kpasswd ticket is never sealed
+    // or opened under any other key set, and no other key set under its
+    // name.
+    let change_password = is_change_password_service_name(&binding.name);
     let acceptable = match purpose {
         KeyPurpose::Krbtgt => reserved && components == 2,
         KeyPurpose::AdminService => admin,
-        KeyPurpose::PrincipalLongterm | KeyPurpose::Service => !reserved && !admin,
+        KeyPurpose::ChangePasswordService => change_password,
+        KeyPurpose::PrincipalLongterm | KeyPurpose::Service => {
+            !reserved && !admin && !change_password
+        }
     };
     if acceptable {
         Ok(NewBinding {

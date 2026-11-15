@@ -109,6 +109,7 @@ use keyd_types::{
     MAX_GRANT_TARGETS,
 };
 use krb_proto::KerberosTime;
+use krb_proto::{PrincipalName, Realm};
 use std::collections::{BTreeMap, HashMap};
 
 /// One set-secret key target (module documentation).
@@ -126,17 +127,49 @@ struct SecretEntry {
     /// From the ceremony's grant (Role::Admin): an initial secret only
     /// (docs/questions/Q-451).
     initial_only: bool,
+    /// The one operation that may redeem the entry: `SetSecret` (admind, a
+    /// `DecidedOperation::SetSecret` decision or the ceremony's grant) or
+    /// `CompleteChangePassword` (keyd's kpasswd completion, a
+    /// `DecidedOperation::ChangePassword` decision). An entry is invisible to
+    /// the other operation — admind cannot redeem a decision dird made for a
+    /// user's own change, nor the reverse. Task K3 (class: a one-time
+    /// authorization meant for one executor redeemable by another; AGENTS.md
+    /// §6.1 — docs/questions/Q-662).
+    executor: Operation,
+    /// The account's name for the password policy's account-name rule: the
+    /// name of the decision's **first** target's binding — the account's
+    /// own key set (`PrincipalLongterm`, named by its sAMAccountName; docs/47
+    /// §9.1) — kept with every target, so that a computer's second
+    /// (`Service`) target, bound to its SPN, is checked against the same
+    /// account name ([MS-SAMR] 3.1.1.7.2 item 3.2.2; docs/53 §6.2). Task K3.
+    account_name: PrincipalName,
 }
 
 /// What a redeemed set-secret entry still requires of the `set_secret` that
 /// consumed it, and the decision it came from (for the record).
 /// Spec: docs/questions/Q-451 item 2; docs/52 §4.5.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Redeemed {
     /// The key set must not exist (an initial secret).
     pub(crate) initial_only: bool,
     /// The decision the entry came from.
     pub(crate) decision: Option<DecisionId>,
+    /// The account name the password policy checks the password against
+    /// (task K3; [MS-SAMR] 3.1.1.7.2 item 3.2.2).
+    pub(crate) account_name: PrincipalName,
+}
+
+/// A set-secret entry redeemed by a change-password completion (task K3):
+/// the binding and salt the install uses — **the decision's**, never the
+/// caller's — the decision id, and the account name for the policy.
+/// Spec: docs/53 §5.5 ("installs through set_secret_inner (salt from the
+/// decision ...)"), §6.2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RedeemedForClient {
+    pub(crate) binding: PrincipalBinding,
+    pub(crate) salt: String,
+    pub(crate) decision: Option<DecisionId>,
+    pub(crate) account_name: PrincipalName,
 }
 
 /// The result of an executed key-operation or destroy decision, kept until
@@ -231,12 +264,13 @@ impl DecisionTable {
         }
     }
 
-    /// Whether a live set-secret entry names `handle` at `now`. Reads only.
-    /// Spec: docs/questions/Q-450 item 1.
-    pub(crate) fn is_live_secret(&self, handle: &KeyHandle, now: i64) -> bool {
+    /// Whether a live set-secret entry that `executor` may redeem names
+    /// `handle` at `now`. Reads only.
+    /// Spec: docs/questions/Q-450 item 1; task K3 (the executor, Q-662).
+    pub(crate) fn is_live_secret(&self, handle: &KeyHandle, executor: Operation, now: i64) -> bool {
         self.secrets
             .get(handle)
-            .is_some_and(|e| now <= e.expires_at)
+            .is_some_and(|e| now <= e.expires_at && e.executor == executor)
     }
 
     /// Register one set-secret entry per target, both or none: refused (the
@@ -244,9 +278,11 @@ impl DecisionTable {
     /// beside the live entries of other handles; a live entry of the same
     /// handle is replaced. `full` is the reason of a full family.
     /// Spec: docs/questions/Q-450 items 2, 4.
+    #[allow(clippy::too_many_arguments)]
     fn register_secrets(
         &mut self,
         decision: Option<DecisionId>,
+        executor: Operation,
         targets: &[SetSecretTarget],
         expires_at: i64,
         initial_only: bool,
@@ -254,6 +290,12 @@ impl DecisionTable {
         full: AuditReason,
     ) -> Internal<()> {
         self.sweep(now);
+        // The account's own name: the first target's binding (the shape is
+        // checked by the caller — a first target always exists).
+        let account_name = targets
+            .first()
+            .map(|t| t.binding.name.clone())
+            .ok_or(Deny::denied(full))?;
         let added = targets
             .iter()
             .filter(|t| !self.secrets.contains_key(&t.handle))
@@ -270,6 +312,8 @@ impl DecisionTable {
                     salt: target.salt.clone(),
                     expires_at,
                     initial_only,
+                    executor,
+                    account_name: account_name.clone(),
                 },
             );
         }
@@ -292,7 +336,7 @@ impl DecisionTable {
         let entry = self.secrets.remove(handle);
         self.sweep(now);
         let entry = entry.ok_or(Deny::denied(AuditReason::NoGrant))?;
-        if now > entry.expires_at {
+        if now > entry.expires_at || entry.executor != Operation::SetSecret {
             return Err(Deny::denied(AuditReason::NoGrant));
         }
         if entry.binding != *binding || entry.salt != salt {
@@ -301,6 +345,48 @@ impl DecisionTable {
         Ok(Redeemed {
             initial_only: entry.initial_only,
             decision: entry.decision,
+            account_name: entry.account_name,
+        })
+    }
+
+    /// Consume the set-secret entry of `handle` for a change-password
+    /// completion of the ticket client (`crealm`, `cname`) — task K3. The
+    /// entry is removed on ANY presentation (one attempt per decision, as
+    /// for `set_secret`). No live entry for this executor (a
+    /// `DecidedOperation::ChangePassword` decision dird registered) ⇒
+    /// `NoGrant`; its binding not identifying the ticket's client (RFC 4120
+    /// 6.2 equivalence — the target is bound by keyd to the client keyd
+    /// verified, never chosen by the caller) ⇒ `GrantMismatch`. The install
+    /// then uses the entry's binding and salt.
+    /// Spec: docs/53 R53-5, R53-8, §4.3, §5.5 ("a live SetSecret decision to
+    /// the handle whose sole target carries binding ≡ (ctx.crealm,
+    /// ctx.cname) (RFC 4120 §6.2; A-19) — else Denied (GrantMismatch)");
+    /// RFC 4120 6.2; docs/questions/Q-450 item 7.
+    pub(crate) fn redeem_secret_for_client(
+        &mut self,
+        handle: &KeyHandle,
+        crealm: &Realm,
+        cname: &PrincipalName,
+        now: i64,
+    ) -> Internal<RedeemedForClient> {
+        let entry = self.secrets.remove(handle);
+        self.sweep(now);
+        let entry = entry.ok_or(Deny::denied(AuditReason::NoGrant))?;
+        if now > entry.expires_at
+            || entry.executor != Operation::CompleteChangePassword
+            || entry.decision.is_none()
+            || entry.initial_only
+        {
+            return Err(Deny::denied(AuditReason::NoGrant));
+        }
+        if !entry.binding.matches(crealm, cname) {
+            return Err(Deny::denied(AuditReason::GrantMismatch));
+        }
+        Ok(RedeemedForClient {
+            binding: entry.binding,
+            salt: entry.salt,
+            decision: entry.decision,
+            account_name: entry.account_name,
         })
     }
 
@@ -308,6 +394,20 @@ impl DecisionTable {
     /// the record of the `set_secret` that will consume it).
     pub(crate) fn secret_decision(&self, handle: &KeyHandle) -> Option<DecisionId> {
         self.secrets.get(handle).and_then(|e| e.decision)
+    }
+
+    /// The decision id of the set-secret entry of `handle` that `executor`
+    /// may redeem, if any (task K3, Q-662: an operation's record never names
+    /// a decision meant for the other executor).
+    pub(crate) fn secret_decision_for(
+        &self,
+        handle: &KeyHandle,
+        executor: Operation,
+    ) -> Option<DecisionId> {
+        self.secrets
+            .get(handle)
+            .filter(|e| e.executor == executor)
+            .and_then(|e| e.decision)
     }
 
     /// Drop the set-secret entry of `handle`, if any (its key set was
@@ -503,8 +603,11 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
 
     /// The decision id of the live set-secret entry naming `handle`, if any
     /// (`None` also for the ceremony's grant, which has no id) — for the
-    /// daemon's intent record of the `set_secret` that will consume it
-    /// (docs/52 §4.5). Reads only; not secret.
+    /// daemon's intent record of the `set_secret` (or, task K3, the
+    /// `complete_change_password`) that will consume it (docs/52 §4.5). The
+    /// daemon asks only after keyd's authorization step admitted the call,
+    /// so the entry is the call's own executor's (Q-662). Reads only; not
+    /// secret.
     #[must_use]
     pub fn secret_decision(&self, handle: &KeyHandle) -> Option<DecisionId> {
         self.decisions.secret_decision(handle)
@@ -627,7 +730,21 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         match operation {
             DecidedOperation::SetSecret { targets, .. } => self.decisions.register_secrets(
                 Some(id),
+                Operation::SetSecret,
                 targets,
+                expires_at,
+                false,
+                now_s,
+                AuditReason::DecisionTableFull,
+            ),
+            // Task K3: a user's own change (dird after the PDP allowed
+            // User-Change-Password on the account itself) — redeemable only
+            // by keyd's completion of that user's request (docs/53 §4.4,
+            // §5.5; Q-662).
+            DecidedOperation::ChangePassword { target } => self.decisions.register_secrets(
+                Some(id),
+                Operation::CompleteChangePassword,
+                core::slice::from_ref(target),
                 expires_at,
                 false,
                 now_s,
@@ -737,6 +854,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             .ok_or(Deny::denied(AuditReason::GrantInvalid))?;
         self.decisions.register_secrets(
             None,
+            Operation::SetSecret,
             targets,
             expires_at,
             true,
@@ -1018,14 +1136,23 @@ mod tests {
         let full = AuditReason::DecisionTableFull;
         let id = Some(DecisionId::new(9));
         assert!(t
-            .register_secrets(id, std::slice::from_ref(&a), 10, false, 0, full)
+            .register_secrets(
+                id,
+                Operation::SetSecret,
+                std::slice::from_ref(&a),
+                10,
+                false,
+                0,
+                full
+            )
             .is_ok());
         assert_eq!(t.secret_decision(&a.handle), id);
         assert_eq!(
             t.redeem_secret(&a.handle, &a.binding, &a.salt, 10),
             Ok(Redeemed {
                 initial_only: false,
-                decision: id
+                decision: id,
+                account_name: a.binding.name.clone(),
             })
         );
         assert_eq!(
@@ -1035,17 +1162,33 @@ mod tests {
         );
         // Another salt (N4).
         assert!(t
-            .register_secrets(id, std::slice::from_ref(&a), 10, false, 0, full)
+            .register_secrets(
+                id,
+                Operation::SetSecret,
+                std::slice::from_ref(&a),
+                10,
+                false,
+                0,
+                full
+            )
             .is_ok());
         assert_eq!(
             t.redeem_secret(&a.handle, &a.binding, "EXAMPLE.ORGother", 1)
                 .map_err(|d| d.reason),
             Err(AuditReason::GrantMismatch)
         );
-        assert!(!t.is_live_secret(&a.handle, 1));
+        assert!(!t.is_live_secret(&a.handle, Operation::SetSecret, 1));
         // Expired.
         assert!(t
-            .register_secrets(None, std::slice::from_ref(&a), 10, true, 0, full)
+            .register_secrets(
+                None,
+                Operation::SetSecret,
+                std::slice::from_ref(&a),
+                10,
+                true,
+                0,
+                full
+            )
             .is_ok());
         assert_eq!(
             t.redeem_secret(&a.handle, &a.binding, &a.salt, 11)
@@ -1053,6 +1196,94 @@ mod tests {
             Err(AuditReason::NoGrant)
         );
         assert_eq!(t.len(), 0);
+    }
+
+    /// docs/53 §5.5 (task K3): a change-password completion redeems only a
+    /// `ChangePassword` decision whose target's binding identifies the
+    /// ticket's client (RFC 4120 6.2: the name-type is ignored); a decision
+    /// for another principal is refused (and consumed); an admin-plane
+    /// `SetSecret` decision or the ceremony's grant is invisible to it — and
+    /// a `ChangePassword` decision is invisible to `set_secret` (Q-662). The
+    /// redemption hands back the decision's binding and salt.
+    #[test]
+    fn a_completion_redeems_only_the_clients_own_user_decision() {
+        let mut t = DecisionTable::new();
+        let full = AuditReason::DecisionTableFull;
+        let id = Some(DecisionId::new(11));
+        let carol = target(3, KeyPurpose::PrincipalLongterm, "carol");
+        let realm = carol.binding.realm.clone();
+        let mut cname = carol.binding.name.clone();
+        cname.name_type = 0; // a hint only (RFC 4120 6.2)
+        let change = Operation::CompleteChangePassword;
+        assert!(t
+            .register_secrets(id, change, std::slice::from_ref(&carol), 10, false, 0, full)
+            .is_ok());
+        assert!(t.is_live_secret(&carol.handle, change, 1));
+        assert!(!t.is_live_secret(&carol.handle, Operation::SetSecret, 1));
+        assert_eq!(
+            t.redeem_secret(&carol.handle, &carol.binding, &carol.salt, 1)
+                .map_err(|d| d.reason),
+            Err(AuditReason::NoGrant)
+        );
+        assert!(t
+            .register_secrets(id, change, std::slice::from_ref(&carol), 10, false, 0, full)
+            .is_ok());
+        assert_eq!(
+            t.redeem_secret_for_client(&carol.handle, &realm, &cname, 1),
+            Ok(RedeemedForClient {
+                binding: carol.binding.clone(),
+                salt: carol.salt.clone(),
+                decision: id,
+                account_name: carol.binding.name.clone(),
+            })
+        );
+        let refused = |t: &mut DecisionTable, name: &PrincipalName| {
+            t.redeem_secret_for_client(&carol.handle, &realm, name, 1)
+                .map_err(|d| d.reason)
+        };
+        // Consumed: no second redemption.
+        assert_eq!(refused(&mut t, &cname), Err(AuditReason::NoGrant));
+        // A decision whose target is another principal's name.
+        let mallory = target(3, KeyPurpose::PrincipalLongterm, "mallory");
+        assert!(t
+            .register_secrets(
+                id,
+                change,
+                std::slice::from_ref(&mallory),
+                10,
+                false,
+                0,
+                full
+            )
+            .is_ok());
+        assert_eq!(refused(&mut t, &cname), Err(AuditReason::GrantMismatch));
+        assert!(!t.is_live_secret(&carol.handle, change, 1));
+        // An admin-plane decision for carol herself: not for this executor.
+        assert!(t
+            .register_secrets(
+                id,
+                Operation::SetSecret,
+                std::slice::from_ref(&carol),
+                10,
+                false,
+                0,
+                full
+            )
+            .is_ok());
+        assert_eq!(refused(&mut t, &cname), Err(AuditReason::NoGrant));
+        // The ceremony's initial-secret grant (no decision id).
+        assert!(t
+            .register_secrets(
+                None,
+                Operation::SetSecret,
+                std::slice::from_ref(&carol),
+                10,
+                true,
+                0,
+                full
+            )
+            .is_ok());
+        assert_eq!(refused(&mut t, &cname), Err(AuditReason::NoGrant));
     }
 
     /// docs/52 §4.3: the same decision registered twice changes nothing; a

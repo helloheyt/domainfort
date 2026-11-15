@@ -42,6 +42,9 @@
 //! | `0x13` | `seal_ceremony` (A-102) | Admin | `0x93` `()` | `0xF3` |
 //! | `0x14` | `list_destroy_decisions` (A-102) | Admin | `0x94` `DestructionPage` | `0xF3` |
 //! | `0x15` | `verify_operation_ticket(principal, operation digest)` (Q-523: keeps no context) | Ldap | `0x95` `OperationTicket` (no context id) | `0xF1` |
+//! | `0x16` | `open_change_password_request(principal, AP-REQ, KRB-PRIV, peer, local)` (task K4) | Ldap | `0x96` `ChangePasswordContext` (context id, verdict) | `0xF1` |
+//! | `0x17` | `complete_change_password(ctx, target)` (task K4; a state call) | Ldap | `0x97` `SealedReply` | `0xF3` |
+//! | `0x18` | `seal_change_password_error(ctx, code ≠ 0)` (task K4) | Ldap | `0x98` `SealedReply` | `0xF3` |
 //! | — | (any) | — | `0xFF` shared `Refused` (A-59) | — |
 //!
 //! No request carries a role: keyd checks the caller's role from the
@@ -83,7 +86,11 @@
 //! kind ([`IssuanceCall`] / [`StateCall`], from keyd-types' one table) and
 //! removed `Connection::check_idle`'s default, from docs/52 §2 rows 18, 19,
 //! 24, §3.10, §3.12, §7 R9, docs/questions Q-312, Q-350, Q-370, Q-403,
-//! Q-466 and PENDING-OWNER A-82, A-90, A-94, A-102.
+//! Q-466 and PENDING-OWNER A-82, A-90, A-94, A-102. Task K4 appended the
+//! three change-password operations (`0x16`-`0x18`, replies `0x96`-`0x98`),
+//! purpose code 5 and decided-operation code 6 from docs/53 §5.5, §5.7,
+//! docs/50 §3.3, RFC 3244 §2 and RFC 4120 §7.1 (pinned, SHA-256 verified),
+//! docs/questions Q-601, Q-604, Q-620, Q-661; `KEYD_VERSION` stays 1.
 //!
 //! Spec: docs/50 §3, §10 (P5); R50-3, R50-4, R50-5, R50-7, R50-8; docs/10;
 //! A-56; A-59; A-62; D182; A-63; A-87; A-88; docs/52 §7 R9 (A-102).
@@ -121,3 +128,9 @@ pub use keyd_types::{
 // The operation-bound verification's argument and answer (Q-523), for its
 // caller (dird).
 pub use keyd_types::{OperationDigest, OperationTicket};
+// The change-password operations' arguments and answers (task K4), for
+// their caller (dird).
+pub use keyd_types::{
+    ChangePasswordContext, ChangePasswordCtxId, ChangePasswordVerdict, HostAddr, SealedReply,
+};
+pub use krb_proto::NonZeroResultCode;

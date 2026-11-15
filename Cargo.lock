@@ -674,6 +674,7 @@ dependencies = [
 name = "keyd"
 version = "0.0.0"
 dependencies = [
+ "admin-password-policy",
  "keyd-types",
  "krb-crypto",
  "krb-proto",

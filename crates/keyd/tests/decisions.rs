@@ -482,7 +482,7 @@ fn the_seal_ends_the_ceremony() {
             &DIRECTORY,
             &CAROL,
             &carol_binding(),
-            z("carol's first password"),
+            z("her first passphrase"),
             CAROL_SALT,
             &now()
         ),
@@ -656,8 +656,14 @@ fn a_destroy_decision_removes_both_key_sets() {
             (service, service_binding.clone()),
         ] {
             assert_eq!(
-                f.keyd
-                    .set_secret(&DIRECTORY, &handle, &binding, z("machine"), salt, &now()),
+                f.keyd.set_secret(
+                    &DIRECTORY,
+                    &handle,
+                    &binding,
+                    z("machine-passphrase-01"),
+                    salt,
+                    &now()
+                ),
                 Ok(Kvno::INITIAL),
                 "round {round}"
             );
@@ -787,7 +793,7 @@ fn a_destroy_registration_discards_the_principals_set_secret_decisions() {
             &DIRECTORY,
             &CAROL,
             &carol_binding(),
-            z("carol's first password"),
+            z("her first passphrase"),
             CAROL_SALT,
             &now()
         ),
@@ -801,7 +807,7 @@ fn a_destroy_registration_discards_the_principals_set_secret_decisions() {
         f.records()[f.records().len() - 1].reason,
         AuditReason::KeyNotFound
     );
-    assert!(!f.password_works(&CAROL, "carol's first password", CAROL_SALT));
+    assert!(!f.password_works(&CAROL, "her first passphrase", CAROL_SALT));
 
     // A computer: both handles' entries go, two records (PrincipalLongterm,
     // then Service).
@@ -962,7 +968,7 @@ fn the_n1_takeover_is_refused_at_every_step() {
                 &DIRECTORY,
                 &ALICE,
                 &alice_binding(),
-                z("alice's next password"),
+                z("her next passphrase"),
                 ALICE_SALT,
                 &now()
             ),

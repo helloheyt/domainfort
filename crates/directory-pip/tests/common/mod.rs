@@ -69,7 +69,9 @@ pub const EXPIRES_2026: i64 = 134_116_992_000_000_000;
 pub const NOW_PLUS_30_FILETIME: i64 = 134_390_376_300_000_000;
 
 /// Passwords of the round-trip accounts (test data).
-pub const ALICE_PASSWORD: &str = "alice-directory-pip-pass";
+/// (Task K3: keyd's password policy — no account name inside, [MS-SAMR]
+/// 3.1.1.7.2 item 3.2.2.)
+pub const ALICE_PASSWORD: &str = "first-directory-pip-pass";
 pub const WS01_PASSWORD: &str = "ws01-machine-secret-for-tests";
 
 /// The standard objects' small ids (GUID = guid(id)) and RIDs.

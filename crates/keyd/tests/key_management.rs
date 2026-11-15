@@ -176,7 +176,7 @@ fn create_key_validates_binding() {
             &DIRECTORY,
             &carol,
             &krbtgt_binding(),
-            z("pw"),
+            z("first passphrase-1"),
             "EXAMPLE.ORGcarol",
             &now()
         ),
@@ -203,7 +203,7 @@ fn set_secret_cannot_rebind() {
             &DIRECTORY,
             &ALICE,
             &bob_binding(),
-            z("pw2"),
+            z("second passphrase-2"),
             ALICE_SALT,
             &now()
         ),
@@ -236,8 +236,14 @@ fn set_secret_cannot_rebind() {
     same.name.name_type = KRB_NT_UNKNOWN;
     f.grant(&ALICE, &same, ALICE_SALT, &now()).unwrap();
     assert_eq!(
-        f.keyd
-            .set_secret(&DIRECTORY, &ALICE, &same, z("pw3"), ALICE_SALT, &now()),
+        f.keyd.set_secret(
+            &DIRECTORY,
+            &ALICE,
+            &same,
+            z("third passphrase-3"),
+            ALICE_SALT,
+            &now()
+        ),
         Ok(Kvno::new(2))
     );
 }
@@ -464,7 +470,7 @@ fn set_secret_rules() {
             &DIRECTORY,
             &ALICE,
             &alice_binding(),
-            z("x"),
+            z("an unused passphrase"),
             ALICE_SALT,
             &now()
         ),
@@ -485,7 +491,7 @@ fn set_secret_rules() {
             &DIRECTORY,
             &carol,
             &carol_binding,
-            z("x"),
+            z("an unused passphrase"),
             "EXAMPLE.ORGcarol",
             &now()
         ),
@@ -496,7 +502,7 @@ fn set_secret_rules() {
             &DIRECTORY,
             &KRBTGT,
             &krbtgt_binding(),
-            z("x"),
+            z("an unused passphrase"),
             "salt",
             &now()
         ),

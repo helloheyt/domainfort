@@ -1,7 +1,8 @@
 #![no_main]
 //! Fuzz target for the keyd channel's client-side reply decoding: the first
 //! input octet picks the operation that was called (one of keyd's
-//! twenty-one — `grant_set_secret`, task A15a, included: its success reply
+//! twenty-four — the three change-password operations of task K4 included;
+//! `grant_set_secret`, task A15a, included: its success reply
 //! carries no payload; and A-102's `register_decision`, `seal_ceremony`,
 //! `list_destroy_decisions`, whose page is bounded by `MAX_DESTROY_PAGE`),
 //! the rest is the reply body, decoded as `KeydClient` decodes it —
@@ -20,6 +21,9 @@
 //! reply ends in the one-value octet `00` (no operation: the unbound
 //! verification), and a decoded `OperationTicket` reply ends in the 32
 //! digest octets it names (Q-523: the operation-bound answer, no context).
+//! A decoded `ChangePasswordContext` reply (task K4) ends in its verdict's
+//! code, from the closed table 0x01-0x05; a decoded `SealedReply` carries a
+//! strict AP-REP and a strict KRB-PRIV.
 //!
 //! Written, not run (PENDING-OWNER P-1).
 //!
@@ -78,6 +82,16 @@ fuzz_target!(|data: &[u8]| {
                 if let Answer::VerifyOperationTicket(Ok(ticket)) = &answer {
                     let digest = ticket.operation.as_bytes();
                     assert!(body.ends_with(digest), "the verified digest, last");
+                }
+                if let Answer::OpenChangePasswordRequest(Ok(context)) = &answer {
+                    let code = match context.verdict {
+                        keyd::ChangePasswordVerdict::Acceptable => 0x01,
+                        keyd::ChangePasswordVerdict::Malformed => 0x02,
+                        keyd::ChangePasswordVerdict::InitialFlagNeeded => 0x03,
+                        keyd::ChangePasswordVerdict::SetNotSupported => 0x04,
+                        keyd::ChangePasswordVerdict::PasswordRefused => 0x05,
+                    };
+                    assert_eq!(body.last(), Some(&code), "the verdict, last");
                 }
                 if let Answer::ListDestroyDecisions(Ok(page)) = &answer {
                     assert!(

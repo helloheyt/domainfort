@@ -135,21 +135,28 @@ impl ArmorOpened {
 }
 
 /// What a service AP-REQ's application binding verified (R2, docs/52 §5):
-/// nothing for an unbound verification (the LDAP front: no `cksum`), or the
-/// operation digest whose MIC verified (dird's admin channel).
+/// nothing for an unbound verification (the LDAP front: no `cksum`), the
+/// operation digest whose MIC verified (dird's admin channel), or — a
+/// change-password request (task K3) — the KRB-PRIV decrypted under the
+/// Authenticator's subkey (RFC 3244 §2; key usage 13).
 #[derive(Debug)]
 pub(crate) enum BindingEvidence {
     /// No application data to bind (the `cksum` was absent, as required).
     Unbound,
     /// The `cksum` verified over this operation digest (key usage 10).
     OperationDigest(OperationDigest, MicVerified),
+    /// The accompanying KRB-PRIV decrypted under this AP-REQ's subkey (key
+    /// usage 13) — the operation binding of a change-password request
+    /// (docs/53 §5.4 item 1): a KRB-PRIV made under another AP-REQ's subkey
+    /// does not decrypt.
+    KrbPriv(Decrypted),
 }
 
 impl BindingEvidence {
     /// The operation digest the `cksum` verified over, if any.
     pub(crate) fn digest(&self) -> Option<OperationDigest> {
         match self {
-            BindingEvidence::Unbound => None,
+            BindingEvidence::Unbound | BindingEvidence::KrbPriv(_) => None,
             BindingEvidence::OperationDigest(digest, _) => Some(*digest),
         }
     }
@@ -250,10 +257,13 @@ impl ChainVerified {
         ChainVerified(())
     }
 
-    /// `open_and_verify_service_ticket`: the service ticket and its
+    /// `open_and_verify_service_ticket`, `verify_operation_ticket` and
+    /// `open_change_password_request`: the service ticket and its
     /// authenticator opened, and the application binding as required (R2:
-    /// the operation digest's MIC, usage 10, before the replay cache).
-    /// Spec: RFC 4120 3.2.3, 5.5.1, 7.5.1 item 10; docs/52 §5; A-26.
+    /// the operation digest's MIC, usage 10; K3: the KRB-PRIV under the
+    /// subkey, usage 13 — each before the replay cache).
+    /// Spec: RFC 4120 3.2.3, 5.5.1, 7.5.1 items 10, 13; RFC 3244 §2; docs/52
+    /// §5; docs/53 §5.3, §5.4; A-26.
     pub(crate) fn service_ticket(_ap_req: ApReqOpened, _binding: BindingEvidence) -> ChainVerified {
         ChainVerified(())
     }

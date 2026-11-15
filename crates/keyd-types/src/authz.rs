@@ -149,11 +149,37 @@ pub enum Operation {
     /// Spec: RFC 4120 3.2.3, 5.5.1, 7.5.1 item 10; docs/10 §5ב; docs/52
     /// §3.4 (C4), §5; docs/questions/Q-387 item 4, Q-493 item 3, Q-523.
     VerifyOperationTicket = 20,
+    /// Open an RFC 3244 change-password request: the AP-REQ for
+    /// `kadmin/changepw` verified by the **same** core as the two
+    /// service-ticket verifications (RFC 4120 3.2.3 under the
+    /// ChangePasswordService key set; a subkey and a sequence number
+    /// required, no `cksum`), the KRB-PRIV decrypted under the subkey (key
+    /// usage 13) and its control information checked, the ChangePasswdData
+    /// judged — and a one-time request context returned, with no password
+    /// leaving keyd. Role::Ldap (dird). Appended by task K3.
+    /// Spec: RFC 3244 §2; RFC 4120 3.2.3, 3.5.2, 5.7.1, 7.5.1; docs/53 R53-7,
+    /// §5.3-§5.5; docs/questions/Q-601 item 2 (A-117).
+    OpenChangePasswordRequest = 21,
+    /// Complete a change-password request: on a live `SetSecret` decision
+    /// whose one target is the ticket's own client (bound by keyd), install
+    /// the context's password through the same install function as
+    /// `set_secret`, then seal the success reply (AP-REP + KRB-PRIV with
+    /// result code 0). Consumes the context. A key-state change. Role::Ldap
+    /// (dird). Appended by task K3.
+    /// Spec: RFC 3244 §2; RFC 4120 3.2.4, 5.5.2, 5.7.1; docs/53 R53-5, R53-7,
+    /// §4.4, §5.5; docs/questions/Q-601 items 2, 5 (A-117).
+    CompleteChangePassword = 22,
+    /// Seal a change-password error reply (AP-REP + KRB-PRIV carrying a
+    /// non-zero result code, no result string). Consumes the context.
+    /// Role::Ldap (dird). Appended by task K3.
+    /// Spec: RFC 3244 §2; docs/53 R53-7, R53-11, §5.5, §5.7; docs/questions/
+    /// Q-604 (A-117).
+    SealChangePasswordError = 23,
 }
 
 impl Operation {
     /// Every operation, for exhaustive checks. Spec: docs/10 §2.
-    pub const ALL: [Operation; 21] = [
+    pub const ALL: [Operation; 24] = [
         Operation::VerifyPreauth,
         Operation::IssueAsRep,
         Operation::OpenAndVerifyTgt,
@@ -175,6 +201,9 @@ impl Operation {
         Operation::SealCeremony,
         Operation::ListDestroyDecisions,
         Operation::VerifyOperationTicket,
+        Operation::OpenChangePasswordRequest,
+        Operation::CompleteChangePassword,
+        Operation::SealChangePasswordError,
     ];
 }
 
@@ -204,7 +233,12 @@ impl Operation {
 /// state changed). Q-523: Ldap's service-ticket verification is two
 /// operations, one per binding — `OpenAndVerifyServiceTicket` (unbound, the
 /// LDAP front; keeps a service context) and `VerifyOperationTicket` (bound
-/// to an operation digest, dird's admin channel; keeps none).
+/// to an operation digest, dird's admin channel; keeps none). Task K3
+/// (docs/53 R53-7, §4.5; Q-601 items 2, 5, A-117): Ldap (dird) also holds the
+/// three change-password operations — `OpenChangePasswordRequest`,
+/// `CompleteChangePassword` (a key-state change, so `requires_decision`: it
+/// redeems a `SetSecret` decision dird itself registered, and the C1 pin now
+/// covers every role) and `SealChangePasswordError`.
 pub const CAPABILITY_TABLE: [(Role, &[Operation]); 4] = [
     (
         Role::Kdc,
@@ -243,6 +277,9 @@ pub const CAPABILITY_TABLE: [(Role, &[Operation]); 4] = [
             Operation::ListDestroyDecisions,
             Operation::DescribeConfig,
             Operation::Ping,
+            Operation::OpenChangePasswordRequest,
+            Operation::CompleteChangePassword,
+            Operation::SealChangePasswordError,
         ],
     ),
 ];
@@ -281,7 +318,10 @@ pub const fn provisioning_only(op: Operation) -> bool {
         | Operation::Ping
         | Operation::RegisterDecision
         | Operation::SealCeremony
-        | Operation::ListDestroyDecisions => false,
+        | Operation::ListDestroyDecisions
+        | Operation::OpenChangePasswordRequest
+        | Operation::CompleteChangePassword
+        | Operation::SealChangePasswordError => false,
     }
 }
 
@@ -289,13 +329,17 @@ pub const fn provisioning_only(op: Operation) -> bool {
 /// (`register_decision`): `set_secret` (matched by handle, binding and
 /// salt), and Role::Admin's `rotate_key`, `rotate_krbtgt`, `retire_kvno`
 /// and `destroy_key_set` (named by decision id; keyd runs the **registered**
-/// parameters, never the caller's). No decision ⇒ the uniform `Denied` at
-/// the authorization step (`NoDecision` / `NoGrant`).
+/// parameters, never the caller's), and Role::Ldap's
+/// `complete_change_password` (task K3: a `SetSecret` decision for the
+/// target handle whose one target's binding is the ticket's client — keyd
+/// binds it, docs/53 §5.5). No decision ⇒ the uniform `Denied` at the
+/// authorization step (`NoDecision` / `NoGrant`).
 ///
 /// The match is exhaustive: a new operation does not compile until it is
 /// decided here.
 ///
-/// Spec: docs/52 §3.1 (C1), §4.2, §7 R1; docs/questions/Q-460 (A-102).
+/// Spec: docs/52 §3.1 (C1), §4.2, §7 R1; docs/questions/Q-460 (A-102);
+/// docs/53 §4.5; docs/questions/Q-601 item 5 (A-117).
 #[must_use]
 pub const fn requires_decision(op: Operation) -> bool {
     match op {
@@ -303,7 +347,8 @@ pub const fn requires_decision(op: Operation) -> bool {
         | Operation::RotateKey
         | Operation::RotateKrbtgt
         | Operation::RetireKvno
-        | Operation::DestroyKeySet => true,
+        | Operation::DestroyKeySet
+        | Operation::CompleteChangePassword => true,
         Operation::VerifyPreauth
         | Operation::IssueAsRep
         | Operation::OpenAndVerifyTgt
@@ -319,7 +364,9 @@ pub const fn requires_decision(op: Operation) -> bool {
         | Operation::GrantSetSecret
         | Operation::RegisterDecision
         | Operation::SealCeremony
-        | Operation::ListDestroyDecisions => false,
+        | Operation::ListDestroyDecisions
+        | Operation::OpenChangePasswordRequest
+        | Operation::SealChangePasswordError => false,
     }
 }
 
@@ -340,9 +387,15 @@ pub const fn requires_decision(op: Operation) -> bool {
 /// The match is exhaustive: a new operation does not compile until it is
 /// classified here.
 ///
+/// `complete_change_password` (task K3) installs a password-derived key
+/// version through the same install function as `set_secret`: key state.
+/// `open_change_password_request` and `seal_change_password_error` touch
+/// only the replay cache and the request-context table (bookkeeping).
+///
 /// Spec: docs/10 §6 (`set_secret`), §7 (`create_key`, `rotate_key`,
 /// `rotate_krbtgt`, `retire_kvno`, `destroy_key_set`), §10;
-/// docs/questions/Q-346 (A-86), Q-466 item 3 (A-102).
+/// docs/questions/Q-346 (A-86), Q-466 item 3 (A-102); docs/53 §4.4, §9
+/// ("`complete_change_password` — intent + outcome (`changes_key_state`)").
 #[must_use]
 pub const fn changes_key_state(op: Operation) -> bool {
     match op {
@@ -351,7 +404,8 @@ pub const fn changes_key_state(op: Operation) -> bool {
         | Operation::RotateKey
         | Operation::RotateKrbtgt
         | Operation::RetireKvno
-        | Operation::DestroyKeySet => true,
+        | Operation::DestroyKeySet
+        | Operation::CompleteChangePassword => true,
         Operation::VerifyPreauth
         | Operation::IssueAsRep
         | Operation::OpenAndVerifyTgt
@@ -366,7 +420,9 @@ pub const fn changes_key_state(op: Operation) -> bool {
         | Operation::GrantSetSecret
         | Operation::RegisterDecision
         | Operation::SealCeremony
-        | Operation::ListDestroyDecisions => false,
+        | Operation::ListDestroyDecisions
+        | Operation::OpenChangePasswordRequest
+        | Operation::SealChangePasswordError => false,
     }
 }
 
@@ -405,7 +461,10 @@ pub const fn loosens_authorization(op: Operation) -> bool {
         | Operation::DescribeConfig
         | Operation::Ping
         | Operation::SealCeremony
-        | Operation::ListDestroyDecisions => false,
+        | Operation::ListDestroyDecisions
+        | Operation::OpenChangePasswordRequest
+        | Operation::CompleteChangePassword
+        | Operation::SealChangePasswordError => false,
     }
 }
 
@@ -454,13 +513,18 @@ pub const fn requires_acknowledged_intent(op: Operation) -> bool {
 /// decision operations (`register_decision`, `seal_ceremony`,
 /// `list_destroy_decisions`, A-102): the decision table is lost at a start
 /// like the grant table (stricter); the ceremony state restarts as
-/// `Provisioning` only for an empty store — docs/52 §4.4 (P-17).
+/// `Provisioning` only for an empty store — docs/52 §4.4 (P-17). Held too
+/// (task K3; docs/53 §5.3, §5.8): the three change-password operations —
+/// `open_change_password_request` enters the shared replay cache and
+/// creates a request context; `complete_change_password` and
+/// `seal_change_password_error` consume one (the issuance / error steps of
+/// that exchange, like `issue_tgs_rep` / `seal_fast_error`).
 ///
 /// The match is exhaustive: a new operation does not compile until it is
 /// decided here.
 ///
 /// Spec: RFC 4120 3.2.3; docs/50 R50-6, §3.5, §7.5; docs/questions/Q-222
-/// (A-56), Q-240 (A-62).
+/// (A-56), Q-240 (A-62); docs/53 §5.3 (A-117).
 pub const fn startup_hold_down_applies(op: Operation) -> bool {
     match op {
         Operation::VerifyPreauth
@@ -470,7 +534,10 @@ pub const fn startup_hold_down_applies(op: Operation) -> bool {
         | Operation::OpenFastArmor
         | Operation::SealFastError
         | Operation::OpenAndVerifyServiceTicket
-        | Operation::VerifyOperationTicket => true,
+        | Operation::VerifyOperationTicket
+        | Operation::OpenChangePasswordRequest
+        | Operation::CompleteChangePassword
+        | Operation::SealChangePasswordError => true,
         Operation::SetSecret
         | Operation::VerifySecret
         | Operation::CreateKey
@@ -559,15 +626,27 @@ pub enum HandleSlot {
 ///   `rotate_krbtgt` (dual control, docs/10 §7); the admin service key is
 ///   drawn by keyd and never password-derived either (R2: no Role::Directory
 ///   `set_secret` can replace the key admin tickets are verified under —
-///   the A-50 / Q-180 item 4 rule as a purpose).
-/// - `rotate_key`: PrincipalLongterm, Service or AdminService.
+///   the A-50 / Q-180 item 4 rule as a purpose); nor is the change-password
+///   service key (docs/53 §4.5, A-117).
+/// - `rotate_key`: PrincipalLongterm, Service or AdminService — never
+///   ChangePasswordService (docs/53 §4.5; Q-601 item 4: "never `set_secret`
+///   / grant / destroy / `rotate_key` targets").
 /// - `destroy_key_set`: PrincipalLongterm or Service — never Krbtgt (A-35),
-///   never AdminService (a destroy decision names a deleted account's
-///   PrincipalLongterm and Service key sets only).
+///   never AdminService or ChangePasswordService (a destroy decision names a
+///   deleted account's PrincipalLongterm and Service key sets only).
 /// - `rotate_krbtgt`: Krbtgt.
 /// - `create_key`, `retire_kvno`: any phase-1 purpose (docs/10 §7:
 ///   create_key also initializes krbtgt; the ceremony draws the admin
-///   service key, docs/51 §4.3 step 11).
+///   service key, docs/51 §4.3 step 11, and the change-password service key,
+///   docs/53 §5.2).
+/// - `open_change_password_request`: ChangePasswordService only — the
+///   purpose of `AppBinding::ChangePassword`; no other operation opens a
+///   ticket under that key set (docs/53 §4.5, pinned below).
+/// - `complete_change_password`: PrincipalLongterm only — the target is a
+///   user's password key set (docs/53 R53-1: users only; the decision's
+///   one target).
+/// - `seal_change_password_error` takes no handle (the request context is
+///   its authority), so no slot of it is permitted.
 /// - `grant_set_secret`: PrincipalLongterm first (every account's password
 ///   key set), Service second (a computer's service key set) — the targets
 ///   dird's `BeginPasswordSet` returns (docs/51 §5.2 row 5, §7.3). Never
@@ -578,13 +657,17 @@ pub enum HandleSlot {
 /// docs/questions/Q-115 (A-35), Q-165 item 3 (A-46), Q-450 item 2, Q-463
 /// item 4 (A-102; docs/52 §5 item 3), Q-523.
 pub const fn purpose_permitted(op: Operation, slot: HandleSlot, purpose: KeyPurpose) -> bool {
-    use KeyPurpose::{AdminService, Krbtgt, PrincipalLongterm, Service};
+    use KeyPurpose::{AdminService, ChangePasswordService, Krbtgt, PrincipalLongterm, Service};
     match (op, slot) {
         (Operation::IssueTgsRep, HandleSlot::Primary) => matches!(purpose, Service | AdminService),
         (Operation::OpenAndVerifyServiceTicket, HandleSlot::Primary) => matches!(purpose, Service),
         (Operation::VerifyOperationTicket, HandleSlot::Primary) => matches!(purpose, AdminService),
+        (Operation::OpenChangePasswordRequest, HandleSlot::Primary) => {
+            matches!(purpose, ChangePasswordService)
+        }
         (Operation::VerifyPreauth, HandleSlot::Primary)
-        | (Operation::IssueAsRep, HandleSlot::Primary) => {
+        | (Operation::IssueAsRep, HandleSlot::Primary)
+        | (Operation::CompleteChangePassword, HandleSlot::Primary) => {
             matches!(purpose, PrincipalLongterm)
         }
         (Operation::IssueAsRep, HandleSlot::Krbtgt)
@@ -601,7 +684,10 @@ pub const fn purpose_permitted(op: Operation, slot: HandleSlot, purpose: KeyPurp
         }
         (Operation::CreateKey, HandleSlot::Primary)
         | (Operation::RetireKvno, HandleSlot::Primary) => {
-            matches!(purpose, PrincipalLongterm | Service | Krbtgt | AdminService)
+            matches!(
+                purpose,
+                PrincipalLongterm | Service | Krbtgt | AdminService | ChangePasswordService
+            )
         }
         (Operation::GrantSetSecret, HandleSlot::Primary) => matches!(purpose, PrincipalLongterm),
         (Operation::GrantSetSecret, HandleSlot::Secondary) => matches!(purpose, Service),
@@ -682,9 +768,11 @@ const _: () = {
     // `Ldap` may call open_and_verify_service_ticket and — docs/50 §3.4 —
     // describe_config and ping, and — docs/52 §4.2, A-102 —
     // register_decision, and — task R6, A-105 — list_destroy_decisions (a
-    // read of its own registrations), and nothing else; no other role may call
+    // read of its own registrations), and — task K3, A-117 — the three
+    // change-password operations, and nothing else; no other role may call
     // either service-ticket verification (Q-523: the unbound one opens only
-    // Service-purpose handles, the operation-bound one only AdminService).
+    // Service-purpose handles, the operation-bound one only AdminService) or
+    // any change-password operation.
     let mut i = 0;
     while i < Operation::ALL.len() {
         let op = Operation::ALL[i];
@@ -694,10 +782,14 @@ const _: () = {
             op as u8 == Operation::DescribeConfig as u8 || op as u8 == Operation::Ping as u8;
         let is_decision = op as u8 == Operation::RegisterDecision as u8
             || op as u8 == Operation::ListDestroyDecisions as u8;
+        let is_change_password = op as u8 == Operation::OpenChangePasswordRequest as u8
+            || op as u8 == Operation::CompleteChangePassword as u8
+            || op as u8 == Operation::SealChangePasswordError as u8;
         assert!(
-            role_permits(Role::Ldap, op) == (is_service_ticket || is_daemon_support || is_decision)
+            role_permits(Role::Ldap, op)
+                == (is_service_ticket || is_daemon_support || is_decision || is_change_password)
         );
-        if is_service_ticket {
+        if is_service_ticket || is_change_password {
             assert!(!role_permits(Role::Kdc, op));
             assert!(!role_permits(Role::Directory, op));
             assert!(!role_permits(Role::Admin, op));
@@ -720,6 +812,7 @@ const _: () = {
         KeyPurpose::Krbtgt,
         KeyPurpose::Service,
         KeyPurpose::AdminService,
+        KeyPurpose::ChangePasswordService,
     ];
     let mut p = 0;
     while p < purposes.len() {
@@ -767,6 +860,15 @@ const _: () = {
     ));
     // Q-523: the operation-bound verification enters the same replay cache.
     assert!(startup_hold_down_applies(Operation::VerifyOperationTicket));
+    // Task K3 (docs/53 §5.3): the change-password request enters it too, and
+    // its context is consumed by the completion or the error seal.
+    assert!(startup_hold_down_applies(
+        Operation::OpenChangePasswordRequest
+    ));
+    assert!(startup_hold_down_applies(Operation::CompleteChangePassword));
+    assert!(startup_hold_down_applies(
+        Operation::SealChangePasswordError
+    ));
     assert!(!startup_hold_down_applies(Operation::DescribeConfig));
     assert!(!startup_hold_down_applies(Operation::Ping));
     // The Admin set_secret grant (docs/51 §5.8 option (b); A-74; Q-450;
@@ -815,6 +917,31 @@ const _: () = {
         }
         c += 1;
     }
+    // Task K3 (docs/53 §4.5; Q-601 item 5, A-117): the C1 pin for **every**
+    // role — an operation that changes key state runs only on a dird
+    // decision or exists only before the seal, whoever may call it. Kdc
+    // issuance changes no key state; `complete_change_password` (Ldap) does,
+    // and must redeem a `SetSecret` decision.
+    let mut k = 0;
+    while k < Operation::ALL.len() {
+        let op = Operation::ALL[k];
+        let roles = [Role::Kdc, Role::Directory, Role::Admin, Role::Ldap];
+        let mut r = 0;
+        while r < roles.len() {
+            if role_permits(roles[r], op) && changes_key_state(op) {
+                assert!(requires_decision(op) || provisioning_only(op));
+            }
+            r += 1;
+        }
+        k += 1;
+    }
+    assert!(requires_decision(Operation::CompleteChangePassword));
+    assert!(changes_key_state(Operation::CompleteChangePassword));
+    assert!(!changes_key_state(Operation::OpenChangePasswordRequest));
+    assert!(!changes_key_state(Operation::SealChangePasswordError));
+    assert!(!loosens_authorization(Operation::OpenChangePasswordRequest));
+    assert!(!loosens_authorization(Operation::CompleteChangePassword));
+    assert!(!loosens_authorization(Operation::SealChangePasswordError));
     assert!(!role_permits(Role::Directory, Operation::GrantSetSecret));
     assert!(!role_permits(Role::Kdc, Operation::GrantSetSecret));
     assert!(!startup_hold_down_applies(Operation::GrantSetSecret));
@@ -898,9 +1025,16 @@ const _: () = {
         KeyPurpose::Service
     ));
     assert!(matches!(bound.key_purpose(), KeyPurpose::AdminService));
+    assert!(matches!(
+        AppBinding::ChangePassword.key_purpose(),
+        KeyPurpose::ChangePasswordService
+    ));
     assert!(AppBinding::Unbound.operation() as u8 == Operation::OpenAndVerifyServiceTicket as u8);
     assert!(bound.operation() as u8 == Operation::VerifyOperationTicket as u8);
-    let bindings = [AppBinding::Unbound, bound];
+    assert!(
+        AppBinding::ChangePassword.operation() as u8 == Operation::OpenChangePasswordRequest as u8
+    );
+    let bindings = [AppBinding::Unbound, bound, AppBinding::ChangePassword];
     let mut b = 0;
     while b < bindings.len() {
         let op = bindings[b].operation();
@@ -968,6 +1102,63 @@ const _: () = {
         HandleSlot::Primary,
         KeyPurpose::AdminService
     ));
+    // Task K3 (docs/53 §4.5, R53-6; Q-601 item 4, A-117): the change-password
+    // service's key set is drawn by keyd (`create_key`) and may have a
+    // retired kvno named (`retire_kvno`, any purpose) — and is opened **only**
+    // by `open_change_password_request`. No other operation accepts it in any
+    // slot: not `set_secret` / `verify_secret` / a grant / `destroy_key_set`
+    // / `rotate_key` (never password-derived, never replaced), not the KDC's
+    // issuance or TGT steps (the TGS refuses the name — the AS profile is
+    // task K5), not the two other service-ticket verifications.
+    let mut x = 0;
+    while x < Operation::ALL.len() {
+        let op = Operation::ALL[x];
+        let opens_it = op as u8 == Operation::OpenChangePasswordRequest as u8
+            || op as u8 == Operation::CreateKey as u8
+            || op as u8 == Operation::RetireKvno as u8;
+        assert!(
+            purpose_permitted(op, HandleSlot::Primary, KeyPurpose::ChangePasswordService)
+                == opens_it
+        );
+        assert!(!purpose_permitted(
+            op,
+            HandleSlot::Krbtgt,
+            KeyPurpose::ChangePasswordService
+        ));
+        assert!(!purpose_permitted(
+            op,
+            HandleSlot::Secondary,
+            KeyPurpose::ChangePasswordService
+        ));
+        x += 1;
+    }
+    // ... and `open_change_password_request` opens nothing else.
+    let mut y = 0;
+    while y < purposes.len() {
+        let own = purposes[y] as u8 == KeyPurpose::ChangePasswordService as u8;
+        assert!(
+            purpose_permitted(
+                Operation::OpenChangePasswordRequest,
+                HandleSlot::Primary,
+                purposes[y]
+            ) == own
+        );
+        // The completion targets a user's password key set only; the error
+        // seal takes no handle.
+        assert!(
+            purpose_permitted(
+                Operation::CompleteChangePassword,
+                HandleSlot::Primary,
+                purposes[y]
+            ) == (purposes[y] as u8 == KeyPurpose::PrincipalLongterm as u8)
+        );
+        assert!(!purpose_permitted(
+            Operation::SealChangePasswordError,
+            HandleSlot::Primary,
+            purposes[y]
+        ));
+        y += 1;
+    }
 };
 
 #[cfg(test)]
@@ -1009,7 +1200,8 @@ mod tests {
     /// RFC 4120 3.2.3 / docs/50 R50-6, §3.5: exactly the operations of the
     /// Kerberos exchanges (roles Kdc and Ldap, except the daemon-support
     /// operations — Q-240 item 1 — and the decision registration and its
-    /// listing — Q-450 item 5, A-102, task R6) are held after start.
+    /// listing — Q-450 item 5, A-102, task R6) are held after start — the
+    /// three change-password operations included (docs/53 §5.3, task K3).
     #[test]
     fn hold_down_covers_exactly_the_kerberos_operations() {
         for op in Operation::ALL {

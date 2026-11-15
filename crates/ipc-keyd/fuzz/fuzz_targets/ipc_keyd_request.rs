@@ -29,6 +29,13 @@
 //! that a decoded 0x07 is never operation-bound (Q-523: only the
 //! context-free kind 0x15 is).
 //!
+//! Task K4: a decoded `open_change_password_request` (kind `0x16`) carries
+//! no password field and its two addresses in their one encoding — an
+//! IPv4-mapped IPv6 address is never decoded as IPv6 (RFC 4120 7.1); a
+//! decoded `seal_change_password_error` (kind `0x18`) never carries
+//! KRB5_KPASSWD_SUCCESS (the type cannot hold it; RFC 3244 §2); a decoded
+//! `register_decision` of a `ChangePassword` decision names one target.
+//!
 //! Written, not run (PENDING-OWNER P-1).
 //!
 //! Spec: docs/50 §3.3, §3.4, §9; R50-4; A-59; docs/51 §5.8;
@@ -37,6 +44,7 @@
 use ipc::{encode_frame, Direction};
 use ipc_keyd::channel::{request_kind, MAX_DECISION_APPROVERS, MAX_GRANT_TARGETS};
 use ipc_keyd::{decode_request, Call, DecidedOperation, KEYD_CHANNEL};
+use keyd::{ADDRESS_TYPE_IPV4, ADDRESS_TYPE_IPV6};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|body: &[u8]| {
@@ -66,6 +74,21 @@ fuzz_target!(|body: &[u8]| {
                 if let DecidedOperation::SetSecret { targets, .. } = operation {
                     assert!(targets.len() <= MAX_GRANT_TARGETS as usize, "count bound");
                 }
+            }
+            // Task K4: one encoding per address — a decoded IPv6 address is
+            // never IPv4-mapped (it would be held as IPv4).
+            if let Call::OpenChangePasswordRequest { peer, local, .. } = &call {
+                for address in [peer, local] {
+                    let len = address.octets().len();
+                    assert!(
+                        (address.addr_type() == ADDRESS_TYPE_IPV4 && len == 4)
+                            || (address.addr_type() == ADDRESS_TYPE_IPV6 && len == 16),
+                        "an address of its family"
+                    );
+                }
+            }
+            if let Call::SealChangePasswordError { code, .. } = &call {
+                assert_ne!(code.value(), 0, "SUCCESS is never sealed as an error");
             }
             let request = call.to_wire().expect("a decoded call re-encodes");
             let frame = encode_frame(KEYD_CHANNEL, Direction::Request, &request)

@@ -107,12 +107,13 @@ fn kind_tables_are_as_documented() {
     // 0x11 `grant_set_secret` appended by task A15a (docs/questions/Q-450);
     // 0x12 `register_decision`, 0x13 `seal_ceremony`, 0x14
     // `list_destroy_decisions` appended by A-102 (docs/52 §4.6); 0x15
-    // `verify_operation_ticket` appended by Q-523.
-    assert_eq!(request_kind::ALL, (0x01..=0x15).collect::<Vec<u8>>());
+    // `verify_operation_ticket` appended by Q-523; 0x16-0x18 the three
+    // change-password operations, appended by task K4 (docs/53 §5.5).
+    assert_eq!(request_kind::ALL, (0x01..=0x18).collect::<Vec<u8>>());
     for (request, reply) in request_kind::ALL.iter().zip(reply_kind::ALL) {
         assert_eq!(*reply, 0x80 | request);
     }
-    assert_eq!(&reply_kind::ALL[21..], &[0xF1, 0xF2, 0xF3]);
+    assert_eq!(&reply_kind::ALL[24..], &[0xF1, 0xF2, 0xF3]);
     assert!(!request_kind::ALL.contains(&REFUSED_KIND));
     assert!(!reply_kind::ALL.contains(&REFUSED_KIND));
     let body = request_body(&Call::Ping);
@@ -128,7 +129,8 @@ fn error_type(operation: keyd_types::Operation) -> u8 {
         | O::OpenFastArmor
         | O::OpenAndVerifyTgt
         | O::OpenAndVerifyServiceTicket
-        | O::VerifyOperationTicket => 1,
+        | O::VerifyOperationTicket
+        | O::OpenChangePasswordRequest => 1,
         O::IssueAsRep | O::IssueTgsRep => 2,
         _ => 3,
     }
@@ -159,6 +161,9 @@ fn is_refusal(answer: &Answer) -> bool {
             | Answer::ListDestroyDecisions(Ok(_))
             | Answer::DescribeConfig(Ok(_))
             | Answer::Ping(Ok(_))
+            | Answer::OpenChangePasswordRequest(Ok(_))
+            | Answer::CompleteChangePassword(Ok(_))
+            | Answer::SealChangePasswordError(Ok(_))
     )
 }
 
@@ -682,8 +687,9 @@ fn an_unknown_ping_caller_role_is_refused() {
 /// §3.10 (c); Q-466 item 3 (A-102: "state calls only through call_with_fate
 /// by type"): for every call of every operation (tests/samples), the split
 /// follows keyd's one table — `keyd_types::authz::requires_acknowledged_intent`,
-/// the table keyd-daemon's classification reads — and the expected eight
-/// operations are exactly the state calls: an `IssuanceCall` (the only
+/// the table keyd-daemon's classification reads — and the expected nine
+/// operations (the eight of R9, and the change-password completion of task
+/// K4) are exactly the state calls: an `IssuanceCall` (the only
 /// argument `KeydClient::call` takes) can be made of every other call and
 /// of none of these, a `StateCall` of these and of no other.
 #[test]
@@ -697,6 +703,7 @@ fn the_state_calls_are_keyds_table_and_never_issuance_calls() {
         Operation::DestroyKeySet,
         Operation::GrantSetSecret,
         Operation::RegisterDecision,
+        Operation::CompleteChangePassword,
     ];
     for operation in Operation::ALL {
         assert_eq!(
@@ -875,7 +882,8 @@ fn the_executions_carry_only_a_decision_id() {
 
 /// A-102 (docs/52 §4.6; docs/50 §3.3 — closed tables, bounded counts): the
 /// `register_decision` request is strict — the decided operation's code is
-/// one of 1-5 (another code is `Malformed`), and at most three approvers
+/// one of 1-6 (6, `ChangePassword`, appended by task K4; another code is
+/// `Malformed`), and at most three approvers
 /// are carried (a fourth is `Malformed` before anything is allocated for
 /// it).
 #[test]
@@ -900,7 +908,7 @@ fn the_register_decision_request_is_strict() {
     assert_eq!(body[30..34], 3u32.to_be_bytes());
     assert_eq!(body.len(), 86);
     assert!(decode_request(&body).is_ok());
-    for code in [0x00, 0x06, 0xFF] {
+    for code in [0x00, 0x07, 0xFF] {
         let mut bad = body.clone();
         bad[12] = code;
         assert_eq!(refusal_of(&bad), Some(Refused::Malformed), "code {code:#x}");
@@ -921,6 +929,104 @@ fn the_register_decision_request_is_strict() {
         request_body(&Call::SealCeremony),
         vec![0x4B, 0x44, 0x01, request_kind::SEAL_CEREMONY]
     );
+}
+
+/// Task K4 (docs/53 §5.5; docs/50 §3.3 — closed tables, one encoding per
+/// value; RFC 3244 §2; RFC 4120 7.1): the change-password messages are
+/// strict.
+/// * `seal_change_password_error` carries exactly the context id and a
+///   16-bit result code: 0 (SUCCESS — "not allowed in a KRB-ERROR
+///   message"), 0xFFFF and every undefined value are `Malformed`;
+/// * a `HostAddr` has one encoding: an IPv4-mapped IPv6 address in the
+///   IPv6 form is `Malformed` ("MUST be represented as addresses of type
+///   2"), as is an unknown family;
+/// * the `ChangePasswordContext` reply's verdict is one of the closed
+///   table (another code is refused);
+/// * no change-password request has a password field: the password is only
+///   inside the KRB-PRIV ciphertext (docs/53 R53-4).
+#[test]
+fn the_change_password_messages_are_strict() {
+    use ipc_keyd::{ChangePasswordCtxId, HostAddr, NonZeroResultCode};
+    let seal = Call::SealChangePasswordError {
+        ctx: ChangePasswordCtxId::from_bytes([0x11; 16]),
+        code: NonZeroResultCode::AuthError,
+    };
+    let body = request_body(&seal);
+    let mut expected = vec![0x4B, 0x44, 0x01, request_kind::SEAL_CHANGE_PASSWORD_ERROR];
+    expected.extend_from_slice(&[0x11; 16]);
+    expected.extend_from_slice(&3u16.to_be_bytes());
+    assert_eq!(body, expected);
+    for value in [0u16, 8, 0x00FF, 0xFFFF] {
+        let mut bad = body.clone();
+        bad[20..22].copy_from_slice(&value.to_be_bytes());
+        assert_eq!(refusal_of(&bad), Some(Refused::Malformed), "{value:#x}");
+    }
+    for value in 1u16..=7 {
+        let mut good = body.clone();
+        good[20..22].copy_from_slice(&value.to_be_bytes());
+        assert!(decode_request(&good).is_ok(), "{value}");
+    }
+
+    // An IPv6 peer, an IPv4 local address: the body ends with
+    // 0x02 ‖ 16 octets ‖ 0x01 ‖ 4 octets.
+    let mut v6 = [0u8; 16];
+    v6[0] = 0x20;
+    v6[1] = 0x01;
+    v6[2] = 0x0d;
+    v6[3] = 0xb8;
+    v6[15] = 0x0a;
+    let open = Call::OpenChangePasswordRequest {
+        service: keyd_types::PrincipalId::from_bytes([0xCF; 16]),
+        ap_req_octets: vec![0x30, 0x00],
+        krb_priv_octets: vec![0x30, 0x00],
+        peer: HostAddr::ipv6(v6),
+        local: HostAddr::ipv4([192, 0, 2, 1]),
+    };
+    let body = request_body(&open);
+    let n = body.len();
+    assert_eq!(body[n - 22], 0x02);
+    assert_eq!(&body[n - 21..n - 5], &v6);
+    assert_eq!(&body[n - 5..], &[0x01, 192, 0, 2, 1]);
+    assert!(decode_request(&body).is_ok());
+    let mut mapped = body.clone();
+    mapped[n - 21..n - 5]
+        .copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 0, 2, 10]);
+    assert_eq!(refusal_of(&mapped), Some(Refused::Malformed));
+    for family in [0x00, 0x03, 0xFF] {
+        let mut bad = body.clone();
+        bad[n - 5] = family;
+        assert_eq!(refusal_of(&bad), Some(Refused::Malformed), "{family:#x}");
+    }
+    // The typed IPv4-mapped peer is held as IPv4 and encoded so.
+    let normalized = Call::OpenChangePasswordRequest {
+        service: keyd_types::PrincipalId::from_bytes([0xCF; 16]),
+        ap_req_octets: vec![0x30, 0x00],
+        krb_priv_octets: vec![0x30, 0x00],
+        peer: HostAddr::ipv6([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 0, 2, 10]),
+        local: HostAddr::ipv4([192, 0, 2, 1]),
+    };
+    let body = request_body(&normalized);
+    let n = body.len();
+    assert_eq!(&body[n - 10..], &[0x01, 192, 0, 2, 10, 0x01, 192, 0, 2, 1]);
+
+    // The verdict is the context reply's last octet.
+    let answer = Answer::OpenChangePasswordRequest(Ok(samples::change_password_context(
+        keyd_types::ChangePasswordVerdict::Acceptable,
+    )));
+    let body = reply_body(&answer);
+    let n = body.len();
+    assert_eq!(body[n - 1], 0x01);
+    for code in [0x00, 0x06, 0xFF] {
+        let mut bad = body.clone();
+        bad[n - 1] = code;
+        assert!(
+            matches!(
+                decode_reply::<KeydReply>(KEYD_CHANNEL, &bad),
+                Err(ipc::Error::UnknownCode)
+            ),
+            "{code:#x}"
+        );
+    }
 }
 
 /// A-102 (docs/52 §4.6; docs/50 §3.3 — "bound before allocation"): a

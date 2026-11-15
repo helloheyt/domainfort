@@ -127,13 +127,17 @@ use core::time::Duration;
 use ipc::{decode_reply, encode_frame, Direction, FrameLimit, Refused, Reply};
 use keyd_types::authz::{requires_acknowledged_intent, role_permits};
 use keyd_types::{
-    AccountKind, ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof, ConfigDescription,
-    CtxId, DecidedOperation, DecisionId, DestructionPage, FastArmor, FastConversation, IssueError,
-    KeyCustody, KeyHandle, Kvno, Operation, OperationDigest, OperationTicket, PrincipalBinding,
-    PrincipalId, Role, ServiceContext, SetSecretTarget, TgsFastRequest, TgsRepParts,
+    AccountKind, ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof,
+    ChangePasswordContext, ChangePasswordCtxId, ConfigDescription, CtxId, DecidedOperation,
+    DecisionId, DestructionPage, FastArmor, FastConversation, HostAddr, IssueError, KeyCustody,
+    KeyHandle, Kvno, Operation, OperationDigest, OperationTicket, PrincipalBinding, PrincipalId,
+    Role, SealedReply, ServiceContext, SetSecretTarget, TgsFastRequest, TgsRepParts,
     TgsTicketTemplate, TgtContext,
 };
-use krb_proto::{ApReq, EncryptedData, KerberosTime, KrbError, KrbFastArmoredReq, PaData, Realm};
+use krb_proto::{
+    ApReq, EncryptedData, KerberosTime, KrbError, KrbFastArmoredReq, NonZeroResultCode, PaData,
+    Realm,
+};
 use std::time::Instant;
 use zeroize::Zeroizing;
 
@@ -591,6 +595,10 @@ const _: () = {
         Operation::Ping,
         Operation::SealCeremony,
         Operation::ListDestroyDecisions,
+        // Task K4: the change-password request's opening and its error seal
+        // change no key state (bookkeeping only).
+        Operation::OpenChangePasswordRequest,
+        Operation::SealChangePasswordError,
     ];
     let state = [
         Operation::SetSecret,
@@ -601,6 +609,8 @@ const _: () = {
         Operation::DestroyKeySet,
         Operation::GrantSetSecret,
         Operation::RegisterDecision,
+        // Task K4: the completion installs a password (docs/52 §3.10 (c)).
+        Operation::CompleteChangePassword,
     ];
     let mut i = 0;
     while i < issuance.len() {
@@ -1180,6 +1190,80 @@ impl<C: Connector> KeydClient<C> {
             Call::Ping,
             |answer| match answer {
                 Answer::Ping(result) => Some(result),
+                _ => None,
+            },
+            keyd_types::Error::Unavailable,
+        )
+    }
+
+    /// docs/53 §5.5 `open_change_password_request` (Role::Ldap — dird; task
+    /// K4): an RFC 3244 request's AP-REQ and KRB-PRIV as received, and the
+    /// connection's addresses as the front's kernel reported them. keyd
+    /// verifies, decrypts and judges the request and answers a one-time
+    /// request context with its verdict — the password never leaves keyd.
+    /// Not a state call.
+    /// Spec: docs/53 §5.3-§5.5; docs/50 §3.4; RFC 3244 §2.
+    pub fn open_change_password_request(
+        &mut self,
+        service: &PrincipalId,
+        ap_req_octets: &[u8],
+        krb_priv_octets: &[u8],
+        peer: &HostAddr,
+        local: &HostAddr,
+    ) -> Result<ChangePasswordContext, AuthnError> {
+        let call = Call::OpenChangePasswordRequest {
+            service: *service,
+            ap_req_octets: ap_req_octets.to_vec(),
+            krb_priv_octets: krb_priv_octets.to_vec(),
+            peer: *peer,
+            local: *local,
+        };
+        self.issuance(
+            call,
+            |answer| match answer {
+                Answer::OpenChangePasswordRequest(result) => Some(result),
+                _ => None,
+            },
+            AuthnError::Unavailable,
+        )
+    }
+
+    /// docs/53 §5.5 `complete_change_password` (Role::Ldap — dird; task K4):
+    /// install the password of request context `ctx` into `target` on the
+    /// `ChangePassword` decision dird registered, and return the sealed
+    /// success reply. It changes key state — a state call: the result
+    /// carries the fate ([`StateOutcome`]: "not performed" and "outcome
+    /// unknown" stay apart, docs/52 §3.10 (c)).
+    /// Spec: docs/53 §5.5, §5.6 step 6; docs/50 §3.4; docs/questions/Q-367
+    /// (A-88), Q-466 item 3.
+    pub fn complete_change_password(
+        &mut self,
+        ctx: &ChangePasswordCtxId,
+        target: &KeyHandle,
+    ) -> StateOutcome<SealedReply> {
+        let call = Call::CompleteChangePassword {
+            ctx: *ctx,
+            target: *target,
+        };
+        self.state(&call, |answer| match answer {
+            Answer::CompleteChangePassword(result) => Some(result),
+            _ => None,
+        })
+    }
+
+    /// docs/53 §5.5 `seal_change_password_error` (Role::Ldap — dird; task
+    /// K4): seal request context `ctx`'s error reply with `code` (never
+    /// SUCCESS — the type cannot hold it). Not a state call.
+    /// Spec: docs/53 §5.5, §5.7; docs/50 §3.4; RFC 3244 §2.
+    pub fn seal_change_password_error(
+        &mut self,
+        ctx: &ChangePasswordCtxId,
+        code: NonZeroResultCode,
+    ) -> Result<SealedReply, keyd_types::Error> {
+        self.issuance(
+            Call::SealChangePasswordError { ctx: *ctx, code },
+            |answer| match answer {
+                Answer::SealChangePasswordError(result) => Some(result),
                 _ => None,
             },
             keyd_types::Error::Unavailable,

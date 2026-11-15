@@ -67,6 +67,20 @@
 //! / §5, docs/questions/Q-387, Q-493, Q-523 and this crate's own code; no other
 //! implementation was consulted or recalled (AGENTS.md §1-3).
 //!
+//! # The third profile: a change-password request (task K3)
+//!
+//! `open_change_password_request` (crate::change_password) runs **this**
+//! core — not a second implementation of RFC 4120 3.2.3 (docs/53 §5.3; class
+//! "one security rule implemented twice", docs/52 C14 / C5) — with
+//! [`Accompanying::KrbPriv`]: the binding `AppBinding::ChangePassword`, the
+//! ChangePasswordService key set, no `cksum` (step 9), and, after the subkey
+//! step, step 10a: the subkey and the Authenticator's sequence number are
+//! required (RFC 3244 §2) and the accompanying KRB-PRIV is decrypted under
+//! the subkey, key usage 13 — part of the cryptographic chain, before the
+//! replay cache, so a KRB-PRIV of another request leaves no replay entry.
+//! Written from RFC 3244 §2, RFC 4120 §3.5.2, §5.5.1, §5.7.1, §7.5.1 (pinned,
+//! SHA-256 verified) and docs/53 §5.3-§5.4.
+//!
 //! Spec: RFC 4120 §4, 2.2, 3.2.3, 3.3.3, 3.3.3.2, 5.3, 5.5.1, 6.2, 7.5.1;
 //! RFC 3961 §3, §4; RFC 3962 §7; RFC 8009 §6; [MS-KILE] 3.4.5 (retry with
 //! the previous server key); docs/10 §5ב, §8, §9, §12; docs/49 §3.3, §12;
@@ -84,11 +98,13 @@ use crate::store::{BoundKeys, KeyStore, KeyVersion};
 use crate::tgs_exchange::{check_ap_options, replay_key_for, subkey_protocol_key, OpenedApReq};
 use crate::time::kerberos_time_seconds;
 use crate::tokens::{ServiceCtxId, TOKEN_ID_LENGTH};
-use crate::usage::{AP_REQ_AUTHENTICATOR, AP_REQ_AUTHENTICATOR_CKSUM};
+use crate::usage::{AP_REQ_AUTHENTICATOR, AP_REQ_AUTHENTICATOR_CKSUM, KRB_PRIV_ENC_PART};
 use keyd_types::{AppBinding, OperationDigest, OperationTicket, ServiceContext};
 use krb_crypto::{ChecksumType, ProtocolKey};
 use krb_proto::constants::DOMAIN_X500_COMPRESS;
-use krb_proto::{ApReq, Checksum, KerberosTime, TransitedEncoding};
+use krb_proto::{
+    ApReq, Checksum, EncKrbPrivPart, KerberosTime, KrbPriv, Microseconds, TransitedEncoding,
+};
 
 // `ServiceContext`, the result type of this operation, lives in the
 // crypto-free keyd-types crate (D182; decision A-63) and is re-exported at
@@ -189,10 +205,19 @@ fn verify_app_binding(
     binding: &AppBinding,
 ) -> Internal<BindingEvidence> {
     match (binding, cksum) {
-        (AppBinding::Unbound, None) => Ok(BindingEvidence::Unbound),
+        // A change-password request carries no `cksum` either: its operation
+        // binding is the KRB-PRIV under the subkey (step 10a,
+        // [`open_krb_priv`], which replaces this evidence) — task K3, Q-603
+        // item 4.
+        (AppBinding::Unbound, None) | (AppBinding::ChangePassword, None) => {
+            Ok(BindingEvidence::Unbound)
+        }
         // L6a has no application data to verify a checksum over; ignoring it
-        // would waive a binding the client asked for (Q-180 item 3).
-        (AppBinding::Unbound, Some(_)) => Err(Deny::denied(AuditReason::ApChecksumUnsupported)),
+        // would waive a binding the client asked for (Q-180 item 3). Nor does
+        // RFC 3244 define any for a change-password request (docs/53 §5.3).
+        (AppBinding::Unbound, Some(_)) | (AppBinding::ChangePassword, Some(_)) => {
+            Err(Deny::denied(AuditReason::ApChecksumUnsupported))
+        }
         (AppBinding::OperationDigest(_), None) => {
             Err(Deny::denied(AuditReason::OperationDigestMissing))
         }
@@ -217,31 +242,108 @@ fn verify_app_binding(
     }
 }
 
+/// Step 10a of a change-password request (task K3): the subkey and the
+/// Authenticator's sequence number are required (RFC 3244 §2: "The
+/// authenticator in the AP-REQ must include a subsession key"; "the
+/// seq-number in the authenticator will be present"), and the accompanying
+/// KRB-PRIV — decoded strictly by keyd — is decrypted under that subkey with
+/// key usage 13 and its EncKrbPrivPart decoded. Takes the step-9 evidence
+/// (no `cksum`) by value and returns the binding evidence that replaces it.
+/// Every failure is the uniform `Denied` (a decryption failure is part of the
+/// chain, A-26).
+/// Spec: RFC 3244 §2 ("This user-data field in the KRB-PRIV message is
+/// encrypted using the subkey from the authenticator in the AP-REQ data");
+/// RFC 4120 3.5.2 (version / type, then decryption — KRB_AP_ERR_BAD_INTEGRITY),
+/// 5.5.1, 5.7.1, 7.5.1 item 13; docs/53 §5.3, §5.4 item 1; Q-603 item 3.
+fn open_krb_priv(
+    no_checksum: BindingEvidence,
+    subkey: Option<&ProtocolKey>,
+    seq_number: Option<u32>,
+    krb_priv_octets: &[u8],
+) -> Internal<(BindingEvidence, EncKrbPrivPart)> {
+    if !matches!(no_checksum, BindingEvidence::Unbound) {
+        return Err(Deny::unavailable(AuditReason::InternalFailure));
+    }
+    let subkey = subkey.ok_or(Deny::denied(AuditReason::SubkeyMissing))?;
+    if seq_number.is_none() {
+        return Err(Deny::denied(AuditReason::SequenceNumberMissing));
+    }
+    let krb_priv =
+        KrbPriv::decode(krb_priv_octets).map_err(|_| Deny::denied(AuditReason::MalformedInput))?;
+    if krb_priv.enc_part.etype != subkey.enc_type().number() {
+        return Err(Deny::denied(AuditReason::UnsupportedEncType));
+    }
+    let (plain, decrypted) = chain::open(subkey, KRB_PRIV_ENC_PART, &krb_priv.enc_part.cipher)?;
+    let part =
+        EncKrbPrivPart::decode(&plain).map_err(|_| Deny::denied(AuditReason::MalformedInput))?;
+    drop(plain);
+    Ok((BindingEvidence::KrbPriv(decrypted), part))
+}
+
+/// The application data that accompanies an AP-REQ, as each verification
+/// receives it — which also fixes the binding ([`Accompanying::binding`]),
+/// hence the key set's purpose and the operation (R2).
+/// Spec: RFC 4120 5.5.1 ("the application data that accompanies the
+/// KRB_AP_REQ"); docs/52 §5 item 3; docs/53 §5.3.
+pub(crate) enum Accompanying<'a> {
+    /// None (`open_and_verify_service_ticket`).
+    Nothing,
+    /// The admin channel's operation digest (`verify_operation_ticket`).
+    OperationDigest(OperationDigest),
+    /// The KRB-PRIV octets of an RFC 3244 request
+    /// (`open_change_password_request`, task K3).
+    KrbPriv(&'a [u8]),
+}
+
+impl Accompanying<'_> {
+    /// The binding this application data requires.
+    /// Spec: docs/52 §5 item 3; docs/53 §5.3.
+    pub(crate) fn binding(&self) -> AppBinding {
+        match self {
+            Accompanying::Nothing => AppBinding::Unbound,
+            Accompanying::OperationDigest(digest) => AppBinding::OperationDigest(*digest),
+            Accompanying::KrbPriv(_) => AppBinding::ChangePassword,
+        }
+    }
+}
+
 /// What the shared verification steps 1-11 established about one AP-REQ:
 /// the ticket's non-secret facts, the keys a context could keep, and the
 /// digest the `cksum` MIC verified over (`None`: unbound). Never leaves
 /// keyd; each public operation turns it into its own answer — the unbound
 /// one keeps the keys under a context id, the operation-bound one drops them
-/// (Q-523).
+/// (Q-523), the change-password one keeps them in its request context
+/// (task K3).
 /// Spec: RFC 4120 3.2.3, 5.3, 5.5.1; docs/10 §5ב; docs/questions/Q-523.
-struct VerifiedApReq {
+pub(crate) struct VerifiedApReq {
     /// Client realm from the ticket. Spec: RFC 4120 5.3.
-    crealm: krb_proto::Realm,
+    pub(crate) crealm: krb_proto::Realm,
     /// Client name from the ticket. Spec: RFC 4120 5.3.
-    cname: krb_proto::PrincipalName,
+    pub(crate) cname: krb_proto::PrincipalName,
     /// Spec: RFC 4120 5.3 (authtime).
-    authtime: KerberosTime,
+    pub(crate) authtime: KerberosTime,
     /// Spec: RFC 4120 5.3 (endtime).
-    endtime: KerberosTime,
+    pub(crate) endtime: KerberosTime,
     /// Spec: RFC 4120 5.3 (flags).
-    flags: krb_proto::TicketFlags,
+    pub(crate) flags: krb_proto::TicketFlags,
     /// The ticket session key. Spec: RFC 4120 5.3 (key).
-    session: ProtocolKey,
+    pub(crate) session: ProtocolKey,
     /// The authenticator subkey, when offered. Spec: RFC 4120 5.5.1.
-    subkey: Option<ProtocolKey>,
+    pub(crate) subkey: Option<ProtocolKey>,
     /// The digest the `cksum` MIC verified over (`None`: unbound).
     /// Spec: RFC 4120 5.5.1; docs/52 §5 item 3.
     bound_operation: Option<OperationDigest>,
+    /// The Authenticator's ctime and cusec — what a KRB_AP_REP must carry
+    /// (RFC 4120 3.2.4: "MUST be the client's timestamp and microsecond
+    /// field"). Spec: RFC 4120 5.5.1, 5.5.2.
+    pub(crate) ctime: KerberosTime,
+    pub(crate) cusec: Microseconds,
+    /// The Authenticator's sequence number (RFC 4120 5.5.1: "the initial
+    /// sequence number for messages from the client to the server").
+    pub(crate) seq_number: Option<u32>,
+    /// The decrypted EncKrbPrivPart of a change-password request (task K3);
+    /// `None` for the other bindings. Spec: RFC 4120 5.7.1; RFC 3244 §2.
+    pub(crate) krb_priv: Option<EncKrbPrivPart>,
 }
 
 impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
@@ -332,12 +434,20 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         ap_req_octets: &[u8],
         now: &KerberosTime,
     ) -> Result<ServiceContext, AuthnError> {
-        let binding = AppBinding::Unbound;
+        let accompanying = Accompanying::Nothing;
+        let binding = accompanying.binding();
         // The key set is named by the binding's purpose (R2).
         let handle = KeyHandle::new(*service, binding.key_purpose());
         let mut fields = AuditFields::for_handle(&handle);
         let result = self
-            .verify_service_ap_req(caller, &handle, &binding, ap_req_octets, now, &mut fields)
+            .verify_service_ap_req(
+                caller,
+                &handle,
+                &accompanying,
+                ap_req_octets,
+                now,
+                &mut fields,
+            )
             .and_then(|verified| self.keep_service_context(caller, &handle, verified, now));
         self.emit(caller, binding.operation(), now, &fields, &result);
         result.map_err(AuthnError::from)
@@ -378,29 +488,42 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         ap_req_octets: &[u8],
         now: &KerberosTime,
     ) -> Result<OperationTicket, AuthnError> {
-        let binding = AppBinding::OperationDigest(*operation);
+        let accompanying = Accompanying::OperationDigest(*operation);
+        let binding = accompanying.binding();
         // The key set is named by the binding's purpose (R2).
         let handle = KeyHandle::new(*service, binding.key_purpose());
         let mut fields = AuditFields::for_handle(&handle);
         let result = self
-            .verify_service_ap_req(caller, &handle, &binding, ap_req_octets, now, &mut fields)
+            .verify_service_ap_req(
+                caller,
+                &handle,
+                &accompanying,
+                ap_req_octets,
+                now,
+                &mut fields,
+            )
             .and_then(|verified| operation_ticket(verified, operation));
         self.emit(caller, binding.operation(), now, &fields, &result);
         result.map_err(AuthnError::from)
     }
 
-    /// Steps 1-11 of both verifications (see
-    /// [`Keyd::open_and_verify_service_ticket`]), under `service` — the
-    /// handle of `binding`'s purpose — with step 9 as `binding` requires.
-    fn verify_service_ap_req(
+    /// Steps 1-11 of every service-ticket verification (see
+    /// [`Keyd::open_and_verify_service_ticket`]) — the unbound one, the
+    /// operation-bound one and the change-password request (task K3) — under
+    /// `service`, the handle of the binding's purpose, with step 9 (and, for
+    /// a change-password request, step 10a: [`open_krb_priv`]) as the
+    /// accompanying application data requires. The one implementation of
+    /// RFC 4120 3.2.3 for a service AP-REQ in keyd (docs/53 §5.3).
+    pub(crate) fn verify_service_ap_req(
         &mut self,
         caller: &CallerId,
         service: &KeyHandle,
-        binding: &AppBinding,
+        accompanying: &Accompanying<'_>,
         ap_req_octets: &[u8],
         now: &KerberosTime,
         fields: &mut AuditFields,
     ) -> Internal<VerifiedApReq> {
+        let binding = &accompanying.binding();
         // 1. Role Ldap, purpose the binding's: Service for the unbound
         // operation, AdminService for the operation-bound one (I2, I3).
         self.admit(
@@ -462,6 +585,22 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             .map(|subkey| subkey_protocol_key(subkey, &self.enctypes))
             .transpose()?;
 
+        // 10a. A change-password request: the subkey and the sequence number
+        // required, the KRB-PRIV opened under the subkey (task K3). Spec: RFC
+        // 3244 §2; RFC 4120 5.7.1, 7.5.1 item 13; docs/53 §5.3, §5.4 item 1.
+        let (binding_evidence, krb_priv) = match accompanying {
+            Accompanying::KrbPriv(octets) => {
+                let (evidence, part) = open_krb_priv(
+                    binding_evidence,
+                    subkey.as_ref(),
+                    authenticator.seq_number,
+                    octets,
+                )?;
+                (evidence, Some(part))
+            }
+            Accompanying::Nothing | Accompanying::OperationDigest(_) => (binding_evidence, None),
+        };
+
         // The cryptographic chain is complete: the ticket decrypted under the
         // service key, the authenticator under the session key and — bound —
         // the operation digest's MIC verified. Its proof is made from that
@@ -485,6 +624,10 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             session,
             subkey,
             bound_operation,
+            ctime: authenticator.ctime,
+            cusec: authenticator.cusec,
+            seq_number: authenticator.seq_number,
+            krb_priv,
         })
     }
 
@@ -513,7 +656,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             flags,
             session,
             subkey,
-            bound_operation: _,
+            ..
         } = verified;
         let context = ServiceContext {
             ctx_id: ServiceCtxId::from_bytes(id),
@@ -560,6 +703,7 @@ fn operation_ticket(
         session,
         subkey,
         bound_operation,
+        ..
     } = verified;
     // Nothing of the session is kept: no consumer exists for it.
     drop((session, subkey));

@@ -129,7 +129,8 @@ impl KeyStore for CustodyStore {
             KeyPurpose::Krbtgt
             | KeyPurpose::PrincipalLongterm
             | KeyPurpose::Service
-            | KeyPurpose::AdminService => true,
+            | KeyPurpose::AdminService
+            | KeyPurpose::ChangePasswordService => true,
         }
     }
 

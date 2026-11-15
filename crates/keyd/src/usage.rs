@@ -59,6 +59,18 @@ pub(crate) const AP_REQ_AUTHENTICATOR_CKSUM: u32 = 10;
 /// RFC 6113 5.4.1.1.
 pub(crate) const AP_REQ_AUTHENTICATOR: u32 = 11;
 
+/// Key usage 12: "AP-REP encrypted part (includes application session
+/// subkey), encrypted with the application session key". Used by the
+/// change-password replies (task K3). Spec: RFC 4120 5.5.2, 7.5.1; docs/53
+/// §5.5, §7.
+pub(crate) const AP_REP_ENC_PART: u32 = 12;
+
+/// Key usage 13: "KRB-PRIV encrypted part, encrypted with a key chosen by
+/// the application" — for RFC 3244, the Authenticator's subkey, in both
+/// directions. Used by the change-password request and replies (task K3).
+/// Spec: RFC 4120 5.7.1, 7.5.1; RFC 3244 §2; docs/53 §5.4 item 1, §7.
+pub(crate) const KRB_PRIV_ENC_PART: u32 = 13;
+
 /// Key usage 50 — KEY_USAGE_FAST_REQ_CHKSUM: the req-checksum of a
 /// KrbFastArmoredReq (over the outer KDC-REQ-BODY of an AS-REQ, over the
 /// PA-TGS-REQ AP-REQ of a TGS-REQ), keyed with the armor key. Spec: RFC 6113
@@ -124,7 +136,10 @@ mod tests {
             TGS_REP_ENC_PART_SUBKEY,
             AP_REQ_AUTHENTICATOR_CKSUM,
             AP_REQ_AUTHENTICATOR,
+            AP_REP_ENC_PART,
+            KRB_PRIV_ENC_PART,
         ];
+        assert_eq!((AP_REP_ENC_PART, KRB_PRIV_ENC_PART), (12, 13));
         for usage in fast {
             assert!(!rfc4120.contains(&usage));
         }

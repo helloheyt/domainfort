@@ -48,6 +48,17 @@ pub struct ArmorId([u8; TOKEN_ID_LENGTH]);
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ServiceCtxId([u8; TOKEN_ID_LENGTH]);
 
+/// The request-context token returned by `open_change_password_request`
+/// (task K3): it names the session key, the Authenticator's subkey and —
+/// for an acceptable request — the new password that keyd holds for one
+/// RFC 3244 request until `complete_change_password` or
+/// `seal_change_password_error` consumes it. Not secret by itself (useless
+/// to any other caller); what it names never leaves keyd.
+/// Spec: docs/53 §5.5 (`ctx_id: ChangePasswordCtxId // one-time,
+/// caller-bound, ≤ token_lifetime_secs`); docs/10 §8.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ChangePasswordCtxId([u8; TOKEN_ID_LENGTH]);
+
 macro_rules! token_id {
     ($ty:ident) => {
         impl $ty {
@@ -80,3 +91,4 @@ token_id!(ExchangeId);
 token_id!(CtxId);
 token_id!(ArmorId);
 token_id!(ServiceCtxId);
+token_id!(ChangePasswordCtxId);

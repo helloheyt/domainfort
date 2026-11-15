@@ -26,6 +26,12 @@ edition = "2021"
 publish = false
 
 [dependencies]
+# The password policy ([MS-SAMR] 3.1.1.7.2 as phase 1 applies it): a leaf of
+# our own workspace — no dependency, no I/O, no crypto. keyd's install path is
+# the one place every password is cleartext, so the policy is enforced there
+# (task K3; docs/53 §6; docs/questions/Q-605 items 1, 5, A-117). D182 is
+# unaffected: it adds no crypto code and no external crate.
+admin-password-policy = { path = "../admin-password-policy" }
 # The crypto-free types of keyd's interface (ids, roles, errors, operation
 # arguments and results, configuration, audit, the `KeyCustody` seam), moved
 # out of this crate and re-exported unchanged so that keyd's callers link no

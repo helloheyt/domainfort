@@ -191,7 +191,10 @@ pub const fn is_gating(operation: Operation) -> bool {
         | Operation::GrantSetSecret
         | Operation::RegisterDecision
         | Operation::SealCeremony
-        | Operation::ListDestroyDecisions => true,
+        | Operation::ListDestroyDecisions
+        | Operation::OpenChangePasswordRequest
+        | Operation::CompleteChangePassword
+        | Operation::SealChangePasswordError => true,
         Operation::DescribeConfig | Operation::Ping => false,
     }
 }

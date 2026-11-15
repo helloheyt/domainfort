@@ -745,9 +745,12 @@ fn purpose_code(purpose: KeyPurpose) -> Result<u8> {
     match purpose {
         KeyPurpose::PrincipalLongterm => Ok(codes::PURPOSE_PRINCIPAL_LONGTERM),
         KeyPurpose::Service => Ok(codes::PURPOSE_SERVICE),
-        // Never a password-set target: the krbtgt key and the admin service
-        // key (R2) are keyd-drawn only.
-        KeyPurpose::Krbtgt | KeyPurpose::AdminService => Err(Error::UnknownCode),
+        // Never a password-set target: the krbtgt key, the admin service
+        // key (R2) and the change-password service key (task K3, docs/53
+        // §4.5) are keyd-drawn only.
+        KeyPurpose::Krbtgt | KeyPurpose::AdminService | KeyPurpose::ChangePasswordService => {
+            Err(Error::UnknownCode)
+        }
     }
 }
 

@@ -12,7 +12,8 @@
 //! | operation arguments and results | [`AuthnProof`], [`AsTicketTemplate`], [`AsRepParts`], [`TgsFastRequest`], [`TgtContext`], [`TgsTicketTemplate`], [`TgsRepParts`], [`FastArmor`], [`FastConversation`], [`ServiceContext`], [`OperationTicket`], [`AppBinding`], [`OperationDigest`], [`AccountKind`], [`SetSecretTarget`] |
 //! | the set_secret grant (task A15a) | [`grant`]: [`MAX_GRANT_TARGETS`], [`MAX_SET_SECRET_GRANT_SECS`], [`MAX_INITIAL_SECRET_GRANT_SECS`], [`MAX_SET_SECRET_GRANTS`], [`grant::max_grant_lifetime_secs`] |
 //! | the decision table and the ceremony (A-102, docs/52 R1, R3) | [`decision`]: [`DecisionId`], [`DecidedOperation`], [`DecisionIntent`], [`PendingDestruction`], [`DestructionPage`], [`CeremonyState`], the bounds |
-//! | one-time token ids | [`ExchangeId`], [`CtxId`], [`ArmorId`], [`ServiceCtxId`] |
+//! | the change-password operations (task K3, docs/53 §5.5) | [`ChangePasswordContext`], [`ChangePasswordVerdict`], [`SealedReply`], [`HostAddr`], the RFC 4120 7.1 address constants |
+//! | one-time token ids | [`ExchangeId`], [`CtxId`], [`ArmorId`], [`ServiceCtxId`], [`ChangePasswordCtxId`] |
 //! | configuration | [`KeydConfig`], [`TicketPolicy`], [`ThrottlePolicy`], [`ConfigDescription`], [`EncTypeId`] |
 //! | audit | [`AuditRecord`], [`AuditOutcome`], [`AuditReason`], [`AuditKeyRef`], [`AuditSink`] |
 //! | time scale | [`kerberos_time_seconds`] |
@@ -62,6 +63,7 @@
 mod as_exchange;
 pub mod audit;
 pub mod authz;
+mod change_password;
 pub mod config;
 mod custody;
 pub mod decision;
@@ -78,7 +80,14 @@ mod tokens;
 pub use as_exchange::{AsRepParts, AsTicketTemplate, AuthnProof};
 pub use audit::{AuditKeyRef, AuditOutcome, AuditReason, AuditRecord, AuditSink};
 pub use authz::{CallerId, Operation, Role};
-pub use config::{ConfigDescription, KeydConfig, ThrottlePolicy, TicketPolicy};
+pub use change_password::{
+    ChangePasswordContext, ChangePasswordVerdict, HostAddr, SealedReply, ADDRESS_TYPE_DIRECTIONAL,
+    ADDRESS_TYPE_IPV4, ADDRESS_TYPE_IPV6, DIRECTIONAL_AP_REQ_RECIPIENT, DIRECTIONAL_AP_REQ_SENDER,
+};
+pub use config::{
+    ConfigDescription, KeydConfig, ThrottlePolicy, TicketPolicy, MAX_MIN_PASSWORD_CHARS,
+    MIN_PASSWORD_CHARS_FLOOR,
+};
 pub use custody::KeyCustody;
 pub use decision::{
     CeremonyState, DecidedOperation, DecisionId, DecisionIntent, DestructionPage,
@@ -94,12 +103,13 @@ pub use grant::{
     MAX_SET_SECRET_GRANTS, MAX_SET_SECRET_GRANT_SECS,
 };
 pub use model::{
-    is_admin_service_name, KeyHandle, KeyPurpose, Kvno, PrincipalBinding, PrincipalId,
-    ServiceKeyHandle, ADMIN_SERVICE_CLASS,
+    is_admin_service_name, is_change_password_service_name, KeyHandle, KeyPurpose, Kvno,
+    PrincipalBinding, PrincipalId, ServiceKeyHandle, ADMIN_SERVICE_CLASS,
+    CHANGE_PASSWORD_SERVICE_NAME,
 };
 pub use service_ticket::{
     AppBinding, OperationDigest, OperationTicket, ServiceContext, OPERATION_DIGEST_LEN,
 };
 pub use tgs_exchange::{TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext};
 pub use time::kerberos_time_seconds;
-pub use tokens::{ArmorId, CtxId, ExchangeId, ServiceCtxId, TOKEN_ID_LENGTH};
+pub use tokens::{ArmorId, ChangePasswordCtxId, CtxId, ExchangeId, ServiceCtxId, TOKEN_ID_LENGTH};

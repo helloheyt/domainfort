@@ -120,6 +120,7 @@ fn intent_then_success_where(
         keyd::KeyPurpose::Krbtgt => KeyPurposeCode::Krbtgt,
         keyd::KeyPurpose::Service => KeyPurposeCode::Service,
         keyd::KeyPurpose::AdminService => KeyPurposeCode::AdminService,
+        keyd::KeyPurpose::ChangePasswordService => KeyPurposeCode::ChangePasswordService,
     };
     let of = |result: KeydOutcome| {
         let found: Vec<u64> = records

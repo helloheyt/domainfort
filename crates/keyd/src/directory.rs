@@ -23,6 +23,24 @@
 //!   component outside keyd knows the current kvno (there is no read
 //!   operation, docs/10 §7).
 //!
+//! # One install path, one password policy (task K3; docs/53 §4.4, §6)
+//!
+//! Every password keyd installs — admind's `set_secret`, the ceremony's
+//! first administrators (`set_secret` on a grant), and kpasswd's
+//! `complete_change_password` — goes through **one** function,
+//! [`Keyd::install_password`]: the password policy, the store's acceptance,
+//! the existence rule, the name binding (A-19), keyd's choice of kvno
+//! (A-35), string-to-key and the install through `BoundKeys` /
+//! `NewBinding`. The policy ([`password_policy`]) is the rule set of crate
+//! admin-password-policy ([MS-SAMR] 3.1.1.7.2 items 2, 3.2.1, 3.2.2) with
+//! keyd's own `min_password_chars` (≥ 12, P-24). keyd's install path is the
+//! one place every password is cleartext, so a password that skipped the
+//! policy is impossible by construction — on every path, also against a
+//! compromised admind holding a live decision (class: "a rule enforced by
+//! the callers of a chokepoint instead of by the chokepoint", docs/52 C14;
+//! docs/questions/Q-605 item 1). admind's and provision's own checks stay as
+//! non-authoritative early checks until task K11 (docs/questions/Q-664).
+//!
 //! Spec: docs/10 §6 (`set_secret`, `verify_secret`), §12 I6, I7; RFC 3961
 //! §3 (string-to-key on UTF-8 strings); RFC 3962 §4; RFC 4120 §4 (default
 //! salt = realm + name components; the directory supplies the salt);
@@ -30,7 +48,7 @@
 
 use crate::audit::{AuditReason, AuditSink};
 use crate::authz::{CallerId, HandleSlot, Operation};
-use crate::config::KeydConfig;
+use crate::config::{KeydConfig, MAX_MIN_PASSWORD_CHARS};
 use crate::enctype::to_crypto;
 use crate::entropy::EntropySource;
 use crate::error::{Deny, Error, Internal};
@@ -41,11 +59,61 @@ use crate::template::check_new_binding;
 use crate::time::kerberos_time_seconds;
 use crate::usage::KEYD_INTERNAL_SECRET_COMPARE;
 use krb_crypto::{EncType, ProtocolKey};
-use krb_proto::KerberosTime;
+use krb_proto::{KerberosTime, PrincipalName};
 use zeroize::Zeroizing;
 
 /// Length of the random challenge the constant-time comparison MACs.
 const COMPARE_CHALLENGE_LENGTH: usize = 32;
+
+// keyd's bound on `min_password_chars` is the policy crate's maximum
+// password length ([MS-SAMR] 3.1.1.7.2 item 2): one value, pinned.
+const _: () =
+    assert!(MAX_MIN_PASSWORD_CHARS as usize == admin_password_policy::MAX_PASSWORD_UTF16_UNITS);
+
+/// Whether the key set an install targets must exist, must not exist, or
+/// either.
+/// Spec: docs/questions/Q-451 item 2 (an initial secret: the key set must
+/// not exist); docs/53 §5.5 (a password **change**: the client's key set
+/// exists — the AS issued its ticket from it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Existence {
+    /// Create the key set or add a version to it (`set_secret` on a dird
+    /// decision).
+    Any,
+    /// The key set must not exist yet (`set_secret` on the ceremony's
+    /// initial-secret grant) — else `GrantMismatch`.
+    MustNotExist,
+    /// The key set must exist (`complete_change_password`) — else
+    /// `KeyNotFound`.
+    MustExist,
+}
+
+/// The password policy — the one rule set, applied by the one install path
+/// ([`Keyd::install_password`]) and, for kpasswd, also when the request is
+/// opened (before dird writes anything — the same function on the same
+/// value, docs/53 §6.2): at most 256 UTF-16 units and at least
+/// `min_password_chars` code points ([MS-SAMR] 3.1.1.7.2 items 2, 3.2.1;
+/// admin-password-policy `check_length`), and none of `account_name`'s
+/// components of more than two characters as a case-insensitive substring
+/// (item 3.2.2; `check_account_name` — the account's binding is its
+/// sAMAccountName, one component, docs/47 §9.1). Which rule failed is not
+/// reported: one reason, `PasswordPolicyRefused` (docs/37 §2; Q-340 item 7).
+///
+/// Spec: [MS-SAMR] 3.1.1.7.2 items 1, 2, 3.2.1, 3.2.2; RFC 3244 §2 ("the
+/// server will apply any local policy checks including password policy
+/// checks"); docs/53 §6; docs/questions/Q-605 items 1, 2 (A-117); P-24.
+pub(crate) fn password_policy(
+    config: &KeydConfig,
+    password: &str,
+    account_name: &PrincipalName,
+) -> Internal<()> {
+    let refused = |_| Deny::denied(AuditReason::PasswordPolicyRefused);
+    admin_password_policy::check_length(password, config.min_password_chars).map_err(refused)?;
+    for component in &account_name.name_string {
+        admin_password_policy::check_account_name(password, component.as_str()).map_err(refused)?;
+    }
+    Ok(())
+}
 
 impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// `set_secret`: derive the principal's keys from `password` and `salt`
@@ -96,7 +164,9 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         now: &KerberosTime,
     ) -> Result<Kvno, Error> {
         let mut fields = AuditFields::for_handle(handle);
-        fields.decision = self.decisions.secret_decision(handle);
+        fields.decision = self
+            .decisions
+            .secret_decision_for(handle, Operation::SetSecret);
         let result = self
             .admit(
                 caller,
@@ -129,14 +199,67 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             self.decisions
                 .redeem_secret(handle, binding, salt, kerberos_time_seconds(now))?;
         fields.decision = redeemed.decision;
+        let existence = if redeemed.initial_only {
+            Existence::MustNotExist
+        } else {
+            Existence::Any
+        };
+        self.install_password(
+            handle,
+            binding,
+            password,
+            salt,
+            existence,
+            &redeemed.account_name,
+            fields,
+        )
+    }
+
+    /// The one install path of a password (module documentation, "One
+    /// install path, one password policy"), after the caller redeemed its
+    /// decision: `set_secret` (the caller's binding and salt, equal to the
+    /// decision's) and `complete_change_password` (the decision's binding
+    /// and salt). In order — every refusal before the install changes
+    /// nothing:
+    /// 1. the store accepts the purpose; the existence rule ([`Existence`]);
+    /// 2. A-19: an existing key set is bound to `binding`; a new one passes
+    ///    the creation rule;
+    /// 3. keyd chooses the kvno (A-35);
+    /// 4. the password policy ([`password_policy`], against `account_name`
+    ///    — the decision's account) — `PasswordPolicyRefused` — before any
+    ///    derivation (docs/questions/Q-605 item 1);
+    /// 5. string-to-key for every configured enctype with `salt`;
+    /// 6. the install through the binding proof (`BoundKeys`
+    ///    `install_password_version`) or the creation proof
+    ///    (`StoredKeySet::create`).
+    ///
+    /// Spec: docs/10 §6, I7; docs/53 R53-5, R53-10, §4.4, §6; RFC 3961 §3;
+    /// RFC 3962 §4; RFC 4120 5.2.9, 6.2; docs/questions/Q-115 (A-35), Q-040
+    /// (A-19), Q-451 item 2, Q-605 (A-117).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn install_password(
+        &mut self,
+        handle: &KeyHandle,
+        binding: &PrincipalBinding,
+        password: &str,
+        salt: &str,
+        existence: Existence,
+        account_name: &PrincipalName,
+        fields: &mut AuditFields,
+    ) -> Internal<Kvno> {
         if !self.store.accepts(handle.purpose) {
             return Err(Deny::denied(AuditReason::StoreRefusedCritical));
         }
         let existing = self.store.get(handle);
-        if redeemed.initial_only && existing.is_some() {
+        match (existence, existing.is_some()) {
             // An initial-secret grant (Role::Admin) never replaces a
             // password (docs/questions/Q-451 item 2).
-            return Err(Deny::denied(AuditReason::GrantMismatch));
+            (Existence::MustNotExist, true) => {
+                return Err(Deny::denied(AuditReason::GrantMismatch))
+            }
+            // A password change never creates a key set.
+            (Existence::MustExist, false) => return Err(Deny::denied(AuditReason::KeyNotFound)),
+            _ => {}
         }
         // A-19, before any derivation work: an existing set must be bound to
         // `binding` (its proof — the installer below checks it again, so the
@@ -158,6 +281,9 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
                 .ok_or(Deny::denied(AuditReason::KvnoExhausted))?,
         };
         fields.kvno = Some(new_kvno);
+        // The password policy, before any derivation: the one enforcement
+        // point of every password on every path (docs/53 §6.1).
+        password_policy(&self.config, password, account_name)?;
         let mut keys = Vec::with_capacity(self.enctypes.len());
         for enctype in &self.enctypes {
             keys.push(derive_password_key(
@@ -481,7 +607,7 @@ mod tests {
             &DIRECTORY,
             &at_max,
             &binding(),
-            Zeroizing::new("next".to_owned()),
+            Zeroizing::new("a next passphrase".to_owned()),
             SALT,
             &now,
         );
@@ -498,7 +624,7 @@ mod tests {
                 &DIRECTORY,
                 &below_max,
                 &binding(),
-                Zeroizing::new("next".to_owned()),
+                Zeroizing::new("a next passphrase".to_owned()),
                 SALT,
                 &now,
             ),

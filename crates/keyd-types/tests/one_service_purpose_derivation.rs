@@ -11,8 +11,10 @@
 //! What this test pins, in the workspace's non-test source (`crates/*/src`):
 //!
 //! 1. Outside keyd's own crates and the channel codecs (listed in
-//!    [`CUSTODY_AND_CODECS`], each with its reason), `KeyPurpose::Service`
-//!    and `KeyPurpose::AdminService` appear only where a purpose is
+//!    [`CUSTODY_AND_CODECS`], each with its reason), `KeyPurpose::Service`,
+//!    `KeyPurpose::AdminService` and `KeyPurpose::ChangePasswordService`
+//!    (docs/53 §5.2: `kadmin/changepw`, derived by the same one function —
+//!    task K3) appear only where a purpose is
 //!    **matched or compared** — a match arm's pattern (`… =>`, `… |`), a
 //!    comparison (`==`, `!=`) — never where one is **chosen** (a handle's
 //!    argument, a field value, an arm's result, …). A component that needs a
@@ -37,8 +39,14 @@
 
 use std::path::{Path, PathBuf};
 
-/// The purpose literals this guard follows.
-const PURPOSES: [&str; 2] = ["KeyPurpose::Service", "KeyPurpose::AdminService"];
+/// The purpose literals this guard follows: every service object's purpose
+/// `KeyPurpose::of_service_name` can derive — `Service`, `AdminService`
+/// (R2) and `ChangePasswordService` (docs/53 §5.2, task K3; A-117).
+const PURPOSES: [&str; 3] = [
+    "KeyPurpose::Service",
+    "KeyPurpose::AdminService",
+    "KeyPurpose::ChangePasswordService",
+];
 
 /// Crates not scanned for rule 1, with the reason: keyd's custody crates
 /// define the derivation and enforce the pairing of a purpose with its bound
@@ -215,7 +223,7 @@ fn no_component_chooses_a_service_purpose_by_a_literal() {
          (docs/52 R2b): {violations:#?}"
     );
     // Positive control: the scan sees the matches it must see — the admin
-    // plane's digest codes of the two service purposes.
+    // plane's digest codes of the three service purposes.
     for literal in PURPOSES {
         assert!(
             matched
@@ -267,6 +275,8 @@ let a = KeyHandle::new(p, KeyPurpose::Service);
     if p != KeyPurpose::AdminService { x }
 // KeyHandle::new(p, KeyPurpose::Service)
 let b = KeyPurpose::ServiceLike;
+let d = KeyHandle::new(p, KeyPurpose::ChangePasswordService);
+    KeyPurpose::ChangePasswordService => 4,
 #[cfg(test)]
 mod tests {
     let c = KeyHandle::new(p, KeyPurpose::AdminService);
@@ -284,6 +294,8 @@ mod tests {
             (6, "KeyPurpose::AdminService", Use::Matched),
             (7, "KeyPurpose::Service", Use::Matched),
             (8, "KeyPurpose::AdminService", Use::Matched),
+            (11, "KeyPurpose::ChangePasswordService", Use::Chosen),
+            (12, "KeyPurpose::ChangePasswordService", Use::Matched),
         ]
     );
 }

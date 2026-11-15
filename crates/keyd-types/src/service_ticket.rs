@@ -36,6 +36,7 @@
 //! |---|---|---|---|
 //! | `Unbound` | `open_and_verify_service_ticket` | [`ServiceContext`] — carries a one-time [`ServiceCtxId`] | the session key and subkey, under that id, for the later GSS steps (task L6b) |
 //! | `OperationDigest(d)` | `verify_operation_ticket` | [`OperationTicket`] — **no context id field**, and the verified `d` | nothing (the replay-cache entry only) |
+//! | `ChangePassword` | `open_change_password_request` | `ChangePasswordContext` (crate `change_password`) — a one-time request context id and a verdict | the session key, the subkey and — when acceptable — the new password, until the completion or the error seal (task K3, docs/53 §5.5) |
 //!
 //! RFC 4120 3.2.3: a server saves a subkey "for later use" or uses it for
 //! its KRB_AP_REP; the admin channel has neither (no KRB_AP_REP, no
@@ -100,7 +101,8 @@ impl fmt::Debug for OperationDigest {
 /// therefore which purpose of key set opens it (module documentation).
 /// Spec: RFC 4120 5.5.1 (cksum), 7.5.1 item 10; docs/52 §5 item 3
 /// (`AppBinding::{Unbound, OperationDigest([u8; 32])}`); docs/questions/
-/// Q-463 item 3 (A-102).
+/// Q-463 item 3 (A-102); docs/53 §5.3 (the change-password profile, task
+/// K3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AppBinding {
     /// No application data: the Authenticator must carry **no** `cksum`
@@ -117,6 +119,20 @@ pub enum AppBinding {
     /// Spec: RFC 4120 5.5.1, 7.5.1 item 10; RFC 3961 §3, §4; docs/52 §5
     /// items 2-3.
     OperationDigest(OperationDigest),
+    /// An RFC 3244 change-password request: the application data is the
+    /// KRB-PRIV that accompanies the AP-REQ, encrypted under the
+    /// Authenticator's subkey ("This user-data field in the KRB-PRIV message
+    /// is encrypted using the subkey from the authenticator in the AP-REQ
+    /// data") — keyd decrypts it in the same call in which it verifies the
+    /// AP-REQ, so no other KRB-PRIV can be paired with this AP-REQ. The
+    /// Authenticator must carry **no** `cksum` (no application data is
+    /// defined to verify one over — refused, not ignored), **must** carry a
+    /// subkey and a sequence number. Opens only a
+    /// [`KeyPurpose::ChangePasswordService`] key set. Carries nothing: the
+    /// KRB-PRIV octets are the operation's own argument.
+    /// Spec: RFC 3244 §2; RFC 4120 5.5.1, 5.7.1, 7.5.1 item 13; docs/53 §5.3,
+    /// §5.4 item 1; docs/questions/Q-603 items 3, 4 (A-117).
+    ChangePassword,
 }
 
 impl AppBinding {
@@ -131,6 +147,7 @@ impl AppBinding {
         match self {
             AppBinding::Unbound => KeyPurpose::Service,
             AppBinding::OperationDigest(_) => KeyPurpose::AdminService,
+            AppBinding::ChangePassword => KeyPurpose::ChangePasswordService,
         }
     }
 
@@ -147,6 +164,7 @@ impl AppBinding {
         match self {
             AppBinding::Unbound => Operation::OpenAndVerifyServiceTicket,
             AppBinding::OperationDigest(_) => Operation::VerifyOperationTicket,
+            AppBinding::ChangePassword => Operation::OpenChangePasswordRequest,
         }
     }
 }

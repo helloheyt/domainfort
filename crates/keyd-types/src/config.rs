@@ -30,6 +30,21 @@ pub const MAX_CLOCK_SKEW_SECS: u32 = 3_600;
 /// "short (seconds)").
 pub const MAX_TOKEN_LIFETIME_SECS: u32 = 300;
 
+/// The least value of [`KeydConfig::min_password_chars`]: 12 characters — the
+/// project's interim floor (P-24: no allowed source fixes a value; the
+/// phase-1 schema has no minPwdLength). Also the default.
+/// Spec: [MS-SAMR] 3.1.1.7.2 item 3.2.1; PENDING-OWNER P-24, A-79;
+/// docs/53 §6.1 (`min_password_chars`, floor 12); docs/questions/Q-605
+/// item 2 (A-117).
+pub const MIN_PASSWORD_CHARS_FLOOR: u32 = 12;
+
+/// The greatest value of [`KeydConfig::min_password_chars`]: 256 — no
+/// password can be longer ([MS-SAMR] 3.1.1.7.2 item 2: "less than or equal
+/// to 256 characters"), so a larger minimum would refuse every password.
+/// Spec: [MS-SAMR] 3.1.1.7.2 item 2; docs/questions/Q-605 item 2 ("floor
+/// 12, maximum 256").
+pub const MAX_MIN_PASSWORD_CHARS: u32 = 256;
+
 /// Ticket flags an operator MAY place in the allowed mask.
 ///
 /// Everything else has no code path in phase 1, so config validation refuses
@@ -145,6 +160,22 @@ pub struct KeydConfig {
     pub max_service_contexts: usize,
     /// Bound of the replay cache (docs/10 D33).
     pub replay_cache_capacity: usize,
+    /// Bound of the change-password request-context table
+    /// (`open_change_password_request`: the session key, the subkey and —
+    /// when acceptable — the new password of one RFC 3244 request, until it
+    /// is completed or its error is sealed; docs/53 §5.5
+    /// `max_change_password_contexts`). Each entry lives at most
+    /// `token_lifetime_secs`.
+    pub max_change_password_contexts: usize,
+    /// The least number of characters (Unicode code points) of any password
+    /// keyd installs — on every path: `set_secret` (admind, the ceremony's
+    /// first administrators) and `complete_change_password` (kpasswd). keyd's
+    /// install path is the one place every password is cleartext, so the
+    /// password policy is enforced there (docs/53 §6.1, R53-10).
+    /// [`MIN_PASSWORD_CHARS_FLOOR`] ..= [`MAX_MIN_PASSWORD_CHARS`].
+    /// Spec: [MS-SAMR] 3.1.1.7.2 item 3.2.1; P-24; docs/53 §6;
+    /// docs/questions/Q-605 items 1, 2 (A-117).
+    pub min_password_chars: u32,
     /// Ticket template policy.
     pub ticket_policy: TicketPolicy,
     /// string-to-key parameters used by `set_secret` (four octets, RFC 3962
@@ -187,6 +218,8 @@ impl KeydConfig {
             max_armor_contexts: 1_024,
             max_service_contexts: 1_024,
             replay_cache_capacity: 65_536,
+            max_change_password_contexts: 64,
+            min_password_chars: MIN_PASSWORD_CHARS_FLOOR,
             ticket_policy: TicketPolicy::default(),
             s2k_params: None,
             max_s2k_iterations: 50_000,
@@ -220,6 +253,7 @@ impl KeydConfig {
             self.max_armor_contexts,
             self.max_service_contexts,
             self.replay_cache_capacity,
+            self.max_change_password_contexts,
             self.throttle.capacity,
             self.preauth_throttle.capacity,
         ] {
@@ -250,6 +284,11 @@ impl KeydConfig {
             if throttle.max_failures == 0 || throttle.window_secs == 0 {
                 return Err(ConfigError::Throttle);
             }
+        }
+        // The password policy's minimum: never below the floor (P-24), never
+        // above the maximum a password may have ([MS-SAMR] 3.1.1.7.2 item 2).
+        if !(MIN_PASSWORD_CHARS_FLOOR..=MAX_MIN_PASSWORD_CHARS).contains(&self.min_password_chars) {
+            return Err(ConfigError::PasswordPolicy);
         }
         Ok(())
     }
@@ -314,6 +353,33 @@ mod tests {
     #[test]
     fn default_config_is_valid() {
         assert_eq!(base().validate(), Ok(()));
+    }
+
+    /// P-24 / docs/53 §6.1 (Q-605 item 2): the minimum password length is
+    /// 12 by default and 12 ..= 256; anything else is refused.
+    #[test]
+    fn min_password_chars_is_bounded() {
+        assert_eq!(base().min_password_chars, 12);
+        for (value, ok) in [
+            (0, false),
+            (11, false),
+            (12, true),
+            (64, true),
+            (256, true),
+            (257, false),
+        ] {
+            let mut c = base();
+            c.min_password_chars = value;
+            let expected = if ok {
+                Ok(())
+            } else {
+                Err(ConfigError::PasswordPolicy)
+            };
+            assert_eq!(c.validate(), expected, "{value}");
+        }
+        let mut c = base();
+        c.max_change_password_contexts = 0;
+        assert_eq!(c.validate(), Err(ConfigError::Capacity));
     }
 
     /// The default mask denies the docs/30 §2.6 options (RFC 4120 5.3 bits).

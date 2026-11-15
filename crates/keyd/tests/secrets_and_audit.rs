@@ -277,14 +277,16 @@ fn every_operation_emits_exactly_one_audit_record() {
             &DIRECTORY,
             &ALICE,
             &alice_binding(),
-            z("next"),
+            z("a next passphrase"),
             ALICE_SALT,
             &n,
         )
         .unwrap();
     check(&f, Operation::SetSecret, &DIRECTORY, true);
     // No role holds verify_secret (A-102, docs/52 R4): one record, refused.
-    let _ = f.keyd.verify_secret(&DIRECTORY, &ALICE, z("next"), &n);
+    let _ = f
+        .keyd
+        .verify_secret(&DIRECTORY, &ALICE, z("a next passphrase"), &n);
     check(&f, Operation::VerifySecret, &DIRECTORY, false);
 
     let h = KeyHandle::new(
@@ -398,6 +400,31 @@ fn every_operation_emits_exactly_one_audit_record() {
         &n,
     );
     check(&f, Operation::VerifyOperationTicket, &LDAP, false);
+
+    // The change-password operations (task K3): one record either way. The
+    // successful paths are audited in tests/change_password.rs.
+    let peer = keyd::HostAddr::ipv4([192, 0, 2, 10]);
+    let local = keyd::HostAddr::ipv4([192, 0, 2, 1]);
+    let _ = f.keyd.open_change_password_request(
+        &LDAP,
+        &SERVICE.principal,
+        &[0x30, 0x00],
+        &[0x30, 0x00],
+        &peer,
+        &local,
+        &n,
+    );
+    check(&f, Operation::OpenChangePasswordRequest, &LDAP, false);
+    let unknown = keyd::ChangePasswordCtxId::from_bytes([9; 16]);
+    let _ = f.keyd.complete_change_password(&LDAP, &unknown, &ALICE, &n);
+    check(&f, Operation::CompleteChangePassword, &LDAP, false);
+    let _ = f.keyd.seal_change_password_error(
+        &DIRECTORY,
+        &unknown,
+        krb_proto::NonZeroResultCode::HardError,
+        &n,
+    );
+    check(&f, Operation::SealChangePasswordError, &DIRECTORY, false);
 
     // Daemon support (docs/50 §3.4): one record either way.
     f.keyd.describe_config(&KDC, &n).unwrap();

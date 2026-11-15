@@ -20,6 +20,7 @@ use crate::authz::{
     provisioning_only, purpose_permitted, role_permits, startup_hold_down_applies, CallerId,
     HandleSlot, Operation,
 };
+use crate::change_password::ChangePasswordEntry;
 use crate::config::KeydConfig;
 use crate::decision::DecisionTable;
 use crate::enctype::to_crypto;
@@ -67,6 +68,10 @@ pub struct Keyd<S: KeyStore, A: AuditSink, E: EntropySource = OsEntropy> {
     /// Verified service tickets: their session keys and subkeys, held for
     /// the later GSS steps (docs/49 §3.3, A-46).
     pub(crate) service_contexts: TokenTable<ServiceContextEntry>,
+    /// Opened change-password requests: the session key, the subkey and —
+    /// when acceptable — the new password, until the completion or the error
+    /// seal consumes the context (task K3; docs/53 §5.5).
+    pub(crate) change_password_contexts: TokenTable<ChangePasswordEntry>,
     /// The one replay cache of every AP-REQ keyd verifies (RFC 4120 3.2.3).
     pub(crate) replay: ReplayCache,
     /// The decision table (A-102, docs/52 R1 — generalizing A-100's grant
@@ -183,6 +188,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             contexts: TokenTable::new(config.max_tgt_contexts),
             armors: TokenTable::new(config.max_armor_contexts),
             service_contexts: TokenTable::new(config.max_service_contexts),
+            change_password_contexts: TokenTable::new(config.max_change_password_contexts),
             replay: ReplayCache::new(config.replay_cache_capacity),
             decisions: DecisionTable::new(),
             preauth_throttle: FailureWindowThrottle::new(config.preauth_throttle),
@@ -243,7 +249,10 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// reason `NoGrant`: decided from the table alone, before any key set is
     /// read, so it is an authorization refusal like the role check — one
     /// record, no intent (A-88), nothing changed. The entry is consumed by
-    /// the operation right after this step (crate decision.rs). The four
+    /// the operation right after this step (crate decision.rs). The same for
+    /// `complete_change_password` (task K3): a live entry of a
+    /// `ChangePassword` decision for the target handle — each entry is
+    /// visible to its own executor only (Q-662). The four
     /// Admin operations that run a decision by id (`rotate_key`,
     /// `rotate_krbtgt`, `retire_kvno`, `destroy_key_set`) are never admitted
     /// here (`NoDecision`): their authorization step is
@@ -264,12 +273,12 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     ) -> Internal<()> {
         self.admit_base(caller, op, handles, now)?;
         match op {
-            Operation::SetSecret => {
+            Operation::SetSecret | Operation::CompleteChangePassword => {
                 let now_s = kerberos_time_seconds(now);
                 let granted = handles
                     .iter()
                     .find(|(slot, _)| *slot == HandleSlot::Primary)
-                    .is_some_and(|(_, handle)| self.decisions.is_live_secret(handle, now_s));
+                    .is_some_and(|(_, handle)| self.decisions.is_live_secret(handle, op, now_s));
                 if granted {
                     Ok(())
                 } else {
@@ -317,7 +326,13 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         result: &Internal<T>,
     ) {
         let (outcome, reason) = match result {
-            Ok(_) => (AuditOutcome::Success, AuditReason::None),
+            // A success may name what it established (task K3: the verdict
+            // of an opened change-password request, the result code of a
+            // sealed error reply) — never which rule failed, never a secret.
+            Ok(_) => (
+                AuditOutcome::Success,
+                fields.success_reason.unwrap_or(AuditReason::None),
+            ),
             Err(deny) => (deny.outcome, deny.reason),
         };
         self.audit.record(&AuditRecord {
@@ -347,6 +362,10 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> fmt::Debug for Keyd<S, A, E> {
             .field("live_tgt_contexts", &self.contexts.len())
             .field("live_armor_contexts", &self.armors.len())
             .field("live_service_contexts", &self.service_contexts.len())
+            .field(
+                "live_change_password_contexts",
+                &self.change_password_contexts.len(),
+            )
             .field("decisions", &self.decisions.len())
             .field("ceremony", &self.ceremony)
             .finish()
@@ -363,6 +382,11 @@ pub(crate) struct AuditFields {
     pub(crate) secondary: Option<AuditKeyRef>,
     pub(crate) approvers: Option<[PrincipalId; 2]>,
     pub(crate) decision: Option<DecisionId>,
+    /// The reason a **successful** operation records (task K3): the verdict
+    /// of `open_change_password_request` or the result code
+    /// `seal_change_password_error` sealed; `None` ⇒ `AuditReason::None`.
+    /// Spec: docs/53 §9 ("one record with the code"); docs/10 §10.
+    pub(crate) success_reason: Option<AuditReason>,
 }
 
 impl AuditFields {

@@ -31,7 +31,7 @@ const CAROL: KeyHandle = KeyHandle::new(
     PrincipalId::from_bytes([0xCA; 16]),
     KeyPurpose::PrincipalLongterm,
 );
-const CAROL_PASSWORD: &str = "carol's first password";
+const CAROL_PASSWORD: &str = "her first passphrase";
 const CAROL_SALT: &str = "EXAMPLE.ORGcarol";
 
 fn carol_name() -> PrincipalName {
@@ -101,7 +101,7 @@ fn set_secret_on_a_new_set_returns_the_initial_kvno() {
 fn set_secret_on_an_existing_set_returns_current_plus_one() {
     let mut f = Fixture::new();
     // alice was created at kvno 1 by the fixture.
-    for (password, expected) in [("second", 2), ("third", 3)] {
+    for (password, expected) in [("a second passphrase", 2), ("a third passphrase", 3)] {
         f.grant(&ALICE, &alice_binding(), ALICE_SALT, &now())
             .unwrap();
         assert_eq!(
@@ -119,14 +119,20 @@ fn set_secret_on_an_existing_set_returns_current_plus_one() {
     }
     assert!(f
         .keyd
-        .verify_preauth(&KDC, &ALICE, &pa_with("third", ALICE_SALT, 3), None, &now())
+        .verify_preauth(
+            &KDC,
+            &ALICE,
+            &pa_with("a third passphrase", ALICE_SALT, 3),
+            None,
+            &now()
+        )
         .is_ok());
     // The superseded kvno is not the current one any more.
     assert_eq!(
         f.keyd.verify_preauth(
             &KDC,
             &ALICE,
-            &pa_with("second", ALICE_SALT, 2),
+            &pa_with("a second passphrase", ALICE_SALT, 2),
             None,
             &now()
         ),
@@ -182,7 +188,7 @@ fn destroyed_handle_is_unknown_to_every_operation() {
             &DIRECTORY,
             &ALICE,
             &alice_binding(),
-            z("second"),
+            z("a second passphrase"),
             ALICE_SALT,
             &now(),
         ),
@@ -193,7 +199,7 @@ fn destroyed_handle_is_unknown_to_every_operation() {
         .verify_preauth(
             &KDC,
             &ALICE,
-            &pa_with("second", ALICE_SALT, 2),
+            &pa_with("a second passphrase", ALICE_SALT, 2),
             None,
             &now(),
         )
@@ -209,7 +215,7 @@ fn destroyed_handle_is_unknown_to_every_operation() {
     assert_eq!(last.kvno, Some(Kvno::new(2)));
     assert_eq!(last.decision, Some(destroy));
 
-    for (password, kvno) in [("second", 2), (ALICE_PASSWORD, 1)] {
+    for (password, kvno) in [("a second passphrase", 2), (ALICE_PASSWORD, 1)] {
         assert_eq!(
             f.keyd.verify_preauth(
                 &KDC,
@@ -281,7 +287,7 @@ fn destroyed_handle_is_unknown_to_every_operation() {
             &DIRECTORY,
             &ALICE,
             &krbtgt_binding(),
-            z("new"),
+            z("a new passphrase"),
             ALICE_SALT,
             &now(),
         ),
@@ -300,7 +306,7 @@ fn destroyed_handle_is_unknown_to_every_operation() {
             &DIRECTORY,
             &ALICE,
             &alice_binding(),
-            z("new"),
+            z("a new passphrase"),
             ALICE_SALT,
             &now(),
         ),
@@ -308,7 +314,13 @@ fn destroyed_handle_is_unknown_to_every_operation() {
     );
     assert!(f
         .keyd
-        .verify_preauth(&KDC, &ALICE, &pa_with("new", ALICE_SALT, 1), None, &now())
+        .verify_preauth(
+            &KDC,
+            &ALICE,
+            &pa_with("a new passphrase", ALICE_SALT, 1),
+            None,
+            &now()
+        )
         .is_ok());
     // The destroyed versions' passwords do not come back.
     assert_eq!(

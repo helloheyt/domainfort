@@ -877,7 +877,9 @@ fn key_target(wire: &WireKeyTarget) -> Result<KeyTarget, ConversionError> {
 fn wire_key_target(target: &KeyTarget) -> Result<WireKeyTarget, ConversionError> {
     if matches!(
         target.handle.purpose,
-        keyd_types::KeyPurpose::Krbtgt | keyd_types::KeyPurpose::AdminService
+        keyd_types::KeyPurpose::Krbtgt
+            | keyd_types::KeyPurpose::AdminService
+            | keyd_types::KeyPurpose::ChangePasswordService
     ) {
         return Err(ConversionError::NonCanonical);
     }

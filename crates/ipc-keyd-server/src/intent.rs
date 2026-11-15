@@ -64,6 +64,11 @@ use krb_proto::KerberosTime;
 /// `Service` key set) the record's secondary key, as keyd's own record of it
 /// (crates/keyd decision.rs); no binding and no lifetime.
 ///
+/// **Task K4 (docs/53 §9):** `complete_change_password` is a key-state
+/// change: its record names the target handle and — as for `set_secret` —
+/// the decision keyd's table holds for it (`keyd::Keyd::secret_decision`).
+/// The context id and the password are not kept (no field for them).
+///
 /// **A-102 (docs/52 §4.5):** `register_decision` takes the same path (it
 /// loosens keyd): the record names the decided key sets, the kvno a
 /// `RetireKvno` decision names, the first two approvers and the decision
@@ -94,7 +99,8 @@ pub struct KeyStateIntent {
 impl KeyStateIntent {
     /// The intent of `call` by `caller` at `now` if `call` needs one and
     /// names its parameters itself — `set_secret`, `create_key`,
-    /// `grant_set_secret`, `register_decision` — else `None`. An execution of
+    /// `grant_set_secret`, `register_decision`, `complete_change_password`
+    /// (task K4) — else `None`. An execution of
     /// a decision names only its id: its intent is
     /// [`KeyStateIntent::decided`]. The match is exhaustive over [`Call`]: a
     /// new call does not compile until it is classified here. [`classify`]
@@ -112,6 +118,14 @@ impl KeyStateIntent {
             Call::CreateKey { handle, .. } => {
                 (Operation::CreateKey, Some(*handle), None, None, None, None)
             }
+            Call::CompleteChangePassword { target, .. } => (
+                Operation::CompleteChangePassword,
+                Some(*target),
+                None,
+                None,
+                None,
+                None,
+            ),
             Call::GrantSetSecret { targets, .. } => (
                 Operation::GrantSetSecret,
                 targets.first().map(|t| t.handle),
@@ -152,7 +166,9 @@ impl KeyStateIntent {
             | Call::DescribeConfig
             | Call::Ping
             | Call::SealCeremony
-            | Call::ListDestroyDecisions { .. } => return None,
+            | Call::ListDestroyDecisions { .. }
+            | Call::OpenChangePasswordRequest { .. }
+            | Call::SealChangePasswordError { .. } => return None,
         };
         Some(KeyStateIntent {
             ts: now,
@@ -378,10 +394,14 @@ fn needs<S: KeyStore, A: AuditSink, E: EntropySource>(
         return Needs::No;
     }
     // A-102 (docs/52 §4.5): a `set_secret` names its handle; the decision
-    // it will consume is keyd's to say.
+    // it will consume is keyd's to say. The same for a change-password
+    // completion's target (task K4).
     match call {
         Call::SetSecret { handle, .. } => {
             Needs::Intent(intent.with_decision(keyd.secret_decision(handle)))
+        }
+        Call::CompleteChangePassword { target, .. } => {
+            Needs::Intent(intent.with_decision(keyd.secret_decision(target)))
         }
         _ => Needs::Intent(intent),
     }

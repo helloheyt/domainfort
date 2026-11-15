@@ -211,8 +211,10 @@ code_table! {
     /// `ListDestroyDecisions` (codes 18-20) were appended by A-102 (docs/52
     /// R1, R3). `VerifyOperationTicket` (code 21) was appended by Q-523 (the
     /// operation-bound service-ticket verification, which keeps no service
-    /// context); codes 1-20 keep their meaning.
-    /// Spec: docs/10 §2-§7; crates/keyd authz.rs; docs/52 §4.
+    /// context); codes 1-20 keep their meaning. `OpenChangePasswordRequest`,
+    /// `CompleteChangePassword`, `SealChangePasswordError` (codes 22-24) were
+    /// appended by task K3 (docs/53 §5.5, §9); codes 1-21 keep their meaning.
+    /// Spec: docs/10 §2-§7; crates/keyd authz.rs; docs/52 §4; docs/53 §9.
     pub enum KeydOperation {
         VerifyPreauth,
         IssueAsRep,
@@ -235,14 +237,24 @@ code_table! {
         SealCeremony,
         ListDestroyDecisions,
         VerifyOperationTicket,
+        OpenChangePasswordRequest,
+        CompleteChangePassword,
+        SealChangePasswordError,
     }
 }
 
 code_table! {
     /// `keyd::KeyPurpose`. `AdminService` (code 4) appended by R2 (A-102,
-    /// docs/52 §5 item 3); 1-3 keep their codes.
+    /// docs/52 §5 item 3); 1-3 keep their codes. `ChangePasswordService`
+    /// (code 5) appended by task K3 (docs/53 §5.2); 1-4 keep their codes.
     /// Spec: docs/10 §2 (I3); crates/keyd-types model.rs.
-    pub enum KeyPurposeCode { PrincipalLongterm, Krbtgt, Service, AdminService }
+    pub enum KeyPurposeCode {
+        PrincipalLongterm,
+        Krbtgt,
+        Service,
+        AdminService,
+        ChangePasswordService,
+    }
 }
 
 code_table! {
@@ -292,8 +304,11 @@ code_table! {
     /// 77-78) were appended by R2 (A-102, docs/52 §5 item 3) the same way;
     /// `Unlisted` moved from 77 to 79. `SecretDecisionDiscarded` (code 79)
     /// was appended by R6b (docs/questions/Q-520) the same way; `Unlisted`
-    /// moved from 79 to 80.
-    /// Spec: crates/keyd audit.rs; docs/10 §9, §10, I8.
+    /// moved from 79 to 80. The fourteen change-password reasons
+    /// (`SubkeyMissing` … `KpasswdInitialFlagNeeded`, codes 80-93) were
+    /// appended by task K3 (docs/53 §9) the same way; `Unlisted` moved from
+    /// 80 to 94.
+    /// Spec: crates/keyd audit.rs; docs/10 §9, §10, I8; docs/53 §9.
     pub enum KeydReason {
         None,
         RoleNotPermitted,
@@ -374,6 +389,20 @@ code_table! {
         OperationDigestMissing,
         OperationDigestMismatch,
         SecretDecisionDiscarded,
+        SubkeyMissing,
+        SequenceNumberMissing,
+        KrbPrivSequenceMismatch,
+        KrbPrivTimestampSkew,
+        KrbPrivAddressMismatch,
+        PasswordPolicyRefused,
+        ChangePasswordNotAcceptable,
+        ResultCodeNotPermitted,
+        KpasswdMalformed,
+        KpasswdHardError,
+        KpasswdAuthError,
+        KpasswdSoftError,
+        KpasswdAccessDenied,
+        KpasswdInitialFlagNeeded,
         Unlisted,
     }
 }

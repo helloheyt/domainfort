@@ -80,12 +80,13 @@ impl Kvno {
 /// tagged for one purpose is usable only by the operations of that purpose
 /// (invariant I3).
 ///
-/// Phase 1 implements exactly these four purposes. The other purposes of
+/// Phase 1 implements exactly these five purposes. The other purposes of
 /// docs/10 §1 (GKDI root, backup key, DC identity) are out of scope and have
 /// no variant.
 ///
 /// Spec: docs/10 §1 (KeyPurpose), §2, §12 I3; docs/09 א.3 (2); docs/52 §3.2,
-/// §5 item 3 (R2, the admin service's own purpose; A-102).
+/// §5 item 3 (R2, the admin service's own purpose; A-102); docs/53 §4.5,
+/// §5.2 (the change-password service's own purpose; A-117).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum KeyPurpose {
@@ -108,6 +109,19 @@ pub enum KeyPurpose {
     /// Spec: docs/52 §3.2 (C2), §5 items 2-3, §7 R2; docs/questions/Q-463
     /// (A-102); A-50; A-73; RFC 4120 5.3.
     AdminService = 3,
+    /// The change-password service's key set (`kadmin/changepw`, RFC 3244
+    /// §2: "The AP-REQ message must be for the service principal
+    /// kadmin/changepw@REALM"): the key the kpasswd tickets are sealed
+    /// under. A purpose of its own so that a ticket under it is opened
+    /// **only** by `open_change_password_request` — whose AP-REQ must carry
+    /// a subkey and a sequence number and whose KRB-PRIV is decrypted under
+    /// that subkey in the same call — and by no other verification, and so
+    /// that no `set_secret`, grant, destruction or rotation can replace it
+    /// (its key is keyd-drawn only). Bound only to the change-password
+    /// service's name ([`is_change_password_service_name`]).
+    /// Spec: RFC 3244 §2; docs/53 R53-6, §4.5, §5.2, §5.3; docs/questions/
+    /// Q-601 item 4 (A-117).
+    ChangePasswordService = 4,
 }
 
 /// The service class — the first name component — of the admin service's
@@ -133,19 +147,50 @@ pub fn is_admin_service_name(name: &PrincipalName) -> bool {
             .is_some_and(|c| c.as_bytes() == ADMIN_SERVICE_CLASS.as_bytes())
 }
 
+/// The two name components of the change-password service's principal,
+/// `kadmin/changepw` — the name RFC 3244 §2 gives ("The AP-REQ message must
+/// be for the service principal kadmin/changepw@REALM").
+/// Spec: RFC 3244 §2; docs/53 §5.2.
+pub const CHANGE_PASSWORD_SERVICE_NAME: [&str; 2] = ["kadmin", "changepw"];
+
+/// `true` if `name` is the change-password service's: exactly the two
+/// components of [`CHANGE_PASSWORD_SERVICE_NAME`], octet for octet (the
+/// name-type is a hint only, RFC 4120 6.2; no canonicalization of this name,
+/// [MS-KILE] 3.3.5.1.2 as recorded in docs/53 §2.2). The same shape of rule
+/// as [`is_admin_service_name`]: keyd binds a
+/// [`KeyPurpose::ChangePasswordService`] key set to this name only, and no
+/// other key set to it.
+/// Spec: RFC 3244 §2; RFC 4120 6.2; docs/53 R53-6, §5.2.
+#[must_use]
+pub fn is_change_password_service_name(name: &PrincipalName) -> bool {
+    name.name_string.len() == CHANGE_PASSWORD_SERVICE_NAME.len()
+        && name
+            .name_string
+            .iter()
+            .zip(CHANGE_PASSWORD_SERVICE_NAME)
+            .all(|(component, expected)| component.as_bytes() == expected.as_bytes())
+}
+
 impl KeyPurpose {
     /// The purpose of the key set a service ticket for `name` is sealed
     /// under: [`KeyPurpose::AdminService`] for the admin service's name
-    /// ([`is_admin_service_name`]), [`KeyPurpose::Service`] for every other
-    /// service. The KDC's account source names the handle with it, and keyd
-    /// refuses any other pairing at the binding check (A-19), so a ticket
-    /// for the admin service is never sealed under a plain service key.
+    /// ([`is_admin_service_name`]), [`KeyPurpose::ChangePasswordService`]
+    /// for the change-password service's name
+    /// ([`is_change_password_service_name`]), [`KeyPurpose::Service`] for
+    /// every other service. The KDC's account source names the handle with
+    /// it, and keyd refuses any other pairing at the binding check (A-19), so
+    /// a ticket for either of those services is never sealed under a plain
+    /// service key. The **only** derivation of a service object's purpose
+    /// (docs/52 R2b; crate tests `one_service_purpose_derivation`).
     /// Spec: docs/47 §1.3 (`AccountSource::service`: the key set
-    /// `(objectGUID, Service)`), §9.1; docs/52 §5 item 3 (R2); A-73.
+    /// `(objectGUID, Service)`), §9.1; docs/52 §5 item 3 (R2, R2b); A-73;
+    /// docs/53 R53-6, §5.2 (A-117).
     #[must_use]
     pub fn of_service_name(name: &PrincipalName) -> KeyPurpose {
         if is_admin_service_name(name) {
             KeyPurpose::AdminService
+        } else if is_change_password_service_name(name) {
+            KeyPurpose::ChangePasswordService
         } else {
             KeyPurpose::Service
         }
@@ -176,8 +221,10 @@ impl KeyHandle {
 /// else. There is no other constructor, so a component that holds one names
 /// exactly the key set the KDC seals that service's tickets under, and
 /// cannot name a purpose that contradicts the name: the admin service
-/// (`admind/<host>`) is always [`KeyPurpose::AdminService`], every other
-/// service [`KeyPurpose::Service`].
+/// (`admind/<host>`) is always [`KeyPurpose::AdminService`], the
+/// change-password service (`kadmin/changepw`, docs/53 §5.2) always
+/// [`KeyPurpose::ChangePasswordService`], every other service
+/// [`KeyPurpose::Service`].
 ///
 /// Class closed (docs/52 R2b, AGENTS.md §6.1): one fact — the purpose of a
 /// service object's key set — chosen in several places (the KDC's account
@@ -220,8 +267,8 @@ impl ServiceKeyHandle {
         self.handle.principal
     }
 
-    /// The derived purpose: `Service` or `AdminService`. Spec: docs/52 §5
-    /// item 3.
+    /// The derived purpose: `Service`, `AdminService` or
+    /// `ChangePasswordService`. Spec: docs/52 §5 item 3; docs/53 §5.2.
     #[must_use]
     pub const fn purpose(&self) -> KeyPurpose {
         self.handle.purpose
@@ -388,5 +435,51 @@ mod tests {
                 KeyPurpose::of_service_name(&name(3, parts))
             );
         }
+    }
+
+    /// RFC 3244 §2 ("the service principal kadmin/changepw@REALM"); docs/53
+    /// §5.2 (R53-6): exactly `kadmin` / `changepw`, octet for octet, whatever
+    /// the name-type (RFC 4120 6.2), derives the change-password service's
+    /// key set; a case variant, a reordering, one or three components, or the
+    /// admin service's class do not.
+    #[test]
+    fn the_change_password_service_name_derives_its_own_purpose() {
+        let p = PrincipalId::from_bytes([9; 16]);
+        for name_type in [0, 1, 2, 3] {
+            let handle = ServiceKeyHandle::of_service(p, &name(name_type, &["kadmin", "changepw"]));
+            assert_eq!(handle.purpose(), KeyPurpose::ChangePasswordService);
+            assert_eq!(
+                handle.handle(),
+                KeyHandle::new(p, KeyPurpose::ChangePasswordService)
+            );
+            assert!(is_change_password_service_name(&name(
+                name_type,
+                &["kadmin", "changepw"]
+            )));
+        }
+        for parts in [
+            &["KADMIN", "changepw"][..],
+            &["kadmin", "CHANGEPW"][..],
+            &["changepw", "kadmin"][..],
+            &["kadmin"][..],
+            &["kadmin", "changepw", "x"][..],
+            &["kadmin/changepw"][..],
+            &["kadmin", "admin"][..],
+        ] {
+            assert!(
+                !is_change_password_service_name(&name(1, parts)),
+                "{parts:?}"
+            );
+            assert_ne!(
+                KeyPurpose::of_service_name(&name(1, parts)),
+                KeyPurpose::ChangePasswordService,
+                "{parts:?}"
+            );
+        }
+        // The admin service's rule and this one never overlap.
+        assert_eq!(
+            KeyPurpose::of_service_name(&name(3, &["admind", "changepw"])),
+            KeyPurpose::AdminService
+        );
     }
 }

@@ -537,7 +537,7 @@ fn key_change_between_steps_denied() {
             &DIRECTORY,
             &ALICE,
             &alice_binding(),
-            Zeroizing::new("changed".to_owned()),
+            Zeroizing::new("a changed passphrase".to_owned()),
             ALICE_SALT,
             &now(),
         )

@@ -324,6 +324,30 @@ fn run<S: KeyStore, A: AuditSink, E: EntropySource>(
         Call::ListDestroyDecisions { after } => {
             Answer::ListDestroyDecisions(keyd.list_destroy_decisions(caller, after, now))
         }
+        // Task K4 (docs/53 §5.5): the change-password operations. The peer
+        // and local addresses are the front's kernel's report, carried by
+        // dird; `now` is the daemon's clock (R50-5).
+        Call::OpenChangePasswordRequest {
+            service,
+            ap_req_octets,
+            krb_priv_octets,
+            peer,
+            local,
+        } => Answer::OpenChangePasswordRequest(keyd.open_change_password_request(
+            caller,
+            &service,
+            &ap_req_octets,
+            &krb_priv_octets,
+            &peer,
+            &local,
+            now,
+        )),
+        Call::CompleteChangePassword { ctx, target } => Answer::CompleteChangePassword(
+            keyd.complete_change_password(caller, &ctx, &target, now),
+        ),
+        Call::SealChangePasswordError { ctx, code } => Answer::SealChangePasswordError(
+            keyd.seal_change_password_error(caller, &ctx, code, now),
+        ),
     }
 }
 

@@ -219,3 +219,82 @@ fn the_clients_state_calls_are_the_calls_classified_for_an_intent() {
         assert_eq!(derived, server_side, "{operation:?}");
     }
 }
+
+/// Task K4 (docs/53 §5.5, §9; docs/52 §3.10 (c)): `complete_change_password`
+/// is a key-state change. Without a live `ChangePassword` decision for its
+/// target keyd's authorization step refuses it — a plain call, one record,
+/// no intent; with dird's decision it is classified for an acknowledged
+/// intent whose record names the target and the decision (from keyd's
+/// table), never the context or a password. The request's opening and its
+/// error seal change no key state: plain.
+#[test]
+fn a_change_password_completion_takes_the_intent_path() {
+    let mut keyd = dev_keyd();
+    let alice = samples::alice_target().handle;
+    let complete = || Call::CompleteChangePassword {
+        ctx: keyd::ChangePasswordCtxId::from_bytes([0xCC; 16]),
+        target: alice,
+    };
+    let Classified::Plain(refused) = classify(&keyd, LDAP, now(), complete()) else {
+        panic!("no decision: refused at keyd's authorization step");
+    };
+    assert!(matches!(
+        execute(&mut keyd, refused),
+        Ok(Answer::CompleteChangePassword(Err(Error::Denied)))
+    ));
+
+    let register = Call::RegisterDecision {
+        id: DecisionId::new(21),
+        operation: DecidedOperation::ChangePassword {
+            target: samples::alice_target(),
+        },
+        approvers: Vec::new(),
+        lifetime_secs: 30,
+    };
+    let Classified::KeyStateChange(registration) = classify(&keyd, LDAP, now(), register) else {
+        panic!("a registration loosens keyd");
+    };
+    assert!(matches!(
+        execute_acknowledged(&mut keyd, acknowledged(registration)),
+        Answer::RegisterDecision(Ok(()))
+    ));
+    // admind's `set_secret` of the same handle is not admitted by it (Q-662).
+    assert!(matches!(
+        classify(&keyd, DIRECTORY, now(), set_alice()),
+        Classified::Plain(_)
+    ));
+    let Classified::KeyStateChange(change) = classify(&keyd, LDAP, now(), complete()) else {
+        panic!("with dird's decision the completion needs its intent");
+    };
+    let EventBody::Keyd(intent) = change.intent_event() else {
+        panic!("a keyd record");
+    };
+    assert_eq!(intent.result, KeydOutcome::Intent);
+    assert_eq!(intent.op, ipc_audit::KeydOperation::CompleteChangePassword);
+    assert_eq!(intent.principal, Some(*alice.principal.as_bytes()));
+    assert_eq!(intent.decision, Some(21));
+    // Run with its proof: no such context — refused.
+    assert!(matches!(
+        execute_acknowledged(&mut keyd, acknowledged(change)),
+        Answer::CompleteChangePassword(Err(Error::Denied))
+    ));
+
+    for call in [
+        Call::OpenChangePasswordRequest {
+            service: keyd::PrincipalId::from_bytes([0xCF; 16]),
+            ap_req_octets: vec![0x30, 0x00],
+            krb_priv_octets: vec![0x30, 0x00],
+            peer: keyd::HostAddr::ipv4([192, 0, 2, 10]),
+            local: keyd::HostAddr::ipv4([192, 0, 2, 1]),
+        },
+        Call::SealChangePasswordError {
+            ctx: keyd::ChangePasswordCtxId::from_bytes([0xCC; 16]),
+            code: krb_proto::NonZeroResultCode::HardError,
+        },
+    ] {
+        let Classified::Plain(plain) = classify(&keyd, LDAP, now(), call) else {
+            panic!("no key state: plain");
+        };
+        assert!(execute(&mut keyd, plain).is_ok());
+    }
+}

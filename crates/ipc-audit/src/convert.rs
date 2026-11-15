@@ -159,7 +159,9 @@ mod from_keyd {
 
     fn purpose(purpose: &keyd::KeyPurpose) -> KeyPurposeCode {
         use keyd::KeyPurpose as Src;
-        map_units!(purpose, Src => KeyPurposeCode { PrincipalLongterm, Krbtgt, Service, AdminService })
+        map_units!(purpose, Src => KeyPurposeCode {
+            PrincipalLongterm, Krbtgt, Service, AdminService, ChangePasswordService,
+        })
     }
 
     fn reason(reason: &keyd::AuditReason) -> KeydReason {
@@ -183,7 +185,11 @@ mod from_keyd {
             ApChecksumUnsupported, StartupHoldDown, NoGrant, GrantMismatch, GrantInvalid,
             GrantTableFull, NoDecision, DecisionMismatch, DecisionInvalid, DecisionTableFull,
             DecisionConflict, DecisionReplayed, CeremonySealed, OperationDigestMissing,
-            OperationDigestMismatch, SecretDecisionDiscarded,
+            OperationDigestMismatch, SecretDecisionDiscarded, SubkeyMissing,
+            SequenceNumberMissing, KrbPrivSequenceMismatch, KrbPrivTimestampSkew,
+            KrbPrivAddressMismatch, PasswordPolicyRefused, ChangePasswordNotAcceptable,
+            ResultCodeNotPermitted, KpasswdMalformed, KpasswdHardError, KpasswdAuthError,
+            KpasswdSoftError, KpasswdAccessDenied, KpasswdInitialFlagNeeded,
         }
             _ => KeydReason::Unlisted,
         )
@@ -205,7 +211,8 @@ mod from_keyd {
                     VerifySecret, CreateKey, RotateKey, RotateKrbtgt, RetireKvno,
                     OpenFastArmor, SealFastError, DestroyKeySet, OpenAndVerifyServiceTicket,
                     DescribeConfig, Ping, GrantSetSecret, RegisterDecision, SealCeremony,
-                    ListDestroyDecisions, VerifyOperationTicket,
+                    ListDestroyDecisions, VerifyOperationTicket, OpenChangePasswordRequest,
+                    CompleteChangePassword, SealChangePasswordError,
                 }),
                 principal: record.principal.map(|id| *id.as_bytes()),
                 purpose: record.purpose.as_ref().map(purpose),

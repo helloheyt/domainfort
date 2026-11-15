@@ -21,6 +21,7 @@
 //! | family | decided operation | named by | registered by dird | consumed by |
 //! |---|---|---|---|---|
 //! | set-secret | [`DecidedOperation::SetSecret`]: the targets (handle, binding, salt) | the handle (admind's `set_secret` names no id) | after `BeginPasswordSet` committed (A-100) | the next `set_secret` of the handle (any presentation) |
+//! | set-secret | [`DecidedOperation::ChangePassword`] (task K3): the one target (handle, binding, salt) — a user's own password change through kpasswd | the handle | after `ChangePassword` committed (docs/53 §5.6, the same order as A-100) | the next `complete_change_password` of the handle whose request's ticket client the binding identifies (any presentation) — **never** a `set_secret`, and a `SetSecret` decision is never redeemed by a completion (docs/questions/Q-662) |
 //! | key operation | `RotateKrbtgt`, `RotateKey`, `RetireKvno` | the decision id (= dird's request id) | at the `Approve` that completes the quorum | `rotate_krbtgt(id)` / `rotate_key(id)` / `retire_kvno(id)`; the result is kept |
 //! | destroy | `DestroyKeySet { principal }` (both purposes) | the decision id (= dird's operation id of the `Delete`) | after a `Delete` of a user / computer committed | `destroy_key_set(id)`; the result is kept |
 //!
@@ -122,6 +123,23 @@ pub enum DecidedOperation {
         /// The deleted account's principal id (its objectGUID).
         principal: PrincipalId,
     },
+    /// A user's own password change through kpasswd (task K3): keyd's
+    /// `complete_change_password` installs the password of the request
+    /// context — keyd decrypted it from the client's KRB-PRIV — into
+    /// `target`, with exactly the target's binding and salt, **only** when
+    /// that binding identifies the request ticket's client (keyd binds the
+    /// target, docs/53 §5.5). The set-secret family (same table, ceiling and
+    /// bound), but a separate variant so that the decision names its
+    /// executor: admind's `set_secret` cannot redeem it, and a completion
+    /// cannot redeem a `SetSecret` decision (docs/questions/Q-662).
+    /// Spec: docs/53 R53-5, R53-8, §4.3, §4.4, §5.5, §5.6 step 5; [MS-ADTS]
+    /// 3.1.1.3.1.5.1 (as recorded in docs/53 §2.2); docs/questions/Q-601
+    /// items 2, 5 (A-117).
+    ChangePassword {
+        /// The user's password key set (`PrincipalLongterm`), its binding
+        /// and its salt.
+        target: SetSecretTarget,
+    },
 }
 
 /// The families of decisions (module documentation): each has its own id
@@ -188,6 +206,7 @@ impl DecidedOperation {
     pub const fn executed_by(&self) -> Operation {
         match self {
             DecidedOperation::SetSecret { .. } => Operation::SetSecret,
+            DecidedOperation::ChangePassword { .. } => Operation::CompleteChangePassword,
             DecidedOperation::RotateKrbtgt { .. } => Operation::RotateKrbtgt,
             DecidedOperation::RotateKey { .. } => Operation::RotateKey,
             DecidedOperation::RetireKvno { .. } => Operation::RetireKvno,
@@ -200,7 +219,9 @@ impl DecidedOperation {
     #[must_use]
     pub const fn family(&self) -> DecisionFamily {
         match self {
-            DecidedOperation::SetSecret { .. } => DecisionFamily::SetSecret,
+            DecidedOperation::SetSecret { .. } | DecidedOperation::ChangePassword { .. } => {
+                DecisionFamily::SetSecret
+            }
             DecidedOperation::RotateKrbtgt { .. }
             | DecidedOperation::RotateKey { .. }
             | DecidedOperation::RetireKvno { .. } => DecisionFamily::KeyOperation,
@@ -216,6 +237,7 @@ impl DecidedOperation {
     pub fn primary(&self) -> Option<KeyHandle> {
         match self {
             DecidedOperation::SetSecret { targets, .. } => targets.first().map(|t| t.handle),
+            DecidedOperation::ChangePassword { target } => Some(target.handle),
             DecidedOperation::RotateKrbtgt { krbtgt } => Some(*krbtgt),
             DecidedOperation::RotateKey { handle }
             | DecidedOperation::RetireKvno { handle, .. } => Some(*handle),
@@ -237,7 +259,8 @@ impl DecidedOperation {
             }
             DecidedOperation::RotateKrbtgt { .. }
             | DecidedOperation::RotateKey { .. }
-            | DecidedOperation::RetireKvno { .. } => None,
+            | DecidedOperation::RetireKvno { .. }
+            | DecidedOperation::ChangePassword { .. } => None,
         }
     }
 
@@ -275,6 +298,12 @@ impl DecidedOperation {
                 purpose_permitted(Operation::RetireKvno, HandleSlot::Primary, handle.purpose)
             }
             DecidedOperation::DestroyKeySet { .. } => true,
+            // A user's password key set only (docs/53 R53-1).
+            DecidedOperation::ChangePassword { target } => purpose_permitted(
+                Operation::CompleteChangePassword,
+                HandleSlot::Primary,
+                target.handle.purpose,
+            ),
         }
     }
 
@@ -293,7 +322,8 @@ impl DecidedOperation {
             DecidedOperation::RetireKvno { kvno, .. } => kvno.get() != 0,
             DecidedOperation::RotateKrbtgt { .. }
             | DecidedOperation::RotateKey { .. }
-            | DecidedOperation::DestroyKeySet { .. } => true,
+            | DecidedOperation::DestroyKeySet { .. }
+            | DecidedOperation::ChangePassword { .. } => true,
         }
     }
 }
@@ -491,6 +521,33 @@ mod tests {
             targets: vec![target(1, KeyPurpose::Service)],
         };
         assert!(!wrong_first.purposes_permitted());
+        // Task K3 (Q-662): a user's own change is the set-secret family,
+        // run by the completion, on a PrincipalLongterm target only.
+        let change = DecidedOperation::ChangePassword {
+            target: target(1, KeyPurpose::PrincipalLongterm),
+        };
+        assert_eq!(change.family(), DecisionFamily::SetSecret);
+        assert_eq!(change.executed_by(), Operation::CompleteChangePassword);
+        assert!(change.purposes_permitted() && change.is_well_formed());
+        assert_eq!(
+            change.primary(),
+            Some(KeyHandle::new(
+                PrincipalId::from_bytes([1; 16]),
+                KeyPurpose::PrincipalLongterm
+            ))
+        );
+        assert_eq!(change.secondary(), None);
+        for purpose in [
+            KeyPurpose::Service,
+            KeyPurpose::Krbtgt,
+            KeyPurpose::AdminService,
+            KeyPurpose::ChangePasswordService,
+        ] {
+            assert!(!DecidedOperation::ChangePassword {
+                target: target(1, purpose)
+            }
+            .purposes_permitted());
+        }
         let destroy = DecidedOperation::DestroyKeySet { principal: p };
         assert_eq!(destroy.family(), DecisionFamily::Destroy);
         assert_eq!(
