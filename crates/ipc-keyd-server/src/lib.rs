@@ -53,6 +53,18 @@
 //! already links keyd, since task IB1 moved it out of an optional feature
 //! of crate ipc-audit (class C40; docs/questions/Q-851, decision A-144).
 //!
+//! # The attestation key (task PN9)
+//!
+//! `install_attestation_key` carries the key's octets in an
+//! `ipc_keyd::AttestationKeyOctets` (exactly 32, never all zero, wiped on
+//! drop). This crate — in the keyd process — is the one place that turns
+//! them into keyd's `AttestationKey` (crate name-attestation, through keyd's
+//! re-export), right before keyd's `install_attestation_key`; the octets are
+//! wiped when the call returns. keyd itself never makes a key (its custody
+//! guard, crates/keyd tests/attestation_key_custody.rs). The call is a
+//! key-state change: it runs only through [`execute_acknowledged`], after
+//! auditd acknowledged its intent (docs/questions/Q-1033 item 3, A-177).
+//!
 //! # Provenance
 //!
 //! Written only from this project's decided design — docs/50 (§3.2-§3.7,
@@ -74,9 +86,20 @@ pub use intent::{classify, Classified, KeyStateCall, KeyStateIntent, PlainCall};
 use core::fmt;
 use ipc::EncodedFrame;
 use ipc_audit_client::AckedIntent;
+use ipc_keyd::AttestationKeyOctets;
 use ipc_keyd::{Answer, Call, DescribedConfig};
-use keyd::{AuditSink, CallerId, EntropySource, KeyStore, Keyd, TgsFastRequest};
+use keyd::{
+    AttestationKey, AuditSink, CallerId, EntropySource, KeyStore, Keyd, TgsFastRequest,
+    ATTESTATION_KEY_LEN,
+};
 use krb_proto::KerberosTime;
+
+// The attestation key's length on the wire (crate ipc-keyd, which links no
+// crypto) is the attestation key's own (crate name-attestation, through
+// keyd): pinned here, the one crate that links both (task PN9). A
+// difference would not build (the octets' array type is the key's).
+// Spec: docs/59 §7.4; docs/questions/Q-1011 item 2 (A-173).
+const _: () = assert!(ipc_keyd::ATTESTATION_KEY_OCTETS == ATTESTATION_KEY_LEN);
 #[cfg(feature = "loopback")]
 use {
     ipc::{encode_refused, Refused},
@@ -364,6 +387,37 @@ fn run<S: KeyStore, A: AuditSink, E: EntropySource>(
         Call::RevokeDecision { id } => {
             Answer::RevokeDecision(keyd.revoke_decision(caller, id, now))
         }
+        // Task PN9 (docs/59 §7.4, §7.5): the ceremony hands keyd the
+        // attestation key; keyd checks the role and the ceremony itself.
+        Call::InstallAttestationKey { key } => {
+            Answer::InstallAttestationKey(install_attestation_key(keyd, caller, &key, now))
+        }
+    }
+}
+
+/// Make keyd's `AttestationKey` from the call's octets and install it — the
+/// one place the octets become a key (module documentation). The octets
+/// (`key`) are wiped when the caller drops them, right after this returns;
+/// the key lives on only in keyd's slot (or is wiped with a refusal).
+///
+/// `AttestationKeyOctets` cannot hold the all-zero key, the only one
+/// name-attestation refuses, so the constructor cannot fail here (the two
+/// rules are pinned equal by this crate's tests). Were it to fail, nothing
+/// is installed and keyd is not called (fail closed): the reply is the
+/// uniform `Denied`, and the daemon counts the outcome record keyd did not
+/// write after the acknowledged intent (crates/keyd-daemon audit, A-88).
+///
+/// Spec: docs/59 §7.4; docs/questions/Q-1011 item 2 (A-173), Q-1033
+/// (A-177); AGENTS.md §6 (fail closed; secrets never in logs or errors).
+fn install_attestation_key<S: KeyStore, A: AuditSink, E: EntropySource>(
+    keyd: &mut Keyd<S, A, E>,
+    caller: &CallerId,
+    key: &AttestationKeyOctets,
+    now: &KerberosTime,
+) -> Result<(), keyd::Error> {
+    match AttestationKey::from_bytes(key.expose()) {
+        Ok(key) => keyd.install_attestation_key(caller, key, now),
+        Err(_) => Err(keyd::Error::Denied),
     }
 }
 

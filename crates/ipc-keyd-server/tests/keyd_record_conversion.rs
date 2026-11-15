@@ -106,10 +106,12 @@ fn keyd_outcomes_never_map_to_a_phase_code() {
 /// their own same-named codes, never `Unlisted`; likewise the seven decision
 /// reasons appended by A-102 (docs/52 §4.5) and the two operation-binding
 /// reasons of R2 (docs/52 §5 item 3), and the two revocation reasons of task
-/// F3 (docs/questions/Q-976).
+/// F3 (docs/questions/Q-976), and the attestation-key install's reason of
+/// task PN9 (docs/59 §7.5, docs/questions/Q-1033 item 4).
 #[test]
 fn keyd_grant_reasons_match() {
     for reason in [
+        keyd::AuditReason::AttestationKeyInstalled,
         keyd::AuditReason::DecisionRevoked,
         keyd::AuditReason::DecisionExecuted,
         keyd::AuditReason::NoGrant,
@@ -190,5 +192,40 @@ fn keyd_operations_and_roles_match() {
             reason: keyd::AuditReason::None,
         };
         assert_eq!(keyd_record(&record).caller_role.name(), format!("{role:?}"));
+    }
+}
+
+/// Task PN9 (docs/59 §7.5; docs/questions/Q-1033 item 4): the four
+/// name-resolution reasons keyd declares after `AttestationKeyInstalled`
+/// have no table entry yet — they are recorded as `Unlisted` (the table's
+/// rule for a `#[non_exhaustive]` source, crates/ipc-audit codes.rs) until
+/// the verification on the issuance path appends them (task PN11).
+#[test]
+fn the_name_resolution_reasons_are_unlisted_until_pn11() {
+    for reason in [
+        keyd::AuditReason::AttestationKeyMissing,
+        keyd::AuditReason::NameResolutionInvalid,
+        keyd::AuditReason::NameResolutionStale,
+        keyd::AuditReason::NameResolutionMismatch,
+    ] {
+        let record = keyd::AuditRecord {
+            ts: ktime(),
+            caller_role: keyd::Role::Kdc,
+            caller_uid: 1,
+            op: keyd::Operation::IssueTgsRep,
+            principal: None,
+            purpose: None,
+            kvno: None,
+            secondary: None,
+            approvers: None,
+            decision: None,
+            result: keyd::AuditOutcome::Denied,
+            reason,
+        };
+        assert_eq!(
+            keyd_record(&record).reason,
+            KeydReason::Unlisted,
+            "{reason:?}"
+        );
     }
 }

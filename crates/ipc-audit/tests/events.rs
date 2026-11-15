@@ -272,8 +272,10 @@ fn code_tables_are_closed() {
     // R6b the discard of a deleted principal's set-secret entries
     // (docs/questions/Q-520); task K3 the fourteen change-password reasons
     // (docs/53 §9, codes 80-93); task F3 the two revocation reasons
-    // (docs/questions/Q-976, codes 94-95), `Unlisted` last (96).
-    assert_eq!(table!(KeydReason), 96);
+    // (docs/questions/Q-976, codes 94-95); task PN9 the attestation-key
+    // install's own reason (docs/59 §7.5, docs/questions/Q-1033 item 4, code
+    // 96), `Unlisted` last (97).
+    assert_eq!(table!(KeydReason), 97);
     assert_eq!(KeydReason::NoGrant.code(), 66);
     assert_eq!(KeydReason::GrantTableFull.code(), 69);
     assert_eq!(KeydReason::NoDecision.code(), 70);
@@ -286,7 +288,8 @@ fn code_tables_are_closed() {
     assert_eq!(KeydReason::KpasswdInitialFlagNeeded.code(), 93);
     assert_eq!(KeydReason::DecisionRevoked.code(), 94);
     assert_eq!(KeydReason::DecisionExecuted.code(), 95);
-    assert_eq!(KeydReason::Unlisted.code(), 96);
+    assert_eq!(KeydReason::AttestationKeyInstalled.code(), 96);
+    assert_eq!(KeydReason::Unlisted.code(), 97);
     assert_eq!(table!(LdapReason), 53);
     assert_eq!(table!(CodecErrorCode), 35);
     assert_eq!(table!(CodecLimit), 12);
@@ -295,9 +298,11 @@ fn code_tables_are_closed() {
     // `SealCeremony`, `ListDestroyDecisions` (18-20) by A-102 (docs/52 §4);
     // `VerifyOperationTicket` (21) by Q-523; the three change-password
     // operations (22-24) by task K3 (docs/53 §9); `RevokeDecision` (25) by
-    // task F3 (docs/questions/Q-976); 1-16 keep their codes.
-    assert_eq!(table!(KeydOperation), 25);
+    // task F3 (docs/questions/Q-976); `InstallAttestationKey` (26) by task
+    // PN9 (docs/59 §7.5, docs/questions/Q-1033); 1-16 keep their codes.
+    assert_eq!(table!(KeydOperation), 26);
     assert_eq!(KeydOperation::RevokeDecision.code(), 25);
+    assert_eq!(KeydOperation::InstallAttestationKey.code(), 26);
     assert_eq!(KeydOperation::VerifyOperationTicket.code(), 21);
     assert_eq!(KeydOperation::OpenChangePasswordRequest.code(), 22);
     assert_eq!(KeydOperation::CompleteChangePassword.code(), 23);

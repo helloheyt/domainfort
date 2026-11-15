@@ -295,7 +295,8 @@ fn account_name_rules_are_enforced() {
     let ok = d.run(create_user(STAFF_OU, "abcdefghijklmnopqrst"), "admin1", &[]);
     assert!(matches!(ok, Ran::Applied { .. }));
     // A computer: 19 + "$" = 20 is the most; a name ending in "$" is not a
-    // single "$" (item 11).
+    // single "$" (item 11). Each on its own host (task PN6, rule N6:
+    // `<computerName>.<realm DNS name>` — [MS-ADTS] 3.1.1.5.3.1.1.2).
     for (name, accepted) in [
         ("w234567890123456789", true),
         ("w2345678901234567890", false),
@@ -304,7 +305,7 @@ fn account_name_rules_are_enforced() {
         let op = Operation::CreateComputer(CreateComputer {
             parent: guid(STAFF_OU),
             name: name.into(),
-            dns_host_name: "ws09.example.test".into(),
+            dns_host_name: format!("{name}.example.test"),
             spn: None,
         });
         let ran = d.run(op, "admin1", &[]);
@@ -332,7 +333,9 @@ fn account_name_rules_are_enforced() {
 
 /// [MS-SAMR] 3.1.1.8.4 item 2 (sAMAccountName unique in the domain; the
 /// index folds A-Z, Q-080), docs/46 §8.5 (UPN, SPN unique), §8.3 item 3
-/// (one RDN per parent) — refused before anything is written.
+/// (one RDN per parent) — refused before anything is written. Since task
+/// PN6 (docs/59 §4.4 N6) a computer's SPN host is its own host, so another
+/// computer's SPN is a value refusal, not a conflict.
 #[test]
 fn values_already_taken_are_conflicts() {
     let mut d = Domain::new("unique");
@@ -358,6 +361,22 @@ fn values_already_taken_are_conflicts() {
         refusal_code(&d.run(second, "admin1", &[]).refused()),
         AdminRefusal::Conflict
     );
+    // A computer named like ws01 in another case: its base name, host name
+    // and SPN are all ws01's.
+    let computer_taken = Operation::CreateComputer(CreateComputer {
+        parent: guid(MANAGED_OU),
+        name: "WS01".into(),
+        dns_host_name: "ws01.example.test".into(),
+        spn: Some("host/ws01.example.test".into()),
+    });
+    assert_eq!(
+        refusal_code(&d.run(computer_taken, "admin1", &[]).refused()),
+        AdminRefusal::Conflict
+    );
+    // ws01's SPN on another computer: since task PN6 its dNSHostName (the
+    // SPN's host) names a host not its own (rule N6; [MS-ADTS]
+    // 3.1.1.5.3.1.1.2) — refused as a value before any key is probed, so an
+    // SPN of another computer's host never reaches the store.
     let spn_taken = Operation::CreateComputer(CreateComputer {
         parent: guid(STAFF_OU),
         name: "ws09".into(),
@@ -366,7 +385,7 @@ fn values_already_taken_are_conflicts() {
     });
     assert_eq!(
         refusal_code(&d.run(spn_taken, "admin1", &[]).refused()),
-        AdminRefusal::Conflict
+        AdminRefusal::ValueInvalid
     );
     // A container named like an existing child of ou=Staff (cn=helper).
     let rdn_taken = Operation::CreateContainer(CreateContainerLike {

@@ -1531,3 +1531,119 @@ fn the_seal_is_one_record_and_ends_create_key_without_an_intent() {
         ]
     );
 }
+
+// ---- the attestation key's install (task PN9) ---------------------------------------
+
+/// The attestation-key install of these tests: a made-up key.
+fn install_attestation_key() -> Call {
+    Call::InstallAttestationKey {
+        key: ipc_keyd::AttestationKeyOctets::from_slice(&[0x4D; 32]).unwrap(),
+    }
+}
+
+/// Task PN9 (docs/59 §7.4, §7.5; docs/questions/Q-1011 items 2, 8 — A-173;
+/// Q-1033 items 2, 3 — A-177; A-86 / A-88): through the daemon's engine,
+/// Admin's install in the ceremony is written to the window as its intent,
+/// acknowledged, and only then run — its outcome keyd's own record
+/// (`Success`); keyd then holds the key. A Kdc caller is refused at the
+/// authorization step (one record, `RoleNotPermitted`, no intent); after the
+/// seal Admin's install is refused the same way (`CeremonySealed`). No
+/// record names a principal, a purpose or a kvno — nothing of the key.
+#[test]
+fn the_attestation_key_install_is_intent_then_outcome_in_the_ceremony_only() {
+    let clock = TestClock::at(t0());
+    let (mut engine, gate) = engine(&clock, WindowConfig::DEFAULT, true);
+    let auditd = AutoAck::start(&gate);
+    assert!(matches!(
+        serve(&mut engine, ADMIN, &install_attestation_key()).0,
+        Ok(Answer::InstallAttestationKey(Ok(())))
+    ));
+    assert!(engine.keyd_mut().has_attestation_key());
+    assert!(matches!(
+        serve(&mut engine, KDC, &install_attestation_key()).0,
+        Ok(Answer::InstallAttestationKey(Err(Error::Denied)))
+    ));
+    assert!(matches!(
+        serve(&mut engine, ADMIN, &Call::SealCeremony).0,
+        Ok(Answer::SealCeremony(Ok(())))
+    ));
+    assert!(matches!(
+        serve(&mut engine, ADMIN, &install_attestation_key()).0,
+        Ok(Answer::InstallAttestationKey(Err(Error::Denied)))
+    ));
+    let records = auditd.wait_for(5);
+    let phases: Vec<_> = records.iter().map(|r| (r.op, r.result, r.reason)).collect();
+    assert_eq!(
+        phases,
+        [
+            (
+                KeydOperation::InstallAttestationKey,
+                KeydOutcome::Intent,
+                KeydReason::None
+            ),
+            (
+                KeydOperation::InstallAttestationKey,
+                KeydOutcome::Success,
+                KeydReason::None
+            ),
+            (
+                KeydOperation::InstallAttestationKey,
+                KeydOutcome::Denied,
+                KeydReason::RoleNotPermitted
+            ),
+            (
+                KeydOperation::SealCeremony,
+                KeydOutcome::Success,
+                KeydReason::None
+            ),
+            (
+                KeydOperation::InstallAttestationKey,
+                KeydOutcome::Denied,
+                KeydReason::CeremonySealed
+            ),
+        ]
+    );
+    for record in &records {
+        assert_eq!(record.principal, None);
+        assert_eq!(record.purpose, None);
+        assert_eq!(record.kvno, None);
+    }
+    assert_eq!(records[0].caller_role, KeydRole::Admin);
+    assert_eq!(records[0].caller_uid, ADMIN.uid);
+    assert_eq!(gate.unrecorded_outcomes(), 0);
+}
+
+/// Task PN9 (Q-1033 item 3, A-177) with A-86 / A-88 ("intent not
+/// acknowledged ⇒ Unavailable, and nothing changed"): an install whose
+/// intent auditd does not acknowledge in time is answered
+/// `Refused::Unavailable` (then close) and keyd does not run it — keyd holds
+/// no key; the window holds the intent and a `NotPerformed` outcome. Once
+/// auditd acknowledges, the same install succeeds (so the first one
+/// installed nothing).
+#[test]
+fn an_unacknowledged_install_is_unavailable_and_installs_nothing() {
+    let clock = TestClock::at(t0());
+    let (mut engine, gate) = engine(&clock, WindowConfig::DEFAULT, true);
+    let (answer, open) = serve_queued(&mut engine, ADMIN, &install_attestation_key(), long_ago());
+    assert_eq!(answer.err(), Some(Refused::Unavailable));
+    assert!(!open);
+    assert!(!engine.keyd_mut().has_attestation_key());
+    let records = window_records(&gate);
+    let phases: Vec<_> = records.iter().map(|r| (r.op, r.result)).collect();
+    assert_eq!(
+        phases,
+        [
+            (KeydOperation::InstallAttestationKey, KeydOutcome::Intent),
+            (
+                KeydOperation::InstallAttestationKey,
+                KeydOutcome::NotPerformed
+            ),
+        ]
+    );
+    let _auditd = AutoAck::start(&gate);
+    assert!(matches!(
+        serve(&mut engine, ADMIN, &install_attestation_key()).0,
+        Ok(Answer::InstallAttestationKey(Ok(())))
+    ));
+    assert!(engine.keyd_mut().has_attestation_key());
+}

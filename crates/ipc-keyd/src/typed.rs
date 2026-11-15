@@ -19,16 +19,17 @@
 //! zeroized), §3.4; docs/10 §4-§9; docs/questions/Q-225 item 6 (A-59),
 //! Q-245 item 1.
 
+use crate::channel::ATTESTATION_KEY_OCTETS;
 use crate::wire::{
-    CompleteChangePasswordRequest, CreateKeyRequest, GrantSetSecretRequest, IssueAsRepRequest,
-    IssueTgsRepRequest, KeydReply, KeydRequest, OpenAndVerifyServiceTicketRequest,
-    OpenAndVerifyTgtRequest, OpenChangePasswordRequestFields, OpenFastArmorRequest,
-    RegisterDecisionRequest, SealChangePasswordErrorRequest, SealFastErrorRequest,
-    SetSecretRequest, VerifyOperationTicketRequest, VerifyPreauthRequest, VerifySecretRequest,
-    WireAsTemplate, WireAuthnProof, WireBinding, WireChangePasswordContext, WireConfigDescription,
-    WireDecidedOperation, WireDestructionPage, WireFastArmor, WireOperationTicket, WireRepParts,
-    WireSealedReply, WireServiceContext, WireSetSecretTarget, WireTgsFast, WireTgsTemplate,
-    WireTgtContext, WireTime,
+    CompleteChangePasswordRequest, CreateKeyRequest, GrantSetSecretRequest,
+    InstallAttestationKeyRequest, IssueAsRepRequest, IssueTgsRepRequest, KeydReply, KeydRequest,
+    OpenAndVerifyServiceTicketRequest, OpenAndVerifyTgtRequest, OpenChangePasswordRequestFields,
+    OpenFastArmorRequest, RegisterDecisionRequest, SealChangePasswordErrorRequest,
+    SealFastErrorRequest, SetSecretRequest, VerifyOperationTicketRequest, VerifyPreauthRequest,
+    VerifySecretRequest, WireAsTemplate, WireAuthnProof, WireBinding, WireChangePasswordContext,
+    WireConfigDescription, WireDecidedOperation, WireDestructionPage, WireFastArmor,
+    WireOperationTicket, WireRepParts, WireSealedReply, WireServiceContext, WireSetSecretTarget,
+    WireTgsFast, WireTgsTemplate, WireTgtContext, WireTime,
 };
 use core::fmt;
 use ipc::{DerBlob, Secret};
@@ -64,6 +65,13 @@ pub enum ConversionError {
     /// Spec: docs/50 §3.4 (a request kind and its reply kind), R50-7 (strict
     /// request → reply).
     UnexpectedReply,
+    /// An attestation key of all-zero octets (task PN9): a buffer that was
+    /// never filled — the key is drawn at random — so it is not a key
+    /// ([`AttestationKeyOctets`]). Carries no octet.
+    /// Spec: docs/questions/Q-1011 item 2 (A-173: provision draws the key);
+    /// crate name-attestation `AttestationKey::from_bytes` (the same rule);
+    /// AGENTS.md §6 (fail closed).
+    AttestationKey,
 }
 
 impl fmt::Display for ConversionError {
@@ -72,6 +80,7 @@ impl fmt::Display for ConversionError {
             ConversionError::KerberosValue => "Kerberos value refused by krb-proto",
             ConversionError::Text => "text field is not UTF-8",
             ConversionError::UnexpectedReply => "reply does not belong to the operation called",
+            ConversionError::AttestationKey => "attestation key refused",
         })
     }
 }
@@ -211,6 +220,83 @@ impl fmt::Debug for Password {
         // Not even the length (docs/questions/Q-225 item 9).
         f.write_str("Password(<redacted>)")
     }
+}
+
+/// The attestation key's octets on their way to keyd (task PN9): exactly
+/// [`ATTESTATION_KEY_OCTETS`] octets, never all zero, in one heap buffer that
+/// is wiped when the value is dropped. Moving the value moves only the
+/// pointer, so no copy of the key is left behind by a move.
+///
+/// * `Debug` prints neither the octets nor anything derived from them;
+///   there is no `Display`, `Clone` or `PartialEq` (no silent second copy, no
+///   variable-time comparison of key material).
+/// * The octets are reachable only through [`AttestationKeyOctets::expose`],
+///   so every place that touches them is visible in review — in the keyd
+///   process, the one place that turns them into keyd's key (crate
+///   ipc-keyd-server); in keyadm, none (it only sends them).
+/// * The all-zero key is unrepresentable: it is a buffer that was never
+///   filled (provision draws the key at random — A-173), and crate
+///   name-attestation refuses it too (`AttestationKey::from_bytes`). Refusing
+///   it here, at the codec, means a zero key never reaches keyd's
+///   classification — it is `Malformed`, no intent is written for it, and
+///   the key keyd builds from an admitted call always exists (the two rules
+///   are pinned equal in crate ipc-keyd-server).
+///
+/// This crate links no crypto code (D182; A-63, A-173: only dird and keyd
+/// link name-attestation): this is a carrier of octets, not a key — it can
+/// neither tag nor verify.
+///
+/// Spec: docs/59 §7.4, §7.5; docs/questions/Q-1011 item 2 (A-173: "delivered
+/// to keyd in ceremony mode only, never exported"), Q-1033 (A-177); docs/50
+/// §3.3 (secret-bearing buffers zeroized, in both sides), §8.2; AGENTS.md §6.
+pub struct AttestationKeyOctets(Box<Zeroizing<[u8; ATTESTATION_KEY_OCTETS]>>);
+
+impl AttestationKeyOctets {
+    /// Copy `octets` into a new zeroizing buffer — `None` unless they are
+    /// exactly [`ATTESTATION_KEY_OCTETS`] octets and not all zero. The caller
+    /// stays responsible for wiping its own copy.
+    /// Spec: docs/59 §7.4; docs/questions/Q-1011 item 2; AGENTS.md §6 (fail
+    /// closed).
+    #[must_use]
+    pub fn from_slice(octets: &[u8]) -> Option<AttestationKeyOctets> {
+        let octets: &[u8; ATTESTATION_KEY_OCTETS] = octets.try_into().ok()?;
+        if octets.iter().all(|&octet| octet == 0) {
+            return None;
+        }
+        // The buffer is allocated (zeroed) first and filled in place: the
+        // key is copied once, from `octets` to the heap.
+        let mut buffer = Box::new(Zeroizing::new([0u8; ATTESTATION_KEY_OCTETS]));
+        let target: &mut [u8; ATTESTATION_KEY_OCTETS] = &mut buffer;
+        target.copy_from_slice(octets);
+        Some(AttestationKeyOctets(buffer))
+    }
+
+    /// The key's octets. Named so every use is visible in review.
+    /// Spec: AGENTS.md §6 (secrets never in logs, panics or errors).
+    #[must_use]
+    pub fn expose(&self) -> &[u8; ATTESTATION_KEY_OCTETS] {
+        &self.0
+    }
+
+    /// A zeroizing wire copy of the octets.
+    fn to_secret(&self) -> Secret {
+        Secret::from_slice(self.expose())
+    }
+}
+
+impl fmt::Debug for AttestationKeyOctets {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AttestationKeyOctets(<redacted>)")
+    }
+}
+
+/// The attestation key of a wire request: the octets move out of the wire's
+/// [`Secret`] into an [`AttestationKeyOctets`] (one more zeroizing copy; the
+/// `Secret` is wiped when it drops here). All zeros ⇒
+/// [`ConversionError::AttestationKey`].
+/// Spec: docs/50 §3.3 (secret-bearing buffers zeroized); docs/59 §7.5.
+fn attestation_key(secret: &Secret) -> Converted<AttestationKeyOctets> {
+    AttestationKeyOctets::from_slice(secret.expose()).ok_or(ConversionError::AttestationKey)
 }
 
 // ===========================================================================
@@ -431,6 +517,13 @@ pub enum Call {
         /// The decision id (dird's request id).
         id: DecisionId,
     },
+    /// Install the attestation key of dird's name resolutions (Role::Admin,
+    /// the ceremony only; task PN9) — a state call. Spec: docs/59 §7.4,
+    /// §7.5; docs/questions/Q-1011 items 2, 8, Q-1033.
+    InstallAttestationKey {
+        /// The key's octets (exactly 32, never all zero).
+        key: AttestationKeyOctets,
+    },
 }
 
 impl Call {
@@ -478,6 +571,7 @@ impl Call {
             Call::CompleteChangePassword { .. } => Operation::CompleteChangePassword,
             Call::SealChangePasswordError { .. } => Operation::SealChangePasswordError,
             Call::RevokeDecision { .. } => Operation::RevokeDecision,
+            Call::InstallAttestationKey { .. } => Operation::InstallAttestationKey,
         }
     }
 
@@ -664,6 +758,11 @@ impl Call {
                 })
             }
             Call::RevokeDecision { id } => KeydRequest::RevokeDecision(*id),
+            Call::InstallAttestationKey { key } => {
+                KeydRequest::InstallAttestationKey(InstallAttestationKeyRequest {
+                    key: key.to_secret(),
+                })
+            }
         })
     }
 
@@ -798,6 +897,9 @@ impl Call {
                 code: m.code,
             },
             KeydRequest::RevokeDecision(id) => Call::RevokeDecision { id },
+            KeydRequest::InstallAttestationKey(m) => Call::InstallAttestationKey {
+                key: attestation_key(&m.key)?,
+            },
         })
     }
 }
@@ -933,7 +1035,8 @@ impl IssuanceCall {
 /// A **state call** ([`Call::is_state_call`]): `set_secret`, `create_key`,
 /// `rotate_key`, `rotate_krbtgt`, `retire_kvno`, `destroy_key_set`,
 /// `grant_set_secret`, `register_decision`, `complete_change_password`
-/// (task K4: it installs a password). Its request's fate matters —
+/// (task K4: it installs a password), `install_attestation_key` (task PN9:
+/// it installs the attestation key). Its request's fate matters —
 /// "not performed" (keyd refused it before running it, A-88) and "outcome
 /// unknown" (it may have run) must not be folded into one `Unavailable` —
 /// so the keyd client sends it only through `KeydClient::call_with_fate`
@@ -1181,6 +1284,8 @@ pub enum Answer {
     SealChangePasswordError(Result<SealedReply, keyd_types::Error>),
     /// Spec: docs/52 §4.2; docs/questions/Q-976 (task F3).
     RevokeDecision(Result<(), keyd_types::Error>),
+    /// Spec: docs/59 §7.5; docs/questions/Q-1033 (task PN9).
+    InstallAttestationKey(Result<(), keyd_types::Error>),
 }
 
 /// A success payload, or keyd's error carried by `failure`.
@@ -1229,6 +1334,7 @@ impl Answer {
             Answer::CompleteChangePassword(_) => Operation::CompleteChangePassword,
             Answer::SealChangePasswordError(_) => Operation::SealChangePasswordError,
             Answer::RevokeDecision(_) => Operation::RevokeDecision,
+            Answer::InstallAttestationKey(_) => Operation::InstallAttestationKey,
         }
     }
 
@@ -1418,6 +1524,11 @@ impl Answer {
             Answer::RevokeDecision(r) => {
                 outcome(r, |()| Ok(KeydReply::RevokeDecision), KeydReply::Failure)
             }
+            Answer::InstallAttestationKey(r) => outcome(
+                r,
+                |()| Ok(KeydReply::InstallAttestationKey),
+                KeydReply::Failure,
+            ),
         }
     }
 
@@ -1584,6 +1695,12 @@ impl Answer {
             }
             (Operation::RevokeDecision, R::RevokeDecision) => Answer::RevokeDecision(Ok(())),
             (Operation::RevokeDecision, R::Failure(e)) => Answer::RevokeDecision(Err(e)),
+            (Operation::InstallAttestationKey, R::InstallAttestationKey) => {
+                Answer::InstallAttestationKey(Ok(()))
+            }
+            (Operation::InstallAttestationKey, R::Failure(e)) => {
+                Answer::InstallAttestationKey(Err(e))
+            }
             _ => return Err(ConversionError::UnexpectedReply),
         })
     }

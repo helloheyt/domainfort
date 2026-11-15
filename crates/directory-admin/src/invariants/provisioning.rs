@@ -43,10 +43,28 @@
 //! keys from the checker, and dird refuses a store without it (task PN10;
 //! Q-1008 item 5).
 //!
+//! # The host name the service objects carry (task PN6)
+//!
+//! Every computer that holds a `HostName` key — the DC account among them —
+//! names exactly `<computerName>.<realm DNS name>` (rule N6, module
+//! `object`). The service objects cannot: four objects share the DC's FQDN,
+//! the host of their SPN (Q-112 option 1, one object per service). They
+//! carry it **without** its key (`keys_of_names`, class
+//! `ProvisionedService`), and the session binds what they carry: a service
+//! object's dNSHostName must be the DC account's, compared in the namespace
+//! fold (`Value` otherwise), and the DC account must already exist in this
+//! session (`Exception` otherwise — the claim borrows a host name nobody
+//! holds). So the exemption is no free value: it names exactly the one host
+//! the DC account owns, and it exists only here — on an empty store, under
+//! a claim (docs/52 R13), never on the online path. Long term the DC's
+//! service SPNs move onto the DC account and the service objects disappear
+//! (Q-867, PN16).
+//!
 //! Spec: docs/51 §4.3 step 5 (the table), §8.3, §11; docs/52 R13; A-75;
 //! A-79; A-83; A-92; [MS-SAMR] v20260427 2.2.1.14, 3.1.1.6 items 14, 20,
-//! 22-24; docs/59 §4.3, §5.1, §5.2, §5.5; docs/questions/Q-298 item 2,
-//! Q-376, Q-506, Q-1003 item 2, Q-1008 item 5, Q-1010 item 3.
+//! 22-24; [MS-ADTS] v20261026 3.1.1.5.3.1.1.2; docs/59 §4.3, §4.4 N6, §5.1,
+//! §5.2, §5.5; docs/questions/Q-298 item 2, Q-376, Q-506, Q-1003 item 2,
+//! Q-1008 item 5, Q-1010 items 1-3.
 
 use core::fmt;
 use std::collections::BTreeSet;
@@ -118,6 +136,24 @@ impl ProvisioningRole {
     /// the plain service object).
     fn once(self) -> bool {
         !matches!(self, ProvisioningRole::ServiceObject)
+    }
+
+    /// `true` for the service-object claims: the computers that carry the DC
+    /// account's dNSHostName (the host of their SPN) without its `HostName`
+    /// key — namespace class `ProvisionedService` (module `object`,
+    /// `principal_class`; pinned equal by the unit test
+    /// `the_service_claims_are_the_provisioned_services`). Exhaustive over the
+    /// claims, so a claim added later takes a position here.
+    /// Spec: docs/59 §4.3, §4.4 N6; docs/questions/Q-1010 item 3 (A-173).
+    pub(super) fn is_service_object(self) -> bool {
+        match self {
+            ProvisioningRole::ServiceObject
+            | ProvisioningRole::AdminServiceObject
+            | ProvisioningRole::ChangePasswordServiceObject => true,
+            ProvisioningRole::NamingContextRoot
+            | ProvisioningRole::Krbtgt
+            | ProvisioningRole::DcAccount => false,
+        }
     }
 }
 
@@ -194,6 +230,10 @@ pub struct Provisioning<'t, 's> {
     wall_clock: Timestamp,
     origin_node: NodeId,
     claimed: BTreeSet<ProvisioningRole>,
+    /// The DC account's dNSHostName in the namespace fold, once its create
+    /// committed (task PN6): the one host name the service objects may carry
+    /// (module documentation, "The host name the service objects carry").
+    dc_host_name: Option<String>,
 }
 
 impl<'t, 's> Provisioning<'t, 's> {
@@ -274,6 +314,7 @@ impl<'t, 's> Provisioning<'t, 's> {
             wall_clock,
             origin_node,
             claimed: BTreeSet::new(),
+            dc_host_name: None,
         })
     }
 
@@ -335,17 +376,21 @@ impl<'t, 's> Provisioning<'t, 's> {
 
     /// Create `new`, claiming the exception `role` (`None`: an ordinary
     /// object, checked exactly as the online path checks one): the checker,
-    /// then the commit — a principal's RID from the counter (its supplied
-    /// objectSid must be the one that RID forms), the write's change-seq.
-    /// A service object's GUID is protected from then on.
+    /// then — for a service object — the session's host-name rule (module
+    /// documentation), then the commit — a principal's RID from the counter
+    /// (its supplied objectSid must be the one that RID forms), the write's
+    /// change-seq. A service object's GUID is protected from then on; the DC
+    /// account's dNSHostName is the session's from then on.
     ///
     /// # Errors
-    /// [`ProvisioningError::Invariant`] (an exception claimed twice, or the
-    /// NC root after another root: `Exception`), [`ProvisioningError::
-    /// SidMismatch`], [`ProvisioningError::Store`].
+    /// [`ProvisioningError::Invariant`] (an exception claimed twice, the NC
+    /// root after another root, or a service object before the DC account:
+    /// `Exception`; a service object whose dNSHostName is not the DC
+    /// account's: `Value`), [`ProvisioningError::SidMismatch`],
+    /// [`ProvisioningError::Store`].
     ///
     /// Spec: module documentation; docs/51 §4.3 step 5; A-89 (every writer
-    /// takes a change-seq).
+    /// takes a change-seq); docs/59 §4.4 N6; docs/questions/Q-1010 item 3.
     pub fn create(
         &mut self,
         role: Option<ProvisioningRole>,
@@ -365,10 +410,17 @@ impl<'t, 's> Provisioning<'t, 's> {
             }
         }
         let guid: Guid = new.guid;
+        // The new object's dNSHostName as given — judged below only after the
+        // checker accepted the record it forms (one value, its form; N6 for
+        // the DC account).
+        let host_name = self.host_name_of(&new);
         let checked = self
             .invariants
             .check_create(self.txn, new, role, &[])
             .map_err(refused)?;
+        if role.is_some_and(ProvisioningRole::is_service_object) {
+            self.check_service_host_name(host_name.as_deref())?;
+        }
         let stamp = WriteStamp {
             wall_clock: self.wall_clock,
             origin_node: self.origin_node,
@@ -388,10 +440,46 @@ impl<'t, 's> Provisioning<'t, 's> {
                 self.claimed.insert(claim);
             }
             Some(role) => {
+                if role == ProvisioningRole::DcAccount {
+                    self.dc_host_name = host_name.as_deref().and_then(principal_names::fold);
+                }
                 self.claimed.insert(role);
             }
             None => {}
         }
         Ok(())
+    }
+
+    /// The dNSHostName `new` carries: its one value as text, `None` if it
+    /// has none, several, or one that is not UTF-8 (the checker refuses
+    /// such a computer before it is judged here).
+    /// Spec: docs/46 §5.4 (dNSHostName single-valued).
+    fn host_name_of(&self, new: &NewObject) -> Option<String> {
+        let id = self.invariants.ids.dns_host_name;
+        match new.attributes.iter().find(|(attr, _)| *attr == id) {
+            Some((_, values)) => match values.as_slice() {
+                [value] => core::str::from_utf8(value).ok().map(str::to_owned),
+                _ => None,
+            },
+            None => None,
+        }
+    }
+
+    /// The session's host-name rule for a service object (module
+    /// documentation): the DC account must exist in this session —
+    /// `Exception` otherwise (the claim borrows a host name nobody holds) —
+    /// and the service object's dNSHostName must be the DC account's,
+    /// compared in the namespace fold — `Value` otherwise.
+    /// Spec: docs/59 §4.4 N6; docs/questions/Q-1010 item 3 (A-173: "the
+    /// session checker requires it to equal the DC account's"); Q-080
+    /// (the fold).
+    fn check_service_host_name(&self, host_name: Option<&str>) -> Result<(), ProvisioningError> {
+        let Some(dc_host_name) = self.dc_host_name.as_deref() else {
+            return Err(ProvisioningError::Invariant(InvariantViolation::Exception));
+        };
+        match host_name.and_then(principal_names::fold) {
+            Some(host_name) if host_name == dc_host_name => Ok(()),
+            _ => Err(ProvisioningError::Invariant(InvariantViolation::Value)),
+        }
     }
 }

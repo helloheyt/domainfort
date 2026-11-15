@@ -27,10 +27,12 @@ const PURPOSES: [KeyPurpose; 5] = [
 /// docs/10 §6, §7; A-86: exactly the six operations that install, rotate,
 /// retire or destroy long-term key versions change key state — and the
 /// change-password completion, which installs a password through the same
-/// install path as `set_secret` (task K3, docs/53 §9). The throttles, the
-/// replay cache and the token tables are bookkeeping (the Kerberos
-/// exchanges, `verify_secret`, the change-password open and error seal),
-/// and `describe_config` / `ping` change nothing.
+/// install path as `set_secret` (task K3, docs/53 §9) — and the attestation
+/// key's install, which installs long-term key material (task PN9; docs/59
+/// §7.4; docs/questions/Q-1033 item 3, A-177). The throttles, the replay
+/// cache and the token tables are bookkeeping (the Kerberos exchanges,
+/// `verify_secret`, the change-password open and error seal), and
+/// `describe_config` / `ping` change nothing.
 #[test]
 fn exactly_the_key_lifecycle_operations_change_key_state() {
     let changing: Vec<Operation> = Operation::ALL
@@ -47,6 +49,7 @@ fn exactly_the_key_lifecycle_operations_change_key_state() {
             Operation::RetireKvno,
             Operation::DestroyKeySet,
             Operation::CompleteChangePassword,
+            Operation::InstallAttestationKey,
         ]
     );
 }

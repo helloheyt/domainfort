@@ -271,6 +271,15 @@ fn invoke(f: &mut Fixture, op: Operation, caller: &CallerId, handle: &KeyHandle)
             .keyd
             .revoke_decision(caller, next_decision_id(), &n)
             .is_ok(),
+        // Task PN9: the key only, no handle (`handle` unused); a made-up key.
+        Operation::InstallAttestationKey => f
+            .keyd
+            .install_attestation_key(
+                caller,
+                keyd::AttestationKey::from_bytes(&[0x6E; keyd::ATTESTATION_KEY_LEN]).unwrap(),
+                &n,
+            )
+            .is_ok(),
     }
 }
 
@@ -293,7 +302,8 @@ fn valid_handle(op: Operation) -> KeyHandle {
         | Operation::SealCeremony
         | Operation::ListDestroyDecisions
         | Operation::SealChangePasswordError
-        | Operation::RevokeDecision => ALICE,
+        | Operation::RevokeDecision
+        | Operation::InstallAttestationKey => ALICE,
         Operation::CreateKey => {
             KeyHandle::new(PrincipalId::from_bytes([0x99; 16]), KeyPurpose::Service)
         }
@@ -366,7 +376,8 @@ fn wrong_purpose_is_denied_for_every_operation() {
         // `verify_operation_ticket`.
         // Task K3: `open_change_password_request` names a principal (its
         // purpose is `AppBinding::ChangePassword`'s) and
-        // `seal_change_password_error` no handle.
+        // `seal_change_password_error` no handle. Task PN9: nor does
+        // `install_attestation_key` (it carries the key, no key set).
         if matches!(
             op,
             Operation::OpenAndVerifyServiceTicket
@@ -385,6 +396,7 @@ fn wrong_purpose_is_denied_for_every_operation() {
                 | Operation::ListDestroyDecisions
                 | Operation::VerifySecret
                 | Operation::RevokeDecision
+                | Operation::InstallAttestationKey
         ) {
             continue;
         }
@@ -464,7 +476,8 @@ fn issue_as_rep_krbtgt_slot_purpose() {
 /// docs/questions/Q-503): `ListDestroyDecisions` Admin and Ldap; task K3
 /// (docs/53 R53-7, A-117): the three change-password operations, Ldap; task
 /// F3 (docs/questions/Q-937 item 6, Q-976): `RevokeDecision`, Ldap — the
-/// role that registers decisions.
+/// role that registers decisions; task PN9 (docs/59 §7.5; docs/questions/
+/// Q-1011 item 8, Q-1033 item 2): `InstallAttestationKey`, Admin.
 #[test]
 fn capability_table_matches_design() {
     use Operation::*;
@@ -495,6 +508,7 @@ fn capability_table_matches_design() {
                 SealCeremony,
                 ListDestroyDecisions,
                 Ping,
+                InstallAttestationKey,
             ],
         ),
         (

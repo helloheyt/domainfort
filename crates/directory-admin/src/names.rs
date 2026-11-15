@@ -23,14 +23,26 @@
 //! key set's purpose from it ([`admin_service_spn_ok`],
 //! `change_password_service_spn_ok`).
 //!
+//! # Which host a computer names (task PN6)
+//!
+//! Rule N6 ([`computer_host_name`]): a computer that holds a `HostName` key
+//! names exactly `<computerName>.<realm DNS name>` — decided by
+//! directory-pip's `host_label`, the one host-name rule (docs/54 §5.3;
+//! docs/questions/Q-1010 item 1). It needs the realm's DNS name, so the one
+//! checker applies it (crate::invariants, module `object`), at `prepare`
+//! and at the commit alike; the provisioned service objects, which carry
+//! the DC account's host name without its key, are bound to the DC
+//! account's value by the provisioning session (Q-1010 item 3).
+//!
 //! Spec: [MS-SAMR] v20260427 3.1.1.6 items 8-13 (sAMAccountName); docs/51
 //! §11 (the table, decided A-79 / Q-298 item 1: ≤ 20 for user and computer
 //! including the "$", ≤ 256 for a group); docs/46 §5.4 (cn / ou 1..64
 //! characters, userPrincipalName and servicePrincipalName 1..1024,
 //! dNSHostName 0..2048, description 0..1024); RFC 4120 §6.2.1 (the host
 //! component of a server name "MUST be lowercase"); docs/47 §1.3 (R47-1,
-//! the SPN write rule); docs/59 §4.4, §5.1; docs/questions/Q-1009, Q-1018
-//! item 2.
+//! the SPN write rule); [MS-ADTS] v20261026 3.1.1.5.3.1.1.2 (dNSHostName);
+//! RFC 1035 §2.3.1; docs/54 §5.3; docs/59 §4.4 N6, §5.1; docs/questions/
+//! Q-994 item 1, Q-1009, Q-1010 items 1-3, Q-1018 item 2.
 
 use keyd_types::KeyPurpose;
 use krb_proto::constants::KRB_NT_SRV_HST;
@@ -161,8 +173,10 @@ pub(crate) fn upn_ok(upn: &str) -> bool {
 /// A dNSHostName: 1..2048 printable ASCII characters without a space or a
 /// "/" (it is the host component of the computer's SPN) and without an
 /// upper-case letter (RFC 4120 §6.2.1: the host component "MUST be
-/// lowercase"; docs/questions/Q-355 item 3).
-/// Spec: docs/46 §5.4; RFC 4120 §6.2.1; docs/47 §1.3; P-6.
+/// lowercase"; docs/questions/Q-355 item 3). The form alone: **which** host
+/// a computer may name is rule N6 (`computer_host_name`, judged by the one
+/// checker with the realm's DNS name — task PN6).
+/// Spec: docs/46 §5.4; RFC 4120 §6.2.1; docs/47 §1.3; P-6; docs/59 §4.4 N6.
 pub fn dns_host_name_ok(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_DNS_HOST_NAME_CHARS
@@ -170,6 +184,80 @@ pub fn dns_host_name_ok(name: &str) -> bool {
         && !name
             .bytes()
             .any(|b| b == b' ' || b == b'/' || b.is_ascii_uppercase())
+}
+
+/// The label separator of a DNS name in text form. Spec: RFC 1035 §2.3.1
+/// (`<subdomain> "." <label>`).
+const LABEL_SEPARATOR: char = '.';
+
+/// Why a computer's dNSHostName breaks rule N6 ([`computer_host_name`]).
+/// Names the rule, never a value.
+/// Spec: docs/59 §4.4 N6; docs/questions/Q-1010 item 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostNameRefused {
+    /// The computer's own name gives no host name at all: its computerName
+    /// (the sAMAccountName without the final "$") is not one RFC 1035
+    /// §2.3.1 label, so no dNSHostName can satisfy N6 — a name rule.
+    ComputerName,
+    /// The dNSHostName is not `<computerName>.<realm DNS name>`: it names
+    /// another host — a value rule.
+    NotItsOwn,
+}
+
+/// Rule N6 of the one principal namespace (task PN6; docs/59 §4.4): the
+/// dNSHostName of a computer that holds a `HostName` key — every computer
+/// without a provisioning claim, and the DC account — is exactly
+/// `<computerName>.<realm DNS name>`, where computerName is its
+/// sAMAccountName without the final "$" ([MS-ADTS] 3.1.1.5.3.1.1.2:
+/// "computerName.fullDomainDnsName, where computerName is the current
+/// sAMAccountName of the object (without the final "$" character), and the
+/// fullDomainDnsName is the DNS name of the domain NC"; msDS-AllowedDNSSuffixes
+/// is not in the phase-1 schema — Q-1010 item 1). So a computer's host name
+/// is a function of its identity: it never names another host (Q-994 item
+/// 1), and it is unique because the computer's base name is (its
+/// `ComputerBase` key — Q-1010 item 1).
+///
+/// **One rule, not a second copy** (class C49; Q-1010 item 1: "one
+/// LDH-label check stays in `host_label`"): the decision is directory-pip's
+/// `host_label` — the host-name rule its DNS record owner, the PIP and the
+/// zone projection already read (task DN6; docs/54 §5.3: "the one write
+/// checker (R13) requires exactly this form in `CreateComputer` and in
+/// `provision`"). It requires the computerName to be one RFC 1035 §2.3.1
+/// label ("start with a letter, end with a letter or digit, and have as
+/// interior characters only letters, digits, and hyphen … 63 characters or
+/// less" — stricter than [MS-SAMR], Q-614 item 3) and compares without case
+/// (RFC 1035 §2.3.1: "no significance is attached to the case"; on the
+/// printable ASCII every name here is, the namespace's fold — Q-080). So
+/// every computer that holds a host name also owns its DNS label: the two
+/// rules cannot disagree. The stored spelling stays lower case
+/// ([`dns_host_name_ok`]; RFC 4120 §6.2.1).
+///
+/// The refusal is attributed (`HostNameRefused`): when not even
+/// `<computerName>.<realm DNS name>` would pass, the computer's name is at
+/// fault; otherwise the dNSHostName names another host. The candidate is
+/// built only to ask `host_label` again — it decides nothing itself.
+/// Spec: [MS-ADTS] v20261026 3.1.1.5.3.1.1.2; RFC 1035 §2.3.1; docs/54
+/// §5.3; docs/59 §4.4 N6, §5.2; docs/questions/Q-614 item 3, Q-994 item 1,
+/// Q-1010 items 1-2, Q-1018 item 2 (N6 is the admin plane's rule).
+pub(crate) fn computer_host_name(
+    sam_account_name: &str,
+    dns_host_name: &str,
+    realm_dns_name: &str,
+) -> Result<(), HostNameRefused> {
+    if directory_pip::host_label(sam_account_name, dns_host_name, realm_dns_name).is_some() {
+        return Ok(());
+    }
+    let own = sam_account_name
+        .strip_suffix(COMPUTER_SUFFIX)
+        .map(|computer_name| format!("{computer_name}{LABEL_SEPARATOR}{realm_dns_name}"));
+    match own {
+        Some(own)
+            if directory_pip::host_label(sam_account_name, &own, realm_dns_name).is_some() =>
+        {
+            Err(HostNameRefused::NotItsOwn)
+        }
+        _ => Err(HostNameRefused::ComputerName),
+    }
 }
 
 /// A computer's single servicePrincipalName, by the admin plane's rules:
@@ -340,6 +428,98 @@ mod tests {
         assert!(!computer_name_ok(&"w".repeat(20)));
         assert!(!computer_name_ok("ws01$"));
         assert_eq!(computer_sam("ws01"), "ws01$");
+    }
+
+    /// Task PN6, rule N6 (docs/59 §4.4): [MS-ADTS] 3.1.1.5.3.1.1.2
+    /// ("computerName.fullDomainDnsName, where computerName is the current
+    /// sAMAccountName of the object (without the final "$" character)");
+    /// RFC 1035 §2.3.1 (one label: letter first, letter or digit last,
+    /// letters, digits and hyphen inside, ≤ 63; case not significant);
+    /// docs/questions/Q-994 item 1 (a dNSHostName naming another host),
+    /// Q-1010 item 1. Names are this project's test data.
+    #[test]
+    fn a_computer_names_only_its_own_host() {
+        let realm = "example.test";
+        // Its own host, in any case of the name or the realm.
+        for (sam, host) in [
+            ("ws01$", "ws01.example.test"),
+            ("WS01$", "ws01.example.test"),
+            ("ws01$", "WS01.EXAMPLE.TEST"),
+            ("a$", "a.example.test"),
+            ("ws-9$", "ws-9.example.test"),
+        ] {
+            assert_eq!(computer_host_name(sam, host, realm), Ok(()), "{sam} {host}");
+        }
+        // Another host, another domain, a deeper or a shallower name, the
+        // realm itself (Q-994 item 1).
+        for host in [
+            "ws02.example.test",
+            "dc01.example.test",
+            "ws01.other.test",
+            "ws01.example.test.evil",
+            "x.ws01.example.test",
+            "ws01",
+            "example.test",
+            "ws01.example",
+            "",
+        ] {
+            assert_eq!(
+                computer_host_name("ws01$", host, realm),
+                Err(HostNameRefused::NotItsOwn),
+                "{host}"
+            );
+        }
+        // A computerName that is not one RFC 1035 §2.3.1 label has no host
+        // name at all (stricter than [MS-SAMR] — Q-614 item 3), and a name
+        // without the final "$" is no computer's.
+        for sam in [
+            "1ws$", "ws-$", "w_s$", "w s$", "w.s$", "*$", "_ldap$", "ws01", "$",
+        ] {
+            let host = format!("{}.{realm}", sam.trim_end_matches('$'));
+            assert_eq!(
+                computer_host_name(sam, &host, realm),
+                Err(HostNameRefused::ComputerName),
+                "{sam}"
+            );
+        }
+        let long = format!("{}$", "a".repeat(64));
+        assert_eq!(
+            computer_host_name(&long, &format!("{}.{realm}", "a".repeat(64)), realm),
+            Err(HostNameRefused::ComputerName)
+        );
+    }
+
+    /// Task PN6; class C49 (docs/59 §3 M3); Q-080 items 1-2; the pin pattern
+    /// of Q-1008 item 4: rule N6 compares through directory-pip's
+    /// `host_label`, which ignores the case of A-Z (RFC 1035 §2.3.1: "no
+    /// significance is attached to the case"). On every pair of printable
+    /// octets its verdict is the namespace fold's (`principal_names::fold`) —
+    /// in the realm part and in the label — so N6 compares through the one
+    /// fold on every value that can reach it (printable ASCII only:
+    /// `dns_host_name_ok`, `keys_of_names`). A split, a merge or a remapping
+    /// by either side fails here.
+    #[test]
+    fn the_host_name_comparison_is_the_namespace_fold() {
+        for x in 0x20u8..=0x7E {
+            for y in 0x20u8..=0x7E {
+                let (x, y) = (char::from(x), char::from(y));
+                let same =
+                    principal_names::fold(&x.to_string()) == principal_names::fold(&y.to_string());
+                let realm = format!("r{y}");
+                assert_eq!(
+                    computer_host_name("a$", &format!("a.r{x}"), &realm).is_ok(),
+                    same,
+                    "realm {x:?} {y:?}"
+                );
+                if x.is_ascii_alphanumeric() && y.is_ascii_alphanumeric() {
+                    assert_eq!(
+                        computer_host_name(&format!("a{y}$"), &format!("a{x}.r"), "r").is_ok(),
+                        same,
+                        "label {x:?} {y:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// RFC 4120 §6.2.1; docs/47 §1.3. The reserved first component

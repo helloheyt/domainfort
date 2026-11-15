@@ -109,12 +109,13 @@ fn kind_tables_are_as_documented() {
     // `list_destroy_decisions` appended by A-102 (docs/52 §4.6); 0x15
     // `verify_operation_ticket` appended by Q-523; 0x16-0x18 the three
     // change-password operations, appended by task K4 (docs/53 §5.5); 0x19
-    // `revoke_decision`, appended by task F3 (docs/questions/Q-976).
-    assert_eq!(request_kind::ALL, (0x01..=0x19).collect::<Vec<u8>>());
+    // `revoke_decision`, appended by task F3 (docs/questions/Q-976); 0x1A
+    // `install_attestation_key`, appended by task PN9 (docs/59 §7.5).
+    assert_eq!(request_kind::ALL, (0x01..=0x1A).collect::<Vec<u8>>());
     for (request, reply) in request_kind::ALL.iter().zip(reply_kind::ALL) {
         assert_eq!(*reply, 0x80 | request);
     }
-    assert_eq!(&reply_kind::ALL[25..], &[0xF1, 0xF2, 0xF3]);
+    assert_eq!(&reply_kind::ALL[26..], &[0xF1, 0xF2, 0xF3]);
     assert!(!request_kind::ALL.contains(&REFUSED_KIND));
     assert!(!reply_kind::ALL.contains(&REFUSED_KIND));
     let body = request_body(&Call::Ping);
@@ -166,6 +167,7 @@ fn is_refusal(answer: &Answer) -> bool {
             | Answer::CompleteChangePassword(Ok(_))
             | Answer::SealChangePasswordError(Ok(_))
             | Answer::RevokeDecision(Ok(_))
+            | Answer::InstallAttestationKey(Ok(_))
     )
 }
 
@@ -689,9 +691,10 @@ fn an_unknown_ping_caller_role_is_refused() {
 /// §3.10 (c); Q-466 item 3 (A-102: "state calls only through call_with_fate
 /// by type"): for every call of every operation (tests/samples), the split
 /// follows keyd's one table — `keyd_types::authz::requires_acknowledged_intent`,
-/// the table keyd-daemon's classification reads — and the expected nine
-/// operations (the eight of R9, and the change-password completion of task
-/// K4) are exactly the state calls: an `IssuanceCall` (the only
+/// the table keyd-daemon's classification reads — and the expected ten
+/// operations (the eight of R9, the change-password completion of task K4
+/// and the attestation key's install of task PN9) are exactly the state
+/// calls: an `IssuanceCall` (the only
 /// argument `KeydClient::call` takes) can be made of every other call and
 /// of none of these, a `StateCall` of these and of no other.
 #[test]
@@ -706,6 +709,7 @@ fn the_state_calls_are_keyds_table_and_never_issuance_calls() {
         Operation::GrantSetSecret,
         Operation::RegisterDecision,
         Operation::CompleteChangePassword,
+        Operation::InstallAttestationKey,
     ];
     for operation in Operation::ALL {
         assert_eq!(
@@ -1056,4 +1060,104 @@ fn the_destroy_page_is_bounded() {
         samples::destruction_page(1, 65, None)
     )))
     .is_err());
+}
+
+// ---- the attestation key's install (task PN9) ----------------------------------------
+
+/// Task PN9 (docs/59 §7.5; docs/50 §3.3 — strict, bounded, one encoding per
+/// value): `install_attestation_key` is kind `0x1A`, then the key as
+/// `secret bytes<32>` — the length field always 32, then exactly 32
+/// octets, nothing else. A length of 31 or 33 (with that many octets), a
+/// length of 32 with 31 octets, a trailing octet, and the all-zero key are
+/// all refused `Malformed` — never decoded, never handed to keyd; a key of
+/// another length cannot be carried at all.
+#[test]
+fn the_attestation_key_request_is_strict() {
+    let body = request_body(&Call::InstallAttestationKey {
+        key: samples::attestation_key(),
+    });
+    let mut expected = vec![0x4B, 0x44, 0x01, request_kind::INSTALL_ATTESTATION_KEY];
+    expected.extend_from_slice(&32u32.to_be_bytes());
+    expected.extend_from_slice(&samples::ATTESTATION_KEY);
+    assert_eq!(body, expected);
+    let Ok(Call::InstallAttestationKey { key }) = decode_request(&body) else {
+        panic!("decodes as the install");
+    };
+    assert_eq!(key.expose(), &samples::ATTESTATION_KEY);
+
+    let with = |length: u32, octets: &[u8]| {
+        let mut body = vec![0x4B, 0x44, 0x01, request_kind::INSTALL_ATTESTATION_KEY];
+        body.extend_from_slice(&length.to_be_bytes());
+        body.extend_from_slice(octets);
+        body
+    };
+    let mut trailing = body.clone();
+    trailing.push(0);
+    for bad in [
+        with(31, &[0x6B; 31]),
+        with(33, &[0x6B; 33]),
+        with(32, &[0x6B; 31]),
+        with(0, &[]),
+        with(u32::MAX, &[0x6B; 32]),
+        trailing,
+        body[..body.len() - 1].to_vec(),
+    ] {
+        assert_eq!(
+            refusal_of(&bad),
+            Some(Refused::Malformed),
+            "{} octets",
+            bad.len()
+        );
+    }
+    // The all-zero key: a well-formed field, refused by the typed layer.
+    let zero = with(32, &[0u8; 32]);
+    assert!(matches!(
+        decode_request(&zero),
+        Err(Rejection::Value(ipc_keyd::ConversionError::AttestationKey))
+    ));
+    assert_eq!(refusal_of(&zero), Some(Refused::Malformed));
+    // The carrier holds exactly 32 octets, never all zero.
+    for octets in [&[0x6B; 31][..], &[0x6B; 33][..], &[][..], &[0u8; 32][..]] {
+        assert!(ipc_keyd::AttestationKeyOctets::from_slice(octets).is_none());
+    }
+    // Encoding a wire request whose key is not 32 octets is refused.
+    for length in [0usize, 31, 33] {
+        let request =
+            KeydRequest::InstallAttestationKey(ipc_keyd::wire::InstallAttestationKeyRequest {
+                key: ipc::Secret::from_slice(&vec![0x6B; length]),
+            });
+        assert!(encode_frame(KEYD_CHANNEL, Direction::Request, &request).is_err());
+    }
+    // The reply: kind 0x9A, no payload; a failure is `Error` (0xF3).
+    let ok = reply_body(&Answer::InstallAttestationKey(Ok(())));
+    assert_eq!(
+        ok,
+        vec![0x4B, 0x44, 0x01, reply_kind::INSTALL_ATTESTATION_KEY]
+    );
+    assert_eq!(reply_kind::INSTALL_ATTESTATION_KEY, 0x9A);
+}
+
+/// docs/50 §8.2 ("secret-bearing types without a Debug that prints
+/// content"), §3.3; AGENTS.md §6; docs/59 §7.4 (the key is never exported):
+/// neither the typed call, the wire request, nor the request decoded on the
+/// server shows the attestation key's octets in any rendering — each says
+/// it is redacted.
+#[test]
+fn the_attestation_key_never_shows_in_debug() {
+    let call = Call::InstallAttestationKey {
+        key: samples::attestation_key(),
+    };
+    let wire = call.to_wire().unwrap();
+    let decoded = decode_request(&request_body(&call)).unwrap();
+    for text in [
+        format!("{call:?}"),
+        format!("{wire:?}"),
+        format!("{decoded:?}"),
+        format!("{call:#?}"),
+        format!("{wire:#?}"),
+    ] {
+        assert!(!text.contains("107"), "{text}");
+        assert!(!text.contains("6b") && !text.contains("6B"), "{text}");
+        assert!(text.contains("redacted"), "{text}");
+    }
 }

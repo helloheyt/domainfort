@@ -218,8 +218,11 @@ code_table! {
     /// `CompleteChangePassword`, `SealChangePasswordError` (codes 22-24) were
     /// appended by task K3 (docs/53 §5.5, §9); codes 1-21 keep their meaning.
     /// `RevokeDecision` (code 25) was appended by task F3 (docs/questions/
-    /// Q-976); codes 1-24 keep their meaning.
-    /// Spec: docs/10 §2-§7; crates/keyd authz.rs; docs/52 §4; docs/53 §9.
+    /// Q-976); codes 1-24 keep their meaning. `InstallAttestationKey` (code
+    /// 26) was appended by task PN9 (docs/59 §7.5; docs/questions/Q-1033);
+    /// codes 1-25 keep their meaning.
+    /// Spec: docs/10 §2-§7; crates/keyd authz.rs; docs/52 §4; docs/53 §9;
+    /// docs/59 §7.5.
     pub enum KeydOperation {
         VerifyPreauth,
         IssueAsRep,
@@ -246,6 +249,7 @@ code_table! {
         CompleteChangePassword,
         SealChangePasswordError,
         RevokeDecision,
+        InstallAttestationKey,
     }
 }
 
@@ -270,7 +274,9 @@ code_table! {
     /// intent must be acknowledged first (`keyd::requires_acknowledged_intent`):
     /// one that changes keyd's key state (`keyd::changes_key_state`:
     /// `SetSecret`, `CreateKey`, `RotateKey`, `RotateKrbtgt`, `RetireKvno`,
-    /// `DestroyKeySet`) or one that loosens keyd's authorization
+    /// `DestroyKeySet`, `CompleteChangePassword` — task K3 — and
+    /// `InstallAttestationKey` — task PN9) or one that loosens keyd's
+    /// authorization
     /// (`keyd::loosens_authorization`: `GrantSetSecret`, task A15a —
     /// docs/questions/Q-452; `RegisterDecision`, A-102):
     ///
@@ -316,7 +322,15 @@ code_table! {
     /// 80 to 94. The two revocation reasons (`DecisionRevoked`,
     /// `DecisionExecuted`, codes 94-95) were appended by task F3
     /// (docs/questions/Q-976) the same way; `Unlisted` moved from 94 to 96.
-    /// Spec: crates/keyd audit.rs; docs/10 §9, §10, I8; docs/53 §9.
+    /// The attestation-key install's own reason (`AttestationKeyInstalled`,
+    /// code 96 — the first of keyd's five PN8 reasons in declaration order)
+    /// was appended by task PN9 (docs/59 §7.5; docs/questions/Q-1033 item 4)
+    /// the same way; `Unlisted` moved from 96 to 97. The four name-resolution
+    /// reasons that follow it in keyd (`AttestationKeyMissing` …
+    /// `NameResolutionMismatch`) come with the verification on the issuance
+    /// path (task PN11); until then they are recorded as `Unlisted`.
+    /// Spec: crates/keyd audit.rs; docs/10 §9, §10, I8; docs/53 §9; docs/59
+    /// §7.5.
     pub enum KeydReason {
         None,
         RoleNotPermitted,
@@ -413,6 +427,7 @@ code_table! {
         KpasswdInitialFlagNeeded,
         DecisionRevoked,
         DecisionExecuted,
+        AttestationKeyInstalled,
         Unlisted,
     }
 }

@@ -15,6 +15,9 @@
 //!   `KRBTGT/…`, `KADMIN/changepw` (`ValueInvalid`), the TGS's name or the
 //!   realm alias as an account name (`AccountNameInvalid`) — refused at
 //!   `prepare`.
+//! - A computer names only its own host, `<computerName>.<realm DNS name>`
+//!   (task PN6, rule N6): another host is `ValueInvalid`, a computerName
+//!   that is no DNS label `AccountNameInvalid` — at `prepare`.
 //! - A create stores exactly the keys its names produce (docs/59 N7).
 //! - `Lookup` finds by one namespace probe and the exact stored value (R47-1
 //!   kept); an object written beneath the checker without keys is not found
@@ -24,9 +27,10 @@
 //! name type does not partition the name space. Ignoring the name type, no
 //! two names can be the same"; "Names of any type with an initial component
 //! of 'krbtgt' are reserved"); [MS-SAMR] 3.1.1.8.4 item 2; [MS-ADTS]
-//! 3.1.1.5.1.3; RFC 3244 §2; docs/questions/Q-1007 items 2, 3, 7, 8, Q-1009
-//! items 1-2, Q-1018 item 5. Fixtures: tests/common; names and values are
-//! this project's own test data.
+//! 3.1.1.5.1.3, 3.1.1.5.3.1.1.2; RFC 1035 §2.3.1; RFC 3244 §2; docs/54
+//! §5.3; docs/questions/Q-994 item 1, Q-1007 items 2, 3, 7, 8, Q-1009 items
+//! 1-2, Q-1010 items 1-2, Q-1018 item 5. Fixtures: tests/common; names and
+//! values are this project's own test data.
 
 mod common;
 
@@ -123,13 +127,10 @@ fn a_name_taken_in_any_form_is_a_conflict() {
         create_group(MANAGED_OU, "Alice"),
         // A user named like the DC's dNSHostName.
         create_user(MANAGED_OU, "dc01.example.test", None),
-        // The LDAP service object's SPN in another case (and the DC's host).
-        create_computer(
-            MANAGED_OU,
-            "ws20",
-            "dc01.example.test",
-            Some("LDAP/dc01.example.test"),
-        ),
+        // (A computer carrying the LDAP service object's SPN in another case
+        // — on the DC's host — was a `Conflict` here until task PN6; it now
+        // names a host not its own, refused as a value before any key is
+        // probed: `create_computer_names_only_its_own_host`.)
     ];
     for op in taken {
         let r = d.run(op.clone(), "admin1", &[]).refused();
@@ -138,15 +139,7 @@ fn a_name_taken_in_any_form_is_a_conflict() {
     }
     assert_eq!(change_seq(&d), before, "nothing written");
     let snapshot = d.store.snapshot().unwrap();
-    for rdn in [
-        "bob",
-        "ws01",
-        "WS01",
-        "carol",
-        "Alice",
-        "dc01.example.test",
-        "ws20",
-    ] {
+    for rdn in ["bob", "ws01", "WS01", "carol", "Alice", "dc01.example.test"] {
         assert_eq!(
             snapshot
                 .lookup_child(Some(guid(MANAGED_OU)), rdn.as_bytes())
@@ -165,6 +158,74 @@ fn a_name_taken_in_any_form_is_a_conflict() {
         )
         .applied();
     assert_eq!(keys_of(&d, created(applied.reply())), ["carol"]);
+}
+
+/// Task PN6, rule N6 (docs/59 §4.4, §10.1: "dNSHostName = `<base>.<realm>`;
+/// other ⇒ refused"); [MS-ADTS] 3.1.1.5.3.1.1.2 ("computerName.
+/// fullDomainDnsName, where computerName is the current sAMAccountName of
+/// the object (without the final "$" character)"); RFC 1035 §2.3.1 (one
+/// label: a letter first, letters, digits and hyphen); docs/54 §5.3;
+/// docs/questions/Q-994 item 1, Q-1010 items 1-2: `CreateComputer` names
+/// only the computer's own host. A dNSHostName naming another host — the
+/// DC's (with the LDAP service object's SPN in another case: a `Conflict`
+/// before task PN6, now a value refused before any key is probed), another
+/// computer's, another domain, the realm itself, a bare label — is
+/// `ValueInvalid` at `prepare`; a computerName that is not one RFC 1035
+/// label (digit first, "_", ".") has no host name at all
+/// (`AccountNameInvalid`). Nothing is written. Its own host, with the name
+/// in another case, is created, and the host is one of its keys.
+#[test]
+fn create_computer_names_only_its_own_host() {
+    let mut d = Domain::new("namespace-host-name");
+    let before = change_seq(&d);
+    let other_hosts = [
+        create_computer(
+            MANAGED_OU,
+            "ws20",
+            "dc01.example.test",
+            Some("LDAP/dc01.example.test"),
+        ),
+        create_computer(MANAGED_OU, "ws20", "dc01.example.test", None),
+        create_computer(MANAGED_OU, "ws20", "ws01.example.test", None),
+        create_computer(MANAGED_OU, "ws20", "ws20.other.test", None),
+        create_computer(MANAGED_OU, "ws20", "example.test", None),
+        create_computer(MANAGED_OU, "ws20", "ws20", None),
+    ];
+    for op in other_hosts {
+        let r = d.run(op.clone(), "admin1", &[]).refused();
+        assert_eq!(refusal_code(&r), AdminRefusal::ValueInvalid, "{op:?}");
+    }
+    for (name, host) in [
+        ("1ws", "1ws.example.test"),
+        ("w_s", "w_s.example.test"),
+        ("w.s", "w.s.example.test"),
+    ] {
+        let op = create_computer(MANAGED_OU, name, host, None);
+        let r = d.run(op.clone(), "admin1", &[]).refused();
+        assert_eq!(refusal_code(&r), AdminRefusal::AccountNameInvalid, "{op:?}");
+    }
+    assert_eq!(change_seq(&d), before, "nothing written");
+    let (_, applied) = d
+        .run(
+            create_computer(
+                MANAGED_OU,
+                "WS20",
+                "ws20.example.test",
+                Some("host/ws20.example.test"),
+            ),
+            "admin1",
+            &[],
+        )
+        .applied();
+    assert_eq!(
+        keys_of(&d, created(applied.reply())),
+        [
+            "host/ws20.example.test",
+            "ws20",
+            "ws20$",
+            "ws20.example.test"
+        ]
+    );
 }
 
 /// Class C49 (docs/59 §3 M3); Q-1009 items 1-2 (decided A-173); A-163; RFC

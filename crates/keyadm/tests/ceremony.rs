@@ -769,3 +769,136 @@ fn the_ceremony_grants_each_first_administrator_its_initial_secret() {
     }
     world.daemon.stop().unwrap();
 }
+
+// ---- the attestation key (task PN9) -----------------------------------------------
+
+/// keyd's `InstallAttestationKey` audit records received so far (intents and
+/// outcomes).
+fn install_records(world: &World) -> Vec<KeydRecord> {
+    world
+        .auditd
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            EventBody::Keyd(record) if record.op == KeydOperation::InstallAttestationKey => {
+                Some(*record)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A made-up attestation key, written to a 0600 file of the test account
+/// inside the workspace (crates/test-scratch — the protected-file walk from
+/// `/` accepts it, Q-480) and read back through keyadm's reader, as the
+/// binary does (until provision writes the file — task PN12).
+fn attestation_key(scratch: &test_scratch::ScratchDir) -> ipc_keyd::AttestationKeyOctets {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let path = scratch.join("attestation.key");
+    std::fs::write(&path, [0x3C; 32]).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let owner = std::fs::metadata(&path).unwrap().uid();
+    keyadm::attestation_key::read_attestation_key_owned_by(&path, owner).unwrap()
+}
+
+/// docs/59 §7.4, §7.5 (task PN9); docs/questions/Q-1011 items 2, 8 (A-173:
+/// "delivered to keyd in ceremony mode only, never exported"), Q-1033 (A-177:
+/// the `Operation`, the wire, the audit codes, the keyadm step, "with an
+/// acknowledged intent before the install"): against the real keyd daemon,
+/// the ceremony given an attestation key installs it after the four key
+/// sets and before the grants and the seal — keyd's audit holds the
+/// install's acknowledged `Intent` and then its `Success` outcome (caller
+/// keyadm's uid, Admin; no principal, purpose or kvno — nothing of the key);
+/// the report says so. After the seal a second install (the same key, sent
+/// by hand) is refused — `Denied`, reason `CeremonySealed`, decided at the
+/// authorization step, so no intent.
+#[test]
+fn the_ceremony_installs_the_attestation_key_once_before_the_seal() {
+    let Some(world) = world(Some(Role::Admin)) else {
+        return;
+    };
+    let scratch = test_scratch::ScratchDir::new("keyadm-attestation-ceremony").unwrap();
+    let m = manifest();
+    let report = ceremony::run_with_attestation_key(
+        &mut world.client(world.uid),
+        &m,
+        attestation_key(&scratch),
+    );
+    assert!(report.is_complete(), "{report:?}");
+    assert!(report.attestation_key_installed());
+    assert_eq!(
+        report.attestation_key,
+        ceremony::AttestationKeyStep::Attempted(Outcome::Answered(Ok(())))
+    );
+    assert_eq!(report::exit_code(&report), EXIT_COMPLETE);
+    let text = report::render(&report, &m).join("\n");
+    assert!(
+        text.contains("installed the attestation key of dird's name resolutions in keyd"),
+        "{text}"
+    );
+    assert!(eventually(Duration::from_secs(10), || install_records(
+        &world
+    )
+    .len()
+        >= 2));
+    let records = install_records(&world);
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].result, KeydOutcome::Intent);
+    assert_eq!(records[1].result, KeydOutcome::Success);
+    for record in &records {
+        assert_eq!(record.caller_uid, world.uid);
+        assert_eq!(record.caller_role, ipc_audit::KeydRole::Admin);
+        assert_eq!(record.principal, None);
+        assert_eq!(record.purpose, None);
+        assert_eq!(record.kvno, None);
+        assert_eq!(record.decision, None);
+    }
+
+    // After the seal: refused at the authorization step, no intent.
+    assert_eq!(
+        world
+            .client(world.uid)
+            .install_attestation_key(attestation_key(&scratch)),
+        Ok(Err(KeydError::Denied))
+    );
+    let refused = || {
+        install_records(&world)
+            .into_iter()
+            .any(|record| record.reason == KeydReason::CeremonySealed)
+    };
+    assert!(eventually(Duration::from_secs(10), refused));
+    let records = install_records(&world);
+    assert_eq!(records.len(), 3, "one record, no intent: {records:?}");
+    assert_eq!(records[2].result, KeydOutcome::Denied);
+    world.daemon.stop().unwrap();
+}
+
+/// docs/59 §7.4 (task PN9): a ceremony without an attestation key file
+/// installs none — it completes as before (four key sets, the grants, the
+/// seal), keyd's audit holds no install at all, and the report says keyd
+/// holds no attestation key (so it will verify no name resolution — fail
+/// closed — until one is installed in a ceremony).
+#[test]
+fn a_ceremony_without_a_key_file_installs_none() {
+    let Some(world) = world(Some(Role::Admin)) else {
+        return;
+    };
+    let m = manifest();
+    let report = ceremony::run(&mut world.client(world.uid), &m);
+    assert!(report.is_complete(), "{report:?}");
+    assert_eq!(
+        report.attestation_key,
+        ceremony::AttestationKeyStep::NotRequested
+    );
+    let text = report::render(&report, &m).join("\n");
+    assert!(text.contains("no attestation key file given"), "{text}");
+    // The seal is the ceremony's last record; nothing installed before it.
+    let sealed = || {
+        world.auditd.events().into_iter().any(|event| {
+            matches!(event, EventBody::Keyd(record) if record.op == KeydOperation::SealCeremony)
+        })
+    };
+    assert!(eventually(Duration::from_secs(10), sealed));
+    assert!(install_records(&world).is_empty());
+    world.daemon.stop().unwrap();
+}

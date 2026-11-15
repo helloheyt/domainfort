@@ -107,6 +107,22 @@ pub const MAX_DECISION_APPROVERS: u32 = 3;
 /// Spec: docs/52 §4.6 (A-102); docs/50 §3.3 (bounded replies).
 pub const MAX_DESTROY_PAGE: u32 = 64;
 
+/// The exact length of the attestation key on the wire (`install_attestation_key`,
+/// task PN9): 32 octets — crate name-attestation's `ATTESTATION_KEY_LEN`
+/// (the SHA-256 output size L, FIPS 180-4 §1, as name-attestation records).
+/// This crate links no crypto code (D182; A-63, A-173), so the value is
+/// restated here and pinned against name-attestation's at compile time in
+/// crate ipc-keyd-server, which links both (a different value does not
+/// build there). Every other length is refused: fewer octets `Truncated`,
+/// more `LengthOverBound` — both `Malformed`.
+/// Spec: docs/59 §7.4; docs/questions/Q-1011 item 2 (A-173), Q-1033
+/// (A-177); docs/50 §3.3 (bounded fields).
+pub const ATTESTATION_KEY_OCTETS: usize = 32;
+
+/// [`ATTESTATION_KEY_OCTETS`] as the `u32` field bound of the ipc layer.
+/// Spec: docs/50 §3.3 (`bytes<max>` = `u32` length ≤ max + octets).
+pub const ATTESTATION_KEY_FIELD: u32 = ATTESTATION_KEY_OCTETS as u32;
+
 // The bounds agree with the values they are derived from; checked at compile
 // time, never at run time. Task K3 (docs/questions/Q-620 item 4): the bound
 // of a password on this channel is the bound of RFC 3244's `newpasswd`, so a
@@ -120,6 +136,8 @@ const _: () = assert!(MAX_DECISION_APPROVERS as usize == keyd_types::MAX_DECISIO
 const _: () = assert!(MAX_DESTROY_PAGE as usize == keyd_types::MAX_DESTROY_DECISION_PAGE);
 const _: () = assert!(MAX_REQUEST_FIELD < MAX_REQUEST_BODY);
 const _: () = assert!(MAX_REPLY_FIELD < MAX_REPLY_BODY);
+const _: () = assert!(ATTESTATION_KEY_FIELD as usize == ATTESTATION_KEY_OCTETS);
+const _: () = assert!(ATTESTATION_KEY_FIELD < MAX_REQUEST_FIELD);
 
 // ---- kinds -----------------------------------------------------------------
 
@@ -195,6 +213,11 @@ pub mod request_kind {
     /// registered. Appended by task F3.
     /// Spec: docs/52 §4.2, §4.6; docs/questions/Q-937 item 6, Q-976.
     pub const REVOKE_DECISION: u8 = 0x19;
+    /// `install_attestation_key(key)` (Admin, provisioning only): hand keyd
+    /// the attestation key of dird's name resolutions — a state call.
+    /// Appended by task PN9.
+    /// Spec: docs/59 §7.4, §7.5; docs/questions/Q-1011 items 2, 8, Q-1033.
+    pub const INSTALL_ATTESTATION_KEY: u8 = 0x1A;
 
     /// The closed request table. Spec: docs/50 §3.3, §3.4.
     pub const ALL: &[u8] = &[
@@ -223,6 +246,7 @@ pub mod request_kind {
         COMPLETE_CHANGE_PASSWORD,
         SEAL_CHANGE_PASSWORD_ERROR,
         REVOKE_DECISION,
+        INSTALL_ATTESTATION_KEY,
     ];
 }
 
@@ -294,6 +318,9 @@ pub mod reply_kind {
     /// `()`: the decision is revoked (task F3). Spec: docs/52 §4.2;
     /// docs/questions/Q-976.
     pub const REVOKE_DECISION: u8 = ok(rq::REVOKE_DECISION);
+    /// `()`: the attestation key is installed (task PN9). Spec: docs/59
+    /// §7.4, §7.5.
+    pub const INSTALL_ATTESTATION_KEY: u8 = ok(rq::INSTALL_ATTESTATION_KEY);
     /// A refusal of an authentication step: `keyd_types::AuthnError`.
     /// Spec: docs/10 §9; A-26; A-56.
     pub const AUTHN_FAILURE: u8 = 0xF1;
@@ -332,6 +359,7 @@ pub mod reply_kind {
         COMPLETE_CHANGE_PASSWORD,
         SEAL_CHANGE_PASSWORD_ERROR,
         REVOKE_DECISION,
+        INSTALL_ATTESTATION_KEY,
         AUTHN_FAILURE,
         ISSUE_FAILURE,
         FAILURE,

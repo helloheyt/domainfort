@@ -119,7 +119,8 @@
 
 use crate::channel::{KEYD_CHANNEL, REPLY_LIMIT};
 use crate::typed::{
-    Answer, Call, ConversionError, DescribedConfig, IssuanceCall, Password, TgsFast,
+    Answer, AttestationKeyOctets, Call, ConversionError, DescribedConfig, IssuanceCall, Password,
+    TgsFast,
 };
 use crate::wire::KeydReply;
 use core::fmt;
@@ -613,6 +614,9 @@ const _: () = {
         Operation::RegisterDecision,
         // Task K4: the completion installs a password (docs/52 §3.10 (c)).
         Operation::CompleteChangePassword,
+        // Task PN9: the install of the attestation key (docs/59 §7.5;
+        // docs/questions/Q-1033 item 3).
+        Operation::InstallAttestationKey,
     ];
     let mut i = 0;
     while i < issuance.len() {
@@ -1159,6 +1163,24 @@ impl<C: Connector> KeydClient<C> {
             Answer::RegisterDecision(result) => Some(result),
             _ => None,
         })
+    }
+
+    /// `install_attestation_key` (Role::Admin — keyadm's ceremony, before the
+    /// seal): hand keyd the attestation key of dird's name resolutions (task
+    /// PN9). It installs long-term key material — a state call: the result
+    /// carries the fate ([`StateOutcome`]). The key is consumed and wiped
+    /// when this returns (the request frame that carried it is zeroizing
+    /// too).
+    /// Spec: docs/59 §7.4, §7.5; docs/questions/Q-1011 items 2, 8, Q-1033;
+    /// docs/10 §10.
+    pub fn install_attestation_key(&mut self, key: AttestationKeyOctets) -> StateOutcome<()> {
+        self.state(
+            &Call::InstallAttestationKey { key },
+            |answer| match answer {
+                Answer::InstallAttestationKey(result) => Some(result),
+                _ => None,
+            },
+        )
     }
 
     /// `revoke_decision` (Role::Ldap — dird): take back the key-operation

@@ -61,9 +61,10 @@
 //!   development custody until KL3 — P-71); a keyd that starts operational
 //!   (a non-empty store) has no ceremony and so no key: every resolution is
 //!   refused (fail closed) until the sealed store keeps the key (KL3).
-//! * The install is not audited yet: an audit record names an `Operation`,
-//!   and the operation `InstallAttestationKey` (capability-table row, wire
-//!   codes of ipc-keyd and ipc-audit) is task PN9 (docs/questions/Q-1033).
+//! * The install is the operation `InstallAttestationKey` since task PN9
+//!   (capability-table row, one audit record, its intent acknowledged by
+//!   auditd first, the wire of ipc-keyd and the codes of ipc-audit —
+//!   docs/questions/Q-1033, Q-1038).
 //!
 //! # Provenance
 //!
@@ -328,7 +329,7 @@ mod tests {
 
     fn keyd_with_key() -> TestKeyd {
         let mut keyd = keyd();
-        keyd.install_attestation_key(&ADMIN, key(&TEST_KEY))
+        keyd.install_attestation_key(&ADMIN, key(&TEST_KEY), &now())
             .unwrap();
         keyd
     }
@@ -597,19 +598,19 @@ mod tests {
         let mut keyd = keyd();
         for caller in [KDC, DIRECTORY, LDAP] {
             assert_eq!(
-                reason(keyd.install_attestation_key_inner(&caller, key(&TEST_KEY))),
+                reason(keyd.install_attestation_key_inner(&caller, key(&TEST_KEY), &now())),
                 Err(AuditReason::RoleNotPermitted),
                 "{caller:?}"
             );
             assert!(!keyd.has_attestation_key());
         }
         assert_eq!(
-            reason(keyd.install_attestation_key_inner(&ADMIN, key(&TEST_KEY))),
+            reason(keyd.install_attestation_key_inner(&ADMIN, key(&TEST_KEY), &now())),
             Ok(())
         );
         assert!(keyd.has_attestation_key());
         assert_eq!(
-            reason(keyd.install_attestation_key_inner(&ADMIN, key(&OTHER_KEY))),
+            reason(keyd.install_attestation_key_inner(&ADMIN, key(&OTHER_KEY), &now())),
             Err(AuditReason::AttestationKeyInstalled)
         );
         assert!(keyd
@@ -633,7 +634,7 @@ mod tests {
         sealed.seal_ceremony(&ADMIN, &now()).unwrap();
         assert_eq!(sealed.ceremony_state(), CeremonyState::Operational);
         assert_eq!(
-            reason(sealed.install_attestation_key_inner(&ADMIN, key(&TEST_KEY))),
+            reason(sealed.install_attestation_key_inner(&ADMIN, key(&TEST_KEY), &now())),
             Err(AuditReason::CeremonySealed)
         );
         assert!(!sealed.has_attestation_key());
@@ -665,7 +666,7 @@ mod tests {
         .unwrap();
         assert_eq!(operational.ceremony_state(), CeremonyState::Operational);
         assert_eq!(
-            reason(operational.install_attestation_key_inner(&ADMIN, key(&TEST_KEY))),
+            reason(operational.install_attestation_key_inner(&ADMIN, key(&TEST_KEY), &now())),
             Err(AuditReason::CeremonySealed)
         );
         assert!(!operational.has_attestation_key());
@@ -677,7 +678,7 @@ mod tests {
     fn debug_shows_only_whether_a_key_is_installed() {
         let mut keyd = keyd();
         assert!(format!("{keyd:?}").contains("attestation_key_installed: false"));
-        keyd.install_attestation_key(&ADMIN, key(&TEST_KEY))
+        keyd.install_attestation_key(&ADMIN, key(&TEST_KEY), &now())
             .unwrap();
         let text = format!("{keyd:?}");
         assert!(text.contains("attestation_key_installed: true"));

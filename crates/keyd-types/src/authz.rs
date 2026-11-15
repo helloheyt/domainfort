@@ -191,11 +191,24 @@ pub enum Operation {
     /// §2, §6א, §10; docs/questions/Q-937 item 6 (the residual of A-159),
     /// Q-976.
     RevokeDecision = 24,
+    /// Install the attestation key with which keyd verifies dird's name
+    /// resolutions (docs/59 §7.2, §7.4): the key `provision` drew and wrote
+    /// to dird's key file, handed to keyd by keyadm's ceremony. Role::Admin
+    /// only, **in the provisioning ceremony only** ([`provisioning_only`]),
+    /// once per start (never replaced). keyd never returns the key and never
+    /// tags with it — it only verifies (invariant I1; D28 / D29). It
+    /// installs long-term key material that cannot be taken back in this
+    /// start, so it is a key-state change ([`changes_key_state`]): its
+    /// intent is acknowledged by auditd before keyd runs it (A-86 / A-88;
+    /// docs/questions/Q-1033 item 3). Appended by task PN9.
+    /// Spec: docs/59 §7.4, §7.5, §10 (PN9); docs/questions/Q-1011 items 2,
+    /// 8 (A-173), Q-1033 (A-177); docs/52 §4.4, §7 R3 (A-102).
+    InstallAttestationKey = 25,
 }
 
 impl Operation {
     /// Every operation, for exhaustive checks. Spec: docs/10 §2.
-    pub const ALL: [Operation; 25] = [
+    pub const ALL: [Operation; 26] = [
         Operation::VerifyPreauth,
         Operation::IssueAsRep,
         Operation::OpenAndVerifyTgt,
@@ -221,6 +234,7 @@ impl Operation {
         Operation::CompleteChangePassword,
         Operation::SealChangePasswordError,
         Operation::RevokeDecision,
+        Operation::InstallAttestationKey,
     ];
 }
 
@@ -258,7 +272,10 @@ impl Operation {
 /// covers every role) and `SealChangePasswordError`. Task F3 (docs/questions/
 /// Q-937 item 6, Q-976): Ldap (dird) also holds `RevokeDecision` — the role
 /// that registers a decision is the only one that may revoke one (pinned:
-/// for every role, `RevokeDecision` ⇔ `RegisterDecision`).
+/// for every role, `RevokeDecision` ⇔ `RegisterDecision`). Task PN9
+/// (docs/59 §7.5; docs/questions/Q-1011 item 8, Q-1033 item 2): Admin
+/// (keyadm's ceremony) alone holds `InstallAttestationKey`, which exists
+/// only before the seal (pinned below).
 pub const CAPABILITY_TABLE: [(Role, &[Operation]); 4] = [
     (
         Role::Kdc,
@@ -286,6 +303,7 @@ pub const CAPABILITY_TABLE: [(Role, &[Operation]); 4] = [
             Operation::SealCeremony,
             Operation::ListDestroyDecisions,
             Operation::Ping,
+            Operation::InstallAttestationKey,
         ],
     ),
     (
@@ -307,8 +325,10 @@ pub const CAPABILITY_TABLE: [(Role, &[Operation]); 4] = [
 
 /// `true` if `op` exists only while keyd is in its provisioning ceremony
 /// (before `seal_ceremony`): `create_key` (the ceremony draws krbtgt and the
-/// two service keys) and Role::Admin's `grant_set_secret` (the first
-/// administrators' initial secrets). After the seal both are refused at the
+/// two service keys), Role::Admin's `grant_set_secret` (the first
+/// administrators' initial secrets) and — task PN9 — `install_attestation_key`
+/// (the attestation key of dird's name resolutions: "delivered to keyd in
+/// ceremony mode only", A-173). After the seal all three are refused at the
 /// authorization step (`CeremonySealed`): Admin can then do nothing that is
 /// not a decision dird registered.
 ///
@@ -316,11 +336,12 @@ pub const CAPABILITY_TABLE: [(Role, &[Operation]); 4] = [
 /// decided here.
 ///
 /// Spec: docs/52 §3.4 (C4), §4.4, §7 R3; docs/51 §4.3 steps 11-12, §6;
-/// docs/questions/Q-451, Q-462 item 1 (A-102).
+/// docs/questions/Q-451, Q-462 item 1 (A-102); docs/59 §7.4, §7.5;
+/// docs/questions/Q-1011 item 2 (A-173), Q-1033 item 2 (A-177).
 #[must_use]
 pub const fn provisioning_only(op: Operation) -> bool {
     match op {
-        Operation::CreateKey | Operation::GrantSetSecret => true,
+        Operation::CreateKey | Operation::GrantSetSecret | Operation::InstallAttestationKey => true,
         Operation::VerifyPreauth
         | Operation::IssueAsRep
         | Operation::OpenAndVerifyTgt
@@ -389,7 +410,8 @@ pub const fn requires_decision(op: Operation) -> bool {
         | Operation::ListDestroyDecisions
         | Operation::OpenChangePasswordRequest
         | Operation::SealChangePasswordError
-        | Operation::RevokeDecision => false,
+        | Operation::RevokeDecision
+        | Operation::InstallAttestationKey => false,
     }
 }
 
@@ -415,10 +437,17 @@ pub const fn requires_decision(op: Operation) -> bool {
 /// `open_change_password_request` and `seal_change_password_error` touch
 /// only the replay cache and the request-context table (bookkeeping).
 ///
+/// `install_attestation_key` (task PN9) installs long-term key material —
+/// the attestation key, which decides which name resolutions keyd believes
+/// — that cannot be replaced or taken back in this start: key state, like
+/// every Role::Admin custody operation (docs/questions/Q-1033 item 3,
+/// decided A-177: "with an acknowledged intent before the install").
+///
 /// Spec: docs/10 §6 (`set_secret`), §7 (`create_key`, `rotate_key`,
 /// `rotate_krbtgt`, `retire_kvno`, `destroy_key_set`), §10;
 /// docs/questions/Q-346 (A-86), Q-466 item 3 (A-102); docs/53 §4.4, §9
-/// ("`complete_change_password` — intent + outcome (`changes_key_state`)").
+/// ("`complete_change_password` — intent + outcome (`changes_key_state`)");
+/// docs/59 §7.4; docs/questions/Q-1033 items 2, 3 (A-177).
 #[must_use]
 pub const fn changes_key_state(op: Operation) -> bool {
     match op {
@@ -428,7 +457,8 @@ pub const fn changes_key_state(op: Operation) -> bool {
         | Operation::RotateKrbtgt
         | Operation::RetireKvno
         | Operation::DestroyKeySet
-        | Operation::CompleteChangePassword => true,
+        | Operation::CompleteChangePassword
+        | Operation::InstallAttestationKey => true,
         Operation::VerifyPreauth
         | Operation::IssueAsRep
         | Operation::OpenAndVerifyTgt
@@ -490,7 +520,8 @@ pub const fn loosens_authorization(op: Operation) -> bool {
         | Operation::OpenChangePasswordRequest
         | Operation::CompleteChangePassword
         | Operation::SealChangePasswordError
-        | Operation::RevokeDecision => false,
+        | Operation::RevokeDecision
+        | Operation::InstallAttestationKey => false,
     }
 }
 
@@ -540,7 +571,9 @@ pub const fn requires_acknowledged_intent(op: Operation) -> bool {
 /// `list_destroy_decisions`, A-102; `revoke_decision`, task F3): the
 /// decision table is lost at a start
 /// like the grant table (stricter); the ceremony state restarts as
-/// `Provisioning` only for an empty store — docs/52 §4.4 (P-17). Held too
+/// `Provisioning` only for an empty store — docs/52 §4.4 (P-17). Nor
+/// `install_attestation_key` (task PN9): an Admin ceremony operation that
+/// uses neither the replay cache nor a token (docs/50 §3.5). Held too
 /// (task K3; docs/53 §5.3, §5.8): the three change-password operations —
 /// `open_change_password_request` enters the shared replay cache and
 /// creates a request context; `complete_change_password` and
@@ -578,7 +611,8 @@ pub const fn startup_hold_down_applies(op: Operation) -> bool {
         | Operation::RegisterDecision
         | Operation::SealCeremony
         | Operation::ListDestroyDecisions
-        | Operation::RevokeDecision => false,
+        | Operation::RevokeDecision
+        | Operation::InstallAttestationKey => false,
     }
 }
 
@@ -668,7 +702,9 @@ pub const fn as_server_slot(armored: bool) -> HandleSlot {
 ///   (the purposes of a decided operation are checked through the operation
 ///   that will run it — `DecidedOperation::purposes_permitted`),
 ///   `seal_ceremony` and `list_destroy_decisions` (A-102), nor
-///   `revoke_decision` (task F3: it names a decision id only).
+///   `revoke_decision` (task F3: it names a decision id only), nor
+///   `install_attestation_key` (task PN9: it carries the key, no handle —
+///   the attestation key is not a key set).
 /// - `issue_tgs_rep`: Service or AdminService — a service ticket is sealed
 ///   under the key set of its service's purpose (the admin service's own,
 ///   R2). Referral TGTs (Krbtgt in docs/10 §5) are cross-realm, which phase
@@ -1387,6 +1423,52 @@ const _: () = {
             purposes[y]
         ));
         y += 1;
+    }
+    // Task PN9 (docs/59 §7.4, §7.5; docs/questions/Q-1011 items 2, 8 —
+    // A-173: "delivered to keyd in ceremony mode only, never exported";
+    // Q-1033 items 2, 3 — A-177: "with an acknowledged intent before the
+    // install"): the attestation key's install is Role::Admin's alone, exists
+    // only before the seal, is a key-state change (its intent acknowledged
+    // first), runs on no dird decision (the ceremony precedes dird), is not
+    // held after a start (no replay cache, no token) and names no key set.
+    assert!(role_permits(Role::Admin, Operation::InstallAttestationKey));
+    assert!(!role_permits(Role::Kdc, Operation::InstallAttestationKey));
+    assert!(!role_permits(
+        Role::Directory,
+        Operation::InstallAttestationKey
+    ));
+    assert!(!role_permits(Role::Ldap, Operation::InstallAttestationKey));
+    assert!(provisioning_only(Operation::InstallAttestationKey));
+    assert!(changes_key_state(Operation::InstallAttestationKey));
+    assert!(!loosens_authorization(Operation::InstallAttestationKey));
+    assert!(requires_acknowledged_intent(
+        Operation::InstallAttestationKey
+    ));
+    assert!(!requires_decision(Operation::InstallAttestationKey));
+    assert!(!startup_hold_down_applies(Operation::InstallAttestationKey));
+    let mut ak = 0;
+    while ak < purposes.len() {
+        assert!(!purpose_permitted(
+            Operation::InstallAttestationKey,
+            HandleSlot::Primary,
+            purposes[ak]
+        ));
+        assert!(!purpose_permitted(
+            Operation::InstallAttestationKey,
+            HandleSlot::Secondary,
+            purposes[ak]
+        ));
+        assert!(!purpose_permitted(
+            Operation::InstallAttestationKey,
+            HandleSlot::AsServer,
+            purposes[ak]
+        ));
+        assert!(!purpose_permitted(
+            Operation::InstallAttestationKey,
+            HandleSlot::ArmoredAsServer,
+            purposes[ak]
+        ));
+        ak += 1;
     }
 };
 

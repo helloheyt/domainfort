@@ -71,6 +71,11 @@ use krb_proto::KerberosTime;
 /// the decision keyd's table holds for it (`keyd::Keyd::secret_decision`).
 /// The context id and the password are not kept (no field for them).
 ///
+/// **Task PN9 (docs/59 §7.5; docs/questions/Q-1033 item 3, A-177):**
+/// `install_attestation_key` is a key-state change: its record names the
+/// operation and the caller only — no handle (the attestation key is not a
+/// key set) and never the key (no field could hold it).
+///
 /// **A-102 (docs/52 §4.5):** `register_decision` takes the same path (it
 /// loosens keyd): the record names the decided key sets, the kvno a
 /// `RetireKvno` decision names, the first two approvers and the decision
@@ -87,8 +92,9 @@ pub struct KeyStateIntent {
     ts: KerberosTime,
     caller: CallerId,
     op: Operation,
-    /// The handle in the operation's `Primary` slot (`None` only for a grant
-    /// that names no key target — keyd refuses it as its outcome).
+    /// The handle in the operation's `Primary` slot (`None` for a grant that
+    /// names no key target — keyd refuses it as its outcome — and for
+    /// `install_attestation_key`, which names no key set, task PN9).
     primary: Option<KeyHandle>,
     /// A grant's second key target (`Secondary` slot).
     secondary: Option<KeyHandle>,
@@ -102,7 +108,8 @@ impl KeyStateIntent {
     /// The intent of `call` by `caller` at `now` if `call` needs one and
     /// names its parameters itself — `set_secret`, `create_key`,
     /// `grant_set_secret`, `register_decision`, `complete_change_password`
-    /// (task K4) — else `None`. An execution of
+    /// (task K4), `install_attestation_key` (task PN9) — else `None`. An
+    /// execution of
     /// a decision names only its id: its intent is
     /// [`KeyStateIntent::decided`]. The match is exhaustive over [`Call`]: a
     /// new call does not compile until it is classified here. [`classify`]
@@ -151,6 +158,15 @@ impl KeyStateIntent {
                     _ => None,
                 },
                 Some(*id),
+            ),
+            // Task PN9: the operation and the caller; no handle, no key.
+            Call::InstallAttestationKey { .. } => (
+                Operation::InstallAttestationKey,
+                None,
+                None,
+                None,
+                None,
+                None,
             ),
             Call::RotateKey { .. }
             | Call::RotateKrbtgt { .. }

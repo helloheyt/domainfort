@@ -16,6 +16,9 @@
 //! **Task PN8:** `install_attestation_key` — the attestation key of dird's
 //! name resolutions, installed once, in the ceremony only, by Role::Admin
 //! only; keyd only verifies with it (crate name_resolution; docs/59 §7.4).
+//! **Task PN9:** it is the operation `Operation::InstallAttestationKey` —
+//! its role and ceremony checks are the capability table's (`Keyd::admit`),
+//! and it emits its one audit record (I8).
 //!
 //! Spec: docs/10 §7; docs/09 א.7 (D32 current + previous); docs/33 §5
 //! (double krbtgt rotation after compromise, D20), §6.1 (D178);
@@ -23,7 +26,7 @@
 //! docs/questions/Q-460, Q-462 item 1 (A-102).
 
 use crate::audit::{AuditKeyRef, AuditReason, AuditSink};
-use crate::authz::{CallerId, HandleSlot, Operation, Role};
+use crate::authz::{CallerId, HandleSlot, Operation};
 use crate::decision::Recorded;
 use crate::entropy::EntropySource;
 use crate::error::{Deny, Error, Internal};
@@ -31,17 +34,9 @@ use crate::keyd::{new_random_keys, store_deny, AuditFields, Keyd};
 use crate::model::{KeyHandle, KeyPurpose, Kvno, PrincipalBinding, PrincipalId};
 use crate::store::{KeyStore, KvnoKeys, StoredKeySet};
 use crate::template::check_new_binding;
-use keyd_types::{CeremonyState, DecidedOperation, DecisionId};
+use keyd_types::{DecidedOperation, DecisionId};
 use krb_proto::KerberosTime;
 use name_attestation::AttestationKey;
-
-/// The one role that may install the attestation key: the ceremony's
-/// (keyadm, Role::Admin — the role of `create_key`). Interim: task PN9 moves
-/// this into the capability table as the Admin row's
-/// `Operation::InstallAttestationKey` (docs/59 §7.5).
-/// Spec: docs/questions/Q-1011 items 2, 8 (A-173: "one ceremony-only
-/// Role::Admin operation to install the key"); docs/52 §4.4.
-const ATTESTATION_KEY_INSTALLER: Role = Role::Admin;
 
 /// The dual-control approval `rotate_krbtgt` requires: two approver
 /// identities, **built only inside keyd** from the approvers of a decision
@@ -367,54 +362,63 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// `install_attestation_key`: put the attestation key dird's name
     /// resolutions are verified with into keyd's slot (task PN8; docs/59
     /// §7.4) — the key `provision` drew and wrote to dird's key file, handed
-    /// to keyd by the ceremony (task PN9 / PN12). keyd never exports it, and
-    /// never tags with it: it only verifies (`Keyd::verify_name_resolution`).
+    /// to keyd by keyadm's ceremony (task PN9; PN12 writes the file). keyd
+    /// never exports it, and never tags with it: it only verifies
+    /// (`Keyd::verify_name_resolution`).
     ///
     /// Refused — the uniform `Denied`, nothing changed, the refused key
     /// wiped on drop — in this order:
-    /// 1. a caller other than Role::Admin (`RoleNotPermitted`): the ceremony
-    ///    is keyadm's (Role::Admin), as for `create_key`;
-    /// 2. outside the provisioning ceremony (`CeremonySealed`): after
-    ///    `seal_ceremony`, or on a keyd that started operational (A-102,
+    /// 1. the authorization step ([`Keyd::admit`] with
+    ///    `Operation::InstallAttestationKey`): a caller other than
+    ///    Role::Admin (`RoleNotPermitted` — the capability table's Admin row
+    ///    alone holds it); outside the provisioning ceremony
+    ///    (`CeremonySealed` — `authz::provisioning_only`: after
+    ///    `seal_ceremony`, or on a keyd that started operational, A-102,
     ///    docs/52 R3) — a key is never installed into a running service;
-    /// 3. a key already installed (`AttestationKeyInstalled`): once per
+    /// 2. a key already installed (`AttestationKeyInstalled`): once per
     ///    start, never replaced — so whoever reaches keyd after the ceremony
     ///    cannot swap in a key whose resolutions keyd would then believe.
     ///
-    /// **Not yet audited** (interim, task PN8 only): an audit record names
-    /// an `Operation`, and the operation `InstallAttestationKey` — its row in
-    /// the capability table (`authz.rs`, Admin only, `provisioning_only`, not
-    /// held down), its codes on the keyd and audit channels — is task PN9
-    /// (docs/59 §7.5, §10), which then routes this call through
-    /// `Keyd::admit` and records it (I8). Until then no process can reach
-    /// it: no wire carries it (docs/questions/Q-1033).
+    /// Exactly one audit record, success or refusal (I8): the operation, the
+    /// caller, the outcome and the reason — no key octet (the record has no
+    /// field that could hold one). It is a key-state change
+    /// (`authz::changes_key_state`): a daemon has its intent acknowledged by
+    /// auditd before it calls this (A-86; docs/questions/Q-1033 item 3).
     ///
-    /// Spec: docs/59 §7.4, §7.5; docs/questions/Q-1011 item 2 (A-173: "drawn
-    /// by `provision` … delivered to keyd in ceremony mode only, never
-    /// exported"); docs/52 §4.4, §7 R3 (A-102); D28 / D29; AGENTS.md §6.1.
+    /// Spec: docs/59 §7.4, §7.5; docs/questions/Q-1011 items 2, 8 (A-173:
+    /// "drawn by `provision` … delivered to keyd in ceremony mode only, never
+    /// exported"), Q-1033 (A-177); docs/52 §4.4, §7 R3 (A-102); docs/10 §10,
+    /// §12 I8; D28 / D29; AGENTS.md §6.1.
     pub fn install_attestation_key(
         &mut self,
         caller: &CallerId,
         key: AttestationKey,
+        now: &KerberosTime,
     ) -> Result<(), Error> {
-        self.install_attestation_key_inner(caller, key)
-            .map_err(Error::from)
+        let fields = AuditFields::default();
+        let result = self.install_attestation_key_inner(caller, key, now);
+        self.emit(
+            caller,
+            Operation::InstallAttestationKey,
+            now,
+            &fields,
+            &result,
+        );
+        result.map_err(Error::from)
     }
 
     /// The checks and the install of [`Keyd::install_attestation_key`], with
-    /// the audit-only reason of a refusal.
-    /// Spec: docs/questions/Q-1011 item 2; docs/52 §4.4.
+    /// the audit-only reason of a refusal (no record of its own).
+    /// Spec: docs/questions/Q-1011 item 2; docs/52 §4.4; docs/10 §2 (I2).
     pub(crate) fn install_attestation_key_inner(
         &mut self,
         caller: &CallerId,
         key: AttestationKey,
+        now: &KerberosTime,
     ) -> Internal<()> {
-        if caller.role != ATTESTATION_KEY_INSTALLER {
-            return Err(Deny::denied(AuditReason::RoleNotPermitted));
-        }
-        if self.ceremony != CeremonyState::Provisioning {
-            return Err(Deny::denied(AuditReason::CeremonySealed));
-        }
+        // Role (I2) and the ceremony state (R3), from the compile-time
+        // tables — the same step every operation runs first.
+        self.admit(caller, Operation::InstallAttestationKey, &[], now)?;
         if self.attestation_key.is_some() {
             return Err(Deny::denied(AuditReason::AttestationKeyInstalled));
         }

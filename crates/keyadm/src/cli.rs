@@ -1,7 +1,7 @@
 //! The command line:
 //!
 //! ```text
-//! keyadm <configuration file> ceremony <manifest file>
+//! keyadm <configuration file> ceremony <manifest file> [<attestation key file>]
 //! keyadm <configuration file> rotate-krbtgt <decision id>
 //! keyadm <configuration file> rotate-key <decision id>
 //! keyadm <configuration file> retire-kvno <decision id>
@@ -25,13 +25,22 @@
 //! A decision id is written in decimal: digits only, no sign, no leading
 //! zero (one spelling per value), at most a `u64`.
 //!
-//! Spec: docs/51 §3 (D95), §6, §12 (A5, A10); docs/50 §7.1; docs/52 §4.2.
+//! **Task PN9:** `ceremony` takes an optional third operand, the path of the
+//! attestation key file (crate attestation_key) — a path, never the key
+//! (D95). Given, the ceremony installs the key in keyd before the seal
+//! (docs/59 §7.4, §7.5); absent, it installs none and keyd verifies no name
+//! resolution (fail closed) — until provision writes the file (task PN12,
+//! docs/questions/Q-1039, which also asks whether the operand becomes
+//! required then).
+//!
+//! Spec: docs/51 §3 (D95), §6, §12 (A5, A10); docs/50 §7.1; docs/52 §4.2;
+//! docs/59 §7.4, §7.5.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
 
 /// The usage lines.
-pub const USAGE: &str = "usage: keyadm <configuration file> ceremony <manifest file>\n       keyadm <configuration file> rotate-krbtgt|rotate-key|retire-kvno <decision id>\n       keyadm <configuration file> destroy-sweep";
+pub const USAGE: &str = "usage: keyadm <configuration file> ceremony <manifest file> [<attestation key file>]\n       keyadm <configuration file> rotate-krbtgt|rotate-key|retire-kvno <decision id>\n       keyadm <configuration file> destroy-sweep";
 
 /// The command name of the ceremony. Spec: docs/51 §6.
 pub const CEREMONY: &str = "ceremony";
@@ -78,6 +87,9 @@ pub enum Command {
         config: PathBuf,
         /// The provisioning manifest.
         manifest: PathBuf,
+        /// The attestation key file, when the ceremony installs the key in
+        /// keyd (task PN9). Spec: docs/59 §7.4, §7.5.
+        attestation_key: Option<PathBuf>,
     },
     /// `rotate-krbtgt` / `rotate-key` / `retire-kvno <decision id>`: run
     /// dird's decision. Spec: docs/51 §6; docs/52 §4.2.
@@ -123,12 +135,22 @@ fn request_id(text: &OsString) -> Result<u64, UsageError> {
 ///
 /// Spec: docs/51 §6.
 pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Command, UsageError> {
-    let args: Vec<OsString> = args.into_iter().take(4).collect();
+    // One more than the longest form, so that an extra argument is seen and
+    // refused rather than dropped.
+    let args: Vec<OsString> = args.into_iter().take(5).collect();
     match args.as_slice() {
         [config, command, manifest] if command == CEREMONY => Ok(Command::Ceremony {
             config: PathBuf::from(config),
             manifest: PathBuf::from(manifest),
+            attestation_key: None,
         }),
+        [config, command, manifest, attestation_key] if command == CEREMONY => {
+            Ok(Command::Ceremony {
+                config: PathBuf::from(config),
+                manifest: PathBuf::from(manifest),
+                attestation_key: Some(PathBuf::from(attestation_key)),
+            })
+        }
         [config, command, id] => {
             let command = if command == ROTATE_KRBTGT {
                 Approved::RotateKrbtgt

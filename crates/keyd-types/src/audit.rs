@@ -329,11 +329,14 @@ pub enum AuditReason {
     /// Spec: docs/52 §3.10, §4.2.
     DecisionReplayed,
     /// `create_key`, Role::Admin's `grant_set_secret` or
-    /// `install_attestation_key` (task PN8) after `seal_ceremony` — or on a
-    /// keyd that started operational: those operations exist only in the
-    /// provisioning ceremony. Reported as the uniform `Denied`.
+    /// `install_attestation_key` (task PN8; the operation
+    /// `Operation::InstallAttestationKey` since task PN9) after
+    /// `seal_ceremony` — or on a keyd that started operational: those
+    /// operations exist only in the provisioning ceremony
+    /// (`authz::provisioning_only`). Decided at the authorization step — no
+    /// intent (A-88). Reported as the uniform `Denied`.
     /// Spec: docs/52 §4.4, §7 R3; docs/questions/Q-462 item 1 (A-102);
-    /// docs/questions/Q-1011 item 2 (A-173).
+    /// docs/questions/Q-1011 item 2 (A-173), Q-1033 item 2 (A-177).
     CeremonySealed,
     /// `verify_operation_ticket` (the operation-digest binding, the admin
     /// service key; Q-523): the Authenticator carries no `cksum`, so
@@ -455,8 +458,10 @@ pub enum AuditReason {
     /// key is installed once per start, in the ceremony, and never replaced
     /// (a second key would let whoever presents it decide which resolutions
     /// keyd believes). Nothing changes. Reported as the uniform `Denied`.
+    /// Decided after the authorization step (task PN9: the second install's
+    /// intent was acknowledged; this record is its outcome).
     /// Spec: docs/59 §7.4; docs/questions/Q-1011 item 2 (A-173: "delivered to
-    /// keyd in ceremony mode only, never exported").
+    /// keyd in ceremony mode only, never exported"), Q-1033 (A-177).
     AttestationKeyInstalled,
     /// A name resolution reached keyd while it holds no attestation key (it
     /// was never installed in this start's ceremony): no resolution can be

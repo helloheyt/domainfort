@@ -306,3 +306,103 @@ fn a_change_password_completion_takes_the_intent_path() {
         assert!(execute(&mut keyd, plain).is_ok());
     }
 }
+
+/// Task PN9 (docs/59 §7.4, §7.5; docs/questions/Q-1011 items 2, 8 — A-173;
+/// Q-1033 items 2, 3 — A-177: "with an acknowledged intent before the
+/// install"): `install_attestation_key` by Role::Admin in the ceremony is a
+/// key-state change — its intent record names the operation and the caller,
+/// no handle and nothing of the key — and keyd installs the key only with
+/// the proof (one record, `Success`). A second install is still admitted by
+/// the authorization step (role and ceremony), so it takes the intent path
+/// too and keyd refuses it as its outcome (`AttestationKeyInstalled`). Any
+/// other role, and Admin after the seal, is refused at the authorization
+/// step: a plain call, one record, no intent.
+#[test]
+fn the_attestation_key_install_takes_the_intent_path_in_the_ceremony_only() {
+    let mut keyd = dev_keyd();
+    let install = || Call::InstallAttestationKey {
+        key: samples::attestation_key(),
+    };
+    for caller in [DIRECTORY, LDAP] {
+        let Classified::Plain(refused) = classify(&keyd, caller, now(), install()) else {
+            panic!("another role: refused at keyd's authorization step");
+        };
+        assert!(matches!(
+            execute(&mut keyd, refused),
+            Ok(Answer::InstallAttestationKey(Err(Error::Denied)))
+        ));
+    }
+    assert_eq!(keyd.audit_sink().0.len(), 2, "one record each, no intent");
+    assert!(!keyd.has_attestation_key());
+
+    let Classified::KeyStateChange(change) = classify(&keyd, ADMIN, now(), install()) else {
+        panic!("Admin in the ceremony: a key-state change");
+    };
+    let EventBody::Keyd(intent) = change.intent_event() else {
+        panic!("a keyd record");
+    };
+    assert_eq!(intent.result, KeydOutcome::Intent);
+    assert_eq!(intent.op, ipc_audit::KeydOperation::InstallAttestationKey);
+    assert_eq!(intent.caller_uid, ADMIN.uid);
+    assert_eq!(intent.principal, None);
+    assert_eq!(intent.purpose, None);
+    assert_eq!(intent.kvno, None);
+    assert_eq!(intent.decision, None);
+    assert!(matches!(
+        execute_acknowledged(&mut keyd, acknowledged(change)),
+        Answer::InstallAttestationKey(Ok(()))
+    ));
+    assert!(keyd.has_attestation_key());
+    assert_eq!(keyd.audit_sink().0.len(), 3);
+
+    // Once installed: admitted again (role, ceremony), refused as the
+    // outcome — never replaced.
+    let Classified::KeyStateChange(again) = classify(&keyd, ADMIN, now(), install()) else {
+        panic!("still admitted by the authorization step");
+    };
+    assert!(matches!(
+        execute_acknowledged(&mut keyd, acknowledged(again)),
+        Answer::InstallAttestationKey(Err(Error::Denied))
+    ));
+    assert_eq!(
+        keyd.audit_sink().0.last().map(|r| r.reason),
+        Some(keyd::AuditReason::AttestationKeyInstalled)
+    );
+
+    // After the seal: refused at the authorization step — plain, no intent.
+    keyd.seal_ceremony(&ADMIN, &now()).unwrap();
+    let Classified::Plain(sealed) = classify(&keyd, ADMIN, now(), install()) else {
+        panic!("sealed: refused at keyd's authorization step");
+    };
+    assert!(matches!(
+        execute(&mut keyd, sealed),
+        Ok(Answer::InstallAttestationKey(Err(Error::Denied)))
+    ));
+    assert_eq!(
+        keyd.audit_sink().0.last().map(|r| r.reason),
+        Some(keyd::AuditReason::CeremonySealed)
+    );
+}
+
+/// Task PN9 (docs/59 §7.4; docs/questions/Q-1011 item 2): the codec's
+/// carrier and keyd's key accept exactly the same 32-octet values — the
+/// carrier refuses the all-zero key as name-attestation does, so the key the
+/// server builds from an admitted call always exists (the server's fallback
+/// `Denied` is unreachable). Sampled: all zero, one non-zero octet at every
+/// position, all ones, the made-up key.
+#[test]
+fn the_carrier_and_the_key_refuse_the_same_octets() {
+    let mut samples_of_octets = vec![[0u8; 32], [0xFF; 32], samples::ATTESTATION_KEY];
+    for position in 0..32 {
+        let mut one = [0u8; 32];
+        one[position] = 0x01;
+        samples_of_octets.push(one);
+    }
+    for octets in samples_of_octets {
+        assert_eq!(
+            ipc_keyd::AttestationKeyOctets::from_slice(&octets).is_some(),
+            keyd::AttestationKey::from_bytes(&octets).is_ok(),
+            "{octets:?}"
+        );
+    }
+}

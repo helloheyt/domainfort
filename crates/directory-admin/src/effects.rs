@@ -26,6 +26,22 @@
 //! | `TicketsRevoked` | the record the write stores | the KDC's `AccountState` (`usable_at`, `revokes`; directory-pip `state_of`, A-162) |
 //! | `ProtectedDataLoss` | an administrator's password set of a user | — (a declared consequence outside the model, P-68: DPAPI secrets) |
 //! | `KeyDestruction` | a `Delete` of a user / computer; a `RetireKvno` | the same predicate as the destroy decision after a `Delete` (crate::key_requests, A-105); the key operation itself |
+//! | `NamesReleased` | a `Delete`'s target record, as `prepare` read it (the record `apply` refuses to delete if it changed) | none to call: the commit derives nothing — dirstore's `delete_object` releases the unique-index entries of the stored `PRINCIPAL_NAME_KEY` values, whose comparison key is the octets (task PN7) |
+//!
+//! # The names a `Delete` releases (task PN7; docs/59 §9 S7, §10)
+//!
+//! A deleted principal's names become free for another object to take —
+//! the reuse of a name after deletion that `revoked_before` contains for
+//! tickets (docs/59 §2, §9 S7). The approver sees it: the plan lists the
+//! keys the object holds, **read from its record, never re-derived**. The
+//! commit (`Op::Delete` → dirstore `delete_object`: "its name and unique
+//! values are released") computes no key either; it removes the entries of
+//! the stored values, and `apply` deletes only the record `prepare` read.
+//! Re-deriving them here with `principal_names::keys_of_names` would be a
+//! second answer to "which names does this object hold" (C14 / C49) —
+//! one that differs from the store for a record written beneath the checker
+//! (docs/questions/Q-1031). So what the plan shows is what the commit frees,
+//! by construction (docs/questions/Q-1037).
 //!
 //! # Which principals
 //!
@@ -50,7 +66,8 @@
 //!
 //! Spec: docs/research/r5-a-admin-model.md §3.3, §8.1 (U4, U17, U18), §8.3
 //! (C46), §9, §10 (RS4, RS9); docs/questions/Q-874, Q-117 (A-36); docs/47
-//! §4-§6; docs/51 §5.6; P-22; P-68; A-105; A-147; A-162.
+//! §4-§6; docs/51 §5.6; P-22; P-68; A-105; A-147; A-162; docs/59 §4.6,
+//! §9 S7, §10 (PN7); docs/questions/Q-1008 item 1, Q-1037.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -58,7 +75,9 @@ use directory_pip::{MemberChange, PrincipalFacts, PrincipalKind, TierMap, Visibi
 use dirstore::{AttrId, AttrStamp, Attribute, NodeId, Object, StampedValue, Timestamp};
 use dtyp::{Guid, Sid};
 use ipc_audit::{AdminFailure, AdminRefusal};
-use ipc_dird_admin::channel::MAX_PLAN_PRINCIPALS;
+use ipc_dird_admin::channel::{
+    MAX_PLAN_PRINCIPALS, MAX_PLAN_RELEASED_NAME, MAX_PLAN_RELEASED_NAMES,
+};
 use ipc_dird_admin::{
     Effect, EffectPlan, PlanError, PlanPrincipal, PlanPrincipalKind, PlanTier, PolicyReferenceKind,
     RevocationKind,
@@ -79,6 +98,17 @@ use crate::time;
 /// (crate ipc-dird-admin `MAX_PLAN_PRINCIPALS`). Beyond it ⇒ `PlanTooLarge`.
 /// Spec: docs/questions/Q-981.
 const PLAN_LIMIT: usize = MAX_PLAN_PRINCIPALS as usize;
+
+// A `NamesReleased` effect holds every key one object may hold: a key of
+// the namespace and a value of its attribute fit the plan's name field, and
+// the most keys of one object fit its count (pinned here, the crate that
+// links principal-names, ad-schema and ipc-dird-admin). A record beyond
+// them (unreachable: only the checker writes keys, within these bounds) is
+// a plan beyond its bounds — `PlanTooLarge`, the delete not performed.
+// Spec: docs/59 §4.6; docs/questions/Q-1008 item 2 (A-173), Q-1037.
+const _: () = assert!(principal_names::MAX_KEY_OCTETS <= MAX_PLAN_RELEASED_NAME as usize);
+const _: () = assert!(ad_schema::PRINCIPAL_NAME_KEY_MAX_OCTETS <= MAX_PLAN_RELEASED_NAME as usize);
+const _: () = assert!(principal_names::MAX_KEYS_PER_OBJECT <= MAX_PLAN_RELEASED_NAMES as usize);
 
 /// A plan the PEP built: the plan and its digest.
 /// Spec: docs/research/r5-a-admin-model.md §3.3 (`EffectPlan {…, digest}`).
@@ -143,6 +173,8 @@ struct Collector {
     revoked: BTreeMap<RevocationKind, BTreeSet<Sid>>,
     data_loss: BTreeSet<Sid>,
     destroyed: BTreeMap<Option<u32>, BTreeSet<Sid>>,
+    /// The namespace keys each deleted principal releases (task PN7).
+    released: BTreeMap<Sid, BTreeSet<String>>,
 }
 
 impl Collector {
@@ -221,6 +253,13 @@ impl Collector {
         }
         for (kvno, principals) in self.destroyed {
             effects.push(Effect::KeyDestruction { kvno, principals });
+        }
+        // One effect per holder: a key has one (docs/59 §4.4 N1).
+        for (sid, names) in self.released {
+            effects.push(Effect::NamesReleased {
+                names,
+                principals: BTreeSet::from([sid]),
+            });
         }
         let plan = EffectPlan::new(self.principals.into_values(), effects).map_err(plan_stop)?;
         let digest = plan.digest().map_err(plan_stop)?;
@@ -410,11 +449,37 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         Ok(())
     }
 
+    /// The principal-namespace keys the record `obj` holds — the values of
+    /// its `PRINCIPAL_NAME_KEY`, **read, not derived** (module
+    /// documentation): exactly the unique-index entries dirstore removes
+    /// when it deletes this record (an OctetString's comparison key is its
+    /// octets — ad-schema `principal_name_key_definition`). A value that is
+    /// not text is an inconsistent record (`IntegrityFailure`); one that is
+    /// not a key's form fails the plan's own check (fail closed).
+    /// Spec: docs/59 §4.6 (the name is released with the tombstone), §10
+    /// (PN7); dirstore `WriteTxn::delete_object` ("its name and unique
+    /// values are released"); docs/questions/Q-1008 item 1, Q-1037.
+    fn held_names(&self, obj: &Object) -> Result<BTreeSet<String>, Stop> {
+        let Some(attribute) = obj.attribute(self.ids.principal_name_key) else {
+            return Ok(BTreeSet::new());
+        };
+        attribute
+            .values
+            .iter()
+            .map(|v| {
+                String::from_utf8(v.value.clone())
+                    .map_err(|_| Stop::Failed(AdminFailure::IntegrityFailure))
+            })
+            .collect()
+    }
+
     /// The plan of a `Delete`: a group's members lose it (and what they
     /// reached only through it); an account's tickets are revoked (it can no
     /// longer be used) and its key sets destroyed by dird's destroy decision
-    /// (A-105); an empty container has no effect beyond itself.
-    /// Spec: docs/51 §5.2 row 9, §6, §9; docs/46 §8.4; A-105; r5-a §8.2.
+    /// (A-105); every namespace key a principal holds is released (task
+    /// PN7); an empty container has no effect beyond itself.
+    /// Spec: docs/51 §5.2 row 9, §6, §9; docs/46 §8.4; A-105; r5-a §8.2;
+    /// docs/59 §9 S7, §10 (PN7).
     fn delete_effects(
         &self,
         cx: &Cx<'_, '_, '_>,
@@ -426,6 +491,16 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         };
         let class = cx.class_of(obj)?;
         let mut collector = Collector::default();
+        // The names the delete frees, beside the principal that held them.
+        // Only a user, computer or group holds keys (docs/59 §4.3): a record
+        // of another class that holds one is inconsistent, and
+        // `account_identity` refuses it (`IntegrityFailure`).
+        let held = self.held_names(obj)?;
+        if !held.is_empty() {
+            let identity = self.account_identity(cx, target, obj)?;
+            collector.released.insert(identity.sid, held);
+            collector.principals.insert(identity.sid, identity);
+        }
         if class == self.ids.group.id {
             let members = record::refs(obj, self.ids.member).map_err(malformed)?;
             return self.membership_effects(

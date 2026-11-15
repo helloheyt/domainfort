@@ -14,7 +14,7 @@
 //! |-------------|------------|
 //! | `Kdc`       | [`Keyd::verify_preauth`], [`Keyd::issue_as_rep`], [`Keyd::open_and_verify_tgt`], [`Keyd::issue_tgs_rep`], [`Keyd::open_fast_armor`], [`Keyd::seal_fast_error`], [`Keyd::describe_config`], [`Keyd::ping`] |
 //! | `Directory` | [`Keyd::set_secret`] (on a dird decision), [`Keyd::ping`] |
-//! | `Admin`     | before the seal: [`Keyd::create_key`], [`Keyd::grant_set_secret`] (initial secrets of users), [`Keyd::install_attestation_key`] (task PN8 — not yet a capability-table row: PN9); always: [`Keyd::rotate_key`], [`Keyd::rotate_krbtgt`], [`Keyd::retire_kvno`], [`Keyd::destroy_key_set`] (each by dird decision id), [`Keyd::seal_ceremony`], [`Keyd::list_destroy_decisions`], [`Keyd::ping`] |
+//! | `Admin`     | before the seal: [`Keyd::create_key`], [`Keyd::grant_set_secret`] (initial secrets of users), [`Keyd::install_attestation_key`] (task PN8; its capability-table row and audit record since task PN9); always: [`Keyd::rotate_key`], [`Keyd::rotate_krbtgt`], [`Keyd::retire_kvno`], [`Keyd::destroy_key_set`] (each by dird decision id), [`Keyd::seal_ceremony`], [`Keyd::list_destroy_decisions`], [`Keyd::ping`] |
 //! | `Ldap`      | [`Keyd::open_and_verify_service_ticket`], [`Keyd::verify_operation_ticket`], [`Keyd::register_decision`], [`Keyd::revoke_decision`] (task F3), [`Keyd::describe_config`], [`Keyd::ping`] |
 //!
 //! [`Keyd::verify_secret`] is in no role's row (A-102, docs/52 R4).
@@ -94,7 +94,9 @@
 //!
 //! **Key-state changes** (decision A-86, docs/questions/Q-346):
 //! [`changes_key_state`] names the six operations that install, rotate,
-//! retire or destroy long-term key versions, and [`Keyd::admits`] runs an
+//! retire or destroy long-term key versions (with the change-password
+//! completion, and — task PN9 — the attestation key's install), and
+//! [`Keyd::admits`] runs an
 //! operation's authorization step (role, purpose, hold-down) on its own, with
 //! no record — so that the daemon can have the record of a change's intent
 //! acknowledged by auditd before keyd performs it.

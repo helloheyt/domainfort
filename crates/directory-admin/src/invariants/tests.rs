@@ -614,6 +614,14 @@ fn service(ids: &Ids, g: Guid, name: &str, host: &str, spn: Option<&str>) -> New
     object
 }
 
+/// The DC account `dc01$` on `dc01.example.test` (ST, the `DcAccount`
+/// claim's shape): its dNSHostName is `<computerName>.<realm DNS name>`
+/// (task PN6, rule N6) and the one host name the session's service objects
+/// may carry (Q-1010 item 3).
+fn dc_account(ids: &Ids, g: Guid) -> NewObject {
+    computer(ids, g, guid(OU), "dc01", ADS_UF_SERVER_TRUST_ACCOUNT)
+}
+
 /// docs/52 R2b follow-up; docs/questions/Q-491 item 1, Q-541; A-73: a
 /// principal name from which the admin service's key-set purpose derives
 /// (`admind/<host>`) is the admin service object's alone. On the online
@@ -634,6 +642,13 @@ fn the_admin_service_name_is_the_admin_service_objects_alone() {
     let admind = "admind/dc01.example.test";
     {
         let mut s = begin(&mut txn);
+        // The DC account whose host name the service objects carry (task
+        // PN6: the session's rule — Q-1010 item 3).
+        s.create(
+            Some(ProvisioningRole::DcAccount),
+            dc_account(&ids, guid(77)),
+        )
+        .unwrap();
         assert_eq!(
             rule(s.create(None, service(&ids, guid(70), "ws70", host, Some(admind)))),
             InvariantViolation::Value
@@ -692,7 +707,13 @@ fn the_admin_service_name_is_the_admin_service_objects_alone() {
         );
         s.create(
             None,
-            service(&ids, guid(76), "ws76", host, Some("host/dc01.example.test")),
+            service(
+                &ids,
+                guid(76),
+                "ws76",
+                "ws76.example.test",
+                Some("host/ws76.example.test"),
+            ),
         )
         .unwrap();
     }
@@ -740,6 +761,13 @@ fn the_change_password_service_name_is_its_objects_alone() {
     let changepw = "kadmin/changepw";
     {
         let mut s = begin(&mut txn);
+        // The DC account whose host name the service objects carry (task
+        // PN6: the session's rule — Q-1010 item 3).
+        s.create(
+            Some(ProvisioningRole::DcAccount),
+            dc_account(&ids, guid(85)),
+        )
+        .unwrap();
         assert_eq!(
             rule(s.create(
                 None,
@@ -1798,7 +1826,12 @@ fn reserved_names_are_judged_on_the_folded_key() {
 /// sAMAccountName is a name rule (`Name`); a UPN of a foreign suffix, without
 /// exactly one "@", or whose local part ends with "$" or holds "/", an "@"
 /// in a dNSHostName, an SPN host part with an instance name — value rules
-/// (`Value`). A numeric port is not an instance name ([MS-ADTS] 2.2.21).
+/// (`Value`). A numeric port is not an instance name ([MS-ADTS] 2.2.21) —
+/// the namespace accepts it (crates/principal-names `port_and_instancename`)
+/// — but since task PN6 no computer reaches the store with one: its SPN's
+/// host part is its dNSHostName (`names::spn_ok`), which is exactly
+/// `<computerName>.<realm DNS name>` (rule N6; [MS-ADTS] 3.1.1.5.3.1.1.2), so
+/// a dNSHostName with ":8080" names no host of its own (`Value`).
 #[test]
 fn the_namespace_syntax_is_the_checkers() {
     let ids = ids();
@@ -1850,7 +1883,18 @@ fn the_namespace_syntax_is_the_checkers() {
         write(&inv, &mut txn, instance, None),
         Err(Some(InvariantViolation::Value))
     );
-    for refused in [150, 151, 152, 153] {
+    let port = online_computer(
+        &ids,
+        guid(154),
+        "ws15",
+        "ws15.example.test:8080",
+        Some("http/ws15.example.test:8080"),
+    );
+    assert_eq!(
+        write(&inv, &mut txn, port, None),
+        Err(Some(InvariantViolation::Value))
+    );
+    for refused in [150, 151, 152, 153, 154] {
         assert_eq!(StoreRead::object(&txn, guid(refused)).unwrap(), None);
     }
     write(
@@ -1860,12 +1904,258 @@ fn the_namespace_syntax_is_the_checkers() {
             &ids,
             guid(154),
             "ws15",
-            "ws15.example.test:8080",
-            Some("http/ws15.example.test:8080"),
+            "ws15.example.test",
+            Some("http/ws15.example.test"),
         ),
         None,
     )
     .unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Which host a computer names — rule N6 (task PN6; docs/59 §4.4; Q-1010).
+// ---------------------------------------------------------------------------
+
+/// `new` with its dNSHostName replaced by `host`.
+fn on_host(ids: &Ids, mut new: NewObject, host: &str) -> NewObject {
+    for (id, values) in new.attributes.iter_mut() {
+        if *id == ids.dns_host_name {
+            *values = text(host);
+        }
+    }
+    new
+}
+
+/// Task PN6, rule N6 (docs/59 §4.4, §10.1: "dNSHostName = `<base>.<realm>`;
+/// other ⇒ refused"); [MS-ADTS] 3.1.1.5.3.1.1.2 ("computerName.
+/// fullDomainDnsName, where computerName is the current sAMAccountName of
+/// the object (without the final "$" character), and the fullDomainDnsName
+/// is the DNS name of the domain NC"); RFC 1035 §2.3.1; docs/54 §5.3;
+/// docs/questions/Q-994 item 1, Q-1010 items 1-2; A-172: every computer that
+/// holds a `HostName` key names exactly its own host, on every write path.
+/// The DC account under its claim: another host is refused (`Value`), its
+/// own (`dc-fqdn` = `<dc-name>.<zone>`) passes. An online computer (the
+/// checker as `apply` calls it): the DC's host (Q-994 item 1's case),
+/// another computer's, another domain, a deeper name, the realm, a bare
+/// label — `Value`; a computerName that is not one RFC 1035 label — no host
+/// name at all (`Name`); an upper-case host keeps the form rule's code
+/// (`Value`, RFC 4120 §6.2.1). Its own host, the name in another case,
+/// passes, and its `HostName` key is the fold of `<computerName>.<realm>` —
+/// a function of its `ComputerBase` key. Nothing refused is written.
+#[test]
+fn every_host_name_holder_names_its_own_host() {
+    let ids = ids();
+    let t = TempStore::new("host-name-n6");
+    let mut txn = t.store.begin_write().unwrap();
+    {
+        let mut s = begin(&mut txn);
+        for host in ["dc02.example.test", "dc01.other.test", "dc01"] {
+            assert_eq!(
+                rule(s.create(
+                    Some(ProvisioningRole::DcAccount),
+                    on_host(&ids, dc_account(&ids, guid(170)), host)
+                )),
+                InvariantViolation::Value,
+                "{host}"
+            );
+        }
+        s.create(
+            Some(ProvisioningRole::DcAccount),
+            dc_account(&ids, guid(170)),
+        )
+        .unwrap();
+    }
+    let inv = Invariants::new(&p1(), BTreeSet::new(), None, names()).unwrap();
+    for host in [
+        "dc01.example.test",
+        "ws02.example.test",
+        "ws21.other.test",
+        "x.ws21.example.test",
+        "ws21.example.test.other",
+        "example.test",
+        "ws21",
+    ] {
+        assert_eq!(
+            write(
+                &inv,
+                &mut txn,
+                online_computer(&ids, guid(171), "ws21", host, None),
+                None
+            ),
+            Err(Some(InvariantViolation::Value)),
+            "{host}"
+        );
+    }
+    for name in ["1ws", "w_s", "w.s", "ws-"] {
+        let host = format!("{name}.example.test");
+        assert_eq!(
+            write(
+                &inv,
+                &mut txn,
+                online_computer(&ids, guid(171), name, &host, None),
+                None
+            ),
+            Err(Some(InvariantViolation::Name)),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        write(
+            &inv,
+            &mut txn,
+            online_computer(&ids, guid(171), "ws21", "WS21.example.test", None),
+            None
+        ),
+        Err(Some(InvariantViolation::Value))
+    );
+    assert_eq!(StoreRead::object(&txn, guid(171)).unwrap(), None);
+    write(
+        &inv,
+        &mut txn,
+        online_computer(
+            &ids,
+            guid(172),
+            "WS21",
+            "ws21.example.test",
+            Some("host/ws21.example.test"),
+        ),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        stored_keys(&txn, guid(172)),
+        [
+            "host/ws21.example.test",
+            "ws21",
+            "ws21$",
+            "ws21.example.test"
+        ]
+    );
+    let base = principal_names::fold("WS21").unwrap();
+    let realm = names()
+        .unwrap()
+        .realm_aliases()
+        .next()
+        .unwrap()
+        .as_str()
+        .to_owned();
+    assert!(stored_keys(&txn, guid(172)).contains(&format!("{base}.{realm}")));
+    assert!(stored_keys(&txn, guid(170)).contains(&"dc01.example.test".to_owned()));
+}
+
+/// Task PN6; docs/59 §4.3, §4.4 N6; docs/questions/Q-1010 item 3 (decided
+/// A-173: "the provisioned service objects keep dNSHostName = dc_fqdn and
+/// claim no `HostName` key; the session checker requires it to equal the DC
+/// account's"): each of the three service-object claims, before the DC
+/// account exists in the session, borrows a host nobody holds (`Exception`);
+/// after it, a dNSHostName other than the DC account's — another DC name,
+/// the object's own `<computerName>.<realm>`, another computer's — is
+/// refused (`Value`); the DC account's host passes, for each claim, and the
+/// service objects hold no `HostName` key — the DC account does. Nothing
+/// refused is written (the same GUIDs are created afterwards).
+#[test]
+fn the_service_objects_carry_the_dc_accounts_host_name() {
+    let ids = ids();
+    let t = TempStore::new("service-host-name");
+    let mut txn = t.store.begin_write().unwrap();
+    let ldap = |host: &str| {
+        service(
+            &ids,
+            guid(180),
+            "ldap-svc",
+            host,
+            Some(&format!("ldap/{host}")),
+        )
+    };
+    let admind = |host: &str| {
+        service(
+            &ids,
+            guid(181),
+            "admind-svc",
+            host,
+            Some(&format!("admind/{host}")),
+        )
+    };
+    let changepw = |host: &str| {
+        service(
+            &ids,
+            guid(182),
+            "changepw-svc",
+            host,
+            Some("kadmin/changepw"),
+        )
+    };
+    let dc_host = "dc01.example.test";
+    {
+        let mut s = begin(&mut txn);
+        for (claim, new) in [
+            (ProvisioningRole::ServiceObject, ldap(dc_host)),
+            (ProvisioningRole::AdminServiceObject, admind(dc_host)),
+            (
+                ProvisioningRole::ChangePasswordServiceObject,
+                changepw(dc_host),
+            ),
+        ] {
+            assert_eq!(
+                rule(s.create(Some(claim), new)),
+                InvariantViolation::Exception,
+                "{claim:?} before the DC account"
+            );
+        }
+        s.create(
+            Some(ProvisioningRole::DcAccount),
+            dc_account(&ids, guid(183)),
+        )
+        .unwrap();
+        for (claim, new) in [
+            (ProvisioningRole::ServiceObject, ldap("dc02.example.test")),
+            (
+                ProvisioningRole::ServiceObject,
+                ldap("ldap-svc.example.test"),
+            ),
+            (
+                ProvisioningRole::AdminServiceObject,
+                admind("dc02.example.test"),
+            ),
+            (
+                ProvisioningRole::ChangePasswordServiceObject,
+                changepw("ws01.example.test"),
+            ),
+        ] {
+            assert_eq!(
+                rule(s.create(Some(claim), new)),
+                InvariantViolation::Value,
+                "{claim:?}"
+            );
+        }
+        // Nothing refused was written: the same GUIDs are created now.
+        s.create(Some(ProvisioningRole::ServiceObject), ldap(dc_host))
+            .unwrap();
+        s.create(Some(ProvisioningRole::AdminServiceObject), admind(dc_host))
+            .unwrap();
+        s.create(
+            Some(ProvisioningRole::ChangePasswordServiceObject),
+            changepw(dc_host),
+        )
+        .unwrap();
+    }
+    for (n, keys) in [
+        (
+            180,
+            &["ldap-svc", "ldap-svc$", "ldap/dc01.example.test"][..],
+        ),
+        (
+            181,
+            &["admind-svc", "admind-svc$", "admind/dc01.example.test"][..],
+        ),
+        (
+            182,
+            &["changepw-svc", "changepw-svc$", "kadmin/changepw"][..],
+        ),
+        (183, &["dc01", "dc01$", "dc01.example.test"][..]),
+    ] {
+        assert_eq!(stored_keys(&txn, guid(n)), keys, "object {n}");
+    }
 }
 
 /// docs/59 §5.1, §5.2, §5.5; Q-1008 item 5 (decided A-173); A-83: the

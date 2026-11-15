@@ -13,15 +13,19 @@
 //! people to tier 0, and the approver sees only AddMember"); Q-941 item 1
 //! (the basis: the records the operation reads), item 4 (one approval, one
 //! execution attempt); P-68 (an administrator's reset loses the user's
-//! protected secrets); A-162 (`revoked_before`); the test domain of
-//! tests/common (its own fixtures — no other implementation's test vectors).
+//! protected secrets); A-162 (`revoked_before`); docs/59 §4.3 (the keys of
+//! each class), §4.6 (a key is released with its object's tombstone), §9 S7
+//! (a name reused after deletion), §10 (PN7: "Delete's EffectPlan shows the
+//! released namespace keys"); docs/questions/Q-1008 item 1, Q-1031, Q-1037;
+//! the test domain of tests/common (its own fixtures — no other
+//! implementation's test vectors).
 
 mod common;
 
 use common::*;
 use directory_admin::{
-    CreateGroup, CreateUser, Membership, Operation, ProposedOperation, Reply, RequestStep,
-    SetEnabled, StepReply,
+    CreateContainerLike, CreateGroup, CreateUser, Membership, Operation, ProposedOperation, Reply,
+    RequestStep, SetEnabled, StepReply,
 };
 use dtyp::{Guid, Sid};
 use ipc_audit::{AdminRefusal, DecisionResult, DirAdminOperation, DirAdminStage};
@@ -510,4 +514,243 @@ fn a_removal_shows_who_leaves_tier0() {
         Effect::TierDelta { subject: (PlanTier::Tier0, PlanTier::None), principals, .. }
             if principals.contains(&h_sid)
     )));
+}
+
+// ---------------------------------------------------------------------------
+// Task PN7: the names a `Delete` releases (docs/59 §9 S7, §10).
+// ---------------------------------------------------------------------------
+
+/// The namespace keys stored on `g`, as text: what a delete of `g` removes
+/// from the store's unique index (docs/59 §4.6).
+fn stored_keys(d: &Domain, g: Guid) -> BTreeSet<String> {
+    d.object(g)
+        .expect("live object")
+        .attribute(ad_schema::PRINCIPAL_NAME_KEY)
+        .map(|a| {
+            a.values
+                .iter()
+                .map(|v| String::from_utf8(v.value.clone()).unwrap())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `NamesReleased` effects of `plan`: the holder and its names.
+fn released(plan: &EffectPlan) -> Vec<(BTreeSet<Sid>, BTreeSet<String>)> {
+    plan.effects()
+        .iter()
+        .filter_map(|e| match e {
+            Effect::NamesReleased { names, principals } => {
+                Some((principals.clone(), names.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The object holding `key` in the namespace now (one probe of the union
+/// index — the one `names_free` makes).
+fn holder(d: &Domain, key: &str) -> Option<Guid> {
+    d.store
+        .snapshot()
+        .unwrap()
+        .lookup_unique(ad_schema::PRINCIPAL_NAME_KEY, key.as_bytes())
+        .unwrap()
+}
+
+fn names(keys: &[&str]) -> BTreeSet<String> {
+    keys.iter().map(|k| (*k).to_owned()).collect()
+}
+
+fn user_op(sam: &str) -> Operation {
+    Operation::CreateUser(CreateUser {
+        parent: guid(STAFF_OU),
+        sam: sam.into(),
+        upn: None,
+        description: None,
+    })
+}
+
+/// docs/59 §10 PN7: a `Delete`'s plan lists every namespace key its target
+/// holds — in every form, folded, exactly the stored values — beside the
+/// principal that held them: a user whose UPN is its sAMAccountName at the
+/// realm holds one key (`Dora` and `dora@example.test` are both `dora`,
+/// docs/59 §4.1); a computer its sAMAccountName, base name, SPN and host name
+/// (§4.3); a group its sAMAccountName — the only effect of deleting an empty
+/// group, beside its members' loss otherwise. An OU holds no name. The plan
+/// stays canonical.
+#[test]
+fn a_delete_shows_every_name_it_releases() {
+    let mut d = Domain::new("plan-delete-names");
+    let op = Operation::CreateUser(CreateUser {
+        parent: guid(STAFF_OU),
+        sam: "Dora".into(),
+        upn: Some("dora@example.test".into()),
+        description: None,
+    });
+    let (_, applied) = d.run(op, "admin1", &[]).applied();
+    let (dora, dora_sid) = created(applied.reply());
+    let (plan, _) = plan_of(&d, &Operation::Delete { target: dora }, "admin1");
+    assert_eq!(stored_keys(&d, dora), names(&["dora"]));
+    assert_eq!(
+        released(&plan),
+        vec![(BTreeSet::from([dora_sid]), names(&["dora"]))]
+    );
+    assert_eq!(plan.principal(&dora_sid).unwrap().name, "Dora");
+    // The other effects of an account's delete stay.
+    assert!(plan.effects().iter().any(|e| matches!(
+        e,
+        Effect::KeyDestruction { kvno: None, principals } if principals.contains(&dora_sid)
+    )));
+
+    // A computer: every form of its names.
+    let ws01 = names(namespace_keys(WS01));
+    assert_eq!(stored_keys(&d, guid(WS01)), ws01);
+    let (plan, _) = plan_of(&d, &Operation::Delete { target: guid(WS01) }, "admin1");
+    assert_eq!(
+        released(&plan),
+        vec![(BTreeSet::from([sid_of(WS01)]), ws01)]
+    );
+    assert_eq!(
+        plan.principal(&sid_of(WS01)).unwrap().kind,
+        PlanPrincipalKind::Computer
+    );
+
+    // A group: an empty one's delete releases its name and does nothing else.
+    let (club, club_sid) = group(&mut d, STAFF_OU, "Club");
+    let (plan, _) = plan_of(&d, &Operation::Delete { target: club }, "admin1");
+    assert_eq!(
+        plan.effects(),
+        &[Effect::NamesReleased {
+            names: names(&["club"]),
+            principals: BTreeSet::from([club_sid]),
+        }]
+    );
+    assert_eq!(
+        plan.principal(&club_sid).unwrap().kind,
+        PlanPrincipalKind::Group
+    );
+    // With a member: the member's loss and the group's names, one plan.
+    add(&mut d, club, guid(ALICE));
+    let (plan, digest) = plan_of(&d, &Operation::Delete { target: club }, "admin1");
+    assert!(plan.effects().iter().any(|e| matches!(
+        e,
+        Effect::MembershipDelta { lost, principals, .. }
+            if lost.contains(&club_sid) && principals.contains(&sid_of(ALICE))
+    )));
+    assert_eq!(
+        released(&plan),
+        vec![(BTreeSet::from([club_sid]), names(&["club"]))]
+    );
+    let bytes = plan.encode().unwrap();
+    assert_eq!(EffectPlan::decode(&bytes).unwrap(), plan);
+    assert_eq!(ipc_dird_admin::plan_digest(&bytes), digest);
+
+    // An OU is outside the namespace: no name to release.
+    let ou = Operation::CreateOu(CreateContainerLike {
+        parent: guid(STAFF_OU),
+        name: "Empty".into(),
+    });
+    let (_, applied) = d.run(ou, "admin1", &[]).applied();
+    let Reply::Created { guid: empty, .. } = applied.reply() else {
+        panic!("{:?}", applied.reply());
+    };
+    let (plan, _) = plan_of(&d, &Operation::Delete { target: *empty }, "admin1");
+    assert!(released(&plan).is_empty());
+}
+
+/// docs/59 §9 S7: what the plan shows released is what the commit frees.
+/// Before the delete every listed key names its holder in the union index;
+/// after the commit none does, and another object takes the same name —
+/// a user named like the deleted computer's base name, a user `BOB` after
+/// `bob` (each refused as a `Conflict` while the name was held, docs/59
+/// §4.4 N1).
+#[test]
+fn the_names_a_delete_shows_are_free_after_its_commit() {
+    let mut d = Domain::new("plan-delete-frees");
+    let (plan, _) = plan_of(&d, &Operation::Delete { target: guid(WS01) }, "admin1");
+    let [(_, ws01_names)]: [(BTreeSet<Sid>, BTreeSet<String>); 1] =
+        released(&plan).try_into().unwrap();
+    let r = d.run(user_op("WS01"), "admin1", &[]).refused();
+    assert_eq!(refusal_code(&r), AdminRefusal::Conflict);
+    for key in &ws01_names {
+        assert_eq!(holder(&d, key), Some(guid(WS01)), "{key}");
+    }
+    let (decision, _) = d
+        .run(Operation::Delete { target: guid(WS01) }, "admin1", &[])
+        .applied();
+    assert!(decision.plan_digest.is_some());
+    for key in &ws01_names {
+        assert_eq!(holder(&d, key), None, "{key} released");
+    }
+    let (_, applied) = d.run(user_op("WS01"), "admin1", &[]).applied();
+    let (taken, _) = created(applied.reply());
+    assert_eq!(holder(&d, "ws01"), Some(taken));
+
+    let (plan, _) = plan_of(&d, &Operation::Delete { target: guid(BOB) }, "admin1");
+    assert_eq!(
+        released(&plan),
+        vec![(BTreeSet::from([sid_of(BOB)]), names(&["bob"]))]
+    );
+    let r = d.run(user_op("BOB"), "admin1", &[]).refused();
+    assert_eq!(refusal_code(&r), AdminRefusal::Conflict);
+    let _ = d
+        .run(Operation::Delete { target: guid(BOB) }, "admin1", &[])
+        .applied();
+    assert_eq!(holder(&d, "bob"), None);
+    let (_, applied) = d.run(user_op("BOB"), "admin1", &[]).applied();
+    let (bob2, _) = created(applied.reply());
+    assert_eq!(holder(&d, "bob"), Some(bob2));
+}
+
+/// No second derivation (C14 / C49; docs/questions/Q-1031, Q-1037): the
+/// plan lists the keys the record holds, not the keys its names would
+/// produce. A record written beneath the checker with a key its names do
+/// not produce (`bob-old`) shows it — and the commit frees exactly the
+/// listed keys; a record holding no key (a store from before the
+/// namespace) shows no `NamesReleased` at all.
+#[test]
+fn the_plan_lists_the_stored_keys_not_a_derivation() {
+    let mut d = Domain::new("plan-delete-stored");
+    let origin = || dirstore::Origin {
+        wall_clock: directory_admin::wall_clock(&now()).unwrap(),
+        origin_node: NODE_ID,
+        origin_seq: 0,
+    };
+    let force_keys = |d: &Domain, g: Guid, keys: &[&str]| {
+        let mut txn = d.store.begin_write().unwrap();
+        txn.modify_object(
+            g,
+            vec![dirstore::AttributeChange::Replace {
+                id: ad_schema::PRINCIPAL_NAME_KEY,
+                values: keys.iter().map(|k| k.as_bytes().to_vec()).collect(),
+            }],
+            &origin(),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+    };
+    force_keys(&d, guid(BOB), &["bob", "bob-old"]);
+    let (plan, _) = plan_of(&d, &Operation::Delete { target: guid(BOB) }, "admin1");
+    assert_eq!(
+        released(&plan),
+        vec![(BTreeSet::from([sid_of(BOB)]), names(&["bob", "bob-old"]))]
+    );
+    force_keys(&d, guid(ALICE), &[]);
+    let (plan, _) = plan_of(
+        &d,
+        &Operation::Delete {
+            target: guid(ALICE),
+        },
+        "admin1",
+    );
+    assert!(released(&plan).is_empty());
+    assert!(plan.principal(&sid_of(ALICE)).is_some(), "keys destroyed");
+
+    assert_eq!(holder(&d, "bob-old"), Some(guid(BOB)));
+    let _ = d
+        .run(Operation::Delete { target: guid(BOB) }, "admin1", &[])
+        .applied();
+    assert_eq!(holder(&d, "bob-old"), None);
+    assert_eq!(holder(&d, "bob"), None);
 }

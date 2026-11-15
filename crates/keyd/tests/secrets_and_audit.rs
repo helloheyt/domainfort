@@ -349,6 +349,16 @@ fn every_operation_emits_exactly_one_audit_record() {
         .keyd
         .destroy_key_set(&ADMIN, DecisionId::new(0xDEAD_0003), &n);
     check(&f, Operation::DestroyKeySet, &ADMIN, false);
+    // The attestation key's install (task PN9; docs/59 §7.5; Q-1033): one
+    // record either way (before the seal: it exists only in the ceremony).
+    let attestation_key =
+        || keyd::AttestationKey::from_bytes(&[0x6E; keyd::ATTESTATION_KEY_LEN]).unwrap();
+    let _ = f.keyd.install_attestation_key(&KDC, attestation_key(), &n);
+    check(&f, Operation::InstallAttestationKey, &KDC, false);
+    f.keyd
+        .install_attestation_key(&ADMIN, attestation_key(), &n)
+        .unwrap();
+    check(&f, Operation::InstallAttestationKey, &ADMIN, true);
     // The seal (A-102, docs/52 R3): one record either way.
     let _ = f.keyd.seal_ceremony(&DIRECTORY, &n);
     check(&f, Operation::SealCeremony, &DIRECTORY, false);

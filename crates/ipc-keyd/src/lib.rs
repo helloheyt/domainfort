@@ -46,6 +46,7 @@
 //! | `0x17` | `complete_change_password(ctx, target)` (task K4; a state call) | Ldap | `0x97` `SealedReply` | `0xF3` |
 //! | `0x18` | `seal_change_password_error(ctx, code ≠ 0)` (task K4) | Ldap | `0x98` `SealedReply` | `0xF3` |
 //! | `0x19` | `revoke_decision(decision)` (task F3; not a state call — it only makes keyd stricter) | Ldap | `0x99` `()` | `0xF3` |
+//! | `0x1A` | `install_attestation_key(key)` (task PN9; a state call; exactly 32 key octets, never all zero) | Admin (before the seal) | `0x9A` `()` | `0xF3` |
 //! | — | (any) | — | `0xFF` shared `Refused` (A-59) | — |
 //!
 //! No request carries a role: keyd checks the caller's role from the
@@ -62,8 +63,10 @@
 //! `#![forbid(unsafe_code)]`. Every bound is a named constant
 //! ([`channel`]); nothing is allocated from a peer-supplied length beyond the
 //! bound. Passwords travel only in zeroizing buffers ([`ipc::Secret`] on the
-//! wire, [`typed::Password`] in a call) whose `Debug` prints nothing. No
-//! error carries frame octets (docs/50 §8.2).
+//! wire, [`typed::Password`] in a call) whose `Debug` prints nothing; so
+//! does the attestation key ([`ipc::Secret`] on the wire,
+//! [`typed::AttestationKeyOctets`] in a call — task PN9). No error carries
+//! frame octets (docs/50 §8.2).
 //!
 //! # Provenance
 //!
@@ -95,7 +98,12 @@
 //! F3 appended `revoke_decision` (`0x19`, reply `0x99`; the additive client
 //! method `KeydClient::revoke_decision`) from docs/52 §4.2, docs/10 §2, §10
 //! and docs/questions Q-937 item 6, Q-976; `KEYD_VERSION` stays 1 (the
-//! precedent of R9 / Q-523 / Q-661).
+//! precedent of R9 / Q-523 / Q-661). Task PN9 appended
+//! `install_attestation_key` (`0x1A`, reply `0x9A`; the additive client
+//! method `KeydClient::install_attestation_key`; the carrier
+//! [`AttestationKeyOctets`]) from docs/59 §7.4, §7.5, §10, docs/questions
+//! Q-1011 items 2, 8 (A-173) and Q-1033 (A-177), with docs/50 §3.3, §8.2;
+//! `KEYD_VERSION` stays 1.
 //!
 //! Spec: docs/50 §3, §10 (P5); R50-3, R50-4, R50-5, R50-7, R50-8; docs/10;
 //! A-56; A-59; A-62; D182; A-63; A-87; A-88; docs/52 §7 R9 (A-102).
@@ -108,15 +116,17 @@ pub mod typed;
 mod unix;
 pub mod wire;
 
-pub use channel::{KEYD_CHANNEL, KEYD_MAGIC, KEYD_VERSION, REPLY_LIMIT, REQUEST_LIMIT};
+pub use channel::{
+    ATTESTATION_KEY_OCTETS, KEYD_CHANNEL, KEYD_MAGIC, KEYD_VERSION, REPLY_LIMIT, REQUEST_LIMIT,
+};
 pub use client::{
     CallFailure, ClientConfigError, Connection, Connector, ExpectedDescription, ExpectedPeer,
     IpcKeyd, KeydClient, RequestFate, StateOutcome, TransportError, Unserved, DEFAULT_DEADLINE,
 };
 pub use server::{decode_request, encode_answer, Rejection};
 pub use typed::{
-    Answer, Call, ConversionError, DescribedConfig, IssuanceCall, Password, RoutedCall, StateCall,
-    TgsFast,
+    Answer, AttestationKeyOctets, Call, ConversionError, DescribedConfig, IssuanceCall, Password,
+    RoutedCall, StateCall, TgsFast,
 };
 // The role a client expects keyd to resolve for it (task R9), re-exported
 // beside `ExpectedPeer` for its callers.

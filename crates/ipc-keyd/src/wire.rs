@@ -18,6 +18,7 @@
 //! | `KerberosTime` | [`WireTime`]: year `u16` ‖ month ‖ day ‖ hour ‖ minute ‖ second (`u8` each), checked by `krb-proto` after the ipc layer |
 //! | raw octets keyd itself parses (`outer_req_body`, `req_body`, `ap_req_octets`) | `bytes<max>`, opaque |
 //! | password / candidate | [`Secret`] (zeroizing; `Debug` redacted) |
+//! | attestation key of `install_attestation_key` (0x1A) | `secret bytes<32>` with a length of **exactly** [`ATTESTATION_KEY_OCTETS`] (fewer `Truncated`, more `LengthOverBound`) — read from the frame straight into a zeroizing [`Secret`] (`Debug` redacted); the typed layer refuses the all-zero key (task PN9) |
 //! | salt | `bytes<max>`, UTF-8 checked after the ipc layer |
 //! | `AccountKind` of a grant | `u8` (closed table: 1 User, 2 Computer) |
 //! | grant / decision lifetime | `u32` seconds, relative — keyd adds its own clock's `now` |
@@ -63,6 +64,13 @@
 //! keyd opens (docs/53 R53-4). `KEYD_VERSION` stays 1 (the precedent of R9
 //! and Q-523; docs/questions/Q-661).
 //!
+//! **Task PN9 (append-only, docs/50 §3.3):** `install_attestation_key` is the
+//! appended kind 0x1A / 0x9A (docs/59 §7.5; docs/questions/Q-1033) — the
+//! key and nothing else: no role, no handle, no time. The key's octets are
+//! never in a `Debug`, an error or a log: [`Secret`] prints nothing, and no
+//! ipc error carries an octet. `KEYD_VERSION` stays 1 (the precedent of F3,
+//! K4, R9 and Q-523).
+//!
 //! **Q-523 (append-only, docs/50 §3.3):** the operation-bound service-ticket
 //! verification was moved out of kind 0x07 into the appended kinds 0x15 /
 //! 0x95, whose answer has no context id. Kind 0x07 / 0x87 keep their layout
@@ -75,8 +83,9 @@
 //! docs/questions/Q-351 (A-87), Q-466 item 2 (A-102), Q-523, Q-575.
 
 use crate::channel::{
-    reply_kind, request_kind, MAX_DECISION_APPROVERS, MAX_DESTROY_PAGE, MAX_ENCTYPES,
-    MAX_GRANT_TARGETS, MAX_REPLY_FIELD, MAX_REQUEST_FIELD, MAX_SALT, MAX_SEAL_PADATA, MAX_SECRET,
+    reply_kind, request_kind, ATTESTATION_KEY_FIELD, ATTESTATION_KEY_OCTETS,
+    MAX_DECISION_APPROVERS, MAX_DESTROY_PAGE, MAX_ENCTYPES, MAX_GRANT_TARGETS, MAX_REPLY_FIELD,
+    MAX_REQUEST_FIELD, MAX_SALT, MAX_SEAL_PADATA, MAX_SECRET,
 };
 use ipc::{DerBlob, Error, MessageSet, Payload, Reader, Result, Secret, Writer};
 use keyd_types::{
@@ -1016,6 +1025,54 @@ impl Payload for VerifySecretRequest {
     }
 }
 
+/// `install_attestation_key` (task PN9): the attestation key and nothing
+/// else — `secret bytes<32>` whose length is exactly
+/// [`ATTESTATION_KEY_OCTETS`]. The octets go from the frame (which its owner
+/// wipes) straight into a zeroizing [`Secret`] — no stack copy — whose
+/// `Debug` prints nothing, not even the length. No `Clone`, no `PartialEq`.
+///
+/// One encoding per value (docs/50 §3.3): the length field is always 32. A
+/// shorter length is an incomplete key field (`Truncated`), a longer one
+/// over the field's bound (`LengthOverBound`) — both answered `Malformed`
+/// before the request reaches keyd; nothing is allocated from a length the
+/// bound did not admit. The all-zero key is refused by the typed layer
+/// (`crate::typed::AttestationKeyOctets`).
+///
+/// Spec: docs/59 §7.4, §7.5; docs/questions/Q-1011 items 2, 8 (A-173),
+/// Q-1033 (A-177); docs/50 §3.3 (bound before allocation; secret-bearing
+/// buffers zeroized; no trailing byte), §8.2 (no secret in a log); AGENTS.md
+/// §6.
+#[derive(Debug)]
+pub struct InstallAttestationKeyRequest {
+    /// The attestation key's octets (exactly [`ATTESTATION_KEY_OCTETS`]).
+    pub key: Secret,
+}
+
+impl Payload for InstallAttestationKeyRequest {
+    /// Spec: docs/50 §3.3; docs/59 §7.5.
+    fn write_fields(&self, writer: &mut Writer) -> Result<()> {
+        // The encoder's matching representability rule: a key of another
+        // length is not one this field holds.
+        if self.key.len() != ATTESTATION_KEY_OCTETS {
+            return Err(Error::LengthOverBound);
+        }
+        writer.write_secret(&self.key, ATTESTATION_KEY_FIELD)
+    }
+
+    /// Spec: docs/50 §3.3; docs/59 §7.5.
+    fn read_fields(reader: &mut Reader<'_>) -> Result<InstallAttestationKeyRequest> {
+        // Borrowed from the frame (bounded by the field first), copied once
+        // into the zeroizing buffer.
+        let octets = reader.read_bytes(ATTESTATION_KEY_FIELD)?;
+        if octets.len() != ATTESTATION_KEY_OCTETS {
+            return Err(Error::Truncated);
+        }
+        Ok(InstallAttestationKeyRequest {
+            key: Secret::from_slice(octets),
+        })
+    }
+}
+
 /// `create_key`. Spec: docs/50 §3.4 ("as the signatures in crates/keyd
 /// admin.rs": handle, binding); docs/10 §7; A-35.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1368,6 +1425,9 @@ pub enum KeydRequest {
     /// `revoke_decision(id)`: the decision id (`u64`), nothing else (task
     /// F3). Spec: docs/52 §4.2, §4.6; docs/questions/Q-976.
     RevokeDecision(DecisionId),
+    /// `install_attestation_key(key)`: the key only (task PN9).
+    /// Spec: docs/59 §7.5; docs/questions/Q-1033.
+    InstallAttestationKey(InstallAttestationKeyRequest),
 }
 
 impl MessageSet for KeydRequest {
@@ -1403,6 +1463,7 @@ impl MessageSet for KeydRequest {
             KeydRequest::CompleteChangePassword(_) => request_kind::COMPLETE_CHANGE_PASSWORD,
             KeydRequest::SealChangePasswordError(_) => request_kind::SEAL_CHANGE_PASSWORD_ERROR,
             KeydRequest::RevokeDecision(_) => request_kind::REVOKE_DECISION,
+            KeydRequest::InstallAttestationKey(_) => request_kind::INSTALL_ATTESTATION_KEY,
         }
     }
 
@@ -1434,6 +1495,7 @@ impl MessageSet for KeydRequest {
             KeydRequest::OpenChangePasswordRequest(m) => m.write_fields(writer),
             KeydRequest::CompleteChangePassword(m) => m.write_fields(writer),
             KeydRequest::SealChangePasswordError(m) => m.write_fields(writer),
+            KeydRequest::InstallAttestationKey(m) => m.write_fields(writer),
         }
     }
 
@@ -1501,6 +1563,9 @@ impl MessageSet for KeydRequest {
                 SealChangePasswordErrorRequest::read_fields(reader)?,
             ),
             request_kind::REVOKE_DECISION => KeydRequest::RevokeDecision(read_decision(reader)?),
+            request_kind::INSTALL_ATTESTATION_KEY => KeydRequest::InstallAttestationKey(
+                InstallAttestationKeyRequest::read_fields(reader)?,
+            ),
             _ => return Err(Error::UnknownKind),
         })
     }
@@ -2116,6 +2181,8 @@ pub enum KeydReply {
     /// The decision is revoked (task F3). Spec: docs/52 §4.2;
     /// docs/questions/Q-976.
     RevokeDecision,
+    /// The attestation key is installed (task PN9). Spec: docs/59 §7.5.
+    InstallAttestationKey,
     /// Spec: docs/10 §9; A-26; A-56.
     AuthnFailure(AuthnError),
     /// Spec: docs/10 §9; A-56.
@@ -2155,6 +2222,7 @@ impl MessageSet for KeydReply {
             KeydReply::CompleteChangePassword(_) => reply_kind::COMPLETE_CHANGE_PASSWORD,
             KeydReply::SealChangePasswordError(_) => reply_kind::SEAL_CHANGE_PASSWORD_ERROR,
             KeydReply::RevokeDecision => reply_kind::REVOKE_DECISION,
+            KeydReply::InstallAttestationKey => reply_kind::INSTALL_ATTESTATION_KEY,
             KeydReply::AuthnFailure(_) => reply_kind::AUTHN_FAILURE,
             KeydReply::IssueFailure(_) => reply_kind::ISSUE_FAILURE,
             KeydReply::Failure(_) => reply_kind::FAILURE,
@@ -2180,7 +2248,8 @@ impl MessageSet for KeydReply {
             | KeydReply::GrantSetSecret
             | KeydReply::RegisterDecision
             | KeydReply::SealCeremony
-            | KeydReply::RevokeDecision => Ok(()),
+            | KeydReply::RevokeDecision
+            | KeydReply::InstallAttestationKey => Ok(()),
             KeydReply::ListDestroyDecisions(m) => m.write_fields(writer),
             KeydReply::VerifyOperationTicket(m) => m.write_fields(writer),
             KeydReply::OpenChangePasswordRequest(m) => m.write_fields(writer),
@@ -2248,6 +2317,7 @@ impl MessageSet for KeydReply {
                 KeydReply::SealChangePasswordError(WireSealedReply::read_fields(reader)?)
             }
             reply_kind::REVOKE_DECISION => KeydReply::RevokeDecision,
+            reply_kind::INSTALL_ATTESTATION_KEY => KeydReply::InstallAttestationKey,
             reply_kind::AUTHN_FAILURE => {
                 KeydReply::AuthnFailure(reader.read_enum(authn_error_from_code)?)
             }

@@ -36,7 +36,8 @@
 //!
 //! A **key-state change** (`keyd::changes_key_state`: `set_secret`,
 //! `create_key`, `rotate_key`, `rotate_krbtgt`, `retire_kvno`,
-//! `destroy_key_set`) that keyd's authorization step admits takes the A-86
+//! `destroy_key_set`, `complete_change_password`, and — task PN9 — the
+//! ceremony's `install_attestation_key`) that keyd's authorization step admits takes the A-86
 //! path instead: reserve two slots or `Busy` → commit the **intent** record
 //! → wait (≤ the daemon's [`IntentAckBudget`] from queueing —
 //! [`INTENT_ACK_BUDGET`] in production, never above

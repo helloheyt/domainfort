@@ -10,8 +10,8 @@
 #![allow(dead_code)] // each test binary uses a different subset
 
 use ipc_keyd::{
-    AccountKind, Answer, Call, DecidedOperation, DecisionId, DescribedConfig, DestructionPage,
-    Password, PendingDestruction, SetSecretTarget, TgsFast,
+    AccountKind, Answer, AttestationKeyOctets, Call, DecidedOperation, DecisionId, DescribedConfig,
+    DestructionPage, Password, PendingDestruction, SetSecretTarget, TgsFast,
 };
 use keyd_types::{
     ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof, ChangePasswordContext,
@@ -28,6 +28,15 @@ use krb_proto::{
 use zeroize::Zeroizing;
 
 pub const PASSWORD: &str = "Nook-Petrel-16-Quay";
+
+/// A made-up attestation key (task PN9): 32 octets, a pattern no test
+/// output may show (`0x6B`, decimal 107).
+pub const ATTESTATION_KEY: [u8; 32] = [0x6B; 32];
+
+/// [`ATTESTATION_KEY`] as the call's carrier.
+pub fn attestation_key() -> AttestationKeyOctets {
+    AttestationKeyOctets::from_slice(&ATTESTATION_KEY).unwrap()
+}
 
 pub fn realm() -> Realm {
     Realm::new("EXAMPLE.ORG").unwrap()
@@ -436,6 +445,19 @@ pub fn calls() -> Vec<Call> {
         Call::RevokeDecision {
             id: DecisionId::new(u64::MAX),
         },
+        // Task PN9 (docs/59 §7.5): the key only — the made-up key, and one
+        // whose only non-zero octet is the last.
+        Call::InstallAttestationKey {
+            key: attestation_key(),
+        },
+        Call::InstallAttestationKey {
+            key: AttestationKeyOctets::from_slice(&{
+                let mut key = [0u8; 32];
+                key[31] = 0x01;
+                key
+            })
+            .unwrap(),
+        },
     ]
 }
 
@@ -631,6 +653,8 @@ pub fn answers() -> Vec<Answer> {
         Answer::SealChangePasswordError(Ok(sealed_reply())),
         // Task F3 (docs/questions/Q-976).
         Answer::RevokeDecision(Ok(())),
+        // Task PN9 (docs/59 §7.5).
+        Answer::InstallAttestationKey(Ok(())),
     ];
     // Task K4: every verdict of the closed table.
     for verdict in [
@@ -700,6 +724,7 @@ pub fn answers() -> Vec<Answer> {
         answers.push(Answer::CompleteChangePassword(Err(error)));
         answers.push(Answer::SealChangePasswordError(Err(error)));
         answers.push(Answer::RevokeDecision(Err(error)));
+        answers.push(Answer::InstallAttestationKey(Err(error)));
     }
     answers
 }

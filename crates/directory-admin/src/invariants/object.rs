@@ -57,6 +57,22 @@
 //! a key that keyd refuses to make (docs/52 R2b follow-up;
 //! docs/questions/Q-541; task K9, Q-972).
 //!
+//! **Which host a computer names — rule N6** (task PN6; docs/59 §4.4,
+//! Q-1010 items 1-3; class: a computer's dNSHostName was a free value that
+//! could name another host — Q-994 item 1): every computer that holds a
+//! `HostName` key — an online computer and the DC account — names exactly
+//! `<computerName>.<realm DNS name>` ([`check_host_name`], decided by
+//! directory-pip's `host_label` through `names::computer_host_name`: one
+//! host-name rule for the namespace and the DNS zone). Its host name is then
+//! a function of its identity: unique because its base name is (the
+//! `ComputerBase` key), and the DNS label it owns. Judged here, the one
+//! checker, so `prepare` (`Invariants::keys_of_new`) and every commit —
+//! online and provisioning — apply the same rule; no phase-1 change writes a
+//! dNSHostName (`modifiable()`). The provisioned service objects carry the
+//! DC account's host name without its key (`keys_of_names`, Q-1010 item 3):
+//! the provisioning session binds them to the DC account's value (module
+//! `provisioning`).
+//!
 //! A host record (task DN6) is a state rule too ([`check_host_record`]):
 //! the internal host-address attribute (ad-schema `HOST_ADDRESS`) only on
 //! an online computer or the DC account whose names give one LDH host label
@@ -68,11 +84,13 @@
 //! Spec: [MS-SAMR] v20260427 (pinned, sha256 083fe00a…8a4e) 3.1.1.6 items
 //! 8-14, 20-24, 3.1.1.8.4 item 2, 3.1.1.8.9; [MS-ADTS] v20261026 (pinned,
 //! 55b59eb1…b2b1) 3.1.1.5.1.3, 3.1.1.5.3.1.1.2, 3.1.1.5.3.1.1.4; RFC 4120
-//! (pinned, 368d3cd1…f75b) §6.2, §6.2.1, §7.3; docs/51 §4.3 step 5, §5.2
-//! rows 1-8, §11 (decided A-79 / docs/questions/Q-298); docs/46 §4.4, §5.4,
-//! §8.2; docs/47 §4.2 (R47-5b); docs/59 §4.1-§4.6, §5.1-§5.2 (A-173);
-//! docs/questions/Q-355, Q-376 items 5-6, Q-1007, Q-1008 items 2, 6,
-//! Q-1009 items 1-2, Q-1010 item 3, Q-1018 item 2, Q-1020 item 7.
+//! (pinned, 368d3cd1…f75b) §6.2, §6.2.1, §7.3; RFC 1035 (pinned,
+//! d14ae809…fdfb) §2.3.1; docs/51 §4.3 step 5, §5.2 rows 1-8, §11 (decided
+//! A-79 / docs/questions/Q-298); docs/46 §4.4, §5.4, §8.2; docs/47 §4.2
+//! (R47-5b); docs/54 §5.3; docs/59 §4.1-§4.6, §5.1-§5.2 (A-173);
+//! docs/questions/Q-355, Q-376 items 5-6, Q-994 item 1, Q-1007, Q-1008
+//! items 2, 6, Q-1009 items 1-2, Q-1010 items 1-3, Q-1018 item 2, Q-1020
+//! item 7.
 
 use ad_schema::flags::group_type::ALLOWED_VALUES;
 use ad_schema::flags::user_account_control::{
@@ -87,7 +105,7 @@ use principal_names::{
 
 use super::{InvariantViolation as V, ProvisioningRole};
 use crate::ids::Ids;
-use crate::names;
+use crate::names::{self, HostNameRefused};
 use crate::record;
 
 /// `true` if `id` is an attribute the checker has a rule for. A new object
@@ -204,8 +222,13 @@ pub(crate) fn check_new(
     // rules below, so that a name those rules refuse keeps their code; any
     // other object holds no name of the namespace at all.
     let principal = is_principal_class(ids, class);
+    let of = if principal {
+        principal_class(ids, class, role)
+    } else {
+        None
+    };
     let namespace = if principal {
-        match (principal_class(ids, class, role), names) {
+        match (of, names) {
             (Some(of), Some(names)) => Some(namespace_keys(ids, obj, of, names)),
             // A claim that does not fit the class: the class rules refuse
             // it (`Exception`); no namespace context: crate::invariants
@@ -232,6 +255,12 @@ pub(crate) fn check_new(
         check_reserved_names(keys, role)?;
     }
     check_class_rules(ids, obj, class, role)?;
+    // N6 (task PN6): a computer that holds a `HostName` key names exactly
+    // its own host, `<computerName>.<realm DNS name>` — after the class
+    // rules, so a dNSHostName their form rule refuses keeps its code.
+    if let (Some(of), Some(names)) = (of, names) {
+        check_host_name(ids, obj, of, names)?;
+    }
     match namespace {
         Some(keys) => keys.map(Some),
         // A security principal never passes without its keys (fail closed:
@@ -449,6 +478,59 @@ pub(crate) fn namespace_keys(
     Ok(keys)
 }
 
+/// Rule N6 (task PN6; module documentation): the dNSHostName of a computer
+/// that holds a `HostName` key — namespace classes `Computer` (no claim) and
+/// `DomainController` (the `DcAccount` claim, `dc-fqdn` = `<dc-name>.<zone>`
+/// — A-172; docs/59 §5.2) — is exactly `<computerName>.<realm DNS name>`
+/// (`names::computer_host_name`, which directory-pip's `host_label`
+/// decides): `Name` when the computer's own name gives no host name,
+/// `Value` when the dNSHostName names another host. The provisioned service
+/// objects (`ProvisionedService`) carry the DC account's host name without
+/// its key — bound to the DC account's value by the provisioning session
+/// (module `provisioning`; Q-1010 item 3); no other class carries a
+/// dNSHostName (`keys_of_names`: `NotForClass`). Exhaustive over the
+/// classes, so a class added later takes a position here.
+/// Spec: [MS-ADTS] v20261026 3.1.1.5.3.1.1.2; RFC 1035 §2.3.1; docs/54
+/// §5.3; docs/59 §4.3, §4.4 N6, §5.2; docs/questions/Q-994 item 1, Q-1010
+/// items 1-3, Q-1018 item 2; A-172.
+fn check_host_name(
+    ids: &Ids,
+    obj: &Object,
+    class: PrincipalClass,
+    names: &NameContext,
+) -> Result<(), V> {
+    match class {
+        PrincipalClass::Computer | PrincipalClass::DomainController => {}
+        PrincipalClass::ProvisionedService
+        | PrincipalClass::User
+        | PrincipalClass::Group
+        | PrincipalClass::TicketGrantingService => return Ok(()),
+    }
+    let sam = text(obj, ids.sam_account_name)?;
+    let host = text(obj, ids.dns_host_name)?;
+    names::computer_host_name(sam, host, realm_dns_name(names)?).map_err(|refused| match refused {
+        HostNameRefused::ComputerName => V::Name,
+        HostNameRefused::NotItsOwn => V::Value,
+    })
+}
+
+/// The realm's DNS name — the DNS name of the domain NC (A-53), the
+/// fullDomainDnsName of [MS-ADTS] 3.1.1.5.3.1.1.2 — as the namespace holds
+/// it: its one realm alias (folded). A `NameContext` holds exactly one
+/// alias by construction (docs/questions/Q-1018 item 4; P-84 open); should
+/// a later change (task PN15) let it hold more, no alias is taken for the
+/// DNS name here and every host name is refused (fail closed) until that
+/// change names it.
+/// Spec: docs/59 §4.2 (`NameContext`), §4.4 N6; A-53; docs/questions/Q-1012
+/// (P-84), Q-1018 item 4.
+fn realm_dns_name(names: &NameContext) -> Result<&str, V> {
+    let mut aliases = names.realm_aliases();
+    match (aliases.next(), aliases.next()) {
+        (Some(alias), None) => Ok(alias.as_str()),
+        _ => Err(V::Value),
+    }
+}
+
 /// A-163 on the folded key (module documentation): every reserved name the
 /// object's keys spell is carried by the claim that owns it (`Value`
 /// otherwise), and a claim that exists for a reserved name carries one
@@ -581,14 +663,17 @@ fn check_user(ids: &Ids, obj: &Object, role: Option<ProvisioningRole>) -> Result
 
 /// A computer: sAMAccountName = cn ‖ "$" with cn a valid computer name
 /// (items 8-12, A-79); dNSHostName required (printable, lower case — Q-355
-/// item 3); at most one servicePrincipalName, `service "/" dNSHostName`
-/// (R47-1; a reserved name in any case — `krbtgt/…`, `admind/…`,
-/// `kadmin/changepw` — is the namespace's refusal, `namespace_keys` and
-/// `check_reserved_names`); userAccountControl WT or WT|D — the DC account ST
-/// alone, without SPN or pwdLastSet (the provisioning exception: ST is
-/// never set by the admin plane, A-79 / Q-298 item 2; docs/51 §4.3 step 5);
-/// a service object WT without pwdLastSet (its keys come from
-/// `create_key`, Q-376 item 6); the admin service object likewise, its one
+/// item 3; which host it may name is N6, [`check_host_name`], with the
+/// realm's DNS name — task PN6); at most one servicePrincipalName,
+/// `service "/" dNSHostName` (R47-1; a reserved name in any case —
+/// `krbtgt/…`, `admind/…`, `kadmin/changepw` — is the namespace's refusal,
+/// `namespace_keys` and `check_reserved_names`); userAccountControl WT or
+/// WT|D — the DC account ST alone, without SPN or pwdLastSet (the
+/// provisioning exception: ST is never set by the admin plane, A-79 /
+/// Q-298 item 2; docs/51 §4.3 step 5); a service object WT without
+/// pwdLastSet (its keys come from `create_key`, Q-376 item 6) on the DC
+/// account's host (the provisioning session's rule — task PN6, Q-1010 item
+/// 3); the admin service object likewise, its one
 /// SPN the admin service's name (`names::admin_service_spn_ok` — the only
 /// object that may carry it, docs/questions/Q-541); the change-password
 /// service object likewise, its one SPN `kadmin/changepw`
@@ -875,9 +960,41 @@ pub(crate) fn check_change(
 mod reserved_claim_tests {
     use super::{
         claim_of_reserved_name, claims_a_reserved_name, known, modifiable, name_attributes,
-        ProvisioningRole, ReservedName,
+        principal_class, PrincipalClass, ProvisioningRole, ReservedName,
     };
     use crate::ids::Ids;
+
+    /// Task PN6; docs/59 §4.3, §4.4 N6; docs/questions/Q-1010 item 3: the
+    /// claims whose computers carry the DC account's host name without its
+    /// key (namespace class `ProvisionedService`, which `keys_of_names` gives
+    /// no `HostName` key and [`super::check_host_name`] exempts from N6) are
+    /// exactly the claims the provisioning session binds to the DC account's
+    /// host name (`ProvisioningRole::is_service_object`) — no claim escapes
+    /// both rules. An unclaimed computer and the DC account are N6's.
+    #[test]
+    fn the_service_claims_are_the_provisioned_services() {
+        let ids = Ids::resolve(&ad_schema::phase1().unwrap()).unwrap();
+        for role in [
+            ProvisioningRole::NamingContextRoot,
+            ProvisioningRole::Krbtgt,
+            ProvisioningRole::DcAccount,
+            ProvisioningRole::ServiceObject,
+            ProvisioningRole::AdminServiceObject,
+            ProvisioningRole::ChangePasswordServiceObject,
+        ] {
+            let provisioned = principal_class(&ids, ids.computer.id, Some(role))
+                == Some(PrincipalClass::ProvisionedService);
+            assert_eq!(provisioned, role.is_service_object(), "{role:?}");
+        }
+        assert_eq!(
+            principal_class(&ids, ids.computer.id, None),
+            Some(PrincipalClass::Computer)
+        );
+        assert_eq!(
+            principal_class(&ids, ids.computer.id, Some(ProvisioningRole::DcAccount)),
+            Some(PrincipalClass::DomainController)
+        );
+    }
 
     /// The two exhaustive matches agree: a claim that exists to carry a
     /// reserved name is exactly a claim some reserved name maps to, and the
