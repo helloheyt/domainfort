@@ -87,6 +87,10 @@ daemon-sandbox = { path = "../daemon-sandbox" }
 # O_NOFOLLOW and checked on the opened descriptor. rustix inside (owner
 # decision P-12), already in the lock — no new package.
 protected-file = { path = "../protected-file" }
+# `SourceLimiter`, `SourceLimits`: the UDP per-source + global admission
+# check, moved out of src/rate.rs unchanged by task DN3 so that dnsd shares
+# the one mechanism (docs/54 §6.7, §10). A leaf: no dependency at all.
+rate-limit = { path = "../rate-limit" }
 
 [features]
 # docs/52 C18 (task R15): the test seams — the module `test_seams` (the full

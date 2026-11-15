@@ -18,8 +18,7 @@
 //!   chunk: the envelope, a 1 MiB chunk with its length, and the `more`
 //!   flag (docs/54 §4.6: "chunks ≤ 1 MiB, total ≤ 8 MiB ⚠" — the dird-ldap
 //!   chunk pattern, docs/50 "bounds of `dird-ldap.sock`", Q-280). A
-//!   `Forwarded` reply (≤ 65548 octets) and a `ZoneDescription` (≤ 267)
-//!   are smaller.
+//!   `Forwarded` reply (≤ 65548 octets) is smaller.
 //! * **A zone image** is at most dns-zone's `MAX_IMAGE_TRANSFER_OCTETS`
 //!   (8 MiB) in at most [`MAX_IMAGE_CHUNKS`] chunks; its fields are bounded by
 //!   dns-zone's own bounds (a host label ≤ 63 octets, ≤ 8 addresses, ≤ 65535
@@ -158,8 +157,6 @@ const LARGEST_FORWARD: usize = ENVELOPE + 1 + LARGEST_PEER + 4 + MAX_MESSAGE as 
 const LARGEST_CHUNK: usize = ENVELOPE + 4 + MAX_IMAGE_CHUNK as usize + 1;
 /// Body octets of the largest `Forwarded`.
 const LARGEST_FORWARDED: usize = ENVELOPE + 1 + 4 + MAX_MESSAGE as usize + 4;
-/// Body octets of the largest `ZoneDescription`.
-const LARGEST_DESCRIPTION: usize = ENVELOPE + 4 + MAX_NAME as usize + 4;
 
 /// Octets of one host record of an encoded image at its largest: the label
 /// with its length, the address count and eight addresses, the TTL.
@@ -189,7 +186,6 @@ const _: () = assert!(MAX_MEMBER_HOSTS as usize + 1 == dns_zone::limits::MAX_HOS
 const _: () = assert!(LARGEST_FORWARD <= MAX_REQUEST_BODY as usize);
 const _: () = assert!(LARGEST_CHUNK <= MAX_REPLY_BODY as usize);
 const _: () = assert!(LARGEST_FORWARDED <= MAX_REPLY_BODY as usize);
-const _: () = assert!(LARGEST_DESCRIPTION <= MAX_REPLY_BODY as usize);
 const _: () = assert!(LARGEST_IMAGE <= MAX_IMAGE_OCTETS);
 const _: () = assert!(MAX_IMAGE_CHUNKS * MAX_IMAGE_CHUNK as usize == MAX_IMAGE_OCTETS);
 const _: () = assert!(MAX_IMAGE_CHUNK as usize <= MAX_IMAGE_OCTETS);
@@ -197,16 +193,22 @@ const _: () = assert!(MAX_IMAGE_CHUNK as usize <= MAX_IMAGE_OCTETS);
 // ---- kinds -----------------------------------------------------------------
 
 /// Request kinds (dnsd → dird): docs/54 §4.6's table. Values are a project
-/// choice.
+/// choice. **`0x02` (`DescribeZone`) is retired by A-152 and never reused**
+/// (docs/questions/Q-922): `FetchZoneImage { have }` already answers it —
+/// `have: Some(s)` → `Unchanged { s }` is the periodic SERIAL check, and
+/// `have: None` returns the whole image, whose first fields are the apex and
+/// the SERIAL — so dnsd's start is `Ping` + `FetchZoneImage { have: None }`.
+/// The remaining kinds keep their numbers; `0x02` is refused like any
+/// unknown kind (docs/50 §3.3: close without a reply).
 /// Spec: docs/54 §4.6; docs/50 §3.3 ("`kind` closed"), §7.5 (`Ping` on every
-/// channel).
+/// channel); docs/25 §3 (D101–D104: minimise the operations); A-152.
 pub mod request_kind {
     /// `Ping`: peer verification on every new connection (R9) and health
     /// check; the reply names the zone dird assigned (R14, R9b pattern).
     /// Spec: docs/54 §4.6.
     pub const PING: u8 = 0x01;
-    /// `DescribeZone`: the apex and SERIAL. Spec: docs/54 §4.6, §4.8.
-    pub const DESCRIBE_ZONE: u8 = 0x02;
+    // 0x02 (`DescribeZone`): retired by A-152, never reused
+    // (docs/questions/Q-922).
     /// `FetchZoneImage { have }`: the image, unless dnsd's SERIAL is current.
     /// Spec: docs/54 §4.4, §4.6.
     pub const FETCH_ZONE_IMAGE: u8 = 0x03;
@@ -215,19 +217,26 @@ pub mod request_kind {
     /// Spec: docs/54 §4.5, §4.6; docs/research/r3-c-dns.md §4.1 (A-140).
     pub const FORWARD: u8 = 0x04;
 
-    /// The closed request table. Spec: docs/54 §4.6; docs/50 §3.3.
-    pub const ALL: &[u8] = &[PING, DESCRIBE_ZONE, FETCH_ZONE_IMAGE, FORWARD];
+    /// The kinds retired by A-152 (`DescribeZone`) — kept only so that
+    /// tests can show the closed table refuses them; never in [`ALL`] (a
+    /// compile-time check below), never reused.
+    /// Spec: docs/questions/Q-922 (A-152).
+    pub const RETIRED: &[u8] = &[0x02];
+
+    /// The closed request table. Spec: docs/54 §4.6; docs/50 §3.3; A-152.
+    pub const ALL: &[u8] = &[PING, FETCH_ZONE_IMAGE, FORWARD];
 }
 
 /// Reply kinds (dird → dnsd). [`ipc::REFUSED_KIND`] (`0xFF`) is reserved for
 /// the shared transport refusal (A-59). Values are a project choice.
-/// Spec: docs/54 §4.6 (the reply column); docs/50 §3.3; A-59.
+/// **`0x82` (`ZoneDescription`, the reply to the retired `DescribeZone`) is
+/// retired by A-152 and never reused** (docs/questions/Q-922).
+/// Spec: docs/54 §4.6 (the reply column); docs/50 §3.3; A-59; A-152.
 pub mod reply_kind {
     /// `Pong { zone }`: the reply to `Ping`. Spec: docs/54 §4.6.
     pub const PONG: u8 = 0x81;
-    /// `ZoneDescription { apex, serial }`: the reply to `DescribeZone`.
-    /// Spec: docs/54 §4.6.
-    pub const ZONE_DESCRIPTION: u8 = 0x82;
+    // 0x82 (`ZoneDescription`): retired by A-152, never reused
+    // (docs/questions/Q-922).
     /// `Unchanged { serial }`: dnsd's image is current.
     /// Spec: docs/54 §4.6.
     pub const UNCHANGED: u8 = 0x83;
@@ -238,9 +247,14 @@ pub mod reply_kind {
     /// Spec: docs/54 §4.6; A-140.
     pub const FORWARDED: u8 = 0x85;
 
+    /// The reply kinds retired by A-152 (`ZoneDescription`); never in
+    /// [`ALL`] (a compile-time check below), never reused.
+    /// Spec: docs/questions/Q-922 (A-152).
+    pub const RETIRED: &[u8] = &[0x82];
+
     /// The closed reply table (without the reserved `REFUSED_KIND`).
-    /// Spec: docs/54 §4.6; docs/50 §3.3; A-59.
-    pub const ALL: &[u8] = &[PONG, ZONE_DESCRIPTION, UNCHANGED, IMAGE_CHUNK, FORWARDED];
+    /// Spec: docs/54 §4.6; docs/50 §3.3; A-59; A-152.
+    pub const ALL: &[u8] = &[PONG, UNCHANGED, IMAGE_CHUNK, FORWARDED];
 }
 
 /// Whether `kinds` lists no value twice. Compile-time helper.
@@ -259,12 +273,31 @@ const fn all_distinct(kinds: &[u8]) -> bool {
     true
 }
 
-// No kind equals the reserved `REFUSED_KIND` (A-59), and each table is a set.
-// Evaluated at compile time: a table that breaks either rule does not build.
+/// Whether no value of `kinds` is listed in `retired`. Compile-time helper.
+const fn none_retired(kinds: &[u8], retired: &[u8]) -> bool {
+    let mut i = 0;
+    while i < kinds.len() {
+        let mut j = 0;
+        while j < retired.len() {
+            if kinds[i] == retired[j] {
+                return false;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    true
+}
+
+// No kind equals the reserved `REFUSED_KIND` (A-59), each table is a set, and
+// no retired kind is back in its table (A-152: never reused). Evaluated at
+// compile time: a table that breaks any rule does not build.
 const _: () = assert!(ipc::kinds_exclude_refused(request_kind::ALL));
 const _: () = assert!(ipc::kinds_exclude_refused(reply_kind::ALL));
 const _: () = assert!(all_distinct(request_kind::ALL));
 const _: () = assert!(all_distinct(reply_kind::ALL));
+const _: () = assert!(none_retired(request_kind::ALL, request_kind::RETIRED));
+const _: () = assert!(none_retired(reply_kind::ALL, reply_kind::RETIRED));
 
 // ---- closed value tables ---------------------------------------------------
 

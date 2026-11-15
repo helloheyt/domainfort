@@ -38,7 +38,7 @@ use crate::clock::{Clock, SystemClock};
 use crate::engine::{self, EngineSetup, EngineThread, StartError};
 use crate::log::{note, Note};
 use crate::queues::RequestQueues;
-use crate::rate::{SourceLimiter, UdpLimits};
+use crate::rate::{SourceLimiter, SourceLimits, UDP_LIMITS};
 use crate::tcp::{accept_tcp, TcpContext, TcpLimits};
 use crate::udp::serve_udp;
 use crate::zones::ZoneTable;
@@ -120,7 +120,7 @@ pub struct ServeParams {
     /// The TCP limits (docs/50 §4.1).
     pub tcp: TcpLimits,
     /// The UDP limits (docs/50 §4.1; Q-223).
-    pub udp: UdpLimits,
+    pub udp: SourceLimits,
     /// Capacity of the AS queue (R50-9).
     pub as_queue_capacity: usize,
     /// Capacity of the TGS queue (R50-9).
@@ -164,7 +164,7 @@ impl DaemonParams {
 
 impl From<DaemonParams> for ServeParams {
     /// The product parameters with the daemon's production constants:
-    /// `UdpLimits::DEFAULT`, [`AS_QUEUE_CAPACITY`], [`TGS_QUEUE_CAPACITY`],
+    /// [`UDP_LIMITS`], [`AS_QUEUE_CAPACITY`], [`TGS_QUEUE_CAPACITY`],
     /// `WindowConfig::DEFAULT` and `kdc::DEFAULT_UDP_MAX_REPLY_LEN` — the
     /// only values a product daemon runs with (docs/52 C18, task R15).
     /// Spec: docs/50 §3.6, §4.1, §8.1; docs/questions/Q-223, Q-230 item 4.
@@ -177,7 +177,7 @@ impl From<DaemonParams> for ServeParams {
             audit: params.audit,
             zones: params.zones,
             tcp: params.tcp,
-            udp: UdpLimits::DEFAULT,
+            udp: UDP_LIMITS,
             as_queue_capacity: AS_QUEUE_CAPACITY,
             tgs_queue_capacity: TGS_QUEUE_CAPACITY,
             window: WindowConfig::DEFAULT,

@@ -10,14 +10,16 @@
 //! transport and peer; `Forwarded.reply: Option`); docs/50 R50-3 (the client
 //! verifies the server's uid), §3.3 (replies decoded with the same
 //! strictness), §3.6, §3.7; docs/questions/Q-312 (idle check, no resend);
-//! RFC 2782 "Fictional example" (the zone). Every value is hand-made or from
-//! those sources.
+//! RFC 2782 "Fictional example" (the zone); A-152 / docs/questions/Q-922
+//! (`DescribeZone` retired: the calls that probe the connection here are the
+//! periodic SERIAL check, `FetchZoneImage { have: Some(s) }` → `Unchanged`).
+//! Every value is hand-made or from those sources.
 
 mod common;
 
 use common::{
-    large_parts, message_octets, name, refusal_body, reply_body, rfc2782_parts, Script,
-    ScriptedConnector, DIRD_UID,
+    large_parts, message_octets, refusal_body, reply_body, rfc2782_parts, Script,
+    ScriptedConnector, DIRD_UID, RFC2782_SERIAL,
 };
 use core::net::{IpAddr, Ipv4Addr};
 use ipc::{Direction, Error, Refused};
@@ -25,8 +27,8 @@ use ipc_dns::channel::request_kind;
 use ipc_dns::{
     encode_image, split_image, ClientConfigError, DnsClient, DnsMessage, DnsReply, DnsRequest,
     ExpectedDird, ForwardRequest, Forwarded, FrontZone, ImageChunk, ImageError, ImageFetch,
-    ImageTransfer, PeerAddress, Serial, Transport, TransportError, Unserved, ZoneDescription,
-    ZoneImage, ZoneImageError, DEFAULT_DEADLINE, DNS_CHANNEL, MAX_IMAGE_CHUNK,
+    ImageTransfer, PeerAddress, Serial, Transport, TransportError, Unserved, ZoneImage,
+    ZoneImageError, DEFAULT_DEADLINE, DNS_CHANNEL, MAX_IMAGE_CHUNK,
 };
 use std::time::Duration;
 
@@ -40,8 +42,15 @@ fn pong() -> Vec<u8> {
     })
 }
 
-fn description() -> ZoneDescription {
-    ZoneDescription::new(name("example.com"), serial(1_995_032_001)).expect("apex")
+/// The SERIAL of the image dnsd answers from in these tests (RFC 2782
+/// "Fictional example").
+fn current() -> Serial {
+    serial(RFC2782_SERIAL)
+}
+
+/// dird's confirmation that [`current`] is current (docs/54 §4.4, §4.6).
+fn unchanged() -> Vec<u8> {
+    reply_body(&DnsReply::Unchanged { serial: current() })
 }
 
 fn expected() -> ExpectedDird {
@@ -96,7 +105,10 @@ fn another_peer_uid_receives_nothing() {
     let mut script = Script::dird(vec![pong()]);
     script.uid = Ok(DIRD_UID + 1);
     let mut client = new_client(vec![script]);
-    assert_eq!(client.describe_zone(), Err(Unserved::PeerMismatch));
+    assert_eq!(
+        client.fetch_zone_image(Some(current())),
+        Err(Unserved::PeerMismatch)
+    );
     assert!(sent_kinds(&client).is_empty());
     assert!(!client.is_connected());
 }
@@ -118,14 +130,14 @@ fn unreadable_peer_credentials_send_nothing() {
 /// request goes only after a `Pong` naming the expected zone.
 #[test]
 fn every_connection_is_verified_before_the_request() {
-    let mut client = new_client(vec![Script::dird(vec![
-        pong(),
-        reply_body(&DnsReply::ZoneDescription(description())),
-    ])]);
-    assert_eq!(client.describe_zone(), Ok(description()));
+    let mut client = new_client(vec![Script::dird(vec![pong(), unchanged()])]);
+    assert_eq!(
+        client.fetch_zone_image(Some(current())),
+        Ok(ImageFetch::Unchanged(current()))
+    );
     assert_eq!(
         sent_kinds(&client),
-        vec![request_kind::PING, request_kind::DESCRIBE_ZONE]
+        vec![request_kind::PING, request_kind::FETCH_ZONE_IMAGE]
     );
     assert!(client.is_connected());
 }
@@ -152,11 +164,8 @@ fn a_failed_probe_sends_only_the_ping() {
             Unserved::Refused(Refused::VersionMismatch),
         ),
     ] {
-        let mut client = new_client(vec![Script::dird(vec![
-            reply,
-            reply_body(&DnsReply::ZoneDescription(description())),
-        ])]);
-        assert_eq!(client.describe_zone(), Err(outcome));
+        let mut client = new_client(vec![Script::dird(vec![reply, unchanged()])]);
+        assert_eq!(client.fetch_zone_image(Some(current())), Err(outcome));
         assert_eq!(sent_kinds(&client), vec![request_kind::PING]);
         assert!(!client.is_connected());
     }
@@ -167,29 +176,28 @@ fn a_failed_probe_sends_only_the_ping() {
 /// verified before the request.
 #[test]
 fn a_held_connection_is_checked_before_reuse() {
-    let describe = reply_body(&DnsReply::ZoneDescription(description()));
-    let mut client = new_client(vec![Script::dird(vec![
-        pong(),
-        describe.clone(),
-        describe.clone(),
-    ])]);
-    client.describe_zone().expect("first");
-    client.describe_zone().expect("second, same connection");
+    let mut client = new_client(vec![Script::dird(vec![pong(), unchanged(), unchanged()])]);
+    client.fetch_zone_image(Some(current())).expect("first");
+    client
+        .fetch_zone_image(Some(current()))
+        .expect("second, same connection");
     assert_eq!(
         sent_kinds(&client),
         vec![
             request_kind::PING,
-            request_kind::DESCRIBE_ZONE,
-            request_kind::DESCRIBE_ZONE
+            request_kind::FETCH_ZONE_IMAGE,
+            request_kind::FETCH_ZONE_IMAGE
         ]
     );
     assert_eq!(client.connector().log.borrow().connects, 1);
 
-    let mut stale = Script::dird(vec![pong(), describe.clone()]);
+    let mut stale = Script::dird(vec![pong(), unchanged()]);
     stale.idle = Err(TransportError::Closed);
-    let mut client = new_client(vec![stale, Script::dird(vec![pong(), describe])]);
-    client.describe_zone().expect("first");
-    client.describe_zone().expect("second, new connection");
+    let mut client = new_client(vec![stale, Script::dird(vec![pong(), unchanged()])]);
+    client.fetch_zone_image(Some(current())).expect("first");
+    client
+        .fetch_zone_image(Some(current()))
+        .expect("second, new connection");
     let log = client.connector().log.borrow();
     assert_eq!(log.connects, 2);
     let per_connection: Vec<(usize, u8)> = log
@@ -201,9 +209,9 @@ fn a_held_connection_is_checked_before_reuse() {
         per_connection,
         vec![
             (1, request_kind::PING),
-            (1, request_kind::DESCRIBE_ZONE),
+            (1, request_kind::FETCH_ZONE_IMAGE),
             (2, request_kind::PING),
-            (2, request_kind::DESCRIBE_ZONE)
+            (2, request_kind::FETCH_ZONE_IMAGE)
         ]
     );
 }
@@ -271,16 +279,26 @@ fn a_refusal_drops_the_connection() {
 }
 
 /// docs/50 §3.3: a reply that does not decode, or does not answer the
-/// request, is refused.
+/// request, is refused — a frame of the retired `ZoneDescription` kind
+/// (`0x82`, A-152 / Q-922) included: it is an unknown kind.
 #[test]
 fn replies_must_decode_and_answer_the_request() {
-    let mut wrong_magic = reply_body(&DnsReply::ZoneDescription(description()));
+    let mut wrong_magic = unchanged();
     wrong_magic[0] = 0x4C;
     let mut client = new_client(vec![Script::dird(vec![pong(), wrong_magic])]);
     assert_eq!(
-        client.describe_zone(),
+        client.fetch_zone_image(Some(current())),
         Err(Unserved::MalformedReply(Error::WrongMagic))
     );
+
+    let mut retired = unchanged();
+    retired[3] = 0x82;
+    let mut client = new_client(vec![Script::dird(vec![pong(), retired])]);
+    assert_eq!(
+        client.fetch_zone_image(Some(current())),
+        Err(Unserved::MalformedReply(Error::UnknownKind))
+    );
+    assert!(!client.is_connected());
 
     let mut client = new_client(vec![Script::dird(vec![pong(), pong()])]);
     assert_eq!(
@@ -289,9 +307,15 @@ fn replies_must_decode_and_answer_the_request() {
     );
     let mut client = new_client(vec![Script::dird(vec![
         pong(),
-        reply_body(&DnsReply::Unchanged { serial: serial(1) }),
+        reply_body(&DnsReply::Forwarded(Forwarded {
+            reply: None,
+            serial: current(),
+        })),
     ])]);
-    assert_eq!(client.describe_zone(), Err(Unserved::UnexpectedReply));
+    assert_eq!(
+        client.fetch_zone_image(Some(current())),
+        Err(Unserved::UnexpectedReply)
+    );
 }
 
 /// A-140: the forward carries the transport, the peer and the exact

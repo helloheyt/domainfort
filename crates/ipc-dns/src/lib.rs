@@ -20,7 +20,7 @@
 //! | layer | module | what it checks |
 //! |---|---|---|
 //! | channel | [`channel`] | magic `0x444E`, exact version 1, per-direction / per-field bounds (pinned to parse-dns and dns-zone), closed kind and code tables (no kind equals `ipc::REFUSED_KIND`) |
-//! | values | `values` | SERIAL ≠ 0, the zone, a canonical peer address, a DNS message of 12..=65535 octets (≤ 512 over UDP), a valid apex |
+//! | values | `values` | SERIAL ≠ 0, the zone, a canonical peer address, a DNS message of 12..=65535 octets (≤ 512 over UDP) |
 //! | wire | [`wire`] | fixed-order fields through `ipc` (lengths, markers, closed tables, field domains, no trailing octet) |
 //! | image | [`image`] | the image encoding, its chunks, dird's validated [`ImageTransfer`], dnsd's bounded [`ImageAssembly`] (whole images only, built by `ZoneImage::new`) |
 //! | server | [`server`] | [`decode_request`] (or how to refuse), [`encode_reply`], [`encode_image_chunks`] |
@@ -35,11 +35,11 @@
 //! | dir | kind | message | payload | reply |
 //! |---|---|---|---|---|
 //! | → | `0x01` | `Ping` | — | `Pong` |
-//! | → | `0x02` | `DescribeZone` | — | `ZoneDescription` |
+//! | → | `0x02` | retired (`DescribeZone`, A-152 — docs/questions/Q-922); refused as an unknown kind | — | — |
 //! | → | `0x03` | `FetchZoneImage` | `have: Option<serial:u32>` | `Unchanged`, or `ImageChunk` × 1..=8 |
 //! | → | `0x04` | `Forward` | `transport:u8{1 Udp, 2 Tcp} ‖ peer:(u8{4} ‖ [4] \| u8{6} ‖ [16]) ‖ message:bytes<65535>` (12 ≤ len; UDP ⇒ len ≤ 512) | `Forwarded` |
 //! | ← | `0x81` | `Pong` | `zone:u8{1 Internal}` | — |
-//! | ← | `0x82` | `ZoneDescription` | `apex:bytes<255> (one uncompressed name, not the root, LDH labels) ‖ serial:u32 (≠ 0)` | — |
+//! | ← | `0x82` | retired (`ZoneDescription`, A-152 — docs/questions/Q-922); refused as an unknown kind | — | — |
 //! | ← | `0x83` | `Unchanged` | `serial:u32 (≠ 0, = have)` | — |
 //! | ← | `0x84` | `ImageChunk` | `chunk:bytes<1 MiB> (≥ 1; = 1 MiB when more) ‖ more:bool` | — |
 //! | ← | `0x85` | `Forwarded` | `reply:Option<bytes<65535>> (12 ≤ len) ‖ serial:u32 (≠ 0)` | — |
@@ -47,6 +47,13 @@
 //!
 //! Request body ≤ 64 KiB + 32; reply body ≤ 1 MiB + 16; an image ≤ 8 MiB
 //! ([`channel`]). The image encoding is in [`image`].
+//!
+//! `DescribeZone` (`0x02`) and its reply `ZoneDescription` (`0x82`) are
+//! retired by A-152 (docs/questions/Q-922): `FetchZoneImage { have }`
+//! already answers them — `have: None` returns the whole image, apex and
+//! SERIAL first; `have: Some(s)` → `Unchanged { s }` is the periodic SERIAL
+//! check — so dnsd starts with `Ping` + `FetchZoneImage { have: None }`. The
+//! other kinds keep their numbers; the retired ones are never reused.
 //!
 //! # What A-140 changed, and what the channel carries for it
 //!
@@ -90,8 +97,8 @@
 //! other implementation, DNS server, serializer or RPC framework was
 //! consulted or recalled (AGENTS.md §1-3).
 //!
-//! Spec: docs/54 §4.4, §4.6, R54-4, R54-5; A-119; A-140; docs/50 R50-3,
-//! R50-4, R50-7, §3; A-59.
+//! Spec: docs/54 §4.4, §4.6, R54-4, R54-5; A-119; A-140; A-152 (Q-922);
+//! docs/50 R50-3, R50-4, R50-7, §3; A-59.
 
 pub mod channel;
 pub mod client;
@@ -117,9 +124,7 @@ pub use image::{
 pub use server::{decode_request, encode_image_chunks, encode_refusal, encode_reply, Rejection};
 #[cfg(unix)]
 pub use unix::{UnixConnection, UnixConnector};
-pub use values::{
-    DnsMessage, ForwardRequest, Forwarded, FrontZone, PeerAddress, Serial, ZoneDescription,
-};
+pub use values::{DnsMessage, ForwardRequest, Forwarded, FrontZone, PeerAddress, Serial};
 pub use wire::{DnsReply, DnsRequest};
 
 // The types of the crates this channel's API speaks in, so that dnsd and

@@ -247,7 +247,7 @@ pub fn kdc_params(audit: &Path, uid: u32) -> DaemonParams {
             idle_timeout: Duration::from_secs(5),
             max_requests: 64,
         },
-        udp: kdc_daemon::rate::UdpLimits {
+        udp: kdc_daemon::rate::SourceLimits {
             per_source: 1000,
             global: 10_000,
             window: Duration::from_secs(1),

@@ -1,0 +1,35 @@
+# rate-limit — the one per-source + global admission limiter of the network
+# fronts (build task DN3; docs/54 §6.7, §10 the DN3 row, which names this
+# crate "rate-limit").
+#
+# `SourceLimiter` was kdc-daemon's UDP admission check (docs/50 §4.1: "a rate
+# limiter per source + a global reply budget"; Q-223 → A-57 option (a)).
+# dnsd (task DN11) needs the same mechanism in front of its UDP socket
+# (docs/54 §6.7: "one mechanism: move kdc-daemon's `SourceLimiter` to a
+# shared crate instead of a second copy" — the C14 pattern of docs/52
+# §3.14: two implementations of one limiter diverge). It moved here
+# unchanged; kdc-daemon re-exports it and keeps its own numbers (Q-230
+# item 4 → A-60; Q-275 item 5). The numbers are each daemon's, never this
+# crate's: a default here would hand the KDC's constants to dnsd.
+#
+# A LEAF: no dependency of any kind (std only) — no network, no crypto, no
+# store — so dnsd, which links no dirstore, krb-crypto or keyd (docs/54
+# §4.7), can link it. Checked by tests/leaf.rs.
+#
+# Written only from this project's decided design: docs/54 §4.7, §6.7, §10
+# (DN3); docs/50 §4.1; docs/52 §3.14 (C14); docs/57; docs/questions Q-223
+# (A-57), Q-230 item 4 (A-60), Q-275 item 5, Q-930; the code moved from
+# crates/kdc-daemon src/rate.rs (this project's own); and the Rust standard
+# library's API documentation. No other implementation consulted or recalled
+# (AGENTS.md §1-3).
+
+[package]
+name = "rate-limit"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

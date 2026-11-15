@@ -5,8 +5,10 @@
 //! hold before the fuzz workspace itself is built (PENDING-OWNER P-1).
 //!
 //! Sources: docs/54 §4.6, §10.3 (`ipc_dns_request`, `ipc_dns_reply`);
-//! docs/50 §3.3, §9; AGENTS.md §6. Inputs are encoded by this crate from
-//! hand-made values and the RFC 2782 "Fictional example" zone.
+//! docs/50 §3.3, §9; AGENTS.md §6; A-152 / docs/questions/Q-922 (the
+//! retired kinds `0x02` / `0x82` are among the garbage inputs). Inputs are
+//! encoded by this crate from hand-made values and the RFC 2782 "Fictional
+//! example" zone.
 
 mod common;
 
@@ -16,12 +18,12 @@ mod request_body;
 #[path = "../fuzz/bodies/ipc_dns_reply.rs"]
 mod reply_body;
 
-use common::{message_octets, name, rfc2782_parts};
+use common::{message_octets, rfc2782_parts};
 use core::net::{IpAddr, Ipv4Addr};
 use ipc::{encode_frame, Direction, Refused};
 use ipc_dns::{
     encode_image, encode_refusal, encode_reply, DnsMessage, DnsReply, DnsRequest, ForwardRequest,
-    Forwarded, FrontZone, ImageChunk, PeerAddress, Serial, Transport, ZoneDescription, DNS_CHANNEL,
+    Forwarded, FrontZone, ImageChunk, PeerAddress, Serial, Transport, DNS_CHANNEL,
 };
 
 fn serial(value: u32) -> Serial {
@@ -41,7 +43,6 @@ fn requests() -> Vec<Vec<u8>> {
     };
     [
         DnsRequest::Ping,
-        DnsRequest::DescribeZone,
         DnsRequest::FetchZoneImage { have: None },
         DnsRequest::FetchZoneImage {
             have: Some(serial(3)),
@@ -64,7 +65,6 @@ fn replies() -> Vec<Vec<u8>> {
         DnsReply::Pong {
             zone: FrontZone::Internal,
         },
-        DnsReply::ZoneDescription(ZoneDescription::new(name("example.com"), serial(9)).unwrap()),
         DnsReply::Unchanged { serial: serial(9) },
         DnsReply::ImageChunk(
             ImageChunk::new(&encode_image(&rfc2782_parts()).unwrap(), false).unwrap(),
@@ -107,6 +107,15 @@ fn garbage() -> Vec<Vec<u8>> {
         vec![0x44, 0x4E, 0x01],
         vec![0x44, 0x4E, 0x01, 0x04, 0xFF, 0xFF, 0xFF, 0xFF],
         vec![0x44, 0x4E, 0x01, 0x84, 0xFF, 0xFF, 0xFF, 0xFF, 0x00],
+        // The retired `DescribeZone` and `ZoneDescription` (A-152): the
+        // former layouts — no payload; an apex and a SERIAL.
+        vec![0x44, 0x4E, 0x01, 0x02],
+        [
+            &[0x44, 0x4E, 0x01, 0x82, 0, 0, 0, 13][..],
+            &b"\x07example\x03com\x00"[..],
+            &[0, 0, 0, 9][..],
+        ]
+        .concat(),
         vec![0xFF; 64],
         vec![0x00; 64],
     ]

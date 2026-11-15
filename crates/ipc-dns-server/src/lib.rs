@@ -27,13 +27,17 @@
 //! | request | host call | reply |
 //! |---|---|---|
 //! | `Ping` | — | `Pong { zone: the connection's zone }` |
-//! | `DescribeZone` | [`ZoneHost::describe_zone`] | `ZoneDescription { apex, serial }` |
 //! | `FetchZoneImage { have }` | [`ZoneHost::zone_image`] | the host's `Unchanged(s)` with `have == Some(s)` ⇒ `Unchanged { s }`; an image whose SERIAL equals `have` ⇒ `Unchanged`; another image ⇒ its `ImageChunk` frames; an `Unchanged(s)` with `have ≠ Some(s)` ⇒ `Refused{Unavailable}` + close (the host contradicts the request — fail closed) |
 //! | `Forward { transport, peer, message }` | [`ZoneHost::forward`] with the connection's zone | `Forwarded { reply, serial }` — `reply: None` tells dnsd to stay silent (UDP) or to close without a reply (TCP) |
 //!
+//! `DescribeZone` (kind `0x02`) is retired by A-152 (docs/questions/Q-922):
+//! `FetchZoneImage { have }` answers the same question, so the host has one
+//! method fewer and dird one parser branch fewer reachable by a compromised
+//! dnsd (docs/54 §8). Its kind is refused like any unknown kind.
+//!
 //! A request that does not decode follows docs/50 §3.3: a wrong magic, an
-//! unknown kind or a body outside the envelope bounds ⇒ close without a
-//! reply; another version ⇒ `Refused{VersionMismatch}` + close; a payload
+//! unknown kind (a retired one included) or a body outside the envelope
+//! bounds ⇒ close without a reply; another version ⇒ `Refused{VersionMismatch}` + close; a payload
 //! error ⇒ `Refused{Malformed}` + close — nothing malformed reaches the host.
 //! A host refusal ([`Unserved::Busy`] — dird's bounded DNS queue is full;
 //! [`Unserved::Unavailable`] — a dependency or the image is not available)
@@ -41,8 +45,8 @@
 //! answers its client SERVFAIL (docs/54 §4.6, §6.6) and its next call
 //! reconnects and verifies again. Once closed, a connection answers nothing.
 //!
-//! Spec: docs/54 §4.4, §4.6, §6.6; A-114; A-140; docs/50 R50-3, R50-7, §3.2,
-//! §3.3, §7.5; docs/52 §3.3, §7 R14; A-59.
+//! Spec: docs/54 §4.4, §4.6, §6.6; A-114; A-140; A-152 (Q-922); docs/50
+//! R50-3, R50-7, §3.2, §3.3, §7.5; docs/52 §3.3, §7 R14; A-59.
 //!
 //! # Provenance
 //!
@@ -57,7 +61,7 @@ use core::fmt;
 use ipc::{EncodedFrame, Refused};
 use ipc_dns::{
     decode_request, encode_image_chunks, encode_refusal, encode_reply, DnsReply, DnsRequest,
-    ForwardRequest, Forwarded, FrontZone, ImageTransfer, Rejection, Serial, ZoneDescription,
+    ForwardRequest, Forwarded, FrontZone, ImageTransfer, Rejection, Serial,
 };
 
 /// The connection a request came on, as dird numbers them (never anything
@@ -122,16 +126,10 @@ pub enum ImageAnswer {
 }
 
 /// What dird supplies for the requests of dnsd's connections (task DN10).
+/// (No `describe_zone`: `DescribeZone` is retired — A-152, docs/questions/
+/// Q-922.)
 /// Spec: docs/54 §4.4–§4.6, §7.5.
 pub trait ZoneHost {
-    /// The zone's apex and current SERIAL.
-    ///
-    /// # Errors
-    /// [`Unserved`].
-    ///
-    /// Spec: docs/54 §4.6.
-    fn describe_zone(&mut self) -> Result<ZoneDescription, Unserved>;
-
     /// The zone image, or `Unchanged` when `have` is the current SERIAL —
     /// from one authority snapshot through dird's one zone projection
     /// (docs/54 §4.4).
@@ -307,10 +305,6 @@ impl DnsConnection {
         };
         match request {
             DnsRequest::Ping => self.reply_one(&DnsReply::Pong { zone: self.zone }),
-            DnsRequest::DescribeZone => match host.describe_zone() {
-                Ok(description) => self.reply_one(&DnsReply::ZoneDescription(description)),
-                Err(unserved) => self.unserved(unserved),
-            },
             DnsRequest::FetchZoneImage { have } => match host.zone_image(have) {
                 Ok(ImageAnswer::Unchanged(serial)) if have == Some(serial) => {
                     self.reply_one(&DnsReply::Unchanged { serial })

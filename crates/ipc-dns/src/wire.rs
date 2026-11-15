@@ -4,13 +4,17 @@
 //! parse-dns's `Forwarded` profile (docs/54 §6.1), dnsd sends dird's replies
 //! as they are (after dns-zone's size rule — A-140).
 //!
+//! `DescribeZone` / `ZoneDescription` (kinds `0x02` / `0x82`) are retired by
+//! A-152 (docs/questions/Q-922): `FetchZoneImage { have }` answers the same
+//! question, so the channel carries one operation fewer. Their kinds are not
+//! in the closed tables and are refused like any unknown kind.
+//!
 //! | message | fields |
 //! |---|---|
-//! | `Ping`, `DescribeZone` | — |
+//! | `Ping` | — |
 //! | `FetchZoneImage` | `have: Option<serial:u32>` |
 //! | `Forward` | `transport: u8`, `peer: family u8 ‖ [u8; 4] or [u8; 16]`, `message: bytes<65535>` |
 //! | `Pong` | `zone: u8` |
-//! | `ZoneDescription` | `apex: bytes<255>` (one uncompressed name), `serial: u32` |
 //! | `Unchanged` | `serial: u32` |
 //! | `ImageChunk` | `chunk: bytes<1 MiB>` (never empty), `more: bool` (`true` only on a chunk of exactly 1 MiB) |
 //! | `Forwarded` | `reply: Option<bytes<65535>>`, `serial: u32` |
@@ -19,15 +23,14 @@
 //!
 //! Beyond `ipc`'s own rules, every field admits only the values its value
 //! type can hold ([`Serial`], [`PeerAddress`], [`DnsMessage`],
-//! [`ForwardRequest`], [`ZoneDescription`], [`ImageChunk`]). A value outside
-//! its domain is refused
-//! as follows (fail closed; each is `Refused{Malformed}` on dird's side,
+//! [`ForwardRequest`], [`ImageChunk`]). A value outside its domain is
+//! refused as follows (fail closed; each is `Refused{Malformed}` on dird's side,
 //! `ipc::Error::refusal`):
 //!
 //! * a SERIAL of zero (RFC 2136 §7.11), an IPv4-mapped IPv6 peer address
-//!   (its IPv4 form is its only spelling), a name that is not exactly one
-//!   uncompressed RFC 1035 §3.1 name, an apex that is the root or has a
-//!   non-LDH label → [`Error::UnknownCode`] — the house reading of "a value
+//!   (its IPv4 form is its only spelling), a name (in the zone image) that
+//!   is not exactly one uncompressed RFC 1035 §3.1 name →
+//!   [`Error::UnknownCode`] — the house reading of "a value
 //!   outside the field's closed table" (precedent: crates/ipc-keyd refuses a
 //!   mapped IPv6 `HostAddr` and a zero result code the same way);
 //! * a DNS message shorter than a header (RFC 1035 §4.1.1), a UDP-borne
@@ -42,16 +45,14 @@
 //! itself, whose TSIG only keyd verifies. The zone is dird's, from dnsd's
 //! peer uid.
 //!
-//! Spec: docs/54 §4.6; A-140; docs/50 §3.3 (primitives, one encoding per
-//! value); RFC 1035 §2.3.4, §3.1, §4.1.1, §4.2; RFC 2136 §7.11.
+//! Spec: docs/54 §4.6; A-140; A-152 (Q-922); docs/50 §3.3 (primitives, one
+//! encoding per value); RFC 1035 §2.3.4, §3.1, §4.1.1, §4.2; RFC 2136 §7.11.
 
 use crate::channel::{
     codes, reply_kind, request_kind, MAX_IMAGE_CHUNK, MAX_MESSAGE, MAX_NAME, MAX_UDP_MESSAGE,
 };
 use crate::image::{chunk_is_valid, ImageChunk};
-use crate::values::{
-    DnsMessage, ForwardRequest, Forwarded, FrontZone, PeerAddress, Serial, ZoneDescription,
-};
+use crate::values::{DnsMessage, ForwardRequest, Forwarded, FrontZone, PeerAddress, Serial};
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use ipc::{Error, MessageSet, Reader, Result, Writer};
 use parse_dns::{Name, Transport};
@@ -156,14 +157,13 @@ const fn message_bound(transport: Transport) -> u32 {
 
 // ---- requests --------------------------------------------------------------
 
-/// The messages dnsd sends.
-/// Spec: docs/54 §4.6; A-140.
+/// The messages dnsd sends (`DescribeZone` retired — module
+/// documentation).
+/// Spec: docs/54 §4.6; A-140; A-152 (Q-922).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DnsRequest {
     /// Peer verification on every new connection, and health check.
     Ping,
-    /// The zone's apex and SERIAL.
-    DescribeZone,
     /// The zone image, unless `have` is its current SERIAL.
     FetchZoneImage {
         /// The SERIAL of the image dnsd answers from, if any.
@@ -179,7 +179,6 @@ impl MessageSet for DnsRequest {
     fn kind(&self) -> u8 {
         match self {
             DnsRequest::Ping => request_kind::PING,
-            DnsRequest::DescribeZone => request_kind::DESCRIBE_ZONE,
             DnsRequest::FetchZoneImage { .. } => request_kind::FETCH_ZONE_IMAGE,
             DnsRequest::Forward(_) => request_kind::FORWARD,
         }
@@ -188,7 +187,7 @@ impl MessageSet for DnsRequest {
     /// Spec: module table; docs/50 §3.3.
     fn write_payload(&self, writer: &mut Writer) -> Result<()> {
         match self {
-            DnsRequest::Ping | DnsRequest::DescribeZone => Ok(()),
+            DnsRequest::Ping => Ok(()),
             DnsRequest::FetchZoneImage { have } => writer
                 .write_option(have.as_ref(), |writer, serial| {
                     write_serial(writer, *serial)
@@ -209,7 +208,6 @@ impl MessageSet for DnsRequest {
     fn read_payload(kind: u8, reader: &mut Reader<'_>) -> Result<DnsRequest> {
         match kind {
             request_kind::PING => Ok(DnsRequest::Ping),
-            request_kind::DESCRIBE_ZONE => Ok(DnsRequest::DescribeZone),
             request_kind::FETCH_ZONE_IMAGE => Ok(DnsRequest::FetchZoneImage {
                 have: reader.read_option(read_serial)?,
             }),
@@ -228,8 +226,9 @@ impl MessageSet for DnsRequest {
 
 // ---- replies ---------------------------------------------------------------
 
-/// The messages dird sends.
-/// Spec: docs/54 §4.6; A-140.
+/// The messages dird sends (`ZoneDescription` retired — module
+/// documentation).
+/// Spec: docs/54 §4.6; A-140; A-152 (Q-922).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DnsReply {
     /// The reply to `Ping`: the zone dird assigned this connection from
@@ -238,8 +237,6 @@ pub enum DnsReply {
         /// The connection's zone.
         zone: FrontZone,
     },
-    /// The reply to `DescribeZone`.
-    ZoneDescription(ZoneDescription),
     /// The reply to `FetchZoneImage { have }` when `have` is current.
     Unchanged {
         /// The current SERIAL (equal to `have`).
@@ -257,7 +254,6 @@ impl MessageSet for DnsReply {
     fn kind(&self) -> u8 {
         match self {
             DnsReply::Pong { .. } => reply_kind::PONG,
-            DnsReply::ZoneDescription(_) => reply_kind::ZONE_DESCRIPTION,
             DnsReply::Unchanged { .. } => reply_kind::UNCHANGED,
             DnsReply::ImageChunk(_) => reply_kind::IMAGE_CHUNK,
             DnsReply::Forwarded(_) => reply_kind::FORWARDED,
@@ -268,10 +264,6 @@ impl MessageSet for DnsReply {
     fn write_payload(&self, writer: &mut Writer) -> Result<()> {
         match self {
             DnsReply::Pong { zone } => writer.write_enum(zone.code()),
-            DnsReply::ZoneDescription(description) => {
-                write_name(writer, description.apex())?;
-                write_serial(writer, description.serial())
-            }
             DnsReply::Unchanged { serial } => write_serial(writer, *serial),
             DnsReply::ImageChunk(chunk) => {
                 // Never produce a chunk the peer would refuse.
@@ -297,15 +289,6 @@ impl MessageSet for DnsReply {
             reply_kind::PONG => Ok(DnsReply::Pong {
                 zone: reader.read_enum(FrontZone::from_code)?,
             }),
-            reply_kind::ZONE_DESCRIPTION => {
-                let apex = read_name(reader)?;
-                let serial = read_serial(reader)?;
-                // The root, or a label that is not LDH, is outside the
-                // apex's domain.
-                ZoneDescription::new(apex, serial)
-                    .map(DnsReply::ZoneDescription)
-                    .ok_or(Error::UnknownCode)
-            }
             reply_kind::UNCHANGED => Ok(DnsReply::Unchanged {
                 serial: read_serial(reader)?,
             }),

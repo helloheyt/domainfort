@@ -65,7 +65,7 @@
 
 use crate::channel::{DNS_CHANNEL, REPLY_LIMIT};
 use crate::image::{ImageAssembly, ImageError};
-use crate::values::{ForwardRequest, Forwarded, FrontZone, Serial, ZoneDescription};
+use crate::values::{ForwardRequest, Forwarded, FrontZone, Serial};
 use crate::wire::{DnsReply, DnsRequest};
 use core::fmt;
 use core::time::Duration;
@@ -405,29 +405,22 @@ impl<C: Connector> DnsClient<C> {
         })
     }
 
-    /// The zone's apex and SERIAL.
-    ///
-    /// # Errors
-    /// [`Unserved`].
-    ///
-    /// Spec: docs/54 §4.6, §4.8.
-    pub fn describe_zone(&mut self) -> Result<ZoneDescription, Unserved> {
-        self.call(&DnsRequest::DescribeZone, |reply| match reply {
-            DnsReply::ZoneDescription(description) => Ok(Step::Done(description)),
-            _ => Err(Unserved::UnexpectedReply),
-        })
-    }
-
     /// The zone image, unless `have` (the SERIAL of the image dnsd answers
     /// from) is current. A new image is returned only whole and validated by
     /// `ZoneImage::new`; its SERIAL differs from `have`.
+    ///
+    /// This is also how dnsd learns the zone's apex and SERIAL (the retired
+    /// `DescribeZone` — A-152, docs/questions/Q-922): at start,
+    /// `have: None` returns the whole image (apex and SERIAL included); the
+    /// periodic SERIAL check is `have: Some(s)` → `Unchanged(s)`.
     ///
     /// # Errors
     /// [`Unserved`]; an `Unchanged` that does not confirm `have`, a chunk
     /// after `Unchanged`, or an image whose SERIAL equals `have` is
     /// [`Unserved::UnexpectedReply`].
     ///
-    /// Spec: docs/54 §4.4 (refresh by SERIAL; atomic replacement), §4.6.
+    /// Spec: docs/54 §4.4 (refresh by SERIAL; atomic replacement), §4.6,
+    /// §4.8 (start); A-152 (Q-922).
     pub fn fetch_zone_image(&mut self, have: Option<Serial>) -> Result<ImageFetch, Unserved> {
         let mut assembly = ImageAssembly::new();
         self.call(&DnsRequest::FetchZoneImage { have }, |reply| match reply {

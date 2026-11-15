@@ -9,12 +9,13 @@
 //! docs/research/r3-c-dns.md §4.1 (`Forward { transport, peer, message }`,
 //! `Forwarded { reply: Option }`); A-59 (`REFUSED_KIND`); RFC 1035 §2.3.4,
 //! §3.1, §4.1.1, §4.2.1, §4.2.2 (message and name bounds); RFC 2136 §7.11
-//! (SERIAL ≠ 0); RFC 2782 "Fictional example" (the apex). Every value is
-//! hand-made or from those sources.
+//! (SERIAL ≠ 0); A-152 / docs/questions/Q-922 (`DescribeZone` /
+//! `ZoneDescription` retired, kinds `0x02` / `0x82` never reused). Every
+//! value is hand-made or from those sources.
 
 mod common;
 
-use common::{message_octets, name, reply_body};
+use common::{message_octets, reply_body};
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use ipc::{
     decode_body, decode_reply, encode_frame, encode_refused, reply_round_trip_is_canonical,
@@ -23,9 +24,8 @@ use ipc::{
 use ipc_dns::channel::{codes, reply_kind, request_kind};
 use ipc_dns::{
     decode_request, DnsMessage, DnsReply, DnsRequest, ForwardRequest, Forwarded, FrontZone,
-    ImageChunk, Name, PeerAddress, Rejection, Serial, Transport, ZoneDescription, DNS_CHANNEL,
-    DNS_MAGIC, DNS_VERSION, MAX_IMAGE_CHUNK, MAX_MESSAGE, MAX_REPLY_BODY, MAX_REQUEST_BODY,
-    MAX_UDP_MESSAGE, MIN_MESSAGE,
+    ImageChunk, PeerAddress, Rejection, Serial, Transport, DNS_CHANNEL, DNS_MAGIC, DNS_VERSION,
+    MAX_IMAGE_CHUNK, MAX_MESSAGE, MAX_REPLY_BODY, MAX_REQUEST_BODY, MAX_UDP_MESSAGE, MIN_MESSAGE,
 };
 
 const CHUNK: usize = MAX_IMAGE_CHUNK as usize;
@@ -50,7 +50,6 @@ fn forward(transport: Transport, peer: PeerAddress, len: usize) -> DnsRequest {
 fn every_request() -> Vec<DnsRequest> {
     vec![
         DnsRequest::Ping,
-        DnsRequest::DescribeZone,
         DnsRequest::FetchZoneImage { have: None },
         DnsRequest::FetchZoneImage {
             have: Some(serial(1_995_032_001)),
@@ -67,9 +66,6 @@ fn every_reply() -> Vec<DnsReply> {
         DnsReply::Pong {
             zone: FrontZone::Internal,
         },
-        DnsReply::ZoneDescription(
-            ZoneDescription::new(name("example.com"), serial(1_995_032_001)).expect("apex"),
-        ),
         DnsReply::Unchanged { serial: serial(7) },
         DnsReply::ImageChunk(ImageChunk::new(&[0x01, 0x02, 0x03], false).expect("chunk")),
         DnsReply::ImageChunk(ImageChunk::new(&vec![0xAB; CHUNK], true).expect("chunk")),
@@ -178,7 +174,6 @@ fn every_reply_round_trips() {
 #[test]
 fn the_layouts_are_the_documented_ones() {
     assert_eq!(request_body(&DnsRequest::Ping), raw_body(0x01, &[]));
-    assert_eq!(request_body(&DnsRequest::DescribeZone), raw_body(0x02, &[]));
     assert_eq!(
         request_body(&DnsRequest::FetchZoneImage { have: None }),
         raw_body(0x03, &[0x00])
@@ -254,7 +249,7 @@ fn the_envelope_is_strict() {
         );
     }
 
-    let mut trailing = request_body(&DnsRequest::DescribeZone);
+    let mut trailing = request_body(&DnsRequest::Ping);
     trailing.push(0);
     assert_eq!(decode_request_body(&trailing), Err(Error::TrailingBytes));
     assert_eq!(
@@ -423,7 +418,7 @@ fn the_forwarded_octets_are_untouched() {
     assert!(!printed.contains("165"), "{printed}");
 }
 
-// ---- SERIAL, zone, apex ------------------------------------------------------
+// ---- SERIAL, zone ------------------------------------------------------------
 
 /// RFC 2136 §7.11: a zero SERIAL has no representation — not in `have`, not
 /// in any reply.
@@ -442,13 +437,6 @@ fn a_zero_serial_is_refused_everywhere() {
 
     let forwarded = raw_body(reply_kind::FORWARDED, &[0x00, 0, 0, 0, 0]);
     assert_eq!(decode_reply_body(&forwarded), Err(Error::UnknownCode));
-
-    let mut description = raw_body(reply_kind::ZONE_DESCRIPTION, &[]);
-    let apex = name("example.com");
-    description.extend_from_slice(&(apex.as_wire().len() as u32).to_be_bytes());
-    description.extend_from_slice(apex.as_wire());
-    description.extend_from_slice(&[0, 0, 0, 0]);
-    assert_eq!(decode_reply_body(&description), Err(Error::UnknownCode));
 }
 
 /// docs/50 §3.3: the option marker of `have` is `00` or `01` only.
@@ -477,60 +465,64 @@ fn the_pong_zone_is_closed() {
     assert_eq!(FrontZone::Internal.code(), codes::ZONE_INTERNAL);
 }
 
-/// RFC 1035 §2.3.1, §3.1, §4.1.4; docs/54 §3.1: the apex is one
-/// uncompressed name, not the root, every label LDH — on construction and
-/// on the wire.
-#[test]
-fn the_apex_is_strict() {
-    assert!(ZoneDescription::new(Name::root(), serial(1)).is_none());
-    assert!(ZoneDescription::new(name("_tcp.example.com"), serial(1)).is_none());
-    assert!(ZoneDescription::new(name("*.example.com"), serial(1)).is_none());
-    assert!(ZoneDescription::new(name("example.com"), serial(1)).is_some());
+// ---- retired kinds (A-152) --------------------------------------------------
 
-    let description = |apex_field: &[u8]| {
-        let mut body = raw_body(reply_kind::ZONE_DESCRIPTION, &[]);
-        body.extend_from_slice(&(apex_field.len() as u32).to_be_bytes());
-        body.extend_from_slice(apex_field);
-        body.extend_from_slice(&1u32.to_be_bytes());
-        body
-    };
-    // Valid.
-    assert!(decode_reply_body(&description(b"\x07example\x03com\x00")).is_ok());
-    // The root.
+/// A-152 / docs/questions/Q-922: `DescribeZone` (`0x02`) and its reply
+/// `ZoneDescription` (`0x82`) are retired — not in the closed tables, so a
+/// frame of either is refused like any unknown kind, whatever its payload
+/// (the former layouts: no payload; an apex and a SERIAL): dird closes
+/// without a reply (docs/50 §3.3), dnsd refuses the reply. The other kinds
+/// kept their numbers.
+#[test]
+fn the_retired_describe_zone_kinds_are_unknown() {
+    assert_eq!(request_kind::RETIRED, &[0x02]);
+    assert_eq!(reply_kind::RETIRED, &[0x82]);
     assert_eq!(
-        decode_reply_body(&description(b"\x00")),
-        Err(Error::UnknownCode)
+        request_kind::ALL,
+        &[
+            request_kind::PING,
+            request_kind::FETCH_ZONE_IMAGE,
+            request_kind::FORWARD
+        ]
     );
-    // A compression pointer (no message to point into).
     assert_eq!(
-        decode_reply_body(&description(b"\x07example\xc0\x00")),
-        Err(Error::UnknownCode)
+        (
+            request_kind::PING,
+            request_kind::FETCH_ZONE_IMAGE,
+            request_kind::FORWARD
+        ),
+        (0x01, 0x03, 0x04)
     );
-    // Octets after the root label.
     assert_eq!(
-        decode_reply_body(&description(b"\x07example\x03com\x00\x00")),
-        Err(Error::UnknownCode)
+        (
+            reply_kind::PONG,
+            reply_kind::UNCHANGED,
+            reply_kind::IMAGE_CHUNK,
+            reply_kind::FORWARDED
+        ),
+        (0x81, 0x83, 0x84, 0x85)
     );
-    // No terminating root label.
-    assert_eq!(
-        decode_reply_body(&description(b"\x07example\x03com")),
-        Err(Error::UnknownCode)
-    );
-    // A reserved label type (RFC 1035 §4.1.4: "10 and 01 combinations").
-    assert_eq!(
-        decode_reply_body(&description(b"\x47example\x00")),
-        Err(Error::UnknownCode)
-    );
-    // A non-LDH label.
-    assert_eq!(
-        decode_reply_body(&description(b"\x04_tcp\x07example\x00")),
-        Err(Error::UnknownCode)
-    );
-    // Over 255 octets: the field bound.
-    assert_eq!(
-        decode_reply_body(&description(&[0x01; 256])),
-        Err(Error::LengthOverBound)
-    );
+    for kind in request_kind::RETIRED {
+        assert!(!request_kind::ALL.contains(kind), "{kind:#x}");
+        let body = raw_body(*kind, &[]);
+        assert_eq!(decode_request_body(&body), Err(Error::UnknownKind));
+        assert_eq!(decode_request(&body), Err(Rejection::Close));
+    }
+    // The former `ZoneDescription` layout: apex `example.com`, SERIAL 1.
+    let mut payload = 13u32.to_be_bytes().to_vec();
+    payload.extend_from_slice(b"\x07example\x03com\x00");
+    payload.extend_from_slice(&1u32.to_be_bytes());
+    for kind in reply_kind::RETIRED {
+        assert!(!reply_kind::ALL.contains(kind), "{kind:#x}");
+        assert_eq!(
+            decode_reply_body(&raw_body(*kind, &payload)),
+            Err(Error::UnknownKind)
+        );
+        assert_eq!(
+            decode_reply_body(&raw_body(*kind, &[])),
+            Err(Error::UnknownKind)
+        );
+    }
 }
 
 // ---- image chunks ------------------------------------------------------------

@@ -54,7 +54,7 @@
 //! | [`audit`] | the event buffer and the A-57 gate (the kdc gates) |
 //! | `audit_client` | the kdc's expectation of auditd for the one ipc-audit client (R50-17; task R9b) |
 //! | `udp` / `tcp` | the listeners (RFC 4120 §7.2.1 / §7.2.2) |
-//! | [`rate`] | UDP per-source / global limits; the PDP's RateLimit obligation |
+//! | [`rate`] | UDP per-source / global limits (the limiter: crate rate-limit, task DN3); the PDP's RateLimit obligation |
 //! | [`zones`] | source address → `Peer.src_net` (docs/50 §4.1) |
 //! | [`clock`] | the kdc's own clock |
 //! | `daemon` | [`serve`], [`DaemonControl`], [`DaemonParams`], [`Listeners`] |
@@ -120,6 +120,10 @@
 //! ([`kdc_event`], module `audit_convert`) since task IB1 moved it out of an
 //! optional feature of crate ipc-audit (class C40; docs/questions/Q-851,
 //! decision A-144).
+//!
+//! The UDP admission check (`rate::SourceLimiter`) moved, unchanged, to the
+//! shared crate rate-limit in task DN3, so that dnsd uses the same mechanism
+//! instead of a second copy (docs/54 §6.7, §10; docs/questions/Q-930).
 //!
 //! Spec: docs/50 §10 (P9), R50-2, R50-3, R50-8, R50-9, R50-14, R50-16,
 //! R50-17; RFC 4120 §7.2; A-56; A-57; A-58; A-68; Decision: A-144; Q-851

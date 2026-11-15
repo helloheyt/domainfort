@@ -3,6 +3,13 @@
 //! PDP's `RateLimit` obligation (docs/11 §8; docs/50 §4.1 "obligations — the
 //! daemon's `RateLimiter` implements the PDP's `RlKey`").
 //!
+//! The UDP admission check itself — [`SourceLimiter`] and its
+//! [`SourceLimits`] — lives in the shared crate rate-limit since task DN3,
+//! moved there unchanged so that dnsd uses the same mechanism instead of a
+//! second copy (docs/54 §6.7, §10; the C14 pattern, docs/52 §3.14). It is
+//! re-exported here; this module keeps the daemon's own numbers
+//! ([`UDP_LIMITS`]) and the obligation limiter.
+//!
 //! docs/50 names these limits without a number, so they are constants in
 //! the daemon (Q-230 item 4 → A-60), listed in docs/questions/Q-275 item 5.
 //! Both use fixed windows: a counter per key that starts again at every new
@@ -11,16 +18,17 @@
 //!
 //! Spec: docs/50 R50-9, §4.1; docs/02 §2 (CLDAP: "rate limiting per source,
 //! listening on internal interfaces only"); docs/07 §1; docs/11 §2, §8;
-//! docs/questions/Q-223 (A-57), Q-230 item 4 (A-60).
+//! docs/questions/Q-223 (A-57), Q-230 item 4 (A-60); docs/54 §6.7 (DN3).
 
-use core::net::IpAddr;
 use core::time::Duration;
 use kdc::RateLimiter;
 use krb_proto::KerberosTime;
 use pdp::RlKey;
 use std::collections::HashMap;
-use std::sync::Mutex;
-use std::time::Instant;
+
+/// The UDP admission check and its limits (crate rate-limit, task DN3).
+/// Spec: docs/50 §4.1; docs/questions/Q-223 (A-57); docs/54 §6.7.
+pub use rate_limit::{SourceLimiter, SourceLimits};
 
 /// UDP datagrams admitted per source address per second. Project choice
 /// (docs/50 §4.1 names "a rate limiter per source" with no number): a
@@ -35,89 +43,16 @@ pub const UDP_GLOBAL_PER_SECOND: u32 = 2048;
 /// The UDP window. Project choice.
 pub const UDP_WINDOW: Duration = Duration::from_secs(1);
 
-/// The UDP limits.
-/// Spec: docs/50 §4.1; docs/questions/Q-223 (A-57).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UdpLimits {
-    /// Datagrams per source address per window.
-    pub per_source: u32,
-    /// Datagrams from all sources per window.
-    pub global: u32,
-    /// The window.
-    pub window: Duration,
-}
-
-impl UdpLimits {
-    /// The daemon's constants.
-    pub const DEFAULT: UdpLimits = UdpLimits {
-        per_source: UDP_PER_SOURCE_PER_SECOND,
-        global: UDP_GLOBAL_PER_SECOND,
-        window: UDP_WINDOW,
-    };
-}
-
-#[derive(Debug)]
-struct SourceWindow {
-    started: Instant,
-    total: u32,
-    per_source: HashMap<IpAddr, u32>,
-}
-
-/// The UDP admission check, shared by every UDP socket of the daemon.
-///
-/// A datagram is admitted when its source has had fewer than `per_source`
-/// datagrams admitted in the current window and all sources fewer than
-/// `global`. Only admitted datagrams create entries, so the table never
-/// holds more than `global` sources (bounded, AGENTS.md §6). The source
-/// address of a UDP datagram can be forged (tokio `UdpSocket::recv_from`:
-/// "should not be trusted"), so the per-source limit is a weak defence
-/// alone (docs/50 §4.1); the global budget and the internal-only binding
-/// carry the rest (Q-223 option (a)).
-///
-/// Spec: docs/50 §4.1; docs/questions/Q-223 (A-57).
-#[derive(Debug)]
-pub struct SourceLimiter {
-    limits: UdpLimits,
-    state: Mutex<SourceWindow>,
-}
-
-impl SourceLimiter {
-    /// A limiter with `limits`, its first window starting `now`.
-    #[must_use]
-    pub fn new(limits: UdpLimits, now: Instant) -> SourceLimiter {
-        SourceLimiter {
-            limits,
-            state: Mutex::new(SourceWindow {
-                started: now,
-                total: 0,
-                per_source: HashMap::new(),
-            }),
-        }
-    }
-
-    /// Admit one datagram from `source` at `now`, or refuse it (drop).
-    /// Spec: docs/50 §4.1; docs/questions/Q-223 (A-57).
-    pub fn admit(&self, source: IpAddr, now: Instant) -> bool {
-        let Ok(mut state) = self.state.lock() else {
-            return false;
-        };
-        if now.saturating_duration_since(state.started) >= self.limits.window {
-            state.started = now;
-            state.total = 0;
-            state.per_source.clear();
-        }
-        if state.total >= self.limits.global {
-            return false;
-        }
-        let count = state.per_source.entry(source).or_insert(0);
-        if *count >= self.limits.per_source {
-            return false;
-        }
-        *count = count.saturating_add(1);
-        state.total = state.total.saturating_add(1);
-        true
-    }
-}
+/// The daemon's UDP limits — the production value of the UDP limits
+/// (`ServeParams::udp`), shared by every UDP socket of the daemon through
+/// one [`SourceLimiter`]. (Before task DN3: `UdpLimits::DEFAULT`, the same
+/// three constants.)
+/// Spec: docs/50 §4.1; docs/questions/Q-223 (A-57), Q-275 item 5 (A-60).
+pub const UDP_LIMITS: SourceLimits = SourceLimits {
+    per_source: UDP_PER_SOURCE_PER_SECOND,
+    global: UDP_GLOBAL_PER_SECOND,
+    window: UDP_WINDOW,
+};
 
 /// Requests one `RlKey` may make per window. Project choice (docs/11 §8
 /// gives the obligation, not its numbers).
@@ -175,39 +110,29 @@ impl RateLimiter for ObligationLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::net::Ipv4Addr;
 
     /// S-1-5-21-7-8-9-`rid` ([MS-DTYP] 2.4.2.4 layout; hand-made).
     fn sid(rid: u32) -> pdp::PrincipalId {
         dtyp::Sid::new(dtyp::SECURITY_NT_AUTHORITY, &[21, 7, 8, 9, rid]).unwrap()
     }
 
-    fn ip(last: u8) -> IpAddr {
-        IpAddr::V4(Ipv4Addr::new(10, 0, 0, last))
-    }
+    // The limiter's own test (`udp_per_source_and_global_limits`) moved with
+    // it to crates/rate-limit (task DN3).
 
-    /// docs/50 §4.1 (a limiter per source + a global reply budget; Q-223
-    /// option (a)): a source past its share is dropped while others go on;
-    /// all sources together stop at the global budget; a new window starts
-    /// again.
+    /// docs/questions/Q-275 item 5 (A-60): the daemon's UDP limits are 32
+    /// datagrams per source and 2048 in all per one-second window — the same
+    /// numbers before and after the limiter moved to crate rate-limit (DN3:
+    /// "no behaviour change in kdc").
     #[test]
-    fn udp_per_source_and_global_limits() {
-        let start = Instant::now();
-        let limits = UdpLimits {
-            per_source: 3,
-            global: 5,
-            window: Duration::from_secs(1),
-        };
-        let limiter = SourceLimiter::new(limits, start);
-        for _ in 0..3 {
-            assert!(limiter.admit(ip(1), start));
-        }
-        assert!(!limiter.admit(ip(1), start), "per-source share used");
-        assert!(limiter.admit(ip(2), start));
-        assert!(limiter.admit(ip(3), start));
-        assert!(!limiter.admit(ip(4), start), "global budget used");
-        let later = start + Duration::from_secs(1);
-        assert!(limiter.admit(ip(1), later), "a new window");
+    fn the_udp_limits_are_the_daemons_constants() {
+        assert_eq!(
+            UDP_LIMITS,
+            SourceLimits {
+                per_source: 32,
+                global: 2048,
+                window: Duration::from_secs(1),
+            }
+        );
     }
 
     /// docs/11 §8: each key gets its share per window; another key is

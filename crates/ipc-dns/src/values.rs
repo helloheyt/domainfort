@@ -10,8 +10,7 @@ use crate::channel::{codes, MAX_MESSAGE, MIN_MESSAGE};
 use core::fmt;
 use core::net::IpAddr;
 use core::num::NonZeroU32;
-use dns_zone::is_ldh_label;
-use parse_dns::{Name, Transport};
+use parse_dns::Transport;
 use zeroize::Zeroizing;
 
 /// A zone SERIAL as the channel carries it: never zero.
@@ -262,51 +261,4 @@ pub struct Forwarded {
     pub reply: Option<DnsMessage>,
     /// The zone's SERIAL after dird processed the message.
     pub serial: Serial,
-}
-
-/// `ZoneDescription`: the zone's apex and current SERIAL. The apex obeys the
-/// rules `ZoneImage::new` applies to it — not the root, every label an RFC
-/// 1035 §2.3.1 LDH label — so a description dnsd accepts never names a zone
-/// no image could have.
-///
-/// Spec: docs/54 §4.6 (`DescribeZone` → `apex`, `serial`), §3.1, §5.3; RFC
-/// 1035 §2.3.1, §3.1; dns-zone `ZoneImageError::{ApexIsRoot,
-/// ApexLabelNotLdh}`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ZoneDescription {
-    apex: Name,
-    serial: Serial,
-}
-
-impl ZoneDescription {
-    /// The description of the zone `apex` at `serial`, or `None` if the apex
-    /// is the root or has a label that is not an LDH label.
-    /// Spec: type documentation.
-    #[must_use]
-    pub fn new(apex: Name, serial: Serial) -> Option<ZoneDescription> {
-        if !is_valid_apex(&apex) {
-            return None;
-        }
-        Some(ZoneDescription { apex, serial })
-    }
-
-    /// The apex.
-    #[must_use]
-    pub fn apex(&self) -> &Name {
-        &self.apex
-    }
-
-    /// The SERIAL.
-    #[must_use]
-    pub fn serial(&self) -> Serial {
-        self.serial
-    }
-}
-
-/// Whether `apex` is a zone apex `ZoneImage::new` admits: not the root, every
-/// label LDH.
-/// Spec: RFC 1035 §2.3.1; docs/54 §3.1 (the zone is the NC's DNS name,
-/// A-53); dns-zone image.rs.
-fn is_valid_apex(apex: &Name) -> bool {
-    !apex.is_root() && apex.labels().all(is_ldh_label)
 }

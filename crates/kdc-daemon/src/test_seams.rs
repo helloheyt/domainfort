@@ -10,7 +10,7 @@
 //!
 //! | seam | what it varies | production value (`crate::serve`) |
 //! |---|---|---|
-//! | [`DaemonParams::udp`] | the UDP limits (docs/questions/Q-223) | `UdpLimits::DEFAULT` |
+//! | [`DaemonParams::udp`] | the UDP limits (docs/questions/Q-223) | `rate::UDP_LIMITS` (crate rate-limit's `SourceLimits`, task DN3) |
 //! | [`DaemonParams::as_queue_capacity`], [`DaemonParams::tgs_queue_capacity`] | the request queues (R50-9) | `AS_QUEUE_CAPACITY`, `TGS_QUEUE_CAPACITY` |
 //! | [`DaemonParams::window`] | the audit window (A-57) | `WindowConfig::DEFAULT` |
 //! | [`DaemonParams::udp_max_reply_len`] | the UDP reply bound (RFC 4120 §7.2.1) | `kdc::DEFAULT_UDP_MAX_REPLY_LEN` |

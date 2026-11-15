@@ -10,8 +10,10 @@
 //! SERVFAIL), §6.6; A-114 (one dnsd, internal only); A-140 / docs/research/
 //! r3-c-dns.md §4.1 (`Forward { transport, peer, message }`,
 //! `Forwarded.reply: Option`); docs/50 R50-3 (uid 0 never mapped), §3.3 (the
-//! disposition table); A-59; RFC 2782 "Fictional example" (the zone). Every
-//! value is hand-made or from those sources.
+//! disposition table); A-59; A-152 / docs/questions/Q-922 (`DescribeZone`
+//! retired: kind `0x02` is an unknown kind; dnsd starts with `Ping` +
+//! `FetchZoneImage { have: None }`); RFC 2782 "Fictional example" (the
+//! zone). Every value is hand-made or from those sources.
 
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use ipc::{decode_reply, Refused, Reply};
@@ -19,8 +21,8 @@ use ipc_dns::{
     Connection, Connector, DnsClient, DnsMessage, DnsReply, DnsRequest, ExpectedDird,
     ForwardRequest, Forwarded, FrontZone, HostRecordParts, ImageAssembly, ImageFetch,
     ImageTransfer, KpasswdService, Name, PeerAddress, Serial, SoaParameters, Transport,
-    TransportError, Unserved as ClientUnserved, ZoneDescription, ZoneImage, ZoneImageParts,
-    DEFAULT_DEADLINE, DNS_CHANNEL, DNS_MAGIC, DNS_VERSION,
+    TransportError, Unserved as ClientUnserved, ZoneImage, ZoneImageParts, DEFAULT_DEADLINE,
+    DNS_CHANNEL, DNS_MAGIC, DNS_VERSION,
 };
 use ipc_dns_server::{Dispatch, DnsConnection, DnsFronts, ImageAnswer, Unserved, ZoneHost};
 use std::cell::RefCell;
@@ -132,7 +134,6 @@ fn replies(dispatch: &Dispatch) -> Vec<Reply<DnsReply>> {
 
 /// What the test host answers and what it was asked.
 struct TestHost {
-    description: Result<ZoneDescription, Unserved>,
     current: ImageTransfer,
     /// When set, `zone_image` answers this regardless of the request.
     image_override: Option<Result<ImageAnswer, Unserved>>,
@@ -145,7 +146,6 @@ struct TestHost {
 impl TestHost {
     fn new(extra: u32) -> TestHost {
         TestHost {
-            description: Ok(ZoneDescription::new(name("example.com"), serial(SERIAL)).unwrap()),
             current: ImageTransfer::new(&parts(extra)).expect("valid"),
             image_override: None,
             forward_answer: Ok(Forwarded {
@@ -160,11 +160,6 @@ impl TestHost {
 }
 
 impl ZoneHost for TestHost {
-    fn describe_zone(&mut self) -> Result<ZoneDescription, Unserved> {
-        self.calls += 1;
-        self.description.clone()
-    }
-
     fn zone_image(&mut self, have: Option<Serial>) -> Result<ImageAnswer, Unserved> {
         self.calls += 1;
         self.image_requests.push(have);
@@ -229,22 +224,7 @@ fn ping_names_the_connections_zone() {
     assert_eq!(host.calls, 0);
 }
 
-// ---- DescribeZone ----------------------------------------------------------------
-
-/// docs/54 §4.6: `DescribeZone` → the host's description.
-#[test]
-fn describe_zone_answers_the_hosts_description() {
-    let mut connection = connection();
-    let mut host = TestHost::new(0);
-    let dispatch = connection.handle(&request_body(&DnsRequest::DescribeZone), &mut host);
-    assert!(!dispatch.closes());
-    assert_eq!(
-        replies(&dispatch),
-        vec![Reply::Message(DnsReply::ZoneDescription(
-            host.description.clone().unwrap()
-        ))]
-    );
-}
+// ---- host refusals ----------------------------------------------------------------
 
 /// docs/54 §4.6 ("queue full ⇒ `Busy` ⇒ dnsd answers SERVFAIL"); docs/50
 /// §3.7: a host refusal is the shared refusal, then close — and a closed
@@ -257,8 +237,11 @@ fn host_refusals_close_the_connection() {
     ] {
         let mut connection = connection();
         let mut host = TestHost::new(0);
-        host.description = Err(unserved);
-        let dispatch = connection.handle(&request_body(&DnsRequest::DescribeZone), &mut host);
+        host.image_override = Some(Err(unserved));
+        let dispatch = connection.handle(
+            &request_body(&DnsRequest::FetchZoneImage { have: None }),
+            &mut host,
+        );
         assert!(dispatch.closes());
         assert_eq!(replies(&dispatch), vec![Reply::Refused(refused)]);
         assert!(connection.is_closed());
@@ -452,6 +435,30 @@ fn malformed_requests_never_reach_the_host() {
     }
 }
 
+/// A-152 / docs/questions/Q-922: the retired `DescribeZone` (`0x02`) is an
+/// unknown kind — dird closes without a reply and the host is not asked,
+/// with or without a payload; and the connection answers nothing after.
+#[test]
+fn the_retired_describe_zone_never_reaches_the_host() {
+    let envelope = [
+        DNS_MAGIC.to_be_bytes()[0],
+        DNS_MAGIC.to_be_bytes()[1],
+        DNS_VERSION,
+        0x02,
+    ];
+    for body in [envelope.to_vec(), [&envelope[..], &[0x00][..]].concat()] {
+        let mut connection = connection();
+        let mut host = TestHost::new(0);
+        let dispatch = connection.handle(&body, &mut host);
+        assert!(matches!(dispatch, Dispatch::Close));
+        assert!(dispatch.frames().is_empty());
+        assert_eq!(host.calls, 0);
+        assert!(connection.is_closed());
+        let after = connection.handle(&request_body(&DnsRequest::Ping), &mut host);
+        assert!(matches!(after, Dispatch::Close));
+    }
+}
+
 // ---- end to end: dnsd's client against this dispatcher ---------------------------------
 
 /// An in-process connection whose far end is a `DnsConnection` with a host.
@@ -519,10 +526,11 @@ impl Connector for LoopbackConnector {
     }
 }
 
-/// docs/54 §4.8 (dnsd's start: `Ping` + `DescribeZone`, then
-/// `FetchZoneImage`), §4.4 (refresh by SERIAL), §4.5 / A-140 (`Forward`):
-/// dnsd's client gets exactly what dird's host answered, over the
-/// dispatcher, and a host refusal reaches it as the shared refusal.
+/// docs/54 §4.8 (dnsd's start — since A-152 / Q-922 `Ping` +
+/// `FetchZoneImage { have: None }`, whose image carries the apex and the
+/// SERIAL), §4.4 (refresh by SERIAL), §4.5 / A-140 (`Forward`): dnsd's
+/// client gets exactly what dird's host answered, over the dispatcher, and
+/// a host refusal reaches it as the shared refusal.
 #[test]
 fn dnsd_and_dird_agree_end_to_end() {
     let host = Rc::new(RefCell::new(TestHost::new(12_000)));
@@ -534,12 +542,11 @@ fn dnsd_and_dird_agree_end_to_end() {
     let mut client = DnsClient::new(connector, expected, DEFAULT_DEADLINE);
 
     client.ping().expect("ping");
-    let description = client.describe_zone().expect("describe");
-    assert_eq!(description.serial(), serial(SERIAL));
-
     let ImageFetch::Image(image) = client.fetch_zone_image(None).expect("image") else {
         panic!("expected an image");
     };
+    assert_eq!(image.apex(), &name("example.com"));
+    assert_eq!(image.serial(), SERIAL);
     assert_eq!(*image, ZoneImage::new(parts(12_000)).expect("valid"));
     assert_eq!(
         client.fetch_zone_image(Some(serial(SERIAL))),

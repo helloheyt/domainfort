@@ -6,7 +6,8 @@
 //! Sources: docs/54 §4.4 (the image's fields; atomic replacement), §4.6
 //! (`FetchZoneImage`: chunks ≤ 1 MiB, total ≤ 8 MiB); A-124 (`ZoneImage::new`
 //! validates every part); docs/50 §3.3 (one encoding per value, no trailing
-//! octet, round trip); RFC 1035 §2.3.4, §3.1 (label / name bounds), §3.4.1
+//! octet, round trip); RFC 1035 §2.3.1, §2.3.4, §3.1, §4.1.4 (label / name
+//! bounds, one uncompressed name), §3.4.1
 //! (32-bit address); RFC 2136 §3.7 (no partial view), §7.11 (SERIAL ≠ 0);
 //! RFC 2782 "Fictional example" (the zone of the fixtures).
 
@@ -278,6 +279,69 @@ fn every_image_field_is_bounded() {
     let payload = encode_image(&rfc2782_parts()).expect("encodes");
     for cut in 0..payload.len() {
         assert!(decode_image(&payload[..cut]).is_err(), "cut {cut}");
+    }
+}
+
+/// RFC 1035 §2.3.1, §2.3.4, §3.1, §4.1.4; docs/54 §3.1, §4.4: a name field
+/// of the image (here the apex) is exactly one uncompressed name — a
+/// pointer, octets after the root label, a missing root label, a reserved
+/// label type or more than 255 octets has no decoding — and an apex that is
+/// the root or has a non-LDH label decodes but is not a zone (dnsd's
+/// assembly refuses it through `ZoneImage::new`). (These field rules were
+/// shown on `ZoneDescription`'s apex until A-152 retired it —
+/// docs/questions/Q-922; the field itself stays on the wire in the image.)
+#[test]
+fn the_name_fields_keep_their_rules() {
+    let good = encode_image(&rfc2782_parts()).expect("encodes");
+    let apex_wire = name("example.com").as_wire().len();
+    let rest = &good[4 + apex_wire..];
+    let with_apex = |field: &[u8]| {
+        let mut payload = (field.len() as u32).to_be_bytes().to_vec();
+        payload.extend_from_slice(field);
+        payload.extend_from_slice(rest);
+        payload
+    };
+    // The field as encoded.
+    assert_eq!(with_apex(b"\x07example\x03com\x00"), good);
+    // A compression pointer (no message to point into).
+    assert_eq!(
+        decode_image(&with_apex(b"\x07example\xc0\x00")),
+        Err(Error::UnknownCode)
+    );
+    // Octets after the root label.
+    assert_eq!(
+        decode_image(&with_apex(b"\x07example\x03com\x00\x00")),
+        Err(Error::UnknownCode)
+    );
+    // No terminating root label.
+    assert_eq!(
+        decode_image(&with_apex(b"\x07example\x03com")),
+        Err(Error::UnknownCode)
+    );
+    // A reserved label type (RFC 1035 §4.1.4: "10 and 01 combinations").
+    assert_eq!(
+        decode_image(&with_apex(b"\x47example\x00")),
+        Err(Error::UnknownCode)
+    );
+    // Over 255 octets: the field bound.
+    assert_eq!(
+        decode_image(&with_apex(&[0x01; 256])),
+        Err(Error::LengthOverBound)
+    );
+    // The root, and a non-LDH label: wire-valid names, not a zone apex.
+    for (field, error) in [
+        (&b"\x00"[..], ZoneImageError::ApexIsRoot),
+        (
+            &b"\x04_tcp\x07example\x00"[..],
+            ZoneImageError::ApexLabelNotLdh,
+        ),
+    ] {
+        let payload = with_apex(field);
+        assert!(decode_image(&payload).is_ok());
+        assert_eq!(
+            assemble(&split_image(&payload).expect("splits")),
+            Err(ImageError::Zone(error))
+        );
     }
 }
 
