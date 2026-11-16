@@ -46,12 +46,11 @@
 #[path = "../../../directory-pip/tests/common/namespace.rs"]
 mod namespace;
 
-/// The shared test signer of name resolutions (task PN10): the bound
-/// session's re-check reads the account through the view's account source,
-/// whose records carry dird's attested resolution — so the context carries a
-/// signer, as dird's do (docs/59 §7.4, §7.5).
-#[path = "../../../directory-pip/tests/common/signer.rs"]
-mod signer;
+// No name-resolution signer (task PN10b; docs/59 §6.2, §6.4; docs/
+// questions/Q-1047, A-187): the bound session's re-check reads the account
+// through the view's ticket-subject lookup, which attests nothing — so the
+// context carries no signer, as dird's LDAP context carries none, and the
+// bound-session searches below show the re-check works without one.
 
 use std::cell::Cell;
 use std::collections::BTreeSet;
@@ -259,8 +258,7 @@ impl Dir {
             &KeydConfig::new(Realm::new(REALM).expect("realm")),
             naming_context(),
         )
-        .expect("context")
-        .with_name_resolution_signer(signer::test_signer());
+        .expect("context");
         let mut txn = store.begin_write().expect("write");
         namespace::create_namespace_marker(&mut txn);
         txn.commit().expect("commit");

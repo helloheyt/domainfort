@@ -38,12 +38,16 @@ ad-schema = { path = "../ad-schema" }
 dtyp = { path = "../dtyp" }
 # The policy decision point: decide, Subject, Action, Resource, Transport.
 pdp = { path = "../pdp" }
-# The per-request directory view (AccountSource + Pip over one snapshot),
-# the tier map, account_salt, the DSTIME mapping.
+# The per-request directory view (Pip over one snapshot), its ticket-subject
+# lookup (the requester's account through the one lookup path in the
+# `TicketClient` context, docs/51 §5.3; docs/59 §6.2), the KDC's account
+# state it re-exports, the tier map, account_salt, the DSTIME mapping.
+#
+# NOT crate kdc (task PN10b; docs/questions/Q-1047, A-187): this crate does
+# not link the KDC's account source, whose records carry dird's attested
+# name resolutions — so no code here can even name it on the raw view the
+# `checks` module holds (compile time).
 directory-pip = { path = "../directory-pip" }
-# The AccountSource trait the view implements (the requester's account is
-# resolved exactly as the KDC resolves an AS client, docs/51 §5.3).
-kdc = { path = "../kdc" }
 # keyd's crypto-free types: KeyHandle, KeyPurpose, PrincipalBinding (the
 # BeginPasswordSet reply), ServiceContext (the verified ticket's facts) and
 # the KerberosTime-to-seconds mapping. NOT keyd and NOT krb-crypto (D182).
@@ -93,12 +97,10 @@ config = { path = "../config" }
 sha2 = { version = "0.11", default-features = false }
 
 [dev-dependencies]
-# TESTS ONLY (task PN10; docs/59 §7.4): the fixtures' directory contexts sign the account records' name
-# resolutions with the shared test signer (crates/directory-pip
-# tests/common/signer.rs) — crate
-# name-attestation's `tag`, the signer dird uses. Our own crate; no new
-# package.
-name-attestation = { path = "../name-attestation" }
+# (Task PN10b: no name-attestation — the fixtures' directory contexts carry
+# no signer, as dird's admin, kpasswd and DNS contexts carry none; docs/
+# questions/Q-1047, A-187.)
+#
 # TESTS ONLY (docs/52 C18, task R15; A-113): the tests open their stores by
 # path (`Store::open`, feature `test-seams`).
 dirstore = { path = "../dirstore", features = ["test-seams"] }

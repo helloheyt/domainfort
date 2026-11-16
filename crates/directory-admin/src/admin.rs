@@ -632,7 +632,7 @@ pub(crate) fn subject_of_facts(
     cname: &PrincipalName,
     authtime: &KerberosTime,
 ) -> Result<AdminSubject, SubjectError> {
-    AdminSubject::from_verified_ticket(cx.pep.accounts(), crealm, cname, authtime, &cx.now)
+    AdminSubject::from_verified_ticket(cx.pep.subjects(), crealm, cname, authtime, &cx.now)
 }
 
 /// The per-request part every operation handler reads.

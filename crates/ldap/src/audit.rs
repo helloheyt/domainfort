@@ -256,8 +256,10 @@ pub enum AuditReason {
     /// (`revoked_before`), or now names another SID. Spec: docs/49 §4.4
     /// (R49-15), §3.2; RFC 4120 3.3.3.1 (hot-list); RFC 4511 §6.
     IdentityRevoked,
-    /// The account source could not answer the re-check (fail closed).
-    /// Spec: docs/49 §4.4; AGENTS.md §6.
+    /// The directory could not answer the re-check (fail closed) — since
+    /// task PN10b through the ticket-subject lookup, not the KDC's account
+    /// source; the reason keeps its name (audit vocabulary, crate
+    /// ipc-audit). Spec: docs/49 §4.4; AGENTS.md §6.
     AccountSourceFailure,
 
     // ---- controls ----------------------------------------------------------

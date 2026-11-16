@@ -13,8 +13,8 @@ mod common;
 
 use common::*;
 use directory_admin::{CreateGroup, Membership, Operation, RefusalStatus, Reply};
+use directory_pip::TicketSubjects;
 use ipc_audit::{AdminRefusal, DecisionResult, DirAdminStage};
-use kdc::AccountSource;
 
 fn refusal_code(r: &directory_admin::Refusal) -> AdminRefusal {
     match r.event().stage {
@@ -46,10 +46,14 @@ fn add(group: dtyp::Guid, member: dtyp::Guid) -> Operation {
     Operation::AddMember(Membership { group, member })
 }
 
-/// Whether the account source (directory-pip's closure) still resolves the
-/// account — i.e. it can still log in.
+/// Whether directory-pip's ticket-subject lookup (its closure — the one
+/// expansion the KDC's account records carry too, R47-8) still resolves the
+/// account — i.e. it can still be a Subject (task PN10b: no account source,
+/// no signer).
 fn resolves(d: &Domain, sam: &str) -> bool {
-    d.view().client(&realm(), &ticket(sam).cname).is_ok()
+    d.view()
+        .ticket_subject(&realm(), &ticket(sam).cname)
+        .is_ok()
 }
 
 /// alice ∈ g1 ∈ g2 ∈ … ∈ g`n`, built link by link through the admin plane:
@@ -71,7 +75,7 @@ fn a_chain_of_sixteen_levels_is_allowed() {
     let groups = chain_above_alice(&mut d, 16);
     let alice = d
         .view()
-        .client(&realm(), &ticket("alice").cname)
+        .ticket_subject(&realm(), &ticket("alice").cname)
         .unwrap()
         .unwrap();
     let top = account_sid(FIRST_ADMIN_RID + 15);

@@ -20,8 +20,15 @@
 //! Failed`), since a record without dird's statement is not one keyd will
 //! ever honour (docs/questions/Q-1046 item 2).
 //!
+//! The account source is the **KDC channel's** alone (task PN10b; docs/
+//! questions/Q-1047, A-187): the subject checks of the admin plane,
+//! kpasswd, the DNS update and the LDAP session read the ticket-subject
+//! lookup (crate::subject — no resolution), so only the KDC channel's
+//! context needs the signer. The signer field and the one function that
+//! uses it (`DirectoryView::attested`) are private to this module.
+//!
 //! Spec: docs/47 §1-§8 (R47-1..R47-11); docs/11 §6; docs/59 §6, §7.1, §7.5;
-//! kdc `accounts.rs`; pdp `pip.rs`.
+//! docs/questions/Q-1047 (A-187); kdc `accounts.rs`; pdp `pip.rs`.
 
 use crate::error::{Fault, ViewError};
 use crate::groups;
@@ -98,8 +105,11 @@ pub struct DirectoryContext {
     /// and clock — crates/ipc-directory-server `ResolutionSigner`), which
     /// the account records carry for keyd. Absent until installed
     /// ([`DirectoryContext::with_name_resolution_signer`]); without it the
-    /// account source answers no record (fail closed).
-    /// Spec: docs/59 §7.1, §7.4, §7.5; docs/questions/Q-1011 item 2 (A-173).
+    /// account source answers no record (fail closed). Private to this
+    /// module: only `DirectoryView::attested` reads it — the ticket-subject
+    /// lookup (crate::subject) cannot name it (task PN10b).
+    /// Spec: docs/59 §7.1, §7.4, §7.5; docs/questions/Q-1011 item 2 (A-173),
+    /// Q-1047 (A-187).
     signer: Option<Arc<dyn NameResolutionSigner>>,
 }
 
@@ -184,12 +194,14 @@ impl DirectoryContext {
     /// This context with `signer` as the attestation of the resolutions its
     /// account records carry (task PN10): dird installs its
     /// `ResolutionSigner` — its attestation key and its clock (crates/
-    /// ipc-directory-server) — on every context it builds. Without one,
+    /// ipc-directory-server) — on the KDC channel's context only (task
+    /// PN10b; crates/directory-daemon `kdc_channel_context`). Without one,
     /// [`AccountSource::client`] / [`AccountSource::service`] answer
     /// `AccountSourceError::Failed` (fail closed); every other question of
-    /// the view is unaffected.
+    /// the view — the ticket-subject lookup of the subject checks
+    /// (crate::subject) included — is unaffected.
     /// Spec: docs/59 §7.1, §7.4, §7.5; docs/questions/Q-1011 item 2 (A-173),
-    /// Q-1046 item 2.
+    /// Q-1046 item 2, Q-1047 (A-187).
     #[must_use]
     pub fn with_name_resolution_signer(
         mut self,

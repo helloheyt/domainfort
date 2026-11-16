@@ -15,10 +15,15 @@
 //!    check the domain (naming-context root, domain SID, krbtgt account) —
 //!    then spawn the engine thread (R50-7). Every directory context dird
 //!    builds — the directory-view, LDAP, admin, kpasswd and DNS services'
-//!    — comes from one constructor ([`dird_context`]) that installs dird's
-//!    name-resolution signer (its attestation key and its clock — docs/59
-//!    §7.4) and the manifest's provisioned service objects (Q-1019 (a);
-//!    Q-1043), so no service can forget either.
+//!    — comes from one constructor ([`dird_context`]) that installs the
+//!    manifest's provisioned service objects (Q-1019 (a); Q-1043), so no
+//!    service can forget them. dird's name-resolution signer (its
+//!    attestation key and its clock — docs/59 §7.4) is installed on the
+//!    directory-view (KDC channel) context only ([`kdc_channel_context`];
+//!    task PN10b): the KDC channel is the one consumer of the account
+//!    source whose records carry it; the other services' subject checks
+//!    read directory-pip's ticket-subject lookup, which attests nothing
+//!    (docs/59 §6.2, §6.4; docs/questions/Q-1047, A-187).
 //! 3. **the LDAP service** (task P10) — the engine (`ldap::Engine` with the
 //!    naming context and `dns_host_name`), the PDP snapshot of the same
 //!    policy file, its own directory context and tier map, the audit gate
@@ -267,8 +272,8 @@ pub struct ServeParams {
     /// The LDAP events' sender window (A-57; `WindowConfig::DEFAULT`).
     pub audit_window: WindowConfig,
     /// The LDAP engine's clock (the system clock; tests inject one) — also
-    /// the clock dird's name-resolution signer stamps `issued_at` with (task
-    /// PN10; docs/59 §7.1).
+    /// the clock dird's name-resolution signer (on the KDC channel's context
+    /// only, task PN10b) stamps `issued_at` with (task PN10; docs/59 §7.1).
     pub clock: SharedClock,
     /// dird's name-resolution attestation key (task PN10; docs/59 §7.4).
     pub attestation_key: SharedAttestationKey,
@@ -548,52 +553,50 @@ fn bind_ldap(path: &Path) -> Result<UnixListener, DaemonError> {
 }
 
 /// What every directory context of dird carries besides the schema, keyd's
-/// configuration and the naming context: the name-resolution signer and
-/// the provisioned service objects (task PN10).
-/// Spec: docs/59 §7.4; docs/questions/Q-1019 (a), Q-1027 item 7, Q-1043.
+/// configuration and the naming context: the provisioned service objects
+/// (task PN10). **Not** the name-resolution signer (task PN10b): the admin,
+/// kpasswd, DNS and LDAP services receive these parts and never a signer.
+/// They still see `ServeParams` (and so the attestation key's handle);
+/// that only [`kdc_channel_context`] builds and installs a signer is pinned
+/// by a source scan (crates/directory-pip
+/// tests/only_the_kdc_channel_attests.rs; docs/questions/Q-1047, A-187).
+/// Spec: docs/59 §4.3, §6.2, §7.5; docs/questions/Q-1019 (a), Q-1027 item
+/// 7, Q-1043, Q-1047.
 #[derive(Clone)]
 struct ContextParts {
-    /// dird's signer — its attestation key and its clock — shared by every
-    /// context.
-    signer: Arc<ResolutionSigner>,
     /// The manifest's provisioned service objects (empty without the admin
     /// service, which is where dird reads its manifest).
     service_objects: BTreeSet<Guid>,
 }
 
 impl ContextParts {
-    /// The parts of `params` (the attestation key and the clock) and of the
-    /// admin service's manifest, when the admin service is configured: its
-    /// service objects (`admin_service::service_object_guids` — the set the
-    /// write PEP protects, one derivation). Without the manifest the set is
-    /// empty, and the one lookup path resolves no reserved name (crate
-    /// directory-pip `resolve`, step 8 — fail closed).
-    /// Spec: docs/59 §7.1, §7.4; docs/questions/Q-1019 (a), Q-1027 items 6,
-    /// 7, Q-1043, Q-1046.
-    fn new(params: &ServeParams, admin: Option<&AdminServeParams>) -> ContextParts {
-        let clock = params.clock.clone();
-        let signer = Arc::new(ResolutionSigner::new(
-            params.attestation_key.clone(),
-            Arc::new(move || clock.now()),
-        ));
+    /// The parts of the admin service's manifest, when the admin service is
+    /// configured: its service objects (`admin_service::service_object_guids`
+    /// — the set the write PEP protects, one derivation). Without the
+    /// manifest the set is empty, and the one lookup path resolves no
+    /// reserved name (crate directory-pip `resolve`, step 8 — fail closed).
+    /// Spec: docs/59 §4.3; docs/questions/Q-1019 (a), Q-1027 items 6, 7,
+    /// Q-1043, Q-1046.
+    fn new(admin: Option<&AdminServeParams>) -> ContextParts {
         let service_objects = admin
             .map(|admin| service_object_guids(&admin.manifest))
             .unwrap_or_default();
-        ContextParts {
-            signer,
-            service_objects,
-        }
+        ContextParts { service_objects }
     }
 }
 
 /// The one constructor of dird's directory contexts (module documentation,
 /// step 2): `DirectoryContext::new` over `schema`, keyd's configuration and
-/// the naming context, with dird's name-resolution signer and the
-/// provisioned service objects — so every service's account records carry
-/// dird's attested resolution (docs/59 §7.5) and every lookup re-derives
-/// the keys the checker stored (Q-1019 (a)).
-/// Spec: docs/59 §4.3, §7.4, §7.5; docs/questions/Q-1019 (a), Q-1027 item
-/// 7, Q-1043 (A-185); docs/52 C14 (one constructor).
+/// the naming context, with the provisioned service objects — so every
+/// lookup re-derives the keys the checker stored (Q-1019 (a)). **No**
+/// name-resolution signer: the admin, kpasswd, DNS and LDAP services' subject
+/// checks read directory-pip's ticket-subject lookup, which attests nothing
+/// (task PN10b; docs/59 §6.2, §6.4), and their service-object checks call the
+/// one lookup path directly (task PN10) — so their account source, never
+/// read, would answer `Failed` (fail closed). Only
+/// [`kdc_channel_context`] adds the signer.
+/// Spec: docs/59 §4.3, §6.2, §6.4; docs/questions/Q-1019 (a), Q-1027 item
+/// 7, Q-1043 (A-185), Q-1047 (A-187); docs/52 C14 (one constructor).
 fn dird_context(
     schema: ad_schema::Phase1Schema,
     params: &ServeParams,
@@ -601,9 +604,31 @@ fn dird_context(
 ) -> Result<DirectoryContext, ViewError> {
     Ok(
         DirectoryContext::new(schema, &params.keyd, params.naming_context.clone())?
-            .with_service_objects(parts.service_objects.clone())
-            .with_name_resolution_signer(parts.signer.clone()),
+            .with_service_objects(parts.service_objects.clone()),
     )
+}
+
+/// The directory-view (KDC channel) context — the only one that carries
+/// dird's name-resolution signer (task PN10b): [`dird_context`] plus a
+/// `ResolutionSigner` built here, from `params`'s attestation key and dird's
+/// clock, so every `Client` / `Service` record the KDC channel answers
+/// carries dird's attested resolution (docs/59 §7.5). The signer is built
+/// in this function and handed to no other: the KDC channel is the one
+/// consumer of the account source (docs/questions/Q-1047 item 1 — class "a
+/// component obtains a capability it does not need").
+/// Spec: docs/59 §7.1, §7.4, §7.5; docs/questions/Q-1011 item 2 (A-173),
+/// Q-1046 items 4-5, Q-1047 (A-187).
+fn kdc_channel_context(
+    schema: ad_schema::Phase1Schema,
+    params: &ServeParams,
+    parts: &ContextParts,
+) -> Result<DirectoryContext, ViewError> {
+    let clock = params.clock.clone();
+    let signer = Arc::new(ResolutionSigner::new(
+        params.attestation_key.clone(),
+        Arc::new(move || clock.now()),
+    ));
+    Ok(dird_context(schema, params, parts)?.with_name_resolution_signer(signer))
 }
 
 /// Wait until `done()` or `grace` passed.
@@ -1093,9 +1118,11 @@ pub async fn serve_with(
     if !directory_pip::principal_namespace_marked(&store).map_err(|_| DaemonError::Store)? {
         return Err(DaemonError::NoPrincipalNamespace);
     }
-    let parts = ContextParts::new(&params, admin.as_ref());
+    let parts = ContextParts::new(admin.as_ref());
     let schema = ad_schema::phase1().map_err(|_| DaemonError::Schema)?;
-    let ctx = dird_context(schema, &params, &parts).map_err(|_| DaemonError::Context)?;
+    // The KDC channel's context — the one context with dird's signer (task
+    // PN10b; docs/questions/Q-1047).
+    let ctx = kdc_channel_context(schema, &params, &parts).map_err(|_| DaemonError::Context)?;
     let tiers = tier_map(&policy).map_err(|_| DaemonError::Policy)?;
     let limits = ViewLimits {
         max_views: params.max_views,

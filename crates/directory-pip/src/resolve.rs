@@ -5,12 +5,13 @@
 //!
 //! [`DirectoryView::canonical_principal`] is the only place in this crate
 //! that turns a name received in a request into an object: the KDC's
-//! client and service lookups ([`kdc::AccountSource`], crate::view) are thin
-//! wrappers of it, so every consumer that resolves a principal by name — the
-//! AS and the TGS, and through `AccountSource` the admin plane's, kpasswd's,
-//! the DNS update's and the LDAP session's subject checks and dird's
-//! service-object checks — passes through it (docs/59 §6.1, R59-5). The
-//! result is a [`ResolvedPrincipal`], built only here.
+//! client and service lookups ([`kdc::AccountSource`], crate::view) and the
+//! ticket-subject lookup of the admin plane's, kpasswd's, the DNS update's
+//! and the LDAP session's subject checks (crate::subject, the
+//! `TicketClient` context — task PN10b) are thin wrappers of it, and dird's
+//! service-object checks call it directly, so every consumer that resolves
+//! a principal by name passes through it (docs/59 §6.1, R59-5). The result
+//! is a [`ResolvedPrincipal`], built only here.
 //!
 //! # The steps (docs/59 §6.1)
 //!
@@ -191,7 +192,8 @@ pub enum LookupCtx {
     AsClient,
     /// The client name in a ticket this realm's KDC issued — the admin
     /// plane's, kpasswd's and the DNS update's subject, the LDAP session
-    /// check. Spec: docs/59 §6.2, §6.4.
+    /// check (crate::subject; task PN10b). Spec: docs/59 §6.2, §6.4;
+    /// docs/questions/Q-1047 (A-187).
     TicketClient,
     /// The server name of a TGS request (sname). Spec: docs/59 §6.2;
     /// [MS-KILE] 3.3.5.1.1; docs/47 §1.3 TGS.
@@ -429,7 +431,8 @@ impl ResolvedPrincipal {
         })
     }
 
-    /// The object itself, for the account records built in this crate.
+    /// The object itself, for the account records and the ticket-subject
+    /// facts built in this crate (crate::view, crate::subject).
     pub(crate) fn object(&self) -> &Object {
         &self.object
     }

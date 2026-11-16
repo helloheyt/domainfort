@@ -11,13 +11,16 @@
 //! [`TEST_ATTESTATION_KEY`] and a fixed issue time.
 //!
 //! The ONE test signer the directory fixtures share (crates/directory-pip
-//! tests/common, and through `#[path]` crates/ipc-directory-server,
-//! crates/ipc-ldap-server, crates/directory-admin and crates/ldap), each with
-//! name-attestation as a dev-dependency.
+//! tests/common, and through it crates/ipc-directory-server and
+//! crates/ipc-ldap-server), each with name-attestation as a dev-dependency.
+//! Only the KDC's account records need it: the subject checks (crates
+//! directory-admin and ldap) read the ticket-subject lookup, which attests
+//! nothing, so their fixtures install no signer (task PN10b; docs/
+//! questions/Q-1047).
 //!
 //! Source: docs/59 §7.1, §7.4; docs/questions/Q-1011 items 1-3 (A-173),
-//! Q-1046. Test-only; this project's own code, no other implementation
-//! consulted.
+//! Q-1046, Q-1047 (A-187). Test-only; this project's own code, no other
+//! implementation consulted.
 #![allow(dead_code)] // each including test binary uses a different subset
 
 use directory_pip::{NameResolutionSigner, ResolvedPrincipal, SignerRefused};

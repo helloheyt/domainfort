@@ -33,9 +33,11 @@ publish = false
 parse-ldap = { path = "../parse-ldap" }
 # The policy decision point (Resource::RootDse, AnonymousGrant — L2).
 pdp = { path = "../pdp" }
-# The account source trait and its non-secret records: the per-request
-# re-check of a bound identity (docs/49 §4.4, R49-15) uses the same R47-1
-# lookup the KDC uses (docs/49 §3.2). Types only; no KDC operation is called.
+# `NamedPrincipal` only: a bound identity's (realm, name). Types only; no KDC
+# operation is called. NOT the KDC's account source (task PN10b; docs/
+# questions/Q-1047, A-187): the per-request re-check of a bound identity
+# (docs/49 §4.4, R49-15) reads directory-pip's ticket-subject lookup — the
+# same R47-1 name rule (docs/49 §3.2), no attested name resolution.
 kdc = { path = "../kdc" }
 # KerberosTime (the caller's `now`), Realm and PrincipalName (a bound
 # identity's name, as keyd's ServiceContext reports it — L6a/L7).
@@ -49,7 +51,8 @@ keyd-types = { path = "../keyd-types" }
 # SIDs for the PDP Subject; GUIDs of directory objects.
 dtyp = { path = "../dtyp" }
 # Search (task L8, docs/49 R49-9, §11): the per-request directory view (one
-# dirstore snapshot that is also the PDP's PIP — docs/47 §8.1), the naming
+# dirstore snapshot that is also the PDP's PIP and, task PN10b, the
+# ticket-subject lookup of the re-check — docs/47 §8.1), the naming
 # context (A-53) and the DSTIME conversion; the dirstore snapshot it exposes
 # (children, lookup_unique, back_links, get_object); the phase-1 schema
 # (attributes by lDAPDisplayName, class chains, CLASSATTS, syntaxes).
@@ -66,12 +69,10 @@ ad-schema = { path = "../ad-schema" }
 fuzz-hooks = []
 
 [dev-dependencies]
-# TESTS ONLY (task PN10; docs/59 §7.4): the unit tests' account record carries a name resolution tagged with a
-# test key, and the directory fixtures' contexts sign theirs with the shared test
-# signer (crates/directory-pip tests/common/signer.rs) — crate
-# name-attestation's `tag`, the signer dird uses. Our own crate; no new
-# package.
-name-attestation = { path = "../name-attestation" }
+# (Task PN10b: no name-attestation — the re-check reads no name resolution,
+# so neither the unit tests' subjects nor the directory fixtures' contexts
+# carry one; docs/questions/Q-1047, A-187.)
+#
 # TESTS ONLY (docs/52 C18, task R15; A-113): the tests open their stores by
 # path (`Store::open`, feature `test-seams`).
 dirstore = { path = "../dirstore", features = ["test-seams"] }

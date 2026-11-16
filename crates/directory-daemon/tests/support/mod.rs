@@ -32,9 +32,13 @@
 //!
 //! dird's name-resolution attestation key (task PN10; docs/59 §7.4) is the
 //! fixtures' test key ([`TEST_ATTESTATION_KEY`], [`attestation_key`]) in
-//! every [`params`]; a directory context a test builds for the account
-//! source carries the product's signer under that key ([`resolution_signer`]
-//! — `directory_daemon::ResolutionSigner`), as dird's own contexts do.
+//! every [`params`]; a directory context a test builds for the KDC's
+//! account source carries the product's signer under that key
+//! ([`resolution_signer`] — `directory_daemon::ResolutionSigner`), as dird's
+//! directory-view (KDC channel) context does — the only one of dird's
+//! contexts with a signer (task PN10b; docs/questions/Q-1047): a context
+//! for a subject check (the admin plane, kpasswd, DNS, the LDAP re-check)
+//! needs none.
 //!
 //! Sources: docs/50 §3.1-§3.7, §9; docs/46 §4.4 (musts per class), §5.4;
 //! docs/47 §1.3, §1.4, §4, §9.1 (what an account object carries; the krbtgt

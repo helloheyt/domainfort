@@ -37,6 +37,14 @@
 //!   provisioned service object (A-163 at the lookup; Q-1027 item 6). The
 //!   `principal-namespace` marker is defined here, with dird's check of it
 //!   ([`principal_namespace_marked`]; docs/59 §5.5).
+//! - **The subject of a ticket (task PN10b; docs/59 §6.2, §6.4; A-187):**
+//!   the admin plane's, kpasswd's, the DNS update's and the LDAP session's
+//!   subject checks and the self-lockout guard read
+//!   [`TicketSubjects::ticket_subject`] — the one lookup path in the
+//!   `TicketClient` context and only the facts those checks read (object,
+//!   SID, state, expansion, tier), with **no** name resolution and no
+//!   signer — never the KDC's account source. Only the KDC channel needs
+//!   the signer (module `subject`; docs/questions/Q-1047).
 //! - **krbtgt (R47-2):** never a client or a service;
 //!   [`DirectoryView::krbtgt_handle`] gives `KdcConfig.krbtgt`.
 //! - **Keys (R47-3):** `KeyHandle = (objectGUID, purpose)`.
@@ -73,7 +81,7 @@
 //! authority's own lookup, not a requester's read — module `visible`).
 //!
 //! A PEP receives the directory as a [`PepView`] — the gate, the locators
-//! of gate questions, the PIP and the account source — never the
+//! of gate questions, the PIP and the ticket-subject lookup — never the
 //! [`DirectoryView`] or its snapshot, so a new PEP cannot put a raw object on
 //! the wire (docs/52 R-a; decision A-103 on docs/questions/Q-486). The raw
 //! snapshot is reachable only through
@@ -168,6 +176,7 @@ mod record;
 mod resolve;
 mod salt;
 mod state;
+mod subject;
 mod tier;
 mod time;
 mod view;
@@ -201,6 +210,13 @@ pub use principal::{
 // (docs/59 §7.1, §7.4): the signer the deployment installs.
 pub use resolve::{LookupCtx, NameResolutionSigner, ResolvedPrincipal, SignerRefused};
 pub use salt::{account_salt, AccountKind, SaltError};
+// The subject lookup of a ticket's client (task PN10b; docs/59 §6.2, §6.4;
+// A-187): what the subject checks read — no name resolution, no signer.
+pub use subject::{TicketSubject, TicketSubjectError, TicketSubjects};
+// The KDC's account state, as the subject records carry it (one derivation —
+// docs/47 §4), so a subject consumer need not link crate kdc (task PN10b:
+// crates/directory-admin names the KDC's account source nowhere).
+pub use kdc::AccountState;
 pub use tier::TierMap;
 pub use time::{dstime_of, time_of_dstime};
 pub use view::{DirectoryContext, DirectoryView, MAX_DN_DEPTH};

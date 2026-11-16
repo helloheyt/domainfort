@@ -24,8 +24,8 @@
 //!
 //! [`Cx`] holds the request's view twice: as a `directory_pip::PepView`
 //! ([`Cx::pep`], public to the crate) — the gate, the locators, the PIP and
-//! the account source, all the request-facing code (crate::admin,
-//! crate::key_requests) can reach — and as the authority's
+//! the ticket-subject lookup (task PN10b), all the request-facing code
+//! (crate::admin, crate::key_requests) can reach — and as the authority's
 //! `DirectoryView`, a **private** field of `Cx`. Only this module reads the
 //! raw snapshot (`DirectoryView::authority_snapshot`): the internal reads
 //! docs/questions/Q-486 item 5 puts outside the gate — the write invariants'
@@ -51,13 +51,13 @@ use std::collections::{BTreeSet, VecDeque};
 
 use ad_schema::flags::group_type::GROUP_TYPE_SECURITY_ENABLED;
 use directory_pip::{
-    DirectoryView, MemberChange, PepView, PrincipalFacts, TierMap, VisibilityGate, VisibilityProof,
-    VisibilityRule, VisibleObject, MAX_EXPANDED_GROUPS, MAX_NESTING_DEPTH,
+    AccountState, DirectoryView, MemberChange, PepView, PrincipalFacts, TicketSubjects, TierMap,
+    VisibilityGate, VisibilityProof, VisibilityRule, VisibleObject, MAX_EXPANDED_GROUPS,
+    MAX_NESTING_DEPTH,
 };
 use dirstore::{ClassId, CounterState, Object, Tombstone, TombstonePage};
 use dtyp::{Guid, Sid};
 use ipc_audit::{AdminFailure, AdminRefusal};
-use kdc::AccountSource;
 use krb_proto::constants::{KRB_NT_PRINCIPAL, KRB_NT_SRV_HST};
 use krb_proto::{KerberosString, KerberosTime, PrincipalName};
 use pdp::{
@@ -121,8 +121,9 @@ pub(crate) struct Cx<'c, 'v, 'a> {
     pub(crate) config: &'c AdminConfig,
     pub(crate) ids: &'c Ids,
     /// The view as the request-facing code receives it: the gate, the
-    /// locators, the PIP, the account source — no raw read (module
-    /// documentation; docs/52 R-a).
+    /// locators, the PIP, the ticket-subject lookup — no raw read and no
+    /// account source of the KDC (module documentation; docs/52 R-a;
+    /// docs/questions/Q-1047).
     pub(crate) pep: PepView<'v, 'a>,
     /// The authority's view of the same snapshot — private to this module,
     /// read only by its internal-read methods (module documentation;
@@ -370,13 +371,13 @@ impl<'v, 'a> Cx<'_, 'v, 'a> {
     /// The requester's own account object of a kpasswd change (task K6):
     /// the record and the canonical DN of `guid` — the objectGUID of the
     /// account the request ticket's client resolved to through this view's
-    /// account source (`AdminSubject::guid`). Internal read: the object is
+    /// ticket-subject lookup (`AdminSubject::guid`). Internal read: the object is
     /// not named by the request, it **is** the authenticated requester, so
     /// the visibility gate (which answers "is the requester allowed to know
     /// this object exists", A-55) does not apply — nothing of it reaches a
     /// reply (docs/questions/Q-963 item 2). Gone, or outside the naming
-    /// context ⇒ `Failed(IntegrityFailure)`: the account source found it in
-    /// this very snapshot.
+    /// context ⇒ `Failed(IntegrityFailure)`: the ticket-subject lookup found
+    /// it in this very snapshot.
     /// Spec: docs/53 §5.6 step 4 (the PDP on "the account object itself");
     /// [MS-ADTS] 3.1.1.3.1.5.1 ("on itself"); docs/47 §1.3 (the handle's
     /// principal is the objectGUID); docs/52 R-a.
@@ -510,7 +511,7 @@ impl<'v, 'a> Cx<'_, 'v, 'a> {
     /// The KDC's account state of the record `obj` — stored, or the one a
     /// write is about to store (task MA3; directory-pip `account_state_of`).
     /// Spec: docs/47 §4; A-162.
-    pub(crate) fn account_state_of(&self, obj: &Object) -> Result<Option<kdc::AccountState>, Stop> {
+    pub(crate) fn account_state_of(&self, obj: &Object) -> Result<Option<AccountState>, Stop> {
         self.view
             .account_state_of(obj)
             .map_err(|_| Stop::Failed(AdminFailure::IntegrityFailure))
@@ -855,9 +856,17 @@ impl<'v, 'a> Cx<'_, 'v, 'a> {
         Ok(admins)
     }
 
-    /// `true` if the user account `obj` could authenticate now: the account
-    /// source finds it by its sAMAccountName and its state is usable.
-    /// Spec: docs/47 §1.3, §4 (`usable_at`); docs/51 §5.3.
+    /// `true` if the user account `obj` could act as a Subject now: the
+    /// ticket-subject lookup (the one lookup path in the `TicketClient`
+    /// context — the one a requester's Subject is built through,
+    /// `AdminSubject::from_verified_ticket`) resolves its sAMAccountName to
+    /// this very object, its Subject facts can be computed (an expansion or
+    /// tier that cannot is a failure, as for the Subject itself), and its
+    /// state is usable — with no name resolution (task PN10b). A name that
+    /// resolves to another object counts as not usable (fewer
+    /// administrators counted ⇒ the guard refuses sooner — fail closed).
+    /// Spec: docs/47 §1.3, §4 (`usable_at`); docs/51 §5.3; docs/59 §6.2;
+    /// Q-295 item 4 (P-22); docs/questions/Q-1047 (A-187).
     fn usable_now(&self, obj: &Object) -> Result<bool, Stop> {
         let Some(sam) = record::text(obj, self.ids.sam_account_name).map_err(malformed)? else {
             return Ok(false);
@@ -869,8 +878,8 @@ impl<'v, 'a> Cx<'_, 'v, 'a> {
             name_type: KRB_NT_PRINCIPAL,
             name_string: vec![component],
         };
-        match self.view.client(self.config.realm(), &name) {
-            Ok(Some(account)) => Ok(account.state.usable_at(&self.now)),
+        match self.view.ticket_subject(self.config.realm(), &name) {
+            Ok(Some(account)) => Ok(account.guid == obj.guid && account.state.usable_at(&self.now)),
             Ok(None) => Ok(false),
             Err(_) => Err(Stop::Failed(AdminFailure::StoreFailure)),
         }

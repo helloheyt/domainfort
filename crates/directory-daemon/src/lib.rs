@@ -48,9 +48,10 @@
 //!    verify auditd (R50-16), open the redb file as dird's account (it must
 //!    exist, owned by dird, no group/other access), refuse a store without
 //!    the `principal-namespace` marker (task PN10; docs/59 §5.5), build the
-//!    directory context — with dird's name-resolution signer and the
-//!    manifest's service objects, through one constructor — and the tier
-//!    map, check the domain (naming-context root,
+//!    directory context — with the manifest's service objects, through one
+//!    constructor, and (the directory-view context only, task PN10b) dird's
+//!    name-resolution signer — and the tier map, check the domain
+//!    (naming-context root,
 //!    domain SID, krbtgt account), build the LDAP service (the engine, the
 //!    PDP snapshot of the same policy file, the audit
 //!    gate), spawn the directory-view engine thread and the LDAP engine
@@ -246,8 +247,9 @@ pub use listener::refused_peer_count;
 pub use reconcile::{MAX_PAGES_PER_RUN, MAX_REGISTRATIONS_PER_RUN, MAX_SETTLED, TOMBSTONE_PAGE};
 pub use registration::{destroy_decision_id, DecisionRegistration};
 // dird's name-resolution attestation (task PN10; docs/59 §7.4): the key's
-// shared handle a `DaemonParams` carries, and the signer every directory
-// context of dird is built with (crate ipc-directory-server).
+// shared handle a `DaemonParams` carries, and the signer dird's
+// directory-view (KDC channel) context is built with — that context only
+// (task PN10b; docs/questions/Q-1047) — crate ipc-directory-server.
 pub use ipc_directory_server::{
     IssueClock, ResolutionSigner, SharedAttestationKey, ATTESTATION_KEY_LEN,
 };

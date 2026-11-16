@@ -242,10 +242,8 @@ dependencies = [
  "ipc-audit",
  "ipc-audit-client",
  "ipc-dird-admin",
- "kdc",
  "keyd-types",
  "krb-proto",
- "name-attestation",
  "pdp",
  "policy-store",
  "principal-names",
@@ -858,7 +856,6 @@ dependencies = [
  "kdc",
  "keyd-types",
  "krb-proto",
- "name-attestation",
  "parse-ldap",
  "pdp",
 ]

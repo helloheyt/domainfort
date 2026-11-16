@@ -32,12 +32,12 @@ pub mod linked;
 #[path = "../../../directory-pip/tests/common/namespace.rs"]
 pub mod namespace;
 
-/// The shared test signer of name resolutions (task PN10; docs/59 §7.4):
-/// the write PEP reads accounts through the view's account source (the
-/// subject, the self-lockout guard), whose records carry dird's attested
-/// resolution — so the fixture's context carries a signer, as dird's do.
-#[path = "../../../directory-pip/tests/common/signer.rs"]
-pub mod signer;
+// No name-resolution signer (task PN10b; docs/59 §6.2; docs/questions/
+// Q-1047, A-187): the write PEP reads its requesters, approvers and the
+// self-lockout count through directory-pip's ticket-subject lookup, which
+// attests nothing — so the fixture's context carries no signer, as dird's
+// admin, kpasswd and DNS contexts carry none, and every test of this crate
+// shows the admin plane works without one.
 
 use core::time::Duration;
 use std::cell::Cell;
@@ -653,8 +653,7 @@ impl Domain {
         )
         .expect("open store");
         let ctx = DirectoryContext::new(p1.clone(), &KeydConfig::new(realm()), naming_context())
-            .expect("context")
-            .with_name_resolution_signer(signer::test_signer());
+            .expect("context");
         let mut subtrees = vec![
             (ou_dn("Tier0"), Tier::Tier0),
             (ou_dn("Managed"), Tier::Tier1),
