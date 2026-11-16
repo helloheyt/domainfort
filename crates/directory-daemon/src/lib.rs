@@ -33,17 +33,24 @@
 //! 2. read the configuration path from argv and parse `DirdSettings`
 //!    ([`startup::read_settings`]: root-owned, not group/other-writable,
 //!    bounded read);
-//! 3. as root, before the drop: read the development integrity key
-//!    ([`startup::read_integrity_key`]: root-owned, mode 0400, exactly 32
-//!    octets, reading buffer wiped) and the development policy
+//! 3. as root, before the drop: read the name-resolution attestation key
+//!    (task PN10 — [`startup::read_attestation_key`] at
+//!    `attestation_key_path`: root-owned, mode 0400, exactly 32 octets, not
+//!    all zero; not configured ⇒ no start — docs/59 §7.4), the development
+//!    integrity key ([`startup::read_integrity_key`]: root-owned, mode 0400,
+//!    exactly 32 octets, reading buffer wiped — the same one reader) and
+//!    the development policy
 //!    ([`startup::read_policy`]: root-owned, bounded, strictly decoded —
 //!    absent or invalid ⇒ no start); prepare the socket directory;
 //! 4. apply the hardening plan ([`startup::hardening_plan`]) while the
 //!    process has one thread (R50-14);
 //! 5. only then build the tokio runtime (current-thread) and run [`serve`]:
 //!    verify auditd (R50-16), open the redb file as dird's account (it must
-//!    exist, owned by dird, no group/other access), build the directory
-//!    context and the tier map, check the domain (naming-context root,
+//!    exist, owned by dird, no group/other access), refuse a store without
+//!    the `principal-namespace` marker (task PN10; docs/59 §5.5), build the
+//!    directory context — with dird's name-resolution signer and the
+//!    manifest's service objects, through one constructor — and the tier
+//!    map, check the domain (naming-context root,
 //!    domain SID, krbtgt account), build the LDAP service (the engine, the
 //!    PDP snapshot of the same policy file, the audit
 //!    gate), spawn the directory-view engine thread and the LDAP engine
@@ -238,6 +245,12 @@ pub use ldap_listener::ldap_refused_peer_count;
 pub use listener::refused_peer_count;
 pub use reconcile::{MAX_PAGES_PER_RUN, MAX_REGISTRATIONS_PER_RUN, MAX_SETTLED, TOMBSTONE_PAGE};
 pub use registration::{destroy_decision_id, DecisionRegistration};
+// dird's name-resolution attestation (task PN10; docs/59 §7.4): the key's
+// shared handle a `DaemonParams` carries, and the signer every directory
+// context of dird is built with (crate ipc-directory-server).
+pub use ipc_directory_server::{
+    IssueClock, ResolutionSigner, SharedAttestationKey, ATTESTATION_KEY_LEN,
+};
 
 /// The test seams (docs/52 C18, task R15): the full parameters, the generic
 /// serve, an already-opened store and any keyd verifier. Compiled only with

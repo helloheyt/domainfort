@@ -46,6 +46,13 @@
 #[path = "../../../directory-pip/tests/common/namespace.rs"]
 mod namespace;
 
+/// The shared test signer of name resolutions (task PN10): the bound
+/// session's re-check reads the account through the view's account source,
+/// whose records carry dird's attested resolution — so the context carries a
+/// signer, as dird's do (docs/59 §7.4, §7.5).
+#[path = "../../../directory-pip/tests/common/signer.rs"]
+mod signer;
+
 use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -252,7 +259,8 @@ impl Dir {
             &KeydConfig::new(Realm::new(REALM).expect("realm")),
             naming_context(),
         )
-        .expect("context");
+        .expect("context")
+        .with_name_resolution_signer(signer::test_signer());
         let mut txn = store.begin_write().expect("write");
         namespace::create_namespace_marker(&mut txn);
         txn.commit().expect("commit");
@@ -1680,6 +1688,49 @@ fn the_naming_context_is_one_source_of_truth() {
         crate::config::naming_context_string(&naming_context()).as_deref(),
         Some(NC_DN)
     );
+}
+
+/// docs/59 §4.6, §6.4 ("`PRINCIPAL_NAME_KEY` is never seen — a test like
+/// `HOST_ADDRESS`'s"; A-174: the LDAP test is task PN10's): the namespace
+/// attribute has no lDAPDisplayName (ATTRTYP in [MS-ADTS] 3.1.1.2.6's
+/// internal range), so no request can name it and no entry shows it — every
+/// type of a `*` (and `*` + operational) answer for a principal is a named
+/// schema attribute — while the stored object does hold its keys (the
+/// positive control).
+#[test]
+fn the_namespace_keys_are_never_on_the_wire() {
+    let d = Dir::standard("namespace-hidden");
+    let stored = d
+        .store
+        .snapshot()
+        .unwrap()
+        .get_object(guid(ALICE))
+        .unwrap()
+        .unwrap();
+    assert!(stored.attribute(ad_schema::PRINCIPAL_NAME_KEY).is_some());
+    assert!(d.p1.attribute(ad_schema::PRINCIPAL_NAME_KEY).is_none());
+    let named: BTreeSet<String> =
+        d.p1.attributes()
+            .map(|a| a.entry.ldap_display_name.to_owned())
+            .collect();
+    let r = Run::new(&d);
+    let alice = "cn=alice,ou=Staff,dc=example,dc=test";
+    for selection in [&["*"][..], &["*", "memberOf"][..], &[][..]] {
+        let types: BTreeSet<String> = r
+            .search(request(
+                alice,
+                Scope::BaseObject,
+                present("objectClass"),
+                selection,
+            ))
+            .only()
+            .attributes
+            .iter()
+            .map(|a| a.r#type.clone())
+            .collect();
+        assert!(!types.is_empty());
+        assert!(types.is_subset(&named), "{types:?}");
+    }
 }
 
 /// RFC 4511 §4.5.1.8: "1.1" alone returns no attribute; unrecognised

@@ -9,10 +9,13 @@
 //!
 //! 1. claim the single-thread proof — the first statement of `main`;
 //! 2. read the configuration path from argv and parse it;
-//! 3. as root: read the development integrity key and the development
-//!    policy (both root-owned files, read before the drop), the provisioning
-//!    manifest when the admin channel is configured (root-owned, docs/51
-//!    §4.3 step 8), and prepare the socket directories;
+//! 3. as root: read the name-resolution attestation key (task PN10 — a
+//!    root-owned 0400 file named by `attestation_key_path`; not configured
+//!    ⇒ no start, docs/59 §7.4), the development integrity key and the
+//!    development policy (both root-owned files, read before the drop), the
+//!    provisioning manifest when the admin channel is configured
+//!    (root-owned, docs/51 §4.3 step 8), and prepare the socket
+//!    directories;
 //! 4. apply the hardening plan while the process has exactly one thread;
 //! 5. only then build the tokio runtime, and serve (auditd first, then the
 //!    directory, then the socket).
@@ -21,14 +24,15 @@
 //! Messages are fixed texts on stderr (docs/50 §8.2); the key never appears.
 //!
 //! Spec: docs/50 R50-2, R50-14, R50-16, §6.2, §7.2, §7.4, §7.5, §8.2;
-//! docs/questions/Q-213, Q-219 (A-57), Q-235 (A-61), Q-270.
+//! docs/questions/Q-213, Q-219 (A-57), Q-235 (A-61), Q-270; docs/59 §7.4;
+//! docs/questions/Q-1046.
 
 use daemon_sandbox::{apply, SingleThreadProof};
 use directory_daemon::log::{note, Note};
 use directory_daemon::startup::{
-    admin_params, dns_params, hardening_plan, kpasswd_params, params,
-    prepare_policy_next_directory, prepare_socket_directory, read_integrity_key, read_policy,
-    read_provision_manifest, read_settings,
+    admin_params, attestation_key_path, dns_params, hardening_plan, kpasswd_params, params,
+    prepare_policy_next_directory, prepare_socket_directory, read_attestation_key,
+    read_integrity_key, read_policy, read_provision_manifest, read_settings,
 };
 use directory_daemon::{serve_with_services, DaemonControl, StoreSource};
 use std::io::Write;
@@ -83,7 +87,15 @@ fn main() -> ExitCode {
         Ok(settings) => settings,
         Err(error) => return fail("configuration", &error),
     };
-    let params = match params(&settings) {
+    // Task PN10: dird's name-resolution attestation key, as root before the
+    // drop (docs/59 §7.4) — not configured or not readable ⇒ no start.
+    let attestation_key = match attestation_key_path(&settings)
+        .and_then(|key_path| read_attestation_key(key_path, ROOT_UID))
+    {
+        Ok(key) => key,
+        Err(error) => return fail("attestation key", &error),
+    };
+    let params = match params(&settings, attestation_key) {
         Ok(params) => params,
         Err(error) => return fail("configuration", &error),
     };

@@ -41,6 +41,15 @@ parse-ldap = { path = "../parse-ldap" }
 pdp = { path = "../pdp" }
 
 [dev-dependencies]
+# TESTS ONLY (task PN10; docs/59 §7.4): the reused crates/directory-pip tests/common fixtures sign their contexts'
+# name resolutions with the shared test signer (tests/common/signer.rs) — crate
+# name-attestation's `tag`, the signer dird uses. Our own crate; no new
+# package.
+name-attestation = { path = "../name-attestation" }
+# TESTS ONLY (task PN10): the resolution type the shared test signer
+# returns (crates/directory-pip tests/common/signer.rs). Our own crate,
+# already in the graph through ldap.
+keyd-types = { path = "../keyd-types" }
 # TESTS ONLY: the directory fixtures of crates/directory-pip/tests/common
 # (reused through `#[path]`) build a temporary dirstore with the phase-1
 # schema and name keyd's configuration through keyd's re-exports; the

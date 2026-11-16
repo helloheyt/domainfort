@@ -32,6 +32,11 @@ publish = false
 path = "src/lib.rs"
 
 [dev-dependencies]
+# TESTS ONLY (task PN10; docs/59 §7.4): the reused crates/kdc/tests/common fixtures tag their account records' name
+# resolutions with a test key (`test_resolution`) — crate
+# name-attestation's `tag`, the signer dird uses. Our own crate; no new
+# package.
+name-attestation = { path = "../name-attestation" }
 # The five daemons, started in-process with injected parameters (docs/50 §9
 # tier 2) — keyd, dird, the kdc, ldap-front and admind through their test
 # seams (`test_seams`, feature `test-seams`; docs/52 C18, task R15), which

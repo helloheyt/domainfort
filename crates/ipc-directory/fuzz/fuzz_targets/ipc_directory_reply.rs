@@ -10,7 +10,14 @@
 //! docs/50 §3.3 ("replies are decoded with the same strictness"): never a
 //! panic; whatever decodes re-encodes to exactly the input.
 //!
-//! Spec: docs/50 §3.3, §3.4, §9; R50-4; A-59.
+//! Since task PN10 a `Client` / `Service` record carries an attested name
+//! resolution (docs/59 §7.5): two bounded realms, two bounded name DERs
+//! (decoded by krb-proto), the principal, the purpose code, the snapshot,
+//! the issue time and the 32-octet tag — read by `into_client` /
+//! `into_service` through `NameResolution::new` (the bounds), so every
+//! reply this target decodes passes through that code too.
+//!
+//! Spec: docs/50 §3.3, §3.4, §9; R50-4; A-59; docs/59 §7.1, §7.5.
 
 use ipc::{decode_reply, encode_frame, encode_refused, Direction, Reply};
 use ipc_directory::wire::DirectoryReply;

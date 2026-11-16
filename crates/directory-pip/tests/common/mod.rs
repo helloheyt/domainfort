@@ -25,9 +25,17 @@
 //! name change, docs/questions/Q-1029 item 9), and [`Dir::write_principal_keys`]
 //! re-derives them. Source: docs/59 §5.1, §5.5; docs/questions/Q-1026 item
 //! 5, Q-1031.
+//!
+//! # The attested resolutions (task PN10)
+//!
+//! Every context the fixture builds carries the shared test signer (module
+//! [`signer`]), so the account records its views answer carry an attested
+//! name resolution, as dird's do (docs/59 §7.1, §7.5). Source: docs/59 §7.4;
+//! docs/questions/Q-1046.
 #![allow(dead_code)] // each test binary uses a different subset
 
 pub mod namespace;
+pub mod signer;
 
 use ad_schema::{phase1, Phase1Schema};
 use directory_pip::{DirectoryContext, DirectoryView, NamingContext, TierMap};
@@ -40,6 +48,18 @@ use krb_proto::{KerberosString, KerberosTime, PrincipalName, Realm};
 use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+
+/// Whether an account answer found a record (`Ok(true)`), found none
+/// (`Ok(false)`) or could not tell (`Err`). Account records have no
+/// `PartialEq` — the resolution they carry has a tag that is compared only in
+/// constant time, by keyd (crates/kdc `accounts.rs`; task PN10) — so the
+/// tests compare answers by what they found, and records by their fields.
+pub fn found<T, E: Copy>(answer: &Result<Option<T>, E>) -> Result<bool, E> {
+    match answer {
+        Ok(record) => Ok(record.is_some()),
+        Err(error) => Err(*error),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Constants.
@@ -231,6 +251,11 @@ impl TempDir {
         std::fs::create_dir_all(&dir).expect("create temp dir");
         TempDir(dir)
     }
+
+    /// The directory's path.
+    pub fn path(&self) -> &std::path::Path {
+        &self.0
+    }
 }
 
 impl Drop for TempDir {
@@ -259,8 +284,9 @@ impl Dir {
             p1.schema().clone(),
         )
         .expect("open store");
-        let ctx =
-            DirectoryContext::new(p1.clone(), &keyd_config(), naming_context()).expect("context");
+        let ctx = DirectoryContext::new(p1.clone(), &keyd_config(), naming_context())
+            .expect("context")
+            .with_name_resolution_signer(signer::test_signer());
         let mut txn = store.begin_write().expect("begin write");
         namespace::create_namespace_marker(&mut txn);
         txn.commit().expect("commit");
@@ -541,11 +567,12 @@ impl Dir {
     }
 
     /// A directory context of this store's realm with `services` as the
-    /// provisioned service objects.
-    fn context_with(&self, services: &BTreeSet<Guid>) -> DirectoryContext {
+    /// provisioned service objects (and the test signer).
+    pub fn context_with(&self, services: &BTreeSet<Guid>) -> DirectoryContext {
         DirectoryContext::new(self.p1.clone(), &keyd_config(), naming_context())
             .expect("context")
             .with_service_objects(services.clone())
+            .with_name_resolution_signer(signer::test_signer())
     }
 
     /// Replace the values of one attribute (empty = remove it) — a write

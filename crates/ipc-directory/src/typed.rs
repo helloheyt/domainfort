@@ -6,19 +6,25 @@
 //! order with no repetition, so every value has exactly one encoding and
 //! `encode(decode(b)) == b` holds for everything that decodes.
 //!
+//! A record's attested name resolution (task PN10) passes, besides its
+//! realms, names and time, through `keyd_types::NameResolution::new` — the
+//! bounds of a resolution — and keeps its tag as the 32 octets that came;
+//! keyd, not this layer, verifies the tag (docs/59 §7.2).
+//!
 //! Spec: docs/50 §3.3 ("Kerberos values … decoded in `krb-proto`"; "a single
 //! encoding per value"; replies decoded with the same strictness), §3.4;
-//! docs/questions/Q-245 item 1 (A-63).
+//! docs/questions/Q-245 item 1 (A-63); docs/59 §7.1, §7.5.
 
 use crate::channel::ViewFailure;
 use crate::wire::{
-    DirectoryReply, DirectoryRequest, WireClient, WireEtypeInfo, WireService, WireState, WireTime,
+    DirectoryReply, DirectoryRequest, WireClient, WireEtypeInfo, WireNameResolution, WireService,
+    WireState, WireTime,
 };
 use core::fmt;
 use dtyp::Sid;
 use ipc::DerBlob;
 use kdc::{AccountSourceError, AccountState, ClientAccount, ServiceAccount};
-use keyd_types::KeyHandle;
+use keyd_types::{AttestedNameResolution, KeyHandle, NameResolution, NameResolutionFields};
 use krb_proto::{EtypeInfo2Entry, KerberosString, KerberosTime, PrincipalName, Realm};
 use pdp::{PipError, PolicyVersion, Tier};
 use std::collections::BTreeSet;
@@ -42,6 +48,10 @@ pub enum ConversionError {
     Label,
     /// The reply is valid but answers another request.
     UnexpectedReply,
+    /// A name resolution is outside the bounds of keyd-types (a name with
+    /// no component or too many, a realm or component too long — task
+    /// PN10).
+    NameResolution,
 }
 
 impl fmt::Display for ConversionError {
@@ -54,6 +64,7 @@ impl fmt::Display for ConversionError {
             ConversionError::GroupOrder => "group SIDs not in ascending order",
             ConversionError::Label => "invalid naming-context label",
             ConversionError::UnexpectedReply => "reply does not answer the request",
+            ConversionError::NameResolution => "name resolution outside its bounds",
         })
     }
 }
@@ -228,11 +239,67 @@ fn wire_state(state: &AccountState) -> WireState {
 
 // ---- records ---------------------------------------------------------------
 
+impl WireNameResolution {
+    /// The wire form of an attested name resolution: its realms' octets, its
+    /// names' DER, its other fields and its tag, unchanged (task PN10).
+    ///
+    /// # Errors
+    /// [`ConversionError::PrincipalName`] if a name cannot be encoded.
+    ///
+    /// Spec: docs/59 §7.1, §7.5; docs/50 §3.3.
+    pub fn from_attested(
+        attested: &AttestedNameResolution,
+    ) -> Result<WireNameResolution, ConversionError> {
+        let resolution = attested.resolution();
+        Ok(WireNameResolution {
+            realm_as_sent: resolution.realm_as_sent().as_bytes().to_vec(),
+            name_as_sent: principal_name_der(resolution.name_as_sent())?,
+            canonical_realm: resolution.canonical_realm().as_bytes().to_vec(),
+            canonical_name: principal_name_der(resolution.canonical_name())?,
+            principal: resolution.principal(),
+            key_purpose: resolution.key_purpose(),
+            snapshot: resolution.snapshot(),
+            issued_at: wire_time(&resolution.issued_at()),
+            tag: *attested.tag(),
+        })
+    }
+
+    /// The attested name resolution, every value through its strict decoder
+    /// and the whole through `NameResolution::new` (the bounds). The tag is
+    /// carried as received — **not verified** here (keyd verifies it, docs/59
+    /// §7.2).
+    ///
+    /// # Errors
+    /// [`ConversionError`] — [`ConversionError::NameResolution`] for a value
+    /// outside a resolution's bounds.
+    ///
+    /// Spec: docs/59 §7.1, §7.2 step 1, §7.5; docs/50 §3.3.
+    pub fn to_attested(&self) -> Result<AttestedNameResolution, ConversionError> {
+        let resolution = NameResolution::new(NameResolutionFields {
+            realm_as_sent: kerberos_string(&self.realm_as_sent)?,
+            name_as_sent: principal_name(&self.name_as_sent)?,
+            canonical_realm: kerberos_string(&self.canonical_realm)?,
+            canonical_name: principal_name(&self.canonical_name)?,
+            principal: self.principal,
+            key_purpose: self.key_purpose,
+            snapshot: self.snapshot,
+            issued_at: time(&self.issued_at)?,
+        })
+        .map_err(|_| ConversionError::NameResolution)?;
+        Ok(AttestedNameResolution::new(resolution, self.tag))
+    }
+}
+
 impl WireClient {
-    /// The wire form of a client record. Spec: docs/50 §3.4.
-    #[must_use]
-    pub fn from_account(account: &ClientAccount) -> WireClient {
-        WireClient {
+    /// The wire form of a client record.
+    ///
+    /// # Errors
+    /// [`ConversionError::PrincipalName`] if a name of its resolution cannot
+    /// be encoded.
+    ///
+    /// Spec: docs/50 §3.4; docs/59 §7.5.
+    pub fn from_account(account: &ClientAccount) -> Result<WireClient, ConversionError> {
+        Ok(WireClient {
             key: account.key,
             sid: account.sid.encode(),
             groups: sid_packets(&account.groups),
@@ -249,7 +316,8 @@ impl WireClient {
                 .collect(),
             kind: account.kind,
             armor_policy: account.armor_policy,
-        }
+            resolution: WireNameResolution::from_attested(&account.resolution)?,
+        })
     }
 
     /// The client record, every value through its strict decoder.
@@ -279,19 +347,26 @@ impl WireClient {
             etype_info,
             kind: self.kind,
             armor_policy: self.armor_policy,
+            resolution: self.resolution.to_attested()?,
         })
     }
 }
 
 impl WireService {
-    /// The wire form of a service record. Spec: docs/50 §3.4.
-    #[must_use]
-    pub fn from_account(account: &ServiceAccount) -> WireService {
-        WireService {
+    /// The wire form of a service record.
+    ///
+    /// # Errors
+    /// [`ConversionError::PrincipalName`] if a name of its resolution cannot
+    /// be encoded.
+    ///
+    /// Spec: docs/50 §3.4; docs/59 §7.5.
+    pub fn from_account(account: &ServiceAccount) -> Result<WireService, ConversionError> {
+        Ok(WireService {
             key: account.key,
             state: wire_state(&account.state),
             enctypes: account.enctypes.clone(),
-        }
+            resolution: WireNameResolution::from_attested(&account.resolution)?,
+        })
     }
 
     /// The service record, every value through its strict decoder.
@@ -305,6 +380,7 @@ impl WireService {
             key: self.key,
             state: state(&self.state)?,
             enctypes: self.enctypes.clone(),
+            resolution: self.resolution.to_attested()?,
         })
     }
 }
@@ -396,22 +472,33 @@ impl Request {
 // ---- replies ---------------------------------------------------------------
 
 impl DirectoryReply {
-    /// The reply to a `Client` query.
-    /// Spec: docs/50 §3.4; crates/kdc accounts.rs.
+    /// The reply to a `Client` query. A record that cannot be put on the
+    /// wire (a name of its resolution that does not encode) is answered as
+    /// the view's own "cannot tell", `AccountSourceError::Failed` — never as
+    /// "no such principal" (fail closed).
+    /// Spec: docs/50 §3.4, §3.7; crates/kdc accounts.rs; docs/59 §7.5.
     #[must_use]
     pub fn from_client(result: &Result<Option<ClientAccount>, AccountSourceError>) -> Self {
         match result {
-            Ok(record) => DirectoryReply::Client(record.as_ref().map(WireClient::from_account)),
+            Ok(None) => DirectoryReply::Client(None),
+            Ok(Some(account)) => match WireClient::from_account(account) {
+                Ok(record) => DirectoryReply::Client(Some(record)),
+                Err(_) => DirectoryReply::AccountFailure(AccountSourceError::Failed),
+            },
             Err(error) => DirectoryReply::AccountFailure(*error),
         }
     }
 
-    /// The reply to a `Service` query.
-    /// Spec: docs/50 §3.4; crates/kdc accounts.rs.
+    /// The reply to a `Service` query (as [`DirectoryReply::from_client`]).
+    /// Spec: docs/50 §3.4, §3.7; crates/kdc accounts.rs; docs/59 §7.5.
     #[must_use]
     pub fn from_service(result: &Result<Option<ServiceAccount>, AccountSourceError>) -> Self {
         match result {
-            Ok(record) => DirectoryReply::Service(record.as_ref().map(WireService::from_account)),
+            Ok(None) => DirectoryReply::Service(None),
+            Ok(Some(account)) => match WireService::from_account(account) {
+                Ok(record) => DirectoryReply::Service(Some(record)),
+                Err(_) => DirectoryReply::AccountFailure(AccountSourceError::Failed),
+            },
             Err(error) => DirectoryReply::AccountFailure(*error),
         }
     }

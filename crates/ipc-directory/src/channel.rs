@@ -38,9 +38,11 @@ pub const MAX_REQUEST_BODY: u32 = 80 * 1024;
 
 /// Reply body bound: 128 KiB. docs/50 §3.3 proposes 64 KiB ("⚠ to be
 /// estimated"); a client record with [`MAX_GROUPS`] group SIDs and
-/// [`MAX_ENCTYPES`] ETYPE-INFO2 entries needs about 90 KiB (checked below at
-/// compile time; docs/questions/Q-270 item 4).
-/// Spec: docs/50 §3.3; Q-270 item 4.
+/// [`MAX_ENCTYPES`] ETYPE-INFO2 entries needs about 90 KiB, and its attested
+/// name resolution (task PN10) at most about 35 KiB more — still within the
+/// bound (checked below at compile time; docs/questions/Q-270 item 4,
+/// Q-1046).
+/// Spec: docs/50 §3.3; Q-270 item 4; docs/59 §7.5.
 pub const MAX_REPLY_BODY: u32 = 128 * 1024;
 
 /// The request direction's [`FrameLimit`]; a bound outside ipc's range stops
@@ -122,11 +124,66 @@ pub const MAX_NC_LABELS: u32 = 16;
 /// Spec: [MS-ADTS] 3.1.1.5.1.2; A-30; A-53.
 pub const MAX_NC_LABEL: u32 = 255;
 
+/// Bound of a realm inside an attested name resolution (task PN10): the
+/// bound keyd-types puts on every realm of a resolution — the binding's,
+/// `keyd_types::sealed_store::MAX_NAME_OCTETS` (pinned below) — so nothing a
+/// resolution cannot hold is read off the wire.
+/// Spec: docs/59 §7.1 (the bounds of krb-proto and the binding), §7.5
+/// ("size bounds"); crates/keyd-types `name_resolution.rs`; AGENTS.md §6.
+pub const MAX_RESOLUTION_REALM: u32 = 1024;
+
+/// Octets of a DER header around contents of at most 65 535 octets: one
+/// identifier octet (a tag number from 0 to 30 — X.690 §8.1.2.2) and at most
+/// three length octets (the definite form in the fewest octets — X.690
+/// §10.1; up to 65 535 the long form's initial octet and two more — X.690
+/// §8.1.3.5).
+/// Spec: ITU-T X.690 (02/2021) §8.1.2.2, §8.1.3.3-§8.1.3.5, §10.1.
+const DER_HEADER: usize = 1 + 3;
+
+/// Octets of a resolution name's `name-type [0] Int32` at most: the context
+/// tag around an INTEGER of at most four contents octets (Int32's range —
+/// RFC 4120 §5.2.4 — in the fewest two's-complement octets, X.690 §8.3.2,
+/// §8.3.3), each header in the short form (contents ≤ 127 octets — X.690
+/// §8.1.3.4).
+/// Spec: RFC 4120 §5 (`DEFINITIONS EXPLICIT TAGS`), §5.2.2 (`name-type [0]
+/// Int32`), §5.2.4 (`Int32`); X.690 §8.1.3.4, §8.3.1-§8.3.3.
+const RESOLUTION_NAME_TYPE_DER: usize = 2 + 2 + 4;
+
+/// Bound of a `PrincipalName` DER inside an attested name resolution (task
+/// PN10): the largest encoding of a name a resolution can hold —
+/// `krb_proto::limits::MAX_NAME_COMPONENTS` components of at most
+/// `keyd_types::sealed_store::MAX_NAME_OCTETS` octets each (the bounds
+/// keyd-types checks) — as `SEQUENCE { name-type [0] Int32, name-string [1]
+/// SEQUENCE OF KerberosString }` under explicit tags: the outer header, the
+/// name-type, the `[1]` and `SEQUENCE OF` headers, and one header plus the
+/// octets per component. 16 468 octets; every contents length involved is
+/// under 65 536, so [`DER_HEADER`] holds for each (checked below).
+/// Spec: RFC 4120 §5 (`DEFINITIONS EXPLICIT TAGS`), §5.2.1
+/// (`KerberosString`), §5.2.2 (`PrincipalName`); X.690 §8.1.2.2, §8.1.3,
+/// §10.1; docs/59 §7.1, §7.5; AGENTS.md §6.
+pub const MAX_RESOLUTION_NAME: u32 = (DER_HEADER
+    + RESOLUTION_NAME_TYPE_DER
+    + DER_HEADER
+    + DER_HEADER
+    + krb_proto::limits::MAX_NAME_COMPONENTS
+        * (DER_HEADER + keyd_types::sealed_store::MAX_NAME_OCTETS))
+    as u32;
+
 // The bounds agree with the values they are derived from and fit the body
 // bounds; checked at compile time, never at run time.
 const _: () = assert!(MAX_REALM as usize == kdc::MAX_REQUEST_LEN);
 const _: () = assert!(MAX_NAME as usize == kdc::MAX_REQUEST_LEN);
 const _: () = assert!(MAX_SID as usize == 8 + 4 * dtyp::SID_MAX_SUB_AUTHORITIES);
+// A resolution's realm bound is keyd-types' (task PN10).
+const _: () = assert!(MAX_RESOLUTION_REALM as usize == keyd_types::sealed_store::MAX_NAME_OCTETS);
+// Every contents length inside a resolution name is under 65 536, so each
+// header takes at most DER_HEADER octets (X.690 §8.1.3.5).
+const _: () = assert!(
+    (MAX_RESOLUTION_NAME as usize) - DER_HEADER <= 0xFFFF
+        && krb_proto::limits::MAX_NAME_COMPONENTS
+            * (DER_HEADER + keyd_types::sealed_store::MAX_NAME_OCTETS)
+            <= 0xFFFF
+);
 
 /// Body octets of the largest `Client` / `Service` request a KDC request can
 /// produce: envelope, view id, two length prefixes, and the realm and name,
@@ -138,6 +195,16 @@ const LARGEST_TIER_REQUEST: usize =
 /// Body octets of one ETYPE-INFO2 entry at its bounds.
 const LARGEST_ETYPE_ENTRY: usize =
     4 + (1 + 4 + MAX_SALT as usize) + (1 + 4 + MAX_S2KPARAMS as usize);
+/// Body octets of the largest attested name resolution a record carries
+/// (task PN10): two realms and two names at their bounds, the principal id,
+/// the purpose, the snapshot, the issue time and the tag.
+const LARGEST_RESOLUTION: usize = 2 * (4 + MAX_RESOLUTION_REALM as usize)
+    + 2 * (4 + MAX_RESOLUTION_NAME as usize)
+    + 16
+    + 1
+    + 8
+    + 7
+    + keyd_types::NAME_RESOLUTION_TAG_LEN;
 /// Body octets of the largest client record reply.
 const LARGEST_CLIENT_REPLY: usize = 4
     + 1
@@ -150,12 +217,18 @@ const LARGEST_CLIENT_REPLY: usize = 4
     + 2 * (1 + 7)
     + 4
     + MAX_ENCTYPES as usize * LARGEST_ETYPE_ENTRY
-    + 2;
+    + 2
+    + LARGEST_RESOLUTION;
+/// Body octets of the largest service record reply (task PN10: it carries
+/// a resolution too).
+const LARGEST_SERVICE_REPLY: usize =
+    4 + 1 + 17 + 2 + 2 * (1 + 7) + 4 + 4 * MAX_ENCTYPES as usize + LARGEST_RESOLUTION;
 /// Body octets of the largest group-expansion reply.
 const LARGEST_GROUPS_REPLY: usize = 4 + 4 + MAX_GROUPS as usize * (4 + MAX_SID as usize);
 const _: () = assert!(LARGEST_NAME_REQUEST <= MAX_REQUEST_BODY as usize);
 const _: () = assert!(LARGEST_TIER_REQUEST <= MAX_REQUEST_BODY as usize);
 const _: () = assert!(LARGEST_CLIENT_REPLY <= MAX_REPLY_BODY as usize);
+const _: () = assert!(LARGEST_SERVICE_REPLY <= MAX_REPLY_BODY as usize);
 const _: () = assert!(LARGEST_GROUPS_REPLY <= MAX_REPLY_BODY as usize);
 
 // ---- kinds -----------------------------------------------------------------

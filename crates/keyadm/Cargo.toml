@@ -74,6 +74,11 @@ daemon-sandbox = { path = "../daemon-sandbox" }
 zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
+# TESTS ONLY (task PN10; docs/59 §7.4): the reused crates/kdc/tests/common fixtures (through crates/admin-daemon's
+# support) tag their account records' name resolutions with a test key — crate
+# name-attestation's `tag`, the signer dird uses. Our own crate; no new
+# package.
+name-attestation = { path = "../name-attestation" }
 # TESTS ONLY (docs/50 §9 tier 2): a real keyd-daemon on a real Unix socket in
 # the test's threads, with the test's own uid mapped to the role under test.
 # Workspace crates, or third-party packages already in the lock (tokio,

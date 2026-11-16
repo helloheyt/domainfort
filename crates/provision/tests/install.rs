@@ -131,7 +131,18 @@ fn provisioning_installs_files_the_daemons_accept() {
     let store = Store::open(p.database.as_path(), key, schema.schema().clone()).unwrap();
     let realm = Realm::new("EXAMPLE.TEST").unwrap();
     let nc = NamingContext::new(&["example", "test"]).unwrap();
-    let ctx = DirectoryContext::new(schema, &KeydConfig::new(realm.clone()), nc).unwrap();
+    // As dird builds its contexts (task PN10): the manifest's provisioned
+    // service objects (Q-1019 (a)) and dird's signer (common `dird_signer`).
+    let service_objects = plan
+        .manifest
+        .service_objects()
+        .into_iter()
+        .map(|set| dtyp::Guid::from_packet(set.handle.principal.as_bytes()))
+        .collect();
+    let ctx = DirectoryContext::new(schema, &KeydConfig::new(realm.clone()), nc)
+        .unwrap()
+        .with_service_objects(service_objects)
+        .with_name_resolution_signer(dird_signer());
 
     // The policy: dird's and kdc's loaders (A-68, A-69).
     let policy = read_policy(p.policy.as_path(), uid).unwrap();

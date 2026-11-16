@@ -6,15 +6,22 @@
 //!
 //! [`DirectoryContext`] is built once (schema identifiers, the reverse
 //! schemaIDGUID map, keyd's realm / enctypes / s2kparams, the namespace's
-//! realm context and the configured provisioned service objects); a
-//! [`DirectoryView`] is taken from it for each request.
+//! realm context, the configured provisioned service objects and — task
+//! PN10 — the deployment's name-resolution signer); a [`DirectoryView`] is
+//! taken from it for each request.
 //!
 //! The account source's client and service lookups are thin wrappers of the
 //! one lookup path by name, [`DirectoryView::canonical_principal`]
-//! (crate::resolve; task PN4, docs/59 §6.1, R59-5).
+//! (crate::resolve; task PN4, docs/59 §6.1, R59-5). Each record they return
+//! carries the resolution dird attests for keyd (task PN10; docs/59 §7.1,
+//! §7.5: `ClientAccount` / `ServiceAccount` `resolution`), made by the
+//! context's [`NameResolutionSigner`] from that very lookup; a context
+//! without a signer answers neither (fail closed — `AccountSourceError::
+//! Failed`), since a record without dird's statement is not one keyd will
+//! ever honour (docs/questions/Q-1046 item 2).
 //!
-//! Spec: docs/47 §1-§8 (R47-1..R47-11); docs/11 §6; docs/59 §6; kdc
-//! `accounts.rs`; pdp `pip.rs`.
+//! Spec: docs/47 §1-§8 (R47-1..R47-11); docs/11 §6; docs/59 §6, §7.1, §7.5;
+//! kdc `accounts.rs`; pdp `pip.rs`.
 
 use crate::error::{Fault, ViewError};
 use crate::groups;
@@ -22,7 +29,9 @@ use crate::names::{is_krbtgt_sid, DOMAIN_USER_RID_KRBTGT, KRBTGT};
 use crate::naming::NamingContext;
 use crate::principal::name_context_of;
 use crate::record::{self, Ids};
-use crate::resolve::{namespace_index_holds_every_key, LookupCtx};
+use crate::resolve::{
+    namespace_index_holds_every_key, LookupCtx, NameResolutionSigner, ResolvedPrincipal,
+};
 use crate::salt::{account_salt, AccountKind};
 use crate::state;
 use crate::tier::{most_privileged, TierMap};
@@ -34,7 +43,7 @@ use kdc::{
     AccountKind as KdcAccountKind, AccountSource, AccountSourceError, AccountState, ArmorPolicy,
     ClientAccount, ServiceAccount,
 };
-use keyd_types::{KeyHandle, KeyPurpose, KeydConfig, PrincipalId};
+use keyd_types::{AttestedNameResolution, KeyHandle, KeyPurpose, KeydConfig, PrincipalId};
 use krb_proto::{EtypeInfo2Entry, PrincipalName, Realm};
 use pdp::{
     AttrClass, ControlRightId, Dn, ObjClass, ObjClassChain, Pip, PipError, PropertySet, Resource,
@@ -42,6 +51,7 @@ use pdp::{
 };
 use principal_names::NameContext;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 /// Most RDN components of a DN this crate resolves or produces (project
 /// choice; bounds the walk up and down the tree — dirstore fixes no tree
@@ -84,6 +94,13 @@ pub struct DirectoryContext {
     /// ([`DirectoryContext::with_service_objects`]).
     /// Spec: docs/questions/Q-1019 option (a) (A-175); docs/59 §4.3.
     service_objects: BTreeSet<Guid>,
+    /// The deployment's attestation of a resolution (dird's attestation key
+    /// and clock — crates/ipc-directory-server `ResolutionSigner`), which
+    /// the account records carry for keyd. Absent until installed
+    /// ([`DirectoryContext::with_name_resolution_signer`]); without it the
+    /// account source answers no record (fail closed).
+    /// Spec: docs/59 §7.1, §7.4, §7.5; docs/questions/Q-1011 item 2 (A-173).
+    signer: Option<Arc<dyn NameResolutionSigner>>,
 }
 
 impl DirectoryContext {
@@ -139,6 +156,7 @@ impl DirectoryContext {
             naming_context,
             name_context,
             service_objects: BTreeSet::new(),
+            signer: None,
         })
     }
 
@@ -161,6 +179,24 @@ impl DirectoryContext {
     #[must_use]
     pub fn service_objects(&self) -> &BTreeSet<Guid> {
         &self.service_objects
+    }
+
+    /// This context with `signer` as the attestation of the resolutions its
+    /// account records carry (task PN10): dird installs its
+    /// `ResolutionSigner` — its attestation key and its clock (crates/
+    /// ipc-directory-server) — on every context it builds. Without one,
+    /// [`AccountSource::client`] / [`AccountSource::service`] answer
+    /// `AccountSourceError::Failed` (fail closed); every other question of
+    /// the view is unaffected.
+    /// Spec: docs/59 §7.1, §7.4, §7.5; docs/questions/Q-1011 item 2 (A-173),
+    /// Q-1046 item 2.
+    #[must_use]
+    pub fn with_name_resolution_signer(
+        mut self,
+        signer: Arc<dyn NameResolutionSigner>,
+    ) -> DirectoryContext {
+        self.signer = Some(signer);
+        self
     }
 
     /// The realm (keyd's).
@@ -702,6 +738,8 @@ impl DirectoryView<'_> {
         // 8. The key set (objectGUID, PrincipalLongterm) — the resolution's.
         // 9. The account kind and the armor policy (docs/48 §3.1, §7.2).
         let (kind, armor_policy) = armor_facts(account.kind);
+        // 10. dird's statement of this lookup, for keyd (task PN10).
+        let resolution = self.attested(&resolved)?;
         Ok(Some(ClientAccount {
             key: resolved.key_handle(),
             sid: account.sid,
@@ -711,6 +749,7 @@ impl DirectoryView<'_> {
             etype_info,
             kind,
             armor_policy,
+            resolution,
         }))
     }
 
@@ -739,11 +778,25 @@ impl DirectoryView<'_> {
         let obj = resolved.object();
         let account = self.account(obj)?.ok_or(Fault::Unavailable)?;
         let state = self.state_of(obj, &account)?;
+        // dird's statement of this lookup, for keyd (task PN10).
+        let resolution = self.attested(&resolved)?;
         Ok(Some(ServiceAccount {
             key: resolved.key_handle(),
             state,
             enctypes: self.ctx.enctypes.clone(),
+            resolution,
         }))
+    }
+
+    /// The resolution `resolved` attested by the context's signer — the
+    /// `resolution` of the account record built from that lookup (task
+    /// PN10). No signer, or a refusal ⇒ a fault (fail closed: the record is
+    /// not answered).
+    /// Spec: docs/59 §7.1, §7.5; docs/questions/Q-1011 item 2 (A-173),
+    /// Q-1046 item 2; AGENTS.md §6.
+    fn attested(&self, resolved: &ResolvedPrincipal) -> Result<AttestedNameResolution, Fault> {
+        let signer = self.ctx.signer.as_ref().ok_or(Fault::Unavailable)?;
+        signer.attest(resolved).map_err(|_| Fault::Unavailable)
     }
 
     /// `object_tier` of a directory object (docs/47 §6.3; A-36): its

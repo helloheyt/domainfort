@@ -26,11 +26,11 @@
 //!   create's own stamp, as the checker writes them with the create. Never a
 //!   hand-written key.
 //! * [`create_namespace_marker`] — the marker counter, with the name and the
-//!   one-value range of crates/directory-admin `PRINCIPAL_NAMESPACE_COUNTER`,
-//!   `_FIRST`, `_END_EXCLUSIVE` ([`NAMESPACE_MARKER`]: those constants are
-//!   not reachable from every crate that reuses this module; pinned equal
-//!   to them by crates/directory-admin tests/common, whose fixture runs in
-//!   every directory-admin test).
+//!   one-value range of the product's one definition,
+//!   `directory_pip::PRINCIPAL_NAMESPACE_COUNTER`, `_FIRST`, `_END_EXCLUSIVE`
+//!   (moved to crate directory-pip by task PN10 so every crate that reuses
+//!   this module reaches it — docs/questions/Q-1043 item 1, A-185; no
+//!   literal copy, no pin).
 //!
 //! An object the checker would refuse — the namespace refuses one of its
 //! names, or its record is inconsistent — has no keys to write: the helper
@@ -39,26 +39,28 @@
 //! explicitly.
 //!
 //! Source: docs/59 §4.3, §4.6, §5.1, §5.5, §6.1; docs/questions/Q-1008 item
-//! 5, Q-1026 items 4-5, Q-1029 items 1, 7, Q-1031 (A-178, A-179). Test-only;
-//! this project's own code, no other implementation consulted.
+//! 5, Q-1026 items 4-5, Q-1029 items 1, 7, Q-1031 (A-178, A-179), Q-1043
+//! item 1 (A-185). Test-only; this project's own code, no other
+//! implementation consulted.
 #![allow(dead_code)] // each including test binary uses a different subset
 
-use directory_pip::{DirectoryContext, TierMap};
+use directory_pip::{
+    DirectoryContext, TierMap, PRINCIPAL_NAMESPACE_COUNTER, PRINCIPAL_NAMESPACE_END_EXCLUSIVE,
+    PRINCIPAL_NAMESPACE_FIRST,
+};
 use dirstore::{AttributeChange, Origin, Store, WriteTxn};
 use dtyp::Guid;
 
-/// The `principal-namespace` marker: `(name, first, end_exclusive)` — a
-/// named counter whose one value is never taken (crates/directory-admin
-/// `config.rs`; docs/questions/Q-1029 item 7).
-/// Spec: docs/59 §5.2 (c), §5.5; docs/questions/Q-1008 item 5 (A-173).
-pub const NAMESPACE_MARKER: (&str, u64, u64) = ("principal-namespace", 1, 2);
-
-/// Create the `principal-namespace` marker in `txn` (module documentation).
-/// Spec: docs/59 §5.5; docs/questions/Q-1008 item 5, Q-1031.
+/// Create the `principal-namespace` marker in `txn` (module documentation)
+/// with the product's one definition of its name and range.
+/// Spec: docs/59 §5.5; docs/questions/Q-1008 item 5, Q-1031, Q-1043 item 1.
 pub fn create_namespace_marker(txn: &mut WriteTxn<'_>) {
-    let (name, first, end_exclusive) = NAMESPACE_MARKER;
-    txn.create_counter(name, first, end_exclusive)
-        .expect("the principal-namespace marker");
+    txn.create_counter(
+        PRINCIPAL_NAMESPACE_COUNTER,
+        PRINCIPAL_NAMESPACE_FIRST,
+        PRINCIPAL_NAMESPACE_END_EXCLUSIVE,
+    )
+    .expect("the principal-namespace marker");
 }
 
 /// Write the namespace keys of every principal among `created` — objects

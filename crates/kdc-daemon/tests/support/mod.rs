@@ -69,7 +69,10 @@ pub struct Handles {
     pub files: KeyHandle,
 }
 
-/// The directory context of the identities (realm EXAMPLE.ORG).
+/// The directory context of the identities (realm EXAMPLE.ORG), with
+/// dird's signer under the fixtures' test key (task PN10: the account
+/// records carry dird's attested resolution — crates/directory-daemon
+/// support `resolution_signer`).
 pub fn context() -> DirectoryContext {
     DirectoryContext::new(
         ad_schema::phase1().unwrap(),
@@ -77,6 +80,7 @@ pub fn context() -> DirectoryContext {
         dird::naming_context(),
     )
     .unwrap()
+    .with_name_resolution_signer(dird::resolution_signer())
 }
 
 impl Handles {

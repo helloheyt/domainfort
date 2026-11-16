@@ -397,9 +397,12 @@ fn the_union_probe_gives_the_phase_one_answers() {
 /// variant of a reserved name — writable through the admin plane until task
 /// PN5 — is refused when found (fail closed). (`KADMIN/changepw` needs a
 /// store of its own: the servicePrincipalName index already folds case.)
+/// The objects holding the reserved names are the configured provisioned
+/// service objects (A-163; task PN10, step 8 of the lookup — Q-1027 item 6).
 #[test]
 fn the_purpose_comes_from_the_stored_name() {
     let wt = || vec![bits(uac::ADS_UF_WORKSTATION_TRUST_ACCOUNT)];
+    let services: BTreeSet<Guid> = [70, 71].into_iter().map(guid).collect();
     let store = |test: &str, spns: &[(u32, &str, &str)]| {
         let d = Dir::new(test);
         let mut objects = d.standard_objects();
@@ -414,7 +417,7 @@ fn the_purpose_comes_from_the_stored_name() {
                 ],
             ));
         }
-        d.create_all(objects);
+        d.create_all_with_service_objects(objects, &services);
         d
     };
     let exact = store(
@@ -432,7 +435,9 @@ fn the_purpose_comes_from_the_stored_name() {
     );
     for ctx in [TgsServer, ServiceObject] {
         let purpose = |d: &Dir, parts: &[&str]| {
-            resolve(&d.view(), ctx, KRB_NT_SRV_INST, parts).map(|r| r.map(|r| r.key_purpose()))
+            let configured = d.context_with(&services);
+            let view = configured.view(&d.store, &d.empty_tiers).unwrap();
+            resolve(&view, ctx, KRB_NT_SRV_INST, parts).map(|r| r.map(|r| r.key_purpose()))
         };
         assert_eq!(
             purpose(&exact, &["admind", "dc01.example.test"]),
@@ -606,14 +611,24 @@ fn the_service_object_set_is_held_by_the_context() {
             assert_eq!(with.guid(), guid(id));
             assert_eq!(with.class(), PrincipalClass::ProvisionedService);
             assert_eq!(with.key_purpose(), purpose);
-            let without = resolve(&unlisted, ctx, KRB_NT_SRV_INST, &parts)
-                .unwrap()
-                .expect("unlisted");
-            assert_eq!(without.class(), PrincipalClass::Computer);
-            assert_eq!(
-                (without.guid(), without.matched(), without.key_purpose()),
-                (with.guid(), with.matched(), with.key_purpose())
-            );
+            let without = resolve(&unlisted, ctx, KRB_NT_SRV_INST, &parts);
+            if purpose == KeyPurpose::Service {
+                let without = without.unwrap().expect("unlisted");
+                assert_eq!(without.class(), PrincipalClass::Computer);
+                assert_eq!(
+                    (without.guid(), without.matched(), without.key_purpose()),
+                    (with.guid(), with.matched(), with.key_purpose())
+                );
+            } else {
+                // Task PN10 (A-163 at the lookup; Q-1027 item 6): a reserved
+                // purpose resolves only on a provisioned service object —
+                // unlisted, the object is a plain computer, and the lookup
+                // fails closed.
+                assert_eq!(
+                    without.map(|r| r.is_some()),
+                    Err(AccountSourceError::Failed)
+                );
+            }
         }
     }
 
@@ -626,7 +641,7 @@ fn the_service_object_set_is_held_by_the_context() {
         Err(())
     );
     assert_eq!(
-        view.client(&realm(), &name(KRB_NT_PRINCIPAL, &["alice"])),
+        found(&view.client(&realm(), &name(KRB_NT_PRINCIPAL, &["alice"]))),
         Err(AccountSourceError::Failed)
     );
 }

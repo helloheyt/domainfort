@@ -67,24 +67,17 @@ pub const CHANGE_SEQ_FIRST: u64 = 1;
 /// (half-open range); docs/questions/Q-376 item 4.
 pub const CHANGE_SEQ_END_EXCLUSIVE: u64 = u64::MAX;
 
-/// The marker of a store whose every principal got its namespace keys from
-/// the one checker (task PN5): a named counter the provisioning session
-/// creates with the other counters (A-83: counters only at provisioning) and
-/// that nothing ever takes — its presence is the fact. dird refuses to open
-/// a store without it (task PN10: fail closed, re-provision; no migration
-/// tool, which would be a second writer of the keys — docs/59 N7).
-/// Spec: docs/59 §5.2 (c), §5.5; docs/questions/Q-1008 item 5 (A-173);
-/// dirstore `MAX_COUNTER_NAME_LEN` (alphabet `a-z 0-9 . - _`).
-pub const PRINCIPAL_NAMESPACE_COUNTER: &str = "principal-namespace";
-
-/// The first (and only) value of the marker counter's range: the counter is
-/// a marker, never taken. Project choice (docs/questions/Q-1029 item 6).
-/// Spec: docs/questions/Q-1008 item 5.
-pub const PRINCIPAL_NAMESPACE_FIRST: u64 = 1;
-
-/// One past the marker counter's only value. Spec: dirstore `CounterState`
-/// (half-open range); docs/questions/Q-1029 item 6.
-pub const PRINCIPAL_NAMESPACE_END_EXCLUSIVE: u64 = 2;
+/// The `principal-namespace` marker (task PN5): its name and one-value
+/// range, defined once in crate directory-pip beside the namespace it marks
+/// (dird refuses a store without it — `directory_pip::
+/// principal_namespace_marked`, task PN10) and created, like the RID and
+/// change-seq counters, by the provisioning session only (A-83). Re-exported
+/// here under the same names (docs/questions/Q-1043 item 1, A-185).
+/// Spec: docs/59 §5.2 (c), §5.5; docs/questions/Q-1008 item 5 (A-173),
+/// Q-1029 item 6, Q-1043 item 1.
+pub use directory_pip::{
+    PRINCIPAL_NAMESPACE_COUNTER, PRINCIPAL_NAMESPACE_END_EXCLUSIVE, PRINCIPAL_NAMESPACE_FIRST,
+};
 
 /// The smallest dual-control quorum: the requester plus one other approver.
 /// There is no "single administrator" mode — a weak option has no code path

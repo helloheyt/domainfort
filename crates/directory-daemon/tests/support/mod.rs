@@ -30,6 +30,12 @@
 //!
 //! Real peer credentials on both sides; no test-only seam in the daemon.
 //!
+//! dird's name-resolution attestation key (task PN10; docs/59 §7.4) is the
+//! fixtures' test key ([`TEST_ATTESTATION_KEY`], [`attestation_key`]) in
+//! every [`params`]; a directory context a test builds for the account
+//! source carries the product's signer under that key ([`resolution_signer`]
+//! — `directory_daemon::ResolutionSigner`), as dird's own contexts do.
+//!
 //! Sources: docs/50 §3.1-§3.7, §9; docs/46 §4.4 (musts per class), §5.4;
 //! docs/47 §1.3, §1.4, §4, §9.1 (what an account object carries; the krbtgt
 //! user, RID 502); [MS-DTYP] 2.4.2.4 (SID layout). Every value is constructed
@@ -54,10 +60,10 @@ use directory_daemon::policy::{DevelopmentPolicy, MandatoryFast};
 // dev-dependency).
 use directory_daemon::test_seams::{serve, DaemonParams};
 use directory_daemon::{
-    AuditEndpoint, DaemonControl, SharedClock, StoreSource, ENGINE_QUEUE_CAPACITY,
-    LDAP_QUEUE_CAPACITY, MAX_LDAP_SESSIONS,
+    AuditEndpoint, DaemonControl, ResolutionSigner, SharedAttestationKey, SharedClock, StoreSource,
+    ATTESTATION_KEY_LEN, ENGINE_QUEUE_CAPACITY, LDAP_QUEUE_CAPACITY, MAX_LDAP_SESSIONS,
 };
-use directory_pip::{DirectoryContext, NamingContext};
+use directory_pip::{DirectoryContext, NameResolutionSigner, NamingContext};
 use dirstore::{AttrId, IntegrityKey, NewObject, NodeId, Origin, Store, Timestamp};
 use dtyp::{Control, Guid, SecurityDescriptor, Sid, SECURITY_NT_AUTHORITY};
 use keyd_types::KeydConfig;
@@ -147,6 +153,27 @@ fn sd_value() -> Vec<u8> {
     .unwrap()
 }
 
+/// dird's attestation key in these fixtures — test data, made up here (the
+/// value crates/kdc tests/common and crates/directory-pip's test signer use
+/// too). Spec: docs/59 §7.4.
+pub const TEST_ATTESTATION_KEY: [u8; ATTESTATION_KEY_LEN] = [0x4B; ATTESTATION_KEY_LEN];
+
+/// dird's attestation key, as its parameters carry it (task PN10).
+pub fn attestation_key() -> SharedAttestationKey {
+    SharedAttestationKey::from_bytes(&TEST_ATTESTATION_KEY).expect("a non-zero test key")
+}
+
+/// dird's own signer — `directory_daemon::ResolutionSigner` — under the test
+/// key, issuing at the system clock (as the daemon's default clock does),
+/// for a directory context a test builds itself (docs/59 §7.1, §7.4).
+pub fn resolution_signer() -> Arc<dyn NameResolutionSigner> {
+    let clock = SharedClock::system();
+    Arc::new(ResolutionSigner::new(
+        attestation_key(),
+        Arc::new(move || clock.now()),
+    ))
+}
+
 /// A directory in its own redb file.
 pub struct Directory {
     pub p1: Phase1Schema,
@@ -159,6 +186,21 @@ impl Directory {
     /// A store at `path` with no object (mode 0600, as dird requires), and
     /// the `principal-namespace` marker (module documentation).
     pub fn empty(path: &Path) -> Directory {
+        Directory::empty_marked(path, true)
+    }
+
+    /// The standard directory at `path` WITHOUT the `principal-namespace`
+    /// marker: a store whose principals did not all get their keys from the
+    /// one checker (from before task PN5) — the store dird refuses to open
+    /// (task PN10; docs/59 §5.5).
+    pub fn standard_without_namespace_marker(path: &Path) -> Directory {
+        let d = Directory::empty_marked(path, false);
+        d.create_all(d.standard_objects());
+        d
+    }
+
+    /// A store at `path` with no object, with or without the marker.
+    fn empty_marked(path: &Path, marked: bool) -> Directory {
         let p1 = phase1().unwrap();
         let store = Store::open(
             path,
@@ -166,9 +208,11 @@ impl Directory {
             p1.schema().clone(),
         )
         .unwrap();
-        let mut txn = store.begin_write().unwrap();
-        namespace::create_namespace_marker(&mut txn);
-        txn.commit().unwrap();
+        if marked {
+            let mut txn = store.begin_write().unwrap();
+            namespace::create_namespace_marker(&mut txn);
+            txn.commit().unwrap();
+        }
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
         Directory {
             p1,
@@ -410,6 +454,7 @@ pub fn params(
         dns_host_name: String::from("dc1.example.org"),
         audit_window: ipc_audit::WindowConfig::DEFAULT,
         clock: SharedClock::system(),
+        attestation_key: attestation_key(),
     }
 }
 

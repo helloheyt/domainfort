@@ -471,8 +471,12 @@ impl World {
     fn start_dird(&self, dnsd_uid: u32) -> DirdRun {
         let paths = &self.input.paths;
         let settings = DirdSettings::parse(&self.read(&paths.dird_config)).unwrap();
+        // Task PN10: dird's attestation key. The produced file names none
+        // until the provisioning tool writes it (task PN12); the fixtures'
+        // test key stands in (docs/questions/Q-1046 item 6).
         let mut params = directory_daemon::test_seams::DaemonParams::from(
-            directory_daemon::startup::params(&settings).unwrap(),
+            directory_daemon::startup::params(&settings, support::kdcd::dird::attestation_key())
+                .unwrap(),
         );
         params.kdc_uid = self.uid;
         params.ldap_front_uid = self.uid;

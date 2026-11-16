@@ -263,6 +263,10 @@ fn deploy_and_check(base: &Path) -> Result<(), String> {
         dns_host_name: String::from(DNS_HOST_NAME),
         audit_window: ipc_audit::WindowConfig::DEFAULT,
         clock: SharedClock::new(FixedTime),
+        // Task PN10: dird's attestation key — the fixtures' test key (the
+        // produced file names none before task PN12; docs/questions/Q-1046
+        // item 6).
+        attestation_key: support::kdcd::dird::attestation_key(),
     };
     let key =
         directory_daemon::startup::read_integrity_key(&key_path, 0).map_err(|e| e.to_string())?;

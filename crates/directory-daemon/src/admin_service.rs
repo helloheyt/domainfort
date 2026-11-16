@@ -144,7 +144,7 @@ use directory_admin::{
     RequestState as PepState, RequestStep, RequestSummary as PepSummary, RequestView,
     SetAccountExpires, SetEnabled, StepReply,
 };
-use directory_pip::{AccountKind as PipKind, DirectoryView};
+use directory_pip::{AccountKind as PipKind, DirectoryView, LookupCtx};
 use dirstore::NodeId;
 use dtyp::Guid;
 use ipc_audit::AccountExpiresValue;
@@ -153,7 +153,6 @@ use ipc_dird_admin::{
     LookupKey, Operation, PasswordSet, PasswordSetOutcome, PendingRequestState, PolicyChange,
     PolicyTier, RefusalStatus, Reply, RequestShown, RequestState, RequestSummary,
 };
-use kdc::AccountSource;
 use keyd_types::{
     AccountKind as GrantKind, AuthnError, DecidedOperation, DecisionId, DestructionPage, KeyHandle,
     OperationDigest, OperationTicket, PrincipalId, ServiceKeyHandle, SetSecretTarget,
@@ -778,22 +777,46 @@ pub(crate) fn check_manifest(
 }
 
 /// The admin service's key set: the manifest's admin-service binding
-/// resolved as the KDC resolves a service principal, and the result must be
-/// the manifest's handle — `(objectGUID, AdminService)` (module
-/// documentation).
-/// Spec: docs/47 §1.3 (`AccountSource::service`); docs/51 §5.3; A-73;
-/// docs/questions/Q-386 item 3.
+/// resolved through the one lookup path in the provisioned service object's
+/// own context (`LookupCtx::ServiceObject` — task PN10, docs/59 §6.2;
+/// docs/questions/Q-1027 item 2), and the result must be the manifest's
+/// handle — `(objectGUID, AdminService)` (module documentation). The
+/// context's provisioned service objects make the reserved purpose resolve
+/// on this object only (crate directory-pip `resolve`, step 8). No account
+/// record — and so no attested resolution — is built for this check: it is
+/// dird's own question, not the KDC's.
+/// Spec: docs/59 §6.1, §6.2 (`ServiceObject`); docs/47 §1.3; docs/51 §5.3;
+/// A-73; A-163; docs/questions/Q-386 item 3, Q-1027 items 2, 6.
 pub(crate) fn admin_service_handle(
     view: &DirectoryView<'_>,
     manifest: &Manifest,
 ) -> Result<KeyHandle, NotStarted> {
     let expected = manifest.admin_service();
-    match view.service(&expected.binding.realm, &expected.binding.name) {
-        Ok(Some(account)) if account.key == expected.handle => Ok(account.key),
+    match view.canonical_principal(
+        &expected.binding.realm,
+        &expected.binding.name,
+        LookupCtx::ServiceObject,
+    ) {
+        Ok(Some(resolved)) if resolved.key_handle() == expected.handle => Ok(resolved.key_handle()),
         Ok(Some(_)) => Err(NotStarted::AdminServiceMismatch),
         Ok(None) => Err(NotStarted::AdminServiceAbsent),
         Err(_) => Err(NotStarted::DirectoryUnreadable),
     }
+}
+
+/// The objectGUIDs of every provisioned service object the manifest names
+/// (`Manifest::service_objects` — iterated, never listed one by one): the
+/// protected objects of the write PEP and the set every directory context
+/// of dird is built with (task PN10; Q-1019 (a)) — one derivation for both.
+/// Spec: docs/51 §4.3 step 8, §5.2 row 9; A-163; docs/questions/Q-975,
+/// Q-1019 (a), Q-1043.
+#[must_use]
+pub(crate) fn service_object_guids(manifest: &Manifest) -> BTreeSet<Guid> {
+    manifest
+        .service_objects()
+        .into_iter()
+        .map(|set| guid_of(&set.handle))
+        .collect()
 }
 
 /// The key sets a key-operation request may name: the manifest's krbtgt
@@ -830,11 +853,7 @@ pub fn protected_objects(manifest: &Manifest, policy: &DevelopmentPolicy) -> Pro
         // included (A-163; docs/questions/Q-975): iterated, never listed one
         // by one, so a service object added to the manifest is protected
         // without an edit here.
-        service_objects: manifest
-            .service_objects()
-            .into_iter()
-            .map(|set| guid_of(&set.handle))
-            .collect(),
+        service_objects: service_object_guids(manifest),
         policy_principals: BTreeSet::from([policy.mandatory_fast.bootstrap_group]),
     }
 }

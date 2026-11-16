@@ -170,12 +170,15 @@ impl Domain {
         let policy = policy_file.snapshot().unwrap();
         let realm = Realm::new("EXAMPLE.TEST").unwrap();
         let nc = NamingContext::new(&["example", "test"]).unwrap();
+        // Task PN10: with dird's signer (common `dird_signer`) — the write
+        // PEP reads accounts through the view's account source.
         let ctx = DirectoryContext::new(
             ad_schema::phase1().unwrap(),
             &KeydConfig::new(realm.clone()),
             nc.clone(),
         )
-        .unwrap();
+        .unwrap()
+        .with_name_resolution_signer(dird_signer());
         let protected = ProtectedObjects {
             service_objects: BTreeSet::from([
                 plan.object(ObjectRole::LdapService).unwrap().guid,

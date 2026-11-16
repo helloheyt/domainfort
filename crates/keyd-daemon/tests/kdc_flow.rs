@@ -218,6 +218,8 @@ fn accounts() -> InMemoryAccounts {
     bob.sid = bob_sid();
     bob.groups = Default::default();
     bob.etype_info = etype_info(BOB_SALT);
+    // Task PN10: bob's record carries the resolution of bob's name.
+    bob.resolution = test_resolution(&bob_name(), BOB);
     accounts.insert_client(&realm(), &bob_name(), bob).unwrap();
     accounts
         .insert_client(&realm(), &machine_name(), machine_account())
@@ -230,6 +232,7 @@ fn accounts() -> InMemoryAccounts {
                 key: SERVICE,
                 state: kdc::AccountState::ACTIVE,
                 enctypes: vec![AES256, AES128],
+                resolution: test_resolution(&service_name(), SERVICE),
             },
         )
         .unwrap();

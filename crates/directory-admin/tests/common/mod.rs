@@ -32,6 +32,13 @@ pub mod linked;
 #[path = "../../../directory-pip/tests/common/namespace.rs"]
 pub mod namespace;
 
+/// The shared test signer of name resolutions (task PN10; docs/59 §7.4):
+/// the write PEP reads accounts through the view's account source (the
+/// subject, the self-lockout guard), whose records carry dird's attested
+/// resolution — so the fixture's context carries a signer, as dird's do.
+#[path = "../../../directory-pip/tests/common/signer.rs"]
+pub mod signer;
+
 use core::time::Duration;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -646,7 +653,8 @@ impl Domain {
         )
         .expect("open store");
         let ctx = DirectoryContext::new(p1.clone(), &KeydConfig::new(realm()), naming_context())
-            .expect("context");
+            .expect("context")
+            .with_name_resolution_signer(signer::test_signer());
         let mut subtrees = vec![
             (ou_dn("Tier0"), Tier::Tier0),
             (ou_dn("Managed"), Tier::Tier1),
@@ -918,18 +926,10 @@ impl Domain {
     /// principal's namespace keys, derived (module [`namespace`]; the
     /// service objects listed — Q-1010 item 3) and checked against
     /// [`namespace_keys`], and — with the counters — the
-    /// `principal-namespace` marker, whose name and range module
-    /// [`namespace`] spells for the crates that cannot reach this crate's
-    /// constants: pinned equal to them here.
+    /// `principal-namespace` marker, with the product's one definition of its
+    /// name and range (crate directory-pip since task PN10, re-exported by
+    /// this crate's config — docs/questions/Q-1043 item 1).
     fn provision(&self, rid_end: Option<u64>) {
-        assert_eq!(
-            namespace::NAMESPACE_MARKER,
-            (
-                directory_admin::PRINCIPAL_NAMESPACE_COUNTER,
-                directory_admin::PRINCIPAL_NAMESPACE_FIRST,
-                directory_admin::PRINCIPAL_NAMESPACE_END_EXCLUSIVE,
-            )
-        );
         let mut txn = self.store.begin_write().expect("begin write");
         if let Some(rid_end) = rid_end {
             txn.create_counter(RID_COUNTER, RID_FIRST, rid_end)

@@ -7,13 +7,16 @@
 //! * auditd is verified first — without it nothing is bound (R50-16);
 //! * the redb file must be dird's own, and the integrity key the store's
 //!   (§6.4, §7.5 step 3);
+//! * a store without the `principal-namespace` marker is not opened (task
+//!   PN10; docs/59 §5.5);
 //! * view pinning over the socket: a write committed after `BeginView` is
 //!   invisible to that view until a new one (§3.4; D39);
 //! * the view lifetime and the bound on concurrent views (§3.4);
 //! * `DescribeDomain` and `Ping` (§3.4, §7.5).
 //!
 //! Sources: docs/50 R50-2, R50-3, R50-16, §3.2, §3.4, §6.4, §7.5, §9;
-//! docs/32 §6 (D39). Every value is hand-made (tests/support).
+//! docs/32 §6 (D39); docs/59 §5.5. Every value is hand-made
+//! (tests/support).
 
 mod support;
 
@@ -232,6 +235,61 @@ fn the_redb_file_must_be_dirds_own_and_the_key_the_stores() {
     start(path, support::TEST_KEY, uid).unwrap().stop().unwrap();
 }
 
+/// docs/59 §5.2 (c), §5.5; docs/questions/Q-1008 item 5, Q-1043 (A-185:
+/// "dird refuses a store without the marker"): a store without the
+/// `principal-namespace` marker — its principals did not all get their keys
+/// from the one checker — is not opened, whichever source hands it over (an
+/// opened store or dird's file): dird does not start, binds nothing, and
+/// says why without a value; the same store with the marker starts.
+#[test]
+fn a_store_without_the_principal_namespace_marker_is_refused() {
+    let dir = TempDir::new();
+    let uid = support::my_uid(&dir);
+    if support::skip_as_root(uid) {
+        return;
+    }
+    let _auditd = FakeAuditd::start_recording_as(&dir.join("a.sock"), ipc_audit::EventSource::Dird);
+    let unmarked = Directory::standard_without_namespace_marker(&dir.join("u.redb"));
+    let error = Dird::start(
+        support::params(&dir, uid, uid, Duration::from_secs(5), 4),
+        directory_daemon::test_seams::opened(Arc::clone(&unmarked.store)),
+        support::policy(1),
+    )
+    .err()
+    .unwrap();
+    assert!(error.contains("principal-namespace"), "{error}");
+    assert!(error.contains("re-provision"), "{error}");
+    assert!(!dir.join("d.sock").exists());
+    drop(unmarked);
+    // From dird's own file too.
+    let files = test_scratch::ScratchDir::new("dird-unmarked").unwrap();
+    let path = files.join("u.redb");
+    drop(Directory::standard_without_namespace_marker(&path));
+    let error = Dird::start(
+        support::params(&dir, uid, uid, Duration::from_secs(5), 4),
+        StoreSource::File {
+            path,
+            key: IntegrityKey::from_bytes(&support::TEST_KEY),
+            owner_uid: uid,
+        },
+        support::policy(1),
+    )
+    .err()
+    .unwrap();
+    assert!(error.contains("principal-namespace"), "{error}");
+    assert!(!dir.join("d.sock").exists());
+    // The marked standard store starts.
+    let marked = Directory::standard(&dir.join("m.redb"));
+    Dird::start(
+        support::params(&dir, uid, uid, Duration::from_secs(5), 4),
+        directory_daemon::test_seams::opened(Arc::clone(&marked.store)),
+        support::policy(1),
+    )
+    .unwrap()
+    .stop()
+    .unwrap();
+}
+
 /// docs/50 §3.4 ("each connection pins one snapshot"); docs/32 §6 (D39):
 /// over the real socket, a write committed after `BeginView` is not
 /// visible through that view; the next view sees it.
@@ -246,7 +304,26 @@ fn a_pinned_view_does_not_see_a_later_write() {
         let before = view.client(&realm(), &alice()).unwrap().unwrap();
         assert!(before.state.enabled);
         w.directory.disable_alice();
-        assert_eq!(view.client(&realm(), &alice()).unwrap().unwrap(), before);
+        let again = view.client(&realm(), &alice()).unwrap().unwrap();
+        // The same record from the same snapshot — every field, and a
+        // resolution of the same lookup (only its issue time is the second
+        // dird attested it in — task PN10, docs/59 §7.1).
+        assert_eq!(again.key, before.key);
+        assert_eq!(again.sid, before.sid);
+        assert_eq!(again.groups, before.groups);
+        assert_eq!(again.tier, before.tier);
+        assert_eq!(again.state, before.state);
+        assert_eq!(again.etype_info, before.etype_info);
+        assert_eq!(again.kind, before.kind);
+        assert_eq!(again.armor_policy, before.armor_policy);
+        let (now, then) = (
+            again.resolution.resolution(),
+            before.resolution.resolution(),
+        );
+        assert_eq!(now.name_as_sent(), then.name_as_sent());
+        assert_eq!(now.canonical_name(), then.canonical_name());
+        assert_eq!(now.principal(), then.principal());
+        assert_eq!(now.snapshot(), then.snapshot());
         view.end().unwrap();
     }
     let view = kdc_side.begin_view().unwrap();
@@ -276,8 +353,8 @@ fn a_view_expires_after_its_lifetime() {
         assert!(view.client(&realm(), &alice()).unwrap().is_some());
         std::thread::sleep(Duration::from_millis(1200));
         assert_eq!(
-            view.client(&realm(), &alice()),
-            Err(AccountSourceError::Unavailable)
+            view.client(&realm(), &alice()).err(),
+            Some(AccountSourceError::Unavailable)
         );
         assert!(!view.is_open());
     }

@@ -110,6 +110,11 @@ protected-file = { path = "../protected-file" }
 admin-password-policy = { path = "../admin-password-policy" }
 
 [dev-dependencies]
+# TESTS ONLY (task PN10; docs/59 §7.4): the reused crates/kdc/tests/common fixtures tag their account records' name
+# resolutions with a test key (`test_resolution`) — crate
+# name-attestation's `tag`, the signer dird uses. Our own crate; no new
+# package.
+name-attestation = { path = "../name-attestation" }
 # TESTS ONLY (docs/52 C18, task R15; A-113): the tests open their stores by
 # path (`Store::open`, feature `test-seams`).
 dirstore = { path = "../dirstore", features = ["test-seams"] }

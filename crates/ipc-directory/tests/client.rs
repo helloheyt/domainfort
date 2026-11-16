@@ -221,13 +221,16 @@ fn a_view_carries_queries_and_passes_answers_through() {
     {
         let view = client.begin_view().unwrap();
         assert_eq!(view.id(), 41);
-        assert_eq!(view.client(&realm(), &alice()), Ok(Some(client_account())));
-        assert_eq!(view.service(&realm(), &alice()), Ok(None));
+        assert_eq!(
+            client_wire(&view.client(&realm(), &alice())),
+            client_wire(&Ok(Some(client_account())))
+        );
+        assert!(matches!(view.service(&realm(), &alice()), Ok(None)));
         // The directory's own "cannot tell" stays Failed (KRB_ERR_GENERIC),
         // exactly as the in-process view answers it.
         assert_eq!(
-            view.client(&realm(), &alice()),
-            Err(AccountSourceError::Failed)
+            view.client(&realm(), &alice()).err(),
+            Some(AccountSourceError::Failed)
         );
         assert_eq!(view.expand_groups(&sid(1010)), Ok(groups.clone()));
         assert_eq!(view.tier_of(&sid(1010), &groups), Ok(Tier::Tier1));
@@ -327,13 +330,13 @@ fn not_served_is_unavailable_never_failed() {
             let view = client.begin_view().unwrap();
             match method {
                 0 => assert_eq!(
-                    view.client(&realm(), &alice()),
-                    Err(AccountSourceError::Unavailable),
+                    view.client(&realm(), &alice()).err(),
+                    Some(AccountSourceError::Unavailable),
                     "case {n}"
                 ),
                 1 => assert_eq!(
-                    view.service(&realm(), &alice()),
-                    Err(AccountSourceError::Unavailable),
+                    view.service(&realm(), &alice()).err(),
+                    Some(AccountSourceError::Unavailable),
                     "case {n}"
                 ),
                 2 => assert_eq!(
@@ -350,8 +353,8 @@ fn not_served_is_unavailable_never_failed() {
             assert!(!view.is_open(), "case {n}");
             let sent = script.borrow().received.len();
             assert_eq!(
-                view.client(&realm(), &alice()),
-                Err(AccountSourceError::Unavailable)
+                view.client(&realm(), &alice()).err(),
+                Some(AccountSourceError::Unavailable)
             );
             drop(view);
             // Nothing more was sent: neither the query nor an EndView.
@@ -389,12 +392,12 @@ fn no_view_means_the_unavailable_directory() {
     );
     let none = UnavailableDirectory;
     assert_eq!(
-        none.client(&realm(), &alice()),
-        Err(AccountSourceError::Unavailable)
+        none.client(&realm(), &alice()).err(),
+        Some(AccountSourceError::Unavailable)
     );
     assert_eq!(
-        none.service(&realm(), &alice()),
-        Err(AccountSourceError::Unavailable)
+        none.service(&realm(), &alice()).err(),
+        Some(AccountSourceError::Unavailable)
     );
     assert_eq!(none.expand_groups(&sid(1)), Err(PipError::Unavailable));
     assert_eq!(

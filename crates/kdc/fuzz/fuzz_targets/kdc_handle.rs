@@ -36,8 +36,12 @@
 //! it stays within the armor TGT's life. Every table the KDC and keyd keep
 //! is bounded, so state growth is bounded.
 //!
+//! Every account record carries the name resolution dird would attest for it
+//! (task PN10; docs/59 §7.1, §7.5), tagged with a harness key through crate
+//! name-attestation's `tag`; the KDC carries it unread until task PN11.
+//!
 //! Spec: RFC 4120 7.2.1, 7.2.2, 5.1.4, 5.9.1; RFC 6113 5.4.1.1, 5.4.2,
-//! 5.4.3, 5.4.6; docs/48 §9.2 item 16; AGENTS.md §6.
+//! 5.4.3, 5.4.6; docs/48 §9.2 item 16; docs/59 §7.1; AGENTS.md §6.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, OnceLock};
@@ -48,11 +52,15 @@ use kdc::{
     InMemoryAccounts, Kdc, KdcConfig, KdcReply, Peer, PolicyInputs, RateLimiter, ServiceAccount,
     TcpFrame, Transport,
 };
+// keyd's account kind (of a set-secret decision) beside the KDC's (of an
+// account record): two types, so keyd's is renamed here (the harness did
+// not build with both under one name — docs/questions/Q-1046 item 8).
 use keyd::{
-    AccountKind, AuditRecord, CallerId, InMemoryKeyStore, KeyHandle, KeyPurpose, Keyd, KeydConfig,
+    AccountKind as SecretAccountKind, AuditRecord, CallerId, InMemoryKeyStore, KeyHandle, KeyPurpose, Keyd, KeydConfig,
     LocalKeyd, OsEntropy, PrincipalBinding, PrincipalId, Role, SetSecretTarget,
     MAX_SET_SECRET_GRANT_SECS,
 };
+use keyd_types::{AttestedNameResolution, NameResolution, NameResolutionFields};
 use krb_crypto::{EncType, KeyUsage, ProtocolKey};
 use krb_proto::constants::{
     FX_FAST_ARMOR_AP_REQUEST, PA_ENCRYPTED_CHALLENGE, PA_ENC_TIMESTAMP, PA_FX_COOKIE, PA_FX_FAST,
@@ -71,6 +79,26 @@ use pdp::{
     ActionClass, ActionMatch, AuthMatch, ContextMatch, Effect, IpScope, Match, Pip, PipError,
     PolicySnapshot, PolicyVersion, ResourceMatch, RlKey, Rule, RuleId, SubjectMatch, Tier,
 };
+
+/// The resolution dird would attest for `name` in `realm` resolving to `key`
+/// (docs/59 §7.1), issued at the harness's base time and tagged with a
+/// harness key (task PN10).
+fn resolution(realm: &Realm, name: &PrincipalName, key: KeyHandle) -> AttestedNameResolution {
+    let resolution = NameResolution::new(NameResolutionFields {
+        realm_as_sent: realm.clone(),
+        name_as_sent: name.clone(),
+        canonical_realm: realm.clone(),
+        canonical_name: name.clone(),
+        principal: key.principal,
+        key_purpose: key.purpose,
+        snapshot: 1,
+        issued_at: base_time(),
+    })
+    .expect("a resolution within its bounds");
+    let harness_key =
+        name_attestation::AttestationKey::from_bytes(&[0x4B; 32]).expect("a harness key");
+    name_attestation::tag(&harness_key, &resolution).expect("a tagged resolution")
+}
 
 struct NoKeydAudit;
 impl keyd::AuditSink for NoKeydAudit {
@@ -447,14 +475,14 @@ fn build() -> FuzzState {
     }
     for (kind, handle, binding, password, salt) in [
         (
-            AccountKind::User,
+            SecretAccountKind::User,
             client,
             client_name.clone(),
             USER_PASSWORD,
             USER_SALT,
         ),
         (
-            AccountKind::Computer,
+            SecretAccountKind::Computer,
             machine_handle,
             machine_name.clone(),
             MACHINE_PASSWORD,
@@ -517,6 +545,7 @@ fn build() -> FuzzState {
                 etype_info: etype_info(USER_SALT),
                 kind: AccountKind::User,
                 armor_policy: ArmorPolicy::Required,
+                resolution: resolution(&realm, &client_name, client),
             },
         )
         .expect("client inserted");
@@ -533,6 +562,7 @@ fn build() -> FuzzState {
                 etype_info: etype_info(MACHINE_SALT),
                 kind: AccountKind::Computer,
                 armor_policy: ArmorPolicy::BootstrapAllowed,
+                resolution: resolution(&realm, &machine_name, machine_handle),
             },
         )
         .expect("computer inserted");
@@ -544,6 +574,7 @@ fn build() -> FuzzState {
                 key: service,
                 state: AccountState::ACTIVE,
                 enctypes: vec![18, 17],
+                resolution: resolution(&realm, &service_name, service),
             },
         )
         .expect("service inserted");

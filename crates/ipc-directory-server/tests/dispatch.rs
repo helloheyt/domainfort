@@ -25,13 +25,13 @@ use core::time::Duration;
 use directory_pip::TierMap;
 use ipc::{decode_reply, encode_frame, Direction, FrameLimit, Refused, Reply};
 use ipc_directory::typed::{Query, Request};
-use ipc_directory::wire::DirectoryReply;
+use ipc_directory::wire::{DirectoryReply, WireClient, WireService};
 use ipc_directory::{
     Connection, Connector, DirectoryClient, TransportError, Unserved, ViewFailure,
     DIRECTORY_CHANNEL,
 };
 use ipc_directory_server::{DirectoryServer, Dispatch, StartError, ViewLimits};
-use kdc::AccountSource;
+use kdc::{AccountSource, AccountSourceError, ClientAccount, ServiceAccount};
 use krb_proto::constants::{KRB_NT_PRINCIPAL, KRB_NT_SRV_HST};
 use pdp::{Pip, PolicyVersion, Tier};
 use std::cell::{Cell, RefCell};
@@ -166,6 +166,35 @@ fn refusal_of(dispatch: Dispatch) -> Refused {
     }
 }
 
+/// The wire form of a client answer: account records have no `PartialEq`
+/// (the resolution they carry has a tag compared only in constant time, by
+/// keyd — task PN10), so the remote and the direct answers are compared as
+/// the channel carries them, octet for octet — the resolution's fields and
+/// tag included (both views sign with the same test signer at the same
+/// fixed time, crates/directory-pip tests/common/signer.rs).
+fn client_wire(
+    answer: &Result<Option<ClientAccount>, AccountSourceError>,
+) -> Result<Option<WireClient>, AccountSourceError> {
+    match answer {
+        Ok(record) => Ok(record
+            .as_ref()
+            .map(|account| WireClient::from_account(account).unwrap())),
+        Err(error) => Err(*error),
+    }
+}
+
+/// The wire form of a service answer (as [`client_wire`]).
+fn service_wire(
+    answer: &Result<Option<ServiceAccount>, AccountSourceError>,
+) -> Result<Option<WireService>, AccountSourceError> {
+    match answer {
+        Ok(record) => Ok(record
+            .as_ref()
+            .map(|account| WireService::from_account(account).unwrap())),
+        Err(error) => Err(*error),
+    }
+}
+
 /// docs/50 R50-2, §3.4; docs/47 §8.1, §8.2: every `AccountSource` and `Pip`
 /// method the kdc asks, through the remote view, equals the direct
 /// `DirectoryView` over the same store and tier map — records, `None`,
@@ -198,13 +227,13 @@ fn every_answer_through_the_remote_view_equals_the_direct_view() {
         let expected = direct.client(&realm(), client_name);
         found += usize::from(matches!(expected, Ok(Some(_))));
         assert_eq!(
-            remote.client(&realm(), client_name),
-            expected,
+            client_wire(&remote.client(&realm(), client_name)),
+            client_wire(&expected),
             "{client_name:?}"
         );
         assert_eq!(
-            remote.client(&other_realm, client_name),
-            direct.client(&other_realm, client_name)
+            client_wire(&remote.client(&other_realm, client_name)),
+            client_wire(&direct.client(&other_realm, client_name))
         );
     }
     assert_eq!(found, 5, "alice, bob, rootadmin, ws01$, dc01$");
@@ -221,8 +250,8 @@ fn every_answer_through_the_remote_view_equals_the_direct_view() {
         let expected = direct.service(&realm(), service_name);
         found += usize::from(matches!(expected, Ok(Some(_))));
         assert_eq!(
-            remote.service(&realm(), service_name),
-            expected,
+            service_wire(&remote.service(&realm(), service_name)),
+            service_wire(&expected),
             "{service_name:?}"
         );
     }
@@ -288,7 +317,10 @@ fn a_view_is_pinned_to_its_snapshot() {
         let mut txn = d.store.begin_write().unwrap();
         txn.delete_object(guid(BOB), &d.origin()).unwrap();
         txn.commit().unwrap();
-        assert_eq!(view.client(&realm(), &alice).unwrap().unwrap(), before);
+        assert_eq!(
+            client_wire(&view.client(&realm(), &alice)),
+            client_wire(&Ok(Some(before)))
+        );
         assert!(view.client(&realm(), &bob).unwrap().is_some());
         // The direct view taken now sees the writes.
         let fresh = d.view();

@@ -55,11 +55,10 @@ use crate::registration::DecisionRegistration;
 use core::fmt;
 use core::net::IpAddr;
 use core::time::Duration;
-use directory_pip::DirectoryView;
+use directory_pip::{DirectoryView, LookupCtx};
 use ipc_kpasswd::{
     ApRepOctets, ChangePasswordRequest, KrbPrivOctets, ObservedAddress, SealedReply,
 };
-use kdc::AccountSource;
 use keyd_types::{
     AuthnError, ChangePasswordContext, ChangePasswordCtxId, HostAddr, KeyHandle, KeyPurpose,
     PrincipalId,
@@ -195,13 +194,16 @@ pub(crate) fn change_password_service_handle(
     manifest: &Manifest,
 ) -> Result<KeyHandle, KpasswdNotStarted> {
     let name = change_password_service_name().ok_or(KpasswdNotStarted::Configuration)?;
-    match view.service(realm, &name) {
-        Ok(Some(account))
-            if account.key.purpose == KeyPurpose::ChangePasswordService
-                && account.key.purpose == KeyPurpose::of_service_name(&name)
-                && account.key == manifest.change_password_service().handle =>
+    // Task PN10 (docs/59 §6.2; docs/questions/Q-1027 item 2): the provisioned
+    // service object's own context, through the one lookup path — no account
+    // record, and so no attested resolution, is built for dird's own check.
+    match view.canonical_principal(realm, &name, LookupCtx::ServiceObject) {
+        Ok(Some(resolved))
+            if resolved.key_purpose() == KeyPurpose::ChangePasswordService
+                && resolved.key_purpose() == KeyPurpose::of_service_name(&name)
+                && resolved.key_handle() == manifest.change_password_service().handle =>
         {
-            Ok(account.key)
+            Ok(resolved.key_handle())
         }
         Ok(_) => Err(KpasswdNotStarted::ServiceAbsent),
         Err(_) => Err(KpasswdNotStarted::DirectoryUnreadable),

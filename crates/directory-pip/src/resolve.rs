@@ -43,6 +43,12 @@
 //!    (`principal_names::reserved_name_of`, Q-1009 items 1-2) — the two
 //!    disagree only for a case variant of a reserved name, which is refused
 //!    (class C49: one name, one equivalence).
+//! 8. **The claim of a reserved purpose** (A-163 at the lookup; task PN10,
+//!    docs/questions/Q-1027 item 6): an `AdminService` or
+//!    `ChangePasswordService` key set resolves only on a provisioned service
+//!    object (class `ProvisionedService`, from the configured set); on any
+//!    other object it is a fault (fail closed).
+//! 9. **The snapshot** (module documentation, "`snapshot`").
 //!
 //! # The probe — the union index (task PN4b; docs/questions/Q-1026)
 //!
@@ -83,6 +89,10 @@
 //!   from the resolved object (its stored canonical name, its class), and a
 //!   stored name whose octet-defined purpose disagrees with its folded
 //!   reservation is refused.
+//! - **C3 on dird's side (M4; task PN10)** — the key that attests "name N
+//!   is key set K" could be applied to a mapping no lookup made: the signer
+//!   accepts only a [`ResolvedPrincipal`] (module documentation, "From a
+//!   resolution to dird's statement").
 //!
 //! # Residuals (documented, not hidden)
 //!
@@ -100,18 +110,48 @@
 //!   variant of a reserved name; a "@" in a sAMAccountName, or one equal to
 //!   the realm alias, is a name no request can probe (Q-1026 item 3).
 //! - Whether a resolved reserved purpose belongs to the provisioning claim
-//!   that owns it (A-163) is the writer's check (task PN5); the lookup knows
-//!   only the configured provisioned service objects as a set (Q-1019), and
-//!   dird does not pass that set yet (task PN10; docs/questions/Q-1027).
-//! - dirstore exposes no change sequence of a snapshot, so a
-//!   `ResolvedPrincipal` carries none; `NameResolution.snapshot` is task
-//!   PN10's (Q-1027).
+//!   that owns it (A-163) is first the writer's check (task PN5). The lookup
+//!   knows the provisioned service objects only as a set (Q-1019), which
+//!   dird passes from its manifest since task PN10 (docs/questions/Q-1027
+//!   item 7, Q-1043): step 8 below refuses a reserved purpose on any other
+//!   object. A context without the set (dird without its admin service,
+//!   which has no manifest) therefore resolves no reserved name — fail
+//!   closed (docs/questions/Q-1046).
 //!
-//! Spec: docs/59 §4.6, §4.7, §5.3, §6.1-§6.3, §10 (the PN4 row); docs/47
-//! §1.3 (R47-1), §1.4 (R47-2), R47-13; docs/questions/Q-1007 items 1-4,
-//! 8, 10, Q-1009 items 1-3, Q-1018 items 2, 5, Q-1019 (a), Q-1026 (the
-//! switch, task PN4b), Q-1036 item 6; A-27; A-178; [MS-KILE] v20261110
-//! 3.1.5.7, 3.3.5.1.1, 3.3.5.1.2, 3.3.5.6.1; RFC 4120 §6.2, §7.3.
+//! # From a resolution to dird's statement (task PN10; docs/59 §7)
+//!
+//! [`ResolvedPrincipal::name_resolution`] is the one conversion of a
+//! resolution into the `keyd_types::NameResolution` keyd verifies (docs/59
+//! §7.1): the request's realm and name, the canonical realm and name, the
+//! principal and the key purpose — each the resolution's own — the
+//! `snapshot` ([`ResolvedPrincipal::snapshot`]) and the issue time the
+//! caller's clock gives. A [`NameResolutionSigner`] — dird's attestation
+//! key, held by crates/ipc-directory-server — attests a resolution, and its
+//! one method takes a [`ResolvedPrincipal`], the capability only this
+//! module builds: dird's key tags only what the one lookup path resolved,
+//! never a mapping some other code put together (class C3 on dird's side —
+//! docs/59 §3 M4; AGENTS.md §6.1 "a type that can only be built after the
+//! check"). This crate links no MAC (A-63, D182): the signer is a trait
+//! object the deployment installs (`DirectoryContext::
+//! with_name_resolution_signer`).
+//!
+//! **`snapshot`.** dirstore exposes no change sequence of a snapshot (Q-1027
+//! item 4 (b)); the value carried is the `origin_seq` — the change-seq of
+//! docs/29 §2 — of the stamp on the probed `PRINCIPAL_NAME_KEY` value: the
+//! write in which the one checker bound the requested key to this object.
+//! Every object the probe reaches holds that stamped value (the probe found
+//! it by it), so the field never needs a counter a store might lack, and a
+//! key freed by a delete and bound again to another object later carries a
+//! later sequence (docs/59 §9 S7). docs/questions/Q-1046 item 3 records the
+//! choice.
+//!
+//! Spec: docs/59 §4.6, §4.7, §5.3, §6.1-§6.3, §7.1, §7.4, §10 (the PN4 and
+//! PN10 rows); docs/47 §1.3 (R47-1), §1.4 (R47-2), R47-13;
+//! docs/questions/Q-1007 items 1-4, 8, 10, Q-1009 items 1-3, Q-1011 items
+//! 1, 2 (A-173), Q-1018 items 2, 5, Q-1019 (a), Q-1026 (the switch, task
+//! PN4b), Q-1027 items 4, 6, 7 (A-178), Q-1036 item 6; A-27; A-163; A-178;
+//! [MS-KILE] v20261110 3.1.5.7, 3.3.5.1.1, 3.3.5.1.2, 3.3.5.6.1; RFC 4120
+//! §5.2.3, §6.2, §7.3; docs/29 §2 (change-seq).
 
 use crate::error::Fault;
 use crate::salt::AccountKind;
@@ -120,9 +160,12 @@ use ad_schema::{Phase1Schema, PRINCIPAL_NAME_KEY};
 use dirstore::Object;
 use dtyp::{Guid, Sid};
 use kdc::AccountSourceError;
-use keyd_types::{KeyHandle, KeyPurpose, PrincipalId};
+use keyd_types::{
+    AttestedNameResolution, KeyHandle, KeyPurpose, NameResolution, NameResolutionError,
+    NameResolutionFields, PrincipalId,
+};
 use krb_proto::constants::KRB_NT_UNKNOWN;
-use krb_proto::{KerberosString, PrincipalName, Realm};
+use krb_proto::{KerberosString, KerberosTime, PrincipalName, Realm};
 use principal_names::{
     key_of_request, keys_of_names, reserved_name_of, KindSet, NameKind, PrincipalClass,
     PrincipalKey, RequestKey, ReservedName, MAX_KEY_OCTETS,
@@ -257,6 +300,9 @@ pub struct ResolvedPrincipal {
     canonical_name: PrincipalName,
     /// The purpose of its key set, from the canonical name (Q-1009 item 3).
     key_purpose: KeyPurpose,
+    /// The change-seq (`origin_seq`) of the write that bound the probed key
+    /// to the object (module documentation, "`snapshot`").
+    snapshot: u64,
 }
 
 impl ResolvedPrincipal {
@@ -340,6 +386,49 @@ impl ResolvedPrincipal {
         KeyHandle::new(self.principal, self.key_purpose)
     }
 
+    /// The change-seq of the write that bound the probed key to the object
+    /// — the `snapshot` of the resolution dird states (module documentation,
+    /// "`snapshot`").
+    /// Spec: docs/59 §4.7 (`snapshot`), §7.1; docs/29 §2 (change-seq);
+    /// docs/questions/Q-1027 item 4 (b), Q-1046 item 3.
+    #[must_use]
+    pub fn snapshot(&self) -> u64 {
+        self.snapshot
+    }
+
+    /// The resolution dird states for this lookup (docs/59 §7.1), issued at
+    /// `issued_at` (the attesting process's clock — dird's; keyd checks it
+    /// against its own, R50-5): the request's realm and name, the canonical
+    /// realm and name, the principal and key purpose and the
+    /// [`ResolvedPrincipal::snapshot`] — every field this resolution's own,
+    /// none taken from the caller but the time. The one conversion
+    /// (module documentation); a [`NameResolutionSigner`] tags its result.
+    ///
+    /// # Errors
+    /// `NameResolutionError` if a name or realm is outside the bounds of a
+    /// resolution (keyd-types: at most `MAX_NAME_COMPONENTS` components of
+    /// at most `MAX_NAME_OCTETS` octets — the bounds of a key set's binding,
+    /// so a name no key set can be bound to is never attested). The caller
+    /// refuses then (fail closed).
+    ///
+    /// Spec: docs/59 §4.7, §7.1; docs/questions/Q-1011 item 1 (A-173),
+    /// Q-1027 item 4; RFC 4120 §5.2.3; AGENTS.md §6.
+    pub fn name_resolution(
+        &self,
+        issued_at: KerberosTime,
+    ) -> Result<NameResolution, NameResolutionError> {
+        NameResolution::new(NameResolutionFields {
+            realm_as_sent: self.realm_as_sent.clone(),
+            name_as_sent: self.name_as_sent.clone(),
+            canonical_realm: self.canonical_realm.clone(),
+            canonical_name: self.canonical_name.clone(),
+            principal: self.principal,
+            key_purpose: self.key_purpose,
+            snapshot: self.snapshot,
+            issued_at,
+        })
+    }
+
     /// The object itself, for the account records built in this crate.
     pub(crate) fn object(&self) -> &Object {
         &self.object
@@ -356,8 +445,51 @@ impl core::fmt::Debug for ResolvedPrincipal {
             .field("canonical_realm", &self.canonical_realm)
             .field("canonical_name", &self.canonical_name)
             .field("key_purpose", &self.key_purpose)
+            .field("snapshot", &self.snapshot)
             .finish_non_exhaustive()
     }
+}
+
+/// A [`NameResolutionSigner`] did not attest a resolution: the clock could
+/// not be read, a name is outside a resolution's bounds, or the MAC failed.
+/// No data (nothing about the key can reach it). The lookup that asked for
+/// the attestation refuses (fail closed).
+/// Spec: AGENTS.md §6 (fail closed; no secret in an error); A-145 RC-7.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SignerRefused;
+
+impl core::fmt::Display for SignerRefused {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("name resolution not attested")
+    }
+}
+
+impl std::error::Error for SignerRefused {}
+
+/// dird's attestation of what the one lookup path resolved (task PN10;
+/// docs/59 §7.1, §7.4; decision A-173 — docs/questions/Q-1011 item 2): turn
+/// a [`ResolvedPrincipal`] into the `keyd_types::AttestedNameResolution`
+/// the KDC forwards to keyd — [`ResolvedPrincipal::name_resolution`] at the
+/// attesting process's clock, tagged with dird's attestation key
+/// (HMAC-SHA-256, crate `name-attestation`).
+///
+/// The implementation holds the key and the clock; this crate links neither
+/// (A-63, D182). The one product implementation is crates/
+/// ipc-directory-server's `ResolutionSigner`; tests implement it with a
+/// test key. Taking a [`ResolvedPrincipal`] — built only by the one lookup
+/// path — is what keeps the key from attesting anything else (module
+/// documentation).
+///
+/// Spec: docs/59 §3 (M4), §7.1, §7.2 (what keyd checks: the tag, the
+/// canonical realm, `|now − issued_at| ≤ 30 s`), §7.4; docs/questions/
+/// Q-1011 items 1-3 (A-173); AGENTS.md §6.1.
+pub trait NameResolutionSigner: Send + Sync {
+    /// Attest `resolved` at the signer's clock.
+    ///
+    /// # Errors
+    /// [`SignerRefused`].
+    fn attest(&self, resolved: &ResolvedPrincipal)
+        -> Result<AttestedNameResolution, SignerRefused>;
 }
 
 /// `true` if the stored SPN `stored` is the request's components joined
@@ -528,6 +660,30 @@ impl DirectoryView<'_> {
             AcceptedName::SamAccountName => KeyPurpose::PrincipalLongterm,
             AcceptedName::ServicePrincipalName => service_purpose(&canonical_name, &key)?,
         };
+        // 8. A reserved purpose belongs only to the provisioning claim that
+        //    owns it (A-163): the admin and change-password key sets are a
+        //    provisioned service object's, never another computer's — a
+        //    store holding one elsewhere was written beneath the checker
+        //    (fail closed; docs/questions/Q-1027 item 6).
+        if (key_purpose == KeyPurpose::AdminService
+            || key_purpose == KeyPurpose::ChangePasswordService)
+            && names.class != PrincipalClass::ProvisionedService
+        {
+            return Err(Fault::Unavailable);
+        }
+        // 9. The snapshot: the change-seq of the probed key's value (module
+        //    documentation, "`snapshot`"); the probe found the object by it,
+        //    so its absence is an inconsistency (fail closed).
+        let snapshot = object
+            .attribute(PRINCIPAL_NAME_KEY)
+            .and_then(|attribute| {
+                attribute
+                    .values
+                    .iter()
+                    .find(|value| value.value == key.as_bytes())
+            })
+            .map(|value| value.stamp.origin_seq)
+            .ok_or(Fault::Unavailable)?;
         Ok(Some(ResolvedPrincipal {
             principal: principal_id(object.guid),
             sid: account.sid,
@@ -540,6 +696,7 @@ impl DirectoryView<'_> {
             canonical_realm: self.ctx.realm().clone(),
             canonical_name,
             key_purpose,
+            snapshot,
             object,
         }))
     }

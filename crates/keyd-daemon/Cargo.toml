@@ -94,6 +94,11 @@ protected-file = { path = "../protected-file" }
 test-seams = []
 
 [dev-dependencies]
+# TESTS ONLY (task PN10; docs/59 §7.4): the reused crates/kdc/tests/common fixtures and tests/kdc_flow.rs tag their
+# account records' name resolutions with a test key (`test_resolution`) — crate
+# name-attestation's `tag`, the signer dird uses. Our own crate; no new
+# package.
+name-attestation = { path = "../name-attestation" }
 # TESTS ONLY (docs/52 C18, task R15): this crate's own tests use its test
 # seams (`test_seams`).
 keyd-daemon = { path = ".", features = ["test-seams"] }

@@ -16,6 +16,17 @@
 //! holds at most one record per (realm, name) and role; returning two
 //! (RFC 4120 7.5.9 KDC_ERR_PRINCIPAL_NOT_UNIQUE) is not expressible here.
 //!
+//! Every record also carries the **resolution** dird attests for it (task
+//! PN10; docs/59 §7.1, §7.5): the `keyd_types::AttestedNameResolution` of
+//! the lookup that produced the record — which realm and name were asked,
+//! which canonical name and key set they resolved to, when — tagged with
+//! dird's attestation key. The KDC does not read it: it only forwards it to
+//! keyd, which verifies it before it binds a key (docs/59 §7.2; that
+//! forwarding is task PN11 — until then the field is carried and ignored).
+//! This crate links no MAC (D182): the tag is opaque octets here, and
+//! records have no `PartialEq` because a tag is compared only in constant
+//! time, by keyd (crate name-attestation; docs/questions/Q-1046 item 4).
+//!
 //! [`InMemoryAccounts`] is the in-memory implementation used by the tests and
 //! the fuzz target. The directory-backed implementation (dirstore + the AD
 //! schema subset of [MS-ADSC] / [MS-ADA1-3]) is the `directory-pip` crate
@@ -25,11 +36,12 @@
 //! Spec: main-session decisions 3, 4, 8; docs/11 §1 (Subject: principal,
 //! groups, tier — from authoritative data, never client-claimed, P3); docs/25
 //! §4 (re-evaluation at use, D53); RFC 4120 3.1.3, 3.3.3.1, 5.2.7.5, 6.2,
-//! 7.5.9; docs/50 §3.7 (R50-8); docs/questions/Q-217 (A-56).
+//! 7.5.9; docs/50 §3.7 (R50-8); docs/questions/Q-217 (A-56); docs/59 §7.1,
+//! §7.5, §10 (the PN10 row); docs/questions/Q-1011 items 1, 8 (A-173).
 
 use crate::names::{same_name, same_realm};
 use dtyp::Sid;
-use keyd_types::KeyHandle;
+use keyd_types::{AttestedNameResolution, KeyHandle};
 use krb_proto::{EtypeInfo2Entry, KerberosString, KerberosTime, PrincipalName, Realm};
 use pdp::Tier;
 use std::collections::{BTreeMap, BTreeSet};
@@ -122,8 +134,9 @@ pub enum ArmorPolicy {
 /// TGS time). Not secret.
 ///
 /// Spec: main-session decision 3; docs/11 §1 (Subject); RFC 4120 5.2.7.5;
-/// docs/48 §3.1, §7.2 (`kind`, `armor_policy`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// docs/48 §3.1, §7.2 (`kind`, `armor_policy`); docs/59 §7.1, §7.5
+/// (`resolution`).
+#[derive(Debug, Clone)]
 pub struct ClientAccount {
     /// keyd handle of the client's long-term key set (purpose
     /// `PrincipalLongterm`, docs/10 §4).
@@ -143,6 +156,11 @@ pub struct ClientAccount {
     pub kind: AccountKind,
     /// Whether an unarmored AS is allowed (docs/48 §7.2 layer 1).
     pub armor_policy: ArmorPolicy,
+    /// dird's attested resolution of the name this record was looked up by
+    /// (module documentation): forwarded to keyd, never read here (task
+    /// PN11 forwards it). Not secret.
+    /// Spec: docs/59 §7.1, §7.5; docs/questions/Q-1011 items 1, 8.
+    pub resolution: AttestedNameResolution,
 }
 
 impl ClientAccount {
@@ -170,8 +188,8 @@ impl ClientAccount {
 ///
 /// Spec: main-session decisions 3, 8; RFC 4120 3.1.3 ("information from the
 /// Kerberos database indicating acceptable encryption methods for the
-/// application server").
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// application server"); docs/59 §7.1, §7.5 (`resolution`).
+#[derive(Debug, Clone)]
 pub struct ServiceAccount {
     /// keyd handle of the service key set (purpose `Service`, docs/10 §5).
     pub key: KeyHandle,
@@ -179,6 +197,11 @@ pub struct ServiceAccount {
     pub state: AccountState,
     /// Encryption types the service accepts for its session keys.
     pub enctypes: Vec<i32>,
+    /// dird's attested resolution of the name this record was looked up by
+    /// (module documentation): forwarded to keyd, never read here (task
+    /// PN11 forwards it). Not secret.
+    /// Spec: docs/59 §7.1, §7.5; docs/questions/Q-1011 items 1, 8.
+    pub resolution: AttestedNameResolution,
 }
 
 /// The account source could not answer. The request fails closed either
@@ -389,18 +412,44 @@ impl NamedPrincipal {
 
 #[cfg(test)]
 mod tests {
+    //! Sources: main-session decisions 3, 4, 8; RFC 4120 3.3.3.1, 6.2;
+    //! docs/48 §3.1, §7.2-§7.3; docs/59 §7.1 (the resolution a record
+    //! carries — here dird's statement made up for the record, tagged with
+    //! a test key by crate name-attestation's signer, a dev-dependency).
+    //! Every value is constructed by hand.
     use super::*;
-    use keyd_types::{KeyPurpose, PrincipalId};
+    use keyd_types::{KeyPurpose, NameResolution, NameResolutionFields, PrincipalId};
 
     fn principal(parts: &[&str], name_type: i32) -> NamedPrincipal {
         NamedPrincipal::from_text("EXAMPLE.ORG", name_type, parts).unwrap()
     }
 
+    /// The resolution dird would attest for `who` resolving to `key`
+    /// (docs/59 §7.1), tagged with a test key. The unit tests' one helper
+    /// (the integration tests' is tests/common `test_resolution`).
+    fn resolution(who: &NamedPrincipal, key: KeyHandle) -> AttestedNameResolution {
+        let resolution = NameResolution::new(NameResolutionFields {
+            realm_as_sent: who.realm.clone(),
+            name_as_sent: who.name.clone(),
+            canonical_realm: who.realm.clone(),
+            canonical_name: who.name.clone(),
+            principal: key.principal,
+            key_purpose: key.purpose,
+            snapshot: 1,
+            issued_at: KerberosTime::new(2026, 11, 16, 10, 0, 0).unwrap(),
+        })
+        .unwrap();
+        let test_key = name_attestation::AttestationKey::from_bytes(&[0x4B; 32]).unwrap();
+        name_attestation::tag(&test_key, &resolution).unwrap()
+    }
+
     fn service() -> ServiceAccount {
+        let key = KeyHandle::new(PrincipalId::from_bytes([1; 16]), KeyPurpose::Service);
         ServiceAccount {
-            key: KeyHandle::new(PrincipalId::from_bytes([1; 16]), KeyPurpose::Service),
+            key,
             state: AccountState::ACTIVE,
             enctypes: vec![18],
+            resolution: resolution(&principal(&["host", "a.example.org"], 3), key),
         }
     }
 
@@ -428,13 +477,13 @@ mod tests {
         );
         source.set_unavailable(true);
         assert_eq!(
-            source.service(&p.realm, &p.name),
-            Err(AccountSourceError::Unavailable)
+            source.service(&p.realm, &p.name).err(),
+            Some(AccountSourceError::Unavailable)
         );
         source.set_failing(true);
         assert_eq!(
-            source.client(&p.realm, &p.name),
-            Err(AccountSourceError::Failed)
+            source.client(&p.realm, &p.name).err(),
+            Some(AccountSourceError::Failed)
         );
         source.set_failing(false);
         assert!(source.service(&p.realm, &p.name).unwrap().is_some());
@@ -446,11 +495,12 @@ mod tests {
     /// may armor.
     #[test]
     fn bootstrap_and_armor_need_a_computer_account() {
+        let key = KeyHandle::new(
+            PrincipalId::from_bytes([2; 16]),
+            KeyPurpose::PrincipalLongterm,
+        );
         let account = |kind, armor_policy| ClientAccount {
-            key: KeyHandle::new(
-                PrincipalId::from_bytes([2; 16]),
-                KeyPurpose::PrincipalLongterm,
-            ),
+            key,
             sid: Sid::new(dtyp::SECURITY_NT_AUTHORITY, &[21, 1, 2, 3, 1000]).unwrap(),
             groups: BTreeSet::new(),
             tier: Tier::Tier2,
@@ -458,6 +508,7 @@ mod tests {
             etype_info: Vec::new(),
             kind,
             armor_policy,
+            resolution: resolution(&principal(&["ws01$"], 1), key),
         };
         let cases = [
             (

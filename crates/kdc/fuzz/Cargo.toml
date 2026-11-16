@@ -49,6 +49,15 @@ path = "../../dtyp"
 [dependencies.krb-crypto]
 path = "../../krb-crypto"
 
+# Task PN10 (docs/59 §7.1, §7.4): every account record carries dird's
+# attested name resolution — its types (keyd-types) and a harness tag made
+# with name-attestation's signer, as dird does (our own crates).
+[dependencies.keyd-types]
+path = "../../keyd-types"
+
+[dependencies.name-attestation]
+path = "../../name-attestation"
+
 [[bin]]
 name = "kdc_handle"
 path = "fuzz_targets/kdc_handle.rs"

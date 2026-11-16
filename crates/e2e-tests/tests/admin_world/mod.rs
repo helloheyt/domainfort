@@ -761,12 +761,16 @@ fn workstation_fixture(plan: &Plan, input: &DomainInput, uid: u32) -> Workstatio
     let tiers = directory_daemon::policy::tier_map(&policy).unwrap();
     let snapshot = policy.snapshot().unwrap();
     let nc = NamingContext::new(&input.naming_context).unwrap();
+    // Task PN10: with dird's signer (crates/provision tests/common
+    // `dird_signer`) — the write PEP reads accounts through the view's
+    // account source, whose records carry dird's attested resolution.
     let ctx = DirectoryContext::new(
         ad_schema::phase1().unwrap(),
         &KeydConfig::new(realm()),
         nc.clone(),
     )
-    .unwrap();
+    .unwrap()
+    .with_name_resolution_signer(provision_common::dird_signer());
     let protected = directory_daemon::admin_service::protected_objects(&plan.manifest, &policy);
     let config = AdminConfig::new(
         Duration::from_secs(u64::from(provision::configs::ADMIN_TICKET_AGE_MAX_SECS)),
@@ -1300,8 +1304,15 @@ impl World {
     pub fn start_dird(&mut self) {
         let paths = &self.input.paths;
         let settings = DirdSettings::parse(&self.read(&paths.dird_config)).unwrap();
+        // Task PN10: dird's attestation key. The produced file names none
+        // until the provisioning tool writes it (task PN12); the fixtures'
+        // test key stands in (docs/questions/Q-1046 item 6).
         let mut params = directory_daemon::test_seams::DaemonParams::from(
-            directory_daemon::startup::params(&settings).unwrap(),
+            directory_daemon::startup::params(
+                &settings,
+                crate::support::kdcd::dird::attestation_key(),
+            )
+            .unwrap(),
         );
         params.kdc_uid = self.uid;
         params.ldap_front_uid = self.uid;

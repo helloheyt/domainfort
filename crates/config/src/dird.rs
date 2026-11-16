@@ -28,6 +28,15 @@
 //! (docs/questions/Q-270 items 1-2). A production kind is added to each
 //! table when its decision is implemented.
 //!
+//! **The attestation key** (task PN10; docs/59 §7.4; A-173 — docs/questions/
+//! Q-1011 item 2): the key dird tags its name resolutions with is never a
+//! setting either — `attestation_key_path` only **points to** dird's
+//! root-only key file, which the provisioning tool writes (task PN12). The
+//! key is optional *here* only because provision does not emit it before
+//! PN12 (its generated files are parsed back with this schema); dird itself
+//! does not start without it (crates/directory-daemon `startup`; fail
+//! closed — docs/questions/Q-1046 item 5).
+//!
 //! Spec: docs/50 R50-2, R50-15, §2.4, §3.2, §3.4, §4.2, §7.1, §7.2, §7.4;
 //! docs/questions/Q-213, Q-219 (A-57), Q-270.
 
@@ -79,6 +88,11 @@ const INTEGRITY_KEY_PATH: &str = "integrity_key_path";
 /// Key: the format of the policy store file. Spec: docs/50 §7.2; Q-219
 /// (A-57); docs/questions/Q-270 item 2.
 pub(crate) const POLICY_STORE_FORMAT: &str = "policy_store_format";
+/// Key: dird's name-resolution attestation-key file (a path, never the key).
+/// Spec: docs/59 §7.4 (dird's key file, written by provision); docs/50 §7.1
+/// ("only paths to protected files"); docs/questions/Q-1011 item 2 (A-173),
+/// Q-1046 item 5.
+const ATTESTATION_KEY_PATH: &str = "attestation_key_path";
 /// Key: this DC's node-id, the `Origin.origin_node` of every directory write
 /// (32 lower-case hex digits, not secret). Spec: docs/51 §4.3 step 2, §4.6;
 /// docs/29 §2 as cited there; docs/questions/Q-385 item 3.
@@ -459,6 +473,7 @@ pub struct DirdSettings {
     database_path: AbsolutePath,
     integrity_key_source: IntegrityKeySource,
     integrity_key_path: AbsolutePath,
+    attestation_key_path: Option<AbsolutePath>,
     policy_store_path: AbsolutePath,
     policy_store_format: PolicyStoreFormat,
     kdc_channel: Channel,
@@ -497,6 +512,7 @@ impl DirdSettings {
         DATABASE_PATH,
         INTEGRITY_KEY_SOURCE,
         INTEGRITY_KEY_PATH,
+        ATTESTATION_KEY_PATH,
         POLICY_STORE_PATH,
         POLICY_STORE_FORMAT,
         DIRD_KDC_SOCKET,
@@ -537,6 +553,9 @@ impl DirdSettings {
     /// `integrity_key_source` (only `insecure-development-file`),
     /// `integrity_key_path`, `policy_store_path`, `policy_store_format`
     /// (only `unsigned-development`), `dird_kdc_socket` with `kdc_uid`,
+    /// (task PN10) `attestation_key_path` — optional in the file until the
+    /// provisioning tool writes it (task PN12), required by dird's start,
+    /// distinct from every other path of the file,
     /// `dird_ldap_socket` with `ldap_front_uid`, `audit_socket`, `auditd_uid`.
     /// Optional: `dird_admin_socket` with `admind_uid` (both or neither);
     /// when they are present, `admin_ticket_age_max` (60s ..= 3600s),
@@ -581,6 +600,16 @@ impl DirdSettings {
             })?
             .value;
         let integrity_key_path = schema::path(&doc, &mut all, INTEGRITY_KEY_PATH)?;
+        // Task PN10: dird's attestation-key file, a path distinct from every
+        // other of the file (the integrity key's above all — two keys, two
+        // files: docs/59 §7.4, "never the dirstore integrity key", A-129).
+        let attestation_key_path = match doc.optional(ATTESTATION_KEY_PATH, value::absolute_path)? {
+            Some(located) => {
+                all.path(ATTESTATION_KEY_PATH, &located.value, located.line)?;
+                Some(located.value)
+            }
+            None => None,
+        };
         let policy_store_path = schema::path(&doc, &mut all, POLICY_STORE_PATH)?;
         let policy_store_format = doc
             .required(POLICY_STORE_FORMAT, |text| {
@@ -753,6 +782,7 @@ impl DirdSettings {
             database_path,
             integrity_key_source,
             integrity_key_path,
+            attestation_key_path,
             policy_store_path,
             policy_store_format,
             kdc_channel,
@@ -814,6 +844,16 @@ impl DirdSettings {
     #[must_use]
     pub fn integrity_key_path(&self) -> &AbsolutePath {
         &self.integrity_key_path
+    }
+
+    /// dird's name-resolution attestation-key file (root-owned, mode 0400,
+    /// exactly 32 octets — the daemon's checks), when configured; dird does
+    /// not start without it (task PN10).
+    /// Spec: docs/59 §7.4; docs/50 §7.1; docs/questions/Q-1011 item 2
+    /// (A-173), Q-1046 item 5.
+    #[must_use]
+    pub fn attestation_key_path(&self) -> Option<&AbsolutePath> {
+        self.attestation_key_path.as_ref()
     }
 
     /// The signed policy store (rules, anonymous allowlist, TierMap — A-36).

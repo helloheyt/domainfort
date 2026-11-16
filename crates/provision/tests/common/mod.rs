@@ -10,12 +10,29 @@ use std::path::{Path, PathBuf};
 use test_scratch::ScratchDir;
 
 use directory_admin::{RandomError, RandomSource};
+use directory_pip::NameResolutionSigner;
 use krb_proto::KerberosTime;
 use provision::install::Halt;
 use provision::{
     Account, Accounts, DomainInput, FilePath, Names, Network, Owner, Ownership, OwnershipError,
     Paths, Progress, Staged, Step,
 };
+use std::sync::Arc;
+
+/// dird's name-resolution signer as dird builds it (task PN10; docs/59
+/// §7.4): the product's `ResolutionSigner` under a test key — the
+/// provisioning tool writes no attestation key before task PN12
+/// (docs/questions/Q-1046 item 6) — issuing at the system clock, for the
+/// directory contexts the tests build to read the produced store as dird's
+/// account source does.
+pub fn dird_signer() -> Arc<dyn NameResolutionSigner> {
+    let key = directory_daemon::SharedAttestationKey::from_bytes(&[0x4B; 32]).expect("test key");
+    let clock = directory_daemon::SharedClock::system();
+    Arc::new(directory_daemon::ResolutionSigner::new(
+        key,
+        Arc::new(move || clock.now()),
+    ))
+}
 
 /// A unique scratch directory (mode 0700), removed on drop — inside the
 /// workspace (crates/test-scratch, Q-480): the products installed here are

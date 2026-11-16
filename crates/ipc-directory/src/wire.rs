@@ -14,18 +14,21 @@
 //! | `KerberosTime` | `year:u16 ‖ month ‖ day ‖ hour ‖ minute ‖ second` (A-63 item 1) |
 //! | etype | `i32` as four octets, big-endian |
 //! | `Tier`, `AccountKind`, `ArmorPolicy`, failures | `u8` from a closed table |
+//! | attested name resolution (task PN10) | realm ‖ name DER ‖ realm ‖ name DER ‖ `PrincipalId` ‖ purpose `u8` ‖ snapshot `u64` ‖ `KerberosTime` ‖ tag (32 octets) |
 //!
 //! Spec: docs/50 §3.3 (primitives, "Kerberos values … as `bytes<max>`
 //! containing DER", "KeyHandle = 16 octets PrincipalId + u8 purpose"), §3.4;
-//! docs/questions/Q-245 item 1 (A-63: KerberosTime as six fixed fields).
+//! docs/questions/Q-245 item 1 (A-63: KerberosTime as six fixed fields);
+//! docs/59 §7.1, §7.5 (the resolution on `Client` / `Service` replies).
 
 use crate::channel::{
     codes, reply_kind, request_kind, ViewFailure, MAX_ENCTYPES, MAX_GROUPS, MAX_NAME, MAX_NC_LABEL,
-    MAX_NC_LABELS, MAX_REALM, MAX_S2KPARAMS, MAX_SALT, MAX_SID,
+    MAX_NC_LABELS, MAX_REALM, MAX_RESOLUTION_NAME, MAX_RESOLUTION_REALM, MAX_S2KPARAMS, MAX_SALT,
+    MAX_SID,
 };
 use ipc::{DerBlob, Error, MessageSet, Payload, Reader, Result, Writer};
 use kdc::{AccountKind, AccountSourceError, ArmorPolicy};
-use keyd_types::{KeyHandle, PrincipalId};
+use keyd_types::{KeyHandle, KeyPurpose, PrincipalId, NAME_RESOLUTION_TAG_LEN};
 use pdp::{PipError, Tier};
 
 /// `KeyHandle` = `PrincipalId` (16 octets) ‖ purpose (`u8`).
@@ -187,10 +190,83 @@ impl Payload for WireEtypeInfo {
     }
 }
 
+/// An attested name resolution (`keyd_types::AttestedNameResolution`, task
+/// PN10): the resolution dird states for the lookup that produced a record —
+/// realm and name as sent, canonical realm and name, the key set's principal
+/// and purpose, the snapshot, the issue time — and its 32-octet tag. Not
+/// secret (names, a handle, a time and a MAC tag). The tag's length is the
+/// type's, never a length on the wire (A-145 RC-4); this layer neither
+/// computes nor checks it (keyd verifies it — docs/59 §7.2). `PartialEq`
+/// compares the octets of a codec value (tests); no product code decides
+/// anything by it.
+/// Spec: docs/59 §7.1 (the fields; the bounds), §7.5 (`Client` / `Service`
+/// replies carry `AttestedNameResolution`); docs/50 §3.3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireNameResolution {
+    /// The realm the request carried (KerberosString octets).
+    pub realm_as_sent: Vec<u8>,
+    /// The name the request carried (`PrincipalName` DER).
+    pub name_as_sent: DerBlob,
+    /// The canonical realm (KerberosString octets).
+    pub canonical_realm: Vec<u8>,
+    /// The canonical name (`PrincipalName` DER).
+    pub canonical_name: DerBlob,
+    /// The key set's principal.
+    pub principal: PrincipalId,
+    /// The key set's purpose (the channel's closed table).
+    pub key_purpose: KeyPurpose,
+    /// The snapshot (docs/59 §4.7).
+    pub snapshot: u64,
+    /// When dird issued it.
+    pub issued_at: WireTime,
+    /// dird's tag over the resolution (HMAC-SHA-256, crate name-attestation).
+    pub tag: [u8; NAME_RESOLUTION_TAG_LEN],
+}
+
+impl Payload for WireNameResolution {
+    /// Spec: docs/59 §7.1, §7.5; docs/50 §3.3.
+    fn write_fields(&self, writer: &mut Writer) -> Result<()> {
+        writer.write_bytes(&self.realm_as_sent, MAX_RESOLUTION_REALM)?;
+        writer.write_der(&self.name_as_sent, MAX_RESOLUTION_NAME)?;
+        writer.write_bytes(&self.canonical_realm, MAX_RESOLUTION_REALM)?;
+        writer.write_der(&self.canonical_name, MAX_RESOLUTION_NAME)?;
+        writer.write_array(self.principal.as_bytes())?;
+        writer.write_enum(codes::key_purpose(self.key_purpose))?;
+        writer.write_u64(self.snapshot)?;
+        self.issued_at.write_fields(writer)?;
+        writer.write_array(&self.tag)
+    }
+
+    /// Spec: docs/59 §7.1, §7.5; docs/50 §3.3.
+    fn read_fields(reader: &mut Reader<'_>) -> Result<WireNameResolution> {
+        let realm_as_sent = reader.read_bytes(MAX_RESOLUTION_REALM)?.to_vec();
+        let name_as_sent = reader.read_der(MAX_RESOLUTION_NAME)?;
+        let canonical_realm = reader.read_bytes(MAX_RESOLUTION_REALM)?.to_vec();
+        let canonical_name = reader.read_der(MAX_RESOLUTION_NAME)?;
+        let principal = PrincipalId::from_bytes(reader.read_array::<16>()?);
+        let key_purpose = reader.read_enum(codes::key_purpose_from)?;
+        let snapshot = reader.read_u64()?;
+        let issued_at = WireTime::read_fields(reader)?;
+        let tag = reader.read_array::<NAME_RESOLUTION_TAG_LEN>()?;
+        Ok(WireNameResolution {
+            realm_as_sent,
+            name_as_sent,
+            canonical_realm,
+            canonical_name,
+            principal,
+            key_purpose,
+            snapshot,
+            issued_at,
+            tag,
+        })
+    }
+}
+
 /// A client record (`kdc::ClientAccount`, non-secret: a key handle, never a
 /// key; salts are public).
 /// Spec: docs/50 §3.4 (`Option<ClientAccount>` — key, sid, groups, tier,
-/// state, etype_info, kind, armor_policy); crates/kdc accounts.rs.
+/// state, etype_info, kind, armor_policy); crates/kdc accounts.rs; docs/59
+/// §7.5 (and the resolution, task PN10).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireClient {
     /// The keyd handle of the long-term key set.
@@ -209,10 +285,12 @@ pub struct WireClient {
     pub kind: AccountKind,
     /// The FAST armor policy.
     pub armor_policy: ArmorPolicy,
+    /// dird's attested resolution of the name looked up (task PN10).
+    pub resolution: WireNameResolution,
 }
 
 impl Payload for WireClient {
-    /// Spec: docs/50 §3.4; crates/kdc accounts.rs.
+    /// Spec: docs/50 §3.4; crates/kdc accounts.rs; docs/59 §7.5.
     fn write_fields(&self, writer: &mut Writer) -> Result<()> {
         write_handle(writer, &self.key)?;
         write_sid(writer, &self.sid)?;
@@ -221,7 +299,8 @@ impl Payload for WireClient {
         self.state.write_fields(writer)?;
         writer.write_seq(&self.etype_info, MAX_ENCTYPES, |w, e| e.write_fields(w))?;
         writer.write_enum(codes::account_kind(self.kind))?;
-        writer.write_enum(codes::armor_policy(self.armor_policy))
+        writer.write_enum(codes::armor_policy(self.armor_policy))?;
+        self.resolution.write_fields(writer)
     }
 
     /// Spec: docs/50 §3.4; crates/kdc accounts.rs.
@@ -234,6 +313,7 @@ impl Payload for WireClient {
         let etype_info = reader.read_seq(MAX_ENCTYPES, WireEtypeInfo::read_fields)?;
         let kind = reader.read_enum(codes::account_kind_from)?;
         let armor_policy = reader.read_enum(codes::armor_policy_from)?;
+        let resolution = WireNameResolution::read_fields(reader)?;
         Ok(WireClient {
             key,
             sid,
@@ -243,12 +323,14 @@ impl Payload for WireClient {
             etype_info,
             kind,
             armor_policy,
+            resolution,
         })
     }
 }
 
 /// A service record (`kdc::ServiceAccount`).
-/// Spec: docs/50 §3.4 (`Option<ServiceAccount>`); crates/kdc accounts.rs.
+/// Spec: docs/50 §3.4 (`Option<ServiceAccount>`); crates/kdc accounts.rs;
+/// docs/59 §7.5 (and the resolution, task PN10).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireService {
     /// The keyd handle of the service key set.
@@ -257,25 +339,30 @@ pub struct WireService {
     pub state: WireState,
     /// The encryption types the service accepts.
     pub enctypes: Vec<i32>,
+    /// dird's attested resolution of the name looked up (task PN10).
+    pub resolution: WireNameResolution,
 }
 
 impl Payload for WireService {
-    /// Spec: docs/50 §3.4; crates/kdc accounts.rs.
+    /// Spec: docs/50 §3.4; crates/kdc accounts.rs; docs/59 §7.5.
     fn write_fields(&self, writer: &mut Writer) -> Result<()> {
         write_handle(writer, &self.key)?;
         self.state.write_fields(writer)?;
-        writer.write_seq(&self.enctypes, MAX_ENCTYPES, |w, e| write_etype(w, *e))
+        writer.write_seq(&self.enctypes, MAX_ENCTYPES, |w, e| write_etype(w, *e))?;
+        self.resolution.write_fields(writer)
     }
 
-    /// Spec: docs/50 §3.4; crates/kdc accounts.rs.
+    /// Spec: docs/50 §3.4; crates/kdc accounts.rs; docs/59 §7.5.
     fn read_fields(reader: &mut Reader<'_>) -> Result<WireService> {
         let key = read_handle(reader)?;
         let state = WireState::read_fields(reader)?;
         let enctypes = reader.read_seq(MAX_ENCTYPES, read_etype)?;
+        let resolution = WireNameResolution::read_fields(reader)?;
         Ok(WireService {
             key,
             state,
             enctypes,
+            resolution,
         })
     }
 }

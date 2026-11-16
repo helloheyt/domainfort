@@ -1172,6 +1172,14 @@ fn the_same_path_under_two_settings_is_rejected() {
             "dird_admin_socket",
             "/run/auditd/audit.sock",
         ),
+        // Task PN10 (docs/59 §7.4: the attestation key is never the dirstore
+        // integrity key — A-129): two keys, two files.
+        (
+            Daemon::Dird,
+            DIRD,
+            "attestation_key_path",
+            "/etc/dird/integrity.key",
+        ),
         (
             Daemon::LdapFront,
             LDAP_FRONT,

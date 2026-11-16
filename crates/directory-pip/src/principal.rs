@@ -51,19 +51,70 @@
 //! [MS-SAMR] 2.2.1.14, 3.1.1.6 items 11, 14; [MS-ADTS] 2.2.16,
 //! 3.1.1.1.5; docs/47 §1.4, §6.3.
 
-use crate::error::Fault;
+use crate::error::{Fault, ViewError};
 use crate::names::is_krbtgt_sid;
 use crate::naming::NamingContext;
 use crate::record;
 use crate::salt::AccountKind;
 use crate::state;
 use crate::view::DirectoryView;
-use dirstore::Object;
+use dirstore::{Object, Store};
 use dtyp::Guid;
 use principal_names::{
     keys_of_names, KeySet, NameContext, NameRefused, PrincipalClass, PrincipalNames,
 };
 use std::collections::BTreeSet;
+
+/// The marker of a store whose every principal got its namespace keys from
+/// the one checker (task PN5): a named counter the provisioning session
+/// creates with the other counters (A-83: counters only at provisioning) and
+/// that nothing ever takes — its presence is the fact. dird refuses to open
+/// a store without it (task PN10, [`principal_namespace_marked`]: fail
+/// closed, re-provision; no migration tool, which would be a second writer
+/// of the keys — docs/59 N7). Defined here, beside the namespace it marks,
+/// so dird and every test fixture name the one definition; crates/
+/// directory-admin's config re-exports it under the same name (as it does
+/// the zone serial counter's — docs/questions/Q-1043 item 1, A-185).
+/// Spec: docs/59 §5.2 (c), §5.5; docs/questions/Q-1008 item 5 (A-173),
+/// Q-1043 item 1 (A-185); dirstore `MAX_COUNTER_NAME_LEN` (alphabet
+/// `a-z 0-9 . - _`).
+pub const PRINCIPAL_NAMESPACE_COUNTER: &str = "principal-namespace";
+
+/// The first (and only) value of the marker counter's range: the counter is
+/// a marker, never taken. Project choice (docs/questions/Q-1029 item 6).
+/// Spec: docs/questions/Q-1008 item 5, Q-1043 item 1.
+pub const PRINCIPAL_NAMESPACE_FIRST: u64 = 1;
+
+/// One past the marker counter's only value. Spec: dirstore `CounterState`
+/// (half-open range); docs/questions/Q-1029 item 6, Q-1043 item 1.
+pub const PRINCIPAL_NAMESPACE_END_EXCLUSIVE: u64 = 2;
+
+/// `true` if `store` carries the `principal-namespace` marker exactly as the
+/// provisioning session creates it: the counter
+/// [`PRINCIPAL_NAMESPACE_COUNTER`] with the range
+/// `[PRINCIPAL_NAMESPACE_FIRST, PRINCIPAL_NAMESPACE_END_EXCLUSIVE)`, its one
+/// value never taken. Any other shape — absent, another range, a value
+/// taken — is `false`: a store dird must not open (docs/59 §5.5, fail
+/// closed). Read from one snapshot.
+///
+/// # Errors
+/// [`ViewError::Store`] if no snapshot could be taken or the counter could
+/// not be read (dird then does not start either).
+///
+/// Spec: docs/59 §5.2 (c), §5.5; docs/questions/Q-1008 item 5 (A-173),
+/// Q-1043 (A-185: "dird refuses a store without the marker"); AGENTS.md §6
+/// (fail closed).
+pub fn principal_namespace_marked(store: &Store) -> Result<bool, ViewError> {
+    let snapshot = store.snapshot().map_err(|_| ViewError::Store)?;
+    let marker = snapshot
+        .counter(PRINCIPAL_NAMESPACE_COUNTER)
+        .map_err(|_| ViewError::Store)?;
+    Ok(marker.is_some_and(|state| {
+        state.first_value == PRINCIPAL_NAMESPACE_FIRST
+            && state.next_value == PRINCIPAL_NAMESPACE_FIRST
+            && state.end_exclusive == PRINCIPAL_NAMESPACE_END_EXCLUSIVE
+    }))
+}
 
 /// The lDAPDisplayName of userPrincipalName (not among the identifiers the
 /// view resolves at construction, crate::record `Ids`; resolved here so

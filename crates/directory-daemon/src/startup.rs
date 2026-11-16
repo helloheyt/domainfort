@@ -1,11 +1,19 @@
 //! The start-up steps `main` runs before the runtime exists: reading the
-//! configuration, the development integrity key and the development policy
-//! (all as root, before the drop), the socket directory, the hardening plan,
-//! and the serving parameters.
+//! configuration, the development integrity key, the name-resolution
+//! attestation key (task PN10) and the development policy (all as root,
+//! before the drop), the socket directory, the hardening plan, and the
+//! serving parameters.
+//!
+//! Both keys are 32-octet root-owned files of mode exactly 0400, read by the
+//! one reader [`read_key_file`] (crates/protected-file underneath): the
+//! integrity key of the store (docs/50 §7.4) and the attestation key dird
+//! tags its name resolutions with (docs/59 §7.4) — two keys, two files,
+//! never one key for both (A-129: "never the dirstore integrity key").
 //!
 //! Spec: docs/50 R50-2, R50-14, R50-15, §3.1, §6.1, §6.2, §6.4, §7.1, §7.2,
 //! §7.4, §7.5; docs/questions/Q-213, Q-219 (A-57), Q-230 (A-60), Q-235
-//! (A-61), Q-270.
+//! (A-61), Q-270; docs/59 §7.4, §10 (the PN10 row); docs/questions/Q-1011
+//! item 2 (A-173), Q-1046.
 
 use crate::admin_service::{AdminParams, KeydEndpoint};
 use crate::audit_link::AuditEndpoint;
@@ -19,6 +27,7 @@ use core::fmt;
 use daemon_sandbox::{HardeningPlan, PlanError, ProcessIdentity};
 use directory_pip::{DnsName, KpasswdService, NamingContext, SoaParameters, ZoneParameters};
 use dirstore::{IntegrityKey, INTEGRITY_KEY_LEN};
+use ipc_directory_server::{SharedAttestationKey, ATTESTATION_KEY_LEN};
 use keyd_types::KeydConfig;
 use krb_proto::Realm;
 use protected_file::{
@@ -37,6 +46,14 @@ const ROOT_UID: u32 = 0;
 /// Spec: docs/50 §7.4, R50-12 ("the file 0400"); docs/questions/Q-270
 /// item 1.
 const INTEGRITY_KEY_FILE_MODE: u32 = 0o400;
+
+/// Octets of every key file dird reads: the integrity key's and the
+/// attestation key's lengths, which are the same (both 32 — checked below),
+/// so one reader serves both.
+/// Spec: dirstore `INTEGRITY_KEY_LEN`; name-attestation
+/// `ATTESTATION_KEY_LEN`; docs/59 §7.4.
+const KEY_FILE_LEN: usize = INTEGRITY_KEY_LEN;
+const _: () = assert!(ATTESTATION_KEY_LEN == KEY_FILE_LEN);
 
 /// Open files beyond the served channels' connection bounds
 /// ([`MAX_SERVED_CONNECTIONS`]): stdio, the listeners, the audit connection,
@@ -123,6 +140,19 @@ pub enum StartupError {
     /// `dns_soa_rname` does not form a DNS name (crates/parse-dns refused
     /// its labels) — task DN10a.
     DnsRname,
+    /// `attestation_key_path` is not configured: dird cannot attest a name
+    /// resolution, so it does not start (task PN10; fail closed).
+    AttestationKeyNotConfigured,
+    /// The attestation-key file could not be opened or read.
+    AttestationKeyUnreadable,
+    /// The attestation-key file is not a regular file owned by root with
+    /// mode 0400.
+    AttestationKeyPermissions,
+    /// The attestation-key file does not hold exactly 32 octets.
+    AttestationKeyLength,
+    /// The attestation key was refused (all zero octets — a file never
+    /// filled; crate name-attestation).
+    AttestationKeyRefused,
 }
 
 impl fmt::Display for StartupError {
@@ -161,6 +191,19 @@ impl fmt::Display for StartupError {
                 "policy.next directory must be dird's, with no group write and no access for others, on a path of root's or dird's directories",
             ),
             StartupError::DnsRname => f.write_str("dns_soa_rname is not a DNS name"),
+            StartupError::AttestationKeyNotConfigured => {
+                f.write_str("attestation_key_path is not configured")
+            }
+            StartupError::AttestationKeyUnreadable => {
+                f.write_str("attestation key file unreadable")
+            }
+            StartupError::AttestationKeyPermissions => f.write_str(
+                "attestation key file must be a regular file owned by root with mode 0400",
+            ),
+            StartupError::AttestationKeyLength => {
+                f.write_str("attestation key file must hold exactly 32 octets")
+            }
+            StartupError::AttestationKeyRefused => f.write_str("attestation key refused"),
         }
     }
 }
@@ -212,20 +255,65 @@ pub fn read_settings_owned_by(path: &Path, owner: u32) -> Result<DirdSettings, S
     Ok(settings)
 }
 
-/// Read the development integrity key (Q-213 interim; Q-270 item 1): a
-/// regular file (not a symbolic link — neither at the path nor when opened,
-/// crates/protected-file) owned by `owner` (root in the daemon), mode
-/// exactly 0400, holding exactly 32 octets. Read as root
-/// before the privilege drop; the reading buffer is wiped when this returns
-/// (the key lives on only inside [`IntegrityKey`], itself wiped on drop).
+/// Which of dird's key files [`read_key_file`] reads — for its refusals
+/// (each file has its own fixed message; none carries an octet).
+/// Spec: docs/50 §7.4; docs/59 §7.4; AGENTS.md §6.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyFile {
+    /// The dirstore integrity key (docs/50 §7.4).
+    Integrity,
+    /// The name-resolution attestation key (docs/59 §7.4).
+    Attestation,
+}
+
+impl KeyFile {
+    /// The file could not be opened or read.
+    fn unreadable(self) -> StartupError {
+        match self {
+            KeyFile::Integrity => StartupError::KeyUnreadable,
+            KeyFile::Attestation => StartupError::AttestationKeyUnreadable,
+        }
+    }
+
+    /// The file breaks the rule (regular, root's — `owner`'s —, 0400) or a
+    /// directory on its path does.
+    fn permissions(self) -> StartupError {
+        match self {
+            KeyFile::Integrity => StartupError::KeyPermissions,
+            KeyFile::Attestation => StartupError::AttestationKeyPermissions,
+        }
+    }
+
+    /// The file does not hold exactly [`KEY_FILE_LEN`] octets.
+    fn length(self) -> StartupError {
+        match self {
+            KeyFile::Integrity => StartupError::KeyLength,
+            KeyFile::Attestation => StartupError::AttestationKeyLength,
+        }
+    }
+}
+
+/// Read one of dird's key files — the one reader both keys share (module
+/// documentation): a regular file (not a symbolic link — neither at the path
+/// nor when opened, crates/protected-file) owned by `owner` (root in the
+/// daemon), mode exactly 0400, holding exactly 32 octets, every directory on
+/// its path root's or `owner`'s and not writable by group or others. Read as
+/// root before the privilege drop; the reading buffer is wiped (the octets
+/// live on only in the returned `Zeroizing` buffer, which the caller hands
+/// to the key's own type and drops).
 ///
 /// # Errors
 /// [`StartupError`] (never carrying a key octet).
 ///
 /// Spec: docs/50 §7.1 ("only paths to protected files"), §7.4, R50-12 (the
 /// same pattern for the TLS key: "read as root before the drop, the file
-/// 0400"); docs/questions/Q-213 (A-57); AGENTS.md §6 (secrets).
-pub fn read_integrity_key(path: &Path, owner: u32) -> Result<IntegrityKey, StartupError> {
+/// 0400"); docs/questions/Q-213 (A-57), Q-270 item 1; A-86; Q-468 (A-102);
+/// docs/59 §7.4; AGENTS.md §6 (secrets).
+fn read_key_file(
+    path: &Path,
+    owner: u32,
+    which: KeyFile,
+) -> Result<Zeroizing<[u8; KEY_FILE_LEN]>, StartupError> {
     // Spec: docs/50 §7.4; Q-270 item 1 (root, mode exactly 0400); A-86
     // (crates/protected-file: no symbolic link is followed, the rule is
     // applied to the path and to the opened descriptor); Q-468 (A-102: every
@@ -236,19 +324,19 @@ pub fn read_integrity_key(path: &Path, owner: u32) -> Result<IntegrityKey, Start
         if facts.regular_file && facts.owner_uid == owner && exact {
             Ok(())
         } else {
-            Err(StartupError::KeyPermissions)
+            Err(which.permissions())
         }
     };
     let file = protected_file::open(path, owner, key_file_rule).map_err(|error| match error {
-        OpenError::Io(_) => StartupError::KeyUnreadable,
-        OpenError::Path(_) => StartupError::KeyPermissions,
+        OpenError::Io(_) => which.unreadable(),
+        OpenError::Path(_) => which.permissions(),
         OpenError::Refused(refusal) => refusal,
     })?;
-    let mut buffer = Zeroizing::new([0u8; INTEGRITY_KEY_LEN + 1]);
+    let mut buffer = Zeroizing::new([0u8; KEY_FILE_LEN + 1]);
     let mut filled = 0usize;
-    let mut reader = file.take(u64::try_from(INTEGRITY_KEY_LEN + 1).unwrap_or(u64::MAX));
+    let mut reader = file.take(u64::try_from(KEY_FILE_LEN + 1).unwrap_or(u64::MAX));
     loop {
-        let slot = buffer.get_mut(filled..).ok_or(StartupError::KeyLength)?;
+        let slot = buffer.get_mut(filled..).ok_or(which.length())?;
         if slot.is_empty() {
             break;
         }
@@ -256,19 +344,71 @@ pub fn read_integrity_key(path: &Path, owner: u32) -> Result<IntegrityKey, Start
             Ok(0) => break,
             Ok(read) => filled += read,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return Err(StartupError::KeyUnreadable),
+            Err(_) => return Err(which.unreadable()),
         }
     }
-    if filled != INTEGRITY_KEY_LEN {
-        return Err(StartupError::KeyLength);
+    if filled != KEY_FILE_LEN {
+        return Err(which.length());
     }
-    let mut key = Zeroizing::new([0u8; INTEGRITY_KEY_LEN]);
-    key.copy_from_slice(
-        buffer
-            .get(..INTEGRITY_KEY_LEN)
-            .ok_or(StartupError::KeyLength)?,
-    );
+    let mut key = Zeroizing::new([0u8; KEY_FILE_LEN]);
+    key.copy_from_slice(buffer.get(..KEY_FILE_LEN).ok_or(which.length())?);
+    Ok(key)
+}
+
+/// Read the development integrity key (Q-213 interim; Q-270 item 1): a
+/// regular file (not a symbolic link — neither at the path nor when opened,
+/// crates/protected-file) owned by `owner` (root in the daemon), mode
+/// exactly 0400, holding exactly 32 octets ([`read_key_file`]). Read as root
+/// before the privilege drop; the reading buffer is wiped when this returns
+/// (the key lives on only inside [`IntegrityKey`], itself wiped on drop).
+///
+/// # Errors
+/// [`StartupError`] (never carrying a key octet).
+///
+/// Spec: docs/50 §7.1 ("only paths to protected files"), §7.4, R50-12 (the
+/// same pattern for the TLS key: "read as root before the drop, the file
+/// 0400"); docs/questions/Q-213 (A-57); AGENTS.md §6 (secrets).
+pub fn read_integrity_key(path: &Path, owner: u32) -> Result<IntegrityKey, StartupError> {
+    let key = read_key_file(path, owner, KeyFile::Integrity)?;
     Ok(IntegrityKey::from_bytes(&key))
+}
+
+/// Read dird's name-resolution attestation key (task PN10; docs/59 §7.4) from
+/// `attestation_key_path` — the file the provisioning tool writes (task
+/// PN12; docs/questions/Q-1011 item 2) — with the one key-file reader
+/// ([`read_key_file`]: regular, owned by `owner` — root in the daemon —,
+/// mode exactly 0400, exactly 32 octets, no symbolic link, the path's
+/// directories root's or `owner`'s). Read as root before the privilege drop;
+/// the octets live on only inside the `AttestationKey` (wiped on drop, no
+/// accessor, no `Debug`), shared by dird's signers. An all-zero key is
+/// refused (crate name-attestation: a file never filled).
+///
+/// # Errors
+/// [`StartupError`] (never carrying a key octet).
+///
+/// Spec: docs/59 §7.4; docs/questions/Q-1011 item 2 (A-173: "written to
+/// dird's protected key file"), Q-1046 item 5; docs/50 §7.1, §7.4; AGENTS.md
+/// §6 (secrets, fail closed).
+pub fn read_attestation_key(path: &Path, owner: u32) -> Result<SharedAttestationKey, StartupError> {
+    let octets = read_key_file(path, owner, KeyFile::Attestation)?;
+    SharedAttestationKey::from_bytes(&octets).map_err(|_| StartupError::AttestationKeyRefused)
+}
+
+/// The configured `attestation_key_path`, or — not configured — the
+/// start-up refusal (task PN10: dird does not start without its attestation
+/// key; the configuration accepts the file without it only until the
+/// provisioning tool writes it, task PN12).
+///
+/// # Errors
+/// [`StartupError::AttestationKeyNotConfigured`].
+///
+/// Spec: docs/59 §7.4; docs/questions/Q-1046 item 5; AGENTS.md §6 (fail
+/// closed).
+pub fn attestation_key_path(settings: &DirdSettings) -> Result<&Path, StartupError> {
+    settings
+        .attestation_key_path()
+        .map(config::AbsolutePath::as_path)
+        .ok_or(StartupError::AttestationKeyNotConfigured)
 }
 
 /// Read the development policy file through the shared loader
@@ -374,14 +514,20 @@ pub fn hardening_plan(settings: &DirdSettings) -> Result<HardeningPlan, PlanErro
 /// The serving parameters from dird's configuration — the one product
 /// constructor (docs/52 C18, task R15) — with keyd's non-secret
 /// configuration for the realm (library defaults, as keyd-daemon builds it —
-/// docs/47 R47-10; Q-270 item 7). The daemon's constants for what the file
-/// does not set (Q-230 item 4) are added by `serve`.
+/// docs/47 R47-10; Q-270 item 7) and dird's attestation key, read from
+/// `attestation_key_path` ([`read_attestation_key`], task PN10). The
+/// daemon's constants for what the file does not set (Q-230 item 4) are
+/// added by `serve`.
 ///
 /// # Errors
 /// [`StartupError::Realm`], [`StartupError::NamingContext`].
 ///
-/// Spec: docs/50 §3.2, §3.4, §3.6, §7.1; docs/47 §7.3 (R47-10); A-53.
-pub fn params(settings: &DirdSettings) -> Result<DaemonParams, StartupError> {
+/// Spec: docs/50 §3.2, §3.4, §3.6, §7.1; docs/47 §7.3 (R47-10); A-53;
+/// docs/59 §7.4.
+pub fn params(
+    settings: &DirdSettings,
+    attestation_key: SharedAttestationKey,
+) -> Result<DaemonParams, StartupError> {
     let realm = Realm::new(settings.realm()).map_err(|_| StartupError::Realm)?;
     let naming_context = NamingContext::new(settings.naming_context().labels())
         .map_err(|_| StartupError::NamingContext)?;
@@ -399,6 +545,7 @@ pub fn params(settings: &DirdSettings) -> Result<DaemonParams, StartupError> {
         ldap_socket: settings.ldap_channel().socket().as_path().to_path_buf(),
         ldap_front_uid: settings.ldap_channel().peer_uid(),
         dns_host_name: settings.dns_host_name().to_owned(),
+        attestation_key,
     })
 }
 

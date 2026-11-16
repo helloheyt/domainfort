@@ -9,6 +9,10 @@
 //! * the development integrity-key file — owner, mode 0400, exactly 32
 //!   octets, no symbolic link; a key read from it opens the store it sealed
 //!   and no other (docs/50 §7.4; Q-213 → A-57; Q-270 item 1);
+//! * the name-resolution attestation-key file (task PN10) — the same rule,
+//!   an all-zero key refused, the key path required by the start though the
+//!   configuration accepts the file without it (docs/59 §7.4; Q-1011 item
+//!   2; docs/questions/Q-1046 item 5);
 //! * the policy file's owner / mode checks and its absence (fail closed);
 //! * the configuration's owner check; the serving parameters and the
 //!   hardening plan derived from a configuration (docs/50 §6.4, §7.1);
@@ -20,8 +24,8 @@
 //! functions take the expected owner, and `main` passes uid 0.
 //!
 //! Sources: docs/50 R50-14, §3.3, §6.4, §7.1, §7.2, §7.4, §9; [MS-DTYP]
-//! 2.4.2.2; A-36; A-68; docs/questions/Q-213, Q-219, Q-270. Every value is
-//! hand-made.
+//! 2.4.2.2; A-36; A-68; docs/questions/Q-213, Q-219, Q-270; docs/59 §7.4
+//! (task PN10). Every value is hand-made.
 
 mod support;
 
@@ -29,8 +33,9 @@ use directory_daemon::policy::{
     tier_map, DevelopmentPolicy, MandatoryFast, PolicyError, MARKER, SUPERSEDED_FORMAT,
 };
 use directory_daemon::startup::{
-    hardening_plan, params, prepare_socket_directory, read_integrity_key, read_policy,
-    read_settings, read_settings_owned_by, StartupError, SOCKET_DIRECTORY_MODE,
+    attestation_key_path, hardening_plan, params, prepare_socket_directory, read_attestation_key,
+    read_integrity_key, read_policy, read_settings, read_settings_owned_by, StartupError,
+    SOCKET_DIRECTORY_MODE,
 };
 use dirstore::Store;
 use dtyp::{Sid, SECURITY_NT_AUTHORITY};
@@ -187,6 +192,103 @@ fn the_integrity_key_file_is_checked_and_opens_its_store() {
     assert!(!shown.contains("5d") && !shown.contains("93"));
 }
 
+/// docs/59 §7.4 (dird's protected key file); docs/questions/Q-1011 item 2
+/// (A-173), Q-1046 item 5 (task PN10): the attestation-key file obeys the
+/// integrity key's rule — the expected owner, mode exactly 0400, exactly 32
+/// octets, no symbolic link, present — through the one reader, with its own
+/// refusals; an all-zero key (a file never filled) is refused; a refusal
+/// carries no key octet, and the key's handle prints none.
+#[test]
+fn the_attestation_key_file_is_checked() {
+    let dir = ScratchDir::new("dird-startup").unwrap();
+    let uid = dir.uid().unwrap();
+    let key_path = dir.join("attestation.key");
+    write(&key_path, &support::TEST_ATTESTATION_KEY, 0o400);
+    let key = read_attestation_key(&key_path, uid).unwrap();
+    assert_eq!(format!("{key:?}"), "SharedAttestationKey(..)");
+
+    assert_eq!(
+        read_attestation_key(&key_path, uid + 1).err(),
+        Some(StartupError::AttestationKeyPermissions)
+    );
+    for mode in [0o600, 0o440, 0o404, 0o500] {
+        let path = dir.join(format!("a{mode:o}"));
+        write(&path, &support::TEST_ATTESTATION_KEY, 0o600);
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
+        assert_eq!(
+            read_attestation_key(&path, uid).err(),
+            Some(StartupError::AttestationKeyPermissions),
+            "mode {mode:o}"
+        );
+    }
+    for length in [0usize, 31, 33, 64] {
+        let path = dir.join(format!("alen{length}"));
+        write(&path, &vec![0x5D; length], 0o400);
+        assert_eq!(
+            read_attestation_key(&path, uid).err(),
+            Some(StartupError::AttestationKeyLength),
+            "length {length}"
+        );
+    }
+    let zero = dir.join("zero.key");
+    write(&zero, &[0u8; 32], 0o400);
+    assert_eq!(
+        read_attestation_key(&zero, uid).err(),
+        Some(StartupError::AttestationKeyRefused)
+    );
+    let link = dir.join("alink.key");
+    std::os::unix::fs::symlink(&key_path, &link).unwrap();
+    assert_eq!(
+        read_attestation_key(&link, uid).err(),
+        Some(StartupError::AttestationKeyPermissions)
+    );
+    assert_eq!(
+        read_attestation_key(&dir.join("absent.key"), uid).err(),
+        Some(StartupError::AttestationKeyUnreadable)
+    );
+    // The integrity key's refusals stay its own (the one reader, two files).
+    assert_eq!(
+        read_integrity_key(&dir.join("absent.key"), uid).err(),
+        Some(StartupError::KeyUnreadable)
+    );
+    for refusal in [
+        StartupError::AttestationKeyNotConfigured,
+        StartupError::AttestationKeyUnreadable,
+        StartupError::AttestationKeyPermissions,
+        StartupError::AttestationKeyLength,
+        StartupError::AttestationKeyRefused,
+    ] {
+        let shown = format!("{refusal:?} {refusal}");
+        assert!(!shown.contains("4b") && !shown.contains("75"), "{shown}");
+    }
+}
+
+/// docs/59 §7.4; docs/questions/Q-1046 item 5 (task PN10): the configuration
+/// accepts dird's file without `attestation_key_path` (until the
+/// provisioning tool writes it, task PN12), but dird's start does not — and
+/// with the key the start's parameters carry it.
+#[test]
+fn the_start_requires_the_attestation_key_path() {
+    let without = config::DirdSettings::parse(DIRD.as_bytes()).unwrap();
+    assert_eq!(
+        attestation_key_path(&without).err(),
+        Some(StartupError::AttestationKeyNotConfigured)
+    );
+    let with = config::DirdSettings::parse(
+        format!("{DIRD}attestation_key_path = /etc/dird/attestation.key\n").as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(
+        attestation_key_path(&with).unwrap(),
+        Path::new("/etc/dird/attestation.key")
+    );
+    let p = params(&with, support::attestation_key()).unwrap();
+    assert_eq!(
+        format!("{:?}", p.attestation_key),
+        "SharedAttestationKey(..)"
+    );
+}
+
 /// docs/50 §7.2 ("dird loads the same file at start"; absent or invalid ⇒
 /// do not start): the policy file must be of the expected owner and not
 /// writable by group or others; absent is refused.
@@ -306,7 +408,9 @@ fn parameters_plan_and_configuration_owner() {
     // docs/52 C18 (task R15): the product parameters carry only the file's
     // values; the constants the product `serve` adds are read back through
     // the test seam's conversion (the one `serve` uses).
-    let p = directory_daemon::test_seams::DaemonParams::from(params(&settings).unwrap());
+    let p = directory_daemon::test_seams::DaemonParams::from(
+        params(&settings, support::attestation_key()).unwrap(),
+    );
     assert_eq!(p.kdc_uid, 61003);
     assert_eq!(p.kdc_socket, Path::new("/run/dird/kdc/dird-kdc.sock"));
     assert_eq!(p.audit.uid, 61005);

@@ -28,6 +28,15 @@
 //!   docs/questions/Q-1026, Q-1027, Q-1042). The DNS record owner is found
 //!   through the same probe, by its `HostName` key (module `host`;
 //!   Q-1036 item 6).
+//! - **dird's statement (task PN10; docs/59 §7):** every account record the
+//!   view answers carries the resolution of its lookup —
+//!   `ResolvedPrincipal::name_resolution`, attested by the
+//!   [`NameResolutionSigner`] the deployment installs on the context (dird's
+//!   attestation key, crates/ipc-directory-server); no signer ⇒ no record
+//!   (fail closed). A reserved key purpose resolves only on a configured
+//!   provisioned service object (A-163 at the lookup; Q-1027 item 6). The
+//!   `principal-namespace` marker is defined here, with dird's check of it
+//!   ([`principal_namespace_marked`]; docs/59 §5.5).
 //! - **krbtgt (R47-2):** never a client or a service;
 //!   [`DirectoryView::krbtgt_handle`] gives `KdcConfig.krbtgt`.
 //! - **Keys (R47-3):** `KeyHandle = (objectGUID, purpose)`.
@@ -180,9 +189,17 @@ pub use pep::PepView;
 // An object's principal names and keys in the one namespace (task PN1;
 // docs/59 §4.3): `DirectoryView::{principal_names_of, principal_keys}`.
 pub use principal::{name_context_of, PrincipalNamesError};
+// The `principal-namespace` marker, defined once beside the namespace it
+// marks (task PN10; docs/questions/Q-1043 item 1, A-185), and dird's check
+// of it (docs/59 §5.5).
+pub use principal::{
+    principal_namespace_marked, PRINCIPAL_NAMESPACE_COUNTER, PRINCIPAL_NAMESPACE_END_EXCLUSIVE,
+    PRINCIPAL_NAMESPACE_FIRST,
+};
 // The one lookup path by name (task PN4; docs/59 §6.1-§6.3):
-// `DirectoryView::canonical_principal`.
-pub use resolve::{LookupCtx, ResolvedPrincipal};
+// `DirectoryView::canonical_principal`; from task PN10 its attestation
+// (docs/59 §7.1, §7.4): the signer the deployment installs.
+pub use resolve::{LookupCtx, NameResolutionSigner, ResolvedPrincipal, SignerRefused};
 pub use salt::{account_salt, AccountKind, SaltError};
 pub use tier::TierMap;
 pub use time::{dstime_of, time_of_dstime};

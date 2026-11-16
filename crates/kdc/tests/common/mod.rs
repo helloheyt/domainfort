@@ -28,6 +28,15 @@
 //! (5.4.4). RFC 6113 has no vectors for these derivations: these are
 //! round-trip tests (docs/48 §9.2 item 15).
 //!
+//! Every account record carries dird's attested resolution of its name
+//! (task PN10; docs/59 §7.1, §7.5): [`test_resolution`] builds it as dird
+//! would — the record's name in the fixtures' realm, resolved to the
+//! record's key set, issued at [`now`] — and tags it with the fixtures'
+//! test attestation key ([`TEST_ATTESTATION_KEY`]) through crate
+//! name-attestation's signer (a dev-dependency of every crate that reuses
+//! this module; the KDC itself links no MAC — D182). The KDC carries the
+//! resolution without reading it until task PN11.
+//!
 //! Every value here is constructed by hand for these tests. No vector or
 //! fixture comes from any other implementation.
 #![allow(dead_code)] // each test binary uses a different subset
@@ -43,6 +52,7 @@ use keyd::{
     KeydConfig, LocalKeyd, PrincipalBinding, PrincipalId, Role, SetSecretTarget, TicketPolicy,
     MAX_SET_SECRET_GRANT_SECS,
 };
+use keyd_types::{AttestedNameResolution, NameResolution, NameResolutionFields};
 use krb_crypto::{EncType, KeyUsage, ProtocolKey};
 use krb_proto::constants::{
     FX_FAST_ARMOR_AP_REQUEST, KRB_NT_PRINCIPAL, KRB_NT_SRV_HST, KRB_NT_SRV_INST,
@@ -56,6 +66,7 @@ use krb_proto::{
     Microseconds, PaData, PaEncTsEnc, PaFxFastReply, PaFxFastRequest, PrincipalName, Realm, TgsRep,
     TgsReq, Ticket,
 };
+use name_attestation::{AttestationKey, ATTESTATION_KEY_LEN};
 use pdp::{
     ActionClass, ActionMatch, AuthMatch, ContextMatch, Effect, IpScope, Match, Pip, PipError,
     PolicySnapshot, PolicyVersion, ResourceMatch, RlKey, Rule, RuleId, SubjectMatch, Tier,
@@ -699,6 +710,35 @@ pub fn etype_info(salt: &str) -> Vec<EtypeInfo2Entry> {
         .collect()
 }
 
+/// The attestation key of these fixtures — dird's and, from task PN11,
+/// the test keyd's copy (docs/59 §7.4). Test data, made up here.
+pub const TEST_ATTESTATION_KEY: [u8; ATTESTATION_KEY_LEN] = [0x4B; ATTESTATION_KEY_LEN];
+
+/// The resolution dird attests for a record looked up by `name` in
+/// [`realm`] that resolved to the key set `key` (docs/59 §7.1): the name as
+/// sent is the canonical name (the phase-1 acceptance, docs/59 §6.3 wave
+/// 2), the purpose and principal are the handle's, the snapshot 1, issued
+/// at [`now`] — tagged with [`TEST_ATTESTATION_KEY`] by name-attestation's
+/// `tag`, the signer dird's `ResolutionSigner` calls. One helper for every
+/// account record of the crates that reuse this module.
+/// Spec: docs/59 §7.1, §7.4; docs/questions/Q-1011 items 1-2 (A-173).
+pub fn test_resolution(name: &PrincipalName, key: KeyHandle) -> AttestedNameResolution {
+    let resolution = NameResolution::new(NameResolutionFields {
+        realm_as_sent: realm(),
+        name_as_sent: name.clone(),
+        canonical_realm: realm(),
+        canonical_name: name.clone(),
+        principal: key.principal,
+        key_purpose: key.purpose,
+        snapshot: 1,
+        issued_at: now(),
+    })
+    .expect("a resolution within its bounds");
+    let attestation_key =
+        AttestationKey::from_bytes(&TEST_ATTESTATION_KEY).expect("a non-zero test key");
+    name_attestation::tag(&attestation_key, &resolution).expect("a tagged resolution")
+}
+
 /// alice: a user account, so FAST is required (docs/48 §7.1, the production
 /// default).
 pub fn alice_account() -> ClientAccount {
@@ -711,6 +751,7 @@ pub fn alice_account() -> ClientAccount {
         etype_info: etype_info(ALICE_SALT),
         kind: AccountKind::User,
         armor_policy: ArmorPolicy::Required,
+        resolution: test_resolution(&alice_name(), ALICE),
     }
 }
 
@@ -734,6 +775,7 @@ pub fn machine_account() -> ClientAccount {
             .collect(),
         kind: AccountKind::Computer,
         armor_policy: ArmorPolicy::BootstrapAllowed,
+        resolution: test_resolution(&machine_name(), MACHINE),
     }
 }
 
@@ -815,6 +857,7 @@ impl Fixture {
                     etype_info: etype_info(BOB_SALT),
                     kind: AccountKind::User,
                     armor_policy: ArmorPolicy::Required,
+                    resolution: test_resolution(&bob_name(), BOB),
                 },
             )
             .unwrap();
@@ -829,6 +872,7 @@ impl Fixture {
                     key: SERVICE,
                     state: AccountState::ACTIVE,
                     enctypes: vec![AES256, AES128],
+                    resolution: test_resolution(&service_name(), SERVICE),
                 },
             )
             .unwrap();
@@ -842,6 +886,7 @@ impl Fixture {
                     key: CHANGEPW,
                     state: AccountState::ACTIVE,
                     enctypes: vec![AES256, AES128],
+                    resolution: test_resolution(&change_password_name(), CHANGEPW),
                 },
             )
             .unwrap();

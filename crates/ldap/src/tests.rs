@@ -18,7 +18,10 @@ use dtyp::{SecurityDescriptor, Sid, SECURITY_NT_AUTHORITY};
 use kdc::{
     AccountKind, AccountState, ArmorPolicy, ClientAccount, InMemoryAccounts, NamedPrincipal,
 };
-use keyd_types::{KeyHandle, KeyPurpose, PrincipalId as KeydPrincipalId};
+use keyd_types::{
+    AttestedNameResolution, KeyHandle, KeyPurpose, NameResolution, NameResolutionFields,
+    PrincipalId as KeydPrincipalId,
+};
 use krb_proto::KerberosTime;
 use parse_ldap::{
     decode_message, encode_message, AuthState, AuthenticationChoice, BindRequest, DecodeOptions,
@@ -66,12 +69,34 @@ fn alice() -> NamedPrincipal {
     NamedPrincipal::from_text(REALM, 1, &["alice"]).expect("valid name")
 }
 
+/// The resolution dird would attest for `who` resolving to `key` (task
+/// PN10; docs/59 §7.1): the name as sent is the canonical name, tagged with
+/// a test key by crate name-attestation's signer (a dev-dependency). The
+/// LDAP engine never reads it; it rides on the account record. The unit
+/// tests' one helper.
+fn test_resolution(who: &NamedPrincipal, key: KeyHandle) -> AttestedNameResolution {
+    let resolution = NameResolution::new(NameResolutionFields {
+        realm_as_sent: who.realm.clone(),
+        name_as_sent: who.name.clone(),
+        canonical_realm: who.realm.clone(),
+        canonical_name: who.name.clone(),
+        principal: key.principal,
+        key_purpose: key.purpose,
+        snapshot: 1,
+        issued_at: KerberosTime::new(2026, 11, 16, 12, 0, 0).expect("valid time"),
+    })
+    .expect("a resolution within its bounds");
+    let test_key = name_attestation::AttestationKey::from_bytes(&[0x4B; 32]).expect("test key");
+    name_attestation::tag(&test_key, &resolution).expect("tagged")
+}
+
 fn alice_account() -> ClientAccount {
+    let key = KeyHandle::new(
+        KeydPrincipalId::from_bytes([5; 16]),
+        KeyPurpose::PrincipalLongterm,
+    );
     ClientAccount {
-        key: KeyHandle::new(
-            KeydPrincipalId::from_bytes([5; 16]),
-            KeyPurpose::PrincipalLongterm,
-        ),
+        key,
         sid: alice_sid(),
         groups: BTreeSet::new(),
         tier: Tier::Tier2,
@@ -79,6 +104,7 @@ fn alice_account() -> ClientAccount {
         etype_info: Vec::new(),
         kind: AccountKind::User,
         armor_policy: ArmorPolicy::Required,
+        resolution: test_resolution(&alice(), key),
     }
 }
 
