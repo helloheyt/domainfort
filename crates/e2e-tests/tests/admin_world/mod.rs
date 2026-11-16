@@ -880,6 +880,18 @@ fn workstation_fixture(plan: &Plan, input: &DomainInput, uid: u32) -> Workstatio
 // The world.
 // ---------------------------------------------------------------------------
 
+/// Which of dird's two account queries on `dird-kdc.sock` a resolution is
+/// read through ([`World::dird_resolution`]): the KDC's client lookup (AS)
+/// or its service lookup (TGS). Spec: docs/50 §3.4 (the dird-kdc table:
+/// `Client`, `Service`); docs/59 §6.2 (`AsClient`, `TgsServer`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirdQuery {
+    /// `Client {realm, name}` — `AccountSource::client`.
+    Client,
+    /// `Service {realm, name}` — `AccountSource::service`.
+    Service,
+}
+
 /// A client of the run who holds an admin-service ticket.
 pub struct Persona {
     pub sam: String,
@@ -1211,6 +1223,21 @@ impl World {
     /// uid checked; the test uid is dird's and its kdc peer here), in one
     /// pinned view.
     pub fn dird_client_resolution(&self, sam: &str) -> keyd_types::AttestedNameResolution {
+        self.dird_resolution(&principal(sam), DirdQuery::Client)
+            .expect("the account exists")
+    }
+
+    /// Task PN13 (docs/59 §7.1, §7.5): the attested name resolution the
+    /// **running** dird answers on `dird-kdc.sock` for `name` — the record
+    /// of a `Client` query (the KDC's AS lookup) or of a `Service` query
+    /// (its TGS lookup) — read through the channel's own client in one
+    /// pinned view, exactly what dird hands the KDC; `None` when dird
+    /// answers that no such principal exists.
+    pub fn dird_resolution(
+        &self,
+        name: &PrincipalName,
+        query: DirdQuery,
+    ) -> Option<keyd_types::AttestedNameResolution> {
         let mut client = ipc_directory::DirectoryClient::connect(
             connector::dird(self.input.paths.dird_kdc_socket.as_path()),
             self.uid,
@@ -1219,11 +1246,16 @@ impl World {
         )
         .expect("dird describes its domain");
         let view = client.begin_view().expect("dird pins a view");
-        let account = kdc::AccountSource::client(&view, &realm(), &principal(sam))
-            .expect("dird answers the client query")
-            .expect("the account exists");
+        let resolution = match query {
+            DirdQuery::Client => kdc::AccountSource::client(&view, &realm(), name)
+                .expect("dird answers the client query")
+                .map(|account| account.resolution),
+            DirdQuery::Service => kdc::AccountSource::service(&view, &realm(), name)
+                .expect("dird answers the service query")
+                .map(|account| account.resolution),
+        };
         view.end().expect("the view ends");
-        account.resolution
+        resolution
     }
 
     /// The first administrators' password files (docs/51 §4.4 source (b):
@@ -1335,6 +1367,16 @@ impl World {
     /// clock, and keyd's verifier through the host's connector (Role::Ldap,
     /// the produced `keyd_socket`).
     pub fn start_dird(&mut self) {
+        let produced = self.input.paths.attestation_key.as_path().to_path_buf();
+        self.start_dird_attesting_with(&produced);
+    }
+
+    /// [`World::start_dird`] with dird's attestation key read — through
+    /// dird's own reader — from `key_file` instead of the produced file its
+    /// configuration names (task PN13: a dird whose key is not the one the
+    /// ceremony installed in keyd; docs/59 §7.2 step 1, §7.4). Everything
+    /// else is the produced configuration's.
+    pub fn start_dird_attesting_with(&mut self, key_file: &Path) {
         let paths = &self.input.paths;
         let settings = DirdSettings::parse(&self.read(&paths.dird_config)).unwrap();
         // Task PN12 (docs/59 §7.4): dird's attestation key — the produced
@@ -1344,11 +1386,8 @@ impl World {
             settings.attestation_key_path().as_path(),
             paths.attestation_key.as_path()
         );
-        let attestation_key = directory_daemon::startup::read_attestation_key(
-            settings.attestation_key_path().as_path(),
-            self.uid,
-        )
-        .unwrap();
+        let attestation_key =
+            directory_daemon::startup::read_attestation_key(key_file, self.uid).unwrap();
         let mut params = directory_daemon::test_seams::DaemonParams::from(
             directory_daemon::startup::params(&settings, attestation_key).unwrap(),
         );
@@ -1418,6 +1457,12 @@ impl World {
             owner_uid: uid,
         };
         self.dird = Some(DirdRun::start(params, admin, source, policy).expect("dird starts"));
+    }
+
+    /// Stop dird (its audit window delivered, bounded).
+    pub fn stop_dird(&mut self) {
+        let unacknowledged = self.dird.take().expect("dird runs").stop().unwrap();
+        assert_eq!(unacknowledged, 0, "dird delivered every audit event");
     }
 
     /// The kdc: its produced file read through the kdc's own reader (owner =
