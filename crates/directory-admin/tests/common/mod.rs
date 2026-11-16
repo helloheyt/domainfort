@@ -25,6 +25,13 @@
 #[path = "../../../ipc-audit-client/tests/linked/mod.rs"]
 pub mod linked;
 
+/// The principal namespace of a store written beneath the one checker —
+/// crates/directory-pip's one fixture helper (task PN4b; docs/59 §5.1,
+/// §5.5; docs/questions/Q-1031): the keys every provisioned principal gets,
+/// derived, and the `principal-namespace` marker.
+#[path = "../../../directory-pip/tests/common/namespace.rs"]
+pub mod namespace;
+
 use core::time::Duration;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -219,13 +226,14 @@ pub fn sid_of(id: u32) -> Sid {
 
 /// The keys a provisioned object holds in the one principal namespace (task
 /// PN5), written by hand in the folded form docs/59 §4.1-§4.3 gives them —
-/// what the write checker derives (`principal_names::keys_of_names`), so a
-/// store this fixture writes beneath the checker looks like one it wrote:
-/// a user / group its sAMAccountName; a computer its sAMAccountName, its
-/// base name, its SPN and its dNSHostName (the DC account too); a service
-/// object the same without the host name (Q-1010 item 3); the krbtgt
-/// account its sAMAccountName and the realm alias `example.test` (N5).
-/// Nothing for an object outside the namespace.
+/// the expectation only: the fixture writes the keys the derivation gives
+/// (module [`namespace`], task PN4b — never these literals) and checks, on
+/// every provisioning, that they are exactly these. A user / group its
+/// sAMAccountName; a computer its sAMAccountName, its base name, its SPN
+/// and its dNSHostName (the DC account too); a service object the same
+/// without the host name (Q-1010 item 3); the krbtgt account its
+/// sAMAccountName and the realm alias `example.test` (N5). Nothing for an
+/// object outside the namespace.
 /// Source: docs/59 §4.1, §4.3, §4.4 N5; docs/questions/Q-1010 item 3; this
 /// project's own test data.
 pub fn namespace_keys(id: u32) -> &'static [&'static str] {
@@ -904,20 +912,38 @@ impl Domain {
         ]
     }
 
-    /// Provision the domain in ONE transaction (module documentation).
+    /// Provision the domain in ONE transaction (module documentation). The
+    /// fixture writes beneath the one checker, so it writes what the checker
+    /// would have (tasks PN5, PN4b; docs/59 §4.3, §5.1, §5.5): every
+    /// principal's namespace keys, derived (module [`namespace`]; the
+    /// service objects listed — Q-1010 item 3) and checked against
+    /// [`namespace_keys`], and — with the counters — the
+    /// `principal-namespace` marker, whose name and range module
+    /// [`namespace`] spells for the crates that cannot reach this crate's
+    /// constants: pinned equal to them here.
     fn provision(&self, rid_end: Option<u64>) {
+        assert_eq!(
+            namespace::NAMESPACE_MARKER,
+            (
+                directory_admin::PRINCIPAL_NAMESPACE_COUNTER,
+                directory_admin::PRINCIPAL_NAMESPACE_FIRST,
+                directory_admin::PRINCIPAL_NAMESPACE_END_EXCLUSIVE,
+            )
+        );
         let mut txn = self.store.begin_write().expect("begin write");
         if let Some(rid_end) = rid_end {
             txn.create_counter(RID_COUNTER, RID_FIRST, rid_end)
                 .expect("rid counter");
             txn.create_counter(CHANGE_SEQ_COUNTER, 1, u64::MAX)
                 .expect("change-seq counter");
+            namespace::create_namespace_marker(&mut txn);
             for id in RID_ORDER {
                 let taken = txn.take_counter_value(RID_COUNTER).expect("rid");
                 assert_eq!(taken, u64::from(rid(id)));
             }
         }
         let mut sds: BTreeMap<u32, SecurityDescriptor> = BTreeMap::new();
+        let mut created = Vec::new();
         for (index, planned) in self.plan().into_iter().enumerate() {
             let class_id = self.p1.class_by_name(planned.class).expect(planned.class);
             let class = self.p1.class(class_id).unwrap();
@@ -934,15 +960,6 @@ impl Domain {
                 self.attr("nTSecurityDescriptor"),
                 vec![sd.encode().unwrap()],
             ));
-            // Task PN5: the namespace keys the one checker would have
-            // written (this fixture writes beneath it).
-            let keys = namespace_keys(planned.id);
-            if !keys.is_empty() {
-                attributes.push((
-                    ad_schema::PRINCIPAL_NAME_KEY,
-                    keys.iter().map(|k| k.as_bytes().to_vec()).collect(),
-                ));
-            }
             let origin = if rid_end.is_some() {
                 self.provision_origin(&mut txn)
             } else {
@@ -952,6 +969,7 @@ impl Domain {
                     origin_seq: u64::try_from(index).unwrap() + 1,
                 }
             };
+            created.push((guid(planned.id), origin));
             txn.create_object(
                 NewObject {
                     guid: guid(planned.id),
@@ -963,6 +981,26 @@ impl Domain {
             )
             .unwrap_or_else(|e| panic!("create {}: {e:?}", planned.id));
             sds.insert(planned.id, sd);
+        }
+        let services =
+            DirectoryContext::new(self.p1.clone(), &KeydConfig::new(realm()), naming_context())
+                .expect("context")
+                .with_service_objects(BTreeSet::from([guid(LDAP_SVC), guid(ADMIND_SVC)]));
+        namespace::write_namespace_keys(&self.store, &mut txn, &services, &created);
+        // The derived keys are docs/59's, as written out by hand above.
+        for (g, _) in &created {
+            let stored: BTreeSet<Vec<u8>> = txn
+                .get_object(*g)
+                .expect("store")
+                .expect("created")
+                .attribute(ad_schema::PRINCIPAL_NAME_KEY)
+                .map(|a| a.values.iter().map(|v| v.value.clone()).collect())
+                .unwrap_or_default();
+            let expected: BTreeSet<Vec<u8>> = namespace_keys(g.data1)
+                .iter()
+                .map(|k| k.as_bytes().to_vec())
+                .collect();
+            assert_eq!(stored, expected, "{}", g.data1);
         }
         txn.commit().expect("commit");
     }

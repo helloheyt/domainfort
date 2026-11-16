@@ -219,8 +219,8 @@ fn provisioned_service_objects_claim_no_host_name() {
             ],
         ));
     }
-    d.create_all(objects);
     let services: BTreeSet<Guid> = [51, 52, 53].into_iter().map(guid).collect();
+    d.create_all_with_service_objects(objects, &services);
 
     let dc = keys_of(&d, 50, &services).unwrap();
     assert!(dc
@@ -319,7 +319,8 @@ fn stored_names_the_namespace_refuses() {
         "Example.Test",
         &[("userAccountControl", normal())],
     ));
-    d.create_all(objects);
+    // Objects the one checker would refuse: written beneath it, keyless.
+    d.create_all_beneath_checker(objects);
     for (id, refusal) in [
         (60, NameRefused::UpnSuffix),
         (61, NameRefused::Separator),
@@ -387,7 +388,10 @@ fn the_fold_is_pinned_to_dirstore_on_every_printable_octet() {
     for (sam, id) in &classes {
         objects.push(d.group(*id, STAFF_OU, sam, GLOBAL_SECURITY, &[]));
     }
-    d.create_all(objects);
+    // Some of these names the namespace refuses ("k/", "k@", "k$"): this
+    // test pins dirstore's per-attribute fold, so the groups are written
+    // beneath the checker, keyless.
+    d.create_all_beneath_checker(objects);
 
     let sam = d.attr("sAMAccountName");
     let view = d.view();

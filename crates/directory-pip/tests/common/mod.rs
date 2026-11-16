@@ -11,7 +11,23 @@
 //! passwords and times are this project's own test data; every time value is
 //! derived by hand in a comment. No vector or fixture comes from any other
 //! implementation.
+//!
+//! # The principal namespace (task PN4b)
+//!
+//! The store is written through dirstore directly — beneath the one checker
+//! — so the fixture writes what the checker would have (module
+//! [`namespace`]): the `principal-namespace` marker when the store is
+//! opened, and every principal [`Dir::create_all`] creates gets its
+//! namespace keys in the same transaction. An object the checker would
+//! refuse is written without keys only through
+//! [`Dir::create_all_beneath_checker`], explicitly; [`Dir::set`] writes
+//! beneath the checker too (the keys stay as they were — phase 1 has no
+//! name change, docs/questions/Q-1029 item 9), and [`Dir::write_principal_keys`]
+//! re-derives them. Source: docs/59 §5.1, §5.5; docs/questions/Q-1026 item
+//! 5, Q-1031.
 #![allow(dead_code)] // each test binary uses a different subset
+
+pub mod namespace;
 
 use ad_schema::{phase1, Phase1Schema};
 use directory_pip::{DirectoryContext, DirectoryView, NamingContext, TierMap};
@@ -245,6 +261,9 @@ impl Dir {
         .expect("open store");
         let ctx =
             DirectoryContext::new(p1.clone(), &keyd_config(), naming_context()).expect("context");
+        let mut txn = store.begin_write().expect("begin write");
+        namespace::create_namespace_marker(&mut txn);
+        txn.commit().expect("commit");
         Dir {
             p1,
             store,
@@ -481,8 +500,38 @@ impl Dir {
         self.principal("group", id, parent, sam, &extra)
     }
 
-    /// Create every object in one committed transaction.
+    /// Create every object in one committed transaction, each principal with
+    /// its namespace keys as the one checker writes them (module
+    /// documentation; no provisioned service object).
     pub fn create_all(&self, objects: Vec<NewObject>) {
+        self.create_all_with_service_objects(objects, &BTreeSet::new());
+    }
+
+    /// [`Dir::create_all`] with `services` as the provisioned service
+    /// objects: their keys are derived without the `HostName` key (docs/59
+    /// §4.3; Q-1010 item 3), as the checker derives them under their claims.
+    pub fn create_all_with_service_objects(
+        &self,
+        objects: Vec<NewObject>,
+        services: &BTreeSet<Guid>,
+    ) {
+        let ctx = self.context_with(services);
+        let mut txn = self.store.begin_write().expect("begin write");
+        let mut created = Vec::with_capacity(objects.len());
+        for obj in objects {
+            let origin = self.origin();
+            created.push((obj.guid, origin));
+            txn.create_object(obj, &origin).expect("create");
+        }
+        namespace::write_namespace_keys(&self.store, &mut txn, &ctx, &created);
+        txn.commit().expect("commit");
+    }
+
+    /// Create every object in one committed transaction WITHOUT namespace
+    /// keys: objects the one checker would refuse (a name the namespace
+    /// refuses, an inconsistent record) — a store written beneath the
+    /// checker, which no lookup by name reaches (docs/questions/Q-1031).
+    pub fn create_all_beneath_checker(&self, objects: Vec<NewObject>) {
         let mut txn = self.store.begin_write().expect("begin write");
         for obj in objects {
             let origin = self.origin();
@@ -491,7 +540,17 @@ impl Dir {
         txn.commit().expect("commit");
     }
 
-    /// Replace the values of one attribute (empty = remove it).
+    /// A directory context of this store's realm with `services` as the
+    /// provisioned service objects.
+    fn context_with(&self, services: &BTreeSet<Guid>) -> DirectoryContext {
+        DirectoryContext::new(self.p1.clone(), &keyd_config(), naming_context())
+            .expect("context")
+            .with_service_objects(services.clone())
+    }
+
+    /// Replace the values of one attribute (empty = remove it) — a write
+    /// beneath the checker: the namespace keys stay as they were
+    /// ([`Dir::write_principal_keys`] re-derives them).
     pub fn set(&self, id: u32, attr: &str, values: Vec<Vec<u8>>) {
         let mut txn = self.store.begin_write().expect("begin write");
         let origin = self.origin();
@@ -507,48 +566,19 @@ impl Dir {
         txn.commit().expect("commit");
     }
 
-    /// Write the namespace keys of the principals `ids` as their
-    /// `PRINCIPAL_NAME_KEY` values — exactly `keys_of_names` of their stored
-    /// names, with `services` as the provisioned service objects — which is
-    /// what the one checker stores from task PN5 on (docs/59 §5.1, N7). A
-    /// test store written through dirstore directly carries no keys
-    /// otherwise; this is the helper docs/questions/Q-1026 item 5 names for
-    /// the fixtures that need them (the product writes only through the
-    /// checker, R13).
+    /// Re-derive the namespace keys of the principals `ids` from their
+    /// stored names now — with `services` as the provisioned service
+    /// objects — and write them as their `PRINCIPAL_NAME_KEY` values: what
+    /// the one checker would have stored had they been created with these
+    /// names (docs/59 §5.1, N7; module [`namespace`]). For a test that
+    /// changed a name beneath the checker ([`Dir::set`]) or created service
+    /// objects whose set it learns later.
     pub fn write_principal_keys(&self, ids: &[u32], services: &BTreeSet<Guid>) {
-        let ctx = DirectoryContext::new(self.p1.clone(), &keyd_config(), naming_context())
-            .expect("context")
-            .with_service_objects(services.clone());
-        let changes: Vec<(u32, Vec<Vec<u8>>)> = {
-            let view = ctx.view(&self.store, &self.empty_tiers).expect("view");
-            ids.iter()
-                .map(|id| {
-                    let obj = view
-                        .authority_snapshot()
-                        .get_object(guid(*id))
-                        .expect("store")
-                        .expect("object");
-                    let keys = view
-                        .principal_keys(&obj, services)
-                        .expect("keys")
-                        .expect("a principal");
-                    (*id, keys.keys().map(|k| k.as_bytes().to_vec()).collect())
-                })
-                .collect()
-        };
+        let ctx = self.context_with(services);
         let mut txn = self.store.begin_write().expect("begin write");
-        for (id, values) in changes {
-            let origin = self.origin();
-            txn.modify_object(
-                guid(id),
-                vec![AttributeChange::Replace {
-                    id: ad_schema::PRINCIPAL_NAME_KEY,
-                    values,
-                }],
-                &origin,
-            )
-            .expect("modify");
-        }
+        let rewritten: Vec<(Guid, Origin)> =
+            ids.iter().map(|id| (guid(*id), self.origin())).collect();
+        namespace::write_namespace_keys(&self.store, &mut txn, &ctx, &rewritten);
         txn.commit().expect("commit");
     }
 

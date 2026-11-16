@@ -9,7 +9,15 @@
 //! * [`Directory`] — a directory for the identities of the kdc fixtures
 //!   (crates/kdc/tests/common: realm EXAMPLE.ORG, alice, the computer
 //!   account ws1$, the service host/files.example.org, the krbtgt account),
-//!   built through dirstore with the phase-1 schema, in a file of its own.
+//!   built through dirstore with the phase-1 schema, in a file of its own —
+//!   beneath the one checker, so it writes what the checker would have
+//!   (task PN4b; docs/59 §5.1, §5.5; docs/questions/Q-1031): the
+//!   `principal-namespace` marker when the store is made, and every
+//!   principal [`Directory::create_all`] creates gets its namespace keys in
+//!   the same transaction, through [`namespace`] — crates/directory-pip's
+//!   one fixture helper, reused through `#[path]`, which also serves this
+//!   crate's own provisioned fixtures (tests/admin_service.rs,
+//!   tests/kpasswd_service.rs) and crates/admin-daemon's.
 //! * [`Dird`] — the real `directory_daemon::serve` on its own thread with
 //!   its own current-thread runtime, stopped through `DaemonControl`.
 //! * [`connector`] — the kdc's side of both sockets. On Linux the daemons'
@@ -33,6 +41,9 @@
 #[path = "../../../keyd-daemon/tests/support/mod.rs"]
 pub mod keyd;
 
+#[path = "../../../directory-pip/tests/common/namespace.rs"]
+pub mod namespace;
+
 pub use keyd::{eventually, my_uid, skip_as_root, FakeAuditd, TempDir, TestClock};
 
 use ad_schema::{flags::user_account_control as uac, phase1, Phase1Schema};
@@ -46,7 +57,7 @@ use directory_daemon::{
     AuditEndpoint, DaemonControl, SharedClock, StoreSource, ENGINE_QUEUE_CAPACITY,
     LDAP_QUEUE_CAPACITY, MAX_LDAP_SESSIONS,
 };
-use directory_pip::NamingContext;
+use directory_pip::{DirectoryContext, NamingContext};
 use dirstore::{AttrId, IntegrityKey, NewObject, NodeId, Origin, Store, Timestamp};
 use dtyp::{Control, Guid, SecurityDescriptor, Sid, SECURITY_NT_AUTHORITY};
 use keyd_types::KeydConfig;
@@ -145,7 +156,8 @@ pub struct Directory {
 }
 
 impl Directory {
-    /// An empty store at `path` (mode 0600, as dird requires).
+    /// A store at `path` with no object (mode 0600, as dird requires), and
+    /// the `principal-namespace` marker (module documentation).
     pub fn empty(path: &Path) -> Directory {
         let p1 = phase1().unwrap();
         let store = Store::open(
@@ -154,6 +166,9 @@ impl Directory {
             p1.schema().clone(),
         )
         .unwrap();
+        let mut txn = store.begin_write().unwrap();
+        namespace::create_namespace_marker(&mut txn);
+        txn.commit().unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
         Directory {
             p1,
@@ -309,12 +324,19 @@ impl Directory {
         ]
     }
 
+    /// Create every object in one committed transaction, each principal with
+    /// its namespace keys as the one checker writes them (module
+    /// documentation; this world holds no provisioned service object).
     pub fn create_all(&self, objects: Vec<NewObject>) {
+        let ctx = DirectoryContext::new(self.p1.clone(), &keyd_config(), naming_context()).unwrap();
         let mut txn = self.store.begin_write().unwrap();
+        let mut created = Vec::with_capacity(objects.len());
         for obj in objects {
             let origin = self.origin();
+            created.push((obj.guid, origin));
             txn.create_object(obj, &origin).unwrap();
         }
+        namespace::write_namespace_keys(&self.store, &mut txn, &ctx, &created);
         txn.commit().unwrap();
     }
 

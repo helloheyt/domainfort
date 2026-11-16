@@ -64,6 +64,7 @@ use core::time::Duration;
 use directory_admin::{wall_clock, CHANGE_SEQ_COUNTER, RID_COUNTER, RID_END_EXCLUSIVE, RID_FIRST};
 use directory_daemon::policy::{DevelopmentPolicy, MandatoryFast};
 use directory_daemon::policy_next::PolicyNextFile;
+use directory_pip::DirectoryContext;
 // The full parameters, the generic serve and any keyd verifier are dird's
 // test seams (docs/52 C18, task R15; feature `test-seams`).
 use directory_daemon::test_seams::{serve_with_admin, AdminParams, DaemonParams, VerifierFactory};
@@ -421,32 +422,16 @@ fn provisioned_at() -> KerberosTime {
     common::kt("20261101000000Z")
 }
 
-/// Task PN5 (docs/59 §4.1, §4.3; A-173): the keys the one write checker
-/// gives each provisioned principal in the one principal namespace, by hand
-/// in their folded form — this fixture writes beneath the checker, and the
-/// admin plane's `Lookup` and create conflicts probe these keys. The service
-/// objects carry the DC's host name without its key (Q-1010 item 3); the
-/// krbtgt account holds the realm alias (docs/59 N5). This project's test
-/// data.
-fn namespace_keys(id: u32) -> &'static [&'static str] {
-    match id {
-        KRBTGT => &["krbtgt", "example.org"],
-        LDAP_SVC => &["ldap-svc$", "ldap-svc", "ldap/dc1.example.org"],
-        ADMIND_SVC => &["admind-svc$", "admind-svc", "admind/dc1.example.org"],
-        CHANGEPW_SVC => &["changepw-svc$", "changepw-svc", "kadmin/changepw"],
-        ADMIN1 => &["admin1"],
-        ADMIN2 => &["admin2"],
-        BOB => &["bob"],
-        TIER0_GROUP => &["tier0"],
-        BOOTSTRAP => &["bootstrap"],
-        STAFF_GROUP => &["staff"],
-        _ => &[],
-    }
-}
-
 /// Provision the directory in ONE transaction, with the two counters
 /// (docs/51 §4.3 step 5, §8.3; A-83; Q-358 item 1: every write takes a
-/// change-seq).
+/// change-seq). The fixture writes beneath the one checker, so it writes
+/// what the checker would have (tasks PN5, PN4b; docs/59 §4.3, §5.1, §5.5):
+/// every principal's namespace keys — derived by tests/support `namespace`
+/// (`keys_of_names` of its stored names; the service objects listed, so
+/// they carry the DC's host name without its key — Q-1010 item 3; the
+/// krbtgt account holding the realm alias — docs/59 N5), which the admin
+/// plane's `Lookup` and create conflicts and the one lookup path probe —
+/// and the `principal-namespace` marker.
 fn provision(
     path: &Path,
     with_admin_service: bool,
@@ -470,7 +455,9 @@ fn provision(
             u64::from(rid(id))
         );
     }
+    support::namespace::create_namespace_marker(&mut txn);
     let mut sds: BTreeMap<u32, SecurityDescriptor> = BTreeMap::new();
+    let mut created = Vec::new();
     for planned in plan(with_admin_service, with_change_password_service) {
         let class_id = p1.class_by_name(planned.class).unwrap();
         let class = p1.class(class_id).unwrap();
@@ -484,14 +471,8 @@ fn provision(
             .map(|(name, values)| (attr(name), values.clone()))
             .collect();
         attributes.push((attr("nTSecurityDescriptor"), vec![sd.encode().unwrap()]));
-        let keys = namespace_keys(planned.id);
-        if !keys.is_empty() {
-            attributes.push((
-                ad_schema::PRINCIPAL_NAME_KEY,
-                keys.iter().map(|k| k.as_bytes().to_vec()).collect(),
-            ));
-        }
         let origin = origin(&mut txn);
+        created.push((g(planned.id), origin));
         txn.create_object(
             NewObject {
                 guid: g(planned.id),
@@ -504,6 +485,14 @@ fn provision(
         .unwrap();
         sds.insert(planned.id, sd);
     }
+    let ctx = DirectoryContext::new(
+        p1.clone(),
+        &support::keyd_config(),
+        support::naming_context(),
+    )
+    .unwrap()
+    .with_service_objects([LDAP_SVC, ADMIND_SVC, CHANGEPW_SVC].map(g).into());
+    support::namespace::write_namespace_keys(&store, &mut txn, &ctx, &created);
     txn.commit().unwrap();
     std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
     Arc::new(store)

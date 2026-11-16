@@ -14,17 +14,20 @@
 //!
 //! # The rules (docs/47 §12, all accepted)
 //!
-//! - **Names (R47-1):** AS client = exactly one component, looked up by
-//!   sAMAccountName through the unique index, then re-compared octet for
-//!   octet; user or computer only; never the krbtgt account (RID 502). TGS
-//!   server = two or more components joined with "/", looked up by
-//!   servicePrincipalName, octet for octet, on computers only. No UPN, "$",
-//!   enterprise or canonicalisation fallbacks. Both go through the one
-//!   lookup path by name, [`DirectoryView::canonical_principal`] (task PN4;
-//!   docs/59 §6): one key per request from crate `principal-names`, one
-//!   probe, the kind and the key purpose read from the object found, and
-//!   R47-1 as the acceptance of wave 2 (module `resolve`;
-//!   docs/questions/Q-1026, Q-1027).
+//! - **Names (R47-1):** AS client = exactly one component, accepted only
+//!   as an object's sAMAccountName, re-compared octet for octet; user or
+//!   computer only; never the krbtgt account (RID 502). TGS server = two or
+//!   more components joined with "/", accepted only as a computer's
+//!   servicePrincipalName, octet for octet. No UPN, "$", enterprise or
+//!   canonicalisation fallbacks. Both go through the one lookup path by
+//!   name, [`DirectoryView::canonical_principal`] (tasks PN4, PN4b; docs/59
+//!   §6): one key per request from crate `principal-names`, one probe of
+//!   the namespace's union index (`PRINCIPAL_NAME_KEY` — no per-attribute
+//!   index is asked for a name), the kind and the key purpose read from the
+//!   object found, and R47-1 as the acceptance of wave 2 (module `resolve`;
+//!   docs/questions/Q-1026, Q-1027, Q-1042). The DNS record owner is found
+//!   through the same probe, by its `HostName` key (module `host`;
+//!   Q-1036 item 6).
 //! - **krbtgt (R47-2):** never a client or a service;
 //!   [`DirectoryView::krbtgt_handle`] gives `KdcConfig.krbtgt`.
 //! - **Keys (R47-3):** `KeyHandle = (objectGUID, purpose)`.
@@ -168,7 +171,7 @@ pub use groups::{MemberChange, MAX_EXPANDED_GROUPS, MAX_NESTING_DEPTH};
 // A computer's DNS host record: the rules its writer, the PIP and the zone
 // projection share (task DN6; docs/54 §5.2-§5.5).
 pub use host::{
-    host_address_of, host_address_value, host_label, registrable, zone_serial,
+    computer_label, host_address_of, host_address_value, host_label, registrable, zone_serial,
     DNS_ZONE_SERIAL_COUNTER, DNS_ZONE_SERIAL_END_EXCLUSIVE, DNS_ZONE_SERIAL_FIRST, HOST_ADDRESS,
     MAX_HOST_ADDRESSES,
 };

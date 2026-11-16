@@ -22,7 +22,7 @@ use crate::names::{is_krbtgt_sid, DOMAIN_USER_RID_KRBTGT, KRBTGT};
 use crate::naming::NamingContext;
 use crate::principal::name_context_of;
 use crate::record::{self, Ids};
-use crate::resolve::LookupCtx;
+use crate::resolve::{namespace_index_holds_every_key, LookupCtx};
 use crate::salt::{account_salt, AccountKind};
 use crate::state;
 use crate::tier::{most_privileged, TierMap};
@@ -69,10 +69,6 @@ pub struct DirectoryContext {
     enctypes: Vec<i32>,
     /// `KeydConfig.s2k_params` (R47-10).
     s2kparams: Option<Vec<u8>>,
-    /// Longest stored sAMAccountName / servicePrincipalName value: a longer
-    /// name cannot match (checked before the index is asked).
-    sam_max_len: usize,
-    spn_max_len: usize,
     /// The DN of the domain NC's root: the suffix of every DN of the NC
     /// (A-53; [MS-ADTS] 3.1.1.1.4, 3.1.1.1.5; crate::naming).
     naming_context: NamingContext,
@@ -98,13 +94,16 @@ impl DirectoryContext {
     /// docs/47 §3.3 item 3), if the naming context's DNS name in upper case
     /// is not that realm (A-53; [MS-ADTS] 3.1.1.1.5) or is not a realm alias
     /// the principal namespace can hold (RFC 4120 §6.1: no ":" or "/"; no
-    /// "@"; not "krbtgt" — crate `principal-names` `NameContext`), or if the
-    /// schema lacks what docs/47 reads. The set of provisioned service
+    /// "@"; not "krbtgt" — crate `principal-names` `NameContext`), if the
+    /// schema lacks what docs/47 reads, or if the namespace attribute
+    /// `PRINCIPAL_NAME_KEY` cannot hold every key (`principal_names::
+    /// MAX_KEY_OCTETS` octets — the one probe then never asks the store an
+    /// over-long value; crate::resolve). The set of provisioned service
     /// objects starts empty ([`DirectoryContext::with_service_objects`]).
     ///
     /// Spec: docs/47 §3.3 item 3, §7.3 (R47-10), §8.2; [MS-KILE] 3.1.1.2;
     /// RFC 4120 §6.1, §6.2; [MS-ADTS] 3.1.1.1.4, 3.1.1.1.5; A-53; docs/59
-    /// §4.2.
+    /// §4.2, §4.6, §6.1 step 2; docs/questions/Q-1008 item 2, Q-1026 item 4.
     pub fn new(
         schema: Phase1Schema,
         keyd: &KeydConfig,
@@ -127,23 +126,15 @@ impl DirectoryContext {
                 return Err(ViewError::Schema);
             }
         }
-        let max_len = |id| {
-            schema
-                .schema()
-                .attribute(id)
-                .map(|d| d.max_value_len)
-                .ok_or(ViewError::Schema)
-        };
-        let sam_max_len = max_len(ids.sam_account_name)?;
-        let spn_max_len = max_len(ids.service_principal_name)?;
+        if !namespace_index_holds_every_key(&schema) {
+            return Err(ViewError::Schema);
+        }
         Ok(DirectoryContext {
             ids,
             attr_by_guid,
             realm,
             enctypes: keyd.enctypes.iter().map(|e| e.number()).collect(),
             s2kparams: keyd.s2k_params.map(|p| p.to_vec()),
-            sam_max_len,
-            spn_max_len,
             schema,
             naming_context,
             name_context,
@@ -189,18 +180,6 @@ impl DirectoryContext {
     #[must_use]
     pub fn name_context(&self) -> &NameContext {
         &self.name_context
-    }
-
-    /// Longest stored sAMAccountName (the schema's bound): a longer probe
-    /// cannot match. Spec: docs/46 §5.4.
-    pub(crate) fn sam_max_len(&self) -> usize {
-        self.sam_max_len
-    }
-
-    /// Longest stored servicePrincipalName (the schema's bound).
-    /// Spec: docs/46 §5.4.
-    pub(crate) fn spn_max_len(&self) -> usize {
-        self.spn_max_len
     }
 
     /// The phase-1 schema.

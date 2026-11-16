@@ -408,7 +408,13 @@ fn origin(txn: &mut WriteTxn<'_>) -> Origin {
 }
 
 /// Provision the directory in ONE transaction, with the two counters
-/// (docs/51 §4.3 step 5, §8.3; A-83).
+/// (docs/51 §4.3 step 5, §8.3; A-83). The fixture writes beneath the one
+/// checker, so it writes what the checker would have (task PN4b; docs/59
+/// §4.3, §5.1, §5.5): every principal's namespace keys — derived by
+/// tests/support `namespace`, the three service objects listed (they carry
+/// the DC's host name without its key — Q-1010 item 3) — which the one
+/// lookup path probes for the kpasswd service, the ticket's client and the
+/// target; and the `principal-namespace` marker.
 fn provision(path: &Path) -> Arc<Store> {
     let p1: Phase1Schema = phase1().unwrap();
     let store = Store::open(
@@ -425,7 +431,9 @@ fn provision(path: &Path) -> Arc<Store> {
     for _ in RID_ORDER {
         txn.take_counter_value(RID_COUNTER).unwrap();
     }
+    support::namespace::create_namespace_marker(&mut txn);
     let mut sds: BTreeMap<u32, SecurityDescriptor> = BTreeMap::new();
+    let mut created = Vec::new();
     for planned in plan() {
         let class_id = p1.class_by_name(planned.class).unwrap();
         let class = p1.class(class_id).unwrap();
@@ -440,6 +448,7 @@ fn provision(path: &Path) -> Arc<Store> {
             .collect();
         attributes.push((attr("nTSecurityDescriptor"), vec![sd.encode().unwrap()]));
         let origin = origin(&mut txn);
+        created.push((g(planned.id), origin));
         txn.create_object(
             NewObject {
                 guid: g(planned.id),
@@ -452,6 +461,14 @@ fn provision(path: &Path) -> Arc<Store> {
         .unwrap();
         sds.insert(planned.id, sd);
     }
+    let ctx = directory_pip::DirectoryContext::new(
+        p1.clone(),
+        &support::keyd_config(),
+        support::naming_context(),
+    )
+    .unwrap()
+    .with_service_objects([LDAP_SVC, ADMIND_SVC, CHANGEPW_SVC].map(g).into());
+    support::namespace::write_namespace_keys(&store, &mut txn, &ctx, &created);
     txn.commit().unwrap();
     std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
     Arc::new(store)

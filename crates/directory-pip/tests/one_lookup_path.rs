@@ -1,43 +1,53 @@
-//! Guard of docs/59 §5.3 and §6.1 (task PN4; decision A-173; classes C31
-//! and C49): in crate directory-pip, a requested principal name reaches an
-//! object only through the one lookup path — `canonical_principal` in
-//! `src/resolve.rs`.
+//! Guard of docs/59 §5.3 and §6.1 (tasks PN4, PN4b; decisions A-173,
+//! A-178; classes C31 and C49): in crate directory-pip, a name reaches an
+//! object only through the one lookup path — the one probe of the
+//! namespace's union index in `src/resolve.rs`.
 //!
 //! The mechanism is a single chokepoint: the KDC's client and service
-//! lookups are thin wrappers of it, and `ResolvedPrincipal` can be built
-//! only there. What Rust cannot express — that no other function of this
-//! crate probes a name index or derives a purpose from a name — is pinned
-//! here, over the crate's non-test source (`crates/directory-pip/src`):
+//! lookups are thin wrappers of `canonical_principal`, the DNS record owner
+//! asks `host_name_holder` (the holder of a `HostName` key — docs/questions/
+//! Q-1036 item 6), both go through the private `probe`, and
+//! `ResolvedPrincipal` can be built only there. What Rust cannot express —
+//! that no other function of this crate probes a name index, derives a
+//! purpose from a name or compares host names by a fold of its own — is
+//! pinned here, over the crate's non-test source
+//! (`crates/directory-pip/src`):
 //!
-//! 1. `lookup_unique(` is asked of a principal-name attribute only by
-//!    `src/resolve.rs` (exactly one call — the one probe; Q-1026) and, with
-//!    its reason, by `src/host.rs` (`dns_record_owner`: a DNS host label to
-//!    its computer — docs/59 §5.3 lists it until it moves to the
-//!    `ComputerBase` key). Everywhere else it is asked only of objectSid (a
-//!    SID is not a name — docs/59 §5.3 item 2), plus `PepView`'s generic
-//!    pass-through in `src/pep.rs` (the LDAP attribute-equality fast path —
-//!    docs/59 §5.3 item 1, §6.4).
+//! 1. `lookup_unique(` is asked of a name only by `src/resolve.rs`, and
+//!    only of `PRINCIPAL_NAME_KEY` — exactly one call, the one probe
+//!    (Q-1026; task PN4b): no per-attribute name index (sAMAccountName,
+//!    userPrincipalName, servicePrincipalName, dNSHostName) is asked
+//!    anywhere, `src/host.rs` included. Everywhere else it is asked only of
+//!    objectSid (a SID is not a name — docs/59 §5.3 item 2), plus
+//!    `PepView`'s generic pass-through in `src/pep.rs` (the LDAP
+//!    attribute-equality fast path — docs/59 §5.3 item 1, §6.4).
 //! 2. The request's key (`key_of_request(`), the reserved-name predicate
 //!    (`reserved_name_of(`), the purpose derivation from a name
-//!    (`KeyPurpose::of_service_name(`) and the namespace attribute
-//!    (`PRINCIPAL_NAME_KEY`) appear only in `src/resolve.rs`: the purpose and
-//!    the reservation are judged on the resolved object's stored name there,
-//!    never on a request's spelling elsewhere (Q-1009 item 3; class C49).
+//!    (`KeyPurpose::of_service_name(`), the namespace attribute
+//!    (`PRINCIPAL_NAME_KEY`) and the probe itself (`probe(`) appear only in
+//!    `src/resolve.rs`: the purpose and the reservation are judged on the
+//!    resolved object's stored name there, never on a request's spelling
+//!    elsewhere (Q-1009 item 3; class C49).
 //! 3. The per-role search keys of R47-1 (`client_search_key`,
 //!    `service_search_key`) exist nowhere (docs/59 §6.3 wave 2, item (c)).
+//! 4. `src/host.rs` compares names only through the namespace's one fold
+//!    (`principal_names::fold`): no `eq_ignore_ascii_case(`,
+//!    `to_ascii_lowercase(` or `to_lowercase(` there (Q-1036 item 6; class
+//!    C49 — the DNS owner rule and rule N6 cannot hold a second
+//!    equivalence).
 //!
 //! Test code is not scanned (directories named `tests`, files whose name
 //! ends in `tests.rs`, and a file's `#[cfg(test)] mod … {` block to its
-//! end). Positive controls: the scan sees the one probe, the host-record
-//! lookup, the objectSid lookups, the pass-through and both account-source
-//! wrappers, so it cannot pass vacuously; and the scanner flags planted
-//! violations but not comments.
+//! end). Positive controls: the scan sees the one probe and its two callers,
+//! the host-record lookup's one call into the path, the objectSid lookups,
+//! the pass-through and both account-source wrappers, so it cannot pass
+//! vacuously; and the scanner flags planted violations but not comments.
 //!
 //! Source: docs/59 §5.3, §6.1, §6.3, §10 (the PN4 row); docs/52 C31, C49;
-//! docs/questions/Q-1009 items 1-3, Q-1026; AGENTS.md §6.1 ("a single
-//! chokepoint through which the action must pass"). Test-only; modelled on
-//! tests/pep_receives_only_the_gate.rs and crates/directory-admin
-//! tests/single_write_path.rs.
+//! docs/questions/Q-1009 items 1-3, Q-1026, Q-1036 item 6, Q-1042; AGENTS.md
+//! §6.1 ("a single chokepoint through which the action must pass").
+//! Test-only; modelled on tests/pep_receives_only_the_gate.rs and
+//! crates/directory-admin tests/single_write_path.rs.
 
 use std::path::{Path, PathBuf};
 
@@ -128,23 +138,30 @@ fn allowed_probe(file: &str, argument: &str) -> Option<&'static str> {
         return Some("objectSid");
     }
     match (file, argument) {
-        ("resolve.rs", _) => Some("the one probe"),
-        ("host.rs", "ids.sam_account_name") => Some("the host record's owner"),
+        ("resolve.rs", "PRINCIPAL_NAME_KEY") => Some("the one probe"),
         ("pep.rs", "&self" | "attr") => Some("the LDAP pass-through"),
         _ => None,
     }
 }
 
 /// The tokens only `src/resolve.rs` may name (rule 2).
-const RESOLVE_ONLY: [&str; 4] = [
+const RESOLVE_ONLY: [&str; 5] = [
     "key_of_request(",
     "reserved_name_of(",
     "KeyPurpose::of_service_name(",
     "PRINCIPAL_NAME_KEY",
+    "probe(",
 ];
 
 /// The tokens no file may name (rule 3).
 const GONE: [&str; 2] = ["client_search_key", "service_search_key"];
+
+/// The comparisons `src/host.rs` may not make (rule 4).
+const HOST_NO_SECOND_FOLD: [&str; 3] = [
+    "eq_ignore_ascii_case(",
+    "to_ascii_lowercase(",
+    "to_lowercase(",
+];
 
 /// Every non-test source file of this crate: `(file name, code)`.
 fn crate_code() -> Vec<(String, String)> {
@@ -165,7 +182,7 @@ fn crate_code() -> Vec<(String, String)> {
         .collect()
 }
 
-/// The violations of rules 1-3 in `files`, and the allowed probes seen.
+/// The violations of rules 1-4 in `files`, and the allowed probes seen.
 fn scan(files: &[(String, String)]) -> (Vec<String>, Vec<String>) {
     let mut violations = Vec::new();
     let mut seen = Vec::new();
@@ -189,12 +206,20 @@ fn scan(files: &[(String, String)]) -> (Vec<String>, Vec<String>) {
                 violations.push(format!("{file}:{line}: {token}"));
             }
         }
+        if file == "host.rs" {
+            for token in HOST_NO_SECOND_FOLD {
+                for (line, _) in occurrences(code, token) {
+                    violations.push(format!("{file}:{line}: {token}"));
+                }
+            }
+        }
     }
     (violations, seen)
 }
 
-/// docs/59 §5.3, §6.1: rules 1-3 over this crate's source, with the
-/// positive controls of the module documentation.
+/// docs/59 §5.3, §6.1; docs/questions/Q-1026, Q-1036 item 6: rules 1-4
+/// over this crate's source, with the positive controls of the module
+/// documentation.
 #[test]
 fn a_name_reaches_an_object_only_through_the_one_lookup_path() {
     let files = crate_code();
@@ -205,11 +230,13 @@ fn a_name_reaches_an_object_only_through_the_one_lookup_path() {
     );
     let count = |entry: &str| seen.iter().filter(|s| s.as_str() == entry).count();
     assert_eq!(count("resolve.rs: the one probe"), 1, "{seen:#?}");
-    assert_eq!(count("host.rs: the host record's owner"), 1, "{seen:#?}");
     assert_eq!(count("pep.rs: the LDAP pass-through"), 2, "{seen:#?}");
     assert!(count("view.rs: objectSid") >= 2, "{seen:#?}");
-    // The account source's two lookups are wrappers of the one path, and
-    // the one path derives the request's key and the purpose.
+    assert!(!seen.iter().any(|s| s.starts_with("host.rs")), "{seen:#?}");
+    // The account source's two lookups are wrappers of the one path, the
+    // DNS record owner asks it once, and the one path derives the request's
+    // key (for a principal and for a host name) and the purpose, and probes
+    // the union index from both entries.
     let code_of_file = |name: &str| {
         files
             .iter()
@@ -221,20 +248,31 @@ fn a_name_reaches_an_object_only_through_the_one_lookup_path() {
         occurrences(code_of_file("view.rs"), "resolve_principal(").len(),
         2
     );
-    for token in ["key_of_request(", "KeyPurpose::of_service_name("] {
+    assert_eq!(
+        occurrences(code_of_file("host.rs"), "host_name_holder(").len(),
+        1
+    );
+    for (token, expected) in [
+        ("key_of_request(", 2),
+        ("KeyPurpose::of_service_name(", 1),
+        ("self.probe(", 2),
+    ] {
         assert_eq!(
             occurrences(code_of_file("resolve.rs"), token).len(),
-            1,
+            expected,
             "{token}"
         );
     }
+    // host.rs compares through the namespace fold.
+    assert!(!occurrences(code_of_file("host.rs"), "fold(").is_empty());
 }
 
 /// Positive control of the scanner: planted violations are flagged — a
-/// second probe of sAMAccountName, a probe of servicePrincipalName outside
-/// the one path, a purpose derived from a request's name, the namespace
-/// attribute named, a resurrected search key — while comments, the
-/// objectSid lookup and the allowed files are not.
+/// second probe of sAMAccountName, a probe of servicePrincipalName (both
+/// now outside the one path wherever they stand), a purpose derived from a
+/// request's name, the namespace attribute named, the probe called, a
+/// resurrected search key, a second fold of host names — while comments,
+/// the objectSid lookup and the allowed files are not.
 #[test]
 fn the_scanner_flags_planted_lookups_by_name() {
     let planted = "\
@@ -245,6 +283,9 @@ let p = KeyPurpose::of_service_name(name);
 let a = ad_schema::PRINCIPAL_NAME_KEY;
 let k = client_search_key(name);
 let o = self.snapshot.lookup_unique(ids.object_sid, &sid.encode())?;
+let h = self.probe(&key)?;
+let n = first.eq_ignore_ascii_case(label);
+let u = self.snapshot.lookup_unique(PRINCIPAL_NAME_KEY, key.as_bytes())?;
 // let x = self.snapshot.lookup_unique(ids.sam_account_name, b\"x\");
 ";
     let files = vec![("view.rs".to_owned(), code_of(planted))];
@@ -254,14 +295,34 @@ let o = self.snapshot.lookup_unique(ids.object_sid, &sid.encode())?;
         vec![
             "view.rs:1: lookup_unique(ids.sam_account_name, …)",
             "view.rs:3: lookup_unique(self.ctx.ids.service_principal_name, …)",
+            "view.rs:10: lookup_unique(PRINCIPAL_NAME_KEY, …)",
             "view.rs:4: KeyPurpose::of_service_name(",
             "view.rs:5: PRINCIPAL_NAME_KEY",
+            "view.rs:10: PRINCIPAL_NAME_KEY",
+            "view.rs:8: probe(",
             "view.rs:6: client_search_key",
         ]
     );
     assert_eq!(seen, vec!["view.rs: objectSid"]);
-    // The same text is allowed in the one path, except the search key.
+    // In the one path only the union probe is allowed: a per-attribute
+    // name index is not, and neither is the search key.
     let in_resolve = vec![("resolve.rs".to_owned(), code_of(planted))];
-    let (violations, _) = scan(&in_resolve);
-    assert_eq!(violations, vec!["resolve.rs:6: client_search_key"]);
+    let (violations, seen) = scan(&in_resolve);
+    assert_eq!(
+        violations,
+        vec![
+            "resolve.rs:1: lookup_unique(ids.sam_account_name, …)",
+            "resolve.rs:3: lookup_unique(self.ctx.ids.service_principal_name, …)",
+            "resolve.rs:6: client_search_key",
+        ]
+    );
+    assert_eq!(
+        seen,
+        vec!["resolve.rs: objectSid", "resolve.rs: the one probe"]
+    );
+    // In host.rs a second fold is flagged too.
+    let in_host = vec![("host.rs".to_owned(), code_of(planted))];
+    let (violations, _) = scan(&in_host);
+    assert!(violations.contains(&"host.rs:9: eq_ignore_ascii_case(".to_owned()));
+    assert!(violations.contains(&"host.rs:1: lookup_unique(ids.sam_account_name, …)".to_owned()));
 }

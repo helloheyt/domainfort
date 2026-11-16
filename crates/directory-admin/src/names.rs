@@ -246,13 +246,15 @@ pub(crate) fn own_host_name(
     sam_account_name: &str,
     realm_dns_name: &str,
 ) -> Result<String, HostNameRefused> {
-    let candidate = sam_account_name
-        .strip_suffix(COMPUTER_SUFFIX)
-        .map(|computer_name| format!("{computer_name}{LABEL_SEPARATOR}{realm_dns_name}"))
-        .filter(|candidate| {
-            directory_pip::host_label(sam_account_name, candidate, realm_dns_name).is_some()
-        })
-        .ok_or(HostNameRefused::ComputerName)?;
+    // The computer's name is at fault only when directory-pip's own label
+    // rule refuses it (`computer_label`, the half `host_label` is built on —
+    // A-185); a host name that rule admits but `host_label` or the stored
+    // form refuses is the realm's fault (over-long, or not foldable).
+    let computer_name =
+        directory_pip::computer_label(sam_account_name).ok_or(HostNameRefused::ComputerName)?;
+    let candidate = format!("{computer_name}{LABEL_SEPARATOR}{realm_dns_name}");
+    directory_pip::host_label(sam_account_name, &candidate, realm_dns_name)
+        .ok_or(HostNameRefused::NotStorable)?;
     principal_names::fold(&candidate)
         .filter(|own| dns_host_name_ok(own))
         .ok_or(HostNameRefused::NotStorable)

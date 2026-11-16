@@ -44,25 +44,33 @@
 //!    disagree only for a case variant of a reserved name, which is refused
 //!    (class C49: one name, one equivalence).
 //!
-//! # The probe (wave 2) — docs/questions/Q-1026
+//! # The probe — the union index (task PN4b; docs/questions/Q-1026)
 //!
-//! Under the phase-1 acceptance every context accepts exactly one kind of
-//! name ([`LookupCtx`] → `AcceptedName`). The probe is the unique index of
-//! that kind's attribute (sAMAccountName or servicePrincipalName), asked
-//! once with the request's key. On a store whose principals carry their
-//! namespace keys (`PRINCIPAL_NAME_KEY`, written by the one checker from
-//! task PN5 on, unique over the union — task PN2), this returns exactly the
-//! object a probe of `PRINCIPAL_NAME_KEY` would return filtered to that kind:
-//! the union index makes the holder of a key unique, and an object holds a
-//! key with kind *k* exactly when its *k* attribute folds to it (the two
-//! folds are pinned equal — tests/principal_names.rs). On today's stores,
-//! where nothing writes `PRINCIPAL_NAME_KEY` yet, it is the lookup R47-1 has
-//! always made. It is ONE probe: there is no second probe in another name
-//! space when the first finds nothing (class C31). When the acceptance
-//! widens to several kinds per context (task PN14), the probe must become
-//! the `PRINCIPAL_NAME_KEY` index — only the union index answers several
-//! kinds in one probe; `AcceptedName` then gives way to a kind set, and the
-//! private `DirectoryView::probe` is the one place to change (Q-1026).
+//! The probe is ONE lookup of the request's key in the namespace's own
+//! unique index, `ad_schema::PRINCIPAL_NAME_KEY` (docs/59 §6.1 step 2): the
+//! values the one checker writes for every principal it creates —
+//! `principal_names::keys_of_names` of its stored names (N7, task PN5) —
+//! unique over the union of every kind (task PN2). There is no second probe
+//! in another name space when it finds nothing, and no per-kind index is
+//! asked at all (class C31; docs/59 §5.3). Which kinds the found key
+//! carries is re-derived from the object after the probe (step 5), and the
+//! context keeps only the kind it accepts — so the per-kind probe of wave 2
+//! (A-178) is gone without any change of what is accepted: on a store whose
+//! principals carry their keys, an object holds key *K* with kind *k*
+//! exactly when its *k* name folds to *K*, and at most one object holds *K*,
+//! so the union probe finds the object the per-kind probe found whenever the
+//! context accepts it (tests/canonical_principal.rs: the equivalence over
+//! 19 requests × 4 contexts). A key is at most
+//! `principal_names::MAX_KEY_OCTETS` octets by construction, and
+//! [`crate::DirectoryContext::new`] requires the attribute to hold that many
+//! (fail closed at setup), so the probe never asks the store an over-long
+//! value.
+//!
+//! The same probe answers the one other question this crate asks by name:
+//! which object holds a host name as its `HostName` key
+//! (`DirectoryView::host_name_holder`, for crate::host's DNS record owner —
+//! docs/questions/Q-1036 item 6). No lookup context accepts that kind
+//! (docs/59 §6.2); the DNS owner rule keeps only it.
 //!
 //! # The classes (AGENTS.md §6.1)
 //!
@@ -78,13 +86,19 @@
 //!
 //! # Residuals (documented, not hidden)
 //!
-//! - The probe uses the per-kind index until the switch of Q-1026.
-//! - Objects whose stored names the namespace refuses (writable through the
-//!   admin plane until task PN5) are no longer handed out: a
-//!   userPrincipalName with a foreign suffix, a stored three-part SPN or a
-//!   case variant of a reserved name is a fault when found; a "@" in a
-//!   sAMAccountName, or one equal to the realm alias, is a name no request
-//!   can probe — fail closed either way (Q-1026 item 3).
+//! - An object reaches a name only through the keys the checker wrote. An
+//!   object written beneath the checker without keys (a development store
+//!   from before task PN5 — no product store: dird refuses one without the
+//!   `principal-namespace` marker from task PN10 on) is no principal to
+//!   this path (docs/questions/Q-1031). An object whose names changed
+//!   beneath the checker after its keys were written is found by an old
+//!   key and refused by the re-derivation (step 5 — fail closed).
+//! - An object whose stored names the namespace refuses has no keys (the
+//!   checker refuses it); if it holds keys written before such a name
+//!   (beneath the checker), it is a fault when found: a userPrincipalName
+//!   with a foreign suffix, a stored three-part SPN, `KRBTGT/…`, a case
+//!   variant of a reserved name; a "@" in a sAMAccountName, or one equal to
+//!   the realm alias, is a name no request can probe (Q-1026 item 3).
 //! - Whether a resolved reserved purpose belongs to the provisioning claim
 //!   that owns it (A-163) is the writer's check (task PN5); the lookup knows
 //!   only the configured provisioned service objects as a set (Q-1019), and
@@ -93,22 +107,25 @@
 //!   `ResolvedPrincipal` carries none; `NameResolution.snapshot` is task
 //!   PN10's (Q-1027).
 //!
-//! Spec: docs/59 §4.7, §6.1-§6.3, §10 (the PN4 row); docs/47 §1.3 (R47-1),
-//! §1.4 (R47-2), R47-13; docs/questions/Q-1007 items 1-4, 10, Q-1009 items
-//! 1-3, Q-1018 items 2, 5, Q-1019 (a); A-27; [MS-KILE] v20261110 3.1.5.7,
-//! 3.3.5.1.1, 3.3.5.1.2, 3.3.5.6.1; RFC 4120 §6.2, §7.3.
+//! Spec: docs/59 §4.6, §4.7, §5.3, §6.1-§6.3, §10 (the PN4 row); docs/47
+//! §1.3 (R47-1), §1.4 (R47-2), R47-13; docs/questions/Q-1007 items 1-4,
+//! 8, 10, Q-1009 items 1-3, Q-1018 items 2, 5, Q-1019 (a), Q-1026 (the
+//! switch, task PN4b), Q-1036 item 6; A-27; A-178; [MS-KILE] v20261110
+//! 3.1.5.7, 3.3.5.1.1, 3.3.5.1.2, 3.3.5.6.1; RFC 4120 §6.2, §7.3.
 
 use crate::error::Fault;
 use crate::salt::AccountKind;
 use crate::view::{principal_id, DirectoryView};
+use ad_schema::{Phase1Schema, PRINCIPAL_NAME_KEY};
 use dirstore::Object;
 use dtyp::{Guid, Sid};
 use kdc::AccountSourceError;
 use keyd_types::{KeyHandle, KeyPurpose, PrincipalId};
+use krb_proto::constants::KRB_NT_UNKNOWN;
 use krb_proto::{KerberosString, PrincipalName, Realm};
 use principal_names::{
     key_of_request, keys_of_names, reserved_name_of, KindSet, NameKind, PrincipalClass,
-    PrincipalKey, RequestKey, ReservedName,
+    PrincipalKey, RequestKey, ReservedName, MAX_KEY_OCTETS,
 };
 
 /// The separator of an SPN's parts in its stored single-string form.
@@ -394,6 +411,20 @@ fn service_purpose(canonical: &PrincipalName, key: &PrincipalKey) -> Result<KeyP
     }
 }
 
+/// `true` if the schema's namespace attribute (`PRINCIPAL_NAME_KEY`) holds
+/// values of `principal_names::MAX_KEY_OCTETS` octets — the longest key the
+/// namespace builds — so the one probe never asks the store a value longer
+/// than the attribute's bound (dirstore refuses such a probe). Checked once,
+/// at [`crate::DirectoryContext::new`] (fail closed at setup).
+/// Spec: docs/59 §4.6 (the 2048-octet bound); docs/questions/Q-1008 item 2,
+/// Q-1026 item 4; ad-schema `PRINCIPAL_NAME_KEY_MAX_OCTETS`.
+pub(crate) fn namespace_index_holds_every_key(schema: &Phase1Schema) -> bool {
+    schema
+        .schema()
+        .attribute(PRINCIPAL_NAME_KEY)
+        .is_some_and(|d| d.max_value_len >= MAX_KEY_OCTETS)
+}
+
 impl DirectoryView<'_> {
     /// Resolve the principal `name` in `realm` for the context `ctx` — the
     /// one lookup path by name (module documentation). `Ok(None)` is "no
@@ -442,8 +473,9 @@ impl DirectoryView<'_> {
         {
             return Ok(None);
         }
-        // 3. One probe (module documentation, "The probe").
-        let Some(guid) = self.probe(accepted, &key)? else {
+        // 3. One probe of the union index (module documentation, "The
+        //    probe").
+        let Some(guid) = self.probe(&key)? else {
             return Ok(None);
         };
         let Some(object) = self.snapshot.get_object(guid)? else {
@@ -512,25 +544,64 @@ impl DirectoryView<'_> {
         }))
     }
 
-    /// The one probe of a lookup (module documentation, "The probe"; docs/
-    /// questions/Q-1026): the unique index of the accepted kind's attribute,
-    /// asked once with the request's key. A key longer than any stored
-    /// value of that attribute cannot match and is not asked (the store
-    /// refuses an over-long probe).
-    /// Spec: docs/59 §6.1 step 2; docs/47 §1.3 AS step 3, TGS step 3;
-    /// docs/46 §8.5; Q-080.
-    fn probe(&self, accepted: AcceptedName, key: &PrincipalKey) -> Result<Option<Guid>, Fault> {
-        let ids = self.ctx.ids;
-        let (attr, max_len) = match accepted {
-            AcceptedName::SamAccountName => (ids.sam_account_name, self.ctx.sam_max_len()),
-            AcceptedName::ServicePrincipalName => {
-                (ids.service_principal_name, self.ctx.spn_max_len())
+    /// The object holding the host name `host_name` as its `HostName` key
+    /// (docs/59 §4.1: `fold(host)`), found through the one probe — never a
+    /// per-kind index (docs/59 §5.3; docs/questions/Q-1036 item 6). The key
+    /// is the request key of `host_name` as a one-component name in the
+    /// configured realm: one component without "@" is its fold (docs/59
+    /// §4.2) — the very key a holder stores for its dNSHostName (§4.1; the
+    /// name-type is "not significant when checking for equivalence", RFC
+    /// 4120 §6.2). After the probe the object's keys are re-derived as for
+    /// a principal: a probed key that is not among them is a fault (fail
+    /// closed — docs/59 §6.1 step 3); a key of another kind (a
+    /// sAMAccountName spelled like a host name) holds no host name
+    /// (`None`). What the DNS owner rule asks beyond that is crate::host's.
+    /// Spec: docs/59 §4.1, §4.2, §5.3, §6.1 steps 2-3; docs/questions/Q-1007
+    /// item 8, Q-1010 items 1-3, Q-1036 item 6; RFC 4120 §6.2; [MS-ADTS]
+    /// 3.1.1.5.3.1.1.2.
+    pub(crate) fn host_name_holder(&self, host_name: &str) -> Result<Option<Object>, Fault> {
+        let Ok(component) = KerberosString::new(host_name) else {
+            return Ok(None);
+        };
+        let name = PrincipalName {
+            name_type: KRB_NT_UNKNOWN,
+            name_string: vec![component],
+        };
+        let key = match key_of_request(&name, self.ctx.realm(), self.ctx.name_context()) {
+            RequestKey::Key(key) => key,
+            RequestKey::LocalTgs | RequestKey::Foreign | RequestKey::NoSuchPrincipal => {
+                return Ok(None);
             }
         };
-        if key.as_bytes().len() > max_len {
+        let Some(guid) = self.probe(&key)? else {
             return Ok(None);
+        };
+        let Some(object) = self.snapshot.get_object(guid)? else {
+            return Ok(None);
+        };
+        let names = match self.principal_names_of(&object, self.ctx.service_objects()) {
+            Ok(Some(names)) => names,
+            Ok(None) => return Ok(None),
+            Err(_) => return Err(Fault::Unavailable),
+        };
+        let matched = keys_of_names(&names, self.ctx.name_context())
+            .map_err(|_| Fault::Unavailable)?
+            .kinds_of(&key);
+        if matched.is_empty() {
+            return Err(Fault::Unavailable);
         }
-        Ok(self.snapshot.lookup_unique(attr, key.as_bytes())?)
+        Ok(matched.contains(NameKind::HostName).then_some(object))
+    }
+
+    /// The one probe (module documentation, "The probe"; docs/questions/
+    /// Q-1026): the namespace's unique index `PRINCIPAL_NAME_KEY`, asked
+    /// once with the key. The only lookup of a name in this crate (guard:
+    /// tests/one_lookup_path.rs).
+    /// Spec: docs/59 §4.6, §5.3, §6.1 step 2; docs/46 §8.5; A-173.
+    fn probe(&self, key: &PrincipalKey) -> Result<Option<Guid>, Fault> {
+        Ok(self
+            .snapshot
+            .lookup_unique(PRINCIPAL_NAME_KEY, key.as_bytes())?)
     }
 }
 
@@ -559,6 +630,21 @@ mod tests {
         ));
         assert!(!spn_equals(stored, &kstrs(&["host/ws01.example.test"])));
         assert!(!spn_equals(stored, &kstrs(&[])));
+    }
+
+    /// docs/59 §4.6 (the 2048-octet bound), Q-1008 item 2, Q-1026 item 4:
+    /// the phase-1 schema's namespace attribute holds the longest key the
+    /// namespace builds, so the one probe never asks an over-long value.
+    #[test]
+    fn the_namespace_index_holds_every_key() {
+        let p1 = ad_schema::phase1().unwrap();
+        assert!(namespace_index_holds_every_key(&p1));
+        assert_eq!(
+            p1.schema()
+                .attribute(PRINCIPAL_NAME_KEY)
+                .map(|d| d.max_value_len),
+            Some(MAX_KEY_OCTETS)
+        );
     }
 
     /// docs/47 §1.3 (R47-1: AS = one component; TGS = two or more); docs/59

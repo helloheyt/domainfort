@@ -45,7 +45,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.95.0
         with: { components: "rustfmt, clippy" }
       # גייט אחד שמזהה workspace ריק (שלב 0) → no-op, ונכנס לתוקף אוטומטית עם
       # ה-crate הראשון. (קודם לכן השלבים הישירים נכשלו על "no members".)
@@ -56,6 +56,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.95.0
       # no-op כל עוד אין crates; מפיק CycloneDX כשיהיו (D61, R13).
       - run: bash scripts/gen-sbom.sh

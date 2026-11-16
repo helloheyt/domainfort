@@ -26,12 +26,25 @@
 //! own test data, every time derived by hand in a comment. No vector or
 //! fixture comes from any other implementation.
 //!
+//! The store is written through dirstore directly — beneath the one checker
+//! — so it holds what the checker would have written (task PN4b; docs/59
+//! §5.1, §5.5; docs/questions/Q-1031): the `principal-namespace` marker and
+//! every principal's namespace keys (`PRINCIPAL_NAME_KEY`), through
+//! crates/directory-pip's one fixture helper ([`namespace`], reused by
+//! `#[path]`). LDAP never names that attribute (it has no lDAPDisplayName —
+//! docs/59 §4.6, §6.4), so the keys change no answer here.
+//!
 //! Sources (each test names its own): RFC 4511 §4.5.1-§4.5.2, A.2; RFC 4517
 //! §3.3.13, §3.3.16; RFC 4514 §2; [MS-ADTS] v20261026 3.1.1.1.4, 3.1.1.1.5,
 //! 3.1.1.2.2.2, 3.1.1.2.2.2.7, 3.1.1.2.2.4, 3.1.1.3.1.2.4, 3.1.1.3.1.3.1,
 //! 3.1.1.3.1.3.5, 3.1.1.3.4.6, 3.1.1.4.3, 3.1.1.4.4, 5.1.3.3.6; [MS-DRSR]
 //! 5.16.3.9; docs/49 R49-9, R49-11, R49-13, R49-14, §6; A-48, A-53, A-54;
 //! Q-168, Q-169.
+
+/// The principal namespace of a store written beneath the one checker
+/// (module documentation).
+#[path = "../../../directory-pip/tests/common/namespace.rs"]
+mod namespace;
 
 use std::cell::Cell;
 use std::collections::BTreeSet;
@@ -240,6 +253,9 @@ impl Dir {
             naming_context(),
         )
         .expect("context");
+        let mut txn = store.begin_write().expect("write");
+        namespace::create_namespace_marker(&mut txn);
+        txn.commit().expect("commit");
         Dir {
             p1,
             store,
@@ -338,8 +354,12 @@ impl Dir {
         self.principal("group", id, parent, sam, open_sd(), &extra)
     }
 
+    /// Create every object in one committed transaction, each principal with
+    /// its namespace keys as the one checker writes them (module
+    /// [`namespace`]).
     fn create_all(&self, objects: Vec<NewObject>) {
         let mut txn = self.store.begin_write().expect("write");
+        let mut created = Vec::with_capacity(objects.len());
         for obj in objects {
             let seq = self.seq.get() + 1;
             self.seq.set(seq);
@@ -348,8 +368,10 @@ impl Dir {
                 origin_node: NodeId([0x18; 16]),
                 origin_seq: seq,
             };
+            created.push((obj.guid, origin));
             txn.create_object(obj, &origin).expect("create");
         }
+        namespace::write_namespace_keys(&self.store, &mut txn, &self.ctx, &created);
         txn.commit().expect("commit");
     }
 

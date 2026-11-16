@@ -71,18 +71,6 @@ fn principal(id: u32) -> PrincipalId {
     PrincipalId::from_bytes(guid(id).to_packet())
 }
 
-/// Write the principals' namespace keys as the one checker stores them
-/// from task PN5 on (docs/59 §5.1, N7) — tests/common
-/// `Dir::write_principal_keys`.
-fn write_keys(d: &Dir, ids: &[u32], services: &BTreeSet<Guid>) {
-    d.write_principal_keys(ids, services);
-}
-
-/// The standard directory's security principals.
-const PRINCIPALS: [u32; 11] = [
-    ALICE, BOB, ROOTADMIN, WS01, DC01, STAFF, ALLSTAFF, MAIL, HIDDEN, TIER0, KRBTGT,
-];
-
 /// docs/59 §4.7 (`ResolvedPrincipal`), §6.1, §6.2; docs/47 §1.3 (R47-1),
 /// §2.3 (R47-3: KeyHandle = (objectGUID, purpose)); Q-1007 item 4 (alice's
 /// sAMAccountName and UPN local part are one key with two kinds); RFC 4120
@@ -275,18 +263,67 @@ fn the_krbtgt_account_groups_and_the_realm_alias_resolve_in_no_context() {
     }
 }
 
-/// docs/59 §6.3 (wave 2: external behaviour unchanged), §5.1 (N7: the one
-/// checker stores exactly `keys_of_names` — task PN5), docs/questions/
-/// Q-1026: the same requests give the same answers on a store without
-/// namespace keys (today's) and on one whose principals carry them; and on
-/// the keyed store, every resolution is the object a probe of the union
-/// index (`PRINCIPAL_NAME_KEY`) returns for the request's key — the
-/// equivalence that lets the probe move to that index unchanged.
+/// The phase-1 lookup of docs/47 §1.3 (R47-1) made the way it was made
+/// before the one namespace — through the per-attribute unique index of the
+/// one kind the context accepts (sAMAccountName for a client, one
+/// component; servicePrincipalName for a service, two or more components
+/// joined with "/"), the stored value equal to the request octet for octet,
+/// the realm the configured one octet for octet, and only the objects R47-1
+/// admits (users and computers as clients, computers as services; never a
+/// group or the krbtgt account — the standard directory's classes, from the
+/// fixture's own table). The oracle of the equivalence test only: no source
+/// file asks these indexes for a name (tests/one_lookup_path.rs).
+/// Spec: docs/47 §1.3 AS steps 1-6, TGS steps 1-4, §1.4 (R47-2); A-27.
+fn phase_one_lookup(d: &Dir, ctx: LookupCtx, realm: &Realm, parts: &[&str]) -> Option<Guid> {
+    if realm.as_bytes() != REALM.as_bytes() {
+        return None;
+    }
+    let (attr, value, admitted): (_, String, &[u32]) = match ctx {
+        AsClient | TicketClient => {
+            let [one] = parts else {
+                return None;
+            };
+            (
+                d.attr("sAMAccountName"),
+                (*one).to_owned(),
+                &[ALICE, BOB, ROOTADMIN, WS01, DC01],
+            )
+        }
+        _ => {
+            if parts.len() < 2 {
+                return None;
+            }
+            (
+                d.attr("servicePrincipalName"),
+                parts.join("/"),
+                &[WS01, DC01],
+            )
+        }
+    };
+    let view = d.view();
+    let snapshot = view.authority_snapshot();
+    let found = snapshot.lookup_unique(attr, value.as_bytes()).ok()??;
+    let object = snapshot.get_object(found).unwrap()?;
+    let stored = &object.attribute(attr)?.values.first()?.value;
+    let id = admitted.iter().copied().find(|id| guid(*id) == found)?;
+    (stored.as_slice() == value.as_bytes()).then(|| guid(id))
+}
+
+/// docs/59 §6.3 (wave 2: external behaviour unchanged), §6.1 step 2 (one
+/// probe of the union index), §5.1 (N7: the one checker stores exactly
+/// `keys_of_names` — task PN5); docs/questions/Q-1026 (the switch's
+/// precondition, task PN4b): the same requests (19, in all four contexts)
+/// resolve, through the union probe, to exactly the objects the phase-1
+/// lookup through the per-kind indexes finds ([`phase_one_lookup`]), with
+/// the request as the canonical name — and every resolution is the object
+/// a probe of `PRINCIPAL_NAME_KEY` returns for the request's key. On a
+/// store whose principals carry no keys (written beneath the checker),
+/// nothing resolves: no per-kind index is a fallback (class C31).
 #[test]
-fn wave_two_answers_are_the_same_with_and_without_namespace_keys() {
-    let plain = Dir::standard("resolve-plain");
+fn the_union_probe_gives_the_phase_one_answers() {
     let keyed = Dir::standard("resolve-keyed");
-    write_keys(&keyed, &PRINCIPALS, &BTreeSet::new());
+    let unkeyed = Dir::new("resolve-unkeyed");
+    unkeyed.create_all_beneath_checker(unkeyed.standard_objects());
     let requests: Vec<(i32, Vec<&str>)> = vec![
         (KRB_NT_PRINCIPAL, vec!["alice"]),
         (KRB_NT_PRINCIPAL, vec!["ALICE"]),
@@ -311,14 +348,28 @@ fn wave_two_answers_are_the_same_with_and_without_namespace_keys() {
         (KRB_NT_SRV_HST, vec!["cifs", "ws01.example.test"]),
         (KRB_NT_SRV_INST, vec!["krbtgt", REALM]),
     ];
-    let (plain_view, keyed_view) = (plain.view(), keyed.view());
+    let (keyed_view, unkeyed_view) = (keyed.view(), unkeyed.view());
     let mut resolved = 0;
     for (name_type, parts) in &requests {
         for ctx in CONTEXTS {
-            let before = said(resolve(&plain_view, ctx, *name_type, parts));
-            let after = said(resolve(&keyed_view, ctx, *name_type, parts));
-            assert_eq!(before, after, "{ctx:?} {parts:?}");
-            if let Ok(Some((found, ..))) = after {
+            let found = said(resolve(&keyed_view, ctx, *name_type, parts));
+            assert_eq!(
+                found.as_ref().map(|f| f.as_ref().map(|s| s.0)),
+                Ok(phase_one_lookup(&keyed, ctx, &realm(), parts)),
+                "{ctx:?} {parts:?}"
+            );
+            assert_eq!(
+                said(resolve(&unkeyed_view, ctx, *name_type, parts)),
+                Ok(None),
+                "{ctx:?} {parts:?}"
+            );
+            if let Ok(Some((found, _, matched, canonical, _))) = found {
+                assert_eq!(canonical, *parts, "{ctx:?}");
+                let accepted = match ctx {
+                    AsClient | TicketClient => NameKind::SamAccountName,
+                    _ => NameKind::ServicePrincipalName,
+                };
+                assert!(matched.contains(&accepted), "{ctx:?} {parts:?}");
                 resolved += 1;
                 let RequestKey::Key(key) =
                     key_of_request(&name(*name_type, parts), &realm(), keyed.ctx.name_context())
@@ -411,49 +462,51 @@ fn the_purpose_comes_from_the_stored_name() {
 }
 
 /// docs/59 §4.4 (N2-N5: refusal, not correction) and §6.1 step 3 (the
-/// lookup re-derives the keys and fails closed); docs/questions/Q-1026:
-/// objects whose stored names the namespace refuses — writable through the
-/// admin plane until task PN5 — are no longer handed out: a foreign UPN
-/// suffix (N3; Q-1007 item 3) and `KRBTGT/<host>` (N4; RFC 4120 §6.2) are
-/// faults when found; a sAMAccountName with "@" (N2) or equal to the realm
-/// alias (N5) is a name no request can probe.
+/// lookup re-derives the keys and fails closed); docs/questions/Q-1026
+/// item 3, Q-1042: the one checker writes no object whose stored names the
+/// namespace refuses (task PN5). An object whose names came to be refused
+/// beneath the checker, after its keys were written — a foreign UPN suffix
+/// (N3; Q-1007 item 3), `KRBTGT/<host>` (N4; RFC 4120 §6.2) — is a fault
+/// when found by its keys; one that never had keys — a sAMAccountName with
+/// "@" (N2) or equal to the realm alias (N5) — is a name no request can
+/// probe.
 #[test]
 fn stored_names_the_namespace_refuses_fail_closed() {
     let d = Dir::new("resolve-refused");
     let normal = || vec![bits(uac::ADS_UF_NORMAL_ACCOUNT)];
     let mut objects = d.standard_objects();
-    objects.push(d.user(
-        60,
-        STAFF_OU,
-        "carol",
-        &[
-            ("userAccountControl", normal()),
-            ("userPrincipalName", vec![b"carol@foreign.test".to_vec()]),
-        ],
-    ));
-    objects.push(d.user(61, STAFF_OU, "a@b", &[("userAccountControl", normal())]));
+    objects.push(d.user(60, STAFF_OU, "carol", &[("userAccountControl", normal())]));
     objects.push(d.computer(
         62,
         STAFF_OU,
         "ws09$",
-        &[
-            (
-                "userAccountControl",
-                vec![bits(uac::ADS_UF_WORKSTATION_TRUST_ACCOUNT)],
-            ),
-            (
-                "servicePrincipalName",
-                vec![b"KRBTGT/ws09.example.test".to_vec()],
-            ),
-        ],
-    ));
-    objects.push(d.user(
-        63,
-        STAFF_OU,
-        "Example.Test",
-        &[("userAccountControl", normal())],
+        &[(
+            "userAccountControl",
+            vec![bits(uac::ADS_UF_WORKSTATION_TRUST_ACCOUNT)],
+        )],
     ));
     d.create_all(objects);
+    // Beneath the checker: names it refuses, on keyed objects …
+    d.set(
+        60,
+        "userPrincipalName",
+        vec![b"carol@foreign.test".to_vec()],
+    );
+    d.set(
+        62,
+        "servicePrincipalName",
+        vec![b"KRBTGT/ws09.example.test".to_vec()],
+    );
+    // … and objects it would never have written, without keys.
+    d.create_all_beneath_checker(vec![
+        d.user(61, STAFF_OU, "a@b", &[("userAccountControl", normal())]),
+        d.user(
+            63,
+            STAFF_OU,
+            "Example.Test",
+            &[("userAccountControl", normal())],
+        ),
+    ]);
     let view = d.view();
     for ctx in [AsClient, TicketClient] {
         assert!(resolve(&view, ctx, KRB_NT_PRINCIPAL, &["carol"]).is_err());
@@ -527,9 +580,8 @@ fn the_service_object_set_is_held_by_the_context() {
             ],
         ));
     }
-    d.create_all(objects);
     let services: BTreeSet<Guid> = [51, 52, 53].into_iter().map(guid).collect();
-    write_keys(&d, &[50, 51, 52, 53], &services);
+    d.create_all_with_service_objects(objects, &services);
 
     let configured = DirectoryContext::new(d.p1.clone(), &keyd_config(), naming_context())
         .unwrap()

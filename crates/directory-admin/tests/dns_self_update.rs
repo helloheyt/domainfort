@@ -101,6 +101,7 @@ fn dns_store(d: &Domain, first: u64) {
     )
     .unwrap();
     let text = |s: &str| vec![s.as_bytes().to_vec()];
+    let mut created = Vec::new();
     for (id, rid_value, cn, host) in [
         (WS02, 5002u32, "ws02", "web.example.test"),
         (WS03, 5003u32, "w_3", "w_3.example.test"),
@@ -129,6 +130,7 @@ fn dns_store(d: &Domain, first: u64) {
             ),
         ];
         let s = seq(&mut txn);
+        created.push((guid(id), o(s)));
         txn.create_object(
             NewObject {
                 guid: guid(id),
@@ -140,6 +142,11 @@ fn dns_store(d: &Domain, first: u64) {
         )
         .unwrap();
     }
+    // Written beneath the checker (which refuses both since rule N6), they
+    // carry the namespace keys their names give (tests/common `namespace`;
+    // task PN4b), so the signer's lookup by name reaches them and the DNS
+    // rule itself is what refuses them.
+    namespace::write_namespace_keys(&d.store, &mut txn, &d.ctx, &created);
     txn.commit().unwrap();
 }
 

@@ -26,7 +26,8 @@ use dns_zone::{
     HostRecordParts, KpasswdService, SoaParameters, SrvService, ZoneImage, ZoneImageParts,
 };
 use parse_dns::Name;
-use pdp::{Dn, Pip, RecordKey, Resource, Tier, ZoneId};
+use pdp::{Dn, Pip, PipError, RecordKey, Resource, Tier, ZoneId};
+use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr};
 
 /// DSTIME of the test "now", 2026-11-13T10:00:00Z: 20 770 days after
@@ -138,6 +139,9 @@ fn zone_dir(test: &str, first: u64) -> Dir {
     let d = Dir::standard(test);
     let wt = uac::ADS_UF_WORKSTATION_TRUST_ACCOUNT;
     d.set(DC01, "dNSHostName", vec![b"dc01.example.test".to_vec()]);
+    // The DC as provisioning writes it: its `HostName` key with its name
+    // (task PN4b; docs/59 §4.3, §5.2).
+    d.write_principal_keys(&[DC01], &BTreeSet::new());
     computer(
         &d,
         WS02,
@@ -397,5 +401,53 @@ fn the_record_tier_is_the_owners() {
         plain.dns_record_owner("example.test", "WS01"),
         Ok(Some(guid(WS01)))
     );
+    assert_eq!(
+        plain.dns_record_owner("EXAMPLE.TEST", "Dc01"),
+        Ok(Some(guid(DC01)))
+    );
     assert_eq!(plain.dns_record_owner("example.test", "ws06"), Ok(None));
+}
+
+/// docs/questions/Q-1036 item 6; docs/59 §4.1 (`HostName` = `fold(host)`),
+/// §5.3 (no lookup by name through a per-attribute index), §6.1 step 3 (the
+/// re-derivation fails closed); [MS-ADTS] 3.1.1.5.3.1.1.2; RFC 1035 §2.3.3:
+/// the owner of a DNS label is the holder of the `HostName` key
+/// `fold(<label>.<zone>)` in the namespace's union index — the one probe —
+/// whatever the case of the request. A name held as another kind (a user
+/// whose sAMAccountName is spelled like a host name) owns no record; a
+/// computer written beneath the checker holds no key and owns none; a
+/// holder whose names no longer give the key it holds (changed beneath the
+/// checker) is a fault, not an owner.
+#[test]
+fn the_record_owner_is_the_host_name_keys_holder() {
+    let d = Dir::standard("zone-owner-key");
+    let wt = || vec![bits(uac::ADS_UF_WORKSTATION_TRUST_ACCOUNT)];
+    d.create_all(vec![d.user(
+        70,
+        STAFF_OU,
+        "ws07.example.test",
+        &[("userAccountControl", vec![bits(uac::ADS_UF_NORMAL_ACCOUNT)])],
+    )]);
+    d.create_all_beneath_checker(vec![d.computer(
+        71,
+        STAFF_OU,
+        "ws08$",
+        &[
+            ("userAccountControl", wt()),
+            ("dNSHostName", vec![b"ws08.example.test".to_vec()]),
+        ],
+    )]);
+    let view = d.view();
+    assert_eq!(
+        view.dns_record_owner("Example.Test", "WS01"),
+        Ok(Some(guid(WS01)))
+    );
+    assert_eq!(view.dns_record_owner("example.test", "ws07"), Ok(None));
+    assert_eq!(view.dns_record_owner("example.test", "ws08"), Ok(None));
+    drop(view);
+    d.set(WS01, "dNSHostName", vec![b"other.example.test".to_vec()]);
+    assert_eq!(
+        d.view().dns_record_owner("example.test", "ws01"),
+        Err(PipError::Unavailable)
+    );
 }

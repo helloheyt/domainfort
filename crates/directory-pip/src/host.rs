@@ -23,10 +23,24 @@
 //! RFC 1035 §2.3.1 preferred-syntax label and the object's dNSHostName is
 //! exactly `<label>.<zone>` (compared without case, RFC 1035 §2.3.3). So a
 //! host name is one LDH label below the apex: `*`, `_`, a dot — a wildcard,
-//! a shadowed SRV name, a multi-level name — have no representation; and
-//! sAMAccountName is unique (folded, docs/46 §8.5), so every label has at
-//! most one owner. Stricter than [MS-SAMR]: a digit-first computerName has
-//! no host record (RFC 1123 is not in specs/SOURCES.md — Q-614 item 3).
+//! a shadowed SRV name, a multi-level name — have no representation.
+//! Stricter than [MS-SAMR]: a digit-first computerName has no host record
+//! (RFC 1123 is not in specs/SOURCES.md — Q-614 item 3).
+//!
+//! # One equivalence, one lookup (task PN4b; docs/questions/Q-1036 item 6)
+//!
+//! "Without case" is the principal namespace's one fold
+//! (`principal_names::fold` — [MS-KILE] 3.1.5.7, Q-080), not a comparison of
+//! this module's own: the host name, the label and the zone are names of
+//! the namespace (a computer's dNSHostName is its `HostName` key, docs/59
+//! §4.1), so the DNS owner rule, rule N6 of the one write checker (which
+//! asks [`host_label`]) and the namespace cannot disagree on what is "the
+//! same name" (class C49). And the owner of a label is found by the key
+//! `fold(<label>.<zone>)` in the namespace's unique index — the one probe
+//! of crate::resolve — never through a per-attribute index (docs/59 §5.3):
+//! the index makes every host name's holder unique over the union of all
+//! kinds, and the rule above then requires the holder's computerName to be
+//! the label.
 //!
 //! # An address is registrable only inside the configured networks
 //!
@@ -36,8 +50,9 @@
 //! matcher — A-114). At most [`MAX_HOST_ADDRESSES`] per host (the image's
 //! bound).
 //!
-//! Spec: docs/54 §4.4, §5.2-§5.5; docs/questions/Q-614 items 1-3, 7, 8,
-//! Q-991; [MS-ADTS] v20261026 3.1.1.5.3.1.1.2; RFC 1035 §2.3.1, §2.3.3,
+//! Spec: docs/54 §4.4, §5.2-§5.5; docs/59 §4.1, §5.3; docs/questions/Q-614
+//! items 1-3, 7, 8, Q-991, Q-1036 item 6; [MS-ADTS] v20261026
+//! 3.1.1.5.3.1.1.2; [MS-KILE] v20261110 3.1.5.7; RFC 1035 §2.3.1, §2.3.3,
 //! §3.4.1; RFC 2136 §3.6, §7.11 (the zone serial).
 
 use crate::error::Fault;
@@ -47,6 +62,7 @@ use config::Network;
 use dirstore::CounterState;
 use dtyp::Guid;
 use pdp::{PipError, Tier};
+use principal_names::fold;
 use std::net::{IpAddr, Ipv4Addr};
 
 pub use ad_schema::HOST_ADDRESS;
@@ -79,6 +95,19 @@ const COMPUTER_SUFFIX: char = '$';
 /// (`<subdomain> "." <label>`).
 const LABEL_SEPARATOR: char = '.';
 
+/// `true` if the names `a` and `b` are the same name without case: equal
+/// after the principal namespace's one fold, each a name the fold accepts
+/// (non-empty printable ASCII within the key bound — anything else is no
+/// name, so no match: fail closed). The only comparison of names in this
+/// module (module documentation, "One equivalence, one lookup").
+/// Spec: RFC 1035 §2.3.3 ("all comparisons between character strings
+/// (e.g., labels, domain names, etc.) are done in a case-insensitive
+/// manner"); [MS-KILE] 3.1.5.7; Q-080 items 1-2; docs/questions/Q-1036
+/// item 6.
+fn same_name(a: &str, b: &str) -> bool {
+    matches!((fold(a), fold(b)), (Some(a), Some(b)) if a == b)
+}
+
 /// The SOA SERIAL of the zone whose serial counter is in `state`: the value
 /// the **next** take returns, modulo 2³² — so every take (every content
 /// change) moves it — and `None` when that is 0, which a zone never shows
@@ -100,21 +129,39 @@ pub fn zone_serial(state: &CounterState) -> Option<u32> {
 /// (module documentation, "The name is derived from the identity"): the
 /// sAMAccountName does not end with "$", its computerName is not one LDH
 /// label, or the dNSHostName is not exactly `<computerName>.<zone>` without
-/// case. The label returned is the sAMAccountName's own spelling.
-/// Spec: [MS-ADTS] 3.1.1.5.3.1.1.2; RFC 1035 §2.3.1, §2.3.3; docs/54 §5.3;
-/// docs/questions/Q-614 item 3.
+/// case — compared through the namespace's one fold (module documentation,
+/// "One equivalence, one lookup"). The label returned is the
+/// sAMAccountName's own spelling.
+/// Spec: [MS-ADTS] 3.1.1.5.3.1.1.2; RFC 1035 §2.3.1, §2.3.3; [MS-KILE]
+/// 3.1.5.7; docs/54 §5.3; docs/questions/Q-614 item 3, Q-1036 item 6.
 #[must_use]
 pub fn host_label<'s>(
     sam_account_name: &'s str,
     dns_host_name: &str,
     zone: &str,
 ) -> Option<&'s str> {
-    let label = sam_account_name.strip_suffix(COMPUTER_SUFFIX)?;
-    if !dns_zone::is_ldh_label(label.as_bytes()) || zone.is_empty() {
+    let label = computer_label(sam_account_name)?;
+    if zone.is_empty() {
         return None;
     }
     let (first, rest) = dns_host_name.split_once(LABEL_SEPARATOR)?;
-    (first.eq_ignore_ascii_case(label) && rest.eq_ignore_ascii_case(zone)).then_some(label)
+    (same_name(first, label) && same_name(rest, zone)).then_some(label)
+}
+
+/// The label half of [`host_label`]: the computerName of a computer
+/// account — its sAMAccountName without the final "$" — when that name is
+/// one RFC 1035 §2.3.1 label; `None` otherwise. [`host_label`] is built on
+/// it, so a caller that must say *why* a host name is refused (the
+/// computer's name, or the zone it would sit in — crate directory-admin
+/// `own_host_name`, task PN6b) asks the same rule instead of a copy of it
+/// (class C49; A-185).
+/// Spec: [MS-ADTS] 3.1.1.5.3.1.1.2 (computerName = the sAMAccountName
+/// "without the final '$' character"); RFC 1035 §2.3.1; docs/54 §5.3;
+/// docs/questions/Q-614 item 3.
+#[must_use]
+pub fn computer_label(sam_account_name: &str) -> Option<&str> {
+    let label = sam_account_name.strip_suffix(COMPUTER_SUFFIX)?;
+    dns_zone::is_ldh_label(label.as_bytes()).then_some(label)
 }
 
 /// The stored value of the host address `address`: its four octets in
@@ -154,19 +201,21 @@ impl DirectoryView<'_> {
     }
 
     /// The owner of the host name `key` in the zone `zone`: the one computer
-    /// object whose host label it is (module documentation) — found through
-    /// the sAMAccountName index under `<key>$` (folded, docs/46 §8.5), then
-    /// checked by the host-name rule against the stored values, compared
-    /// without case (RFC 1035 §2.3.3). `None` when the zone is not this
-    /// view's, `key` is not one LDH label, or no computer owns it. A GUID
-    /// only (an authority read: nothing of the object is handed back).
+    /// object whose host label it is (module documentation) — the holder of
+    /// the `HostName` key `fold(<key>.<zone>)`, found by the one probe of
+    /// the namespace's unique index (crate::resolve `host_name_holder`;
+    /// docs/questions/Q-1036 item 6), then checked by the host-name rule
+    /// against its stored values. `None` when the zone is not this view's,
+    /// `key` is not one LDH label, or no computer owns it. A GUID only (an
+    /// authority read: nothing of the object is handed back).
     ///
     /// # Errors
     /// `PipError::Unavailable` when the store fails or a record is
-    /// inconsistent.
+    /// inconsistent (a key its holder's names do not give included).
     ///
-    /// Spec: docs/54 §5.3, §5.6; docs/questions/Q-614 items 3, 6;
-    /// [MS-ADTS] 3.1.1.5.3.1.1.2; RFC 1035 §2.3.1, §2.3.3.
+    /// Spec: docs/54 §5.3, §5.6; docs/59 §4.1, §5.3; docs/questions/Q-614
+    /// items 3, 6, Q-1036 item 6; [MS-ADTS] 3.1.1.5.3.1.1.2; RFC 1035
+    /// §2.3.1, §2.3.3.
     pub fn dns_record_owner(&self, zone: &str, key: &str) -> Result<Option<Guid>, PipError> {
         Ok(self.record_owner(zone, key)?)
     }
@@ -175,19 +224,18 @@ impl DirectoryView<'_> {
     fn record_owner(&self, zone: &str, key: &str) -> Result<Option<Guid>, Fault> {
         let ids = self.ctx.ids;
         let own_zone = self.zone_name();
-        if !zone.eq_ignore_ascii_case(&own_zone) || !dns_zone::is_ldh_label(key.as_bytes()) {
+        if !same_name(zone, &own_zone) || !dns_zone::is_ldh_label(key.as_bytes()) {
             return Ok(None);
         }
-        let mut sam = String::with_capacity(key.len() + 1);
-        sam.push_str(key);
-        sam.push(COMPUTER_SUFFIX);
-        let Some(guid) = self
-            .snapshot
-            .lookup_unique(ids.sam_account_name, sam.as_bytes())?
-        else {
+        // The dNSHostName the label's owner carries, `<computerName>.<zone>`
+        // ([MS-ADTS] 3.1.1.5.3.1.1.2) — its `HostName` key once folded.
+        let mut host_name = String::with_capacity(key.len() + 1 + own_zone.len());
+        host_name.push_str(key);
+        host_name.push(LABEL_SEPARATOR);
+        host_name.push_str(&own_zone);
+        let Some(obj) = self.host_name_holder(&host_name)? else {
             return Ok(None);
         };
-        let obj = self.snapshot.get_object(guid)?.ok_or(Fault::Unavailable)?;
         if self.most_specific_class(&obj)? != ids.computer {
             return Ok(None);
         }
@@ -196,7 +244,7 @@ impl DirectoryView<'_> {
             return Ok(None);
         };
         Ok(match host_label(stored, dns_host_name, &own_zone) {
-            Some(label) if label.eq_ignore_ascii_case(key) => Some(guid),
+            Some(label) if same_name(label, key) => Some(obj.guid),
             _ => None,
         })
     }
@@ -256,6 +304,27 @@ mod tests {
             None
         );
         assert_eq!(host_label("ws01$", "ws01.", ""), None);
+    }
+
+    /// docs/questions/Q-1036 item 6 (one fold — class C49); Q-080 items 1-2
+    /// (printable ASCII, A-Z folded); RFC 1035 §2.3.3: names compare
+    /// through the namespace's fold — equal without case; a name the fold
+    /// has no key for (empty, a non-printable octet) equals nothing, itself
+    /// included (fail closed).
+    #[test]
+    fn names_compare_through_the_namespace_fold() {
+        assert!(same_name("WS01", "ws01"));
+        assert!(same_name("Example.Test", "example.TEST"));
+        assert!(!same_name("ws01", "ws02"));
+        assert!(!same_name("", ""));
+        assert!(!same_name("ex\tample", "ex\tample"));
+        assert!(!same_name("caf\u{e9}", "caf\u{e9}"));
+        // So a zone or host name the fold refuses gives no host label.
+        assert_eq!(host_label("ws01$", "ws01.ex\tample", "ex\tample"), None);
+        assert_eq!(
+            host_label("ws01$", "WS01.EXAMPLE.TEST", "example.test"),
+            Some("ws01")
+        );
     }
 
     /// RFC 2136 §7.11 (never zero), §3.6 (modulo 2³²); docs/54 §5.4.

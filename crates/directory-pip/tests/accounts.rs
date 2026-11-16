@@ -155,14 +155,21 @@ fn krbtgt_is_never_returned() {
 
 /// docs/47 §1.3 step 6: the RID check stands alone — an RID-502 account
 /// under another sAMAccountName (breaking [MS-SAMR] 3.1.1.6 item 14) is
-/// still never a client, and is not accepted as the krbtgt account.
+/// still never a client, and is not accepted as the krbtgt account. Task
+/// PN4b (docs/59 §4.3, §5.1 N7, §6.1 steps 2-4): the one checker never
+/// writes such an account — `keys_of_names` refuses an RID-502 account not
+/// named "krbtgt" — so it is modelled as a record that changed beneath the
+/// checker: created as the user `kdcsvc` (its namespace key the checker's),
+/// its objectSid then the domain's RID 502. The lookup reaches it by its
+/// key, and the RID check refuses it.
 #[test]
 fn rid_502_is_refused_whatever_its_name() {
+    const KDCSVC: u32 = 45;
     let d = Dir::new("rid-502");
     let mut objects = d.standard_objects();
     objects.retain(|o| o.guid != guid(KRBTGT));
     objects.push(d.user(
-        KRBTGT,
+        KDCSVC,
         USERS_CN,
         "kdcsvc",
         &[
@@ -171,6 +178,8 @@ fn rid_502_is_refused_whatever_its_name() {
         ],
     ));
     d.create_all(objects);
+    assert!(client(&d.view(), &["kdcsvc"]).unwrap().is_some());
+    d.set(KDCSVC, "objectSid", vec![account_sid(502).encode()]);
     let view = d.view();
     assert_eq!(client(&view, &["kdcsvc"]), Ok(None));
     assert_eq!(
@@ -214,12 +223,14 @@ fn spn_lookup_on_computers() {
 /// R2 (docs/52 §5 item 3; A-73): the admin service's two-part name
 /// `admind/<host>` resolves to its object's `AdminService` key set — the
 /// KDC seals its tickets there — and another class's name to the `Service`
-/// key set. Task PN4 (docs/59 §4.4 N4, §6.1 step 3; [MS-ADTS] 2.2.21,
-/// 3.1.1.5.3.1.1.4; docs/questions/Q-1018 item 6, Q-1026): a stored
-/// three-part SPN is a name the phase-1 namespace refuses (three parts only
-/// on the DC's object, task PN16), so an object holding one is refused when
-/// it is found — fail closed (`Failed`), where the R47-1 lookup used to
-/// hand out its `Service` key set.
+/// key set. Tasks PN4 / PN4b (docs/59 §4.4 N4, §6.1 steps 2-3; [MS-ADTS]
+/// 2.2.21, 3.1.1.5.3.1.1.4; docs/questions/Q-1018 item 6, Q-1026 item 3,
+/// Q-1042): a stored three-part SPN is a name the phase-1 namespace refuses
+/// (three parts only on the DC's object, task PN16) — the checker writes no
+/// key for it, so no request reaches it (`None`, where the R47-1 lookup
+/// used to hand out its `Service` key set) — and an object that came to
+/// hold one beneath the checker is refused when it is found by another of
+/// its keys (fail closed, `Failed`).
 #[test]
 fn the_admin_service_name_names_the_admin_service_key_set() {
     let d = Dir::new("spn-admind");
@@ -250,21 +261,28 @@ fn the_admin_service_name_names_the_admin_service_key_set() {
                 vec![bits(uac::ADS_UF_WORKSTATION_TRUST_ACCOUNT)],
             ),
             ("pwdLastSet", vec![int64(PWD_LAST_SET)]),
-            (
-                "servicePrincipalName",
-                vec![b"admind/dc01.example.test/x".to_vec()],
-            ),
         ],
     ));
     d.create_all(objects);
+    // The third component written beneath the checker.
+    d.set(
+        61,
+        "servicePrincipalName",
+        vec![b"admind/dc01.example.test/x".to_vec()],
+    );
     let view = d.view();
     let admin = service(&view, &["admind", "dc01.example.test"])
         .unwrap()
         .expect("the admin service");
     assert_eq!(admin.key, key_of(60, KeyPurpose::AdminService));
-    // A stored third component is refused by the namespace (PN4).
+    // A stored third component has no key (PN4b) and fails closed when its
+    // object is found by another key (PN4).
     assert_eq!(
         service(&view, &["admind", "dc01.example.test", "x"]),
+        Ok(None)
+    );
+    assert_eq!(
+        client(&view, &["admindx$"]),
         Err(AccountSourceError::Failed)
     );
     let ws01 = service(&view, &["host", "ws01.example.test"])
@@ -279,9 +297,11 @@ fn the_admin_service_name_names_the_admin_service_key_set() {
 /// not significant); docs/47 §1.3 TGS step 3 (the unique index folds A–Z,
 /// Q-080; the final comparison is octet for octet); A-139 (one name rule):
 /// `kadmin/changepw` resolves to its object's `ChangePasswordService` key
-/// set under either name-type; a case variant matches no stored SPN. Task
-/// PN4 (docs/59 §4.4 N4, §6.1 step 3; Q-1026): an object holding a stored
-/// three-part SPN is refused when found — fail closed (`Failed`).
+/// set under either name-type; a case variant matches no stored SPN. Tasks
+/// PN4 / PN4b (docs/59 §4.4 N4, §6.1 steps 2-3; Q-1026 item 3, Q-1042): a
+/// stored three-part SPN has no key (no request reaches it), and an object
+/// holding one beneath the checker is refused when found by another key —
+/// fail closed (`Failed`).
 #[test]
 fn the_change_password_service_name_names_its_key_set() {
     let d = Dir::new("spn-changepw");
@@ -309,10 +329,15 @@ fn the_change_password_service_name_names_its_key_set() {
                 vec![bits(uac::ADS_UF_WORKSTATION_TRUST_ACCOUNT)],
             ),
             ("pwdLastSet", vec![int64(PWD_LAST_SET)]),
-            ("servicePrincipalName", vec![b"kadmin/changepw/x".to_vec()]),
         ],
     ));
     d.create_all(objects);
+    // The third component written beneath the checker.
+    d.set(
+        63,
+        "servicePrincipalName",
+        vec![b"kadmin/changepw/x".to_vec()],
+    );
     let view = d.view();
     for name_type in [KRB_NT_SRV_INST, KRB_NT_PRINCIPAL] {
         let changepw = view
@@ -322,8 +347,9 @@ fn the_change_password_service_name_names_its_key_set() {
         assert_eq!(changepw.key, key_of(62, KeyPurpose::ChangePasswordService));
     }
     assert_eq!(service(&view, &["KADMIN", "changepw"]), Ok(None));
+    assert_eq!(service(&view, &["kadmin", "changepw", "x"]), Ok(None));
     assert_eq!(
-        service(&view, &["kadmin", "changepw", "x"]),
+        client(&view, &["kpasswdx$"]),
         Err(AccountSourceError::Failed)
     );
 }
@@ -592,7 +618,11 @@ fn password_expired_bit() {
 
 /// docs/47 §4.1 (R47-5a): userAccountControl absent ⇒ not enabled (fail
 /// closed); a kind that contradicts the class ⇒ error ([MS-SAMR] 3.1.1.6
-/// items 20, 23, 24).
+/// items 20, 23, 24). Task PN4b (docs/59 §5.1 N7, §6.1 steps 2-4): the one
+/// checker writes no keys for such a record, so the contradiction is
+/// written beneath it, after the account was created consistent (its
+/// namespace key the checker's): the lookup reaches it by that key and
+/// refuses it.
 #[test]
 fn missing_or_inconsistent_user_account_control() {
     let s = state_of("uac-absent", &[("pwdLastSet", vec![int64(PWD_LAST_SET)])])
@@ -604,14 +634,19 @@ fn missing_or_inconsistent_user_account_control() {
         ("uac-user-st", uac::ADS_UF_SERVER_TRUST_ACCOUNT),
         ("uac-user-none", uac::ADS_UF_DONT_EXPIRE_PASSWD),
     ] {
+        let d = Dir::standard(test);
+        d.create_all(vec![d.user(
+            60,
+            STAFF_OU,
+            "carol",
+            &[
+                ("userAccountControl", normal()),
+                ("pwdLastSet", vec![int64(PWD_LAST_SET)]),
+            ],
+        )]);
+        d.set(60, "userAccountControl", vec![bits(bits_value)]);
         assert_eq!(
-            state_of(
-                test,
-                &[
-                    ("userAccountControl", vec![bits(bits_value)]),
-                    ("pwdLastSet", vec![int64(PWD_LAST_SET)]),
-                ]
-            ),
+            client(&d.view(), &["carol"]).map(|c| c.map(|c| c.state)),
             Err(AccountSourceError::Failed),
             "{test}"
         );
