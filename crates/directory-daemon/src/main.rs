@@ -10,8 +10,9 @@
 //! 1. claim the single-thread proof — the first statement of `main`;
 //! 2. read the configuration path from argv and parse it;
 //! 3. as root: read the name-resolution attestation key (task PN10 — a
-//!    root-owned 0400 file named by `attestation_key_path`; not configured
-//!    ⇒ no start, docs/59 §7.4), the development integrity key and the
+//!    root-owned 0400 file named by `attestation_key_path`, which the
+//!    configuration schema requires (task PN12); unreadable ⇒ no start,
+//!    docs/59 §7.4), the development integrity key and the
 //!    development policy (both root-owned files, read before the drop), the
 //!    provisioning manifest when the admin channel is configured
 //!    (root-owned, docs/51 §4.3 step 8), and prepare the socket
@@ -88,10 +89,10 @@ fn main() -> ExitCode {
         Err(error) => return fail("configuration", &error),
     };
     // Task PN10: dird's name-resolution attestation key, as root before the
-    // drop (docs/59 §7.4) — not configured or not readable ⇒ no start.
-    let attestation_key = match attestation_key_path(&settings)
-        .and_then(|key_path| read_attestation_key(key_path, ROOT_UID))
-    {
+    // drop (docs/59 §7.4) — not readable ⇒ no start. Not configured is not
+    // reachable here: the schema requires the key, so `read_settings`
+    // already refused such a file (task PN12; docs/questions/Q-1055 item 9).
+    let attestation_key = match read_attestation_key(attestation_key_path(&settings), ROOT_UID) {
         Ok(key) => key,
         Err(error) => return fail("attestation key", &error),
     };

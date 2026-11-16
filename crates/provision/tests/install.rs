@@ -229,9 +229,12 @@ fn provisioning_installs_files_the_daemons_accept() {
             .collect(),
     };
     let changepw = view.service(&realm, &changepw_name).unwrap().unwrap();
-    assert_eq!(changepw.key, plan.manifest.change_password_service().handle);
     assert_eq!(
-        changepw.key.purpose,
+        changepw.key(),
+        plan.manifest.change_password_service().handle
+    );
+    assert_eq!(
+        changepw.key().purpose,
         keyd_types::KeyPurpose::ChangePasswordService
     );
     assert!(changepw.state.usable_at(&at(10, 0, 5)));

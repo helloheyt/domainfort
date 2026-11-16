@@ -75,7 +75,7 @@ fn a_subject_check_needs_no_signer() {
         let record = signed.client(&realm(), &n).unwrap().expect(sam);
         assert_eq!(
             subject.guid,
-            Guid::from_packet(record.key.principal.as_bytes()),
+            Guid::from_packet(record.key().principal.as_bytes()),
             "{sam}"
         );
         assert_eq!(subject.sid, record.sid, "{sam}");

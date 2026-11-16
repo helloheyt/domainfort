@@ -595,7 +595,6 @@ fn build() -> FuzzState {
             &realm,
             &client_name,
             ClientAccount {
-                key: client,
                 sid,
                 groups: BTreeSet::new(),
                 tier: Tier::Tier2,
@@ -612,7 +611,6 @@ fn build() -> FuzzState {
             &realm,
             &machine_name,
             ClientAccount {
-                key: machine_handle,
                 sid: machine_sid,
                 groups: [bootstrap].into_iter().collect(),
                 tier: Tier::Tier2,
@@ -629,7 +627,6 @@ fn build() -> FuzzState {
             &realm,
             &service_name,
             ServiceAccount {
-                key: service,
                 state: AccountState::ACTIVE,
                 enctypes: vec![18, 17],
                 resolution: resolution(&realm, &service_name, service),

@@ -154,10 +154,10 @@ const LARGEST_TIER_REQUEST: usize =
 /// Body octets of one ETYPE-INFO2 entry at its bounds.
 const LARGEST_ETYPE_ENTRY: usize =
     4 + (1 + 4 + MAX_SALT as usize) + (1 + 4 + MAX_S2KPARAMS as usize);
-/// Body octets of the largest client record reply.
+/// Body octets of the largest client record reply (no key handle of its
+/// own since task PN10c — the resolution names the key set).
 const LARGEST_CLIENT_REPLY: usize = 4
     + 1
-    + 17
     + (4 + MAX_SID as usize)
     + 4
     + MAX_GROUPS as usize * (4 + MAX_SID as usize)
@@ -169,9 +169,9 @@ const LARGEST_CLIENT_REPLY: usize = 4
     + 2
     + LARGEST_RESOLUTION;
 /// Body octets of the largest service record reply (task PN10: it carries
-/// a resolution too).
+/// a resolution too; task PN10c: and no key handle of its own).
 const LARGEST_SERVICE_REPLY: usize =
-    4 + 1 + 17 + 2 + 2 * (1 + 7) + 4 + 4 * MAX_ENCTYPES as usize + LARGEST_RESOLUTION;
+    4 + 1 + 2 + 2 * (1 + 7) + 4 + 4 * MAX_ENCTYPES as usize + LARGEST_RESOLUTION;
 /// Body octets of the largest group-expansion reply.
 const LARGEST_GROUPS_REPLY: usize = 4 + 4 + MAX_GROUPS as usize * (4 + MAX_SID as usize);
 const _: () = assert!(LARGEST_NAME_REQUEST <= MAX_REQUEST_BODY as usize);

@@ -18,17 +18,24 @@
 //!
 //! # The change-password service's key set
 //!
-//! At start, dird resolves `kadmin/changepw` (RFC 3244 §2) exactly as the
-//! KDC resolves it for the AS (crate kdc `as_exchange.rs` A8a:
-//! `AccountSource::service`, the unique servicePrincipalName index, the
-//! stored value compared octet for octet, a computer object): its key set
-//! must be `(objectGUID, ChangePasswordService)` — the purpose the one
-//! derivation gives the name (`KeyPurpose::of_service_name`, docs/52 R2b).
-//! Absent, of another purpose, or unreadable ⇒ the kpasswd service does not
-//! start; dird's other services run. keyd checks the binding again on every
-//! request (A-19: the key set opens only tickets for `kadmin/changepw`).
-//! The provisioning manifest does not name this object yet (task K9 —
-//! docs/questions/Q-964 item 2).
+//! At start, dird resolves `kadmin/changepw` (RFC 3244 §2) through the one
+//! lookup path, in the provisioned service object's own context
+//! (`DirectoryView::canonical_principal`, `LookupCtx::ServiceObject` — task
+//! PN10; docs/59 §6.1, §6.2: the namespace probe, the stored value compared
+//! octet for octet under R47-1, a computer object) — the path the KDC's
+//! account source wraps for the AS (crate kdc `as_exchange.rs` A8a), but no
+//! KDC account record is built here and nothing is attested: this
+//! service's directory context carries **no** name-resolution signer —
+//! dird builds one only in `daemon::kdc_channel_context`, for the KDC
+//! channel (task PN10b; A-189 on docs/questions/Q-1050 item 6, Q-1051 item
+//! 4). Its key set must be `(objectGUID, ChangePasswordService)` — the
+//! purpose the one derivation gives the name (`KeyPurpose::of_service_name`,
+//! docs/52 R2b) — and exactly the provisioning manifest's change-password
+//! service handle (task K9; docs/questions/Q-964 item 4) —
+//! `change_password_service_handle`. Absent, of another purpose, or
+//! unreadable ⇒ the kpasswd service does not start; dird's other services
+//! run. keyd checks the binding again on every request (A-19: the key set
+//! opens only tickets for `kadmin/changepw`).
 //!
 //! # Parameters
 //!
@@ -180,14 +187,17 @@ impl KpasswdNotStarted {
     }
 }
 
-/// The change-password service's key set: `kadmin/changepw` resolved as the
-/// KDC resolves it, which must give a `ChangePasswordService` key set **and**
-/// be exactly the manifest's change-password service handle (A-163;
-/// docs/questions/Q-964 item 4) — the same check the admin service's handle
-/// gets (`admin_service_handle`). Anything else ⇒ the service does not start
-/// (fail closed).
+/// The change-password service's key set: `kadmin/changepw` resolved through
+/// the one lookup path in the provisioned service object's context (the
+/// path the KDC's account source wraps; `view`'s context has no signer —
+/// only `daemon::kdc_channel_context` builds one, task PN10b), which must
+/// give a `ChangePasswordService` key set **and** be exactly the manifest's
+/// change-password service handle (A-163; docs/questions/Q-964 item 4) —
+/// the same check the admin service's handle gets (`admin_service_handle`).
+/// Anything else ⇒ the service does not start (fail closed).
 /// Spec: RFC 3244 §2; docs/53 §5.2; crate kdc `as_exchange.rs` A8a; docs/52
-/// R2b; docs/questions/Q-964 item 4, Q-975.
+/// R2b; docs/59 §6.2 (`ServiceObject`); docs/questions/Q-964 item 4, Q-975,
+/// Q-1050 item 6 (A-189).
 pub(crate) fn change_password_service_handle(
     view: &DirectoryView<'_>,
     realm: &Realm,

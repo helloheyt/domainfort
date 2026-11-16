@@ -5,8 +5,9 @@
 //! AS, the service's with every TGS — and keyd binds the keys only through
 //! it; which kind of server a looked-up name is, and the name the PDP
 //! judges, come from the resolution (the key set's purpose, the canonical
-//! name), never from the request's spelling; a record whose resolution
-//! names another key set is inconsistent and refused before keyd.
+//! name), never from the request's spelling; and the key set the KDC asks
+//! keyd for is the one the resolution names — the record's only statement
+//! of it (task PN10c; docs/questions/Q-1060 item 1 (e)).
 //!
 //! Sources: docs/59 §4.7 (`key_purpose` from the stored name and the claim),
 //! §6.1 step 6, §7.2 (keyd verifies; the ticket's names ∈ {as sent,
@@ -16,8 +17,9 @@
 //! client resolution at TGS); RFC 4120 §3.3.3 (the TGS-REP), §6.2 (the
 //! name-type is not significant); RFC 3244 §2 (`kadmin/changepw`); docs/53
 //! §5.2 (no change-password ticket from a TGT); main-session decision 3 (an
-//! inconsistent record fails closed, KRB_ERR_GENERIC). Every value is made
-//! up here; no vector comes from any other implementation.
+//! inconsistent record fails closed, KRB_ERR_GENERIC); docs/59 §9 S5 (a
+//! false mapping stated by dird), docs/questions/Q-1060 item 1 (e). Every
+//! value is made up here; no vector comes from any other implementation.
 
 mod common;
 
@@ -98,43 +100,49 @@ fn the_tgt_carries_the_clients_resolution_and_no_other() {
     assert_eq!(issue.result, keyd::AuditOutcome::Success);
 }
 
-/// docs/59 §7.2 step 4; main-session decision 3: a client record whose
-/// resolution names another key set than its handle (bob's, for alice's
-/// record) is inconsistent — KRB_ERR_GENERIC, `AccountRecordInvalid`,
-/// before keyd is asked to pre-authenticate or issue; likewise a service
-/// record whose resolution names the change-password service's key set
-/// while its handle is the service's.
+/// docs/59 §7.1 (the resolution's `principal` and `key_purpose`), §7.2
+/// step 4, §9 S5; docs/questions/Q-1060 item 1 (e) (task PN10c): a record
+/// states its key set once — in dird's resolution — so the key set the KDC
+/// asks keyd for is always the one the resolution it forwards names (the
+/// TGT's client key set is the client resolution's `(principal, purpose)`).
+/// A resolution mapping alice's name to bob's key set (S5: a false mapping
+/// dird would have to state) therefore makes the KDC ask for bob's key set
+/// — there is no second statement left to disagree with — and keyd, which
+/// binds bob's key set to bob's name only (`bound_by`), refuses the
+/// issuance even to a client that proves bob's key: no ticket names alice
+/// under bob's key (`NameResolutionMismatch`).
 #[test]
-fn a_record_whose_resolution_names_another_key_set_is_refused() {
+fn the_key_set_the_kdc_asks_for_is_the_one_the_resolution_names() {
+    let mut f = Fixture::new();
+    let _tgt = obtain_tgt(&mut f);
+    let call = f.issue_as_rep_calls().last().unwrap().clone();
+    assert_eq!(
+        call.client,
+        KeyHandle::new(
+            call.client_resolution.principal(),
+            call.client_resolution.key_purpose()
+        )
+    );
+    assert_eq!(call.client, ALICE);
+
     let mut f = Fixture::new();
     f.accounts()
         .client_mut(&realm(), &alice_name())
         .unwrap()
         .resolution = test_resolution(&alice_name(), BOB);
-    let spec = AsReqSpec::alice().with_challenge(&alice_key(AES256));
+    let bob_key = password_key(AES256, BOB_PASSWORD, BOB_SALT);
+    let spec = AsReqSpec::alice().with_challenge(&bob_key);
     let _ = f.send_fast(&spec);
-    assert_eq!(
-        f.events().last().unwrap().reason,
-        AuditReason::AccountRecordInvalid
-    );
-    assert!(!f
+    let call = f.issue_as_rep_calls().last().unwrap().clone();
+    assert_eq!(call.client, BOB);
+    assert_eq!(call.client_resolution.principal(), BOB.principal);
+    let issue = f
         .keyd_records()
         .iter()
-        .any(|r| r.op == keyd::Operation::IssueAsRep || r.op == keyd::Operation::VerifyPreauth));
-
-    let mut f = Fixture::new();
-    let tgt = obtain_tgt(&mut f);
-    f.accounts()
-        .service_mut(&realm(), &service_name())
-        .unwrap()
-        .resolution = test_resolution(&service_name(), CHANGEPW);
-    let (request, _) = TgsReqSpec::service().encode(&tgt);
-    let _ = f.send(&request);
-    assert_eq!(
-        f.events().last().unwrap().reason,
-        AuditReason::AccountRecordInvalid
-    );
-    assert!(!issued_tgs(&f));
+        .rfind(|r| r.op == keyd::Operation::IssueAsRep)
+        .unwrap();
+    assert_eq!(issue.result, keyd::AuditOutcome::Denied);
+    assert_eq!(issue.reason, keyd::AuditReason::NameResolutionMismatch);
 }
 
 /// Q-1009 item 4 (A-173): which kind of server a name is comes from the key

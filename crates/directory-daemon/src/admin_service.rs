@@ -89,14 +89,21 @@
 //! # The admin service's key set (A-73)
 //!
 //! At start, dird resolves the SPN `admind/<dc-fqdn>` — the binding the
-//! provisioning manifest records for the admin service object — exactly as
-//! the KDC resolves a service principal (`AccountSource::service`, docs/47
-//! §1.3: the unique servicePrincipalName index, the single stored value
-//! compared octet for octet, a computer object): the handle is
+//! provisioning manifest records for the admin service object — through the
+//! one lookup path, in the provisioned service object's own context
+//! (`DirectoryView::canonical_principal`, `LookupCtx::ServiceObject` — task
+//! PN10; docs/59 §6.1, §6.2: the namespace probe, the stored value compared
+//! octet for octet under R47-1, a computer object): the handle is
 //! `(objectGUID, AdminService)` (R2: the admin service's own purpose,
-//! `KeyPurpose::of_service_name`). Absent, multi-valued, or naming another object
-//! than the manifest's admin service ⇒ the admin service does not start;
-//! dird's other services run (docs/questions/Q-386 item 3).
+//! `KeyPurpose::of_service_name`) — `admin_service_handle`. It is the
+//! path the KDC's account source wraps, but no KDC account record is built
+//! here and nothing is attested: this service's directory context carries
+//! **no** name-resolution signer — dird builds one only in
+//! `daemon::kdc_channel_context`, for the KDC channel (task PN10b; A-189 on
+//! docs/questions/Q-1050 item 6, Q-1051 item 4). Absent, multi-valued, or
+//! naming another object than the manifest's admin service ⇒ the admin
+//! service does not start; dird's other services run (docs/questions/Q-386
+//! item 3).
 //!
 //! # The request queue (task D2-c; docs/questions/Q-882, A-148)
 //!
@@ -784,9 +791,11 @@ pub(crate) fn check_manifest(
 /// context's provisioned service objects make the reserved purpose resolve
 /// on this object only (crate directory-pip `resolve`, step 8). No account
 /// record — and so no attested resolution — is built for this check: it is
-/// dird's own question, not the KDC's.
+/// dird's own question, not the KDC's, and `view`'s context has no signer
+/// (only `daemon::kdc_channel_context` builds one — task PN10b).
 /// Spec: docs/59 §6.1, §6.2 (`ServiceObject`); docs/47 §1.3; docs/51 §5.3;
-/// A-73; A-163; docs/questions/Q-386 item 3, Q-1027 items 2, 6.
+/// A-73; A-163; docs/questions/Q-386 item 3, Q-1027 items 2, 6, Q-1050 item
+/// 6 (A-189).
 pub(crate) fn admin_service_handle(
     view: &DirectoryView<'_>,
     manifest: &Manifest,

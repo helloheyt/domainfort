@@ -289,7 +289,7 @@ fn the_configuration_requires_the_attestation_key_path() {
 
     let with = config::DirdSettings::parse(DIRD.as_bytes()).unwrap();
     assert_eq!(
-        attestation_key_path(&with).unwrap(),
+        attestation_key_path(&with),
         Path::new("/etc/dird/attestation.key")
     );
     let p = params(&with, support::attestation_key()).unwrap();

@@ -308,7 +308,7 @@ fn a_pinned_view_does_not_see_a_later_write() {
         // The same record from the same snapshot — every field, and a
         // resolution of the same lookup (only its issue time is the second
         // dird attested it in — task PN10, docs/59 §7.1).
-        assert_eq!(again.key, before.key);
+        assert_eq!(again.key(), before.key());
         assert_eq!(again.sid, before.sid);
         assert_eq!(again.groups, before.groups);
         assert_eq!(again.tier, before.tier);

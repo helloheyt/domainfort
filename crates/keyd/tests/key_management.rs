@@ -14,7 +14,9 @@ use keyd::{
     KeyPurpose, Keyd, Kvno, PrincipalBinding, PrincipalId, MAX_KEY_DECISION_SECS,
 };
 use krb_crypto::EncType;
-use krb_proto::constants::{KRB_NT_PRINCIPAL, KRB_NT_SRV_HST, KRB_NT_SRV_INST, KRB_NT_UNKNOWN};
+use krb_proto::constants::{
+    KRB_NT_ENTERPRISE, KRB_NT_PRINCIPAL, KRB_NT_SRV_HST, KRB_NT_SRV_INST, KRB_NT_UNKNOWN,
+};
 use krb_proto::{EncTicketPart, PrincipalName};
 use zeroize::Zeroizing;
 
@@ -193,14 +195,16 @@ fn create_key_validates_binding() {
 /// reserved-name predicate (class C49): every spelling of `krbtgt/X`,
 /// `admind/<host>` and `kadmin/changepw` is bound only to its own purpose's
 /// key set — and to that one in any case — and a name no object of the
-/// namespace can hold (more than three components, an "@" or an empty part
-/// inside a component, a key equal to the realm's name, a one-part name in
-/// "@" form whose suffix is another realm) is bound to no key set.
+/// namespace stores (more than two components in phase 1, an "@" or an
+/// empty part inside a component, a key equal to the realm's name, a
+/// one-part name in "@" form) is bound to no key set.
 /// Source: RFC 4120 6.2 ("Names of any type with an initial component of
 /// 'krbtgt' are reserved for the Kerberos ticket-granting service"; the
 /// name-type is not significant), 7.3; RFC 3244 §2; A-73; docs/59 §4.2 (the
-/// request table, the reserved-name predicates); docs/questions/Q-1009
-/// items 1-2, Q-1061 item 1 (A-190).
+/// request table, the reserved-name predicates), §4.4 N4; [MS-ADTS]
+/// 3.1.1.5.3.1.1.4 (a three-part SPN only on a DC's object — task PN16);
+/// docs/questions/Q-1009 items 1-2, Q-1061 item 1 (A-190), Q-1066 (task
+/// PN10c: the three-part name moved from accepted to refused).
 #[test]
 fn the_creation_rule_judges_reserved_names_folded() {
     fn named(name_type: i32, parts: &[&str]) -> PrincipalBinding {
@@ -233,6 +237,8 @@ fn the_creation_rule_judges_reserved_names_folded() {
         named(KRB_NT_SRV_HST, &["host", ""]),
         named(KRB_NT_PRINCIPAL, &["example.org"]),
         named(KRB_NT_PRINCIPAL, &["carol@OTHER.ORG"]),
+        // Task PN10c: a three-part name is no phase-1 stored SPN.
+        named(KRB_NT_SRV_HST, &["ldap", "dc01.example.org", "example.org"]),
     ];
     for binding in reserved_spellings.iter().chain(&no_namespace_names) {
         for handle in [service, longterm] {
@@ -286,17 +292,12 @@ fn the_creation_rule_judges_reserved_names_folded() {
         );
     }
     // A namespace name that is no reserved one takes a plain key set — in
-    // any case, a two- or three-part service name included.
+    // any case, a two-part service name included.
     for (id, handle_purpose, binding) in [
         (
             0x77,
             KeyPurpose::Service,
             named(KRB_NT_SRV_HST, &["HOST", "ws9.example.org"]),
-        ),
-        (
-            0x78,
-            KeyPurpose::Service,
-            named(KRB_NT_SRV_HST, &["ldap", "dc01.example.org", "example.org"]),
         ),
         (
             0x79,
@@ -306,6 +307,112 @@ fn the_creation_rule_judges_reserved_names_folded() {
     ] {
         push_keys(&f, id);
         let handle = KeyHandle::new(PrincipalId::from_bytes([id; 16]), handle_purpose);
+        assert!(
+            f.keyd.create_key(&ADMIN, &handle, &binding, &now()).is_ok(),
+            "{binding:?}"
+        );
+    }
+}
+
+/// Task PN10c (the A-190 residual of docs/questions/Q-1060; Q-1066): a key
+/// set's binding is a stored name, so the creation rule reads it as one —
+/// never as a request. A one-part `carol@<this realm>` (any case) is how a
+/// request may spell carol (crate principal-names `key_of_request` maps it
+/// to `carol`, [MS-KILE] 3.3.5.6.1), but no object stores it as a
+/// sAMAccountName ("@" — docs/59 §4.4 N2) and a userPrincipalName is no
+/// binding: it is bound to no key set, by `create_key` or by the
+/// `set_secret` that would create one; nor is a final "$" that is no
+/// computer's form ([MS-SAMR] 3.1.1.6 item 11: "a single '$'"), nor a host
+/// part with an ":instancename" ([MS-ADTS] 3.1.1.5.3.1.1.4). The stored
+/// spellings of the same principals are bound (controls): `carol`, `ws9$`,
+/// `host/ws9.example.org:8080` (a numeric port, [MS-ADTS] 2.2.21).
+/// Source: docs/59 §4.2 (the request table), §4.4 N2-N4, §7.3 (the stored
+/// binding); [MS-SAMR] 3.1.1.6 items 10-11; [MS-ADTS] 2.2.21,
+/// 3.1.1.5.3.1.1.4; [MS-KILE] 3.3.5.6.1 (as cited by principal-names);
+/// RFC 4120 6.2. Every value is made up here.
+#[test]
+fn a_binding_is_read_as_a_stored_name_never_as_a_request() {
+    fn named(name_type: i32, parts: &[&str]) -> PrincipalBinding {
+        bound(PrincipalName {
+            name_type,
+            name_string: parts.iter().map(|p| kstr(p)).collect(),
+        })
+    }
+    let mut f = Fixture::new();
+    let carol = KeyHandle::new(
+        PrincipalId::from_bytes([0xC1; 16]),
+        KeyPurpose::PrincipalLongterm,
+    );
+    let service = KeyHandle::new(PrincipalId::from_bytes([0xC2; 16]), KeyPurpose::Service);
+    let request_only = [
+        named(KRB_NT_PRINCIPAL, &["carol@EXAMPLE.ORG"]),
+        named(KRB_NT_ENTERPRISE, &["carol@example.org"]),
+        named(KRB_NT_PRINCIPAL, &["ws9$$"]),
+        named(KRB_NT_SRV_HST, &["host", "ws9.example.org:inst"]),
+    ];
+    for binding in &request_only {
+        for handle in [carol, service] {
+            assert_eq!(
+                f.keyd.create_key(&ADMIN, &handle, binding, &now()),
+                Err(Error::Denied),
+                "{handle:?} {binding:?}"
+            );
+            assert_eq!(
+                f.records().last().unwrap().reason,
+                AuditReason::InvalidNameBinding
+            );
+        }
+    }
+    // The set_secret that would create carol's key set reads it the same
+    // way (the grant does not judge bindings — task A15a).
+    let upn = named(KRB_NT_ENTERPRISE, &["carol@EXAMPLE.ORG"]);
+    grant(&mut f.keyd, &carol, &upn, "EXAMPLE.ORGcarol", &now()).unwrap();
+    assert_eq!(
+        f.keyd.set_secret(
+            &DIRECTORY,
+            &carol,
+            &upn,
+            z("Marble-Pigeon-93-Cactus"),
+            "EXAMPLE.ORGcarol",
+            &now()
+        ),
+        Err(Error::Denied)
+    );
+    assert_eq!(
+        f.records().last().unwrap().reason,
+        AuditReason::InvalidNameBinding
+    );
+    // Controls: the stored spellings are bound.
+    let stored = named(KRB_NT_PRINCIPAL, &["carol"]);
+    grant(&mut f.keyd, &carol, &stored, "EXAMPLE.ORGcarol", &now()).unwrap();
+    assert!(f
+        .keyd
+        .set_secret(
+            &DIRECTORY,
+            &carol,
+            &stored,
+            z("Marble-Pigeon-93-Cactus"),
+            "EXAMPLE.ORGcarol",
+            &now()
+        )
+        .is_ok());
+    for (id, purpose, binding) in [
+        (
+            0xC3,
+            KeyPurpose::PrincipalLongterm,
+            named(KRB_NT_PRINCIPAL, &["ws9$"]),
+        ),
+        (
+            0xC4,
+            KeyPurpose::Service,
+            named(KRB_NT_SRV_HST, &["host", "ws9.example.org:8080"]),
+        ),
+    ] {
+        for e in &f.keyd.config().enctypes {
+            let length = EncType::from_number(e.number()).unwrap().key_length();
+            f.entropy.push(&[id; 32][..length]);
+        }
+        let handle = KeyHandle::new(PrincipalId::from_bytes([id; 16]), purpose);
         assert!(
             f.keyd.create_key(&ADMIN, &handle, &binding, &now()).is_ok(),
             "{binding:?}"

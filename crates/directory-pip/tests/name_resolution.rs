@@ -122,8 +122,13 @@ fn every_record_carries_the_attested_resolution_of_its_lookup() {
         .unwrap();
     let checked = verify(&test_key(), &alice.resolution).unwrap();
     let r = checked.resolution();
-    assert_eq!(r.principal(), alice.key.principal);
-    assert_eq!(r.key_purpose(), alice.key.purpose);
+    // It names alice's key set, (objectGUID, PrincipalLongterm) — the
+    // record's one statement of it (task PN10c; Q-1060 item 1 (e)).
+    assert_eq!(
+        r.principal(),
+        PrincipalId::from_bytes(guid(ALICE).to_packet())
+    );
+    assert_eq!(r.key_purpose(), KeyPurpose::PrincipalLongterm);
     assert_eq!(r.canonical_realm(), d.ctx.realm());
     assert_eq!(r.name_as_sent(), &name(KRB_NT_PRINCIPAL, &["alice"]));
     assert!(r.is_fresh_at(&signer_time()));
@@ -138,7 +143,10 @@ fn every_record_carries_the_attested_resolution_of_its_lookup() {
         .unwrap()
         .unwrap();
     let checked = verify(&test_key(), &ws01.resolution).unwrap();
-    assert_eq!(checked.resolution().principal(), ws01.key.principal);
+    assert_eq!(
+        checked.resolution().principal(),
+        PrincipalId::from_bytes(guid(WS01).to_packet())
+    );
     assert_eq!(checked.resolution().key_purpose(), KeyPurpose::Service);
     // Another key does not verify it (only dird's key attests).
     let other = AttestationKey::from_bytes(&[0x3A; 32]).unwrap();

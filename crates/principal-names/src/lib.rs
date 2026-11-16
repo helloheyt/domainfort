@@ -19,6 +19,7 @@
 //! | [`NameKind`], [`KindSet`] | the kinds a key carries | §4.1 |
 //! | [`NameContext`] | the realm's alias set (phase 1: its DNS name only — P-84) | §4.2 |
 //! | [`keys_of_names`], [`PrincipalNames`], [`PrincipalClass`], [`KeySet`] | the write side: the keys an object's stored names produce | §4.3, §4.4 |
+//! | [`key_of_stored_name`] | one stored name (a sAMAccountName, a servicePrincipalName) in its principal-name form — a key set's binding — read by the write side's rules, never as a request | §4.4, §7.3 |
 //! | [`key_of_request`], [`RequestKey`] | the lookup side: the one key a request probes | §4.2 |
 //! | [`reserved_name_of`], [`ReservedName`] | the reserved names, judged on the folded form | §4.2, Q-1009 |
 //! | [`NameRefused`] | why a stored name has no key | §4.4 |
@@ -97,6 +98,6 @@ pub use key::{fold, KindSet, NameKind, PrincipalKey, MAX_KEY_COMPONENTS, MAX_KEY
 pub use request::{key_of_request, RequestKey};
 pub use reserved::{reserved_name_of, ReservedName};
 pub use stored::{
-    keys_of_names, KeySet, PrincipalClass, PrincipalNames, MAX_KEYS_PER_OBJECT,
+    key_of_stored_name, keys_of_names, KeySet, PrincipalClass, PrincipalNames, MAX_KEYS_PER_OBJECT,
     MAX_SERVICE_PRINCIPAL_NAMES,
 };

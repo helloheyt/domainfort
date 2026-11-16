@@ -181,7 +181,7 @@ impl RequestHost for LdapHost<'_> {
         let outcome = run(RequestInputs {
             snapshot: self.policy,
             pip: &view,
-            accounts: &view,
+            subjects: &view,
             rate: &mut *self.rate,
             now,
             transport,

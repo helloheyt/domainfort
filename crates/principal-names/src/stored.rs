@@ -42,6 +42,20 @@
 //!   is "krbtgt" (RFC 4120 §6.2) or a key equal to a realm alias (N5);
 //! - each kind only on the classes of the table above.
 //!
+//! # One stored name in its principal-name form
+//!
+//! `key_of_stored_name` reads ONE stored name given as a `PrincipalName` —
+//! the form of a key set's name binding (keyd's creation rule, task PN10c)
+//! and of a resolution's canonical name (the stored value split at "/") —
+//! with the same rules: one component is a sAMAccountName (a computer's
+//! form when it ends with "$"), two components a servicePrincipalName.
+//! It shares `keys_of_names`'s readers of those two attributes and its
+//! reservation check, so there is one definition of a stored name, not a
+//! second one. It is not `key_of_request`: a spelling only a request may
+//! use — a one-component `local@<alias>` (a userPrincipalName, whose key is
+//! its local part only as a request), three parts in phase 1, an
+//! ":instancename" — has no key here (docs/questions/Q-1060, A-190).
+//!
 //! The admin plane's value rules stay in crates/directory-admin `names.rs`
 //! (lengths of docs/51 §11, [MS-SAMR] 3.1.1.6 items 8-10 beyond "/", the
 //! host part of an SPN equal to the object's dNSHostName, a lower-case host
@@ -49,15 +63,17 @@
 //! Q-1010 item 1) and which claim may carry a reserved name (A-163) —
 //! docs/questions/Q-1018 item 2.
 //!
-//! Spec: docs/59 §4.1-§4.4; docs/questions/Q-1007 items 1-5, 7-9, Q-1008
-//! item 2, Q-1009 items 1-2, Q-1010 items 1-3; [MS-SAMR] 3.1.1.6 items
-//! 10, 11, 14, 3.1.1.8.4 item 2; [MS-ADTS] 2.2.21, 3.1.1.5.3.1.1.2,
-//! 3.1.1.5.3.1.1.4; RFC 4120 §6.2, §7.3.
+//! Spec: docs/59 §4.1-§4.4, §7.3 (the stored binding); docs/questions/
+//! Q-1007 items 1-5, 7-9, Q-1008 item 2, Q-1009 items 1-2, Q-1010 items
+//! 1-3, Q-1060 (A-190: the binding read as a stored name); [MS-SAMR]
+//! 3.1.1.6 items 10, 11, 14, 3.1.1.8.4 item 2; [MS-ADTS] 2.2.21,
+//! 3.1.1.5.3.1.1.2, 3.1.1.5.3.1.1.4; RFC 4120 §6.2, §7.3.
 
 use crate::context::NameContext;
 use crate::error::NameRefused;
 use crate::key::{KindSet, NameKind, PrincipalKey, COMPONENT_SEPARATOR, UPN_SEPARATOR};
 use crate::reserved::{is_tgs_name, TGS_NAME};
+use krb_proto::PrincipalName;
 use std::collections::BTreeMap;
 
 /// The most servicePrincipalName values one object may hold: phase 1 keeps
@@ -215,19 +231,10 @@ pub fn keys_of_names(names: &PrincipalNames<'_>, ctx: &NameContext) -> Result<Ke
     if class == PrincipalClass::TicketGrantingService && sam != TGS_NAME {
         return Err(NameRefused::Reserved);
     }
-    keys.add(
-        PrincipalKey::of_components(&[sam])?,
-        NameKind::SamAccountName,
-    );
-    match (class.is_computer(), sam.strip_suffix(COMPUTER_SUFFIX)) {
-        (true, Some(base)) if !base.ends_with(COMPUTER_SUFFIX) => {
-            keys.add(
-                PrincipalKey::of_components(&[base])?,
-                NameKind::ComputerBase,
-            );
-        }
-        (false, None) => {}
-        _ => return Err(NameRefused::ComputerSuffix),
+    let (own, base) = sam_account_name_keys(sam, class.is_computer())?;
+    keys.add(own, NameKind::SamAccountName);
+    if let Some(base) = base {
+        keys.add(base, NameKind::ComputerBase);
     }
 
     // userPrincipalName (N3). Spec: docs/59 §4.4 N3; Q-1007 items 2-3.
@@ -271,14 +278,77 @@ pub fn keys_of_names(names: &PrincipalNames<'_>, ctx: &NameContext) -> Result<Ke
     } else {
         // No other object holds a TGS name or a realm alias.
         // Spec: RFC 4120 §6.2; docs/59 §4.4 N4, N5; Q-1009 item 1.
-        let reserved = keys
-            .keys()
-            .any(|key| is_tgs_name(key.first_component()) || ctx.is_alias_key(key));
-        if reserved {
+        if keys.keys().any(|key| reserved_for_the_tgs(key, ctx)) {
             return Err(NameRefused::Reserved);
         }
     }
     Ok(keys)
+}
+
+/// The key of one stored name given in its principal-name form (module
+/// documentation, "One stored name in its principal-name form"): one
+/// component — a sAMAccountName, read as a computer's when it ends with
+/// "$" and as any other account's otherwise; two components — a phase-1
+/// servicePrincipalName; each by the reader `keys_of_names` uses for that
+/// attribute, then refused if it is reserved for the krbtgt account (an
+/// initial component "krbtgt", a realm alias — N4, N5). Every other form
+/// has no key: no component, three or more (phase 1; [MS-ADTS]
+/// 3.1.1.5.3.1.1.4 — three parts only on a DC's object, task PN16), an
+/// "@" or a "/" inside a component (so never a userPrincipalName — N2,
+/// N3), an ":instancename". The TGS's own name (`krbtgt/<realm>`) is a
+/// protocol name and no stored one (RFC 4120 §7.3): it has no key here
+/// either — `key_of_request` names it (`LocalTgs` / `Foreign`). The
+/// name-type is not significant (RFC 4120 §6.2). Total and panic-free.
+/// Spec: docs/59 §4.4 N2-N5, §7.3; docs/questions/Q-1060 (A-190);
+/// [MS-SAMR] 3.1.1.6 items 10, 11, 14; [MS-ADTS] 2.2.21, 3.1.1.5.3.1.1.4;
+/// RFC 4120 §6.2, §7.3.
+pub fn key_of_stored_name(
+    name: &PrincipalName,
+    ctx: &NameContext,
+) -> Result<PrincipalKey, NameRefused> {
+    let key = match name.name_string.as_slice() {
+        [] => return Err(NameRefused::Empty),
+        [sam] => {
+            let sam = sam.as_str();
+            sam_account_name_keys(sam, sam.ends_with(COMPUTER_SUFFIX))?.0
+        }
+        [service, host] => spn_key_of_parts(&[service.as_str(), host.as_str()])?,
+        _ => return Err(NameRefused::SpnForm),
+    };
+    if reserved_for_the_tgs(&key, ctx) {
+        return Err(NameRefused::Reserved);
+    }
+    Ok(key)
+}
+
+/// The keys of a sAMAccountName (N2): its own key and, for a computer, the
+/// key of its base name without the final "$" — a computer's ends with a
+/// single "$", no other's ends with "$". The one reader of the attribute,
+/// for `keys_of_names` and `key_of_stored_name`.
+/// Spec: [MS-SAMR] 3.1.1.6 items 10, 11 ("MUST end with a single '$'");
+/// docs/59 §4.3, §4.4 N2; Q-355 item 2.
+fn sam_account_name_keys(
+    sam: &str,
+    computer: bool,
+) -> Result<(PrincipalKey, Option<PrincipalKey>), NameRefused> {
+    let own = PrincipalKey::of_components(&[sam])?;
+    match (computer, sam.strip_suffix(COMPUTER_SUFFIX)) {
+        (true, Some(base)) if !base.ends_with(COMPUTER_SUFFIX) => {
+            Ok((own, Some(PrincipalKey::of_components(&[base])?)))
+        }
+        (false, None) => Ok((own, None)),
+        _ => Err(NameRefused::ComputerSuffix),
+    }
+}
+
+/// `true` if `key` is reserved for the krbtgt account: its initial
+/// component is "krbtgt", or it is a realm alias. The one reservation
+/// check, for `keys_of_names` and `key_of_stored_name`.
+/// Spec: RFC 4120 §6.2 ("Names of any type with an initial component of
+/// 'krbtgt' are reserved for the Kerberos ticket-granting service"),
+/// §7.3; docs/59 §4.4 N4, N5; Q-1009 item 1.
+fn reserved_for_the_tgs(key: &PrincipalKey, ctx: &NameContext) -> bool {
+    is_tgs_name(key.first_component()) || ctx.is_alias_key(key)
 }
 
 /// The key of a userPrincipalName: `fold(local)` for `local "@" suffix`
@@ -304,13 +374,22 @@ fn spn_key(spn: &str) -> Result<PrincipalKey, NameRefused> {
     let parts: Vec<&str> = spn
         .splitn(STORED_SPN_PARTS + 1, COMPONENT_SEPARATOR)
         .collect();
-    let [_, host] = parts.as_slice() else {
+    spn_key_of_parts(&parts)
+}
+
+/// The key of a stored servicePrincipalName's parts (the value split at
+/// "/"): two parts in phase 1, no ":instancename" in the host part, each
+/// part a key component (non-empty, no "/" or "@"). The one reader of the
+/// attribute's parts, for `spn_key` and `key_of_stored_name`.
+/// Spec: [MS-ADTS] 2.2.21, 3.1.1.5.3.1.1.4; docs/59 §4.4 N4.
+fn spn_key_of_parts(parts: &[&str]) -> Result<PrincipalKey, NameRefused> {
+    let [_, host] = parts else {
         return Err(NameRefused::SpnForm);
     };
     if !host_part_ok(host) {
         return Err(NameRefused::SpnForm);
     }
-    PrincipalKey::of_components(&parts)
+    PrincipalKey::of_components(parts)
 }
 
 /// `true` if an SPN's host part carries no ":instancename": no ":" at all,

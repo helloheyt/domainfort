@@ -18,16 +18,24 @@
 //! 5. Writer and reader agree (class C49): for every object `keys_of_names`
 //!    accepts, each stored name, sent as a request the way a client spells
 //!    it, probes exactly the key the object stores for it.
+//! 6. The writer and the stored-name reading agree (task PN10c): for every
+//!    object `keys_of_names` accepts (but the krbtgt account, whose binding
+//!    is the TGS's name), its sAMAccountName and each servicePrincipalName,
+//!    in principal-name form (one component; the SPN split at "/"), have
+//!    through `key_of_stored_name` exactly the key the object stores for
+//!    that name — and its userPrincipalName, a request's spelling only, has
+//!    none.
 //!
-//! Source: docs/59 §4.2, §4.3, §10.1; RFC 4120 §6.2; [MS-KILE] 3.1.5.7,
-//! 3.3.5.1.1, 3.3.5.6.1; Q-1007 items 2, 5. Test code only; no vector from
-//! any other implementation.
+//! Source: docs/59 §4.2, §4.3, §4.4, §7.3, §10.1; RFC 4120 §6.2; [MS-KILE]
+//! 3.1.5.7, 3.3.5.1.1, 3.3.5.6.1; Q-1007 items 2, 5; Q-1066 (task PN10c).
+//! Test code only; no vector from any other implementation.
 #![allow(dead_code)] // each including crate uses a subset
 
 use krb_proto::{KerberosString, PrincipalName, Realm};
 use principal_names::{
-    fold, key_of_request, keys_of_names, reserved_name_of, KeySet, NameContext, NameKind,
-    PrincipalKey, PrincipalNames, RequestKey, ReservedName, MAX_KEY_COMPONENTS, MAX_KEY_OCTETS,
+    fold, key_of_request, key_of_stored_name, keys_of_names, reserved_name_of, KeySet, NameContext,
+    NameKind, PrincipalKey, PrincipalNames, RequestKey, ReservedName, MAX_KEY_COMPONENTS,
+    MAX_KEY_OCTETS,
 };
 
 /// The name-types every request is also tried under (RFC 4120 §6.2 table,
@@ -143,6 +151,33 @@ fn request(components: &[&str]) -> Option<PrincipalName> {
     })
 }
 
+/// Property 6 for one accepted object (module documentation).
+fn check_stored_names(names: &PrincipalNames<'_>, keys: &KeySet, ctx: &NameContext) {
+    let reads_as = |components: &[&str], kind: NameKind| {
+        let Some(name) = request(components) else {
+            return;
+        };
+        match key_of_stored_name(&name, ctx) {
+            Ok(key) => assert!(
+                keys.kinds_of(&key).contains(kind),
+                "{components:?} reads as {key:?}, which carries no {kind:?} in {keys:?}"
+            ),
+            Err(refused) => panic!("{components:?} ({kind:?}) has no stored key: {refused:?}"),
+        }
+    };
+    reads_as(&[names.sam_account_name], NameKind::SamAccountName);
+    for spn in &names.service_principal_names {
+        let parts: Vec<&str> = spn.split('/').collect();
+        reads_as(&parts, NameKind::ServicePrincipalName);
+    }
+    if let Some(name) = names.user_principal_name.and_then(|upn| request(&[upn])) {
+        assert!(
+            key_of_stored_name(&name, ctx).is_err(),
+            "a userPrincipalName is no stored binding form: {name:?}"
+        );
+    }
+}
+
 /// Property 5 for one stored name: the request `components` must probe a
 /// key of `keys` that carries `kind`.
 fn assert_probes(
@@ -187,6 +222,7 @@ pub fn check_stored(
         assert_eq!(check_request(&tgs, realm, ctx), RequestKey::LocalTgs);
         return Some(keys);
     }
+    check_stored_names(names, &keys, ctx);
     let sam = names.sam_account_name;
     assert_probes(&keys, NameKind::SamAccountName, &[sam], realm, ctx);
     if let Some(base) = sam.strip_suffix('$') {

@@ -474,10 +474,11 @@ fn the_pdp_denies_the_computer_group_too() {
 /// docs/53 §5.2; RFC 4120 3.1.3 ("looks up the client and server
 /// principals"): the change-password service object is resolved before
 /// pre-authentication — absent → KDC_ERR_S_PRINCIPAL_UNKNOWN; disabled →
-/// KDC_ERR_SERVICE_REVOKED; a record whose key set is not the
-/// change-password one (the one derivation, `KeyPurpose::of_service_name`)
-/// → KRB_ERR_GENERIC (fail closed); each armored, keyd never asked to
-/// verify or issue.
+/// KDC_ERR_SERVICE_REVOKED; a record whose key set — the one its resolution
+/// names, the record's only statement of it (task PN10c; Q-1060 item 1 (e))
+/// — is not the change-password one (the one derivation,
+/// `KeyPurpose::of_service_name`) → KRB_ERR_GENERIC (fail closed); each
+/// armored, keyd never asked to verify or issue.
 #[test]
 fn the_service_object_must_resolve_to_its_own_key_set() {
     for case in 0..3 {
@@ -501,10 +502,12 @@ fn the_service_object_must_resolve_to_its_own_key_set() {
                     .enabled = false;
             }
             _ => {
+                // dird resolved the name to a plain Service key set — the
+                // record's one statement of its key set (task PN10c).
                 f.accounts()
                     .service_mut(&realm(), &change_password_name())
                     .unwrap()
-                    .key = SERVICE;
+                    .resolution = test_resolution(&change_password_name(), SERVICE);
             }
         }
         let fast = f.send_fast(&alice_for_change_password().with_challenge(&alice_key(AES256)));

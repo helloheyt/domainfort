@@ -291,7 +291,6 @@ fn bounds_hold_at_their_edges() {
         KeyPurpose::PrincipalLongterm,
     );
     let account = ClientAccount {
-        key,
         sid: big_sid(u32::MAX),
         groups: groups.clone(),
         tier: Tier::Tier0,
@@ -517,41 +516,101 @@ fn a_resolution_outside_its_bounds_is_refused() {
     );
 }
 
+/// The octets of a resolution on the wire (wire.rs, `WireNameResolution`).
+fn resolution_octets(r: &WireNameResolution) -> usize {
+    4 + r.realm_as_sent.len()
+        + 4
+        + r.name_as_sent.as_der().len()
+        + 4
+        + r.canonical_realm.len()
+        + 4
+        + r.canonical_name.as_der().len()
+        + 16
+        + 1
+        + 8
+        + 7
+        + NAME_RESOLUTION_TAG_LEN
+}
+
+/// `true` if `body` is refused as the reply to a `Client` (or, `service`,
+/// a `Service`) request: by the ipc layer, or by the typed layer — never
+/// read as a record.
+fn refused_as_record(body: &[u8], service: bool) -> bool {
+    match decode_reply::<DirectoryReply>(DIRECTORY_CHANNEL, body) {
+        Err(_) => true,
+        Ok(Reply::Refused(_)) => false,
+        Ok(Reply::Message(reply)) => {
+            if service {
+                reply.into_service().is_err()
+            } else {
+                reply.into_client().is_err()
+            }
+        }
+    }
+}
+
 /// docs/50 §3.3 ("exact version", "no trailing octet"; the channel's
 /// version stays 1 by the codecs' precedent — docs/questions/Q-1045 item 1,
-/// A-184; Q-1046): a `Client` / `Service` record of the layout before task
-/// PN10 — the same fields without the resolution — is refused
-/// (`Truncated`), never read as a record without one.
+/// A-184; Q-1046; Q-1060 item 1 (e)): a `Client` / `Service` record of an
+/// earlier layout is refused, never read as a record of this one — the
+/// layout before task PN10 (a 17-octet key handle `PrincipalId ‖ purpose`,
+/// the fields, no resolution) and the layout of tasks PN10-PN11 (the
+/// handle, the fields, the resolution), whose handle task PN10c removed
+/// (the resolution names the key set). Each is built from this layout's
+/// body by putting the handle back after the reply's option marker — with
+/// the record's own key set and with handles of every-zero, every-one and
+/// every-0xFF principal octets — for a user, a computer and a service
+/// record.
 #[test]
-fn a_record_of_the_old_layout_is_refused_not_misread() {
-    let resolution_octets = |r: &WireNameResolution| {
-        4 + r.realm_as_sent.len()
-            + 4
-            + r.name_as_sent.as_der().len()
-            + 4
-            + r.canonical_realm.len()
-            + 4
-            + r.canonical_name.as_der().len()
-            + 16
-            + 1
-            + 8
-            + 7
-            + NAME_RESOLUTION_TAG_LEN
+fn a_record_of_an_old_layout_is_refused_not_misread() {
+    let handles = |key: KeyHandle| {
+        [
+            key.principal,
+            PrincipalId::from_bytes([0; 16]),
+            PrincipalId::from_bytes([1; 16]),
+            PrincipalId::from_bytes([0xFF; 16]),
+        ]
+        .map(|principal| {
+            let mut octets = principal.as_bytes().to_vec();
+            octets.push(ipc_directory::channel::codes::key_purpose(key.purpose));
+            octets
+        })
     };
-    let client = WireClient::from_account(&client_account()).unwrap();
-    let body = reply_body(&DirectoryReply::Client(Some(client.clone())));
-    let old = &body[..body.len() - resolution_octets(&client.resolution)];
-    assert_eq!(
-        decode_reply::<DirectoryReply>(DIRECTORY_CHANNEL, old).err(),
-        Some(Error::Truncated)
-    );
-    let service = ipc_directory::wire::WireService::from_account(&service_account()).unwrap();
-    let body = reply_body(&DirectoryReply::Service(Some(service.clone())));
-    let old = &body[..body.len() - resolution_octets(&service.resolution)];
-    assert_eq!(
-        decode_reply::<DirectoryReply>(DIRECTORY_CHANNEL, old).err(),
-        Some(Error::Truncated)
-    );
+    // (body, the resolution's octets, the record's key set, is a service).
+    let mut records = Vec::new();
+    for account in [client_account(), computer_account()] {
+        let wire = WireClient::from_account(&account).unwrap();
+        let body = reply_body(&DirectoryReply::Client(Some(wire.clone())));
+        records.push((
+            body,
+            resolution_octets(&wire.resolution),
+            account.key(),
+            false,
+        ));
+    }
+    let account = service_account();
+    let wire = ipc_directory::wire::WireService::from_account(&account).unwrap();
+    let body = reply_body(&DirectoryReply::Service(Some(wire.clone())));
+    records.push((
+        body,
+        resolution_octets(&wire.resolution),
+        account.key(),
+        true,
+    ));
+
+    for (body, resolution_len, key, service) in records {
+        // This layout decodes (the control).
+        assert!(!refused_as_record(&body, service));
+        // Envelope (4 octets) and the option marker (1) stay first.
+        let (head, fields) = body.split_at(5);
+        for handle in handles(key) {
+            let pn10 = [head, &handle, fields].concat();
+            assert!(refused_as_record(&pn10, service), "PN10-PN11 layout");
+            let without = &fields[..fields.len() - resolution_len];
+            let pre_pn10 = [head, &handle, without].concat();
+            assert!(refused_as_record(&pre_pn10, service), "pre-PN10 layout");
+        }
+    }
 }
 
 /// docs/50 §3.3 ("a single encoding per value"): every single-octet change

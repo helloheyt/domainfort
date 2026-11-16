@@ -300,7 +300,6 @@ impl WireClient {
     /// Spec: docs/50 §3.4; docs/59 §7.5.
     pub fn from_account(account: &ClientAccount) -> Result<WireClient, ConversionError> {
         Ok(WireClient {
-            key: account.key,
             sid: account.sid.encode(),
             groups: sid_packets(&account.groups),
             tier: account.tier,
@@ -339,7 +338,6 @@ impl WireClient {
             })
             .collect::<Result<Vec<_>, ConversionError>>()?;
         Ok(ClientAccount {
-            key: self.key,
             sid: sid(&self.sid)?,
             groups: sid_set(&self.groups)?,
             tier: self.tier,
@@ -362,7 +360,6 @@ impl WireService {
     /// Spec: docs/50 §3.4; docs/59 §7.5.
     pub fn from_account(account: &ServiceAccount) -> Result<WireService, ConversionError> {
         Ok(WireService {
-            key: account.key,
             state: wire_state(&account.state),
             enctypes: account.enctypes.clone(),
             resolution: WireNameResolution::from_attested(&account.resolution)?,
@@ -377,7 +374,6 @@ impl WireService {
     /// Spec: docs/50 §3.3, §3.4.
     pub fn to_account(&self) -> Result<ServiceAccount, ConversionError> {
         Ok(ServiceAccount {
-            key: self.key,
             state: state(&self.state)?,
             enctypes: self.enctypes.clone(),
             resolution: self.resolution.to_attested()?,

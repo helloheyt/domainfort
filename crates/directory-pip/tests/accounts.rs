@@ -43,7 +43,7 @@ fn exact_sam_account_name_hit() {
     let d = Dir::standard("exact-hit");
     let view = d.view();
     let alice = client(&view, &["alice"]).unwrap().expect("alice");
-    assert_eq!(alice.key, key_of(ALICE, KeyPurpose::PrincipalLongterm));
+    assert_eq!(alice.key(), key_of(ALICE, KeyPurpose::PrincipalLongterm));
     assert_eq!(alice.sid, sid_of(ALICE));
     let etypes: Vec<i32> = alice.etype_info.iter().map(|e| e.etype).collect();
     assert_eq!(etypes, vec![18, 17]);
@@ -56,7 +56,7 @@ fn exact_sam_account_name_hit() {
         .client(&realm(), &name(KRB_NT_ENTERPRISE, &["alice"]))
         .unwrap()
         .expect("alice under another name-type");
-    assert_eq!(other_type.key, alice.key);
+    assert_eq!(other_type.key(), alice.key());
     assert_eq!(other_type.sid, alice.sid);
     assert_eq!(other_type.groups, alice.groups);
     assert_eq!(other_type.tier, alice.tier);
@@ -223,7 +223,7 @@ fn spn_lookup_on_computers() {
     let ws01 = service(&view, &["host", "ws01.example.test"])
         .unwrap()
         .expect("ws01");
-    assert_eq!(ws01.key, key_of(WS01, KeyPurpose::Service));
+    assert_eq!(ws01.key(), key_of(WS01, KeyPurpose::Service));
     assert_eq!(ws01.enctypes, vec![18, 17]);
     assert!(ws01.state.usable_at(&now()));
     // Exact: no case folding (A-27), no single component, no extra
@@ -309,7 +309,7 @@ fn the_admin_service_name_names_the_admin_service_key_set() {
     let admin = service(&view, &["admind", "dc01.example.test"])
         .unwrap()
         .expect("the admin service");
-    assert_eq!(admin.key, key_of(60, KeyPurpose::AdminService));
+    assert_eq!(admin.key(), key_of(60, KeyPurpose::AdminService));
     // A stored third component has no key (PN4b) and fails closed when its
     // object is found by another key (PN4).
     assert_eq!(
@@ -323,7 +323,7 @@ fn the_admin_service_name_names_the_admin_service_key_set() {
     let ws01 = service(&view, &["host", "ws01.example.test"])
         .unwrap()
         .unwrap();
-    assert_eq!(ws01.key.purpose, KeyPurpose::Service);
+    assert_eq!(ws01.key().purpose, KeyPurpose::Service);
 }
 
 /// docs/53 R53-6, §5.2 (task K5: the change-password service's object,
@@ -388,7 +388,10 @@ fn the_change_password_service_name_names_its_key_set() {
             .service(&realm(), &name(name_type, &["kadmin", "changepw"]))
             .unwrap()
             .expect("the change-password service");
-        assert_eq!(changepw.key, key_of(62, KeyPurpose::ChangePasswordService));
+        assert_eq!(
+            changepw.key(),
+            key_of(62, KeyPurpose::ChangePasswordService)
+        );
     }
     assert_eq!(found(&service(&view, &["KADMIN", "changepw"])), Ok(false));
     assert_eq!(

@@ -392,22 +392,20 @@ pub fn read_attestation_key(path: &Path, owner: u32) -> Result<SharedAttestation
     SharedAttestationKey::from_bytes(&octets).map_err(|_| StartupError::AttestationKeyRefused)
 }
 
-/// The configured `attestation_key_path` (task PN10). Since task PN12 the
-/// configuration schema requires the key (A-187 on docs/questions/Q-1048
-/// item 1): a dird file without it is refused when it is parsed, so dird
-/// still does not start without its attestation key (fail closed) and this
-/// accessor has no refusal of its own. It keeps its `Result` so the start's
-/// one call site composes with [`read_attestation_key`] unchanged (that call
-/// site, `main.rs`, is outside task PN12's files — docs/questions/Q-1055
-/// item 9).
+/// The configured `attestation_key_path` (task PN10) — the file
+/// [`read_attestation_key`] reads. The configuration schema requires the key
+/// (task PN12; A-187 on docs/questions/Q-1048 item 1): a dird file without
+/// it is refused when it is parsed (`StartupError::Config`), before any key
+/// file is opened, so dird does not start without its attestation key (fail
+/// closed) and this accessor has nothing to refuse — its type says so
+/// (task PN10c: the `Result` that was always `Ok` is gone; docs/questions/
+/// Q-1055 item 9, A-188).
 ///
-/// # Errors
-/// None since task PN12 (always `Ok`).
-///
-/// Spec: docs/59 §7.4; docs/questions/Q-1046 item 5, Q-1048 item 1;
-/// AGENTS.md §6 (fail closed).
-pub fn attestation_key_path(settings: &DirdSettings) -> Result<&Path, StartupError> {
-    Ok(settings.attestation_key_path().as_path())
+/// Spec: docs/59 §7.4; docs/questions/Q-1046 item 5, Q-1048 item 1, Q-1055
+/// item 9; AGENTS.md §6 (fail closed).
+#[must_use]
+pub fn attestation_key_path(settings: &DirdSettings) -> &Path {
+    settings.attestation_key_path().as_path()
 }
 
 /// Read the development policy file through the shared loader

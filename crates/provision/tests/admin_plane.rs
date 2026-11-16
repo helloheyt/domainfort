@@ -170,16 +170,18 @@ impl Domain {
         let policy = policy_file.snapshot().unwrap();
         let realm = Realm::new("EXAMPLE.TEST").unwrap();
         let nc = NamingContext::new(&["example", "test"]).unwrap();
-        // Task PN10: with dird's signer (common `dird_signer` — under the
-        // produced attestation key since task PN12) — the write PEP reads
-        // accounts through the view's account source.
+        // No signer (task PN10c; A-189): the write PEP's subject check reads
+        // the ticket's subject through `TicketSubjects` — the one lookup
+        // path, no KDC record, no attested resolution — and only dird's KDC
+        // channel attests (docs/questions/Q-1050 item 1, Q-1051 item 1).
+        // Nothing these tests run reads a KDC record (tests/install.rs
+        // does, and keeps its signer).
         let ctx = DirectoryContext::new(
             ad_schema::phase1().unwrap(),
             &KeydConfig::new(realm.clone()),
             nc.clone(),
         )
-        .unwrap()
-        .with_name_resolution_signer(dird_signer(p, uid));
+        .unwrap();
         let protected = ProtectedObjects {
             service_objects: BTreeSet::from([
                 plan.object(ObjectRole::LdapService).unwrap().guid,

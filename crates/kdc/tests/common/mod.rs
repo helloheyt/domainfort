@@ -813,7 +813,6 @@ impl kdc::AccountSource for Resigning<'_> {
 /// default).
 pub fn alice_account() -> ClientAccount {
     ClientAccount {
-        key: ALICE,
         sid: alice_sid(),
         groups: [users_group()].into_iter().collect(),
         tier: Tier::Tier2,
@@ -830,7 +829,6 @@ pub fn alice_account() -> ClientAccount {
 /// carry none, RFC 4120 5.2.7.5 "salt OPTIONAL").
 pub fn machine_account() -> ClientAccount {
     ClientAccount {
-        key: MACHINE,
         sid: machine_sid(),
         groups: [bootstrap_group()].into_iter().collect(),
         tier: Tier::Tier2,
@@ -923,7 +921,6 @@ impl Fixture {
                 &realm(),
                 &bob_name(),
                 ClientAccount {
-                    key: BOB,
                     sid: bob_sid(),
                     groups: BTreeSet::new(),
                     tier: Tier::Tier2,
@@ -943,7 +940,6 @@ impl Fixture {
                 &realm(),
                 &service_name(),
                 ServiceAccount {
-                    key: SERVICE,
                     state: AccountState::ACTIVE,
                     enctypes: vec![AES256, AES128],
                     resolution: test_resolution(&service_name(), SERVICE),
@@ -957,7 +953,6 @@ impl Fixture {
                 &realm(),
                 &change_password_name(),
                 ServiceAccount {
-                    key: CHANGEPW,
                     state: AccountState::ACTIVE,
                     enctypes: vec![AES256, AES128],
                     resolution: test_resolution(&change_password_name(), CHANGEPW),

@@ -81,7 +81,7 @@ pub trait SearchClock {
 /// [MS-ADTS] 3.1.1.5.1.4). For a directory search the engine takes every PIP
 /// answer from it as well (`PepView::pip`), so the objects it enumerates and
 /// the descriptors the PDP reads come from the same snapshot (docs/11 §6
-/// P9); the caller passes the same view as `pip` and `accounts` (docs/47
+/// P9); the caller passes the same view as `pip` and `subjects` (docs/47
 /// §8.1, R47-11). It is a `PepView` — the visibility gate, the locators of
 /// its questions and the PIP — never the `DirectoryView`: the engine cannot
 /// read a raw object (docs/52 R-a; A-103 on docs/questions/Q-486).
@@ -105,9 +105,10 @@ pub struct RequestInputs<'a> {
     /// per-request re-check of a bound identity (docs/49 §4.4, R49-15) reads
     /// the bound client's account facts from it — the one lookup path in
     /// the `TicketClient` context, with no name resolution and no signer
-    /// (docs/59 §6.2, §6.4; docs/questions/Q-1047, A-187). The field keeps
-    /// its name: the account facts of the request's view.
-    pub accounts: &'a dyn TicketSubjects,
+    /// (docs/59 §6.2, §6.4; docs/questions/Q-1047, A-187). Named for what
+    /// it is — a `TicketSubjects`, never the KDC's account source (task
+    /// PN10c; A-189 on docs/questions/Q-1051 item 2).
+    pub subjects: &'a dyn TicketSubjects,
     /// The caller's rate limiter. Spec: docs/49 §10.2.
     pub rate: &'a mut dyn RateLimiter,
     /// The caller's time. Spec: docs/49 §11; docs/11 P9.

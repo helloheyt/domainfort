@@ -747,13 +747,14 @@ impl DirectoryView<'_> {
                 s2kparams: self.ctx.s2kparams.clone(),
             })
             .collect();
-        // 8. The key set (objectGUID, PrincipalLongterm) — the resolution's.
+        // 8. The key set (objectGUID, PrincipalLongterm) — stated once, by
+        // the resolution of step 10: `ClientAccount::key` derives the handle
+        // from it and no field restates it (task PN10c; Q-1060 item 1 (e)).
         // 9. The account kind and the armor policy (docs/48 §3.1, §7.2).
         let (kind, armor_policy) = armor_facts(account.kind);
         // 10. dird's statement of this lookup, for keyd (task PN10).
         let resolution = self.attested(&resolved)?;
         Ok(Some(ClientAccount {
-            key: resolved.key_handle(),
             sid: account.sid,
             groups,
             tier,
@@ -790,10 +791,11 @@ impl DirectoryView<'_> {
         let obj = resolved.object();
         let account = self.account(obj)?.ok_or(Fault::Unavailable)?;
         let state = self.state_of(obj, &account)?;
-        // dird's statement of this lookup, for keyd (task PN10).
+        // dird's statement of this lookup, for keyd (task PN10) — also the
+        // record's one statement of its key set (`ServiceAccount::key`,
+        // task PN10c).
         let resolution = self.attested(&resolved)?;
         Ok(Some(ServiceAccount {
-            key: resolved.key_handle(),
             state,
             enctypes: self.ctx.enctypes.clone(),
             resolution,

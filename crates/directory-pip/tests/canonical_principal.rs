@@ -141,7 +141,7 @@ fn every_context_over_the_standard_directory() {
         .unwrap()
         .expect("alice");
     assert_eq!(
-        client.key,
+        client.key(),
         KeyHandle::new(principal(ALICE), KeyPurpose::PrincipalLongterm)
     );
 }

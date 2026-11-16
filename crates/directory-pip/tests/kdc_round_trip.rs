@@ -204,7 +204,7 @@ fn kdc_for(d: &Dir) -> TestKdc {
         &DecidedOperation::SetSecret {
             kind: keyd::AccountKind::User,
             targets: vec![SetSecretTarget {
-                handle: alice.key,
+                handle: alice.key(),
                 binding: PrincipalBinding::new(realm(), alice_name()),
                 salt: alice_salt.as_str().to_owned(),
             }],
@@ -221,12 +221,12 @@ fn kdc_for(d: &Dir) -> TestKdc {
             kind: keyd::AccountKind::Computer,
             targets: vec![
                 SetSecretTarget {
-                    handle: ws01_client.key,
+                    handle: ws01_client.key(),
                     binding: PrincipalBinding::new(realm(), ws01_name()),
                     salt: ws01_salt.as_str().to_owned(),
                 },
                 SetSecretTarget {
-                    handle: ws01.key,
+                    handle: ws01.key(),
                     binding: PrincipalBinding::new(realm(), service_name()),
                     salt: ws01_salt.as_str().to_owned(),
                 },
@@ -239,14 +239,17 @@ fn kdc_for(d: &Dir) -> TestKdc {
     .unwrap();
     keyd.set_secret(
         &DIRECTORY,
-        &alice.key,
+        &alice.key(),
         &PrincipalBinding::new(realm(), alice_name()),
         String::from(ALICE_PASSWORD).into(),
         alice_salt.as_str(),
         &n,
     )
     .unwrap();
-    for (handle, binding) in [(ws01.key, service_name()), (ws01_client.key, ws01_name())] {
+    for (handle, binding) in [
+        (ws01.key(), service_name()),
+        (ws01_client.key(), ws01_name()),
+    ] {
         keyd.set_secret(
             &DIRECTORY,
             &handle,

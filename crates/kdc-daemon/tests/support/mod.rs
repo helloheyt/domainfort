@@ -94,13 +94,17 @@ impl Handles {
         use kdc::AccountSource as _;
         Handles {
             krbtgt: view.krbtgt_handle(&dird::domain_sid()).unwrap(),
-            alice: view.client(&realm(), &alice_name()).unwrap().unwrap().key,
-            ws1: view.client(&realm(), &machine_name()).unwrap().unwrap().key,
+            alice: view.client(&realm(), &alice_name()).unwrap().unwrap().key(),
+            ws1: view
+                .client(&realm(), &machine_name())
+                .unwrap()
+                .unwrap()
+                .key(),
             files: view
                 .service(&realm(), &service_name())
                 .unwrap()
                 .unwrap()
-                .key,
+                .key(),
         }
     }
 }

@@ -10,11 +10,16 @@
 //! | realm, salt | `bytes<max>` holding KerberosString octets |
 //! | name | `bytes<MAX_NAME>` holding the `PrincipalName` DER |
 //! | SID | `bytes<MAX_SID>` holding the [MS-DTYP] 2.4.2.2 packet |
-//! | `KeyHandle` | 16-octet `PrincipalId` ‖ purpose `u8` (closed table) |
+//! | `KeyHandle` (the `Domain` reply's krbtgt) | 16-octet `PrincipalId` ‖ purpose `u8` (closed table) |
 //! | `KerberosTime` | `year:u16 ‖ month ‖ day ‖ hour ‖ minute ‖ second` (A-63 item 1) |
 //! | etype | `i32` as four octets, big-endian |
 //! | `Tier`, `AccountKind`, `ArmorPolicy`, failures | `u8` from a closed table |
 //! | attested name resolution (task PN10) | realm ‖ name DER ‖ realm ‖ name DER ‖ `PrincipalId` ‖ purpose `u8` ‖ snapshot `u64` ‖ `KerberosTime` ‖ tag (32 octets) |
+//!
+//! A `Client` / `Service` record carries no `KeyHandle` of its own: its key
+//! set is the one its resolution names (principal, purpose) — one statement
+//! of one fact, so a record whose handle and resolution disagree has no
+//! encoding (task PN10c; docs/questions/Q-1060 item 1 (e)).
 //!
 //! Spec: docs/50 §3.3 (primitives, "Kerberos values … as `bytes<max>`
 //! containing DER", "KeyHandle = 16 octets PrincipalId + u8 purpose"), §3.4;
@@ -262,15 +267,15 @@ impl Payload for WireNameResolution {
     }
 }
 
-/// A client record (`kdc::ClientAccount`, non-secret: a key handle, never a
-/// key; salts are public).
+/// A client record (`kdc::ClientAccount`, non-secret: a key handle — in
+/// its resolution — never a key; salts are public).
 /// Spec: docs/50 §3.4 (`Option<ClientAccount>` — key, sid, groups, tier,
 /// state, etype_info, kind, armor_policy); crates/kdc accounts.rs; docs/59
-/// §7.5 (and the resolution, task PN10).
+/// §7.5 (and the resolution, task PN10, which since task PN10c is the
+/// record's only statement of its key set — no `key` field precedes `sid`;
+/// docs/questions/Q-1060 item 1 (e)).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireClient {
-    /// The keyd handle of the long-term key set.
-    pub key: KeyHandle,
     /// The account SID packet.
     pub sid: Vec<u8>,
     /// The expanded group SID packets, in ascending SID order.
@@ -285,14 +290,14 @@ pub struct WireClient {
     pub kind: AccountKind,
     /// The FAST armor policy.
     pub armor_policy: ArmorPolicy,
-    /// dird's attested resolution of the name looked up (task PN10).
+    /// dird's attested resolution of the name looked up (task PN10); its
+    /// principal and purpose name the key set (task PN10c).
     pub resolution: WireNameResolution,
 }
 
 impl Payload for WireClient {
     /// Spec: docs/50 §3.4; crates/kdc accounts.rs; docs/59 §7.5.
     fn write_fields(&self, writer: &mut Writer) -> Result<()> {
-        write_handle(writer, &self.key)?;
         write_sid(writer, &self.sid)?;
         writer.write_seq(&self.groups, MAX_GROUPS, |w, g| write_sid(w, g))?;
         writer.write_enum(codes::tier(self.tier))?;
@@ -305,7 +310,6 @@ impl Payload for WireClient {
 
     /// Spec: docs/50 §3.4; crates/kdc accounts.rs.
     fn read_fields(reader: &mut Reader<'_>) -> Result<WireClient> {
-        let key = read_handle(reader)?;
         let sid = read_sid(reader)?;
         let groups = reader.read_seq(MAX_GROUPS, read_sid)?;
         let tier = reader.read_enum(codes::tier_from)?;
@@ -315,7 +319,6 @@ impl Payload for WireClient {
         let armor_policy = reader.read_enum(codes::armor_policy_from)?;
         let resolution = WireNameResolution::read_fields(reader)?;
         Ok(WireClient {
-            key,
             sid,
             groups,
             tier,
@@ -330,23 +333,23 @@ impl Payload for WireClient {
 
 /// A service record (`kdc::ServiceAccount`).
 /// Spec: docs/50 §3.4 (`Option<ServiceAccount>`); crates/kdc accounts.rs;
-/// docs/59 §7.5 (and the resolution, task PN10).
+/// docs/59 §7.5 (and the resolution, task PN10 — the record's only
+/// statement of its key set since task PN10c; docs/questions/Q-1060 item 1
+/// (e)).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireService {
-    /// The keyd handle of the service key set.
-    pub key: KeyHandle,
     /// The account state.
     pub state: WireState,
     /// The encryption types the service accepts.
     pub enctypes: Vec<i32>,
-    /// dird's attested resolution of the name looked up (task PN10).
+    /// dird's attested resolution of the name looked up (task PN10); its
+    /// principal and purpose name the key set (task PN10c).
     pub resolution: WireNameResolution,
 }
 
 impl Payload for WireService {
     /// Spec: docs/50 §3.4; crates/kdc accounts.rs; docs/59 §7.5.
     fn write_fields(&self, writer: &mut Writer) -> Result<()> {
-        write_handle(writer, &self.key)?;
         self.state.write_fields(writer)?;
         writer.write_seq(&self.enctypes, MAX_ENCTYPES, |w, e| write_etype(w, *e))?;
         self.resolution.write_fields(writer)
@@ -354,12 +357,10 @@ impl Payload for WireService {
 
     /// Spec: docs/50 §3.4; crates/kdc accounts.rs; docs/59 §7.5.
     fn read_fields(reader: &mut Reader<'_>) -> Result<WireService> {
-        let key = read_handle(reader)?;
         let state = WireState::read_fields(reader)?;
         let enctypes = reader.read_seq(MAX_ENCTYPES, read_etype)?;
         let resolution = WireNameResolution::read_fields(reader)?;
         Ok(WireService {
-            key,
             state,
             enctypes,
             resolution,

@@ -103,7 +103,6 @@ pub fn client_account() -> ClientAccount {
         KeyPurpose::PrincipalLongterm,
     );
     ClientAccount {
-        key,
         sid: sid(1010),
         groups: [sid(1030), sid(1031), sid(513)].into_iter().collect(),
         tier: Tier::Tier2,
@@ -138,7 +137,6 @@ pub fn computer_account() -> ClientAccount {
         KeyPurpose::PrincipalLongterm,
     );
     ClientAccount {
-        key,
         sid: sid(1020),
         groups: BTreeSet::new(),
         tier: Tier::Untiered,
@@ -153,7 +151,6 @@ pub fn computer_account() -> ClientAccount {
 pub fn service_account() -> ServiceAccount {
     let key = KeyHandle::new(PrincipalId::from_bytes([0x5E; 16]), KeyPurpose::Service);
     ServiceAccount {
-        key,
         state: AccountState {
             enabled: false,
             locked: true,

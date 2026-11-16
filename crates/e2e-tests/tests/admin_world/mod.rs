@@ -765,17 +765,18 @@ fn workstation_fixture(plan: &Plan, input: &DomainInput, uid: u32) -> Workstatio
     let tiers = directory_daemon::policy::tier_map(&policy).unwrap();
     let snapshot = policy.snapshot().unwrap();
     let nc = NamingContext::new(&input.naming_context).unwrap();
-    // Task PN10: with dird's signer (crates/provision tests/common
-    // `dird_signer` — under the produced attestation key since task PN12) —
-    // the write PEP reads accounts through the view's account source, whose
-    // records carry dird's attested resolution.
+    // No signer (task PN10c; A-189): the write PEP's subject check reads
+    // the ticket's subject through `TicketSubjects` — the one lookup path,
+    // no KDC record, no attested resolution — and its service-object
+    // checks through `canonical_principal`; only dird's KDC channel attests
+    // (docs/questions/Q-1050 item 1, Q-1051 item 1). Nothing this fixture
+    // runs reads a KDC record.
     let ctx = DirectoryContext::new(
         ad_schema::phase1().unwrap(),
         &KeydConfig::new(realm()),
         nc.clone(),
     )
-    .unwrap()
-    .with_name_resolution_signer(provision_common::dird_signer(paths, uid));
+    .unwrap();
     let protected = directory_daemon::admin_service::protected_objects(&plan.manifest, &policy);
     let config = AdminConfig::new(
         Duration::from_secs(u64::from(provision::configs::ADMIN_TICKET_AGE_MAX_SECS)),

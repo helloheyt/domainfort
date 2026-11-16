@@ -264,10 +264,11 @@
 //!   creation and `bound_by`'s binding compare narrow what it can map a
 //!   name to), and a compromised KDC can replay a true, fresh resolution
 //!   within its 30 s window (S4) — it cannot invent a mapping. keyd's
-//!   creation rule (`template::check_new_binding`) still recognises the
-//!   reserved names octet for octet (a follow-up — docs/questions/Q-1061).
-//!   There is no rename in phase 1 (follow-up: a rename interface, docs/10
-//!   §7).
+//!   creation rule (`template::check_new_binding`) judges the reserved
+//!   names on the folded form (A-190; docs/questions/Q-1061 item 1) and
+//!   reads a binding as a stored name, never as a request (task PN10c;
+//!   docs/questions/Q-1066). There is no rename in phase 1 (follow-up: a
+//!   rename interface, docs/10 §7).
 //! - keyd trusts the caller's `now` and start time (the daemon's own clock,
 //!   docs/50 R50-5) and dird's decisions — the approvers a decision names
 //!   were verified by dird, not by keyd (dird ≡ tier-0 for keyd's

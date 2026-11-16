@@ -89,13 +89,17 @@ impl Handles {
         );
         Handles {
             krbtgt: view.krbtgt_handle(&support::domain_sid()).unwrap(),
-            alice: alice.key,
-            ws1: view.client(&realm(), &machine_name()).unwrap().unwrap().key,
+            alice: alice.key(),
+            ws1: view
+                .client(&realm(), &machine_name())
+                .unwrap()
+                .unwrap()
+                .key(),
             files: view
                 .service(&realm(), &service_name())
                 .unwrap()
                 .unwrap()
-                .key,
+                .key(),
         }
     }
 }

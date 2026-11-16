@@ -248,7 +248,7 @@ fn root_dse_search(n: u32) -> LdapMessage {
 
 fn send(
     session: &mut Session,
-    accounts: &InMemorySubjects,
+    subjects: &InMemorySubjects,
     policy: &PolicySnapshot,
     msg: &LdapMessage,
     at: KerberosTime,
@@ -262,7 +262,7 @@ fn send(
         RequestInputs {
             snapshot: policy,
             pip: &pip,
-            accounts,
+            subjects,
             rate: &mut rate,
             now: at,
             transport: tls_report(),
@@ -589,7 +589,7 @@ fn malformed_input_on_a_bound_session_is_recorded_against_the_principal() {
         RequestInputs {
             snapshot: &allow_policy(),
             pip: &pip,
-            accounts: &accounts,
+            subjects: &accounts,
             rate: &mut rate,
             now: now(),
             transport: tls_report(),

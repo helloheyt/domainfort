@@ -25,7 +25,7 @@ use ipc_directory::wire::DirectoryReply;
 use ipc_directory::DIRECTORY_CHANNEL;
 use ipc_directory_server::{answer, ResolutionSigner, SharedAttestationKey};
 use kdc::{AccountSource, AccountSourceError};
-use keyd_types::NAME_RESOLUTION_WINDOW_SECS;
+use keyd_types::{KeyHandle, KeyPurpose, PrincipalId, NAME_RESOLUTION_WINDOW_SECS};
 use krb_proto::constants::{KRB_NT_PRINCIPAL, KRB_NT_SRV_HST};
 use krb_proto::KerberosTime;
 use name_attestation::{verify, AttestationKey};
@@ -77,7 +77,18 @@ fn the_signer_signs_what_keyd_verifies() {
         .unwrap()
         .unwrap();
     let key = AttestationKey::from_bytes(&KEY).unwrap();
-    for (attested, handle) in [(&alice.resolution, alice.key), (&ws01.resolution, ws01.key)] {
+    // The key sets the lookups resolve to, known independently of the
+    // records (objectGUID + purpose, docs/47 §2.3): a record states its key
+    // set only through its resolution (task PN10c).
+    let handle_of =
+        |id, purpose| KeyHandle::new(PrincipalId::from_bytes(guid(id).to_packet()), purpose);
+    for (attested, handle) in [
+        (
+            &alice.resolution,
+            handle_of(ALICE, KeyPurpose::PrincipalLongterm),
+        ),
+        (&ws01.resolution, handle_of(WS01, KeyPurpose::Service)),
+    ] {
         let checked = verify(&key, attested).unwrap();
         let r = checked.resolution();
         assert_eq!(r.canonical_realm().as_bytes(), ctx.realm().as_bytes());
@@ -141,7 +152,10 @@ fn the_resolution_crosses_the_channel_as_signed() {
     let record = decoded.into_client().unwrap().unwrap().unwrap();
     let key = AttestationKey::from_bytes(&KEY).unwrap();
     let checked = verify(&key, &record.resolution).unwrap();
-    assert_eq!(checked.resolution().principal(), record.key.principal);
+    assert_eq!(
+        checked.resolution().principal(),
+        PrincipalId::from_bytes(guid(ALICE).to_packet())
+    );
     assert_eq!(
         checked.resolution().name_as_sent(),
         &name(KRB_NT_PRINCIPAL, &["alice"])

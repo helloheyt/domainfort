@@ -14,7 +14,8 @@
 //! Spec: RFC 4120 2.1-2.6, 3.1.3, 3.3.3, 5.3, 5.4.1, 6.2, 7.3; docs/10 §4,
 //! §5; docs/questions/Q-040 (A-19); docs/59 §4.2, §7.2, §7.3;
 //! docs/questions/Q-1061 item 1 (A-190: the creation rule judges the
-//! reserved names on the folded form).
+//! reserved names on the folded form), Q-1066 (task PN10c: it reads the
+//! binding as the stored name it is, never as a request).
 
 use crate::audit::AuditReason;
 use crate::config::TicketPolicy;
@@ -25,7 +26,9 @@ use keyd_types::CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS;
 use krb_proto::constants::KRB_NT_SRV_INST;
 use krb_proto::limits::MAX_NAME_COMPONENTS;
 use krb_proto::{KerberosFlags, KerberosString, KerberosTime, PrincipalName, Realm, TicketFlags};
-use principal_names::{key_of_request, reserved_name_of, NameContext, RequestKey, ReservedName};
+use principal_names::{
+    key_of_request, key_of_stored_name, reserved_name_of, NameContext, RequestKey, ReservedName,
+};
 
 /// The first name component of every TGS principal. Spec: RFC 4120 7.3.
 const KRBTGT: &str = "krbtgt";
@@ -70,13 +73,27 @@ impl NewBinding {
 /// created, and return its creation proof ([`NewBinding`]):
 /// - the realm is this keyd's realm (phase 1 is single-realm);
 /// - the name has 1..=MAX_NAME_COMPONENTS components (krb-proto's bound);
-/// - the name is a name of the one namespace, judged by crate
-///   principal-names — the namespace's own reading of a request's name
-///   (`key_of_request`) and its reserved-name predicate (`reserved_name_of`),
-///   both on the folded form (class C49; A-190 on Q-1061 item 1): a name no
-///   object can hold (`NoSuchPrincipal` — more than three components, an
-///   empty component, a "/" or an "@" inside one, a key equal to the realm's
-///   name, a non-printable octet) is bound to no key set;
+/// - the name is read as what a binding is — a **stored** name, never a
+///   request (task PN10c; the A-190 residual of docs/questions/Q-1060):
+///   - the TGS's name, `krbtgt/X` (any case), is a protocol name and no
+///     stored one (RFC 4120 7.3), so it is recognised as a request names
+///     the TGS — crate principal-names `key_of_request` ⇒ `LocalTgs`
+///     (this realm) or `Foreign` (another realm's TGS; X is any realm
+///     name, which this rule does not parse further);
+///   - every other name must be a stored name of the one namespace, read
+///     by crate principal-names with the write side's own rules
+///     (`key_of_stored_name`: one component a sAMAccountName, two a
+///     servicePrincipalName — the forms dird binds, crates/directory-admin
+///     `password_targets`, and provisioning's manifest) and judged by its
+///     reserved-name predicate (`reserved_name_of`), both on the folded
+///     form (class C49; A-190 on Q-1061 item 1). A name no object stores
+///     in those forms is bound to no key set: no component, three or more
+///     (phase 1), an empty component, a "/" or an "@" inside one — so
+///     never a userPrincipalName spelling `x@<realm>`, which only a
+///     request may use for `x` (`key_of_request` would map it to `x`) —
+///     an ":instancename" host part, a final "$" that is no computer's
+///     sAMAccountName form, a key equal to the realm's name, a
+///     non-printable octet;
 /// - a Krbtgt key is bound to a two-part TGS name ("krbtgt", X — any case),
 ///   and no other key may be bound to a name starting with "krbtgt" (reserved
 ///   for the TGS);
@@ -88,10 +105,11 @@ impl NewBinding {
 ///   RFC 3244 §2), and no other key may be bound to that name (task K3;
 ///   docs/53 §5.2).
 ///
-/// So the creation rule and dird's writer share one definition of
-/// "reserved": a spelling the writer reserves (`KRBTGT/x`, `ADMIND/h`,
-/// `KADMIN/changepw`) is never bound to a plain Service or PrincipalLongterm
-/// key set either. Failure is `Denied` (reason `InvalidNameBinding`; a realm
+/// So the creation rule and dird's writer share one definition of a stored
+/// name and of "reserved": a spelling the writer reserves (`KRBTGT/x`,
+/// `ADMIND/h`, `KADMIN/changepw`) is never bound to a plain Service or
+/// PrincipalLongterm key set either, and a spelling the writer never stores
+/// is bound to no key set. Failure is `Denied` (reason `InvalidNameBinding`; a realm
 /// that forms no namespace — `WrongRealm`, as keyd's
 /// `Keyd::name_context` — fails closed).
 ///
@@ -100,8 +118,11 @@ impl NewBinding {
 /// ("a two-part name ... with the first part 'krbtgt'"); docs/questions/
 /// Q-040 (A-19); A-73 (the admin service's name); docs/52 §5 item 3 (R2);
 /// docs/questions/Q-491; docs/59 §3 (M3 = C49), §4.2 (the request table and
-/// the reserved-name predicates), §7.3 (`check_new_binding` stays the
-/// creation rule); docs/questions/Q-1009 items 1-2, Q-1061 item 1 (A-190).
+/// the reserved-name predicates), §4.4 N2-N5 (the stored forms), §7.3
+/// (`check_new_binding` stays the creation rule; the binding is stored);
+/// [MS-SAMR] 3.1.1.6 items 10-11; [MS-ADTS] 2.2.21, 3.1.1.5.3.1.1.4;
+/// docs/questions/Q-1009 items 1-2, Q-1061 item 1 (A-190), Q-1060 (A-190
+/// residual), Q-1066 (task PN10c).
 pub(crate) fn check_new_binding(
     realm: &Realm,
     handle: &KeyHandle,
@@ -118,14 +139,24 @@ pub(crate) fn check_new_binding(
     }
     let ctx =
         NameContext::new(realm.as_str()).map_err(|_| Deny::denied(AuditReason::WrongRealm))?;
-    // The reserved name the binding spells, folded (docs/59 §4.2): the TGS's
-    // two-part names are `LocalTgs` (this realm) or `Foreign` (another —
-    // the realm itself is this keyd's, checked above), never a key; a key
-    // never begins with "krbtgt" (principal-names: `NoSuchPrincipal`).
-    let reserved = match key_of_request(&binding.name, &binding.realm, &ctx) {
-        RequestKey::LocalTgs | RequestKey::Foreign => Some(ReservedName::TicketGrantingService),
-        RequestKey::Key(key) => reserved_name_of(&key),
-        RequestKey::NoSuchPrincipal => return bad,
+    // The TGS's name (RFC 4120 7.3) is a protocol name: recognised as a
+    // request names the TGS — `LocalTgs` (this realm) or `Foreign` (another
+    // realm's TGS; the binding's own realm is this keyd's, checked above).
+    let names_the_tgs = matches!(
+        key_of_request(&binding.name, &binding.realm, &ctx),
+        RequestKey::LocalTgs | RequestKey::Foreign
+    );
+    // Every other binding is a stored name (docs/59 §7.3), read by the
+    // write side's rules and never as a request — a request's spelling of
+    // a stored name (`x@<realm>` for `x`) is no binding (task PN10c) — and
+    // the reserved name it spells, if any, judged on the folded key.
+    let reserved = if names_the_tgs {
+        Some(ReservedName::TicketGrantingService)
+    } else {
+        match key_of_stored_name(&binding.name, &ctx) {
+            Ok(key) => reserved_name_of(&key),
+            Err(_) => return bad,
+        }
     };
     // R2 / task K3 (docs/53 §5.2, R53-6): each reserved name is bound only
     // to its own purpose's key set, and that key set to nothing else — so a

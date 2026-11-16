@@ -382,3 +382,89 @@ fn kinds_of_a_key() {
     let other = ws01.keys().next().unwrap();
     assert!(keys.kinds_of(other).is_empty());
 }
+
+/// Task PN10c (docs/questions/Q-1066; the A-190 residual of Q-1060):
+/// `key_of_stored_name` reads one stored name in principal-name form — the
+/// form of a key set's binding — with the write side's rules, never as a
+/// request: a sAMAccountName (one component; a computer's when it ends with
+/// a single "$" — [MS-SAMR] 3.1.1.6 item 11) and a phase-1
+/// servicePrincipalName (two components, a numeric ":port" allowed —
+/// [MS-ADTS] 2.2.21) have the key `keys_of_names` stores for them; a
+/// request-only spelling has none: a one-part `local@<realm alias>` (a
+/// userPrincipalName — `key_of_request` maps it to `local`; docs/59 §4.4
+/// N2), "x$$", three parts in phase 1 and an ":instancename" ([MS-ADTS]
+/// 3.1.1.5.3.1.1.4), an empty or "/"-holding part, no component; nor does a
+/// name reserved for the krbtgt account (RFC 4120 §6.2, §7.3; N5) — the
+/// TGS's own name included, a protocol name no object stores. The
+/// name-type is not significant (RFC 4120 §6.2).
+#[test]
+fn one_stored_name_is_read_by_the_writers_rules() {
+    use krb_proto::constants::{KRB_NT_ENTERPRISE, KRB_NT_PRINCIPAL, KRB_NT_SRV_HST};
+    use krb_proto::{KerberosString, PrincipalName};
+    use principal_names::key_of_stored_name;
+    let ctx = ctx();
+    let name = |name_type: i32, parts: &[&str]| PrincipalName {
+        name_type,
+        name_string: parts
+            .iter()
+            .map(|p| KerberosString::new(p).unwrap())
+            .collect(),
+    };
+    let stored = |n: &PrincipalName| key_of_stored_name(n, &ctx);
+
+    // The writer's keys, through the stored-name reading.
+    let alice = keys_of_names(&names(PrincipalClass::User, "Alice"), &ctx).unwrap();
+    let key = stored(&name(KRB_NT_PRINCIPAL, &["Alice"])).unwrap();
+    assert!(alice.kinds_of(&key).contains(SamAccountName));
+    let mut ws01 = names(PrincipalClass::Computer, "WS01$");
+    ws01.service_principal_names = vec!["HTTP/ws01.example.test:8080"];
+    let ws01 = keys_of_names(&ws01, &ctx).unwrap();
+    let key = stored(&name(KRB_NT_PRINCIPAL, &["ws01$"])).unwrap();
+    assert!(ws01.kinds_of(&key).contains(SamAccountName));
+    let key = stored(&name(KRB_NT_SRV_HST, &["http", "WS01.example.test:8080"])).unwrap();
+    assert!(ws01.kinds_of(&key).contains(ServicePrincipalName));
+    // The name-type is not significant.
+    assert_eq!(
+        stored(&name(KRB_NT_ENTERPRISE, &["alice"])),
+        stored(&name(KRB_NT_PRINCIPAL, &["alice"]))
+    );
+
+    // Request-only spellings and non-stored forms have no key.
+    for (parts, refused) in [
+        (&["alice@example.test"][..], NameRefused::Separator),
+        (&["alice@EXAMPLE.TEST"][..], NameRefused::Separator),
+        (&["x$$"][..], NameRefused::ComputerSuffix),
+        (&["$"][..], NameRefused::Empty),
+        (
+            &["ldap", "dc01.example.test", "example.test"][..],
+            NameRefused::SpnForm,
+        ),
+        (
+            &["host", "ws01.example.test:inst"][..],
+            NameRefused::SpnForm,
+        ),
+        (&["host", ""][..], NameRefused::Empty),
+        (&["host", "a/b"][..], NameRefused::Separator),
+        (&[][..], NameRefused::Empty),
+    ] {
+        assert_eq!(
+            stored(&name(KRB_NT_PRINCIPAL, parts)),
+            Err(refused),
+            "{parts:?}"
+        );
+    }
+    // Reserved for the krbtgt account: any "krbtgt" first component, the
+    // realm alias — and so the TGS's name itself.
+    for parts in [
+        &["krbtgt"][..],
+        &["KRBTGT", "EXAMPLE.TEST"][..],
+        &["krbtgt", "ws01.example.test"][..],
+        &["example.test"][..],
+    ] {
+        assert_eq!(
+            stored(&name(KRB_NT_PRINCIPAL, parts)),
+            Err(NameRefused::Reserved),
+            "{parts:?}"
+        );
+    }
+}

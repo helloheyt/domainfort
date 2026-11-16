@@ -48,8 +48,8 @@
 //!    expired → KDC_ERR_CLIENT_REVOKED; TGT authtime before the account's
 //!    revocation instant → KDC_ERR_TGT_REVOKED (3.3.3.1 hot-list);
 //! 8. the service account: unknown → KDC_ERR_S_PRINCIPAL_UNKNOWN; a record
-//!    whose resolution names another key set, or one that is no service's
-//!    → KRB_ERR_GENERIC (inconsistent, fail closed); the change-password
+//!    whose resolution names a key set that is no service's → KRB_ERR_GENERIC
+//!    (inconsistent, fail closed); the change-password
 //!    service — by the purpose of the key set dird resolved the name to,
 //!    not by the request's spelling (task PN11; Q-1009 item 4) →
 //!    KDC_ERR_POLICY; disabled, locked or expired → KDC_ERR_SERVICE_REVOKED
@@ -347,19 +347,15 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
             }
             Ok(Some(service)) => service,
         };
-        // The record names its key set twice (the handle and dird's
-        // resolution): they must agree (fail closed; keyd checks the same).
         // Which kind of server the name is comes from the key set dird
         // resolved it to — its purpose, derived from the stored name and
-        // the provisioning claim (docs/59 §4.7) — never from the request's
-        // spelling (task PN11; Q-1009 item 4): Service or AdminService is a
-        // service; the change-password service's key set is refused here
-        // too (its tickets come only from an armored AS, docs/53 §5.2 — the
-        // step-6 check sees only the exact spelling); anything else is no
-        // service (an inconsistent record).
-        if !service.resolution_names_key() {
-            return Err(internal(AuditReason::AccountRecordInvalid));
-        }
+        // the provisioning claim (docs/59 §4.7), the record's one statement
+        // of its key set (task PN10c) — never from the request's spelling
+        // (task PN11; Q-1009 item 4): Service or AdminService is a service;
+        // the change-password service's key set is refused here too (its
+        // tickets come only from an armored AS, docs/53 §5.2 — the step-6
+        // check sees only the exact spelling); anything else is no service
+        // (an inconsistent record).
         let resolution = service.resolution.resolution();
         match resolved_server_kind(resolution.key_purpose()) {
             Some(ServerNameKind::Service) => {}
@@ -484,7 +480,7 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
         let parts = self
             .custody
             .issue_tgs_rep(
-                &service.key,
+                &service.key(),
                 &service.resolution,
                 &tgt.ctx_id,
                 &template,

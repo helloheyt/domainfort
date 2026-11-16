@@ -56,11 +56,12 @@ fn accounts() -> InMemoryAccounts {
         .insert_client(&realm(), &alice_name(), alice_account())
         .unwrap();
     let mut bob = alice_account();
-    bob.key = BOB;
     bob.sid = bob_sid();
     bob.groups = Default::default();
     bob.etype_info = etype_info(BOB_SALT);
-    // Task PN10: bob's record carries the resolution of bob's name.
+    // Task PN10: bob's record carries the resolution of bob's name — and,
+    // since task PN10c, through it bob's key set (the record's one
+    // statement of its handle).
     bob.resolution = test_resolution(&bob_name(), BOB);
     accounts.insert_client(&realm(), &bob_name(), bob).unwrap();
     accounts
@@ -71,7 +72,6 @@ fn accounts() -> InMemoryAccounts {
             &realm(),
             &service_name(),
             kdc::ServiceAccount {
-                key: SERVICE,
                 state: kdc::AccountState::ACTIVE,
                 enctypes: vec![AES256, AES128],
                 resolution: test_resolution(&service_name(), SERVICE),

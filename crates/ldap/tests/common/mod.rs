@@ -223,7 +223,7 @@ pub struct Harness {
     pub session: Session,
     pub snapshot: PolicySnapshot,
     pub pip: TestPip,
-    pub accounts: CountingSubjects,
+    pub subjects: CountingSubjects,
     pub rate: TestRate,
 }
 
@@ -234,7 +234,7 @@ impl Harness {
             session: Session::new(7, listener),
             snapshot: root_dse_policy(),
             pip: TestPip::untiered(),
-            accounts: CountingSubjects::default(),
+            subjects: CountingSubjects::default(),
             rate: TestRate {
                 admit: true,
                 calls: 0,
@@ -247,7 +247,7 @@ impl Harness {
         let inputs = RequestInputs {
             snapshot: &self.snapshot,
             pip: &self.pip,
-            accounts: &self.accounts,
+            subjects: &self.subjects,
             rate: &mut self.rate,
             now: now(),
             transport,

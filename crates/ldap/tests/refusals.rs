@@ -272,7 +272,7 @@ fn password_octets_from_the_front_are_refused() {
     let outcome = h.send_octets(&octets, tls());
     assert_notice(&outcome, ResultCode::ProtocolError);
     assert!(!format!("{outcome:?}").contains("secret"));
-    assert_eq!(h.accounts.calls.get(), 0);
+    assert_eq!(h.subjects.calls.get(), 0);
 }
 
 /// [MS-ADTS] 3.1.1.3.4.6 ("If the server receives a request that is larger

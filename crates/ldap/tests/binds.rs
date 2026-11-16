@@ -43,7 +43,7 @@ fn anonymous_simple_bind_succeeds_and_stays_anonymous() {
         let bind = outcome.audit.bind.expect("bind facts");
         assert_eq!(bind.mechanism, BindMechanism::SimpleAnonymous);
         assert_eq!(bind.name, None);
-        assert_eq!(h.accounts.calls.get(), 0);
+        assert_eq!(h.subjects.calls.get(), 0);
     }
 }
 
@@ -69,7 +69,7 @@ fn simple_bind_with_password_is_auth_method_not_supported_without_lookup() {
             tls_up,
         );
         assert_eq!(code, ResultCode::AuthMethodNotSupported);
-        assert_eq!(h.accounts.calls.get(), 0, "no name lookup");
+        assert_eq!(h.subjects.calls.get(), 0, "no name lookup");
         assert_eq!(h.session.auth_state(), AuthState::Unauthenticated);
     }
 }
@@ -81,7 +81,7 @@ fn empty_name_with_password_is_auth_method_not_supported() {
     let mut h = Harness::new(Listener::Ldaps);
     let code = bind_code(&mut h, &simple_bind(3, "", false), true);
     assert_eq!(code, ResultCode::AuthMethodNotSupported);
-    assert_eq!(h.accounts.calls.get(), 0);
+    assert_eq!(h.subjects.calls.get(), 0);
 }
 
 /// RFC 4513 §5.1.2: "Servers SHOULD by default fail Unauthenticated Bind
@@ -102,7 +102,7 @@ fn unauthenticated_bind_is_unwilling_to_perform() {
         bind.name,
         Some(AuditText::Text("CN=bob,DC=example,DC=org".to_owned()))
     );
-    assert_eq!(h.accounts.calls.get(), 0);
+    assert_eq!(h.subjects.calls.get(), 0);
 }
 
 /// docs/49 §10.1: a client string that is not printable ASCII, or longer than
@@ -162,7 +162,7 @@ fn gssapi_without_tls_is_confidentiality_required() {
     let outcome = h.send(&sasl_bind(8, "GSSAPI", Some(vec![0x60, 0x00])), cleartext());
     assert_eq!(only_code(&outcome), ResultCode::ConfidentialityRequired);
     assert_eq!(outcome.audit.reason, AuditReason::SaslWithoutTls);
-    assert_eq!(h.accounts.calls.get(), 0);
+    assert_eq!(h.subjects.calls.get(), 0);
 }
 
 /// docs/49 §12: the GSSAPI bind is task L7, blocked on P-13; until then it is
@@ -174,7 +174,7 @@ fn gssapi_over_tls_is_not_yet_supported() {
     assert_eq!(only_code(&outcome), ResultCode::AuthMethodNotSupported);
     assert_eq!(outcome.audit.reason, AuditReason::SaslGssapiNotAvailable);
     assert_eq!(h.session.auth_state(), AuthState::Unauthenticated);
-    assert_eq!(h.accounts.calls.get(), 0);
+    assert_eq!(h.subjects.calls.get(), 0);
 }
 
 /// RFC 4511 §4.2: "If the server does not support the specified version, it
