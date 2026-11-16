@@ -493,7 +493,6 @@ fn the_first_administrator_can_run_every_admin_operation_under_the_tier0_ou() {
         Operation::CreateComputer(CreateComputer {
             parent: ou,
             name: "ws9".into(),
-            dns_host_name: "ws9.example.test".into(),
             spn: Some("host/ws9.example.test".into()),
         }),
         "alice",

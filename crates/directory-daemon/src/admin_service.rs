@@ -945,7 +945,6 @@ fn wire_operation(operation: &PepOperation) -> Operation {
         PepOperation::CreateComputer(c) => Operation::CreateComputer {
             parent: c.parent,
             name: c.name.clone(),
-            dns_host_name: c.dns_host_name.clone(),
             spn: c.spn.clone(),
         },
         PepOperation::CreateGroup(c) => Operation::CreateGroup {
@@ -1141,17 +1140,14 @@ pub fn pep_operation(operation: &Operation) -> Option<PepOperation> {
             upn: upn.clone(),
             description: description.clone(),
         }),
-        Operation::CreateComputer {
-            parent,
-            name,
-            dns_host_name,
-            spn,
-        } => PepOperation::CreateComputer(CreateComputer {
-            parent: *parent,
-            name: name.clone(),
-            dns_host_name: dns_host_name.clone(),
-            spn: spn.clone(),
-        }),
+        // Task PN6b: no dNSHostName crosses the channel — the PEP derives it.
+        Operation::CreateComputer { parent, name, spn } => {
+            PepOperation::CreateComputer(CreateComputer {
+                parent: *parent,
+                name: name.clone(),
+                spn: spn.clone(),
+            })
+        }
         Operation::CreateGroup {
             parent,
             sam,
@@ -1400,9 +1396,6 @@ const _: () =
 const _: () = assert!(
     ipc_dird_admin::channel::MAX_PRINCIPAL_NAME as usize
         >= directory_admin::MAX_PRINCIPAL_NAME_CHARS
-);
-const _: () = assert!(
-    ipc_dird_admin::channel::MAX_DNS_HOST_NAME as usize >= directory_admin::MAX_DNS_HOST_NAME_CHARS
 );
 const _: () = assert!(
     ipc_dird_admin::channel::MAX_DESCRIPTION as usize >= 3 * directory_admin::MAX_DESCRIPTION_UNITS

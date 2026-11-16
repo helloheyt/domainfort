@@ -141,11 +141,6 @@ pub const MAX_NAME: u32 = 256;
 /// `MAX_PRINCIPAL_NAME_CHARS`.
 pub const MAX_PRINCIPAL_NAME: u32 = 1024;
 
-/// Bound of a dNSHostName (octets): 2048.
-/// Spec: docs/46 §5.4 (dNSHostName 0..2048); crates/directory-admin
-/// `MAX_DNS_HOST_NAME_CHARS`.
-pub const MAX_DNS_HOST_NAME: u32 = 2048;
-
 /// Bound of a description (octets of UTF-8): 3072 — 1024 UTF-16 units
 /// (docs/46 §5.4) take at most three UTF-8 octets each (a unit of the Basic
 /// Multilingual Plane), or four octets per surrogate pair of two units.
@@ -269,10 +264,9 @@ const CREATE_USER: usize = 16
     + (4 + MAX_NAME as usize)
     + (1 + 4 + MAX_PRINCIPAL_NAME as usize)
     + (1 + 4 + MAX_DESCRIPTION as usize);
-const CREATE_COMPUTER: usize = 16
-    + (4 + MAX_NAME as usize)
-    + (4 + MAX_DNS_HOST_NAME as usize)
-    + (1 + 4 + MAX_PRINCIPAL_NAME as usize);
+// Task PN6b: no dNSHostName field (dird derives it — docs/questions/
+// Q-1036 item 1); there is no bound for one either.
+const CREATE_COMPUTER: usize = 16 + (4 + MAX_NAME as usize) + (1 + 4 + MAX_PRINCIPAL_NAME as usize);
 const LOOKUP_DN: usize = 1 + 4 + MAX_DN_COMPONENTS as usize * (4 + MAX_DN_COMPONENT as usize);
 const LOOKUP_SPN: usize = 1 + 4 + MAX_PRINCIPAL_NAME as usize;
 

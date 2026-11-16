@@ -314,15 +314,16 @@ pub enum Operation {
         /// The description.
         description: Option<String>,
     },
-    /// `CreateComputer {parent, name, dns_host_name, spn?}`.
+    /// `CreateComputer {parent, name, spn?}`. No dNSHostName: dird derives
+    /// `<name>.<realm DNS name>` ([MS-ADTS] 3.1.1.5.3.1.1.2), so a client
+    /// cannot name a host (task PN6b; docs/questions/Q-1036 item 1, A-182).
     CreateComputer {
         /// The container.
         parent: Guid,
         /// The computer name, without the trailing "$".
         name: String,
-        /// The dNSHostName.
-        dns_host_name: String,
-        /// The single servicePrincipalName.
+        /// The single servicePrincipalName (its host: the derived
+        /// dNSHostName).
         spn: Option<String>,
     },
     /// `CreateGroup {parent, sam, group_type?}`.
@@ -492,15 +493,9 @@ impl Operation {
                 upn: opt_text(upn.as_ref())?,
                 description: opt_text(description.as_ref())?,
             },
-            WireOperation::CreateComputer {
-                parent,
-                name,
-                dns_host_name,
-                spn,
-            } => Operation::CreateComputer {
+            WireOperation::CreateComputer { parent, name, spn } => Operation::CreateComputer {
                 parent: guid(parent),
                 name: text(name)?,
-                dns_host_name: text(dns_host_name)?,
                 spn: opt_text(spn.as_ref())?,
             },
             WireOperation::CreateGroup {
@@ -630,15 +625,9 @@ impl Operation {
                 upn: opt(upn),
                 description: opt(description),
             },
-            Operation::CreateComputer {
-                parent,
-                name,
-                dns_host_name,
-                spn,
-            } => WireOperation::CreateComputer {
+            Operation::CreateComputer { parent, name, spn } => WireOperation::CreateComputer {
                 parent: parent.to_packet(),
                 name: bytes(name),
-                dns_host_name: bytes(dns_host_name),
                 spn: opt(spn),
             },
             Operation::CreateGroup {

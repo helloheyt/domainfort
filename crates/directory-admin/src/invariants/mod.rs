@@ -814,6 +814,21 @@ impl Invariants {
         self.hosts.as_ref()
     }
 
+    /// The dNSHostName rule N6 gives a new computer whose sAMAccountName is
+    /// `sam_account_name` — derived from this checker's own realm context,
+    /// the one [`Invariants::check_create`] judges it in (module `object`,
+    /// `own_host_name`). The online `CreateComputer` writes this value and
+    /// takes none from the request (task PN6b; docs/questions/Q-1036 item
+    /// 1, decided A-182). No namespace context ⇒ `Fault::Namespace` (fail
+    /// closed, as for every security principal). Reads nothing from the
+    /// directory.
+    /// Spec: [MS-ADTS] v20261026 3.1.1.5.3.1.1.2; docs/59 §4.4 N6, §5.1;
+    /// docs/questions/Q-1036 item 1.
+    pub(crate) fn own_host_name(&self, sam_account_name: &str) -> Result<String, Refused> {
+        let names = self.names.as_ref().ok_or(Fault::Namespace)?;
+        Ok(object::own_host_name(sam_account_name, names)?)
+    }
+
     /// The rules of module `graph` over `store`.
     pub(crate) fn graph<'g, R: StoreRead + ?Sized>(&'g self, store: &'g R) -> Graph<'g, R> {
         Graph {

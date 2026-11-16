@@ -15,8 +15,13 @@
 //! requests (`0x10`–`0x12`) were retired by A-102: nothing decodes with one
 //! of those kinds (admind no longer forwards anything for keyadm, N2).
 //!
+//! Task PN6b (docs/questions/Q-1045): the forwarded `CreateComputer`
+//! (`0x02`) is dird's `parent ‖ name ‖ spn?` — no `dns_host_name` (dird
+//! derives it). The target reaches the new layout through dird's codec
+//! unchanged; ipc-dird-admin's own request target pins the field set.
+//!
 //! Spec: docs/51 §6, §7.1, §7.2, §7.6; docs/50 §3.3, §9; A-59;
-//! docs/questions/Q-422, Q-460 (A-102).
+//! docs/questions/Q-422, Q-460 (A-102), Q-1045.
 
 use ipc::{decode_body, encode_frame, Direction};
 use ipc_admin::{decode_request, encode_request, AdminRequest, Request, ADMIN_CHANNEL};

@@ -23,12 +23,20 @@
 //! digest (the application data its AP-REQs are bound to), the same from
 //! the typed and the wire form. Written, not run (PENDING-OWNER P-1).
 //!
+//! Task PN6b (docs/questions/Q-1036 item 1, Q-1045): `CreateComputer`
+//! (`0x02`) is `parent ‖ name ‖ spn?` — its `dns_host_name` field left the
+//! layout (dird derives the value). The target is layout-agnostic, so it
+//! covers the new layout as is; one assertion is added: a decoded
+//! `CreateComputer` re-encodes to exactly `16 + (4 + |name|) + spn?` payload
+//! octets after `auth`, so no field can be hiding between `name` and `spn`.
+//!
 //! Spec: docs/51 §6, §7.1-§7.3, §7.5; docs/50 §3.3, §9; A-59;
-//! docs/questions/Q-422, Q-460 (A-102), Q-882; docs/52 §5 item 1.
+//! docs/questions/Q-422, Q-460 (A-102), Q-882, Q-1045; docs/52 §5 item 1.
 
 use ipc::{decode_body, encode_frame, Direction};
 use ipc_dird_admin::{
-    decode_request, operation_digest, wire_operation_digest, AdminRequest, Request, ADMIN_CHANNEL,
+    decode_request, operation_digest, wire_operation_digest, AdminRequest, Request, WireOperation,
+    ADMIN_CHANNEL,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -39,6 +47,25 @@ fuzz_target!(|data: &[u8]| {
                 .expect("a decoded request re-encodes");
             assert_eq!(again.body(), data, "canonical wire round trip");
             assert!(!ipc_dird_admin::channel::request_kind::RETIRED.contains(&data[3]));
+            // Task PN6b: a `CreateComputer` is exactly the envelope, `auth`
+            // (requester length ‖ octets ‖ the empty approvals count) and
+            // `parent ‖ name ‖ spn?` — no dNSHostName octets anywhere.
+            if let AdminRequest::Operation {
+                auth,
+                operation: WireOperation::CreateComputer { name, spn, .. },
+            } = &wire
+            {
+                let expected = 4
+                    + (4 + auth.requester.len() + 4)
+                    + 16
+                    + (4 + name.len())
+                    + spn.as_ref().map_or(1, |s| 1 + 4 + s.len());
+                assert_eq!(
+                    data.len(),
+                    expected,
+                    "CreateComputer carries no other field"
+                );
+            }
             if let Ok(request) = Request::from_wire(&wire) {
                 let typed = request.to_wire().expect("a typed request re-encodes");
                 assert_eq!(typed, wire, "canonical typed round trip");

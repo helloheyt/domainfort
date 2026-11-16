@@ -50,7 +50,7 @@
 //! | dir | kind | message | payload after `auth` | reply |
 //! |---|---|---|---|---|
 //! | → | `0x01` | `CreateUser` | `parent:[16] ‖ sam:bytes<256> ‖ upn:Option<bytes<1024>> ‖ description:Option<bytes<3072>>` | `Created` |
-//! | → | `0x02` | `CreateComputer` | `parent ‖ name:bytes<256> ‖ dns_host_name:bytes<2048> ‖ spn:Option<bytes<1024>>` | `Created` |
+//! | → | `0x02` | `CreateComputer` | `parent ‖ name:bytes<256> ‖ spn:Option<bytes<1024>>` (task PN6b: no `dns_host_name` — dird derives it) | `Created` |
 //! | → | `0x03` | `CreateGroup` | `parent ‖ sam:bytes<256> ‖ group_type:Option<u32>` | `Created` |
 //! | → | `0x04` | `CreateOu` | `parent ‖ name:bytes<256>` | `Created` |
 //! | → | `0x05` | `CreateContainer` | `parent ‖ name:bytes<256>` | `Created` |
@@ -102,6 +102,19 @@
 //! requester's AP-REQ and the approvers' `Approve` bind; dird recomputes the
 //! plan at the execution and refuses any difference (`PlanChanged`, wire
 //! `Conflict`).
+//!
+//! **`CreateComputer` names no host (task PN6b; docs/questions/Q-1036 item
+//! 1, decided A-182).** Its `dns_host_name` field left the layout of kind
+//! `0x02`: dird derives the dNSHostName, `<name>.<realm DNS name>`
+//! ([MS-ADTS] 3.1.1.5.3.1.1.2), so no client can supply one. The version
+//! stays 1 (docs/questions/Q-1045 item 1): the version is exact and never
+//! negotiated (docs/50 §3.3, D57), admind and dird are built from one
+//! workspace, and the precedents changed layouts under version 1 (A-148's
+//! retired approvals, MA2's planned kinds; A-183). A frame in the earlier
+//! layout cannot be read as the new one: the first octet of its
+//! `dns_host_name` length (≤ 2048, so `00`) reads as an absent `spn`, and
+//! at least four octets then trail — refused (`Malformed`, no trailing
+//! octet), never misread.
 //! `Fact := guid:[16] ‖ dn:seq<bytes<128>,64> ‖ class:bytes<64> ‖
 //! sid:Option<bytes<68>> ‖ tier:u8{0 Tier0, 1 Tier1, 2 Tier2,
 //! 3 Unclassified}`. `expires` is in seconds since 1970-01-01T00:00:00Z.

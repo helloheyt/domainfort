@@ -2043,6 +2043,59 @@ fn every_host_name_holder_names_its_own_host() {
     assert!(stored_keys(&txn, guid(170)).contains(&"dc01.example.test".to_owned()));
 }
 
+/// Task PN6b (docs/questions/Q-1036 item 1, decided A-182 — the root form
+/// of N6): the dNSHostName the online `CreateComputer` writes is derived by
+/// the checker from its own realm context, and it is exactly the value the
+/// checker's commit accepts — [MS-ADTS] 3.1.1.5.3.1.1.2
+/// ("computerName.fullDomainDnsName"), RFC 4120 §6.2.1 (lower case), RFC
+/// 1035 §2.3.1 (one label). A name in upper case gets its host in lower case
+/// and is written (its `HostName` key the same value); a computerName that is
+/// not one label has none (`Name`, the code N6 gives it — Q-1035 item 5); a
+/// checker with no namespace context derives nothing (`Fault::Namespace`,
+/// fail closed). Names are this project's test data.
+#[test]
+fn the_online_create_derives_the_host_name_n6_accepts() {
+    let ids = ids();
+    let t = TempStore::new("host-name-derived");
+    let mut txn = t.store.begin_write().unwrap();
+    drop(begin(&mut txn));
+    let inv = Invariants::new(&p1(), BTreeSet::new(), None, names()).unwrap();
+    for (n, (name, own)) in [
+        ("ws30", "ws30.example.test"),
+        ("WS31", "ws31.example.test"),
+        ("Ws-32", "ws-32.example.test"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let derived = inv.own_host_name(&format!("{name}$")).unwrap();
+        assert_eq!(derived, own, "{name}");
+        let g = guid(180 + u8::try_from(n).unwrap());
+        write(
+            &inv,
+            &mut txn,
+            online_computer(&ids, g, name, &derived, None),
+            None,
+        )
+        .unwrap();
+        assert!(stored_keys(&txn, g).contains(&own.to_owned()), "{name}");
+    }
+    for name in ["1ws", "w_s", "w.s", "ws-"] {
+        assert!(
+            matches!(
+                inv.own_host_name(&format!("{name}$")),
+                Err(Refused::Rule(InvariantViolation::Name))
+            ),
+            "{name}"
+        );
+    }
+    let without = Invariants::new(&p1(), BTreeSet::new(), None, None).unwrap();
+    assert!(matches!(
+        without.own_host_name("ws30$"),
+        Err(Refused::Fault(Fault::Namespace))
+    ));
+}
+
 /// Task PN6; docs/59 §4.3, §4.4 N6; docs/questions/Q-1010 item 3 (decided
 /// A-173: "the provisioned service objects keep dNSHostName = dc_fqdn and
 /// claim no `HostName` key; the session checker requires it to equal the DC

@@ -1010,9 +1010,10 @@ code_table! {
 
 code_table! {
     /// Which name a [`crate::TargetName`] is: the name fields of the
-    /// `dird-admin.sock` requests (docs/51 §7.3: `sam`, `upn`, `name`,
-    /// `dns_host_name`, `spn`, and `dn` for `Lookup`), by the attribute they
-    /// name in docs/51 §11. `PolicyChange` (appended by task A16): one
+    /// `dird-admin.sock` requests (docs/51 §7.3: `sam`, `upn`, `name`, `spn`,
+    /// and `dn` for `Lookup`) and the dNSHostName a `CreateComputer` derives
+    /// (A-184 — not a request field), by the attribute they name in docs/51
+    /// §11. `PolicyChange` (appended by task A16): one
     /// tier-map change of a `ChangePolicy` request, in the command-line
     /// spelling of `provision policy` (`--add-principal <SID> <TierN>`, …;
     /// crate policy-store module `edit`) — SIDs and DNs only, not secret

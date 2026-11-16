@@ -72,7 +72,6 @@ fn bare_operations() -> Vec<Operation> {
         Operation::CreateComputer {
             parent: guid(2),
             name: "ws02".into(),
-            dns_host_name: "ws02.example.test".into(),
             spn: None,
         },
         Operation::CreateGroup {

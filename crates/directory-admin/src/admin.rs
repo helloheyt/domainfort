@@ -651,7 +651,8 @@ enum NewObject<'r> {
     Container(&'r CreateContainerLike),
 }
 
-/// The values a create determines from the request alone.
+/// The values a create determines from the request alone (and, for a
+/// computer's dNSHostName, the checker's realm context — task PN6b).
 struct NewValues {
     class: ClassIds,
     /// The RDN value (cn / ou), for the name check under the parent.
@@ -659,6 +660,9 @@ struct NewValues {
     attributes: Vec<(AttrId, Vec<Vec<u8>>)>,
     /// A security principal: gets a RID and an objectSid.
     principal: bool,
+    /// A computer's derived dNSHostName (the value in `attributes`), for
+    /// the decision event: the request names no host (task PN6b).
+    derived_host_name: Option<String>,
 }
 
 impl<R: RandomSource> DirectoryAdmin<R> {
@@ -810,6 +814,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                     rdn: c.sam.clone(),
                     attributes,
                     principal: true,
+                    derived_host_name: None,
                 }
             }
             // CreateComputer: sAMAccountName = name ‖ "$", UAC = WT|D (ST is
@@ -820,10 +825,19 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                 if !names::computer_name_ok(&c.name) {
                     return Err(invalid_name);
                 }
-                if !names::dns_host_name_ok(&c.dns_host_name) {
-                    return Err(invalid_value);
-                }
                 let sam = names::computer_sam(&c.name);
+                // dNSHostName = `<name>.<realm DNS name>`, derived — never
+                // taken from the request (task PN6b; Q-1036 item 1, A-182:
+                // the root form of rule N6, [MS-ADTS] 3.1.1.5.3.1.1.2) —
+                // by the checker from the realm context it judges the
+                // create in, so `keys_of_new` below and the commit's
+                // `check_create` accept exactly this value. A computerName
+                // with no host name (not one RFC 1035 label) ⇒
+                // `AccountNameInvalid` (Q-1035 item 5).
+                let dns_host_name = self
+                    .invariants
+                    .own_host_name(&sam)
+                    .map_err(invariant_stop)?;
                 let mut attributes = vec![
                     (ids.cn, text(&c.name)),
                     (ids.sam_account_name, text(&sam)),
@@ -837,10 +851,11 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                         ids.account_expires,
                         vec![record::encode_int64(ACCOUNT_EXPIRES_NEVER)],
                     ),
-                    (ids.dns_host_name, text(&c.dns_host_name)),
+                    (ids.dns_host_name, text(&dns_host_name)),
                 ];
+                // The SPN's host is the derived dNSHostName (Q-355 item 3).
                 if let Some(spn) = &c.spn {
-                    if !names::spn_ok(spn, &c.dns_host_name) {
+                    if !names::spn_ok(spn, &dns_host_name) {
                         return Err(invalid_value);
                     }
                     attributes.push((ids.service_principal_name, text(spn)));
@@ -850,6 +865,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                     rdn: c.name.clone(),
                     attributes,
                     principal: true,
+                    derived_host_name: Some(dns_host_name),
                 }
             }
             // CreateGroup: groupType one of the six phase-1 values, default
@@ -877,6 +893,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                         (ids.group_type, vec![record::encode_flags(group_type)]),
                     ],
                     principal: true,
+                    derived_host_name: None,
                 }
             }
             NewObject::Ou(c) => {
@@ -888,6 +905,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                     rdn: c.name.clone(),
                     attributes: vec![(ids.ou, text(&c.name))],
                     principal: false,
+                    derived_host_name: None,
                 }
             }
             NewObject::Container(c) => {
@@ -899,6 +917,7 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                     rdn: c.name.clone(),
                     attributes: vec![(ids.cn, text(&c.name))],
                     principal: false,
+                    derived_host_name: None,
                 }
             }
         })
@@ -916,6 +935,12 @@ impl<R: RandomSource> DirectoryAdmin<R> {
     ) -> Result<Handled, Stop> {
         let cx = ctx.cx;
         let values = self.new_values(new)?;
+        // The decision event names the dNSHostName the create will write —
+        // the derived value, which the request no longer carries (task PN6b;
+        // docs/questions/Q-1044 item 5).
+        if let Some(host) = &values.derived_host_name {
+            base.derived_host_name(host);
+        }
         let parent_guid = match new {
             NewObject::User(c) => c.parent,
             NewObject::Computer(c) => c.parent,

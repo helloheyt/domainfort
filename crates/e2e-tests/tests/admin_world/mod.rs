@@ -846,7 +846,6 @@ fn workstation_fixture(plan: &Plan, input: &DomainInput, uid: u32) -> Workstatio
     let guid = match run(PepOperation::CreateComputer(CreateComputer {
         parent: workstations,
         name: WORKSTATION.into(),
-        dns_host_name: format!("{WORKSTATION}.example.org"),
         spn: None,
     })) {
         PepReply::Created { guid, .. } => guid,

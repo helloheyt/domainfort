@@ -17,9 +17,9 @@ use ipc::{
     round_trip_is_canonical, Direction, FrameReader, Refused, REFUSED_KIND,
 };
 use ipc_dird_admin::channel::{
-    request_kind, MAX_AP_REQ, MAX_DESCRIPTION, MAX_DNS_HOST_NAME, MAX_DN_COMPONENT,
-    MAX_DN_COMPONENTS, MAX_FACTS, MAX_LISTED_REQUESTS, MAX_NAME, MAX_POLICY_CHANGES,
-    MAX_POLICY_DN_COMPONENTS, MAX_PRINCIPAL_NAME, MAX_REASON_REF, MAX_SID,
+    request_kind, MAX_AP_REQ, MAX_DESCRIPTION, MAX_DN_COMPONENT, MAX_DN_COMPONENTS, MAX_FACTS,
+    MAX_LISTED_REQUESTS, MAX_NAME, MAX_POLICY_CHANGES, MAX_POLICY_DN_COMPONENTS,
+    MAX_PRINCIPAL_NAME, MAX_REASON_REF, MAX_SID,
 };
 use ipc_dird_admin::{
     decode_request, encode_reply, AccountExpires, AccountKind, AdminReply, AdminRequest, Auth,
@@ -144,13 +144,11 @@ fn requests() -> Vec<Request> {
         op(Operation::CreateComputer {
             parent: guid(2),
             name: "ws02".into(),
-            dns_host_name: "ws02.example.test".into(),
             spn: Some("host/ws02.example.test".into()),
         }),
         op(Operation::CreateComputer {
             parent: guid(2),
             name: "ws03".into(),
-            dns_host_name: "ws03.example.test".into(),
             spn: None,
         }),
         op(Operation::CreateGroup {
@@ -856,6 +854,53 @@ fn in_request_approvals_are_retired() {
     }
 }
 
+/// Task PN6b (docs/questions/Q-1036 item 1, decided A-182; Q-1045 item 1):
+/// `CreateComputer` carries no dNSHostName — dird derives it ([MS-ADTS]
+/// 3.1.1.5.3.1.1.2). Its payload after `auth` is exactly `parent:[16] ‖
+/// name:bytes<256> ‖ spn:Option<bytes<1024>>` (docs/50 §3.3 primitives:
+/// `bytes` = u32 length ‖ octets, `Option` = `00` | `01 T`), with or
+/// without the SPN — the field set the fuzz target `ipc_dird_admin_request`
+/// pins with the same formula. A frame in the layout before PN6b (a
+/// `dns_host_name:bytes<2048>` between `name` and `spn`) is refused
+/// `Malformed` — never read as another request: the first octet of its
+/// length reads as an absent SPN and the rest trails (docs/50 §3.3: no
+/// trailing octet). Values are this project's test data.
+#[test]
+fn create_computer_names_no_host() {
+    let auth_octets = 4 + 300 + 4;
+    for spn in [None, Some("host/ws02.example.test")] {
+        let request = op(Operation::CreateComputer {
+            parent: guid(2),
+            name: "ws02".into(),
+            spn: spn.map(str::to_owned),
+        });
+        let body = request_body(&request);
+        let expected =
+            4 + auth_octets + 16 + (4 + "ws02".len()) + spn.map_or(1, |s| 1 + 4 + s.len());
+        assert_eq!(body.len(), expected, "{spn:?}");
+        // parent ‖ name, then the SPN's marker — nothing in between.
+        let name_at = 4 + auth_octets + 16;
+        assert_eq!(&body[name_at..name_at + 4], &4u32.to_be_bytes());
+        assert_eq!(&body[name_at + 4..name_at + 8], b"ws02");
+        assert_eq!(body[name_at + 8], u8::from(spn.is_some()));
+        assert_eq!(decode_request(&body).unwrap(), request);
+
+        // The layout before PN6b: a dNSHostName after the name.
+        for host in ["ws02.example.test", "", &"h".repeat(2048)] {
+            let mut old = body[..name_at + 8].to_vec();
+            old.extend(u32::try_from(host.len()).unwrap().to_be_bytes());
+            old.extend(host.as_bytes());
+            old.extend(&body[name_at + 8..]);
+            assert_eq!(
+                decode_request(&old),
+                Err(Rejection::Refuse(Refused::Malformed)),
+                "{spn:?} {}",
+                host.len()
+            );
+        }
+    }
+}
+
 /// The `bytes<max>` bound of `field` in `make(len)`: `max` octets pass,
 /// `max + 1` are refused on encoding and, built by hand, on decoding.
 fn check_bound(max: u32, make: impl Fn(usize) -> Request) {
@@ -907,19 +952,10 @@ fn every_field_bound() {
             description: Some(ascii(n)),
         })
     });
-    check_bound(MAX_DNS_HOST_NAME, |n| {
-        op(Operation::CreateComputer {
-            parent: guid(1),
-            name: "x".into(),
-            dns_host_name: ascii(n),
-            spn: None,
-        })
-    });
     check_bound(MAX_PRINCIPAL_NAME, |n| {
         op(Operation::CreateComputer {
             parent: guid(1),
             name: "x".into(),
-            dns_host_name: "x".into(),
             spn: Some(ascii(n)),
         })
     });

@@ -16,8 +16,9 @@
 //!   realm alias as an account name (`AccountNameInvalid`) — refused at
 //!   `prepare`.
 //! - A computer names only its own host, `<computerName>.<realm DNS name>`
-//!   (task PN6, rule N6): another host is `ValueInvalid`, a computerName
-//!   that is no DNS label `AccountNameInvalid` — at `prepare`.
+//!   (task PN6, rule N6) — derived since task PN6b, never taken from the
+//!   request: an SPN on another host is `ValueInvalid`, a computerName that
+//!   is no DNS label `AccountNameInvalid` — at `prepare`.
 //! - A create stores exactly the keys its names produce (docs/59 N7).
 //! - `Lookup` finds by one namespace probe and the exact stored value (R47-1
 //!   kept); an object written beneath the checker without keys is not found
@@ -40,7 +41,7 @@ use directory_admin::{
     RefusalStatus, Reply,
 };
 use dirstore::{NewObject, Origin};
-use ipc_audit::{AdminRefusal, DecisionResult, DirAdminStage};
+use ipc_audit::{AdminNameKind, AdminRefusal, DecisionResult, DirAdminStage};
 
 /// The refusal code of a `prepare` refusal.
 fn refusal_code(r: &directory_admin::Refusal) -> AdminRefusal {
@@ -59,11 +60,12 @@ fn create_user(parent: u32, sam: &str, upn: Option<&str>) -> Operation {
     })
 }
 
-fn create_computer(parent: u32, name: &str, host: &str, spn: Option<&str>) -> Operation {
+/// A `CreateComputer`: no dNSHostName — the PEP derives
+/// `<name>.<realm DNS name>` (task PN6b; docs/questions/Q-1036 item 1).
+fn create_computer(parent: u32, name: &str, spn: Option<&str>) -> Operation {
     Operation::CreateComputer(CreateComputer {
         parent: guid(parent),
         name: name.to_owned(),
-        dns_host_name: host.to_owned(),
         spn: spn.map(str::to_owned),
     })
 }
@@ -115,7 +117,7 @@ fn a_name_taken_in_any_form_is_a_conflict() {
     let before = change_seq(&d);
     let taken = [
         // noPac's shape: the computer `bob$` — base name `bob`, the user's.
-        create_computer(MANAGED_OU, "bob", "bob.example.test", None),
+        create_computer(MANAGED_OU, "bob", None),
         // The reverse: a user named like the computer `ws01$`'s base name.
         create_user(MANAGED_OU, "ws01", None),
         create_user(MANAGED_OU, "WS01", None),
@@ -129,8 +131,9 @@ fn a_name_taken_in_any_form_is_a_conflict() {
         create_user(MANAGED_OU, "dc01.example.test", None),
         // (A computer carrying the LDAP service object's SPN in another case
         // — on the DC's host — was a `Conflict` here until task PN6; it now
-        // names a host not its own, refused as a value before any key is
-        // probed: `create_computer_names_only_its_own_host`.)
+        // names a host not its own (its own is derived — PN6b), refused as a
+        // value before any key is probed:
+        // `create_computer_names_only_its_own_host`.)
     ];
     for op in taken {
         let r = d.run(op.clone(), "admin1", &[]).refused();
@@ -160,70 +163,83 @@ fn a_name_taken_in_any_form_is_a_conflict() {
     assert_eq!(keys_of(&d, created(applied.reply())), ["carol"]);
 }
 
-/// Task PN6, rule N6 (docs/59 §4.4, §10.1: "dNSHostName = `<base>.<realm>`;
-/// other ⇒ refused"); [MS-ADTS] 3.1.1.5.3.1.1.2 ("computerName.
-/// fullDomainDnsName, where computerName is the current sAMAccountName of
-/// the object (without the final "$" character)"); RFC 1035 §2.3.1 (one
-/// label: a letter first, letters, digits and hyphen); docs/54 §5.3;
-/// docs/questions/Q-994 item 1, Q-1010 items 1-2: `CreateComputer` names
-/// only the computer's own host. A dNSHostName naming another host — the
-/// DC's (with the LDAP service object's SPN in another case: a `Conflict`
-/// before task PN6, now a value refused before any key is probed), another
-/// computer's, another domain, the realm itself, a bare label — is
-/// `ValueInvalid` at `prepare`; a computerName that is not one RFC 1035
-/// label (digit first, "_", ".") has no host name at all
-/// (`AccountNameInvalid`). Nothing is written. Its own host, with the name
-/// in another case, is created, and the host is one of its keys.
+/// Tasks PN6 / PN6b, rule N6 (docs/59 §4.4, §10.1: "dNSHostName =
+/// `<base>.<realm>`; other ⇒ refused"); [MS-ADTS] 3.1.1.5.3.1.1.2
+/// ("computerName.fullDomainDnsName, where computerName is the current
+/// sAMAccountName of the object (without the final "$" character)"); RFC
+/// 1035 §2.3.1 (one label: a letter first, letters, digits and hyphen); RFC
+/// 4120 §6.2.1 (the host "MUST be lowercase"); docs/54 §5.3; docs/questions/
+/// Q-994 item 1, Q-1010 items 1-2, Q-1036 item 1 (A-182: derive, do not
+/// take): `CreateComputer` names only the computer's own host — it carries
+/// no dNSHostName, so the only way left to name another host is the SPN's
+/// host part. An SPN on another host — the DC's (the LDAP service object's
+/// SPN in another case: a `Conflict` before task PN6), another computer's,
+/// another domain, the realm itself, a bare label — is `ValueInvalid` at
+/// `prepare`; a computerName that is not one RFC 1035 label (digit first,
+/// "_", ".") has no host name at all (`AccountNameInvalid`). Nothing is
+/// written. A computer named in upper case gets its host derived in lower
+/// case, stored, keyed and named in the decision event (the request names
+/// none).
 #[test]
 fn create_computer_names_only_its_own_host() {
     let mut d = Domain::new("namespace-host-name");
     let before = change_seq(&d);
-    let other_hosts = [
-        create_computer(
-            MANAGED_OU,
-            "ws20",
-            "dc01.example.test",
-            Some("LDAP/dc01.example.test"),
-        ),
-        create_computer(MANAGED_OU, "ws20", "dc01.example.test", None),
-        create_computer(MANAGED_OU, "ws20", "ws01.example.test", None),
-        create_computer(MANAGED_OU, "ws20", "ws20.other.test", None),
-        create_computer(MANAGED_OU, "ws20", "example.test", None),
-        create_computer(MANAGED_OU, "ws20", "ws20", None),
-    ];
-    for op in other_hosts {
+    for spn in [
+        "LDAP/dc01.example.test",
+        "host/dc01.example.test",
+        "host/ws01.example.test",
+        "host/ws20.other.test",
+        "host/example.test",
+        "host/ws20",
+    ] {
+        let op = create_computer(MANAGED_OU, "ws20", Some(spn));
         let r = d.run(op.clone(), "admin1", &[]).refused();
         assert_eq!(refusal_code(&r), AdminRefusal::ValueInvalid, "{op:?}");
     }
-    for (name, host) in [
-        ("1ws", "1ws.example.test"),
-        ("w_s", "w_s.example.test"),
-        ("w.s", "w.s.example.test"),
-    ] {
-        let op = create_computer(MANAGED_OU, name, host, None);
+    for name in ["1ws", "w_s", "w.s"] {
+        let op = create_computer(MANAGED_OU, name, None);
         let r = d.run(op.clone(), "admin1", &[]).refused();
         assert_eq!(refusal_code(&r), AdminRefusal::AccountNameInvalid, "{op:?}");
     }
     assert_eq!(change_seq(&d), before, "nothing written");
-    let (_, applied) = d
+    let (decision, applied) = d
         .run(
-            create_computer(
-                MANAGED_OU,
-                "WS20",
-                "ws20.example.test",
-                Some("host/ws20.example.test"),
-            ),
+            create_computer(MANAGED_OU, "WS20", Some("host/ws20.example.test")),
             "admin1",
             &[],
         )
         .applied();
+    let ws20 = created(applied.reply());
     assert_eq!(
-        keys_of(&d, created(applied.reply())),
+        keys_of(&d, ws20),
         [
             "host/ws20.example.test",
             "ws20",
             "ws20$",
             "ws20.example.test"
+        ]
+    );
+    let stored = d.object(ws20).unwrap();
+    assert_eq!(
+        stored.attribute(d.attr("dNSHostName")).unwrap().values[0].value,
+        b"ws20.example.test"
+    );
+    // The decision event names the derived host after the request's names.
+    let names: Vec<(AdminNameKind, Option<&str>)> = decision
+        .names
+        .as_slice()
+        .iter()
+        .map(|n| (n.kind, n.text.as_text()))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            (AdminNameKind::Name, Some("WS20")),
+            (
+                AdminNameKind::ServicePrincipalName,
+                Some("host/ws20.example.test")
+            ),
+            (AdminNameKind::DnsHostName, Some("ws20.example.test")),
         ]
     );
 }
@@ -242,19 +258,12 @@ fn reserved_names_in_any_case_are_refused() {
     let mut d = Domain::new("namespace-reserved");
     let before = change_seq(&d);
     let invalid_values = [
-        create_computer(
-            STAFF_OU,
-            "ws21",
-            "ws21.example.test",
-            Some("ADMIND/ws21.example.test"),
-        ),
-        create_computer(
-            STAFF_OU,
-            "ws21",
-            "ws21.example.test",
-            Some("KRBTGT/ws21.example.test"),
-        ),
-        create_computer(STAFF_OU, "ws21", "changepw", Some("KADMIN/changepw")),
+        create_computer(STAFF_OU, "ws21", Some("ADMIND/ws21.example.test")),
+        create_computer(STAFF_OU, "ws21", Some("KRBTGT/ws21.example.test")),
+        // Since task PN6b the host part must be the derived
+        // ws21.example.test, so this is refused by the SPN host rule before
+        // the folded reservation is asked (both are `ValueInvalid`).
+        create_computer(STAFF_OU, "ws21", Some("KADMIN/changepw")),
         create_user(STAFF_OU, "carol", Some("carol@foreign.example")),
     ];
     for op in invalid_values {
@@ -265,7 +274,7 @@ fn reserved_names_in_any_case_are_refused() {
         create_user(STAFF_OU, "KrbTgt", None),
         create_user(STAFF_OU, "Example.Test", None),
         create_group(STAFF_OU, "KRBTGT"),
-        create_computer(STAFF_OU, "Krbtgt", "krbtgt.example.test", None),
+        create_computer(STAFF_OU, "Krbtgt", None),
         create_user(STAFF_OU, "a@b", None),
     ];
     for op in invalid_names {
@@ -294,12 +303,7 @@ fn a_create_stores_the_keys_its_names_produce() {
     );
     let ws22 = create(
         &mut d,
-        create_computer(
-            STAFF_OU,
-            "ws22",
-            "ws22.example.test",
-            Some("HOST/ws22.example.test"),
-        ),
+        create_computer(STAFF_OU, "ws22", Some("HOST/ws22.example.test")),
     );
     let grp = create(&mut d, create_group(STAFF_OU, "Grp1"));
     let ou = create(

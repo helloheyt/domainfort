@@ -34,12 +34,13 @@ fn refusal_code(r: &directory_admin::Refusal) -> AdminRefusal {
     }
 }
 
+/// A computer with the SPN `<class>/<its host>`; its host is derived as
+/// `<name>.example.test` (task PN6b — the request names none).
 fn create_computer(name: &str, class: &str) -> Operation {
     let host = format!("{name}.example.test");
     Operation::CreateComputer(CreateComputer {
         parent: guid(STAFF_OU),
         name: name.into(),
-        dns_host_name: host.clone(),
         spn: Some(format!("{class}/{host}")),
     })
 }

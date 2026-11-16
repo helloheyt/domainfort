@@ -1800,7 +1800,6 @@ fn every_operation_end_to_end() {
                 Operation::CreateComputer {
                     parent: g(STAFF_OU),
                     name: "ws9".into(),
-                    dns_host_name: "ws9.example.org".into(),
                     spn: Some("host/ws9.example.org".into()),
                 },
             )
@@ -4149,7 +4148,6 @@ fn lost_destroy_decisions_are_registered_again_until_keyd_ran_them() {
                 Operation::CreateComputer {
                     parent: g(STAFF_OU),
                     name: "ws7".into(),
-                    dns_host_name: "ws7.example.org".into(),
                     spn: Some("host/ws7.example.org".into()),
                 },
             )

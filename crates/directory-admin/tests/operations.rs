@@ -103,7 +103,9 @@ fn create_user_writes_the_object_the_spec_describes() {
 }
 
 /// docs/51 §5.2 rows 2-4: a computer (sAMAccountName = name ‖ "$", cn =
-/// name, UAC = WT|D, one SPN), a group (default groupType 0x80000002 —
+/// name, UAC = WT|D, one SPN, and the dNSHostName derived as
+/// `<name>.<realm DNS name>` — task PN6b, [MS-ADTS] 3.1.1.5.3.1.1.2 — the
+/// request names none), a group (default groupType 0x80000002 —
 /// [MS-SAMR] 3.1.1.8.1 item 2.2 — or one of the six), an OU and a
 /// container; RIDs only for the principals (docs/51 §8.3).
 #[test]
@@ -112,7 +114,6 @@ fn create_computer_group_ou_and_container() {
     let computer = Operation::CreateComputer(CreateComputer {
         parent: guid(STAFF_OU),
         name: "ws02".into(),
-        dns_host_name: "ws02.example.test".into(),
         spn: Some("host/ws02.example.test".into()),
     });
     let (_, applied) = d.run(computer, "admin1", &[]).applied();
@@ -295,8 +296,9 @@ fn account_name_rules_are_enforced() {
     let ok = d.run(create_user(STAFF_OU, "abcdefghijklmnopqrst"), "admin1", &[]);
     assert!(matches!(ok, Ran::Applied { .. }));
     // A computer: 19 + "$" = 20 is the most; a name ending in "$" is not a
-    // single "$" (item 11). Each on its own host (task PN6, rule N6:
-    // `<computerName>.<realm DNS name>` — [MS-ADTS] 3.1.1.5.3.1.1.2).
+    // single "$" (item 11). Each gets its own host, derived (tasks PN6 /
+    // PN6b, rule N6: `<computerName>.<realm DNS name>` — [MS-ADTS]
+    // 3.1.1.5.3.1.1.2).
     for (name, accepted) in [
         ("w234567890123456789", true),
         ("w2345678901234567890", false),
@@ -305,7 +307,6 @@ fn account_name_rules_are_enforced() {
         let op = Operation::CreateComputer(CreateComputer {
             parent: guid(STAFF_OU),
             name: name.into(),
-            dns_host_name: format!("{name}.example.test"),
             spn: None,
         });
         let ran = d.run(op, "admin1", &[]);
@@ -334,8 +335,9 @@ fn account_name_rules_are_enforced() {
 /// [MS-SAMR] 3.1.1.8.4 item 2 (sAMAccountName unique in the domain; the
 /// index folds A-Z, Q-080), docs/46 §8.5 (UPN, SPN unique), §8.3 item 3
 /// (one RDN per parent) — refused before anything is written. Since task
-/// PN6 (docs/59 §4.4 N6) a computer's SPN host is its own host, so another
-/// computer's SPN is a value refusal, not a conflict.
+/// PN6 (docs/59 §4.4 N6) a computer's SPN host is its own host — since
+/// PN6b the derived `<name>.<realm>` — so another computer's SPN is a value
+/// refusal, not a conflict.
 #[test]
 fn values_already_taken_are_conflicts() {
     let mut d = Domain::new("unique");
@@ -361,26 +363,24 @@ fn values_already_taken_are_conflicts() {
         refusal_code(&d.run(second, "admin1", &[]).refused()),
         AdminRefusal::Conflict
     );
-    // A computer named like ws01 in another case: its base name, host name
-    // and SPN are all ws01's.
+    // A computer named like ws01 in another case: its base name, derived
+    // host name and SPN are all ws01's.
     let computer_taken = Operation::CreateComputer(CreateComputer {
         parent: guid(MANAGED_OU),
         name: "WS01".into(),
-        dns_host_name: "ws01.example.test".into(),
         spn: Some("host/ws01.example.test".into()),
     });
     assert_eq!(
         refusal_code(&d.run(computer_taken, "admin1", &[]).refused()),
         AdminRefusal::Conflict
     );
-    // ws01's SPN on another computer: since task PN6 its dNSHostName (the
-    // SPN's host) names a host not its own (rule N6; [MS-ADTS]
+    // ws01's SPN on another computer: its host is not that computer's own
+    // (derived) dNSHostName (rule N6, task PN6b; [MS-ADTS]
     // 3.1.1.5.3.1.1.2) — refused as a value before any key is probed, so an
     // SPN of another computer's host never reaches the store.
     let spn_taken = Operation::CreateComputer(CreateComputer {
         parent: guid(STAFF_OU),
         name: "ws09".into(),
-        dns_host_name: "ws01.example.test".into(),
         spn: Some("host/ws01.example.test".into()),
     });
     assert_eq!(
@@ -400,8 +400,8 @@ fn values_already_taken_are_conflicts() {
 
 /// docs/51 §5.2 rows 2-3, §11: groupType only from the six phase-1 values
 /// (docs/46 §8.2); an SPN only `service/host` with the computer's own
-/// lower-case dNSHostName (RFC 4120 §6.2.1; Q-355 item 3); no "krbtgt"
-/// service (RFC 4120 §7.3).
+/// lower-case dNSHostName — derived since task PN6b — (RFC 4120 §6.2.1;
+/// Q-355 item 3); no "krbtgt" service (RFC 4120 §7.3).
 #[test]
 fn value_rules_are_enforced() {
     let mut d = Domain::new("values");
@@ -414,25 +414,23 @@ fn value_rules_are_enforced() {
         // (A-85, Q-340 item 5).
         assert_eq!(r.event().group_type, None);
     }
-    for (dns, spn) in [
-        ("WS09.example.test", None),
-        ("ws09.example.test", Some("host/ws08.example.test")),
-        ("ws09.example.test", Some("krbtgt/ws09.example.test")),
-        ("ws09.example.test", Some("host")),
-        ("ws 09.example.test", None),
+    // The computer's derived host is ws09.example.test (task PN6b): an SPN
+    // naming another host, the same host in upper case, a ":port" (PN16 —
+    // Q-1036 item 3), no host, or the reserved "krbtgt" service is refused.
+    for spn in [
+        "host/ws08.example.test",
+        "host/WS09.example.test",
+        "host/ws09.example.test:8080",
+        "krbtgt/ws09.example.test",
+        "host",
     ] {
         let op = Operation::CreateComputer(CreateComputer {
             parent: guid(STAFF_OU),
             name: "ws09".into(),
-            dns_host_name: dns.into(),
-            spn: spn.map(str::to_owned),
+            spn: Some(spn.to_owned()),
         });
         let r = d.run(op, "admin1", &[]).refused();
-        assert_eq!(
-            refusal_code(&r),
-            AdminRefusal::ValueInvalid,
-            "{dns} {spn:?}"
-        );
+        assert_eq!(refusal_code(&r), AdminRefusal::ValueInvalid, "{spn}");
     }
     // accountExpires 0 is refused (docs/51 §5.2 row 7; R47-5b).
     let op = Operation::SetAccountExpires(SetAccountExpires {

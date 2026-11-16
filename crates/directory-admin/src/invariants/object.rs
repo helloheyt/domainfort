@@ -71,7 +71,10 @@
 //! dNSHostName (`modifiable()`). The provisioned service objects carry the
 //! DC account's host name without its key (`keys_of_names`, Q-1010 item 3):
 //! the provisioning session binds them to the DC account's value (module
-//! `provisioning`).
+//! `provisioning`). **The root form (task PN6b; Q-1036 item 1, A-182):**
+//! `CreateComputer` carries no dNSHostName — the online create writes
+//! [`own_host_name`], the one value N6 admits, derived from the same realm
+//! DNS name; this rule stays the invariant of every write path.
 //!
 //! A host record (task DN6) is a state rule too ([`check_host_record`]):
 //! the internal host-address attribute (ad-schema `HOST_ADDRESS`) only on
@@ -508,10 +511,32 @@ fn check_host_name(
     }
     let sam = text(obj, ids.sam_account_name)?;
     let host = text(obj, ids.dns_host_name)?;
-    names::computer_host_name(sam, host, realm_dns_name(names)?).map_err(|refused| match refused {
+    names::computer_host_name(sam, host, realm_dns_name(names)?).map_err(host_name_violation)
+}
+
+/// The dNSHostName rule N6 gives a new computer whose sAMAccountName is
+/// `sam_account_name`, in the namespace of `names` (task PN6b; docs/
+/// questions/Q-1036 item 1, decided A-182): `names::own_host_name` over the
+/// same realm DNS name [`check_host_name`] compares with — so the value the
+/// online create derives is, by construction, the one this checker accepts
+/// at `prepare` and at the commit. `Name` when the computer has no host
+/// name, `Value` when it cannot be stored.
+/// Spec: [MS-ADTS] v20261026 3.1.1.5.3.1.1.2; RFC 4120 §6.2.1; docs/59
+/// §4.4 N6; docs/questions/Q-1035 item 1, Q-1036 item 1.
+pub(super) fn own_host_name(sam_account_name: &str, names: &NameContext) -> Result<String, V> {
+    names::own_host_name(sam_account_name, realm_dns_name(names)?).map_err(host_name_violation)
+}
+
+/// N6's refusals as the checker reports them (Q-1035 item 5, confirmed
+/// A-182): the computer's own name gives no host name ⇒ `Name`; a value
+/// that names another host, or none that could be stored ⇒ `Value`.
+/// Spec: [MS-ADTS] 3.1.1.5.2.2 (a non-conforming dNSHostName ⇒
+/// ERROR_DS_INVALID_ATTRIBUTE_SYNTAX); docs/questions/Q-1035 item 5.
+fn host_name_violation(refused: HostNameRefused) -> V {
+    match refused {
         HostNameRefused::ComputerName => V::Name,
-        HostNameRefused::NotItsOwn => V::Value,
-    })
+        HostNameRefused::NotItsOwn | HostNameRefused::NotStorable => V::Value,
+    }
 }
 
 /// The realm's DNS name — the DNS name of the domain NC (A-53), the

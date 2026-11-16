@@ -34,6 +34,12 @@
 //! the DC account's host name without its key, are bound to the DC
 //! account's value by the provisioning session (Q-1010 item 3).
 //!
+//! **Derived, never taken** (task PN6b; docs/questions/Q-1036 item 1,
+//! A-182): `CreateComputer` carries no dNSHostName. The online create
+//! writes [`own_host_name`] — the one value N6 admits, built once and
+//! judged by the same `host_label` — so the request cannot name a host at
+//! all; N6 in the checker stays the invariant every write path keeps.
+//!
 //! Spec: [MS-SAMR] v20260427 3.1.1.6 items 8-13 (sAMAccountName); docs/51
 //! §11 (the table, decided A-79 / Q-298 item 1: ≤ 20 for user and computer
 //! including the "$", ≤ 256 for a group); docs/46 §5.4 (cn / ou 1..64
@@ -190,9 +196,10 @@ pub fn dns_host_name_ok(name: &str) -> bool {
 /// (`<subdomain> "." <label>`).
 const LABEL_SEPARATOR: char = '.';
 
-/// Why a computer's dNSHostName breaks rule N6 ([`computer_host_name`]).
-/// Names the rule, never a value.
-/// Spec: docs/59 §4.4 N6; docs/questions/Q-1010 item 1.
+/// Why a computer's dNSHostName breaks rule N6 ([`computer_host_name`]), or
+/// why no dNSHostName can be derived for it ([`own_host_name`]). Names the
+/// rule, never a value.
+/// Spec: docs/59 §4.4 N6; docs/questions/Q-1010 item 1, Q-1036 item 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HostNameRefused {
     /// The computer's own name gives no host name at all: its computerName
@@ -202,6 +209,53 @@ pub(crate) enum HostNameRefused {
     /// The dNSHostName is not `<computerName>.<realm DNS name>`: it names
     /// another host — a value rule.
     NotItsOwn,
+    /// `<computerName>.<realm DNS name>` passes N6 but is no storable
+    /// dNSHostName — beyond its 2048-octet bound or of a form
+    /// [`dns_host_name_ok`] refuses: the realm gives this computer no host
+    /// name it could store — a value rule. Only [`own_host_name`] reports
+    /// it ([`computer_host_name`] judges a value that already passed the
+    /// form rule).
+    NotStorable,
+}
+
+/// The one dNSHostName rule N6 admits for the computer whose sAMAccountName
+/// is `sam_account_name`, in the realm whose DNS name is `realm_dns_name`
+/// (task PN6b; docs/questions/Q-1036 item 1, decided A-182): the online
+/// create writes this value and never takes one from the request.
+///
+/// `<computerName>.<realm DNS name>` ([MS-ADTS] 3.1.1.5.3.1.1.2:
+/// "computerName.fullDomainDnsName, where computerName is the current
+/// sAMAccountName of the object (without the final "$" character), and the
+/// fullDomainDnsName is the DNS name of the domain NC"), built **only
+/// here** — [`computer_host_name`] builds no candidate of its own — and
+/// judged by directory-pip's `host_label`, the one host-name rule (class
+/// C49: no second copy of N6). Stored in the namespace fold
+/// (`principal_names::fold`: A-Z to a-z on printable ASCII, the comparison
+/// `host_label` is pinned to — `the_host_name_comparison_is_the_namespace_fold`),
+/// because the host component of a server name "MUST be lowercase" (RFC
+/// 4120 §6.2.1); and it must pass the stored form rule
+/// ([`dns_host_name_ok`]), so what is derived is what the checker accepts.
+///
+/// `ComputerName` when the computerName is not one RFC 1035 §2.3.1 label
+/// (no host name exists), `NotStorable` when the host name it would have
+/// cannot be stored.
+/// Spec: [MS-ADTS] v20261026 3.1.1.5.3.1.1.2; RFC 1035 §2.3.1; RFC 4120
+/// §6.2.1; docs/46 §5.4 (dNSHostName ≤ 2048); docs/54 §5.3; docs/59 §4.4
+/// N6, §4.5; docs/questions/Q-1010 item 1, Q-1035 items 1-2, Q-1036 item 1.
+pub(crate) fn own_host_name(
+    sam_account_name: &str,
+    realm_dns_name: &str,
+) -> Result<String, HostNameRefused> {
+    let candidate = sam_account_name
+        .strip_suffix(COMPUTER_SUFFIX)
+        .map(|computer_name| format!("{computer_name}{LABEL_SEPARATOR}{realm_dns_name}"))
+        .filter(|candidate| {
+            directory_pip::host_label(sam_account_name, candidate, realm_dns_name).is_some()
+        })
+        .ok_or(HostNameRefused::ComputerName)?;
+    principal_names::fold(&candidate)
+        .filter(|own| dns_host_name_ok(own))
+        .ok_or(HostNameRefused::NotStorable)
 }
 
 /// Rule N6 of the one principal namespace (task PN6; docs/59 §4.4): the
@@ -232,10 +286,11 @@ pub(crate) enum HostNameRefused {
 /// rules cannot disagree. The stored spelling stays lower case
 /// ([`dns_host_name_ok`]; RFC 4120 §6.2.1).
 ///
-/// The refusal is attributed (`HostNameRefused`): when not even
-/// `<computerName>.<realm DNS name>` would pass, the computer's name is at
-/// fault; otherwise the dNSHostName names another host. The candidate is
-/// built only to ask `host_label` again — it decides nothing itself.
+/// The refusal is attributed (`HostNameRefused`): when the computer has no
+/// host name at all ([`own_host_name`] refuses its computerName), the
+/// computer's name is at fault; otherwise the dNSHostName names another
+/// host. The own host name is asked for only to attribute the refusal — it
+/// decides nothing itself, and it is built in one place (task PN6b).
 /// Spec: [MS-ADTS] v20261026 3.1.1.5.3.1.1.2; RFC 1035 §2.3.1; docs/54
 /// §5.3; docs/59 §4.4 N6, §5.2; docs/questions/Q-614 item 3, Q-994 item 1,
 /// Q-1010 items 1-2, Q-1018 item 2 (N6 is the admin plane's rule).
@@ -247,16 +302,11 @@ pub(crate) fn computer_host_name(
     if directory_pip::host_label(sam_account_name, dns_host_name, realm_dns_name).is_some() {
         return Ok(());
     }
-    let own = sam_account_name
-        .strip_suffix(COMPUTER_SUFFIX)
-        .map(|computer_name| format!("{computer_name}{LABEL_SEPARATOR}{realm_dns_name}"));
-    match own {
-        Some(own)
-            if directory_pip::host_label(sam_account_name, &own, realm_dns_name).is_some() =>
-        {
+    match own_host_name(sam_account_name, realm_dns_name) {
+        Err(HostNameRefused::ComputerName) => Err(HostNameRefused::ComputerName),
+        Ok(_) | Err(HostNameRefused::NotItsOwn | HostNameRefused::NotStorable) => {
             Err(HostNameRefused::NotItsOwn)
         }
-        _ => Err(HostNameRefused::ComputerName),
     }
 }
 
@@ -486,6 +536,80 @@ mod tests {
         assert_eq!(
             computer_host_name(&long, &format!("{}.{realm}", "a".repeat(64)), realm),
             Err(HostNameRefused::ComputerName)
+        );
+    }
+
+    /// Task PN6b (docs/questions/Q-1036 item 1, A-182): the derived host
+    /// name is the one value N6 admits. [MS-ADTS] 3.1.1.5.3.1.1.2
+    /// ("computerName.fullDomainDnsName"); RFC 4120 §6.2.1 (the host
+    /// "MUST be lowercase" — stored in the namespace fold); RFC 1035
+    /// §2.3.1 (one label); docs/46 §5.4 (≤ 2048 octets). For every name:
+    /// `own_host_name` gives a value exactly when `computer_host_name` does
+    /// not refuse the name itself, that value is lower case, passes the
+    /// stored form rule and N6, and every other spelling of the same host
+    /// passes N6 too (case not significant) while no other host does. Names
+    /// are this project's test data.
+    #[test]
+    fn the_own_host_name_is_the_one_n6_admits() {
+        let realm = "example.test";
+        for (sam, own) in [
+            ("ws01$", "ws01.example.test"),
+            ("WS01$", "ws01.example.test"),
+            ("Ws-9$", "ws-9.example.test"),
+            ("a$", "a.example.test"),
+            ("w234567890123456789$", "w234567890123456789.example.test"),
+        ] {
+            assert_eq!(own_host_name(sam, realm).as_deref(), Ok(own), "{sam}");
+            assert!(dns_host_name_ok(own), "{own}");
+            assert_eq!(computer_host_name(sam, own, realm), Ok(()), "{sam}");
+            assert_eq!(
+                computer_host_name(sam, &own.to_ascii_uppercase(), realm),
+                Ok(()),
+                "{sam}"
+            );
+            assert_eq!(
+                computer_host_name(sam, &format!("x{own}"), realm),
+                Err(HostNameRefused::NotItsOwn),
+                "{sam}"
+            );
+        }
+        // The realm's spelling does not reach the stored value: it is folded.
+        assert_eq!(
+            own_host_name("ws01$", "EXAMPLE.Test").as_deref(),
+            Ok("ws01.example.test")
+        );
+        // No host name for a computerName that is not one label, or for a
+        // name without the final "$" — the same refusal N6 attributes.
+        for sam in [
+            "1ws$", "ws-$", "w_s$", "w s$", "w.s$", "*$", "_ldap$", "ws01", "$",
+        ] {
+            assert_eq!(
+                own_host_name(sam, realm),
+                Err(HostNameRefused::ComputerName),
+                "{sam}"
+            );
+            let host = format!("{}.{realm}", sam.trim_end_matches('$'));
+            assert_eq!(
+                computer_host_name(sam, &host, realm),
+                Err(HostNameRefused::ComputerName),
+                "{sam}"
+            );
+        }
+        // A realm that leaves no room for a storable host name (beyond the
+        // 2048-octet bound, or with a space the form rule refuses): nothing
+        // is derived, and N6 still says "not its own" for any stored value.
+        let long_realm = format!("{}.test", "r".repeat(2048));
+        assert_eq!(
+            own_host_name("ws01$", &long_realm),
+            Err(HostNameRefused::NotStorable)
+        );
+        assert_eq!(
+            computer_host_name("ws01$", "ws01.example.test", &long_realm),
+            Err(HostNameRefused::NotItsOwn)
+        );
+        assert_eq!(
+            own_host_name("ws01$", "exa mple.test"),
+            Err(HostNameRefused::NotStorable)
         );
     }
 
