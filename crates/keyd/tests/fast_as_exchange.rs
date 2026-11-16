@@ -184,7 +184,7 @@ fn issue(
     armor: &FastArmor,
     template: &AsTicketTemplate,
 ) -> Result<AsRepParts, IssueError> {
-    f.keyd.issue_as_rep(
+    f.keyd.issue_as(
         &KDC,
         &ALICE,
         &KRBTGT,
@@ -600,7 +600,7 @@ fn proof_is_bound_to_its_armor() {
     let (armor_d, key_d) = open_armor(&mut f, &tgt, 33);
     let proof_d = preauth(&mut f, &armor_d, &challenge(&key_d, &alice_key(), now())).unwrap();
     assert_eq!(
-        f.keyd.issue_as_rep(
+        f.keyd.issue_as(
             &KDC,
             &ALICE,
             &KRBTGT,

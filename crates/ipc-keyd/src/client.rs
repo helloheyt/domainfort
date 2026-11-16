@@ -128,12 +128,12 @@ use core::time::Duration;
 use ipc::{decode_reply, encode_frame, Direction, FrameLimit, Refused, Reply};
 use keyd_types::authz::{requires_acknowledged_intent, role_permits};
 use keyd_types::{
-    AccountKind, ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof,
-    ChangePasswordContext, ChangePasswordCtxId, ConfigDescription, CtxId, DecidedOperation,
-    DecisionId, DestructionPage, FastArmor, FastConversation, HostAddr, IssueError, KeyCustody,
-    KeyHandle, Kvno, Operation, OperationDigest, OperationTicket, PrincipalBinding, PrincipalId,
-    Role, SealedReply, ServiceContext, SetSecretTarget, TgsFastRequest, TgsRepParts,
-    TgsTicketTemplate, TgtContext,
+    AccountKind, ArmorId, AsRepParts, AsResolutions, AsTicketTemplate, AttestedNameResolution,
+    AuthnError, AuthnProof, ChangePasswordContext, ChangePasswordCtxId, ConfigDescription, CtxId,
+    DecidedOperation, DecisionId, DestructionPage, FastArmor, FastConversation, HostAddr,
+    IssueError, KeyCustody, KeyHandle, Kvno, Operation, OperationDigest, OperationTicket,
+    PrincipalBinding, PrincipalId, Role, SealedReply, ServiceContext, SetSecretTarget,
+    TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext,
 };
 use krb_proto::{
     ApReq, EncryptedData, KerberosTime, KrbError, KrbFastArmoredReq, NonZeroResultCode, PaData,
@@ -855,7 +855,9 @@ impl<C: Connector> KeydClient<C> {
         )
     }
 
-    /// docs/10 §4 `issue_as_rep`. Spec: docs/50 §3.4.
+    /// docs/10 §4 `issue_as_rep`, with dird's attested name resolutions as
+    /// the account records carried them (task PN11). Spec: docs/50 §3.4;
+    /// docs/59 §7.5.
     pub fn issue_as_rep(
         &mut self,
         client: &KeyHandle,
@@ -863,6 +865,7 @@ impl<C: Connector> KeydClient<C> {
         proof: &AuthnProof,
         armor: Option<ArmorId>,
         template: &AsTicketTemplate,
+        resolutions: AsResolutions<'_>,
     ) -> Result<AsRepParts, IssueError> {
         let call = Call::IssueAsRep {
             client: *client,
@@ -870,6 +873,8 @@ impl<C: Connector> KeydClient<C> {
             proof: proof.clone(),
             armor,
             template: template.clone(),
+            client_resolution: Box::new(resolutions.client.clone()),
+            server_resolution: resolutions.server.map(|r| Box::new(r.clone())),
         };
         self.issuance(
             call,
@@ -930,10 +935,12 @@ impl<C: Connector> KeydClient<C> {
         )
     }
 
-    /// docs/10 §5 `issue_tgs_rep`. Spec: docs/50 §3.4.
+    /// docs/10 §5 `issue_tgs_rep`, with dird's attested resolution of the
+    /// service's name (task PN11). Spec: docs/50 §3.4; docs/59 §7.5.
     pub fn issue_tgs_rep(
         &mut self,
         service: &KeyHandle,
+        service_resolution: &AttestedNameResolution,
         ctx: &CtxId,
         template: &TgsTicketTemplate,
     ) -> Result<TgsRepParts, IssueError> {
@@ -941,6 +948,7 @@ impl<C: Connector> KeydClient<C> {
             service: *service,
             ctx: *ctx,
             template: template.clone(),
+            service_resolution: Box::new(service_resolution.clone()),
         };
         self.issuance(
             call,
@@ -1440,10 +1448,11 @@ impl<C: Connector> KeyCustody for IpcKeyd<C> {
         proof: &AuthnProof,
         armor: Option<ArmorId>,
         template: &AsTicketTemplate,
+        resolutions: AsResolutions<'_>,
         _now: &KerberosTime,
     ) -> Result<AsRepParts, IssueError> {
         self.client
-            .issue_as_rep(client, krbtgt, proof, armor, template)
+            .issue_as_rep(client, krbtgt, proof, armor, template, resolutions)
     }
 
     fn open_fast_armor(
@@ -1472,11 +1481,13 @@ impl<C: Connector> KeyCustody for IpcKeyd<C> {
     fn issue_tgs_rep(
         &mut self,
         service: &KeyHandle,
+        service_resolution: &AttestedNameResolution,
         ctx: &CtxId,
         template: &TgsTicketTemplate,
         _now: &KerberosTime,
     ) -> Result<TgsRepParts, IssueError> {
-        self.client.issue_tgs_rep(service, ctx, template)
+        self.client
+            .issue_tgs_rep(service, service_resolution, ctx, template)
     }
 
     fn seal_fast_error(

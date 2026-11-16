@@ -21,12 +21,24 @@ pub const KEYD_MAGIC: u16 = 0x4B44;
 /// §12; D57.
 pub const KEYD_VERSION: u8 = 1;
 
-/// Request body bound: 80 KiB. Every byte or DER field of a keyd request is
+/// Request body bound: 80 KiB for the KDC-request part of a request, plus
+/// room for the two attested name resolutions an `issue_as_rep` can carry
+/// (task PN11) — 149 KiB in all (derived below: [`MAX_KDC_PART_BODY`] +
+/// 2 × [`LARGEST_RESOLUTION`] + the option marker, rounded up to whole KiB;
+/// checked at compile time). Every byte or DER field of a keyd request is
 /// part of one KDC request (at most `kdc::MAX_REQUEST_LEN` = 64 KiB) or a
-/// small structure the KDC builds (a KRB-ERROR, PA-DATA).
+/// small structure the KDC builds (a KRB-ERROR, PA-DATA) — except a
+/// resolution's canonical names, which come from dird's store, not from the
+/// request, so the 80 KiB of docs/50 §3.3 no longer bound them.
 /// Spec: docs/50 §3.3 ("keyd request ≤ 80 KiB"; "⚠ to be estimated" — see
-/// docs/questions/Q-245 item 6 for the armored TGS case).
-pub const MAX_REQUEST_BODY: u32 = 80 * 1024;
+/// docs/questions/Q-245 item 6 for the armored TGS case); docs/59 §7.5
+/// ("size bounds"); docs/questions/Q-1062 (the bound as built).
+pub const MAX_REQUEST_BODY: u32 = 149 * 1024;
+
+/// The KDC-request part of a request body: docs/50 §3.3's 80 KiB (every
+/// field a substring of one KDC request or a small structure the KDC
+/// builds). Spec: docs/50 §3.3.
+pub const MAX_KDC_PART_BODY: u32 = 80 * 1024;
 
 /// Reply body bound: 320 KiB (krb-proto bounds every encoding at 256 KiB).
 /// Spec: docs/50 §3.3 ("reply ≤ 320 KiB").
@@ -123,6 +135,18 @@ pub const ATTESTATION_KEY_OCTETS: usize = 32;
 /// Spec: docs/50 §3.3 (`bytes<max>` = `u32` length ≤ max + octets).
 pub const ATTESTATION_KEY_FIELD: u32 = ATTESTATION_KEY_OCTETS as u32;
 
+/// The bounds of an attested name resolution on this channel (task PN11):
+/// a realm (`MAX_RESOLUTION_REALM`), a `PrincipalName` DER
+/// (`MAX_RESOLUTION_NAME`) and the whole resolution's body
+/// (`LARGEST_RESOLUTION`) — defined once in crate keyd-types beside the
+/// bounds of `NameResolution` they are derived from, and used by this
+/// channel and the dird-kdc channel (crate ipc-directory, task PN10) alike:
+/// one resolution, one bound on both of its channels (A-190 on
+/// docs/questions/Q-1062 item 1).
+/// Spec: docs/59 §7.1, §7.5 ("size bounds"); crates/keyd-types
+/// `name_resolution.rs`; AGENTS.md §6.
+pub use keyd_types::{LARGEST_RESOLUTION, MAX_RESOLUTION_NAME, MAX_RESOLUTION_REALM};
+
 // The bounds agree with the values they are derived from; checked at compile
 // time, never at run time. Task K3 (docs/questions/Q-620 item 4): the bound
 // of a password on this channel is the bound of RFC 3244's `newpasswd`, so a
@@ -138,6 +162,18 @@ const _: () = assert!(MAX_REQUEST_FIELD < MAX_REQUEST_BODY);
 const _: () = assert!(MAX_REPLY_FIELD < MAX_REPLY_BODY);
 const _: () = assert!(ATTESTATION_KEY_FIELD as usize == ATTESTATION_KEY_OCTETS);
 const _: () = assert!(ATTESTATION_KEY_FIELD < MAX_REQUEST_FIELD);
+// Task PN11: a resolution's realm bound is keyd-types' (the derivation and
+// its own compile-time checks are keyd-types', A-190); the request body
+// holds the KDC-request part and two resolutions (the AS client's and the
+// change-password service's) with an option marker.
+const _: () = assert!(MAX_RESOLUTION_REALM as usize == keyd_types::sealed_store::MAX_NAME_OCTETS);
+const _: () = assert!(MAX_RESOLUTION_NAME < MAX_REQUEST_FIELD);
+// (`<` here: the KDC part, two resolutions and the one option-marker octet.)
+const _: () =
+    assert!(MAX_KDC_PART_BODY as usize + 2 * LARGEST_RESOLUTION < MAX_REQUEST_BODY as usize);
+const _: () = assert!(
+    (MAX_REQUEST_BODY as usize) < MAX_KDC_PART_BODY as usize + 2 * LARGEST_RESOLUTION + 1 + 1024
+);
 
 // ---- kinds -----------------------------------------------------------------
 

@@ -326,9 +326,12 @@ code_table! {
     /// code 96 — the first of keyd's five PN8 reasons in declaration order)
     /// was appended by task PN9 (docs/59 §7.5; docs/questions/Q-1033 item 4)
     /// the same way; `Unlisted` moved from 96 to 97. The four name-resolution
-    /// reasons that follow it in keyd (`AttestationKeyMissing` …
-    /// `NameResolutionMismatch`) come with the verification on the issuance
-    /// path (task PN11); until then they are recorded as `Unlisted`.
+    /// reasons that follow it in keyd (`AttestationKeyMissing`,
+    /// `NameResolutionInvalid`, `NameResolutionStale`,
+    /// `NameResolutionMismatch`, codes 97-100) and the seal's
+    /// `AttestationKeyNotInstalled` (code 101) were appended by task PN11
+    /// (docs/59 §7.5; docs/questions/Q-1033 item 4, Q-1056 item 4) the same
+    /// way, in keyd's declaration order; `Unlisted` moved from 97 to 102.
     /// Spec: crates/keyd audit.rs; docs/10 §9, §10, I8; docs/53 §9; docs/59
     /// §7.5.
     pub enum KeydReason {
@@ -428,6 +431,11 @@ code_table! {
         DecisionRevoked,
         DecisionExecuted,
         AttestationKeyInstalled,
+        AttestationKeyMissing,
+        NameResolutionInvalid,
+        NameResolutionStale,
+        NameResolutionMismatch,
+        AttestationKeyNotInstalled,
         Unlisted,
     }
 }

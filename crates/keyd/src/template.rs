@@ -6,25 +6,26 @@
 //! Failures are `BadTemplate` — the rules are public policy, nothing secret.
 //! The principal-name binding checks are authorization failures and are
 //! `Denied`: the creation rule here ([`check_new_binding`], whose proof is
-//! the only way to create a key set), and the use rule — a name must be the
-//! one the key set is bound to — in `StoredKeySet::bound_to` (crate::store,
-//! R7).
+//! the only way to create a key set), and the use rules — which name may be
+//! used with which key set — in the doors of `StoredKeySet` (crate::store,
+//! R7; since task PN11 issuance passes through dird's verified name
+//! resolution, `StoredKeySet::bound_by`).
 //!
 //! Spec: RFC 4120 2.1-2.6, 3.1.3, 3.3.3, 5.3, 5.4.1, 6.2, 7.3; docs/10 §4,
-//! §5; docs/questions/Q-040 (A-19).
+//! §5; docs/questions/Q-040 (A-19); docs/59 §4.2, §7.2, §7.3;
+//! docs/questions/Q-1061 item 1 (A-190: the creation rule judges the
+//! reserved names on the folded form).
 
 use crate::audit::AuditReason;
 use crate::config::TicketPolicy;
 use crate::error::{Deny, Internal};
 use crate::model::{KeyHandle, KeyPurpose, PrincipalBinding};
 use crate::time::{kerberos_time_seconds, within_skew};
-use keyd_types::{
-    is_admin_service_name, is_change_password_service_name,
-    CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS,
-};
+use keyd_types::CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS;
 use krb_proto::constants::KRB_NT_SRV_INST;
 use krb_proto::limits::MAX_NAME_COMPONENTS;
 use krb_proto::{KerberosFlags, KerberosString, KerberosTime, PrincipalName, Realm, TicketFlags};
+use principal_names::{key_of_request, reserved_name_of, NameContext, RequestKey, ReservedName};
 
 /// The first name component of every TGS principal. Spec: RFC 4120 7.3.
 const KRBTGT: &str = "krbtgt";
@@ -42,14 +43,6 @@ pub(crate) fn tgs_name(realm: &Realm) -> PrincipalName {
             Err(_) => Vec::new(),
         },
     }
-}
-
-/// `true` if `name` is a TGS name of any realm (first component
-/// "krbtgt"). Spec: RFC 4120 7.3.
-pub(crate) fn is_tgs_name(name: &PrincipalName) -> bool {
-    name.name_string
-        .first()
-        .is_some_and(|c| c.as_str() == KRBTGT)
 }
 
 /// The creation proof of a key set: a binding that passed the creation rule
@@ -77,24 +70,38 @@ impl NewBinding {
 /// created, and return its creation proof ([`NewBinding`]):
 /// - the realm is this keyd's realm (phase 1 is single-realm);
 /// - the name has 1..=MAX_NAME_COMPONENTS components (krb-proto's bound);
-/// - a Krbtgt key is bound to a two-part TGS name ("krbtgt", X), and no other
-///   key may be bound to a name starting with "krbtgt" (reserved for the
-///   TGS);
+/// - the name is a name of the one namespace, judged by crate
+///   principal-names — the namespace's own reading of a request's name
+///   (`key_of_request`) and its reserved-name predicate (`reserved_name_of`),
+///   both on the folded form (class C49; A-190 on Q-1061 item 1): a name no
+///   object can hold (`NoSuchPrincipal` — more than three components, an
+///   empty component, a "/" or an "@" inside one, a key equal to the realm's
+///   name, a non-printable octet) is bound to no key set;
+/// - a Krbtgt key is bound to a two-part TGS name ("krbtgt", X — any case),
+///   and no other key may be bound to a name starting with "krbtgt" (reserved
+///   for the TGS);
 /// - an AdminService key is bound to the admin service's two-part name
-///   (`admind`, host — `keyd_types::is_admin_service_name`), and no other
-///   key may be bound to such a name (R2: the same shape of reservation, for
-///   this project's own service);
-/// - a ChangePasswordService key is bound to exactly `kadmin/changepw`
-///   (`keyd_types::is_change_password_service_name`, RFC 3244 §2), and no
-///   other key may be bound to that name (task K3; docs/53 §5.2).
+///   (`admind`, host — any case), and no other key may be bound to such a
+///   name (R2: the same shape of reservation, for this project's own
+///   service);
+/// - a ChangePasswordService key is bound to `kadmin/changepw` (any case —
+///   RFC 3244 §2), and no other key may be bound to that name (task K3;
+///   docs/53 §5.2).
 ///
-/// Failure is `Denied` (reason `InvalidNameBinding`).
+/// So the creation rule and dird's writer share one definition of
+/// "reserved": a spelling the writer reserves (`KRBTGT/x`, `ADMIND/h`,
+/// `KADMIN/changepw`) is never bound to a plain Service or PrincipalLongterm
+/// key set either. Failure is `Denied` (reason `InvalidNameBinding`; a realm
+/// that forms no namespace — `WrongRealm`, as keyd's
+/// `Keyd::name_context` — fails closed).
 ///
 /// Spec: RFC 4120 6.2 ("Names of any type with an initial component of
 /// 'krbtgt' are reserved for the Kerberos ticket-granting service"), 7.3
 /// ("a two-part name ... with the first part 'krbtgt'"); docs/questions/
 /// Q-040 (A-19); A-73 (the admin service's name); docs/52 §5 item 3 (R2);
-/// docs/questions/Q-491.
+/// docs/questions/Q-491; docs/59 §3 (M3 = C49), §4.2 (the request table and
+/// the reserved-name predicates), §7.3 (`check_new_binding` stays the
+/// creation rule); docs/questions/Q-1009 items 1-2, Q-1061 item 1 (A-190).
 pub(crate) fn check_new_binding(
     realm: &Realm,
     handle: &KeyHandle,
@@ -109,25 +116,27 @@ pub(crate) fn check_new_binding(
     {
         return bad;
     }
-    let reserved = is_tgs_name(&binding.name);
-    // R2: the admin service's name is bound only to the admin service's key
-    // set, and that key set to nothing else — so a ticket for `admind/<host>`
-    // is never sealed or opened under a plain Service key (the binding check
-    // of every issuance and verification, A-19), and the KDC's purpose rule
-    // (`KeyPurpose::of_service_name`) is enforced here too.
-    let admin = is_admin_service_name(&binding.name);
-    // Task K3 (docs/53 §5.2, R53-6): the same reservation for the
-    // change-password service's name — so a kpasswd ticket is never sealed
-    // or opened under any other key set, and no other key set under its
-    // name.
-    let change_password = is_change_password_service_name(&binding.name);
+    let ctx =
+        NameContext::new(realm.as_str()).map_err(|_| Deny::denied(AuditReason::WrongRealm))?;
+    // The reserved name the binding spells, folded (docs/59 §4.2): the TGS's
+    // two-part names are `LocalTgs` (this realm) or `Foreign` (another —
+    // the realm itself is this keyd's, checked above), never a key; a key
+    // never begins with "krbtgt" (principal-names: `NoSuchPrincipal`).
+    let reserved = match key_of_request(&binding.name, &binding.realm, &ctx) {
+        RequestKey::LocalTgs | RequestKey::Foreign => Some(ReservedName::TicketGrantingService),
+        RequestKey::Key(key) => reserved_name_of(&key),
+        RequestKey::NoSuchPrincipal => return bad,
+    };
+    // R2 / task K3 (docs/53 §5.2, R53-6): each reserved name is bound only
+    // to its own purpose's key set, and that key set to nothing else — so a
+    // ticket for `krbtgt/…`, `admind/<host>` or `kadmin/changepw` is never
+    // sealed or opened under a plain Service key (the binding doors of every
+    // issuance and verification, A-19).
     let acceptable = match purpose {
-        KeyPurpose::Krbtgt => reserved && components == 2,
-        KeyPurpose::AdminService => admin,
-        KeyPurpose::ChangePasswordService => change_password,
-        KeyPurpose::PrincipalLongterm | KeyPurpose::Service => {
-            !reserved && !admin && !change_password
-        }
+        KeyPurpose::Krbtgt => reserved == Some(ReservedName::TicketGrantingService),
+        KeyPurpose::AdminService => reserved == Some(ReservedName::AdminService),
+        KeyPurpose::ChangePasswordService => reserved == Some(ReservedName::ChangePasswordService),
+        KeyPurpose::PrincipalLongterm | KeyPurpose::Service => reserved.is_none(),
     };
     if acceptable {
         Ok(NewBinding {
@@ -139,9 +148,11 @@ pub(crate) fn check_new_binding(
     }
 }
 
-// The check that an EXISTING key set is bound to a name — A-19 at every use
-// of a key — is no longer a function here: it is `StoredKeySet::bound_to`,
-// the only way to a stored key (crate::store, docs/52 §3.5, R7).
+// The checks that an EXISTING key set may be used for a name — A-19 at every
+// use of a key — are no longer functions here: they are the doors of
+// `StoredKeySet` (`bound_by`, `ticket_granting`, `accepting`, `bound_to`),
+// the only ways to a stored key (crate::store, docs/52 §3.5, R7; docs/59
+// §7.2).
 
 /// The bits set in both masks.
 fn intersect(a: TicketFlags, b: TicketFlags) -> TicketFlags {
@@ -515,6 +526,6 @@ mod tests {
         let n = tgs_name(&realm);
         assert_eq!(n.name_type, KRB_NT_SRV_INST);
         assert_eq!(n.name_string.len(), 2);
-        assert!(is_tgs_name(&n));
+        assert_eq!(n.name_string[0].as_str(), KRBTGT);
     }
 }

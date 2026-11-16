@@ -84,7 +84,7 @@ fn issue(
     };
     let rep = f
         .keyd
-        .issue_tgs_rep(&KDC, service, &ctx.ctx_id, &template, &now())
+        .issue_tgs(&KDC, service, &ctx.ctx_id, &template, &now())
         .unwrap();
     let part = EncTgsRepPart::decode(&open(&tgt.session, 8, &rep.enc_part)).unwrap();
     f.keyd.audit_sink_mut().records.clear();

@@ -195,18 +195,19 @@ fn keyd_operations_and_roles_match() {
     }
 }
 
-/// Task PN9 (docs/59 §7.5; docs/questions/Q-1033 item 4): the four
-/// name-resolution reasons keyd declares after `AttestationKeyInstalled`
-/// have no table entry yet — they are recorded as `Unlisted` (the table's
-/// rule for a `#[non_exhaustive]` source, crates/ipc-audit codes.rs) until
-/// the verification on the issuance path appends them (task PN11).
+/// Task PN11 (docs/59 §7.5; docs/questions/Q-1033 item 4, Q-1056 item 4):
+/// the four name-resolution reasons keyd reports on the issuance path, and
+/// the seal's refusal without the attestation key, map to their own
+/// same-named codes (97-101, appended in keyd's declaration order), never
+/// `Unlisted`.
 #[test]
-fn the_name_resolution_reasons_are_unlisted_until_pn11() {
-    for reason in [
-        keyd::AuditReason::AttestationKeyMissing,
-        keyd::AuditReason::NameResolutionInvalid,
-        keyd::AuditReason::NameResolutionStale,
-        keyd::AuditReason::NameResolutionMismatch,
+fn the_name_resolution_reasons_have_their_own_codes() {
+    for (reason, code) in [
+        (keyd::AuditReason::AttestationKeyMissing, 97),
+        (keyd::AuditReason::NameResolutionInvalid, 98),
+        (keyd::AuditReason::NameResolutionStale, 99),
+        (keyd::AuditReason::NameResolutionMismatch, 100),
+        (keyd::AuditReason::AttestationKeyNotInstalled, 101),
     ] {
         let record = keyd::AuditRecord {
             ts: ktime(),
@@ -222,10 +223,9 @@ fn the_name_resolution_reasons_are_unlisted_until_pn11() {
             result: keyd::AuditOutcome::Denied,
             reason,
         };
-        assert_eq!(
-            keyd_record(&record).reason,
-            KeydReason::Unlisted,
-            "{reason:?}"
-        );
+        let wire = keyd_record(&record).reason;
+        assert_eq!(wire.name(), format!("{reason:?}"));
+        assert_eq!(wire.code(), code, "{reason:?}");
+        assert_ne!(wire, KeydReason::Unlisted);
     }
 }

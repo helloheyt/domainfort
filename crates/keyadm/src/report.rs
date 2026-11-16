@@ -142,11 +142,6 @@ fn grant_identifiers(admin: usize, manifest: &Manifest) -> String {
 /// Spec: docs/59 §7.4, §7.5; docs/questions/Q-1033; docs/50 §8.2.
 fn attestation_key_line(step: AttestationKeyStep) -> Option<String> {
     let outcome = match step {
-        AttestationKeyStep::NotRequested => {
-            return Some(
-                "no attestation key file given: keyd holds no attestation key and will verify no name resolution until one is installed in a ceremony (docs/59 7.4)".to_owned(),
-            )
-        }
         AttestationKeyStep::NotAttempted => return None,
         AttestationKeyStep::Attempted(outcome) => outcome,
     };

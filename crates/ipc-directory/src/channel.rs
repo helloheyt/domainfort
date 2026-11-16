@@ -124,66 +124,25 @@ pub const MAX_NC_LABELS: u32 = 16;
 /// Spec: [MS-ADTS] 3.1.1.5.1.2; A-30; A-53.
 pub const MAX_NC_LABEL: u32 = 255;
 
-/// Bound of a realm inside an attested name resolution (task PN10): the
-/// bound keyd-types puts on every realm of a resolution — the binding's,
-/// `keyd_types::sealed_store::MAX_NAME_OCTETS` (pinned below) — so nothing a
-/// resolution cannot hold is read off the wire.
-/// Spec: docs/59 §7.1 (the bounds of krb-proto and the binding), §7.5
-/// ("size bounds"); crates/keyd-types `name_resolution.rs`; AGENTS.md §6.
-pub const MAX_RESOLUTION_REALM: u32 = 1024;
-
-/// Octets of a DER header around contents of at most 65 535 octets: one
-/// identifier octet (a tag number from 0 to 30 — X.690 §8.1.2.2) and at most
-/// three length octets (the definite form in the fewest octets — X.690
-/// §10.1; up to 65 535 the long form's initial octet and two more — X.690
-/// §8.1.3.5).
-/// Spec: ITU-T X.690 (02/2021) §8.1.2.2, §8.1.3.3-§8.1.3.5, §10.1.
-const DER_HEADER: usize = 1 + 3;
-
-/// Octets of a resolution name's `name-type [0] Int32` at most: the context
-/// tag around an INTEGER of at most four contents octets (Int32's range —
-/// RFC 4120 §5.2.4 — in the fewest two's-complement octets, X.690 §8.3.2,
-/// §8.3.3), each header in the short form (contents ≤ 127 octets — X.690
-/// §8.1.3.4).
-/// Spec: RFC 4120 §5 (`DEFINITIONS EXPLICIT TAGS`), §5.2.2 (`name-type [0]
-/// Int32`), §5.2.4 (`Int32`); X.690 §8.1.3.4, §8.3.1-§8.3.3.
-const RESOLUTION_NAME_TYPE_DER: usize = 2 + 2 + 4;
-
-/// Bound of a `PrincipalName` DER inside an attested name resolution (task
-/// PN10): the largest encoding of a name a resolution can hold —
-/// `krb_proto::limits::MAX_NAME_COMPONENTS` components of at most
-/// `keyd_types::sealed_store::MAX_NAME_OCTETS` octets each (the bounds
-/// keyd-types checks) — as `SEQUENCE { name-type [0] Int32, name-string [1]
-/// SEQUENCE OF KerberosString }` under explicit tags: the outer header, the
-/// name-type, the `[1]` and `SEQUENCE OF` headers, and one header plus the
-/// octets per component. 16 468 octets; every contents length involved is
-/// under 65 536, so [`DER_HEADER`] holds for each (checked below).
-/// Spec: RFC 4120 §5 (`DEFINITIONS EXPLICIT TAGS`), §5.2.1
-/// (`KerberosString`), §5.2.2 (`PrincipalName`); X.690 §8.1.2.2, §8.1.3,
-/// §10.1; docs/59 §7.1, §7.5; AGENTS.md §6.
-pub const MAX_RESOLUTION_NAME: u32 = (DER_HEADER
-    + RESOLUTION_NAME_TYPE_DER
-    + DER_HEADER
-    + DER_HEADER
-    + krb_proto::limits::MAX_NAME_COMPONENTS
-        * (DER_HEADER + keyd_types::sealed_store::MAX_NAME_OCTETS))
-    as u32;
+/// The bounds of an attested name resolution on this channel (task PN10):
+/// a realm (`MAX_RESOLUTION_REALM`), a `PrincipalName` DER
+/// (`MAX_RESOLUTION_NAME`) and the whole resolution's body
+/// (`LARGEST_RESOLUTION`) — defined once in crate keyd-types beside the
+/// bounds of `NameResolution` they are derived from, and used by this
+/// channel and the keyd channel (crate ipc-keyd) alike: one resolution, one
+/// bound on both of its channels (A-190 on docs/questions/Q-1062 item 1).
+/// Spec: docs/59 §7.1, §7.5 ("size bounds"); crates/keyd-types
+/// `name_resolution.rs`; AGENTS.md §6.
+pub use keyd_types::{LARGEST_RESOLUTION, MAX_RESOLUTION_NAME, MAX_RESOLUTION_REALM};
 
 // The bounds agree with the values they are derived from and fit the body
 // bounds; checked at compile time, never at run time.
 const _: () = assert!(MAX_REALM as usize == kdc::MAX_REQUEST_LEN);
 const _: () = assert!(MAX_NAME as usize == kdc::MAX_REQUEST_LEN);
 const _: () = assert!(MAX_SID as usize == 8 + 4 * dtyp::SID_MAX_SUB_AUTHORITIES);
-// A resolution's realm bound is keyd-types' (task PN10).
+// A resolution's realm bound is keyd-types' (task PN10; the derivation and
+// its own compile-time checks are keyd-types', A-190).
 const _: () = assert!(MAX_RESOLUTION_REALM as usize == keyd_types::sealed_store::MAX_NAME_OCTETS);
-// Every contents length inside a resolution name is under 65 536, so each
-// header takes at most DER_HEADER octets (X.690 §8.1.3.5).
-const _: () = assert!(
-    (MAX_RESOLUTION_NAME as usize) - DER_HEADER <= 0xFFFF
-        && krb_proto::limits::MAX_NAME_COMPONENTS
-            * (DER_HEADER + keyd_types::sealed_store::MAX_NAME_OCTETS)
-            <= 0xFFFF
-);
 
 /// Body octets of the largest `Client` / `Service` request a KDC request can
 /// produce: envelope, view id, two length prefixes, and the realm and name,
@@ -195,16 +154,6 @@ const LARGEST_TIER_REQUEST: usize =
 /// Body octets of one ETYPE-INFO2 entry at its bounds.
 const LARGEST_ETYPE_ENTRY: usize =
     4 + (1 + 4 + MAX_SALT as usize) + (1 + 4 + MAX_S2KPARAMS as usize);
-/// Body octets of the largest attested name resolution a record carries
-/// (task PN10): two realms and two names at their bounds, the principal id,
-/// the purpose, the snapshot, the issue time and the tag.
-const LARGEST_RESOLUTION: usize = 2 * (4 + MAX_RESOLUTION_REALM as usize)
-    + 2 * (4 + MAX_RESOLUTION_NAME as usize)
-    + 16
-    + 1
-    + 8
-    + 7
-    + keyd_types::NAME_RESOLUTION_TAG_LEN;
 /// Body octets of the largest client record reply.
 const LARGEST_CLIENT_REPLY: usize = 4
     + 1

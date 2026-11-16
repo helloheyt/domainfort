@@ -36,17 +36,26 @@
 //! [`ConfigDescription`] — what `describe_config` returns over IPC (docs/50
 //! §3.4, §7.5 step 4) — never keyd's whole configuration.
 //!
+//! # Name resolutions (task PN11)
+//!
+//! `issue_as_rep` and `issue_tgs_rep` carry dird's attested name
+//! resolutions ([`AttestedNameResolution`]) as the account records brought
+//! them: the KDC forwards them, it cannot make or change one (it links no
+//! MAC — A-65, D182), and keyd binds a client or service key only through a
+//! resolution it verified (docs/59 §7.2).
+//!
 //! Spec: docs/10 §2 (Role `Kdc`: verify_preauth, issue_as_rep,
 //! open_and_verify_tgt, issue_tgs_rep, open_fast_armor, seal_fast_error),
 //! §4, §5, §5א, §8, §9; docs/48 §2.3; docs/09 א.1; docs/30 §1; docs/50 R50-8,
 //! §3.4, §3.6, §3.7, §7.5; RFC 4120 3.2.3, 7.5.9; docs/questions/Q-217,
-//! Q-222 (A-56); D182; A-63.
+//! Q-222 (A-56); D182; A-63; docs/59 §7.5 (task PN11).
 
-use crate::as_exchange::{AsRepParts, AsTicketTemplate, AuthnProof};
+use crate::as_exchange::{AsRepParts, AsResolutions, AsTicketTemplate, AuthnProof};
 use crate::config::ConfigDescription;
 use crate::error::{AuthnError, Error, IssueError};
 use crate::fast_armor::{FastArmor, FastConversation};
 use crate::model::KeyHandle;
+use crate::name_resolution::AttestedNameResolution;
 use crate::tgs_exchange::{TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext};
 use crate::tokens::{ArmorId, CtxId};
 use krb_proto::{ApReq, EncryptedData, KerberosTime, KrbError, KrbFastArmoredReq, PaData};
@@ -79,9 +88,13 @@ pub trait KeyCustody {
     /// ticket is sealed under: this realm's krbtgt (a TGT), or — armored
     /// only — the change-password service's (`kadmin/changepw`, under its
     /// ticket profile); keyd refuses any other (`crate::AsServer`, the
-    /// closed server slot of task K3b).
+    /// closed server slot of task K3b). `resolutions` are dird's attested
+    /// name resolutions the account records carried (task PN11): keyd binds
+    /// the client key set — and the change-password service's — only through
+    /// them ([`AsResolutions`]).
     /// Spec: docs/10 §4; docs/53 §5.2; docs/questions/Q-915 items 1, 3
-    /// (A-151).
+    /// (A-151); docs/59 §7.2, §7.5.
+    #[allow(clippy::too_many_arguments)]
     fn issue_as_rep(
         &mut self,
         client: &KeyHandle,
@@ -89,6 +102,7 @@ pub trait KeyCustody {
         proof: &AuthnProof,
         armor: Option<ArmorId>,
         template: &AsTicketTemplate,
+        resolutions: AsResolutions<'_>,
         now: &KerberosTime,
     ) -> Result<AsRepParts, IssueError>;
 
@@ -116,9 +130,17 @@ pub trait KeyCustody {
     ) -> Result<TgtContext, AuthnError>;
 
     /// docs/10 §5 `issue_tgs_rep` (armored exactly when the context is).
+    /// `service_resolution` is dird's attested resolution of the template's
+    /// sname to the `service` key set, which the service account record
+    /// carried; keyd reaches the service key only through it (task PN11).
+    /// The client needs none: it comes from the TGT keyd sealed
+    /// (docs/questions/Q-1011 item 7).
+    /// Spec: docs/10 §5; docs/59 §7.2, §7.5; docs/questions/Q-1011 items 4,
+    /// 7, 8 (A-173).
     fn issue_tgs_rep(
         &mut self,
         service: &KeyHandle,
+        service_resolution: &AttestedNameResolution,
         ctx: &CtxId,
         template: &TgsTicketTemplate,
         now: &KerberosTime,

@@ -120,7 +120,7 @@ fn invoke(f: &mut Fixture, op: Operation, caller: &CallerId, handle: &KeyHandle)
                 authtime: n,
             };
             f.keyd
-                .issue_as_rep(caller, handle, &KRBTGT, &proof, None, &as_template(), &n)
+                .issue_as(caller, handle, &KRBTGT, &proof, None, &as_template(), &n)
                 .is_ok()
         }
         Operation::OpenAndVerifyTgt => f
@@ -129,7 +129,7 @@ fn invoke(f: &mut Fixture, op: Operation, caller: &CallerId, handle: &KeyHandle)
             .is_ok(),
         Operation::IssueTgsRep => f
             .keyd
-            .issue_tgs_rep(
+            .issue_tgs(
                 caller,
                 handle,
                 &CtxId::from_bytes([4; 16]),
@@ -443,7 +443,7 @@ fn issue_as_rep_krbtgt_slot_purpose() {
     for wrong in [SERVICE, BOB, ADMIN_SERVICE, CHANGE_PASSWORD_SERVICE] {
         assert!(f
             .keyd
-            .issue_as_rep(&KDC, &ALICE, &wrong, &proof, None, &as_template(), &now())
+            .issue_as(&KDC, &ALICE, &wrong, &proof, None, &as_template(), &now())
             .is_err());
         assert_eq!(
             f.records().last().unwrap().reason,
@@ -453,7 +453,7 @@ fn issue_as_rep_krbtgt_slot_purpose() {
     // The purpose refusal precedes the token: the proof is still usable.
     assert!(f
         .keyd
-        .issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, None, &as_template(), &now())
+        .issue_as(&KDC, &ALICE, &KRBTGT, &proof, None, &as_template(), &now())
         .is_ok());
 }
 

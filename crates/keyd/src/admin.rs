@@ -32,7 +32,7 @@ use crate::entropy::EntropySource;
 use crate::error::{Deny, Error, Internal};
 use crate::keyd::{new_random_keys, store_deny, AuditFields, Keyd};
 use crate::model::{KeyHandle, KeyPurpose, Kvno, PrincipalBinding, PrincipalId};
-use crate::store::{KeyStore, KvnoKeys, StoredKeySet};
+use crate::store::{KeyStore, KvnoKeys, StoreError, StoredKeySet};
 use crate::template::check_new_binding;
 use keyd_types::{DecidedOperation, DecisionId};
 use krb_proto::KerberosTime;
@@ -360,8 +360,9 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     }
 
     /// `install_attestation_key`: put the attestation key dird's name
-    /// resolutions are verified with into keyd's slot (task PN8; docs/59
-    /// §7.4) — the key `provision` drew and wrote to dird's key file, handed
+    /// resolutions are verified with into keyd's key store (task PN8;
+    /// A-190: `KeyStore::install_attestation_key`, which keeps it once;
+    /// docs/59 §7.4) — the key `provision` drew and wrote to dird's key file, handed
     /// to keyd by keyadm's ceremony (task PN9; PN12 writes the file). keyd
     /// never exports it, and never tags with it: it only verifies
     /// (`Keyd::verify_name_resolution`).
@@ -419,11 +420,14 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         // Role (I2) and the ceremony state (R3), from the compile-time
         // tables — the same step every operation runs first.
         self.admit(caller, Operation::InstallAttestationKey, &[], now)?;
-        if self.attestation_key.is_some() {
-            return Err(Deny::denied(AuditReason::AttestationKeyInstalled));
-        }
-        self.attestation_key = Some(key);
-        Ok(())
+        // The key lives in the store (A-190), which keeps it once: a key
+        // already held is `Exists` — reported as the install's own reason.
+        self.store
+            .install_attestation_key(key)
+            .map_err(|error| match error {
+                StoreError::Exists => Deny::denied(AuditReason::AttestationKeyInstalled),
+                other => store_deny(other),
+            })
     }
 
     /// Whether this start's ceremony installed the attestation key. Not
@@ -431,7 +435,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// Spec: docs/59 §7.4; docs/questions/Q-1011 item 2.
     #[must_use]
     pub fn has_attestation_key(&self) -> bool {
-        self.attestation_key.is_some()
+        self.store.attestation_key().is_some()
     }
 
     /// Destroy the key set of `handle` if it exists, with everything bound

@@ -1489,16 +1489,30 @@ fn an_execution_takes_its_intent_from_keyds_table() {
 /// A-102 (docs/52 §4.4, §7 R3; Q-462 item 1): `seal_ceremony` by Admin is
 /// one record (it only makes keyd stricter: no intent); afterwards
 /// `create_key` is refused at keyd's authorization step (`CeremonySealed`)
-/// — one record, no intent, no wait. The seal is Admin's alone.
+/// — one record, no intent, no wait. The seal is Admin's alone. Task PN11
+/// (Q-1056 item 4, A-188): before the attestation key is installed the
+/// seal is refused (`AttestationKeyNotInstalled`) — one record, no intent;
+/// the install itself is intent then outcome (task PN9).
 #[test]
 fn the_seal_is_one_record_and_ends_create_key_without_an_intent() {
     let clock = TestClock::at(t0());
     let (mut engine, gate) = engine(&clock, WindowConfig::DEFAULT, true);
-    let started = Instant::now();
+    // auditd acknowledges the install's intent (task PN9); the seal and the
+    // refusals need none.
+    let auditd = AutoAck::start(&gate);
     assert!(matches!(
         serve(&mut engine, LDAP, &Call::SealCeremony).0,
         Ok(Answer::SealCeremony(Err(Error::Denied)))
     ));
+    assert!(matches!(
+        serve(&mut engine, ADMIN, &Call::SealCeremony).0,
+        Ok(Answer::SealCeremony(Err(Error::Denied)))
+    ));
+    assert!(matches!(
+        serve(&mut engine, ADMIN, &install_attestation_key()).0,
+        Ok(Answer::InstallAttestationKey(Ok(())))
+    ));
+    let started = Instant::now();
     assert!(matches!(
         serve(&mut engine, ADMIN, &Call::SealCeremony).0,
         Ok(Answer::SealCeremony(Ok(())))
@@ -1508,7 +1522,7 @@ fn the_seal_is_one_record_and_ends_create_key_without_an_intent() {
         Ok(Answer::CreateKey(Err(Error::Denied)))
     ));
     assert!(started.elapsed() < generous().get(), "no wait");
-    let records = window_records(&gate);
+    let records = auditd.wait_for(6);
     let phases: Vec<_> = records.iter().map(|r| (r.op, r.result, r.reason)).collect();
     assert_eq!(
         phases,
@@ -1517,6 +1531,21 @@ fn the_seal_is_one_record_and_ends_create_key_without_an_intent() {
                 KeydOperation::SealCeremony,
                 KeydOutcome::Denied,
                 KeydReason::RoleNotPermitted
+            ),
+            (
+                KeydOperation::SealCeremony,
+                KeydOutcome::Denied,
+                KeydReason::AttestationKeyNotInstalled
+            ),
+            (
+                KeydOperation::InstallAttestationKey,
+                KeydOutcome::Intent,
+                KeydReason::None
+            ),
+            (
+                KeydOperation::InstallAttestationKey,
+                KeydOutcome::Success,
+                KeydReason::None
             ),
             (
                 KeydOperation::SealCeremony,

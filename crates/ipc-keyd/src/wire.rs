@@ -71,6 +71,18 @@
 //! ipc error carries an octet. `KEYD_VERSION` stays 1 (the precedent of F3,
 //! K4, R9 and Q-523).
 //!
+//! **Task PN11 (docs/59 §7.5):** `issue_as_rep` (0x02) carries dird's
+//! attested name resolutions after its template — the client's, and an
+//! optional one for the change-password service — and `issue_tgs_rep`
+//! (0x05) the service's, after its template ([`WireNameResolution`]: two
+//! realms, two DER names, the key set's principal and purpose, the
+//! snapshot, the issue time, the 32-octet tag; every field within the
+//! bounds keyd-types puts on a resolution). The tag is carried, never
+//! checked here — keyd verifies it. The layouts of 0x02 / 0x05 change; an
+//! old-layout request is refused (`Truncated`), never misread.
+//! `KEYD_VERSION` stays 1 (the precedent of F3, K4, R9, PN9 and Q-523; no
+//! deployed peer — the same choice as the dird-kdc channel's in task PN10).
+//!
 //! **Q-523 (append-only, docs/50 §3.3):** the operation-bound service-ticket
 //! verification was moved out of kind 0x07 into the appended kinds 0x15 /
 //! 0x95, whose answer has no context id. Kind 0x07 / 0x87 keep their layout
@@ -85,14 +97,16 @@
 use crate::channel::{
     reply_kind, request_kind, ATTESTATION_KEY_FIELD, ATTESTATION_KEY_OCTETS,
     MAX_DECISION_APPROVERS, MAX_DESTROY_PAGE, MAX_ENCTYPES, MAX_GRANT_TARGETS, MAX_REPLY_FIELD,
-    MAX_REQUEST_FIELD, MAX_SALT, MAX_SEAL_PADATA, MAX_SECRET,
+    MAX_REQUEST_FIELD, MAX_RESOLUTION_NAME, MAX_RESOLUTION_REALM, MAX_SALT, MAX_SEAL_PADATA,
+    MAX_SECRET,
 };
 use ipc::{DerBlob, Error, MessageSet, Payload, Reader, Result, Secret, Writer};
 use keyd_types::{
     AccountKind, ArmorId, AuthnError, ChangePasswordCtxId, ChangePasswordVerdict, CtxId,
     DecisionId, EncTypeId, ExchangeId, FastConversation, HostAddr, IssueError, KeyHandle,
     KeyPurpose, Kvno, OperationDigest, PendingDestruction, PrincipalId, Role, ServiceCtxId,
-    TicketPolicy, ADDRESS_TYPE_IPV4, OPERATION_DIGEST_LEN, TOKEN_ID_LENGTH,
+    TicketPolicy, ADDRESS_TYPE_IPV4, NAME_RESOLUTION_TAG_LEN, OPERATION_DIGEST_LEN,
+    TOKEN_ID_LENGTH,
 };
 use krb_proto::{KerberosFlags, NonZeroResultCode, TicketFlags};
 
@@ -313,6 +327,84 @@ impl Payload for WireBinding {
     }
 }
 
+/// An attested name resolution (`keyd_types::AttestedNameResolution`, task
+/// PN11): the resolution dird stated for the lookup that produced an account
+/// record — realm and name as sent, canonical realm and name, the key set's
+/// principal and purpose, the snapshot, the issue time — and its 32-octet
+/// tag, as the KDC forwards it. Not secret (names, a handle, a time and a
+/// MAC tag). The tag's length is the type's, never a length on the wire
+/// (A-145 RC-4); this layer neither computes nor checks it (keyd verifies it
+/// — docs/59 §7.2). `PartialEq` compares the octets of a codec value
+/// (tests); no product code decides anything by it.
+///
+/// Layout: `realm:bytes<1024> ‖ name:DER<16468> ‖ realm:bytes<1024> ‖
+/// name:DER<16468> ‖ principal[16] ‖ purpose:u8 ‖ snapshot:u64 ‖ time(7) ‖
+/// tag[32]` — the purpose from this channel's own closed table (as the
+/// `KeyHandle` beside it).
+///
+/// Spec: docs/59 §7.1 (the fields; the bounds), §7.5 (`IssueAsRep` +
+/// `client_resolution`, `IssueTgsRep` + `service_resolution`); docs/50 §3.3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireNameResolution {
+    /// The realm the request carried (KerberosString octets).
+    pub realm_as_sent: Vec<u8>,
+    /// The name the request carried (`PrincipalName` DER).
+    pub name_as_sent: DerBlob,
+    /// The canonical realm (KerberosString octets).
+    pub canonical_realm: Vec<u8>,
+    /// The canonical name (`PrincipalName` DER).
+    pub canonical_name: DerBlob,
+    /// The key set's principal.
+    pub principal: PrincipalId,
+    /// The key set's purpose.
+    pub key_purpose: KeyPurpose,
+    /// The snapshot (docs/59 §4.7).
+    pub snapshot: u64,
+    /// When dird issued it.
+    pub issued_at: WireTime,
+    /// dird's tag over the resolution (HMAC-SHA-256, crate name-attestation).
+    pub tag: [u8; NAME_RESOLUTION_TAG_LEN],
+}
+
+impl Payload for WireNameResolution {
+    /// Spec: docs/59 §7.1, §7.5; docs/50 §3.3.
+    fn write_fields(&self, writer: &mut Writer) -> Result<()> {
+        writer.write_bytes(&self.realm_as_sent, MAX_RESOLUTION_REALM)?;
+        writer.write_der(&self.name_as_sent, MAX_RESOLUTION_NAME)?;
+        writer.write_bytes(&self.canonical_realm, MAX_RESOLUTION_REALM)?;
+        writer.write_der(&self.canonical_name, MAX_RESOLUTION_NAME)?;
+        writer.write_array(self.principal.as_bytes())?;
+        writer.write_enum(purpose_code(self.key_purpose))?;
+        writer.write_u64(self.snapshot)?;
+        self.issued_at.write_fields(writer)?;
+        writer.write_array(&self.tag)
+    }
+
+    /// Spec: docs/59 §7.1, §7.5; docs/50 §3.3.
+    fn read_fields(reader: &mut Reader<'_>) -> Result<WireNameResolution> {
+        let realm_as_sent = read_owned(reader, MAX_RESOLUTION_REALM)?;
+        let name_as_sent = reader.read_der(MAX_RESOLUTION_NAME)?;
+        let canonical_realm = read_owned(reader, MAX_RESOLUTION_REALM)?;
+        let canonical_name = reader.read_der(MAX_RESOLUTION_NAME)?;
+        let principal = PrincipalId::from_bytes(reader.read_array()?);
+        let key_purpose = reader.read_enum(purpose_from_code)?;
+        let snapshot = reader.read_u64()?;
+        let issued_at = WireTime::read_fields(reader)?;
+        let tag = reader.read_array::<NAME_RESOLUTION_TAG_LEN>()?;
+        Ok(WireNameResolution {
+            realm_as_sent,
+            name_as_sent,
+            canonical_realm,
+            canonical_name,
+            principal,
+            key_purpose,
+            snapshot,
+            issued_at,
+            tag,
+        })
+    }
+}
+
 // ===========================================================================
 // Requests.
 // ===========================================================================
@@ -456,12 +548,14 @@ impl Payload for WireAsTemplate {
 }
 
 /// `issue_as_rep`. Spec: docs/50 §3.4 (`client`, `krbtgt`, `proof`, `armor`,
-/// `template`); docs/10 §4.
+/// `template`); docs/10 §4; docs/59 §7.5 (`IssueAsRep` +
+/// `client_resolution`; task PN11 — and the change-password service's
+/// resolution, present exactly for that server, keyd decides).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssueAsRepRequest {
     /// PrincipalLongterm handle of the client.
     pub client: KeyHandle,
-    /// Krbtgt handle.
+    /// The server's handle: Krbtgt, or (armored) ChangePasswordService.
     pub krbtgt: KeyHandle,
     /// The proof `verify_preauth` returned.
     pub proof: WireAuthnProof,
@@ -469,31 +563,45 @@ pub struct IssueAsRepRequest {
     pub armor: Option<ArmorId>,
     /// The ticket template.
     pub template: WireAsTemplate,
+    /// dird's resolution of the client's name (task PN11). Boxed: the
+    /// request enum stays small (a resolution's fields are its largest
+    /// part).
+    pub client_resolution: Box<WireNameResolution>,
+    /// dird's resolution of the change-password service's name (task PN11);
+    /// absent for a TGT.
+    pub server_resolution: Option<Box<WireNameResolution>>,
 }
 
 impl Payload for IssueAsRepRequest {
-    /// Spec: docs/50 §3.4.
+    /// Spec: docs/50 §3.4; docs/59 §7.5.
     fn write_fields(&self, writer: &mut Writer) -> Result<()> {
         write_handle(writer, &self.client)?;
         write_handle(writer, &self.krbtgt)?;
         self.proof.write_fields(writer)?;
         writer.write_option(self.armor.as_ref(), |w, a| w.write_array(a.as_bytes()))?;
-        self.template.write_fields(writer)
+        self.template.write_fields(writer)?;
+        self.client_resolution.write_fields(writer)?;
+        writer.write_option(self.server_resolution.as_ref(), |w, r| r.write_fields(w))
     }
 
-    /// Spec: docs/50 §3.4.
+    /// Spec: docs/50 §3.4; docs/59 §7.5.
     fn read_fields(reader: &mut Reader<'_>) -> Result<IssueAsRepRequest> {
         let client = read_handle(reader)?;
         let krbtgt = read_handle(reader)?;
         let proof = WireAuthnProof::read_fields(reader)?;
         let armor = reader.read_option(|r| read_token(r).map(ArmorId::from_bytes))?;
         let template = WireAsTemplate::read_fields(reader)?;
+        let client_resolution = Box::new(WireNameResolution::read_fields(reader)?);
+        let server_resolution =
+            reader.read_option(|r| WireNameResolution::read_fields(r).map(Box::new))?;
         Ok(IssueAsRepRequest {
             client,
             krbtgt,
             proof,
             armor,
             template,
+            client_resolution,
+            server_resolution,
         })
     }
 }
@@ -655,34 +763,41 @@ impl Payload for WireTgsTemplate {
 }
 
 /// `issue_tgs_rep`. Spec: docs/50 §3.4 (`service`, `ctx: CtxId`,
-/// `template`); docs/10 §5.
+/// `template`); docs/10 §5; docs/59 §7.5 (`IssueTgsRep` +
+/// `service_resolution`, task PN11).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssueTgsRepRequest {
-    /// Service (or krbtgt) handle.
+    /// Service handle.
     pub service: KeyHandle,
     /// The context `open_and_verify_tgt` returned.
     pub ctx: CtxId,
     /// The ticket template.
     pub template: WireTgsTemplate,
+    /// dird's resolution of the service's name (task PN11). Boxed, as
+    /// [`IssueAsRepRequest`]'s.
+    pub service_resolution: Box<WireNameResolution>,
 }
 
 impl Payload for IssueTgsRepRequest {
-    /// Spec: docs/50 §3.4.
+    /// Spec: docs/50 §3.4; docs/59 §7.5.
     fn write_fields(&self, writer: &mut Writer) -> Result<()> {
         write_handle(writer, &self.service)?;
         writer.write_array(self.ctx.as_bytes())?;
-        self.template.write_fields(writer)
+        self.template.write_fields(writer)?;
+        self.service_resolution.write_fields(writer)
     }
 
-    /// Spec: docs/50 §3.4.
+    /// Spec: docs/50 §3.4; docs/59 §7.5.
     fn read_fields(reader: &mut Reader<'_>) -> Result<IssueTgsRepRequest> {
         let service = read_handle(reader)?;
         let ctx = CtxId::from_bytes(read_token(reader)?);
         let template = WireTgsTemplate::read_fields(reader)?;
+        let service_resolution = Box::new(WireNameResolution::read_fields(reader)?);
         Ok(IssueTgsRepRequest {
             service,
             ctx,
             template,
+            service_resolution,
         })
     }
 }

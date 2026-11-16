@@ -181,17 +181,21 @@
 //!
 //! Name binding (docs/questions/Q-040, decided A-19): every key set is bound,
 //! at creation and for good, to one principal name ([`PrincipalBinding`]).
-//! keyd refuses to issue a ticket naming a client other than the client
-//! key's bound name, to seal a service ticket for an sname other than the
-//! service key's bound name, and to use a krbtgt key not bound to
-//! krbtgt/REALM. Name equivalence follows RFC 4120 6.2 (realm and
-//! components octet for octet; name-type not significant). **By type since
-//! R7** (docs/52 §3.5; [`store`]): a stored key is reachable only through
-//! the proof of its binding (`StoredKeySet::bound_to`) or a declared
-//! `UnboundUse` (the pre-authentication check and `verify_secret`, which
-//! issue nothing under a name); a password-derived version is installed only
-//! under its binding, and a key set is created only from the creation rule's
-//! proof — an operation that skips the check does not compile.
+//! keyd refuses to issue a ticket naming a client other than one dird
+//! resolved to the client key set, to seal a service ticket for an sname
+//! other than one dird resolved to the service key set, and to use a krbtgt
+//! key not bound to krbtgt/REALM. **By type since R7** (docs/52 §3.5;
+//! [`store`]): a stored key is reachable only through one of four doors —
+//! dird's verified name resolution for issuance under a client or service
+//! key set (`StoredKeySet::bound_by`, task PN11), the exact TGS name for the
+//! krbtgt (`StoredKeySet::ticket_granting`), the namespace key for the
+//! acceptor (`StoredKeySet::accepting`), the request's own binding for
+//! `set_secret` on an existing set (`StoredKeySet::bound_to`) — or a
+//! declared `UnboundUse` (the pre-authentication check and `verify_secret`,
+//! which issue nothing under a name); a password-derived version is
+//! installed only under its binding, and a key set is created only from the
+//! creation rule's proof — an operation that skips the check does not
+//! compile.
 //!
 //! Destroy decisions (R6b; docs/questions/Q-501, Q-520): a `DestroyKeySet`
 //! registration first discards every live set-secret entry of the
@@ -202,17 +206,20 @@
 //! is read from the key store, and a re-registration after the destruction
 //! schedules nothing.
 //!
-//! **Name resolutions** (task PN8, additive; docs/59 §7; decision A-173 —
-//! docs/questions/Q-1011): keyd holds one attestation key — installed by
+//! **Name resolutions** (tasks PN8, PN11; docs/59 §7; decision A-173 —
+//! docs/questions/Q-1011): keyd holds one attestation key, in its key store
+//! (A-190: `KeyStore::attestation_key` / `install_attestation_key`) — installed by
 //! Role::Admin in the ceremony only ([`Keyd::install_attestation_key`]),
-//! never replaced, never exported, never used to tag — and verifies dird's
-//! `AttestedNameResolution` with it: tag (constant time, before any field)
-//! ⇒ realm ⇒ freshness (30 s on keyd's clock) ⇒ a `VerifiedNameResolution`,
-//! which exists only after those checks and is the only input of
-//! `StoredKeySet::bound_by` (principal and purpose = the set's own handle;
-//! canonical name = the bound name by the `principal-names` key). AS / TGS
-//! issuance still binds by `bound_to`; it moves to the resolution in task
-//! PN11 (crate name_resolution).
+//! never replaced, never exported, never used to tag; and the ceremony
+//! cannot be sealed without it ([`Keyd::seal_ceremony`], Q-1056, A-188) —
+//! and verifies dird's `AttestedNameResolution` with it: tag (constant time,
+//! before any field) ⇒ realm ⇒ freshness (30 s on keyd's clock) ⇒ a
+//! `VerifiedNameResolution`, which exists only after those checks and is
+//! the only input of `StoredKeySet::bound_by` (principal and purpose = the
+//! set's own handle; canonical name = the bound name by the
+//! `principal-names` key; the ticket's name = one of the resolution's two).
+//! Since task PN11 that is the only way AS and TGS issuance reach a client
+//! or service key (crate name_resolution).
 //!
 //! # Time and randomness
 //!
@@ -252,13 +259,15 @@
 //!   they are sealed or decoded. Rust moves of `ProtocolKey` values may leave
 //!   stack copies. `mlock`, no core dumps and guard pages belong to the
 //!   daemon (docs/10 §11).
-//! - Name binding compares names exactly as given (`bound_to`; the
-//!   resolution path of task PN8 compares by the namespace key and is not
-//!   used for issuance until PN11): canonicalization (case,
-//!   aliases, enterprise names) is the KDC's job before it calls keyd, and a
-//!   binding is only as correct as the Admin / Directory caller that created
-//!   the key set. There is no rename in phase 1 (follow-up: a rename
-//!   interface, docs/10 §7).
+//! - Which names map to which key set is dird's statement (docs/59 §9 S5:
+//!   a compromised dird can sign a false resolution; `check_new_binding` at
+//!   creation and `bound_by`'s binding compare narrow what it can map a
+//!   name to), and a compromised KDC can replay a true, fresh resolution
+//!   within its 30 s window (S4) — it cannot invent a mapping. keyd's
+//!   creation rule (`template::check_new_binding`) still recognises the
+//!   reserved names octet for octet (a follow-up — docs/questions/Q-1061).
+//!   There is no rename in phase 1 (follow-up: a rename interface, docs/10
+//!   §7).
 //! - keyd trusts the caller's `now` and start time (the daemon's own clock,
 //!   docs/50 R50-5) and dird's decisions — the approvers a decision names
 //!   were verified by dird, not by keyd (dird ≡ tier-0 for keyd's
@@ -417,6 +426,8 @@ pub use keyd_types::{
     ThrottlePolicy, TicketPolicy, MAX_FX_COOKIE_LENGTH, TOKEN_ID_LENGTH,
 };
 pub use keyd_types::{AsServer, CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS};
+// The resolutions issuance takes (task PN11; docs/59 §7.2).
+pub use keyd_types::{AsResolutions, AttestedNameResolution};
 pub use keyd_types::{
     CeremonyState, DecidedOperation, DecisionId, DecisionIntent, DestructionPage,
     PendingDestruction, MAX_DECISION_APPROVERS, MAX_DESTROY_DECISIONS, MAX_DESTROY_DECISION_PAGE,

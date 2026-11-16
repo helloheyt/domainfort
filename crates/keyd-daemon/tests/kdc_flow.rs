@@ -203,6 +203,10 @@ fn fixture_keyd(
         )
         .unwrap();
     }
+    // The ceremony hands keyd dird's attestation key (task PN11: keyd
+    // verifies the resolutions the kdc forwards with it).
+    keyd.install_attestation_key(&ADMIN, test_attestation_key(), &now())
+        .unwrap();
     let _ = keyd.audit_sink_mut().take();
     Ok(keyd)
 }

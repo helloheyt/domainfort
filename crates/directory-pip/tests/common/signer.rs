@@ -8,7 +8,11 @@
 //! clock). The fixtures of crates that cannot reach it install this one:
 //! the same construction — `ResolvedPrincipal::name_resolution` at a time,
 //! tagged with crate name-attestation's `tag` — under the test key
-//! [`TEST_ATTESTATION_KEY`] and a fixed issue time.
+//! [`TEST_ATTESTATION_KEY`] and a fixed issue time: by default the
+//! fixtures' own `now` (tests/common `now`), the time the fixtures' keyd runs
+//! at — keyd judges a resolution's age on its own clock (30 s, docs/59 §7.2
+//! step 3), so one test world has one clock (task PN11, A-190;
+//! docs/questions/Q-1063 items 1-2).
 //!
 //! The ONE test signer the directory fixtures share (crates/directory-pip
 //! tests/common, and through it crates/ipc-directory-server and
@@ -62,8 +66,8 @@ pub fn test_signer_at(issued_at: KerberosTime) -> Arc<dyn NameResolutionSigner> 
     })
 }
 
-/// The test signer issuing at a fixed time of the fixtures (2026-11-16
-/// 12:00:00Z).
+/// The test signer issuing at the fixtures' `now` (tests/common `now`,
+/// 2026-11-13 10:00:00Z — module documentation).
 pub fn test_signer() -> Arc<dyn NameResolutionSigner> {
-    test_signer_at(KerberosTime::new(2026, 11, 16, 12, 0, 0).expect("a valid time"))
+    test_signer_at(super::now())
 }

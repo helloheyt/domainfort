@@ -18,7 +18,15 @@
 //! 3. `name_attestation::verify(` appears only in [`VERIFIER_FILE`], with
 //!    the installed key;
 //! 4. no line returns an `AttestationKey` (`->` … `AttestationKey`, by
-//!    value or by reference).
+//!    value or by reference) — except the key store's read accessor
+//!    (`KeyStore::attestation_key`, declared and implemented in
+//!    [`STORE_FILE`] only: since A-190 the key lives in keyd's store, and the
+//!    store's owner — `Keyd`, which exposes no reference to its store —
+//!    reads it there);
+//! 5. that accessor is called only by the verifier ([`VERIFIER_FILE`]) and,
+//!    to answer "is a key installed" with a `bool`, by
+//!    [`PRESENCE_FILE`] (`.attestation_key().is_some()`) — no other code in
+//!    keyd holds a reference to the key.
 //!
 //! A lexical scan, not a type: a reviewer decides any new hit. Test code is
 //! not scanned (a file's `#[cfg(test)] mod … {` block to its end) and
@@ -27,8 +35,9 @@
 //! vacuously).
 //!
 //! Source: docs/59 §7.4; docs/questions/Q-1011 item 2 (A-173); A-145 RC-6
-//! (C42); D28 / D29; AGENTS.md §6.1. The scanner pattern follows this
-//! project's own guards (crates/keyd-types tests/
+//! (C42); D28 / D29; AGENTS.md §6.1; docs/questions/Q-1063 item 3 (A-190:
+//! the key moves into the store; rules 4 and 5 as amended). The scanner
+//! pattern follows this project's own guards (crates/keyd-types tests/
 //! one_service_purpose_derivation.rs). Test-only.
 
 use std::path::{Path, PathBuf};
@@ -46,6 +55,21 @@ const ALLOWED_ITEMS: [&str; 4] = [
 
 /// The one file that verifies.
 const VERIFIER_FILE: &str = "name_resolution.rs";
+
+/// The file of the key store, which declares and implements the one read
+/// accessor of the attestation key (A-190).
+const STORE_FILE: &str = "store.rs";
+
+/// The read accessor's signature, the one line rule 4 admits (in
+/// [`STORE_FILE`] only).
+const STORE_ACCESSOR: &str = "fn attestation_key(&self) -> Option<&AttestationKey>";
+
+/// The one file besides the verifier that calls the accessor — for a `bool`
+/// (`Keyd::has_attestation_key`).
+const PRESENCE_FILE: &str = "admin.rs";
+
+/// The accessor's call, as rule 5 scans for it.
+const ACCESSOR_CALL: &str = ".attestation_key()";
 
 fn src_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
@@ -133,6 +157,28 @@ fn line_violations(code: &str) -> Vec<&'static str> {
     found
 }
 
+/// Rule 4's one exception and rule 5, which depend on the file (A-190):
+/// the violations of `code` in the file `name`, after [`line_violations`].
+fn file_violations(name: &str, code: &str) -> Vec<&'static str> {
+    let mut found: Vec<&'static str> = line_violations(code)
+        .into_iter()
+        .filter(|rule| {
+            !(rule.starts_with("rule 4") && name == STORE_FILE && code.contains(STORE_ACCESSOR))
+        })
+        .collect();
+    let mut rest = code;
+    while let Some(at) = rest.find(ACCESSOR_CALL) {
+        let after = &rest[at + ACCESSOR_CALL.len()..];
+        let allowed =
+            name == VERIFIER_FILE || (name == PRESENCE_FILE && after.starts_with(".is_some()"));
+        if !allowed {
+            found.push("rule 5: reads the attestation key outside the verifier");
+        }
+        rest = after;
+    }
+    found
+}
+
 /// Every violation in keyd's product source, and the files that call
 /// `name_attestation::verify(`.
 fn scan() -> (Vec<String>, Vec<String>, usize) {
@@ -149,7 +195,7 @@ fn scan() -> (Vec<String>, Vec<String>, usize) {
             .to_string_lossy()
             .into_owned();
         for (n, code) in product_lines(&text).iter().enumerate() {
-            for rule in line_violations(code) {
+            for rule in file_violations(&name, code) {
                 violations.push(format!("{name}:{}: {rule}: {}", n + 1, code.trim()));
             }
             if code.contains("name_attestation::verify(") {
@@ -197,6 +243,16 @@ fn the_scanner_flags_planted_violations() {
             "not flagged: {planted}"
         );
     }
+    // Rule 4's exception is the store file's accessor alone; rule 5 admits
+    // the verifier and a `bool` in admin.rs (A-190).
+    let accessor = "    fn attestation_key(&self) -> Option<&AttestationKey> {";
+    assert!(file_violations(STORE_FILE, accessor).is_empty());
+    assert!(!file_violations("keyd.rs", accessor).is_empty());
+    let read = "let key = self.store.attestation_key().ok_or(missing)?;";
+    assert!(file_violations(VERIFIER_FILE, read).is_empty());
+    assert!(!file_violations("keyd.rs", read).is_empty());
+    assert!(!file_violations(PRESENCE_FILE, read).is_empty());
+    assert!(file_violations(PRESENCE_FILE, "self.store.attestation_key().is_some()").is_empty());
     for allowed in [
         "use name_attestation::AttestationKey;",
         "pub use name_attestation::ATTESTATION_KEY_LEN;",

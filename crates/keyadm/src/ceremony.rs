@@ -1,8 +1,8 @@
 //! `keyadm ceremony`: create the krbtgt key set and the three service key
 //! sets the provisioning manifest names, install the attestation key (task
-//! PN9, when its file is named), grant the first administrators' initial
-//! secrets, and **seal** keyd's ceremony (docs/51 §4.3 step 11; A-102,
-//! docs/52 R3; docs/59 §7.4, §7.5).
+//! PN9), grant the first administrators' initial secrets, and **seal**
+//! keyd's ceremony (docs/51 §4.3 step 11; A-102, docs/52 R3; docs/59 §7.4,
+//! §7.5).
 //!
 //! # The steps
 //!
@@ -31,13 +31,13 @@
 //!    keyd was contacted. keyd installs it once per start, for Role::Admin,
 //!    in the ceremony only (its capability table and ceremony state), with
 //!    its intent acknowledged by auditd first (a key-state change, A-86);
-//!    keyd never returns it, and keyadm never prints it. The binary always
-//!    runs this step (the file is a required operand since task PN12 —
-//!    A-183, [`run_with_attestation_key`]); the keyless [`run`] remains a
-//!    library entry for tests of the other steps: it installs none, and keyd
-//!    then verifies no name resolution (fail closed). After the key sets and
-//!    before the grants, so that the grants' 15 minutes start as late as
-//!    possible.
+//!    keyd never returns it, and keyadm never prints it. Every ceremony runs
+//!    this step: the file is a required operand since task PN12 (A-183), and
+//!    since task PN11 the library has no keyless entry either
+//!    ([`run_with_attestation_key`] is the one) — keyd itself refuses to seal
+//!    without the key (docs/questions/Q-1056 item 4, A-188), so a ceremony
+//!    without it could never complete. After the key sets and before the
+//!    grants, so that the grants' 15 minutes start as late as possible.
 //! 4. **`grant_set_secret` for each first administrator, in the manifest's
 //!    order** (task A15a; docs/questions/Q-451) — a user's one key target,
 //!    `(GUID, PrincipalLongterm)` with its NT-PRINCIPAL [sAMAccountName]
@@ -308,28 +308,22 @@ pub struct GrantReport {
     pub outcome: Outcome<()>,
 }
 
-/// The attestation key step of a ceremony (task PN9).
-/// Spec: docs/59 §7.4, §7.5; docs/questions/Q-1033.
+/// The attestation key step of a ceremony (task PN9). Every ceremony has
+/// one (task PN11: no keyless entry — Q-1056 item 4, A-188).
+/// Spec: docs/59 §7.4, §7.5; docs/questions/Q-1033, Q-1056.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttestationKeyStep {
-    /// The keyless library entry ([`run`]) was used: the ceremony installs
-    /// no key (keyd verifies no name resolution — fail closed). The binary
-    /// never reports it: its attestation key file is a required operand
-    /// since task PN12 (A-183).
-    NotRequested,
-    /// A key was given, but the ceremony stopped before this step.
+    /// The ceremony stopped before this step.
     NotAttempted,
     /// The `install_attestation_key` call and how it ended.
     Attempted(Outcome<()>),
 }
 
 impl AttestationKeyStep {
-    /// `true` if this step does not hold the ceremony back: no key was
-    /// asked for, or keyd answered the install `Ok`.
+    /// `true` if keyd answered the install `Ok`.
     #[must_use]
     pub const fn is_done(&self) -> bool {
         match self {
-            AttestationKeyStep::NotRequested => true,
             AttestationKeyStep::NotAttempted => false,
             AttestationKeyStep::Attempted(outcome) => outcome.succeeded(),
         }
@@ -338,8 +332,8 @@ impl AttestationKeyStep {
 
 /// What the ceremony did: the contact, then the steps attempted (in order;
 /// it stops after the first that did not succeed): the four key sets, the
-/// attestation key (task PN9, when requested), the first administrators'
-/// grants, then the seal.
+/// attestation key (task PN9), the first administrators' grants, then the
+/// seal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CeremonyReport {
     /// The `ping` that opened (and verified) the connection.
@@ -368,9 +362,9 @@ impl CeremonyReport {
         self.grants_registered() && self.is_sealed()
     }
 
-    /// `true` if all four key sets were created, the attestation key (when
-    /// one was given) installed, and every first administrator's initial
-    /// secret granted (the seal may still be missing).
+    /// `true` if all four key sets were created, the attestation key
+    /// installed, and every first administrator's initial secret granted
+    /// (the seal may still be missing).
     #[must_use]
     pub fn grants_registered(&self) -> bool {
         self.key_sets_created()
@@ -429,41 +423,25 @@ impl CeremonyReport {
 
 /// Run the ceremony for `manifest` through `client` (see the module
 /// documentation): contact, then `create_key` for each [`Step`] in order,
-/// then `grant_set_secret` for each first administrator in order, then
-/// `seal_ceremony` — stopping at the first call that does not succeed.
-/// Never retries. Each grant binds the salt the manifest names for its
-/// administrator (every manifest names one — A-105, Q-473). Installs no
-/// attestation key ([`AttestationKeyStep::NotRequested`]; with one:
-/// [`run_with_attestation_key`]).
+/// then — once the four key sets exist — `install_attestation_key` with
+/// `attestation_key` (task PN9), then `grant_set_secret` for each first
+/// administrator in order, then `seal_ceremony` — stopping at the first
+/// call that does not succeed. Never retries. Each grant binds the salt the
+/// manifest names for its administrator (every manifest names one — A-105,
+/// Q-473). The key is consumed: its octets are wiped once the call returns,
+/// and also when the ceremony stops before the step. The one entry since
+/// task PN11: a ceremony without the key could never be sealed (keyd
+/// refuses — docs/questions/Q-1056 item 4, A-188).
 ///
 /// Spec: docs/51 §4.3 step 11, §5.8 option (b); docs/10 §7; docs/50 R50-3;
 /// docs/52 §4.2 (N4), §4.4 (R3); A-19; A-35; A-77; docs/questions/Q-367
-/// (A-88: each call's fate from the client), Q-451, Q-462 item 1.
-pub fn run<C: Connector>(client: &mut KeydClient<C>, manifest: &Manifest) -> CeremonyReport {
-    run_steps(client, manifest, None)
-}
-
-/// [`run`], and — once the four key sets exist, before the grants —
-/// `install_attestation_key` with `attestation_key` (step 3 of the module
-/// documentation; task PN9). The key is consumed: its octets are wiped once
-/// the call returns, and also when the ceremony stops before the step.
-///
-/// Spec: docs/59 §7.4, §7.5, §10 (PN9); docs/questions/Q-1011 items 2, 8
-/// (A-173), Q-1033 (A-177); docs/51 §4.3 step 11; docs/52 §4.4 (R3).
+/// (A-88: each call's fate from the client), Q-451, Q-462 item 1; docs/59
+/// §7.4, §7.5, §10 (PN9); docs/questions/Q-1011 items 2, 8 (A-173), Q-1033
+/// (A-177), Q-1056 (A-188).
 pub fn run_with_attestation_key<C: Connector>(
     client: &mut KeydClient<C>,
     manifest: &Manifest,
     attestation_key: AttestationKeyOctets,
-) -> CeremonyReport {
-    run_steps(client, manifest, Some(attestation_key))
-}
-
-/// The ceremony's steps, in order, stopping at the first that does not
-/// succeed (module documentation).
-fn run_steps<C: Connector>(
-    client: &mut KeydClient<C>,
-    manifest: &Manifest,
-    attestation_key: Option<AttestationKeyOctets>,
 ) -> CeremonyReport {
     // Task R9: the client's probe of the new connection already checked
     // that keyd gives this account the Admin role; the role in the answer
@@ -476,10 +454,7 @@ fn run_steps<C: Connector>(
     let mut report = CeremonyReport {
         contact,
         steps: Vec::with_capacity(Step::ALL.len()),
-        attestation_key: match attestation_key {
-            Some(_) => AttestationKeyStep::NotAttempted,
-            None => AttestationKeyStep::NotRequested,
-        },
+        attestation_key: AttestationKeyStep::NotAttempted,
         grants: Vec::with_capacity(first_admins),
         first_admins,
         seal: None,
@@ -506,18 +481,18 @@ fn run_steps<C: Connector>(
     // Task PN9 (docs/59 §7.4, §7.5): the attestation key, before the seal —
     // keyd installs it only in the ceremony. The call (and with it the key)
     // is dropped, and wiped, when the client returns.
-    if let Some(key) = attestation_key {
-        let call = Call::InstallAttestationKey { key };
-        let outcome = classify(client.call_with_fate(&call), |answer| match answer {
-            Answer::InstallAttestationKey(result) => Some(result),
-            _ => None,
-        });
-        drop(call);
-        let stop = !outcome.succeeded();
-        report.attestation_key = AttestationKeyStep::Attempted(outcome);
-        if stop {
-            return report;
-        }
+    let call = Call::InstallAttestationKey {
+        key: attestation_key,
+    };
+    let outcome = classify(client.call_with_fate(&call), |answer| match answer {
+        Answer::InstallAttestationKey(result) => Some(result),
+        _ => None,
+    });
+    drop(call);
+    let stop = !outcome.succeeded();
+    report.attestation_key = AttestationKeyStep::Attempted(outcome);
+    if stop {
+        return report;
     }
     let grants = &mut report.grants;
     for (admin, first_admin) in manifest.first_admins().iter().enumerate() {

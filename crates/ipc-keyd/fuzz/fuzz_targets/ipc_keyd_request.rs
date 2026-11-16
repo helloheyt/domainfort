@@ -42,6 +42,13 @@
 //! dedicated target `ipc_keyd_install_attestation_key` fuzzes its payload
 //! alone.
 //!
+//! Task PN11: a decoded `issue_as_rep` (kind `0x02`) carries the client's
+//! attested name resolution and, optionally, the change-password service's;
+//! a decoded `issue_tgs_rep` (kind `0x05`) the service's. Each is within a
+//! resolution's bounds (it decoded through `NameResolution::new`: 1..=16
+//! components, each and every realm at most 1024 octets — docs/59 §7.1);
+//! its tag is carried, never checked here (keyd verifies it, §7.2).
+//!
 //! Written, not run (PENDING-OWNER P-1).
 //!
 //! Spec: docs/50 §3.3, §3.4, §9; R50-4; A-59; docs/51 §5.8;
@@ -104,6 +111,31 @@ fuzz_target!(|body: &[u8]| {
                     "never all zero"
                 );
                 assert_eq!(format!("{key:?}"), "AttestationKeyOctets(<redacted>)");
+            }
+            // Task PN11: every decoded resolution is within its bounds.
+            let resolutions: Vec<&keyd::AttestedNameResolution> = match &call {
+                Call::IssueAsRep {
+                    client_resolution,
+                    server_resolution,
+                    ..
+                } => core::iter::once(&**client_resolution)
+                    .chain(server_resolution.as_deref())
+                    .collect(),
+                Call::IssueTgsRep {
+                    service_resolution,
+                    ..
+                } => vec![&**service_resolution],
+                _ => Vec::new(),
+            };
+            for attested in resolutions {
+                let r = attested.resolution();
+                for name in [r.name_as_sent(), r.canonical_name()] {
+                    assert!((1..=16).contains(&name.name_string.len()), "component bound");
+                    assert!(name.name_string.iter().all(|c| c.as_bytes().len() <= 1024));
+                }
+                for realm in [r.realm_as_sent(), r.canonical_realm()] {
+                    assert!(realm.as_bytes().len() <= 1024, "realm bound");
+                }
             }
             let request = call.to_wire().expect("a decoded call re-encodes");
             let frame = encode_frame(KEYD_CHANNEL, Direction::Request, &request)

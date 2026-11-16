@@ -14,10 +14,16 @@
 //! field has exactly one encoding, a decoded call or answer re-encodes to
 //! the octets it came from (docs/50 §3.3, round-trip row).
 //!
+//! An attested name resolution (task PN11) crosses as its realms, names,
+//! fields and tag: on decode every value through its strict decoder and the
+//! whole through `keyd_types::NameResolution::new` (the bounds); the tag is
+//! carried as received, never checked here (keyd verifies it — docs/59
+//! §7.2).
+//!
 //! Spec: docs/50 §3.3 (Kerberos values as DER "decoded in `krb-proto` (strict
 //! DER, already fuzzed and inside keyd's TCB)"; secret-bearing buffers
 //! zeroized), §3.4; docs/10 §4-§9; docs/questions/Q-225 item 6 (A-59),
-//! Q-245 item 1.
+//! Q-245 item 1; docs/59 §7.1, §7.5.
 
 use crate::channel::ATTESTATION_KEY_OCTETS;
 use crate::wire::{
@@ -28,17 +34,18 @@ use crate::wire::{
     SealFastErrorRequest, SetSecretRequest, VerifyOperationTicketRequest, VerifyPreauthRequest,
     VerifySecretRequest, WireAsTemplate, WireAuthnProof, WireBinding, WireChangePasswordContext,
     WireConfigDescription, WireDecidedOperation, WireDestructionPage, WireFastArmor,
-    WireOperationTicket, WireRepParts, WireSealedReply, WireServiceContext, WireSetSecretTarget,
-    WireTgsFast, WireTgsTemplate, WireTgtContext, WireTime,
+    WireNameResolution, WireOperationTicket, WireRepParts, WireSealedReply, WireServiceContext,
+    WireSetSecretTarget, WireTgsFast, WireTgsTemplate, WireTgtContext, WireTime,
 };
 use core::fmt;
 use ipc::{DerBlob, Secret};
 use keyd_types::{
-    AccountKind, ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof,
-    ChangePasswordContext, ChangePasswordCtxId, ConfigDescription, CtxId, DecidedOperation,
-    DecisionId, DestructionPage, FastArmor, FastConversation, HostAddr, IssueError, KeyHandle,
-    Kvno, Operation, OperationDigest, OperationTicket, PrincipalBinding, PrincipalId, Role,
-    SealedReply, ServiceContext, SetSecretTarget, TgsRepParts, TgsTicketTemplate, TgtContext,
+    AccountKind, ArmorId, AsRepParts, AsTicketTemplate, AttestedNameResolution, AuthnError,
+    AuthnProof, ChangePasswordContext, ChangePasswordCtxId, ConfigDescription, CtxId,
+    DecidedOperation, DecisionId, DestructionPage, FastArmor, FastConversation, HostAddr,
+    IssueError, KeyHandle, Kvno, NameResolution, NameResolutionFields, Operation, OperationDigest,
+    OperationTicket, PrincipalBinding, PrincipalId, Role, SealedReply, ServiceContext,
+    SetSecretTarget, TgsRepParts, TgsTicketTemplate, TgtContext,
 };
 use krb_proto::{
     ApRep, ApReq, EncryptedData, KerberosTime, KrbError, KrbFastArmoredReq, KrbFastReq, KrbPriv,
@@ -72,6 +79,11 @@ pub enum ConversionError {
     /// crate name-attestation `AttestationKey::from_bytes` (the same rule);
     /// AGENTS.md §6 (fail closed).
     AttestationKey,
+    /// An attested name resolution outside a resolution's bounds (task
+    /// PN11): `keyd_types::NameResolution::new` refused it. Carries no
+    /// value.
+    /// Spec: docs/59 §7.1 (the bounds); docs/50 §3.3.
+    NameResolution,
 }
 
 impl fmt::Display for ConversionError {
@@ -81,6 +93,7 @@ impl fmt::Display for ConversionError {
             ConversionError::Text => "text field is not UTF-8",
             ConversionError::UnexpectedReply => "reply does not belong to the operation called",
             ConversionError::AttestationKey => "attestation key refused",
+            ConversionError::NameResolution => "name resolution outside its bounds",
         })
     }
 }
@@ -138,6 +151,45 @@ fn time(wire: &WireTime) -> Converted<KerberosTime> {
 /// Spec: RFC 4120 5.2.3.
 fn opt_time(wire: Option<&WireTime>) -> Converted<Option<KerberosTime>> {
     wire.map(time).transpose()
+}
+
+/// The wire form of an attested name resolution: its realms' octets, its
+/// names' DER, its other fields and its tag, unchanged (task PN11).
+/// Spec: docs/59 §7.1, §7.5; docs/50 §3.3.
+fn wire_resolution(attested: &AttestedNameResolution) -> Converted<WireNameResolution> {
+    let resolution = attested.resolution();
+    Ok(WireNameResolution {
+        realm_as_sent: resolution.realm_as_sent().as_bytes().to_vec(),
+        name_as_sent: der(resolution.name_as_sent().encode())?,
+        canonical_realm: resolution.canonical_realm().as_bytes().to_vec(),
+        canonical_name: der(resolution.canonical_name().encode())?,
+        principal: resolution.principal(),
+        key_purpose: resolution.key_purpose(),
+        snapshot: resolution.snapshot(),
+        issued_at: wire_time(&resolution.issued_at()),
+        tag: *attested.tag(),
+    })
+}
+
+/// The attested name resolution of a wire value: every Kerberos value
+/// through krb-proto's strict decoder, the whole through
+/// `NameResolution::new` (the bounds — else
+/// [`ConversionError::NameResolution`]). The tag is carried as received —
+/// **not verified** here (keyd verifies it first, docs/59 §7.2 step 1).
+/// Spec: docs/59 §7.1, §7.2 step 1, §7.5; docs/50 §3.3.
+fn resolution(wire: &WireNameResolution) -> Converted<AttestedNameResolution> {
+    let resolution = NameResolution::new(NameResolutionFields {
+        realm_as_sent: realm(&wire.realm_as_sent)?,
+        name_as_sent: decoded(&wire.name_as_sent, PrincipalName::decode)?,
+        canonical_realm: realm(&wire.canonical_realm)?,
+        canonical_name: decoded(&wire.canonical_name, PrincipalName::decode)?,
+        principal: wire.principal,
+        key_purpose: wire.key_purpose,
+        snapshot: wire.snapshot,
+        issued_at: time(&wire.issued_at)?,
+    })
+    .map_err(|_| ConversionError::NameResolution)?;
+    Ok(AttestedNameResolution::new(resolution, wire.tag))
 }
 
 /// A realm's KerberosString octets checked by krb-proto.
@@ -328,11 +380,11 @@ pub enum Call {
         /// The FAST armor, if armored.
         armor: Option<ArmorId>,
     },
-    /// Spec: docs/10 §4.
+    /// Spec: docs/10 §4; docs/59 §7.5.
     IssueAsRep {
         /// PrincipalLongterm handle.
         client: KeyHandle,
-        /// Krbtgt handle.
+        /// The server's handle: Krbtgt, or (armored) ChangePasswordService.
         krbtgt: KeyHandle,
         /// The proof of `verify_preauth`.
         proof: AuthnProof,
@@ -340,6 +392,12 @@ pub enum Call {
         armor: Option<ArmorId>,
         /// The ticket template.
         template: AsTicketTemplate,
+        /// dird's resolution of the client's name (task PN11; boxed — the
+        /// call enum stays small).
+        client_resolution: Box<AttestedNameResolution>,
+        /// dird's resolution of the change-password service's name; `None`
+        /// for a TGT (task PN11).
+        server_resolution: Option<Box<AttestedNameResolution>>,
     },
     /// Spec: docs/10 §5א.
     OpenFastArmor {
@@ -361,7 +419,7 @@ pub enum Call {
         /// The implicit FAST armor, if armored.
         fast: Option<TgsFast>,
     },
-    /// Spec: docs/10 §5.
+    /// Spec: docs/10 §5; docs/59 §7.5.
     IssueTgsRep {
         /// Service handle.
         service: KeyHandle,
@@ -369,6 +427,8 @@ pub enum Call {
         ctx: CtxId,
         /// The ticket template.
         template: TgsTicketTemplate,
+        /// dird's resolution of the service's name (task PN11; boxed).
+        service_resolution: Box<AttestedNameResolution>,
     },
     /// Spec: docs/10 §5א.
     SealFastError {
@@ -594,6 +654,8 @@ impl Call {
                 proof,
                 armor,
                 template,
+                client_resolution,
+                server_resolution,
             } => KeydRequest::IssueAsRep(IssueAsRepRequest {
                 client: *client,
                 krbtgt: *krbtgt,
@@ -610,6 +672,11 @@ impl Call {
                     flags: template.flags,
                     session_enctype: template.session_enctype,
                     nonce: template.nonce,
+                },
+                client_resolution: Box::new(wire_resolution(client_resolution)?),
+                server_resolution: match server_resolution {
+                    Some(server) => Some(Box::new(wire_resolution(server)?)),
+                    None => None,
                 },
             }),
             Call::OpenFastArmor {
@@ -642,6 +709,7 @@ impl Call {
                 service,
                 ctx,
                 template,
+                service_resolution,
             } => KeydRequest::IssueTgsRep(IssueTgsRepRequest {
                 service: *service,
                 ctx: *ctx,
@@ -654,6 +722,7 @@ impl Call {
                     session_enctype: template.session_enctype,
                     nonce: template.nonce,
                 },
+                service_resolution: Box::new(wire_resolution(service_resolution)?),
             }),
             Call::SealFastError {
                 conversation,
@@ -794,6 +863,11 @@ impl Call {
                     session_enctype: m.template.session_enctype,
                     nonce: m.template.nonce,
                 },
+                client_resolution: Box::new(resolution(&m.client_resolution)?),
+                server_resolution: match &m.server_resolution {
+                    Some(server) => Some(Box::new(resolution(server)?)),
+                    None => None,
+                },
             },
             KeydRequest::OpenFastArmor(m) => Call::OpenFastArmor {
                 krbtgt: m.krbtgt,
@@ -824,6 +898,7 @@ impl Call {
                     session_enctype: m.template.session_enctype,
                     nonce: m.template.nonce,
                 },
+                service_resolution: Box::new(resolution(&m.service_resolution)?),
             },
             KeydRequest::SealFastError(m) => Call::SealFastError {
                 conversation: m.conversation,

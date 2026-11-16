@@ -39,7 +39,6 @@ use core::fmt;
 use keyd_types::{CeremonyState, DecisionId};
 use krb_crypto::{EncType, KeyUsage, ProtocolKey, CONFOUNDER_LENGTH};
 use krb_proto::KerberosTime;
-use name_attestation::AttestationKey;
 use zeroize::Zeroizing;
 
 /// The secret-custody engine.
@@ -83,18 +82,6 @@ pub struct Keyd<S: KeyStore, A: AuditSink, E: EntropySource = OsEntropy> {
     /// The ceremony state (A-102, docs/52 R3): `Provisioning` only when the
     /// store was empty at construction, until `seal_ceremony`.
     pub(crate) ceremony: CeremonyState,
-    /// The attestation key dird's name resolutions are verified with (task
-    /// PN8; docs/59 §7.2, §7.4): empty at every start, filled once — only
-    /// by `install_attestation_key`, only in the ceremony, only for
-    /// Role::Admin — and never replaced, read out or printed. `AttestationKey`
-    /// has no accessor, `Debug` or `Clone` (crate name-attestation), so the
-    /// only use of this slot is `name_attestation::verify`
-    /// (`Keyd::verify_name_resolution`); keyd never tags with it
-    /// (tests/attestation_key_custody.rs). Wiped on drop.
-    /// Spec: docs/59 §7.4; docs/questions/Q-1011 item 2 (A-173: "delivered
-    /// to keyd in ceremony mode only, never exported"); D28 / D29; A-145
-    /// RC-6 (C42).
-    pub(crate) attestation_key: Option<AttestationKey>,
     /// The last second (on the [`kerberos_time_seconds`] scale) of the
     /// startup hold-down: the start time given at construction plus
     /// [`STARTUP_HOLD_DOWN_SKEW_INTERVALS`] × `clock_skew_secs`
@@ -222,9 +209,6 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         Ok(Keyd {
             startup_hold_down_until,
             ceremony,
-            // Empty at every start: installed in this start's ceremony
-            // (docs/questions/Q-1011 item 2).
-            attestation_key: None,
             proofs: TokenTable::new(config.max_authn_proofs),
             contexts: TokenTable::new(config.max_tgt_contexts),
             armors: TokenTable::new(config.max_armor_contexts),
@@ -409,8 +393,9 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> fmt::Debug for Keyd<S, A, E> {
             )
             .field("decisions", &self.decisions.len())
             .field("ceremony", &self.ceremony)
-            // Whether the slot is filled — never the key (it has no Debug).
-            .field("attestation_key_installed", &self.attestation_key.is_some())
+            // Whether the store holds the attestation key — never the key
+            // (it has no Debug; A-190: it lives in the store).
+            .field("attestation_key_installed", &self.has_attestation_key())
             .finish()
     }
 }

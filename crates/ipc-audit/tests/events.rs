@@ -274,8 +274,10 @@ fn code_tables_are_closed() {
     // (docs/53 §9, codes 80-93); task F3 the two revocation reasons
     // (docs/questions/Q-976, codes 94-95); task PN9 the attestation-key
     // install's own reason (docs/59 §7.5, docs/questions/Q-1033 item 4, code
-    // 96), `Unlisted` last (97).
-    assert_eq!(table!(KeydReason), 97);
+    // 96); task PN11 the four name-resolution reasons (codes 97-100) and the
+    // seal's refusal without the attestation key (Q-1056 item 4, code 101),
+    // `Unlisted` last (102).
+    assert_eq!(table!(KeydReason), 102);
     assert_eq!(KeydReason::NoGrant.code(), 66);
     assert_eq!(KeydReason::GrantTableFull.code(), 69);
     assert_eq!(KeydReason::NoDecision.code(), 70);
@@ -289,7 +291,12 @@ fn code_tables_are_closed() {
     assert_eq!(KeydReason::DecisionRevoked.code(), 94);
     assert_eq!(KeydReason::DecisionExecuted.code(), 95);
     assert_eq!(KeydReason::AttestationKeyInstalled.code(), 96);
-    assert_eq!(KeydReason::Unlisted.code(), 97);
+    assert_eq!(KeydReason::AttestationKeyMissing.code(), 97);
+    assert_eq!(KeydReason::NameResolutionInvalid.code(), 98);
+    assert_eq!(KeydReason::NameResolutionStale.code(), 99);
+    assert_eq!(KeydReason::NameResolutionMismatch.code(), 100);
+    assert_eq!(KeydReason::AttestationKeyNotInstalled.code(), 101);
+    assert_eq!(KeydReason::Unlisted.code(), 102);
     assert_eq!(table!(LdapReason), 53);
     assert_eq!(table!(CodecErrorCode), 35);
     assert_eq!(table!(CodecLimit), 12);

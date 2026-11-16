@@ -211,6 +211,14 @@ fn armored_user_as_hands_keyd_the_profile() {
     assert_eq!(t.flags, TicketFlags::empty());
     assert_eq!(t.session_enctype.number(), AES256);
     assert_eq!(t.nonce, spec.nonce);
+    // Task PN11 (docs/59 §7.2, §7.5): the KDC forwards both records'
+    // resolutions as dird sent them — alice's, and the change-password
+    // service's, which keyd binds that key set by.
+    assert_eq!(call.client_resolution.name_as_sent(), &alice_name());
+    assert_eq!(call.client_resolution.principal(), ALICE.principal);
+    let server = call.server_resolution.as_ref().expect("the service's");
+    assert_eq!(server.canonical_name(), &change_password_name());
+    assert_eq!(server.key_purpose(), KeyPurpose::ChangePasswordService);
     assert_eq!(
         f.keyd_ops()[..3],
         [

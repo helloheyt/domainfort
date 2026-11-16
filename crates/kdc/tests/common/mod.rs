@@ -34,8 +34,13 @@
 //! record's key set, issued at [`now`] — and tags it with the fixtures'
 //! test attestation key ([`TEST_ATTESTATION_KEY`]) through crate
 //! name-attestation's signer (a dev-dependency of every crate that reuses
-//! this module; the KDC itself links no MAC — D182). The KDC carries the
-//! resolution without reading it until task PN11.
+//! this module; the KDC itself links no MAC — D182). Since task PN11 the KDC
+//! forwards it to keyd, which verifies it on its own clock (30 s — docs/59
+//! §7.2): the fixture keyd holds the same test key (installed in its
+//! ceremony, as keyadm does), and [`Fixture::send_at`] answers the KDC
+//! through [`Resigning`], which states each record's resolution again at
+//! the request's time — as dird signs at lookup time (crates/ipc-directory-
+//! server `ResolutionSigner`).
 //!
 //! Every value here is constructed by hand for these tests. No vector or
 //! fixture comes from any other implementation.
@@ -52,7 +57,7 @@ use keyd::{
     KeydConfig, LocalKeyd, PrincipalBinding, PrincipalId, Role, SetSecretTarget, TicketPolicy,
     MAX_SET_SECRET_GRANT_SECS,
 };
-use keyd_types::{AttestedNameResolution, NameResolution, NameResolutionFields};
+use keyd_types::{AsResolutions, AttestedNameResolution, NameResolution, NameResolutionFields};
 use krb_crypto::{EncType, KeyUsage, ProtocolKey};
 use krb_proto::constants::{
     FX_FAST_ARMOR_AP_REQUEST, KRB_NT_PRINCIPAL, KRB_NT_SRV_HST, KRB_NT_SRV_INST,
@@ -522,13 +527,16 @@ pub struct TestCustody {
 }
 
 /// One `issue_as_rep` call: the client and server key sets, whether it was
-/// armored, and the template. TESTS ONLY.
+/// armored, the template, and the resolutions the KDC forwarded (task
+/// PN11). TESTS ONLY.
 #[derive(Debug, Clone)]
 pub struct IssueAsRepCall {
     pub client: KeyHandle,
     pub server: KeyHandle,
     pub armored: bool,
     pub template: keyd::AsTicketTemplate,
+    pub client_resolution: NameResolution,
+    pub server_resolution: Option<NameResolution>,
 }
 
 impl TestCustody {
@@ -570,6 +578,7 @@ impl KeyCustody for TestCustody {
         proof: &keyd::AuthnProof,
         armor: Option<keyd::ArmorId>,
         template: &keyd::AsTicketTemplate,
+        resolutions: AsResolutions<'_>,
         now: &KerberosTime,
     ) -> Result<keyd::AsRepParts, keyd::IssueError> {
         self.issue_as_rep_calls.push(IssueAsRepCall {
@@ -577,12 +586,14 @@ impl KeyCustody for TestCustody {
             server: *server,
             armored: armor.is_some(),
             template: template.clone(),
+            client_resolution: resolutions.client.resolution().clone(),
+            server_resolution: resolutions.server.map(|r| r.resolution().clone()),
         });
         if self.down(CustodyOp::IssueAsRep) {
             return Err(keyd::IssueError::Unavailable);
         }
         self.inner
-            .issue_as_rep(client, server, proof, armor, template, now)
+            .issue_as_rep(client, server, proof, armor, template, resolutions, now)
     }
     fn open_fast_armor(
         &mut self,
@@ -614,6 +625,7 @@ impl KeyCustody for TestCustody {
     fn issue_tgs_rep(
         &mut self,
         service: &KeyHandle,
+        service_resolution: &AttestedNameResolution,
         ctx: &keyd::CtxId,
         template: &keyd::TgsTicketTemplate,
         now: &KerberosTime,
@@ -621,7 +633,8 @@ impl KeyCustody for TestCustody {
         if self.down(CustodyOp::IssueTgsRep) {
             return Err(keyd::IssueError::Unavailable);
         }
-        self.inner.issue_tgs_rep(service, ctx, template, now)
+        self.inner
+            .issue_tgs_rep(service, service_resolution, ctx, template, now)
     }
     fn seal_fast_error(
         &mut self,
@@ -714,6 +727,11 @@ pub fn etype_info(salt: &str) -> Vec<EtypeInfo2Entry> {
 /// the test keyd's copy (docs/59 §7.4). Test data, made up here.
 pub const TEST_ATTESTATION_KEY: [u8; ATTESTATION_KEY_LEN] = [0x4B; ATTESTATION_KEY_LEN];
 
+/// The fixtures' attestation key, for keyd's `install_attestation_key`.
+pub fn test_attestation_key() -> AttestationKey {
+    AttestationKey::from_bytes(&TEST_ATTESTATION_KEY).expect("a non-zero test key")
+}
+
 /// The resolution dird attests for a record looked up by `name` in
 /// [`realm`] that resolved to the key set `key` (docs/59 §7.1): the name as
 /// sent is the canonical name (the phase-1 acceptance, docs/59 §6.3 wave
@@ -737,6 +755,58 @@ pub fn test_resolution(name: &PrincipalName, key: KeyHandle) -> AttestedNameReso
     let attestation_key =
         AttestationKey::from_bytes(&TEST_ATTESTATION_KEY).expect("a non-zero test key");
     name_attestation::tag(&attestation_key, &resolution).expect("a tagged resolution")
+}
+
+/// `resolution` stated again at `when` — the same realms, names, key set
+/// and snapshot, a new issue time, tagged with [`TEST_ATTESTATION_KEY`]:
+/// what dird's signer answers for the same lookup made at `when`.
+/// Spec: docs/59 §7.1, §7.2 step 3 (keyd judges freshness on its clock).
+pub fn restated_at(
+    resolution: &AttestedNameResolution,
+    when: &KerberosTime,
+) -> AttestedNameResolution {
+    let mut fields = resolution.resolution().clone().into_fields();
+    fields.issued_at = *when;
+    let resolution = NameResolution::new(fields).expect("a resolution within its bounds");
+    let attestation_key =
+        AttestationKey::from_bytes(&TEST_ATTESTATION_KEY).expect("a non-zero test key");
+    name_attestation::tag(&attestation_key, &resolution).expect("a tagged resolution")
+}
+
+/// The fixtures' account source as the KDC sees it at one request's time:
+/// every record `inner` answers carries its resolution stated again at
+/// `at` ([`restated_at`]) — dird signs each answer at lookup time (crates/
+/// ipc-directory-server `ResolutionSigner`), so the KDC forwards a fresh
+/// one whatever the test's clock says. Failures and "no such principal"
+/// pass through unchanged. TESTS ONLY.
+/// Spec: docs/59 §7.1, §7.2 step 3, §7.5.
+pub struct Resigning<'a> {
+    pub inner: &'a dyn kdc::AccountSource,
+    pub at: KerberosTime,
+}
+
+impl kdc::AccountSource for Resigning<'_> {
+    fn client(
+        &self,
+        realm: &Realm,
+        name: &PrincipalName,
+    ) -> Result<Option<ClientAccount>, kdc::AccountSourceError> {
+        Ok(self.inner.client(realm, name)?.map(|mut account| {
+            account.resolution = restated_at(&account.resolution, &self.at);
+            account
+        }))
+    }
+
+    fn service(
+        &self,
+        realm: &Realm,
+        name: &PrincipalName,
+    ) -> Result<Option<ServiceAccount>, kdc::AccountSourceError> {
+        Ok(self.inner.service(realm, name)?.map(|mut account| {
+            account.resolution = restated_at(&account.resolution, &self.at);
+            account
+        }))
+    }
 }
 
 /// alice: a user account, so FAST is required (docs/48 §7.1, the production
@@ -819,6 +889,10 @@ impl Fixture {
             )
             .unwrap();
         }
+        // The ceremony hands keyd dird's attestation key (task PN11: keyd
+        // verifies the resolutions the KDC forwards with it).
+        keyd.install_attestation_key(&ADMIN, test_attestation_key(), &n)
+            .unwrap();
         for (handle, who, password, salt) in [
             (ALICE, alice_name(), ALICE_PASSWORD, ALICE_SALT),
             (BOB, bob_name(), BOB_PASSWORD, BOB_SALT),
@@ -971,6 +1045,11 @@ impl Fixture {
             snapshot: &self.snapshot,
             pip: &self.pip,
         };
+        // dird states each resolution at lookup time (module docs).
+        let accounts = Resigning {
+            inner: &self.accounts,
+            at: when,
+        };
         self.kdc.handle(
             request,
             Peer {
@@ -979,7 +1058,7 @@ impl Fixture {
             },
             when,
             &inputs,
-            &self.accounts,
+            &accounts,
         )
     }
 

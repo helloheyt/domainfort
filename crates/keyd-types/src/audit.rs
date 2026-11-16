@@ -491,6 +491,16 @@ pub enum AuditReason {
     /// Spec: docs/59 §7.2 step 4, §7.5; docs/questions/Q-1011 item 4
     /// (A-173: "NameResolutionMismatch"); RFC 4120 §6.2, §7.3.
     NameResolutionMismatch,
+    // ---- task PN11: the seal needs the attestation key (Q-1056, A-188) --
+    /// `seal_ceremony` while keyd holds no attestation key: a keyd sealed
+    /// without it could verify no name resolution and so would refuse every
+    /// AS / TGS issuance, with no Admin operation left to repair it short of
+    /// a restart (docs/52 R3). The seal is refused instead, so a sealed keyd
+    /// without the key is unrepresentable, whichever client asks. Nothing
+    /// changes; the ceremony stays open. Reported as the uniform `Denied`.
+    /// Spec: docs/questions/Q-1056 item 4 (A-188); docs/59 §7.2 step 1, §7.4;
+    /// docs/52 §4.4 (R3); AGENTS.md §6.1.
+    AttestationKeyNotInstalled,
 }
 
 /// A key referenced by an operation, for audit (no key material).

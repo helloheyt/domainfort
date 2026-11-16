@@ -230,7 +230,7 @@ fn destroyed_handle_is_unknown_to_every_operation() {
     }
     assert_eq!(
         f.keyd
-            .issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, None, &as_template(), &now()),
+            .issue_as(&KDC, &ALICE, &KRBTGT, &proof, None, &as_template(), &now()),
         Err(IssueError::Denied)
     );
     let rotation = f
@@ -382,7 +382,7 @@ fn destroy_discards_live_proofs_of_the_key_set() {
     );
     assert_eq!(
         f.keyd
-            .issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, None, &as_template(), &now()),
+            .issue_as(&KDC, &ALICE, &KRBTGT, &proof, None, &as_template(), &now()),
         Err(IssueError::Denied)
     );
     assert_eq!(
@@ -476,7 +476,7 @@ fn destroy_takes_both_key_sets_of_the_principal() {
     template.cname = client_name.clone();
     assert_eq!(
         f.keyd
-            .issue_as_rep(&KDC, &client, &KRBTGT, &proof, None, &template, &now()),
+            .issue_as(&KDC, &client, &KRBTGT, &proof, None, &template, &now()),
         Err(IssueError::Denied)
     );
     assert_eq!(
@@ -520,7 +520,7 @@ fn destroyed_service_key_issues_no_ticket() {
     let ctx = open_tgt(&mut f, &tgt, 31, 31);
     assert_eq!(
         f.keyd
-            .issue_tgs_rep(&KDC, &SERVICE, &ctx.ctx_id, &tgs_template(31), &now()),
+            .issue_tgs(&KDC, &SERVICE, &ctx.ctx_id, &tgs_template(31), &now()),
         Err(IssueError::Denied)
     );
     assert_eq!(f.records().last().unwrap().reason, AuditReason::KeyNotFound);
@@ -578,7 +578,7 @@ fn destroy_key_set_role_krbtgt_and_unknown_decision() {
     let ctx = open_tgt(&mut f, &tgt, 33, 33);
     assert!(f
         .keyd
-        .issue_tgs_rep(&KDC, &SERVICE, &ctx.ctx_id, &tgs_template(33), &now())
+        .issue_tgs(&KDC, &SERVICE, &ctx.ctx_id, &tgs_template(33), &now())
         .is_ok());
 }
 

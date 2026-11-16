@@ -89,8 +89,8 @@ use ipc_audit_client::AckedIntent;
 use ipc_keyd::AttestationKeyOctets;
 use ipc_keyd::{Answer, Call, DescribedConfig};
 use keyd::{
-    AttestationKey, AuditSink, CallerId, EntropySource, KeyStore, Keyd, TgsFastRequest,
-    ATTESTATION_KEY_LEN,
+    AsResolutions, AttestationKey, AuditSink, CallerId, EntropySource, KeyStore, Keyd,
+    TgsFastRequest, ATTESTATION_KEY_LEN,
 };
 use krb_proto::KerberosTime;
 
@@ -218,9 +218,21 @@ fn run<S: KeyStore, A: AuditSink, E: EntropySource>(
             proof,
             armor,
             template,
-        } => Answer::IssueAsRep(
-            keyd.issue_as_rep(caller, &client, &krbtgt, &proof, armor, &template, now),
-        ),
+            client_resolution,
+            server_resolution,
+        } => Answer::IssueAsRep(keyd.issue_as_rep(
+            caller,
+            &client,
+            &krbtgt,
+            &proof,
+            armor,
+            &template,
+            AsResolutions {
+                client: &client_resolution,
+                server: server_resolution.as_deref(),
+            },
+            now,
+        )),
         Call::OpenFastArmor {
             krbtgt,
             armored_req,
@@ -250,7 +262,15 @@ fn run<S: KeyStore, A: AuditSink, E: EntropySource>(
             service,
             ctx,
             template,
-        } => Answer::IssueTgsRep(keyd.issue_tgs_rep(caller, &service, &ctx, &template, now)),
+            service_resolution,
+        } => Answer::IssueTgsRep(keyd.issue_tgs_rep(
+            caller,
+            &service,
+            &service_resolution,
+            &ctx,
+            &template,
+            now,
+        )),
         Call::SealFastError {
             conversation,
             error,

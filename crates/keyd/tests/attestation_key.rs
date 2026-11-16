@@ -11,8 +11,9 @@
 //! mode only, never exported"), Q-1033 (A-177: the `Operation`, the
 //! capability-table row, the audit record); docs/52 §4.4, §7 R3 (A-102: the
 //! ceremony exists only for an empty store, until `seal_ceremony`); docs/10
-//! §10, §12 I8. The verification itself (tag, realm, freshness, `bound_by`)
-//! is crate-internal until issuance adopts it (task PN11) and is tested in
+//! §10, §12 I8; docs/questions/Q-1056 item 4 (A-188: no seal without the
+//! key — task PN11). The verification itself is tested through issuance in
+//! tests/issuance_by_resolution.rs and inside the crate in
 //! crates/keyd/src/name_resolution.rs. Every value is made up here; no
 //! vector comes from any other implementation.
 
@@ -108,20 +109,55 @@ fn no_other_role_installs_the_key() {
     assert_eq!(keyd.audit_sink().records.len(), 3);
 }
 
+/// Q-1056 item 4 (A-188; task PN11): keyd refuses to seal its ceremony
+/// while it holds no attestation key — `Denied` / `AttestationKeyNotInstalled`,
+/// one record, the ceremony still open — for every client (the PEP, not a
+/// tool, holds the rule); once the key is installed the seal succeeds. A
+/// sealed keyd that could verify no name resolution is unrepresentable.
+#[test]
+fn no_seal_without_the_attestation_key() {
+    let mut keyd = ceremony_keyd();
+    assert_eq!(keyd.seal_ceremony(&ADMIN, &now()), Err(Error::Denied));
+    assert_eq!(keyd.ceremony_state(), CeremonyState::Provisioning);
+    assert_eq!(
+        last(&keyd),
+        (
+            Operation::SealCeremony,
+            AuditOutcome::Denied,
+            AuditReason::AttestationKeyNotInstalled
+        )
+    );
+    // The authorization step still comes first (another role: its reason).
+    assert_eq!(keyd.seal_ceremony(&KDC, &now()), Err(Error::Denied));
+    assert_eq!(last(&keyd).2, AuditReason::RoleNotPermitted);
+    // With the key the ceremony seals — and a re-run of the seal is
+    // harmless, as before.
+    assert_eq!(keyd.install_attestation_key(&ADMIN, key(), &now()), Ok(()));
+    assert_eq!(keyd.seal_ceremony(&ADMIN, &now()), Ok(()));
+    assert_eq!(keyd.ceremony_state(), CeremonyState::Operational);
+    assert_eq!(keyd.seal_ceremony(&ADMIN, &now()), Ok(()));
+    assert_eq!(keyd.audit_sink().records.len(), 5, "one record per call");
+}
+
 /// docs/52 R3 (A-102); Q-1011 item 2: after the seal no key is installed —
-/// neither on an empty keyd nor on one whose ceremony created key sets; the
-/// refusal is `CeremonySealed` (the authorization step's, as for
-/// `create_key`). (A keyd that starts operational has no ceremony at all —
-/// crate tests of `install_attestation_key_inner`.)
+/// neither a replacement on an empty keyd nor on one whose ceremony created
+/// key sets; the refusal is `CeremonySealed` (the authorization step's, as
+/// for `create_key`), and the key the ceremony installed stays. (A keyd
+/// that starts operational has no ceremony at all — crate tests of
+/// `install_attestation_key_inner`.)
 #[test]
 fn no_key_is_installed_outside_the_ceremony() {
     let mut sealed = ceremony_keyd();
+    assert_eq!(
+        sealed.install_attestation_key(&ADMIN, key(), &now()),
+        Ok(())
+    );
     assert_eq!(sealed.seal_ceremony(&ADMIN, &now()), Ok(()));
     assert_eq!(
         sealed.install_attestation_key(&ADMIN, key(), &now()),
         Err(Error::Denied)
     );
-    assert!(!sealed.has_attestation_key());
+    assert!(sealed.has_attestation_key());
     assert_eq!(
         last(&sealed),
         (
@@ -131,14 +167,15 @@ fn no_key_is_installed_outside_the_ceremony() {
         )
     );
 
-    // A ceremony that already created keys, then sealed.
+    // A ceremony that already created keys (and installed the fixtures'
+    // key), then sealed.
     let mut f = Fixture::new();
     assert_eq!(f.keyd.seal_ceremony(&ADMIN, &now()), Ok(()));
     assert_eq!(
         f.keyd.install_attestation_key(&ADMIN, key(), &now()),
         Err(Error::Denied)
     );
-    assert!(!f.keyd.has_attestation_key());
+    assert!(f.keyd.has_attestation_key());
     assert_eq!(
         f.records().last().map(|r| r.reason),
         Some(AuditReason::CeremonySealed)

@@ -38,7 +38,12 @@
 //!
 //! Every account record carries the name resolution dird would attest for it
 //! (task PN10; docs/59 §7.1, §7.5), tagged with a harness key through crate
-//! name-attestation's `tag`; the KDC carries it unread until task PN11.
+//! name-attestation's `tag`. Since task PN11 the KDC forwards it and keyd
+//! verifies it (30 s on keyd's clock — docs/59 §7.2): keyd's ceremony
+//! installs the harness key, and each input's lookups are answered through
+//! [`AtTime`], which states every resolution again at the input's time, as
+//! dird signs at lookup time — so the harness clock's advance never turns
+//! the fuzzed paths into stale-resolution refusals.
 //!
 //! Spec: RFC 4120 7.2.1, 7.2.2, 5.1.4, 5.9.1; RFC 6113 5.4.1.1, 5.4.2,
 //! 5.4.3, 5.4.6; docs/48 §9.2 item 16; docs/59 §7.1; AGENTS.md §6.
@@ -56,7 +61,7 @@ use kdc::{
 // account record): two types, so keyd's is renamed here (the harness did
 // not build with both under one name — docs/questions/Q-1046 item 8).
 use keyd::{
-    AccountKind as SecretAccountKind, AuditRecord, CallerId, InMemoryKeyStore, KeyHandle, KeyPurpose, Keyd, KeydConfig,
+    AccountKind as SecretAccountKind, AttestationKey, AuditRecord, CallerId, InMemoryKeyStore, KeyHandle, KeyPurpose, Keyd, KeydConfig,
     LocalKeyd, OsEntropy, PrincipalBinding, PrincipalId, Role, SetSecretTarget,
     MAX_SET_SECRET_GRANT_SECS,
 };
@@ -96,8 +101,54 @@ fn resolution(realm: &Realm, name: &PrincipalName, key: KeyHandle) -> AttestedNa
     })
     .expect("a resolution within its bounds");
     let harness_key =
-        name_attestation::AttestationKey::from_bytes(&[0x4B; 32]).expect("a harness key");
+        name_attestation::AttestationKey::from_bytes(&HARNESS_ATTESTATION_KEY).expect("a harness key");
     name_attestation::tag(&harness_key, &resolution).expect("a tagged resolution")
+}
+
+/// The harness's attestation key: dird's (its `tag`) and keyd's (installed
+/// in the ceremony, task PN11).
+const HARNESS_ATTESTATION_KEY: [u8; 32] = [0x4B; 32];
+
+/// `attested` stated again at `at`: the same fields, a new issue time, the
+/// harness key's tag — what dird answers for the same lookup at `at`.
+fn restated(attested: &AttestedNameResolution, at: &KerberosTime) -> AttestedNameResolution {
+    let mut fields = attested.resolution().clone().into_fields();
+    fields.issued_at = *at;
+    let resolution = NameResolution::new(fields).expect("a resolution within its bounds");
+    let harness_key =
+        name_attestation::AttestationKey::from_bytes(&HARNESS_ATTESTATION_KEY).expect("a harness key");
+    name_attestation::tag(&harness_key, &resolution).expect("a tagged resolution")
+}
+
+/// The account source of one input at its time (task PN11): every record
+/// carries its resolution stated again at `at` (module docs).
+struct AtTime<'a> {
+    inner: &'a InMemoryAccounts,
+    at: KerberosTime,
+}
+
+impl kdc::AccountSource for AtTime<'_> {
+    fn client(
+        &self,
+        realm: &Realm,
+        name: &PrincipalName,
+    ) -> Result<Option<ClientAccount>, kdc::AccountSourceError> {
+        Ok(self.inner.client(realm, name)?.map(|mut account| {
+            account.resolution = restated(&account.resolution, &self.at);
+            account
+        }))
+    }
+
+    fn service(
+        &self,
+        realm: &Realm,
+        name: &PrincipalName,
+    ) -> Result<Option<ServiceAccount>, kdc::AccountSourceError> {
+        Ok(self.inner.service(realm, name)?.map(|mut account| {
+            account.resolution = restated(&account.resolution, &self.at);
+            account
+        }))
+    }
 }
 
 struct NoKeydAudit;
@@ -473,6 +524,13 @@ fn build() -> FuzzState {
         )
         .expect("key created");
     }
+    // The ceremony installs dird's attestation key (task PN11).
+    keyd.install_attestation_key(
+        &ADMIN,
+        AttestationKey::from_bytes(&HARNESS_ATTESTATION_KEY).expect("a harness key"),
+        &n,
+    )
+    .expect("attestation key installed");
     for (kind, handle, binding, password, salt) in [
         (
             SecretAccountKind::User,
@@ -836,7 +894,12 @@ fuzz_target!(|data: &[u8]| {
         accounts,
         ..
     } = &mut *guard;
-    let accounts: &InMemoryAccounts = accounts;
+    // dird states each resolution at lookup time (module docs; task PN11).
+    let at_time = AtTime {
+        inner: accounts,
+        at: when,
+    };
+    let accounts: &AtTime<'_> = &at_time;
     let inputs = PolicyInputs {
         snapshot: &*snapshot,
         pip: &*pip,

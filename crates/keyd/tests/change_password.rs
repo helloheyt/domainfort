@@ -901,7 +901,7 @@ fn the_change_password_key_is_opened_by_its_operation_only() {
     assert_eq!(last(&f).reason, AuditReason::KeyNotFound);
     assert!(f
         .keyd
-        .issue_tgs_rep(
+        .issue_tgs(
             &KDC,
             &CHANGE_PASSWORD_SERVICE,
             &keyd::CtxId::from_bytes([1; 16]),
@@ -1477,7 +1477,7 @@ fn issue_armored(
     server: &KeyHandle,
     template: &AsTicketTemplate,
 ) -> Result<AsRepParts, IssueError> {
-    f.keyd.issue_as_rep(
+    f.keyd.issue_as(
         &KDC,
         &ALICE,
         server,
@@ -1641,7 +1641,7 @@ fn an_unarmored_change_password_issuance_is_refused() {
         .unwrap();
     assert_eq!(
         f.keyd
-            .issue_as_rep(
+            .issue_as(
                 &KDC,
                 &ALICE,
                 &CHANGE_PASSWORD_SERVICE,
@@ -1657,7 +1657,7 @@ fn an_unarmored_change_password_issuance_is_refused() {
     assert_eq!(last(&f).reason, AuditReason::PurposeMismatch);
     let tgt_parts = f
         .keyd
-        .issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, None, &as_template(), &now())
+        .issue_as(&KDC, &ALICE, &KRBTGT, &proof, None, &as_template(), &now())
         .unwrap();
     assert_eq!(tgt_parts.ticket.sname, krbtgt_name());
 
@@ -1666,7 +1666,7 @@ fn an_unarmored_change_password_issuance_is_refused() {
     let proof = armored_proof(&mut f, &c);
     assert_eq!(
         f.keyd
-            .issue_as_rep(
+            .issue_as(
                 &KDC,
                 &ALICE,
                 &CHANGE_PASSWORD_SERVICE,
@@ -1687,6 +1687,97 @@ fn an_unarmored_change_password_issuance_is_refused() {
         &change_password_template(at(300)),
     )
     .is_ok());
+}
+
+/// Task PN11 (docs/59 §7.2; the change-password service is a non-krbtgt key
+/// set, so keyd reaches it only through dird's verified resolution, like
+/// every client and service key): an armored AS for `kadmin/changepw` whose
+/// server resolution is missing, names another principal, another purpose,
+/// or another name is refused (`NameResolutionMismatch`); a forged one is
+/// `NameResolutionInvalid`; dird's honest resolution issues. RFC 3244 §2
+/// (the service principal `kadmin/changepw@REALM`); [MS-KILE] v20261110
+/// 3.3.5.1.2 (that name is never canonicalised — as sent equals canonical).
+#[test]
+fn the_change_password_service_is_reached_only_through_its_resolution() {
+    let (mut f, tgt) = as_fixture();
+    let template = change_password_template(at(300));
+    let alice = resolution_at(&alice_name(), &ALICE, &now());
+    let honest = resolution_fields(
+        &realm(),
+        &change_password_service_name(),
+        &CHANGE_PASSWORD_SERVICE,
+        &now(),
+    );
+    let mut other_principal = honest.clone();
+    other_principal.principal = ALICE_ID;
+    let mut other_purpose = honest.clone();
+    other_purpose.key_purpose = KeyPurpose::Service;
+    let mut other_name = honest.clone();
+    other_name.name_as_sent = service_name();
+    other_name.canonical_name = service_name();
+    let cases = [
+        (None, AuditReason::NameResolutionMismatch),
+        (
+            Some(signed(other_principal, &ATTESTATION_KEY)),
+            AuditReason::NameResolutionMismatch,
+        ),
+        (
+            Some(signed(other_purpose, &ATTESTATION_KEY)),
+            AuditReason::NameResolutionMismatch,
+        ),
+        (
+            Some(signed(other_name, &ATTESTATION_KEY)),
+            AuditReason::NameResolutionMismatch,
+        ),
+        (
+            Some(signed(honest.clone(), &FORGED_ATTESTATION_KEY)),
+            AuditReason::NameResolutionInvalid,
+        ),
+    ];
+    for (cusec, (server, reason)) in (10..).zip(cases) {
+        let c = open_conversation(&mut f, &tgt, cusec);
+        let proof = armored_proof(&mut f, &c);
+        assert_eq!(
+            f.keyd
+                .issue_as_rep(
+                    &KDC,
+                    &ALICE,
+                    &CHANGE_PASSWORD_SERVICE,
+                    &proof,
+                    Some(c.armor.armor_id),
+                    &template,
+                    keyd::AsResolutions {
+                        client: &alice,
+                        server: server.as_ref(),
+                    },
+                    &now(),
+                )
+                .map(|_| ()),
+            Err(IssueError::Denied),
+            "{reason:?}"
+        );
+        assert_eq!(last(&f).reason, reason);
+    }
+    let c = open_conversation(&mut f, &tgt, 20);
+    let proof = armored_proof(&mut f, &c);
+    let honest = signed(honest, &ATTESTATION_KEY);
+    let parts = f
+        .keyd
+        .issue_as_rep(
+            &KDC,
+            &ALICE,
+            &CHANGE_PASSWORD_SERVICE,
+            &proof,
+            Some(c.armor.armor_id),
+            &template,
+            keyd::AsResolutions {
+                client: &alice,
+                server: Some(&honest),
+            },
+            &now(),
+        )
+        .unwrap();
+    assert_eq!(parts.ticket.sname, change_password_service_name());
 }
 
 /// keyd enforces the profile whatever the KDC asks (docs/53 §5.2: "lifetime

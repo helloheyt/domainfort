@@ -80,7 +80,8 @@ fn ceremony(config_path: &Path, manifest_path: &Path, attestation_key_path: &Pat
     // Every manifest names each first administrator's salt (A-105,
     // docs/questions/Q-473): nothing to refuse before contacting keyd.
     // Task PN12: the binary always installs the key (the operand is
-    // required); the keyless library entry (`ceremony::run`) is not used.
+    // required); since task PN11 the library has no keyless entry either
+    // (keyd refuses to seal without the key — Q-1056, A-188).
     let outcome = ceremony::run_with_attestation_key(&mut client, &manifest, attestation_key);
     print(report::render(&outcome, &manifest));
     ExitCode::from(report::exit_code(&outcome))

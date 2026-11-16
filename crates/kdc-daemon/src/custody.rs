@@ -20,9 +20,9 @@
 //! Q-218 (A-57), Q-252 item 8 (A-64); crates/keyd-types custody.rs.
 
 use keyd_types::{
-    ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof, ConfigDescription, CtxId, Error,
-    FastArmor, FastConversation, IssueError, KeyCustody, KeyHandle, TgsFastRequest, TgsRepParts,
-    TgsTicketTemplate, TgtContext,
+    ArmorId, AsRepParts, AsResolutions, AsTicketTemplate, AttestedNameResolution, AuthnError,
+    AuthnProof, ConfigDescription, CtxId, Error, FastArmor, FastConversation, IssueError,
+    KeyCustody, KeyHandle, TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext,
 };
 use krb_proto::{ApReq, EncryptedData, KerberosTime, KrbError, KrbFastArmoredReq, PaData};
 
@@ -92,13 +92,14 @@ impl<K: KeyCustody> KeyCustody for GatedCustody<K> {
         proof: &AuthnProof,
         armor: Option<ArmorId>,
         template: &AsTicketTemplate,
+        resolutions: AsResolutions<'_>,
         now: &KerberosTime,
     ) -> Result<AsRepParts, IssueError> {
         if !self.serving {
             return Err(IssueError::Unavailable);
         }
         self.inner
-            .issue_as_rep(client, krbtgt, proof, armor, template, now)
+            .issue_as_rep(client, krbtgt, proof, armor, template, resolutions, now)
     }
 
     fn open_fast_armor(
@@ -133,6 +134,7 @@ impl<K: KeyCustody> KeyCustody for GatedCustody<K> {
     fn issue_tgs_rep(
         &mut self,
         service: &KeyHandle,
+        service_resolution: &AttestedNameResolution,
         ctx: &CtxId,
         template: &TgsTicketTemplate,
         now: &KerberosTime,
@@ -140,7 +142,8 @@ impl<K: KeyCustody> KeyCustody for GatedCustody<K> {
         if !self.serving {
             return Err(IssueError::Unavailable);
         }
-        self.inner.issue_tgs_rep(service, ctx, template, now)
+        self.inner
+            .issue_tgs_rep(service, service_resolution, ctx, template, now)
     }
 
     fn seal_fast_error(

@@ -1,6 +1,7 @@
 //! keyd's side of dird's name-resolution attestation (task PN8; docs/59 §7;
 //! decision A-173 — docs/questions/Q-1011): the verified resolution, the
-//! one function that makes it, and the attestation key's slot it reads.
+//! one function that makes it, reading the attestation key from keyd's key
+//! store (A-190).
 //!
 //! # What it does
 //!
@@ -16,17 +17,20 @@
 //! 3. freshness on keyd's own clock: `|now − issued_at| ≤ 30 s`
 //!    (`NameResolution::is_fresh_at`; `now` never from the wire — R50-5);
 //!
-//! — and only then is there a [`VerifiedNameResolution`]. Step 4 (the
-//! resolution names the key set: principal, purpose, bound name) is
+//! — and only then is there a [`VerifiedNameResolution`]. Steps 4 and 5
+//! (the resolution names the key set: principal, purpose, bound name; the
+//! ticket's name is one of the resolution's two names) are
 //! `StoredKeySet::bound_by` (crate store), the only way from a verified
 //! resolution to a key.
 //!
-//! # Additive (task PN8)
+//! # Issuance through the resolution (task PN11)
 //!
-//! Nothing outside tests calls [`Keyd::verify_name_resolution`] or
-//! `StoredKeySet::bound_by` yet: AS / TGS issuance still binds by
-//! `StoredKeySet::bound_to` and moves to the resolution in task PN11; the
-//! wire of the install operation is task PN9 (docs/59 §10).
+//! `issue_as_rep` (the client key set; the change-password service's) and
+//! `issue_tgs_rep` (the service key set) verify the resolution the KDC
+//! forwarded and reach the key only through `bound_by`; the krbtgt is
+//! reached by its exact stored binding (`StoredKeySet::ticket_granting`) and
+//! the acceptor compares the ticket's sname through [`same_principal`]
+//! (`StoredKeySet::accepting`) — docs/59 §7.2.
 //!
 //! # Classes closed by construction (AGENTS.md §6.1)
 //!
@@ -39,13 +43,16 @@
 //!   freshness was not checked cannot be represented as verified, and the
 //!   only door to a key (`bound_by`) takes nothing else.
 //! * **Key export / MAC oracle** (D28 / D29; A-145 RC-6, C42). The key enters
-//!   once, by `Keyd::install_attestation_key` (crate admin), and is held in a
-//!   private slot of [`Keyd`]; `AttestationKey` has no accessor, `Debug` or
-//!   `Clone`, so no keyd code can hand out its octets, and no keyd function
-//!   returns the key or tags with it — keyd only verifies (pinned lexically
-//!   by tests/attestation_key_custody.rs: the product source never names
-//!   `name_attestation::tag` or `AttestationKey::from_bytes`, and no
-//!   signature returns an `AttestationKey`).
+//!   once, by `Keyd::install_attestation_key` (crate admin), and is held in
+//!   keyd's key store (`KeyStore::install_attestation_key`, A-190 — so a
+//!   store that outlives a keyd lifetime carries it with the key sets);
+//!   `AttestationKey` has no accessor, `Debug` or `Clone`, so no keyd code
+//!   can hand out its octets, and no keyd function returns the key or tags
+//!   with it — keyd only verifies (pinned lexically by
+//!   tests/attestation_key_custody.rs: the product source never names
+//!   `name_attestation::tag` or `AttestationKey::from_bytes`, no signature
+//!   but the store's read accessor returns an `AttestationKey`, and only
+//!   this file reads it).
 //! * **A second name equivalence** (C49). Whether the resolution's canonical
 //!   name is the key set's bound name is decided by `principal-names` (the
 //!   namespace key of both names), never by an octet comparison written here.
@@ -57,10 +64,12 @@
 //! * A compromised dird can sign a false resolution (S5; dird owns the fact —
 //!   C16): `check_new_binding` at creation and the binding compare of
 //!   `bound_by` narrow what it can map a name to.
-//! * The key lives in process memory, installed again at every start (the
-//!   development custody until KL3 — P-71); a keyd that starts operational
-//!   (a non-empty store) has no ceremony and so no key: every resolution is
-//!   refused (fail closed) until the sealed store keeps the key (KL3).
+//! * The key lives in keyd's store (A-190): with the development store, in
+//!   process memory, installed again at every start (P-71). A store that
+//!   outlives a keyd lifetime carries it; KL1's sealed-store format has no
+//!   record for it yet (docs/questions/Q-1064), so until KL3 a keyd that
+//!   starts over a persisted store holds no key and refuses every
+//!   resolution (fail closed).
 //! * The install is the operation `InstallAttestationKey` since task PN9
 //!   (capability-table row, one audit record, its intent acknowledged by
 //!   auditd first, the wire of ipc-keyd and the codes of ipc-audit —
@@ -86,7 +95,7 @@ use crate::keyd::Keyd;
 use crate::model::{KeyHandle, PrincipalBinding};
 use crate::store::KeyStore;
 use keyd_types::{AttestedNameResolution, NameResolution};
-use krb_proto::{KerberosTime, Realm};
+use krb_proto::{KerberosTime, PrincipalName, Realm};
 use name_attestation::AuthenticatedNameResolution;
 use principal_names::{key_of_request, NameContext, RequestKey};
 
@@ -100,7 +109,6 @@ use principal_names::{key_of_request, NameContext, RequestKey};
 /// Spec: docs/59 §7.2; docs/questions/Q-1011 item 4 (A-173: "`BoundKeys`
 /// only from `VerifiedNameResolution`"); AGENTS.md §6.1.
 #[derive(Debug)]
-#[cfg_attr(not(test), allow(dead_code))] // issuance adopts it in PN11
 pub(crate) struct VerifiedNameResolution {
     resolution: NameResolution,
     /// The namespace of keyd's realm (its one alias — principal-names), in
@@ -108,7 +116,6 @@ pub(crate) struct VerifiedNameResolution {
     context: NameContext,
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // issuance adopts it in PN11
 impl VerifiedNameResolution {
     /// Steps 2 and 3 of docs/59 §7.2 on a resolution whose tag
     /// `name_attestation::verify` accepted (step 1 — the proof, taken by
@@ -139,9 +146,8 @@ impl VerifiedNameResolution {
         })
     }
 
-    /// The verified resolution (its names, for the ticket-template check of
-    /// task PN11: the names in a ticket are one of its two name pairs —
-    /// docs/59 §7.2 step 5). Spec: docs/59 §7.1.
+    /// The verified resolution. Spec: docs/59 §7.1.
+    #[cfg(test)]
     pub(crate) fn resolution(&self) -> &NameResolution {
         &self.resolution
     }
@@ -162,14 +168,56 @@ impl VerifiedNameResolution {
     /// Spec: docs/59 §4.2, §7.2 step 4; docs/questions/Q-1011 item 6
     /// (A-173: "folded key equality"); RFC 4120 §6.2.
     pub(crate) fn names_binding(&self, binding: &PrincipalBinding) -> bool {
-        let canonical = key_of_request(
-            self.resolution.canonical_name(),
+        same_principal(
             self.resolution.canonical_realm(),
+            self.resolution.canonical_name(),
+            &binding.realm,
+            &binding.name,
             &self.context,
-        );
-        let bound = key_of_request(&binding.name, &binding.realm, &self.context);
-        matches!((canonical, bound), (RequestKey::Key(a), RequestKey::Key(b)) if a == b)
+        )
     }
+
+    /// `true` if a ticket naming (`realm`, `name`) names one of the
+    /// resolution's two (realm, name) pairs — as the request sent it, or
+    /// canonical — exactly: the realm's octets and the whole principal name,
+    /// name-type included. keyd does not fold here: dird already chose which
+    /// spelling stands for the principal, and a ticket may carry only one
+    /// dird attested (docs/59 §4.5, §7.2 step 5: "השוואה מדויקת"; Q-1011
+    /// item 1: "so keyd can allow either name in a ticket without
+    /// canonicalizing anything itself"). An identity check against two
+    /// given values, not an equivalence (no second definition of "the same
+    /// name" — C49).
+    /// Spec: docs/59 §7.1, §7.2 step 5; docs/questions/Q-1011 items 1, 4
+    /// (A-173); RFC 4120 §5.3 (crealm, cname; sname).
+    pub(crate) fn names_ticket(&self, realm: &Realm, name: &PrincipalName) -> bool {
+        let r = &self.resolution;
+        (realm.as_bytes() == r.realm_as_sent().as_bytes() && name == r.name_as_sent())
+            || (realm.as_bytes() == r.canonical_realm().as_bytes() && name == r.canonical_name())
+    }
+}
+
+/// `true` if (`realm_a`, `name_a`) and (`realm_b`, `name_b`) are the same
+/// principal in the namespace's one equivalence: both give the same
+/// namespace key (`principal_names::key_of_request` — the name-type
+/// ignored, RFC 4120 §6.2; the case folded; each realm one of `context`'s
+/// aliases). A name that gives no key (a TGS name, a realm alias, a foreign
+/// realm, a malformed name) is the same as nothing. keyd's only name
+/// equivalence — the resolution's binding compare (`bound_by`) and the
+/// acceptor's sname compare (`StoredKeySet::accepting`) both call it; never
+/// an octet comparison (class C49).
+/// Spec: docs/59 §4.2, §7.2 step 4 and the acceptor paragraph;
+/// docs/questions/Q-1011 item 6 (A-173: "folded key equality"); RFC 4120
+/// §6.2.
+pub(crate) fn same_principal(
+    realm_a: &Realm,
+    name_a: &PrincipalName,
+    realm_b: &Realm,
+    name_b: &PrincipalName,
+    context: &NameContext,
+) -> bool {
+    let a = key_of_request(name_a, realm_a, context);
+    let b = key_of_request(name_b, realm_b, context);
+    matches!((a, b), (RequestKey::Key(a), RequestKey::Key(b)) if a == b)
 }
 
 impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
@@ -191,19 +239,29 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     ///
     /// Spec: docs/59 §7.2 steps 1–3; docs/questions/Q-1011 items 2–4
     /// (A-173); A-26 (uniform before the cryptographic chain).
-    #[cfg_attr(not(test), allow(dead_code))] // issuance adopts it in PN11
     pub(crate) fn verify_name_resolution(
         &self,
         attested: &AttestedNameResolution,
         now: &KerberosTime,
     ) -> Internal<VerifiedNameResolution> {
+        // The key lives in keyd's store (A-190), installed in a ceremony.
         let key = self
-            .attestation_key
-            .as_ref()
+            .store
+            .attestation_key()
             .ok_or(Deny::denied(AuditReason::AttestationKeyMissing))?;
         let authenticated = name_attestation::verify(key, attested)
             .map_err(|_| Deny::denied(AuditReason::NameResolutionInvalid))?;
         VerifiedNameResolution::from_authenticated(authenticated, &self.config.realm, now)
+    }
+
+    /// The namespace of keyd's realm (its one alias — crate principal-names),
+    /// in which the acceptor compares a ticket's sname with a key set's
+    /// binding; a realm that forms none fails closed (`WrongRealm`, as
+    /// [`VerifiedNameResolution`] does).
+    /// Spec: docs/59 §4.2; docs/questions/Q-1011 item 6; AGENTS.md §6.
+    pub(crate) fn name_context(&self) -> Internal<NameContext> {
+        NameContext::new(self.config.realm.as_str())
+            .map_err(|_| Deny::denied(AuditReason::WrongRealm))
     }
 }
 
@@ -476,14 +534,17 @@ mod tests {
             .unwrap()
     }
 
+    /// `bound_by` for a ticket that carries the resolution's canonical
+    /// pair (step 5 then holds; steps 1–4 are what these tests vary).
     fn bound_by(
         keyd: &TestKeyd,
         handle: &KeyHandle,
         f: NameResolutionFields,
     ) -> Result<(), AuditReason> {
+        let (ticket_realm, ticket_name) = (f.canonical_realm.clone(), f.canonical_name.clone());
         let resolution = verified(keyd, f);
         let set = keyd.store.get(handle).unwrap();
-        reason(set.bound_by(&resolution))
+        reason(set.bound_by(&resolution, &ticket_realm, &ticket_name))
     }
 
     /// docs/59 §7.2 step 4: the resolution of the service's own handle and
@@ -493,7 +554,9 @@ mod tests {
         let keyd = keyd_with_key();
         let resolution = verified(&keyd, fields());
         let set = keyd.store.get(&SERVICE).unwrap();
-        let bound = set.bound_by(&resolution).unwrap();
+        let bound = set
+            .bound_by(&resolution, &realm(), &service_name())
+            .unwrap();
         assert_eq!(bound.current().kvno(), crate::Kvno::INITIAL);
         // The user's key set by its own resolution, too.
         let mut f = fields();
@@ -590,9 +653,85 @@ mod tests {
         );
     }
 
+    /// docs/59 §7.2 step 5 (task PN11): the ticket's (realm, name) must be
+    /// one of the resolution's two pairs — the name as sent or the
+    /// canonical one — exactly (keyd does not fold here: dird chose). A
+    /// name the resolution does not hold, a case variant of one, another
+    /// name-type, or a pair whose realm is the other pair's is refused.
+    #[test]
+    fn bound_by_writes_only_a_name_the_resolution_holds() {
+        let keyd = keyd_with_key();
+        let mut f = fields();
+        // dird resolved a request spelled in upper case to the stored SPN.
+        f.name_as_sent = name(3, &["HOST", "files.example.org"]);
+        let resolution = verified(&keyd, f);
+        let set = keyd.store.get(&SERVICE).unwrap();
+        let ticket = |r: &Realm, n: &PrincipalName| reason(set.bound_by(&resolution, r, n));
+        assert_eq!(ticket(&realm(), &service_name()), Ok(()));
+        assert_eq!(
+            ticket(&realm(), &name(3, &["HOST", "files.example.org"])),
+            Ok(())
+        );
+        for name in [
+            name(3, &["Host", "files.example.org"]),
+            name(1, &["host", "files.example.org"]),
+            name(3, &["host", "other.example.org"]),
+        ] {
+            assert_eq!(
+                ticket(&realm(), &name),
+                Err(AuditReason::NameResolutionMismatch),
+                "{name:?}"
+            );
+        }
+        assert_eq!(
+            ticket(&s("example.org"), &service_name()),
+            Err(AuditReason::NameResolutionMismatch)
+        );
+    }
+
+    /// Q-1011 item 6 (A-173): keyd's one name equivalence — the namespace
+    /// key — is what the acceptor's door compares; RFC 4120 §6.2 (the
+    /// name-type is not significant).
+    #[test]
+    fn the_acceptor_compares_by_the_namespace_key() {
+        let keyd = keyd_with_key();
+        let context = keyd.name_context().unwrap();
+        let set = keyd.store.get(&SERVICE).unwrap();
+        for (sname, expected) in [
+            (service_name(), Ok(())),
+            (name(1, &["HOST", "Files.Example.org"]), Ok(())),
+            (
+                name(3, &["host", "other.example.org"]),
+                Err(AuditReason::NameBindingMismatch),
+            ),
+            (
+                name(1, &["host/files.example.org"]),
+                Err(AuditReason::NameBindingMismatch),
+            ),
+        ] {
+            assert_eq!(
+                reason(set.accepting(&realm(), &sname, &context)),
+                expected,
+                "{sname:?}"
+            );
+        }
+        // Never the krbtgt key set, whatever the name (it has its own door).
+        let krbtgt = keyd.store.get(&KRBTGT).unwrap();
+        assert_eq!(
+            reason(krbtgt.accepting(&realm(), &name(2, &["krbtgt", REALM]), &context)),
+            Err(AuditReason::NameBindingMismatch)
+        );
+        assert!(krbtgt.ticket_granting(&realm()).is_ok());
+        assert_eq!(
+            reason(set.ticket_granting(&realm())),
+            Err(AuditReason::NameBindingMismatch)
+        );
+    }
+
     /// Q-1011 item 2 (A-173): the key is installed by Role::Admin only, in
     /// the ceremony only, once only; a refused install changes nothing (the
-    /// first key stays the one verifying).
+    /// first key stays the one verifying). Q-1056 item 4 (A-188): no seal
+    /// without the key.
     #[test]
     fn the_key_is_installed_once_by_admin_in_the_ceremony() {
         let mut keyd = keyd();
@@ -619,7 +758,8 @@ mod tests {
         assert!(keyd
             .verify_name_resolution(&signed(fields(), &OTHER_KEY), &now())
             .is_err());
-        // After the seal, no install — on a keyd that has none, either.
+        // No seal without the key (Q-1056, A-188); after the seal, no
+        // install — not even a second one.
         let mut sealed = TestKeyd::new(
             {
                 let mut c = KeydConfig::new(realm());
@@ -631,13 +771,20 @@ mod tests {
             &KerberosTime::new(2026, 11, 14, 10, 0, 0).unwrap(),
         )
         .unwrap();
+        assert!(sealed.seal_ceremony(&ADMIN, &now()).is_err());
+        assert_eq!(sealed.ceremony_state(), CeremonyState::Provisioning);
+        sealed
+            .install_attestation_key(&ADMIN, key(&TEST_KEY), &now())
+            .unwrap();
         sealed.seal_ceremony(&ADMIN, &now()).unwrap();
         assert_eq!(sealed.ceremony_state(), CeremonyState::Operational);
         assert_eq!(
-            reason(sealed.install_attestation_key_inner(&ADMIN, key(&TEST_KEY), &now())),
+            reason(sealed.install_attestation_key_inner(&ADMIN, key(&OTHER_KEY), &now())),
             Err(AuditReason::CeremonySealed)
         );
-        assert!(!sealed.has_attestation_key());
+        assert!(sealed
+            .verify_name_resolution(&signed(fields(), &TEST_KEY), &now())
+            .is_ok());
         // A keyd whose store holds keys at start is operational from the
         // start (docs/52 §4.4): it never had a ceremony to install in.
         let mut store = InMemoryKeyStore::new(4);

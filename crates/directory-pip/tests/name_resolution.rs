@@ -35,9 +35,10 @@ fn test_key() -> AttestationKey {
     AttestationKey::from_bytes(&TEST_ATTESTATION_KEY).unwrap()
 }
 
-/// The fixed issue time of `test_signer` (tests/common/signer.rs).
+/// The fixed issue time of `test_signer` (tests/common/signer.rs): the
+/// fixtures' `now` (A-190: one clock per test world).
 fn signer_time() -> KerberosTime {
-    KerberosTime::new(2026, 11, 16, 12, 0, 0).unwrap()
+    now()
 }
 
 /// The `origin_seq` of the stamp on `object`'s `PRINCIPAL_NAME_KEY` value
@@ -126,8 +127,8 @@ fn every_record_carries_the_attested_resolution_of_its_lookup() {
     assert_eq!(r.canonical_realm(), d.ctx.realm());
     assert_eq!(r.name_as_sent(), &name(KRB_NT_PRINCIPAL, &["alice"]));
     assert!(r.is_fresh_at(&signer_time()));
-    assert!(r.is_fresh_at(&KerberosTime::new(2026, 11, 16, 12, 0, 30).unwrap()));
-    assert!(!r.is_fresh_at(&KerberosTime::new(2026, 11, 16, 12, 0, 31).unwrap()));
+    assert!(r.is_fresh_at(&kt(2026, 11, 13, 10, 0, 30)));
+    assert!(!r.is_fresh_at(&kt(2026, 11, 13, 10, 0, 31)));
 
     let ws01 = view
         .service(

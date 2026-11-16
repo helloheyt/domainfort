@@ -8,6 +8,17 @@
 //! enterprise names, referrals or canonicalisation. Names are ASCII
 //! (krb-proto enforces the IA5 KerberosString repertoire; P-6).
 //!
+//! **From the resolution, not the request** (task PN11; docs/questions/
+//! Q-1009 items 4-5, A-173): which kind of service a looked-up name is — an
+//! ordinary service or the change-password service — is the purpose of the
+//! key set dird resolved it to ([`resolved_server_kind`]), and the string
+//! the PDP judges is dird's canonical name ([`service_spn`] of it), never
+//! the request's spelling. [`classify_server`] stays for the decisions made
+//! before any lookup: this realm's TGS and other TGS names (they never
+//! reach the namespace — RFC 4120 §6.2 "reserved"), and an early refusal of
+//! `kadmin/changepw` (a refusal only — a name is never admitted on its
+//! strength; R47-1's exact acceptance holds until PN14, docs/59 §6.3).
+//!
 //! Spec: RFC 4120 6.1 ("realm names are case sensitive"), 6.2 ("It is not
 //! significant when checking for equivalence. Principal names that differ only
 //! in the name-type identify the same principal"; "Names of any type with an
@@ -15,9 +26,10 @@
 //! ticket-granting service"), 7.3 (name of the TGS); RFC 3244 §2 (the
 //! change-password service principal `kadmin/changepw@REALM`); [MS-KILE]
 //! 3.3.5.1.2 (that name is never canonicalised); main-session decision 4;
-//! A-139 (one name space, one canonicalisation function).
+//! A-139 (one name space, one canonicalisation function); docs/59 §6.3,
+//! §7.2.
 
-use keyd_types::is_change_password_service_name;
+use keyd_types::{is_change_password_service_name, KeyPurpose};
 use krb_proto::constants::KRB_NT_SRV_INST;
 use krb_proto::{KerberosString, PrincipalName, Realm};
 
@@ -99,6 +111,24 @@ pub(crate) fn classify_server(name: &PrincipalName, realm: &Realm) -> ServerName
     }
 }
 
+/// The kind of a server the KDC looked up, from dird's resolution of its
+/// name — the purpose of the key set the name resolved to — never from the
+/// request's octets (Q-1009 item 4): the change-password service's key set
+/// ⇒ [`ServerNameKind::ChangePassword`]; a service's or the admin service's
+/// ⇒ [`ServerNameKind::Service`]; a client's or the krbtgt's key set is no
+/// server a lookup can yield ⇒ `None` (the caller fails closed — an
+/// inconsistent record).
+/// Spec: docs/questions/Q-1009 item 4 (A-173: "Classify from the resolution
+/// (its purpose / claim), not the string"); docs/59 §4.7 (`key_purpose`
+/// derived from the stored name and the claim), §6.1 step 6; RFC 3244 §2.
+pub(crate) const fn resolved_server_kind(purpose: KeyPurpose) -> Option<ServerNameKind> {
+    match purpose {
+        KeyPurpose::ChangePasswordService => Some(ServerNameKind::ChangePassword),
+        KeyPurpose::Service | KeyPurpose::AdminService => Some(ServerNameKind::Service),
+        KeyPurpose::Krbtgt | KeyPurpose::PrincipalLongterm => None,
+    }
+}
+
 /// The service-name string the PDP matches exactly
 /// (`KerbResKind::Service(Spn)`, docs/11 §1): the name-string components
 /// joined with "/".
@@ -107,7 +137,9 @@ pub(crate) fn classify_server(name: &PrincipalName, realm: &Realm) -> ServerName
 /// joined string would then also name a different component list, and two
 /// distinct principals must never reach the PDP as one resource. There is no
 /// escaping scheme. Phase-1 project rule (docs/11 §1 "target SPN"; RFC 4120
-/// 6.2 "no two names can be the same").
+/// 6.2 "no two names can be the same"). Since task PN11 the TGS passes the
+/// canonical name of dird's resolution — the stored SPN — never the
+/// request's spelling (Q-1009 item 5).
 pub(crate) fn service_spn(name: &PrincipalName) -> Option<String> {
     let mut out = String::new();
     for (i, part) in name.name_string.iter().enumerate() {
@@ -220,6 +252,22 @@ mod tests {
                 ServerNameKind::Service,
                 "{parts:?}"
             );
+        }
+    }
+
+    /// Q-1009 item 4 (A-173): a looked-up server's kind is its key set's
+    /// purpose; a client or krbtgt key set is no server (None).
+    #[test]
+    fn a_looked_up_servers_kind_is_its_key_purpose() {
+        assert_eq!(
+            resolved_server_kind(KeyPurpose::ChangePasswordService),
+            Some(ServerNameKind::ChangePassword)
+        );
+        for purpose in [KeyPurpose::Service, KeyPurpose::AdminService] {
+            assert_eq!(resolved_server_kind(purpose), Some(ServerNameKind::Service));
+        }
+        for purpose in [KeyPurpose::Krbtgt, KeyPurpose::PrincipalLongterm] {
+            assert_eq!(resolved_server_kind(purpose), None);
         }
     }
 

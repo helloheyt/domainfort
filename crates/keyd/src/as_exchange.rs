@@ -26,14 +26,25 @@
 //! service's key set in the unarmored server slot before that (docs/53 §5.2;
 //! A-142 — the KDC's type is the first layer, this the second).
 //!
+//! **Keys only through dird's attested name resolution** (task PN11;
+//! docs/59 §7.2): the client key set — and, for the change-password
+//! service, the server key set — is reached only through
+//! `StoredKeySet::bound_by` on a resolution keyd verified (dird's tag under
+//! the attestation key, keyd's realm, issued within 30 s of keyd's clock),
+//! which must name that key set and the very (realm, name) the ticket will
+//! carry. The krbtgt of a TGT is reached by its exact stored binding to the
+//! canonical TGS name (`StoredKeySet::ticket_granting`). The KDC forwards
+//! the resolutions; it cannot choose which key set a name maps to (C3).
+//!
 //! Phase 1 issues no PAC (MS-PAC / NDR is phase 2, where D124 applies):
 //! tickets carry no authorization-data. Tickets are addressless (no caddr;
 //! RFC 4120 5.3 recommends allowing addressless tickets). The transited
 //! field is empty (local authentication, RFC 4120 3.3.3.2).
 //!
-//! Spec: RFC 4120 2.1, 3.1.2, 3.1.3, 5.2.7.2, 5.3, 5.4.2, 7.3, 7.5.1; RFC
-//! 6113 5.1, 5.4, 5.4.3, 5.4.6, 6.2, 8; RFC 3244 §2; docs/10 §4, §8; docs/30
-//! §2; docs/48 §2.3, §4; docs/53 R53-6, §5.2; docs/questions/Q-915 (A-151).
+//! Spec: RFC 4120 2.1, 3.1.2, 3.1.3, 3.1.5, 5.2.7.2, 5.3, 5.4.2, 7.3, 7.5.1;
+//! RFC 6113 5.1, 5.4, 5.4.3, 5.4.6, 6.2, 8; RFC 3244 §2; [MS-KILE] 3.3.5.1.2;
+//! docs/10 §4, §8; docs/30 §2; docs/48 §2.3, §4; docs/53 R53-6, §5.2;
+//! docs/59 §7.2; docs/questions/Q-915 (A-151), Q-1011 (A-173).
 
 use crate::audit::{AuditKeyRef, AuditReason, AuditSink};
 use crate::authz::{as_server_slot, CallerId, HandleSlot, Operation};
@@ -54,7 +65,8 @@ use crate::usage::{
     AS_REP_ENC_PART, AS_REQ_PA_ENC_TIMESTAMP, KEY_USAGE_ENC_CHALLENGE_CLIENT, TICKET_ENC_PART,
 };
 use keyd_types::{
-    is_change_password_service_name, AsRepParts, AsServer, AsTicketTemplate, AuthnProof,
+    is_change_password_service_name, AsRepParts, AsResolutions, AsServer, AsTicketTemplate,
+    AuthnProof,
 };
 use krb_crypto::{EncType, ProtocolKey};
 use krb_proto::constants::{DOMAIN_X500_COMPRESS, PA_ENCRYPTED_CHALLENGE, PA_ENC_TIMESTAMP};
@@ -494,10 +506,16 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     ///    renew-till, the realm's time rules, endtime ≤ authtime + 300 s);
     ///    armored: the armor is live, this caller's and bound to this proof,
     ///    and the template's crealm / cname / nonce are the stored inner
-    ///    request's (`Denied`, docs/48 §3.4); then the name bindings
-    ///    (`Denied`): crealm/cname must identify the client key set's bound
-    ///    name, and the server key set must be bound to the template's sname
-    ///    (Q-040, A-19; RFC 4120 6.2, 7.3);
+    ///    request's (`Denied`, docs/48 §3.4); then the keys, each only
+    ///    through its proof (`Denied`; task PN11, docs/59 §7.2): dird's
+    ///    client resolution verifies (tag, realm, 30 s — else
+    ///    `AttestationKeyMissing` / `NameResolutionInvalid` / `WrongRealm` /
+    ///    `NameResolutionStale`) and names the client key set and the
+    ///    template's (crealm, cname) (`NameResolutionMismatch`); the server
+    ///    key set is, for a TGT, the krbtgt bound to this realm's TGS name
+    ///    (no resolution may come with it), for the change-password service
+    ///    the one its own verified resolution names together with the
+    ///    template's sname (its absence refused) — `NameResolutionMismatch`;
     /// 4. draw a fresh session key;
     /// 5. EncTicketPart sealed under the CURRENT key of the server key set,
     ///    usage 2 (the flags: the TGT's requested ones, or for the
@@ -522,7 +540,8 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// encryption key extracted from the server principal's record"), 5.3,
     /// 5.4.2 (key usage 3; client kvno included), 7.5.1 (usages 2, 3); RFC
     /// 6113 5.4, 5.4.2, 5.4.3, 5.4.6; RFC 3244 §2; docs/53 R53-6, §5.2;
-    /// docs/questions/Q-915 items 1, 3, 4 (A-151); A-142.
+    /// docs/questions/Q-915 items 1, 3, 4 (A-151); A-142; docs/59 §7.2;
+    /// docs/questions/Q-1011 items 4, 8 (A-173); [MS-KILE] 3.3.5.1.2.
     #[allow(clippy::too_many_arguments)]
     pub fn issue_as_rep(
         &mut self,
@@ -532,6 +551,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         proof: &AuthnProof,
         armor: Option<ArmorId>,
         template: &AsTicketTemplate,
+        resolutions: AsResolutions<'_>,
         now: &KerberosTime,
     ) -> Result<AsRepParts, IssueError> {
         let mut fields = AuditFields::for_handle(client);
@@ -542,6 +562,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             proof,
             armor,
             template,
+            resolutions,
             now,
             &mut fields,
         );
@@ -558,6 +579,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         proof: &AuthnProof,
         armor: Option<ArmorId>,
         template: &AsTicketTemplate,
+        resolutions: AsResolutions<'_>,
         now: &KerberosTime,
         fields: &mut AuditFields,
     ) -> Internal<AsRepParts> {
@@ -654,17 +676,33 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
                 )?;
         }
 
-        // Keys: the client key that pre-authenticated, the current krbtgt key
-        // — each only through the proof of its name binding (Q-040, A-19;
-        // crate::store, R7).
+        // dird's resolutions, verified on keyd's clock before any key is
+        // touched (docs/59 §7.2 steps 1-3): the client's always; the
+        // server's exactly for the change-password service — a TGT's krbtgt
+        // is bound by its exact stored binding, so a resolution offered for
+        // it is refused, as is the change-password service's missing one
+        // (fail closed; task PN11).
+        let client_resolution = self.verify_name_resolution(resolutions.client, now)?;
+        let server_resolution = match (&issuance, resolutions.server) {
+            (AsIssuance::LocalTgt { .. }, None) => None,
+            (AsIssuance::ChangePasswordService { .. }, Some(attested)) => {
+                Some(self.verify_name_resolution(attested, now)?)
+            }
+            _ => return Err(Deny::denied(AuditReason::NameResolutionMismatch)),
+        };
+
+        // Keys: the client key that pre-authenticated, the server's current
+        // key — each only through the proof of its door (crate::store, "The
+        // doors"; Q-040, A-19; R7).
         let client_set = self
             .store
             .get(client)
             .ok_or(Deny::denied(AuditReason::KeyNotFound))?;
         fields.kvno = Some(client_set.current_kvno());
-        // The ticket may only name the principal the client key is bound to.
+        // The ticket may only name the client as dird resolved it, under the
+        // key set dird resolved it to (docs/59 §7.2 steps 4-5).
         let client_version = client_set
-            .bound_to(&template.crealm, &template.cname)?
+            .bound_by(&client_resolution, &template.crealm, &template.cname)?
             .current();
         if client_version.kvno() != entry.reply_kvno {
             return Err(Deny::denied(AuditReason::KvnoMismatch));
@@ -681,12 +719,19 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             purpose: server.purpose,
             kvno: Some(server_set.current_kvno()),
         });
-        // The server key must be bound to the ticket's sname — which step 2
-        // found to be this realm's TGS name (RFC 4120 7.3) or
-        // `kadmin/changepw` (RFC 3244 §2); keyd's creation rule binds a
-        // Krbtgt key set only to a TGS name and a ChangePasswordService key
-        // set only to `kadmin/changepw` (template::check_new_binding).
-        let server_version = server_set.bound_to(realm, &template.sname)?.current();
+        // The server key: for a TGT the krbtgt bound to this realm's TGS
+        // name — which step 2 found the template's sname to be, exactly
+        // (RFC 4120 7.3; [MS-KILE] 3.3.5.1.2); for the change-password
+        // service the key set its verified resolution names together with
+        // the template's sname, `kadmin/changepw` (RFC 3244 §2; docs/59
+        // §7.2). keyd's creation rule binds a Krbtgt key set only to a TGS
+        // name and a ChangePasswordService key set only to `kadmin/changepw`
+        // (template::check_new_binding).
+        let server_keys = match &server_resolution {
+            None => server_set.ticket_granting(realm)?,
+            Some(resolution) => server_set.bound_by(resolution, realm, &template.sname)?,
+        };
+        let server_version = server_keys.current();
         let server_key = server_version
             .preferred()
             .ok_or(Deny::denied(AuditReason::KeyNotFound))?;

@@ -20,12 +20,16 @@
 //! PN10; docs/59 §7.1, §7.5): the `keyd_types::AttestedNameResolution` of
 //! the lookup that produced the record — which realm and name were asked,
 //! which canonical name and key set they resolved to, when — tagged with
-//! dird's attestation key. The KDC does not read it: it only forwards it to
-//! keyd, which verifies it before it binds a key (docs/59 §7.2; that
-//! forwarding is task PN11 — until then the field is carried and ignored).
-//! This crate links no MAC (D182): the tag is opaque octets here, and
-//! records have no `PartialEq` because a tag is compared only in constant
-//! time, by keyd (crate name-attestation; docs/questions/Q-1046 item 4).
+//! dird's attestation key. Since task PN11 the KDC forwards it to keyd,
+//! which verifies it before it binds a key (docs/59 §7.2), and reads two of
+//! its facts for its own decisions — as it reads every other field of the
+//! record dird sent: which kind of server a looked-up name is (its key
+//! set's purpose) and the canonical name the PDP judges (docs/questions/
+//! Q-1009 items 4-5). A record whose resolution names another key set than
+//! its `key` is inconsistent and refused (`resolution_names_key`). This
+//! crate links no MAC (D182): the tag is opaque octets here, and records
+//! have no `PartialEq` because a tag is compared only in constant time, by
+//! keyd (crate name-attestation; docs/questions/Q-1046 item 4).
 //!
 //! [`InMemoryAccounts`] is the in-memory implementation used by the tests and
 //! the fuzz target. The directory-backed implementation (dirstore + the AD
@@ -41,7 +45,7 @@
 
 use crate::names::{same_name, same_realm};
 use dtyp::Sid;
-use keyd_types::{AttestedNameResolution, KeyHandle};
+use keyd_types::{AttestedNameResolution, KeyHandle, NameResolution};
 use krb_proto::{EtypeInfo2Entry, KerberosString, KerberosTime, PrincipalName, Realm};
 use pdp::Tier;
 use std::collections::{BTreeMap, BTreeSet};
@@ -157,13 +161,31 @@ pub struct ClientAccount {
     /// Whether an unarmored AS is allowed (docs/48 §7.2 layer 1).
     pub armor_policy: ArmorPolicy,
     /// dird's attested resolution of the name this record was looked up by
-    /// (module documentation): forwarded to keyd, never read here (task
-    /// PN11 forwards it). Not secret.
+    /// (module documentation): forwarded to keyd with `issue_as_rep` (task
+    /// PN11). Not secret.
     /// Spec: docs/59 §7.1, §7.5; docs/questions/Q-1011 items 1, 8.
     pub resolution: AttestedNameResolution,
 }
 
+/// The key set a resolution names: its `(principal, key_purpose)`.
+/// Spec: docs/59 §7.1, §7.2 step 4.
+fn resolved_handle(resolution: &NameResolution) -> KeyHandle {
+    KeyHandle::new(resolution.principal(), resolution.key_purpose())
+}
+
 impl ClientAccount {
+    /// `true` if dird's resolution names this record's key set: the record
+    /// states the key set twice (`key`, and the resolution's principal and
+    /// purpose), and a record whose two statements disagree is inconsistent
+    /// — the caller refuses it (KRB_ERR_GENERIC, fail closed) before keyd
+    /// is asked (keyd would refuse it too: `bound_by` compares the
+    /// resolution with the key set's own handle).
+    /// Spec: docs/59 §7.2 step 4; main-session decision 3 ("an inconsistent
+    /// or unusable record" ⇒ Failed); AGENTS.md §6 (fail closed).
+    pub(crate) fn resolution_names_key(&self) -> bool {
+        resolved_handle(self.resolution.resolution()) == self.key
+    }
+
     /// `true` if this account may make an unarmored AS request (the
     /// bootstrap): a computer account whose policy is BootstrapAllowed.
     /// BootstrapAllowed on any other kind of account counts as Required —
@@ -198,10 +220,21 @@ pub struct ServiceAccount {
     /// Encryption types the service accepts for its session keys.
     pub enctypes: Vec<i32>,
     /// dird's attested resolution of the name this record was looked up by
-    /// (module documentation): forwarded to keyd, never read here (task
-    /// PN11 forwards it). Not secret.
-    /// Spec: docs/59 §7.1, §7.5; docs/questions/Q-1011 items 1, 8.
+    /// (module documentation): forwarded to keyd with `issue_tgs_rep` (and,
+    /// for the change-password service, `issue_as_rep` — task PN11); its key
+    /// set's purpose says which kind of server the name is, and its
+    /// canonical name is what the PDP judges (Q-1009 items 4-5). Not secret.
+    /// Spec: docs/59 §7.1, §7.5; docs/questions/Q-1011 items 1, 8, Q-1009.
     pub resolution: AttestedNameResolution,
+}
+
+impl ServiceAccount {
+    /// `true` if dird's resolution names this record's key set (see
+    /// [`ClientAccount::resolution_names_key`]).
+    /// Spec: docs/59 §7.2 step 4; main-session decision 3; AGENTS.md §6.
+    pub(crate) fn resolution_names_key(&self) -> bool {
+        resolved_handle(self.resolution.resolution()) == self.key
+    }
 }
 
 /// The account source could not answer. The request fails closed either

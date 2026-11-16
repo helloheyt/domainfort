@@ -14,11 +14,12 @@ use ipc_keyd::{
     DestructionPage, Password, PendingDestruction, SetSecretTarget, TgsFast,
 };
 use keyd_types::{
-    ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof, ChangePasswordContext,
-    ChangePasswordCtxId, ChangePasswordVerdict, ConfigDescription, CtxId, EncTypeId, ExchangeId,
-    FastArmor, FastConversation, HostAddr, IssueError, KeyHandle, KeyPurpose, Kvno,
-    PrincipalBinding, PrincipalId, Role, SealedReply, ServiceContext, ServiceCtxId, TgsRepParts,
-    TgsTicketTemplate, TgtContext, TicketPolicy,
+    ArmorId, AsRepParts, AsTicketTemplate, AttestedNameResolution, AuthnError, AuthnProof,
+    ChangePasswordContext, ChangePasswordCtxId, ChangePasswordVerdict, ConfigDescription, CtxId,
+    EncTypeId, ExchangeId, FastArmor, FastConversation, HostAddr, IssueError, KeyHandle,
+    KeyPurpose, Kvno, NameResolution, NameResolutionFields, PrincipalBinding, PrincipalId, Role,
+    SealedReply, ServiceContext, ServiceCtxId, TgsRepParts, TgsTicketTemplate, TgtContext,
+    TicketPolicy,
 };
 use krb_proto::{
     ApOptions, ApRep, ApReq, Checksum, EncryptedData, FastOptions, KdcOptions, KdcReqBody,
@@ -54,6 +55,30 @@ pub fn name(name_type: i32, parts: &[&str]) -> PrincipalName {
 
 pub fn time(offset_minutes: u8) -> KerberosTime {
     KerberosTime::new(2026, 11, 13, 10, offset_minutes, 7).unwrap()
+}
+
+/// A name resolution as dird would state it (task PN11): `sent` resolved to
+/// `canonical` and the key set `key`, issued at `time(3)`, with a made-up
+/// tag `[tag; 32]` — the codec carries the tag, it never checks it (keyd
+/// does, docs/59 §7.2), so no MAC is needed here.
+pub fn resolution(
+    sent: PrincipalName,
+    canonical: PrincipalName,
+    key: KeyHandle,
+    tag: u8,
+) -> AttestedNameResolution {
+    let resolution = NameResolution::new(NameResolutionFields {
+        realm_as_sent: realm(),
+        name_as_sent: sent,
+        canonical_realm: realm(),
+        canonical_name: canonical,
+        principal: key.principal,
+        key_purpose: key.purpose,
+        snapshot: 0x0102_0304_0506_0708,
+        issued_at: time(3),
+    })
+    .unwrap();
+    AttestedNameResolution::new(resolution, [tag; 32])
 }
 
 pub fn handle(octet: u8, purpose: KeyPurpose) -> KeyHandle {
@@ -218,6 +243,18 @@ pub fn calls() -> Vec<Call> {
             proof: proof(),
             armor: Some(ArmorId::from_bytes([0xAB; 16])),
             template: as_template(true),
+            client_resolution: Box::new(resolution(
+                name(10, &["ALICE"]),
+                name(1, &["alice"]),
+                alice,
+                0x9A,
+            )),
+            server_resolution: Some(Box::new(resolution(
+                name(2, &["kadmin", "changepw"]),
+                name(2, &["kadmin", "changepw"]),
+                handle(0xC7, KeyPurpose::ChangePasswordService),
+                0x9B,
+            ))),
         },
         Call::IssueAsRep {
             client: alice,
@@ -225,6 +262,13 @@ pub fn calls() -> Vec<Call> {
             proof: proof(),
             armor: None,
             template: as_template(false),
+            client_resolution: Box::new(resolution(
+                name(1, &["alice"]),
+                name(1, &["alice"]),
+                alice,
+                0x9C,
+            )),
+            server_resolution: None,
         },
         Call::OpenFastArmor {
             krbtgt: KRBTGT,
@@ -250,11 +294,23 @@ pub fn calls() -> Vec<Call> {
             service,
             ctx: CtxId::from_bytes([0xC1; 16]),
             template: tgs_template(true),
+            service_resolution: Box::new(resolution(
+                name(3, &["host", "files.example.org"]),
+                name(3, &["host", "files.example.org"]),
+                service,
+                0x9D,
+            )),
         },
         Call::IssueTgsRep {
             service: KRBTGT,
             ctx: CtxId::from_bytes([0xC2; 16]),
             template: tgs_template(false),
+            service_resolution: Box::new(resolution(
+                name(3, &["HOST", "files.example.org"]),
+                name(3, &["host", "files.example.org"]),
+                service,
+                0x9E,
+            )),
         },
         Call::SealFastError {
             conversation: FastConversation::As(ArmorId::from_bytes([0xAC; 16])),

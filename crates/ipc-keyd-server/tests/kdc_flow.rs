@@ -126,6 +126,15 @@ impl IpcWorld {
                 .unwrap()
                 .unwrap();
         }
+        // The ceremony hands keyd dird's attestation key (task PN11: keyd
+        // verifies the resolutions the kdc forwards with it), over the
+        // channel as keyadm does.
+        admin
+            .install_attestation_key(
+                ipc_keyd::AttestationKeyOctets::from_slice(&TEST_ATTESTATION_KEY).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
         let mut directory = KeydClient::new(
             Loopback::new(&server, DIRECTORY),
             ipc_keyd::ExpectedPeer::new(KEYD_UID, DIRECTORY.role).unwrap(),
@@ -232,6 +241,12 @@ impl IpcWorld {
             snapshot: &self.snapshot,
             pip: &self.pip,
         };
+        // dird states each resolution at lookup time (the kdc fixtures'
+        // `Resigning`, task PN11).
+        let accounts = Resigning {
+            inner: &self.accounts,
+            at: when,
+        };
         self.kdc.handle(
             request,
             Peer {
@@ -240,7 +255,7 @@ impl IpcWorld {
             },
             when,
             &inputs,
-            &self.accounts,
+            &accounts,
         )
     }
 

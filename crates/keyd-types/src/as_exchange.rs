@@ -16,6 +16,7 @@
 
 use crate::enctype::EncTypeId;
 use crate::model::{KeyPurpose, PrincipalId};
+use crate::name_resolution::AttestedNameResolution;
 use crate::tokens::ExchangeId;
 use krb_proto::{EncryptedData, KerberosTime, PrincipalName, Realm, Ticket, TicketFlags};
 
@@ -137,17 +138,21 @@ pub struct AsTicketTemplate {
     pub client: PrincipalId,
     /// Client realm; must be the configured realm (single realm, phase 1).
     pub crealm: Realm,
-    /// Client name (RFC 4120 5.3 cname). Must identify the principal name
-    /// the client key set is bound to (realm + name-string, RFC 4120 6.2;
-    /// docs/questions/Q-040, A-19) — otherwise `Denied`. Canonicalization
-    /// (case, aliases, enterprise names) is the KDC's job before the call.
+    /// Client name (RFC 4120 5.3 cname). Together with `crealm` it must be
+    /// one of the two (realm, name) pairs of the client's attested name
+    /// resolution ([`AsResolutions::client`]) — as the request sent it, or
+    /// canonical — exactly (task PN11; docs/59 §7.2 step 5); the resolution
+    /// itself must name the client key set — otherwise `Denied`. keyd never
+    /// canonicalises: dird chose the names (docs/59 §4.5).
     pub cname: PrincipalName,
     /// Server name. For [`AsServer::LocalTgt`]: this realm's TGS name,
-    /// NT-SRV-INST ("krbtgt", realm), because the ticket is sealed under the
-    /// krbtgt key (RFC 4120 7.3). For [`AsServer::ChangePasswordService`]:
-    /// `kadmin/changepw` as the client asked (any name-type, RFC 4120 6.2;
-    /// never canonicalised, docs/53 §5.2) — the name that key set is bound
-    /// to (A-19).
+    /// NT-SRV-INST ("krbtgt", realm), exactly — the canonical TGS name the
+    /// KDC always writes ([MS-KILE] 3.3.5.1.2; RFC 4120 7.3), checked against
+    /// the krbtgt key set's stored binding without any resolution. For
+    /// [`AsServer::ChangePasswordService`]: `kadmin/changepw` (RFC 3244 §2;
+    /// never canonicalised, [MS-KILE] 3.3.5.1.2) — one of the two names of
+    /// the service's attested name resolution ([`AsResolutions::server`],
+    /// task PN11).
     pub sname: PrincipalName,
     /// Requested starttime; must be within the clock skew of now (no
     /// postdating). `None` = authtime is the start (RFC 4120 5.3). Absent
@@ -169,6 +174,37 @@ pub struct AsTicketTemplate {
     pub session_enctype: EncTypeId,
     /// The AS-REQ nonce, echoed in EncASRepPart (RFC 4120 5.4.2).
     pub nonce: u32,
+}
+
+/// dird's attested name resolutions for one `issue_as_rep` (task PN11;
+/// docs/59 §7.2, §7.5): the statement, tagged with the attestation key,
+/// that the names the KDC asks keyd to write resolve to the key sets it
+/// names. keyd verifies each (tag, canonical realm, 30 s on its own clock)
+/// and reaches a client or service key only through a verified one
+/// (`StoredKeySet::bound_by` in crate keyd); the KDC only forwards what
+/// dird sent with the account records (crate kdc `ClientAccount`,
+/// `ServiceAccount`).
+///
+/// - `client`: the resolution of the request's (crealm, cname) to the
+///   client's PrincipalLongterm key set — always.
+/// - `server`: the resolution of `kadmin/changepw` to the change-password
+///   service's key set — present exactly for
+///   [`AsServer::ChangePasswordService`]. A TGT carries none: the krbtgt key
+///   set is reached only by its exact stored binding to the canonical TGS
+///   name ([MS-KILE] 3.3.5.1.2; RFC 4120 7.3; docs/59 §7.2), so a resolution
+///   for it is refused, and its absence for the change-password service is
+///   refused too (fail closed).
+///
+/// Borrowed and `Copy`: one value per call, nothing kept.
+///
+/// Spec: docs/59 §7.1, §7.2, §7.5; docs/questions/Q-1011 items 1, 4, 8
+/// (A-173); RFC 3244 §2; [MS-KILE] 3.3.5.1.2; AGENTS.md §6 (fail closed).
+#[derive(Debug, Clone, Copy)]
+pub struct AsResolutions<'a> {
+    /// The client's resolution (request name ⇒ PrincipalLongterm key set).
+    pub client: &'a AttestedNameResolution,
+    /// The change-password service's resolution; `None` for a TGT.
+    pub server: Option<&'a AttestedNameResolution>,
 }
 
 /// The sealed AS-REP parts: the ticket (sealed under the server's key set —

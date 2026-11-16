@@ -9,10 +9,10 @@ mod common;
 
 use common::*;
 use keyd::{
-    AccountKind, ArmorId, AsRepParts, AsTicketTemplate, AuditOutcome, AuthnError, AuthnProof,
-    CallerId, CtxId, DecidedOperation, DecisionId, DestructionPage, Error, IssueError, KeyHandle,
-    Kvno, Operation, PrincipalBinding, PrincipalId, ServiceContext, SetSecretTarget,
-    TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext,
+    AccountKind, ArmorId, AsRepParts, AsResolutions, AsTicketTemplate, AttestedNameResolution,
+    AuditOutcome, AuthnError, AuthnProof, CallerId, CtxId, DecidedOperation, DecisionId,
+    DestructionPage, Error, IssueError, KeyHandle, Kvno, Operation, PrincipalBinding, PrincipalId,
+    ServiceContext, SetSecretTarget, TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext,
 };
 use krb_proto::{ApReq, KerberosTime, PaData};
 use zeroize::Zeroizing;
@@ -51,6 +51,7 @@ fn operation_signatures_return_no_key_material() {
         &AuthnProof,
         Option<ArmorId>,
         &AsTicketTemplate,
+        AsResolutions<'_>,
         &KerberosTime,
     ) -> Result<AsRepParts, IssueError> = K::issue_as_rep;
     // docs/48 §2.3 (task T3): the TGS opening takes the FAST part of an
@@ -69,6 +70,7 @@ fn operation_signatures_return_no_key_material() {
         &mut K,
         &CallerId,
         &KeyHandle,
+        &AttestedNameResolution,
         &CtxId,
         &TgsTicketTemplate,
         &KerberosTime,
@@ -165,7 +167,7 @@ fn returned_values_contain_no_key_octets() {
     let ctx = open_tgt(&mut f, &tgt, 60, 60);
     let tgs = f
         .keyd
-        .issue_tgs_rep(&KDC, &SERVICE, &ctx.ctx_id, &tgs_template(60), &now())
+        .issue_tgs(&KDC, &SERVICE, &ctx.ctx_id, &tgs_template(60), &now())
         .unwrap();
     let service_session = krb_proto::EncTgsRepPart::decode(&open(&tgt.session, 8, &tgs.enc_part))
         .unwrap()
@@ -218,12 +220,12 @@ fn every_operation_emits_exactly_one_audit_record() {
     check(&f, Operation::VerifyPreauth, &DIRECTORY, false);
     let parts = f
         .keyd
-        .issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, None, &as_template(), &n)
+        .issue_as(&KDC, &ALICE, &KRBTGT, &proof, None, &as_template(), &n)
         .unwrap();
     check(&f, Operation::IssueAsRep, &KDC, true);
     let _ = f
         .keyd
-        .issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, None, &as_template(), &n);
+        .issue_as(&KDC, &ALICE, &KRBTGT, &proof, None, &as_template(), &n);
     check(&f, Operation::IssueAsRep, &KDC, false);
 
     let rep = krb_proto::EncAsRepPart::decode(&open(&alice_key(), 3, &parts.enc_part)).unwrap();
@@ -243,12 +245,12 @@ fn every_operation_emits_exactly_one_audit_record() {
         .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, None, &n);
     check(&f, Operation::OpenAndVerifyTgt, &KDC, false);
     f.keyd
-        .issue_tgs_rep(&KDC, &SERVICE, &ctx.ctx_id, &tgs_template(70), &n)
+        .issue_tgs(&KDC, &SERVICE, &ctx.ctx_id, &tgs_template(70), &n)
         .unwrap();
     check(&f, Operation::IssueTgsRep, &KDC, true);
     let _ = f
         .keyd
-        .issue_tgs_rep(&ADMIN, &SERVICE, &ctx.ctx_id, &tgs_template(70), &n);
+        .issue_tgs(&ADMIN, &SERVICE, &ctx.ctx_id, &tgs_template(70), &n);
     check(&f, Operation::IssueTgsRep, &ADMIN, false);
 
     // The ceremony's grant (task A15a; Admin before the seal, A-102): one
@@ -355,10 +357,12 @@ fn every_operation_emits_exactly_one_audit_record() {
         || keyd::AttestationKey::from_bytes(&[0x6E; keyd::ATTESTATION_KEY_LEN]).unwrap();
     let _ = f.keyd.install_attestation_key(&KDC, attestation_key(), &n);
     check(&f, Operation::InstallAttestationKey, &KDC, false);
-    f.keyd
-        .install_attestation_key(&ADMIN, attestation_key(), &n)
-        .unwrap();
-    check(&f, Operation::InstallAttestationKey, &ADMIN, true);
+    // The fixture's ceremony installed the key (task PN11): a second
+    // install is refused — still one record.
+    let _ = f
+        .keyd
+        .install_attestation_key(&ADMIN, attestation_key(), &n);
+    check(&f, Operation::InstallAttestationKey, &ADMIN, false);
     // The seal (A-102, docs/52 R3): one record either way.
     let _ = f.keyd.seal_ceremony(&DIRECTORY, &n);
     check(&f, Operation::SealCeremony, &DIRECTORY, false);
@@ -486,7 +490,7 @@ fn audit_records_contain_no_secret_bytes() {
     let ctx = open_tgt(&mut f, &tgt, 80, 80);
     let tgs = f
         .keyd
-        .issue_tgs_rep(&KDC, &SERVICE, &ctx.ctx_id, &tgs_template(80), &now())
+        .issue_tgs(&KDC, &SERVICE, &ctx.ctx_id, &tgs_template(80), &now())
         .unwrap();
     let service_session = krb_proto::EncTgsRepPart::decode(&open(&tgt.session, 8, &tgs.enc_part))
         .unwrap()

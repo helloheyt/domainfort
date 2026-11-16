@@ -14,7 +14,7 @@ use keyd::{
     KeyPurpose, Keyd, Kvno, PrincipalBinding, PrincipalId, MAX_KEY_DECISION_SECS,
 };
 use krb_crypto::EncType;
-use krb_proto::constants::{KRB_NT_PRINCIPAL, KRB_NT_SRV_INST, KRB_NT_UNKNOWN};
+use krb_proto::constants::{KRB_NT_PRINCIPAL, KRB_NT_SRV_HST, KRB_NT_SRV_INST, KRB_NT_UNKNOWN};
 use krb_proto::{EncTicketPart, PrincipalName};
 use zeroize::Zeroizing;
 
@@ -88,7 +88,7 @@ fn krbtgt_refused_by_non_development_store() {
         )
         .unwrap();
     assert_eq!(
-        keyd.issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, None, &as_template(), &now()),
+        keyd.issue_as(&KDC, &ALICE, &KRBTGT, &proof, None, &as_template(), &now()),
         Err(IssueError::Denied)
     );
 }
@@ -117,7 +117,7 @@ fn create_key_does_not_overwrite() {
     let ctx = open_tgt(&mut f, &tgt, 41, 41);
     assert!(f
         .keyd
-        .issue_tgs_rep(&KDC, &SERVICE, &ctx.ctx_id, &tgs_template(41), &now())
+        .issue_tgs(&KDC, &SERVICE, &ctx.ctx_id, &tgs_template(41), &now())
         .is_ok());
 }
 
@@ -188,6 +188,131 @@ fn create_key_validates_binding() {
     );
 }
 
+/// The creation rule judges the reserved names on the folded form, through
+/// crate principal-names — the namespace's reading of a name and its
+/// reserved-name predicate (class C49): every spelling of `krbtgt/X`,
+/// `admind/<host>` and `kadmin/changepw` is bound only to its own purpose's
+/// key set — and to that one in any case — and a name no object of the
+/// namespace can hold (more than three components, an "@" or an empty part
+/// inside a component, a key equal to the realm's name, a one-part name in
+/// "@" form whose suffix is another realm) is bound to no key set.
+/// Source: RFC 4120 6.2 ("Names of any type with an initial component of
+/// 'krbtgt' are reserved for the Kerberos ticket-granting service"; the
+/// name-type is not significant), 7.3; RFC 3244 §2; A-73; docs/59 §4.2 (the
+/// request table, the reserved-name predicates); docs/questions/Q-1009
+/// items 1-2, Q-1061 item 1 (A-190).
+#[test]
+fn the_creation_rule_judges_reserved_names_folded() {
+    fn named(name_type: i32, parts: &[&str]) -> PrincipalBinding {
+        bound(PrincipalName {
+            name_type,
+            name_string: parts.iter().map(|p| kstr(p)).collect(),
+        })
+    }
+    fn push_keys(f: &Fixture, octet: u8) {
+        for e in &f.keyd.config().enctypes {
+            let length = EncType::from_number(e.number()).unwrap().key_length();
+            f.entropy.push(&[octet; 32][..length]);
+        }
+    }
+    let mut f = Fixture::new();
+    let service = KeyHandle::new(PrincipalId::from_bytes([0x71; 16]), KeyPurpose::Service);
+    let longterm = KeyHandle::new(
+        PrincipalId::from_bytes([0x72; 16]),
+        KeyPurpose::PrincipalLongterm,
+    );
+    let reserved_spellings = [
+        named(KRB_NT_SRV_INST, &["KRBTGT", "EXAMPLE.ORG"]),
+        named(KRB_NT_SRV_INST, &["Krbtgt", "other.org"]),
+        named(KRB_NT_SRV_HST, &["ADMIND", "dc01.example.org"]),
+        named(KRB_NT_SRV_INST, &["KADMIN", "CHANGEPW"]),
+    ];
+    let no_namespace_names = [
+        named(KRB_NT_SRV_HST, &["host", "a", "b", "c"]),
+        named(KRB_NT_SRV_HST, &["host", "files@example.org"]),
+        named(KRB_NT_SRV_HST, &["host", ""]),
+        named(KRB_NT_PRINCIPAL, &["example.org"]),
+        named(KRB_NT_PRINCIPAL, &["carol@OTHER.ORG"]),
+    ];
+    for binding in reserved_spellings.iter().chain(&no_namespace_names) {
+        for handle in [service, longterm] {
+            assert_eq!(
+                f.keyd.create_key(&ADMIN, &handle, binding, &now()),
+                Err(Error::Denied),
+                "{handle:?} {binding:?}"
+            );
+            assert_eq!(
+                f.records().last().unwrap().reason,
+                AuditReason::InvalidNameBinding
+            );
+        }
+    }
+    // A Krbtgt key set takes no name outside the TGS's, in any case.
+    let krbtgt = KeyHandle::new(PrincipalId::from_bytes([0x73; 16]), KeyPurpose::Krbtgt);
+    for binding in [
+        named(KRB_NT_SRV_INST, &["krbtgt"]),
+        named(KRB_NT_SRV_INST, &["KRBTGT", "a", "b"]),
+        named(KRB_NT_SRV_HST, &["ADMIND", "dc01.example.org"]),
+    ] {
+        assert_eq!(
+            f.keyd.create_key(&ADMIN, &krbtgt, &binding, &now()),
+            Err(Error::Denied),
+            "{binding:?}"
+        );
+    }
+    // Each reserved name, in another case, is its own purpose's name.
+    for (id, purpose, binding) in [
+        (
+            0x74,
+            KeyPurpose::Krbtgt,
+            named(KRB_NT_SRV_INST, &["KRBTGT", "example.org"]),
+        ),
+        (
+            0x75,
+            KeyPurpose::AdminService,
+            named(KRB_NT_SRV_HST, &["ADMIND", "dc01.example.org"]),
+        ),
+        (
+            0x76,
+            KeyPurpose::ChangePasswordService,
+            named(KRB_NT_SRV_INST, &["KADMIN", "changepw"]),
+        ),
+    ] {
+        push_keys(&f, id);
+        let handle = KeyHandle::new(PrincipalId::from_bytes([id; 16]), purpose);
+        assert!(
+            f.keyd.create_key(&ADMIN, &handle, &binding, &now()).is_ok(),
+            "{binding:?}"
+        );
+    }
+    // A namespace name that is no reserved one takes a plain key set — in
+    // any case, a two- or three-part service name included.
+    for (id, handle_purpose, binding) in [
+        (
+            0x77,
+            KeyPurpose::Service,
+            named(KRB_NT_SRV_HST, &["HOST", "ws9.example.org"]),
+        ),
+        (
+            0x78,
+            KeyPurpose::Service,
+            named(KRB_NT_SRV_HST, &["ldap", "dc01.example.org", "example.org"]),
+        ),
+        (
+            0x79,
+            KeyPurpose::PrincipalLongterm,
+            named(KRB_NT_PRINCIPAL, &["ws9$"]),
+        ),
+    ] {
+        push_keys(&f, id);
+        let handle = KeyHandle::new(PrincipalId::from_bytes([id; 16]), handle_purpose);
+        assert!(
+            f.keyd.create_key(&ADMIN, &handle, &binding, &now()).is_ok(),
+            "{binding:?}"
+        );
+    }
+}
+
 /// set_secret cannot change the binding of an existing key set (no rename in
 /// phase 1); a binding differing only in name-type is the same principal
 /// (RFC 4120 6.2) and is accepted, the stored binding staying as created.
@@ -228,7 +353,7 @@ fn set_secret_cannot_rebind() {
     t.cname = bob_name();
     assert_eq!(
         f.keyd
-            .issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, None, &t, &now()),
+            .issue_as(&KDC, &ALICE, &KRBTGT, &proof, None, &t, &now()),
         Err(IssueError::Denied)
     );
 
@@ -397,7 +522,7 @@ fn rotate_service_key() {
     let ctx = open_tgt(&mut f, &tgt, 40, 40);
     let parts = f
         .keyd
-        .issue_tgs_rep(&KDC, &SERVICE, &ctx.ctx_id, &tgs_template(40), &now())
+        .issue_tgs(&KDC, &SERVICE, &ctx.ctx_id, &tgs_template(40), &now())
         .unwrap();
     assert_eq!(parts.ticket.enc_part.kvno, Some(2));
     assert!(krb_crypto::decrypt(&service_key(), usage(2), &parts.ticket.enc_part.cipher).is_err());
@@ -561,7 +686,7 @@ fn entropy_failure_fails_closed() {
     );
     assert_eq!(
         f.keyd
-            .issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, None, &as_template(), &now()),
+            .issue_as(&KDC, &ALICE, &KRBTGT, &proof, None, &as_template(), &now()),
         Err(IssueError::Denied)
     );
     assert_eq!(
@@ -584,7 +709,7 @@ fn entropy_failure_fails_closed() {
     let ctx = open_tgt(&mut f, &tgt, 50, 50);
     let parts = f
         .keyd
-        .issue_tgs_rep(&KDC, &SERVICE, &ctx.ctx_id, &tgs_template(50), &now())
+        .issue_tgs(&KDC, &SERVICE, &ctx.ctx_id, &tgs_template(50), &now())
         .unwrap();
     assert!(EncTicketPart::decode(&open(&service_key(), 2, &parts.ticket.enc_part)).is_ok());
 }

@@ -98,6 +98,8 @@ fn reason(reason: &keyd::AuditReason) -> KeydReason {
         ResultCodeNotPermitted, KpasswdMalformed, KpasswdHardError, KpasswdAuthError,
         KpasswdSoftError, KpasswdAccessDenied, KpasswdInitialFlagNeeded,
         DecisionRevoked, DecisionExecuted, AttestationKeyInstalled,
+        AttestationKeyMissing, NameResolutionInvalid, NameResolutionStale,
+        NameResolutionMismatch, AttestationKeyNotInstalled,
     }
         _ => KeydReason::Unlisted,
     )

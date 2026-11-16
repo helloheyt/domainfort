@@ -5,15 +5,27 @@
 //! krb-crypto), following RFC 4120 §3.1, §3.3, §5.2.7.2, §5.5.1 and the key
 //! usages of §7.5.1. Every value here is constructed by hand for these tests;
 //! no vector comes from any other implementation.
+//!
+//! dird's attested name resolutions (task PN11; docs/59 §7.1, §7.2): the
+//! fixture keyd holds [`ATTESTATION_KEY`] (installed in its ceremony, as
+//! keyadm does), and [`resolution_at`] / [`signed`] make the resolutions
+//! dird would send — tagged with name-attestation's `tag`, the signer dird
+//! calls (test code only; keyd itself never tags). [`Resolved`] is the
+//! honest dird: `issue_as` / `issue_tgs` call keyd's issuance with the
+//! resolutions of exactly the names the template carries, so the tests of
+//! the other rules keep their meaning; the resolution's own rules are
+//! tested in tests/issuance_by_resolution.rs.
 #![allow(dead_code)] // each test binary uses a different subset
 
 use keyd::{
-    AccountKind, AsRepParts, AsTicketTemplate, AuditRecord, AuditSink, CallerId, DecidedOperation,
-    DecisionId, EntropyError, EntropySource, InMemoryKeyStore, KeyHandle, KeyPurpose, KeyStore,
-    Keyd, KeydConfig, PrincipalBinding, PrincipalId, Role, SetSecretTarget, TgsTicketTemplate,
-    TgtContext, MAX_DESTROY_DECISION_SECS, MAX_INITIAL_SECRET_GRANT_SECS, MAX_KEY_DECISION_SECS,
-    MAX_SET_SECRET_GRANT_SECS,
+    AccountKind, AsRepParts, AsResolutions, AsTicketTemplate, AttestationKey,
+    AttestedNameResolution, AuditRecord, AuditSink, CallerId, DecidedOperation, DecisionId,
+    EntropyError, EntropySource, InMemoryKeyStore, IssueError, KeyHandle, KeyPurpose, KeyStore,
+    Keyd, KeydConfig, PrincipalBinding, PrincipalId, Role, SetSecretTarget, TgsRepParts,
+    TgsTicketTemplate, TgtContext, ATTESTATION_KEY_LEN, MAX_DESTROY_DECISION_SECS,
+    MAX_INITIAL_SECRET_GRANT_SECS, MAX_KEY_DECISION_SECS, MAX_SET_SECRET_GRANT_SECS,
 };
+use keyd_types::{NameResolution, NameResolutionFields};
 use krb_crypto::{ChecksumType, EncType, KeyUsage, ProtocolKey};
 use krb_proto::constants::{
     FX_FAST_ARMOR_AP_REQUEST, KRB_NT_PRINCIPAL, KRB_NT_SRV_HST, KRB_NT_SRV_INST, PA_ENC_TIMESTAMP,
@@ -193,6 +205,147 @@ pub fn bound(name: PrincipalName) -> PrincipalBinding {
     PrincipalBinding::new(realm(), name)
 }
 
+// ---------------------------------------------------------------------------
+// dird's attested name resolutions (task PN11; docs/59 §7.1, §7.2).
+// ---------------------------------------------------------------------------
+
+/// The attestation key of these fixtures — dird's and the fixture keyd's
+/// copy (docs/59 §7.4; installed in the ceremony). Made up here.
+pub const ATTESTATION_KEY: [u8; ATTESTATION_KEY_LEN] = [0x7A; ATTESTATION_KEY_LEN];
+
+/// Another key (a forger's): its tags never verify under
+/// [`ATTESTATION_KEY`]. Made up here.
+pub const FORGED_ATTESTATION_KEY: [u8; ATTESTATION_KEY_LEN] = [0x3C; ATTESTATION_KEY_LEN];
+
+/// The fixtures' attestation key, for `install_attestation_key`.
+pub fn attestation_key() -> AttestationKey {
+    AttestationKey::from_bytes(&ATTESTATION_KEY).unwrap()
+}
+
+/// `fields` as dird's signer states them: tagged under `key` with
+/// name-attestation's `tag` (TEST code — the product keyd never tags).
+/// Spec: docs/59 §7.1, §7.4.
+pub fn signed(
+    fields: NameResolutionFields,
+    key: &[u8; ATTESTATION_KEY_LEN],
+) -> AttestedNameResolution {
+    let resolution = NameResolution::new(fields).unwrap();
+    name_attestation::tag(&AttestationKey::from_bytes(key).unwrap(), &resolution).unwrap()
+}
+
+/// The fields of dird's resolution of (`realm_as_sent`, `name`) to `handle`:
+/// the canonical realm is the test realm, the canonical name the name as
+/// sent (the phase-1 acceptance, R47-1 — docs/59 §6.3), snapshot 1, issued
+/// at `when`. Spec: docs/59 §4.7, §7.1.
+pub fn resolution_fields(
+    realm_as_sent: &Realm,
+    name: &PrincipalName,
+    handle: &KeyHandle,
+    when: &KerberosTime,
+) -> NameResolutionFields {
+    NameResolutionFields {
+        realm_as_sent: realm_as_sent.clone(),
+        name_as_sent: name.clone(),
+        canonical_realm: realm(),
+        canonical_name: name.clone(),
+        principal: handle.principal,
+        key_purpose: handle.purpose,
+        snapshot: 1,
+        issued_at: *when,
+    }
+}
+
+/// dird's attested resolution of (test realm, `name`) to `handle`, issued at
+/// `when`, under [`ATTESTATION_KEY`]. Spec: docs/59 §7.1, §7.2.
+pub fn resolution_at(
+    name: &PrincipalName,
+    handle: &KeyHandle,
+    when: &KerberosTime,
+) -> AttestedNameResolution {
+    signed(
+        resolution_fields(&realm(), name, handle, when),
+        &ATTESTATION_KEY,
+    )
+}
+
+/// keyd's issuance with the resolutions an honest dird sends: of exactly
+/// the (realm, name) the template carries, to exactly the key set the call
+/// names, issued at keyd's `now` (module documentation). The arguments are
+/// those of `issue_as_rep` / `issue_tgs_rep` without the resolutions.
+/// Spec: docs/59 §7.1, §7.2, §7.5.
+pub trait Resolved {
+    /// `issue_as_rep` with the client's resolution of (crealm, cname) to
+    /// `client` and — for a change-password server — the server's of its
+    /// sname to `server`.
+    #[allow(clippy::too_many_arguments)]
+    fn issue_as(
+        &mut self,
+        caller: &CallerId,
+        client: &KeyHandle,
+        server: &KeyHandle,
+        proof: &keyd::AuthnProof,
+        armor: Option<keyd::ArmorId>,
+        template: &AsTicketTemplate,
+        now: &KerberosTime,
+    ) -> Result<AsRepParts, IssueError>;
+
+    /// `issue_tgs_rep` with the service's resolution of (realm, sname) to
+    /// `service`.
+    fn issue_tgs(
+        &mut self,
+        caller: &CallerId,
+        service: &KeyHandle,
+        ctx: &keyd::CtxId,
+        template: &TgsTicketTemplate,
+        now: &KerberosTime,
+    ) -> Result<TgsRepParts, IssueError>;
+}
+
+impl<S: KeyStore, A: AuditSink, E: EntropySource> Resolved for Keyd<S, A, E> {
+    fn issue_as(
+        &mut self,
+        caller: &CallerId,
+        client: &KeyHandle,
+        server: &KeyHandle,
+        proof: &keyd::AuthnProof,
+        armor: Option<keyd::ArmorId>,
+        template: &AsTicketTemplate,
+        now: &KerberosTime,
+    ) -> Result<AsRepParts, IssueError> {
+        let client_resolution = signed(
+            resolution_fields(&template.crealm, &template.cname, client, now),
+            &ATTESTATION_KEY,
+        );
+        let server_resolution = (server.purpose == KeyPurpose::ChangePasswordService)
+            .then(|| resolution_at(&template.sname, server, now));
+        self.issue_as_rep(
+            caller,
+            client,
+            server,
+            proof,
+            armor,
+            template,
+            AsResolutions {
+                client: &client_resolution,
+                server: server_resolution.as_ref(),
+            },
+            now,
+        )
+    }
+
+    fn issue_tgs(
+        &mut self,
+        caller: &CallerId,
+        service: &KeyHandle,
+        ctx: &keyd::CtxId,
+        template: &TgsTicketTemplate,
+        now: &KerberosTime,
+    ) -> Result<TgsRepParts, IssueError> {
+        let resolution = resolution_at(&template.sname, service, now);
+        self.issue_tgs_rep(caller, service, &resolution, ctx, template, now)
+    }
+}
+
 pub fn alice_binding() -> PrincipalBinding {
     bound(alice_name())
 }
@@ -272,6 +425,16 @@ impl Fixture {
     /// (the startup hold-down tests). The keys are created and the passwords
     /// set at [`now`]: Admin and Directory operations are not held.
     pub fn started(config: KeydConfig, started_at: &KerberosTime) -> Self {
+        Self::build(config, started_at, true)
+    }
+
+    /// [`Fixture::new`] whose ceremony installed no attestation key (task
+    /// PN11: such a keyd verifies no name resolution, so it issues nothing).
+    pub fn without_attestation_key() -> Self {
+        Self::build(config(), &keyd_started(), false)
+    }
+
+    fn build(config: KeydConfig, started_at: &KerberosTime, attestation: bool) -> Self {
         let entropy = TestEntropy::default();
         let store = InMemoryKeyStore::new_insecure_development_allowing_krbtgt(64);
         let mut keyd = Keyd::with_entropy(
@@ -299,6 +462,11 @@ impl Fixture {
         }
         keyd.create_key(&ADMIN, &SERVICE, &service_binding(), &n)
             .unwrap();
+        // The ceremony hands keyd dird's attestation key (task PN9 / PN11).
+        if attestation {
+            keyd.install_attestation_key(&ADMIN, attestation_key(), &n)
+                .unwrap();
+        }
         grant(&mut keyd, &ALICE, &alice_binding(), ALICE_SALT, &n).unwrap();
         keyd.set_secret(
             &DIRECTORY,
@@ -584,7 +752,7 @@ pub fn obtain_tgt(f: &mut Fixture, when: KerberosTime, template: &AsTicketTempla
         .unwrap();
     let parts = f
         .keyd
-        .issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, None, template, &when)
+        .issue_as(&KDC, &ALICE, &KRBTGT, &proof, None, template, &when)
         .unwrap();
     let rep = EncAsRepPart::decode(&open(&alice_key(), 3, &parts.enc_part)).unwrap();
     let session = key_from(&rep.0.key);
@@ -889,7 +1057,7 @@ pub fn obtain_computer_tgt(f: &mut Fixture, when: KerberosTime, endtime: Kerbero
     };
     let parts = f
         .keyd
-        .issue_as_rep(&KDC, &WS01, &KRBTGT, &proof, None, &template, &when)
+        .issue_as(&KDC, &WS01, &KRBTGT, &proof, None, &template, &when)
         .unwrap();
     let rep = EncAsRepPart::decode(&open(&ws01_key(), 3, &parts.enc_part)).unwrap();
     let session = key_from(&rep.0.key);

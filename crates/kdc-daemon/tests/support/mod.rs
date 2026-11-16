@@ -72,7 +72,9 @@ pub struct Handles {
 /// The directory context of the identities (realm EXAMPLE.ORG), with
 /// dird's signer under the fixtures' test key (task PN10: the account
 /// records carry dird's attested resolution — crates/directory-daemon
-/// support `resolution_signer`).
+/// support `resolution_signer`, which issues at the fixtures' `now`, the
+/// instant the in-process keyd judges it at: one clock per test world —
+/// A-190; dird's daemon clock in that support's `params` is the same).
 pub fn context() -> DirectoryContext {
     DirectoryContext::new(
         ad_schema::phase1().unwrap(),
@@ -142,6 +144,10 @@ pub fn directory_keyd(
         )
         .unwrap();
     }
+    // The ceremony hands keyd dird's attestation key (task PN11: keyd
+    // verifies the resolutions the kdc forwards with it).
+    keyd.install_attestation_key(&ADMIN, crate::common::test_attestation_key(), &now())
+        .unwrap();
     crate::common::grant_user(
         &mut keyd,
         &handles.alice,

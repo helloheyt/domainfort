@@ -978,16 +978,38 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// administrators' `set_secret` follows the ceremony — docs/51 §4.3
     /// step 12). Role::Admin.
     ///
+    /// **No seal without the attestation key** (task PN11; Q-1056 item 4,
+    /// A-188): after the authorization step, a keyd that holds no
+    /// attestation key refuses (`Denied`, `AttestationKeyNotInstalled`) and
+    /// stays as it was. A sealed keyd could verify no name resolution — and
+    /// issuance binds client and service keys only through one (docs/59
+    /// §7.2) — so it would refuse every AS and TGS, with no Admin operation
+    /// left to repair it short of a restart (docs/52 R3). With the check
+    /// here, in the PEP, that state is unrepresentable whichever client asks
+    /// (keyadm's required operand was the tool-side half — A-188). Class:
+    /// "keyd leaves its ceremony in a state in which an operation the sealed
+    /// keyd must perform cannot succeed" (Q-1056 item 1); root: the
+    /// transition requires what the state needs.
+    ///
     /// The seal only ever makes keyd stricter, so it is one record, no
     /// intent (A-88). It is held in memory: a keyd started with an empty
     /// store is `Provisioning` again (development mode: every start —
     /// P-17, A-77; docs/52 §4.4 residual).
     ///
     /// Spec: docs/52 §4.4, §7 R3; docs/51 §4.3, §4.5; docs/questions/Q-462
-    /// item 1 (A-102).
+    /// item 1 (A-102), Q-1056 item 4 (A-188); docs/59 §7.2, §7.4; AGENTS.md
+    /// §6.1.
     pub fn seal_ceremony(&mut self, caller: &CallerId, now: &KerberosTime) -> Result<(), Error> {
         let fields = AuditFields::default();
-        let result = self.admit(caller, Operation::SealCeremony, &[], now);
+        let result = self
+            .admit(caller, Operation::SealCeremony, &[], now)
+            .and_then(|()| {
+                if self.has_attestation_key() {
+                    Ok(())
+                } else {
+                    Err(Deny::denied(AuditReason::AttestationKeyNotInstalled))
+                }
+            });
         if result.is_ok() {
             self.ceremony = CeremonyState::Operational;
         }

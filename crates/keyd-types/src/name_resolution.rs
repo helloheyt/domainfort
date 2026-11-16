@@ -117,6 +117,77 @@ pub const MAX_NAME_RESOLUTION_MAC_INPUT: usize = 1
     + 8
     + 7;
 
+/// Bound of a realm of a name resolution on an ipc channel — dird → kdc
+/// (crate ipc-directory, task PN10) and kdc → keyd (crate ipc-keyd, task
+/// PN11): the bound this module puts on every realm of a resolution
+/// ([`MAX_NAME_OCTETS`]), so nothing a resolution cannot hold is read off
+/// either wire. Defined once, here, beside the bounds it is derived from:
+/// one resolution, one bound on both of its channels (A-190 on
+/// docs/questions/Q-1062 item 1).
+/// Spec: docs/59 §7.1 (the bounds of krb-proto and the binding), §7.5
+/// ("size bounds"); this module's bounds; AGENTS.md §6.
+pub const MAX_RESOLUTION_REALM: u32 = MAX_NAME_OCTETS as u32;
+
+/// Octets of a DER header around contents of at most 65 535 octets: one
+/// identifier octet (a tag number from 0 to 30 — X.690 §8.1.2.2) and at most
+/// three length octets (the definite form in the fewest octets — X.690
+/// §10.1; up to 65 535 the long form's initial octet and two more — X.690
+/// §8.1.3.5).
+/// Spec: ITU-T X.690 (02/2021) §8.1.2.2, §8.1.3.3-§8.1.3.5, §10.1.
+const DER_HEADER: usize = 1 + 3;
+
+/// Octets of a resolution name's `name-type [0] Int32` at most: the context
+/// tag around an INTEGER of at most four contents octets (Int32's range —
+/// RFC 4120 §5.2.4 — in the fewest two's-complement octets, X.690 §8.3.2,
+/// §8.3.3), each header in the short form (contents ≤ 127 octets — X.690
+/// §8.1.3.4).
+/// Spec: RFC 4120 §5 (`DEFINITIONS EXPLICIT TAGS`), §5.2.2 (`name-type [0]
+/// Int32`), §5.2.4 (`Int32`); X.690 §8.1.3.4, §8.3.1-§8.3.3.
+const RESOLUTION_NAME_TYPE_DER: usize = 2 + 2 + 4;
+
+/// Bound of a `PrincipalName` DER of a name resolution on an ipc channel
+/// (the two of [`MAX_RESOLUTION_REALM`]): the largest encoding of a name a
+/// resolution can hold — `MAX_NAME_COMPONENTS` components of at most
+/// [`MAX_NAME_OCTETS`] octets each (this module's bounds) — as `SEQUENCE {
+/// name-type [0] Int32, name-string [1] SEQUENCE OF KerberosString }` under
+/// explicit tags: the outer header, the name-type, the `[1]` and `SEQUENCE
+/// OF` headers, and one header plus the octets per component. 16 468
+/// octets; every contents length involved is under 65 536, so
+/// [`DER_HEADER`] holds for each (checked below).
+/// Spec: RFC 4120 §5 (`DEFINITIONS EXPLICIT TAGS`), §5.2.1
+/// (`KerberosString`), §5.2.2 (`PrincipalName`); X.690 §8.1.2.2, §8.1.3,
+/// §10.1; docs/59 §7.1, §7.5; AGENTS.md §6.
+pub const MAX_RESOLUTION_NAME: u32 = (DER_HEADER
+    + RESOLUTION_NAME_TYPE_DER
+    + DER_HEADER
+    + DER_HEADER
+    + MAX_NAME_COMPONENTS * (DER_HEADER + MAX_NAME_OCTETS))
+    as u32;
+
+/// Body octets of the largest name resolution on an ipc channel (the two of
+/// [`MAX_RESOLUTION_REALM`], which encode it alike): two realms and two
+/// names at their bounds, each behind its `u32` length, the principal id,
+/// the purpose, the snapshot, the issue time and the tag.
+/// Spec: docs/50 §3.3 (`bytes<max>` = `u32` length + octets; fixed-width
+/// integers); docs/59 §7.1; this module's fields.
+pub const LARGEST_RESOLUTION: usize = 2 * (4 + MAX_RESOLUTION_REALM as usize)
+    + 2 * (4 + MAX_RESOLUTION_NAME as usize)
+    + 16
+    + 1
+    + 8
+    + 7
+    + NAME_RESOLUTION_TAG_LEN;
+
+// The wire bounds agree with the values they are derived from: the realm
+// bound is this module's; every contents length inside a resolution name is
+// under 65 536, so each header takes at most DER_HEADER octets (X.690
+// §8.1.3.5). Checked at compile time, never at run time.
+const _: () = {
+    assert!(MAX_RESOLUTION_REALM as usize == MAX_NAME_OCTETS);
+    assert!((MAX_RESOLUTION_NAME as usize) - DER_HEADER <= 0xFFFF);
+    assert!(MAX_NAME_COMPONENTS * (DER_HEADER + MAX_NAME_OCTETS) <= 0xFFFF);
+};
+
 /// Why a name resolution was refused: the value is outside the bounds. No
 /// data is carried (names are not secret, but nothing needs to be).
 /// Spec: this module's bounds; AGENTS.md §6.

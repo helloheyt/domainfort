@@ -257,6 +257,16 @@ fn kdc_for(d: &Dir) -> TestKdc {
         )
         .unwrap();
     }
+    // The ceremony hands keyd dird's attestation key (task PN11: keyd
+    // verifies the resolution of every account record the kdc forwards —
+    // docs/59 §7.2); the context's signer issues at the fixtures' `now`
+    // (tests/common/signer.rs).
+    keyd.install_attestation_key(
+        &ADMIN,
+        keyd::AttestationKey::from_bytes(&common::signer::TEST_ATTESTATION_KEY).unwrap(),
+        &n,
+    )
+    .unwrap();
     Kdc::new(
         KdcConfig::new(realm(), krbtgt),
         LocalKeyd::new(keyd, KDC_CALLER).unwrap(),

@@ -462,11 +462,13 @@ fn code_identifiers(source: &str) -> Vec<String> {
 ///   field names a role in the whole file, `pub caller_role: Role`, and it
 ///   is `WireConfigDescription`'s;
 ///
-/// and every time field encoded is a ticket fact or a template time — never
-/// a value handed to keyd as its `now`. The type-level argument: `dispatch`
-/// and `execute` take `now` as a parameter and build every keyd call from
-/// it; `Call` (what a request decodes to) has no time field outside
-/// templates, proofs and contexts, and no role field at all.
+/// and every time field encoded is a ticket fact or a template time — or
+/// the issue time of dird's attested name resolution (task PN11), a fact
+/// keyd judges against its own clock (docs/59 §7.2 step 3) — never a value
+/// handed to keyd as its `now`. The type-level argument: `dispatch` and
+/// `execute` take `now` as a parameter and build every keyd call from it;
+/// `Call` (what a request decodes to) has no time field outside templates,
+/// proofs, contexts and resolutions, and no role field at all.
 #[test]
 fn no_now_on_the_wire_and_no_role_in_any_request() {
     let wire = include_str!("../src/wire.rs");
@@ -521,6 +523,9 @@ fn no_now_on_the_wire_and_no_role_in_any_request() {
         "endtime",
         "renew_till",
         "armor_authtime",
+        // dird's issue time of a name resolution (task PN11): keyd checks it
+        // against its own `now` (R50-5 holds — docs/59 §7.2 step 3).
+        "issued_at",
     ];
     let mut time_fields = BTreeSet::new();
     for line in wire.lines() {
@@ -1160,4 +1165,215 @@ fn the_attestation_key_never_shows_in_debug() {
         assert!(!text.contains("6b") && !text.contains("6B"), "{text}");
         assert!(text.contains("redacted"), "{text}");
     }
+}
+
+// ---- dird's attested name resolutions (task PN11; docs/59 §7.5) -------------
+
+/// The `issue_tgs_rep` call of the samples (with its service resolution).
+fn tgs_call() -> Call {
+    samples::calls()
+        .into_iter()
+        .find(|c| matches!(c, Call::IssueTgsRep { .. }))
+        .unwrap()
+}
+
+/// The armored `issue_as_rep` sample (with both resolutions).
+fn as_call() -> Call {
+    samples::calls()
+        .into_iter()
+        .find(|c| {
+            matches!(
+                c,
+                Call::IssueAsRep {
+                    server_resolution: Some(_),
+                    ..
+                }
+            )
+        })
+        .unwrap()
+}
+
+/// docs/59 §7.1, §7.5: the resolutions cross the channel unchanged — every
+/// field and the tag (which this layer carries, never checks: keyd verifies
+/// it, §7.2 step 1); the AS request carries the client's and, when present,
+/// the change-password service's.
+#[test]
+fn the_resolutions_cross_the_channel_unchanged() {
+    for call in [as_call(), tgs_call()] {
+        let decoded = decode_request(&request_body(&call)).unwrap();
+        let pairs = match (&call, &decoded) {
+            (
+                Call::IssueAsRep {
+                    client_resolution: a,
+                    server_resolution: Some(b),
+                    ..
+                },
+                Call::IssueAsRep {
+                    client_resolution: x,
+                    server_resolution: Some(y),
+                    ..
+                },
+            ) => vec![(a, x), (b, y)],
+            (
+                Call::IssueTgsRep {
+                    service_resolution: a,
+                    ..
+                },
+                Call::IssueTgsRep {
+                    service_resolution: x,
+                    ..
+                },
+            ) => vec![(a, x)],
+            _ => panic!("the same operation"),
+        };
+        for (sent, received) in pairs {
+            assert_eq!(sent.resolution(), received.resolution());
+            assert_eq!(sent.tag(), received.tag());
+        }
+    }
+}
+
+/// The octets of `resolution` as the channel encodes it (its fields, no
+/// envelope).
+fn resolution_octets(resolution: &ipc_keyd::wire::WireNameResolution) -> usize {
+    use ipc::Payload;
+    let mut writer = ipc::Writer::new(ipc_keyd::REQUEST_LIMIT);
+    resolution.write_fields(&mut writer).unwrap();
+    writer.into_payload().len()
+}
+
+/// docs/50 §3.3 (strict, bounded, no trailing octet); docs/59 §7.5: a
+/// request in the layout before task PN11 — the same request without the
+/// resolutions after its template — is refused (`Malformed`), never
+/// misread; so is one whose resolution is cut short, or followed by an
+/// extra octet.
+#[test]
+fn a_request_without_its_resolution_is_refused() {
+    for call in [as_call(), tgs_call()] {
+        let body = request_body(&call);
+        let appended = match call.to_wire().unwrap() {
+            KeydRequest::IssueAsRep(wire) => {
+                resolution_octets(&wire.client_resolution)
+                    + 1
+                    + wire
+                        .server_resolution
+                        .as_deref()
+                        .map_or(0, resolution_octets)
+            }
+            KeydRequest::IssueTgsRep(wire) => resolution_octets(&wire.service_resolution),
+            _ => unreachable!(),
+        };
+        let old_layout = &body[..body.len() - appended];
+        assert_eq!(refusal_of(old_layout), Some(Refused::Malformed));
+        for cut in 1..=64 {
+            let short = &body[..body.len() - cut];
+            assert_eq!(refusal_of(short), Some(Refused::Malformed), "cut {cut}");
+        }
+        let mut trailing = body.clone();
+        trailing.push(0);
+        assert_eq!(refusal_of(&trailing), Some(Refused::Malformed));
+    }
+}
+
+/// docs/59 §7.1 (the bounds: 1..=16 components, each and every realm at
+/// most 1024 octets): a resolution outside them is refused by the typed
+/// layer (`ConversionError::NameResolution` ⇒ `Malformed`) — here a
+/// canonical name with one component of 1025 octets (within the DER bound,
+/// outside the component bound; 17 components krb-proto itself never
+/// encodes or decodes); and the wire bounds are exactly the
+/// largest resolution keyd-types admits (a realm of 1025 octets is refused
+/// at the codec; the largest name and realm fit, and two of the largest
+/// resolutions fit in one request body).
+#[test]
+fn the_resolution_bounds_are_the_resolutions() {
+    use ipc_keyd::channel::{
+        LARGEST_RESOLUTION, MAX_KDC_PART_BODY, MAX_REQUEST_BODY, MAX_RESOLUTION_NAME,
+        MAX_RESOLUTION_REALM,
+    };
+    assert_eq!(MAX_RESOLUTION_REALM, 1024);
+    assert_eq!(MAX_RESOLUTION_NAME, 16_468);
+    assert_eq!(LARGEST_RESOLUTION, 35_064);
+    assert_eq!(MAX_KDC_PART_BODY, 80 * 1024);
+    assert!(MAX_KDC_PART_BODY as usize + 2 * LARGEST_RESOLUTION < MAX_REQUEST_BODY as usize);
+
+    let Ok(KeydRequest::IssueTgsRep(mut wire)) = tgs_call().to_wire() else {
+        panic!("the TGS request");
+    };
+    // One component of 1025 octets: well-formed DER within the field's
+    // bound, outside a resolution's component bound.
+    let long = "c".repeat(1025);
+    wire.service_resolution.canonical_name =
+        ipc::DerBlob::new(samples::name(1, &[long.as_str()]).encode().unwrap());
+    let body = encode_frame(
+        KEYD_CHANNEL,
+        Direction::Request,
+        &KeydRequest::IssueTgsRep(wire),
+    )
+    .unwrap()
+    .body()
+    .to_vec();
+    assert!(matches!(
+        decode_request(&body),
+        Err(Rejection::Value(ipc_keyd::ConversionError::NameResolution))
+    ));
+    assert_eq!(refusal_of(&body), Some(Refused::Malformed));
+
+    // A realm longer than the bound is refused when encoding.
+    let Ok(KeydRequest::IssueTgsRep(mut wire)) = tgs_call().to_wire() else {
+        panic!("the TGS request");
+    };
+    wire.service_resolution.realm_as_sent = vec![b'R'; 1025];
+    assert!(encode_frame(
+        KEYD_CHANNEL,
+        Direction::Request,
+        &KeydRequest::IssueTgsRep(wire)
+    )
+    .is_err());
+
+    // The largest resolution keyd-types admits crosses: 16 components of
+    // 1024 octets, realms of 1024 octets.
+    let part = "p".repeat(1024);
+    let parts: Vec<&str> = vec![part.as_str(); 16];
+    let big_name = samples::name(1, &parts);
+    let big_realm = krb_proto::Realm::new(&"R".repeat(1024)).unwrap();
+    let resolution = keyd_types::NameResolution::new(keyd_types::NameResolutionFields {
+        realm_as_sent: big_realm.clone(),
+        name_as_sent: big_name.clone(),
+        canonical_realm: big_realm,
+        canonical_name: big_name,
+        principal: keyd_types::PrincipalId::from_bytes([0x11; 16]),
+        key_purpose: keyd_types::KeyPurpose::Service,
+        snapshot: u64::MAX,
+        issued_at: samples::time(3),
+    })
+    .unwrap();
+    let largest = keyd_types::AttestedNameResolution::new(resolution, [0xEE; 32]);
+    let Call::IssueAsRep {
+        client,
+        krbtgt,
+        proof,
+        armor,
+        template,
+        ..
+    } = as_call()
+    else {
+        panic!("the AS call");
+    };
+    let call = Call::IssueAsRep {
+        client,
+        krbtgt,
+        proof,
+        armor,
+        template,
+        client_resolution: Box::new(largest.clone()),
+        server_resolution: Some(Box::new(largest.clone())),
+    };
+    let body = request_body(&call);
+    let Ok(Call::IssueAsRep {
+        client_resolution, ..
+    }) = decode_request(&body)
+    else {
+        panic!("decodes");
+    };
+    assert_eq!(client_resolution.resolution(), largest.resolution());
 }
