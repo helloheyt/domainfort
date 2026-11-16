@@ -15,10 +15,15 @@
 //! 2. **Staging** (step 3): a new directory, mode 0700, owner root.
 //! 3. **Staged files**, each created exclusively without following links,
 //!    its mode set exactly, its owner set through [`Ownership`], written,
-//!    `fsync`ed: the integrity key (root:0400, 32 octets — step 4); the
-//!    database (an empty 0600 file created for reading and writing, handed
-//!    **as that descriptor** to dirstore `Store::open_file` — redb's
-//!    `create_with_backend` initialises it, "Open an existing or create a
+//!    `fsync`ed: the integrity key (root:0400, 32 octets — step 4); task
+//!    PN12 — the name-resolution attestation key, from the plan's one buffer,
+//!    twice: dird's key file (root:0400, 32 octets — the rule dird's one
+//!    key-file reader applies) and keyadm's input copy (keyadm's uid, 0400,
+//!    32 octets — the rule keyadm's reader applies; docs/59 §7.4,
+//!    docs/questions/Q-1039 item 1); the database (an empty 0600 file
+//!    created for reading and writing, handed **as that descriptor** to
+//!    dirstore `Store::open_file` — redb's `create_with_backend` initialises
+//!    it, "Open an existing or create a
 //!    new database with the given backend", redb 4.5.0 docs.rs — then
 //!    **one** `WriteTxn` with every object, committed and read back, module
 //!    `store`; owner dird, 0600 — step 5); the policy (root:0644 — step
@@ -26,8 +31,9 @@
 //!    (root:0644 — step 8). Then the staging directory is `fsync`ed.
 //! 4. **Install** (step 9): rename into place, never replacing an existing
 //!    path (`RENAME_NOREPLACE`): the configuration files, the policy, the
-//!    key, the manifest; `fsync` of each target directory; **then the
-//!    database, last**, and `fsync` of its directory.
+//!    keys (the integrity key, then the attestation key's two files), the
+//!    manifest; `fsync` of each target directory; **then the database,
+//!    last**, and `fsync` of its directory.
 //! 5. The empty staging directory is removed and its parent `fsync`ed.
 //!
 //! # A crash — or any error — at each point (docs/51 §4.4)
@@ -39,7 +45,7 @@
 //! |---|---|---|---|
 //! | in the pre-check, or before the staging directory exists | [`InstallState::NothingWritten`] | — | runs |
 //! | after the staging directory exists, before the first rename | [`InstallState::StagingOnly`] — only the staging directory (with what was staged) | no database ⇒ does not start | refuses (staging exists) until the operator removes it |
-//! | after a rename, before the database's | [`InstallState::PartlyInstalled`] — some of configuration / policy / key / manifest in place, no database | does not start (fail closed) | refuses (targets exist) until the operator removes them |
+//! | after a rename, before the database's | [`InstallState::PartlyInstalled`] — some of configuration / policy / keys / manifest in place, no database | does not start (fail closed) | refuses (targets exist) until the operator removes them |
 //! | after the database's rename | [`InstallState::InstalledStagingLeft`] — the domain is complete; the empty staging directory may remain | starts | refuses (targets exist) |
 //!
 //! Every domain object is in the one committed transaction (D136): there
@@ -61,7 +67,9 @@
 //! Spec: docs/51 §4.3 steps 1, 3-9, §4.4 (R51-2); docs/50 §6.4, §7.1;
 //! Q-270 items 1, 3; A-68; A-86 (O_NOFOLLOW); A-109 (Q-532 item 2, task
 //! R11c); docs/questions Q-468 option 2(b); redb 4.5.0 docs.rs
-//! `Builder::create_with_backend`; std `File::try_clone`.
+//! `Builder::create_with_backend`; std `File::try_clone`; docs/59 §7.4, §10
+//! (PN12), docs/questions/Q-1039 item 1 (A-183), Q-1048 item 2 (A-187: root,
+//! exactly 0400), Q-1055 (the attestation key's two files).
 
 use core::fmt;
 use std::io::{self, Write};
@@ -86,6 +94,10 @@ pub enum Target {
     Policy,
     /// The integrity key.
     IntegrityKey,
+    /// dird's name-resolution attestation key (task PN12).
+    AttestationKey,
+    /// keyadm's input copy of the attestation key (task PN12).
+    KeyadmAttestationKey,
     /// The manifest.
     Manifest,
     /// The database.
@@ -108,6 +120,8 @@ impl Target {
             Target::Config(Daemon::Dnsd) => "config-dnsd",
             Target::Policy => "policy",
             Target::IntegrityKey => "integrity-key",
+            Target::AttestationKey => "attestation-key",
+            Target::KeyadmAttestationKey => "keyadm-attestation-key",
             Target::Manifest => "manifest",
             Target::Store => "database",
         }
@@ -128,21 +142,27 @@ impl Target {
             Target::Config(Daemon::Dnsd) => &paths.dnsd_config,
             Target::Policy => &paths.policy,
             Target::IntegrityKey => &paths.integrity_key,
+            Target::AttestationKey => &paths.attestation_key,
+            Target::KeyadmAttestationKey => &paths.keyadm_attestation_key,
             Target::Manifest => &paths.manifest,
             Target::Store => &paths.database,
         }
     }
 
     /// Every target, in installation order: the configuration files, the
-    /// policy, the key, the manifest, and the database last.
+    /// policy, the keys (the integrity key, then — task PN12 — dird's
+    /// attestation key and keyadm's copy), the manifest, and the database
+    /// last.
     /// Spec: docs/51 §4.3 step 9 ("configuration files, policy, key,
-    /// manifest — and the database last").
+    /// manifest — and the database last"); docs/59 §7.4.
     #[must_use]
     pub fn installation_order() -> Vec<Target> {
         let mut order: Vec<Target> = Daemon::ALL.iter().map(|d| Target::Config(*d)).collect();
         order.extend([
             Target::Policy,
             Target::IntegrityKey,
+            Target::AttestationKey,
+            Target::KeyadmAttestationKey,
             Target::Manifest,
             Target::Store,
         ]);
@@ -590,6 +610,28 @@ pub fn install<O: Ownership, P: Progress>(
         NewFileMode::OwnerRead,
         Owner::ROOT,
         plan.integrity_key().bytes().as_slice(),
+    )?;
+    // Task PN12 (docs/59 §7.4): the attestation key, through the same
+    // writer and mode, straight from the plan's one zeroizing buffer (no
+    // copy) — dird's key file (root:0400: dird's one key-file reader
+    // requires exactly that, A-187 on docs/questions/Q-1048 item 2) and
+    // keyadm's input copy (keyadm's uid, 0400: keyadm's reader requires the
+    // running account's file, mode 0400 or 0600 — docs/questions/Q-1039
+    // item 1, A-183). One draw, so the two files cannot hold two keys.
+    let attestation_key = plan.attestation_key().expose().as_slice();
+    run.stage_file(
+        Target::AttestationKey,
+        Staged::AttestationKey,
+        NewFileMode::OwnerRead,
+        Owner::ROOT,
+        attestation_key,
+    )?;
+    run.stage_file(
+        Target::KeyadmAttestationKey,
+        Staged::KeyadmAttestationKey,
+        NewFileMode::OwnerRead,
+        plan.keyadm_key_owner,
+        attestation_key,
     )?;
     // Step 5: the database (dird, 0600).
     run.stage_store()?;

@@ -14,6 +14,7 @@
 //!     --kpasswd-front-account <uid>:<gid> --dnsd-account <uid>:<gid> \
 //!     --keyadm-uid <uid> --admin-socket-group <gid> \
 //!     --staging-dir <path> --database-path <path> --integrity-key-path <path> \
+//!     --attestation-key-path <path> --keyadm-attestation-key-path <path> \
 //!     --policy-path <path> --manifest-path <path> --audit-log-path <path> \
 //!     --keyd-config <path> --dird-config <path> --kdc-config <path> \
 //!     --ldap-front-config <path> --auditd-config <path> \
@@ -79,7 +80,12 @@
 //! (A-176), Q-1024. Task DN10d moves the StartTLS requirement into
 //! ldap-front's own schema (the plan's parse-back refuses a file without
 //! `ldap_listen`) and gives dnsd's listeners port 53 only (A-178 on
-//! docs/questions/Q-1025 items 1, 3).
+//! docs/questions/Q-1025 items 1, 3). Task PN12 adds the attestation key's
+//! two files (docs/59 §7.4): `--attestation-key-path` (dird's key file, the
+//! `attestation_key_path` of dird's file) and `--keyadm-attestation-key-path`
+//! (keyadm's input copy — the operand of `keyadm ceremony`; docs/questions/
+//! Q-1039 item 1, A-183) — paths only: the key is drawn by the run, never an
+//! argument (D95).
 //!
 //! Spec: docs/51 §4.3 (the input; step 12), §4.4 (the password source),
 //! §5.10 (`provision policy`), §3 (D95); docs/50 §7.1 (numeric ids, no
@@ -186,6 +192,8 @@ const DOMAIN_FLAGS: &[(&str, Arity)] = &[
     ("--staging-dir", Arity::One),
     ("--database-path", Arity::One),
     ("--integrity-key-path", Arity::One),
+    ("--attestation-key-path", Arity::One),
+    ("--keyadm-attestation-key-path", Arity::One),
     ("--policy-path", Arity::One),
     ("--manifest-path", Arity::One),
     ("--audit-log-path", Arity::One),
@@ -378,6 +386,8 @@ fn parse_domain(args: &[String]) -> Result<DomainInput, CliError> {
             staging: f.path("--staging-dir")?,
             database: f.path("--database-path")?,
             integrity_key: f.path("--integrity-key-path")?,
+            attestation_key: f.path("--attestation-key-path")?,
+            keyadm_attestation_key: f.path("--keyadm-attestation-key-path")?,
             policy: f.path("--policy-path")?,
             manifest: f.path("--manifest-path")?,
             audit_log: f.path("--audit-log-path")?,

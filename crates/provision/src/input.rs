@@ -7,6 +7,10 @@
 //! only) and the change-password service object's name (docs/53 §5.2).
 //! Task DN10b adds the DC's own addresses (`--dc-address`, docs/54 §3.1, §10
 //! row DN13), written as the DC's host record through the one checker.
+//! Task PN12 adds the two files of the name-resolution attestation key
+//! (docs/59 §7.4, §10 row PN12): dird's key file (`--attestation-key-path`)
+//! and keyadm's input copy for the ceremony (`--keyadm-attestation-key-path`,
+//! docs/questions/Q-1039 item 1 — A-183).
 //!
 //! Spec: docs/51 §4.3 ("input (without any secret)"; step 1), §4.4, §4.6,
 //! §11; docs/50 §2.4, §3.1, R50-3, §7.1; docs/53 §3.3, §5.2, §10 (K9);
@@ -153,6 +157,13 @@ pub struct Paths {
     pub database: FilePath,
     /// The development integrity key (`integrity_key_path`).
     pub integrity_key: FilePath,
+    /// dird's name-resolution attestation key (`attestation_key_path` in
+    /// dird's file; root:0400, 32 octets — task PN12, docs/59 §7.4).
+    pub attestation_key: FilePath,
+    /// keyadm's input copy of the same attestation key — the operand of
+    /// `keyadm ceremony`, which installs it in keyd (keyadm's uid, 0400 —
+    /// task PN12; docs/questions/Q-1039 item 1, A-183).
+    pub keyadm_attestation_key: FilePath,
     /// The policy file (`policy_store_path`, dird and kdc).
     pub policy: FilePath,
     /// The manifest.
@@ -718,10 +729,14 @@ impl DomainInput {
     /// directory, owned by the server's uid"); Q-230 item 16.
     fn check_paths(&self) -> Result<(), InputError> {
         let p = &self.paths;
-        let named: [(&'static str, &FilePath); 26] = [
+        let named: [(&'static str, &FilePath); 28] = [
             ("staging-dir", &p.staging),
             ("database-path", &p.database),
             ("integrity-key-path", &p.integrity_key),
+            // Task PN12 (docs/59 §7.4): the attestation key's two files —
+            // dird's and keyadm's — each its own path.
+            ("attestation-key-path", &p.attestation_key),
+            ("keyadm-attestation-key-path", &p.keyadm_attestation_key),
             ("policy-path", &p.policy),
             ("manifest-path", &p.manifest),
             ("audit-log-path", &p.audit_log),

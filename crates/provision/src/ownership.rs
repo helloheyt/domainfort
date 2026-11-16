@@ -12,7 +12,9 @@
 //!   implementation in the binary.
 //!
 //! Spec: docs/51 §4.3 steps 3-9 (the owners and modes), §4.4; Q-270 item 3
-//! (the database owned by dird's account); A-68 (the key root:0400); the
+//! (the database owned by dird's account); A-68 (the key root:0400);
+//! docs/59 §7.4 and docs/questions/Q-1039 item 1 (task PN12: dird's
+//! attestation key root:0400, keyadm's copy owned by keyadm's uid); the
 //! task's rule "the production implementation requires root and refuses
 //! otherwise"; rustix docs.rs `fs::fchown`, `fs::Uid::from_raw`,
 //! `fs::Gid::from_raw`, `process::geteuid` (P-2).
@@ -29,6 +31,11 @@ pub enum Staged {
     StagingDirectory,
     /// The integrity key file.
     IntegrityKey,
+    /// dird's attestation key file (task PN12; root:0400).
+    AttestationKey,
+    /// keyadm's input copy of the attestation key (task PN12; keyadm's uid,
+    /// 0400).
+    KeyadmAttestationKey,
     /// The database file.
     Store,
     /// The policy file.

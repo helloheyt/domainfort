@@ -15,11 +15,15 @@
 //!    absent, parents real directories on one filesystem, every directory
 //!    on every path walked from `/` — crates/protected-file, task R11c);
 //! 2. **draws** from the CSPRNG — the domain SID, every objectGUID, the
-//!    NodeId, the integrity key ([`Plan`]); the source is
+//!    NodeId, the integrity key and (task PN12) the name-resolution
+//!    attestation key ([`Plan`]); the source is
 //!    `directory_admin::OsRandom`, keyd's (A-15 / A-77) behind
 //!    `directory_admin::RandomSource`;
 //! 3. **staging** directory (root, 0700) on the targets' filesystem;
-//! 4. the **integrity key** (root:0400, 32 octets);
+//! 4. the **integrity key** (root:0400, 32 octets); (task PN12) the
+//!    **attestation key** twice from one draw — dird's key file (root:0400)
+//!    and keyadm's input copy for the ceremony (keyadm's uid, 0400; docs/59
+//!    §7.4, docs/questions/Q-1039 item 1);
 //! 5. the **database** — one `WriteTxn` with both named counters and every
 //!    domain object (module [`plan`] lists them; module `store`), owner
 //!    dird, 0600;
@@ -32,7 +36,9 @@
 //!    the crash analysis).
 //!
 //! Part B (the online key ceremony) is `keyadm ceremony` (task A5, crate
-//! keyadm) and `provision first-admin-secret` (task A6, below).
+//! keyadm) — which since task PN12 takes keyadm's attestation-key copy this
+//! run wrote and installs it in keyd before the seal (task PN9) — and
+//! `provision first-admin-secret` (task A6, below).
 //!
 //! # `provision first-admin-secret` — docs/51 §4.3 step 12 (task A6)
 //!
@@ -67,7 +73,9 @@
 //!
 //! `#![forbid(unsafe_code)]`; no `unwrap`, `expect` or `panic!` outside
 //! tests. The integrity key lives in zeroizing buffers, is written only to
-//! its 0400 file, and never appears in a message or a `Debug` output; so do
+//! its 0400 file, and never appears in a message or a `Debug` output; so
+//! does the attestation key (task PN12: written only to dird's 0400 file and
+//! keyadm's 0400 copy, never to the manifest or a configuration file); so do
 //! the first administrators' passwords of `first-admin-secret`, which are
 //! never written anywhere (they go to keyd only). Every
 //! file is created exclusively without following links (O_EXCL |
@@ -84,7 +92,10 @@
 //!
 //! - **Development sources only**: the integrity key is a development file
 //!   and the policy is unsigned (Q-270 items 1-2, A-68); keyd's store is
-//!   in-memory (P-17), so part B repeats after every keyd restart (A-77).
+//!   in-memory (P-17), so part B repeats after every keyd restart (A-77) —
+//!   which is why keyadm's copy of the attestation key stays on disk next to
+//!   dird's (two copies, each readable by one account, until keyd keeps the
+//!   key itself — KL3, P-71; docs/questions/Q-1039 item 1, Q-1057).
 //! - The CSPRNG readiness threshold of D74 is not checked (A-77, until
 //!   P-18).
 //! - `fsync` on Apple platforms is not a persistence guarantee (rustix
@@ -132,6 +143,25 @@
 //! 6.1.1.2.7.52; [MS-DTYP] v20241119 2.4.2.4, 2.4.4.1, 2.4.4.3, 2.5.3.1.1
 //! (SHA-256 verified against tools/spec-pin/manifest.json). Interpretations:
 //! docs/questions/Q-972 … Q-975.
+//!
+//! # Task PN12 — the name-resolution attestation key
+//!
+//! `provision domain` draws the attestation key (32 octets, never all zero)
+//! with the other draws and writes it, from that one buffer and through the
+//! installer's one file writer, to dird's key file (`--attestation-key-path`:
+//! root:0400, named by dird's `attestation_key_path`, which dird's schema now
+//! requires) and to keyadm's input copy (`--keyadm-attestation-key-path`:
+//! keyadm's uid, 0400) — the operand `keyadm ceremony` installs in keyd
+//! before the seal (task PN9). No other channel carries the key between the
+//! daemons; it is never printed, never in the manifest or a configuration
+//! file. Opened in the PN12 session: docs/59 (whole; §7.4, §10), docs/50
+//! §7.1, §7.4, docs/51 §4.3-§4.6, §6, docs/questions/Q-1011, Q-1035..Q-1039,
+//! Q-1046, Q-1048, PENDING-OWNER A-182, A-183, A-187, and the public API of
+//! this workspace's crates (directory-daemon `startup`, keyadm
+//! `attestation_key` / `ceremony`, ipc-keyd `AttestationKeyOctets`,
+//! name-attestation, config). No Microsoft specification or RFC governs this
+//! project key's custody. Interpretations: docs/questions/Q-1055 … Q-1057
+//! (module [`plan`], "The attestation key").
 
 pub mod cli;
 pub mod configs;
@@ -154,7 +184,7 @@ pub use install::{
     install, precheck, InstallError, InstallState, Installed, Progress, Step, Target,
 };
 pub use ownership::{NotRoot, Ownership, OwnershipError, RootOwnership, Staged};
-pub use plan::{ObjectRole, Owner, Plan, PlanError, PlannedObject, RidSource};
+pub use plan::{keyadm_key_owner, ObjectRole, Owner, Plan, PlanError, PlannedObject, RidSource};
 pub use store::StoreError;
 
 use core::fmt;

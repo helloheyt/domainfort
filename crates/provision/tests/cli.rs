@@ -82,6 +82,12 @@ fn domain_args() -> Vec<String> {
         ("--staging-dir", "/srv/p/etc/staging"),
         ("--database-path", "/srv/p/var/directory.redb"),
         ("--integrity-key-path", "/srv/p/etc/integrity.key"),
+        // Task PN12 (docs/59 §7.4): the attestation key's two files.
+        ("--attestation-key-path", "/srv/p/etc/attestation.key"),
+        (
+            "--keyadm-attestation-key-path",
+            "/srv/p/etc/keyadm-attestation.key",
+        ),
         ("--policy-path", "/srv/p/etc/policy.store"),
         ("--manifest-path", "/srv/p/etc/provision.manifest"),
         ("--audit-log-path", "/srv/p/var/audit.log"),
@@ -200,6 +206,32 @@ fn the_k9_flags_are_required() {
         "--dird-kpasswd-socket",
         "--dird-dns-socket",
     ] {
+        let i = base.iter().position(|a| a == flag).unwrap();
+        let mut v = base.clone();
+        v.drain(i..i + 2);
+        assert!(usage(&v), "{flag}");
+    }
+}
+
+/// Task PN12 (docs/59 §7.4; docs/questions/Q-1039 item 1, A-183): the
+/// attestation key's two files — dird's and keyadm's copy — are paths on
+/// the command line (the key itself never is: the run draws it — D95), each
+/// required and parsed into the input.
+#[test]
+fn the_attestation_key_paths_are_required_flags() {
+    let Command::Domain(input) = parse(os(&domain_args())).unwrap() else {
+        panic!("not domain");
+    };
+    assert_eq!(
+        input.paths.attestation_key.as_str(),
+        "/srv/p/etc/attestation.key"
+    );
+    assert_eq!(
+        input.paths.keyadm_attestation_key.as_str(),
+        "/srv/p/etc/keyadm-attestation.key"
+    );
+    let base = domain_args();
+    for flag in ["--attestation-key-path", "--keyadm-attestation-key-path"] {
         let i = base.iter().position(|a| a == flag).unwrap();
         let mut v = base.clone();
         v.drain(i..i + 2);

@@ -140,9 +140,10 @@ pub enum StartupError {
     /// `dns_soa_rname` does not form a DNS name (crates/parse-dns refused
     /// its labels) — task DN10a.
     DnsRname,
-    /// `attestation_key_path` is not configured: dird cannot attest a name
-    /// resolution, so it does not start (task PN10; fail closed).
-    AttestationKeyNotConfigured,
+    // (Task PN12: no "attestation key not configured" refusal — the
+    // configuration schema requires `attestation_key_path`, so a file
+    // without it is refused as `Config`, before anything is read; A-187 on
+    // docs/questions/Q-1048 item 1.)
     /// The attestation-key file could not be opened or read.
     AttestationKeyUnreadable,
     /// The attestation-key file is not a regular file owned by root with
@@ -191,9 +192,6 @@ impl fmt::Display for StartupError {
                 "policy.next directory must be dird's, with no group write and no access for others, on a path of root's or dird's directories",
             ),
             StartupError::DnsRname => f.write_str("dns_soa_rname is not a DNS name"),
-            StartupError::AttestationKeyNotConfigured => {
-                f.write_str("attestation_key_path is not configured")
-            }
             StartupError::AttestationKeyUnreadable => {
                 f.write_str("attestation key file unreadable")
             }
@@ -394,21 +392,22 @@ pub fn read_attestation_key(path: &Path, owner: u32) -> Result<SharedAttestation
     SharedAttestationKey::from_bytes(&octets).map_err(|_| StartupError::AttestationKeyRefused)
 }
 
-/// The configured `attestation_key_path`, or — not configured — the
-/// start-up refusal (task PN10: dird does not start without its attestation
-/// key; the configuration accepts the file without it only until the
-/// provisioning tool writes it, task PN12).
+/// The configured `attestation_key_path` (task PN10). Since task PN12 the
+/// configuration schema requires the key (A-187 on docs/questions/Q-1048
+/// item 1): a dird file without it is refused when it is parsed, so dird
+/// still does not start without its attestation key (fail closed) and this
+/// accessor has no refusal of its own. It keeps its `Result` so the start's
+/// one call site composes with [`read_attestation_key`] unchanged (that call
+/// site, `main.rs`, is outside task PN12's files — docs/questions/Q-1055
+/// item 9).
 ///
 /// # Errors
-/// [`StartupError::AttestationKeyNotConfigured`].
+/// None since task PN12 (always `Ok`).
 ///
-/// Spec: docs/59 §7.4; docs/questions/Q-1046 item 5; AGENTS.md §6 (fail
-/// closed).
+/// Spec: docs/59 §7.4; docs/questions/Q-1046 item 5, Q-1048 item 1;
+/// AGENTS.md §6 (fail closed).
 pub fn attestation_key_path(settings: &DirdSettings) -> Result<&Path, StartupError> {
-    settings
-        .attestation_key_path()
-        .map(config::AbsolutePath::as_path)
-        .ok_or(StartupError::AttestationKeyNotConfigured)
+    Ok(settings.attestation_key_path().as_path())
 }
 
 /// Read the development policy file through the shared loader

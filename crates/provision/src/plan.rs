@@ -11,10 +11,32 @@
 //! octets, never the NULL GUID, all distinct — [MS-ADTS] 3.1.1.5.2.4), the
 //! NodeId (16 octets, never all zero — docs/29 §2 as cited in docs/51 §4.3
 //! step 2; directory-admin refuses a zero node id), the integrity key (32
-//! octets, `dirstore::INTEGRITY_KEY_LEN`). A source failure, a NULL or
-//! repeated GUID or a zero node id stops the run before anything is written
-//! (fail closed; no retry — a CSPRNG that repeats is broken). The readiness
-//! threshold of D74 is a documented residual until P-18 (A-77).
+//! octets, `dirstore::INTEGRITY_KEY_LEN`), and — task PN12 — the
+//! name-resolution attestation key (32 octets, never all zero; docs/59 §7.4).
+//! A source failure, a NULL or repeated GUID, a zero node id or an all-zero
+//! attestation key stops the run before anything is written (fail closed; no
+//! retry — a CSPRNG that repeats is broken). The readiness threshold of D74
+//! is a documented residual until P-18 (A-77).
+//!
+//! # The attestation key (task PN12)
+//!
+//! One draw, two files, written by the installer from this one buffer: dird's
+//! key file (root:0400 — the rule dird's one key-file reader applies,
+//! crates/directory-daemon `startup::read_attestation_key`) and keyadm's input
+//! copy (keyadm's uid, 0400 — the rule of keyadm's reader, crates/keyadm
+//! `attestation_key`), which `keyadm ceremony` installs in keyd before the
+//! seal (Role::Admin, ceremony only, its intent acknowledged — task PN9). So
+//! dird tags with exactly the key keyd verifies with, and no channel ever
+//! carries the key from one daemon to the other: keyd never exports it (D28 /
+//! D29) and dird never hands it out. The key is held in
+//! `ipc_keyd::AttestationKeyOctets` — the carrier keyadm sends keyd, which
+//! cannot hold the all-zero key (the one statement of that rule on this side
+//! of the D182 line: this crate links no crypto, so not crate
+//! name-attestation) — wiped on drop, never printed (its `Debug` is
+//! redacted), never in the manifest or a configuration file (dird's file
+//! names only the path — A-60). Spec: docs/59 §7.4, §10 (PN12);
+//! docs/questions/Q-1011 item 2 (A-173), Q-1039 item 1 (A-183), Q-1048
+//! (A-187), Q-1055.
 //!
 //! # The objects (step 5) — creation order
 //!
@@ -46,7 +68,8 @@
 //! 3.1.1.9.2; [MS-ADTS] v20261026 3.1.1.5.2.4, 6.1.3; [MS-DTYP] v20241119
 //! 2.4.2.4; docs/46 §4.4, §5.4, §8.1; docs/47 §1.4, §4.1, §6.3; RFC 3244
 //! §2 and docs/53 R53-6, §5.2, §10 (K9) for row 8; A-72, A-75, A-76, A-79,
-//! A-83, A-84, A-89, A-117, P-22; docs/questions/Q-964 item 13, Q-972.
+//! A-83, A-84, A-89, A-117, P-22; docs/questions/Q-964 item 13, Q-972;
+//! docs/59 §7.4, §10 (PN12) for the attestation key.
 
 use core::fmt;
 use std::collections::BTreeSet;
@@ -66,6 +89,7 @@ use directory_pip::{
 };
 use dirstore::{AttrId, ClassId, NodeId, INTEGRITY_KEY_LEN};
 use dtyp::{Guid, SecurityDescriptor, Sid, GUID_PACKET_LEN, SECURITY_NT_AUTHORITY};
+use ipc_keyd::{AttestationKeyOctets, ATTESTATION_KEY_OCTETS};
 use keyd_types::CHANGE_PASSWORD_SERVICE_NAME;
 use krb_proto::{KerberosTime, Realm};
 use pdp::Dn;
@@ -117,6 +141,22 @@ impl IntegrityKeyMaterial {
 impl fmt::Debug for IntegrityKeyMaterial {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("IntegrityKeyMaterial(<redacted>)")
+    }
+}
+
+/// The owner of keyadm's input copy of the attestation key: keyadm's uid
+/// (its reader requires the running account's file — crates/keyadm
+/// `attestation_key`; docs/51 §4.4's password-file rule as PN9 adopted it)
+/// and root's group — the input names no gid for keyadm, a tool started
+/// directly as its account (docs/questions/Q-347 item 2), and the file's mode
+/// (0400) gives its group nothing; root's group is the group every file the
+/// installer creates as root already has.
+/// Spec: docs/questions/Q-1039 item 1 (A-183), Q-1055.
+#[must_use]
+pub const fn keyadm_key_owner(keyadm_uid: u32) -> Owner {
+    Owner {
+        uid: keyadm_uid,
+        gid: Owner::ROOT.gid,
     }
 }
 
@@ -288,6 +328,8 @@ pub struct Plan {
     /// This DC's node id (dird's `node_id`, every write's `origin_node`).
     pub node_id: NodeId,
     key: IntegrityKeyMaterial,
+    /// The name-resolution attestation key (task PN12; module documentation).
+    attestation_key: AttestationKeyOctets,
     /// The objects, in creation order.
     pub objects: Vec<PlannedObject>,
     /// The policy.
@@ -302,6 +344,9 @@ pub struct Plan {
     pub paths: Paths,
     /// The owner of the database file (dird's account).
     pub store_owner: Owner,
+    /// The owner of keyadm's input copy of the attestation key (task PN12;
+    /// [`keyadm_key_owner`]).
+    pub keyadm_key_owner: Owner,
     /// The provisioning session's host-record networks: dird's
     /// `dns_registrable_networks` as its own schema parsed them back (task
     /// DN10b; docs/questions/Q-1014).
@@ -339,6 +384,7 @@ struct Draws {
     guids: Vec<Guid>,
     node_id: NodeId,
     key: IntegrityKeyMaterial,
+    attestation_key: AttestationKeyOctets,
 }
 
 /// Fill `out` from the CSPRNG. Spec: A-15 ("read_exact, fail closed").
@@ -376,11 +422,21 @@ fn draw<R: RandomSource>(rng: &mut R, objects: usize) -> Result<Draws, PlanError
     }
     let mut key = Zeroizing::new([0u8; INTEGRITY_KEY_LEN]);
     fill(rng, key.as_mut_slice())?;
+    // Task PN12 (docs/59 §7.4; A-173 on docs/questions/Q-1011 item 2:
+    // "drawn by `provision`"): the attestation key, last, into a zeroizing
+    // buffer (wiped when this returns) and from there into its carrier,
+    // which refuses the all-zero key — a source that gives it is broken
+    // (fail closed, like a zero node id).
+    let mut attestation = Zeroizing::new([0u8; ATTESTATION_KEY_OCTETS]);
+    fill(rng, attestation.as_mut_slice())?;
+    let attestation_key = AttestationKeyOctets::from_slice(attestation.as_slice())
+        .ok_or(PlanError::RandomUnusable)?;
     Ok(Draws {
         sub,
         guids,
         node_id: NodeId(node),
         key: IntegrityKeyMaterial(key),
+        attestation_key,
     })
 }
 
@@ -867,6 +923,7 @@ impl Plan {
             domain_sid,
             node_id: draws.node_id,
             key: draws.key,
+            attestation_key: draws.attestation_key,
             objects,
             policy,
             policy_file,
@@ -874,6 +931,7 @@ impl Plan {
             manifest,
             paths: input.paths.clone(),
             store_owner: Owner::from(input.accounts.dird),
+            keyadm_key_owner: keyadm_key_owner(input.accounts.keyadm_uid),
             dns_registration,
         })
     }
@@ -881,6 +939,12 @@ impl Plan {
     /// The integrity key (installer only). Spec: docs/51 §4.3 step 4.
     pub(crate) fn integrity_key(&self) -> &IntegrityKeyMaterial {
         &self.key
+    }
+
+    /// The attestation key (installer only: dird's file and keyadm's copy
+    /// are written from it). Spec: docs/59 §7.4, §10 (PN12).
+    pub(crate) fn attestation_key(&self) -> &AttestationKeyOctets {
+        &self.attestation_key
     }
 
     /// The planned object of `role`, if any.

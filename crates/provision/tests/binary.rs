@@ -61,6 +61,8 @@ fn args(input: &provision::DomainInput) -> Vec<String> {
         ("--staging-dir", &p.staging),
         ("--database-path", &p.database),
         ("--integrity-key-path", &p.integrity_key),
+        ("--attestation-key-path", &p.attestation_key),
+        ("--keyadm-attestation-key-path", &p.keyadm_attestation_key),
         ("--policy-path", &p.policy),
         ("--manifest-path", &p.manifest),
         ("--audit-log-path", &p.audit_log),

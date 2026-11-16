@@ -1,7 +1,7 @@
 //! The command line:
 //!
 //! ```text
-//! keyadm <configuration file> ceremony <manifest file> [<attestation key file>]
+//! keyadm <configuration file> ceremony <manifest file> <attestation key file>
 //! keyadm <configuration file> rotate-krbtgt <decision id>
 //! keyadm <configuration file> rotate-key <decision id>
 //! keyadm <configuration file> retire-kvno <decision id>
@@ -25,22 +25,24 @@
 //! A decision id is written in decimal: digits only, no sign, no leading
 //! zero (one spelling per value), at most a `u64`.
 //!
-//! **Task PN9:** `ceremony` takes an optional third operand, the path of the
+//! **Tasks PN9, PN12:** `ceremony` takes a second operand, the path of the
 //! attestation key file (crate attestation_key) — a path, never the key
-//! (D95). Given, the ceremony installs the key in keyd before the seal
-//! (docs/59 §7.4, §7.5); absent, it installs none and keyd verifies no name
-//! resolution (fail closed) — until provision writes the file (task PN12,
-//! docs/questions/Q-1039, which also asks whether the operand becomes
-//! required then).
+//! (D95). The ceremony installs the key in keyd before the seal (docs/59
+//! §7.4, §7.5). The operand is **required** since `provision domain` writes
+//! that file (task PN12; A-183 on docs/questions/Q-1039 item 2): a ceremony
+//! command without it is a usage error, so the tool cannot seal keyd without
+//! the key dird signs with — a keyd without it would verify no name
+//! resolution (fail closed), and the operator would learn it only at the
+//! first login.
 //!
 //! Spec: docs/51 §3 (D95), §6, §12 (A5, A10); docs/50 §7.1; docs/52 §4.2;
-//! docs/59 §7.4, §7.5.
+//! docs/59 §7.4, §7.5; docs/questions/Q-1039 item 2 (A-183), Q-1055.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
 
 /// The usage lines.
-pub const USAGE: &str = "usage: keyadm <configuration file> ceremony <manifest file> [<attestation key file>]\n       keyadm <configuration file> rotate-krbtgt|rotate-key|retire-kvno <decision id>\n       keyadm <configuration file> destroy-sweep";
+pub const USAGE: &str = "usage: keyadm <configuration file> ceremony <manifest file> <attestation key file>\n       keyadm <configuration file> rotate-krbtgt|rotate-key|retire-kvno <decision id>\n       keyadm <configuration file> destroy-sweep";
 
 /// The command name of the ceremony. Spec: docs/51 §6.
 pub const CEREMONY: &str = "ceremony";
@@ -87,9 +89,10 @@ pub enum Command {
         config: PathBuf,
         /// The provisioning manifest.
         manifest: PathBuf,
-        /// The attestation key file, when the ceremony installs the key in
-        /// keyd (task PN9). Spec: docs/59 §7.4, §7.5.
-        attestation_key: Option<PathBuf>,
+        /// The attestation key file the ceremony installs in keyd (task
+        /// PN9; required since task PN12). Spec: docs/59 §7.4, §7.5;
+        /// docs/questions/Q-1039 item 2 (A-183).
+        attestation_key: PathBuf,
     },
     /// `rotate-krbtgt` / `rotate-key` / `retire-kvno <decision id>`: run
     /// dird's decision. Spec: docs/51 §6; docs/52 §4.2.
@@ -139,16 +142,14 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Command, Usage
     // refused rather than dropped.
     let args: Vec<OsString> = args.into_iter().take(5).collect();
     match args.as_slice() {
-        [config, command, manifest] if command == CEREMONY => Ok(Command::Ceremony {
-            config: PathBuf::from(config),
-            manifest: PathBuf::from(manifest),
-            attestation_key: None,
-        }),
+        // Task PN12 (A-183 on docs/questions/Q-1039 item 2): the attestation
+        // key file is required — `ceremony <manifest>` alone falls to the
+        // three-argument arm below, which knows no `ceremony`, and is refused.
         [config, command, manifest, attestation_key] if command == CEREMONY => {
             Ok(Command::Ceremony {
                 config: PathBuf::from(config),
                 manifest: PathBuf::from(manifest),
-                attestation_key: Some(PathBuf::from(attestation_key)),
+                attestation_key: PathBuf::from(attestation_key),
             })
         }
         [config, command, id] => {

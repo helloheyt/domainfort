@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 //! The keyadm binary: `keyadm <configuration file> ceremony <manifest file>
-//! [<attestation key file>]`,
+//! <attestation key file>`,
 //! `… rotate-krbtgt | rotate-key | retire-kvno <decision id>`, `…
 //! destroy-sweep` (crates/keyadm cli.rs). keyadm talks to keyd only (A-102,
 //! docs/52 §4.6).
@@ -47,16 +47,14 @@ fn install_panic_hook() {
     }));
 }
 
-/// `ceremony`: refuse root, read the configuration, the manifest and — when
-/// named — the attestation key file (task PN9), connect to keyd (peer uid
-/// checked before anything is sent), run, report. A file that cannot be read
-/// is refused before keyd is contacted (nothing attempted).
-/// Spec: docs/51 §4.3 step 11; docs/50 R50-3; docs/59 §7.4, §7.5.
-fn ceremony(
-    config_path: &Path,
-    manifest_path: &Path,
-    attestation_key_path: Option<&Path>,
-) -> ExitCode {
+/// `ceremony`: refuse root, read the configuration, the manifest and the
+/// attestation key file (task PN9; required since task PN12 — A-183),
+/// connect to keyd (peer uid checked before anything is sent), run, report.
+/// A file that cannot be read is refused before keyd is contacted (nothing
+/// attempted).
+/// Spec: docs/51 §4.3 step 11; docs/50 R50-3; docs/59 §7.4, §7.5;
+/// docs/questions/Q-1039 item 2 (A-183).
+fn ceremony(config_path: &Path, manifest_path: &Path, attestation_key_path: &Path) -> ExitCode {
     if let Err(error) = identity::check_current_process() {
         return fail("identity", &error);
     }
@@ -70,12 +68,9 @@ fn ceremony(
     };
     // Task PN9: the key's octets, read now (wiped when the ceremony is done
     // with them); the error is a fixed text — never an octet of the file.
-    let attestation_key = match attestation_key_path {
-        Some(path) => match attestation_key::read_attestation_key(path) {
-            Ok(key) => Some(key),
-            Err(error) => return fail("attestation key", &error),
-        },
-        None => None,
+    let attestation_key = match attestation_key::read_attestation_key(attestation_key_path) {
+        Ok(key) => key,
+        Err(error) => return fail("attestation key", &error),
     };
     let connector = UnixConnector::new(settings.keyd().socket().as_path().to_path_buf());
     let mut client = match admin_peer(settings.keyd().uid()) {
@@ -84,10 +79,9 @@ fn ceremony(
     };
     // Every manifest names each first administrator's salt (A-105,
     // docs/questions/Q-473): nothing to refuse before contacting keyd.
-    let outcome = match attestation_key {
-        Some(key) => ceremony::run_with_attestation_key(&mut client, &manifest, key),
-        None => ceremony::run(&mut client, &manifest),
-    };
+    // Task PN12: the binary always installs the key (the operand is
+    // required); the keyless library entry (`ceremony::run`) is not used.
+    let outcome = ceremony::run_with_attestation_key(&mut client, &manifest, attestation_key);
     print(report::render(&outcome, &manifest));
     ExitCode::from(report::exit_code(&outcome))
 }
@@ -158,7 +152,7 @@ fn main() -> ExitCode {
             config,
             manifest,
             attestation_key,
-        }) => ceremony(&config, &manifest, attestation_key.as_deref()),
+        }) => ceremony(&config, &manifest, &attestation_key),
         Ok(Command::Execute {
             config,
             command,

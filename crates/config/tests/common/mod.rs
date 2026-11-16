@@ -84,7 +84,9 @@ frame_timeout = 5s
 view_lifetime = 3s
 ";
 
-/// dird, required keys only. Spec: docs/50 §7.1.
+/// dird, required keys only — `attestation_key_path` among them since task
+/// PN12 (docs/59 §7.4; docs/questions/Q-1048 item 1, A-187). Spec: docs/50
+/// §7.1.
 pub const DIRD_MINIMAL: &str = "\
 run_as_uid = 802
 run_as_gid = 802
@@ -94,6 +96,7 @@ dns_host_name = dc1.example.test
 database_path = /var/lib/dird/directory.redb
 integrity_key_source = insecure-development-file
 integrity_key_path = /etc/dird/integrity.key
+attestation_key_path = /etc/dird/attestation.key
 policy_store_path = /etc/domain/policy.store
 policy_store_format = unsigned-development
 dird_kdc_socket = /run/dird/kdc/dird-kdc.sock

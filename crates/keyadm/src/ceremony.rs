@@ -24,16 +24,18 @@
 //!    docs/53 R53-6, §5.2: its key drawn by a fourth `create_key`). The
 //!    purpose comes from the manifest's key table. keyd draws the keys and
 //!    chooses the kvno (A-35); keyadm only asks.
-//! 3. **`install_attestation_key`, when an attestation key file was named**
-//!    (task PN9; docs/59 §7.4, §7.5; docs/questions/Q-1011 item 2, Q-1033) —
-//!    the key with which keyd verifies dird's name resolutions, read from
-//!    its protected file (crate attestation_key) before keyd was contacted.
-//!    keyd installs it once per start, for Role::Admin, in the ceremony only
-//!    (its capability table and ceremony state), with its intent
-//!    acknowledged by auditd first (a key-state change, A-86); keyd never
-//!    returns it, and keyadm never prints it. Without a file the ceremony
-//!    installs none: keyd then verifies no name resolution (fail closed)
-//!    until provision writes the file (task PN12). After the key sets and
+//! 3. **`install_attestation_key`** (task PN9; docs/59 §7.4, §7.5;
+//!    docs/questions/Q-1011 item 2, Q-1033) — the key with which keyd
+//!    verifies dird's name resolutions, read from its protected file (crate
+//!    attestation_key — the copy `provision domain` writes, task PN12) before
+//!    keyd was contacted. keyd installs it once per start, for Role::Admin,
+//!    in the ceremony only (its capability table and ceremony state), with
+//!    its intent acknowledged by auditd first (a key-state change, A-86);
+//!    keyd never returns it, and keyadm never prints it. The binary always
+//!    runs this step (the file is a required operand since task PN12 —
+//!    A-183, [`run_with_attestation_key`]); the keyless [`run`] remains a
+//!    library entry for tests of the other steps: it installs none, and keyd
+//!    then verifies no name resolution (fail closed). After the key sets and
 //!    before the grants, so that the grants' 15 minutes start as late as
 //!    possible.
 //! 4. **`grant_set_secret` for each first administrator, in the manifest's
@@ -310,9 +312,10 @@ pub struct GrantReport {
 /// Spec: docs/59 §7.4, §7.5; docs/questions/Q-1033.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttestationKeyStep {
-    /// No attestation key file was named: the ceremony installs no key
-    /// (keyd verifies no name resolution — fail closed — until provision
-    /// writes the file, task PN12).
+    /// The keyless library entry ([`run`]) was used: the ceremony installs
+    /// no key (keyd verifies no name resolution — fail closed). The binary
+    /// never reports it: its attestation key file is a required operand
+    /// since task PN12 (A-183).
     NotRequested,
     /// A key was given, but the ceremony stopped before this step.
     NotAttempted,

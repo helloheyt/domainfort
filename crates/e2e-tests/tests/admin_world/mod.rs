@@ -9,8 +9,12 @@
 //!    with the installer's recording `Ownership` and `Progress` of A4's
 //!    tests (crates/provision/tests/common, reused through `#[path]`),
 //!    never root, into the run's 0700 temporary directory. Its database,
-//!    integrity key, policy, manifest and seven configuration files are the
-//!    daemons' inputs ([`World::provisioned`]).
+//!    integrity key, policy, manifest and configuration files are the
+//!    daemons' inputs ([`World::provisioned`]) — and (task PN12) its
+//!    attestation key's two files: dird's key file, which dird reads with
+//!    its own reader ([`World::start_dird`]), and keyadm's copy, which the
+//!    ceremony installs in keyd ([`World::ceremony`]) — one draw, so dird
+//!    tags with the key keyd holds.
 //! 2. **The test-only workstation fixture** ([`Workstation`]; P-23 is open,
 //!    docs/questions/Q-431): before dird starts, directly on the produced
 //!    store, through the write PEP itself (crate directory-admin `prepare` /
@@ -762,15 +766,16 @@ fn workstation_fixture(plan: &Plan, input: &DomainInput, uid: u32) -> Workstatio
     let snapshot = policy.snapshot().unwrap();
     let nc = NamingContext::new(&input.naming_context).unwrap();
     // Task PN10: with dird's signer (crates/provision tests/common
-    // `dird_signer`) — the write PEP reads accounts through the view's
-    // account source, whose records carry dird's attested resolution.
+    // `dird_signer` — under the produced attestation key since task PN12) —
+    // the write PEP reads accounts through the view's account source, whose
+    // records carry dird's attested resolution.
     let ctx = DirectoryContext::new(
         ad_schema::phase1().unwrap(),
         &KeydConfig::new(realm()),
         nc.clone(),
     )
     .unwrap()
-    .with_name_resolution_signer(provision_common::dird_signer());
+    .with_name_resolution_signer(provision_common::dird_signer(paths, uid));
     let protected = directory_daemon::admin_service::protected_objects(&plan.manifest, &policy);
     let config = AdminConfig::new(
         Duration::from_secs(u64::from(provision::configs::ADMIN_TICKET_AGE_MAX_SECS)),
@@ -1175,9 +1180,13 @@ impl World {
     /// `keyadm ceremony` (library, over keyd's socket, Role::Admin):
     /// `create_key` for krbtgt and the three service objects of the manifest
     /// (docs/51 §4.3 step 11; the change-password service's since task K9 —
-    /// docs/53 §5.2), then the first administrators' initial-secret
-    /// grants (task A15a; their salts from the manifest — A-102, N4), then
-    /// the seal (A-102, docs/52 R3). keyadm's file names keyd's socket.
+    /// docs/53 §5.2), then (task PN12) the attestation key — keyadm's copy
+    /// that `provision domain` wrote, read through keyadm's own reader (the
+    /// test uid stands in for keyadm's account: the installer's owner change
+    /// is recorded, not made) and installed in keyd (task PN9) — then the
+    /// first administrators' initial-secret grants (task A15a; their salts
+    /// from the manifest — A-102, N4), then the seal (A-102, docs/52 R3).
+    /// keyadm's file names keyd's socket.
     pub fn ceremony(&mut self) -> keyadm::ceremony::CeremonyReport {
         self.keyd_phase(KeydPhase::Provisioning);
         let settings = KeyadmSettings::parse(&self.read(&self.input.paths.keyadm_config)).unwrap();
@@ -1187,10 +1196,33 @@ impl World {
         );
         let mut client =
             key_state_client(settings.keyd().socket().as_path(), self.uid, Role::Admin);
-        let report = keyadm::ceremony::run(&mut client, &self.manifest);
+        let key = provision_common::keyadm_attestation_key(&self.input.paths, self.uid);
+        let report = keyadm::ceremony::run_with_attestation_key(&mut client, &self.manifest, key);
         self.captured
             .extend(keyadm::report::render(&report, &self.manifest));
         report
+    }
+
+    /// Task PN12 (docs/59 §7.1, §7.5): the attested name resolution of
+    /// `sam`'s client record as the **running** dird answers it on
+    /// `dird-kdc.sock` — the record the KDC hands keyd once PN11 lands —
+    /// read through the channel's own client (`ipc_directory`, the server
+    /// uid checked; the test uid is dird's and its kdc peer here), in one
+    /// pinned view.
+    pub fn dird_client_resolution(&self, sam: &str) -> keyd_types::AttestedNameResolution {
+        let mut client = ipc_directory::DirectoryClient::connect(
+            connector::dird(self.input.paths.dird_kdc_socket.as_path()),
+            self.uid,
+            ipc_directory::DEFAULT_DEADLINE,
+            self.plan.policy.version,
+        )
+        .expect("dird describes its domain");
+        let view = client.begin_view().expect("dird pins a view");
+        let account = kdc::AccountSource::client(&view, &realm(), &principal(sam))
+            .expect("dird answers the client query")
+            .expect("the account exists");
+        view.end().expect("the view ends");
+        account.resolution
     }
 
     /// The first administrators' password files (docs/51 §4.4 source (b):
@@ -1304,15 +1336,20 @@ impl World {
     pub fn start_dird(&mut self) {
         let paths = &self.input.paths;
         let settings = DirdSettings::parse(&self.read(&paths.dird_config)).unwrap();
-        // Task PN10: dird's attestation key. The produced file names none
-        // until the provisioning tool writes it (task PN12); the fixtures'
-        // test key stands in (docs/questions/Q-1046 item 6).
+        // Task PN12 (docs/59 §7.4): dird's attestation key — the produced
+        // file its produced configuration names, read with dird's own
+        // reader (root:0400, 32 octets; the test uid stands in for root).
+        assert_eq!(
+            settings.attestation_key_path().as_path(),
+            paths.attestation_key.as_path()
+        );
+        let attestation_key = directory_daemon::startup::read_attestation_key(
+            settings.attestation_key_path().as_path(),
+            self.uid,
+        )
+        .unwrap();
         let mut params = directory_daemon::test_seams::DaemonParams::from(
-            directory_daemon::startup::params(
-                &settings,
-                crate::support::kdcd::dird::attestation_key(),
-            )
-            .unwrap(),
+            directory_daemon::startup::params(&settings, attestation_key).unwrap(),
         );
         params.kdc_uid = self.uid;
         params.ldap_front_uid = self.uid;
@@ -1979,6 +2016,10 @@ fn domain_input(dir: &ScratchDir, uid: u32) -> DomainInput {
             staging: path("etc/staging"),
             database: path("var/directory.redb"),
             integrity_key: path("etc/integrity.key"),
+            // Task PN12 (docs/59 §7.4): dird's attestation key and keyadm's
+            // copy.
+            attestation_key: path("etc/attestation.key"),
+            keyadm_attestation_key: path("etc/keyadm-attestation.key"),
             policy: path("etc/policy.store"),
             manifest: path("etc/provision.manifest"),
             audit_log: path("var/audit.log"),

@@ -9,7 +9,10 @@
 //! (`S-1-5-21-r1-r2-r3`), 2.4.4.1-2.4.4.3, 2.4.5, 2.4.6; [MS-ADTS]
 //! v20261026 3.1.1.5.2.4, 5.1.3.2, 6.1.3, 6.1.3.1; A-75, A-76, A-79, A-84
 //! (Q-335/Q-336: no INHERIT_ONLY, no CREATOR_*, no generic bit on the
-//! root), A-86, P-22. Fixtures: tests/common (obviously fake values).
+//! root), A-86, P-22; docs/59 §7.4, §10 (PN12) and docs/questions/Q-1011
+//! item 2 (A-173), Q-1048 item 1 (A-187) for the attestation key's draw and
+//! dird's `attestation_key_path`. Fixtures: tests/common (obviously fake
+//! values).
 
 mod common;
 
@@ -821,13 +824,98 @@ fn the_manifest_carries_the_directorys_salts() {
         .any(|l| l.starts_with("first_admin_salts = ")));
 }
 
-/// AGENTS.md §6: the plan's debug output never shows the integrity key.
+/// AGENTS.md §6: the plan's debug output never shows the integrity key —
+/// nor (task PN12) the attestation key: both appear only as their redacted
+/// placeholders.
 #[test]
 fn the_integrity_key_is_redacted_in_debug_output() {
     let dir = TempDir::new();
     let p = plan(&input(&dir, 61002, 61007));
     let debug = format!("{p:?}");
-    assert!(debug.contains("<redacted>"));
+    assert!(debug.contains("IntegrityKeyMaterial(<redacted>)"));
+    assert!(debug.contains("AttestationKeyOctets(<redacted>)"));
+}
+
+/// docs/59 §7.4; A-187 on docs/questions/Q-1048 item 1 (task PN12): dird's
+/// generated file names the attestation-key file — the input's
+/// `--attestation-key-path`, beside (and distinct from) the integrity key's —
+/// and parses back with dird's own schema, which requires the key; no
+/// configuration file carries anything of the key itself (A-60: paths only).
+#[test]
+fn dirds_file_names_the_attestation_key_file() {
+    let dir = TempDir::new();
+    let input = input(&dir, 61002, 61007);
+    let p = plan(&input);
+    let dird = p
+        .configs
+        .iter()
+        .find(|f| f.daemon == provision::Daemon::Dird)
+        .unwrap()
+        .text();
+    let line = format!(
+        "attestation_key_path = {}",
+        input.paths.attestation_key.as_str()
+    );
+    assert!(dird.lines().any(|l| l == line), "{dird}");
+    let settings = config::DirdSettings::parse(dird.as_bytes()).unwrap();
+    assert_eq!(
+        settings.attestation_key_path().as_str(),
+        input.paths.attestation_key.as_str()
+    );
+    assert_ne!(
+        settings.attestation_key_path().as_str(),
+        settings.integrity_key_path().as_str()
+    );
+    // keyadm's copy is named nowhere but on keyadm's command line (an
+    // operand, task PN9): keyadm's file names keyd only.
+    for file in &p.configs {
+        assert!(
+            !file
+                .text()
+                .contains(input.paths.keyadm_attestation_key.as_str()),
+            "{:?}",
+            file.daemon
+        );
+    }
+}
+
+/// The attestation key's carrier refuses all zeros (ipc-keyd
+/// `AttestationKeyOctets`), so a source whose 16th fill — the attestation
+/// key's, the last draw — is all zero is broken: the plan stops
+/// (`RandomUnusable`, like a zero node id), before anything is written.
+/// Source: docs/59 §7.4 (task PN12); A-173 (the key is drawn at random);
+/// AGENTS.md §6 (fail closed).
+#[test]
+fn an_all_zero_attestation_key_draw_stops_the_plan() {
+    struct ZeroAt {
+        zero_at: u64,
+        inner: CountingRandom,
+    }
+    impl directory_admin::RandomSource for ZeroAt {
+        fn fill(&mut self, out: &mut [u8]) -> Result<(), directory_admin::RandomError> {
+            self.inner.fill(out)?;
+            if self.inner.fills == self.zero_at {
+                out.fill(0);
+            }
+            Ok(())
+        }
+    }
+    let dir = TempDir::new();
+    let i = input(&dir, 61002, 61007);
+    let mut rng = ZeroAt {
+        zero_at: 16,
+        inner: CountingRandom::default(),
+    };
+    assert_eq!(
+        Plan::build(&i, now(), &mut rng).unwrap_err(),
+        PlanError::RandomUnusable
+    );
+    assert_eq!(rng.inner.fills, 16);
+    // The same source without the zero fill builds a plan: the 16th fill is
+    // the attestation key's, and the last.
+    let mut counting = CountingRandom::default();
+    Plan::build(&i, now(), &mut counting).unwrap();
+    assert_eq!(counting.fills, 16);
 }
 
 fn refused(input: &provision::DomainInput) -> PlanError {
@@ -1536,6 +1624,26 @@ fn shared_paths_and_socket_directories_are_refused() {
     let mut i = input(&dir, 61002, 61007);
     i.paths.dnsd_config = i.paths.kpasswd_front_config.clone();
     assert_eq!(input_kind(refused(&i)), InputErrorKind::DuplicatePath);
+    // Task PN12 (docs/59 §7.4; A-129: "never the dirstore integrity key"):
+    // the attestation key's two files are distinct targets — from each
+    // other, from the integrity key's file, and outside the staging
+    // directory.
+    for change in [
+        |i: &mut provision::DomainInput| i.paths.attestation_key = i.paths.integrity_key.clone(),
+        |i: &mut provision::DomainInput| {
+            i.paths.keyadm_attestation_key = i.paths.attestation_key.clone();
+        },
+        |i: &mut provision::DomainInput| {
+            i.paths.keyadm_attestation_key = i.paths.integrity_key.clone();
+        },
+    ] {
+        let mut i = input(&dir, 61002, 61007);
+        change(&mut i);
+        assert_eq!(input_kind(refused(&i)), InputErrorKind::DuplicatePath);
+    }
+    let mut i = input(&dir, 61002, 61007);
+    i.paths.keyadm_attestation_key = path(&dir, "etc/provision-staging/keyadm.key");
+    assert_eq!(input_kind(refused(&i)), InputErrorKind::DuplicatePath);
 }
 
 /// A-15 / A-77: a CSPRNG failure at any draw stops the plan; a broken
@@ -1544,8 +1652,9 @@ fn shared_paths_and_socket_directories_are_refused() {
 fn a_csprng_failure_stops_the_plan() {
     let dir = TempDir::new();
     let i = input(&dir, 61002, 61007);
-    // 1 SID draw + 11 GUIDs + node id + key = 14 fills.
-    for fail_at in 1..=14 {
+    // 1 SID draw + 12 GUIDs + node id + integrity key + attestation key
+    // (task PN12) = 16 fills.
+    for fail_at in 1..=16 {
         let mut rng = FailingRandom {
             fail_at,
             inner: CountingRandom::default(),

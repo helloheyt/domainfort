@@ -160,6 +160,10 @@ fn domain_input(dir: &ScratchDir, uid: u32) -> DomainInput {
             staging: path("etc/staging"),
             database: path("var/directory.redb"),
             integrity_key: path("etc/integrity.key"),
+            // Task PN12 (docs/59 §7.4): dird's attestation key and keyadm's
+            // copy.
+            attestation_key: path("etc/attestation.key"),
+            keyadm_attestation_key: path("etc/keyadm-attestation.key"),
             policy: path("etc/policy.store"),
             manifest: path("etc/provision.manifest"),
             audit_log: path("var/audit.log"),
@@ -471,12 +475,20 @@ impl World {
     fn start_dird(&self, dnsd_uid: u32) -> DirdRun {
         let paths = &self.input.paths;
         let settings = DirdSettings::parse(&self.read(&paths.dird_config)).unwrap();
-        // Task PN10: dird's attestation key. The produced file names none
-        // until the provisioning tool writes it (task PN12); the fixtures'
-        // test key stands in (docs/questions/Q-1046 item 6).
+        // Task PN12 (docs/59 §7.4): dird's attestation key — the produced
+        // file its produced configuration names, read with dird's own
+        // reader (root:0400, 32 octets; the test uid stands in for root).
+        assert_eq!(
+            settings.attestation_key_path().as_path(),
+            paths.attestation_key.as_path()
+        );
+        let attestation_key = directory_daemon::startup::read_attestation_key(
+            settings.attestation_key_path().as_path(),
+            self.uid,
+        )
+        .unwrap();
         let mut params = directory_daemon::test_seams::DaemonParams::from(
-            directory_daemon::startup::params(&settings, support::kdcd::dird::attestation_key())
-                .unwrap(),
+            directory_daemon::startup::params(&settings, attestation_key).unwrap(),
         );
         params.kdc_uid = self.uid;
         params.ldap_front_uid = self.uid;

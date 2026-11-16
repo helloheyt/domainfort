@@ -56,6 +56,7 @@
 //! |---|---|---|---|
 //! | every directory above it, and itself | root | 0755 | every walk (root's and the daemons' accounts') — Q-468 option 2(b), Q-482 item 6 |
 //! | `integrity.key` | root | 0400 | dird's `read_integrity_key`, as root (docs/50 §7.4; Q-270 item 1) |
+//! | `attestation.key` | root | 0400 | dird's `read_attestation_key`, as root (task PN12: the file provisioning writes — docs/59 §7.4; Q-1048 item 2) |
 //! | `policy.store` | root | 0644 | dird's and the kdc's `read_policy`, as root (A-68; docs/50 §7.1) |
 //! | `l.redb` | root | 0600 | the test only (the reference copy, opened by path) |
 //! | `audit/` | auditd:shared | 0750 | auditd's log and socket directory (docs/50 §3.1: "owned by the server's uid, mode 0750, group = the channel's clients") |
@@ -194,6 +195,10 @@ fn deploy_and_check(base: &Path) -> Result<(), String> {
     let handles = Handles::read(&local.store);
     let key_path = base.join("integrity.key");
     write_file(&key_path, &dird::TEST_KEY, 0o400);
+    // Task PN12 (docs/59 §7.4): dird's attestation key, as production has it
+    // — a root-owned 0400 file, read as root before dird starts.
+    let attestation_key_path = base.join("attestation.key");
+    write_file(&attestation_key_path, &dird::TEST_ATTESTATION_KEY, 0o400);
     let policy_path = base.join("policy.store");
     write_policy(&policy_path, POLICY_VERSION);
 
@@ -263,10 +268,10 @@ fn deploy_and_check(base: &Path) -> Result<(), String> {
         dns_host_name: String::from(DNS_HOST_NAME),
         audit_window: ipc_audit::WindowConfig::DEFAULT,
         clock: SharedClock::new(FixedTime),
-        // Task PN10: dird's attestation key — the fixtures' test key (the
-        // produced file names none before task PN12; docs/questions/Q-1046
-        // item 6).
-        attestation_key: support::kdcd::dird::attestation_key(),
+        // Task PN12: dird's attestation key, read as root from its root-owned
+        // 0400 file by dird's own reader (docs/59 §7.4; Q-1048 item 2).
+        attestation_key: directory_daemon::startup::read_attestation_key(&attestation_key_path, 0)
+            .map_err(|e| e.to_string())?,
     };
     let key =
         directory_daemon::startup::read_integrity_key(&key_path, 0).map_err(|e| e.to_string())?;

@@ -791,7 +791,9 @@ fn install_records(world: &World) -> Vec<KeydRecord> {
 /// A made-up attestation key, written to a 0600 file of the test account
 /// inside the workspace (crates/test-scratch — the protected-file walk from
 /// `/` accepts it, Q-480) and read back through keyadm's reader, as the
-/// binary does (until provision writes the file — task PN12).
+/// binary does with the copy `provision domain` writes (task PN12 — the
+/// provisioned file itself is used in crates/provision tests/ceremony.rs and
+/// crates/e2e-tests).
 fn attestation_key(scratch: &test_scratch::ScratchDir) -> ipc_keyd::AttestationKeyOctets {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let path = scratch.join("attestation.key");
@@ -873,11 +875,13 @@ fn the_ceremony_installs_the_attestation_key_once_before_the_seal() {
     world.daemon.stop().unwrap();
 }
 
-/// docs/59 §7.4 (task PN9): a ceremony without an attestation key file
-/// installs none — it completes as before (four key sets, the grants, the
-/// seal), keyd's audit holds no install at all, and the report says keyd
-/// holds no attestation key (so it will verify no name resolution — fail
-/// closed — until one is installed in a ceremony).
+/// docs/59 §7.4 (task PN9): the keyless library entry (`ceremony::run`)
+/// installs no attestation key — it completes as before (four key sets, the
+/// grants, the seal), keyd's audit holds no install at all, and the report
+/// says keyd holds no attestation key (so it will verify no name resolution
+/// — fail closed — until one is installed in a ceremony). The binary never
+/// takes this path: its attestation key file is a required operand since
+/// task PN12 (A-183 on docs/questions/Q-1039 item 2; tests/local.rs).
 #[test]
 fn a_ceremony_without_a_key_file_installs_none() {
     let Some(world) = world(Some(Role::Admin)) else {

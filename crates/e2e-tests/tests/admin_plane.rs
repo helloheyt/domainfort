@@ -241,6 +241,31 @@ fn provisioning_to_a_new_users_login() {
         w.start_front();
         w.start_admind();
 
+        // ---- 3b. Task PN12: dird signs with the key the ceremony gave keyd --
+        // docs/59 §7.2 step 1, §7.4: `provision domain` drew one attestation
+        // key and wrote it to dird's file and to keyadm's copy; the ceremony
+        // installed keyadm's copy in keyd (task PN9); dird read its own file.
+        // A resolution the running dird signs — alice's client record over
+        // dird-kdc.sock — verifies under exactly the octets the ceremony
+        // sent keyd (keyadm's reader), and under no other key. keyd's own
+        // verification of such a record on issuance is PN11's / PN13's; no
+        // octet of the key is shown here.
+        assert!(
+            ceremony.attestation_key_installed(),
+            "the ceremony installed the attestation key in keyd"
+        );
+        let ceremony_key = name_attestation::AttestationKey::from_bytes(
+            provision_common::keyadm_attestation_key(&w.input.paths, w.uid).expose(),
+        )
+        .unwrap();
+        let signed = w.dird_client_resolution(ALICE);
+        assert!(
+            name_attestation::verify(&ceremony_key, &signed).is_ok(),
+            "dird's resolution verifies under the key the ceremony installed in keyd"
+        );
+        let other = name_attestation::AttestationKey::from_bytes(&[0x4B; 32]).unwrap();
+        assert!(name_attestation::verify(&other, &signed).is_err());
+
         // ---- 4. The first administrators log in -------------------------------
         let ws = w.bootstrap_workstation();
         let alice_tgt = w
@@ -1068,6 +1093,30 @@ fn provisioning_to_a_new_users_login() {
                 "a password in {line}"
             );
         }
+        // ---- Task PN12: the attestation key only in its two files ---------------
+        // AGENTS.md §6 (docs/59 §7.4): its octets are in dird's key file and
+        // keyadm's copy and nowhere else the run left — not the audit log,
+        // the manifest, a configuration file, the store — nor in anything a
+        // tool printed (compared, never printed).
+        let key_copy = provision_common::keyadm_attestation_key(&w.input.paths, w.uid);
+        let key_octets = key_copy.expose();
+        let holds_key = |octets: &[u8]| {
+            octets
+                .windows(key_octets.len())
+                .any(|window| window == key_octets)
+        };
+        let key_files = [
+            w.input.paths.attestation_key.as_path(),
+            w.input.paths.keyadm_attestation_key.as_path(),
+        ];
+        for (path, octets) in w.files() {
+            if key_files.contains(&path.as_path()) {
+                assert!(octets.as_slice() == key_octets.as_slice(), "{path:?}");
+            } else {
+                assert!(!holds_key(&octets), "the attestation key in {path:?}");
+            }
+        }
+        assert!(!w.captured.iter().any(|line| holds_key(line.as_bytes())));
         // The key sets the run left (not secret: kvnos only): krbtgt rotated
         // once by dird's decision, dave's destroyed by keyadm's sweep of
         // dird's destroy decision (A-102), the others untouched.

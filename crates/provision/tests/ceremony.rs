@@ -9,14 +9,19 @@
 //!   uid is provisioned as keyadm's, so keyd gives it Role::Admin — A-73);
 //! - the **produced** manifest file, parsed back.
 //!
+//! - (task PN12) keyadm's **produced** attestation-key copy, read through
+//!   keyadm's own reader, which the ceremony installs in keyd before the
+//!   seal.
+//!
 //! The ceremony creates the four key sets of the manifest (docs/51 §4.3
 //! step 11; docs/53 §5.2 for the fourth, task K9): krbtgt, the LDAP service,
 //! the admin service and the change-password service (`kadmin/changepw`,
-//! RFC 3244 §2).
+//! RFC 3244 §2) — and installs the attestation key (task PN9).
 //!
 //! Sources: docs/51 §4.3 steps 7-8, 11; A-73 (keyd's role map); A-86 (the
 //! manifest and the ceremony); docs/10 §7 (`create_key` returns kvno 1 for
-//! a new key set — A-35). Fixtures: tests/common.
+//! a new key set — A-35); docs/59 §7.4, §10 (PN9, PN12), docs/questions/
+//! Q-1039 items 1-2 (A-183). Fixtures: tests/common.
 
 #[path = "../../keyd-daemon/tests/support/mod.rs"]
 mod support;
@@ -179,9 +184,15 @@ fn keyadm_ceremony_completes_with_the_produced_manifest_and_role_map() {
     // salt (a required key — A-105), so the ceremony grants them and ends
     // with the seal (R3).
     assert!(manifest.first_admins().iter().all(|a| !a.salt().is_empty()));
-    let report = ceremony::run(&mut client, &manifest);
+    // Task PN12 (docs/59 §7.4; A-183 on docs/questions/Q-1039 item 2): the
+    // ceremony's second operand is the copy this run produced for keyadm
+    // (the test's uid stands in for keyadm's account — no chown here); the
+    // ceremony installs it in keyd after the key sets, before the grants.
+    let key = common::keyadm_attestation_key(&input.paths, uid);
+    let report = ceremony::run_with_attestation_key(&mut client, &manifest, key);
     assert!(report.is_complete(), "{report:?}");
     assert!(report.is_sealed());
+    assert!(report.attestation_key_installed(), "{report:?}");
     assert_eq!(
         report.created(),
         [

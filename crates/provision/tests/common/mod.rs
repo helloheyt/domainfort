@@ -20,18 +20,33 @@ use provision::{
 use std::sync::Arc;
 
 /// dird's name-resolution signer as dird builds it (task PN10; docs/59
-/// §7.4): the product's `ResolutionSigner` under a test key — the
-/// provisioning tool writes no attestation key before task PN12
-/// (docs/questions/Q-1046 item 6) — issuing at the system clock, for the
+/// §7.4): the product's `ResolutionSigner` under the key of the **produced**
+/// attestation-key file (task PN12), read with dird's own reader
+/// (`startup::read_attestation_key` — root:0400, 32 octets; `owner` stands in
+/// for root, the tests cannot chown), issuing at the system clock — for the
 /// directory contexts the tests build to read the produced store as dird's
 /// account source does.
-pub fn dird_signer() -> Arc<dyn NameResolutionSigner> {
-    let key = directory_daemon::SharedAttestationKey::from_bytes(&[0x4B; 32]).expect("test key");
+pub fn dird_signer(paths: &Paths, owner: u32) -> Arc<dyn NameResolutionSigner> {
+    let key =
+        directory_daemon::startup::read_attestation_key(paths.attestation_key.as_path(), owner)
+            .expect("the produced attestation key file");
     let clock = directory_daemon::SharedClock::system();
     Arc::new(directory_daemon::ResolutionSigner::new(
         key,
         Arc::new(move || clock.now()),
     ))
+}
+
+/// keyadm's input copy of the attestation key as `keyadm ceremony` reads it
+/// (task PN12; crates/keyadm `attestation_key` — the running account's file,
+/// 0400/0600, 32 octets, not all zero): the **produced** file, with `owner`
+/// standing in for keyadm's account (the tests cannot chown).
+pub fn keyadm_attestation_key(paths: &Paths, owner: u32) -> ipc_keyd::AttestationKeyOctets {
+    keyadm::attestation_key::read_attestation_key_owned_by(
+        paths.keyadm_attestation_key.as_path(),
+        owner,
+    )
+    .expect("the produced keyadm attestation key file")
 }
 
 /// A unique scratch directory (mode 0700), removed on drop — inside the
@@ -273,6 +288,10 @@ pub fn input(dir: &TempDir, dird_uid: u32, keyadm_uid: u32) -> DomainInput {
             staging: path(dir, "etc/provision-staging"),
             database: path(dir, "var/directory.redb"),
             integrity_key: path(dir, "etc/integrity.key"),
+            // Task PN12 (docs/59 §7.4): dird's attestation key and keyadm's
+            // copy.
+            attestation_key: path(dir, "etc/attestation.key"),
+            keyadm_attestation_key: path(dir, "etc/keyadm-attestation.key"),
             policy: path(dir, "etc/policy.store"),
             manifest: path(dir, "etc/provision.manifest"),
             audit_log: path(dir, "var/audit.log"),

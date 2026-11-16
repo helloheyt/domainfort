@@ -369,14 +369,17 @@ impl World {
         self.daemon.as_ref().unwrap().socket.clone()
     }
 
-    /// `keyadm ceremony` (its public API) as Role::Admin on the same keyd.
+    /// `keyadm ceremony` (its public API) as Role::Admin on the same keyd —
+    /// with keyadm's attestation-key copy this run produced (task PN12; the
+    /// test's uid stands in for keyadm's account, the tests cannot chown).
     fn ceremony(&self) -> keyadm::ceremony::CeremonyReport {
         let mut client = KeydClient::new(
             connector::new(&self.admin_socket),
             ExpectedPeer::new(self.uid, keyd_types::Role::Admin).unwrap(),
             DEFAULT_DEADLINE,
         );
-        keyadm::ceremony::run(&mut client, &self.manifest)
+        let key = common::keyadm_attestation_key(&self.input.paths, self.uid);
+        keyadm::ceremony::run_with_attestation_key(&mut client, &self.manifest, key)
     }
 
     /// keyd's GrantSetSecret outcome records so far (intents apart).

@@ -183,10 +183,12 @@ fn every_client_result_is_classified() {
 // ---- command line --------------------------------------------------------------
 
 /// docs/51 §6 (`ceremony <manifest>`), the configuration path first as the
-/// daemons take it; exactly three arguments — or four, the fourth the
-/// attestation key file (task PN9; docs/59 §7.4) — no options; the A10
-/// commands take a decimal request id (`destroy-sweep` nothing) — the rest
-/// of their grammar is in tests/key_operations_local.rs.
+/// daemons take it; exactly four arguments for the ceremony, the fourth the
+/// attestation key file (task PN9; docs/59 §7.4) — required since task PN12
+/// (A-183 on docs/questions/Q-1039 item 2: `ceremony <manifest>` alone is a
+/// usage error) — no options; the A10 commands take a decimal request id
+/// (`destroy-sweep` nothing) — the rest of their grammar is in
+/// tests/key_operations_local.rs.
 #[test]
 fn the_command_line_is_exact() {
     let args = |list: &[&str]| list.iter().map(OsString::from).collect::<Vec<_>>();
@@ -196,11 +198,7 @@ fn the_command_line_is_exact() {
             "ceremony",
             "/etc/test/manifest"
         ])),
-        Ok(Command::Ceremony {
-            config: PathBuf::from("/etc/test/keyadm.conf"),
-            manifest: PathBuf::from("/etc/test/manifest"),
-            attestation_key: None,
-        })
+        Err(UsageError)
     );
     assert_eq!(
         cli::parse(args(&[
@@ -212,7 +210,7 @@ fn the_command_line_is_exact() {
         Ok(Command::Ceremony {
             config: PathBuf::from("/etc/test/keyadm.conf"),
             manifest: PathBuf::from("/etc/test/manifest"),
-            attestation_key: Some(PathBuf::from("/etc/test/attestation.key")),
+            attestation_key: PathBuf::from("/etc/test/attestation.key"),
         })
     );
     for bad in [
@@ -224,6 +222,8 @@ fn the_command_line_is_exact() {
         &["/c", "destroy-sweep", "/m", "/k"][..],
         &["/c", "rotate-key", "7", "/k"][..],
         &["/c", "Ceremony", "/m"][..],
+        &["/c", "Ceremony", "/m", "/k"][..],
+        &["/c", "ceremony", "/m"][..],
         &["ceremony", "/m", "/c"][..],
         &["/c", "destroy-sweep", "/m"][..],
         &["/c", "rotate-krbtgt", "/m"][..],

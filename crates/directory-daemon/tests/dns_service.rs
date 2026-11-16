@@ -769,6 +769,7 @@ fn dird_file(kpasswd: bool) -> String {
          database_path = /var/lib/dird/directory.redb\n\
          integrity_key_source = insecure-development-file\n\
          integrity_key_path = /etc/dird/integrity.key\n\
+         attestation_key_path = /etc/dird/attestation.key\n\
          policy_store_path = /etc/domain/policy.store\n\
          policy_store_format = unsigned-development\n\
          dird_kdc_socket = /run/dird/kdc/dird-kdc.sock\nkdc_uid = 803\n\

@@ -1,11 +1,16 @@
 //! Reading the attestation key keyadm's ceremony hands keyd (task PN9).
 //!
 //! The attestation key is the key with which keyd verifies dird's name
-//! resolutions (docs/59 §7.2, §7.4). `provision` draws it and writes dird's
-//! protected key file and keyadm's input file (task PN12); keyadm reads the
-//! input file here and sends the key to keyd in the ceremony, before the
-//! seal ([`crate::ceremony::run_with_attestation_key`]). keyd never returns
-//! it (docs/10 I1; D28 / D29); keyadm never prints it.
+//! resolutions (docs/59 §7.2, §7.4). `provision domain` draws it and writes
+//! dird's protected key file and keyadm's input file from that one draw
+//! (task PN12: `--attestation-key-path`, `--keyadm-attestation-key-path` —
+//! keyadm's uid, mode 0400); keyadm reads the input file here and sends the
+//! key to keyd in the ceremony, before the seal
+//! ([`crate::ceremony::run_with_attestation_key`]). keyd never returns it
+//! (docs/10 I1; D28 / D29); keyadm never prints it, and never deletes the
+//! file — it could not (the file's directory is root's, the provisioning
+//! installer's rule), and in development mode the next ceremony needs it
+//! (docs/51 §4.5; docs/questions/Q-1057).
 //!
 //! # The file rule
 //!
@@ -30,8 +35,8 @@
 //! The owner and mode follow the precedent of `provision`'s password files
 //! (docs/51 §4.4: "a regular file (not a symlink), owned by the running uid,
 //! mode 0400/0600"); the raw 32 octets follow dird's integrity key file
-//! (crates/directory-daemon `read_integrity_key`). Who writes the file, and
-//! where, is task PN12 (docs/questions/Q-1039).
+//! (crates/directory-daemon `read_integrity_key`). `provision domain` writes
+//! it so (task PN12; docs/questions/Q-1039 item 1, A-183).
 //!
 //! Errors are fixed texts: no octet of the file, no length read, no path
 //! (the path is the operator's own argument).

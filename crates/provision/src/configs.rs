@@ -331,7 +331,9 @@ fn list(items: &[String]) -> String {
 ///   dird → Ldap (A-73; docs/51 §4.3 step 7); `key_store =
 ///   insecure-development` (R50-18 — the only store until P-17).
 /// - dird: the development integrity-key file and the unsigned development
-///   policy, both named explicitly (Q-270 items 1-2); the admin channel
+///   policy, both named explicitly (Q-270 items 1-2); (task PN12) the
+///   name-resolution attestation-key file (`attestation_key_path`, docs/59
+///   §7.4; docs/questions/Q-1048 item 1); the admin channel
 ///   (`dird_admin_socket` + `admind_uid`) with A8's keys ([`DIRD_ADMIN_CHANNEL_KEYS`]:
 ///   keyd's socket and uid, the node id, `admin_ticket_age_max` =
 ///   [`ADMIN_TICKET_AGE_MAX_SECS`] s, `admin_quorum` = [`ADMIN_QUORUM`],
@@ -370,7 +372,7 @@ fn list(items: &[String]) -> String {
 /// Spec: docs/51 §4.3 step 7, §4.6, §6; docs/50 §2.4, §3.1, §3.2, §7.1;
 /// docs/53 R53-3, §3.3, §5.6, §5.7; docs/54 §4.3, §4.6, §4.7; A-60; A-68;
 /// A-73; A-97; A-117; A-160; docs/52 §4.6 (A-102); docs/questions/Q-960
-/// item 6, Q-964 items 12-13.
+/// item 6, Q-964 items 12-13; docs/59 §7.4 (task PN12).
 #[must_use]
 pub fn domain_configs(input: &DomainInput, node_id: &NodeId) -> Vec<ConfigFile> {
     let a = &input.accounts;
@@ -410,6 +412,10 @@ pub fn domain_configs(input: &DomainInput, node_id: &NodeId) -> Vec<ConfigFile> 
             "insecure-development-file".to_owned(),
         ),
         ("integrity_key_path", path(&p.integrity_key)),
+        // Task PN12 (docs/59 §7.4): dird's attestation-key file — the path
+        // only (A-60: no setting holds a secret); required by dird's schema
+        // since this task (A-187 on docs/questions/Q-1048 item 1).
+        ("attestation_key_path", path(&p.attestation_key)),
         ("policy_store_path", path(&p.policy)),
         ("policy_store_format", "unsigned-development".to_owned()),
         ("dird_kdc_socket", path(&p.dird_kdc_socket)),

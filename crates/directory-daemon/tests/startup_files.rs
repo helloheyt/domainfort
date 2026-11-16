@@ -10,9 +10,9 @@
 //!   octets, no symbolic link; a key read from it opens the store it sealed
 //!   and no other (docs/50 §7.4; Q-213 → A-57; Q-270 item 1);
 //! * the name-resolution attestation-key file (task PN10) — the same rule,
-//!   an all-zero key refused, the key path required by the start though the
-//!   configuration accepts the file without it (docs/59 §7.4; Q-1011 item
-//!   2; docs/questions/Q-1046 item 5);
+//!   an all-zero key refused; the key path required by the configuration
+//!   schema since task PN12 (docs/59 §7.4; Q-1011 item 2; docs/questions/
+//!   Q-1046 item 5, Q-1048 item 1 — A-187);
 //! * the policy file's owner / mode checks and its absence (fail closed);
 //! * the configuration's owner check; the serving parameters and the
 //!   hardening plan derived from a configuration (docs/50 §6.4, §7.1);
@@ -25,7 +25,7 @@
 //!
 //! Sources: docs/50 R50-14, §3.3, §6.4, §7.1, §7.2, §7.4, §9; [MS-DTYP]
 //! 2.4.2.2; A-36; A-68; docs/questions/Q-213, Q-219, Q-270; docs/59 §7.4
-//! (task PN10). Every value is hand-made.
+//! (tasks PN10, PN12). Every value is hand-made.
 
 mod support;
 
@@ -252,7 +252,6 @@ fn the_attestation_key_file_is_checked() {
         Some(StartupError::KeyUnreadable)
     );
     for refusal in [
-        StartupError::AttestationKeyNotConfigured,
         StartupError::AttestationKeyUnreadable,
         StartupError::AttestationKeyPermissions,
         StartupError::AttestationKeyLength,
@@ -263,21 +262,32 @@ fn the_attestation_key_file_is_checked() {
     }
 }
 
-/// docs/59 §7.4; docs/questions/Q-1046 item 5 (task PN10): the configuration
-/// accepts dird's file without `attestation_key_path` (until the
-/// provisioning tool writes it, task PN12), but dird's start does not — and
-/// with the key the start's parameters carry it.
+/// docs/59 §7.4; docs/questions/Q-1046 item 5, Q-1048 item 1 (A-187: the
+/// key required once the provisioning tool writes it — task PN12): dird's
+/// file without `attestation_key_path` is refused when it is read — the
+/// configuration's own `MissingKey`, before any key file is opened, so dird
+/// does not start (fail closed) — and with the key the start's path and
+/// parameters carry it.
 #[test]
-fn the_start_requires_the_attestation_key_path() {
-    let without = config::DirdSettings::parse(DIRD.as_bytes()).unwrap();
-    assert_eq!(
-        attestation_key_path(&without).err(),
-        Some(StartupError::AttestationKeyNotConfigured)
-    );
-    let with = config::DirdSettings::parse(
-        format!("{DIRD}attestation_key_path = /etc/dird/attestation.key\n").as_bytes(),
-    )
-    .unwrap();
+fn the_configuration_requires_the_attestation_key_path() {
+    let without: String = DIRD
+        .lines()
+        .filter(|line| !line.starts_with("attestation_key_path"))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    let refused = config::DirdSettings::parse(without.as_bytes()).unwrap_err();
+    assert_eq!(refused.kind(), config::ErrorKind::MissingKey);
+    assert_eq!(refused.key(), Some("attestation_key_path"));
+    let dir = ScratchDir::new("dird-startup").unwrap();
+    let uid = dir.uid().unwrap();
+    let path = dir.join("dird.conf");
+    write(&path, without.as_bytes(), 0o644);
+    assert!(matches!(
+        read_settings_owned_by(&path, uid),
+        Err(StartupError::Config(_))
+    ));
+
+    let with = config::DirdSettings::parse(DIRD.as_bytes()).unwrap();
     assert_eq!(
         attestation_key_path(&with).unwrap(),
         Path::new("/etc/dird/attestation.key")
@@ -325,7 +335,8 @@ fn the_policy_file_is_checked_and_absent_is_refused() {
 }
 
 /// A dird configuration (docs/50 §7.1) with the development sources named
-/// explicitly (Q-270 items 1-2); account 61002.
+/// explicitly (Q-270 items 1-2) and dird's attestation-key file (required
+/// since task PN12 — Q-1048 item 1); account 61002.
 const DIRD: &str = "\
 run_as_uid = 61002
 run_as_gid = 61002
@@ -335,6 +346,7 @@ dns_host_name = dc1.example.org
 database_path = /var/lib/dird/directory.redb
 integrity_key_source = insecure-development-file
 integrity_key_path = /etc/dird/integrity.key
+attestation_key_path = /etc/dird/attestation.key
 policy_store_path = /etc/domain/policy.store
 policy_store_format = unsigned-development
 dird_kdc_socket = /run/dird/kdc/dird-kdc.sock

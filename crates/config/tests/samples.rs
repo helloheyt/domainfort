@@ -87,8 +87,8 @@ fn dird_sample_parses() {
     assert_eq!(s.integrity_key_path().as_str(), "/etc/dird/integrity.key");
     // Task PN10 (docs/59 §7.4): dird's attestation-key file, a path only.
     assert_eq!(
-        s.attestation_key_path().map(|p| p.as_str()),
-        Some("/etc/dird/attestation.key")
+        s.attestation_key_path().as_str(),
+        "/etc/dird/attestation.key"
     );
     assert_eq!(s.policy_store_path().as_str(), "/etc/domain/policy.store");
     assert_eq!(
@@ -139,9 +139,13 @@ fn dird_minimal_sample_takes_defaults() {
     assert!(s.admin_service().is_none());
     assert!(s.keyd().is_none());
     assert!(s.node_id().is_none());
-    // Optional in the file until provision writes it (task PN12); dird's
-    // start refuses its absence (docs/questions/Q-1046 item 5).
-    assert!(s.attestation_key_path().is_none());
+    // Required since task PN12 (provision writes it — docs/questions/Q-1048
+    // item 1, A-187): the minimal file names it; removing it is
+    // `MissingKey` (`every_minimal_key_is_required`).
+    assert_eq!(
+        s.attestation_key_path().as_str(),
+        "/etc/dird/attestation.key"
+    );
     assert_eq!(s.frame_timeout(), secs(5));
     assert_eq!(s.view_lifetime(), secs(5));
 }
