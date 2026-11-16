@@ -1,7 +1,7 @@
 {
   "_comment": "ספריית המפרטים המוצמדת (specs/SOURCES.md §D, docs/17 SV-*). revision+sha256 ממולאים ע\"י scripts/pin-specs.sh. ללא הצמדה — אין לכתוב קוד מהמסמך (AGENTS.md).",
   "ms_openspec_pdf_host": "https://winprotocoldoc.z19.web.core.windows.net",
-  "generated_at": "2026-11-14T23:50:18Z",
+  "generated_at": "2026-11-16T13:52:52Z",
   "documents": [
     {
       "id": "MS-ADTS",
@@ -535,6 +535,769 @@
       "sha256": "a2f2628c0a83b873fc4786abd921f9b2c02395954b655d190bf16b831633345d",
       "phase": "1",
       "blocks": []
+    },
+    {
+      "id": "RFC2743",
+      "title": "Generic Security Service Application Program Interface Version 2, Update 1",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc2743.txt",
+      "revision": "RFC2743",
+      "sha256": "59ca50ca7469d3b5000462810e8c3aea18d12bf34209220bb3daae7c494f3600",
+      "phase": "1",
+      "blocks": [
+        "L6b",
+        "L7"
+      ]
+    },
+    {
+      "id": "RFC2744",
+      "title": "Generic Security Service API Version 2 : C-bindings",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc2744.txt",
+      "revision": "RFC2744",
+      "sha256": "494d9f48349271453cbec3d87f541d8302dc7ad338286b03dd77207700bac74b",
+      "phase": "1",
+      "blocks": []
+    },
+    {
+      "id": "RFC5056",
+      "title": "On the Use of Channel Bindings to Secure Channels",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc5056.txt",
+      "revision": "RFC5056",
+      "sha256": "decec18daccd159c0fd3141dba122a8c66dbded12d6ac70adf34b75488c25920",
+      "phase": "1",
+      "blocks": []
+    },
+    {
+      "id": "RFC9266",
+      "title": "Channel Bindings for TLS 1.3",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc9266.txt",
+      "revision": "RFC9266",
+      "sha256": "dda84b295ff134eb77105f406a55ab6cee3afe035fd23c9e79a2dad662c2e880",
+      "phase": "1",
+      "blocks": [
+        "Q-162"
+      ]
+    },
+    {
+      "id": "RFC4532",
+      "title": "Lightweight Directory Access Protocol (LDAP) \"Who am I?\" Operation",
+      "kind": "rfc",
+      "url": "https://www.rfc-editor.org/rfc/rfc4532.txt",
+      "revision": "RFC4532",
+      "sha256": "acba6c42dd300ed809f30c9b5564abc24067916c7643e30fa096ad3b04c100b8",
+      "phase": "1",
+      "blocks": []
+    },
+    {
+      "id": "POSIX-PWD-H",
+      "title": "<pwd.h> (POSIX.1-2024)",
+      "kind": "posix",
+      "url": "https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/pwd.h.html",
+      "revision": "IEEE Std 1003.1-2024 / Base Specifications Issue 8",
+      "sha256": "1da878ccdc9ac3e75cc14da6dfee802d1df0bead2231daeec0eff79bdbfed565",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "POSIX-GRP-H",
+      "title": "<grp.h> (POSIX.1-2024)",
+      "kind": "posix",
+      "url": "https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/grp.h.html",
+      "revision": "IEEE Std 1003.1-2024 / Base Specifications Issue 8",
+      "sha256": "5e8640ec5149c0951a146fe5bbfc34c4d7cb1e73a9335bdcd0a52989c3b1b3cb",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "POSIX-GETPWNAM",
+      "title": "getpwnam(), getpwnam_r() (POSIX.1-2024)",
+      "kind": "posix",
+      "url": "https://pubs.opengroup.org/onlinepubs/9799919799/functions/getpwnam.html",
+      "revision": "IEEE Std 1003.1-2024 / Base Specifications Issue 8",
+      "sha256": "90d2bd5d1559e852875a5607740188b16fda075376080aa51b24aac57bc24fea",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "POSIX-GETPWUID",
+      "title": "getpwuid(), getpwuid_r() (POSIX.1-2024)",
+      "kind": "posix",
+      "url": "https://pubs.opengroup.org/onlinepubs/9799919799/functions/getpwuid.html",
+      "revision": "IEEE Std 1003.1-2024 / Base Specifications Issue 8",
+      "sha256": "4d8d97f7cb32cb69f874a525d30341b425ba6f50004b0a7dbfca03c42b43c938",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "POSIX-GETGRNAM",
+      "title": "getgrnam(), getgrnam_r() (POSIX.1-2024)",
+      "kind": "posix",
+      "url": "https://pubs.opengroup.org/onlinepubs/9799919799/functions/getgrnam.html",
+      "revision": "IEEE Std 1003.1-2024 / Base Specifications Issue 8",
+      "sha256": "ba00547eaef131d487ff19b121077ada01376475a57c564acd97e87c2b93f70a",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "POSIX-GETGRGID",
+      "title": "getgrgid(), getgrgid_r() (POSIX.1-2024)",
+      "kind": "posix",
+      "url": "https://pubs.opengroup.org/onlinepubs/9799919799/functions/getgrgid.html",
+      "revision": "IEEE Std 1003.1-2024 / Base Specifications Issue 8",
+      "sha256": "d95bdab744f407253bf1e89b4f6b96d0efcbe028e56a749dcec64816e9f093c1",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "POSIX-XBD-CH3",
+      "title": "Base Definitions ch. 3, Definitions (POSIX.1-2024)",
+      "kind": "posix",
+      "url": "https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/V1_chap03.html",
+      "revision": "IEEE Std 1003.1-2024 / Base Specifications Issue 8",
+      "sha256": "0037b423cc292c3cd7c55d347a2273407d156be2a161e56771b08c1c0d421d5a",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "XSSO-FRONT",
+      "title": "XSSO-PAM P702 front matter",
+      "kind": "opengroup",
+      "url": "https://pubs.opengroup.org/onlinepubs/8329799/front.htm",
+      "revision": "X/Open P702 Preliminary Specification (June 1997)",
+      "sha256": "50e7b5b96f52ec241a960c75139c8366a0011a794986289d31e4679b16f51700",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "XSSO-CH2",
+      "title": "XSSO-PAM P702 ch. 2 Conformance",
+      "kind": "opengroup",
+      "url": "https://pubs.opengroup.org/onlinepubs/8329799/chap2.htm",
+      "revision": "X/Open P702 Preliminary Specification (June 1997)",
+      "sha256": "9a3b2e2de4efba520c7620a69545a0a26cd196287ff311e709898ff78f9ec624",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "XSSO-CH4",
+      "title": "XSSO-PAM P702 ch. 4 XSSO Sign-on Services",
+      "kind": "opengroup",
+      "url": "https://pubs.opengroup.org/onlinepubs/8329799/chap4.htm",
+      "revision": "X/Open P702 Preliminary Specification (June 1997)",
+      "sha256": "6282a0a55a379dd461d44d21ba11a7339eb0d25bacc821b3dc66518045a52c91",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "XSSO-CH5",
+      "title": "XSSO-PAM P702 ch. 5 Parameter Passing Conventions in PAM",
+      "kind": "opengroup",
+      "url": "https://pubs.opengroup.org/onlinepubs/8329799/chap5.htm",
+      "revision": "X/Open P702 Preliminary Specification (June 1997)",
+      "sha256": "6f22ffd0889d2b127e596701907e1f3174e92c30e4e253f585f63b70cfd03036",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "XSSO-APDXA",
+      "title": "XSSO-PAM P702 appendix A Example Header Files",
+      "kind": "opengroup",
+      "url": "https://pubs.opengroup.org/onlinepubs/8329799/apdxa.htm",
+      "revision": "X/Open P702 Preliminary Specification (June 1997)",
+      "sha256": "fe27c26e35202d02434a313a21850cec493ab2f30dfce358d660c8958322ffed",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "XSSO-APDXB",
+      "title": "XSSO-PAM P702 appendix B PAM Configuration Administration",
+      "kind": "opengroup",
+      "url": "https://pubs.opengroup.org/onlinepubs/8329799/apdxb.htm",
+      "revision": "X/Open P702 Preliminary Specification (June 1997)",
+      "sha256": "3d4b48a08cb86f93eb9517aeffef3e6dfea1e7aed9bc2361e9c796756e0f3707",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "XSSO-APDXC",
+      "title": "XSSO-PAM P702 appendix C Internationalization",
+      "kind": "opengroup",
+      "url": "https://pubs.opengroup.org/onlinepubs/8329799/apdxc.htm",
+      "revision": "X/Open P702 Preliminary Specification (June 1997)",
+      "sha256": "d18f992cf72d8fce7b25aebabf44582e39d056aab7abf68929da68bddf539752",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "XSSO-PAM-SM-AUTHENTICATE",
+      "title": "XSSO-PAM P702 pam_sm_authenticate()",
+      "kind": "opengroup",
+      "url": "https://pubs.opengroup.org/onlinepubs/8329799/pam_sm_authenticate.htm",
+      "revision": "X/Open P702 Preliminary Specification (June 1997)",
+      "sha256": "400ad653f97bbf9a8b0e3130f7e8b66590261b12aa957dece16019a1d35e9e1f",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "XSSO-PAM-SM-SETCRED",
+      "title": "XSSO-PAM P702 pam_sm_setcred()",
+      "kind": "opengroup",
+      "url": "https://pubs.opengroup.org/onlinepubs/8329799/pam_sm_setcred.htm",
+      "revision": "X/Open P702 Preliminary Specification (June 1997)",
+      "sha256": "438a4a08a81f82fbe98b63ddd61ebae5ed190c6a3fa6b1c197d88a6c17b2f9ae",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "XSSO-PAM-SM-ACCT-MGMT",
+      "title": "XSSO-PAM P702 pam_sm_acct_mgmt()",
+      "kind": "opengroup",
+      "url": "https://pubs.opengroup.org/onlinepubs/8329799/pam_sm_acct_mgmt.htm",
+      "revision": "X/Open P702 Preliminary Specification (June 1997)",
+      "sha256": "8d991ac2cf93beaaae9fbd04c981db37e5cc5af9df785b4fcdb1d55011d3d2fa",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "XSSO-PAM-SM-OPEN-SESSION",
+      "title": "XSSO-PAM P702 pam_sm_open_session()",
+      "kind": "opengroup",
+      "url": "https://pubs.opengroup.org/onlinepubs/8329799/pam_sm_open_session.htm",
+      "revision": "X/Open P702 Preliminary Specification (June 1997)",
+      "sha256": "a7f6e8936a81fe986d294f7ccf04303a05b39d8f1f648d60b5755890137769f1",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "XSSO-PAM-SM-CLOSE-SESSION",
+      "title": "XSSO-PAM P702 pam_sm_close_session()",
+      "kind": "opengroup",
+      "url": "https://pubs.opengroup.org/onlinepubs/8329799/pam_sm_close_session.htm",
+      "revision": "X/Open P702 Preliminary Specification (June 1997)",
+      "sha256": "5f6720c92e86028c34e57e15d62d4e94a4efe8103fe228ae4b81f5c252220fb0",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "XSSO-PAM-SM-CHAUTHTOK",
+      "title": "XSSO-PAM P702 pam_sm_chauthtok()",
+      "kind": "opengroup",
+      "url": "https://pubs.opengroup.org/onlinepubs/8329799/pam_sm_chauthtok.htm",
+      "revision": "X/Open P702 Preliminary Specification (June 1997)",
+      "sha256": "6154cdfcd9b87628d12fde5c00f06af9fb9bd9cda51907c5aa0f54fadf85fe50",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "XSSO-PAM-GET-ITEM",
+      "title": "XSSO-PAM P702 pam_get_item()",
+      "kind": "opengroup",
+      "url": "https://pubs.opengroup.org/onlinepubs/8329799/pam_get_item.htm",
+      "revision": "X/Open P702 Preliminary Specification (June 1997)",
+      "sha256": "a99df044590dabdad51e4eb651894bc2583816d2a4dc8c1ea3a555ae08c05266",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "XSSO-PAM-SET-ITEM",
+      "title": "XSSO-PAM P702 pam_set_item()",
+      "kind": "opengroup",
+      "url": "https://pubs.opengroup.org/onlinepubs/8329799/pam_set_item.htm",
+      "revision": "X/Open P702 Preliminary Specification (June 1997)",
+      "sha256": "102dff15100f3786bd09e5fad94dfb26bd2b4d4b537897ed5087c7c356a18994",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "XSSO-PAM-GET-USER",
+      "title": "XSSO-PAM P702 pam_get_user()",
+      "kind": "opengroup",
+      "url": "https://pubs.opengroup.org/onlinepubs/8329799/pam_get_user.htm",
+      "revision": "X/Open P702 Preliminary Specification (June 1997)",
+      "sha256": "e1614fcf91808d58a584287841422b4b01eff553d7c38f43ad8adcc9076afc8c",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "XSSO-PAM-GET-DATA",
+      "title": "XSSO-PAM P702 pam_get_data()",
+      "kind": "opengroup",
+      "url": "https://pubs.opengroup.org/onlinepubs/8329799/pam_get_data.htm",
+      "revision": "X/Open P702 Preliminary Specification (June 1997)",
+      "sha256": "f2b9fec919bb15cce188de1243f7be20322297288c9920dbf8e75ac62885d246",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "XSSO-PAM-SET-DATA",
+      "title": "XSSO-PAM P702 pam_set_data()",
+      "kind": "opengroup",
+      "url": "https://pubs.opengroup.org/onlinepubs/8329799/pam_set_data.htm",
+      "revision": "X/Open P702 Preliminary Specification (June 1997)",
+      "sha256": "105e8bf086187e3c79531e639132032be32d5030eb56dfb4ab7ec25e35183c42",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "XSSO-PAM-STRERROR",
+      "title": "XSSO-PAM P702 pam_strerror()",
+      "kind": "opengroup",
+      "url": "https://pubs.opengroup.org/onlinepubs/8329799/pam_strerror.htm",
+      "revision": "X/Open P702 Preliminary Specification (June 1997)",
+      "sha256": "1f05f3ea453e4bb8c678b4ff3f126febcc8aacfa4dd07d7050e8b9e7f96f7a90",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "GLIBC-NSS",
+      "title": "glibc 2.44 manual: System Databases and Name Service Switch",
+      "kind": "glibc-manual",
+      "url": "https://sourceware.org/glibc/manual/2.44/html_node/Name-Service-Switch.html",
+      "revision": "glibc 2.44",
+      "sha256": "a30ff323386799bbcdd0c3ccfd2908cc7b50cceb271b08c796c2a1ce9c983c37",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "GLIBC-NSS-BASICS",
+      "title": "glibc 2.44 manual: NSS Basics",
+      "kind": "glibc-manual",
+      "url": "https://sourceware.org/glibc/manual/2.44/html_node/NSS-Basics.html",
+      "revision": "glibc 2.44",
+      "sha256": "4eb824fafe9e7ede335364f4a70cf0e7d87244051616b10ea785d35784d54b9b",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "GLIBC-NSS-CONFIG",
+      "title": "glibc 2.44 manual: NSS Configuration File",
+      "kind": "glibc-manual",
+      "url": "https://sourceware.org/glibc/manual/2.44/html_node/NSS-Configuration-File.html",
+      "revision": "glibc 2.44",
+      "sha256": "ab9da7e9b15dcda6e939e3e5ede0248999c2535ff2d2571adecad786232a3201",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "GLIBC-NSS-SERVICES",
+      "title": "glibc 2.44 manual: Services in the NSS configuration",
+      "kind": "glibc-manual",
+      "url": "https://sourceware.org/glibc/manual/2.44/html_node/Services-in-the-NSS-configuration.html",
+      "revision": "glibc 2.44",
+      "sha256": "28138c484503db58d1bbd738d895737dcd3f042cd4ba5411519fd36e7efcb5e3",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "GLIBC-NSS-ACTIONS",
+      "title": "glibc 2.44 manual: Actions in the NSS configuration",
+      "kind": "glibc-manual",
+      "url": "https://sourceware.org/glibc/manual/2.44/html_node/Actions-in-the-NSS-configuration.html",
+      "revision": "glibc 2.44",
+      "sha256": "3392c48c51512462d78f46811a4ef3055c73dcfce4f71e47d62920b2076664fe",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "GLIBC-NSS-CONFIG-NOTES",
+      "title": "glibc 2.44 manual: Notes on NSS Configuration File",
+      "kind": "glibc-manual",
+      "url": "https://sourceware.org/glibc/manual/2.44/html_node/Notes-on-NSS-Configuration-File.html",
+      "revision": "glibc 2.44",
+      "sha256": "ef9f3b2180a96f774066035f126d8ac1f4df06669cc5573a8562ec259e9629c3",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "GLIBC-NSS-MODULE-INTERNALS",
+      "title": "glibc 2.44 manual: NSS Module Internals",
+      "kind": "glibc-manual",
+      "url": "https://sourceware.org/glibc/manual/2.44/html_node/NSS-Module-Internals.html",
+      "revision": "glibc 2.44",
+      "sha256": "c994310667d7572c36f3e07b47aa6bf70f38ad24587d3dff96a8398927843aa1",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "GLIBC-NSS-MODULE-NAMES",
+      "title": "glibc 2.44 manual: NSS Module Names",
+      "kind": "glibc-manual",
+      "url": "https://sourceware.org/glibc/manual/2.44/html_node/NSS-Module-Names.html",
+      "revision": "glibc 2.44",
+      "sha256": "9b06f7f6fe4b94577f0b022767efe15051fa978b7db83d1e774bb8635b006d37",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "GLIBC-NSS-MODULES-INTERFACE",
+      "title": "glibc 2.44 manual: NSS Modules Interface",
+      "kind": "glibc-manual",
+      "url": "https://sourceware.org/glibc/manual/2.44/html_node/NSS-Modules-Interface.html",
+      "revision": "glibc 2.44",
+      "sha256": "6f7f2c292773ebfc65ffff8c9a9224bb285ad89fc41763561fb666e24ba46701",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "GLIBC-NSS-EXTENDING",
+      "title": "glibc 2.44 manual: Extending NSS",
+      "kind": "glibc-manual",
+      "url": "https://sourceware.org/glibc/manual/2.44/html_node/Extending-NSS.html",
+      "revision": "glibc 2.44",
+      "sha256": "c968a3396b7728bd130284f5f9d415cf92dafe3bc2fd9742c6d67cb74a0dbcc6",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "GLIBC-NSS-ADDING-SERVICE",
+      "title": "glibc 2.44 manual: Adding another Service to NSS",
+      "kind": "glibc-manual",
+      "url": "https://sourceware.org/glibc/manual/2.44/html_node/Adding-another-Service-to-NSS.html",
+      "revision": "glibc 2.44",
+      "sha256": "ff2c1903fdff21e56e6199ad81866963cf0c5b3efdbbd4fe1072662a02f244ac",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "GLIBC-NSS-FUNCTION-INTERNALS",
+      "title": "glibc 2.44 manual: NSS Module Function Internals",
+      "kind": "glibc-manual",
+      "url": "https://sourceware.org/glibc/manual/2.44/html_node/NSS-Module-Function-Internals.html",
+      "revision": "glibc 2.44",
+      "sha256": "d3f401b61f411b70bd3ed952d35ff37fd119ef933a62b9c5eb97869c7019f5d4",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "GLIBC-USER-DATA-STRUCTURE",
+      "title": "glibc 2.44 manual: User Data Structure",
+      "kind": "glibc-manual",
+      "url": "https://sourceware.org/glibc/manual/2.44/html_node/User-Data-Structure.html",
+      "revision": "glibc 2.44",
+      "sha256": "7af633ec78b2558fc87a3dd26f422947266afab09387424e1d13c726edead78a",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "GLIBC-GROUP-DATA-STRUCTURE",
+      "title": "glibc 2.44 manual: Group Data Structure",
+      "kind": "glibc-manual",
+      "url": "https://sourceware.org/glibc/manual/2.44/html_node/Group-Data-Structure.html",
+      "revision": "glibc 2.44",
+      "sha256": "62709edb15b0285afd6a70873685b342c9889f7edaa028a77897be9f3aa810f7",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "GLIBC-DOC-LICENSE",
+      "title": "glibc 2.44 manual: Documentation License",
+      "kind": "glibc-manual",
+      "url": "https://sourceware.org/glibc/manual/2.44/html_node/Documentation-License.html",
+      "revision": "glibc 2.44",
+      "sha256": "97bf0184721dcb9534b1d212fa3145da56926b11dfcf176e60131218c232f7b1",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "DEBMAN-PAM-3",
+      "title": "Debian trixie man page pam(3) (libpam-doc)",
+      "kind": "debian-manpage",
+      "url": "https://manpages.debian.org/trixie/libpam-doc/pam.3.en.html",
+      "revision": "trixie libpam 1.7.0-5",
+      "sha256": "b46e7cc3b30fbbb584e6238005ebb69c118cac7ccf206e5bb3d91cb6bd5fa053",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "DEBMAN-PAM-SM-AUTHENTICATE-3",
+      "title": "Debian trixie man page pam_sm_authenticate(3)",
+      "kind": "debian-manpage",
+      "url": "https://manpages.debian.org/trixie/libpam-doc/pam_sm_authenticate.3.en.html",
+      "revision": "trixie libpam 1.7.0-5",
+      "sha256": "92078a0b1a3c5dcf7190c23c685e9900be1f682124e67476ee575a713addb452",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "DEBMAN-PAM-SM-SETCRED-3",
+      "title": "Debian trixie man page pam_sm_setcred(3)",
+      "kind": "debian-manpage",
+      "url": "https://manpages.debian.org/trixie/libpam-doc/pam_sm_setcred.3.en.html",
+      "revision": "trixie libpam 1.7.0-5",
+      "sha256": "206c4043f79f688edf2989a66ed3aaa226a018a91d8f59bbbde97332924fa568",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "DEBMAN-PAM-SM-ACCT-MGMT-3",
+      "title": "Debian trixie man page pam_sm_acct_mgmt(3)",
+      "kind": "debian-manpage",
+      "url": "https://manpages.debian.org/trixie/libpam-doc/pam_sm_acct_mgmt.3.en.html",
+      "revision": "trixie libpam 1.7.0-5",
+      "sha256": "9a4971f9376b1e5833613a0209a8689b3cd5e18ce1ecf480ccbe301740b1f03b",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "DEBMAN-PAM-SM-OPEN-SESSION-3",
+      "title": "Debian trixie man page pam_sm_open_session(3)",
+      "kind": "debian-manpage",
+      "url": "https://manpages.debian.org/trixie/libpam-doc/pam_sm_open_session.3.en.html",
+      "revision": "trixie libpam 1.7.0-5",
+      "sha256": "d85226c55adaa1a3286fe6a9e7cca9451a74b747f368879c5047767f0d3de5db",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "DEBMAN-PAM-SM-CLOSE-SESSION-3",
+      "title": "Debian trixie man page pam_sm_close_session(3)",
+      "kind": "debian-manpage",
+      "url": "https://manpages.debian.org/trixie/libpam-doc/pam_sm_close_session.3.en.html",
+      "revision": "trixie libpam 1.7.0-5",
+      "sha256": "ea76cde15159e404b34aacf9f3687d75b29dfabb167830614e46475c14807e0a",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "DEBMAN-PAM-SM-CHAUTHTOK-3",
+      "title": "Debian trixie man page pam_sm_chauthtok(3)",
+      "kind": "debian-manpage",
+      "url": "https://manpages.debian.org/trixie/libpam-doc/pam_sm_chauthtok.3.en.html",
+      "revision": "trixie libpam 1.7.0-5",
+      "sha256": "fb051e597e9dbc220b506db9860a0000bdc012094d16e8d8a1c4728c90275421",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "DEBMAN-PAM-GET-ITEM-3",
+      "title": "Debian trixie man page pam_get_item(3)",
+      "kind": "debian-manpage",
+      "url": "https://manpages.debian.org/trixie/libpam-doc/pam_get_item.3.en.html",
+      "revision": "trixie libpam 1.7.0-5",
+      "sha256": "fd3d6da7bc241d0cbefd995cabc44f6d996173849b9b83265d3273ffdf18064d",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "DEBMAN-PAM-GET-USER-3",
+      "title": "Debian trixie man page pam_get_user(3)",
+      "kind": "debian-manpage",
+      "url": "https://manpages.debian.org/trixie/libpam-doc/pam_get_user.3.en.html",
+      "revision": "trixie libpam 1.7.0-5",
+      "sha256": "a5cb3db0974845f0d2ab92e889f52464494447052b715b995f7a7b2a336c2f55",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "DEBMAN-PAM-CONV-3",
+      "title": "Debian trixie man page pam_conv(3)",
+      "kind": "debian-manpage",
+      "url": "https://manpages.debian.org/trixie/libpam-doc/pam_conv.3.en.html",
+      "revision": "trixie libpam 1.7.0-5",
+      "sha256": "84f7665a176015b679872133b25e0068b61104835f0e7b441e7db30bd6ae1d3b",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "DEBMAN-PAM-SET-DATA-3",
+      "title": "Debian trixie man page pam_set_data(3)",
+      "kind": "debian-manpage",
+      "url": "https://manpages.debian.org/trixie/libpam-doc/pam_set_data.3.en.html",
+      "revision": "trixie libpam 1.7.0-5",
+      "sha256": "5e860d4e9e42ba0f0afa334a6669050e5b78e9cb73e320c2223a503d7c5a4f29",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "DEBMAN-PAM-GET-DATA-3",
+      "title": "Debian trixie man page pam_get_data(3)",
+      "kind": "debian-manpage",
+      "url": "https://manpages.debian.org/trixie/libpam-doc/pam_get_data.3.en.html",
+      "revision": "trixie libpam 1.7.0-5",
+      "sha256": "11e316ddd619d02eba8873d607a8427302d9de7fb1a7915f7064208bed4e8152",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "DEBMAN-PAM-STRERROR-3",
+      "title": "Debian trixie man page pam_strerror(3)",
+      "kind": "debian-manpage",
+      "url": "https://manpages.debian.org/trixie/libpam-doc/pam_strerror.3.en.html",
+      "revision": "trixie libpam 1.7.0-5",
+      "sha256": "06e9bd6413786e8636c75c41d00f35eef421c95c1ffc389c155d44045c918624",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "DEBMAN-PAM-CONF-5",
+      "title": "Debian trixie man page pam.conf(5)",
+      "kind": "debian-manpage",
+      "url": "https://manpages.debian.org/trixie/libpam-runtime/pam.conf.5.en.html",
+      "revision": "trixie libpam 1.7.0-5",
+      "sha256": "34b53f1777c35d6e5e22255e5db9a1b7001c26e77801a9472bbbe5b79b007bf4",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "DEBMAN-PAM-AUTH-UPDATE-8",
+      "title": "Debian trixie man page pam-auth-update(8)",
+      "kind": "debian-manpage",
+      "url": "https://manpages.debian.org/trixie/libpam-runtime/pam-auth-update.8.en.html",
+      "revision": "trixie libpam 1.7.0-5",
+      "sha256": "4d3241666767101fc8e4f9aabea9d1d3b43d03833c42313f0e281e9d43c36b6b",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "DEBMAN-NSSWITCH-CONF-5",
+      "title": "Debian trixie man page nsswitch.conf(5)",
+      "kind": "debian-manpage",
+      "url": "https://manpages.debian.org/trixie/manpages/nsswitch.conf.5.en.html",
+      "revision": "trixie manpages 6.9.1-1",
+      "sha256": "4d70e671d5a8c356a5d68c27185911a60d23e71e15de268c4904af224c9fdbff",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "DEBMAN-NSS-5",
+      "title": "Debian trixie man page nss(5)",
+      "kind": "debian-manpage",
+      "url": "https://manpages.debian.org/trixie/manpages/nss.5.en.html",
+      "revision": "trixie manpages 6.9.1-1",
+      "sha256": "68772ba25f055b139a6ac2d59434251bb4c4289f98b17af2556d890cf6f23f1a",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
+    },
+    {
+      "id": "DEBIAN-POLICY-CH9",
+      "title": "Debian Policy Manual ch. 9 Operating system",
+      "kind": "debian-policy",
+      "url": "https://www.debian.org/doc/debian-policy/ch-opersys.html",
+      "revision": "Debian Policy 4.7.4.1",
+      "sha256": "ae1360141cca20cdcb12b75b5247c78cbdc29571306612505c0a70b8ec369e85",
+      "phase": "1",
+      "blocks": [
+        "P-56 group 1 (LX1, LX6, LX7, LX8, LX11)"
+      ]
     }
   ]
 }
