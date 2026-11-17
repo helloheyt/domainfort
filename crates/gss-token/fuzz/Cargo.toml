@@ -1,0 +1,60 @@
+# cargo-fuzz harness for gss-token (AGENTS.md §6 / docs/32 §8: every parser
+# gets a fuzz target before it merges to main; docs/60 §10 LG1).
+#
+# This is a SEPARATE workspace (note the empty [workspace] table below): it is
+# intentionally NOT a member of the root workspace, so `cargo build --all`,
+# `cargo clippy`, `cargo test`, `cargo deny` and the SBOM in the product
+# workspace never pull in the fuzzing-only dependencies. It is built only via
+# `cargo fuzz run initial_context_token` / `wrap_token` /
+# `authenticator_checksum` (nightly + cargo-fuzz).
+#
+# NOTE FOR REVIEW: libfuzzer-sys is fuzz-harness-only test infrastructure, not
+# linked into any product crate, and on the license allowlist (MIT / Apache-2.0,
+# AGENTS.md §7) — the same harness dependency as the other crates' fuzz
+# directories (PENDING-OWNER P-1).
+
+[package]
+name = "gss-token-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.gss-token]
+path = ".."
+
+# `ContextEstablishmentToken::decode` on arbitrary bytes for both TOK_IDs,
+# with the invariants and the exact re-encoding (`cargo fuzz run
+# initial_context_token`).
+[[bin]]
+name = "initial_context_token"
+path = "fuzz_targets/initial_context_token.rs"
+test = false
+doc = false
+bench = false
+
+# `WrapHeader::read` and `ReceivedWrapToken::parse` on arbitrary bytes under
+# every expectation, with the profile invariants (`cargo fuzz run wrap_token`).
+[[bin]]
+name = "wrap_token"
+path = "fuzz_targets/wrap_token.rs"
+test = false
+doc = false
+bench = false
+
+# `AuthenticatorChecksum::from_authenticator` on arbitrary checksum octets
+# (`cargo fuzz run authenticator_checksum`).
+[[bin]]
+name = "authenticator_checksum"
+path = "fuzz_targets/authenticator_checksum.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the root workspace (see header).
+[workspace]
