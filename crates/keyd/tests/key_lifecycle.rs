@@ -472,7 +472,6 @@ fn destroy_takes_both_key_sets_of_the_principal() {
     assert_eq!(secondary.kvno, Some(Kvno::INITIAL));
     // The client set and its live proof are gone.
     let mut template = as_template();
-    template.client = id;
     template.cname = client_name.clone();
     assert_eq!(
         f.keyd

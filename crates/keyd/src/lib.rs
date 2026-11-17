@@ -187,7 +187,8 @@
 //! key not bound to krbtgt/REALM. **By type since R7** (docs/52 §3.5;
 //! [`store`]): a stored key is reachable only through one of four doors —
 //! dird's verified name resolution for issuance under a client or service
-//! key set (`StoredKeySet::bound_by`, task PN11), the exact TGS name for the
+//! key set (`store::bound_by`, tasks PN11, PN11b — it looks the set up by
+//! the resolution), the exact TGS name for the
 //! krbtgt (`StoredKeySet::ticket_granting`), the namespace key for the
 //! acceptor (`StoredKeySet::accepting`), the request's own binding for
 //! `set_secret` on an existing set (`StoredKeySet::bound_to`) — or a
@@ -215,11 +216,13 @@
 //! and verifies dird's `AttestedNameResolution` with it: tag (constant time,
 //! before any field) ⇒ realm ⇒ freshness (30 s on keyd's clock) ⇒ a
 //! `VerifiedNameResolution`, which exists only after those checks and is
-//! the only input of `StoredKeySet::bound_by` (principal and purpose = the
-//! set's own handle; canonical name = the bound name by the
-//! `principal-names` key; the ticket's name = one of the resolution's two).
-//! Since task PN11 that is the only way AS and TGS issuance reach a client
-//! or service key (crate name_resolution).
+//! the only input of the door `store::bound_by` (the key set = the one
+//! stored under the resolution's principal and purpose; canonical name = the
+//! bound name by the `principal-names` key; the ticket's name = one of the
+//! resolution's two). Since task PN11 that is the only way AS and TGS
+//! issuance reach a client or service key (crate name_resolution); since
+//! task PN11b the issuance requests name such a key set only through its
+//! resolution — no handle beside it (docs/questions/Q-1067).
 //!
 //! # Time and randomness
 //!
@@ -427,8 +430,9 @@ pub use keyd_types::{
     ThrottlePolicy, TicketPolicy, MAX_FX_COOKIE_LENGTH, TOKEN_ID_LENGTH,
 };
 pub use keyd_types::{AsServer, CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS};
-// The resolutions issuance takes (task PN11; docs/59 §7.2).
-pub use keyd_types::{AsResolutions, AttestedNameResolution};
+// The resolutions issuance takes (task PN11; docs/59 §7.2) and the server
+// key set of an AS issuance, each named once (task PN11b).
+pub use keyd_types::{AsServerKeySet, AttestedNameResolution};
 pub use keyd_types::{
     CeremonyState, DecidedOperation, DecisionId, DecisionIntent, DestructionPage,
     PendingDestruction, MAX_DECISION_APPROVERS, MAX_DESTROY_DECISIONS, MAX_DESTROY_DECISION_PAGE,

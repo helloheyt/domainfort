@@ -24,15 +24,24 @@ pub const KEYD_VERSION: u8 = 1;
 /// Request body bound: 80 KiB for the KDC-request part of a request, plus
 /// room for the two attested name resolutions an `issue_as_rep` can carry
 /// (task PN11) — 149 KiB in all (derived below: [`MAX_KDC_PART_BODY`] +
-/// 2 × [`LARGEST_RESOLUTION`] + the option marker, rounded up to whole KiB;
-/// checked at compile time). Every byte or DER field of a keyd request is
-/// part of one KDC request (at most `kdc::MAX_REQUEST_LEN` = 64 KiB) or a
-/// small structure the KDC builds (a KRB-ERROR, PA-DATA) — except a
-/// resolution's canonical names, which come from dird's store, not from the
-/// request, so the 80 KiB of docs/50 §3.3 no longer bound them.
+/// 2 × [`LARGEST_RESOLUTION`] + one octet, rounded up to whole KiB; checked
+/// at compile time). Every byte or DER field of a keyd request is part of
+/// one KDC request (at most `kdc::MAX_REQUEST_LEN` = 64 KiB) or a small
+/// structure the KDC builds (a KRB-ERROR, PA-DATA) — except a resolution's
+/// canonical names, which come from dird's store, not from the request, so
+/// the 80 KiB of docs/50 §3.3 no longer bound them.
+///
+/// Task PN11b re-derived it from task PN11b's layout (docs/questions/
+/// Q-1081): the largest request is still an armored change-password
+/// `issue_as_rep` — its KDC part, the client's resolution, the server's
+/// variant octet and the service's resolution (the octet replaces PN11's
+/// option marker; the two handles and the template's client principal that
+/// left the request only shrink the KDC part) — so the bound is unchanged;
+/// a TGT's request (one resolution, the octet, a 17-octet handle) and
+/// `issue_tgs_rep` (one resolution, no handle) are smaller.
 /// Spec: docs/50 §3.3 ("keyd request ≤ 80 KiB"; "⚠ to be estimated" — see
 /// docs/questions/Q-245 item 6 for the armored TGS case); docs/59 §7.5
-/// ("size bounds"); docs/questions/Q-1062 (the bound as built).
+/// ("size bounds"); docs/questions/Q-1062 (the bound as built), Q-1081.
 pub const MAX_REQUEST_BODY: u32 = 149 * 1024;
 
 /// The KDC-request part of a request body: docs/50 §3.3's 80 KiB (every
@@ -165,10 +174,11 @@ const _: () = assert!(ATTESTATION_KEY_FIELD < MAX_REQUEST_FIELD);
 // Task PN11: a resolution's realm bound is keyd-types' (the derivation and
 // its own compile-time checks are keyd-types', A-190); the request body
 // holds the KDC-request part and two resolutions (the AS client's and the
-// change-password service's) with an option marker.
+// change-password service's) with one octet — since task PN11b the server's
+// variant code (Q-1081).
 const _: () = assert!(MAX_RESOLUTION_REALM as usize == keyd_types::sealed_store::MAX_NAME_OCTETS);
 const _: () = assert!(MAX_RESOLUTION_NAME < MAX_REQUEST_FIELD);
-// (`<` here: the KDC part, two resolutions and the one option-marker octet.)
+// (`<` here: the KDC part, two resolutions and the server's one variant octet.)
 const _: () =
     assert!(MAX_KDC_PART_BODY as usize + 2 * LARGEST_RESOLUTION < MAX_REQUEST_BODY as usize);
 const _: () = assert!(

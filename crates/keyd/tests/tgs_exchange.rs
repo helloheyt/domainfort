@@ -549,8 +549,7 @@ fn service_bound_to_other_name_denied() {
     t.sname = other;
     let honest = resolution_at(&service_name(), &SERVICE, &now());
     assert_eq!(
-        f.keyd
-            .issue_tgs_rep(&KDC, &SERVICE, &honest, &ctx.ctx_id, &t, &now()),
+        f.keyd.issue_tgs_rep(&KDC, &honest, &ctx.ctx_id, &t, &now()),
         Err(IssueError::Denied)
     );
     assert_eq!(

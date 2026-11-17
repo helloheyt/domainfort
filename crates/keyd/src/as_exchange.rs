@@ -28,13 +28,27 @@
 //!
 //! **Keys only through dird's attested name resolution** (task PN11;
 //! docs/59 §7.2): the client key set — and, for the change-password
-//! service, the server key set — is reached only through
-//! `StoredKeySet::bound_by` on a resolution keyd verified (dird's tag under
-//! the attestation key, keyd's realm, issued within 30 s of keyd's clock),
-//! which must name that key set and the very (realm, name) the ticket will
-//! carry. The krbtgt of a TGT is reached by its exact stored binding to the
-//! canonical TGS name (`StoredKeySet::ticket_granting`). The KDC forwards
-//! the resolutions; it cannot choose which key set a name maps to (C3).
+//! service, the server key set — is reached only through the door
+//! `store::bound_by` on a resolution keyd verified (dird's tag under the
+//! attestation key, keyd's realm, issued within 30 s of keyd's clock),
+//! which must name the very (realm, name) the ticket will carry. The krbtgt
+//! of a TGT is reached by its exact stored binding to the canonical TGS name
+//! (`StoredKeySet::ticket_granting`). The KDC forwards the resolutions; it
+//! cannot choose which key set a name maps to (C3).
+//!
+//! **Each resolved key set is named once** (task PN11b; docs/questions/
+//! Q-1067 — the class "one request states one fact twice", AGENTS.md §6.1):
+//! `issue_as_rep` takes no client handle and no change-password server
+//! handle, and the template no client principal. keyd derives each such
+//! key set from the resolution it verified — the door looks it up by the
+//! resolution's `(principal, key_purpose)` — and checks the derived
+//! handle's purpose against the capability table's slot; the proof of
+//! `verify_preauth` (keyd's own record of the key set that
+//! pre-authenticated) must be bound to the client key set so derived. The
+//! krbtgt keeps its handle (`AsServerKeySet::LocalTgt`): it has no
+//! resolution. `verify_preauth` keeps its client handle — it takes no
+//! resolution (docs/questions/Q-1080: the alternative of Q-1067 open point
+//! 1, and why).
 //!
 //! Phase 1 issues no PAC (MS-PAC / NDR is phase 2, where D124 applies):
 //! tickets carry no authorization-data. Tickets are addressless (no caddr;
@@ -44,7 +58,8 @@
 //! Spec: RFC 4120 2.1, 3.1.2, 3.1.3, 3.1.5, 5.2.7.2, 5.3, 5.4.2, 7.3, 7.5.1;
 //! RFC 6113 5.1, 5.4, 5.4.3, 5.4.6, 6.2, 8; RFC 3244 §2; [MS-KILE] 3.3.5.1.2;
 //! docs/10 §4, §8; docs/30 §2; docs/48 §2.3, §4; docs/53 R53-6, §5.2;
-//! docs/59 §7.2; docs/questions/Q-915 (A-151), Q-1011 (A-173).
+//! docs/59 §7.1, §7.2; docs/questions/Q-915 (A-151), Q-1011 (A-173),
+//! Q-1067, Q-1080 (task PN11b).
 
 use crate::audit::{AuditKeyRef, AuditReason, AuditSink};
 use crate::authz::{as_server_slot, CallerId, HandleSlot, Operation};
@@ -52,9 +67,10 @@ use crate::chain::{self, ChainClass, ChainVerified};
 use crate::enctype::to_crypto;
 use crate::entropy::EntropySource;
 use crate::error::{AuthnError, Deny, Internal, IssueError};
-use crate::keyd::{draw, new_random_key, seal, AuditFields, Keyd};
-use crate::model::{KeyHandle, Kvno, PrincipalId};
-use crate::store::{KeyStore, KeyVersion, UnboundUse};
+use crate::keyd::{admit_resolved, draw, new_random_key, seal, AuditFields, Keyd};
+use crate::model::{KeyHandle, KeyPurpose, Kvno, PrincipalId};
+use crate::name_resolution::VerifiedNameResolution;
+use crate::store::{bound_by, KeyStore, KeyVersion, UnboundUse};
 use crate::template::{
     as_ticket_flags, change_password_ticket, check_times, tgs_name, TemplateTimes,
 };
@@ -65,8 +81,8 @@ use crate::usage::{
     AS_REP_ENC_PART, AS_REQ_PA_ENC_TIMESTAMP, KEY_USAGE_ENC_CHALLENGE_CLIENT, TICKET_ENC_PART,
 };
 use keyd_types::{
-    is_change_password_service_name, AsRepParts, AsResolutions, AsServer, AsTicketTemplate,
-    AuthnProof,
+    is_change_password_service_name, AsRepParts, AsServer, AsServerKeySet, AsTicketTemplate,
+    AttestedNameResolution, AuthnProof,
 };
 use krb_crypto::{EncType, ProtocolKey};
 use krb_proto::constants::{DOMAIN_X500_COMPRESS, PA_ENCRYPTED_CHALLENGE, PA_ENC_TIMESTAMP};
@@ -112,11 +128,11 @@ impl ProofEntry {
 }
 
 /// What one `issue_as_rep` issues: the closed server slot ([`AsServer`])
-/// joined with the issuance's armor. Built only by [`AsIssuance::of`], after
-/// the capability table admitted the server key set in the slot of its
-/// armoring — and the change-password variant holds its armor, not an
-/// `Option` of one: inside keyd an unarmored change-password issuance is
-/// not a value (task K3b; the second layer of A-142 — the KDC's
+/// joined with the issuance's armor. Built only by [`AsIssuance::of`] —
+/// for a TGT after the capability table admitted the krbtgt handle in the
+/// slot of its armoring — and the change-password variant holds its armor,
+/// not an `Option` of one: inside keyd an unarmored change-password
+/// issuance is not a value (task K3b; the second layer of A-142 — the KDC's
 /// `ArmoredServer` is the first).
 /// Spec: docs/53 §5.2; docs/questions/Q-915 items 1, 3 (A-151); A-142;
 /// docs/52 C24.
@@ -135,15 +151,25 @@ enum AsIssuance {
 }
 
 impl AsIssuance {
-    /// The issuance for `server` with `armor`: the one classification
-    /// ([`AsServer::of`]) — anything else is `Denied` (`PurposeMismatch`,
-    /// as the capability table already decided in `admit`).
-    /// Spec: docs/53 §5.2; docs/questions/Q-915 items 1, 3.
-    fn of(server: &KeyHandle, armor: Option<ArmorId>) -> Internal<AsIssuance> {
+    /// The issuance for `server` with `armor` — anything else is `Denied`
+    /// (`PurposeMismatch`, decided before the proof is touched): a TGT
+    /// whose krbtgt handle the one classification ([`AsServer::of`]) finds
+    /// to be this realm's TGS — not merely a server of its slot, so a
+    /// change-password key set named as a TGT's krbtgt is refused; the
+    /// change-password service only when armored (A-142). The service's own
+    /// key set is classified the same way once its resolution is verified
+    /// ([`Keyd::issue_as_rep`]).
+    /// Spec: docs/53 §5.2; docs/questions/Q-915 items 1, 3; A-142;
+    /// docs/questions/Q-1067.
+    fn of(server: AsServerKeySet<'_>, armor: Option<ArmorId>) -> Internal<AsIssuance> {
         let armor = armor.map(|armor_id| *armor_id.as_bytes());
-        match (AsServer::of(server.purpose, armor.is_some()), armor) {
-            (Some(AsServer::LocalTgt), armor) => Ok(AsIssuance::LocalTgt { armor }),
-            (Some(AsServer::ChangePasswordService), Some(armor)) => {
+        match (server, armor) {
+            (AsServerKeySet::LocalTgt(krbtgt), armor)
+                if AsServer::of(krbtgt.purpose, armor.is_some()) == Some(AsServer::LocalTgt) =>
+            {
+                Ok(AsIssuance::LocalTgt { armor })
+            }
+            (AsServerKeySet::ChangePasswordService(_), Some(armor)) => {
                 Ok(AsIssuance::ChangePasswordService { armor })
             }
             _ => Err(Deny::denied(AuditReason::PurposeMismatch)),
@@ -157,6 +183,18 @@ impl AsIssuance {
             AsIssuance::ChangePasswordService { armor } => Some(armor),
         }
     }
+}
+
+/// The server key set of one `issue_as_rep` as keyd will reach it: this
+/// realm's krbtgt by its handle, or the change-password service by the
+/// resolution keyd verified (task PN11b — the request named that key set
+/// only through its resolution).
+/// Spec: docs/59 §7.2; docs/53 §5.2; docs/questions/Q-1067.
+enum VerifiedAsServer<'a> {
+    /// The krbtgt of a TGT (no resolution — docs/59 §7.2).
+    LocalTgt(&'a KeyHandle),
+    /// The change-password service, by its verified resolution.
+    ChangePasswordService(VerifiedNameResolution),
 }
 
 /// Map a token refusal to its audit reason. Spec: docs/10 §8, D36.
@@ -481,22 +519,25 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
 
     /// `issue_as_rep`: consume `proof` and issue an AS ticket for `server` —
     /// armored when `armor` is `Some`. `server` is one of a closed set
-    /// ([`AsServer`]): this realm's krbtgt key set (a TGT, armored or not), or
-    /// — armored only — the change-password service's key set (a ticket for
-    /// `kadmin/changepw`, under that service's profile).
+    /// ([`AsServer`]): this realm's krbtgt key set by its handle (a TGT,
+    /// armored or not), or — armored only — the change-password service by
+    /// dird's attested resolution of its name (a ticket for
+    /// `kadmin/changepw`, under that service's profile). `client` is dird's
+    /// attested resolution of the request's client name — the only name of
+    /// the client key set in the request (task PN11b).
     ///
-    /// 1. authorize and admit (Kdc; client handle PrincipalLongterm; server
-    ///    handle in the server slot of its armoring — `as_server_slot`:
-    ///    unarmored Krbtgt only, armored Krbtgt or ChangePasswordService —
-    ///    `Denied` / `PurposeMismatch` otherwise, the proof untouched); the
-    ///    issuance is then one of `AsIssuance` — a change-password one
-    ///    always holds its armor;
-    /// 2. consume the proof: live, issued to this caller, bound to this
-    ///    client (`Denied` otherwise — the proof is destroyed either way);
-    ///    and the proof's armor is the issuance's — None↔None,
-    ///    Some(a)↔Some(a) (`Denied`, docs/48 §2.3) — so a change-password
-    ///    ticket is issued only on an encrypted challenge verified under the
-    ///    same armor;
+    /// 1. authorize and admit (Kdc; for a TGT the krbtgt handle in the
+    ///    server slot of its armoring — `as_server_slot`: unarmored Krbtgt
+    ///    only, armored Krbtgt or ChangePasswordService); the issuance is
+    ///    then one of `AsIssuance` — a TGT's handle must classify as this
+    ///    realm's TGS, a change-password one always holds its armor
+    ///    (`Denied` / `PurposeMismatch` otherwise, the proof untouched);
+    /// 2. consume the proof: live, issued to this caller, its client and
+    ///    authtime keyd's own (`Denied` otherwise — the proof is destroyed
+    ///    either way); and the proof's armor is the issuance's —
+    ///    None↔None, Some(a)↔Some(a) (`Denied`, docs/48 §2.3) — so a
+    ///    change-password ticket is issued only on an encrypted challenge
+    ///    verified under the same armor;
     /// 3. validate the template (`BadTemplate`): realm; sname — this realm's
     ///    TGS name for a TGT, `kadmin/changepw` (any name-type) for the
     ///    change-password service; enctype configured; for a TGT, flags in
@@ -507,15 +548,18 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     ///    armored: the armor is live, this caller's and bound to this proof,
     ///    and the template's crealm / cname / nonce are the stored inner
     ///    request's (`Denied`, docs/48 §3.4); then the keys, each only
-    ///    through its proof (`Denied`; task PN11, docs/59 §7.2): dird's
-    ///    client resolution verifies (tag, realm, 30 s — else
+    ///    through its proof (`Denied`; tasks PN11, PN11b, docs/59 §7.2):
+    ///    dird's client resolution verifies (tag, realm, 30 s — else
     ///    `AttestationKeyMissing` / `NameResolutionInvalid` / `WrongRealm` /
-    ///    `NameResolutionStale`) and names the client key set and the
-    ///    template's (crealm, cname) (`NameResolutionMismatch`); the server
-    ///    key set is, for a TGT, the krbtgt bound to this realm's TGS name
-    ///    (no resolution may come with it), for the change-password service
-    ///    the one its own verified resolution names together with the
-    ///    template's sname (its absence refused) — `NameResolutionMismatch`;
+    ///    `NameResolutionStale`); the key set it names is PrincipalLongterm
+    ///    (`PurposeMismatch`) and the one the proof is bound to
+    ///    (`TokenPrincipalMismatch`); for the change-password service its
+    ///    own resolution verifies likewise and names a ChangePasswordService
+    ///    key set (`PurposeMismatch`); the door `store::bound_by` looks each
+    ///    such set up by its resolution and requires the set's binding and
+    ///    the ticket's (crealm, cname) — or the service's sname — to be the
+    ///    resolution's (`KeyNotFound` / `NameResolutionMismatch`); for a TGT
+    ///    the server key set is the krbtgt bound to this realm's TGS name;
     /// 4. draw a fresh session key;
     /// 5. EncTicketPart sealed under the CURRENT key of the server key set,
     ///    usage 2 (the flags: the TGT's requested ones, or for the
@@ -535,26 +579,28 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// (docs/48 §4.1 A13); an armor presented by another caller, or expired,
     /// is destroyed.
     ///
-    /// Spec: docs/10 §4 (issue_as_rep, steps 1-7), §8; docs/48 §2.3, §3.4,
-    /// §4.3, §4.4; RFC 4120 2.1, 3.1.3 (the ticket sealed with "the
+    /// Spec: docs/10 §2 (b), §4 (issue_as_rep, steps 1-7), §8; docs/48 §2.3,
+    /// §3.4, §4.3, §4.4; RFC 4120 2.1, 3.1.3 (the ticket sealed with "the
     /// encryption key extracted from the server principal's record"), 5.3,
     /// 5.4.2 (key usage 3; client kvno included), 7.5.1 (usages 2, 3); RFC
     /// 6113 5.4, 5.4.2, 5.4.3, 5.4.6; RFC 3244 §2; docs/53 R53-6, §5.2;
-    /// docs/questions/Q-915 items 1, 3, 4 (A-151); A-142; docs/59 §7.2;
-    /// docs/questions/Q-1011 items 4, 8 (A-173); [MS-KILE] 3.3.5.1.2.
+    /// docs/questions/Q-915 items 1, 3, 4 (A-151); A-142; docs/59 §7.1,
+    /// §7.2; docs/questions/Q-1011 items 4, 8 (A-173), Q-1067, Q-1080;
+    /// [MS-KILE] 3.3.5.1.2.
     #[allow(clippy::too_many_arguments)]
     pub fn issue_as_rep(
         &mut self,
         caller: &CallerId,
-        client: &KeyHandle,
-        server: &KeyHandle,
+        client: &AttestedNameResolution,
+        server: AsServerKeySet<'_>,
         proof: &AuthnProof,
         armor: Option<ArmorId>,
         template: &AsTicketTemplate,
-        resolutions: AsResolutions<'_>,
         now: &KerberosTime,
     ) -> Result<AsRepParts, IssueError> {
-        let mut fields = AuditFields::for_handle(client);
+        // The record names a key set only once keyd knows it: the proof's
+        // (keyd's own record), then the verified resolutions'.
+        let mut fields = AuditFields::default();
         let result = self.issue_as_rep_inner(
             caller,
             client,
@@ -562,7 +608,6 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             proof,
             armor,
             template,
-            resolutions,
             now,
             &mut fields,
         );
@@ -574,39 +619,41 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     fn issue_as_rep_inner(
         &mut self,
         caller: &CallerId,
-        client: &KeyHandle,
-        server: &KeyHandle,
+        client: &AttestedNameResolution,
+        server: AsServerKeySet<'_>,
         proof: &AuthnProof,
         armor: Option<ArmorId>,
         template: &AsTicketTemplate,
-        resolutions: AsResolutions<'_>,
         now: &KerberosTime,
         fields: &mut AuditFields,
     ) -> Internal<AsRepParts> {
-        // The closed server slot: the slot of this issuance's armoring
-        // (Q-915 items 1, 3; pinned in keyd-types authz.rs).
-        self.admit(
-            caller,
-            Operation::IssueAsRep,
-            &[
-                (HandleSlot::Primary, client),
-                (as_server_slot(armor.is_some()), server),
-            ],
-            now,
-        )?;
+        // The role, the hold-down and, for a TGT, the krbtgt handle in the
+        // closed server slot of this issuance's armoring (Q-915 items 1, 3;
+        // pinned in keyd-types authz.rs). A resolved key set has no handle
+        // in the request: its purpose is checked once its resolution is
+        // verified (task PN11b).
+        let server_slot = as_server_slot(armor.is_some());
+        match server {
+            AsServerKeySet::LocalTgt(krbtgt) => {
+                self.admit(caller, Operation::IssueAsRep, &[(server_slot, krbtgt)], now)?
+            }
+            AsServerKeySet::ChangePasswordService(_) => {
+                self.admit(caller, Operation::IssueAsRep, &[], now)?;
+            }
+        }
         let issuance = AsIssuance::of(server, armor)?;
         let now_s = kerberos_time_seconds(now);
 
-        // Step 1: the proof (I4).
+        // Step 1: the proof (I4) — keyd's own record of the key set that
+        // pre-authenticated, (principal, PrincipalLongterm): verify_preauth
+        // admits only that purpose.
         let entry = self
             .proofs
             .take(proof.exchange_id.as_bytes(), caller, now_s)
             .map_err(token_deny)?;
-        if entry.principal != client.principal
-            || proof.client != entry.principal
-            || template.client != entry.principal
-            || proof.authtime != entry.authtime
-        {
+        fields.principal = Some(entry.principal);
+        fields.purpose = Some(KeyPurpose::PrincipalLongterm);
+        if proof.client != entry.principal || proof.authtime != entry.authtime {
             return Err(Deny::denied(AuditReason::TokenPrincipalMismatch));
         }
         // The proof and the armor are one conversation: None↔None,
@@ -678,58 +725,100 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
 
         // dird's resolutions, verified on keyd's clock before any key is
         // touched (docs/59 §7.2 steps 1-3): the client's always; the
-        // server's exactly for the change-password service — a TGT's krbtgt
-        // is bound by its exact stored binding, so a resolution offered for
-        // it is refused, as is the change-password service's missing one
-        // (fail closed; task PN11).
-        let client_resolution = self.verify_name_resolution(resolutions.client, now)?;
-        let server_resolution = match (&issuance, resolutions.server) {
-            (AsIssuance::LocalTgt { .. }, None) => None,
-            (AsIssuance::ChangePasswordService { .. }, Some(attested)) => {
-                Some(self.verify_name_resolution(attested, now)?)
+        // change-password service's for that server — a TGT's krbtgt has
+        // none (it is bound by its exact stored binding). Each names the
+        // key set keyd will reach — the request names it nowhere else (task
+        // PN11b) — so its purpose is checked here, against the capability
+        // table's slot (docs/10 §2 (b)).
+        let client_resolution = self.verify_name_resolution(client, now)?;
+        let client_handle = client_resolution.handle();
+        // From here the record names the key set the verified resolution
+        // names — the issuance's client, as the request's client handle was
+        // before task PN11b.
+        fields.principal = Some(client_handle.principal);
+        fields.purpose = Some(client_handle.purpose);
+        admit_resolved(Operation::IssueAsRep, HandleSlot::Primary, &client_handle)?;
+        // The proof is bound to the client: the key set that
+        // pre-authenticated is the one dird resolved the client's name to
+        // (docs/10 §4 step 1) — two statements keyd made or verified
+        // itself (docs/questions/Q-1080).
+        if client_handle.principal != entry.principal {
+            return Err(Deny::denied(AuditReason::TokenPrincipalMismatch));
+        }
+        let server_set = match server {
+            AsServerKeySet::LocalTgt(krbtgt) => VerifiedAsServer::LocalTgt(krbtgt),
+            AsServerKeySet::ChangePasswordService(attested) => {
+                let resolution = self.verify_name_resolution(attested, now)?;
+                let handle = resolution.handle();
+                // The same classification as a handle in this slot: the
+                // capability table, then the one classification of a server
+                // key set — it must be the change-password service's (Q-915
+                // items 1, 3).
+                admit_resolved(Operation::IssueAsRep, server_slot, &handle)?;
+                if AsServer::of(handle.purpose, armor.is_some())
+                    != Some(AsServer::ChangePasswordService)
+                {
+                    return Err(Deny::denied(AuditReason::PurposeMismatch));
+                }
+                VerifiedAsServer::ChangePasswordService(resolution)
             }
-            _ => return Err(Deny::denied(AuditReason::NameResolutionMismatch)),
         };
 
         // Keys: the client key that pre-authenticated, the server's current
         // key — each only through the proof of its door (crate::store, "The
-        // doors"; Q-040, A-19; R7).
-        let client_set = self
-            .store
-            .get(client)
-            .ok_or(Deny::denied(AuditReason::KeyNotFound))?;
-        fields.kvno = Some(client_set.current_kvno());
-        // The ticket may only name the client as dird resolved it, under the
-        // key set dird resolved it to (docs/59 §7.2 steps 4-5).
-        let client_version = client_set
-            .bound_by(&client_resolution, &template.crealm, &template.cname)?
-            .current();
+        // doors"; Q-040, A-19; R7). The ticket may only name the client as
+        // dird resolved it, under the key set dird resolved it to (docs/59
+        // §7.2 steps 4-5).
+        let client_version = bound_by(
+            &self.store,
+            &client_resolution,
+            &template.crealm,
+            &template.cname,
+        )?
+        .current();
+        fields.kvno = Some(client_version.kvno());
         if client_version.kvno() != entry.reply_kvno {
             return Err(Deny::denied(AuditReason::KvnoMismatch));
         }
         let client_key = client_version
             .key_for(entry.reply_enctype)
             .ok_or(Deny::denied(AuditReason::KeyNotFound))?;
-        let server_set = self
-            .store
-            .get(server)
-            .ok_or(Deny::denied(AuditReason::KeyNotFound))?;
-        fields.secondary = Some(AuditKeyRef {
-            principal: server.principal,
-            purpose: server.purpose,
-            kvno: Some(server_set.current_kvno()),
-        });
         // The server key: for a TGT the krbtgt bound to this realm's TGS
         // name — which step 2 found the template's sname to be, exactly
         // (RFC 4120 7.3; [MS-KILE] 3.3.5.1.2); for the change-password
-        // service the key set its verified resolution names together with
+        // service the key set its verified resolution names, together with
         // the template's sname, `kadmin/changepw` (RFC 3244 §2; docs/59
         // §7.2). keyd's creation rule binds a Krbtgt key set only to a TGS
         // name and a ChangePasswordService key set only to `kadmin/changepw`
         // (template::check_new_binding).
-        let server_keys = match &server_resolution {
-            None => server_set.ticket_granting(realm)?,
-            Some(resolution) => server_set.bound_by(resolution, realm, &template.sname)?,
+        let server_keys = match &server_set {
+            VerifiedAsServer::LocalTgt(krbtgt) => {
+                let set = self
+                    .store
+                    .get(krbtgt)
+                    .ok_or(Deny::denied(AuditReason::KeyNotFound))?;
+                fields.secondary = Some(AuditKeyRef {
+                    principal: krbtgt.principal,
+                    purpose: krbtgt.purpose,
+                    kvno: Some(set.current_kvno()),
+                });
+                set.ticket_granting(realm)?
+            }
+            VerifiedAsServer::ChangePasswordService(resolution) => {
+                let handle = resolution.handle();
+                fields.secondary = Some(AuditKeyRef {
+                    principal: handle.principal,
+                    purpose: handle.purpose,
+                    kvno: None,
+                });
+                let keys = bound_by(&self.store, resolution, realm, &template.sname)?;
+                fields.secondary = Some(AuditKeyRef {
+                    principal: handle.principal,
+                    purpose: handle.purpose,
+                    kvno: Some(keys.current().kvno()),
+                });
+                keys
+            }
         };
         let server_version = server_keys.current();
         let server_key = server_version

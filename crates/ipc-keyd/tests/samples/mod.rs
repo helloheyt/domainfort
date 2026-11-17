@@ -10,8 +10,9 @@
 #![allow(dead_code)] // each test binary uses a different subset
 
 use ipc_keyd::{
-    AccountKind, Answer, AttestationKeyOctets, Call, DecidedOperation, DecisionId, DescribedConfig,
-    DestructionPage, Password, PendingDestruction, SetSecretTarget, TgsFast,
+    AccountKind, Answer, AsServerArgument, AttestationKeyOctets, Call, DecidedOperation,
+    DecisionId, DescribedConfig, DestructionPage, Password, PendingDestruction, SetSecretTarget,
+    TgsFast,
 };
 use keyd_types::{
     ArmorId, AsRepParts, AsTicketTemplate, AttestedNameResolution, AuthnError, AuthnProof,
@@ -193,7 +194,6 @@ pub fn proof() -> AuthnProof {
 
 pub fn as_template(full: bool) -> AsTicketTemplate {
     AsTicketTemplate {
-        client: PrincipalId::from_bytes([0xA1; 16]),
         crealm: realm(),
         cname: name(1, &["alice"]),
         sname: name(2, &["krbtgt", "EXAMPLE.ORG"]),
@@ -237,38 +237,48 @@ pub fn calls() -> Vec<Call> {
             padata: padata(138),
             armor: None,
         },
+        // Task PN11b: the client and the change-password service by their
+        // resolutions only; a TGT's krbtgt by its handle.
         Call::IssueAsRep {
-            client: alice,
-            krbtgt: KRBTGT,
-            proof: proof(),
-            armor: Some(ArmorId::from_bytes([0xAB; 16])),
-            template: as_template(true),
-            client_resolution: Box::new(resolution(
+            client: Box::new(resolution(
                 name(10, &["ALICE"]),
                 name(1, &["alice"]),
                 alice,
                 0x9A,
             )),
-            server_resolution: Some(Box::new(resolution(
+            server: AsServerArgument::ChangePasswordService(Box::new(resolution(
                 name(2, &["kadmin", "changepw"]),
                 name(2, &["kadmin", "changepw"]),
                 handle(0xC7, KeyPurpose::ChangePasswordService),
                 0x9B,
             ))),
+            proof: proof(),
+            armor: Some(ArmorId::from_bytes([0xAB; 16])),
+            template: as_template(true),
         },
         Call::IssueAsRep {
-            client: alice,
-            krbtgt: KRBTGT,
-            proof: proof(),
-            armor: None,
-            template: as_template(false),
-            client_resolution: Box::new(resolution(
+            client: Box::new(resolution(
                 name(1, &["alice"]),
                 name(1, &["alice"]),
                 alice,
                 0x9C,
             )),
-            server_resolution: None,
+            server: AsServerArgument::LocalTgt(KRBTGT),
+            proof: proof(),
+            armor: None,
+            template: as_template(false),
+        },
+        Call::IssueAsRep {
+            client: Box::new(resolution(
+                name(1, &["alice"]),
+                name(1, &["alice"]),
+                alice,
+                0x9F,
+            )),
+            server: AsServerArgument::LocalTgt(KRBTGT),
+            proof: proof(),
+            armor: Some(ArmorId::from_bytes([0xAD; 16])),
+            template: as_template(true),
         },
         Call::OpenFastArmor {
             krbtgt: KRBTGT,
@@ -291,26 +301,24 @@ pub fn calls() -> Vec<Call> {
             fast: None,
         },
         Call::IssueTgsRep {
-            service,
-            ctx: CtxId::from_bytes([0xC1; 16]),
-            template: tgs_template(true),
-            service_resolution: Box::new(resolution(
+            service: Box::new(resolution(
                 name(3, &["host", "files.example.org"]),
                 name(3, &["host", "files.example.org"]),
                 service,
                 0x9D,
             )),
+            ctx: CtxId::from_bytes([0xC1; 16]),
+            template: tgs_template(true),
         },
         Call::IssueTgsRep {
-            service: KRBTGT,
-            ctx: CtxId::from_bytes([0xC2; 16]),
-            template: tgs_template(false),
-            service_resolution: Box::new(resolution(
+            service: Box::new(resolution(
                 name(3, &["HOST", "files.example.org"]),
                 name(3, &["host", "files.example.org"]),
                 service,
                 0x9E,
             )),
+            ctx: CtxId::from_bytes([0xC2; 16]),
+            template: tgs_template(false),
         },
         Call::SealFastError {
             conversation: FastConversation::As(ArmorId::from_bytes([0xAC; 16])),

@@ -25,8 +25,9 @@ use ipc::{
 use ipc_keyd::channel::{reply_kind, request_kind, MAX_ENCTYPES, MAX_REPLY_BODY, MAX_REPLY_FIELD};
 use ipc_keyd::wire::WireConfigDescription;
 use ipc_keyd::{
-    decode_request, encode_answer, Answer, Call, DescribedConfig, IssuanceCall, KeydReply,
-    KeydRequest, Rejection, RoutedCall, StateCall, KEYD_CHANNEL, KEYD_MAGIC, KEYD_VERSION,
+    decode_request, encode_answer, Answer, AsServerArgument, Call, DescribedConfig, IssuanceCall,
+    KeydReply, KeydRequest, Rejection, RoutedCall, StateCall, KEYD_CHANNEL, KEYD_MAGIC,
+    KEYD_VERSION,
 };
 use keyd_types::{EncTypeId, Operation, Role, TicketPolicy};
 use std::collections::BTreeSet;
@@ -1167,7 +1168,7 @@ fn the_attestation_key_never_shows_in_debug() {
     }
 }
 
-// ---- dird's attested name resolutions (task PN11; docs/59 §7.5) -------------
+// ---- dird's attested name resolutions (tasks PN11, PN11b; docs/59 §7.5) -----
 
 /// The `issue_tgs_rep` call of the samples (with its service resolution).
 fn tgs_call() -> Call {
@@ -1177,7 +1178,8 @@ fn tgs_call() -> Call {
         .unwrap()
 }
 
-/// The armored `issue_as_rep` sample (with both resolutions).
+/// The armored `issue_as_rep` sample for the change-password service (both
+/// key sets by their resolutions).
 fn as_call() -> Call {
     samples::calls()
         .into_iter()
@@ -1185,7 +1187,24 @@ fn as_call() -> Call {
             matches!(
                 c,
                 Call::IssueAsRep {
-                    server_resolution: Some(_),
+                    server: AsServerArgument::ChangePasswordService(_),
+                    ..
+                }
+            )
+        })
+        .unwrap()
+}
+
+/// The unarmored `issue_as_rep` sample for a TGT (the krbtgt by its handle).
+fn tgt_call() -> Call {
+    samples::calls()
+        .into_iter()
+        .find(|c| {
+            matches!(
+                c,
+                Call::IssueAsRep {
+                    server: AsServerArgument::LocalTgt(_),
+                    armor: None,
                     ..
                 }
             )
@@ -1195,8 +1214,10 @@ fn as_call() -> Call {
 
 /// docs/59 §7.1, §7.5: the resolutions cross the channel unchanged — every
 /// field and the tag (which this layer carries, never checks: keyd verifies
-/// it, §7.2 step 1); the AS request carries the client's and, when present,
-/// the change-password service's.
+/// it, §7.2 step 1); the AS request carries the client's and, for the
+/// change-password service, the service's in place of its handle (task
+/// PN11b); a TGT's request carries the krbtgt's handle and no server
+/// resolution.
 #[test]
 fn the_resolutions_cross_the_channel_unchanged() {
     for call in [as_call(), tgs_call()] {
@@ -1204,26 +1225,19 @@ fn the_resolutions_cross_the_channel_unchanged() {
         let pairs = match (&call, &decoded) {
             (
                 Call::IssueAsRep {
-                    client_resolution: a,
-                    server_resolution: Some(b),
+                    client: a,
+                    server: AsServerArgument::ChangePasswordService(b),
                     ..
                 },
                 Call::IssueAsRep {
-                    client_resolution: x,
-                    server_resolution: Some(y),
+                    client: x,
+                    server: AsServerArgument::ChangePasswordService(y),
                     ..
                 },
             ) => vec![(a, x), (b, y)],
-            (
-                Call::IssueTgsRep {
-                    service_resolution: a,
-                    ..
-                },
-                Call::IssueTgsRep {
-                    service_resolution: x,
-                    ..
-                },
-            ) => vec![(a, x)],
+            (Call::IssueTgsRep { service: a, .. }, Call::IssueTgsRep { service: x, .. }) => {
+                vec![(a, x)]
+            }
             _ => panic!("the same operation"),
         };
         for (sent, received) in pairs {
@@ -1231,40 +1245,123 @@ fn the_resolutions_cross_the_channel_unchanged() {
             assert_eq!(sent.tag(), received.tag());
         }
     }
+    let Ok(Call::IssueAsRep {
+        server: AsServerArgument::LocalTgt(krbtgt),
+        ..
+    }) = decode_request(&request_body(&tgt_call()))
+    else {
+        panic!("a TGT's request keeps its krbtgt handle");
+    };
+    assert_eq!(krbtgt, samples::KRBTGT);
+}
+
+/// The fields of `payload` as the channel encodes them (no envelope).
+fn payload_octets(payload: &impl ipc::Payload) -> Vec<u8> {
+    let mut writer = ipc::Writer::new(ipc_keyd::REQUEST_LIMIT);
+    payload.write_fields(&mut writer).unwrap();
+    writer.into_payload().to_vec()
 }
 
 /// The octets of `resolution` as the channel encodes it (its fields, no
 /// envelope).
 fn resolution_octets(resolution: &ipc_keyd::wire::WireNameResolution) -> usize {
-    use ipc::Payload;
-    let mut writer = ipc::Writer::new(ipc_keyd::REQUEST_LIMIT);
-    resolution.write_fields(&mut writer).unwrap();
-    writer.into_payload().len()
+    payload_octets(resolution).len()
 }
 
-/// docs/50 §3.3 (strict, bounded, no trailing octet); docs/59 §7.5: a
-/// request in the layout before task PN11 — the same request without the
-/// resolutions after its template — is refused (`Malformed`), never
-/// misread; so is one whose resolution is cut short, or followed by an
-/// extra octet.
+/// A `KeyHandle` in the channel's encoding — `PrincipalId` (16 octets) ‖
+/// purpose `u8` (the closed table of crate ipc-keyd `wire`: 1
+/// PrincipalLongterm … 5 ChangePasswordService) — as the layouts before
+/// task PN11b carried it. Spec: docs/50 §3.3 (keyd types row).
+fn handle_octets(principal: u8, purpose_code: u8) -> Vec<u8> {
+    let mut octets = vec![principal; 16];
+    octets.push(purpose_code);
+    octets
+}
+
+/// docs/50 §3.3 (exact version, strict, bounded, no trailing octet — "a
+/// mismatched pair fails closed"); docs/59 §7.5; task PN11b
+/// (docs/questions/Q-1067): a request in a layout before task PN11b is
+/// refused (`Malformed`), never misread — the PN11 layouts (the client's
+/// and the server's handles before the proof, the template's client
+/// principal, the change-password service's resolution behind an option
+/// marker; the service's handle before the TGS context) and the layouts
+/// before PN11 (the same without the resolutions), each built from this
+/// layout's fields with the samples' handles and with made-up ones of every
+/// purpose code; so is a request of this layout cut short, or followed by
+/// an extra octet. `KEYD_VERSION` stays 1.
 #[test]
-fn a_request_without_its_resolution_is_refused() {
-    for call in [as_call(), tgs_call()] {
-        let body = request_body(&call);
-        let appended = match call.to_wire().unwrap() {
-            KeydRequest::IssueAsRep(wire) => {
-                resolution_octets(&wire.client_resolution)
-                    + 1
-                    + wire
-                        .server_resolution
-                        .as_deref()
-                        .map_or(0, resolution_octets)
-            }
-            KeydRequest::IssueTgsRep(wire) => resolution_octets(&wire.service_resolution),
-            _ => unreachable!(),
+fn a_request_of_an_old_layout_is_refused_not_misread() {
+    let header = |kind: u8| vec![0x4B, 0x44, 0x01, kind];
+    let handles: Vec<(u8, u8)> = [(0xA1, 1), (0x7B, 2), (0x5E, 3), (0x00, 4), (0xFF, 5)]
+        .into_iter()
+        .collect();
+    let mut old_layouts = Vec::new();
+    for call in [as_call(), tgt_call()] {
+        let Ok(KeydRequest::IssueAsRep(wire)) = call.to_wire() else {
+            panic!("the AS request");
         };
-        let old_layout = &body[..body.len() - appended];
-        assert_eq!(refusal_of(old_layout), Some(Refused::Malformed));
+        let server_resolution = match &wire.server {
+            ipc_keyd::wire::WireAsServer::ChangePasswordService(resolution) => {
+                Some(payload_octets(resolution.as_ref()))
+            }
+            ipc_keyd::wire::WireAsServer::LocalTgt(_) => None,
+        };
+        for &(octet, code) in &handles {
+            // client handle ‖ server handle ‖ proof ‖ armor? ‖ client
+            // principal ‖ the template's other fields …
+            let mut pre_pn11 = header(request_kind::ISSUE_AS_REP);
+            pre_pn11.extend(handle_octets(octet, 1));
+            pre_pn11.extend(handle_octets(octet ^ 0x0F, code));
+            pre_pn11.extend(payload_octets(&wire.proof));
+            match &wire.armor {
+                Some(armor) => {
+                    pre_pn11.push(1);
+                    pre_pn11.extend(armor.as_bytes());
+                }
+                None => pre_pn11.push(0),
+            }
+            pre_pn11.extend([octet; 16]);
+            pre_pn11.extend(payload_octets(&wire.template));
+            // … ‖ the client's resolution ‖ option(the server's).
+            let mut pn11 = pre_pn11.clone();
+            pn11.extend(payload_octets(wire.client_resolution.as_ref()));
+            match &server_resolution {
+                Some(octets) => {
+                    pn11.push(1);
+                    pn11.extend(octets);
+                }
+                None => pn11.push(0),
+            }
+            old_layouts.push(pre_pn11);
+            old_layouts.push(pn11);
+        }
+    }
+    let Ok(KeydRequest::IssueTgsRep(wire)) = tgs_call().to_wire() else {
+        panic!("the TGS request");
+    };
+    for &(octet, code) in &handles {
+        // service handle ‖ ctx ‖ template (‖ the service's resolution).
+        let mut pre_pn11 = header(request_kind::ISSUE_TGS_REP);
+        pre_pn11.extend(handle_octets(octet, code));
+        pre_pn11.extend(wire.ctx.as_bytes());
+        pre_pn11.extend(payload_octets(&wire.template));
+        let mut pn11 = pre_pn11.clone();
+        pn11.extend(payload_octets(wire.service_resolution.as_ref()));
+        old_layouts.push(pre_pn11);
+        old_layouts.push(pn11);
+    }
+    assert_eq!(old_layouts.len(), 30);
+    for (index, old) in old_layouts.iter().enumerate() {
+        assert_eq!(
+            refusal_of(old),
+            Some(Refused::Malformed),
+            "old layout {index}"
+        );
+    }
+    // This layout decodes (the control), and a cut or extended one does not.
+    for call in [as_call(), tgt_call(), tgs_call()] {
+        let body = request_body(&call);
+        assert!(decode_request(&body).is_ok());
         for cut in 1..=64 {
             let short = &body[..body.len() - cut];
             assert_eq!(refusal_of(short), Some(Refused::Malformed), "cut {cut}");
@@ -1275,6 +1372,34 @@ fn a_request_without_its_resolution_is_refused() {
     }
 }
 
+/// Task PN11b (docs/50 §3.3: enum = `u8` from a closed table): the server
+/// of `issue_as_rep` is one closed choice — code 1 the krbtgt's handle,
+/// code 2 the change-password service's resolution; another code is
+/// refused (`Malformed`), and so is a code followed by the other variant's
+/// field (a handle where a resolution belongs, or the reverse), so a server
+/// named both ways, or by neither, has no encoding.
+#[test]
+fn the_as_server_is_one_closed_choice() {
+    for call in [as_call(), tgt_call()] {
+        let body = request_body(&call);
+        let Ok(KeydRequest::IssueAsRep(wire)) = call.to_wire() else {
+            panic!("the AS request");
+        };
+        let server = payload_octets(&wire.server);
+        let start = body.len() - server.len();
+        assert_eq!(&body[start..], server.as_slice());
+        for code in [0u8, 3, 0x80, 0xFF] {
+            let mut other = body.clone();
+            other[start] = code;
+            assert_eq!(refusal_of(&other), Some(Refused::Malformed), "code {code}");
+        }
+        // The other variant's code before this variant's field.
+        let mut swapped = body.clone();
+        swapped[start] = if body[start] == 1 { 2 } else { 1 };
+        assert_eq!(refusal_of(&swapped), Some(Refused::Malformed));
+    }
+}
+
 /// docs/59 §7.1 (the bounds: 1..=16 components, each and every realm at
 /// most 1024 octets): a resolution outside them is refused by the typed
 /// layer (`ConversionError::NameResolution` ⇒ `Malformed`) — here a
@@ -1282,8 +1407,9 @@ fn a_request_without_its_resolution_is_refused() {
 /// outside the component bound; 17 components krb-proto itself never
 /// encodes or decodes); and the wire bounds are exactly the
 /// largest resolution keyd-types admits (a realm of 1025 octets is refused
-/// at the codec; the largest name and realm fit, and two of the largest
-/// resolutions fit in one request body).
+/// at the codec; the largest name and realm fit, and the largest request —
+/// an armored change-password AS whose two resolutions are the largest,
+/// task PN11b's layout — fits in one request body: docs/questions/Q-1081).
 #[test]
 fn the_resolution_bounds_are_the_resolutions() {
     use ipc_keyd::channel::{
@@ -1294,6 +1420,7 @@ fn the_resolution_bounds_are_the_resolutions() {
     assert_eq!(MAX_RESOLUTION_NAME, 16_468);
     assert_eq!(LARGEST_RESOLUTION, 35_064);
     assert_eq!(MAX_KDC_PART_BODY, 80 * 1024);
+    assert_eq!(MAX_REQUEST_BODY, 149 * 1024);
     assert!(MAX_KDC_PART_BODY as usize + 2 * LARGEST_RESOLUTION < MAX_REQUEST_BODY as usize);
 
     let Ok(KeydRequest::IssueTgsRep(mut wire)) = tgs_call().to_wire() else {
@@ -1348,9 +1475,21 @@ fn the_resolution_bounds_are_the_resolutions() {
     })
     .unwrap();
     let largest = keyd_types::AttestedNameResolution::new(resolution, [0xEE; 32]);
+    let Ok(KeydRequest::IssueTgsRep(wire)) = tgs_call().to_wire() else {
+        panic!("the TGS request");
+    };
+    let Ok(KeydRequest::IssueTgsRep(big)) = (Call::IssueTgsRep {
+        service: Box::new(largest.clone()),
+        ctx: wire.ctx,
+        template: samples::tgs_template(true),
+    })
+    .to_wire() else {
+        panic!("the TGS request");
+    };
+    // Within the bound (which allows each DER header its longest form, and
+    // the longest name-type: an upper bound, not this name's exact size).
+    assert!(resolution_octets(&big.service_resolution) <= LARGEST_RESOLUTION);
     let Call::IssueAsRep {
-        client,
-        krbtgt,
         proof,
         armor,
         template,
@@ -1360,20 +1499,22 @@ fn the_resolution_bounds_are_the_resolutions() {
         panic!("the AS call");
     };
     let call = Call::IssueAsRep {
-        client,
-        krbtgt,
+        client: Box::new(largest.clone()),
+        server: AsServerArgument::ChangePasswordService(Box::new(largest.clone())),
         proof,
         armor,
         template,
-        client_resolution: Box::new(largest.clone()),
-        server_resolution: Some(Box::new(largest.clone())),
     };
     let body = request_body(&call);
+    assert!(body.len() <= MAX_REQUEST_BODY as usize);
     let Ok(Call::IssueAsRep {
-        client_resolution, ..
+        client,
+        server: AsServerArgument::ChangePasswordService(server),
+        ..
     }) = decode_request(&body)
     else {
         panic!("decodes");
     };
-    assert_eq!(client_resolution.resolution(), largest.resolution());
+    assert_eq!(client.resolution(), largest.resolution());
+    assert_eq!(server.resolution(), largest.resolution());
 }

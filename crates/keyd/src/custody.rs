@@ -24,7 +24,7 @@ use crate::model::KeyHandle;
 use crate::store::KeyStore;
 use crate::tokens::{ArmorId, CtxId};
 use keyd_types::{
-    AsRepParts, AsResolutions, AsTicketTemplate, AttestedNameResolution, AuthnProof, FastArmor,
+    AsRepParts, AsServerKeySet, AsTicketTemplate, AttestedNameResolution, AuthnProof, FastArmor,
     FastConversation, KeyCustody, TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext,
 };
 use krb_proto::{ApReq, EncryptedData, KerberosTime, KrbError, KrbFastArmoredReq, PaData};
@@ -87,24 +87,15 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> KeyCustody for LocalKeyd<S, A,
 
     fn issue_as_rep(
         &mut self,
-        client: &KeyHandle,
-        server: &KeyHandle,
+        client: &AttestedNameResolution,
+        server: AsServerKeySet<'_>,
         proof: &AuthnProof,
         armor: Option<ArmorId>,
         template: &AsTicketTemplate,
-        resolutions: AsResolutions<'_>,
         now: &KerberosTime,
     ) -> Result<AsRepParts, IssueError> {
-        self.keyd.issue_as_rep(
-            &self.caller,
-            client,
-            server,
-            proof,
-            armor,
-            template,
-            resolutions,
-            now,
-        )
+        self.keyd
+            .issue_as_rep(&self.caller, client, server, proof, armor, template, now)
     }
 
     fn open_fast_armor(
@@ -132,20 +123,13 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> KeyCustody for LocalKeyd<S, A,
 
     fn issue_tgs_rep(
         &mut self,
-        service: &KeyHandle,
-        service_resolution: &AttestedNameResolution,
+        service: &AttestedNameResolution,
         ctx: &CtxId,
         template: &TgsTicketTemplate,
         now: &KerberosTime,
     ) -> Result<TgsRepParts, IssueError> {
-        self.keyd.issue_tgs_rep(
-            &self.caller,
-            service,
-            service_resolution,
-            ctx,
-            template,
-            now,
-        )
+        self.keyd
+            .issue_tgs_rep(&self.caller, service, ctx, template, now)
     }
 
     fn seal_fast_error(

@@ -8,6 +8,16 @@
 //! Every refusal is the uniform `Denied` with one audit record naming the
 //! reason; the issuance that follows a valid resolution is unchanged.
 //!
+//! Since task PN11b (docs/questions/Q-1067, Q-1080) the request names a
+//! resolved key set only through its resolution: keyd looks the set up by
+//! the resolution it verified, checks the purpose it names against the
+//! capability table's slot (`PurposeMismatch`), finds no set for a key set
+//! it does not hold (`KeyNotFound`), and requires the proof of
+//! `verify_preauth` to be bound to the resolved client
+//! (`TokenPrincipalMismatch`). A handle beside a resolution — and so a
+//! disagreement between the two — has no representation; the tests that
+//! presented one now present the nearest state that still exists.
+//!
 //! Sources: docs/59 §7.1 (the fields), §7.2 steps 1-5 (the checks and their
 //! order; "the krbtgt check stays against the stored binding, exact"), §9
 //! (S4: a true, fresh resolution replayed within its window — a residual;
@@ -15,7 +25,9 @@
 //! attacks: a wrong tag, a stale resolution, another principal, another
 //! purpose, a name not in the resolution); docs/questions/Q-1011 items 3, 4,
 //! 7 (A-173: W = 30 s on keyd's clock; no client resolution at TGS), Q-1034
-//! (A-177: the binding compare kept through PN11); RFC 4120 §3.1.5 (the
+//! (A-177: the binding compare kept through PN11), Q-1067, Q-1080 (task
+//! PN11b); docs/10 §2 (b), §4 step 1 (the proof bound to the client); RFC
+//! 4120 §3.1.5 (the
 //! client checks that the reply's cname / crealm are what it requested),
 //! §6.2 (the name-type is not significant), §7.3 (the TGS name); [MS-KILE]
 //! v20261110 3.3.5.1.2 (the KDC returns krbtgt/FQDN for a TGT). Every value
@@ -25,7 +37,7 @@ mod common;
 
 use common::*;
 use keyd::{
-    AsResolutions, AttestedNameResolution, AuditReason, AuthnProof, IssueError, KeyPurpose,
+    AsServerKeySet, AttestedNameResolution, AuditReason, AuthnProof, IssueError, KeyPurpose,
     TgtContext,
 };
 use keyd_types::NameResolutionFields;
@@ -69,15 +81,11 @@ fn issue_alice_tgt(
     let proof = alice_proof(f, when);
     f.keyd.issue_as_rep(
         &KDC,
-        &ALICE,
-        &KRBTGT,
+        client,
+        AsServerKeySet::LocalTgt(&KRBTGT),
         &proof,
         None,
         &as_template(),
-        AsResolutions {
-            client,
-            server: None,
-        },
         when,
     )
 }
@@ -122,14 +130,8 @@ fn issue_service(
     nonce: u32,
 ) -> Result<keyd::TgsRepParts, IssueError> {
     let ctx = context_for(f, tgt, service_name(), nonce);
-    f.keyd.issue_tgs_rep(
-        &KDC,
-        &SERVICE,
-        resolution,
-        &ctx.ctx_id,
-        &tgs_template(nonce),
-        &now(),
-    )
+    f.keyd
+        .issue_tgs_rep(&KDC, resolution, &ctx.ctx_id, &tgs_template(nonce), &now())
 }
 
 /// docs/59 §7.2 (a valid resolution issues; R47-1's behaviour unchanged):
@@ -234,10 +236,14 @@ fn a_stale_or_future_resolution_is_refused() {
     assert_eq!(last_reason(&f), AuditReason::NameResolutionStale);
 }
 
-/// docs/59 §7.2 step 4, §10.1 ("`principal` of another object ⇒ Denied"):
-/// bob's genuine resolution presented with alice's key set and proof, and
-/// another service's presented with this service's key set, are refused
-/// (`NameResolutionMismatch`): a resolution opens only the key set it names.
+/// docs/59 §7.2 step 4, §10.1 ("`principal` of another object ⇒ Denied");
+/// docs/10 §4 step 1 (the proof bound to the client): bob's genuine
+/// resolution presented with alice's proof names bob's key set, not the one
+/// that pre-authenticated (`TokenPrincipalMismatch` — task PN11b: the
+/// client key set is the resolution's, so the proof is what it is checked
+/// against); another service's resolution presented for this service's
+/// request is refused (`NameResolutionMismatch`): a resolution opens only
+/// the key set it names, for a name it holds.
 #[test]
 fn a_resolution_of_another_principal_is_refused() {
     let mut f = Fixture::new();
@@ -246,7 +252,7 @@ fn a_resolution_of_another_principal_is_refused() {
         issue_alice_tgt(&mut f, &bob, &now()),
         Err(IssueError::Denied)
     );
-    assert_eq!(last_reason(&f), AuditReason::NameResolutionMismatch);
+    assert_eq!(last_reason(&f), AuditReason::TokenPrincipalMismatch);
 
     add_ldap_service(&mut f);
     let tgt = obtain_tgt(&mut f, now(), &as_template());
@@ -258,10 +264,13 @@ fn a_resolution_of_another_principal_is_refused() {
     assert_eq!(last_reason(&f), AuditReason::NameResolutionMismatch);
 }
 
-/// docs/59 §7.2 step 4, §10.1 ("purpose other ⇒ Denied"): a resolution of
-/// the right principal with another key purpose is refused — at AS (alice's
-/// principal as a Service key set) and at TGS (the service's principal as
-/// its AdminService or PrincipalLongterm key set).
+/// docs/59 §7.2 step 4, §10.1 ("purpose other ⇒ Denied"); docs/10 §2 (b):
+/// a resolution of the right principal with another key purpose is refused
+/// — the purpose it names is the key set keyd would reach (task PN11b), so
+/// the capability table's slot judges it: at AS alice's principal as a
+/// Service key set (`PurposeMismatch`), at TGS the service's principal as
+/// its PrincipalLongterm key set (`PurposeMismatch`) or as an AdminService
+/// key set — a service purpose, but no such set is held (`KeyNotFound`).
 #[test]
 fn a_resolution_of_another_purpose_is_refused() {
     let mut f = Fixture::new();
@@ -272,12 +281,16 @@ fn a_resolution_of_another_purpose_is_refused() {
         issue_alice_tgt(&mut f, &resolution, &now()),
         Err(IssueError::Denied)
     );
-    assert_eq!(last_reason(&f), AuditReason::NameResolutionMismatch);
+    assert_eq!(last_reason(&f), AuditReason::PurposeMismatch);
 
     let tgt = obtain_tgt(&mut f, now(), &as_template());
-    for (nonce, purpose) in [
-        (73, KeyPurpose::AdminService),
-        (74, KeyPurpose::PrincipalLongterm),
+    for (nonce, purpose, reason) in [
+        (73, KeyPurpose::AdminService, AuditReason::KeyNotFound),
+        (
+            74,
+            KeyPurpose::PrincipalLongterm,
+            AuditReason::PurposeMismatch,
+        ),
     ] {
         let mut fields = service_fields();
         fields.key_purpose = purpose;
@@ -287,42 +300,41 @@ fn a_resolution_of_another_purpose_is_refused() {
             Err(IssueError::Denied),
             "{purpose:?}"
         );
-        assert_eq!(last_reason(&f), AuditReason::NameResolutionMismatch);
+        assert_eq!(last_reason(&f), reason, "{purpose:?}");
     }
 }
 
 /// docs/59 §7.2 step 5, §10.1 ("a name in the template that is not in the
 /// resolution ⇒ Denied"); docs/59 §9 S4: a KDC that replays alice's true,
-/// fresh resolution for bob's request (bob's key set, bob's proof, a
-/// template naming bob) is refused, and so is the service's resolution
-/// replayed for a request for another service — the resolution must name
-/// the key set used **and** the name written.
+/// fresh resolution for bob's request (bob's proof, a template naming bob)
+/// is refused — the resolved client is alice, not the key set bob's proof
+/// is bound to (`TokenPrincipalMismatch`, task PN11b); alice's resolution
+/// and proof with a template naming bob are refused by the door
+/// (`NameResolutionMismatch`); and the service's resolution replayed for a
+/// request for another service is refused too — the resolution names the
+/// key set used (the only name of it the request has) **and** must hold
+/// the name written.
 #[test]
 fn a_resolution_replayed_for_another_request_is_refused() {
     let mut f = Fixture::new();
     let alice = resolution_at(&alice_name(), &ALICE, &now());
     let proof = bob_proof(&mut f);
     let mut bob_template = as_template();
-    bob_template.client = BOB_ID;
     bob_template.cname = bob_name();
     assert_eq!(
         f.keyd.issue_as_rep(
             &KDC,
-            &BOB,
-            &KRBTGT,
+            &alice,
+            AsServerKeySet::LocalTgt(&KRBTGT),
             &proof,
             None,
             &bob_template,
-            AsResolutions {
-                client: &alice,
-                server: None
-            },
             &now(),
         ),
         Err(IssueError::Denied)
     );
-    assert_eq!(last_reason(&f), AuditReason::NameResolutionMismatch);
-    // alice's resolution with alice's key set, but the template naming bob
+    assert_eq!(last_reason(&f), AuditReason::TokenPrincipalMismatch);
+    // alice's resolution with alice's proof, but the template naming bob
     // (the KDC choosing the name): refused too.
     let proof = alice_proof(&mut f, &now());
     let mut t = as_template();
@@ -330,15 +342,11 @@ fn a_resolution_replayed_for_another_request_is_refused() {
     assert_eq!(
         f.keyd.issue_as_rep(
             &KDC,
-            &ALICE,
-            &KRBTGT,
+            &alice,
+            AsServerKeySet::LocalTgt(&KRBTGT),
             &proof,
             None,
             &t,
-            AsResolutions {
-                client: &alice,
-                server: None
-            },
             &now(),
         ),
         Err(IssueError::Denied)
@@ -346,7 +354,7 @@ fn a_resolution_replayed_for_another_request_is_refused() {
     assert_eq!(last_reason(&f), AuditReason::NameResolutionMismatch);
 
     // The service's resolution replayed for a request for the LDAP service
-    // under the LDAP key set.
+    // (the KDC can no longer name the LDAP key set beside it).
     add_ldap_service(&mut f);
     let tgt = obtain_tgt(&mut f, now(), &as_template());
     let service = resolution_at(&service_name(), &SERVICE, &now());
@@ -354,17 +362,64 @@ fn a_resolution_replayed_for_another_request_is_refused() {
     let mut template = tgs_template(75);
     template.sname = ldap_service_name();
     assert_eq!(
-        f.keyd.issue_tgs_rep(
-            &KDC,
-            &LDAP_SERVICE,
-            &service,
-            &ctx.ctx_id,
-            &template,
-            &now()
-        ),
+        f.keyd
+            .issue_tgs_rep(&KDC, &service, &ctx.ctx_id, &template, &now()),
         Err(IssueError::Denied)
     );
     assert_eq!(last_reason(&f), AuditReason::NameResolutionMismatch);
+}
+
+/// Task PN11b (docs/questions/Q-1067 open point 1, Q-1080; docs/10 §4 step
+/// 1: the proof is valid and bound to the client): the client key set of an
+/// issuance is the one dird's verified resolution names, and the proof —
+/// keyd's own record of the key set that pre-authenticated — must be bound
+/// to it. bob's genuine resolution with alice's proof and a template naming
+/// bob is refused (`TokenPrincipalMismatch`), and the proof is consumed
+/// (I4: a second try with alice's own resolution finds no proof); the
+/// record names the key set the verified resolution names — the
+/// issuance's client — never a field keyd did not verify. With alice's
+/// proof and her own resolution the reply opens under her key — the key
+/// set the resolution names.
+#[test]
+fn the_proof_is_checked_against_the_resolved_client() {
+    let mut f = Fixture::new();
+    let bob = resolution_at(&bob_name(), &BOB, &now());
+    let alice = resolution_at(&alice_name(), &ALICE, &now());
+    let proof = alice_proof(&mut f, &now());
+    let mut t = as_template();
+    t.cname = bob_name();
+    assert_eq!(
+        f.keyd.issue_as_rep(
+            &KDC,
+            &bob,
+            AsServerKeySet::LocalTgt(&KRBTGT),
+            &proof,
+            None,
+            &t,
+            &now(),
+        ),
+        Err(IssueError::Denied)
+    );
+    let record = f.records().last().unwrap();
+    assert_eq!(record.reason, AuditReason::TokenPrincipalMismatch);
+    assert_eq!(record.principal, Some(BOB_ID));
+    assert_eq!(record.purpose, Some(KeyPurpose::PrincipalLongterm));
+    assert_eq!(
+        f.keyd.issue_as_rep(
+            &KDC,
+            &alice,
+            AsServerKeySet::LocalTgt(&KRBTGT),
+            &proof,
+            None,
+            &as_template(),
+            &now(),
+        ),
+        Err(IssueError::Denied)
+    );
+    assert_eq!(last_reason(&f), AuditReason::TokenUnknown);
+    let parts = issue_alice_tgt(&mut f, &alice, &now()).unwrap();
+    let rep = EncAsRepPart::decode(&open(&alice_key(), 3, &parts.enc_part)).unwrap();
+    assert_eq!(rep.0.sname, krbtgt_name());
 }
 
 /// docs/59 §7.2 step 5 (the ticket's names ∈ {as sent, canonical}, exactly
@@ -402,15 +457,11 @@ fn the_ticket_carries_a_name_the_resolution_holds_and_no_other() {
         t.cname = cname.clone();
         let result = f.keyd.issue_as_rep(
             &KDC,
-            &ALICE,
-            &KRBTGT,
+            &resolution,
+            AsServerKeySet::LocalTgt(&KRBTGT),
             &proof,
             None,
             &t,
-            AsResolutions {
-                client: &resolution,
-                server: None,
-            },
             &now(),
         );
         if accepted {
@@ -440,40 +491,40 @@ fn without_the_attestation_key_nothing_is_issued() {
 }
 
 /// docs/59 §7.2 ("the krbtgt check stays against the stored binding, exact
-/// — without resolution"); RFC 4120 §7.3; [MS-KILE] 3.3.5.1.2: a TGT takes
-/// no server resolution — one offered is refused (`NameResolutionMismatch`),
-/// even dird's genuine statement of the krbtgt's own handle and name.
+/// — without resolution"); RFC 4120 §7.3; [MS-KILE] 3.3.5.1.2: a TGT names
+/// its krbtgt by its handle only (`AsServerKeySet::LocalTgt` — since task
+/// PN11b a TGT with a server resolution has no value at all), and dird's
+/// genuine statement of the krbtgt's own key set and name opens nothing:
+/// offered as the client's resolution it is refused by the capability
+/// table's slot (`PurposeMismatch`), and the door refuses any krbtgt set
+/// (crate keyd unit test `no_resolution_opens_a_krbtgt_key_set`).
 #[test]
 fn the_krbtgt_is_never_bound_by_a_resolution() {
     let mut f = Fixture::new();
-    let alice = resolution_at(&alice_name(), &ALICE, &now());
     let krbtgt = resolution_at(&krbtgt_name(), &KRBTGT, &now());
     let proof = alice_proof(&mut f, &now());
     assert_eq!(
         f.keyd.issue_as_rep(
             &KDC,
-            &ALICE,
-            &KRBTGT,
+            &krbtgt,
+            AsServerKeySet::LocalTgt(&KRBTGT),
             &proof,
             None,
             &as_template(),
-            AsResolutions {
-                client: &alice,
-                server: Some(&krbtgt)
-            },
             &now(),
         ),
         Err(IssueError::Denied)
     );
-    assert_eq!(last_reason(&f), AuditReason::NameResolutionMismatch);
+    assert_eq!(last_reason(&f), AuditReason::PurposeMismatch);
 }
 
 /// docs/59 §9 S5 (a compromised dird signs a false resolution) and
 /// Q-1034 (A-177: `bound_by` also compares the canonical name with the key
 /// set's stored binding, through PN11): a tagged resolution stating that
-/// `alice` is bob's key set — presented with bob's key set, bob's proof and
-/// a template naming alice — is refused, because bob's key set is not bound
-/// to `alice`. The binding compare narrows what a false statement can map.
+/// `alice` is bob's key set — presented with bob's proof and a template
+/// naming alice, so keyd looks up bob's key set (task PN11b) — is refused,
+/// because bob's key set is not bound to `alice`. The binding compare
+/// narrows what a false statement can map.
 #[test]
 fn a_resolution_mapping_a_name_to_a_key_set_not_bound_to_it_is_refused() {
     let mut f = Fixture::new();
@@ -481,20 +532,14 @@ fn a_resolution_mapping_a_name_to_a_key_set_not_bound_to_it_is_refused() {
     fields.principal = BOB_ID;
     let lie = signed(fields, &ATTESTATION_KEY);
     let proof = bob_proof(&mut f);
-    let mut t = as_template();
-    t.client = BOB_ID;
     assert_eq!(
         f.keyd.issue_as_rep(
             &KDC,
-            &BOB,
-            &KRBTGT,
+            &lie,
+            AsServerKeySet::LocalTgt(&KRBTGT),
             &proof,
             None,
-            &t,
-            AsResolutions {
-                client: &lie,
-                server: None
-            },
+            &as_template(),
             &now(),
         ),
         Err(IssueError::Denied)
@@ -521,8 +566,10 @@ fn residual_a_true_resolution_replayed_within_its_window_issues_again() {
 }
 
 /// docs/10 §12 I8 (one record per operation), AGENTS.md §6: a refused
-/// issuance leaves exactly one record, naming the operation's key set and
-/// the reason, and nothing of the resolution's tag.
+/// issuance leaves exactly one record, naming the operation's key set — for
+/// a resolution that does not verify, the proof's, keyd's own record (task
+/// PN11b: never a field of a resolution keyd did not verify) — and the
+/// reason, and nothing of the resolution's tag.
 #[test]
 fn a_refusal_is_one_record_without_the_tag() {
     let mut f = Fixture::new();
@@ -531,15 +578,11 @@ fn a_refusal_is_one_record_without_the_tag() {
     let before = f.records().len();
     let _ = f.keyd.issue_as_rep(
         &KDC,
-        &ALICE,
-        &KRBTGT,
+        &forged,
+        AsServerKeySet::LocalTgt(&KRBTGT),
         &proof,
         None,
         &as_template(),
-        AsResolutions {
-            client: &forged,
-            server: None,
-        },
         &now(),
     );
     assert_eq!(f.records().len(), before + 1);

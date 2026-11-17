@@ -110,7 +110,10 @@ fn the_tgt_carries_the_clients_resolution_and_no_other() {
 /// — there is no second statement left to disagree with — and keyd, which
 /// binds bob's key set to bob's name only (`bound_by`), refuses the
 /// issuance even to a client that proves bob's key: no ticket names alice
-/// under bob's key (`NameResolutionMismatch`).
+/// under bob's key (`NameResolutionMismatch`). Since task PN11b the KDC
+/// names that key set to `issue_as_rep` only by the resolution — keyd
+/// looks it up there (docs/questions/Q-1067); the handle the KDC derives
+/// goes only to `verify_preauth` (docs/questions/Q-1080).
 #[test]
 fn the_key_set_the_kdc_asks_for_is_the_one_the_resolution_names() {
     let mut f = Fixture::new();

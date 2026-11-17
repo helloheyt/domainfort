@@ -18,12 +18,18 @@
 //! Task PN11 adds the inventory of the four doors to a key set's keys
 //! (crate store, "The doors"): which file uses `bound_by`,
 //! `ticket_granting`, `accepting` and `bound_to`, so "`bound_to` leaves the
-//! issuance path" (docs/59 §10, the PN11 row) stays true.
+//! issuance path" (docs/59 §10, the PN11 row) stays true. Task PN11b made
+//! `bound_by` a function of the store module that looks the key set up by
+//! the verified resolution (no set or handle is handed to it —
+//! docs/questions/Q-1067), so the scan counts every call form of a door —
+//! a method call, a path call (`store::bound_by(`, `StoredKeySet::bound_to(`)
+//! or a plain call — not only `.door(`: it is stricter than before, never
+//! looser.
 //!
 //! Source: docs/52 §3.5 ("operations in which the name is not an input …
 //! receive a separate, declared accessor, so that every access is marked"),
 //! §7 R7; docs/questions/Q-040 (A-19), Q-521; docs/59 §7.2; docs/questions/
-//! Q-1011 items 4, 6 (A-173).
+//! Q-1011 items 4, 6 (A-173), Q-1067 (task PN11b).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -98,7 +104,8 @@ fn unbound_key_uses_are_exactly_the_declared_ones() {
 /// The doors to a stored key set's keys and the files that use each (task
 /// PN11; crate store, "The doors"): (source file, door, call sites).
 /// Issuance reaches a client or service key only through `bound_by` (dird's
-/// verified name resolution), the krbtgt only through `ticket_granting`
+/// verified name resolution — the door looks the key set up by it, task
+/// PN11b), the krbtgt only through `ticket_granting`
 /// (its exact TGS name), the acceptor only through `accepting` (the
 /// namespace key); `bound_to` — a compare of a caller-supplied name — is
 /// left only to `set_secret` on an existing set, never to an issuance.
@@ -122,9 +129,26 @@ const DOORS: &[(&str, &str, usize)] = &[
 /// The doors scanned for.
 const DOOR_NAMES: [&str; 4] = ["bound_by", "ticket_granting", "accepting", "bound_to"];
 
-/// The call sites of each door (`.<door>(`) in the product source of `src/`
-/// outside the store module: comment lines skipped, and each file read up
-/// to its `#[cfg(test)] mod tests` (unit tests may call any door).
+/// How many times `door` is called on `code`: each `<door>(` not preceded
+/// by an identifier character — so `.door(`, `path::door(` and `door(` all
+/// count (task PN11b: `bound_by` is a function of the store module), and
+/// another identifier that merely ends with the door's name does not.
+fn door_calls(code: &str, door: &str) -> usize {
+    let call = format!("{door}(");
+    code.match_indices(&call)
+        .filter(|(at, _)| {
+            !code[..*at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+        .count()
+}
+
+/// The call sites of each door (every call form — [`door_calls`]) in the
+/// product source of `src/` outside the store module: comment lines
+/// skipped, and each file read up to its `#[cfg(test)] mod tests` (unit
+/// tests may call any door).
 fn door_call_sites() -> BTreeMap<(String, String), usize> {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut sites = BTreeMap::new();
@@ -145,7 +169,7 @@ fn door_call_sites() -> BTreeMap<(String, String), usize> {
                 continue;
             }
             for door in DOOR_NAMES {
-                let count = code.matches(&format!(".{door}(")).count();
+                let count = door_calls(code, door);
                 if count > 0 {
                     *sites.entry((file.clone(), door.to_owned())).or_insert(0) += count;
                 }
@@ -158,9 +182,23 @@ fn door_call_sites() -> BTreeMap<(String, String), usize> {
 /// Task PN11 (docs/59 §7.2, §10 the PN11 row: "`bound_to` leaves the
 /// issuance path"; docs/questions/Q-1011 items 4, 6): the doors are used
 /// exactly where listed — positive control: the scan finds every listed
-/// site, so it cannot pass vacuously.
+/// site, so it cannot pass vacuously; and the scan sees every call form
+/// (task PN11b — [`door_calls`] on a method, a path and a plain call, and
+/// not on an identifier that only ends with a door's name).
 #[test]
 fn keys_are_reached_only_through_the_listed_doors() {
+    assert_eq!(door_calls("set.bound_to(realm, name)", "bound_to"), 1);
+    assert_eq!(
+        door_calls("StoredKeySet::bound_to(&set, r, n)", "bound_to"),
+        1
+    );
+    assert_eq!(
+        door_calls("bound_by(&self.store, &r, a, b)?", "bound_by"),
+        1
+    );
+    assert_eq!(door_calls("store::bound_by(s, r, a, b)", "bound_by"), 1);
+    assert_eq!(door_calls("not_bound_by(x) + unbound_to(y)", "bound_by"), 0);
+    assert_eq!(door_calls("unbound_to(y)", "bound_to"), 0);
     let found = door_call_sites();
     let listed: BTreeMap<(String, String), usize> = DOORS
         .iter()

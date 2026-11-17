@@ -14,11 +14,15 @@
 //! honest dird: `issue_as` / `issue_tgs` call keyd's issuance with the
 //! resolutions of exactly the names the template carries, so the tests of
 //! the other rules keep their meaning; the resolution's own rules are
-//! tested in tests/issuance_by_resolution.rs.
+//! tested in tests/issuance_by_resolution.rs. Since task PN11b the
+//! issuance names a resolved key set only through its resolution: the
+//! handle a test hands `issue_as` / `issue_tgs` is the key set the honest
+//! dird resolves the name to, and it reaches keyd only inside that
+//! resolution (the krbtgt of a TGT keeps its handle — it has none).
 #![allow(dead_code)] // each test binary uses a different subset
 
 use keyd::{
-    AccountKind, AsRepParts, AsResolutions, AsTicketTemplate, AttestationKey,
+    AccountKind, AsRepParts, AsServerKeySet, AsTicketTemplate, AttestationKey,
     AttestedNameResolution, AuditRecord, AuditSink, CallerId, DecidedOperation, DecisionId,
     EntropyError, EntropySource, InMemoryKeyStore, IssueError, KeyHandle, KeyPurpose, KeyStore,
     Keyd, KeydConfig, PrincipalBinding, PrincipalId, Role, SetSecretTarget, TgsRepParts,
@@ -269,14 +273,17 @@ pub fn resolution_at(
 }
 
 /// keyd's issuance with the resolutions an honest dird sends: of exactly
-/// the (realm, name) the template carries, to exactly the key set the call
+/// the (realm, name) the template carries, to exactly the key set the test
 /// names, issued at keyd's `now` (module documentation). The arguments are
-/// those of `issue_as_rep` / `issue_tgs_rep` without the resolutions.
-/// Spec: docs/59 §7.1, §7.2, §7.5.
+/// the handles of the key sets the names resolve to — keyd sees each only
+/// inside its resolution (task PN11b) — and the rest of `issue_as_rep` /
+/// `issue_tgs_rep`.
+/// Spec: docs/59 §7.1, §7.2, §7.5; docs/questions/Q-1067.
 pub trait Resolved {
     /// `issue_as_rep` with the client's resolution of (crealm, cname) to
     /// `client` and — for a change-password server — the server's of its
-    /// sname to `server`.
+    /// sname to `server` in place of the handle; any other `server` goes as
+    /// a TGT's krbtgt handle (`AsServerKeySet::LocalTgt`).
     #[allow(clippy::too_many_arguments)]
     fn issue_as(
         &mut self,
@@ -318,17 +325,17 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Resolved for Keyd<S, A, E> {
         );
         let server_resolution = (server.purpose == KeyPurpose::ChangePasswordService)
             .then(|| resolution_at(&template.sname, server, now));
+        let server = match &server_resolution {
+            Some(resolution) => AsServerKeySet::ChangePasswordService(resolution),
+            None => AsServerKeySet::LocalTgt(server),
+        };
         self.issue_as_rep(
             caller,
-            client,
+            &client_resolution,
             server,
             proof,
             armor,
             template,
-            AsResolutions {
-                client: &client_resolution,
-                server: server_resolution.as_ref(),
-            },
             now,
         )
     }
@@ -342,7 +349,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Resolved for Keyd<S, A, E> {
         now: &KerberosTime,
     ) -> Result<TgsRepParts, IssueError> {
         let resolution = resolution_at(&template.sname, service, now);
-        self.issue_tgs_rep(caller, service, &resolution, ctx, template, now)
+        self.issue_tgs_rep(caller, &resolution, ctx, template, now)
     }
 }
 
@@ -708,7 +715,6 @@ pub fn pa_enc_timestamp(key: &ProtocolKey, kvno: Option<u32>, ts: KerberosTime) 
 /// A valid AS template: an 8-hour TGT for alice.
 pub fn as_template() -> AsTicketTemplate {
     AsTicketTemplate {
-        client: ALICE_ID,
         crealm: realm(),
         cname: alice_name(),
         sname: krbtgt_name(),
@@ -1044,7 +1050,6 @@ pub fn obtain_computer_tgt(f: &mut Fixture, when: KerberosTime, endtime: Kerbero
         )
         .unwrap();
     let template = AsTicketTemplate {
-        client: WS01_ID,
         crealm: realm(),
         cname: ws01_name(),
         sname: krbtgt_name(),

@@ -185,9 +185,11 @@ impl ClientAccount {
     /// `PrincipalLongterm`, docs/10 §4): the key set dird's resolution
     /// names. The record states it only there — there is no second
     /// statement for it to disagree with (task PN10c; class "one record
-    /// states one fact twice", Q-1060 item 1 (e)). keyd still compares the
-    /// resolution with the key set's own handle (`bound_by`, docs/59 §7.2
-    /// step 4).
+    /// states one fact twice", Q-1060 item 1 (e)). The KDC hands it to keyd
+    /// only for `verify_preauth`, which takes no resolution
+    /// (docs/questions/Q-1080); `issue_as_rep` takes the resolution itself
+    /// and keyd looks the key set up by it (task PN11b, docs/questions/
+    /// Q-1067), so no handle travels beside a resolution.
     /// Spec: docs/59 §7.1, §7.2 step 4; docs/10 §1, §4.
     pub fn key(&self) -> KeyHandle {
         resolved_handle(self.resolution.resolution())
@@ -241,7 +243,8 @@ impl ServiceAccount {
     /// keyd handle of the service key set (purpose `Service`,
     /// `AdminService` or `ChangePasswordService`, docs/10 §5; Q-1009 item
     /// 3): the key set dird's resolution names, stated only there (see
-    /// [`ClientAccount::key`]).
+    /// [`ClientAccount::key`]). No keyd call takes it since task PN11b: the
+    /// KDC hands keyd the resolution (docs/questions/Q-1067).
     /// Spec: docs/59 §7.1, §7.2 step 4; docs/10 §1, §5.
     pub fn key(&self) -> KeyHandle {
         resolved_handle(self.resolution.resolution())

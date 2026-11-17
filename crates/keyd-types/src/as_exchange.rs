@@ -10,12 +10,28 @@
 //! ([`CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS`], the one definition keyd
 //! enforces and the KDC plans with).
 //!
+//! # Each key set named once (task PN11b; docs/questions/Q-1067)
+//!
+//! **The class (AGENTS.md §6.1):** "one request states one fact twice" —
+//! until PN11b the KDC handed `issue_as_rep` the client's key handle (and,
+//! for `kadmin/changepw`, the service's) **beside** dird's attested name
+//! resolution that already names that key set (`principal`, `key_purpose`
+//! — docs/59 §7.1), and the template named the client a third time; keyd
+//! refused a disagreement, but the disagreement was representable. **The
+//! root-level change:** the request names a resolved key set only through
+//! its resolution. `issue_as_rep` takes the client's resolution and no
+//! client handle; the server is an [`AsServerKeySet`] — this realm's krbtgt
+//! by its handle (it has no resolution: docs/59 §7.2), or the
+//! change-password service by its resolution alone; [`AsTicketTemplate`]
+//! has no `client`. keyd looks each resolved set up by the resolution it
+//! verified, so there is nothing left to compare.
+//!
 //! Spec: RFC 4120 2.1, 3.1.3, 5.3, 5.4.2; RFC 6113 5.4, 5.4.3; RFC 3244 §2;
 //! docs/10 §4, §8; docs/48 §2.3; docs/53 R53-6, §5.2; docs/questions/Q-915
-//! (A-151).
+//! (A-151); docs/59 §7.1, §7.2; docs/questions/Q-1067 (task PN11b).
 
 use crate::enctype::EncTypeId;
-use crate::model::{KeyPurpose, PrincipalId};
+use crate::model::{KeyHandle, KeyPurpose, PrincipalId};
 use crate::name_resolution::AttestedNameResolution;
 use crate::tokens::ExchangeId;
 use krb_proto::{EncryptedData, KerberosTime, PrincipalName, Realm, Ticket, TicketFlags};
@@ -107,14 +123,65 @@ impl AsServer {
     }
 }
 
+/// The server key set of one `issue_as_rep`, as the KDC names it to keyd —
+/// one of the closed set [`AsServer`], each named **once** (task PN11b;
+/// docs/questions/Q-1067):
+///
+/// - [`AsServerKeySet::LocalTgt`]: a TGT — this realm's krbtgt key set by
+///   its handle. The krbtgt has no name resolution: the KDC always writes
+///   the canonical TGS name `krbtgt/<REALM>`, and keyd reaches the set's
+///   keys only by its exact stored binding to that name ([MS-KILE]
+///   3.3.5.1.2; RFC 4120 §7.3; docs/59 §7.2);
+/// - [`AsServerKeySet::ChangePasswordService`]: a ticket for
+///   `kadmin/changepw` (armored only — keyd refuses it unarmored, A-142) —
+///   by dird's attested resolution of the service object's name alone (the
+///   record carried it, task PN11). No handle travels beside it: keyd looks
+///   the key set up by the resolution it verified, so the server's key set
+///   cannot be stated twice (docs/59 §7.1, §7.2).
+///
+/// Borrowed and `Copy`: one value per call, nothing kept.
+///
+/// Spec: docs/53 §5.2; docs/59 §7.1, §7.2; docs/questions/Q-915 items 1, 3
+/// (A-151), Q-1011 item 8 (A-173), Q-1067; RFC 3244 §2; [MS-KILE] 3.3.5.1.2;
+/// RFC 4120 §7.3; AGENTS.md §6.1.
+#[derive(Debug, Clone, Copy)]
+pub enum AsServerKeySet<'a> {
+    /// This realm's krbtgt key set (a TGT), by its handle.
+    /// Spec: RFC 4120 §7.3; docs/59 §7.2.
+    LocalTgt(&'a KeyHandle),
+    /// The change-password service's key set, by dird's attested
+    /// resolution of `kadmin/changepw`. Spec: RFC 3244 §2; docs/53 §5.2;
+    /// docs/59 §7.2.
+    ChangePasswordService(&'a AttestedNameResolution),
+}
+
+impl AsServerKeySet<'_> {
+    /// The server of the closed set this names.
+    /// Spec: docs/53 §5.2; docs/questions/Q-915 items 1, 3.
+    #[must_use]
+    pub const fn server(&self) -> AsServer {
+        match self {
+            AsServerKeySet::LocalTgt(_) => AsServer::LocalTgt,
+            AsServerKeySet::ChangePasswordService(_) => AsServer::ChangePasswordService,
+        }
+    }
+}
+
 /// Proof that pre-authentication succeeded, returned by `verify_preauth`
 /// and consumed by `issue_as_rep`. It binds the issuance to this exchange,
 /// this caller and this client; it is short-lived and single-use. It carries
 /// no decrypted plaintext (no decryption oracle, docs/10 §4).
 ///
+/// The client it binds is keyd's own record of the key set that
+/// pre-authenticated; `issue_as_rep` requires it to be the key set of the
+/// client's attested name resolution keyd verified (task PN11b) — two
+/// statements keyd made or checked itself, never the KDC's.
+///
 /// The expiry is tracked inside keyd (docs/10 `expires: Instant`).
 ///
-/// Spec: docs/10 §4 (`struct AuthnProof`), §8, D36.
+/// Spec: docs/10 §4 (`struct AuthnProof`; `issue_as_rep` step 1: the proof
+/// is valid and bound to the client), §8, D36; docs/questions/Q-1067 open
+/// point 1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthnProof {
     /// The one-time exchange token.
@@ -130,20 +197,24 @@ pub struct AuthnProof {
 /// change-password service ticket. keyd fills in the session key, the
 /// realm, authtime, transited and the INITIAL / PRE-AUTHENT flags itself.
 ///
+/// It names no client principal (task PN11b): the ticket's client is the
+/// key set of the client's attested name resolution keyd verified, which
+/// must be the one the proof is bound to (docs/10 §4 step 1; docs/59 §7.1)
+/// — docs/10 §4's `TicketTemplate.client` would state it a second time.
+///
 /// Spec: docs/10 §4 (`struct TicketTemplate`); RFC 4120 5.3, 5.4.2;
-/// docs/53 §5.2.
+/// docs/53 §5.2; docs/questions/Q-1067.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AsTicketTemplate {
-    /// The client; must be the principal the proof is bound to.
-    pub client: PrincipalId,
     /// Client realm; must be the configured realm (single realm, phase 1).
     pub crealm: Realm,
     /// Client name (RFC 4120 5.3 cname). Together with `crealm` it must be
     /// one of the two (realm, name) pairs of the client's attested name
-    /// resolution ([`AsResolutions::client`]) — as the request sent it, or
-    /// canonical — exactly (task PN11; docs/59 §7.2 step 5); the resolution
-    /// itself must name the client key set — otherwise `Denied`. keyd never
-    /// canonicalises: dird chose the names (docs/59 §4.5).
+    /// resolution (`issue_as_rep`'s `client`) — as the request sent it, or
+    /// canonical — exactly (task PN11; docs/59 §7.2 step 5); keyd looks the
+    /// client key set up by that resolution (task PN11b) — otherwise
+    /// `Denied`. keyd never canonicalises: dird chose the names (docs/59
+    /// §4.5).
     pub cname: PrincipalName,
     /// Server name. For [`AsServer::LocalTgt`]: this realm's TGS name,
     /// NT-SRV-INST ("krbtgt", realm), exactly — the canonical TGS name the
@@ -151,8 +222,8 @@ pub struct AsTicketTemplate {
     /// the krbtgt key set's stored binding without any resolution. For
     /// [`AsServer::ChangePasswordService`]: `kadmin/changepw` (RFC 3244 §2;
     /// never canonicalised, [MS-KILE] 3.3.5.1.2) — one of the two names of
-    /// the service's attested name resolution ([`AsResolutions::server`],
-    /// task PN11).
+    /// the service's attested name resolution
+    /// ([`AsServerKeySet::ChangePasswordService`], task PN11).
     pub sname: PrincipalName,
     /// Requested starttime; must be within the clock skew of now (no
     /// postdating). `None` = authtime is the start (RFC 4120 5.3). Absent
@@ -174,37 +245,6 @@ pub struct AsTicketTemplate {
     pub session_enctype: EncTypeId,
     /// The AS-REQ nonce, echoed in EncASRepPart (RFC 4120 5.4.2).
     pub nonce: u32,
-}
-
-/// dird's attested name resolutions for one `issue_as_rep` (task PN11;
-/// docs/59 §7.2, §7.5): the statement, tagged with the attestation key,
-/// that the names the KDC asks keyd to write resolve to the key sets it
-/// names. keyd verifies each (tag, canonical realm, 30 s on its own clock)
-/// and reaches a client or service key only through a verified one
-/// (`StoredKeySet::bound_by` in crate keyd); the KDC only forwards what
-/// dird sent with the account records (crate kdc `ClientAccount`,
-/// `ServiceAccount`).
-///
-/// - `client`: the resolution of the request's (crealm, cname) to the
-///   client's PrincipalLongterm key set — always.
-/// - `server`: the resolution of `kadmin/changepw` to the change-password
-///   service's key set — present exactly for
-///   [`AsServer::ChangePasswordService`]. A TGT carries none: the krbtgt key
-///   set is reached only by its exact stored binding to the canonical TGS
-///   name ([MS-KILE] 3.3.5.1.2; RFC 4120 7.3; docs/59 §7.2), so a resolution
-///   for it is refused, and its absence for the change-password service is
-///   refused too (fail closed).
-///
-/// Borrowed and `Copy`: one value per call, nothing kept.
-///
-/// Spec: docs/59 §7.1, §7.2, §7.5; docs/questions/Q-1011 items 1, 4, 8
-/// (A-173); RFC 3244 §2; [MS-KILE] 3.3.5.1.2; AGENTS.md §6 (fail closed).
-#[derive(Debug, Clone, Copy)]
-pub struct AsResolutions<'a> {
-    /// The client's resolution (request name ⇒ PrincipalLongterm key set).
-    pub client: &'a AttestedNameResolution,
-    /// The change-password service's resolution; `None` for a TGT.
-    pub server: Option<&'a AttestedNameResolution>,
 }
 
 /// The sealed AS-REP parts: the ticket (sealed under the server's key set —

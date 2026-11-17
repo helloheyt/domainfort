@@ -89,8 +89,8 @@ use ipc_audit_client::AckedIntent;
 use ipc_keyd::AttestationKeyOctets;
 use ipc_keyd::{Answer, Call, DescribedConfig};
 use keyd::{
-    AsResolutions, AttestationKey, AuditSink, CallerId, EntropySource, KeyStore, Keyd,
-    TgsFastRequest, ATTESTATION_KEY_LEN,
+    AttestationKey, AuditSink, CallerId, EntropySource, KeyStore, Keyd, TgsFastRequest,
+    ATTESTATION_KEY_LEN,
 };
 use krb_proto::KerberosTime;
 
@@ -212,25 +212,22 @@ fn run<S: KeyStore, A: AuditSink, E: EntropySource>(
             padata,
             armor,
         } => Answer::VerifyPreauth(keyd.verify_preauth(caller, &client, &padata, armor, now)),
+        // Task PN11b (docs/questions/Q-1067): the resolutions are the
+        // call's only names of the client's and the change-password
+        // service's key sets; the krbtgt of a TGT goes by its handle.
         Call::IssueAsRep {
             client,
-            krbtgt,
+            server,
             proof,
             armor,
             template,
-            client_resolution,
-            server_resolution,
         } => Answer::IssueAsRep(keyd.issue_as_rep(
             caller,
             &client,
-            &krbtgt,
+            server.as_key_set(),
             &proof,
             armor,
             &template,
-            AsResolutions {
-                client: &client_resolution,
-                server: server_resolution.as_deref(),
-            },
             now,
         )),
         Call::OpenFastArmor {
@@ -262,15 +259,7 @@ fn run<S: KeyStore, A: AuditSink, E: EntropySource>(
             service,
             ctx,
             template,
-            service_resolution,
-        } => Answer::IssueTgsRep(keyd.issue_tgs_rep(
-            caller,
-            &service,
-            &service_resolution,
-            &ctx,
-            &template,
-            now,
-        )),
+        } => Answer::IssueTgsRep(keyd.issue_tgs_rep(caller, &service, &ctx, &template, now)),
         Call::SealFastError {
             conversation,
             error,

@@ -54,7 +54,7 @@ krb-proto = { path = "../krb-proto" }
 # signer `tag` (tests/attestation_key_custody.rs).
 name-attestation = { path = "../name-attestation" }
 # The one name equivalence of the principal namespace (task PN1; docs/59
-# §4.2, §7.2; class C49): `StoredKeySet::bound_by` compares the key set's
+# §4.2, §7.2; class C49): the door `store::bound_by` compares the key set's
 # bound name with a verified resolution's canonical name by the namespace
 # key (`key_of_request`), never octet for octet — keyd holds no second
 # equivalence. Our own pure leaf crate (krb-proto, keyd-types; no I/O, no

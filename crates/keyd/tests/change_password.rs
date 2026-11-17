@@ -899,13 +899,33 @@ fn the_change_password_key_is_opened_by_its_operation_only() {
         Err(AuthnError::Denied)
     );
     assert_eq!(last(&f).reason, AuditReason::KeyNotFound);
+    // The KDC's TGS issuance: dird's resolution naming this key set is
+    // refused by the capability table's slot (task PN11b: the service's key
+    // set is named only by its resolution, whose purpose keyd checks after
+    // the context — so the context is a live one).
+    let tgt = obtain_tgt(&mut f, now(), &as_template());
+    let (_, body) = tgs_req_body(1, change_password_service_name());
+    let auth = authenticator(&tgt.session, &AuthenticatorSpec::new(now(), 1, &body));
+    let ctx = f
+        .keyd
+        .open_and_verify_tgt(
+            &KDC,
+            &KRBTGT,
+            &common::ap_req(&tgt.parts.ticket, auth),
+            &body,
+            None,
+            &now(),
+        )
+        .unwrap();
+    let mut template = tgs_template(1);
+    template.sname = change_password_service_name();
     assert!(f
         .keyd
         .issue_tgs(
             &KDC,
             &CHANGE_PASSWORD_SERVICE,
-            &keyd::CtxId::from_bytes([1; 16]),
-            &tgs_template(1),
+            &ctx.ctx_id,
+            &template,
             &now(),
         )
         .is_err());
@@ -1456,7 +1476,6 @@ fn armored_proof(f: &mut Fixture, c: &Conversation) -> AuthnProof {
 /// `endtime` (docs/53 §5.2: no flag, no starttime, no renew-till).
 fn change_password_template(endtime: KerberosTime) -> AsTicketTemplate {
     AsTicketTemplate {
-        client: ALICE_ID,
         crealm: realm(),
         cname: alice_name(),
         sname: change_password_service_name(),
@@ -1691,12 +1710,18 @@ fn an_unarmored_change_password_issuance_is_refused() {
 
 /// Task PN11 (docs/59 §7.2; the change-password service is a non-krbtgt key
 /// set, so keyd reaches it only through dird's verified resolution, like
-/// every client and service key): an armored AS for `kadmin/changepw` whose
-/// server resolution is missing, names another principal, another purpose,
-/// or another name is refused (`NameResolutionMismatch`); a forged one is
-/// `NameResolutionInvalid`; dird's honest resolution issues. RFC 3244 §2
-/// (the service principal `kadmin/changepw@REALM`); [MS-KILE] v20261110
-/// 3.3.5.1.2 (that name is never canonicalised — as sent equals canonical).
+/// every client and service key) and task PN11b (docs/questions/Q-1067: the
+/// request names that key set only through its resolution — keyd looks it
+/// up by the resolution): an armored AS for `kadmin/changepw` whose server
+/// is named by a handle (as a TGT's krbtgt) is refused (`PurposeMismatch`,
+/// the one classification of a server key set); a resolution of a key set
+/// keyd does not hold (another principal) reaches nothing (`KeyNotFound`);
+/// one of another purpose is refused by the capability table's slot
+/// (`PurposeMismatch`); one of another name is refused by the door
+/// (`NameResolutionMismatch`); a forged one is `NameResolutionInvalid`;
+/// dird's honest resolution issues. RFC 3244 §2 (the service principal
+/// `kadmin/changepw@REALM`); [MS-KILE] v20261110 3.3.5.1.2 (that name is
+/// never canonicalised — as sent equals canonical).
 #[test]
 fn the_change_password_service_is_reached_only_through_its_resolution() {
     let (mut f, tgt) = as_fixture();
@@ -1716,14 +1741,14 @@ fn the_change_password_service_is_reached_only_through_its_resolution() {
     other_name.name_as_sent = service_name();
     other_name.canonical_name = service_name();
     let cases = [
-        (None, AuditReason::NameResolutionMismatch),
+        (None, AuditReason::PurposeMismatch),
         (
             Some(signed(other_principal, &ATTESTATION_KEY)),
-            AuditReason::NameResolutionMismatch,
+            AuditReason::KeyNotFound,
         ),
         (
             Some(signed(other_purpose, &ATTESTATION_KEY)),
-            AuditReason::NameResolutionMismatch,
+            AuditReason::PurposeMismatch,
         ),
         (
             Some(signed(other_name, &ATTESTATION_KEY)),
@@ -1737,19 +1762,21 @@ fn the_change_password_service_is_reached_only_through_its_resolution() {
     for (cusec, (server, reason)) in (10..).zip(cases) {
         let c = open_conversation(&mut f, &tgt, cusec);
         let proof = armored_proof(&mut f, &c);
+        // No resolution: the change-password key set named by its handle,
+        // in the only place a handle can go — a TGT's krbtgt.
+        let server = match &server {
+            Some(resolution) => keyd::AsServerKeySet::ChangePasswordService(resolution),
+            None => keyd::AsServerKeySet::LocalTgt(&CHANGE_PASSWORD_SERVICE),
+        };
         assert_eq!(
             f.keyd
                 .issue_as_rep(
                     &KDC,
-                    &ALICE,
-                    &CHANGE_PASSWORD_SERVICE,
+                    &alice,
+                    server,
                     &proof,
                     Some(c.armor.armor_id),
                     &template,
-                    keyd::AsResolutions {
-                        client: &alice,
-                        server: server.as_ref(),
-                    },
                     &now(),
                 )
                 .map(|_| ()),
@@ -1765,15 +1792,11 @@ fn the_change_password_service_is_reached_only_through_its_resolution() {
         .keyd
         .issue_as_rep(
             &KDC,
-            &ALICE,
-            &CHANGE_PASSWORD_SERVICE,
+            &alice,
+            keyd::AsServerKeySet::ChangePasswordService(&honest),
             &proof,
             Some(c.armor.armor_id),
             &template,
-            keyd::AsResolutions {
-                client: &alice,
-                server: Some(&honest),
-            },
             &now(),
         )
         .unwrap();

@@ -686,15 +686,11 @@ fn every_transport_failure_is_unavailable() {
         );
         assert_eq!(
             kdc.issue_as_rep(
-                &alice,
-                &samples::KRBTGT,
+                &resolution,
+                keyd::AsServerKeySet::LocalTgt(&samples::KRBTGT),
                 &samples::proof(),
                 None,
                 &samples::as_template(false),
-                keyd::AsResolutions {
-                    client: &resolution,
-                    server: None,
-                },
             ),
             Err(IssueError::Unavailable),
             "{fault:?}"

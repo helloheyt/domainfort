@@ -9,7 +9,7 @@ mod common;
 
 use common::*;
 use keyd::{
-    AccountKind, ArmorId, AsRepParts, AsResolutions, AsTicketTemplate, AttestedNameResolution,
+    AccountKind, ArmorId, AsRepParts, AsServerKeySet, AsTicketTemplate, AttestedNameResolution,
     AuditOutcome, AuthnError, AuthnProof, CallerId, CtxId, DecidedOperation, DecisionId,
     DestructionPage, Error, IssueError, KeyHandle, Kvno, Operation, PrincipalBinding, PrincipalId,
     ServiceContext, SetSecretTarget, TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext,
@@ -43,15 +43,17 @@ fn operation_signatures_return_no_key_material() {
         Option<ArmorId>,
         &KerberosTime,
     ) -> Result<AuthnProof, AuthnError> = K::verify_preauth;
+    // Task PN11b (docs/questions/Q-1067): the client and the
+    // change-password server reach keyd only as their resolutions; the
+    // krbtgt of a TGT keeps its handle (`AsServerKeySet::LocalTgt`).
     let _: fn(
         &mut K,
         &CallerId,
-        &KeyHandle,
-        &KeyHandle,
+        &AttestedNameResolution,
+        AsServerKeySet<'_>,
         &AuthnProof,
         Option<ArmorId>,
         &AsTicketTemplate,
-        AsResolutions<'_>,
         &KerberosTime,
     ) -> Result<AsRepParts, IssueError> = K::issue_as_rep;
     // docs/48 §2.3 (task T3): the TGS opening takes the FAST part of an
@@ -69,7 +71,6 @@ fn operation_signatures_return_no_key_material() {
     let _: fn(
         &mut K,
         &CallerId,
-        &KeyHandle,
         &AttestedNameResolution,
         &CtxId,
         &TgsTicketTemplate,

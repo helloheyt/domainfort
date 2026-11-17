@@ -119,8 +119,8 @@
 
 use crate::channel::{KEYD_CHANNEL, REPLY_LIMIT};
 use crate::typed::{
-    Answer, AttestationKeyOctets, Call, ConversionError, DescribedConfig, IssuanceCall, Password,
-    TgsFast,
+    Answer, AsServerArgument, AttestationKeyOctets, Call, ConversionError, DescribedConfig,
+    IssuanceCall, Password, TgsFast,
 };
 use crate::wire::KeydReply;
 use core::fmt;
@@ -128,7 +128,7 @@ use core::time::Duration;
 use ipc::{decode_reply, encode_frame, Direction, FrameLimit, Refused, Reply};
 use keyd_types::authz::{requires_acknowledged_intent, role_permits};
 use keyd_types::{
-    AccountKind, ArmorId, AsRepParts, AsResolutions, AsTicketTemplate, AttestedNameResolution,
+    AccountKind, ArmorId, AsRepParts, AsServerKeySet, AsTicketTemplate, AttestedNameResolution,
     AuthnError, AuthnProof, ChangePasswordContext, ChangePasswordCtxId, ConfigDescription, CtxId,
     DecidedOperation, DecisionId, DestructionPage, FastArmor, FastConversation, HostAddr,
     IssueError, KeyCustody, KeyHandle, Kvno, Operation, OperationDigest, OperationTicket,
@@ -856,25 +856,24 @@ impl<C: Connector> KeydClient<C> {
     }
 
     /// docs/10 §4 `issue_as_rep`, with dird's attested name resolutions as
-    /// the account records carried them (task PN11). Spec: docs/50 §3.4;
-    /// docs/59 §7.5.
+    /// the account records carried them (task PN11) — the client's, and the
+    /// change-password service's in place of its handle; a TGT's krbtgt by
+    /// its handle (task PN11b). Spec: docs/50 §3.4; docs/59 §7.5;
+    /// docs/questions/Q-1067.
     pub fn issue_as_rep(
         &mut self,
-        client: &KeyHandle,
-        krbtgt: &KeyHandle,
+        client: &AttestedNameResolution,
+        server: AsServerKeySet<'_>,
         proof: &AuthnProof,
         armor: Option<ArmorId>,
         template: &AsTicketTemplate,
-        resolutions: AsResolutions<'_>,
     ) -> Result<AsRepParts, IssueError> {
         let call = Call::IssueAsRep {
-            client: *client,
-            krbtgt: *krbtgt,
+            client: Box::new(client.clone()),
+            server: AsServerArgument::of(server),
             proof: proof.clone(),
             armor,
             template: template.clone(),
-            client_resolution: Box::new(resolutions.client.clone()),
-            server_resolution: resolutions.server.map(|r| Box::new(r.clone())),
         };
         self.issuance(
             call,
@@ -936,19 +935,18 @@ impl<C: Connector> KeydClient<C> {
     }
 
     /// docs/10 §5 `issue_tgs_rep`, with dird's attested resolution of the
-    /// service's name (task PN11). Spec: docs/50 §3.4; docs/59 §7.5.
+    /// service's name (task PN11) — the only name of its key set (task
+    /// PN11b). Spec: docs/50 §3.4; docs/59 §7.5; docs/questions/Q-1067.
     pub fn issue_tgs_rep(
         &mut self,
-        service: &KeyHandle,
-        service_resolution: &AttestedNameResolution,
+        service: &AttestedNameResolution,
         ctx: &CtxId,
         template: &TgsTicketTemplate,
     ) -> Result<TgsRepParts, IssueError> {
         let call = Call::IssueTgsRep {
-            service: *service,
+            service: Box::new(service.clone()),
             ctx: *ctx,
             template: template.clone(),
-            service_resolution: Box::new(service_resolution.clone()),
         };
         self.issuance(
             call,
@@ -1443,16 +1441,15 @@ impl<C: Connector> KeyCustody for IpcKeyd<C> {
 
     fn issue_as_rep(
         &mut self,
-        client: &KeyHandle,
-        krbtgt: &KeyHandle,
+        client: &AttestedNameResolution,
+        server: AsServerKeySet<'_>,
         proof: &AuthnProof,
         armor: Option<ArmorId>,
         template: &AsTicketTemplate,
-        resolutions: AsResolutions<'_>,
         _now: &KerberosTime,
     ) -> Result<AsRepParts, IssueError> {
         self.client
-            .issue_as_rep(client, krbtgt, proof, armor, template, resolutions)
+            .issue_as_rep(client, server, proof, armor, template)
     }
 
     fn open_fast_armor(
@@ -1480,14 +1477,12 @@ impl<C: Connector> KeyCustody for IpcKeyd<C> {
 
     fn issue_tgs_rep(
         &mut self,
-        service: &KeyHandle,
-        service_resolution: &AttestedNameResolution,
+        service: &AttestedNameResolution,
         ctx: &CtxId,
         template: &TgsTicketTemplate,
         _now: &KerberosTime,
     ) -> Result<TgsRepParts, IssueError> {
-        self.client
-            .issue_tgs_rep(service, service_resolution, ctx, template)
+        self.client.issue_tgs_rep(service, ctx, template)
     }
 
     fn seal_fast_error(

@@ -97,8 +97,58 @@ fn decided_for(handle: &KeyHandle) -> DecidedOperation {
     }
 }
 
+/// The token an issuance by the Kdc role redeems — a live one, so that the
+/// purpose of the key set a resolution names is reached (task PN11b: the
+/// request names the AS client and the TGS service only through their
+/// resolutions, whose purpose keyd checks once it verified them, after the
+/// token step — docs/59 §7.2; docs/questions/Q-1067). Any other role is
+/// refused before the token is looked at, so a made-up one serves.
+fn live_proof(f: &mut Fixture, caller: &CallerId) -> AuthnProof {
+    let n = now();
+    if caller.role == Role::Kdc {
+        if let Ok(proof) = f.keyd.verify_preauth(
+            caller,
+            &ALICE,
+            &pa_enc_timestamp(&alice_key(), Some(1), n),
+            None,
+            &n,
+        ) {
+            return proof;
+        }
+    }
+    AuthnProof {
+        exchange_id: ExchangeId::from_bytes([3; 16]),
+        client: ALICE_ID,
+        authtime: n,
+    }
+}
+
+/// A TGS context of alice's TGT for the service at `nonce` (live for the Kdc
+/// role, made up otherwise — see [`live_proof`]).
+fn live_context(f: &mut Fixture, caller: &CallerId, nonce: u32) -> CtxId {
+    if caller.role != Role::Kdc {
+        return CtxId::from_bytes([4; 16]);
+    }
+    let tgt = obtain_tgt(f, now(), &as_template());
+    let (_, body) = tgs_req_body(nonce, service_name());
+    let auth = authenticator(&tgt.session, &AuthenticatorSpec::new(now(), nonce, &body));
+    f.keyd
+        .open_and_verify_tgt(
+            caller,
+            &KRBTGT,
+            &ap_req(&tgt.parts.ticket, auth),
+            &body,
+            None,
+            &now(),
+        )
+        .map(|ctx| ctx.ctx_id)
+        .unwrap_or(CtxId::from_bytes([4; 16]))
+}
+
 /// Invoke `op` with `caller` on `handle` (other arguments are plausible but
-/// irrelevant: authorization is the first step). Returns whether it
+/// irrelevant: authorization is the first step — for the AS client and the
+/// TGS service, the purpose check of the key set their resolution names
+/// follows the token, which is then a live one). Returns whether it
 /// succeeded.
 fn invoke(f: &mut Fixture, op: Operation, caller: &CallerId, handle: &KeyHandle) -> bool {
     let n = now();
@@ -114,11 +164,7 @@ fn invoke(f: &mut Fixture, op: Operation, caller: &CallerId, handle: &KeyHandle)
             )
             .is_ok(),
         Operation::IssueAsRep => {
-            let proof = AuthnProof {
-                exchange_id: ExchangeId::from_bytes([3; 16]),
-                client: handle.principal,
-                authtime: n,
-            };
+            let proof = live_proof(f, caller);
             f.keyd
                 .issue_as(caller, handle, &KRBTGT, &proof, None, &as_template(), &n)
                 .is_ok()
@@ -127,16 +173,13 @@ fn invoke(f: &mut Fixture, op: Operation, caller: &CallerId, handle: &KeyHandle)
             .keyd
             .open_and_verify_tgt(caller, handle, &dummy_ap_req(), &[0x30, 0x00], None, &n)
             .is_ok(),
-        Operation::IssueTgsRep => f
-            .keyd
-            .issue_tgs(
-                caller,
-                handle,
-                &CtxId::from_bytes([4; 16]),
-                &tgs_template(1),
-                &n,
-            )
-            .is_ok(),
+        Operation::IssueTgsRep => {
+            let nonce = u32::try_from(f.records().len()).unwrap();
+            let ctx = live_context(f, caller, nonce);
+            f.keyd
+                .issue_tgs(caller, handle, &ctx, &tgs_template(nonce), &n)
+                .is_ok()
+        }
         Operation::SetSecret => f
             .keyd
             .set_secret(

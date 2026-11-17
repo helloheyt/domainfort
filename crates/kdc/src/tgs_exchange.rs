@@ -62,8 +62,10 @@
 //! 11. times planned within policy and within the TGT (3.3.3; decision 10)
 //!     → KDC_ERR_NEVER_VALID if too short;
 //! 12. keyd `issue_tgs_rep` on the armored context — with dird's resolution
-//!     of the service's name as the record carried it (task PN11: keyd
-//!     reaches the service key only through it, docs/59 §7.2) — seals the
+//!     of the service's name as the record carried it, and no handle beside
+//!     it (task PN11: keyd reaches the service key only through it, docs/59
+//!     §7.2; task PN11b: keyd looks the key set up by it,
+//!     docs/questions/Q-1067) — seals the
 //!     service ticket, the reply under the strengthened reply key, and the
 //!     KrbFastResponse (RFC 6113 5.4.3); a refusal leaves the context live
 //!     for the armored error (docs/questions/Q-150 item 3);
@@ -474,18 +476,14 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
             session_enctype,
             nonce: body.nonce,
         };
-        // dird's resolution goes with the call as the record carried it:
-        // keyd binds the service key only through it (docs/59 §7.2). The
-        // client needs none — it is the TGT's (Q-1011 item 7).
+        // dird's resolution goes with the call as the record carried it —
+        // the call's only name of the service's key set: keyd looks the set
+        // up by it and binds the service key only through it (docs/59 §7.2;
+        // task PN11b, docs/questions/Q-1067). The client needs none — it is
+        // the TGT's (Q-1011 item 7).
         let parts = self
             .custody
-            .issue_tgs_rep(
-                &service.key(),
-                &service.resolution,
-                &tgt.ctx_id,
-                &template,
-                now,
-            )
+            .issue_tgs_rep(&service.resolution, &tgt.ctx_id, &template, now)
             .map_err(issue_refusal)?;
 
         // 13. The TGS-REP (5.4.2): PA-FX-FAST only (RFC 6113 5.4.3).

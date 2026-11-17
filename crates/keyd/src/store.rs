@@ -46,7 +46,7 @@
 //!
 //! | door | for | check |
 //! |---|---|---|
-//! | `StoredKeySet::bound_by` | AS / TGS issuance under a client or service key set (the AS client, the change-password service, every TGS service) | a `VerifiedNameResolution` — dird's statement whose tag, realm and freshness keyd checked (crate name_resolution) — names this set's own handle and, in the namespace's equivalence (`principal-names`), its bound name; and the name the ticket will carry is one of the resolution's two names |
+//! | `bound_by` | AS / TGS issuance under a client or service key set (the AS client, the change-password service, every TGS service) | the set is the one stored under the handle a `VerifiedNameResolution` names — dird's statement whose tag, realm and freshness keyd checked (crate name_resolution); the door looks it up itself, so no other set can be handed to it (task PN11b) — it is no krbtgt, the resolution's canonical name is its bound name in the namespace's equivalence (`principal-names`), and the name the ticket will carry is one of the resolution's two names |
 //! | `StoredKeySet::ticket_granting` | the krbtgt: sealing a TGT, opening a TGT or a FAST armor ticket | the set is a Krbtgt key set bound to this realm's TGS name — the canonical `krbtgt/<REALM>` the KDC always writes, exactly, no resolution ([MS-KILE] 3.3.5.1.2; RFC 4120 §7.3; docs/59 §7.2) |
 //! | `StoredKeySet::accepting` | the acceptor (a service AP-REQ, a change-password request) | the ticket's (srealm, sname) and the set's binding are the same principal in the namespace's one equivalence (`principal-names` — Q-1011 item 6, A-173) |
 //! | `StoredKeySet::bound_to` | `set_secret` on an existing set (dird's own install path) | the set is bound to the (realm, name) of the request's binding — never an issuance (docs/59 §3 M4: `directory.rs` stays) |
@@ -54,6 +54,9 @@
 //! So the KDC cannot choose which key set a name maps to (class C3, closed
 //! for names), no issuance reaches a client or service key on the KDC's word
 //! alone (C5 kept closed: every door is a proof type built after its check),
+//! no issuance request names a resolved key set twice — the resolution is
+//! the only name keyd looks it up by (task PN11b; "one request states one
+//! fact twice", docs/questions/Q-1067),
 //! and no door compares names by a second equivalence (C49: the two
 //! namespace compares go through `principal-names`; the two exact ones
 //! compare against one fixed name — the canonical TGS name — or the
@@ -242,10 +245,10 @@ impl fmt::Debug for KeyVersion<'_> {
 }
 
 /// Proof that a stored key set may be used for the name an operation uses
-/// it for (A-19): built only by one of the four doors of
-/// [`StoredKeySet`] — `bound_by`, `ticket_granting`, `accepting`,
-/// `bound_to` (module documentation, "The doors") — after its check. The
-/// key versions of the set are reached through it.
+/// it for (A-19): built only by one of the four doors — `bound_by`, and
+/// [`StoredKeySet`]'s `ticket_granting`, `accepting`, `bound_to` (module
+/// documentation, "The doors") — after its check. The key versions of the
+/// set are reached through it.
 ///
 /// Spec: docs/questions/Q-040 (A-19); RFC 4120 6.2; docs/52 §3.5 (R7);
 /// docs/59 §7.2.
@@ -295,10 +298,11 @@ impl fmt::Debug for BoundKeys<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnboundUse {
     /// `verify_preauth`: it issues nothing — its `AuthnProof` is bound to the
-    /// key handle, and `issue_as_rep`, its only redeemer, binds the ticket's
-    /// crealm / cname to that same key set through dird's verified name
-    /// resolution ([`StoredKeySet::bound_by`], task PN11) before anything is
-    /// sealed. Spec: docs/10 §4, §8; A-19; docs/59 §7.2.
+    /// key handle, and `issue_as_rep`, its only redeemer, requires that key
+    /// set to be the one dird's verified client resolution names and binds
+    /// the ticket's crealm / cname to it through that resolution
+    /// (`bound_by`, tasks PN11, PN11b) before anything is sealed.
+    /// Spec: docs/10 §4, §8; A-19; docs/59 §7.2; docs/questions/Q-1080.
     Preauthentication,
     /// `verify_secret`: it compares a candidate password with the current
     /// password-derived key and issues nothing under any name; no role holds
@@ -318,10 +322,10 @@ pub(crate) enum UnboundUse {
 /// Opaque: no public constructor, no public key accessor (I1).
 ///
 /// The set also keeps the handle its creation rule was checked for (task
-/// PN8): `StoredKeySet::bound_by` compares a verified name resolution with
-/// the set's **own** handle, fixed at creation — never with a handle a
-/// caller passes alongside (which could name another key set than the one
-/// whose keys are then used).
+/// PN8) — the purpose its doors judge (a krbtgt set opens only through
+/// `ticket_granting`). The issuance door `bound_by` looks a set up by the
+/// handle a verified name resolution names, so no handle passed alongside
+/// the resolution exists to compare (task PN11b).
 ///
 /// Spec: docs/10 §1 ("keyd holds current + previous"; "decrypt may try a set
 /// of kvnos; signing/sealing always with the current kvno"); docs/09 D32;
@@ -338,7 +342,7 @@ impl StoredKeySet {
     /// A new key set from its creation proof — the binding passed the
     /// creation rule (`template::check_new_binding`) for one handle — and its
     /// first version. Returns that handle, under which the caller stores the
-    /// set; the set keeps it too (for `StoredKeySet::bound_by`).
+    /// set; the set keeps it too (the purpose its doors judge).
     /// Spec: docs/questions/Q-040 (A-19); docs/10 §6, §7; docs/59 §7.2.
     pub(crate) fn create(binding: NewBinding, current: KvnoKeys) -> (KeyHandle, StoredKeySet) {
         let (handle, binding) = binding.into_parts();
@@ -369,8 +373,8 @@ impl StoredKeySet {
     /// Since task PN11 the door of one path only: `set_secret` on an
     /// existing set, where the name compared is the request's own binding
     /// (dird's install path — docs/59 §3 M4) — never an issuance, which
-    /// reaches a key only through [`StoredKeySet::bound_by`] or, for the
-    /// krbtgt, [`StoredKeySet::ticket_granting`] (pinned by
+    /// reaches a key only through `bound_by` or, for the krbtgt,
+    /// [`StoredKeySet::ticket_granting`] (pinned by
     /// tests/key_access_inventory.rs).
     ///
     /// Spec: RFC 4120 6.2 ("Principal names that differ only in the
@@ -382,63 +386,6 @@ impl StoredKeySet {
         } else {
             Err(Deny::denied(AuditReason::NameBindingMismatch))
         }
-    }
-
-    /// The proof that this set is the one a **verified** name resolution
-    /// names, for a ticket that will carry (`ticket_realm`, `ticket_name`) —
-    /// dird's statement, checked by keyd (`name_attestation::verify` ⇒ realm
-    /// ⇒ freshness, `Keyd::verify_name_resolution`) — through which its keys
-    /// are used; otherwise `Denied` (reason `NameResolutionMismatch`). The
-    /// only door of AS / TGS issuance to a client or service key (task
-    /// PN11).
-    ///
-    /// All of:
-    /// 1. the set is not a krbtgt key set — the krbtgt is reached only by
-    ///    its exact stored binding (`bound_to(realm, krbtgt/REALM)`), never
-    ///    by a resolution (docs/59 §7.2: "the KDC always writes the
-    ///    canonical `krbtgt/<REALM>`"; RFC 4120 §7.3);
-    /// 2. the resolution's principal **and** key purpose are the set's own
-    ///    handle (docs/59 §7.2 step 4: `principal == handle.principal` and
-    ///    `key_purpose == handle.purpose`) — the handle the set was created
-    ///    for, not one the caller supplies;
-    /// 3. the resolution's canonical name is the set's bound name in the
-    ///    namespace's one equivalence — the same `principal-names` key, the
-    ///    name-type ignored (RFC 4120 §6.2) and the case folded — never an
-    ///    octet comparison: keyd holds no second definition of "the same
-    ///    name" (class C49, docs/59 §3 M3; Q-1011 item 6);
-    /// 4. the ticket's (realm, name) is one of the resolution's two pairs —
-    ///    as the request sent it, or canonical — exactly: keyd does not fold
-    ///    here, dird already chose (docs/59 §7.2 step 5). Checked in the
-    ///    door, so no issuance can take the keys and write another name.
-    ///
-    /// The type does the rest: a `VerifiedNameResolution` exists only after
-    /// the tag, realm and freshness checks (crate name_resolution), so an
-    /// unchecked or stale resolution cannot reach this function.
-    ///
-    /// Spec: docs/59 §7.2 steps 1–5, §3 (M4 = C3, keeping C5 closed — R7);
-    /// docs/questions/Q-1011 items 4–6 (A-173), Q-1034 (A-177: the binding
-    /// compare is kept through PN11); RFC 4120 §6.2, §7.3; AGENTS.md §6.1 (a
-    /// proof type built only after the check, one chokepoint).
-    pub(crate) fn bound_by(
-        &self,
-        verified: &VerifiedNameResolution,
-        ticket_realm: &Realm,
-        ticket_name: &PrincipalName,
-    ) -> Internal<BoundKeys<'_>> {
-        let mismatch = Err(Deny::denied(AuditReason::NameResolutionMismatch));
-        if self.handle.purpose == KeyPurpose::Krbtgt {
-            return mismatch;
-        }
-        if verified.handle() != self.handle {
-            return mismatch;
-        }
-        if !verified.names_binding(&self.binding) {
-            return mismatch;
-        }
-        if !verified.names_ticket(ticket_realm, ticket_name) {
-            return mismatch;
-        }
-        Ok(BoundKeys { set: self })
     }
 
     /// The proof that this is a krbtgt key set bound to the TGS name of
@@ -639,6 +586,70 @@ pub trait KeyStore {
     /// Spec: docs/questions/Q-115 (A-35: `destroy_key_set`, zeroize; never
     /// krbtgt); docs/10 §7, §11 (zeroize).
     fn destroy(&mut self, handle: &KeyHandle) -> Result<(), StoreError>;
+}
+
+/// The door of AS / TGS issuance to a client or service key set (task
+/// PN11): the proof that the key set a **verified** name resolution names
+/// may be used for a ticket that will carry (`ticket_realm`,
+/// `ticket_name`) — dird's statement, checked by keyd
+/// (`name_attestation::verify` ⇒ realm ⇒ freshness,
+/// `Keyd::verify_name_resolution`). Otherwise `Denied`: `KeyNotFound` when
+/// no set is stored for the resolution's key set, `NameResolutionMismatch`
+/// for every other refusal.
+///
+/// **The set comes from the resolution** (task PN11b; docs/questions/
+/// Q-1067): the door looks it up in `store` under the resolution's own
+/// `(principal, key_purpose)` (docs/59 §7.1, §7.2 step 4) — it takes no set
+/// and no handle from its caller, so no request can name the key set beside
+/// the resolution, and no keyd code can open one set with another set's
+/// resolution. Step 4's compare (`principal == handle.principal`,
+/// `key_purpose == handle.purpose`) is the lookup itself: nothing is left to
+/// compare.
+///
+/// Then all of:
+/// 1. the set is not a krbtgt key set — the krbtgt is reached only by its
+///    exact stored binding ([`StoredKeySet::ticket_granting`]), never by a
+///    resolution (docs/59 §7.2: "the KDC always writes the canonical
+///    `krbtgt/<REALM>`"; RFC 4120 §7.3);
+/// 2. the resolution's canonical name is the set's bound name in the
+///    namespace's one equivalence — the same `principal-names` key, the
+///    name-type ignored (RFC 4120 §6.2) and the case folded — never an
+///    octet comparison: keyd holds no second definition of "the same name"
+///    (class C49, docs/59 §3 M3; Q-1011 item 6);
+/// 3. the ticket's (realm, name) is one of the resolution's two pairs — as
+///    the request sent it, or canonical — exactly: keyd does not fold here,
+///    dird already chose (docs/59 §7.2 step 5). Checked in the door, so no
+///    issuance can take the keys and write another name.
+///
+/// The type does the rest: a `VerifiedNameResolution` exists only after the
+/// tag, realm and freshness checks (crate name_resolution), so an unchecked
+/// or stale resolution cannot reach this function.
+///
+/// Spec: docs/59 §7.1, §7.2 steps 1–5, §3 (M4 = C3, keeping C5 closed —
+/// R7); docs/questions/Q-1011 items 4–6 (A-173), Q-1034 (A-177: the binding
+/// compare is kept through PN11), Q-1067 (task PN11b); RFC 4120 §6.2, §7.3;
+/// AGENTS.md §6.1 (a proof type built only after the check, one chokepoint;
+/// the restatement unrepresentable).
+pub(crate) fn bound_by<'s, S: KeyStore + ?Sized>(
+    store: &'s S,
+    verified: &VerifiedNameResolution,
+    ticket_realm: &Realm,
+    ticket_name: &PrincipalName,
+) -> Internal<BoundKeys<'s>> {
+    let set = store
+        .get(&verified.handle())
+        .ok_or(Deny::denied(AuditReason::KeyNotFound))?;
+    let mismatch = Err(Deny::denied(AuditReason::NameResolutionMismatch));
+    if set.handle.purpose == KeyPurpose::Krbtgt {
+        return mismatch;
+    }
+    if !verified.names_binding(&set.binding) {
+        return mismatch;
+    }
+    if !verified.names_ticket(ticket_realm, ticket_name) {
+        return mismatch;
+    }
+    Ok(BoundKeys { set })
 }
 
 /// In-memory key store (keys in process RAM, zeroized on drop), bounded.

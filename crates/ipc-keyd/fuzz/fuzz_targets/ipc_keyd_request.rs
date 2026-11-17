@@ -43,11 +43,16 @@
 //! alone.
 //!
 //! Task PN11: a decoded `issue_as_rep` (kind `0x02`) carries the client's
-//! attested name resolution and, optionally, the change-password service's;
-//! a decoded `issue_tgs_rep` (kind `0x05`) the service's. Each is within a
-//! resolution's bounds (it decoded through `NameResolution::new`: 1..=16
-//! components, each and every realm at most 1024 octets — docs/59 §7.1);
-//! its tag is carried, never checked here (keyd verifies it, §7.2).
+//! attested name resolution and, for the change-password service, the
+//! service's; a decoded `issue_tgs_rep` (kind `0x05`) the service's. Each is
+//! within a resolution's bounds (it decoded through `NameResolution::new`:
+//! 1..=16 components, each and every realm at most 1024 octets — docs/59
+//! §7.1); its tag is carried, never checked here (keyd verifies it, §7.2).
+//! Task PN11b (docs/questions/Q-1067): the server of a decoded
+//! `issue_as_rep` is exactly one of the krbtgt's handle (Krbtgt purpose on
+//! the wire is not this layer's to judge — keyd classifies it) or the
+//! change-password service's resolution; neither request carries a handle
+//! beside a resolution (the types have no field for one).
 //!
 //! Written, not run (PENDING-OWNER P-1).
 //!
@@ -56,7 +61,9 @@
 
 use ipc::{encode_frame, Direction};
 use ipc_keyd::channel::{request_kind, MAX_DECISION_APPROVERS, MAX_GRANT_TARGETS};
-use ipc_keyd::{decode_request, Call, DecidedOperation, ATTESTATION_KEY_OCTETS, KEYD_CHANNEL};
+use ipc_keyd::{
+    decode_request, AsServerArgument, Call, DecidedOperation, ATTESTATION_KEY_OCTETS, KEYD_CHANNEL,
+};
 use keyd::{ADDRESS_TYPE_IPV4, ADDRESS_TYPE_IPV6};
 use libfuzzer_sys::fuzz_target;
 
@@ -112,19 +119,15 @@ fuzz_target!(|body: &[u8]| {
                 );
                 assert_eq!(format!("{key:?}"), "AttestationKeyOctets(<redacted>)");
             }
-            // Task PN11: every decoded resolution is within its bounds.
+            // Task PN11: every decoded resolution is within its bounds; task
+            // PN11b: they are the requests' only names of the resolved key
+            // sets (the server one closed choice).
             let resolutions: Vec<&keyd::AttestedNameResolution> = match &call {
-                Call::IssueAsRep {
-                    client_resolution,
-                    server_resolution,
-                    ..
-                } => core::iter::once(&**client_resolution)
-                    .chain(server_resolution.as_deref())
-                    .collect(),
-                Call::IssueTgsRep {
-                    service_resolution,
-                    ..
-                } => vec![&**service_resolution],
+                Call::IssueAsRep { client, server, .. } => match server {
+                    AsServerArgument::ChangePasswordService(server) => vec![&**client, &**server],
+                    AsServerArgument::LocalTgt(_) => vec![&**client],
+                },
+                Call::IssueTgsRep { service, .. } => vec![&**service],
                 _ => Vec::new(),
             };
             for attested in resolutions {

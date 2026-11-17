@@ -367,14 +367,18 @@ fn proof_bound_to_caller() {
 }
 
 /// I4: a proof is bound to the pre-authenticated client: it cannot issue a
-/// ticket for another client handle, nor with a template naming another
-/// client. Source: docs/10 §4 step 1 ("proof valid and bound to client").
+/// ticket for another client — dird's resolution of bob's name to bob's key
+/// set (`TokenPrincipalMismatch`: since task PN11b the client key set is the
+/// resolution's, and the proof must be bound to it) — nor with a template
+/// naming another client under alice's key set (the door refuses it), nor
+/// with a proof whose echoed client was changed. Source: docs/10 §4 step 1
+/// ("proof valid and bound to client"); docs/questions/Q-1067, Q-1080.
 #[test]
 fn proof_bound_to_client() {
     let mut f = Fixture::new();
     let p = proof(&mut f);
     let mut t = as_template();
-    t.client = BOB_ID;
+    t.cname = bob_name();
     assert_eq!(
         f.keyd.issue_as(&KDC, &BOB, &KRBTGT, &p, None, &t, &now()),
         Err(IssueError::Denied)
@@ -388,6 +392,10 @@ fn proof_bound_to_client() {
     assert_eq!(
         f.keyd.issue_as(&KDC, &ALICE, &KRBTGT, &p, None, &t, &now()),
         Err(IssueError::Denied)
+    );
+    assert_eq!(
+        f.records().last().unwrap().reason,
+        AuditReason::NameResolutionMismatch
     );
 
     let mut p = proof(&mut f);
@@ -616,15 +624,11 @@ fn as_cname_must_match_client_binding() {
         assert_eq!(
             f.keyd.issue_as_rep(
                 &KDC,
-                &ALICE,
-                &KRBTGT,
+                &alice,
+                keyd::AsServerKeySet::LocalTgt(&KRBTGT),
                 &p,
                 None,
                 &t,
-                keyd::AsResolutions {
-                    client: &alice,
-                    server: None
-                },
                 &now()
             ),
             Err(IssueError::Denied),

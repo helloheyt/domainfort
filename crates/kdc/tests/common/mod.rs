@@ -57,7 +57,7 @@ use keyd::{
     KeydConfig, LocalKeyd, PrincipalBinding, PrincipalId, Role, SetSecretTarget, TicketPolicy,
     MAX_SET_SECRET_GRANT_SECS,
 };
-use keyd_types::{AsResolutions, AttestedNameResolution, NameResolution, NameResolutionFields};
+use keyd_types::{AsServerKeySet, AttestedNameResolution, NameResolution, NameResolutionFields};
 use krb_crypto::{EncType, KeyUsage, ProtocolKey};
 use krb_proto::constants::{
     FX_FAST_ARMOR_AP_REQUEST, KRB_NT_PRINCIPAL, KRB_NT_SRV_HST, KRB_NT_SRV_INST,
@@ -526,9 +526,13 @@ pub struct TestCustody {
     pub issue_as_rep_calls: Vec<IssueAsRepCall>,
 }
 
-/// One `issue_as_rep` call: the client and server key sets, whether it was
-/// armored, the template, and the resolutions the KDC forwarded (task
-/// PN11). TESTS ONLY.
+/// One `issue_as_rep` call: the client and server key sets it names,
+/// whether it was armored, the template, and the resolutions the KDC
+/// forwarded (task PN11). Since task PN11b the call names the client's key
+/// set — and the change-password service's — only by its resolution, so
+/// `client` (and, for that server, `server`) is the key set the resolution
+/// names; a TGT's `server` is the krbtgt handle the call carries.
+/// TESTS ONLY.
 #[derive(Debug, Clone)]
 pub struct IssueAsRepCall {
     pub client: KeyHandle,
@@ -537,6 +541,12 @@ pub struct IssueAsRepCall {
     pub template: keyd::AsTicketTemplate,
     pub client_resolution: NameResolution,
     pub server_resolution: Option<NameResolution>,
+}
+
+/// The key set a resolution names: `(principal, key_purpose)` (docs/59
+/// §7.1). TESTS ONLY.
+pub fn resolution_handle(resolution: &NameResolution) -> KeyHandle {
+    KeyHandle::new(resolution.principal(), resolution.key_purpose())
 }
 
 impl TestCustody {
@@ -573,27 +583,33 @@ impl KeyCustody for TestCustody {
     }
     fn issue_as_rep(
         &mut self,
-        client: &KeyHandle,
-        server: &KeyHandle,
+        client: &AttestedNameResolution,
+        server: AsServerKeySet<'_>,
         proof: &keyd::AuthnProof,
         armor: Option<keyd::ArmorId>,
         template: &keyd::AsTicketTemplate,
-        resolutions: AsResolutions<'_>,
         now: &KerberosTime,
     ) -> Result<keyd::AsRepParts, keyd::IssueError> {
+        let (server_handle, server_resolution) = match server {
+            AsServerKeySet::LocalTgt(krbtgt) => (*krbtgt, None),
+            AsServerKeySet::ChangePasswordService(resolution) => (
+                resolution_handle(resolution.resolution()),
+                Some(resolution.resolution().clone()),
+            ),
+        };
         self.issue_as_rep_calls.push(IssueAsRepCall {
-            client: *client,
-            server: *server,
+            client: resolution_handle(client.resolution()),
+            server: server_handle,
             armored: armor.is_some(),
             template: template.clone(),
-            client_resolution: resolutions.client.resolution().clone(),
-            server_resolution: resolutions.server.map(|r| r.resolution().clone()),
+            client_resolution: client.resolution().clone(),
+            server_resolution,
         });
         if self.down(CustodyOp::IssueAsRep) {
             return Err(keyd::IssueError::Unavailable);
         }
         self.inner
-            .issue_as_rep(client, server, proof, armor, template, resolutions, now)
+            .issue_as_rep(client, server, proof, armor, template, now)
     }
     fn open_fast_armor(
         &mut self,
@@ -624,8 +640,7 @@ impl KeyCustody for TestCustody {
     }
     fn issue_tgs_rep(
         &mut self,
-        service: &KeyHandle,
-        service_resolution: &AttestedNameResolution,
+        service: &AttestedNameResolution,
         ctx: &keyd::CtxId,
         template: &keyd::TgsTicketTemplate,
         now: &KerberosTime,
@@ -633,8 +648,7 @@ impl KeyCustody for TestCustody {
         if self.down(CustodyOp::IssueTgsRep) {
             return Err(keyd::IssueError::Unavailable);
         }
-        self.inner
-            .issue_tgs_rep(service, service_resolution, ctx, template, now)
+        self.inner.issue_tgs_rep(service, ctx, template, now)
     }
     fn seal_fast_error(
         &mut self,

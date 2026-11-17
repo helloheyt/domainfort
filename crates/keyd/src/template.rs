@@ -9,7 +9,8 @@
 //! the only way to create a key set), and the use rules — which name may be
 //! used with which key set — in the doors of `StoredKeySet` (crate::store,
 //! R7; since task PN11 issuance passes through dird's verified name
-//! resolution, `StoredKeySet::bound_by`).
+//! resolution, the door `store::bound_by`, which since task PN11b looks the
+//! key set up by that resolution).
 //!
 //! Spec: RFC 4120 2.1-2.6, 3.1.3, 3.3.3, 5.3, 5.4.1, 6.2, 7.3; docs/10 §4,
 //! §5; docs/questions/Q-040 (A-19); docs/59 §4.2, §7.2, §7.3;

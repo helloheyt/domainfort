@@ -44,13 +44,28 @@
 //! MAC — A-65, D182), and keyd binds a client or service key only through a
 //! resolution it verified (docs/59 §7.2).
 //!
+//! # A resolved key set is named once (task PN11b)
+//!
+//! Neither issuance takes a handle for a key set a resolution names: the
+//! client of `issue_as_rep`, its change-password server
+//! ([`AsServerKeySet::ChangePasswordService`]) and the service of
+//! `issue_tgs_rep` reach keyd as their resolutions alone, and keyd looks the
+//! key set up by the resolution it verified — a handle beside the
+//! resolution ("one request states one fact twice", AGENTS.md §6.1;
+//! docs/questions/Q-1067) has no representation. The krbtgt keeps its
+//! handle: it has no resolution (docs/59 §7.2). `verify_preauth` keeps its
+//! client handle (it takes no resolution — docs/questions/Q-1080): its proof
+//! binds the key set keyd pre-authenticated, and `issue_as_rep` requires
+//! that key set to be the verified client resolution's.
+//!
 //! Spec: docs/10 §2 (Role `Kdc`: verify_preauth, issue_as_rep,
 //! open_and_verify_tgt, issue_tgs_rep, open_fast_armor, seal_fast_error),
 //! §4, §5, §5א, §8, §9; docs/48 §2.3; docs/09 א.1; docs/30 §1; docs/50 R50-8,
 //! §3.4, §3.6, §3.7, §7.5; RFC 4120 3.2.3, 7.5.9; docs/questions/Q-217,
-//! Q-222 (A-56); D182; A-63; docs/59 §7.5 (task PN11).
+//! Q-222 (A-56); D182; A-63; docs/59 §7.5 (task PN11); docs/questions/
+//! Q-1067, Q-1080 (task PN11b).
 
-use crate::as_exchange::{AsRepParts, AsResolutions, AsTicketTemplate, AuthnProof};
+use crate::as_exchange::{AsRepParts, AsServerKeySet, AsTicketTemplate, AuthnProof};
 use crate::config::ConfigDescription;
 use crate::error::{AuthnError, Error, IssueError};
 use crate::fast_armor::{FastArmor, FastConversation};
@@ -84,25 +99,24 @@ pub trait KeyCustody {
     ) -> Result<AuthnProof, AuthnError>;
 
     /// docs/10 §4 `issue_as_rep`; armored when `armor` is `Some` (then
-    /// `fast_rep` is `Some`, docs/48 §2.3). `server` is the key set the
-    /// ticket is sealed under: this realm's krbtgt (a TGT), or — armored
-    /// only — the change-password service's (`kadmin/changepw`, under its
-    /// ticket profile); keyd refuses any other (`crate::AsServer`, the
-    /// closed server slot of task K3b). `resolutions` are dird's attested
-    /// name resolutions the account records carried (task PN11): keyd binds
-    /// the client key set — and the change-password service's — only through
-    /// them ([`AsResolutions`]).
+    /// `fast_rep` is `Some`, docs/48 §2.3). `client` is dird's attested
+    /// resolution of the request's (crealm, cname), as the client record
+    /// carried it (task PN11): keyd looks the client key set up by that
+    /// resolution once verified, and the proof must be bound to that key
+    /// set (task PN11b). `server` is the key set the ticket is sealed under
+    /// ([`AsServerKeySet`]): this realm's krbtgt by its handle (a TGT), or —
+    /// armored only — the change-password service by its resolution alone
+    /// (`kadmin/changepw`, under its ticket profile); keyd refuses any other
+    /// (`crate::AsServer`, the closed server slot of task K3b).
     /// Spec: docs/10 §4; docs/53 §5.2; docs/questions/Q-915 items 1, 3
-    /// (A-151); docs/59 §7.2, §7.5.
-    #[allow(clippy::too_many_arguments)]
+    /// (A-151); docs/59 §7.1, §7.2, §7.5; docs/questions/Q-1067.
     fn issue_as_rep(
         &mut self,
-        client: &KeyHandle,
-        server: &KeyHandle,
+        client: &AttestedNameResolution,
+        server: AsServerKeySet<'_>,
         proof: &AuthnProof,
         armor: Option<ArmorId>,
         template: &AsTicketTemplate,
-        resolutions: AsResolutions<'_>,
         now: &KerberosTime,
     ) -> Result<AsRepParts, IssueError>;
 
@@ -130,17 +144,17 @@ pub trait KeyCustody {
     ) -> Result<TgtContext, AuthnError>;
 
     /// docs/10 §5 `issue_tgs_rep` (armored exactly when the context is).
-    /// `service_resolution` is dird's attested resolution of the template's
-    /// sname to the `service` key set, which the service account record
-    /// carried; keyd reaches the service key only through it (task PN11).
-    /// The client needs none: it comes from the TGT keyd sealed
+    /// `service` is dird's attested resolution of the template's sname,
+    /// which the service account record carried (task PN11); keyd looks the
+    /// service key set up by that resolution once verified and reaches its
+    /// key only through it — no handle travels beside it (task PN11b). The
+    /// client needs none: it comes from the TGT keyd sealed
     /// (docs/questions/Q-1011 item 7).
-    /// Spec: docs/10 §5; docs/59 §7.2, §7.5; docs/questions/Q-1011 items 4,
-    /// 7, 8 (A-173).
+    /// Spec: docs/10 §5; docs/59 §7.1, §7.2, §7.5; docs/questions/Q-1011
+    /// items 4, 7, 8 (A-173), Q-1067.
     fn issue_tgs_rep(
         &mut self,
-        service: &KeyHandle,
-        service_resolution: &AttestedNameResolution,
+        service: &AttestedNameResolution,
         ctx: &CtxId,
         template: &TgsTicketTemplate,
         now: &KerberosTime,

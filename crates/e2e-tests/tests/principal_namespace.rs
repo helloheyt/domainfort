@@ -20,7 +20,12 @@
 //!    KDC does, and asks keyd to issue with them misapplied — a wrong tag,
 //!    a stale one, another object's, another purpose's, a ticket name the
 //!    resolution does not hold. Every one is refused `Denied`, audited with
-//!    its reason, and the legitimate login afterwards still works.
+//!    its reason, and the legitimate login afterwards still works. (Since
+//!    task PN11b the KDC names a resolved key set to keyd only by its
+//!    resolution — no handle beside it — so "a resolution with another key
+//!    set" is expressed as the nearest state that still exists: bob's
+//!    resolution with alice's proof, another object's resolution for a
+//!    request naming this service; docs/questions/Q-1080.)
 //! 3. [`no_pac_name_shapes_are_refused_through_the_admin_plane`] — the
 //!    noPac name shapes over `admin.sock` → admind → `dird-admin.sock` →
 //!    dird's one write checker: `dc$` beside a user `dc` (and the reverse),
@@ -69,8 +74,10 @@
 //! 3.1.1.6 items 8-14, 3.1.1.8.4 item 2 (sAMAccountName unique over a
 //! union); RFC 3244 §2 (`kadmin/changepw`); docs/59 §3 (M1-M4), §4.1-§4.4
 //! (N1-N7), §6.2, §7.1-§7.2, §7.5, §9 (S4), §10.1; docs/50 §3.2, §3.4,
-//! §3.5 (R50-5), §7.5, §9; docs/51 §5.2; A-173, A-188..A-191. Every value is
-//! hand-made test data; no vector comes from any other implementation.
+//! §3.5 (R50-5), §7.5, §9; docs/51 §5.2; docs/10 §2 (b), §4 step 1;
+//! A-173, A-188..A-191; docs/questions/Q-1067, Q-1080 (task PN11b). Every
+//! value is hand-made test data; no vector comes from any other
+//! implementation.
 
 #[path = "../../kdc/tests/common/mod.rs"]
 mod common;
@@ -91,7 +98,7 @@ use ipc_dird_admin::{LookupKey, Operation};
 use ipc_keyd::KeydClient;
 use keyd::KeyHandle;
 use keyd_types::{
-    AsRepParts, AsResolutions, AsTicketTemplate, AttestedNameResolution, EncTypeId, IssueError,
+    AsRepParts, AsServerKeySet, AsTicketTemplate, AttestedNameResolution, EncTypeId, IssueError,
     TgsRepParts, TgsTicketTemplate,
 };
 use krb_crypto::ProtocolKey;
@@ -343,12 +350,15 @@ fn first_admin(w: &World, n: usize) -> Account<'static> {
 }
 
 /// One TGT a compromised KDC asks keyd for: `who`'s PA-ENC-TIMESTAMP
-/// relayed at the world time (`verify_preauth`, RFC 4120 §5.2.7.2), then
-/// `issue_as_rep` for `who`'s key set with a template naming `cname` and
-/// `resolution` as dird's statement of the client's name. On success the
-/// enc-part opens under `who`'s key with the template's nonce (RFC 4120
-/// §3.1.5). Spec: docs/50 §3.4 (`VerifyPreauth`, `IssueAsRep`); docs/59
-/// §7.2, §7.5.
+/// relayed at the world time (`verify_preauth` with `who`'s key set handle,
+/// RFC 4120 §5.2.7.2 — the proof binds that key set), then `issue_as_rep`
+/// with `resolution` as dird's statement of the client's name — since task
+/// PN11b the call's only name of the client's key set (keyd looks it up by
+/// the resolution and requires the proof to be bound to it; docs/questions/
+/// Q-1067, Q-1080) — and a template naming `cname`. On success the enc-part
+/// opens under `who`'s key with the template's nonce (RFC 4120 §3.1.5).
+/// Spec: docs/50 §3.4 (`VerifyPreauth`, `IssueAsRep`); docs/59 §7.2, §7.5;
+/// docs/10 §4 step 1.
 fn issue_tgt(
     w: &mut World,
     keyd: &mut KeydClient<connector::KeydConnector>,
@@ -362,7 +372,6 @@ fn issue_tgt(
         .verify_preauth(&who.handle, &padata, None)
         .expect("keyd verifies the relayed timestamp");
     let template = AsTicketTemplate {
-        client: who.handle.principal,
         crealm: realm(),
         cname: cname.clone(),
         sname: common::krbtgt_name(),
@@ -375,15 +384,11 @@ fn issue_tgt(
     };
     let krbtgt = w.manifest.krbtgt().handle;
     let issued = keyd.issue_as_rep(
-        &who.handle,
-        &krbtgt,
+        resolution,
+        AsServerKeySet::LocalTgt(&krbtgt),
         &proof,
         None,
         &template,
-        AsResolutions {
-            client: resolution,
-            server: None,
-        },
     );
     if let Ok(parts) = &issued {
         let part = EncAsRepPart::decode(&common::open(&key, 3, &parts.enc_part)).unwrap();
@@ -396,16 +401,17 @@ fn issue_tgt(
 /// One service ticket a compromised KDC asks keyd for: the client of `tgt`
 /// asks for `sname` (an unarmored TGS-REQ body and its PA-TGS-REQ
 /// authenticator, RFC 4120 §5.5.1, fresh at the world time), keyd opens the
-/// TGT (`open_and_verify_tgt`), then `issue_tgs_rep` under the key set
-/// `service` with `resolution` as dird's statement of the service's name.
-/// On success the ticket names `sname` and the enc-part opens under the
-/// TGT's session key (key usage 8). Spec: docs/50 §3.4 (`OpenAndVerifyTgt`,
-/// `IssueTgsRep`); docs/59 §7.2, §7.5; RFC 4120 §3.3.3.
+/// TGT (`open_and_verify_tgt`), then `issue_tgs_rep` with `resolution` as
+/// dird's statement of the service's name — since task PN11b the call's
+/// only name of the service's key set: keyd seals under the key set the
+/// resolution names (docs/questions/Q-1067). On success the ticket names
+/// `sname` and the enc-part opens under the TGT's session key (key usage
+/// 8). Spec: docs/50 §3.4 (`OpenAndVerifyTgt`, `IssueTgsRep`); docs/59
+/// §7.2, §7.5; RFC 4120 §3.3.3.
 fn issue_service(
     w: &mut World,
     keyd: &mut KeydClient<connector::KeydConnector>,
     tgt: &Tgt,
-    service: &KeyHandle,
     sname: &PrincipalName,
     resolution: &AttestedNameResolution,
 ) -> Result<TgsRepParts, IssueError> {
@@ -439,7 +445,7 @@ fn issue_service(
         session_enctype: EncTypeId::Aes256CtsHmacSha196,
         nonce,
     };
-    let issued = keyd.issue_tgs_rep(service, resolution, &ctx.ctx_id, &template);
+    let issued = keyd.issue_tgs_rep(resolution, &ctx.ctx_id, &template);
     if let Ok(parts) = &issued {
         assert_eq!(&parts.ticket.sname, sname, "RFC 4120 §3.3.3");
         let part = EncTgsRepPart::decode(&common::open(&tgt.session, 8, &parts.enc_part)).unwrap();
@@ -606,13 +612,18 @@ fn issuance_rests_on_the_attested_resolutions_dird_hands_the_kdc() {
             ],
             "every issuance of the run, each through a verified resolution"
         );
+        // An AS refusal names the key set of alice's proof (keyd's own
+        // record); a TGS refusal whose resolution does not verify names no
+        // key set — task PN11b: the request names the service's key set
+        // only in that resolution, and keyd records no unverified field
+        // (docs/questions/Q-1080 item 7; formerly the KDC's handle, ldap).
         assert_eq!(
             issuances(&keyd, KeydOutcome::Denied),
             vec![
                 (As, KeydReason::NameResolutionStale, alice_id),
-                (Tgs, KeydReason::NameResolutionStale, ldap_id),
+                (Tgs, KeydReason::NameResolutionStale, None),
                 (As, KeydReason::NameResolutionInvalid, alice_id),
-                (Tgs, KeydReason::NameResolutionInvalid, ldap_id),
+                (Tgs, KeydReason::NameResolutionInvalid, None),
             ],
             "every refusal, with keyd's reason"
         );
@@ -685,8 +696,11 @@ fn a_compromised_kdc_on_keyd_sock_binds_no_name_to_another_key_set() {
             issue_tgt(&mut w, &mut kdc, &alice, &alice_name, &flipped(&genuine)),
             Err(IssueError::Denied)
         );
-        // Another object's resolution: bob's, genuine, with alice's key set
-        // and proof (step 4: `principal` ≠ the handle's).
+        // Another object's resolution: bob's, genuine, with alice's proof
+        // (step 4; docs/10 §4 step 1). Task PN11b: no client handle travels
+        // beside the resolution, so keyd resolves bob's key set and refuses
+        // because alice's proof is not bound to it — TokenPrincipalMismatch,
+        // formerly NameResolutionMismatch (docs/questions/Q-1080 item 4).
         let bob = w.dird_client_resolution(BOB);
         assert_eq!(
             issue_tgt(&mut w, &mut kdc, &alice, &alice_name, &bob),
@@ -721,44 +735,36 @@ fn a_compromised_kdc_on_keyd_sock_binds_no_name_to_another_key_set() {
                 .expect("dird resolves the service")
         };
         let ldap_resolution = service(&w, &ldap);
-        issue_service(
-            &mut w,
-            &mut kdc,
-            &alice_tgt,
-            &ldap_handle,
-            &ldap,
-            &ldap_resolution,
-        )
-        .expect("dird's resolution of the LDAP service, applied as stated, issues");
+        issue_service(&mut w, &mut kdc, &alice_tgt, &ldap, &ldap_resolution)
+            .expect("dird's resolution of the LDAP service, applied as stated, issues");
         // A wrong tag.
         assert_eq!(
             issue_service(
                 &mut w,
                 &mut kdc,
                 &alice_tgt,
-                &ldap_handle,
                 &ldap,
                 &flipped(&ldap_resolution)
             ),
             Err(IssueError::Denied)
         );
         // Another object's resolution: the admin service's, genuine, for a
-        // ticket sealed under the LDAP service's key set.
+        // request naming the LDAP service. Task PN11b: the KDC can no longer
+        // name the LDAP service's key set beside it — keyd resolves the
+        // admin service's key set and refuses because the ticket's name is
+        // not the resolution's (docs/questions/Q-1080 item 4).
         let admin_resolution = service(&w, &admin_sname);
         assert_eq!(
-            issue_service(
-                &mut w,
-                &mut kdc,
-                &alice_tgt,
-                &ldap_handle,
-                &ldap,
-                &admin_resolution
-            ),
+            issue_service(&mut w, &mut kdc, &alice_tgt, &ldap, &admin_resolution),
             Err(IssueError::Denied)
         );
         // Another purpose: dird's genuine resolution of the LDAP service
         // object's own account name (a client lookup: its principal, the
-        // PrincipalLongterm purpose) for its Service key set.
+        // PrincipalLongterm purpose) for a request naming the LDAP service.
+        // Task PN11b: the purpose it names is the key set keyd would reach,
+        // so the capability table refuses it — PurposeMismatch, formerly
+        // NameResolutionMismatch (docs/10 §2 (b); docs/questions/Q-1080
+        // item 4).
         let ldap_object = w.plan.object(ObjectRole::LdapService).unwrap();
         let ldap_sam = ldap_object.sam_account_name.clone().unwrap();
         let longterm = w
@@ -770,34 +776,20 @@ fn a_compromised_kdc_on_keyd_sock_binds_no_name_to_another_key_set() {
             keyd::KeyPurpose::PrincipalLongterm
         );
         assert_eq!(
-            issue_service(&mut w, &mut kdc, &alice_tgt, &ldap_handle, &ldap, &longterm),
+            issue_service(&mut w, &mut kdc, &alice_tgt, &ldap, &longterm),
             Err(IssueError::Denied)
         );
         // A ticket name the resolution does not hold: the LDAP service's
-        // genuine resolution and key set, the request and template naming
-        // the admin service.
+        // genuine resolution, the request and template naming the admin
+        // service.
         assert_eq!(
-            issue_service(
-                &mut w,
-                &mut kdc,
-                &alice_tgt,
-                &ldap_handle,
-                &admin_sname,
-                &ldap_resolution
-            ),
+            issue_service(&mut w, &mut kdc, &alice_tgt, &admin_sname, &ldap_resolution),
             Err(IssueError::Denied)
         );
         // A stale resolution.
         w.advance(WINDOW_SECS + 1);
         assert_eq!(
-            issue_service(
-                &mut w,
-                &mut kdc,
-                &alice_tgt,
-                &ldap_handle,
-                &ldap,
-                &ldap_resolution
-            ),
+            issue_service(&mut w, &mut kdc, &alice_tgt, &ldap, &ldap_resolution),
             Err(IssueError::Denied)
         );
         drop(kdc);
@@ -817,38 +809,56 @@ fn a_compromised_kdc_on_keyd_sock_binds_no_name_to_another_key_set() {
 
         // ---- every refusal audited, with its reason ---------------------------------
         let alice_id = Some(*alice.handle.principal.as_bytes());
+        let bob_id = Some(*first_admin(&w, 1).handle.principal.as_bytes());
         let ldap_id = Some(*ldap_handle.principal.as_bytes());
+        let admin_id = Some(*w.manifest.admin_service().handle.principal.as_bytes());
         let events = w.finish();
         let keyd = keyd_records(&events);
         use KeydOperation::{IssueAsRep as As, IssueTgsRep as Tgs};
         use KeydReason::{
             NameResolutionInvalid as Invalid, NameResolutionMismatch as Mismatch,
-            NameResolutionStale as Stale,
+            NameResolutionStale as Stale, PurposeMismatch as Purpose,
+            TokenPrincipalMismatch as NotTheProofs,
         };
+        // Task PN11b (docs/questions/Q-1080 items 4, 7): a record names the
+        // key set keyd knows — at AS the proof's (alice's), then the verified
+        // client resolution's (bob's, in the attack that presents it); at TGS
+        // the verified resolution's, or none when it does not verify. Before
+        // PN11b every record named the key set the KDC's handle asked for.
         assert_eq!(
             issuances(&keyd, KeydOutcome::Denied),
             vec![
                 (As, Invalid, alice_id),
-                (As, Mismatch, alice_id),
+                (As, NotTheProofs, bob_id),
                 (As, Mismatch, alice_id),
                 (As, Stale, alice_id),
-                (Tgs, Invalid, ldap_id),
+                (Tgs, Invalid, None),
+                (Tgs, Mismatch, admin_id),
+                (Tgs, Purpose, ldap_id),
                 (Tgs, Mismatch, ldap_id),
-                (Tgs, Mismatch, ldap_id),
-                (Tgs, Mismatch, ldap_id),
-                (Tgs, Stale, ldap_id),
+                (Tgs, Stale, None),
             ],
             "each attack: one refusal record of the Kdc role, keyd's reason"
         );
-        // Every refusal names the key set the request asked for — the
-        // LDAP service's Service key set even for the PrincipalLongterm
-        // resolution of its account name.
-        for record in keyd
-            .iter()
-            .filter(|r| r.op == KeydOperation::IssueTgsRep && r.result == KeydOutcome::Denied)
-        {
-            assert_eq!(record.purpose, Some(ipc_audit::KeyPurposeCode::Service));
-        }
+        // Each TGS refusal names the purpose of the key set the verified
+        // resolution names — the admin service's AdminService set, the LDAP
+        // object's PrincipalLongterm set, the LDAP service's Service set —
+        // and none for a resolution that did not verify (formerly always
+        // the Service set the KDC's handle named).
+        use ipc_audit::KeyPurposeCode as Code;
+        assert_eq!(
+            keyd.iter()
+                .filter(|r| r.op == KeydOperation::IssueTgsRep && r.result == KeydOutcome::Denied)
+                .map(|r| r.purpose)
+                .collect::<Vec<_>>(),
+            vec![
+                None,
+                Some(Code::AdminService),
+                Some(Code::PrincipalLongterm),
+                Some(Code::Service),
+                None,
+            ]
+        );
         // The running kdc served only the legitimate exchanges — every one
         // issued (the compromised KDC's calls went to keyd.sock directly, so
         // keyd's records above are their only trace, as for a real one).

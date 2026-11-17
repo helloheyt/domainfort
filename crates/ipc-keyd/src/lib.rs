@@ -22,10 +22,10 @@
 //! | request kind | operation | role (docs/10 §2) | success reply kind | failure reply kind |
 //! |---|---|---|---|---|
 //! | `0x01` | `verify_preauth` | Kdc | `0x81` `AuthnProof` | `0xF1` `AuthnError` |
-//! | `0x02` | `issue_as_rep` (+ dird's client resolution and, for the change-password service, its own — task PN11) | Kdc | `0x82` `AsRepParts` | `0xF2` `IssueError` |
+//! | `0x02` | `issue_as_rep` (dird's client resolution — no client handle; the server: the krbtgt's handle, or the change-password service's resolution — tasks PN11, PN11b) | Kdc | `0x82` `AsRepParts` | `0xF2` `IssueError` |
 //! | `0x03` | `open_fast_armor` | Kdc | `0x83` `FastArmor` | `0xF1` |
 //! | `0x04` | `open_and_verify_tgt` | Kdc | `0x84` `TgtContext` | `0xF1` |
-//! | `0x05` | `issue_tgs_rep` (+ dird's service resolution — task PN11) | Kdc | `0x85` `TgsRepParts` | `0xF2` |
+//! | `0x05` | `issue_tgs_rep` (dird's service resolution — no service handle; tasks PN11, PN11b) | Kdc | `0x85` `TgsRepParts` | `0xF2` |
 //! | `0x06` | `seal_fast_error` | Kdc | `0x86` `EncryptedData` | `0xF3` `Error` |
 //! | `0x07` | `open_and_verify_service_ticket(principal)` — unbound only (R2: the binding names the key purpose; Q-523) | Ldap | `0x87` `ServiceContext` (with its context id) | `0xF1` |
 //! | `0x08` | `set_secret` | Directory | `0x88` `Kvno` | `0xF3` |
@@ -110,7 +110,15 @@
 //! with the X.690 header arithmetic (ITU-T X.690 (02/2021) §8.1.2.2,
 //! §8.1.3, §8.3, §10.1; RFC 4120 §5.2.1, §5.2.2, §5.2.4, pinned copies) — and
 //! re-derived the request body bound (docs/59 §7.1, §7.5; docs/questions/
-//! Q-1011 item 8, Q-1060); `KEYD_VERSION` stays 1.
+//! Q-1011 item 8, Q-1060); `KEYD_VERSION` stays 1. Task PN11b removed the
+//! handles those resolutions restated — the client's and the
+//! change-password service's from `issue_as_rep` (the server is now one
+//! closed choice, [`wire::WireAsServer`]: the krbtgt's handle or the
+//! service's resolution), the template's client principal, and the
+//! service's from `issue_tgs_rep` — so a resolved key set is named once
+//! (docs/questions/Q-1067); the old layouts are refused, never misread; the
+//! request body bound re-derived unchanged (Q-1081); `KEYD_VERSION` stays
+//! 1.
 //!
 //! Spec: docs/50 §3, §10 (P5); R50-3, R50-4, R50-5, R50-7, R50-8; docs/10;
 //! A-56; A-59; A-62; D182; A-63; A-87; A-88; docs/52 §7 R9 (A-102).
@@ -132,8 +140,8 @@ pub use client::{
 };
 pub use server::{decode_request, encode_answer, Rejection};
 pub use typed::{
-    Answer, AttestationKeyOctets, Call, ConversionError, DescribedConfig, IssuanceCall, Password,
-    RoutedCall, StateCall, TgsFast,
+    Answer, AsServerArgument, AttestationKeyOctets, Call, ConversionError, DescribedConfig,
+    IssuanceCall, Password, RoutedCall, StateCall, TgsFast,
 };
 // The role a client expects keyd to resolve for it (task R9), re-exported
 // beside `ExpectedPeer` for its callers.

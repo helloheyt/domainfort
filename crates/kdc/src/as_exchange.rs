@@ -126,7 +126,12 @@
 //! `kadmin/changepw`, the service record's — as dird sent them; keyd binds
 //! the client key and the change-password service's key only through them,
 //! so the KDC cannot choose which key set a name maps to. The TGT's krbtgt
-//! takes none (the canonical `krbtgt/<REALM>`, [MS-KILE] 3.3.5.1.2).
+//! takes none (the canonical `krbtgt/<REALM>`, [MS-KILE] 3.3.5.1.2) and
+//! goes by its handle. Since task PN11b the KDC names those two key sets to
+//! `issue_as_rep` only by their resolutions — no handle beside them, no
+//! client in the template (docs/questions/Q-1067); `verify_preauth` still
+//! takes the client record's handle, which keyd binds its proof to and
+//! checks against the resolution at issuance (docs/questions/Q-1080).
 //!
 //! Every keyd call above (`open_fast_armor`, `verify_preauth`,
 //! `issue_as_rep`) that keyd does not serve — the `Unavailable` variant: its
@@ -162,7 +167,7 @@ use crate::time::seconds;
 use crate::transport::Peer;
 use core::time::Duration;
 use keyd_types::{
-    ArmorId, AsRepParts, AsResolutions, AsTicketTemplate, AuthnError, AuthnProof, EncTypeId,
+    ArmorId, AsRepParts, AsServerKeySet, AsTicketTemplate, AuthnError, AuthnProof, EncTypeId,
     KeyCustody, KeyPurpose, CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS,
 };
 use krb_proto::constants::{
@@ -848,7 +853,6 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
             .clone()
             .ok_or_else(|| internal(AuditReason::InternalFailure))?;
         let template = AsTicketTemplate {
-            client: account.key().principal,
             crealm: body.realm.clone(),
             cname,
             sname: local_tgs_name(&self.config.realm)?,
@@ -859,20 +863,17 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
             session_enctype,
             nonce: body.nonce,
         };
-        // The client's resolution as dird sent it (task PN11); the krbtgt
-        // takes none (docs/59 §7.2).
+        // The client's resolution as dird sent it — the call's only name of
+        // the client's key set (tasks PN11, PN11b); the krbtgt has none and
+        // goes by its handle (docs/59 §7.2).
         let krbtgt = self.config.krbtgt;
         self.custody
             .issue_as_rep(
-                &account.key(),
-                &krbtgt,
+                &account.resolution,
+                AsServerKeySet::LocalTgt(&krbtgt),
                 proof,
                 armor,
                 &template,
-                AsResolutions {
-                    client: &account.resolution,
-                    server: None,
-                },
                 now,
             )
             .map_err(issue_refusal)
@@ -1034,7 +1035,6 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
             .clone()
             .ok_or_else(|| internal(AuditReason::InternalFailure))?;
         let template = AsTicketTemplate {
-            client: account.key().principal,
             crealm: body.realm.clone(),
             cname,
             sname,
@@ -1046,19 +1046,16 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
             nonce: body.nonce,
         };
         // Both resolutions as dird sent them: the client's and the
-        // change-password service's — keyd binds each key set only through
-        // its own (task PN11; docs/59 §7.2).
+        // change-password service's — the call's only names of the two key
+        // sets; keyd looks each set up by its own and binds it only through
+        // it (tasks PN11, PN11b; docs/59 §7.2).
         self.custody
             .issue_as_rep(
-                &account.key(),
-                &target.service.key(),
+                &account.resolution,
+                AsServerKeySet::ChangePasswordService(&target.service.resolution),
                 proof,
                 Some(target.armor),
                 &template,
-                AsResolutions {
-                    client: &account.resolution,
-                    server: Some(&target.service.resolution),
-                },
                 now,
             )
             .map_err(issue_refusal)

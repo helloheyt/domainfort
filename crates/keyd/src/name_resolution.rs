@@ -20,14 +20,17 @@
 //! — and only then is there a [`VerifiedNameResolution`]. Steps 4 and 5
 //! (the resolution names the key set: principal, purpose, bound name; the
 //! ticket's name is one of the resolution's two names) are
-//! `StoredKeySet::bound_by` (crate store), the only way from a verified
-//! resolution to a key.
+//! `store::bound_by`, the only way from a verified resolution to a key —
+//! which looks the key set up by the resolution's own `(principal,
+//! key_purpose)` (task PN11b: no handle travels beside a resolution, so
+//! none is compared).
 //!
 //! # Issuance through the resolution (task PN11)
 //!
 //! `issue_as_rep` (the client key set; the change-password service's) and
 //! `issue_tgs_rep` (the service key set) verify the resolution the KDC
-//! forwarded and reach the key only through `bound_by`; the krbtgt is
+//! forwarded — the only name of that key set in the request (task PN11b)
+//! — and reach the key only through `bound_by`; the krbtgt is
 //! reached by its exact stored binding (`StoredKeySet::ticket_granting`) and
 //! the acceptor compares the ticket's sname through [`same_principal`]
 //! (`StoredKeySet::accepting`) — docs/59 §7.2.
@@ -104,7 +107,8 @@ use principal_names::{key_of_request, NameContext, RequestKey};
 /// freshness window of keyd's clock (docs/59 §7.2 steps 1–3). Built only
 /// from the proof `AuthenticatedNameResolution`, by
 /// [`Keyd::verify_name_resolution`]; its fields are private. Consumed by
-/// `StoredKeySet::bound_by` (step 4). Not secret.
+/// `store::bound_by` (step 4), which looks up the key set it names. Not
+/// secret.
 ///
 /// Spec: docs/59 §7.2; docs/questions/Q-1011 item 4 (A-173: "`BoundKeys`
 /// only from `VerifiedNameResolution`"); AGENTS.md §6.1.
@@ -152,8 +156,12 @@ impl VerifiedNameResolution {
         &self.resolution
     }
 
-    /// The key set the resolution names: `(principal, key_purpose)`.
-    /// Spec: docs/59 §7.2 step 4; docs/10 §1.
+    /// The key set the resolution names: `(principal, key_purpose)` — the
+    /// only handle an issuance has for a resolved key set (task PN11b): the
+    /// door looks the set up by it, and the operation checks its purpose
+    /// against the capability table's slot.
+    /// Spec: docs/59 §7.1, §7.2 step 4; docs/10 §1, §2 (b); docs/questions/
+    /// Q-1067.
     pub(crate) fn handle(&self) -> KeyHandle {
         KeyHandle::new(self.resolution.principal(), self.resolution.key_purpose())
     }
@@ -534,50 +542,65 @@ mod tests {
             .unwrap()
     }
 
-    /// `bound_by` for a ticket that carries the resolution's canonical
-    /// pair (step 5 then holds; steps 1–4 are what these tests vary).
-    fn bound_by(
-        keyd: &TestKeyd,
-        handle: &KeyHandle,
-        f: NameResolutionFields,
-    ) -> Result<(), AuditReason> {
+    /// The door (`store::bound_by`) for a ticket that carries the
+    /// resolution's canonical pair (step 5 then holds; steps 1–4 are what
+    /// these tests vary) — the key set is the one the resolution names
+    /// (task PN11b); `Ok` holds its current kvno.
+    fn bound_by(keyd: &TestKeyd, f: NameResolutionFields) -> Result<crate::Kvno, AuditReason> {
         let (ticket_realm, ticket_name) = (f.canonical_realm.clone(), f.canonical_name.clone());
         let resolution = verified(keyd, f);
-        let set = keyd.store.get(handle).unwrap();
-        reason(set.bound_by(&resolution, &ticket_realm, &ticket_name))
+        crate::store::bound_by(&keyd.store, &resolution, &ticket_realm, &ticket_name)
+            .map(|bound| bound.current().kvno())
+            .map_err(|deny| deny.reason)
     }
 
-    /// docs/59 §7.2 step 4: the resolution of the service's own handle and
-    /// bound name yields the set's keys (its current version).
-    #[test]
-    fn bound_by_its_own_resolution_gives_the_keys() {
-        let keyd = keyd_with_key();
-        let resolution = verified(&keyd, fields());
-        let set = keyd.store.get(&SERVICE).unwrap();
-        let bound = set
-            .bound_by(&resolution, &realm(), &service_name())
-            .unwrap();
-        assert_eq!(bound.current().kvno(), crate::Kvno::INITIAL);
-        // The user's key set by its own resolution, too.
+    /// The fields of dird's resolution of alice's name to her key set.
+    fn alice_fields() -> NameResolutionFields {
         let mut f = fields();
         f.name_as_sent = name(1, &["alice"]);
         f.canonical_name = name(1, &["alice"]);
         f.principal = ALICE_ID;
         f.key_purpose = KeyPurpose::PrincipalLongterm;
-        assert_eq!(bound_by(&keyd, &ALICE, f), Ok(()));
+        f
     }
 
-    /// docs/59 §7.2 step 4, §10.1: a verified resolution of another
-    /// principal or another purpose never opens this set — the comparison
-    /// is with the set's own handle.
+    /// docs/59 §7.2 step 4: the resolution of the service's own key set and
+    /// bound name yields that set's keys (its current version); alice's own
+    /// resolution yields hers.
     #[test]
-    fn bound_by_refuses_another_principal_or_purpose() {
+    fn bound_by_its_own_resolution_gives_the_keys() {
         let keyd = keyd_with_key();
+        assert_eq!(bound_by(&keyd, fields()), Ok(crate::Kvno::INITIAL));
+        assert_eq!(bound_by(&keyd, alice_fields()), Ok(crate::Kvno::INITIAL));
+    }
+
+    /// Task PN11b (docs/questions/Q-1067; docs/59 §7.1, §7.2 step 4): the
+    /// door looks the key set up by the resolution's own `(principal,
+    /// key_purpose)` — it takes no set and no handle — so the set whose keys
+    /// it yields is exactly the one the resolution names: after the
+    /// service's key set is rotated, the service's resolution reaches the
+    /// new version and alice's still hers; a resolution of a key set keyd
+    /// does not hold (another principal, another purpose) reaches nothing
+    /// (`KeyNotFound`); and a resolution mapping the service's name to
+    /// alice's key set opens hers only if her binding is that name — it is
+    /// not (`NameResolutionMismatch`; docs/59 §9 S5).
+    #[test]
+    fn the_door_opens_only_the_key_set_the_resolution_names() {
+        let mut keyd = keyd_with_key();
+        let random =
+            krb_crypto::random_to_key(krb_crypto::EncType::Aes256CtsHmacSha196, &[0x42; 32])
+                .unwrap();
+        keyd.store
+            .get_mut(&SERVICE)
+            .unwrap()
+            .rotate_random(crate::Kvno::new(2), vec![random]);
+        assert_eq!(bound_by(&keyd, fields()), Ok(crate::Kvno::new(2)));
+        assert_eq!(bound_by(&keyd, alice_fields()), Ok(crate::Kvno::INITIAL));
         let mut other_principal = fields();
-        other_principal.principal = ALICE_ID;
+        other_principal.principal = PrincipalId::from_bytes([0x0E; 16]);
         assert_eq!(
-            bound_by(&keyd, &SERVICE, other_principal),
-            Err(AuditReason::NameResolutionMismatch)
+            bound_by(&keyd, other_principal),
+            Err(AuditReason::KeyNotFound)
         );
         for purpose in [
             KeyPurpose::PrincipalLongterm,
@@ -588,18 +611,17 @@ mod tests {
             let mut f = fields();
             f.key_purpose = purpose;
             assert_eq!(
-                bound_by(&keyd, &SERVICE, f),
-                Err(AuditReason::NameResolutionMismatch),
+                bound_by(&keyd, f),
+                Err(AuditReason::KeyNotFound),
                 "{purpose:?}"
             );
         }
-        // Alice's resolution presented to the service's set.
-        let mut alice = fields();
-        alice.canonical_name = name(1, &["alice"]);
-        alice.principal = ALICE_ID;
-        alice.key_purpose = KeyPurpose::PrincipalLongterm;
+        // The service's name resolved to alice's key set.
+        let mut swapped = fields();
+        swapped.principal = ALICE_ID;
+        swapped.key_purpose = KeyPurpose::PrincipalLongterm;
         assert_eq!(
-            bound_by(&keyd, &SERVICE, alice),
+            bound_by(&keyd, swapped),
             Err(AuditReason::NameResolutionMismatch)
         );
     }
@@ -632,7 +654,7 @@ mod tests {
         ] {
             let mut f = fields();
             f.canonical_name = canonical.clone();
-            assert_eq!(bound_by(&keyd, &SERVICE, f), expected, "{canonical:?}");
+            assert_eq!(bound_by(&keyd, f).map(|_| ()), expected, "{canonical:?}");
         }
     }
 
@@ -647,10 +669,7 @@ mod tests {
         f.canonical_name = name(2, &["krbtgt", REALM]);
         f.principal = KRBTGT_ID;
         f.key_purpose = KeyPurpose::Krbtgt;
-        assert_eq!(
-            bound_by(&keyd, &KRBTGT, f),
-            Err(AuditReason::NameResolutionMismatch)
-        );
+        assert_eq!(bound_by(&keyd, f), Err(AuditReason::NameResolutionMismatch));
     }
 
     /// docs/59 §7.2 step 5 (task PN11): the ticket's (realm, name) must be
@@ -665,8 +684,9 @@ mod tests {
         // dird resolved a request spelled in upper case to the stored SPN.
         f.name_as_sent = name(3, &["HOST", "files.example.org"]);
         let resolution = verified(&keyd, f);
-        let set = keyd.store.get(&SERVICE).unwrap();
-        let ticket = |r: &Realm, n: &PrincipalName| reason(set.bound_by(&resolution, r, n));
+        let ticket = |r: &Realm, n: &PrincipalName| {
+            reason(crate::store::bound_by(&keyd.store, &resolution, r, n))
+        };
         assert_eq!(ticket(&realm(), &service_name()), Ok(()));
         assert_eq!(
             ticket(&realm(), &name(3, &["HOST", "files.example.org"])),

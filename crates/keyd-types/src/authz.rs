@@ -640,19 +640,30 @@ pub const fn role_permits(role: Role, op: Operation) -> bool {
 
 /// Which handle argument of an operation a purpose check is about.
 ///
-/// `issue_as_rep` takes a client and a server handle; its server slot has
+/// `issue_as_rep` has a client and a server key set; its server slot has
 /// two variants, chosen by whether the issuance is FAST-armored
 /// ([`as_server_slot`]) — so the capability table itself, and its
 /// compile-time pins, say that the change-password service is a server only
 /// of an armored issuance (task K3b).
 ///
+/// Since task PN11b a slot is not always filled from a handle in the
+/// request: the AS client (`Primary`), the change-password server
+/// (`ArmoredAsServer`) and the TGS service (`Primary`) reach keyd only as
+/// dird's attested name resolutions, and keyd checks the purpose of the key
+/// set each verified resolution names against the same slot — the table
+/// stays the one definition of which purposes a slot accepts
+/// (docs/questions/Q-1067).
+///
 /// Spec: docs/10 §4 (issue_as_rep takes a client and a server handle);
-/// docs/53 §5.2; docs/questions/Q-915 items 1, 3 (A-151).
+/// docs/53 §5.2; docs/questions/Q-915 items 1, 3 (A-151); docs/59 §7.1,
+/// §7.2; docs/questions/Q-1067.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum HandleSlot {
     /// The operation's main handle (the client, service, krbtgt or managed
-    /// key, depending on the operation).
+    /// key, depending on the operation) — for `issue_as_rep`'s client and
+    /// `issue_tgs_rep`'s service, the key set a verified resolution names
+    /// (task PN11b).
     Primary = 0,
     /// The server handle of an **unarmored** `issue_as_rep`: the key set
     /// the ticket is sealed under — this realm's krbtgt only
@@ -667,8 +678,10 @@ pub enum HandleSlot {
     Secondary = 2,
     /// The server handle of a **FAST-armored** `issue_as_rep`: krbtgt or the
     /// change-password service's key set ([`AsServer::of`] with `armored =
-    /// true`).
-    /// Spec: docs/53 §5.2; docs/questions/Q-915 items 1, 3 (A-151); A-117.
+    /// true`) — the latter the key set the service's verified resolution
+    /// names (task PN11b).
+    /// Spec: docs/53 §5.2; docs/questions/Q-915 items 1, 3 (A-151); A-117;
+    /// docs/questions/Q-1067.
     ArmoredAsServer = 3,
 }
 
