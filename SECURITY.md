@@ -5,6 +5,9 @@
 This project is **pre-alpha** and has no released version. Nothing here should be deployed to protect
 real systems yet.
 
+Use of any version is entirely at your own risk, and reports are handled on a best-effort basis
+only, with no obligation to respond, fix or notify — see [DISCLAIMER.md](DISCLAIMER.md).
+
 ## Reporting a vulnerability
 
 Please report suspected vulnerabilities **privately** through GitHub's private vulnerability

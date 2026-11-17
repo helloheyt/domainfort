@@ -5,6 +5,10 @@
 > **Status: pre-alpha. Not for production use.** There is no release. Several security-critical
 > components still run in clearly labelled development modes (see [Status](docs/STATUS.md)), and
 > neither Windows nor Linux computers can join a Domainfort domain yet.
+>
+> **Disclaimer:** use of this project, in any version, commit or form, is entirely at your own risk.
+> It is provided "as is", without warranty of any kind, and the authors accept no liability for any
+> damage or loss of any kind arising from its use. See [DISCLAIMER.md](DISCLAIMER.md).
 
 ## What it is
 
@@ -128,6 +132,16 @@ Do not open a public issue.
 ## Licence
 
 GNU Affero General Public License v3.0 — see [LICENSE](LICENSE).
+
+## Disclaimer
+
+Domainfort is provided **"as is", without warranty of any kind**. Any use of it — of any version,
+commit, branch, tag, release, fork or copy, including old versions and versions published before
+this notice was added — is **entirely at your own risk**, and you alone are responsible for its
+results. To the maximum extent permitted by law, the authors and contributors accept **no
+liability** for any damage or loss of any kind, direct or indirect, arising from the project or its
+use. It is pre-alpha security software: do not use it to protect real systems. The full notice is
+in [DISCLAIMER.md](DISCLAIMER.md); it applies together with sections 15–17 of the licence.
 
 ---
 
