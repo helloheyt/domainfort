@@ -22,7 +22,7 @@ fuzzers running continuously, and an external security review of the KDC.
 
 ## The crates
 
-52 crates, grouped by area.
+55 crates, grouped by area.
 
 ### Encoding and parsers
 
@@ -43,6 +43,7 @@ fuzzers running continuously, and an external security review of the KDC.
 | `krb-proto` | Typed Kerberos V5 and FAST messages with strict DER decoding and canonical encoding. |
 | `kdc` | The KDC as a library: AS and TGS, mandatory FAST, a policy decision at every step; no keys, no sockets. |
 | `kdc-daemon` | The KDC process: UDP and TCP 88, bounded queues, rate limits, audit. |
+| `gss-token` | Strict framing of Kerberos GSS-API tokens — the initial-context token, the authenticator checksum, the wrap-token header — with no cryptography; groundwork for the LDAP Kerberos bind, not linked by a daemon yet. |
 
 ### Key custody
 
@@ -59,6 +60,8 @@ fuzzers running continuously, and an external security review of the KDC.
 |---|---|
 | `dirstore` | The directory storage engine over an embedded key-value store: per-record integrity MAC, snapshots, tombstones, link and uniqueness indexes. |
 | `ad-schema` | A first subset of the Active Directory schema, as data. |
+| `principal-names` | The one definition of principal-name equivalence — one fold, one key form — shared by the write path, the lookup and the key holder ([PRINCIPAL-NAMESPACE.md](PRINCIPAL-NAMESPACE.md)). |
+| `name-attestation` | The tag over `dird`'s name resolutions: `dird` signs every resolution it hands the KDC, and the key holder verifies it before it reaches any key. |
 | `directory-pip` | The directory as seen by the KDC and the policy decision point: account lookup, group expansion, tier classification, the visibility gate, the one revocation rule. |
 | `pdp` | The central policy decision point and the Windows access check. |
 | `policy-store` | The policy file loaded by `dird` and the KDC (currently an explicitly unsigned development format). |
@@ -147,25 +150,38 @@ machine:
   attempts, and refusal of password binds.
 - **Fail closed.** `keyd`, `dird` and the audit daemon stopped and restarted; policy
   version mismatches; channels deliberately cross-wired to the wrong daemon.
-- **DNS.** The DNS front serving from a fetched zone image over UDP and TCP: freshness, refresh by
-  serial number, internal sources only, rate limits, UDP size rules and TCP framing bounds — against
-  a test stand-in for `dird`.
+- **DNS.** `dird` builds the zone image from the directory — the domain controller's records from
+  provisioning, a service record only for a service that actually listens, a serial that advances
+  only through the one checked write — and the DNS front serves it over UDP and TCP 53: freshness,
+  refresh by serial number, internal sources only, rate limits, UDP size rules and TCP framing
+  bounds.
+- **Principal namespace.** Every ticket rests on `dird`'s signed name resolution, verified by the
+  key holder, which finds the key set only from that resolution. A forged, stale or mismatched
+  resolution sent by a compromised KDC is refused and audited; the account-name spoofing shapes
+  (names that differ only in a final "$", reserved names in another case, colliding service names)
+  are refused at write time with nothing written, and the KDC has no fallback lookup. See
+  [PRINCIPAL-NAMESPACE.md](PRINCIPAL-NAMESPACE.md).
 - **Distinct accounts.** On Linux as root, the daemons run under distinct accounts and the audit
   daemon labels each record with the right source; process hardening is applied and verified.
 
 What does **not** work yet: no Windows or Linux computer can join; there is no Kerberos bind for
-LDAP; `dird` does not yet serve the DNS zone; there is no time service; there is no shipped
-command-line or graphical administration client; keys do not survive a `keyd` restart.
+LDAP; secure dynamic DNS updates are not accepted yet; there is no time service; there is no
+shipped command-line or graphical administration client; keys do not survive a `keyd` restart
+([KEY-CUSTODY.md](KEY-CUSTODY.md#key-storage-the-main-gap-before-deployment)).
 
 ## What is next
 
 Work that does not depend on outside decisions:
 
-- **The directory side of DNS:** `dird` builds the zone image from the directory and serves it, so
-  that the DNS front starts against a real `dird`.
+- **The Kerberos bind for LDAP**, designed in [LDAP-GSSAPI-BIND.md](LDAP-GSSAPI-BIND.md): the TLS
+  front computes the TLS 1.3 channel-binding value once per connection, a dedicated LDAP service
+  key, the key holder's two acceptor operations, and the engine's bind state machine. The token
+  framing (`gss-token`) is done.
+- **The last key handle the KDC states:** pre-authentication takes the client's signed name
+  resolution, and the key holder stamps the time of an armored error itself.
 - **An end-to-end test through the change-password front** over TCP.
-- **Groundwork for the protocols that follow:** one principal-name index and one security-context
-  acceptor inside `keyd`, shared by every Kerberos-based channel.
+- **The Linux member side:** the interface documentation it needs (the POSIX user and group
+  database, PAM, NSS) is now in the project's allowed sources; the design comes next.
 - **Build hardening:** a check of every artifact's complete linked set against a closed list of
   what it may contain, and supply-chain tooling as a required part of the gate.
 
@@ -175,7 +191,7 @@ Work that does not depend on outside decisions:
 |---|---|
 | Persistent key store | A sealed key store backend, awaiting a cryptographic library decision for the sealing suite; a hardware-anchored (TPM) backend, awaiting a dependency decision. |
 | Signed policy and signed audit log | A decision on the signature scheme and the custody of the signing keys. |
-| Kerberos bind for LDAP; the Linux member side (join, logon, identity) | The GSS-API interface specifications and operating-system interface documentation being added to the project's allowed sources. |
+| Kerberos bind for LDAP | A decision on the channel-binding digest: RFC 4121 defines it as MD5, which the project otherwise refuses ([LDAP-GSSAPI-BIND.md](LDAP-GSSAPI-BIND.md#open-design-questions)). Everything else in the bind can be built before it. |
 | DNS | Specifications for IPv6 address records, negative caching, TKEY and DNSSEC record formats, and DNS over TLS being added to the allowed sources. |
 | Time | The authenticated-encryption specification NTS mandates being added to the allowed sources; a decision on the domain controller's own time source. |
 | Windows-facing phase | A decision on the supported Windows versions; the file-system specification SMB needs being added to the allowed sources; further interoperability recordings. |

@@ -74,14 +74,15 @@ linked. Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 | | |
 |---|---|
-| Workspace | 52 crates, roughly 320,000 lines of Rust including tests |
-| Tests | over 3,000 test functions; day-to-day runs are on macOS, and the full suite, including the root-only tests, has also been run on Debian 12 at an earlier point of development |
-| Fuzz targets | 46, in 27 crates, covering the network-facing parsers, the IPC codecs and the file formats; continuous fuzzing is not set up yet |
+| Workspace | 55 crates, roughly 365,000 lines of Rust including tests |
+| Tests | about 3,550 test functions; day-to-day runs are on macOS, and the full suite, including the root-only tests, has also been run on Debian 12 at an earlier point of development |
+| Fuzz targets | 51, in 29 crates, covering the network-facing parsers, the IPC codecs and the file formats; continuous fuzzing is not set up yet |
 | Processes | `keyd` (key custody), `dird` (directory, policy decisions, write path), `kdc-daemon`, `ldap-front`, `dns-daemon`, `kpasswd-front`, `audit-daemon`, `admin-daemon`; tools `provision` and `keyadm` |
 | Kerberos | AS and TGS with **mandatory FAST**, AES-only encryption types (RFC 3961/3962/8009 on approved primitives, verified against the RFC test vectors), change password (RFC 3244) over TCP |
 | Directory | storage engine with per-record integrity protection, a first subset of the Active Directory schema, Windows security descriptors and access checks, a central policy decision point |
 | LDAP | read-only engine behind a TLS 1.3 front: the rootDSE, and directory search for authenticated clients (the Kerberos bind that provides them is planned); no password binds, no writes |
-| DNS | strict DNS codec, an authoritative zone image and answer function, and the DNS front process |
+| DNS | strict DNS codec; `dird` builds the authoritative zone image from the directory and the DNS front serves it |
+| Principal names | one name space for every kind of principal name; `dird` signs every name resolution and the key holder verifies it before reaching any key |
 | Administration | local administration plane with dual control, effect plans, a password policy, offline provisioning and a key ceremony |
 | Audit | append-only, hash-chained audit log; intent acknowledged before every state change |
 
@@ -123,6 +124,10 @@ The daemons run on Linux only. The code builds and the tests run on macOS and on
 | [docs/STATUS.md](docs/STATUS.md) | crates by area, what works end to end, what is next, what is blocked |
 | [docs/BUILDING.md](docs/BUILDING.md) | toolchain, checks, test tiers, fuzzing, platforms |
 | [docs/STANDARDS.md](docs/STANDARDS.md) | the standards implemented or read, grouped by area |
+| [docs/KEY-CUSTODY.md](docs/KEY-CUSTODY.md) | the key holder: compute-don't-give, roles, one-time tokens, FAST, the ceremony, what a compromised KDC can and cannot do |
+| [docs/PRINCIPAL-NAMESPACE.md](docs/PRINCIPAL-NAMESPACE.md) | one name space for every principal, signed name resolutions, and the name-confusion attacks it rules out |
+| [docs/AD-ATTACK-CLASSES.md](docs/AD-ATTACK-CLASSES.md) | known Active Directory weakness classes and this design's answer to each, with status |
+| [docs/LDAP-GSSAPI-BIND.md](docs/LDAP-GSSAPI-BIND.md) | the design of the Kerberos bind for LDAP over TLS 1.3 with channel binding (planned) |
 
 ## Reporting a vulnerability
 

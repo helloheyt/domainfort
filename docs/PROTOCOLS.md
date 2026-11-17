@@ -97,7 +97,8 @@ change-password version; change password over UDP.
 ## LDAP
 
 **Standards:** RFC 4511, RFC 4512, RFC 4513, RFC 4514, RFC 4517, RFC 8446, RFC 5280; [MS-ADTS];
-for the planned bind: RFC 4422, RFC 4752, RFC 4121, RFC 5929, [MS-SPNG].
+for the planned bind: RFC 4422, RFC 4752, RFC 4121, RFC 2743, RFC 9266 (and, for the Windows-facing
+phase, RFC 5929 and [MS-SPNG]).
 
 ### Implemented
 
@@ -125,11 +126,16 @@ for the planned bind: RFC 4422, RFC 4752, RFC 4121, RFC 5929, [MS-SPNG].
 
 ### Planned
 
-- **Kerberos bind** through SASL (RFC 4422) with GSS-SPNEGO or GSSAPI (RFC 4752), Kerberos first,
-  with the **SASL security layer providing confidentiality (sealing)** — the protection Windows
-  members use. An authenticated session without sealing will not be representable, and the
-  security layer will terminate inside the key holder. Whether TLS remains offered next to it is an
-  open design decision; if it does, channel binding (RFC 5929) will be required on binds over TLS.
+- **Kerberos bind for native clients** (designed; the GSS token framing crate `gss-token` exists):
+  SASL (RFC 4422) GSSAPI (RFC 4752) **over TLS 1.3 only**, with no SASL security layer, bound to the
+  TLS connection with the `tls-exporter` channel binding (RFC 9266), one GSSAPI exchange per TLS
+  connection, and all Kerberos cryptography inside the key holder. GSSAPI is advertised only once a
+  successful bind is possible. Details and open questions: [LDAP-GSSAPI-BIND.md](LDAP-GSSAPI-BIND.md).
+- **Kerberos bind for Windows members** (Windows-facing phase): GSS-SPNEGO or GSSAPI with the
+  **SASL security layer providing confidentiality (sealing)**, the protection Windows members use;
+  the security layer will terminate inside the key holder. Whether TLS is offered next to it, with
+  `tls-server-end-point` channel binding (RFC 5929) as Windows clients expect, is an open design
+  decision.
 - **One narrow write path:** a computer updating its own permitted attributes during join, through
   the one checked write path. Administrative writes over LDAP are not planned: administration goes
   through the administration plane, with dual control and effect plans.

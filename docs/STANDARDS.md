@@ -131,6 +131,9 @@ the subject is given.
 | RFC 3244 | Microsoft Windows 2000 Kerberos Change Password and Set Password Protocols | pinned |
 | RFC 4121 | The Kerberos Version 5 GSS-API Mechanism: Version 2 | pinned |
 | RFC 4178 | The Simple and Protected GSS-API Negotiation Mechanism | pinned |
+| RFC 2743 | Generic Security Service Application Program Interface, Version 2, Update 1 | pinned |
+| RFC 2744 | GSS-API Version 2: C-bindings (the channel-bindings structure) | pinned |
+| RFC 5056 | On the Use of Channel Bindings to Secure Channels | pinned |
 | RFC 4556 | Public Key Cryptography for Initial Authentication in Kerberos (PKINIT) | pinned |
 | RFC 6806 | Kerberos name canonicalization and referrals (read to know what is refused) | — |
 | RFC 6112 | Anonymous PKINIT and the anonymous principal (read to know what is refused) | — |
@@ -150,7 +153,9 @@ the subject is given.
 | RFC 2891 | LDAP server-side sorting control | — |
 | RFC 4422 | Simple Authentication and Security Layer (SASL) | pinned |
 | RFC 4752 | The Kerberos V5 ("GSSAPI") SASL Mechanism | pinned |
-| RFC 5929 | Channel Bindings for TLS | pinned |
+| RFC 5929 | Channel Bindings for TLS (TLS 1.2 and earlier; the Windows-facing phase only) | pinned |
+| RFC 9266 | Channel Bindings for TLS 1.3 (`tls-exporter`) | pinned |
+| RFC 4532 | LDAP "Who am I?" Operation | pinned |
 
 ### TLS and X.509
 
